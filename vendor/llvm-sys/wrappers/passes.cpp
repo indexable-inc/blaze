@@ -42,6 +42,9 @@
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/LLVMRemarkStreamer.h>
+#include <llvm/Support/raw_ostream.h>
+#include <llvm-c/Core.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/MC/MCSubtargetInfo.h>
@@ -826,6 +829,82 @@ void LLVMBlazeReportKept(LLVMBlazeOpaquePasses *Passes, LLVMValueRef Fn) {
 size_t LLVMBlazeReportRows(LLVMBlazeOpaquePasses *Passes, const LLVMBlazeReportRow **Out) {
   *Out = Passes->Rows.data();
   return Passes->Rows.size();
+}
+
+/* The inliner's remark stream (crates/blaze-llvm, D100 point 7 (c)): the remarks of the passes
+ * a regular expression names, serialized as YAML into a buffer the sink owns, for
+ * llvm-c/Remarks.h's parser to read back. LLVM's C API can parse remarks but not start a
+ * stream, so these three do. */
+struct LLVMBlazeRemarkSink {
+  std::string Text;
+  raw_string_ostream Stream{Text};
+};
+
+/* Starts the stream on `C` for the passes `Passes[0..Length)` matches; the sink in `*Out`.
+ * An error if `C` already streams remarks. OWNERSHIP: the caller owns the sink (freed only by
+ * LLVMBlazeRemarksDispose); `C` keeps a streamer writing into the sink's buffer, so `C` must
+ * stay alive until LLVMBlazeRemarksEnd, and End must run before Dispose and before `C` is
+ * disposed. `Passes` is read during this call only. */
+LLVMErrorRef LLVMBlazeRemarksBegin(LLVMContextRef C, const char *Passes, size_t Length,
+                                   LLVMBlazeRemarkSink **Out) {
+  *Out = nullptr;
+  LLVMContext &Context = *unwrap(C);
+  if (Context.getLLVMRemarkStreamer() || Context.getMainRemarkStreamer())
+    return wrap(make_error<StringError>("blaze: the context already streams remarks",
+                                        inconvertibleErrorCode()));
+  auto Sink = std::make_unique<LLVMBlazeRemarkSink>();
+  if (Error Err = setupLLVMOptimizationRemarks(Context, Sink->Stream, StringRef(Passes, Length),
+                                               "yaml", /*RemarksWithHotness=*/false))
+    return wrap(std::move(Err));
+  *Out = Sink.release();
+  return nullptr;
+}
+
+/* Finalizes the stream and deregisters it from `C` (which must be the context Begin was given,
+ * still alive); the YAML in `*Data`/`*Length`, borrowed from the sink until
+ * LLVMBlazeRemarksDispose. After this `C` holds no pointer into the sink. */
+void LLVMBlazeRemarksEnd(LLVMContextRef C, LLVMBlazeRemarkSink *Sink, const char **Data,
+                         size_t *Length) {
+  finalizeLLVMOptimizationRemarks(*unwrap(C));
+  Sink->Stream.flush();
+  *Data = Sink->Text.data();
+  *Length = Sink->Text.size();
+}
+
+/* Frees the sink and its buffer: only after LLVMBlazeRemarksEnd (no context points into it). */
+void LLVMBlazeRemarksDispose(LLVMBlazeRemarkSink *Sink) { delete Sink; }
+
+/* LLVM's own per-module default pipeline at level `Level` (1, 2 or 3; anything else is null),
+ * built for `Machine` (non-null; its target registered) with SLP vectorization as
+ * `SLPVectorization` says, and printed as `opt -print-pipeline-passes` prints it: class names
+ * mapped to the registered pass names. OWNERSHIP: the text is a fresh copy made by
+ * LLVMCreateMessage, owned by the caller and freed with LLVMDisposeMessage. `Machine` is only
+ * read during this call. No module or context is involved, so nothing outlives the call. */
+char *LLVMBlazeDefaultPipeline(LLVMTargetMachineRef Machine, unsigned Level,
+                               LLVMBool SLPVectorization) {
+  if (!Machine)
+    return nullptr;
+  OptimizationLevel Opt;
+  switch (Level) {
+  case 1: Opt = OptimizationLevel::O1; break;
+  case 2: Opt = OptimizationLevel::O2; break;
+  case 3: Opt = OptimizationLevel::O3; break;
+  default: return nullptr;
+  }
+  /* The callbacks must be handed to the builder so that it registers every class-to-name pair,
+   * which is what the printer maps through. */
+  PassInstrumentationCallbacks Callbacks;
+  PassBuilder Builder(reinterpret_cast<TargetMachine *>(Machine),
+                      tuning(SLPVectorization != 0), std::nullopt, &Callbacks);
+  ModulePassManager Manager = Builder.buildPerModuleDefaultPipeline(Opt);
+  std::string Text;
+  raw_string_ostream Out(Text);
+  Manager.printPipeline(Out, [&Callbacks](StringRef ClassName) {
+    StringRef Name = Callbacks.getPassNameForClassName(ClassName);
+    return Name.empty() ? ClassName : Name;
+  });
+  Out.flush();
+  return LLVMCreateMessage(Text.c_str());
 }
 
 } // extern "C"

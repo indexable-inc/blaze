@@ -30,13 +30,13 @@
 use std::{alloc::Allocator, hash::BuildHasher, marker::PhantomData};
 
 use blaze_format::SpanRef;
-use blaze_hash::{FixedState, HashMap};
+use blaze_hash::{FixedState, Map, MapOpts};
 
 use crate::{
     flags::{AtomicRmw, Flags, FloatCond, IntCond},
     func::{
         AsmId, AsmOperandKind, AsmOperandRec, AsmPieceRec, AsmRec, Block, BlockKind, CompoundRec,
-        Conv, DataId, DataRec, DataRelocRec, Ext, FnAttrs, Func, Head, InlinedRec, IntrinsicId,
+        Conv, DataId, DataPositionRec, DataRec, DataRelocRec, Ext, FnAttrs, Func, Head, InlinedRec, IntrinsicId,
         IntrinsicRec, MemAttrsRec, NONE, ParamFactsRec, ParamKind, ParamRec, RangeRec, RefId,
         RefKind, RefRec, SigId, SigRec, SlotId, SlotKind, SlotRec, Value, VarRec,
     },
@@ -201,6 +201,22 @@ pub struct DataReloc {
     pub addend: i64,
 }
 
+/// A source position in data ([`DataPositionRec`]): at byte `offset`, the `field` of byte
+/// `site` of item `item`'s text, filled when the program is placed.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DataPosition {
+    pub offset: u32,
+    /// The item's key.
+    pub item: u128,
+    /// The byte offset from the item's first byte.
+    pub site: u32,
+    pub field: crate::func::PositionField,
+}
+
+fn position_rec(it: &DataPosition) -> DataPositionRec {
+    DataPositionRec { item: it.item.to_le_bytes(), offset: it.offset, site: it.site, field: it.field as u32 }
+}
+
 /// A piece of an `asm!` template.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AsmPiece<'a> {
@@ -255,21 +271,25 @@ pub struct Builder<A: Allocator + Clone, S: Sink> {
     loc: u32,
     signature: Option<SigId>,
     error: Option<BuildError>,
-    compound_rows: HashMap<u64, u32, A>,
-    sig_rows: HashMap<u64, u32, A>,
-    fact_rows: HashMap<ParamFactsRec, u32, A>,
-    attr_rows: HashMap<MemAttrsRec, u32, A>,
-    range_rows: HashMap<RangeRec, u32, A>,
-    ref_rows: HashMap<RefRec, u32, A>,
-    data_rows: HashMap<u64, u32, A>,
-    intrinsic_rows: HashMap<u64, u32, A>,
-    span_rows: HashMap<SpanRef, u32, A>,
+    compound_rows: Map<u64, u32, FixedState, A>,
+    sig_rows: Map<u64, u32, FixedState, A>,
+    fact_rows: Map<ParamFactsRec, u32, FixedState, A>,
+    attr_rows: Map<MemAttrsRec, u32, FixedState, A>,
+    range_rows: Map<RangeRec, u32, FixedState, A>,
+    ref_rows: Map<RefRec, u32, FixedState, A>,
+    data_rows: Map<u64, u32, FixedState, A>,
+    intrinsic_rows: Map<u64, u32, FixedState, A>,
+    span_rows: Map<SpanRef, u32, FixedState, A>,
+    /// The most alignment (log2) a plain access made from now on may claim: `None` until
+    /// [`Builder::cap_access_align`] lowers it (a `repr(packed)` aggregate's parts sit below
+    /// their own alignment). Atomics are never capped: an atomic access is at its size.
+    access_cap: Option<u8>,
 }
 
 /// The row of `hash` in a table of `rows` rows: `Ok` with the one `same` holds of, or `Err`
 /// with the row a new one takes. A hash shared by two rows finds the second by a scan.
 fn intern<A: Allocator + Clone>(
-    map: &mut HashMap<u64, u32, A>,
+    map: &mut Map<u64, u32, FixedState, A>,
     hash: u64,
     rows: u32,
     same: impl Fn(u32) -> bool,
@@ -311,15 +331,34 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
             loc: 0,
             signature: None,
             error: None,
-            compound_rows: HashMap::new_in(alloc.clone()),
-            sig_rows: HashMap::new_in(alloc.clone()),
-            fact_rows: HashMap::new_in(alloc.clone()),
-            attr_rows: HashMap::new_in(alloc.clone()),
-            range_rows: HashMap::new_in(alloc.clone()),
-            ref_rows: HashMap::new_in(alloc.clone()),
-            data_rows: HashMap::new_in(alloc.clone()),
-            intrinsic_rows: HashMap::new_in(alloc.clone()),
-            span_rows: HashMap::new_in(alloc),
+            compound_rows: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            sig_rows: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            fact_rows: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            attr_rows: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            range_rows: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            ref_rows: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            data_rows: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            intrinsic_rows: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            span_rows: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
+            access_cap: None,
+        }
+    }
+
+    /// From now on every plain load, store, bulk copy, `memcmp` and masked access claims at
+    /// most `1 << log2` alignment (the least of every cap asked): the Reference, "Type layout",
+    /// `[layout.repr.alignment.packed-fields]`: under `packed` a field is positioned at "the
+    /// smaller of the specified alignment and the alignment of the field's type", so an access
+    /// through it may claim no more. Lowering a claimed alignment never makes code wrong;
+    /// atomics keep theirs.
+    pub fn cap_access_align(&mut self, log2: u8) {
+        self.access_cap = Some(self.access_cap.map_or(log2, |cap| cap.min(log2)));
+    }
+
+    /// `attrs` with its alignments lowered to the access cap, if one was asked.
+    fn capped(&self, attrs: MemAttrs) -> MemAttrs {
+        match self.access_cap {
+            None => attrs,
+            Some(cap) => MemAttrs { align: attrs.align.min(cap), src_align: attrs.src_align.min(cap), ..attrs },
         }
     }
 
@@ -521,19 +560,35 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
 
     /// The function's own data, made once per content, aligned to `1 << align`.
     pub fn data(&mut self, bytes: &[u8], align: u32, relocs: &[DataReloc]) -> RefId {
-        let hash = FixedState.hash_one((bytes, align, relocs));
+        self.data_with_positions(bytes, align, relocs, &[])
+    }
+
+    /// [`Builder::data`] with source positions in it (`positions` by ascending offset, each a
+    /// 4-byte field the verifier checks lies in the bytes and overlaps no address).
+    pub fn data_with_positions(
+        &mut self,
+        bytes: &[u8],
+        align: u32,
+        relocs: &[DataReloc],
+        positions: &[DataPosition],
+    ) -> RefId {
+        let hash = FixedState.hash_one((bytes, align, relocs, positions));
         let func = &self.func;
         let same = |row: u32| {
             let rec = func.datas[row as usize];
             let have_bytes = &func.data_bytes[rec.bytes_first as usize..][..rec.bytes_len as usize];
             let have_relocs =
                 &func.data_relocs[rec.relocs_first as usize..][..rec.relocs_len as usize];
+            let have_positions =
+                &func.data_positions[rec.positions_first as usize..][..rec.positions_len as usize];
             rec.align == align
                 && have_bytes == bytes
                 && have_relocs.len() == relocs.len()
                 && have_relocs.iter().zip(relocs).all(|(a, b)| {
                     a.offset == b.offset && a.target == b.target.0 && a.addend == b.addend
                 })
+                && have_positions.len() == positions.len()
+                && have_positions.iter().zip(positions).all(|(a, b)| *a == position_rec(b))
         };
         let rows = self.func.datas.len() as u32;
         let row = match intern(&mut self.data_rows, hash, rows, same) {
@@ -547,12 +602,16 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
                     offset: it.offset,
                     target: it.target.0,
                 }));
+                let positions_first = self.func.data_positions.len() as u32;
+                self.func.data_positions.extend(positions.iter().map(position_rec));
                 self.func.datas.push(DataRec {
                     bytes_first,
                     bytes_len: bytes.len() as u32,
                     relocs_first,
                     relocs_len: relocs.len() as u32,
                     align,
+                    positions_first,
+                    positions_len: positions.len() as u32,
                 });
                 row
             }
@@ -1024,6 +1083,7 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
     // Memory.
 
     pub fn load(&mut self, ty: Ty, flags: Flags, ptr: Value, offset: i32, attrs: MemAttrs) -> Value {
+        let attrs = self.capped(attrs);
         let attrs = self.mem(attrs);
         self.push(Op::Load, flags, ty, attrs, |w| {
             w.value(ptr);
@@ -1032,6 +1092,7 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
     }
 
     pub fn store(&mut self, flags: Flags, value: Value, ptr: Value, offset: i32, attrs: MemAttrs) {
+        let attrs = self.capped(attrs);
         let attrs = self.mem(attrs);
         self.push(Op::Store, flags, Ty::NONE, attrs, |w| {
             w.value(value);
@@ -1042,6 +1103,7 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
 
     /// `memcpy`, `memmove` or `memset`.
     pub fn bulk(&mut self, op: Op, flags: Flags, dst: Value, src: Value, len: Value, attrs: MemAttrs) {
+        let attrs = self.capped(attrs);
         let attrs = self.mem(attrs);
         self.push(op, flags, Ty::NONE, attrs, |w| {
             w.value(dst);
@@ -1051,6 +1113,7 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
     }
 
     pub fn memcmp(&mut self, a: Value, b: Value, len: Value, attrs: MemAttrs) -> Value {
+        let attrs = self.capped(attrs);
         let attrs = self.mem(attrs);
         self.push(Op::Memcmp, Flags::NONE, Ty::I32, attrs, |w| {
             w.value(a);
@@ -1138,6 +1201,7 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
     /// `masked_load` or `gather` of `ty`: the address(es), the mask and the lanes where it is
     /// false.
     pub fn masked_load(&mut self, op: Op, ty: Ty, ptr: Value, mask: Value, passthru: Value, attrs: MemAttrs) -> Value {
+        let attrs = self.capped(attrs);
         let attrs = self.mem(attrs);
         self.push(op, Flags::NONE, ty, attrs, |w| {
             w.value(ptr);
@@ -1148,6 +1212,7 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
 
     /// `masked_store` or `scatter`: the value, the address(es) and the mask.
     pub fn masked_store(&mut self, op: Op, value: Value, ptr: Value, mask: Value, attrs: MemAttrs) {
+        let attrs = self.capped(attrs);
         let attrs = self.mem(attrs);
         self.push(op, Flags::NONE, Ty::NONE, attrs, |w| {
             w.value(value);
@@ -1248,7 +1313,13 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
     }
 
     pub fn unreachable(&mut self) {
-        self.push(Op::Unreachable, Flags::NONE, Ty::NONE, 0, |_| {});
+        self.unreachable_inst();
+    }
+
+    /// [`Builder::unreachable`], answering the instruction (its index in layout order, as
+    /// every instruction's): what a build's trap table counts its `unreachable`s by.
+    pub fn unreachable_inst(&mut self) -> Value {
+        self.push(Op::Unreachable, Flags::NONE, Ty::NONE, 0, |_| {})
     }
 
     pub fn trap(&mut self, code: u32) {
@@ -1257,6 +1328,25 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
 
     pub fn resume(&mut self, exception: Value) {
         self.push(Op::Resume, Flags::NONE, Ty::NONE, 0, |w| w.value(exception));
+    }
+
+    /// Suspension point `point` of a coroutine body ([`Op::Suspend`]): this poll returns
+    /// `pending` (the function's returns); the next poll goes on at `resume`, and the state's
+    /// drop, when the state is dropped parked here, at `cancel`. Neither block takes
+    /// parameters.
+    pub fn suspend(&mut self, point: u32, resume: Block, cancel: Block, pending: &[Value]) {
+        self.push_targets(&[resume, cancel]);
+        self.push(Op::Suspend, Flags::NONE, Ty::NONE, 0, |w| {
+            w.word(point);
+            w.block(resume);
+            w.block(cancel);
+            w.values(pending);
+        });
+    }
+
+    /// The end of a cancel path ([`Op::Cancelled`]).
+    pub fn cancelled(&mut self) {
+        self.push(Op::Cancelled, Flags::NONE, Ty::NONE, 0, |_| {});
     }
 
     /// A call that may unwind to `unwind` (a landing block), returning to `normal`, whose
@@ -1341,6 +1431,13 @@ impl<A: Allocator + Clone> Builder<A, Full> {
         self.finish_as(Check::Always)
     }
 
+    /// [`Builder::finish`] with its proof (D163): verified once, in every build, and handed out
+    /// as a [`crate::VerifiedFunc`] an emitter takes without checking again.
+    pub fn finish_verified(self) -> Result<crate::VerifiedFunc<A>, BuildError> {
+        let func = self.finish_as(Check::ByProof)?;
+        crate::VerifiedFunc::new(func).map_err(BuildError::Verify)
+    }
+
     fn finish_as(mut self, check: Check) -> Result<Func<A>, BuildError> {
         self.check_finish()?;
         if let Some(block) = (0..self.named.len())
@@ -1356,6 +1453,8 @@ impl<A: Allocator + Clone> Builder<A, Full> {
         let verify_now = match check {
             Check::Always => true,
             Check::Debug => cfg!(debug_assertions),
+            // The caller makes the proof (`VerifiedFunc::new`): verified there, once.
+            Check::ByProof => false,
         };
         if verify_now {
             verify::verify(self.func.view()).map_err(BuildError::Verify)?;
@@ -1377,6 +1476,8 @@ impl<A: Allocator + Clone> Builder<A, RequestsOnly> {
 enum Check {
     Debug,
     Always,
+    /// Not here: [`Builder::finish_verified`] verifies once, making the proof.
+    ByProof,
 }
 
 /// Where an instruction's operands are written.

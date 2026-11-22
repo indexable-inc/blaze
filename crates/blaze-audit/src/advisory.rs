@@ -12,7 +12,7 @@
 //! informational = "unmaintained" | "unsound" | "notice"     withdrawn = "YYYY-MM-DD"
 //! [affected]  functions = { "foo::bar" = ["< 1.2.3"] }   arch = [..]   os = [..]
 //! [versions]  patched = [">= 1.2.3"]   unaffected = ["< 1.0.0"]
-//! ```
+//! ```text
 //! # Title
 //! Description.
 //! ```
@@ -27,7 +27,9 @@
 use std::alloc::Global;
 use std::fmt;
 
-use semver::VersionReq;
+use blaze_data::{Map, Value};
+use blaze_semver::VersionReq;
+use blaze_toml::Item;
 
 use crate::date::Date;
 
@@ -85,8 +87,8 @@ pub struct Advisory {
     /// The ranges as written (rendered back as written), and parsed.
     pub patched: Vec<String, Global>,
     pub unaffected: Vec<String, Global>,
-    pub patched_reqs: Vec<VersionReq, Global>,
-    pub unaffected_reqs: Vec<VersionReq, Global>,
+    pub patched_reqs: Vec<VersionReq<Global>, Global>,
+    pub unaffected_reqs: Vec<VersionReq<Global>, Global>,
 }
 
 /// Why an advisory, or a database, was not read. `file` is the path within the database.
@@ -136,24 +138,35 @@ fn is_package(name: &str) -> bool {
     !name.is_empty() && name.len() <= 64 && name.bytes().all(|it| it.is_ascii_alphanumeric() || it == b'-' || it == b'_')
 }
 
-struct Fields<'a> {
+/// The front matter starts on the file's second line, after the fence.
+const FRONT_LINE: usize = 1;
+
+/// ` (line L, column C)`: where `item` is in the advisory's file.
+fn place(item: &Item<'_, '_, Global>) -> String {
+    let (line, col) = item.line_col();
+    format!(" (line {}, column {col})", line + FRONT_LINE)
+}
+
+struct Fields<'a, 'd, 't> {
     file: &'a str,
-    table: &'a toml::Table,
+    table: Item<'d, 't, Global>,
     part: &'a str,
 }
 
-impl<'a> Fields<'a> {
+impl<'a, 'd, 't> Fields<'a, 'd, 't> {
     fn bad(&self, why: String) -> AdvisoryRefused {
         AdvisoryRefused::Bad { file: self.file.to_owned(), why }
     }
 
     /// Every key of the table is one of `known`.
     fn only(&self, known: &[&str]) -> Result<(), AdvisoryRefused> {
-        match self.table.keys().find(|key| !known.contains(&key.as_str())) {
-            Some(key) => Err(self.bad(format!(
-                "has `{}.{key}`, which is not a field of the format (`{}` are)",
+        match self.table.children().find(|it| !known.contains(&it.key())) {
+            Some(item) => Err(self.bad(format!(
+                "has `{}.{}`, which is not a field of the format (`{}` are){}",
                 self.part,
-                known.join("`, `")
+                item.key(),
+                known.join("`, `"),
+                place(&item)
             ))),
             None => Ok(()),
         }
@@ -162,8 +175,10 @@ impl<'a> Fields<'a> {
     fn text(&self, key: &str) -> Result<Option<String>, AdvisoryRefused> {
         match self.table.get(key) {
             None => Ok(None),
-            Some(toml::Value::String(it)) => Ok(Some(it.clone())),
-            Some(_) => Err(self.bad(format!("has `{}.{key}`, which is not a string", self.part))),
+            Some(item) => match item.as_str() {
+                Some(it) => Ok(Some(it.to_owned())),
+                None => Err(self.bad(format!("has `{}.{key}`, which is not a string{}", self.part, place(&item)))),
+            },
         }
     }
 
@@ -172,17 +187,23 @@ impl<'a> Fields<'a> {
     }
 
     fn date(&self, key: &str) -> Result<Option<Date>, AdvisoryRefused> {
-        match self.table.get(key) {
-            None => Ok(None),
-            Some(toml::Value::String(it)) => {
-                Date::parse(it).map(Some).map_err(|why| self.bad(format!("has `{}.{key}`: {why}", self.part)))
-            }
-            // TOML's own date, as `date = 2021-01-01` unquoted.
-            Some(toml::Value::Datetime(it)) => {
+        let Some(item) = self.table.get(key) else {
+            return Ok(None);
+        };
+        if let Some(it) = item.as_str() {
+            return Date::parse(it)
+                .map(Some)
+                .map_err(|why| self.bad(format!("has `{}.{key}`: {why}{}", self.part, place(&item))));
+        }
+        // TOML's own date, as `date = 2021-01-01` unquoted.
+        match item.as_datetime() {
+            Some(it) => {
                 let text = it.to_string();
-                Date::parse(&text).map(Some).map_err(|_| self.bad(format!("has `{}.{key}` = {text}, which is no day", self.part)))
+                Date::parse(&text)
+                    .map(Some)
+                    .map_err(|_| self.bad(format!("has `{}.{key}` = {text}, which is no day{}", self.part, place(&item))))
             }
-            Some(_) => Err(self.bad(format!("has `{}.{key}`, which is not a day", self.part))),
+            None => Err(self.bad(format!("has `{}.{key}`, which is not a day{}", self.part, place(&item)))),
         }
     }
 
@@ -190,24 +211,26 @@ impl<'a> Fields<'a> {
         let mut out = Vec::new_in(Global);
         match self.table.get(key) {
             None => {}
-            Some(toml::Value::Array(items)) => {
-                for item in items {
-                    let text = item
-                        .as_str()
-                        .ok_or_else(|| self.bad(format!("has `{}.{key}` with an item that is not a string", self.part)))?;
+            Some(items) if items.is_array() => {
+                for item in items.children() {
+                    let text = item.as_str().ok_or_else(|| {
+                        self.bad(format!("has `{}.{key}` with an item that is not a string{}", self.part, place(&item)))
+                    })?;
                     out.push(text.to_owned());
                 }
             }
-            Some(_) => return Err(self.bad(format!("has `{}.{key}`, which is not a list of strings", self.part))),
+            Some(item) => {
+                return Err(self.bad(format!("has `{}.{key}`, which is not a list of strings{}", self.part, place(&item))));
+            }
         }
         Ok(out)
     }
 }
 
-fn reqs(file: &str, part: &str, ranges: &[String]) -> Result<Vec<VersionReq, Global>, AdvisoryRefused> {
+fn reqs(file: &str, part: &str, ranges: &[String]) -> Result<Vec<VersionReq<Global>, Global>, AdvisoryRefused> {
     let mut out = Vec::with_capacity_in(ranges.len(), Global);
     for range in ranges {
-        let req = VersionReq::parse(range).map_err(|why| AdvisoryRefused::Bad {
+        let req = VersionReq::parse_in(range, blaze_semver::Limits::CARGO, Global).map_err(|why| AdvisoryRefused::Bad {
             file: file.to_owned(),
             why: format!("has `{part}` range `{range}`, which is no semver requirement: {why}"),
         })?;
@@ -216,18 +239,38 @@ fn reqs(file: &str, part: &str, ranges: &[String]) -> Result<Vec<VersionReq, Glo
     Ok(out)
 }
 
-/// A TOML list of `items`.
-fn strings(items: &[String]) -> toml::Value {
-    let mut out = Vec::with_capacity_in(items.len(), Global);
-    out.extend(items.iter().cloned().map(toml::Value::String));
-    toml::Value::Array(out)
+fn text_value(text: &str) -> Value<Global> {
+    Value::Text(blaze_own::String::from_str_in(text, Global))
 }
 
-fn table_of<'a>(doc: &'a toml::Table, key: &str, file: &str) -> Result<Option<&'a toml::Table>, AdvisoryRefused> {
+/// A TOML list of `items`.
+fn strings(items: &[String]) -> Value<Global> {
+    let mut out = blaze_own::Vec::with_capacity_in(items.len(), Global);
+    for item in items {
+        out.push(text_value(item));
+    }
+    Value::List(out)
+}
+
+/// `key = value` into `table`, when there is a value.
+fn put(table: &mut Map<Global>, key: &str, value: Option<Value<Global>>) {
+    if let Some(value) = value {
+        table.insert(blaze_own::String::from_str_in(key, Global), value);
+    }
+}
+
+fn table_of<'d, 't>(
+    doc: Item<'d, 't, Global>,
+    key: &str,
+    file: &str,
+) -> Result<Option<Item<'d, 't, Global>>, AdvisoryRefused> {
     match doc.get(key) {
         None => Ok(None),
-        Some(toml::Value::Table(it)) => Ok(Some(it)),
-        Some(_) => Err(AdvisoryRefused::Bad { file: file.to_owned(), why: format!("has `{key}`, which is not a table") }),
+        Some(it) if it.is_table() => Ok(Some(it)),
+        Some(it) => Err(AdvisoryRefused::Bad {
+            file: file.to_owned(),
+            why: format!("has `{key}`, which is not a table{}", place(&it)),
+        }),
     }
 }
 
@@ -243,11 +286,19 @@ impl Advisory {
         let rest = text.strip_prefix(FENCE).ok_or_else(|| bad("does not open with a ```toml fence".to_owned()))?;
         let end = rest.find(FENCE_END).ok_or_else(|| bad("has no end to its ```toml fence".to_owned()))?;
         let (front, body) = (&rest[..end + 1], &rest[end + FENCE_END.len()..]);
-        let doc: toml::Table = toml::from_str(front).map_err(|why| bad(format!("has front matter that is not TOML: {why}")))?;
-        if let Some(key) = doc.keys().find(|key| !["advisory", "affected", "versions"].contains(&key.as_str())) {
-            return Err(bad(format!("has `[{key}]`, which is not a table of the format (`advisory`, `affected`, `versions` are)")));
+        let doc = blaze_toml::Document::parse_in(front, blaze_toml::Limits::CARGO, Global).map_err(|why| {
+            let (line, col) = why.line_col(front);
+            bad(format!("has front matter that is not TOML: line {}, column {col}: {}", line + FRONT_LINE, why.what))
+        })?;
+        let doc = doc.root();
+        if let Some(item) = doc.children().find(|it| !["advisory", "affected", "versions"].contains(&it.key())) {
+            return Err(bad(format!(
+                "has `[{}]`, which is not a table of the format (`advisory`, `affected`, `versions` are){}",
+                item.key(),
+                place(&item)
+            )));
         }
-        let head = table_of(&doc, "advisory", file)?.ok_or_else(|| bad("has no `[advisory]`".to_owned()))?;
+        let head = table_of(doc, "advisory", file)?.ok_or_else(|| bad("has no `[advisory]`".to_owned()))?;
         let head = Fields { file, table: head, part: "advisory" };
         head.only(&[
             "id", "package", "date", "url", "references", "categories", "keywords", "aliases", "related", "cvss",
@@ -279,22 +330,25 @@ impl Advisory {
         };
         let mut functions = Vec::new_in(Global);
         let (mut arch, mut os) = (Vec::new_in(Global), Vec::new_in(Global));
-        if let Some(affected) = table_of(&doc, "affected", file)? {
+        if let Some(affected) = table_of(doc, "affected", file)? {
             let affected = Fields { file, table: affected, part: "affected" };
             affected.only(&["functions", "arch", "os"])?;
             arch = affected.list("arch")?;
             os = affected.list("os")?;
             if let Some(found) = table_of(affected.table, "functions", file)? {
                 let found = Fields { file, table: found, part: "affected.functions" };
-                for path in found.table.keys() {
+                for item in found.table.children() {
+                    let path = item.key();
                     let ranges = found.list(path)?;
                     reqs(file, &format!("affected.functions.{path}"), &ranges)?;
-                    functions.push((path.clone(), ranges));
+                    functions.push((path.to_owned(), ranges));
                 }
+                // Sorted by path, whatever order the file names them in.
+                functions.sort_by(|a: &(String, Vec<String, Global>), b| a.0.cmp(&b.0));
             }
         }
         let (mut patched, mut unaffected) = (Vec::new_in(Global), Vec::new_in(Global));
-        if let Some(versions) = table_of(&doc, "versions", file)? {
+        if let Some(versions) = table_of(doc, "versions", file)? {
             let versions = Fields { file, table: versions, part: "versions" };
             versions.only(&["patched", "unaffected"])?;
             patched = versions.list("patched")?;
@@ -342,51 +396,54 @@ impl Advisory {
     /// The advisory as a file of the format, with sorted keys: [`Advisory::parse`] of it is
     /// this advisory.
     pub fn render(&self) -> String {
-        let mut head = toml::Table::new();
-        let put = |table: &mut toml::Table, key: &str, value: Option<toml::Value>| {
-            if let Some(value) = value {
-                table.insert(key.to_owned(), value);
-            }
-        };
-        let text = |it: &Option<String>| it.clone().map(toml::Value::String);
+        // Every table's keys are put in sorted order: the writer keeps insertion order, and
+        // a render is the same bytes for the same advisory.
+        let text = |it: &Option<String>| it.as_deref().map(text_value);
         let list = |it: &[String]| (!it.is_empty()).then(|| strings(it));
-        put(&mut head, "id", Some(toml::Value::String(self.id.clone())));
-        put(&mut head, "package", Some(toml::Value::String(self.package.clone())));
-        put(&mut head, "date", Some(toml::Value::String(self.date.to_string())));
-        put(&mut head, "url", text(&self.url));
-        put(&mut head, "references", list(&self.references));
-        put(&mut head, "categories", list(&self.categories));
-        put(&mut head, "keywords", list(&self.keywords));
+        let mut head = Map::new_in(Global);
         put(&mut head, "aliases", list(&self.aliases));
-        put(&mut head, "related", list(&self.related));
+        put(&mut head, "categories", list(&self.categories));
         put(&mut head, "cvss", text(&self.cvss));
+        put(&mut head, "date", Some(text_value(&self.date.to_string())));
+        put(&mut head, "id", Some(text_value(&self.id)));
+        put(&mut head, "informational", self.informational.map(|it| text_value(it.name())));
+        put(&mut head, "keywords", list(&self.keywords));
         put(&mut head, "license", text(&self.license));
+        put(&mut head, "package", Some(text_value(&self.package)));
+        put(&mut head, "references", list(&self.references));
+        put(&mut head, "related", list(&self.related));
         put(&mut head, "source", text(&self.source));
-        put(&mut head, "informational", self.informational.map(|it| toml::Value::String(it.name().to_owned())));
-        put(&mut head, "withdrawn", self.withdrawn.map(|it| toml::Value::String(it.to_string())));
-        let mut doc = toml::Table::new();
-        doc.insert("advisory".to_owned(), toml::Value::Table(head));
-        let mut affected = toml::Table::new();
+        put(&mut head, "url", text(&self.url));
+        put(&mut head, "withdrawn", self.withdrawn.map(|it| text_value(&it.to_string())));
+        let mut doc = Map::new_in(Global);
+        put(&mut doc, "advisory", Some(Value::Map(head)));
+        let mut affected = Map::new_in(Global);
         put(&mut affected, "arch", list(&self.arch));
-        put(&mut affected, "os", list(&self.os));
         if !self.functions.is_empty() {
-            let mut functions = toml::Table::new();
+            // `functions` is sorted by path.
+            let mut functions = Map::new_in(Global);
             for (path, ranges) in &self.functions {
-                functions.insert(path.clone(), strings(ranges));
+                put(&mut functions, path, Some(strings(ranges)));
             }
-            affected.insert("functions".to_owned(), toml::Value::Table(functions));
+            put(&mut affected, "functions", Some(Value::Map(functions)));
         }
+        put(&mut affected, "os", list(&self.os));
         if !affected.is_empty() {
-            doc.insert("affected".to_owned(), toml::Value::Table(affected));
+            put(&mut doc, "affected", Some(Value::Map(affected)));
         }
         if self.informational.is_none() || !self.patched.is_empty() || !self.unaffected.is_empty() {
-            let mut versions = toml::Table::new();
-            versions.insert("patched".to_owned(), strings(&self.patched));
+            let mut versions = Map::new_in(Global);
+            put(&mut versions, "patched", Some(strings(&self.patched)));
             put(&mut versions, "unaffected", list(&self.unaffected));
-            doc.insert("versions".to_owned(), toml::Value::Table(versions));
+            put(&mut doc, "versions", Some(Value::Map(versions)));
         }
-        let front = toml::to_string(&doc).expect("a table of strings and lists renders");
-        let mut out = format!("{FENCE}{front}");
+        // Every table under its own header, as the `toml` crate wrote them.
+        let layout = blaze_toml::DocumentOptions { inline_from_depth: usize::MAX };
+        let mut front = blaze_own::String::new_in(Global);
+        if let Err(why) = blaze_toml::write_document(&doc, &mut front, layout) {
+            unreachable!("a table of strings and lists has a TOML form: {why}");
+        }
+        let mut out = format!("{FENCE}{}", front.as_str());
         if !out.ends_with('\n') {
             out.push('\n');
         }

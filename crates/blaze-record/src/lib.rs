@@ -1,4 +1,4 @@
-//! A record with its reads (docs/v2/plan/design/end-state.md, "One primitive first"): a result
+//! A record with its reads: a result
 //! kept in a write-once content-addressed store as `base key → read-lists → answer`.
 //!
 //! - The **base key** is the result's own content identity, computable before the work.

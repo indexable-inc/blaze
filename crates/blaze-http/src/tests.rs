@@ -119,7 +119,7 @@ fn a_chunked_body_is_read_whole_however_it_is_cut() {
         panic!("{error:?}")
     };
     assert_eq!(host, "example.test");
-    assert!(why.contains("not hex"), "{why}");
+    assert!(why.contains("no hex"), "{why}");
     assert!(ios(&mut client).contains(&Io::Close { conn }));
 }
 
@@ -132,7 +132,7 @@ fn a_kept_alive_connection_is_reused_until_it_idles_out() {
     let (conn, written) = open(&mut client, 1, Request::get("http://example.test/a?x=1"));
     assert_eq!(
         String::from_utf8(written).unwrap(),
-        "GET /a?x=1 HTTP/1.1\r\nhost: example.test\r\nuser-agent: blaze-test\r\naccept-encoding: gzip\r\n\r\n"
+        "GET /a?x=1 HTTP/1.1\r\nHost: example.test\r\nuser-agent: blaze-test\r\naccept-encoding: gzip\r\n\r\n"
     );
     received(&mut client, conn, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     assert_eq!(answer(&events(&mut client)), (200, b"ok".to_vec(), true));
@@ -215,7 +215,7 @@ fn a_redirect_is_followed_and_its_connection_kept() {
     };
     assert_eq!(host, "two.test");
     client.complete(Completion::Connected { conn: two });
-    assert!(sent(&mut client, two).starts_with(b"GET /b?sig=1 HTTP/1.1\r\nhost: two.test\r\n"));
+    assert!(sent(&mut client, two).starts_with(b"GET /b?sig=1 HTTP/1.1\r\nHost: two.test\r\n"));
     received(&mut client, two, b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone");
     let got = events(&mut client);
     let Some(Event::Head { url, .. }) = got.first() else { panic!("{got:?}") };
@@ -252,10 +252,14 @@ fn a_request_past_its_redirects_fails() {
 /// scheme-relative `http:` address; without it, any redirect is followed.
 #[test]
 fn an_https_only_redirect_to_plain_http_is_refused() {
-    let from = url::Url::parse("https://github.com/o/r/releases/download/v1/a.tar.gz").unwrap();
+    let from = blaze_url::Url::parse("https://github.com/o/r/releases/download/v1/a.tar.gz").unwrap();
     let to = |location: &str, https_only: bool| {
-        redirect_to(&from, location, https_only).map(String::from)
+        redirect_to(&from, location, https_only).map(|it| it.as_str().to_owned())
     };
+    // A relative path is not followed; a user part is refused like any address naming one.
+    assert!(matches!(to("b", true), Err(Kind::Url(_))));
+    assert!(matches!(to("https://u:p@objects.example/a", true), Err(Kind::Url(_))));
+    assert_eq!(to("//objects.example/a", true), Ok("https://objects.example/a".to_owned()));
     assert_eq!(
         to("https://objects.example/a?sig=1", true),
         Ok("https://objects.example/a?sig=1".to_owned())
@@ -321,7 +325,7 @@ fn a_malformed_answer_fails_naming_the_host_and_step() {
     assert!(matches!(&error.kind, Kind::Io { step: Step::Head, .. }), "{error:?}");
     let said = error.to_string();
     assert!(
-        said.starts_with("reading the answer's head from example.test:80: not an HTTP/1 answer"),
+        said.starts_with("reading the answer's head from example.test:80: blaze_h1:") && said.contains("status line"),
         "{said}"
     );
     assert!(!said.contains("/a"), "the message names no path: {said}");
@@ -339,9 +343,9 @@ fn a_malformed_answer_fails_naming_the_host_and_step() {
 #[test]
 fn gzip_is_decoded_where_asked_and_bodies_are_held_to_their_bound() {
     let plain = b"hello ".repeat(100);
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
-    encoder.write_all(&plain).unwrap();
-    let zipped = encoder.finish().unwrap();
+    let mut zipped = blaze_own::Vec::new_in(std::alloc::Global);
+    blaze_deflate::gzip(&plain, blaze_deflate::Level::Default, std::alloc::Global, &mut zipped).unwrap();
+    let zipped = zipped.as_slice().to_vec();
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
         zipped.len()
@@ -403,16 +407,28 @@ fn a_slow_asker_holds_the_transfer_back() {
 /// The answer's events, and what the server read, for `url` asked of an in-memory rustls server
 /// holding a self-signed certificate for `localhost` that the client trusts as its one root.
 fn tls_exchange(url: &str) -> (Vec<Event>, Vec<u8>) {
+    tls_exchange_trusting(url, true)
+}
+
+/// A self-signed certificate for `localhost` and its key.
+fn throwaway_root() -> (rcgen::KeyPair, rustls::pki_types::CertificateDer<'static>) {
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
     let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
         .unwrap()
         .self_signed(&key)
         .unwrap();
     let der = cert.der().clone();
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(der.clone()).unwrap();
+    (key, der)
+}
+
+/// [`tls_exchange`], the client's one root given as DER ([`crate::roots::with_der`]): the
+/// server's own when `trusted`, else another throwaway root.
+fn tls_exchange_trusting(url: &str, trusted: bool) -> (Vec<Event>, Vec<u8>) {
+    let (key, der) = throwaway_root();
+    let other = throwaway_root().1;
+    let root: &[u8] = if trusted { &der } else { &other };
     let mut client =
-        Client::new(Config::new(crate::roots::with_roots(roots).unwrap(), "blaze-test", TIMEOUT));
+        Client::new(Config::new(crate::roots::with_der([root].into_iter()).unwrap(), "blaze-test", TIMEOUT));
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -483,7 +499,7 @@ fn tls_exchange(url: &str) -> (Vec<Event>, Vec<u8>) {
 fn tls_is_spoken_through_rustls_sans_io() {
     let (got, asked) = tls_exchange("https://localhost/secret");
     assert!(
-        asked.starts_with(b"GET /secret HTTP/1.1\r\nhost: localhost\r\n"),
+        asked.starts_with(b"GET /secret HTTP/1.1\r\nHost: localhost\r\n"),
         "{}",
         String::from_utf8_lossy(&asked)
     );
@@ -496,6 +512,24 @@ fn tls_is_spoken_through_rustls_sans_io() {
     };
     assert_eq!(host, "other.test");
     assert!(why.contains("certificate"), "{why}");
+}
+
+/// Roots given as DER are the only ones trusted: a server whose root is given is spoken to;
+/// one whose root is not fails in the TLS step with a certificate error. No root at all is
+/// refused before any connection.
+#[test]
+fn only_the_roots_given_are_trusted() {
+    let (got, _) = tls_exchange_trusting("https://localhost/secret", true);
+    assert_eq!(answer(&got), (200, b"secret".to_vec(), true));
+    let (got, _) = tls_exchange_trusting("https://localhost/secret", false);
+    let error = failed(&got);
+    let Kind::Io { step: Step::Tls, why, .. } = &error.kind else { panic!("{error:?}") };
+    assert!(why.contains("certificate"), "{why}");
+    assert!(matches!(crate::roots::with_der(std::iter::empty()), Err(crate::roots::TlsSetup::NoRoots)));
+    assert!(matches!(
+        crate::roots::with_der([&b"not a certificate"[..]].into_iter()),
+        Err(crate::roots::TlsSetup::BadRoot { at: 0, .. })
+    ));
 }
 
 /// A client whose connections go through `proxies`; its TLS has no roots, and no test of it
@@ -530,18 +564,40 @@ fn connected(client: &mut Client, host: &str, port: u16) -> ConnId {
 fn an_http_origin_through_an_http_proxy_is_asked_in_absolute_form() {
     let through = proxy(ProxyKind::Http, "proxy.test", 3128, Some(("u", "p")));
     let mut client = proxied(Proxies { http: Some(through), ..Proxies::none() });
-    client.request(RequestId(1), Request::get("http://user:secret@example.test/a?x=1")).unwrap();
+    client.request(RequestId(1), Request::get("http://example.test/a?x=1#frag")).unwrap();
     let conn = connected(&mut client, "proxy.test", 3128);
     let written = String::from_utf8(sent(&mut client, conn)).unwrap();
     assert!(
         written.starts_with(
-            "GET http://example.test/a?x=1 HTTP/1.1\r\nhost: example.test\r\nproxy-authorization: Basic dTpw\r\n"
+            "GET http://example.test/a?x=1 HTTP/1.1\r\nHost: example.test\r\nproxy-authorization: Basic dTpw\r\n"
         ),
         "{written}"
     );
-    assert!(!written.contains("secret"), "{written}");
     received(&mut client, conn, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     assert_eq!(answer(&events(&mut client)), (200, b"ok".to_vec(), true));
+}
+
+/// An address the client does not ask fails at once, before any IO, by name: a user part
+/// (never quoted: it may hold a password), a backslash, a non-ASCII host or path, a scheme
+/// other than http and https, and plain http where HTTPS only is asked.
+#[test]
+fn an_address_the_client_does_not_ask_fails_by_name_before_any_io() {
+    let mut client = client();
+    let refused = |client: &mut Client, request: Request| {
+        client.request(RequestId(1), request).unwrap();
+        let got = events(client);
+        assert!(ios(client).is_empty(), "no IO for a refused address");
+        failed(&got).clone()
+    };
+    let error = refused(&mut client, Request::get("https://user:hunter2@example.test/a"));
+    assert!(matches!(error.kind, Kind::Url(_)), "{error:?}");
+    assert!(!error.to_string().contains("hunter2"), "{error}");
+    for url in ["https://example.test\\@evil.test/", "https://bücher.test/", "https://example.test/ä", "ftp://example.test/"] {
+        let error = refused(&mut client, Request::get(url));
+        assert!(matches!(error.kind, Kind::Url(_)), "{url}: {error:?}");
+    }
+    let error = refused(&mut client, Request { https_only: true, ..Request::get("http://example.test/a") });
+    assert_eq!(error.kind, Kind::NotHttps);
 }
 
 /// An `https` origin through an HTTP proxy tunnels through `CONNECT`, its TLS starting only
@@ -599,7 +655,7 @@ fn socks5_opens_a_tunnel_by_name_or_by_address() {
     asked.extend_from_slice(&[0, 80]);
     assert_eq!(sent(&mut client, conn), asked);
     received(&mut client, conn, &[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
-    assert!(sent(&mut client, conn).starts_with(b"GET /a HTTP/1.1\r\nhost: example.test\r\n"));
+    assert!(sent(&mut client, conn).starts_with(b"GET /a HTTP/1.1\r\nHost: example.test\r\n"));
     received(&mut client, conn, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     assert_eq!(answer(&events(&mut client)), (200, b"ok".to_vec(), true));
 

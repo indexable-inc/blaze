@@ -1,0 +1,14 @@
+{
+ "id": "ladder-build-1",
+ "date": "2026-11-15",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane blaze-build under the ladder lead",
+ "where": "crates/blaze-build (blaze-typeck body + Checked record to blaze-lir)",
+ "what": "The body form holds no literal values, so `blaze_build::Adts` grew `int_lit`, `int_pat` and `byte_str` (default: none, refused as NoLiteralValue); blaze-typeck's ToyWorld and BodyView accessors are pub(crate), so every consumer's tests rewrite a World and a body buffer by hand; the shared cargo lock held the lane for long stretches behind other lanes' tests.",
+ "cost": "about half an hour of waiting on the lock; a test World of ~120 lines duplicated from typeck's",
+ "cause": "the body form and its test helpers were shaped for the checker alone",
+ "whys": "typeck needs a literal's kind only; a builder needs its value; test worlds were never exported",
+ "class": "a record shaped for one consumer forces its second consumer to carry a parallel column",
+ "prevention": "open: a literal-value column in the body form read by blaze-build; export a test World from blaze-typeck's `toy` feature",
+ "workaround": "Adts::int_lit/int_pat/byte_str in blaze-build; TestWorld in crates/blaze-build/src/tests.rs",
+ "state": "open"
+}

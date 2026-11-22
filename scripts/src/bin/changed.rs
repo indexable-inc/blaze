@@ -6,8 +6,8 @@
 //!     blaze run -q -p scripts --bin changed -- '{"base": "origin/main"}'
 //!     blaze run -q -p scripts --bin changed -- selftest
 //!
-//! Where this differed from the Python: a manifest that is not TOML is refused in the toml
-//! crate's words, not tomllib's.
+//! Where this differed from the Python: a manifest that is not TOML is refused in blaze-toml's
+//! words (its path, line, column and what), not tomllib's.
 
 /// What the usage error prints: harness/v2/changed.py's docstring, with this script's commands.
 const DOC: &str = r#"changed.py: the packages a change touches and the packages that depend on them, in the order
@@ -67,7 +67,7 @@ use serde_json::json;
 
 const SCRIPT: &str = "changed.py";
 /// What every package's check reads besides its own files.
-const EVERYTHING: [&str; 6] = ["Cargo.toml", "Cargo.lock", ".clippy.toml", ".rustfmt.toml", "harness/toolchain", ".cargo/"];
+const EVERYTHING: [&str; 6] = ["Cargo.toml", "Cargo.lock", ".clippy.toml", ".rustfmt.toml", "pins/", ".cargo/"];
 const TABLES: [&str; 3] = ["dependencies", "build-dependencies", "dev-dependencies"];
 
 struct Args {
@@ -105,13 +105,13 @@ struct Package {
 /// Every dependency table of a manifest with its kind: its own and each `[target.*]`'s.
 fn tables(manifest: &Table) -> Vec<(&'static str, &Table)> {
     let mut holders = vec![manifest];
-    if let Some(Toml::Table(targets)) = manifest.get("target") {
-        holders.extend(targets.values().filter_map(Toml::as_table));
+    if let Some(Toml::Map(targets)) = manifest.get("target") {
+        holders.extend(targets.iter().map(|(_, it)| it).filter_map(Toml::as_map));
     }
     let mut out = Vec::new();
     for holder in holders {
         for kind in TABLES {
-            if let Some(Toml::Table(table)) = holder.get(kind) {
+            if let Some(Toml::Map(table)) = holder.get(kind) {
                 out.push((kind, table));
             }
         }
@@ -122,11 +122,11 @@ fn tables(manifest: &Table) -> Vec<(&'static str, &Table)> {
 fn read_toml(path: &Path) -> Result<Table, String> {
     let shown = path.display().to_string();
     let text = std::fs::read_to_string(path).map_err(|e| os_error(&e, &shown))?;
-    blaze_script::toml::from_str::<Table>(&text).map_err(|e| e.to_string().trim_end().to_owned())
+    blaze_script::toml::parse(&text).map_err(|e| format!("{shown}: {}", e.display(&text)))
 }
 
 fn strs(value: Option<&Toml>) -> Vec<&str> {
-    value.and_then(Toml::as_array).map(|items| items.iter().filter_map(Toml::as_str).collect()).unwrap_or_default()
+    value.and_then(Toml::as_list).map(|items| items.iter().filter_map(Toml::as_str).collect()).unwrap_or_default()
 }
 
 /// The member the dependency `key = spec` of the member in `directory` is, if it is one.
@@ -137,7 +137,7 @@ fn member<'f>(
     key: &str,
     spec: Option<&Toml>,
 ) -> Option<&'f str> {
-    let spec = spec?.as_table()?;
+    let spec = spec?.as_map()?;
     if spec.get("workspace").and_then(Toml::as_bool) == Some(true) {
         return member(found, shared, "", key, shared.and_then(|it| it.get(key)));
     }
@@ -152,7 +152,7 @@ fn member<'f>(
 fn workspace(root: &Path) -> Result<Vec<Package>, String> {
     let top = read_toml(&root.join("Cargo.toml"))?;
     let ws = match top.get("workspace") {
-        Some(Toml::Table(ws)) if !ws.is_empty() => ws,
+        Some(Toml::Map(ws)) if !ws.is_empty() => ws,
         _ => return Err(format!("{} has no [workspace]", root.join("Cargo.toml").display())),
     };
     let root_s = root.to_string_lossy().into_owned();
@@ -178,12 +178,12 @@ fn workspace(root: &Path) -> Result<Vec<Package>, String> {
             }
         }
     }
-    let shared = ws.get("dependencies").and_then(Toml::as_table);
+    let shared = ws.get("dependencies").and_then(Toml::as_map);
     let mut out: Vec<Package> = Vec::new();
     for (directory, (name, toml)) in &found {
         let (mut needs, mut dev) = (BTreeSet::new(), BTreeSet::new());
         for (kind, table) in tables(toml) {
-            for (key, spec) in table {
+            for (key, spec) in table.iter() {
                 if let Some(it) = member(&found, shared, directory, key, Some(spec))
                     && it != name
                 {
@@ -443,7 +443,7 @@ fn selftest() {
     // (`hash`, which `ids` needs, depends on a changed package only to test itself, and goes first).
     let found = affected_or_fail(
         &packages,
-        &["crates/ids/src/keyed.rs", "crates/link/src/lib.rs", "crates/codegen/src/delta.rs", "docs/lints.md"],
+        &["crates/ids/src/keyed.rs", "crates/link/src/lib.rs", "crates/codegen/src/delta.rs", "docs/cargo.md"],
         true,
     );
     expect(
@@ -475,7 +475,7 @@ fn selftest() {
         affected_or_fail(&packages, &["tools/lint/cli/src/main.rs"], true).order == ["lint-cli"],
         "a member outside crates/",
     );
-    for file in ["Cargo.lock", ".clippy.toml", "harness/toolchain", ".cargo/config.toml"] {
+    for file in ["Cargo.lock", ".clippy.toml", "pins/toolchain", ".cargo/config.toml"] {
         let whole = affected_or_fail(&packages, &[file, "crates/lone/src/lib.rs"], true);
         expect(
             whole.all

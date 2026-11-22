@@ -13,32 +13,43 @@ repository.workspace = true
 [lib]
 doctest = false
 
+# The forms of crates from outside the workspace, each an adapter the crates above turn on (the
+# root manifest's `blaze-ids` entry): with none on, this crate depends only on workspace crates
+# that depend on no crate from outside it (docs/v2/plan/design/bottom.md, "Also decided on
+# 2026-11-15").
+[features]
+# serde's forms of `ContentId`, `Fingerprint` and `Bits`.
+serde = ["dep:serde"]
+
 [dependencies]
-blaze-core.workspace = true
-blake3.workspace = true
+# By path, not `.workspace`: the workspace entries turn on the adapter features the crates above
+# need, which a member's entry cannot turn off, so this crate's own graph would hold them.
+blaze-blake3.workspace = true
+# The IDs' `ToValue`/`FromValue` (src/data.rs); on blaze-own alone.
+blaze-data.workspace = true
+blaze-own.workspace = true
 blaze-hash.workspace = true
+# D169's meter: bytes hashed and digests made, on the thread that hashed them.
+blaze-meter.workspace = true
 blaze-radix.workspace = true
 blaze-rng.workspace = true
-blaze-mem.workspace = true
-blaze-serde.workspace = true
-serde = { workspace = true, features = ["derive"] }
-smallvec.workspace = true
-thin-vec.workspace = true
+blaze-swiss.workspace = true
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+# Frame-held words in the bit-set tests.
+blaze-mem.workspace = true
 blaze-sim.workspace = true
+# The reference the BLAKE3 tests and the bench hold blaze's to.
+blake3.workspace = true
 postcard.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(blaze_check)'.dependencies]
 blaze-check.workspace = true
 
-# The targets blake3-servil's build script builds for (`src/b3.rs` chooses the same).
-[target.'cfg(all(target_endian = "little", any(all(target_arch = "x86_64", target_os = "linux"), all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")))))'.dependencies]
-blake3-servil.workspace = true
-
-# blake3-servil against official BLAKE3 on blaze's shapes; prints both, run by hand.
+# blaze-blake3 against official BLAKE3 on blaze's shapes; prints both, run by hand.
 [[bench]]
 name = "blake3"
 harness = false

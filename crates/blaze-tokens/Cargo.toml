@@ -1,0 +1,43 @@
+[package]
+name = "blaze-tokens"
+description = "An expansion's token record (docs/v2/plan/design/drive.md, D122 \"An expansion is its token record\"): per token the parser's word, a joined flag, its lexeme by index into the record's own table, its hygiene context and its origin; token ranges, one token digest and one rendering for a person; written once, read in place, and handed to the parser with no lexer"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# Below every reader (blaze-file-items, blaze-lower, blaze-scope, blaze-ladder) and the one writer
+# (blaze-expand): it names only the crates that define what a token record holds.
+[dependencies]
+# `word`, `word_kind`, `token_word`, `JOINT`, `FRAGMENT`, `SyntaxKind`, `Tokens`, `Input`: a token's
+# kind is the parser's word, handed to it as it is.
+parser.workspace = true
+# `record!`, `Writer`, `Own`, `Placed`, `Slice`, `open_as`: the record, on `core` alone. By path,
+# as blaze-lower and blaze-body name it.
+blaze-format-core.workspace = true
+# `ContentId`, `Hasher`: the token digest, in its own domain. By path: the workspace entry turns
+# on its serde adapter.
+blaze-ids.workspace = true
+# `CrateItemKey`, `ItemKey`: a mark's definition site.
+blaze-id.workspace = true
+# `DefSite`, `Transparency`, `Edition`: a mark's words, defined once there.
+blaze-surface.workspace = true
+# `Vec`, `Alloc`: the builder's columns and the record's bytes, in the allocator its caller names.
+blaze-own.workspace = true
+# `HashMap`, `FixedState`: the builder's table from a lexeme's hash to its number. By path: the
+# workspace entry turns on serde and the shared tables.
+blaze-hash.workspace = true
+
+[dev-dependencies]
+# `testing::heap()`: the tests' root allocator capability.
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

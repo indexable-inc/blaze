@@ -8,7 +8,8 @@
 //! 2. After a crash, a path whose last change was synced (`Durable::Yes`) holds exactly that
 //!    change.
 //! 3. After a crash, a path changed unsynced since holds what was last synced, or one of
-//!    those unsynced changes cut short (a prefix of its bytes; nothing, for a remove): never
+//!    those unsynced changes torn (each sector of its bytes landed or a hole, the length any
+//!    up to its own; nothing, for a remove): never
 //!    anything else.
 //! 4. A clone of a [`Flushed`] forces no writeback: no act of this test adds to
 //!    `forced_writeback`, since the types leave no way to clone a file that is not flushed.
@@ -140,7 +141,8 @@ impl Slot {
         }
         self.since.iter().any(|change| match (change, got) {
             (None, None) => true,
-            (Some(content), Some(got)) => content.starts_with(got),
+            // A new file's bytes torn by sectors: each landed or a hole, never another byte.
+            (Some(content), Some(got)) => blaze_core::sim::appended_and_torn(&[], content, got),
             _ => false,
         })
     }

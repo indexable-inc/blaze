@@ -33,16 +33,12 @@ use std::{
     },
 };
 
-use arrow_array::{
-    Array, RecordBatch,
-    cast::AsArray,
-    types::{UInt32Type, UInt64Type},
-};
 use blaze_graph::wait::{OwnedBy, WaitKind};
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use std::alloc::Global;
 
 use crate::{
+    columns::Batch,
     flight::{self, SpanRow, names::Token},
     schema::{self, Type},
 };
@@ -84,7 +80,8 @@ impl Eq for Name {}
 thread_local! {
     /// The names [`Name::kept`] gave on this thread, by the address and length of their text.
     // alloc: once per thread, grown to the kept names it opens spans of
-    static KEPT: RefCell<HashMap<(usize, usize), Name, Global>> = RefCell::new(HashMap::new_in(Global));
+    static KEPT: RefCell<Map<(usize, usize), Name, FixedState, Global>> =
+        RefCell::new(Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }));
 }
 
 impl Name {
@@ -452,32 +449,18 @@ pub trait Span: Fields {
     fn site() -> Option<u16>;
 }
 
-/// The callsite of a kind: what its `tracing` metadata names, so a kind's site is one of the
-/// recorder's as any span's is ([`flight::register`]). No subscriber ever sees it.
-pub struct KindCallsite(pub &'static tracing::Metadata<'static>);
-
-impl tracing::callsite::Callsite for KindCallsite {
-    fn set_interest(&self, _: tracing::subscriber::Interest) {}
-
-    fn metadata(&self) -> &tracing::Metadata<'_> {
-        self.0
-    }
-}
-
-/// The metadata of the kind `name`: target `blaze`, info, no fields.
-pub const fn kind_meta(
-    name: &'static str,
-    callsite: &'static KindCallsite,
-) -> tracing::Metadata<'static> {
-    tracing::Metadata::new(
+/// The site of the kind `name`: target `blaze`, info, no fields, so a kind's site is one of
+/// the recorder's as any span's is ([`flight::register`]). No sink ever sees it.
+pub const fn kind_meta(name: &'static str) -> blaze_trace::Metadata<'static> {
+    blaze_trace::Metadata::new(
         name,
         "blaze",
-        tracing::Level::INFO,
+        blaze_trace::Level::INFO,
         Some(file!()),
         Some(line!()),
         Some(module_path!()),
-        tracing::field::FieldSet::new(&[], tracing::callsite::Identifier(callsite)),
-        tracing::metadata::Kind::SPAN,
+        blaze_trace::field::FieldSet::new(&[]),
+        blaze_trace::Kind::SPAN,
     )
 }
 
@@ -492,7 +475,7 @@ impl SiteOnce {
     }
 
     #[inline]
-    pub fn get(&self, meta: &'static tracing::Metadata<'static>) -> Option<u16> {
+    pub fn get(&self, meta: &'static blaze_trace::Metadata<'static>) -> Option<u16> {
         match self.0.load(Ordering::Relaxed) {
             0 => self.register(meta),
             REFUSED => None,
@@ -501,7 +484,7 @@ impl SiteOnce {
     }
 
     #[cold]
-    fn register(&self, meta: &'static tracing::Metadata<'static>) -> Option<u16> {
+    fn register(&self, meta: &'static blaze_trace::Metadata<'static>) -> Option<u16> {
         let site = flight::register(meta);
         self.0.store(site.map_or(REFUSED, u32::from), Ordering::Relaxed);
         site
@@ -673,7 +656,7 @@ fn typed<K: Span>(said: &Said, span_id: u64) -> Result<Typed<K>, KindError> {
 /// The spans of kind `K` in `batch`, a batch of the `spans` table as `batches.rs` writes it
 /// and the Parquet history keeps it, in order. Names are interned in this process as they are
 /// read.
-pub fn read_batch<K: Span>(batch: &RecordBatch) -> Result<Vec<Typed<K>>, KindError> {
+pub fn read_batch<K: Span>(batch: &Batch) -> Result<Vec<Typed<K>>, KindError> {
     let missing = |column: &'static str| KindError::Column {
         kind: K::NAME,
         column,
@@ -681,7 +664,7 @@ pub fn read_batch<K: Span>(batch: &RecordBatch) -> Result<Vec<Typed<K>>, KindErr
     };
     let names = batch.column_by_name("name").ok_or(missing("name"))?;
     let ids = batch.column_by_name("span_id").ok_or(missing("span_id"))?;
-    let ids = ids.as_primitive_opt::<UInt64Type>().ok_or(KindError::Column {
+    let ids = ids.u64s().ok_or(KindError::Column {
         kind: K::NAME,
         column: "span_id",
         why: "is not UInt64",
@@ -690,46 +673,33 @@ pub fn read_batch<K: Span>(batch: &RecordBatch) -> Result<Vec<Typed<K>>, KindErr
     let mut columns = Vec::with_capacity(CELLS.len());
     for cells in &CELLS {
         let column = batch.column_by_name(cells.column.name).ok_or(missing(cells.column.name))?;
-        columns.push((cells, column.as_ref()));
+        columns.push((cells, column));
     }
     // alloc: the spans read, once a read
     let mut out = Vec::new();
     for row in 0..batch.num_rows() {
-        if text_at(names.as_ref(), row) != Some(K::NAME) {
+        if names.text(row) != Some(K::NAME) {
             continue;
         }
         let mut said = Said::EMPTY;
         for &(cells, column) in &columns {
             let word = if cells.column.ty == Type::U64 {
-                let Some(numbers) = column.as_primitive_opt::<UInt64Type>() else {
+                let Some(numbers) = column.u64s() else {
                     return Err(KindError::Column {
                         kind: K::NAME,
                         column: cells.column.name,
                         why: "is not UInt64",
                     });
                 };
-                if numbers.is_valid(row) { numbers.value(row).saturating_add(1) } else { 0 }
+                numbers.get(row).map_or(0, |it| it.saturating_add(1))
             } else {
-                text_at(column, row).map_or(0, cells.of_text)
+                column.text(row).map_or(0, cells.of_text)
             };
             said.set(cells.at, word);
         }
         out.push(typed::<K>(&said, ids.value(row))?);
     }
     Ok(out)
-}
-
-/// The text of a `Dict` or `Utf8` cell; `None` when null or neither.
-fn text_at(column: &dyn Array, row: usize) -> Option<&str> {
-    if !column.is_valid(row) {
-        return None;
-    }
-    if let Some(dict) = column.as_dictionary_opt::<UInt32Type>() {
-        let key = usize::try_from(dict.keys().value(row)).ok()?;
-        let values = dict.values().as_string_opt::<i32>()?;
-        return (key < values.len()).then(|| values.value(key));
-    }
-    column.as_string_opt::<i32>().map(|it| it.value(row))
 }
 
 /// A kind as its SQL view shows it: its name and each field with the column it fills.
@@ -900,8 +870,7 @@ macro_rules! span_kinds {
 
     (@site $kname:literal) => {
         fn site() -> Option<u16> {
-            static CALLSITE: KindCallsite = KindCallsite(&META);
-            static META: tracing::Metadata<'static> = kind_meta($kname, &CALLSITE);
+            static META: blaze_trace::Metadata<'static> = kind_meta($kname);
             static SITE: SiteOnce = SiteOnce::new();
             SITE.get(&META)
         }
@@ -952,7 +921,7 @@ span_kinds! {
         Crate = "crate" (Dict) fields "crate" | "krate",
             "the crate it was of: a kind's `krate`, or an ad hoc span's field `crate`; a front-end span's names one build of it, `serde v1.0.219 (lib)`, `(lib-test)` for its `cfg(test)` copy, `(lib, wasm)` for the proc macros' wasm copy";
         Function = "function" (Utf8) fields "function" | "subject",
-            "the function it was of: a `macro expand`'s macro path, what a `wait` awaits, what a `hold` holds, or an ad hoc span's field `function` or `subject`";
+            "the function it was of: a `macro expand`'s macro path, what a `wait` awaits, what a `hold` holds, or an ad hoc span's field `function` or `subject` (a macro file as its calls and source, `{macro call 3fa2.5 in macro call 77e1.3 in src/num/mod.rs}`, never a dump of its ids)";
         Unit = "unit" (Utf8) fields "unit" | "cgu",
             "the unit it was of: a unit phase's package, version and target (`serde v1.0.219 (build script)`), or an ad hoc span's field `unit` (a codegen unit)";
     }
@@ -1225,9 +1194,11 @@ mod tests {
             Process { pid: 1, name: "span kinds test", commit: None },
         )
         .unwrap();
-        let at = batch.schema().index_of("waits_on").unwrap();
-        let mut older = batch.clone();
-        older.remove_column(at);
+        let at = batch.index_of("waits_on").unwrap();
+        let (mut fields, mut columns) = batch.into_parts();
+        fields.remove(at);
+        columns.remove(at);
+        let older = Batch::try_new(fields, columns).unwrap();
         assert_eq!(
             read_batch::<Wait>(&older),
             Err(KindError::Column { kind: "wait", column: "waits_on", why: "is not in the batch" })
@@ -1264,7 +1235,7 @@ mod tests {
         let tid = std::thread::spawn(|| {
             let what: &'static str = "its outputs, being placed";
             let held = Some((
-                tracing::info_span!(target: "blaze", "span kinds held, never entered", function = what, awaits = what),
+                blaze_trace::info_span!(target: "blaze", "span kinds held, never entered", function = what, awaits = what),
                 what,
             ));
             // Something else of the thread's between its start and its close.
@@ -1287,8 +1258,8 @@ mod tests {
             batches::spans(&rows, Process { pid: 1, name: "span kinds test", commit: None })
                 .unwrap();
         let cell = |column: &str| {
-            let column = batch.column(schema::SPANS.column(column).unwrap()).as_string::<i32>();
-            column.is_valid(at).then(|| column.value(at).to_owned())
+            let column = batch.column(schema::SPANS.column(column).unwrap());
+            column.text(at).map(str::to_owned)
         };
         assert_eq!(cell("function").as_deref(), what, "the `function` column");
         assert_eq!(cell("awaits").as_deref(), what, "the `awaits` column");
@@ -1304,19 +1275,19 @@ mod tests {
         const NAME: &str = "span kinds with fields of no column";
         crate::install();
         let tid = std::thread::spawn(|| {
-            let span = tracing::info_span!(
+            let span = blaze_trace::info_span!(
                 target: "blaze",
                 "span kinds with fields of no column",
                 function = "place outputs",
                 what = "the image",
                 runs = 3,
-                why = tracing::field::Empty,
+                why = blaze_trace::field::Empty,
             );
             span.record("why", "memory is short");
             // Long enough for a row of its own: a span under `flight::FOLD_BELOW` is summed.
             std::thread::sleep(Duration::from_millis(2));
             drop(span);
-            let plain = tracing::info_span!(target: "blaze", "span kinds with no field");
+            let plain = blaze_trace::info_span!(target: "blaze", "span kinds with no field");
             std::thread::sleep(Duration::from_millis(2));
             drop(plain);
             crate::sampler::os_tid() as u32
@@ -1343,7 +1314,7 @@ mod tests {
                 .unwrap();
         let at = rows.iter().position(|it| std::ptr::eq(it, said)).unwrap();
         let fields = batch.column_by_name("fields").expect("`fields` is a column of `spans`");
-        assert_eq!(text_at(fields.as_ref(), at), Some("what=the image runs=3 why=memory is short"));
+        assert_eq!(fields.text(at), Some("what=the image runs=3 why=memory is short"));
     }
 
     /// [`ad_hoc_fields`], the list `blaze::span_field_unrecorded` holds a span's fields to, is

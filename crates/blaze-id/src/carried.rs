@@ -2,7 +2,7 @@
 
 use core::{alloc::Allocator, fmt, hash::Hash};
 
-use blaze_hash::{HashMap, hash_map};
+use blaze_hash::{FixedState, Map, MapOpts, hash_map};
 
 use crate::Portable;
 
@@ -10,23 +10,23 @@ use crate::Portable;
 /// that can only be keyed by a [`Portable`] key, so it never holds an id of a dead arena. An
 /// item is its [`crate::ItemKey`] here, never its interned id.
 ///
-/// It is the workspace's single-owner map (`blaze_hash::HashMap`, AGENTS.md rule 12) in the
+/// It is the workspace's single-owner map (`blaze_hash::Map` on `FixedState`, AGENTS.md rule 12) in the
 /// allocator `A`, which the maker names (rule 11): `Global` for a table that lives as long as
 /// the process's database, a request's or a session's allocator for a shorter one. Shared
 /// between threads, it sits behind a `blaze_core::lock::Lock` as any single-owner map does.
 pub struct Carried<K: Portable, V, A: Allocator + Clone> {
-    map: HashMap<K, V, A>,
+    map: Map<K, V, FixedState, A>,
 }
 
 impl<K: Portable + Eq + Hash, V, A: Allocator + Clone> Carried<K, V, A> {
     /// An empty table in `alloc`. It allocates nothing until its first insert.
     pub fn new_in(alloc: A) -> Carried<K, V, A> {
-        Carried { map: HashMap::new_in(alloc) }
+        Carried { map: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }) }
     }
 
     /// An empty table in `alloc` with room for `capacity` entries.
     pub fn with_capacity_in(capacity: usize, alloc: A) -> Carried<K, V, A> {
-        Carried { map: HashMap::with_capacity_in(capacity, alloc) }
+        Carried { map: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: Some(capacity) }) }
     }
 
     /// Puts `value` under `key`, giving back the value it held before, if any.

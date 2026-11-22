@@ -25,7 +25,7 @@ fn example() -> Report {
                 .words(" (")
                 .hash("e152d9fa3c71b2d4")
                 .words("), pinned in ")
-                .path("/w/crates/hir-ty-codegen/llvm.json"),
+                .path("/w/crates/blaze-toolchain/pins/llvm.json"),
         )
         .fact("found", Text::new().var("LLVM_SYS_231_PREFIX").words(" is not set"))
         .blocks(Blocks {
@@ -47,7 +47,7 @@ fn example_piped() {
     let expected = "\
 error: llvm-sys can't find LLVM  [llvm: pin]
   ┌ build script of llvm-sys 231.0.1  (vendor/llvm-sys/build.rs)
-  │ needs LLVM 23.1.4 (e152d9fa), pinned in crates/hir-ty-codegen/llvm.json
+  │ needs LLVM 23.1.4 (e152d9fa), pinned in crates/blaze-toolchain/pins/llvm.json
   │ `LLVM_SYS_231_PREFIX` is not set
   └ blocks 247 packages, including blaze-engine
 
@@ -68,7 +68,7 @@ error: llvm-sys can't find LLVM  [llvm: pin]
   ┌ build script of llvm-sys 231.0.1
   │ (vendor/llvm-sys/build.rs)
   │ needs LLVM 23.1.4 (e152d9fa), pinned in
-  │ crates/hir-ty-codegen/llvm.json
+  │ crates/blaze-toolchain/pins/llvm.json
   │ `LLVM_SYS_231_PREFIX` is not set
   └ blocks 247 packages, including blaze-engine
 
@@ -89,7 +89,7 @@ fn example_as_json() {
         r#"{"Plain":"  ("},{"Path":"/w/vendor/llvm-sys/build.rs"},{"Plain":")"}],"#,
         r#""log":"/home/u/.cache/blaze/workers/67e8ace3/log","rule":"llvm:pin","#,
         r#""facts":[{"key":"needs","text":[{"Plain":"needs LLVM "},{"Version":"23.1.4"},{"Plain":" ("},"#,
-        r#"{"Hash":"e152d9fa3c71b2d4"},{"Plain":"), pinned in "},{"Path":"/w/crates/hir-ty-codegen/llvm.json"}]},"#,
+        r#"{"Hash":"e152d9fa3c71b2d4"},{"Plain":"), pinned in "},{"Path":"/w/crates/blaze-toolchain/pins/llvm.json"}]},"#,
         r#"{"key":"found","text":[{"Var":"LLVM_SYS_231_PREFIX"},{"Plain":" is not set"}]}],"#,
         r#""fixes":[{"note":null,"lines":["nix develop"]},{"note":null,"lines":["#,
         r#""python3 .github/scripts/llvm.py '{\"command\": \"fetch\", \"target\": \"aarch64-apple-darwin\", \"dir\": \"~/.blaze/llvm\"}'","#,
@@ -332,7 +332,71 @@ fn config() {
     assert_eq!(config.notify, terminal::Notify::Off);
     assert_eq!(config.notify_after_secs, 30);
     assert!(
-        Config::from_toml("[terminal]\ncolor = \"blue\"\n").unwrap_err().contains("terminal.color")
+        Config::from_toml("[terminal]\ncolor = \"blue\"\n")
+            .unwrap_err()
+            .to_string()
+            .contains("terminal.color` (line 2, column 9) takes")
     );
-    assert!(Config::from_toml("[terminal]\nbeep = true\n").unwrap_err().contains("`beep`"));
+    assert!(Config::from_toml("[terminal]\nbeep = true\n").unwrap_err().to_string().contains("`beep`"));
+}
+
+#[test]
+fn ui_formatting_wrapping_notice_group_and_run_history() {
+    use crate::ui::{
+        RunRecord, Theme, fmt_bytes, fmt_count, fmt_delta_pct, fmt_duration_ns, fmt_rate_per_core,
+        render_run_history, visible_width, wrap_words,
+    };
+
+    assert_eq!(fmt_bytes(740_076_616), "705.8 MiB");
+    assert_eq!(fmt_bytes(3_188_185_530), "2.97 GiB");
+    assert_eq!(fmt_count(1_234_567), "1,234,567");
+    assert_eq!(fmt_duration_ns(4_020_000_000), "4.02 s");
+    assert_eq!(fmt_duration_ns(452_000), "452.0 µs");
+    assert_eq!(fmt_rate_per_core(143_100_000, 1_000_000_000, 1), "143.1 MB/s/core (1 cores)");
+    assert_eq!(fmt_delta_pct(4_000_000_000, 200_000_000), "-95.0%");
+
+    // Word wrapping never splits mid-word and respects visible width (ignoring ANSI escapes).
+    let wrapped = wrap_words("alpha beta gamma delta epsilon zeta", 28, "  note  ", "        ");
+    for line in wrapped.lines() {
+        assert!(visible_width(line) <= 28, "line exceeded 28 cols: {line:?}");
+    }
+    assert!(!wrapped.contains("epsil\non"));
+
+    // NoticeGroup collapses multiple stale stores into one scannable block.
+    let block = Theme::PLAIN.notice_group(
+        "note",
+        crate::palette::Token::Warning,
+        "2 old stores (3.68 GiB)",
+        &[("~/.blaze/v2/store", "8 files · 705.8 MiB"), ("~/.blaze/v2/store/f5s3", "239 files · 2.97 GiB")],
+        Some("run `blaze clean` to remove (auto-expires after 30 days)"),
+    );
+    assert!(block.contains("705.8 MiB"));
+    assert!(block.contains("2.97 GiB"));
+    assert!(block.contains("blaze clean"));
+
+    // RunRecord wire round-trip + history trend table.
+    let r1 = RunRecord {
+        run_id: 1,
+        timestamp_unix_s: 1_700_000_000,
+        duration_ns: 4_000_000_000,
+        compiled: 106,
+        cached: 0,
+        peak_rss_bytes: 120 * 1024 * 1024,
+        bytes_processed: 4_000_000,
+        cores: 18,
+    };
+    let r2 = RunRecord {
+        run_id: 2,
+        timestamp_unix_s: 1_700_000_010,
+        duration_ns: 140_000_000,
+        compiled: 1,
+        cached: 105,
+        peak_rss_bytes: 48 * 1024 * 1024,
+        bytes_processed: 4_000_000,
+        cores: 18,
+    };
+    assert_eq!(RunRecord::from_bytes(&r1.to_bytes()), Some(r1));
+    let table = render_run_history(&Theme::PLAIN, &[r1, r2]);
+    assert!(table.contains("-96.5%"));
+    assert!(table.contains("99% (105/106)"));
 }

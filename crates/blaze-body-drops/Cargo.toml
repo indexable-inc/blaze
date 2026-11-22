@@ -1,0 +1,25 @@
+[package]
+name = "blaze-body-drops"
+description = "Drop elaboration over the body (docs/v2/plan/design/backend-next.md, \"One lowering\", D119, rule 3): one body-to-body pass that turns each un-elaborated `Drop` into nothing, a drop, a drop behind a drop flag, or the remaining fields' drops with their unwind ladder, from the move check's answer read through a small seam"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# core only beside the crates it names; the allocator is a value the caller passes in.
+[dependencies]
+# The body read (`Verified`) and the body written (`BodyBuilder`); its `body` module re-exports the
+# checked record's type handles (`PTy`, `Mutbl`), so blaze-typeck is not named here.
+blaze-body.workspace = true
+# `Vec`: the pass's side tables, in the allocator it is given.
+blaze-own.workspace = true
+
+[lints]
+workspace = true

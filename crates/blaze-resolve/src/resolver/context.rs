@@ -1,17 +1,15 @@
 use super::RequestedFeatures;
-use super::dep_cache::{Query, RegistryQueryer};
+use super::dep_cache::RegistryQueryer;
 use super::errors::ActivateResult;
 use super::types::{ActivationsKey, ConflictMap, ConflictReason, FeaturesSet, ResolveOpts};
 use crate::graph::Graph;
 use crate::interning::InternedString;
 use crate::persistent;
-use crate::resolver::HashMap;
-use crate::resolver::HashSet;
+use crate::resolver::{FixedState, Map, Set};
 use crate::{Dependency, PackageId, Registry, Summary};
-use anyhow::format_err;
 use std::alloc::Global;
 use std::collections::BTreeSet;
-use tracing::debug;
+use blaze_trace::debug;
 
 // A `Context` is basically a bunch of local resolution information which is
 // kept around for all `BacktrackFrame` instances. As a result, this runs the
@@ -83,13 +81,7 @@ impl ResolverContext {
                 if let Some(link) = summary.links()
                     && self.links.insert(link, id).is_some()
                 {
-                    return Err(format_err!(
-                        "Attempting to resolve a dependency with more than \
-                             one crate with links={}.\nThis will not build as \
-                             is. Consider rebuilding the .lock file.",
-                        &*link
-                    )
-                    .into());
+                    return Err(crate::ResolveError::LinksTwice { links: link }.into());
                 }
                 v.insert((summary.clone(), age));
 
@@ -170,16 +162,16 @@ impl ResolverContext {
 
     pub(super) fn resolve_replacements(
         &self,
-        registry: &RegistryQueryer<'_, impl Registry, impl Query>,
-    ) -> HashMap<PackageId, PackageId, Global> {
+        registry: &RegistryQueryer<'_, impl Registry>,
+    ) -> Map<PackageId, PackageId, FixedState, Global> {
         self.activations
             .values()
             .filter_map(|(s, _)| registry.used_replacement_for(s.package_id()))
             .collect()
     }
 
-    pub(super) fn graph(&self) -> Graph<PackageId, HashSet<Dependency, Global>> {
-        let mut graph: Graph<PackageId, HashSet<Dependency, Global>> = Graph::new();
+    pub(super) fn graph(&self) -> Graph<PackageId, Set<Dependency, FixedState, Global>> {
+        let mut graph: Graph<PackageId, Set<Dependency, FixedState, Global>> = Graph::new();
         self.activations.values().for_each(|(r, _)| graph.add(r.package_id()));
         for i in self.parents.iter() {
             graph.add(*i);

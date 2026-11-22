@@ -1,0 +1,9 @@
+warning  a bare `as` cast to an integer
+error  `v.len() as u32` can lose bits
+  ╭─ src/pick.rs:2:17
+1 │ fn pick(v: Vec<u8>) -> u8 {
+2 │     let first = v[0] as u32 + v.len() as u32;
+  │                 ^^^^^^^^^^^   ^^^^^^^^^^^^^^
+  │                 │             ╰─ truncates past 4 GiB
+  │                 ╰─ use `u32::from`
+  ╰─ blaze explain lint:casts · blaze explain lint:truncate

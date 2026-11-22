@@ -27,11 +27,11 @@ use crate::flight::{EventRow, FieldRow, FieldValue, Read};
 
 /// Whether an event of `target` named `name` at `level` is kept by the flight recorder (the
 /// module doc's rule).
-pub fn keeps_event(target: &str, name: &str, level: tracing::Level) -> bool {
+pub fn keeps_event(target: &str, name: &str, level: blaze_trace::Level) -> bool {
     match level {
-        tracing::Level::ERROR | tracing::Level::WARN => true,
-        tracing::Level::INFO => crate::keeps(target, name),
-        tracing::Level::DEBUG => blaze_debug(target),
+        blaze_trace::Level::ERROR | blaze_trace::Level::WARN => true,
+        blaze_trace::Level::INFO => crate::keeps(target, name),
+        blaze_trace::Level::DEBUG => blaze_debug(target),
         _ => false,
     }
 }
@@ -39,7 +39,7 @@ pub fn keeps_event(target: &str, name: &str, level: tracing::Level) -> bool {
 /// [`keeps_event`] of the level `tracing` names `level` (`"info"`, `"DEBUG"`, `"3"`): what a
 /// lint reads from a macro's text. False for a name that is no level's.
 pub fn keeps_event_named(target: &str, name: &str, level: &str) -> bool {
-    level.parse::<tracing::Level>().is_ok_and(|level| keeps_event(target, name, level))
+    level.parse::<blaze_trace::Level>().is_ok_and(|level| keeps_event(target, name, level))
 }
 
 /// Whether a DEBUG event of `target` is kept: its target is `blaze` or a path under it
@@ -89,11 +89,22 @@ impl Policy {
 }
 
 /// [`POLICY_VAR`] names no policy.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{var}={value:?} names no history level: it takes `info` (the default) or `debug`", var = POLICY_VAR)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyError {
     pub value: String,
 }
+
+impl std::fmt::Display for PolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{POLICY_VAR}={:?} names no history level: it takes `info` (the default) or `debug`",
+            self.value
+        )
+    }
+}
+
+impl core::error::Error for PolicyError {}
 
 /// DEBUG rows held a build, at most: past it, its oldest go, with their fields.
 pub const HOLD_EVENTS: usize = 1 << 14;
@@ -207,7 +218,7 @@ impl Hold {
         let errors: Vec<u32> = read
             .events
             .iter()
-            .filter(|it| it.build != 0 && level(it.site) == Some(tracing::Level::ERROR))
+            .filter(|it| it.build != 0 && level(it.site) == Some(blaze_trace::Level::ERROR))
             .map(|it| it.build)
             .collect();
         for build in errors {
@@ -217,7 +228,7 @@ impl Hold {
         let held = &mut self.held;
         let (troubled, well) = (&self.troubled, &self.well);
         let fate = |build: u32, site: u16| match level(site) {
-            Some(tracing::Level::DEBUG) => match build {
+            Some(blaze_trace::Level::DEBUG) => match build {
                 0 => Fate::Drop,
                 _ if troubled.contains(&build) => Fate::Write,
                 _ if well.contains(&build) => Fate::Drop,
@@ -307,7 +318,7 @@ fn remember(set: &mut BTreeSet<u32>, build: u32) {
 }
 
 /// The level of the callsite `site`.
-fn level(site: u16) -> Option<tracing::Level> {
+fn level(site: u16) -> Option<blaze_trace::Level> {
     crate::flight::meta(site).map(|it| *it.level())
 }
 
@@ -412,12 +423,12 @@ pub fn fields_text(fields: &[(String, Value)]) -> String {
 mod tests {
     use std::time::Duration;
 
-    use arrow_array::{
-        Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array,
-    };
-
     use super::*;
-    use crate::{batches, flight};
+    use crate::{
+        batches,
+        columns::{Batch, Column},
+        flight,
+    };
 
     /// Reads the rows of the rings a test's thread `tid` wrote in the last minute.
     fn mine(tid: u32) -> Read {
@@ -430,13 +441,8 @@ mod tests {
         read
     }
 
-    fn column<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> &'a T {
-        batch
-            .column_by_name(name)
-            .unwrap_or_else(|| panic!("event_fields has {name}"))
-            .as_any()
-            .downcast_ref::<T>()
-            .unwrap_or_else(|| panic!("{name} is of its schema's type"))
+    fn column<'a>(batch: &'a Batch, name: &str) -> &'a Column {
+        batch.column_by_name(name).unwrap_or_else(|| panic!("event_fields has {name}"))
     }
 
     #[test]
@@ -445,7 +451,7 @@ mod tests {
         let read = std::thread::spawn(|| {
             let tid = crate::sampler::os_tid() as u32;
             let _build = flight::building(0x7a11);
-            tracing::info!(target: "blaze", n = -3i64, count = 7u64, ratio = 0.5, ok = true, label = "x", shown = ?[1, 2], "typed fields");
+            blaze_trace::info!(target: "blaze", n = -3i64, count = 7u64, ratio = 0.5, ok = true, label = "x", shown = ?[1, 2], "typed fields");
             mine(tid)
         })
         .join()
@@ -460,39 +466,32 @@ mod tests {
         assert!(read.fields.iter().all(|it| it.event_id == event.event_id && it.build == 0x7a11));
         let batch = batches::event_fields(&read.fields, batches::Process::this())
             .expect("a batch of event_fields");
-        let keys = strings(batch.column_by_name("key").expect("key").as_ref());
+        let keys = strings(column(&batch, "key"));
         assert_eq!(keys, ["n", "count", "ratio", "ok", "label", "shown"]);
-        let kinds = strings(batch.column_by_name("kind").expect("kind").as_ref());
+        let kinds = strings(column(&batch, "kind"));
         assert_eq!(kinds, ["i64", "u64", "f64", "bool", "str", "str"]);
-        let ints = column::<Int64Array>(&batch, "value_i64");
-        assert_eq!((ints.value(0), ints.null_count()), (-3, 5));
-        let unsigned = column::<UInt64Array>(&batch, "value_u64");
-        assert_eq!((unsigned.value(1), unsigned.null_count()), (7, 5));
-        let floats = column::<Float64Array>(&batch, "value_f64");
-        assert_eq!((floats.value(2), floats.null_count()), (0.5, 5));
-        let bools = column::<BooleanArray>(&batch, "value_bool");
-        assert_eq!((bools.value(3), bools.null_count()), (true, 5));
-        let texts = column::<StringArray>(&batch, "value_str");
-        assert_eq!((texts.value(4), texts.value(5), texts.null_count()), ("x", "[1, 2]", 4));
+        let ints = column(&batch, "value_i64");
+        assert_eq!((ints.i64s().expect("i64s").value(0), ints.null_count()), (-3, 5));
+        let unsigned = column(&batch, "value_u64");
+        assert_eq!((unsigned.u64s().expect("u64s").value(1), unsigned.null_count()), (7, 5));
+        let floats = column(&batch, "value_f64");
+        assert_eq!((floats.f64s().expect("f64s").value(2), floats.null_count()), (0.5, 5));
+        let bools = column(&batch, "value_bool");
+        assert_eq!((bools.bools().expect("bools").value(3), bools.null_count()), (true, 5));
+        let texts = column(&batch, "value_str");
+        assert_eq!((texts.text(4), texts.text(5), texts.null_count()), (Some("x"), Some("[1, 2]"), 4));
         let ordinals: Vec<u16> = read.fields.iter().map(|it| it.ordinal).collect();
         assert_eq!(ordinals, [0, 1, 2, 3, 4, 5]);
         let events =
             batches::events(&read.events, batches::Process::this()).expect("a batch of events");
-        let ids = column::<UInt64Array>(&events, "event_id");
+        let ids = column(&events, "event_id").u64s().expect("u64s");
         assert_eq!(ids.value(0), event.event_id, "events and event_fields name the event alike");
     }
 
     /// A dictionary column's values, row by row.
-    fn strings(array: &dyn Array) -> Vec<String> {
-        let dict = array
-            .as_any()
-            .downcast_ref::<arrow_array::DictionaryArray<arrow_array::types::UInt32Type>>()
-            .expect("a dictionary column");
-        let values = dict.values().as_any().downcast_ref::<StringArray>().expect("of strings");
-        dict.keys()
-            .iter()
-            .map(|key| values.value(key.expect("a key") as usize).to_owned())
-            .collect()
+    fn strings(column: &Column) -> Vec<String> {
+        assert!(column.strs().and_then(|it| it.dict()).is_some(), "a dictionary column");
+        (0..column.len()).map(|row| column.text(row).expect("a key").to_owned()).collect()
     }
 
     #[test]
@@ -503,10 +502,10 @@ mod tests {
             let tid = crate::sampler::os_tid() as u32;
             for build in [ok, failed] {
                 let _build = flight::building(build);
-                tracing::debug!(target: "blaze", step = 1u64, "debug of a build");
-                tracing::info!(target: "blaze", step = 2u64, "info of a build");
+                blaze_trace::debug!(target: "blaze", step = 1u64, "debug of a build");
+                blaze_trace::info!(target: "blaze", step = 2u64, "info of a build");
             }
-            tracing::debug!(target: "blaze_fmt::hot", "a module path's debug is not kept");
+            blaze_trace::debug!(target: "blaze_fmt::hot", "a module path's debug is not kept");
             mine(tid)
         })
         .join()
@@ -524,7 +523,7 @@ mod tests {
         };
         assert_eq!(
             builds(&read),
-            [(ok, Some(tracing::Level::INFO)), (failed, Some(tracing::Level::INFO))],
+            [(ok, Some(blaze_trace::Level::INFO)), (failed, Some(blaze_trace::Level::INFO))],
             "debug rows held"
         );
         assert_eq!(read.fields.len(), 2, "the info events' fields");
@@ -535,7 +534,7 @@ mod tests {
         hold.sort(&mut next);
         assert_eq!(
             builds(&next),
-            [(failed, Some(tracing::Level::DEBUG))],
+            [(failed, Some(blaze_trace::Level::DEBUG))],
             "the failed build's debug row alone"
         );
         let [field] = next.fields.as_slice() else { panic!("its field: {:?}", next.fields) };
@@ -560,11 +559,11 @@ mod tests {
 
     #[test]
     fn warn_of_any_target_is_kept_and_debug_only_when_it_opts_in() {
-        assert!(keeps_event("hyper::proto", "event x.rs:1", tracing::Level::WARN));
-        assert!(!keeps_event("hyper::proto", "event x.rs:1", tracing::Level::INFO));
-        assert!(keeps_event("blaze::store", "event x.rs:1", tracing::Level::DEBUG));
-        assert!(!keeps_event("blaze_fmt", "event x.rs:1", tracing::Level::DEBUG));
-        assert!(!keeps_event("blaze", "event x.rs:1", tracing::Level::TRACE));
+        assert!(keeps_event("hyper::proto", "event x.rs:1", blaze_trace::Level::WARN));
+        assert!(!keeps_event("hyper::proto", "event x.rs:1", blaze_trace::Level::INFO));
+        assert!(keeps_event("blaze::store", "event x.rs:1", blaze_trace::Level::DEBUG));
+        assert!(!keeps_event("blaze_fmt", "event x.rs:1", blaze_trace::Level::DEBUG));
+        assert!(!keeps_event("blaze", "event x.rs:1", blaze_trace::Level::TRACE));
         assert!(keeps_event_named("anything", "event x.rs:1", "error"));
     }
 }

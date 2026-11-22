@@ -1,0 +1,67 @@
+# A `use` of one alias alone becomes a `use` of what its rewrites name, from the same path
+# (`blaze_hash::`, `bstd::map::`, `bstd::set::`, `crate::`). A use list (`use x::{HashMap, Y}`)
+# is not matched: see the README's leftovers. A name the file already imports is then imported
+# twice, an error the build names; the README says how to find those.
+id: explicit-hasher-use-hash-map
+language: rust
+severity: hint
+message: "D125/D126: import the table, its options and its hasher"
+rule:
+  pattern: use $P::HashMap;
+fix: "use $P::{FixedState, Map, MapOpts};"
+---
+id: explicit-hasher-use-hash-set
+language: rust
+severity: hint
+message: "D125/D126: import the table, its options and its hasher"
+rule:
+  pattern: use $P::HashSet;
+fix: "use $P::{FixedState, Set, SetOpts};"
+---
+id: explicit-hasher-use-index-map
+language: rust
+severity: hint
+message: "D125/D126: import the table, its options and its hasher"
+rule:
+  pattern: use $P::IndexMap;
+fix: "use $P::{FixedState, OrderMap, OrderMapOpts};"
+---
+id: explicit-hasher-use-index-set
+language: rust
+severity: hint
+message: "D125/D126: import the table, its options and its hasher"
+rule:
+  pattern: use $P::IndexSet;
+fix: "use $P::{FixedState, OrderSet, OrderSetOpts};"
+---
+id: explicit-hasher-use-by-hash
+language: rust
+severity: hint
+message: "D125/D126: import the table, its options and its hasher"
+rule:
+  pattern: use $P::ByHash;
+fix: "use $P::{BuildKeyHasher, Map, MapOpts};"
+---
+id: explicit-hasher-use-by-hash-set
+language: rust
+severity: hint
+message: "D125/D126: import the table, its options and its hasher"
+rule:
+  pattern: use $P::ByHashSet;
+fix: "use $P::{BuildKeyHasher, Set, SetOpts};"
+---
+id: explicit-hasher-use-keyed-map
+language: rust
+severity: hint
+message: "D125/D126: import the table, its options and its hasher"
+rule:
+  pattern: use $P::KeyedMap;
+fix: "use $P::{Map, MapOpts, SipKey};"
+---
+id: explicit-hasher-use-keyed-set
+language: rust
+severity: hint
+message: "D125/D126: import the table, its options and its hasher"
+rule:
+  pattern: use $P::KeyedSet;
+fix: "use $P::{Set, SetOpts, SipKey};"

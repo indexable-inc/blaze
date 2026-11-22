@@ -1,0 +1,14 @@
+{
+ "id": "seeded-import-needs-a-live-type-view",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane VF",
+ "where": "crates/blaze-ladder/src/front2/check.rs check_rounds_as (body.tys.view(&r.store.tys) once per round); crates/blaze-typeck/src/portable.rs PTys (slices) and OwnTys::view (base truncated at the body's start)",
+ "what": "Importing a head on the spot (rounds == 1 on the seeded path) needs its types interned into store.tys during the check. A body's own types are an overlay whose ids start at store.tys's length when it was lowered, and the checker reads through a PTys of slices taken at the round's start: a type imported mid-check would take an id the body's own types already use, and no view taken before it can read it. The Rows tables (lanes VD, VE, VF) make the heads' rows stable; the type ids are the part left.",
+ "cost": "six lanes (VW..VF) on the groundwork before the obstacle was named",
+ "cause": "the type table's id space is split by a length fixed at the body's start (overlay), and its view is a snapshot",
+ "class": "a table read by snapshot while the design needs it to grow under its readers",
+ "prevention": "not done: on the seeded path lower the body INTO the per-body store's stable table (no overlay, as lower_again does) and give the checker a view that reads the stable columns' current length (blaze-typeck PTys over Stable columns): a typeck change (lane US's crate)",
+ "annoyance": "the runner's ask is moved to the background after 180 s by the session's tool; waiting for its answer needed a bounded wait on the output file",
+ "workaround": "timeout 580 sh -c 'while [ ! -s <output> ]; do sleep 10; done' on the ask's own output file",
+ "state": "open"
+}

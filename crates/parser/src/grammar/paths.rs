@@ -3,11 +3,11 @@ use super::*;
 pub(super) const PATH_FIRST: TokenSet =
     TokenSet::new(&[IDENT, T![self], T![super], T![crate], T![Self], T![:], T![<]]);
 
-pub(super) fn is_path_start(p: &Parser<'_>) -> bool {
+pub(super) fn is_path_start<S: Sink>(p: &Parser<'_, S>) -> bool {
     is_use_path_start(p) || p.at(T![<]) || p.at(T![Self])
 }
 
-pub(super) fn is_use_path_start(p: &Parser<'_>) -> bool {
+pub(super) fn is_use_path_start<S: Sink>(p: &Parser<'_, S>) -> bool {
     match p.current() {
         IDENT | T![self] | T![super] | T![crate] => true,
         T![:] if p.at(T![::]) => true,
@@ -15,28 +15,28 @@ pub(super) fn is_use_path_start(p: &Parser<'_>) -> bool {
     }
 }
 
-pub(super) fn use_path(p: &mut Parser<'_>) {
+pub(super) fn use_path<S: Sink>(p: &mut Parser<'_, S>) {
     path(p, Mode::Use);
 }
 
-pub(super) fn vis_path(p: &mut Parser<'_>) {
+pub(super) fn vis_path<S: Sink>(p: &mut Parser<'_, S>) {
     path(p, Mode::Vis);
 }
 
-pub(super) fn attr_path(p: &mut Parser<'_>) {
+pub(super) fn attr_path<S: Sink>(p: &mut Parser<'_, S>) {
     path(p, Mode::Attr);
 }
 
-pub(crate) fn type_path(p: &mut Parser<'_>) {
+pub(crate) fn type_path<S: Sink>(p: &mut Parser<'_, S>) {
     path(p, Mode::Type);
 }
 
-pub(super) fn expr_path(p: &mut Parser<'_>) {
+pub(super) fn expr_path<S: Sink>(p: &mut Parser<'_, S>) {
     path(p, Mode::Expr);
 }
 
-pub(crate) fn type_path_for_qualifier(
-    p: &mut Parser<'_>,
+pub(crate) fn type_path_for_qualifier<S: Sink>(
+    p: &mut Parser<'_, S>,
     qual: CompletedMarker,
 ) -> CompletedMarker {
     path_for_qualifier(p, Mode::Type, qual)
@@ -51,7 +51,7 @@ enum Mode {
     Vis,
 }
 
-fn path(p: &mut Parser<'_>, mode: Mode) -> Option<CompletedMarker> {
+fn path<S: Sink>(p: &mut Parser<'_, S>, mode: Mode) -> Option<CompletedMarker> {
     let path = p.start();
     if path_segment(p, mode, true).is_none() {
         path.abandon(p);
@@ -61,8 +61,8 @@ fn path(p: &mut Parser<'_>, mode: Mode) -> Option<CompletedMarker> {
     Some(path_for_qualifier(p, mode, qual))
 }
 
-fn path_for_qualifier(
-    p: &mut Parser<'_>,
+fn path_for_qualifier<S: Sink>(
+    p: &mut Parser<'_, S>,
     mode: Mode,
     mut qual: CompletedMarker,
 ) -> CompletedMarker {
@@ -83,7 +83,7 @@ const EXPR_PATH_SEGMENT_RECOVERY_SET: TokenSet =
     expressions::EXPR_RECOVERY_SET.union(items::ITEM_RECOVERY_SET);
 const TYPE_PATH_SEGMENT_RECOVERY_SET: TokenSet = types::TYPE_RECOVERY_SET;
 
-fn path_segment(p: &mut Parser<'_>, mode: Mode, first: bool) -> Option<CompletedMarker> {
+fn path_segment<S: Sink>(p: &mut Parser<'_, S>, mode: Mode, first: bool) -> Option<CompletedMarker> {
     let m = p.start();
     // test qual_paths
     // type X = <A as B>::Output;
@@ -139,7 +139,7 @@ fn path_segment(p: &mut Parser<'_>, mode: Mode, first: bool) -> Option<Completed
     Some(m.complete(p, PATH_SEGMENT))
 }
 
-pub(crate) fn opt_path_type_args(p: &mut Parser<'_>) {
+pub(crate) fn opt_path_type_args<S: Sink>(p: &mut Parser<'_, S>) {
     // test typepathfn_with_coloncolon
     // type F = Start::(Middle) -> (Middle)::End;
     // type GenericArg = S<Start(Middle)::End>;
@@ -208,7 +208,7 @@ pub(crate) fn opt_path_type_args(p: &mut Parser<'_>) {
     }
 }
 
-fn opt_path_args(p: &mut Parser<'_>, mode: Mode) {
+fn opt_path_args<S: Sink>(p: &mut Parser<'_, S>, mode: Mode) {
     match mode {
         Mode::Use | Mode::Attr | Mode::Vis => {}
         Mode::Type => opt_path_type_args(p),

@@ -8,7 +8,7 @@ use std::cmp::{Ordering, max, min};
 use crate::ast;
 use crate::ast::visit;
 use crate::span::{BytePos, DUMMY_SP, Ident, Span, symbol};
-use tracing::debug;
+use blaze_trace::debug;
 
 use crate::attr::filter_inline_attrs;
 use crate::comment::{

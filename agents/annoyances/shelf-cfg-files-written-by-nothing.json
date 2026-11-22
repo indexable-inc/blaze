@@ -1,0 +1,15 @@
+{
+ "id": "shelf-cfg-files-written-by-nothing",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), D174 toolchain-side lane",
+ "where": "crates/blaze-build-script/src/toolchain.rs SHELF_MEMBERS (line 201) and pins/clang.json shelf_programs; the clang shelf <home>/.blaze/v2/toolchain/clang/<sha256>/",
+ "what": "SHELF_MEMBERS lists clang.cfg-style files the shelf is said to hold, and the missing-member check refuses a shelf without them, but no code found in the tree (toolchain_cut, llvm.py, the fetch) writes them; the shelf is the LLVM release unpacked, and what puts the cfg files there could not be found by grep",
+ "cost": "about twenty minutes searching for the writer before treating the files as hand-made",
+ "cause": "the shelf's layout is declared in one crate and filled by a step that is not in the tree",
+ "whys": "the clang shelf predates toolchain_cut and was never given a cut of its own",
+ "class": "a layout checked by a reader with no writer in the tree",
+ "prevention": "the clang shelf is cut by toolchain_cut like the Rust shelf, from pins/clang.json, cfg files included; D174's blaze-cfront needs no cfg file (--no-default-config), so the cfg files matter only to the build-script path",
+ "annoyance": "no writer for a checked layout",
+ "workaround": "none: D174 does not read them",
+ "state": "open"
+}

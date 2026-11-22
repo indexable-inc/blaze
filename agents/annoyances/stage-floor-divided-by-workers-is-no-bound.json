@@ -1,0 +1,15 @@
+{
+ "id": "stage-floor-divided-by-workers-is-no-bound",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), D167 floors writer",
+ "where": "crates/blaze-cli/src/engine_times.rs write (the 'floor' line); blaze-std Scope::narrow_workers and Scope::may_overlap; engine_bodies.rs/engine_heads.rs time a task as its thread's wall (clock.now().since(began))",
+ "what": "tempo's profile (score-c1725wave42) printed Bodies wall / floor 0.89: the 'floor' max(largest task, task ms / 16 workers) was above the wall it should bound. Task ms is each task's thread wall (preemption in it), and narrow_workers sets a count without capping how many may_overlap jobs run at once: a job runs on whichever pool worker starts it, or on its joiner. 62.4 s x 16 / 55.3 s says about 18 tasks' clocks ran at once on average.",
+ "cost": "a floor that read as broken until the pool's semantics were read",
+ "cause": "a bound that divides thread wall time by a configured worker count assumes task time is CPU time and that no more than that many ran at once; neither held",
+ "whys": "the floor was written from the rule (largest task, work / workers) without checking what a task's ms measures or what narrow_workers guarantees",
+ "class": "a lower bound computed from a configured limit instead of a measured one",
+ "prevention": "engine_times.rs now records each pool job's thread stretch (Times::job) and divides by the most that ran at once, measured, per barrier step; the old division is printed beside it as 'no bound'. A CPU-time bound needs each job's thread CPU time (CLOCK_THREAD_CPUTIME_ID), which bstd does not expose yet",
+ "annoyance": "narrow_workers reads as a cap on concurrency and is not one",
+ "workaround": "read 'the most at once' on the floor line",
+ "state": "fixed in the profile; the pool's cap is not changed"
+}

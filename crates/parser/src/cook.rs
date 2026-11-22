@@ -9,7 +9,10 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 use rustc_lexer::{Base, LiteralKind, RawStrError, validate_raw_str};
-use rustc_literal_escaper::{EscapeError, Mode, check_for_errors};
+use crate::line_break::is_bare_cr;
+#[cfg(doc)]
+use crate::line_break::line_comment_text;
+use crate::unescape::{EscapeError, Mode, check_for_errors};
 
 /// `rustc_ast::token::LitKind` as rustc's lexer makes it: never `Bool`, and `Err` without the
 /// `ErrorGuaranteed`.
@@ -197,13 +200,16 @@ fn raw_str_error(rest: &str, token_len: u32, prefix_len: u32) -> CookError {
 }
 
 /// `cook_doc_comment`'s errors: one for each bare CR in `content` (the comment after its
-/// `///`, `//!`, `/**` or `/*!`), at its offset in `content`.
+/// `///`, `//!`, `/**` or `/*!`; a line comment's through [`line_comment_text`], so its break's
+/// CR is not in it), at its offset in `content`. The CR of a CR LF is a line break, no error
+/// (crate::line_break).
 pub fn doc_comment_errors(content: &str, block: bool, mut report: impl FnMut(CookError)) {
     let message = match block {
         true => "bare CR not allowed in block doc-comment",
         false => "bare CR not allowed in doc-comment",
     };
-    for (idx, _) in content.bytes().enumerate().filter(|&(_, b)| b == b'\r') {
+    let bytes = content.as_bytes();
+    for idx in (0..bytes.len()).filter(|&idx| is_bare_cr(&bytes[idx..])) {
         let idx = idx as u32;
         report(CookError::new(idx..idx + 1, message));
     }

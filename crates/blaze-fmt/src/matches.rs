@@ -6,7 +6,7 @@ use std::iter::repeat;
 
 use crate::ast::{self, MatchKind};
 use crate::span::{BytePos, Span};
-use tracing::debug;
+use blaze_trace::debug;
 
 use crate::comment::{FindUncommented, combine_strs_with_missing_comments, rewrite_comment};
 use crate::config::lists::*;

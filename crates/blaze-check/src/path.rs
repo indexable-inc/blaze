@@ -8,6 +8,8 @@ use crate::{
     rng::Rng,
 };
 
+pub(crate) mod schedules;
+
 /// What a thread is at a schedule branch (loom's `path::Thread`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Mark {

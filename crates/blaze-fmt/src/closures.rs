@@ -2,7 +2,7 @@
 
 use crate::ast::{self, Label};
 use crate::span::Span;
-use tracing::debug;
+use blaze_trace::debug;
 
 use crate::attr::get_attrs_from_stmt;
 use crate::config::StyleEdition;

@@ -1,20 +1,40 @@
 //! The one place blaze makes a directory under the system's temporary directory (rule
-//! `blaze::tmp_path`, docs/lints.md#tmp_path): [`TempDir`], a directory of its own that is
+//! `blaze::tmp_path`): [`TempDir`], a directory of its own that is
 //! removed with all it holds when it drops, so a test's home or a probe's scratch never
 //! outlives what made it. Nothing else names `/tmp`, `/private/tmp`, `/var/tmp` or calls
 //! `std::env::temp_dir`: a home left there leaked, and a reboot wiped a round's notes kept
 //! there.
 
 use std::{
-    io,
+    env, io,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU32, Ordering},
 };
 
-/// The system's temporary directory: `TMPDIR` where it is set, else the platform's (`/tmp` on
-/// Linux). Only [`TempDir`] and what makes a temporary file next to it read it.
+/// [`base_in`] and [`platform`]: the temporary directory from values its caller read.
+mod given;
+
+pub use given::base_in;
+#[cfg(unix)]
+pub use given::platform;
+
+/// The system's temporary directory: `TMPDIR` where it is set and not empty, else the
+/// platform's ([`platform`]: `/tmp` on Linux, the user's under `/var/folders` on macOS). Only
+/// [`TempDir`] and what makes a temporary file next to it read it.
+///
+/// Ambient (rule 75): reads this process's environment from nowhere. The capability form is
+/// [`base_in`] of the `TMPDIR` its caller read from its `Env`. Deleted by batch P5-temp once
+/// its callers have moved.
+#[allow(clippy::disallowed_methods, reason = "the ambient form's one read of TMPDIR, kept until batch P5-temp")]
 pub fn base() -> PathBuf {
-    std::env::temp_dir()
+    #[cfg(unix)]
+    {
+        base_in(env::var_os("TMPDIR").as_deref().map(Path::new), &platform())
+    }
+    #[cfg(not(unix))]
+    {
+        env::temp_dir()
+    }
 }
 
 /// A new directory under [`base`], removed with all it holds when this drops.

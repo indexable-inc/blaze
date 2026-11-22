@@ -11,6 +11,10 @@
 //! table lookup per digit is the bound: the decode looks both digits of a byte up in one
 //! 256-entry table and checks for a bad digit once, at the end.
 
+use core::alloc::Allocator;
+
+use blaze_own::Alloc;
+
 const DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 /// Not a digit, in [`NIBBLES`] and [`LOWER_NIBBLES`]: any value above 15 would do.
@@ -39,19 +43,45 @@ const fn nibbles(upper: bool) -> [u8; 256] {
     table
 }
 
-/// `bytes` in lowercase hex.
-pub fn encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(2 * bytes.len());
+/// DEPRECATED (the `std` feature): `bytes` in lowercase hex, on the global heap. [`encode_in`]
+/// replaces it.
+// to remove: callers pass an allocator (bstd move): they call [`encode_in`].
+#[cfg(feature = "std")]
+pub fn encode(bytes: &[u8]) -> std::string::String {
+    let mut out = std::string::String::with_capacity(2 * bytes.len());
     encode_into(bytes, &mut out);
     out
 }
 
-/// Appends `bytes` to `out` in lowercase hex.
-pub fn encode_into(bytes: &[u8], out: &mut String) {
+/// DEPRECATED (the `std` feature): appends `bytes` to `out` in lowercase hex.
+/// [`encode_into_in`] replaces it.
+// to remove: callers pass an allocator (bstd move): they call [`encode_into_in`].
+#[cfg(feature = "std")]
+pub fn encode_into(bytes: &[u8], out: &mut std::string::String) {
     out.reserve(2 * bytes.len());
+    each_digit(bytes, |digit| out.push(digit));
+}
+
+/// `bytes` in lowercase hex, in the caller's allocator: the same text as [`encode`].
+pub fn encode_in<'a>(bytes: &[u8], alloc: Alloc<'a>) -> blaze_own::String<Alloc<'a>> {
+    let mut out = blaze_own::String::with_capacity_in(2 * bytes.len(), alloc);
+    encode_into_in(bytes, &mut out);
+    out
+}
+
+/// Appends `bytes` to `out`, a string in the caller's allocator, in lowercase hex: the same text
+/// as [`encode_into`].
+pub fn encode_into_in<A: Allocator>(bytes: &[u8], out: &mut blaze_own::String<A>) {
+    out.reserve(2 * bytes.len());
+    each_digit(bytes, |digit| out.push(digit));
+}
+
+/// Each digit of `bytes` in lowercase hex, high nibble first: the one body under every encoder.
+#[inline]
+fn each_digit(bytes: &[u8], mut push: impl FnMut(char)) {
     for &byte in bytes {
-        out.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        out.push(char::from(DIGITS[usize::from(byte & 15)]));
+        push(char::from(DIGITS[usize::from(byte >> 4)]));
+        push(char::from(DIGITS[usize::from(byte & 15)]));
     }
 }
 

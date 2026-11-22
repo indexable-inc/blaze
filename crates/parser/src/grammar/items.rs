@@ -17,7 +17,7 @@ use super::*;
 // foo::bar!();
 // super::baz! {}
 // struct S;
-pub(super) fn mod_contents(p: &mut Parser<'_>, stop_on_r_curly: bool) {
+pub(super) fn mod_contents<S: Sink>(p: &mut Parser<'_, S>, stop_on_r_curly: bool) {
     attributes::inner_attrs(p);
     while !(p.at(EOF) || (p.at(T!['}']) && stop_on_r_curly)) {
         // We can set `is_in_extern=true`, because it only allows `safe fn`, and there is no ambiguity here.
@@ -45,8 +45,8 @@ pub(super) const ITEM_RECOVERY_SET: TokenSet = TokenSet::new(&[
     T![;],
 ]);
 
-pub(super) fn item_or_macro(
-    p: &mut Parser<'_>,
+pub(super) fn item_or_macro<S: Sink>(
+    p: &mut Parser<'_, S>,
     stop_on_r_curly: bool,
     is_in_extern: bool,
     is_in_trait: bool,
@@ -58,12 +58,12 @@ pub(super) fn item_or_macro(
 
 /// One item and no more, as a macro's `$i:item` takes it: a `;` after the item is the
 /// macro's next token (`($i:item ; $l:lifetime)`), not a stray one of a list of items.
-pub(super) fn item_fragment(p: &mut Parser<'_>) {
+pub(super) fn item_fragment<S: Sink>(p: &mut Parser<'_, S>) {
     stdx::ensure_sufficient_stack(|| item_or_macro_here(p, true, true, false, false))
 }
 
-fn item_or_macro_here(
-    p: &mut Parser<'_>,
+fn item_or_macro_here<S: Sink>(
+    p: &mut Parser<'_, S>,
     stop_on_r_curly: bool,
     is_in_extern: bool,
     is_in_trait: bool,
@@ -129,8 +129,8 @@ fn item_or_macro_here(
 }
 
 /// Try to parse an item, completing `m` in case of success.
-pub(super) fn opt_item(
-    p: &mut Parser<'_>,
+pub(super) fn opt_item<S: Sink>(
+    p: &mut Parser<'_, S>,
     m: Marker,
     is_in_extern: bool,
     is_in_trait: bool,
@@ -163,6 +163,18 @@ pub(super) fn opt_item(
             p.error("expected an impl restriction");
         }
         m.complete(p, IMPL_RESTRICTION);
+        has_mods = true;
+    }
+
+    // A const closure (`const move |x| ..`, `const || ..`) is an expression, not an item.
+    if at_const_closure(p) {
+        return Err(m);
+    }
+
+    // `final fn` in a trait: a method no impl overrides (`#![feature(final_associated_functions)]`).
+    if p.at(T![final]) && matches!(p.nth(1), T![fn] | T![const] | T![unsafe] | T![async] | T![extern])
+    {
+        p.bump(T![final]);
         has_mods = true;
     }
 
@@ -301,11 +313,16 @@ pub(super) fn opt_item(
 
 /// Whether `p` is at `const static {`, blaze's `const static { .. }` block
 /// (`#![feature(blaze_comptime)]`): an expression, never an item's `const`.
-fn at_comptime_block(p: &Parser<'_>) -> bool {
+fn at_comptime_block<S: Sink>(p: &Parser<'_, S>) -> bool {
     p.at(T![const]) && p.nth(1) == T![static] && p.nth(2) == T!['{']
 }
 
-fn opt_item_without_modifiers(p: &mut Parser<'_>, m: Marker) -> Result<(), Marker> {
+/// At `const` starting a closure, `const |x| ..`, `const || ..` or `const move ..`.
+fn at_const_closure<S: Sink>(p: &Parser<'_, S>) -> bool {
+    p.at(T![const]) && matches!(p.nth(1), T![move] | T![|] | T![||])
+}
+
+fn opt_item_without_modifiers<S: Sink>(p: &mut Parser<'_, S>, m: Marker) -> Result<(), Marker> {
     let la = p.nth(1);
     match p.current() {
         T![extern] if la == T![crate] => extern_crate(p, m),
@@ -350,7 +367,7 @@ fn opt_item_without_modifiers(p: &mut Parser<'_>, m: Marker) -> Result<(), Marke
 // test extern_crate
 // extern crate foo;
 // extern crate self;
-fn extern_crate(p: &mut Parser<'_>, m: Marker) {
+fn extern_crate<S: Sink>(p: &mut Parser<'_, S>, m: Marker) {
     p.bump(T![extern]);
     p.bump(T![crate]);
 
@@ -366,7 +383,7 @@ fn extern_crate(p: &mut Parser<'_>, m: Marker) {
 
 // test mod_item
 // mod a;
-pub(crate) fn mod_item(p: &mut Parser<'_>, m: Marker) {
+pub(crate) fn mod_item<S: Sink>(p: &mut Parser<'_, S>, m: Marker) {
     p.bump(T![mod]);
     name(p);
     if p.at(T!['{']) {
@@ -381,7 +398,7 @@ pub(crate) fn mod_item(p: &mut Parser<'_>, m: Marker) {
 
 // test type_alias
 // type Foo = Bar;
-fn type_alias(p: &mut Parser<'_>, m: Marker) {
+fn type_alias<S: Sink>(p: &mut Parser<'_, S>, m: Marker) {
     p.bump(T![type]);
 
     name(p);
@@ -409,18 +426,18 @@ fn type_alias(p: &mut Parser<'_>, m: Marker) {
     m.complete(p, TYPE_ALIAS);
 }
 
-pub(crate) fn item_list(p: &mut Parser<'_>) {
+pub(crate) fn item_list<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T!['{']));
-    let m = p.start();
+    let m = p.start_list(ITEM_LIST);
     p.bump(T!['{']);
     mod_contents(p, true);
     p.expect(T!['}']);
     m.complete(p, ITEM_LIST);
 }
 
-pub(crate) fn extern_item_list(p: &mut Parser<'_>) {
+pub(crate) fn extern_item_list<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T!['{']));
-    let m = p.start();
+    let m = p.start_list(EXTERN_ITEM_LIST);
     p.bump(T!['{']);
     mod_contents(p, true);
     p.expect(T!['}']);
@@ -429,7 +446,7 @@ pub(crate) fn extern_item_list(p: &mut Parser<'_>) {
 
 // test try_macro_rules 2015
 // macro_rules! try { () => {} }
-fn macro_rules(p: &mut Parser<'_>, m: Marker) {
+fn macro_rules<S: Sink>(p: &mut Parser<'_, S>, m: Marker) {
     assert!(p.at_contextual_kw(T![macro_rules]));
     p.bump_remap(T![macro_rules]);
     p.expect(T![!]);
@@ -452,7 +469,7 @@ fn macro_rules(p: &mut Parser<'_>, m: Marker) {
 
 // test macro_def
 // macro m($i:ident) {}
-fn macro_def(p: &mut Parser<'_>, m: Marker) {
+fn macro_def<S: Sink>(p: &mut Parser<'_, S>, m: Marker) {
     p.expect(T![macro]);
     name_r(p, ITEM_RECOVERY_SET);
     if p.at(T!['{']) {
@@ -474,7 +491,7 @@ fn macro_def(p: &mut Parser<'_>, m: Marker) {
 
 // test fn_
 // fn foo() {}
-fn fn_(p: &mut Parser<'_>, m: Marker, is_in_trait: bool) {
+fn fn_<S: Sink>(p: &mut Parser<'_, S>, m: Marker, is_in_trait: bool) {
     p.bump(T![fn]);
 
     name_r(p, ITEM_RECOVERY_SET);
@@ -526,7 +543,7 @@ fn fn_(p: &mut Parser<'_>, m: Marker, is_in_trait: bool) {
     m.complete(p, FN);
 }
 
-fn macro_call(p: &mut Parser<'_>, m: Marker) {
+fn macro_call<S: Sink>(p: &mut Parser<'_, S>, m: Marker) {
     assert!(p.at(T![!]));
     match macro_call_after_excl(p) {
         BlockLike::Block => (),
@@ -537,7 +554,7 @@ fn macro_call(p: &mut Parser<'_>, m: Marker) {
     m.complete(p, MACRO_CALL);
 }
 
-pub(super) fn macro_call_after_excl(p: &mut Parser<'_>) -> BlockLike {
+pub(super) fn macro_call_after_excl<S: Sink>(p: &mut Parser<'_, S>) -> BlockLike {
     p.expect(T![!]);
 
     match p.current() {
@@ -556,11 +573,11 @@ pub(super) fn macro_call_after_excl(p: &mut Parser<'_>) -> BlockLike {
     }
 }
 
-pub(crate) fn token_tree(p: &mut Parser<'_>) {
+pub(crate) fn token_tree<S: Sink>(p: &mut Parser<'_, S>) {
     stdx::ensure_sufficient_stack(|| token_tree_here(p))
 }
 
-fn token_tree_here(p: &mut Parser<'_>) {
+fn token_tree_here<S: Sink>(p: &mut Parser<'_, S>) {
     let closing_paren_kind = match p.current() {
         T!['{'] => T!['}'],
         T!['('] => T![')'],

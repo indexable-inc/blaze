@@ -28,6 +28,26 @@ impl Fd {
     }
 }
 
+/// A terminal's size in cells, as `ioctl(TIOCGWINSZ)` reads it (`struct winsize`'s first two
+/// fields; its pixel sizes are not kept).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WindowSize {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// `struct winsize` (sys/ttycom.h on macOS, asm-generic/termios.h on Linux): the same four
+/// `unsigned short`s on both.
+#[repr(C)]
+#[derive(Default)]
+#[cfg_attr(not(unix), expect(dead_code, reason = "a terminal's size is read on Unix only"))]
+pub(crate) struct Winsize {
+    pub(crate) rows: u16,
+    pub(crate) cols: u16,
+    pub(crate) x_pixels: u16,
+    pub(crate) y_pixels: u16,
+}
+
 /// A path as the kernel takes it: bytes ending in a NUL, lent. Never allocated here; a caller
 /// with bytes and no NUL makes one in a buffer of its own ([`Path::in_buffer`]).
 ///

@@ -1,0 +1,13 @@
+error  `v` is changed while `first` still borrows it
+  ╭─ src/last.rs:3:5
+1 │ fn last(mut v: Vec<u8>) -> u8 {
+2 │     let first = &v[0];
+  │                 -----
+  │                 ╰─ borrowed here
+3 │     v.push(1);
+  │     ^^^^^^^^^
+  │     ╰─ changed here
+4 │     *first
+  │     ------
+  │     ╰─ and used here
+  ╰─ blaze explain borrow:mut-while-shared

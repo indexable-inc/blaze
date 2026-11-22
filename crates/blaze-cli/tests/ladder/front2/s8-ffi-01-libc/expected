@@ -1,0 +1,11 @@
+status 0
+stdout
+5
+12
+true true
+7 -42
+true
+AAAAAAA
+Q
+nul byte found in provided data at position: 1
+[98, 121, 116, 101, 115, 0]

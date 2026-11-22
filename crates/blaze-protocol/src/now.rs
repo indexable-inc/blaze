@@ -1,5 +1,5 @@
 //! A build as it runs now: the one model of it that its client's live view, `blaze status`
-//! and the explorer's daemon source read (docs/v2/plan/design/build-view.md). [`Now`] is the
+//! and the explorer's daemon source read. [`Now`] is the
 //! wire type, said to a build's client about twice a second; [`Fold`] is the sans-IO core
 //! that builds it from tasks and their moves ([`TaskRecord`]s through [`Fold::take`], [`State`]s
 //! through [`Fold::moved`]), the clock it is handed ([`Fold::advance_clock`]) and what one look
@@ -20,7 +20,7 @@
 
 use std::{alloc::Global, cmp::Reverse};
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map};
 
 use serde::{Deserialize, Serialize};
 
@@ -582,7 +582,7 @@ pub struct Fold {
     /// The tasks, in the order first said.
     tasks: Vec<Slot>,
     /// Each task's slot in `tasks`, by id. Asked, never iterated.
-    slots: HashMap<u64, u32, Global>,
+    slots: Map<u64, u32, FixedState, Global>,
     /// The daemon's release count at the build's first look ([`Memory::releases`]).
     releases_base: Option<u32>,
     /// When each task settled in the last [`RECENT_MS`], oldest first ([`Now::recent`]).
@@ -1125,7 +1125,7 @@ fn mentions(words: &str, word: &str) -> bool {
 /// blocker its worker's innermost span.
 fn blockers(
     tasks: &[Slot],
-    slots: &HashMap<u64, u32, Global>,
+    slots: &Map<u64, u32, FixedState, Global>,
     now_ns: u64,
     walk: &mut Walk,
     busy: &[Busy],

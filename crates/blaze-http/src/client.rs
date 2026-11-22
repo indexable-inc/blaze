@@ -31,6 +31,7 @@
 #![blaze::sans_io]
 
 use std::{
+    alloc::Global,
     collections::{BTreeMap, VecDeque},
     fmt,
     net::IpAddr,
@@ -38,15 +39,26 @@ use std::{
     time::Duration,
 };
 
+use blaze_h1::{HeaderFault, Limits, Out, Range};
+use blaze_own::AllocFailure;
+use blaze_url::Url;
 use rustls::pki_types::ServerName;
 
 use crate::{
+    Method,
     gzip::Gunzip,
-    h1,
     pool::{Origin, Pool},
     proxy::{Credentials, Handshake, Proxies, ProxyKind},
     tls::Session,
 };
+
+/// What an answer may hold as blaze-h1 reads it: a head of at most 64 KiB and 100 headers
+/// (hyper's), a body of any length (the client holds it to the request's bound itself, as sent
+/// and once decoded, [`Kind::TooBig`]).
+pub(crate) const ANSWER: Limits = Limits { most_head: 64 << 10, most_headers: 100, most_body: u64::MAX, ..Limits::SHIPPED };
+
+/// An answer read by blaze-h1, its buffers in the global allocator.
+type Answer = blaze_h1::Response<Global>;
 
 /// How many redirects one request follows.
 pub const REDIRECTS: usize = 10;
@@ -113,11 +125,14 @@ impl Config {
 /// with the same method, headers and body, as blaze-registry's client always asked them).
 #[derive(Clone, Debug)]
 pub struct Request {
-    pub method: http::Method,
+    pub method: Method,
+    /// An `http` or `https` URL as blaze-url takes it: ASCII, no user part, no backslash.
     pub url: String,
-    /// Sent after the client's `host` (which a caller's `Host` replaces), `user-agent` and
-    /// `accept-encoding`. `Content-Length`, `Transfer-Encoding` and `Connection` are the
-    /// client's, and a request naming one is refused ([`Kind::Header`]).
+    /// The bytes asked for (`Range: bytes=first-last`), or all of them.
+    pub range: Option<Range>,
+    /// Sent after the client's `Host`, `Range`, `user-agent` and `accept-encoding`. `Host`,
+    /// `Range`, `Content-Length`, `Transfer-Encoding` and `Connection` are the client's, and a
+    /// request naming one is refused ([`Kind::Header`]).
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     /// Whether gzip is asked for (`Accept-Encoding: gzip`) and a gzip body decoded. Without it
@@ -134,8 +149,9 @@ impl Request {
     /// A `GET` of `url`, gzip asked for, with no bound.
     pub fn get(url: impl Into<String>) -> Request {
         Request {
-            method: http::Method::GET,
+            method: Method::Get,
             url: url.into(),
+            range: None,
             // alloc: empty, allocates nothing.
             headers: Vec::new(),
             // alloc: empty, allocates nothing.
@@ -277,7 +293,7 @@ pub enum Kind {
     /// `step` with `host:port` failed: `why`.
     Io { step: Step, host: String, port: u16, why: String },
     /// A body its head says is gzip, which is not.
-    Gzip(String),
+    Gzip(blaze_deflate::Error),
     /// Its [`RequestId`] is another request's, still in flight: the driver's mistake.
     InUse,
 }
@@ -384,7 +400,7 @@ impl std::error::Error for Error {}
 struct Exchange {
     request: Request,
     /// The address asked now: the request's, or where its redirects led.
-    url: url::Url,
+    url: Url,
     /// Redirects followed so far.
     hops: usize,
     /// The connection asked on now, if one is.
@@ -440,13 +456,27 @@ struct Conn {
 enum Work {
     /// In the pool.
     Idle,
-    /// Asked by `request`, waiting for its answer's head.
-    Head { request: RequestId },
+    /// Asked by `request`, waiting for its answer's head, read into `answer`.
+    Head { request: RequestId, answer: Answer },
     /// Reading `request`'s answer's body.
-    Body { request: RequestId, body: h1::Body, reusable: bool },
-    /// Reading a redirect's body to its end, for no one, to be kept if `reusable`; at most
+    Body { request: RequestId, answer: Answer },
+    /// Reading a redirect's body to its end, for no one, to be kept if it can be; at most
     /// `left` bytes more, by `until`.
-    Draining { body: h1::Body, reusable: bool, left: u64, until: Duration },
+    Draining { answer: Answer, left: u64, until: Duration },
+}
+
+/// A redirect's body as it is drained: counted, never kept.
+struct Dropped(u64);
+
+impl Out for Dropped {
+    fn try_reserve_more(&mut self, _more: usize) -> Result<(), AllocFailure> {
+        Ok(())
+    }
+
+    fn try_put(&mut self, bytes: &[u8]) -> Result<(), AllocFailure> {
+        self.0 += bytes.len() as u64;
+        Ok(())
+    }
 }
 
 impl Conn {
@@ -475,7 +505,7 @@ impl Conn {
     /// The request it is asked by, if one is.
     fn request(&self) -> Option<RequestId> {
         match self.work {
-            Work::Head { request } | Work::Body { request, .. } => Some(request),
+            Work::Head { request, .. } | Work::Body { request, .. } => Some(request),
             Work::Idle | Work::Draining { .. } => None,
         }
     }
@@ -579,26 +609,25 @@ impl Client {
         if self.exchanges.contains_key(&id) {
             return Err(Error { url: request.url, kind: Kind::InUse });
         }
-        let url = match url::Url::parse(&request.url) {
+        let url = match Url::parse(&request.url) {
             Ok(url) => url,
             Err(e) => {
                 // alloc: an error's message, made only when it fails.
-                let kind = Kind::Url(format!("it does not parse as a URL: {e}"));
-                self.events.push_back(Event::Failed {
-                    request: id,
-                    error: Error { url: request.url, kind },
-                });
+                let kind = Kind::Url(format!("it is no URL this client asks: it {}", e.why.says()));
+                // A user part may hold a password: the error never quotes such a URL.
+                let url = match e.why {
+                    // alloc: an error's message, made only when it fails.
+                    blaze_url::UrlWhy::UserInfo => "(a URL naming a user, not quoted)".to_owned(),
+                    _ => request.url,
+                };
+                self.events.push_back(Event::Failed { request: id, error: Error { url, kind } });
                 return Ok(());
             }
         };
-        let refused = if request.https_only && url.scheme() != "https" {
+        let refused = if request.https_only && url.scheme().as_str() != "https" {
             Some(Kind::NotHttps)
         } else {
-            request
-                .headers
-                .iter()
-                .find_map(|(name, value)| h1::refuse_header(name, value))
-                .map(Kind::Header)
+            request.headers.iter().find_map(|(name, value)| refuse_header(name, value)).map(Kind::Header)
         };
         if let Some(kind) = refused {
             self.events
@@ -732,19 +761,35 @@ impl Client {
         };
         // alloc: one per exchange through a proxy with a user, its header's value.
         let proxy_authorization = forward.and_then(|it| it.auth.as_ref()).map(Credentials::basic);
+        let host = host_of(&exchange.url);
+        let method = exchange.request.method;
+        // alloc: one per exchange, its headers as blaze-h1 takes them: the client's, then the
+        // caller's, names as given (the client's in lower case, as hyper wrote them).
+        let mut headers: Vec<(&str, &str)> = Vec::with_capacity(3 + exchange.request.headers.len());
+        if let Some(credentials) = proxy_authorization.as_deref() {
+            headers.push(("proxy-authorization", credentials));
+        }
+        headers.push(("user-agent", &self.config.user_agent));
+        if exchange.request.gzip {
+            headers.push(("accept-encoding", "gzip"));
+        }
+        headers.extend(exchange.request.headers.iter().map(|(name, value)| (name.as_str(), value.as_str())));
+        let body = exchange.request.body.len() as u64;
+        let head = blaze_h1::Request {
+            method: method.as_str(),
+            target: &target,
+            host: &host,
+            range: exchange.request.range,
+            headers: &headers,
+            body_len: (body > 0 || method.carries_body()).then_some(body),
+            close: false,
+        };
         // alloc: one per exchange, its head and body as written.
         let mut written = Vec::with_capacity(512 + exchange.request.body.len());
-        h1::write_request(
-            &mut written,
-            &exchange.request.method,
-            &target,
-            &host_of(&exchange.url),
-            &self.config.user_agent,
-            exchange.request.gzip,
-            &exchange.request.headers,
-            exchange.request.body.len(),
-            proxy_authorization.as_deref(),
-        );
+        if let Err(e) = blaze_h1::write_request(&head, &mut written) {
+            // alloc: an error's message, made only when it fails.
+            return self.fail(id, Kind::Header(e.to_string()));
+        }
         written.extend_from_slice(&exchange.request.body);
         let pooled = if fresh { None } else { self.pool.take(&origin) };
         let conn = match pooled {
@@ -822,7 +867,8 @@ impl Client {
             exchange.deadline = Some(deadline);
         }
         let Some(it) = self.conns.get_mut(&conn) else { return };
-        it.work = Work::Head { request: id };
+        let answer = Answer::new_in(ANSWER, method == Method::Head, Global);
+        it.work = Work::Head { request: id, answer };
         it.reused = pooled.is_some();
         it.got = false;
         let Conn { session, out, held, tunnel, .. } = it;
@@ -930,61 +976,52 @@ impl Client {
                     }
                     return;
                 }
-                Work::Draining { body, reusable, left, .. } => {
-                    // alloc: a redirect's body, read to be dropped, at most `DRAIN_MOST`.
-                    let mut dropped = Vec::new();
-                    let Ok((used, done)) = body.decode(&conn.plain, &mut dropped) else {
+                Work::Draining { answer, left, .. } => {
+                    let mut dropped = Dropped(0);
+                    let Ok(fed) = answer.feed(&conn.plain, &mut dropped) else {
                         return self.close(id);
                     };
-                    conn.plain.drain(..used);
-                    let read = dropped.len() as u64;
-                    if read > *left {
+                    conn.plain.drain(..fed.consumed);
+                    if dropped.0 > *left {
                         return self.close(id);
                     }
-                    *left -= read;
-                    if done && *reusable && conn.plain.is_empty() && !conn.eof {
+                    *left -= dropped.0;
+                    if fed.done && answer.reusable() && conn.plain.is_empty() && !conn.eof {
                         return self.idle(id);
                     }
-                    if done || conn.eof {
+                    if fed.done || conn.eof {
                         self.close(id);
                     }
                     return;
                 }
-                Work::Head { request } => {
+                Work::Head { request, answer } => {
                     let request = *request;
-                    let head_request = self
-                        .exchanges
-                        .get(&request)
-                        .is_some_and(|it| it.request.method == http::Method::HEAD);
-                    let head = match h1::parse_head(&conn.plain, head_request) {
-                        Ok(Some(head)) => head,
-                        Ok(None) => {
-                            if conn.eof {
-                                let why = if conn.plain.is_empty() {
-                                    "the connection closed before any answer came"
-                                } else {
-                                    "the connection closed in the middle of the answer's head"
-                                };
-                                self.conn_failed(id, Step::Head, why.to_owned());
-                            }
-                            return;
-                        }
-                        Err(why) => return self.conn_failed(id, Step::Head, why),
+                    // The head alone: its body is read as the asker takes it. Interim heads
+                    // (100 Continue, 103 Early Hints) are read past; a 101 is refused.
+                    let fed = match answer.feed_head(&conn.plain) {
+                        Ok(fed) => fed,
+                        // alloc: an error's message, made only when it fails.
+                        Err(e) => return self.conn_failed(id, Step::Head, e.to_string()),
                     };
-                    conn.plain.drain(..head.len);
-                    if (100..200).contains(&head.status) {
-                        if head.status == 101 {
-                            let why = "101 Switching Protocols, which was not asked for".to_owned();
-                            return self.conn_failed(id, Step::Head, why);
+                    conn.plain.drain(..fed.consumed);
+                    if !answer.has_head() {
+                        if conn.eof {
+                            let why = if conn.got {
+                                "the connection closed in the middle of the answer's head"
+                            } else {
+                                "the connection closed before any answer came"
+                            };
+                            self.conn_failed(id, Step::Head, why.to_owned());
                         }
-                        // An informational answer (100 Continue, 103 Early Hints): the real one follows.
-                        continue;
+                        return;
                     }
-                    self.answer(id, request, head);
+                    let Work::Head { answer, .. } = std::mem::replace(&mut conn.work, Work::Idle) else {
+                        return;
+                    };
+                    self.answer(id, request, answer);
                 }
-                Work::Body { request, body, reusable } => {
+                Work::Body { request, answer } => {
                     let request = *request;
-                    let reusable = *reusable;
                     let Some(exchange) = self.exchanges.get_mut(&request) else {
                         return self.close(id);
                     };
@@ -994,25 +1031,27 @@ impl Client {
                     }
                     // alloc: one per piece of the body, handed to the asker.
                     let mut data = Vec::new();
-                    let (used, done) = match body.decode(&conn.plain, &mut data) {
-                        Ok(it) => it,
-                        Err(why) => return self.conn_failed(id, Step::Body, why),
+                    let fed = match answer.feed(&conn.plain, &mut data) {
+                        Ok(fed) => fed,
+                        // alloc: an error's message, made only when it fails.
+                        Err(e) => return self.conn_failed(id, Step::Body, e.to_string()),
                     };
-                    conn.plain.drain(..used);
-                    if used > 0 {
+                    conn.plain.drain(..fed.consumed);
+                    if fed.consumed > 0 {
                         exchange.deadline = Some(self.now + self.config.timeout);
                     }
                     if let Err(kind) = deliver(exchange, data, &mut self.events, request) {
                         return self.fail(request, kind);
                     }
-                    if done {
-                        let keep = reusable && conn.plain.is_empty() && !conn.eof;
+                    if fed.done {
+                        let keep = answer.reusable() && conn.plain.is_empty() && !conn.eof;
                         return self.finish(request, id, keep);
                     }
                     if conn.eof {
-                        return match body.closed() {
+                        return match answer.closed() {
                             Ok(()) => self.finish(request, id, false),
-                            Err(why) => self.conn_failed(id, Step::Body, why),
+                            // alloc: an error's message, made only when it fails.
+                            Err(e) => self.conn_failed(id, Step::Body, e.to_string()),
                         };
                     }
                     return;
@@ -1023,8 +1062,25 @@ impl Client {
 
     /// `head` answered `request` on `conn`: a redirect starts its next exchange, leaving
     /// `conn` to read the redirect's body; the final answer is told to the asker.
-    fn answer(&mut self, conn: ConnId, request: RequestId, head: h1::Head) {
-        let h1::Head { status, headers, body, reusable, location, gzip, length, .. } = head;
+    fn answer(&mut self, conn: ConnId, request: RequestId, answer: Answer) {
+        let status = answer.status();
+        // Visible ASCII is UTF-8.
+        fn text(value: &[u8]) -> Option<&str> {
+            value.iter().all(|&b| (32..127).contains(&b) || b == b'\t').then(|| std::str::from_utf8(value).unwrap_or_default())
+        }
+        // alloc: one per redirect, where it leads.
+        let location = answer.header("location").and_then(text).map(str::to_owned);
+        let gzip = answer.header("content-encoding").and_then(text).is_some_and(|it| it.eq_ignore_ascii_case("gzip"));
+        let length = answer.content_length();
+        // alloc: one per answer, its headers handed to the asker: each whose value is visible
+        // ASCII (as hyper's `to_str` takes them), its name in lower case, in the order sent.
+        let headers: Vec<(String, String)> = answer
+            .headers()
+            .filter_map(|(name, value)| Some((String::from_utf8_lossy(name).to_ascii_lowercase(), text(value)?.to_owned())))
+            .collect();
+        // The connection is the request's until this says otherwise, so a failure closes it.
+        let Some(it) = self.conns.get_mut(&conn) else { return };
+        it.work = Work::Body { request, answer };
         let now = self.now;
         let timeout = self.config.timeout;
         let redirects = self.config.redirects;
@@ -1043,8 +1099,10 @@ impl Client {
             }
             exchange.url = next;
             exchange.conn = None;
-            if let Some(it) = self.conns.get_mut(&conn) {
-                it.work = Work::Draining { body, reusable, left: DRAIN_MOST, until: now + timeout };
+            if let Some(it) = self.conns.get_mut(&conn)
+                && let Work::Body { answer, .. } = std::mem::replace(&mut it.work, Work::Idle)
+            {
+                it.work = Work::Draining { answer, left: DRAIN_MOST, until: now + timeout };
             }
             // The redirect's body first: when it is all here already (a short or empty one),
             // its connection is back in the pool for the next exchange to take, if that goes to
@@ -1057,16 +1115,13 @@ impl Client {
             return self.fail(request, Kind::TooBig { most, said: Some(length), decoded: false });
         }
         if gzip && exchange.request.gzip {
-            exchange.gzip = Some(Gunzip::new());
+            exchange.gzip = Some(Gunzip::new(most));
         }
         exchange.answered = true;
         exchange.deadline = Some(now + timeout);
         // alloc: one per answer, the address that answered, for the asker.
-        let url = exchange.url.to_string();
+        let url = exchange.url.as_str().to_owned();
         self.events.push_back(Event::Head { request, url, status, headers });
-        if let Some(it) = self.conns.get_mut(&conn) {
-            it.work = Work::Body { request, body, reusable };
-        }
     }
 
     /// `request`'s body ended whole on `conn`: the rest of its gzip, then `Done`, and `conn`
@@ -1076,7 +1131,7 @@ impl Client {
         let ended = match exchange.gzip.as_mut().map(Gunzip::finish) {
             None => Ok(()),
             Some(Ok(rest)) => give(exchange, rest, &mut self.events, request),
-            Some(Err(why)) => Err(Kind::Gzip(why)),
+            Some(Err(kind)) => Err(kind),
         };
         if let Err(kind) = ended {
             return self.fail(request, kind);
@@ -1130,7 +1185,7 @@ impl Client {
         let Some(request) = request else { return };
         let Some(exchange) = self.exchanges.get_mut(&request) else { return };
         exchange.conn = None;
-        if retry && !exchange.retried && idempotent(&exchange.request.method) {
+        if retry && !exchange.retried && exchange.request.method.idempotent() {
             exchange.retried = true;
             exchange.fresh = true;
             return self.start(request);
@@ -1142,7 +1197,7 @@ impl Client {
     fn fail(&mut self, request: RequestId, kind: Kind) {
         let Some(exchange) = self.exchanges.remove(&request) else { return };
         self.drop_conn_of(request, exchange.conn);
-        let error = Error { url: exchange.url.into(), kind };
+        let error = Error { url: exchange.url.as_str().to_owned(), kind };
         self.events.push_back(Event::Failed { request, error });
     }
 
@@ -1172,7 +1227,7 @@ fn deliver(
         return Err(Kind::TooBig { most, said: None, decoded: false });
     }
     let bytes = match exchange.gzip.as_mut() {
-        Some(gzip) => gzip.feed(&data).map_err(Kind::Gzip)?,
+        Some(gzip) => gzip.feed(&data)?,
         None => data,
     };
     give(exchange, bytes, events, request)
@@ -1204,27 +1259,48 @@ fn give(
     Ok(())
 }
 
-/// Where `from` redirecting to `location` (its `Location`, maybe relative) leads; with
-/// `https_only`, a redirect off HTTPS is [`Kind::Downgraded`].
-pub(crate) fn redirect_to(
-    from: &url::Url,
-    location: &str,
-    https_only: bool,
-) -> Result<url::Url, Kind> {
+/// Why a caller's header can't be sent as given: blaze-h1's check, said as a message.
+fn refuse_header(name: &str, value: &str) -> Option<String> {
     // alloc: an error's message, made only when it fails.
-    let next = from
-        .join(location)
-        .map_err(|e| Kind::Url(format!("its redirect leads to no address: {e}")))?;
-    if https_only && next.scheme() != "https" {
-        return Err(Kind::Downgraded { to: next.into() });
+    blaze_h1::check_header(name, value).err().map(|fault| match fault {
+        HeaderFault::NotToken => format!("`{name}` is no header name"),
+        HeaderFault::Owned => {
+            format!("`{name}` is the client's to say: it frames the body, keeps the connection or is a field of the request")
+        }
+        HeaderFault::ControlByte => format!("the value of `{name}` has a line break, a NUL or another control byte in it"),
+    })
+}
+
+/// Where `from` redirecting to `location` (its `Location`) leads: an absolute URL, a
+/// scheme-relative `//host/path` or an absolute path `/path`; a relative path is not followed
+/// (blaze-h1's rule: no server blaze asks sends one). With `https_only`, a redirect off HTTPS
+/// is [`Kind::Downgraded`].
+pub(crate) fn redirect_to(from: &Url, location: &str, https_only: bool) -> Result<Url, Kind> {
+    let scheme = from.scheme().as_str();
+    // alloc: one per redirect, where it leads.
+    let joined = if location.starts_with("//") {
+        format!("{scheme}:{location}")
+    } else if location.starts_with('/') {
+        format!("{scheme}://{}{location}", host_of(from))
+    } else if location.split_once(':').is_some_and(|(it, _)| !it.is_empty() && !it.contains('/')) {
+        location.to_owned()
+    } else {
+        // alloc: an error's message, made only when it fails.
+        return Err(Kind::Url("its redirect is to a relative path, which is not followed: only an absolute URL, `//host/path` or `/path`".to_owned()));
+    };
+    // alloc: an error's message, made only when it fails.
+    let next = Url::parse(&joined).map_err(|e| Kind::Url(format!("its redirect leads to no address: it {}", e.why.says())))?;
+    if https_only && next.scheme().as_str() != "https" {
+        return Err(Kind::Downgraded { to: absolute_of(&next) });
     }
     Ok(next)
 }
 
 /// The origin `url` is asked of: `http` or `https` only, its port the scheme's when it names
-/// none, an IPv6 host without its brackets.
-fn origin_of(url: &url::Url) -> Result<Origin, Kind> {
-    let https = match url.scheme() {
+/// none, an IPv6 host without its brackets. A path and query of ASCII only: a byte past it is
+/// the caller's to percent-encode, not this client's to guess at.
+fn origin_of(url: &Url) -> Result<Origin, Kind> {
+    let https = match url.scheme().as_str() {
         "https" => true,
         "http" => false,
         // alloc: an error's message, made only when it fails.
@@ -1234,56 +1310,39 @@ fn origin_of(url: &url::Url) -> Result<Origin, Kind> {
             )));
         }
     };
-    // alloc: one per exchange, the host its connection goes to.
-    let host = match url.host() {
-        Some(url::Host::Domain(it)) => it.to_owned(),
-        Some(url::Host::Ipv4(it)) => it.to_string(),
-        Some(url::Host::Ipv6(it)) => it.to_string(),
-        None => return Err(Kind::Url("it names no host".to_owned())),
+    let Some(at) = url.origin().map(|it| it.at()) else {
+        return Err(Kind::Url("it names no host".to_owned()));
     };
-    let port = url.port_or_known_default().unwrap_or(if https { 443 } else { 80 });
-    Ok(Origin { https, host, port })
+    if !url.target().is_ascii() {
+        return Err(Kind::Url("its path or query has a byte past ASCII: percent-encode it".to_owned()));
+    }
+    let host = at.host();
+    // alloc: one per exchange, the host its connection goes to.
+    let host = host.strip_prefix('[').and_then(|it| it.strip_suffix(']')).unwrap_or(host).to_owned();
+    Ok(Origin { https, host, port: at.port() })
 }
 
 /// `url`'s `Host`: its host as written (an IPv6 one in brackets), with its port when that is
 /// not the scheme's.
-fn host_of(url: &url::Url) -> String {
-    let host = url.host_str().unwrap_or_default();
-    match url.port() {
+fn host_of(url: &Url) -> String {
+    let Some(at) = url.origin().map(|it| it.at()) else { return String::new() };
+    match url.scheme().default_port() == Some(at.port()) {
         // alloc: one per exchange, its `Host` header.
-        Some(port) => format!("{host}:{port}"),
+        true => at.host().to_owned(),
         // alloc: one per exchange, its `Host` header.
-        None => host.to_owned(),
+        false => at.to_string(),
     }
 }
 
 /// `url`'s request target in absolute form, as a proxy is asked (RFC 9112 section 3.2.2): its
-/// scheme, host and port as [`host_of`] says them, path and query; no credentials and no
-/// fragment.
-fn absolute_of(url: &url::Url) -> String {
+/// scheme, host and port as [`host_of`] says them, path and query; no fragment.
+fn absolute_of(url: &Url) -> String {
     // alloc: one per exchange through a proxy, its request target.
-    format!("{}://{}{}", url.scheme(), host_of(url), target_of(url))
+    format!("{}://{}{}", url.scheme(), host_of(url), url.target())
 }
 
 /// `url`'s request target in origin form: its path and query, no fragment.
-fn target_of(url: &url::Url) -> String {
-    match url.query() {
-        // alloc: one per exchange, its request target.
-        Some(query) => format!("{}?{query}", url.path()),
-        // alloc: one per exchange, its request target.
-        None => url.path().to_owned(),
-    }
-}
-
-/// Whether sending `method` twice does what sending it once does (RFC 9110 section 9.2.2).
-fn idempotent(method: &http::Method) -> bool {
-    matches!(
-        *method,
-        http::Method::GET
-            | http::Method::HEAD
-            | http::Method::OPTIONS
-            | http::Method::TRACE
-            | http::Method::PUT
-            | http::Method::DELETE
-    )
+fn target_of(url: &Url) -> String {
+    // alloc: one per exchange, its request target.
+    url.target().to_owned()
 }

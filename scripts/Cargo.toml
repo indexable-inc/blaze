@@ -13,13 +13,37 @@ repository.workspace = true
 # Every file of src/bin is a script, a binary cargo finds by its name; `selftest` is its test.
 
 [dependencies]
+blaze-data.workspace = true
+blaze-toml.workspace = true
 blaze-script.workspace = true
 # The workspace's one SHA-256, with no dependencies: `smoke` names the binary it ran by its hash.
 blaze-sha256.workspace = true
-# `unicode-case` for `(?i)` as Python's `re.IGNORECASE` folds (crates/blaze-script/Cargo.toml).
-regex = { workspace = true, features = ["unicode-case"] }
+# `proc_macro_modules`: a git source's files, read from the fetch store's verified pack.
+blaze-fetch.workspace = true
+blaze-git-fetch.workspace = true
+# A refused pack's reason as words (`Shown`).
+blaze-text.workspace = true
+# proc_macro_modules: the source corrections' allocator and the lexer's vector width (D58).
+blaze-own = { workspace = true, features = ["std"] }
+# A plain `fn main`'s one frame (memory from the OS), handed down in place of a heap from nowhere.
+blaze-mem.workspace = true
+blaze-lex.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
-toml = { workspace = true, features = ["preserve_order"] }
+# toolchain_cut: the toolchain record it writes and the reader it checks against; the sysroot's
+# units (blaze-unit-graph), the layouts and lockfiles it resolves (blaze-manifest), and editions.
+blaze-toolchain.workspace = true
+blaze-unit-graph.workspace = true
+# toolchain_cut, proc_macro_modules: the paths of the pins in a checkout (pins/README.md).
+blaze-pins.workspace = true
+# proc_macro_modules' native build-script builds (D65): the one deny-by-default Seatbelt
+# profile (`native::seatbelt_with`), so the builder is confined as the scripts it builds are.
+blaze-build-script.workspace = true
+blaze-manifest = { workspace = true, default-features = false }
+edition.workspace = true
+
+[dev-dependencies]
+# store_vendor's tests: a test's root allocator (`blaze_own::testing::heap()`, D102).
+blaze-own = { workspace = true, features = ["std", "testing"] }
 
 [lints]
 workspace = true

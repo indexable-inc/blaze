@@ -34,8 +34,9 @@ case "$RELEASES" in
     https://*) ;;
     *) fail "BLAZE_RELEASES is $RELEASES, which is not an https:// address." "A release and its checksums come from there together, so they are fetched over HTTPS only." ;;
 esac
-# harness/toolchain; harness/toolchain_bump.py writes it
-TOOLCHAIN="nightly-2026-10-27"
+# The pinned nightly is not copied here: its one home is the repository's pins/toolchain, which
+# the installed blaze knows (`blaze toolchain`) and which is published at this address.
+PINNED_TOOLCHAIN="https://raw.githubusercontent.com/$REPO/main/pins/toolchain"
 VERSION="${BLAZE_VERSION:-}"
 CHANNEL="${BLAZE_CHANNEL:-}"
 NO_TOOLCHAIN="${BLAZE_NO_TOOLCHAIN:-}"
@@ -127,7 +128,7 @@ case "$os" in
         esac
         ;;
     MINGW* | MSYS* | CYGWIN* | Windows_NT)
-        fail "this installer is for macOS and Linux." "On Windows, install with: cargo +$TOOLCHAIN install --locked blaze-engine"
+        fail "this installer is for macOS and Linux." "On Windows, install with cargo and the nightly $PINNED_TOOLCHAIN names: cargo +<that nightly> install --locked blaze-engine"
         ;;
     *) fail "blaze has no build for $os yet." "It runs on macOS with Apple silicon and on Linux (x86-64, ARM64)." ;;
 esac
@@ -337,7 +338,7 @@ fi
 
 # blaze downloads its own copy, once, unless rustup has the one it builds with.
 if [ -n "$NO_TOOLCHAIN" ]; then
-    step "Rust $TOOLCHAIN is downloaded at the first build"
+    step "Rust (the nightly blaze pins) is downloaded at the first build"
 elif "$bin/blaze" toolchain >"$tmp/toolchain"; then
     step "$(cat "$tmp/toolchain")"
 else

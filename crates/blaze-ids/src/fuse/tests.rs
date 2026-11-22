@@ -12,8 +12,9 @@ fn random(seed: u64, n: usize) -> Vec<u64> {
 /// and the same after an encoding and decoding.
 #[test]
 fn a_filter_never_hides_a_key_it_was_built_of() {
-    blaze_sim::check(Config::DEFAULT, |tape| {
-        let mut keys: Vec<u64> = tape.vec(0..=3000, "keys", |tape| tape.int("key"));
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
+        let most = if cfg!(miri) { 60 } else { 3000 };
+        let mut keys: Vec<u64> = tape.vec(0..=most, "keys", |tape| tape.int("key"));
         let repeated: usize = tape.int_in(0..=keys.len(), "repeated");
         keys.extend_from_within(..repeated);
         let filter = Fuse8::of(keys.clone());
@@ -30,7 +31,7 @@ fn a_filter_never_hides_a_key_it_was_built_of() {
 
 #[test]
 fn every_size_up_to_a_thousand_holds_its_keys() {
-    for n in 0..1000 {
+    for n in 0..if cfg!(miri) { 40 } else { 1000 } {
         let keys = random(n as u64, n);
         let filter = Fuse8::of(keys.clone());
         assert!(keys.iter().all(|&key| filter.contains(key)), "a filter of {n} keys");
@@ -38,6 +39,7 @@ fn every_size_up_to_a_thousand_holds_its_keys() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "a statistic over 200,000 keys of safe code; the filter's build is the smaller tests'")]
 fn a_large_filter_is_about_nine_bits_a_key_and_rarely_wrong() {
     const N: usize = 200_000;
     let keys = random(1, N);

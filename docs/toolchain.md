@@ -1,6 +1,6 @@
 ---
 status: current
-summary: blaze's own pinned nightly: what it is, how it is fetched and checked, and the daily bump.
+summary: blaze's own pinned nightly: what it is, how it is fetched and checked, and how its pin moves.
 ---
 # blaze's own toolchain
 
@@ -35,15 +35,16 @@ the standard library is part of a compiler.
 ## What it is today
 
 - **Name:** `blaze-<date>` (`blaze-2026-10-27`), after the date of the Rust nightly it is built
-  from (`harness/toolchain`, `nightly-2026-10-27`; `blaze_cargo::toolchain::name`).
+  from (`pins/toolchain`, `nightly-2026-10-27`; `blaze_cargo::toolchain::name`).
   `blaze toolchain` prints it and where it is, downloading it first when it is not there;
   `blaze toolchain --json` prints one object (`name`, `nightly`, `rustc`, `release`, `commit`,
   the host's tuple as `host`, and `sysroot`), which a harness reads instead of running
-  `rustc -vV` (harness/storelib.py, `blaze_toolchain`).
+  `rustc -vV`.
 - **Bytes:** the upstream nightly's `rustc`, `cargo`, the host's `rust-std` and
   wasm32-wasip1's (for wasi-libc, which blaze's linker links every proc macro's module with), unchanged,
   from static.rust-lang.org, each checked against the sha256 compiled into blaze
-  (`crates/blaze-cargo/src/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
+  (`pins/rust.txt`, written by `harness/toolchain_pins.py` and read at compile time by
+  `crates/blaze-pins`, the one Rust reader of `pins/`; [pins/README.md](../pins/README.md)). So `rustc -V`
   still says `1.101.0-nightly (16d1ffac1 2026-10-26)`.
 - **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>`, the machine's: every `BLAZE_HOME` reads
   this one copy (`BLAZE_HOME` moves a daemon's settings and state, not the toolchain).
@@ -66,15 +67,15 @@ the standard library is part of a compiler.
   A rustup toolchain that has `rust-src` is used without it, `RUST_SRC_PATH` is not read,
   and the daemon's front end reads the library blaze fetched (`crates/blaze-cargo/src/toolchain/library.rs`,
   the build's `library` mount) rather than looking for a `rust-src`. Where
-  `rust-src` is still installed it is for something that is not blaze: rustc's side of the
-  harnesses (`.github/actions/toolchain`, [harness.md](harness.md#running-them)), rust-analyzer
+  `rust-src` is still installed it is for something that is not blaze: CI's `cargo` job
+  (`.github/actions/toolchain`, [harness.md](harness.md#ci)), rust-analyzer
   in an editor of this repository (the dev shell of `flake.nix`), and `harness/library.py`,
   which imports `library/` from the nightly's `rust-src` tarball.
 - **Who uses it:** the daemon, which runs none of its programs. Its linker takes the C runtime
   WASI links and the sanitizer runtimes from the toolchain's sysroot
   (`blaze_link::target::locate`), and blaze answers `rustc --print sysroot` with it. A build
   script's `RUSTC` and `RUSTDOC` are blaze itself, linked as `rustc` and `rustdoc` in the
-  daemon's `tools` directory (`crates/blaze-engine/src/as_rustc.rs`). The user's `cargo`,
+  daemon's `tools` directory (`crates/blaze-cargo/src/as_rustc.rs`). The user's `cargo`,
   `rustc` and pins are untouched, and blaze reads none of them.
 - **What rustc says:** blaze answers every question asked of rustc (`--version`, `-vV`,
   `--print cfg|sysroot|target-libdir|target-spec-json|...`) itself, for this release
@@ -82,12 +83,12 @@ the standard library is part of a compiler.
   stand-in, which also checks the probes build scripts compile (`autocfg`, `rustversion`,
   `version_check`, `anyhow`'s and `thiserror`'s) with `blaze check`'s verdict. No rustc is run to find any of it
   ([no-rustc.md](no-rustc.md), step B).
-- **Bumps:** every day, to the newest nightly, by a workflow, with the merge gate and the
-  release train as the gate ([The daily bump](#the-daily-bump)).
+- **Bumps:** by hand, to a newer nightly, with `harness/toolchain_bump.py`
+  ([Moving the pin](#moving-the-pin)).
 
 ## The LLVM blaze is built with
 
-Building blaze itself takes one more pinned piece, LLVM: `crates/hir-ty-codegen/llvm.json` names
+Building blaze itself takes one more pinned piece, LLVM: `pins/llvm.json` names
 its commit and version (23.1.4, our fork's `ix/23.x`) and the sha256 of each target's release
 archive. blaze fetches it itself, by that sha256, and hands it to the build scripts that link
 it: the root `Cargo.toml` declares it a pinned native input
@@ -99,79 +100,26 @@ For a target with no archive, the `llvm` workflow (`.github/workflows/llvm.yaml`
 is not a toolchain for projects: it builds them with the toolchain above. Its MC assembler is
 what assembles `asm!`, `naked_asm!` and `global_asm!` in process, never the machine's clang or
 `cc`. The seed, built without LLVM, assembles them with rsasm in process (hir-ty-codegen's
-`rsasm`, which blaze-engine's `seed` turns on; `vendor/rsasm/SOURCE.md`). What else
+`rsasm`; `vendor/rsasm/SOURCE.md`). What else
 blaze still takes from the machine's C toolchain (the C driver the linker asks for crt files,
 the macOS SDK, MSVC's libraries, build scripts' `CC`) and the plan to replace it with one C
 toolchain built from this LLVM: [v2/plan/toolchain-c.md](v2/plan/design/toolchain-c.md).
 
-## The daily bump
+## Moving the pin
 
-blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` runs every day at
-05:40 UTC (nightlies are published at about 00:00 to 02:00 UTC), and by hand with a date
-(`gh workflow run toolchain-bump.yaml -f date=2026-11-02`):
-
-1. On the branch `toolchain/bump` (the open bump's with main merged in, or a new one from main),
-   `harness/toolchain_bump.py` pins the newest nightly whose manifest has every component blaze
-   needs on every host it ships for. It writes `harness/toolchain` and `pins.txt`, re-vendors
-   `crates/rustc_abi` from rust-lang/rust at the new commit, merges
-   the new nightly's standard library into `library/` ([The standard
-   library](#the-standard-library-library)), and moves the pin in `site/install.sh`, `Cargo.toml`
-   and the flake.
-2. `harness/answers.py --write` on Linux x86-64, Linux AArch64 and macOS arm64, since the
-   target specs depend on the host rustc was built for; the three are merged into
-   `crates/blaze-units/src/stdlib/rustc.json`, and `tools/cpus.py` writes the CPU table
-   (`target_features::cpus`) from it.
-3. The pull request `toolchain: pin nightly-YYYY-MM-DD` is opened, or updated when one is open,
-   which runs the merge gate, and the release train is started on the branch and on
-   `toolchain/base`, the main commit the branch is on, to compare with. (main's own trains are
-   cancelled by the next merge more often than not, and an older one has red that main gained
-   since.) The train is
-   what a bump needs beyond the gate: every harness on four platforms and `blaze` on real
-   projects.
-4. When the train finishes, the verdict (`.github/scripts/toolchain_bump_ci.py verdict`)
-   compares its jobs with `toolchain/base`'s train. (v1's count of the functions the standard
-   library refused, `stdcount.py`, was deleted on 2026-10-30: v2 compiles std's crates as units
-   of the build like any other, and the train's harnesses build them.)
-   - **green**: no job or harness red that is green on `toolchain/base`'s train (waited for, or
-     started if there is none; main's newest finished train only if it was cancelled):
-     `gh pr merge --auto`, so it lands once the gate passes, and
-     the next release of blaze carries the new pin. The gate passed hours before, and GitHub
-     acts on auto-merge only when a check finishes after it is set, so the gate's `ci` job runs
-     again (seconds). A merge made for GITHUB_TOKEN starts no workflow, so once it merges the
-     verdict dispatches on main every workflow a push to main starts (`train.yaml`,
-     `blaze.yaml`, ...). A job red on main too is listed and not
-     counted against the bump; the train's own issue covers it.
-   - **red on the first attempt**: the train's failed jobs run again (`gh run rerun --failed`),
-     and the verdict of that attempt decides, so a harness that fails one run in ten does not
-     block a day's bump. A job red on main too runs again with them.
-   - **red**: a comment on the pull request with what broke, and the issue
-     "Toolchain bump to <date> is blocked", opened or commented on and retitled to the
-     newest date, with how many days main's pin is behind. The pull request stays open.
-   - **no verdict** (GitHub's API failing past its retries, a bug in the script): the same
-     issue says so, with `gh workflow run toolchain-bump.yaml -f train=<run id>`, which counts
-     and decides again with main's scripts.
-5. A step before the pull request that fails (a vendoring conflict, a conflict merging the
-   standard library, no usable nightly in two weeks, a conflict merging main into the bump) opens or comments on the same issue with what
-   failed, and so does a bump open for a day without merging. Nothing is skipped quietly.
-6. Once a bump has merged, `python3 harness/nightly_features.py '{}'` on main moves the
-   tree of nightly features (#967) to the new pin: an issue for each new language feature, and
-   a comment and a close on the issue of each one stabilized or removed. The workflow does not
-   run it yet; it is run by hand after the merge.
-7. blaze's registry of rustc's lints (`crates/blaze-lint-defs/src/rustc.rs`: every lint with
-   its level, text and flags, the groups, the renamed and removed names) is written from
-   rustc's source at the new commit by the bump itself
-   (`blaze run -q -p scripts --bin lint_table -- '{"command": "write", "rust": "<checkout>"}'`),
-   and the gate's `lint_table check` fails a tree whose registry was written from another
-   commit than `library/UPSTREAM`'s, or was edited. What the new lints, levels and wordings
-   ask of blaze-diagnostics is then its tests' to show. A bump that crosses a release also
-   reads that release's "Language" section against [language.md](language.md) and adds its
-   cases to `crates/blaze-diagnostics/src/tests/stabilized.rs` and
-   `crates/hir-ty-mir/src/tests/mir/stabilized.rs`. The feature gates of blaze-diagnostics
-   are still a hand copy.
-
-Fixes for what a nightly breaks (layouts, the ABI, std's source, intrinsics, borrow-check
-verdicts) are pushed to `toolchain/bump`. The next day's run merges main into it and moves it to
-that day's nightly from there, so they are kept, and the train runs again.
+The daily bump workflow was deleted on 2026-11-15; the pin moves by hand.
+`uv run --frozen python harness/toolchain_bump.py '{}'` (or `'{"date": "YYYY-MM-DD"}'`) picks
+the newest nightly whose manifest has every component blaze needs on every host it ships for,
+writes `pins/toolchain` and `pins/rust.txt`
+(`harness/toolchain_pins.py`), re-vendors the crates blaze takes from rust-lang/rust at the new
+commit, merges the new nightly's standard library into `library/` ([The standard
+library](#the-standard-library-library)) and writes blaze's registry of rustc's lints again
+(`crates/blaze-lint-defs/src/rustc.rs`, `scripts/src/bin/lint_table.rs`); each step names
+itself when it fails, and stops there (the script's docstring lists them). After it,
+`harness/answers.py --write` on each host writes `pins/answers/rustc.json`,
+and `harness/nightly_features.py '{}'` moves the tree of nightly features (#967) to the new pin.
+The gate's `lint_table check` fails a tree whose registry was written from another commit than
+`library/UPSTREAM`'s, or was edited.
 
 ## The standard library: library/
 
@@ -200,8 +148,7 @@ of blaze is told where it is in `BLAZE_LIBRARY`, the first of:
   downloaded as the release's `library-<digest>.tar.xz` (6.0 MB, `harness/library.py
   archive` writes it, the release workflow attaches it). `BLAZE_LIBRARY_FROM` names another
   place to get it from (an address or a directory with that archive, or a library to copy),
-  taken over the checkout too: `harness/libraryfetch.py` installs from an archive served
-  locally that way, so the release's download is tried before a tag ships. Whichever way it
+  taken over the checkout too. Whichever way it
   came it is checked against the digest file by file. A checkout's own
   `library/` is never read in place: what the store keeps of a crate whose data names the
   checkout being built is that checkout's alone, and the standard library's is everyone's.
@@ -216,41 +163,17 @@ of blaze is told where it is in `BLAZE_LIBRARY`, the first of:
   runs (same bytes, parent, author and date: the same commit). `git diff upstream/library --
   library/` is blaze's changes (`python3 harness/library.py snapshot '{}'` points the local
   branch at `UPSTREAM`'s snapshot first).
-- The daily bump moves it with the pin as a merge (`harness/library.py merge`): it makes the
+- A bump moves it with the pin as a merge (`harness/library.py merge`): it makes the
   new nightly's snapshot on `upstream/library` and applies upstream's changes from the old
   snapshot to the new one three-way, so blaze's own changes are kept, then pushes the snapshot
-  with its branch. A conflict stops the bump, names the files and opens the bump's issue.
+  with its branch. A conflict stops the bump and names the files.
 
 To change the standard library, edit it under `library/`, run
 `python3 harness/library.py digest '{}'` (the test `the_library_is_the_one_its_digest_says`
 fails on a stale `DIGEST`) and commit. The next build copies the changed library into
 `~/.blaze/library/<new digest>`, and the store keys what it compiles of it apart from the old.
-Nothing checks it against upstream file by file: the integration tests (smoke, the rustc
-comparison harnesses, real crates) are what hold blaze's behaviour to the nightly's.
-
-## How far behind it gets, and how long a bump takes
-
-Measured 2026-10-27, on the first bump the workflow made.
-
-- **Before the daily bump** the pin moved by hand: Rust 1.99.0 until 2026-10-25 (ce555b5f2d),
-  then that day's nightly, two days old when the first automatic bump started.
-- **Which nightly:** every one of the 120 nightlies up to 2026-10-27 had every component blaze
-  needs on all four hosts (a scan of their manifests with `toolchain_bump.missing`), so the
-  newest usable nightly is that day's. How far behind main is comes from the gates alone: the
-  run at 05:40 UTC takes a nightly about 4 to 6 hours old, which lands hours later, so main's pin
-  is under a day old on a green day and one day older for each red day.
-- **The first bump** (to the nightly of 2026-10-27, #543): dispatched 11:40:01Z, merged 16:53:36Z, 5 h 14
-  min. The bump and the answers of three hosts took 80 s. The train took 2 h 11 min (most of it
-  the `projects (nushell)` jobs, red on main too, running into their 120-minute timeout), the
-  verdict 32 min waiting for `toolchain/base`'s train, the rerun of one job red only on the bump
-  (`remote.py`, a remote-cache flake) 2 h 1 min, and the verdict on it 3 min. blaze built on the
-  new nightly with no change to its code: the standard library refused 1940 of 25960 functions
-  against main's 1940 of 25942 (+0), borrow-check UI was green, and no harness was red that is
-  green on main's train.
-  The changes it needed were to the bump itself (#540, #578, #615, #657, #691, #699).
-- **A typical day,** then: about 2 h 45 min from the run to the merge when the train has no new
-  red, about 5 h with one rerun. The nushell jobs' timeout is most of each train while they are
-  red on main.
+Nothing checks it against upstream file by file: the smoke corpus and real crates' own tests
+are what hold blaze's behaviour to the nightly's.
 
 ## What it means for a project
 
@@ -282,5 +205,5 @@ already blaze's (`library/`, downloaded with blaze's release rather than as the 
   gone. Done: `library/`, the release's `library-<digest>.tar.xz`.
 - [#403](https://github.com/indexable-inc/blaze/issues/403): shrink the download as each
   no-rustc step removes a piece (`cargo`, `rustc`, `rust-std`), down to blaze alone.
-- [#404](https://github.com/indexable-inc/blaze/issues/404): the bump, every day
-  ([The daily bump](#the-daily-bump)), the `blaze-<date>` name moving with it.
+- [#404](https://github.com/indexable-inc/blaze/issues/404): the bump
+  ([Moving the pin](#moving-the-pin)), the `blaze-<date>` name moving with it.

@@ -6,7 +6,9 @@
 //! nothing else: SRI's base64 (`sha256-…`), Nix's base32 and upper-case names are refused, so a
 //! digest has one spelling and a pin compares as text. md5 and sha1 are refused as weak by name,
 //! and every other algorithm as unknown, naming the three that are taken. A git commit id is not
-//! a digest: it selects a commit and never verifies one ([`crate::Source::Git`]).
+//! a digest: it selects a commit, whose objects git's own ids then bind ([`crate::plan::Unit::Git`]).
+//! blaze-audit pins sources by these; the fetch of a lock's crates checks its SHA-256 directly
+//! ([`crate::fetch`]).
 
 use std::fmt;
 
@@ -39,14 +41,6 @@ impl Algo {
         }
     }
 
-    /// Its byte in a key ([`crate::store`]); never reused.
-    pub(crate) const fn code(self) -> u8 {
-        match self {
-            Algo::Sha256 => 1,
-            Algo::Sha512 => 2,
-            Algo::Blake3 => 3,
-        }
-    }
 
     fn named(name: &str) -> Option<Algo> {
         Algo::ALL.into_iter().find(|it| it.name() == name)
@@ -185,19 +179,6 @@ impl std::str::FromStr for Digest {
     }
 }
 
-impl serde::Serialize for Digest {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(self)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for Digest {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Digest, D::Error> {
-        let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
-        Digest::parse(&text).map_err(serde::de::Error::custom)
-    }
-}
-
 /// Plain BLAKE3 of some bytes, as `b3sum` prints it: what the store files an object by.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Blake3(pub [u8; 32]);
@@ -208,7 +189,7 @@ impl Blake3 {
     }
 
     /// As a store key's input. A plain BLAKE3, not a derive-key one: only a key built in this
-    /// crate's own schema reads it ([`crate::store`]).
+    /// crate's own schema reads it.
     pub fn id(&self) -> blaze_ids::ContentId {
         blaze_ids::ContentId(self.0)
     }
@@ -235,7 +216,7 @@ pub struct Hashing {
 enum Other {
     None,
     Sha256(blaze_sha256::Sha256),
-    Sha512(sha2::Sha512),
+    Sha512(blaze_ed25519::sha512::Sha512),
 }
 
 /// What a [`Hashing`] came to.
@@ -260,7 +241,7 @@ impl Hashing {
     pub fn new(algo: Algo) -> Hashing {
         let other = match algo {
             Algo::Sha256 => Other::Sha256(blaze_sha256::Sha256::new()),
-            Algo::Sha512 => Other::Sha512(<sha2::Sha512 as sha2::Digest>::new()),
+            Algo::Sha512 => Other::Sha512(blaze_ed25519::sha512::Sha512::new()),
             Algo::Blake3 => Other::None,
         };
         Hashing { other, blake3: blaze_ids::b3::Hasher::new(), len: 0 }
@@ -273,7 +254,7 @@ impl Hashing {
             Other::Sha256(it) => {
                 it.update(bytes);
             }
-            Other::Sha512(it) => sha2::Digest::update(it, bytes),
+            Other::Sha512(it) => it.update(bytes),
         }
         self.len += bytes.len() as u64;
     }
@@ -283,7 +264,7 @@ impl Hashing {
         let digest = match self.other {
             Other::None => Digest::new(Algo::Blake3, &blake3.0),
             Other::Sha256(it) => Digest::new(Algo::Sha256, &it.finish()),
-            Other::Sha512(it) => Digest::new(Algo::Sha512, &sha2::Digest::finalize(it)),
+            Other::Sha512(it) => Digest::new(Algo::Sha512, &it.finalize()),
         };
         Hashed {
             digest: digest.expect("each hasher's output is its algorithm's length"),

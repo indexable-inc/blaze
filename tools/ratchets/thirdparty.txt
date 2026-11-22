@@ -1,0 +1,44 @@
+# The third-party packages the `blaze` binary reaches (docs/v2/plan/design/end-state.md, D180).
+# Target 0. `(reached)`: packages with a source (registry or git) reached from blaze-cli's
+# `blaze` by normal and build edges, every platform; `(with tests)`: from every member, dev
+# edges too; then `<our crate><TAB><third-party name>` for each name a reached crate of ours
+# names directly (a package under vendor/ is third-party unless tools/ratchets/vendored.txt
+# names it). Only falls: `just lint-write` lowers it; a new pair or a higher count is refused.
+# Empty or absent, the gate refuses every third-party package outright. Checked by
+# scripts/src/bin/thirdparty.rs (`reach-check`), a row of tools/gate.txt.
+(reached)	205
+(with tests)	274
+blaze-cas	libc
+blaze-check	libc
+blaze-check	windows-sys
+blaze-core	libc
+blaze-core	windows-sys
+blaze-http	bytes
+blaze-http	quinn-proto
+blaze-http	rustls
+blaze-ids	serde
+blaze-inproc-rt	libc
+blaze-ladder	libc
+blaze-launch-rt	libc
+blaze-manifest	serde
+blaze-manifest	serde_json
+blaze-manifest	url
+blaze-mem	libc
+blaze-mem	windows-sys
+blaze-proc-macro	libc
+blaze-proc-macro	tracing
+blaze-proc-macro	wasmtime
+blaze-protocol	serde
+blaze-remote	ring
+blaze-report	serde
+blaze-report	sonic-rs
+blaze-resolve	imbl
+blaze-resolve	serde
+blaze-resolve	url
+blaze-screen	serde
+blaze-source	rustc-stable-hash
+blaze-source	serde
+blaze-source	url
+blaze-wasi	wasmtime
+stdx	libc
+stdx	stacker

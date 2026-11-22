@@ -1,0 +1,42 @@
+[package]
+name = "blaze-body-eval"
+description = "The constant evaluator over the one body (docs/v2/plan/design/backend-next.md, \"The body: one lowering\", D119, P5): an interpreter of a verified `blaze_body::Body` at ground type arguments, its rows run as written (blocks and terminators, locals, drops), over blaze-consteval's memory with provenance, layouts, arithmetic and typed refusals; an explicit frame stack, a step bound and a depth bound"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# core only beside the crates it names; the allocator is a value the caller passes in.
+[dependencies]
+# The input: `Verified` (the proof a body is well formed) and every row's form.
+blaze-body.workspace = true
+# The machine kept (rule 30): `mem` (allocations, pointers with provenance, unwritten bytes),
+# `Layout`, `Refusal`/`ConstError`, `ConstWorld` (the same `resolve` and `fn_kind` questions),
+# `ConstRecord`, the integer and float rules (`arith`) and the soft floats.
+blaze-consteval.workspace = true
+# `ground` (a type of a body's table at the frame's arguments), `instance_key`, `LayoutCx`,
+# the intrinsics table (`Which`) and the data form of a record.
+blaze-build.workspace = true
+# `PTy`, `PNode`, `PTys`, `PortableTys`, `List`, `ItemKey`, `Fetch`.
+blaze-typeck.workspace = true
+# `Vec` in the allocator the caller passes; `Alloc`.
+blaze-own.workspace = true
+# `ContentId`: a record's reads. By path: the workspace entry turns on serde adapters.
+blaze-ids.workspace = true
+
+[dev-dependencies]
+blaze-own = { workspace = true, features = ["std", "testing"] }
+# `Fx`: the table world's types and ADTs, written by hand.
+blaze-typeck = { workspace = true, features = ["testing"] }
+# `fixture::World`: the old evaluator's table world (ADTs, layouts' facts, fn kinds), wrapped.
+blaze-consteval = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

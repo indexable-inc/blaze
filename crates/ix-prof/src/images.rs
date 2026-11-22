@@ -103,6 +103,14 @@ fn hash_file(image: &Image, open: &std::path::Path) -> Result<String, String> {
     if len == 0 {
         return Err(format!("{} is empty", open.display()));
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use blaze_sys::posix::io::{self, MapFlags, Prot};
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // SAFETY: this requests a fresh private mapping at an address chosen by the kernel.
+    let at = unsafe {
+        io::mmap(None, len, Prot::READ, MapFlags::PRIVATE, Some(blaze_sys::Fd::new(file.as_raw_fd())), 0)
+    }.map_err(|why| format!("mapping {}: {}", open.display(), std::io::Error::from_raw_os_error(i32::from(why.raw()))))?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     // SAFETY: a new read-only private mapping of `len` bytes of a file opened above, unmapped
     // below before anything it lends out outlives it.
     let at = unsafe {
@@ -115,13 +123,18 @@ fn hash_file(image: &Image, open: &std::path::Path) -> Result<String, String> {
             0,
         )
     };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     if at == libc::MAP_FAILED {
         return Err(format!("mapping {}: {}", open.display(), std::io::Error::last_os_error()));
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let ptr = at.as_ptr();
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let ptr = at.cast::<u8>();
     // SAFETY: the mapping is `len` readable bytes until the `munmap` below, and `bytes` is not
     // used past it. A file written while mapped could change under the hash; an executable
     // being run is not written in place (Linux refuses, `ETXTBSY`).
-    let bytes = unsafe { std::slice::from_raw_parts(at.cast::<u8>(), len) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
     let checked = match &image.build_id {
         Some(want) => match file_build_id(bytes) {
             Some(got) if got == *want => Ok(()),
@@ -137,6 +150,10 @@ fn hash_file(image: &Image, open: &std::path::Path) -> Result<String, String> {
         None => Ok(()),
     };
     let hash = checked.map(|()| blake3::hash(bytes).to_hex().to_string());
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // SAFETY: the mapping made above, of `len`, unmapped once; `bytes` is dead.
+    let _ = unsafe { io::munmap(at, len) };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     // SAFETY: the mapping made above, of `len`, unmapped once; `bytes` is dead.
     unsafe { libc::munmap(at, len) };
     hash
@@ -165,9 +182,9 @@ mod platform {
     pub(super) fn loaded() -> Vec<Image> {
         unsafe extern "C" fn each(
             info: *mut libc::dl_phdr_info,
-            _size: libc::size_t,
-            out: *mut libc::c_void,
-        ) -> libc::c_int {
+            _size: usize,
+            out: *mut core::ffi::c_void,
+        ) -> core::ffi::c_int {
             // SAFETY: the loader gives a valid entry for the length of the call, and `out` is
             // the `Vec<Image>` `loaded` passed, alive and not otherwise borrowed for the call.
             let (info, out) = unsafe { (&*info, &mut *out.cast::<Vec<Image>>()) };
@@ -281,26 +298,33 @@ mod platform {
 #[cfg(target_vendor = "apple")]
 mod platform {
     use super::{Image, hex};
+    #[cfg(target_os = "macos")]
+    use blaze_sys::posix::thread as dyld;
+    #[cfg(not(target_os = "macos"))]
+    use libc as dyld;
 
     const MH_MAGIC_64: u32 = 0xfeed_facf;
     const LC_SEGMENT_64: u32 = 0x19;
     const LC_UUID: u32 = 0x1b;
 
     pub(super) fn loaded() -> Vec<Image> {
+        #[cfg(target_os = "macos")]
+        let count = dyld::_dyld_image_count();
+        #[cfg(not(target_os = "macos"))]
         // SAFETY: no precondition.
         let count = unsafe { libc::_dyld_image_count() };
         // alloc: a listing of images, once a flush with samples
         let mut out = Vec::with_capacity(count as usize);
         for i in 0..count {
             // SAFETY: an index below the count; a library unloaded meanwhile gives null.
-            let header = unsafe { libc::_dyld_get_image_header(i) };
+            let header = unsafe { dyld::_dyld_get_image_header(i) };
             if header.is_null() {
                 continue;
             }
             // SAFETY: as above.
-            let slide = unsafe { libc::_dyld_get_image_vmaddr_slide(i) } as u64;
+            let slide = unsafe { dyld::_dyld_get_image_vmaddr_slide(i) } as u64;
             // SAFETY: as above; a NUL-terminated path dyld keeps while the image is loaded.
-            let name = unsafe { libc::_dyld_get_image_name(i) };
+            let name = unsafe { dyld::_dyld_get_image_name(i) };
             // SAFETY: as above, checked for null.
             let path = (!name.is_null())
                 .then(|| unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned());
@@ -369,7 +393,11 @@ mod platform {
 
     pub(super) fn boot() -> Option<String> {
         let mut buf = [0u8; 64];
+        #[cfg(target_os = "macos")]
+        let len = dyld::sysctl_bytes(c"kern.bootsessionuuid", &mut buf).ok()??;
+        #[cfg(not(target_os = "macos"))]
         let mut len = buf.len();
+        #[cfg(not(target_os = "macos"))]
         // SAFETY: a NUL-terminated name, a buffer of `len` bytes to fill and its length to
         // update; no new value.
         let got = unsafe {
@@ -381,6 +409,7 @@ mod platform {
                 0,
             )
         };
+        #[cfg(not(target_os = "macos"))]
         if got != 0 {
             return None;
         }

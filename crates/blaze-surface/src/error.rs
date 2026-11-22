@@ -102,6 +102,9 @@ pub enum BuildError {
     Twice { table: &'static str, key: ContentId },
     /// A row of `table` names a crate the graph does not hold.
     Unknown { table: &'static str, key: ContentId },
+    /// A record of `table` was given two values of one fact that differ: `what` names it (a
+    /// proc macro's export name and the name of its item).
+    Disagrees { table: &'static str, what: &'static str },
 }
 
 impl fmt::Display for BuildError {
@@ -121,6 +124,9 @@ impl fmt::Display for BuildError {
             }
             BuildError::Unknown { table, key } => {
                 write!(f, "a row of the table {table} names the crate {key:x}, which the graph does not hold")
+            }
+            BuildError::Disagrees { table, what } => {
+                write!(f, "the table {table} was given two values that differ: {what}")
             }
         }
     }

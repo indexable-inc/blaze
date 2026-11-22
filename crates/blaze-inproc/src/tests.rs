@@ -886,25 +886,112 @@ fn retired_code_waits_for_the_threads_of_a_live_process() {
     memory.reserve(arena, 16).unwrap();
 }
 
-/// The invariant: a start hook in a PID namespace of its own (a sandboxed run on Linux) is
-/// known by the last ID of its `NSpid`, the one its `getpid` answers; the control is a status
-/// with no such line, which names nobody. `host` is the daemon's side, behind its feature, as
-/// the `host` tests of `linux` below are.
-#[cfg(feature = "host")]
 #[test]
-fn a_hook_in_a_pid_namespace_is_known_by_its_innermost_id() {
-    let nested = "Name:\tt\nTgid:\t4711\nPid:\t4711\nNSpid:\t4711\t2\nNSpgid:\t4711\t1\n";
-    assert_eq!(crate::host::innermost(nested), Some(2));
-    assert_eq!(crate::host::innermost("Name:\tt\nNSpid:\t4711\n"), Some(4711));
-    assert_eq!(crate::host::innermost("Name:\tt\nPid:\t4711\n"), None);
-    assert_eq!(crate::host::innermost("NSpid:\t4711\tx\n"), None);
+fn retire_batch_shares_one_epoch_and_tracks_unposted_cursor() {
+    if !SUPPORTED {
+        return;
+    }
+    let page = crate::sys::page();
+    let arena_pages = 8u64;
+    let mut exe = elf(&[
+        (R, 0, 0, 0x200, 0x200),
+        (RX, page, page, page, page),
+        (0, 0, 4 * page, 0, arena_pages * page),
+        (0, 0, (4 + arena_pages + 2) * page, 0, page),
+    ]);
+    exe.resize(2 * page as usize, 0);
+    let mut memory = CodeMemory::with_cells("batch", 2 * page, arena_pages * page, page).unwrap();
+    memory.write(0, &exe).unwrap();
+    memory.lay_out(Format::Elf).unwrap();
+
+    // Cold retire_batch (no attached process): immediately frees all ranges without bumping epoch.
+    let epoch0 = memory.fences.epoch();
+    let cold_ranges: Vec<CodeRange> = (0..16).map(|_| memory.reserve(64, 16).unwrap()).collect();
+    memory.retire_batch(&[]).unwrap();
+    memory.retire_batch(&cold_ranges).unwrap();
+    assert_eq!(memory.held(), 0);
+    assert_eq!(memory.fences.epoch(), epoch0);
+    assert_eq!(memory.arena.largest(), arena_pages * page);
+
+    // Attach a non-existent pid (`i32::MAX` -> 0 live threads, so `collect()` passes graces).
+    let ghost_pid = i32::MAX as u32;
+    memory.attach(ghost_pid);
+
+    // Validation atomicity: a batch containing an out-of-arena range retires nothing.
+    let valid_r = memory.reserve(64, 16).unwrap();
+    let bad_r = CodeRange { offset: 0, len: 16 };
+    assert!(memory.retire_batch(&[valid_r, bad_r]).is_err());
+    assert_eq!(memory.held(), 0);
+    assert_eq!(memory.fences.epoch(), epoch0);
+    memory.unreserve(valid_r).unwrap();
+
+    // Retire 32 ranges in ONE batch: must bump W_EPOCH by EXACTLY 1 (one SeqCst fence).
+    let batch32: Vec<CodeRange> = (0..32).map(|_| memory.reserve(64, 16).unwrap()).collect();
+    memory.retire_batch(&batch32).unwrap();
+    assert_eq!(memory.fences.epoch(), epoch0 + 1, "retire_batch must share ONE epoch bump");
+    assert_eq!(memory.unposted, 32);
+    assert_eq!(memory.limbo.len(), 32);
+    assert_eq!(memory.held(), 32 * 64);
+
+    // Overflow fence::ENTRIES (256): retire 300 more ranges in ONE batch.
+    // 256 - 32 = 224 fit in the control table now; 76 remain unposted in `limbo[unposted..]`.
+    let batch300: Vec<CodeRange> = (0..300).map(|_| memory.reserve(64, 16).unwrap()).collect();
+    memory.retire_batch(&batch300).unwrap();
+    assert_eq!(memory.fences.epoch(), epoch0 + 2, "overflow batch still does ONE epoch bump");
+    assert_eq!(memory.unposted, crate::fence::ENTRIES);
+    assert_eq!(memory.limbo.len(), 332);
+    assert!(memory.limbo[..memory.unposted].iter().all(|(entry, _)| entry.is_some()));
+    assert!(memory.limbo[memory.unposted..].iter().all(|(entry, _)| entry.is_none()));
+
+    // First collect(): frees the 256 posted entries AND automatically posts the remaining 76!
+    let freed1 = memory.collect().unwrap();
+    assert_eq!(freed1, crate::fence::ENTRIES);
+    assert_eq!(memory.limbo.len(), 76);
+    assert_eq!(memory.unposted, 76);
+    assert_eq!(memory.fences.epoch(), epoch0 + 3);
+    assert!(memory.limbo.iter().all(|(entry, _)| entry.is_some()));
+
+    // Second collect(): frees the remaining 76 entries.
+    let freed2 = memory.collect().unwrap();
+    assert_eq!(freed2, 76);
+    assert_eq!(memory.limbo.len(), 0);
+    assert_eq!(memory.unposted, 0);
+    assert_eq!(memory.held(), 0);
+    assert_eq!(memory.arena.largest(), arena_pages * page);
+
+    memory.exited(ghost_pid);
+}
+
+#[test]
+fn zero_works_both_cold_and_with_attached_process() {
+    let Some(probe) = memory(1, 1) else { return };
+    let page = probe.page();
+    drop(probe);
+    let Some(mut memory) = memory(4 * page, page) else { return };
+    // Cold path (`processes.is_empty()`): skips icache publish while still zeroing written pages.
+    memory.write(page + 16, &[0xaa; 32]).unwrap();
+    assert_eq!(memory.zero(0, 4 * page).unwrap(), page);
+    assert!(memory.bytes(CodeRange { offset: page + 16, len: 32 }).unwrap().iter().all(|&b| b == 0));
+
+    // Warm path (with an attached process): zeroes and publishes written pages.
+    let pid = std::process::id();
+    memory.attach(pid);
+    memory.write(2 * page + 8, &[0xbb; 16]).unwrap();
+    assert_eq!(memory.zero(2 * page, page).unwrap(), page);
+    assert!(
+        memory.bytes(CodeRange { offset: 2 * page + 8, len: 16 }).unwrap().iter().all(|&b| b == 0)
+    );
+    memory.exited(pid);
 }
 
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod linux {
     use std::path::PathBuf;
+    use std::ptr::NonNull;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
+
+    use blaze_sys::linux::{self, MapFlags, Prot};
 
     use super::*;
     use crate::channel::Channel;
@@ -992,17 +1079,16 @@ mod linux {
         fn new(len: usize) -> FileLike {
             // SAFETY: a new private anonymous mapping the kernel places; nothing else uses it.
             let at = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
+                linux::mmap(
+                    None,
                     len,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                    -1,
+                    Prot::READ | Prot::WRITE,
+                    MapFlags::PRIVATE | MapFlags::ANONYMOUS,
+                    None,
                     0,
                 )
-            };
-            assert_ne!(at, libc::MAP_FAILED);
-            FileLike { at: at as u64, len }
+            }.unwrap();
+            FileLike { at: at.as_ptr() as u64, len }
         }
 
         /// Puts `bytes` here and makes the pages read and execute, as the file maps.
@@ -1013,13 +1099,13 @@ mod linux {
             // SAFETY: the same mapping, made read and execute before any thread runs it.
             assert_eq!(
                 unsafe {
-                    libc::mprotect(
-                        self.at as *mut libc::c_void,
+                    linux::mprotect(
+                        NonNull::new_unchecked(self.at as *mut u8),
                         self.len,
-                        libc::PROT_READ | libc::PROT_EXEC,
+                        Prot::READ | Prot::EXEC,
                     )
                 },
-                0
+                Ok(())
             );
         }
 
@@ -1034,7 +1120,7 @@ mod linux {
         fn drop(&mut self) {
             // SAFETY: the pages this made (or the overlay that replaced them), which no thread
             // runs any more: the test joined its thread.
-            unsafe { libc::munmap(self.at as *mut libc::c_void, self.len) };
+            let _ = unsafe { linux::munmap(NonNull::new_unchecked(self.at as *mut u8), self.len) };
         }
     }
 
@@ -1376,434 +1462,5 @@ mod linux {
         assert!(len > 1);
         let mut short = [0u64; 1];
         assert_eq!(sys::backtrace(&mut short), None);
-    }
-
-    #[cfg(feature = "host")]
-    mod host {
-        use std::sync::Arc;
-
-        use blaze_core::{Command, Sandbox};
-        use blaze_core::lock::Lock;
-
-        use super::*;
-        use crate::handshake::HOST_VAR;
-        use crate::host::{Host, Image, Launch, Program, StartError};
-
-        /// The invariant: a launch whose path the build's record says holds another key than
-        /// the program's memory, or holds nothing, is refused with
-        /// [`StartError::NotPlaced`] naming the path, the key placed and the key held, and the
-        /// file at the path is left as it was (the host writes no file): no fallback write.
-        #[test]
-        fn a_launch_from_a_path_not_holding_its_file_is_refused_naming_both_keys() {
-            use std::os::unix::fs::MetadataExt;
-            let Some(memory) = laid_out("refused") else { return };
-            let page = memory.page();
-            let (_held, dir) = temp_dir();
-            std::fs::create_dir_all(&dir).unwrap();
-            let host = Arc::new(Host::new(&dir.join("host")).unwrap());
-            let memory = Arc::new(Lock::new("inproc.test.memory", memory));
-            let (sessions, _got) = crossbeam_channel::unbounded();
-            let held = [7; 32];
-            let program =
-                Program::new(host, memory.clone(), Image { key: held, len: 2 * page }, sessions);
-            let path = dir.join("prog");
-            std::fs::write(&path, b"another build's file").unwrap();
-            let identity = |path: &std::path::Path| {
-                let meta = std::fs::metadata(path).unwrap();
-                (meta.ino(), meta.len(), meta.mtime(), meta.mtime_nsec(), std::fs::read(path).unwrap())
-            };
-            let before = identity(&path);
-            let command = || Command {
-                program: path.clone(),
-                args: Vec::new(),
-                env: Vec::new(),
-                dir: dir.clone(),
-                stdin: Vec::new(),
-                sandbox: Sandbox::Off,
-                memory: None,
-            };
-            for placed in [Some([8; 32]), None] {
-                let Err(error) = program.command(command(), false, placed) else {
-                    panic!("a launch from a path holding {placed:?} started");
-                };
-                assert_eq!(error, StartError::NotPlaced { path: path.clone(), placed, held });
-                let said = error.to_string();
-                assert!(said.contains(&path.display().to_string()), "{said}");
-                assert!(said.contains(&"07".repeat(32)), "{said}");
-                if placed.is_some() {
-                    assert!(said.contains(&"08".repeat(32)), "{said}");
-                }
-            }
-            assert_eq!(identity(&path), before, "a refused launch changed the file at its path");
-            assert_eq!(program.starts_held(), 0);
-            assert!(memory.lock().processes.is_empty());
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-
-        /// Plays the start hook of `command` in this process: hello at a slid header, the
-        /// grant checked against the image's own layout, the control words and the asks
-        /// mapped, STARTED.
-        fn play_hook(
-            command: &Command,
-            own: &Layout,
-            slide: u64,
-        ) -> (Channel, Grant, &'static [std::sync::atomic::AtomicU64]) {
-            let var = command
-                .env
-                .iter()
-                .find(|(name, _)| name == HOST_VAR)
-                .unwrap()
-                .1
-                .to_str()
-                .unwrap()
-                .to_owned();
-            let (address, token) = host_var(var.as_bytes()).unwrap();
-            let mut channel = Channel::new(sys::connect(address).unwrap());
-            let mut hello = Vec::new();
-            Hello {
-                token,
-                pid: std::process::id(),
-                version: VERSION,
-                page: sys::page(),
-                header: own.header + slide,
-            }
-            .encode(&mut hello);
-            channel.send(kinds::HELLO, 0, &hello).unwrap();
-            let grant = {
-                let frame = channel.recv().unwrap();
-                assert_eq!(frame.kind, kinds::GRANT);
-                Grant::decode(frame.body).unwrap()
-            };
-            grant.check(own, sys::page()).unwrap();
-            let granted = sys::recv_objects(&mut channel, grant.objects.len()).unwrap();
-            let control = granted[1].map_anywhere(&mut channel, Access::Shared).unwrap();
-            let control =
-                sys::adopt_words(control, granted[1].len(), crate::fence::CONTROL_BYTES).unwrap();
-            assert!(crate::fence::Thread::ready(&control));
-            let asks = granted[2].map_anywhere(&mut channel, Access::Shared).unwrap();
-            let asks = sys::adopt_words(asks, granted[2].len(), crate::ask::BYTES).unwrap();
-            assert!(crate::ask::ready(&asks));
-            let mut started = Vec::new();
-            Writer::new(&mut started).u64(sys::thread_id());
-            channel.send(kinds::STARTED, 0, &started).unwrap();
-            (channel, grant, asks)
-        }
-
-        #[test]
-        fn the_host_grants_the_code_segments_arena_and_cells_and_learns_the_slide() {
-            let Some(memory) = laid_out("host") else { return };
-            let page = memory.page();
-            let (_held, dir) = temp_dir();
-            let host = Host::new(&dir).unwrap();
-            let program = dir.join("prog");
-            let launch = Launch {
-                image: &memory,
-                maps: Vec::new(),
-                writes: Vec::new(),
-                lookups: Vec::new(),
-                program: program.clone(),
-                args: vec!["a".into(), "b".into()],
-                env: vec![("X".into(), "1".into()), (HOST_VAR.into(), "stale".into())],
-                dir: dir.clone(),
-                stdin: Vec::new(),
-                sandbox: Sandbox::On {
-                    read: Vec::new(),
-                    write: Vec::new(),
-                    network: false,
-                    trace: false,
-                    services: Vec::new(),
-                },
-                memory: None,
-            };
-            let (command, pending) = host.launch(&launch).unwrap();
-            assert_eq!(command.program, program);
-            assert_eq!(command.args, ["a", "b"]);
-            assert_eq!(command.env.iter().filter(|(name, _)| name == HOST_VAR).count(), 1);
-            assert!(command.env.iter().any(|(name, value)| name == "X" && value == "1"));
-            let Sandbox::On { read, write, network, services, .. } = &command.sandbox else {
-                panic!("the run left its sandbox")
-            };
-            assert!(read.contains(&program));
-            if cfg!(target_os = "macos") {
-                assert_eq!(*services, [format!("dev.blaze.inproc.{}", std::process::id())]);
-            } else {
-                assert!(services.is_empty());
-            }
-            // The host's socket is connected to by its path, given readable: a launch adds
-            // nothing writable to the run's sandbox.
-            assert!(write.is_empty(), "{write:?}");
-            if cfg!(unix) {
-                let socket = dir.join(format!("inproc-{}.sock", std::process::id()));
-                assert!(read.contains(&socket), "{read:?}");
-            }
-            assert!(!network);
-
-            let slide = 0x5555_0000_0000;
-            let own = memory.layout().unwrap().clone();
-            let (mut channel, grant, asks) = play_hook(&command, &own, slide);
-            assert_eq!(
-                grant.objects.iter().map(|it| it.1).collect::<Vec<_>>(),
-                [Rights::Code, Rights::Words, Rights::Words, Rights::Words]
-            );
-            assert_eq!(
-                grant.overlays,
-                [
-                    Overlay {
-                        object: 0,
-                        offset: page,
-                        len: page,
-                        at: page,
-                        access: Access::Execute,
-                        place: Place::Code,
-                        image: false
-                    },
-                    Overlay {
-                        object: 0,
-                        offset: 2 * page,
-                        len: page,
-                        at: 4 * page,
-                        access: Access::Execute,
-                        place: Place::Reserved,
-                        image: false,
-                    },
-                    Overlay {
-                        object: 3,
-                        offset: 0,
-                        len: page,
-                        at: 6 * page,
-                        access: Access::Shared,
-                        place: Place::Reserved,
-                        image: false
-                    },
-                ]
-            );
-            let session = pending.wait(Duration::from_secs(10)).unwrap();
-            assert_eq!(
-                (session.pid, session.slide, session.thread),
-                (std::process::id(), slide, sys::thread_id())
-            );
-            assert_eq!(session.killed(), None);
-            let (mut reader, sender) = session.split();
-            assert_eq!(sender.pid(), std::process::id());
-            let answering = std::thread::spawn(move || {
-                let frame = reader.recv().unwrap();
-                assert_eq!((frame.kind, frame.body), (Kind(0x300), &b"ask"[..]));
-                sender.send(Kind(0x301), frame.seq, b"answer").unwrap();
-            });
-            let mut answer = [0u8; 16];
-            let asked =
-                crate::ask::request(&asks, channel.stream(), Kind(0x300), b"ask", &mut answer)
-                    .unwrap();
-            assert_eq!((asked, &answer[..6]), ((Kind(0x301), 6), &b"answer"[..]));
-            answering.join().unwrap();
-
-            let (stale, wrong) = host.launch(&launch).unwrap();
-            let var = stale
-                .env
-                .iter()
-                .find(|(name, _)| name == HOST_VAR)
-                .unwrap()
-                .1
-                .to_str()
-                .unwrap()
-                .to_owned();
-            let (address, mut token) = host_var(var.as_bytes()).unwrap();
-            token[0] ^= 1;
-            let mut channel = Channel::new(sys::connect(address).unwrap());
-            let mut hello = Vec::new();
-            Hello {
-                token,
-                pid: std::process::id(),
-                version: VERSION,
-                page: sys::page(),
-                header: 0,
-            }
-            .encode(&mut hello);
-            channel.send(kinds::HELLO, 0, &hello).unwrap();
-            assert!(wrong.wait(Duration::from_millis(300)).is_err());
-        }
-
-        #[test]
-        fn a_program_attaches_its_processes_until_they_exit_and_never_one_that_ended_first() {
-            let Some(memory) = laid_out("program") else { return };
-            let page = memory.page();
-            let own = memory.layout().unwrap().clone();
-            let (_held, dir) = temp_dir();
-            std::fs::create_dir_all(&dir).unwrap();
-            let host = Arc::new(Host::new(&dir.join("host")).unwrap());
-            let memory = Arc::new(Lock::new("inproc.test.memory", memory));
-            let (sessions, got) = crossbeam_channel::unbounded();
-            let key = [9; 32];
-            let image = Image { key, len: 2 * page };
-            let program = Program::new(host, memory.clone(), image, sessions);
-            // The build's placement of the program's file, under the memory's key.
-            std::fs::write(dir.join("prog"), an_executable(page)).unwrap();
-            let command = || Command {
-                program: dir.join("prog"),
-                args: Vec::new(),
-                env: Vec::new(),
-                dir: dir.clone(),
-                stdin: Vec::new(),
-                sandbox: Sandbox::Off,
-                memory: None,
-            };
-            let pid = std::process::id();
-
-            let (spawned, started) = program.command(command(), false, Some(key)).unwrap();
-            assert_eq!(std::fs::read(dir.join("prog")).unwrap(), an_executable(page));
-            let _channel = play_hook(&spawned, &own, 0);
-            let session = got.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
-            assert_eq!(session.pid, pid);
-            assert!(memory.lock().processes.iter().any(|it| it.pid == pid && !it.forks));
-            program.exited(started);
-            assert!(memory.lock().processes.is_empty());
-            program.exited(started);
-
-            let (spawned, started) = program.command(command(), true, Some(key)).unwrap();
-            program.exited(started);
-            let _channel = play_hook(&spawned, &own, 0);
-            let ended = got.recv_timeout(Duration::from_secs(10)).unwrap();
-            assert!(ended.is_err_and(|it| it.what.contains("ended while")));
-            assert!(memory.lock().processes.is_empty());
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-
-        /// The invariant: a launch of a program whose file the build placed at its path
-        /// writes nothing there (the file is the same file, byte for byte, with the same
-        /// inode and time, so the build's placement and its outputs' watch see no change),
-        /// and once its process has attached and exited nothing of the launch is left: no
-        /// grant waiting, no start kept, no process on the memory, no thread of the host's
-        /// or the program's. So any number of `blaze run`s leave the daemon as it was.
-        #[test]
-        fn launches_of_a_placed_executable_write_nothing_and_leave_nothing_behind() {
-            let (held, moved) = launches_leave(Planted::Nothing);
-            assert_eq!(held, Held::default(), "after {LAUNCHES} launches");
-            assert!(!moved, "the placed file was written by a launch");
-        }
-
-        /// The control: a launch whose process is never said to have exited keeps its start
-        /// and its process on the memory, and the oracle counts them.
-        #[test]
-        fn the_oracle_catches_a_launch_never_said_exited() {
-            let (held, moved) = launches_leave(Planted::NeverExited);
-            assert_eq!((held.starts, held.processes), (LAUNCHES, 1), "{held:?}");
-            assert!(!moved);
-        }
-
-        /// The control: a second writer of the path (a launch that wrote the file as the host
-        /// once did, planted here as a write between launches) is seen by the oracle as the
-        /// file moved.
-        #[test]
-        fn the_oracle_catches_a_second_writer_of_the_placed_file() {
-            let (held, moved) = launches_leave(Planted::Rewritten);
-            assert_eq!(held, Held::default());
-            assert!(moved, "a file written again between launches was not seen moved");
-        }
-
-        const LAUNCHES: usize = 24;
-
-        #[derive(Clone, Copy, PartialEq, Eq)]
-        enum Planted {
-            Nothing,
-            NeverExited,
-            /// The file at the path written again, same bytes, after the first launch.
-            Rewritten,
-        }
-
-        /// What launches left behind, each a count.
-        #[derive(Default, PartialEq, Eq, Debug)]
-        struct Held {
-            waiting: usize,
-            starts: usize,
-            processes: usize,
-            handshakes: usize,
-            starting: usize,
-        }
-
-        /// [`LAUNCHES`] launches of a program whose executable is at its path already, each
-        /// attached by a start hook played here and then ended: what they left, and whether
-        /// the file at the path is another than before (its bytes, inode, length or time).
-        fn launches_leave(planted: Planted) -> (Held, bool) {
-            use std::os::unix::fs::MetadataExt;
-            let name = match planted {
-                Planted::Nothing => "placed",
-                Planted::NeverExited => "placed-kept",
-                Planted::Rewritten => "placed-written",
-            };
-            let Some(memory) = laid_out(name) else {
-                // No code memory on this platform: what the invariant's test and each
-                // control expect of one.
-                return match planted {
-                    Planted::Nothing => (Held::default(), false),
-                    Planted::NeverExited => {
-                        (Held { starts: LAUNCHES, processes: 1, ..Held::default() }, false)
-                    }
-                    Planted::Rewritten => (Held::default(), true),
-                };
-            };
-            let page = memory.page();
-            let own = memory.layout().unwrap().clone();
-            let (_held, dir) = temp_dir();
-            std::fs::create_dir_all(&dir).unwrap();
-            let host = Arc::new(Host::new(&dir.join("host")).unwrap());
-            let memory = Arc::new(Lock::new("inproc.test.memory", memory));
-            let (sessions, got) = crossbeam_channel::unbounded();
-            let key = [7; 32];
-            let image = Image { key, len: 2 * page };
-            let program = Program::new(host.clone(), memory.clone(), image, sessions);
-            // The build's placement: the same bytes, a file of the build's own making.
-            let path = dir.join("prog");
-            std::fs::write(&path, an_executable(page)).unwrap();
-            let identity = |path: &std::path::Path| {
-                let meta = std::fs::metadata(path).unwrap();
-                (meta.ino(), meta.len(), meta.mtime(), meta.mtime_nsec(), std::fs::read(path).unwrap())
-            };
-            let before = identity(&path);
-            for at in 0..LAUNCHES {
-                let command = Command {
-                    program: path.clone(),
-                    args: Vec::new(),
-                    env: Vec::new(),
-                    dir: dir.clone(),
-                    stdin: Vec::new(),
-                    sandbox: Sandbox::Off,
-                    memory: None,
-                };
-                let (spawned, started) = program.command(command, false, Some(key)).unwrap();
-                if planted == Planted::Rewritten && at == 0 {
-                    // A second writer: the same bytes, a new file renamed over the path.
-                    let again = dir.join("prog.again");
-                    std::fs::write(&again, an_executable(page)).unwrap();
-                    std::fs::rename(&again, &path).unwrap();
-                }
-                let (channel, ..) = play_hook(&spawned, &own, 0);
-                let session = got.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
-                // The process ends: its channel hangs up, its session is let go, and its
-                // launcher says it exited.
-                drop(channel);
-                drop(session);
-                if planted != Planted::NeverExited {
-                    program.exited(started);
-                }
-            }
-            // The threads of the last launches end on their own, a moment after their
-            // sessions were handed over: bounded, 10 s.
-            let ended = std::time::Instant::now() + Duration::from_secs(10);
-            while (host.handshakes() != 0 || program.starting() != 0)
-                && std::time::Instant::now() < ended
-            {
-                std::thread::yield_now();
-            }
-            let held = Held {
-                waiting: host.waiting(),
-                starts: program.starts_held(),
-                processes: memory.lock().processes.len(),
-                handshakes: host.handshakes(),
-                starting: program.starting(),
-            };
-            let moved = identity(&path) != before;
-            let _ = std::fs::remove_dir_all(&dir);
-            (held, moved)
-        }
     }
 }

@@ -2,7 +2,7 @@ use super::*;
 
 // test use_item
 // use std::collections;
-pub(super) fn use_(p: &mut Parser<'_>, m: Marker) {
+pub(super) fn use_<S: Sink>(p: &mut Parser<'_, S>, m: Marker) {
     p.bump(T![use]);
     use_tree(p, true);
     p.expect(T![;]);
@@ -11,7 +11,7 @@ pub(super) fn use_(p: &mut Parser<'_>, m: Marker) {
 
 // test use_tree
 // use outer::tree::{inner::tree};
-fn use_tree(p: &mut Parser<'_>, top_level: bool) -> bool {
+fn use_tree<S: Sink>(p: &mut Parser<'_, S>, top_level: bool) -> bool {
     let m = p.start();
     match p.current() {
         // test use_tree_star
@@ -84,7 +84,7 @@ pub(super) const USE_TREE_LIST_FIRST_SET: TokenSet = TokenSet::new(&[T!['{'], T!
 
 // test use_tree_list
 // use {a, b, c};
-pub(crate) fn use_tree_list(p: &mut Parser<'_>) {
+pub(crate) fn use_tree_list<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T!['{']));
     let m = p.start();
 
@@ -101,7 +101,7 @@ pub(crate) fn use_tree_list(p: &mut Parser<'_>) {
         T![,],
         || "expected use tree".into(),
         USE_TREE_LIST_FIRST_SET,
-        |p: &mut Parser<'_>| use_tree(p, false) || p.at_ts(USE_TREE_LIST_RECOVERY_SET),
+        |p: &mut Parser<'_, S>| use_tree(p, false) || p.at_ts(USE_TREE_LIST_RECOVERY_SET),
     );
 
     m.complete(p, USE_TREE_LIST);

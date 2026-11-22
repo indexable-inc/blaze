@@ -17,7 +17,7 @@ This replaces, rather than sits beside, blaze's flat `ApiError { what, at }` and
 ```
 error: llvm-sys can't find LLVM  [llvm: pin]
   ┌ build script of llvm-sys 231.0.1  (vendor/llvm-sys/build.rs)
-  │ needs LLVM 23.1.4 (e152d9f0), pinned in crates/hir-ty-codegen/llvm.json
+  │ needs LLVM 23.1.4 (e152d9f0), pinned in pins/llvm.json
   │ `LLVM_SYS_231_PREFIX` is not set
   └ blocks 247 packages, including blaze-engine
 

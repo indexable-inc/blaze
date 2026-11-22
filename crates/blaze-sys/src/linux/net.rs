@@ -44,6 +44,7 @@ pub enum SockKind {
 
 flag_set! {
     /// The flags a new socket's descriptor gets (`socket`, `accept4`).
+    /// replaces libc::SOCK_NONBLOCK (blaze_sys::linux::SockFlags::NONBLOCK in the typed calls; or `blaze_sys::posix::net::SOCK_STREAM | SockFlags::NONBLOCK.bits() as c_int` with posix::net::socket; Linux only)
     SockFlags: u32 {
         /// `SOCK_NONBLOCK`.
         NONBLOCK = 0o4000;
@@ -200,6 +201,9 @@ pub fn accept4(socket: Fd, flags: SockFlags) -> Result<OwnedFd, Errno> {
 
 flag_set! {
     /// `sendmsg`'s and `recvmsg`'s flags.
+    /// replaces libc::MSG_PEEK (blaze_sys::posix::net::MsgFlags::PEEK; both systems)
+    /// replaces libc::MSG_WAITALL (blaze_sys::posix::net::MsgFlags::WAIT_ALL; both systems)
+    /// replaces libc::MSG_DONTWAIT (blaze_sys::posix::net::MsgFlags::DONT_WAIT; both systems)
     MsgFlags: u32 {
         /// `MSG_PEEK`.
         PEEK = 0x02;
@@ -246,6 +250,37 @@ impl<'a> IoSliceMut<'a> {
     #[blaze::nopanic]
     pub const fn new(into: &'a mut [u8]) -> IoSliceMut<'a> {
         IoSliceMut { base: into.as_mut_ptr(), len: into.len(), bytes: core::marker::PhantomData }
+    }
+
+    /// `room`, not yet initialized, lent for a receive: the kernel only writes it, and the
+    /// count a receive returns is how many bytes from its start it initialized (a `Vec`'s
+    /// spare capacity, then `set_len`).
+    /// replaces libc::iovec (over uninitialized room: `iov_base` a `Vec`'s spare capacity, as blaze-core's net.rs `recv` and net/udp.rs's datagram slots)
+    #[blaze::noalloc]
+    #[blaze::nopanic]
+    pub const fn uninit(room: &'a mut [core::mem::MaybeUninit<u8>]) -> IoSliceMut<'a> {
+        IoSliceMut { base: room.as_mut_ptr().cast::<u8>(), len: room.len(), bytes: core::marker::PhantomData }
+    }
+}
+
+#[cfg(test)]
+mod uninit_tests {
+    use super::{IoSliceMut, MsgFlags, recvmsg};
+    use core::mem::MaybeUninit;
+
+    /// A receive into uninitialized room fills its start with the bytes sent, and the slice
+    /// is the C `iovec` the libc crate has.
+    #[test]
+    fn a_receive_fills_uninitialized_room() {
+        assert_eq!(size_of::<IoSliceMut<'_>>(), size_of::<libc::iovec>());
+        let [a, b] = super::super::sock::socketpair(1, 1, 0).unwrap(); // AF_UNIX, SOCK_STREAM
+        assert_eq!(crate::linux::write(a.fd(), b"blaze"), Ok(5));
+        let mut room = [MaybeUninit::<u8>::uninit(); 16];
+        let got = recvmsg(b.fd(), &mut [IoSliceMut::uninit(&mut room)], MsgFlags::NONE).unwrap();
+        assert_eq!(got, 5);
+        // SAFETY: the receive initialized the first `got` bytes.
+        let bytes: [u8; 5] = core::array::from_fn(|n| unsafe { room[n].assume_init() });
+        assert_eq!(&bytes, b"blaze");
     }
 }
 
@@ -327,4 +362,100 @@ pub fn shutdown(socket: Fd, which: Shutdown) -> Result<(), Errno> {
     };
     // SAFETY: the call takes numbers and no memory.
     raw::check(unsafe { raw::syscall2(nr::SHUTDOWN, arg(socket), how) }).map(|_| ())
+}
+
+/// One typed socket option of [`setsockopt`]: its level and name are the variant, its value
+/// the field. The ones blaze-core's sockets, the remote cache client and the test servers set.
+/// replaces libc::IPV6_V6ONLY (with setsockopt: blaze_sys::linux::setsockopt(fd, SockOpt::V6Only(on)); Linux; on macOS no item yet)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SockOpt {
+    /// `SOL_SOCKET`, `SO_REUSEADDR`.
+    ReuseAddr(bool),
+    /// `SOL_SOCKET`, `SO_REUSEPORT`.
+    ReusePort(bool),
+    /// `SOL_SOCKET`, `SO_KEEPALIVE`.
+    KeepAlive(bool),
+    /// `SOL_SOCKET`, `SO_PASSCRED`: a Unix socket's peer credentials with each message.
+    PassCred(bool),
+    /// `SOL_SOCKET`, `SO_RCVBUF`, in bytes (the kernel doubles it).
+    RecvBuf(u32),
+    /// `SOL_SOCKET`, `SO_SNDBUF`, in bytes (the kernel doubles it).
+    SendBuf(u32),
+    /// `SOL_SOCKET`, `SO_LINGER`: `Some(seconds)` makes a close wait that long for unsent
+    /// data, `None` is the default.
+    Linger(Option<u32>),
+    /// `IPPROTO_TCP`, `TCP_NODELAY`.
+    NoDelay(bool),
+    /// `IPPROTO_TCP`, `TCP_KEEPIDLE`, in seconds.
+    KeepIdle(u32),
+    /// `IPPROTO_TCP`, `TCP_KEEPINTVL`, in seconds.
+    KeepInterval(u32),
+    /// `IPPROTO_TCP`, `TCP_KEEPCNT`.
+    KeepCount(u32),
+    /// `IPPROTO_IPV6`, `IPV6_V6ONLY`.
+    V6Only(bool),
+}
+
+/// `SOL_SOCKET`, `IPPROTO_TCP` and `IPPROTO_IPV6`.
+const SOL_SOCKET: usize = 1;
+const IPPROTO_TCP: usize = 6;
+const IPPROTO_IPV6: usize = 41;
+
+/// An `int` option's value of `on`.
+#[blaze::noalloc]
+#[blaze::nopanic]
+const fn flag(on: bool) -> Result<[i32; 2], Errno> {
+    Ok([on as i32, 0])
+}
+
+/// An `int` option's value of `n`; [`Errno::Inval`] past `i32::MAX`, which no `int` holds.
+#[blaze::noalloc]
+#[blaze::nopanic]
+const fn count(n: u32) -> Result<[i32; 2], Errno> {
+    if n > i32::MAX as u32 { Err(Errno::Inval) } else { Ok([n as i32, 0]) }
+}
+
+impl SockOpt {
+    /// The level, the name, the value as the kernel reads it (an `int`, or `struct linger`'s
+    /// two) and its length.
+    #[blaze::noalloc]
+    #[blaze::nopanic]
+    const fn raw(self) -> Result<(usize, usize, [i32; 2], usize), Errno> {
+        let int = size_of::<i32>();
+        let (level, name, value, len) = match self {
+            SockOpt::ReuseAddr(on) => (SOL_SOCKET, 2, flag(on), int),
+            SockOpt::ReusePort(on) => (SOL_SOCKET, 15, flag(on), int),
+            SockOpt::KeepAlive(on) => (SOL_SOCKET, 9, flag(on), int),
+            SockOpt::PassCred(on) => (SOL_SOCKET, 16, flag(on), int),
+            SockOpt::RecvBuf(bytes) => (SOL_SOCKET, 8, count(bytes), int),
+            SockOpt::SendBuf(bytes) => (SOL_SOCKET, 7, count(bytes), int),
+            SockOpt::Linger(None) => (SOL_SOCKET, 13, Ok([0, 0]), 2 * int),
+            SockOpt::Linger(Some(secs)) => match count(secs) {
+                Ok([secs, _]) => (SOL_SOCKET, 13, Ok([1, secs]), 2 * int),
+                Err(errno) => (SOL_SOCKET, 13, Err(errno), 2 * int),
+            },
+            SockOpt::NoDelay(on) => (IPPROTO_TCP, 1, flag(on), int),
+            SockOpt::KeepIdle(secs) => (IPPROTO_TCP, 4, count(secs), int),
+            SockOpt::KeepInterval(secs) => (IPPROTO_TCP, 5, count(secs), int),
+            SockOpt::KeepCount(n) => (IPPROTO_TCP, 6, count(n), int),
+            SockOpt::V6Only(on) => (IPPROTO_IPV6, 26, flag(on), int),
+        };
+        match value {
+            Ok(value) => Ok((level, name, value, len)),
+            Err(errno) => Err(errno),
+        }
+    }
+}
+
+/// `setsockopt`: one typed option set on `socket`. [`Errno::Inval`] for a count past
+/// `i32::MAX`, refused before the call; an option the socket's protocol lacks is the kernel's
+/// refusal, as it gives it.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn setsockopt(socket: Fd, option: SockOpt) -> Result<(), Errno> {
+    let (level, name, value, len) = option.raw()?;
+    // SAFETY: `value` is live memory of at least `len` bytes (an `int`, or `struct linger`'s
+    // two `int`s) the kernel reads and does not keep.
+    raw::check(unsafe { raw::syscall5(nr::SETSOCKOPT, arg(socket), level, name, value.as_ptr() as usize, len) })
+        .map(|_| ())
 }

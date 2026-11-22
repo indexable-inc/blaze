@@ -22,33 +22,33 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
-use windows_sys::Win32::Foundation::{
+use blaze_sys::windows::diagnostics::{
+    CONTEXT, CreateToolhelp32Snapshot, FlushInstructionCache, ReadProcessMemory,
+    RtlCaptureContext, RtlLookupFunctionEntry, RtlVirtualUnwind, TH32CS_SNAPTHREAD, THREADENTRY32,
+    Thread32First, Thread32Next, UNW_FLAG_NHANDLER, WriteProcessMemory,
+};
+use blaze_sys::windows::foundation::{
     DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_NO_MORE_FILES, ERROR_TIMEOUT, GetLastError,
-    HANDLE, HMODULE, INVALID_HANDLE_VALUE, SetLastError, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    HMODULE, SetLastError, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
-use windows_sys::Win32::Security::Cryptography::ProcessPrng;
-use windows_sys::Win32::System::Diagnostics::Debug::{
-    CONTEXT, FlushInstructionCache, ReadProcessMemory, RtlCaptureContext, RtlLookupFunctionEntry,
-    RtlVirtualUnwind, UNW_FLAG_NHANDLER, WriteProcessMemory,
-};
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
-};
-use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, MEM_COMMIT, MEM_IMAGE, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
+use blaze_sys::windows::memory::{
+    self, CreateFileMappingW, MEM_COMMIT, MEM_IMAGE, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
     MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION,
     MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-    PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, SEC_COMMIT, UnmapViewOfFile,
-    UnmapViewOfFile2, VirtualAlloc2, VirtualFreeEx, VirtualProtectEx, VirtualQueryEx,
+    PAGE_NOACCESS, PAGE_READWRITE, PAGE_WRITECOPY, SEC_COMMIT, UnmapViewOfFile, UnmapViewOfFile2,
+    VirtualAlloc2, VirtualFreeEx, VirtualProtectEx, VirtualQueryEx,
 };
-use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
-use windows_sys::Win32::System::Threading::{
+use blaze_sys::windows::security::ProcessPrng;
+use blaze_sys::windows::system::{
+    GetModuleHandleW, GetProcAddress, GetSystemInfo, K32EnumProcessModules, SYSTEM_INFO,
+};
+use blaze_sys::windows::threading::{
     CreateEventW, GetCurrentProcess, GetCurrentThreadId, INFINITE, OpenProcess, PROCESS_DUP_HANDLE,
     PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, PROCESS_VM_OPERATION,
     PROCESS_VM_READ, PROCESS_VM_WRITE, SetEvent, TerminateProcess, WaitForMultipleObjects,
     WaitForSingleObject, WaitOnAddress, WakeByAddressAll,
 };
+use blaze_sys::windows::{Bool, Handle};
 
 pub use pipe::{Listener, Stream, connect};
 
@@ -65,6 +65,12 @@ const OBJECTS_SEQ: u32 = 1;
 /// What failed, with the error Windows gave. Call it right after the failing call.
 fn os(what: impl std::fmt::Display) -> Error {
     Error::new(format!("Windows: {what}: {}", std::io::Error::last_os_error()))
+}
+
+/// The kernel handle std's owned handle stands for, as blaze-sys's calls take it; borrowed, so
+/// `handle` must outlive the call it is passed to.
+fn handle_of(handle: &impl AsRawHandle) -> Handle {
+    Handle::from_raw(handle.as_raw_handle())
 }
 
 pub fn page() -> u64 {
@@ -85,7 +91,7 @@ pub fn check_icache() -> Result<(), Error> {
 
 pub fn random(out: &mut [u8; 16]) -> Result<(), Error> {
     // SAFETY: ProcessPrng writes exactly `out.len()` bytes into `out`.
-    if unsafe { ProcessPrng(out.as_mut_ptr(), out.len()) } == 0 {
+    if !unsafe { ProcessPrng(out.as_mut_ptr(), out.len()) }.is_true() {
         return Err(os("ProcessPrng"));
     }
     Ok(())
@@ -94,7 +100,7 @@ pub fn random(out: &mut [u8; 16]) -> Result<(), Error> {
 fn protection(access: Access) -> u32 {
     match access {
         Access::Execute => PAGE_EXECUTE_READ,
-        Access::Read => PAGE_READONLY,
+        Access::Read => memory::PAGE_READONLY,
         Access::Copy => PAGE_WRITECOPY,
         Access::Shared => PAGE_READWRITE,
     }
@@ -135,8 +141,8 @@ fn granular(offset: u64, len: u64, at: u64) -> Result<(), Error> {
 /// Maps `len` bytes of `section` from `offset` into `process` at `at` (0: anywhere), as `kind`
 /// says (0 into free address space, or `MEM_REPLACE_PLACEHOLDER`).
 fn map_view(
-    section: HANDLE,
-    process: HANDLE,
+    section: Handle,
+    process: Handle,
     offset: u64,
     len: u64,
     at: u64,
@@ -178,11 +184,11 @@ pub struct Object {
 
 impl Object {
     pub fn create(name: &str, len: u64) -> Result<Object, Error> {
-        // SAFETY: a section backed by the paging file (`INVALID_HANDLE_VALUE`), unnamed, with the
+        // SAFETY: a section backed by the paging file (`Handle::INVALID`), unnamed, with the
         // default security; every argument is a value or null.
         let section = unsafe {
             CreateFileMappingW(
-                INVALID_HANDLE_VALUE,
+                Handle::INVALID,
                 std::ptr::null(),
                 PAGE_EXECUTE_READWRITE | SEC_COMMIT,
                 (len >> 32) as u32,
@@ -194,7 +200,7 @@ impl Object {
             return Err(os(format_args!("CreateFileMappingW of {len:#x} bytes for {name}")));
         }
         // SAFETY: the handle was just made and nothing else owns it.
-        Ok(Object { section: unsafe { OwnedHandle::from_raw_handle(section) }, len })
+        Ok(Object { section: unsafe { OwnedHandle::from_raw_handle(section.raw()) }, len })
     }
 
     pub fn len(&self) -> u64 {
@@ -214,7 +220,7 @@ impl Object {
             .map_err(|_| Error::new(format!("a view of {:#x} bytes", self.len)))?;
         // SAFETY: GetCurrentProcess returns a pseudo-handle, valid always.
         let at = map_view(
-            self.section.as_raw_handle(),
+            handle_of(&self.section),
             unsafe { GetCurrentProcess() },
             0,
             self.len,
@@ -379,7 +385,7 @@ impl Exec {
         write(code_bytes, data_bytes);
         let mut old = 0;
         // SAFETY: the code's pages of the allocation above, which nothing writes from here on.
-        if unsafe {
+        if !unsafe {
             VirtualProtectEx(
                 GetCurrentProcess(),
                 exec.at as *const c_void,
@@ -387,7 +393,8 @@ impl Exec {
                 PAGE_EXECUTE_READ,
                 &mut old,
             )
-        } == 0
+        }
+        .is_true()
         {
             return Err(os(format_args!(
                 "VirtualProtectEx of {code_pages:#x} bytes of code to execute and read"
@@ -405,9 +412,6 @@ impl Exec {
     pub fn data_address(&self) -> u64 {
         self.at as u64 + self.code_pages as u64
     }
-
-    /// Windows has no `fork`, and the code's pages are executable for every thread.
-    pub fn after_fork() {}
 
     pub fn data(&mut self) -> &mut [u8] {
         // SAFETY: the data's `data` bytes after the code's pages, committed writable, live as
@@ -437,12 +441,12 @@ pub fn send_objects(
         | PROCESS_DUP_HANDLE
         | PROCESS_SYNCHRONIZE;
     // SAFETY: value-only arguments; the handle it returns is checked and owned below.
-    let process = unsafe { OpenProcess(access, 0, pid) };
+    let process = unsafe { OpenProcess(access, Bool::FALSE, pid) };
     if process.is_null() {
         return Err(os(format_args!("OpenProcess of the run process {pid}")));
     }
     // SAFETY: just opened, owned by nothing else.
-    let process = unsafe { OwnedHandle::from_raw_handle(process) };
+    let process = unsafe { OwnedHandle::from_raw_handle(process.raw()) };
     let mut kept = Vec::with_capacity(objects.len());
     for (object, rights) in objects {
         kept.push((object.duplicate()?, *rights));
@@ -522,8 +526,8 @@ fn outside(range: Range<u64>, overlays: &[Range<u64>]) -> Vec<Range<u64>> {
 /// The protection a private page takes for an image page's: copy-on-write is the image's own.
 fn private_protection(protect: u32) -> Result<u32, Error> {
     match protect {
-        PAGE_READONLY | PAGE_READWRITE => Ok(protect),
-        PAGE_WRITECOPY => Ok(PAGE_READWRITE),
+        memory::PAGE_READONLY | memory::PAGE_READWRITE => Ok(protect),
+        memory::PAGE_WRITECOPY => Ok(PAGE_READWRITE),
         other => Err(Error::new(format!(
             "image pages of protection {other:#x} outside the overlays: only data is kept as it was, and code runs only \
              from the code memory"
@@ -558,14 +562,15 @@ impl Bells {
     pub fn wake(&self, slot: usize, _: &AtomicU64) {
         if let Some(event) = self.slots.get(slot) {
             // SAFETY: an event this daemon made and holds.
-            unsafe { SetEvent(event.as_raw_handle()) };
+            unsafe { SetEvent(handle_of(event)) };
         }
     }
 
     pub fn wait_ring(&self, _: &mut Stream) -> Result<bool, Error> {
-        let handles = [self.doorbell.as_raw_handle(), self.process.as_raw_handle()];
+        let handles = [handle_of(&self.doorbell), handle_of(&self.process)];
         // SAFETY: two handles this daemon holds, live for the call.
-        let waited = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
+        let waited =
+            unsafe { WaitForMultipleObjects(2, handles.as_ptr(), Bool::FALSE, INFINITE) };
         match waited {
             WAIT_OBJECT_0 => Ok(true),
             it if it == WAIT_OBJECT_0 + 1 => Ok(false),
@@ -577,37 +582,38 @@ impl Bells {
 /// A new auto-reset event, and its name in `process` put in `names`.
 fn bell(process: &OwnedHandle, names: &mut Vec<u64>) -> Result<OwnedHandle, Error> {
     // SAFETY: an unnamed auto-reset event, not signaled; value-only arguments.
-    let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+    let event =
+        unsafe { CreateEventW(std::ptr::null(), Bool::FALSE, Bool::FALSE, std::ptr::null()) };
     if event.is_null() {
         return Err(os("CreateEventW for an asks bell"));
     }
     // SAFETY: just made, owned by nothing else.
-    let event = unsafe { OwnedHandle::from_raw_handle(event) };
-    let mut theirs: HANDLE = std::ptr::null_mut();
+    let event = unsafe { OwnedHandle::from_raw_handle(event.raw()) };
+    let mut theirs = Handle::NULL;
     // SAFETY: duplicates an event this daemon holds into the run process, opened with
     // PROCESS_DUP_HANDLE; writes only `theirs`, a handle value in that process.
     let ok = unsafe {
         DuplicateHandle(
             GetCurrentProcess(),
-            event.as_raw_handle(),
-            process.as_raw_handle(),
+            handle_of(&event),
+            handle_of(process),
             &mut theirs,
             0,
-            0,
+            Bool::FALSE,
             DUPLICATE_SAME_ACCESS,
         )
     };
-    if ok == 0 {
+    if !ok.is_true() {
         return Err(os("DuplicateHandle of an asks bell into the run process"));
     }
-    names.push(theirs as u64);
+    names.push(theirs.raw() as u64);
     Ok(event)
 }
 
 pub fn ring(_: &Stream, doorbell: u64) -> Result<(), Error> {
     // SAFETY: the doorbell the daemon duplicated into this process; a handle that is not an
     // event fails the call, which is checked.
-    if unsafe { SetEvent(doorbell as HANDLE) } == 0 {
+    if !unsafe { SetEvent(Handle::from_raw(doorbell as *mut c_void)) }.is_true() {
         return Err(os("SetEvent on the asks doorbell"));
     }
     Ok(())
@@ -624,7 +630,7 @@ fn millis(timeout: std::time::Duration) -> u32 {
 pub fn wait_answer(_: &AtomicU64, _: u32, bell: u64, timeout: std::time::Duration) -> bool {
     // SAFETY: the slot's event the daemon duplicated into this process; a handle that is not
     // one fails the wait, and the caller looks at the state word either way.
-    unsafe { WaitForSingleObject(bell as HANDLE, millis(timeout)) != WAIT_TIMEOUT }
+    unsafe { WaitForSingleObject(Handle::from_raw(bell as *mut c_void), millis(timeout)) != WAIT_TIMEOUT }
 }
 
 /// Within this process only: on Windows the run process sleeps for a slot of its own.
@@ -635,7 +641,7 @@ pub fn wait(word: &AtomicU64, expected: u32, timeout: std::time::Duration) -> bo
         WaitOnAddress(word.as_ptr().cast(), (&raw const expected).cast(), 4, millis(timeout))
     };
     // SAFETY: GetLastError reads this thread's last error.
-    ok != 0 || unsafe { GetLastError() } != ERROR_TIMEOUT
+    ok.is_true() || unsafe { GetLastError() } != ERROR_TIMEOUT
 }
 
 pub fn wake(word: &AtomicU64) {
@@ -663,10 +669,10 @@ impl Drop for Errno {
 impl Remote {
     pub fn kill(&self) -> Result<(), Error> {
         // SAFETY: the run process's own handle, opened with PROCESS_TERMINATE.
-        if unsafe { TerminateProcess(self.process.as_raw_handle(), 137) } == 0 {
+        if !unsafe { TerminateProcess(handle_of(&self.process), 137) }.is_true() {
             // SAFETY: the process handle, opened with PROCESS_SYNCHRONIZE; a zero wait returns
             // at once.
-            if unsafe { WaitForSingleObject(self.process.as_raw_handle(), 0) } == WAIT_OBJECT_0 {
+            if unsafe { WaitForSingleObject(handle_of(&self.process), 0) } == WAIT_OBJECT_0 {
                 return Ok(());
             }
             return Err(os("TerminateProcess of the run process"));
@@ -686,8 +692,8 @@ impl Remote {
             )));
         }
         map_view(
-            granted.section.as_raw_handle(),
-            self.process.as_raw_handle(),
+            handle_of(&granted.section),
+            handle_of(&self.process),
             0,
             granted.len,
             0,
@@ -739,7 +745,7 @@ impl Remote {
         if let Err(error) = rebuilt {
             // SAFETY: the run process's own handle, opened with PROCESS_TERMINATE; a process
             // whose image is half replaced must not run on.
-            unsafe { TerminateProcess(self.process.as_raw_handle(), 127) };
+            unsafe { TerminateProcess(handle_of(&self.process), 127) };
             return Err(Error::new(format!("{}; the run process was ended", error.what)));
         }
         Ok(())
@@ -750,7 +756,7 @@ impl Remote {
         // SAFETY: writes at most `size_of::<MEMORY_BASIC_INFORMATION>()` bytes into `info`.
         let got = unsafe {
             VirtualQueryEx(
-                self.process.as_raw_handle(),
+                handle_of(&self.process),
                 at as *const c_void,
                 &mut info,
                 size_of::<MEMORY_BASIC_INFORMATION>(),
@@ -792,14 +798,14 @@ impl Remote {
                 // `bytes`, of the same length.
                 let got = unsafe {
                     ReadProcessMemory(
-                        self.process.as_raw_handle(),
+                        handle_of(&self.process),
                         part.start as *const c_void,
                         bytes.as_mut_ptr().cast(),
                         bytes.len(),
                         &mut read,
                     )
                 };
-                if got == 0 || read != bytes.len() {
+                if !got.is_true() || read != bytes.len() {
                     return Err(os(format_args!(
                         "ReadProcessMemory of {:#x}..{:#x}",
                         part.start, part.end
@@ -820,13 +826,14 @@ impl Remote {
         overlays: &[Overlay],
         kept: &[Kept],
     ) -> Result<(), Error> {
-        let process = self.process.as_raw_handle();
+        let process = handle_of(&self.process);
         // SAFETY: unmaps the run process's image view, whose every page outside the overlays was
         // read above; its only thread that runs, the start hook's, waits on the pipe for the
         // OVERLAID this answers with, and reaches no byte of the image until then.
-        if unsafe {
+        if !unsafe {
             UnmapViewOfFile2(process, MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut c_void }, 0)
-        } == 0
+        }
+        .is_true()
         {
             return Err(os(format_args!("UnmapViewOfFile2 of the image at {base:#x}")));
         }
@@ -854,14 +861,15 @@ impl Remote {
             if at + len < end {
                 // SAFETY: splits `at..at + len` off the front of the placeholder this loop
                 // still holds from `at`: no memory changes.
-                if unsafe {
+                if !unsafe {
                     VirtualFreeEx(
                         process,
                         at as *mut c_void,
                         len as usize,
                         MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
                     )
-                } == 0
+                }
+                .is_true()
                 {
                     return Err(os(format_args!(
                         "VirtualFreeEx splitting {len:#x} bytes at {at:#x} off the placeholder"
@@ -874,7 +882,7 @@ impl Remote {
                     let (object, _) = &self.objects[overlay.object as usize];
                     let kind = MEM_REPLACE_PLACEHOLDER;
                     map_view(
-                        object.section.as_raw_handle(),
+                        handle_of(&object.section),
                         process,
                         overlay.offset,
                         len,
@@ -937,7 +945,7 @@ impl Remote {
                     &mut written,
                 )
             };
-            if got == 0 || written != len {
+            if !got.is_true() || written != len {
                 return Err(os(format_args!(
                     "WriteProcessMemory of {len:#x} bytes at {:#x}",
                     part.at
@@ -945,9 +953,10 @@ impl Remote {
             }
             let mut old = 0;
             // SAFETY: the protection of the pages just written, as the image had them.
-            if unsafe {
+            if !unsafe {
                 VirtualProtectEx(process, part.at as *const c_void, len, part.protect, &mut old)
-            } == 0
+            }
+            .is_true()
             {
                 return Err(os(format_args!(
                     "VirtualProtectEx of {len:#x} bytes at {:#x}",
@@ -1048,18 +1057,6 @@ pub fn overlay(channel: &mut Channel, _: &[Granted], _: &[Overlay], _: u64) -> R
     Ok(())
 }
 
-#[link(name = "kernel32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
-unsafe extern "system" {
-    /// psapi's `EnumProcessModules`, which kernel32 exports under this name: the process's
-    /// modules in load order, read from its loader's list without taking the loader lock.
-    fn K32EnumProcessModules(
-        process: HANDLE,
-        modules: *mut HMODULE,
-        bytes: u32,
-        needed: *mut u32,
-    ) -> windows_sys::core::BOOL;
-}
-
 /// What the process's global scope is on Windows: every module the system loader loaded, the
 /// executable first, each export found by `GetProcAddress` (forwarders followed), the first
 /// module that exports a name winning.
@@ -1089,9 +1086,10 @@ impl Scope {
             let mut needed = 0u32;
             // SAFETY: the process's own pseudo-handle; `modules` is `bytes` writable bytes and
             // `needed` a live `u32`, the only memory the call writes.
-            if unsafe {
+            if !unsafe {
                 K32EnumProcessModules(GetCurrentProcess(), modules.as_mut_ptr(), bytes, &mut needed)
-            } == 0
+            }
+            .is_true()
             {
                 return Err(os("EnumProcessModules of this process"));
             }
@@ -1158,15 +1156,15 @@ pub fn threads(pid: u32, out: &mut Vec<u64>) -> Result<(), Error> {
     out.clear();
     // SAFETY: value-only arguments; the handle it returns is checked and owned below.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
+    if snapshot.is_invalid() {
         return Err(os("CreateToolhelp32Snapshot of the system's threads"));
     }
     // SAFETY: just made, owned by nothing else.
-    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot.raw()) };
     let size = size_of::<THREADENTRY32>() as u32;
     let mut entry = THREADENTRY32 { dwSize: size, ..Default::default() };
     // SAFETY: `entry` is a THREADENTRY32 whose `dwSize` says so; the call writes only it.
-    if unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) } == 0 {
+    if !unsafe { Thread32First(handle_of(&snapshot), &mut entry) }.is_true() {
         return Err(os("Thread32First"));
     }
     loop {
@@ -1175,7 +1173,7 @@ pub fn threads(pid: u32, out: &mut Vec<u64>) -> Result<(), Error> {
         }
         entry.dwSize = size;
         // SAFETY: as above.
-        if unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) } == 0 {
+        if !unsafe { Thread32Next(handle_of(&snapshot), &mut entry) }.is_true() {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
                 return Ok(());
@@ -1211,8 +1209,8 @@ pub fn serialize() {
     }
 }
 
-/// `RtlCaptureContext` stores the vector registers with aligned stores; windows-sys's `CONTEXT`
-/// is aligned to 8 only.
+/// `RtlCaptureContext` stores the vector registers with aligned stores; blaze-sys's `CONTEXT`,
+/// like windows-sys's, is aligned to 8 only.
 #[repr(C, align(16))]
 struct Context(CONTEXT);
 

@@ -1,758 +1,322 @@
-//! The environment cargo 1.99 runs a build script with: `Compilation::host_process` and
-//! `fill_env` (`src/compiler/compilation.rs`), then `build_work`
-//! (`src/compiler/custom_build.rs`) and the jobserver, in rust-lang/cargo at 5f94df478, the
-//! commit `cargo 1.99.0 -vV` names. The script inherits cargo's own environment with what
-//! these set and take away.
+//! The environment a script is given: exactly what the Cargo Book's "Environment variables
+//! Cargo sets for build scripts" documents, computed from the unit graph, and nothing of the
+//! machine. Paths are the sandbox's view (decision D96): a dependency's package at `/package`, a
+//! member at `/workspace/<dir>` with its workspace above it, and `OUT_DIR` an in-memory folder
+//! at `/target/debug/build/<name>-<config>/out`, the shape scripts parse (tempo-node takes the
+//! profile from its fourth part from the end).
 //!
-//! Left out, as unstable in 1.99 and so never set by a stable cargo: `CARGO_DEP_<name>_<key>`
-//! (`-Z any-build-script-metadata`), `CARGO_TRIM_PATHS_*` (`-Z trim-paths`), the artifact
-//! dependencies' variables (`-Z bindeps`) and the host runner (`-Z host-config`).
+//! What is set, for `check` (the dev profile):
 //!
-//! Built once per unit: what cargo sets is a list in the order set, names of the fixed set
-//! `&'static str` and every other name and value made at its size in one allocation; it is
-//! sorted once, by a precomputed `u128` of a name's first bytes, the last word on each name
-//! kept, and merged with what cargo inherits, which is sorted only when the caller did not
-//! pass it sorted. What is inherited is copied only where it is kept.
+//! - `CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_PATH`, `CARGO_MANIFEST_LINKS` (with `links`);
+//! - `CARGO_FEATURE_<NAME>` = `1` for each feature, uppercased, `-` as `_`;
+//! - `CARGO_CFG_<NAME>` for each cfg of the target the crate is built for: a flag as an empty
+//!   value, a name with values as the values joined by `,` (in the target description's
+//!   sorted order); `test` and `proc_macro`, which no `--print cfg` gives, left out;
+//! - `OUT_DIR`, `TARGET`, `HOST`, `OPT_LEVEL` `0`, `DEBUG` `true`, `PROFILE` `debug`;
+//! - `RUSTC` `rustc` and `RUSTDOC` `rustdoc` (names the sandbox's process host answers, not
+//!   paths), `CARGO` `cargo`, `CARGO_ENCODED_RUSTFLAGS` empty;
+//! - `CARGO_PKG_*` from the manifest, absent values as `""`;
+//! - `DEP_<LINKS>_<KEY>` from each direct dependency's `links` metadata;
+//! - for an `-apple-darwin` target, `MACOSX_DEPLOYMENT_TARGET`
+//!   ([`crate::toolchain::MACOS_MIN`]): not cargo's, but what `cc` reads first, so it never asks
+//!   `xcrun --show-sdk-version` (a deferred tool) for the `-mmacosx-version-min` of its
+//!   compiles; a compiler probe's row (pins/answers/clang.json) is keyed with it.
+//!
+//! Not set: `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `RUSTC_LINKER`, `PATH`, `HOME`, and every
+//! variable of the user's: a switch such as `LIBC_CI` is unset.
+//!
+//! The parallelism a script's children get is NOT in [`Env`]: a job count is a hint about the
+//! machine, never an input of the run's result, so it is in no key and no record (rules 21, 25).
+//! A run is given [`Env::for_run`], a [`RunEnv`] (another type, so no key can take it): the keyed
+//! variables and its [`Jobs`]:
+//!
+//! - a wasm run ([`Jobs::One`], it has no threads): `NUM_JOBS` `1`, no jobserver;
+//! - a native run ([`Jobs::Shared`]): `NUM_JOBS` the command's worker count and
+//!   `CARGO_MAKEFLAGS` naming the command's jobserver fifo exactly as cargo writes it
+//!   ([`makeflags`]), which the `jobserver` crate (`cc`'s `parallel`), cmake and make read
+//!   (`CARGO_MAKEFLAGS`, then `MAKEFLAGS`, then `MFLAGS`; `NUM_JOBS` only when none is set).
 
-use std::{
-    borrow::Cow,
-    cmp::Ordering,
-    ffi::{OsStr, OsString},
-    path::{Path, PathBuf},
-};
+#![blaze::sans_io]
 
-use crate::{
-    Error,
-    unit::{Package, Unfilled, Unit},
-};
+use blaze_expand::seen::SeenRoot;
+use blaze_ids::Hasher;
+use blaze_own::{AString, AVec, Alloc, String, Vec};
+use blaze_unit_graph::{CfgAtom, PackageMetaVars, Text};
 
-/// A script's whole environment, and which of it cargo sets from the unit.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Env {
-    /// Sorted by name, each name once: read in this order into the run's key and the
-    /// child's environment.
-    pub vars: Vec<(OsString, OsString)>,
-    /// Whether each of `vars`, by index, is one cargo sets from the unit, its configuration
-    /// and the build (#805): `CARGO_*`, `OUT_DIR`, `TARGET`, `HOST`, the profile's, the
-    /// tools', the `DEP_*` of its dependencies, `[env]`'s, the dynamic library path (with
-    /// what cargo's own environment had of it after the unit's directories), the
-    /// jobserver's `CARGO_MAKEFLAGS`. Every other variable is passed through from the
-    /// environment cargo was started with.
-    from_unit: Vec<bool>,
+/// The manifest's package facts a script is told (`CARGO_PKG_*`); an absent value is `""`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PackageFacts<'s> {
+    pub name: &'s str,
+    /// The full version: `2.1.2+zstd.1.5.7`.
+    pub version: &'s str,
+    /// The `[package]` metadata (`CARGO_PKG_AUTHORS`, ..), from the one table (blaze-manifest
+    /// layout meta.rs, carried as `UnitGraph::meta`): an unstated key `""` as cargo sets it.
+    /// `None`: the graph does not carry it, and the script is told none of those names.
+    pub meta: Option<PackageMetaVars<'s>>,
+    pub links: Option<&'s str>,
 }
 
-/// Where a variable of a script's environment comes from.
+/// One `links` metadata pair of a direct dependency: `DEP_<LINKS>_<KEY>=value`.
+#[derive(Clone, Copy, Debug)]
+pub struct DepMetadata<'s> {
+    pub links: &'s str,
+    pub key: &'s str,
+    pub value: &'s str,
+}
+
+/// What the environment is computed from.
+#[derive(Clone, Copy, Debug)]
+pub struct Given<'s, 'u> {
+    pub package: PackageFacts<'s>,
+    /// What the script sees as its package's root (D96): `SeenRoot::Package` for a dependency
+    /// (`/package`), `SeenRoot::member(dir)` for a workspace member (`/workspace/<dir>`).
+    pub seen: SeenRoot<'s>,
+    /// The unit's features, sorted.
+    pub features: &'s [Text<'u>],
+    /// The cfgs of the target the crate is built for, sorted (the library unit's).
+    pub target_cfg: &'s [CfgAtom<'u>],
+    pub target: &'s str,
+    pub host: &'s str,
+    pub deps: &'s [DepMetadata<'s>],
+}
+
+/// The variables, sorted by name, each once.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Env<'a> {
+    pub vars: AVec<'a, (AString<'a>, AString<'a>)>,
+}
+
+impl Env<'_> {
+    pub fn get(&self, name: &str) -> Option<&str> {
+        let at = self.vars.binary_search_by(|(n, _)| n.as_str().cmp(name)).ok()?;
+        Some(self.vars[at].1.as_str())
+    }
+
+    /// Appends the bytes the key hashes: a count, then each name and value length-prefixed.
+    pub fn encode(&self, out: &mut AVec<'_, u8>) {
+        out.extend_from_slice(&(self.vars.len() as u64).to_le_bytes());
+        for (name, value) in self.vars.iter() {
+            out.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            out.extend_from_slice(value.as_bytes());
+        }
+    }
+
+    /// The environment a run is given: these variables and the job variables of `jobs`
+    /// ([`job_vars`]), sorted by name, each once. Never keyed: [`crate::key::KeyInputs`] takes an
+    /// [`Env`], and this is a [`RunEnv`].
+    pub fn for_run<'a>(&self, jobs: Jobs<'_>, alloc: Alloc<'a>) -> RunEnv<'a> {
+        let mut vars: AVec<'a, (AString<'a>, AString<'a>)> = Vec::with_capacity_in(self.vars.len() + 2, alloc);
+        for (name, value) in self.vars.iter() {
+            vars.push((String::from_str_in(name, alloc), String::from_str_in(value, alloc)));
+        }
+        for (name, value) in job_vars(jobs, alloc) {
+            match vars.binary_search_by(|(n, _)| n.as_str().cmp(name)) {
+                // The keyed environment never holds a job variable (`env` sets none); a caller's
+                // own `Env` that did is overridden, as the last `export` would.
+                Ok(at) => vars[at].1 = value,
+                Err(at) => vars.insert(at, (String::from_str_in(name, alloc), value)),
+            }
+        }
+        RunEnv { vars }
+    }
+}
+
+/// The environment a run is given ([`Env::for_run`]): the keyed variables and the job
+/// variables, sorted by name, each once. A separate type so no key can hold it (rule 25).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunEnv<'a> {
+    pub vars: AVec<'a, (AString<'a>, AString<'a>)>,
+}
+
+impl RunEnv<'_> {
+    pub fn get(&self, name: &str) -> Option<&str> {
+        let at = self.vars.binary_search_by(|(n, _)| n.as_str().cmp(name)).ok()?;
+        Some(self.vars[at].1.as_str())
+    }
+}
+
+/// How many jobs a run's children may run at once: a hint about the machine, never an input of
+/// the run's result (no key or record holds it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Origin {
-    /// Set by cargo from the unit: what a run is given.
-    Unit,
-    /// Passed through from the environment cargo was started with: what a run reads of it
-    /// is traced.
-    PassedThrough,
+pub enum Jobs<'s> {
+    /// One: a wasm run (it has no threads), or a native run given no jobserver (an example's).
+    One,
+    /// A native run: the command's `workers` and its jobserver's fifo (an absolute path), which
+    /// holds the tokens the command lends its scripts' children.
+    Shared { workers: core::num::NonZeroU32, fifo: &'s str },
 }
 
-impl Env {
-    fn find(&self, name: &OsStr) -> Option<usize> {
-        self.vars.binary_search_by(|(it, _)| it.as_os_str().cmp(name)).ok()
-    }
-
-    pub fn get(&self, name: &str) -> Option<&OsStr> {
-        self.find(OsStr::new(name)).map(|at| self.vars[at].1.as_os_str())
-    }
-
-    /// Where `name` comes from, if the script has it.
-    pub fn origin(&self, name: &OsStr) -> Option<Origin> {
-        self.find(name).map(|at| match self.from_unit[at] {
-            true => Origin::Unit,
-            false => Origin::PassedThrough,
-        })
-    }
-
-    /// The variables set from the unit, sorted by name.
-    pub fn set_from_unit(&self) -> impl Iterator<Item = (&OsStr, &OsStr)> {
-        self.with_origin(true)
-    }
-
-    /// The variables passed through from cargo's environment, sorted by name.
-    pub fn passed_through(&self) -> impl Iterator<Item = (&OsStr, &OsStr)> {
-        self.with_origin(false)
-    }
-
-    fn with_origin(&self, from_unit: bool) -> impl Iterator<Item = (&OsStr, &OsStr)> {
-        self.vars
-            .iter()
-            .zip(&self.from_unit)
-            .filter(move |(_, it)| **it == from_unit)
-            .map(|((name, value), _)| (name.as_os_str(), value.as_os_str()))
-    }
-}
-
-/// What cargo sets on the command, in order, over what it inherits: a variable set, or taken
-/// away (`None`). The last word on a name is the one that counts.
-struct Explicit {
-    vars: Vec<(Cow<'static, str>, Option<OsString>)>,
-}
-
-impl Explicit {
-    fn set(&mut self, name: impl Into<Cow<'static, str>>, value: impl Into<OsString>) {
-        self.vars.push((name.into(), Some(value.into())));
-    }
-
-    fn remove(&mut self, name: &'static str) {
-        self.vars.push((Cow::Borrowed(name), None));
-    }
-
-    fn contains(&self, name: &str) -> bool {
-        self.vars.iter().any(|(it, _)| it == name)
-    }
-
-    fn get(&self, name: &str) -> Option<&OsStr> {
-        self.vars.iter().rev().find(|(it, _)| it == name).and_then(|(_, it)| it.as_deref())
-    }
-}
-
-/// What the machine that runs the script is, as far as its environment goes: cargo decides
-/// these by what it was built for, which is the host.
-struct HostOs {
-    windows: bool,
-    macos: bool,
-    /// The variable programs find dynamic libraries by.
-    dylib_var: &'static str,
-}
-
-impl HostOs {
-    fn of(host: &str) -> HostOs {
-        let windows = host.contains("windows");
-        let macos = host.contains("apple");
-        let dylib_var = if windows {
-            "PATH"
-        } else if macos {
-            "DYLD_FALLBACK_LIBRARY_PATH"
-        } else if host.contains("aix") {
-            "LIBPATH"
-        } else if host.contains("haiku") {
-            "LIBRARY_PATH"
-        } else {
-            "LD_LIBRARY_PATH"
-        };
-        HostOs { windows, macos, dylib_var }
-    }
-
-    /// `std::env::split_paths` on the host: on Unix the bytes split at `:`, as std splits
-    /// them, so a path that is not UTF-8 is kept as it is.
-    fn split_paths(&self, value: &OsStr) -> Vec<PathBuf> {
-        if !self.windows {
-            #[cfg(unix)]
-            {
-                use std::os::unix::ffi::OsStrExt;
-                return value
-                    .as_bytes()
-                    .split(|it| *it == b':')
-                    .map(|it| PathBuf::from(OsStr::from_bytes(it)))
-                    // alloc: setup, once per unit: the library path, split to be joined again.
-                    .collect();
-            }
-            #[cfg(not(unix))]
-            // alloc: setup, once per unit: the library path, split to be joined again.
-            return value.to_string_lossy().split(':').map(PathBuf::from).collect();
-        }
-        let value = value.to_string_lossy();
-        // alloc: setup, once per unit: the library path, split to be joined again.
-        let mut paths = Vec::new();
-        // alloc: setup, once per unit: one buffer for each path's text.
-        let mut path = String::new();
-        let mut quoted = false;
-        let mut after_separator = false;
-        for c in value.chars() {
-            after_separator = false;
-            match c {
-                '"' => quoted = !quoted,
-                ';' if !quoted => {
-                    paths.push(PathBuf::from(std::mem::take(&mut path)));
-                    after_separator = true;
-                }
-                c => path.push(c),
-            }
-        }
-        if after_separator || !path.is_empty() {
-            paths.push(PathBuf::from(path));
-        }
-        paths
-    }
-
-    /// `std::env::join_paths` on the host, which cargo fails on as here. The separators and
-    /// quotes looked for are ASCII, which a path's encoded bytes hold only as themselves.
-    fn join_paths(&self, paths: &[PathBuf], var: &str) -> Result<OsString, Error> {
-        let len = paths.iter().map(|it| it.as_os_str().len() + 3).sum();
-        let mut joined = OsString::with_capacity(len);
-        for (i, path) in paths.iter().enumerate() {
-            let text = path.as_os_str();
-            let bytes = text.as_encoded_bytes();
-            if i > 0 {
-                joined.push(if self.windows { ";" } else { ":" });
-            }
-            if self.windows && bytes.contains(&b'"') || !self.windows && bytes.contains(&b':') {
-                // alloc: error path.
-                let mut message = format!(
-                    "failed to join paths from `${var}` together\n\n\
-                     Check if any of path segments listed below contain an \
-                     unterminated quote character or path separator:"
-                );
-                for path in paths {
-                    // alloc: error path.
-                    message.push_str(&format!("\n    {path:?}"));
-                }
-                return Err(Error(message));
-            }
-            if self.windows && bytes.contains(&b';') {
-                joined.push("\"");
-                joined.push(text);
-                joined.push("\"");
-            } else {
-                joined.push(text);
-            }
-        }
-        Ok(joined)
-    }
-}
-
-/// `name` as cargo makes it part of a variable's, added to `out`: upper case, `-` as `_`.
-fn envify_into(out: &mut String, name: &str) {
-    if name.is_ascii() {
-        out.extend(name.bytes().map(|it| match it {
-            b'-' => '_',
-            it => char::from(it.to_ascii_uppercase()),
-        }));
-    } else {
-        out.extend(
-            name.chars().flat_map(char::to_uppercase).map(|c| if c == '-' { '_' } else { c }),
-        );
-    }
-}
-
-/// A name as cargo makes it part of a variable's: upper case, `-` as `_`.
-pub fn envify(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    envify_into(&mut out, name);
+/// `CARGO_MAKEFLAGS`' value for the jobserver fifo `fifo`, as cargo writes it (the `jobserver`
+/// crate's `Client::configure`: both spellings, for old and new make):
+/// `-j --jobserver-fds=fifo:<fifo> --jobserver-auth=fifo:<fifo>`.
+pub fn makeflags<'a>(fifo: &str, alloc: Alloc<'a>) -> AString<'a> {
+    let mut out = String::with_capacity_in(2 * fifo.len() + 48, alloc);
+    out.push_str("-j --jobserver-fds=fifo:");
+    out.push_str(fifo);
+    out.push_str(" --jobserver-auth=fifo:");
+    out.push_str(fifo);
     out
 }
 
-/// `prefix` and `name` [`envify`]d, in one allocation of their size.
-fn prefixed(prefix: &str, name: &str) -> String {
-    let mut out = String::with_capacity(prefix.len() + name.len());
+/// The job variables of `jobs`, sorted by name: `NUM_JOBS` (`1`, or the worker count) and, for a
+/// shared jobserver, `CARGO_MAKEFLAGS` ([`makeflags`]).
+pub fn job_vars<'a>(jobs: Jobs<'_>, alloc: Alloc<'a>) -> AVec<'a, (&'static str, AString<'a>)> {
+    let mut out: AVec<'a, (&'static str, AString<'a>)> = Vec::with_capacity_in(2, alloc);
+    match jobs {
+        Jobs::One => out.push(("NUM_JOBS", String::from_str_in("1", alloc))),
+        Jobs::Shared { workers, fifo } => {
+            out.push(("CARGO_MAKEFLAGS", makeflags(fifo, alloc)));
+            let mut count = String::with_capacity_in(10, alloc);
+            // Writing into a string cannot fail (`String`'s `fmt::Write` never errs).
+            _ = core::fmt::Write::write_fmt(&mut count, format_args!("{workers}"));
+            out.push(("NUM_JOBS", count));
+        }
+    }
+    out
+}
+
+/// `-` as `_`, uppercased: how Cargo spells a feature or cfg name in a variable's name.
+fn shout<'a>(prefix: &str, name: &str, alloc: Alloc<'a>) -> AString<'a> {
+    let mut out = String::with_capacity_in(prefix.len() + name.len(), alloc);
     out.push_str(prefix);
-    envify_into(&mut out, name);
+    for ch in name.chars() {
+        out.push(if ch == '-' { '_' } else { ch.to_ascii_uppercase() });
+    }
     out
 }
 
-/// `n` in decimal, without the formatting machinery.
-fn decimal(mut n: u32) -> String {
-    let mut digits = [0u8; 10];
-    let mut at = digits.len();
-    loop {
-        at -= 1;
-        digits[at] = b'0' + (n % 10) as u8;
-        n /= 10;
-        if n == 0 {
-            break;
-        }
+/// The 16 hex digits naming a configuration in `OUT_DIR`'s path: of the package's name and
+/// version, the features and the target and its cfgs.
+fn config(given: &Given<'_, '_>) -> [u8; 16] {
+    let mut hasher = Hasher::new("blaze v2 build-script out-dir 1");
+    hasher.part(given.package.name.as_bytes()).part(given.package.version.as_bytes()).part(given.target.as_bytes());
+    for feature in given.features {
+        hasher.part(feature.as_bytes());
     }
-    // alloc: setup, once per unit: a number made at its length.
-    digits[at..].iter().map(|it| char::from(*it)).collect()
+    for atom in given.target_cfg {
+        hasher.part(atom.name.as_bytes()).opt_part(atom.value.as_ref().map(|v| v.as_bytes()));
+    }
+    let id = hasher.finish();
+    let mut out = [0; 16];
+    for (at, byte) in id.0[..8].iter().enumerate() {
+        out[at * 2] = b"0123456789abcdef"[usize::from(byte >> 4)];
+        out[at * 2 + 1] = b"0123456789abcdef"[usize::from(byte & 15)];
+    }
+    out
 }
 
-/// A cfg as `rustc --print cfg` prints it: a name, or a name and a quoted value.
-fn cfg_of<'l>(package: &Package, line: &'l str) -> Result<(&'l str, Option<&'l str>), Unfilled> {
-    match line.split_once('=') {
-        Some((name, value)) => {
-            let value = value.trim();
-            match value.strip_prefix('"').and_then(|it| it.strip_suffix('"')) {
-                Some(value) => Ok((name.trim(), Some(value))),
-                // alloc: error path.
-                None => Err(Unfilled::Cfg { package: package.descr(), line: line.to_owned() }),
-            }
-        }
-        None => Ok((line.trim(), None)),
-    }
+/// `major.minor.patch[-pre][+build]` split as Cargo's `CARGO_PKG_VERSION_*` give it.
+fn version_parts(version: &str) -> (&str, &str, &str, &str) {
+    let core_pre = version.split_once('+').map_or(version, |(v, _)| v);
+    let (core, pre) = core_pre.split_once('-').unwrap_or((core_pre, ""));
+    let mut parts = core.splitn(3, '.');
+    (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""), pre)
 }
 
-/// The cfgs as cargo's map has them, each name where it was first named: a name's values
-/// are those given since it was last given a whole list. Three vectors, not one per name.
-#[derive(Default)]
-struct Cfgs<'a> {
-    names: Vec<&'a str>,
-    /// Per name, the first of `values` that can still be its own.
-    since: Vec<u32>,
-    /// Each value, with the index of its name.
-    values: Vec<(u32, &'a str)>,
-}
+/// The script's environment.
+pub fn env<'a>(given: &Given<'_, '_>, alloc: Alloc<'a>) -> Env<'a> {
+    let mut vars: AVec<'a, (AString<'a>, AString<'a>)> = Vec::new_in(alloc);
+    let mut set = |name: AString<'a>, value: &str| vars.push((name, String::from_str_in(value, alloc)));
+    let named = |name: &str| String::from_str_in(name, alloc);
 
-impl<'a> Cfgs<'a> {
-    fn slot(&mut self, name: &'a str) -> u32 {
-        match self.names.iter().position(|it| *it == name) {
-            Some(at) => at as u32,
-            None => {
-                self.names.push(name);
-                self.since.push(self.values.len() as u32);
-                (self.names.len() - 1) as u32
-            }
-        }
+    // D96: the mount and the folder in it come from `SeenRoot`, their one home.
+    let mut dir = String::from_str_in(given.seen.mount(), alloc);
+    if !given.seen.folder().is_empty() {
+        dir.push('/');
+        dir.push_str(given.seen.folder());
+    }
+    let mut manifest = dir.clone_in(alloc);
+    manifest.push_str("/Cargo.toml");
+    set(named("CARGO_MANIFEST_DIR"), dir.as_str());
+    set(named("CARGO_MANIFEST_PATH"), manifest.as_str());
+    if let Some(links) = given.package.links {
+        set(named("CARGO_MANIFEST_LINKS"), links);
     }
 
-    /// `name` with exactly `values`.
-    fn insert(&mut self, name: &'a str, values: impl IntoIterator<Item = &'a str>) {
-        let slot = self.slot(name);
-        self.since[slot as usize] = self.values.len() as u32;
-        self.values.extend(values.into_iter().map(|it| (slot, it)));
+    for feature in given.features {
+        set(shout("CARGO_FEATURE_", feature, alloc), "1");
     }
 
-    fn add(&mut self, name: &'a str, value: &'a str) {
-        let slot = self.slot(name);
-        self.values.push((slot, value));
-    }
-
-    /// Each name, in order, with its values joined by `,`.
-    fn joined(&self) -> impl Iterator<Item = (&'a str, String)> + '_ {
-        self.names.iter().enumerate().map(|(slot, name)| {
-            let own = || {
-                self.values[self.since[slot] as usize..]
-                    .iter()
-                    .filter(move |(it, _)| *it as usize == slot)
-                    .map(|(_, value)| *value)
-            };
-            let len = own().map(|it| it.len() + 1).sum::<usize>().saturating_sub(1);
-            let mut joined = String::with_capacity(len);
-            for (i, value) in own().enumerate() {
-                if i > 0 {
+    // `CARGO_CFG_*`: atoms of one name joined; the atoms are sorted, so a name's are adjacent.
+    let mut at = 0;
+    let cfg = given.target_cfg;
+    while at < cfg.len() {
+        let name = cfg[at].name.as_str();
+        let mut end = at;
+        let mut joined = String::new_in(alloc);
+        while end < cfg.len() && cfg[end].name.as_str() == name {
+            if let Some(value) = &cfg[end].value {
+                if !joined.is_empty() {
                     joined.push(',');
                 }
                 joined.push_str(value);
             }
-            (*name, joined)
-        })
-    }
-}
-
-/// The search path of `paths` for dynamic libraries: of those with a kind (`native=`,
-/// `crate=`, `dependency=`, `framework=`, `all=`), the directory.
-fn dynamic_search_path(path: &Path) -> &Path {
-    match path.to_str().and_then(|it| it.split_once('=')) {
-        Some(("native" | "crate" | "dependency" | "framework" | "all", path)) => Path::new(path),
-        _ => path,
-    }
-}
-
-/// Of `paths`, the directories below `root`: one outside is likely the system's, whose
-/// libraries would be found in place of the system's own (cargo's issue 3366).
-fn below(paths: &[PathBuf], root: &Path) -> Vec<PathBuf> {
-    paths
-        .iter()
-        .map(|it| dynamic_search_path(it))
-        .filter(|it| it.starts_with(root))
-        .map(Path::to_owned)
-        // alloc: setup, once per unit: the plugin directories it keeps.
-        .collect()
-}
-
-/// Where openssl-probe 0.1.6 looks for certificates, in order, on `host`.
-fn certificate_dirs(host: &str) -> Vec<&'static Path> {
-    // alloc: setup: once per cargo started, the directories openssl-probe looks in.
-    let mut dirs = vec![
-        "/var/ssl",
-        "/usr/share/ssl",
-        "/usr/local/ssl",
-        "/usr/local/openssl",
-        "/usr/local/etc/openssl",
-        "/usr/local/share",
-        "/usr/lib/ssl",
-        "/usr/ssl",
-        "/etc/openssl",
-        "/etc/pki/ca-trust/extracted/pem",
-        "/etc/pki/tls",
-        "/etc/ssl",
-        "/etc/certs",
-        "/opt/etc/ssl",
-    ];
-    if host.contains("android") {
-        dirs.push("/data/data/com.termux/files/usr/etc/tls");
-    }
-    if host.contains("haiku") {
-        dirs.push("/boot/system/data/ssl");
-    }
-    // alloc: setup: once per cargo started.
-    dirs.into_iter().map(Path::new).collect()
-}
-
-const CERTIFICATE_FILES: [&str; 10] = [
-    "cert.pem",
-    "certs.pem",
-    "ca-bundle.pem",
-    "cacert.pem",
-    "ca-certificates.crt",
-    "certs/ca-certificates.crt",
-    "certs/ca-root-nss.crt",
-    "certs/ca-bundle.crt",
-    "CARootCertificates.pem",
-    "tls-ca-bundle.pem",
-];
-
-/// cargo's environment once it has started, from the one it was started with: what its
-/// scripts inherit. Before any command, cargo starts libgit2, whose `openssl_env_init` (git2
-/// 0.21.0, on hosts other than Windows, macOS and iOS) sets `SSL_CERT_FILE` and `SSL_CERT_DIR`
-/// to the certificates openssl-probe 0.1.6 finds on this machine, unless they name a file and
-/// a directory that exist.
-pub fn cargo_started(
-    started_with: &[(OsString, OsString)],
-    host: &str,
-) -> Vec<(OsString, OsString)> {
-    cargo_started_in(started_with, host, &certificate_dirs(host))
-}
-
-fn cargo_started_in(
-    started_with: &[(OsString, OsString)],
-    host: &str,
-    certificate_dirs: &[&Path],
-) -> Vec<(OsString, OsString)> {
-    let os = HostOs::of(host);
-    // alloc: setup: once per cargo started, the environment it begins with.
-    let mut env = started_with.to_vec();
-    if os.windows || os.macos {
-        return env;
-    }
-    let existing = |name: &str| {
-        started_with
-            .iter()
-            .find(|(it, _)| it == OsStr::new(name))
-            .map(|(_, value)| PathBuf::from(value))
-            .filter(|it| it.exists())
-    };
-    let mut cert_file = existing("SSL_CERT_FILE");
-    let mut cert_dir = existing("SSL_CERT_DIR");
-    // Each candidate is joined in this one buffer, and copied out only when it is found.
-    let mut candidate = PathBuf::new();
-    for dir in certificate_dirs.iter().filter(|it| it.exists()) {
-        if cert_file.is_none() {
-            cert_file = CERTIFICATE_FILES.iter().find_map(|it| {
-                let path = joined(&mut candidate, dir, it);
-                // alloc: setup: once per cargo started, a certificate path found.
-                path.exists().then(|| path.to_owned())
-            });
+            end += 1;
         }
-        if cert_dir.is_none() {
-            let path = joined(&mut candidate, dir, "certs");
-            if path.exists() {
-                // alloc: setup: once per cargo started, a certificate path found.
-                cert_dir = Some(path.to_owned());
-            }
+        if name != "test" && name != "proc_macro" {
+            set(shout("CARGO_CFG_", name, alloc), joined.as_str());
         }
-        if cert_file.is_some() && cert_dir.is_some() {
-            break;
-        }
+        at = end;
     }
-    for (name, value) in [("SSL_CERT_FILE", cert_file), ("SSL_CERT_DIR", cert_dir)] {
-        let Some(value) = value else { continue };
-        match env.iter_mut().find(|(it, _)| it == OsStr::new(name)) {
-            Some((_, it)) => *it = value.into_os_string(),
-            None => env.push((name.into(), value.into_os_string())),
-        }
-    }
-    env
-}
 
-/// `dir` and `name` joined in `buf`, which keeps its allocation from one join to the next.
-fn joined<'b>(buf: &'b mut PathBuf, dir: &Path, name: &str) -> &'b Path {
-    buf.as_mut_os_string().clear();
-    buf.push(dir);
-    buf.push(name);
-    buf
-}
+    let config = config(given);
+    let mut out_dir = String::from_str_in("/target/debug/build/", alloc);
+    out_dir.push_str(given.package.name);
+    out_dir.push('-');
+    out_dir.push_str(core::str::from_utf8(&config).unwrap_or(""));
+    out_dir.push_str("/out");
+    set(named("OUT_DIR"), out_dir.as_str());
+    set(named("TARGET"), given.target);
+    set(named("HOST"), given.host);
+    // No `NUM_JOBS` here: a job count is the machine's, never keyed (`Env::for_run` adds it).
+    set(named("OPT_LEVEL"), "0");
+    set(named("DEBUG"), "true");
+    set(named("PROFILE"), "debug");
+    set(named("RUSTC"), "rustc");
+    set(named("RUSTDOC"), "rustdoc");
+    set(named("CARGO"), "cargo");
+    set(named("CARGO_ENCODED_RUSTFLAGS"), "");
+    if given.target.ends_with("-apple-darwin") {
+        set(named("MACOSX_DEPLOYMENT_TARGET"), crate::toolchain::MACOS_MIN);
+    }
 
-/// The directories the dynamic loader of `host` searches for the libraries of a program started
-/// in `env` (a script's whole environment, as [`env`] makes it): the value of the host's
-/// library path variable there, split as the host splits it, in order. Empty when the
-/// variable is not set. What a check of a run's reads knows the loader's probes by
-/// (`blaze_usercode::pure::Places::search`): the very list the run was given, never one made
-/// again from the unit.
-pub fn dylib_search_path(host: &str, env: &[(OsString, OsString)]) -> Vec<PathBuf> {
-    let host = HostOs::of(host);
-    // The last of a name is the one a process started in `env` sees.
-    env.iter()
-        .rev()
-        .find(|(name, _)| name == OsStr::new(host.dylib_var))
-        .map(|(_, value)| host.split_paths(value))
-        .unwrap_or_default()
-}
-
-/// About how many words cargo has on the fixed set of names, the dynamic library path's two
-/// among them.
-const FIXED: usize = 40;
-
-/// The environment cargo runs `unit`'s script with, when cargo's own is `inherited` (see
-/// [`cargo_started`]).
-pub fn env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Env, Error> {
-    unit.check()?;
-    let host = HostOs::of(&unit.host);
-    let inherited_var = |name: &str| {
-        inherited.iter().find(|(it, _)| it == OsStr::new(name)).map(|(_, value)| value.as_os_str())
-    };
-    let package = &unit.package;
-    let metadata: usize = unit.dependencies.iter().map(|it| it.metadata.len()).sum();
-    let mut cmd = Explicit {
-        vars: Vec::with_capacity(
-            FIXED
-                + unit.config_env.len()
-                + unit.features.len()
-                + unit.target_cfgs.len()
-                + metadata
-                + 1,
-        ),
-    };
-
-    // `fill_env`, for a process on the host.
-    let search = &unit.dylib_search;
-    let mut search_path = Vec::with_capacity(search.host_deps.len() + 5);
-    if let Some(host_root) = &search.host_root {
-        // alloc: setup, once per unit: the search path it sets.
-        search_path.push(host_root.clone());
+    let p = &given.package;
+    let (major, minor, patch, pre) = version_parts(p.version);
+    for (name, value) in [
+        ("CARGO_PKG_NAME", p.name),
+        ("CARGO_PKG_VERSION", p.version),
+        ("CARGO_PKG_VERSION_MAJOR", major),
+        ("CARGO_PKG_VERSION_MINOR", minor),
+        ("CARGO_PKG_VERSION_PATCH", patch),
+        ("CARGO_PKG_VERSION_PRE", pre),
+    ] {
+        set(named(name), value);
     }
-    search_path.extend(search.host_deps.iter().cloned());
-    if !search.sysroot_libdir.as_os_str().is_empty() {
-        // alloc: setup, once per unit: the search path it sets.
-        search_path.push(search.sysroot_libdir.clone());
-    }
-    let dylib_path =
-        inherited_var(host.dylib_var).map(|it| host.split_paths(it)).unwrap_or_default();
-    let dylib_path_is_empty = dylib_path.is_empty();
-    if dylib_path.starts_with(&search_path) {
-        search_path = dylib_path;
-    } else {
-        search_path.extend(dylib_path);
-    }
-    if host.macos && dylib_path_is_empty {
-        if let Some(home) = inherited_var("HOME") {
-            search_path.push(Path::new(home).join("lib"));
-        }
-        search_path.push(PathBuf::from("/usr/local/lib"));
-        search_path.push(PathBuf::from("/usr/lib"));
-    }
-    cmd.set(host.dylib_var, host.join_paths(&search_path, host.dylib_var)?);
-    cmd.set("CARGO", &unit.tools.cargo);
-    let version = Version::of(package)?;
-    cmd.set("CARGO_MANIFEST_DIR", &package.manifest_dir);
-    cmd.set("CARGO_MANIFEST_PATH", &package.manifest_path);
-    cmd.set("CARGO_PKG_VERSION_MAJOR", version.major);
-    cmd.set("CARGO_PKG_VERSION_MINOR", version.minor);
-    cmd.set("CARGO_PKG_VERSION_PATCH", version.patch);
-    cmd.set("CARGO_PKG_VERSION_PRE", version.pre);
-    cmd.set("CARGO_PKG_VERSION", &package.version);
-    cmd.set("CARGO_PKG_NAME", &package.name);
-    fn field(it: &Option<String>) -> &str {
-        it.as_deref().unwrap_or("")
-    }
-    cmd.set("CARGO_PKG_DESCRIPTION", field(&package.description));
-    cmd.set("CARGO_PKG_HOMEPAGE", field(&package.homepage));
-    cmd.set("CARGO_PKG_REPOSITORY", field(&package.repository));
-    cmd.set("CARGO_PKG_LICENSE", field(&package.license));
-    cmd.set("CARGO_PKG_LICENSE_FILE", field(&package.license_file));
-    cmd.set("CARGO_PKG_AUTHORS", package.authors.join(":"));
-    cmd.set("CARGO_PKG_RUST_VERSION", field(&package.rust_version));
-    cmd.set("CARGO_PKG_README", field(&package.readme));
-    // `[env]` takes nothing cargo has set, and only what cargo's environment lacks unless forced.
-    for it in &unit.config_env {
-        if (it.force || inherited_var(&it.name).is_none()) && !cmd.contains(&it.name) {
-            // clone: setup, once per unit: an `[env]` name it sets.
-            cmd.set(it.name.clone(), &it.value);
+    if let Some(meta) = p.meta {
+        for (name, value) in meta.pairs() {
+            set(named(name), value);
         }
     }
 
-    // `build_work`.
-    cmd.set("OUT_DIR", &unit.out_dir);
-    cmd.set("CARGO_MANIFEST_DIR", &package.manifest_dir);
-    cmd.set("CARGO_MANIFEST_PATH", &package.manifest_path);
-    cmd.set("NUM_JOBS", decimal(unit.jobs));
-    cmd.set("TARGET", &unit.target);
-    cmd.set("DEBUG", if unit.profile.debuginfo { "true" } else { "false" });
-    cmd.set("OPT_LEVEL", &unit.profile.opt_level);
-    cmd.set("PROFILE", if unit.profile.release { "release" } else { "debug" });
-    cmd.set("HOST", &unit.host);
-    cmd.set("RUSTC", &unit.tools.rustc);
-    cmd.set("RUSTDOC", &unit.tools.rustdoc);
-    if let Some(linker) = &unit.tools.linker {
-        cmd.set("RUSTC_LINKER", linker);
+    for dep in given.deps {
+        let mut name = shout("DEP_", dep.links, alloc);
+        name.push('_');
+        let key = shout("", dep.key, alloc);
+        name.push_str(&key);
+        set(name, dep.value);
     }
-    if let Some(links) = &package.links {
-        cmd.set("CARGO_MANIFEST_LINKS", links);
-    }
-    for feature in &unit.features {
-        cmd.set(prefixed("CARGO_FEATURE_", feature), "1");
-    }
-    // The cfgs as cargo's map has them: `feature` first, `debug_assertions` from the profile
-    // and not from rustc, which asks without the profile's flags; a name again empties it.
-    let mut cfgs = Cfgs::default();
-    cfgs.insert("feature", unit.features.iter().map(String::as_str));
-    if unit.profile.debug_assertions {
-        cfgs.insert("debug_assertions", []);
-    }
-    for line in &unit.target_cfgs {
-        match cfg_of(package, line)? {
-            ("debug_assertions", None) => {}
-            (name, None) => cfgs.insert(name, []),
-            (name, Some(value)) => cfgs.add(name, value),
+
+    // Sorted by name; a later value of one name (a `DEP_` pair printed twice) wins, as the
+    // last `export` would.
+    vars.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    let mut kept: AVec<'a, (AString<'a>, AString<'a>)> = Vec::with_capacity_in(vars.len(), alloc);
+    for pair in vars {
+        match kept.last_mut() {
+            Some(last) if last.0 == pair.0 => *last = pair,
+            _ => kept.push(pair),
         }
     }
-    for (name, values) in cfgs.joined() {
-        cmd.set(prefixed("CARGO_CFG_", name), values);
-    }
-    match &unit.tools.rustc_wrapper {
-        Some(wrapper) => cmd.set("RUSTC_WRAPPER", wrapper),
-        None => cmd.remove("RUSTC_WRAPPER"),
-    }
-    cmd.remove("RUSTC_WORKSPACE_WRAPPER");
-    if unit.workspace_member
-        && let Some(wrapper) = &unit.tools.rustc_workspace_wrapper
-    {
-        cmd.set("RUSTC_WORKSPACE_WRAPPER", wrapper);
-    }
-    cmd.set("CARGO_ENCODED_RUSTFLAGS", unit.rustflags.join("\x1f"));
-    cmd.remove("RUSTFLAGS");
-    for dependency in &unit.dependencies {
-        let Some(links) = &dependency.links else { continue };
-        let mut prefix = prefixed("DEP_", links);
-        prefix.push('_');
-        for (key, value) in &dependency.metadata {
-            cmd.set(prefixed(&prefix, key), value);
-        }
-    }
-    // `add_plugin_deps`.
-    if let Some(host_root) = &search.host_root {
-        let mut search_path =
-            cmd.get(host.dylib_var).map(|it| host.split_paths(it)).unwrap_or_default();
-        search_path.extend(below(&search.plugin_search, host_root));
-        cmd.set(host.dylib_var, host.join_paths(&search_path, host.dylib_var)?);
-    }
-    // The jobserver's `Client::configure`.
-    if let Some(auth) = &unit.jobserver {
-        cmd.set(
-            "CARGO_MAKEFLAGS",
-            ["-j --jobserver-fds=", auth.as_str(), " --jobserver-auth=", auth.as_str()].concat(),
-        );
-    }
-    Ok(merged(inherited, cmd))
+    Env { vars: kept }
 }
-
-/// A variable cargo sets (or takes away), before it is sorted.
-struct Entry {
-    /// The name's first sixteen bytes, big-endian: most comparisons of names end here. Eight
-    /// would tie on most of them (`CARGO_CF`, `CARGO_FE`, `CARGO_PK`); sixteen part all but
-    /// the target's cfgs, at one compare of two words.
-    order: u128,
-    name: OsString,
-    value: Option<OsString>,
-    from_unit: bool,
-    /// Which word on its name it is: a later one wins.
-    seq: u32,
-}
-
-impl Entry {
-    fn new(name: OsString, value: Option<OsString>, from_unit: bool, seq: usize) -> Self {
-        let bytes = name.as_encoded_bytes();
-        let mut first = [0u8; 16];
-        let len = bytes.len().min(16);
-        first[..len].copy_from_slice(&bytes[..len]);
-        Entry { order: u128::from_be_bytes(first), name, value, from_unit, seq: seq as u32 }
-    }
-}
-
-/// What cargo inherits with what it sets over it, sorted by name, the last word on each name
-/// kept and what is taken away left out. What cargo sets is sorted; what is inherited is
-/// the same for every script of a build, so a caller that passes it sorted (each name once)
-/// pays one pass to check that, not a sort; otherwise its indices are sorted. The two are
-/// then merged, what cargo sets winning, and an inherited variable is copied only where kept.
-fn merged(inherited: &[(OsString, OsString)], cmd: Explicit) -> Env {
-    let mut own: Vec<Entry> = Vec::with_capacity(cmd.vars.len());
-    for (seq, (name, value)) in cmd.vars.into_iter().enumerate() {
-        let from_unit = value.is_some();
-        own.push(Entry::new(OsString::from(name.into_owned()), value, from_unit, seq));
-    }
-    own.sort_unstable_by(|a, b| {
-        a.order.cmp(&b.order).then_with(|| a.name.cmp(&b.name)).then(b.seq.cmp(&a.seq))
-    });
-    own.dedup_by(|later, first| later.name == first.name);
-
-    let order: Option<Vec<u32>> = (!inherited.is_sorted_by(|a, b| a.0 < b.0)).then(|| {
-        // alloc: setup, once per unit: the inherited order, when not passed sorted (request 6).
-        let mut order: Vec<u32> = (0..inherited.len() as u32).collect();
-        order.sort_unstable_by(|a, b| {
-            inherited[*a as usize].0.cmp(&inherited[*b as usize].0).then(b.cmp(a))
-        });
-        order.dedup_by(|later, first| inherited[*later as usize].0 == inherited[*first as usize].0);
-        order
-    });
-    let kept = order.as_ref().map_or(inherited.len(), Vec::len);
-    let inherited_at = |at: usize| match &order {
-        Some(order) => order.get(at).map(|it| &inherited[*it as usize]),
-        None => inherited.get(at),
-    };
-
-    let mut vars = Vec::with_capacity(kept + own.len());
-    let mut from_unit = Vec::with_capacity(kept + own.len());
-    let mut own = own.into_iter().peekable();
-    let mut at = 0;
-    loop {
-        let next_inherited = inherited_at(at);
-        let next = match (own.peek(), next_inherited) {
-            (None, None) => break,
-            (Some(set), Some((name, _))) => set.name.cmp(name),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-        };
-        if next != Ordering::Less
-            && let Some((name, value)) = next_inherited
-        {
-            at += 1;
-            if next == Ordering::Greater {
-                // alloc: setup, once per unit: an inherited variable copied where it is kept.
-                vars.push((name.clone(), value.clone()));
-                from_unit.push(false);
-                continue;
-            }
-        }
-        if let Some(Entry { name, value: Some(value), from_unit: set_from_unit, .. }) = own.next() {
-            vars.push((name, value));
-            from_unit.push(set_from_unit);
-        }
-    }
-    Env { vars, from_unit }
-}
-
-/// The parts of a version cargo names apart.
-struct Version<'a> {
-    major: &'a str,
-    minor: &'a str,
-    patch: &'a str,
-    pre: &'a str,
-}
-
-impl Version<'_> {
-    /// The parts of `package`'s version, which cargo's manifest reader has made semver's: three
-    /// numbers, then a pre-release and build metadata, each optional.
-    fn of(package: &Package) -> Result<Version<'_>, Unfilled> {
-        let whole = package.version.as_str();
-        let version = whole.split_once('+').map_or(whole, |(it, _)| it);
-        let (numbers, pre) = version.split_once('-').unwrap_or((version, ""));
-        let digits = |it: &str| !it.is_empty() && it.bytes().all(|b| b.is_ascii_digit());
-        let mut parts = numbers.split('.');
-        match (parts.next(), parts.next(), parts.next(), parts.next()) {
-            (Some(major), Some(minor), Some(patch), None)
-                if digits(major) && digits(minor) && digits(patch) =>
-            {
-                Ok(Version { major, minor, patch, pre })
-            }
-            // alloc: error path.
-            _ => Err(Unfilled::Version { package: package.descr(), version: whole.to_owned() }),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests;

@@ -37,11 +37,83 @@ pub enum OutlineStrStep<'a> {
     },
 }
 
+/// Which tokens of a text are joint ([`crate::JOINT`]), from where each stands in it: the one
+/// rule, whether the tokens come from the lexer ([`LexedStr::each_input_token`]) or from a
+/// renderer that wrote the text and knows where each token is (blaze-file-items'
+/// `outline_tokens`). Fed in order: [`Joiner::gap`] wherever bytes that are no token's lie
+/// before the next token (whitespace, a comment), [`Joiner::token`] for each token.
+///
+/// The rule, as the grammar reads it (`Tokens::is_joint`; a float's own mark picks the split
+/// of `x.0.1`, expressions.rs `float_split`):
+/// - a token that is neither an identifier nor a float is joint to the token before it when no
+///   gap lies between it and the last token that could say so: [`Joins::before`];
+/// - a float with a fraction (`1.0`, `1e3`: its text does not end in `.`) is marked itself
+///   ([`Joins::own`]) and leaves what the next token reads as it was; a float that ends in `.`
+///   (`1.`) clears it;
+/// - an identifier marks nothing and leaves what the next token reads as it was.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Joiner {
+    was_joint: bool,
+}
+
+/// What [`Joiner::token`] says of one token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Joins {
+    /// The token given before this one is joint to it: [`crate::JOINT`] goes in that token's
+    /// word ([`crate::Input::was_joint`]).
+    pub before: bool,
+    /// This token's own word has [`crate::JOINT`]: a float with a fraction.
+    pub own: bool,
+}
+
+impl Joins {
+    /// `word`, this token's ([`crate::word`]), with its own mark.
+    #[inline]
+    pub const fn marked(self, word: u32) -> u32 {
+        if self.own { word | crate::JOINT } else { word }
+    }
+}
+
+impl Joiner {
+    /// Before a text's first token.
+    #[inline]
+    pub const fn new() -> Joiner {
+        Joiner { was_joint: false }
+    }
+
+    /// Bytes that are no token's lie before the next token.
+    #[inline]
+    pub fn gap(&mut self) {
+        self.was_joint = false;
+    }
+
+    /// The next token, of `kind`; `ends_in_dot` is asked only of a float: whether its text's
+    /// last byte is `.`.
+    #[inline]
+    pub fn token(&mut self, kind: SyntaxKind, ends_in_dot: impl FnOnce() -> bool) -> Joins {
+        match kind {
+            SyntaxKind::IDENT => Joins { before: false, own: false },
+            // Tag the token as joint if it is float with a fractional part
+            // we use this jointness to inform the parser about what token split
+            // event to emit when we encounter a float literal in a field access
+            SyntaxKind::FLOAT_NUMBER => {
+                let before = self.was_joint;
+                let own = !ends_in_dot();
+                if !own {
+                    self.was_joint = false;
+                }
+                Joins { before, own }
+            }
+            _ => Joins { before: core::mem::replace(&mut self.was_joint, true), own: false },
+        }
+    }
+}
+
 impl LexedStr<'_> {
     pub fn to_input(&self, edition: Edition) -> crate::Input {
-        let _p = tracing::info_span!(target: "blaze", "LexedStr::to_input").entered();
+        let _p = blaze_trace::info_span!(target: "blaze", "LexedStr::to_input").entered();
         let mut res = crate::Input::with_capacity(self.len());
-        self.push_input(&mut res, &mut false, edition);
+        self.push_input(&mut res, &mut Joiner::new(), edition);
         res
     }
 
@@ -50,46 +122,67 @@ impl LexedStr<'_> {
     /// again.
     pub fn to_input_followed_by(&self, following: &LexedStr<'_>, edition: Edition) -> crate::Input {
         let mut res = crate::Input::with_capacity(self.len() + following.len());
-        let mut was_joint = false;
-        self.push_input(&mut res, &mut was_joint, edition);
-        following.push_input(&mut res, &mut was_joint, edition);
+        let mut joiner = Joiner::new();
+        self.push_input(&mut res, &mut joiner, edition);
+        following.push_input(&mut res, &mut joiner, edition);
         res
     }
 
     /// Only an identifier's text is sliced (for its contextual keyword) and a float's last byte
     /// read: the other tokens cost their word alone.
-    fn push_input(&self, res: &mut crate::Input, was_joint: &mut bool, edition: Edition) {
+    fn push_input(&self, res: &mut crate::Input, joiner: &mut Joiner, edition: Edition) {
+        self.each_input_token(edition, joiner, |word, _, joins| {
+            if joins {
+                res.was_joint();
+            }
+            res.push_word(word);
+        });
+    }
+
+    /// The parser's input of this text, a token at a time with no [`crate::Input`] made: for
+    /// each token that is not trivia, in order, `token(word, bytes, joins)` with its word
+    /// ([`crate::word`]; a float with a fraction has [`crate::JOINT`] set already), its bytes
+    /// in the text, and whether the token given before it is joint to it, which the caller
+    /// records by setting [`crate::JOINT`] in the word it was given last
+    /// ([`crate::Input::was_joint`]). The words, in order and with those bits set, followed by
+    /// [`crate::Tokens::PAD`] words [`crate::Tokens::EOF_WORD`], are [`LexedStr::to_input`]'s
+    /// (`the_input_a_token_at_a_time_is_the_input`), so a caller that keeps columns of its own
+    /// (an outline: word, start, end) fills them in this one pass and parses from them
+    /// ([`crate::Tokens::new`]).
+    ///
+    /// `joiner` is the state between two texts lexed apart ([`LexedStr::to_input_followed_by`]):
+    /// new before the first.
+    #[inline]
+    pub fn each_input_token(
+        &self,
+        edition: Edition,
+        joiner: &mut Joiner,
+        mut token: impl FnMut(u32, core::ops::Range<usize>, bool),
+    ) {
         let text = self.as_str();
         let mut end = 0;
         for (kind, len) in self.kinds_and_lens() {
             let start = end;
             end += len;
             if kind.is_trivia() {
-                *was_joint = false
-            } else if kind == SyntaxKind::IDENT {
-                res.push_ident(
-                    SyntaxKind::from_contextual_keyword(&text[start..end], edition)
-                        .unwrap_or(SyntaxKind::IDENT),
-                    edition,
-                )
+                joiner.gap();
             } else {
-                if *was_joint {
-                    res.was_joint();
-                }
-                res.push(kind, edition);
-                // Tag the token as joint if it is float with a fractional part
-                // we use this jointness to inform the parser about what token split
-                // event to emit when we encounter a float literal in a field access
-                if kind == SyntaxKind::FLOAT_NUMBER {
-                    // A float is never empty, and a UTF-8 continuation byte is never `.`.
-                    if text.as_bytes()[end - 1] != b'.' {
-                        res.was_joint();
-                    } else {
-                        *was_joint = false;
+                // Only an identifier's text is sliced, for its contextual keyword. A whole body
+                // in one token ([`LexedStr::new_outline`]) is a `{` to the parser, its
+                // contextual kind saying it is the whole body (`Parser::lazy_body`): every
+                // question the grammar asks of the token there is answered as of the `{`.
+                let (kind, contextual) = match kind {
+                    SyntaxKind::IDENT => {
+                        let word = &text[start..end];
+                        let contextual = SyntaxKind::from_contextual_keyword(word, edition);
+                        (kind, contextual.unwrap_or(SyntaxKind::IDENT))
                     }
-                } else {
-                    *was_joint = true;
-                }
+                    SyntaxKind::LAZY_BODY => (SyntaxKind::L_CURLY, SyntaxKind::LAZY_BODY),
+                    _ => (kind, SyntaxKind::EOF),
+                };
+                // A float is never empty, and a UTF-8 continuation byte is never `.`.
+                let joins = joiner.token(kind, || text.as_bytes()[end - 1] == b'.');
+                token(joins.marked(crate::word(kind, contextual, edition)), start..end, joins.before);
             }
         }
     }

@@ -32,6 +32,8 @@ use std::{io, ptr::NonNull, sync::atomic};
 
 #[cfg(unix)]
 use crate::syscalls::{Kind, timed};
+#[cfg(unix)]
+use blaze_sys::posix::io::{Advice, MapFlags, Prot, madvise, mmap, mprotect, munmap};
 
 /// Alignment of every reservation: a huge page on Unix (so a huge region starts on one);
 /// Windows' allocation granularity, which `VirtualAlloc` always gives.
@@ -81,9 +83,9 @@ fn query_page_size() -> usize {
 #[cfg(unix)]
 pub(crate) fn reserve(bytes: usize, huge: bool) -> io::Result<NonNull<u8>> {
     #[cfg(target_os = "linux")]
-    let prot = libc::PROT_READ | libc::PROT_WRITE;
+    let prot = Prot::READ | Prot::WRITE;
     #[cfg(not(target_os = "linux"))]
-    let prot = libc::PROT_NONE;
+    let prot = Prot::NONE;
     reserve_with(bytes, huge, prot)
 }
 
@@ -102,17 +104,15 @@ pub(crate) const RESERVATION_WRITABLE: bool = cfg!(target_os = "linux");
 #[cfg(unix)]
 pub(crate) fn reserve_sparse(bytes: usize) -> io::Result<NonNull<u8>> {
     // Base pages, advised so by `reserve_with` (`advise_pages`).
-    reserve_with(bytes, false, libc::PROT_READ | libc::PROT_WRITE)
+    reserve_with(bytes, false, Prot::READ | Prot::WRITE)
 }
 
 #[cfg(windows)]
 pub(crate) fn reserve_sparse(bytes: usize) -> io::Result<NonNull<u8>> {
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
-    };
+    use blaze_sys::windows::memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
     // SAFETY: a fresh reservation at an address the kernel picks, committed whole.
     let base =
-        unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        unsafe { VirtualAlloc(core::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
     NonNull::new(base.cast::<u8>()).ok_or_else(io::Error::last_os_error)
 }
 
@@ -123,42 +123,44 @@ pub(crate) fn reserve_sparse(bytes: usize) -> io::Result<NonNull<u8>> {
 
 /// [`reserve`] with the pages' protection `prot`.
 #[cfg(unix)]
-fn reserve_with(bytes: usize, huge: bool, prot: libc::c_int) -> io::Result<NonNull<u8>> {
+fn reserve_with(bytes: usize, huge: bool, prot: Prot) -> io::Result<NonNull<u8>> {
     let padded = bytes
         .checked_add(RESERVE_ALIGN)
         .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "reservation overflows"))?;
     // SAFETY: a fresh anonymous mapping at an address the kernel picks: it overlaps nothing the
     // program holds.
     let base = timed(Kind::Reserve, || unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
+        mmap(
+            None,
             padded,
             prot,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-            -1,
+            MapFlags::PRIVATE | MapFlags::ANONYMOUS | MapFlags::NO_RESERVE,
+            None,
             0,
         )
-    });
-    if base == libc::MAP_FAILED {
-        return Err(refused_reservation(padded, prot, io::Error::last_os_error()));
-    }
+    })
+    .map_err(|e| io::Error::from_raw_os_error(e.raw() as i32))
+    .map_err(|why| refused_reservation(padded, prot, why))?;
     let base = base.cast::<u8>();
     let head = base.align_offset(RESERVE_ALIGN);
     let tail = padded - head - bytes;
-    let aligned = base.wrapping_add(head);
+    // `base` is non-null (blaze-sys's `mmap` says so in its type); `aligned` is inside the mapping.
+    let aligned = base.as_ptr().wrapping_add(head);
     if head != 0 {
         // SAFETY: `[base, aligned)` is the front of the mapping just made, which nothing else
         // knows of.
-        let _ = timed(Kind::Munmap, || unsafe { libc::munmap(base.cast(), head) });
+        let _ = timed(Kind::Munmap, || unsafe { munmap(base.cast(), head) });
     }
-    if tail != 0 {
+    if tail != 0
+        && let Some(back) = NonNull::new(aligned.wrapping_add(bytes))
+    {
         // SAFETY: `[aligned + bytes, base + padded)` is the back of the same fresh mapping.
-        let _ = timed(Kind::Munmap, || unsafe { libc::munmap(aligned.wrapping_add(bytes).cast(), tail) });
+        let _ = timed(Kind::Munmap, || unsafe { munmap(back, tail) });
     }
     #[cfg(target_os = "linux")]
     {
         advise_pages(aligned, bytes, huge);
-        if huge && prot != libc::PROT_NONE && bytes > crate::HUGE_PAGE {
+        if huge && prot != Prot::NONE && bytes > crate::HUGE_PAGE {
             // A writable reservation advised huge pages whole would make its first touch a
             // 2 MiB page, so a small huge region would cost a huge page: its first huge page's
             // worth stays base pages until it grows past it ([`promote_first`]).
@@ -173,18 +175,30 @@ fn reserve_with(bytes: usize, huge: bool, prot: libc::c_int) -> io::Result<NonNu
 /// A refused reservation, named: on Linux a writable one is charged to the commit limit at once
 /// when the system ignores `MAP_NORESERVE` (`vm.overcommit_memory = 2`), which a reservation of
 /// tens of GiB passes.
+// to remove: callers pass HostMemory (bstd move): this reads the overcommit mode here.
 #[cfg(unix)]
 #[cold]
-fn refused_reservation(bytes: usize, prot: libc::c_int, why: io::Error) -> io::Error {
+fn refused_reservation(bytes: usize, prot: Prot, why: io::Error) -> io::Error {
+    refused_reservation_in(bytes, prot, why, overcommit_here())
+}
+
+/// As [`refused_reservation`], worded with the host's `overcommit` mode given (a
+/// [`HostMemory`](crate::HostMemory) fact read at boot).
+#[cfg(unix)]
+#[cold]
+fn refused_reservation_in(
+    bytes: usize,
+    prot: Prot,
+    why: io::Error,
+    overcommit: crate::host::Overcommit,
+) -> io::Error {
     if !(cfg!(target_os = "linux")
-        && prot != libc::PROT_NONE
-        && why.raw_os_error() == Some(libc::ENOMEM))
+        && prot != Prot::NONE
+        && why.raw_os_error() == Some(blaze_sys::Errno::NoMem.raw() as i32))
     {
         return why;
     }
-    let mode = std::fs::read_to_string("/proc/sys/vm/overcommit_memory")
-        .map(|it| it.trim().to_owned()) // alloc: the error of a refused reservation, once
-        .unwrap_or_else(|read| format!("unreadable: {read}")); // alloc: as above
+    let mode = overcommit.shown();
     // alloc: the error of a refused reservation, once
     io::Error::new(
         why.kind(),
@@ -193,6 +207,65 @@ fn refused_reservation(bytes: usize, prot: libc::c_int, why: io::Error) -> io::E
              vm.overcommit_memory is {mode}, and blaze needs 0 or 1 (2 charges every reservation whole)"
         ),
     )
+}
+
+/// The host's memory facts as read here, with the process's `huge_pages` choice: the overcommit
+/// mode, the transparent huge page setting and the 2 MiB pool's size.
+// to remove: callers pass HostMemory (bstd move): blaze-core reads these files at boot.
+pub(crate) fn host_memory_here(huge_pages: crate::host::HugeChoice) -> crate::HostMemory {
+    crate::HostMemory {
+        huge_pages,
+        overcommit: overcommit_here(),
+        thp: thp_here(),
+        huge_pool_2m: pool_here(),
+    }
+}
+
+/// `vm.overcommit_memory`, read here; [`Overcommit::Unread`](crate::host::Overcommit::Unread)
+/// when the file cannot be read or parsed.
+// to remove: callers pass HostMemory (bstd move).
+#[cfg(target_os = "linux")]
+fn overcommit_here() -> crate::host::Overcommit {
+    // alloc: the setting's few bytes, read once per process
+    match std::fs::read_to_string("/proc/sys/vm/overcommit_memory") {
+        Ok(text) => crate::host::Overcommit::parse(&text).unwrap_or(crate::host::Overcommit::Unread),
+        Err(_) => crate::host::Overcommit::Unread,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn overcommit_here() -> crate::host::Overcommit {
+    crate::host::Overcommit::Unread
+}
+
+/// The transparent huge page setting, read here; [`ThpSetting::Missing`](crate::host::ThpSetting::Missing)
+/// when the file cannot be read or marks no setting.
+// to remove: callers pass HostMemory (bstd move).
+#[cfg(target_os = "linux")]
+fn thp_here() -> crate::host::ThpSetting {
+    // alloc: the setting's few bytes, read once per process
+    match std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled") {
+        Ok(text) => crate::host::ThpSetting::parse(&text).unwrap_or(crate::host::ThpSetting::Missing),
+        Err(_) => crate::host::ThpSetting::Missing,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn thp_here() -> crate::host::ThpSetting {
+    crate::host::ThpSetting::Missing
+}
+
+/// The 2 MiB hugetlb pool's size in pages, read here; `None` when unreadable.
+// to remove: callers pass HostMemory (bstd move).
+#[cfg(target_os = "linux")]
+fn pool_here() -> Option<u64> {
+    // alloc: the pool's size, read once per process
+    std::fs::read_to_string(POOL).ok().as_deref().and_then(crate::host::parse_pool)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pool_here() -> Option<u64> {
+    None
 }
 
 /// Tells Linux which pages `[ptr, ptr + bytes)` is made of: with `huge`, transparent huge
@@ -208,9 +281,11 @@ fn refused_reservation(bytes: usize, prot: libc::c_int, why: io::Error) -> io::E
 /// each such mapping is advised again.
 #[cfg(target_os = "linux")]
 fn advise_pages(ptr: *mut u8, bytes: usize, huge: bool) {
-    let advice = if huge { libc::MADV_HUGEPAGE } else { libc::MADV_NOHUGEPAGE };
+    let advice = if huge { Advice::HugePage } else { Advice::NoHugePage };
     // SAFETY: the caller's range is a mapping of its own; advice changes no contents.
-    let _ = timed(Kind::Advise, || unsafe { libc::madvise(ptr.cast(), bytes, advice) });
+    let _ = timed(Kind::Advise, || unsafe {
+        madvise(NonNull::new_unchecked(ptr), bytes, advice)
+    });
 }
 
 /// Keeps `[ptr, ptr + bytes)`, a mapping its caller made outside a region (a fiber's stack),
@@ -248,12 +323,12 @@ pub(crate) unsafe fn keep_base_pages(_ptr: NonNull<u8>, _bytes: usize) {}
 pub(crate) fn opt_out_unadvised(pages: crate::huge::Pages) -> crate::huge::Thp {
     use crate::huge::{Pages, Thp};
     /// `prctl.h`'s `PR_THP_DISABLE_EXCEPT_ADVISED` (Linux 6.18).
-    const PR_THP_DISABLE_EXCEPT_ADVISED: libc::c_ulong = 1 << 1;
+    const PR_THP_DISABLE_EXCEPT_ADVISED: core::ffi::c_ulong = 1 << 1;
     let (flags, then) = match pages {
         Pages::Transparent => (PR_THP_DISABLE_EXCEPT_ADVISED, Thp::AdvisedOnly),
         Pages::Base | Pages::Reserved => (0, Thp::Off),
     };
-    let (on, unused): (libc::c_ulong, libc::c_ulong) = (1, 0);
+    let (on, unused): (core::ffi::c_ulong, core::ffi::c_ulong) = (1, 0);
     // SAFETY: sets one flag of this process's memory descriptor; reads and writes no memory.
     let set = unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, on, flags, unused, unused) };
     if set == 0 { then } else { Thp::Unavailable }
@@ -266,9 +341,9 @@ pub(crate) fn opt_out_unadvised(_pages: crate::huge::Pages) -> crate::huge::Thp 
 
 #[cfg(windows)]
 pub(crate) fn reserve(bytes: usize, _huge: bool) -> io::Result<NonNull<u8>> {
-    use windows_sys::Win32::System::Memory::{MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc};
+    use blaze_sys::windows::memory::{MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc};
     // SAFETY: a fresh reservation at an address the kernel picks.
-    let base = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE, PAGE_NOACCESS) };
+    let base = unsafe { VirtualAlloc(core::ptr::null(), bytes, MEM_RESERVE, PAGE_NOACCESS) };
     NonNull::new(base.cast::<u8>()).ok_or_else(io::Error::last_os_error)
 }
 
@@ -285,7 +360,7 @@ pub(crate) fn reserve(bytes: usize, _huge: bool) -> io::Result<NonNull<u8>> {
     let pages = bytes.div_ceil(RESERVE_ALIGN).max(1);
     if let Some(at) = freed::take(pages) {
         // As below: an address in the module's own memory, from the free list's answer.
-        let base = std::ptr::with_exposed_provenance_mut::<u8>(at * RESERVE_ALIGN);
+        let base = core::ptr::with_exposed_provenance_mut::<u8>(at * RESERVE_ALIGN);
         return NonNull::new(base)
             .ok_or_else(|| io::Error::other("the free list gave pages at address 0"));
     }
@@ -301,7 +376,7 @@ pub(crate) fn reserve(bytes: usize, _huge: bool) -> io::Result<NonNull<u8>> {
     }
     // The pages are the module's own memory at `old` pages in: an address, with nothing to
     // derive it from but the instruction's answer.
-    let base = std::ptr::with_exposed_provenance_mut::<u8>(old * RESERVE_ALIGN);
+    let base = core::ptr::with_exposed_provenance_mut::<u8>(old * RESERVE_ALIGN);
     NonNull::new(base).ok_or_else(|| io::Error::other("memory.grow gave pages at address 0"))
 }
 
@@ -337,13 +412,13 @@ mod freed {
         blaze::process_static,
         reason = "the released address ranges, merged with their neighbours: bounded by the process's one reserved address space"
     )]
-    static FREE: parking_lot::Mutex<BTreeMap<usize, usize>> =
-        parking_lot::Mutex::new(BTreeMap::new());
+    static FREE: std::sync::Mutex<BTreeMap<usize, usize>> =
+        std::sync::Mutex::new(BTreeMap::new());
 
     /// The first page of the smallest released range of at least `pages`, its tail filed
     /// again, or `None` when no range is big enough.
     pub(super) fn take(pages: usize) -> Option<usize> {
-        let mut free = FREE.lock();
+        let mut free = FREE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (&at, &have) = free
             .iter()
             .filter(|&(_, &have)| have >= pages)
@@ -359,7 +434,7 @@ mod freed {
     /// overlaps one already filed was released twice, or is not what `reserve` gave: filing it
     /// would hand the same pages to two regions, so the process aborts, naming both.
     pub(super) fn give(mut at: usize, mut pages: usize) {
-        let mut free = FREE.lock();
+        let mut free = FREE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = free.range(..at).next_back().filter(|&(&before, &len)| before + len > at);
         let after = free.range(at..).next().filter(|&(&next, _)| next < at + pages);
         if let Some((&filed, &len)) = before.or(after) {
@@ -422,16 +497,16 @@ pub(crate) fn reserve_on(bytes: usize, huge: bool, node: u32) -> io::Result<NonN
 
 #[cfg(windows)]
 pub(crate) fn reserve_on(bytes: usize, _huge: bool, node: u32) -> io::Result<NonNull<u8>> {
-    use windows_sys::Win32::System::{
-        Memory::{MEM_RESERVE, PAGE_NOACCESS, VirtualAllocExNuma},
-        Threading::GetCurrentProcess,
+    use blaze_sys::windows::{
+        memory::{MEM_RESERVE, PAGE_NOACCESS, VirtualAllocExNuma},
+        threading::GetCurrentProcess,
     };
     // SAFETY: a fresh reservation in this process at an address the kernel picks; the node is a
     // number the kernel checks.
     let base = unsafe {
         VirtualAllocExNuma(
             GetCurrentProcess(),
-            std::ptr::null(),
+            core::ptr::null(),
             bytes,
             MEM_RESERVE,
             PAGE_NOACCESS,
@@ -464,12 +539,12 @@ pub(crate) fn reserve_on(bytes: usize, huge: bool, node: u32) -> io::Result<NonN
 #[cfg(target_os = "linux")]
 pub(crate) unsafe fn bind(ptr: NonNull<u8>, bytes: usize, node: u32) -> io::Result<()> {
     /// `mempolicy.h`'s `MPOL_PREFERRED`.
-    const MPOL_PREFERRED: libc::c_long = 1;
+    const MPOL_PREFERRED: core::ffi::c_long = 1;
     /// The nodes a mask names: 1024.
     const MASK_WORDS: usize = 16;
-    let bits = libc::c_ulong::BITS as usize;
+    let bits = core::ffi::c_ulong::BITS as usize;
     let at = node as usize;
-    let mut mask = [0 as libc::c_ulong; MASK_WORDS];
+    let mut mask = [0 as core::ffi::c_ulong; MASK_WORDS];
     let Some(word) = mask.get_mut(at / bits) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -479,7 +554,7 @@ pub(crate) unsafe fn bind(ptr: NonNull<u8>, bytes: usize, node: u32) -> io::Resu
     };
     *word |= 1 << (at % bits);
     // The kernel reads one bit fewer than `maxnode` says.
-    let maxnode = (MASK_WORDS * bits + 1) as libc::c_ulong;
+    let maxnode = (MASK_WORDS * bits + 1) as core::ffi::c_ulong;
     // SAFETY: `mbind` reads `MASK_WORDS` words of `mask`, a live array, and changes only the
     // policy of the range, which the caller says is a reservation of ours.
     let status = timed(Kind::Advise, || unsafe {
@@ -498,7 +573,7 @@ pub(crate) unsafe fn bind(ptr: NonNull<u8>, bytes: usize, node: u32) -> io::Resu
     }
     let why = io::Error::last_os_error();
     match why.raw_os_error() {
-        Some(libc::ENOSYS) if node == 0 => Ok(()),
+        Some(code) if node == 0 && code == blaze_sys::Errno::NoSys.raw() as i32 => Ok(()),
         // alloc: the error of a placement refused, once
         _ => Err(io::Error::new(
             why.kind(),
@@ -512,10 +587,10 @@ pub(crate) unsafe fn bind(ptr: NonNull<u8>, bytes: usize, node: u32) -> io::Resu
 /// node `node` only on a machine of that one node.
 #[cfg(windows)]
 pub(crate) unsafe fn bind(_ptr: NonNull<u8>, _bytes: usize, node: u32) -> io::Result<()> {
-    use windows_sys::Win32::System::Threading::GetNumaHighestNodeNumber;
+    use blaze_sys::windows::threading::GetNumaHighestNodeNumber;
     let mut highest = 0u32;
     // SAFETY: `highest` is a live `u32` to write.
-    let known = unsafe { GetNumaHighestNodeNumber(&mut highest) } != 0;
+    let known = unsafe { GetNumaHighestNodeNumber(&mut highest) }.is_true();
     if known && highest == 0 && node == 0 {
         return Ok(());
     }
@@ -543,13 +618,13 @@ fn one_node(node: u32) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         // alloc: an error naming the node, once
-        format!("{} has one memory node and no NUMA node {node}", std::env::consts::OS),
+        format!("{SYSTEM} has one memory node and no NUMA node {node}"),
     ))
 }
 
 #[cfg(all(not(any(unix, windows)), not(target_arch = "wasm64")))]
-fn whole(bytes: usize) -> io::Result<std::alloc::Layout> {
-    std::alloc::Layout::from_size_align(bytes.max(1), RESERVE_ALIGN)
+fn whole(bytes: usize) -> io::Result<core::alloc::Layout> {
+    core::alloc::Layout::from_size_align(bytes.max(1), RESERVE_ALIGN)
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "reservation overflows"))
 }
 
@@ -567,7 +642,7 @@ fn whole(bytes: usize) -> io::Result<std::alloc::Layout> {
 #[cfg(target_os = "linux")]
 pub(crate) unsafe fn commit(ptr: NonNull<u8>, bytes: usize) -> io::Result<()> {
     /// `mman-common.h`'s `MADV_POPULATE_WRITE`.
-    const MADV_POPULATE_WRITE: libc::c_int = 23;
+    const MADV_POPULATE_WRITE: core::ffi::c_int = 23;
     // SAFETY: the caller says the range is inside a live reservation of ours, readable and
     // writable; populating makes zero pages where there are none and leaves the rest alone.
     let _ = timed(Kind::Populate, || unsafe {
@@ -580,15 +655,13 @@ pub(crate) unsafe fn commit(ptr: NonNull<u8>, bytes: usize) -> io::Result<()> {
 pub(crate) unsafe fn commit(ptr: NonNull<u8>, bytes: usize) -> io::Result<()> {
     // SAFETY: the caller says the range is inside a live reservation of ours, which nothing
     // else maps; changing its protection touches no other memory.
-    let rc = timed(Kind::Mprotect, || unsafe {
-        libc::mprotect(ptr.as_ptr().cast(), bytes, libc::PROT_READ | libc::PROT_WRITE)
-    });
-    if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+    timed(Kind::Mprotect, || unsafe { mprotect(ptr, bytes, Prot::READ | Prot::WRITE) })
+        .map_err(|e| io::Error::from_raw_os_error(e.raw() as i32))
 }
 
 #[cfg(windows)]
 pub(crate) unsafe fn commit(ptr: NonNull<u8>, bytes: usize) -> io::Result<()> {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
+    use blaze_sys::windows::memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
     // SAFETY: the caller says the range is inside a live reservation of ours; committing
     // committed pages leaves them as they are.
     let got = unsafe { VirtualAlloc(ptr.as_ptr().cast(), bytes, MEM_COMMIT, PAGE_READWRITE) };
@@ -607,26 +680,23 @@ const POOL: &str = "/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages";
 
 /// Whether Linux makes transparent huge pages for a region advised `MADV_HUGEPAGE`: the
 /// setting is `always` or `madvise`, not `never`, and the kernel has them at all.
-#[cfg(target_os = "linux")]
+// to remove: callers pass HostMemory (bstd move): `HostMemory::transparent_offered`.
+#[cfg_attr(not(test), expect(dead_code, reason = "the tests' reader until they pass HostMemory"))]
 pub(crate) fn transparent_offered() -> bool {
-    // alloc: the setting's few bytes, read once per process
-    match std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled") {
-        Ok(setting) => !setting.contains("[never]"),
-        Err(_) => false,
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn transparent_offered() -> bool {
-    false
+    cfg!(target_os = "linux") && thp_here().offers()
 }
 
 /// Checks the 2 MiB hugetlb pool has pages: a commit takes them from it, and a pool of none
 /// would fail the first one.
-#[cfg(target_os = "linux")]
+// to remove: callers pass HostMemory (bstd move): `reserved_pool_in(host.huge_pool_2m)`.
 pub(crate) fn reserved_pool() -> io::Result<()> {
-    // alloc: the pool's size, read once per process
-    let pages = std::fs::read_to_string(POOL).ok().and_then(|text| text.trim().parse::<u64>().ok());
+    reserved_pool_in(pool_here())
+}
+
+/// As [`reserved_pool`], for a pool of `pages` 2 MiB pages (`None`: none to read), a
+/// [`HostMemory`](crate::HostMemory) fact read at boot.
+#[cfg(target_os = "linux")]
+pub(crate) fn reserved_pool_in(pages: Option<u64>) -> io::Result<()> {
     if pages.is_some_and(|pages| pages > 0) {
         return Ok(());
     }
@@ -643,7 +713,7 @@ pub(crate) fn reserved_pool() -> io::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn reserved_pool() -> io::Result<()> {
+pub(crate) fn reserved_pool_in(_pages: Option<u64>) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         // alloc: the error of a setting this system cannot honor, once
@@ -651,10 +721,34 @@ pub(crate) fn reserved_pool() -> io::Result<()> {
             "{}=reserved: reserved huge pages (hugetlbfs) are Linux's, and {} has none for \
              anonymous memory; unset it",
             crate::huge::VAR,
-            std::env::consts::OS
+            SYSTEM
         ),
     ))
 }
+
+/// The system's name for an error's text: the value Rust's `env::consts::OS` has, from `cfg!`.
+#[cfg_attr(target_os = "linux", expect(dead_code, reason = "named only in other systems' errors"))]
+const SYSTEM: &str = if cfg!(target_os = "macos") {
+    "macos"
+} else if cfg!(target_os = "ios") {
+    "ios"
+} else if cfg!(windows) {
+    "windows"
+} else if cfg!(target_os = "freebsd") {
+    "freebsd"
+} else if cfg!(target_os = "openbsd") {
+    "openbsd"
+} else if cfg!(target_os = "netbsd") {
+    "netbsd"
+} else if cfg!(target_os = "android") {
+    "android"
+} else if cfg!(target_os = "linux") {
+    "linux"
+} else if cfg!(target_os = "wasi") {
+    "wasi"
+} else {
+    "this system"
+};
 
 /// Makes `[ptr, ptr + bytes)` readable and writable on 2 MiB pages of the reserved hugetlb
 /// pool, every page made now, preferred on NUMA node `node` when given. Errs, with the range
@@ -677,33 +771,40 @@ pub(crate) unsafe fn commit_reserved(
     node: Option<u32>,
 ) -> io::Result<()> {
     /// `mman-common.h`'s `MADV_POPULATE_WRITE`.
-    const MADV_POPULATE_WRITE: libc::c_int = 23;
+    const MADV_POPULATE_WRITE: core::ffi::c_int = 23;
     debug_assert!(ptr.as_ptr().addr() % crate::HUGE_PAGE == 0 && bytes % crate::HUGE_PAGE == 0);
     // SAFETY: the caller says the range is uncommitted space of a live reservation of ours
     // that nothing reaches; the fixed mapping replaces only it. `MAP_NORESERVE` defers the
     // pool's pages to the populate below, which reports their want as an error.
+    // SAFETY: the range is uncommitted space of a live reservation of ours that nothing reaches.
     let got = timed(Kind::MapFixed, || unsafe {
-        libc::mmap(
-            ptr.as_ptr().cast(),
+        mmap(
+            Some(ptr),
             bytes,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_FIXED
-                | libc::MAP_PRIVATE
-                | libc::MAP_ANONYMOUS
-                | libc::MAP_NORESERVE
-                | libc::MAP_HUGETLB
-                | libc::MAP_HUGE_2MB,
-            -1,
+            Prot::READ | Prot::WRITE,
+            MapFlags::FIXED
+                | MapFlags::PRIVATE
+                | MapFlags::ANONYMOUS
+                | MapFlags::NO_RESERVE
+                | MapFlags::HUGETLB
+                | MapFlags::HUGE_2MB,
+            None,
             0,
         )
     });
-    if got == libc::MAP_FAILED {
-        return Err(on_reserved(bytes, "mapping", &io::Error::last_os_error()));
+    if let Err(error) = got {
+        return Err(on_reserved(bytes, "mapping", &io::Error::from_raw_os_error(error.raw() as i32)));
     }
     let made = (|| {
         // SAFETY: the range just mapped, ours alone; the advice changes what `fork` copies.
-        if timed(Kind::Advise, || unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, libc::MADV_DONTFORK) }) != 0 {
-            return Err(on_reserved(bytes, "excluding from fork", &io::Error::last_os_error()));
+        if let Err(error) = timed(Kind::Advise, || unsafe {
+            madvise(ptr, bytes, Advice::DontFork)
+        }) {
+            return Err(on_reserved(
+                bytes,
+                "excluding from fork",
+                &io::Error::from_raw_os_error(error.raw() as i32),
+            ));
         }
         if let Some(node) = node {
             // SAFETY: the range just mapped, holding no page yet; the fresh mapping has the
@@ -731,10 +832,10 @@ pub(crate) unsafe fn commit_reserved(
 #[cold]
 fn on_reserved(bytes: usize, step: &str, why: &io::Error) -> io::Error {
     let hint = match why.raw_os_error() {
-        Some(libc::EINVAL) if step.starts_with("making") => {
+        Some(code) if code == blaze_sys::Errno::Inval.raw() as i32 && step.starts_with("making") => {
             "populating needs Linux 5.14 (`MADV_POPULATE_WRITE`)"
         }
-        Some(libc::ENOMEM | libc::EFAULT) => {
+        Some(code) if code == blaze_sys::Errno::NoMem.raw() as i32 || code == blaze_sys::Errno::Fault.raw() as i32 => {
             "the pool has too few free 2 MiB pages: reserve more (`sysctl vm.nr_hugepages`)"
         }
         _ => "unset BLAZE_HUGE_PAGES for transparent huge pages",
@@ -765,7 +866,7 @@ pub(crate) unsafe fn commit_reserved(
 #[cfg(target_os = "linux")]
 pub(crate) unsafe fn collapse(ptr: NonNull<u8>, bytes: usize) {
     /// `mman-common.h`'s `MADV_COLLAPSE`.
-    const MADV_COLLAPSE: libc::c_int = 25;
+    const MADV_COLLAPSE: core::ffi::c_int = 25;
     // SAFETY: the caller says the range is committed memory of ours; collapsing copies its
     // pages into one, keeping every byte, while other threads may read and write it.
     let _ = timed(Kind::Advise, || unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, MADV_COLLAPSE) });
@@ -811,24 +912,24 @@ pub(crate) unsafe fn decommit(
     if pages != crate::huge::Pages::Reserved {
         // SAFETY: the caller says the range is inside a live reservation of ours that nothing
         // uses; dropping its pages loses only contents nobody reads.
-        let rc = timed(Kind::Purge, || unsafe {
-            libc::madvise(ptr.as_ptr().cast(), bytes, libc::MADV_DONTNEED)
-        });
-        return if rc == 0 { Ok(false) } else { Err(io::Error::last_os_error()) };
+        let rc = timed(Kind::Purge, || unsafe { madvise(ptr, bytes, Advice::DontNeed) });
+        return rc
+            .map(|_| false)
+            .map_err(|e| io::Error::from_raw_os_error(e.raw() as i32));
     }
     // SAFETY: as above; a fixed mapping over it replaces only those pages.
     let got = timed(Kind::MapFixed, || unsafe {
-        libc::mmap(
-            ptr.as_ptr().cast(),
+        mmap(
+            Some(ptr),
             bytes,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-            -1,
+            Prot::READ | Prot::WRITE,
+            MapFlags::FIXED | MapFlags::PRIVATE | MapFlags::ANONYMOUS | MapFlags::NO_RESERVE,
+            None,
             0,
         )
     });
-    if got == libc::MAP_FAILED {
-        return Err(io::Error::last_os_error());
+    if let Err(error) = got {
+        return Err(io::Error::from_raw_os_error(error.raw() as i32));
     }
     // The same range, mapped afresh just now: the new mapping lost the advice.
     advise_pages(ptr.as_ptr(), bytes, false);
@@ -844,17 +945,17 @@ pub(crate) unsafe fn decommit(
     // SAFETY: the caller says the range is inside a live reservation of ours that nothing uses;
     // a fixed mapping over it replaces only those pages.
     let got = timed(Kind::MapFixed, || unsafe {
-        libc::mmap(
-            ptr.as_ptr().cast(),
+        mmap(
+            Some(ptr),
             bytes,
-            libc::PROT_NONE,
-            libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-            -1,
+            Prot::NONE,
+            MapFlags::FIXED | MapFlags::PRIVATE | MapFlags::ANONYMOUS | MapFlags::NO_RESERVE,
+            None,
             0,
         )
     });
-    if got == libc::MAP_FAILED {
-        return Err(io::Error::last_os_error());
+    if let Err(error) = got {
+        return Err(io::Error::from_raw_os_error(error.raw() as i32));
     }
     Ok(true)
 }
@@ -865,10 +966,10 @@ pub(crate) unsafe fn decommit(
     bytes: usize,
     _pages: crate::huge::Pages,
 ) -> io::Result<bool> {
-    use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+    use blaze_sys::windows::memory::{MEM_DECOMMIT, VirtualFree};
     // SAFETY: the caller says the range is inside a live reservation of ours that nothing uses.
     let ok = unsafe { VirtualFree(ptr.as_ptr().cast(), bytes, MEM_DECOMMIT) };
-    if ok != 0 { Ok(false) } else { Err(io::Error::last_os_error()) }
+    if ok.is_true() { Ok(false) } else { Err(io::Error::last_os_error()) }
 }
 
 /// Gives the pages back through the runner, which leaves them reading zeros, as on Linux.
@@ -912,21 +1013,21 @@ pub(crate) unsafe fn decommit(
 #[cfg(unix)]
 pub(crate) unsafe fn purge(ptr: NonNull<u8>, bytes: usize) -> bool {
     #[cfg(target_os = "macos")]
-    let advice = libc::MADV_FREE_REUSABLE;
+    let advice = Advice::FreeReusable;
     #[cfg(not(target_os = "macos"))]
-    let advice = libc::MADV_DONTNEED;
+    let advice = Advice::DontNeed;
     // SAFETY: the caller says the committed range holds nothing anyone reads.
-    timed(Kind::Purge, || unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, advice) }) == 0
+    timed(Kind::Purge, || unsafe { madvise(ptr, bytes, advice) }).is_ok()
 }
 
 #[cfg(windows)]
 pub(crate) unsafe fn purge(ptr: NonNull<u8>, bytes: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+    use blaze_sys::windows::memory::{MEM_DECOMMIT, VirtualFree};
     // A refusal leaves the pages committed, which costs memory and not correctness: `reuse`
     // commits them either way.
     // SAFETY: the caller says the committed range holds nothing anyone reads, and nothing
     // touches it before `reuse` commits it again.
-    unsafe { VirtualFree(ptr.as_ptr().cast(), bytes, MEM_DECOMMIT) != 0 }
+    unsafe { VirtualFree(ptr.as_ptr().cast(), bytes, MEM_DECOMMIT) }.is_true()
 }
 
 /// The pages go back through the runner, as for [`decommit`]; they read zeros after.
@@ -957,7 +1058,7 @@ pub(crate) unsafe fn reuse(ptr: NonNull<u8>, bytes: usize) -> io::Result<()> {
     // Advice: a refusal leaves the pages counted as reusable, which misstates the footprint
     // and costs no correctness, as libmalloc treats it.
     // SAFETY: the caller says the range is committed and ours.
-    let _ = unsafe { libc::madvise(ptr.as_ptr().cast(), bytes, libc::MADV_FREE_REUSE) };
+    let _ = unsafe { madvise(ptr, bytes, Advice::FreeReuse) };
     Ok(())
 }
 
@@ -1005,10 +1106,10 @@ pub(crate) const EVICT_BATCH: usize = 256;
 /// [`reserve_sparse`] at `base`, and nothing reads or writes it through a plain reference
 /// meanwhile (only [`crate::racy`]'s atomic copies, which may see any bytes).
 #[cfg(target_os = "linux")]
-pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>]) -> usize {
+pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[core::ops::Range<usize>]) -> usize {
     let mut given = 0;
     for batch in ranges.chunks(EVICT_BATCH) {
-        let mut iov = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; EVICT_BATCH];
+        let mut iov = [libc::iovec { iov_base: core::ptr::null_mut(), iov_len: 0 }; EVICT_BATCH];
         let mut want = 0;
         for (slot, range) in iov.iter_mut().zip(batch) {
             slot.iov_base = base.as_ptr().wrapping_add(range.start).cast();
@@ -1025,7 +1126,7 @@ pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>])
                 iov.as_ptr(),
                 batch.len(),
                 libc::MADV_DONTNEED,
-                0 as libc::c_uint,
+                0 as core::ffi::c_uint,
             )
         });
         let Ok(got) = usize::try_from(got) else { break };
@@ -1041,19 +1142,19 @@ pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>])
 /// none opened. A forked child that called [`evict`] would name itself, never its parent, which
 /// a pidfd opened by the parent and inherited would.
 #[cfg(target_os = "linux")]
-const PIDFD_SELF_THREAD_GROUP: libc::c_int = -10001;
+const PIDFD_SELF_THREAD_GROUP: core::ffi::c_int = -10001;
 
 #[cfg(target_os = "macos")]
-pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>]) -> usize {
+pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[core::ops::Range<usize>]) -> usize {
     let mut given = 0;
     for range in ranges {
         let at = base.as_ptr().wrapping_add(range.start);
         // SAFETY: the caller says the range is page-aligned inside a live reservation of ours
         // that nothing references; marking it reusable loses only bytes no one reads.
         let rc = timed(Kind::Purge, || unsafe {
-            libc::madvise(at.cast(), range.len(), libc::MADV_FREE_REUSABLE)
+            madvise(NonNull::new_unchecked(at), range.len(), Advice::FreeReusable)
         });
-        if rc != 0 {
+        if rc.is_err() {
             break;
         }
         given += range.len();
@@ -1064,15 +1165,15 @@ pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>])
 /// The other Unixes have no reusable advice and no vector call: `MADV_DONTNEED` per range,
 /// which drops a private anonymous page now there too.
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>]) -> usize {
+pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[core::ops::Range<usize>]) -> usize {
     let mut given = 0;
     for range in ranges {
         let at = base.as_ptr().wrapping_add(range.start);
         // SAFETY: as on macOS.
         let rc = timed(Kind::Purge, || unsafe {
-            libc::madvise(at.cast(), range.len(), libc::MADV_DONTNEED)
+            madvise(NonNull::new_unchecked(at), range.len(), Advice::DontNeed)
         });
-        if rc != 0 {
+        if rc.is_err() {
             break;
         }
         given += range.len();
@@ -1081,14 +1182,14 @@ pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>])
 }
 
 #[cfg(windows)]
-pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>]) -> usize {
-    use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[core::ops::Range<usize>]) -> usize {
+    use blaze_sys::windows::memory::{MEM_DECOMMIT, VirtualFree};
     let mut given = 0;
     for range in ranges {
         let at = base.as_ptr().wrapping_add(range.start);
         // SAFETY: the caller says the range is inside a live reservation of ours that nothing
         // references or reads.
-        if unsafe { VirtualFree(at.cast(), range.len(), MEM_DECOMMIT) } == 0 {
+        if !unsafe { VirtualFree(at.cast(), range.len(), MEM_DECOMMIT) }.is_true() {
             break;
         }
         given += range.len();
@@ -1098,7 +1199,7 @@ pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>])
 
 /// Through the seed's runner, which leaves the pages reading zeros, as on Linux.
 #[cfg(all(not(any(unix, windows)), target_arch = "wasm64"))]
-pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>]) -> usize {
+pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[core::ops::Range<usize>]) -> usize {
     let mut given = 0;
     for range in ranges {
         // SAFETY: the caller says the range is inside a live reservation of ours, grown linear
@@ -1111,7 +1212,7 @@ pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>])
 
 /// Nothing gives pages back here ([`check_evict`] says so).
 #[cfg(all(not(any(unix, windows)), not(target_arch = "wasm64")))]
-pub(crate) unsafe fn evict(_base: NonNull<u8>, _ranges: &[std::ops::Range<usize>]) -> usize {
+pub(crate) unsafe fn evict(_base: NonNull<u8>, _ranges: &[core::ops::Range<usize>]) -> usize {
     0
 }
 
@@ -1211,13 +1312,17 @@ const EVICT_NEEDS: &str = "the store's pool cannot give its pages back on this s
 #[cfg(unix)]
 #[cold]
 fn system_release() -> std::string::String {
-    // SAFETY: `utsname` is plain bytes, valid zeroed.
-    let mut name: libc::utsname = unsafe { std::mem::zeroed() };
-    // SAFETY: `uname` writes the live struct it is given.
-    if unsafe { libc::uname(&mut name) } != 0 {
+    let Ok(name) = blaze_sys::posix::thread::system_name() else {
         return "a kernel uname does not name".to_owned(); // alloc: an error's text, once
-    }
-    let text = |field: &[libc::c_char]| {
+    };
+    #[cfg(target_os = "linux")]
+    let text = |field: &[u8]| {
+        let bytes = field.iter().take_while(|&&c| c != 0).copied();
+        let bytes: Vec<u8> = bytes.collect(); // alloc: an error's text, once
+        std::string::String::from_utf8_lossy(&bytes).into_owned()
+    };
+    #[cfg(target_os = "macos")]
+    let text = |field: &[core::ffi::c_char]| {
         let bytes = field.iter().take_while(|&&c| c != 0).map(|&c| c as u8);
         let bytes: Vec<u8> = bytes.collect(); // alloc: an error's text, once
         std::string::String::from_utf8_lossy(&bytes).into_owned()
@@ -1228,7 +1333,7 @@ fn system_release() -> std::string::String {
 #[cfg(any(windows, all(not(unix), target_arch = "wasm64")))]
 #[cold]
 fn system_release() -> std::string::String {
-    std::env::consts::OS.to_owned() // alloc: an error's text, once
+    SYSTEM.to_owned() // alloc: an error's text, once
 }
 
 /// Releases a whole reservation.
@@ -1240,12 +1345,12 @@ fn system_release() -> std::string::String {
 #[cfg(unix)]
 pub(crate) unsafe fn release(ptr: NonNull<u8>, bytes: usize) {
     // SAFETY: the caller hands over the whole reservation, which nothing uses any more.
-    let _ = timed(Kind::Munmap, || unsafe { libc::munmap(ptr.as_ptr().cast(), bytes) });
+    let _ = timed(Kind::Munmap, || unsafe { munmap(ptr, bytes) });
 }
 
 #[cfg(windows)]
 pub(crate) unsafe fn release(ptr: NonNull<u8>, _bytes: usize) {
-    use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+    use blaze_sys::windows::memory::{MEM_RELEASE, VirtualFree};
     // SAFETY: the caller hands over the whole reservation, which nothing uses any more.
     let _ = unsafe { VirtualFree(ptr.as_ptr().cast(), 0, MEM_RELEASE) };
 }

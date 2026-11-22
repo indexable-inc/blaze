@@ -3,13 +3,15 @@
 //! cargo's tests build the project and read the features from what it prints or fails to
 //! compile; here they are read from the feature resolver. cargo is MIT or Apache-2.0.
 
+#![feature(allocator_api)]
+
 #[path = "resolver/helpers.rs"]
 mod helpers;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use anyhow::Result as CargoResult;
+use blaze_resolve::ResolveError;
 use blaze_resolve::resolver::{
     CliFeatures, CompileKind, FeatureOpts, FeatureResolver, FeaturesFor, ForceAllTargets,
     HasDevUnits, Members, PackageTargets, ResolveBehavior, ResolveOpts, VersionOrdering,
@@ -18,6 +20,8 @@ use blaze_resolve::resolver::{
 use blaze_resolve::{Cfg, DepKind, Dependency, PackageId, PackageIdSpec, Platform, Summary};
 
 use helpers::{ToDep, dep, dep_kind, dep_platform, pkg, pkg_dep, pkg_dep_with, resolve_summaries};
+
+type CargoResult<T> = Result<T, ResolveError>;
 
 const HOST: &str = "x86_64-unknown-linux-gnu";
 
@@ -293,7 +297,7 @@ fn other_member_from_current() {
     let bar = features("bar", &["f1", "f2", "f3", "f4"]);
     let bar_features = |ws: &Ws, args| {
         let out = ws.build(args, HasDevUnits::No)?;
-        Ok::<_, anyhow::Error>(out.lines().find(|l| l.starts_with("bar:")).unwrap().to_owned())
+        Ok::<_, ResolveError>(out.lines().find(|l| l.starts_with("bar:")).unwrap().to_owned())
     };
 
     let ws = Ws::new(vec![foo.clone(), bar.clone()], vec![], ResolveBehavior::V1);

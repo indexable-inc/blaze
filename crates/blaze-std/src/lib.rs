@@ -16,8 +16,9 @@
 //!   [`task::Scope`] and its [`task::Task`]s are joined, an op in flight
 //!   ([`pending::Pending`]) is waited for or cancelled, a writable [`fs::File`] is closed, a
 //!   buffered writer ([`fs::Buffered`]) is finished and a [`net::Conn`] or [`net::Listener`]
-//!   is finished. Leaving one is a compile error; a panic
-//!   that unwinds past one runs its abandonment path, which each type's doc names.
+//!   is finished. Leaving one is a compile error when blaze builds the crate; under rustc,
+//!   which ignores the mark, it is a `#[must_use]` warning and runs the abandonment path, as a
+//!   panic that unwinds past one does: each type's doc names it (std.md, "Two builders").
 //! - A capability the host does not offer is `None` at the root ([`io::Io::fs`], ...;
 //!   [`io::Offers`]), with a `need_` form whose [`io::Missing`] names it.
 //! - Nothing is global: the crate holds no `static` with interior mutability, no `static mut`
@@ -66,16 +67,23 @@
 //! only. Nothing is copied, merged or moved; where two crates offer one concept, the module
 //! says which one it took. Left out on purpose: what reaches state through the thread or the
 //! process (blaze-mem's `frame::current`, blaze-radix's `set_ambient` and its ambient sorts,
-//! blaze-http's `roots` and `proxy_env`, which read the machine), and `chan` (the crossbeam
-//! queue and channel are not yet dependencies of this crate).
+//! blaze-http's `roots` and `proxy_env`, which read the machine). The channel is bstd's own,
+//! bounded only ([`sync::Chan`]), not a re-export.
 //!
 //! | module | what | from |
 //! |---|---|---|
-//! | [`mem`] | allocators by lifetime | blaze-mem |
-//! | [`bytes`], [`text`] | held bytes and UTF-8 text, lent and never copied | blaze-bytes |
-//! | [`map`], [`set`], [`hash`] | one map and set per need (hashed, by hash, by content, insertion-ordered, sorted, keyed, shared), and their hashers | blaze-hash, blaze-hashcons, `alloc` |
-//! | [`id`] | content ids, dense indices, the interner | blaze-ids |
-//! | [`sync`], [`cell`] | `Shared`, named locks, `Atomic`, token cells, the spin, reclamation | std, blaze-core, blaze-spin, blaze-reclaim |
+//! | [`mem`] | allocators by lifetime, and the handle a function takes ([`mem::Alloc`]) | blaze-mem, blaze-own |
+//! | [`vec`], [`boxed`], [`rows`], [`soa`] | the vectors (growable, inline, segmented, packed), one value in a block, rows in two arrays, a struct of arrays | blaze-own, blaze-kit |
+//! | [`bytes`], [`text`] | held bytes and UTF-8 text, lent and never copied; many strings in one buffer | blaze-bytes, blaze-own |
+//! | [`map`], [`set`], [`hash`] | one map and set per need (hashed, by hash, by content, insertion-ordered, flat sorted, B-tree, keyed, shared), and their hashers | blaze-hash, blaze-hashcons, blaze-own |
+//! | [`id`] | content ids, dense indices, the interner; typed ids and the tables they index | blaze-ids, blaze-kit |
+//! | [`bits`], [`paths`] | the bit set and the sparse set of ids; paths as a table | blaze-kit, blaze-own |
+//!
+//! Each form of [`vec`], [`boxed`], [`rows`], [`soa`], [`text`], [`map`], [`set`], [`id`],
+//! [`bits`], [`paths`] and [`mem`] is in a table in its module: what to reach for it instead of,
+//! and its cost (D120: one form per need, its cost said, its allocator named).
+//! | [`sync`], [`cell`] | `Shared`, named and ranked locks, `Swap`, `Frozen`, `Flight`, the bounded `Chan`, named atomics, one-thread cells, token cells, the spin, reclamation | blaze-core, blaze-own, blaze-spin, blaze-reclaim, new |
+//! | [`par`] | `for_each`, `map_into`, `reduce` over disjoint chunks, deterministic in any schedule | new, over [`task::Scope`] |
 //! | [`own`] | ownership properties derived by reflection (`Acyclic`), `Shared` and `Shares` | new |
 //! | [`sort`], [`phf`] | the radix sort; perfect hashes of fixed name sets | blaze-radix, blaze-phf |
 //! | [`digest`] | BLAKE3 and SHA-256 | blaze-ids' `b3`, blaze-sha256 |
@@ -101,22 +109,29 @@
 // A field marked `#[blaze::policy]` (a cost or a guarantee its maker decides) is never chosen
 // by a `Default` or a `new()` that takes nothing (std.md, "The second rule").
 #![warn(blaze::default_policy)]
+// Two builders (std.md, "Two builders"): what is plain Rust is compiled by rustc and by blaze;
+// what needs blaze's extensions is under `cfg(blaze)`, the cfg blaze sets for every crate it
+// compiles, each with a plain form under `cfg(not(blaze))` that says what the extension adds.
+#![cfg_attr(blaze, feature(blaze_comptime, blaze_const_exprs, blaze_verify))]
 #![feature(
     allocator_ext,
     atomic_internals,
-    blaze_comptime,
-    blaze_const_exprs,
-    blaze_verify,
     coerce_unsized,
     const_cmp,
     const_trait_impl,
+    const_type_name,
+    contracts,
     core_intrinsics,
     custom_inner_attributes,
+    fn_static,
+    freeze,
     generic_atomic,
     macro_attr,
     marker_trait_attr,
+    portable_simd,
     register_tool,
     rustc_attrs,
+    thread_local,
     type_info,
     unsize
 )]
@@ -128,13 +143,20 @@
               has to name; `rustc_attrs` for `#[rustc_comptime]` on `own`'s walk, which calls \
               reflection's compile-time-only functions and so is compile-time-only itself"
 )]
+#![allow(
+    incomplete_features,
+    reason = "`contracts`: nightly's `#[core::contracts::ensures]`, the one contract form both \
+              builders read"
+)]
 #![register_tool(blaze)]
 
 // Contracts (ledger V3; docs/v2/plan/design/contracts.md): bstd's functions state what they
-// promise as native `requires` and `ensures` clauses (`blaze_verify`), checked in the dev and
-// test profiles. The first are on `budget`, `clock`, `kv` and `fs` (std.md, "Contracts");
-// each `ensures` names only its return and by-value arguments, which is what the lowering is
-// known to take.
+// promise as nightly's `#[core::contracts::ensures(..)]`, which rustc and blaze both read (blaze
+// lowers it as the pinned nightly does: contracts.md, part 0), and which both run under
+// `cfg(contract_checks)` (`-Zcontract-checks`). The native `requires`/`ensures` clauses
+// (`blaze_verify`) are syntax rustc cannot parse, so they wait until blaze is the only builder;
+// `blaze::native_contracts` then rewrites these. The first are on `budget`, `clock`, `kv` and
+// `fs` (std.md, "Contracts"); each `ensures` names only its return and by-value arguments.
 extern crate alloc;
 
 pub mod args;
@@ -144,6 +166,8 @@ pub mod audio;
 pub mod automation;
 /// An object store beneath a directory: `Blobs`, bytes under the BLAKE3 of what they are.
 pub mod blobs;
+/// Block devices (D182): `Block` over a `Device` (a file, the simulated device, a raw device).
+pub mod block;
 /// Budgets: the byte limit of a `Net` and the quota of a `Dir`, and the `Over` each ends in.
 pub mod budget;
 #[expect(
@@ -164,13 +188,24 @@ pub mod entry;
 pub mod env;
 /// Who decides how a pure function is computed: `Eval` and its providers, memo points, keys.
 pub mod eval;
+/// Flat values: `Flat`, bytes that mean the same on any thread, process or machine.
+#[expect(
+    unsafe_code,
+    reason = "`Flat` is an `unsafe` property trait: its plain blanket impl and its derived one, each with its SAFETY"
+)]
+pub mod flat;
 pub mod fs;
 pub mod gpu;
 pub mod host;
+// The heavy areas, each behind its feature (Cargo.toml, "[features]"; std.md, "What a program
+// pays for at start"): a program that turns none on links none of their dependencies.
+#[cfg(feature = "image")]
 pub mod image;
 /// The simulated host behind the capabilities blaze-core has no effect for, and how a call
 /// on one fails.
 pub mod hosted;
+/// Standard input: `In`, the byte stream a program was started with.
+pub mod input;
 pub mod io;
 /// The keychain: `Keys`, by named key, and the `Secret` a fetch gives.
 pub mod keys;
@@ -186,9 +221,13 @@ pub mod mem;
 pub mod name;
 mod narrow;
 pub mod net;
+/// The whole network, a `main` grant narrowed by the program itself (`Network`, D104 B1).
+pub mod network;
 /// Handing a URL to the user's default application: `Opener`, narrowed to a scheme.
 pub mod opener;
 pub mod out;
+/// Data parallelism over disjoint chunks: `for_each`, `map_into`, `reduce`.
+pub mod par;
 /// Ownership properties derived by reflection (`Acyclic`, `NoCapability`), the walk they are
 /// instances of, and the handles built on them: `Shared`, `LocalShared`, `Shares`.
 #[expect(
@@ -198,13 +237,43 @@ pub mod out;
 )]
 pub mod own;
 pub mod path;
+// `main`'s parameters as grants, and the run spec that grants them (run.md).
+pub mod grant;
+pub mod spec;
+// The hosted world (run.md, "The hosted world"): the wire, the program's side, the host's.
+pub mod wire;
+#[expect(
+    unsafe_code,
+    reason = "copies into and out of the host's exchange and calls through its table, each with its SAFETY"
+)]
+pub mod guest;
+#[expect(
+    unsafe_code,
+    reason = "the C table's entries, its pointer back to its host and views of the exchange, each with its SAFETY"
+)]
+pub mod hosting;
+// The `dry` and `ask` layers and the `fake` providers, at the host's seam (run.md).
+pub mod layers;
+/// High-performance Wasmtime 64 (`memory64`) batched sans-IO host/guest ring ABI (`blaze_host_v1`).
+pub mod wasm64;
+/// Compile-time reflection & zero-proc-macro derive bridge (`cfg(blaze)` comptime-first).
+pub mod comptime;
+/// Order-independent, zero-overhead compile-time Type Sets with safe disjoint borrows & `Lacks<T>`.
+pub mod type_set;
+/// Anonymous Union Types (`A | B | C`) with small local tags, by-value widening & narrowing.
+pub mod union_ty;
+/// The native backend's reads of its host's facts.
+#[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
+mod native;
 pub mod pending;
 /// Power: the battery, and keeping the machine awake.
 pub mod power;
 /// Other processes: `Procs`, from `Host`, narrowed to one.
 pub mod procs;
+#[cfg(feature = "net")]
 pub mod quic;
-/// Making requests: `Http`, one type over a `Net`, the host or a handler.
+/// Making requests: `Http`, one type over a `Net`, the host or a handler. Behind `requests`.
+#[cfg(feature = "requests")]
 pub mod requests;
 /// Name lookup alone: `Resolver`, from a `Net`, with no connect.
 pub mod resolver;
@@ -224,9 +293,15 @@ mod simtest;
 pub mod streams;
 pub mod sync;
 pub mod task;
+// What a run used and where its time went, kept per worker and merged into one `Report` at
+// exit (D178): spans, distributions, effects by kind, the pool, the longest chain.
+pub mod telemetry;
 /// The terminal as a device: `Term`, its size, raw mode, styled text and keys.
 pub mod term;
 pub mod trace;
+/// The rustc debug build's check that a must-finish value was finished, not dropped.
+pub(crate) mod unfinished;
+#[cfg(feature = "video")]
 pub mod video;
 /// Addresses as types: `Scheme`, `Origin`, `Url`.
 pub mod url;
@@ -234,6 +309,20 @@ pub mod url;
 pub mod user;
 /// The program's windows: `Window`, a surface's size and its events.
 pub mod window;
+/// A worker's state as a value the pool owns, in typed columns (D171): `Workers`, `Slot<T>`,
+/// `cx.on_worker`.
+#[expect(
+    unsafe_code,
+    reason = "the cells' sparse reservation: typed columns reached by offset, each cell's making and drop, the keys' and handles' `Send`/`Sync`, and a gather's reach of a column (`each_made`), each with its SAFETY"
+)]
+pub mod workers;
+/// One value per worker, written with no lock, merged once at a boundary no task can hold one
+/// across (D179's GATHERED).
+#[expect(
+    unsafe_code,
+    reason = "two calls of `Workers::each_made`, whose contract `&mut Gathered` (the only key, lent only to `with`) meets, each with its SAFETY"
+)]
+pub mod gathered;
 
 /// Bytes held without a copy: their own `Arc`, a range their owner keeps in place, or a
 /// `'static` slice (blaze-bytes). Not [`mem::Bytes`], which are bytes being written into an
@@ -242,47 +331,183 @@ pub mod bytes {
     pub use blaze_bytes::{Bytes, le};
 }
 
-/// UTF-8 text held without a copy: [`bytes::Bytes`] checked once (blaze-bytes). Owned text in
-/// an allocator is [`mem::String`].
+/// Text. Held without a copy: [`text::Text`], [`bytes::Bytes`] checked once (blaze-bytes). One
+/// owned string in an allocator is [`mem::String`]. Many strings are one of these (blaze-own):
+///
+/// | form | reach for it instead of | cost |
+/// |---|---|---|
+/// | [`text::Texts`] | `Vec<String>` | one byte buffer and one array of `u32` ends: two blocks in all, 4 bytes a string past its text (`Vec<String>` is 24 bytes and a block a string) |
+/// | [`text::SortedTexts`] | a sorted `Vec<String>` searched by hand, a `HashSet<String>` built once | the same two blocks, sorted and each once; `contains` and `find` are O(log n) compares |
+/// | [`text::FixedString`] | a `String` for a short text with a known bound | `N` bytes inline, no allocation; a write past `N` is refused and the refusal stays ([`text::Overflow`]) |
 pub mod text {
     pub use blaze_bytes::{Text, text_of};
+    pub use blaze_own::{FixedString, Overflow, SortedTexts, Texts};
 }
 
-/// The maps, one per need (docs/v2/plan/design/std.md, "Collections"); every one is made with
-/// `new_in(alloc)` or `with_capacity_in(n, alloc)`, and none has a `new()`.
+/// The vectors, one per need (blaze-own, blaze-kit); every one is made in an allocator the
+/// caller names (`Vec::new_in(cx.frame())`), and none has a `new()` but the inline ones.
+///
+/// | form | reach for it instead of | cost |
+/// |---|---|---|
+/// | [`vec::Vec`], [`vec_in!`](vec::vec_in!) | `alloc`'s `Vec<T>` on the global heap | one block; index and push O(1), a push past capacity copies every value once; `remove_shift`, `insert_shift` and `scan_for` say they are linear |
+/// | [`vec::FixedVec`] | a `Vec` that never holds more than `N` | `N` values inline, no allocation; a push past `N` is refused with the value handed back ([`vec::Full`]) |
+/// | [`vec::InlineVec`] | `smallvec`, a `Vec` that is short nearly always | `N` values inline, then one block of the allocator |
+/// | [`vec::Segs`] | one `Vec` grown to gigabytes, a `Vec` whose values must not move | segments that double and never move: a push copies nothing, an index is two shifts and one load |
+/// | [`vec::SharedSegs`], [`vec::Appender`] | a `Vec` behind a lock that readers read while one thread pushes | as [`vec::Segs`], read without a lock; one appender at a time |
+/// | [`vec::Packed`] | a `Vec` of an enum whose widest variant sets every element's size | each value its own bytes end to end; iterated, not indexed; a seek starts from a checkpoint every `K` values |
+/// | [`rows::Lists`] | `Vec<Vec<T>>` | see [`rows`] |
+pub mod vec {
+    pub use blaze_kit::InlineVec;
+    pub use blaze_own::{Appender, CollectIn, FixedVec, Full, Pack, Packed, Refused, Segs, SharedSegs, Vec, vec_in};
+}
+
+/// One value in a block (blaze-own): [`boxed::Box`] owns it, [`boxed::Rc`] and [`boxed::Arc`]
+/// share it, each in an allocator the caller names (`Box::new_in(value, alloc)`).
+///
+/// | form | reach for it instead of | cost |
+/// |---|---|---|
+/// | [`boxed::Box`] | `alloc`'s `Box<T>` on the global heap | one block (none for a zero-sized value), one pointer word |
+/// | [`boxed::Rc`] | a value shared on one thread | one block for the value and its counts; a clone is a plain increment |
+/// | [`boxed::Arc`] | a value shared between threads | one block; every clone and drop writes the one shared count: a value many workers read is borrowed from a scope instead (std.md, "What std makes easy to get slow") |
+pub mod boxed {
+    pub use blaze_own::arc::Weak as WeakArc;
+    pub use blaze_own::rc::Weak as WeakRc;
+    pub use blaze_own::{Arc, Box, CallOnce, Rc};
+}
+
+/// Rows of items in two arrays (blaze-own's [`rows::Lists`]): every item end to end in one, and
+/// where each row ends in the other.
+///
+/// | form | reach for it instead of | cost |
+/// |---|---|---|
+/// | [`rows::Lists`] | `Vec<Vec<T>>`; a `HashMap<K, Vec<V>>` keyed by a dense index (`Lists::from_pairs_in`) | two blocks in all, 4 bytes a row past its items (`Vec<Vec<T>>` is a block and 24 bytes a row); a row is pushed whole or opened and filled, and cannot grow once a later one is pushed |
+pub mod rows {
+    pub use blaze_own::Lists;
+    pub use blaze_own::lists::OpenRow;
+}
+
+/// A struct-of-arrays vector (blaze-own's [`soa::Soa`], and [`soa!`](soa::soa!), which names the
+/// columns of a struct).
+///
+/// | form | reach for it instead of | cost |
+/// |---|---|---|
+/// | [`soa::Soa`] | a `Vec` of a struct whose passes each read one or two fields | one block, one packed column a field: a pass over one field reads only that field's bytes, and no field pads another |
+pub mod soa {
+    pub use blaze_own::soa::{ColumnAt, Columns};
+    pub use blaze_own::{Soa, soa};
+}
+
+/// The bit set, one: blaze-kit's [`bits::ChunkedBitSet`], and beside it the sparse set of ids.
+/// Of the three bit sets in the tree, blaze-ids' `Bits` keeps its words in `alloc`'s `Vec<u64>`
+/// on the global heap (no allocator named) and blaze-flow's `Bits` is rows of a dataflow's
+/// matrix above bstd; `ChunkedBitSet` names its allocator and is the one a set copied at every
+/// block entry needs. A plain bit per id of a table is [`id::TableSet`].
+///
+/// | form | reach for it instead of | cost |
+/// |---|---|---|
+/// | [`bits::ChunkedBitSet`] | a bit set copied per block, a `HashSet<u32>` over a large domain | 8 bytes a uniform chunk of 2,048 ids, 264 a mixed one shared by its copies; `contains` reads one or two lines; a copy costs a word a chunk |
+/// | [`bits::SparseSet`] | a worklist as a `Vec<u32>` beside a `Vec<bool>` of marks | insert, remove and contains O(1), a clear costs its members; a bit and 4 bytes an id of the domain, plus 4 a member |
+pub mod bits {
+    pub use blaze_kit::{ChunkedBitSet, SparseSet};
+}
+
+/// Paths as a table (blaze-own's [`paths::Paths`]): directories as (parent, name) rows and files
+/// as (directory, name) rows.
+///
+/// | form | reach for it instead of | cost |
+/// |---|---|---|
+/// | [`paths::Paths`] | `Vec<PathBuf>`, `Vec<String>` of paths, a `HashMap<String, V>` keyed by a path | each name stored once for its directory; a [`paths::PathId`] is 4 bytes; a lookup in a directory is one probe, a whole path's one probe a component |
+/// | [`paths::SealedPaths`], [`paths::PathsView`] | a path table rebuilt from text on every read | sealed once, its columns stored as they are and read in place, checked once |
+pub mod paths {
+    pub use blaze_own::paths::{BadColumns, PathColumns, Remap};
+    pub use blaze_own::{DirId, PathId, Paths, PathsView, SealedPaths};
+}
+
+/// The maps, one per need (docs/v2/plan/design/std.md, "Collections"); none has a `new()` that
+/// takes nothing.
+///
+/// A hash table names its hasher, in its type and as a value when it is made, as it names its
+/// allocator (decision D125), and it is made by one constructor taking one options struct whose
+/// every field is written (D126): `Map<K, V, FixedState, A>` made by
+/// `Map::new(MapOpts { hasher: FixedState, alloc: frame, capacity: None })` (`Some(n)` to
+/// reserve room for `n`), [`map::OrderMap`] by `OrderMap::new(OrderMapOpts { .. })` the same
+/// way, and a shared one by `SharedMap::new(SharedMapOpts { name, hasher, alloc, capacity })`.
+/// A map of an iterator's pairs is `new` then `extend`. The hashers are in [`hash`]
+/// (`FixedState` for ordinary keys, `SipKey` from [`crate::io::Io::sip_key`] for keys an
+/// outsider picks, `BuildKeyHasher` for keys that are hashes already). The aliases below that
+/// hide the hasher (`HashMap`, `IndexMap`, `ByHash`, `KeyedMap`) and the older constructors
+/// (`new_in`, `with_capacity_in`, `from_iter_in`, `with_hasher_in`) go at D125's sweep.
 ///
 /// | need | type |
 /// |---|---|
-/// | ordinary keys | [`map::HashMap`] |
-/// | keys that are hashes already | [`map::ByHash`] |
+/// | ordinary keys | [`map::Map`] on [`hash::FixedState`] (was [`map::HashMap`]) |
+/// | keys that are hashes already | [`map::Map`] on [`hash::BuildKeyHasher`] (was [`map::ByHash`]) |
 /// | values stored once, found by their content | [`map::ContentMap`] (one owner), [`id::Sharded`] (shared, dense indices) |
-/// | iteration in insertion order, lookup by position | [`map::IndexMap`] |
-/// | sorted keys, ranges | [`map::SortedMap`] |
+/// | iteration in insertion order, lookup by position | [`map::OrderMap`] on [`hash::FixedState`] (was [`map::IndexMap`]) |
+/// | sorted keys, built once, then read | [`map::FlatMap`] |
+/// | sorted keys, changed after the build, ranges | [`map::BTreeMap`] |
+/// | dense ids as keys | [`id::TableMap`] |
 /// | dense ids with a generation | [`mem::Slab`] and [`mem::Handle`] |
-/// | keys an attacker may pick | [`map::KeyedMap`], made with a [`hash::SipKey`] |
+/// | keys an attacker may pick | [`map::Map`] on a [`hash::SipKey`] (was [`map::KeyedMap`]) |
 /// | shared between threads | [`map::SharedMap`], [`map::SharedByHash`] |
+///
+/// The ordered ones and their costs (blaze-own), against what code writes without them:
+///
+/// | form | reach for it instead of | cost |
+/// |---|---|---|
+/// | [`map::FlatMap`] | a sorted `Vec<(K, V)>` searched with `binary_search_by_key` | one sorted array: lookup O(log n) compares, iteration a slice walk, one block; insert and remove O(n) moves, so build it once from sorted entries (`FlatMap::from_sorted`) |
+/// | [`map::BTreeMap`] | `alloc`'s `BTreeMap`, a sorted `Vec` with inserts after the build | a B-tree of up to 15 entries a node, keys and values in separate columns, a node on a cache line: lookup, insert and remove O(log n), ranges |
+/// | a [`map::HashMap`] keyed by an [`id::Sharded`] id, or [`paths::Paths`] | a `HashMap<String, V>` | the key text stored once, the key a 4-byte id: a hit allocates nothing and compares an integer |
 pub mod map {
-    /// Sorted by key, with range queries: `alloc`'s B-tree, which takes its allocator on this
-    /// nightly (`SortedMap::new_in(alloc)`).
-    pub use alloc::collections::BTreeMap as SortedMap;
-    pub use blaze_hash::{
-        ByHash, Equivalent, HashMap, IndexMap, KeyedMap, Operation, OrderMap, SharedByHash,
-        SharedMap, hash_map::Entry,
-    };
+    /// Sorted by key, built once: blaze-own's `SortedMap`, one sorted array (lookup O(log n),
+    /// insert O(n)).
+    pub use blaze_own::SortedMap as FlatMap;
+    /// Sorted by key, changed after it is built, with ranges: blaze-own's B-tree.
+    pub use blaze_own::BTreeMap;
+    pub use blaze_own::sorted::NotSorted;
+    pub use blaze_core::{SharedByHash, SharedMap};
+    pub use blaze_hash::{ByHash, Equivalent, HashMap, IndexMap, KeyedMap, OrderMap, hash_map::Entry};
+    /// The single-owner hash map, its hasher named in the type and at construction (D125), and
+    /// what it is made from: `Map::new(MapOpts { hasher, alloc, capacity: None })` (D126).
+    pub use blaze_hash::{Map, MapOpts, OrderMapOpts};
+    /// The shared tables' options: `SharedMap::new(SharedMapOpts { name, hasher, alloc,
+    /// capacity: None })` (D126).
+    pub use blaze_hash::SharedMapOpts;
+    /// The hashers, here too so that a map's whole explicit form is under one path.
+    pub use blaze_hash::{BuildKeyHasher, FixedState, SipKey};
     pub use blaze_hashcons::{Consed as Content, ContentMap, Mismatch, content_of};
 }
 
-/// The sets, as [`map`].
+/// The sets, as [`map`]; a set of dense ids is [`id::TableSet`] or one of [`bits`]. A hash set
+/// names its hasher as a map does (D125): `Set<T, FixedState, A>` made by
+/// `Set::new(SetOpts { hasher: FixedState, alloc, capacity: None })` (D126), and the same on
+/// [`set::OrderSet`] (`OrderSetOpts`) and a shared set (`SharedSetOpts`, with its locks' name);
+/// the aliases that hide it (`HashSet`, `IndexSet`, `ByHashSet`, `KeyedSet`) and the older
+/// constructors go at the sweep.
+///
+/// | form | reach for it instead of | cost |
+/// |---|---|---|
+/// | [`set::FlatSet`] | a sorted, deduplicated `Vec<T>` searched by hand | one sorted array: `contains` O(log n) compares, one block; insert O(n) moves, so build it once (`FlatSet::from_sorted`) |
+/// | [`set::BTreeSet`] | `alloc`'s `BTreeSet` | a [`map::BTreeMap`] of the values to `()`: insert, remove and `contains` O(log n), ranges |
 pub mod set {
-    /// Sorted, with range queries: `alloc`'s B-tree set, in a named allocator.
-    pub use alloc::collections::BTreeSet as SortedSet;
-    pub use blaze_hash::{ByHashSet, HashSet, IndexSet, KeyedSet, OrderSet, SharedSet};
+    /// Sorted, built once: blaze-own's `SortedSet`, one sorted array.
+    pub use blaze_own::SortedSet as FlatSet;
+    /// Sorted, changed after it is built, with ranges: blaze-own's B-tree set.
+    pub use blaze_own::BTreeSet;
+    pub use blaze_core::SharedSet;
+    pub use blaze_hash::{ByHashSet, HashSet, IndexSet, KeyedSet, OrderSet};
+    /// The single-owner hash set, its hasher named in the type and at construction (D125), and
+    /// what the sets are made from (D126).
+    pub use blaze_hash::{OrderSetOpts, Set, SetOpts, SharedSetOpts};
+    /// The hashers, as in [`super::map`].
+    pub use blaze_hash::{BuildKeyHasher, FixedState, SipKey};
 }
 
 /// The hashers behind [`map`] and [`set`]: the fixed seed, the identity hasher for keys that are
 /// hashes already, SipHash under a key for keys an attacker picks, and a value's `Hash` fed to
-/// BLAKE3 for what is persisted (blaze-hash). `LazyKey`, a key drawn for a table in a `static`,
-/// is left out: bstd has no statics with interior mutability.
+/// BLAKE3 for what is persisted (blaze-hash). A `SipKey` comes from [`crate::io::Io::sip_key`].
+/// `LazyKey`, a key drawn for a table in a `static`, is left out: bstd has no statics with
+/// interior mutability.
 pub mod hash {
     pub use blaze_hash::{
         Blake3Hasher, BuildKeyHasher, FixedHasher, FixedState, KeyHasher, SipHasher, SipKey,
@@ -293,10 +518,23 @@ pub mod hash {
 /// [`id::Idx`] a dense `u32` index into one arena, and [`id::Sharded`] the interner between them
 /// (blaze-ids). The interner is blaze-ids'; `intern` and `blaze-hashcons` are not merged into it
 /// yet, and are not re-exported.
+///
+/// Typed ids and the tables they index (blaze-kit): an id of one table cannot index another.
+/// blaze-ids' [`id::Idx`] and blaze-kit's [`id::Id`] are two homes of one concept, to merge
+/// (D120 (2)); both are here until then.
+///
+/// | form | reach for it instead of | cost |
+/// |---|---|---|
+/// | [`id::Id`], [`id!`](id::id!), [`id::NonMax`] | a `usize` or `u32` index into anything | 4 bytes, and an `Option` of an [`id!`](id::id!) type is 4 bytes too |
+/// | [`id::Table`] | a `Vec<T>` indexed by `usize` | one block; a push gives the new id, a read by id is O(1) and indexes only its own table |
+/// | [`id::TableSet`] | a `Vec<bool>` of marks, a `HashSet<u32>` of dense ids | one bit an id, up to the largest inserted |
+/// | [`id::TableMap`] | a `HashMap<u32, V>` (or `usize`, `u64`) of dense ids | a slot an id up to the largest inserted: a read is one index, no hash |
 pub mod id {
     pub use blaze_ids::{
         ContentId, Domain, Fingerprint, Hasher as ContentHasher, Idx, Interner, Sharded, index_key,
     };
+    pub use blaze_kit::table::{Branded, Ix};
+    pub use blaze_kit::{Id, NonMax, Table, TableMap, TableSet, id};
 }
 
 /// The stable radix sort (blaze-radix), on workers named at the call ([`sort::on`], with
@@ -344,21 +582,23 @@ pub mod report {
 }
 
 /// HTTP/1.1 as a sans-IO core: blaze-http's [`http::Client`], bytes and completions in, IO to
-/// do, events and the next deadline out, with its request writer and head parser ([`http::h1`])
+/// do, events and the next deadline out, over blaze-h1's request writer and response parser ([`http::h1`])
 /// and proxies. Its tokio driver is behind blaze-http's `tokio` feature, which bstd does not
 /// turn on; `roots` and `proxy_env` read the machine and are left out. HTTP/3 and WebTransport
-/// are [`quic`].
+/// are [`quic`]. Behind `net`.
+#[cfg(feature = "net")]
 pub mod http {
+    pub use blaze_h1 as h1;
     pub use blaze_http::{
-        Client, Completion, Config, ConnId, Error, Event, IDLE_FOR, IDLE_MOST, Io, Kind, Proxies,
-        Proxy, ProxyError, ProxyKind, REDIRECTS, Request, RequestId, Step, WINDOW, h1,
+        Client, Completion, Config, ConnId, Error, Event, IDLE_FOR, IDLE_MOST, Io, Kind, Method,
+        Proxies, Proxy, ProxyError, ProxyKind, REDIRECTS, Range, Request, RequestId, Step, WINDOW,
     };
 }
 
 /// Testing. `#[bstd::test]` (the attribute, [`test!`]) is the default test of a bstd program:
 /// a function shaped like `main` run on the simulation under [`test::Seeds`], 256 by default,
-/// with every [`test::Fault`] kind on unless it leaves one out by name, a failure saying its
-/// seed and the line that replays it ([`test::run`]; docs/v2/plan/design/bstd-sim-test.md).
+/// with the [`test::Fault`] kinds its parameters can meet on unless it leaves one out by name, a failure saying its
+/// seed and the line that replays it ([`test::granted`]; docs/v2/plan/design/bstd-sim-test.md).
 /// Then blaze-core's seeded simulation itself ([`test::Sim`]: a virtual clock, shuffled
 /// completions, failures, crashes), the model checker for lock-free code ([`test::model`], its
 /// shims in [`test::checked`]), and allocation counting ([`test::Counting`], [`test::measure`]).
@@ -368,11 +608,33 @@ pub mod test {
     pub use blaze_alloc_count::{Counting, Used, assert_at_most, installed, measure};
     pub use blaze_check::{Builder, MAX_THREADS, model};
     pub use blaze_core::sim::{
-        Faults, Journal, KILLED, Program, Ran, Sim,
+        Faults, Journal, KILLED, Program, Ran, Sim, SimAbove,
         seeds::{Broke, Counts, Ended, Failed, Fault, Given, Passed, Plan, Replay, Run, Seeds},
     };
 
-    pub use crate::simtest::{BUDGET, Outcome, one, run, seeded};
+    pub use crate::simtest::{BUDGET, Outcome, seeded};
+    /// `#[bstd::test]` with grants (D109): the attribute's setup, the plan by parameter kind,
+    /// the test entry, and its one-block report.
+    pub use crate::simtest::granted::{
+        ALL_FAULTS, Broken, Endpoint, File, Files, MOST_GRANTS, Planned, Setup, SetupError, Test, Var, bit, granted,
+        one_seed, reach, report, simulated, spec_of,
+    };
+    /// What makes each parameter of a `#[bstd::test]` (D109): a capability or a drawn value.
+    pub use crate::simtest::param::{
+        Draws, DrawnReport, From, Making, Param, Slot, drawn, grant_count, grants, slot,
+    };
+    /// The drawn half (D109), with bstd's feature `sim-draws`.
+    #[cfg(any(test, feature = "sim-draws"))]
+    pub use crate::simtest::drawn::{CASES, CASES_MOST, DrawnGiven, TAPE_SALT, cases};
+    /// A type of a user's drawn in a test: `bstd::test::AnyIn`, `bstd::test::any_in_by_any!`.
+    #[cfg(feature = "sim-draws")]
+    pub use blaze_sim::{Any, AnyIn, any_in_by_any};
+
+    /// A native world over a test's directory, made with a test's root of real-OS authority
+    /// (`blaze_core::testing::os()`): the one way a test makes a native world once batch B1
+    /// deletes `Io::native`. Behind the `testing` feature.
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::rt::testing_native::native;
 
     /// The model checker's shims, with std's API: a crate's code switches to them under
     /// `cfg(blaze_check)`.
@@ -386,12 +648,18 @@ pub mod test {
 /// has one a Rust edition.
 pub mod prelude {
     /// The prelude of `edition = "blaze-2026.11"`: `core`'s prelude of Rust 2024, the types
-    /// a `main` names (`Cx`, `Io` and the entry's `Error`), and `core`'s macros that Rust's `std` hands on from its
-    /// root. The collections are here by their types, to be made in an allocator the code
-    /// was handed (`Vec::new_in(cx.frame())`, `Box::new_in(value, alloc)`); `String` is
-    /// bstd's, which is made in one, with `format_in!` in place of `format!`. `vec!` and
-    /// `format!`, which reach the global heap by themselves, are not (std.md, "Memory is
-    /// explicit").
+    /// a `main` names (`Cx`, the entry's `Error`, and every grant: `Out`, `Args`, `Clock`,
+    /// `Dir<ReadOnly>`, `Net`, `Env`, the whole capabilities), and `core`'s macros that Rust's `std` hands on from its
+    /// root. Nothing here reaches the global heap (D120): the collections are blaze-own's
+    /// `Vec` and `Box`, which have no `new()` and are made in an allocator the code was handed
+    /// from `main` down (`Vec::new_in(cx.frame())`, `Box::new_in(value, alloc)`); `Frame` (what
+    /// `cx.frame()` is) and `Alloc` (the one-word handle a function takes) are here so a
+    /// program can name the allocator in a type (`Box<dyn Area + '_, &Frame>`). `Heap` is the
+    /// process's heap, a grant `main` names (`heap: Heap`) for what outlives its tasks and for a
+    /// pinned box (`Box::pin_in(future, heap)`); nothing else hands it out. `String` is
+    /// blaze-own's, made in one, with `format_in!` in place of `format!`; the entry's `Error`
+    /// keeps its words inline. `vec!`, `format!`, `ToString` and `ToOwned`, which reach the
+    /// global heap by themselves, are not here (std.md, "Memory is explicit").
     pub mod blaze_2026_11 {
         pub use core::prelude::rust_2024::*;
         pub use core::{
@@ -399,14 +667,44 @@ pub mod prelude {
             unimplemented, unreachable, write, writeln,
         };
 
-        pub use alloc::{boxed::Box, vec::Vec};
-
         pub use crate::{
+            boxed::Box,
             cx::Cx,
             entry::Error,
-            io::Io,
-            mem::{String, format_in},
+            mem::{Alloc, Frame, Heap, String, format_in},
+            vec::Vec,
         };
+
+        // Every type a `main` may take as a grant (crate::grant, each `impl Grant for`), so
+        // a program names what it takes without a `use` (D104).
+        pub use crate::{
+            args::Args,
+            audio::Audio,
+            automation::Automation,
+            clock::Clock,
+            code::Code,
+            device::{Bluetooth, Camera, Clipboard, Location, Notify, Screen, Serial, Usb},
+            env::Env,
+            fs::{Dir, Fs, ReadOnly, ReadWrite},
+            grant::Spec,
+            host::Host,
+            input::In,
+            keys::Keys,
+            locale::Locale,
+            mem::Mem,
+            net::Net,
+            opener::Opener,
+            out::Out,
+            power::Power,
+            rng::Rng,
+            roots::Roots,
+            streams::Streams,
+            term::Term,
+            user::User,
+            window::Window,
+        };
+        #[cfg(feature = "requests")]
+        pub use crate::requests::Http;
     }
 }
 
@@ -424,8 +722,11 @@ pub use crate::{
     net::HostPort,
     path::Path,
     pending::Pending,
-    requests::Http,
     task::{Scope, Task},
+};
+#[cfg(feature = "requests")]
+pub use crate::requests::Http;
+pub use crate::{
     url::{Origin, Url},
 };
 pub use blaze_core::wait::Deadline;
@@ -465,15 +766,6 @@ impl fmt::Display for Stopped {
 }
 
 impl core::error::Error for Stopped {}
-
-/// Consumes a linear value that has no fields left to move out (a fieldless marker such as
-/// [`fs::ReadWrite`]): the one way such a value ends, besides its type's own consuming calls.
-#[blaze::consumes]
-#[blaze::pure]
-#[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn consume<#[blaze::linear] T>(_: T) {}
 
 /// A safeguard a test turns off to prove its oracle sees the bug (skill `testing`, planted-bug
 /// controls). Always [`Plant::None`] outside this crate's tests: only their constructor
@@ -534,8 +826,30 @@ pub(crate) enum Plant {
     PublishBeforeRename,
     /// A `_synced` file call skips the sync of its directory's names.
     DurableSkipsNameSync,
+    /// An `_unsynced` rename or publish renames through the syncing `Effect::Rename`.
+    UnsyncedRenameSyncs,
     /// `Written::flush` asks for the flush and hands out its `Flushed` without waiting for it.
     FlushedBeforeFlush,
     /// `Flushed::clone_to` does not look at whether its file was changed behind it.
     StaleFlushedCloned,
+    /// `par::reduce` and `par::map_into` join their chunks in the order they ran, not by
+    /// position.
+    ParJoinsInRunOrder,
+    /// `Building::freeze` keeps one count of its own: the value is never dropped.
+    FreezeLeaks,
+    /// `Swap::publish` drops the value it replaced at once, not after its grace.
+    SwapFreesAtOnce,
+    /// A `Flight` asked for a key already being computed starts a second computation.
+    FlightComputesTwice,
+    /// A full `Chan` takes one more value.
+    ChanPassesCapacity,
+    /// A second `PublishOnce::set` replaces the value readers saw.
+    PublishOnceOverwrites,
+    /// `Cx::lock_order` hands out a second token while the first is alive.
+    OrderTokenTwice,
+    /// A task resumed from a wait is put on another worker than the one it started on.
+    TaskMigrates,
+    /// `Fs::ancestors` asks the driver for every folder above the start, not only the granted
+    /// ones: the bound not checked.
+    AncestorsUnbounded,
 }

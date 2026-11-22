@@ -1,48 +1,39 @@
-//! `#[bstd::test]`: a test shaped like `main` (`fn(cx: &Cx, io: Io)`), run on the simulation
-//! under many seeds with its faults on (docs/v2/plan/design/bstd-sim-test.md). The simulated
-//! world is the default of a bstd test, as TigerBeetle's VOPR is of TigerBeetle's.
+//! `#[bstd::test]`: a test names what it takes in its signature, as `main` does (D104,
+//! D109), and is run on the simulation under seeds, with the fault kinds its parameters can
+//! meet on (docs/v2/plan/design/bstd-sim-test.md). The simulated world is the default of a
+//! bstd test, as TigerBeetle's VOPR is of TigerBeetle's.
 //!
 //! ```ignore
-//! #[bstd::test]
-//! fn the_ledger_keeps_what_it_committed(cx: &Cx, io: Io) -> Result<(), FsError> { .. }
+//! #[bstd::test(data = files("ledger/head" => b"0\n"))]
+//! fn the_ledger_keeps_what_it_committed(cx: &Cx, data: Dir<ReadWrite>, clock: Clock) -> Result<(), FsError> { .. }
 //!
-//! #[bstd::test(without(Crashes))]          // a fault kind is left out by name
-//! fn a_report_is_rendered(cx: &Cx, io: Io) { .. }
+//! #[bstd::test(without(Crashes))]          // a fault kind its folder meets, left out by name
+//! fn a_report_is_rendered(cx: &Cx, out: Out, data: Dir<ReadWrite>) { .. }
 //! ```
 //!
-//! The runner is blaze-core's ([`blaze_core::sim::seeds`], re-exported in [`crate::test`]):
-//! 256 seeds, each a world of its own ([`Io::sim`]) armed with what the seed injects (failed
-//! effects, late completions, power cuts); the program started again after each cut and each
-//! error it gives up with; a last start once the faults are healed, which has to end well. A
-//! failure says its seed, its plan, the end of its trace and the one line that replays it,
-//! and whether its second run was the same run, byte for byte.
+//! The runner is blaze-core's ([`blaze_core::sim::seeds`], re-exported in [`crate::test`]);
+//! the test entry, its setup, the plan by parameter kind and the one-block report are
+//! [`granted`]'s. What stays here:
 //!
-//! What this module adds to the runner:
-//!
-//! - [`run`] and [`seeded`]: the runner over a program on an [`Io`]. A start makes a root
-//!   context of [`BUDGET`] and [`TASK_FRAME`] and calls the program with it and the world, as
-//!   the process's entry calls `main`. How it ended is its [`Outcome`]: `()` is well, a
-//!   `Result`'s error is the program giving up (restarted under faults, a failure once they
-//!   are healed), a panic fails the seed.
+//! - [`Outcome`]: how a test's program ended, by what it returned: `()` is well, a `Result`'s
+//!   error is the program giving up (restarted under faults, a failure once they are healed).
 //! - [`power_lost`]: the unwind of a power cut. [`Io`]'s submit asks the armed simulation
 //!   after each effect; on a cut the world crashes ([`Io::crash`], the disk's ledger with it)
 //!   and the program is unwound with an [`Exit`] payload, as the simulated exit unwinds it and
 //!   as scopes pass on. Nothing of the program runs after the cut but its destructors, and
 //!   the machine is off: what they ask is dropped.
+//! - [`seeded`]: the runner over a library under test that itself takes a whole [`Io`] (a
+//!   store over `OnDir { io, dir }`), called from a `#[test]` with its own seeds. Not a test's
+//!   form: a test names what it takes. It goes when those libraries take what they use (B1).
 //! - The attribute, [`crate::test!`]: a `macro_rules!` attribute rule (`macro_attr`), no proc
-//!   macro. It turns the function into a `#[test]` that calls [`run`] with its package, its
-//!   path and its seeds.
-//!
-//! A test that needs a world of its own making (scripted devices, an environment, a withheld
-//! capability) is not this attribute's yet: it makes its `Io` and loops its seeds, as the
-//! tests of this crate do.
+//!   macro. A whole `Io` is refused at the attribute, naming what to write instead.
 
 use alloc::{boxed::Box, format, string::String, string::ToString};
 use core::{fmt, panic::AssertUnwindSafe, time::Duration};
 
 use blaze_core::sim::{
     KILLED, Sim,
-    seeds::{self, Ended, Failed, Given, Name, Passed, Run, Seeds, World},
+    seeds::{self, Ended, Failed, Given, Name, Passed, Seeds, World},
 };
 
 use crate::{
@@ -53,6 +44,14 @@ use crate::{
     rt::{catch_unwind, resume_unwind},
     task::said,
 };
+
+/// `#[bstd::test]` with grants (D109): the test entry, its setup and its report.
+pub(crate) mod granted;
+/// What makes one parameter of a test: a capability or a drawn value (D109).
+pub(crate) mod param;
+/// The drawn half's runner: a case is a world seed and a tape (D109).
+#[cfg(any(test, feature = "sim-draws"))]
+pub(crate) mod drawn;
 
 /// The budget of a start's root context, on the simulation's clock: an hour, longer than any
 /// wait a test means to finish, so the deadlines a test sets are the ones that end its waits.
@@ -143,10 +142,12 @@ fn listed(module: &str, test: &str) -> String {
     }
 }
 
-/// `program` under `seeds`, or under the seed or the count `given` in their place: what
-/// [`run`] runs, as a value. `package` is the test's package and `module` and `test` its path
+/// `program`, a library under test that itself takes a whole `Io` (a store over
+/// `OnDir { io, dir }`), under `seeds`, or under the seed or the count `given` in their place,
+/// as a value. `package` is the test's package and `module` and `test` its path
 /// (`module_path!()` and the function's name), for what a failure says and the line that
-/// replays it.
+/// replays it. Not a test's form (a `#[bstd::test]` names what it takes, D109); it goes when
+/// its callers' stores take what they use (batch B1).
 pub fn seeded<P, R>(
     package: &str,
     module: &str,
@@ -164,53 +165,85 @@ where
     seeds::run(seeds, given, name, |seed| Program { io: Io::sim(seed), program: &program })
 }
 
-/// One seed of `program` under `seeds`: its verdict, its counts and its trace.
-pub fn one<P, R>(seed: u64, seeds: Seeds, program: P) -> Run
-where
-    P: Fn(&Cx, Io) -> R,
-    R: Outcome,
-{
-    seeds::one(seed, &seeds, &mut |seed| Program { io: Io::sim(seed), program: &program })
-}
-
-/// What `#[bstd::test]` expands to: `program` under `seeds`, or under what the person running
-/// the test gave in the environment ([`seeds::SEED_VAR`], [`seeds::SEEDS_VAR`]); a failure
-/// panics with its report, which the test harness prints.
-pub fn run<P, R>(package: &str, module: &str, test: &str, seeds: Seeds, program: P)
-where
-    P: Fn(&Cx, Io) -> R,
-    R: Outcome,
-{
-    let failed = match Given::from_env() {
-        Ok(given) => match seeded(package, module, test, seeds, given, program) {
-            Ok(_) => return,
-            Err(failed) => failed,
-        },
-        Err(why) => Failed::Given(why),
-    };
-    panic!("bstd::test: {failed}");
-}
-
-/// The attribute of a simulation test (the module's doc): `#[bstd::test]` on a function
-/// shaped like `main`, `fn(cx: &Cx, io: Io)`, returning `()` or a `Result`. A fault kind is
-/// left out by name: `#[bstd::test(without(Crashes, IoFailures))]`
-/// ([`crate::test::Fault`]).
+/// The attribute of a simulation test (D109; [`granted`]'s doc): `#[bstd::test]` on a function
+/// that names what it takes after `cx`, as `main` does, returning `()` or a `Result`:
+///
+/// ```ignore
+/// #[bstd::test(data = files("ledger/head" => b"0\n"))]
+/// fn the_ledger_keeps_what_it_committed(cx: &Cx, data: Dir<ReadWrite>, clock: Clock) -> Result<(), FsError> { .. }
+/// ```
+///
+/// Each parameter is a [`crate::grant::Grant`] made from the test's simulated world, narrowed
+/// to that one capability; a type that is not one is a compile error at its parameter. The
+/// arguments, any order, each once, all checked as the crate compiles: `seed = 41` (one seed
+/// alone, the one a failure named), `without(IoFailures, Delays, Crashes)` (a fault kind the
+/// parameters can meet, left out), `real` (the machine, beneath a directory made for the
+/// test), `<dir> = files("path" => b"..", "p2" => include_bytes!("f"))`, `<net> =
+/// connect("host:port")` or `listen("host:port")`, `env(NAME = "value")`, `args("..")`,
+/// `input = b".."`. The fault kinds a seed explores are those the parameters can meet; a test
+/// that meets none (`cx` alone, `Out`, `Args`, `Env`) is run once. A failure is one block
+/// ([`granted::report`]) ending in the one line that replays it.
+///
+/// A whole `io: Io` after `cx` is refused here, naming the parameters to write; a whole `Io`
+/// anywhere else is refused at its type (`Io` is no `Grant`, D104).
 #[macro_export]
 macro_rules! test {
-    attr($(without($($fault:ident),+ $(,)?))?) (
+    // The whole world is no parameter (D109): refused with what to write.
+    attr($($arg:tt)*) (
         $(#[$meta:meta])*
-        $vis:vis fn $name:ident($($params:tt)*) $(-> $returns:ty)? $body:block
+        $vis:vis fn $name:ident($cx:ident : $cxty:ty, $io:ident : Io $(, $($rest:tt)*)?) $(-> $returns:ty)? $body:block
     ) => {
+        ::core::compile_error!(::core::concat!(
+            "bstd::test: `", ::core::stringify!($name), "` takes a whole `", ::core::stringify!($io), ": Io`, ",
+            "and a test cannot take a whole `Io` (D109): name what it uses after `cx`, each by its type, ",
+            "e.g. `data: Dir<ReadWrite>, clock: Clock, out: Out, api: Net` ",
+            "(a folder's files, an endpoint, the environment are set up in the attribute: ",
+            "`#[bstd::test(data = files(\"a\" => b\"..\"), api = connect(\"host:443\"))]`)"
+        ));
+    };
+    // A test that names its grants (D109).
+    attr($($arg:tt)*) (
+        $(#[$meta:meta])*
+        $vis:vis fn $name:ident($cx:ident : $cxty:ty $(, $param:ident : $ty:ty)* $(,)?) $(-> $returns:ty)? $body:block
+    ) => {
+        // The attribute checked against the parameters as the crate compiles, in every build
+        // (a `#[test]` function is compiled only under `--test`; this item always is).
+        const _: $crate::test::Planned = {
+            const SLOTS: &[$crate::test::Slot] = &[
+                $( $crate::test::slot::<$ty>(::core::stringify!($param)) ),*
+            ];
+            const PARAMS: &[$crate::grant::Param] =
+                &$crate::test::grants::<{ $crate::test::grant_count(SLOTS) }>(SLOTS);
+            const SETUP: $crate::test::Setup =
+                $crate::__test_setup!(@ $crate::test::Setup::DEFAULT ; $($arg)*).checked(PARAMS);
+            $crate::test::Planned::of(&SETUP, PARAMS).drawing(&SETUP, $crate::test::drawn(SLOTS))
+        };
         $(#[$meta])*
         #[::core::prelude::v1::test]
         $vis fn $name() {
-            fn $name($($params)*) $(-> $returns)? $body
-            $crate::test::run(
-                ::core::env!("CARGO_PKG_NAME"),
-                ::core::module_path!(),
-                ::core::stringify!($name),
-                $crate::test::Seeds::DEFAULT $($(.without($crate::test::Fault::$fault))+)?,
-                $name,
+            const SLOTS: &[$crate::test::Slot] = &[
+                $( $crate::test::slot::<$ty>(::core::stringify!($param)) ),*
+            ];
+            const PARAMS: &[$crate::grant::Param] =
+                &$crate::test::grants::<{ $crate::test::grant_count(SLOTS) }>(SLOTS);
+            /// The test's manifest: what it takes, as data in the test binary.
+            static MANIFEST: $crate::grant::Manifest = $crate::grant::Manifest::new(PARAMS);
+            const SETUP_VALUE: $crate::test::Setup =
+                $crate::__test_setup!(@ $crate::test::Setup::DEFAULT ; $($arg)*).checked(PARAMS);
+            /// What its grants start with, its seed and its faults left out: data in the binary.
+            static SETUP: $crate::test::Setup = SETUP_VALUE;
+            const PLANNED: $crate::test::Planned =
+                $crate::test::Planned::of(&SETUP_VALUE, PARAMS).drawing(&SETUP_VALUE, $crate::test::drawn(SLOTS));
+            $crate::test::granted(
+                $crate::test::Test {
+                    package: ::core::env!("CARGO_PKG_NAME"),
+                    module: ::core::module_path!(),
+                    name: ::core::stringify!($name),
+                    manifest: &MANIFEST,
+                    setup: &SETUP,
+                    planned: PLANNED,
+                },
+                $crate::__test_body!($cx : $cxty $(, $param : $ty)* ; $(-> $returns)? $body),
             )
         }
     };

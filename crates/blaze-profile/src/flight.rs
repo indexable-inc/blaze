@@ -39,7 +39,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use blaze_hash::{FixedHasher, HashMap, HashSet};
+use blaze_hash::{FixedHasher, FixedState, Map, MapOpts, Set, SetOpts};
 use blaze_core::lock::{Lock, LockGuard};
 use std::alloc::Global;
 
@@ -108,7 +108,7 @@ const SLOTS: usize = (1 << SITE_BITS) - 1;
 /// The table is kept at most half full, so a lookup probes one or two slots.
 const SITES_MAX: usize = SLOTS / 2;
 
-type Meta = tracing::Metadata<'static>;
+type Meta = blaze_trace::Metadata<'static>;
 
 /// A callsite recorded, and which of the span columns its fields fill: bit `i` for the column
 /// at [`span::Said::get`]'s `i` ([`span::ad_hoc_column`]: the columns that hold a name, the
@@ -158,14 +158,14 @@ pub const FIELDS_TEXT_MAX: usize = 1024;
 static SITES: [OnceLock<Site>; SLOTS] = [const { OnceLock::new() }; SLOTS];
 static TAKEN: Lock<usize> = Lock::unrecorded("profile.flight.taken", 0);
 
-fn home(meta: &tracing::Metadata<'_>) -> usize {
+fn home(meta: &blaze_trace::Metadata<'_>) -> usize {
     let address = std::ptr::from_ref(meta).addr() as u64;
     (address.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize % SLOTS
 }
 
 /// The site of a callsite [`register`]ed.
 #[inline]
-pub(crate) fn site(meta: &tracing::Metadata<'_>) -> Option<u16> {
+pub(crate) fn site(meta: &blaze_trace::Metadata<'_>) -> Option<u16> {
     let mut at = home(meta);
     for _ in 0..SLOTS {
         match SITES[at].get() {
@@ -245,7 +245,7 @@ static FOREIGN: [OnceLock<SiteText>; FOREIGN_MAX] = [const { OnceLock::new() }; 
     blaze::process_static,
     reason = "indexes the FOREIGN slots, so at most FOREIGN_MAX entries in all"
 )]
-static FOREIGN_BY_TEXT: Lock<(usize, Option<HashMap<u64, Vec<u16>, Global>>)> =
+static FOREIGN_BY_TEXT: Lock<(usize, Option<Map<u64, Vec<u16>, FixedState, Global>>)> =
     Lock::unrecorded("profile.flight.foreign_by_text", (0, None));
 
 fn foreign_key(name: &str, target: &str, level: &str) -> u64 {
@@ -268,7 +268,7 @@ pub(crate) fn foreign_site(name: &str, target: &str, level: &str) -> Option<u16>
     let key = foreign_key(name, target, level);
     let mut guard = lock(&FOREIGN_BY_TEXT);
     let (taken, by_text) = &mut *guard;
-    let bucket = by_text.get_or_insert_with(|| HashMap::new_in(Global)).entry(key).or_default();
+    let bucket = by_text.get_or_insert_with(|| Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None })).entry(key).or_default();
     let same = |site: &u16| {
         site_text(*site)
             .is_some_and(|it| it.name == name && it.target == target && it.level == level)
@@ -321,7 +321,7 @@ const READER_EPOCHS: u32 = 1 << 6;
 /// thread that records.
 #[derive(Default)]
 struct Table {
-    ids: HashMap<std::sync::Arc<str>, Sym, Global>,
+    ids: Map<std::sync::Arc<str>, Sym, FixedState, Global>,
     names: Vec<std::sync::Arc<str>>,
 }
 
@@ -1618,7 +1618,7 @@ impl Logged {
         &self.fields[..self.len]
     }
 
-    fn put(&mut self, field: &tracing::field::Field, value: FieldValue) {
+    fn put(&mut self, field: &blaze_trace::field::Field, value: FieldValue) {
         let index = field.index();
         if self.len == EVENT_FIELDS || !event_field_recorded(index) {
             FIELDS_LOST.fetch_add(1, Ordering::Relaxed);
@@ -1628,7 +1628,7 @@ impl Logged {
         self.len += 1;
     }
 
-    fn text(&mut self, field: &tracing::field::Field, token: Token) {
+    fn text(&mut self, field: &blaze_trace::field::Field, token: Token) {
         if field.name() == "message" {
             self.message = token;
         } else if self.texts < EVENT_FIELDS {
@@ -1660,42 +1660,42 @@ impl Logged {
     }
 }
 
-impl tracing::field::Visit for Logged {
-    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+impl blaze_trace::field::Visit for Logged {
+    fn record_i64(&mut self, field: &blaze_trace::field::Field, value: i64) {
         self.put(field, FieldValue::I64(value));
     }
 
-    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+    fn record_u64(&mut self, field: &blaze_trace::field::Field, value: u64) {
         self.put(field, FieldValue::U64(value));
     }
 
-    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+    fn record_f64(&mut self, field: &blaze_trace::field::Field, value: f64) {
         self.put(field, FieldValue::F64(value));
     }
 
-    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+    fn record_bool(&mut self, field: &blaze_trace::field::Field, value: bool) {
         self.put(field, FieldValue::Bool(value));
     }
 
-    fn record_i128(&mut self, field: &tracing::field::Field, value: i128) {
+    fn record_i128(&mut self, field: &blaze_trace::field::Field, value: i128) {
         match i64::try_from(value) {
             Ok(it) => self.put(field, FieldValue::I64(it)),
             Err(_) => self.record_debug(field, &value),
         }
     }
 
-    fn record_u128(&mut self, field: &tracing::field::Field, value: u128) {
+    fn record_u128(&mut self, field: &blaze_trace::field::Field, value: u128) {
         match u64::try_from(value) {
             Ok(it) => self.put(field, FieldValue::U64(it)),
             Err(_) => self.record_debug(field, &value),
         }
     }
 
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+    fn record_str(&mut self, field: &blaze_trace::field::Field, value: &str) {
         self.text(field, intern(value));
     }
 
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+    fn record_debug(&mut self, field: &blaze_trace::field::Field, value: &dyn std::fmt::Debug) {
         let sym = TEXT
             .try_with(|text| {
                 // A field's `Debug` that itself logs finds the text taken: that field is lost.
@@ -1721,7 +1721,7 @@ impl tracing::field::Visit for Logged {
 /// build; its id is its ring and its row's place there ([`event_id`]). A field's number is kept
 /// as itself, with no allocation, and its text interned. Nothing when the thread has no ring
 /// (counted as ringless).
-pub(crate) fn evented(event: &tracing::Event<'_>, site: u16) {
+pub(crate) fn evented(event: &blaze_trace::Event<'_>, site: u16) {
     let Some(ring) = ring() else {
         RINGLESS.fetch_add(1, Ordering::Relaxed);
         return;
@@ -3154,15 +3154,15 @@ impl Fields {
     }
 }
 
-impl tracing::field::Visit for Fields {
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+impl blaze_trace::field::Visit for Fields {
+    fn record_str(&mut self, field: &blaze_trace::field::Field, value: &str) {
         match field_of(field.name()) & self.wanted {
             0 => self.gather(field.name(), value),
             column => self.set(column, value),
         }
     }
 
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+    fn record_debug(&mut self, field: &blaze_trace::field::Field, value: &dyn std::fmt::Debug) {
         let column = field_of(field.name()) & self.wanted;
         if column == 0 && !(self.rest && kept_as_text(field.name())) {
             return;
@@ -3184,14 +3184,14 @@ impl tracing::field::Visit for Fields {
 /// [`UNRECORDED`]. Its fields fill the columns its site names, whether or not it is ever
 /// entered: its row is written as its last handle drops ([`closed`]).
 #[inline]
-pub(crate) fn opened(span: &tracing::span::Attributes<'_>, site: u16) -> u64 {
+pub(crate) fn opened(span: &blaze_trace::span::Attributes<'_>, site: u16) -> u64 {
     let mut fields = Fields::of(site, Said::EMPTY);
     if fields.reads() {
         span.record(&mut fields);
         fields.finish();
     }
     let parent =
-        if span.is_root() { Some(0) } else { span.parent().map(tracing::span::Id::into_u64) };
+        if span.is_root() { Some(0) } else { span.parent().map(blaze_trace::span::Id::into_u64) };
     began(site, parent, &fields.said)
 }
 
@@ -3330,7 +3330,7 @@ pub(crate) fn cloned(id: u64) {
 /// The ad hoc span `id`, still open, was given values after it was made: those of its
 /// columns replace the ones it began with. A value given after the span closed is not
 /// kept.
-pub(crate) fn recorded(id: u64, values: &tracing::span::Record<'_>) {
+pub(crate) fn recorded(id: u64, values: &blaze_trace::span::Record<'_>) {
     if id == UNRECORDED {
         return;
     }
@@ -4966,7 +4966,7 @@ pub(crate) fn part(window: Duration) -> Part {
     let mut read = Read::default();
     self::window(window, &mut read);
     let mut part = Part { pid: std::process::id(), command: crate::command(), ..Part::default() };
-    let mut named: HashSet<u32, Global> = HashSet::new_in(Global);
+    let mut named: Set<u32, FixedState, Global> = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
     for span in &read.spans {
         if named.insert(span.thread) {
             // alloc: a dump, on demand
@@ -5035,11 +5035,11 @@ mod tests {
 
     /// The next message on `rx`, or `None` once its senders are gone; past [`WAIT`] the test
     /// fails naming `what` it waited for.
-    fn heard<T>(rx: &crossbeam_channel::Receiver<T>, what: &str) -> Option<T> {
+    fn heard<T>(rx: &blaze_core::chan::Receiver<T>, what: &str) -> Option<T> {
         match rx.recv_timeout(WAIT) {
             Ok(it) => Some(it),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => None,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            Err(blaze_core::chan::RecvTimeoutError::Disconnected) => None,
+            Err(blaze_core::chan::RecvTimeoutError::Timeout) => {
                 panic!("waited {WAIT:?} for {what}")
             }
         }
@@ -5214,11 +5214,11 @@ mod tests {
         let thread = std::thread::spawn(|| {
             let _build = building(7);
             let outer =
-                tracing::info_span!(target: "blaze", "flight outer", krate = "app").entered();
+                blaze_trace::info_span!(target: "blaze", "flight outer", krate = "app").entered();
             let outer_id = outer.id().unwrap().into_u64();
             {
                 let _inner =
-                    tracing::info_span!(target: "blaze", "flight inner", function = "app::main", unit = 3).entered();
+                    blaze_trace::info_span!(target: "blaze", "flight inner", function = "app::main", unit = 3).entered();
             }
             drop(outer);
             (crate::sampler::os_tid() as u32, outer_id)
@@ -5258,17 +5258,17 @@ mod tests {
     fn a_span_given_its_crate_and_function_after_it_began_has_them_in_its_row() {
         crate::install();
         let thread = std::thread::spawn(|| {
-            let span = tracing::info_span!(
+            let span = blaze_trace::info_span!(
                 target: "blaze",
                 "flight named late",
-                krate = tracing::field::Empty,
-                function = tracing::field::Empty,
+                krate = blaze_trace::field::Empty,
+                function = blaze_trace::field::Empty,
                 unit = 5
             );
             span.record("krate", "shapes");
             span.record("function", "shapes::area::of_square");
             drop(span.entered());
-            let unnamed = tracing::info_span!(target: "blaze", "flight never named", function = tracing::field::Empty);
+            let unnamed = blaze_trace::info_span!(target: "blaze", "flight never named", function = blaze_trace::field::Empty);
             drop(unnamed);
             crate::sampler::os_tid() as u32
         });
@@ -5294,10 +5294,13 @@ mod tests {
         assert_eq!(row("flight never named").function, 0);
     }
 
-    /// The waits of `thread` in `read` for a key, refusing any other. A test's threads are in a
-    /// scheduler of their own, which no other test's pools or drivers lock, and the tests order
-    /// their threads' ends so that neither waits on the other's lock: a wait for the scheduler's
-    /// lock here would be one the test made.
+    /// The waits of `thread` in `read` for a key, refusing any other but the tests' own
+    /// handshakes. A test's threads are in a scheduler of their own, which no other test's
+    /// pools or drivers lock, and the tests order their threads' ends so that neither waits on
+    /// the other's lock: a wait for the scheduler's lock here would be one the test made. The
+    /// handshakes are `blaze_core::chan` channels of `()`, whose receives are waits too (a
+    /// channel's wait is its signal span, `signal ()`), so those are passed over; a channel of
+    /// any other value is no handshake of these tests and is refused.
     fn key_waits(read: &Read, thread: u32) -> Vec<&SpanRow> {
         use blaze_graph::wait::WaitKind;
         // alloc: a test's rows
@@ -5307,6 +5310,7 @@ mod tests {
             let awaits = wait.fields.awaits.text();
             match wait.fields.on {
                 WaitKind::Key => keys.push(row),
+                WaitKind::Channel if awaits.as_deref() == Some("signal ()") => {}
                 other => panic!("thread {thread} waited on {other:?} {awaits:?}, not a key"),
             }
         }
@@ -5323,16 +5327,16 @@ mod tests {
         let flights: &'static Flights<u32> = Box::leak(Box::new(Flights::new()));
         let key = Key([0x5a; 32]);
         let named = |it: &mut String| it.push_str("slow_query(of_square)");
-        let (started, has_started) = crossbeam_channel::unbounded();
+        let (started, has_started) = blaze_core::chan::unbounded();
         // The two threads' ends each lock the scheduler their wait joined: the asker ends once
         // the run's end let go of it, and the runner once the asker ended, so neither waits on
         // the other's lock.
-        let (ran_out, has_ran_out) = crossbeam_channel::unbounded();
-        let (asked_out, has_asked_out) = crossbeam_channel::unbounded::<()>();
+        let (ran_out, has_ran_out) = blaze_core::chan::unbounded();
+        let (asked_out, has_asked_out) = blaze_core::chan::unbounded::<()>();
         // The run goes on for 300 ms from the moment the asker is about to ask, however late
         // its thread starts: on a loaded machine the asker began 230 ms into a run that slept
         // 300 ms from its own start, and its wait was 68 ms.
-        let (asking_now, is_asking) = crossbeam_channel::unbounded::<()>();
+        let (asking_now, is_asking) = blaze_core::chan::unbounded::<()>();
         let runner = std::thread::spawn(move || {
             let got = flights.get_or_run_named(key, named, || {
                 started.send(()).unwrap();
@@ -5347,7 +5351,7 @@ mod tests {
         });
         has_started.recv_timeout(WAIT).expect("the runner started its run");
         let asker = std::thread::spawn(move || {
-            let asking = tracing::info_span!(target: "blaze", "flight asking").entered();
+            let asking = blaze_trace::info_span!(target: "blaze", "flight asking").entered();
             let asking_id = asking.id().unwrap().into_u64();
             asking_now.send(()).unwrap();
             let got = flights.get_or_run_named(key, named, || Ok(0));
@@ -5416,11 +5420,11 @@ mod tests {
         crate::install();
         let flights: &'static Flights<u32> = Box::leak(Box::new(Flights::new()));
         let key = Key([0x6b; 32]);
-        let (held, has_held) = crossbeam_channel::unbounded();
+        let (held, has_held) = blaze_core::chan::unbounded();
         // As in the test above: the waiter ends once the hold's end let go of the scheduler
         // their wait joined, and the holder once the waiter ended.
-        let (ended, has_ended) = crossbeam_channel::unbounded();
-        let (waited, has_waited) = crossbeam_channel::unbounded::<()>();
+        let (ended, has_ended) = blaze_core::chan::unbounded();
+        let (waited, has_waited) = blaze_core::chan::unbounded::<()>();
         let holder = std::thread::spawn(move || {
             let hold = flights
                 .hold_named(key, |it| it.push_str("codegen round 3 of app"))
@@ -5485,7 +5489,7 @@ mod tests {
     fn a_span_closed_on_another_thread_keeps_where_it_began() {
         crate::install();
         let (span, tid) = std::thread::spawn(|| {
-            (tracing::info_span!(target: "blaze", "flight moved"), crate::sampler::os_tid() as u32)
+            (blaze_trace::info_span!(target: "blaze", "flight moved"), crate::sampler::os_tid() as u32)
         })
         .join()
         .unwrap();
@@ -5512,9 +5516,9 @@ mod tests {
             .name(MAKER.to_owned())
             .spawn(|| {
                 let by_taker =
-                    tracing::info_span!(target: "blaze", "flight outlived, closed by the taker");
+                    blaze_trace::info_span!(target: "blaze", "flight outlived, closed by the taker");
                 let by_other =
-                    tracing::info_span!(target: "blaze", "flight outlived, closed by another");
+                    blaze_trace::info_span!(target: "blaze", "flight outlived, closed by another");
                 let ring = ring().unwrap();
                 (
                     by_taker,
@@ -5532,7 +5536,7 @@ mod tests {
         let passed = || left.lease.load(Ordering::Relaxed) != lease;
         // Threads take the lowest free ring: start them, each holding its ring, until the ring
         // the maker left is held by another thread (one of these, or another test's).
-        let (took, taken) = crossbeam_channel::unbounded::<u16>();
+        let (took, taken) = blaze_core::chan::unbounded::<u16>();
         // alloc: a test's threads
         let mut holders = Vec::new();
         let mut taker = None;
@@ -5541,7 +5545,7 @@ mod tests {
                 break;
             }
             let took = took.clone();
-            let (to_close, close) = crossbeam_channel::bounded::<Option<tracing::Span>>(1);
+            let (to_close, close) = blaze_core::chan::bounded::<Option<blaze_trace::Span>>(1);
             holders.push((
                 to_close,
                 std::thread::spawn(move || {
@@ -5600,20 +5604,20 @@ mod tests {
         count_frame_copies(test_copied).expect("no other test gives a reader");
         let (copying, quiet, outer, moved) = std::thread::spawn(|| {
             copy(1, 10);
-            let outer = tracing::info_span!(target: "blaze", "copies outer").entered();
+            let outer = blaze_trace::info_span!(target: "blaze", "copies outer").entered();
             let outer_id = outer.id().unwrap().into_u64();
             let copying = {
-                let it = tracing::info_span!(target: "blaze", "copies inner").entered();
+                let it = blaze_trace::info_span!(target: "blaze", "copies inner").entered();
                 copy(2, 300);
                 it.id().unwrap().into_u64()
             };
             let quiet = {
-                let it = tracing::info_span!(target: "blaze", "copies none").entered();
+                let it = blaze_trace::info_span!(target: "blaze", "copies none").entered();
                 it.id().unwrap().into_u64()
             };
             copy(1, 7);
             drop(outer);
-            let moved = tracing::info_span!(target: "blaze", "copies moved");
+            let moved = blaze_trace::info_span!(target: "blaze", "copies moved");
             (copying, quiet, outer_id, moved)
         })
         .join()
@@ -5667,7 +5671,7 @@ mod tests {
         crate::sampler::os_tid() as u32
     }
 
-    fn id(span: &tracing::Span) -> u64 {
+    fn id(span: &blaze_trace::Span) -> u64 {
         span.id().unwrap().into_u64()
     }
 
@@ -5686,8 +5690,8 @@ mod tests {
                 }
                 CarryJob::Moving => {
                     let _build = building(41);
-                    let outer = tracing::info_span!(target: "blaze", "carry outer").entered();
-                    let inner = tracing::info_span!(target: "blaze", "carry inner").entered();
+                    let outer = blaze_trace::info_span!(target: "blaze", "carry outer").entered();
+                    let inner = blaze_trace::info_span!(target: "blaze", "carry inner").entered();
                     let left = tid();
                     self.started.store(true, Ordering::Release);
                     let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -5699,7 +5703,7 @@ mod tests {
                         cx.miss();
                     }
                     let reached = tid();
-                    let after = tracing::info_span!(target: "blaze", "carry after");
+                    let after = blaze_trace::info_span!(target: "blaze", "carry after");
                     let after_id = id(&after);
                     drop(after);
                     let other =
@@ -5713,7 +5717,7 @@ mod tests {
                     drop(outer);
                 }
                 CarryJob::Other => {
-                    let other = tracing::info_span!(target: "blaze", "carry other");
+                    let other = blaze_trace::info_span!(target: "blaze", "carry other");
                     let mut seen = lock(&self.seen);
                     (seen.other, seen.other_on) = (id(&other), tid());
                 }
@@ -5816,9 +5820,9 @@ mod tests {
         let key = Key([0x7c; 32]);
         let named = |it: &mut String| it.push_str("job span test key");
         let since = clock::mono_ns();
-        let (started, has_started) = crossbeam_channel::unbounded();
-        let (first, first_done) = crossbeam_channel::unbounded();
-        let (second, second_done) = crossbeam_channel::unbounded();
+        let (started, has_started) = blaze_core::chan::unbounded();
+        let (first, first_done) = blaze_core::chan::unbounded();
+        let (second, second_done) = blaze_core::chan::unbounded();
         pool.submit(
             None,
             move || {
@@ -5928,15 +5932,15 @@ mod tests {
             fold_here(Duration::from_secs(5), Duration::from_secs(5), Duration::from_secs(600));
             let _build = building(23);
             for _ in 0..100 {
-                let _short = tracing::info_span!(target: "blaze", "fold short").entered();
+                let _short = blaze_trace::info_span!(target: "blaze", "fold short").entered();
             }
             {
-                let _parent = tracing::info_span!(target: "blaze", "fold parent").entered();
+                let _parent = blaze_trace::info_span!(target: "blaze", "fold parent").entered();
                 for _ in 0..3 {
-                    let _child = tracing::info_span!(target: "blaze", "fold child").entered();
+                    let _child = blaze_trace::info_span!(target: "blaze", "fold child").entered();
                 }
-                let _named = tracing::info_span!(target: "blaze", "fold named").entered();
-                tracing::info!(target: "blaze", "fold names its span");
+                let _named = blaze_trace::info_span!(target: "blaze", "fold named").entered();
+                blaze_trace::info!(target: "blaze", "fold names its span");
             }
             let typed = span::open_raw(span::Job {
                 kind: span::Name::kept("fold typed"),
@@ -6011,7 +6015,7 @@ mod tests {
                 "a wait shorter than its bound folds, counted"
             );
             for _ in 0..10 {
-                let _short = tracing::info_span!(target: "blaze", "fold at the end").entered();
+                let _short = blaze_trace::info_span!(target: "blaze", "fold at the end").entered();
             }
             (tid, cursor)
         });
@@ -6033,8 +6037,8 @@ mod tests {
 
         crate::install();
         let pool = Pool::new(&Topology::flat(1), false).expect("the pool starts");
-        let (done, ran) = crossbeam_channel::bounded(1);
-        let giver = tracing::info_span!(target: "blaze", "creator test giver").entered();
+        let (done, ran) = blaze_core::chan::bounded(1);
+        let giver = blaze_trace::info_span!(target: "blaze", "creator test giver").entered();
         let creator = giver.id().unwrap().into_u64();
         pool.submit(None, tid, move |on| done.send(on.unwrap()).unwrap());
         drop(giver);
@@ -6086,7 +6090,7 @@ mod tests {
         build: u32,
         flights: blaze_graph::pump::Flights<u32>,
         pool: std::sync::Weak<blaze_graph::pool::Pool>,
-        done: crossbeam_channel::Sender<(usize, bool)>,
+        done: blaze_core::chan::Sender<(usize, bool)>,
     }
 
     /// Gives `job` to `pool`: called with the test's handle for the root, and with a parent
@@ -6198,7 +6202,7 @@ mod tests {
         let tree = tree(tape);
         let jobs = tree.parent.len();
         let build = BUILDS.fetch_add(1, Ordering::Relaxed);
-        let (done, finished) = crossbeam_channel::unbounded();
+        let (done, finished) = blaze_core::chan::unbounded();
         let case = Case {
             tree,
             build,
@@ -6348,18 +6352,18 @@ mod tests {
         _ = count_cpu(test_cpu);
         let (parked, taken) = std::thread::spawn(|| {
             {
-                let _outer = tracing::info_span!(target: "blaze", "cpu outer").entered();
+                let _outer = blaze_trace::info_span!(target: "blaze", "cpu outer").entered();
                 spend(10);
-                let _inner = tracing::info_span!(target: "blaze", "cpu inner").entered();
+                let _inner = blaze_trace::info_span!(target: "blaze", "cpu inner").entered();
                 spend(20);
             }
             {
                 // Held across two steps of a state machine, with the loop's other work between.
-                let held = tracing::info_span!(target: "blaze", "cpu held", held = true);
+                let held = blaze_trace::info_span!(target: "blaze", "cpu held", held = true);
                 spend(40);
                 held.in_scope(|| {
                     spend(7);
-                    let _under = tracing::info_span!(target: "blaze", "cpu held under").entered();
+                    let _under = blaze_trace::info_span!(target: "blaze", "cpu held under").entered();
                     spend(2);
                 });
                 spend(40);
@@ -6372,7 +6376,7 @@ mod tests {
             let taken = take_open().expect("a job inside a span has state to carry");
             // Another job runs on the thread while the first is parked.
             {
-                let _other = tracing::info_span!(target: "blaze", "cpu other job").entered();
+                let _other = blaze_trace::info_span!(target: "blaze", "cpu other job").entered();
                 spend(100);
             }
             (parked, taken)
@@ -6417,16 +6421,16 @@ mod tests {
     fn a_span_read_before_its_threads_next_boundary_waits_for_it_and_is_never_read_uncounted() {
         crate::install();
         _ = count_cpu(test_cpu);
-        let (ready, is_ready) = crossbeam_channel::bounded(0);
-        let (read_once, has_read) = crossbeam_channel::bounded(0);
+        let (ready, is_ready) = blaze_core::chan::bounded(0);
+        let (read_once, has_read) = blaze_core::chan::bounded(0);
         let mut cursor = Cursor::default();
         let mut first = Read::default();
         self::read(&mut cursor, &mut first);
         let thread = std::thread::spawn(move || {
-            let outer = tracing::info_span!(target: "blaze", "cpu waits outer").entered();
+            let outer = blaze_trace::info_span!(target: "blaze", "cpu waits outer").entered();
             // Closed well within `cpu::AGE` of the boundary the root's enter made: its ticks
             // wait in its row.
-            drop(tracing::info_span!(target: "blaze", "cpu waits inner").entered());
+            drop(blaze_trace::info_span!(target: "blaze", "cpu waits inner").entered());
             ready.send(()).unwrap();
             has_read.recv_timeout(WAIT).expect("the test read once");
             spend(1);

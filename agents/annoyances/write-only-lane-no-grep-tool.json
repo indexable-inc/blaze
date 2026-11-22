@@ -1,0 +1,15 @@
+{
+ "id": "write-only-lane-no-grep-tool",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), successor of lane RC3",
+ "where": "the lane session's tools (LANES-1810.md: Read, Grep, Glob, Edit, Write only)",
+ "what": "the session had no Grep or Glob tool, only Bash; LANES-1810 says a write-only lane runs no shell at all, so searching meant either breaking the letter of the rule or reading whole files",
+ "cost": "a few minutes deciding; searches were done with read-only `grep`/`sed -n` through Bash (no build, no write, no state)",
+ "cause": "the lane's tool set does not match the rules file's list",
+ "whys": "LANES-1810 names tools the harness did not give this session",
+ "class": "a rule that names tools the session lacks",
+ "prevention": "give write-only lanes Grep and Glob, or let LANES-1810 allow read-only grep through the shell",
+ "annoyance": "no Grep tool in a write-only lane",
+ "workaround": "read-only grep through Bash",
+ "state": "open"
+}

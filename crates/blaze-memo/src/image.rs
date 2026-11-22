@@ -41,7 +41,7 @@ use blaze_keyed::{
     proof::{self, Snapshot},
     record,
 };
-use crossbeam_queue::SegQueue;
+use blaze_queue::SegQueue;
 
 use crate::{
     Fact, Kind, KindId, Memo, Read,
@@ -240,13 +240,93 @@ stable_tuple!(A, B, C, D, E, F);
 stable_tuple!(A, B, C, D, E, F, G);
 stable_tuple!(A, B, C, D, E, F, G, H);
 
+/// A variable-length byte-backed value that can be imaged through [`Imaged::for_bytes`] without
+/// requiring fixed-size `blaze_format::Record::PLAIN`.
+pub trait ImagedBytes: Sized {
+    fn as_imaged_bytes(&self) -> &[u8];
+    fn from_imaged_bytes(bytes: &[u8]) -> Option<Self>;
+}
+
+impl ImagedBytes for Vec<u8> {
+    fn as_imaged_bytes(&self) -> &[u8] {
+        self.as_slice()
+    }
+    fn from_imaged_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(bytes.to_vec())
+    }
+}
+
+impl ImagedBytes for Box<[u8]> {
+    fn as_imaged_bytes(&self) -> &[u8] {
+        self
+    }
+    fn from_imaged_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(Box::from(bytes))
+    }
+}
+
+impl ImagedBytes for std::sync::Arc<[u8]> {
+    fn as_imaged_bytes(&self) -> &[u8] {
+        self
+    }
+    fn from_imaged_bytes(bytes: &[u8]) -> Option<Self> {
+        Some(std::sync::Arc::from(bytes))
+    }
+}
+
+impl ImagedBytes for String {
+    fn as_imaged_bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+    fn from_imaged_bytes(bytes: &[u8]) -> Option<Self> {
+        std::str::from_utf8(bytes).ok().map(str::to_owned)
+    }
+}
+
+impl ImagedBytes for Box<str> {
+    fn as_imaged_bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+    fn from_imaged_bytes(bytes: &[u8]) -> Option<Self> {
+        std::str::from_utf8(bytes).ok().map(Box::from)
+    }
+}
+
+impl ImagedBytes for std::sync::Arc<str> {
+    fn as_imaged_bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+    fn from_imaged_bytes(bytes: &[u8]) -> Option<Self> {
+        std::str::from_utf8(bytes).ok().map(std::sync::Arc::from)
+    }
+}
+
 /// What an imaged query gives `fetch`: its key's stable form and its value's bytes both ways.
-/// Made only where the bounds hold ([`Imaged::new`]), so `fetch` needs none.
+/// Made only where the bounds hold ([`Imaged::new`] or [`Imaged::for_bytes`]), so `fetch` needs
+/// none.
 pub struct Imaged<K, V> {
     stable: fn(&K, &Memo, &mut StableKey),
     encode: fn(&V) -> &[u8],
     decode: fn(&[u8]) -> Option<V>,
     _of: PhantomData<fn(K) -> V>,
+}
+
+impl<K: Stable, V> Imaged<K, V> {
+    /// Builds an [`Imaged`] codec from explicit byte encode/decode functions (for variable-length
+    /// or custom byte-serialized query values).
+    pub const fn from_codec(encode: fn(&V) -> &[u8], decode: fn(&[u8]) -> Option<V>) -> Imaged<K, V> {
+        fn stable<K: Stable>(key: &K, memo: &Memo, out: &mut StableKey) {
+            key.stable(memo, out);
+        }
+        Imaged { stable: stable::<K>, encode, decode, _of: PhantomData }
+    }
+}
+
+impl<K: Stable, V: ImagedBytes> Imaged<K, V> {
+    /// Builds an [`Imaged`] adapter for any variable-length [`ImagedBytes`] value.
+    pub const fn for_bytes() -> Imaged<K, V> {
+        Self::from_codec(V::as_imaged_bytes, V::from_imaged_bytes)
+    }
 }
 
 impl<K: Stable, V: blaze_format::Record> Imaged<K, V> {
@@ -258,9 +338,6 @@ impl<K: Stable, V: blaze_format::Record> Imaged<K, V> {
                  every bit pattern a value and nothing to follow, so its bytes are the value"
             )
         };
-        fn stable<K: Stable>(key: &K, memo: &Memo, out: &mut StableKey) {
-            key.stable(memo, out);
-        }
         fn encode<V: blaze_format::Record>(value: &V) -> &[u8] {
             blaze_format::bytes_of_slice(std::slice::from_ref(value))
         }
@@ -271,7 +348,7 @@ impl<K: Stable, V: blaze_format::Record> Imaged<K, V> {
                 unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<V>()) }
             })
         }
-        Imaged { stable: stable::<K>, encode: encode::<V>, decode: decode::<V>, _of: PhantomData }
+        Self::from_codec(encode::<V>, decode::<V>)
     }
 }
 
@@ -325,7 +402,7 @@ impl Serving {
 }
 
 /// The records imaged runs filed in a snapshot, for [`Memo::file_records`].
-pub(crate) struct Outbox(SegQueue<Filed>);
+pub(crate) struct Outbox(SegQueue<Filed, Global>);
 
 impl Outbox {
     pub(crate) fn new() -> Outbox {
@@ -529,6 +606,7 @@ pub(crate) fn file<K, V>(
     imaged: &Imaged<K, V>,
 ) {
     let mut untracked = false;
+    let mut backdated = false;
     let made = memo.image.with(|image| {
         let reads = crate::record::flat_of(memo, head);
         if reads.iter().any(|read| read.is_untracked()) {
@@ -536,6 +614,18 @@ pub(crate) fn file<K, V>(
             return None;
         }
         let record_key = entry_key(memo, image.tool(), kind, key, imaged);
+        let payload = (imaged.encode)(value);
+        // Output-fingerprint early cutoff (backdating): when recomputing after a read digest
+        // moved produces the exact same serialized value bytes as the previous record, skip
+        // redundant record serialization and re-filing.
+        if let Some(prev_bytes) = image.record(slot.id.index(), &record_key)
+            && let Ok(prev_root) = record::open::<MemoEntry>(prev_bytes, &record_key)
+            && let Ok(prev_payload) = prev_root.payload.follow(prev_bytes)
+            && prev_payload == payload
+        {
+            backdated = true;
+            return None;
+        }
         let mut facts = Vec::with_capacity_in(reads.len(), Global);
         for read in reads {
             facts.push(match *read {
@@ -551,11 +641,13 @@ pub(crate) fn file<K, V>(
         }
         facts.sort_unstable();
         facts.dedup();
-        let bytes = record::write_traced(&record_key, &facts, &[], (imaged.encode)(value));
+        let bytes = record::write_traced(&record_key, &facts, &[], payload);
         Some(Filed { arena: slot.id.index(), key: record_key, bytes })
     });
     if untracked {
         counts::image_untracked();
+    } else if backdated {
+        counts::image_backdated();
     }
     if let Some(filed) = made {
         counts::image_filed();

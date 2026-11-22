@@ -1,0 +1,14 @@
+{
+ "id": "census-body-sources-1",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane LW",
+ "where": "crates/blaze-ladder/src/front2/program.rs (survey_from, survey_within, make_from), crates/blaze-real/examples/tempo_build.rs, front2/reach.rs body_failed",
+ "what": "tempo's build census said `LEFT 79 lower: Lowered` and `LEFT 20 lower: Convert` with one example each, so the causes under them could not be counted. The first one shown (tokio `select!`'s `$crate::select_priv_clean_pattern`) was refused by the host as `Host(HostError { ask: ProcMacro, why: Refused })`, which looked like a missing proc-macro path in bodies. In fact the survey's program was built with no body sources at all (`Store::sources` was None), so every body proc-macro call, `env!` and `include!` was refused before any runner was asked. `blaze build`'s lazy program already set them.",
+ "cost": "about an hour reading the host, the hook and the resolvers before finding that the census tool alone lacked the sources",
+ "cause": "the census's program had a constructor that left out an input the real command passes, and the class cut the Debug form at its first `{`, so one variant hid every cause",
+ "whys": "make_from had no body-sources parameter (the lazy program set them after construction); class_of kept only the outer variant name",
+ "class": "a measurement tool that builds the thing under test differently from the command, and a census class too coarse to count causes",
+ "prevention": "done: make_from takes body_sources, and every caller passes it (None only for given-file programs with no package); body_failed classes `Lowered` by the first finding's typed cause chain (BodyFinding::Macro has `cause`) and `Convert` by the refusal and the type builder's why; test front2_body_proc_macro (with sources the runner is asked; control without sources leaves the fn out, class names ProcMacro)",
+ "workaround": "none needed now",
+ "state": "fixed"
+}

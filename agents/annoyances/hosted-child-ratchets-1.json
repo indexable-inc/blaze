@@ -1,0 +1,14 @@
+{
+ "id": "hosted-child-ratchets-1",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), write-only lane H (hosted start in the child) under D124",
+ "where": "crates/blaze-launcher/src/main.rs (`make_host`) against tools/ratchets/{std-alloc,alloc-sites,ambient-reach}.txt",
+ "what": "bstd's `Hosting::new` takes `Vec<String>` and `Vec<(String, String)>` (implicit Global) for the program's arguments and grants, so a host made in the launcher must allocate on the global heap with no allocator named; the launcher's rows in the only-fall ratchets (std-alloc, alloc-sites, ambient-reach's env column for `args_os`/`var_os`/`remove_var`) rise with the piece, and a write-only lane cannot run the ratchet script to rewrite them.",
+ "cost": "none yet; the coordinator rewrites the rows after the round",
+ "cause": "Hosting's constructor predates the explicit-allocator rule (D102) for its argument lists",
+ "whys": "the host's lists are owned strings; Hosting holds `alloc` only for its answers' encodings; the in-process host in blaze-cli program.rs had the same shape and its rows were counted there",
+ "class": "a shared constructor without an allocator parameter forces every new caller to raise an only-fall ratchet",
+ "prevention": "wanted: `Hosting::new` takes its argument and grant lists borrowed (or in `alloc`), so the launcher passes the process's argv and the parsed grants in place",
+ "workaround": "coordinator rewrites the launcher's ratchet rows after compiling",
+ "state": "open"
+}

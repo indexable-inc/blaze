@@ -17,12 +17,12 @@
           inherit system;
           overlays = [ rust-overlay.overlays.default ];
         };
-        # The one toolchain blaze is pinned to: the dated nightly in harness/toolchain
+        # The one toolchain blaze is pinned to: the dated nightly in pins/toolchain
         # (`nightly-YYYY-MM-DD`, moved by harness/toolchain_bump.py, which also moves the
         # rust-overlay input to one that has it). rust-src is for rust-analyzer in an editor of
         # this repository; blaze reads none of it (its standard library is library/,
         # docs/toolchain.md).
-        pin = pkgs.lib.removePrefix "nightly-" (pkgs.lib.fileContents ./harness/toolchain);
+        pin = pkgs.lib.removePrefix "nightly-" (pkgs.lib.fileContents ./pins/toolchain);
         rust = pkgs.rust-bin.nightly.${pin}.default.override {
           extensions = [ "rust-src" ];
         };
@@ -33,15 +33,15 @@
         };
         # The one LLVM the `llvm` feature builds against, for every build of it: the dev shells
         # here, CI (`.#llvm`, .github/actions/toolchain), the flake's `dist` and the release.
-        # crates/hir-ty-codegen/llvm.json pins it: LLVM 23.1.4, built for each target by
+        # pins/llvm.json pins it: LLVM 23.1.4, built for each target by
         # .github/scripts/llvm.py (the llvm workflow) and fetched here by its sha256. Its static libraries, headers, llvm-config,
         # llvm-dwarfdump and llvm-pdbutil; LLVM_SYS_231_PREFIX names it, and
         # vendor/llvm-sys links it statically, and its build script (pin.rs) refuses any other. Its tools were
         # built on Ubuntu 22.04 with the C++ runtime linked in: on Linux they are pointed at the
         # store's libc.
-        llvmPin = builtins.fromJSON (builtins.readFile ./crates/hir-ty-codegen/llvm.json);
+        llvmPin = builtins.fromJSON (builtins.readFile ./pins/llvm.json);
         llvm =
-          let pin = llvmPin.targets.${triple} or (throw "crates/hir-ty-codegen/llvm.json has no LLVM for ${triple}: run the llvm workflow");
+          let pin = llvmPin.targets.${triple} or (throw "pins/llvm.json has no LLVM for ${triple}: run the llvm workflow");
           in pkgs.stdenv.mkDerivation {
             pname = "blaze-llvm";
             inherit (llvmPin) version;
@@ -190,22 +190,13 @@
 
         # One derivation per cargo unit (tools/nix/units.nix, tools/nix/units/*.json from tools/nix/unit_graph.py):
         # editing blaze's own source rebuilds only blaze, never the crates it depends on. The
-        # demo's window is built this way; `daemon-units` is blaze built this way, `release`
-        # without PGO, for working on the flake: what ships is `dist`.
+        # demo's window is built this way.
         units = json: import ./tools/nix/units.nix {
           inherit pkgs rust guiLibs json;
           repo = ./.;
           gitSha = self.shortRev or self.dirtyShortRev or "";
         };
-        daemonUnits = units ./tools/nix/units/daemon.json;
         lifeUnits = units ./tools/nix/units/life.json;
-        # blaze's binaries run each other from next to themselves, found by
-        # their own path: the binaries are copied together, not wrapped or linked. The toolchain
-        # has to be on PATH (the launcher puts it there).
-        daemon-units = pkgs.runCommand "blaze-units" { } ''
-          mkdir -p $out/bin
-          cp -L ${daemonUnits.bins}/bin/* $out/bin/
-        '';
         life-bin = pkgs.runCommand "blaze-life-bin" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
           mkdir -p $out/bin
           makeWrapper ${builtins.head lifeUnits.roots}/bin/life $out/bin/life \
@@ -229,7 +220,6 @@
             ./crates/blaze-format
             ./crates/blaze-graph
             ./crates/blaze-ids
-            ./crates/blaze-image
             ./crates/blaze-inproc
             ./crates/blaze-inproc-rt
             ./library/blaze_inproc_rt
@@ -243,7 +233,6 @@
             ./crates/blaze-reclaim
             ./crates/blaze-rng
             ./crates/blaze-sha256
-            ./crates/blaze-vfs
             ./crates/intern
             ./crates/stdx
             ./vendor/blake3-servil
@@ -265,7 +254,7 @@
           # `blaze build` works. `#blaze` names it too.
           default = daemon;
           blaze = daemon;
-          inherit dist daemon run life daemon-units life-bin duckdb;
+          inherit dist daemon run life life-bin duckdb;
           # The pinned LLVM: its tools (llvm-dwarfdump), which CI puts on PATH where the harnesses
           # read debug info, and the prefix a build of the `llvm` feature links.
           inherit llvm;
@@ -289,11 +278,11 @@
         };
         # `nix develop`: the pinned LLVM (LLVM_SYS_231_PREFIX, its tools on PATH) and a C
         # toolchain with libstdc++.a, so `cargo build -p blaze-engine` links it in. Rust is
-        # rustup at the pinned nightly: plain `cargo` is harness/toolchain's and `cargo +<toolchain>` works.
+        # rustup at the pinned nightly: plain `cargo` is pins/toolchain's and `cargo +<toolchain>` works.
         devShells.default = pkgs.mkShell (llvmEnv // {
           packages = scripts.packages ++ [ pkgs.rustup llvm ];
           inherit (scripts) UV_PYTHON UV_PYTHON_DOWNLOADS;
-          RUSTUP_TOOLCHAIN = pkgs.lib.fileContents ./harness/toolchain;
+          RUSTUP_TOOLCHAIN = pkgs.lib.fileContents ./pins/toolchain;
           # The pinned DuckDB that `blaze slow`, `blaze debug sql` and `blaze explain` run (blaze
           # never looks for one on PATH), as the installed `blaze` wrapper sets it.
           BLAZE_DUCKDB = "${duckdb}/bin/duckdb";
@@ -313,7 +302,7 @@
         devShells.wasm = pkgs.mkShell (llvmEnv // {
           packages = scripts.packages ++ [ pkgs.rustup llvm pkgs.wasmtime pkgs.wasm-tools pkgs.wasm-bindgen-cli ];
           inherit (scripts) UV_PYTHON UV_PYTHON_DOWNLOADS;
-          RUSTUP_TOOLCHAIN = pkgs.lib.fileContents ./harness/toolchain;
+          RUSTUP_TOOLCHAIN = pkgs.lib.fileContents ./pins/toolchain;
           hardeningDisable = [ "all" ];
         });
         devShells.bench = pkgs.mkShell bench;

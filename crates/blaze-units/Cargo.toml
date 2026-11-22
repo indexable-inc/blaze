@@ -1,6 +1,6 @@
 [package]
 name = "blaze-units"
-description = "cargo's unit graph made by blaze: the units a build compiles and runs, with their features, profiles and edges, computed from blaze-resolve's resolve and blaze-manifest's workspace with no I/O"
+description = "Typed quantities (D184): authored lengths as whole nanometres and angles as whole micro-arcseconds, so one value has one key however it was computed; areas, volumes, masses and densities in f64 base units; integer telemetry (`Nanos<Wall>`, `Bytes<Resident>`, `Count<K>`) with named checked or saturating arithmetic and no operation across kinds; printing for people in one place; `no_std`, no `alloc`"
 publish = false
 
 version.workspace = true
@@ -14,40 +14,17 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-anyhow.workspace = true
-# `blaze.lock`'s `[git]` and `[advisories]` tables, and the rule the load refuses an unpinned
-# git package by (`weak_source_pin`).
-blaze-audit.workspace = true
-# A std script's port described and its output read as cargo would (`stdlib::cfg::std_cfg`).
-blaze-build-script.workspace = true
-# A git package's tree digest (`Digest`), which its fetch is pinned by.
-blaze-fetch.workspace = true
-blaze-format.workspace = true
-blaze-hash.workspace = true
-blaze-ids.workspace = true
-blaze-lint-defs.workspace = true
-blaze-radix.workspace = true
-blaze-protocol.workspace = true
-blaze-serde.workspace = true
-blaze-source.workspace = true
-blaze-manifest.workspace = true
-blaze-resolve.workspace = true
-cargo-util-schemas.workspace = true
-rustc-stable-hash.workspace = true
-semver.workspace = true
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
-blaze-sha256.workspace = true
-# The CPUs of `-C target-cpu` and their features (target_features::cpus).
-target-features.workspace = true
-toml.workspace = true
-url.workspace = true
-# The view std's graph is resolved in (`stdlib::cfg::std_graph`).
-blaze-vfs.workspace = true
+# `Show`, `Put` and `Writes`: the one place quantities are printed for people, and its
+# `duration` and `byte_count` for the telemetry kinds.
+blaze-text.workspace = true
+# The plant seam of the rounding controls (`Plants`, `Planted`, `NoPlant`).
+blaze-own.workspace = true
 
 [dev-dependencies]
-blaze-alloc-count.workspace = true
-blaze-core.workspace = true
+# Properties: algebra identities on drawn values, round trips through every unit, printing;
+# with a planted-bug control.
+blaze-sim.workspace = true
+blaze-own = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

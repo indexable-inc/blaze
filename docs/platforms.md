@@ -130,7 +130,7 @@ What is specific to the port:
   71 with 57 spliced, 13 full links and 1 step with nothing edited, and fails on Windows if the
   count is not 57 (train run 40494685771, both backends). Five of the full links are the steps
   after a thread-local's first value is edited, which then carry its own copy
-  ([live.md](live.md#statics)); Linux and macOS link those five in full too. COFF
+  (live.md, deleted); Linux and macOS link those five in full too. COFF
   has no symbol sizes, so each named static gets a section of its own, and a static that
   grows is not spliced. Thread-local data in a patch declines the splice. Executables with
   Control Flow Guard, a signature, or no PDB always take the full link (inferred from the
@@ -143,7 +143,7 @@ What is specific to the port:
   named event where Unix has a datagram socket. A static with another value asks for a restart
   (the splice writes it in place). `blaze_live::edit`, which the demo's editor sends each
   keystroke with, talks to the daemon's AF_UNIX socket through Winsock. `harness/live_e2e.py`
-  passes, by hand, not in CI; life's latency is in [live.md](live.md#latency-under-typing).
+  passes, by hand, not in CI; life's latency was in live.md (deleted).
 - The daemon's socket is an AF_UNIX socket. The check that only the user can reach it is
   not implemented on Windows.
 

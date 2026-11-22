@@ -258,6 +258,10 @@ pub enum ExprKind<'s, A: Allocator> {
         function: Name<'s>,
         args: CallArgs<'s, A>,
     },
+    /// A form only the query grammar ([`crate::parse::parse_script`]) makes: a subquery,
+    /// `exists`, an aggregate with `filter` or an inner `order by`, a window, `::`. The typed
+    /// subset refuses it ([`crate::infer::TypeErrorKind::NotInSubset`]).
+    Analytic(Box<crate::query::Analytic<'s, A>, A>),
 }
 
 /// One `op operand` of a [`ExprKind::Chain`].

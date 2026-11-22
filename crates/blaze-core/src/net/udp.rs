@@ -18,9 +18,20 @@
 //! for the length of the one call; a receive's bytes land in the batch's spare capacity and
 //! are counted as initialized only up to what the kernel said it wrote.
 
+#[cfg(target_os = "macos")]
+use core::ffi::c_void;
+use core::ffi::{c_int, c_uint};
+use blaze_sys::{
+    Fd,
+    posix::{
+        io::IoSlice,
+        net,
+        types::{sa_family_t, socklen_t},
+    },
+};
 use std::{
     io,
-    mem::{self, MaybeUninit},
+    mem::MaybeUninit,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket},
     os::fd::{AsRawFd as _, RawFd},
     ptr,
@@ -47,24 +58,24 @@ const MESSAGES: usize = BATCH_MOST;
 /// `at`, bound, nonblocking and close-on-exec, with each of `options` set. An option the
 /// system refuses fails the bind, naming it.
 pub(crate) fn bind(at: SocketAddr, options: Options) -> Result<UdpSocket, (&'static str, io::Error)> {
-    // std's sockets are made close-on-exec.
-    let socket = UdpSocket::bind(at).map_err(|error| ("the bind", error))?;
+    // Made close-on-exec, its tuning set before the bind (reuse must be).
+    let socket = crate::sockopt::bind_udp(at, &options)?;
     socket.set_nonblocking(true).map_err(|error| ("O_NONBLOCK", error))?;
     let fd = socket.as_raw_fd();
     let v6 = at.is_ipv6();
     if options.ecn {
         match v6 {
-            false => set(fd, libc::IPPROTO_IP, libc::IP_RECVTOS, 1, "IP_RECVTOS")?,
-            true => set(fd, libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS, 1, "IPV6_RECVTCLASS")?,
+            false => set(fd, net::IPPROTO_IP, net::IP_RECVTOS, 1, "IP_RECVTOS")?,
+            true => set(fd, net::IPPROTO_IPV6, net::IPV6_RECVTCLASS, 1, "IPV6_RECVTCLASS")?,
         }
     }
     if options.local_address {
         match v6 {
             #[cfg(target_os = "linux")]
-            false => set(fd, libc::IPPROTO_IP, libc::IP_PKTINFO, 1, "IP_PKTINFO")?,
+            false => set(fd, net::IPPROTO_IP, net::IP_PKTINFO, 1, "IP_PKTINFO")?,
             #[cfg(target_os = "macos")]
-            false => set(fd, libc::IPPROTO_IP, libc::IP_RECVDSTADDR, 1, "IP_RECVDSTADDR")?,
-            true => set(fd, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO, 1, "IPV6_RECVPKTINFO")?,
+            false => set(fd, net::IPPROTO_IP, net::IP_RECVDSTADDR, 1, "IP_RECVDSTADDR")?,
+            true => set(fd, net::IPPROTO_IPV6, net::IPV6_RECVPKTINFO, 1, "IPV6_RECVPKTINFO")?,
         }
     }
     if options.dont_fragment {
@@ -72,54 +83,42 @@ pub(crate) fn bind(at: SocketAddr, options: Options) -> Result<UdpSocket, (&'sta
         match v6 {
             false => set(
                 fd,
-                libc::IPPROTO_IP,
-                libc::IP_MTU_DISCOVER,
-                libc::IP_PMTUDISC_PROBE,
+                net::IPPROTO_IP,
+                net::IP_MTU_DISCOVER,
+                net::IP_PMTUDISC_PROBE,
                 "IP_MTU_DISCOVER",
             )?,
             true => set(
                 fd,
-                libc::IPPROTO_IPV6,
-                libc::IPV6_MTU_DISCOVER,
-                libc::IPV6_PMTUDISC_PROBE,
+                net::IPPROTO_IPV6,
+                net::IPV6_MTU_DISCOVER,
+                net::IPV6_PMTUDISC_PROBE,
                 "IPV6_MTU_DISCOVER",
             )?,
         }
         #[cfg(target_os = "macos")]
         match v6 {
-            false => set(fd, libc::IPPROTO_IP, libc::IP_DONTFRAG, 1, "IP_DONTFRAG")?,
-            true => set(fd, libc::IPPROTO_IPV6, libc::IPV6_DONTFRAG, 1, "IPV6_DONTFRAG")?,
+            false => set(fd, net::IPPROTO_IP, net::IP_DONTFRAG, 1, "IP_DONTFRAG")?,
+            true => set(fd, net::IPPROTO_IPV6, net::IPV6_DONTFRAG, 1, "IPV6_DONTFRAG")?,
         }
     }
     // macOS has no receive offload: `coalesce` permits runs, and none come.
     #[cfg(target_os = "linux")]
     if options.coalesce {
-        set(fd, libc::SOL_UDP, libc::UDP_GRO, 1, "UDP_GRO")?;
+        set(fd, net::SOL_UDP, net::UDP_GRO, 1, "UDP_GRO")?;
     }
     Ok(socket)
 }
 
 fn set(
     fd: RawFd,
-    level: libc::c_int,
-    name: libc::c_int,
-    value: libc::c_int,
+    level: c_int,
+    name: c_int,
+    value: c_int,
     what: &'static str,
 ) -> Result<(), (&'static str, io::Error)> {
-    // SAFETY: an int option of an open socket, its value on the stack for the call.
-    let done = unsafe {
-        libc::setsockopt(
-            fd,
-            level,
-            name,
-            (&raw const value).cast(),
-            size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    match done {
-        0 => Ok(()),
-        _ => Err((what, io::Error::last_os_error())),
-    }
+    net::setsockopt_int(Fd::new(fd), level, name, value)
+        .map_err(|error| (what, io::Error::from_raw_os_error(i32::from(error.raw()))))
 }
 
 /// How far a send of a batch has got: the next datagram to send is at byte `offset` of run
@@ -139,52 +138,51 @@ impl At {
 
 /// `peer` written as the system names it, for a socket of the family `v6` says: a v4 peer of a
 /// v6 socket is its v4-mapped address.
-fn write_addr(peer: SocketAddr, v6: bool, storage: &mut libc::sockaddr_storage) -> libc::socklen_t {
+fn write_addr(peer: SocketAddr, v6: bool, storage: &mut net::sockaddr_storage) -> socklen_t {
     let peer = match (peer, v6) {
         (SocketAddr::V4(it), true) => {
             SocketAddr::V6(SocketAddrV6::new(it.ip().to_ipv6_mapped(), it.port(), 0, 0))
         }
         (peer, _) => peer,
     };
-    // SAFETY: all zeros is a valid `sockaddr_storage`.
-    *storage = unsafe { mem::zeroed() };
+    *storage = net::sockaddr_storage::ZERO;
     let len = match peer {
         SocketAddr::V4(address) => {
             // SAFETY: `sockaddr_storage` is large and aligned enough for any address.
-            let in4 = unsafe { &mut *(&raw mut *storage).cast::<libc::sockaddr_in>() };
-            in4.sin_family = libc::AF_INET as libc::sa_family_t;
+            let in4 = unsafe { &mut *(&raw mut *storage).cast::<net::sockaddr_in>() };
+            in4.sin_family = net::AF_INET as sa_family_t;
             in4.sin_port = address.port().to_be();
-            in4.sin_addr = libc::in_addr { s_addr: u32::from_ne_bytes(address.ip().octets()) };
-            size_of::<libc::sockaddr_in>()
+            in4.sin_addr = net::in_addr { s_addr: u32::from_ne_bytes(address.ip().octets()) };
+            size_of::<net::sockaddr_in>()
         }
         SocketAddr::V6(address) => {
             // SAFETY: as above.
-            let in6 = unsafe { &mut *(&raw mut *storage).cast::<libc::sockaddr_in6>() };
-            in6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            let in6 = unsafe { &mut *(&raw mut *storage).cast::<net::sockaddr_in6>() };
+            in6.sin6_family = net::AF_INET6 as sa_family_t;
             in6.sin6_port = address.port().to_be();
             in6.sin6_flowinfo = address.flowinfo();
-            in6.sin6_addr = libc::in6_addr { s6_addr: address.ip().octets() };
+            in6.sin6_addr = net::in6_addr { s6_addr: address.ip().octets() };
             in6.sin6_scope_id = address.scope_id();
-            size_of::<libc::sockaddr_in6>()
+            size_of::<net::sockaddr_in6>()
         }
     };
     super::set_len(storage, len);
-    len as libc::socklen_t
+    len as socklen_t
 }
 
 /// The address the system wrote, a v4-mapped one said as v4; `None` for a family that is
 /// neither.
-fn read_addr(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
-    match storage.ss_family as libc::c_int {
-        libc::AF_INET => {
+fn read_addr(storage: &net::sockaddr_storage) -> Option<SocketAddr> {
+    match storage.ss_family as c_int {
+        net::AF_INET => {
             // SAFETY: the family says it is a `sockaddr_in`.
-            let in4 = unsafe { &*(&raw const *storage).cast::<libc::sockaddr_in>() };
+            let in4 = unsafe { &*(&raw const *storage).cast::<net::sockaddr_in>() };
             let ip = Ipv4Addr::from(in4.sin_addr.s_addr.to_ne_bytes());
             Some(SocketAddr::V4(SocketAddrV4::new(ip, u16::from_be(in4.sin_port))))
         }
-        libc::AF_INET6 => {
+        net::AF_INET6 => {
             // SAFETY: the family says it is a `sockaddr_in6`.
-            let in6 = unsafe { &*(&raw const *storage).cast::<libc::sockaddr_in6>() };
+            let in6 = unsafe { &*(&raw const *storage).cast::<net::sockaddr_in6>() };
             let ip = Ipv6Addr::from(in6.sin6_addr.s6_addr);
             let port = u16::from_be(in6.sin6_port);
             Some(match ip.to_ipv4_mapped() {
@@ -203,19 +201,19 @@ fn read_addr(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
 
 /// One control message to send.
 enum Cmsg {
-    Int { level: libc::c_int, kind: libc::c_int, value: libc::c_int },
+    Int { level: c_int, kind: c_int, value: c_int },
     #[cfg(target_os = "linux")]
-    U16 { level: libc::c_int, kind: libc::c_int, value: u16 },
+    U16 { level: c_int, kind: c_int, value: u16 },
     #[cfg(target_os = "linux")]
-    Pktinfo4(libc::in_pktinfo),
-    Pktinfo6(libc::in6_pktinfo),
+    Pktinfo4(net::in_pktinfo),
+    Pktinfo6(net::in6_pktinfo),
 }
 
 impl Cmsg {
-    fn raw(&self) -> (libc::c_int, libc::c_int, *const u8, usize) {
+    fn raw(&self) -> (c_int, c_int, *const u8, usize) {
         match self {
             Cmsg::Int { level, kind, value } => {
-                (*level, *kind, (&raw const *value).cast(), size_of::<libc::c_int>())
+                (*level, *kind, (&raw const *value).cast(), size_of::<c_int>())
             }
             #[cfg(target_os = "linux")]
             Cmsg::U16 { level, kind, value } => {
@@ -223,16 +221,16 @@ impl Cmsg {
             }
             #[cfg(target_os = "linux")]
             Cmsg::Pktinfo4(info) => (
-                libc::IPPROTO_IP,
-                libc::IP_PKTINFO,
+                net::IPPROTO_IP,
+                net::IP_PKTINFO,
                 (&raw const *info).cast(),
-                size_of::<libc::in_pktinfo>(),
+                size_of::<net::in_pktinfo>(),
             ),
             Cmsg::Pktinfo6(info) => (
-                libc::IPPROTO_IPV6,
-                libc::IPV6_PKTINFO,
+                net::IPPROTO_IPV6,
+                net::IPV6_PKTINFO,
                 (&raw const *info).cast(),
-                size_of::<libc::in6_pktinfo>(),
+                size_of::<net::in6_pktinfo>(),
             ),
         }
     }
@@ -243,18 +241,17 @@ impl Cmsg {
 fn cmsgs(head: &Head, peer_v4: bool, out: &mut [Option<Cmsg>; 3]) {
     *out = [None, None, None];
     if head.ecn != Ecn::NotEct {
-        let value = libc::c_int::from(head.ecn.bits());
+        let value = c_int::from(head.ecn.bits());
         out[0] = Some(match peer_v4 {
-            true => Cmsg::Int { level: libc::IPPROTO_IP, kind: libc::IP_TOS, value },
-            false => Cmsg::Int { level: libc::IPPROTO_IPV6, kind: libc::IPV6_TCLASS, value },
+            true => Cmsg::Int { level: net::IPPROTO_IP, kind: net::IP_TOS, value },
+            false => Cmsg::Int { level: net::IPPROTO_IPV6, kind: net::IPV6_TCLASS, value },
         });
     }
     match head.local {
         #[cfg(target_os = "linux")]
         Some(IpAddr::V4(ip)) => {
-            // SAFETY: all zeros is a valid `in_pktinfo`: no interface, the address below.
-            let mut info: libc::in_pktinfo = unsafe { mem::zeroed() };
-            info.ipi_spec_dst = libc::in_addr { s_addr: u32::from_ne_bytes(ip.octets()) };
+            let mut info = net::in_pktinfo::ZERO;
+            info.ipi_spec_dst = net::in_addr { s_addr: u32::from_ne_bytes(ip.octets()) };
             out[1] = Some(Cmsg::Pktinfo4(info));
         }
         // macOS sends from a v4 address by `IP_SENDSRCADDR`, which a socket bound at one
@@ -263,9 +260,8 @@ fn cmsgs(head: &Head, peer_v4: bool, out: &mut [Option<Cmsg>; 3]) {
         #[cfg(not(target_os = "linux"))]
         Some(IpAddr::V4(_)) => {}
         Some(IpAddr::V6(ip)) => {
-            // SAFETY: all zeros is a valid `in6_pktinfo`.
-            let mut info: libc::in6_pktinfo = unsafe { mem::zeroed() };
-            info.ipi6_addr = libc::in6_addr { s6_addr: ip.octets() };
+            let mut info = net::in6_pktinfo::ZERO;
+            info.ipi6_addr = net::in6_addr { s6_addr: ip.octets() };
             out[1] = Some(Cmsg::Pktinfo6(info));
         }
         None => {}
@@ -273,12 +269,12 @@ fn cmsgs(head: &Head, peer_v4: bool, out: &mut [Option<Cmsg>; 3]) {
     #[cfg(target_os = "linux")]
     if head.segment < head.len {
         let value = u16::try_from(head.segment).expect("a segment is at most DATAGRAM_MOST");
-        out[2] = Some(Cmsg::U16 { level: libc::SOL_UDP, kind: libc::UDP_SEGMENT, value });
+        out[2] = Some(Cmsg::U16 { level: net::SOL_UDP, kind: net::UDP_SEGMENT, value });
     }
 }
 
 /// `msg`'s control messages written into `control`: none leaves it without.
-fn encode(msg: &mut libc::msghdr, control: &mut Control, items: &[Option<Cmsg>; 3]) {
+fn encode(msg: &mut net::msghdr, control: &mut Control, items: &[Option<Cmsg>; 3]) {
     if items.iter().all(Option::is_none) {
         msg.msg_control = ptr::null_mut();
         msg.msg_controllen = 0;
@@ -292,16 +288,16 @@ fn encode(msg: &mut libc::msghdr, control: &mut Control, items: &[Option<Cmsg>; 
     // function; each header is written only where `CMSG_FIRSTHDR` or `CMSG_NXTHDR` said it
     // fits, and its data, at most an `in6_pktinfo`, fits its `CMSG_SPACE` within `CONTROL`.
     unsafe {
-        let mut cmsg = libc::CMSG_FIRSTHDR(msg);
+        let mut cmsg = net::CMSG_FIRSTHDR(msg);
         for item in items.iter().flatten() {
             assert!(!cmsg.is_null(), "a datagram's control messages fit CONTROL, {CONTROL} bytes");
             let (level, kind, data, len) = item.raw();
             (*cmsg).cmsg_level = level;
             (*cmsg).cmsg_type = kind;
-            (*cmsg).cmsg_len = libc::CMSG_LEN(len as libc::c_uint) as _;
-            ptr::copy_nonoverlapping(data, libc::CMSG_DATA(cmsg), len);
-            used += libc::CMSG_SPACE(len as libc::c_uint) as usize;
-            cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+            (*cmsg).cmsg_len = net::CMSG_LEN(len as c_uint) as _;
+            ptr::copy_nonoverlapping(data, net::CMSG_DATA(cmsg), len);
+            used += net::CMSG_SPACE(len as c_uint) as usize;
+            cmsg = net::CMSG_NXTHDR(msg, cmsg);
         }
     }
     msg.msg_controllen = used as _;
@@ -316,9 +312,9 @@ struct Said {
     segment: Option<u32>,
 }
 
-fn decode(msg: &libc::msghdr) -> Said {
+fn decode(msg: &net::msghdr) -> Said {
     let mut said = Said::default();
-    if msg.msg_control.is_null() || (msg.msg_controllen as usize) < size_of::<libc::cmsghdr>() {
+    if msg.msg_control.is_null() || (msg.msg_controllen as usize) < size_of::<net::cmsghdr>() {
         return said;
     }
     // SAFETY: the kernel wrote `msg_controllen` bytes of control messages into the buffer
@@ -326,37 +322,37 @@ fn decode(msg: &libc::msghdr) -> Said {
     // `CMSG_FIRSTHDR` or `CMSG_NXTHDR` found it within them, and its data no longer than its
     // `cmsg_len` says (unaligned reads: the data is aligned only to the header's alignment).
     unsafe {
-        let mut cmsg = libc::CMSG_FIRSTHDR(msg);
+        let mut cmsg = net::CMSG_FIRSTHDR(msg);
         while !cmsg.is_null() {
             let (level, kind) = ((*cmsg).cmsg_level, (*cmsg).cmsg_type);
-            let data = libc::CMSG_DATA(cmsg);
-            let len = ((*cmsg).cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
+            let data = net::CMSG_DATA(cmsg);
+            let len = ((*cmsg).cmsg_len as usize).saturating_sub(net::CMSG_LEN(0) as usize);
             // The codepoint: a byte (Linux's IP_TOS, macOS's IP_RECVTOS) or an int.
             let byte_or_int = || match len {
                 1 => u8::from(*data),
-                _ => ptr::read_unaligned(data.cast::<libc::c_int>()) as u8,
+                _ => ptr::read_unaligned(data.cast::<c_int>()) as u8,
             };
             match (level, kind) {
-                (libc::IPPROTO_IP, libc::IP_TOS) => said.ecn = Some(Ecn::of_tos(byte_or_int())),
+                (net::IPPROTO_IP, net::IP_TOS) => said.ecn = Some(Ecn::of_tos(byte_or_int())),
                 #[cfg(target_os = "macos")]
-                (libc::IPPROTO_IP, libc::IP_RECVTOS) => {
+                (net::IPPROTO_IP, net::IP_RECVTOS) => {
                     said.ecn = Some(Ecn::of_tos(byte_or_int()));
                 }
-                (libc::IPPROTO_IPV6, libc::IPV6_TCLASS) => {
+                (net::IPPROTO_IPV6, net::IPV6_TCLASS) => {
                     said.ecn = Some(Ecn::of_tos(byte_or_int()));
                 }
                 #[cfg(target_os = "linux")]
-                (libc::IPPROTO_IP, libc::IP_PKTINFO) => {
-                    let info = ptr::read_unaligned(data.cast::<libc::in_pktinfo>());
+                (net::IPPROTO_IP, net::IP_PKTINFO) => {
+                    let info = ptr::read_unaligned(data.cast::<net::in_pktinfo>());
                     said.local = Some(IpAddr::V4(Ipv4Addr::from(info.ipi_addr.s_addr.to_ne_bytes())));
                 }
                 #[cfg(target_os = "macos")]
-                (libc::IPPROTO_IP, libc::IP_RECVDSTADDR) => {
-                    let addr = ptr::read_unaligned(data.cast::<libc::in_addr>());
+                (net::IPPROTO_IP, net::IP_RECVDSTADDR) => {
+                    let addr = ptr::read_unaligned(data.cast::<net::in_addr>());
                     said.local = Some(IpAddr::V4(Ipv4Addr::from(addr.s_addr.to_ne_bytes())));
                 }
-                (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO) => {
-                    let info = ptr::read_unaligned(data.cast::<libc::in6_pktinfo>());
+                (net::IPPROTO_IPV6, net::IPV6_PKTINFO) => {
+                    let info = ptr::read_unaligned(data.cast::<net::in6_pktinfo>());
                     let ip = Ipv6Addr::from(info.ipi6_addr.s6_addr);
                     said.local = Some(match ip.to_ipv4_mapped() {
                         Some(v4) => IpAddr::V4(v4),
@@ -364,52 +360,53 @@ fn decode(msg: &libc::msghdr) -> Said {
                     });
                 }
                 #[cfg(target_os = "linux")]
-                (libc::SOL_UDP, libc::UDP_GRO) => {
-                    let size = ptr::read_unaligned(data.cast::<libc::c_int>());
+                (net::SOL_UDP, net::UDP_GRO) => {
+                    let size = ptr::read_unaligned(data.cast::<c_int>());
                     said.segment = u32::try_from(size).ok();
                 }
                 _ => {}
             }
-            cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+            cmsg = net::CMSG_NXTHDR(msg, cmsg);
         }
     }
     said
 }
 
-/// The messages of one send: their headers, the iovec and address each points at, and their
-/// control messages. On the stack of the call, never moved while the kernel reads it.
+/// The messages of one call: their headers, addresses and control messages. The call also
+/// owns one iovec per header. All are on the stack and unmoved while the kernel uses them.
 struct Messages {
-    msgs: [libc::msghdr; MESSAGES],
-    iovs: [libc::iovec; MESSAGES],
-    names: [libc::sockaddr_storage; MESSAGES],
+    msgs: [net::msghdr; MESSAGES],
+    names: [net::sockaddr_storage; MESSAGES],
     controls: [Control; MESSAGES],
     /// Where each message's datagrams end: the [`At`] after it.
     after: [At; MESSAGES],
     /// Of a receive: each message's length and flags, as the kernel said them.
-    got: [(usize, libc::c_int); MESSAGES],
+    got: [(usize, c_int); MESSAGES],
     len: usize,
 }
 
 impl Messages {
     fn new() -> Messages {
-        // SAFETY: all zeros is a valid message header, iovec and address: null pointers and
-        // zero lengths, filled before the kernel sees one.
-        unsafe {
-            Messages {
-                msgs: mem::zeroed(),
-                iovs: mem::zeroed(),
-                names: mem::zeroed(),
-                controls: [Control::ZERO; MESSAGES],
-                after: [At::default(); MESSAGES],
-                got: [(0, 0); MESSAGES],
-                len: 0,
-            }
+        Messages {
+            msgs: [net::msghdr::ZERO; MESSAGES],
+            names: [net::sockaddr_storage::ZERO; MESSAGES],
+            controls: [Control::ZERO; MESSAGES],
+            after: [At::default(); MESSAGES],
+            got: [(0, 0); MESSAGES],
+            len: 0,
         }
     }
 
     /// The messages of `batch` from `at`, at most [`MESSAGES`]: one per run where `whole`
     /// (the kernel cuts it), else one per datagram.
-    fn fill(&mut self, batch: &Batch, mut at: At, v6: bool, whole: bool) {
+    fn fill<'a>(
+        &mut self,
+        batch: &'a Batch,
+        mut at: At,
+        v6: bool,
+        whole: bool,
+        iovs: &mut [IoSlice<'a>; MESSAGES],
+    ) {
         self.len = 0;
         let mut items = [None, None, None];
         while self.len < MESSAGES && !at.done(batch) {
@@ -424,10 +421,7 @@ impl Messages {
             };
             let n = self.len;
             let namelen = write_addr(head.peer, v6, &mut self.names[n]);
-            self.iovs[n] = libc::iovec {
-                iov_base: batch.bytes[start..start + len].as_ptr().cast_mut().cast(),
-                iov_len: len,
-            };
+            iovs[n] = IoSlice::new(&batch.bytes[start..start + len]);
             let mut one = *head;
             if !whole {
                 one.len = len as u32;
@@ -435,11 +429,11 @@ impl Messages {
             }
             cmsgs(&one, head.peer.is_ipv4(), &mut items);
             let msg = &mut self.msgs[n];
-            // SAFETY: all zeros is a valid header; every field the kernel reads is set below.
-            *msg = unsafe { mem::zeroed() };
+            *msg = net::msghdr::ZERO;
             msg.msg_name = (&raw mut self.names[n]).cast();
             msg.msg_namelen = namelen;
-            msg.msg_iov = &raw mut self.iovs[n];
+            // IoSlice is a C iovec. A send only reads the payload it borrows.
+            msg.msg_iov = (&raw mut iovs[n]).cast();
             msg.msg_iovlen = 1;
             encode(msg, &mut self.controls[n], &items);
             at.offset += len;
@@ -469,27 +463,30 @@ fn send_into(
     at: At,
     messages: &mut Messages,
 ) -> io::Result<At> {
-    messages.fill(batch, at, v6, true);
-    // SAFETY: an `mmsghdr` is a `msghdr` and the count the kernel writes; all zeros is valid.
-    let mut mmsgs: [libc::mmsghdr; MESSAGES] = unsafe { mem::zeroed() };
+    let mut iovs = [IoSlice::new(&[]); MESSAGES];
+    messages.fill(batch, at, v6, true, &mut iovs);
+    let mut mmsgs = [net::mmsghdr::ZERO; MESSAGES];
     for (to, from) in mmsgs.iter_mut().zip(&messages.msgs[..messages.len]) {
         // A copy of a header whose pointers point into `messages`.
         to.msg_hdr = *from;
     }
     loop {
-        // SAFETY: `messages.len` headers, each pointing at its address, iovec and control in
-        // `messages` and at the batch's bytes, all alive and unmoved across the call.
+        // SAFETY: each header points at live iovecs, batch bytes, addresses and control
+        // buffers for its full length. All remain unmoved across the call.
         let sent = unsafe {
-            libc::sendmmsg(socket.as_raw_fd(), mmsgs.as_mut_ptr(), messages.len as _, 0 as _)
+            blaze_sys::linux::sock::sendmmsg(
+                Fd::new(socket.as_raw_fd()),
+                &mut mmsgs[..messages.len],
+                net::MsgFlags::NONE,
+            )
         };
-        match sent {
-            n if n > 0 => return Ok(messages.after[n as usize - 1]),
-            _ => {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
-            }
+        let error = match sent {
+            Ok(0) => io::Error::last_os_error(),
+            Ok(n) => return Ok(messages.after[n - 1]),
+            Err(error) => io::Error::from_raw_os_error(i32::from(error.raw())),
+        };
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
         }
     }
 }
@@ -499,14 +496,14 @@ fn send_into(
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct MsghdrX {
-    msg_name: *mut libc::c_void,
-    msg_namelen: libc::socklen_t,
-    msg_iov: *mut libc::iovec,
-    msg_iovlen: libc::c_int,
-    msg_control: *mut libc::c_void,
-    msg_controllen: libc::socklen_t,
-    msg_flags: libc::c_int,
-    msg_datalen: libc::size_t,
+    msg_name: *mut c_void,
+    msg_namelen: socklen_t,
+    msg_iov: *mut blaze_sys::posix::io::IoSliceMut<'static>,
+    msg_iovlen: c_int,
+    msg_control: *mut c_void,
+    msg_controllen: socklen_t,
+    msg_flags: c_int,
+    msg_datalen: usize,
 }
 
 // Private to libSystem (rule macos-private-apis): many datagrams in one call, where the public
@@ -514,14 +511,12 @@ struct MsghdrX {
 // are checked by `tests::the_private_batch_calls_are_there`.
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
-    fn sendmsg_x(s: libc::c_int, msgp: *const MsghdrX, cnt: libc::c_uint, flags: libc::c_int)
-    -> isize;
-    fn recvmsg_x(s: libc::c_int, msgp: *const MsghdrX, cnt: libc::c_uint, flags: libc::c_int)
-    -> isize;
+    fn sendmsg_x(s: c_int, msgp: *const MsghdrX, cnt: c_uint, flags: c_int) -> isize;
+    fn recvmsg_x(s: c_int, msgp: *const MsghdrX, cnt: c_uint, flags: c_int) -> isize;
 }
 
 #[cfg(target_os = "macos")]
-fn to_x(msg: &libc::msghdr) -> MsghdrX {
+fn to_x(msg: &net::msghdr) -> MsghdrX {
     MsghdrX {
         msg_name: msg.msg_name,
         msg_namelen: msg.msg_namelen,
@@ -548,7 +543,8 @@ fn send_into(
             "a v4 source address named per datagram: macOS's IP_SENDSRCADDR is not built",
         ));
     }
-    messages.fill(batch, at, v6, false);
+    let mut iovs = [IoSlice::new(&[]); MESSAGES];
+    messages.fill(batch, at, v6, false, &mut iovs);
     let mut xs = [MsghdrX {
         msg_name: ptr::null_mut(),
         msg_namelen: 0,
@@ -566,7 +562,7 @@ fn send_into(
         // SAFETY: as Linux's `sendmmsg` above: `messages.len` headers into `messages` and the
         // batch, alive and unmoved across the call.
         let sent =
-            unsafe { sendmsg_x(socket.as_raw_fd(), xs.as_ptr(), messages.len as libc::c_uint, 0) };
+            unsafe { sendmsg_x(socket.as_raw_fd(), xs.as_ptr(), messages.len as c_uint, 0) };
         match sent {
             n if n > 0 => return Ok(messages.after[n as usize - 1]),
             _ => {
@@ -589,17 +585,17 @@ pub(crate) fn recv(socket: &UdpSocket, batch: &mut Batch, slots: Slots) -> io::R
     batch.bytes.reserve(most * size);
     batch.heads.reserve(most);
     let mut messages = Messages::new();
+    let mut iovs = [const { MaybeUninit::uninit() }; MESSAGES];
     let base = batch.bytes.spare_capacity_mut().as_mut_ptr();
     for n in 0..most {
         // SAFETY: slot `n` is within the `most * size` bytes reserved above.
         let slot: *mut MaybeUninit<u8> = unsafe { base.add(n * size) };
-        messages.iovs[n] = libc::iovec { iov_base: slot.cast(), iov_len: size };
+        let iov = iovs[n].write(libc::iovec { iov_base: slot.cast(), iov_len: size });
         let msg = &mut messages.msgs[n];
-        // SAFETY: all zeros is a valid header.
-        *msg = unsafe { mem::zeroed() };
+        *msg = net::msghdr::ZERO;
         msg.msg_name = (&raw mut messages.names[n]).cast();
-        msg.msg_namelen = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-        msg.msg_iov = &raw mut messages.iovs[n];
+        msg.msg_namelen = size_of::<net::sockaddr_storage>() as socklen_t;
+        msg.msg_iov = ptr::from_mut(iov).cast();
         msg.msg_iovlen = 1;
         msg.msg_control = messages.controls[n].0.as_mut_ptr().cast();
         msg.msg_controllen = CONTROL as _;
@@ -625,7 +621,7 @@ pub(crate) fn recv(socket: &UdpSocket, batch: &mut Batch, slots: Slots) -> io::R
             ecn: said.ecn.unwrap_or(Ecn::NotEct),
             len,
             segment: said.segment.filter(|&it| it > 0 && it < len).unwrap_or(len),
-            truncated: flags & libc::MSG_TRUNC != 0,
+            truncated: flags & net::MSG_TRUNC != 0,
         });
     }
     // SAFETY: the first `end` bytes were written by the kernel and moved down above.
@@ -640,27 +636,24 @@ fn recv_into(
     messages: &mut Messages,
     most: usize,
 ) -> io::Result<usize> {
-    // SAFETY: as in `send_into`.
-    let mut mmsgs: [libc::mmsghdr; MESSAGES] = unsafe { mem::zeroed() };
+    let mut mmsgs = [net::mmsghdr::ZERO; MESSAGES];
     for (to, from) in mmsgs.iter_mut().zip(&messages.msgs[..most]) {
         // A copy of a header whose pointers point into `messages` and the batch.
         to.msg_hdr = *from;
     }
     loop {
-        // SAFETY: `most` headers, each pointing at its slot of the batch's reserved bytes and
-        // at its address and control buffers in `messages`, alive and unmoved across the call.
+        // SAFETY: each header points to its exclusive live slot of the batch, iovec, address
+        // and control buffer, each valid for its length and unmoved across the call.
         let got = unsafe {
-            libc::recvmmsg(
-                socket.as_raw_fd(),
-                mmsgs.as_mut_ptr(),
-                most as _,
-                0 as _,
-                ptr::null_mut(),
+            blaze_sys::linux::sock::recvmmsg(
+                Fd::new(socket.as_raw_fd()),
+                &mut mmsgs[..most],
+                net::MsgFlags::NONE,
+                None,
             )
         };
         match got {
-            n if n >= 0 => {
-                let n = n as usize;
+            Ok(n) => {
                 for (at, mmsg) in mmsgs[..n].iter().enumerate() {
                     // The kernel's view of the header: its address and control lengths.
                     messages.msgs[at] = mmsg.msg_hdr;
@@ -668,12 +661,8 @@ fn recv_into(
                 }
                 return Ok(n);
             }
-            _ => {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
-            }
+            Err(blaze_sys::Errno::Intr) => continue,
+            Err(error) => return Err(io::Error::from_raw_os_error(i32::from(error.raw()))),
         }
     }
 }
@@ -700,7 +689,7 @@ fn recv_into(
     loop {
         // SAFETY: as Linux's `recvmmsg`.
         let got =
-            unsafe { recvmsg_x(socket.as_raw_fd(), xs.as_ptr(), most as libc::c_uint, 0) };
+            unsafe { recvmsg_x(socket.as_raw_fd(), xs.as_ptr(), most as c_uint, 0) };
         match got {
             n if n >= 0 => {
                 let n = n as usize;
@@ -732,10 +721,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn the_private_batch_calls_are_there() {
+        use blaze_sys::posix::thread::{RTLD_DEFAULT, symbol};
+
         for name in [c"sendmsg_x", c"recvmsg_x"] {
-            // SAFETY: a lookup of a NUL-terminated name in the process's own images.
-            let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
-            assert!(!found.is_null(), "{name:?} is not in libSystem");
+            // SAFETY: RTLD_DEFAULT searches the process's own loaded images.
+            let found = unsafe { symbol(RTLD_DEFAULT, name) };
+            assert!(found.is_some(), "{name:?} is not in libSystem");
         }
     }
 

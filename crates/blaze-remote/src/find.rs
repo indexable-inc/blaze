@@ -31,13 +31,42 @@ pub const BLOCKS_CACHED: usize = 4096;
 pub struct Cache {
     heads: BTreeMap<ContentId, Head>,
     blocks: BTreeMap<(ContentId, usize), Vec<Entry>>,
+    /// Deterministic LRU tracking for `blocks`: avoids cliff-edge wholesale wipes on huge monorepos.
+    block_tick: u64,
+    block_last_use: BTreeMap<(ContentId, usize), u64>,
+    block_lru: BTreeSet<(u64, ContentId, usize)>,
     roots: BTreeMap<u64, RootSeen>,
     absent: BTreeMap<u64, (ContentId, BTreeSet<[u8; 32]>)>,
 }
 
 impl Cache {
+    fn touch_block(&mut self, key: (ContentId, usize)) {
+        self.block_tick = self.block_tick.wrapping_add(1);
+        let tick = self.block_tick;
+        if let Some(prev) = self.block_last_use.insert(key, tick) {
+            self.block_lru.remove(&(prev, key.0, key.1));
+        }
+        self.block_lru.insert((tick, key.0, key.1));
+    }
+
+    /// Evicts only the least-recently-used excess blocks down to `BLOCKS_CACHED`, keeping the hot
+    /// working set warm instead of wiping the whole cache on huge monorepos.
+    pub(crate) fn trim_blocks(&mut self) {
+        while self.blocks.len() > BLOCKS_CACHED {
+            let Some(&(tick, shard, i)) = self.block_lru.first() else {
+                self.blocks.clear();
+                self.block_last_use.clear();
+                break;
+            };
+            self.block_lru.remove(&(tick, shard, i));
+            self.block_last_use.remove(&(shard, i));
+            self.blocks.remove(&(shard, i));
+        }
+    }
+
     pub(crate) fn keep_block(&mut self, shard: ContentId, i: usize, entries: Vec<Entry>) {
         self.blocks.insert((shard, i), entries);
+        self.touch_block((shard, i));
     }
 
     /// Keeps a block a merge checked, while fewer than [`BLOCKS_CACHED`] are held: a merge
@@ -46,6 +75,7 @@ impl Cache {
     pub(crate) fn keep_merged_block(&mut self, shard: ContentId, i: usize, entries: Vec<Entry>) {
         if self.blocks.len() < BLOCKS_CACHED {
             self.blocks.insert((shard, i), entries);
+            self.touch_block((shard, i));
         }
     }
 
@@ -55,6 +85,7 @@ impl Cache {
 
     /// Every entry of `shard`, when its head and every block of it are held (each checked once,
     /// when it was kept): a merge that needs the shard again takes them without a fetch.
+    #[cfg(feature = "sign")]
     pub(crate) fn whole(&self, shard: &ShardRef) -> Option<Vec<Entry>> {
         let head = self.heads.get(&shard.digest)?;
         let mut out = Vec::with_capacity(shard.count as usize);
@@ -133,9 +164,9 @@ impl Find {
         keys.sort_unstable();
         keys.dedup();
         let mut cache = cache;
-        // Bounded between finds, never during one: a find answers from every block it fetched.
+        // Bounded between finds, never during one: evict only LRU excess so warm shards stay hot.
         if cache.blocks.len() > BLOCKS_CACHED {
-            cache.blocks.clear();
+            cache.trim_blocks();
         }
         Ok(Find {
             namespace,

@@ -12,7 +12,7 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map};
 use std::alloc::Global;
 use syntax_tree::TextRange;
 
@@ -218,7 +218,7 @@ pub struct SyntaxEdit {
     old_root: SyntaxNode,
     new_root: SyntaxNode,
     changed_elements: Vec<SyntaxElement>,
-    annotations: HashMap<SyntaxAnnotation, Vec<SyntaxElement>, Global>,
+    annotations: Map<SyntaxAnnotation, Vec<SyntaxElement>, FixedState, Global>,
 }
 
 impl SyntaxEdit {
@@ -573,7 +573,7 @@ fn is_ancestor_or_self_of_element(node: &SyntaxElement, ancestor: &SyntaxNode) -
 mod tests {
     use std::ops::Range;
 
-    use expect_test::expect;
+    use test_utils::expect;
 
     use crate::{
         AstNode, Text,
@@ -957,7 +957,7 @@ mod tests {
         editor.delete(attr.syntax());
         let preds = ["T", "U"].map(|name| {
             let bound = make::type_bound_text("Clone");
-            make::where_pred(either::Either::Right(make::ty(name)), [bound])
+            make::where_pred(stdx::Either::Right(make::ty(name)), [bound])
         });
         strukt.get_or_create_where_clause(&editor, preds.into_iter());
         let edit = editor.finish();

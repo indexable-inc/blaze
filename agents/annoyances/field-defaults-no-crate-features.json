@@ -1,0 +1,12 @@
+{
+ "id": "field-defaults-no-crate-features",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane DF (default field values) on rebuild-1115",
+ "where": "crates/blaze-ladder/src/front2/heads.rs field_default_allowed, front2/body.rs defaults_gate; blaze-scope graph RootAttrs; front2/spell.rs; front2/const_at.rs needs_of",
+ "what": "Gating `default_field_values` needs the crate's `#![feature(..)]` list, and the new item layer has none: RootAttrs holds only no_std, no_core and blaze::arbitrary_ints, and the one other feature read (source.rs may_write_incoherent) is a `text.contains` over the root file. So a Rust-edition crate that asks for the feature is refused anyway. Second: E0063 for a field the body does not write cannot print the field's name, because the diagnostic's names are spelled from the BODY's text only (`Unspelled(Name(..))`). Third: the constant values a lowering needs at an instance are pulled only from `Checked::const_args` rows (const_at.rs, another lane's file), so a new kind of constant read (a field default) cannot be built without editing it.",
+ "cost": "the Rust-edition gate refuses programs nightly accepts; the missing-field error names the struct but not the field; the build of `S { a: 1, .. }` stays a typed refusal",
+ "cause": "crate features were never read past the solve; the spelling table is per body; const needs are found from one column",
+ "whys": "only a handful of root attributes changed name resolution, so only those were kept; diagnostics were made for names the user wrote; const pulls grew from paths",
+ "class": "a fact of the crate or the head is only reachable through a body-scoped or path-scoped table",
+ "prevention": "wanted: RootAttrs (blaze-scope) keeps the crate's feature names, sorted; the diagnostic renderer spells a Name from the ADT's head as well as the body; const_at.rs needs_of also walks Checked::default_fields as ConstNeed::Item(key) at the struct type's arguments"
+}

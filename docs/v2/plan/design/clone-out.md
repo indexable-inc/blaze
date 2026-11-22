@@ -6,7 +6,7 @@ date: 2026-11-02
 # Lane clone-out: build directories as clones of the store
 
 The goal: a second checkout of a project costs almost no disk. Each workspace builds into
-`<root>/build/<name>-<id>` ([cargo.md](../../../cargo.md#where-a-build-writes)), which holds
+`<root>/build/<name>-<id>` ([cargo.md](../../../cargo.md)), which holds
 only what must be a real path; the bytes live once in `$BLAZE_HOME/v2/store`. For scale, kache
 measured a second Firefox worktree at about 3 GB instead of 16.7 GB by cloning blobs.
 
@@ -104,8 +104,7 @@ made only of a clone waits for the file to be made, sealed and written back firs
   hand: a second checkout, a record replayed.
 - **Patch room is not written.** The runs are `Image::file_runs`: the regions' bytes, gaps past
   a page left out, so the two 64 MiB patch regions are holes. Hello world's edit writes about
-  28 MB a path where it wrote or cloned 162 MB. The room out of the file's length altogether
-  is [patch-in-place.md](patch-in-place.md)'s layout change, still not built.
+  28 MB a path where it wrote or cloned 162 MB.
 - **Not in place, and not only the changed blocks.** Writing the path's file in place is
   refused while a program runs it (`ETXTBSY`) and changes its mapped pages under it; a private
   copy to write changed blocks into is a clone of the path's last file, which was written an
@@ -126,8 +125,8 @@ made only of a clone waits for the file to be made, sealed and written back firs
   simulation holds a patch's clone to what its path's last place wrote
   (`tests::place_made`), and the control takes the write-back out.
 - **The store's copy.** The value is put as a recipe: of the link's ranges over the file
-  before it, a few KB, or on a first link of the file's runs over the base of holes
-  ([patch-in-place.md](patch-in-place.md), "The patch room"), never the file at its length.
+  before it, a few KB, or on a first link of the file's runs over the base of holes, never
+  the file at its length.
   It is durable with the store's next commit, after the
   answer (`Settling`). No `placed/` file is made on the edit path; `Store::unplace_made` lets
   go of the one the path's last value was cloned from.

@@ -1,7 +1,7 @@
 //! Adaptive placement, for the hottest tables whose keys an attacker may pick (hir-ty's
 //! interned kinds, the watcher's names): the fixed fast hash until the table sees a probe walk
 //! no honest set of keys makes, then, once and for the rest of the table's life, SipHash-1-3
-//! under a key drawn at that moment ([`switch_key`]), every key in the table placed again by
+//! under a key the table's maker drew ([`switch_key_from`]), every key in the table placed again by
 //! it.
 //!
 //! Why not a key from the start: on these tables the fixed hash's lead is LLVM folding its
@@ -48,6 +48,11 @@
 
 use crate::SipKey;
 
+/// [`switch_key_from`]: the switch key from a key the table's maker drew.
+mod drawn;
+
+pub use drawn::switch_key_from;
+
 /// The shortest walk (full slots stepped past from a key's home, the key not found among them)
 /// that a linear-probing table of `2^log_slots` slots, at most half full, refuses as a flood.
 ///
@@ -74,12 +79,9 @@ pub const fn refused_run(log_slots: u32) -> usize {
 /// speed.
 pub const FLOODED_COMPARES: usize = 8;
 
-/// The key an adaptive table switches to: drawn by [`SipKey::random`], never shown. Under the
-/// model checker (`cfg(blaze_check)`) a fixed key instead, as intern's tables do: the checker
-/// runs a model many times and needs each run to place keys alike.
-pub fn switch_key() -> SipKey {
-    if cfg!(blaze_check) { MODEL_KEY } else { SipKey::random() }
-}
+// `switch_key`, the ambient form that drew by `SipKey::random` inside the table operation that
+// saw the flood, was deleted on 2026-11-20 (batch P4-switch's condition: no caller was left in
+// the tree); [`switch_key_from`] of a standby key the table holds from its maker is the form.
 
-/// [`switch_key`] under the model checker.
+/// [`switch_key_from`] under the model checker.
 const MODEL_KEY: SipKey = SipKey::new(0x6164_6170_7469_7630, 0x6164_6170_7469_7631);

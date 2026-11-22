@@ -11,10 +11,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use arrow_array::{Int64Array, RecordBatch};
-use arrow_ipc::reader::StreamReader;
-use arrow_schema::{DataType, Field, Schema};
-use base64::Engine as _;
+use std::alloc::Global;
+
+use blaze_columns::{Batch, Column, Field, Scalar, Type};
 use blaze_core::{
     Driver as _, Effect, Tag,
     sim::{Datagrams, Faults, Sim},
@@ -23,9 +22,8 @@ use blaze_http::{
     h3::{
         ClientConfig, Closed, Direction, Endpoint, Event, ServerConfig, SessionId, StreamRef,
         Transport, Trust,
-        driver::{self as h3_driver, Driver, Loop, Session as Connection},
+        driver::{self as h3_driver, AskError, Driver, Loop, Session as Connection},
     },
-    mailbox,
 };
 use blaze_sim::{Broke, Tape};
 use serde_json::Value;
@@ -59,13 +57,22 @@ fn hello() -> Hello {
     }
 }
 
-fn numbers(n: i64) -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
-    RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from_iter_values(0..n))]).unwrap()
+fn numbers(n: i64) -> Batch<Global> {
+    Batch::try_new(
+        blaze_own::Vec::from_array_in([Field::new("n", Type::One(Scalar::I64), false)], Global),
+        blaze_own::Vec::from_array_in([Column::values(0..n, Global)], Global),
+    )
+    .unwrap()
 }
 
-fn decode(ipc: &[u8]) -> Vec<RecordBatch> {
-    StreamReader::try_new(ipc, None).unwrap().collect::<Result<_, _>>().unwrap()
+fn decode(ipc: &[u8]) -> blaze_own::Vec<Batch<Global>, Global> {
+    blaze_arrow_ipc::read_stream(ipc, Global).unwrap().batches
+}
+
+/// `batch` as one Arrow IPC stream, appended to `out`.
+fn ipc_of(out: &mut Vec<u8>, batch: &Batch<Global>) -> Result<(), OpError> {
+    frame::ipc(out, batch.fields(), std::slice::from_ref(batch))
+        .map_err(|why| OpError::new(Kind::Encode, why.to_string()))
 }
 
 /// A source with one op, `count` (`n` rows), and a live feed of a `spans` table of two rows a
@@ -84,7 +91,10 @@ impl Source for Test {
     fn op(&self, name: &str, args: &Value, _stop: &Stop) -> Option<Result<Answer, OpError>> {
         match name {
             "count" => Some(match args.get("n").and_then(Value::as_i64) {
-                Some(n) => Ok(Answer { table: Table::of(vec![numbers(n)]), ..Answer::new("count") }
+                Some(n) => Ok(Answer {
+                    table: Table::of(blaze_own::Vec::from_array_in([numbers(n)], Global)),
+                    ..Answer::new("count")
+                }
                     .with("n", n)),
                 None => Err(OpError::new(Kind::BadArgs, "`count` takes a whole `n`")),
             }),
@@ -102,13 +112,11 @@ impl Live for TestLive {
         self.ticks += 1;
         let spans = into.table("spans", Rule::Append);
         spans.rows = 2;
-        frame::ipc(&mut spans.ipc, &numbers(2).schema(), &[numbers(2)])
-            .map_err(|why| OpError::new(Kind::Encode, why.to_string()))?;
+        ipc_of(&mut spans.ipc, &numbers(2))?;
         let open = into.table("open", Rule::Replace);
         if self.ticks == 1 {
             open.rows = 1;
-            frame::ipc(&mut open.ipc, &numbers(1).schema(), &[numbers(1)])
-                .map_err(|why| OpError::new(Kind::Encode, why.to_string()))?;
+            ipc_of(&mut open.ipc, &numbers(1))?;
         }
         Ok(())
     }
@@ -320,14 +328,14 @@ fn an_unknown_op_is_named_with_the_layers_that_have_ops() {
 
 #[test]
 fn an_answer_carries_rows_and_elapsed_and_one_aligned_ipc_stream() {
-    let answer = Answer { table: Table::of(vec![numbers(5), numbers(2)]), ..Answer::new("count") };
+    let answer = Answer { table: Table::of(blaze_own::Vec::from_array_in([numbers(5), numbers(2)], Global)), ..Answer::new("count") };
     let bytes = frame::answer_bytes(Ok(answer), 1234);
     let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
     assert_eq!((4 + len) % frame::ALIGN, 0, "the IPC starts 8-aligned");
     let header: Value = serde_json::from_slice(&bytes[4..4 + len]).unwrap();
     assert_eq!((header["op"].as_str(), header["rows"].as_u64()), (Some("count"), Some(7)));
     assert_eq!(header["elapsed_ns"], 1234);
-    let rows: usize = decode(&bytes[4 + len..]).iter().map(RecordBatch::num_rows).sum();
+    let rows: usize = decode(&bytes[4 + len..]).iter().map(Batch::num_rows).sum();
     assert_eq!(rows, 7);
 }
 
@@ -389,9 +397,13 @@ fn explorer(dev_origin: bool) -> Explorer {
 }
 
 /// A client pinning the explorer's certificate, as the page does, on a driver thread of its
-/// own; its handles' futures are polled by the runtime the test awaits them on.
+/// own; each of its handles' calls waits on this thread at most [`WITHIN`].
 fn client(explorer: &Explorer) -> Driver {
-    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(explorer.certhash()).unwrap();
+    let raw = blaze_base64::URL_SAFE_NO_PAD
+        .decode_in(explorer.certhash().as_bytes(), std::alloc::Global)
+        .unwrap()
+        .as_slice()
+        .to_vec();
     let config =
         ClientConfig { trust: Trust::Pinned(vec![raw.try_into().unwrap()]), transport: Transport::default() };
     Driver::spawn(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), None, Some(config)).unwrap().0
@@ -399,14 +411,6 @@ fn client(explorer: &Explorer) -> Driver {
 
 /// How long a real-socket test waits for any one thing: loopback answers in milliseconds.
 const WITHIN: Duration = Duration::from_secs(10);
-
-/// `future` polled on this thread to its end within [`WITHIN`], waiting for `what`.
-fn wait<F: std::future::Future>(what: &'static str, future: F) -> F::Output {
-    match mailbox::block_on(what, Some(WITHIN), future) {
-        Ok(it) => it,
-        Err(why) => panic!("{why}"),
-    }
-}
 
 fn connect(
     client: &Driver,
@@ -417,22 +421,24 @@ fn connect(
     let url = format!("https://127.0.0.1:{}{path}", explorer.port());
     let to = SocketAddr::from((Ipv4Addr::LOCALHOST, explorer.port()));
     let headers: Vec<(&str, &str)> = origin.map(|it| ("origin", it)).into_iter().collect();
-    wait("the explorer's answer to a CONNECT", client.connect(to, &url, &headers))
+    match client.connect(to, &url, &headers, WITHIN) {
+        Ok(it) => Ok(it),
+        Err(AskError::Failed(closed)) => Err(closed),
+        Err(AskError::Unanswered(why)) => panic!("the explorer's answer to a CONNECT: {why}"),
+    }
 }
 
 /// The header and the IPC of the answer to `request`.
 fn ask(connection: &Connection, request: &str) -> (Value, Vec<u8>) {
-    let bytes = wait("the explorer's answer to a request", async {
-        let (mut send, mut recv) = connection.open_bi().await.unwrap();
-        send.write_all(request.as_bytes()).await.unwrap();
-        send.finish();
-        let mut bytes = Vec::new();
-        let mut chunk = [0u8; 4096];
-        while let Some(n) = recv.read(&mut chunk).await.unwrap() {
-            bytes.extend_from_slice(&chunk[..n]);
-        }
-        bytes
-    });
+    let (mut send, mut recv) = connection.open_bi(WITHIN).unwrap();
+    send.write_all(request.as_bytes(), WITHIN).unwrap();
+    send.finish();
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    // Bounded: each read waits at most WITHIN, and the answer is a few KiB.
+    while let Some(n) = recv.read(&mut chunk, WITHIN).unwrap() {
+        bytes.extend_from_slice(&chunk[..n]);
+    }
     let (header, ipc) = answer(&bytes).unwrap();
     (header, ipc.to_vec())
 }
@@ -515,7 +521,7 @@ fn a_session_is_refused_until_hello_then_answered_and_fed() {
     assert_eq!(header["op"], "count", "{header}");
     assert_eq!(header["rows"], 3);
     assert!(header["elapsed_ns"].is_u64(), "{header}");
-    assert_eq!(decode(&ipc).iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+    assert_eq!(decode(&ipc).iter().map(Batch::num_rows).sum::<usize>(), 3);
 
     let (header, _) = ask(&connection, r#"{"op":"count"}"#);
     assert_eq!(header["error"]["kind"], "bad_args", "the source's own error: {header}");
@@ -523,20 +529,21 @@ fn a_session_is_refused_until_hello_then_answered_and_fed() {
     assert_eq!(header["error"]["kind"], "unknown_op", "{header}");
     assert_eq!(header["error"]["op"], "frobnicate", "{header}");
 
-    let mut live = wait("the explorer's live stream", connection.accept_uni()).unwrap();
-    let (header, ipc) = wait("the live stream's first frame", async {
+    let mut live = connection.accept_uni(WITHIN).unwrap();
+    let (header, ipc) = {
         let (mut bytes, mut got, mut chunk) = (Vec::new(), Vec::new(), [0u8; 4096]);
+        // Bounded: each read waits at most WITHIN, and the first frame is a few KiB.
         while got.is_empty() {
-            let n = live.read(&mut chunk).await.unwrap().unwrap();
+            let n = live.read(&mut chunk, WITHIN).unwrap().unwrap();
             bytes.extend_from_slice(&chunk[..n]);
             frames(&mut bytes, &mut got).unwrap();
         }
         got.swap_remove(0)
-    });
+    };
     let (op, table) = (header["op"].as_str(), header["table"].as_str());
     assert_eq!((op, table), (Some("live"), Some("spans")), "{header}");
     assert_eq!(header["rows"], 2, "{header}");
-    assert_eq!(decode(&ipc).iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    assert_eq!(decode(&ipc).iter().map(Batch::num_rows).sum::<usize>(), 2);
 
     let other = connect(&client, &explorer, link::PATH, Some(link::ORIGIN)).unwrap();
     let wrong = if token.starts_with('0') {
@@ -546,7 +553,7 @@ fn a_session_is_refused_until_hello_then_answered_and_fed() {
     };
     let (header, _) = ask(&other, &format!(r#"{{"op":"hello","token":"{wrong}"}}"#));
     assert_eq!(header["error"]["kind"], "bad_token", "{header}");
-    let closed = wait("bad_token to close the session", other.closed());
+    let closed = other.closed(WITHIN).unwrap();
     assert!(matches!(closed, Closed::ByPeer { code: CLOSE_BAD_TOKEN, .. }), "{closed}");
     let (header, _) = ask(&connection, r#"{"op":"count","n":1}"#);
     assert_eq!(header["op"], "count", "another session's bad token leaves this one open");
@@ -567,7 +574,7 @@ fn dropping_the_explorer_closes_its_sessions() {
     let client = client(&explorer);
     let connection = connect(&client, &explorer, link::PATH, Some(link::ORIGIN)).unwrap();
     drop(explorer);
-    let closed = wait("the stop to close the session", connection.closed());
+    let closed = connection.closed(WITHIN).unwrap();
     assert!(matches!(closed, Closed::ByPeer { code: CLOSE_STOPPED, .. }), "{closed}");
 }
 
@@ -834,7 +841,7 @@ impl Page {
                 return Err(format!("request {i} ({request}) ended {} times, finished: {}, told after its end: {}", seen.ends, seen.finished, seen.after_end));
             }
             let (header, ipc) = answer(&seen.body).map_err(|why| format!("request {i} ({request}): {why}"))?;
-            let rows = || decode(ipc).iter().map(RecordBatch::num_rows).sum::<usize>();
+            let rows = || decode(ipc).iter().map(Batch::num_rows).sum::<usize>();
             let right = match *expect {
                 Expect::Error(kind) => header["error"]["kind"] == kind && ipc.is_empty(),
                 Expect::UnknownOp(op) => header["error"]["kind"] == "unknown_op" && header["error"]["op"] == op,
@@ -877,7 +884,7 @@ impl Page {
         let mut open = Vec::new();
         let mut spans = 0u64;
         for (_, header, ipc) in &self.live_frames {
-            let rows = if ipc.is_empty() { 0 } else { decode(ipc).iter().map(RecordBatch::num_rows).sum::<usize>() };
+            let rows = if ipc.is_empty() { 0 } else { decode(ipc).iter().map(Batch::num_rows).sum::<usize>() };
             if header["op"] != "live" || header["rows"] != rows {
                 return Err(format!("a live frame {header} carries {rows} rows"));
             }

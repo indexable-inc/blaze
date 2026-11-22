@@ -1,0 +1,15 @@
+{
+ "id": "impl-index-sorted-per-ask",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane BK",
+ "where": "crates/blaze-ladder/src/front2/buckets.rs (Buckets' filed lists) and buckets/asked.rs admit_asked",
+ "what": "tempo's cold blaze check (tree fc9d853072) passed its 900 s limit after the crates behind RocksDB were checked. A 4 s sample showed the one busy worker sorting: every admit_asked that filed an impl sorted ALL of the job's filed lists (impls' crates, unread, bare, blanket, bounded, inherent any, negatives) again so binary searches could read them: a job's N questions cost N sorts of lists that grow with the job, quadratic in its questions. The sample names one of those sorts `quicksort<ItemKey> .. blaze_surface`: the instance's home crate after dedup, not the caller (it is buckets.rs sort_filed).",
+ "cost": "small; reading the v0 names by path parts found the caller",
+ "cause": "membership kept as vectors sorted for binary search, re-sorted after each filing",
+ "whys": "the lazy index files impls question by question, but its lists were written for the eager index, which files every impl once and sorts once",
+ "class": "a structure sorted for lookup that keeps growing after it is sorted: re-sorting per insert is quadratic",
+ "prevention": "done: the lookup lists are hash sets/maps (constant-time filing, nothing re-sorted); what a question reads in order is sorted per question; test tests/front2_buckets_order.rs asks one set of questions alone, forward and reversed and requires equal answers, and counts one lookup per (crate, bucket). It found a second order dependence (negative impls not narrowed by the question's home), fixed with it",
+ "annoyance": "macOS sample attributes a generic instance to whichever crate the linker kept it from, so `quicksort<ItemKey> (blaze_surface)` was buckets.rs's sort",
+ "workaround": "read the parent frame, not the instance's crate",
+ "state": "fixed"
+}

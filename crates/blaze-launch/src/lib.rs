@@ -14,6 +14,7 @@
 //! | [`record`] | one function's code or one static's value as the launcher takes it: position- and process-independent bytes with the places an address goes, by place |
 //! | [`place`] | a record made code at an address: its pool of cells, each fixup written against what its place is in this process |
 //! | [`frame`] | a placed function's unwind entry as bytes, and where its addresses are in them |
+//! | [`grants`] | `BLAZE_LAUNCH_GRANTS`: the grants `blaze run` hands a hosted program's launcher, written and read in one place |
 //! | [`image`] | what a launcher's first edit leaves in its memory, made once by the daemon against the addresses of no process: the bytes, the words to move, the launcher's tables |
 //! | [`wire`] | the patch protocol between the launcher and the daemon: one versioned schema in deterministic CBOR, written and read without an allocator of its own |
 //!
@@ -25,14 +26,23 @@
 //! simulation (`tests/sim.rs`) whose oracle states the invariants and whose controls plant a
 //! bug each.
 //!
-//! It is `no_std` on `core` and `alloc` alone: its tables are in the allocator its maker hands
-//! it ([`Launch::new`], a [`Kept`]), a message is encoded into the caller's buffer. It is not
-//! on bstd (docs/v2/plan/design/std.md) yet, and that is a decision, not an oversight: bstd
+//! It is `no_std` on `core` and blaze-own: its tables are blaze-own collections in the
+//! allocator its maker names ([`Launch::new`] takes any `A: Allocator`, in a program a
+//! `blaze_own::Alloc<'_>` its entry hands down; D170 C1), a message is encoded into the
+//! caller's buffer, every refusal is a typed enum ([`Error`], [`image::ImageError`],
+//! [`frame::FrameError`], [`place::PlaceError`], [`grants::GrantsError`],
+//! [`wire::WireError`]), its planted bugs come through blaze-own's seam
+//! (`blaze_own::planted`, [`launch::LaunchPlant`], [`observe::ObservePlant`]; `NoPlant` where it
+//! ships) and its caps are values ([`launch::Config`], which its driver chooses per program,
+//! and [`image::ImageLimits`] with its `SHIPPED`; D165; the grant text's bounds in [`grants`]
+//! are the format's, which host and program share, not caps). It is not on bstd (docs/v2/plan/design/std.md) yet: bstd
 //! uses syntax only blaze accepts, and while cargo with the pinned nightly builds and tests
-//! blaze in the dev loop (AGENTS.md, `blaze-builds-blaze`, as of 2026-11-11) a crate that
-//! must be verified now cannot depend on it. When the rule returns to blaze-only, [`Kept`]
-//! becomes `bstd::mem::Kept` (one allocator a subsystem tag) and nothing else here changes:
-//! every table already names its allocator.
+//! blaze in the dev loop (AGENTS.md, `blaze-builds-blaze`) a crate that must be verified now
+//! cannot depend on it.
+//!
+//! Left for a port with its callers (D170's seams): [`image::Image`]'s tables and the wire's
+//! output buffers are still `alloc`'s `Vec` (the global heap's for an image), as the drivers in
+//! blaze-launch-rt and blaze-cli read and fill them; [`Kept`] and [`KEPT`] stay only for them.
 
 #![cfg_attr(not(test), no_std)]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
@@ -46,10 +56,13 @@ extern crate alloc;
 
 pub mod area;
 pub mod frame;
+pub mod grants;
 pub mod image;
 pub mod launch;
+pub mod observe;
 pub mod place;
 pub mod record;
+pub mod telemetry;
 pub mod wire;
 
 #[cfg(test)]
@@ -57,13 +70,18 @@ mod tests;
 
 use core::fmt;
 
-pub use launch::{Bind, Committed, Config, Edit, Launch, Placed, Target, Write};
+pub use launch::{Bind, Committed, Config, Edit, Launch, LaunchPlant, Placed, Target, Write};
 
-/// The allocator of the core's tables, which live as long as the process: the global heap
-/// until this crate is on bstd (the crate's documentation says when), then `bstd::mem::Kept`.
+/// The global heap, under the name the drivers knew it by.
+///
+/// Deprecated (D170 C1, rule 75): in this crate only [`image::Image`]'s tables and the
+/// deprecated [`image::lay`] still allocate in it. Name the allocator instead: a `blaze_own::Alloc<'_>` the program's entry hands down, passed to
+/// [`Launch::new`], [`area::Area::new`], [`observe::Observe::new`], [`place::pool`] and
+/// [`image::lay_in`]. Kept only for its callers in blaze-launch-rt (records.rs:32, :371;
+/// run_mode.rs:1665, :1683, :1783; drive.rs:42, :245, :268, :305), until they take an allocator.
 pub type Kept = alloc::alloc::Global;
 
-/// The one [`Kept`].
+/// The one [`Kept`]. Deprecated as [`Kept`] is.
 pub const KEPT: Kept = alloc::alloc::Global;
 
 /// A function's slot: its index in the table. A slot is a path and an ABI, so a function

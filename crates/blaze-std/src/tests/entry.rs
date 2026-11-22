@@ -157,7 +157,8 @@ fn the_writer_takes_write_macros_and_keeps_the_first_error() {
     assert_eq!(written(&io), "a1 b2\n", "nothing of the late write is there");
 }
 
-/// A value whose `Display` fails is an error that says so, not a silent short line.
+/// A value whose `Display` fails on its own breaks `Display`'s contract: the write stops with a
+/// panic that says so (as `ToString` does), never a silent short line.
 #[test]
 fn a_display_that_fails_is_said() {
     struct Broken;
@@ -169,6 +170,10 @@ fn a_display_that_fails_is_said() {
     }
     let io = Io::sim(9);
     let cx = super::root(&io);
-    let refused = io.out().expect("out").line(&cx, Broken).expect_err("Display failed");
-    assert_eq!(refused.why, OutWhy::Format);
+    let out = io.out().expect("out");
+    let said = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| out.line(&cx, format_args!("{Broken}"))))
+        .expect_err("a `Display` that fails on its own stops the write");
+    let said = said.downcast_ref::<&str>().copied().or_else(|| said.downcast_ref::<String>().map(String::as_str));
+    assert_eq!(said, Some("blaze_text: a `Display` inside `format_args!` returned an error on its own"));
+    assert_eq!(written(&io), "", "nothing of the failed line was written");
 }

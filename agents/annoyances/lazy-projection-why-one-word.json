@@ -1,0 +1,14 @@
+{
+ "id": "lazy-projection-why-one-word",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane AS",
+ "where": "crates/blaze-ladder/src/front2/program/lazy/front_end.rs `normalize`, run/lay_states.rs error mapping",
+ "what": "A projection the lazy program could not normalize while laying a coroutine state was reported as the builder's bare `the associated type 0x.. of trait 0x.. was not normalized` (lay_states.rs mapped BuildError::Projection to RunError::Build, dropping the seam's `last_projection`), and the lazy program's own why said only `Check`: two asks to learn it was `Check(Malformed(BodyTypeInRecord(Coroutine(..))))` at Self = a ground coroutine.",
+ "cost": "two extra queue round trips",
+ "cause": "the why was printed in two places (eager and lazy normalize), the lazy one without Self's form and with the error cut to its first word; lay_states did not route errors through the projection mapping make_one.rs uses",
+ "whys": "copied printer drifted; each RunError::Build site maps errors on its own",
+ "class": "a refusal that drops its cause on one path (rule 19)",
+ "prevention": "done: one printer, program.rs `projection_why` (trait, Self's form, the whole error up to 300 bytes), used by both programs; lay_states.rs `build_error` names a projection's why at every site",
+ "workaround": "none needed now",
+ "state": "fixed"
+}

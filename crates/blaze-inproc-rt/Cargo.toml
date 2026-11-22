@@ -40,17 +40,26 @@ testing = []
 
 [dependencies]
 
+# The platform layer's system calls (library/blaze_inproc_rt/src/sys), until they move to
+# blaze-sys (wave-1124-sansio, W1 group a's report lists them).
 [target.'cfg(unix)'.dependencies]
+blaze-sys.workspace = true
 libc.workspace = true
 
+# Windows stays (D180, corrected: the source's `sys/windows.rs` is kept, not deleted). Its calls
+# are blaze-sys's declarations (`blaze_sys::windows`), not windows-sys.
 [target.'cfg(windows)'.dependencies]
-windows-sys.workspace = true
+blaze-sys.workspace = true
 
 [dev-dependencies]
 blaze-ids.workspace = true
+# The tests' root allocator (`blaze_own::testing::heap()`), handed to `blaze_radix::Csr::build_in`
+# by `fence/model.rs`.
+blaze-own = { workspace = true, features = ["testing"] }
 blaze-radix.workspace = true
 blaze-spin.workspace = true
-crossbeam-channel.workspace = true
+# `library/blaze_inproc_rt/src/fence/tests.rs` (the standard library's workspace, which this
+# lane may not edit) takes `parking_lot::Mutex`; it goes once that test moves to std's lock.
 parking_lot.workspace = true
 
 [lints]

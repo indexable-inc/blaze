@@ -1,0 +1,14 @@
+{
+ "id": "member-build-rs-dropped-by-listing-filter",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane MZ",
+ "where": "crates/blaze-cli/src/sweep.rs `wanted`; crates/blaze-cli/tests/build_scripts.rs",
+ "what": "A workspace member's build.rs was never seen: the sweep's listing filter handed the layout only lib.rs and main.rs of a package folder, so blaze-manifest's `RawBuild::Auto` never found build.rs and the unit graph had no build-script unit. A fetched package's layout is read from its pack listing, unfiltered, so dependencies' scripts ran. The test that would have shown it had been red on green for a day and its fixture had also gone stale (no `wasm-sha256` in the module record; every check now ends 'incomplete: NOT checked: borrows', so a test that asserts exit 0 fails).",
+ "cost": "about thirty minutes: two runs to see the real output, then the filter",
+ "cause": "two readers of a directory (the checkout's filtered sweep, the pack's unfiltered listing) with the filter's list of wanted names kept apart from the layout's list of names it reads",
+ "class": "a filter that must list what another component reads, kept by hand",
+ "prevention": "owed: the layout should export the file names it reads in a package folder (lib.rs, main.rs, build.rs) and `wanted` take that list, so the two cannot drift",
+ "annoyance": "a test red on green is invisible until a lane asks for it",
+ "workaround": "build.rs added to `wanted`; fixture writes the module's digest; tests read the '0 errors' line instead of the status",
+ "state": "fixed"
+}

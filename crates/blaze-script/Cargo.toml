@@ -14,15 +14,20 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-data.workspace = true
+blaze-toml.workspace = true
 # The user's home directory (`blaze_core::home`), the one answer to it.
 blaze-core.workspace = true
 # Both keep a JSON object's and a table's keys in the order they were written, as Python's do.
 serde_json = { workspace = true, features = ["preserve_order"] }
-toml = { workspace = true, features = ["preserve_order"] }
-# `unicode-case`: Python's `re.IGNORECASE` on a str pattern folds case by Unicode's rules
-# (`ſ` matches `s`), and a ported pattern's `(?i)` must do the same; the workspace's regex leaves
-# it out.
-regex = { workspace = true, features = ["unicode-case"] }
+# `\d` of a pattern (`regex`) is Unicode Nd.
+blaze-unicode.workspace = true
+# The pinned nightly's name (`RUSTUP_TOOLCHAIN` of a run).
+blaze-pins.workspace = true
+
+[dev-dependencies]
+# The property test of `regex` against a backtracking reference.
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

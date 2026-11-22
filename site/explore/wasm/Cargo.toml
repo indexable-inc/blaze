@@ -1,0 +1,44 @@
+[workspace]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["blaze contributors"]
+repository = "https://github.com/indexable-inc/blaze"
+rust-version = "1.101"
+
+[workspace.lints.rust]
+unexpected_cfgs = "allow"
+
+[workspace.dependencies]
+blaze-int = { path = "../../../crates/blaze-int" }
+blaze-memchr = { path = "../../../crates/blaze-memchr" }
+blaze-unicode = { path = "../../../crates/blaze-unicode" }
+blaze-lex = { path = "../../../crates/blaze-lex" }
+
+[package]
+name = "blaze-explore-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+blaze-lex.workspace = true
+
+[lints]
+workspace = true
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

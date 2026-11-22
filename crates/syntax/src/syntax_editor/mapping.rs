@@ -2,8 +2,8 @@
 //!
 //! [`SyntaxMappingBuilder`] should be used to create mappings to add to a `SyntaxEditor`
 
-use blaze_hash::HashMap;
-use itertools::Itertools;
+use blaze_hash::{FixedState, Map};
+use stdx::iter::IterExt;
 use std::alloc::Global;
 
 use crate::{SyntaxElement, SyntaxNode};
@@ -17,7 +17,7 @@ pub struct SyntaxMapping {
 
     // mappings ->  parents
     entry_parents: Vec<SyntaxNode>,
-    node_mappings: HashMap<SyntaxNode, MappingEntry, Global>,
+    node_mappings: Map<SyntaxNode, MappingEntry, FixedState, Global>,
 }
 
 impl SyntaxMapping {
@@ -222,11 +222,11 @@ impl SyntaxMappingBuilder {
     ) {
         for pairs in input.into_iter().zip_longest(output) {
             let (input, output) = match pairs {
-                itertools::EitherOrBoth::Both(l, r) => (l, r),
-                itertools::EitherOrBoth::Left(_) => {
+                stdx::iter::EitherOrBoth::Both(l, r) => (l, r),
+                stdx::iter::EitherOrBoth::Left(_) => {
                     unreachable!("mapping more input nodes than there are output nodes")
                 }
-                itertools::EitherOrBoth::Right(_) => break,
+                stdx::iter::EitherOrBoth::Right(_) => break,
             };
 
             self.map_node(input, output);

@@ -43,11 +43,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use anyhow::bail;
-use cargo_platform::Platform;
+use crate::platform::Platform;
 
 use super::types::{FeaturesSet, ResolveBehavior};
-use super::{CargoResult, HashMap, HashSet};
+use super::{CargoResult, FixedState, Map, MapOpts, Set, SetOpts};
 use crate::dependency::{DepKind, Dependency};
 use crate::interning::InternedString;
 use crate::package_id::PackageId;
@@ -78,7 +77,7 @@ pub enum CompileKind {
 pub type PackageFeaturesKey = (PackageId, FeaturesFor);
 /// Map of activated features.
 // BTreeSet: grown while resolving and read in order by every `activated_features` call.
-pub type ActivateMap = HashMap<PackageFeaturesKey, BTreeSet<InternedString>, Global>;
+pub type ActivateMap = Map<PackageFeaturesKey, BTreeSet<InternedString>, FixedState, Global>;
 
 /// Set of all activated features for all packages in the resolve graph.
 pub struct ResolvedFeatures {
@@ -232,11 +231,13 @@ impl CliFeatures {
                 // Maybe call validate_feature_name here once it is an error?
                 FeatureValue::Feature(_) => {}
                 FeatureValue::Dep { .. } => {
-                    bail!("feature `{}` is not allowed to use explicit `dep:` syntax", feature);
+                    let feature = feature.clone(); // clone: error path
+                    return Err(crate::ResolveError::CliDepSyntax { feature });
                 }
                 FeatureValue::DepFeature { dep_feature, .. } => {
                     if dep_feature.contains('/') {
-                        bail!("multiple slashes in feature `{}` is not allowed", feature);
+                        let feature = feature.clone(); // clone: error path
+                        return Err(crate::ResolveError::CliSlashes { feature });
                     }
                 }
             }
@@ -386,7 +387,7 @@ pub struct FeatureResolver<'a, T> {
     activated_dependencies: ActivateMap,
     /// Keeps track of which packages have had its dependencies processed.
     /// Used to avoid cycles, and to speed up processing.
-    processed_deps: HashSet<PackageFeaturesKey, Global>,
+    processed_deps: Set<PackageFeaturesKey, FixedState, Global>,
     /// If this is `true`, then a non-default `feature_key` needs to be tracked while
     /// traversing the graph.
     ///
@@ -404,7 +405,7 @@ pub struct FeatureResolver<'a, T> {
     /// dependency will trigger the addition of new features. The value is the
     /// set of features to activate.
     deferred_weak_dependencies:
-        HashMap<(PackageId, FeaturesFor, InternedString), HashSet<InternedString, Global>, Global>,
+        Map<(PackageId, FeaturesFor, InternedString), Set<InternedString, FixedState, Global>, FixedState, Global>,
 }
 
 impl<'a, T: PackageTargets> FeatureResolver<'a, T> {
@@ -426,14 +427,14 @@ impl<'a, T: PackageTargets> FeatureResolver<'a, T> {
             requested_targets,
             resolve,
             opts,
-            activated_features: HashMap::new_in(Global),
-            activated_dependencies: HashMap::new_in(Global),
-            processed_deps: HashSet::new_in(Global),
+            activated_features: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            activated_dependencies: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            processed_deps: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }),
             track_for_host,
-            deferred_weak_dependencies: HashMap::new_in(Global),
+            deferred_weak_dependencies: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
         };
         r.do_resolve(member_features)?;
-        tracing::debug!("features={:#?}", r.activated_features);
+        blaze_trace::debug!("features={:#?}", r.activated_features);
         Ok(ResolvedFeatures {
             activated_features: r.activated_features,
             activated_dependencies: r.activated_dependencies,
@@ -473,7 +474,7 @@ impl<'a, T: PackageTargets> FeatureResolver<'a, T> {
         fk: FeaturesFor,
         fvs: &[FeatureValue],
     ) -> CargoResult<()> {
-        tracing::trace!("activate_pkg {} {}", pkg_id.name(), fk);
+        blaze_trace::trace!("activate_pkg {} {}", pkg_id.name(), fk);
         // Add an empty entry to ensure everything is covered. This is intended for
         // finding bugs where the resolver missed something it should have visited.
         // Remove this in the future if `activated_features` uses an empty default.
@@ -519,7 +520,7 @@ impl<'a, T: PackageTargets> FeatureResolver<'a, T> {
         fk: FeaturesFor,
         fv: &FeatureValue,
     ) -> CargoResult<()> {
-        tracing::trace!("activate_fv {} {} {}", pkg_id.name(), fk, fv);
+        blaze_trace::trace!("activate_fv {} {} {}", pkg_id.name(), fk, fv);
         match fv {
             FeatureValue::Feature(f) => {
                 self.activate_rec(pkg_id, fk, *f)?;
@@ -542,7 +543,7 @@ impl<'a, T: PackageTargets> FeatureResolver<'a, T> {
         fk: FeaturesFor,
         feature_to_enable: InternedString,
     ) -> CargoResult<()> {
-        tracing::trace!("activate_rec {} {} feat={}", pkg_id.name(), fk, feature_to_enable);
+        blaze_trace::trace!("activate_rec {} {} feat={}", pkg_id.name(), fk, feature_to_enable);
         let enabled =
             self.activated_features.entry((pkg_id, fk.apply_opts(&self.opts))).or_default();
         if !enabled.insert(feature_to_enable) {
@@ -555,7 +556,7 @@ impl<'a, T: PackageTargets> FeatureResolver<'a, T> {
             // TODO: this should only happen for optional dependencies.
             // Other cases should be validated by Summary's `build_feature_map`.
             // Figure out some way to validate this assumption.
-            tracing::debug!("pkg {:?} does not define feature {}", pkg_id, feature_to_enable);
+            blaze_trace::debug!("pkg {:?} does not define feature {}", pkg_id, feature_to_enable);
             return Ok(());
         };
         for fv in fvs {
@@ -584,7 +585,7 @@ impl<'a, T: PackageTargets> FeatureResolver<'a, T> {
                 }
                 if let Some(to_enable) = &to_enable {
                     for dep_feature in to_enable {
-                        tracing::trace!(
+                        blaze_trace::trace!(
                             "activate deferred {} {} -> {}/{}",
                             pkg_id.name(),
                             fk,
@@ -627,7 +628,7 @@ impl<'a, T: PackageTargets> FeatureResolver<'a, T> {
                     {
                         // This is weak, but not yet activated. Defer in case
                         // something comes along later and enables it.
-                        tracing::trace!(
+                        blaze_trace::trace!(
                             "deferring feature {} {} -> {}/{}",
                             pkg_id.name(),
                             fk,

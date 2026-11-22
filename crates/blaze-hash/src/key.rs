@@ -11,7 +11,7 @@
 #[derive(Default, Clone, Copy)]
 pub struct KeyHasher(u64);
 
-impl std::hash::Hasher for KeyHasher {
+impl core::hash::Hasher for KeyHasher {
     #[inline]
     fn finish(&self) -> u64 {
         self.0
@@ -33,12 +33,17 @@ impl std::hash::Hasher for KeyHasher {
     fn write_usize(&mut self, _: usize) {}
 }
 
-/// The `BuildHasher` of [`KeyHasher`], for a table built elsewhere (`hashbrown`, `with_hasher`).
-pub type BuildKeyHasher = std::hash::BuildHasherDefault<KeyHasher>;
+/// The `BuildHasher` of [`KeyHasher`], for a table built elsewhere (a shared one's, `with_hasher`).
+pub type BuildKeyHasher = core::hash::BuildHasherDefault<KeyHasher>;
 
 /// A map on hashes, indexed by the hash itself, in the allocator `A`, which every use names
 /// (`ByHash::new_in(frame)`).
+///
+/// D125: goes at the sweep; write the hasher: `Map<K, V, BuildKeyHasher, A>`, made by
+/// `Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None })`.
 pub type ByHash<K, V, A> = crate::Map<K, V, BuildKeyHasher, A>;
 
 /// A set of hashes, indexed by the hash itself, in the allocator `A`, which every use names.
+///
+/// D125: goes at the sweep; write the hasher: `Set<K, BuildKeyHasher, A>`.
 pub type ByHashSet<K, A> = crate::Set<K, BuildKeyHasher, A>;

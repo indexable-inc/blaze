@@ -87,7 +87,7 @@ mod tests {
 
     #[test]
     fn order_keys_agree_with_bytes() {
-        let names = names(1, 2_000);
+        let names = names(1, if cfg!(miri) { 200 } else { 2_000 });
         for (a, _) in &names {
             for (b, _) in names.iter().step_by(7) {
                 let (ka, kb) = (order_key(a), order_key(b));
@@ -100,7 +100,9 @@ mod tests {
 
     #[test]
     fn sorts_as_a_stable_byte_sort() {
-        let sizes = [0, 1, 2, 40, radix::SMALL, radix::SMALL + 1, 3_000, 70_000];
+        // Under Miri, each side of the radix sort's small cut and one size past it.
+        let most = if cfg!(miri) { 2 * radix::SMALL + 3 } else { 70_000 };
+        let sizes = [0, 1, 2, 40, radix::SMALL, radix::SMALL + 1, 3_000.min(most), most];
         for (seed, n) in (2..).zip(sizes) {
             let mut ours = names(seed, n);
             let mut reference = ours.clone();

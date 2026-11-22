@@ -1,0 +1,32 @@
+[package]
+name = "blaze-producers"
+description = "Each producer's source digest (decision D105, docs/v2/plan/design/producer-id.md): a sans-IO walk over the workspace's manifests and files, given as values, that finds each producer's crates from `[package.metadata.blaze] producer` and digests them; the entry's build step drives it"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# No crate depends on it since 2026-11-17: every producing function is in blaze-cli, so the entry
+# keys every row by the binary's id (crates/blaze-cli/src/producers.rs). It returns as the entry's
+# build-dependency when a producer's function moves into a crate that names its row.
+[dependencies]
+# `Row`, `ContentId`, `Hasher`. By path: the workspace entry turns on serde adapters.
+blaze-ids.workspace = true
+# Vec, String, SortedMap, VecDeque in the caller's allocator.
+blaze-own.workspace = true
+# The manifests and the lock, read from text.
+blaze-toml.workspace = true
+
+[dev-dependencies]
+# `testing::heap()`: a test's root allocator (D102).
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

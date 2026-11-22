@@ -1,6 +1,6 @@
 //! Collection of assorted algorithms for syntax trees.
 
-use itertools::Itertools;
+use stdx::iter::IterExt;
 
 use crate::{
     AstNode, Direction, NodeOrToken, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, TextRange,

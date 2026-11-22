@@ -427,6 +427,92 @@ impl fmt::Display for StoreFile {
     }
 }
 
+/// Who put the value a key holds when another value meets it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Holder {
+    /// A record a committed generation names: an earlier process's, or this one's after its
+    /// commit.
+    Committed,
+    /// This process's own put, not yet committed (its batch, a lane, a segment being laid out).
+    ThisProcess,
+}
+
+/// Two values under one key (rule 21), the one shape every raise site fills (rule 19): the key,
+/// the held record and the refused one, each by kind and length, and where their bytes first
+/// differ. What a site cannot know is `None`, never a guess: `len` for a read that asked kind
+/// `tag` of a key holding another kind, `differs_at` where only the two index entries are at
+/// hand (equal lengths whose checksums differ) or the bytes are equal and the kind is not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TwoValues {
+    pub key: ContentId,
+    /// The refused value's kind: a put's, or the kind a read asked for.
+    pub tag: Tag,
+    /// The refused value's length; `None` for a read.
+    pub len: Option<u64>,
+    pub held_tag: Tag,
+    pub held_len: u64,
+    pub held: Holder,
+    /// The offset of the first differing byte (the shorter's length when one is a prefix).
+    pub differs_at: Option<u64>,
+}
+
+impl fmt::Display for TwoValues {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let held = match self.held {
+            Holder::Committed => "a committed",
+            Holder::ThisProcess => "this process's",
+        };
+        write!(f, "two values under one key {:?} (rule 21: the key misses an input of its value): {held} record of kind {} and {} bytes", self.key, self.held_tag.0, self.held_len)?;
+        match self.len {
+            Some(len) => write!(f, ", and a put of kind {} and {len} bytes", self.tag.0)?,
+            None => write!(f, ", where a read asked kind {}", self.tag.0)?,
+        }
+        match (self.differs_at, self.len) {
+            (Some(at), _) => write!(f, ", first differing at byte {at}"),
+            (None, Some(len)) if len == self.held_len && self.tag == self.held_tag => f.write_str(", their bytes not at hand (their checksums differ)"),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Why a segment's row (or a segment about to be written) is not one a commit writes: one
+/// variant a condition, each carrying its values (blaze-cas plain format.rs `Row::new`, the
+/// one constructor that checks them, in this order).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowRefused {
+    /// `len` bytes, past the segment cap `most` ([`SEGMENT_MOST`] for the store).
+    TooLong { len: u64, most: u64 },
+    /// Its index starts at `index_at`, not a multiple of `align`.
+    Unaligned { index_at: u64, align: u64 },
+    /// `count` entries from `index_at` end at `end` (`None`: past `u64`), not at its footer
+    /// before `len`.
+    NotItsEnd { index_at: u64, count: u32, end: Option<u64>, len: u64 },
+    /// Made in generation `row`, after the manifest's own `manifest`.
+    NewerGeneration { row: u64, manifest: u64 },
+    /// Touched in generation `row`, after the manifest's own `manifest`.
+    NewerTouch { row: u64, manifest: u64 },
+    /// Flags `flags` set outside the three a row holds.
+    Flags { flags: u32 },
+}
+
+impl fmt::Display for RowRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RowRefused::TooLong { len, most } => write!(f, "its length {len} is past the segment cap of {most} bytes"),
+            RowRefused::Unaligned { index_at, align } => write!(f, "its index at byte {index_at} is not aligned to {align}"),
+            RowRefused::NotItsEnd { index_at, count, end: Some(end), len } => {
+                write!(f, "its {count} index entries from byte {index_at} end at byte {end}, not at its footer in its {len} bytes")
+            }
+            RowRefused::NotItsEnd { index_at, count, end: None, len } => {
+                write!(f, "its {count} index entries from byte {index_at} end past any length, not at its footer in its {len} bytes")
+            }
+            RowRefused::NewerGeneration { row, manifest } => write!(f, "it was made in generation {row}, after the manifest's generation {manifest}"),
+            RowRefused::NewerTouch { row, manifest } => write!(f, "it was touched in generation {row}, after the manifest's generation {manifest}"),
+            RowRefused::Flags { flags } => write!(f, "its flags {flags:#x} are not ones a row holds"),
+        }
+    }
+}
+
 /// A failure of the store, by name and class: never a formatted string.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum StoreError {
@@ -449,16 +535,27 @@ pub enum StoreError {
     Format { what: &'static str, found: u32, wanted: u32 },
     /// Generation `generation`'s manifest: `what` is wrong at byte `at`.
     Manifest { generation: u64, what: &'static str, at: u64 },
-    /// Two values under one key within one segment being sealed: the key misses an input
-    /// (rule 21).
-    TwoValues { tag: Tag, key: ContentId },
+    /// Generation `generation`'s manifest names `segment` (its row at byte `at`) in a shape no
+    /// commit writes (blaze-cas plain format.rs `Row`): on encode the commit is refused and the
+    /// store stops; on open the store does not open.
+    Row { generation: u64, segment: u64, at: u64, why: RowRefused },
+    /// A segment of `namespace` refused before it is written: its shape is not one a row holds
+    /// (blaze-cas plain core.rs `copy_live`, `lay_out`).
+    Shape { namespace: Namespace, why: RowRefused },
+    /// Two values under one key (rule 21: the key misses an input), each side as the raise
+    /// site knows it (rule 19).
+    TwoValues(TwoValues),
     /// A namespace other than the one asked: a key is never answered from a namespace the
     /// caller did not ask for.
     Namespace { found: Namespace, wanted: Namespace },
     /// A fetch of `segment` returned `len` bytes where its reference names `wanted`.
     Fetched { segment: SegmentId, len: u64, wanted: u64 },
     /// A segment generation `generation` names is gone or cannot be mapped (`what`): removed
-    /// outside blaze, or lost in a power cut; its records are dropped, and said.
+    /// outside blaze, or lost in a power cut; its records are dropped, and said. Also a lazy
+    /// map asked more than the grace after the open (blaze-cas plain probe.rs, "THE GRACE"):
+    /// refused, never retried. A short command cannot reach it; a long-lived holder (the
+    /// `blaze run` parent, any helper) maps every segment once its child has started, off the
+    /// path to `main`, and re-opens the head whenever it needs a record committed after its open.
     Lost { segment: u64, generation: u64, what: &'static str },
     /// The store's driver ended `what` (a commit, a compaction slice, an open) without the
     /// outcome it owes.
@@ -487,10 +584,32 @@ pub enum StoreError {
     Changed { segment: u64, generation: u64, len: u64, named: u64 },
     /// A commit took `took_s` seconds, past the grace of `grace_s` that keeps its files.
     CommitTooSlow { took_s: u64, grace_s: u64 },
+    /// One commit's segments alone are `request_bytes`, past the store's cap of `cap_bytes`: no
+    /// reclamation could make room for it. (A store over its cap otherwise only owes
+    /// reclamation, which the next commands' slices pay; nothing fails or waits for it.)
+    OverCap { request_bytes: u64, cap_bytes: u64 },
     /// The store was asked for something while in `phase`, which takes no such ask.
     Busy { phase: &'static str },
     /// The root `key` of generation `generation` names a record no segment holds.
     RootGone { generation: u64, key: ContentId },
+    /// A commit's root names the record `key`, which this process read from the segment
+    /// `segment`; a cleanup slice of another process replaced that segment since, judging the
+    /// record dead in its own view. The commit carries such records forward into a segment of
+    /// its own and flips again; this is the stop after blaze-cas `CARRY_ROUNDS` rounds (or
+    /// when the record cannot be carried: not mapped here, or a pointer), never a flip naming
+    /// a record that may be gone.
+    SweptUnder { key: ContentId, segment: u64 },
+    /// The indexed root `root` of generation `generation` names the index `index`, which no
+    /// segment holds (blaze-cas `Plain::root_through`).
+    IndexGone { generation: u64, root: ContentId, index: ContentId },
+    /// The indexed root `root` names `key`, whose record is filed under `tag`, not as an index.
+    NotAnIndex { root: ContentId, key: ContentId, tag: Tag },
+    /// An index of `keys` keys (or an indexed root of `keys` indexes), past the most one holds.
+    IndexOver { keys: u64, most: u64 },
+    /// The root `root` was asked to name `key`, which no one put: not this command's put, not
+    /// held, not committed in a namespace read (blaze-cas `Driven::root_names_held`, D200's
+    /// set-time guard). A writer's bug, refused when the root is set, on every boot.
+    RootNamesUnheld { root: String, key: ContentId },
     /// A bucket object (`object`: its name in the bucket) was refused or failed: `what`, with
     /// the bucket's status (0 when it gave none).
     RemoteObject { what: &'static str, object: String, status: u32 },
@@ -520,9 +639,13 @@ impl fmt::Display for StoreError {
             StoreError::Manifest { generation, what, at } => {
                 write!(f, "generation {generation}'s manifest: {what} at byte {at}")
             }
-            StoreError::TwoValues { tag, key } => {
-                write!(f, "two values of kind {} under key {key:?}: the key misses an input", tag.0)
+            StoreError::Row { generation, segment, at, why } => {
+                write!(f, "generation {generation}'s manifest: segment {segment:016x} (its row at byte {at}) is not one a commit writes: {why}")
             }
+            StoreError::Shape { namespace, why } => {
+                write!(f, "a segment of namespace {:016x} is refused before it is written: {why}", namespace.0)
+            }
+            StoreError::TwoValues(two) => write!(f, "{two}"),
             StoreError::Namespace { found, wanted } => write!(
                 f,
                 "namespace {:016x} where {:016x} was asked: a key is never answered from a namespace the caller did not ask for",
@@ -557,9 +680,29 @@ impl fmt::Display for StoreError {
             StoreError::CommitTooSlow { took_s, grace_s } => {
                 write!(f, "a commit took {took_s} s, past the {grace_s} s that keep its files")
             }
+            StoreError::OverCap { request_bytes, cap_bytes } => write!(
+                f,
+                "one commit of {request_bytes} bytes is larger than the store's cap of {cap_bytes} bytes (plain store settings `cap_mib`): raise the cap"
+            ),
             StoreError::Busy { phase } => write!(f, "the store is {phase}, and takes no such ask then"),
             StoreError::RootGone { generation, key } => {
                 write!(f, "the root {key:?} of generation {generation} names a record no segment holds")
+            }
+            StoreError::SweptUnder { key, segment } => write!(
+                f,
+                "a root of this commit names the record {key:?}, read from segment {segment:016x}, which another process's cleanup slice replaced since, after the commit carried such records forward as many rounds as it may (or this one could not be carried): the commit is not flipped, and the next command makes its records again"
+            ),
+            StoreError::IndexGone { generation, root, index } => {
+                write!(f, "the indexed root {root:?} of generation {generation} names the index {index:?}, which no segment holds")
+            }
+            StoreError::NotAnIndex { root, key, tag } => {
+                write!(f, "the indexed root {root:?} names {key:?}, a record of kind {}, not an index", tag.0)
+            }
+            StoreError::IndexOver { keys, most } => {
+                write!(f, "an index of {keys} keys is past the most one holds, {most}: refused, never cut")
+            }
+            StoreError::RootNamesUnheld { root, key } => {
+                write!(f, "the root `{root}` names {key:?}, which was never put (not this command's put, not held, not committed): a writer's bug, refused when the root is set")
             }
             StoreError::RemoteObject { what, object, status } => {
                 write!(f, "the remote cache: {what} for `{object}` ({status})")

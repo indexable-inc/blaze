@@ -127,11 +127,14 @@ impl CodeHeap {
     pub(crate) fn take(&mut self, len: u64, align: u64) -> Option<CodeRange> {
         let len = len.checked_next_multiple_of(GRAIN)?;
         let align = align.max(GRAIN);
-        let need = len.checked_add(align - GRAIN)?;
-        let index = self.find(need)?;
+        let index = match len.checked_add(align - GRAIN).and_then(|need| self.find(need)) {
+            Some(index) => index,
+            None if align > GRAIN => self.find_aligned(len, align)?,
+            None => return None,
+        };
         let block = self.blocks[index as usize];
+        let offset = block.offset.checked_next_multiple_of(align)?;
         self.unlink(index);
-        let offset = block.offset.next_multiple_of(align);
         let head = offset - block.offset;
         let tail = block.len - head - len;
         if head != 0 {
@@ -198,6 +201,41 @@ impl CodeHeap {
                 return Some(at);
             }
             at = self.blocks[at as usize].next;
+        }
+        None
+    }
+
+    /// Fallback when `len + align - GRAIN` did not fit: scans free blocks of at least `len`
+    /// bytes for one whose alignment padding still leaves `len` bytes inside the block,
+    /// preventing spurious OOMs under fragmentation when an already-aligned block exists.
+    fn find_aligned(&self, len: u64, align: u64) -> Option<u32> {
+        let (start_first, start_second) = class(len);
+        if start_first >= FIRST {
+            return None;
+        }
+        let mut firsts = self.first & (u64::MAX << start_first);
+        while firsts != 0 {
+            let first = firsts.trailing_zeros() as usize;
+            firsts &= firsts - 1;
+            let mut seconds = u32::from(self.second[first]);
+            if first == start_first {
+                seconds &= u32::MAX << start_second;
+            }
+            while seconds != 0 {
+                let second = seconds.trailing_zeros() as usize;
+                seconds &= seconds - 1;
+                let mut at = self.heads[first * SECOND + second];
+                while at != NONE {
+                    let block = self.blocks[at as usize];
+                    if block.len >= len
+                        && let Some(offset) = block.offset.checked_next_multiple_of(align)
+                        && offset - block.offset <= block.len - len
+                    {
+                        return Some(at);
+                    }
+                    at = block.next;
+                }
+            }
         }
         None
     }
@@ -319,10 +357,13 @@ mod tests {
                         model.take(range.offset, range.len);
                         taken.push(range);
                     } else {
-                        let need = want.next_multiple_of(GRAIN) + align.max(GRAIN) - GRAIN;
+                        let rounded = want.next_multiple_of(GRAIN);
                         assert!(
-                            model.free.iter().all(|it| it.1 < need),
-                            "a range of {need} was free and not found"
+                            model.free.iter().all(|&(at, n)| {
+                                at.checked_next_multiple_of(align)
+                                    .is_none_or(|off| n < rounded || off - at > n - rounded)
+                            }),
+                            "a range fitting {rounded} bytes aligned to {align} was free and not found"
                         );
                     }
                 } else {
@@ -360,5 +401,52 @@ mod tests {
                 "class ({first}, {second}) holds ranges shorter than {len}"
             );
         }
+    }
+
+    #[test]
+    fn exact_aligned_fallback_avoids_spurious_oom_under_fragmentation() {
+        // 4 pages of 4096 bytes starting on a 4096-byte boundary.
+        let start = 0x1_0000;
+        let page = 4096u64;
+        let mut heap = CodeHeap::new(start, 4 * page);
+        // Carve into four 4096-byte allocations, then free only the two non-adjacent pages so
+        // `largest() == 4096`, strictly less than `len + align - GRAIN = 8176`.
+        let a = heap.take(page, GRAIN).unwrap();
+        let b = heap.take(page, GRAIN).unwrap();
+        let c = heap.take(page, GRAIN).unwrap();
+        let d = heap.take(page, GRAIN).unwrap();
+        assert_eq!(heap.free(), 0);
+        heap.give(a);
+        heap.give(c);
+        assert_eq!(heap.largest(), page);
+        // Both freed blocks are already 4096-aligned: exact-aligned fallback must find them.
+        let r1 = heap.take(page, page).expect("exact-aligned free page must not OOM");
+        assert!(r1.offset.is_multiple_of(page) && r1.len == page);
+        let r2 = heap.take(page, page).expect("second exact-aligned free page must not OOM");
+        assert!(r2.offset.is_multiple_of(page) && r2.len == page);
+        assert_ne!(r1.offset, r2.offset);
+        assert_eq!(heap.free(), 0);
+
+        // Also test a partially-aligned block (6144 bytes starting at +2048): smaller than
+        // 8176, yet alignment pad (2048) + len (4096) == 6144 fits cleanly!
+        heap.give(b);
+        heap.give(d);
+        heap.give(r1);
+        heap.give(r2);
+        assert_eq!(heap.free(), 4 * page);
+        let pin_head = heap.take(2048, GRAIN).unwrap();
+        let mid = heap.take(6144, GRAIN).unwrap();
+        let pin_tail = heap.take(4 * page - 2048 - 6144, GRAIN).unwrap();
+        assert_eq!(heap.free(), 0);
+        heap.give(mid);
+        assert_eq!(heap.largest(), 6144);
+        let aligned = heap.take(page, page).expect("partially aligned 6144B block fits 4096B @ 4096");
+        assert_eq!(aligned.offset, start + page);
+        assert_eq!(aligned.len, page);
+        assert_eq!(heap.free(), 2048);
+        heap.give(pin_head);
+        heap.give(aligned);
+        heap.give(pin_tail);
+        assert_eq!(heap.largest(), 4 * page);
     }
 }

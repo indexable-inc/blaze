@@ -23,13 +23,14 @@
 //! prints a secret, and an error about one names the setting, never its value.
 
 use std::{
+    alloc::Global,
     ffi::OsString,
     fmt,
     path::{Path, PathBuf},
 };
 
 use blaze_cas::plain::Namespace;
-use serde::Deserialize;
+use blaze_data::{Cursor, FromValue, ShapeError};
 
 use crate::{
     name,
@@ -68,24 +69,37 @@ impl fmt::Display for Secret {
     }
 }
 
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
+/// `remote.json`: every field optional, `enabled` true when absent, unknown fields refused.
+#[derive(Default)]
 struct FileForm {
-    #[serde(default = "yes")]
     enabled: bool,
     bucket: Option<BucketForm>,
-    #[serde(default)]
     namespaces: Vec<NamespaceForm>,
     root: Option<String>,
     sample_per_1024: Option<u32>,
 }
 
-fn yes() -> bool {
-    true
+impl FromValue<Global> for FileForm {
+    fn from_value(c: &Cursor<'_, '_, Global>) -> Result<FileForm, ShapeError<Global>> {
+        c.deny_unknown(&["enabled", "bucket", "namespaces", "root", "sample_per_1024"])?;
+        let mut namespaces = Vec::new();
+        if let Some(list) = c.field_opt("namespaces")? {
+            list.each(|it| {
+                namespaces.push(it.get::<NamespaceForm>()?);
+                Ok::<(), ShapeError<Global>>(())
+            })?;
+        }
+        Ok(FileForm {
+            enabled: c.opt("enabled")?.unwrap_or(true),
+            bucket: c.opt("bucket")?,
+            namespaces,
+            root: opt_text(c, "root")?,
+            sample_per_1024: c.opt("sample_per_1024")?,
+        })
+    }
 }
 
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
+#[derive(Default)]
 struct BucketForm {
     endpoint: Option<String>,
     name: Option<String>,
@@ -94,20 +108,89 @@ struct BucketForm {
     transport: Option<String>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+impl FromValue<Global> for BucketForm {
+    fn from_value(c: &Cursor<'_, '_, Global>) -> Result<BucketForm, ShapeError<Global>> {
+        c.deny_unknown(&["endpoint", "name", "public_url", "cas", "transport"])?;
+        Ok(BucketForm {
+            endpoint: opt_text(c, "endpoint")?,
+            name: opt_text(c, "name")?,
+            public_url: opt_text(c, "public_url")?,
+            cas: c.opt("cas")?,
+            transport: opt_text(c, "transport")?,
+        })
+    }
+}
+
 struct NamespaceForm {
     name: String,
     anchors: Vec<String>,
 }
 
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
+impl FromValue<Global> for NamespaceForm {
+    fn from_value(c: &Cursor<'_, '_, Global>) -> Result<NamespaceForm, ShapeError<Global>> {
+        c.deny_unknown(&["name", "anchors"])?;
+        Ok(NamespaceForm { name: c.field("name")?.text()?.to_owned(), anchors: texts(&c.field("anchors")?)? })
+    }
+}
+
+#[derive(Default)]
 struct CredentialsForm {
     access_key_id: Option<String>,
     secret_access_key: Option<String>,
     signing_seed: Option<String>,
     key_list: Option<PathBuf>,
+}
+
+impl FromValue<Global> for CredentialsForm {
+    fn from_value(c: &Cursor<'_, '_, Global>) -> Result<CredentialsForm, ShapeError<Global>> {
+        c.deny_unknown(&["access_key_id", "secret_access_key", "signing_seed", "key_list"])?;
+        Ok(CredentialsForm {
+            access_key_id: opt_text(c, "access_key_id")?,
+            secret_access_key: opt_text(c, "secret_access_key")?,
+            signing_seed: opt_text(c, "signing_seed")?,
+            key_list: opt_text(c, "key_list")?.map(PathBuf::from),
+        })
+    }
+}
+
+/// The field `key` as text, if it is there and not null.
+pub(crate) fn opt_text(c: &Cursor<'_, '_, Global>, key: &str) -> Result<Option<String>, ShapeError<Global>> {
+    match c.field_opt(key)? {
+        Some(field) if !field.is_null() => Ok(Some(field.text()?.to_owned())),
+        _ => Ok(None),
+    }
+}
+
+/// A list of text.
+pub(crate) fn texts(c: &Cursor<'_, '_, Global>) -> Result<Vec<String>, ShapeError<Global>> {
+    let mut out = Vec::with_capacity(c.list()?.len());
+    c.each(|it| {
+        out.push(it.text()?.to_owned());
+        Ok::<(), ShapeError<Global>>(())
+    })?;
+    Ok(out)
+}
+
+/// Why JSON `bytes` are no `T`: where in the text, or which field; never a value, which may be
+/// a secret.
+pub(crate) enum Unread {
+    Json(blaze_json::Error),
+    Shape(ShapeError<Global>),
+}
+
+impl fmt::Display for Unread {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Unread::Json(e) => e.fmt(f),
+            Unread::Shape(e) => e.fmt(f),
+        }
+    }
+}
+
+/// `bytes` read as JSON, then as a `T`.
+pub(crate) fn read_json<T: FromValue<Global>>(bytes: &[u8]) -> Result<T, Unread> {
+    let value = blaze_json::read_in(bytes, blaze_json::Limits::DEFAULT, Global).map_err(Unread::Json)?;
+    Cursor::root(&value, Global).get().map_err(Unread::Shape)
 }
 
 /// The bucket.
@@ -232,7 +315,7 @@ impl Settings {
         let form: FileForm = match std::fs::read(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => FileForm { enabled: true, ..FileForm::default() },
             Err(e) => return Err(format!("{}: {e}", path.display())),
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?,
+            Ok(bytes) => read_json(&bytes).map_err(|e| format!("{}: {e}", path.display()))?,
         };
         let cpath = root.join(CREDENTIALS);
         let creds: CredentialsForm = match std::fs::read(&cpath) {
@@ -245,7 +328,14 @@ impl Settings {
                     return Err(format!("{}: its mode is {:o}: a file of credentials is read only when no one but its owner can read it (chmod 600)", cpath.display(), mode & 0o777));
                 }
                 // The error never quotes the file: it holds secrets.
-                serde_json::from_slice(&bytes).map_err(|e| format!("{}: not the credentials form (line {}, column {})", cpath.display(), e.line(), e.column()))?
+                read_json(&bytes).map_err(|e| match e {
+                    Unread::Json(e) => {
+                        let (line, column) = e.line_col(&bytes);
+                        format!("{}: not the credentials form (line {line}, column {column})", cpath.display())
+                    }
+                    // A path of field names, never a value.
+                    Unread::Shape(e) => format!("{}: not the credentials form ({e})", cpath.display()),
+                })?
             }
         };
         let mut from = Vec::new();

@@ -11,7 +11,7 @@
 //! Cost: insert, remove and lookup are O(1) with no allocation once the slab has grown to its
 //! working set: a lookup is a bounds check, one compare of the generation and a load.
 
-use std::{
+use core::{
     cmp::Ordering,
     fmt,
     hash::{Hash, Hasher},

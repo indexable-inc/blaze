@@ -1,0 +1,15 @@
+{
+ "id": "checker-nine-restart-layers",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), joiner lane, D161 checker half",
+ "where": "crates/blaze-typeck/src/infer/mod.rs (MAX_FILLS), crates/blaze-ladder/src/front2/check.rs (MOST_ROUNDS, consts rounds), world_items.rs (`again`, MOST_IMPORTS_A_QUESTION), heads.rs (`ensure_seeded` step restart); new crate crates/blaze-ask",
+ "what": "A fact a body lacks is met in nine places, each answering Missing and restarting its own unit (a solver goal, a check round, a question, a head step) under its own cap; none shares a claim, so two bodies make one head each and a restarted round redoes all inference. The claim table that would make each fact once (blaze-core claim_table.rs) was built and used by none of them.",
+ "cost": "typeck.md measures 74% of solver calls as a restarted goal; each layer's cap is its own hang-or-refuse rule",
+ "cause": "each layer was fixed where its need surfaced (a retry at that grain), the second fix to the mechanism never stopped it (rule 66)",
+ "whys": "the world answers Missing with no way to wait; head lowering is not resumable (a step re-runs from the top); the solver re-enters head making on the caller's stack",
+ "class": "a restart where a wait belongs: redone work, per-layer caps, facts made twice across tasks",
+ "prevention": "built here: blaze-ask (Need, GateSet/Settled, Asker over the claim table with an explicit bounded work stack, AskError::Cycle naming the loop, Census) with its simulation and four controls; the census is in front2 tables/cost.rs `Spent::census`. Each loop is to move onto `Asker::ask` behind a rule-78 seam; none is switched yet",
+ "annoyance": "write-only lane: the switch of a loop cannot be proven equal without a build, so it was left designed, not written",
+ "workaround": "contract and simulation first, so the coordinator can run them before any loop moves",
+ "state": "open"
+}

@@ -1,0 +1,12 @@
+status 0
+stdout
+Pending
+dropping unfinished
+drop in-future
+Pending
+drop in-future
+Ready(5)
+never polled: dropped quietly
+drop captured
+one two three
+end

@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use blaze_hash::{HashMap, HashSet};
+use blaze_hash::{FixedState, Map, MapOpts, Set, SetOpts};
 use blaze_sim::{Config, Tape};
 use std::alloc::Global;
 
@@ -77,18 +77,18 @@ struct Sim {
     jobs: u32,
     rank: Vec<u64>,
     /// A parallel map's job and its counter.
-    maps: HashMap<u32, CounterId, Global>, // alloc: a test's model
+    maps: Map<u32, CounterId, FixedState, Global>, // alloc: a test's model
     /// Each counter's jobs.
-    counted: HashMap<u32, Vec<u32>, Global>, // alloc: a test's model
-    waits: HashMap<u32, ModelWait, Global>, // alloc: a test's model
+    counted: Map<u32, Vec<u32>, FixedState, Global>, // alloc: a test's model
+    waits: Map<u32, ModelWait, FixedState, Global>, // alloc: a test's model
     /// Key number to claimer (`None` for the driver's).
-    flights: HashMap<u32, Option<u32>, Global>, // alloc: a test's model
+    flights: Map<u32, Option<u32>, FixedState, Global>, // alloc: a test's model
     next_key: u32,
     woken: Vec<u32>,
     /// Cores whose move flag is set.
-    flags: HashSet<u32, Global>, // alloc: a test's model
-    ran: HashSet<u32, Global>,  // alloc: a test's model
-    done: HashSet<u32, Global>, // alloc: a test's model
+    flags: Set<u32, FixedState, Global>, // alloc: a test's model
+    ran: Set<u32, FixedState, Global>,  // alloc: a test's model
+    done: Set<u32, FixedState, Global>, // alloc: a test's model
 }
 
 const MAX_SIM_JOBS: u32 = 120;
@@ -100,15 +100,15 @@ impl Sim {
             mode,
             jobs: 0,
             rank: Vec::new(),
-            maps: HashMap::new_in(Global),    // alloc: a test's model
-            counted: HashMap::new_in(Global), // alloc: a test's model
-            waits: HashMap::new_in(Global),   // alloc: a test's model
-            flights: HashMap::new_in(Global), // alloc: a test's model
+            maps: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),    // alloc: a test's model
+            counted: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: a test's model
+            waits: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),   // alloc: a test's model
+            flights: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: a test's model
             next_key: 0,
             woken: Vec::new(),
-            flags: HashSet::new_in(Global), // alloc: a test's model
-            ran: HashSet::new_in(Global),   // alloc: a test's model
-            done: HashSet::new_in(Global),  // alloc: a test's model
+            flags: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: a test's model
+            ran: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }),   // alloc: a test's model
+            done: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }),  // alloc: a test's model
         }
     }
 
@@ -240,7 +240,7 @@ impl Sim {
 
     /// Whether the model's waits reach `job` from `wait`.
     fn reaches(&self, job: u32, wait: ModelWait) -> bool {
-        let mut seen = HashSet::new_in(Global); // alloc: a test's model
+        let mut seen = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }); // alloc: a test's model
         let mut todo: VecDeque<u32> = self.resolve(wait).into();
         while let Some(next) = todo.pop_front() {
             if next == job {

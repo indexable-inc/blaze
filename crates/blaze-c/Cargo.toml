@@ -1,0 +1,40 @@
+[package]
+name = "blaze-c"
+description = "C in blaze, step 1 of docs/v2/plan/design/c.md (D174): the declaration model of a C header in columns, its record (equal bytes from two front ends that agree), the import's key and read list, the `CFrontEnd` seam driven as a machine that asks for file texts by effect, the rendering to Rust items, the grammar of `blaze::c::import!`, and the differential compare of two records; sans-IO, `no_std`, no `alloc`, no toolchain"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[features]
+# `ModelFrontEnd`, the front end whose declarations and reads are given as data: for this crate's
+# tests and for the tests of the expansion side (step 3), never for a shipped import.
+model-front-end = []
+
+# Base crates only (D166).
+[dependencies]
+# `Vec`, `String`, `Alloc`: every column, every rendered text, in the allocator the caller names.
+blaze-own.workspace = true
+# `ContentId`, `Hasher`: header digests, path digests, the request key and the import key.
+blaze-ids.workspace = true
+# `Map` on `FixedState`: a type's canonical number by its content, while the record is written.
+blaze-hash.workspace = true
+# `record!`, `Writer`, `WriterOpts`, `Own`, `Placed`, `Slice`, `open_as`: the declaration record
+# and the read-list record, written once and read in place.
+blaze-format-core.workspace = true
+
+[dev-dependencies]
+# Property tests and typed planted-bug controls (D165).
+blaze-sim.workspace = true
+# `testing::heap()`: a test's root allocator (D170 C1: no `Global` in tests either).
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

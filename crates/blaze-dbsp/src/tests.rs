@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use blaze_sim::{Config, Tape};
-use smallvec::smallvec;
 
 use crate::{
     Arrangement, Closure, Pos, ReadIndex, SeqDiff, SliceHasher, Weight, Worklist, ZSet, closure,
@@ -25,10 +24,10 @@ fn positions_sort_in_text_order() {
 }
 
 #[test]
-fn a_child_within_six_steps_is_inline() {
-    let deep = Pos(smallvec![1, 2, 3, 4, 5]);
+fn a_child_is_one_allocation() {
+    let deep = Pos(vec![1, 2, 3, 4, 5]);
     let (_, used) = blaze_alloc_count::measure(|| deep.child(6));
-    assert_eq!(used.allocations, 0);
+    assert_eq!(used.allocations, 1);
 }
 
 #[test]

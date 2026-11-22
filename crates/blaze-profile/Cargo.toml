@@ -14,38 +14,35 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-arrow-array.workspace = true
-arrow-buffer.workspace = true
-arrow-ipc.workspace = true
-arrow-schema.workspace = true
-base64.workspace = true
+blaze-arrow-ipc.workspace = true
+blaze-columns.workspace = true
 blaze-core.workspace = true
 blaze-graph.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true
+blaze-kit.workspace = true
 blaze-mem.workspace = true
+blaze-own.workspace = true
+blaze-parquet.workspace = true
 blaze-report.workspace = true
-blaze-serde.workspace = true
-bytes.workspace = true
 blaze-v2-proof.workspace = true
-crossbeam-channel.workspace = true
-crossbeam-queue.workspace = true
+blaze-queue.workspace = true
 ix-prof.workspace = true
-parquet.workspace = true
 serde.workspace = true
 serde_derive.workspace = true
 serde_json.workspace = true
 stdx.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
+blaze-trace.workspace = true
 
 [target.'cfg(unix)'.dependencies]
+blaze-sys.workspace = true
 libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys.workspace = true
+blaze-sys.workspace = true
 
 [dev-dependencies]
+blaze-own = { workspace = true, features = ["testing"] }
 blaze-sim.workspace = true
 
 [lints]

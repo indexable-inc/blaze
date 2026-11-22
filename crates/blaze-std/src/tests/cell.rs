@@ -1,7 +1,6 @@
 //! Token cells: one token reads and writes every cell of its kind, and the token behind one
 //! `Lock` guards them all across threads. That two live `get_mut` through one token do not
-//! compile is the `compile_fail` fixture in `cell.rs`'s docs (unrun: bstd has
-//! `doctest = false`).
+//! compile is `refusals/token_two_borrows.rs`, compiled by `tests/refusals.rs`.
 
 use super::{root, world};
 use crate::{
@@ -37,10 +36,8 @@ fn a_token_behind_one_lock_guards_every_cell_across_threads() {
         std::thread::scope(|threads| {
             for _ in 0..THREADS {
                 threads.spawn(|| {
-                    // A context is its thread's own (`Cx` is not `Send`), and so is a world:
-                    // an `Io` is not `Sync` where the native driver is bound to its thread
-                    // (Linux: `blaze_core::Native` is the single-issuer ring). Each thread
-                    // waits for the lock under the root of a world of its own.
+                    // A context is its thread's own (`Cx` is not `Send`). Each thread waits
+                    // for the lock under the root of a world of its own.
                     let io = world(29, Plant::None);
                     let cx = root(&io);
                     for _ in 0..EACH {

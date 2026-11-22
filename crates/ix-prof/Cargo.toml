@@ -19,55 +19,59 @@ doctest = false
 default = ["sampler", "layer"]
 # The CPU sampler thread (perf_event_open on Linux, thread_suspend on arm64 macOS).
 sampler = []
-# `ix_prof::layer()`, a `tracing_subscriber::Layer`.
-layer = ["dep:tracing-subscriber"]
+# `ix_prof::layer()`, a `blaze_trace::Sink`.
+layer = []
 # `/debug/pprof/*` and `/debug/pprof/live` on a loopback port. Its accept loop waits through
 # blaze-core's one deadline wait (rule deadline-waits).
 http = []
 # `ix_prof::explore`: the WebTransport server https://ix.dev/explore connects to on 127.0.0.1, for
 # any program with an `explore::Source` (the blaze daemon's is blaze-explore's).
 explore = [
-  "dep:base64",
+  "dep:blaze-base64",
   "dep:blaze-http",
+  "blaze-http/h3",
   "dep:blaze-sha256",
-  "dep:crossbeam-channel",
   "dep:rcgen",
 ]
 
 [dependencies]
+blaze-own.workspace = true
+# pprof bodies, gunzipped (`pprof`).
+blaze-deflate.workspace = true
 addr2line.workspace = true
-arrow-array.workspace = true
-arrow-ipc.workspace = true
-arrow-schema.workspace = true
+# The tables' columns and their Arrow IPC files and streams, in place of arrow-*.
+blaze-arrow-ipc.workspace = true
+blaze-columns.workspace = true
 blake3.workspace = true
 # Named locks (blaze_core::lock) and the one deadline wait.
 blaze-core.workspace = true
 # The dev runtime's stubs and jump table: a function pointer of a blaze dev run is its slot's
 # stub, which only the jump table ties to its function (symbols.rs).
 blaze-inproc-rt.workspace = true
-crossbeam-queue.workspace = true
-flate2 = { workspace = true, features = ["rust_backend"] }
+blaze-queue.workspace = true
 # `endian-reader`: `EndianArcSlice`, the reader the symbolizer keeps DWARF in.
 gimli = { workspace = true, features = ["endian-reader"] }
 object.workspace = true
-regex.workspace = true
+# The patterns of `peek` and `list` (`blaze_script::regex`).
+blaze-script.workspace = true
 rustc-demangle.workspace = true
 # The explorer's typed headers and what its session reads of a request, serialized and read
 # field by field: no JSON map is made in the session core (`explore::session`).
 serde.workspace = true
 serde_json.workspace = true
-tracing.workspace = true
-tracing-subscriber = { workspace = true, optional = true }
+blaze-trace.workspace = true
 # The explorer (feature `explore`): the certificate's hash in the link (base64url, SHA-256), the
-# certificate (rcgen), the request's stop (crossbeam-channel), and the WebTransport server:
-# blaze-http's sans-IO HTTP/3 core and its driver loop, run with the explorer's own sans-IO
-# machine (`explore::serving`) on one blaze-core driver; the jobs' results come back on a
-# crossbeam-queue. No async runtime.
-base64 = { workspace = true, optional = true }
+# certificate (rcgen), and the WebTransport server: blaze-http's sans-IO HTTP/3 core and its
+# driver loop, run with the explorer's own sans-IO machine (`explore::serving`) on one
+# blaze-core driver; the request's stop is a `blaze_core::chan`, and the jobs' results come
+# back on a `blaze_queue::SegQueue`. No async runtime.
+blaze-base64 = { workspace = true, optional = true }
 blaze-http = { workspace = true, optional = true }
 blaze-sha256 = { workspace = true, optional = true }
-crossbeam-channel = { workspace = true, optional = true }
 rcgen = { workspace = true, optional = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+blaze-sys.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

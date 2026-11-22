@@ -1,0 +1,26 @@
+[package]
+name = "blaze-blake3"
+description = "BLAKE3, written here: every mode blaze uses and the extended output, bit for bit official BLAKE3's, whole chunks side by side in SIMD lanes, and the CPU feature detection the bottom of the tree dispatches on; `no_std`, no allocation, its one dependency blaze-int (which depends on nothing)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# Integer conversions that say what they do: the counter's words are truncated on purpose.
+blaze-int.workspace = true
+
+[dev-dependencies]
+# The reference the property test holds this crate to, test-only: the normal graph has none.
+blake3.workspace = true
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

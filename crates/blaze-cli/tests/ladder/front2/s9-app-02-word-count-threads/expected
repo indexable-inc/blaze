@@ -1,0 +1,8 @@
+status 0
+stdout
+[(0, 4), (1, 5), (2, 3), (3, 3)]
+jobs 4
+quick 3
+the 3
+dog 2
+9 distinct, 15 words

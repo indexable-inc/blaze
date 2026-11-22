@@ -1,0 +1,28 @@
+[package]
+name = "blaze-code"
+description = "Code records, segments and the program image (docs/v2/plan/design/run.md, \"End state\"): one function instance's position-independent code with its targets by symbol, the segment that places records together to be mapped read-only and executable in place, and the image that binds every segment's import words at fixed addresses and patches only the words naming what an edit moved"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `Vec`, `BTreeMap` and `Alloc`: every table, in the allocator the caller names (no `alloc`).
+blaze-own.workspace = true
+# The domain-separated BLAKE3 `Hasher`: an outside name's symbol, a record's fold digest. By
+# path: the workspace entry turns on its `serde` adapter.
+blaze-ids.workspace = true
+
+[dev-dependencies]
+# `Alloc::global()`, the handle the tests hand every function.
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

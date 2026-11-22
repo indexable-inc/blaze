@@ -283,7 +283,7 @@ fn the_wheels_fire_alike(tape: &Tape) {
 fn a_wheel_in_its_steady_state_allocates_nothing() {
     let mut wheel: Wheel<u32> = Wheel::new();
     let mut fired = Vec::with_capacity(8);
-    let mut round = |wheel: &mut Wheel<u32>, fired: &mut Vec<u32>, now: u64| {
+    let round = |wheel: &mut Wheel<u32>, fired: &mut Vec<u32>, now: u64| {
         let handles: [Handle; 8] =
             std::array::from_fn(|k| wheel.insert(now + 1 + 1_000 * k as u64, k as u32));
         for handle in &handles[..4] {

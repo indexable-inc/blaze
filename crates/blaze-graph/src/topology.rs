@@ -20,7 +20,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_radix as radix;
 use std::alloc::Global;
 
@@ -75,7 +75,7 @@ impl Topology {
         let online =
             list(&read(&root.join("online"))?).map_err(|why| at(&root.join("online"), &why))?;
         let mut found = Vec::with_capacity(online.len());
-        let mut capacities: HashMap<u32, u64, Global> = HashMap::new_in(Global); // alloc: setup, once per pool
+        let mut capacities: Map<u32, u64, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }); // alloc: setup, once per pool
         for &id in &online {
             // alloc: a sysfs path, once per CPU per pool
             let cpu = root.join(format!("cpu{id}"));
@@ -100,12 +100,12 @@ impl Topology {
             }
             found.push((id, share, socket.unwrap_or(0), node_of(&cpu)?));
         }
-        let node: HashMap<u32, u32, Global> = // alloc: setup, once per pool
+        let node: Map<u32, u32, FixedState, Global> = // alloc: setup, once per pool
             // alloc: once per pool, setup
             found.iter().map(|&(id, _, _, node)| (id, node)).collect();
         let fastest = capacities.values().copied().max();
         // Groups are numbered in the order they are first met, so the map's order is never read.
-        let mut sets: HashMap<Vec<u32>, u32, Global> = HashMap::new_in(Global); // alloc: setup, once per pool
+        let mut sets: Map<Vec<u32>, u32, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }); // alloc: setup, once per pool
         let mut cpus = Vec::with_capacity(found.len());
         for (id, share, socket, home) in found {
             // A cache shared across nodes is split by node: a group's memory is all local.
@@ -132,6 +132,14 @@ impl Topology {
     /// another. Workers of level 1 and below used to be slow and run at `utility` QoS, which a
     /// loaded host starves (about 2% of a core against 30% for `user-initiated`), while they
     /// still stole critical jobs and did most of a build's work.
+    ///
+    /// The levels' counts are read (`detect`), and only shape the groups: `fast` stays `true`
+    /// on the efficiency levels because the pool reads it to exclude cores. With any group not
+    /// `fast`, `crate::pool`'s `mixed` holds, and `place` sends a critical job only to `fast`
+    /// groups (`least_loaded(only_fast)`, its tie-break in `least`), so marking the efficiency
+    /// cores would keep every critical job off them (checked 2026-11-21). The work that
+    /// belongs at `utility` is the work after the answer, the file effects it asks for among
+    /// it (blaze_core::threads::qos), never a worker.
     pub fn from_perflevels(levels: &[(u32, u32)]) -> Topology {
         // alloc: the pool's shape, once per pool
         let (mut cpus, mut id, mut first_group) = (Vec::new(), 0u32, 0u32);
@@ -175,7 +183,7 @@ impl Topology {
     /// its NUMA node, then of its socket, then the rest, each nearest by id first (ties to the
     /// lower). Empty for a group the topology does not have.
     pub fn steal_order(&self, group: u32) -> Vec<u32> {
-        let mut place_of: HashMap<u32, (u32, u32), Global> = HashMap::new_in(Global); // alloc: setup, once per pool
+        let mut place_of: Map<u32, (u32, u32), FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }); // alloc: setup, once per pool
         for cpu in &self.cpus {
             place_of.entry(cpu.group).or_insert((cpu.socket, cpu.node));
         }
@@ -209,7 +217,7 @@ impl Topology {
 /// `cpus` by id, their groups numbered from 0 in the order of their first CPU.
 fn dense(mut cpus: Vec<Cpu>) -> Topology {
     radix::sort_copy_by_key(&mut cpus, |it| it.id);
-    let mut renamed: HashMap<u32, u32, Global> = HashMap::new_in(Global); // alloc: setup, once per pool
+    let mut renamed: Map<u32, u32, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }); // alloc: setup, once per pool
     for cpu in &mut cpus {
         let next = u32::try_from(renamed.len()).unwrap_or(u32::MAX);
         cpu.group = *renamed.entry(cpu.group).or_insert(next);
@@ -389,20 +397,20 @@ fn at(path: &Path, why: &io::Error) -> io::Error {
 pub(crate) mod linux {
     use std::{collections::BTreeSet, io, mem::size_of};
 
-    const BITS: usize = 8 * size_of::<libc::c_ulong>();
+    const BITS: usize = 8 * size_of::<core::ffi::c_ulong>();
 
     /// The CPUs the process may run on.
     pub(crate) fn affinity() -> io::Result<BTreeSet<u32>> {
         let mut words = 1024 / BITS;
         loop {
             // alloc: the affinity mask, once per pool
-            let mut mask: Vec<libc::c_ulong> = vec![0; words];
+        let mut mask: Vec<core::ffi::c_ulong> = vec![0; words];
             // SAFETY: the kernel writes at most `words * size_of::<c_ulong>()` bytes of the mask,
             // which is what `mask` holds; a `cpu_set_t` is such words.
             let got = unsafe {
                 libc::sched_getaffinity(
                     0,
-                    words * size_of::<libc::c_ulong>(),
+                    words * size_of::<core::ffi::c_ulong>(),
                     mask.as_mut_ptr().cast::<libc::cpu_set_t>(),
                 )
             };
@@ -420,7 +428,7 @@ pub(crate) mod linux {
             }
             let why = io::Error::last_os_error();
             // EINVAL: the mask is smaller than the kernel's.
-            if why.raw_os_error() == Some(libc::EINVAL) && words < 1 << 16 {
+            if why.raw_os_error() == Some(blaze_sys::Errno::Inval.raw() as i32) && words < 1 << 16 {
                 words *= 2;
                 continue;
             }
@@ -433,13 +441,13 @@ pub(crate) mod linux {
     pub(crate) fn bind(cpu: u32) -> io::Result<()> {
         let cpu = cpu as usize;
         // alloc: the affinity mask, once per worker start
-        let mut mask: Vec<libc::c_ulong> = vec![0; (cpu / BITS + 1).max(1024 / BITS)];
+        let mut mask: Vec<core::ffi::c_ulong> = vec![0; (cpu / BITS + 1).max(1024 / BITS)];
         mask[cpu / BITS] |= 1 << (cpu % BITS);
         // SAFETY: the kernel reads `mask.len() * size_of::<c_ulong>()` bytes, which `mask` holds.
         let set = unsafe {
             libc::sched_setaffinity(
                 0,
-                mask.len() * size_of::<libc::c_ulong>(),
+                mask.len() * size_of::<core::ffi::c_ulong>(),
                 mask.as_ptr().cast::<libc::cpu_set_t>(),
             )
         };
@@ -457,25 +465,16 @@ pub(crate) mod linux {
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 pub(crate) mod macos {
-    use std::{ffi::CString, mem::size_of, ptr};
+    use std::{ffi::CString, mem::size_of};
+
+    use blaze_sys::posix::thread::sysctl_bytes;
 
     /// A 32-bit integer the kernel says by `name`, if it says it.
     pub(crate) fn sysctl(name: &str) -> Option<u32> {
         let name = CString::new(name).ok()?;
-        let mut value: i32 = 0;
-        let mut len = size_of::<i32>();
-        // SAFETY: `value` has room for the `len` bytes the kernel may write, and `name` is a C
-        // string that outlives the call.
-        let got = unsafe {
-            libc::sysctlbyname(
-                name.as_ptr(),
-                (&raw mut value).cast::<libc::c_void>(),
-                &mut len,
-                ptr::null_mut(),
-                0,
-            )
-        };
-        (got == 0 && len == size_of::<i32>()).then(|| u32::try_from(value).ok()).flatten()
+        let mut bytes = [0u8; size_of::<i32>()];
+        let got = sysctl_bytes(&name, &mut bytes).ok().flatten()?;
+        (got == size_of::<i32>()).then(|| u32::try_from(i32::from_ne_bytes(bytes)).ok()).flatten()
     }
 }
 

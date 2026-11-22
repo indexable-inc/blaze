@@ -10,12 +10,36 @@
 //! Nothing here knows an unwinder: the driver tells the system's of the entry
 //! (`blaze-launch-rt`'s `unwind`).
 
-use alloc::format;
-use alloc::string::String;
 use alloc::vec::Vec;
 use core::alloc::Allocator;
+use core::fmt;
 
 use crate::record::Unwind;
+
+/// Why an unwind entry cannot be written: which part of the record's call frame information
+/// the version-1 CIE this module writes cannot hold.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FrameError {
+    /// The return address register is past the 255 a version-1 CIE's one byte holds.
+    ReturnAddress { register: u16 },
+    /// A language-specific data area with no personality routine to read it.
+    DataAreaWithoutRoutine,
+}
+
+impl fmt::Display for FrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            FrameError::ReturnAddress { register } => {
+                write!(f, "return address register {register} is past the 255 a version 1 CIE holds")
+            }
+            FrameError::DataAreaWithoutRoutine => {
+                f.write_str("a data area for a personality routine, and no routine")
+            }
+        }
+    }
+}
+
+impl core::error::Error for FrameError {}
 
 /// Where the parts of an entry [`entry`] wrote are, as offsets in its bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -66,9 +90,11 @@ fn finish<A: Allocator>(out: &mut Vec<u8, A>, start: usize) {
 /// `DW_EH_PE_absptr`: an address as it is, 8 bytes.
 const ABSPTR: u8 = 0x00;
 
-/// Clears `out` and writes the entry of a function at `start`, `len` bytes long: a CIE, its
-/// FDE, and the zero length that ends a run. `personality` and `lsda` are the addresses of
-/// the record's personality routine and data area. Gives where each part is.
+/// [`write_entry`] with its refusal as text.
+///
+/// Deprecated (D170 C4): call [`write_entry`], whose refusal is a [`FrameError`]. Kept only for
+/// its caller blaze-launch-rt unwind.rs:34 (`unwind::entry`, which returns `Result<usize,
+/// String>`), until that takes the typed error.
 pub fn entry<A: Allocator>(
     unwind: &Unwind<'_>,
     start: u64,
@@ -76,17 +102,27 @@ pub fn entry<A: Allocator>(
     personality: Option<u64>,
     lsda: Option<u64>,
     out: &mut Vec<u8, A>,
-) -> Result<Entry, String> {
+) -> Result<Entry, alloc::string::String> {
+    use alloc::string::ToString;
+    write_entry(unwind, start, len, personality, lsda, out).map_err(|why| why.to_string())
+}
+
+/// Clears `out` and writes the entry of a function at `start`, `len` bytes long: a CIE, its
+/// FDE, and the zero length that ends a run. `personality` and `lsda` are the addresses of
+/// the record's personality routine and data area. Gives where each part is.
+pub fn write_entry<A: Allocator>(
+    unwind: &Unwind<'_>,
+    start: u64,
+    len: u64,
+    personality: Option<u64>,
+    lsda: Option<u64>,
+    out: &mut Vec<u8, A>,
+) -> Result<Entry, FrameError> {
     let Ok(return_address) = u8::try_from(unwind.return_address) else {
-        // alloc: an error
-        return Err(format!(
-            "return address register {} is past the 255 a version 1 CIE holds",
-            unwind.return_address
-        ));
+        return Err(FrameError::ReturnAddress { register: unwind.return_address });
     };
     if lsda.is_some() && personality.is_none() {
-        // alloc: an error
-        return Err(String::from("a data area for a personality routine, and no routine"));
+        return Err(FrameError::DataAreaWithoutRoutine);
     }
     out.clear();
     // The CIE: its length (filled by `finish`), id 0, version 1.

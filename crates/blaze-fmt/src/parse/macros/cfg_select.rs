@@ -12,7 +12,7 @@ use crate::ast::token::{Token, TokenKind};
 use crate::ast::tokenstream::TokenStream;
 use crate::parse::stream::{AllowConstBlockItems, ForceCollect, exp};
 use crate::span::Span;
-use tracing::debug;
+use blaze_trace::debug;
 
 use crate::comment::contains_comment;
 use crate::expr::is_unsafe_block;

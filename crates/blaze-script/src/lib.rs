@@ -13,6 +13,7 @@
 //!   status (`in_process` times with it, `smoke` checks with it).
 //! - [`pyfmt`]: `{x:g}`, `{x!r}` and `{x}` of a value, as an f-string writes them.
 //! - [`pystr`]: Python's `splitlines` and whitespace, where Rust's `lines` and `trim` differ.
+//! - [`regex`]: patterns, a Pike VM linear in the text, with the `regex` crate's interface.
 //! - [`pypath`]: `os.path`'s `normpath`, `relpath` and the rest, `glob.glob` and `fnmatch`.
 //! - [`TempDir`]: `tempfile.TemporaryDirectory`, for a `selftest` that writes files.
 //! - [`fail`], [`expect`], [`exit`]: how a script ends, in an error or with a status, and how
@@ -21,22 +22,30 @@
 //!   asyncio's tasks under a semaphore.
 //! - [`engine`], [`report`]: harness/v2's `engine.py` and `report.py`, the blaze under test and
 //!   a run's result.
+//! - [`toml`]: TOML read by blaze-toml and lowered to blaze-data's `Value`.
+//! - [`ratchet`]: what a per-crate ratchet of scripts/ shares: Rust read as text, test code,
+//!   the walk of crates/, the list and the base.
+//! - [`finding`]: the record a ratchet's `findings` command prints and `advise` ranks.
 //!
 //! When a release carries bstd and reflection, a script's `Input::parse` is derived
 //! (`bstd::data`) and these become bstd's (`blaze::std_use` moves the callers).
 
 // `#[expect(blaze::..)]` names a blaze lint; inert under rustc.
-#![feature(register_tool)]
+#![feature(allocator_api, register_tool)]
 #![register_tool(blaze)]
 
 pub mod child;
 pub mod engine;
+pub mod finding;
 pub mod input;
 pub mod pyfmt;
 pub mod pyjson;
 pub mod pypath;
 pub mod pystr;
+pub mod ratchet;
+pub mod regex;
 pub mod report;
+pub mod toml;
 
 use std::{
     io::Read,
@@ -46,9 +55,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub use regex;
 pub use serde_json::{self as json, Map, Value};
-pub use toml;
 
 /// Ends the script as Python's `sys.exit(f"{script}: {message}")` does: the line on standard
 /// error, exit status 1.

@@ -1,0 +1,11 @@
+status 0
+stdout
+t=0 c immediate
+t=2 b tick 0
+t=3 a tick 0
+t=4 b tick 1
+t=6 a tick 1
+t=6 a done
+t=6 b tick 2
+t=6 b done
+polls 8, clock 6

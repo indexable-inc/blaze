@@ -4,16 +4,18 @@
 
 use std::{
     alloc::{AllocError, Allocator, Global, Layout},
+    borrow::ToOwned,
     cell::Cell,
     hash::BuildHasher,
     ptr::NonNull,
+    string::{String, ToString},
+    vec::Vec,
 };
 
 use blaze_sim::{Config, Tape};
 
 use crate::{
-    BuildKeyHasher, ByHash, FixedState, HashMap, IndexMap, IndexSet, KeyedMap, KeyedSet, OrderMap,
-    SipKey,
+    BuildKeyHasher, ByHash, HashMap, IndexMap, IndexSet, KeyedMap, KeyedSet, OrderMap, SipKey,
 };
 
 /// The global heap, each allocation counted.
@@ -39,7 +41,7 @@ fn agrees(tape: &Tape) -> Result<(), String> {
     let mut map: IndexMap<u8, u32, Global> = IndexMap::new_in(Global); // alloc: a test's map
     let mut model: Vec<(u8, u32)> = Vec::new(); // alloc: a test's model
     let place = |model: &Vec<(u8, u32)>, key: u8| model.iter().position(|it| it.0 == key);
-    for step in 0..tape.below(200, "steps") {
+    for step in 0..tape.below(if cfg!(miri) { 60 } else { 200 }, "steps") {
         // Few keys, so that most operations meet a key that is there.
         let key = tape.below(24, "key") as u8;
         let value = step as u32;
@@ -129,7 +131,7 @@ fn agrees(tape: &Tape) -> Result<(), String> {
 /// under the same operations holds, in its order, and finds each key at its index.
 #[test]
 fn an_ordered_map_is_a_vec_of_pairs_under_any_operations() {
-    blaze_sim::check(Config::cases(300), agrees);
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 300 }), agrees);
 }
 
 /// The two removals are two orders, so the model above tells them apart: `swap_remove` moves
@@ -163,6 +165,11 @@ fn an_ordered_set_keeps_insertion_order() {
     assert!(set.shift_remove("d"));
     assert_eq!(set.iter().copied().collect::<Vec<_>>(), ["a", "b"]);
     assert_eq!((set.insert_full("b"), set.insert_full("z")), ((1, false), (2, true)));
+    assert_eq!((&set).into_iter().copied().collect::<Vec<_>>(), ["a", "b", "z"]);
+    let room = set.capacity();
+    assert_eq!(set.drain().collect::<Vec<_>>(), ["a", "b", "z"]);
+    assert!(set.is_empty() && !set.contains("a") && set.capacity() == room);
+    assert_eq!(set.insert_full("a"), (0, true));
 }
 
 /// A table made with room for what it will hold allocates when it is made and never after:
@@ -170,7 +177,7 @@ fn an_ordered_set_keeps_insertion_order() {
 /// made empty allocates nothing until its first insert.
 #[test]
 fn a_table_with_room_allocates_only_when_made() {
-    const N: usize = 1000;
+    const N: usize = if cfg!(miri) { 100 } else { 1000 };
     let count = Cell::new(0);
     let mut map: HashMap<u32, u32, Counted<'_>> = HashMap::with_capacity_in(N, Counted(&count));
     assert_eq!(count.get(), 1, "a hash map with room");
@@ -222,6 +229,10 @@ const CHILD: &str = "BLAZE_HASH_ORDER_CHILD";
 /// control is the cause: a hash map of the same inserts under two random keys iterates in two
 /// orders, so the order this test compares is one a table can get wrong.
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "runs its own program as a child, which Miri's isolation refuses; the ordered table's raw paths are an_ordered_map_is_a_vec_of_pairs_under_any_operations's"
+)]
 fn insertion_order_is_the_same_under_any_hasher_and_in_another_process() {
     let expected = order_of(inserts());
     let fixed: IndexMap<u64, u64, Global> = IndexMap::from_iter_in(inserts(), Global); // alloc: a test's map
@@ -272,7 +283,8 @@ fn insertion_order_is_the_same_under_any_hasher_and_in_another_process() {
 /// place them differently. A keyed table is made only with its key.
 #[test]
 fn a_keyed_table_spreads_keys_picked_to_collide() {
-    let picked: Vec<[u64; 2]> = (0..4096u64).map(|it| [0x5eed, it]).collect(); // alloc: a test's keys
+    let picked: Vec<[u64; 2]> =
+        (0..if cfg!(miri) { 256 } else { 4096u64 }).map(|it| [0x5eed, it]).collect(); // alloc: a test's keys
     let known: crate::HashSet<u64, Global> =
         picked.iter().map(|it| BuildKeyHasher::default().hash_one(it)).collect(); // alloc: a test's set
     assert_eq!(known.len(), 1, "every picked key has one hash under the known hasher");
@@ -311,7 +323,6 @@ fn collections_cost() {
 
     let mut hash: HashMap<u32, u32, Global> = HashMap::new_in(Global); // alloc: measured
     let mut ours: IndexMap<u32, u32, Global> = IndexMap::new_in(Global); // alloc: measured
-    let mut theirs: indexmap::IndexMap<u32, u32, FixedState> = indexmap::IndexMap::default(); // alloc: measured
     let fill_hash = median(|| {
         hash = HashMap::new_in(Global);
         (0..N).for_each(|it| drop(hash.insert(it, it)));
@@ -322,23 +333,16 @@ fn collections_cost() {
         (0..N).for_each(|it| drop(ours.insert(it, it)));
         ours.len() as u64
     });
-    let fill_theirs = median(|| {
-        theirs = indexmap::IndexMap::default();
-        (0..N).for_each(|it| drop(theirs.insert(it, it)));
-        theirs.len() as u64
-    });
-    println!("insert 1M u32 ids, growing: IndexMap {fill_ours:.1} ns, indexmap {fill_theirs:.1} ns, HashMap {fill_hash:.1} ns");
+    println!("insert 1M u32 ids, growing: IndexMap {fill_ours:.1} ns, HashMap {fill_hash:.1} ns");
 
     let sum = |get: &dyn Fn(u32) -> u32| ids.iter().map(|&it| u64::from(get(it))).sum::<u64>();
     let look_hash = median(|| sum(&|it| hash[&it]));
     let look_ours = median(|| sum(&|it| *ours.get(&it).expect("held")));
-    let look_theirs = median(|| sum(&|it| theirs[&it]));
-    println!("hash + lookup of 1M u32 ids: IndexMap {look_ours:.1} ns, indexmap {look_theirs:.1} ns, HashMap {look_hash:.1} ns");
+    println!("hash + lookup of 1M u32 ids: IndexMap {look_ours:.1} ns, HashMap {look_hash:.1} ns");
 
     let walk_hash = median(|| hash.values().map(|&it| u64::from(it)).sum());
     let walk_ours = median(|| ours.values().map(|&it| u64::from(it)).sum());
-    let walk_theirs = median(|| theirs.values().map(|&it| u64::from(it)).sum());
-    println!("iteration of 1M entries: IndexMap {walk_ours:.2} ns, indexmap {walk_theirs:.2} ns, HashMap {walk_hash:.2} ns");
+    println!("iteration of 1M entries: IndexMap {walk_ours:.2} ns, HashMap {walk_hash:.2} ns");
 
     // 32-byte hashes: spread by a multiply per word, as a digest's bytes are.
     let digest = |it: u32| {
@@ -359,4 +363,66 @@ fn collections_cost() {
     let look_by = median(|| digests.iter().map(|it| u64::from(by_hash[it])).sum());
     let look_hashed = median(|| digests.iter().map(|it| u64::from(hashed[it])).sum());
     println!("lookup of 1M 32-byte hashes: ByHash {look_by:.1} ns, HashMap<[u8; 32]> {look_hashed:.1} ns");
+}
+
+/// D126: `OrderMap::new` and `OrderSet::new` make what the constructors they replace made.
+/// `capacity: None` is `new_in`, and allocates nothing; `Some(n)` is `with_capacity_in(n, ..)`:
+/// the same capacity, two allocations for `n > 0`, and after the same inserts the same entries in
+/// the same order.
+#[test]
+fn new_with_options_is_the_old_constructors() {
+    use crate::{FixedState, OrderMapOpts, OrderSet, OrderSetOpts};
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
+        let count = tape.index(201, "keys");
+        let keys: Vec<u32> = (0..count).map(|_| tape.below(300, "key") as u32).collect(); // alloc: a case's keys
+        let room = if tape.coin("reserve") { Some(tape.index(500, "capacity")) } else { None };
+
+        let made = Cell::new(0);
+        let mut new: OrderMap<u32, u32, FixedState, Counted<'_>> =
+            OrderMap::new(OrderMapOpts { hasher: FixedState, alloc: Counted(&made), capacity: room });
+        let expected = match room {
+            None | Some(0) => 0,
+            Some(_) => 2,
+        };
+        assert_eq!(made.get(), expected, "allocations for capacity {room:?}");
+        let mut old: IndexMap<u32, u32, Global> = match room {
+            None => IndexMap::new_in(Global),
+            Some(n) => IndexMap::with_capacity_in(n, Global),
+        };
+        assert_eq!(new.capacity(), old.capacity(), "capacity {room:?}");
+        let mut set: OrderSet<u32, FixedState, Global> =
+            OrderSet::new(OrderSetOpts { hasher: FixedState, alloc: Global, capacity: room });
+        let mut old_set: IndexSet<u32, Global> = match room {
+            None => IndexSet::new_in(Global),
+            Some(n) => IndexSet::with_capacity_in(n, Global),
+        };
+        assert_eq!(set.capacity(), old_set.capacity(), "set capacity {room:?}");
+        for (step, &key) in keys.iter().enumerate() {
+            assert_eq!(new.insert(key, step as u32), old.insert(key, step as u32));
+            assert_eq!(set.insert(key), old_set.insert(key));
+        }
+        assert!(new.iter().eq(old.iter()), "the same entries in the same order");
+        assert!(set.iter().eq(old_set.iter()), "the same values in the same order");
+    });
+}
+
+/// D125: a keyed ordered map is made the same way, its key as the hasher; under two different
+/// keys it holds the same entries in the same order, since the order is the inserts'.
+#[test]
+fn a_keyed_order_map_takes_its_key_as_the_hasher() {
+    use crate::OrderMapOpts;
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 128 }), |tape| {
+        let count = tape.index(201, "keys");
+        let keys: Vec<u32> = (0..count).map(|_| tape.below(300, "key") as u32).collect(); // alloc: a case's keys
+        let first = SipKey::new(tape.int("k0"), tape.int("k1"));
+        let second = SipKey::new(first.words()[0] ^ 1, first.words()[1]);
+        let mut a: OrderMap<u32, u32, SipKey, Global> =
+            OrderMap::new(OrderMapOpts { hasher: first, alloc: Global, capacity: None });
+        let mut b: OrderMap<u32, u32, SipKey, Global> =
+            OrderMap::new(OrderMapOpts { hasher: second, alloc: Global, capacity: Some(count) });
+        for (step, &key) in keys.iter().enumerate() {
+            assert_eq!(a.insert(key, step as u32), b.insert(key, step as u32));
+        }
+        assert!(a.iter().eq(b.iter()), "the inserts' order under either key");
+    });
 }

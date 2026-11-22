@@ -61,6 +61,41 @@ bridge is handed to fastcompile ([below](#for-fastcompile-the-proc-macro-bridge)
 A wasm module that can't be built or run is an error that names the macro. It is never run
 natively in its place.
 
+## What is not supported
+
+2026-11-16 (lane proc-macro, `scripts/src/bin/proc_macro_modules.rs` over tempo's 79
+proc-macro units): one crate refuses wasm32-wasip1 unchanged, and blaze does not patch it.
+
+- **synstructure's `decl_derive!` on wasm32 + wasi.** synstructure (0.13.2 and 0.14.0 alike)
+  compiles its proc_macro use out
+  under `#[cfg(all(not(all(target_arch = "wasm32", any(target_os = "unknown", target_os =
+  "wasi"))), feature = "proc-macro"))]` (on `decl_derive!` at `src/macros.rs:84` in both,
+  and on `extern crate proc_macro` in 0.13.2's `src/lib.rs:159`). A crate that declares its derives with `synstructure::decl_derive!`
+  then fails: "error[E0433]: cannot find `decl_derive` in `synstructure`". In tempo that is
+  asn1-rs-derive 0.6.0 (BerAlias, DerAlias, BerSequence, DerSequence, BerSet, DerSet,
+  ToStatic, ToDerSequence). tempo's other synstructure units (yoke-derive and
+  zerofrom-derive, on 0.14.0) write `#[proc_macro_derive]` themselves and call none of the gated
+  items, so they build.
+- **What tempo loses.** asn1-rs depends on asn1-rs-derive unconditionally. Following the lock's
+  `dependencies` lists by name, 13 packages lie above it: asn1-rs, der-parser, oid-registry,
+  x509-parser and rcgen, and 8 of tempo's members (tempo-nitro-attestation-fuzz, tempo-xtask,
+  tempo-zone, tempo-zone-prover-enclave, tempo-zone-prover-utils, zone-node, zone-prover,
+  zone-sequencer). A build that reaches one of them stops, naming the module. The `tempo` node
+  binary is not among them.
+- **The smallest honest remedy, not built.** A second target description for macro crates that
+  call `synstructure::decl_derive!`: wasm32 with an `os` that is neither `unknown` nor
+  `wasi` (say `blaze`). The gate is then false and the crate builds unchanged. It would change
+  three things:
+  - std for that target is the unsupported platform layer, not WASI. `std::env` and `std::fs`
+    in such a module return `Unsupported` unless the shim serves them as it serves `getenv`.
+    asn1-rs-derive reads neither.
+  - Crates with `cfg(target_os = "wasi")` code (libc, getrandom) take other paths or fail to
+    build.
+  - The module key covers the target's digest, so these modules are keyed apart.
+
+  rustc offers no flag that turns a built-in cfg off: `--cfg` can only add, so
+  `target_os = "wasi"` stays true.
+
 ## Keys
 
 An expansion is a run of user code: `RunKey { code, given }`, found and kept through
@@ -205,3 +240,119 @@ already exists, and is exact against rustc's proc-macro server, so a port can re
 - **What change 20 makes obsolete here:** the warm servers (`proc-macro-api/src/warm.rs`), the
   scope markers (`proc-macro-srv/src/scope.rs`), the wasm build of macros, and `rule.rs`.
   Remove them once the evaluator runs every macro, with no fallback to them.
+
+## For a successor (2026-11-16, rebuild-1115)
+
+Where the rebuilt pipeline stands, each line from a run on tempo in this session:
+
+- The hook is `crates/blaze-proc-macro/src/hook.rs`: `ProcMacros::run` behind
+  `ExpandCx::run_proc_macro` (`ProcCx` wraps any host). It finds the record, runs the module on a
+  miss and keeps the answer. A missing module is one `Finding::MissingModule` per crate; a trap
+  is `Finding::Call` naming the macro and the base key. Nobody calls the runner directly.
+- A caller registers each reached macro crate with `ProcMacros::add_reached(store, lock, &Reached
+  { name, version, source, features })`, which keys the module as the builder does and returns
+  the `CrateItemKey` its `MacroDefinition::proc_macro` must carry. The names library
+  (acd2f3dd892b1b198) and the expansion lane were told this; blaze-scope declares the defs.
+- Names reach the hook through `blaze-lower`'s `MacroNames` (`Lists`, `ByName::with_names`).
+- The proof run is `examples/tempo_pipeline.rs` (checkout, module store, unit list, out,
+  optional `--no-proc-macros`). With the test-time unit list
+  (`blaze-int-1112-notes/unit-graph/tempo-units-tests-1116.txt`, 81 proc-macro units, 80
+  modules in the scratch store `pm/store-c`): 2,374 calls, 0 refused, limit or failed, 13
+  `compile_error!`s. It also checks every body as stage h does (`to_typeck`), split by item
+  source; only 1 body stops for anything but an unexpanded `macro_rules` call (std's and
+  dependencies' rules are not loaded by the example; the names library carries them).
+- `host::HOST_VERSION` (2) is in every base key; bump it when the host's answer to a call
+  changes. Tests: an attribute with no arguments gets an empty stream; an answer under another
+  host version is not read.
+- Expansion is bounded (blaze-lower `EXPANSION_DEPTH` 128, `EXPANSION_BUDGET` 65,536 per
+  top-level item and per body; `Refusal` names the macro). Tempo's deepest item chain is 3.
+- The 13 errors: 12 are tokio `select!` with `biased;` sent to commonware's `select` by the
+  example's by-name resolver (needs real name resolution); 1 is clap `Args` on `TempoArgs`
+  (bin/tempo/src/cli.rs:57), a blaze-expand bug: `ItemAttrs::derives` drops a field whose
+  `#[cfg]` is false but keeps an attribute written before the `#[cfg]`. Handed to the expansion
+  lane (note at the top of crates/blaze-lower/src/lib.rs), not fixed.
+- Census gaps explained: 3 `tokio::test` are behind a false cfg (linux target, feature `rpc`);
+  9 `#[contract]` sit inside `proptest!` bodies; test-case takes all of a function's
+  `#[test_case]`s in one call (164 calls for 167 counted runs: 2 runs miscounted by trailing
+  comments, 1 behind `cfg(feature = "reth-codec")`).
+- Not built yet: the driver task kind in blaze-drive, the stack-size statement, hostile-module
+  and invalidation proofs through the hook, the floor measurement, the typed store error, the
+  tool's version check by equality, and the record encoding (answers average about 45 KB:
+  per token an 8-byte kind and 4-byte length; proposal: interned text table, varint kinds).
+- Compiled records (2026-11-16, host.rs "Compiled records" holds the full rule, trust included).
+  The measured cause: the names runs made their `Runtime` over `--procs-out`, which the run
+  script deletes, so every run compiled every module, lazily, under the hook's `OnceLock`
+  (alloy-primitives 2,947 ms where it takes 33.5 ms loaded). Now: the record is
+  `<module dir>/compiled-<code key>` beside the wasm, sealed by `compiled-<code key>.seal`
+  (BLAKE3 of the bytes and the key's parts, written after the bytes, each by temp name and
+  rename); the code key is the wasm SHA-256, every `host::Settings` field (the one place the
+  engine is built), Wasmtime's compatibility hash (triple, compiler flags, host CPU features,
+  tunables, wasm features, Wasmtime's version), arch and OS. A record is loaded only from a
+  folder group and others cannot write, with the folder's owner, its seal's key equal and its
+  BLAKE3 equal, once per runtime; else it is removed, a `CompiledFinding` names it
+  (`hook::Finding::Compiled`) and the module is compiled again. A second worker waits on the
+  module's slot with a deadline (`LOAD_DEADLINE`, 300 s) and a span `proc_macro_module_wait`.
+  `Runtime::new()` no longer takes a folder. `Runtime::load_all` / `ProcMacros::load_all`
+  compile or load a list on N workers before expansion; blaze-world's `names` example calls it.
+  Measured (examples/compile_modules.rs over a copy of the 80-module store, Mac):
+  "first pass: 80 modules on 18 workers in 4554.2 ms; compiled 80; ... compiled records
+  279.7 MB (wasm 115.8 MB)"; "second pass: 80 modules on 18 workers in 268.9 ms; compiled 0";
+  serially "80 modules on 1 workers in 150.2 ms; ... one load: median 1.87 ms, slowest
+  4.00 ms". The alloy-primitives subset (run-ready10.sh, `--roots alloy-primitives`, 18
+  threads; world-1116/apc-cold.txt, apc-warm.txt): cold "11 modules ready on 18 workers in
+  1389.6 ms, 11 compiled", then "120 crates resolved in 3821.4 ms", "49.0 ms alloy-primitives";
+  warm "11 modules ready on 18 workers in 37.4 ms, 0 compiled", "120 crates resolved in
+  3785.0 ms", "47.5 ms alloy-primitives" (before: wall 8058.4 ms, alloy-primitives 2756.8 ms).
+  evm2 is not in that subset: the whole-tempo run is the names lane's. One module (2a85238058f6) compiles but does not link: it imports WASI
+  `path_create_directory`, which blaze_wasi lacks. Left: the driver's `MacroModule` task calls
+  `load_all`; the 18-worker warm pass is 1.8x the serial one (contention not profiled);
+  `script.rs`'s build-script runtime still has its own unsealed compiled record and should
+  take this one; records are 2.4x the wasm (279.7 MB): no cleanup of records of old keys yet.
+- Source corrections (D58, built 2026-11-16). The table is `crates/blaze-fetch/corrections.json`
+  (frozen `Table`/`Row`, unknown fields refused); the pure function is
+  `blaze_fetch::correct` (`Row::correct_text`, `Row::correct_crate`: lexed by blaze-lex, a match
+  is the row's predicate as a whole token subtree inside a `cfg`/`cfg_attr` attribute; a listed
+  file with no match is `Refused::Stale`). Home: blaze-fetch, where a fetched source becomes
+  what readers read, and a dependency of the builder, blaze-proc-macro and blaze-world. One row:
+  synstructure `>=0.13, <0.15` (0.14.0 carries the same gate). Keys: `Table::pin` adds
+  ` corrected <row digest>` to a corrected package's pin in every module's lock closure (builder
+  `closure_lines` and `LockedPackages::closure` alike; test
+  `a_source_correction_row_is_in_the_module_key`); blaze-world's crate key takes the digest too.
+  The builder does not use the fetch store for registry crates: it corrects its own
+  `<work>/vendor` copy in place after `cargo vendor` and rewrites that copy's
+  `.cargo-checksum.json` file entries (not a `[patch]`: that would move the lock's source).
+  Runs (procs-1116/d58): build.txt "corrected: synstructure 0.13.2: 7 predicates (D58)", "asn1-rs-derive 0.6.0: module
+  1cdc4d32..."; six modules re-keyed and added (asn1-rs-derive, yoke-derive, zerofrom-derive,
+  i18n-embed-fl, i18n-embed-impl, tempo-precompiles-macros: their lock closures reach
+  synstructure); the store holds 86 (the old yoke/zerofrom/i18n/tempo-precompiles keys stay).
+  names2.txt: "79 macro crates registered, 79 with a module", "unresolved imports in two
+  columns: ours to fix 0 | waiting on a build script that cannot run yet 45". blaze-world reads
+  corrected text through `Texts` and prints `corrected:` lines, but the names world holds no
+  proc-macro crate's dependencies, so it never reads synstructure: no line there today.
+  NOT DONE (step 3 of the brief): `record::DirStore` still writes expansion records with
+  ambient `std::fs` (no sync, no whole-record digest, no crash test). Move it onto blaze-core's
+  `Dir<ReadWrite>` as crates/blaze-cli/src/store.rs does, verify each record's digest once per
+  boot, and prove it with a `blaze_core::sim` crash simulation (oracle: after any crash every
+  record read is one that was written, whole; planted bug: no sync before the rename).
+
+## DECIDED 2026-11-16 06:25 (coordinator): the runtime inside `blaze`, the identity without it
+
+- The sandbox runtime (Wasmtime) is linked INTO `blaze`, behind blaze-cli's cargo feature
+  `sandbox` (on by default): no helper process, no second executable, one code path. A command
+  that expands nothing must not pay for it; the proof is binary size and a bare `blaze` and a
+  repeat `check` with and without it (drive.md, the DONE 06:xx entry).
+- blaze-proc-macro is split by its feature `runtime` (default on for the crate itself; the
+  workspace dependency turns it off, so each user asks): WITHOUT it are `module` (the identity,
+  `lock_closure` and `LockedPackages` (the lock read once for many crates), `module_key`,
+  `find_module`: the store lookup that reads the record's `wasm-sha256`, not the wasm, and
+  `read_module`), `record` (`base_key`, `HOST_VERSION` moved here from host.rs so the key is
+  the same with and without the runtime, `find`, `DirStore`) and `sandbox` (no Wasmtime in it).
+  WITH it: `host`, `hook`, `server`, `wire`, `protocol`, `script`, `script_sandbox`,
+  `script_unit`, and the dependencies wasmtime, blaze-build-script, blaze-unit-graph,
+  blaze-format and blaze-id. blaze-real and blaze-world's `procs-run` ask for it.
+- The macro crate's identity has ONE home, blaze-world `procs::identify` (feature `procs`, no
+  runtime); `register_macro_crates` (feature `procs-run`) is built on it.
+- The module store a command looks in is the user's shared store, `<home>/.blaze/v2/
+  proc-macro/modules/<key>/`, the home the passed value main.rs reads at the edge: a module is
+  keyed by its crate's identity alone, the same for every project. The bootstrap tool's `store`
+  input names that folder (`<home>/.blaze/v2`).

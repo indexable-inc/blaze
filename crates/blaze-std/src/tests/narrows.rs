@@ -31,7 +31,6 @@ use crate::{
     net::{HostPort, NetKind},
     opener::Opener,
     procs::{ProcId, Procs, SimProc},
-    requests::{Http, HttpKind, Request, SimRoute},
     resolver::Resolver,
     roots::{Anchor, Roots},
     streams::Streams,
@@ -625,8 +624,13 @@ fn origin(at: usize) -> Origin {
     origins()[at].origin().expect("a test's URL has an origin").clone()
 }
 
+#[cfg(feature = "requests")]
+use crate::requests::{Http, HttpKind, Request, SimRoute};
+
+#[cfg(feature = "requests")]
 struct HttpCase;
 
+#[cfg(feature = "requests")]
 impl Narrows for HttpCase {
     type Cap = Http;
     const THINGS: usize = 3;
@@ -795,6 +799,7 @@ narrowing!(BluetoothCase, bluetooth_only_never_widens, the_oracle_catches_blueto
 narrowing!(UsbCase, usb_only_never_widens, the_oracle_catches_usb_that_widens);
 narrowing!(SerialCase, serial_only_never_widens, the_oracle_catches_serial_that_widens);
 narrowing!(ClipboardCase, clipboard_narrowing_never_widens, the_oracle_catches_a_clipboard_that_widens);
+#[cfg(feature = "requests")]
 narrowing!(HttpCase, http_only_never_widens, the_oracle_catches_http_that_widens);
 narrowing!(StreamsCase, streams_only_never_widens, the_oracle_catches_streams_that_widen);
 narrowing!(ResolverCase, resolver_only_never_widens, the_oracle_catches_a_resolver_that_widens);

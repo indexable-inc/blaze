@@ -62,7 +62,8 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use blaze_hash::{ByHash, HashMap};
+use blaze_hash::{BuildKeyHasher, FixedState, Map, MapOpts};
+use blaze_kit::Heap4;
 use blaze_mem::{Handle, RegionVec, Slab, Tag as MemTag};
 use blaze_protocol::events::{Event, Level, NodeKind, NodeState, Record};
 use blaze_radix as radix;
@@ -828,7 +829,6 @@ impl Request {
 
 /// What [`Plane::check`] found of a batch of nodes, for [`Plane::add`]; its buffers are kept
 /// for the next batch.
-#[derive(Default)]
 struct Batch {
     /// Each node's deps, by its place in the batch: a slot, or [`NEW`] and the place of a node
     /// of the batch.
@@ -842,13 +842,27 @@ struct Batch {
     /// For Kahn's order: each place's deps of the batch not yet placed; the places that wait
     /// for each, as CSR; the places that can go, least first.
     waiting: Vec<u32>,
-    then: radix::Csr<u32>,
+    then: radix::Csr<u32, Global>,
     /// `then`'s rebuild cursors, kept.
     cursors: Vec<u32>,
-    can: BinaryHeap<Reverse<u32>>,
+    /// A 4-ary min-heap: the places are distinct, so the order is the places' own.
+    can: Heap4<u32, Global>,
 }
 
 impl Batch {
+    fn new() -> Batch {
+        Batch {
+            deps: Vec::new(),
+            deps_at: Vec::new(),
+            order: Vec::new(),
+            slots: Vec::new(),
+            waiting: Vec::new(),
+            then: radix::Csr::default(),
+            cursors: Vec::new(),
+            can: Heap4::new_in(Global),
+        }
+    }
+
     /// Kahn's order over a batch with a dep on a later node of it, into `order`, the first
     /// given first among those that can go; or the ids of the nodes in a cycle, sorted.
     fn sort(&mut self, nodes: &(impl Given + ?Sized)) -> Result<(), Vec<NodeId>> {
@@ -863,16 +877,18 @@ impl Batch {
         let pairs = (0..len).flat_map(|at| of(at).map(move |&dep| (dep & !NEW, at as u32)));
         self.then.rebuild(len, pairs, &mut self.cursors);
         self.can.clear();
-        self.can.extend((0..len as u32).filter(|&at| self.waiting[at as usize] == 0).map(Reverse));
+        for at in (0..len as u32).filter(|&at| self.waiting[at as usize] == 0) {
+            self.can.push(at);
+        }
         self.order.clear();
-        while let Some(Reverse(at)) = self.can.pop() {
+        while let Some(at) = self.can.pop() {
             self.order.push(at);
             let at = at as usize;
             for &next in self.then.row(at) {
                 let next = next as usize;
                 self.waiting[next] -= 1;
                 if self.waiting[next] == 0 {
-                    self.can.push(Reverse(next as u32));
+                    self.can.push(next as u32);
                 }
             }
         }
@@ -888,7 +904,7 @@ impl Batch {
 }
 
 /// Keys of tasks, by the key's own bits: a [`Key`] hashes as its first word.
-type ByKey<V> = ByHash<Key, V, Global>; // alloc: the plane's index, for the daemon's life
+type ByKey<V> = Map<Key, V, BuildKeyHasher, Global>; // alloc: the plane's index, for the daemon's life
 
 /// A node of an open request that has not settled ([`Plane::unsettled`]).
 #[derive(Clone, Copy, Debug)]
@@ -910,7 +926,7 @@ pub struct Plane<M = NoMemo> {
     keys: RegionVec<Key>,
     node_slots: Slots<NodeSlot>,
     /// Each node by its id: its slot, or while a batch is checked its [`place`].
-    index: HashMap<NodeId, NodeHandle, Global>, // alloc: the plane's index, for the daemon's life
+    index: Map<NodeId, NodeHandle, FixedState, Global>, // alloc: the plane's index, for the daemon's life
     /// The task columns, by slot, and which slots are live.
     tasks: RegionVec<TaskRow>,
     task_keys: RegionVec<Key>,
@@ -918,7 +934,7 @@ pub struct Plane<M = NoMemo> {
     /// Each request's room, by slot, and which slots are live.
     requests: RegionVec<Request>,
     request_slots: Slots<RequestSlot>,
-    request_index: HashMap<RequestId, RequestHandle, Global>, // alloc: the plane's index, for the daemon's life
+    request_index: Map<RequestId, RequestHandle, FixedState, Global>, // alloc: the plane's index, for the daemon's life
     next_seq: u64,
     /// The database's memo, asked once a keyed node is ready and its key is not in flight.
     memo: M,
@@ -983,16 +999,16 @@ impl<M: Memo> Plane<M> {
             states: column(MAX_NODES),
             keys: column(MAX_NODES),
             node_slots: Slots::new(MAX_NODES),
-            index: HashMap::new_in(Global), // alloc: the plane's index, for the daemon's life
+            index: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: the plane's index, for the daemon's life
             tasks: column(MAX_TASKS),
             task_keys: column(MAX_TASKS),
             task_slots: Slots::new(MAX_TASKS),
             requests: column(MAX_REQUESTS),
             request_slots: Slots::new(MAX_REQUESTS),
-            request_index: HashMap::new_in(Global), // alloc: the plane's index, for the daemon's life
+            request_index: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: the plane's index, for the daemon's life
             next_seq: 0,
             memo,
-            flight: ByKey::default(),
+            flight: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: None }),
             running: [0; 2],
             vclock: [0; 2],
             idle_vclock: [0; 2],
@@ -1005,7 +1021,7 @@ impl<M: Memo> Plane<M> {
             deferred: Vec::new(),             // alloc: kept scratch
             last_ns: 0,
             counts: Counts::default(),
-            batch: Batch::default(),
+            batch: Batch::new(),
             touched: Vec::new(),  // alloc: kept scratch
             added: Vec::new(),    // alloc: kept scratch
             rising: Vec::new(),   // alloc: kept scratch
@@ -1486,7 +1502,8 @@ impl<M: Memo> Plane<M> {
         if len == 0 {
             return;
         }
-        let mut batch = std::mem::take(&mut self.batch);
+        // `Batch::new` allocates nothing: the kept buffers come back below.
+        let mut batch = std::mem::replace(&mut self.batch, Batch::new());
         batch.slots.clear();
         batch.slots.resize(len, NONE);
         let mut added = std::mem::take(&mut self.added);
@@ -2280,7 +2297,7 @@ fn new_task(
 
 /// Takes the ids of the first `len` nodes of a batch refused back out of the index.
 fn unindex(
-    index: &mut HashMap<NodeId, NodeHandle, Global>,
+    index: &mut Map<NodeId, NodeHandle, FixedState, Global>,
     nodes: &(impl Given + ?Sized),
     len: usize,
 ) {

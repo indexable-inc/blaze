@@ -8,7 +8,7 @@ A `const fn` is blaze's pure function: deterministic, touching no mutable state,
 can be computed at compile time, cached by its code and arguments, and trusted to be the same
 on every machine. blaze evaluates constants with its own interpreter
 (`crates/hir-ty-mir/src/mir/eval.rs`) and never asks rustc. Everything the pinned nightly
-(`harness/toolchain`) accepts in const is accepted, and gives the value rustc gives; what goes
+(`pins/toolchain`) accepts in const is accepted, and gives the value rustc gives; what goes
 further is an extension a workspace opts into.
 
 ## Const traits, closures and std's const impls
@@ -221,8 +221,7 @@ const G: u3 = 9;                // error: literal `9` out of range for `u3`
 
 The evaluator's arithmetic is `crates/hir-ty-mir/src/mir/eval/narrow.rs`, codegen's
 `crates/hir-ty-codegen/arbitrary_int.rs`. Tests: `arbitrary_ints_*` in
-`crates/hir-ty-mir/src/tests/` (`consteval.rs`, `layout.rs`, `simple.rs`), the literal error
-in `crates/blaze-diagnostics/src/tests/lints/bodies/types/limits.rs`, and the smoke case
+`crates/hir-ty-mir/src/tests/` (`consteval.rs`, `layout.rs`, `simple.rs`), and the smoke case
 `harness/smoke/arbitrary_ints`, which runs the same calls compiled and in const eval, in dev
 and release.
 
@@ -237,5 +236,4 @@ blaze checks const bodies against rustc's `check_consts` rules (#914, #1440,
 `crates/hir-ty-mir/src/mir/const_check.rs`): E0015 for a non-const call, a call of a `fn`
 pointer, an intrinsic not declared `const`, and const stability (`const_check/calls.rs`: the
 nightly's atomics are `const` only under `#![feature(const_atomic)]`). Its errors are part of a
-unit's check (`crates/hir/src/diagnostics.rs`, `crates/blaze-cargo/src/serve/unit/checks.rs`),
-so they fail the build as rustc's do.
+unit's check, so they fail the build as rustc's do.

@@ -2,18 +2,20 @@
 //! (`src/workspace/registry.rs`), `QueryKind` (`src/sources/source.rs`) and `IndexSummary`
 //! (`src/sources/registry/index/mod.rs`).
 
-use anyhow::Result;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map};
 use std::alloc::Global;
 
 use crate::dependency::Dependency;
+use crate::error::ResolveError;
 use crate::interning::InternedString;
 use crate::package_id::PackageId;
 use crate::source_id::SourceId;
 use crate::summary::Summary;
 
+type Result<T, E = ResolveError> = std::result::Result<T, E>;
+
 /// How a query matches.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum QueryKind {
     /// Summaries `Dependency::matches`, yanked ones included and marked.
     Exact,
@@ -86,25 +88,40 @@ impl IndexSummary {
     }
 }
 
+/// Whether a table held the answer to a query.
+#[must_use]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lookup<T = ()> {
+    Answered(T),
+    /// The table does not hold it yet (an index file not fetched): the resolve machine
+    /// ([`crate::resolving::Resolving`]) asks its driver for it as an
+    /// [`Ask`](crate::resolving::Ask), and the round that met it is thrown away.
+    Unknown,
+}
+
 /// The sources as the resolver sees them, with `[patch]`, `[replace]` and source replacement
-/// already applied by whoever implements it.
+/// already applied by whoever implements it: a synchronous table of what is known now.
 ///
-/// A query that needs the network awaits it. The resolver asks for everything it can, runs
-/// what is pending at once and starts again, so a graph's index files are fetched together.
-/// It polls on one thread, so the futures need not be `Send`.
-#[allow(async_fn_in_trait)]
+/// It never waits. What it cannot answer from what it holds (an index file not fetched) it
+/// answers [`Lookup::Unknown`]; the resolve machine collects every such query of a round into
+/// one [`Effect::Query`](crate::resolving::Effect::Query), so a graph's index files are
+/// fetched together, by the driver, and resolves again over the answers.
 pub trait Registry {
-    /// Calls `f` with each summary of `dep`'s name that matches it as `kind` says.
-    async fn query(
+    /// Calls `f` with each summary of `dep`'s name that matches it as `kind` says, or calls it
+    /// never and answers [`Lookup::Unknown`].
+    fn query(
         &self,
         dep: &Dependency,
         kind: QueryKind,
         f: &mut impl FnMut(IndexSummary),
-    ) -> Result<()>;
+    ) -> Result<Lookup>;
 
-    async fn query_vec(&self, dep: &Dependency, kind: QueryKind) -> Result<Vec<IndexSummary>> {
+    fn query_vec(&self, dep: &Dependency, kind: QueryKind) -> Result<Lookup<Vec<IndexSummary>>> {
         let mut ret = Vec::new();
-        self.query(dep, kind, &mut |s| ret.push(s)).await.map(|()| ret)
+        Ok(match self.query(dep, kind, &mut |s| ret.push(s))? {
+            Lookup::Answered(()) => Lookup::Answered(ret),
+            Lookup::Unknown => Lookup::Unknown,
+        })
     }
 
     /// How to name the source in messages.
@@ -114,10 +131,29 @@ pub trait Registry {
     fn is_replaced(&self, source: SourceId) -> bool;
 }
 
+impl<R: Registry> Registry for &R {
+    fn query(
+        &self,
+        dep: &Dependency,
+        kind: QueryKind,
+        f: &mut impl FnMut(IndexSummary),
+    ) -> Result<Lookup> {
+        (**self).query(dep, kind, f)
+    }
+
+    fn describe_source(&self, source: SourceId) -> String {
+        (**self).describe_source(source)
+    }
+
+    fn is_replaced(&self, source: SourceId) -> bool {
+        (**self).is_replaced(source)
+    }
+}
+
 /// A registry held in memory: the resolver's tests, and sources already read.
 #[derive(Default, Debug, Clone)]
 pub struct MemRegistry {
-    packages: HashMap<InternedString, Vec<IndexSummary>, Global>,
+    packages: Map<InternedString, Vec<IndexSummary>, FixedState, Global>,
 }
 
 impl MemRegistry {
@@ -128,25 +164,10 @@ impl MemRegistry {
     pub fn add(&mut self, summary: IndexSummary) {
         self.packages.entry(summary.package_id().name()).or_default().push(summary);
     }
-}
 
-impl FromIterator<Summary> for MemRegistry {
-    fn from_iter<I: IntoIterator<Item = Summary>>(iter: I) -> Self {
-        let mut registry = MemRegistry::new();
-        for summary in iter {
-            registry.add(IndexSummary::Candidate(summary));
-        }
-        registry
-    }
-}
-
-impl Registry for MemRegistry {
-    async fn query(
-        &self,
-        dep: &Dependency,
-        kind: QueryKind,
-        f: &mut impl FnMut(IndexSummary),
-    ) -> Result<()> {
+    /// Calls `f` with each summary it holds that matches `dep` as `kind` says: a table in
+    /// memory always answers.
+    pub fn matching(&self, dep: &Dependency, kind: QueryKind, f: &mut impl FnMut(IndexSummary)) {
         let normalized = |s: &str| s.replace('-', "_");
         for (name, summaries) in &self.packages {
             let name_matches = match kind {
@@ -171,7 +192,28 @@ impl Registry for MemRegistry {
                 }
             }
         }
-        Ok(())
+    }
+}
+
+impl FromIterator<Summary> for MemRegistry {
+    fn from_iter<I: IntoIterator<Item = Summary>>(iter: I) -> Self {
+        let mut registry = MemRegistry::new();
+        for summary in iter {
+            registry.add(IndexSummary::Candidate(summary));
+        }
+        registry
+    }
+}
+
+impl Registry for MemRegistry {
+    fn query(
+        &self,
+        dep: &Dependency,
+        kind: QueryKind,
+        f: &mut impl FnMut(IndexSummary),
+    ) -> Result<Lookup> {
+        self.matching(dep, kind, f);
+        Ok(Lookup::Answered(()))
     }
 
     fn describe_source(&self, source: SourceId) -> String {
@@ -186,8 +228,8 @@ impl Registry for MemRegistry {
 /// Asks `pinned` first when `dep` is exact and its source has no registry or its version is
 /// locked. `Ok(true)` when that answered (or `dep` is a path), so the caller asks no further;
 /// an unregistered source `pinned` does not hold is refused.
-pub async fn query_pinned(
-    pinned: &impl Registry,
+pub fn query_pinned(
+    pinned: &MemRegistry,
     registered: bool,
     dep: &Dependency,
     kind: QueryKind,
@@ -198,22 +240,18 @@ pub async fn query_pinned(
         return Ok(false);
     }
     let mut found = false;
-    pinned
-        .query(dep, kind, &mut |it| {
-            found = true;
-            f(it)
-        })
-        .await?;
+    pinned.matching(dep, kind, &mut |it| {
+        found = true;
+        f(it)
+    });
     if found || dep.source_id().is_path() {
         return Ok(true);
     }
     if !registered {
-        anyhow::bail!(
-            "`{}` of {} is not pinned by Cargo.lock, and blaze reads that source only at the \
-             versions Cargo.lock pins",
-            dep.package_name(),
-            describe(dep.source_id())
-        );
+        return Err(ResolveError::NotPinned {
+            dep: dep.package_name(),
+            source: describe(dep.source_id()),
+        });
     }
     Ok(false)
 }
@@ -230,9 +268,7 @@ mod tests {
     }
 
     fn versions(r: &MemRegistry, dep: &Dependency, kind: QueryKind) -> Vec<String> {
-        let mut query = std::pin::pin!(r.query_vec(dep, kind));
-        let cx = &mut std::task::Context::from_waker(std::task::Waker::noop());
-        let std::task::Poll::Ready(Ok(found)) = query.as_mut().poll(cx) else { panic!() };
+        let Ok(Lookup::Answered(found)) = r.query_vec(dep, kind) else { panic!() };
         let mut found: Vec<_> = found
             .iter()
             .map(|s| {
@@ -267,49 +303,37 @@ mod tests {
         assert_eq!(versions(&r, &dep, QueryKind::AlternativeNames), ["1.0.0"]);
     }
 
-    /// A registry that waits once before it answers, as one fetching an index file does.
-    struct Fetching(MemRegistry);
+    /// A table that does not hold the index file yet, as one before its fetch.
+    struct Unfetched;
 
-    impl Registry for Fetching {
-        async fn query(
+    impl Registry for Unfetched {
+        fn query(
             &self,
-            dep: &Dependency,
-            kind: QueryKind,
-            f: &mut impl FnMut(IndexSummary),
-        ) -> Result<()> {
-            let mut fetched = false;
-            std::future::poll_fn(|_| {
-                if std::mem::replace(&mut fetched, true) {
-                    std::task::Poll::Ready(())
-                } else {
-                    std::task::Poll::Pending
-                }
-            })
-            .await;
-            self.0.query(dep, kind, f).await
+            _dep: &Dependency,
+            _kind: QueryKind,
+            _f: &mut impl FnMut(IndexSummary),
+        ) -> Result<Lookup> {
+            Ok(Lookup::Unknown)
         }
 
         fn describe_source(&self, source: SourceId) -> String {
-            self.0.describe_source(source)
+            source.to_string()
         }
 
-        fn is_replaced(&self, source: SourceId) -> bool {
-            self.0.is_replaced(source)
+        fn is_replaced(&self, _source: SourceId) -> bool {
+            false
         }
     }
 
+    /// `query_vec` passes on "not known yet" and gives nothing.
     #[test]
-    fn a_query_may_wait() {
-        let r = Fetching([summary("foo", "1.0.0")].into_iter().collect());
+    fn an_unknown_answer_gives_nothing() {
         let dep = Dependency::parse("foo", Some("1"), SourceId::crates_io()).unwrap();
-        let mut query = std::pin::pin!(r.query_vec(&dep, QueryKind::Exact));
-        let cx = &mut std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(query.as_mut().poll(cx).is_pending());
-        let std::task::Poll::Ready(Ok(found)) = query.as_mut().poll(cx) else { panic!() };
-        assert_eq!(found.len(), 1);
+        assert!(matches!(Unfetched.query_vec(&dep, QueryKind::Exact), Ok(Lookup::Unknown)));
+        assert!(matches!((&Unfetched).query_vec(&dep, QueryKind::Exact), Ok(Lookup::Unknown)));
     }
 
-    /// `query_pinned` of `dep` against `pinned`, polled once: its answer and what it gave `f`.
+    /// `query_pinned` of `dep` against `pinned`: its answer and what it gave `f`.
     fn pinned_answer(
         pinned: &MemRegistry,
         registered: bool,
@@ -319,13 +343,7 @@ mod tests {
         let mut given = Vec::new();
         let mut f = |it: IndexSummary| given.push(it.package_id().version().to_string());
         let describe = |it: SourceId| format!("the source `{it}`");
-        let answer = {
-            let mut query =
-                std::pin::pin!(query_pinned(pinned, registered, dep, kind, &mut f, describe));
-            let cx = &mut std::task::Context::from_waker(std::task::Waker::noop());
-            let std::task::Poll::Ready(answer) = query.as_mut().poll(cx) else { panic!() };
-            answer
-        };
+        let answer = query_pinned(pinned, registered, dep, kind, &mut f, describe);
         (answer, given)
     }
 

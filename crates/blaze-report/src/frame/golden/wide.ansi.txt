@@ -1,0 +1,7 @@
+[0;1;33mwarning  [0ma bare [0;2m`[0;1mas[0;2m` [0mcast to an integer
+  [0;2m╭─ [0msrc/greet.rs[0;2m:2:26[0m
+[0;2m1 │ fn greet() {[0m
+[0;2m2 │     [0mlet 名前 [0;2m= "世界🌍";    [0mlet n [0;2m= [0;1m名前.len() as u8[0;2m;[0m
+  [0;2m│                                     [0;33m^^^^^^^^^^^^^^^^[0m
+  [0;2m│                                     ╰─ [0;33mtruncates[0m
+  [0;2m╰─ blaze explain lint:casts[0m

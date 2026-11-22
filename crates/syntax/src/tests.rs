@@ -7,7 +7,7 @@ use std::{
 
 use ast::{HasModuleItem, HasName};
 use blaze_graph::par;
-use expect_test::expect_file;
+use test_utils::expect_file;
 use parser::Edition;
 use stdx::format_to_acc;
 use test_utils::{bench, bench_fixture, project_root};
@@ -114,6 +114,22 @@ fn reparse_fuzz_tests() {
     }
 }
 
+/// The syntax extensions a file that is its own crate's root turns on with its inner
+/// attributes (`#![blaze::uniq]`, `#![blaze::error_unions]`, `#![blaze::records]`), as that
+/// crate would parse it: crates/blaze-real/extensions holds one-file programs that do. Every
+/// other file is parsed under none, its crate's (blaze's crates turn none on).
+fn own_gates(text: &str) -> crate::Extensions {
+    let gates = [
+        ("#![blaze::uniq]", crate::Extensions::UNIQ),
+        ("#![blaze::error_unions]", crate::Extensions::ERROR_UNIONS),
+        ("#![blaze::records]", crate::Extensions::RECORDS),
+    ];
+    text.lines()
+        .map(str::trim)
+        .filter_map(|line| gates.iter().find(|(attr, _)| line == *attr))
+        .fold(crate::Extensions::NONE, |on, (_, gate)| on.with(*gate))
+}
+
 /// Test that Rust-analyzer can parse and validate the rust-analyzer
 #[test]
 fn self_hosting_parsing() {
@@ -150,7 +166,8 @@ fn self_hosting_parsing() {
 
     let errors = par::filter_map(files, |file| {
         let text = read_text(&file);
-        match SourceFile::parse(&text, Edition::CURRENT).ok() {
+        match SourceFile::parse_shared_with(text.as_str(), Edition::CURRENT, own_gates(&text)).ok()
+        {
             Ok(_) => None,
             Err(err) => Some((file, err)),
         }

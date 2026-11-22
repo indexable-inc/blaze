@@ -4,17 +4,12 @@
 //! reads them as the views `job_intervals`, `span_time`, `path_links` and `core_busy`.
 
 use std::{
+    alloc::Global,
     fmt::Write as _,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
-use arrow_array::{
-    Array, ArrayRef, Int64Array, PrimitiveArray, RecordBatch, StringArray, UInt32Array,
-    UInt64Array,
-    cast::AsArray,
-    types::{Float64Type, Int64Type, UInt64Type},
-};
+use blaze_columns::{Native, Prim, Strs};
 use blaze_graph::wait::OwnedBy;
 
 use super::{
@@ -24,7 +19,12 @@ use super::{
     report::{self, By},
     trace,
 };
-use crate::{batches, history, schema, schema::Table, sql};
+use crate::{
+    columns::{self, Batch, BatchError, Column},
+    history, schema,
+    schema::Table,
+    sql,
+};
 
 /// Where the history is, and the DuckDB that reads it.
 #[derive(Clone, Copy, Debug)]
@@ -118,7 +118,7 @@ pub(crate) fn query(
     source: &Source<'_>,
     sql: &str,
     doing: &'static str,
-) -> Result<Vec<RecordBatch>, TimeError> {
+) -> Result<Vec<Batch>, TimeError> {
     sql::run(&sql::Query {
         duckdb: source.duckdb,
         history: source.history,
@@ -134,7 +134,7 @@ pub(crate) fn query_many(
     source: &Source<'_>,
     sqls: &[&str],
     doing: &'static str,
-) -> Result<Vec<Vec<RecordBatch>>, TimeError> {
+) -> Result<Vec<Vec<Batch>>, TimeError> {
     query_many_in(source, sql::Scope::All, sqls, doing)
 }
 
@@ -145,7 +145,7 @@ pub(crate) fn query_many_in(
     scope: sql::Scope,
     sqls: &[&str],
     doing: &'static str,
-) -> Result<Vec<Vec<RecordBatch>>, TimeError> {
+) -> Result<Vec<Vec<Batch>>, TimeError> {
     let answers = sql::run_all(source.duckdb, source.history, scope, sqls)
         .map_err(|error| TimeError::Sql { doing, error })?;
     if answers.len() != sqls.len() {
@@ -163,8 +163,8 @@ pub(crate) fn query_all<const N: usize>(
     source: &Source<'_>,
     sqls: [&str; N],
     doing: &'static str,
-) -> Result<[Vec<RecordBatch>; N], TimeError> {
-    <[Vec<RecordBatch>; N]>::try_from(query_many(source, &sqls, doing)?).map_err(|_| {
+) -> Result<[Vec<Batch>; N], TimeError> {
+    <[Vec<Batch>; N]>::try_from(query_many(source, &sqls, doing)?).map_err(|_| {
         TimeError::BadColumn {
             table: "answers",
             column: "count",
@@ -428,7 +428,7 @@ fn by_floor(
 }
 
 /// [`cut_sql`]'s answer: (bucket, spans, time) each.
-fn buckets(batches: &[RecordBatch]) -> Result<Vec<(usize, u64, i64)>, TimeError> {
+fn buckets(batches: &[Batch]) -> Result<Vec<(usize, u64, i64)>, TimeError> {
     // alloc: the buckets, once a pass a report
     let mut out = Vec::with_capacity(FLOORS_NS.len());
     for batch in batches {
@@ -450,7 +450,7 @@ fn buckets(batches: &[RecordBatch]) -> Result<Vec<(usize, u64, i64)>, TimeError>
 
 /// The first pass's floor for `build`'s spans by [`cut_sql`]'s answer `batches`, or the hard
 /// bound's refusal when not even its unended spans fit.
-fn cut_of(batches: &[RecordBatch], build: u64) -> Result<SpanCut, TimeError> {
+fn cut_of(batches: &[Batch], build: u64) -> Result<SpanCut, TimeError> {
     let (kept, cut_ns, total) = by_floor(&buckets(batches)?);
     let Some(at) = floor_within(&kept, SPAN_BUDGET, SPAN_BUDGET - PATH_BUDGET) else {
         let last = FLOORS_NS.len() - 1;
@@ -671,11 +671,11 @@ fn groups_sql(spans: &str, floor: i64, by_subject: bool) -> String {
 }
 
 /// [`groups_sql`]'s answer.
-fn groups(batches: &[RecordBatch]) -> Result<Vec<CutGroup>, TimeError> {
+fn groups(batches: &[Batch]) -> Result<Vec<CutGroup>, TimeError> {
     const T: &str = "spans";
     // alloc: the groups, once a report
     let mut out = Vec::new();
-    let text = |it: &StringArray, row: usize| get(it, row, |it, row| it.value(row).to_owned());
+    let text = |it: Strs<'_, Global>, row: usize| get(it, row, |it, row| it.value(row).to_owned());
     for batch in batches {
         let (name, krate, subject) =
             (texts(batch, T, "name")?, texts(batch, T, "krate")?, texts(batch, T, "subject")?);
@@ -992,11 +992,11 @@ fn of_build(table: &str, build: u64, added: &str, window: Option<String>) -> Str
 }
 
 pub(crate) fn array<'a>(
-    batch: &'a RecordBatch,
+    batch: &'a Batch,
     table: &'static str,
     column: &'static str,
-) -> Result<&'a dyn Array, TimeError> {
-    batch.column_by_name(column).map(|it| it.as_ref()).ok_or(TimeError::BadColumn {
+) -> Result<&'a Column, TimeError> {
+    batch.column_by_name(column).ok_or(TimeError::BadColumn {
         table,
         column,
         why: "is not among the rows DuckDB answered",
@@ -1004,11 +1004,11 @@ pub(crate) fn array<'a>(
 }
 
 pub(crate) fn ints<'a>(
-    batch: &'a RecordBatch,
+    batch: &'a Batch,
     table: &'static str,
     column: &'static str,
-) -> Result<&'a PrimitiveArray<Int64Type>, TimeError> {
-    array(batch, table, column)?.as_primitive_opt::<Int64Type>().ok_or(TimeError::BadColumn {
+) -> Result<Prim<'a, i64>, TimeError> {
+    array(batch, table, column)?.i64s().ok_or(TimeError::BadColumn {
         table,
         column,
         why: "is not a BIGINT",
@@ -1016,11 +1016,11 @@ pub(crate) fn ints<'a>(
 }
 
 pub(crate) fn uints<'a>(
-    batch: &'a RecordBatch,
+    batch: &'a Batch,
     table: &'static str,
     column: &'static str,
-) -> Result<&'a PrimitiveArray<UInt64Type>, TimeError> {
-    array(batch, table, column)?.as_primitive_opt::<UInt64Type>().ok_or(TimeError::BadColumn {
+) -> Result<Prim<'a, u64>, TimeError> {
+    array(batch, table, column)?.u64s().ok_or(TimeError::BadColumn {
         table,
         column,
         why: "is not a UBIGINT",
@@ -1028,28 +1028,41 @@ pub(crate) fn uints<'a>(
 }
 
 pub(crate) fn texts<'a>(
-    batch: &'a RecordBatch,
+    batch: &'a Batch,
     table: &'static str,
     column: &'static str,
-) -> Result<&'a StringArray, TimeError> {
-    array(batch, table, column)?.as_string_opt::<i32>().ok_or(TimeError::BadColumn {
+) -> Result<Strs<'a, Global>, TimeError> {
+    array(batch, table, column)?.strs().ok_or(TimeError::BadColumn {
         table,
         column,
         why: "is not a VARCHAR",
     })
 }
 
-pub(crate) fn get<'a, A: Array, T>(
-    array: &'a A,
-    row: usize,
-    value: impl FnOnce(&'a A, usize) -> T,
-) -> Option<T> {
+/// A column view whose rows may be null: what [`get`] reads.
+pub(crate) trait Cells: Copy {
+    fn is_null(&self, row: usize) -> bool;
+}
+
+impl<T: Native> Cells for Prim<'_, T> {
+    fn is_null(&self, row: usize) -> bool {
+        Prim::is_null(self, row)
+    }
+}
+
+impl Cells for Strs<'_, Global> {
+    fn is_null(&self, row: usize) -> bool {
+        Strs::is_null(self, row)
+    }
+}
+
+pub(crate) fn get<A: Cells, T>(array: A, row: usize, value: impl FnOnce(A, usize) -> T) -> Option<T> {
     (!array.is_null(row)).then(|| value(array, row))
 }
 
 /// A column of a batch that must not be null, as `u32`.
 fn u32_at(
-    array: &PrimitiveArray<Int64Type>,
+    array: Prim<'_, i64>,
     row: usize,
     table: &'static str,
     column: &'static str,
@@ -1059,10 +1072,10 @@ fn u32_at(
         .ok_or(TimeError::BadColumn { table, column, why: "is null or past u32" })
 }
 
-fn switches(batches: &[RecordBatch]) -> Result<Vec<SwitchIn>, TimeError> {
+fn switches(batches: &[Batch]) -> Result<Vec<SwitchIn>, TimeError> {
     const T: &str = "switches";
     // alloc: the build's switches, once a report
-    let mut out = Vec::with_capacity(batches.iter().map(RecordBatch::num_rows).sum());
+    let mut out = Vec::with_capacity(batches.iter().map(Batch::num_rows).sum());
     for batch in batches {
         let (process, thread, t_ns, event) = (
             ints(batch, T, "process")?,
@@ -1112,11 +1125,11 @@ fn switches(batches: &[RecordBatch]) -> Result<Vec<SwitchIn>, TimeError> {
     Ok(out)
 }
 
-fn spans_of(batches: &[RecordBatch]) -> Result<Vec<SpanIn>, TimeError> {
+fn spans_of(batches: &[Batch]) -> Result<Vec<SpanIn>, TimeError> {
     const T: &str = "spans";
     // alloc: the build's spans, once a report
-    let mut out = Vec::with_capacity(batches.iter().map(RecordBatch::num_rows).sum());
-    let text = |it: &StringArray, row: usize| get(it, row, |it, row| it.value(row).to_owned());
+    let mut out = Vec::with_capacity(batches.iter().map(Batch::num_rows).sum());
+    let text = |it: Strs<'_, Global>, row: usize| get(it, row, |it, row| it.value(row).to_owned());
     for batch in batches {
         let (process, thread, span_id, parent) = (
             ints(batch, T, "process")?,
@@ -1181,11 +1194,11 @@ fn spans_of(batches: &[RecordBatch]) -> Result<Vec<SpanIn>, TimeError> {
 
 /// The events of `batches`, each with its fields from `fields` (ordered by process, event and
 /// ordinal). An event of a file older than schema version 5 has no id (0) and no fields.
-fn events(batches: &[RecordBatch], fields: &[RecordBatch]) -> Result<Vec<EventIn>, TimeError> {
+fn events(batches: &[Batch], fields: &[Batch]) -> Result<Vec<EventIn>, TimeError> {
     const T: &str = "events";
     // alloc: the build's events, once a report
-    let mut out = Vec::with_capacity(batches.iter().map(RecordBatch::num_rows).sum());
-    let text = |it: &StringArray, row: usize| get(it, row, |it, row| it.value(row).to_owned());
+    let mut out = Vec::with_capacity(batches.iter().map(Batch::num_rows).sum());
+    let text = |it: Strs<'_, Global>, row: usize| get(it, row, |it, row| it.value(row).to_owned());
     let mut fields_of = event_fields(fields)?;
     for batch in batches {
         let (process, thread, t_ns, job) = (
@@ -1232,15 +1245,24 @@ fn events(batches: &[RecordBatch], fields: &[RecordBatch]) -> Result<Vec<EventIn
 
 /// The rows of `event_fields` in `batches`, by process and event, each event's in order.
 fn event_fields(
-    batches: &[RecordBatch],
+    batches: &[Batch],
 ) -> Result<
-    blaze_hash::HashMap<(u32, u64), Vec<(String, crate::logs::Value)>, std::alloc::Global>,
+    blaze_hash::Map<
+        (u32, u64),
+        Vec<(String, crate::logs::Value)>,
+        blaze_hash::FixedState,
+        std::alloc::Global,
+    >,
     TimeError,
 > {
     use crate::logs::Value;
     const T: &str = "event_fields";
     // alloc: the build's event fields, once a report
-    let mut out = blaze_hash::HashMap::new_in(std::alloc::Global);
+    let mut out = blaze_hash::Map::new(blaze_hash::MapOpts {
+        hasher: blaze_hash::FixedState,
+        alloc: std::alloc::Global,
+        capacity: None,
+    });
     for batch in batches {
         let (process, event_id, key, kind) = (
             ints(batch, T, "process")?,
@@ -1253,11 +1275,11 @@ fn event_fields(
             uints(batch, T, "value_u64")?,
             texts(batch, T, "value_str")?,
         );
-        let value_f64 = array(batch, T, "value_f64")?.as_primitive_opt::<Float64Type>().ok_or(
+        let value_f64 = array(batch, T, "value_f64")?.f64s().ok_or(
             TimeError::BadColumn { table: T, column: "value_f64", why: "is not a DOUBLE" },
         )?;
         let value_bool =
-            array(batch, T, "value_bool")?.as_boolean_opt().ok_or(TimeError::BadColumn {
+            array(batch, T, "value_bool")?.bools().ok_or(TimeError::BadColumn {
                 table: T,
                 column: "value_bool",
                 why: "is not a BOOLEAN",
@@ -1308,7 +1330,7 @@ pub fn write(dir: &Path, model: &Model, path: &CriticalPath) -> Result<Vec<PathB
         (&schema::PATH_LINKS, path_links(model, path)),
         (&schema::CORE_BUSY, core_busy(model)),
     ] {
-        let batch = batch.map_err(|error| TimeError::Arrow { table: table.name, error })?;
+        let batch = batch.map_err(TimeError::Batch)?;
         // alloc: a file's name, once a table a report
         let file = dir.join(format!("{}-00000000.{}.parquet", model.build, table.name));
         written.push(file);
@@ -1316,26 +1338,30 @@ pub fn write(dir: &Path, model: &Model, path: &CriticalPath) -> Result<Vec<PathB
     }
     // Listed in the manifest in one commit, in place of the last report's of the build, which
     // the same names replace ([`history::write_listed`]).
-    let files: Vec<(&Path, &'static Table, &[RecordBatch])> =
+    let files: Vec<(&Path, &'static Table, &[Batch])> =
         // alloc: once a report
         written.iter().zip(&rows).map(|(file, (table, batch))| (file.as_path(), *table, batch.as_slice())).collect();
     history::write_listed(dir, &files).map_err(TimeError::History)?;
     Ok(written)
 }
 
-fn column(array: impl Array + 'static) -> ArrayRef {
-    // alloc: a batch's column, once a table a report
-    Arc::new(array)
+fn values<T: Native>(values: impl IntoIterator<Item = T>) -> Column {
+    Column::values(values, Global)
 }
 
-fn batch(
-    table: &'static Table,
-    columns: Vec<ArrayRef>,
-) -> Result<RecordBatch, arrow_schema::ArrowError> {
-    RecordBatch::try_new(batches::schema_of(table), columns)
+fn options<T: Native>(values: impl IntoIterator<Item = Option<T>>) -> Column {
+    Column::options(values, Global)
 }
 
-fn job_intervals(model: &Model) -> Result<RecordBatch, arrow_schema::ArrowError> {
+fn texts_of<'s>(texts: impl IntoIterator<Item = &'s str>) -> Column {
+    Column::texts_of(texts, Global)
+}
+
+fn opt_texts_of<'s>(texts: impl IntoIterator<Item = Option<&'s str>>) -> Column {
+    Column::opt_texts_of(texts, Global)
+}
+
+fn job_intervals(model: &Model) -> Result<Batch, BatchError> {
     // alloc: once a report
     let rows: Vec<(&super::Lane, &super::Interval)> = model
         .lanes
@@ -1347,78 +1373,64 @@ fn job_intervals(model: &Model) -> Result<RecordBatch, arrow_schema::ArrowError>
         State::Running { core, thread, end } => Some((core, thread, end)),
         _ => None,
     };
-    batch(
+    columns::batch(
         &schema::JOB_INTERVALS,
         // alloc: a batch's columns, once a report
-        vec![
-            column(UInt64Array::from_iter_values(rows.iter().map(|_| model.build))),
-            column(UInt32Array::from_iter_values(rows.iter().map(|(lane, _)| lane.id.process()))),
-            column(UInt64Array::from_iter(rows.iter().map(|(lane, _)| lane.id.job()))),
-            column(UInt32Array::from_iter(rows.iter().map(|(lane, _)| match lane.id {
+        [
+            values(rows.iter().map(|_| model.build)),
+            values(rows.iter().map(|(lane, _)| lane.id.process())),
+            options(rows.iter().map(|(lane, _)| lane.id.job())),
+            options(rows.iter().map(|(lane, _)| match lane.id {
                 LaneId::Thread { thread, .. } => Some(thread),
                 LaneId::Job { .. } => None,
-            }))),
-            column(UInt32Array::from_iter(rows.iter().map(|(lane, _)| lane.fiber))),
-            column(StringArray::from_iter_values(rows.iter().map(|(_, it)| it.state.name()))),
-            column(Int64Array::from_iter_values(rows.iter().map(|(_, it)| it.from_ns))),
-            column(Int64Array::from_iter_values(rows.iter().map(|(_, it)| it.to_ns))),
-            column(Int64Array::from_iter_values(rows.iter().map(|(_, it)| it.dur_ns()))),
-            column(UInt32Array::from_iter(
-                rows.iter().map(|(_, it)| running(it).and_then(|it| it.0)),
-            )),
-            column(UInt32Array::from_iter(rows.iter().map(|(_, it)| running(it).map(|it| it.1)))),
-            column(StringArray::from_iter(
-                rows.iter().map(|(_, it)| running(it).map(|it| it.2.name())),
-            )),
-            column(StringArray::from_iter(
+            })),
+            options(rows.iter().map(|(lane, _)| lane.fiber)),
+            texts_of(rows.iter().map(|(_, it)| it.state.name())),
+            values(rows.iter().map(|(_, it)| it.from_ns)),
+            values(rows.iter().map(|(_, it)| it.to_ns)),
+            values(rows.iter().map(|(_, it)| it.dur_ns())),
+            options(rows.iter().map(|(_, it)| running(it).and_then(|it| it.0))),
+            options(rows.iter().map(|(_, it)| running(it).map(|it| it.1))),
+            opt_texts_of(rows.iter().map(|(_, it)| running(it).map(|it| it.2.name()))),
+            opt_texts_of(
                 rows.iter().map(|(_, it)| wait(it).and_then(|w| w.on).map(|on| on.name())),
-            )),
-            column(UInt64Array::from_iter(
-                rows.iter().map(|(_, it)| wait(it).and_then(|w| w.on.map(|_| w.value))),
-            )),
-            column(StringArray::from_iter(rows.iter().map(|(_, it)| {
+            ),
+            options(rows.iter().map(|(_, it)| wait(it).and_then(|w| w.on.map(|_| w.value)))),
+            opt_texts_of(rows.iter().map(|(_, it)| {
                 wait(it).and_then(|w| w.span).and_then(|s| model.spans[s].awaits.as_deref())
-            }))),
-            column(UInt64Array::from_iter(rows.iter().map(|(_, it)| {
+            })),
+            options(rows.iter().map(|(_, it)| {
                 wait(it).and_then(|w| w.waker.lane()).and_then(|l| model.lanes[l].id.job())
-            }))),
-            column(StringArray::from_iter(
-                rows.iter().map(|(_, it)| wait(it).map(|w| w.waker.name())),
-            )),
-            column(UInt64Array::from_iter(
-                rows.iter().map(|(_, it)| it.inside.map(|s| model.spans[s].span_id)),
-            )),
-            column(StringArray::from_iter(rows.iter().map(|(_, it)| match it.state {
+            })),
+            opt_texts_of(rows.iter().map(|(_, it)| wait(it).map(|w| w.waker.name()))),
+            options(rows.iter().map(|(_, it)| it.inside.map(|s| model.spans[s].span_id))),
+            opt_texts_of(rows.iter().map(|(_, it)| match it.state {
                 State::Unrecorded { why } => Some(why.name()),
                 _ => None,
-            }))),
+            })),
         ],
     )
 }
 
-fn span_time(model: &Model) -> Result<RecordBatch, arrow_schema::ArrowError> {
+fn span_time(model: &Model) -> Result<Batch, BatchError> {
     let spans = &model.spans;
     let times = &model.span_time;
-    let ns = |at: fn(&super::SpanTime) -> i64| {
-        column(Int64Array::from_iter_values(times.iter().map(at)))
-    };
-    batch(
+    let ns = |at: fn(&super::SpanTime) -> i64| values(times.iter().map(at));
+    columns::batch(
         &schema::SPAN_TIME,
         // alloc: a batch's columns, once a report
-        vec![
-            column(UInt64Array::from_iter_values(spans.iter().map(|_| model.build))),
-            column(UInt32Array::from_iter_values(spans.iter().map(|it| it.process))),
-            column(UInt64Array::from_iter_values(spans.iter().map(|it| it.span_id))),
-            column(UInt64Array::from_iter(
-                times.iter().map(|it| it.lane.and_then(|l| model.lanes[l].id.job())),
-            )),
-            column(UInt32Array::from_iter_values(spans.iter().map(|it| it.thread))),
-            column(StringArray::from_iter_values(spans.iter().map(|it| it.name.as_str()))),
-            column(StringArray::from_iter(spans.iter().map(|it| it.krate.as_deref()))),
-            column(StringArray::from_iter(spans.iter().map(|it| it.function.as_deref()))),
-            column(StringArray::from_iter(spans.iter().map(|it| it.unit.as_deref()))),
-            column(Int64Array::from_iter_values(spans.iter().map(|it| it.start_ns))),
-            column(Int64Array::from_iter_values(spans.iter().map(|it| it.dur_ns))),
+        [
+            values(spans.iter().map(|_| model.build)),
+            values(spans.iter().map(|it| it.process)),
+            values(spans.iter().map(|it| it.span_id)),
+            options(times.iter().map(|it| it.lane.and_then(|l| model.lanes[l].id.job()))),
+            values(spans.iter().map(|it| it.thread)),
+            texts_of(spans.iter().map(|it| it.name.as_str())),
+            opt_texts_of(spans.iter().map(|it| it.krate.as_deref())),
+            opt_texts_of(spans.iter().map(|it| it.function.as_deref())),
+            opt_texts_of(spans.iter().map(|it| it.unit.as_deref())),
+            values(spans.iter().map(|it| it.start_ns)),
+            values(spans.iter().map(|it| it.dur_ns)),
             ns(|it| it.totals.running_ns),
             ns(|it| it.totals.parked_ns),
             ns(|it| it.totals.queued_ns),
@@ -1430,56 +1442,56 @@ fn span_time(model: &Model) -> Result<RecordBatch, arrow_schema::ArrowError> {
     )
 }
 
-fn path_links(model: &Model, path: &CriticalPath) -> Result<RecordBatch, arrow_schema::ArrowError> {
+fn path_links(model: &Model, path: &CriticalPath) -> Result<Batch, BatchError> {
     let links = &path.links;
     let lane = |it: &path::Link| &model.lanes[it.lane];
-    batch(
+    // alloc: a cell, once a row a report
+    let lanes: Vec<String> = links.iter().map(|it| lane(it).id.to_string()).collect();
+    // alloc: a cell, once a row a report
+    let items: Vec<String> = links.iter().map(|it| report::link_item(model, it)).collect();
+    // alloc: a cell, once a row a report
+    let wakes: Vec<Option<String>> =
+        links.iter().map(|it| it.wakes.map(|w| model.wait_label(&model.waits[w]))).collect();
+    columns::batch(
         &schema::PATH_LINKS,
         // alloc: a batch's columns, once a report
-        vec![
-            column(UInt64Array::from_iter_values(links.iter().map(|_| model.build))),
-            column(UInt64Array::from_iter_values(0..links.len() as u64)),
-            column(StringArray::from_iter_values(links.iter().map(|it| it.kind.name()))),
-            column(UInt32Array::from_iter_values(links.iter().map(|it| lane(it).id.process()))),
-            column(UInt64Array::from_iter(links.iter().map(|it| lane(it).id.job()))),
-            // alloc: a cell, once a row a report
-            column(StringArray::from_iter_values(links.iter().map(|it| lane(it).id.to_string()))),
-            column(UInt32Array::from_iter(links.iter().map(|it| {
-                match lane(it).intervals[it.interval].state {
-                    State::Running { core, .. } => core,
-                    _ => None,
-                }
-            }))),
-            column(Int64Array::from_iter_values(links.iter().map(|it| it.from_ns))),
-            column(Int64Array::from_iter_values(links.iter().map(|it| it.to_ns))),
-            column(Int64Array::from_iter_values(links.iter().map(path::Link::dur_ns))),
-            column(StringArray::from_iter_values(
-                links.iter().map(|it| report::link_item(model, it)),
-            )),
-            column(UInt64Array::from_iter(
+        [
+            values(links.iter().map(|_| model.build)),
+            values(0..links.len() as u64),
+            texts_of(links.iter().map(|it| it.kind.name())),
+            values(links.iter().map(|it| lane(it).id.process())),
+            options(links.iter().map(|it| lane(it).id.job())),
+            Column::texts(&lanes, Global),
+            options(links.iter().map(|it| match lane(it).intervals[it.interval].state {
+                State::Running { core, .. } => core,
+                _ => None,
+            })),
+            values(links.iter().map(|it| it.from_ns)),
+            values(links.iter().map(|it| it.to_ns)),
+            values(links.iter().map(path::Link::dur_ns)),
+            Column::texts(&items, Global),
+            options(
                 links
                     .iter()
                     .map(|it| it.wakes.and_then(|w| model.lanes[model.waits[w].lane].id.job())),
-            )),
-            column(StringArray::from_iter(
-                links.iter().map(|it| it.wakes.map(|w| model.wait_label(&model.waits[w]))),
-            )),
+            ),
+            Column::opt_texts(&wakes, Global),
         ],
     )
 }
 
-fn core_busy(model: &Model) -> Result<RecordBatch, arrow_schema::ArrowError> {
+fn core_busy(model: &Model) -> Result<Batch, BatchError> {
     let rows = report::core_busy(model, 1_000_000_000);
-    batch(
+    columns::batch(
         &schema::CORE_BUSY,
         // alloc: a batch's columns, once a report
-        vec![
-            column(UInt64Array::from_iter_values(rows.iter().map(|_| model.build))),
-            column(UInt32Array::from_iter_values(rows.iter().map(|it| it.process))),
-            column(UInt32Array::from_iter_values(rows.iter().map(|it| it.core))),
-            column(Int64Array::from_iter_values(rows.iter().map(|it| it.t0_ns))),
-            column(Int64Array::from_iter_values(rows.iter().map(|it| it.t1_ns))),
-            column(Int64Array::from_iter_values(rows.iter().map(|it| it.running_ns))),
+        [
+            values(rows.iter().map(|_| model.build)),
+            values(rows.iter().map(|it| it.process)),
+            values(rows.iter().map(|it| it.core)),
+            values(rows.iter().map(|it| it.t0_ns)),
+            values(rows.iter().map(|it| it.t1_ns)),
+            values(rows.iter().map(|it| it.running_ns)),
         ],
     )
 }

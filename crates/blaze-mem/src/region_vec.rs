@@ -6,7 +6,7 @@
 //! Cost: one bounds compare and one store per push; a commit system call every
 //! `max(committed / 4, 64 KB)` bytes of growth, up to 64 MB per call.
 
-use std::{
+use core::{
     fmt,
     marker::PhantomData,
     mem::{self, MaybeUninit},

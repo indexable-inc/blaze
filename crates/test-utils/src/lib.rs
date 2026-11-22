@@ -11,6 +11,7 @@
 
 mod assert_linear;
 pub mod bench_fixture;
+pub mod expect;
 mod fixture;
 
 use std::{
@@ -22,13 +23,14 @@ use std::{
 
 use paths::Utf8PathBuf;
 use stdx::is_ci;
-use text_size::{TextRange, TextSize};
+use blaze_text_size::{TextRange, TextSize};
 
 pub use blaze_hash::HashMap;
 pub use dissimilar::diff as __diff;
 
 pub use crate::{
     assert_linear::AssertLinear,
+    expect::{Expect, ExpectFile},
     fixture::{Fixture, FixtureWithProjectMeta, MiniCore},
 };
 

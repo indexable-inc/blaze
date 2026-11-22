@@ -12,9 +12,13 @@
 //! names its effects from a base ([`Loop::new`], [`Loop::owns`]), so a test runs a server's
 //! loop and a client's on one simulation.
 //!
-//! [`Driver`] runs one [`Loop`] on the native driver on a thread of its own, with handles
-//! ([`Request`], [`Session`], [`SendStream`], [`RecvStream`]) that post asks to its inbox and
-//! wait for its answers on [`crate::mailbox`] channels: futures any executor polls. A
+//! [`Driver`] runs one [`Loop`] on the native driver on a thread of its own ([`serve`], a
+//! plain blocking loop: drain the inbox, step the machine, submit, wait on the driver to the
+//! machine's deadline, hand the completions back), with handles ([`Request`], [`Session`],
+//! [`SendStream`], [`RecvStream`]) that post asks to its inbox and wait for its answers with
+//! one timed receive each on blaze-core's channel ([`crate::mailbox::answer`]): every wait of
+//! a handle's takes how long it may wait and ends in [`Unanswered::TimedOut`] naming what it
+//! waited for; no future, waker or executor is under them. A
 //! [`RecvStream`] says each piece taken ([`Endpoint::consumed`]) as its reader takes the last
 //! of it, so a slow reader holds its stream back rather than the driver buffering it; a
 //! [`SendStream::write_all`] returns once QUIC took all of its bytes ([`Event::StreamSent`]).
@@ -43,8 +47,9 @@
 //! # The waits
 //!
 //! The driver's one wait is its poll, to the endpoint's next deadline (armed as a timer) or the
-//! next completion or wake. Every connection ends by its idle timeout, and with it every
-//! session and stream, whose handles then fail: no wait of a handle's is open.
+//! next completion or wake. A handle's wait is bounded by the `within` it is given; and every
+//! connection ends by its idle timeout, and with it every session and stream, whose handles
+//! then fail.
 
 use std::{
     alloc::Global,
@@ -57,6 +62,7 @@ use std::{
 
 use blaze_core::{
     self as effects, Dgram, Done, Driver as _, Effect, Tag,
+    chan::{self, Receiver, Sender},
     dgram::{BATCH_MOST, Batch, Ecn, Options, RUN_MOST, SEGMENTS_MOST, Slots},
 };
 
@@ -64,7 +70,7 @@ use super::{
     ClientConfig, Closed, Direction, Endpoint, Error, Event, Identity, ServerConfig, SessionId,
     SessionRequest, Step, StreamRef, Transmit, Waited, Wire,
 };
-use crate::mailbox::{self, Latch, Rx, Setter, Tx};
+use crate::mailbox::{self, Latch, Setter, Unanswered};
 
 /// How many runs one receive takes: each slot one run of up to [`RUN_MOST`] bytes, so a
 /// receive holds about a mebibyte, enough for a full congestion window's burst at a time.
@@ -305,7 +311,7 @@ impl Loop {
             }
         }
         match (op, done) {
-            (Op::Bind, Done::Bound { sock, local }) => self.sock = Some((sock, local)),
+            (Op::Bind, Done::Bound { sock, local, .. }) => self.sock = Some((sock, local)),
             (Op::Bind, Done::Failed(error)) => {
                 let why = format!("binding the UDP socket at {}: {error}", self.at);
                 self.failed = Some(Error { peer: None, step: Step::Config, why });
@@ -356,19 +362,19 @@ impl Loop {
 
 /// What the driver's thread is told by the handles.
 enum Message {
-    Connect { to: SocketAddr, url: String, headers: Vec<(String, String)>, reply: Tx<Result<Session, Closed>> },
-    Accept { session: SessionId, reply: Tx<Result<Session, Closed>> },
+    Connect { to: SocketAddr, url: String, headers: Vec<(String, String)>, reply: Sender<Result<Session, Closed>> },
+    Accept { session: SessionId, reply: Sender<Result<Session, Closed>> },
     Refuse { session: SessionId, status: u16 },
     Open { session: SessionId, open: Opening },
-    Send { stream: StreamRef, bytes: Vec<u8>, reply: Tx<Result<(), StreamError>> },
+    Send { stream: StreamRef, bytes: Vec<u8>, reply: Sender<Result<(), StreamError>> },
     Finish { stream: StreamRef },
     Reset { stream: StreamRef, code: u32 },
     Stop { stream: StreamRef, code: u32 },
     Consumed { stream: StreamRef, bytes: usize },
-    Datagram { session: SessionId, bytes: Vec<u8>, reply: Tx<Result<(), Error>> },
+    Datagram { session: SessionId, bytes: Vec<u8>, reply: Sender<Result<(), Error>> },
     Close { session: SessionId, code: u32, reason: String },
-    SetIdentity { identity: Identity, reply: Tx<Result<(), Error>> },
-    CloseAll { code: u32, reason: String, reply: Tx<()> },
+    SetIdentity { identity: Identity, reply: Sender<Result<(), Error>> },
+    CloseAll { code: u32, reason: String, reply: Sender<()> },
     /// The last [`Driver`] is gone.
     Quit,
 }
@@ -377,8 +383,8 @@ type Inbox = mailbox::Inbox<Message>;
 
 /// A stream asked for, waiting for the peer to allow one.
 enum Opening {
-    Bi(Tx<Result<(SendStream, RecvStream), Closed>>),
-    Uni(Tx<Result<SendStream, Closed>>),
+    Bi(Sender<Result<(SendStream, RecvStream), Closed>>),
+    Uni(Sender<Result<SendStream, Closed>>),
 }
 
 impl Opening {
@@ -390,12 +396,19 @@ impl Opening {
     }
 
     fn fail(self, closed: Closed) {
-        // An asker that went away wants no answer.
+        // An asker that went away wants no answer; the one slot is empty, so the loop never
+        // waits here.
         match self {
-            Opening::Bi(reply) => _ = reply.send(Err(closed)),
-            Opening::Uni(reply) => _ = reply.send(Err(closed)),
+            Opening::Bi(reply) => _ = reply.try_send(Err(closed)),
+            Opening::Uni(reply) => _ = reply.try_send(Err(closed)),
         }
     }
+}
+
+/// A reply channel: one slot the loop fills once, so its one send finds the slot empty and the
+/// driver's thread never waits on a handle.
+fn reply<T>() -> (Sender<T>, Receiver<T>) {
+    chan::bounded(1)
 }
 
 /// What a stream's reader gets from the loop.
@@ -416,6 +429,8 @@ pub enum StreamError {
     Refused(Error),
     /// The stream's session or the driver is gone.
     Gone,
+    /// The wait for the loop's answer passed its bound.
+    Unanswered(Unanswered),
 }
 
 impl std::fmt::Display for StreamError {
@@ -425,19 +440,52 @@ impl std::fmt::Display for StreamError {
             StreamError::Reset(code) => write!(f, "the peer reset the stream (code {code:?})"),
             StreamError::Refused(error) => write!(f, "{error}"),
             StreamError::Gone => f.write_str("the stream's session, or the HTTP/3 driver, is gone"),
+            StreamError::Unanswered(unanswered) => write!(f, "{unanswered}"),
         }
     }
 }
 
 impl std::error::Error for StreamError {}
 
+/// How a handle's ask of the loop ended without what it asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AskError<E> {
+    /// The loop answered, or stopped, with `E`.
+    Failed(E),
+    /// The wait for the answer passed its bound; the ask may still be answered later, into
+    /// nothing.
+    Unanswered(Unanswered),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for AskError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AskError::Failed(error) => write!(f, "{error}"),
+            AskError::Unanswered(unanswered) => write!(f, "{unanswered}"),
+        }
+    }
+}
+
+impl<E: std::fmt::Debug + std::fmt::Display> std::error::Error for AskError<E> {}
+
 fn driver_gone(peer: Option<SocketAddr>) -> Closed {
     Closed::Failed(Error { peer, step: Step::Session, why: "the HTTP/3 driver stopped".to_owned() })
 }
 
-/// An answer the loop gives once: `None` (the loop stopped first) is `gone`.
-async fn answer<T>(answer: Rx<T>, gone: impl FnOnce() -> T) -> T {
-    answer.recv().await.unwrap_or_else(gone)
+/// The answer the loop gives once, waiting at most `within` for `what`: the loop stopping
+/// first is `gone`.
+fn answer<T, E>(
+    what: &'static str,
+    from: &Receiver<Result<T, E>>,
+    within: Duration,
+    gone: impl FnOnce() -> E,
+) -> Result<T, AskError<E>> {
+    match mailbox::answer(what, from, within) {
+        Ok(Some(Ok(it))) => Ok(it),
+        Ok(Some(Err(error))) => Err(AskError::Failed(error)),
+        Ok(None) => Err(AskError::Failed(gone())),
+        Err(unanswered) => Err(AskError::Unanswered(unanswered)),
+    }
 }
 
 /// The last clone dropped stops the thread.
@@ -459,7 +507,10 @@ pub struct Driver {
 }
 
 /// The sessions peers ask for, as they come.
-pub type Requests = Rx<Request>;
+pub type Requests = Receiver<Request>;
+
+/// What [`Driver::spawn`]'s wait for the thread names.
+pub const BIND: &str = "the HTTP/3 driver's thread to bind its socket";
 
 impl Driver {
     /// Starts the loop on a thread of its own, its socket bound at `at` (port 0: one the system
@@ -472,8 +523,10 @@ impl Driver {
         if server.as_ref().is_some_and(|it| it.requests) {
             return Err(config("the HTTP/3 driver's handles serve WebTransport sessions only: a server that takes plain requests runs its Endpoint in a loop of its own (Loop)".to_owned()));
         }
-        let (ready_to, ready) = mailbox::channel::<Result<(Arc<Inbox, Global>, SocketAddr), Error>>(Some(1));
-        let (incoming, requests) = mailbox::channel(None);
+        let (ready_to, ready) = reply::<Result<(Arc<Inbox, Global>, SocketAddr), Error>>();
+        // Unbounded: the loop never waits to hand a request over; each is a peer's CONNECT,
+        // bounded by the endpoint's own limits.
+        let (incoming, requests) = chan::unbounded();
         std::thread::Builder::new()
             .name("blaze-http h3".to_owned())
             .spawn(move || {
@@ -531,11 +584,11 @@ impl Driver {
                 serve(&mut driver, core, &inbox, routes);
             })
             .map_err(|why| config(format!("starting the HTTP/3 driver's thread: {why}")))?;
-        let started = mailbox::block_on("the HTTP/3 driver's thread to bind its socket", Some(START_WAIT), ready.recv());
-        let (inbox, local) = match started {
+        // The thread's own bind ends by START_WAIT; the wait here is bounded by twice that.
+        let (inbox, local) = match mailbox::answer(BIND, &ready, START_WAIT * 2) {
             Ok(Some(started)) => started?,
             Ok(None) => return Err(config("the HTTP/3 driver's thread ended before it bound its socket".to_owned())),
-            Err(blocked) => return Err(config(blocked.to_string())),
+            Err(unanswered) => return Err(config(unanswered.to_string())),
         };
         Ok((Driver { owner: Arc::new_in(Owner { inbox, local }, Global) }, requests))
     }
@@ -550,28 +603,32 @@ impl Driver {
     }
 
     /// Opens a session to `to` at `url` (`https://host:port/path`), sending `headers`
-    /// (lowercase names, no pseudo-fields) with its CONNECT.
-    pub async fn connect(&self, to: SocketAddr, url: &str, headers: &[(&str, &str)]) -> Result<Session, Closed> {
-        let (reply, answered) = mailbox::channel(Some(1));
+    /// (lowercase names, no pseudo-fields) with its CONNECT, waiting at most `within` for it.
+    pub fn connect(&self, to: SocketAddr, url: &str, headers: &[(&str, &str)], within: Duration) -> Result<Session, AskError<Closed>> {
+        let (reply, answered) = reply();
         let headers = headers.iter().map(|(n, v)| ((*n).to_owned(), (*v).to_owned())).collect();
         self.post(Message::Connect { to, url: url.to_owned(), headers, reply });
-        answer(answered, || Err(driver_gone(Some(to)))).await
+        answer("an HTTP/3 session to open", &answered, within, || driver_gone(Some(to)))
     }
 
     /// Serves `identity` to connections from now on; open ones keep theirs.
-    pub async fn set_identity(&self, identity: Identity) -> Result<(), Error> {
-        let (reply, answered) = mailbox::channel(Some(1));
+    pub fn set_identity(&self, identity: Identity, within: Duration) -> Result<(), AskError<Error>> {
+        let (reply, answered) = reply();
         self.post(Message::SetIdentity { identity, reply });
-        answer(answered, || Err(Error { peer: None, step: Step::Config, why: "the HTTP/3 driver stopped".to_owned() })).await
+        answer("the HTTP/3 driver to take a new identity", &answered, within, || Error {
+            peer: None,
+            step: Step::Config,
+            why: "the HTTP/3 driver stopped".to_owned(),
+        })
     }
 
     /// Closes every session with `code` and `reason`, then every connection; returns once each
     /// connection's close is sent (at most [`super::LINGER`] after the sessions' closes, when
-    /// a peer does not acknowledge them).
-    pub async fn close(&self, code: u32, reason: &str) {
-        let (reply, answered) = mailbox::channel(Some(1));
+    /// a peer does not acknowledge them), or the driver stopped, or `within` passed.
+    pub fn close(&self, code: u32, reason: &str, within: Duration) -> Result<(), Unanswered> {
+        let (reply, answered) = reply();
         self.post(Message::CloseAll { code, reason: reason.to_owned(), reply });
-        _ = answered.recv().await;
+        mailbox::answer("the HTTP/3 driver's connections to close", &answered, within).map(|_| ())
     }
 }
 
@@ -611,13 +668,13 @@ impl Request {
         self.request.peer
     }
 
-    /// Accepts the session: its CONNECT is answered 200.
-    pub async fn accept(mut self) -> Result<Session, Closed> {
+    /// Accepts the session: its CONNECT is answered 200; waits at most `within` for the loop.
+    pub fn accept(mut self, within: Duration) -> Result<Session, AskError<Closed>> {
         self.answered = true;
         let peer = self.request.peer;
-        let (reply, answered) = mailbox::channel(Some(1));
+        let (reply, answered) = reply();
         self.inbox.post(Message::Accept { session: self.session, reply });
-        answer(answered, || Err(driver_gone(Some(peer)))).await
+        answer("an HTTP/3 session to be accepted", &answered, within, || driver_gone(Some(peer)))
     }
 
     /// Refuses the session with `status` (300 to 599).
@@ -645,9 +702,9 @@ struct SessionInner {
     id: SessionId,
     peer: SocketAddr,
     inbox: Arc<Inbox, Global>,
-    bi: Rx<(SendStream, RecvStream)>,
-    uni: Rx<RecvStream>,
-    datagrams: Rx<Vec<u8>>,
+    bi: Receiver<(SendStream, RecvStream)>,
+    uni: Receiver<RecvStream>,
+    datagrams: Receiver<Vec<u8>>,
     closed: Latch<Closed>,
 }
 
@@ -660,55 +717,70 @@ impl Session {
         self.inner.peer
     }
 
-    /// How the session ended, once it has.
-    pub async fn closed(&self) -> Closed {
-        self.inner.closed.wait().await.unwrap_or_else(|| driver_gone(Some(self.inner.peer)))
+    /// How the session ended, once it has, waiting at most `within`.
+    pub fn closed(&self, within: Duration) -> Result<Closed, Unanswered> {
+        Ok(self.inner.closed.wait("an HTTP/3 session to end", within)?.unwrap_or_else(|| self.gone()))
     }
 
-    /// The next bidirectional stream the peer opens.
-    pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), Closed> {
-        match self.inner.bi.recv().await {
-            Some(it) => Ok(it),
-            None => Err(self.closed().await),
+    /// How the session ended, read once its channels closed: the loop sets the latch before it
+    /// drops their senders, so an unset latch means the driver went away.
+    fn ended(&self) -> Closed {
+        self.inner.closed.get().unwrap_or_else(|| self.gone())
+    }
+
+    fn gone(&self) -> Closed {
+        driver_gone(Some(self.inner.peer))
+    }
+
+    /// The next item of one of the session's channels, waiting at most `within` for `what`.
+    fn next<T>(&self, what: &'static str, from: &Receiver<T>, within: Duration) -> Result<T, AskError<Closed>> {
+        match mailbox::answer(what, from, within) {
+            Ok(Some(it)) => Ok(it),
+            Ok(None) => Err(AskError::Failed(self.ended())),
+            Err(unanswered) => Err(AskError::Unanswered(unanswered)),
         }
     }
 
-    /// The next unidirectional stream the peer opens.
-    pub async fn accept_uni(&self) -> Result<RecvStream, Closed> {
-        match self.inner.uni.recv().await {
-            Some(it) => Ok(it),
-            None => Err(self.closed().await),
-        }
+    /// The next bidirectional stream the peer opens, waiting at most `within`.
+    pub fn accept_bi(&self, within: Duration) -> Result<(SendStream, RecvStream), AskError<Closed>> {
+        self.next("the peer to open a bidirectional stream", &self.inner.bi, within)
     }
 
-    /// The next datagram.
-    pub async fn receive_datagram(&self) -> Result<Vec<u8>, Closed> {
-        match self.inner.datagrams.recv().await {
-            Some(it) => Ok(it),
-            None => Err(self.closed().await),
-        }
+    /// The next unidirectional stream the peer opens, waiting at most `within`.
+    pub fn accept_uni(&self, within: Duration) -> Result<RecvStream, AskError<Closed>> {
+        self.next("the peer to open a unidirectional stream", &self.inner.uni, within)
     }
 
-    /// Opens a bidirectional stream, waiting while the peer allows no more.
-    pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), Closed> {
-        let (reply, answered) = mailbox::channel(Some(1));
+    /// The next datagram, waiting at most `within`.
+    pub fn receive_datagram(&self, within: Duration) -> Result<Vec<u8>, AskError<Closed>> {
+        self.next("the peer's next datagram", &self.inner.datagrams, within)
+    }
+
+    /// Opens a bidirectional stream, waiting while the peer allows no more, at most `within`.
+    pub fn open_bi(&self, within: Duration) -> Result<(SendStream, RecvStream), AskError<Closed>> {
+        let (reply, answered) = reply();
         self.inner.inbox.post(Message::Open { session: self.inner.id, open: Opening::Bi(reply) });
-        answer(answered, || Err(driver_gone(Some(self.inner.peer)))).await
+        answer("a bidirectional stream to open", &answered, within, || self.gone())
     }
 
-    /// Opens a unidirectional stream, waiting while the peer allows no more.
-    pub async fn open_uni(&self) -> Result<SendStream, Closed> {
-        let (reply, answered) = mailbox::channel(Some(1));
+    /// Opens a unidirectional stream, waiting while the peer allows no more, at most `within`.
+    pub fn open_uni(&self, within: Duration) -> Result<SendStream, AskError<Closed>> {
+        let (reply, answered) = reply();
         self.inner.inbox.post(Message::Open { session: self.inner.id, open: Opening::Uni(reply) });
-        answer(answered, || Err(driver_gone(Some(self.inner.peer)))).await
+        answer("a unidirectional stream to open", &answered, within, || self.gone())
     }
 
-    /// Sends a datagram; it may be lost, as datagrams may.
-    pub async fn send_datagram(&self, bytes: &[u8]) -> Result<(), Error> {
-        let (reply, answered) = mailbox::channel(Some(1));
+    /// Sends a datagram; it may be lost, as datagrams may. Waits at most `within` for the
+    /// loop to take it.
+    pub fn send_datagram(&self, bytes: &[u8], within: Duration) -> Result<(), AskError<Error>> {
+        let (reply, answered) = reply();
         self.inner.inbox.post(Message::Datagram { session: self.inner.id, bytes: bytes.to_vec(), reply });
         let peer = self.inner.peer;
-        answer(answered, || Err(Error { peer: Some(peer), step: Step::Datagram, why: "the HTTP/3 driver stopped".to_owned() })).await
+        answer("the HTTP/3 driver to take a datagram", &answered, within, || Error {
+            peer: Some(peer),
+            step: Step::Datagram,
+            why: "the HTTP/3 driver stopped".to_owned(),
+        })
     }
 
     /// Closes the session with `code` and `reason`.
@@ -737,14 +809,18 @@ impl SendStream {
         self.stream
     }
 
-    /// Sends `bytes`, returning once QUIC took all of them.
-    pub async fn write_all(&mut self, bytes: &[u8]) -> Result<(), StreamError> {
+    /// Sends `bytes`, returning once QUIC took all of them, waiting at most `within`.
+    pub fn write_all(&mut self, bytes: &[u8], within: Duration) -> Result<(), StreamError> {
         if bytes.is_empty() {
             return Ok(());
         }
-        let (reply, answered) = mailbox::channel(Some(1));
+        let (reply, answered) = reply();
         self.inbox.post(Message::Send { stream: self.stream, bytes: bytes.to_vec(), reply });
-        answer(answered, || Err(StreamError::Gone)).await
+        match answer("QUIC to take a stream's bytes", &answered, within, || StreamError::Gone) {
+            Ok(()) => Ok(()),
+            Err(AskError::Failed(error)) => Err(error),
+            Err(AskError::Unanswered(unanswered)) => Err(StreamError::Unanswered(unanswered)),
+        }
     }
 
     /// Finishes the stream once what was written is sent.
@@ -761,10 +837,11 @@ impl SendStream {
         }
     }
 
-    /// Waits for the peer to stop the stream: its WebTransport code, if it was one. Never
-    /// returns while the stream lives and is not stopped; `None` too when it is gone.
-    pub async fn stopped(&mut self) -> Option<u32> {
-        self.stopped.wait().await.flatten()
+    /// Waits at most `within` for the peer to stop the stream: its WebTransport code, if it
+    /// was one; `None` too when the stream is gone; [`Unanswered::TimedOut`] while it lives and
+    /// is not stopped.
+    pub fn stopped(&mut self, within: Duration) -> Result<Option<u32>, Unanswered> {
+        Ok(self.stopped.wait("the peer to stop a stream", within)?.flatten())
     }
 }
 
@@ -778,7 +855,7 @@ impl Drop for SendStream {
 pub struct RecvStream {
     stream: StreamRef,
     inbox: Arc<Inbox, Global>,
-    pieces: Rx<Piece>,
+    pieces: Receiver<Piece>,
     piece: Vec<u8>,
     at: usize,
     ended: bool,
@@ -789,8 +866,10 @@ impl RecvStream {
         self.stream
     }
 
-    /// Reads into `out`: the bytes read, or `None` at the stream's end.
-    pub async fn read(&mut self, out: &mut [u8]) -> Result<Option<usize>, StreamError> {
+    /// Reads into `out`: the bytes read, or `None` at the stream's end; waits at most `within`
+    /// for the next bytes, a wait that passes being [`StreamError::Unanswered`] (the stream
+    /// still readable after it).
+    pub fn read(&mut self, out: &mut [u8], within: Duration) -> Result<Option<usize>, StreamError> {
         // Each pass either hands out bytes, or takes the next piece; a piece that is data has
         // bytes, so the second pass hands them out.
         loop {
@@ -809,7 +888,7 @@ impl RecvStream {
             if self.ended {
                 return Ok(None);
             }
-            match self.pieces.recv().await {
+            match mailbox::answer("the peer's next bytes on a stream", &self.pieces, within).map_err(StreamError::Unanswered)? {
                 Some(Piece::Data(bytes)) => {
                     self.piece = bytes;
                     self.at = 0;
@@ -853,18 +932,18 @@ enum Opener {
 
 /// The loop's side of a session.
 struct SessionTx {
-    bi: Tx<(SendStream, RecvStream)>,
-    uni: Tx<RecvStream>,
-    datagrams: Tx<Vec<u8>>,
+    bi: Sender<(SendStream, RecvStream)>,
+    uni: Sender<RecvStream>,
+    datagrams: Sender<Vec<u8>>,
     closed: Setter<Closed>,
     opening: VecDeque<Opening, Global>,
 }
 
 /// The loop's side of a stream.
 struct StreamTx {
-    pieces: Option<Tx<Piece>>,
+    pieces: Option<Sender<Piece>>,
     stopped: Option<Setter<Option<u32>>>,
-    sent: Option<Tx<Result<(), StreamError>>>,
+    sent: Option<Sender<Result<(), StreamError>>>,
 }
 
 impl StreamTx {
@@ -876,11 +955,11 @@ impl StreamTx {
 /// Where the endpoint's events go: the handles' channels.
 struct Routes {
     inbox: Arc<Inbox, Global>,
-    incoming: Tx<Request>,
-    connects: BTreeMap<SessionId, Tx<Result<Session, Closed>>, Global>,
+    incoming: Sender<Request>,
+    connects: BTreeMap<SessionId, Sender<Result<Session, Closed>>, Global>,
     sessions: BTreeMap<SessionId, SessionTx, Global>,
     streams: BTreeMap<StreamRef, StreamTx, Global>,
-    closing: Vec<Tx<()>, Global>,
+    closing: Vec<Sender<()>, Global>,
 }
 
 /// The thread's loop: the handles' asks in, the endpoint's events to the handles, the loop's
@@ -922,7 +1001,7 @@ fn serve(driver: &mut impl effects::Driver, mut core: Loop, inbox: &Inbox, mut r
 }
 
 impl Routes {
-    fn new(inbox: Arc<Inbox, Global>, incoming: Tx<Request>) -> Routes {
+    fn new(inbox: Arc<Inbox, Global>, incoming: Sender<Request>) -> Routes {
         Routes {
             inbox,
             incoming,
@@ -1023,9 +1102,11 @@ impl Routes {
     /// connection is gone.
     fn session(&mut self, endpoint: &Endpoint, id: SessionId) -> Option<Session> {
         let peer = endpoint.peer(id.conn)?;
-        let (bi, bi_rx) = mailbox::channel(None);
-        let (uni, uni_rx) = mailbox::channel(None);
-        let (datagrams, datagrams_rx) = mailbox::channel(Some(DATAGRAMS_HELD));
+        // Streams are bounded by the peer's stream limits; datagrams by DATAGRAMS_HELD, the
+        // loop's `try_send` dropping one the reader is behind on.
+        let (bi, bi_rx) = chan::unbounded();
+        let (uni, uni_rx) = chan::unbounded();
+        let (datagrams, datagrams_rx) = chan::bounded(DATAGRAMS_HELD);
         let (closed, closed_rx) = mailbox::latch();
         self.sessions.insert(id, SessionTx { bi, uni, datagrams, closed, opening: VecDeque::new_in(Global) });
         let inner = SessionInner { id, peer, inbox: Arc::clone(&self.inbox), bi: bi_rx, uni: uni_rx, datagrams: datagrams_rx, closed: closed_rx };
@@ -1047,7 +1128,9 @@ impl Routes {
             SendStream { stream, inbox: Arc::clone(&self.inbox), stopped: stopped_rx, done: false }
         });
         let recv = receives.then(|| {
-            let (pieces, pieces_rx) = mailbox::channel(None);
+            // Bounded by the stream's flow-control window: the peer sends no more than the
+            // reader's `Consumed` lets it.
+            let (pieces, pieces_rx) = chan::unbounded();
             tx.pieces = Some(pieces);
             RecvStream { stream, inbox: Arc::clone(&self.inbox), pieces: pieces_rx, piece: Vec::new_in(Global), at: 0, ended: false }
         });
@@ -1098,7 +1181,7 @@ impl Routes {
             match event {
                 Event::SessionRequest { session, request } => {
                     let request = Request { session, request, inbox: Arc::clone(&self.inbox), answered: false };
-                    if let Err(mut unsent) = self.incoming.send(request) {
+                    if let Err(chan::SendError(mut unsent)) = self.incoming.send(request) {
                         unsent.answered = true;
                         _ = endpoint.refuse(session, 503);
                     }
@@ -1171,7 +1254,7 @@ impl Routes {
                 Event::Datagram { session, bytes } => {
                     if let Some(tx) = self.sessions.get(&session) {
                         // Full (the reader is behind) or gone: dropped, as datagrams may be.
-                        _ = tx.datagrams.send(bytes);
+                        _ = tx.datagrams.try_send(bytes);
                     }
                 }
                 // The core answered it; the explorer's peers are browsers, whose errors are
@@ -1267,7 +1350,7 @@ impl<D: effects::Driver> Wired<D> {
             driver.poll(&mut done, until);
             if let Some(at_bind) = done.iter().position(|it| it.tag == Tag(0)) {
                 match done.swap_remove(at_bind).done {
-                    Done::Bound { sock, local } => break (sock, local),
+                    Done::Bound { sock, local, .. } => break (sock, local),
                     Done::Failed(why) => return Err(config(format!("binding the UDP socket at {at}: {why}"))),
                     other => panic!("blaze-http's HTTP/3 wire: a bind completed with {other:?}, which blaze-core's effect never gives"),
                 }

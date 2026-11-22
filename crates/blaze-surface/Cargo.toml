@@ -23,12 +23,17 @@ testing = []
 # its key.
 blaze-id.workspace = true
 # `record!`, `Writer`, `open`, `Slice`, `Aligned`: each record is a flat buffer read in place.
+# By path: the workspace entry turns on its `serde`, which would bring serde.
 blaze-format.workspace = true
 # `HashMap`: a task's table from item keys to its local numbers.
 blaze-hash.workspace = true
+# `Vec`: every builder's rows, in the allocator its caller names.
+blaze-own.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true
+# `Alloc::global()`: the handle the tests pass.
+blaze-own = { workspace = true, features = ["std", "testing"] }
 
 [lints]
 workspace = true

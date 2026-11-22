@@ -1,0 +1,8 @@
+{
+  "date": "2026-11-17",
+  "model": "claude-opus-5-5",
+  "lane": "CJ",
+  "area": "blaze-scope cells: the one-group names solve (switch.rs, mod.rs textual walk, groups.rs)",
+  "annoyance": "`Cells<'x, &'a str>` has two lifetimes (the core's allocator 'x is shorter than the names' 'a, because `BuiltDeps` is a local of `solve_and_write`): a helper written as `impl<'a> Cells<'a, &'a str>` reads naturally and fails only at the caller with E0597 on `deps`. A module's `ModuleScope` record holds its flattened textual sequence and the marks of its `mod` lines, but not which children are `#[macro_use]`, so a walk that reads a parent from its record cannot know which children the walk over text would have logged without the parent's `ModuleDecls` (the module tree).",
+  "workaround": "Keep `impl<'a> Cells<'_, &'a str>` and allocate what the core holds with `self.alloc`. Read `#[macro_use]` children from `facts.decls(parent).mods` (the module tree, read by every group); a mark no `mod` line names (an expansion's `mod`) leaves them unknown and the walk refuses as `Textual`."
+}

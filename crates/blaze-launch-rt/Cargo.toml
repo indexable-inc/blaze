@@ -1,6 +1,6 @@
 [package]
 name = "blaze-launch-rt"
-description = "blaze's launcher under the `edit` goal (docs/v2/plan/design/launcher.md), step 2: the drivers of blaze-launch's core. A real code area (macOS `MAP_JIT`, Linux a memfd mapped twice), the slot words, gates and lazy stubs as machine code, a thread's epoch report at a safepoint, and the control thread that speaks the patch protocol over a Unix socket"
+description = "blaze's launcher under the `edit` goal (docs/v2/plan/design/launcher.md), step 2: the drivers of blaze-launch's core. A real code area (macOS an anonymous write view remapped with mach_vm_remap, Linux a memfd mapped twice) with a data region beyond it, the slot words, gates, lazy stubs and observe stubs as machine code, a thread's epoch report at a safepoint, and the control thread that speaks the patch protocol over a Unix socket"
 publish = false
 
 version.workspace = true
@@ -16,15 +16,50 @@ doctest = false
 # On `std`, not bstd: blaze-launch's src/lib.rs says why and when that changes.
 [dependencies]
 blaze-launch.workspace = true
-# The one channel (rule standard-structures): what threads tell the control thread.
-crossbeam-channel.workspace = true
 # The one queue (rule standard-structures): what threads say to the control thread.
-crossbeam-queue.workspace = true
+blaze-queue.workspace = true
 # A record's id is the BLAKE3 hash of its bytes: checked when the daemon gives one.
-blake3.workspace = true
+blaze-blake3.workspace = true
+# `zygote`: the test pool, a child's steps, the report form and the OS-call classifier it drives.
+blaze-run.workspace = true
+# `zygote`: the driver's vectors, in the allocator the caller names.
+blaze-own.workspace = true
+# `code_unwind`: a code record's unwind entry (blaze-code eh.rs), registered before its slot's
+# word is published.
+blaze-code.workspace = true
+# `native_lib`: the native library record's descriptor (BNL2), whose one home is blaze-native's
+# descriptor.rs (sans-IO, no_std).
+blaze-native.workspace = true
+# `sample`: the sample ring's entry (`sample::SampleEntry`), piece 0 of code generation.
+blaze-tier.workspace = true
+# `stub_wait`: a stub's kernel wait to a deadline and the control thread's bell
+# (`wait::wait_shared`, `wake_shared`; THREADS.md D6).
+blaze-core.workspace = true
+# run_mode/bind.rs `Table`: a compile-time run's outside names bound through the table and the
+# layer's C functions (D175; feature `child`, the functions themselves).
+blaze-comptime-sys = { workspace = true, features = ["child"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+# `zygote`: a test's process group killed through the one wrapper (`kill_group`, D177); already
+# below blaze-core, so no new crate is built.
+blaze-sys.workspace = true
+
+[dev-dependencies]
+blaze-own = { workspace = true, features = ["std", "testing"] }
+# examples/fork_smoke: its entry's frame (memory from the OS), handed to the zygote.
+blaze-mem.workspace = true
+# sample/tests.rs: the frame check's property and planted-bug control, the pace's property.
+blaze-sim.workspace = true
+# stub_wait_tests.rs: the stub path's allocation count (`#[global_allocator]` of the test binary).
+blaze-alloc-count.workspace = true
+# tests/native_load.rs: a tiny native library record written without a compiler (W4's writer),
+# loaded by the real `dlopen` path. blaze-export does not depend on this crate: no cycle.
+blaze-export.workspace = true
+
+# sample/ring_wait.rs: the ring under the interleaving checker (`--cfg blaze_check`).
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
 
 [lints]
 workspace = true

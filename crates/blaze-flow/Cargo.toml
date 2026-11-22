@@ -1,0 +1,25 @@
+[package]
+name = "blaze-flow"
+description = "The flow, one mid-level form per body (docs/v2/plan/design/flow.md, decision D61): places, points and statements as flat tables, the move check (two initialization dataflows) and the borrow check in two tiers (location-insensitive, then the Polonius rules), over hand-built flows"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# core and alloc only; the allocator is a value the caller passes in.
+[dependencies]
+blaze-own.workspace = true
+
+[dev-dependencies]
+# `check`, `control`: the simulations and their planted-bug controls.
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

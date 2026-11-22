@@ -14,7 +14,8 @@
 //! | tables, interners and columns | [`RegionVec`] (one owner), [`AppendVec`] (one writer, lock-free readers) and [`Column`] (any number of appenders): address space reserved up front, pages committed as they grow, never moved; the big, randomly read ones on huge pages ([`huge`]) |
 //! | per-call scratch | [`scratch`]: buffers per worker, grown once to their high-water mark, lent for a closure or until dropped |
 //! | values kept past every request, each dying when its owner drops it (a parsed tree, a file's bytes in the VFS, a query's token tree) | [`Kept`]: an `Allocator` over [`blocks`], counted to the tag it names |
-//! | tables made and dropped whole, grown by a new one twice the last | [`blocks`]: blocks in size classes (four to a doubling) from a region per class, recycled through lock-free stacks; [`blocks::Slice`] is `Box<[T]>` in one |
+//! | a whole program or test: the root every handle is borrowed from | [`Root`]: one reservation in size classes with free lists, made at the entry's or the test's top and handed down as `Alloc<'_>`/`SharedAlloc<'_>` (D102: no ambient heap) |
+//! | tables made and dropped whole, grown by a new one twice the last | [`blocks`]:blocks in size classes (four to a doubling) from a region per class, recycled through lock-free stacks; [`blocks::Slice`] is `Box<[T]>` in one |
 //!
 //! Owned text takes its allocator too ([`text`]): [`String<A>`](String), and on unix
 //! [`OsString<A>`](OsString) and [`PathBuf<A>`](PathBuf), each over a `Vec<u8, A>`, with
@@ -61,9 +62,11 @@ pub mod arena;
 pub mod blocks;
 pub mod chunks;
 pub mod column;
+pub mod counted;
 mod error;
 pub mod frame;
 pub mod handle;
+pub mod host;
 pub mod huge;
 mod os;
 pub mod pool;
@@ -74,9 +77,12 @@ pub mod racy;
 pub mod region;
 pub mod region_vec;
 pub mod revision;
+pub mod root;
 pub mod scratch;
 mod stack;
-pub mod swiss;
+/// The SwissTable group probe, a crate of its own below this one (`blaze-swiss`), so the bottom
+/// of the tree (`blaze-ids`) reaches it without this crate's dependencies.
+pub use blaze_swiss as swiss;
 pub mod syscalls;
 mod sync;
 pub mod tag;
@@ -92,6 +98,7 @@ pub use blocks::Kept;
 pub use column::{Block, Column};
 pub use error::MemError;
 pub use frame::{Frame, Marker};
+pub use host::HostMemory;
 pub use handle::{Handle, Slab};
 pub use pool::{Cache, Pool, Pooled, Shared};
 #[cfg(target_pointer_width = "64")]
@@ -99,6 +106,7 @@ pub use program::{ProgramArena, ProgramError, ProgramLifetime, Ref32};
 pub use region::Region;
 pub use region_vec::RegionVec;
 pub use revision::{Built, Revisions};
+pub use root::{LiveAtDrop, Root, RootOpts, RootUsed};
 pub use tag::Tag;
 pub use text::{FromUtf8Error, String};
 #[cfg(unix)]
@@ -121,6 +129,9 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 #[cfg(all(test, not(blaze_check)))]
 mod tests;
+
+#[cfg(all(test, not(blaze_check)))]
+mod root_tests;
 
 #[cfg(all(test, blaze_check))]
 mod model;

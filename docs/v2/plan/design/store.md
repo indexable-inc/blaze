@@ -1,6 +1,7 @@
 ---
-status: plan
-summary: blaze v2: the store.
+status: superseded
+superseded_by: end-state.md#d159-one-body-one-store-one-answer-form-code-made-ahead
+summary: (the pack store, deleted from blaze-cas 2026-11-20; the store is the plain store, crates/blaze-cas/src/plain.rs) blaze v2: the store.
 date: 2026-11-01
 ---
 # blaze v2: store
@@ -618,8 +619,7 @@ hello-world); every input of that work is public and the same on every machine o
   build scripts' roots are (Portable keys, above), before any std record is another machine's.
   (3) The ask: the `std library` task fetches the bundle when the shared std store has no record
   of the placement, before the plan's units are posted, and says a miss by name (no bundle
-  for this target, a signature refused) with what will be compiled instead. (4) F2 of
-  [restore.md](restore.md): a fetched image is only worth its bytes if no crate is resolved
+  for this target, a signature refused) with what will be compiled instead. (4) A fetched image is only worth its bytes if no crate is resolved
   before the store is asked.
 
 ## Item sets: one value an item (rule granular-caching)

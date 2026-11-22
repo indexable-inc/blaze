@@ -4,10 +4,13 @@
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use blaze_ids::rng::SplitMix64;
+use blaze_sys::linux;
+use blaze_sys::posix::signal::{SIGKILL, SIGUSR1};
 
 use super::*;
 use crate::Access;
@@ -74,15 +77,14 @@ fn echo(mut reader: Reader, sender: Sender) -> std::thread::JoinHandle<usize> {
 /// Aborts the test process unless dropped within a minute: a deadlock fails instead of hanging.
 struct Watchdog {
     /// Dropped with the watchdog, which ends its thread's wait.
-    _done: crossbeam_channel::Sender<()>,
+    _done: mpsc::Sender<()>,
 }
 
 impl Watchdog {
     fn new(what: &'static str) -> Watchdog {
-        let (done, seen) = crossbeam_channel::bounded::<()>(0);
+        let (done, seen) = mpsc::channel::<()>();
         std::thread::spawn(move || {
-            if seen.recv_timeout(Duration::from_secs(60))
-                == Err(crossbeam_channel::RecvTimeoutError::Timeout)
+            if seen.recv_timeout(Duration::from_secs(60)) == Err(RecvTimeoutError::Timeout)
             {
                 eprintln!("{what}: deadlocked");
                 std::process::abort();
@@ -161,7 +163,7 @@ static ASKER: OnceLock<Asker> = OnceLock::new();
 /// 1 once the handler's ask was answered as it should be, 2 otherwise.
 static HANDLED: AtomicU32 = AtomicU32::new(0);
 
-extern "C" fn asks_inside(_: libc::c_int) {
+extern "C" fn asks_inside(_: core::ffi::c_int) {
     let Some(asker) = ASKER.get() else { return };
     let mut out = [0u8; 16];
     let got = request(&asker.run.words, &asker.hook, Kind(0x300), b"handler", &mut out);
@@ -174,29 +176,27 @@ fn a_signal_handler_that_asks_inside_its_threads_ask_is_answered_first() {
     let _watchdog = Watchdog::new("a signal handler asking");
     let Both { mut reader, sender, run, hook } = both();
     let asker = ASKER.get_or_init(|| Asker { run, hook });
-    // SAFETY: a zeroed `sigaction` is a valid one (no flags, an empty mask); the handler is an
-    // `extern "C" fn(c_int)`, which is what `sa_sigaction` holds without SA_SIGINFO.
-    unsafe {
-        let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = asks_inside as extern "C" fn(libc::c_int) as usize;
-        assert_eq!(libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()), 0);
-    }
-    let (thread_tx, thread_rx) = crossbeam_channel::unbounded();
+    let action = linux::signal::SigAction {
+        sa_sigaction: asks_inside as extern "C" fn(core::ffi::c_int) as usize,
+        ..linux::signal::SigAction::DEFAULT
+    };
+    // SAFETY: this process-lifetime, single-argument handler uses the signal-safe ask path.
+    unsafe { linux::signal::set_action(SIGUSR1 as u32, &action) }.unwrap();
+    let (thread_tx, thread_rx) = mpsc::channel();
     let thread = std::thread::spawn(move || {
-        // SAFETY: the calling thread's own handle.
-        thread_tx.send(unsafe { libc::pthread_self() }).unwrap();
+        thread_tx.send(linux::sample::gettid()).unwrap();
         let mut out = [0u8; 16];
         let got = request(&asker.run.words, &asker.hook, Kind(0x200), b"thread", &mut out);
         (got.map_err(|it| it.what), out)
     });
-    let pthread = thread_rx.recv().unwrap();
+    let tid = thread_rx.recv().unwrap();
     let first = {
         let frame = reader.recv().unwrap();
         assert_eq!((frame.kind, frame.body), (Kind(0x200), &b"thread"[..]));
         frame.seq
     };
-    // SAFETY: the thread is alive: it waits for the answer to `first`, which nothing sent.
-    assert_eq!(unsafe { libc::pthread_kill(pthread, libc::SIGUSR1) }, 0);
+    // The thread is alive: it waits for the answer to `first`, which nothing sent.
+    linux::signal::tgkill(linux::getpid(), tid, SIGUSR1 as u32).unwrap();
     let second = {
         let frame = reader.recv().unwrap();
         assert_eq!((frame.kind, frame.body), (Kind(0x300), &b"handler"[..]));
@@ -283,6 +283,6 @@ fn a_kill_ends_the_process_and_keeps_the_first_reason() {
     run.kill("first").unwrap();
     run.kill("second").unwrap();
     assert_eq!(run.killed().as_deref(), Some("first"));
-    assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+    assert_eq!(child.wait().unwrap().signal(), Some(SIGKILL));
     run.kill("after it was reaped").unwrap();
 }

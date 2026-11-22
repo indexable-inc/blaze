@@ -23,9 +23,16 @@ enum GraphAtom {
     Succ,
 }
 
-#[derive(Debug, snafu::Snafu)]
-#[snafu(display("graph source failed"))]
+#[derive(Debug)]
 struct GraphError;
+
+impl std::fmt::Display for GraphError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("graph source failed")
+    }
+}
+
+impl std::error::Error for GraphError {}
 
 impl Language for Graph {
     type Atom = GraphAtom;
@@ -426,12 +433,14 @@ fn a_regex_that_does_not_compile_or_is_past_the_size_cap_is_refused_at_load() {
         matches!(unclosed, Error::Regex { line: 2, ref name, .. } if name == "text-match"),
         "{unclosed}"
     );
-    // The `regex` crate's own default takes this pattern; the cap is what refuses it.
-    let big = r"(?:\w{100}){2}";
-    assert!(regex::Regex::new(big).is_ok(), "within the crate's default limit");
-    let rules = format!("(rule (m a) (edge a b) (text-match a \"{}\"))", big.replace('\\', "\\\\"));
-    let past = Program::<Graph>::parse(&rules).expect_err("past MAX_REGEX_BYTES");
+    // The matcher's own default takes this pattern (20,004 instructions); the cap is what
+    // refuses it, and a pattern under the cap is taken.
+    let rules = |pattern: &str| format!("(rule (m a) (edge a b) (text-match a \"{}\"))", pattern.replace('\\', "\\\\"));
+    let big = r"(?:\w{100}){200}";
+    assert!(blaze_script::regex::Regex::new(big).is_ok(), "within the matcher's default limit");
+    let past = Program::<Graph>::parse(&rules(big)).expect_err("past MAX_REGEX_INSTRUCTIONS");
     assert!(matches!(past, Error::Regex { line: 1, .. }), "{past}");
+    assert!(Program::<Graph>::parse(&rules(r"(?:\w{100}){2}")).is_ok(), "under the cap");
 }
 
 #[test]

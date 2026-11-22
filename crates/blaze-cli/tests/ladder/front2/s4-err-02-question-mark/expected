@@ -1,0 +1,12 @@
+status 0
+stdout
+Ok(6)
+error: parse error: invalid digit found in string (source: true)
+error: -3 is negative (source: false)
+error: empty input (source: false)
+Some('R') None
+14
+too big
+invalid digit found in string
+true
+Some([1, 2])

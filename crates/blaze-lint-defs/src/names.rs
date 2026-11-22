@@ -165,6 +165,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::many_bools",
             "blaze::default_policy",
             "blaze::sans_io_core",
+            "blaze::lock_without_reason",
             "blaze::key_ignores_field",
             "blaze::wildcard_arm",
             "blaze::large_move",
@@ -300,6 +301,8 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::registry_spread",
             "blaze::same_behaviour",
             "blaze::workspace_unsafe",
+            "blaze::raw_sync",
+            "blaze::anon_tuple_return",
         ],
     ),
     // The cross-configuration reachability lints (docs/v2/plan/design/multiconfig-check.md), also in

@@ -1,0 +1,46 @@
+[package]
+name = "blaze-export"
+description = "`blaze export` (docs/v2/plan/design/bottom.md, section 11; run.md, \"Export\"): the code records of everything a program reaches laid out as one whole program (equal records folded, every call in reach a direct `bl`, C names through the platform's own binding) and written as one native executable, Mach-O for arm64 macOS with its ad-hoc code signature or ELF for arm64 Linux; sans-IO, byte-equal on every machine"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The code record (`CodeView`, `Symbol`, `Target`) and the AArch64 site encoders (`a64`).
+blaze-code.workspace = true
+# `Vec` and `Alloc`: every table in the allocator the caller names.
+blaze-own.workspace = true
+# The domain-separated BLAKE3 `Hasher`: fold digests, the file's identity (`LC_UUID`, build id).
+# By path, as blaze-code takes it: the workspace entry turns on its `serde` adapter.
+blaze-ids.workspace = true
+# The code directory's page hashes (Mach-O's ad-hoc signature is SHA-256 by its format).
+blaze-sha256.workspace = true
+# The `bzcode02` code record (`RecordView`, `read`, `from_v1`) and its placer's two shared rules
+# (`page_offset`, `calls`): export at the optimized tier (optimized.rs).
+blaze-tier.workspace = true
+# The native image (`Image`, its regions and fixups) and the library table: the native library
+# record's dylib (native_dylib.rs, NATIVE.md W4).
+blaze-native.workspace = true
+
+[dev-dependencies]
+# `Alloc::global()`, the handle the tests hand every function.
+blaze-own = { workspace = true, features = ["std", "testing"] }
+# The example's entry frame and each test's top frame: memory from the OS, handed down.
+blaze-mem.workspace = true
+# tests/native_run.rs: `FixedState`, the seed blaze-native's `resolve::plan` takes.
+blaze-hash.workspace = true
+# tests/native_run.rs: `toolchain::clang_pin` over `blaze_pins::CLANG_JSON`, the one home of the
+# pinned clang's digest (the shelf folder's name).
+blaze-build-script.workspace = true
+blaze-pins.workspace = true
+
+[lints]
+workspace = true

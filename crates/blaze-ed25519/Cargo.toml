@@ -1,0 +1,29 @@
+[package]
+name = "blaze-ed25519"
+description = "Ed25519 signature verification, written here (RFC 8032 section 5.1.7, strict): SHA-512, the field mod 2^255 - 19, edwards25519 and the double-scalar multiplication; verification only, no signing; `no_std`, no allocation, no unsafe code, its one dependency blaze-int"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# Integer conversions that say what they do: limb products are truncated on purpose.
+blaze-int.workspace = true
+# The plant seam (`Planted<P>`, D165): no_std, and itself depends only on blaze-memchr.
+blaze-own.workspace = true
+
+[dev-dependencies]
+blaze-sim.workspace = true
+# A second Ed25519, test-only, never in the normal graph: it signs random messages under random
+# keys so the differential test can hold this crate's verdicts to it (`tests/ring.rs`).
+ring.workspace = true
+
+[lints]
+workspace = true

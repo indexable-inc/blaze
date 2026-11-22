@@ -1,0 +1,4 @@
+[package]
+name = "ladder-s4-err-03-panic-exit-101"
+version = "0.1.0"
+edition = "2024"

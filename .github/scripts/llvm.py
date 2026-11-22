@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The one LLVM blaze's `llvm` feature links: built here, fetched everywhere else.
 
-crates/hir-ty-codegen/llvm.json pins it: the source (a repository, a ref and its commit: our
+pins/llvm.json pins it: the source (a repository, a ref and its commit: our
 fork indexable-inc/llvm, branch ix/23.x, LLVM 23.1.4 with our fixes, at the commit wasm-host's
 ix-aot pins, so blaze and ix-aot run one LLVM), where the builds are (`release`: blaze's R2
 bucket, https://blaze-releases.ix.dev/native, which llvm.yaml fills with .github/scripts/r2.py),
@@ -12,11 +12,13 @@ One JSON value, inline, a file's path, or `-` for stdin (AGENTS.md, scripts-take
 
   {"command": "build", "target": T, "work": DIR, "out": DIR, "jobs": N, "origin": REPO}
       build the pinned commit, archive it into `out` (named by its sha256, beside a T.json);
-      `jobs` (default: ninja's) and `origin`, a clone or bundle to fetch the commit from
+      `jobs` (default: ninja's) and `origin`, a clone or bundle to fetch the commit from;
+      `"cfront": true` also builds blaze-cfront (D174, crates/blaze-cc/helper) into it
   {"command": "fetch", "target": T, "dir": DIR}
       the pinned archive for T, checked and unpacked into `dir` (a no-op when it holds it)
   {"command": "pin", "root": DIR}
-      llvm.json names the archives in each directory of `root`
+      llvm.json names the archives in each directory of `root`, and pins/cfront.json the
+      helper of each archive built with `cfront`
 
 `build` makes a prefix of what the feature and the harnesses read, and no more: the static
 libraries of the X86 and AArch64 targets, the headers, `llvm-config`, `llvm-dwarfdump` and
@@ -51,18 +53,36 @@ from typing import Literal
 
 ROOT = Path(__file__).resolve().parents[2]
 # Run by a bare python on a runner, and by build_release.py with -I, not by uv: the one stdlib-only
-# module it needs is found from the tree.
+# modules it needs are found from the tree: typed_input, and the pins' one reader.
 sys.path.insert(0, str(ROOT / "tools" / "typed-input" / "src"))
+sys.path.insert(0, str(ROOT / "harness"))
 
+import toolchain_pins
 from typed_input import fail, parse
 
-PIN = ROOT / "crates" / "hir-ty-codegen" / "llvm.json"
+PIN = Path(toolchain_pins.LLVM)
 MARKER = "blaze-llvm.json"
 # The sha256 of the archive a directory was unpacked from, written by `fetch`.
 UNPACKED = "blaze-llvm.sha256"
 # What the prefix has: `ninja install-distribution` installs these components.
-COMPONENTS = ["llvm-libraries", "llvm-headers", "cmake-exports", "llvm-config", "llvm-dwarfdump", "llvm-pdbutil"]
+# D69: the C toolchain native build scripts run with comes from the same build: `clang` (also
+# `clang++`), its resource headers, `libclang` (bindgen loads it), `lld` (`ld64.lld`, the
+# linker the shelf's `clang.cfg` names) and `llvm-ar`. The pin in pins/clang.json
+# moves to this archive once it carries them.
+COMPONENTS = [
+    "llvm-libraries", "llvm-headers", "cmake-exports", "llvm-config", "llvm-dwarfdump", "llvm-pdbutil",
+    "clang", "clang-resource-headers", "libclang", "lld", "llvm-ar",
+]
 WINDOWS = sys.platform == "win32"
+# D174 (docs/v2/plan/design/c.md "The toolchain side"): with `cfront`, the C toolchain helper
+# blaze-cfront (crates/blaze-cc/helper) is built against the prefix after
+# `install-distribution` and before the libraries are merged, from these extra components:
+# clang's static libraries, headers and cmake config, which are removed again once it is built,
+# so the archive carries the helper and not them. pins/cfront.json pins its sha256 per target.
+CFRONT_COMPONENTS = ["clang-libraries", "clang-headers", "clang-cmake-exports"]
+CFRONT_SOURCE = ROOT / "crates" / "blaze-cc" / "helper"
+CFRONT_PIN = ROOT / "pins" / "cfront.json"
+CFRONT_MEMBER = "bin/blaze-cfront"
 
 
 def pin():
@@ -126,13 +146,19 @@ async def checkout(p, work, origin):
     return src
 
 
-def cmake_args(target):
+def cmake_args(target, cfront=False):
+    components = COMPONENTS + (CFRONT_COMPONENTS if cfront else [])
     args = [
         "-G", "Ninja",
         "-DCMAKE_BUILD_TYPE=Release",
         # WebAssembly: blaze builds proc-macro crates for wasm32-wasip1 and runs them in Wasmtime.
         "-DLLVM_TARGETS_TO_BUILD=X86;AArch64;WebAssembly",
-        "-DLLVM_ENABLE_PROJECTS=",
+        "-DLLVM_ENABLE_PROJECTS=clang;lld",
+        # `clang` as `clang++` too; no clang tools beyond the driver and libclang.
+        "-DCLANG_ENABLE_ARCMT=OFF",
+        "-DCLANG_ENABLE_STATIC_ANALYZER=OFF",
+        "-DCLANG_INCLUDE_TESTS=OFF",
+        "-DCLANG_INCLUDE_DOCS=OFF",
         "-DLLVM_ENABLE_ASSERTIONS=OFF",
         "-DLLVM_INCLUDE_TESTS=OFF",
         "-DLLVM_INCLUDE_BENCHMARKS=OFF",
@@ -149,7 +175,7 @@ def cmake_args(target):
         "-DLLVM_ENABLE_HTTPLIB=OFF",
         "-DLLVM_BUILD_LLVM_DYLIB=OFF",
         "-DLLVM_LINK_LLVM_DYLIB=OFF",
-        f"-DLLVM_DISTRIBUTION_COMPONENTS={';'.join(COMPONENTS)}",
+        f"-DLLVM_DISTRIBUTION_COMPONENTS={';'.join(components)}",
     ]
     if "linux" in target:
         args += ["-DCMAKE_C_COMPILER=gcc", "-DCMAKE_CXX_COMPILER=g++", "-DLLVM_STATIC_LINK_CXX_STDLIB=ON"]
@@ -179,11 +205,47 @@ def cmake_env(target):
     return env
 
 
-def recipe(target):
+def recipe(target, cfront=False):
     """What a build tree is configured with. cmake reads CFLAGS and CXXFLAGS only when it first
     configures a tree, so a tree configured with other ones is not built on."""
     env = cmake_env(target)
-    return json.dumps({"args": cmake_args(target), "cflags": env.get("CFLAGS"), "cxxflags": env.get("CXXFLAGS")})
+    return json.dumps({"args": cmake_args(target, cfront), "cflags": env.get("CFLAGS"), "cxxflags": env.get("CXXFLAGS")})
+
+
+async def build_cfront(target, work, prefix, exe):
+    """D174: blaze-cfront from CFRONT_SOURCE, configured against `prefix` (its clang and LLVM
+    cmake config, before `merge` removes the component libraries), linked statically to them,
+    installed as `prefix`/CFRONT_MEMBER; then the clang libraries, headers and config it was
+    built from are removed from the prefix. Returns its sha256. A missing source is refused by
+    name: nothing is built without it."""
+    if not (CFRONT_SOURCE / "CMakeLists.txt").is_file():
+        sys.exit(f"error: llvm.py: cfront: {CFRONT_SOURCE / 'CMakeLists.txt'} does not exist; "
+                 "the helper's source is not in this tree")
+    if WINDOWS:
+        sys.exit("error: llvm.py: cfront: blaze-cfront has no Windows build (D174 covers macOS and Linux)")
+    bld = work / "cfront-build"
+    shutil.rmtree(bld, ignore_errors=True)
+    bld.mkdir()
+    args = ["-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_PREFIX_PATH={prefix}",
+            f"-DCMAKE_INSTALL_PREFIX={prefix}"]
+    if "linux" in target:
+        args += ["-DCMAKE_C_COMPILER=gcc", "-DCMAKE_CXX_COMPILER=g++",
+                 "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc"]
+    elif "apple" in target:
+        args += ["-DCMAKE_OSX_DEPLOYMENT_TARGET=13.0", "-DCMAKE_OSX_ARCHITECTURES=arm64"]
+    await run("cfront cmake", "cmake", *args, CFRONT_SOURCE, cwd=bld, env=cmake_env(target), limit=600)
+    await run("cfront ninja", "ninja", "install", cwd=bld, limit=3600)
+    helper = prefix / f"{CFRONT_MEMBER}{exe}"
+    if not helper.is_file():
+        sys.exit(f"error: llvm.py: cfront: the helper's install left no {helper}")
+    lib = prefix / "lib"
+    for it in sorted(lib.glob("libclang*.a")):
+        # clang's static libraries (libclangAST.a, ...); `libclang` (the shared library bindgen
+        # loads) is a .dylib or .so and stays.
+        it.unlink()
+    shutil.rmtree(prefix / "include" / "clang", ignore_errors=True)
+    shutil.rmtree(lib / "cmake" / "clang", ignore_errors=True)
+    return sha256(helper)
 
 
 def pack(prefix, out, top):
@@ -284,11 +346,11 @@ async def build(args):
     bld, prefix = work / "build", work / "prefix"
     shutil.rmtree(prefix, ignore_errors=True)
     stamp = bld / "blaze-recipe.json"
-    if bld.exists() and (not stamp.exists() or stamp.read_text() != recipe(args.target)):
+    if bld.exists() and (not stamp.exists() or stamp.read_text() != recipe(args.target, args.cfront)):
         shutil.rmtree(bld)
     bld.mkdir(exist_ok=True)
-    stamp.write_text(recipe(args.target))
-    await run("cmake", "cmake", *cmake_args(args.target), f"-DCMAKE_INSTALL_PREFIX={prefix}", src / "llvm",
+    stamp.write_text(recipe(args.target, args.cfront))
+    await run("cmake", "cmake", *cmake_args(args.target, args.cfront), f"-DCMAKE_INSTALL_PREFIX={prefix}", src / "llvm",
               cwd=bld, env=cmake_env(args.target), limit=900)
     jobs = ["-j", str(args.jobs)] if args.jobs else []
     await run("ninja", "ninja", *jobs, "install-distribution", cwd=bld, limit=5 * 3600)
@@ -296,6 +358,7 @@ async def build(args):
     said = (await run("llvm-config", prefix / "bin" / f"llvm-config{exe}", "--version", limit=60)).strip()
     if said != p["version"]:
         sys.exit(f"error: llvm.py: the build says LLVM {said}, llvm.json pins {p['version']}")
+    cfront = await build_cfront(args.target, work, prefix, exe) if args.cfront else None
     link = await manifest(prefix, exe)
     (prefix / MARKER).write_text(json.dumps(
         {"version": p["version"], "repo": p["repo"], "ref": p["ref"], "commit": p["commit"],
@@ -305,8 +368,11 @@ async def build(args):
     await asyncio.to_thread(pack, prefix, packed, stem)
     digest = sha256(packed)
     archive = packed.rename(out / f"{stem}-{digest[:16]}.tar.xz")
-    (out / f"{args.target}.json").write_text(json.dumps(
-        {"target": args.target, "name": archive.name, "sha256": digest}, indent=2) + "\n")
+    entry = {"target": args.target, "name": archive.name, "sha256": digest}
+    if cfront:
+        # D174: `pin` writes it to pins/cfront.json.
+        entry["cfront_sha256"] = cfront
+    (out / f"{args.target}.json").write_text(json.dumps(entry, indent=2) + "\n")
     print(f"llvm.py: {archive} ({archive.stat().st_size / 1e6:.0f} MB, sha256 {digest})", flush=True)
 
 
@@ -365,6 +431,8 @@ def fetch(args):
 
 def pin_dirs(root):
     p = pin()
+    c = json.loads(CFRONT_PIN.read_text())
+    cfront = dict(c["targets"])
     for d in sorted(Path(root).expanduser().iterdir()):
         if not d.is_dir():
             continue
@@ -375,8 +443,15 @@ def pin_dirs(root):
             if not got["name"].startswith(archive_stem(p, got["target"]) + "-"):
                 sys.exit(f"error: llvm.py: {got['name']} is not a build of the pinned commit")
             p["targets"][got["target"]] = {"name": got["name"], "sha256": got["sha256"]}
+            if "cfront_sha256" in got:
+                cfront[got["target"]] = {"archive": got["name"], "sha256": got["cfront_sha256"]}
+            else:
+                # An archive without the helper: a pin of it would name a helper that is not there.
+                cfront.pop(got["target"], None)
     p["targets"] = dict(sorted(p["targets"].items()))
     PIN.write_text(json.dumps(p, indent=2) + "\n")
+    c["targets"] = dict(sorted(cfront.items()))
+    CFRONT_PIN.write_text(json.dumps(c, indent=2) + "\n")
 
 
 @dataclass(frozen=True)
@@ -389,11 +464,13 @@ class Input:
     origin: str = ""
     dir: str = ""
     root: str = ""
+    # D174: build blaze-cfront into the archive too (CFRONT_SOURCE must exist).
+    cfront: bool = False
 
 
 # What each command needs, and what it may also be given.
 FIELDS = {
-    "build": ({"target", "work", "out"}, {"jobs", "origin"}),
+    "build": ({"target", "work", "out"}, {"jobs", "origin", "cfront"}),
     "fetch": ({"target", "dir"}, set()),
     "pin": ({"root"}, set()),
 }

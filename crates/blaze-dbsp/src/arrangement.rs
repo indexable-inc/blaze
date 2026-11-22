@@ -1,6 +1,6 @@
 use std::hash::Hash;
 
-use blaze_hash::{HashMap, HashSet};
+use blaze_hash::{FixedState, Map, MapOpts, Set, SetOpts};
 use std::alloc::Global;
 
 use crate::Weight;
@@ -19,11 +19,11 @@ use crate::Weight;
 /// all cancel goes on a free list with its buffer, which the next new key takes.
 #[derive(Debug)]
 pub struct Arrangement<K, S, V> {
-    slot: HashMap<K, u32, Global>,
+    slot: Map<K, u32, FixedState, Global>,
     rows: Vec<KeyRows<K, S, V>>,
     free: Vec<u32>,
     changed: Vec<K>,
-    changed_set: HashSet<K, Global>,
+    changed_set: Set<K, FixedState, Global>,
 }
 
 #[derive(Debug)]
@@ -51,11 +51,11 @@ impl<K: Copy + Eq + Hash, S: Ord + Clone, V: Copy + Eq + Hash> Default for Arran
 impl<K: Copy + Eq + Hash, S: Ord + Clone, V: Copy + Eq + Hash> Arrangement<K, S, V> {
     pub fn new() -> Self {
         Arrangement {
-            slot: HashMap::new_in(Global),
+            slot: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             rows: Vec::new(), // alloc: setup: an empty buffer, grown once and kept
             free: Vec::new(), // alloc: setup: an empty buffer, grown once and kept
             changed: Vec::new(), // alloc: setup: an empty buffer, grown once and kept
-            changed_set: HashSet::new_in(Global),
+            changed_set: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }),
         }
     }
 

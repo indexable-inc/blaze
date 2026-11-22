@@ -18,9 +18,16 @@
 )]
 mod spawn;
 
+#[allow(
+    unsafe_code,
+    reason = "a linked child: copies of inherited descriptors, the group's kill, the macOS exit watch (kqueue)"
+)]
+pub mod linked;
+
 #[cfg(test)]
 mod tests;
 
+use blaze_sys::{Errno, posix::{io::PollEvents, proc, types::pid_t}};
 use std::{
     fmt, io,
     os::fd::OwnedFd,
@@ -41,7 +48,7 @@ static RUNS: AtomicU64 = AtomicU64::new(0);
 
 /// A process started, its pipes the driver's.
 pub(crate) struct Started {
-    pub(crate) pid: libc::pid_t,
+    pub(crate) pid: pid_t,
     /// Readable once it exits; made with it, so it names this process and no later one.
     #[cfg(target_os = "linux")]
     pub(crate) pidfd: OwnedFd,
@@ -79,7 +86,7 @@ static CHILDREN: Lock<Vec<Child>> = Lock::new("core.process.children", Vec::new(
 
 /// A child as [`CHILDREN`] lists it.
 struct Child {
-    pid: libc::pid_t,
+    pid: pid_t,
     /// Its start's number ([`RUNS`]): a pid is reused once reaped, a run never is.
     run: u64,
     program: PathBuf,
@@ -93,7 +100,7 @@ struct Child {
 /// Each child started and not reaped, with the thread mark of the thread that waits for it in
 /// place ([`Waiter::Starter`]), if one does: the task watchdog's look at which thread waits on
 /// which child. Allocates nothing.
-pub fn each_child(mut each: impl FnMut(libc::pid_t, Option<u64>)) {
+pub fn each_child(mut each: impl FnMut(pid_t, Option<u64>)) {
     for child in CHILDREN.lock().iter() {
         let waiter = matches!(child.waiter, Waiter::Starter(_)).then_some(child.starter);
         each(child.pid, waiter);
@@ -104,7 +111,7 @@ pub fn each_child(mut each: impl FnMut(libc::pid_t, Option<u64>)) {
 /// else's. The task watchdog's end of a child that used no CPU for its bound: whoever waits for
 /// it wakes to its exit, and the job that started it fails. `false` when it is not listed (it
 /// was reaped since the watchdog looked).
-pub fn kill_listed(pid: libc::pid_t) -> bool {
+pub fn kill_listed(pid: pid_t) -> bool {
     let children = CHILDREN.lock();
     if !children.iter().any(|it| it.pid == pid) {
         return false;
@@ -160,7 +167,7 @@ pub enum State {
 /// A child started and not reaped, as [`unreaped`] says it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unreaped {
-    pub pid: libc::pid_t,
+    pub pid: pid_t,
     pub program: PathBuf,
     pub waiter: Waiter,
     /// How long ago it started.
@@ -196,7 +203,7 @@ impl fmt::Display for Unreaped {
 /// stopped polling. Reads each child's state without reaping it.
 pub fn unreaped() -> Vec<Unreaped> {
     let now = Instant::now();
-    let listed: Vec<(libc::pid_t, PathBuf, Waiter, Duration)> = (CHILDREN.lock().iter())
+    let listed: Vec<(pid_t, PathBuf, Waiter, Duration)> = (CHILDREN.lock().iter())
         .map(|it| {
             (it.pid, it.program.clone(), it.waiter, now.saturating_duration_since(it.started))
         }) // clone: the program's path, out of the lock, once per report
@@ -207,7 +214,7 @@ pub fn unreaped() -> Vec<Unreaped> {
             let state = match crate::raw::has_exited(pid) {
                 Ok(true) => State::Exited,
                 Ok(false) => State::Running,
-                Err(error) if error.raw_os_error() == Some(libc::ECHILD) => State::Gone,
+                Err(error) if error.raw_os_error() == Some(i32::from(Errno::Child.raw())) => State::Gone,
                 Err(error) => State::Unknown(error.raw_os_error().unwrap_or(0)),
             };
             Unreaped { pid, program, waiter, age, state }
@@ -219,12 +226,12 @@ pub fn unreaped() -> Vec<Unreaped> {
 /// child out, it does nothing; dropped with the child still listed, the child stays listed as
 /// [`Waiter::Abandoned`], a zombie or a running process no one will reap.
 struct Listed {
-    pid: libc::pid_t,
+    pid: pid_t,
     run: u64,
 }
 
 impl Listed {
-    fn new(pid: libc::pid_t, run: u64, program: &Path) -> Listed {
+    fn new(pid: pid_t, run: u64, program: &Path) -> Listed {
         let program = program.to_path_buf(); // alloc: the program's path, once per spawn, what a stall report names it by
         let child = Child {
             pid,
@@ -249,7 +256,7 @@ impl Drop for Listed {
 }
 
 /// Takes `pid` out of [`CHILDREN`]: reaped, so its pid may be another's from now on.
-fn unlist(pid: libc::pid_t) {
+fn unlist(pid: pid_t) {
     let mut children = CHILDREN.lock();
     if let Some(at) = children.iter().position(|it| it.pid == pid) {
         children.remove(at);
@@ -408,7 +415,7 @@ impl Finish {
     /// and removes what was made for it.
     pub(crate) fn exited(
         self,
-        pid: libc::pid_t,
+        pid: pid_t,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
     ) -> io::Result<Exit> {
@@ -447,16 +454,16 @@ impl Finish {
                 return Err(io::Error::new(error.kind(), why));
             }
         };
-        let (code, signal) = match libc::WIFSIGNALED(status) {
-            true => (None, Some(libc::WTERMSIG(status))),
-            false => (Some(libc::WEXITSTATUS(status)), None),
+        let (code, signal) = match proc::WIFSIGNALED(status) {
+            true => (None, Some(proc::WTERMSIG(status))),
+            false => (Some(proc::WEXITSTATUS(status)), None),
         };
         let max_rss = u64::try_from(rusage.ru_maxrss).unwrap_or(0);
         // Kibibytes on Linux, bytes on Apple's systems.
         let peak_rss = if cfg!(target_os = "macos") { max_rss } else { max_rss * 1024 };
         let peak_memory = peak_rss.max(limited);
         if crate::reaped::observed() {
-            let count = |it: libc::c_long| u64::try_from(it).unwrap_or(0);
+            let count = |it: core::ffi::c_long| u64::try_from(it).unwrap_or(0);
             crate::reaped::report(&crate::reaped::Reaped {
                 pid: u32::try_from(pid).unwrap_or(0),
                 program: &self.command.program,
@@ -506,7 +513,7 @@ fn cpu(it: libc::timeval) -> Duration {
 /// Reaps `pid`, waiting until it has exited: its status and what it used. The one reap of a
 /// child [`start`] made: it leaves [`unreaped`]'s list here, reaped, or found reaped already
 /// (`ECHILD`, which names the second reap as the error it is).
-pub(crate) fn reap(pid: libc::pid_t) -> io::Result<(libc::c_int, libc::rusage)> {
+pub(crate) fn reap(pid: pid_t) -> io::Result<(core::ffi::c_int, libc::rusage)> {
     // On Linux a `wait4(WNOHANG)`, and where the child still runs, its exit waited for on the
     // thread's wait ring (`IORING_OP_WAITID`, leaving it unreaped) before that reap.
     #[cfg(target_os = "linux")]
@@ -529,7 +536,7 @@ pub(crate) fn reap(pid: libc::pid_t) -> io::Result<(libc::c_int, libc::rusage)> 
     };
     match &reaped {
         Ok(_) => unlist(pid),
-        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+        Err(error) if error.raw_os_error() == Some(i32::from(Errno::Child.raw())) => {
             unlist(pid);
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -545,7 +552,7 @@ pub(crate) fn reap(pid: libc::pid_t) -> io::Result<(libc::c_int, libc::rusage)> 
 }
 
 /// Waits until `pid` has exited without reaping it, so its pid is not another's until it is.
-pub(crate) fn wait_exited(pid: libc::pid_t) -> io::Result<()> {
+pub(crate) fn wait_exited(pid: pid_t) -> io::Result<()> {
     // On Linux `IORING_OP_WAITID` on the thread's wait ring.
     #[cfg(target_os = "linux")]
     {
@@ -566,7 +573,7 @@ pub(crate) fn wait_exited(pid: libc::pid_t) -> io::Result<()> {
 }
 
 /// Signals `pid`, which has not been reaped, so no one else's.
-pub(crate) fn kill(pid: libc::pid_t) {
+pub(crate) fn kill(pid: pid_t) {
     crate::raw::kill(pid);
 }
 
@@ -600,12 +607,12 @@ pub(crate) fn communicate(
         let mut which = [None; 3];
         let mut n = 0;
         if let Some(fd) = &stdin {
-            fds[n] = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
+            fds[n] = libc::pollfd { fd: fd.as_raw_fd(), events: PollEvents::OUT.bits(), revents: 0 };
             n += 1;
         }
         for (at, fd) in outputs.iter().enumerate() {
             if let Some(fd) = fd {
-                fds[n] = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                fds[n] = libc::pollfd { fd: fd.as_raw_fd(), events: PollEvents::IN.bits(), revents: 0 };
                 which[n] = Some(at);
                 n += 1;
             }
@@ -638,7 +645,7 @@ pub(crate) fn communicate(
                         ),
                     };
                     // Done, or the process is not reading (EPIPE and the rest): its input ends.
-                    if written == input.len() || broken || polled.revents & libc::POLLOUT == 0 {
+                    if written == input.len() || broken || polled.revents & PollEvents::OUT.bits() == 0 {
                         stdin = None;
                     }
                 }

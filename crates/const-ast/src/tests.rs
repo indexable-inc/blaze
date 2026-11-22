@@ -582,12 +582,13 @@ fn rust_files(dir: &FsPath, out: &mut Vec<PathBuf>) {
 }
 
 /// Real crates: the standard library's `core` and `alloc` (every kind of item, attribute and
-/// generic there is), the query engine (derives and generic code) and this crate.
+/// generic there is), the memo engine (derives and generic code; it took the place of the
+/// query engine, `crates/blaze-query`, deleted with the old item layer) and this crate.
 fn corpus() -> Vec<PathBuf> {
     let root = FsPath::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut files = Vec::new();
     for dir in
-        ["library/core/src", "library/alloc/src", "crates/blaze-query/src", "crates/const-ast/src"]
+        ["library/core/src", "library/alloc/src", "crates/blaze-memo/src", "crates/const-ast/src"]
     {
         rust_files(&root.join(dir), &mut files);
     }
@@ -963,4 +964,73 @@ fn a_full_fixed_builder_panics_naming_its_size() {
     b.token("a");
     b.token("b");
     b.token("c");
+}
+
+#[test]
+fn is_type_and_bitsets_match_syntax_ast_for_every_kind() {
+    for raw in 0..SyntaxKind::__LAST as u16 {
+        let sk = SyntaxKind::from(raw);
+        let is_tok = raw < SyntaxKind::ABI as u16 || sk.fixed_text().is_some();
+        let encoded = if is_tok { raw | TOKEN } else { raw };
+        let kinds_arr = [encoded];
+        let ends_arr = [1u32];
+        let spans_arr = [NO_SPAN];
+        let texts_arr = [""];
+        let tree = Tree::new(&kinds_arr, &ends_arr, &spans_arr, &texts_arr);
+        if is_tok {
+            assert!(tree.node(0).is_none());
+            continue;
+        }
+        let node = tree.node(0).expect("a node");
+        assert_eq!(Type::cast(node).is_some(), ast::Type::can_cast(sk), "Type::cast mismatch for {sk:?}");
+        assert_eq!(Item::cast(node).is_some(), ast::Item::can_cast(sk), "Item::cast mismatch for {sk:?}");
+    }
+    // Explicitly check the three newly covered Type node kinds.
+    for kind in [kinds::UNION_TYPE, kinds::RECORD_TYPE, kinds::UNSAFE_BINDER_TYPE] {
+        let kinds_arr = [kind];
+        let ends_arr = [1u32];
+        let spans_arr = [NO_SPAN];
+        let texts_arr = [""];
+        let tree = Tree::new(&kinds_arr, &ends_arr, &spans_arr, &texts_arr);
+        assert!(Type::cast(tree.root()).is_some(), "Type::cast must accept kind {kind}");
+    }
+}
+
+#[test]
+fn tuple_type_fields_count_and_decimal_bytes_and_token_in() {
+    let text = "type A = (u8, i32, &str); type B = ();";
+    let arrays = Arrays::of(AstFile::parse(text, Edition::CURRENT).root().shared_file());
+    let tree = arrays.tree();
+    let mut items = SourceFile::cast(tree.root()).unwrap().items();
+    let first = items.next().unwrap();
+    let second = items.next().unwrap();
+    let t1 = first.syntax().children().find_map(TupleType::cast).unwrap();
+    let t2 = second.syntax().children().find_map(TupleType::cast).unwrap();
+    assert_eq!(t1.fields().count(), 3);
+    assert_eq!(t2.fields().count(), 0);
+
+    for (n, want) in [
+        (0u128, "0"),
+        (1, "1"),
+        (9, "9"),
+        (10, "10"),
+        (42, "42"),
+        (1_000_000_000, "1000000000"),
+        (u64::MAX as u128, "18446744073709551615"),
+        (u128::MAX, "340282366920938463463374607431768211455"),
+    ] {
+        let (buf, start) = crate::builder::decimal_bytes(n);
+        assert_eq!(core::str::from_utf8(&buf[start..]).unwrap(), want);
+    }
+
+    let (mut kinds, mut sizes, mut spans) = ([0u16; 6], [0u32; 6], [0u32; 6]);
+    let mut texts = [""; 6];
+    let mut b = Builder::over(&mut kinds, &mut sizes, &mut spans, &mut texts, Span::mixed_site());
+    b.token_in("foo", Span::call_site(), &[Kind::PATH_TYPE, Kind::PATH, Kind::PATH_SEGMENT, Kind::NAME_REF]);
+    b.token_in("bar", Span::def_site(), &[]);
+    let built = b.finish(Entry::Type);
+    assert_eq!(built.kinds(), &[kinds::PATH_TYPE, kinds::PATH, kinds::PATH_SEGMENT, kinds::NAME_REF, TOKEN, TOKEN]);
+    assert_eq!(built.sizes(), &[5, 4, 3, 2, 1, 1]);
+    assert_eq!(built.spans(), &[NO_SPAN, NO_SPAN, NO_SPAN, NO_SPAN, Span::call_site().index(), Span::def_site().index()]);
+    assert_eq!(built.texts(), &["", "", "", "", "foo", "bar"]);
 }

@@ -3,7 +3,7 @@
 
 use std::fmt::Write as _;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use std::alloc::Global;
 
 use super::{
@@ -57,7 +57,7 @@ pub struct Row {
 /// The rows of `model` by `by`, those whose key holds `matching` when given, longest first.
 pub fn rows(model: &Model, by: By, matching: Option<&str>) -> Vec<Row> {
     // alloc: a report's rows, once a report
-    let mut rows: HashMap<String, Row, Global> = HashMap::new_in(Global);
+    let mut rows: Map<String, Row, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     match by {
         By::Unit | By::Item => {
             for (i, span) in model.spans.iter().enumerate() {
@@ -102,7 +102,7 @@ pub fn rows(model: &Model, by: By, matching: Option<&str>) -> Vec<Row> {
 
 /// The row of `key`, unless it does not hold `matching`.
 fn row<'a>(
-    rows: &'a mut HashMap<String, Row, Global>,
+    rows: &'a mut Map<String, Row, FixedState, Global>,
     matching: Option<&str>,
     key: String,
 ) -> Option<&'a mut Row> {
@@ -209,7 +209,11 @@ impl Utilization {
 }
 
 pub fn utilization(model: &Model) -> Utilization {
-    let mut cores = blaze_hash::HashSet::new_in(Global);
+    let mut cores = blaze_hash::Set::new(blaze_hash::SetOpts {
+        hasher: blaze_hash::FixedState,
+        alloc: Global,
+        capacity: None,
+    });
     let mut running_ns = 0;
     let (start, end) = (model.bounds.start_ns, model.bounds.end_ns);
     for lane in &model.lanes {

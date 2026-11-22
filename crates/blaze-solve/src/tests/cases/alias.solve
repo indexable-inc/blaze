@@ -1,0 +1,330 @@
+# Aliases: projection and normalizes-to goals, opaque types, alias bounds
+# (src/alias.rs; reference: vendor/rustc_next_trait_solver/src/solve/project_goals/,
+# normalizes_to.rs, assembly/mod.rs). Expected answers are the pinned nightly's next solver's.
+
+trait Tr { type A; }
+trait Bnd { type B: Clone; }
+trait Bp { type B: Iterator<Item = u32>; }
+trait Outer { type O: Bp; }
+trait Foo
+impl<I: Iterator<Item = u32>> Foo for I
+
+# --- projection through an impl (normalizes_to.rs consider_impl_candidate) ---
+
+case proj_impl_vec = normalizes_to.rs consider_impl_candidate
+goal <Vec<u32> as Iterator>::Item == u32 => yes
+
+case proj_impl_mismatch = normalizes_to.rs consider_impl_candidate
+goal <Vec<u32> as Iterator>::Item == u8 => no
+
+case proj_impl_infer_term = project_goals/mod.rs normalize_associated_term
+goal <Vec<u32> as Iterator>::Item == ?0 => yes ?0 = u32
+
+case proj_impl_infer_self_arg = normalizes_to.rs consider_impl_candidate
+goal <Vec<?0> as Iterator>::Item == u32 => yes ?0 = u32
+
+case proj_trait_args = normalizes_to.rs consider_impl_candidate
+goal <u32 as Add<u32>>::Output == u32 => yes
+
+case proj_trait_args_no_impl = normalizes_to.rs compute_normalizes_to_goal
+# The trait goal `u32: Add<u8>` fails, so normalizing fails (its `?`).
+goal <u32 as Add<u8>>::Output == u32 => no
+
+case proj_deref_target = normalizes_to.rs consider_impl_candidate
+goal <Vec<u8> as Deref>::Target == [u8] => yes
+
+case proj_no_impl = normalizes_to.rs compute_normalizes_to_goal
+goal <u8 as Iterator>::Item == u32 => no
+
+case proj_self_var = normalizes_to.rs compute_normalizes_to_goal
+# `?0: Iterator` is ambiguous: proven_via is None, forced ambiguity.
+goal <?0 as Iterator>::Item == u32 => maybe
+
+case normalizes_to_impl = normalizes_to.rs compute_normalizes_to_goal
+goal normalizes(<Vec<u32> as Iterator>::Item) == ?0 => yes ?0 = u32
+
+case proj_two_aliases_equal = project_goals/mod.rs normalize_associated_term
+impl Tr for u8 { type A = u32; }
+impl Tr for u16 { type A = u32; }
+goal <u8 as Tr>::A == <u16 as Tr>::A => yes
+
+case proj_two_aliases_differ = project_goals/mod.rs normalize_associated_term
+impl Tr for u8 { type A = u32; }
+impl Tr for u16 { type A = u8; }
+goal <u8 as Tr>::A == <u16 as Tr>::A => no
+
+case proj_nested_alias_in_value = normalizes_to.rs consider_impl_candidate (EvalCtxt::normalize of the value)
+impl Tr for u8 { type A = Vec<<Vec<u32> as Iterator>::Item>; }
+goal <u8 as Tr>::A == ?0 => yes ?0 = Vec<u32>
+
+case proj_value_is_alias = normalizes_to.rs consider_impl_candidate
+impl Tr for u8 { type A = <Vec<u16> as Iterator>::Item; }
+goal <u8 as Tr>::A == u16 => yes
+
+# --- the param env (normalizes_to.rs match_assumption) ---
+
+case env_projection = normalizes_to.rs match_assumption
+params T
+env T: Iterator; <T as Iterator>::Item == u32
+goal <T as Iterator>::Item == u32 => yes
+
+case env_projection_infer = normalizes_to.rs match_assumption
+params T
+env T: Iterator<Item = u32>
+goal <T as Iterator>::Item == ?0 => yes ?0 = u32
+
+case env_projection_mismatch = normalizes_to.rs match_assumption
+params T
+env T: Iterator<Item = u32>
+goal <T as Iterator>::Item == u8 => no
+
+case env_orphaned_projection = assembly/mod.rs assemble_and_merge_candidates (Misc: param-env preferred)
+# `u8: Tr` is proven by the impl (Misc), and the orphaned normalization bound wins over it.
+impl Tr for u8 { type A = u32; }
+env <u8 as Tr>::A == u16
+goal <u8 as Tr>::A == u16 => yes
+
+case env_where_bound_over_alias_bound = assembly/mod.rs assemble_and_merge_candidates (where-bounds over alias bounds)
+# tests/ui/winnowing/norm-where-bound-gt-alias-bound.rs
+params T
+env T: Bp; <<T as Bp>::B as Iterator>::Item == u8
+goal <<T as Bp>::B as Iterator>::Item == u8 => yes  # unsure: whether the env projection and the alias bound's u32 conflict earlier
+
+# --- rigid aliases (instantiate_normalizes_to_as_rigid) ---
+
+case rigid_env_trait_bound = assembly/mod.rs assemble_and_merge_candidates (inject_normalize_to_rigid_candidate)
+params T
+env T: Iterator
+goal <T as Iterator>::Item == ?0 => yes ?0 = rigid <T as Iterator>::Item
+
+case rigid_not_concrete = assembly/mod.rs assemble_and_merge_candidates (inject_normalize_to_rigid_candidate)
+params T
+env T: Iterator
+goal <T as Iterator>::Item == u32 => no
+
+case rigid_identical = project_goals/mod.rs normalize_associated_term
+params T
+env T: Iterator
+goal <T as Iterator>::Item == <T as Iterator>::Item => yes
+
+case rigid_normalizes_to = normalizes_to.rs instantiate_normalizes_to_as_rigid
+params T
+env T: Iterator
+goal normalizes(<T as Iterator>::Item) == ?0 => yes ?0 = rigid <T as Iterator>::Item
+
+case env_shadows_blanket_impl = assembly/mod.rs assemble_and_merge_candidates (ParamEnv: impls not used)
+# trait-system-refactor-initiative#125: the where-bound proves `T: Tr`, so the impl does not
+# normalize and the alias is rigid.
+impl<X: ?Sized> Tr for X { type A = u8; }
+params T
+env T: Tr
+goal <T as Tr>::A == u8 => no
+
+case blanket_impl_without_env = normalizes_to.rs consider_impl_candidate
+impl<X: ?Sized> Tr for X { type A = u8; }
+params T
+goal <T as Tr>::A == u8 => yes
+
+# --- projections in where-clauses ---
+
+case where_projection_impl = normalizes_to.rs consider_impl_candidate (impl where-clause)
+goal Vec<u32>: Foo => yes
+
+case where_projection_impl_no = normalizes_to.rs consider_impl_candidate (impl where-clause)
+goal Vec<u8>: Foo => no
+
+case where_projection_infer = normalizes_to.rs consider_impl_candidate (impl where-clause)
+goal Vec<?0>: Foo => yes ?0 = u32
+
+case where_projection_env = normalizes_to.rs match_assumption (impl where-clause)
+params T
+env T: Iterator<Item = u32>
+goal T: Foo => yes
+
+case where_projection_env_wrong = normalizes_to.rs match_assumption (impl where-clause)
+params T
+env T: Iterator<Item = u8>
+goal T: Foo => no
+
+# --- alias bounds (assembly/mod.rs assemble_alias_bound_candidates_recur) ---
+
+case alias_bound_trait = assembly/mod.rs assemble_alias_bound_candidates (SelfBounds)
+params T
+env T: Bnd
+goal <T as Bnd>::B: Clone => yes
+
+case alias_bound_trait_missing = assembly/mod.rs assemble_alias_bound_candidates (SelfBounds)
+params T
+env T: Bnd
+goal <T as Bnd>::B: Copy => no
+
+case alias_bound_projection = assembly/mod.rs assemble_alias_bound_candidates (NormalizesTo)
+params T
+env T: Bp
+goal <<T as Bp>::B as Iterator>::Item == u32 => yes
+
+case alias_bound_projection_infer = assembly/mod.rs assemble_alias_bound_candidates (NormalizesTo)
+params T
+env T: Bp
+goal <<T as Bp>::B as Iterator>::Item == ?0 => yes ?0 = u32
+
+case alias_bound_nested = assembly/mod.rs assemble_alias_bound_candidates_recur
+params T
+env T: Outer
+goal <<<T as Outer>::O as Bp>::B as Iterator>::Item == u32 => yes
+
+case alias_bound_shadowed_by_env = assembly/mod.rs assemble_and_merge_candidates (alias bounds still considered)
+# tests/ui/next-solver/alias-bound-shadowed-by-env.rs
+params T
+env T: Bp; <T as Bp>::B: Iterator
+goal <<T as Bp>::B as Iterator>::Item == u32 => yes
+
+# --- default associated types (fetch_eligible_assoc_item) ---
+
+case trait_default_used = normalizes_to.rs consider_impl_candidate (fetch_eligible_assoc_item: final impl)
+trait Df { type A = u8; }
+impl Df for u32
+goal <u32 as Df>::A == u8 => yes
+
+case impl_default_item_not_used = normalizes_to.rs consider_impl_candidate (NotFound: rigid outside coherence)
+trait Ds { type A; }
+impl Ds for u32 { default type A = u8; }
+goal <u32 as Ds>::A == u8 => no
+
+case impl_default_item_rigid = normalizes_to.rs consider_impl_candidate (NotFound: rigid outside coherence)
+trait Ds { type A; }
+impl Ds for u32 { default type A = u8; }
+goal <u32 as Ds>::A == ?0 => yes ?0 = rigid <u32 as Ds>::A
+
+case impl_missing_item = normalizes_to.rs consider_impl_candidate (error_response)
+impl Tr for u32
+goal <u32 as Tr>::A == ?0 => yes ?0 = _
+
+# --- GATs ---
+
+case owner_impl_and_gat_args = normalizes_to.rs consider_impl_candidate
+trait Arrange<H> { type Out<C>; }
+impl<A, B> Arrange<B> for (B, A) { type Out<C> = (A, B, C); }
+goal <(u8, u16) as Arrange<u8>>::Out<bool> == ?0 => yes ?0 = (u16, u8, bool)
+goal <(u8, u16) as Arrange<u8>>::Out<bool> == (u8, u16, bool) => no
+
+case owner_alias_bound_args = assembly/mod.rs assemble_alias_bound_candidates
+trait Family<A> { type Out<B>: Iterator<Item = (B, A)>; }
+params X
+env X: Family<u16>
+goal <<X as Family<u16>>::Out<bool> as Iterator>::Item == ?0 => yes ?0 = (bool, u16)
+goal <<X as Family<u16>>::Out<bool> as Iterator>::Item == (u16, bool) => no
+
+case gat_unconstrained_arg = normalizes_to.rs compute_normalizes_to_goal (inject_forced_ambiguity_candidate)
+trait G { type A<X>; }
+params T
+env T: G; <T as G>::A<u8> == u32
+goal <T as G>::A<?0> == ?1 => maybe
+
+case gat_constrained_arg = normalizes_to.rs match_assumption
+trait G { type A<X>; }
+params T
+env T: G; <T as G>::A<u8> == u32
+goal <T as G>::A<u8> == ?1 => yes ?1 = u32
+
+# --- objects ---
+
+case dyn_projection = normalizes_to.rs probe_and_consider_object_bound_candidate
+goal <dyn Iterator<Item = u32> as Iterator>::Item == u32 => yes
+
+case dyn_projection_mismatch = normalizes_to.rs probe_and_consider_object_bound_candidate
+goal <dyn Iterator<Item = u32> as Iterator>::Item == u8 => no
+
+# --- opaque types (project_goals/opaque_types.rs normalize_opaque_type, analysis) ---
+
+case opaque_rigid = project_goals/opaque_types.rs normalize_opaque_type (not in defining scope: rigid)
+opaque Op: Clone
+goal opaque#Op == u32 => no
+
+case opaque_rigid_infer = project_goals/opaque_types.rs normalize_opaque_type (not in defining scope: rigid)
+opaque Op: Clone
+goal opaque#Op == ?0 => yes ?0 = rigid opaque#Op
+
+# In analysis a hidden type the world gives is still not seen by normalization (a caller may
+# not know it: `let x: u32 = make();` for `fn make() -> impl Sized { 0u32 }` is E0308); after
+# analysis it is. Each pair differs in the mode alone.
+case opaque_hidden_analysis_rigid = project_goals/opaque_types.rs normalize_opaque_type (analysis: rigid though a hidden type is known)
+opaque Oh: Clone = u32
+goal opaque#Oh == u32 => no
+
+case opaque_hidden_analysis_rigid_infer = project_goals/opaque_types.rs normalize_opaque_type (analysis: rigid though a hidden type is known)
+opaque Oh: Clone = u32
+goal opaque#Oh == ?0 => yes ?0 = rigid opaque#Oh
+
+case opaque_hidden = project_goals/opaque_types.rs normalize_opaque_type (post-analysis: hidden type visible)
+mode post_analysis
+opaque Oh: Clone = u32
+goal opaque#Oh == u32 => yes
+
+case opaque_hidden_infer = project_goals/opaque_types.rs normalize_opaque_type (post-analysis: hidden type visible)
+mode post_analysis
+opaque Oh: Clone = u32
+goal opaque#Oh == ?0 => yes ?0 = u32
+
+# A hidden type that names its own opaque (a recursive future's `Pin<Box<O>>`, here `Vec<O>`):
+# after analysis the opaque is its unfolding, so a term one layer more revealed is equal and a
+# term that differs at any depth is not; both decided (alias.rs `eq_revealing`), never the
+# overflow the lazy relation's `Projection { O, Vec<?y> }` cycle gave.
+case opaque_recursive_unfolded = project_goals/opaque_types.rs normalize_opaque_type (post-analysis: a recursive hidden type is its unfolding)
+mode post_analysis
+opaque Or: Clone = Vec<opaque#Or>
+goal opaque#Or == Vec<Vec<opaque#Or>> => yes
+
+case opaque_recursive_unfolded_twin = project_goals/opaque_types.rs normalize_opaque_type (post-analysis: a recursive hidden type is no finite type)
+mode post_analysis
+opaque Or: Clone = Vec<opaque#Or>
+goal opaque#Or == Vec<Vec<u8>> => no
+
+# The item bound answers the projection in analysis, the hidden type's impl does not: `Vec<u8>`
+# iterates `u8`, the bound says `u32`.
+case opaque_bound_not_hidden = assembly/mod.rs assemble_alias_bound_candidates (analysis: the bound, not the hidden type)
+opaque Ob: Iterator<Item = u32> = Vec<u8>
+goal <opaque#Ob as Iterator>::Item == u32 => yes
+
+case opaque_bound_not_hidden_twin = assembly/mod.rs assemble_alias_bound_candidates (analysis: the hidden type's item is not seen)
+opaque Ob: Iterator<Item = u32> = Vec<u8>
+goal <opaque#Ob as Iterator>::Item == u8 => no
+
+case opaque_alias_bound = assembly/mod.rs assemble_alias_bound_candidates (opaque SelfBounds)
+opaque Op: Clone
+goal opaque#Op: Clone => yes
+
+case opaque_alias_bound_missing = assembly/mod.rs assemble_alias_bound_candidates (opaque SelfBounds)
+opaque Op: Clone
+goal opaque#Op: Copy => no
+
+case opaque_generic_projection_bound = assembly/mod.rs assemble_alias_bound_candidates (opaque, NormalizesTo)
+opaque Og<T>: Iterator<Item = T>
+goal <opaque#Og<u32> as Iterator>::Item == u32 => yes
+
+# --- the IntoIterator blanket impl of the prelude ---
+
+case into_iter_item = normalizes_to.rs consider_impl_candidate (blanket impl, value an alias)
+goal <Vec<u32> as IntoIterator>::Item == ?0 => yes ?0 = u32
+
+case into_iter_into_iter = normalizes_to.rs consider_impl_candidate (blanket impl)
+goal <Vec<u32> as IntoIterator>::IntoIter == Vec<u32> => yes
+
+case into_iter_param = normalizes_to.rs consider_impl_candidate (blanket impl, rigid value)
+params T
+env T: Iterator
+goal <T as IntoIterator>::Item == ?0 => yes ?0 = rigid <T as Iterator>::Item
+
+case into_iter_alias_bound = assembly/mod.rs assemble_alias_bound_candidates (IntoIter: Iterator<Item = ..>)
+params T
+env T: IntoIterator
+goal <<T as IntoIterator>::IntoIter as Iterator>::Item == <T as IntoIterator>::Item => yes
+
+# --- cycles ---
+
+case self_normalization_cycle = normalizes_to.rs consider_impl_candidate (search graph: Unknown path)
+# `<u8 as Cy>::A` normalizes to itself through the impl: the NormalizesTo goal is its own nested
+# goal; the cycle's provisional result is overflow and it never settles (rustc: E0275).
+trait Cy { type A; }
+impl Cy for u8 { type A = <u8 as Cy>::A; }
+goal <u8 as Cy>::A == u32 => overflow  # unsure: overflow vs. maybe(ambiguous) after the fixpoint

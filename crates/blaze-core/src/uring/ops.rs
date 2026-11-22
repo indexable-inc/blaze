@@ -144,13 +144,21 @@ pub(super) const NO_FOLLOW: u8 = 1 << 3;
 /// [`crate::CLONE_OF_NO_FILE`] once its target is unlinked (the bit [`WHOLE`] is).
 pub(super) const NOT_REGULAR: u8 = 1 << 3;
 
+/// A [`Kind::Accept`] of a Unix listen: each connection accepted into a descriptor of the
+/// process's table, not straight into a slot, as `SO_PEERCRED` is read through a descriptor;
+/// its peer's uid checked (`crate::net::Listener::admit`, the decision every driver's accept
+/// takes) before it is put in the driver's half of the table and handed to anyone, and one of
+/// another user, or of a uid that cannot be read, closed unread (uring/flight.rs `admitted`;
+/// the bit [`WHOLE`] is).
+pub(super) const UNIX_PEER: u8 = 1 << 3;
+
 /// A [`Kind::Open`] of a kept file for reads into and writes from memory at offsets
 /// ([`Kind::ReadInto`], [`Kind::WriteFrom`]): opened without `O_APPEND`, which on Linux puts a
 /// positional write at the end, and with [`DIRECT`] `O_DIRECT` (the bit [`WHOLE`] is).
 pub(super) const POSITIONAL: u8 = 1 << 3;
-/// A [`Kind::Open`] of a kept file for a sync or a barrier alone, of a name no request kept:
-/// `O_RDONLY`, as a file sealed read-only refuses an open for writing (`Kept::read_only`; the
-/// bit [`FINISHED`] is).
+/// A [`Kind::Open`] of a kept file for a sync or a barrier alone, of a name no request kept,
+/// or ([`POSITIONAL`]) for reads into memory alone: `O_RDONLY`, as a file sealed read-only
+/// refuses an open for writing (`Kept::read_only`; the bit [`FINISHED`] is).
 pub(super) const READ_ONLY: u8 = 1 << 6;
 /// A [`Kind::ReadInto`] at `IOPRIO_CLASS_IDLE` (the bit [`WHOLE`] is).
 pub(super) const IDLE: u8 = 1 << 3;
@@ -437,7 +445,7 @@ pub(super) fn arena_of(hot: &Hot) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use blaze_hash::HashMap;
+    use blaze_hash::{FixedState, Map, MapOpts};
     use std::alloc::Global;
 
     use super::*;
@@ -449,7 +457,7 @@ mod tests {
         for seed in 0..32 {
             let mut rng = crate::sim::Rng::new(seed);
             let mut ops = Ops::new(1 << 12).unwrap();
-            let mut model: HashMap<u64, (Id, u64, Vec<u8>, u64), Global> = HashMap::new_in(Global);
+            let mut model: Map<u64, (Id, u64, Vec<u8>, u64), FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
             for next in 0..2_000u64 {
                 if model.is_empty() || (model.len() < 128 && rng.below(3) != 0) {
                     let bytes = next.to_le_bytes().to_vec();

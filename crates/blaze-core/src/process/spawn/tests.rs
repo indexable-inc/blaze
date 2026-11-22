@@ -167,7 +167,7 @@ mod held {
 
     /// `program` held open for writing by another thread for `held`, from before the spawn.
     fn holding(program: &Path, held: Duration) -> std::thread::JoinHandle<()> {
-        let (opened, open) = crossbeam_channel::bounded(0);
+        let (opened, open) = crate::chan::bounded(0);
         let program = program.to_path_buf();
         let holder = std::thread::spawn(move || {
             let file = std::fs::OpenOptions::new().write(true).open(&program).unwrap();

@@ -1,0 +1,8 @@
+{
+  "date": "2026-11-17",
+  "model": "claude-opus-5-5",
+  "lane": "FL",
+  "area": "the build queue (runner.py ask), blaze-cli tests, blaze-toolchain shelf rows",
+  "annoyance": "The runner's test form takes `--features ..` only after `--test X`; put first, it is refused with no hint of the order. A passing test's output is not shown, so the only way to see its prints is a forced panic, which then has to be removed before admission. Nine blaze-cli bin tests fail on green (store worktree, certified answer, include_data x2, native_image x2, stale_facts x3), so a full `-p blaze-cli --bin blaze` run tells nothing until a baseline ask on green is made beside it. The equal_flows tests in blaze-body-flow fail on green too. The toolchain row's sysroot edges came from the root file only, so a toolchain crate's `extern crate std;` in a module (bstd's `mod rt`) bound nothing, and the ladder's `Inputs` gives every toolchain crate the sysroot, so no ladder test could show it.",
+  "workaround": "Put `--features` after `--test`. Print through a temporary panic. Run a no-admit baseline ask with an unrelated path to name the failures that are already on green. Read blaze-cli names/scope.rs `sysroot_given` when a toolchain crate's name is NotFound only in the command."
+}

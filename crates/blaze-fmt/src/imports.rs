@@ -6,8 +6,6 @@ use std::fmt;
 
 use core::hash::{Hash, Hasher};
 
-use itertools::Itertools;
-
 use crate::ast::{self, UseTreeKind};
 use crate::span::{
     BytePos, DUMMY_SP, Span,
@@ -264,11 +262,12 @@ fn flatten_use_trees(
 ) -> Vec<UseTree> {
     // Return non-sorted single occurrence of the use-trees text string;
     // order is by first occurrence of the use-tree.
+    let mut seen = std::collections::HashSet::new();
     use_trees
         .into_iter()
         .flat_map(|tree| tree.flatten(import_granularity))
         .map(UseTree::nest_trailing_self)
-        .unique()
+        .filter(|tree| seen.insert(tree.clone()))
         .collect()
 }
 

@@ -41,7 +41,7 @@ test has no failing test either (agents.json A39, vacuous success). With `args` 
 tests, say how many they select.
 
 `max_mb`, when not 0, fails the run when the machine had more than that many megabytes of memory
-and swap in use at once while it ran (docs/memory-budget.md, the check in CI).
+and swap in use at once while it ran (the check in CI).
 """
 import dataclasses, json, os, re, shutil, signal, subprocess, sys, threading, time, typing
 
@@ -318,7 +318,7 @@ def main():
             f.write(f"### Unit tests\n\n{said}\n\n")
     over = cfg.max_mb and watch.at_peak and watch.peak > cfg.max_mb
     if over:
-        print(f"::error::the machine had {watch.peak} MB of memory and swap in use at once, over the {cfg.max_mb} MB bound (max_mb; docs/memory-budget.md)")
+        print(f"::error::the machine had {watch.peak} MB of memory and swap in use at once, over the {cfg.max_mb} MB bound (max_mb)")
     if cfg.build:
         sys.exit(status or (1 if over else 0))
     context = failures.Context("release", failures.this_os())

@@ -1,0 +1,15 @@
+{
+ "id": "trait-members-restart-per-need",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane VB",
+ "where": "crates/blaze-ladder/src/front2/heads.rs Store::ensure_noting and trait_members; measured by tests/front2_tables_cost.rs",
+ "what": "the body task (a fresh head store per body) spent 149 ms of its 188 ms a body making heads, and 126 ms of those were head steps that stopped at a need and were done again: a trait's members were lowered from the top after EACH need one member's signature met. core's Iterator (about 75 members, each naming another adapter) restarted about 60 times a body, 240 ms and 50 MB each time it was made.",
+ "cost": "found in one measuring ask once the meter named heads per want (Cost::enter_want, the slowest wants printed)",
+ "cause": "Store::step returns one Why::Need and the work list re-enters the want from the top after making it",
+ "whys": "a step's need was designed as one value; a trait is the one want whose step does n independent pieces of work",
+ "class": "a step that restarts from scratch per need: quadratic in the number of needs a want meets",
+ "prevention": "partly done: trait_members gathers every member's need (NeedsMet::All) and ensure_noting makes them all before the trait steps again (heads 149 -> 52 ms a body); the same for impl_ and adt steps and for needs found while making a need is open; the cost test runs both strategies and asserts equal answers",
+ "annoyance": "the queue cuts a long test output before a failure's panic text: write long lines to a file and keep stdout to a few summary lines",
+ "workaround": "note! macro in the cost test writes BODY lines to the temp file only",
+ "state": "partly fixed"
+}

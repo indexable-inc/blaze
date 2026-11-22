@@ -1,3 +1,5 @@
+use std::{format, string::String, vec, vec::Vec};
+
 use blaze_ids::rng::SplitMix64;
 use blaze_sim::Config;
 
@@ -233,4 +235,38 @@ fn matches_the_reference() {
         }
         assert_eq!(hasher.finish(), want);
     });
+}
+
+/// RFC 4231's cases 1 to 4, 6 and 7 (case 5 is a truncated tag): short, "Jefe", 0xdd data,
+/// a 25-byte key, and a 131-byte key (hashed first) with short and long data.
+#[test]
+fn hmac_rfc4231_vectors() {
+    let long_key = [0xaau8; 131];
+    let counting: Vec<u8> = (1..=25).collect();
+    let cases: [(&[u8], &[u8], &str); 6] = [
+        (&[0x0b; 20], b"Hi There", "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"),
+        (b"Jefe", b"what do ya want for nothing?", "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"),
+        (&[0xaa; 20], &[0xdd; 50], "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe"),
+        (&counting, &[0xcd; 50], "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b"),
+        (
+            &long_key,
+            b"Test Using Larger Than Block-Size Key - Hash Key First",
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
+        ),
+        (
+            &long_key,
+            b"This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.",
+            "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2",
+        ),
+    ];
+    for (key, message, want) in cases {
+        assert_eq!(hex(&hmac(key, message)), want, "key of {} bytes", key.len());
+        // In parts, the same tag; and `finish` leaves the value able to take more.
+        let mut mac = HmacSha256::new(key);
+        let half = message.len() / 2;
+        mac.update(&message[..half]);
+        let _ = mac.finish();
+        mac.update(&message[half..]);
+        assert_eq!(hex(&mac.finish()), want);
+    }
 }

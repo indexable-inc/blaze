@@ -1,0 +1,15 @@
+{
+ "id": "stuck-on-the-store",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane CL",
+ "where": "crates/blaze-cas/src/plain (lent.rs, core.rs, handle.rs, driven.rs, format.rs), crates/blaze-keyed/src/store.rs TwoValues, crates/blaze-cli/src/store.rs StoreFailure::TwoValues, crates/blaze-cli/src/clean.rs",
+ "what": "The owner's `blaze check` stopped on 'two values under one key 3555bcbdf6da (rule 21: the key misses an input of its value)' with no record named, no sizes, no side, no way on; `blaze clean` was a usage error. Each blaze-cas raise site built its own shape (some a tag and key only).",
+ "cost": "the owner stuck on his own hello world until the home was copied by hand",
+ "cause": "the refusal carried only the key and kind; there was no command to remove derived state",
+ "whys": "rule 21 says the fix is the key, which is right, but nothing told the user what to do meanwhile; the store's raise sites grew one by one",
+ "class": "a refusal that names a bug but leaves the user without a step to go on",
+ "prevention": "done: one typed TwoValues (both kinds and sizes, the side that holds it, the first differing byte) at every raise site; the CLI line names the record and says `blaze clean --store`; `blaze clean [dir] [--store]` removes only folders shown to be blaze's",
+ "annoyance": "blaze-cli has no library target: `--lib` fails, the tests are `--bin blaze`. The simulated world's `publish` names a file's folders without making them, so `remove_dir` of such a folder is NotFound (tests make folders with make_dir). `Dir::own_entries` of a folder that is not there fails with a driver string in the sim, not FsKind::NotFound. The runner does not show a passing test's stdout even with --nocapture.",
+ "workaround": "tests assert exact output strings instead of relying on printed lines",
+ "state": "fixed"
+}

@@ -1,0 +1,50 @@
+[package]
+name = "blaze-names-source"
+description = "blaze-names-demand's `Source` over real inputs: one module's outline from blaze-file-items with a `Writes` summary per macro call from blaze-expand, one call's expansion through `expand` and `outline_token_record`, one crate's root; sans-IO, texts read through a `Texts` trait"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `Writes`, `Source`, `Entry`: what this crate answers the demand machine with.
+blaze-names-demand.workspace = true
+# `MacroWrites` (what a definition can write), `expand`, the token record of an expansion.
+blaze-expand.workspace = true
+# One file's outline, and the outline of an expansion's token record.
+blaze-file-items.workspace = true
+# `AVec`, `Alloc`: every table in the allocator the caller names.
+blaze-own.workspace = true
+# `CrateItemKey`: the crate a text is read from; `ContentId` in the tests' sites.
+blaze-id.workspace = true
+# The one home of the module walk (the `mod x;` path rule), lowering (keys, cfg, attributes,
+# use trees) and a macro's definition: this source's keys equal the whole-crate names' by it.
+blaze-scope.workspace = true
+# `DeclsBuilder` and its kinds: what lowering hands back.
+blaze-surface.workspace = true
+# `Implicit` and `Sysroot`: a crate's extern prelude and its prelude's module.
+blaze-unit-graph.workspace = true
+# `Hasher`: a crate root's digest.
+blaze-ids.workspace = true
+
+[dev-dependencies]
+# The soundness property: generated definitions expanded for real, against their summaries.
+blaze-sim.workspace = true
+# `Frame`: each case's allocator.
+blaze-mem.workspace = true
+# `Tokens::open` over an expansion's token record.
+blaze-tokens.workspace = true
+# `bytes_of_slice`: the record copied to a 16-byte aligned column.
+blaze-format.workspace = true
+# `Edition2021` of the fixture's `Implicit` preludes.
+edition.workspace = true
+
+[lints]
+workspace = true

@@ -14,29 +14,29 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-own.workspace = true
 blaze-core.workspace = true
 # A proxy's `Proxy-Authorization: Basic` credentials.
-base64.workspace = true
+blaze-base64.workspace = true
 # The SHA-256 of a pinned certificate (h3's `serverCertificateHashes` check).
 blaze-sha256.workspace = true
-# quinn-proto's datagram buffers.
-bytes.workspace = true
-# Gzip bodies, decoded as they come; the pure-Rust backend, as blaze-engine's.
-flate2 = { workspace = true, features = ["rust_backend"] }
-# A request's method.
-http.workspace = true
-# An answer's head.
-httparse.workspace = true
+# quinn-proto's datagram buffers. Under `h3`.
+bytes = { workspace = true, optional = true }
+# Gzip bodies, decoded as they come.
+blaze-deflate.workspace = true
+# Requests written and answers read: blaze's own HTTP/1.1 core.
+blaze-h1.workspace = true
+# Addresses: blaze's checked URL and host-and-port, ASCII only, userinfo refused.
+blaze-url.workspace = true
 # TLS, sans-IO (`ClientConnection` driven by hand), on ring.
 rustls.workspace = true
-# QUIC under h3: quinn-proto's sans-IO endpoint and connections, on rustls with ring.
-quinn-proto.workspace = true
-# A proxy address's user and password, percent-decoded.
-percent-encoding.workspace = true
-# The machine's roots (`roots::native`), read once as a client is made; not the core's.
-rustls-native-certs.workspace = true
-# Addresses and where their redirects lead.
-url.workspace = true
+# QUIC under h3: quinn-proto's sans-IO endpoint and connections, on rustls with ring. Under `h3`.
+quinn-proto = { workspace = true, optional = true }
+
+[features]
+# HTTP/3 and WebTransport (`h3`): quinn-proto and `bytes`. Off for a program that only fetches
+# over HTTP/1.1 (blaze's binary), whose closure is then the TLS stack alone.
+h3 = ["dep:quinn-proto", "dep:bytes"]
 
 [dev-dependencies]
 # The certificates of the in-memory rustls server the TLS test speaks to and of the h3 pair.

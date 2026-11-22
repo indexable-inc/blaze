@@ -32,12 +32,16 @@ mod frontmatter;
 mod grammar;
 mod input;
 mod lexed_str;
+pub mod line_break;
 mod outline;
 mod output;
 mod parser;
 mod shortcuts;
+mod sink;
 mod syntax_kind;
 mod token_set;
+pub mod token_key;
+pub mod unescape;
 
 pub use T_ as T;
 
@@ -49,11 +53,12 @@ pub(crate) use token_set::TokenSet;
 pub use edition::{BlazeEdition, Edition, Extensions, UnknownBlazeEdition};
 
 pub use crate::{
-    input::{FRAGMENT, Input, JOINT, Tokens, word},
+    input::{FRAGMENT, Input, JOINT, Tokens, WordRefused, token_word, word, word_kind},
     lexed_str::LexedStr,
     outline::lazy_block_len,
     output::{OutlineStep, Output, Step},
-    shortcuts::{OutlineStrStep, StrStep},
+    shortcuts::{Joiner, Joins, OutlineStrStep, StrStep},
+    sink::{Done, Message, Sink},
     syntax_kind::SyntaxKind,
 };
 
@@ -111,7 +116,7 @@ impl TopEntryPoint {
 
     fn parse_with(&self, input: Tokens<'_>, outline: bool) -> Output {
         let _p =
-            tracing::info_span!(target: "blaze", "TopEntryPoint::parse", ?self, outline).entered();
+            blaze_trace::info_span!(target: "blaze", "TopEntryPoint::parse", ?self, outline).entered();
         let entry_point: fn(&'_ mut parser::Parser<'_>) = match self {
             TopEntryPoint::SourceFile => grammar::entry::top::source_file,
             TopEntryPoint::MacroStmts => grammar::entry::top::macro_stmts,
@@ -151,6 +156,25 @@ impl TopEntryPoint {
 
         res
     }
+}
+
+/// A source file's parse told to `sink` step by step ([`Sink`]), with no list of events and no
+/// [`Output`] made: what [`TopEntryPoint::SourceFile`] parses, by the same grammar. `outline`
+/// is whether each `fn` item's body is left a lazy node ([`Sink::lazy`], [`lazy_block_len`])
+/// when it can be one.
+pub fn source_file_into<'t, S: Sink>(input: impl Into<Tokens<'t>>, outline: bool, sink: S) -> S {
+    let mut p = parser::Parser::with_sink(input.into(), outline, sink);
+    grammar::entry::top::source_file(&mut p);
+    p.into_sink()
+}
+
+/// A `{ .. }` block's parse told to `sink`, every body in it parsed: what
+/// `Reparser::for_node(BLOCK_EXPR, None, None)` parses, by the same grammar. The tokens start
+/// with `{`, end with `}` and form a valid brace sequence.
+pub fn block_into<'t, S: Sink>(tokens: impl Into<Tokens<'t>>, sink: S) -> S {
+    let mut p = parser::Parser::with_sink(tokens.into(), false, sink);
+    grammar::block(&mut p);
+    p.into_sink()
 }
 
 /// Parse a prefix of the input as a given syntactic construct.

@@ -17,7 +17,6 @@
 #![blaze::sans_io]
 
 pub(crate) mod png;
-pub(crate) mod zlib;
 
 use alloc::vec::Vec;
 use core::{alloc::Allocator, fmt};
@@ -191,7 +190,7 @@ pub struct Limits {
     pub width: u32,
     pub height: u32,
     /// Every byte decode asks of the allocator, together: the inflated rows with their filter
-    /// bytes, plus one (see [`decode_bytes`]). The pixels are made in place in that buffer.
+    /// bytes (see [`decode_bytes`]). The pixels are made in place in that buffer.
     pub bytes: usize,
 }
 
@@ -201,14 +200,14 @@ impl Limits {
 }
 
 /// The bytes [`decode`] asks of its allocator for an image of this size and kind: every row
-/// with its filter byte, and one byte more (the inflater's proof that the stream ends where
-/// the header says).
+/// with its filter byte (the inflater writes into exactly these, and refuses a stream that
+/// says more).
 #[blaze::pure]
 #[blaze::noalloc]
 #[blaze::nonblocking]
 pub fn decode_bytes(width: u32, height: u32, color: Color, depth: Depth) -> u64 {
     let stride = u64::from(width) * u64::from(color.channels()) * u64::from(depth.bytes());
-    u64::from(height).saturating_mul(stride.saturating_add(1)).saturating_add(1)
+    u64::from(height).saturating_mul(stride.saturating_add(1))
 }
 
 /// A PNG's pixels, in `alloc`. Width, height and bytes are checked against `limits` before
@@ -272,8 +271,10 @@ pub enum ImageError {
     Unsupported { what: &'static str, value: u32 },
     /// The image passes the decode limit `limit`: it asks `asked`, the most is `most`.
     Limit { limit: &'static str, asked: u64, most: u64 },
-    /// The zlib stream in the IDAT chunks: `why`.
-    Inflate { why: &'static str },
+    /// The zlib stream in the IDAT chunks is refused (bad, truncated, or past the rows).
+    Inflate(blaze_deflate::Error),
+    /// The encoder's deflater stopped.
+    Deflate(blaze_deflate::DeflateError),
     /// The IDAT chunks inflate to `got` bytes; the header asks for `expected`.
     DataSize { expected: u64, got: u64 },
     /// Row `row` (from the top, from 0) has filter type `kind`; PNG defines 0 to 4.
@@ -305,7 +306,8 @@ impl fmt::Display for ImageError {
             ImageError::Limit { limit, asked, most } => {
                 write!(f, "png: the image's {limit} is {asked}, past the decode limit {most}")
             }
-            ImageError::Inflate { why } => write!(f, "png: IDAT: {why}"),
+            ImageError::Inflate(e) => write!(f, "png: IDAT: {e}"),
+            ImageError::Deflate(e) => write!(f, "png: encoding IDAT: {e}"),
             ImageError::DataSize { expected, got } => {
                 write!(f, "png: IDAT inflates to {got} bytes; IHDR asks for {expected}")
             }

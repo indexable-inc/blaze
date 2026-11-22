@@ -1,0 +1,7 @@
+id: explicit-hasher-order-set-new-in
+language: rust
+severity: hint
+message: "D125/D126: write the hasher; `OrderSet::new(OrderSetOpts { hasher: FixedState, alloc, capacity: None })`"
+rule:
+  pattern: IndexSet::new_in($A)
+fix: "OrderSet::new(OrderSetOpts { hasher: FixedState, alloc: $A, capacity: None })"

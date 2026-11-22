@@ -114,10 +114,7 @@ impl ResolveBehavior {
             "1" => Ok(ResolveBehavior::V1),
             "2" => Ok(ResolveBehavior::V2),
             "3" => Ok(ResolveBehavior::V3),
-            s => anyhow::bail!(
-                "`resolver` setting `{}` is not valid, valid options are \"1\", \"2\" or \"3\"",
-                s
-            ),
+            s => Err(crate::ResolveError::ResolverSetting { value: s.to_owned() }),
         }
     }
 
@@ -190,8 +187,8 @@ pub enum SemverCompatibility {
     Patch(u64),
 }
 
-impl From<&semver::Version> for SemverCompatibility {
-    fn from(ver: &semver::Version) -> Self {
+impl From<&crate::Version> for SemverCompatibility {
+    fn from(ver: &crate::Version) -> Self {
         if let Some(m) = NonZeroU64::new(ver.major) {
             return SemverCompatibility::Major(m);
         }

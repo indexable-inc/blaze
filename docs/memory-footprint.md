@@ -5,7 +5,7 @@ date: 2026-11-09
 ---
 # Memory: what the stage5 self-build showed, and the fixes
 
-This plan applies [memory-budget.md](memory-budget.md) and [memory-pool.md](memory-pool.md) to
+This plan applies memory-budget.md and memory-pool.md (both deleted on 2026-11-15) to
 one measured build. It adds what that build showed and orders the next steps. Where it overlaps
 those plans, they stay the design, and this note says which of their sections the step builds.
 
@@ -117,7 +117,7 @@ frame limit is not done yet.
 Footprint is the one number admission, the front end's release and the ceiling read (rule
 `one-memory-measure`). Test the ceiling on the release binary with `BLAZE_DAEMON_MEMORY_GB=4`.
 
-Built on `kept-memory-1109` (design: [v2/plan/admission-by-footprint.md](v2/plan/admission-by-footprint.md)):
+Built on `kept-memory-1109` (design: admission-by-footprint.md, deleted on 2026-11-15):
 
 - The plane charges the larger of its grants and the footprint plus the grants not yet realized,
   asks a purge before it holds work back or starts a task alone, and fails alone a task that
@@ -215,7 +215,7 @@ allocates and frees 95 MiB of the global heap (`CompiledFunction::clone` 27, the
 17% of an edit; with that gone, `no_thp` is 1.0 GiB for nothing.
 
 What came next (the pool's give-back wired, mimalloc on base pages, the order for the rest):
-[v2/plan/design/restore.md](v2/plan/design/restore.md), "Memory: a bounded cache over records".
+restore.md (deleted on 2026-11-15), "Memory: a bounded cache over records".
 
 ### 4. Outputs as records in the store's buffer pool
 

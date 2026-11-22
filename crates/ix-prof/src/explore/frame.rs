@@ -14,22 +14,16 @@
 //! dictionaries once, then a batch and its dictionaries' new values a frame, and an
 //! end-of-stream marker then a new schema where the stream starts again.
 
-use arrow_array::RecordBatch;
-use arrow_ipc::{
-    CompressionType, MetadataVersion,
-    writer::{IpcWriteOptions, StreamWriter},
-};
-use arrow_schema::{ArrowError, Schema};
+use std::alloc::Global;
+
+use blaze_arrow_ipc::IpcError;
+use blaze_columns::{Batch, Field};
 use serde::Serialize;
 
 use super::{Answer, Kind, OpError, session};
 
 /// Where the Arrow IPC stream starts: a multiple of this from the start of the answer or frame.
 pub const ALIGN: usize = 8;
-
-/// The zstd level of the IPC buffers: the fastest, since the bytes cross loopback, not a
-/// network (docs/v2/plan/design/explore.md, "Speed of light").
-pub const ZSTD_LEVEL: i32 = 1;
 
 /// Appends the head of an answer to `out`: the header's length and its JSON, padded so that
 /// what is appended next starts [`ALIGN`]-aligned from where the head began. A header is what
@@ -60,28 +54,20 @@ pub fn live_head<H: Serialize + ?Sized>(
     Ok(())
 }
 
-/// The IPC options of every answer: 8-aligned buffers, metadata V5, zstd.
-pub fn options() -> Result<IpcWriteOptions, ArrowError> {
-    IpcWriteOptions::try_new(ALIGN, false, MetadataVersion::V5)?
-        .try_with_compression(Some(CompressionType::ZSTD))?
-        .try_with_compression_level(Some(ZSTD_LEVEL))
-}
-
-/// Appends `batches`, all of `schema`, to `out` as one Arrow IPC stream. `out` must be
-/// [`ALIGN`]-aligned where the stream starts for the page to view it in place; [`head`] leaves
-/// it so.
-pub fn ipc(out: &mut Vec<u8>, schema: &Schema, batches: &[RecordBatch]) -> Result<(), ArrowError> {
-    let mut writer = StreamWriter::try_new_with_options(&mut *out, schema, options()?)?;
-    for batch in batches {
-        writer.write(batch)?;
-    }
-    writer.finish()
+/// Appends `batches`, all of `fields`, to `out` as one Arrow IPC stream (uncompressed, its
+/// buffers 8-aligned). `out` must be [`ALIGN`]-aligned where the stream starts for the page to
+/// view it in place; [`head`] leaves it so.
+pub fn ipc(out: &mut Vec<u8>, fields: &[Field<Global>], batches: &[Batch<Global>]) -> Result<(), IpcError> {
+    let stream = blaze_arrow_ipc::stream(fields, &[], batches, Global)?;
+    // alloc: the answer's bytes, into the buffer the driver writes
+    out.extend_from_slice(&stream);
+    Ok(())
 }
 
 /// An answer as the wire carries it: its header, `rows` and `elapsed_ns` added
 /// ([`session::answer_header`]), then its table's IPC; or the error it became. The session core
-/// decides the header; the IPC is written here, outside the core, since arrow's IPC writer keys
-/// its dictionaries in a `HashMap` of `RandomState`, OS randomness a sans-IO core does not reach.
+/// decides the header; the IPC is written here, outside the core, by the driver that holds the
+/// answer's bytes.
 pub fn answer_bytes(answer: Result<Answer, OpError>, elapsed_ns: u64) -> Vec<u8> {
     // alloc: once an answer, the bytes the driver writes
     let mut out = Vec::new();
@@ -89,7 +75,7 @@ pub fn answer_bytes(answer: Result<Answer, OpError>, elapsed_ns: u64) -> Vec<u8>
         session::answer_header(&mut answer, elapsed_ns);
         head(&mut out, &answer.header).expect("a JSON map always serializes");
         if let Some(table) = &answer.table {
-            ipc(&mut out, &table.schema, &table.batches).map_err(|why| {
+            ipc(&mut out, &table.fields, &table.batches).map_err(|why| {
                 OpError::new(Kind::Encode, format!("the answer as Arrow IPC: {why}"))
             })?;
         }
@@ -104,11 +90,7 @@ pub fn answer_bytes(answer: Result<Answer, OpError>, elapsed_ns: u64) -> Vec<u8>
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use arrow_array::{Int64Array, StringArray};
-    use arrow_ipc::reader::StreamReader;
-    use arrow_schema::{DataType, Field};
+    use blaze_columns::{Column, Scalar, Type};
     use serde_json::{Map, Value};
 
     use super::*;
@@ -161,26 +143,31 @@ mod tests {
 
     #[test]
     fn an_answer_reads_back_as_one_ipc_stream_at_an_aligned_offset() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("n", DataType::Int64, false),
-            Field::new("s", DataType::Utf8, true),
-        ]));
-        let batches: Vec<RecordBatch> = (0..3i64)
-            .map(|i| {
-                let n: Int64Array = (0..100i64).map(|it| it * i).collect();
-                let s: StringArray =
+        let fields = [
+            Field::new("n", Type::One(Scalar::I64), false),
+            Field::new("s", Type::One(Scalar::Text), true),
+        ];
+        let batches = blaze_own::Vec::from_iter_in(
+            (0..3i64).map(|i| {
+                let n = Column::values((0..100i64).map(|it| it * i), Global);
+                let s: Vec<Option<String>> =
                     (0..100i64).map(|it| (it % 3 == 0).then(|| format!("row {it}"))).collect();
-                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(n), Arc::new(s)]).unwrap()
-            })
-            .collect();
+                let s = Column::opt_texts(&s, Global);
+                Batch::try_new(
+                    blaze_own::Vec::from_slice_in(&fields, Global),
+                    blaze_own::Vec::from_array_in([n, s], Global),
+                )
+                .unwrap()
+            }),
+            Global,
+        );
         let mut out = Vec::new();
         head(&mut out, &header("select n, s from t")).unwrap();
         let at = out.len();
         assert_eq!(at % ALIGN, 0);
-        ipc(&mut out, &schema, &batches).unwrap();
+        ipc(&mut out, &fields, &batches).unwrap();
         assert_eq!(out.len() % ALIGN, 0, "an 8-aligned IPC stream is a multiple of 8 long");
-        let back: Vec<RecordBatch> =
-            StreamReader::try_new(&out[at..], None).unwrap().collect::<Result<_, _>>().unwrap();
-        assert_eq!(back, batches);
+        let back = blaze_arrow_ipc::read_stream(&out[at..], Global).unwrap();
+        assert_eq!(back.batches, batches);
     }
 }

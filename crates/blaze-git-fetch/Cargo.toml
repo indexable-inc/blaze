@@ -1,0 +1,30 @@
+[package]
+name = "blaze-git-fetch"
+description = "One commit of a git repository over smart HTTP protocol v2 (its requests and answers as bytes), its packfile indexed in place and read one object at a time with offset and reference deltas under bounds and a byte-bounded base cache, object ids by SHA-1 (git's names, never trust), and the commit's files handed out with every name checked"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The index's rows and buffers, the request bodies and the walk's stack, in the caller's
+# allocator.
+blaze-own.workspace = true
+# Each pack entry is a zlib stream.
+blaze-deflate.workspace = true
+
+[dev-dependencies]
+# Property tests and planted-bug controls.
+blaze-sim.workspace = true
+# The test heap (`blaze_own::testing::heap`), never `Global` (D102).
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

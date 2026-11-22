@@ -3,6 +3,9 @@
 //! [`crate::control`](fn@crate::control), which are built on those layers. They sit here, above
 //! every module, so that no module imports from one built on it.
 
+mod board;
+mod limits;
+mod observe;
 mod search;
 mod tape;
 mod text;

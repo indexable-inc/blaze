@@ -17,6 +17,8 @@
 //! Nothing here touches memory or knows a process: the driver resolves the places
 //! (`blaze-launch-rt`), this module computes bytes.
 
+// The output buffers are `alloc`'s vector, the drivers' type (blaze-launch-rt records.rs fills
+// a `std` one) until the vector seam (D170); the pool's own table is blaze-own's.
 use alloc::vec::Vec;
 use core::alloc::Allocator;
 use core::fmt;
@@ -70,7 +72,7 @@ struct Entry {
 
 /// The pool of a record, and so the body's placed length. A function of the record alone.
 pub struct Pool<A: Allocator> {
-    entries: Vec<Entry, A>,
+    entries: blaze_own::Vec<Entry, A>,
     /// The body's length, placed: its code, then the pool.
     pub len: u64,
 }
@@ -89,9 +91,9 @@ pub fn pool<A: Allocator + Clone>(record: &Record<'_>, alloc: A) -> Result<Pool<
     }
     // Which places are functions, read once: a list in a record is read item by item.
     // clone: the allocator's handle, for a second list of the same lifetime
-    let mut functions = Vec::with_capacity_in(record.places.len(), alloc.clone());
+    let mut functions = blaze_own::Vec::with_capacity_in(record.places.len(), alloc.clone());
     functions.extend(record.places.iter().map(|it| it == Place::Function));
-    let mut pool = Pool { entries: Vec::new_in(alloc), len: record.size.next_multiple_of(8) };
+    let mut pool = Pool { entries: blaze_own::Vec::new_in(alloc), len: record.size.next_multiple_of(8) };
     for fixup in record.fixups.iter() {
         let through = fixup.kind.through();
         let function = match fixup.to {

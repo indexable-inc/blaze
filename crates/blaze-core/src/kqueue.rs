@@ -14,8 +14,10 @@
 //! Memory (docs/v2/plan/design/memory.md): processes, listens, connects, connections and
 //! watches sit in [`Slab`]s tagged [`MemTag::Io`], named by their handles (a [`Conn`] is one's
 //! bits), with maps from the caller's [`Tag`] to the handle reserved at setup. A file effect
-//! goes to the threads through a bounded channel and comes back through another, each holding
-//! [`FILES`], the most at the threads at once (more wait in a backlog the driver keeps), so
+//! goes to its lane's threads (crate::threads::lanes: a fast lane, and a device lane for what
+//! waits on the drive; each effect at its asker's QoS class) through a bounded channel of the lane's and comes
+//! back through another, each holding [`FILES`] a lane, the most at its threads at once (more
+//! wait in a backlog the driver keeps a lane, up to [`BACKLOG`]), so
 //! neither ever waits and a round trip allocates nothing. Watches tell through a channel of
 //! their own, and a stopped watch is kept with its buffers for the next. A warm submit and
 //! poll allocate only what a completion carries.
@@ -35,18 +37,30 @@ use std::{
     time::{Duration, Instant},
 };
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_mem::{MemError, Slab, Tag as MemTag};
-use crossbeam_channel::{Receiver, SendTimeoutError, Sender};
+use blaze_sys::{
+    Errno, Fd,
+    posix::{
+        io::{self as sys_io, Filter, KeventFlags, NoteFlags},
+        net as sys_net,
+    },
+};
+use crate::chan::{Receiver, SendTimeoutError, Sender};
 use std::alloc::Global;
 
 use crate::{
-    Address, Command, Completion, Confine, Conn, Cursor, Done, Driver, Effect, FileName, IoError,
+    Address, Command, Completion, Confine, Conn, Cursor, DirName, Done, Driver, Effect, IoError,
     Tag,
     descriptors::Descriptors,
     fsevents::{self, Tell},
     handoff::Wake,
     net, process,
+    threads::{
+        lanes::{self, Dispatch, LANES, Lane, Limits, Placed, Split, Ticket},
+        opening::{self, OpenCount, Opening},
+        qos::{self, Lowered, Qos},
+    },
     wait::{self, Clock as _, Deadline, Monotonic, Waited},
     wheel::{self, Wheel},
 };
@@ -60,6 +74,10 @@ const EVENTS: usize = 64;
 /// channel between the driver and the threads holds this many, so neither a submit nor a file
 /// thread ever waits on one; more wait in the driver's backlog.
 const FILES: usize = 1024;
+/// File effects a lane holds in its backlog past its [`FILES`] at the threads: past it an effect
+/// is refused with [`lanes::Full`], naming the lane. A bound, not a budget: the store asks a few
+/// thousand at once at most; the backlog's memory is taken only as it fills.
+const BACKLOG: usize = 1 << 20;
 /// Completions of watches not yet taken: a watch that hears more waits for room (its queue
 /// holds fseventsd back, which drops what it cannot hold and says so).
 const WATCHED: usize = 4096;
@@ -100,14 +118,34 @@ struct Kevent {
 }
 
 const _: () = assert!(
-    size_of::<Kevent>() == size_of::<libc::kevent>()
-        && align_of::<Kevent>() == align_of::<libc::kevent>()
+    size_of::<Kevent>() == size_of::<sys_io::Kevent>()
+        && align_of::<Kevent>() == align_of::<sys_io::Kevent>()
 );
+
+/// A file effect on its way to its lane's threads: its ticket, and when it was asked on the
+/// driver's clock.
+struct Queued {
+    effect: Effect,
+    ticket: Ticket,
+    asked: Duration,
+    /// The class of the thread that asked for it, at the ask: the taking thread runs it at most
+    /// there (`work_on`), so an effect asked after the answer (in a [`Lowered`] stretch) runs
+    /// lowered and one asked before it at the command's class, whichever lane it waits in.
+    asker: Qos,
+}
+
+/// A file effect's completion handed back: its ticket, and how long it waited in its lane's
+/// queue before a thread took it.
+struct Finished {
+    completion: Completion,
+    ticket: Ticket,
+    waited_ns: u64,
+}
 
 /// The kqueue and the channels, shared with the file threads and the watches' queues.
 struct Notify {
     kq: OwnedFd,
-    files: Sender<Completion>,
+    files: Sender<Finished>,
     watched: Sender<Completion>,
     /// Whether a hand-back since the driver last drained the channels has fired the trigger:
     /// a batch of them costs one `kevent`, not one each.
@@ -122,6 +160,9 @@ struct Notify {
     /// Triggers fired.
     #[cfg(test)]
     triggers: std::sync::atomic::AtomicU64,
+    /// The class the last file effect ran at, on its thread (`Qos::raw`).
+    #[cfg(test)]
+    ran_at: std::sync::atomic::AtomicU32,
 }
 
 impl Notify {
@@ -159,7 +200,7 @@ impl Notify {
         if self.woke.wake() {
             #[cfg(test)]
             self.triggers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            _ = self.change(TRIGGER as usize, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER, 0, TRIGGER);
+            _ = self.change(TRIGGER as usize, Filter::USER.0, 0, NoteFlags::TRIGGER.bits(), 0, TRIGGER);
         }
     }
 }
@@ -231,12 +272,12 @@ enum Owner {
 /// What each registration's `udata` names. Ids are handles' bits: one of a registration that
 /// has ended names nothing, even once its slot holds another's.
 struct Owners {
-    slab: Slab<Owner>,
+    slab: LazySlab<Owner>,
 }
 
 impl Owners {
     fn new() -> Result<Owners, MemError> {
-        Ok(Owners { slab: Slab::new(MOST, MemTag::Io)? })
+        Ok(Owners { slab: LazySlab::new() })
     }
 
     fn own(&mut self, owner: Owner) -> u64 {
@@ -272,7 +313,7 @@ impl Ids {
 
 struct Spawned {
     tag: Tag,
-    pid: libc::pid_t,
+    pid: blaze_sys::posix::types::pid_t,
     /// Open until its input is all written.
     stdin: Option<OwnedFd>,
     written: usize,
@@ -323,22 +364,119 @@ fn no_slab(error: MemError) -> io::Error {
     io::Error::other(error)
 }
 
-pub struct Kqueue {
+/// A [`Slab`] whose region is reserved at its first insert, not with the driver: a program that
+/// never spawns, listens, connects or watches reserves nothing for them (std.md, "What a program
+/// pays for at start": macOS charges a reservation by its size, and these were seven of a
+/// start's map calls). Reads of one never inserted into find nothing.
+struct LazySlab<T> {
+    slab: Option<Slab<T>>,
+}
+
+impl<T> LazySlab<T> {
+    const fn new() -> LazySlab<T> {
+        LazySlab { slab: None }
+    }
+
+    /// The slab, reserved now if it was not.
+    fn made(&mut self) -> Result<&mut Slab<T>, MemError> {
+        if self.slab.is_none() {
+            self.slab = Some(Slab::new(MOST, MemTag::Io)?);
+        }
+        Ok(self.slab.as_mut().expect("made just above"))
+    }
+
+    fn try_insert(&mut self, value: T) -> Result<blaze_mem::Handle<T>, MemError> {
+        self.made()?.try_insert(value)
+    }
+
+    /// As [`Slab::insert`]: a refusal of its region or its room panics, naming the tag.
+    #[track_caller]
+    fn insert(&mut self, value: T) -> blaze_mem::Handle<T> {
+        match self.made() {
+            Ok(slab) => slab.insert(value),
+            Err(error) => panic!("the kqueue driver's slab of {}: {error}", core::any::type_name::<T>()),
+        }
+    }
+
+    fn get(&self, handle: blaze_mem::Handle<T>) -> Option<&T> {
+        self.slab.as_ref()?.get(handle)
+    }
+
+    fn get_mut(&mut self, handle: blaze_mem::Handle<T>) -> Option<&mut T> {
+        self.slab.as_mut()?.get_mut(handle)
+    }
+
+    fn remove(&mut self, handle: blaze_mem::Handle<T>) -> Option<T> {
+        self.slab.as_mut()?.remove(handle)
+    }
+
+    fn len(&self) -> usize {
+        self.slab.as_ref().map_or(0, Slab::len)
+    }
+
+    #[cfg(test)]
+    fn contains(&self, handle: blaze_mem::Handle<T>) -> bool {
+        self.slab.as_ref().is_some_and(|slab| slab.contains(handle))
+    }
+
+    /// Whether its region was reserved: a test's view.
+    #[cfg(test)]
+    fn reserved(&self) -> bool {
+        self.slab.is_some()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (blaze_mem::Handle<T>, &T)> {
+        self.slab.iter().flat_map(Slab::iter)
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = (blaze_mem::Handle<T>, &mut T)> {
+        self.slab.iter_mut().flat_map(Slab::iter_mut)
+    }
+}
+
+/// `tags`, made at [`TAGS`] at its first use and grown past that only as a table grows.
+fn first_use<V>(tags: &mut Map<Tag, V, FixedState, Global>) -> &mut Map<Tag, V, FixedState, Global> {
+    if tags.capacity() == 0 {
+        // alloc: once per driver and table, at its first tag.
+        tags.reserve(TAGS);
+    }
+    tags
+}
+
+/// The macOS driver. `S` is which lane of file threads each file effect waits in
+/// (crate::threads::lanes), `O` how those threads open the file of an effect a kept descriptor
+/// serves (crate::threads::opening): the defaults are the shipped choice, the other the
+/// tested control.
+pub struct Kqueue<S: Split = lanes::TwoLanes, O: Opening = opening::Kept> {
     start: Instant,
+    /// The machine's boot, read once as the driver is made ([`crate::Driver::boot`]).
+    boot: Result<crate::Boot, crate::NoBoot>,
     root: Arc<Path>,
     notify: Arc<Notify>,
-    files: Receiver<Completion>,
+    files: Receiver<Finished>,
     watched: Receiver<Completion>,
     /// What the host told ([`HostSink`]).
     hosted: Receiver<Completion>,
     /// The datagrams, the standard streams, the clock and randomness ([`crate::host`]).
     host: crate::host::Host,
-    work: Option<Sender<Effect>>,
-    /// File effects asked for beyond the [`FILES`] at the threads, in the order asked.
-    backlog: VecDeque<Effect>,
-    /// File effects at the threads whose completions are not taken yet.
-    at_threads: usize,
+    /// Each lane's queue to its threads, by [`Lane::index`].
+    work: Option<[Sender<Queued>; LANES]>,
+    /// File effects of each lane asked for beyond the [`FILES`] at its threads, in the order
+    /// asked.
+    backlog: [VecDeque<Queued>; LANES],
+    /// Which lane each file effect waits in; each lane's threads, room and backlog counted;
+    /// the waits (crate::threads::lanes).
+    dispatch: Dispatch<S>,
+    /// The file threads started so far, of both lanes: one more in a lane each time a file
+    /// effect finds every one of its lane busy, up to the lane's cap (the `threads` it was made
+    /// with).
     workers: Vec<JoinHandle<()>>,
+    /// Each lane's threads' end of its queue, cloned into each as it starts.
+    queues: [Receiver<Queued>; LANES],
     // dyn: the platform's sandbox, given once at setup and asked once per spawn.
     confine: Option<Arc<dyn Confine>>,
     /// Where each sandboxed spawn's own directory is made: `root/.blaze-spawn` unless
@@ -352,20 +490,21 @@ pub struct Kqueue {
     /// Completions made on the polling thread, in the order they happened.
     ready: Vec<Completion>,
     owners: Owners,
-    /// By ticks since `start`; the wait ends at the next one due.
-    timers: Wheel<Tag>,
-    watches: Slab<fsevents::Watch<Watched>>,
-    watch_tags: HashMap<Tag, WatchId, Global>,
+    /// By ticks since `start`; the wait ends at the next one due. Made with the first timer
+    /// (`LazySlab`'s reason).
+    timers: Option<Wheel<Tag>>,
+    watches: LazySlab<fsevents::Watch<Watched>>,
+    watch_tags: Map<Tag, WatchId, FixedState, Global>,
     /// Stopped, for the next watch.
     spare: Vec<fsevents::Watch<Watched>>,
     /// The flushes a stopping watch had not told.
     untold: Vec<Tag>,
-    spawns: Slab<Spawned>,
-    spawn_tags: HashMap<Tag, SpawnId, Global>,
-    listens: Slab<Listening>,
-    listen_tags: HashMap<Tag, ListenId, Global>,
-    connecting: Slab<Connecting>,
-    conns: Slab<Connection>,
+    spawns: LazySlab<Spawned>,
+    spawn_tags: Map<Tag, SpawnId, FixedState, Global>,
+    listens: LazySlab<Listening>,
+    listen_tags: Map<Tag, ListenId, FixedState, Global>,
+    connecting: LazySlab<Connecting>,
+    conns: LazySlab<Connection>,
     /// The file locks of [`Effect::Lock`], each taken as it is asked for.
     locks: crate::locks::Locks,
     /// The [`Effect::Pressure`] in flight and its registration's id: one a kqueue, since the
@@ -380,31 +519,69 @@ pub struct Kqueue {
     /// What the watches' callbacks allocated beyond their payloads, as each watch stopped.
     #[cfg(test)]
     watch_overhead: u64,
-    /// The descriptors the file threads keep for reads into memory: a file opened once.
+    /// The descriptors the file threads keep for reads into memory, and under
+    /// [`opening::Kept`] for maps, write-backs and queued reads: a file opened once.
     descriptors: Arc<Descriptors>,
+    /// The opens by name of the effects a kept descriptor could have served.
+    opened_by_name: Arc<OpenCount>,
+    _opening: core::marker::PhantomData<O>,
+    /// The class and relative priority of the thread that made the driver: every file thread's
+    /// own, set at its start whatever thread started it (one started inside a [`Lowered`]
+    /// stretch would otherwise keep that class for the driver's life); each effect then runs at
+    /// most at its asker's ([`Queued::asker`]).
+    class: (Qos, i32),
+    /// The file locks this driver holds now ([`Effect::Lock`] answered `Locked`, not yet
+    /// unlocked). While any is held, a file effect runs at the driver's class whatever its
+    /// asker's: `flock` lends no priority to its holder, so a holder lowered after its answer
+    /// (the store's flip, whose writes and barriers are asked one at a time under the lock)
+    /// would keep another process's commit, at its command's class, waiting on throttled IO.
+    /// Never above the driver's class.
+    locks_held: usize,
 }
 
 impl Kqueue {
-    /// How many files the threads opened for reads into memory, and closed.
+    /// A driver whose files are under `root`, with `threads` threads a lane for the file calls.
+    pub fn new(root: impl Into<PathBuf>, threads: usize) -> io::Result<Kqueue> {
+        Self::made(root, threads)
+    }
+}
+
+impl<S: Split, O: Opening> Kqueue<S, O> {
+    /// How many files the threads opened through the kept descriptors, and closed.
     pub fn opens(&self) -> crate::Opens {
         self.descriptors.opens()
     }
 
-    /// A driver whose files are under `root`, with `threads` threads for the file calls.
-    pub fn new(root: impl Into<PathBuf>, threads: usize) -> io::Result<Kqueue> {
+    /// How many files the threads opened by name for an effect a kept descriptor could serve
+    /// (crate::threads::opening): zero under [`opening::Kept`].
+    pub fn opens_by_name(&self) -> u64 {
+        self.opened_by_name.by_name()
+    }
+
+    /// Each lane's waits in its queue, and the longest wait of a fast effect behind a device one
+    /// (crate::threads::lanes).
+    pub fn lanes(&self) -> lanes::Waits {
+        self.dispatch.waits()
+    }
+
+    /// [`Kqueue::new`] of the lanes `S` and the opening `O`: for a choice not the default (the
+    /// tests' controls).
+    pub fn made(root: impl Into<PathBuf>, threads: usize) -> io::Result<Kqueue<S, O>> {
         let root: Arc<Path> = root.into().into();
-        // SAFETY: no pointers; a descriptor of its own or -1.
-        let kq = unsafe { libc::kqueue() };
-        if kq < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: the call returned a descriptor of its own.
-        let kq = unsafe { OwnedFd::from_raw_fd(kq) };
+        let kq = sys_io::kqueue()
+            .map_err(|errno| io::Error::from_raw_os_error(i32::from(errno.raw())))?;
+        // SAFETY: into_raw transfers sole ownership of the new kqueue descriptor.
+        let kq = unsafe { OwnedFd::from_raw_fd(kq.into_raw()) };
         net::set_cloexec(kq.as_raw_fd())?;
+        // Each lane's room at its threads; one lane's driver makes the device lane's channel of
+        // one slot, which nothing is ever sent through.
+        let room = [FILES, if S::TWO { FILES } else { 1 }];
         // alloc: setup, once per driver: each channel's slots.
-        let (files_done, files) = crossbeam_channel::bounded(FILES);
-        let (watched_done, watched) = crossbeam_channel::bounded(WATCHED); // alloc: as above.
-        let (work, queue) = crossbeam_channel::bounded::<Effect>(FILES); // alloc: as above.
+        let (files_done, files) = crate::chan::bounded(room[0] + room[1]);
+        let (watched_done, watched) = crate::chan::bounded(WATCHED); // alloc: as above.
+        let (fast_work, fast_queue) = crate::chan::bounded::<Queued>(room[0]); // alloc: as above.
+        let (device_work, device_queue) = crate::chan::bounded::<Queued>(room[1]); // alloc: as above.
+        let limits = |at_threads| Limits { threads: threads.max(1), at_threads, backlog: BACKLOG };
         let notify = Arc::new(Notify {
             kq,
             files: files_done,
@@ -415,70 +592,70 @@ impl Kqueue {
             file_allocations: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             triggers: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            ran_at: std::sync::atomic::AtomicU32::new(0),
         });
         notify.change(
             TRIGGER as usize,
-            libc::EVFILT_USER,
-            libc::EV_ADD | libc::EV_CLEAR,
+            Filter::USER.0,
+            (KeventFlags::ADD | KeventFlags::CLEAR).bits(),
             0,
             0,
             TRIGGER,
         )?;
         // alloc: setup, once per driver: the host's channel, which grows with what it tells
         // between two polls.
-        let (host_done, hosted) = crossbeam_channel::unbounded();
+        let (host_done, hosted) = crate::chan::unbounded();
         // clone: setup, a count of the kqueue for the host's wakes.
         let sink = HostSink { done: host_done, notify: Arc::clone(&notify) };
         let host = crate::host::Host::new(Arc::new(sink)); // alloc: setup, once per driver.
         // alloc: setup, once per driver: the table the file threads share.
         let descriptors = Arc::new(Descriptors::new());
-        let workers = (0..threads.max(1))
-            .map(|n| {
-                // clone: setup, one count of each per worker thread.
-                let (root, queue, notify) = (Arc::clone(&root), queue.clone(), Arc::clone(&notify));
-                let kept = Arc::clone(&descriptors); // clone: as above.
-                std::thread::Builder::new()
-                    // alloc: setup, once per thread.
-                    .name(format!("blaze-kqueue-{n}"))
-                    .spawn(move || work_on(&root, &kept, &queue, &notify))
-            })
-            // alloc: setup, once per driver.
-            .collect::<io::Result<Vec<_>>>()?;
-        fn tags<V>() -> HashMap<Tag, V, Global> {
-            HashMap::with_capacity_in(TAGS, Global)
+        // No file thread yet: each is started when a file effect finds every one of its lane
+        // busy ([`Kqueue::to_threads`]), up to `threads` a lane.
+        // alloc: setup, once per driver: the handles, at their most.
+        let workers = Vec::with_capacity(threads.max(1) * if S::TWO { 2 } else { 1 });
+        // Each table of tags, the backlog, the spares and the output buffer are empty until
+        // their first use, then made at their usual most at once (`LazySlab`'s reason: a
+        // program that never watches, spawns or listens dirties none of their pages; measured
+        // 2026-11-16, hello's footprint at exit).
+        fn tags<V>() -> Map<Tag, V, FixedState, Global> {
+            Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None })
         }
         let spawn_dirs = root.join(".blaze-spawn"); // alloc: setup, once per driver.
         Ok(Kqueue {
             start: Instant::now(),
+            boot: crate::boot::system(),
             root,
             notify,
             files,
             watched,
             hosted,
             host,
-            work: Some(work),
-            backlog: VecDeque::with_capacity(FILES), // alloc: setup, once per driver.
-            at_threads: 0,
+            work: Some([fast_work, device_work]),
+            backlog: [VecDeque::new(), VecDeque::new()],
+            dispatch: Dispatch::new([limits(room[0]), limits(room[1])]),
             workers,
+            queues: [fast_queue, device_queue],
             confine: None,
             spawn_dirs,
-            buffer: vec![0; 64 << 10], // alloc: setup, once per driver.
+            buffer: Vec::new(),
             // alloc: setup, once per driver: the lists of a wait at their usual most.
             changes: Vec::with_capacity(EVENTS),
             events: Vec::with_capacity(2 * EVENTS), // alloc: as above.
             ready: Vec::with_capacity(EVENTS),      // alloc: as above.
             owners: Owners::new().map_err(no_slab)?,
-            timers: Wheel::try_new(wheel::MAX_TIMERS).map_err(no_slab)?,
-            watches: Slab::new(MOST, MemTag::Io).map_err(no_slab)?,
+            timers: None,
+            watches: LazySlab::new(),
             watch_tags: tags(),
-            spare: Vec::with_capacity(SPARE_WATCHES), // alloc: setup, once per driver.
+            spare: Vec::new(),
             untold: Vec::with_capacity(16),           // alloc: setup, once per driver.
-            spawns: Slab::new(MOST, MemTag::Io).map_err(no_slab)?,
+            spawns: LazySlab::new(),
             spawn_tags: tags(),
-            listens: Slab::new(MOST, MemTag::Io).map_err(no_slab)?,
+            listens: LazySlab::new(),
             listen_tags: tags(),
-            connecting: Slab::new(MOST, MemTag::Io).map_err(no_slab)?,
-            conns: Slab::new(MOST, MemTag::Io).map_err(no_slab)?,
+            connecting: LazySlab::new(),
+            conns: LazySlab::new(),
             locks: crate::locks::Locks::new(),
             pressure: None,
             in_flight: 0,
@@ -486,18 +663,23 @@ impl Kqueue {
             #[cfg(test)]
             watch_overhead: 0,
             descriptors,
+            // alloc: setup, once per driver: the count the file threads share.
+            opened_by_name: Arc::new(OpenCount::default()),
+            _opening: core::marker::PhantomData,
+            class: qos::this_thread()?,
+            locks_held: 0,
         })
     }
 
     /// The driver, starting each process whose sandbox is on as `confine` makes it.
     // dyn: the platform's sandbox, given once at setup
-    pub fn confined(mut self, confine: Arc<dyn Confine>) -> Kqueue {
+    pub fn confined(mut self, confine: Arc<dyn Confine>) -> Self {
         self.confine = Some(confine);
         self
     }
 
     /// The driver, making each sandboxed spawn's own directory under `dir`, made here.
-    pub fn scratch(mut self, dir: impl Into<PathBuf>) -> io::Result<Kqueue> {
+    pub fn scratch(mut self, dir: impl Into<PathBuf>) -> io::Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
         self.spawn_dirs = dir;
@@ -569,32 +751,39 @@ impl Kqueue {
             | Effect::Remove { .. }
             | Effect::MakeDir { .. }
             | Effect::RemoveDir { .. }
+            | Effect::Ancestors { .. }
+            | Effect::Above { .. }
             | Effect::Stamp { .. }
             | Effect::Entries { .. }
-            | Effect::Map { .. }) => {
-                match self.at_threads < FILES && self.backlog.is_empty() {
-                    true => self.to_threads(effect),
-                    false => self.backlog.push_back(effect),
-                }
-                Ok(())
-            }
+            | Effect::Map { .. }
+            | Effect::MapWrite { .. }) => self.to_lane(effect),
             // A lock never waits, so it is taken here rather than on the threads.
             Effect::Lock { file, mode, tag } => {
                 let done = self.locks.lock(&self.root, &file, mode, tag)?;
+                if done == Done::Locked {
+                    self.locks_held += 1;
+                }
                 self.ready.push(Completion { tag, done });
                 Ok(())
             }
             Effect::Unlock { lock, tag } => {
                 let done = self.locks.unlock(lock)?;
+                if done == Done::Unlocked {
+                    // Only a held lock unlocks, and each was counted at its `Locked`.
+                    self.locks_held -= 1;
+                }
                 self.ready.push(Completion { tag, done });
                 Ok(())
             }
             Effect::Timer { after, tag } => {
                 let due = wheel::ticks(self.start.elapsed()).saturating_add(wheel::ticks(after));
-                self.timers.insert(due, tag);
+                if self.timers.is_none() {
+                    self.timers = Some(Wheel::try_new(wheel::MAX_TIMERS).map_err(no_slab)?);
+                }
+                self.timers.as_mut().expect("made just above").insert(due, tag);
                 Ok(())
             }
-            Effect::Watch { dir, tag } => self.watch(dir, None, tag),
+            Effect::Watch { dir, tag } => self.watch(DirName::Named(dir), None, tag),
             Effect::Journal { dir, since, tag } => self.watch(dir, Some(since), tag),
             // Told through the watches' channel by the stream, after the changes it heard first.
             Effect::Flush { watch, tag } => {
@@ -608,8 +797,8 @@ impl Kqueue {
                 }
             }
             Effect::Spawn { command, tag } => self.spawn(command, tag),
-            Effect::Listen { at, tag } => self.listen(&at, tag),
-            Effect::Connect { at, tag } => self.connect(at, tag),
+            Effect::Listen { at, options, tag } => self.listen(&at, &options, tag),
+            Effect::Connect { at, options, tag } => self.connect(at, &options, tag),
             Effect::Recv { conn, most, into, tag } => {
                 match self.connection(conn) {
                     Ok(connection) => connection.recvs.push_back((tag, most, into)),
@@ -642,7 +831,7 @@ impl Kqueue {
                     Owner::Pressure(tag),
                     0,
                     EVFILT_MEMORYSTATUS,
-                    libc::EV_ADD | libc::EV_CLEAR,
+                    (KeventFlags::ADD | KeventFlags::CLEAR).bits(),
                     NOTE_MEMORYSTATUS_PRESSURE_WARN | NOTE_MEMORYSTATUS_PRESSURE_CRITICAL,
                 );
                 self.pressure = Some((tag, id));
@@ -657,7 +846,8 @@ impl Kqueue {
             | Effect::ReadStdin { .. }
             | Effect::WriteOut { .. }
             | Effect::Now { .. }
-            | Effect::Random { .. }) => {
+            | Effect::Random { .. }
+            | Effect::Roots { .. }) => {
                 self.host.submit(effect);
                 Ok(())
             }
@@ -667,11 +857,68 @@ impl Kqueue {
         }
     }
 
-    /// A file effect onto the threads' queue, which has room: at most [`FILES`] are there.
-    fn to_threads(&mut self, effect: Effect) {
+    /// A file effect into its lane (crate::threads::lanes `lane_of`, then `S`): onto the lane's
+    /// threads where they have room and its backlog is empty, else into its backlog, else
+    /// refused naming the lane and its caps.
+    fn to_lane(&mut self, effect: Effect) -> io::Result<()> {
+        let class = lanes::lane_of(&effect).expect("a file effect, which a lane's threads run");
+        // Under a held lock, the driver's class ([`Kqueue::locks_held`]).
+        let asker = if self.locks_held > 0 { self.class.0 } else { qos::this_thread()?.0 };
+        let (ticket, placed) = self.dispatch.place(class).map_err(io::Error::other)?;
+        let queued = Queued { effect, ticket, asked: self.start.elapsed(), asker };
+        match placed {
+            Placed::Threads { start } => self.to_threads(queued, start),
+            Placed::Backlog => {
+                let backlog = &mut self.backlog[ticket.lane.index()];
+                if backlog.capacity() == 0 {
+                    // alloc: once per driver and lane, at its first effect beyond its threads.
+                    backlog.reserve(FILES);
+                }
+                backlog.push_back(queued);
+                Ok(())
+            }
+        }
+    }
+
+    /// A file effect onto its lane's queue, which has room (the dispatcher's word): at most
+    /// [`FILES`] are there. With `start` (every thread of the lane started so far is busy, and
+    /// fewer than its cap are started) one more is started first, so a driver that is asked no
+    /// file call starts no thread and one asked one at a time starts one a lane. Every thread,
+    /// of either lane, runs at the driver's class ([`Kqueue::class`]). A thread the system
+    /// refuses fails this effect, naming it; the effect is not queued.
+    fn to_threads(&mut self, queued: Queued, start: bool) -> io::Result<()> {
+        let lane = queued.ticket.lane;
+        if start {
+            let n = self.dispatch.started(lane) - 1;
+            // clone: one count of each per file thread, at its start.
+            let (root, queue, notify) = (Arc::clone(&self.root), self.queues[lane.index()].clone(), Arc::clone(&self.notify));
+            let kept = Arc::clone(&self.descriptors); // clone: as above.
+            let count = Arc::clone(&self.opened_by_name); // clone: as above.
+            let (clock, class) = (self.clock(), self.class);
+            let started = std::thread::Builder::new()
+                // alloc: once per thread.
+                .name(match lane {
+                    Lane::Fast => format!("blaze-kqueue-{n}"),
+                    Lane::Device => format!("blaze-kqueue-device-{n}"),
+                })
+                .spawn(move || work_on::<O>(lane, class, &root, &kept, &count, &queue, &notify, &clock))
+                .map_err(|error| {
+                    // alloc: an error path.
+                    io::Error::new(error.kind(), format!("file thread {n} of the kqueue driver's {} lane: {error}", lane.name()))
+                });
+            match started {
+                Ok(started) => self.workers.push(started),
+                Err(error) => {
+                    self.dispatch.not_started(queued.ticket);
+                    return Err(error);
+                }
+            }
+        }
         let work = self.work.as_ref().expect("the driver is running");
-        work.try_send(effect).expect("room for a file effect at the threads, which are running");
-        self.at_threads += 1;
+        if work[lane.index()].try_send(queued).is_err() {
+            unreachable!("room for a file effect at the {} lane's threads, which are running (the dispatcher's count)", lane.name());
+        }
+        Ok(())
     }
 
     fn connection(&mut self, conn: Conn) -> io::Result<&mut Connection> {
@@ -681,14 +928,14 @@ impl Kqueue {
     /// Watches `dir` as `tag`, a journal of it from `since`: on a stopped watch kept from an
     /// earlier one where there is one. A watch of `tag` already ends first, telling nothing
     /// more.
-    fn watch(&mut self, dir: FileName, since: Option<Cursor>, tag: Tag) -> io::Result<()> {
+    fn watch(&mut self, dir: DirName, since: Option<Cursor>, tag: Tag) -> io::Result<()> {
         if let Some(old) = self.watch_tags.remove(&tag) {
             self.retire(old);
         }
         let watch = match self.spare.pop() {
             Some(watch) => watch,
             // clone: one count per watch made, only when no spare one is left; never per event.
-            None => fsevents::Watch::new(Watched(Arc::clone(&self.notify)))?,
+            None => fsevents::Watch::new(Watched(Arc::clone(&self.notify)), &self.root)?,
         };
         let id = self.watches.insert(watch);
         let watch = self.watches.get_mut(id).expect("inserted above");
@@ -704,7 +951,7 @@ impl Kqueue {
                     let done = Done::Journaled(Box::new(first));
                     self.ready.push(Completion { tag, done });
                 }
-                self.watch_tags.insert(tag, id);
+                first_use(&mut self.watch_tags).insert(tag, id);
                 Ok(())
             }
             Err(error) => {
@@ -741,11 +988,19 @@ impl Kqueue {
     fn keep(&mut self, watch: fsevents::Watch<Watched>) {
         debug_assert!(!watch.is_running());
         if self.spare.len() < SPARE_WATCHES {
+            // alloc: once per driver, at the first watch stopped.
+            self.spare.reserve_exact(SPARE_WATCHES);
             self.spare.push(watch);
         }
     }
 
     fn spawn(&mut self, command: Box<Command>, tag: Tag) -> io::Result<()> {
+        // A sandbox's scratch folder is named in its profile, which takes absolute paths; a
+        // driver over `.` (a program's start folder, not read at start) makes it absolute here,
+        // at the first spawn that could need it, once.
+        if self.spawn_dirs.is_relative() {
+            self.spawn_dirs = std::path::absolute(&self.spawn_dirs)?; // alloc: once per driver.
+        }
         let process::Started { pid, stdin, stdout, stderr, finish } =
             process::start(&self.spawn_dirs, command, self.confine.as_ref())?;
         // Reaped only as this driver's loop polls its exit: a stall report names the tag.
@@ -767,7 +1022,7 @@ impl Kqueue {
         match self.follow(spawn) {
             Ok(()) => {
                 // A spawn of `tag` already runs on, followed by its own handle.
-                self.spawn_tags.insert(tag, spawn);
+                first_use(&mut self.spawn_tags).insert(tag, spawn);
                 Ok(())
             }
             Err(error) => {
@@ -794,7 +1049,7 @@ impl Kqueue {
         for (fd, err) in outputs {
             set_nonblocking(fd)?;
             let owner = Owner::Output { spawn, err };
-            let id = self.register(owner, fd as usize, libc::EVFILT_READ, libc::EV_ADD, 0);
+            let id = self.register(owner, fd as usize, Filter::READ.0, KeventFlags::ADD.bits(), 0);
             self.spawns.get_mut(spawn).expect("followed as it is made").ids.push(id);
         }
         if let Some(fd) = stdin {
@@ -802,14 +1057,14 @@ impl Kqueue {
             let id = self.register(
                 Owner::Input(spawn),
                 fd as usize,
-                libc::EVFILT_WRITE,
-                libc::EV_ADD,
+                Filter::WRITE.0,
+                KeventFlags::ADD.bits(),
                 0,
             );
             self.spawns.get_mut(spawn).expect("followed as it is made").ids.push(id);
         }
-        let (pid, flags) = (pid as usize, libc::EV_ADD | libc::EV_ONESHOT);
-        let id = self.register(Owner::Exit(spawn), pid, libc::EVFILT_PROC, flags, libc::NOTE_EXIT);
+        let (pid, flags) = (pid as usize, (KeventFlags::ADD | KeventFlags::ONESHOT).bits());
+        let id = self.register(Owner::Exit(spawn), pid, Filter::PROC.0, flags, NoteFlags::EXIT.bits());
         self.spawns.get_mut(spawn).expect("followed as it is made").ids.push(id);
         Ok(())
     }
@@ -821,17 +1076,19 @@ impl Kqueue {
             false => (&mut spawned.stdout, &mut spawned.out),
         };
         let Some(fd) = pipe.as_ref().map(|it| it.as_raw_fd()) else { return };
+        if self.buffer.is_empty() {
+            // alloc: once per driver, at the first output read.
+            self.buffer.resize(64 << 10, 0);
+        }
         loop {
-            // SAFETY: an open descriptor and a buffer of the length given.
-            let n = unsafe { libc::read(fd, self.buffer.as_mut_ptr().cast(), self.buffer.len()) };
-            match n {
-                1.. => into.extend_from_slice(&self.buffer[..n as usize]),
-                0 => {
+            match sys_io::read(Fd::new(fd), &mut self.buffer) {
+                Ok(0) => {
                     *pipe = None;
                     break;
                 }
-                _ => {
-                    let error = io::Error::last_os_error();
+                Ok(n) => into.extend_from_slice(&self.buffer[..n]),
+                Err(errno) => {
+                    let error = io::Error::from_raw_os_error(i32::from(errno.raw()));
                     match error.kind() {
                         io::ErrorKind::Interrupted => continue,
                         io::ErrorKind::WouldBlock => break,
@@ -853,16 +1110,14 @@ impl Kqueue {
         let input = &spawned.finish.command.stdin;
         while spawned.written < input.len() {
             let rest = &input[spawned.written..];
-            // SAFETY: an open descriptor and `rest.len()` bytes to read.
-            let n = unsafe { libc::write(fd, rest.as_ptr().cast(), rest.len()) };
-            match n {
-                1.. => spawned.written += n as usize,
-                0 => {
+            match sys_io::write(Fd::new(fd), rest) {
+                Ok(0) => {
                     spawned.failed.get_or_insert(io::ErrorKind::WriteZero.into());
                     break;
                 }
-                _ => {
-                    let error = io::Error::last_os_error();
+                Ok(n) => spawned.written += n,
+                Err(errno) => {
+                    let error = io::Error::from_raw_os_error(i32::from(errno.raw()));
                     match error.kind() {
                         io::ErrorKind::Interrupted => {}
                         io::ErrorKind::WouldBlock => return,
@@ -908,18 +1163,18 @@ impl Kqueue {
         self.ready.push(Completion { tag, done });
     }
 
-    fn listen(&mut self, at: &Address, tag: Tag) -> io::Result<()> {
+    fn listen(&mut self, at: &Address, options: &crate::sockopt::Tcp, tag: Tag) -> io::Result<()> {
         let context =
             // alloc: an error path.
             |error: io::Error| io::Error::new(error.kind(), format!("listening at {at:?}: {error}"));
-        let listener = net::listen(&self.root, at).map_err(context)?;
+        let listener = net::listen(&self.root, at, options).map_err(context)?;
         listener.set_nonblocking(true).map_err(context)?;
         let fd = listener.fd() as usize;
         let listen = self.listens.insert(Listening { tag, listener, id: TRIGGER });
-        let id = self.register(Owner::Listen(listen), fd, libc::EVFILT_READ, libc::EV_ADD, 0);
+        let id = self.register(Owner::Listen(listen), fd, Filter::READ.0, KeventFlags::ADD.bits(), 0);
         self.listens.get_mut(listen).expect("inserted above").id = id;
         // A listen of `tag` already ends, as the one it is replaced by begins.
-        if let Some(old) = self.listen_tags.insert(tag, listen)
+        if let Some(old) = first_use(&mut self.listen_tags).insert(tag, listen)
             && let Some(old) = self.listens.remove(old)
         {
             self.disown(old.id);
@@ -985,30 +1240,26 @@ impl Kqueue {
         Conn(conn.to_bits())
     }
 
-    fn connect(&mut self, at: Address, tag: Tag) -> io::Result<()> {
+    fn connect(&mut self, at: Address, options: &crate::sockopt::Tcp, tag: Tag) -> io::Result<()> {
         let context =
             // alloc: an error path.
             |error: io::Error| io::Error::new(error.kind(), format!("connecting to {at:?}: {error}"));
         let address = net::sockaddr(&self.root, &at).map_err(context)?;
         let fd = net::stream_socket(address.domain).map_err(context)?;
+        crate::sockopt::for_stream(fd.as_raw_fd(), address.domain, options, crate::sockopt::Side::Connect)
+            .map_err(context)?;
         set_nonblocking(fd.as_raw_fd()).map_err(context)?;
         no_sigpipe(fd.as_raw_fd()).map_err(context)?;
-        let unix = address.domain == libc::AF_UNIX;
-        // SAFETY: an address of `len` bytes, of the socket's domain.
-        let connected = unsafe {
-            libc::connect(fd.as_raw_fd(), (&raw const address.storage).cast(), address.len)
-        };
-        if connected == 0 {
-            return self.connected(tag, fd, unix).map_err(context);
-        }
-        let error = io::Error::last_os_error();
-        if !matches!(error.raw_os_error(), Some(libc::EINPROGRESS | libc::EINTR)) {
-            return Err(context(error));
+        let unix = address.domain == sys_net::AF_UNIX;
+        match sys_net::connect(Fd::new(fd.as_raw_fd()), &address.storage, address.len) {
+            Ok(()) => return self.connected(tag, fd, unix).map_err(context),
+            Err(Errno::InProgress | Errno::Intr) => {}
+            Err(errno) => return Err(context(io::Error::from_raw_os_error(i32::from(errno.raw())))),
         }
         let ident = fd.as_raw_fd() as usize;
-        let flags = libc::EV_ADD | libc::EV_ONESHOT;
+        let flags = (KeventFlags::ADD | KeventFlags::ONESHOT).bits();
         let connecting = self.connecting.insert(Connecting { tag, fd, at, unix });
-        self.register(Owner::Connecting(connecting), ident, libc::EVFILT_WRITE, flags, 0);
+        self.register(Owner::Connecting(connecting), ident, Filter::WRITE.0, flags, 0);
         Ok(())
     }
 
@@ -1026,10 +1277,9 @@ impl Kqueue {
     }
 
     fn connected(&mut self, tag: Tag, fd: OwnedFd, unix: bool) -> io::Result<()> {
+        // Its options were set before it connected (`connect`): setting no-delay here would
+        // undo a caller's `no_delay: Must(false)`.
         let socket = net::Socket::from_fd(fd, unix);
-        if let net::Socket::Tcp(stream) = &socket {
-            stream.set_nodelay(true)?;
-        }
         let conn = self.adopt(socket);
         self.ready.push(Completion { tag, done: Done::Connected { conn } });
         Ok(())
@@ -1045,8 +1295,8 @@ impl Kqueue {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     self.changes.push(Kevent {
                         ident: connection.socket.fd() as usize,
-                        filter: libc::EVFILT_READ,
-                        flags: libc::EV_ADD | libc::EV_ONESHOT,
+                        filter: Filter::READ.0,
+                        flags: (KeventFlags::ADD | KeventFlags::ONESHOT).bits(),
                         fflags: 0,
                         data: 0,
                         udata: connection.read as usize,
@@ -1081,8 +1331,8 @@ impl Kqueue {
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         self.changes.push(Kevent {
                             ident: connection.socket.fd() as usize,
-                            filter: libc::EVFILT_WRITE,
-                            flags: libc::EV_ADD | libc::EV_ONESHOT,
+                            filter: Filter::WRITE.0,
+                            flags: (KeventFlags::ADD | KeventFlags::ONESHOT).bits(),
                             fflags: 0,
                             data: 0,
                             udata: connection.write as usize,
@@ -1119,16 +1369,18 @@ impl Kqueue {
     /// Makes the changes asked for and waits until `until` (forever for `None`), or until the
     /// next timer is due, for events, and acts on them; then fires the timers due.
     fn wait(&mut self, until: Option<Deadline>) {
-        let timer = self.timers.next_deadline().map(|due| Deadline::at(Duration::from_nanos(due)));
+        let timer = self.timers.as_mut().and_then(Wheel::next_deadline).map(|due| Deadline::at(Duration::from_nanos(due)));
         let until = match (until, timer) {
             (Some(until), Some(timer)) => Some(until.min(timer)),
             (until, timer) => until.or(timer),
         };
         self.wait_events(until);
         let ready = &mut self.ready;
-        self.timers.advance(wheel::ticks(self.start.elapsed()), |_, tag| {
-            ready.push(Completion { tag, done: Done::Fired });
-        });
+        if let Some(timers) = &mut self.timers {
+            timers.advance(wheel::ticks(self.start.elapsed()), |_, tag| {
+                ready.push(Completion { tag, done: Done::Fired });
+            });
+        }
     }
 
     fn wait_events(&mut self, until: Option<Deadline>) {
@@ -1181,7 +1433,7 @@ impl Kqueue {
             return;
         }
         let Some(owner) = self.owners.get(id) else { return };
-        if event.flags & libc::EV_ERROR != 0 {
+        if event.flags & KeventFlags::ERROR.bits() != 0 {
             if event.data != 0 {
                 self.refused(id, owner, io::Error::from_raw_os_error(event.data as i32));
             }
@@ -1220,7 +1472,7 @@ impl Kqueue {
                 let Some(spawned) = self.spawns.get_mut(spawn) else { return };
                 // `ESRCH`: exited already, a child not reaped, which the kernel no longer
                 // follows. Anything else: its end cannot be heard, so it does not run on.
-                if error.raw_os_error() != Some(libc::ESRCH) {
+                if error.raw_os_error() != Some(i32::from(Errno::Srch.raw())) {
                     process::kill(spawned.pid);
                     if let Err(waiting) = process::wait_exited(spawned.pid) {
                         spawned.failed.get_or_insert(waiting);
@@ -1296,13 +1548,19 @@ impl Kqueue {
         // Cleared before the channels are read: a hand-back that finds it set was made before
         // this, so the reads below see it (`Wake`, model-checked in `handoff`).
         self.notify.woke.drain();
-        while let Ok(completion) = self.files.try_recv() {
-            self.at_threads -= 1;
+        while let Ok(Finished { completion, ticket, waited_ns }) = self.files.try_recv() {
+            self.dispatch.ended(ticket, waited_ns);
             out.push(completion);
         }
-        while self.at_threads < FILES {
-            let Some(effect) = self.backlog.pop_front() else { break };
-            self.to_threads(effect);
+        for lane in Lane::ALL {
+            while let Some(start) = self.dispatch.promote(lane) {
+                let queued = self.backlog[lane.index()].pop_front().expect("the dispatcher's backlog count is the driver's");
+                let tag = queued.effect.tag();
+                if let Err(error) = self.to_threads(queued, start) {
+                    // alloc: an error path.
+                    out.push(Completion { tag, done: Done::Failed(IoError(error.to_string())) });
+                }
+            }
         }
         while let Ok(completion) = self.watched.try_recv() {
             out.push(completion);
@@ -1313,7 +1571,7 @@ impl Kqueue {
     }
 }
 
-impl Drop for Kqueue {
+impl<S: Split, O: Opening> Drop for Kqueue<S, O> {
     fn drop(&mut self) {
         for (_, watch) in self.watches.iter_mut() {
             watch.stop(|_| {});
@@ -1337,7 +1595,7 @@ impl Drop for Kqueue {
     }
 }
 
-impl Driver for Kqueue {
+impl<S: Split, O: Opening> Driver for Kqueue<S, O> {
     fn submit(&mut self, effects: &mut Vec<Effect>) {
         for effect in effects.drain(..) {
             let tag = effect.tag();
@@ -1353,7 +1611,7 @@ impl Driver for Kqueue {
                 Effect::Unwatch { tag } if self.pressure.is_some_and(|(it, _)| it == tag) => {
                     let (_, id) = self.pressure.take().expect("matched above");
                     self.disown(id);
-                    self.change(0, EVFILT_MEMORYSTATUS, libc::EV_DELETE, 0, 0, id);
+                    self.change(0, EVFILT_MEMORYSTATUS, KeventFlags::DELETE.bits(), 0, 0, id);
                     self.ready.push(Completion { tag, done: Done::Unwatched });
                 }
                 // Its end after every change it told, which `retire` moves to `ready` first.
@@ -1449,25 +1707,81 @@ impl Driver for Kqueue {
         crate::system_wall_ns()
     }
 
+    fn boot(&self) -> Result<crate::Boot, crate::NoBoot> {
+        self.boot.clone()
+    }
+
     fn waker(&self) -> Option<crate::Waker> {
         // Only the polling thread reads it, and only after this call on that same thread.
         self.waker_given.store(true, std::sync::atomic::Ordering::Relaxed);
         // clone: a handle to the kqueue's notify, once per waker asked for
         Some(crate::Waker::new(Arc::clone(&self.notify) as Arc<dyn crate::Wake>))
     }
+
+    /// The file threads' calls, made on the asker's thread: the same [`crate::threads::run`]
+    /// over the same root and kept descriptors (crate::threads::inline, its table).
+    fn inline_files(&self) -> Option<crate::threads::inline::Inline> {
+        // clone: two counts, once per asker's world.
+        Some(crate::threads::inline::Inline::new(Arc::clone(&self.root), Arc::clone(&self.descriptors)))
+    }
 }
 
-/// Runs the file effects this thread takes off `queue`, which every file thread takes from
-/// with no lock, until the driver drops its end. The completions channel has room for each:
-/// the driver keeps at most [`FILES`] at the threads.
-fn work_on(root: &Path, kept: &Descriptors, queue: &Receiver<Effect>, notify: &Notify) {
-    while let Ok(effect) = queue.recv() {
+impl<S: Split, O: Opening> Kqueue<S, O> {
+    /// [`Driver::now`]'s clock as a value read with no `&self`: what an asker holds beside
+    /// the lock it keeps the driver under, so a clock read takes no lock (std.md, "End state:
+    /// efficiency", piece 6). On the instant the driver began, as `now` and every poll's
+    /// deadline are.
+    pub fn clock(&self) -> crate::wait::Monotonic {
+        crate::wait::Monotonic::since(self.start)
+    }
+}
+
+/// Runs the file effects this thread takes off its lane's `queue`, which every thread of the
+/// lane takes from with no lock, until the driver drops its end; each as `O` opens its file
+/// (crate::threads::opening), timed from its ask to its take on the driver's `clock`. The
+/// completions channel has room for each: the driver keeps at most [`FILES`] a lane at the
+/// threads. The thread first takes the driver's `class` (the lane does not choose it: a
+/// barrier a command's answer waits on runs at the command's class, unthrottled), then runs
+/// each effect at most at its asker's class ([`Lowered`], which never raises), given back
+/// before it hands the effect back. A class the system refuses fails the effect, or every
+/// effect for the thread's own, naming why.
+fn work_on<O: Opening>(
+    lane: Lane,
+    class: (Qos, i32),
+    root: &Path,
+    kept: &Descriptors,
+    count: &OpenCount,
+    queue: &Receiver<Queued>,
+    notify: &Notify,
+    clock: &Monotonic,
+) {
+    let refused = match qos::this_thread() {
+        Ok(now) if now == class => None,
+        Ok(_) => qos::set_this_thread(class.0.settable(), class.1).err(),
+        Err(error) => Some(error),
+    };
+    while let Ok(Queued { effect, ticket, asked, asker }) = queue.recv() {
+        let waited_ns = u64::try_from(clock.now().saturating_sub(asked).as_nanos()).unwrap_or(u64::MAX);
         let sent = counted(notify, || {
             let tag = effect.tag();
-            let done = crate::threads::run(root, kept, effect)
+            let done = match refused {
                 // alloc: an error path.
-                .unwrap_or_else(|error| Done::Failed(IoError(error.to_string())));
-            let sent = notify.files.send(Completion { tag, done }).is_ok();
+                Some(error) => Done::Failed(IoError(format!("a thread of the kqueue driver's {} lane: {error}", lane.name()))),
+                None => match Lowered::at_most(asker) {
+                    Ok(_lowered) => {
+                        #[cfg(test)]
+                        if let Ok((now, _)) = qos::this_thread() {
+                            notify.ran_at.store(now.raw(), std::sync::atomic::Ordering::Relaxed);
+                        }
+                        opening::run::<O>(root, kept, count, effect)
+                            // alloc: an error path.
+                            .unwrap_or_else(|error| Done::Failed(IoError(error.to_string())))
+                    }
+                    // alloc: an error path.
+                    Err(error) => Done::Failed(IoError(format!("{tag:?} at its asker's class on the kqueue driver's {} lane: {error}", lane.name()))),
+                },
+            };
+            let sent = notify.files.send(Finished { completion: Completion { tag, done }, ticket, waited_ns }).is_ok();
             if sent {
                 notify.wake();
             }
@@ -1512,47 +1826,21 @@ fn no_connection(conn: Conn) -> io::Error {
 /// `O_NONBLOCK` set on `fd`: one `FIONBIO`, which sets the flag `fcntl`'s `F_SETFL` would,
 /// where a read-modify-write of the flags is two calls.
 fn set_nonblocking(fd: RawFd) -> io::Result<()> {
-    let mut on: libc::c_int = 1;
-    // SAFETY: an open descriptor and an int the call reads.
-    if unsafe { libc::ioctl(fd, libc::FIONBIO, &raw mut on) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    sys_io::fionbio(Fd::new(fd), true)
+        .map_err(|errno| io::Error::from_raw_os_error(i32::from(errno.raw())))
 }
 
 /// A write to a socket whose peer is gone fails rather than raising SIGPIPE.
 fn no_sigpipe(fd: RawFd) -> io::Result<()> {
-    let on: libc::c_int = 1;
-    // SAFETY: an open socket and an int of the size given.
-    let set = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_NOSIGPIPE,
-            (&raw const on).cast(),
-            size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if set != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    sys_net::setsockopt_int(Fd::new(fd), sys_net::SOL_SOCKET, sys_net::SO_NOSIGPIPE, 1)
+        .map_err(|errno| io::Error::from_raw_os_error(i32::from(errno.raw())))
 }
 
 /// How a nonblocking connect of `fd` ended.
 fn socket_error(fd: RawFd) -> io::Result<()> {
-    let mut error: libc::c_int = 0;
-    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
-    // SAFETY: an open socket and an int of the size given to write.
-    let got = unsafe {
-        libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_ERROR, (&raw mut error).cast(), &mut len)
-    };
-    if got != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    match error {
-        0 => Ok(()),
-        error => Err(io::Error::from_raw_os_error(error)),
+    match sys_net::pending_error(Fd::new(fd)) {
+        Ok(None) => Ok(()),
+        Ok(Some(errno)) | Err(errno) => Err(io::Error::from_raw_os_error(i32::from(errno.raw()))),
     }
 }
 
@@ -1561,7 +1849,7 @@ mod tests {
     use std::{collections::BTreeMap, ffi::OsString, sync::atomic::Ordering};
 
     use super::*;
-    use crate::{Confined, Exit, Sandbox, Traced, run_until_idle, sim::Rng, threads::Threads};
+    use crate::{Confined, Exit, FileName, Sandbox, Traced, run_until_idle, sim::Rng, threads::Threads};
 
     fn name(it: &str) -> FileName {
         FileName::new(it).unwrap()
@@ -1571,6 +1859,30 @@ mod tests {
     /// long as a driver works in it.
     fn dir(what: &str) -> crate::temp::TempDir {
         crate::temp::TempDir::for_test(&format!("blaze-kq-{what}-"))
+    }
+
+    /// A new driver reserves no slab and no timer wheel (the start's map calls): each is made by
+    /// the first effect that needs it, and a timer made that way still fires.
+    #[test]
+    fn a_new_driver_reserves_nothing_until_asked() {
+        let root = dir("lazy");
+        let mut driver = Kqueue::new(&*root, 1).unwrap();
+        let slabs = |d: &Kqueue| {
+            [d.owners.slab.reserved(), d.watches.reserved(), d.spawns.reserved(), d.listens.reserved()]
+                .into_iter()
+                .chain([d.connecting.reserved(), d.conns.reserved(), d.timers.is_some()])
+                .filter(|reserved| *reserved)
+                .count()
+        };
+        assert_eq!(slabs(&driver), 0, "a new driver reserved a region");
+        driver.submit(&mut vec![Effect::Timer { after: Duration::from_millis(1), tag: Tag(3) }]);
+        assert_eq!(slabs(&driver), 1, "a timer makes the wheel and nothing else");
+        let mut done = Vec::new();
+        while done.is_empty() {
+            driver.poll(&mut done, Deadline::after(driver.now(), Duration::from_secs(5)));
+        }
+        assert_eq!(done[0].tag, Tag(3));
+        assert!(matches!(done[0].done, Done::Fired), "{:?}", done[0].done);
     }
 
     fn command(program: &str, args: &[&str], stdin: &[u8]) -> Box<Command> {
@@ -1741,9 +2053,9 @@ mod tests {
         assert_eq!((one.stdout.as_slice(), one.stderr.as_slice()), (&b"hello"[..], &b"err\n"[..]));
         assert!(one.peak_memory > 0);
         let two = exit(&seen[&2]);
-        assert_eq!((two.code, two.signal), (None, Some(libc::SIGTERM)));
+        assert_eq!((two.code, two.signal), (None, Some(blaze_sys::posix::signal::SIGTERM)));
         let three = exit(&seen[&3]);
-        assert_eq!((three.code, three.signal), (None, Some(libc::SIGKILL)));
+        assert_eq!((three.code, three.signal), (None, Some(blaze_sys::posix::signal::SIGKILL)));
         assert!(
             matches!(&seen[&4], Done::Failed(why) if why.0.contains("Confine")),
             "{:?}",
@@ -1823,7 +2135,7 @@ mod tests {
     fn round_trip(root: &Path, at: Address) {
         let mut driver = Kqueue::new(root, 1).unwrap();
         // The listen is made as it is submitted.
-        driver.submit(&mut vec![Effect::Listen { at: at.clone(), tag: Tag(1) }]);
+        driver.submit(&mut vec![Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) }]);
         let at = match at {
             Address::Tcp(_) => {
                 let bound = driver.listens.iter().find_map(|(_, it)| it.listener.local_addr());
@@ -1831,7 +2143,7 @@ mod tests {
             }
             other => other,
         };
-        let mut effects = vec![Effect::Connect { at, tag: Tag(2) }];
+        let mut effects = vec![Effect::Connect { at, options: crate::sockopt::Tcp::DEFAULT, tag: Tag(2) }];
         let (mut server, mut client) = (None, None);
         let mut ends = Vec::new();
         run_until_idle(&mut driver, &mut effects, |done, effects| match (done.tag.0, done.done) {
@@ -1912,7 +2224,7 @@ mod tests {
                 Effect::Unlisten { tag: Tag(2) },
                 Effect::Recv { conn: Conn(77), most: 8, into: b"kept".to_vec(), tag: Tag(3) },
                 Effect::Hangup { conn: Conn(77), tag: Tag(4) },
-                Effect::Connect { at: Address::Unix(name("nobody")), tag: Tag(5) },
+                Effect::Connect { at: Address::Unix(name("nobody")), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(5) },
                 Effect::Kill { tag: Tag(6) },
             ],
         );
@@ -2055,8 +2367,8 @@ mod tests {
                     18 => {
                         Effect::Rename { from: file.clone(), to: name("vfs/moved"), tag: Tag(19) }
                     }
-                    19 => Effect::List { dir: name("vfs"), tag: Tag(20) },
-                    20 => Effect::List { dir: name("missing"), tag: Tag(21) },
+                    19 => Effect::List { dir: name("vfs").into(), tag: Tag(20) },
+                    20 => Effect::List { dir: name("missing").into(), tag: Tag(21) },
                     21 => Effect::WriteAt {
                         file: name("missing"),
                         at: 0,
@@ -2069,10 +2381,14 @@ mod tests {
             }).expect("the effects end");
             seen
         }
-        let (ours, theirs) = (dir("files"), dir("files-threads"));
+        let (ours, theirs, control) = (dir("files"), dir("files-threads"), dir("files-control"));
         let kqueue = script(&mut Kqueue::new(&ours, 2).unwrap(), &file);
         let threads = script(&mut Threads::new(&theirs, 2), &file);
         assert_eq!(kqueue, threads);
+        // The controls of the two seams (one lane, opens by name) end the same.
+        let before = script(&mut Kqueue::<lanes::OneLane, opening::ByName>::made(&control, 2).unwrap(), &file);
+        assert_eq!(kqueue, before);
+        std::fs::remove_dir_all(control).unwrap();
         assert_eq!(kqueue[5], format!("{:?}", Done::Read(b"onet".to_vec())));
         assert_eq!(kqueue[3], format!("{:?}", Done::Read(b"etw".to_vec())));
         assert_eq!(kqueue[6], "stat 4 false");
@@ -2112,11 +2428,220 @@ mod tests {
         let seen = run(&mut driver, effects);
         assert_eq!(seen.len() as u64, n);
         assert!(seen.values().all(|it| *it == Done::Appended));
-        assert!(driver.backlog.is_empty() && driver.at_threads == 0);
+        assert!(driver.backlog.iter().all(VecDeque::is_empty));
+        assert_eq!((driver.dispatch.held(Lane::Fast), driver.dispatch.held(Lane::Device)), ((0, 0), (0, 0)));
         let bytes = std::fs::read(root.join("log")).unwrap();
         let wanted: Vec<u8> = (0..n).flat_map(u64::to_le_bytes).collect();
         assert!(bytes == wanted, "appended out of order");
         drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Two lanes: a barrier runs on the device lane's thread and a stat on the fast lane's, both
+    /// threads at the class of the thread that made the driver; each lane's waits are counted.
+    /// Control: one lane starts no device thread and counts both in the fast lane.
+    #[test]
+    fn a_barrier_runs_on_the_device_lane_and_a_stat_on_the_fast_lane() {
+        use std::os::unix::thread::JoinHandleExt as _;
+        fn class_of(handle: &JoinHandle<()>) -> crate::threads::qos::Qos {
+            let mut class = blaze_sys::posix::proc::QOS_CLASS_UNSPECIFIED;
+            let mut relative = 0;
+            // SAFETY: a live thread of the driver's (joined only at its drop); the two locals
+            // are written by the call.
+            let got = unsafe {
+                blaze_sys::posix::thread::pthread_get_qos_class_np(handle.as_pthread_t() as _, &mut class, &mut relative)
+            };
+            assert_eq!(got, 0, "pthread_get_qos_class_np");
+            crate::threads::qos::Qos::of_raw(class).expect("a class sys/qos.h lists")
+        }
+        let root = dir("lanes");
+        std::fs::write(root.join("f"), b"bytes").unwrap();
+        let effects = || vec![Effect::Barrier { file: name("f"), tag: Tag(1) }, Effect::Stat { file: name("f"), tag: Tag(2) }];
+        let mut two = Kqueue::<lanes::TwoLanes, opening::Kept>::made(&root, 1).unwrap();
+        let done = run(&mut two, effects());
+        assert_eq!(done.get(&1), Some(&Done::Ordered));
+        let waits = two.lanes();
+        assert_eq!((waits.lanes[Lane::Fast.index()].taken, waits.lanes[Lane::Device.index()].taken), (1, 1), "{waits:?}");
+        assert_eq!(waits.fast_behind_device, 0, "{waits:?}");
+        assert_eq!(two.workers.len(), 2, "one thread a lane");
+        let names: Vec<_> = two.workers.iter().map(|it| it.thread().name().unwrap().to_owned()).collect();
+        let device = two.workers.iter().position(|it| it.thread().name() == Some("blaze-kqueue-device-0")).expect("a device thread");
+        let fast = 1 - device;
+        for lane in [device, fast] {
+            assert_eq!(class_of(&two.workers[lane]), qos::this_thread().unwrap().0, "the driver's class: {names:?}");
+        }
+        drop(two);
+        let mut one = Kqueue::<lanes::OneLane, opening::ByName>::made(&root, 1).unwrap();
+        run(&mut one, effects());
+        let waits = one.lanes();
+        assert_eq!((waits.lanes[Lane::Fast.index()].taken, waits.lanes[Lane::Device.index()].taken), (2, 0), "{waits:?}");
+        assert_eq!(one.workers.len(), 1);
+        drop(one);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An effect runs at its asker's class, not its lane's: a barrier asked at the command's
+    /// class (`user-initiated`) runs there, one asked inside a [`Lowered`] stretch (after the
+    /// answer) at `utility`, and the thread is given back its class after it. A device thread
+    /// first started inside the stretch still takes the driver's class for the effects asked
+    /// after it. Inside the stretch, a barrier asked while the driver holds a file lock runs
+    /// at the driver's class, the asker's own left lowered, and the next after the unlock is
+    /// lowered again. Control: the effect asked lowered does run lowered (the class changes).
+    #[test]
+    fn an_effect_runs_at_its_askers_class_on_either_lane() {
+        let root = dir("asker-class");
+        std::fs::write(root.join("f"), b"bytes").unwrap();
+        let ran_at = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    qos::set_this_thread(Qos::UserInitiated, 0).unwrap();
+                    let mut driver = Kqueue::<lanes::TwoLanes, opening::Kept>::made(&root, 1).unwrap();
+                    let barrier = |driver: &mut Kqueue<lanes::TwoLanes, opening::Kept>, n: u64| {
+                        let done = run(driver, vec![Effect::Barrier { file: name("f"), tag: Tag(n) }]);
+                        assert_eq!(done.get(&n), Some(&Done::Ordered));
+                        Qos::of_raw(driver.notify.ran_at.load(Ordering::Relaxed)).expect("a class")
+                    };
+                    let mut seen = Vec::new();
+                    {
+                        // The device thread starts here, inside the stretch.
+                        let lowered = Lowered::at_most(Qos::Utility).unwrap();
+                        assert_eq!(lowered.was(), Some(Qos::UserInitiated));
+                        seen.push(barrier(&mut driver, 1));
+                    }
+                    seen.push(barrier(&mut driver, 2));
+                    {
+                        let _lowered = Lowered::at_most(Qos::Utility).unwrap();
+                        seen.push(barrier(&mut driver, 3));
+                        // The critical section of a lock taken after the answer: the driver's
+                        // class, given up at the unlock.
+                        let lock = run(&mut driver, vec![Effect::Lock { file: name("lock"), mode: crate::LockMode::Exclusive, tag: Tag(10) }]);
+                        assert_eq!(lock.get(&10), Some(&Done::Locked));
+                        seen.push(barrier(&mut driver, 11));
+                        let unlock = run(&mut driver, vec![Effect::Unlock { lock: Tag(10), tag: Tag(12) }]);
+                        assert_eq!(unlock.get(&12), Some(&Done::Unlocked));
+                        seen.push(barrier(&mut driver, 13));
+                        assert_eq!(qos::this_thread().unwrap().0, Qos::Utility, "the asker stays lowered");
+                    }
+                    seen.push(barrier(&mut driver, 4));
+                    assert_eq!(driver.workers.len(), 1, "one device thread for the barriers");
+                    assert_eq!(driver.locks_held, 0);
+                    drop(driver);
+                    seen
+                })
+                .join()
+                .unwrap()
+        });
+        assert_eq!(
+            ran_at,
+            [Qos::Utility, Qos::UserInitiated, Qos::Utility, Qos::UserInitiated, Qos::Utility, Qos::UserInitiated]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A map, a write-back, a read and a map again of one file open it once, through the kept
+    /// descriptors. Control: by name, each opens it, and the table opens nothing.
+    #[test]
+    fn an_effect_sequence_on_one_file_opens_it_once() {
+        fn sequence(driver: &mut impl Driver) {
+            let file = name("f");
+            let steps = [
+                Effect::Map { file: file.clone(), extent: crate::Extent::Whole, tag: Tag(1) },
+                Effect::WriteBack { file: file.clone(), tag: Tag(2) },
+                Effect::Read { file: file.clone(), at: 1, len: 3, tag: Tag(3) },
+                Effect::Map { file: file.clone(), extent: crate::Extent::Range { at: 1, len: 3 }, tag: Tag(4) },
+                Effect::Read { file: file.clone(), at: 0, len: 5, tag: Tag(5) },
+            ];
+            // One at a time: no two threads race to the first open.
+            for effect in steps {
+                let tag = effect.tag();
+                let done = run(driver, vec![effect]);
+                match &done[&tag.0] {
+                    Done::Mapped(mapping) => assert_eq!(mapping.bytes(), if tag.0 == 1 { &b"bytes"[..] } else { &b"yte"[..] }),
+                    Done::WrittenBack => {}
+                    Done::Read(bytes) => assert_eq!(&bytes[..], if tag.0 == 3 { &b"yte"[..] } else { &b"bytes"[..] }),
+                    other => panic!("effect {tag:?}: {other:?}"),
+                }
+            }
+        }
+        let root = dir("opens-once");
+        std::fs::write(root.join("f"), b"bytes").unwrap();
+        let mut kept = Kqueue::<lanes::TwoLanes, opening::Kept>::made(&root, 1).unwrap();
+        sequence(&mut kept);
+        assert_eq!((kept.opens().opened, kept.opens_by_name()), (1, 0), "kept: {:?}", kept.opens());
+        drop(kept);
+        let mut by_name = Kqueue::<lanes::TwoLanes, opening::ByName>::made(&root, 1).unwrap();
+        sequence(&mut by_name);
+        assert_eq!((by_name.opens().opened, by_name.opens_by_name()), (0, 5), "by name: {:?}", by_name.opens());
+        drop(by_name);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Writes in place and a cut of one file, as a segment is written and sealed: under the kept
+    /// opening the writes open its writable descriptor once, its barrier and sync one read-only
+    /// descriptor, and nothing opens by name; a barrier and a cut of a file that is missing make
+    /// it by its name (opening.rs's rule). The by-name control opens each by name. Both leave the
+    /// same bytes.
+    #[test]
+    fn a_write_sequence_on_one_file_opens_it_once() {
+        /// The opens of the table and by name after the writes, after the syncs, after the
+        /// effects on missing files.
+        fn sequence<S: Split, O: Opening>(driver: &mut Kqueue<S, O>) -> [(u64, u64); 3] {
+            let file = name("w");
+            let mut seen = [(0, 0); 3];
+            let steps = [
+                Effect::WriteAt { file: file.clone(), at: 0, bytes: b"B".to_vec(), tag: Tag(1) },
+                Effect::Truncate { file: file.clone(), len: 4, tag: Tag(2) },
+                Effect::WriteAt { file: file.clone(), at: 4, bytes: b"S!".to_vec(), tag: Tag(3) },
+                Effect::WriteAt { file: file.clone(), at: 1, bytes: b"Y".to_vec(), tag: Tag(4) },
+                Effect::Barrier { file: file.clone(), tag: Tag(5) },
+                Effect::Sync { file: file.clone(), tag: Tag(6) },
+                // The cut makes `made/` too; a barrier makes its file, not its directory.
+                Effect::Truncate { file: name("made/cut"), len: 3, tag: Tag(7) },
+                Effect::Barrier { file: name("made/barrier"), tag: Tag(8) },
+            ];
+            // One at a time: no two threads race to the first open.
+            for effect in steps {
+                let tag = effect.tag();
+                let done = run(driver, vec![effect]);
+                match (tag.0, &done[&tag.0]) {
+                    (1 | 3 | 4, Done::Written) | (2 | 7, Done::Truncated) | (5 | 8, Done::Ordered) | (6, Done::Synced) => {}
+                    (_, other) => panic!("effect {tag:?}: {other:?}"),
+                }
+                let now = (driver.opens().opened, driver.opens_by_name());
+                match tag.0 {
+                    4 => seen[0] = now,
+                    6 => seen[1] = now,
+                    8 => seen[2] = now,
+                    _ => {}
+                }
+            }
+            seen
+        }
+        let ends = |root: &Path| {
+            (
+                std::fs::read(root.join("w")).unwrap(),
+                std::fs::read(root.join("made/barrier")).unwrap(),
+                std::fs::read(root.join("made/cut")).unwrap(),
+            )
+        };
+        let root = dir("writes-open-once");
+        std::fs::write(root.join("w"), b"bytes").unwrap();
+        let mut kept = Kqueue::<lanes::TwoLanes, opening::Kept>::made(&root, 1).unwrap();
+        let opens = sequence(&mut kept);
+        // The writes: one writable open. The syncs: one read-only open more (a sealed file
+        // refuses a writable one). The missing files: two made by name, none in the table.
+        assert_eq!(opens, [(1, 0), (2, 0), (2, 2)], "kept: {:?}", kept.opens());
+        drop(kept);
+        let kept_ends = ends(root.path());
+        assert_eq!(kept_ends, (b"BYteS!".to_vec(), Vec::new(), vec![0; 3]));
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("w"), b"bytes").unwrap();
+        let mut by_name = Kqueue::<lanes::TwoLanes, opening::ByName>::made(&root, 1).unwrap();
+        let opens = sequence(&mut by_name);
+        assert_eq!(opens, [(0, 4), (0, 6), (0, 8)], "by name: {:?}", by_name.opens());
+        drop(by_name);
+        assert_eq!(ends(root.path()), kept_ends);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2165,17 +2690,18 @@ mod tests {
         use std::os::fd::AsRawFd;
         let (read, write) = std::io::pipe().unwrap();
         for fd in [read.as_raw_fd(), write.as_raw_fd()] {
-            // SAFETY: an open descriptor.
-            assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK, 0);
+            let nonblocking = || {
+                sys_io::status_flags(Fd::new(fd))
+                    .map(|flags| flags.contains(sys_io::OpenFlags::NONBLOCK))
+            };
+            assert_eq!(nonblocking(), Ok(false));
             set_nonblocking(fd).unwrap();
-            // SAFETY: as above.
-            assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK, 0);
+            assert_ne!(nonblocking(), Ok(false));
         }
         let mut byte = [0u8; 1];
-        // SAFETY: an open descriptor and a buffer of the length given.
-        let n = unsafe { libc::read(read.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
-        let error = io::Error::last_os_error();
-        assert_eq!((n, error.kind()), (-1, io::ErrorKind::WouldBlock));
+        let n = sys_io::read(Fd::new(read.as_raw_fd()), &mut byte)
+            .map_err(|errno| io::Error::from_raw_os_error(i32::from(errno.raw())).kind());
+        assert_eq!(n, Err(io::ErrorKind::WouldBlock));
         drop(write);
     }
 
@@ -2344,33 +2870,70 @@ mod tests {
             &mut driver,
             vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }],
         );
+        let src = || crate::DirName::Named(name("src"));
         driver.submit(&mut vec![Effect::Journal {
-            dir: name("src"),
+            dir: src(),
             since: crate::Cursor::None,
             tag: Tag(7),
         }]);
         let batches = journal_until(&mut driver, Tag(7), |it| it.caught_up);
         assert!(matches!(batches[0].cursor, crate::Cursor::FsEvents { .. }), "{batches:?}");
-        assert!(!batches[0].caught_up && batches[0].lost.is_empty());
+        assert!(!batches[0].caught_up && batches[0].lost.is_empty() && batches[0].whole.is_none());
         // A batch does not end it.
         assert_eq!(driver.in_flight(), 1);
         let cursor = batches.last().unwrap().cursor;
         unwatch(&mut driver, Tag(7));
         std::fs::write(root.join("src/while-down.rs"), b"fn f() {}").unwrap();
         fsevents::fseventsd_keeps(Duration::from_secs(1));
-        driver.submit(&mut vec![Effect::Journal { dir: name("src"), since: cursor, tag: Tag(8) }]);
+        driver.submit(&mut vec![Effect::Journal { dir: src(), since: cursor, tag: Tag(8) }]);
         let batches = journal_until(&mut driver, Tag(8), |it| it.caught_up);
         let told: Vec<_> = batches.iter().flat_map(|it| &it.files).collect();
         assert!(told.contains(&&name("src/while-down.rs")), "{batches:?}");
-        assert!(batches.iter().all(|it| it.lost.is_empty()), "{batches:?}");
+        assert!(batches.iter().all(|it| it.lost.is_empty() && it.whole.is_none()), "{batches:?}");
         assert_eq!(driver.in_flight(), 1);
         unwatch(&mut driver, Tag(8));
         // Of another store: lost, the whole directory.
         let other = crate::Cursor::FsEvents { event: 1, volume: [7; 16] };
-        driver.submit(&mut vec![Effect::Journal { dir: name("src"), since: other, tag: Tag(9) }]);
+        driver.submit(&mut vec![Effect::Journal { dir: src(), since: other, tag: Tag(9) }]);
         let batches = journal_until(&mut driver, Tag(9), |_| true);
-        assert_eq!(batches[0].lost, [(name("src"), crate::Lost::Reset)]);
+        assert_eq!((batches[0].lost.as_slice(), batches[0].whole), (&[][..], Some(crate::Lost::Reset)));
         unwatch(&mut driver, Tag(9));
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A journal of the driver's ROOT (a checkout run from its own folder) resumes from its
+    /// cursor and names what changed at the root's own level, not only beneath its folders: a
+    /// file made there, one removed, and one renamed in from a folder (named at its source and
+    /// at its destination). CONTROL: a file written in a folder is named as before.
+    #[test]
+    fn a_journal_of_the_root_names_its_own_entries() {
+        let root = dir("journal-root");
+        let mut driver = Kqueue::new(&root, 1).unwrap();
+        run(
+            &mut driver,
+            vec![
+                Effect::Write { file: name("gone.toml"), bytes: Vec::new(), tag: Tag(1) },
+                Effect::Write { file: name("src/moved.rs"), bytes: Vec::new(), tag: Tag(2) },
+            ],
+        );
+        driver.submit(&mut vec![Effect::Journal { dir: crate::DirName::Root, since: crate::Cursor::None, tag: Tag(7) }]);
+        let batches = journal_until(&mut driver, Tag(7), |it| it.caught_up);
+        let cursor = batches.last().unwrap().cursor;
+        unwatch(&mut driver, Tag(7));
+        std::fs::write(root.join("made.toml"), b"[a]").unwrap();
+        std::fs::remove_file(root.join("gone.toml")).unwrap();
+        std::fs::rename(root.join("src/moved.rs"), root.join("moved.rs")).unwrap();
+        std::fs::write(root.join("src/edited.rs"), b"fn f() {}").unwrap();
+        fsevents::fseventsd_keeps(Duration::from_secs(1));
+        driver.submit(&mut vec![Effect::Journal { dir: crate::DirName::Root, since: cursor, tag: Tag(8) }]);
+        let batches = journal_until(&mut driver, Tag(8), |it| it.caught_up);
+        let told: Vec<_> = batches.iter().flat_map(|it| &it.files).collect();
+        for wanted in ["made.toml", "gone.toml", "moved.rs", "src/moved.rs", "src/edited.rs"] {
+            assert!(told.contains(&&name(wanted)), "{wanted}: {batches:?}");
+        }
+        assert!(batches.iter().all(|it| it.whole.is_none()), "{batches:?}");
+        unwatch(&mut driver, Tag(8));
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2399,8 +2962,8 @@ mod tests {
             &mut driver,
             vec![
                 Effect::Stamp { files: Arc::new(names.clone()), tag: Tag(3) },
-                Effect::Entries { dir: name("src"), tag: Tag(4) },
-                Effect::Entries { dir: name("missing"), tag: Tag(5) },
+                Effect::Entries { dir: name("src").into(), tag: Tag(4) },
+                Effect::Entries { dir: name("missing").into(), tag: Tag(5) },
             ],
         );
         let stamps = crate::fs::stamps(&root, &names).unwrap();
@@ -2408,10 +2971,10 @@ mod tests {
         assert!(stamps[0].is_file() && stamps[0].size == 9, "{stamps:?}");
         assert!(stamps[1].is_dir() && stamps[2].is_link(), "{stamps:?}");
         assert!(stamps[3].is_gone() && stamps[4].is_gone(), "{stamps:?}");
-        let entries = crate::fs::entries(&root.join("src"), &name("src")).unwrap();
-        assert_eq!(seen[&4], Done::Entries(entries.clone()));
+        let entries = crate::fs::entries(&root.join("src"), &name("src").into()).unwrap();
+        assert_eq!(seen[&4], Done::Entries(Box::new(entries.clone())));
         let named: Vec<_> = entries.iter().map(|(it, _)| it.as_str()).collect();
-        assert_eq!(named, ["src/deep", "src/lib.rs", "src/link"]);
+        assert_eq!(named, ["deep", "lib.rs", "link"]);
         assert!(matches!(seen[&5], Done::Failed(_)));
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
@@ -2421,7 +2984,7 @@ mod tests {
     /// trigger's, never reused.
     struct OldOwners {
         next: u64,
-        owners: HashMap<u64, Owner, Global>,
+        owners: Map<u64, Owner, FixedState, Global>,
     }
 
     impl OldOwners {
@@ -2463,7 +3026,7 @@ mod tests {
         for seed in 0..300 {
             let mut rng = Rng::new(seed);
             let mut owners = Owners::new().unwrap();
-            let mut old = OldOwners { next: TRIGGER + 1, owners: HashMap::new_in(Global) };
+            let mut old = OldOwners { next: TRIGGER + 1, owners: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }) };
             // Each registration made: its id in each, and whether it is live.
             let mut made: Vec<(u64, u64, bool)> = Vec::new();
             for _ in 0..500 {
@@ -2516,7 +3079,7 @@ mod tests {
         let root = dir("stale");
         let mut driver = Kqueue::new(&root, 1).unwrap();
         let connecting = |driver: &mut Kqueue, tag| {
-            let fd = net::stream_socket(libc::AF_UNIX).unwrap();
+            let fd = net::stream_socket(sys_net::AF_UNIX).unwrap();
             driver.connecting.insert(Connecting {
                 tag,
                 fd,
@@ -2535,9 +3098,9 @@ mod tests {
         assert_ne!(ended, live);
         // An `EVFILT_USER` of its own, its `udata` the ended registration's, then triggered.
         let user = |driver: &Kqueue, id: u64| {
-            let flags = libc::EV_ADD | libc::EV_CLEAR;
-            driver.notify.change(1, libc::EVFILT_USER, flags, 0, 0, id).unwrap();
-            driver.notify.change(1, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER, 0, id).unwrap();
+            let flags = (KeventFlags::ADD | KeventFlags::CLEAR).bits();
+            driver.notify.change(1, Filter::USER.0, flags, 0, 0, id).unwrap();
+            driver.notify.change(1, Filter::USER.0, 0, NoteFlags::TRIGGER.bits(), 0, id).unwrap();
         };
         user(&driver, ended);
         driver.wait(Some(Deadline::after(driver.now(), Duration::from_millis(50))));
@@ -2753,8 +3316,8 @@ mod tests {
         let mut driver = Kqueue::new(&root, 1).unwrap();
         let at = Address::Unix(name("s"));
         let mut effects = vec![
-            Effect::Listen { at: at.clone(), tag: Tag(1) },
-            Effect::Connect { at: at.clone(), tag: Tag(2) },
+            Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) },
+            Effect::Connect { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(2) },
         ];
         driver.submit(&mut effects);
         let mut out = Vec::with_capacity(16);
@@ -2822,7 +3385,7 @@ mod tests {
             "{out:?}"
         );
         out.clear();
-        effects.push(Effect::Connect { at, tag: Tag(3) });
+        effects.push(Effect::Connect { at, options: crate::sockopt::Tcp::DEFAULT, tag: Tag(3) });
         driver.submit(&mut effects);
         let (again, other) = accept(&mut driver, &mut out, Tag(3));
         let index = |conn: Conn| conn_id(conn).index();

@@ -24,8 +24,10 @@
 
 #![cfg(target_os = "linux")]
 
+use blaze_sys::linux::fdctl::{MemfdFlags, memfd_create};
+use blaze_sys::posix::proc::{Elf64_Addr, Elf64_Phdr, PF_R, PF_X, PT_LOAD};
+use blaze_sys::posix::types::{c_int, c_void, size_t};
 use std::ffi::CString;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::Mutex;
 
 const SYMBOL: usize = 24;
@@ -115,23 +117,16 @@ pub fn file(bodies: &[(u64, u64, Box<str>)]) -> Vec<u8> {
 
 /// A memfd that holds `bytes`: its descriptor, left open for the life of the process.
 fn kept(bytes: &[u8]) -> Option<i32> {
-    // SAFETY: a name that is a C string; the result is checked.
-    let fd = unsafe { libc::memfd_create(c"blaze-launch-symbols".as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-        return None;
-    }
-    // SAFETY: a descriptor just made, owned by nothing else.
-    let file = unsafe { OwnedFd::from_raw_fd(fd) };
+    let file = memfd_create(blaze_sys::Path::new(c"blaze-launch-symbols"), MemfdFlags::CLOSE_ON_EXEC).ok()?;
     let mut done = 0;
     while done < bytes.len() {
-        // SAFETY: a write of a live slice to a descriptor this function owns.
-        let wrote = unsafe { libc::write(file.as_raw_fd(), bytes[done..].as_ptr().cast(), bytes.len() - done) };
-        if wrote <= 0 {
+        let wrote = blaze_sys::linux::write(file.fd(), &bytes[done..]).ok()?;
+        if wrote == 0 {
             return None;
         }
-        done += wrote as usize;
+        done += wrote;
     }
-    Some(file.into_raw_fd())
+    Some(file.into_raw())
 }
 
 /// `dl_iterate_phdr` as the program is bound to it: every image the system reports, then the
@@ -143,9 +138,9 @@ fn kept(bytes: &[u8]) -> Option<i32> {
 ///
 /// As `dl_iterate_phdr`: `callback` may be called with `data`.
 pub unsafe extern "C" fn iterate(
-    callback: Option<unsafe extern "C" fn(*mut libc::dl_phdr_info, libc::size_t, *mut libc::c_void) -> libc::c_int>,
-    data: *mut libc::c_void,
-) -> libc::c_int {
+    callback: Option<unsafe extern "C" fn(*mut libc::dl_phdr_info, size_t, *mut c_void) -> c_int>,
+    data: *mut c_void,
+) -> c_int {
     // SAFETY: the caller's contract, handed on.
     let ended = unsafe { libc::dl_iterate_phdr(callback, data) };
     let (0, Some(callback)) = (ended, callback) else { return ended };
@@ -165,14 +160,14 @@ pub unsafe extern "C" fn iterate(
     // alloc: the image's name, for the length of the callback (which copies it)
     let Ok(name) = CString::new(format!("/proc/self/fd/{fd}")) else { return 0 };
     // SAFETY: zeroes are a valid `Elf64_Phdr` and a valid `dl_phdr_info`.
-    let (mut segment, mut info): (libc::Elf64_Phdr, libc::dl_phdr_info) = unsafe { core::mem::zeroed() };
-    segment.p_type = libc::PT_LOAD;
-    segment.p_flags = libc::PF_R | libc::PF_X;
+    let (mut segment, mut info): (Elf64_Phdr, libc::dl_phdr_info) = unsafe { core::mem::zeroed() };
+    segment.p_type = PT_LOAD;
+    segment.p_flags = PF_R | PF_X;
     segment.p_memsz = len as u64;
     segment.p_filesz = len as u64;
-    info.dlpi_addr = base as libc::Elf64_Addr;
+    info.dlpi_addr = base as Elf64_Addr;
     info.dlpi_name = name.as_ptr();
-    info.dlpi_phdr = &segment;
+    info.dlpi_phdr = core::ptr::from_ref(&segment).cast();
     info.dlpi_phnum = 1;
     // SAFETY: the caller's contract; `info` and what it points to live across the call.
     unsafe { callback(&mut info, core::mem::size_of::<libc::dl_phdr_info>(), data) }

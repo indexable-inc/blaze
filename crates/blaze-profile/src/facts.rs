@@ -13,13 +13,13 @@
 //! [`CHILDREN`] for the next flush to take ([`take_processes`]). The tests a build ran
 //! (`test_runs`) come with its end, as its links do ([`crate::history::History::tests_ran`]).
 
-use arrow_array::{
-    ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
-    types::UInt32Type,
-};
-use arrow_schema::ArrowError;
+use std::alloc::Global;
 
-use crate::{batches, schema};
+use crate::{
+    columns::{self, Batch, BatchError, Column},
+    errors::dict,
+    schema,
+};
 
 /// How an image was linked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -283,7 +283,7 @@ pub struct TestRunRow {
     blaze::process_static,
     reason = "drained by each history flush: bounded by the children one flush interval reaps"
 )]
-static CHILDREN: crossbeam_queue::SegQueue<ProcessRow> = crossbeam_queue::SegQueue::new();
+static CHILDREN: blaze_queue::SegQueue<ProcessRow, Global> =blaze_queue::SegQueue::new();
 
 /// Has every child a driver reaps from now on queued as a `processes` row, each label naming
 /// the build this thread works for and the span it is inside ([`crate::flight::current_build`],
@@ -340,87 +340,89 @@ pub fn take_processes(into: &mut Vec<ProcessRow>) {
 }
 
 /// The `processes` rows of `rows`, all reaped by the process `pid`.
-pub fn processes(rows: &[ProcessRow], pid: u32) -> Result<RecordBatch, ArrowError> {
-    let int =
-        |of: fn(&ProcessRow) -> Option<i64>| column(Int64Array::from_iter(rows.iter().map(of)));
-    let count =
-        |of: fn(&ProcessRow) -> Option<u64>| column(UInt64Array::from_iter(rows.iter().map(of)));
+pub fn processes(rows: &[ProcessRow], pid: u32) -> Result<Batch, BatchError> {
+    let err = BatchError::of(&schema::PROCESSES);
+    let int = |of: fn(&ProcessRow) -> Option<i64>| Column::options(rows.iter().map(of), Global);
+    let count = |of: fn(&ProcessRow) -> Option<u64>| Column::options(rows.iter().map(of), Global);
     let word = |it: Option<i32>| it.map(|it| it as u32);
     // alloc: a batch's columns, once a flush
-    let columns: Vec<ArrayRef> = vec![
+    let columns: Vec<Column> = vec![
         count(|it| (it.build_id != 0).then_some(it.build_id)),
-        column(UInt32Array::from_value(pid, rows.len())),
-        column(UInt32Array::from_iter_values(rows.iter().map(|it| it.pid))),
-        dict(rows.iter().map(|it| Some(it.kind))),
-        column(StringArray::from_iter(rows.iter().map(|it| it.unit.as_deref()))),
-        column(StringArray::from_iter_values(rows.iter().map(|it| it.program.as_str()))),
+        Column::repeat(pid, rows.len(), Global),
+        Column::values(rows.iter().map(|it| it.pid), Global),
+        dict(rows.iter().map(|it| Some(it.kind))).map_err(err)?,
+        Column::opt_texts_of(rows.iter().map(|it| it.unit.as_deref()), Global),
+        Column::texts_of(rows.iter().map(|it| it.program.as_str()), Global),
         count(|it| (it.parent_span != 0).then_some(it.parent_span)),
-        column(Int64Array::from_iter_values(rows.iter().map(|it| it.spawned_ns))),
+        Column::values(rows.iter().map(|it| it.spawned_ns), Global),
         int(|it| it.exec_ns),
-        column(Int64Array::from_iter_values(rows.iter().map(|it| it.exited_ns))),
+        Column::values(rows.iter().map(|it| it.exited_ns), Global),
         int(|it| it.sandbox_ns),
-        column(Int64Array::from_iter_values(rows.iter().map(|it| it.user_ns))),
-        column(Int64Array::from_iter_values(rows.iter().map(|it| it.system_ns))),
+        Column::values(rows.iter().map(|it| it.user_ns), Global),
+        Column::values(rows.iter().map(|it| it.system_ns), Global),
         count(|it| it.peak_rss),
         count(|it| it.minor_faults),
         count(|it| it.major_faults),
         count(|it| it.voluntary_switches),
         count(|it| it.involuntary_switches),
-        column(UInt32Array::from_iter(rows.iter().map(|it| word(it.code)))),
-        column(UInt32Array::from_iter(rows.iter().map(|it| word(it.signal)))),
+        Column::options(rows.iter().map(|it| word(it.code)), Global),
+        Column::options(rows.iter().map(|it| word(it.signal)), Global),
     ];
-    RecordBatch::try_new(batches::schema_of(&schema::PROCESSES), columns)
+    columns::batch(&schema::PROCESSES, columns)
 }
 
 /// The `test_runs` rows of `rows`.
-pub fn test_runs(rows: &[TestRunRow]) -> Result<RecordBatch, ArrowError> {
+pub fn test_runs(rows: &[TestRunRow]) -> Result<Batch, BatchError> {
+    let err = BatchError::of(&schema::TEST_RUNS);
     // alloc: a batch's columns, once a flush
-    let columns: Vec<ArrayRef> = vec![
-        column(UInt64Array::from_iter_values(rows.iter().map(|it| it.build_id))),
-        column(StringArray::from_iter_values(rows.iter().map(|it| it.test.as_str()))),
-        dict(rows.iter().map(|it| it.krate.as_deref())),
-        column(StringArray::from_iter_values(rows.iter().map(|it| it.binary.as_str()))),
-        dict(rows.iter().map(|it| Some(it.outcome.name()))),
-        column(Int64Array::from_iter_values(rows.iter().map(|it| it.dur_ns))),
-        column(UInt32Array::from_iter_values(rows.iter().map(|it| it.retries))),
-        column(Int64Array::from_iter_values(rows.iter().map(|it| it.ended_ns))),
+    let columns: Vec<Column> = vec![
+        Column::values(rows.iter().map(|it| it.build_id), Global),
+        Column::texts_of(rows.iter().map(|it| it.test.as_str()), Global),
+        dict(rows.iter().map(|it| it.krate.as_deref())).map_err(err)?,
+        Column::texts_of(rows.iter().map(|it| it.binary.as_str()), Global),
+        dict(rows.iter().map(|it| Some(it.outcome.name()))).map_err(err)?,
+        Column::values(rows.iter().map(|it| it.dur_ns), Global),
+        Column::values(rows.iter().map(|it| it.retries), Global),
+        Column::values(rows.iter().map(|it| it.ended_ns), Global),
     ];
-    RecordBatch::try_new(batches::schema_of(&schema::TEST_RUNS), columns)
+    columns::batch(&schema::TEST_RUNS, columns)
 }
 
 /// The `links` rows of `rows`.
-pub fn links(rows: &[LinkRow]) -> Result<RecordBatch, ArrowError> {
+pub fn links(rows: &[LinkRow]) -> Result<Batch, BatchError> {
+    let err = BatchError::of(&schema::LINKS);
     // alloc: a batch's columns, once a flush
-    let columns: Vec<ArrayRef> = vec![
-        column(UInt64Array::from_iter_values(rows.iter().map(|it| it.build_id))),
-        column(StringArray::from_iter_values(rows.iter().map(|it| it.image.as_str()))),
-        dict(rows.iter().map(|it| it.krate.as_deref())),
-        dict(rows.iter().map(|it| Some(it.outcome.name()))),
-        column(Int64Array::from_iter(rows.iter().map(|it| it.dur_ns))),
+    let columns: Vec<Column> = vec![
+        Column::values(rows.iter().map(|it| it.build_id), Global),
+        Column::texts_of(rows.iter().map(|it| it.image.as_str()), Global),
+        dict(rows.iter().map(|it| it.krate.as_deref())).map_err(err)?,
+        dict(rows.iter().map(|it| Some(it.outcome.name()))).map_err(err)?,
+        Column::options(rows.iter().map(|it| it.dur_ns), Global),
     ];
-    RecordBatch::try_new(batches::schema_of(&schema::LINKS), columns)
+    columns::batch(&schema::LINKS, columns)
 }
 
 /// The `crate_deps` rows of `rows`.
-pub fn crate_deps(rows: &[CrateDepRow]) -> Result<RecordBatch, ArrowError> {
+pub fn crate_deps(rows: &[CrateDepRow]) -> Result<Batch, BatchError> {
+    let err = BatchError::of(&schema::CRATE_DEPS);
     // alloc: a batch's columns, once a flush
-    let columns: Vec<ArrayRef> = vec![
-        column(UInt64Array::from_iter_values(rows.iter().map(|it| it.build_id))),
-        dict(rows.iter().map(|it| Some(it.krate.as_str()))),
-        dict(rows.iter().map(|it| Some(it.dep.as_str()))),
-        dict(rows.iter().map(|it| Some(it.kind.name()))),
+    let columns: Vec<Column> = vec![
+        Column::values(rows.iter().map(|it| it.build_id), Global),
+        dict(rows.iter().map(|it| Some(it.krate.as_str()))).map_err(err)?,
+        dict(rows.iter().map(|it| Some(it.dep.as_str()))).map_err(err)?,
+        dict(rows.iter().map(|it| Some(it.kind.name()))).map_err(err)?,
     ];
-    RecordBatch::try_new(batches::schema_of(&schema::CRATE_DEPS), columns)
+    columns::batch(&schema::CRATE_DEPS, columns)
 }
 
 /// The `query_counts` rows of `rows`.
-pub fn query_counts(rows: &[QueryCountRow]) -> Result<RecordBatch, ArrowError> {
-    let count =
-        |of: fn(&QueryCountRow) -> u64| column(UInt64Array::from_iter_values(rows.iter().map(of)));
+pub fn query_counts(rows: &[QueryCountRow]) -> Result<Batch, BatchError> {
+    let err = BatchError::of(&schema::QUERY_COUNTS);
+    let count = |of: fn(&QueryCountRow) -> u64| Column::values(rows.iter().map(of), Global);
     // alloc: a batch's columns, once a flush
-    let columns: Vec<ArrayRef> = vec![
+    let columns: Vec<Column> = vec![
         count(|it| it.build_id),
-        dict(rows.iter().map(|it| Some(it.query))),
+        dict(rows.iter().map(|it| Some(it.query))).map_err(err)?,
         count(|it| it.executed),
         count(|it| it.verified),
         count(|it| it.reran),
@@ -448,29 +450,31 @@ pub fn query_counts(rows: &[QueryCountRow]) -> Result<RecordBatch, ArrowError> {
         count(|it| it.validity.edge_claimed),
         count(|it| it.validity.edges_compared),
     ];
-    RecordBatch::try_new(batches::schema_of(&schema::QUERY_COUNTS), columns)
+    columns::batch(&schema::QUERY_COUNTS, columns)
 }
 
 /// The `provenance` rows of `rows`.
-pub fn provenance(rows: &[ProvenanceRow]) -> Result<RecordBatch, ArrowError> {
+pub fn provenance(rows: &[ProvenanceRow]) -> Result<Batch, BatchError> {
+    let err = BatchError::of(&schema::PROVENANCE);
     // alloc: a batch's columns, once a flush
-    let columns: Vec<ArrayRef> = vec![
-        column(UInt64Array::from_iter_values(rows.iter().map(|it| it.build_id))),
-        column(StringArray::from_iter_values(rows.iter().map(|it| it.query_key.as_str()))),
-        dict(rows.iter().map(|it| Some(it.kind))),
-        dict(rows.iter().map(|it| Some(it.outcome.name()))),
-        column(StringArray::from_iter(rows.iter().map(|it| it.cause))),
-        column(UInt32Array::from_iter_values(rows.iter().map(|it| it.view))),
-        column(StringArray::from_iter(rows.iter().map(|it| it.cause_key.as_deref()))),
-        dict(rows.iter().map(|it| it.cause_kind)),
-        column(StringArray::from_iter(rows.iter().map(|it| it.what))),
-        column(UInt32Array::from_iter(rows.iter().map(|it| Some(it.weight)))),
+    let columns: Vec<Column> = vec![
+        Column::values(rows.iter().map(|it| it.build_id), Global),
+        Column::texts_of(rows.iter().map(|it| it.query_key.as_str()), Global),
+        dict(rows.iter().map(|it| Some(it.kind))).map_err(err)?,
+        dict(rows.iter().map(|it| Some(it.outcome.name()))).map_err(err)?,
+        Column::opt_texts_of(rows.iter().map(|it| it.cause), Global),
+        Column::values(rows.iter().map(|it| it.view), Global),
+        Column::opt_texts_of(rows.iter().map(|it| it.cause_key.as_deref()), Global),
+        dict(rows.iter().map(|it| it.cause_kind)).map_err(err)?,
+        Column::opt_texts_of(rows.iter().map(|it| it.what), Global),
+        Column::values(rows.iter().map(|it| it.weight), Global),
     ];
-    RecordBatch::try_new(batches::schema_of(&schema::PROVENANCE), columns)
+    columns::batch(&schema::PROVENANCE, columns)
 }
 
 /// The `key_parts` rows of `rows`.
-pub fn key_parts(misses: &[KeyedMiss]) -> Result<RecordBatch, ArrowError> {
+pub fn key_parts(misses: &[KeyedMiss]) -> Result<Batch, BatchError> {
+    let err = BatchError::of(&schema::KEY_PARTS);
     // Each miss's rows: its parts, or one with none when its key exposes none.
     let rows = || {
         misses.iter().flat_map(|miss| {
@@ -479,41 +483,41 @@ pub fn key_parts(misses: &[KeyedMiss]) -> Result<RecordBatch, ArrowError> {
         })
     };
     let text = |of: fn(Option<&KeyPart>) -> Option<&str>| {
-        column(StringArray::from_iter(rows().map(|(_, part)| of(part))))
+        Column::opt_texts_of(rows().map(|(_, part)| of(part)), Global)
     };
     // alloc: a batch's columns, once a flush
-    let columns: Vec<ArrayRef> = vec![
-        column(UInt64Array::from_iter_values(rows().map(|(miss, _)| miss.build_id))),
-        dict(rows().map(|(miss, _)| Some(miss.step))),
-        column(StringArray::from_iter_values(rows().map(|(miss, _)| miss.item.as_str()))),
-        column(StringArray::from_iter_values(rows().map(|(miss, _)| miss.key.as_str()))),
+    let columns: Vec<Column> = vec![
+        Column::values(rows().map(|(miss, _)| miss.build_id), Global),
+        dict(rows().map(|(miss, _)| Some(miss.step))).map_err(err)?,
+        Column::texts_of(rows().map(|(miss, _)| miss.item.as_str()), Global),
+        Column::texts_of(rows().map(|(miss, _)| miss.key.as_str()), Global),
         text(|part| part.map(|it| it.name.as_str())),
         text(|part| part.and_then(|it| it.hash.as_deref())),
         text(|part| part.and_then(|it| it.names.as_deref())),
-        column(StringArray::from_iter(rows().map(|(miss, _)| miss.beyond))),
+        Column::opt_texts_of(rows().map(|(miss, _)| miss.beyond), Global),
     ];
-    RecordBatch::try_new(batches::schema_of(&schema::KEY_PARTS), columns)
+    columns::batch(&schema::KEY_PARTS, columns)
 }
 
 /// The `misses` rows of `rows`.
-pub fn misses(rows: &[MissRow]) -> Result<RecordBatch, ArrowError> {
-    let text =
-        |of: fn(&MissRow) -> Option<&str>| column(StringArray::from_iter(rows.iter().map(of)));
+pub fn misses(rows: &[MissRow]) -> Result<Batch, BatchError> {
+    let err = BatchError::of(&schema::MISSES);
+    let text = |of: fn(&MissRow) -> Option<&str>| Column::opt_texts_of(rows.iter().map(of), Global);
     // alloc: a batch's columns, once a flush
-    let columns: Vec<ArrayRef> = vec![
-        column(UInt64Array::from_iter_values(rows.iter().map(|it| it.build_id))),
-        dict(rows.iter().map(|it| Some(it.step.as_str()))),
-        column(StringArray::from_iter_values(rows.iter().map(|it| it.item.as_str()))),
-        dict(rows.iter().map(|it| Some(it.cause))),
+    let columns: Vec<Column> = vec![
+        Column::values(rows.iter().map(|it| it.build_id), Global),
+        dict(rows.iter().map(|it| Some(it.step.as_str()))).map_err(err)?,
+        Column::texts_of(rows.iter().map(|it| it.item.as_str()), Global),
+        dict(rows.iter().map(|it| Some(it.cause))).map_err(err)?,
         text(|it| it.what.as_deref()),
         text(|it| it.names.as_deref()),
         text(|it| it.was.as_deref()),
         text(|it| it.now.as_deref()),
-        column(UInt32Array::from_iter(rows.iter().map(|it| it.changed))),
-        column(UInt32Array::from_iter(rows.iter().map(|it| it.of))),
-        column(UInt64Array::from_iter(rows.iter().map(|it| it.since))),
+        Column::options(rows.iter().map(|it| it.changed), Global),
+        Column::options(rows.iter().map(|it| it.of), Global),
+        Column::options(rows.iter().map(|it| it.since), Global),
     ];
-    RecordBatch::try_new(batches::schema_of(&schema::MISSES), columns)
+    columns::batch(&schema::MISSES, columns)
 }
 
 /// The most text one batch of a fact table holds. Arrow's `Utf8` columns address their bytes
@@ -556,8 +560,8 @@ pub fn in_batches<T>(
     rows: &[T],
     text_bytes: impl Fn(&T) -> usize,
     most: usize,
-    batch: impl Fn(&[T]) -> Result<RecordBatch, ArrowError>,
-) -> Result<Vec<RecordBatch>, ArrowError> {
+    batch: impl Fn(&[T]) -> Result<Batch, BatchError>,
+) -> Result<Vec<Batch>, BatchError> {
     if rows.is_empty() {
         return Ok(vec![batch(rows)?]); // alloc: a flush's parts, once a flush
     }
@@ -608,19 +612,8 @@ impl MissRow {
     }
 }
 
-fn column(array: impl arrow_array::Array + 'static) -> ArrayRef {
-    // alloc: a batch's column, once a flush
-    std::sync::Arc::new(array)
-}
-
-fn dict<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
-    column(values.collect::<DictionaryArray<UInt32Type>>())
-}
-
 #[cfg(test)]
 mod tests {
-    use arrow_array::{Array, cast::AsArray};
-
     use super::*;
 
     /// Every row lands in exactly one run, in order, and a run holds more than `most` bytes of
@@ -656,7 +649,7 @@ mod tests {
         let most = 10 * row.text_bytes();
         let rows = vec![row; 25];
         let batches = in_batches(&rows, KeyedMiss::text_bytes, most, key_parts).unwrap();
-        assert_eq!(batches.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(), [10, 10, 5]);
+        assert_eq!(batches.iter().map(Batch::num_rows).collect::<Vec<_>>(), [10, 10, 5]);
         assert_eq!(in_batches(&[], KeyedMiss::text_bytes, most, key_parts).unwrap().len(), 1);
     }
 
@@ -679,10 +672,8 @@ mod tests {
             },
         ])
         .unwrap();
-        let outcome = links.column(3).as_dictionary::<UInt32Type>();
-        let names = outcome.values().as_string::<i32>();
-        let said: Vec<&str> =
-            outcome.keys().iter().map(|it| names.value(it.unwrap() as usize)).collect();
+        let outcome = links.column(3);
+        let said: Vec<&str> = (0..outcome.len()).map(|it| outcome.text(it).unwrap()).collect();
         assert_eq!(said, ["patched", "placed"]);
         assert!(links.column(2).is_null(1) && links.column(4).is_null(1));
 
@@ -693,8 +684,7 @@ mod tests {
             kind: DepKind::Build,
         }])
         .unwrap();
-        let kind = deps.column(3).as_dictionary::<UInt32Type>();
-        assert_eq!(kind.values().as_string::<i32>().value(kind.keys().value(0) as usize), "build");
+        assert_eq!(deps.column(3).text(0), Some("build"));
     }
 
     #[test]
@@ -723,17 +713,14 @@ mod tests {
         let batch = provenance(&[changed, read]).unwrap();
         let weight = batch.column(schema::PROVENANCE.column("weight").unwrap());
         assert_eq!(
-            weight.as_primitive::<UInt32Type>().values().to_vec(),
+            weight.u32s().unwrap().values().to_vec(),
             vec![1u32, 64],
             "a sample of the runs past the log's bound says how many it stands for"
         );
         let at = |name: &str| schema::PROVENANCE.column(name).unwrap();
-        assert_eq!(
-            batch.column(at("cause_key")).as_string::<i32>().value(0),
-            "`FileText.text`(Id(2))"
-        );
+        assert_eq!(batch.column(at("cause_key")).text(0), Some("`FileText.text`(Id(2))"));
         assert!(batch.column(at("cause")).is_null(1) && batch.column(at("cause_key")).is_null(1));
-        assert_eq!(batch.column(at("what")).as_string::<i32>().value(1), "the proc macro's output");
+        assert_eq!(batch.column(at("what")).text(1), Some("the proc macro's output"));
 
         let part = |name: &str, hash: &str| KeyPart {
             name: name.into(),
@@ -759,19 +746,16 @@ mod tests {
             },
         ])
         .unwrap();
-        assert_eq!(
-            parts.column(schema::KEY_PARTS.column("hash").unwrap()).as_string::<i32>().value(0),
-            "cd"
-        );
+        assert_eq!(parts.column(schema::KEY_PARTS.column("hash").unwrap()).text(0), Some("cd"));
         // A row a part, and one with no part for the key that exposes none, each with its
         // miss's item.
-        let text = |name: &str| parts.column(schema::KEY_PARTS.column(name).unwrap()).as_string::<i32>();
+        let text = |name: &str| parts.column(schema::KEY_PARTS.column(name).unwrap());
         assert_eq!(parts.num_rows(), 3);
-        assert_eq!(text("part").value(1), "env LD");
-        assert_eq!(text("item").value(1), "app v0.1.0 (lib)");
+        assert_eq!(text("part").text(1), Some("env LD"));
+        assert_eq!(text("item").text(1), Some("app v0.1.0 (lib)"));
         assert!(text("part").is_null(2) && text("hash").is_null(2));
-        assert_eq!(text("item").value(2), "lib v0.1.0 (lib)");
-        assert_eq!(text("beyond").value(1), "its process variables");
+        assert_eq!(text("item").text(2), Some("lib v0.1.0 (lib)"));
+        assert_eq!(text("beyond").text(1), Some("its process variables"));
         assert!(text("beyond").is_null(2));
     }
 }

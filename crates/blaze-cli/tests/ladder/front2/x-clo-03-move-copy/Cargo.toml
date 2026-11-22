@@ -1,0 +1,4 @@
+[package]
+name = "ladder-x-clo-03-move-copy"
+version = "0.1.0"
+edition = "blaze-2026.11"

@@ -1,0 +1,15 @@
+{
+ "id": "names-row-wall-is-a-cover-of-filed-tasks",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), D167 (a)+(b) writer",
+ "where": "crates/blaze-cli/src/engine_times.rs Times::fold (a row's wall is first start to last end of the intervals filed in it); engine_scripts.rs Pipeline::collect files tasks by (wave, name) order, not by when they ran",
+ "what": "tempo's profile showed 'Names 7' with a wall of about 41.7 s for 3 tasks of a few ms each, which read as a phase waiting 41 s. It was not waiting: its three tasks ran about 41.7 s apart and were filed into one row because they share a phase, so the row's wall is the cover of their intervals, mostly other rows' work.",
+ "cost": "about an hour reading the pipeline before the profile could be trusted",
+ "cause": "a pipelined phase's row has no wall of its own; the fold gave it the span of whatever was filed in it",
+ "whys": "PhaseTime was designed for phases run whole, one after another; the pipeline made rows overlap and nothing said what a row's wall was made of",
+ "class": "a time printed as a stage's that is a cover of others' work: any total with no account of its parts",
+ "prevention": "done in D167 (b): each Names/Scripts row and stage now reads wall = its tasks + other tasks + coordinator stretches + unaccounted, with an UNACCOUNTED line over 1% (engine_times.rs Account)",
+ "annoyance": "a row named by its phase reads as a phase that ran for its wall",
+ "workaround": "read the row's account line, not its wall",
+ "state": "fixed"
+}

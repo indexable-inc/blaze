@@ -1,0 +1,55 @@
+[package]
+name = "blaze-lower"
+description = "Rust source text to signature records and body records, straight from the parser's events with no syntax tree: syntactic types in columns, one task per item, bodies in post-order columns with locals, labels and rustc's desugarings resolved, every position item-relative (docs/v2/plan/design/bottom.md, `Signature`, `Body`)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# The producers this crate's code makes values for (decision D105,
+# docs/v2/plan/design/producer-id.md): its source and its workspace dependencies' are the row.
+[package.metadata.blaze]
+producer = ["lowering"]
+
+[lib]
+doctest = false
+
+[dependencies]
+# By path, as blaze-typeck takes them: the workspace entries turn on features this crate does not use.
+blaze-format-core.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-own.workspace = true
+blaze-surface.workspace = true
+blaze-file-items.workspace = true
+blaze-typeck.workspace = true
+# `Fragment`: what a body's macro call is parsed as. The expansion itself comes through the
+# caller's `Expand` (this crate stays sans-IO and names no definition).
+blaze-expand.workspace = true
+# `Names::macro_definition`: `scoped::Scoped`, a body call's path resolved in its module, any
+# crate (a read of the names already made: no IO).
+blaze-scope.workspace = true
+parser.workspace = true
+
+[dev-dependencies]
+# `check`, `control`: the scope property, the record-equality property, the plant's control.
+blaze-sim.workspace = true
+# `Alloc::global()`: the older tests' and the example's handle; `testing`: `testing::heap()`,
+# the allocator tests/asm.rs takes.
+blaze-own = { workspace = true, features = ["std", "testing"] }
+# `fixture`: rung 7c's world, for `typeck_tests` (bodies from text checked by `InferCtx`).
+blaze-typeck = { workspace = true, features = ["testing"] }
+# `CrateItemKey`: the crate the tests' `macro_rules!` definitions are written in.
+blaze-id.workspace = true
+# `scoped_tests`: the two crates' `Implicit` (Rust's std and prelude) for `resolve_crates`.
+blaze-unit-graph.workspace = true
+# `ScriptCx` over a script record: `include!(concat!(env!("OUT_DIR"), ..))` in `scoped_tests`.
+blaze-build-script.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true

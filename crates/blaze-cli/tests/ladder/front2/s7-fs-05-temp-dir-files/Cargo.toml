@@ -1,0 +1,4 @@
+[package]
+name = "ladder-s7-fs-05-temp-dir-files"
+version = "0.1.0"
+edition = "2024"

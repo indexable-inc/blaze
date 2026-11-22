@@ -25,6 +25,7 @@
 //! Mach services, `blaze-cargo/src/sandbox/macos.rs`): it filters no system call by number and
 //! macOS has one wait driver, so there is nothing of this to run there.
 
+use blaze_sys::{Errno, linux, posix::{net, types::pid_t}};
 use std::{
     panic::{UnwindSafe, catch_unwind},
     time::Duration,
@@ -64,35 +65,23 @@ pub enum Ended {
 ///
 /// When the kernel refuses the filter.
 pub fn refuse_io_uring() {
-    let insn =
-        |code: u32, jt: u8, jf: u8, k: u32| libc::sock_filter { code: code as u16, jt, jf, k };
+    let insn = |code, jt, jf, k| linux::SockFilter { code, jt, jf, k };
     let (load, jump, ret) = (
-        libc::BPF_LD | libc::BPF_W | libc::BPF_ABS,
-        libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
-        libc::BPF_RET | libc::BPF_K,
+        net::BPF_LD | net::BPF_W | net::BPF_ABS,
+        net::BPF_JMP | net::BPF_JEQ | net::BPF_K,
+        net::BPF_RET | net::BPF_K,
     );
-    let mut filter = [
+    let filter = [
         // The call's number, which is `io_uring_setup`'s or not.
         insn(load, 0, 0, 0),
-        insn(jump, 0, 1, libc::SYS_io_uring_setup as u32),
-        insn(ret, 0, 0, libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32),
-        insn(ret, 0, 0, libc::SECCOMP_RET_ALLOW),
+        insn(jump, 0, 1, linux::nr::IO_URING_SETUP as u32),
+        insn(ret, 0, 0, net::SECCOMP_RET_ERRNO | u32::from(Errno::NoSys.raw())),
+        insn(ret, 0, 0, net::SECCOMP_RET_ALLOW),
     ];
-    let program = libc::sock_fprog { len: filter.len() as u16, filter: filter.as_mut_ptr() };
-    let (on, no): (libc::c_ulong, libc::c_ulong) = (1, 0);
-    // SAFETY: `prctl` with integer arguments, each the `unsigned long` it reads; `seccomp`
-    // reads `program` and the filter it points at, both live for the call, and keeps a copy
-    // of its own.
-    unsafe {
-        assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, on, no, no, no), 0, "no_new_privs");
-        let installed = libc::syscall(
-            libc::SYS_seccomp,
-            libc::SECCOMP_SET_MODE_FILTER,
-            0,
-            std::ptr::from_ref(&program),
-        );
-        assert_eq!(installed, 0, "seccomp: {}", std::io::Error::last_os_error());
-    }
+    assert_eq!(linux::prctl(linux::Prctl::NoNewPrivs), Ok(()), "no_new_privs");
+    linux::seccomp_filter(&filter, linux::SeccompFlags::NONE).unwrap_or_else(|error| {
+        panic!("seccomp: {}", std::io::Error::from_raw_os_error(i32::from(error.raw())))
+    });
 }
 
 /// What `io_uring_setup` answers this thread: the error's number.
@@ -104,7 +93,7 @@ pub fn io_uring_setup_errno() -> Option<i32> {
     // SAFETY: a null `io_uring_params`, which a kernel that takes the call refuses (`EFAULT`)
     // before it makes anything.
     let made = unsafe {
-        libc::syscall(libc::SYS_io_uring_setup, 8u32, std::ptr::null_mut::<libc::c_void>())
+        libc::syscall(linux::nr::IO_URING_SETUP as core::ffi::c_long, 8u32, std::ptr::null_mut::<core::ffi::c_void>())
     };
     assert!(made < 0, "io_uring_setup with no parameters made a ring");
     std::io::Error::last_os_error().raw_os_error()
@@ -142,7 +131,7 @@ pub fn take_over(cases: &[Case]) {
     };
     let code = match run_case(move || {
         refuse_io_uring();
-        assert_eq!(io_uring_setup_errno(), Some(libc::ENOSYS), "the filter is not in force");
+        assert_eq!(io_uring_setup_errno(), Some(i32::from(Errno::NoSys.raw())), "the filter is not in force");
         let waits = super::choose_from_env().unwrap_or_else(|refused| panic!("{refused}"));
         (case.run)(waits)
     }) {
@@ -186,7 +175,7 @@ pub fn run(case: &'static str, marked: bool, within: Duration) -> Ended {
     let mut child = command.spawn().unwrap_or_else(|why| panic!("starting the case `{case}`: {why}"));
     let clock = Monotonic::new();
     let deadline = Some(Deadline::after(clock.now(), within));
-    let pid = libc::pid_t::try_from(child.id()).unwrap_or_else(|_| panic!("a pid past pid_t"));
+    let pid = pid_t::try_from(child.id()).unwrap_or_else(|_| panic!("a pid past pid_t"));
     let what = "a test's case run again under a filter that refuses io_uring";
     let waited =
         super::exited(what, pid, deadline, &clock).unwrap_or_else(|why| panic!("`{case}`: {why}"));
@@ -207,10 +196,7 @@ pub fn run(case: &'static str, marked: bool, within: Duration) -> Ended {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd},
-        sync::Arc,
-    };
+    use std::sync::Arc;
 
     use super::*;
     use crate::wait::{Parker, exited, pollable, sleep_until};
@@ -240,19 +226,14 @@ mod tests {
 
         sleep_until("a filtered test's sleep", soon(&clock), &clock).unwrap();
 
-        let mut ends = [0; 2];
-        // SAFETY: two descriptors for the kernel to write.
-        assert_eq!(unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
-        // SAFETY: the pipe's two ends, which no one else holds.
-        let (read, write) =
-            unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+        let (read, write) = linux::pipe2(linux::PipeFlags::CLOSE_ON_EXEC).expect("create test pipe");
         let what = "a filtered test's pipe";
-        let polled = pollable(what, read.as_raw_fd(), libc::POLLIN, Some(soon(&clock)), &clock);
+        let events = linux::PollEvents::IN.bits();
+        let polled = pollable(what, read.fd().raw(), events, Some(soon(&clock)), &clock);
         assert_eq!(polled.unwrap(), Waited::Deadline, "an empty pipe polled readable");
-        // SAFETY: one byte of a live local written to the pipe's own end.
-        assert_eq!(unsafe { libc::write(write.as_raw_fd(), [1u8].as_ptr().cast(), 1) }, 1);
-        match pollable(what, read.as_raw_fd(), libc::POLLIN, long(&clock), &clock).unwrap() {
-            Waited::Ready(revents) => assert_ne!(revents & libc::POLLIN, 0),
+        assert_eq!(linux::write(write.fd(), &[1]), Ok(1));
+        match pollable(what, read.fd().raw(), events, long(&clock), &clock).unwrap() {
+            Waited::Ready(revents) => assert_ne!(revents & events, 0),
             Waited::Deadline => panic!("a written pipe did not poll readable within 60 s"),
         }
 

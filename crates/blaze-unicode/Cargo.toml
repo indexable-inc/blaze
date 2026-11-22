@@ -1,0 +1,20 @@
+[package]
+name = "blaze-unicode"
+description = "The Unicode properties blaze reads (identifiers, display width, emoji, two general categories, legacy grapheme clusters, NFD), from tables generated from the Unicode Character Database; no dependency"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dev-dependencies]
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

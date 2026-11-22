@@ -1,0 +1,33 @@
+[package]
+name = "blaze-body-lower"
+description = "The one lowering (docs/v2/plan/design/backend-next.md, \"One lowering\", D119): a checked body to a blaze-body Body, generic, with every value written out and unwind edges and cleanup blocks from the start"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# core only beside the crates it names; the allocator is a value the caller passes in.
+[dependencies]
+# `Body`, `BodyBuilder` and every row form: what the lowering writes.
+blaze-body.workspace = true
+# `Facts`, `AdtFacts`, `CalleeFacts`: the input seam blaze-flow-lower already takes, kept so
+# both lowerings are asked the same questions until the switch.
+blaze-flow-lower.workspace = true
+# `Vec`: the lowering's scratch tables, in the allocator it is given.
+blaze-own.workspace = true
+# `BodyView`, `Checked`, `PTy`, `PNode`: the checked body read.
+blaze-typeck.workspace = true
+
+[dev-dependencies]
+blaze-typeck = { workspace = true, features = ["testing"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

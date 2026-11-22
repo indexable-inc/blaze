@@ -11,13 +11,14 @@
 
 use std::{collections::BTreeMap, fmt, fmt::Write as _, panic::Location, path::Path};
 
-use arrow_array::RecordBatch;
 use blaze_core::lock::{Awaits, LockWait, Probe};
 use blaze_graph::wait::WaitKind;
 use serde_derive::Serialize;
 
 use crate::{
-    clock, flight,
+    clock,
+    columns::Batch,
+    flight,
     gate::{self, GateError},
     sql::{self, SqlError},
 };
@@ -109,7 +110,7 @@ impl fmt::Display for At {
 /// moving lock waits to a row kind of their own is a change to this one function (and the view).
 pub fn record(wait: &LockWait) {
     let holder = wait.holder;
-    tracing::info!(
+    blaze_trace::info!(
         target: "blaze::lock",
         lock = wait.lock,
         value_type = wait.value_type,
@@ -181,7 +182,7 @@ pub struct Ranked {
 pub const SITES_SHOWN: usize = 3;
 
 pub const ARC_SWAP: &str = "arc-swap or RCU";
-pub const MAP: &str = "papaya::HashMap (shared) or blaze_hash::HashMap behind one owner";
+pub const MAP: &str = "blaze_core::SharedMap (shared) or blaze_hash::HashMap behind one owner";
 pub const ATOMIC: &str = "an atomic";
 pub const CHANNEL: &str = "a crossbeam channel";
 pub const OWNER: &str = "move it into its owner and send it messages";
@@ -196,7 +197,7 @@ const ATOMIC_TYPES: [&str; 13] = [
 /// that holds:
 /// - reads are 80% or more of the waits and most holders that said themselves wrote: arc-swap
 ///   or RCU;
-/// - a map or set: `papaya::HashMap`, or `blaze_hash::HashMap` behind one owner;
+/// - a map or set: `blaze_core::SharedMap`, or `blaze_hash::HashMap` behind one owner;
 /// - an integer or bool: an atomic;
 /// - a `VecDeque` or `Vec` that waiters on two threads or more wait for: a crossbeam channel;
 /// - every holder that said itself is one thread: move the value into that owner;
@@ -422,7 +423,7 @@ fn unsigned(it: Vec<i64>) -> impl Iterator<Item = u64> {
     it.into_iter().map(|it| u64::try_from(it).unwrap_or(0))
 }
 
-fn read_rows(batches: &[RecordBatch]) -> Result<Vec<Row>, String> {
+fn read_rows(batches: &[Batch]) -> Result<Vec<Row>, String> {
     let s = |at| gate::strings(batches, at);
     let (lock, value_type, mode, site) = (s(0)?, s(1)?, s(2)?, s(3)?);
     let (thread, wait_ns) = (gate::i64s(batches, 4)?, gate::i64s(batches, 5)?);
@@ -457,7 +458,7 @@ fn read_rows(batches: &[RecordBatch]) -> Result<Vec<Row>, String> {
     Ok(out)
 }
 
-fn read_stalls(batches: &[RecordBatch]) -> Result<Vec<Stalled>, String> {
+fn read_stalls(batches: &[Batch]) -> Result<Vec<Stalled>, String> {
     let (t_ns, kind, line) =
         (gate::i64s(batches, 0)?, gate::strings(batches, 1)?, gate::strings(batches, 2)?);
     let (head, waiters) = (unsigned(gate::i64s(batches, 3)?), unsigned(gate::i64s(batches, 4)?));
@@ -639,7 +640,7 @@ mod tests {
 
     #[test]
     fn a_lock_wait_event_is_kept_by_the_recorder() {
-        assert!(crate::logs::keeps_event(TARGET, "event src/locks.rs:1", tracing::Level::INFO));
-        assert!(crate::logs::keeps_event(STALL_TARGET, "event src/x.rs:1", tracing::Level::INFO));
+        assert!(crate::logs::keeps_event(TARGET, "event src/locks.rs:1", blaze_trace::Level::INFO));
+        assert!(crate::logs::keeps_event(STALL_TARGET, "event src/x.rs:1", blaze_trace::Level::INFO));
     }
 }

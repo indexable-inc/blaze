@@ -6,7 +6,7 @@ date: 2026-11-10
 # Debug info beside the executable
 
 Hello world's dev executable is 162,021,720 bytes, written, hashed and placed every edit, and
-linked twice. Follows [item-hash.md](item-hash.md) section 13, [patch-in-place.md](patch-in-place.md).
+linked twice. Follows [item-hash.md](item-hash.md) section 13.
 
 ## What the 162 MB is (from the code; the split needs measuring)
 
@@ -16,7 +16,7 @@ mangled names (1 to 3 MB, which `.strtab` holds again). **At least 134,217,728 o
 162,021,720 bytes (82.8%) are the two patch regions' room** (64 MiB each, in the file up to
 its end, `elf/image.rs` `tail`); the other 27.8 MB is code, data, unwind tables, each growing
 region's doubled room, the symbol table and the debug info. Measure with `readelf -SW` /
-`otool -l`, `du` against `ls -l`. The room out of the file: [patch-in-place.md](patch-in-place.md).
+`otool -l`, `du` against `ls -l`.
 
 ## Where debug info goes
 

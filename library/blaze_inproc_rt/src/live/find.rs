@@ -42,14 +42,22 @@ mod unix {
     };
 
     use super::super::{DESCRIPTOR, Descriptor, mem};
+    #[cfg(target_os = "macos")]
+    use blaze_sys::posix::thread as dyld;
 
     /// The image that has `address`: where it starts and its path as the loader has it.
-    fn image_of(address: *const c_void) -> Option<(u64, *const libc::c_char)> {
+    #[cfg(not(target_os = "macos"))]
+    fn image_of(address: *const c_void) -> Option<(u64, *const core::ffi::c_char)> {
         // SAFETY: a `Dl_info` is plain pointers, for which zero is a value.
         let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
         // SAFETY: `info` is a whole `Dl_info` for dladdr to fill.
         (unsafe { libc::dladdr(address, &mut info) } != 0)
             .then_some((info.dli_fbase as u64, info.dli_fname))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn image_of(address: *const c_void) -> Option<(u64, *const core::ffi::c_char)> {
+        dyld::address_info(address).map(|info| (info.dli_fbase as u64, info.dli_fname))
     }
 
     /// Where the image that has `address` starts, for the platforms' check that a patch's data
@@ -80,6 +88,10 @@ mod unix {
         if handle.is_null() {
             return None;
         }
+        #[cfg(target_os = "macos")]
+        // SAFETY: the handle is open and the name is NUL-terminated.
+        let found = unsafe { dyld::symbol(handle, name) }?.as_ptr();
+        #[cfg(not(target_os = "macos"))]
         // SAFETY: the handle is open, the name ends in a zero.
         let found = unsafe { libc::dlsym(handle, name.as_ptr()) };
         (!found.is_null() && image_of(found)?.0 == base).then_some(found as u64)
@@ -104,6 +116,10 @@ mod unix {
         let own = descriptor as fn() -> Result<(u64, &'static [u8]), String> as *const c_void;
         let (base, path) =
             image_of(own).ok_or("the loader knows no image of the dev runtime's own code")?;
+        #[cfg(target_os = "macos")]
+        // SAFETY: a null path asks for the program's handle, which is never unloaded.
+        let program = unsafe { dyld::dlopen(std::ptr::null(), dyld::RtldFlags::LAZY.bits()) };
+        #[cfg(not(target_os = "macos"))]
         // SAFETY: a null path asks for the program's handle, which is never unloaded.
         let program = unsafe { libc::dlopen(std::ptr::null(), libc::RTLD_LAZY) };
         if let Some(found) = lookup(program, &name, base) {
@@ -118,11 +134,21 @@ mod unix {
             })
             .filter(|it| !it.is_empty());
         if let Some(path) = path {
+            #[cfg(target_os = "macos")]
+            // SAFETY: the path is NUL-terminated, NOLOAD opens nothing new, and we close below.
+            let handle = unsafe {
+                dyld::dlopen(path.as_ptr(), (dyld::RtldFlags::LAZY | dyld::RtldFlags::NOLOAD).bits())
+            };
+            #[cfg(not(target_os = "macos"))]
             // SAFETY: NOLOAD opens nothing new; the handle is closed below.
             let handle =
                 unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_LAZY | libc::RTLD_NOLOAD) };
             let found = lookup(handle, &name, base);
             if !handle.is_null() {
+                #[cfg(target_os = "macos")]
+                // SAFETY: opened above; the image stays loaded, as it was before.
+                unsafe { dyld::dlclose(handle) };
+                #[cfg(not(target_os = "macos"))]
                 // SAFETY: opened above; the image stays loaded, as it was before.
                 unsafe { libc::dlclose(handle) };
             }

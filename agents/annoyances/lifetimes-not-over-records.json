@@ -1,0 +1,15 @@
+{
+ "id": "lifetimes-not-over-records",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane FK",
+ "where": "crates/blaze-ladder/src/front2/lifetimes.rs (Reader, Store::fn_life/adt_life/container_life); tables/head.rs export",
+ "what": "Putting the lifetime parts into the frozen head record failed at the first step: lifetimes.rs read signatures only through solved `&Names` (Resolver { names }, names.item_text), while freeze runs over `Records`, whose `solved()` is None. Its container lives were also keyed by library key, while an impl's head is filed by checker key, so an impl's ContainerLife had no home a seeded store could file it under.",
+ "cost": "about an hour of reading before the first edit",
+ "cause": "the lifetime reader was written for the old one-world front end and only tests called its Store accessors; production borrow check reads lifetimes from text (blaze_flow_lower read_signature)",
+ "whys": "two readers of one signature's lifetimes (the store's and the flow lowerer's) with no record between them, so nothing forced the store's one onto the record path",
+ "class": "a head part made by a reader bound to one names source: it silently cannot exist in a record built over the other",
+ "prevention": "done: lifetimes.rs is generic over NamesSource (Paths { names }, text_of, home_of); container lives keyed by checker key; head_record form 10 holds every part made or refused. Left: the borrow check should read FnLife from the head record, not reparse text (one reader)",
+ "annoyance": "the runner's ask moved to the background after 180 s though run in the foreground with a 600 s timeout",
+ "workaround": "read the task's output file once it reported done",
+ "state": "partly fixed"
+}

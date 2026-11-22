@@ -44,7 +44,7 @@ mod reaping;
 mod retry;
 
 pub use self::{
-    choice::{MarkRefused, SANDBOXED, Waits, choose, choose_from_env},
+    choice::{MarkRefused, SANDBOXED, Waits, choose, choose_from, choose_from_env, waits_of},
     retry::{Clock, Deadline, Once, WaitError, Waited},
 };
 
@@ -106,6 +106,22 @@ pub use self::windows::{signaled, sleep_until};
 
 #[cfg(test)]
 mod tests;
+
+/// How long ago this process began, on the clock a driver's `now()` reads, so that a stamp on
+/// it can say time since the process started: macOS asks `proc_pid_rusage` (`wait/macos.rs`,
+/// exact), Linux `/proc/self/stat` (`wait/linux.rs`, in 10 ms steps). Another system says
+/// it cannot.
+pub fn process_age() -> std::io::Result<Duration> {
+    #[cfg(target_os = "macos")]
+    return macos::process_age();
+    #[cfg(target_os = "linux")]
+    return linux::process_age();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "blaze_core::wait::process_age: this system's process start is not asked yet",
+    ))
+}
 
 /// The system's monotonic clock, counted from an origin: for code that has no driver to ask
 /// for `now()`. A driver's own clock is one of these on the instant it began
@@ -179,9 +195,55 @@ pub fn until<T>(
             None,
         )
     });
-    let waited = retry::drive(retry::Retry::new(what, deadline, clock.now()), &mut (clock, once));
+    let waited = unlisted(what, clock, deadline, once);
     drop(registered);
     waited
+}
+
+/// [`until`] without the wait-for graph's row: for a wait whose caller is the row already (a
+/// lock's acquire, a [`crate::lock::Signal`]'s wait), so a thread waits on one thing in the
+/// graph, and so a lock's wait asks nothing of the probe (whose own calls may take locks).
+pub(crate) fn unlisted<T>(
+    what: &'static str,
+    clock: &impl Clock,
+    deadline: Option<Deadline>,
+    once: impl FnMut(Option<Duration>) -> std::io::Result<Once<T>>,
+) -> Result<Waited<T>, WaitError> {
+    retry::drive(retry::Retry::new(what, deadline, clock.now()), &mut (clock, once))
+}
+
+/// Sleeps while `word` holds `expected`, until a [`word_wake`] of it or `deadline` on `clock`
+/// (forever for `None`): the futex of a lock's word ([`crate::lock::raw`]), which any number of
+/// threads of this process wait on at once. `Ready` when woken, when the word no longer held
+/// `expected` or on a return with nothing (the caller looks at the word again), `Deadline`
+/// once it passed. The kernel compares the word and blocks in one step, so a wake between the
+/// caller's look and its wait is not lost. No row in the wait-for graph: the lock's is the row.
+///
+/// - Linux: `futex(FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG)` directly, on either driver
+///   ([`choose`]): a lock is waited for by threads that have no ring, and by a thread whose
+///   ring is in use, so it needs none.
+/// - macOS: `os_sync_wait_on_address_with_deadline` (`wait/macos.rs`), as a park.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn word_wait(
+    what: &'static str,
+    word: &crate::atomic::AtomicU32,
+    expected: u32,
+    deadline: Option<Deadline>,
+    clock: &impl Clock,
+) -> Result<Waited<()>, WaitError> {
+    #[cfg(target_os = "linux")]
+    return direct::word_wait(what, word, expected, deadline, clock);
+    #[cfg(target_os = "macos")]
+    return macos::word_wait(what, word, expected, deadline, clock);
+}
+
+/// Wakes one thread sleeping in [`word_wait`] on `word`, or every one (`all`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn word_wake(word: &crate::atomic::AtomicU32, all: bool) {
+    #[cfg(target_os = "linux")]
+    direct::word_wake(word, all);
+    #[cfg(target_os = "macos")]
+    macos::word_wake(word, all);
 }
 
 /// Sleeps while the low 32 bits of `word` hold `expected`, until a [`wake_shared`] of it from
@@ -257,6 +319,23 @@ impl Parker {
         clock: &impl Clock,
     ) -> Result<Waited<()>, WaitError> {
         let plant = parking::ParkPlant::None;
+        // The thread's meter (D169): one park and its time on `clock`, the one this wait runs on.
+        let began = clock.now();
+        let parked = self.park_on(what, deadline, clock, plant);
+        let ns = u64::try_from(clock.now().saturating_sub(began).as_nanos()).unwrap_or(u64::MAX);
+        blaze_meter::add(blaze_meter::Count::Parks, 1);
+        blaze_meter::add(blaze_meter::Count::ParkNs, ns);
+        parked
+    }
+
+    /// [`Parker::park`]'s wait, on the kernel this process chose.
+    fn park_on(
+        &self,
+        what: &'static str,
+        deadline: Option<Deadline>,
+        clock: &impl Clock,
+        plant: parking::ParkPlant,
+    ) -> Result<Waited<()>, WaitError> {
         #[cfg(target_os = "linux")]
         if choice::chosen() == Waits::Direct {
             let kernel = direct::Direct(&direct::Kernel);

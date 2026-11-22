@@ -1,0 +1,30 @@
+[package]
+name = "blaze-semver"
+description = "Semantic versions (SemVer 2.0.0: pre-release and build metadata, precedence) and Cargo's version requirements (caret, tilde, wildcard, comparison sets, the pre-release rule) with no dependencies; identifiers up to 23 bytes inline, longer ones in the allocator the caller names; typed errors with the byte offset; `no_std`, no `alloc`"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `String<A>` for an identifier past the inline size, and `Vec` for a requirement's comparators.
+blaze-own.workspace = true
+# Versions and requirements as values (their text), read strictly (`data`).
+blaze-data.workspace = true
+
+[dev-dependencies]
+# Properties: precedence is a total order consistent with equality, display parses back, and
+# a requirement agrees with its own interval; with a planted-bug control.
+blaze-sim.workspace = true
+# `blaze_own::testing::heap()`: a test's root allocator (D102), in place of `Global`.
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,14 @@
+{
+ "id": "rc-1",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane RC (tempo's check converges) under rebuild-1115",
+ "where": "lane brief; crates/blaze-cli/src/body_types/heads.rs; crates/blaze-drive/src/request.rs",
+ "what": "The brief named crates/blaze-cli/src/head_digest.rs, which does not exist: `heads_of` and `want_digest` are in crates/blaze-ladder/src/front2/project/head_digest.rs, a file the brief forbade. The cause of tempo's non-convergence is in heads.rs (R8's), so the fix there could only be described, not made. The lane also had no Grep or Glob tool, only Read with offsets, for a 4,300-line request.rs.",
+ "cost": "about an hour of reading by offset before the mechanism was found",
+ "cause": "the brief was written from memory of the tree; the lane's tools were narrower than the brief assumed",
+ "whys": "a brief names files without a check that they exist; a write-only lane gets no search tool",
+ "class": "a brief whose file list was never checked against the tree sends the lane to a wrong or forbidden file",
+ "prevention": "the coordinator checks each path in a brief exists before sending it, and names the owner of each file the cause may be in",
+ "workaround": "exact OLD/NEW for heads.rs given in the report",
+ "state": "open"
+}

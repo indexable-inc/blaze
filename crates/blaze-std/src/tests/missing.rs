@@ -79,8 +79,11 @@ fn asked(io: &Io, name: &str) -> Option<(bool, Result<(), Missing>)> {
         "serial" => (io.serial().is_some(), need(io.need_serial())),
         "clipboard" => (io.clipboard().is_some(), need(io.need_clipboard())),
         "notify" => (io.notify().is_some(), need(io.need_notify())),
+        #[cfg(feature = "requests")]
         "http" => (io.http().is_some(), need(io.need_http())),
         "streams" => (io.streams().is_some(), need(io.need_streams())),
+        "out" => (io.out().is_some(), need(io.need_out())),
+        "err" => (io.err().is_some(), need(io.need_err())),
         _ => return None,
     })
 }
@@ -108,6 +111,10 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
             (Some(outer), false) => outer,
             _ => name,
         };
+        // `Http` is behind bstd's `net` feature: without it the flag has no accessor.
+        if cfg!(not(feature = "net")) && name == "http" {
+            continue;
+        }
         let Some((handed, needed)) = asked(&io, name) else {
             return Err(format!("Offers has the flag {name}, and this test knows no accessor for it"));
         };
@@ -154,10 +161,12 @@ fn sim_offers_everything_and_sim_with_withholds() {
 #[test]
 fn a_native_world_offers_only_what_blaze_core_has_effects_for() {
     let native = crate::host::OFFERS;
-    for name in ["fs", "env", "args", "clock", "rng", "mem", "host"] {
+    // `net` is offered but on wasi, where blaze-core has no sockets.
+    let provided = ["fs", "net", "env", "args", "clock", "rng", "mem", "host", "out", "err"];
+    for name in ["fs", "env", "args", "clock", "rng", "mem", "host", "out", "err"] {
         assert_eq!(native.offers(name), Some(true), "{name}");
     }
-    for name in &Offers::NAMES[8..] {
+    for name in Offers::NAMES.iter().filter(|name| !provided.contains(*name)) {
         assert_eq!(native.offers(name), Some(false), "a native world has no provider for {name}");
     }
 }

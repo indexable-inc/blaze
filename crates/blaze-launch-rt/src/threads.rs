@@ -23,6 +23,9 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+#[cfg(target_os = "macos")]
+use blaze_sys::posix::thread;
+
 use crate::table::{Birth, Mutator, Shared};
 
 /// The launcher's `Shared`, leaked by [`adopt`]: what [`create`] announces births to.
@@ -35,6 +38,9 @@ static KEY: AtomicUsize = AtomicUsize::new(0);
 struct Ending {
     me: Mutator,
     rounds: u8,
+    /// The thread's registration with the sampler (sample/register.rs), given back at its end
+    /// before its `Mutator` says it ended.
+    sampled: Option<crate::sample::register::Entered>,
 }
 
 /// The rounds a thread's end waits through: the program's destructors run in the earlier.
@@ -44,17 +50,26 @@ const ROUNDS: u8 = 4;
 /// calling thread (the program's main thread) its [`Mutator`], which it keeps until the
 /// process ends. Called once, before any of the program's code runs.
 pub fn adopt(shared: &Arc<Shared>) -> Result<Mutator, i32> {
-    let mut key: libc::pthread_key_t = 0;
-    // SAFETY: `key` is a live local the call fills; `ended` has the destructor's signature
-    // and lives as long as the process.
-    let refused = unsafe { libc::pthread_key_create(&mut key, Some(ended)) };
-    if refused != 0 {
-        return Err(refused);
-    }
+    #[cfg(target_os = "macos")]
+    let key = thread::key_create(Some(ended)).map_err(|error| i32::from(error.raw()))?;
+    #[cfg(not(target_os = "macos"))]
+    let key = {
+        let mut key: libc::pthread_key_t = 0;
+        // SAFETY: `key` is a live local the call fills; `ended` has the destructor's signature
+        // and lives as long as the process.
+        let refused = unsafe { libc::pthread_key_create(&mut key, Some(ended)) };
+        if refused != 0 {
+            return Err(refused);
+        }
+        key
+    };
     KEY.store(key as usize + 1, Ordering::Release);
     // One count of the `Arc` is leaked: threads announce to it for the life of the process.
     SHARED.store(Arc::into_raw(Arc::clone(shared)).cast_mut(), Ordering::Release);
-    Ok(shared.birth().begin())
+    let me = shared.birth().begin();
+    // The main thread is sampled for the life of the process (D100 point 4).
+    crate::sample::register::enter_main(me.thread().0);
+    Ok(me)
 }
 
 /// The key's destructor: `ending` is the ending thread's [`Ending`].
@@ -65,16 +80,31 @@ unsafe extern "C" fn ended(ending: *mut c_void) {
     let rounds = unsafe { &mut (*ending).rounds };
     *rounds += 1;
     if *rounds < ROUNDS {
-        let key = (KEY.load(Ordering::Acquire) - 1) as libc::pthread_key_t;
+        let key = KEY.load(Ordering::Acquire) - 1;
         // SAFETY: the key is this module's; the value is this thread's own `Ending`. Set
         // again, the system calls this destructor again in its next round.
-        if unsafe { libc::pthread_setspecific(key, ending.cast()) } == 0 {
+        #[cfg(target_os = "macos")]
+        let armed = unsafe { thread::set_specific(key as thread::pthread_key_t, ending.cast()) }.is_ok();
+        #[cfg(not(target_os = "macos"))]
+        // SAFETY: the same live key and its own Ending.
+        let armed = unsafe { libc::pthread_setspecific(key as libc::pthread_key_t, ending.cast()) } == 0;
+        if armed {
             return;
         }
     }
     // SAFETY: boxed in `run` and dropped once, here: the `Mutator`'s drop says the thread
     // ended.
-    drop(unsafe { Box::from_raw(ending) });
+    let Ending { me, rounds: _, sampled } = *unsafe { Box::from_raw(ending) };
+    // The sampler stops stopping this thread before the core is told it ended.
+    if let Some(entered) = sampled {
+        crate::sample::register::leave(entered);
+    }
+    let _ = crate::telemetry::emit(crate::telemetry::Event::thread_lifecycle(
+        crate::telemetry::current_thread_id(),
+        false,
+        crate::telemetry::now_ns(),
+    ));
+    drop(me);
 }
 
 /// What a new thread is started with.
@@ -82,18 +112,34 @@ struct Born {
     birth: Birth,
     start: extern "C" fn(*mut c_void) -> *mut c_void,
     arg: *mut c_void,
+    parent_tid: u32,
+    spawn_frames: [u64; 3],
 }
 
 /// The new thread's first function: begins as a mutator, then runs the program's.
 extern "C" fn run(born: *mut c_void) -> *mut c_void {
     // SAFETY: `born` is the `Born` `create` boxed for exactly this thread.
-    let Born { birth, start, arg } = *unsafe { Box::from_raw(born.cast::<Born>()) };
+    let Born { birth, start, arg, parent_tid, spawn_frames } = *unsafe { Box::from_raw(born.cast::<Born>()) };
+    let me = birth.begin();
+    // Registered with the sampler (its port or CPU timer, its stack bounds) before a byte of the
+    // program runs on this thread.
+    let sampled = crate::sample::register::enter(me.thread().0);
+    let _ = crate::telemetry::emit(crate::telemetry::Event::thread_birth(
+        crate::telemetry::current_thread_id(),
+        crate::telemetry::now_ns(),
+        parent_tid,
+        spawn_frames,
+    ));
     // alloc: one `Ending` a thread, freed by the key's destructor as the thread ends.
-    let ending = Box::into_raw(Box::new(Ending { me: birth.begin(), rounds: 0 }));
-    let key = (KEY.load(Ordering::Acquire) - 1) as libc::pthread_key_t;
+    let ending = Box::into_raw(Box::new(Ending { me, rounds: 0, sampled }));
+    let key = KEY.load(Ordering::Acquire) - 1;
+    #[cfg(target_os = "macos")]
+    // SAFETY: adopt created this live key with ended as its destructor for this boxed Ending.
+    let _ = unsafe { thread::set_specific(key as thread::pthread_key_t, ending.cast()) };
+    #[cfg(not(target_os = "macos"))]
     // SAFETY: the key was made by `adopt` before any thread could be created through
     // `create`; the value is this thread's own.
-    unsafe { libc::pthread_setspecific(key, ending.cast()) };
+    unsafe { libc::pthread_setspecific(key as libc::pthread_key_t, ending.cast()) };
     start(arg)
 }
 
@@ -109,7 +155,7 @@ pub unsafe extern "C" fn create(
     attr: *const libc::pthread_attr_t,
     start: extern "C" fn(*mut c_void) -> *mut c_void,
     arg: *mut c_void,
-) -> libc::c_int {
+) -> core::ffi::c_int {
     let shared = SHARED.load(Ordering::Acquire);
     // SAFETY: `adopt` leaked a count of the `Arc` this points to (the caller's contract), so
     // it lives as long as the process; a count is taken for the borrow below and given
@@ -119,7 +165,14 @@ pub unsafe extern "C" fn create(
         Arc::from_raw(shared.cast_const())
     };
     // alloc: what the new thread begins with, freed by it.
-    let born = Box::into_raw(Box::new(Born { birth: shared.birth(), start, arg }));
+    let parent_tid = crate::telemetry::current_thread_id();
+    let spawn_frames = crate::telemetry::capture_caller_frames(1);
+    let born = Box::into_raw(Box::new(Born { birth: shared.birth(), start, arg, parent_tid, spawn_frames }));
+    #[cfg(target_os = "macos")]
+    // SAFETY: thread is writable and attr is null or initialized, as guaranteed by the caller.
+    // The macOS pointers name the same pthread ABI types, and run takes ownership of the box.
+    let refused = unsafe { thread::pthread_create(thread.cast(), attr.cast(), run, born.cast()) };
+    #[cfg(not(target_os = "macos"))]
     // SAFETY: the caller's contract for `thread`, `attr`; `run` takes the box.
     let refused = unsafe { libc::pthread_create(thread, attr, run, born.cast()) };
     if refused != 0 {

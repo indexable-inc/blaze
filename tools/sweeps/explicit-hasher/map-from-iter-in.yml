@@ -1,0 +1,16 @@
+# The block reserves the iterator's lower size hint, as `from_iter_in` did, so the table's
+# capacity, and with it its iteration order, is what it was.
+id: explicit-hasher-map-from-iter-in
+language: rust
+severity: hint
+message: "D125/D126: write the hasher; `Map::new(MapOpts { .. })` then `extend`"
+rule:
+  pattern: HashMap::from_iter_in($I, $A)
+fix: |-
+  {
+      let iter = IntoIterator::into_iter($I);
+      let capacity = Some(iter.size_hint().0);
+      let mut map = Map::new(MapOpts { hasher: FixedState, alloc: $A, capacity });
+      map.extend(iter);
+      map
+  }

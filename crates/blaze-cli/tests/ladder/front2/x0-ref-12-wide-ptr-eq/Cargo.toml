@@ -1,0 +1,4 @@
+[package]
+name = "ladder-x0-ref-12-wide-ptr-eq"
+version = "0.1.0"
+edition = "blaze-2026.11"

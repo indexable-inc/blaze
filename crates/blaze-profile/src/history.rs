@@ -101,6 +101,7 @@
 //! next flush; a file written and not yet listed is listed by the next commit.
 
 use std::{
+    alloc::Global,
     collections::VecDeque,
     fmt, fs, io,
     path::{Path, PathBuf},
@@ -109,26 +110,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use blaze_core::chan::{Receiver, RecvTimeoutError, Sender};
 use blaze_core::lock::Lock;
-
-use arrow_array::{
-    Array, ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, UInt32Array,
-    UInt64Array, types::UInt32Type,
-};
-use arrow_schema::ArrowError;
-use parquet::{
-    arrow::ArrowWriter,
-    basic::{Compression, ZstdLevel},
-    errors::ParquetError,
-    file::properties::{WriterProperties, WriterVersion},
-    schema::types::ColumnPath,
-};
+use blaze_parquet::ParquetError;
 
 use crate::{
     account::{self, AccountRow},
     batches::{self, Process},
-    clock, crash,
+    clock,
+    columns::{self, Batch, BatchError},
+    crash,
     errors::{self, ErrorRow},
     facts::{
         self, CrateDepRow, KeyedMiss, LinkRow, MissRow, ProcessRow, ProvenanceRow, QueryCountRow,
@@ -137,7 +128,7 @@ use crate::{
     flight::{self, CounterRow, Cursor, Plot, Read, SpanRow},
     identity, logs, panics,
     sampler::{self, Sample},
-    schema::{self, Column, Table, Type},
+    schema::{self, Table},
     supervise::{self, Dropped},
     symbols,
 };
@@ -147,6 +138,7 @@ mod drive;
 mod files;
 pub mod manifest;
 pub(crate) mod merge;
+mod order;
 mod pin;
 pub(crate) mod retire;
 
@@ -298,10 +290,8 @@ pub fn writer(dir: &Path) -> Option<u32> {
 /// Whether a process `pid` is alive: one this user may not signal is, one that is gone is not.
 #[cfg(unix)]
 pub fn alive(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else { return false };
-    // SAFETY: signal 0 sends nothing: the kernel only checks that `pid` names a process.
-    let sent = unsafe { libc::kill(pid, 0) };
-    sent == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    let Ok(pid) = i32::try_from(pid) else { return false };
+    matches!(blaze_sys::posix::signal::kill(pid, 0), Ok(()) | Err(blaze_sys::Errno::Perm))
 }
 
 #[cfg(not(unix))]
@@ -482,7 +472,7 @@ fn said_capped(capped: &files::Capped, said_over: &mut bool) {
         (0, _) => *said_over = false,
         (over, false) => {
             *said_over = true;
-            tracing::warn!(
+            blaze_trace::warn!(
                 target: "blaze",
                 over,
                 keep = KEEP_BUILDS,
@@ -497,7 +487,7 @@ fn said_capped(capped: &files::Capped, said_over: &mut bool) {
         return;
     }
     let [first_build, last_build] = capped.builds.unwrap_or([0, 0]);
-    tracing::warn!(
+    blaze_trace::warn!(
         target: "blaze",
         files = capped.files,
         rows = capped.rows,
@@ -602,10 +592,8 @@ pub enum HistoryError {
         table: &'static str,
         error: ParquetError,
     },
-    Arrow {
-        table: &'static str,
-        error: ArrowError,
-    },
+    /// A batch of a table's rows could not be made (the table is the error's).
+    Batch(BatchError),
     /// What a build was of could not be told: its tree's digest, or blaze's own hash.
     Identity {
         what: &'static str,
@@ -701,7 +689,7 @@ impl fmt::Display for HistoryError {
                     path.display()
                 )
             }
-            HistoryError::Arrow { table, error } => {
+            HistoryError::Batch(BatchError { table, error }) => {
                 write!(f, "the profile history: making the {table} table's rows: {error}")
             }
             HistoryError::Identity { what, path, error } => {
@@ -752,7 +740,7 @@ impl std::error::Error for HistoryError {
         match self {
             HistoryError::Io { error, .. } => Some(error),
             HistoryError::Parquet { error, .. } => Some(error),
-            HistoryError::Arrow { error, .. } => Some(error),
+            HistoryError::Batch(error) => Some(error),
             HistoryError::Identity { error, .. } => Some(error),
             HistoryError::SchemasMissing { error, .. } => Some(error.as_ref()),
             HistoryError::Compact { error: CompactError::Io(error), .. } => Some(error),
@@ -777,39 +765,15 @@ fn io_error<'a>(
     move |error| HistoryError::Io { path: path.to_owned(), doing, error }
 }
 
-fn arrow_error(table: &'static Table) -> impl FnOnce(ArrowError) -> HistoryError {
-    move |error| HistoryError::Arrow { table: table.name, error }
-}
+/// How every table's files are written ([`blaze_parquet::Options`]): DuckDB-sized row groups,
+/// with each column chunk's statistics for pruning by time and build. Uncompressed: the
+/// writer has no codec (until 2026-11-15 files were zstd, which only a merge still copies).
+const OPTIONS: blaze_parquet::Options =
+    blaze_parquet::Options { row_group_rows: ROW_GROUP_ROWS, ..blaze_parquet::Options::DEFAULT };
 
-/// Whether a column's Parquet pages are dictionary-encoded: the strings, and the numbers that
-/// repeat (processes, threads, depths, builds). Unique numbers (ids, instants, durations) are
-/// not, since their dictionary would be as big as the column.
-fn dictionary(column: &Column) -> bool {
-    match column.ty {
-        Type::Dict | Type::Stack | Type::Utf8 | Type::U16 | Type::U32 => true,
-        Type::U64 => column.name == "build_id",
-        Type::I64 | Type::F64 | Type::Pcs | Type::Bool => false,
-    }
-}
-
-/// How each table's files are written: zstd at level 1 (fast enough to keep up with the
-/// recorder: see docs/v2/plan/design/profile-history.md), Parquet 2 pages (delta-encoded
-/// integers), DuckDB-sized row groups, page statistics for pruning by time and build.
-fn properties(table: &Table) -> WriterProperties {
-    let mut it = WriterProperties::builder()
-        .set_writer_version(WriterVersion::PARQUET_2_0)
-        .set_compression(Compression::ZSTD(ZstdLevel::default()))
-        .set_max_row_group_row_count(Some(ROW_GROUP_ROWS))
-        .set_dictionary_enabled(false);
-    for column in table.columns.iter().filter(|it| dictionary(it)) {
-        let path = match column.ty {
-            // alloc: writer properties, made once a table when the history opens
-            Type::Stack => ColumnPath::new(vec![column.name.into(), "list".into(), "frame".into()]),
-            _ => ColumnPath::from(column.name),
-        };
-        it = it.set_column_dictionary_enabled(path, true);
-    }
-    it.build()
+/// A batch of `table` with no rows: the part of a table nothing was read of.
+fn empty(table: &'static Table) -> Result<Batch, BatchError> {
+    columns::batch(table, columns::fields(table).iter().map(|it| columns::Column::nulls(it.ty, 0, Global)))
 }
 
 pub(crate) fn table_at(table: &Table) -> usize {
@@ -819,27 +783,14 @@ pub(crate) fn table_at(table: &Table) -> usize {
     }
 }
 
-/// Each table's writer properties, by its place in [`schema::TABLES`]: what its files and its
-/// merges are written with.
-pub(crate) fn all_properties() -> Vec<WriterProperties> {
-    // alloc: once a writer
-    schema::TABLES.iter().map(|it| properties(it)).collect()
-}
-
-/// Encodes record batches as Parquet files, for the core to place.
+/// Encodes batches as Parquet files, for the core to place.
 pub(crate) struct Writer {
-    properties: Vec<WriterProperties>,
+    options: blaze_parquet::Options,
 }
 
 impl Writer {
-    /// The writer properties of the table at `table` in [`schema::TABLES`]: what a merge of its
-    /// files writes with.
-    pub(crate) fn properties(&self, table: usize) -> &WriterProperties {
-        &self.properties[table]
-    }
-
     pub(crate) fn new() -> Writer {
-        Writer { properties: all_properties() }
+        Writer { options: OPTIONS }
     }
 
     /// `parts`, rows of `table`, as the bytes of the Parquet file `path` (named in its error).
@@ -847,7 +798,7 @@ impl Writer {
         &self,
         path: &Path,
         table: &'static Table,
-        parts: &[RecordBatch],
+        parts: &[Batch],
     ) -> Result<Vec<u8>, HistoryError> {
         let parquet = |error| HistoryError::Parquet {
             // alloc: an error
@@ -855,16 +806,14 @@ impl Writer {
             table: table.name,
             error,
         };
-        // clone: a table's writer properties, once a file
-        let properties = self.properties[table_at(table)].clone();
-        // alloc: a file's bytes, handed to the core to place
-        let buf = Vec::with_capacity(1 << 16);
-        let mut writer = ArrowWriter::try_new(buf, batches::schema_of(table), Some(properties))
-            .map_err(parquet)?;
+        let metadata = columns::metadata(table);
+        let mut writer = blaze_parquet::Writer::new(columns::fields(table), self.options, Global);
         for part in parts {
             writer.write(part).map_err(parquet)?;
         }
-        writer.into_inner().map_err(parquet)
+        // alloc: a file's bytes, handed to the core to place (a copy: a placed file holds
+        // std's `Vec`)
+        Ok(writer.finish(&metadata).map_err(parquet)?.to_vec())
     }
 
     /// [`Writer::encode`] written straight to `path`, with no core: a test's file beside a
@@ -874,7 +823,7 @@ impl Writer {
         &mut self,
         path: &Path,
         table: &'static Table,
-        parts: &[RecordBatch],
+        parts: &[Batch],
     ) -> Result<u64, HistoryError> {
         let bytes = self.encode(path, table, parts)?;
         fs::write(path, &bytes).map_err(io_error(path, "writing"))?;
@@ -889,41 +838,45 @@ fn schema_file(table: &Table) -> String {
     format!("schema.{}.parquet", table.name)
 }
 
-fn column(array: impl Array + 'static) -> ArrayRef {
-    // alloc: a batch's column, once a flush
-    Arc::new(array)
-}
-
 /// The `builds` rows of `rows`, all of the process `pid`; a row whose build is in `solo` has
 /// its solo columns from it.
-pub fn builds(rows: &[BuildRow], solo: &[SoloOf], pid: u32) -> Result<RecordBatch, ArrowError> {
+pub fn builds(rows: &[BuildRow], solo: &[SoloOf], pid: u32) -> Result<Batch, BatchError> {
+    use columns::Column;
     let solo_of = |row: &BuildRow| solo.iter().find(|it| it.build == row.build_id);
-    let outcomes = column(StringArray::from_iter_values(Outcome::ALL.iter().map(|it| it.name())));
-    let outcome = UInt32Array::from_iter_values(rows.iter().map(|it| it.outcome as u32));
-    // alloc: a batch's columns, once a flush
-    let columns: Vec<ArrayRef> = vec![
-        column(UInt64Array::from_iter_values(rows.iter().map(|it| it.build_id))),
-        column(StringArray::from_iter(rows.iter().map(|it| it.commit.as_deref()))),
-        column(StringArray::from_iter_values(rows.iter().map(|it| it.workspace.as_str()))),
-        column(StringArray::from_iter_values(rows.iter().map(|it| it.command.as_str()))),
-        column(Int64Array::from_iter_values(rows.iter().map(|it| it.started_ns))),
-        column(Int64Array::from_iter(rows.iter().map(|it| it.dur_ns))),
-        column(Int64Array::from_iter(rows.iter().map(|it| it.started_unix_ns))),
-        column(DictionaryArray::<UInt32Type>::try_new(outcome, outcomes)?),
-        column(UInt64Array::from_iter(rows.iter().map(|it| it.hits))),
-        column(UInt64Array::from_iter(rows.iter().map(|it| it.misses))),
-        column(UInt64Array::from_iter(rows.iter().map(|it| it.joined))),
-        column(StringArray::from_iter(rows.iter().map(|it| it.tree.as_deref()))),
-        column(StringArray::from_iter(rows.iter().map(|it| it.blaze.as_deref()))),
-        column(UInt32Array::from_value(pid, rows.len())),
-        column(Int64Array::from_iter(rows.iter().map(|it| it.client_ns.map(|it| it.0)))),
-        column(Int64Array::from_iter(rows.iter().map(|it| it.client_ns.map(|it| it.1)))),
-        column(Int64Array::from_iter(rows.iter().map(|it| it.daemon_cpu_ns.map(|it| it.0)))),
-        column(Int64Array::from_iter(rows.iter().map(|it| it.daemon_cpu_ns.map(|it| it.1)))),
-        column(StringArray::from_iter(rows.iter().map(|it| solo_of(it).map(|it| it.slot.as_str())))),
-        column(UInt64Array::from_iter(rows.iter().map(|it| solo_of(it).and_then(|it| it.certified_by)))),
-    ];
-    RecordBatch::try_new(batches::schema_of(&schema::BUILDS), columns)
+    let mut outcomes = blaze_columns::Texts::new_in(Global);
+    for outcome in Outcome::ALL {
+        outcomes.push(outcome.name());
+    }
+    let outcome = Column::dict(rows.iter().map(|it| Some(it.outcome as u32)), outcomes, Global)
+        .map_err(BatchError::of(&schema::BUILDS))?;
+    let texts = |text: fn(&BuildRow) -> Option<&str>| Column::opt_texts_of(rows.iter().map(text), Global);
+    let ints = |int: fn(&BuildRow) -> Option<i64>| Column::options(rows.iter().map(int), Global);
+    let counts = |count: fn(&BuildRow) -> Option<u64>| Column::options(rows.iter().map(count), Global);
+    columns::batch(
+        &schema::BUILDS,
+        [
+            Column::values(rows.iter().map(|it| it.build_id), Global),
+            texts(|it| it.commit.as_deref()),
+            Column::texts_of(rows.iter().map(|it| it.workspace.as_str()), Global),
+            Column::texts_of(rows.iter().map(|it| it.command.as_str()), Global),
+            Column::values(rows.iter().map(|it| it.started_ns), Global),
+            ints(|it| it.dur_ns),
+            ints(|it| it.started_unix_ns),
+            outcome,
+            counts(|it| it.hits),
+            counts(|it| it.misses),
+            counts(|it| it.joined),
+            texts(|it| it.tree.as_deref()),
+            texts(|it| it.blaze.as_deref()),
+            Column::repeat(pid, rows.len(), Global),
+            ints(|it| it.client_ns.map(|it| it.0)),
+            ints(|it| it.client_ns.map(|it| it.1)),
+            ints(|it| it.daemon_cpu_ns.map(|it| it.0)),
+            ints(|it| it.daemon_cpu_ns.map(|it| it.1)),
+            Column::opt_texts_of(rows.iter().map(|it| solo_of(it).map(|it| it.slot.as_str())), Global),
+            Column::options(rows.iter().map(|it| solo_of(it).and_then(|it| it.certified_by)), Global),
+        ],
+    )
 }
 
 /// The key of a merged file's metadata that says how many rows its merge read from its inputs'
@@ -972,9 +925,9 @@ pub struct History {
     processes: Vec<ProcessRow>,
     test_runs: Vec<TestRunRow>,
     /// What clients sent since the last flush, by table: written by the next.
-    client_spans: Vec<RecordBatch>,
-    client_events: Vec<RecordBatch>,
-    client_folded: Vec<RecordBatch>,
+    client_spans: Vec<Batch>,
+    client_events: Vec<Batch>,
+    client_folded: Vec<Batch>,
     /// The highest build a client sent rows of since the last flush, 0 for none.
     client_build: u64,
     /// The last [`RECENT_BUILDS`] builds that ended, newest last: a client's times are given
@@ -1079,7 +1032,7 @@ impl History {
         // A record refused (another layout, another blaze) is set aside and said; it never
         // stops the history opening.
         for refused in &opened.crashes.refused {
-            tracing::warn!(target: "blaze", "{refused}");
+            blaze_trace::warn!(target: "blaze", "{refused}");
         }
         let mut said_over = false;
         said_capped(&opened.capped, &mut said_over);
@@ -1089,8 +1042,8 @@ impl History {
             error,
         })?;
         let drained = Arc::new(Drained::default()); // alloc: once a history
-        let (full_to, full) = crossbeam_channel::bounded(1);
-        let (stop, stopped) = crossbeam_channel::bounded::<()>(0);
+        let (full_to, full) = blaze_core::chan::bounded(1);
+        let (stop, stopped) = blaze_core::chan::bounded::<()>(0);
         let draining = Arc::clone(&drained);
         let drainer = std::thread::Builder::new()
             .name("blaze-drain".to_owned()) // alloc: once a history
@@ -1540,7 +1493,7 @@ impl History {
     pub fn flush(&mut self, build: Option<u64>) -> Result<Flushed, HistoryError> {
         // The record cost of the history itself: encoding and writing a flush's Parquet had no
         // span, so a slow flush read as uncovered time on the history's thread.
-        let _span = tracing::info_span!(target: "blaze", "profile flush").entered();
+        let _span = blaze_trace::info_span!(target: "blaze", "profile flush").entered();
         let (late, behind) = self.drained.take(&mut self.read, &mut self.cursor);
         // DEBUG events are held for their build's end, written if it was in trouble.
         self.hold.sort(&mut self.read);
@@ -1553,7 +1506,7 @@ impl History {
         let (lost, skipped) =
             (now.0.saturating_sub(self.told.0), now.1.saturating_sub(self.told.1));
         if lost != 0 || skipped != 0 {
-            tracing::warn!(
+            blaze_trace::warn!(
                 target: "blaze",
                 spans_lost = lost,
                 rows_skipped = skipped,
@@ -1727,9 +1680,13 @@ impl History {
                 of
             });
         }
+        // The rows in one total order, not the rings' drain order: equal rows write equal bytes.
+        order::spans(&mut self.read.spans);
+        order::spans(&mut self.others);
+        order::counters(&mut self.read.counters);
         let of_build = Process { commit, ..self.process };
         let client_rows =
-            |parts: &[RecordBatch]| parts.iter().map(RecordBatch::num_rows).sum::<usize>();
+            |parts: &[Batch]| parts.iter().map(Batch::num_rows).sum::<usize>();
         let client = client_rows(&self.client_spans)
             + client_rows(&self.client_events)
             + client_rows(&self.client_folded);
@@ -1743,27 +1700,27 @@ impl History {
         let mut spans = in_row_batches(&schema::SPANS, &self.read.spans, &mut unwritten, |rows| {
             batches::spans(rows, of_build)
         })
-        .map_err(arrow_error(&schema::SPANS))?;
+        .map_err(HistoryError::Batch)?;
         spans.extend(
             in_row_batches(&schema::SPANS, &self.others, &mut unwritten, |rows| {
                 batches::spans(rows, self.process)
             })
-            .map_err(arrow_error(&schema::SPANS))?,
+            .map_err(HistoryError::Batch)?,
         );
         spans.append(&mut self.client_spans);
         let counters = [batches::counters(&self.read.counters, self.process)
-            .map_err(arrow_error(&schema::COUNTERS))?];
-        let builds = [builds(&self.ended, &self.solo, self.process.pid).map_err(arrow_error(&schema::BUILDS))?];
-        let errors = [errors::batch(&self.errors).map_err(arrow_error(&schema::ERRORS))?];
-        let links = [facts::links(&self.links).map_err(arrow_error(&schema::LINKS))?];
+            .map_err(HistoryError::Batch)?];
+        let builds = [builds(&self.ended, &self.solo, self.process.pid).map_err(HistoryError::Batch)?];
+        let errors = [errors::batch(&self.errors).map_err(HistoryError::Batch)?];
+        let links = [facts::links(&self.links).map_err(HistoryError::Batch)?];
         let crate_deps =
-            [facts::crate_deps(&self.crate_deps).map_err(arrow_error(&schema::CRATE_DEPS))?];
+            [facts::crate_deps(&self.crate_deps).map_err(HistoryError::Batch)?];
         let query_counts =
             [facts::query_counts(&self.query_counts)
-                .map_err(arrow_error(&schema::QUERY_COUNTS))?];
+                .map_err(HistoryError::Batch)?];
         // Split by their text: one build's can pass the 2 GiB a `Utf8` column holds (#1726).
         let misses = facts::in_batches(&self.misses, MissRow::text_bytes, facts::BATCH_TEXT_BYTES, facts::misses)
-            .map_err(arrow_error(&schema::MISSES))?;
+            .map_err(HistoryError::Batch)?;
         let key_parts =
             facts::in_batches(
                 &self.key_parts,
@@ -1771,28 +1728,28 @@ impl History {
                 facts::BATCH_TEXT_BYTES,
                 facts::key_parts,
             )
-                .map_err(arrow_error(&schema::KEY_PARTS))?;
+                .map_err(HistoryError::Batch)?;
         let provenance = facts::in_batches(
             &self.provenance,
             ProvenanceRow::text_bytes,
             facts::BATCH_TEXT_BYTES,
             facts::provenance,
         )
-        .map_err(arrow_error(&schema::PROVENANCE))?;
+        .map_err(HistoryError::Batch)?;
         let switches = [batches::switches(&self.read.switches, self.process)
-            .map_err(arrow_error(&schema::SWITCHES))?];
+            .map_err(HistoryError::Batch)?];
         let mut events = in_row_batches(&schema::EVENTS, &self.read.events, &mut unwritten, |rows| {
             batches::events(rows, self.process)
         })
-        .map_err(arrow_error(&schema::EVENTS))?;
+        .map_err(HistoryError::Batch)?;
         events.append(&mut self.client_events);
         let event_fields =
             in_row_batches(&schema::EVENT_FIELDS, &self.read.fields, &mut unwritten, |rows| {
                 batches::event_fields(rows, self.process)
             })
-            .map_err(arrow_error(&schema::EVENT_FIELDS))?;
+            .map_err(HistoryError::Batch)?;
         let accounts =
-            [account::accounts(&self.accounts).map_err(arrow_error(&schema::ACCOUNTS))?];
+            [account::accounts(&self.accounts).map_err(HistoryError::Batch)?];
         let mut unwritten_rows = 0usize;
         for error in &unwritten {
             if let HistoryError::Dropped { table, rows, .. } = error {
@@ -1801,25 +1758,25 @@ impl History {
             }
             // Never silent (rule 3): in the build's problems, and told to the daemon
             // (`History::take_failed`).
-            tracing::warn!(target: "blaze", "{error}");
+            blaze_trace::warn!(target: "blaze", "{error}");
         }
         self.deferred.append(&mut unwritten);
         let mut folded = vec![
             batches::folded(&self.read.folds, self.process)
-                .map_err(arrow_error(&schema::FOLDED))?,
+                .map_err(HistoryError::Batch)?,
         ]; // alloc: as `spans`
         folded.append(&mut self.client_folded);
         let processes = [facts::processes(&self.processes, self.process.pid)
-            .map_err(arrow_error(&schema::PROCESSES))?];
+            .map_err(HistoryError::Batch)?];
         let test_runs =
-            [facts::test_runs(&self.test_runs).map_err(arrow_error(&schema::TEST_RUNS))?];
+            [facts::test_runs(&self.test_runs).map_err(HistoryError::Batch)?];
         self.samples.clear();
         let samples_skipped = self.sampler.since(&mut self.sampled, &mut self.samples);
-        let samples = [self.samples_batch().map_err(arrow_error(&schema::SAMPLES))?];
+        let samples = [self.samples_batch().map_err(HistoryError::Batch)?];
         self.heap_samples.clear();
         let heap_skipped = crate::heap::since(&mut self.heap_sampled, &mut self.heap_samples);
         let alloc_samples =
-            [self.alloc_samples_batch().map_err(arrow_error(&schema::ALLOC_SAMPLES))?];
+            [self.alloc_samples_batch().map_err(HistoryError::Batch)?];
         // What the heap holds, by call site: a reading of the sampled blocks nobody freed,
         // once every `HELD_EVERY` (each reading is every held sample again, so not each flush).
         self.held_samples.clear();
@@ -1828,7 +1785,7 @@ impl History {
             crate::heap::held(&mut self.held_samples);
         }
         let held_samples =
-            [self.held_samples_batch().map_err(arrow_error(&schema::HELD_SAMPLES))?];
+            [self.held_samples_batch().map_err(HistoryError::Batch)?];
         // The images the samples' and this process's panics' addresses are in, and each
         // recovered crash's executable, of its own process.
         let seen_ns = clock::mono_ns();
@@ -1841,16 +1798,16 @@ impl History {
         let mut images = vec![
             self.images
                 .batch(stacks, seen_ns, self.process)
-                .map_err(arrow_error(&schema::IMAGES))?,
+                .map_err(HistoryError::Batch)?,
         ]; // alloc: as `spans`
         for (pid, image) in &self.crashes.images {
             let process = Process { pid: *pid, commit: None, ..self.process };
             images.push(
                 batches::images(std::slice::from_ref(image), None, seen_ns, process)
-                    .map_err(arrow_error(&schema::IMAGES))?,
+                    .map_err(HistoryError::Batch)?,
             );
         }
-        let rows = |parts: &[RecordBatch]| parts.iter().map(RecordBatch::num_rows).sum::<usize>();
+        let rows = |parts: &[Batch]| parts.iter().map(Batch::num_rows).sum::<usize>();
         // What every thread is inside, with each flush where that changed: the last reading is
         // what a daemon that died was doing, which no `spans` row holds (they are written as
         // they close), and a deadlocked one's stays its last. An idle daemon's flushes write none.
@@ -1858,14 +1815,14 @@ impl History {
         let open = match same_open(&now, &self.open_written) {
             false => {
                 let batch = batches::open(&now, clock::mono_ns(), self.process)
-                    .map_err(arrow_error(&schema::OPEN))?;
+                    .map_err(HistoryError::Batch)?;
                 self.open_written = now;
                 batch
             }
-            true => RecordBatch::new_empty(batches::schema_of(&schema::OPEN)),
+            true => empty(&schema::OPEN).map_err(HistoryError::Batch)?,
         };
         let open = [open];
-        let panics = [panics::batch(&panic_rows).map_err(arrow_error(&schema::PANICS))?];
+        let panics = [panics::batch(&panic_rows).map_err(HistoryError::Batch)?];
         let mut flushed = Flushed {
             seq,
             spans: rows(&spans),
@@ -1907,7 +1864,7 @@ impl History {
         let build = named;
         flushed.build = build;
         self.core.files_mut().named(build);
-        let tables: [(&'static Table, &[RecordBatch]); 23] = [
+        let tables: [(&'static Table, &[Batch]); 23] = [
             (&schema::SPANS, &spans),
             (&schema::COUNTERS, &counters),
             (&schema::BUILDS, &builds),
@@ -2077,7 +2034,7 @@ impl History {
         flight::flush_committed(seq, self.read.at_ns);
         // One that can't be deleted is consumed already: the next open deletes it unread.
         for error in &undeleted {
-            tracing::warn!(target: "blaze", "{error}");
+            blaze_trace::warn!(target: "blaze", "{error}");
         }
         flushed.files = files;
         flushed.bytes = bytes;
@@ -2134,9 +2091,9 @@ impl History {
 
     /// The flush's CPU samples as a `samples` batch, their frames named. A flush with no new
     /// samples names nothing.
-    fn samples_batch(&self) -> Result<RecordBatch, ArrowError> {
+    fn samples_batch(&self) -> Result<Batch, BatchError> {
         if self.samples.is_empty() {
-            return Ok(RecordBatch::new_empty(batches::schema_of(&schema::SAMPLES)));
+            return empty(&schema::SAMPLES);
         }
         // Every address gets a frame, `[code in no image]` at worst.
         let frames =
@@ -2146,9 +2103,9 @@ impl History {
 
     /// The `alloc_samples` rows of the heap samples this flush read ([`crate::heap`]), named
     /// as [`History::samples_batch`] names the CPU samples'.
-    fn alloc_samples_batch(&self) -> Result<RecordBatch, ArrowError> {
+    fn alloc_samples_batch(&self) -> Result<Batch, BatchError> {
         if self.heap_samples.is_empty() {
-            return Ok(RecordBatch::new_empty(batches::schema_of(&schema::ALLOC_SAMPLES)));
+            return empty(&schema::ALLOC_SAMPLES);
         }
         let frames =
             symbols::frames(self.heap_samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]));
@@ -2164,9 +2121,9 @@ impl History {
 impl History {
     /// The `held_samples` rows of this flush's reading of the samples still held, none where
     /// it made no reading.
-    fn held_samples_batch(&self) -> Result<RecordBatch, ArrowError> {
+    fn held_samples_batch(&self) -> Result<Batch, BatchError> {
         if self.held_samples.is_empty() {
-            return Ok(RecordBatch::new_empty(batches::schema_of(&schema::HELD_SAMPLES)));
+            return empty(&schema::HELD_SAMPLES);
         }
         let frames =
             symbols::frames(self.held_samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]));
@@ -2181,7 +2138,7 @@ impl Drop for History {
         if let Some((stop, drainer)) = self.drainer.take() {
             drop(stop);
             if drainer.join().is_err() {
-                tracing::error!(target: "blaze", "the profile history's drain thread (`blaze-drain`) of {} panicked", self.core.dir().display());
+                blaze_trace::error!(target: "blaze", "the profile history's drain thread (`blaze-drain`) of {} panicked", self.core.dir().display());
             }
         }
         // Every row written by the last flush: no postmortem is owed. One that failed leaves
@@ -2191,7 +2148,7 @@ impl Drop for History {
         }
         // What failed after a commit and no one took is said, never dropped unseen.
         for error in self.deferred.drain(..) {
-            tracing::error!(target: "blaze", "{error}");
+            blaze_trace::error!(target: "blaze", "{error}");
         }
     }
 }
@@ -2261,7 +2218,7 @@ fn drain(drained: &Drained, stop: &Receiver<()>, full: &Sender<()>) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
         }
         due = Instant::now() + DRAIN;
-        let _span = tracing::info_span!(target: "blaze", "profile drain").entered();
+        let _span = blaze_trace::info_span!(target: "blaze", "profile drain").entered();
         let mut at = drained.0.lock();
         if at.read.rows() >= BACKLOG_ROWS {
             at.stopped = true;
@@ -2294,12 +2251,12 @@ fn in_row_batches<T>(
     table: &'static Table,
     rows: &[T],
     unwritten: &mut Vec<HistoryError>,
-    make: impl Fn(&[T]) -> Result<RecordBatch, ArrowError>,
-) -> Result<Vec<RecordBatch>, ArrowError> {
+    make: impl Fn(&[T]) -> Result<Batch, BatchError>,
+) -> Result<Vec<Batch>, BatchError> {
     let split = supervise::split(rows, BATCH_ROWS, make)?;
     if split.splits > 0 || split.dropped > 0 {
         let why = split.why.unwrap_or_default();
-        tracing::warn!(
+        blaze_trace::warn!(
             target: "blaze",
             table = table.name,
             rows = rows.len(),
@@ -2319,7 +2276,7 @@ fn in_row_batches<T>(
     }
     if split.batches.is_empty() {
         // Every row was dropped: the table still has its part.
-        return Ok(vec![RecordBatch::new_empty(batches::schema_of(table))]); // alloc: a flush's parts
+        return Ok(vec![empty(table)?]); // alloc: a flush's parts
     }
     Ok(split.batches)
 }
@@ -2331,23 +2288,23 @@ fn client_batches(
     build: u64,
     table: &'static Table,
     bytes: &[u8],
-) -> Result<Vec<RecordBatch>, HistoryError> {
+) -> Result<Vec<Batch>, HistoryError> {
     let refused = |why: String| HistoryError::Client { build, table: table.name, why };
     if bytes.is_empty() {
         return Ok(Vec::new()); // alloc: empty, allocates nothing
     }
-    let schema = batches::schema_of(table);
     let at = table
         .column("build_id")
         .unwrap_or_else(|| unreachable!("{} has a build_id column", table.name));
-    let mut out = crate::live::decode(bytes)
+    let sent = crate::live::decode(bytes)
         .map_err(|error| refused(format!("not an Arrow IPC stream: {error}")))?;
-    for batch in &mut out {
-        // clone: the columns' `Arc`s, once a batch
-        *batch = RecordBatch::try_new(schema.clone(), batch.columns().to_vec())
+    // alloc: a client's batches, once a frame it sent
+    let mut out = Vec::with_capacity(sent.len());
+    for batch in sent {
+        let (_, columns) = batch.into_parts();
+        let batch = columns::batch(table, columns)
             .map_err(|error| refused(format!("not of the table's schema: {error}")))?;
-        let builds = batch.column(at).as_any().downcast_ref::<UInt64Array>();
-        let Some(builds) = builds else {
+        let Some(builds) = batch.column(at).u64s() else {
             return Err(refused("its build_id column is not u64".to_owned()));
         };
         if let Some(other) = builds.iter().find(|it| *it != Some(build)) {
@@ -2355,6 +2312,7 @@ fn client_batches(
                 "a row of build {other:?}, not of the build it was sent for"
             )));
         }
+        out.push(batch);
     }
     Ok(out)
 }
@@ -2363,20 +2321,17 @@ fn client_batches(
 mod tests {
     use std::collections::BTreeSet;
 
-    use arrow_array::{Array, cast::AsArray};
-    use parquet::{arrow::arrow_reader::ParquetRecordBatchReaderBuilder, file::metadata::ParquetMetaDataReader};
-
     use super::*;
     use crate::flight::{Allocated, FrameCopied};
 
     /// Merges the Parquet files `inputs` into `output`, as the core's merge copies their
     /// column chunks ([`merge::Concat`]), written straight to disk: a test's merge.
-    fn concat(output: &Path, inputs: &[PathBuf], properties: &WriterProperties) -> Result<u64, String> {
+    fn concat(output: &Path, inputs: &[PathBuf]) -> Result<u64, String> {
         let inputs: Vec<merge::Input> = inputs
             .iter()
-            .map(|it| merge::Input::of_bytes(bytes::Bytes::from(fs::read(it).unwrap())).unwrap())
+            .map(|it| merge::Input::of_bytes(fs::read(it).unwrap()).unwrap())
             .collect();
-        let merged = merge::Concat::new(inputs, properties)
+        let merged = merge::Concat::new(inputs)
             .and_then(merge::Concat::all)
             .map_err(|it| format!("{} of input {:?}: {}", it.doing, it.input, it.error))?;
         fs::write(output, &merged).unwrap();
@@ -2391,31 +2346,46 @@ mod tests {
         (tmp, dir)
     }
 
-    fn read_back(path: &Path) -> Vec<RecordBatch> {
-        let file = fs::File::open(path).unwrap();
-        ParquetRecordBatchReaderBuilder::try_new(file)
-            .unwrap()
-            .build()
-            .unwrap()
-            .map(Result::unwrap)
-            .collect()
+    fn read_back(path: &Path) -> Vec<Batch> {
+        let bytes = fs::read(path).unwrap();
+        blaze_parquet::File::open(&bytes, Global).unwrap().read_all().unwrap().into_iter().collect()
     }
 
-    fn same(written: &RecordBatch, read: &[RecordBatch]) {
+    /// Row `row` of `column` as text, whatever its type: a dictionary's text reads back plain.
+    fn cell(column: &columns::Column, row: usize) -> String {
+        if column.is_null(row) {
+            return "null".to_owned();
+        }
+        if let Some(lists) = column.lists() {
+            return match (lists.texts(row), lists.slice::<u64>(row)) {
+                (Some(texts), _) => format!("{:?}", texts.collect::<Vec<_>>()),
+                (None, Some(values)) => format!("{values:?}"),
+                (None, None) => unreachable!("a list of text or of u64"),
+            };
+        }
+        match (column.text(row), column.int(row), column.float(row)) {
+            (Some(text), ..) => format!("{text:?}"),
+            (None, Some(int), _) => int.to_string(),
+            (None, None, Some(float)) => float.to_string(),
+            (None, None, None) => column.bools().map(|it| it.value(row).to_string()).unwrap_or_default(),
+        }
+    }
+
+    fn same(written: &Batch, read: &[Batch]) {
         assert_eq!(read.len(), 1, "a small table reads back as one batch");
         let read = &read[0];
         assert_eq!(read.num_rows(), written.num_rows());
-        assert_eq!(
-            read.schema().fields(),
-            written.schema().fields(),
-            "the Arrow types come back, dictionaries too"
-        );
-        for (i, field) in written.schema().fields().iter().enumerate() {
-            assert!(
-                read.column(i).as_ref() == written.column(i).as_ref(),
-                "{} reads back the same",
-                field.name()
-            );
+        let names = |batch: &Batch| batch.fields().iter().map(|it| it.name().to_owned()).collect::<Vec<_>>();
+        assert_eq!(names(read), names(written), "the columns come back in order");
+        for (i, field) in written.fields().iter().enumerate() {
+            for row in 0..written.num_rows() {
+                assert_eq!(
+                    cell(read.column(i), row),
+                    cell(written.column(i), row),
+                    "{} reads back the same at row {row}",
+                    field.name()
+                );
+            }
         }
     }
 
@@ -2553,12 +2523,7 @@ mod tests {
         let read = read_back(
             &dir.join(format!("{}-{:08}.builds.parquet", flushed.build, flushed.seq)),
         );
-        let int = |name: &str| {
-            read[0]
-                .column(schema::BUILDS.column(name).unwrap())
-                .as_primitive::<arrow_array::types::Int64Type>()
-                .value(0)
-        };
+        let int = |name: &str| read[0].column(schema::BUILDS.column(name).unwrap()).int(0).unwrap();
         assert_eq!((int("client_started_ns"), int("client_ended_ns")), (500, 90_000));
         assert_eq!((int("daemon_user_ns"), int("daemon_system_ns")), (7, 3));
 
@@ -2603,21 +2568,18 @@ mod tests {
         let flushed = history.flush(None).unwrap();
         assert_eq!((flushed.builds, flushed.client), (2, 1));
         let read = read_back(&dir.join(format!("{}-{:08}.builds.parquet", flushed.build, flushed.seq)));
-        let column = |name: &str| read[0].column(schema::BUILDS.column(name).unwrap()).clone();
+        let column = |name: &str| read[0].column(schema::BUILDS.column(name).unwrap());
         let ids = column("build_id");
-        let ids = ids.as_primitive::<arrow_array::types::UInt64Type>();
-        let at = (0..ids.len()).find(|&it| ids.value(it) == 91).expect("the solo build's row");
+        let at = (0..ids.len()).find(|&it| ids.int(it) == Some(91)).expect("the solo build's row");
         let daemon = 1 - at;
         let slot = column("solo_slot");
-        let slot = slot.as_string::<i32>();
-        assert_eq!((slot.value(at), slot.is_null(daemon)), ("ab12", true));
+        assert_eq!((slot.text(at), slot.is_null(daemon)), (Some("ab12"), true));
         let by = column("solo_certified_by");
-        let by = by.as_primitive::<arrow_array::types::UInt64Type>();
-        assert_eq!((by.value(at), by.is_null(daemon)), (90, true));
-        let int = |name: &str| column(name).as_primitive::<arrow_array::types::Int64Type>().value(at);
+        assert_eq!((by.int(at), by.is_null(daemon)), (Some(90), true));
+        let int = |name: &str| column(name).int(at).unwrap();
         assert_eq!((int("started_ns"), int("dur_ns")), (500, 2_000));
         assert_eq!((int("client_started_ns"), int("client_ended_ns")), (500, 2_500));
-        assert_eq!(column("misses").as_primitive::<arrow_array::types::UInt64Type>().value(at), 0);
+        assert_eq!(column("misses").int(at), Some(0));
 
         let mut other = Vec::new();
         let spans = batches::spans(&[client_span(93)], Process { pid: 9, name: "client", commit: None });
@@ -2682,16 +2644,13 @@ mod tests {
             assert_eq!(bytes, fs::metadata(&path).unwrap().len());
             let read = read_back(&path);
             same(batch, &read);
-            // arrow-rs gives the batches it reads no schema metadata; the file's schema has it.
-            let file =
-                ParquetRecordBatchReaderBuilder::try_new(fs::File::open(&path).unwrap()).unwrap();
-            assert_eq!(file.schema().metadata()["blaze.table"], table.name);
+            let bytes = fs::read(&path).unwrap();
+            let file = blaze_parquet::File::open(&bytes, Global).unwrap();
+            assert_eq!(file.value("blaze.table"), Some(table.name));
         }
         let read = read_back(&dir.join("1-00000001.builds.parquet"));
-        let outcome =
-            read[0].column(schema::BUILDS.column("outcome").unwrap()).as_dictionary::<UInt32Type>();
-        let names = outcome.values().as_string::<i32>();
-        assert_eq!(names.value(outcome.keys().value(1) as usize), "stalled");
+        let outcome = read[0].column(schema::BUILDS.column("outcome").unwrap());
+        assert_eq!(outcome.text(1), Some("stalled"));
         assert!(
             fs::read_dir(&dir).unwrap().all(|it| !it
                 .unwrap()
@@ -2726,27 +2685,24 @@ mod tests {
             (dir.join("1-00000001.counters.parquet"), dir.join("1-00000002.counters.parquet"));
         writer.write(&a, &schema::COUNTERS, &[counters(3)]).unwrap();
         writer.write(&b, &schema::COUNTERS, &[counters(4)]).unwrap();
-        let table = table_at(&schema::COUNTERS);
         let footer = |path: &Path| {
-            let metadata = ParquetMetaDataReader::new()
-                .parse_and_finish(&fs::File::open(path).unwrap())
-                .unwrap();
-            let said: Vec<Option<String>> = metadata
-                .file_metadata()
-                .key_value_metadata()
-                .into_iter()
-                .flatten()
-                .filter(|it| it.key == MERGED_ROWS)
-                .map(|it| it.value.clone())
+            let bytes = fs::read(path).unwrap();
+            let file = blaze_parquet::File::open(&bytes, Global).unwrap();
+            let said: Vec<Option<String>> = file
+                .meta()
+                .key_value
+                .iter()
+                .filter(|it| it.key.as_str() == MERGED_ROWS)
+                .map(|it| it.value.as_ref().map(|it| it.as_str().to_owned()))
                 .collect();
-            (metadata.file_metadata().num_rows(), said)
+            (file.num_rows(), said)
         };
         let merged = dir.join("1-00000001-00000002-1.counters.parquet");
-        concat(&merged, &[a.clone(), b], writer.properties(table)).unwrap();
+        concat(&merged, &[a.clone(), b]).unwrap();
         assert_eq!(footer(&merged), (7, vec![Some("7".to_owned())]));
         // A merge of a merged file says its own count, once.
         let again = dir.join("1-00000001-00000002-2.counters.parquet");
-        concat(&again, &[merged, a], writer.properties(table)).unwrap();
+        concat(&again, &[merged, a]).unwrap();
         assert_eq!(footer(&again), (10, vec![Some("10".to_owned())]));    }
 
     #[test]
@@ -2834,11 +2790,7 @@ mod tests {
                 &dir.join(format!("profile/{}-{:08}.builds.parquet", flushed.build, flushed.seq)),
             );
             let string = |name: &str| {
-                read[0]
-                    .column(schema::BUILDS.column(name).unwrap())
-                    .as_string::<i32>()
-                    .value(0)
-                    .to_owned()
+                read[0].column(schema::BUILDS.column(name).unwrap()).text(0).unwrap().to_owned()
             };
             (string("tree"), string("blaze"))
         };
@@ -2881,13 +2833,12 @@ mod tests {
         assert_eq!((flushed.links, flushed.crate_deps), (1, 2));
         let links =
             read_back(&dir.join(format!("{}-{:08}.links.parquet", flushed.build, flushed.seq)));
-        let image =
-            links[0].column(schema::LINKS.column("image").unwrap()).as_string::<i32>().value(0);
-        assert_eq!(image, "app (bin)");
+        let image = links[0].column(schema::LINKS.column("image").unwrap()).text(0);
+        assert_eq!(image, Some("app (bin)"));
         let deps = read_back(
             &dir.join(format!("{}-{:08}.crate_deps.parquet", flushed.build, flushed.seq)),
         );
-        assert_eq!(deps.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        assert_eq!(deps.iter().map(Batch::num_rows).sum::<usize>(), 2);
 
         let again = history.flush(Some(62)).unwrap();
         assert_eq!((again.links, again.crate_deps), (0, 0), "a flush writes each row once");    }
@@ -2897,8 +2848,6 @@ mod tests {
     /// rows through the table's schema file.
     #[test]
     fn a_builds_account_is_written_at_the_next_flush_once() {
-        use arrow_array::types::UInt64Type;
-
         use crate::account::{Account, End, Origin, STEP_UNIT, Seen, Step};
         let (_tmp, dir) = scratch("accounts");
         let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
@@ -2915,26 +2864,19 @@ mod tests {
             &dir.join(format!("{}-{:08}.accounts.parquet", flushed.build, flushed.seq)),
         );
         let batch = &read[0];
-        let count = |name: &str| {
-            batch
-                .column(schema::ACCOUNTS.column(name).unwrap())
-                .as_primitive::<UInt64Type>()
-                .value(0)
-        };
+        let count = |name: &str| batch.column(schema::ACCOUNTS.column(name).unwrap()).u64s().unwrap().value(0);
         assert_eq!(
             ["build_id", "steps", "units", "by_workspace_file", "changes", "links", "by_unexplained"].map(count),
             [71, 1, 1, 1, 1, 2, 0]
         );
-        let first = batch.column(schema::ACCOUNTS.column("first_change").unwrap()).as_string::<i32>();
-        assert_eq!(first.value(0), "/w/src/lib.rs");
+        let first = batch.column(schema::ACCOUNTS.column("first_change").unwrap());
+        assert_eq!(first.text(0), Some("/w/src/lib.rs"));
         assert!(batch.column(schema::ACCOUNTS.column("alarms").unwrap()).is_null(0));
         let again = history.flush(Some(72)).unwrap();
         assert_eq!(again.accounts, 0, "a flush writes each account once");    }
 
     #[test]
     fn a_builds_query_counts_are_written_at_the_next_flush_column_for_column() {
-        use arrow_array::types::{UInt32Type, UInt64Type};
-
         use crate::facts::QueryCountRow;
         let (_tmp, dir) = scratch("query-counts");
         let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
@@ -2972,16 +2914,10 @@ mod tests {
         );
         let batch = &read[0];
         let count = |name: &str, row: usize| {
-            batch
-                .column(schema::QUERY_COUNTS.column(name).unwrap())
-                .as_primitive::<UInt64Type>()
-                .value(row)
+            batch.column(schema::QUERY_COUNTS.column(name).unwrap()).u64s().unwrap().value(row)
         };
-        let query = batch
-            .column(schema::QUERY_COUNTS.column("query").unwrap())
-            .as_dictionary::<UInt32Type>();
-        let names = query.values().as_string::<i32>();
-        assert_eq!(names.value(query.keys().value(1) as usize), "infer_body_query");
+        let query = batch.column(schema::QUERY_COUNTS.column("query").unwrap());
+        assert_eq!(query.text(1), Some("infer_body_query"));
         assert_eq!(
             [
                 "build_id",
@@ -3016,7 +2952,7 @@ mod tests {
         crate::install();
         std::thread::spawn(|| {
             let _build = flight::building(41);
-            let _span = tracing::info_span!(target: "blaze", "history flushed").entered();
+            let _span = blaze_trace::info_span!(target: "blaze", "history flushed").entered();
         })
         .join()
         .unwrap();
@@ -3033,17 +2969,10 @@ mod tests {
         let path = dir.join(format!("{}-{:08}.spans.parquet", flushed.build, flushed.seq));
         let spans = read_back(&path);
         let found = spans.iter().any(|batch| {
-            let names =
-                batch.column(schema::SPANS.column("name").unwrap()).as_dictionary::<UInt32Type>();
-            let commits =
-                batch.column(schema::SPANS.column("commit").unwrap()).as_dictionary::<UInt32Type>();
+            let names = batch.column(schema::SPANS.column("name").unwrap());
+            let commits = batch.column(schema::SPANS.column("commit").unwrap());
             (0..batch.num_rows()).any(|row| {
-                let name =
-                    names.values().as_string::<i32>().value(names.keys().value(row) as usize);
-                let commit = commits.keys().is_valid(row).then(|| {
-                    commits.values().as_string::<i32>().value(commits.keys().value(row) as usize)
-                });
-                name == "history flushed" && commit == Some("0123abc")
+                names.text(row) == Some("history flushed") && commits.text(row) == Some("0123abc")
             })
         });
         assert!(found, "the span is in the build's file, with the build's commit");
@@ -3071,7 +3000,7 @@ mod tests {
             let _build = flight::building(43);
             for _ in 0..bursts {
                 for _ in 0..burst {
-                    let _span = tracing::info_span!(target: "blaze", "history drained").entered();
+                    let _span = blaze_trace::info_span!(target: "blaze", "history drained").entered();
                 }
                 std::thread::sleep(3 * DRAIN);
             }
@@ -3086,20 +3015,11 @@ mod tests {
         let ours: usize = spans
             .iter()
             .map(|batch| {
-                let names = batch
-                    .column(schema::SPANS.column("name").unwrap())
-                    .as_dictionary::<UInt32Type>();
-                let threads = batch
-                    .column(schema::SPANS.column("thread").unwrap())
-                    .as_primitive::<UInt32Type>();
+                let names = batch.column(schema::SPANS.column("name").unwrap());
+                let threads = batch.column(schema::SPANS.column("thread").unwrap());
                 (0..batch.num_rows())
                     .filter(|&row| {
-                        threads.value(row) == tid
-                            && names
-                                .values()
-                                .as_string::<i32>()
-                                .value(names.keys().value(row) as usize)
-                                == "history drained"
+                        threads.int(row) == Some(tid.into()) && names.text(row) == Some("history drained")
                     })
                     .count()
             })
@@ -3155,7 +3075,7 @@ mod tests {
         let mut first = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         std::thread::spawn(|| {
             let _build = flight::building(KILLED);
-            let _span = tracing::info_span!(target: "blaze", "history killed mid-build").entered();
+            let _span = blaze_trace::info_span!(target: "blaze", "history killed mid-build").entered();
         })
         .join()
         .unwrap();
@@ -3276,7 +3196,7 @@ mod tests {
         let manifest = read_manifest(dir).unwrap();
         manifest
             .files(table.name)
-            .map(|it| read_back(&dir.join(it)).iter().map(RecordBatch::num_rows).sum::<usize>())
+            .map(|it| read_back(&dir.join(it)).iter().map(Batch::num_rows).sum::<usize>())
             .sum()
     }
 
@@ -3346,7 +3266,7 @@ mod tests {
             level: 1,
         };
         let path = dir.join(output.file_name());
-        concat(&path, &inputs, Writer::new().properties(output.table)).unwrap();
+        concat(&path, &inputs).unwrap();
         assert_eq!(
             listed_rows(&dir, &schema::BUILDS),
             2,
@@ -3459,7 +3379,7 @@ mod tests {
         let whole = start.elapsed();
         let n = rows.len() as f64;
         println!(
-            "{} spans: {:.0} ns a span to Arrow, {:.0} ns a span to Parquet, {:.1} bytes a span",
+            "{} spans: {:.0} ns a span to a batch, {:.0} ns a span to Parquet, {:.1} bytes a span",
             rows.len(),
             arrow.as_nanos() as f64 / n,
             (whole - arrow).as_nanos() as f64 / n,

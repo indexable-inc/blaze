@@ -633,7 +633,7 @@ impl Conn {
             // Its body is not read: the status is the answer.
             return self.end_get(n, RequestEnd::Done, cx);
         }
-        if get.request.method == http::Method::HEAD {
+        if get.request.method == crate::Method::Head {
             get.most = 0;
             get.exact = None;
             return;

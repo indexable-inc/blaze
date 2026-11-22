@@ -1,0 +1,38 @@
+[package]
+name = "blaze-comptime-sys"
+description = "The system layer of a compile-time child (D175): the table every outside C name of a proc macro's or build script's code records is bound to (the process's own definition for memory, strings and unwinding; the layer's answer from its own state; a blaze-comptime protocol call; or a refusal with the real errno and a finding), the sans-IO core that holds the child's descriptors, directory streams, environment, working directory and spawned commands, and, under the `child` feature, the C functions the launcher binds; no_std, the allocator passed in"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[features]
+# The C functions themselves (child.rs), linked into the launcher only: the one place this
+# crate holds `unsafe` and the process's one layer.
+child = []
+
+[dependencies]
+# `Vec` in the caller's allocator; the plant seam.
+blaze-own.workspace = true
+# The protocol: `Call`, `Answer`, `Guest`, `SysError`.
+blaze-comptime.workspace = true
+# Lexical normalization of a spelled path (an inode number is the digest of its one spelling).
+blaze-roots.workspace = true
+# The inode numbers' digest.
+blaze-blake3.workspace = true
+
+[dev-dependencies]
+# The simulation: drawn C call sequences against a model, planted-bug controls.
+blaze-sim.workspace = true
+# `blaze_own::testing::heap()`: a test's root allocator (D102), never `Global`.
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

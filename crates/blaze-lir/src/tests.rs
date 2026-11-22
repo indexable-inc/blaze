@@ -745,7 +745,7 @@ fn the_example_prints_as_written_and_parses_as_built() {
 /// The rule `verify` refuses `func` by.
 fn refused(func: &Func<Global>) -> &'static str {
     match verify(func.view()) {
-        Ok(()) => panic!("LIR that breaks a rule verified:\n{}", print(func.view())),
+        Ok(_) => panic!("LIR that breaks a rule verified:\n{}", print(func.view())),
         Err(error) => error.rule,
     }
 }
@@ -910,4 +910,40 @@ fn constants_take_the_narrowest_form() {
     assert_eq!(view.operands(wide.index()).constant(), &[0u32, 1 << 8][..]);
     assert_eq!(view.data[byte.index()], 0xff, "a constant is truncated to its width");
     let _ = verify::structure(view);
+}
+
+/// The access cap (`Builder::cap_access_align`) lowers every later plain access's claimed
+/// alignment and never raises it again: the Reference, "Type layout",
+/// `[layout.repr.alignment.packed-fields]`: under `packed` a field is positioned at "the
+/// smaller of the specified alignment and the alignment of the field's type". Expected:
+/// `test tests::the_access_cap_lowers_later_accesses_only ... ok`. Without the cap the accesses
+/// after it print `!m0` (`align 2`) and the test fails.
+#[test]
+fn the_access_cap_lowers_later_accesses_only() {
+    let mut b = Builder::<Global, Full>::new_in(64, Global);
+    let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[]);
+    b.set_signature(sig);
+    let entry = b.create_block(BlockKind::Normal);
+    b.begin(entry);
+    let p = b.param(Ty::PTR);
+    let before = b.load(Ty::I32, Flags::NONE, p, 0, MemAttrs::aligned(2));
+    b.cap_access_align(0);
+    let after = b.load(Ty::I32, Flags::NONE, p, 1, MemAttrs::aligned(2));
+    // A wider cap asked later keeps the least.
+    b.cap_access_align(1);
+    b.store(Flags::NONE, before, p, 5, MemAttrs::aligned(2));
+    b.store(Flags::NONE, after, p, 9, MemAttrs::aligned(2));
+    b.ret(&[]);
+    let func = b.finish_checked().expect("the capped function is valid");
+    let text = print(func.view());
+    assert!(text.contains("mem m0 = align 2 src_align 0"), "the access before the cap keeps its alignment:\n{text}");
+    assert!(text.contains("v1 = load i32 v0, 0 !m0\n"), "the access before the cap claims its alignment:\n{text}");
+    // A capped claim of `align 0` is the default attributes: no mem row, no `!m` on the access.
+    // Without the cap these would claim `align 2` (`!m0`).
+    assert!(text.contains("v2 = load i32 v0, 1\n"), "an access after the cap claims at most the cap:\n{text}");
+    assert!(
+        text.contains("store v1, v0, 5\n") && text.contains("store v2, v0, 9\n"),
+        "a later wider cap raised the claim:\n{text}"
+    );
+    assert!(!text.contains("mem m1"), "an access after the cap made a mem row of its own:\n{text}");
 }

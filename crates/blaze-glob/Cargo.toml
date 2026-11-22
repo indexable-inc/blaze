@@ -1,0 +1,20 @@
+[package]
+name = "blaze-glob"
+description = "Unix shell patterns as cargo reads `workspace.members` (glob 0.3's syntax and matches, its default options) and the walk that expands one over a tree; no dependency"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dev-dependencies]
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

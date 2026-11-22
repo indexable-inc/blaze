@@ -3,23 +3,110 @@
 //! as cargo's `unit_dependencies` derives it, and the strip and debuginfo adjustments of cargo's
 //! `rebuild_unit_graph_shared` are applied over the graph's dependencies.
 
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, anyhow, bail};
-use blaze_hash::HashMap;
-use blaze_manifest::config::CompileKind;
+use blaze_hash::{FixedState, Map, MapOpts};
+use blaze_manifest::config::{CompileKind, ConfigError};
 use blaze_manifest::diagnostic::report;
 use blaze_manifest::files::Disk;
 use blaze_manifest::manifest::PackageId as Pkg;
 use blaze_manifest::metadata::root_manifest;
 use blaze_manifest::profiles::{Profile, Profiles, UnitFor, requested_profile};
 use blaze_manifest::source::{self, SourceId};
-use blaze_manifest::{Config, Context, Workspace};
-use cargo_util_schemas::core::PackageIdSpec;
-use cargo_util_schemas::lockfile::TomlLockfile;
+use blaze_manifest::{Config, Context, ManifestError, Workspace};
+use blaze_resolve::PackageIdSpec;
+use blaze_semver::{Limits, Version};
 use serde_json::Value;
 use std::alloc::Global;
+
+/// What the walk refused: blaze-manifest's error, or one about cargo's arguments, unit graph or
+/// lock file, which the fixtures were recorded to have none of.
+#[derive(Debug)]
+enum WalkError {
+    Manifest(ManifestError),
+    NoCommand,
+    MissingValue { flag: String },
+    Graph(serde_json::Error),
+    PackageId { id: String, what: PackageIdWhat },
+    Lockfile { path: PathBuf, error: Box<dyn core::error::Error + Send + Sync> },
+    LockVersion { name: String, version: String, error: blaze_semver::Error },
+    NoUnits,
+    NoRoots,
+    RootNotIndex,
+    RootNotUnit { root: usize },
+    TwoProfiles { unit: usize, identity: String, first: String, second: String },
+    Unreached { unit: usize },
+}
+
+/// What a unit's `pkg_id` lacks.
+#[derive(Debug)]
+enum PackageIdWhat {
+    Spec(blaze_resolve::ResolveError),
+    NoVersion,
+    NoSource,
+    NoKind,
+}
+
+impl fmt::Display for WalkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WalkError::Manifest(e) => write!(f, "{e:#}"),
+            WalkError::NoCommand => f.write_str("no cargo command given"),
+            WalkError::MissingValue { flag } => {
+                write!(f, "a value is required for '{flag} <VALUE>'")
+            }
+            WalkError::Graph(e) => write!(f, "cargo's unit graph: {e}"),
+            WalkError::PackageId { id, what } => match what {
+                PackageIdWhat::Spec(e) => write!(f, "package id `{id}`: {e}"),
+                PackageIdWhat::NoVersion => write!(f, "package id `{id}` has no version"),
+                PackageIdWhat::NoSource => write!(f, "package id `{id}` has no source"),
+                PackageIdWhat::NoKind => write!(f, "package id `{id}` has no source kind"),
+            },
+            WalkError::Lockfile { path, error } => {
+                write!(f, "failed to parse `{}`: {error}", path.display())
+            }
+            WalkError::LockVersion { name, version, error } => {
+                write!(f, "`{name}` {version} in the lock file: {error}")
+            }
+            WalkError::NoUnits => f.write_str("no `units` in the unit graph"),
+            WalkError::NoRoots => f.write_str("no `roots` in the unit graph"),
+            WalkError::RootNotIndex => f.write_str("a root is not an index"),
+            WalkError::RootNotUnit { root } => write!(f, "root {root} is not a unit"),
+            WalkError::TwoProfiles { unit, identity, first, second } => {
+                write!(f, "unit {unit} ({identity}) gets two profiles:\n{first}\n{second}")
+            }
+            WalkError::Unreached { unit } => write!(f, "unit {unit} is reached from no root"),
+        }
+    }
+}
+
+impl core::error::Error for WalkError {}
+
+impl From<ManifestError> for WalkError {
+    fn from(e: ManifestError) -> WalkError {
+        WalkError::Manifest(e)
+    }
+}
+
+impl From<ConfigError> for WalkError {
+    fn from(e: ConfigError) -> WalkError {
+        WalkError::Manifest(e.into())
+    }
+}
+
+/// `err` as cargo prints it: blaze-manifest's with its report, the walk's own plainly.
+fn report_walk(err: &WalkError, cwd: &Path) -> String {
+    match err {
+        WalkError::Manifest(e) => report(e, cwd),
+        other => format!("error: {other}"),
+    }
+}
+
+/// `value` as one line of JSON, for comparing profiles.
+fn json<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string(value).expect("a profile serializes")
+}
 
 /// What the profiles of `cargo <args> --unit-graph` were made from.
 pub(crate) struct Output {
@@ -40,9 +127,9 @@ struct Command {
     manifest_path: Option<PathBuf>,
 }
 
-fn parse_args(args: &[String]) -> anyhow::Result<Command> {
+fn parse_args(args: &[String]) -> Result<Command, WalkError> {
     let mut args = args.iter().cloned();
-    let Some(name) = args.next() else { bail!("no cargo command given") };
+    let Some(name) = args.next() else { return Err(WalkError::NoCommand) };
     let mut command = Command {
         requested_profile: String::new(),
         target: None,
@@ -61,7 +148,7 @@ fn parse_args(args: &[String]) -> anyhow::Result<Command> {
             inline
                 .clone()
                 .or_else(|| args.next())
-                .ok_or_else(|| anyhow!("a value is required for '{flag} <VALUE>'"))
+                .ok_or_else(|| WalkError::MissingValue { flag: flag.clone() })
         };
         match flag.as_str() {
             "--release" | "-r" => release = true,
@@ -101,6 +188,7 @@ pub(crate) fn main(
     let mut config = match Config::load(cwd, env, &[]) {
         Ok(config) => config,
         Err(err) => {
+            let err = ManifestError::from(err);
             return Output { code: 101, stdout: String::new(), stderr: report(&err, cwd) + "\n" };
         }
     };
@@ -121,7 +209,7 @@ pub(crate) fn main(
     match result {
         Ok(stdout) => Output { code: 0, stdout, stderr },
         Err(err) => {
-            let _ = writeln!(stderr, "{}", report(&err, cwd));
+            let _ = writeln!(stderr, "{}", report_walk(&err, cwd));
             Output { code: 101, stdout: String::new(), stderr }
         }
     }
@@ -133,8 +221,8 @@ fn run(
     command: &Command,
     graph: &str,
     stderr: &mut String,
-) -> anyhow::Result<String> {
-    let root = root_manifest(command.manifest_path.as_deref(), ctx)?;
+) -> Result<String, WalkError> {
+    let root = root_manifest(command.manifest_path.as_deref(), ctx).map_err(ManifestError::from)?;
     let ws = Workspace::new(&root, ctx)?;
     for warning in ws.workspace_warnings() {
         let _ = writeln!(stderr, "warning: {warning}");
@@ -149,16 +237,17 @@ fn run(
         &command.requested_profile,
         host,
     )?;
-    let graph: Value = serde_json::from_str(graph).context("cargo's unit graph")?;
+    let graph: Value = serde_json::from_str(graph).map_err(WalkError::Graph)?;
     let profiles = profiles_of(&ws, &profiles, command, &graph, stderr)?;
-    Ok(serde_json::to_string_pretty(&profiles)? + "\n")
+    Ok(serde_json::to_string_pretty(&profiles).expect("profiles serialize") + "\n")
 }
 
-fn package(pkg_id: &str) -> anyhow::Result<Pkg> {
-    let spec = PackageIdSpec::parse(pkg_id).with_context(|| format!("package id `{pkg_id}`"))?;
-    let version = spec.version().ok_or_else(|| anyhow!("package id `{pkg_id}` has no version"))?;
-    let url = spec.url().ok_or_else(|| anyhow!("package id `{pkg_id}` has no source"))?;
-    let kind = spec.kind().ok_or_else(|| anyhow!("package id `{pkg_id}` has no source kind"))?;
+fn package(pkg_id: &str) -> Result<Pkg, WalkError> {
+    let refuse = |what| WalkError::PackageId { id: pkg_id.to_owned(), what };
+    let spec = PackageIdSpec::parse(pkg_id).map_err(|e| refuse(PackageIdWhat::Spec(e)))?;
+    let version = spec.version().ok_or_else(|| refuse(PackageIdWhat::NoVersion))?;
+    let url = spec.url().ok_or_else(|| refuse(PackageIdWhat::NoSource))?;
+    let kind = spec.kind().ok_or_else(|| refuse(PackageIdWhat::NoKind))?;
     let source_id = source::from_spec(kind, url)?;
     Ok(Pkg { name: spec.name().to_owned(), version, source_id })
 }
@@ -166,14 +255,23 @@ fn package(pkg_id: &str) -> anyhow::Result<Pkg> {
 /// The packages of the workspace's `Cargo.lock`, which cargo checks the package overrides
 /// against: every package of the resolve, built or not. A path package's directory is that of
 /// the unit or member of its name and version.
-fn lock_packages(ws: &Workspace<'_, Disk>, units: &[Unit]) -> anyhow::Result<Option<Vec<Pkg>>> {
+fn lock_packages(
+    ws: &Workspace<'_, Disk>,
+    units: &[Unit],
+) -> Result<Option<Vec<Pkg>>, WalkError> {
     let path = ws.root().join("Cargo.lock");
     let Ok(text) = std::fs::read_to_string(&path) else { return Ok(None) };
-    let lock: TomlLockfile =
-        toml::from_str(&text).with_context(|| format!("failed to parse `{}`", path.display()))?;
+    let lock = blaze_resolve::lockfile::parse(&text)
+        .map_err(|error| WalkError::Lockfile { path: path.clone(), error: error.into() })?;
     let mut packages = Vec::new();
     for package in lock.package.into_iter().flatten() {
-        let version: semver::Version = package.version.parse()?;
+        let version = Version::parse_in(&package.version, Limits::CARGO, Global).map_err(
+            |error| WalkError::LockVersion {
+                name: package.name.clone(),
+                version: package.version.clone(),
+                error,
+            },
+        )?;
         let source_id = match &package.source {
             Some(locked) => source::from_spec(locked.kind(), locked.url())?,
             None => {
@@ -188,7 +286,7 @@ fn lock_packages(ws: &Workspace<'_, Disk>, units: &[Unit]) -> anyhow::Result<Opt
                 match (unit, member) {
                     (Some(u), _) => u.pkg.source_id,
                     (None, Some((_, m))) => m.package_id.source_id,
-                    (None, None) => SourceId::for_path(ws.root())?,
+                    (None, None) => SourceId::for_path(ws.root()).map_err(ManifestError::from)?,
                 }
             }
         };
@@ -247,8 +345,8 @@ fn profiles_of(
     command: &Command,
     graph: &Value,
     stderr: &mut String,
-) -> anyhow::Result<Vec<Profile>> {
-    let units = graph["units"].as_array().ok_or_else(|| anyhow!("no `units` in the unit graph"))?;
+) -> Result<Vec<Profile>, WalkError> {
+    let units = graph["units"].as_array().ok_or(WalkError::NoUnits)?;
     let mut parsed = Vec::new();
     for unit in units {
         let pkg = package(unit["pkg_id"].as_str().unwrap_or_default())?;
@@ -266,12 +364,8 @@ fn profiles_of(
             Some(t) => CompileKind::Target(t.to_owned()),
             None => CompileKind::Host,
         };
-        let identity = serde_json::to_string(&[
-            &unit["pkg_id"],
-            &unit["target"],
-            &unit["mode"],
-            &unit["features"],
-        ])?;
+        let identity =
+            json(&[&unit["pkg_id"], &unit["target"], &unit["mode"], &unit["features"]]);
         parsed.push(Unit {
             pkg,
             is_member,
@@ -292,7 +386,11 @@ fn profiles_of(
     if let Some(locked) = &locked {
         packages.extend(locked.iter());
     } else {
-        let mut seen = blaze_hash::HashSet::new_in(Global);
+        let mut seen = blaze_hash::Set::new(blaze_hash::SetOpts {
+            hasher: blaze_hash::FixedState,
+            alloc: Global,
+            capacity: None,
+        });
         for (unit, value) in parsed.iter().zip(units) {
             if seen.insert(value["pkg_id"].as_str()) {
                 packages.push(&unit.pkg);
@@ -305,8 +403,8 @@ fn profiles_of(
         let _ = writeln!(stderr, "warning: {warning}");
     }
     let mut walk =
-        Walk { units: &parsed, profiles, interned: Vec::new(), by_unit: HashMap::new_in(Global) };
-    let roots = graph["roots"].as_array().ok_or_else(|| anyhow!("no `roots` in the unit graph"))?;
+        Walk { units: &parsed, profiles, interned: Vec::new(), by_unit: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }) };
+    let roots = graph["roots"].as_array().ok_or(WalkError::NoRoots)?;
     let is_test_command = matches!(command.name.as_str(), "test" | "bench");
     let requested = match &command.target {
         Some(t) => CompileKind::Target(t.clone()),
@@ -314,8 +412,8 @@ fn profiles_of(
     };
     let mut root_units = Vec::new();
     for root in roots {
-        let i = root.as_u64().ok_or_else(|| anyhow!("a root is not an index"))? as usize;
-        let unit = parsed.get(i).ok_or_else(|| anyhow!("root {i} is not a unit"))?;
+        let i = root.as_u64().ok_or(WalkError::RootNotIndex)? as usize;
+        let unit = parsed.get(i).ok_or(WalkError::RootNotUnit { root: i })?;
         let profile_for = if unit.is_any_test() || is_test_command {
             UnitFor::new_test()
         } else if unit.for_host() {
@@ -349,21 +447,20 @@ fn profiles_of(
     for (n, interned) in walk.interned.iter().enumerate() {
         let Some(profile) = shared[n].take() else { continue };
         match &out[interned.unit] {
-            Some(prev) if serde_json::to_string(prev)? != serde_json::to_string(&profile)? => {
-                bail!(
-                    "unit {} ({}) gets two profiles:\n{}\n{}",
-                    interned.unit,
-                    parsed[interned.unit].identity,
-                    serde_json::to_string(prev)?,
-                    serde_json::to_string(&profile)?
-                )
+            Some(prev) if json(prev) != json(&profile) => {
+                return Err(WalkError::TwoProfiles {
+                    unit: interned.unit,
+                    identity: parsed[interned.unit].identity.clone(),
+                    first: json(prev),
+                    second: json(&profile),
+                });
             }
             _ => out[interned.unit] = Some(profile),
         }
     }
     out.into_iter()
         .enumerate()
-        .map(|(i, v)| v.ok_or_else(|| anyhow!("unit {i} is reached from no root")))
+        .map(|(i, v)| v.ok_or(WalkError::Unreached { unit: i }))
         .collect()
 }
 
@@ -371,7 +468,7 @@ struct Walk<'a> {
     units: &'a [Unit],
     profiles: &'a Profiles,
     interned: Vec<Interned>,
-    by_unit: HashMap<usize, Vec<usize>, Global>,
+    by_unit: Map<usize, Vec<usize>, FixedState, Global>,
 }
 
 impl Walk<'_> {

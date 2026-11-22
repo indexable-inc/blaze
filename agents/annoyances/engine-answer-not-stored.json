@@ -1,0 +1,15 @@
+{
+ "id": "engine-answer-not-stored",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane EQ",
+ "where": "crates/blaze-cli/src/engine_check.rs `check` (Engine::new_in over Answer::new_in every request); crates/blaze-engine/src/pages.rs and crates/blaze-cli/src/engine_answer.rs now",
+ "what": "`blaze engine-check` run twice on an unchanged hello world took 5.71 s then 6.61 s: every cause in the second profile was `new`, because the engine's answer lived only in the process. The engine core was built and simulated as incremental (owed cells, causes, the certificate) but nothing wrote its answer down, so every request was a cold one.",
+ "cost": "the whole incremental half of E6 unmeasurable until this lane",
+ "cause": "the driver was written plan-first and the stored answer was left for later; the core's simulation fed each request the previous in-memory answer, so it never exercised a restore",
+ "whys": "no test ran two commands in a row against one home; the history simulation passed the Answer by value between requests",
+ "class": "state that a sans-IO core keeps between requests but no driver persists: invisible to the core's own simulation",
+ "prevention": "done: the history simulation now starts every request from the last answer encoded to pages and decoded (sim.rs `store_and_restore`), so a restore is held to a fresh build; the command-level test runs engine-check repeatedly over one home",
+ "annoyance": "the runner shows a failing test's stdout only; Checked had no names of entered tasks, so command tests assert counts and groups, not names",
+ "workaround": "assertion messages carry the entries table",
+ "state": "fixed in part: findings of rows that stand are not read back from records yet (stated as a note and INCOMPLETE status)"
+}

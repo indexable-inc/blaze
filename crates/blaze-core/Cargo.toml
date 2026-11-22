@@ -16,25 +16,38 @@ doctest = false
 [dependencies]
 blaze-hash.workspace = true
 blaze-mem.workspace = true
+# D169's meter: an effect's kind (`Effect::metered`), opens (descriptors.rs), lock waits
+# (lock.rs) and parks (wait.rs) add to the thread's cells.
+blaze-meter.workspace = true
+# `SortedTexts`: a listing's names as one buffer and its ends (`listing`). Already under
+# blaze-mem, so no new crate in the graph.
+blaze-own.workspace = true
+# The channel's queues (`chan`), and the queues the drivers hand work through.
+blaze-queue.workspace = true
 blaze-radix.workspace = true
 blaze-rng.workspace = true
-crossbeam-channel.workspace = true
-crossbeam-queue.workspace = true
-parking_lot.workspace = true
+blaze-spin.workspace = true
+# `trust::pem`: the PEM bundles of the machine's TLS roots (portable; only reading the system's
+# store is per-OS).
+blaze-base64.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 # The one home of system calls (docs/v2/plan/design/sys.md): the drivers move onto it call by
-# call, and `libc` above goes when the last has.
-[target.'cfg(target_os = "linux")'.dependencies]
+# call, and `libc` above goes when the last has. On macOS its table of calls resolved at first
+# use (`blaze_sys::macos::cold`). On Windows its declarations of the system DLLs' exports
+# (`blaze_sys::windows`, D180).
+[target.'cfg(any(target_os = "linux", target_os = "macos", windows))'.dependencies]
 blaze-sys.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Security_Authorization"] }
 
 [target.'cfg(blaze_check)'.dependencies]
 blaze-check.workspace = true
+
+[features]
+# `blaze_core::testing::os()` (os.rs): a test's root of real-OS authority, for the crates whose
+# tests make a native driver or world. Turned on in their dev-dependencies only.
+testing = []
 
 [lints]
 workspace = true
@@ -43,4 +56,3 @@ workspace = true
 blaze-alloc-count.workspace = true
 blaze-ids.workspace = true
 blaze-sim.workspace = true
-blaze-spin.workspace = true

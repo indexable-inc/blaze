@@ -1,0 +1,4 @@
+[package]
+name = "ladder-x-iter-05-enumerate"
+version = "0.1.0"
+edition = "blaze-2026.11"

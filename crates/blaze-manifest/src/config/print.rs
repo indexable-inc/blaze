@@ -4,21 +4,28 @@
 //! answers the caller's: this module runs nothing.
 
 use std::collections::BTreeSet;
+use std::error::Error;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use anyhow::{Context as _, bail};
-use cargo_platform::Cfg;
+use blaze_resolve::Cfg;
 
 use super::Config;
+use super::error::{ConfigError, ConfigWhat};
 use super::target::{CompileKind, Flags};
 use crate::files::Files;
+
+/// What the caller's rustc failed with, as a cause.
+// dyn: the caller's error, held only on an error path.
+fn rustc_failed(error: impl Error + Send + Sync + 'static) -> ConfigError {
+    ConfigError::foreign(error)
+}
 
 impl<F: Files> Config<F> {
     /// The rustc cargo runs, as `GlobalContext::get_tool`: `RUSTC` (against the current
     /// directory when it has a separator), else `build.rustc`. `None` is cargo's default,
     /// the toolchain's own rustc.
-    pub fn rustc_program(&self) -> anyhow::Result<Option<PathBuf>> {
+    pub fn rustc_program(&self) -> Result<Option<PathBuf>, ConfigError> {
         if let Some(path) = self.env("RUSTC") {
             let relative = path.contains('/') || path.contains('\\');
             return Ok(Some(if relative { self.cwd().join(path) } else { PathBuf::from(path) }));
@@ -29,15 +36,16 @@ impl<F: Files> Config<F> {
     /// The kinds a command with `--target` `targets` builds for, as cargo's
     /// `CompileKind::from_requested_targets`: those, else `build.target`, else the host; each
     /// once, in order of their names.
-    pub fn requested_kinds(&self, targets: &[String]) -> anyhow::Result<Vec<CompileKind>> {
-        let dedup = |targets: &[String]| -> anyhow::Result<Vec<CompileKind>> {
+    pub fn requested_kinds(&self, targets: &[String]) -> Result<Vec<CompileKind>, ConfigError> {
+        let dedup = |targets: &[String]| -> Result<Vec<CompileKind>, ConfigError> {
             let mut kinds = BTreeSet::new();
             for target in targets {
                 if target.is_empty() {
-                    bail!("target was empty");
+                    return Err(ConfigError::new(ConfigWhat::TargetEmpty));
                 }
                 if target.ends_with(".json") {
-                    bail!("blaze does not read a target spec file yet: `{target}`");
+                    let target = target.clone();
+                    return Err(ConfigError::new(ConfigWhat::TargetSpec { target }));
                 }
                 kinds.insert(target.clone());
             }
@@ -57,17 +65,17 @@ impl<F: Files> Config<F> {
     /// the `cfg` tables first, then again with the `cfg` rustc prints under those, at most
     /// twice, warning when they still differ. `cfg` is rustc's answer for those flags. `rustc`
     /// answers the arguments given as the rustc cargo runs would, `Err` when it fails.
-    pub fn target_rustflags(
+    pub fn target_rustflags<E: Error + Send + Sync + 'static>(
         &self,
         requested: &[CompileKind],
         host: &str,
         kind: &CompileKind,
-        rustc: &mut impl FnMut(&[String]) -> anyhow::Result<String>,
-    ) -> anyhow::Result<(Vec<String>, Vec<Cfg>)> {
+        rustc: &mut impl FnMut(&[String]) -> Result<String, E>,
+    ) -> Result<(Vec<String>, Vec<Cfg>), ConfigError> {
         let mut rustflags = self.extra_args(requested, host, None, kind, Flags::Rust)?;
         let mut turn = 0;
         loop {
-            let output = rustc(&cfg_args(&rustflags, kind))?;
+            let output = rustc(&cfg_args(&rustflags, kind)).map_err(rustc_failed)?;
             let cfg = parse_cfg(&output)?;
             let new_flags = self.extra_args(requested, host, Some(&cfg), kind, Flags::Rust)?;
             let fixed = new_flags == rustflags;
@@ -90,21 +98,18 @@ impl<F: Files> Config<F> {
     /// What `cargo rustc --print <what>` with `--target` `targets` and `-- <rustc_args>` prints:
     /// for each kind asked for, rustc's answer to that kind's flags, `rustc_args`, the target
     /// and `--print <what>`, an empty line between kinds.
-    pub fn rustc_print(
+    pub fn rustc_print<E: Error + Send + Sync + 'static>(
         &self,
         targets: &[String],
         what: &str,
         rustc_args: &[String],
-        rustc: &mut impl FnMut(&[String]) -> anyhow::Result<String>,
-    ) -> anyhow::Result<String> {
-        let verbose = rustc(&["-vV".to_owned()])?;
-        let host = verbose
-            .lines()
-            .find_map(|it| it.strip_prefix("host: "))
-            .with_context(|| {
-                format!("`rustc -vV` didn't have a line for `host:`, got:\n{verbose}")
-            })?
-            .to_owned();
+        rustc: &mut impl FnMut(&[String]) -> Result<String, E>,
+    ) -> Result<String, ConfigError> {
+        let verbose = rustc(&["-vV".to_owned()]).map_err(rustc_failed)?;
+        let Some(host) = verbose.lines().find_map(|it| it.strip_prefix("host: ")) else {
+            return Err(ConfigError::new(ConfigWhat::NoHostLine { verbose: verbose.clone() }));
+        };
+        let host = host.to_owned();
         let requested = self.requested_kinds(targets)?;
         let mut out = String::new();
         for (index, kind) in requested.iter().enumerate() {
@@ -115,7 +120,7 @@ impl<F: Files> Config<F> {
             args.extend(rustc_args.iter().cloned());
             add_target_arg(kind, &mut args);
             args.extend(["--print".to_owned(), what.to_owned()]);
-            out += &rustc(&args)?;
+            out += &rustc(&args).map_err(rustc_failed)?;
         }
         Ok(out)
     }
@@ -140,12 +145,12 @@ pub fn cfg_args(rustflags: &[String], kind: &CompileKind) -> Vec<String> {
 
 /// The `cfg` of rustc's `--print cfg`, as cargo keeps it: without `proc_macro`, which a probe
 /// that names the proc-macro crate type has.
-pub fn parse_cfg(output: &str) -> anyhow::Result<Vec<Cfg>> {
+pub fn parse_cfg(output: &str) -> Result<Vec<Cfg>, ConfigError> {
     let cfg = output
         .lines()
         .map(Cfg::from_str)
         .filter(|it| !matches!(it, Ok(Cfg::Name(name)) if name.as_str() == "proc_macro"));
-    cfg.collect::<Result<Vec<_>, _>>().with_context(|| {
-        format!("failed to parse the cfg from `rustc --print=cfg`, got:\n{output}")
+    cfg.collect::<Result<Vec<_>, _>>().map_err(|e| {
+        ConfigError::foreign(e).context(ConfigWhat::ParseCfg { output: output.to_owned() })
     })
 }

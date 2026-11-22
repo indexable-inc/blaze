@@ -10,7 +10,7 @@ toolchain = "nightly-2026-10-27"
 newest = "2026-10-30T20:31:26Z"
 
 [native.llvm]
-pin = "crates/hir-ty-codegen/llvm.json"
+pin = "pins/llvm.json"
 
 [native.llvm.targets]
 aarch64-apple-darwin = "e95fc3b4bd332691ec96b022850b5e5b8684b4a2060c05c31b481c31f0f1a866"

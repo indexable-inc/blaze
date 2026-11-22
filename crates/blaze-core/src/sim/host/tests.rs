@@ -89,7 +89,7 @@ fn datagrams(seed: u64, plant: Option<Plant>, saw: &mut Saw) -> Result<(), Strin
     drive(&mut sim, &mut effects, |_, Completion { tag, done }, effects| {
         let mut fail = |why: String| _ = broke.get_or_insert(format!("seed {seed}: {why}"));
         match (tag, done) {
-            (Tag(n @ (1 | 2)), Done::Bound { sock, local }) => {
+            (Tag(n @ (1 | 2)), Done::Bound { sock, local, .. }) => {
                 bound[n as usize - 1] = Some((sock, local));
                 if let [Some(_), Some((to, at))] = bound {
                     let (from, _) = bound[0].expect("both bound");
@@ -181,7 +181,7 @@ fn a_datagram_too_long_or_to_a_socket_not_bound_is_refused_naming_it() {
     let options = Options::default();
     let mut effects = vec![Effect::Bind { at, options, tag: Tag(1) }];
     run_until_idle(&mut sim, &mut effects, |done, _| answers.push(done)).unwrap();
-    let Done::Bound { sock, local } = answers.pop().unwrap().done else { panic!("not bound") };
+    let Done::Bound { sock, local, .. } = answers.pop().unwrap().done else { panic!("not bound") };
     assert_eq!(local, at);
     let mut long = Batch::new();
     long.push(at, Ecn::NotEct, &vec![0; DATAGRAM_MOST + 1]);
@@ -404,15 +404,17 @@ fn something_under(dir: &str, made: &Names, files: &Names) -> bool {
     made.iter().chain(files.iter()).any(|it| *it != dir && is_under(it, dir))
 }
 
-/// Whether the model has `dir` a directory: made, or something under it.
-fn model_dir(dir: &str, made: &Names, files: &Names) -> bool {
-    made.contains(dir) || something_under(dir, made, files)
+/// Whether the model has `dir` a directory: made (by a make of it, or by a write under it),
+/// and not removed since. A directory stays when its last file goes, as a disk's does.
+fn model_dir(dir: &str, made: &Names) -> bool {
+    made.contains(dir)
 }
 
 /// A client that makes and removes directories and writes and removes files under them, one
 /// at a time, one in six failing. The oracle, a model of the disk: each answer is what the
-/// model says (a failure injected changing nothing), so no file goes but by a remove of it,
-/// and after each the simulated disk has the model's files and directories.
+/// model says (a failure injected changing nothing), so no file goes but by a remove of it, a
+/// write makes the directories it is under, and after each the simulated disk has the model's
+/// files and directories.
 fn dirs(seed: u64, plant: Option<Plant>) -> Result<(), String> {
     let mut sim = Sim::new(seed, Faults { fail_one_in: 6, ..Faults::default() });
     if let Some(plant) = plant {
@@ -426,10 +428,9 @@ fn dirs(seed: u64, plant: Option<Plant>) -> Result<(), String> {
         let file = FILES[rng.index(FILES.len())];
         let (effect, expected) = match rng.below(4) {
             0 => {
-                let parent_there = dir
-                    .rsplit_once('/')
-                    .is_none_or(|(parent, _)| model_dir(parent, &made, &files));
-                let ok = !model_dir(dir, &made, &files) && parent_there;
+                let parent_there =
+                    dir.rsplit_once('/').is_none_or(|(parent, _)| model_dir(parent, &made));
+                let ok = !model_dir(dir, &made) && parent_there;
                 (Effect::MakeDir { dir: name(dir), tag: Tag(1) }, ok)
             }
             1 => {
@@ -465,7 +466,12 @@ fn dirs(seed: u64, plant: Option<Plant>) -> Result<(), String> {
             match effect {
                 Effect::MakeDir { .. } => _ = made.insert(dir),
                 Effect::RemoveDir { .. } => _ = made.remove(dir),
-                Effect::Write { .. } => _ = files.insert(file),
+                Effect::Write { .. } => {
+                    files.insert(file);
+                    for (at, _) in file.match_indices('/') {
+                        made.insert(&file[..at]);
+                    }
+                }
                 _ => _ = files.remove(file),
             }
         }
@@ -475,7 +481,7 @@ fn dirs(seed: u64, plant: Option<Plant>) -> Result<(), String> {
             }
         }
         for dir in DIRS {
-            if sim.is_dir(&name(dir)) != model_dir(dir, &made, &files) {
+            if sim.is_dir(&name(dir)) != model_dir(dir, &made) {
                 return Err(format!("{what}: {dir} a directory or not, not as the model says"));
             }
         }
@@ -499,12 +505,18 @@ fn a_directory_made_is_listed_stated_and_removed_empty() {
     let mut effects = vec![Effect::MakeDir { dir: name("x"), tag: Tag(1) }];
     run_until_idle(&mut sim, &mut effects, |it, _| answers.push(it.done)).unwrap();
     let mut effects = vec![
-        Effect::List { dir: name("x"), tag: Tag(2) },
+        Effect::List { dir: name("x").into(), tag: Tag(2) },
         Effect::Stat { file: name("x"), tag: Tag(3) },
         Effect::MakeDir { dir: name("x/y/z"), tag: Tag(4) },
         Effect::MakeDir { dir: name("x"), tag: Tag(5) },
     ];
     run_until_idle(&mut sim, &mut effects, |it, _| answers.push(it.done)).unwrap();
+    // x's name is its parent's, the root's: durable once the root is synced (dir_names.rs).
+    let mut effects = vec![Effect::SyncDir { dir: crate::DirName::Root, tag: Tag(8) }];
+    run_until_idle(&mut sim, &mut effects, |it, _| {
+        assert!(matches!(it.done, Done::Synced), "the root's sync: {:?}", it.done)
+    })
+    .unwrap();
     sim.crash();
     let mut effects = vec![Effect::RemoveDir { dir: name("x"), tag: Tag(6) }];
     run_until_idle(&mut sim, &mut effects, |it, _| answers.push(it.done)).unwrap();
@@ -538,8 +550,15 @@ fn each_planted_bug_is_caught() {
             Plant::BarriersNotKept
             | Plant::RenameFlushesOthers
             | Plant::PutBackWithBarriers
-            | Plant::SyncCoversLess => {
+            | Plant::SyncCoversLess
+            | Plant::FileSyncKeepsName => {
                 unreachable!("{plant:?} is the disk's, caught by its own controls (sim/world.rs)")
+            }
+            Plant::DirNamesDurable => {
+                unreachable!("{plant:?} is caught by its own controls (sim/host/dir_names/tests.rs)")
+            }
+            Plant::MadeParentsNotSynced => {
+                unreachable!("{plant:?} is caught by scenario (5)'s control (sim/host/dir_names/tests.rs)")
             }
         })
     };
@@ -604,7 +623,7 @@ fn a_black_hole_drops_every_datagram_and_codepoints_cross() {
     let bound: Vec<(Dgram, SocketAddr)> = answers
         .drain(..)
         .map(|it| match it.done {
-            Done::Bound { sock, local } => (sock, local),
+            Done::Bound { sock, local, .. } => (sock, local),
             done => panic!("bound with {done:?}"),
         })
         .collect();

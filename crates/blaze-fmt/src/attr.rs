@@ -5,7 +5,7 @@
 use crate::ast;
 use crate::ast::HasAttrs;
 use crate::span::{Span, symbol::sym};
-use tracing::debug;
+use blaze_trace::debug;
 
 use self::doc_comment::DocCommentFormatter;
 use crate::comment::{CommentStyle, contains_comment, rewrite_doc_comment};

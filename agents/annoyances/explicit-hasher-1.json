@@ -1,0 +1,14 @@
+{
+ "id": "explicit-hasher-1",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), write-only lane explicit-hasher (D125/D126 step 1) under rebuild-1115",
+ "where": "crates/blaze-hash (hash_map.rs, hash_set.rs, order.rs, shared.rs, lib.rs), crates/blaze-std/src/lib.rs, crates/blaze-lint, tools/sweeps/explicit-hasher",
+ "what": "The constructor design was redirected twice mid-lane: first explicit `with_*_hasher_in` names (D125), then one `new(Opts)` (D126) with `capacity: usize = 0` under `default_field_values`, then `capacity: Option<usize>` with no default. Each turn meant removing the names the last one added in five files. The brief also said to read with Read/Grep/Glob, which this lane did not have; reads went through `rg` in Bash.",
+ "cost": "about a third of the lane spent undoing the earlier forms",
+ "cause": "the brief was written before rule 83 (options-struct) settled what a default field is for",
+ "whys": "D126 came after D125's brief; the constructor shape was decided in the lane rather than before it",
+ "class": "a brief that names an API's shape before the rule that governs the shape is settled",
+ "prevention": "a lane brief that adds a constructor names its final signature, per rule 83, before the lane starts",
+ "workaround": "none needed now",
+ "state": "open"
+}

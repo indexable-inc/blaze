@@ -1,0 +1,27 @@
+[package]
+name = "blaze-h1"
+description = "blaze's own HTTP/1.1 client as a sans-IO machine: a deterministic request writer, a response parser fed in pieces (content-length, chunked, until-close) bounded in head and body, byte ranges checked against what was asked, and a bounded same-scheme redirect policy; `no_std`, every buffer in the allocator passed in"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The response's head and header index, in the caller's allocator.
+blaze-own.workspace = true
+
+[dev-dependencies]
+# Property tests and planted-bug controls.
+blaze-sim.workspace = true
+# `blaze_own::testing::heap()`: a test's root allocator (D102), in place of `Global`.
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

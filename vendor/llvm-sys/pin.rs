@@ -1,4 +1,4 @@
-// blaze: the one LLVM blaze links (crates/hir-ty-codegen/llvm.json), checked before anything of
+// blaze: the one LLVM blaze links (pins/llvm.json), checked before anything of
 // LLVM is run or linked. vendor/llvm-sys/build.rs includes this file and every LLVM consumer in
 // blaze links LLVM through llvm-sys, so none can skip it; llvm-sys's `pin` test target
 // (tests/pin.rs) includes it with its tests, and blaze-codegen-code includes it to key the code
@@ -12,7 +12,7 @@ pub(crate) const PIN_PREFIX: &str = "LLVM_SYS_231_PREFIX";
 /// What `.github/scripts/llvm.py build` writes into each prefix it makes: its version and commit.
 pub(crate) const PIN_MARKER: &str = "blaze-llvm.json";
 /// The pin, from llvm-sys's manifest directory.
-pub(crate) const PIN_JSON: &str = "../../crates/hir-ty-codegen/llvm.json";
+pub(crate) const PIN_JSON: &str = "../../pins/llvm.json";
 
 /// The LLVM llvm.json pins.
 #[derive(Debug, PartialEq, Eq)]
@@ -30,7 +30,7 @@ impl Pin {
     /// as `cargo::error=` takes.
     pub(crate) fn refusal(&self, found: &str) -> String {
         format!(
-            "blaze links only the LLVM crates/hir-ty-codegen/llvm.json pins (LLVM {}, commit {}), \
+            "blaze links only the LLVM pins/llvm.json pins (LLVM {}, commit {}), \
              and {found}. blaze sets {PIN_PREFIX} itself, to the release llvm.json pins for the \
              target, fetched by its sha256 and unpacked under blaze's home \
              (`[workspace.metadata.blaze.native.llvm]` in the root Cargo.toml, docs/cargo.md \
@@ -86,7 +86,7 @@ fn pin_report(pin: &Pin, json: &str, prefix: Option<&std::ffi::OsStr>, found: &s
     }
     say("rule", "llvm:pin");
     let commit = &pin.commit[..pin.commit.len().min(8)];
-    say("fact.needs", &format!("needs LLVM {} ({commit}), pinned in crates/hir-ty-codegen/llvm.json", pin.version));
+    say("fact.needs", &format!("needs LLVM {} ({commit}), pinned in pins/llvm.json", pin.version));
     match unset {
         true => say("fact.found", &format!("`{PIN_PREFIX}` is not set")),
         false => say("fact.found", found),

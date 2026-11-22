@@ -1,0 +1,29 @@
+[package]
+name = "blaze-tar"
+description = "blaze's own tar: a sans-IO reader fed in pieces (ustar, pax and GNU long names, as crates.io `.crate` files hold them) that refuses every path, link and device escaping its destination, and a deterministic ustar writer; `no_std`, every buffer in the allocator passed in"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The reader's names and its record of links, in the caller's allocator.
+blaze-own.workspace = true
+
+[dev-dependencies]
+# The tests' root allocator capability (`testing::heap()`, D102) in place of `Global`.
+blaze-own = { workspace = true, features = ["testing"] }
+# Property tests and planted-bug controls.
+blaze-sim.workspace = true
+# The reference the tests compare against in both directions; a dev-dependency only.
+tar.workspace = true
+
+[lints]
+workspace = true

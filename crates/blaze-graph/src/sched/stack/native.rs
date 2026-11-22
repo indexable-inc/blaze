@@ -16,6 +16,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(unix)]
+use blaze_sys::posix::io::{Advice, Prot, madvise, mprotect};
+
 #[cfg(not(unix))]
 use corosensei::stack::{DefaultStack, Stack as _};
 use corosensei::{Coroutine, CoroutineResult};
@@ -137,9 +140,11 @@ impl Stack {
         let region = blaze_mem::Region::reserve_sparse(GUARD + bytes, blaze_mem::Tag::Frames)
             .map_err(io::Error::other)?; // alloc: error path
         let low = region.base().as_ptr();
-        // SAFETY: the reservation's lowest `GUARD` bytes, its own, which nothing has used.
-        if unsafe { libc::mprotect(low.cast(), GUARD, libc::PROT_NONE) } != 0 {
-            let error = io::Error::last_os_error();
+        // SAFETY: `low` is the non-null base of the reservation, and the guard is its own
+        // lowest bytes, which nothing has used.
+        let low = unsafe { std::ptr::NonNull::new_unchecked(low) };
+        if let Err(error) = unsafe { mprotect(low, GUARD, Prot::NONE) } {
+            let error = io::Error::from_raw_os_error(error.raw() as i32);
             return Err(io::Error::new(
                 error.kind(),
                 // alloc: error path
@@ -321,12 +326,9 @@ fn thread_stack() -> io::Result<(usize, usize)> {
 
 #[cfg(target_os = "macos")]
 fn thread_stack() -> io::Result<(usize, usize)> {
-    // SAFETY: both read the calling thread's own stack, which lives as long as it does.
-    let (high, size) = unsafe {
-        let this = libc::pthread_self();
-        (libc::pthread_get_stackaddr_np(this).addr(), libc::pthread_get_stacksize_np(this))
-    };
-    Ok((high - size, high))
+    blaze_sys::posix::thread::this_thread_stack()
+        .map(|stack| (stack.low, stack.high))
+        .map_err(|error| io::Error::from_raw_os_error(error.raw() as i32))
 }
 
 /// How far below the calling frame the advice stops: room for the frames of the call that
@@ -360,9 +362,9 @@ const BELOW_HERE: usize = 16 << 10;
 #[inline(never)]
 pub fn give_back_below_here() -> io::Result<usize> {
     #[cfg(target_os = "linux")]
-    let advice = libc::MADV_DONTNEED;
+    let advice = Advice::DontNeed;
     #[cfg(target_os = "macos")]
-    let advice = libc::MADV_FREE_REUSABLE;
+    let advice = Advice::FreeReusable;
     let (low, high) = thread_stack()?;
     let marker = 0u8;
     let here = std::ptr::from_ref(std::hint::black_box(&marker)).addr();
@@ -384,16 +386,17 @@ pub fn give_back_below_here() -> io::Result<usize> {
     // SAFETY: `[from, to)` is whole pages of this thread's own mapped stack, below every live
     // frame of it (the calling frame, and `BELOW_HERE` for the frames of this call): nothing
     // reads their bytes again before writing them, so dropping them changes no live value.
-    let rc = unsafe { libc::madvise(std::ptr::without_provenance_mut(from), to - from, advice) };
-    if rc != 0 {
-        let error = io::Error::last_os_error();
+    let from_addr = from;
+    let from = unsafe { std::ptr::NonNull::new_unchecked(std::ptr::without_provenance_mut(from_addr)) };
+    if let Err(error) = unsafe { madvise(from, to - from_addr, advice) } {
+        let error = io::Error::from_raw_os_error(error.raw() as i32);
         return Err(io::Error::new(
             error.kind(),
             // alloc: error path
-            format!("madvise of this thread's stack {from:#x}..{to:#x} (of {low:#x}..{high:#x}): {error}"),
+            format!("madvise of this thread's stack {from_addr:#x}..{to:#x} (of {low:#x}..{high:#x}): {error}"),
         ));
     }
-    Ok(to - from)
+    Ok(to - from_addr)
 }
 
 /// Elsewhere no advice gives back a live thread stack's pages without breaking how it grows

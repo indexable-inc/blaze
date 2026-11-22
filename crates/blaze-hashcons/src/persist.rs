@@ -10,8 +10,8 @@
 use std::mem::{offset_of, size_of};
 
 use blaze_format::{
-    ALIGN, FormatError, Part, Persist, Record, SchemaHash, Slice, Writer, open_as, open_verified,
-    read_verified, schema_of,
+    ALIGN, FormatError, Part, Persist, Record, SchemaHash, Slice, Writer, WriterIn, open_as,
+    open_verified, read_verified, schema_of,
 };
 use blaze_ids::ContentId;
 
@@ -24,7 +24,7 @@ impl<T: Consed + Persist> Persist for Interned<'static, T> {
     const SCHEMA: SchemaHash = T::SCHEMA;
     type Ref<'a> = T::Ref<'a>;
 
-    fn write(&self, out: &mut Writer) -> u64 {
+    fn write<P: WriterIn>(&self, out: &mut Writer<P>) -> u64 {
         self.get().write(out)
     }
 
@@ -77,8 +77,10 @@ impl<T: Consed + Persist> HashCons<T> {
     /// bytes whatever order their values were interned in.
     pub fn write_pack(&self) -> Vec<u8> {
         let values = self.sorted();
-        let mut out = Writer::new(PACK_SCHEMA);
-        let mut scratch = Writer::new(T::SCHEMA);
+        // Compatibility (D170): the global heap until blaze-hashcons' conversion passes an
+        // allocator to `write_pack`.
+        let mut out = Writer::on_the_global_heap_until_ported(PACK_SCHEMA);
+        let mut scratch = Writer::on_the_global_heap_until_ported(T::SCHEMA);
         // clone: the header each value's scratch buffer starts again from, once per pack
         let header = scratch.bytes.clone();
         let mut placed = Vec::with_capacity(values.len());

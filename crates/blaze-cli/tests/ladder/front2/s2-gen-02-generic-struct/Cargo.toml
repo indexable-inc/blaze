@@ -1,0 +1,4 @@
+[package]
+name = "ladder-s2-gen-02-generic-struct"
+version = "0.1.0"
+edition = "2024"

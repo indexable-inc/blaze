@@ -1,0 +1,31 @@
+[package]
+name = "blaze-json"
+description = "JSON as a format over blaze-data's `Value`: a strict RFC 8259 reader (bytes to events, events to a `Value`; no trailing commas, no comments, duplicate keys refused, integers exact, bounded depth and size, typed errors with byte offset and line) and a deterministic writer (a `Value` or events to text, keys sorted or in insertion order, shortest round-trip floats, bytes refused unless an encoding is chosen); `no_std`, no `alloc`"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The format-neutral value read into and written from.
+blaze-data.workspace = true
+# Bytes in a `Value` are written as base64 only when the caller picks that encoding.
+blaze-base64.workspace = true
+blaze-own.workspace = true
+
+[dev-dependencies]
+# Properties: write then read gives the value back, and the event stream copied through the
+# writer gives the compact text back; with a planted-bug control.
+blaze-sim.workspace = true
+# `blaze_own::testing::heap()`: a test's root allocator (D102), in place of `Global`.
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

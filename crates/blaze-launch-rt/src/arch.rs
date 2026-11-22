@@ -86,17 +86,6 @@ mod encode {
         0xb500_0000 | ((((delta >> 2) as u32) & 0x7_ffff) << 5) | reg
     }
 
-    /// `adrp x<reg>, <the page of to>` at `at`: the pages are within 4 GiB.
-    pub(super) const fn adrp(reg: u32, at: u64, to: u64) -> u32 {
-        let pages = ((to >> 12) as i64 - (at >> 12) as i64) as u32;
-        0x9000_0000 | ((pages & 3) << 29) | (((pages >> 2) & 0x7_ffff) << 5) | reg
-    }
-
-    /// `ldr x<reg>, [x<base>, #offset]`: `offset` is a multiple of 8 below 32768.
-    pub(super) const fn ldr_offset(reg: u32, base: u32, offset: u64) -> u32 {
-        0xf940_0000 | (((offset >> 3) as u32) << 10) | (base << 5) | reg
-    }
-
     /// `b <this instruction + delta>`: `delta` is a multiple of 4 within 128 MiB.
     pub(super) const fn b(delta: i64) -> u32 {
         0x1400_0000 | (((delta >> 2) as u32) & 0x03ff_ffff)
@@ -158,13 +147,18 @@ pub fn gate_entry(at: u64, flag: u64, old: u64, new: u64) -> Result<[u8; 40], Ou
 /// `adrp x16, word; ldr x16, [x16, word's offset in its page]; br x16`.
 #[cfg(target_arch = "aarch64")]
 pub fn thunk(at: u64, word: u64) -> Result<[u8; THUNK], OutOfReach> {
-    use encode::{BR_X16, adrp, ldr_offset};
+    use blaze_code::a64::{adrp_to, lo12};
+    use encode::BR_X16;
 
-    let pages = (word >> 12) as i64 - (at >> 12) as i64;
-    if word % 8 != 0 || !(-(1 << 20)..(1 << 20)).contains(&pages) {
-        return Err(OutOfReach { what: "an entry thunk's load of its word", from: at, to: word });
-    }
-    let code = [adrp(16, at, word), ldr_offset(16, 16, word & 0xfff), BR_X16, 0];
+    /// `adrp x16, 0` and `ldr x16, [x16, #0]`, whose fields blaze-code's one encoders fill.
+    const ADRP_X16: u32 = 0x9000_0010;
+    const LDR_X16_X16: u32 = 0xf940_0210;
+    let far = OutOfReach { what: "an entry thunk's load of its word", from: at, to: word };
+    // The page: refused past 4 GiB of pages by the encoder itself, whoever calls it.
+    let page = adrp_to(ADRP_X16, at, word).map_err(|_| far)?;
+    // The 8-byte load's offset in the page: refused unless the word is 8-aligned.
+    let load = lo12(LDR_X16_X16, word, 3).ok_or(far)?;
+    let code = [page, load, BR_X16, 0];
     let mut bytes = [0; THUNK];
     for (index, instruction) in code.iter().enumerate() {
         bytes[index * 4..index * 4 + 4].copy_from_slice(&instruction.to_le_bytes());

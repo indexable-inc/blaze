@@ -1,0 +1,15 @@
+{
+ "id": "read-grains-stored-row",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), writer of the read grains row and the page proof hand-through",
+ "where": "crates/blaze-cli/src/engine_scope_reads.rs `ReadGrains::new`, engine_answer.rs `Stored`, store/plain_place.rs `snapshot_get`, engine_check.rs",
+ "what": "(1) ReadGrains::new read 3 answer facts for each of 624 crates on every command; each fact was one page of the stored answer, hashed whole on its first open: 1,240 task pages and 128 header shards for a one-function edit. (2) Changing `Stored::new` and `ReadGrains::new` in write-only mode broke the preview build at 8 call sites (engine_check.rs is not in the brief's files). The rule-24 port had to be done after the fact, at the coordinator's request.",
+ "cost": "a third of the edit's CPU (the coordinator's sample); one red preview",
+ "cause": "a derived table was rebuilt from the answer each command because nothing kept it, and pages were hashed although the store had already proved them",
+ "whys": "the grains have no task of their own, so the engine never decides whether they are stale; the snapshot returned bytes without the store's proof",
+ "class": "a derived row rebuilt by hand instead of kept and woken forward from what changed",
+ "prevention": "the grains record keyed by the graph and stamped with the serial it was made at, with refresh limited to the tasks entered this request (engine_scope_reads.rs `GrainsIn`); Sealed::by_store on every snapshot read; the end state is an engine task row for the grains",
+ "annoyance": "a brief's file list that omits the callers of a signature it asks to change",
+ "workaround": "rg every caller before changing a signature and edit them in the same step, then tell the coordinator",
+ "state": "open"
+}

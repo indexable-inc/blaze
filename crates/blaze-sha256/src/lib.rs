@@ -8,15 +8,41 @@
 //! workspace's sources, `blaze-cargo`'s name of the sandbox library). It has no dependencies so
 //! that those build scripts take it without `sha2`, whose `cpufeatures` needs `libc` on Apple's
 //! aarch64 and a build dependency is built for the machine that builds.
+//!
+//! Which compression runs is decided as the crate compiles, by the target's features: the
+//! instructions where the build enables them for every CPU it runs on (`target_feature =
+//! "sha2"` on aarch64, which Apple's targets enable; `sha`, `ssse3` and `sse4.1` on x86-64),
+//! the portable one elsewhere. Nothing is detected at run time: D170 puts CPU feature detection
+//! in blaze-sys, which has no such call yet, and this crate is a `no_std` core. Until it has
+//! one, a build for a generic aarch64 Linux or x86-64 target hashes with the portable code
+//! (wave-1124-sansio, W1 group a's report says what that costs).
 
+#![no_std]
 #![deny(unsafe_code)]
 // `#![blaze::trust]` below names blaze's tool; inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core, blaze::std_use, blaze::implicit_allocator, blaze::process_static)]
 #![blaze::trust(
     unsafe,
-    reason = "the processor's SHA-256 instructions (ARMv8 SHA-256, x86-64 SHA-NI) are `unsafe` intrinsics: each compression runs only after the feature was detected, over loads and stores of whole 16-byte blocks in bounds"
+    reason = "the processor's SHA-256 instructions (ARMv8 SHA-256, x86-64 SHA-NI) are `unsafe` intrinsics: each compression runs only where the build enables the feature for every CPU it runs on (or, in the tests, after std detected it), over loads and stores of whole 16-byte blocks in bounds"
 )]
+
+// The tests' growable buffers, `format!`, run-time feature detection and counting allocator.
+#[cfg(test)]
+extern crate std;
+
+/// Whether the build enables the ARMv8 SHA-256 instructions for every CPU it runs on.
+const AARCH64_SHA2: bool = cfg!(all(target_arch = "aarch64", target_feature = "sha2"));
+
+/// Whether the build enables SHA-NI, SSSE3 and SSE4.1 for every CPU it runs on.
+const X86_SHA_NI: bool = cfg!(all(
+    target_arch = "x86_64",
+    target_feature = "sha",
+    target_feature = "ssse3",
+    target_feature = "sse4.1"
+));
 
 const INITIAL: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
@@ -40,18 +66,11 @@ pub fn digest(bytes: &[u8]) -> [u8; 32] {
     hasher.finish()
 }
 
-/// Whether this processor has the SHA-256 instructions, so that pages hash on one thread about
-/// as fast as memory feeds them (a few GB/s) and splitting them over threads gains little.
+/// Whether this build hashes with the processor's SHA-256 instructions, so that pages hash on
+/// one thread about as fast as memory feeds them (a few GB/s) and splitting them over threads
+/// gains little. Decided as the crate compiles (the crate's doc says why).
 pub fn fast() -> bool {
-    #[cfg(target_arch = "aarch64")]
-    if std::arch::is_aarch64_feature_detected!("sha2") {
-        return true;
-    }
-    #[cfg(target_arch = "x86_64")]
-    if x86::detected() {
-        return true;
-    }
-    false
+    AARCH64_SHA2 || X86_SHA_NI
 }
 
 /// A SHA-256 of bytes given in parts: the same as [`digest`] of them joined. Holds at most one
@@ -122,21 +141,35 @@ fn compress(state: &mut [u32; 8], blocks: &[u8]) {
     if blocks.is_empty() {
         return;
     }
-    #[cfg(target_arch = "aarch64")]
-    if std::arch::is_aarch64_feature_detected!("sha2") {
-        // SAFETY: the processor has the SHA-256 instructions, checked just above.
-        unsafe { aarch64::compress(state, blocks) };
-        return;
-    }
-    #[cfg(target_arch = "x86_64")]
-    if x86::detected() {
-        // SAFETY: `detected` checked SHA-NI, SSSE3 and SSE4.1.
-        unsafe { x86::compress(state, blocks) };
-        return;
-    }
+    // SAFETY: the build enables the SHA-256 instructions for every CPU it runs on
+    // (`AARCH64_SHA2`'s target features).
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha2"))]
+    unsafe {
+        aarch64::compress(state, blocks)
+    };
+    // SAFETY: the build enables SHA-NI, SSSE3 and SSE4.1 for every CPU it runs on
+    // (`X86_SHA_NI`'s target features).
+    #[cfg(all(target_arch = "x86_64", target_feature = "sha", target_feature = "ssse3", target_feature = "sse4.1"))]
+    unsafe {
+        x86::compress(state, blocks)
+    };
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "sha2"),
+        all(target_arch = "x86_64", target_feature = "sha", target_feature = "ssse3", target_feature = "sse4.1")
+    )))]
     portable(state, blocks);
 }
 
+#[cfg_attr(
+    all(
+        not(test),
+        any(
+            all(target_arch = "aarch64", target_feature = "sha2"),
+            all(target_arch = "x86_64", target_feature = "sha", target_feature = "ssse3", target_feature = "sse4.1")
+        )
+    ),
+    expect(dead_code, reason = "this build compresses with the instructions; the tests hold them to this")
+)]
 fn portable(state: &mut [u32; 8], blocks: &[u8]) {
     for block in blocks.chunks_exact(64) {
         let mut w = [0u32; 64];
@@ -164,10 +197,12 @@ fn portable(state: &mut [u32; 8], blocks: &[u8]) {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+// Built where the build enables the instructions, and in the tests, which run it where std
+// detects them.
+#[cfg(all(target_arch = "aarch64", any(test, target_feature = "sha2")))]
 #[allow(unsafe_code)]
 mod aarch64 {
-    use std::arch::aarch64::{
+    use core::arch::aarch64::{
         uint8x16_t, uint32x4_t, vaddq_u32, vld1q_u8, vld1q_u32, vreinterpretq_u32_u8, vrev32q_u8,
         vsha256h2q_u32, vsha256hq_u32, vsha256su0q_u32, vsha256su1q_u32, vst1q_u32,
     };
@@ -206,7 +241,7 @@ mod aarch64 {
         let mut efgh = words(&state[4..]);
         for block in blocks.chunks_exact(64) {
             let (abcd_was, efgh_was) = (abcd, efgh);
-            let mut words: [uint32x4_t; 4] = std::array::from_fn(|nth| {
+            let mut words: [uint32x4_t; 4] = core::array::from_fn(|nth| {
                 vreinterpretq_u32_u8(vrev32q_u8(bytes(&block[nth * 16..])))
             });
             for group in 0..16 {
@@ -228,10 +263,15 @@ mod aarch64 {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+// Built where the build enables the instructions, and in the tests, which run it where std
+// detects them.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(test, all(target_feature = "sha", target_feature = "ssse3", target_feature = "sse4.1"))
+))]
 #[allow(unsafe_code)]
 mod x86 {
-    use std::arch::x86_64::{
+    use core::arch::x86_64::{
         __m128i, _mm_add_epi32, _mm_alignr_epi8, _mm_blend_epi16, _mm_loadu_si128, _mm_set_epi64x,
         _mm_sha256msg1_epu32, _mm_sha256msg2_epu32, _mm_sha256rnds2_epu32, _mm_shuffle_epi8,
         _mm_shuffle_epi32, _mm_storeu_si128,
@@ -239,6 +279,8 @@ mod x86 {
 
     use super::K;
 
+    /// Whether this processor has SHA-NI, SSSE3 and SSE4.1, as std detects them: the tests'.
+    #[cfg(test)]
     pub(super) fn detected() -> bool {
         std::arch::is_x86_feature_detected!("sha")
             && std::arch::is_x86_feature_detected!("ssse3")
@@ -302,6 +344,61 @@ mod x86 {
         store(&mut state[..4], _mm_blend_epi16(feba, dchg, 0xf0));
         store(&mut state[4..], _mm_alignr_epi8(dchg, feba, 8));
     }
+}
+
+/// HMAC-SHA-256 (RFC 2104 over this SHA-256; the vectors are RFC 4231's): what signs a
+/// request to an S3 bucket (SigV4's chain of keyed digests). A key longer than SHA-256's block
+/// (64 bytes) is hashed first, a shorter one padded with zeros, as RFC 2104 says.
+///
+/// The padded key lives in this value's two hashers' states, already mixed, and in no buffer
+/// that outlives [`HmacSha256::new`]; the stack copies made there are not wiped (no volatile
+/// write is made: this crate has no unsafe code), so a caller holding a long-lived secret keeps
+/// the key's own copies as it would anyway.
+#[derive(Clone)]
+pub struct HmacSha256 {
+    inner: Sha256,
+    outer: Sha256,
+}
+
+impl HmacSha256 {
+    pub fn new(key: &[u8]) -> HmacSha256 {
+        let mut block = [0u8; 64];
+        if key.len() > 64 {
+            block[..32].copy_from_slice(&digest(key));
+        } else {
+            block[..key.len()].copy_from_slice(key);
+        }
+        let mut inner_pad = [0x36u8; 64];
+        let mut outer_pad = [0x5cu8; 64];
+        for ((inner, outer), byte) in inner_pad.iter_mut().zip(outer_pad.iter_mut()).zip(block) {
+            *inner ^= byte;
+            *outer ^= byte;
+        }
+        let mut inner = Sha256::new();
+        inner.update(&inner_pad);
+        let mut outer = Sha256::new();
+        outer.update(&outer_pad);
+        HmacSha256 { inner, outer }
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) -> &mut HmacSha256 {
+        self.inner.update(bytes);
+        self
+    }
+
+    /// The tag of everything given so far; the value may take more after it.
+    pub fn finish(&self) -> [u8; 32] {
+        let mut outer = self.outer.clone(); // clone: 104 bytes of hasher state, so `finish` borrows
+        outer.update(&self.inner.finish());
+        outer.finish()
+    }
+}
+
+/// The HMAC-SHA-256 of `message` under `key`.
+pub fn hmac(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut mac = HmacSha256::new(key);
+    mac.update(message);
+    mac.finish()
 }
 
 #[cfg(test)]

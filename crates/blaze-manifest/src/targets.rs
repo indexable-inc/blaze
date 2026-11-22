@@ -2,22 +2,148 @@
 //! `examples/`, `tests/`, `benches/`, `build.rs`) merged with what the manifest declares, as
 //! cargo's `targets.rs` does it.
 
-use std::fmt::{self, Write as _};
+use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, bail};
-use blaze_hash::{HashMap, HashSet};
-use cargo_util_schemas::manifest::{
-    PathValue, StringOrVec, TomlManifest, TomlPackageBuild, TomlTarget,
-};
+use blaze_hash::{FixedState, Set, SetOpts};
 use serde::Serialize;
 use std::alloc::Global;
 
 use crate::edit_distance::closest_msg;
+use crate::error::{Context, ManifestError, ResultExt as _};
 use crate::features::{Edition, Feature, Features};
 use crate::files::Files;
 use crate::manifest::deprecated_underscore;
 use crate::paths::normalize_path;
+use crate::schema::{PathValue, StringOrVec, TomlManifest, TomlPackageBuild, TomlTarget};
+
+/// What cargo refuses in a package's targets, in its words.
+#[derive(Debug)]
+pub enum TargetError {
+    /// The manifest has neither `[package]` nor `[project]`.
+    NoPackage,
+    /// `package.metabuild` and `package.build` both set.
+    MetabuildAndBuild,
+    /// A `metabuild` package that is no build dependency.
+    MetabuildNotBuildDependency { name: String },
+    /// No `src/lib.rs` and no `lib.path` for the library `name`.
+    LibraryNotFound { name: String },
+    /// A library with both `dylib` and `cdylib` crate types.
+    DylibAndCdylib { name: String },
+    /// `proc-macro` with other crate types.
+    ProcMacroMixed,
+    /// No file for a target at the default paths. `misplaced` is a file at a commonly wrong
+    /// path and the path it belongs at; `defaults` the file and directory paths looked at;
+    /// `closest` cargo's `Did you mean` suffix, empty where nothing is close.
+    PathNotFound {
+        name: String,
+        kind: String,
+        misplaced: Option<(PathBuf, PathBuf)>,
+        defaults: [PathBuf; 2],
+        closest: String,
+    },
+    /// Two inferred files for one target name, relative to the package root.
+    AmbiguousPath { name: String, kind: String, first: PathBuf, second: PathBuf },
+    /// Two targets of one kind with one name.
+    DuplicateName { kind: String, name: String },
+    /// Build scripts sharing a file stem: each stem, in order, with its scripts.
+    DuplicateBuildStems { stems: Vec<(String, Vec<String>)> },
+    /// A `package.build` path with no file stem.
+    BuildName,
+    /// A library name with `-`.
+    LibraryHyphen { name: String },
+    /// A binary named as one of cargo's build directories.
+    ForbiddenBinName { name: String },
+    /// A target name that is empty or only spaces.
+    EmptyName { kind_human: String },
+    /// A target with no `name`.
+    NameRequired { kind_human: String, kind: String },
+}
+
+impl fmt::Display for TargetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TargetError::NoPackage => f.write_str("manifest has no `package` (or `project`)"),
+            TargetError::MetabuildAndBuild => {
+                f.write_str("cannot specify both `metabuild` and `build`")
+            }
+            TargetError::MetabuildNotBuildDependency { name } => write!(
+                f,
+                "metabuild package `{name}` must be specified in `build-dependencies`"
+            ),
+            TargetError::LibraryNotFound { name } => write!(
+                f,
+                "can't find library `{name}`, rename file to `src/lib.rs` or specify lib.path"
+            ),
+            TargetError::DylibAndCdylib { name } => write!(
+                f,
+                "library `{name}` cannot set the crate type of both `dylib` and `cdylib`"
+            ),
+            TargetError::ProcMacroMixed => {
+                f.write_str("cannot mix `proc-macro` crate type with others")
+            }
+            TargetError::PathNotFound { name, kind, misplaced, defaults, closest } => {
+                match misplaced {
+                    Some((wrong_path, possible_path)) => write!(
+                        f,
+                        "can't find `{name}` {kind} at default paths, but found a file at \
+                         `{}`.\nPerhaps rename the file to `{}` for target auto-discovery, or \
+                         specify {kind}.path if you want to use a non-default path.{closest}",
+                        wrong_path.display(),
+                        possible_path.display(),
+                    ),
+                    None => write!(
+                        f,
+                        "can't find `{name}` {kind} at `{}` or `{}`. Please specify {kind}.path \
+                         if you want to use a non-default path.{closest}",
+                        defaults[0].display(),
+                        defaults[1].display(),
+                    ),
+                }
+            }
+            TargetError::AmbiguousPath { name, kind, first, second } => write!(
+                f,
+                "cannot infer path for `{name}` {kind}\nCargo doesn't know which to use because \
+                 multiple target files found at `{}` and `{}`.",
+                first.display(),
+                second.display(),
+            ),
+            TargetError::DuplicateName { kind, name } => write!(
+                f,
+                "found duplicate {kind} name {name}, but all {kind} targets must have a unique \
+                 name"
+            ),
+            TargetError::DuplicateBuildStems { stems } => {
+                f.write_str(
+                    "found build scripts with duplicate file stems, but all build scripts must \
+                     have a unique file stem",
+                )?;
+                for (stem, paths) in stems {
+                    write!(f, "\n  for stem `{stem}`: {}", paths.join(", "))?;
+                }
+                Ok(())
+            }
+            TargetError::BuildName => f.write_str("invalid `package.build` file name"),
+            TargetError::LibraryHyphen { name } => {
+                write!(f, "library target names cannot contain hyphens: {name}")
+            }
+            TargetError::ForbiddenBinName { name } => write!(
+                f,
+                "the binary target name `{name}` is forbidden, it conflicts with cargo's build \
+                 directory names"
+            ),
+            TargetError::EmptyName { kind_human } => {
+                write!(f, "{kind_human} target names cannot be empty")
+            }
+            TargetError::NameRequired { kind_human, kind } => {
+                write!(f, "{kind_human} target {kind}.name is required")
+            }
+        }
+    }
+}
+
+impl core::error::Error for TargetError {}
 
 const DEFAULT_TEST_DIR_NAME: &str = "tests";
 const DEFAULT_BENCH_DIR_NAME: &str = "benches";
@@ -385,7 +511,7 @@ pub(crate) fn to_targets(
     edition: Edition,
     metabuild: &Option<StringOrVec>,
     warnings: &mut Vec<String>,
-) -> anyhow::Result<Vec<Target>> {
+) -> Result<Vec<Target>, ManifestError> {
     let mut targets = Vec::new();
 
     if let Some(target) = to_lib_target(
@@ -401,7 +527,7 @@ pub(crate) fn to_targets(
     let package = normalized_toml
         .package
         .as_ref()
-        .ok_or_else(|| anyhow::format_err!("manifest has no `package` (or `project`)"))?;
+        .ok_or(TargetError::NoPackage)?;
 
     targets.extend(to_bin_targets(
         features,
@@ -431,7 +557,7 @@ pub(crate) fn to_targets(
 
     if let Some(custom_build) = package.normalized_build().expect("previously normalized") {
         if metabuild.is_some() {
-            bail!("cannot specify both `metabuild` and `build`");
+            return Err(TargetError::MetabuildAndBuild.into());
         }
         validate_unique_build_scripts(custom_build)?;
         for script in custom_build {
@@ -451,7 +577,7 @@ pub(crate) fn to_targets(
         let bdeps = normalized_toml.build_dependencies.as_ref();
         for name in &metabuild.0 {
             if !bdeps.is_some_and(|bd| bd.contains_key(name.as_str())) {
-                bail!("metabuild package `{name}` must be specified in `build-dependencies`");
+                return Err(TargetError::MetabuildNotBuildDependency { name: name.clone() }.into());
             }
         }
         targets.push(Target::metabuild_target(&format!(
@@ -471,7 +597,7 @@ pub(crate) fn normalize_lib<F: Files>(
     edition: Edition,
     autodiscover: Option<bool>,
     warnings: &mut Vec<String>,
-) -> anyhow::Result<Option<TomlTarget>> {
+) -> Result<Option<TomlTarget>, ManifestError> {
     if is_normalized(original_lib, autodiscover) {
         let Some(mut lib) = original_lib.cloned() else {
             return Ok(None);
@@ -512,10 +638,7 @@ pub(crate) fn normalize_lib<F: Files>(
                     ));
                     lib.path = Some(PathValue(legacy_path));
                 } else {
-                    bail!(
-                        "can't find library `{name}`, \
-                         rename file to `src/lib.rs` or specify lib.path",
-                    )
+                    return Err(TargetError::LibraryNotFound { name: name.to_owned() }.into());
                 }
             }
         }
@@ -533,7 +656,7 @@ fn to_lib_target(
     package_root: &Path,
     edition: Edition,
     warnings: &mut Vec<String>,
-) -> anyhow::Result<Option<Target>> {
+) -> Result<Option<Target>, ManifestError> {
     let Some(lib) = normalized_lib else {
         return Ok(None);
     };
@@ -543,10 +666,7 @@ fn to_lib_target(
         (Some(kinds), _)
             if kinds.iter().any(|k| k == "dylib") && kinds.iter().any(|k| k == "cdylib") =>
         {
-            bail!(
-                "library `{}` cannot set the crate type of both `dylib` and `cdylib`",
-                name_or_panic(lib)
-            );
+            return Err(TargetError::DylibAndCdylib { name: name_or_panic(lib).to_owned() }.into());
         }
         (Some(kinds), _) if kinds.iter().any(|k| k == "proc-macro") => {
             warnings.push(format!(
@@ -554,7 +674,7 @@ fn to_lib_target(
                 name_or_panic(lib)
             ));
             if kinds.len() > 1 {
-                bail!("cannot mix `proc-macro` crate type with others");
+                return Err(TargetError::ProcMacroMixed.into());
             }
             vec![CrateType::ProcMacro]
         }
@@ -580,7 +700,7 @@ pub(crate) fn normalize_bins<F: Files>(
     warnings: &mut Vec<String>,
     errors: &mut Vec<String>,
     has_lib: bool,
-) -> anyhow::Result<Vec<TomlTarget>> {
+) -> Result<Vec<TomlTarget>, ManifestError> {
     if are_normalized(toml_bins, autodiscover) {
         let mut toml_bins = toml_bins.cloned().unwrap_or_default();
         for bin in toml_bins.iter_mut() {
@@ -623,7 +743,7 @@ pub(crate) fn normalize_bins<F: Files>(
             );
             let path = match path {
                 Ok(path) => normalize_path(&path),
-                Err(e) => bail!("{e}"),
+                Err(e) => return Err(e.into()),
             };
             bin.path = Some(PathValue(path));
         }
@@ -637,7 +757,7 @@ fn to_bin_targets(
     package_root: &Path,
     edition: Edition,
     warnings: &mut Vec<String>,
-) -> anyhow::Result<Vec<Target>> {
+) -> Result<Vec<Target>, ManifestError> {
     for bin in bins {
         if bin.filename.is_some() {
             features.require(Feature::different_binary_name)?;
@@ -692,7 +812,7 @@ pub(crate) fn normalize_examples<F: Files>(
     autodiscover: Option<bool>,
     warnings: &mut Vec<String>,
     errors: &mut Vec<String>,
-) -> anyhow::Result<Vec<TomlTarget>> {
+) -> Result<Vec<TomlTarget>, ManifestError> {
     normalize_targets(
         files,
         TARGET_KIND_HUMAN_EXAMPLE,
@@ -714,7 +834,7 @@ fn to_example_targets(
     package_root: &Path,
     edition: Edition,
     warnings: &mut Vec<String>,
-) -> anyhow::Result<Vec<Target>> {
+) -> Result<Vec<Target>, ManifestError> {
     validate_unique_names(targets, TARGET_KIND_EXAMPLE)?;
     let mut result = Vec::with_capacity(targets.len());
     for toml in targets {
@@ -744,7 +864,7 @@ pub(crate) fn normalize_tests<F: Files>(
     autodiscover: Option<bool>,
     warnings: &mut Vec<String>,
     errors: &mut Vec<String>,
-) -> anyhow::Result<Vec<TomlTarget>> {
+) -> Result<Vec<TomlTarget>, ManifestError> {
     normalize_targets(
         files,
         TARGET_KIND_HUMAN_TEST,
@@ -766,7 +886,7 @@ fn to_test_targets(
     package_root: &Path,
     edition: Edition,
     warnings: &mut Vec<String>,
-) -> anyhow::Result<Vec<Target>> {
+) -> Result<Vec<Target>, ManifestError> {
     validate_unique_names(targets, TARGET_KIND_TEST)?;
     let mut result = Vec::with_capacity(targets.len());
     for toml in targets {
@@ -787,7 +907,7 @@ pub(crate) fn normalize_benches<F: Files>(
     autodiscover: Option<bool>,
     warnings: &mut Vec<String>,
     errors: &mut Vec<String>,
-) -> anyhow::Result<Vec<TomlTarget>> {
+) -> Result<Vec<TomlTarget>, ManifestError> {
     normalize_targets(
         files,
         TARGET_KIND_HUMAN_BENCH,
@@ -853,7 +973,7 @@ fn to_bench_targets(
     package_root: &Path,
     edition: Edition,
     warnings: &mut Vec<String>,
-) -> anyhow::Result<Vec<Target>> {
+) -> Result<Vec<Target>, ManifestError> {
     validate_unique_names(targets, TARGET_KIND_BENCH)?;
     let mut result = Vec::with_capacity(targets.len());
     for toml in targets {
@@ -903,7 +1023,7 @@ fn normalize_targets<F: Files>(
     errors: &mut Vec<String>,
     legacy: Legacy,
     autodiscover_flag_name: &str,
-) -> anyhow::Result<Vec<TomlTarget>> {
+) -> Result<Vec<TomlTarget>, ManifestError> {
     if are_normalized(toml_targets, autodiscover) {
         let mut toml_targets = toml_targets.cloned().unwrap_or_default();
         for target in toml_targets.iter_mut() {
@@ -949,7 +1069,8 @@ fn normalize_targets<F: Files>(
             let path = match path {
                 Ok(path) => path,
                 Err(e) => {
-                    errors.push(e);
+                    // alloc: the error's text, kept with the manifest's other errors
+                    errors.push(e.to_string());
                     continue;
                 }
             };
@@ -1060,8 +1181,8 @@ fn toml_targets_and_inferred(
             let target_path =
                 |target: &TomlTarget| target.path.clone().map(|p| package_root.join(p.0));
 
-            let mut seen_names = HashSet::new_in(Global);
-            let mut seen_paths = HashSet::new_in(Global);
+            let mut seen_names = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
+            let mut seen_paths = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
             for target in targets.iter() {
                 seen_names.insert(target.name.clone());
                 seen_paths.insert(target_path(target));
@@ -1132,38 +1253,35 @@ fn inferred_to_toml_targets(inferred: &[(String, PathBuf)]) -> Vec<TomlTarget> {
         .collect()
 }
 
-fn validate_unique_names(targets: &[TomlTarget], target_kind: &str) -> anyhow::Result<()> {
-    let mut seen = HashSet::new_in(Global);
+fn validate_unique_names(targets: &[TomlTarget], target_kind: &str) -> Result<(), ManifestError> {
+    let mut seen = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
     for name in targets.iter().map(name_or_panic) {
         if !seen.insert(name) {
-            bail!(
-                "found duplicate {target_kind} name {name}, \
-                 but all {target_kind} targets must have a unique name",
-            );
+            return Err(TargetError::DuplicateName {
+                kind: target_kind.to_owned(),
+                name: name.to_owned(),
+            }
+            .into());
         }
     }
     Ok(())
 }
 
-fn validate_unique_build_scripts(scripts: &[String]) -> anyhow::Result<()> {
-    let mut seen: HashMap<&str, Vec<&str>, Global> = HashMap::new_in(Global);
+fn validate_unique_build_scripts(scripts: &[String]) -> Result<(), ManifestError> {
+    // By stem in name order, so the error reads the same on every run.
+    let mut seen: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for script in scripts {
         let stem =
             Path::new(script).file_stem().and_then(|s| s.to_str()).expect("previously normalized");
         seen.entry(stem).or_default().push(script.as_str());
     }
-    let mut conflict_file_stem = false;
-    let mut err_msg = String::from(
-        "found build scripts with duplicate file stems, but all build scripts must have a unique file stem",
-    );
-    for (stem, paths) in seen {
-        if paths.len() > 1 {
-            conflict_file_stem = true;
-            write!(&mut err_msg, "\n  for stem `{stem}`: {}", paths.join(", "))?;
-        }
-    }
-    if conflict_file_stem {
-        bail!(err_msg);
+    let stems: Vec<(String, Vec<String>)> = seen
+        .into_iter()
+        .filter(|(_, paths)| paths.len() > 1)
+        .map(|(stem, paths)| (stem.to_owned(), paths.into_iter().map(str::to_owned).collect()))
+        .collect();
+    if !stems.is_empty() {
+        return Err(TargetError::DuplicateBuildStems { stems }.into());
     }
     Ok(())
 }
@@ -1173,7 +1291,7 @@ fn configure(
     target: &mut Target,
     target_kind_human: &str,
     warnings: &mut Vec<String>,
-) -> anyhow::Result<()> {
+) -> Result<(), ManifestError> {
     let t2 = target.clone();
     target.tested = toml.test.unwrap_or(t2.tested);
     target.doc = toml.doc.unwrap_or(t2.doc);
@@ -1188,18 +1306,18 @@ fn configure(
         let name = &target.name;
         warnings
             .push(format!("`edition` is set on {target_kind_human} `{name}` which is deprecated"));
-        target.edition = edition.parse().context("failed to parse the `edition` key")?;
+        target.edition = edition.parse::<Edition>().context(|| Context::EditionKey)?;
     }
     Ok(())
 }
 
-fn target_path_not_found_error_message<F: Files>(
+fn target_path_not_found_error<F: Files>(
     files: &F,
     package_root: &Path,
     target: &TomlTarget,
     target_kind: &str,
     inferred: &[(String, PathBuf)],
-) -> String {
+) -> TargetError {
     fn possible_target_paths(name: &str, kind: &str, commonly_wrong: bool) -> [PathBuf; 2] {
         let mut target_path = PathBuf::new();
         match (kind, commonly_wrong) {
@@ -1221,24 +1339,18 @@ fn target_path_not_found_error_message<F: Files>(
     let commonly_wrong_paths = possible_target_paths(target_name, target_kind, true);
     let possible_paths = possible_target_paths(target_name, target_kind, false);
 
-    let msg = closest_msg(target_name, inferred.iter(), |(n, _p)| n, target_kind);
-    if let Some((wrong_path, possible_path)) = commonly_wrong_paths
+    let closest = closest_msg(target_name, inferred.iter(), |(n, _p)| n, target_kind);
+    let misplaced = commonly_wrong_paths
         .iter()
         .zip(possible_paths.iter())
         .find(|(wp, _)| files.exists(&package_root.join(wp)))
-    {
-        let [wrong_path, possible_path] = [wrong_path, possible_path].map(|p| p.display());
-        format!(
-            "can't find `{target_name}` {target_kind} at default paths, but found a file at `{wrong_path}`.\n\
-             Perhaps rename the file to `{possible_path}` for target auto-discovery, \
-             or specify {target_kind}.path if you want to use a non-default path.{msg}",
-        )
-    } else {
-        let [path_file, path_dir] = possible_paths.each_ref().map(|p| p.display());
-        format!(
-            "can't find `{target_name}` {target_kind} at `{path_file}` or `{path_dir}`. \
-             Please specify {target_kind}.path if you want to use a non-default path.{msg}"
-        )
+        .map(|(wrong, possible)| (wrong.clone(), possible.clone()));
+    TargetError::PathNotFound {
+        name: target_name.to_owned(),
+        kind: target_kind.to_owned(),
+        misplaced,
+        defaults: possible_paths,
+        closest,
     }
 }
 
@@ -1252,7 +1364,7 @@ fn target_path<F: Files>(
     edition: Edition,
     legacy: Legacy,
     legacy_warnings: &mut Vec<String>,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, TargetError> {
     if let Some(ref path) = target.path {
         return Ok(path.0.clone());
     }
@@ -1268,7 +1380,7 @@ fn target_path<F: Files>(
             {
                 return Ok(path);
             }
-            Err(target_path_not_found_error_message(
+            Err(target_path_not_found_error(
                 files,
                 package_root,
                 target,
@@ -1282,15 +1394,12 @@ fn target_path<F: Files>(
             {
                 return Ok(path);
             }
-            Err(format!(
-                "\
-cannot infer path for `{}` {}
-Cargo doesn't know which to use because multiple target files found at `{}` and `{}`.",
-                name_or_panic(target),
-                target_kind,
-                p0.strip_prefix(package_root).unwrap_or(&p0).display(),
-                p1.strip_prefix(package_root).unwrap_or(&p1).display(),
-            ))
+            Err(TargetError::AmbiguousPath {
+                name: name_or_panic(target).to_owned(),
+                kind: target_kind.to_owned(),
+                first: p0.strip_prefix(package_root).unwrap_or(&p0).to_owned(),
+                second: p1.strip_prefix(package_root).unwrap_or(&p1).to_owned(),
+            })
         }
         (None, Some(_)) => unreachable!(),
     }
@@ -1301,7 +1410,7 @@ pub(crate) fn normalize_build<F: Files>(
     files: &F,
     build: Option<&TomlPackageBuild>,
     package_root: &Path,
-) -> anyhow::Result<Option<TomlPackageBuild>> {
+) -> Result<Option<TomlPackageBuild>, ManifestError> {
     const BUILD_RS: &str = "build.rs";
     match build {
         None => {
@@ -1332,9 +1441,9 @@ pub(crate) fn normalize_build<F: Files>(
     }
 }
 
-fn validate_build_name(build: &str) -> anyhow::Result<()> {
+fn validate_build_name(build: &str) -> Result<(), ManifestError> {
     if Path::new(build).file_stem().is_none() {
-        bail!("invalid `package.build` file name");
+        return Err(TargetError::BuildName.into());
     }
     Ok(())
 }
@@ -1343,23 +1452,20 @@ fn name_or_panic(target: &TomlTarget) -> &str {
     target.name.as_deref().unwrap_or_else(|| panic!("target name is required"))
 }
 
-fn validate_lib_name(target: &TomlTarget, warnings: &mut Vec<String>) -> anyhow::Result<()> {
+fn validate_lib_name(target: &TomlTarget, warnings: &mut Vec<String>) -> Result<(), ManifestError> {
     validate_target_name(target, TARGET_KIND_HUMAN_LIB, TARGET_KIND_LIB, warnings)?;
     let name = name_or_panic(target);
     if name.contains('-') {
-        bail!("library target names cannot contain hyphens: {name}")
+        return Err(TargetError::LibraryHyphen { name: name.to_owned() }.into());
     }
     Ok(())
 }
 
-fn validate_bin_name(bin: &TomlTarget, warnings: &mut Vec<String>) -> anyhow::Result<()> {
+fn validate_bin_name(bin: &TomlTarget, warnings: &mut Vec<String>) -> Result<(), ManifestError> {
     validate_target_name(bin, TARGET_KIND_HUMAN_BIN, TARGET_KIND_BIN, warnings)?;
     let name = name_or_panic(bin);
     if ["deps", "examples", "build", "incremental"].contains(&name) {
-        bail!(
-            "the binary target name `{name}` is forbidden, \
-             it conflicts with cargo's build directory names",
-        )
+        return Err(TargetError::ForbiddenBinName { name: name.to_owned() }.into());
     }
     Ok(())
 }
@@ -1369,14 +1475,22 @@ fn validate_target_name(
     target_kind_human: &str,
     target_kind: &str,
     _warnings: &mut Vec<String>,
-) -> anyhow::Result<()> {
+) -> Result<(), ManifestError> {
     match target.name {
         Some(ref name) => {
             if name.trim().is_empty() {
-                bail!("{target_kind_human} target names cannot be empty")
+                return Err(
+                    TargetError::EmptyName { kind_human: target_kind_human.to_owned() }.into()
+                );
             }
         }
-        None => bail!("{target_kind_human} target {target_kind}.name is required"),
+        None => {
+            return Err(TargetError::NameRequired {
+                kind_human: target_kind_human.to_owned(),
+                kind: target_kind.to_owned(),
+            }
+            .into());
+        }
     }
     Ok(())
 }
@@ -1386,7 +1500,7 @@ fn validate_bin_proc_macro(
     edition: Edition,
     warnings: &mut Vec<String>,
     errors: &mut Vec<String>,
-) -> anyhow::Result<()> {
+) -> Result<(), ManifestError> {
     if target.proc_macro() == Some(true) {
         let name = name_or_panic(target);
         errors.push(format!(
@@ -1403,8 +1517,8 @@ fn validate_proc_macro(
     kind: &str,
     edition: Edition,
     warnings: &mut Vec<String>,
-) -> anyhow::Result<()> {
-    deprecated_underscore(
+) -> Result<(), ManifestError> {
+    Ok(deprecated_underscore(
         &target.proc_macro2,
         &target.proc_macro,
         "proc-macro",
@@ -1412,7 +1526,7 @@ fn validate_proc_macro(
         &format!("{kind} target"),
         edition,
         warnings,
-    )
+    )?)
 }
 
 fn validate_bin_crate_types(
@@ -1420,7 +1534,7 @@ fn validate_bin_crate_types(
     edition: Edition,
     warnings: &mut Vec<String>,
     errors: &mut Vec<String>,
-) -> anyhow::Result<()> {
+) -> Result<(), ManifestError> {
     if let Some(crate_types) = target.crate_types() {
         if !crate_types.is_empty() {
             let name = name_or_panic(target);
@@ -1441,8 +1555,8 @@ fn validate_crate_types(
     kind: &str,
     edition: Edition,
     warnings: &mut Vec<String>,
-) -> anyhow::Result<()> {
-    deprecated_underscore(
+) -> Result<(), ManifestError> {
+    Ok(deprecated_underscore(
         &target.crate_type2,
         &target.crate_type,
         "crate-type",
@@ -1450,5 +1564,5 @@ fn validate_crate_types(
         &format!("{kind} target"),
         edition,
         warnings,
-    )
+    )?)
 }

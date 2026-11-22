@@ -1,6 +1,6 @@
 ---
 name: runtime-code
-description: "How code inside blaze is written: no fallbacks, the one standard data structure per need (locks, maps, queues, channels, waits), sans-IO cores, named and bounded waits, hangs turned into typed failures by the watchdog, errors that name the thing, panics that fail one job, nothing thread-bound across a fiber wait. Allocation by lifetime, what is persisted and why no state lives between requests are the `memory-and-data` skill. Load before writing or reviewing Rust in blaze's crates, especially the scheduler, the request loop, a build's helper process, the query engine, the store or anything concurrent."
+description: "How code inside blaze is written: no fallbacks, the one standard data structure per need (locks, maps, queues, channels, waits), sans-IO cores, named and bounded waits, hangs turned into typed failures by the watchdog, errors that name the thing, panics that fail one job, nothing thread-bound across a fiber wait. Allocation by lifetime, what is persisted and why no state lives between requests are the `memory-and-data` skill. Load before writing or reviewing Rust in blaze's crates, especially the scheduler, the request loop, a build's helper process, the store or anything concurrent."
 ---
 
 # Writing blaze's runtime code
@@ -78,23 +78,22 @@ trait the driver implements, taken as a type parameter: calls through it are the
 core's. Drivers are separate, unmarked modules, so the exemption is by module, never by an allow on
 a line. A core's errors carry the path the driver will report, and a step that waits on no effect is
 a typed error (`bounded-progress`). There is no part of blaze this does not cover: the request loop
-(the daemon's today, one command's process in the target), a build's helper process (no `watch`:
-nothing builds unless asked), the build plan and the scheduler, the file watcher, the store, the
-linker's writes, the launcher, the client, the hub. Logic that does its own IO (reads a file, the
-clock or the environment, starts a thread or a process, opens a socket, sleeps) is not finished
-work, whoever wrote it and however long it has been there. When you meet such code in what you are
-changing, cut the seam in the same change without being asked: the decisions go into a core, the IO
-into a driver that only performs effects and returns completions; when it is too large for the
-change, add an an `agents/annoyances/` row naming the file and what blocks it, and a ledger row if
-it needs one. One implementation, the real one: the code that ships is the code the simulation runs.
-A fake, mock, stub, test double or second model written because the real code could not run in a
-test (a simulated request loop beside the real one, a toy scheduler in a test, a hand-written
-in-memory store with its own logic) is a duplicate (`one-concept-one-home`) that proves nothing
-about what ships: make the real code sans-IO, drive it with `Sim`, and delete the fake in the same
-change. What stays outside the cores is only the drivers, and a driver holds no decision: no branch
-on state, no retry, no ordering choice; if a driver needs a test of its logic, that logic belongs in
-the core. The same unifying goes for two cores that decide the same thing: merge them and ban the
-removed name.
+(one command's process), a build's helper process (no `watch`: nothing builds unless asked), the
+build plan and the scheduler, the file watcher, the store, the linker's writes, the launcher, the
+client, the hub. Logic that does its own IO (reads a file, the clock or the environment, starts a
+thread or a process, opens a socket, sleeps) is not finished work, whoever wrote it and however long
+it has been there. When you meet such code in what you are changing, cut the seam in the same change
+without being asked: the decisions go into a core, the IO into a driver that only performs effects
+and returns completions; when it is too large for the change, add an an `agents/annoyances/` row
+naming the file and what blocks it, and a ledger row if it needs one. One implementation, the real
+one: the code that ships is the code the simulation runs. A fake, mock, stub, test double or second
+model written because the real code could not run in a test (a simulated request loop beside the
+real one, a toy scheduler in a test, a hand-written in-memory store with its own logic) is a
+duplicate (`one-concept-one-home`) that proves nothing about what ships: make the real code sans-IO,
+drive it with `Sim`, and delete the fake in the same change. What stays outside the cores is only
+the drivers, and a driver holds no decision: no branch on state, no retry, no ordering choice; if a
+driver needs a test of its logic, that logic belongs in the core. The same unifying goes for two
+cores that decide the same thing: merge them and ban the removed name.
 
 ## every-wait-says-what (rule 15)
 
@@ -141,8 +140,8 @@ against 6 references is given 7" is unfinished until it says which function and 
 A panic inside a job (a query, a codegen unit, a proc-macro evaluation) fails that job's units with
 a typed error naming the panic and the job; keep-going (the default; `--fail-fast` opts out) keeps
 building the rest, the command still writes the records of what succeeded and exits with the errors,
-and a build's helper process (or the daemon, while it exists) keeps serving. Formatting an error
-must not panic: render what needs the database while the database is attached.
+and a build's helper process keeps serving. Formatting an error must not panic: render what needs
+the database while the database is attached.
 
 ## no-wait-across-thread-locals (rule 27)
 
@@ -200,5 +199,43 @@ take the thing as a parameter or a type parameter; read each ambient source in e
 and pass the value on; ban the ambient form in `.clippy.toml` with the explicit replacement
 (`fix-through-blaze-lints`); an item that must keep one says why with `#[expect(.., reason =
 "..")]`.
+
+## options-struct (rule 83)
+
+A type made from more than one input, or with any tunable, has ONE constructor, `T::new(opts)`
+(`T::try_new` when making it can fail), which takes one plain struct of named public fields,
+`<Type>Opts`: never a family of names (`new_in`, `with_capacity_in`, `with_hasher_in`,
+`with_capacity_and_hasher_in`, `from_iter_in`), a builder, or positional flags. A field WITHOUT a
+default is a decision the caller must write: every capability (the allocator, the clock, randomness,
+a grant), every strategy (the hasher, an ordering) and any input with no value that is right
+everywhere. An input that changes what the reader should expect of cost or behaviour is written too,
+even when its usual value is nothing: a table's `capacity: Option<usize>` has no default, and most
+calls say `capacity: None`. A field WITH a default (`pub shards: usize = 64`: nightly's
+`default_field_values`, named in the crate's features while cargo builds blaze and on unasked in a
+blaze edition) is only a tunable almost no caller should think about, its default safe and stated in
+its doc. The call names what it sets and takes any such rest by `..`: `Map::new(MapOpts { hasher:
+FixedState, alloc: frame, capacity: None })`. An options struct is a call's named arguments and
+nothing else: it is marked `#[blaze::args]`, and a value of it is only ever written as a struct
+literal directly in the call that takes it, never bound by a `let`, kept in a `const` or `static`,
+held in a field or returned from a helper (lint `args-inline`), so every choice is read at the call.
+The same holds for a function with a flag, an optional input, two parameters of one type or more
+than three parameters: it takes one struct of named fields. A conversion from one value (`from`,
+`as_*`) and a hot leaf with one or two distinct inputs stay positional. Length at the call is not a
+cost: models write and read this code, and a name at the use is where a mistake is seen. bstd's API
+follows this wherever a thing is made, and blaze's own crates use it (`blaze-uses-its-extensions`).
+blaze builds it: a struct expression with `..` and no base takes each unset field's default, a
+constant of the field's type.
+
+## newtypes-and-named-returns (rule 85)
+
+At function and capability boundaries, name the meaning in the type: wrap unit- or ID-bearing
+numbers in zero-cost newtypes, replace bare `bool` flags with two-variant enums or `#[blaze::args]`
+options structs, avoid adjacent identical primitive parameters (`blaze::bool_param`,
+`blaze::swappable_parameters`, `blaze::primitive_meaning`), and return a named struct instead of an
+anonymous stateful tuple like `(Option<T>, bool)` or `Option<(A, B, C)>`
+(`blaze::anon_tuple_return`). Narrow capabilities monotonically at boundaries (`Dir<ReadOnly,
+Flat>`, `Leaf`, `Budget`).
+
+See [docs/v2/plan/design/auto-perf.md](../../../docs/v2/plan/design/auto-perf.md).
 
 <!-- End of the generated rules. Hand-written notes follow. -->

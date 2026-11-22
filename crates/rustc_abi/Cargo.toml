@@ -1,4 +1,4 @@
-# rustc's `rustc_abi`, as it is at the toolchain in `harness/toolchain` (nightly-2026-10-25,
+# rustc's `rustc_abi`, as it is at the toolchain in `pins/toolchain` (nightly-2026-10-25,
 # rustc 1.101.0-nightly 12433c307 2026-10-24): `src` is `compiler/rustc_abi/src` of
 # rust-lang/rust at commit 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0, unchanged but for blaze's four lines at the top of
 # `src/lib.rs` (its `#![blaze::trust(unsafe, ..)]`, kept by harness/toolchain_bump.py). It takes the
@@ -20,7 +20,8 @@ nightly = []
 randomize = []
 
 [dependencies]
-bitflags.workspace = true
+# blaze's `bitflags!` under bitflags' name, so `src`, copied unchanged, names it as `bitflags::`.
+bitflags = { package = "blaze-bitflags", path = "../blaze-bitflags" }
 rustc_hashes.workspace = true
 rustc_index.workspace = true
-tracing = { workspace = true, features = ["default"] }
+blaze-trace.workspace = true

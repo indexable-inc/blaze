@@ -6,6 +6,8 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
+use std::alloc::Global;
+
 /// The largest index file read: 32 MiB. The largest crates.io packages (thousands of
 /// versions) are a few MiB.
 pub const MOST_INDEX_BYTES: usize = 32 << 20;
@@ -19,18 +21,28 @@ pub enum Yanked {
     NotChecked(String),
 }
 
-#[derive(serde::Deserialize)]
+/// The three fields of an index line the check reads; every other field is the registry's.
 struct Line<'a> {
-    #[serde(borrow)]
-    name: std::borrow::Cow<'a, str>,
-    #[serde(borrow)]
-    vers: std::borrow::Cow<'a, str>,
-    #[serde(default)]
+    name: &'a str,
+    vers: &'a str,
+    /// False when the line has none.
     yanked: bool,
 }
 
+/// `line` read as an index entry, its strings borrowed from the value. Its other keys (`deps`,
+/// `cksum`, `features`, `v`, ...) are let be on purpose: the line is the registry's format,
+/// which gains keys a reader must tolerate, so this reads the three it needs and no others.
+fn line_of(value: &blaze_data::Value<std::alloc::Global>) -> Result<Line<'_>, blaze_data::ShapeError<std::alloc::Global>> {
+    let c = blaze_data::Cursor::root(value, std::alloc::Global);
+    Ok(Line {
+        name: c.field("name")?.text()?,
+        vers: c.field("vers")?.text()?,
+        yanked: c.opt::<bool>("yanked")?.unwrap_or(false),
+    })
+}
+
 /// What the index file `bytes` of `package` says of `version`.
-pub fn yanked(package: &str, version: &semver::Version, bytes: &[u8]) -> Yanked {
+pub fn yanked(package: &str, version: &blaze_semver::Version<Global>, bytes: &[u8]) -> Yanked {
     if bytes.len() > MOST_INDEX_BYTES {
         return Yanked::NotChecked(format!(
             "its index file is {} bytes, more than the {MOST_INDEX_BYTES} one may be",
@@ -42,14 +54,18 @@ pub fn yanked(package: &str, version: &semver::Version, bytes: &[u8]) -> Yanked 
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let line: Line<'_> = match serde_json::from_slice(line) {
+        let value = match blaze_json::read_in(line, blaze_json::Limits::DEFAULT, std::alloc::Global) {
+            Ok(it) => it,
+            Err(why) => return Yanked::NotChecked(format!("line {} of its index file is not an index entry: {why}", at + 1)),
+        };
+        let line = match line_of(&value) {
             Ok(it) => it,
             Err(why) => return Yanked::NotChecked(format!("line {} of its index file is not an index entry: {why}", at + 1)),
         };
         if !line.name.eq_ignore_ascii_case(package) {
             return Yanked::NotChecked(format!("line {} of its index file is of `{}`", at + 1, line.name));
         }
-        if semver::Version::parse(&line.vers).is_ok_and(|it| &it == version) {
+        if blaze_semver::Version::parse_in(&line.vers, blaze_semver::Limits::CARGO, Global).is_ok_and(|it| &it == version) {
             found = Some(line.yanked);
         }
     }

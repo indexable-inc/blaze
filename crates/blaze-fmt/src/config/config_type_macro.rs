@@ -58,6 +58,48 @@ macro_rules! config_type {
                 )*
                 unreachable!()
             }
+
+            fn from_toml<A: ::std::alloc::Allocator>(
+                item: ::blaze_toml::Item<'_, '_, A>,
+            ) -> Result<Self, $crate::config::config_type::OptionRefusal> {
+                use $crate::config::config_type::{OptionRefusal, Refusal};
+                let Some(s) = item.as_str() else {
+                    return Err(OptionRefusal {
+                        at: item.span().start,
+                        below: String::new(),
+                        what: Refusal::Expected { expected: "a string", found: item.kind() },
+                    });
+                };
+                let mut allowed: Vec<&'static str> = Vec::new(); // alloc: the values, for the refusal
+                $(
+                    $crate::config::config_type_macro::config_type_if_unit!(
+                        [$($($field)*)?]
+                        {
+                            let value = $crate::config::config_type_macro::config_type_value!(
+                                $variant; $([$($vattr)*])*
+                            );
+                            if value.eq_ignore_ascii_case(s) {
+                                return Ok($name::$variant);
+                            }
+                            allowed.push(value);
+                        }
+                    );
+                )*
+                Err(OptionRefusal {
+                    at: item.span().start,
+                    below: String::new(),
+                    what: Refusal::UnknownVariant { found: s.to_owned(), allowed },
+                })
+            }
+
+            fn to_toml(
+                &self,
+            ) -> Result<
+                ::blaze_data::Value<::std::alloc::Global>,
+                $crate::config::config_type::NoTomlForm,
+            > {
+                Ok($crate::config::config_type::toml_text(&self.to_string()))
+            }
         }
 
         impl ::std::str::FromStr for $name {

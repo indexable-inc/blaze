@@ -15,9 +15,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use arrow_array::{Array, RecordBatch, cast::AsArray, types::Int64Type};
-
 use crate::{
+    columns::{Batch, Column},
     errors,
     sql::{self, Query, SqlError},
 };
@@ -216,7 +215,7 @@ pub fn of_builds(
     Ok(out)
 }
 
-fn read_answer(batch: &RecordBatch, out: &mut [(u64, Summary, bool)]) -> Result<(), DiffError> {
+fn read_answer(batch: &Batch, out: &mut [(u64, Summary, bool)]) -> Result<(), DiffError> {
     let column = |name: &str| {
         batch
             .column_by_name(name)
@@ -225,49 +224,45 @@ fn read_answer(batch: &RecordBatch, out: &mut [(u64, Summary, bool)]) -> Result<
     };
     let (part, build, key, count, ns) =
         (column("part")?, column("build")?, column("key")?, column("count")?, column("ns")?);
-    // dyn: an Arrow column, as DuckDB's answer gives it, once a diff
-    let text = |array: &dyn Array, name: &str, row: usize| -> Result<Option<String>, DiffError> {
-        if array.is_null(row) {
+    let text = |column: &Column, name: &str, row: usize| -> Result<Option<String>, DiffError> {
+        if column.is_null(row) {
             return Ok(None);
         }
-        match (array.as_string_opt::<i32>(), array.as_string_view_opt()) {
+        match column.text(row) {
             // alloc: a row of DuckDB's answer, once a diff
-            (Some(it), _) => Ok(Some(it.value(row).to_owned())),
-            // alloc: a row of DuckDB's answer, once a diff
-            (None, Some(it)) => Ok(Some(it.value(row).to_owned())),
+            Some(it) => Ok(Some(it.to_owned())),
             // alloc: an error
-            (None, None) => Err(DiffError::Answer(format!(
-                "has column {name} of type {}, not text",
-                array.data_type()
+            None => Err(DiffError::Answer(format!(
+                "has column {name} of type {:?}, not text",
+                column.ty()
             ))),
         }
     };
-    // dyn: an Arrow column, as DuckDB's answer gives it, once a diff
-    let int = |array: &dyn Array, name: &str, row: usize| -> Result<Option<i64>, DiffError> {
-        if array.is_null(row) {
+    let int = |column: &Column, name: &str, row: usize| -> Result<Option<i64>, DiffError> {
+        if column.is_null(row) {
             return Ok(None);
         }
-        match array.as_primitive_opt::<Int64Type>() {
+        match column.i64s() {
             Some(it) => Ok(Some(it.value(row))),
             // alloc: an error
             None => Err(DiffError::Answer(format!(
-                "has column {name} of type {}, not BIGINT",
-                array.data_type()
+                "has column {name} of type {:?}, not BIGINT",
+                column.ty()
             ))),
         }
     };
     for row in 0..batch.num_rows() {
-        let build = int(build.as_ref(), "build", row)?.unwrap_or(0) as u64;
-        let key = text(key.as_ref(), "key", row)?.unwrap_or_default();
-        let count = int(count.as_ref(), "count", row)?.unwrap_or(0) as u64;
-        let ns = int(ns.as_ref(), "ns", row)?.unwrap_or(0);
+        let build = int(build, "build", row)?.unwrap_or(0) as u64;
+        let key = text(key, "key", row)?.unwrap_or_default();
+        let count = int(count, "count", row)?.unwrap_or(0) as u64;
+        let ns = int(ns, "ns", row)?.unwrap_or(0);
         let Some((_, summary, known)) = out.iter_mut().find(|it| it.0 == build) else {
             // alloc: an error
             return Err(DiffError::Answer(format!(
                 "has a row of build {build}, which was not asked"
             )));
         };
-        match text(part.as_ref(), "part", row)?.as_deref() {
+        match text(part, "part", row)?.as_deref() {
             Some("build") => *known = true,
             Some("phase") => {
                 if let Ok(phases) = &mut summary.phases {
@@ -590,7 +585,7 @@ errors gone:
             std::thread::spawn(move || {
                 let _build = crate::flight::building(build);
                 let _unit =
-                    tracing::info_span!(target: "blaze", "unit codegen", krate = "app").entered();
+                    blaze_trace::info_span!(target: "blaze", "unit codegen", krate = "app").entered();
                 blaze_graph::spin::busy(std::time::Duration::from_millis(ms));
             })
             .join()

@@ -1,0 +1,14 @@
+{
+ "id": "tree-record-positions-moved",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane CM (successor)",
+ "where": "crates/blaze-scope/src/tree_record.rs (TreeModule::item) and resolve.rs from_tree_record",
+ "what": "the module tree record kept each inline module's outline position in its file; a `pub use` added to `a` moved `r`'s position in the same file, and the one-group solve of `r` lowered the item at the old position (`b`'s). The walk rows of a childless module are empty both ways, so the record's check passed. Three byte-equality tests failed with no enums or macros in them.",
+ "cost": "one differential test (the same one-group solve walking and from the record, with each tree) named it in one run, after CM spent its context reading resolve.rs",
+ "cause": "a position in a record that is read against a newer text (rule 71: keys and records hold item-relative positions)",
+ "class": "a record field that is a position in a text the reader holds newer than the writer",
+ "prevention": "done: a reader finds an inline module by its name under its parent in the outline as it is now (task/lower.rs inline_child); left: drop `item` from the record (VERSION 3)",
+ "annoyance": "the brief's test targets (`--test names_groups_edit`) are lib tests under src/tests/: the queue needs `--lib -- names_groups_edit`",
+ "workaround": "ask with `-p blaze-scope --lib -- <module filter>`",
+ "state": "fixed"
+}

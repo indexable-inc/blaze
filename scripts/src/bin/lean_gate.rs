@@ -83,7 +83,7 @@ const LEDGER: &str = "docs/v2/plan/objectives.json";
 const MANIFEST: &str = "lean/analysis/lake-manifest.json";
 /// A package's name, its directory, and the directories its modules are found under, in order.
 const PACKAGES: [(&str, &str, &[&str]); 2] =
-    [("core", "lean", &["lean", "crates/blaze-graph/lean", "crates/blaze-core/lean"]), ("analysis", "lean/analysis", &["lean/analysis"])];
+    [("core", "lean", &["lean", "crates/blaze-graph/lean", "crates/blaze-core/lean", "crates/blaze-std/lean"]), ("analysis", "lean/analysis", &["lean/analysis"])];
 const SORRY: &str = "declaration uses 'sorry'";
 
 fn package_dir(package: &str) -> &'static str {
@@ -95,6 +95,8 @@ fn package_dir(package: &str) -> &'static str {
 enum Find {
     /// Python's `(?<![\w.'])<word>(?![\w'])`.
     Bare(&'static str),
+    /// The text itself, anywhere.
+    Text(&'static str),
     Re(Regex),
 }
 
@@ -112,6 +114,7 @@ impl Find {
                 })
                 .map(|(at, _)| at)
                 .collect(),
+            Find::Text(text) => code.match_indices(text).map(|(at, _)| at).collect(),
             Find::Re(re) => re.find_iter(code).map(|m| m.start()).collect(),
         }
     }
@@ -138,11 +141,11 @@ impl Patterns {
             refused: vec![
                 ("sorry", Find::Bare("sorry")),
                 ("admit", Find::Bare("admit")),
-                ("native_decide", Find::Re(re(r"native_decide"))),
+                ("native_decide", Find::Text("native_decide")),
                 ("decide +native", Find::Re(re(r"\+native\b"))),
                 ("axiom", Find::Re(re(r"(?m)^\s*(?:(?:private|protected|noncomputable|unsafe)\s+)*axiom\s"))),
                 ("partial def", Find::Re(re(r"\bpartial\s+def\b"))),
-                ("debug.skipKernelTC", Find::Re(re(r"skipKernelTC"))),
+                ("debug.skipKernelTC", Find::Text("skipKernelTC")),
             ],
             axioms: re(r"'([^'\s]+)' depends on axioms: \[([^\]]*)\]"),
             no_axioms: re(r"'([^'\s]+)' does not depend on any axioms"),
@@ -351,14 +354,16 @@ fn lean_sources(root: &Path) -> Vec<String> {
 }
 
 fn mathlib_rev(lakefile: &str) -> Result<String, String> {
-    let data: toml::Table = toml::from_str(lakefile).map_err(|e| e.to_string())?;
-    for need in data.get("require").and_then(toml::Value::as_array).into_iter().flatten() {
+    let data = toml::parse(lakefile).map_err(|e| format!("lakefile.toml is not TOML: {}", e.display(lakefile)))?;
+    for need in data.get("require").and_then(toml::Value::as_list).into_iter().flatten() {
         if need.get("name").and_then(toml::Value::as_str) == Some("mathlib") {
-            return Ok(match need.get("rev") {
-                None => String::new(),
-                Some(toml::Value::String(rev)) => rev.clone(),
-                Some(other) => other.to_string(),
-            });
+            return match need.get("rev") {
+                None => Ok(String::new()),
+                Some(rev) => match rev.as_str() {
+                    Some(rev) => Ok(rev.to_owned()),
+                    None => Err(format!("lakefile.toml's mathlib `rev` is {}, not a string", rev.kind())),
+                },
+            };
         }
     }
     Ok(String::new())

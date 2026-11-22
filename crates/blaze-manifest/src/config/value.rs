@@ -24,26 +24,83 @@ pub(crate) const DEFINITION_FIELD: &str = "$__cargo_private_definition";
 pub(crate) const NAME: &str = "$__cargo_private_Value";
 pub(crate) static FIELDS: [&str; 2] = [VALUE_FIELD, DEFINITION_FIELD];
 
+/// Where in its text a value was written: the 1-based line and column (in characters) of its
+/// first byte, as blaze-toml's `Item::line_col` gives it. Only printed, never part of a key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Place {
+    pub line: u32,
+    pub column: u32,
+}
+
+impl Place {
+    /// The place of a blaze-toml item.
+    pub(crate) fn of(line_col: (usize, usize)) -> Place {
+        let narrow = |n: usize| match u32::try_from(n) {
+            Ok(n) => n,
+            Err(_) => unreachable!("blaze-toml refuses a text past `u32::MAX` bytes"),
+        };
+        Place { line: narrow(line_col.0), column: narrow(line_col.1) }
+    }
+
+    /// The place packed in one word for the `Value<T>` protocol (`de.rs`): 0 for none.
+    pub(crate) fn pack(place: Option<Place>) -> u64 {
+        place.map_or(0, |p| (u64::from(p.line) << 32) | u64::from(p.column))
+    }
+
+    pub(crate) fn unpack(word: u64) -> Option<Place> {
+        let half = |n: u64| match u32::try_from(n) {
+            Ok(n) => n,
+            Err(_) => unreachable!("half of a word fits in 32 bits"),
+        };
+        let place = || Place { line: half(word >> 32), column: half(word & u64::from(u32::MAX)) };
+        (word != 0).then(place)
+    }
+}
+
 /// Where a value was defined, which decides its priority and what a relative path in it is
-/// relative to. Two definitions of the same kind are equal.
+/// relative to. Two definitions of the same kind are equal. A file's carries the place in it of
+/// the value it defines, when that value came from the file's text.
 #[derive(Clone, Debug, Eq)]
 pub enum Definition {
     BuiltIn,
     /// A config file, by its path.
-    Path(PathBuf),
+    Path(PathBuf, Option<Place>),
     /// An environment variable, by its name.
     Environment(String),
     /// `--config`, with the file's path when the argument named a file.
-    Cli(Option<PathBuf>),
+    Cli(Option<PathBuf>, Option<Place>),
 }
 
 impl Definition {
+    /// The same definition at `place` in its text: for the values under a table read from it.
+    pub(crate) fn at(&self, place: Place) -> Definition {
+        match self {
+            Definition::Path(path, _) => Definition::Path(path.clone(), Some(place)),
+            Definition::Cli(path, _) => Definition::Cli(path.clone(), Some(place)),
+            Definition::BuiltIn | Definition::Environment(_) => self.clone(),
+        }
+    }
+
+    /// The place in the file (or `--config` argument) of the value it defines.
+    pub fn place(&self) -> Option<Place> {
+        match self {
+            Definition::Path(_, place) | Definition::Cli(_, place) => *place,
+            Definition::BuiltIn | Definition::Environment(_) => None,
+        }
+    }
+
+    /// As [`Display`](fmt::Display), with `:line:column` after a file's path when the place is
+    /// known: what blaze's own errors name a value by.
+    pub fn located(&self) -> Located<'_> {
+        Located(self)
+    }
+
     pub(crate) fn rank(&self) -> u8 {
         match self {
             Definition::BuiltIn => 0,
-            Definition::Path(_) => 1,
+            Definition::Path(..) => 1,
             Definition::Environment(_) => 2,
-            Definition::Cli(_) => 3,
+            Definition::Cli(..) => 3,
         }
     }
 
@@ -55,8 +112,10 @@ impl Definition {
     /// file, the current directory otherwise.
     pub fn root<'a>(&'a self, cwd: &'a Path) -> &'a Path {
         match self {
-            Definition::Path(p) | Definition::Cli(Some(p)) => p.parent().unwrap().parent().unwrap(),
-            Definition::Environment(_) | Definition::Cli(None) | Definition::BuiltIn => cwd,
+            Definition::Path(p, _) | Definition::Cli(Some(p), _) => {
+                p.parent().unwrap().parent().unwrap()
+            }
+            Definition::Environment(_) | Definition::Cli(None, _) | Definition::BuiltIn => cwd,
         }
     }
 }
@@ -82,10 +141,24 @@ impl Ord for Definition {
 impl fmt::Display for Definition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Definition::Path(p) | Definition::Cli(Some(p)) => p.display().fmt(f),
+            Definition::Path(p, _) | Definition::Cli(Some(p), _) => p.display().fmt(f),
             Definition::Environment(key) => write!(f, "environment variable `{key}`"),
-            Definition::Cli(None) => write!(f, "--config cli option"),
+            Definition::Cli(None, _) => write!(f, "--config cli option"),
             Definition::BuiltIn => write!(f, "default"),
+        }
+    }
+}
+
+/// [`Definition::located`].
+pub struct Located<'d>(&'d Definition);
+
+impl fmt::Display for Located<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Definition::Path(p, Some(place)) | Definition::Cli(Some(p), Some(place)) => {
+                write!(f, "{}:{}:{}", p.display(), place.line, place.column)
+            }
+            other => other.fmt(f),
         }
     }
 }
@@ -158,12 +231,13 @@ impl<'de, const VALUE: bool> de::Deserialize<'de> for FieldKey<VALUE> {
 
 impl<'de> de::Deserialize<'de> for Definition {
     fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Definition, D::Error> {
-        let (discr, value) = <(u32, String)>::deserialize(deserializer)?;
+        let (discr, value, place) = <(u32, String, u64)>::deserialize(deserializer)?;
+        let place = Place::unpack(place);
         match discr {
             0 => Ok(Definition::BuiltIn),
-            1 => Ok(Definition::Path(value.into())),
+            1 => Ok(Definition::Path(value.into(), place)),
             2 => Ok(Definition::Environment(value)),
-            3 => Ok(Definition::Cli((!value.is_empty()).then(|| value.into()))),
+            3 => Ok(Definition::Cli((!value.is_empty()).then(|| value.into()), place)),
             _ => Err(de::Error::custom(format!("unexpected definition {discr} {value}"))),
         }
     }

@@ -3,18 +3,18 @@
 
 // alloc: expansion time, once per annotated item; no query runs this
 
-use blaze_hash::HashSet;
+use blaze_hash::{FixedState, Set, SetOpts};
 use proc_macro2::{Span, TokenStream, TokenTree};
 use quote::ToTokens;
 use std::alloc::Global;
 
 pub(crate) struct Hygiene {
-    used: HashSet<String, Global>,
+    used: Set<String, FixedState, Global>,
 }
 
 impl Hygiene {
     pub(crate) fn of(item: &impl ToTokens) -> Hygiene {
-        let mut used = HashSet::new_in(Global);
+        let mut used = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
         collect(item.to_token_stream(), &mut used);
         Hygiene { used }
     }
@@ -30,7 +30,7 @@ impl Hygiene {
     }
 }
 
-fn collect(tokens: TokenStream, used: &mut HashSet<String, Global>) {
+fn collect(tokens: TokenStream, used: &mut Set<String, FixedState, Global>) {
     for token in tokens {
         match token {
             TokenTree::Group(group) => collect(group.stream(), used),

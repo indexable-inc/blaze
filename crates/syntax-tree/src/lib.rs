@@ -26,7 +26,7 @@ pub mod ast;
 pub mod view;
 
 pub use blaze_bytes::Text;
-pub use text_size::{TextLen, TextRange, TextSize};
+pub use blaze_text_size::{TextLen, TextRange, TextSize};
 
 pub use crate::{
     api::{

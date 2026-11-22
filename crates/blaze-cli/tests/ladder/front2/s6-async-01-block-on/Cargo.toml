@@ -1,0 +1,4 @@
+[package]
+name = "ladder-s6-async-01-block-on"
+version = "0.1.0"
+edition = "2024"

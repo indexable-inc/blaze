@@ -127,8 +127,26 @@ pub(crate) fn escape_key_part(part: &str) -> Cow<'_, str> {
     if part.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')) {
         Cow::Borrowed(part)
     } else {
-        Cow::Owned(toml::Value::from(part).to_string())
+        // As cargo spells it: the part as a TOML string value, not as a TOML key.
+        let mut quoted = String::new();
+        push_toml_string(part, &mut quoted);
+        Cow::Owned(quoted)
     }
+}
+
+/// `text` as a TOML string value onto `out`, spelled as cargo spells it (blaze-toml's
+/// writer: basic, literal or multi-line by what the text holds).
+pub(crate) fn push_toml_string(text: &str, out: &mut String) {
+    let mut spelled = blaze_own::String::new_in(std::alloc::Global);
+    blaze_toml::write_string(text, &mut spelled);
+    out.push_str(spelled.as_str());
+}
+
+/// `key` as a TOML key onto `out`, spelled as cargo spells it (bare, else quoted).
+pub(crate) fn push_toml_key(key: &str, out: &mut String) {
+    let mut spelled = blaze_own::String::new_in(std::alloc::Global);
+    blaze_toml::write_key(key, &mut spelled);
+    out.push_str(spelled.as_str());
 }
 
 #[cfg(test)]

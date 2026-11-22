@@ -1,0 +1,14 @@
+{
+ "id": "engine-records-static-lifetimes",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane RC3 (plan row C3, the read side holds nothing)",
+ "where": "crates/blaze-cli/src/body_types.rs Kept (records, list, trees), engine_bodies.rs Group/Scope/Found, engine_heads.rs Job and tables_of, run_names.rs Crate",
+ "what": "Every record a stage read was typed `'static` (`CrateRecords<'static>`, `CrateList<'static>`, trees `&'static`), which was only true because each was copied into the heap and leaked; reading in place from the store's mapping needs the store borrow's lifetime, and the stages that hold the copies (BodiesStage, used after the store's Lent is moved into its commit) cannot hold a borrow of it.",
+ "cost": "the in-place reader cannot drop into `Kept`; it is a separate local of engine_check `check`, threaded into both phases, and the crate list and trees still copy (the cascade through `corrected` strings and `tables_of`'s `'static` bounds is left to the next lane)",
+ "cause": "a copy made `'static` to dodge a lifetime, then the lifetime spread through every signature that read it",
+ "class": "a leak used as a lifetime: `'static` on data that is really a borrow of the request's store",
+ "prevention": "a lint refusing `Vec::leak`/`Box::leak` of record bytes outside the store, and a named request lifetime ('r) on every type that holds a record's bytes from the start",
+ "workaround": "EngineRecords<'r> local to the request; Group<'f, 'r>, Scope<'r>, Job<'r>",
+ "fix": "Wanted: the crate list and trees as borrows of the UnitGraph record in place (engine_records.rs), Kept deleted with the old check path.",
+ "state": "open"
+}

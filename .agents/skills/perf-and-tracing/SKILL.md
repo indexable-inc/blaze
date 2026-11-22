@@ -11,35 +11,63 @@ description: "How a slow thing is found and fixed: a span names every stretch of
 
 Anything slow is a P0 until a span names it, and anything large until the profile says what held it
 (bytes by allocator tag, each task's peak, the allocation samples); the trace comes before the fix.
-Every command writes that profile, with a daemon or without, through the one allocator, the one
-schema (`crates/blaze-profile/src/schema.rs`) and the one set of readers: a new command, path or
-task kind that writes none is itself the P0, fixed before its numbers are discussed, and it gets no
-second accounting or summary line computed apart from the profile. Every stretch of worker time sits
-under a `tracing::info_span!(target: "blaze", ...)` that names the work: the macro path for a
-proc-macro expansion, the package, version and target kind for a unit, the query and key, the
-creator of a scope being waited on. Its own CPU time (`self_cpu_ns`) is filled, so a DuckDB query
-over `<BLAZE_HOME>/v2/profile/*.spans.parquet` says which item took the time and whether it was busy
-or waiting. A sampler stack or a guess from a log is a lead. The PR that makes something faster
-quotes the before and after from those spans.
+Every command writes that profile through the one allocator, the one schema
+(`crates/blaze-profile/src/schema.rs`) and the one set of readers: a new command, path or task kind
+that writes none is itself the P0, fixed before its numbers are discussed, and it gets no second
+accounting or summary line computed apart from the profile. Every stretch of worker time sits under
+a `tracing::info_span!(target: "blaze", ...)` that names the work: the macro path for a proc-macro
+expansion, the package, version and target kind for a unit, the query and key, the creator of a
+scope being waited on. Its own CPU time (`self_cpu_ns`) is filled, so a DuckDB query over
+`<BLAZE_HOME>/v2/profile/*.spans.parquet` says which item took the time and whether it was busy or
+waiting. A sampler stack or a guess from a log is a lead. The PR that makes something faster quotes
+the before and after from those spans.
 
 ## incremental-first (rule 60)
 
 What blaze is for is the time between an edit and its result, so that is what is measured, profiled
-and fixed first. When two things trade, the order is the owner's: incremental compile time, then
-memory use, then cold compile time, then disk cleanup that never blocks a build, then disk use. The
-edit loop is these operations, each on real large workspaces (`verify-on-real-projects`:
-paradigmxyz/reth, tempoxyz/tempo and blaze itself), on a typical Mac and on the 128-core build VM,
-each reported against its floor (`within-ten-percent-of-the-floor`): a no-op; a comment edit; a
-private body edit; a signature edit with N dependents; adding an item; adding a derive; the first
-edit after a cold build; an edit in a fresh process (the normal case, since a command answers and
-exits: `no-state-between-requests`); and the memory held between edits (none outside a build's
-helper process). When incremental work and cold-build work compete for time, incremental wins, and a
-cold-build cost is accepted where it buys a faster edit (work done once at build end so an edit need
-not redo it, records written so a restart can read them). Cold builds are not ignored: every design
-keeps the door open to a fast cold build (nothing that makes cold time worse than linear in the
-work, no structure that only an edit can use), a cold build that fails or regresses badly is still a
-bug, and its numbers are still recorded; but tuning cold time is not picked ahead of an open
-incremental item until the owner says the priority has changed. Say which of the two a speed change
-is for, and quote the edit-loop numbers with it.
+and fixed first. When two things trade, the order is the owner's (said again 2026-11-17, and revised
+the same day at 09:14: a PROJECT's records shared between machines are not a goal; a live process is
+allowed if it is wanted, ideally not, because a restart must never cost a re-index): incremental
+compile time, on enormous crates and files too and after a restart with nothing running, with lints
+as fast as it; then fetching the records blaze publishes (std, core and alloc precomputed per
+platform, from R2: the owner at 10:18 the same day, "when ppl do blaze they get a pre
+compiled/cached versino of std core alloc ... BY platform ... it would dl from r2"); then memory
+use; then cold compile time; then disk cleanup that never blocks a build; then disk use. Caches are
+shared across worktrees with no setting, tests are incremental (only the changed ones rerun), and
+the data is laid out for it (columns, structure of arrays). The edit loop is these operations, each
+on real large workspaces (`verify-on-real-projects`: paradigmxyz/reth, tempoxyz/tempo and blaze
+itself), on a typical Mac and on the 128-core build VM, each reported against its floor
+(`within-ten-percent-of-the-floor`): a no-op; a comment edit; a private body edit; a signature edit
+with N dependents; adding an item; adding a derive; the first edit after a cold build; an edit in a
+fresh process (the normal case, since a command answers and exits: `no-state-between-requests`); and
+the memory held between edits (none outside a build's helper process). When incremental work and
+cold-build work compete for time, incremental wins, and a cold-build cost is accepted where it buys
+a faster edit (work done once at build end so an edit need not redo it, records written so a restart
+can read them). Cold builds are not ignored: every design keeps the door open to a fast cold build
+(nothing that makes cold time worse than linear in the work, no structure that only an edit can
+use), a cold build that fails or regresses badly is still a bug, and its numbers are still recorded;
+but tuning cold time is not picked ahead of an open incremental item until the owner says the
+priority has changed. Say which of the two a speed change is for, and quote the edit-loop numbers
+with it.
+
+## per-core-units (rule 84)
+
+Every throughput or latency number reported in a benchmark, commit, PR or reply names its
+concurrency explicitly and states per-core units (`MB/s/core`, `GB/s/core`, `ops/s/core`,
+`ns/op/core`, `tris/s/core`, `rays/s/core`, `evals/s/core`). When reporting multi-core aggregate
+throughput, always show both the core count and the per-core rate (e.g. `38.7 GB/s across 18 cores =
+2.15 GB/s/core`), never a bare `MB/s` or `GB/s` that hides whether the run was 1 core or 18 cores.
+
+## pgo-by-default (rule 86)
+
+Performance telemetry closes the loop automatically: seed cold runs with static loop/cold estimates
+(`PgoSiteTable::estimate_static`), persist exponentially decayed cross-run `BPG1` profiles across
+reboots and worktrees (`PgoSiteTable::merge_decayed`), key JIT code records by PGO tier for
+zero-warmup reuse, feed persisted PGO into bottom-up SCC LTO (`blaze-lir::lto`) and Profile-Guided
+Linting (`blaze-lint::pgo`), and consume persisted PGO by default in `blaze export`. Use
+`bstd::sync::CachePadded` (128B) for contended atomics and `bstd::mem::{SmallVec, GenMap, KindSet,
+interp_search_by_prefix}` on hot paths so one code path scales from Macs to 128-core servers.
+
+See [docs/v2/plan/design/auto-perf.md](../../../docs/v2/plan/design/auto-perf.md).
 
 <!-- End of the generated rules. Hand-written notes follow. -->

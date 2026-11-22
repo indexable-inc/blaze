@@ -1,7 +1,16 @@
 // Follows `src/tools/rustfmt/src/config/config_type.rs` at rust-lang/rust 12433c307 (MIT or Apache-2.0).
 
+use std::alloc::{Allocator, Global};
+use std::collections::HashSet;
+use std::fmt;
+use std::path::PathBuf;
+use std::str::FromStr;
+
+use blaze_data::{Int, Map, Value};
+use blaze_toml::{Item, Kind};
+
 use crate::config::file_lines::FileLines;
-use crate::config::macro_names::MacroSelectors;
+use crate::config::macro_names::{MacroSelector, MacroSelectors};
 use crate::config::options::{IgnoreList, WidthHeuristics};
 
 /// Trait for types that can be used in `Config`.
@@ -17,11 +26,164 @@ pub(crate) trait ConfigType: Sized {
     fn stable_variant(&self) -> bool {
         true
     }
+
+    /// The option's value as a rustfmt.toml writes it, read from its TOML item; a value of
+    /// another shape is refused, naming where in the item.
+    fn from_toml<A: Allocator>(item: Item<'_, '_, A>) -> Result<Self, OptionRefusal>;
+
+    /// The option's value as TOML, for `--print-config`.
+    fn to_toml(&self) -> Result<Value<Global>, NoTomlForm>;
+}
+
+/// Why a rustfmt.toml option's value was refused: the byte offset of the part refused, the
+/// path from the option down to it (`.fn_call_width`, `[2]`; empty for the value itself), and
+/// what is wrong with it.
+#[derive(Debug)]
+pub struct OptionRefusal {
+    pub(crate) at: usize,
+    pub(crate) below: String,
+    pub(crate) what: Refusal,
+}
+
+impl OptionRefusal {
+    fn new<A: Allocator>(item: Item<'_, '_, A>, what: Refusal) -> OptionRefusal {
+        OptionRefusal {
+            at: item.span().start,
+            below: String::new(),
+            what,
+        }
+    }
+
+    fn expected<A: Allocator>(item: Item<'_, '_, A>, expected: &'static str) -> OptionRefusal {
+        OptionRefusal::new(
+            item,
+            Refusal::Expected {
+                expected,
+                found: item.kind(),
+            },
+        )
+    }
+
+    /// The refusal of a part of the value, `step` (`.key` or `[index]`) below it.
+    fn under(mut self, step: fmt::Arguments<'_>) -> OptionRefusal {
+        self.below.insert_str(0, &step.to_string());
+        self
+    }
+}
+
+/// What is wrong with a rustfmt.toml option's value.
+#[derive(Debug)]
+pub enum Refusal {
+    /// A value of another TOML type.
+    Expected { expected: &'static str, found: Kind },
+    /// A negative or too large integer where an unsigned one goes.
+    NotUnsigned(i64),
+    /// An integer past the platform's `isize`.
+    NotSigned(i64),
+    /// A string that names none of the option's values.
+    UnknownVariant {
+        found: String,
+        allowed: Vec<&'static str>,
+    },
+    /// A table without a key it must have.
+    MissingField(&'static str),
+    /// A table with a key it does not take.
+    UnknownField(String),
+    /// `file_lines`, which only `--file-lines` sets.
+    CliOnly,
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Refusal::Expected { expected, found } => {
+                write!(f, "expected {expected}, found {}", found.name())
+            }
+            Refusal::NotUnsigned(n) => write!(f, "expected an unsigned integer, found {n}"),
+            Refusal::NotSigned(n) => write!(f, "{n} is past a signed integer of this platform"),
+            Refusal::UnknownVariant { found, allowed } => {
+                write!(f, "unknown variant `{found}`, expected one of ")?;
+                for (at, value) in allowed.iter().enumerate() {
+                    if at > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "`{value}`")?;
+                }
+                Ok(())
+            }
+            Refusal::MissingField(field) => write!(f, "missing field `{field}`"),
+            Refusal::UnknownField(field) => write!(f, "unknown field `{field}`"),
+            Refusal::CliOnly => f.write_str(
+                "FileLines cannot be deserialized from a project rustfmt.toml file: please \
+                 specify it via the `--file-lines` option instead",
+            ),
+        }
+    }
+}
+
+/// Why an option's value has no TOML form.
+#[derive(Debug)]
+pub enum NoTomlForm {
+    /// A path that is not UTF-8.
+    NotUtf8(PathBuf),
+    /// `file_lines`, which no rustfmt.toml holds.
+    CliOnly,
+}
+
+impl fmt::Display for NoTomlForm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NoTomlForm::NotUtf8(path) => {
+                write!(f, "path {path:?} can't be serialized as UTF-8 string")
+            }
+            NoTomlForm::CliOnly => f.write_str("FileLines cannot be serialized"),
+        }
+    }
+}
+
+/// `text` as a TOML string value.
+pub(crate) fn toml_text(text: &str) -> Value<Global> {
+    Value::Text(blaze_own::String::from_str_in(text, Global))
+}
+
+/// The strings of a TOML array, each refused by its index when it is not one.
+fn toml_strings<'d, A: Allocator>(
+    item: Item<'d, '_, A>,
+) -> Result<Vec<&'d str>, OptionRefusal> {
+    if !item.is_array() {
+        return Err(OptionRefusal::expected(item, "an array of strings"));
+    }
+    item.children()
+        .enumerate()
+        .map(|(at, element)| {
+            element.as_str().ok_or_else(|| {
+                OptionRefusal::expected(element, "a string").under(format_args!("[{at}]"))
+            })
+        })
+        .collect() // alloc: the strings of one option's array, read once
+}
+
+/// `texts` as a TOML array of strings.
+fn toml_list<'s>(texts: impl Iterator<Item = &'s str>) -> Value<Global> {
+    let mut list = blaze_own::Vec::new_in(Global);
+    for text in texts {
+        list.push(toml_text(text));
+    }
+    Value::List(list)
 }
 
 impl ConfigType for bool {
     fn doc_hint() -> String {
         String::from("<boolean>")
+    }
+
+    fn from_toml<A: Allocator>(item: Item<'_, '_, A>) -> Result<Self, OptionRefusal> {
+        item.as_bool()
+            .ok_or_else(|| OptionRefusal::expected(item, "a boolean"))
+    }
+
+    fn to_toml(&self) -> Result<Value<Global>, NoTomlForm> {
+        Ok(Value::Bool(*self))
     }
 }
 
@@ -29,11 +191,33 @@ impl ConfigType for usize {
     fn doc_hint() -> String {
         String::from("<unsigned integer>")
     }
+
+    fn from_toml<A: Allocator>(item: Item<'_, '_, A>) -> Result<Self, OptionRefusal> {
+        let n = item
+            .as_integer()
+            .ok_or_else(|| OptionRefusal::expected(item, "an unsigned integer"))?;
+        usize::try_from(n).map_err(|_| OptionRefusal::new(item, Refusal::NotUnsigned(n)))
+    }
+
+    fn to_toml(&self) -> Result<Value<Global>, NoTomlForm> {
+        Ok(Value::Int(Int::from_u64(*self as u64)))
+    }
 }
 
 impl ConfigType for isize {
     fn doc_hint() -> String {
         String::from("<signed integer>")
+    }
+
+    fn from_toml<A: Allocator>(item: Item<'_, '_, A>) -> Result<Self, OptionRefusal> {
+        let n = item
+            .as_integer()
+            .ok_or_else(|| OptionRefusal::expected(item, "a signed integer"))?;
+        isize::try_from(n).map_err(|_| OptionRefusal::new(item, Refusal::NotSigned(n)))
+    }
+
+    fn to_toml(&self) -> Result<Value<Global>, NoTomlForm> {
+        Ok(Value::Int(Int::from_i64(*self as i64)))
     }
 }
 
@@ -41,11 +225,29 @@ impl ConfigType for String {
     fn doc_hint() -> String {
         String::from("<string>")
     }
+
+    fn from_toml<A: Allocator>(item: Item<'_, '_, A>) -> Result<Self, OptionRefusal> {
+        item.as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| OptionRefusal::expected(item, "a string"))
+    }
+
+    fn to_toml(&self) -> Result<Value<Global>, NoTomlForm> {
+        Ok(toml_text(self))
+    }
 }
 
 impl ConfigType for FileLines {
     fn doc_hint() -> String {
         String::from("<json>")
+    }
+
+    fn from_toml<A: Allocator>(item: Item<'_, '_, A>) -> Result<Self, OptionRefusal> {
+        Err(OptionRefusal::new(item, Refusal::CliOnly))
+    }
+
+    fn to_toml(&self) -> Result<Value<Global>, NoTomlForm> {
+        Err(NoTomlForm::CliOnly)
     }
 }
 
@@ -53,17 +255,118 @@ impl ConfigType for MacroSelectors {
     fn doc_hint() -> String {
         String::from("[<string>, ...]")
     }
+
+    fn from_toml<A: Allocator>(item: Item<'_, '_, A>) -> Result<Self, OptionRefusal> {
+        let selectors = toml_strings(item)?
+            .into_iter()
+            .map(|name| {
+                let Ok(selector) = MacroSelector::from_str(name);
+                selector
+            })
+            .collect(); // alloc: the option's selectors, kept in the config
+        Ok(MacroSelectors(selectors))
+    }
+
+    fn to_toml(&self) -> Result<Value<Global>, NoTomlForm> {
+        let names: Vec<String> = self.0.iter().map(ToString::to_string).collect(); // alloc: the selectors as text, written once
+        Ok(toml_list(names.iter().map(String::as_str)))
+    }
 }
 
 impl ConfigType for WidthHeuristics {
     fn doc_hint() -> String {
         String::new()
     }
+
+    fn from_toml<A: Allocator>(item: Item<'_, '_, A>) -> Result<Self, OptionRefusal> {
+        if !item.is_table() {
+            return Err(OptionRefusal::expected(item, "a table"));
+        }
+        let mut fields: [Option<usize>; 8] = [None; 8];
+        for field in item.children() {
+            let Some(at) = WIDTH_HEURISTICS.iter().position(|name| *name == field.key()) else {
+                return Err(OptionRefusal::new(
+                    field,
+                    Refusal::UnknownField(field.key().to_owned()),
+                ));
+            };
+            let width = usize::from_toml(field)
+                .map_err(|refusal| refusal.under(format_args!(".{}", WIDTH_HEURISTICS[at])))?;
+            fields[at] = Some(width);
+        }
+        let field = |at: usize| {
+            fields[at].ok_or_else(|| {
+                OptionRefusal::new(item, Refusal::MissingField(WIDTH_HEURISTICS[at]))
+            })
+        };
+        Ok(WidthHeuristics {
+            fn_call_width: field(0)?,
+            attr_fn_like_width: field(1)?,
+            struct_lit_width: field(2)?,
+            struct_variant_width: field(3)?,
+            array_width: field(4)?,
+            chain_width: field(5)?,
+            single_line_if_else_max_width: field(6)?,
+            single_line_let_else_max_width: field(7)?,
+        })
+    }
+
+    fn to_toml(&self) -> Result<Value<Global>, NoTomlForm> {
+        let widths = [
+            self.fn_call_width,
+            self.attr_fn_like_width,
+            self.struct_lit_width,
+            self.struct_variant_width,
+            self.array_width,
+            self.chain_width,
+            self.single_line_if_else_max_width,
+            self.single_line_let_else_max_width,
+        ];
+        let mut map = Map::new_in(Global);
+        for (name, width) in WIDTH_HEURISTICS.iter().zip(widths) {
+            map.insert(
+                blaze_own::String::from_str_in(name, Global),
+                width.to_toml()?,
+            );
+        }
+        Ok(Value::Map(map))
+    }
 }
+
+/// The keys of `width_heuristics`, in the order of `WidthHeuristics`'s fields.
+const WIDTH_HEURISTICS: [&str; 8] = [
+    "fn_call_width",
+    "attr_fn_like_width",
+    "struct_lit_width",
+    "struct_variant_width",
+    "array_width",
+    "chain_width",
+    "single_line_if_else_max_width",
+    "single_line_let_else_max_width",
+];
 
 impl ConfigType for IgnoreList {
     fn doc_hint() -> String {
         String::from("[<string>,..]")
+    }
+
+    fn from_toml<A: Allocator>(item: Item<'_, '_, A>) -> Result<Self, OptionRefusal> {
+        let paths: HashSet<PathBuf> = toml_strings(item)?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect(); // alloc: the option's paths, kept in the config
+        Ok(IgnoreList::from_paths(paths))
+    }
+
+    fn to_toml(&self) -> Result<Value<Global>, NoTomlForm> {
+        let paths: Vec<&str> = self
+            .into_iter()
+            .map(|path| {
+                path.to_str()
+                    .ok_or_else(|| NoTomlForm::NotUtf8(path.to_owned()))
+            })
+            .collect::<Result<_, _>>()?; // alloc: the paths as text, written once
+        Ok(toml_list(paths.into_iter()))
     }
 }
 
@@ -77,7 +380,6 @@ macro_rules! create_config {
     ($($i:ident: $ty:ty, $stb:expr, $( $dstring:expr ),+ );+ $(;)*) => (
         use std::io::Write;
 
-        use serde::{Deserialize, Serialize};
         use $crate::config::style_edition::StyleEditionDefault;
 
         #[derive(Clone)]
@@ -100,10 +402,69 @@ macro_rules! create_config {
         // specify all properties of `Config`.
         // We first parse into `PartialConfig`, then create a default `Config`
         // and overwrite the properties with corresponding values from `PartialConfig`.
-        #[derive(Deserialize, Serialize, Clone)]
+        #[derive(Clone)]
         #[allow(unreachable_pub)]
         pub struct PartialConfig {
             $(pub $i: Option<<$ty as StyleEditionDefault>::ConfigType>),+
+        }
+
+        impl PartialConfig {
+            /// The options of the rustfmt.toml `file`, whose text `text` is and whose root table
+            /// `root` is, each read by its type's `ConfigType::from_toml`. Every key is an option:
+            /// `refused_options` refuses the file otherwise, before this runs.
+            fn read_toml<A: ::std::alloc::Allocator>(
+                root: ::blaze_toml::Item<'_, '_, A>,
+                text: &str,
+                file: &Path,
+            ) -> Result<PartialConfig, ConfigError> {
+                let mut parsed = PartialConfig { $($i: None),+ };
+                for item in root.children() {
+                    match item.key() {
+                        $(
+                            stringify!($i) => {
+                                let value = <<$ty as StyleEditionDefault>::ConfigType as
+                                    $crate::config::config_type::ConfigType>::from_toml(item)
+                                    .map_err(|refusal| {
+                                        ConfigError::option(file, text, stringify!($i), refusal)
+                                    })?;
+                                parsed.$i = Some(value);
+                            }
+                        )+
+                        key => {
+                            let (line, column) =
+                                ::blaze_toml::line_col(text, item.key_span().start);
+                            return Err(ConfigError::Refused {
+                                file: file.to_owned(),
+                                options: vec![format!(
+                                    "  `{key}` (line {line}, column {column}): not an option of \
+                                     rustfmt {} (the pinned nightly's)",
+                                    $crate::RUSTFMT_VERSION
+                                )],
+                            });
+                        }
+                    }
+                }
+                Ok(parsed)
+            }
+
+            /// The options that are set, as one TOML table in the order they are declared.
+            fn toml_map(&self) -> Result<::blaze_data::Map<::std::alloc::Global>, ToTomlError> {
+                let mut map = ::blaze_data::Map::new_in(::std::alloc::Global);
+                $(
+                    if let Some(value) = &self.$i {
+                        let value = $crate::config::config_type::ConfigType::to_toml(value)
+                            .map_err(|why| ToTomlError::NoTomlForm {
+                                option: stringify!($i),
+                                why,
+                            })?;
+                        map.insert(
+                            ::blaze_own::String::from_str_in(stringify!($i), ::std::alloc::Global),
+                            value,
+                        );
+                    }
+                )+
+                Ok(map)
+            }
         }
 
         // Macro hygiene won't allow us to make `set_$i()` methods on Config

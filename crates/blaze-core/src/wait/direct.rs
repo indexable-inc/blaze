@@ -27,6 +27,8 @@
 //! `wait/tests.rs` runs this driver, its absolute times and its reading of each call's error,
 //! against the simulated kernel the cores are proven on; [`Kernel`] is the real one.
 
+use blaze_sys::{Errno, Fd, Timespec, linux, posix::proc};
+use core::ffi::{c_int, c_short};
 use std::{
     io,
     os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd},
@@ -36,7 +38,7 @@ use std::{
 
 use super::{
     Clock, Deadline, Once, WaitError, Waited,
-    linux::{KERNEL_SIGSET, WAITING_MASK},
+    linux::WAITING_MASK,
     parking::Futex,
     reaping::Children,
     until,
@@ -97,24 +99,7 @@ impl<S: FutexCalls> Futex for Direct<'_, S> {
         deadline: Option<Deadline>,
         clock: &C,
     ) -> Result<Waited<()>, WaitError> {
-        until(what, clock, deadline, |left| {
-            // The absolute time of this call alone, from what is left now.
-            let at = match left {
-                Some(left) => Some(self.0.monotonic()?.saturating_add(left)),
-                None => None,
-            };
-            match self.0.futex_wait(word, expected, at) {
-                // Woken, or returned with nothing: the parker looks at the word again.
-                Ok(()) => Ok(Once::Ready(())),
-                Err(error) => match error.raw_os_error() {
-                    // The word no longer held `expected`: a wake came before the wait.
-                    Some(libc::EAGAIN) => Ok(Once::Ready(())),
-                    Some(libc::EINTR) => Ok(Once::Interrupted),
-                    Some(libc::ETIMEDOUT) => Ok(Once::TimedOut),
-                    _ => Err(error),
-                },
-            }
-        })
+        until(what, clock, deadline, |left| futex_once(self.0, word, expected, left))
     }
 
     fn wake(&self, word: &AtomicU32) {
@@ -124,6 +109,60 @@ impl<S: FutexCalls> Futex for Direct<'_, S> {
     fn switch(&self) {
         self.0.between();
     }
+}
+
+/// One `FUTEX_WAIT_BITSET` of `calls` on `word` while it holds `expected`, for at most `left`
+/// (no limit for `None`): the call of a park and of a lock's word alike.
+fn futex_once<S: FutexCalls>(
+    calls: &S,
+    word: &AtomicU32,
+    expected: u32,
+    left: Option<Duration>,
+) -> io::Result<Once<()>> {
+    // The absolute time of this call alone, from what is left now.
+    let at = match left {
+        Some(left) => Some(calls.monotonic()?.saturating_add(left)),
+        None => None,
+    };
+    match calls.futex_wait(word, expected, at) {
+        // Woken, or returned with nothing: the waiter looks at the word again.
+        Ok(()) => Ok(Once::Ready(())),
+        Err(error) => match error.raw_os_error() {
+            // The word no longer held `expected`: a wake came before the wait.
+            Some(code) if code == i32::from(Errno::Again.raw()) => Ok(Once::Ready(())),
+            Some(code) if code == i32::from(Errno::Intr.raw()) => Ok(Once::Interrupted),
+            Some(code) if code == i32::from(Errno::TimedOut.raw()) => Ok(Once::TimedOut),
+            _ => Err(error),
+        },
+    }
+}
+
+/// The wait of a lock's word ([`super::word_wait`]), on either driver: a direct
+/// `FUTEX_WAIT_BITSET`, never the thread's ring, so a lock waited for while the ring is in use
+/// (or in a thread that has none) needs no ring; and no row of its own in the wait-for graph
+/// (the lock's is the row).
+pub(crate) fn word_wait(
+    what: &'static str,
+    word: &AtomicU32,
+    expected: u32,
+    deadline: Option<Deadline>,
+    clock: &impl Clock,
+) -> Result<Waited<()>, WaitError> {
+    super::unlisted(what, clock, deadline, |left| futex_once(&Kernel, word, expected, left))
+}
+
+/// The wake of a lock's word: one `FUTEX_WAKE | FUTEX_PRIVATE_FLAG` of one waiter, or of every
+/// one (`all`).
+pub(crate) fn word_wake(word: &AtomicU32, all: bool) {
+    let count = match all {
+        true => i32::MAX as u32,
+        false => 1,
+    };
+    // A wake of a live aligned word cannot fail; the count woken is not needed.
+    #[cfg(test)]
+    // SAFETY: the test wrapper's as_ptr borrows its live aligned AtomicU32; every access is atomic.
+    let word = unsafe { core::sync::atomic::AtomicU32::from_ptr(word.as_ptr()) };
+    _ = linux::futex_wake(word, count);
 }
 
 impl<S: ChildCalls> Children for Direct<'_, S> {
@@ -175,60 +214,28 @@ fn errno() -> io::Error {
     io::Error::last_os_error()
 }
 
-/// `at` as the kernel's `timespec`, saturating at its end.
-fn timespec(at: Duration) -> libc::timespec {
-    libc::timespec {
-        // `time_t` is 64 bits on every Linux blaze runs on.
-        tv_sec: i64::try_from(at.as_secs()).unwrap_or(i64::MAX),
-        tv_nsec: at.subsec_nanos().into(),
-    }
-}
-
 /// `CLOCK_MONOTONIC` now.
 fn monotonic() -> io::Result<Duration> {
-    let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    // SAFETY: a timespec for the kernel to write.
-    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
-        return Err(errno());
-    }
-    Ok(Duration::new(u64::try_from(now.tv_sec).unwrap_or(0), now.tv_nsec as u32))
+    let now = linux::clock_gettime(linux::ClockId::Monotonic)
+        .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))?;
+    Ok(Duration::new(u64::try_from(now.sec).unwrap_or(0), now.nsec as u32))
 }
 
 /// One `ppoll` of `fd` for `events`, for up to `left` (no limit for `None`), under
 /// [`WAITING_MASK`]: its `revents` when it is ready.
 fn ppoll_one(
     fd: RawFd,
-    events: libc::c_short,
+    events: c_short,
     left: Option<Duration>,
-) -> io::Result<Once<libc::c_short>> {
-    let mut fds = libc::pollfd { fd, events, revents: 0 };
-    let ts = left.map(timespec);
-    let mask = WAITING_MASK;
-    // SAFETY: `fds` is one live pollfd the kernel writes `revents` of; the timespec (null for
-    // no limit) and the mask are live locals it reads, the mask of the kernel's own size; it
-    // keeps no pointer after the call. The raw call, as glibc's takes its own larger sigset.
-    let ready = unsafe {
-        libc::syscall(
-            libc::SYS_ppoll,
-            &raw mut fds,
-            1 as libc::nfds_t,
-            ts.as_ref().map_or(ptr::null(), ptr::from_ref),
-            &raw const mask,
-            KERNEL_SIGSET as usize,
-        )
-    };
-    if ready > 0 {
-        return Ok(Once::Ready(fds.revents));
-    }
-    if ready == 0 {
-        return Ok(Once::TimedOut);
-    }
-    let error = errno();
-    match error.raw_os_error() {
-        Some(libc::EINTR) => Ok(Once::Interrupted),
+) -> io::Result<Once<c_short>> {
+    let mut fds = [linux::PollFd::new(Fd::new(fd), linux::PollEvents::from_bits(events))];
+    match linux::ppoll(&mut fds, left.map(Timespec::from_duration), Some(linux::SigSet(WAITING_MASK))) {
+        Ok(0) => Ok(Once::TimedOut),
+        Ok(_) => Ok(Once::Ready(fds[0].found().bits())),
+        Err(Errno::Intr) => Ok(Once::Interrupted),
         // The kernel could not allocate for the call this time.
-        Some(libc::EAGAIN) => Ok(Once::Spurious),
-        _ => Err(error),
+        Err(Errno::Again) => Ok(Once::Spurious),
+        Err(error) => Err(io::Error::from_raw_os_error(i32::from(error.raw()))),
     }
 }
 
@@ -238,40 +245,15 @@ impl FutexCalls for Kernel {
     }
 
     fn futex_wait(&self, word: &AtomicU32, expected: u32, at: Option<Duration>) -> io::Result<()> {
-        let ts = at.map(timespec);
-        // SAFETY: `word` is a live `u32` of this process the kernel only reads; the timespec
-        // (null for no limit) is a live local it reads, an absolute `CLOCK_MONOTONIC` time as
-        // `FUTEX_WAIT_BITSET` takes it; no pointer is kept after the call.
-        let waited = unsafe {
-            libc::syscall(
-                libc::SYS_futex,
-                word.as_ptr(),
-                libc::FUTEX_WAIT_BITSET | libc::FUTEX_PRIVATE_FLAG,
-                expected,
-                ts.as_ref().map_or(ptr::null(), ptr::from_ref),
-                ptr::null::<u32>(),
-                FUTEX_ANY,
-            )
-        };
-        match waited {
-            0 => Ok(()),
-            _ => Err(errno()),
-        }
+        #[cfg(test)]
+        // SAFETY: the test wrapper's as_ptr borrows its live aligned AtomicU32; every access is atomic.
+        let word = unsafe { core::sync::atomic::AtomicU32::from_ptr(word.as_ptr()) };
+        linux::futex_wait_bitset(word, expected, at.map(Timespec::from_duration), FUTEX_ANY)
+            .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))
     }
 
     fn futex_wake(&self, word: &AtomicU32) {
-        // SAFETY: a wake of a word of this process; the kernel reads no memory of it.
-        unsafe {
-            libc::syscall(
-                libc::SYS_futex,
-                word.as_ptr(),
-                libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
-                1,
-                ptr::null::<libc::timespec>(),
-                ptr::null::<u32>(),
-                0,
-            )
-        };
+        word_wake(word, false);
     }
 }
 
@@ -290,13 +272,13 @@ pub(crate) fn wait_shared(
     let low = word.as_ptr().cast::<u32>().cast_const();
     until(what, clock, Some(deadline), |left| {
         let at = monotonic()?.saturating_add(left.unwrap_or_default());
-        let ts = timespec(at);
+        let ts = Timespec::from_duration(at);
         // SAFETY: `low` is the live, aligned low half of a word of a shared mapping, which the
         // kernel only reads; the timespec is a live local it reads, an absolute
         // `CLOCK_MONOTONIC` time; no pointer is kept after the call.
         let waited = unsafe {
             libc::syscall(
-                libc::SYS_futex,
+                linux::nr::FUTEX as core::ffi::c_long,
                 low,
                 libc::FUTEX_WAIT_BITSET,
                 expected,
@@ -311,9 +293,9 @@ pub(crate) fn wait_shared(
         let error = errno();
         match error.raw_os_error() {
             // The word no longer held `expected`: the caller looks again.
-            Some(libc::EAGAIN) => Ok(Once::Ready(())),
-            Some(libc::EINTR) => Ok(Once::Interrupted),
-            Some(libc::ETIMEDOUT) => Ok(Once::TimedOut),
+            Some(code) if code == i32::from(Errno::Again.raw()) => Ok(Once::Ready(())),
+            Some(code) if code == i32::from(Errno::Intr.raw()) => Ok(Once::Interrupted),
+            Some(code) if code == i32::from(Errno::TimedOut.raw()) => Ok(Once::TimedOut),
             // alloc: an error.
             _ => Err(io::Error::new(error.kind(), format!("futex(FUTEX_WAIT_BITSET), shared: {error}"))),
         }
@@ -327,11 +309,11 @@ pub(crate) fn wake_shared(word: &std::sync::atomic::AtomicU64) {
     // SAFETY: a futex wake of a word of a shared mapping; the kernel reads no memory of it.
     _ = unsafe {
         libc::syscall(
-            libc::SYS_futex,
+            linux::nr::FUTEX as core::ffi::c_long,
             word.as_ptr().cast::<u32>(),
             libc::FUTEX_WAKE,
             i32::MAX,
-            ptr::null::<libc::timespec>(),
+            ptr::null::<Timespec>(),
             ptr::null::<u32>(),
             0u32,
         )
@@ -339,7 +321,7 @@ pub(crate) fn wake_shared(word: &std::sync::atomic::AtomicU64) {
 }
 
 impl ChildCalls for Kernel {
-    type Reaped = (libc::c_int, libc::rusage);
+    type Reaped = (c_int, libc::rusage);
     type Pidfd = OwnedFd;
 
     fn reap_now(&self, pid: i32) -> io::Result<Option<Self::Reaped>> {
@@ -349,53 +331,44 @@ impl ChildCalls for Kernel {
         // `WNOHANG` never blocks; an interruption is retried a few times, then is the error.
         for _ in 0..4 {
             // SAFETY: live locals the call writes and does not keep.
-            let reaped = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, &mut rusage) };
+            let reaped = unsafe { libc::wait4(pid, &mut status, proc::WNOHANG, &mut rusage) };
             match reaped {
                 0 => return Ok(None),
                 n if n == pid => return Ok(Some((status, rusage))),
-                _ if errno().raw_os_error() == Some(libc::EINTR) => {}
+                _ if errno().raw_os_error() == Some(i32::from(Errno::Intr.raw())) => {}
                 _ => return Err(errno()),
             }
         }
-        Err(io::Error::from_raw_os_error(libc::EINTR))
+        Err(io::Error::from_raw_os_error(i32::from(Errno::Intr.raw())))
     }
 
     fn exited_now(&self, pid: i32, keep: bool) -> io::Result<bool> {
-        let options = libc::WEXITED | libc::WNOHANG | if keep { libc::WNOWAIT } else { 0 };
-        let id = libc::id_t::try_from(pid)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a negative process id"))?;
+        let mut options = linux::WaitOptions::EXITED | linux::WaitOptions::NO_HANG;
+        if keep {
+            options = options | linux::WaitOptions::NO_WAIT;
+        }
+        if pid < 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "a negative process id"));
+        }
         // As `reap_now`: `WNOHANG` never blocks.
         for _ in 0..4 {
-            // SAFETY: all-zero bytes is a valid `siginfo_t`, zeroed so that a child still
-            // running, of which the call writes nothing it need not, reads as pid 0.
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            // SAFETY: a live local the call writes and does not keep.
-            let waited = unsafe { libc::waitid(libc::P_PID, id, &mut info, options) };
-            if waited == 0 {
-                // SAFETY: `waitid` returned 0, so `info` is a `SIGCHLD` one, whose pid field
-                // is valid to read: the child's once it has exited, 0 while it runs.
-                return Ok(unsafe { info.si_pid() } == pid);
-            }
-            let error = errno();
-            if error.raw_os_error() != Some(libc::EINTR) {
-                return Err(error);
+            match linux::waitid(linux::Children::Pid(pid), options) {
+                Ok(child) => return Ok(child.map_or(0, |child| child.pid) == pid),
+                Err(Errno::Intr) => {}
+                Err(error) => return Err(io::Error::from_raw_os_error(i32::from(error.raw()))),
             }
         }
-        Err(io::Error::from_raw_os_error(libc::EINTR))
+        Err(io::Error::from_raw_os_error(i32::from(Errno::Intr.raw())))
     }
 
     fn pidfd(&self, pid: i32) -> io::Result<OwnedFd> {
-        // SAFETY: the call takes a pid and flags and returns a descriptor of its own.
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        if fd < 0 {
-            return Err(errno());
-        }
-        // SAFETY: the call returned a descriptor no one else holds.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+        let fd = linux::pidfd_open(pid).map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))?;
+        // SAFETY: into_raw transfers sole ownership of the open pidfd.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd.into_raw()) })
     }
 
     fn poll_exit(&self, fd: &OwnedFd, left: Option<Duration>) -> io::Result<Once<()>> {
-        Ok(match ppoll_one(fd.as_raw_fd(), libc::POLLIN, left)? {
+        Ok(match ppoll_one(fd.as_raw_fd(), linux::PollEvents::IN.bits(), left)? {
             Once::Ready(_) => Once::Ready(()),
             Once::Interrupted => Once::Interrupted,
             Once::Spurious => Once::Spurious,
@@ -408,10 +381,10 @@ impl ChildCalls for Kernel {
 pub(crate) fn poll(
     what: &'static str,
     fd: RawFd,
-    events: libc::c_short,
+    events: c_short,
     deadline: Option<Deadline>,
     clock: &impl Clock,
-) -> Result<Waited<libc::c_short>, WaitError> {
+) -> Result<Waited<c_short>, WaitError> {
     until(what, clock, deadline, |left| ppoll_one(fd, events, left))
 }
 
@@ -425,28 +398,14 @@ pub(crate) fn sleep_until(
     // Never ready: it ends as its deadline passes on `clock`.
     until(what, clock, Some(deadline), |left| {
         let at = monotonic()?.saturating_add(left.unwrap_or(Duration::ZERO));
-        match nanosleep_until(&timespec(at)) {
+        match linux::clock_nanosleep_until(linux::ClockId::Monotonic, Timespec::from_duration(at)) {
             // The kernel's time came: the wait ends once the deadline has passed on its clock.
-            0 => Ok(Once::<()>::TimedOut),
-            libc::EINTR => Ok(Once::Interrupted),
-            error => Err(io::Error::from_raw_os_error(error)),
+            Ok(()) => Ok(Once::<()>::TimedOut),
+            Err(Errno::Intr) => Ok(Once::Interrupted),
+            Err(error) => Err(io::Error::from_raw_os_error(i32::from(error.raw()))),
         }
     })
     .map(|_| ())
-}
-
-/// One `clock_nanosleep` to `at` on `CLOCK_MONOTONIC`: 0, or the error's number (the call
-/// returns it, and sets no `errno`).
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the one `clock_nanosleep` of the direct driver's `sleep_until`, to an absolute time recomputed from the deadline"
-)]
-fn nanosleep_until(at: &libc::timespec) -> libc::c_int {
-    // SAFETY: `at` is a live timespec the kernel reads; no remainder is asked for, as the
-    // time is absolute.
-    unsafe {
-        libc::clock_nanosleep(libc::CLOCK_MONOTONIC, libc::TIMER_ABSTIME, at, ptr::null_mut())
-    }
 }
 
 #[cfg(test)]
@@ -455,6 +414,7 @@ mod tests {
     //! the ring's): a park woken, one that ends at its deadline, one a signal interrupts, a
     //! child's exit waited for past a deadline and to its end, a poll and a sleep.
 
+    use blaze_sys::posix::signal::{SIGKILL, SIGUSR2};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -549,7 +509,7 @@ mod tests {
             at: Option<Duration>,
         ) -> io::Result<()> {
             let waited = Kernel.futex_wait(word, expected, at);
-            if waited.as_ref().is_err_and(|it| it.raw_os_error() == Some(libc::EINTR)) {
+            if waited.as_ref().is_err_and(|it| it.raw_os_error() == Some(i32::from(Errno::Intr.raw()))) {
                 self.0.fetch_add(1, Ordering::SeqCst);
             }
             waited
@@ -560,7 +520,7 @@ mod tests {
         }
     }
 
-    extern "C" fn nothing(_: libc::c_int) {}
+    extern "C" fn nothing(_: c_int) {}
 
     /// A park whose thread is signalled every few milliseconds is interrupted, waits again for
     /// what is left, and ends at its deadline, not a whole wait after the last signal.
@@ -568,16 +528,12 @@ mod tests {
     fn a_park_interrupted_by_signals_ends_at_its_deadline() {
         // A handler that does nothing, so the signal ends the wait and not the process. The
         // one place a blaze thread is signalled: a test of what an interruption does.
-        // SAFETY: all-zero bytes is a valid `sigaction`; the handler is async-signal-safe (it
-        // does nothing), and is installed with no `SA_RESTART`.
-        unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = nothing as extern "C" fn(libc::c_int) as usize;
-            libc::sigemptyset(&mut action.sa_mask);
-            assert_eq!(libc::sigaction(libc::SIGUSR2, &action, ptr::null_mut()), 0);
-        }
-        // SAFETY: the calling thread's own handle.
-        let me = unsafe { libc::pthread_self() } as usize;
+        let mut action = linux::signal::SigAction::DEFAULT;
+        action.sa_sigaction = nothing as extern "C" fn(c_int) as usize;
+        // SAFETY: nothing is a static one-argument handler, has no effects and needs no alternate stack.
+        unsafe { linux::signal::set_action(SIGUSR2.cast_unsigned(), &action) }.expect("install SIGUSR2 handler");
+        let me = linux::sample::gettid();
+        let process = linux::getpid();
         let parked = Arc::new(AtomicU32::new(0));
         let signaller = {
             let parked = Arc::clone(&parked); // clone: a reference count, for the signalling thread
@@ -587,9 +543,7 @@ mod tests {
                         return;
                     }
                     nap(ms(5));
-                    // SAFETY: `me` is the handle of the parking thread, which lives until it
-                    // has joined this one.
-                    unsafe { libc::pthread_kill(me as libc::pthread_t, libc::SIGUSR2) };
+                    _ = linux::signal::tgkill(process, me, SIGUSR2.cast_unsigned());
                 }
             })
         };
@@ -645,7 +599,7 @@ mod tests {
         let reaped = reaping::reap(what, &mut Direct(&Kernel), pid, deadline, &clock, plant);
         match reaped.unwrap() {
             Waited::Ready((status, _)) => {
-                assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL);
+                assert!(proc::WIFSIGNALED(status) && proc::WTERMSIG(status) == SIGKILL);
             }
             Waited::Deadline => panic!("a killed child was not reaped within 60 s"),
         }
@@ -653,7 +607,7 @@ mod tests {
         let deadline = Some(Deadline::after(clock.now(), LONG));
         let again = Direct(&Kernel).exited("a test's child", pid, true, deadline, &clock);
         let error = again.expect_err("a reaped child was waited for again");
-        assert_eq!(error.io_error().and_then(io::Error::raw_os_error), Some(libc::ECHILD));
+        assert_eq!(error.io_error().and_then(io::Error::raw_os_error), Some(i32::from(Errno::Child.raw())));
     }
 
     #[test]
@@ -670,8 +624,8 @@ mod tests {
         let reaped = reaping::reap(what, &mut Direct(&Kernel), pid, deadline, &clock, plant);
         match reaped.unwrap() {
             Waited::Ready((status, _)) => {
-                assert!(libc::WIFEXITED(status));
-                assert_eq!(libc::WEXITSTATUS(status), 7);
+                assert!(proc::WIFEXITED(status));
+                assert_eq!(proc::WEXITSTATUS(status), 7);
             }
             Waited::Deadline => panic!("a child that exits at once was not reaped within 60 s"),
         }
@@ -679,22 +633,17 @@ mod tests {
 
     #[test]
     fn a_poll_ends_at_its_deadline_and_is_ready_once_written() {
-        let mut ends = [0; 2];
-        // SAFETY: two descriptors for the kernel to write.
-        assert_eq!(unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
-        // SAFETY: the pipe's two ends, which no one else holds.
-        let (read, write) =
-            unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+        let (read, write) = linux::pipe2(linux::PipeFlags::CLOSE_ON_EXEC).expect("create test pipe");
         let clock = Monotonic::new();
         let deadline = Deadline::after(clock.now(), ms(30));
-        let polled = poll("a test's pipe", read.as_raw_fd(), libc::POLLIN, Some(deadline), &clock);
+        let events = linux::PollEvents::IN.bits();
+        let polled = poll("a test's pipe", read.fd().raw(), events, Some(deadline), &clock);
         assert_eq!(polled.unwrap(), Waited::Deadline);
         assert!(deadline.passed(clock.now()));
-        // SAFETY: one byte of a live local written to the pipe's own end.
-        assert_eq!(unsafe { libc::write(write.as_raw_fd(), [1u8].as_ptr().cast(), 1) }, 1);
+        assert_eq!(linux::write(write.fd(), &[1]), Ok(1));
         let deadline = Some(Deadline::after(clock.now(), LONG));
-        match poll("a test's pipe", read.as_raw_fd(), libc::POLLIN, deadline, &clock).unwrap() {
-            Waited::Ready(revents) => assert_ne!(revents & libc::POLLIN, 0),
+        match poll("a test's pipe", read.fd().raw(), events, deadline, &clock).unwrap() {
+            Waited::Ready(revents) => assert_ne!(revents & events, 0),
             Waited::Deadline => panic!("a written pipe did not poll readable within 60 s"),
         }
     }

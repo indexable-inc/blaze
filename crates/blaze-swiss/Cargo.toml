@@ -1,0 +1,34 @@
+[package]
+name = "blaze-swiss"
+description = "The SwissTable group probe every interner's table shares, `Index`, the lock-free-read table of `u32`s on it, and the bottom of the tree's once-cell and spin lock; `no_std`, its dependencies blaze-own and blaze-int, so the bottom of the tree reaches it (moved from blaze-mem's `swiss`)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# `core`, blaze-own (its `Box` and `Vec`, in place of `alloc`) and blaze-int, which depend on
+# nothing.
+[dependencies]
+# Integer conversions that say what they do: a hash's bits are truncated on purpose.
+blaze-int.workspace = true
+blaze-own.workspace = true
+
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+
+[dev-dependencies]
+# `blaze_own::testing::heap()`: the tests' allocator (no `Global`, no `Alloc::global()`).
+blaze-own = { workspace = true, features = ["std", "testing"] }
+blaze-alloc-count.workspace = true
+blaze-rng.workspace = true
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

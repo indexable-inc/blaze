@@ -1,0 +1,15 @@
+{
+ "id": "blaze-serde-banned-toward-but-unused",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), wave W1 group c",
+ "where": ".clippy.toml:156-159, crates/blaze-cas/clippy.toml:241-244, crates/blaze-ids/clippy.toml:241-244; crates/blaze-serde; the Cargo.toml dependency lines of blaze-fmt, blaze-graph, blaze-manifest, blaze-profile, blaze-protocol and blaze-resolve",
+ "what": "The clippy bans send every `serde::Serialize`/`serde_derive::Serialize` user to `blaze_serde::Serialize` (blaze's own derive), and six crates list blaze-serde as a dependency, which reads as blaze-serde being in use. No .rs file outside blaze-serde names `blaze_serde`: those crates derive through serde's own `derive` feature or `serde_derive` (blaze-profile locks.rs:16, describe.rs:17), the very paths the bans name.",
+ "cost": "a grep round to find that the bridge has no users before deciding whether to rewrite it",
+ "cause": "the move to blaze-serde-derive was started (bans, manifest lines) and the derives were never switched, or were switched back",
+ "whys": "a dependency line and a ban are both taken as evidence of use; nothing checks a listed dependency is named in code",
+ "class": "a listed dependency no source names (unused-crate-dependencies off), and a ban whose replacement nothing uses",
+ "prevention": "delete blaze-serde and blaze-serde-derive with the serde users' move to blaze-data, drop the six manifest lines and the bans; or turn on `unused_crate_dependencies` for the workspace",
+ "annoyance": "none beyond the above",
+ "workaround": "grep for the crate's name in .rs files, not the manifests",
+ "state": "open"
+}

@@ -6,13 +6,85 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use anyhow::bail;
-use blaze_hash::{HashMap, HashSet};
-use cargo_util_schemas::manifest::FeatureName;
+use blaze_hash::{FixedState, Map, MapOpts, Set};
 use std::alloc::Global;
 
-use super::Dependency;
+use super::{Dependency, DependencyError};
 use crate::edit_distance::closest_msg;
+
+/// What the old feature map refused, in its words (cargo's).
+#[derive(Debug)]
+pub(super) enum ReferenceError {
+    Dependency(DependencyError),
+    Name(blaze_resolve::ResolveError),
+    NeitherDependencyNorFeature { feature: String, value: String, closest: String },
+    OptionalWithoutImplicit { feature: String, value: String, name: String },
+    NotOptionalFeature { feature: String, value: String, name: String },
+    DepNotListed { feature: String, value: String, name: String },
+    DepNotOptional { feature: String, value: String, name: String },
+    MultipleSlashes { feature: String, value: String },
+    DepAndSlash { feature: String, value: String, extra_help: String },
+    NotADependency { feature: String, value: String, name: String },
+    WeakNotOptional { feature: String, value: String, name: String },
+    UnusedOptional { name: String },
+}
+
+impl fmt::Display for ReferenceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use ReferenceError as E;
+        match self {
+            E::Dependency(e) => write!(f, "{e}"),
+            E::Name(e) => write!(f, "{e}"),
+            E::NeitherDependencyNorFeature { feature, value, closest } => write!(
+                f,
+                "feature `{feature}` includes `{value}` which is neither a dependency \
+                 nor another feature{closest}"
+            ),
+            E::OptionalWithoutImplicit { feature, value, name } => write!(
+                f,
+                "feature `{feature}` includes `{value}`, but `{name}` is an \
+                 optional dependency without an implicit feature\n\
+                 Use `dep:{name}` to enable the dependency."
+            ),
+            E::NotOptionalFeature { feature, value, name } | E::DepNotOptional { feature, value, name } => write!(
+                f,
+                "feature `{feature}` includes `{value}`, but `{name}` is not an optional dependency\n\
+                 A non-optional dependency of the same name is defined; \
+                 consider adding `optional = true` to its definition."
+            ),
+            E::DepNotListed { feature, value, name } => write!(
+                f,
+                "feature `{feature}` includes `{value}`, but `{name}` is not listed as a dependency"
+            ),
+            E::MultipleSlashes { feature, value } => write!(
+                f,
+                "multiple slashes in feature `{value}` (included by feature `{feature}`) are not allowed"
+            ),
+            E::DepAndSlash { feature, value, extra_help } => write!(
+                f,
+                "feature `{feature}` includes `{value}` with both `dep:` and `/`\n\
+                 To fix this, remove the `dep:` prefix.{extra_help}"
+            ),
+            E::NotADependency { feature, value, name } => write!(
+                f,
+                "feature `{feature}` includes `{value}`, but `{name}` is not a dependency"
+            ),
+            E::WeakNotOptional { feature, value, name } => write!(
+                f,
+                "feature `{feature}` includes `{value}` with a `?`, but `{name}` is not an optional dependency\n\
+                 A non-optional dependency of the same name is defined; \
+                 consider removing the `?` or changing the dependency to be optional"
+            ),
+            E::UnusedOptional { name } => write!(
+                f,
+                "optional dependency `{name}` is not included in any feature\n\
+                 Make sure that `dep:{name}` is included in one of features in the [features] table."
+            ),
+        }
+    }
+}
+
+impl core::error::Error for ReferenceError {}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum FeatureValue {
@@ -72,14 +144,16 @@ pub(super) type FeatureMap = BTreeMap<String, Vec<FeatureValue>>;
 pub(super) fn build_summary_features(
     features: &BTreeMap<String, Vec<String>>,
     dependencies: &[Dependency],
-) -> anyhow::Result<FeatureMap> {
+) -> Result<FeatureMap, ReferenceError> {
+    use ReferenceError as E;
     for dep in dependencies {
         if dep.optional && !dep.is_transitive() {
-            bail!("dev-dependencies are not allowed to be optional: `{}`", dep.name_in_toml());
+            let name = dep.name_in_toml().to_owned();
+            return Err(E::Dependency(DependencyError::OptionalDevDependency { name }));
         }
     }
 
-    let mut dep_map: HashMap<&str, bool, Global> = HashMap::new_in(Global);
+    let mut dep_map: Map<&str, bool, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     for dep in dependencies {
         *dep_map.entry(dep.name_in_toml()).or_insert(false) |= dep.optional;
     }
@@ -91,7 +165,7 @@ pub(super) fn build_summary_features(
         })
         .collect();
 
-    let explicitly_listed: HashSet<String, Global> =
+    let explicitly_listed: Set<String, FixedState, Global> =
         map.values().flatten().filter_map(|fv| fv.explicit_dep_name()).map(str::to_owned).collect();
 
     for dep in dependencies {
@@ -106,57 +180,40 @@ pub(super) fn build_summary_features(
     }
 
     for (feature, fvs) in &map {
-        FeatureName::new(feature.as_str())?;
+        blaze_resolve::validate_feature_name(feature.as_str()).map_err(E::Name)?;
         for fv in fvs {
             let dep_data = dep_map.get(fv.feature_or_dep_name());
             let is_any_dep = dep_data.is_some();
             let is_optional_dep = dep_data.is_some_and(|&o| o);
+            let (feature, value) = (feature.clone(), fv.to_string());
             match fv {
                 FeatureValue::Feature(f) => {
                     if !features.contains_key(f) {
                         if !is_any_dep {
                             let closest = closest_msg(f, features.keys(), |k| k, "feature");
-                            bail!(
-                                "feature `{feature}` includes `{fv}` which is neither a dependency \
-                                 nor another feature{closest}"
-                            );
+                            return Err(E::NeitherDependencyNorFeature { feature, value, closest });
                         }
                         if is_optional_dep {
                             if !map.contains_key(f) {
-                                bail!(
-                                    "feature `{feature}` includes `{fv}`, but `{f}` is an \
-                                     optional dependency without an implicit feature\n\
-                                     Use `dep:{f}` to enable the dependency."
-                                );
+                                let name = f.clone();
+                                return Err(E::OptionalWithoutImplicit { feature, value, name });
                             }
                         } else {
-                            bail!(
-                                "feature `{feature}` includes `{fv}`, but `{f}` is not an optional dependency\n\
-                                 A non-optional dependency of the same name is defined; \
-                                 consider adding `optional = true` to its definition."
-                            );
+                            return Err(E::NotOptionalFeature { feature, value, name: f.clone() });
                         }
                     }
                 }
                 FeatureValue::Dep { dep_name } => {
                     if !is_any_dep {
-                        bail!(
-                            "feature `{feature}` includes `{fv}`, but `{dep_name}` is not listed as a dependency"
-                        );
+                        return Err(E::DepNotListed { feature, value, name: dep_name.clone() });
                     }
                     if !is_optional_dep {
-                        bail!(
-                            "feature `{feature}` includes `{fv}`, but `{dep_name}` is not an optional dependency\n\
-                             A non-optional dependency of the same name is defined; \
-                             consider adding `optional = true` to its definition."
-                        );
+                        return Err(E::DepNotOptional { feature, value, name: dep_name.clone() });
                     }
                 }
                 FeatureValue::DepFeature { dep_name, dep_feature, weak } => {
                     if dep_feature.contains('/') {
-                        bail!(
-                            "multiple slashes in feature `{fv}` (included by feature `{feature}`) are not allowed"
-                        );
+                        return Err(E::MultipleSlashes { feature, value });
                     }
                     if let Some(stripped_dep) = dep_name.strip_prefix("dep:") {
                         let has_other_dep = explicitly_listed.contains(stripped_dep);
@@ -171,29 +228,20 @@ pub(super) fn build_summary_features(
                                  \"dep:{stripped_dep}\", \"{stripped_dep}/{dep_feature}\""
                             )
                         };
-                        bail!(
-                            "feature `{feature}` includes `{fv}` with both `dep:` and `/`\n\
-                             To fix this, remove the `dep:` prefix.{extra_help}"
-                        )
+                        return Err(E::DepAndSlash { feature, value, extra_help });
                     }
                     if !is_any_dep {
-                        bail!(
-                            "feature `{feature}` includes `{fv}`, but `{dep_name}` is not a dependency"
-                        );
+                        return Err(E::NotADependency { feature, value, name: dep_name.clone() });
                     }
                     if *weak && !is_optional_dep {
-                        bail!(
-                            "feature `{feature}` includes `{fv}` with a `?`, but `{dep_name}` is not an optional dependency\n\
-                             A non-optional dependency of the same name is defined; \
-                             consider removing the `?` or changing the dependency to be optional"
-                        );
+                        return Err(E::WeakNotOptional { feature, value, name: dep_name.clone() });
                     }
                 }
             }
         }
     }
 
-    let used: HashSet<&str, Global> = map
+    let used: Set<&str, FixedState, Global> = map
         .values()
         .flatten()
         .filter_map(|fv| match fv {
@@ -206,10 +254,7 @@ pub(super) fn build_summary_features(
     if let Some((dep, _)) =
         dep_map.iter().find(|&(dep, &is_optional)| is_optional && !used.contains(dep))
     {
-        bail!(
-            "optional dependency `{dep}` is not included in any feature\n\
-             Make sure that `dep:{dep}` is included in one of features in the [features] table."
-        );
+        return Err(E::UnusedOptional { name: (*dep).to_owned() });
     }
 
     Ok(map)

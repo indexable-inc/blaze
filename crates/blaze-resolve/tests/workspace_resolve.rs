@@ -11,14 +11,14 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map};
 use blaze_resolve::lockfile::{self, PathDeps};
 use blaze_resolve::metadata::{MetadataPackages, resolve_graph};
 use blaze_resolve::resolver::{CliFeatures, CompileKind, HasDevUnits, Members, VersionOrdering};
-use blaze_resolve::workspace_resolve::{PackageRegistry, Patch, Workspace, resolve_ws};
+use blaze_resolve::workspace_resolve::{Patch, Workspace};
 use blaze_resolve::{
-    Dependency, InternedString, MemRegistry, PackageId, PackageIdSpec, Platform, Resolve,
-    ResolveVersion, SourceId, Summary,
+    Dependency, Effect, Event, InternedString, MemRegistry, PackageId, PackageIdSpec, Platform,
+    Resolve, ResolveVersion, SourceId, Summary, resolving_ws,
 };
 use std::alloc::Global;
 use url::Url;
@@ -68,7 +68,7 @@ fn resolve(
     patch: &[(Url, Vec<Patch>)],
     lock: Option<&str>,
 ) -> Resolve {
-    let path_packages: HashMap<SourceId, Summary, Global> = members
+    let path_packages: Map<SourceId, Summary, FixedState, Global> = members
         .iter()
         .copied()
         .chain(packages)
@@ -98,15 +98,15 @@ fn resolve(
     };
     let registry: MemRegistry = members.iter().copied().chain(packages).cloned().collect();
     let specs: Vec<PackageIdSpec> = members.iter().map(|m| m.package_id().to_spec()).collect();
-    let (_, resolve) = resolve_ws(
-        &mut PackageRegistry::new(registry),
-        &ws,
-        lock.as_ref(),
-        &CliFeatures::new_all(false),
-        &specs,
-        HasDevUnits::Yes,
-    )
-    .unwrap();
+    let cli_features = CliFeatures::new_all(false);
+    let mut machine =
+        resolving_ws(&registry, &ws, lock.as_ref(), &cli_features, &specs, HasDevUnits::Yes, Global);
+    let mut out = Vec::new_in(Global);
+    machine.step(Event::Start, &mut out).unwrap();
+    // Every package is in memory: the machine asks nothing and answers at its first step.
+    let Some(Effect::Done(result)) = out.pop() else { panic!("asked of an in-memory registry") };
+    assert!(out.is_empty());
+    let (_, resolve) = result.unwrap();
     resolve
 }
 

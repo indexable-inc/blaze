@@ -7,7 +7,16 @@
 //! because both of those sit below `blaze-ids` (`blaze-core` stays below `blake3`, and
 //! `blaze-ids` checks its lock-free code with `blaze-check`).
 
+#![no_std]
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core, blaze::std_use, blaze::implicit_allocator, blaze::process_static)]
 #![forbid(unsafe_code)]
+
+// The tests' growable buffers and `catch_unwind`: `core` has neither.
+#[cfg(test)]
+extern crate std;
 
 /// The Weyl increment, `2^64 / φ` rounded to odd.
 pub const GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -61,7 +70,7 @@ impl SplitMix64 {
 
     /// In `start..end`, or `start` when the range is empty.
     #[inline]
-    pub fn range(&mut self, range: std::ops::Range<u64>) -> u64 {
+    pub fn range(&mut self, range: core::ops::Range<u64>) -> u64 {
         range.start + self.below(range.end.saturating_sub(range.start))
     }
 
@@ -136,6 +145,12 @@ impl SplitMix64 {
 /// The list is all the bookkeeping: no count beside it and no number on an arm, so two
 /// changes that each add an arm merge without renumbering. It panics, naming itself, when no
 /// condition holds.
+///
+/// It is for other crates: its rules call each other through `$crate::choose!`, which rustc
+/// refuses where the call is inside blaze-rng (`macro_expanded_macro_exports_accessed_by_absolute_paths`:
+/// the crate-root `#![blaze::sans_io]` makes the crate's exported macros count as
+/// macro-expanded; annoyance crate-root-tool-attribute-hides-macros), and the recursion cannot go, since one matcher cannot tell an `if` arm from an `if`
+/// expression. Its test is tests/choose.rs.
 #[macro_export]
 macro_rules! choose {
     // Each arm in turn moves to the lists of conditions and arms; one rule per form, since a
@@ -169,6 +184,8 @@ macro_rules! choose {
 
 #[cfg(test)]
 mod tests {
+    use std::{vec, vec::Vec};
+
     use blaze_sim::Config;
 
     use super::*;
@@ -244,21 +261,8 @@ mod tests {
         assert_eq!(rng.pick(&[9]), Some(&9));
     }
 
-    /// Each open arm about as often as the others, a closed one never, and nothing to take is
-    /// a panic.
-    #[test]
-    fn choose_takes_open_arms_evenly() {
-        let mut rng = SplitMix64::new(11);
-        let mut taken = [0u32; 4];
-        for _ in 0..12_000 {
-            let arm: usize = choose!(rng; 0, if false => 1, 2, 3);
-            taken[arm] += 1;
-        }
-        assert_eq!(taken[1], 0, "{taken:?}");
-        assert!(taken.iter().all(|&n| n == 0 || (3600..4400).contains(&n)), "{taken:?}");
-        let none = std::panic::catch_unwind(|| choose!(SplitMix64::new(0); if false => 0u8));
-        assert!(none.is_err());
-    }
+    // `choose!`'s test is tests/choose.rs: an exported macro that calls itself through
+    // `$crate::choose!` is refused inside its own crate (see the macro).
 
     #[test]
     fn shuffle_permutes() {

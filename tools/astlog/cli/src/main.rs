@@ -6,96 +6,252 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use astlog_core::{Analysis, Finding, Severity, SuppressedFinding, Value, one_line};
-use clap::{Parser, Subcommand};
-use snafu::{ResultExt as _, Snafu};
+use error_chain::args::{ArgError, Args};
 
-#[derive(Parser)]
-#[command(name = "astlog", version, about)]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
 enum Command {
     /// Evaluate rules and print derived relations (pure inspection; `scan`
     /// is the lint gate).
-    Query {
-        /// Rules file (`.astlog`).
-        rules: PathBuf,
-        /// Files or directories to load (directories walk gitignore-aware).
-        #[arg(required = true)]
-        paths: Vec<PathBuf>,
-        /// Print only this relation.
-        #[arg(long)]
-        relation: Option<String>,
-        /// Emit JSON instead of text.
-        #[arg(long)]
-        json: bool,
-    },
+    Query { rules: PathBuf, paths: Vec<PathBuf>, relation: Option<String>, json: bool },
     /// Evaluate rules and emit one finding per row of each `(lint ...)`
     /// relation, minus `astlog-ignore` suppressions. Exits nonzero when any
     /// error-severity finding survives.
-    Scan {
-        /// Rules file (`.astlog`).
-        rules: PathBuf,
-        /// Files or directories to scan (default: the current directory).
-        paths: Vec<PathBuf>,
-        /// Emit a JSON array of findings instead of text.
-        #[arg(long)]
-        json: bool,
-        /// Promote warnings to errors for the exit-code decision.
-        #[arg(long)]
-        error: bool,
-    },
+    Scan { rules: PathBuf, paths: Vec<PathBuf>, json: bool, error: bool },
     /// Evaluate rules and list every finding an `astlog-ignore` comment
     /// suppresses, with the comment behind each (pure inspection; exits zero).
-    Suppressions {
-        /// Rules file (`.astlog`).
-        rules: PathBuf,
-        /// Files or directories to scan (default: the current directory).
-        paths: Vec<PathBuf>,
-        /// Emit a JSON array of suppressed findings instead of text.
-        #[arg(long)]
-        json: bool,
-    },
+    Suppressions { rules: PathBuf, paths: Vec<PathBuf>, json: bool },
     /// Evaluate rules and apply `(rewrite ...)` edits.
-    Fix {
-        /// Rules file (`.astlog`).
-        rules: PathBuf,
-        /// Files or directories to load.
-        #[arg(required = true)]
-        paths: Vec<PathBuf>,
-        /// Write changes to disk instead of printing the diff.
-        #[arg(long)]
-        write: bool,
-    },
+    Fix { rules: PathBuf, paths: Vec<PathBuf>, write: bool },
 }
 
-#[derive(Debug, Snafu)]
+const COMMANDS: &str = "`query`, `scan`, `suppressions`, `fix`, `help`";
+
+const VERSION: &str = concat!("astlog ", env!("CARGO_PKG_VERSION"), "\n");
+
+const HELP: &str = concat!(
+    env!("CARGO_PKG_DESCRIPTION"),
+    "
+
+Usage: astlog <COMMAND>
+
+Commands:
+  query         Evaluate rules and print derived relations (pure inspection; `scan` is the lint
+                gate)
+  scan          Evaluate rules and emit one finding per row of each `(lint ...)` relation, minus
+                `astlog-ignore` suppressions. Exits nonzero when any error-severity finding
+                survives
+  suppressions  Evaluate rules and list every finding an `astlog-ignore` comment suppresses, with
+                the comment behind each (pure inspection; exits zero)
+  fix           Evaluate rules and apply `(rewrite ...)` edits
+  help          Print this message or the help of the given command
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+"
+);
+
+const QUERY_HELP: &str = "\
+Evaluate rules and print derived relations (pure inspection; `scan` is the lint gate).
+
+Usage: astlog query [OPTIONS] <RULES> <PATHS>...
+
+Arguments:
+  <RULES>     Rules file (`.astlog`)
+  <PATHS>...  Files or directories to load (directories walk gitignore-aware)
+
+Options:
+      --relation <RELATION>  Print only this relation
+      --json                 Emit JSON instead of text
+  -h, --help                 Print help
+";
+
+const SCAN_HELP: &str = "\
+Evaluate rules and emit one finding per row of each `(lint ...)` relation, minus `astlog-ignore`
+suppressions. Exits nonzero when any error-severity finding survives.
+
+Usage: astlog scan [OPTIONS] <RULES> [PATHS]...
+
+Arguments:
+  <RULES>     Rules file (`.astlog`)
+  [PATHS]...  Files or directories to scan (default: the current directory)
+
+Options:
+      --json   Emit a JSON array of findings instead of text
+      --error  Promote warnings to errors for the exit-code decision
+  -h, --help   Print help
+";
+
+const SUPPRESSIONS_HELP: &str = "\
+Evaluate rules and list every finding an `astlog-ignore` comment suppresses, with the comment
+behind each (pure inspection; exits zero).
+
+Usage: astlog suppressions [OPTIONS] <RULES> [PATHS]...
+
+Arguments:
+  <RULES>     Rules file (`.astlog`)
+  [PATHS]...  Files or directories to scan (default: the current directory)
+
+Options:
+      --json  Emit a JSON array of suppressed findings instead of text
+  -h, --help  Print help
+";
+
+const FIX_HELP: &str = "\
+Evaluate rules and apply `(rewrite ...)` edits.
+
+Usage: astlog fix [OPTIONS] <RULES> <PATHS>...
+
+Arguments:
+  <RULES>     Rules file (`.astlog`)
+  <PATHS>...  Files or directories to load
+
+Options:
+      --write  Write changes to disk instead of printing the diff
+  -h, --help   Print help
+";
+
+/// What the command line asks for: a command to run, or text to print (help, the version).
+enum Parsed {
+    Run(Command),
+    Print(&'static str),
+}
+
+/// Read the command line. A `--help` (or `-h`) wins over every other refusal of its command.
+fn parse(mut args: Args) -> Result<Parsed, ArgError> {
+    let Some(first) = args.first() else {
+        return Err(ArgError::MissingCommand { commands: COMMANDS });
+    };
+    let help = |args: &mut Args, text| args.switch(&["-h", "--help"]).map(|it| it.then_some(text));
+    let command = match first.as_str() {
+        "-h" | "--help" => return Ok(Parsed::Print(HELP)),
+        "-V" | "--version" => return Ok(Parsed::Print(VERSION)),
+        "help" => {
+            let text = match args.positional().as_deref() {
+                None => HELP,
+                Some(name) => command_help(name)?,
+            };
+            if let Some(extra) = args.finish()?.into_iter().next() {
+                return Err(ArgError::Unexpected { arg: extra });
+            }
+            return Ok(Parsed::Print(text));
+        }
+        name => command_help(name)?,
+    };
+    if let Some(text) = help(&mut args, command)? {
+        return Ok(Parsed::Print(text));
+    }
+    let command = match first.as_str() {
+        "query" => {
+            let relation = args.value("--relation")?;
+            let json = args.switch(&["--json"])?;
+            let (rules, paths) = rules_and_paths(args, true)?;
+            Command::Query { rules, paths, relation, json }
+        }
+        "scan" => {
+            let json = args.switch(&["--json"])?;
+            let error = args.switch(&["--error"])?;
+            let (rules, paths) = rules_and_paths(args, false)?;
+            Command::Scan { rules, paths, json, error }
+        }
+        "suppressions" => {
+            let json = args.switch(&["--json"])?;
+            let (rules, paths) = rules_and_paths(args, false)?;
+            Command::Suppressions { rules, paths, json }
+        }
+        _ => {
+            let write = args.switch(&["--write"])?;
+            let (rules, paths) = rules_and_paths(args, true)?;
+            Command::Fix { rules, paths, write }
+        }
+    };
+    Ok(Parsed::Run(command))
+}
+
+/// The help of the command `name`, which also checks that it is one.
+fn command_help(name: &str) -> Result<&'static str, ArgError> {
+    match name {
+        "query" => Ok(QUERY_HELP),
+        "scan" => Ok(SCAN_HELP),
+        "suppressions" => Ok(SUPPRESSIONS_HELP),
+        "fix" => Ok(FIX_HELP),
+        flag if flag.starts_with('-') => Err(ArgError::UnknownFlag { flag: flag.to_owned() }),
+        _ => Err(ArgError::UnknownCommand { name: name.to_owned(), commands: COMMANDS }),
+    }
+}
+
+/// The `<RULES>` positional and the paths after it, which `required` says may not be none.
+fn rules_and_paths(mut args: Args, required: bool) -> Result<(PathBuf, Vec<PathBuf>), ArgError> {
+    let rules = args.positional().ok_or(ArgError::Missing { what: "<RULES>" })?;
+    let paths: Vec<PathBuf> = args.finish()?.into_iter().map(PathBuf::from).collect();
+    if required && paths.is_empty() {
+        return Err(ArgError::Missing { what: "<PATHS>..." });
+    }
+    Ok((PathBuf::from(rules), paths))
+}
+
+#[derive(Debug)]
 enum Error {
-    #[snafu(display("read rules {}", path.display()))]
     ReadRules { path: PathBuf, source: std::io::Error },
 
-    #[snafu(transparent)]
+    /// Displays as the core error itself.
     Core { source: astlog_core::Error },
 
-    #[snafu(display("relation `{name}` is not defined; available: {available}"))]
     NoRelation { name: String, available: String },
 
-    #[snafu(display("write {}", path.display()))]
     WriteFixed { path: PathBuf, source: std::io::Error },
 
-    #[snafu(display("{count} blocking finding(s)"))]
     Findings { count: usize },
 }
 
-fn main() -> ExitCode {
-    error_chain::main("astlog", || run(&Cli::parse()))
+impl From<astlog_core::Error> for Error {
+    fn from(source: astlog_core::Error) -> Self {
+        Self::Core { source }
+    }
 }
 
-fn run(cli: &Cli) -> Result<(), Error> {
-    match &cli.command {
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReadRules { path, .. } => write!(f, "read rules {}", path.display()),
+            Self::Core { source } => std::fmt::Display::fmt(source, f),
+            Self::NoRelation { name, available } => {
+                write!(f, "relation `{name}` is not defined; available: {available}")
+            }
+            Self::WriteFixed { path, .. } => write!(f, "write {}", path.display()),
+            Self::Findings { count } => write!(f, "{count} blocking finding(s)"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ReadRules { source, .. } | Self::WriteFixed { source, .. } => Some(source),
+            // Transparent: the core error displays as this one, so its own source is next.
+            Self::Core { source } => std::error::Error::source(source),
+            Self::NoRelation { .. } | Self::Findings { .. } => None,
+        }
+    }
+}
+
+fn main() -> ExitCode {
+    let command = match Args::from_env().and_then(parse) {
+        Ok(Parsed::Run(command)) => command,
+        Ok(Parsed::Print(text)) => {
+            print!("{text}");
+            return ExitCode::SUCCESS;
+        }
+        Err(error) => {
+            // A command line the command refuses exits 2, as a usage error does.
+            eprintln!("astlog: {error}\n\nFor more information, try `astlog --help`.");
+            return ExitCode::from(2);
+        }
+    };
+    error_chain::main("astlog", || run(&command))
+}
+
+fn run(command: &Command) -> Result<(), Error> {
+    match command {
         Command::Query { rules, paths, relation, json } => {
             let analysis = load(rules, paths)?;
             let selected = select(&analysis, relation.as_deref())?;
@@ -117,7 +273,7 @@ fn run(cli: &Cli) -> Result<(), Error> {
             }
             match blocking_count(&findings, *error) {
                 0 => Ok(()),
-                count => FindingsSnafu { count }.fail(),
+                count => Err(Error::Findings { count }),
             }
         }
         Command::Suppressions { rules, paths, json } => {
@@ -135,8 +291,9 @@ fn run(cli: &Cli) -> Result<(), Error> {
             let analysis = load(rules, paths)?;
             if *write {
                 for fixed in analysis.rewritten() {
-                    std::fs::write(&fixed.path, fixed.content)
-                        .context(WriteFixedSnafu { path: &fixed.path })?;
+                    if let Err(source) = std::fs::write(&fixed.path, fixed.content) {
+                        return Err(Error::WriteFixed { path: fixed.path, source });
+                    }
                 }
                 eprintln!("astlog: applied {} edit(s)", analysis.edits.len());
             } else {
@@ -148,7 +305,8 @@ fn run(cli: &Cli) -> Result<(), Error> {
 }
 
 fn load(rules: &Path, paths: &[PathBuf]) -> Result<Analysis, Error> {
-    let source = std::fs::read_to_string(rules).context(ReadRulesSnafu { path: rules })?;
+    let source = std::fs::read_to_string(rules)
+        .map_err(|source| Error::ReadRules { path: rules.to_path_buf(), source })?;
     Ok(astlog_core::analyze(&source, paths)?)
 }
 
@@ -252,7 +410,7 @@ fn select(analysis: &Analysis, relation: Option<&str>) -> Result<Vec<String>, Er
     match relation {
         None => Ok(all),
         Some(name) if all.iter().any(|key| key == name) => Ok(vec![name.to_owned()]),
-        Some(name) => NoRelationSnafu { name, available: all.join(", ") }.fail(),
+        Some(name) => Err(Error::NoRelation { name: name.to_owned(), available: all.join(", ") }),
     }
 }
 

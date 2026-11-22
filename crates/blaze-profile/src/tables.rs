@@ -15,15 +15,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use arrow_array::{
-    Array, DictionaryArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt16Array,
-    UInt32Array, UInt64Array,
-    cast::AsArray,
-    types::{Float64Type, Int64Type, UInt16Type, UInt32Type, UInt64Type},
-};
-use parquet::arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
+use std::alloc::Global;
+
+use blaze_parquet::ParquetError;
 
 use crate::{
+    columns::{Batch, BatchError, Column},
     history::{HistoryError, Pin, manifest::Scope},
     schema::{self, Table},
 };
@@ -38,11 +35,7 @@ pub enum TableError {
     },
     Parquet {
         path: PathBuf,
-        error: parquet::errors::ParquetError,
-    },
-    Arrow {
-        path: PathBuf,
-        error: arrow_schema::ArrowError,
+        error: ParquetError,
     },
     /// A file of a schema version this blaze can't read ([`schema::readable`]).
     Version {
@@ -63,7 +56,7 @@ pub enum TableError {
     /// An answer's rows could not be made a batch: a bug in the reader that made them.
     Answer {
         view: &'static str,
-        error: arrow_schema::ArrowError,
+        error: BatchError,
     },
 }
 
@@ -76,9 +69,6 @@ impl fmt::Display for TableError {
             }
             TableError::Parquet { path, error } => {
                 write!(f, "the profile history: reading {}: {error}", path.display())
-            }
-            TableError::Arrow { path, error } => {
-                write!(f, "the profile history: reading the rows of {}: {error}", path.display())
             }
             TableError::Version { path, version, why } => write!(
                 f,
@@ -105,7 +95,7 @@ impl std::error::Error for TableError {}
 /// One file's rows of the columns asked for, each named by its place in the ask.
 pub struct Rows {
     pub path: PathBuf,
-    pub batch: RecordBatch,
+    pub batch: Batch,
     /// For each column asked, its index in `batch`; `None` where the file has none of it.
     at: Vec<Option<usize>>,
 }
@@ -122,7 +112,7 @@ impl Rows {
     /// The `i`th column asked for, as cells.
     pub fn cells(&self, i: usize, column: &'static str) -> Result<Cells<'_>, TableError> {
         let Some(at) = self.at.get(i).copied().flatten() else { return Ok(Cells::Missing) };
-        Cells::of(self.batch.column(at).as_ref())
+        Cells::of(self.batch.column(at))
             .ok_or_else(|| TableError::Type { path: self.path.clone(), column }) // clone: an error
     }
 }
@@ -150,23 +140,15 @@ pub fn read(
             version: entry.version,
             why,
         })?;
-        let opened = fs::File::open(&path)
-            .map_err(|error| TableError::Io { path: path.clone(), error })?; // clone: an error
+        // alloc: a file's bytes, once a question
+        let bytes = fs::read(&path).map_err(|error| TableError::Io { path: path.clone(), error })?; // clone: an error
         let parquet = |error| TableError::Parquet { path: path.clone(), error }; // clone: an error
-        let builder = ParquetRecordBatchReaderBuilder::try_new(opened).map_err(parquet)?;
-        let fields = builder.schema().fields();
+        let file = blaze_parquet::File::open(&bytes, Global).map_err(parquet)?;
         // alloc: a file's projection, once a file
-        let roots: Vec<usize> = columns
-            .iter()
-            .filter_map(|name| fields.iter().position(|it| it.name() == name))
-            .collect();
-        let mask = ProjectionMask::roots(builder.parquet_schema(), roots);
-        let reader = builder.with_projection(mask).build().map_err(parquet)?;
-        for batch in reader {
-            let batch = batch.map_err(|error| TableError::Arrow { path: path.clone(), error })?; // clone: an error
-            let schema = batch.schema();
+        let roots: Vec<usize> = columns.iter().filter_map(|name| file.column(name)).collect();
+        for batch in file.read(&roots).map_err(parquet)? {
             // alloc: a batch's column map, once a batch
-            let at = columns.iter().map(|name| schema.index_of(name).ok()).collect();
+            let at = columns.iter().map(|name| batch.index_of(name)).collect();
             out.push(Rows { path: path.clone(), batch, at }); // clone: a path, once a batch
         }
     }
@@ -177,63 +159,20 @@ pub fn read(
 /// column the file has none of, every cell null.
 pub enum Cells<'a> {
     Missing,
-    U16(&'a UInt16Array),
-    U32(&'a UInt32Array),
-    U64(&'a UInt64Array),
-    I64(&'a Int64Array),
-    F64(&'a Float64Array),
-    Text(&'a StringArray),
-    Dict(&'a DictionaryArray<UInt32Type>, &'a StringArray),
+    /// A column of one value a row: a list column is of no type a fixed question reads.
+    Column(&'a Column),
 }
 
 impl<'a> Cells<'a> {
-    fn of(array: &'a dyn Array) -> Option<Cells<'a>> {
-        if let Some(it) = array.as_primitive_opt::<UInt16Type>() {
-            return Some(Cells::U16(it));
-        }
-        if let Some(it) = array.as_primitive_opt::<UInt32Type>() {
-            return Some(Cells::U32(it));
-        }
-        if let Some(it) = array.as_primitive_opt::<UInt64Type>() {
-            return Some(Cells::U64(it));
-        }
-        if let Some(it) = array.as_primitive_opt::<Int64Type>() {
-            return Some(Cells::I64(it));
-        }
-        if let Some(it) = array.as_primitive_opt::<Float64Type>() {
-            return Some(Cells::F64(it));
-        }
-        if let Some(it) = array.as_string_opt::<i32>() {
-            return Some(Cells::Text(it));
-        }
-        let dict = array.as_dictionary_opt::<UInt32Type>()?;
-        Some(Cells::Dict(dict, dict.values().as_string_opt::<i32>()?))
-    }
-
-    fn null(&self, row: usize) -> bool {
-        match self {
-            Cells::Missing => true,
-            Cells::U16(it) => it.is_null(row),
-            Cells::U32(it) => it.is_null(row),
-            Cells::U64(it) => it.is_null(row),
-            Cells::I64(it) => it.is_null(row),
-            Cells::F64(it) => it.is_null(row),
-            Cells::Text(it) => it.is_null(row),
-            Cells::Dict(it, _) => it.is_null(row),
-        }
+    fn of(column: &'a Column) -> Option<Cells<'a>> {
+        column.lists().is_none().then_some(Cells::Column(column))
     }
 
     /// An integer cell; `None` null, or of a text or float column.
     pub fn int(&self, row: usize) -> Option<i128> {
-        if self.null(row) {
-            return None;
-        }
         match self {
-            Cells::U16(it) => Some(it.value(row).into()),
-            Cells::U32(it) => Some(it.value(row).into()),
-            Cells::U64(it) => Some(it.value(row).into()),
-            Cells::I64(it) => Some(it.value(row).into()),
-            _ => None,
+            Cells::Missing => None,
+            Cells::Column(it) => it.int(row),
         }
     }
 
@@ -247,28 +186,18 @@ impl<'a> Cells<'a> {
 
     /// A number cell as a double, as DuckDB casts one for arithmetic with a double.
     pub fn f64(&self, row: usize) -> Option<f64> {
-        if self.null(row) {
-            return None;
-        }
         match self {
-            Cells::F64(it) => Some(it.value(row)),
-            // As DuckDB casts an integer to DOUBLE: the nearest double.
-            _ => self.int(row).map(|it| it as f64),
+            Cells::Missing => None,
+            // An integer as DuckDB casts one to DOUBLE: the nearest double.
+            Cells::Column(it) => it.float(row),
         }
     }
 
     /// A text cell, of a plain or a dictionary column.
     pub fn text(&self, row: usize) -> Option<&'a str> {
-        if self.null(row) {
-            return None;
-        }
         match self {
-            Cells::Text(it) => Some(it.value(row)),
-            Cells::Dict(dict, values) => {
-                let key = usize::try_from(dict.keys().value(row)).ok()?;
-                (key < values.len()).then(|| values.value(key))
-            }
-            _ => None,
+            Cells::Missing => None,
+            Cells::Column(it) => it.text(row),
         }
     }
 }

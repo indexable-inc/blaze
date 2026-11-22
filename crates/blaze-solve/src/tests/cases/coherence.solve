@@ -1,0 +1,395 @@
+# Coherence (src/coherence.rs): overlap of impl headers, the orphan check, knowability and the
+# unknowable candidate. References: vendor/rustc_next_trait_solver/src/coherence.rs,
+# solve/assembly/mod.rs consider_coherence_unknowable_candidate, and rustc_trait_selection
+# traits/coherence.rs overlap (not vendored). Every item is declared in its case.
+
+# ---- overlap of two impl headers ----
+
+case overlap_blanket_and_concrete = rustc_trait_selection coherence.rs overlap
+trait Foo
+impl@a<T> Foo for T
+impl@b Foo for u32
+overlap @a @b => overlap
+
+case overlap_blanket_where_clause_holds = rustc_trait_selection coherence.rs overlap
+trait Foo
+trait Bar
+impl Bar for u32
+impl@a<T: Bar> Foo for T
+impl@b Foo for u32
+overlap @a @b => overlap
+
+case disjoint_by_failing_where_clause = rustc_trait_selection coherence.rs impl_intersection_has_impossible_obligation
+trait Foo
+trait Bar
+impl Bar for bool
+impl@a<T: Bar> Foo for T
+impl@b Foo for u32
+overlap @a @b => disjoint
+
+case disjoint_by_self_type = rustc_trait_selection coherence.rs equate_impl_headers
+trait Foo
+impl@a Foo for u32
+impl@b Foo for i32
+overlap @a @b => disjoint
+
+case disjoint_by_adt_args = rustc_trait_selection coherence.rs equate_impl_headers
+trait Foo
+struct Local<T>
+impl@a Foo for Local<u32>
+impl@b Foo for Local<bool>
+overlap @a @b => disjoint
+
+case overlap_two_generic_impls = rustc_trait_selection coherence.rs overlap
+trait Foo
+struct Local<T>
+impl@a<T> Foo for Local<T>
+impl@b<U> Foo for Local<U>
+# Both impls' implicit `T: Sized` is `?T: Sized`, ambiguous on a variable self type: the same
+# rule as may_overlap_where_clause_on_unresolved_var (rustc reports both as one overlap).
+overlap @a @b => may_overlap
+
+case overlap_with_unresolved_var = rustc_trait_selection coherence.rs overlap
+# The intersection leaves impl a's T bound to bool; nothing else is asked.
+trait Foo<X>
+impl@a<T> Foo<T> for u32
+impl@b Foo<bool> for u32
+overlap @a @b => overlap
+
+case may_overlap_where_clause_on_unresolved_var = assembly/mod.rs assemble_and_evaluate_candidates forced_ambiguity
+# `?T: Bar` stays ambiguous (its self type is a variable): an overlap for coherence.
+trait Foo<X>
+trait Bar
+impl Bar for u8
+impl@a<T: Bar> Foo<T> for u32
+impl@b<T> Foo<T> for u32
+overlap @a @b => may_overlap
+
+case may_overlap_two_blankets_no_negative_reasoning = rustc_trait_selection coherence.rs overlap
+# No common type implements both A and B today, but a downstream crate may add one.
+trait Foo
+trait A
+trait B
+impl A for u32
+impl B for bool
+impl@a<T: A> Foo for T
+impl@b<T: B> Foo for T
+overlap @a @b => may_overlap
+
+case may_overlap_upstream_may_add_impl = coherence.rs trait_ref_is_knowable Conflict::Upstream
+# "upstream crates may add a new impl of trait `Debug` for type `Vec<Local>`".
+trait Foo
+struct Local
+impl@a<T: Debug> Foo for T
+impl@b Foo for Vec<Local>
+overlap @a @b => may_overlap
+
+case disjoint_local_type_foreign_trait = coherence.rs trait_ref_is_knowable
+# `Local: Debug` is knowable: only this crate may implement it.
+trait Foo
+struct Local
+impl@a<T: Debug> Foo for T
+impl@b Foo for Local
+overlap @a @b => disjoint
+
+case disjoint_box_local_fundamental = coherence.rs OrphanChecker::visit_ty fundamental Adt
+trait Foo
+struct Local
+impl@a<T: Debug> Foo for T
+impl@b Foo for Box<Local>
+overlap @a @b => disjoint
+
+case disjoint_ref_local_fundamental = coherence.rs OrphanChecker::visit_ty Ref
+trait Foo
+struct Local
+impl@a<T: Debug> Foo for T
+impl@b Foo for &Local
+overlap @a @b => disjoint
+
+case may_overlap_downstream_box_var = coherence.rs trait_ref_is_knowable Conflict::Downstream
+# "downstream crates may implement trait `Bar` for type `Box<_>`".
+trait Foo
+trait Bar
+impl@a<T: Bar> Foo for T
+impl@b<T> Foo for Box<T>
+overlap @a @b => may_overlap
+
+case disjoint_fundamental_trait = coherence.rs trait_ref_is_local_or_fundamental
+extern fundamental trait FT
+trait Foo
+impl@a<T: FT> Foo for T
+impl@b Foo for Vec<u32>
+overlap @a @b => disjoint
+
+case may_overlap_upstream_copy = coherence.rs trait_ref_is_knowable Conflict::Upstream
+trait Foo
+impl@a<T: Copy> Foo for T
+impl@b Foo for String
+overlap @a @b => may_overlap
+
+case disjoint_negative_impl_is_no_positive_candidate = trait_goals.rs consider_impl_candidate polarity
+trait Foo
+trait Bar
+struct Local
+impl !Bar for Local
+impl@a<T: Bar> Foo for T
+impl@b Foo for Local
+overlap @a @b => disjoint
+
+case overlap_positive_and_negative_impl = rustc_middle impls_are_allowed_to_overlap Positive/Negative
+# E0751: a positive and a negative impl of one header conflict.
+trait Bar
+struct Local
+impl@a Bar for Local
+impl@b !Bar for Local
+overlap @a @b => overlap
+
+case disjoint_positive_and_negative_other_type = rustc_trait_selection coherence.rs equate_impl_headers
+trait Bar
+struct Local
+impl@a Bar for Local
+impl@b !Bar for u32
+overlap @a @b => disjoint
+
+case overlap_marker_trait = rustc_middle impls_are_allowed_to_overlap marker
+# The headers overlap (coherence::permitted allows it: Marker); a goal merges the two impls.
+marker trait M
+impl@a<T> M for T
+impl@b M for u32
+overlap @a @b => overlap
+goal u32: M => yes
+
+case disjoint_marker_trait_where_clause = rustc_trait_selection coherence.rs overlap
+marker trait M
+trait Bar
+impl@a<T: Bar> M for T
+impl@b M for u32
+overlap @a @b => disjoint
+
+case disjoint_by_projection_bound = rustc_trait_selection coherence.rs impl_intersection_has_impossible_obligation
+# `<L as Iterator>::Item == u32` fails: L's Item is bool, and `L: Iterator` is knowable.
+trait Foo
+struct L
+impl Iterator for L { type Item = bool; }
+impl@a<T: Iterator<Item = u32>> Foo for T
+impl@b Foo for L
+overlap @a @b => disjoint
+
+case disjoint_different_traits = rustc_trait_selection coherence.rs overlap
+trait Foo
+trait Bar
+impl@a Foo for u32
+impl@b Bar for u32
+overlap @a @b => disjoint
+
+# ---- ambiguity of a plain goal between two impls ----
+
+case ambiguity_two_impls_self_var = assembly/mod.rs assemble_and_evaluate_candidates forced_ambiguity
+trait Foo
+impl Foo for u32
+impl Foo for bool
+goal ?0: Foo => maybe
+
+case ambiguity_two_impls_arg_var = trait_goals.rs merge_trait_candidates bail_with_ambiguity
+trait Foo<X>
+impl Foo<u8> for u32
+impl Foo<u16> for u32
+goal u32: Foo<?0> => maybe
+goal u32: Foo<u8> => yes
+goal u32: Foo<bool> => no
+
+case one_impl_constrains_var = trait_goals.rs consider_impl_candidate
+trait Foo<X>
+impl Foo<u8> for u32
+goal u32: Foo<?0> => yes ?0 = u8
+
+case ambiguity_two_impls_self_var_coherence = assembly/mod.rs assemble_and_evaluate_candidates forced_ambiguity
+mode coherence
+trait Foo
+impl Foo for u32
+impl Foo for bool
+goal ?0: Foo => maybe
+
+# ---- the orphan check ----
+
+case orphan_local_trait_any_type = rustc_trait_selection coherence.rs orphan_check local trait
+trait Foo
+impl@a Foo for u32
+impl@b<T> Foo for T
+impl@c Foo for Vec<u8>
+orphan @a => ok
+orphan @b => ok
+orphan @c => ok
+
+case orphan_foreign_trait_foreign_type = coherence.rs orphan_check_trait_ref NonLocalInputType
+impl@a Debug for bool
+impl@b Debug for Vec<u16>
+orphan @a => not_local
+orphan @b => not_local
+
+case orphan_foreign_trait_local_type = coherence.rs orphan_check_trait_ref LocalTy
+struct Local
+impl@a Debug for Local
+orphan @a => ok
+
+case orphan_uncovered_param_first = coherence.rs orphan_check_trait_ref UncoveredTyParams
+# E0210: T comes before the first local type.
+struct Local
+impl@a<T> From<Local> for T
+orphan @a => uncovered(0)
+
+case orphan_param_after_local_self = coherence.rs orphan_check_trait_ref LocalTy
+struct Local
+impl@a<T> From<T> for Local
+orphan @a => ok
+
+case orphan_box_local = coherence.rs OrphanChecker::visit_ty OwnedBox
+struct Local
+impl@a Debug for Box<Local>
+orphan @a => ok
+
+case orphan_ref_local = coherence.rs OrphanChecker::visit_ty Ref
+struct Local
+impl@a Debug for &Local
+impl@b Debug for &mut Local
+orphan @a => ok
+orphan @b => ok
+
+case orphan_vec_local_not_fundamental = coherence.rs OrphanChecker::visit_ty Adt non-fundamental
+struct Local
+impl@a Debug for Vec<Local>
+orphan @a => not_local
+
+case orphan_box_param_uncovered = coherence.rs OrphanChecker::visit_ty fundamental Adt
+struct Local
+impl@a<T> From<Local> for Box<T>
+orphan @a => uncovered(0)
+
+case orphan_vec_param_covered = coherence.rs OrphanChecker::visit_ty Adt non-fundamental
+# Vec<T> is non-local and T is not reached through it; Local then is the local key.
+struct Local
+impl@a<T> From<Local> for Vec<T>
+orphan @a => ok
+
+case orphan_local_generic_type = coherence.rs OrphanChecker::visit_ty Adt local
+struct Local<T>
+impl@a<T> Debug for Local<T>
+impl@b<T> From<T> for Local<T>
+orphan @a => ok
+orphan @b => ok
+
+case orphan_structural_types_not_fundamental = coherence.rs OrphanChecker::visit_ty Tuple Slice RawPtr
+struct Local
+impl@a Debug for (Local, u32)
+impl@b Debug for [Local]
+impl@c Debug for *const Local
+orphan @a => not_local
+orphan @b => not_local
+orphan @c => not_local
+
+case orphan_dyn_principal = coherence.rs OrphanChecker::visit_ty Dynamic
+trait LocalTr
+impl@a Debug for dyn LocalTr
+impl@b Debug for dyn Debug
+orphan @a => ok
+orphan @b => not_local
+
+case orphan_extern_fundamental_struct = coherence.rs OrphanChecker::visit_ty fundamental Adt
+extern fundamental struct Fund<T>(T)
+struct Local
+impl@a Debug for Fund<Local>
+impl@b Debug for Fund<u32>
+impl@c<T> From<Local> for Fund<T>
+orphan @a => ok
+orphan @b => not_local
+orphan @c => uncovered(0)
+
+case orphan_local_second_input = coherence.rs orphan_check_trait_ref LocalTy
+struct Local
+impl@a From<Local> for u32
+orphan @a => ok
+
+case orphan_uncovered_after_foreign_self = coherence.rs orphan_check_trait_ref UncoveredTyParams
+impl@a<T> From<T> for u32
+orphan @a => uncovered(0)
+
+case orphan_uncovered_param_index = rustc_trait_selection coherence.rs orphan_check UncoveredTyParamCollector
+struct Local<U>
+impl@a<U, T> From<Local<U>> for Box<T>
+orphan @a => uncovered(1)
+
+case orphan_foreign_type_decl = coherence.rs OrphanChecker::visit_ty Foreign
+foreign Ext
+impl@a Debug for Ext
+orphan @a => ok
+
+case orphan_projection_uncovered = coherence.rs OrphanChecker::visit_ty Alias OrphanCheckMode::Proper
+# unsure: rustc_hir_analysis reruns a failing Proper check in Compat mode and only lints
+# (uncovered_param_in_projection) when Compat passes; orphan_check is the Proper check.
+struct Local
+impl@a<T: Iterator> From<Local> for <T as Iterator>::Item
+orphan @a => uncovered(0)
+
+# ---- knowability in coherence mode ----
+
+case knowable_local_type = coherence.rs trait_ref_is_knowable
+mode coherence
+struct Local
+goal Local: Debug => no
+goal &Local: Debug => no
+goal Box<Local>: Debug => no
+
+case unknowable_foreign_wrapper_of_local = coherence.rs trait_ref_is_knowable Conflict::Upstream
+mode coherence
+struct Local
+goal Vec<Local>: Debug => maybe
+goal (Local, u32): Debug => maybe
+
+case analysis_ignores_knowability = assembly/mod.rs assemble_and_evaluate_candidates is_coherence
+struct Local
+goal Vec<Local>: Debug => no
+
+case unknowable_downstream_var = coherence.rs trait_ref_is_knowable Conflict::Downstream
+mode coherence
+trait Bar
+goal Box<?0>: Bar => maybe
+
+case knowable_local_trait_var_behind_vec = coherence.rs trait_ref_is_local_or_fundamental
+mode coherence
+trait Bar
+trait Baz
+impl<T> Bar for Vec<T>
+# The impl's implicit `T: Sized` is `?0: Sized`, ambiguous while ?0 is unresolved.
+goal Vec<?0>: Bar => maybe
+goal Vec<?0>: Baz => no
+
+case unknowable_foreign_trait_foreign_type = coherence.rs trait_ref_is_knowable Conflict::Upstream
+mode coherence
+extern trait NTr
+goal Vec<u32>: NTr => maybe
+goal u32: NTr => maybe
+
+case knowable_fundamental_trait = coherence.rs trait_ref_is_local_or_fundamental
+mode coherence
+extern fundamental trait FT
+goal Vec<u32>: FT => no
+
+case unknowable_supertrait_has_no_solution = assembly/mod.rs consider_coherence_unknowable_candidate elaborate
+# The candidate adds `Vec<u32>: FSuper` (knowable, no impl): it fails, and no impl remains.
+mode coherence
+extern fundamental trait FSuper
+extern trait FSub: FSuper
+goal Vec<u32>: FSub => no
+
+case unknowable_supertrait_ambiguous = assembly/mod.rs consider_coherence_unknowable_candidate elaborate
+mode coherence
+extern trait S1
+extern trait S2: S1
+goal Vec<u32>: S2 => maybe
+
+case where_const_never_disjoint = eval.rs const_holds
+# Opposite conditions never prove two impls disjoint: a condition is ambiguous under coherence.
+trait Foo
+impl@a<T> Foo for T where const yes(T)
+impl@b<T> Foo for T where const no(T)
+overlap @a @b => may_overlap

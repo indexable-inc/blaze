@@ -1,0 +1,24 @@
+[package]
+name = "blaze-memchr"
+description = "blaze's byte search, in place of the crates.io `memchr`: the first or last of one, two or three bytes and the first of a byte string, a `core::simd` vector of 16 byte lanes at a time on every target (the compiler makes NEON, SSE2 or scalar code), with a word-at-a-time twin the tests hold it to, with memchr's own paths (`memchr`, `memchr2`, `memchr_iter`, `memmem::find_iter`, `memmem::Finder`) so rustc's copied lexer names it unchanged; `no_std`, no dependency from outside the workspace"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `u32 -> usize` for a lane's index, in place of `as`.
+blaze-int.workspace = true
+
+[dev-dependencies]
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

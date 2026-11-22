@@ -1,0 +1,30 @@
+[package]
+name = "blaze-toolchain"
+description = "The toolchain as records (docs/v2/plan/design/toolchain.md): the manifest record that lists each standard-library crate's source pack by digest and, per target, the sysroot's units; the pinned id the binary opens; and the shelf reader that verifies it (the tool that cuts it from the tree is the script scripts/src/bin/toolchain_cut.rs)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The allocator as a value and the owning types the record is made in.
+blaze-own.workspace = true
+# The pack form each crate's files are in, read in place; BLAKE3; a `.crate`'s record.
+blaze-fetch.workspace = true
+# A pack's refusal in words (`Show`).
+blaze-text.workspace = true
+# The sysroot's units as the edition rule takes them (`Sysroot`); the tool's resolution.
+blaze-unit-graph.workspace = true
+
+[dev-dependencies]
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

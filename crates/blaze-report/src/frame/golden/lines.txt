@@ -1,0 +1,15 @@
+src/main.rs:2:18: error[not-supported-yet]: the `?` operator is not supported by this build of blaze yet
+src/main.rs:2:45: error[not-supported-yet]: the `?` operator is not supported by this build of blaze yet
+Cargo.toml:7:1: error[dependency-not-read]: this build of blaze cannot read the dependency `bstd` yet
+src/total.rs:3:11: error[resolve:unknown]: cannot find `undefined_name` here
+src/main.rs:2:18: warning[syntax:semicolon]: a `;` is missing after this statement
+src/run.rs:2:22: error[ladder:async]: an `async` block is not supported by this build of blaze yet
+src/pick.rs:2:17: warning[lint:casts]: a bare `as` cast to an integer
+src/pick.rs:2:31: error[lint:truncate]: `v.len() as u32` can lose bits
+src/fold.rs:34:18: error[lint:casts]: a bare `as` cast to an integer
+src/table.rs:1:411: error[resolve:unknown]: cannot find `oops` here
+src/greet.rs:2:26: warning[lint:casts]: a bare `as` cast to an integer
+src/copy.rs:1:16: note[lint:slices]: take a slice: `&[String]`
+src/copy.rs:2:22: warning[lint:clones]: this `.clone()` copies a vector only read
+src/last.rs:3:5: error[borrow:mut-while-shared]: `v` is changed while `first` still borrows it
+src/␛[2Jevil.rs:3:14: error[evil␛[31m]: a message with ␛]0;title␇ and ␛[2J in it

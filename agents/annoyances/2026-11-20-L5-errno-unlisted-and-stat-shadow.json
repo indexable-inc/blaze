@@ -1,0 +1,8 @@
+{
+  "date": "2026-11-20",
+  "model": "claude-opus-5-5",
+  "lane": "L5 (D180, libc leaves the tree)",
+  "area": "blaze-sys errno.rs table, linux::ETIME, posix/proc's module names",
+  "annoyance": "`crate::linux::ETIME` is `Errno::Unlisted(62)` and linux/tests.rs compares `Err(ETIME)` by that value, so adding an `ETIME` row to the errnos! table (the natural home for every E* constant) silently changes what `from_raw(62)` returns and breaks the io_uring timeout match. The table also has no form for an error a target lacks (macOS has no ENONET; Linux's ENOTSUP is EOPNOTSUPP's number), and the tests require distinct numbers per target. Separately: a private `mod stat;` beside `pub use stat::*;` makes `posix::proc::stat` the module, not the `struct stat` the glob re-exports (an explicit item shadows a glob).",
+  "workaround": "ETIME stays `crate::linux::ETIME` (every use is Linux); a missing error gets a number above 4095 (no call returns one), documented above its row. The file module is `status`, not `stat`."
+}

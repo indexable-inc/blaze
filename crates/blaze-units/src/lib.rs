@@ -1,251 +1,98 @@
-//! cargo's unit graph made by blaze: the units a `cargo build`, `check`, `test` or `bench`
-//! compiles and runs, each with its target, profile, features and platform, and the edges
-//! between them, as `cargo <command> --unit-graph -Z unstable-options` prints them (schema
-//! version 1, [`schema`]).
+//! TYPED QUANTITIES (D184): a model cannot add metres to degrees, a profile cannot add wall time
+//! to CPU time, and a value has ONE key however its author computed it.
 //!
-//! Nothing here reads a file or runs a process (issue #458): the workspace's manifests, the
-//! resolve and its features and the profiles come in ([`Request`]), already read by
-//! blaze-manifest and resolved by blaze-resolve, and the graph goes out, equal to cargo's.
+//! # The closed table
 //!
-//! The code follows the pinned nightly's cargo (`cad07cf8e`): `ops/cargo_compile/mod.rs`
-//! (`create_bcx`, `rebuild_unit_graph_shared`), `ops/cargo_compile/unit_generator.rs` (the
-//! root units), `compiler/unit_dependencies.rs` (their dependencies) and
-//! `compiler/unit_graph.rs` (the JSON), keeping cargo's names so the two read side by side.
-//! What cargo does with an unstable flag (`-Zbuild-std`, artifact dependencies,
-//! `-Zdual-proc-macros`, multiple build scripts, per-package targets) is not ported: a
-//! workspace that needs one is an error naming it.
+//! | name | holds | base unit | why it is here |
+//! |---|---|---|---|
+//! | [`Length`] | `i64` | nanometre | every authored dimension, offset, radius and tolerance of the CAD kernel (D183) |
+//! | [`Angle`] | `i64` | micro-arcsecond (1/1,296,000,000,000 turn) | rotations, twists, arcs, revolves, draft |
+//! | [`Area`] | `f64` | square metre | sections and the checks' answers (`Length * Length`) |
+//! | [`Volume`] | `f64` | cubic metre | mass properties (`Area * Length`) |
+//! | [`Mass`] | `f64` | kilogram | a part's mass, from the Python model's `Mass` |
+//! | [`Density`] | `f64` | kilogram per cubic metre | a material: `Mass / Volume`, `Density * Volume = Mass` |
+//! | [`Nanos<K>`] | `u64` | nanosecond | telemetry: kinds [`Wall`], [`Cpu`] |
+//! | [`Bytes<K>`] | `u64` | byte | telemetry: kinds [`Allocated`], [`Resident`], [`Read`], [`Written`], [`Hashed`] |
+//! | [`Count<K>`] | `u64` | one | telemetry: the kind ([`Counted`]) names what is counted |
+//!
+//! Left out because nothing needs them yet: time as a physical quantity, speed, force, energy,
+//! temperature. Adding one is a row here.
+//!
+//! # Authored quantities are exact (D183, "the same number computed two ways")
+//!
+//! A [`Length`] is a whole number of nanometres and an [`Angle`] a whole number of
+//! micro-arcseconds. `Length::mm(0.1) + Length::mm(0.2) == Length::mm(0.3)`, because each
+//! constructor rounds its argument once to the grid; a value computed two ways that lands on
+//! one grid point is one key. The interpreters' f64 is derived by one fixed conversion
+//! (`as_m`: the integer as f64 divided by 10^9, one rounding). Range: +-9.2 * 10^9 m, a
+//! kilometre ship with nanometre steps with nine orders of magnitude to spare; an operation
+//! leaving it panics (a bug at the caller, never a silent wrap). An angle unit divides a turn
+//! by 4, 8, 12, 360 and 3600: quarter, eighth and twelfth turns and every whole degree,
+//! arc-minute and arc-second are exact, and blaze-math's `sin_cos_turns` makes the sines and
+//! cosines of the first three exact or correctly rounded.
+//!
+//! Derived quantities ([`Area`], [`Volume`], [`Mass`], [`Density`]) are f64 in base units:
+//! they are answers, not keys. A product of two lengths would need 128 bits as an integer (a
+//! square kilometre in square nanometres is 10^24) for no key that needs it.
+//!
+//! # Units in and out by name only
+//!
+//! No `From<f64>`, `Into`, `Deref` or `as` path: `Length::mm(2.0)` in, `.as_mm()` out;
+//! `Angle::degrees(30.0)`, `.as_radians()`. A dimensionless result is a plain `f64`
+//! (`Length / Length`).
+//!
+//! # Kinds
+//!
+//! Each quantity takes a KIND, a zero-sized type parameter defaulting to [`Plain`]: a
+//! `Length<WallThickness>` cannot be added to a `Length<Plain>`. Sums, differences and
+//! comparisons need one kind; products and quotients give plain kinds. The telemetry kinds
+//! have no default: a `Nanos` is always `Nanos<Wall>` or `Nanos<Cpu>`.
+//!
+//! # The form this table waits for
+//!
+//! The end state is one type `Quantity<const D: Dim, K>`, `Dim` a struct of small integer
+//! exponents (length, angle, mass, time, bytes), with `Mul` giving `Quantity<{ D1.add(D2) }, _>`.
+//! That needs `generic_const_exprs` (and `adt_const_params` for a struct-valued parameter),
+//! incomplete on the pinned nightly, so it is not used. Every public name here is a struct a
+//! future `type Length<K = Plain> = Quantity<LENGTH, K>` can stand behind with the same
+//! constructors and accessors; the integer-held ones keep their representation as a
+//! parameter of that form.
+//!
+//! # Printing
+//!
+//! [`blaze_text::Show`] for every quantity picks the unit for people (`2 mm`, `1.4 m`, `45°`,
+//! `12.5ms`, `1.40 GiB`), in `show.rs` only. Durations and byte counts are blaze-text's own
+//! `duration` and `byte_count` (rule 30: one home for each), which print binary byte units.
+//!
+//! # Not duplicated: `blaze_int::time`
+//!
+//! `blaze_int::time::Nanos(pub u64)` is an instant or a length of time with a `Clock` and a
+//! `Deadline`. [`Nanos<K>`] here is only a length of time of a kind. The end state is one home:
+//! see `telemetry.rs` for the plan given to blaze-int's owner.
 
-#![forbid(unsafe_code)]
-#![feature(allocator_api)]
-// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
-#![feature(register_tool)]
+#![no_std]
+#![feature(register_tool, custom_inner_attributes, core_float_math)]
 #![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core)]
+#![deny(blaze::std_use)]
+#![deny(blaze::implicit_allocator)]
+#![deny(blaze::process_static)]
+#![forbid(unsafe_code)]
 
 #[cfg(test)]
-#[global_allocator]
-static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+extern crate std;
 
-mod graph;
-pub mod index;
-pub mod lint_level;
-pub mod load;
-pub mod lock;
-mod order;
-pub mod query;
-pub mod read;
-pub mod schema;
-pub mod sources;
-pub mod stdlib;
+mod exact;
+mod float;
+mod kind;
+mod show;
+mod telemetry;
 
-use blaze_hash::HashMap;
-use blaze_manifest::manifest::Manifest;
-use blaze_manifest::profiles::Profiles;
-use blaze_resolve::resolver::ResolvedFeatures;
-use blaze_resolve::{Cfg, PackageId, Platform, Resolve};
-use std::alloc::Global;
+#[cfg(test)]
+mod tests;
 
-pub use read::Read;
-pub use schema::UnitGraph;
-
-/// What the user asked cargo to do (cargo's `UserIntent`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Intent {
-    Build,
-    /// `cargo check`; `test` with `--profile test`, which checks the tests too.
-    Check {
-        test: bool,
-    },
-    Test,
-    /// `test --doc`: the doctests of the selected libraries only (cargo's `UserIntent::Doctest`),
-    /// each library's examples built and run by blaze, never by rustdoc
-    /// (docs/v2/plan/design/doctests.md).
-    Doctest,
-    Bench,
-    /// `cargo doc`: the targets cargo documents, checked, for the front end the pages are
-    /// written from. With or without `--no-deps` every dependency is checked, as cargo checks
-    /// each for the metadata rustdoc reads. `open` is `--open`, whose browser the plan reads.
-    Doc {
-        open: bool,
-    },
-}
-
-impl Intent {
-    /// The profile the command builds with when `--release` and `--profile` say none.
-    pub fn default_profile(self) -> &'static str {
-        match self {
-            Intent::Build | Intent::Check { .. } | Intent::Doc { .. } => "dev",
-            Intent::Test | Intent::Doctest => "test",
-            Intent::Bench => "bench",
-        }
-    }
-}
-
-/// Which targets of the selected packages are built (cargo's `CompileFilter`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Filter {
-    /// No target flag: the command's own default targets.
-    Default {
-        /// Whether a target whose `required-features` are not on is left out rather than an
-        /// error: true unless the targets were named some other way.
-        required_features_filterable: bool,
-    },
-    Only {
-        all_targets: bool,
-        lib: LibRule,
-        bins: Rule,
-        examples: Rule,
-        tests: Rule,
-        benches: Rule,
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LibRule {
-    /// `--lib`.
-    True,
-    /// The library when there is one (`--all-targets`).
-    Default,
-    False,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Rule {
-    /// `--bins`, `--tests`, ...: every target of the kind.
-    All,
-    /// `--bin NAME`, ...: the targets named (glob patterns are not read yet); none when empty.
-    Just(Vec<String>),
-}
-
-impl Rule {
-    pub fn none() -> Rule {
-        Rule::Just(Vec::new())
-    }
-
-    fn is_specific(&self) -> bool {
-        match self {
-            Rule::All => true,
-            Rule::Just(names) => !names.is_empty(),
-        }
-    }
-}
-
-impl Filter {
-    /// The filter of the command line's target flags, as cargo's `from_raw_arguments`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_flags(
-        lib_only: bool,
-        bins: Vec<String>,
-        all_bins: bool,
-        tests: Vec<String>,
-        all_tests: bool,
-        examples: Vec<String>,
-        all_examples: bool,
-        benches: Vec<String>,
-        all_benches: bool,
-        all_targets: bool,
-    ) -> Filter {
-        if all_targets {
-            return Filter::all_targets();
-        }
-        let rule = |names: Vec<String>, all: bool| if all { Rule::All } else { Rule::Just(names) };
-        let lib = if lib_only { LibRule::True } else { LibRule::False };
-        let (bins, tests) = (rule(bins, all_bins), rule(tests, all_tests));
-        let (examples, benches) = (rule(examples, all_examples), rule(benches, all_benches));
-        if lib == LibRule::True
-            || bins.is_specific()
-            || tests.is_specific()
-            || examples.is_specific()
-            || benches.is_specific()
-        {
-            Filter::Only { all_targets: false, lib, bins, examples, tests, benches }
-        } else {
-            Filter::Default { required_features_filterable: true }
-        }
-    }
-
-    pub fn all_targets() -> Filter {
-        Filter::Only {
-            all_targets: true,
-            lib: LibRule::Default,
-            bins: Rule::All,
-            examples: Rule::All,
-            tests: Rule::All,
-            benches: Rule::All,
-        }
-    }
-
-    /// Whether the build needs the dev-dependencies resolved (`HasDevUnits`).
-    pub fn need_dev_deps(&self, intent: Intent) -> bool {
-        match intent {
-            Intent::Test | Intent::Doctest | Intent::Bench | Intent::Check { test: true } => true,
-            Intent::Build | Intent::Check { test: false } | Intent::Doc { .. } => match self {
-                Filter::Default { .. } => false,
-                Filter::Only { examples, tests, benches, .. } => {
-                    examples.is_specific() || tests.is_specific() || benches.is_specific()
-                }
-            },
-        }
-    }
-
-    fn is_specific(&self) -> bool {
-        matches!(self, Filter::Only { .. })
-    }
-}
-
-/// blaze's device target (stdlib/own_targets.json): what a dependency asked for with
-/// `artifact = "gpu"` is built for, by the front end alone, its `GPU_ENTRIES` lowered to MSL by
-/// blaze-shader (docs/future/gpu/shaders.md).
-pub const GPU_DEVICE: &str = "naga-unknown-unknown";
-
-/// A platform built for: its triple and what `rustc --print cfg` says of it.
-#[derive(Clone, Debug)]
-pub struct Platformed {
-    pub triple: String,
-    pub cfg: Vec<Cfg>,
-}
-
-impl Platformed {
-    fn activates(&self, platform: &Platform) -> bool {
-        platform.matches(&self.triple, &self.cfg)
-    }
-}
-
-/// A package of the resolve, as read from its manifest.
-#[derive(Clone, Copy)]
-pub struct Package<'a> {
-    pub manifest: &'a Manifest,
-    /// Whether it is a member of the workspace.
-    pub is_member: bool,
-}
-
-/// Everything a unit graph is made from.
-pub struct Request<'a> {
-    /// Every package of the resolve, by its id.
-    pub packages: &'a HashMap<PackageId, Package<'a>, Global>,
-    /// The resolve of the build (cargo's `targeted_resolve`).
-    pub resolve: &'a Resolve,
-    /// The features the feature resolver activated for the build.
-    pub features: &'a ResolvedFeatures,
-    pub profiles: &'a Profiles,
-    /// The packages asked for (`-p`, `--workspace` or the default members), by their ids.
-    pub roots: &'a [PackageId],
-    pub intent: Intent,
-    pub filter: &'a Filter,
-    /// The host, which build scripts and proc macros are built for.
-    pub host: &'a Platformed,
-    /// `--target`, when the build is for another platform than the host's.
-    pub target: Option<&'a Platformed>,
-    /// The platform proc macros are built for to run as wasm modules (wasm32-wasip1), each
-    /// with the normal dependencies it has; `None` builds them for the host, as cargo does.
-    pub macro_wasm: Option<&'a Platformed>,
-    /// The device platform ([`GPU_DEVICE`]) that a dependency asked for with blaze's
-    /// `artifact = "gpu"` is built for, with what it depends on; `None` refuses such a dependency.
-    pub gpu: Option<&'a Platformed>,
-    /// Whether the dev-dependencies were resolved ([`Filter::need_dev_deps`]).
-    pub has_dev_units: bool,
-}
-
-/// The unit graph `request` makes.
-pub fn unit_graph(request: &Request<'_>) -> anyhow::Result<UnitGraph> {
-    graph::build(request)
-}
+pub use exact::{Angle, Length, UnitsPlant};
+pub use float::{Area, Density, Mass, Volume};
+pub use kind::{Allocated, ByteKind, Counted, Cpu, Hashed, Kind, Plain, Read, Resident, TimeKind, Wall, Written};
+pub use telemetry::{Bytes, Count, Nanos};

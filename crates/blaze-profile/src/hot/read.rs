@@ -4,7 +4,7 @@
 use std::sync::{Arc, atomic::AtomicU64};
 
 use blaze_graph::wait::WaitKind;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_core::lock::Lock;
 use std::alloc::Global;
 
@@ -73,13 +73,22 @@ pub struct Hot {
 }
 
 /// Why there is nothing to read.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum HotError {
-    #[error(
-        "no build has ended in this process, so there is no last build to read the sketches of"
-    )]
     NoBuild,
 }
+
+impl std::fmt::Display for HotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HotError::NoBuild => f.write_str(
+                "no build has ended in this process, so there is no last build to read the sketches of",
+            ),
+        }
+    }
+}
+
+impl core::error::Error for HotError {}
 
 /// Every ring's counters summed at one moment.
 struct Summed {
@@ -87,7 +96,7 @@ struct Summed {
     count_min: CountMin,
     waits: Vec<DdSketch>,
     /// Each ring's listed keys and their exact ticks, by ring number.
-    listed: HashMap<(u16, u64), u64, Global>,
+    listed: Map<(u16, u64), u64, FixedState, Global>,
     torn: u64,
 }
 
@@ -98,7 +107,7 @@ impl Summed {
             count_min: CountMin::new(),
             // alloc: a read's sum, once a read
             waits: (0..record::KINDS).map(|_| DdSketch::new()).collect(),
-            listed: HashMap::new_in(Global),
+            listed: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             torn: 0,
         }
     }
@@ -188,13 +197,13 @@ fn copy(summed: &Summed) -> Summed {
 
 fn hot(summed: &Summed, top: usize, since: Since) -> Hot {
     let scale = clock::Scale::now();
-    let mut lower: HashMap<u64, u64, Global> = HashMap::new_in(Global);
+    let mut lower: Map<u64, u64, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     for (&(_, key), exact) in &summed.listed {
         let it = lower.entry(key).or_default();
         *it = it.saturating_add(*exact);
     }
     // Keys whose names are one (a name given a new number in a later generation) are summed.
-    let mut named: HashMap<(&'static str, Function), (u64, u64), Global> = HashMap::new_in(Global);
+    let mut named: Map<(&'static str, Function), (u64, u64), FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     for (key, lower) in lower {
         let (site, function) = record::of(key);
         let Some(meta) = flight::meta(site) else { continue };

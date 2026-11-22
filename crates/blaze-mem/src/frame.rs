@@ -40,7 +40,7 @@
 //! allocation happens in place, so a `Vec<T, &Frame>` pushed in a loop never copies while
 //! nothing else is allocated after it and it stays in its block (in a span, always).
 
-use std::{
+use core::{
     alloc::{AllocError, Allocator, Layout},
     cell::Cell,
     mem::{self, ManuallyDrop, MaybeUninit},
@@ -58,6 +58,15 @@ use crate::{
     error::fail,
     tag,
 };
+
+pub mod grow;
+pub mod table;
+
+#[cfg(test)]
+mod shelf_tests;
+
+pub use grow::{Abandoned, abandoned_on_thread};
+pub use table::{FrameTable, TableRefused};
 
 /// The most one frame holds unless made with [`Frame::with_reserve`]: what one task may take.
 #[cfg(target_pointer_width = "64")]
@@ -86,6 +95,54 @@ const SPAN_WARM: usize = CHUNK;
 /// and [`SPANS`] spans of [`SPAN_WARM`] bytes each. What a task's frame leaves behind is never
 /// more.
 pub const WARM: usize = SHELF * CHUNK + SPANS * SPAN_WARM;
+
+/// The frame memory all of a machine's threads keep warm between tasks, at most: eight shelves
+/// at their most, 256 MiB, what a typical Mac's eight workers keep. A machine of more threads
+/// shares it ([`ShelfSize::for_threads`]): before, every thread kept [`WARM`], 32 MiB, so 128
+/// workers kept 4 GiB idle and charged to no task (the outside review, thoughts2.md 4.2).
+pub const WARM_ALL: usize = 8 * WARM;
+
+/// Warm spans the process keeps behind its threads' shelves, for a thread whose shelf has none:
+/// 16 of [`SPAN_WARM`], 32 MiB. Chunks have the process's cache behind them already
+/// ([`chunks::WARM_KEEP`]); a span past this goes to the kernel.
+pub const SPAN_POOL: usize = 16;
+
+/// How many blocks one thread's shelf keeps warm, from the machine it is on (rule 75: the pool
+/// that starts the thread hands it in, [`size_shelf`]; one code path, sized by the machine).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShelfSize {
+    /// Chunks, at most [`SHELF`].
+    pub chunks: usize,
+    /// Spans of [`SPAN_WARM`] committed, at most [`SPANS`].
+    pub spans: usize,
+}
+
+impl ShelfSize {
+    /// Today's on every thread that is handed no size: [`WARM`].
+    pub const MOST: ShelfSize = ShelfSize { chunks: SHELF, spans: SPANS };
+
+    /// A thread's part of [`WARM_ALL`] on a machine of `threads` workers, as chunks and spans
+    /// half each: [`ShelfSize::MOST`] up to eight threads, one of each (4 MiB) from 64 threads
+    /// on, so 128 threads keep at most 512 MiB (and the process's pools behind them).
+    pub const fn for_threads(threads: usize) -> ShelfSize {
+        let threads = if threads == 0 { 1 } else { threads };
+        let blocks = WARM_ALL / threads / CHUNK;
+        let half = blocks / 2;
+        let half = if half == 0 {
+            1
+        } else if half > SHELF {
+            SHELF
+        } else {
+            half
+        };
+        ShelfSize { chunks: half, spans: half }
+    }
+
+    /// The most a shelf of this size keeps committed.
+    pub const fn bytes(self) -> usize {
+        self.chunks * CHUNK + self.spans * SPAN_WARM
+    }
+}
 
 /// An allocation bigger than this goes in a span rather than a chunk.
 const SPAN_AT: usize = CHUNK / 2;
@@ -159,6 +216,10 @@ pub struct Frame {
     /// Blocks `grow` moved since the last reset, and the bytes it copied moving them.
     copies: Cell<u64>,
     copied: Cell<u64>,
+    /// Blocks `grow` or `shrink` moved since the last reset, and the bytes they left behind
+    /// in the bump ([`grow::Abandoned`]).
+    abandons: Cell<u64>,
+    abandoned: Cell<u64>,
     first: Cell<*mut Block>,
     current: Cell<*mut Block>,
     /// Bytes of the blocks it holds: whole chunks, spans' committed pages.
@@ -175,6 +236,8 @@ pub struct Frame {
     lent: Cell<bool>,
     /// The bytes an outer task's frame lent this one, `start..end`; empty when none.
     window: (usize, usize),
+    /// The use before the last allocation the frame refused, until the caller takes it or reset.
+    exhaustion: Cell<Option<usize>>,
     /// [`sealed`] of `id` while the frame is alive, [`UNSEALED`] once dropped: what [`task`]
     /// checks of the frame a thread says encloses it before using it.
     seal: Cell<u64>,
@@ -232,6 +295,8 @@ impl Frame {
             peak: Cell::new(0),
             copies: Cell::new(0),
             copied: Cell::new(0),
+            abandons: Cell::new(0),
+            abandoned: Cell::new(0),
             first: Cell::new(ptr::null_mut()),
             current: Cell::new(ptr::null_mut()),
             held: Cell::new(0),
@@ -241,6 +306,7 @@ impl Frame {
             task,
             lent: Cell::new(false),
             window: (0, 0),
+            exhaustion: Cell::new(None),
             seal: Cell::new(sealed(id)),
             opened_at: Location::caller(),
             ended_on: Cell::new(0),
@@ -375,11 +441,17 @@ impl Frame {
     }
 
     fn exhausted(&self, more: usize) -> MemError {
+        self.exhaustion.set(Some(self.used()));
         MemError::Exhausted {
             tag: self.tag.get(),
             reserved: self.limit,
             wanted: self.used().saturating_add(more),
         }
+    }
+
+    /// Takes the use remembered when the frame last refused an allocation.
+    pub fn take_exhaustion(&self) -> Option<usize> {
+        self.exhaustion.take()
     }
 
     /// Makes the current block one `layout` fits in at the cursor: the current span grown, a
@@ -757,10 +829,14 @@ impl Frame {
     /// tag ([`tag::task_ended`]).
     pub fn reset(&mut self) {
         tag::task_ended(self.tag.get(), self.peak(), self.copied());
+        grow::report(self.abandoned());
         self.rewind();
         self.peak.set(0);
         self.copies.set(0);
         self.copied.set(0);
+        self.abandons.set(0);
+        self.abandoned.set(0);
+        self.exhaustion.set(None);
     }
 
     /// Runs `f` with this frame and frees what it allocated once it returns. What `f` returns
@@ -822,7 +898,10 @@ impl Frame {
     /// Grows the top allocation, ending at the cursor, to end at `end`, in place: within the
     /// bump's end, or in the current span by committing more. Whether it could.
     fn grow_top(&self, end: usize) -> Result<bool, MemError> {
-        if end > self.end.get() {
+        // The block's end is exact: past the bump's end (a chunk's end, a span's committed end,
+        // the limit's) the block grows only by committing its span further, else it moves.
+        // `grow::ignores_end` is a test's planted bug, false in every other build.
+        if end > self.end.get() && !grow::ignores_end() {
             let current = self.current.get();
             if current.is_null() || header(current).span.is_none() || end > header(current).end {
                 return Ok(false);
@@ -932,6 +1011,8 @@ unsafe impl Allocator for Frame {
         unsafe { ptr::copy_nonoverlapping(ptr.as_ptr(), to.as_ptr(), old.size()) };
         self.copies.set(self.copies.get() + 1);
         self.copied.set(self.copied.get() + old.size() as u64);
+        // The old block stays taken until a reset: counted, so a profile shows it.
+        self.left_behind(old.size());
         Ok(NonNull::slice_from_raw_parts(to, new.size()))
     }
 
@@ -962,6 +1043,7 @@ unsafe impl Allocator for Frame {
             let to = self.try_alloc_layout(new).map_err(|_| AllocError)?;
             // SAFETY: `ptr` is a live block of at least `new.size()` bytes and `to` a fresh one.
             unsafe { ptr::copy_nonoverlapping(ptr.as_ptr(), to.as_ptr(), new.size()) };
+            self.left_behind(old.size());
             return Ok(NonNull::slice_from_raw_parts(to, new.size()));
         }
         if self.is_top(ptr, old.size()) {
@@ -972,8 +1054,8 @@ unsafe impl Allocator for Frame {
     }
 }
 
-impl std::fmt::Debug for Frame {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for Frame {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Frame")
             .field("tag", &self.tag.get())
             .field("used", &self.used())
@@ -992,9 +1074,106 @@ struct Shelf {
     /// Spans, linked through their headers' `next`.
     spans: Cell<*mut Block>,
     span_count: Cell<usize>,
+    /// What it keeps at most ([`size_shelf`]): [`ShelfSize::MOST`] until its thread is sized.
+    most_chunks: Cell<usize>,
+    most_spans: Cell<usize>,
+}
+
+/// Warm spans no thread's shelf had room for ([`SPAN_POOL`] at most), each with its pages past
+/// [`SPAN_WARM`] given back.
+struct SpanPool {
+    spans: [*mut Block; SPAN_POOL],
+    len: usize,
+}
+
+// SAFETY: a pooled span is the pool's alone: by the invariant above `header`, its header and
+// committed pages are owned by their one holder, here the pool, and no thread keeps a pointer
+// into it; handing it to another thread moves that ownership whole.
+unsafe impl Send for SpanPool {}
+
+/// The process's [`SpanPool`]. A `std` mutex (as os.rs's and region.rs's): blaze-mem is below
+/// blaze-core's named locks, and the lock is taken only when a shelf is full or empty of spans.
+static SPANS_POOLED: std::sync::Mutex<SpanPool> = std::sync::Mutex::new(SpanPool { spans: [ptr::null_mut(); SPAN_POOL], len: 0 });
+
+fn span_pool() -> std::sync::MutexGuard<'static, SpanPool> {
+    // A panic while it was held left a consistent pool: each push and pop is one store each.
+    SPANS_POOLED.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `span`, which no shelf kept, to the process's pool with its pages past [`SPAN_WARM`] given
+/// back, or to the kernel when the pool is full.
+fn pool_or_drop_span(span: *mut Block) {
+    let mut pool = span_pool();
+    if pool.len >= SPAN_POOL {
+        drop(pool);
+        drop_span(span);
+        return;
+    }
+    if let Some(region) = header_mut(span).span.as_deref_mut() {
+        // A refused decommit leaves the pages committed: memory held, nothing broken.
+        _ = region.decommit_after(SPAN_WARM);
+    }
+    let len = pool.len;
+    pool.spans[len] = span;
+    pool.len = len + 1;
+}
+
+/// A pooled span whose reservation holds `need` bytes, out of the pool.
+fn take_pooled_span(need: usize) -> Option<*mut Block> {
+    let mut pool = span_pool();
+    let len = pool.len;
+    let at = pool.spans[..len].iter().position(|&span| header(span).end - data(span).addr() >= need)?;
+    let span = pool.spans[at];
+    pool.spans[at] = pool.spans[len - 1];
+    pool.spans[len - 1] = ptr::null_mut();
+    pool.len = len - 1;
+    Some(span)
+}
+
+/// The bytes the process's pool of spans keeps committed.
+pub fn pooled_span_bytes() -> usize {
+    let pool = span_pool();
+    pool.spans[..pool.len].iter().map(|&span| header(span).span.as_deref().map_or(0, Region::committed)).sum()
+}
+
+/// Gives every pooled span to the kernel: with [`trim_spare`], after a burst.
+pub fn trim_span_pool() {
+    let mut pool = span_pool();
+    let len = pool.len;
+    pool.len = 0;
+    let spans = pool.spans;
+    drop(pool);
+    for &span in &spans[..len] {
+        drop_span(span);
+    }
+}
+
+/// Sizes the calling thread's shelf for the machine: what a pool's worker does as it starts,
+/// with the size its pool was handed ([`ShelfSize::for_threads`] of the pool's workers). What
+/// the shelf keeps past the size goes to the process's pools now.
+pub fn size_shelf(size: ShelfSize) {
+    _ = SHELF_OF.try_with(|shelf| shelf.resize(size));
 }
 
 impl Shelf {
+    /// Keeps at most `size` from now on; what it keeps past it goes to the process's pools.
+    fn resize(&self, size: ShelfSize) {
+        self.most_chunks.set(size.chunks.min(SHELF));
+        self.most_spans.set(size.spans.min(SPANS));
+        while self.len.get() > self.most_chunks.get() {
+            let len = self.len.get() - 1;
+            self.len.set(len);
+            // Past the new most, so to the process's cache warm (`give_chunk`'s other arm).
+            self.give_chunk(Chunk::from_index(self.chunks[len].get()), false);
+        }
+        while self.span_count.get() > self.most_spans.get() {
+            let span = self.spans.get();
+            self.spans.set(header(span).next);
+            self.span_count.set(self.span_count.get() - 1);
+            pool_or_drop_span(span);
+        }
+    }
+
     /// The shelf's top chunk, if it keeps any.
     fn take_chunk(&self) -> Option<Chunk> {
         let len = self.len.get();
@@ -1009,7 +1188,7 @@ impl Shelf {
     /// (to the kernel's pages with `cold`).
     fn give_chunk(&self, chunk: Chunk, cold: bool) {
         let len = self.len.get();
-        if len < SHELF && !cold {
+        if len < self.most_chunks.get() && !cold {
             self.chunks[len].set(chunk.index());
             self.len.set(len + 1);
             return;
@@ -1020,7 +1199,8 @@ impl Shelf {
         }
     }
 
-    /// A warm span whose reservation holds `need` bytes, out of the shelf.
+    /// A warm span whose reservation holds `need` bytes, out of the shelf, else out of the
+    /// process's pool.
     fn take_span(&self, need: usize) -> Option<*mut Block> {
         let mut prev: *mut Block = ptr::null_mut();
         let mut span = self.spans.get();
@@ -1037,15 +1217,15 @@ impl Shelf {
             prev = span;
             span = head.next;
         }
-        None
+        take_pooled_span(need)
     }
 
-    /// Keeps a span a task's frame gave up, its pages past
-    /// [`SPAN_WARM`] given to the kernel, or gives it whole to the kernel when the shelf is
-    /// full.
+    /// Keeps a span a task's frame gave up, its pages past [`SPAN_WARM`] given to the kernel,
+    /// or gives it to the process's pool when the shelf is full (whole to the kernel when that
+    /// is full too).
     fn give_span(&self, span: *mut Block) {
-        if self.span_count.get() >= SPANS {
-            drop_span(span);
+        if self.span_count.get() >= self.most_spans.get() {
+            pool_or_drop_span(span);
             return;
         }
         let head = header_mut(span);
@@ -1144,6 +1324,13 @@ struct Stack {
     heap: Cell<Option<Tag>>,
 }
 
+// D171: this shelf is per-worker state held by the thread, the form the workers' cells
+// (bstd's `workers`) replace. It moves when its callers can reach a worker cell: the shelf
+// becomes a `Shelf` value in the worker's own fields, `task` and `heap_of` take `&Shelf`
+// handed by their driver (`cx.on_worker(|w| frame::task_on(w.shelf(), tag, ..))`), and this
+// `thread_local!` is deleted with the last caller. The global allocator's hook (`heap_of`'s
+// tag, read inside `GlobalAlloc`) is the one exception: an allocator has no context, so its
+// named thread-local stays (C3).
 thread_local! {
     static SHELF_OF: Shelf = const {
         Shelf {
@@ -1151,6 +1338,8 @@ thread_local! {
             len: Cell::new(0),
             spans: Cell::new(ptr::null_mut()),
             span_count: Cell::new(0),
+            most_chunks: Cell::new(SHELF),
+            most_spans: Cell::new(SPANS),
         }
     };
     static STACK: Stack = const {
@@ -1370,6 +1559,7 @@ pub fn task<R>(tag: Tag, f: impl FnOnce(&Frame) -> R) -> R {
             let held = self.below + self.frame.peak() + grew;
             end_task(&self.frame, self.outer, self.outer_below, held);
             tag::task_ended(self.frame.tag(), self.frame.peak(), self.frame.copied());
+            grow::report(self.frame.abandoned());
             // Dropping the frame, after this, gives its blocks to the thread's shelves.
         }
     }
@@ -1636,6 +1826,7 @@ pub fn settle_spare() -> bool {
         return false;
     }
     trim_spare(0);
+    trim_span_pool();
     true
 }
 
@@ -1766,5 +1957,26 @@ mod tests {
             task(Tag::Other, |_| STACK.with(|stack| stack.current.get()) != at)
         });
         assert!(inner, "the inner task's frame is current inside it");
+    }
+
+    #[test]
+    fn an_exhaustion_is_taken_once_and_reset_clears_it() {
+        let mut frame = Frame::with_reserve(64, Tag::Other).expect("a small frame");
+        let fitting = Layout::from_size_align(32, 1).expect("a layout");
+        let too_large = Layout::from_size_align(40, 1).expect("a layout");
+        assert!(frame.try_alloc_layout(fitting).is_ok());
+        assert_eq!(frame.take_exhaustion(), None, "a fitting allocation leaves no exhaustion");
+
+        let used = frame.used();
+        assert!(frame.try_alloc_layout(too_large).is_err(), "the frame refuses past its reserve");
+        assert_eq!(frame.used(), used, "a refused allocation does not advance the frame");
+        assert_eq!(frame.take_exhaustion(), Some(used), "the refused allocation records its use");
+        assert_eq!(frame.take_exhaustion(), None, "taking exhaustion clears it");
+
+        assert!(frame.try_alloc_layout(too_large).is_err(), "a second allocation is refused");
+        frame.reset();
+        assert_eq!(frame.take_exhaustion(), None, "reset clears an unconsumed exhaustion");
+        assert!(frame.try_alloc_layout(fitting).is_ok());
+        assert_eq!(frame.take_exhaustion(), None, "a fitting allocation after reset leaves none");
     }
 }

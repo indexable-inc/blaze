@@ -1,0 +1,6 @@
+[0;1;31merror  [0mthe [0;2m`[0;1m?[0;2m` [0moperator is not supported by this build of blaze yet
+  [0;2m╭─ ]8;;file:///work/hello%20world/src/main.rs\[0msrc/main.rs[0;2m:2:18]8;;\[0m
+[0;2m1 │ fn main(cx: &Cx, io: Io) -> Result<(), Error> {[0m
+[0;2m2 │     [0mio[0;2m.[0mneed_out[0;2m()[0;1;4:3;58;5;1m?[0;2m.[0mline[0;2m([0mcx[0;2m, [0;38;2;118;134;156m"Hello, world!"[0;2m)[0;1;4:3;58;5;1m?[0;2m;[0m
+  [0;2m│                  ╰─ [0;31mthis build of blaze cannot run this yet[0m
+  [0;2m╰─ blaze explain not-supported-yet[0m

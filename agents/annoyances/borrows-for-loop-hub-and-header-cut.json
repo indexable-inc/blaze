@@ -1,0 +1,15 @@
+{
+ "id": "borrows-for-loop-hub-and-header-cut",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane BW",
+ "where": "crates/blaze-flow-lower/src/generic_call.rs (read_shape, call_by_generic_signature), crates/blaze-flow-lower/src/sig/outlives.rs (container_declares_type_outlives), crates/blaze-ladder/src/front2/borrows.rs gather_facts",
+ "what": "tempo's largest false borrow class: every `for` loop and `it.next()` (E0499 at the iterator, E0505/E0597 at `for` and at `return` in the loop). `Iterator::next(&mut self) -> Option<Self::Item>` had no shape (read_shape refused any projection) and no call bounds (the container header was cut at the first `{` byte, which in Iterator and IntoIterator is inside `#[rustc_on_unimplemented(label = \"`{Self}` is not an iterator\")]`, so the header did not lex), so the call went through unify_call's one hub, putting the `&mut iter` loan into `Iter<'a, _>`'s 'a.",
+ "cost": "about two hours to reduce and read the facts; the runner cuts a long failing test's output, so the first probe wrote its dump to the scratchpad",
+ "cause": "two: a hidden output position had no exact relation, and a header cut by bytes instead of by the lexer",
+ "whys": "E0207 bounds a closed projection's lifetimes by its arguments', which was not used; outlives.rs cut a header with `find('{')` while impl_life.rs already cut by tokens",
+ "class": "a callee head with a projection in its output (every iterator, IntoIterator, Deref::Target, Index::Output) related through the hub; any container whose attribute strings hold a `{`",
+ "prevention": "done: Mark::Hidden for a closed projection (trait declares no lifetime, no GAT; read rows keyed by the trait, sig_impl.rs TRAIT_DETAIL) relates the output's positions to the projection's arguments only; one header cut (impl_life.rs header_cut) for both readers; test front2_borrows_tempo with three controls",
+ "annoyance": "the runner cuts a failing test's output past a few dozen lines, so a test that prints flows must print only the failing body's",
+ "workaround": "assert per body and put only the wrong bodies' flows in the message",
+ "state": "fixed"
+}

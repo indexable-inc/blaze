@@ -1,9 +1,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use blaze_hash::{HashMap, HashSet};
+use blaze_hash::{FixedState, Map, MapOpts, Set};
 use blaze_ids::rng::SplitMix64;
 use blaze_protocol::events::{Event, NodeKind, NodeState, Record};
-use expect_test::{expect, expect_file};
+use test_utils::{expect, expect_file};
 use blaze_core::lock::Lock;
 use std::alloc::Global;
 
@@ -310,7 +310,7 @@ fn random_builds_keep_the_rules() {
         };
         let mut specs = Vec::new();
         for id in 0..nodes {
-            let deps: HashSet<u32, Global> = (0..random.below(4)) // alloc: a test's model
+            let deps: Set<u32, FixedState, Global> = (0..random.below(4)) // alloc: a test's model
                 .filter(|_| id > 0)
                 .map(|_| random.below(id.into()) as u32)
                 .collect();
@@ -319,18 +319,18 @@ fn random_builds_keep_the_rules() {
             let pool = if random.below(3) == 0 { Pool::Io } else { Pool::Work };
             specs.push(spec(id, NodeKind::Names, &deps, pool, random.below(10)));
         }
-        let deps_of: HashMap<u32, Vec<u32>, Global> = // alloc: a test's model
+        let deps_of: Map<u32, Vec<u32>, FixedState, Global> = // alloc: a test's model
             specs.iter().map(|it| (it.id.0, it.deps.iter().map(|it| it.0).collect())).collect();
-        let pool_of: HashMap<u32, Pool, Global> =
+        let pool_of: Map<u32, Pool, FixedState, Global> =
             specs.iter().map(|it| (it.id.0, it.pool)).collect(); // alloc: a test's model
         let mut machine = Machine::new(config).unwrap();
         let mut running: Vec<u32> = Vec::new();
         let mut finished = None;
-        let mut states: HashMap<u32, NodeState, Global> = HashMap::new_in(Global); // alloc: a test's model
+        let mut states: Map<u32, NodeState, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }); // alloc: a test's model
         let mut critical = Vec::new();
         let take = |outputs: Vec<Output>,
                     running: &mut Vec<u32>,
-                    states: &mut HashMap<u32, NodeState, Global>, // alloc: a test's model
+                    states: &mut Map<u32, NodeState, FixedState, Global>, // alloc: a test's model
                     finished: &mut Option<bool>,
                     critical: &mut Vec<u32>| {
             for output in outputs {
@@ -407,7 +407,7 @@ fn step_into_gives_what_step_gives() {
         };
         let mut specs = Vec::new();
         for id in 0..nodes {
-            let deps: HashSet<u32, Global> = (0..random.below(4)) // alloc: a test's model
+            let deps: Set<u32, FixedState, Global> = (0..random.below(4)) // alloc: a test's model
                 .filter(|_| id > 0)
                 .map(|_| random.below(id.into()) as u32)
                 .collect();

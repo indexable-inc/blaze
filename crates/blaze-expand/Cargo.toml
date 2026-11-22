@@ -1,0 +1,52 @@
+[package]
+name = "blaze-expand"
+description = "Macro expansion for the item layer (docs/v2/plan/design/bottom.md, `Expansion` and `MacroDef`): one pure function from a macro's definition and one call's tokens to a portable expansion record, its key, its outside reads and its errors as values"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# The producers this crate's code makes values for (decision D105,
+# docs/v2/plan/design/producer-id.md): its source and its workspace dependencies' are the row.
+[package.metadata.blaze]
+producer = ["expander"]
+
+[lib]
+doctest = false
+
+[dependencies]
+# `ContentId`, `CrateItemKey`, `ItemKey`, `Portable`: what a record names a crate, a module
+# and a definition's content by.
+blaze-id.workspace = true
+# `Writer`, `Slice`, `open_as`, `leb`: the expansion's stored record (its columns, read back).
+blaze-format.workspace = true
+# The schema's words (`Edition`, `CallShape`, `Range`, `MacroKind` and the builtin and proc
+# macro names) and the `MacroDef` record a `MacroDefinition` is written to and read from.
+blaze-surface.workspace = true
+# `TokensBuilder`, `Tokens`: an expansion's tokens as its token record (drive.md D122), written
+# beside its columns and opened where it is.
+blaze-tokens.workspace = true
+# `Vec`: every owning collection, in the allocator the caller names.
+blaze-own.workspace = true
+# `Hasher`: the keys and a definition's content hash.
+blaze-ids.workspace = true
+# `frame::task`: the task frame a `macro_rules!` call's matcher lists live in.
+blaze-mem.workspace = true
+# `LexedStr`: the lexer's kinds and lengths, which `lex` reads straight into a stream; the
+# fragment entry points the matcher parses `expr`, `ty`, `pat` and the rest with.
+parser.workspace = true
+# `tokenize`: a literal token's kind, quotes and suffix; `is_ident`: whether the text
+# `${concat(..)}` makes is an identifier.
+rustc_lexer.workspace = true
+
+[dev-dependencies]
+blaze-sim.workspace = true
+# `Alloc::global()`: the tests' handle.
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

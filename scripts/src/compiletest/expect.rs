@@ -43,21 +43,21 @@ fn quoted(text: &str) -> String {
 }
 
 pub(crate) fn read(text: &str) -> Result<Expected, String> {
-    let value: toml::Table = text.parse().map_err(|e| format!("not TOML: {e}"))?;
+    let value = toml::parse(text).map_err(|e| format!("not TOML: {}", e.display(text)))?;
     let mut out = Expected::default();
-    for (key, section) in &value {
-        let table = section.as_table().ok_or_else(|| format!("`{key}` is not a table"))?;
-        match key.as_str() {
+    for (key, section) in value.iter() {
+        let table = section.as_map().ok_or_else(|| format!("`{key}` is not a table"))?;
+        match key {
             "counts" => {
-                let count = |name: &str| table.get(name).and_then(toml::Value::as_integer).and_then(|it| u64::try_from(it).ok()).ok_or_else(|| format!("[counts] has no `{name}`"));
+                let count = |name: &str| table.get(name).and_then(toml::Value::as_u64).ok_or_else(|| format!("[counts] has no `{name}`"));
                 (out.total, out.ran) = (count("total")?, count("ran")?);
             }
             class if LISTED.contains(&class) => {
-                for (cause, tests) in table {
-                    let tests = tests.as_array().ok_or_else(|| format!("[{class}] {cause}: not a list of tests"))?;
+                for (cause, tests) in table.iter() {
+                    let tests = tests.as_list().ok_or_else(|| format!("[{class}] {cause}: not a list of tests"))?;
                     for test in tests {
                         let id = test.as_str().ok_or_else(|| format!("[{class}] {cause}: a test that is not a string"))?;
-                        if out.listed.insert(id.to_owned(), (class.to_owned(), cause.clone())).is_some() {
+                        if out.listed.insert(id.to_owned(), (class.to_owned(), cause.to_owned())).is_some() {
                             return Err(format!("{id} is listed twice"));
                         }
                     }

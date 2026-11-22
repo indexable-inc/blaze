@@ -1,0 +1,4 @@
+[package]
+name = "ladder-s0-fmt-03-strings"
+version = "0.1.0"
+edition = "2024"

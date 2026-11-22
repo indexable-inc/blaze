@@ -8,19 +8,17 @@
 //! reader refuses rows of another format by name, never reads them as this one's.
 
 use std::{
+    alloc::Global,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
-use arrow_array::{
-    Array, ArrayRef, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
-    cast::AsArray,
-    types::{Int64Type, UInt32Type, UInt64Type},
-};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use blaze_columns::{Prim, Strs};
 use serde_derive::Serialize;
 
-use crate::{batches, history, schema};
+use crate::{
+    columns::{self, Batch, Column},
+    history, schema,
+};
 
 /// The perf rows' format. Bumped when a column changes meaning; a reader refuses another.
 pub const FORMAT: u32 = 1;
@@ -85,22 +83,19 @@ pub fn is_run(run: &str) -> bool {
     run.len() == 16 && run.bytes().all(|it| matches!(it, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-fn column(array: impl Array + 'static) -> ArrayRef {
-    // alloc: a batch's column, once a run written
-    Arc::new(array)
-}
-
 /// The `perf_runs` batch of `rows`.
-pub fn runs_batch(rows: &[RunRow]) -> Result<RecordBatch, String> {
-    let text = |it: fn(&RunRow) -> &str| column(StringArray::from_iter_values(rows.iter().map(it)));
-    let opt = |it: fn(&RunRow) -> Option<&str>| column(StringArray::from_iter(rows.iter().map(it)));
+pub fn runs_batch(rows: &[RunRow]) -> Result<Batch, String> {
+    // alloc: a batch's column, once a run written
+    let text = |it: fn(&RunRow) -> &str| Column::texts_of(rows.iter().map(it), Global);
+    // alloc: a batch's column, once a run written
+    let opt = |it: fn(&RunRow) -> Option<&str>| Column::opt_texts_of(rows.iter().map(it), Global);
     // alloc: a batch's columns, once a run written
-    let columns: Vec<ArrayRef> = vec![
+    let columns: Vec<Column> = vec![
         text(|it| &it.run),
-        column(UInt32Array::from_iter_values(rows.iter().map(|it| it.format))),
+        Column::values(rows.iter().map(|it| it.format), Global),
         text(|it| &it.target),
-        column(Int64Array::from_iter_values(rows.iter().map(|it| it.started_unix_ns))),
-        column(UInt32Array::from_iter_values(rows.iter().map(|it| it.reps))),
+        Column::values(rows.iter().map(|it| it.started_unix_ns), Global),
+        Column::values(rows.iter().map(|it| it.reps), Global),
         opt(|it| it.tree.as_deref()),
         text(|it| &it.blaze),
         opt(|it| it.binary.as_deref()),
@@ -108,41 +103,44 @@ pub fn runs_batch(rows: &[RunRow]) -> Result<RecordBatch, String> {
         text(|it| &it.host),
         text(|it| &it.arch),
         text(|it| &it.os),
-        column(UInt64Array::from_iter(rows.iter().map(|it| it.cpu_period_ns))),
+        Column::options(rows.iter().map(|it| it.cpu_period_ns), Global),
         text(|it| &it.sampler),
-        column(UInt64Array::from_iter_values(rows.iter().map(|it| it.samples))),
-        column(UInt64Array::from_iter_values(rows.iter().map(|it| it.unmapped))),
-        column(Int64Array::from_iter_values(rows.iter().map(|it| it.wall_ns))),
+        Column::values(rows.iter().map(|it| it.samples), Global),
+        Column::values(rows.iter().map(|it| it.unmapped), Global),
+        Column::values(rows.iter().map(|it| it.wall_ns), Global),
         opt(|it| it.maps.as_deref()),
         opt(|it| it.gaps.as_deref()),
     ];
-    RecordBatch::try_new(batches::schema_of(&schema::PERF_RUNS), columns)
-        .map_err(|error| format!("the {} batch: {error}", schema::PERF_RUNS.name))
+    // alloc: an error
+    columns::batch(&schema::PERF_RUNS, columns).map_err(|error| error.to_string())
 }
 
 /// The `perf_functions` batch of `rows`.
-pub fn functions_batch(rows: &[FnRow]) -> Result<RecordBatch, String> {
-    let text = |it: fn(&FnRow) -> &str| column(StringArray::from_iter_values(rows.iter().map(it)));
-    let opt = |it: fn(&FnRow) -> Option<&str>| column(StringArray::from_iter(rows.iter().map(it)));
-    let count = |it: fn(&FnRow) -> Option<u64>| column(UInt64Array::from_iter(rows.iter().map(it)));
+pub fn functions_batch(rows: &[FnRow]) -> Result<Batch, String> {
+    // alloc: a batch's column, once a run written
+    let text = |it: fn(&FnRow) -> &str| Column::texts_of(rows.iter().map(it), Global);
+    // alloc: a batch's column, once a run written
+    let opt = |it: fn(&FnRow) -> Option<&str>| Column::opt_texts_of(rows.iter().map(it), Global);
+    // alloc: a batch's column, once a run written
+    let count = |it: fn(&FnRow) -> Option<u64>| Column::options(rows.iter().map(it), Global);
     // alloc: a batch's columns, once a run written
-    let columns: Vec<ArrayRef> = vec![
+    let columns: Vec<Column> = vec![
         text(|it| &it.run),
-        column(UInt32Array::from_iter_values(rows.iter().map(|it| it.rep))),
+        Column::values(rows.iter().map(|it| it.rep), Global),
         text(|it| &it.function),
         opt(|it| it.module.as_deref()),
         opt(|it| it.identity.as_deref()),
         opt(|it| it.code.as_deref()),
         opt(|it| it.key.as_deref()),
         opt(|it| it.deep.as_deref()),
-        column(UInt64Array::from_iter_values(rows.iter().map(|it| it.self_samples))),
-        column(UInt64Array::from_iter_values(rows.iter().map(|it| it.total_samples))),
+        Column::values(rows.iter().map(|it| it.self_samples), Global),
+        Column::values(rows.iter().map(|it| it.total_samples), Global),
         count(|it| it.calls),
         count(|it| it.instructions),
         opt(|it| it.gap.as_deref()),
     ];
-    RecordBatch::try_new(batches::schema_of(&schema::PERF_FUNCTIONS), columns)
-        .map_err(|error| format!("the {} batch: {error}", schema::PERF_FUNCTIONS.name))
+    // alloc: an error
+    columns::batch(&schema::PERF_FUNCTIONS, columns).map_err(|error| error.to_string())
 }
 
 /// Writes the run `run` and its `functions` into the history `dir`, both files listed in its
@@ -211,103 +209,85 @@ pub fn functions(dir: &Path, run: &str) -> Result<Vec<FnRow>, String> {
     read_functions(&functions_file(dir, run))
 }
 
-fn batches_of(path: &Path) -> Result<Vec<RecordBatch>, String> {
-    let file = std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .and_then(|it| it.build())
+fn batches_of(path: &Path) -> Result<Vec<Batch>, String> {
+    // alloc: a file's bytes, once a read
+    let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let file = blaze_parquet::File::open(&bytes, Global)
         .map_err(|error| format!("{}: {error}", path.display()))?;
-    reader.collect::<Result<_, _>>().map_err(|error| format!("{}: {error}", path.display()))
+    let batches = file.read_all().map_err(|error| format!("{}: {error}", path.display()))?;
+    // alloc: a file's batches, once a read
+    Ok(batches.into_iter().collect())
 }
 
 /// The columns of one batch read back, each by name, with errors naming the file.
 struct Columns<'a> {
-    batch: &'a RecordBatch,
+    batch: &'a Batch,
     path: &'a Path,
 }
 
 impl<'a> Columns<'a> {
-    fn get(&self, name: &str) -> Result<&'a ArrayRef, String> {
+    fn get(&self, name: &str) -> Result<&'a Column, String> {
         // alloc: an error
         self.batch
             .column_by_name(name)
             .ok_or_else(|| format!("{}: no column `{name}`", self.path.display()))
     }
 
-    fn text(&self, name: &str) -> Result<&'a StringArray, String> {
+    fn text(&self, name: &str) -> Result<Strs<'a, Global>, String> {
         let it = self.get(name)?;
         // alloc: an error
-        it.as_string_opt::<i32>().ok_or_else(|| {
-            format!("{}: `{name}` is {}, not text", self.path.display(), it.data_type())
-        })
+        it.strs().ok_or_else(|| format!("{}: `{name}` is {:?}, not text", self.path.display(), it.ty()))
     }
 
-    fn u32(&self, name: &str) -> Result<&'a UInt32Array, String> {
+    fn u32(&self, name: &str) -> Result<Prim<'a, u32>, String> {
         let it = self.get(name)?;
         // alloc: an error
-        it.as_primitive_opt::<UInt32Type>().ok_or_else(|| {
-            format!("{}: `{name}` is {}, not u32", self.path.display(), it.data_type())
-        })
+        it.u32s().ok_or_else(|| format!("{}: `{name}` is {:?}, not u32", self.path.display(), it.ty()))
     }
 
-    fn u64(&self, name: &str) -> Result<&'a UInt64Array, String> {
+    fn u64(&self, name: &str) -> Result<Prim<'a, u64>, String> {
         let it = self.get(name)?;
         // alloc: an error
-        it.as_primitive_opt::<UInt64Type>().ok_or_else(|| {
-            format!("{}: `{name}` is {}, not u64", self.path.display(), it.data_type())
-        })
+        it.u64s().ok_or_else(|| format!("{}: `{name}` is {:?}, not u64", self.path.display(), it.ty()))
     }
 
-    fn i64(&self, name: &str) -> Result<&'a Int64Array, String> {
+    fn i64(&self, name: &str) -> Result<Prim<'a, i64>, String> {
         let it = self.get(name)?;
         // alloc: an error
-        it.as_primitive_opt::<Int64Type>().ok_or_else(|| {
-            format!("{}: `{name}` is {}, not i64", self.path.display(), it.data_type())
-        })
+        it.i64s().ok_or_else(|| format!("{}: `{name}` is {:?}, not i64", self.path.display(), it.ty()))
     }
 
-    /// A column no row may leave empty: an empty one is a damaged file, named.
-    fn present(&self, array: &dyn Array, name: &str, row: usize) -> Result<(), String> {
-        if array.is_null(row) {
-            // alloc: an error
-            return Err(format!("{}: row {row} has no `{name}`", self.path.display()));
-        }
-        Ok(())
+    /// A cell no row may leave empty: an empty one is a damaged file, named.
+    fn present<T>(&self, cell: Option<T>, name: &str, row: usize) -> Result<T, String> {
+        // alloc: an error
+        cell.ok_or_else(|| format!("{}: row {row} has no `{name}`", self.path.display()))
     }
 
     fn string(&self, name: &str, row: usize) -> Result<String, String> {
         let it = self.text(name)?;
-        self.present(it, name, row)?;
         // alloc: a row read back
-        Ok(it.value(row).to_owned())
+        Ok(self.present(it.get(row), name, row)?.to_owned())
     }
 
     fn opt_string(&self, name: &str, row: usize) -> Result<Option<String>, String> {
-        let it = self.text(name)?;
         // alloc: a row read back
-        Ok(it.is_valid(row).then(|| it.value(row).to_owned()))
+        Ok(self.text(name)?.get(row).map(str::to_owned))
     }
 
     fn opt_u64(&self, name: &str, row: usize) -> Result<Option<u64>, String> {
-        let it = self.u64(name)?;
-        Ok(it.is_valid(row).then(|| it.value(row)))
+        Ok(self.u64(name)?.get(row))
     }
 
     fn req_u64(&self, name: &str, row: usize) -> Result<u64, String> {
-        let it = self.u64(name)?;
-        self.present(it, name, row)?;
-        Ok(it.value(row))
+        self.present(self.u64(name)?.get(row), name, row)
     }
 
     fn req_u32(&self, name: &str, row: usize) -> Result<u32, String> {
-        let it = self.u32(name)?;
-        self.present(it, name, row)?;
-        Ok(it.value(row))
+        self.present(self.u32(name)?.get(row), name, row)
     }
 
     fn req_i64(&self, name: &str, row: usize) -> Result<i64, String> {
-        let it = self.i64(name)?;
-        self.present(it, name, row)?;
-        Ok(it.value(row))
+        self.present(self.i64(name)?.get(row), name, row)
     }
 }
 

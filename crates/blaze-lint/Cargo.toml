@@ -1,0 +1,41 @@
+[package]
+name = "blaze-lint"
+description = "blaze's lints at item grain: each rule a pure function of one item's text, all rules run in one pass over its tokens, findings with item-relative ranges, template messages and fixes, no level (docs/v2/plan/design/lint.md)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `tokenize`: an item's own bytes to rustc_lexer's tokens, the one lex every rule shares.
+blaze-lex.workspace = true
+# `AVec` and `Alloc`: the findings' columns and the pass's scratch, in the caller's allocator.
+blaze-own.workspace = true
+# `Put` and `Writes`: a finding's message, written from its template and arguments.
+blaze-text.workspace = true
+# `Hasher::new_derive_key`: a rule set's identity, which joins every finding record's key.
+blaze-blake3.workspace = true
+# `memchr`, `memrchr`: line bounds, for the rules that read the comment above a site.
+blaze-memchr.workspace = true
+# `Item`: an outline's entries, which `Units::plan` makes a file's lint units of.
+blaze-surface.workspace = true
+# `name_phf_table!`: the rules' words as a perfect hash fixed at compile time, one probe per
+# identifier.
+blaze-phf.workspace = true
+
+[dev-dependencies]
+blaze-sim.workspace = true
+# `Alloc::global()`: the handle the tests and the example lint in.
+blaze-own = { workspace = true, features = ["std", "testing"] }
+# `outline`: a file's items, whose own bytes the tests and the example lint one by one.
+blaze-file-items.workspace = true
+
+[lints]
+workspace = true

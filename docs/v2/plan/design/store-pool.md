@@ -1,5 +1,6 @@
 ---
-status: plan
+status: superseded
+superseded_by: bottom.md#10-storage
 summary: The store's hot tier as a vmcache-style buffer pool - one reserved range with a fixed slot per page of every store file, a state word per page (optimistic and pinned reads), misses as explicit reads around the page cache through blaze-core that the task yields on, immutable records written once through the pool, eviction by the one evictor (a second-chance sweep that takes a page read once first) with MADV_DONTNEED / MADV_FREE_REUSABLE, prefetch we plan ourselves (each view's recorded trace replayed in order and paced by its hits, then the change set's cone in the query graph), codegen outputs then memos then the image on it, a DST, and the lanes.
 date: 2026-11-10
 ---
@@ -27,7 +28,7 @@ query's result) is a blaze-format record. It is written once into the store and 
 (rule `outputs-are-records`, the `memory-and-data` skill). This doc designs the part
 that reads it in place: the store's **hot tier**, a buffer pool of blaze's own, in the style of
 vmcache. It is step 4 of [memory-footprint.md](../../../memory-footprint.md#4-outputs-as-records-in-the-stores-buffer-pool).
-The pool is the first cache that [memory-pool.md](../../../memory-pool.md) puts over the store and
+The pool is the first cache that memory-pool.md (deleted 2026-11-15, in git history) puts over the store and
 under the one evictor. It builds on admission by footprint (docs/v2/plan/admission-by-footprint.md on branches
 admit-footprint-1106 and kept-memory-1109, not yet on main). It does not redo that work: admission by footprint, the purge before a refusal,
 and naming each task's crate and unit are that lane's. This design adds one input to that lane's
@@ -527,7 +528,7 @@ tear and crash it at any point. That proof is section 7.
 
 ### The one evictor, and what it ranks
 
-[memory-pool.md](../../../memory-pool.md#3-every-cache-is-a-hot-tier-over-the-store) puts one
+memory-pool.md section 3 puts one
 evictor over every cache and ranks entries by the least cost to rebuild per byte, measured. The pool
 is the first cache on it. It implements the evictor's interface (`name`, `charge`, `cost`,
 `evict(bytes) -> freed`, memory-pool.md's order step 3) as `pool::Sweep`
@@ -573,7 +574,7 @@ ranges, and the batch is given back in as few calls as the system allows. The ne
   daemon itself (`PIDFD_SELF_THREAD_GROUP`, Linux 6.14, so no descriptor is opened or inherited by a
   child) with one iovec per range. Linux 6.13 lets `process_madvise` take any advice
   for the caller's own process, and 6.16 flushes the TLB once per call for `MADV_DONTNEED` rather
-  than once per range. blaze's floor is 7.2 ([memory-pool.md section 7](../../../memory-pool.md#7-what-the-kernel-does-for-it-linux-72-macos)). Lane 1 read both in
+  than once per range. blaze's floor is 7.2 (memory-pool.md section 7). Lane 1 read both in
   `mm/madvise.c` (7.4-rc2): `process_madvise` skips its remote-only advice check when the target's
   mm is the caller's, and `vector_madvise` gathers the TLB once around every range for
   `MADV_DONTNEED`. It returns the bytes of the leading ranges it finished, so `Region::evict`
@@ -599,7 +600,7 @@ and at 256 pages a batch that is tens of flushes a second. On Apple silicon, TLB
 broadcast TLBI instruction, with no IPI. The `pool evict` span times each batch, and the flush's
 share shows up there before anyone tunes it (rule `slow-is-p0-traced`).
 
-**Not `MAP_DROPPABLE`.** [memory-pool.md section 7](../../../memory-pool.md#7-what-the-kernel-does-for-it-linux-72-macos)
+**Not `MAP_DROPPABLE`.** memory-pool.md section 7
 maps caches droppable, so the kernel can drop their pages under pressure. That cannot work under
 pinned, zero-copy reads: the kernel could zero a page while a `P::Ref` reads it. The pool keeps
 eviction its own, and this supersedes that bullet for the store's tier. `memory.reclaim` of a

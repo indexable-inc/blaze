@@ -444,7 +444,7 @@ struct Package {
 /// The workspace root and member packages of the workspace `manifest_path` (or the working
 /// directory) is in: what rustfmt reads from `cargo metadata --no-deps`.
 fn get_cargo_metadata(manifest_path: Option<&Path>) -> Result<(PathBuf, Vec<Package>), io::Error> {
-    let load = || -> anyhow::Result<(PathBuf, Vec<Package>)> {
+    let load = || -> Result<(PathBuf, Vec<Package>), crate::FmtError> {
         let ctx = Context::new(Config::from_process()?);
         let ws = Workspace::new(&root_manifest(manifest_path, &ctx)?, &ctx)?;
         let packages = ws
@@ -462,7 +462,7 @@ fn get_cargo_metadata(manifest_path: Option<&Path>) -> Result<(PathBuf, Vec<Pack
             .collect();
         Ok((ws.root().to_owned(), packages))
     };
-    load().map_err(|e| io::Error::other(format!("{e:#}")))
+    load().map_err(io::Error::other)
 }
 
 fn get_targets_root_only(
@@ -618,21 +618,19 @@ impl StdoutToNull {
     #[cfg(unix)]
     fn new() -> Option<StdoutToNull> {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use blaze_sys::{
+            posix::{io::dup, proc::STDOUT_FILENO},
+            Fd,
+        };
         let null = fs::OpenOptions::new().write(true).open("/dev/null").ok()?;
         let _ = io::stdout().flush();
-        // SAFETY: `dup` and `dup2` on the process's standard output and a file it owns;
-        // the duplicate is owned by `saved` and restored on drop.
-        unsafe {
-            let saved = libc::dup(libc::STDOUT_FILENO);
-            if saved < 0 {
-                return None;
-            }
-            let saved = OwnedFd::from_raw_fd(saved);
-            if libc::dup2(null.as_raw_fd(), libc::STDOUT_FILENO) < 0 {
-                return None;
-            }
-            Some(StdoutToNull { saved })
+        let saved = dup(Fd::new(STDOUT_FILENO)).ok()?.into_raw();
+        // SAFETY: `dup` returned a fresh descriptor owned by this value.
+        let saved = unsafe { OwnedFd::from_raw_fd(saved) };
+        if blaze_sys::posix::io::dup2(Fd::new(null.as_raw_fd()), Fd::new(STDOUT_FILENO)).is_err() {
+            return None;
         }
+        Some(StdoutToNull { saved })
     }
 
     #[cfg(not(unix))]
@@ -647,10 +645,10 @@ impl Drop for StdoutToNull {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
-            // SAFETY: puts back the standard output `new` saved.
-            unsafe {
-                libc::dup2(self.saved.as_raw_fd(), libc::STDOUT_FILENO);
-            }
+            let _ = blaze_sys::posix::io::dup2(
+                blaze_sys::Fd::new(self.saved.as_raw_fd()),
+                blaze_sys::Fd::new(blaze_sys::posix::proc::STDOUT_FILENO),
+            );
         }
     }
 }

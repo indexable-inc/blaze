@@ -3,7 +3,7 @@ use super::*;
 // test_err generic_arg_list_recover_expr
 // const _: () = T::<0, ,T>;
 // const _: () = T::<0, ,T>();
-pub(super) fn opt_generic_arg_list_expr(p: &mut Parser<'_>) {
+pub(super) fn opt_generic_arg_list_expr<S: Sink>(p: &mut Parser<'_, S>) {
     let m;
     if p.at(T![::]) && p.nth(2) == T![<] {
         m = p.start();
@@ -48,7 +48,7 @@ const GENERIC_ARG_RECOVERY_SET: TokenSet = TokenSet::new(&[T![>], T![,]]);
 
 // test generic_arg
 // type T = S<i32, dyn T, fn()>;
-pub(crate) fn generic_arg(p: &mut Parser<'_>) -> bool {
+pub(crate) fn generic_arg<S: Sink>(p: &mut Parser<'_, S>) -> bool {
     match p.current() {
         LIFETIME_IDENT if !p.nth_at(1, T![+]) => lifetime_arg(p),
         // blaze, under `#![blaze::records]`: `type T = Vec<{ a: u8, b: u8 }>;`
@@ -128,13 +128,13 @@ pub(crate) fn generic_arg(p: &mut Parser<'_>) -> bool {
 
 // test lifetime_arg
 // type T = S<'static>;
-fn lifetime_arg(p: &mut Parser<'_>) {
+fn lifetime_arg<S: Sink>(p: &mut Parser<'_, S>) {
     let m = p.start();
     lifetime(p);
     m.complete(p, LIFETIME_ARG);
 }
 
-pub(super) fn const_arg_expr(p: &mut Parser<'_>) {
+pub(super) fn const_arg_expr<S: Sink>(p: &mut Parser<'_, S>) {
     // The tests in here are really for `const_arg`, which wraps the content
     // CONST_ARG.
     match p.current() {
@@ -177,13 +177,13 @@ pub(super) fn const_arg_expr(p: &mut Parser<'_>) {
 
 // test const_arg
 // type T = S<92>;
-pub(super) fn const_arg(p: &mut Parser<'_>) {
+pub(super) fn const_arg<S: Sink>(p: &mut Parser<'_, S>) {
     let m = p.start();
     const_arg_expr(p);
     m.complete(p, CONST_ARG);
 }
 
-pub(crate) fn type_arg(p: &mut Parser<'_>) {
+pub(crate) fn type_arg<S: Sink>(p: &mut Parser<'_, S>) {
     let m = p.start();
     types::type_(p);
     m.complete(p, TYPE_ARG);

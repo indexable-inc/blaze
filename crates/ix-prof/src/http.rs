@@ -109,7 +109,7 @@ impl Server {
         // One byte ends the accept loop's poll; a failed write (the loop already gone, its
         // end closed) leaves nothing to wake.
         let _ = (&self.wake).write_all(&[1]);
-        let _wait = tracing::info_span!(target: "blaze::ix_prof", "join", wait = "thread", on = "ix-prof-http").entered();
+        let _wait = blaze_trace::info_span!(target: "blaze::ix_prof", "join", wait = "thread", on = "ix-prof-http").entered();
         let _ = thread.join();
     }
 }
@@ -130,9 +130,13 @@ fn accept_loop(listener: &TcpListener, woken: &std::os::unix::net::UnixStream, t
     use blaze_core::wait::{self, Clock as _, Deadline, Monotonic, Waited};
     let clock = Monotonic::new();
     let gate = Arc::new(Gate::default());
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let readable = blaze_sys::posix::io::PollEvents::IN.bits();
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let readable = libc::POLLIN;
     let mut fds = [
-        libc::pollfd { fd: woken.as_raw_fd(), events: libc::POLLIN, revents: 0 },
-        libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+        libc::pollfd { fd: woken.as_raw_fd(), events: readable, revents: 0 },
+        libc::pollfd { fd: listener.as_raw_fd(), events: readable, revents: 0 },
     ];
     // Set while `accept` keeps failing: the pause before the listener is waited on again.
     let mut backoff_ms: Option<u64> = None;
@@ -146,7 +150,7 @@ fn accept_loop(listener: &TcpListener, woken: &std::os::unix::net::UnixStream, t
         };
         let waited = {
             let _wait = backoff_ms
-                .map(|ms| tracing::info_span!(target: "blaze::ix_prof", "accept_backoff", wait = "timer", on = "ix-prof-http", ms).entered());
+                .map(|ms| blaze_trace::info_span!(target: "blaze::ix_prof", "accept_backoff", wait = "timer", on = "ix-prof-http", ms).entered());
             wait::readable(
                 "the ix-prof endpoint's listener or its stop byte",
                 &mut fds[..nfds],
@@ -1054,6 +1058,9 @@ mod tests {
         let file = dir.join(crate::endpoint::FILE);
         std::fs::remove_file(&file).unwrap();
         let c = std::ffi::CString::new(file.as_os_str().as_encoded_bytes()).unwrap();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert_eq!(blaze_sys::posix::proc::make_fifo(blaze_sys::Path::new(&c), 0o600), Ok(()));
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         // SAFETY: a NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
         let (done, stopped) = std::sync::mpsc::channel();

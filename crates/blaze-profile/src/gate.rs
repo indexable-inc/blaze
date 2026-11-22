@@ -30,23 +30,16 @@
 //! would otherwise pass `blocks_in_waits` by having no samples.
 
 use std::{
+    alloc::Global,
     fmt, fs,
     path::{Path, PathBuf},
 };
 
-use arrow_array::{
-    Array, RecordBatch,
-    cast::AsArray,
-    types::{Float64Type, Int64Type},
-};
-use parquet::{
-    arrow::ArrowWriter,
-    file::metadata::{PageIndexPolicy, ParquetMetaDataReader},
-};
 use serde_derive::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::{
+    columns::{Batch, Column},
     history::{self, compact::Name},
     schema, slow,
     sql::{self, Query, SqlError},
@@ -383,10 +376,10 @@ pub fn check(duckdb: &Path, history: &Path, asked: Option<u64>) -> Result<Verdic
     let mut checks = Vec::with_capacity(CheckName::ALL.len());
     for (name, sqls, judge) in asks {
         // alloc: a check's answers, once a check
-        let mine: Vec<Result<Vec<RecordBatch>, String>> =
+        let mine: Vec<Result<Vec<Batch>, String>> =
             replies.by_ref().take(sqls.len()).collect();
         // alloc: a check's answers, once a check
-        let answered: Result<Vec<Vec<RecordBatch>>, String> = mine.into_iter().collect();
+        let answered: Result<Vec<Vec<Batch>>, String> = mine.into_iter().collect();
         checks.push(match answered {
             Ok(batches) => judge(&it, &batches).unwrap_or_else(|why| Check::unchecked(name, why)),
             Err(why) => Check::unchecked(name, why),
@@ -439,7 +432,7 @@ pub(crate) fn build(duckdb: &Path, history: &Path, asked: Option<u64>) -> Result
 
 /// A check's judgement of its queries' answers, in the order it asked them; `Err` when the
 /// answers are not what it asked for.
-type Judge = fn(&Build, &[Vec<RecordBatch>]) -> Result<Check, String>;
+type Judge = fn(&Build, &[Vec<Batch>]) -> Result<Check, String>;
 
 /// The checks the history's SQL answers: each check's name, its queries and its judge.
 fn sql_checks(it: &Build) -> Vec<(CheckName, Vec<String>, Judge)> {
@@ -587,7 +580,7 @@ fn sql_checks(it: &Build) -> Vec<(CheckName, Vec<String>, Judge)> {
 
 /// Each of `sqls`' answers, or why it has none. They run in one DuckDB; when that fails, each
 /// runs alone so the error is the query's own and the others still answer.
-fn answers(duckdb: &Path, history: &Path, sqls: &[&str]) -> Vec<Result<Vec<RecordBatch>, String>> {
+fn answers(duckdb: &Path, history: &Path, sqls: &[&str]) -> Vec<Result<Vec<Batch>, String>> {
     match sql::run_all(duckdb, history, sql::Scope::All, sqls) {
         // alloc: the checks' answers, once a verdict
         Ok(all) => all.into_iter().map(Ok).collect(),
@@ -603,7 +596,7 @@ fn answers(duckdb: &Path, history: &Path, sqls: &[&str]) -> Vec<Result<Vec<Recor
     }
 }
 
-fn workers_covered(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, String> {
+fn workers_covered(_: &Build, answers: &[Vec<Batch>]) -> Result<Check, String> {
     let rows = &answers[0];
     let (threads, names, seconds, pcts) =
         (i64s(rows, 0)?, strings(rows, 1)?, f64s(rows, 2)?, f64s(rows, 3)?);
@@ -635,7 +628,7 @@ fn workers_covered(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, Str
     Ok(Check::new(name, outcome, said).with(detail))
 }
 
-fn blocks_in_waits(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, String> {
+fn blocks_in_waits(_: &Build, answers: &[Vec<Batch>]) -> Result<Check, String> {
     let (threads, at, frames) =
         (i64s(&answers[0], 0)?, i64s(&answers[0], 1)?, strings(&answers[0], 2)?);
     let (off, samples) =
@@ -671,7 +664,7 @@ fn blocks_in_waits(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, Str
     Ok(Check::new(name, outcome, said).with(detail))
 }
 
-fn waits_say_what(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, String> {
+fn waits_say_what(_: &Build, answers: &[Vec<Batch>]) -> Result<Check, String> {
     let (waits, unsaid) =
         (first_i64(&answers[0], 0).unwrap_or(0), first_i64(&answers[0], 1).unwrap_or(0));
     let name = CheckName::WaitsSayWhat;
@@ -687,7 +680,7 @@ fn waits_say_what(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, Stri
     ))
 }
 
-fn rows_lost(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, String> {
+fn rows_lost(_: &Build, answers: &[Vec<Batch>]) -> Result<Check, String> {
     // alloc: an error, once a check
     let recorder = slow::load::recorder(&answers[0]).map_err(|error| error.to_string())?;
     let name = CheckName::RowsLost;
@@ -706,7 +699,7 @@ fn rows_lost(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, String> {
     Ok(Check::new(name, outcome, said))
 }
 
-fn samples_in_spans(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, String> {
+fn samples_in_spans(_: &Build, answers: &[Vec<Batch>]) -> Result<Check, String> {
     let row = &answers[0];
     let at = |i| first_i64(row, i).unwrap_or(0);
     let (samples, no_span, outside, no_row) = (at(0), at(1), at(2), at(3));
@@ -733,7 +726,7 @@ fn samples_in_spans(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, St
     Ok(Check::new(name, outcome, said).with(detail))
 }
 
-fn lock_waits(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, String> {
+fn lock_waits(_: &Build, answers: &[Vec<Batch>]) -> Result<Check, String> {
     let rows = &answers[0];
     let (locks, waited, waits, worker) =
         (strings(rows, 0)?, f64s(rows, 1)?, i64s(rows, 2)?, f64s(rows, 3)?);
@@ -786,7 +779,7 @@ fn lock_waits(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, String> 
     Ok(Check::new(name, outcome, said).with(detail))
 }
 
-fn children_in_parents(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, String> {
+fn children_in_parents(_: &Build, answers: &[Vec<Batch>]) -> Result<Check, String> {
     let at = |i| first_i64(&answers[0], i).unwrap_or(0);
     let (children, orphans, over) = (at(0), at(1), at(2));
     let name = CheckName::ChildrenInParents;
@@ -818,7 +811,7 @@ fn children_in_parents(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check,
     Ok(Check::new(name, outcome, said).with(detail))
 }
 
-fn self_cpu_in_duration(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, String> {
+fn self_cpu_in_duration(_: &Build, answers: &[Vec<Batch>]) -> Result<Check, String> {
     let counted = first_i64(&answers[0], 0).unwrap_or(0);
     let name = CheckName::SelfCpuInDuration;
     if counted == 0 {
@@ -841,7 +834,7 @@ fn self_cpu_in_duration(_: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check
     Ok(Check::new(name, outcome, said).with(detail))
 }
 
-fn cpu_matches_process(it: &Build, answers: &[Vec<RecordBatch>]) -> Result<Check, String> {
+fn cpu_matches_process(it: &Build, answers: &[Vec<Batch>]) -> Result<Check, String> {
     let row = &answers[0];
     let name = CheckName::CpuMatchesProcess;
     let has_cpu = first_i64(row, 0).unwrap_or(0);
@@ -956,18 +949,12 @@ fn files_of(history: &Path, build: u64) -> Result<(history::Pin, Vec<(Name, Path
 
 /// A Parquet file's footer row count and the value of its [`history::MERGED_ROWS`] key.
 fn footer(path: &Path) -> Result<(i64, Option<String>), String> {
-    let file =
-        fs::File::open(path).map_err(|error| format!("opening {}: {error}", path.display()))?;
-    let metadata = ParquetMetaDataReader::new()
-        .with_page_index_policy(PageIndexPolicy::Skip)
-        .parse_and_finish(&file)
+    let bytes = fs::read(path).map_err(|error| format!("reading {}: {error}", path.display()))?;
+    let file = blaze_parquet::File::open(&bytes, Global)
         .map_err(|error| format!("reading the footer of {}: {error}", path.display()))?;
-    let meta = metadata.file_metadata();
-    let said = meta
-        .key_value_metadata()
-        .and_then(|kv| kv.iter().find(|it| it.key == history::MERGED_ROWS))
-        .and_then(|it| it.value.clone());
-    Ok((meta.num_rows(), said))
+    // alloc: a count's text, once a file
+    let said = file.value(history::MERGED_ROWS).map(str::to_owned);
+    Ok((file.num_rows(), said))
 }
 
 /// Every merged file of `build` holds the rows its merge read, as its metadata says.
@@ -1036,21 +1023,17 @@ fn merges_exact(duckdb: &Path, history: &Path, build: u64) -> Check {
 
 /// The Parquet files `inputs` merged into `output` as the history's core merges them
 /// ([`history::merge::Concat`]): their column chunks copied, the file written whole.
-fn merge(
-    output: &Path,
-    inputs: &[PathBuf],
-    properties: &parquet::file::properties::WriterProperties,
-) -> Result<(), String> {
+fn merge(output: &Path, inputs: &[PathBuf]) -> Result<(), String> {
     // alloc: a merge's inputs, once a table
     let mut read = Vec::with_capacity(inputs.len());
     for input in inputs {
         // alloc: an input's bytes, once a merge
         let bytes = fs::read(input).map_err(|error| format!("reading {}: {error}", input.display()))?;
-        let input = history::merge::Input::of_bytes(bytes::Bytes::from(bytes))
+        let input = history::merge::Input::of_bytes(bytes)
             .map_err(|error| format!("reading the footer of {}: {error}", input.display()))?;
         read.push(input);
     }
-    let merged = history::merge::Concat::new(read, properties)
+    let merged = history::merge::Concat::new(read)
         .and_then(history::merge::Concat::all)
         .map_err(|failed| {
             let file = match failed.input {
@@ -1074,7 +1057,6 @@ fn merged_again(duckdb: &Path, history: &Path, build: u64) -> Result<Check, Stri
     for dir in [&empty, &out] {
         fs::create_dir_all(dir).map_err(|error| format!("making {}: {error}", dir.display()))?;
     }
-    let writer = history::Writer::new();
     // alloc: a check's lines, once a check
     let (mut wrong, mut sqls, mut tables) = (Vec::new(), Vec::new(), Vec::new());
     for table in 0..schema::TABLES.len() {
@@ -1087,7 +1069,7 @@ fn merged_again(duckdb: &Path, history: &Path, build: u64) -> Result<Check, Stri
         }
         // alloc: a path, once a table
         let output = out.join(format!("merged.{}.parquet", schema::TABLES[table].name));
-        merge(&output, &inputs, writer.properties(table))?;
+        merge(&output, &inputs)?;
         let mut read = 0;
         for input in &inputs {
             read += footer(input)?.0;
@@ -1158,14 +1140,9 @@ pub fn summary(duckdb: &Path, history: &Path, build: i64, out: &Path) -> Result<
     let Some(first) = batches.iter().find(|it| it.num_rows() > 0) else {
         return Err(fail(format!("build {build} has no row in build_summary")));
     };
-    let file = fs::File::create(out).map_err(|error| fail(error.to_string()))?;
-    let mut writer = ArrowWriter::try_new(file, first.schema(), None)
+    let bytes = blaze_parquet::write(first.fields(), &batches, &[], blaze_parquet::Options::DEFAULT, Global)
         .map_err(|error| fail(error.to_string()))?;
-    for batch in &batches {
-        writer.write(batch).map_err(|error| fail(error.to_string()))?;
-    }
-    writer.close().map_err(|error| fail(error.to_string()))?;
-    Ok(())
+    fs::write(out, &bytes).map_err(|error| fail(error.to_string()))
 }
 
 /// `text` inside SQL single quotes.
@@ -1180,46 +1157,40 @@ fn first_line(text: &str) -> String {
 }
 
 /// Column `at` of every batch, as the `BIGINT` the gate's SQL casts it to; null as 0.
-pub(crate) fn i64s(batches: &[RecordBatch], at: usize) -> Result<Vec<i64>, String> {
+pub(crate) fn i64s(batches: &[Batch], at: usize) -> Result<Vec<i64>, String> {
     // alloc: a check's answer
     let mut out = Vec::new();
     for batch in batches {
-        let column = column(batch, at)?
-            .as_primitive_opt::<Int64Type>()
-            .ok_or_else(|| wrong_type(batch, at, "BIGINT"))?;
+        let column = column(batch, at)?.i64s().ok_or_else(|| wrong_type(batch, at, "BIGINT"))?;
         out.extend(column.iter().map(Option::unwrap_or_default));
     }
     Ok(out)
 }
 
-pub(crate) fn f64s(batches: &[RecordBatch], at: usize) -> Result<Vec<f64>, String> {
+pub(crate) fn f64s(batches: &[Batch], at: usize) -> Result<Vec<f64>, String> {
     // alloc: a check's answer
     let mut out = Vec::new();
     for batch in batches {
-        let column = column(batch, at)?
-            .as_primitive_opt::<Float64Type>()
-            .ok_or_else(|| wrong_type(batch, at, "DOUBLE"))?;
+        let column = column(batch, at)?.f64s().ok_or_else(|| wrong_type(batch, at, "DOUBLE"))?;
         out.extend(column.iter().map(Option::unwrap_or_default));
     }
     Ok(out)
 }
 
-pub(crate) fn strings(batches: &[RecordBatch], at: usize) -> Result<Vec<String>, String> {
+pub(crate) fn strings(batches: &[Batch], at: usize) -> Result<Vec<String>, String> {
     // alloc: a check's answer
     let mut out = Vec::new();
     for batch in batches {
-        let column = column(batch, at)?
-            .as_string_opt::<i32>()
-            .ok_or_else(|| wrong_type(batch, at, "VARCHAR"))?;
+        let column = column(batch, at)?.strs().ok_or_else(|| wrong_type(batch, at, "VARCHAR"))?;
         // alloc: a check's answer
         out.extend(column.iter().map(|it| it.unwrap_or("?").to_owned()));
     }
     Ok(out)
 }
 
-fn column(batch: &RecordBatch, at: usize) -> Result<&dyn Array, String> {
+fn column(batch: &Batch, at: usize) -> Result<&Column, String> {
     match at < batch.num_columns() {
-        true => Ok(batch.column(at).as_ref()),
+        true => Ok(batch.column(at)),
         // alloc: an error, a bug in the gate's SQL
         false => Err(format!(
             "the gate's query answered {} columns, not {}",
@@ -1229,34 +1200,31 @@ fn column(batch: &RecordBatch, at: usize) -> Result<&dyn Array, String> {
     }
 }
 
-fn wrong_type(batch: &RecordBatch, at: usize, wanted: &str) -> String {
+fn wrong_type(batch: &Batch, at: usize, wanted: &str) -> String {
     // alloc: an error, a bug in the gate's SQL
     format!(
-        "the gate's query answered column {} as {}, not {wanted}",
-        batch.schema().field(at).name(),
-        batch.column(at).data_type()
+        "the gate's query answered column {} as {:?}, not {wanted}",
+        batch.field(at).name(),
+        batch.column(at).ty()
     )
 }
 
 /// Row 0's column `at`, a `BIGINT` or null.
-fn first_i64(batches: &[RecordBatch], at: usize) -> Option<i64> {
+fn first_i64(batches: &[Batch], at: usize) -> Option<i64> {
     let batch = batches.iter().find(|it| it.num_rows() > 0)?;
-    let column = batch.column(at).as_primitive_opt::<Int64Type>()?;
-    column.is_valid(0).then(|| column.value(0))
+    batch.column(at).i64s()?.get(0)
 }
 
-fn first_f64(batches: &[RecordBatch], at: usize) -> Option<f64> {
+fn first_f64(batches: &[Batch], at: usize) -> Option<f64> {
     let batch = batches.iter().find(|it| it.num_rows() > 0)?;
-    let column = batch.column(at).as_primitive_opt::<Float64Type>()?;
-    column.is_valid(0).then(|| column.value(0))
+    batch.column(at).f64s()?.get(0)
 }
 
 /// Row 0's column `at`, a string or null.
-fn nullable(batches: &[RecordBatch], at: usize) -> Option<String> {
+fn nullable(batches: &[Batch], at: usize) -> Option<String> {
     let batch = batches.iter().find(|it| it.num_rows() > 0)?;
-    let column = batch.column(at).as_string_opt::<i32>()?;
     // alloc: a build's identity, once a check
-    column.is_valid(0).then(|| column.value(0).to_owned())
+    batch.column(at).strs()?.get(0).map(str::to_owned)
 }
 
 #[cfg(test)]

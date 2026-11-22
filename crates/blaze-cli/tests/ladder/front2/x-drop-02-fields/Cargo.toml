@@ -1,0 +1,4 @@
+[package]
+name = "ladder-x-drop-02-fields"
+version = "0.1.0"
+edition = "blaze-2026.11"

@@ -1,0 +1,7 @@
+warning  a bare `as` cast to an integer
+  ╭─ src/greet.rs:2:26
+1 │ fn greet() {
+2 │     let 名前 = "世界🌍";    let n = 名前.len() as u8;
+  │                                     ^^^^^^^^^^^^^^^^
+  │                                     ╰─ truncates
+  ╰─ blaze explain lint:casts

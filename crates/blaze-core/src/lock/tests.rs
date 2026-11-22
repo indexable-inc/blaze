@@ -37,10 +37,10 @@ use std::{
     time::Duration,
 };
 
-use blaze_sim::{Broke, Config, Tape};
+use blaze_sim::{Broke, Broken, Config, Tape};
 
 use super::{
-    Awaits, Lock, LockGuard, LockWait, Mode, Probe, Queued, graph, set_thread_mark,
+    Awaits, Lock, LockGuard, LockPlant, LockWait, Mode, Probe, Queued, graph, set_thread_mark,
     stall::{self, Blocked, Snapshot, Stall, WaitRow},
 };
 use crate::{
@@ -106,7 +106,7 @@ struct Probed {
     began: AtomicU64,
     ended: AtomicU64,
     /// Told of each wait span opened, for a test on real threads to know a waiter waits.
-    on_begin: Option<crossbeam_channel::Sender<()>>,
+    on_begin: Option<crate::chan::Sender<()>>,
     waits: Lock<Vec<LockWait>>,
 }
 
@@ -115,7 +115,7 @@ impl Probed {
         Probed::leaked_telling(None)
     }
 
-    fn leaked_telling(on_begin: Option<crossbeam_channel::Sender<()>>) -> &'static Probed {
+    fn leaked_telling(on_begin: Option<crate::chan::Sender<()>>) -> &'static Probed {
         // alloc: a test's probe, leaked so its locks can hold it as `&'static`.
         Box::leak(Box::new(Probed {
             now_ns: AtomicU64::new(0),
@@ -846,7 +846,7 @@ fn a_healthy_run(tape: &Tape) {
 /// holder and naming where the holder took it.
 #[test]
 fn a_contended_lock_on_two_threads_records_one_wait_behind_its_holder() {
-    let (tell, told) = crossbeam_channel::bounded::<()>(1);
+    let (tell, told) = crate::chan::bounded::<()>(1);
     let probe = Probed::leaked_telling(Some(tell));
     // alloc: a test's lock, leaked so the waiter's thread can borrow it.
     let lock: &'static Lock<u64> = Box::leak(Box::new(Lock::probed("dst.threads.state", 0, probe)));
@@ -905,4 +905,120 @@ fn a_convoys_oldest_is_the_same_whatever_order_its_rows_came_in() {
         oldest.thread
     };
     assert_eq!((oldest_of([1, 2]), oldest_of([2, 1])), (1, 1));
+}
+
+// --- The lock record (D171, D179) ------------------------------------------------------------
+
+/// The lock record under the virtual clock: a holder that took the lock without waiting, a
+/// waiter that begins at a drawn time, the holder's release at a drawn later time, the waiter's
+/// take. The oracle: the thread's lock table gains exactly one row for this lock, one wait, of
+/// the virtual wait's length, its holder named by the task its thread ran at its release, with
+/// a hold of at least (not whole) the time from the waiter's start to the release; the meter's
+/// lock-wait count and time reconcile with the table. A record charged to another lock's name
+/// (the plant) is caught: the row is missing.
+#[derive(Debug)]
+enum RecordBroken {
+    /// The thread's table has no row under the lock's name.
+    NoRow { lock: &'static str },
+    /// The row's wait is not the virtual wait.
+    WrongWait { lock: &'static str },
+    /// The row's holder is not the task that held the lock, or not for its hold.
+    WrongHolder { lock: &'static str },
+    /// The table and the meter's lock-wait count and time differ (the UNACCOUNTED rule).
+    Unaccounted { lock: &'static str },
+}
+
+impl core::fmt::Display for RecordBroken {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+blaze_sim::plants! {
+    /// The lock record's plants, each with the invariant that must catch it.
+    impl LockPlant breaks RecordBroken {
+        /// The record as it is.
+        None,
+        /// The wait is charged under another lock's name.
+        ChargesAnotherName => RecordBroken::NoRow { .. },
+    }
+}
+
+fn record_names_its_holder(tape: &Tape, plant: super::LockPlant) -> Result<(), Broken<RecordBroken>> {
+    let name = match plant {
+        super::LockPlant::None => "dst.record.state",
+        super::LockPlant::ChargesAnotherName => "dst.record.planted",
+    };
+    let probe = Probed::leaked();
+    let lock = Lock::probed_planted(name, 0u64, probe, plant);
+    let before = blaze_meter::Meter::now();
+    let start = us(1 + tape.below(1_000, "waiter starts at us"));
+    let held_for = us(1 + tape.below(1_000, "the holder lets go after us"));
+    probe.act(1, Duration::ZERO);
+    let was = blaze_meter::set_doing("dst.record.holder");
+    let held = lock.lock();
+    probe.act(2, start);
+    blaze_meter::set_doing("dst.record.waiter");
+    let mut queued = Some(lock.enqueue());
+    probe.act(1, start + held_for);
+    blaze_meter::set_doing("dst.record.holder");
+    drop(held);
+    probe.act(2, start + held_for);
+    blaze_meter::set_doing("dst.record.waiter");
+    let guard = match queued.take().map(Queued::take) {
+        Some(Ok(guard)) => guard,
+        _ => {
+            blaze_meter::set_doing(was);
+            return Err(Broken::Harness(format!("{name}: the waiter could not take the lock its holder let go")));
+        }
+    };
+    drop(guard);
+    blaze_meter::set_doing(was);
+    let used = blaze_meter::Meter::now().since(&before).expect("one thread's pair");
+    tape.note(format_args!("{name}: {:?}", used.locks));
+    let Some(row) = used.locks.rows.iter().flatten().find(|row| row.lock == name) else {
+        return Err(Broken::Oracle(RecordBroken::NoRow { lock: name }));
+    };
+    let want_ns = ns(held_for);
+    if (row.contended, row.ns, row.longest_ns) != (1, want_ns, want_ns) {
+        return Err(Broken::Oracle(RecordBroken::WrongWait { lock: name }));
+    }
+    match row.top {
+        // A stretch's longest hold is the thread's running longest (an earlier case's may be
+        // longer): at least this case's hold.
+        Some(top) if top.doing == "dst.record.holder" && !top.whole && top.longest_hold_ns >= want_ns => {}
+        _ => return Err(Broken::Oracle(RecordBroken::WrongHolder { lock: name })),
+    }
+    if !used.locks_reconcile() {
+        return Err(Broken::Oracle(RecordBroken::Unaccounted { lock: name }));
+    }
+    Ok(())
+}
+
+/// The record as it is passes every case, and a wait charged under another lock's name
+/// ([`super::PLANTED_OTHER_NAME`]) is caught as a missing row.
+#[test]
+fn a_contended_locks_record_names_its_holder_and_its_wait() {
+    blaze_sim::controls(Config::cases(CONTROL_SEEDS), record_names_its_holder);
+}
+
+/// An uncontended acquire records nothing: a thousand takes and releases of each kind make no
+/// contention slot (the slow path's first act) and leave the thread's lock table and its
+/// lock-wait count as they were.
+#[test]
+fn an_uncontended_acquire_records_nothing() {
+    let lock = Lock::new("dst.record.uncontended", 0u64);
+    let read = super::ReadLock::new("dst.record.uncontended.rw", 0u64);
+    let before = blaze_meter::Meter::now();
+    for _ in 0..1_000 {
+        *lock.lock() += 1;
+        drop(lock.try_lock());
+        drop(read.read());
+        *read.write() += 1;
+    }
+    let used = blaze_meter::Meter::now().since(&before).expect("one thread's pair");
+    assert!(lock.meta.contention.load(Ordering::Relaxed).is_null(), "an uncontended lock made its contention slot");
+    assert!(read.meta.contention.load(Ordering::Relaxed).is_null(), "an uncontended read lock made its contention slot");
+    assert_eq!(used.locks.total(), (0, 0), "{:?}", used.locks);
+    assert_eq!(used.count(blaze_meter::Count::LockWaits), 0);
 }

@@ -8,6 +8,7 @@
 //! write of the whole buffer per receive). `sockaddr_storage` is viewed as the family it holds
 //! only after its `ss_family` says which.
 
+use core::ffi::c_int;
 use std::{
     io::{self, Write as _},
     net::{SocketAddr, TcpListener, TcpStream},
@@ -22,23 +23,31 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use blaze_sys::{
+    Fd,
+    posix::{net as sys, types::{sa_family_t, socklen_t}},
+};
+
 use crate::{Address, RECV_MOST};
 
 pub(crate) enum Listener {
     /// `path` is the file it made and its identity, removed when it is dropped while the name
-    /// is still that file; `None` for an inherited one.
+    /// is still that file; `None` for an inherited one. `user`: the one user whose connections
+    /// it accepts ([`peer_is`]), this process's effective uid when it was made.
     Unix {
         listener: UnixListener,
         path: Option<(PathBuf, Made)>,
+        user: u32,
     },
-    Tcp(TcpListener),
+    /// With its options, set again on each connection it accepts.
+    Tcp(TcpListener, crate::sockopt::Tcp),
 }
 
 impl Listener {
     pub(crate) fn fd(&self) -> RawFd {
         match self {
             Listener::Unix { listener, .. } => listener.as_raw_fd(),
-            Listener::Tcp(listener) => listener.as_raw_fd(),
+            Listener::Tcp(listener, _) => listener.as_raw_fd(),
         }
     }
 
@@ -49,7 +58,7 @@ impl Listener {
     pub(crate) fn set_nonblocking(&self, on: bool) -> io::Result<()> {
         match self {
             Listener::Unix { listener, .. } => listener.set_nonblocking(on),
-            Listener::Tcp(listener) => listener.set_nonblocking(on),
+            Listener::Tcp(listener, _) => listener.set_nonblocking(on),
         }
     }
 
@@ -57,19 +66,91 @@ impl Listener {
     pub(crate) fn local_addr(&self) -> Option<std::net::SocketAddr> {
         match self {
             Listener::Unix { .. } => None,
-            Listener::Tcp(listener) => listener.local_addr().ok(),
+            Listener::Tcp(listener, _) => listener.local_addr().ok(),
         }
     }
 
+    /// The next connection. A Unix one is first checked to be of this listener's user
+    /// ([`peer_is`]): one of another user is closed unread and said as `ConnectionAborted`,
+    /// which every driver's accept loop takes as a connection gone before it was taken and
+    /// goes on listening (kqueue.rs `accept`, threads.rs, the accept thread). The io_uring
+    /// driver accepts on the listener's descriptor itself and takes the same decision through
+    /// [`Listener::admit`] (uring/flight.rs `admitted`).
     pub(crate) fn accept(&self) -> io::Result<Socket> {
         match self {
-            Listener::Unix { listener, .. } => Ok(Socket::Unix(listener.accept()?.0)),
-            Listener::Tcp(listener) => {
+            Listener::Unix { listener, user, .. } => {
+                let stream = listener.accept()?.0;
+                peer_is(Fd::new(stream.as_raw_fd()), *user)?;
+                Ok(Socket::Unix(stream))
+            }
+            Listener::Tcp(listener, options) => {
                 let (stream, _) = listener.accept()?;
-                stream.set_nodelay(true)?;
+                crate::sockopt::accepted(&stream, options)?;
                 Ok(Socket::Tcp(stream))
             }
         }
+    }
+
+    /// A connection a driver accepted on this listener's descriptor itself (the io_uring
+    /// driver's accept, uring/flight.rs `admitted`) checked as [`Listener::accept`] checks its
+    /// own, by the same decision: a Unix listener's peer by [`peer_is`]; a TCP one's nothing
+    /// (its options were set on the listener before its bind, and a connection inherits them).
+    /// Refused: `ConnectionAborted`, and the caller closes `peer` unread.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn admit(&self, peer: Fd) -> io::Result<()> {
+        match self {
+            Listener::Unix { user, .. } => peer_is(peer, *user),
+            Listener::Tcp(..) => Ok(()),
+        }
+    }
+
+    /// A test plays another user: no second user exists where tests run, so the listener is
+    /// told another uid and this process's own connection is the foreign one.
+    #[cfg(test)]
+    pub(crate) fn answer_only(&mut self, uid: u32) {
+        if let Listener::Unix { user, .. } = self {
+            *user = uid;
+        }
+    }
+}
+
+/// The second wall of a Unix socket blaze listens on (the first: the folder it is made in is
+/// the user's alone, bstd's private-folder check, and the socket is 0600 before its name
+/// appears, [`listen`]): the connecting process's effective uid, as the kernel recorded it at
+/// its connect, is `user`'s, or the connection is refused before any byte of it is read.
+/// macOS: `getpeereid` (`LOCAL_PEERCRED`'s uid); Linux: `SO_PEERCRED`. A peer whose uid cannot
+/// be read is refused too (rule 3: what is not proven is not let in). The refusal is
+/// `ConnectionAborted`, naming both uids.
+///
+/// A peer may hang up before its connection is accepted. Whether its uid can still be read
+/// then is the kernel's (it records the uid at the connect); where it cannot, the connection
+/// is refused ([`peer_judged`]'s `Err` arm), never taken and never a panic.
+fn peer_is(fd: Fd, user: u32) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let peer = sys::peer_ids(fd).map(|(uid, _)| uid);
+    #[cfg(target_os = "linux")]
+    let peer = sys::peer_cred(fd).map(|cred| cred.uid);
+    peer_judged(peer, user)
+}
+
+/// [`peer_is`]'s decision on the peer's uid as it was read (sans-IO, so its refusal of an
+/// unreadable uid is tested without a kernel that refuses the read).
+fn peer_judged(peer: Result<u32, blaze_sys::Errno>, user: u32) -> io::Result<()> {
+    match peer {
+        Ok(uid) if uid == user => Ok(()),
+        Ok(uid) => Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            // alloc: an error path.
+            format!("a connection of uid {uid} refused unread: this socket answers uid {user} alone (blaze-core net.rs `peer_is`)"),
+        )),
+        Err(error) => Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            // alloc: an error path.
+            format!(
+                "a connection refused unread: its peer's uid could not be read ({}), and this socket answers uid {user} alone (blaze-core net.rs `peer_is`)",
+                io::Error::from_raw_os_error(i32::from(error.raw()))
+            ),
+        )),
     }
 }
 
@@ -106,7 +187,10 @@ impl Drop for Listener {
 /// A socket listening at `at`. A Unix socket is made under a temporary name, given mode 0600
 /// and renamed into place, so no other user can connect in between; a name left by a daemon
 /// that is gone is replaced, one another process listens on is refused.
-pub(crate) fn listen(root: &Path, at: &Address) -> io::Result<Listener> {
+pub(crate) fn listen(root: &Path, at: &Address, options: &crate::sockopt::Tcp) -> io::Result<Listener> {
+    if !matches!(at, Address::Tcp(_)) {
+        crate::sockopt::unix_refused(options)?;
+    }
     match at {
         Address::Unix(name) => {
             let path = root.join(name.as_str());
@@ -141,10 +225,14 @@ pub(crate) fn listen(root: &Path, at: &Address) -> io::Result<Listener> {
                     return Err(error);
                 }
             };
-            Ok(Listener::Unix { listener, path: Some((path, made)) })
+            Ok(Listener::Unix { listener, path: Some((path, made)), user: blaze_sys::posix::thread::geteuid() })
         }
         Address::Inherited { fd, at } => inherited(root, *fd, at),
-        Address::Tcp(address) => Ok(Listener::Tcp(TcpListener::bind(address)?)),
+        Address::Tcp(address) => {
+            let listener = crate::sockopt::listen_tcp(*address, options.get())?;
+            // clone: the listen's options, kept to set on each connection it accepts.
+            Ok(Listener::Tcp(listener, options.clone()))
+        }
     }
 }
 
@@ -171,8 +259,7 @@ fn bind(path: &Path) -> io::Result<UnixListener> {
         // A link above `/tmp` is followed: what matters is the directory the name is looked up
         // in, which nobody else may replace entries of.
         let is = std::fs::metadata(tmp)?;
-        // SAFETY: no pointers; the call cannot fail.
-        let user = unsafe { libc::geteuid() };
+        let user = blaze_sys::posix::thread::geteuid();
         if (is.uid() != user && is.uid() != 0)
             || (is.mode() & 0o002 != 0 && is.mode() & 0o1000 == 0)
         {
@@ -214,34 +301,22 @@ fn inherited(root: &Path, fd: RawFd, at: &crate::FileName) -> io::Result<Listene
             format!("the socket passed as fd {fd} for {}: {what}", path.display()),
         )
     };
-    // SAFETY: no pointers; a new descriptor of its own, or -1.
-    let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-    if copy < 0 {
+    let copy = blaze_sys::posix::io::dup_at_least(Fd::new(fd), 0, true).map_err(|error| {
+        let error = io::Error::from_raw_os_error(i32::from(error.raw()));
         // alloc: an error path.
-        return Err(refused(format!("not open ({})", io::Error::last_os_error())));
-    }
-    // SAFETY: `copy` is the descriptor the call just made, owned by nothing else.
-    let copy = unsafe { OwnedFd::from_raw_fd(copy) };
-    let option = |name: libc::c_int| -> io::Result<libc::c_int> {
-        let mut value: libc::c_int = 0;
-        let mut len = size_of::<libc::c_int>() as libc::socklen_t;
-        // SAFETY: `value` and `len` are valid for writes of the sizes `len` says.
-        let got = unsafe {
-            libc::getsockopt(
-                copy.as_raw_fd(),
-                libc::SOL_SOCKET,
-                name,
-                (&raw mut value).cast(),
-                &raw mut len,
-            )
-        };
-        if got < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(value)
+        refused(format!("not open ({error})"))
+    })?;
+    // SAFETY: `into_raw` transfers sole ownership of the new descriptor.
+    let copy = unsafe { OwnedFd::from_raw_fd(copy.into_raw()) };
+    let copied_fd = Fd::new(copy.as_raw_fd());
+    let option = |name: c_int| -> io::Result<c_int> {
+        let mut value = [0; size_of::<c_int>()];
+        sys::getsockopt_bytes(copied_fd, sys::SOL_SOCKET, name, &mut value)
+            .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))?;
+        Ok(c_int::from_ne_bytes(value))
     };
-    match option(libc::SO_TYPE) {
-        Ok(kind) if kind == libc::SOCK_STREAM => {}
+    match option(sys::SO_TYPE) {
+        Ok(kind) if kind == sys::SOCK_STREAM => {}
         // alloc: an error path.
         Ok(_) => return Err(refused("not a stream socket".to_owned())),
         // alloc: an error path.
@@ -252,22 +327,18 @@ fn inherited(root: &Path, fd: RawFd, at: &crate::FileName) -> io::Result<Listene
         // alloc: an error path.
         return Err(refused("not listening".to_owned()));
     }
-    // SAFETY: all zeros is a valid `sockaddr_storage`.
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    // SAFETY: `storage` and `len` are valid for writes of the sizes `len` says.
-    if unsafe { libc::getsockname(copy.as_raw_fd(), (&raw mut storage).cast(), &raw mut len) } < 0 {
+    let (storage, len) = sys::getsockname(copied_fd).map_err(|error| {
         // alloc: an error path.
-        return Err(refused(io::Error::last_os_error().to_string()));
-    }
-    if libc::c_int::from(storage.ss_family) != libc::AF_UNIX {
+        refused(io::Error::from_raw_os_error(i32::from(error.raw())).to_string())
+    })?;
+    if c_int::from(storage.ss_family) != sys::AF_UNIX {
         // alloc: an error path.
         return Err(refused("not a Unix socket".to_owned()));
     }
     // SAFETY: the system wrote a `sockaddr_un` (its family is AF_UNIX), which `storage` holds.
-    let un = unsafe { &*(&raw const storage).cast::<libc::sockaddr_un>() };
+    let un = unsafe { &*(&raw const storage).cast::<sys::sockaddr_un>() };
     let named = (len as usize)
-        .saturating_sub(std::mem::offset_of!(libc::sockaddr_un, sun_path))
+        .saturating_sub(std::mem::offset_of!(sys::sockaddr_un, sun_path))
         .min(un.sun_path.len());
     let named = &un.sun_path[..named];
     let bound = &named[..named.iter().position(|&it| it == 0).unwrap_or(named.len())];
@@ -277,16 +348,16 @@ fn inherited(root: &Path, fd: RawFd, at: &crate::FileName) -> io::Result<Listene
         // alloc: an error path.
         return Err(refused(format!("bound at {:?}, not there", String::from_utf8_lossy(&bound))));
     }
-    Ok(Listener::Unix { listener: UnixListener::from(copy), path: None })
+    Ok(Listener::Unix { listener: UnixListener::from(copy), path: None, user: blaze_sys::posix::thread::geteuid() })
 }
 
 /// Whether the stream socket `fd` listens, by `SO_ACCEPTCONN` (`option` reads a socket option).
 #[cfg(not(target_os = "macos"))]
 fn accepting(
     _fd: &OwnedFd,
-    option: impl Fn(libc::c_int) -> io::Result<libc::c_int>,
+    option: impl Fn(c_int) -> io::Result<c_int>,
 ) -> io::Result<bool> {
-    Ok(option(libc::SO_ACCEPTCONN)? != 0)
+    Ok(option(sys::SO_ACCEPTCONN)? != 0)
 }
 
 /// Whether the stream socket `fd` listens. Apple's `getsockopt` has no `SO_ACCEPTCONN`, so it is
@@ -297,9 +368,9 @@ fn accepting(
 #[cfg(target_os = "macos")]
 fn accepting(
     fd: &OwnedFd,
-    option: impl Fn(libc::c_int) -> io::Result<libc::c_int>,
+    option: impl Fn(c_int) -> io::Result<c_int>,
 ) -> io::Result<bool> {
-    const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
+    const PROC_PIDFDSOCKETINFO: c_int = 3;
     // `socket_fdinfo` is a 24-byte `proc_fileinfo`, then `socket_info`: a 136-byte
     // `vinfo_stat`, `soi_so` and `soi_pcb` (8 bytes each), then `soi_type`, `soi_protocol`,
     // `soi_family` (`int`s) and `soi_options` (a `short`).
@@ -308,12 +379,11 @@ fn accepting(
     const OPTIONS: usize = 24 + 164;
     // Larger than `socket_fdinfo` (792 bytes): the call refuses a smaller buffer only.
     let mut info = [0u64; 256];
-    let size = std::mem::size_of_val(&info) as libc::c_int;
-    // SAFETY: takes nothing and reads no memory of this process.
-    let pid = unsafe { libc::getpid() };
+    let size = std::mem::size_of_val(&info) as c_int;
+    let pid = blaze_sys::posix::thread::getpid();
     // SAFETY: `info` is valid for writes of `size` bytes, and the call writes at most that.
     let got = unsafe {
-        libc::proc_pidfdinfo(
+        blaze_sys::posix::thread::proc_pidfdinfo(
             pid,
             fd.as_raw_fd(),
             PROC_PIDFDSOCKETINFO,
@@ -329,20 +399,20 @@ fn accepting(
         std::slice::from_raw_parts(info.as_ptr().cast::<u8>(), std::mem::size_of_val(&info))
     };
     let int =
-        |at: usize| libc::c_int::from_ne_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
+        |at: usize| c_int::from_ne_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
     if (got as usize) < OPTIONS + 2
-        || int(TYPE) != option(libc::SO_TYPE)?
-        || int(FAMILY) != libc::AF_UNIX
-            && int(FAMILY) != libc::AF_INET
-            && int(FAMILY) != libc::AF_INET6
+        || int(TYPE) != option(sys::SO_TYPE)?
+        || int(FAMILY) != sys::AF_UNIX
+            && int(FAMILY) != sys::AF_INET
+            && int(FAMILY) != sys::AF_INET6
     {
         return Err(io::Error::other(
             "the kernel's description of the socket is not laid out as <sys/proc_info.h> says",
         ));
     }
     let options =
-        libc::c_short::from_ne_bytes(bytes[OPTIONS..OPTIONS + 2].try_into().expect("2 bytes"));
-    Ok(libc::c_int::from(options) & libc::SO_ACCEPTCONN != 0)
+        core::ffi::c_short::from_ne_bytes(bytes[OPTIONS..OPTIONS + 2].try_into().expect("2 bytes"));
+    Ok(c_int::from(options) & sys::SO_ACCEPTCONN != 0)
 }
 
 fn not_connectable(at: &Address) -> io::Error {
@@ -400,6 +470,10 @@ impl Socket {
         into.reserve(most);
         let room = into.spare_capacity_mut().as_mut_ptr().cast::<u8>();
         loop {
+            #[cfg(target_os = "macos")]
+            // SAFETY: `room` has `most` writable bytes. recv initializes only the returned count.
+            let got = unsafe { sys::c::recv(self.fd(), room.cast(), most, 0) };
+            #[cfg(not(target_os = "macos"))]
             // SAFETY: the socket's open descriptor and `most` bytes of `into`'s spare room
             // (reserved above), which the call only writes.
             let got = unsafe { libc::recv(self.fd(), room.cast(), most, 0) };
@@ -450,7 +524,10 @@ impl Socket {
 }
 
 /// A connection made to `at`, blocking until it is.
-pub(crate) fn connect(root: &Path, at: &Address) -> io::Result<Socket> {
+pub(crate) fn connect(root: &Path, at: &Address, options: &crate::sockopt::Tcp) -> io::Result<Socket> {
+    if !matches!(at, Address::Tcp(_)) {
+        crate::sockopt::unix_refused(options)?;
+    }
     match at {
         Address::Unix(name) => {
             let stream = blaze_mem::scratch::with_path(|path| {
@@ -461,31 +538,26 @@ pub(crate) fn connect(root: &Path, at: &Address) -> io::Result<Socket> {
             Ok(Socket::Unix(stream))
         }
         Address::Inherited { .. } => Err(not_connectable(at)),
-        Address::Tcp(address) => {
-            let stream = TcpStream::connect(address)?;
-            stream.set_nodelay(true)?;
-            Ok(Socket::Tcp(stream))
-        }
+        Address::Tcp(address) => Ok(Socket::Tcp(crate::sockopt::connect_tcp(*address, options)?)),
     }
 }
 
 /// `at` as the system names a socket's address, for a driver that connects by itself.
 pub(crate) struct SockAddr {
-    pub(crate) storage: libc::sockaddr_storage,
-    pub(crate) len: libc::socklen_t,
-    pub(crate) domain: libc::c_int,
+    pub(crate) storage: sys::sockaddr_storage,
+    pub(crate) len: socklen_t,
+    pub(crate) domain: c_int,
 }
 
 pub(crate) fn sockaddr(root: &Path, at: &Address) -> io::Result<SockAddr> {
-    // SAFETY: all zeros is a valid `sockaddr_storage`.
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut storage = sys::sockaddr_storage::ZERO;
     let (len, domain) = match at {
         Address::Unix(name) => blaze_mem::scratch::with_path(|path| {
             path.push(root);
             path.push(name.as_str());
             let bytes = path.as_os_str().as_bytes();
             // SAFETY: `sockaddr_storage` is large and aligned enough for any address.
-            let un = unsafe { &mut *(&raw mut storage).cast::<libc::sockaddr_un>() };
+            let un = unsafe { &mut *(&raw mut storage).cast::<sys::sockaddr_un>() };
             if bytes.len() >= un.sun_path.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -493,65 +565,59 @@ pub(crate) fn sockaddr(root: &Path, at: &Address) -> io::Result<SockAddr> {
                     format!("{}: longer than a socket's path may be", path.display()),
                 ));
             }
-            un.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            un.sun_family = sys::AF_UNIX as sa_family_t;
             for (to, &from) in un.sun_path.iter_mut().zip(bytes) {
-                *to = from as libc::c_char;
+                *to = from as core::ffi::c_char;
             }
-            let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
-            Ok((len, libc::AF_UNIX))
+            let len = std::mem::offset_of!(sys::sockaddr_un, sun_path) + bytes.len() + 1;
+            Ok((len, sys::AF_UNIX))
         })?,
         Address::Inherited { .. } => return Err(not_connectable(at)),
         Address::Tcp(SocketAddr::V4(address)) => {
             // SAFETY: as above.
-            let in4 = unsafe { &mut *(&raw mut storage).cast::<libc::sockaddr_in>() };
-            in4.sin_family = libc::AF_INET as libc::sa_family_t;
+            let in4 = unsafe { &mut *(&raw mut storage).cast::<sys::sockaddr_in>() };
+            in4.sin_family = sys::AF_INET as sa_family_t;
             in4.sin_port = address.port().to_be();
-            in4.sin_addr = libc::in_addr { s_addr: u32::from_ne_bytes(address.ip().octets()) };
-            (size_of::<libc::sockaddr_in>(), libc::AF_INET)
+            in4.sin_addr = sys::in_addr { s_addr: u32::from_ne_bytes(address.ip().octets()) };
+            (size_of::<sys::sockaddr_in>(), sys::AF_INET)
         }
         Address::Tcp(SocketAddr::V6(address)) => {
             // SAFETY: as above.
-            let in6 = unsafe { &mut *(&raw mut storage).cast::<libc::sockaddr_in6>() };
-            in6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            let in6 = unsafe { &mut *(&raw mut storage).cast::<sys::sockaddr_in6>() };
+            in6.sin6_family = sys::AF_INET6 as sa_family_t;
             in6.sin6_port = address.port().to_be();
             in6.sin6_flowinfo = address.flowinfo();
-            in6.sin6_addr = libc::in6_addr { s6_addr: address.ip().octets() };
+            in6.sin6_addr = sys::in6_addr { s6_addr: address.ip().octets() };
             in6.sin6_scope_id = address.scope_id();
-            (size_of::<libc::sockaddr_in6>(), libc::AF_INET6)
+            (size_of::<sys::sockaddr_in6>(), sys::AF_INET6)
         }
     };
     set_len(&mut storage, len);
-    Ok(SockAddr { storage, len: len as libc::socklen_t, domain })
+    Ok(SockAddr { storage, len: len as socklen_t, domain })
 }
 
 /// Every address starts with its length on Apple's systems.
 #[cfg(target_os = "macos")]
-fn set_len(storage: &mut libc::sockaddr_storage, len: usize) {
+fn set_len(storage: &mut sys::sockaddr_storage, len: usize) {
     storage.ss_len = len as u8;
 }
 
 #[cfg(not(target_os = "macos"))]
-fn set_len(_: &mut libc::sockaddr_storage, _: usize) {}
+fn set_len(_: &mut sys::sockaddr_storage, _: usize) {}
 
 /// A socket of `domain`, of the kind `connect` takes, not yet connected.
-pub(crate) fn stream_socket(domain: libc::c_int) -> io::Result<OwnedFd> {
-    // SAFETY: no pointers; a descriptor of its own or -1.
-    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
+pub(crate) fn stream_socket(domain: c_int) -> io::Result<OwnedFd> {
+    let fd = sys::socket(domain, sys::SOCK_STREAM, 0)
+        .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))?;
     // SAFETY: the call returned a descriptor of its own.
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let fd = unsafe { OwnedFd::from_raw_fd(fd.raw()) };
     set_cloexec(fd.as_raw_fd())?;
     Ok(fd)
 }
 
 pub(crate) fn set_cloexec(fd: RawFd) -> io::Result<()> {
-    // SAFETY: an open descriptor.
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    blaze_sys::posix::io::set_close_on_exec(Fd::new(fd), true)
+        .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))
 }
 
 pub(crate) mod udp;

@@ -1,4 +1,4 @@
-//! A value's derived [`std::hash::Hash`] fed to a BLAKE3 state as bytes the same on every
+//! A value's derived [`core::hash::Hash`] fed to a BLAKE3 state as bytes the same on every
 //! target and in every run: every integer written little-endian at a fixed width, `usize` and
 //! `isize` as 64 bits.
 //!
@@ -90,7 +90,7 @@ pub trait Blake3 {
 /// A `std::hash::Hasher` feeding a [`Blake3`] state, integers at a fixed width.
 pub struct Blake3Hasher<'a, B: Blake3 + ?Sized>(pub &'a mut B);
 
-impl<B: Blake3 + ?Sized> std::hash::Hasher for Blake3Hasher<'_, B> {
+impl<B: Blake3 + ?Sized> core::hash::Hasher for Blake3Hasher<'_, B> {
     /// The first 64 bits of what was fed so far: no `Hash` impl reads it, but the trait asks.
     fn finish(&self) -> u64 {
         self.0.first_word()
@@ -101,5 +101,7 @@ impl<B: Blake3 + ?Sized> std::hash::Hasher for Blake3Hasher<'_, B> {
         self.0.update(bytes);
     }
 
-    crate::fixed_width_writes!();
+    // Unqualified: a `macro_export` macro is not reachable by `crate::` path inside its own
+    // crate; it is in textual scope here, below its definition.
+    fixed_width_writes!();
 }

@@ -15,7 +15,7 @@
 //! space per value. A commit system call per quarter of growth. Per read: a bounds check and
 //! one acquire load of the ready byte.
 
-use std::{
+use core::{
     fmt,
     marker::PhantomData,
     mem,

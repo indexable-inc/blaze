@@ -13,14 +13,30 @@ repository.workspace = true
 [lib]
 doctest = false
 
+# With no feature on, the crate is `#![no_std]`: every writer takes the caller's allocator.
+[features]
+default = ["std"]
+# DEPRECATED, on by default until every caller passes an allocator (D170): the global-heap forms
+# (`Spans`, `Aligned`, `Writer::on_the_global_heap_until_ported`, `hex::encode`,
+# `leb::write_u64`, `Put` for `std`'s `Vec<u8>`, `From<cursor::Error>` for `String`).
+std = ["blaze-format-core/alloc"]
+
 [dependencies]
+# The records, views and writer; this crate re-exports them at their old paths. Nothing here may
+# bring a third-party package: compression by tier, which needs zstd, is blaze-format-tiers
+# (split out 2026-11-15).
+blaze-format-core.workspace = true
+# By path, not `.workspace`: the workspace entry turns on blaze-ids' adapter feature (serde),
+# which a member's entry cannot turn off.
 blaze-ids.workspace = true
-blaze-serde.workspace = true
-serde = { workspace = true, features = ["derive"] }
-zstd.workspace = true
+# The own collections the `_in` forms write into (`blaze_own::Vec<u8, A>`, `String<A>`), in the
+# caller's allocator: the bstd move off `alloc`'s.
+blaze-own.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+# `Alloc::global()`, the allocator a test names at its top (blaze-own's `std` feature).
+blaze-own = { workspace = true, features = ["std", "testing"] }
 blaze-sim.workspace = true
 blaze-v2-proof.workspace = true
 

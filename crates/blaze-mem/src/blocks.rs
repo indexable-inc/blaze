@@ -45,9 +45,9 @@
 
 use std::{fmt, marker::PhantomData, mem, ops::Deref, ptr::NonNull, sync::OnceLock};
 
-// The class's counts are `std`'s atomics even under `cfg(blaze_check)`, as tag's lines are:
+// The class's counts are `core`'s atomics even under `cfg(blaze_check)`, as tag's lines are:
 // process-wide counters every test shares, which a model execution would reset.
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 
 use crate::{
     MemError, Region, Tag,
@@ -457,7 +457,7 @@ impl Class {
         // aligned to a page; the `trimming` flag, swapped to true above, makes this thread the
         // one that touches it until the flag is cleared below.
         let held = unsafe {
-            std::slice::from_raw_parts_mut(self.scratch.base().cast::<u32>().as_ptr(), TRIM_MOST)
+            core::slice::from_raw_parts_mut(self.scratch.base().cast::<u32>().as_ptr(), TRIM_MOST)
         };
         let goal = (KEEP / 2) as i64;
         let mut taken = 0;
@@ -772,7 +772,7 @@ impl<T> Deref for Slice<T> {
     fn deref(&self) -> &[T] {
         // SAFETY: the first `len` places of the block are values (`new_with`), aligned, and
         // live until the slice drops; `&self` lends them shared.
-        unsafe { std::slice::from_raw_parts(self.first().as_ptr(), self.len) }
+        unsafe { core::slice::from_raw_parts(self.first().as_ptr(), self.len) }
     }
 }
 
@@ -781,7 +781,7 @@ impl<T> Drop for Slice<T> {
         // SAFETY: the first `len` places are values no one else drops; the block, given back
         // after this, is not read again by this slice.
         unsafe {
-            std::ptr::slice_from_raw_parts_mut(self.first().as_ptr(), self.len).drop_in_place()
+            core::ptr::slice_from_raw_parts_mut(self.first().as_ptr(), self.len).drop_in_place()
         };
     }
 }
@@ -826,7 +826,7 @@ impl Kept {
 
     /// The bytes a value of `layout` holds, which its tag counts: its class's size, 0 for a
     /// zero size; an error for a layout no class holds.
-    pub fn held(layout: std::alloc::Layout) -> Result<usize, MemError> {
+    pub fn held(layout: core::alloc::Layout) -> Result<usize, MemError> {
         match layout.size() {
             0 => Ok(0),
             _ => Ok(class_size(class_of(layout.size(), layout.align(), Tag::Other)?)),
@@ -834,7 +834,7 @@ impl Kept {
     }
 
     /// The class of a block asked for with `layout`, which a non-zero size has.
-    fn class(self, layout: std::alloc::Layout) -> Result<&'static Class, MemError> {
+    fn class(self, layout: core::alloc::Layout) -> Result<&'static Class, MemError> {
         class(class_of(layout.size(), layout.align(), self.0)?)
     }
 }
@@ -846,22 +846,22 @@ impl Kept {
 // Blocks of one class are disjoint and live as long as the process (a class is never
 // unreserved), so a block stays valid until given back, and any `Kept` (a copy) may give back
 // what another took. Zero-size layouts are a dangling, aligned pointer, never given back.
-unsafe impl std::alloc::Allocator for Kept {
+unsafe impl core::alloc::Allocator for Kept {
     fn allocate(
         &self,
-        layout: std::alloc::Layout,
-    ) -> Result<NonNull<[u8]>, std::alloc::AllocError> {
+        layout: core::alloc::Layout,
+    ) -> Result<NonNull<[u8]>, core::alloc::AllocError> {
         self.made(layout, Fill::Any)
     }
 
     fn allocate_zeroed(
         &self,
-        layout: std::alloc::Layout,
-    ) -> Result<NonNull<[u8]>, std::alloc::AllocError> {
+        layout: core::alloc::Layout,
+    ) -> Result<NonNull<[u8]>, core::alloc::AllocError> {
         self.made(layout, Fill::Zeroed)
     }
 
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: std::alloc::Layout) {
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: core::alloc::Layout) {
         if layout.size() == 0 {
             return;
         }
@@ -885,9 +885,9 @@ unsafe impl std::alloc::Allocator for Kept {
     unsafe fn grow(
         &self,
         ptr: NonNull<u8>,
-        old: std::alloc::Layout,
-        new: std::alloc::Layout,
-    ) -> Result<NonNull<[u8]>, std::alloc::AllocError> {
+        old: core::alloc::Layout,
+        new: core::alloc::Layout,
+    ) -> Result<NonNull<[u8]>, core::alloc::AllocError> {
         // SAFETY: the caller's contract, passed on: `ptr` is a block of `old`, `new` no smaller.
         unsafe { self.moved(ptr, old, new, Fill::Any) }
     }
@@ -895,9 +895,9 @@ unsafe impl std::alloc::Allocator for Kept {
     unsafe fn grow_zeroed(
         &self,
         ptr: NonNull<u8>,
-        old: std::alloc::Layout,
-        new: std::alloc::Layout,
-    ) -> Result<NonNull<[u8]>, std::alloc::AllocError> {
+        old: core::alloc::Layout,
+        new: core::alloc::Layout,
+    ) -> Result<NonNull<[u8]>, core::alloc::AllocError> {
         // SAFETY: as for `grow`.
         unsafe { self.moved(ptr, old, new, Fill::Zeroed) }
     }
@@ -905,9 +905,9 @@ unsafe impl std::alloc::Allocator for Kept {
     unsafe fn shrink(
         &self,
         ptr: NonNull<u8>,
-        old: std::alloc::Layout,
-        new: std::alloc::Layout,
-    ) -> Result<NonNull<[u8]>, std::alloc::AllocError> {
+        old: core::alloc::Layout,
+        new: core::alloc::Layout,
+    ) -> Result<NonNull<[u8]>, core::alloc::AllocError> {
         // SAFETY: as for `grow`, `new` no larger.
         unsafe { self.moved(ptr, old, new, Fill::Any) }
     }
@@ -917,23 +917,23 @@ unsafe impl std::alloc::Allocator for Kept {
 // whatever its tag (the `Allocator` impl's comment): a block taken through one copy may be
 // given back through another, moving or dropping one invalidates nothing, and cloning cannot
 // unwind.
-unsafe impl std::alloc::AllocatorClone for Kept {}
+unsafe impl core::alloc::AllocatorClone for Kept {}
 
 impl Kept {
     fn made(
         self,
-        layout: std::alloc::Layout,
+        layout: core::alloc::Layout,
         fill: Fill,
-    ) -> Result<NonNull<[u8]>, std::alloc::AllocError> {
+    ) -> Result<NonNull<[u8]>, core::alloc::AllocError> {
         if layout.size() == 0 {
             // A dangling pointer aligned to `layout`: the contract's zero-size block.
             let at = NonNull::<u8>::without_provenance(
-                std::num::NonZeroUsize::new(layout.align()).expect("an alignment is not zero"),
+                core::num::NonZeroUsize::new(layout.align()).expect("an alignment is not zero"),
             );
             return Ok(NonNull::slice_from_raw_parts(at, 0));
         }
-        let class = self.class(layout).map_err(|_| std::alloc::AllocError)?;
-        let (at, warm) = class.take_raw(fill).map_err(|_| std::alloc::AllocError)?;
+        let class = self.class(layout).map_err(|_| core::alloc::AllocError)?;
+        let (at, warm) = class.take_raw(fill).map_err(|_| core::alloc::AllocError)?;
         let (size, warm) = (class.size(), -i32::from(warm));
         tag::add(self.0, size);
         // The tag's allocated bytes and the class's warm blocks, gathered in one thread-local
@@ -959,14 +959,14 @@ impl Kept {
     unsafe fn moved(
         self,
         ptr: NonNull<u8>,
-        old: std::alloc::Layout,
-        new: std::alloc::Layout,
+        old: core::alloc::Layout,
+        new: core::alloc::Layout,
         fill: Fill,
-    ) -> Result<NonNull<[u8]>, std::alloc::AllocError> {
+    ) -> Result<NonNull<[u8]>, core::alloc::AllocError> {
         if old.size() != 0 && new.size() != 0 {
-            let from = self.class(old).map_err(|_| std::alloc::AllocError)?;
-            let to = self.class(new).map_err(|_| std::alloc::AllocError)?;
-            if std::ptr::eq(from, to) {
+            let from = self.class(old).map_err(|_| core::alloc::AllocError)?;
+            let to = self.class(new).map_err(|_| core::alloc::AllocError)?;
+            if core::ptr::eq(from, to) {
                 if fill == Fill::Zeroed && new.size() > old.size() {
                     // SAFETY: `[old.size(), new.size())` is in the block (its class holds
                     // `new`), which the caller owns.
@@ -980,14 +980,14 @@ impl Kept {
         // least `new.size()`, in another block (this one is the caller's until given back
         // below), so the ranges do not overlap.
         unsafe {
-            std::ptr::copy_nonoverlapping(
+            core::ptr::copy_nonoverlapping(
                 ptr.as_ptr(),
                 made.cast::<u8>().as_ptr(),
                 old.size().min(new.size()),
             )
         };
         // SAFETY: `ptr` is a block of `old`, given back once; the caller does not use it again.
-        unsafe { std::alloc::Allocator::deallocate(&self, ptr, old) };
+        unsafe { core::alloc::Allocator::deallocate(&self, ptr, old) };
         Ok(made)
     }
 }

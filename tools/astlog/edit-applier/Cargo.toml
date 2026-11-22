@@ -11,8 +11,8 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
-similar.workspace = true
-snafu.workspace = true
+# The Myers diff `astlog fix` prints (`stdx::myers`).
+stdx.workspace = true
 
 [lints]
 workspace = true

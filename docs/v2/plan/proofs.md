@@ -13,7 +13,99 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-135 theorems: 122 in `lean`, 13 in `lean/analysis`.
+160 theorems: 147 in `lean`, 13 in `lean/analysis`.
+
+## E3
+
+**`Blaze.TypeAlgebra.typeset_canonical_order_independent`** (`Blaze.TypeAlgebra`, `lean`): Inserting two erased type keys into a canonical TypeSet in either order produces the same set.
+
+```lean
+theorem typeset_canonical_order_independent (s : TypeSet) (a b : TypeKey) :
+    (s.insert a).insert b = (s.insert b).insert a
+```
+
+**`Blaze.TypeAlgebra.typeset_insert_idempotent`** (`Blaze.TypeAlgebra`, `lean`): Inserting an erased type key twice into a canonical TypeSet collapses duplicates idempotently.
+
+```lean
+theorem typeset_insert_idempotent (s : TypeSet) (a : TypeKey) :
+    (s.insert a).insert a = s.insert a
+```
+
+**`Blaze.TypeAlgebra.typeset_disjoint_borrow_sound`** (`Blaze.TypeAlgebra`, `lean`): Distinct erased type keys in a canonical TypeSet always occupy distinct slot indices.
+
+```lean
+theorem typeset_disjoint_borrow_sound (s : TypeSet) (a b : TypeKey) (i j : Nat)
+    (hne : a ≠ b) (ha : s.slot a = some i) (hb : s.slot b = some j) :
+    i ≠ j
+```
+
+**`Blaze.TypeAlgebra.union_widen_preserves_member`** (`Blaze.TypeAlgebra`, `lean`): Widening a structural union U to a superset V preserves membership and guarantees a valid re-tag lookup in V.
+
+```lean
+theorem union_widen_preserves_member (u v : UnionTy) (hsub : u.Sub v) (k : TypeKey) (tag : Nat)
+    (hu : u.tagOf k = some tag) :
+    v.members.mem k ∧ ∃ newTag, v.tagOf k = some newTag
+```
+
+**`Blaze.TypeAlgebra.union_narrow_complete`** (`Blaze.TypeAlgebra`, `lean`): Every member of a structural union U is either the matched member m or remains in U \ {m}, which excludes m.
+
+```lean
+theorem union_narrow_complete (u : UnionTy) (m k : TypeKey) (hk : u.members.mem k) :
+    (k = m ∨ (u.narrow m).members.mem k) ∧ ¬ (u.narrow m).members.mem m
+```
+
+## S1
+
+**`BlazeStd.Capability.dir_narrow_subtree_to_flat_monotone`** (`BlazeStd.Capability`, `lean`): Narrowing a Dir capability from Subtree to Flat is monotone: every path Flat allows is allowed by Subtree.
+
+```lean
+theorem dir_narrow_subtree_to_flat_monotone (p : RelPath)
+    (h : allows Scope.Flat p = true) :
+    allows Scope.Subtree p = true
+```
+
+**`BlazeStd.Capability.dir_flat_rejects_nested`** (`BlazeStd.Capability`, `lean`): A Flat-scoped Dir capability rejects every nested relative path.
+
+```lean
+theorem dir_flat_rejects_nested (p : RelPath)
+    (h : nested p = true) :
+    allows Scope.Flat p = false
+```
+
+**`BlazeStd.Capability.dir_narrow_transitive`** (`BlazeStd.Capability`, `lean`): Capability scope narrowing composes transitively without ever widening path authority.
+
+```lean
+theorem dir_narrow_transitive (s₁ s₂ s₃ : Scope)
+    (h12 : Narrowed s₂ s₁) (h23 : Narrowed s₃ s₂) :
+    Narrowed s₃ s₁
+```
+
+**`BlazeStd.Capability.chan_push_preserves_bound`** (`BlazeStd.Capability`, `lean`): A successful push into a bounded FIFO channel preserves its fixed capacity invariant.
+
+```lean
+theorem chan_push_preserves_bound {α : Type} (c c' : BoundedChan α) (v : α)
+    (hpush : c.push v = some c') :
+    c'.withinBound
+```
+
+**`BlazeStd.Capability.chan_pop_preserves_bound`** (`BlazeStd.Capability`, `lean`): A successful pop from a bounded FIFO channel preserves its fixed capacity invariant.
+
+```lean
+theorem chan_pop_preserves_bound {α : Type} (c c' : BoundedChan α) (v : α)
+    (hbound : c.withinBound) (hpop : c.pop = some (v, c')) :
+    c'.withinBound
+```
+
+**`BlazeStd.Capability.chan_fifo_order`** (`BlazeStd.Capability`, `lean`): Pushing a then b into an empty bounded channel of capacity at least 2 pops a first and b second.
+
+```lean
+theorem chan_fifo_order {α : Type} (cap : Nat) (hcap : 2 ≤ cap) (a b : α) :
+    ∃ c1 c2 c3,
+      (BoundedChan.empty cap).push a = some c1 ∧
+      c1.push b = some c2 ∧
+      c2.pop = some (a, c3) ∧
+      c3.pop = some (b, BoundedChan.empty cap)
+```
 
 ## V5
 
@@ -662,6 +754,106 @@ theorem simplifyCfg_call (k : Nat) (prog : Program) (n : Nat) (id : FnId) (base 
     (args : List Value) (r : Outcome Value) (h : prog.call n id base args = r)
     (hd : r ≠ Outcome.diverge) (hu : ∀ (why : Undefined), r ≠ Outcome.undefined why) :
     (simplifyCfg k prog).call n id base args = r
+```
+
+## V9
+
+**`Blaze.Lir.Aegraph.aegraph_add_zero`** (`Blaze.Lir.Aegraph`, `lean`): Adding zero to any 64-bit LIR scalar leaves it unchanged.
+
+```lean
+theorem aegraph_add_zero (x : BitVec 64) :
+    x + 0 = x
+```
+
+**`Blaze.Lir.Aegraph.aegraph_sub_self`** (`Blaze.Lir.Aegraph`, `lean`): Subtracting any 64-bit LIR scalar from itself yields zero.
+
+```lean
+theorem aegraph_sub_self (x : BitVec 64) :
+    x - x = 0
+```
+
+**`Blaze.Lir.Aegraph.aegraph_mul_one`** (`Blaze.Lir.Aegraph`, `lean`): Multiplying any 64-bit LIR scalar by one leaves it unchanged.
+
+```lean
+theorem aegraph_mul_one (x : BitVec 64) :
+    x * 1 = x
+```
+
+**`Blaze.Lir.Aegraph.aegraph_mul_zero`** (`Blaze.Lir.Aegraph`, `lean`): Multiplying any 64-bit LIR scalar by zero yields zero.
+
+```lean
+theorem aegraph_mul_zero (x : BitVec 64) :
+    x * 0 = 0
+```
+
+**`Blaze.Lir.Aegraph.aegraph_xor_self`** (`Blaze.Lir.Aegraph`, `lean`): Bitwise XOR of any 64-bit LIR scalar with itself yields zero.
+
+```lean
+theorem aegraph_xor_self (x : BitVec 64) :
+    x ^^^ x = 0
+```
+
+**`Blaze.Lir.Aegraph.aegraph_neg_neg`** (`Blaze.Lir.Aegraph`, `lean`): Two's-complement negation of a 64-bit LIR scalar is an involution.
+
+```lean
+theorem aegraph_neg_neg (x : BitVec 64) :
+    -(-x) = x
+```
+
+**`Blaze.Lir.Aegraph.aegraph_not_not`** (`Blaze.Lir.Aegraph`, `lean`): Bitwise NOT of a 64-bit LIR scalar is an involution.
+
+```lean
+theorem aegraph_not_not (x : BitVec 64) :
+    ~~~(~~~x) = x
+```
+
+**`Blaze.Lir.Aegraph.aegraph_add_comm`** (`Blaze.Lir.Aegraph`, `lean`): Addition of 64-bit LIR scalars commutes, justifying commutative GVN canonicalization.
+
+```lean
+theorem aegraph_add_comm (x y : BitVec 64) :
+    x + y = y + x
+```
+
+**`Blaze.Lir.Aegraph.aegraph_mul_comm`** (`Blaze.Lir.Aegraph`, `lean`): Multiplication of 64-bit LIR scalars commutes, justifying commutative GVN canonicalization.
+
+```lean
+theorem aegraph_mul_comm (x y : BitVec 64) :
+    x * y = y * x
+```
+
+**`Blaze.Lir.Aegraph.aegraph_select_same`** (`Blaze.Lir.Aegraph`, `lean`): Selecting between identical 64-bit LIR operands returns that operand regardless of condition.
+
+```lean
+theorem aegraph_select_same (cond : Bool) (x : BitVec 64) :
+    select cond x x = x
+```
+
+**`Blaze.Lir.Aegraph.aegraph_mul_pow2_shl`** (`Blaze.Lir.Aegraph`, `lean`): Multiplying a 64-bit LIR scalar by 2^k (1 <<< k, k < 64) equals shifting it left by k.
+
+```lean
+theorem aegraph_mul_pow2_shl (x : BitVec 64) (k : Nat) (hk : k < 64) :
+    x * ((1 : BitVec 64) <<< k) = x <<< k
+```
+
+**`Blaze.Lir.Aegraph.aegraph_udiv_pow2_lshr`** (`Blaze.Lir.Aegraph`, `lean`): Unsigned division of a 64-bit LIR scalar by 2^k (1 <<< k, k < 64) equals logical right shift by k.
+
+```lean
+theorem aegraph_udiv_pow2_lshr (x : BitVec 64) (k : Nat) (hk : k < 64) :
+    x / ((1 : BitVec 64) <<< k) = x >>> k
+```
+
+**`Blaze.Lir.Aegraph.aegraph_urem_pow2_and`** (`Blaze.Lir.Aegraph`, `lean`): Unsigned remainder of a 64-bit LIR scalar by 2^k (1 <<< k, k < 64) equals masking with (1 <<< k) - 1.
+
+```lean
+theorem aegraph_urem_pow2_and (x : BitVec 64) (k : Nat) (hk : k < 64) :
+    x % ((1 : BitVec 64) <<< k) = x &&& (((1 : BitVec 64) <<< k) - 1)
+```
+
+**`Blaze.Lir.Aegraph.aegraph_add_self_shl1`** (`Blaze.Lir.Aegraph`, `lean`): Adding a 64-bit LIR scalar to itself equals shifting it left by 1.
+
+```lean
+theorem aegraph_add_self_shl1 (x : BitVec 64) :
+    x + x = x <<< 1
 ```
 
 ## V10

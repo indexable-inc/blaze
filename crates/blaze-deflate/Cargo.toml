@@ -1,0 +1,31 @@
+[package]
+name = "blaze-deflate"
+description = "blaze's own DEFLATE (RFC 1951): a streaming inflate fed in pieces, bounded in output and in ratio so a decompression bomb is a typed refusal, and a deterministic deflate at a fast and a default level; zlib (RFC 1950) and gzip (RFC 1952) framing with Adler-32 and CRC-32; `no_std`, sans-IO, every buffer in the allocator passed in"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The inflater's window and tables and the deflater's buffers, in the caller's allocator.
+blaze-own.workspace = true
+
+[dev-dependencies]
+# The tests' root allocator capability (`testing::heap()`, D102) in place of `Global`.
+blaze-own = { workspace = true, features = ["testing"] }
+# Property tests and planted-bug controls.
+blaze-sim.workspace = true
+# The reference the tests compare against (both directions); a dev-dependency only, so it is in
+# no normal graph. `with-alloc` turns on its Vec helpers for the tests alone (resolver 2 keeps
+# dev features out of normal builds).
+miniz_oxide = { workspace = true, features = ["with-alloc"] }
+
+[lints]
+workspace = true

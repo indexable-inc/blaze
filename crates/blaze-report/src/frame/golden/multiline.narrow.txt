@@ -1,0 +1,11 @@
+[0;1;31merror  [0man [0;2m`[0;1masync[0;2m` [0mblock is not supported
+       by this build of blaze yet
+  [0;2m,- [0msrc/run.rs[0;2m:2:22[0m
+[0;2m1 | fn run() {[0m
+[0;2m2 |     [0mlet task [0;2m= [0mspawn[0;2m([0;1masync {[0m
+  [0;2m|                      [0;31m^^^^^^^[0m
+  [0;2m:[0m
+[0;2m8 |     [0;1m}[0;2m);[0m
+  [0;2m|     [0;31m^[0m
+  [0;2m|     `- [0;31mthis block[0m
+  [0;2m`- blaze explain ladder:async[0m

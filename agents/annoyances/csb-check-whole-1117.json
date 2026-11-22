@@ -1,0 +1,12 @@
+{
+ "id": "A-csb-check-whole-1",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane CSB",
+ "where": "crates/blaze-cli/tests/check_unchecked_items.rs, asked through runner.py",
+ "what": "The test fails on green at its first package (errors only): it looks for `type error E0308`, and `blaze check` now prints `error[types] src/main.rs:2:17 found `&str`, expected `u8``, plus the same error a second time inside `{the expansion that took `main`}::main`. An ask naming it is refused for a reason outside the asking lane's change.",
+ "cost": "one ask (85 s) and a second ask without the test",
+ "cause": "the print form changed and the test's phrase was not moved with it; the duplicate is the KNOWN DOUBLE of every_body.rs or the replaced-main root",
+ "workaround": "ask without that test; its unchecked item was moved to a `cfg` that does not read, since `const C: u8 = 1;` is now checked",
+ "fix": "move E0308's phrase to the printed form and decide whether the doubled finding is one",
+ "state": "open"
+}

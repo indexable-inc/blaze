@@ -1,0 +1,15 @@
+{
+ "id": "census-binary-lags-the-green-tree",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane MT",
+ "where": "/Volumes/Projects/blaze-int-1112-notes/port27/tempo-run/build-census-g*.txt and runner/scoreboard.md",
+ "what": "Lane MT's check was 'the rows shrink in the next census, quoted before and after'. The censuses from g043439 to g050933 stopped at a panic and held no builder CLASS rows. g051231 and g051728 ran, but on a tempo_build binary built before batch 2 was admitted: they still print 'a structural match of an ADT constant is not built', a message that is no longer in the tree. g052251 stopped at a static ('an unsizing coercion other than an array to a slice'). So batches 2 and 3 have no after-count yet.",
+ "cost": "about 15 minutes of reading census files to work out which tree each one ran on",
+ "cause": "a census header names the tree it measured but not which runner admissions that tree holds, and a census that stops early writes no builder section at all",
+ "whys": "the census stops at the first panic or refused static instead of reporting the builder classes it had reached",
+ "class": "a check that depends on a later measurement, with no way to tell whether the measurement contains the change",
+ "prevention": "wanted: the census header lists the last admitted runner ref in its tree, and a census that stops early still writes the builder classes it reached",
+ "annoyance": "the typeck fixture's Bb keeps `pats` private and has no `_` or `x @ p` builder (added bind_sub and wild)",
+ "workaround": "for each class, compare the census text with the refusal strings in the tree to see whether the binary predates the fix",
+ "state": "open"
+}

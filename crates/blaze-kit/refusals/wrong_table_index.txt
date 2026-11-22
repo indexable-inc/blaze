@@ -1,0 +1,58 @@
+Refusals of blaze-kit's typed tables: each snippet below must FAIL to compile, with the error named
+after it. They are the `compile_fail` cases of `Table` and the branded index (src/table.rs, src/id.rs):
+the type system, not a check at run time, keeps an id of one table off another, and a proof of one
+table's range off any other table and out of its closure.
+
+Each case is a whole crate on blaze-kit (`use blaze_kit::{Id, Table, id};`, `std::alloc::System`
+in scope), its body in `fn main`. The preamble is shared:
+
+    use std::alloc::System;
+    use blaze_kit::{Id, Table, id};
+    id! { struct Local; }
+    id! { struct Block; }
+
+== case 1: an id of another table ==
+    let mut locals: Table<Local, u64, _> = Table::new_in(System);
+    let blocks: Table<Block, u64, _> = Table::new_in(System);
+    let _ = locals.push(1);
+    let b = Block::from_u32(0);
+    let _ = locals[b];
+expect: error[E0277]: the type `Table<Local, u64, System>` cannot be indexed by `Block`
+        (any E0277 naming `Index<Block>` not implemented for `Table<Local, ..>`)
+
+== case 2: a bare usize ==
+    let locals: Table<Local, u64, _> = Table::new_in(System);
+    let _ = locals.get(0usize);
+expect: error[E0308]: mismatched types (expected `Local`, found `usize`)
+
+== case 3: a proven index escaping its closure ==
+    let locals: Table<Local, u64, _> = Table::new_in(System);
+    let escaped = locals.checked(|t| t.check(Local::from_u32(0)));
+expect: error: lifetime may not live long enough (the brand `'b` cannot outlive the closure),
+        or error[E0521]/E0700 naming the brand's lifetime
+
+== case 4: a proven index of one table read through another's ==
+    let a: Table<Local, u64, _> = Table::new_in(System);
+    let b: Table<Local, u64, _> = Table::new_in(System);
+    a.checked(|ta| b.checked(|tb| {
+        if let Some(ix) = ta.check(Local::from_u32(0)) {
+            let _ = tb.get(ix);
+        }
+    }));
+expect: error: lifetime may not live long enough / borrowed data escapes (the two brands are
+        distinct invariant lifetimes; `Ix<'a, _>` is not `Ix<'b, _>`)
+
+== case 5: shrinking a table while a proof of it is alive ==
+    let mut a: Table<Local, u64, _> = Table::new_in(System);
+    let _ = a.push(1);
+    a.checked(|t| {
+        let ix = t.check(Local::from_u32(0));
+        a.clear();
+        ix.map(|ix| *t.get(ix))
+    });
+expect: error[E0502]: cannot borrow `a` as mutable because it is also borrowed as immutable
+
+Note: the harness should build the preamble plus one case at a time and require each to fail with
+an error of the kind named (the code or the words), and the preamble alone to build. Case 1 is the
+promise the coordinator asked for (an index of one table cannot be used on another); cases 3 to 5
+are the soundness argument of `Table::checked` in src/table.rs, one per point it makes.

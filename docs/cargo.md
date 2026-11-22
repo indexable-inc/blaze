@@ -4,17 +4,14 @@ summary: Every blaze command and setting: cargo's commands and flags, what a bui
 ---
 # Using blaze
 
-`blaze <command>` takes cargo's commands and flags (`blaze build`, `blaze test`, `blaze run`),
+`blaze <command>` takes cargo's commands and flags (`blaze check`, `blaze test`, `blaze run`),
 described here. Plain `cargo` never goes through blaze (the section at the end).
 
 blaze had another name and another command before 2026-10-28; [rename.md](rename.md) maps them.
 
-This file describes blaze v2, checked against its code on 2026-10-30: the program `blaze`
-(`crates/blaze-engine/src/program.rs`), in front of the client (`crates/blaze-cargo/src/cli.rs`
-and `cli/`) of the daemon `blaze serve` (`crates/blaze-cargo/src/serve/`), on the crates of
-[v2/plan/reference/crates.md](v2/plan.md). v1's code was deleted that day;
-where v1 had a setting or command v2 lacks, the section says so. v2's design is
-[v2/plan.md](v2/plan.md).
+The daemon (`blaze serve`), its client and `blaze build` were deleted on 2026-11-15; the command
+line (`crates/blaze-cargo/src/cli.rs`) is parked until it is made over the new layer. v2's
+design is [v2/plan.md](v2/plan.md).
 
 ## Install
 
@@ -35,7 +32,7 @@ blaze on PATH (the stage 0 `.github/blaze-version` names), for this machine's ta
 That build has the LLVM backend (the release profile's, [below](#backends)) and the LLVM tiers, as the
 installer's binaries do, linking the LLVM 23 blaze pins in statically ([which
 LLVM](contributing.md#llvm)). blaze itself fetches that LLVM, by the sha256
-`crates/hir-ty-codegen/llvm.json` pins, and hands it to llvm-sys's build script: the root
+`pins/llvm.json` pins, and hands it to llvm-sys's build script: the root
 manifest declares it a [pinned native input](#pinned-native-inputs), so a plain
 `blaze build -p blaze-engine --release` on a clean Mac or Linux machine needs no Nix and no
 variable. A stage 0 from before that change does not read the table, and still needs
@@ -44,14 +41,14 @@ blaze-engine --release` is the quicker build the harnesses and CI use while work
 it is not what ships.
 
 `blaze` builds with the one toolchain blaze compiles, the dated nightly in
-`harness/toolchain` (`nightly-2026-10-27`): the language and standard library are the ones this
+`pins/toolchain` (`nightly-2026-10-27`): the language and standard library are the ones this
 blaze ships. It ignores `rust-toolchain`/`rust-toolchain.toml`, `rustup override`,
 `+toolchain`, `RUSTUP_TOOLCHAIN`, rustup's default and `RUSTC`, and never runs or asks a rustc
 to learn anything ([toolchain.md](toolchain.md)). The nightly builds
 what older releases built, so a project on a stable release or an older nightly builds as it
 is, `#![feature(...)]` included. A project that needs another Rust pins another blaze. Plain
 `cargo` still builds with the project's toolchain, in its own `target/` in the checkout:
-blaze's build directory is elsewhere ([Where a build writes](#where-a-build-writes)).
+blaze's build directory is elsewhere.
 
 Where the nightly's files come from, found with nothing run: blaze's own copy in
 `~/.blaze/toolchains/nightly-2026-10-27-<host>` (`BLAZE_HOME` moves `~/.blaze`), laid out as rustup lays
@@ -63,11 +60,11 @@ own servers (the standard library's source is blaze's own `library/`, a 6.0 MB a
 blaze's release, [toolchain.md](toolchain.md#the-standard-library-library)), 122 MB on macOS, 159 MB on Linux x86-64 and 143 MB on Linux ARM64 (about 654 MB on macOS
 and 816 MB on Linux x86-64 once unpacked, wasm32-wasip1's 106 MB of it). Each file's sha256 is built
 into blaze, from the nightly's published manifest (`harness/toolchain_pins.py` writes them into
-`crates/blaze-cargo/src/toolchain/pins.txt`), and a file with other bytes is refused. Concurrent
+`pins/rust.txt`), and a file with other bytes is refused. Concurrent
 builds download it once; a download that stopped goes on from where it stopped the next time.
 A build script is given blaze itself as `CARGO`, and as `RUSTC` and `RUSTDOC` links to blaze
 in the daemon's tools directory, which answer what a script asks of rustc with no rustc run
-(`crates/blaze-engine/src/as_rustc.rs`).
+(`crates/blaze-cargo/src/as_rustc.rs`).
 `BLAZE_RUST_DIST` names a mirror of `https://static.rust-lang.org/dist` (or a directory with
 the files), for a machine that cannot reach it. v1's `blaze toolchain`, which said which Rust
 blaze builds with and fetched its copy, is gone; v2 has no such command (`blaze --version`
@@ -76,11 +73,7 @@ a build first needs it.
 
 ## Commands
 
-    blaze build [cargo's flags]                                       (b)
-    blaze check [cargo's flags] [--fix [--lint NAME]...]               (c)
-    blaze check [cargo's flags] [--allow|--warn|--deny|--forbid LINT]...
-    blaze check [cargo's flags] --replace FROM=TO [--replace FROM=TO ...]
-    blaze check --workspace --target TRIPLE --baselines DIR [--bless-baselines] [--new-baseline LINT[,LINT...]]
+    blaze check [cargo's flags]                                       (c)
     blaze run   [cargo's flags] [-- program arguments]                (r)
     blaze test  [cargo's flags] [TESTNAME] [-- test arguments]        (t)
     blaze bench [cargo's flags] [BENCHNAME] [-- bench arguments]
@@ -91,16 +84,8 @@ a build first needs it.
     blaze init  [--bin|--lib] [--name NAME] [--edition YEAR|blaze-2026.11] [--rust] [--bstd PATH] [--vcs VCS] [--registry NAME] [PATH]
     blaze tree  [cargo tree's flags]
     blaze metadata [--format-version 1] [--no-deps] [--filter-platform TRIPLE] [the feature flags] [--manifest-path PATH]
-    blaze serve [--socket PATH] [--http ADDR] [--activated] [--ready-fd N] [--stall-bound SECS]
-    blaze stop
-    blaze status [--json]
     blaze toolchain [--json]
-    blaze daemon install | uninstall
-    blaze codegen-inputs --format=json
-    blaze trace --out PATH
-    blaze tables --format=json
     blaze pin
-    blaze diagnostics [--since TOKEN] [-p PKG]... [--workspace] [--manifest-path PATH] [--file FILE] [--client NAME] [--wait SECONDS] [--json]
     blaze agents install|remove [claude|codex]... [--project|--user] [--strict] [--dry-run]
     blaze agents status [--json]
     blaze agents hook claude|codex vN [--strict]
@@ -126,21 +111,9 @@ profile at `opt-level` 2, 3, `s` or `z`) are `max`. A package cargo gives its ow
 (`[profile.*.package.*]`) keeps it under both. The build's last line says where the linked
 code stands: `tier 0 · 38% optimized` ([v2/plan/design/tiers.md](v2/plan/design/tiers.md),
 [terminal.md](terminal.md)).
-`serve` is the daemon itself ([below](#the-daemon)); `codegen-inputs`, `trace` and `tables`
-print what the daemon's last build of the checkout did (each instance it made with its code
-hash, every result with its edges as CBOR, the size of each long-lived table); `check --replace std::sync::Mutex=parking_lot::Mutex` retargets every
-reference that resolves to the item `FROM` names to the item `TO` names, each a def path from a
-crate's name: the daemon's front end finds them by name resolution (imports, renames, globs,
-re-exports, the prelude, a macro's input), never by text, rewrites a `use` of it or a path that
-qualifies it, leaves a path through the checkout's own import of it (which moves instead),
-and commits the edits to the checkout's head, and the client writes them to its files
-(`crates/blaze-intent/src/replace.rs`, the agent API's `Edit::Replace`). A crate that would have
-to name `TO` without depending on its crate, or a name the front end can't place (a
-`macro_rules!` body, cfg'd out code), stops it with an error naming the file and line, before
-anything is written, and nothing is checked; `pin` is [below](#pinning-a-release-of-blaze). `check`'s lints, `--fix`
-and `--baselines` are [below](#lints). There is no `clippy` and no `fix` command: `check` is both. Any other command (v1's `tree`,
-`metadata`, ...) fails with `error: no such command` and status 101; none is
-passed to cargo, and no cargo plugin is run ([Every subcommand](#every-subcommand)).
+`pin` is [below](#pinning-a-release-of-blaze). Any other command fails with `error: no such
+command` and status 101; none is passed to cargo, and no cargo plugin is run
+([Every subcommand](#every-subcommand)).
 
 `fmt` is `cargo fmt` and rustfmt, run in the client's process with blaze's own formatter
 (`crates/blaze-fmt`, `blaze_fmt::command`); it asks nothing of the daemon and starts no rustfmt
@@ -160,65 +133,10 @@ with a name those they pick, as cargo's unit graph of the check has them. A targ
 a test (a library's unit tests under `--tests`) is checked with `cfg(test)` and the
 dev-dependencies; a member the selected packages only depend on is checked as its library.
 
-`build`, `run`, `test` and `bench` take the flags cargo takes and leave the files cargo would
-in the same layout, under the workspace's build directory, which is never in the checkout
-([Where a build writes](#where-a-build-writes)). The client reads no manifest: it finds the checkout, sends the
-daemon one request with the whole command line, its environment and the configuration files
-outside the checkout, and shows the responses as [terminal.md](terminal.md) says (on a
-terminal a region redrawn while the build runs and one line when it ends; off one the
-diagnostics and one `blaze: ok` or `blaze: failed` line), with cargo's exit codes. `check` is
-the daemon's check of every body of each crate the command picks, as rustc checks them
-(`crates/blaze-cargo/src/serve/unit/checks.rs`): the errors a build would fail with, or that
-one line, and no rustc. `--message-format` takes each of cargo's values; in JSON the
-messages are cargo's (`compiler-artifact`, `build-script-executed`, `compiler-message` with
-rustc's diagnostic, `build-finished`), written as cargo and rustc write them
-(`crates/blaze-cargo/src/cli/json.rs`), which is what rust-analyzer's check-on-save and other
-editors read. The wording of a diagnostic is blaze's (`crates/blaze-diagnostics`), not always
-rustc's. `status` prints the daemon's process, the requests it has served, the checkouts it
-watches and the memory it holds of its budget (`--json`: one object, [The daemon](#the-daemon)).
-`stop` has the daemon write its state and end.
-
-Under a JSON `--message-format` every `build`, `check`, `run`, `test` and `bench` ends its build
-with one `build-finished` line on stdout, the last of its JSON messages and before anything the
-program or the tests print. cargo's has only `success`; blaze's carries what a tool would
-otherwise read from the build's last line on stderr and the daemon's log, each field always present,
-`null` where there is nothing to say:
-
-    {"reason":"build-finished","success":true,"profile":"dev","served":"daemon","took_ms":812,"build_id":7,"units":{"built":2,"replayed":40},"links":{"first":0,"spliced":1,"unchanged":0,"full":0},"program":"/w/target/debug/app","size_bytes":4123456}
-
-- `success`: as cargo's.
-- `profile`: the profile's name, `null` when the build placed nothing (it failed first).
-- `served`: `daemon`, or `in-process` for the seed's one-shot engine (docs/future/bootstrap.md).
-- `took_ms`: from the command's start to the build's end.
-- `build_id`: the daemon's id of the build, which the profile history's rows carry
-  (`blaze slow --build N`, `blaze debug sql`); `null` with no work report.
-- `units`: the units made again (`built`) and replayed from the store as they were
-  (`replayed`); `null` for a request that sent no work report (a load that failed).
-- `links`: each image linked, by how: its first link, spliced into the last one, unchanged, or
-  laid out whole again (`full`, which the `link:` line on stderr says why of).
-
-`--message-format=json-render-diagnostics` keeps the diagnostics rendered on stderr as the
-human format has them and puts only the JSON messages on stdout: what harness/storelib.py's
-`split_build_output` reads (`crates/blaze-cargo/src/cli/json.rs`, `build_finished`).
-
-`doc` takes `cargo doc`'s flags (`--open`, `--no-deps`, `--document-private-items`, `--lib`,
-`--bins`, `--bin`, `--examples`, `--example`, and the package, feature, profile and target
-ones) and documents what `cargo doc` documents, with no rustdoc: the daemon checks the targets
-`cargo doc` picks (a library, and each binary not named as it; `Intent::Doc` in
-`crates/blaze-units`) and every dependency, as any check, then makes every page from that front
-end with `cfg(doc)` set (`crates/blaze-doc`, `crates/blaze-cargo/src/serve/unit/doc.rs`, the
-agent API's `Request::Doc`). The client writes the pages to `doc` in the build directory, or
-`<triple>/doc` there with `--target`, prints that path, keeps the crates earlier runs documented there in the
-search's list, and says `Documenting`, `Finished` and `Generated` (or `Opening`, and opens the
-page with `$BROWSER` or the system's opener, for `--open`) as cargo does. What `cargo doc`
-reads and blaze can't honor yet stops it with an error naming it: rustdoc's flags
-(`RUSTDOCFLAGS`, `build.rustdocflags`, `target.<triple>.rustdocflags`), `doc.browser` under
-`--open`, a JSON `--message-format`, `--unit-graph` and `--timings`; doctests are
-`blaze test --doc`'s. What the pages hold is in [doc.md](doc.md), a record of v1's
-`blaze doc`, which wrote them from the same crate.
-
-While a build waits, the client prints each unit's lines as the daemon sends them; there is no
-live progress view in v2.
+The commands are being rebuilt with no daemon (docs/v2/plan/design/bottom.md, "The commands"):
+each is a process that answers and exits; `run` and `test` write no executable, `check` makes
+no code, and there is no `blaze build`. The rest of this page describes the parked command line
+(`crates/blaze-cargo`, docs/v2/plan/parked.md) where it is not marked as gone.
 
 ## What a build does
 
@@ -232,7 +150,7 @@ linked by blaze's linker (`crates/blaze-link`) where cargo puts it in the build 
 program can reach that blaze cannot compile fails its unit, naming the function and why;
 nothing is handed to cargo or rustc.
 
-What a unit makes (`crates/blaze-cargo/src/serve/unit/codegen.rs`, `makes`): a binary, an
+What a unit makes (the deleted daemon's codegen.rs, `makes`): a binary, an
 example, a test or a build script is an executable; a `cdylib` (a native Node addon, a Python
 extension, a plugin) or a proc macro is a shared library, at cargo's path
 (`target/debug/lib<name>.so`, `.dylib` on macOS), linked with the package's
@@ -256,7 +174,7 @@ lints, its items (signatures, types, impls) sound, fails open: it stays failed, 
 built or linked from it, and the units that depend on it are still checked against its items,
 so one pass shows their errors too. A unit whose items are broken, or one that is built rather
 than checked, still holds back what depends on it. Which it was is part of the unit's check
-result and its record (`crates/blaze-cargo/src/serve/unit/compile.rs`, `open`); an item
+result and its record (the deleted daemon's compile.rs, `open`); an item
 declared inside a body's block counts as the body's. At the end of a build that failed, blaze
 says on stderr how many units it left unchecked and behind which failure, and which units an
 open failure let through; under `--message-format json` the same comes as one
@@ -265,7 +183,7 @@ open failure let through; under `--message-format json` the same comes as one
 The build is the daemon's, and the daemon keeps what it built: its database and its store.
 The next build compiles only the functions an edit changed, and links each program again
 against an image it kept of the last link at that path, so the link writes only what changed
-(`crates/blaze-cargo/src/serve/unit/codegen.rs`, `Linked`). Build scripts and proc macros
+(the deleted daemon's codegen.rs, `Linked`). Build scripts and proc macros
 are compiled by blaze too, as units of the same graph ([below](#build-scripts-and-proc-macros-run-in-a-sandbox)).
 
 The standard library is built to unwind, whatever the profile's `panic`, as the toolchain's
@@ -292,7 +210,7 @@ for one.
 binaries and integration tests with `test = true`, the examples built beside them, and the
 binaries an integration test runs (`CARGO_BIN_EXE_<name>`), or what the target flags pick. A
 test crate's harness is written into its root before its unit is compiled
-(`crates/blaze-cargo/src/serve/unit/harness.rs`). An integration test or a benchmark is told
+(the deleted daemon's harness.rs). An integration test or a benchmark is told
 `CARGO_BIN_EXE_<name>` of its package's binaries and `CARGO_TARGET_TMPDIR`, as cargo tells
 them.
 
@@ -335,7 +253,7 @@ same place (`blaze_units::lock::after_resolve`), so the same table holds for the
 
 `BLAZE_LOCK=write` is `--no-locked` said once for everything a harness starts: blaze's harnesses,
 e2e tests and release checks make throwaway workspaces with no committed lock, and set it where
-they start their children (`harness/ci.py`, `harness/smoke.py`, `harness/blaze_cli.py`, the repro
+they start their children (`harness/smoke.py`, the repro
 tests) instead of passing `--no-locked` to each command. A typed `--locked` or `--frozen` still
 wins over it; any value but `write` is an error.
 
@@ -362,7 +280,7 @@ the same resolve (another encoding or spacing) is the same, as cargo's `--locked
 
 - `[blaze] release`, `toolchain`: only for a workspace that pins a blaze version
   (`[workspace.metadata.blaze] version = "0.YYYYMMDD.N"`): that release and the nightly it ships
-  (`harness/toolchain`), recorded when that release runs it. An unpinned workspace, or one pinned
+  (`pins/toolchain`), recorded when that release runs it. An unpinned workspace, or one pinned
   to a channel, has no `[blaze]`: it runs whichever blaze it gets, and a lock naming one would
   change with every upgrade. Run by another blaze (a build of blaze's tree, or `--ignore-pin`),
   the entry is kept as it is; one that names another release than the pin disagrees with it and
@@ -480,7 +398,7 @@ default depends on the host, decided in one place (`tests_sandboxed_by_default` 
 | Linux | always, with nothing to opt into, unless its package takes it out ([below](#a-package-takes-its-tests-out)) or the command says `BLAZE_SANDBOX=off` |
 | macOS | only where its package opts in (`tests = true` in its `[package.metadata.blaze.sandbox]`) or the workspace does (`experimental = ["sandboxed-tests"]`), and then the same way out applies |
 
-The two differ because of a known hole on macOS ([below](#the-daemons-socket-and-a-known-hole-on-macos)):
+The two differ because of a known hole on macOS:
 a sandboxed test there can read another test binary's launch token. The difference goes when
 the channel to the daemon is a descriptor the test inherits, with no token in any environment.
 
@@ -543,10 +461,10 @@ unsandboxed-tests = ["tests::writes_home"]    # or these, by libtest's names
 ```
 
 On Linux `tests = true` is the default said out loud; on macOS it is the opt-in that sandboxes
-the package's tests (with the hole [below](#the-daemons-socket-and-a-known-hole-on-macos)).
+the package's tests.
 Any other key there is an error, and a
 dependency's own table is not read. The tests named run from a second server of the binary,
-started outside, after every sandboxed test (`crates/blaze-cargo/src/serve/unit/test.rs`).
+started outside, after every sandboxed test (the deleted daemon's test.rs).
 `BLAZE_SANDBOX=off` in the command's environment runs every test and build script of the
 command outside, as cargo does. A test outside the sandbox runs every time: what it read is not
 known, so its pass is never kept. Its line says so (`(not kept: not sandboxed)`), and the run
@@ -572,141 +490,12 @@ did would break, unseen, the promise that a test can't change the machine or rea
 network, and a warning in a long log is not seen. `BLAZE_SANDBOX=off` is the explicit way to
 run outside.
 
-#### The daemon's socket, and a known hole on macOS
-
-A test binary blaze runs on its code memory (a dev test binary) connects, as it starts, to the
-daemon's socket under `BLAZE_HOME/v2/inproc`, which hands it its code. That socket, like its
-fork server's own, is given to the sandbox as readable: the test may connect to it by that exact
-path and to nothing else of the daemon's home, which it can't write. What a connection gets
-there: the daemon answers only a process of its own user whose first frame names the one-use
-token of a launch still waiting, within 30 seconds, and drops any other with nothing sent. A
-test's own token is used up by its start hook before `main`; another launch's is only in that
-process's environment, which a Linux sandbox can't read (its own PID namespace and `/proc`, or
-Landlock's scoping when confined).
-
-On macOS it can. A sandboxed test reads the arguments and environment of every other process
-of the same user (`sysctl` `KERN_PROCARGS2`), so a second test binary's launch token is
-readable while that binary waits to redeem it, and a test that wins the race takes the grant
-meant for it: its code memory, written by the daemon for that launch. No Seatbelt rule tried
-closed it: `(deny process-info*)`, `(deny sysctl-read (sysctl-name "kern.procargs2"))` and
-`(deny sysctl*)` all left the read working on macOS 27.0.1 (26A434). This hole is known and not
-closed; it is why macOS sandboxes tests only on an opt-in ([above](#sandboxed-tests)), and
-`sandbox::macos::tests::a_sandboxed_run_reads_another_processs_environment` asserts that it is
-still there. A package or workspace that opts in takes this hole with it. The end state,
-on both hosts, is a socket the test inherits per launch, with no path or token to steal; then
-that test is inverted and macOS sandboxes tests by default as Linux does.
-
-On Linux the sandbox is user, mount, network, IPC and PID namespaces: the machine bound
-read-only, overlays for the workspace and target directory, tmpfs for the empty directories, a
-network namespace with only loopback up, and a seccomp filter whose supervisor reads the paths
-asked for. `/run` starts empty too, but for the links at its top (NixOS's `PATH` goes through
-`/run/current-system`), and so does the Nix daemon's socket directory: a network namespace
-hides abstract sockets but not the machine's Unix sockets (the Docker, D-Bus, systemd, Nix
-daemon and agents' sockets of `/run` and `/run/user/$UID`), which would let a test have a daemon
-outside do what it may not. Its overlays need namespaces a user can make; Ubuntu's AppArmor
-stops them unless `kernel.apparmor_restrict_unprivileged_userns` is 0, which the error says
-(a build script, which has no overlays, is confined with Landlock there instead). A filter is
-installed on every run. It refuses `TIOCSTI` and `TIOCLINUX` (`EPERM`); `io_uring_setup`
-(`ENOSYS`, as a kernel built without it answers and as Docker's default profile refuses it:
-seccomp never sees an `io_uring` operation, so a ring would read, write and connect past the
-record and the socket check, and libraries fall back to plain calls); and the calls of another
-architecture's table (32-bit or x32 calls on x86-64, `ENOSYS`), which the filter's numbers
-don't name. It asks the supervisor about each `connect` and each `sendto` with an address: one
-to a Unix socket outside the overlays, the writable directories and the empty ones, but for a
-socket the readable entries name by its exact path (its fork server's, the daemon's code
-memory's), with every link on its path followed as the program sees them, is refused (`EACCES`) and recorded as an
-`N` line, `unix:` and the path. When the run is recorded it also notifies writes, the network
-and the harness's marks, and reads too when they are recorded (`affected`).
-
-On macOS the sandbox is Seatbelt, applied with `sandbox_init_with_parameters` in the child
-before it runs the program (as Nix does), and needs no root: a profile that allows everything
-but writes (allowed only to the sandbox's scratch directory, the writable directories and the
-null and random devices, not a terminal by name), the network (loopback, and Unix sockets
-below the scratch and writable directories only, which keeps out `mDNSResponder`, `syslog`,
-`usbmuxd` and every other daemon's) and Mach services. A service runs outside the sandbox and
-writes for whoever asks: `cfprefsd` wrote a test's `defaults write` into
-`~/Library/Preferences`, and launchd, LaunchServices and the background task manager take
-jobs and login items. So every lookup is refused but these, which only answer or log:
-
-| service | for |
-|---|---|
-| `com.apple.system.opendirectoryd.libinfo`, `.membership` | `getpwuid`, `getgrgid`, groups (Nix allows the first) |
-| `com.apple.system.notification_center` | libSystem's notifications (time zone, network changes) |
-| `com.apple.logd`, `com.apple.diagnosticd`, `com.apple.system.logger` | `os_log`, `syslog`, what a crash reports |
-| `com.apple.FSEvents` | watching files (the `notify` crate) |
-| `com.apple.trustd`, `com.apple.trustd.agent` | checking a certificate against the system's roots (Nix allows these too) |
-| `com.apple.MTLCompilerService` (an XPC service) | Metal compiling a library from source at run time |
-
-They were found on 2026-10-26 (macOS 27, M5 Max) by running, under a profile that refused
-every lookup, the C toolchain (`cc`, `ld`), `xcrun metal` and `metallib` (which need none), a
-Metal program that compiles a kernel at run time and dispatches it (the compiler service), an
-FSEvents stream (`FSEvents`) and `getpwuid` (`libinfo`); a cold `blaze build` of a
-workspace with `ring`, `cc`, `serde` and a build script that runs `xcrun metal` builds under
-the list, and a build script's `defaults write` and `launchctl submit` fail. An interposer library blaze builds and loads with
-`DYLD_INSERT_LIBRARIES` records what is read, makes the workspace and target directory
-copy-on-write (`clonefile`, whiteouts for removed files, merged listings) and gives the empty
-temporary directory. Seatbelt alone can neither record reads without root (`fs_usage` needs
-it, and `(with report)` logs nothing a user can read) nor give private writes, hence the
-interposer. Its limits: a program macOS protects (`/bin/sh`, `/usr/bin/*`) is started without
-the interposer, so what it reads is not known (the test then runs every time under
-`affected`, and `-v` says so) and its writes to the workspace are refused rather than kept
-private; a test that makes raw system calls, or tampers with the interposer in its own process,
-gets past the recording and the private writes but not Seatbelt's read-only machine or its
-network rule; a sandbox inside the sandbox fails with `EPERM`; and the profile allows reading
-other processes, so a sandboxed program reads the arguments and environment of every process
-of the same user (`sysctl` `KERN_PROCARGS2`), a second test binary's launch token among them,
-which no Seatbelt rule tried closed ([above](#the-daemons-socket-and-a-known-hole-on-macos)).
-
-What it cost v1, measured with `sandboxbench.py` (since deleted) on 2026-10-26 (one sandbox per
-executable, v1's way, against a sandbox per test). v2's fork server is a third way, one sandbox
-per binary and a fork per test, not measured here; its costs are in
-[v2/plan/lanes/usercode/tests.md](v2/plan.md):
-
-| | Linux x86-64 (dev host, 16 cores) | macOS (M5 Max, 8 at a time, loaded) |
-|---|---|---|
-| a trivial program, bare | 0.86 ms | 5.2 ms |
-| in a sandbox | 8.0 ms | 29 ms |
-| in a sandbox, recording reads | 9.3 ms | 25 ms |
-| 600-test library, test phase, `BLAZE_SANDBOX=off` | 18 ms | 20 ms |
-| the same, sandboxed, `all` | 37 ms | 68 ms |
-| the same, sandboxed, `affected` (every test forced to run) | 80 ms | 100 ms |
-| the same, a sandbox per test (16 at a time on Linux, 8 on macOS) | 0.68 s | 2.26 s |
-
-A sandbox per test executable costs one launch, about 8 ms on Linux, whatever its number of
-tests, and about 25 ms on macOS (mostly the fork, Seatbelt and dyld); a sandbox per test cost
-the 600-test library ten to thirty times as much. On
-macOS a stat under the interposer goes from 0.8 to 1.1 µs, and to 3 to 5 µs on a workspace
-whose overlay has been written.
-
-On Windows the sandbox is an AppContainer in a job object
-(`crates/blaze-cargo/src/sandbox/windows.rs`): reads are granted to the container, writes to a
-capability of the run's own and taken back as it ends, and there is no network without a
-capability a run is not given. What a program reads is not traced there, so a pass of a test
-run on Windows is never kept.
-
-What is left: On Linux `openat2` always counts as a write; the
-check of a Unix socket's path reads the address from the program's memory and follows its
-links before the call goes on, so a second thread that changes the address, or a link swapped
-between the check and the call, gets past it (seccomp's notifications can't be a security
-boundary for pointers; the empty `/run`, `/tmp` and Nix socket directory are what keeps the
-usual daemons out of reach whatever the program names); and a `sendmsg` with an address is only
-asked about when the run is recorded, so a datagram to a Unix socket outside those directories
-is not refused in a run that records nothing. A test that needs `io_uring`, a 32-bit helper
-program or a terminal of its own (`/dev/tty`, or `/dev/ptmx` on macOS) runs outside
-(`unsandboxed-tests`). On macOS a sandboxed test reads other processes' arguments and
-environments, another test binary's launch token among them (above), which is why tests are
-sandboxed there only on an opt-in; a test that makes raw system calls gets past the interposer's
-recording (above); Metal's compiler service and the log write outside on the program's behalf
-(the shader cache, the system log), as the allowed services do. The plan is
-[#257](https://github.com/indexable-inc/blaze/issues/257). Build scripts and proc macros run
-in the same sandbox, below.
-
 ### Build scripts and proc macros run in a sandbox
 
 Every build script, the workspace's and its dependencies', is compiled by blaze and runs in
 the sandbox tests run in ([#147](https://github.com/indexable-inc/blaze/issues/147)), as a
 spawn of the daemon's driver through blaze's launcher (`blaze sandbox --v2`,
-`crates/blaze-cargo/src/sandbox/v2.rs`); `crates/blaze-cargo/src/serve/unit/script.rs` is the
+`crates/blaze-cargo/src/sandbox/v2.rs`); the deleted daemon's script.rs is the
 one place a run is made. A script is given the command's whole environment with what cargo
 sets for scripts over it (`CARGO_*`, `DEP_*`, `OUT_DIR`, `TARGET`, `PROFILE`, ...), as cargo
 gives it (`script.rs`, `inherited`). The variables are the command's, not those of whoever
@@ -866,7 +655,7 @@ workspace's root manifest, pinned by its digest, in place of a variable each mac
 
 ```toml
 [workspace.metadata.blaze.native.llvm]
-pin = "crates/hir-ty-codegen/llvm.json"     # the pin file, relative to the root manifest
+pin = "pins/llvm.json"     # the pin file, relative to the root manifest
 env = "LLVM_SYS_231_PREFIX"                 # the variable the script reads the directory from
 packages = ["llvm-sys", "blaze-stencil/llvm-stencils"]
 ```
@@ -892,7 +681,7 @@ cargo or blaze sets, or a loader, shell, make, compiler driver or reproducible b
 
 Before any of the build's units is lowered (or a trace's or verify's view is read), the
 daemon lays out each input the build needs, on an IO thread
-(`crates/blaze-cargo/src/serve/native.rs`): one layout task a digest, shared by every job
+(the deleted daemon's native.rs): one layout task a digest, shared by every job
 asking it whatever it names the input, so the daemon never waits on its own lock; a wait for
 another process laying out the same digest stops once every job waiting on it is cancelled or
 ended (one job's cancel never fails another that joined it). The
@@ -1026,7 +815,7 @@ blaze's MIR evaluator (`crates/blaze-macro-eval`,
 macro's code too, on the same machine and server, and stays as const eval's and as the
 reference the module's output is tested against (`crates/blaze-macro-eval/tests/wasm.rs`). A
 build never runs a macro on it: a proc macro that reaches a build built for the host is an
-error naming it (`crates/blaze-cargo/src/serve/unit/compile.rs`, `macros`).
+error naming it (the deleted daemon's compile.rs, `macros`).
 
 v1 could compile a build script for `wasm32-wasip1` and run it under Wasmtime (`wasi-compare`,
 `wasi-build-scripts`), and could expand with rust-analyzer's out-of-process proc-macro server.
@@ -1042,7 +831,7 @@ the tests and sends each result, which the client prints in libtest's format. Ea
 in a process of its own, forked from its binary's fork server, on one queue over every binary
 and every core (`crates/blaze-usercode/src/test/queue.rs`). blaze-testsel's machine
 (`crates/blaze-testsel`, [v2/plan/design/test-selection.md](v2/plan/design/test-selection.md))
-decides which run (`crates/blaze-cargo/src/serve/unit/test.rs` performs what it asks). A pass
+decides which run (the deleted daemon's test.rs performs what it asks). A pass
 is kept in the store under two things: the functions the test executed, each with its bound
 code (a byte per function slot that the runtime writes on the slot's first call), and what it
 read, in the sandbox. When none of those changed, the test is not run. Its kept pass stands,
@@ -1157,22 +946,9 @@ a terminal each test executable's stdout comes through blaze, which writes it on
 reads libtest's result lines from it.
 
 v1's test cache is gone with v1: `BLAZE_TESTS` (`affected`, `verify`, `all`),
-`BLAZE_TESTS_FROM`, its environment setting, `blaze test --why`, and the `tests-passed`,
+BLAZE_TESTS_FROM, its environment setting, `blaze test --why`, and the `tests-passed`,
 `tests-programs` and `target/blaze/tests.ndjson` files it wrote. No v2 crate reads or writes
 them.
-
-### Tests are hermetic, or say why not (v1, not in v2)
-
-v1 read each test from the code it compiled, found what it reached that its code did not
-decide (files, the environment, the network, processes, foreign code, assembly, mutable
-statics, the clock, randomness, threads) and kept the pass of a test that reached none by its
-code alone, writing what it found to `target/blaze/tests.ndjson` and
-`tests.summary.json` (`blaze test --why`). The walk is still in
-`crates/hir-ty-codegen/fncache.rs` (`tests_reach`), but nothing in v2 calls it; v2 keeps a
-pass by the functions the test executed and what it read ([above](#which-tests-run)).
-
-v1 also started a spare worker while cargo built, to be ready to patch rustc's executable
-(`BLAZE_SPARE`); v2 runs no cargo build and has no spare worker.
 
 ## blaze never builds with cargo
 
@@ -1193,317 +969,11 @@ one alone, and a `test_harness` example is built as a test under its own libtest
 rustdoc's `--test` builds it. A unit blaze can't build fails alone: unless
 `--fail-fast`, every other unit's tests still run, and the end names the doc tests it held back. The design and what is left are in [v2/plan/doctests.md](v2/plan/design/doctests.md).
 
-## The daemon
-
-There is one daemon per user, `blaze serve` (`crates/blaze-cargo/src/serve.rs`). The first
-`blaze` that finds nothing listening starts it in a process group of its own, so it outlives
-the command, and waits on a pipe (`--ready-fd`) the daemon writes a byte to as it enters each
-phase of its start (reading its state, setting up its store), then a newline once its socket is
-bound; the command connects only after that newline, and gives each phase 60 s. A start that
-stops short is an error naming the phase it reached and, when the daemon ended, its exit code
-or signal; or systemd or launchd start it on the first connection
-after `blaze daemon install` (socket activation; `blaze daemon uninstall` removes the units). It stops on
-`blaze stop` or SIGTERM, letting go of its socket first and then writing its state; by itself
-only when idle with no client or launcher connected (`crates/blaze-cargo/src/serve/idle.rs`:
-after 30 s if it never built, after 600 s otherwise), or, started with
-`BLAZE_DAEMON_EXIT_UNHELD`, once no connection has been open for that grace
-(`crates/blaze-cargo/src/serve/unheld.rs`; it ends with exit status 78, `UNHELD`). `blaze stop` and `blaze status` say `no daemon is running` only when nothing listens at the
-socket and no daemon holds the state either: the state's lock (`serve.lock`, held by the kernel
-for the daemon's life, naming its pid) is asked, never the socket alone, since the socket's
-path follows `XDG_RUNTIME_DIR` and the state's does not. A daemon that holds the state and
-does not listen at the command's socket is an error naming its pid, its lock and the socket;
-one that answers in another API schema (another build of blaze) is said to be running, with
-its schema and pid and what stops it (`absent` and `other_schema` in
-`crates/blaze-cargo/src/cli/daemon.rs`).
-
-A daemon holds `serve.lock` in its state directory, which names its pid, for as long as it runs.
-One started while the one before it still ends (writing its image) says so on the pipe and
-waits at most 300 s for that lock, then stops with an error naming the other's pid; it never
-starts over a live daemon. Two commands that start a daemon at once race the same way: the
-second's daemon, finding the first listening at its socket while it waits, ends at once with
-exit status 79 (`SERVED`), and its command connects to the first. A listener removes its socket's file only while that file is still
-the socket it bound, so an ending daemon never removes the next one's. A command that finds a
-daemon of another build tells it to stop and waits for its process to end before starting
-its own.
-
-It is one process, with no workers: one loop holds the API server, the watched files, the
-database, the store and the scheduler, for every workspace and checkout it is asked about.
-What it may hold is the machine's memory less a margin of 1 GiB: the least of what the
-machine has, the control group's limit on Linux and the process's `RLIMIT_AS`, less what is
-in use there (`blaze_graph::arena::machine_budget`); where none can be read it stops with an
-error. `blaze status` prints:
-
-    pid: 10969
-    requests: 1 (7)
-    views: 2
-    memory: 1.3 GiB of 30.1 GiB
-    bugs: 0
-    builds: 1
-      #7 test (2 min 05 s): waits for its pinned native inputs, 1 of 1 layouts left
-        downloading llvm-21.1-aarch64-apple-darwin.tar.xz: 34.0 of 410.0 MB (8%), 2.1 MB/s, 3 min 00 s left
-    downloads: 1
-      llvm-21.1-aarch64-apple-darwin.tar.xz: 34.0 of 410.0 MB (8%), 2.1 MB/s, 3 min 00 s left
-        from https://…/llvm-21.1-aarch64-apple-darwin.tar.xz
-
-the requests it is answering, how many views (a workspace at a checkout) it holds, and what it
-holds of its budget; then each build a client waits on, as the daemon looks at it once a
-second (its request, command and age, where it is, and for each thread working for it the
-outermost and innermost open span with their ages), and every download in flight with its
-progress. `blaze status --json` prints one object instead, for a script or an agent,
-and starts no daemon:
-
-    {"format":1,"version":"blaze 0.1.0 (...)","api_schema":41,"home":"/Users/me/.cache/blaze","state":"/Users/me/.cache/blaze/v2","socket":"/Users/me/.cache/blaze/v2.sock","daemon":{"pid":10969,"build":"<64 hex>","exe":"/usr/local/bin/blaze","uptime_ms":5230000,"memory_bytes":1395864371,"budget_bytes":32319628083,"bugs":0,"requests":[7],"views":2,"history":null,"settings":{"BLAZE_DAEMON_MEMORY_GB":null},"builds":[],"downloads":[]}}
-
-`format` is the object's own shape (a new number when a field changes meaning or goes);
-`version` and `api_schema` are this blaze's (`blaze --version`, the daemon API's schema);
-`home` is blaze's root (`BLAZE_HOME`, else `blaze` in the user's cache directory), `state` the
-daemon's directory under it and `socket` where the CLI connects. `daemon` is `null` when none
-answers; else its pid, the hash of its executable as it started (`build`) and that file, how
-long it has run, its memory and budget in bytes, the bugs it went on past (every site's summed;
-the human `blaze status` lists each), the requests under way, its views, the profile history's
-last error, the settings it was started with, its `builds` (`id`, `what`, `phase`, `spans`,
-`for_ms`) and its `downloads` (`what`, `url`, `done`, `total`, `rate`, `idle_ms`,
-`elapsed_ms`). `blaze toolchain --json` is the same for the
-Rust blaze builds with: `{"name","nightly","rustc","release","commit","host","sysroot"}`, the
-host's tuple among them, what a script asks instead of `rustc -vV`
-([toolchain.md](toolchain.md)).
-
-A build whose tasks run while no span closes, no query completes and no task or step ends for
-the stall bound fails with an error naming what each thread is inside, and the daemon stops
-([profiling.md](profiling.md#the-stall-watchdog)). The bound is 120 s; `blaze serve
---stall-bound SECS` sets another, for a daemon started by hand (`blaze stop` first) on a host
-so loaded that one piece of work can go that long with nothing else moving.
-
-### A build with nothing changed
-
-A `build` or `check` of a checkout (and the build of `run`, `test` and `bench`) with nothing
-changed is answered as the checkout's last one was: its warnings byte for byte, its units and
-its artifacts, with no plan, lowering, task or store commit (`serve/job/noop.rs`). The daemon's
-span `no-op answer` is the whole of it, and the answer's `Work` has no `build_id`
-(`"build_id":null` with `--message-format json`): no build ran, so the client sends no rows.
-
-The answer said again is that of a build that walked every unit and made nothing, so the
-first build after a change builds, the next walks and is kept, and each one after is
-answered. It is said again only while every input of that walk is as it was:
-
-| Input | Covered by |
-|---|---|
-| The checkout's files (sources, manifests, lock file, config in it) | the view's root, which the checkout's watcher commits before the request is seen |
-| Command, arguments, directory, the request's whole environment, config files outside the checkout, fetched sources and path dependencies, toolchain, blaze's version | the view's config, by its bytes |
-| `-v`, `--goal` | the request's own hash |
-| How the client is shown diagnostics (colors, width, `--message-format`, `--refused`) | no input of what is built: an answer with no diagnostic is said again to any client; one with diagnostics walks, and the walk draws them for that client from the units' records and compiles nothing (`serve/unit/drawn.rs`) |
-| Paths outside the checkout a build script, proc macro or `include!` read | the watches outside views heard nothing since the kept walk began, and that walk looked at no such path on the disk; a path named through symlinks (the macOS SDK's `libm.tbd`) is watched at each link and at the file they end at |
-| Path dependencies outside the checkout | each one's watch vouches for it; one named through a link, or a single file, is read again by every build |
-| A manifest above the checkout that is not there | looked at as the request is asked |
-| The outputs, the standard library's among them | each directory they are in (a profile's or a target's under the build directories, one build's under the daemon's `std` place) has been watched since before the kept walk and heard nothing; a `blaze run`'s launch writes none of them |
-| Layout profiles (`<target>/layout`) | watched when there, looked at when not |
-| Other jobs | none is under way |
-
-A request is held until its checkout's watcher and the watches outside it have heard every
-change made before it (the span `the request waits for the watches to hear every change made
-before it`), so an edit saved just before the request is seen. What is not covered walks, which
-is the whole build: a build whose walk listed a directory or read an unwatched path outside
-the checkout, one with `-C profile-use`, one whose outputs are named through a symlink, and one
-with `BLAZE_PROFILE` set (there is then a build to trace). `blaze why` after a build that
-walked and computed nothing names the input that moved or that nothing covers.
-
-### The client's share, and building on save (specified 2026-11-11, not built)
-
-Measured 2026-11-10 on a 32-core Linux VM: a no-op `blaze build` took 92 to 110 ms of which
-the daemon's answer was 0.4 ms. The rest is the `blaze` process: its start, its command line,
-finding the pin and the daemon, and its exit. Two changes take that away; neither is built.
-
-**`blaze` asks before it sets anything up.** `blaze-fast` (docs/client.md) is already the
-client with nothing else in it: it connects to the daemon's socket, sends one request and
-prints the answers. `blaze build|check|run|test` with only the options `blaze-fast` reads
-takes the same path as its first act: before tracing, before the allocator's tags, before
-the pin and toolchain are looked for, it resolves the daemon's socket for its directory
-(`blaze_client::start`'s lookup, no launch), and when a daemon of its own version answers it
-is the client and nothing more. With no daemon, a daemon of another version, or a word
-`blaze-fast` refuses, it goes on as today; this is one command's two entry points, not a
-fallback, and what it prints is the same bytes either way. The budget: a no-op `blaze build`
-within 5 ms of the daemon's answer, held by budgets.py's no-op row once built.
-
-**The daemon builds when a watched file is saved.** The daemon already watches each open
-checkout. When its watcher commits a change to a source file, the daemon starts the build
-the checkout's last request asked for (the same command, arguments and environment: the
-view's config), so the `blaze build` or `blaze run` typed afterwards finds the answer kept
-and is the no-op lane's. The policy:
-
-- Which build: the checkout's last successful or failed `build`, `check`, `run` or `test`
-  request, once; a checkout nothing has built is not built.
-- On by default for a checkout with a request in the last ten minutes, off with
-  `[blaze] build-on-save = false` in `.cargo/config.toml` (specified, not built: no code
-  reads the setting yet); it
-  never runs the program or a test, only their build.
-- Debounced: it starts 20 ms after the last change the watcher heard, on the daemon's
-  injected clock.
-- Cancellable: a later change sets the job's stop flag (the one a request's cancel sets) and
-  the build starts again from the new view; a request for the same build that arrives while
-  it runs joins it and takes its answer. Each wait has a bound and a typed end
-  (`bounded-progress`): started, joined, cancelled by a change, or refused.
-- With a live `blaze run` session the save's build is the session's patch: the daemon builds
-  and patches the running program without a request, as `blaze run` does on its own rebuild.
-- It is a job like any other to admission and memory: it yields its workers to a request
-  that arrives for another checkout.
-
-Proof when built: a deterministic simulation over the watcher's core (changes, the clock, a
-request arriving before, during and after the save's build) whose oracle is that every
-request's answer is the answer of a build of the view it was asked at, with a planted bug
-that answers from the view before the last change.
-
-### Cores and priority
-
-By default blaze leaves two cores to the rest of the machine and runs at background priority,
-so a long build does not freeze the desktop (on 2026-11-03 a release build at every core and
-normal priority took an 18-core Mac to load 154 and froze its GUI). `BLAZE_CORES` says
-otherwise:
-
-| `BLAZE_CORES` | Cores | Priority |
-|---|---|---|
-| unset (or empty) | the machine's less 2, at least 1 | background |
-| `all` | every core | normal (CI and ix VMs set this) |
-| `n`, a whole number of 1 or more | exactly `n` | background |
-
-Anything else is an error naming the variable, the value and what it takes. The budget sizes
-the daemon's plane, its worker pool, test runs (a test binary's `--test-threads` is taken from
-the same budget as the processes running beside it) and the `NUM_JOBS` a build script's `cc`
-is told (a quarter of the budget: blaze has no jobserver to share, and scripts often run a
-few at once). `blaze test` on a terminal runs a quarter of the budget's test binaries at once,
-each with `RUST_TEST_THREADS` at a quarter, unless the command sets `RUST_TEST_THREADS`
-itself. Background priority is nice 10 (`setpriority`), which every thread and child process
-inherits; on macOS the worker pool's threads also drop from `user-initiated` to the `default`
-QoS class. macOS's own background state (`PRIO_DARWIN_BG`) is not used: it throttles disk and
-network IO and keeps the work on the efficiency cores. A priority blaze cannot lower is a
-warning naming the call and errno, and the build goes on at the priority it started with.
-
-The client and the daemon each read it once, as they start (`blaze_core::cores`). A daemon's
-budget and priority are fixed for its life, so a command that sets a `BLAZE_CORES` giving
-another budget or priority than the running daemon's is refused before any request, in one
-error with every other daemon setting it differs in; `blaze stop` and run it again, and the
-daemon that command starts takes its setting. A command that leaves it unset runs on the
-daemon's. A daemon systemd or launchd starts (`blaze daemon install`) reads its unit's
-environment, which captures the installing shell's `BLAZE_CORES`.
-
-### Files
-
-The socket is `v2.sock` in `$BLAZE_HOME` if set, else `$XDG_RUNTIME_DIR/blaze`, else
-`~/.cache/blaze` (`blaze serve --socket PATH` names another). What outlives the daemon (the
-watched files' journal, the database's image, the store, the scheduler's estimates) and its log
-`serve.log` are in `$BLAZE_HOME/v2`, else `$XDG_CACHE_HOME/blaze/v2`, else `~/.cache/blaze/v2`,
-never in `XDG_RUNTIME_DIR`, which does not outlive the session. The directories must belong to
-you and be closed to group and others (mode 0700); otherwise the client and the daemon refuse
-to use them. The socket is 0600, and a connection from another user is refused before its
-request is read. `blaze serve --http ADDR` listens on TCP as well, only with a bearer token in
-`BLAZE_API_TOKEN`.
-
-In a project, the daemon writes the programs and test executables where cargo would in the
-workspace's build directory, under `<profile>/` there.
-
-#### Files that outlive a version
-
-The rule (persisted-state-round-trips): a file one blaze writes and another version of blaze can
-find has a test that a file of its previous layout is handled: refused by name with what to do,
-read, or left alone under a name of its own. Never a refusal to start that names nothing, and
-never bytes of one layout read as another's. A new persisted file adds its row here with its test.
-
-| File | Where | Written by | Layout marker | A blaze of another layout | Test |
-|---|---|---|---|---|---|
-| The machine's memory ledger | `/tmp/blaze-<uid>/machine.<layout>` (outside every home) | every daemon of the user, under its `flock` | the layout in the file's name and in its header (`blzledgr`, a `u32`) | left alone: each layout has a file of its own, so daemons of two layouts share no budget and neither refuses to start; bytes of another layout under this name are refused naming the file, both layouts and "stop every blaze daemon of this user, then remove" it | `a_file_of_the_previous_layout_is_left_alone`, `a_file_of_the_previous_layout_is_refused_by_name_under_this_layouts_name` (`crates/blaze-cargo/src/serve/machine.rs`); `a_file_of_the_layout_before_the_lease_is_refused_naming_both_layouts` (`crates/blaze-graph/src/ledger/tests.rs`) |
-| The daemon's socket | `<home>/v2.sock` | the daemon | the API's schema number, in every frame | refused by name: the client says both schemas and builds; a daemon of another build is stopped and this one started | `another_schema_is_refused_by_name` (`crates/blaze-api/src/client/tests.rs`), `a_daemon_of_another_schema_is_refused_naming_both` (`crates/blaze-cargo/src/cli/daemon/tests.rs`) |
-| A unit's record | the store, under the unit's key | the daemon | the record format's number in the domain of its key (`RECORD` in `serve/unit/compile.rs`; 12: it holds what the unit said, drawn for each client as it is answered) | left alone: a record of another format is under a key no lookup of this blaze makes; its bytes read as this format's are refused naming the unit and the key, never read as a unit that said nothing | `a_record_of_the_layout_before_is_refused_and_never_read_as_empty`, `a_record_of_what_a_unit_said_restores_to_it` (`crates/blaze-cargo/src/serve/unit/tests/drawn.rs`) |
-| The state directory | `<home>/v2` | the daemon | the `v2` in its name | left alone: another generation of the daemon's state has another directory | none: the name is the marker |
-| The store's head, indexes and packs | `<home>/v2/store` | the store | a format number in the head and in each index | refused by name: the store is broken naming the file and both formats, never migrated | `a_head_of_another_format_is_refused_by_name`, `a_store_of_the_format_before_block_checks_is_refused_naming_both` (`crates/blaze-cas/src/tests.rs`) |
-| The daemon image (database, symbols, the plane's history, the estimates) | `<home>/v2/db` | the daemon's stop | the schema hash of each section; the estimates' magic | starts cold saying why (a section of another schema), and a damaged one is a fault | `an_image_of_another_layout_starts_cold_and_a_damaged_one_is_a_fault` (`crates/blaze-cargo/src/serve/daemon.rs`), `a_history_of_another_blaze_or_none_starts_empty_saying_why` (`crates/blaze-cargo/src/serve/image.rs`) |
-| The profile history's manifest | `<home>/v2/profile/manifest.json` | the daemon's flushes and merges | `format` | read: formats from the oldest still read up to this one, rewritten as this one at the next commit; any other refused naming both | `a_manifest_reads_back_what_it_consumed_byte_for_byte` (`crates/blaze-profile/src/history/manifest.rs`) |
-| The flight recorder's mapped rings and the crash record | beside the profile history, `<home>/v2/profile` | every blaze process | a magic and a layout number | refused naming its file; its rows are not recovered | `a_mapping_of_another_layout_is_refused_naming_its_file` (`crates/blaze-profile/src/flight/postmortem.rs`), `a_record_of_another_layout_or_blaze_is_refused` (`crates/blaze-profile/src/crash.rs`) |
-| The collector's ledger | `<home>/v2/gc-ledger.json` | the daemon's collector | `format` | refused by name (the file and both formats) in the log and in status, then a new ledger is started | `a_file_of_the_previous_layout_is_refused_by_name` (`crates/blaze-gc/src/ledger.rs`) |
-| The why ledger | under `<home>/v2` | the daemon | a magic that ends in the blaze version's hash (records are zstd frames from version 4) | moved aside as another version's, never written over | the `Fault::Version` case in `crates/blaze-cargo/src/serve/why.rs`'s tests |
-| A flight recording | `<home>/v2/flightrec/<pid>-<ms>.cbor` | the daemon | a magic and a format number | format 1 (the CBOR as it is) is read; format 2 is the same CBOR as one zstd frame; any other is refused naming both formats | `a_file_of_format_1_reads_as_the_recording_it_is`, `a_file_of_another_format_is_refused_naming_both` (`crates/blaze-cargo/src/serve/flightrec.rs`) |
-| The daemon's log | `<home>/v2/serve.log`, and `serve.log.1` before it | the daemon's standard error | none: lines of text | read by every version; rotated at 8 MiB, the two kept to 16 MiB | `the_log_and_the_one_before_it_stay_within_the_cap` (`crates/blaze-cargo/src/serve/log.rs`) |
-| The daemon's lock | `<home>/v2/serve.lock` | the daemon | none: a pid and ` stopped` as text | read by every version | none yet |
-| The performance history's run rows | the build directory | `blaze perf record` | `format` in each row | refused naming the file, the run and both formats, with what to do (record it again) | none yet |
-| Build directories and fetched sources | `<home>/build`, `<home>/sources` | the daemon | none, on purpose: they keep their place across the daemon's formats | read | none: their contents are checked by content hash |
-
-### Where a build writes
-
-blaze writes no build file into the checkout: there is no `./target`. A workspace builds into
-`<root>/build/<name>-<id>`, where `<root>` is blaze's root on the machine (`$BLAZE_HOME`, else
-`blaze` in `$XDG_CACHE_HOME`, else `~/.cache/blaze`; the daemon's state is `v2/` beside it),
-`<name>` is the last part of the workspace root's path and `<id>` is the first 32 hex digits of
-the BLAKE3 of that path (domain `blaze workspace build dir 1`,
-`crates/blaze-manifest/src/home.rs`). Two checkouts of one repository, worktrees among them,
-get two directories; a lane needs no `CARGO_TARGET_DIR` of its own. The directory has no `v2/`
-on purpose: it is the user's to open and delete, not the daemon's state.
-
-The directory holds what has to be a real path: build scripts' `OUT_DIR`s, the executables
-that are run (programs, tests, build scripts) and the `doc` pages a user opens. What is
-addressed by content lives in the store. An output of 16 KiB or more (a library, an executable,
-a test) is placed in the directory as a clone of the store's read-only copy of its bytes
-([v2-store.md](v2/plan/design/store.md)), so a second checkout of the same project adds
-only the blocks its own outputs differ in; a volume that cannot clone (or a build directory on
-another volume than the store) fails the build, naming both volumes, and nothing is copied
-instead. Each build reports the bytes it placed by clone, wrote and copied in its `blaze-work`
-line (`placed`). `OUT_DIR`s are still written whole on restore and `doc` pages by the client.
-
-The packages a build fetches (registry `.crate`s and git checkouts) are kept in `<root>/sources`,
-laid out as cargo lays out its home (`registry/src/<registry dir>/<name>-<version>`,
-`git/checkouts/<ident>/<commit>`, the whole commit where cargo takes a short one): each is
-mounted there for the front end and written there whole at its fetch (into a directory beside
-it, its files read-only, then renamed), because a build script runs in its package's directory,
-and its sandbox is given that directory, as are the C compiler and the other programs it runs.
-The last file written into each is `.blaze-ok`, the content id of its files: a copy without it
-or with another id (edited in place, written by another fetch) is refused by name, never read
-as the package. A write is refused anywhere but under `registry/src/` and `git/checkouts/` of
-`<root>/sources`, and a lock file's package name that cargo refuses, or a git commit that is no
-object id, is refused before any fetch. blaze keeps no packages in `$CARGO_HOME` (it still
-reads `$CARGO_HOME/config.toml`, as cargo does): a machine with no `~/.cargo` builds the same.
-A package whose copy was deleted is fetched again at the daemon's next start, and a write a
-stopped daemon left half done (`.<name>.part-<pid>-<n>`) is removed then
-(`crates/blaze-cargo/src/serve/fetch.rs`, `keep_on_disk` and `sweep_parts`).
-
-`--target-dir`, `CARGO_TARGET_DIR` and `build.target-dir` still name the directory, as tools
-and scripts pass them; `build.build-dir` still names where the intermediate files go. The paths
-blaze prints (a test executable, `blaze doc`'s pages) are the real ones, and `cargo metadata`'s
-`target_directory` and `build_directory` (as `crates/blaze-metadata` makes them) name the same
-directory, so rust-analyzer and editors look there.
-
-The daemon tells when its watch of a checkout has caught up with a request by flushing the
-watch, so it writes no sync file into the checkout either (`crates/blaze-cargo/src/serve/heads.rs`).
-On macOS the flush is a cookie in a directory of the watch's own, outside the checkout; on
-Linux io_uring drains the watch's queue. On Windows the checkout's watch reads the volume's
-NTFS USN journal (unprivileged, Windows 10 1709 or later), and a flush is the journal's own
-position: the driver asks where the journal ends (`FSCTL_QUERY_USN_JOURNAL`) after the request
-arrived and holds the request until the watch has told every record before it
-(`crates/blaze-core/src/journal/barrier.rs`). A file a program still holds open and writes is
-heard as it is first written and as it is closed, not at each write. A checkout on a network
-share, on a volume with no USN journal (FAT, exFAT) or on one whose journal was never made
-can't be watched: each request on it fails, naming the checkout and why (the last says how an
-administrator makes the journal).
-
-`blaze clean` is normally not needed: the daemon collects what is unused on its own, and works
-harder the fuller the disk gets, so free space stays above its floor without anyone asking
-([gc.md](gc.md#pacing-how-hard-it-works)). It stays as an escape hatch. It removes the
-workspace's build directory (the one named by `--target-dir` or the
-configuration, if one is), with `--dry-run` and cargo's `Removed` summary. `blaze clean --list`
-prints every workspace's directory under blaze's root with its size, whether a build holds it,
-when it was last used and its checkout, and `blaze clean --all` removes them all. A directory a
-build holds is refused, naming it. Only a directory that is no symlink, is not the same directory as (by device and inode) and
-does not hold the checkout, `$HOME`, `/` or the current directory, and carries a build directory's mark (blaze's
-lease or record, or a `CACHEDIR.TAG` with its signature) is removed: renamed away and unlinked
-while its lease is held ([gc.md](gc.md#commands)). `blaze cache gc` runs one collection now,
-and `blaze cache gc --dry-run` shows each volume's free space, its levels and what would go
-([gc.md](gc.md)).
-
-The store is always on: one per daemon, in `$BLAZE_HOME/v2/store`, the user's alone (the
-daemon refuses one another user owns or others may write to;
-[v2/plan/lanes/store.md](v2/plan/design/store.md)).
-
 ## blaze prove
 
 `blaze prove` checks the proofs of a crate's theorem functions with Lean
 ([v2/plan/design/proofs-for-sans-io.md](v2/plan/design/proofs-for-sans-io.md), section 5;
-`crates/blaze-cargo/src/cli/prove.rs`, `crates/blaze-cargo/src/serve/unit/prove.rs`). It takes
+`crates/blaze-cargo/src/cli/prove.rs`, the deleted daemon's prove.rs). It takes
 the package and target flags of `blaze check` and proves the library crates that check would
 check, without `cfg(test)`. Nothing is compiled: the daemon builds only the proc macros and
 build scripts' runs the front end applies, as `blaze reach` does.
@@ -1645,7 +1115,7 @@ the assets. `--manifest-path` picks the workspace a command is for, as it does f
 A build of blaze's source tree (`blaze 0.0.0-dev`, built without `BLAZE_RELEASE`) runs itself
 in blaze's own tree, whatever that pins: that is how blaze's tree, which pins a release for
 everyone else, builds itself. blaze's tree is any workspace whose root holds
-`crates/blaze-engine/Cargo.toml` naming the package `blaze-engine`, wherever it is (a worktree,
+blaze-engine's Cargo.toml naming the package `blaze-engine`, wherever it is (a worktree,
 a copy in a VM, the source of a Nix build, a fork). In any other workspace that pins a release
 it hands off to that release as a release does, with one line on stderr naming its own
 version, the pin and the manifest, and saying `--ignore-pin` runs it instead.
@@ -1655,7 +1125,7 @@ build of blaze is tried on a pinned project. Anywhere else it is the command's o
 (`blaze run --bin tool x --ignore-pin` passes it to `tool`). It applies to that one command's
 workspace: blaze sets `BLAZE_IGNORE_PIN_FOR` to its root manifest for the processes under it, so
 a blaze a test or build script runs there (`$CARGO`) runs itself too, and one run in another
-workspace (a test's temporary one) follows that workspace's pin. Likewise `BLAZE_PINNED_BY`,
+workspace (a test's temporary one) follows that workspace's pin. Likewise BLAZE_PINNED_BY,
 which the blaze that hands off sets for the release it runs, holds only in the workspace it
 names.
 
@@ -1715,20 +1185,18 @@ whichever command started it; to change one there, run `blaze stop` first):
 | Variable | Meaning | Default |
 |---|---|---|
 | `BLAZE_LEAN_PROVER` | the `lean` executable `blaze prove` checks proofs with, an absolute path, of the Lean `lean/lean-toolchain` pins; read by the client and sent with the request ([blaze prove](#blaze-prove)) | unset: `blaze prove` fails unless `--emit` |
-| `BLAZE_HOME` | the daemon's socket and state directory, and blaze's releases and settings; not its toolchains ([Files](#files), [Install](#install)) | see there |
+| `BLAZE_HOME` | the daemon's socket and state directory, and blaze's releases and settings; not its toolchains ([Install](#install)) | see there |
 | `BLAZE_TOOLCHAINS` | the directory blaze keeps the Rust it builds with in, shared by every `BLAZE_HOME` ([toolchain.md](toolchain.md)) | `.blaze/toolchains` in the user's home (`HOME`, else the system's record of the user) |
 | `BLAZE_RUST_DIST` | where the pinned nightly's components come from: a URL, or a directory of them ([Install](#install)) | rust-lang's dist server, at the pinned date |
 | `BLAZE_RELEASES` | a mirror of blaze's releases ([below](#pinning-a-release-of-blaze)) | `https://blaze-releases.ix.dev` |
-| `BLAZE_API_TOKEN` | the bearer token `blaze serve --http` requires ([Files](#files)) | none: `--http` refuses to start |
-| `BLAZE_CORES` | how many cores blaze's work runs on and at what priority: unset, the machine's less 2 at background priority; `all`, every core at normal priority; `n`, exactly `n` at background priority. A command that sets a value giving another budget or priority than the running daemon's is refused ([Cores and priority](#cores-and-priority)) | unset |
-| `BLAZE_DAEMON_EXIT_UNHELD` | the daemon stops itself once no client or launcher connection has been open at its socket for a grace: `on` for 20 s, or a whole number of seconds above 0. It never stops while one is open, a connection inside the grace ends the countdown, and it stops as `blaze stop` does (writing its image), logging why and ending with exit status 78 (`UNHELD`). For test runs and scripts whose clients may be killed before they could stop it. A daemon setting: a command that sets another value than the running daemon's is refused ([The daemon](#the-daemon)) | unset: it exits only as below |
+| `BLAZE_CORES` | how many cores blaze's work runs on and at what priority: unset, the machine's less 2 at background priority; `all`, every core at normal priority; `n`, exactly `n` at background priority. A command that sets a value giving another budget or priority than the running daemon's is refused | unset |
 | `BLAZE_EMIT` | LLVM instruction selection: `optimized` or `fast`. It is in no unit's key, so code the store kept under one value is used under the other | `optimized`; `fast` at level 0 |
 
 `BLAZE_BACKEND`, `BLAZE_OPT` and `BLAZE_INLINE` are not settings in v2. They change the code
 made without being part of a unit's key, so set in the daemon's environment they fail every
 unit, naming the variable (`crates/hir-ty-codegen/v2/backend.rs`, `CHANGES_CODE`); the profile
 picks the backend ([below](#backends)). v1's splice setting, its build-script runner's,
-`BLAZE_TESTS`, `BLAZE_TESTS_FROM`, `BLAZE_IDLE_SECS`, `BLAZE_MEMORY_MAX`,
+`BLAZE_TESTS`, BLAZE_TESTS_FROM, BLAZE_IDLE_SECS, BLAZE_MEMORY_MAX,
 `BLAZE_MEMORY_BUDGET`, `BLAZE_SPARE` and `BLAZE_LRU` are read by nothing in v2.
 
 ## Backends
@@ -1798,7 +1266,7 @@ it is in [platforms.md](platforms.md). The rest of this section is a record of v
 names nor the splice is in v2.
 
 What was run under v1, on an 8-CPU Apple M4 virtual machine with macOS 26.5 and Rust 1.99.0:
-`harness/blaze_cli.py --small`, under Cranelift and under LLVM (`BLAZE_OPT=2`,
+harness/blaze_cli.py `--small` (deleted since), under Cranelift and under LLVM (`BLAZE_OPT=2`,
 `BLAZE_EMIT=fast`). Under each it passed: ripgrep, fd and hyperfine gave the same output,
 exit status and test results as cargo alone on every step of both modes (134 comparisons),
 and the 101 checks of the flags, the daemon and plain cargo held. Those include the
@@ -1860,12 +1328,12 @@ decide the lock files as a build does ([Lock files](#lock-files)).
 | `verify-project` | yes | `{"success":"true"}`, or `{"invalid":...}` and status 1 |
 | `version`, `help` | yes | blaze's version and help |
 | `fmt` | yes | `crates/blaze-fmt`: rustfmt and cargo-fmt at rust-lang/rust 12433c307 ported onto a syntax tree of blaze's own, filled by rust-analyzer's parser with rustc's spans, run in process. `blaze fmt [--check] [-p NAME]... [--all] [--manifest-path PATH] [-v\|-q] [-- RUSTFMT_ARGS]` formats the targets blaze-manifest reads; `blaze fmt a.rs b.rs` formats files, with rustfmt's options. Measured against stock rustfmt (the pinned nightly's) before the comparison harnesses were deleted (2026-10-30): ripgrep, nushell, fd, helix and biome with their own rustfmt.toml, 6068 of 6068 files byte-equal (100%), and `--check` exit codes and diffs equal; the same with `max_width = 60`, 6068 of 6068 (100%); rustfmt's `tests/source`, 773 of 793 (97.5%; 18 more use line ranges, which it does not run). At blaze-fmt f43e4a20af on dev-aws-14. A file is refused with the reason, and left as it is, when it has nightly syntax rust-analyzer does not parse (postfix `.yield`, `.use` and `.match`, `const` block items, `use` closures, `&pin`, unsafe binders, `unsafe mod`, `mut ref`, `default` on an associated `const fn`), a parenthesized trait object with `+` (`(Foo) + 'static`), a `macro` with a parameter list, an `impl` or `mut` restriction, or a typed `try` block; a non-empty `ignore` option is an error |
-| `clippy` | yes | `crates/blaze-lints`: 24 of clippy's lints ported onto rust-analyzer's analysis, run by the daemon, written as `cargo clippy` writes them; [below](#lints) |
+| `clippy` | yes | blaze-lints (deleted on 2026-11-15): 24 of clippy's lints ported onto rust-analyzer's analysis, run by the daemon, written as `cargo clippy` writes them |
 | `doc` (`d`) | yes | `crates/blaze-doc`: every page from rust-analyzer's HIR, no rustdoc; cargo's flags, `target/doc/<crate>/index.html`, search, source pages, themes. Measured against the pinned nightly's `cargo doc` before the comparison harnesses were deleted (2026-10-30), with their dependencies: fd 100.0% of rustdoc's pages, 99.9% of their members and impls, 99.4% of the resolved links; ripgrep 99.9%, 99.6%, 99.1%; nushell 99.5%, 99.2%, 98.4%; helix 98.9%, 99.0%, 98.7%; biome 99.0%, 99.2%, 98.1%. biome in 92.5 s against `cargo doc`'s 1028.0 s, nushell in 28.4 s against 497.1 s, its build scripts already run ([doc.md](doc.md)). The load still runs cargo for build scripts and proc macros, as every load does; doctests are `blaze test --doc`'s |
 | `tree` | yes | `crates/blaze-tree`, cargo 1.101's `cargo tree` ported onto blaze-resolve: every flag (`-p`, `--workspace`, `--exclude`, `-e`, `-i`, `--prune`, `--depth`, `--prefix`, `--no-dedupe`, `-d`, `-f`, `--target`, `--charset`, `--color`, the feature flags). Measured equal to cargo's before the comparison harnesses were deleted (2026-10-30): 26 forms over ripgrep, fd, helix, nushell and biome, 130 of 130 byte-equal. Package patterns with globs (`-p 'serde*'`) and `-i` with no value are refused |
 | `pkgid` | yes | the package's full spec from `Cargo.lock`, with cargo's errors for none or several matches |
 | `fetch` | yes | every package `Cargo.lock` names, downloaded by blaze-registry. `--target` fetches every platform's, and with no lock file it fails (choosing versions is #321) |
-| `clean` | yes | the workspace's whole build directory under blaze's root ([Where a build writes](#where-a-build-writes)), or the one `--target-dir`, `CARGO_TARGET_DIR` or `build.target-dir` names, and `build.build-dir`'s; `--dry-run`, `--manifest-path` and cargo's `Removed` summary. `--list` prints every workspace's build directory with its size, `--all` removes them all. One profile's (`--release`, `--profile`), `--doc`, `-p`, `--workspace` and `--target` are refused (`crates/blaze-cargo/src/cli/clean.rs`) |
+| `clean` | yes | the workspace's whole build directory under blaze's root, or the one `--target-dir`, `CARGO_TARGET_DIR` or `build.target-dir` names, and `build.build-dir`'s; `--dry-run`, `--manifest-path` and cargo's `Removed` summary. `--list` prints every workspace's build directory with its size, `--all` removes them all. One profile's (`--release`, `--profile`), `--doc`, `-p`, `--workspace` and `--target` are refused (`crates/blaze-cargo/src/cli/clean.rs`) |
 | `new`, `init` | yes | `crates/blaze-new`, cargo 1.101's `ops/cargo_new.rs`: the manifest, source file, ignore file and repository, the workspace's `members`, and cargo's checks of the name. The repository is made by `git init` (or `hg`, `pijul`, `fossil`, as cargo runs them). Cargo runs rustfmt on the file it writes; blaze does not, so a `rustfmt.toml` above the package that would change the template is not applied. Measured equal to cargo's before the comparison harnesses were deleted (2026-10-30): 50 of 50 cases, what each prints and every file it leaves |
 | `new --bstd PATH`, `--rust` | blaze's | A package of the blaze edition ([std](v2/plan/design/std.md#the-blaze-edition-opting-in)): `edition = "blaze-2026.11"`, bstd named at `PATH`, and a `main(cx: &Cx, io: Io)` that writes its line through `Out`. `--rust` is the package of the row above whatever the default; the edition becomes the default when blaze ships bstd (`blaze_new::BSTD_SHIPS`). A release build is told the shipped bstd's digest at compile time in `BLAZE_BSTD_DIGEST` (`blaze_new::BSTD_DIGEST`); a build of the tree has none |
 | `remove` (`rm`) | yes | the dependencies out of the member's manifest, with `toml_edit` keeping its layout and comments, as cargo 1.99's `cargo_remove.rs` and `toml_mut` do: the features that named them, then the `[workspace.dependencies]`, `[profile.*.package]`, `[replace]` and `[patch]` entries nothing uses any more; then the lock file resolved again by blaze with every version it keeps locked as it was (blaze-metadata's `relock`), honouring `--locked`. A workspace with no lock file is refused: writing one chooses versions (#321). Measured equal to cargo's before the comparison harnesses were deleted (2026-10-30), manifests and lock files byte for byte: 43 of 43 cases on ripgrep and a made-up workspace |
@@ -1879,130 +1347,3 @@ decide the lock files as a build does ([Lock files](#lock-files)).
 | `report` | yes | `future-incompatibilities` (`future-incompat`): the report a build left in the build directory, with `--id`, `-p` and `--color`, as cargo 1.99's `future_incompat.rs` prints it. `timings`, `sessions` and `rebuilds` are unstable in cargo: refused as cargo refuses them without `-Z build-analysis`, and with it they fail saying blaze's builds do not write the logs they read. Measured equal to cargo's before the comparison harnesses were deleted (2026-10-30): 23 of 23 cases |
 | `config` | yes | `config get`, by blaze-manifest's port of cargo 1.99's `cargo_config.rs`: `--format toml`, `json` and `json-value`, `--show-origin`, `--merged no`. Unstable in cargo, and refused as cargo refuses it unless `-Z unstable-options`, `unstable.unstable-options` or `CARGO_UNSTABLE_UNSTABLE_OPTIONS` allows it. Measured equal to cargo's before the comparison harnesses were deleted (2026-10-30): 41 of 41 cases |
 | any other | no | `error: no such command`; blaze runs no cargo plugin |
-
-### Lints
-
-v2's `blaze check` runs every lint, rustc's, clippy's and blaze's (`blaze::`), at the levels
-the manifests set: `crates/blaze-lints` runs over each crate of the workspace's packages beside
-its check, with `--cfg clippy` and the `clippy.toml` clippy's search finds; a registry crate is
-checked, not linted. `--fix` makes every machine-applicable suggestion of the check (with
-`--lint NAME`, given any number of times, only those of the lints named), checks the result
-again up to four times, and writes the files only when no check of it has an error the first
-did not; `--fix` checks every target when none is named. It edits only the packages the request
-asked for (`-p`, or the default members): a member or a vendored crate that is checked because
-one of those depends on it keeps its files, and the count of its suggestions is said.
-
-`--allow LINT`, `--warn LINT`, `--deny LINT` and `--forbid LINT` (rustc's long flags, any
-number of times) set a lint's level for every workspace package of the run, after the
-workspace's tables, the ratchet and the package's own `[lints]`, so the command line's level
-is the one that holds: `blaze check --deny blaze::todo`. `LINT` is `tool::name` or one of
-rustc's by its plain name; `blaze::name` must be a lint or group blaze has. No other command
-takes them, and `--allow` and `--warn` of `blaze::unreachable` are refused, as a table that
-sets either is (`unreachable`). A level is one of the unit's lint
-flags, which its plan holds and its check's kept results are keyed by.
-
-Once every unit ends, `blaze check` lints each workspace package's items over every
-configuration it checked (the lib, the lib as a test, each bin, test, bench and example):
-`blaze::dead` when none uses an item (in place of rustc's `dead_code`, which a linted crate's
-own check leaves out), `blaze::test_only` when only the tests do (`--fix` adds `#[cfg(test)]`)
-and `blaze::cfg_only` when only some features or platforms do (with the narrowest exact
-`#[cfg]`). The group `blaze::reach` sets all three; they warn by default. None is given when a
-unit failed. See [the plan](v2/plan/design/multiconfig-check.md).
-
-`--baselines DIR` holds the run's `clippy::` and `blaze::` findings, counted by lint and crate
-(the package of the unit that gave each; a finding a crate's lib and its lib test both give
-counts once), to the baselines checked in under `DIR`: one file per lint,
-`<tool>.<lint>.txt`, with one `crate<TAB>count` line per package that has findings, sorted, and
-a `TARGET` file naming the target triple the counts are of: cfg'd code differs, so a run for
-another target is refused. It needs `--workspace`, one `--target` and no target selection (each
-package's default targets), since a crate or target the run did not check would read as at
-zero.
-The run fails when a crate's count is over its baseline, when a crate the baseline does not
-have has findings, or when a lint has findings and no baseline; and it fails when a count is
-under its baseline, saying to run the same command again with `--bless-baselines`, which lowers
-the baselines to the run's (it never raises one or adds a crate) and deletes one that reaches
-empty, whose lint then moves to `deny`. `--new-baseline LINT[,LINT...]` starts a lint's
-baseline at the run's counts, refusing a lint with no findings or one that has a baseline. A
-baseline holds a lint at `warn`: a `deny` lint's finding fails the check, baselined or not. A
-line may read `crate<TAB>unmeasured`: any count passes it and it is stale, and the bless
-records the run's count in its place or drops the crate at zero. A workspace whose
-`lints-ratchet` names the directory holds each crate a `blaze.<lint>.txt` lists at `warn` on
-that lint and every other crate at `deny` (`the ratchet`).
-
-blaze's own baselines go in crates/blaze-lints/baselines, of `aarch64-unknown-linux-gnu`
-(AGENTS.md rule fix-through-blaze-lints), and the merge gate's `lint-baselines` job holds every
-change to them with the blaze the change builds, on Linux AArch64. Run the same command in an
-arm64 Linux VM (`ix new` gives one by default) to check or bless them; another host's check
-needs that target's C compiler and LLVM for the build scripts, so it is not the same run:
-
-    blaze check --workspace --target aarch64-unknown-linux-gnu --baselines crates/blaze-lints/baselines
-
-Tests are not counted yet: blaze's check of a test target fails for now ("can't find crate for
-`test`"), and once it passes the scope grows to every target and the baselines are made again.
-The `blaze.*.txt` baselines were written on 2026-11-11 with every crate `unmeasured` on every
-lint the ratchet newly denied. `lint-baselines` fails until a run of the command above with
-`--bless-baselines` records them, with `--new-baseline` for each clippy lint that run names as
-having findings and no baseline.
-
-A record of v1 (as of 2026-10-27). v1's `blaze clippy` linted with
-blaze's own lints, `crates/blaze-lints`:
-each a port of one of clippy's, with its file naming the clippy source it follows, keeping its
-messages, spans, suggestions and conditions. The daemon runs them over the crates it loads as
-`blaze check` would, and the client writes them as `cargo clippy` does: rustc's
-rendering, the notes and the docs link, cargo's line ending each crate's warnings with its
-`--fix` hint, `--message-format=json`, and status 0 for warnings, 101 for an error. Levels are
-read as clippy reads them: `#[allow]`, `#[expect]`, `[lints.clippy]`, `clippy.toml`, `-- -W`,
-`-A`, `-D`, `-F clippy::name` and `-D warnings`. A lint blaze has not ported is not run.
-
-The lints, chosen as those stock clippy reported most on the bench apps (ripgrep, fd, helix,
-nushell, biome) so that they cover 90% of what it reported there:
-`bool_assert_comparison`, `byte_char_slices`, `clone_on_copy`, `collapsible_if`,
-`crate_in_macro_def`, `empty_enums`, `get_first`, `io_other_error`, `map_clone`,
-`map_unwrap_or`, `match_like_matches_macro`, `needless_bool`, `needless_borrow`,
-`needless_borrows_for_generic_args`, `needless_return`, `new_without_default`,
-`nonstandard_macro_braces`, `redundant_static_lifetimes`, `single_char_add_str`,
-`unnecessary_map_or`, `upper_case_acronyms`, `useless_borrows_in_formatting`, `useless_format`,
-`useless_vec`, and rustc's `unfulfilled_lint_expectations` for an `#[expect]` nothing met.
-
-They were held to stock clippy by a harness, deleted on 2026-10-30 with the other comparisons
-with rustc and cargo ([harness.md](harness.md)), that ran both with `--message-format=json` and
-compared each diagnostic by lint, file, line and column, then its rendered text, and the exit
-status, over the apps and a crate that exercised every lint. Run on dev-aws-14 on 2026-10-27, with `blaze clippy --workspace --all-targets` against the pinned nightly's
-`cargo clippy --workspace --all-targets --message-format=json`; biome with its `*_analyze`
-packages under `unsandboxed-build-scripts` (they write their lists of rules into their own
-`src`, which blaze's sandbox refuses):
-
-| App | Stock diagnostics | Of the lints ported | Matched | Missed | Extra | Rendered the same | Exit status, stock and blaze |
-|---|---|---|---|---|---|---|---|
-| ripgrep | 676 | 553 | 553 | 0 | 0 | 553 | 0 and 0 |
-| fd | 14 | 14 | 14 | 0 | 0 | 14 | 0 and 0 |
-| helix | 57 | 20 | 20 | 0 | 0 | 20 | 0 and 0 |
-| biome | 971 | 969 | 0 | 969 | 0 | 0 | 0 and 101 |
-| the lint fixture | 53 | 53 | 53 | 0 | 0 | 53 | 101 and 101 |
-
-On ripgrep, fd and helix, 587 of stock's 747 diagnostics (78.6%) are written the same; the 160
-missed are all of lints not ported, most of them `doc_lazy_continuation` (40),
-`explicit_auto_deref` (11) and `derivable_impls` (11).
-
-Over the five apps stock clippy wrote 1718 diagnostics (each counted once, by lint and place),
-1556 of them (90.6%) of the lints ported. Its most frequent: `empty_enums` 540,
-`nonstandard_macro_braces` 276, `bool_assert_comparison` 164,
-`needless_borrows_for_generic_args` 145, `map_unwrap_or` 141, `needless_borrow` 43,
-`redundant_static_lifetimes` 42, `useless_vec` 41, `doc_lazy_continuation` 40 (not ported: it
-needs rustdoc's Markdown reading), `unnecessary_map_or` 30. The diagnostics are the same; what
-cargo writes around them still differs in two ways: blaze writes no `Checking` line, and the
-order the crates finish in, with the `(N duplicates)` count that follows from it, is blaze's.
-
-What is not done:
-
-- biome lints nothing: `blaze check` of it fails in `biome_analyze` and `biome_wasm`
-  with errors stock rustc does not give ([#423](https://github.com/indexable-inc/blaze/issues/423):
-  the trait of an impl a proc-macro derive writes is not in scope in its body), and the crates
-  that depend on one that does not check are not linted, as cargo does not build them.
-- nushell's stock run fails under `--workspace` (a compile error in `ethnum`), so it has no
-  oracle.
-- The deny-by-default (correctness) lints: none fired on the bench apps, and none is ported.
-- `--fix` is refused: blaze does not apply its suggestions yet.
-- Ported in part, each file saying what it leaves out: `needless_borrow` (a receiver, a callee
-  or a field's base, and chains of `&` and `*`), `map_clone` (`Clone::clone` as a path),
-  `needless_borrows_for_generic_args` (bounds through projections or other parameters).

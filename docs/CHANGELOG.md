@@ -570,7 +570,7 @@ since the release before and the title of each change merged since.
   place, as on Unix, instead of being linked again; the daemon wakes the program through a
   named event; and `ra_jit_live::edit` reaches the daemon, so `demo/life`'s editor builds as you
   type. life's edit to running is 26.6 ms at p50 (`socket`) on a Windows 11 desktop
-  ([live.md](live.md#latency-under-typing)). A static with another value still asks for a
+  (live.md, deleted). A static with another value still asks for a
   restart.
 
 - `crates/blaze-build-script`: the environment cargo 1.99.0 gives a build script, computed
@@ -825,7 +825,7 @@ since the release before and the title of each change merged since.
   restart. An edit sends an edited function back to Cranelift in the same build.
   `RA_JIT_TIER=off` turns it off. The Game of Life window shows each hot function's level
   and the promotions as they happen; `demo/lifebench` and `harness/tiers.py` measure and
-  check it ([docs/tiers.md](tiers.md)).
+  check it (tiers.md, deleted).
 - `ra_jit_live::tiers()`, and the sampler that the daemon turns on in a running program.
   It stops once the worker that reads it is gone.
 - Benchmarks on real projects that keep the README current: `harness/bench.py` measures
@@ -880,8 +880,8 @@ since the release before and the title of each change merged since.
   of the callees it keeps calling and of what those call. Level 3 of `demo/lifebench` runs
   at 88% of a release build and 94 to 96% of one that checks overflow as the dev profile
   does, from 71 to 74% and 77 to 81%, measured side by side on a loaded machine
-  ([docs/tiers.md](tiers.md)).
-- `harness/tierbench.py`, the benchmark table of docs/tiers.md; `--together` runs the builds
+  (tiers.md, deleted).
+- `harness/tierbench.py`, the benchmark table of tiers.md; `--together` runs the builds
   of a round at once, so that a loaded machine slows them alike.
 - `RA_JIT_DUMP_LLVM=after` prints the LLVM IR as the passes left it.
 - Live-edit latency under real typing ([#9](https://github.com/indexable-inc/ra-jit/issues/9)):
@@ -894,7 +894,7 @@ since the release before and the title of each change merged since.
   battery, the commit and the run, which `benchhistory.py live` reads. `harness/live-bevy`
   (bevy 0.20, generic systems) and `harness/live-egui` (egui 0.37, generic widgets) are real
   programs that take edits. Measured on a MacBook Pro in
-  [docs/live.md](live.md#latency-under-typing).
+  live.md (deleted).
 - A borrow checker, the crate `hir-ty-borrowck` in the rust-analyzer subtree, written to give
   rustc's verdict: Polonius alpha by default as nightly rustc does, NLL with
   `RA_JIT_BORROWCK=nll`. It gives rustc's errors on
@@ -2273,7 +2273,7 @@ since the release before and the title of each change merged since.
   calls `bcmp`, a `pthread_` function only rustc's inlined code reached) no longer has the
   program linked in full and started over at level 1, after which every later patch of it
   was linked in full too: that function stays where it was, and says why
-  ([docs/tiers.md](tiers.md), "Code no patch can hold").
+  (tiers.md, deleted, "Code no patch can hold").
 - The thread that compiles at a higher level has a stack of 64 MiB, and the bodies a body
   built in shows are ten deep at most: a deep chain of them overflowed the 2 MiB default and
   took the worker down.
@@ -2281,7 +2281,7 @@ since the release before and the title of each change merged since.
   calls `bcmp`, a `pthread_` function only rustc's inlined code reached) no longer has the
   program linked in full and started over at level 1, after which every later patch of it
   was linked in full too: that function stays where it was, and says why
-  ([docs/tiers.md](tiers.md), "Code no patch can hold").
+  (tiers.md, deleted, "Code no patch can hold").
 - The thread that compiles at a higher level has a stack of 64 MiB, and the bodies a body
   built in shows are ten deep at most: a deep chain of them overflowed the 2 MiB default and
   took the worker down.

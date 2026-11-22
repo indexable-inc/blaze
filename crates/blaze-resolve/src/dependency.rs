@@ -4,15 +4,15 @@
 use std::fmt;
 use std::sync::Arc;
 
-use anyhow::Result;
-use cargo_platform::Platform;
-use semver::VersionReq;
-
+use crate::error::ResolveError;
 use crate::interning::InternedString;
 use crate::package_id::PackageId;
+use crate::platform::Platform;
 use crate::source_id::SourceId;
 use crate::summary::Summary;
-use crate::version::OptVersionReq;
+use crate::version::{OptVersionReq, Version, parse_req};
+
+type Result<T, E = ResolveError> = std::result::Result<T, E>;
 
 /// Cheap to clone; changed through its setters, which copy on write.
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
@@ -89,13 +89,10 @@ impl Dependency {
     ) -> Result<Dependency> {
         let name = name.into();
         let (specified_req, version_req) = match version {
-            Some(v) => match VersionReq::parse(v) {
+            Some(v) => match parse_req(v) {
                 Ok(req) => (true, OptVersionReq::Req(req)),
-                Err(err) => {
-                    return Err(anyhow::Error::new(err).context(format!(
-                        "failed to parse the version requirement `{}` for dependency `{}`",
-                        v, name,
-                    )));
+                Err(error) => {
+                    return Err(ResolveError::DependencyReq { name, req: v.to_owned(), error });
                 }
             },
             None => (false, OptVersionReq::Any),
@@ -261,7 +258,7 @@ impl Dependency {
     }
 
     /// Pins the version only, as `[patch]` and `[replace]` do.
-    pub fn lock_version(&mut self, version: &semver::Version) -> &mut Dependency {
+    pub fn lock_version(&mut self, version: &Version) -> &mut Dependency {
         Arc::make_mut(&mut self.inner).req.lock_to(version);
         self
     }

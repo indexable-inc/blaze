@@ -21,8 +21,15 @@
 //! - [`entry`]: a program's `main` run on the simulation: its line on standard output, its
 //!   status, its error said, a withheld `Out` absent.
 //! - [`env`]: `Env::only` never widens.
-//! - [`world`]: `Args`, `Host`, the trace and `spawn_concurrent`'s refusal under `Inline`, each
-//!   once.
+//! - [`world`]: `Args`, `Host` and the trace, each once.
+//! - [`overlap`]: under one worker, `must_overlap` refuses a producer and consumer pair with a
+//!   typed `NoParallelism` before anything waits, where `may_overlap` runs it inline into its
+//!   deadline; and `may_overlap` gives one result under one worker and many.
+//! - [`flat`]: what the `AnyAddress` walk clears and refuses, decided as the crate compiles.
+//! - [`forms`]: each cost-explicit form (D120) built by the bstd path its module's table names,
+//!   in a task's frame, with one operation: not a simulation test, a check of the exports.
+//! - `unfinished` (rustc debug builds only): a must-finish value dropped unfinished stops,
+//!   naming its type and where it was made; one finished, or dropped by an unwind, does not.
 //! - [`cell`]: one token reads and writes every cell of its kind, behind one lock across
 //!   threads too.
 //! - [`names`]: the compile-time checks of `path!`, `var!` and `host!` are the run-time ones.
@@ -45,6 +52,21 @@
 //! - [`requests`]: `Http::handler` and `Http::over` give the same answer to the same request,
 //!   and refuse the same ones once narrowed.
 //! - [`hosted`]: each simulated provider once, a scripted value in and a recorded one out.
+//! - [`par`]: `reduce`, `map_into` and `for_each` give the sequential result in every order
+//!   their halves ran, and ragged columns are refused.
+//! - [`placement`]: a started task resumes from every wait on the worker it started on.
+//! - [`freeze`]: a frozen value is read the same through every handle and dropped once.
+//! - [`swap`]: a `Swap`'s reader sees the last publish, and a replaced value outlives every task
+//!   that was in when it was replaced.
+//! - [`flight`]: a key is computed at most once at a time, failures are retried, the table
+//!   stays in its bound; and the driver once.
+//! - [`chan`]: a channel is bounded, in order, each value once, drained before closed; its
+//!   waits end at their deadline; flat messages from many producers come out once each, in
+//!   order, through the ring (plant: the ring's back index forgets its front).
+//! - [`atomics`]: the named atomics mean what their docs say (their orderings are untested).
+//! - [`ranks`]: one lock-order token a task, back when dropped.
+//! - [`ancestors`]: the folders above the start are exactly the granted ones and only read;
+//!   a step past the top and a name back into the start are typed refusals.
 //!
 //! The compile-time half, that dropping a `Scope`, `Task`, `Pending` or `File<ReadWrite>`
 //! unfinished is an error, is in crates/hir-ty-linear's fixtures (`bstd_*`): that harness
@@ -60,35 +82,74 @@
 //! Replay: a failure prints its plan, the simulation's seed in it; a control prints the seed of
 //! the plan that caught its plant.
 
+mod ancestors;
 mod arena;
+mod atomics;
 mod budget;
 mod cancel;
 mod cell;
+mod chan;
 mod close;
 mod contexts;
 mod crash;
 mod deadlines;
+mod dirs;
 mod durable;
 mod effects;
 mod entry;
+mod grants;
+mod guest;
+mod hold;
+mod home;
+mod layers;
 mod env;
 mod eval;
 mod explicit;
+mod flat;
+mod flight;
+mod forms;
+mod freeze;
+mod fast_tests;
+mod gpu_tests;
 mod hosted;
 mod inflight;
+mod input;
 mod kv;
+mod journal;
 mod local;
+mod looks;
+mod read_sized;
 mod missing;
+#[cfg(feature = "image")]
 mod image;
+#[cfg(feature = "video")]
 mod mp4;
 mod names;
 mod narrowing;
 mod narrows;
+mod native_root;
+mod out_buffer;
+mod overlap;
 mod own;
+mod par;
 mod paths;
+mod placement;
+mod ranks;
+mod reach;
+#[cfg(feature = "requests")]
 mod requests;
+#[cfg(feature = "requests")]
+mod requests_servers;
 mod scopes;
 mod simtest;
+mod test_grants;
+mod sip_key;
+mod swap;
+mod syncs;
+mod unfinished;
+mod union_tests;
+mod upgrades;
+mod walk;
 mod world;
 
 use std::{fmt, time::Duration};

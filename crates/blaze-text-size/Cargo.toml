@@ -1,0 +1,20 @@
+[package]
+name = "blaze-text-size"
+description = "Offsets and ranges in UTF-8 text, as 32-bit byte counts (`TextSize`, `TextRange`), in place of the text-size crate: the one home the syntax trees, spans, token trees and test fixtures share; `no_std`, no dependencies"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# Nothing: `core` and `alloc` only (alloc for `Index<TextRange> for String`).
+[dependencies]
+
+[lints]
+workspace = true

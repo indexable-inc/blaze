@@ -1,0 +1,42 @@
+[package]
+name = "blaze-own"
+description = "blaze's own owning types in place of Rust's `alloc` crate: Vec, Box, Arc, Rc, VecDeque, a sorted map and set, a borrow-or-own Cow and a struct-of-arrays vector, each over `core::alloc::Allocator` with no default allocator (`new_in(alloc)` is the only constructor); `no_std`, no `alloc`; depends only on blaze-memchr (and its blaze-int), for byte search"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+# Doc tests run here, as in blaze-id: that a collection over a thread's own allocator cannot
+# cross a thread is a `compile_fail` doc test (`Erased::shared`), beside its control.
+
+# A dependency here is a dependency of every crate's collections: only crates on `core` alone.
+[dependencies]
+# `Vec::contains` and `Vec::position` on bytes: NEON or SSE2, 64 bytes a step (`spec::Find`).
+# no_std, and itself depends only on blaze-int, which depends on nothing.
+blaze-memchr.workspace = true
+
+[features]
+# `AsRef<OsStr>` and `AsRef<Path>` for `String`, which only this crate may write (the orphan
+# rule) and only std has; blaze-mem turns it on.
+std = []
+# `blaze_own::testing`: allocators that count live blocks and refuse the n-th allocation, and
+# `every_failure`, for tests of any crate's allocation-failure paths (a dev-dependency feature);
+# and `testing::heap()`, a test's root allocator capability (D102), which needs `std`'s heap.
+testing = ["std"]
+
+# The model checker's atomics for `SharedSegs`, in a model build only (`--cfg blaze_check`);
+# it depends on blaze-rng and libc, neither on this crate.
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+
+[dev-dependencies]
+# The tree's property engine; itself depends only on blaze-rng, which depends on nothing.
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

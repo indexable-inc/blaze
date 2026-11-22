@@ -28,15 +28,11 @@ use crate::{
 use Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
 
 /// Every outcome `f` returns over the model's executions.
-#[expect(
-    clippy::disallowed_types,
-    reason = "below blaze-core: blaze-check is a dependency of blaze-core; the outcomes collected outside the model"
-)]
 fn outcomes<T: Ord + Clone + 'static>(
     builder: &Builder,
     f: impl Fn() -> T + 'static,
 ) -> BTreeSet<T> {
-    let seen = StdArc::new(parking_lot::Mutex::new(BTreeSet::new()));
+    let seen = StdArc::new(crate::held::Mutex::new(BTreeSet::new()));
     let into = StdArc::clone(&seen);
     builder.check(move || {
         let out = f();
@@ -508,6 +504,40 @@ fn a_spin_loop_with_a_hint_ends() {
             crate::hint::spin_loop();
         }
         setter.join().unwrap();
+    });
+}
+
+/// Two threads spin, yielding, on a flag a third sets after a step of its own: a yielder waits
+/// for every thread that could run when it yielded, so the two cannot hand the run to each
+/// other past the setter until the bound on branches.
+#[test]
+fn two_spinners_let_the_thread_they_wait_for_run() {
+    let mut builder = builder();
+    builder.max_branches = 400;
+    builder.check(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+        let step = Arc::new(AtomicU32::new(0));
+        let setter = {
+            let (flag, step) = (flag.clone(), step.clone());
+            thread::spawn(move || {
+                step.store(1, Relaxed);
+                flag.store(true, Release);
+            })
+        };
+        let spinner = {
+            let flag = flag.clone();
+            thread::spawn(move || {
+                while !flag.load(Acquire) {
+                    thread::yield_now();
+                }
+            })
+        };
+        while !flag.load(Acquire) {
+            thread::yield_now();
+        }
+        assert_eq!(step.load(Relaxed), 1);
+        setter.join().unwrap();
+        spinner.join().unwrap();
     });
 }
 
@@ -1118,13 +1148,9 @@ fn executions_after_the_first_allocate_nothing() {
 }
 
 /// Every execution's order of steps, in the order the search ran them.
-#[expect(
-    clippy::disallowed_types,
-    reason = "below blaze-core: blaze-check is a dependency of blaze-core; the steps collected outside the model"
-)]
 fn interleavings() -> Vec<Vec<u8>> {
-    let log = StdArc::new(parking_lot::Mutex::new(Vec::new()));
-    let runs = StdArc::new(parking_lot::Mutex::new(Vec::new()));
+    let log = StdArc::new(crate::held::Mutex::new(Vec::new()));
+    let runs = StdArc::new(crate::held::Mutex::new(Vec::new()));
     let (into_log, into_runs) = (log.clone(), runs.clone());
     let mut builder = builder();
     builder.max_preemptions = Some(2);

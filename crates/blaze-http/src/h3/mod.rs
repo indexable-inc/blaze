@@ -56,8 +56,9 @@
 //! from its driver: the [`Wire`] trait is that seam, and the caller does the steps above.
 //!
 //! [`driver`]'s one wait is its poll of blaze-core's driver, to the endpoint's next deadline
-//! (armed as a timer); a caller blocking on a handle's future parks in
-//! [`crate::mailbox::block_on`], named by what it waits for (every-wait-says-what).
+//! (armed as a timer); a caller waiting on a handle makes one timed receive
+//! ([`crate::mailbox::answer`]), whose bound passing is [`crate::mailbox::Unanswered::TimedOut`]
+//! naming what it waited for (every-wait-says-what).
 //!
 //! # What the core reads that is not its input
 //!

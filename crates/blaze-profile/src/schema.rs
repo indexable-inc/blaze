@@ -1,7 +1,7 @@
 //! The one schema of what blaze records about itself: every reader (the Parquet history,
 //! `blaze debug sql`, `blaze debug live`, the explorer at ix.dev/explore, the stall reports)
 //! reads these tables, and nothing else defines them. The Arrow schema of each table is made
-//! from it (`arrow.rs`), and so are the DuckDB views and the table of columns in
+//! from it (`columns.rs`), and so are the DuckDB views and the table of columns in
 //! docs/profiling.md.
 //!
 //! Time: every `*_ns` instant is nanoseconds on the machine's monotonic clock ([`CLOCK`]): the

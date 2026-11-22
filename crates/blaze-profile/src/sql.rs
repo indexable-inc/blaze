@@ -1,9 +1,9 @@
 //! `blaze debug sql`: a query over the history, run by the pinned DuckDB CLI (`nix run
-//! .#duckdb`'s package; DuckDB is never linked into blaze), its answer read back as Arrow.
+//! .#duckdb`'s package; DuckDB is never linked into blaze), its answer read back as batches.
 //!
 //! DuckDB's CLI has no Arrow output without extensions, and nothing here downloads one, so
 //! the query runs as `COPY (<query>) TO '<scratch>/answer.parquet'` after the views of
-//! [`views::PRELUDE`], and the file is read back with the `parquet` crate.
+//! [`views::PRELUDE`], uncompressed, and the file is read back with `blaze_parquet`.
 //!
 //! The views read the files the history's manifest lists, as it is when the query starts
 //! ([`history::manifest`]): every row the history committed, each once. Rows the daemon has
@@ -18,6 +18,7 @@
 //! history's writer deletes none of them meanwhile, though a merge or the cap retires them.
 
 use std::{
+    alloc::Global,
     fmt,
     fmt::Write as _,
     fs, io,
@@ -26,11 +27,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use arrow_array::RecordBatch;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
 pub use crate::history::manifest::Scope;
 use crate::{
+    columns::Batch,
     history::{self, HistoryError, Pin, manifest},
     views::{self, ViewError},
 };
@@ -186,16 +185,16 @@ impl Drop for Scratch {
 }
 
 /// What stops a query under way: a message on it, or every sender of it gone.
-pub type Stop = crossbeam_channel::Receiver<()>;
+pub type Stop = blaze_core::chan::Receiver<()>;
 
-/// Runs `query` over the history; its answer as Arrow record batches.
-pub fn run(query: &Query<'_>) -> Result<Vec<RecordBatch>, SqlError> {
-    run_with(query, &crossbeam_channel::never())
+/// Runs `query` over the history; its answer as batches, one a row group.
+pub fn run(query: &Query<'_>) -> Result<Vec<Batch>, SqlError> {
+    run_with(query, &blaze_core::chan::never())
 }
 
 /// [`run`], killing DuckDB and answering [`SqlError::Stopped`] once `stop` says to: what the
 /// explorer does when the page cancels a query.
-pub fn run_with(query: &Query<'_>, stop: &Stop) -> Result<Vec<RecordBatch>, SqlError> {
+pub fn run_with(query: &Query<'_>, stop: &Stop) -> Result<Vec<Batch>, SqlError> {
     let mut scratch = Scratch::new()?;
     let answer = run_in(&scratch.dir, query.duckdb, &[query.sql], query.history, query.scope, stop)
         .map(only);
@@ -213,19 +212,19 @@ pub fn run_all(
     history: &Path,
     scope: Scope,
     sqls: &[&str],
-) -> Result<Vec<Vec<RecordBatch>>, SqlError> {
+) -> Result<Vec<Vec<Batch>>, SqlError> {
     if sqls.is_empty() {
         // alloc: nothing, no query asked
         return Ok(Vec::new());
     }
     let mut scratch = Scratch::new()?;
-    let answers = run_in(&scratch.dir, duckdb, sqls, history, scope, &crossbeam_channel::never());
+    let answers = run_in(&scratch.dir, duckdb, sqls, history, scope, &blaze_core::chan::never());
     scratch.keep = answers.is_err();
     answers
 }
 
 /// The answer of a run of one query.
-fn only(mut answers: Vec<Vec<RecordBatch>>) -> Vec<RecordBatch> {
+fn only(mut answers: Vec<Vec<Batch>>) -> Vec<Batch> {
     answers.pop().unwrap_or_default()
 }
 
@@ -237,22 +236,35 @@ fn ended_or_stopped(child: &mut Child, stop: &Stop) -> io::Result<Option<ExitSta
     #[cfg(unix)]
     let watched = child.id();
     #[cfg(windows)]
-    let watched = std::os::windows::io::AsRawHandle::as_raw_handle(child) as usize;
-    let (exited, heard) = crossbeam_channel::bounded::<io::Result<()>>(1);
+    let watched = blaze_sys::windows::Handle::from_raw(
+        std::os::windows::io::AsRawHandle::as_raw_handle(child),
+    );
+    let (exited, heard) = blaze_core::chan::bounded::<io::Result<()>>(1);
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             // alloc: a thread's name, once a query
             .name("duckdb exit".to_owned())
             .spawn_scoped(scope, move || _ = exited.send(exit_heard(watched)))?;
-        crossbeam_channel::select! {
-            recv(heard) -> seen => {
-                seen.map_err(|_| io::Error::other("the thread that waits for DuckDB's exit ended saying nothing"))??;
-                child.wait().map(Some)
+        // The exit is waited for, the stop looked at between waits: a cancel is heard within
+        // one look, and the channel has no select (a message or every sender gone, as before).
+        const LOOK: std::time::Duration = std::time::Duration::from_millis(20);
+        loop {
+            match heard.recv_timeout(LOOK) {
+                Ok(seen) => {
+                    seen?;
+                    return child.wait().map(Some);
+                }
+                Err(blaze_core::chan::RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::other(
+                        "the thread that waits for DuckDB's exit ended saying nothing",
+                    ));
+                }
+                Err(blaze_core::chan::RecvTimeoutError::Timeout) => {}
             }
-            recv(stop) -> _ => {
+            if !matches!(stop.try_recv(), Err(blaze_core::chan::TryRecvError::Empty)) {
                 // One already gone is fine: either way it is reaped by the wait.
                 _ = child.kill();
-                child.wait().map(|_| None)
+                return child.wait().map(|_| None);
             }
         }
     })
@@ -271,19 +283,15 @@ fn ended_or_stopped(_child: &mut Child, _stop: &Stop) -> io::Result<Option<ExitS
 /// Waits until the child `pid` has ended, leaving it to be reaped by its `Child`.
 #[cfg(unix)]
 fn exit_heard(pid: u32) -> io::Result<()> {
-    let pid = libc::id_t::try_from(pid).map_err(io::Error::other)?;
+    let pid = i32::try_from(pid).map_err(io::Error::other)?;
     loop {
-        // SAFETY: all zeros is a `siginfo_t` of nothing, for the call to write over.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: `info` is live for the call to write. `WNOWAIT` leaves the child unreaped, so
-        // its number names it alone until its `Child` waits for it.
-        if unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) } == 0
-        {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
+        match blaze_sys::posix::proc::wait_id(
+            pid,
+            blaze_sys::posix::proc::WaitFlags::EXITED | blaze_sys::posix::proc::WaitFlags::NO_WAIT,
+        ) {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) | Err(blaze_sys::Errno::Intr) => continue,
+            Err(error) => return Err(io::Error::from_raw_os_error(i32::from(error.raw()))),
         }
     }
 }
@@ -294,15 +302,14 @@ fn exit_heard(pid: u32) -> io::Result<()> {
     clippy::disallowed_methods,
     reason = "a child's exit on a scoped thread of its own, no pool thread or fiber; blocking child waits move to the driver in step 5 of docs/v2/plan/design/deadline-waits.md"
 )]
-fn exit_heard(handle: usize) -> io::Result<()> {
-    use windows_sys::Win32::{
-        Foundation::WAIT_OBJECT_0,
-        System::Threading::{INFINITE, WaitForSingleObject},
+fn exit_heard(handle: blaze_sys::windows::Handle) -> io::Result<()> {
+    use blaze_sys::windows::{
+        foundation::WAIT_OBJECT_0,
+        threading::{INFINITE, WaitForSingleObject},
     };
     // SAFETY: the process handle of a `Child` that outlives this call: `ended_or_stopped` waits
     // on a scoped thread, and its `Child` is borrowed for the whole scope.
-    match unsafe { WaitForSingleObject(handle as windows_sys::Win32::Foundation::HANDLE, INFINITE) }
-    {
+    match unsafe { WaitForSingleObject(handle, INFINITE) } {
         WAIT_OBJECT_0 => Ok(()),
         _ => Err(io::Error::last_os_error()),
     }
@@ -367,7 +374,9 @@ fn script(
         out.push_str("\n) TO ");
         // Writing to a `String` does not fail.
         _ = views::quote(answer, &mut out);
-        out.push_str(" (FORMAT parquet, COMPRESSION zstd);\n");
+        // Uncompressed: blaze-parquet reads no compressed file, and the answer lives only until
+        // it is read back.
+        out.push_str(" (FORMAT parquet, COMPRESSION uncompressed);\n");
     }
     Ok(out)
 }
@@ -389,7 +398,7 @@ fn run_in(
     history: &Path,
     scope: Scope,
     stop: &Stop,
-) -> Result<Vec<Vec<RecordBatch>>, SqlError> {
+) -> Result<Vec<Vec<Batch>>, SqlError> {
     let no_duckdb = |why: &str| SqlError::NoDuckdb {
         // alloc: an error
         path: duckdb.to_owned(),
@@ -479,32 +488,25 @@ fn run_in(
     Ok(answers)
 }
 
-/// DuckDB's answer at `answer`, as Arrow record batches.
-fn read_answer(answer: &Path) -> Result<Vec<RecordBatch>, SqlError> {
-    let answer_error = |error: String| SqlError::Answer {
+/// DuckDB's answer at `answer`, a batch a row group.
+fn read_answer(answer: &Path) -> Result<Vec<Batch>, SqlError> {
+    let answer_error = |error: blaze_parquet::ParquetError| SqlError::Answer {
         // alloc: an error
         path: answer.to_owned(),
-        error,
+        // alloc: an error
+        error: error.to_string(),
     };
-    let file = fs::File::open(answer).map_err(io_error(answer, "opening DuckDB's answer"))?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .and_then(|it| it.build())
-        // alloc: an error
-        .map_err(|error| answer_error(error.to_string()))?;
+    // alloc: the answer's bytes, once a query
+    let bytes = fs::read(answer).map_err(io_error(answer, "reading DuckDB's answer"))?;
+    let file = blaze_parquet::File::open(&bytes, Global).map_err(answer_error)?;
     // alloc: the answer, once a query
-    let mut batches = Vec::new();
-    for batch in reader {
-        // alloc: an error
-        batches.push(batch.map_err(|error| answer_error(error.to_string()))?);
-    }
-    Ok(batches)
+    Ok(file.read_all().map_err(answer_error)?.into_iter().collect())
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use arrow_array::cast::AsArray;
     use serde_json::{Map, Value};
 
     use super::*;
@@ -539,8 +541,8 @@ mod tests {
         assert!(script.contains("read_parquet(['/h/schema.spans.parquet', '/h/1-00000001.spans.parquet'], union_by_name = true)"));
         assert!(
             script.ends_with(
-                "COPY (\nSELECT 1\n) TO '/w/it''s/answer.parquet' (FORMAT parquet, COMPRESSION zstd);\n\
-                 \nCOPY (\nSELECT 2\n) TO '/w/it''s/answer-1.parquet' (FORMAT parquet, COMPRESSION zstd);\n"
+                "COPY (\nSELECT 1\n) TO '/w/it''s/answer.parquet' (FORMAT parquet, COMPRESSION uncompressed);\n\
+                 \nCOPY (\nSELECT 2\n) TO '/w/it''s/answer-1.parquet' (FORMAT parquet, COMPRESSION uncompressed);\n"
             ),
             "{script}"
         );
@@ -558,7 +560,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let (stopper, stop) = crossbeam_channel::bounded(1);
+        let (stopper, stop) = blaze_core::chan::bounded(1);
         let started = std::time::Instant::now();
         let query = Query { duckdb: &fake, history: &dir, scope: Scope::All, sql: "SELECT 1" };
         let error = std::thread::scope(|scope| {
@@ -578,11 +580,11 @@ mod tests {
     fn a_query_that_ends_is_heard_at_its_exit_and_a_dropped_stop_stops() {
         let started = std::time::Instant::now();
         let mut child = Command::new("/bin/sh").args(["-c", "exit 3"]).spawn().map(stdx::JodChild).unwrap();
-        let status = ended_or_stopped(&mut child, &crossbeam_channel::never()).unwrap().unwrap();
+        let status = ended_or_stopped(&mut child, &blaze_core::chan::never()).unwrap().unwrap();
         assert_eq!(status.code(), Some(3));
         assert!(started.elapsed() < Duration::from_secs(5), "heard after {:?}", started.elapsed());
         let mut child = Command::new("/bin/sh").args(["-c", "exec sleep 600"]).spawn().map(stdx::JodChild).unwrap();
-        let (stopper, stop) = crossbeam_channel::bounded::<()>(1);
+        let (stopper, stop) = blaze_core::chan::bounded::<()>(1);
         drop(stopper);
         assert!(ended_or_stopped(&mut child, &stop).unwrap().is_none());
         assert!(
@@ -674,11 +676,7 @@ mod tests {
             let batches =
                 run(&Query { duckdb: &duckdb, history: &dir, scope: Scope::All, sql: &sql })
                     .unwrap_or_else(|error| panic!("{table}: {error}"));
-            assert_eq!(
-                batches[0].column(0).as_primitive::<arrow_array::types::Int64Type>().value(0),
-                0,
-                "{table}"
-            );
+            assert_eq!(batches[0].column(0).int(0), Some(0), "{table}");
         }    }
 
     #[test]
@@ -705,9 +703,9 @@ mod tests {
         crate::install();
         std::thread::spawn(|| {
             let _build = flight::building(77);
-            let _outer = tracing::info_span!(target: "blaze", "sql outer").entered();
+            let _outer = blaze_trace::info_span!(target: "blaze", "sql outer").entered();
             let _inner =
-                tracing::info_span!(target: "blaze", "sql inner", function = "app::main").entered();
+                blaze_trace::info_span!(target: "blaze", "sql inner", function = "app::main").entered();
             flight::plot(flight::Plot::Queued, 3);
             for (job, deepest) in [(1, 40 << 10), (2, 900 << 10)] {
                 flight::fiber_stack(flight::FiberStack {
@@ -747,7 +745,7 @@ mod tests {
         let count = |sql: &str| {
             let batches = run(&Query { duckdb: &duckdb, history: &dir, scope: Scope::All, sql })
                 .unwrap_or_else(|error| panic!("{error}"));
-            batches[0].column(0).as_primitive::<arrow_array::types::Int64Type>().value(0)
+            batches[0].column(0).int(0).expect("a count")
         };
         assert!(
             count("SELECT count(*) AS n FROM spans WHERE build_id = 77 AND name = 'sql inner'")
@@ -786,11 +784,7 @@ mod tests {
             sql: "SELECT count(*) AS n FROM builds WHERE build_id = 77",
         })
         .unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(
-            one[0].column(0).as_primitive::<arrow_array::types::Int64Type>().value(0),
-            1,
-            "a build's scope reads its files"
-        );
+        assert_eq!(one[0].column(0).int(0), Some(1), "a build's scope reads its files");
 
         for view in views::VIEWS {
             let mut args = Map::new();
@@ -883,21 +877,12 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
         let mut steps = Vec::new();
         for batch in &batches {
-            let int = |at: usize| {
-                batch.column(at).as_primitive::<arrow_array::types::Int64Type>().clone()
-            };
-            let text = |at: usize| batch.column(at).as_string::<i32>().clone();
-            let (step, lane, what, from, to) = (int(0), text(1), text(2), int(3), int(4));
-            let pct = batch.column(5).as_primitive::<arrow_array::types::Float64Type>().clone();
+            let int = |at: usize, i: usize| batch.column(at).int(i).expect("an int");
+            let text = |at: usize, i: usize| batch.column(at).text(i).expect("a text").to_owned();
             for i in 0..batch.num_rows() {
-                steps.push((
-                    step.value(i),
-                    lane.value(i).to_owned(),
-                    what.value(i).to_owned(),
-                    from.value(i),
-                    to.value(i),
-                ));
-                assert!((pct.value(i) - 100.0).abs() < 0.01, "the path is the whole build");
+                steps.push((int(0, i), text(1, i), text(2, i), int(3, i), int(4, i)));
+                let pct = batch.column(5).float(i).expect("a share");
+                assert!((pct - 100.0).abs() < 0.01, "the path is the whole build");
             }
         }
         assert_eq!(
@@ -955,9 +940,10 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
         let mut workers = Vec::new();
         for batch in &batches {
-            let thread = batch.column(0).as_primitive::<arrow_array::types::Int64Type>().clone();
-            let pct = batch.column(1).as_primitive::<arrow_array::types::Float64Type>().clone();
-            workers.extend((0..batch.num_rows()).map(|i| (thread.value(i), pct.value(i))));
+            let (thread, pct) = (batch.column(0), batch.column(1));
+            workers.extend(
+                (0..batch.num_rows()).map(|i| (thread.int(i).expect("a thread"), pct.float(i).expect("a share"))),
+            );
         }
         assert_eq!(workers, [(10, 0.0), (11, 50.0)]);    }
 

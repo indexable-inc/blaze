@@ -1,0 +1,31 @@
+[package]
+name = "blaze-text"
+description = "Text out and in without `core::fmt`: a sink trait `Put` (blaze-own's `String`, a fixed stack `Buf` that refuses when full, a `Count` that only measures), chainable typed writers over it (`out.str(\"x = \").int(x)`: integers of every width two digits at a time, hex and binary, shortest round-trip and fixed-place floats, human durations and byte counts, Rust and JSON escapes, columns), `Show` in place of `Display`, and `Parse<'a>`, which returns the rest of the input and may borrow from it; `no_std`, no `alloc`"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The growable sink (`String<A>`), the collections `Show` is implemented for, the vector
+# `sep_by` fills and `ParseIn`, the error of a parse that also allocates.
+blaze-own.workspace = true
+# Every integer conversion (no bare `as`).
+blaze-int.workspace = true
+
+[dev-dependencies]
+# `blaze_own::testing::heap()` for the tests and `Heap::process()` for the cost example's `main`.
+blaze-own = { workspace = true, features = ["testing"] }
+# Properties: every writer against `core::fmt`, float round trips, parse offsets; with a
+# planted-bug control.
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

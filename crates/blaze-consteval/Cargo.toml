@@ -1,0 +1,55 @@
+[package]
+name = "blaze-consteval"
+description = "The constant evaluator (docs/v2/plan/design/consteval.md): `const` items, `static` initialisers, array lengths, enum discriminants, inline `const` blocks and the `const fn` calls in them, interpreted over the checker's typed body form with an explicit stack, step and memory bounds and memory with provenance; each value a record of bytes and relocations"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# Zero third-party crates.
+[dependencies]
+# The input: the body form (`BodyView`), the check's record (`Checked`), portable types, `Def`, `Adt`.
+blaze-typeck.workspace = true
+# `ground` (a type of another table at an instance's arguments) and `InstanceKey` (a fn
+# pointer's target in a record): the one home of both.
+blaze-build.workspace = true
+# `Vec` in the allocator the caller passes; `Alloc`.
+blaze-own.workspace = true
+# `Hasher`, `ContentId`: a value's record key. By path: the workspace entry turns on serde adapters.
+blaze-ids.workspace = true
+# The unit's code by item and arguments (`Codes`). By path: the workspace entry turns on serde
+# and the shared tables.
+blaze-hash.workspace = true
+# The fixture only (`testing`): bodies written as Rust text, lowered as the driver lowers them.
+blaze-lower = { workspace = true, optional = true }
+
+[features]
+# `fixture`: a world and bodies written by hand, for the tests and `examples/cost.rs`.
+testing = ["blaze-own/std", "blaze-own/testing", "dep:blaze-lower", "blaze-typeck/testing"]
+
+[dev-dependencies]
+blaze-consteval = { workspace = true, features = ["testing"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
+# `read_back`: code the builder emits reads a constant's record back (layout cannot drift).
+blaze-build = { workspace = true, features = ["testing"] }
+# `check`, `control`: the arithmetic property and its planted bugs.
+blaze-sim.workspace = true
+# `examples/cost.rs`: each evaluation in a task's frame, as the builder runs it (rule 11).
+blaze-mem.workspace = true
+# `examples/census.rs`: real trees lowered by `lower_file`, macros expanded by name.
+blaze-lower.workspace = true
+blaze-expand.workspace = true
+blaze-id.workspace = true
+blaze-surface.workspace = true
+blaze-file-items.workspace = true
+blaze-typeck.workspace = true
+
+[lints]
+workspace = true

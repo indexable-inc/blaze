@@ -1,0 +1,11 @@
+{
+ "id": "crate-root-tool-attribute-hides-macros",
+ "date": "2026-11-15",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), coordinator of rebuild-1115; found by the formats lane (claude-opus-5-5) in crates/blaze-data",
+ "where": "any crate whose lib.rs carries a blaze tool attribute at the crate root, e.g. `#![blaze::sans_io]`, and also exports `macro_rules!` macros",
+ "what": "rustc reported 26 errors `macro-expanded macro_export macros from the current crate cannot be referred to by absolute paths` in crates/blaze-data, at every `crate::value!` and `$crate::value!` inside the crate. Nothing in the macros was wrong.",
+ "why": "A tool attribute at the crate root (`#![blaze::sans_io]`, needing `register_tool` and `custom_inner_attributes`) makes rustc treat the whole crate as the output of a macro expansion. Every `#[macro_export]` macro in it is then 'macro-expanded', and such a macro cannot be named by path from inside its own crate.",
+ "fix": "Put the tool attribute on each module (`#[blaze::sans_io] mod core;`) instead of on the crate root, or call the crate's own macros unqualified after a `#[macro_use] mod macros;` declared first. The same trap hit crates/blaze-mem earlier (`crate::format_in!`).",
+ "class": "a blaze extension changes what plain rustc accepts in a way unrelated to what the extension means",
+ "guard": "wanted: the `sans_io` check should take a crate-level opt-in from the manifest or from a module attribute, so no crate needs a tool attribute at its root; until then a ratchet could refuse `#![blaze::` at a crate root that also has `#[macro_export]`."
+}

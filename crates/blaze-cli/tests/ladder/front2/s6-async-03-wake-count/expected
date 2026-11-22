@@ -1,0 +1,9 @@
+status 0
+stdout
+Pending
+wakes 0
+wakes 1
+Ready(42)
+Pending
+wakes 2 Ready(7)
+2

@@ -37,15 +37,22 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     let cx = root(&io);
     let jail = io.need_fs().map_err(|e| format!("harness: {e}"))?.open_dir(&cx, &path("jail/in")).map_err(|e| format!("harness: {e}"))?;
     io.record();
+    // The names written so far, each branch in its own terms: a later write that clashes with
+    // one of them is refused by every disk, and still touches nothing outside the jail.
+    let mut written: Vec<String> = Vec::new();
     for raw in &plan.raws {
         let before = io.touched().len();
         if plant == Plant::LexicalParent {
             // The planted bug: `..` let in and resolved by text.
             let Ok(raw) = Path::with_parents(raw) else { continue };
             let Some(file) = jail.beneath_by_text(&raw) else { continue };
+            let name = file.as_str().to_owned();
+            let clash = clashes(&written, &name);
             let done = io.call(&cx, |tag| Effect::Write { file, bytes: b"x".to_vec(), tag });
-            if !matches!(done, Ok(Done::Written)) {
-                return Err(format!("harness: the planted write of {raw} said {done:?}"));
+            match (clash, &done) {
+                (false, Ok(Done::Written)) => written.push(name),
+                (true, Ok(Done::Failed(_))) => {}
+                _ => return Err(format!("harness: the planted write of {raw} said {done:?}, a clash {clash}")),
             }
         } else {
             match Path::new(raw) {
@@ -54,7 +61,15 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
                     if text != raw || text.starts_with('/') || text.split('/').any(|it| matches!(it, "" | "." | "..")) {
                         return Err(format!("Path::new took {raw:?} as {text:?}: not plain and relative"));
                     }
-                    write_synced(&cx, &jail, &made, b"x").map_err(|e| format!("harness: {e}"))?;
+                    let clash = clashes(&written, text);
+                    match (clash, write_synced(&cx, &jail, &made, b"x")) {
+                        (false, Ok(())) => written.push(text.to_owned()),
+                        (true, Err(_)) => {}
+                        (false, Err(error)) => return Err(format!("harness: {error}")),
+                        (true, Ok(())) => {
+                            return Err(format!("harness: {text} was written though a file written before clashes with it"));
+                        }
+                    }
                 }
                 Err(refused) => {
                     if refused.path != *raw {
@@ -66,12 +81,21 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
         // The jail's own name is touched by the sync of its names a synced write ends with
         // (`Effect::SyncDir`), which writes no file: `is_under` takes it.
         for (file, _) in &io.touched()[before..] {
-            if !file.is_under(jail.name()) {
+            if !jail.name().holds(file) {
                 return Err(format!("the path {raw:?} reached {file}, not beneath {}", jail.name()));
             }
         }
     }
     Ok(())
+}
+
+/// Whether a file named `name` cannot be made beside the files `written`: one of them is above
+/// it (`ENOTDIR`) or beneath it, so `name` is a directory (`EISDIR`). A real disk refuses
+/// both, and so does the simulated one since 2026-11-20; the plan draws such pairs (`a`, then
+/// `a/a`), and what is tested is where a write lands, not whether it is made.
+fn clashes(written: &[String], name: &str) -> bool {
+    let under = |low: &str, high: &str| low.strip_prefix(high).is_some_and(|rest| rest.starts_with('/'));
+    written.iter().any(|it| under(name, it) || under(it, name))
 }
 
 /// The invariant: a `Path` never escapes its `Dir`. Whatever text a path is made of, what

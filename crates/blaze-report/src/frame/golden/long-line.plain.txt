@@ -1,0 +1,6 @@
+error  cannot find `oops` here
+  ╭─ src/table.rs:1:411
+1 │ …111, 38000114, 39000117, oops, 7];
+  │                           ^^^^
+  │                           ╰─ not a number
+  ╰─ blaze explain resolve:unknown

@@ -23,12 +23,12 @@ branch must contain origin/main (`git merge origin/main` first), so the merge co
 head's; the quote must name that tree, clean, with verdict ok (smoke.rs decides, land.py only asks
 it: `smoke '{"verify": ...}'`). It pushes the branch, opens its pull request (titled "Merge
 <branch>: <what it does>", which with " (#N)" is the merge commit's subject) or takes the one
-already open, and puts the quote in its body. The pull request's run is the merge gate, the build
-and the unit tests on Linux AArch64 (on ix runners). Once it passes, the waiting asks smoke.rs
+already open, and puts the quote in its body. The pull request's run is the merge gate
+(blaze.yaml's `ci`: the script checks, actionlint, the Lean proofs, and cargo check and the unit
+tests on Linux AArch64, on ix runners). Once it passes, the waiting asks smoke.rs
 again about the body's quote and the head GitHub has, checks that main has not moved past the
-head, and merges with a merge commit, as `git merge --no-ff` would, pinned to that head. Every
-harness runs after the merge, in the release train (train.yaml). land.py waits until then and
-exits 0 with the commit main is at, or exits 1 and says why the pull request did not merge (a
+head, and merges with a merge commit, as `git merge --no-ff` would, pinned to that head.
+land.py waits until then and exits 0 with the commit main is at, or exits 1 and says why the pull request did not merge (a
 check that failed, a conflict with main, main moved, the quote). GitHub deletes the branch on
 origin once it is merged. There is no flag around the smoke, and an admin merge is not an
 exception to it (rule 68).

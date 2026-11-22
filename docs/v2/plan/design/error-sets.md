@@ -12,15 +12,15 @@ failures it can return, the way `#[blaze::may(..)]` says exactly which effects i
 ```rust
 #![blaze::error_unions]
 
-fn main(cx: &Cx, io: Io) -> Result<(), Missing | FsError> {
-    let fs = io.need_fs()?;                      // Missing
+fn main(cx: &Cx, fs: Fs, out: Out) -> Result<(), OutError | FsError> {
     let data = fs.open_dir(cx, path!("data"))?;  // FsError
+    out.line(cx, "opened data")?;                // OutError
     ..
 }
 
-match main(cx, io) {
+match main(cx, fs, out) {
     Ok(()) => {}
-    Err(Missing { capability }) => ..,
+    Err(OutError { stream, .. }) => ..,
     Err(FsError { kind: FsKind::NotFound, path, .. }) => ..,
     Err(e @ FsError { .. }) => report(e),        // e: FsError
 }
@@ -161,8 +161,7 @@ that open the root.
 | `KvError { under: FsError }` | stays: it adds the key and the operation to the file's error, which is context, not a sum; its `under` follows `FsError`, so `Kv`'s nine functions (kv.rs 230 to 314) return `KvError \| Stopped` | |
 | `TaskWhy::OutOfMemory(Stopped)` | `Scope::spawn`'s reserve failure is the `Stopped` it is: `Task::join` returns `TaskError \| Stopped` | `task.rs` 221, 322 |
 
-Stay as they are: `Io::need_*` (`Missing`, a set of one, which is what makes `main` above
-work), the name types' errors (`PathError`, `UrlError`, `KeyError`, `NameError`,
+Stay as they are: `Io::need_*` (`Missing`, a set of one), the name types' errors (`PathError`, `UrlError`, `KeyError`, `NameError`,
 `HostPortError`, `VarNameError`, `HeaderError`), `ImageError`, `VideoError`, `MuxError`, and
 `TaskWhy::Failed(String)`: a task's own error `E` as a member needs a set over a type
 parameter, which is refused.

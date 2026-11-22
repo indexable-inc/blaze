@@ -28,9 +28,9 @@
 //! A call loads its word relative to itself (`call [rip + word]`; `adrp`, `ldr`), so every
 //! body must be within reach of the table: 2 GiB on x86-64, 4 GiB on AArch64. The table is
 //! therefore in the mapping the code is in, before it, and the whole is at most [`REACH`]:
-//! any body reaches any word, with no second copy of the table. (On macOS this also has to
-//! be so: a `MAP_JIT` mapping cannot be placed at a chosen address beside another.) The
-//! words are data that happen to lie in the code's mapping; a store to one goes through
+//! any body reaches any word, with no second copy of the table. The words are data that
+//! happen to lie in the code's mapping, with the writable data region (the counter table, the
+//! mark bitmaps, the wait table) beyond the code; a store to one goes through
 //! `sys::Code::store`, as a gate's flag does.
 
 use core::sync::atomic::Ordering;
@@ -44,6 +44,7 @@ use blaze_launch::{
 
 use crate::arch::{self, GATE_ALIGN, GATE_ENTRY, GATE_HEAD, OutOfReach, STUB, STUB_HEAD, THUNK};
 use crate::sys::{self, Code, SysError};
+use crate::stub_wait::{self, Waiters};
 use crate::table::{Event, Shared, Told};
 
 /// Where a bind's code comes from: the daemon's records, to the launcher.
@@ -230,7 +231,7 @@ impl core::error::Error for EditError {}
 /// Dropping a `Driver` frees its tables and unmaps nothing (`sys::Code` is never unmapped):
 /// code a thread is in, and the words it loads, outlive it.
 pub struct Driver {
-    core: Launch,
+    core: Launch<Kept>,
     /// The one mapping: words, stubs, area.
     code: Code,
     /// The offset in the mapping of the stub region's head.
@@ -286,6 +287,7 @@ impl Driver {
             base + stubs,
             base + thunks,
             base + area..base + whole as usize,
+            Waiters::reserve(stub_wait::MOST_WAITERS)?,
         ));
         // The stubs hand this pointer to `table::resolve` for as long as the process runs
         // code: one count of the `Arc` is leaked for it, so it never dangles, whatever
@@ -310,6 +312,11 @@ impl Driver {
     /// What program threads hold.
     pub fn shared(&self) -> Arc<Shared> {
         Arc::clone(&self.shared)
+    }
+
+    /// The rows stubs wait in: what the control thread answers through.
+    pub(crate) fn waiters(&self) -> &Waiters {
+        &self.shared.waiters
     }
 
     /// The address of the code area's offset 0.

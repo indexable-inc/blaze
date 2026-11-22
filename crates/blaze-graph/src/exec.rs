@@ -24,16 +24,15 @@ use std::{
     time::Instant,
 };
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_mem::{Cache, MemError, Pooled, Slab, Tag as MemTag, frame};
 use blaze_protocol::events::{Event, Record};
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use blaze_core::chan::{Receiver, Sender, bounded, unbounded};
 use std::alloc::Global;
 
 use crate::{
     Cancelled, Key,
     admission::{self, Predict, TaskKind},
-    arena,
     machine::{Error, Input, Machine, NodeId, Outcome, Output, Pool, Spec},
     plane::{Memo, Plane, PlaneConfig, PlaneInput, PlaneOutput, RequestId},
     pool::{self, Header, Pool as Workers},
@@ -622,7 +621,7 @@ impl<W> Handle<W> {
     ///
     /// When the scheduler is gone.
     pub fn estimates(&self) -> Vec<u8> {
-        let (reply, estimates) = crossbeam_channel::bounded(1);
+        let (reply, estimates) = blaze_core::chan::bounded(1);
         _ = self.tx.send(Msg::Estimates { reply });
         recv_said(&estimates, "the scheduler's estimates")
             .unwrap_or_else(|_| panic!("the scheduler is gone"))
@@ -630,7 +629,7 @@ impl<W> Handle<W> {
 
     #[cfg(test)]
     fn slots(&self) -> usize {
-        let (reply, slots) = crossbeam_channel::bounded(1);
+        let (reply, slots) = blaze_core::chan::bounded(1);
         _ = self.tx.send(Msg::Slots { reply });
         slots.recv().unwrap_or_else(|_| panic!("the scheduler is gone"))
     }
@@ -746,8 +745,8 @@ impl<W: Send + 'static> Scheduler<W> {
         let owner = Owner {
             plane,
             predict,
-            heard: HashMap::new_in(Global), // alloc: the executor's state, for its life
-            works: HashMap::new_in(Global), // alloc: the executor's state, for its life
+            heard: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: the executor's state, for its life
+            works: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: the executor's state, for its life
             ctx,
             table,
             later: VecDeque::new(),
@@ -818,9 +817,9 @@ struct Entry<W> {
 struct Owner<R: Runner, P, M> {
     plane: Plane<M>,
     predict: P,
-    heard: HashMap<RequestId, Sender<Heard>, Global>, // alloc: the executor's state, for its life
+    heard: Map<RequestId, Sender<Heard>, FixedState, Global>, // alloc: the executor's state, for its life
     /// The work of each node added and not settled.
-    works: HashMap<NodeId, Entry<R::Work>, Global>, // alloc: the executor's state, for its life
+    works: Map<NodeId, Entry<R::Work>, FixedState, Global>, // alloc: the executor's state, for its life
     ctx: &'static Ctx<R>,
     table: Table<R>,
     /// What the owner tells itself (a node it cannot run fails), taken after the message at
@@ -1152,11 +1151,11 @@ fn run_io<R: Runner>(run: Ran<R>) {
 /// `rx.recv()`, said as a wait on the channel `name` ([`crate::wait`]) only when nothing is
 /// there yet: a receive that finds a message costs a `try_recv`. On a target without threads
 /// (the seed) the wait gives the pools this thread drives turns ([`pool::recv`]).
-fn recv_said<T>(rx: &Receiver<T>, name: &'static str) -> Result<T, crossbeam_channel::RecvError> {
+fn recv_said<T>(rx: &Receiver<T>, name: &'static str) -> Result<T, blaze_core::chan::RecvError> {
     match rx.try_recv() {
         Ok(it) => Ok(it),
-        Err(crossbeam_channel::TryRecvError::Disconnected) => Err(crossbeam_channel::RecvError),
-        Err(crossbeam_channel::TryRecvError::Empty) => {
+        Err(blaze_core::chan::TryRecvError::Disconnected) => Err(blaze_core::chan::RecvError),
+        Err(blaze_core::chan::TryRecvError::Empty) => {
             crate::wait::wait(crate::wait::WaitOn::Channel(name), None, || pool::recv(rx, name))
         }
     }
@@ -1174,9 +1173,9 @@ mod tests {
         time::Duration,
     };
 
-    use blaze_hash::{HashMap, HashSet};
+    use blaze_hash::{FixedState, Map, MapOpts, Set};
     use blaze_protocol::events::{Event, NodeKind, NodeState, Record};
-    use crossbeam_channel::bounded;
+    use blaze_core::chan::bounded;
     use blaze_core::lock::Lock;
     use std::alloc::Global;
 
@@ -1230,7 +1229,7 @@ mod tests {
 
     /// The database a test's work puts each key's value in before its `Done`, as real work
     /// does; the scheduler's memo reads it.
-    type Db = Arc<Lock<HashMap<Key, Outcome, Global>>>; // alloc: a test's model
+    type Db = Arc<Lock<Map<Key, Outcome, FixedState, Global>>>; // alloc: a test's model
 
     fn scheduler(workers: usize) -> (Scheduler<Work>, Db) {
         scheduler_on(&Topology::flat(workers)).0
@@ -1267,7 +1266,10 @@ mod tests {
         let pool: &'static Workers = Box::leak(Box::new(Workers::new(topology, false).unwrap()));
         let workers = pool.workers();
         let config = PlaneConfig { io: 1, work: workers };
-        let db: Db = Arc::new(Lock::new("graph.test.exec.db", HashMap::default()));
+        let db: Db = Arc::new(Lock::new(
+            "graph.test.exec.db",
+            Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+        ));
         let memo = {
             let db = Arc::clone(&db);
             move |key: Key| db.lock().get(&key).cloned()
@@ -1484,7 +1486,7 @@ mod tests {
             };
             assert!(drive(&mut machine, nodes, &work, &mut |_| {}, None).unwrap());
             let ran = ran.into_inner();
-            let on = |nodes: &[u32]| -> HashSet<ThreadId, Global> {
+            let on = |nodes: &[u32]| -> Set<ThreadId, FixedState, Global> {
                 // alloc: a test's model
                 ran.iter().filter(|(id, _)| nodes.contains(id)).map(|&(_, at)| at).collect()
             };
@@ -1505,8 +1507,11 @@ mod tests {
     #[test]
     fn shared_keys_run_once_for_two_requests() {
         let (scheduler, db) = scheduler(4);
-        let runs: Arc<Lock<HashMap<u8, u32, Global>>> =
-            Arc::new(Lock::new("graph.test.exec.runs", HashMap::default())); // alloc: a test's model
+        let runs: Arc<Lock<Map<u8, u32, FixedState, Global>>> =
+            Arc::new(Lock::new(
+                "graph.test.exec.runs",
+                Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            )); // alloc: a test's model
         let keyed = |id: u32, key: u8| {
             let (runs, db) = (Arc::clone(&runs), Arc::clone(&db));
             let work: Work = Arc::new(move || {

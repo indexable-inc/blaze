@@ -1501,3 +1501,195 @@ fn a_run_log_row_renders_its_key_only_when_read() {
     let why = planted.expect_err("a log formatting at the run's start printed a detached key");
     assert!(why.contains("Shy(5) printed with no database attached"), "{why}");
 }
+
+// --- SOTA upgrade tests: backdating, ImagedBytes, selective eviction, large indexed cycles ---
+
+#[blaze_memo::tracked(image, returns(copy))]
+fn parity(db: &dyn Db, leaf: Leaf) -> u64 {
+    db.ran(VALUE, leaf.gid(), 7);
+    *leaf.n(db) % 2
+}
+
+/// Output-fingerprint backdating / early-cutoff: when an imaged query recomputes after a read
+/// digest moved and produces the exact same serialized bytes as the previous record, re-filing
+/// is skipped and `image_backdated` is counted; when the output changes, it files normally.
+#[test]
+fn image_backdating_skips_refiling_when_output_is_unchanged() {
+    let mut world = World::new(values());
+    world.values[1][0] = 10; // even -> parity = 0
+    let mut resident = Resident::new(u64::MAX);
+
+    let ask = |world: &World, db: &TestDb, resident: &mut Resident| -> (u64, blaze_memo::Counts, usize) {
+        let facts = facts_now(world);
+        let now = |id: ContentId| facts.iter().find(|it| it.id == id).map(|it| it.digest);
+        let leaf = world.krate(1).leaves(db)[0];
+        take_counts();
+        let value = {
+            let query = |_: &Memo, row: Read| -> Option<Fact> { panic!("unexpected boundary {row:?}") };
+            let image = ImageOf { tool: tool(), records: &*resident, now, query };
+            db.memo.serve(&image, || parity(db, leaf))
+        };
+        let counts = take_counts();
+        let filed = proof::scope(|snap| db.memo.file_records(snap, resident));
+        (value, counts, filed)
+    };
+
+    // Cold run: computes parity(10) = 0 and files 1 record.
+    let first = db(world.first(config(Plant::None)));
+    let (v, c, filed) = ask(&world, &first, &mut resident);
+    assert_eq!((v, c.image_filed, c.image_backdated, filed), (0, 1, 0, 1));
+
+    // Edit leaf 10 -> 12 (different digest, SAME output 0): redone, backdated, NOT re-filed.
+    world.values[1][0] = 12;
+    let (memo, _) = world.next(&first.memo, &[1]);
+    let second = db(memo);
+    let (v, c, filed) = ask(&world, &second, &mut resident);
+    assert_eq!((v, c.image_redone, c.image_backdated, c.image_filed, filed), (0, 1, 1, 0, 0), "{c:?}");
+
+    // Control: edit leaf 12 -> 13 (output changes to 1): redone, NOT backdated, re-filed.
+    world.values[1][0] = 13;
+    let (memo, _) = world.next(&second.memo, &[1]);
+    let third = db(memo);
+    let (v, c, filed) = ask(&world, &third, &mut resident);
+    assert_eq!((v, c.image_redone, c.image_backdated, c.image_filed, filed), (1, 1, 0, 1, 1), "{c:?}");
+}
+
+/// Variable-length `ImagedBytes` adapters round-trip arbitrary byte slices and UTF-8 strings.
+#[test]
+fn imaged_bytes_round_trips_variable_length_values() {
+    use blaze_memo::{Imaged, ImagedBytes};
+    let _vec_codec = Imaged::<u32, Vec<u8>>::for_bytes();
+    let _box_codec = Imaged::<u32, Box<[u8]>>::for_bytes();
+    let _arc_codec = Imaged::<u32, Arc<[u8]>>::for_bytes();
+    let _str_codec = Imaged::<u32, String>::for_bytes();
+
+    let payload = b"blaze variable-length payload \x00\xff";
+    let v = Vec::<u8>::from_imaged_bytes(payload).expect("vec decode");
+    assert_eq!(v.as_imaged_bytes(), payload);
+    let b = Box::<[u8]>::from_imaged_bytes(payload).expect("box decode");
+    assert_eq!(b.as_imaged_bytes(), payload);
+    let a = Arc::<[u8]>::from_imaged_bytes(payload).expect("arc decode");
+    assert_eq!(a.as_imaged_bytes(), payload);
+
+    let text = "hello blaze memo";
+    let s = String::from_imaged_bytes(text.as_bytes()).expect("string decode");
+    assert_eq!(s.as_imaged_bytes(), text.as_bytes());
+    assert!(String::from_imaged_bytes(&[0xff, 0xfe]).is_none(), "invalid UTF-8 refused");
+}
+
+#[blaze_memo::tracked(returns(ref))]
+fn pad_arena(db: &dyn Db, krate: Crate, n: u32) -> [u64; 512] {
+    let base = *krate.leaves(db)[0].n(db);
+    [base.wrapping_add(u64::from(n)); 512]
+}
+
+/// Selective unsealed-first eviction in `Memo::next`: when carried memory exceeds `cap_bytes`,
+/// unsealed arenas are evicted (largest first) while warm sealed dependency arenas are kept;
+/// sealed arenas are dropped only if still over cap after unsealed arenas are gone.
+#[test]
+fn selective_eviction_preserves_warm_sealed_arenas_under_cap() {
+    let make_snapshot = |cap_bytes: u64| -> (Memo, [Crate; 4]) {
+        let cfg = Config {
+            arenas: 5,
+            reads: Reads::Kept,
+            flight: Arc::new(Alone::new()),
+            cap_bytes,
+            plant: Plant::None,
+        };
+        let mut builder = Memo::builder(cfg);
+        let session = builder.arena(0, Tag::Query).id();
+        let make_crate = |builder: &mut blaze_memo::Builder, idx: u32, seal: bool, dep: Option<Crate>| {
+            let inputs = builder.arena(idx, Tag::Query);
+            inputs.borrows(session);
+            if let Some(d) = dep {
+                inputs.borrows(d.gid().arena());
+            }
+            if seal {
+                inputs.seal();
+            }
+            let leaves = (0..LEAVES).map(|l| Leaf::new(&inputs, leaf_fact(idx, l, u64::from(idx)), u64::from(idx))).collect();
+            let deps = dep.into_iter().collect();
+            Crate::new(&inputs, crate_fact(idx), leaves, deps)
+        };
+        let c1 = make_crate(&mut builder, 1, true, None);       // sealed warm dependency
+        let c2 = make_crate(&mut builder, 2, false, Some(c1));  // unsealed, small
+        let c3 = make_crate(&mut builder, 3, false, Some(c1));  // unsealed, large
+        let c4 = make_crate(&mut builder, 4, false, Some(c1));  // unsealed, medium
+        (builder.build(), [c1, c2, c3, c4])
+    };
+
+    // First measure the slab size of the 5 arenas before inflating unsealed arena 3.
+    let (memo_probe, crates_probe) = make_snapshot(u64::MAX);
+    let dp = db(memo_probe);
+    pad_arena(&dp, crates_probe[0], 0);
+    for i in 0..2 {
+        pad_arena(&dp, crates_probe[1], i);
+        pad_arena(&dp, crates_probe[3], i);
+    }
+    let baseline_held = dp.memo.held() as u64;
+    for i in 0..4000 {
+        pad_arena(&dp, crates_probe[2], i);
+    }
+    let inflated_held = dp.memo.held() as u64;
+    assert!(inflated_held > baseline_held, "inflating arena 3 grew held memory ({baseline_held} -> {inflated_held})");
+
+    // Set `cap_bytes` right at `baseline_held`: evicting the single largest unsealed arena (3)
+    // brings carried memory back under cap, preserving warm sealed arena 1 (and small arenas 0, 2, 4)!
+    let (memo_tight, crates_tight) = make_snapshot(baseline_held);
+    let dt = db(memo_tight);
+    pad_arena(&dt, crates_tight[0], 0);
+    for i in 0..2 {
+        pad_arena(&dt, crates_tight[1], i);
+        pad_arena(&dt, crates_tight[3], i);
+    }
+    for i in 0..4000 {
+        pad_arena(&dt, crates_tight[2], i);
+    }
+    let next = dt.memo.next(&[]).expect("next snapshot succeeds");
+    assert!(
+        !next.dropped().contains(&1),
+        "sealed warm dependency arena 1 should be preserved; dropped: {:?}",
+        next.dropped()
+    );
+    assert!(
+        next.dropped().contains(&3),
+        "largest unsealed arena 3 should be evicted first; dropped: {:?}",
+        next.dropped()
+    );
+
+    // When cap_bytes is 0, sealed arena 1 must also be dropped to stay within cap.
+    let (memo_zero, crates_zero) = make_snapshot(0);
+    let dz = db(memo_zero);
+    pad_arena(&dz, crates_zero[0], 0);
+    let next_zero = dz.memo.next(&[]).expect("next snapshot at cap 0");
+    assert!(
+        next_zero.dropped().contains(&1),
+        "sealed arena 1 must drop when cap_bytes is 0; dropped: {:?}",
+        next_zero.dropped()
+    );
+}
+
+#[blaze_memo::tracked(returns(copy), cycle_initial = big_ring_init)]
+fn big_ring(db: &dyn Db, krate: Crate, node: u32) -> u64 {
+    const N: u32 = 24;
+    let next = big_ring(db, krate, (node + 1) % N);
+    let floor = *krate.leaves(db)[0].n(db);
+    next.max(floor).min(floor + 3)
+}
+
+fn big_ring_init(_db: &dyn Db, _krate: Crate, _node: u32) -> u64 {
+    0
+}
+
+/// A 24-member fixpoint cycle (> `BOOK_INDEX_THRESHOLD = 16`) exercises the hash-indexed
+/// `Book::provs` and `Book::keeps` paths across multiple convergence rounds.
+#[test]
+fn large_cycle_over_index_threshold_converges_correctly() {
+    let mut world = World::new(values());
+    let d = db(world.first(config(Plant::None)));
+    let krate = world.krate(1);
+    let want = *krate.leaves(&d)[0].n(&d);
+    for node in 0..24u32 {
+        assert_eq!(big_ring(&d, krate, node), want, "ring node {node}");
+    }
+}

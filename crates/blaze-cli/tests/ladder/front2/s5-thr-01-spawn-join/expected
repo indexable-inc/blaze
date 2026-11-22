@@ -1,0 +1,9 @@
+status 0
+stdout
+[499500, 1499500, 2499500, 3499500]
+7998000
+true
+[2, 4, 6]
+Some("named") Some("main")
+true
+slept

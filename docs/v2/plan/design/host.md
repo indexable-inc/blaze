@@ -1,6 +1,7 @@
 ---
-status: plan
-summary: The host of the keyed driver. blaze-keyed's driver decides what a request does (certificate, then a mark per unit, then records found by what they read); blaze-host performs its effects on a real store and pool with a Front it is given. This page says the three crates (blaze-unitkey, blaze-front, blaze-host), what each task reads and writes, and each operation's floor.
+status: superseded
+superseded_by: end-state.md#d157-one-driver-a-stage-is-a-kind-of-task
+summary: (crates/blaze-host deleted 2026-11-20) The host of the keyed driver. blaze-keyed's driver decides what a request does (certificate, then a mark per unit, then records found by what they read); blaze-host performs its effects on a real store and pool with a Front it is given. This page says the three crates (blaze-unitkey, blaze-front, blaze-host), what each task reads and writes, and each operation's floor.
 date: 2026-11-13
 ---
 # The host: one command drives the keyed driver on real code

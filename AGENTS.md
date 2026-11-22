@@ -13,25 +13,24 @@ iterate. Rules 28, 62, 66 and 67 say how.
 
 ## The goal
 
-Fast incremental compiles of real Rust in a million-line workspace. When two trade, the order is:
-incremental time (large crates and files, after a restart too) and lints as fast; records from
-remote; memory; cold time; cleanup that never blocks; disk use. Best on 128 cores, good on a typical
-Mac (8 to 16 cores, 16 to 64 GB), with one code path sized by the machine.
+Fast incremental compiles, lints and tests of real Rust in monorepos of millions of lines, enormous
+crates and files included: an edit redoes only what changed. When two trade, the order is:
+incremental time (after a restart too) with lints as fast; fetching published records; memory; cold
+time; cleanup that never blocks; disk use. Best on 128 cores, good on a typical Mac, one code path.
 
 ## The design ([in full](docs/v2/plan/design/bottom.md))
 
 - Everything kept is a record: keyed from text, written once, read in place, in columns.
-- A command is a process that answers and exits; no daemon holds state between builds.
+- A command answers and exits; a live process may speed it, and a restart re-indexes nothing.
 - A record is valid by its key, or else by its read list checked against today's facts.
 - No dependency graph in memory: candidates are found forward from what changed.
 - Work is at item grain: one body, instance, macro call or script run per task.
 - A program runs from code records in its own process: compiled on first call, no link step.
 - A dependency is only its records and an item only its key; text for the crate compiled alone.
 - A check happens once and leaves a proof later code takes; a coarse proof covers all under it.
-- Records are shared by content: CI fills a cache anyone can read, so std arrives precompiled.
-- Decide at run time: a hook, check or optimization is a version swapped into a slot.
-- A lint finding is a record too: errors before the answer, advice after, analyses in the
-  background.
+- Records share by content across checkouts; std's arrive precomputed from R2.
+- Decide at run time: hooks and opts swap into slots, guided by persisted PGO (`export` default).
+- Lint findings are records: errors before the answer, advice after, PGO-ranked in background.
 
 ## Scope
 
@@ -39,18 +38,16 @@ In scope:
 - Cargo workspaces. The acceptance projects are reth, tempo and blaze itself.
 - Hosts: macOS on arm64, and Linux (arm64 first; x86-64 is covered by CI).
 - A build runs when asked, and may leave a helper with an expiry that never builds on its own.
-- `run`, `test`, `check`; later `export` (a native file). No `build`. A run compiles what is called.
-- Dependencies and cached records are fully optimized; workspace code is built fast, then tiered up
-  in the background, the top tier optimizing across functions at function grain.
-- The shared cache is read without a login. Only CI, and later the remote workers, write to it.
-- Private builds can always stay local: nothing leaves the machine unless an organisation opts in.
+- `run`, `test`, `check`; `export` (native, PGO by default). No `build`. Runs compile what's called.
+- Deps and cached records are fully optimized; workspace code tiers up via cross-fn LTO & PGO.
+- std's records (names, heads, code) are fetched per platform from R2, CI-written; yours stay local.
 - An old home after an upgrade is detected, reported and rebuilt; nothing is migrated.
 - blaze's own code is on bstd and our collections: no `std`, `alloc` or third-party crate.
 - A plain Rust project adopts blaze's checks by steps: `rust`, `suggest`, `edition`, `strict`.
 
 Not now:
 - `blaze watch` or building on save; live patching that keeps a program's state (wanted later).
-- Windows, and Buck or Bazel workspaces.
+- Windows; Buck or Bazel workspaces; a project's records shared between machines; remote runs.
 
 ## How work is done
 
@@ -62,9 +59,8 @@ Not now:
 
 ## Rules
 
-One line per rule; its full text is in the skill its heading names, under .agents/skills/: load that
-skill before work it covers. Numbers are stable ids that code cites, not an order. Edit
-tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
+One line per rule; the full text is in its heading's skill (.agents/skills/): load it before work it
+covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it with `--write`.
 
 ### Memory and data (skill `memory-and-data`)
 - **11. bump-allocate**: Don't allocate where a borrow does; where you must, name the allocator in code (a frame, `Global`).
@@ -115,14 +111,16 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 
 ### Speed and tracing (skill `perf-and-tracing`)
 - **16. slow-is-p0-traced**: Anything slow or large is a P0 until the profile names it; the fix quotes before and after.
-- **60. incremental-first**: Judge by the edit loop first; trade in the order incremental, memory, cold, disk cleanup, disk.
+- **60. incremental-first**: Judge by the edit loop first; trade: incremental and lints, remote, memory, cold, cleanup, disk.
+- **84. per-core-units**: Report throughput and latency in per-core units (`MB/s/core`, `ns/op/core`) and name core count.
+- **86. pgo-by-default**: Persist decayed cross-run PGO (`BPG1`) for JIT, LTO, PGL, and default `blaze export`; pad 128B.
 
 ### Evidence and debugging (skill `debugging`)
 - **17. ask-the-profile-first**: Say why a build was slow, reran or grew from its profile, before guessing or measuring.
 - **61. claims-from-evidence**: State as fact only what a tool call here showed; a pass counts only with proof the check ran.
 
 ### Design and changing code (skill `changing-code`)
-- **13. fix-through-blaze-lints**: Change many sites with astlog rules (`blaze check --rules`) or a ban and `--fix`: never by text.
+- **13. fix-through-blaze-lints**: Change many sites with an astlog rules file or a `.clippy.toml` ban: never by text.
 - **24. whole-ports**: A shared signature changes with all its callers in one batch; the tree compiles at every save.
 - **28. best-long-term-design**: Pick the best long-term design, not the least work; be proud of the first iteration, then prove it.
 - **29. spec-then-build**: A change that needs a design gets a short spec, then the same lane builds it at once.
@@ -134,19 +132,21 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 - **63. agents-json**: Read every how-to in `agents/`, search its annoyances for your area, add a row as things happen.
 - **66. end-state-not-hill-climb**: A second fix to one mechanism stops it until an outsider says rebuild or delete.
 - **67. within-ten-percent-of-the-floor**: Aim every design at the floor from the start; state it and report the ratio.
-- **72. edit-rust-by-syntax**: Only the edit tools, astlog rules, `blaze check --fix` or `ast-grep`; never a heredoc or `sed`.
+- **72. edit-rust-by-syntax**: Only the edit tools, astlog rules or `ast-grep`; never a heredoc, `sed` or a script.
 - **73. type-then-lint-then-rule**: Prevent a mistake by a type, then a lint with a fix; a rule here comes last.
-- **76. correct-by-construction**: A value with an obligation or meaning is a type saying so: linear, proof, typed id, checked length.
+- **76. correct-by-construction**: A value that means something is a newtype, never a bare number; an obligation is linear or a proof.
 - **78. strategy-is-a-type-parameter**: A choice between strategies is a type parameter at one seam, each instantiation tested equal.
 - **79. interfaces-first**: A rewrite starts as one small crate of types and state machines that compiles and is simulated.
+- **83. options-struct**: One constructor a type, `new(Opts { .. })`: choices required, tunables defaulted; no `with_*` names.
+- **85. newtypes-and-named-returns**: Use newtypes, enums and named return structs instead of bare primitives or `(Option<T>, bool)`.
 
 ### Building, lanes and machines (skill `build-and-test`)
 - **2. blaze-builds-blaze**: Cargo is the dev-loop builder for now; blaze still builds itself and makes every verdict.
 - **7. verify-on-real-projects**: Judge blaze by real projects it builds passing their own tests, never against cargo.
-- **8. own-nightly**: Each project builds with `harness/toolchain`; toolchain files, rustup and `RUSTC` are ignored.
+- **8. own-nightly**: Each project builds with `pins/toolchain`; toolchain files, rustup and `RUSTC` are ignored.
 - **22. measure-the-exact-tree**: A measurement, bisect or checkpoint names and keeps the tree and binary it ran on.
 - **34. work-in-ix-vms**: Build, test and smoke on the Mac, or on `blaze-vm` when it answers; no AWS, no x86 VM.
-- **35. fan-out-write-only**: Lanes only write and never wait on a compile; the main agent compiles the tree in batches.
+- **35. fan-out-write-only**: Lanes write and check their own crate through the one build lock; the main agent admits the tree.
 - **36. worktree-per-lane**: One directory, each lane in its own files; a worktree is the exception; never `git stash`.
 - **39. clean-up-lane**: When a lane is done, delete what it made: VM state, worktrees, branches, processes left running.
 - **46. ledger-decides**: Work comes from the objectives ledger and is done when its row's check passes on a named commit.
@@ -167,6 +167,7 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 - **41. docs-say-what-they-are**: Front matter says current, plan, record or superseded; current docs are kept true.
 - **42. scripts-take-typed-input**: A script takes one JSON value parsed into a frozen dataclass, not flags or env vars.
 - **49. docs-stay-small**: The plan, the ledger, the bounds and one spec per unbuilt design; delete what stops being true.
+- **85. lint-every-jank**: Whenever you encounter janky, fragile, or anti-pattern code (e.g. double-indirection `Arc<Vec<T>>`/`Arc<String>`, raw `libc::mmap`/`sandbox-exec` outside `blaze-inproc`/`bstd::procs::hermetic`, hand-rolled workarounds), add a `blaze-lint` rule to flag it — or auto-fix it where safe and deterministic — so the pattern can never recur.
 
 ## Code Review Rules
 

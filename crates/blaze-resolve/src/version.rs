@@ -2,10 +2,35 @@
 //! versions of `rust-version` and package id specs (`cargo-util-schemas`'
 //! `core/partial_version.rs` and `manifest/rust_version.rs`), of cargo 1.99.0 (5f94df4789).
 
+use std::alloc::Global;
 use std::fmt;
 
-use anyhow::{Result, bail};
-use semver::{Comparator, Op, Version, VersionReq};
+use blaze_semver::{BuildMetadata, Comparator, Limits, Op, Prerelease};
+
+use crate::error::{PartialWhy, ResolveError};
+
+/// A package's version. Pre-release and build metadata past blaze-semver's inline size live in
+/// the process allocator: a version is kept as long as the package ids interned with it.
+pub type Version = blaze_semver::Version<Global>;
+
+/// A dependency's version requirement, its comparators in the process allocator, as long as
+/// the dependency that holds it.
+pub type VersionReq = blaze_semver::VersionReq<Global>;
+
+/// `text` as a version, by cargo's limits.
+pub fn parse_version(text: &str) -> Result<Version, blaze_semver::Error> {
+    Version::parse_in(text, Limits::CARGO, Global)
+}
+
+/// `text` as a version requirement, by cargo's limits.
+pub fn parse_req(text: &str) -> Result<VersionReq, blaze_semver::Error> {
+    VersionReq::parse_in(text, Limits::CARGO, Global)
+}
+
+/// `*`: any release.
+pub fn star() -> VersionReq {
+    VersionReq::star_in(Global)
+}
 
 /// A dependency's version requirement, and what a lock file or `cargo update --precise` pinned
 /// it to.
@@ -21,15 +46,14 @@ pub enum OptVersionReq {
 }
 
 pub(crate) fn to_req(version: &Version, op: Op) -> VersionReq {
-    VersionReq {
-        comparators: vec![Comparator {
-            op,
-            major: version.major,
-            minor: Some(version.minor),
-            patch: Some(version.patch),
-            pre: version.pre.clone(),
-        }],
-    }
+    let comparator = Comparator {
+        op,
+        major: version.major,
+        minor: Some(version.minor),
+        patch: Some(version.patch),
+        pre: version.pre.clone(),
+    };
+    VersionReq { comparators: blaze_own::Vec::from_array_in([comparator], Global) }
 }
 
 impl OptVersionReq {
@@ -60,7 +84,7 @@ impl OptVersionReq {
         assert!(self.matches(version), "cannot lock {} to {}", self, version);
         let version = version.clone();
         *self = match self {
-            OptVersionReq::Any => OptVersionReq::Locked(version, VersionReq::STAR),
+            OptVersionReq::Any => OptVersionReq::Locked(version, star()),
             OptVersionReq::Req(req)
             | OptVersionReq::Locked(_, req)
             | OptVersionReq::Precise(_, req) => OptVersionReq::Locked(version, req.clone()),
@@ -70,7 +94,7 @@ impl OptVersionReq {
     pub fn precise_to(&mut self, version: &Version) {
         let version = version.clone();
         *self = match self {
-            OptVersionReq::Any => OptVersionReq::Precise(version, VersionReq::STAR),
+            OptVersionReq::Any => OptVersionReq::Precise(version, star()),
             OptVersionReq::Req(req)
             | OptVersionReq::Locked(_, req)
             | OptVersionReq::Precise(_, req) => OptVersionReq::Precise(version, req.clone()),
@@ -141,8 +165,8 @@ pub struct PartialVersion {
     pub major: u64,
     pub minor: Option<u64>,
     pub patch: Option<u64>,
-    pub pre: Option<semver::Prerelease>,
-    pub build: Option<semver::BuildMetadata>,
+    pub pre: Option<Prerelease<Global>>,
+    pub build: Option<BuildMetadata<Global>>,
 }
 
 impl PartialVersion {
@@ -151,21 +175,20 @@ impl PartialVersion {
             major: self.major,
             minor: self.minor?,
             patch: self.patch?,
-            pre: self.pre.clone().unwrap_or_default(),
-            build: self.build.clone().unwrap_or_default(),
+            pre: self.pre.clone().unwrap_or(Prerelease::EMPTY),
+            build: self.build.clone().unwrap_or(BuildMetadata::EMPTY),
         })
     }
 
     pub fn to_caret_req(&self) -> VersionReq {
-        VersionReq {
-            comparators: vec![Comparator {
-                op: Op::Caret,
-                major: self.major,
-                minor: self.minor,
-                patch: self.patch,
-                pre: self.pre.clone().unwrap_or_default(),
-            }],
-        }
+        let comparator = Comparator {
+            op: Op::Caret,
+            major: self.major,
+            minor: self.minor,
+            patch: self.patch,
+            pre: self.pre.clone().unwrap_or(Prerelease::EMPTY),
+        };
+        VersionReq { comparators: blaze_own::Vec::from_array_in([comparator], Global) }
     }
 
     /// Whether `version` is this one, build metadata included where this has some. A
@@ -195,29 +218,28 @@ impl From<Version> for PartialVersion {
 }
 
 impl std::str::FromStr for PartialVersion {
-    type Err = anyhow::Error;
+    type Err = ResolveError;
 
-    fn from_str(value: &str) -> Result<Self> {
-        if let Ok(ver) = Version::parse(value) {
+    fn from_str(value: &str) -> Result<Self, ResolveError> {
+        if let Ok(ver) = parse_version(value) {
             return Ok(ver.into());
         }
+        let refuse = |why| ResolveError::PartialVersion { text: value.to_owned(), why };
         // A one-comparator caret requirement without the `^` is a partial version.
-        let mut version_req = match VersionReq::parse(value) {
+        let mut version_req = match parse_req(value) {
             Ok(req) => req,
-            Err(_) if value.contains('-') => {
-                bail!("unexpected prerelease field, expected a version like \"1.32\"")
-            }
-            Err(_) if value.contains('+') => {
-                bail!("unexpected build field, expected a version like \"1.32\"")
-            }
-            Err(_) => bail!("expected a version like \"1.32\""),
+            Err(_) if value.contains('-') => return Err(refuse(PartialWhy::Prerelease)),
+            Err(_) if value.contains('+') => return Err(refuse(PartialWhy::Build)),
+            Err(_) => return Err(refuse(PartialWhy::NotAVersion)),
         };
         if version_req.comparators.len() != 1 {
-            bail!("unexpected version requirement, expected a version like \"1.32\"")
+            return Err(refuse(PartialWhy::Requirement));
         }
-        let comp = version_req.comparators.pop().unwrap();
+        let Some(comp) = version_req.comparators.pop() else {
+            unreachable!("a requirement of one comparator has one to pop")
+        };
         if comp.op != Op::Caret || value.starts_with('^') {
-            bail!("unexpected version requirement, expected a version like \"1.32\"")
+            return Err(refuse(PartialWhy::Requirement));
         }
         Ok(PartialVersion {
             major: comp.major,
@@ -264,13 +286,8 @@ impl RustVersion {
     /// Whether a toolchain of version `rustc` (its prerelease ignored) meets this.
     pub fn is_compatible_with(&self, rustc: &PartialVersion) -> bool {
         let msrv = self.to_partial().to_caret_req();
-        let rustc = Version {
-            major: rustc.major,
-            minor: rustc.minor.unwrap_or_default(),
-            patch: rustc.patch.unwrap_or_default(),
-            pre: Default::default(),
-            build: Default::default(),
-        };
+        let rustc =
+            Version::new(rustc.major, rustc.minor.unwrap_or(0), rustc.patch.unwrap_or(0));
         msrv.matches(&rustc)
     }
 
@@ -286,15 +303,16 @@ impl RustVersion {
 }
 
 impl std::str::FromStr for RustVersion {
-    type Err = anyhow::Error;
+    type Err = ResolveError;
 
-    fn from_str(value: &str) -> Result<Self> {
+    fn from_str(value: &str) -> Result<Self, ResolveError> {
         let partial: PartialVersion = value.parse()?;
+        let refuse = |why| ResolveError::PartialVersion { text: value.to_owned(), why };
         if partial.pre.is_some() {
-            bail!("unexpected prerelease field, expected a version like \"1.32\"")
+            return Err(refuse(PartialWhy::Prerelease));
         }
         if partial.build.is_some() {
-            bail!("unexpected build field, expected a version like \"1.32\"")
+            return Err(refuse(PartialWhy::Build));
         }
         Ok(RustVersion { major: partial.major, minor: partial.minor, patch: partial.patch })
     }
@@ -311,12 +329,16 @@ mod tests {
     use super::*;
 
     fn v(s: &str) -> Version {
-        s.parse().unwrap()
+        parse_version(s).unwrap()
+    }
+
+    fn r(s: &str) -> VersionReq {
+        parse_req(s).unwrap()
     }
 
     #[test]
     fn locked_matches_build_metadata_exactly() {
-        let mut req = OptVersionReq::Req("^1".parse().unwrap());
+        let mut req = OptVersionReq::Req(r("^1"));
         req.lock_to(&v("1.0.0+bar"));
         assert!(req.is_locked() && req.is_exact());
         assert!(req.matches(&v("1.0.0+bar")));
@@ -339,13 +361,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "cannot lock")]
     fn lock_outside_requirement() {
-        OptVersionReq::Req("^1".parse().unwrap()).lock_to(&v("2.0.0"));
+        OptVersionReq::Req(r("^1")).lock_to(&v("2.0.0"));
     }
 
     #[test]
     fn exactness() {
         assert!(OptVersionReq::exact(&v("1.2.3")).is_exact());
-        assert!(!OptVersionReq::Req("=1.2".parse().unwrap()).is_exact());
+        assert!(!OptVersionReq::Req(r("=1.2")).is_exact());
         assert!(!OptVersionReq::Any.is_exact());
     }
 

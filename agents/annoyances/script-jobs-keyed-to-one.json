@@ -1,0 +1,14 @@
+{
+ "id": "script-jobs-keyed-to-one",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane NJ under LANES-0445",
+ "where": "crates/blaze-build-script/src/env.rs (NUM_JOBS in the keyed Env), crates/blaze-proc-macro/src/native_script.rs",
+ "what": "Every build script was told NUM_JOBS=1, inside the keyed environment, so native scripts (librocksdb-sys and the rest of NATIVE_EVERY_MODE) compiled C and C++ one file at a time: tempo's cold check went from 170 s to 627 s, 470 s of it script time (check-g050256).",
+ "cost": "a 3.7x cold regression on tempo once native scripts ran",
+ "cause": "a machine hint (the job count) lived in the same type as the key's inputs, so the only safe value was a constant",
+ "whys": "Env was both what the key hashes and what the child is given; a varying NUM_JOBS would have split keys by machine (rule 25), so it was pinned to 1",
+ "class": "a run-only hint stored in a keyed type is either keyed (machine in the key) or frozen (slow)",
+ "prevention": "done: Env::for_run(Jobs, alloc) -> RunEnv, a separate type no key takes; native runs get a command jobserver fifo (jobserver.rs) and NUM_JOBS=workers; test script_jobs_are_told_to_the_run_and_never_keyed. Owed: blaze's scheduler taking tokens for its own workers.",
+ "workaround": "none needed now",
+ "state": "fixed (first piece)"
+}

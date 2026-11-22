@@ -19,18 +19,20 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 use std::fmt;
+
+use blaze_data::Value;
 
 use crate::advisory::is_id;
 use crate::date::Date;
 
 /// One acceptance of an advisory.
-#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Accept {
     pub id: String,
     pub reason: String,
-    #[serde(serialize_with = "crate::report::as_text")]
+    /// Written in the report as its `Display`, `YYYY-MM-DD`.
     pub until: Date,
 }
 
@@ -60,18 +62,19 @@ impl fmt::Display for SettingsRefused {
 
 impl Settings {
     /// The `[workspace.metadata.blaze.audit]` table, or `None` when the workspace has none.
-    pub fn parse(table: Option<&toml::Value>) -> Result<Settings, SettingsRefused> {
+    /// The table is TOML lowered to a [`Value`] (a datetime as its text).
+    pub fn parse<A: Allocator>(table: Option<&Value<A>>) -> Result<Settings, SettingsRefused> {
         let refuse = |key: &str, why: &str| SettingsRefused { key: key.to_owned(), why: why.to_owned() };
         let mut settings = Settings::default();
         let Some(table) = table else {
             return Ok(settings);
         };
-        let table = table.as_table().ok_or_else(|| SettingsRefused {
+        let table = table.as_map().ok_or_else(|| SettingsRefused {
             key: String::new(),
             why: "is not a table".to_owned(),
         })?;
-        for (key, value) in table {
-            match key.as_str() {
+        for (key, value) in table.iter() {
+            match key {
                 "database" => {
                     let path = value.as_str().ok_or_else(|| refuse(key, "is not a string"))?;
                     if path.is_empty() {
@@ -80,7 +83,7 @@ impl Settings {
                     settings.database = Some(path.to_owned());
                 }
                 "allow-unpinned-paths" => {
-                    let list = value.as_array().ok_or_else(|| refuse(key, "is not a list of package names"))?;
+                    let list = value.as_list().ok_or_else(|| refuse(key, "is not a list of package names"))?;
                     for name in list {
                         let name = name.as_str().ok_or_else(|| refuse(key, "has an item that is not a package name"))?;
                         settings.allow_unpinned_paths.push(name.to_owned());
@@ -89,7 +92,7 @@ impl Settings {
                     settings.allow_unpinned_paths.dedup();
                 }
                 "accept" => {
-                    let list = value.as_array().ok_or_else(|| refuse(key, "is not a list of `{ id, reason, until }`"))?;
+                    let list = value.as_list().ok_or_else(|| refuse(key, "is not a list of `{ id, reason, until }`"))?;
                     for (at, item) in list.iter().enumerate() {
                         settings.accept.push(accept(at, item)?);
                     }
@@ -120,17 +123,17 @@ impl Settings {
     }
 }
 
-fn accept(at: usize, item: &toml::Value) -> Result<Accept, SettingsRefused> {
+fn accept<A: Allocator>(at: usize, item: &Value<A>) -> Result<Accept, SettingsRefused> {
     let key = format!("accept[{at}]");
     let refuse = |why: String| SettingsRefused { key: key.clone(), why };
-    let table = item.as_table().ok_or_else(|| refuse("is not a table `{ id, reason, until }`".to_owned()))?;
-    if let Some(other) = table.keys().find(|it| !["id", "reason", "until"].contains(&it.as_str())) {
+    let table = item.as_map().ok_or_else(|| refuse("is not a table `{ id, reason, until }`".to_owned()))?;
+    if let Some((other, _)) = table.iter().find(|(it, _)| !["id", "reason", "until"].contains(it)) {
         return Err(refuse(format!("has `{other}`, which is not known (`id`, `reason` and `until` are)")));
     }
+    // A TOML datetime (`until = 2027-01-31` unquoted) is lowered to its text.
     let field = |name: &str| -> Result<String, SettingsRefused> {
         match table.get(name) {
-            Some(toml::Value::String(it)) => Ok(it.clone()),
-            Some(toml::Value::Datetime(it)) => Ok(it.to_string()),
+            Some(Value::Text(it)) => Ok(it.as_str().to_owned()),
             Some(_) => Err(refuse(format!("has `{name}`, which is not a string"))),
             None => Err(refuse(format!("has no `{name}`: an acceptance needs an id, a reason and an expiry"))),
         }
@@ -149,8 +152,8 @@ fn accept(at: usize, item: &toml::Value) -> Result<Accept, SettingsRefused> {
 }
 
 /// How a finding counts.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
+/// In the report, `error`, `warning` or `accepted`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Severity {
     Error,
     Warning,

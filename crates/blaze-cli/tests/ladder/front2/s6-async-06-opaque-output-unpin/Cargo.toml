@@ -1,0 +1,4 @@
+[package]
+name = "ladder-s6-async-06-opaque-output-unpin"
+version = "0.1.0"
+edition = "2024"

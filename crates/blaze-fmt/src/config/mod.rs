@@ -1,14 +1,14 @@
 // Follows `src/tools/rustfmt/src/config/mod.rs` at rust-lang/rust 12433c307 (MIT or Apache-2.0).
 
+use std::alloc::Global;
 use std::cell::Cell;
-use std::fs::File;
-use std::io::{Error, ErrorKind, Read};
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::{env, fs};
-
-use thiserror::Error;
+use std::{env, fmt, fs};
 
 use crate::config::config_type::ConfigType;
+#[allow(unreachable_pub)]
+pub use crate::config::config_type::{NoTomlForm, OptionRefusal, Refusal};
 #[allow(unreachable_pub)]
 pub use crate::config::file_lines::{FileLines, FileName, Range};
 #[allow(unreachable_pub)]
@@ -209,9 +209,155 @@ create_config! {
          files that would be formatted when used with `--check` mode. ";
 }
 
-#[derive(Error, Debug)]
-#[error("Could not output config: {0}")]
-pub struct ToTomlError(toml::ser::Error);
+/// A config that could not be written out as TOML.
+#[derive(Debug)]
+pub enum ToTomlError {
+    /// The value of `option` has no TOML form.
+    NoTomlForm {
+        option: &'static str,
+        why: NoTomlForm,
+    },
+    /// blaze-toml could not write the table.
+    Write(blaze_toml::WriteError<Global>),
+}
+
+impl fmt::Display for ToTomlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ToTomlError::NoTomlForm { option, why } => {
+                write!(f, "Could not output config: `{option}`: {why}")
+            }
+            ToTomlError::Write(error) => write!(f, "Could not output config: {error}"),
+        }
+    }
+}
+
+impl core::error::Error for ToTomlError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            ToTomlError::NoTomlForm { .. } => None,
+            ToTomlError::Write(error) => Some(error),
+        }
+    }
+}
+
+/// A rustfmt.toml that could not be found, read or used; each names the file, and a refused
+/// value its option and line.
+#[derive(Debug)]
+pub enum ConfigError {
+    /// An IO error while `what` (`reading`, `canonicalizing`, ...) `path`.
+    Io {
+        what: &'static str,
+        path: PathBuf,
+        error: io::Error,
+    },
+    /// `--config-path` names nothing.
+    NotFound { path: PathBuf },
+    /// The file is no TOML.
+    Toml {
+        file: PathBuf,
+        line: usize,
+        column: usize,
+        error: blaze_toml::Error,
+    },
+    /// Options blaze fmt does not run, one line each.
+    Refused { file: PathBuf, options: Vec<String> },
+    /// A value `option` does not take.
+    Option {
+        file: PathBuf,
+        option: &'static str,
+        below: String,
+        line: usize,
+        column: usize,
+        what: Refusal,
+    },
+    /// The file has no parent directory to resolve `ignore` against.
+    NoParent { file: PathBuf },
+}
+
+impl ConfigError {
+    fn io<'p>(what: &'static str, path: &'p Path) -> impl FnOnce(io::Error) -> ConfigError + 'p {
+        move |error| ConfigError::Io {
+            what,
+            path: path.to_owned(),
+            error,
+        }
+    }
+
+    fn option(file: &Path, text: &str, option: &'static str, refusal: OptionRefusal) -> ConfigError {
+        let (line, column) = blaze_toml::line_col(text, refusal.at);
+        ConfigError::Option {
+            file: file.to_owned(),
+            option,
+            below: refusal.below,
+            line,
+            column,
+            what: refusal.what,
+        }
+    }
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigError::Io { what, path, error } => {
+                write!(f, "{what} {}: {error}", path.display())
+            }
+            ConfigError::NotFound { path } => write!(
+                f,
+                "Error: unable to find a config file for the given path: `{}`",
+                path.display()
+            ),
+            ConfigError::Toml {
+                file,
+                line,
+                column,
+                error,
+            } => write!(
+                f,
+                "{}:{line}:{column}: Could not parse TOML: {}",
+                file.display(),
+                error.what
+            ),
+            // rustfmt warns of an option it does not know and formats without it; blaze fmt
+            // has no rustfmt to leave it to, so an option it would not run refuses the file,
+            // naming each.
+            ConfigError::Refused { file, options } => write!(
+                f,
+                "blaze fmt refuses `{}`: it has options blaze fmt does not run (remove them, or \
+                 file them against crates/blaze-fmt):\n{}",
+                file.display(),
+                options.join("\n")
+            ),
+            ConfigError::Option {
+                file,
+                option,
+                below,
+                line,
+                column,
+                what,
+            } => write!(
+                f,
+                "The file `{}` failed to parse.\nError details: line {line}, column {column}: \
+                 `{option}{below}`: {what}",
+                file.display()
+            ),
+            ConfigError::NoParent { file } => {
+                write!(f, "failed to get parent directory for {}", file.display())
+            }
+        }
+    }
+}
+
+impl core::error::Error for ConfigError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            ConfigError::Io { error, .. } => Some(error),
+            ConfigError::Toml { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl PartialConfig {
     pub fn to_toml(&self) -> Result<String, ToTomlError> {
@@ -225,7 +371,11 @@ impl PartialConfig {
         cloned.fn_args_layout = None;
         cloned.hide_parse_errors = None;
 
-        ::toml::to_string(&cloned).map_err(ToTomlError)
+        let map = cloned.toml_map()?;
+        let mut out = blaze_own::String::new_in(Global);
+        blaze_toml::write_document(&map, &mut out, blaze_toml::DocumentOptions::CARGO)
+            .map_err(ToTomlError::Write)?;
+        Ok(out.as_str().to_owned())
     }
 
     pub(super) fn to_parsed_config(
@@ -245,17 +395,17 @@ impl PartialConfig {
 }
 
 fn check_semver_version(range_requirement: &str, actual: &str) -> bool {
-    // A bare version (no comparator prefix) is left as `semver`'s own default,
-    // which is a caret requirement, matching how Cargo treats dependency version
-    // requirements.
-    let version_req = match semver::VersionReq::parse(range_requirement) {
+    // A bare version (no comparator prefix) is a caret requirement, as Cargo treats
+    // dependency version requirements.
+    let limits = blaze_semver::Limits::CARGO;
+    let version_req = match blaze_semver::VersionReq::parse_in(range_requirement, limits, Global) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Error: failed to parse required version {range_requirement:?}: {e}");
             return false;
         }
     };
-    let actual_version = match semver::Version::parse(actual) {
+    let actual_version = match blaze_semver::Version::parse_in(actual, limits, Global) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("Error: failed to parse current version {actual:?}: {e}");
@@ -319,12 +469,9 @@ impl Config {
         edition: Option<Edition>,
         style_edition: Option<StyleEdition>,
         version: Option<Version>,
-    ) -> Result<Config, Error> {
-        let mut file = File::open(&file_path)?;
-        let mut toml = String::new();
-        file.read_to_string(&mut toml)?;
+    ) -> Result<Config, ConfigError> {
+        let toml = fs::read_to_string(file_path).map_err(ConfigError::io("reading", file_path))?;
         Config::from_toml_for_style_edition(&toml, file_path, edition, style_edition, version)
-            .map_err(|err| Error::new(ErrorKind::InvalidData, err))
     }
 
     /// Resolves the config for input in `dir`.
@@ -341,7 +488,7 @@ impl Config {
         edition: Option<Edition>,
         style_edition: Option<StyleEdition>,
         version: Option<Version>,
-    ) -> Result<(Config, Option<PathBuf>), Error> {
+    ) -> Result<(Config, Option<PathBuf>), ConfigError> {
         let path = match resolve_project_file(dir)? {
             Some(path) => Some(path),
             None => config_from_user_dirs()?,
@@ -358,7 +505,7 @@ impl Config {
     }
 
     #[allow(dead_code)]
-    pub(super) fn from_toml(toml: &str, file_path: &Path) -> Result<Config, String> {
+    pub(super) fn from_toml(toml: &str, file_path: &Path) -> Result<Config, ConfigError> {
         Self::from_toml_for_style_edition(toml, file_path, None, None, None)
     }
 
@@ -368,65 +515,54 @@ impl Config {
         edition: Option<Edition>,
         style_edition: Option<StyleEdition>,
         version: Option<Version>,
-    ) -> Result<Config, String> {
-        let parsed: ::toml::Value =
-            toml::from_str(toml).map_err(|e| format!("Could not parse TOML: {}", e))?;
-        let mut err = String::new();
-        let table = parsed
-            .as_table()
-            .ok_or_else(|| String::from("Parsed config was not table"))?;
-        // rustfmt warns of an option it does not know and formats without it; blaze fmt has no
-        // rustfmt to leave it to, so an option it would not run refuses the file, naming each.
-        let refused = refused_options(table);
+    ) -> Result<Config, ConfigError> {
+        let doc = blaze_toml::Document::parse_in(toml, blaze_toml::Limits::CARGO, Global)
+            .map_err(|error| {
+                let (line, column) = error.line_col(toml);
+                ConfigError::Toml {
+                    file: file_path.to_owned(),
+                    line,
+                    column,
+                    error,
+                }
+            })?;
+        let root = doc.root();
+        let refused = refused_options(root, toml);
         if !refused.is_empty() {
-            return Err(format!(
-                "blaze fmt refuses `{}`: it has options blaze fmt does not run (remove them, or \
-                 file them against crates/blaze-fmt):\n{}",
-                file_path.display(),
-                refused.join("\n")
-            ));
+            return Err(ConfigError::Refused {
+                file: file_path.to_owned(),
+                options: refused,
+            });
         }
 
-        match parsed.try_into::<PartialConfig>() {
-            Ok(parsed_config) => {
-                let dir = file_path.parent().ok_or_else(|| {
-                    format!("failed to get parent directory for {}", file_path.display())
-                })?;
-
-                Ok(parsed_config.to_parsed_config(style_edition, edition, version, dir))
-            }
-            Err(e) => {
-                let err_msg = format!(
-                    "The file `{}` failed to parse.\nError details: {e}",
-                    file_path.display()
-                );
-                err.push_str(&err_msg);
-                Err(err_msg)
-            }
-        }
+        let parsed_config = PartialConfig::read_toml(root, toml, file_path)?;
+        let dir = file_path.parent().ok_or_else(|| ConfigError::NoParent {
+            file: file_path.to_owned(),
+        })?;
+        Ok(parsed_config.to_parsed_config(style_edition, edition, version, dir))
     }
 }
 
-/// The options of a rustfmt.toml that blaze fmt refuses, each with why: a name that is none of
-/// rustfmt 1.11.0's options (the pinned nightly's), and a non-empty `ignore`, whose gitignore
-/// matching is not ported (`ignore_path`).
-fn refused_options(table: &::toml::Table) -> Vec<String> {
+/// The options of a rustfmt.toml that blaze fmt refuses, each with why and its line: a name
+/// that is none of rustfmt 1.11.0's options (the pinned nightly's), and a non-empty `ignore`,
+/// whose gitignore matching is not ported (`ignore_path`).
+fn refused_options(table: blaze_toml::Item<'_, '_, Global>, text: &str) -> Vec<String> {
     let mut refused = Vec::new(); // alloc: the refused options of one config file, for its error
-    for key in table.keys() {
+    for item in table.children() {
+        let key = item.key();
+        let (line, column) = blaze_toml::line_col(text, item.key_span().start);
         if !Config::is_valid_name(key) {
             refused.push(format!(
-                "  `{key}`: not an option of rustfmt {} (the pinned nightly's)",
+                "  `{key}` (line {line}, column {column}): not an option of rustfmt {} (the \
+                 pinned nightly's)",
                 crate::RUSTFMT_VERSION
             ));
+        } else if key == "ignore" && !(item.is_array() && item.is_empty()) {
+            refused.push(format!(
+                "  `ignore` (line {line}, column {column}): rustfmt's gitignore matching of it is \
+                 not ported to blaze fmt",
+            ));
         }
-    }
-    let ignores = table
-        .get("ignore")
-        .is_some_and(|it| it.as_array().is_none_or(|it| !it.is_empty()));
-    if ignores {
-        refused.push(String::from(
-            "  `ignore`: rustfmt's gitignore matching of it is not ported to blaze fmt",
-        ));
     }
     refused
 }
@@ -435,14 +571,16 @@ fn refused_options(table: &::toml::Table) -> Vec<String> {
 ///
 /// Returns the path of the configuration file nearest to that directory if one exists, or `None` if
 /// none was found.
-fn resolve_project_file(dir: &Path) -> Result<Option<PathBuf>, Error> {
+fn resolve_project_file(dir: &Path) -> Result<Option<PathBuf>, ConfigError> {
     let mut current = if dir.is_relative() {
-        env::current_dir()?.join(dir)
+        env::current_dir()
+            .map_err(ConfigError::io("reading the current directory to resolve", dir))?
+            .join(dir)
     } else {
         dir.to_path_buf()
     };
 
-    current = fs::canonicalize(current)?;
+    current = fs::canonicalize(&current).map_err(ConfigError::io("canonicalizing", &current))?;
 
     loop {
         match get_toml_path(&current) {
@@ -462,7 +600,7 @@ fn resolve_project_file(dir: &Path) -> Result<Option<PathBuf>, Error> {
 ///
 /// Returns the path of the first configuration file found in that order, or `None` if none was
 /// found.
-fn config_from_user_dirs() -> Result<Option<PathBuf>, Error> {
+fn config_from_user_dirs() -> Result<Option<PathBuf>, ConfigError> {
     for dir in [home_dir(), config_dir().map(|d| d.join("rustfmt"))]
         .iter()
         .flatten()
@@ -480,7 +618,7 @@ fn config_from_user_dirs() -> Result<Option<PathBuf>, Error> {
 pub fn load_config<O: CliOptions>(
     file_path: Option<&Path>,
     options: Option<O>,
-) -> Result<(Config, Option<PathBuf>), Error> {
+) -> Result<(Config, Option<PathBuf>), ConfigError> {
     let (over_ride, edition, style_edition, version) = match options {
         Some(ref opts) => (
             config_path(opts)?,
@@ -514,23 +652,29 @@ pub fn load_config<O: CliOptions>(
 // Check for the presence of known config file names (`rustfmt.toml`, `.rustfmt.toml`) in `dir`
 //
 // Return the path if a config file exists, empty if no file exists, and Error for IO errors
-fn get_toml_path(dir: &Path) -> Result<Option<PathBuf>, Error> {
+fn get_toml_path(dir: &Path) -> Result<Option<PathBuf>, ConfigError> {
     const CONFIG_FILE_NAMES: [&str; 2] = [".rustfmt.toml", "rustfmt.toml"];
     for config_file_name in &CONFIG_FILE_NAMES {
         let config_file = dir.join(config_file_name);
         match fs::metadata(&config_file) {
             // Only return if it's a file to handle the unlikely situation of a directory named
             // `rustfmt.toml`.
-            Ok(ref md) if md.is_file() => return Ok(Some(config_file.canonicalize()?)),
+            Ok(ref md) if md.is_file() => {
+                let canonical = config_file
+                    .canonicalize()
+                    .map_err(ConfigError::io("canonicalizing", &config_file))?;
+                return Ok(Some(canonical));
+            }
             // We didn't find the project file yet, and continue searching if:
             // `NotFound` => file not found
             // `NotADirectory` => rare case where expected directory is a file
             // Otherwise, return the error
             Err(e) => {
                 if !matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) {
-                    let ctx = format!("Failed to get metadata for config file {:?}", config_file);
-                    let err = anyhow::Error::new(e).context(ctx);
-                    return Err(Error::new(ErrorKind::Other, err));
+                    return Err(ConfigError::io(
+                        "Failed to get metadata for config file",
+                        &config_file,
+                    )(e));
                 }
             }
             _ => {}
@@ -539,25 +683,18 @@ fn get_toml_path(dir: &Path) -> Result<Option<PathBuf>, Error> {
     Ok(None)
 }
 
-fn config_path(options: &impl CliOptions) -> Result<Option<PathBuf>, Error> {
-    let config_path_not_found = |path: &str| -> Result<Option<PathBuf>, Error> {
-        Err(Error::new(
-            ErrorKind::NotFound,
-            format!(
-                "Error: unable to find a config file for the given path: `{}`",
-                path
-            ),
-        ))
-    };
-
+fn config_path(options: &impl CliOptions) -> Result<Option<PathBuf>, ConfigError> {
     // Read the config_path and convert to parent dir if a file is provided.
     // If a config file cannot be found from the given path, return error.
     match options.config_path() {
-        Some(path) if !path.exists() => config_path_not_found(path.to_str().unwrap()),
+        Some(path) if !path.exists() => Err(ConfigError::NotFound {
+            path: path.to_owned(),
+        }),
         Some(path) if path.is_dir() => resolve_project_file(path),
         Some(path) => Ok(Some(
             // Canonicalize only after checking above that the `path.exists()`.
-            path.canonicalize()?,
+            path.canonicalize()
+                .map_err(ConfigError::io("canonicalizing", path))?,
         )),
         None => Ok(None),
     }

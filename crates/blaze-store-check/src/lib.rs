@@ -18,10 +18,13 @@
 //! strings first differ, by the CPU's SIMD). The invalidation oracle, `blaze-v2-proof`, uses
 //! both; it holds what compares two builds' records (`under`, `over`, `apart`).
 
+#![feature(allocator_api)]
+
 pub mod bytes;
 
-use std::fmt;
+use std::{alloc::Global, fmt};
 
+use blaze_data::{Cursor, FromValue, ShapeError};
 use blaze_ids::{ContentId, Hasher};
 
 /// The variable, read from the request's environment (as `BLAZE_SANDBOX` is).
@@ -34,13 +37,20 @@ const SAMPLE_DOMAIN: &str = "blaze v2 verify store sample 1";
 /// Written as a bare rate (`0.01`, `1`) or as one JSON object, which refuses unknown fields:
 /// `{"rate": 0.01, "seed": 7}`. The seed picks which hits a rate below one samples, so CI can
 /// rotate through the store. Unset, or a rate of zero, is off.
-#[derive(Clone, Copy, PartialEq, Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Setting {
     /// The fraction of hits recomputed, from 0 (none) to 1 (every one).
     pub rate: f64,
-    #[serde(default)]
+    /// Zero when the object has none.
     pub seed: u64,
+}
+
+/// The object form: `rate` required, `seed` optional, any other field refused.
+impl<A: core::alloc::Allocator + Clone> FromValue<A> for Setting {
+    fn from_value(c: &Cursor<'_, '_, A>) -> Result<Setting, ShapeError<A>> {
+        c.deny_unknown(&["rate", "seed"])?;
+        Ok(Setting { rate: c.req("rate")?, seed: c.opt("seed")?.unwrap_or(0) })
+    }
 }
 
 /// A value of [`VAR`] that is no [`Setting`].
@@ -79,7 +89,9 @@ impl Setting {
         let refused = |why: String| SettingError { value: value.to_owned(), why }; // alloc: an error
         let trimmed = value.trim();
         let setting = if trimmed.starts_with('{') {
-            serde_json::from_str::<Setting>(trimmed).map_err(|e| refused(e.to_string()))?
+            let object = blaze_json::read_in(trimmed.as_bytes(), blaze_json::Limits::DEFAULT, Global)
+                .map_err(|e| refused(e.to_string()))?;
+            Cursor::root(&object, Global).get::<Setting>().map_err(|e| refused(e.to_string()))?
         } else {
             let rate = trimmed.parse::<f64>().map_err(|e| refused(e.to_string()))?;
             Setting { rate, seed: 0 }

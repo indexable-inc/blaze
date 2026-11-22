@@ -1,0 +1,36 @@
+[package]
+name = "blaze-cunit"
+description = "C and C++ translation units as code records (docs/v2/plan/design/c.md, part 3; D174, D176): the unit's key from its text, headers, flags, target and toolchain; the split of the relocatable object the pinned clang writes into one atom a function and one a data object, each referring to other symbols by name; the lowering of an atom to a blaze-code code record or datum; and the symbol index (a C name to the unit that defines it, with the deterministic choice among weak and COMDAT definitions). Sans-IO: bytes in, records out"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `Vec` and `Alloc`: every table in the allocator the caller names (no `alloc`).
+blaze-own.workspace = true
+# The domain-separated BLAKE3 `Hasher`: the unit key, an atom's key, a unit-local symbol. By
+# path, as blaze-code has it: the workspace entry turns on its `serde` adapter.
+blaze-ids.workspace = true
+# The one object model and its readers (Mach-O arm64 `MH_OBJECT`, ELF64 AArch64 `ET_REL`): the
+# reader's one home (rule 30); this crate reads nothing of a file's format but the Mach-O
+# header's flags word (lib.rs, "Outside changes").
+blaze-native.workspace = true
+# The code record and the datum the atoms are lowered to: the form Rust bodies are made in.
+blaze-code.workspace = true
+
+[dev-dependencies]
+# The split's and the index's properties, and their planted-bug controls.
+blaze-sim.workspace = true
+# `blaze_own::testing::heap()`: a test's root allocator (D102), in place of `Global`.
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

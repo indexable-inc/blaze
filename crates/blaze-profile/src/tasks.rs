@@ -47,7 +47,7 @@ pub struct Reader {
     running: Vec<Running, Global>,
     waits: Vec<WaitRow, Global>,
     parked: Vec<(u64, StallWait, Option<u64>), Global>,
-    children: Vec<(libc::pid_t, Option<u64>), Global>,
+    children: Vec<(blaze_sys::posix::types::pid_t, Option<u64>), Global>,
     /// The tasks of the last look, and what the driver needs of each, index for index.
     pub seen: Vec<TaskSeen, Global>,
     pub about: Vec<About, Global>,
@@ -270,8 +270,8 @@ pub struct Told {
 /// Mach time units, scaled by `mach_timebase_info`. `None` where it cannot be read (it exited,
 /// or the system refused).
 #[cfg(target_os = "linux")]
-fn child_cpu_ns(pid: libc::pid_t) -> Option<u64> {
-    let mut clock: libc::clockid_t = 0;
+fn child_cpu_ns(pid: blaze_sys::posix::types::pid_t) -> Option<u64> {
+    let mut clock: blaze_sys::posix::types::clockid_t = 0;
     // SAFETY: `clock` is a clockid to fill; a pid of no process fails with ESRCH.
     if unsafe { libc::clock_getcpuclockid(pid, &mut clock) } != 0 {
         return None;
@@ -283,12 +283,12 @@ fn child_cpu_ns(pid: libc::pid_t) -> Option<u64> {
 }
 
 #[cfg(target_os = "macos")]
-fn child_cpu_ns(pid: libc::pid_t) -> Option<u64> {
-    let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
-    let size = size_of::<libc::proc_taskinfo>() as libc::c_int;
+fn child_cpu_ns(pid: blaze_sys::posix::types::pid_t) -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<blaze_sys::posix::thread::proc_taskinfo>::zeroed();
+    let size = size_of::<blaze_sys::posix::thread::proc_taskinfo>() as core::ffi::c_int;
     // SAFETY: `info` is a `proc_taskinfo` of `size` bytes for the kernel to fill.
     let got =
-        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, info.as_mut_ptr().cast(), size) };
+        unsafe { blaze_sys::posix::thread::proc_pidinfo(pid, blaze_sys::posix::proc::PROC_PIDTASKINFO, 0, info.as_mut_ptr().cast(), size) };
     if got != size {
         return None;
     }
@@ -301,7 +301,7 @@ fn child_cpu_ns(pid: libc::pid_t) -> Option<u64> {
         denom: u32,
     }
     unsafe extern "C" {
-        fn mach_timebase_info(info: *mut Timebase) -> libc::c_int;
+        fn mach_timebase_info(info: *mut Timebase) -> core::ffi::c_int;
     }
     let mut base = Timebase { numer: 0, denom: 0 };
     // SAFETY: a struct for the kernel to fill.
@@ -314,6 +314,6 @@ fn child_cpu_ns(pid: libc::pid_t) -> Option<u64> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn child_cpu_ns(_pid: libc::pid_t) -> Option<u64> {
+fn child_cpu_ns(_pid: blaze_sys::posix::types::pid_t) -> Option<u64> {
     None
 }

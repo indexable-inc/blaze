@@ -1,0 +1,46 @@
+[package]
+name = "blaze-emit"
+description = "The baseline tier: one LIR function to AArch64 machine code in one pass, no optimization, every value in a stack slot, the platform's C convention, calls through slot words; the first backend that runs `blaze run` (crates/blaze-cli/tests/ladder/README.md)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The input: one function's columns (`View`), its ops, types and signatures.
+blaze-lir.workspace = true
+# The record form's output (`emit_record`): `CodeRecord`, its sites, words and targets. By
+# path, as blaze-code names its own dependencies: it has no workspace entry.
+blaze-code.workspace = true
+# `Vec` and `Alloc`: the record form's rows, in the allocator the caller names.
+blaze-own.workspace = true
+# The template table's form, `Pattern`, and the register descriptions (piece 0).
+blaze-tier.workspace = true
+# The template table's digest (`TableHead::digest`): BLAKE3 of its bytes.
+blaze-blake3.workspace = true
+
+[build-dependencies]
+# build.rs: the committed table's BLAKE3, against table/arm64.json.
+blaze-blake3.workspace = true
+
+[dev-dependencies]
+# `Alloc::global()`, the handle the record tests hand `emit_record`.
+blaze-own = { workspace = true, features = ["std", "testing"] }
+# `examples/gen_table.rs`: the files it writes, through bstd's effect layer.
+blaze-std.workspace = true
+# The reference evaluator every emitted function is compared with.
+blaze-lir = { workspace = true, features = ["eval"] }
+# `check`: random LIR functions run as machine code and in the evaluator.
+blaze-sim.workspace = true
+# `Executable`: emitted code made executable in the test process and called.
+blaze-inproc.workspace = true
+
+[lints]
+workspace = true

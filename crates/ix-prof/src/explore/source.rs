@@ -5,8 +5,9 @@
 //! and answers every request but `hello` ([`Source::op`]), which the session answers itself. A
 //! source answers in tables ([`Answer`]); the session encodes them as the wire carries them.
 
-use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use std::alloc::Global;
+
+use blaze_columns::{Batch, Field};
 use serde::ser::{Serialize, SerializeMap, Serializer};
 use serde_json::{Map, Value};
 
@@ -14,7 +15,7 @@ use serde_json::{Map, Value};
 /// however it ends (answered, stopped by the page, the session gone, the server stopping), so a
 /// source's long work (blaze's DuckDB query) watches it and ends. The same type as
 /// blaze-profile's `sql::Stop`.
-pub type Stop = crossbeam_channel::Receiver<()>;
+pub type Stop = blaze_core::chan::Receiver<()>;
 
 /// A program the explorer serves.
 pub trait Source: Send + Sync + 'static {
@@ -138,23 +139,23 @@ impl Tick {
     }
 }
 
-/// A table of an answer: its schema and its batches, all of it.
+/// A table of an answer: its fields and its batches, all of it.
 #[derive(Debug)]
 pub struct Table {
-    pub schema: SchemaRef,
-    pub batches: Vec<RecordBatch>,
+    pub fields: blaze_own::Vec<Field<Global>, Global>,
+    pub batches: blaze_own::Vec<Batch<Global>, Global>,
 }
 
 impl Table {
     pub fn rows(&self) -> usize {
-        self.batches.iter().map(RecordBatch::num_rows).sum()
+        self.batches.iter().map(Batch::num_rows).sum()
     }
 
-    /// The table of `batches`, its schema the first's; `None` when there are none.
-    pub fn of(batches: Vec<RecordBatch>) -> Option<Table> {
-        // clone: an `Arc` of the schema
-        let schema = batches.first()?.schema();
-        Some(Table { schema, batches })
+    /// The table of `batches`, its fields the first's; `None` when there are none.
+    pub fn of(batches: blaze_own::Vec<Batch<Global>, Global>) -> Option<Table> {
+        // clone: the first batch's fields, once an answer
+        let fields = blaze_own::Vec::from_slice_in(batches.first()?.fields(), Global);
+        Some(Table { fields, batches })
     }
 }
 

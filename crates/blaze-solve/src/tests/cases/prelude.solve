@@ -1,0 +1,64 @@
+# The prelude every case file is read on top of: the lang items and a few std items, all
+# `extern` (of another crate than the one under test), as the pinned library declares them.
+extern lang(pointee_sized) trait PointeeSized
+extern lang(meta_sized) coinductive trait MetaSized: PointeeSized
+# `Sized` is `#[fundamental]` in core (so `[T]: !Default`-style questions are knowable).
+extern lang(sized) coinductive fundamental trait Sized: MetaSized
+extern lang(clone) trait Clone: Sized
+extern lang(copy) trait Copy: Clone
+extern lang(send) auto unsafe trait Send
+extern lang(sync) auto unsafe trait Sync
+extern lang(unpin) auto trait Unpin
+extern lang(tuple) trait Tuple
+extern lang(fn_once) trait FnOnce<Args: Tuple> { lang(fn_once_output) type Output; }
+extern lang(fn_mut) trait FnMut<Args: Tuple>: FnOnce<Args>
+extern lang(fn) trait Fn<Args: Tuple>: FnMut<Args>
+extern lang(fn_ptr_trait) trait FnPtr: Copy + Clone
+extern lang(pointee) trait Pointee { lang(metadata) type Metadata: Copy + Send + Sync + Unpin; }
+extern lang(discriminant_kind) trait DiscriminantKind { lang(discriminant) type Discriminant: Copy + Send + Sync; }
+extern lang(destruct) trait Destruct
+extern lang(drop) trait Drop
+extern lang(unsize) trait Unsize<U>
+extern lang(phantom_data) struct PhantomData<T>
+extern lang(owned_box) fundamental struct Box<T>(T)
+extern lang(manually_drop) struct ManuallyDrop<T>(T)
+extern lang(dyn_metadata) struct DynMetadata<T>
+
+extern trait Iterator { type Item; }
+extern trait IntoIterator { type Item; type IntoIter: Iterator<Item = <Self as IntoIterator>::Item>; }
+extern impl<I: Iterator> IntoIterator for I { type Item = <I as Iterator>::Item; type IntoIter = I; }
+extern trait Default
+extern trait Debug
+extern trait PartialEq<Rhs>
+extern trait Add<Rhs> { type Output; }
+extern trait Deref { type Target; }
+extern trait From<T>
+extern trait Into<T>
+extern impl<T, U: From<T>> Into<U> for T
+extern impl<T> From<T> for T
+
+extern struct Vec<T>(T)
+extern struct String(Vec<u8>)
+extern struct Rc<T>(T)
+extern struct Cell<T>(T)
+extern enum Option<T> { | T }
+extern impl<T: Clone> Clone for Vec<T>
+extern impl<T> Iterator for Vec<T> { type Item = T; }
+extern impl<T> Default for Vec<T>
+extern impl<T: Debug> Debug for Vec<T>
+extern impl<T> Deref for Vec<T> { type Target = [T]; }
+extern impl Clone for String
+extern impl Default for String
+extern impl Debug for String
+extern impl Debug for u32
+extern impl Debug for u8
+extern impl Default for u32
+extern impl<T: Clone> Clone for Option<T>
+extern impl<T: Copy> Copy for Option<T>
+extern impl<T> Clone for Rc<T>
+extern impl<T> !Send for Rc<T>
+extern impl<T> !Sync for Rc<T>
+extern impl<T> !Sync for Cell<T>
+extern impl<T: Send> Send for Cell<T>
+extern impl Add<u32> for u32 { type Output = u32; }
+extern impl PartialEq<u32> for u32

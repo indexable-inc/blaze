@@ -16,10 +16,16 @@ doctest = false
 blaze-hash.workspace = true
 # Avoid adding deps here, this crate is widely used in tests it should compile fast!
 dissimilar.workspace = true
-text-size.workspace = true
+blaze-text-size.workspace = true
+# `blaze_core::lock::Lock` around the files `expect!` rewrites under `UPDATE_EXPECT`.
+blaze-core.workspace = true
 
 paths.workspace = true
 stdx.workspace = true
+
+[dev-dependencies]
+# The round trip of `expect!`'s literals, as a property with its planted-bug control.
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

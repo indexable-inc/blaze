@@ -5,11 +5,10 @@ use alloc::{
     string::{String, ToString as _},
     vec::Vec,
 };
-use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
 /// The columns `text` takes.
 pub fn width(text: &str) -> usize {
-    text.width()
+    blaze_unicode::str_width(text)
 }
 
 /// A time: `12ms`, `0.70s`, `19.4s`, `4m30s`. Under a second it is whole milliseconds, so an
@@ -46,7 +45,7 @@ pub fn fit(text: &str, most: usize) -> String {
     let mut out = String::new(); // alloc: as above
     let mut used = 0;
     for c in text.chars() {
-        let w = c.width().unwrap_or(0);
+        let w = blaze_unicode::char_width(c).unwrap_or(0);
         if used + w + 1 > most {
             break;
         }
@@ -76,7 +75,7 @@ pub fn middle(text: &str, most: usize) -> String {
     let mut out = String::new(); // alloc: as above
     let mut used = 0;
     for &c in &chars {
-        let w = c.width().unwrap_or(0);
+        let w = blaze_unicode::char_width(c).unwrap_or(0);
         if used + w > head {
             break;
         }
@@ -87,7 +86,7 @@ pub fn middle(text: &str, most: usize) -> String {
     let mut end = Vec::new(); // alloc: as above
     let mut used = 0;
     for &c in chars.iter().rev() {
-        let w = c.width().unwrap_or(0);
+        let w = blaze_unicode::char_width(c).unwrap_or(0);
         if used + w > tail {
             break;
         }

@@ -10,12 +10,15 @@
 //! What a freed range gives back is memory, not addresses: [`Area::free`] names each whole page
 //! that no live range overlaps any more and that the end has passed, once.
 
-use alloc::vec::Vec;
+use core::alloc::Allocator;
 
-use crate::{Error, Kept, Range};
+use blaze_own::Vec;
 
-/// The code area of one process, as offsets from where its driver mapped it.
-pub struct Area {
+use crate::{Error, Range};
+
+/// The code area of one process, as offsets from where its driver mapped it; its page counts
+/// in `A`, the allocator its maker names.
+pub struct Area<A: Allocator> {
     /// The reservation's length.
     limit: u64,
     /// The page size: a power of two.
@@ -23,12 +26,12 @@ pub struct Area {
     /// Where the next range goes. Everything below was handed out or skipped for alignment.
     end: u64,
     /// By page number, for each page below `end`: how many ranges not yet freed overlap it.
-    live: Vec<u32, Kept>,
+    live: Vec<u32, A>,
 }
 
-impl Area {
-    /// An empty area of `limit` bytes in pages of `page` bytes.
-    pub fn new(limit: u64, page: u64, alloc: Kept) -> Result<Area, Error> {
+impl<A: Allocator> Area<A> {
+    /// An empty area of `limit` bytes in pages of `page` bytes, its counts in `alloc`.
+    pub fn new(limit: u64, page: u64, alloc: A) -> Result<Area<A>, Error> {
         if !page.is_power_of_two() {
             return Err(Error::Config { what: "the page size is not a power of two", value: page });
         }

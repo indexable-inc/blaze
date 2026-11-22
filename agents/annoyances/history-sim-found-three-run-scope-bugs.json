@@ -1,0 +1,15 @@
+{
+ "id": "history-sim-found-three-run-scope-bugs",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane DR",
+ "where": "crates/blaze-drive/src/sim.rs histories (the floor: request.rs taken_read, STALE_READ)",
+ "what": "The first simulation mixing check and run over one store, with failures, removals and member edits, failed before the floor was in (bisected with the shortcut and the mark off). Three bugs, each an ignored test: a failing task among removals runs a BodyCheck on old text; a run whose closure shrank keeps and prints findings of bodies it no longer reaches (finish's findings merge keeps all but dropped); a file re-read while its member is outside the closure has its parts gated and dropped unmade, so they keep old rows and the next run never enters them. Also: a run whose certificate stands holds no `now` rows, and any program Want then fails LateWant. Also the harness: it flagged a file changed against the last world, while the cli flags it against the last answer's leaf table (only files read); modelled as World::unread.",
+ "cost": "about an hour of bisecting through the queue (each step 30-130 s)",
+ "cause": "every simulation ran one scope per store; nothing walked a narrower request after a wider one or a shrinking closure",
+ "whys": "run's closure was tested only growing (sim.rs scopes); the invariant that a row's recorded answers are today's was never stated, so nothing checked it across scopes",
+ "class": "a request that reaches less than the answer it walks from leaves rows that are not today's",
+ "prevention": "partly: the invariant stated once at request.rs taken_read, checked in debug builds and the simulation (DriveError::RecordedRead); dirtied readers not run are marked STALE_READ; the three bugs wait for the run-scope owner",
+ "annoyance": "the runner answers `clean (0 s)` and runs no test when the directory equals green, so a suite cannot be rerun on an admitted tree; output arriving in a background file while the rule says foreground",
+ "workaround": "run the suite in the same ask as the admit",
+ "state": "open"
+}

@@ -11,9 +11,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use windows_sys::Win32::{
-    Foundation::{ERROR_ALREADY_EXISTS, ERROR_PATH_NOT_FOUND, INVALID_HANDLE_VALUE},
-    Storage::FileSystem::{
+use blaze_sys::windows::{
+    foundation::{ERROR_ALREADY_EXISTS, ERROR_PATH_NOT_FOUND},
+    fs::{
         CreateDirectoryW, DeleteFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
         FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FindClose, FindFirstFileW,
         FindNextFileW, RemoveDirectoryW, SetFileAttributesW, WIN32_FIND_DATAW,
@@ -129,7 +129,7 @@ impl RunDirs {
         // SAFETY: a NUL-terminated pattern and a buffer to fill.
         let find = unsafe { FindFirstFileW(self.wide.as_ptr(), &mut found) };
         self.wide.truncate(at);
-        if find != INVALID_HANDLE_VALUE {
+        if !find.is_invalid() {
             loop {
                 let len =
                     found.cFileName.iter().position(|&it| it == 0).unwrap_or(found.cFileName.len());
@@ -150,7 +150,7 @@ impl RunDirs {
                         (false, _) => self.with_nul(|wide| {
                             // SAFETY: `wide` is NUL-terminated and borrowed across the call,
                             // which keeps no pointer to it; a missing NUL would read past it.
-                            let deleted = unsafe { DeleteFileW(wide) } != 0;
+                            let deleted = unsafe { DeleteFileW(wide) }.is_true();
                             if !deleted && attributes & FILE_ATTRIBUTE_READONLY != 0 {
                                 // SAFETY: as above.
                                 unsafe { SetFileAttributesW(wide, FILE_ATTRIBUTE_NORMAL) };
@@ -162,7 +162,7 @@ impl RunDirs {
                     self.wide.truncate(at);
                 }
                 // SAFETY: the search `FindFirstFileW` opened, and a buffer to fill.
-                if unsafe { FindNextFileW(find, &mut found) } == 0 {
+                if !unsafe { FindNextFileW(find, &mut found) }.is_true() {
                     break;
                 }
             }

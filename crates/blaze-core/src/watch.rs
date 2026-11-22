@@ -42,7 +42,6 @@
 use std::{
     ffi::CStr,
     io,
-    mem::MaybeUninit,
     os::{
         fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd},
         unix::ffi::OsStrExt as _,
@@ -50,22 +49,27 @@ use std::{
     path::Path,
 };
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_mem::{RegionVec, Tag as MemTag};
+use blaze_sys::{
+    Errno, Fd, Path as SysPath, Timespec,
+    linux::{self, AtFlags, InotifyFlags, InotifyMask, PollEvents, PollFd},
+    posix::proc::{DT_DIR, DT_UNKNOWN, S_IFDIR, S_IFMT},
+};
 use std::alloc::Global;
 
 use crate::{Done, FileName, utf8::push_lossy};
 
-const MASK: u32 = libc::IN_CREATE
-    | libc::IN_DELETE
-    | libc::IN_MODIFY
-    | libc::IN_CLOSE_WRITE
-    | libc::IN_MOVED_FROM
-    | libc::IN_MOVED_TO
-    | libc::IN_ATTRIB
-    | libc::IN_DELETE_SELF
-    | libc::IN_MOVE_SELF
-    | libc::IN_EXCL_UNLINK;
+const MASK: InotifyMask = InotifyMask::CREATE
+    .with(InotifyMask::DELETE)
+    .with(InotifyMask::MODIFY)
+    .with(InotifyMask::CLOSE_WRITE)
+    .with(InotifyMask::MOVED_FROM)
+    .with(InotifyMask::MOVED_TO)
+    .with(InotifyMask::ATTRIB)
+    .with(InotifyMask::DELETE_SELF)
+    .with(InotifyMask::MOVE_SELF)
+    .with(InotifyMask::EXCLUDE_UNLINKED);
 
 /// The head of an event, before its name.
 const HEAD: usize = 16;
@@ -109,7 +113,7 @@ thread_local! {
 /// until the test lets one through, so a test can ask while a watch is provably not in place.
 /// Nothing outside tests.
 #[cfg(test)]
-pub(crate) type Gate = Option<crossbeam_channel::Receiver<()>>;
+pub(crate) type Gate = Option<crate::chan::Receiver<()>>;
 #[cfg(not(test))]
 pub(crate) type Gate = ();
 
@@ -140,7 +144,12 @@ pub(crate) fn looks_under(effect: &crate::Effect, mut under: impl FnMut(&str) ->
         | Effect::ReadAll { file, .. }
         | Effect::Read { file, .. }
         | Effect::ReadLink { file, .. } => under(file.as_str()),
-        Effect::Entries { dir, .. } | Effect::List { dir, .. } => under(dir.as_str()),
+        Effect::List { dir, .. } | Effect::Entries { dir, .. } => match dir.name() {
+            Some(dir) => under(dir.as_str()),
+            // A listing of the root looks under every directory, so under every watch still
+            // starting (each caller asks only while one is).
+            None => true,
+        },
         Effect::Stamp { files, .. } => files.iter().any(&mut under),
         _ => false,
     }
@@ -193,6 +202,13 @@ pub(crate) struct Walk {
 }
 
 impl Walk {
+    /// The start of a watch of `dir` into `room`'s tables, still to walk.
+    fn of(mut room: Room, dir: &FileName, nonblocking: bool) -> Walk {
+        room.top.clear();
+        room.top.push_str(dir.as_str());
+        Walk { room, nonblocking }
+    }
+
     /// The watched directory, relative to the root.
     pub(crate) fn dir(&self) -> &str {
         &self.room.top
@@ -313,7 +329,7 @@ impl Grow {
         let Grown { tops, dirs, wds, files, error } = &mut into;
         let first = if tops.is_empty() { "" } else { tops.get(0) };
         walk_span("walk a new directory to watch with inotify", first, || {
-            let fd = fd.as_raw_fd();
+            let fd = Fd::new(fd.as_raw_fd());
             for at in 0..tops.len() {
                 let top = tops.get(at);
                 let walked = walker.walk(
@@ -327,25 +343,24 @@ impl Grow {
                                  fanotify (CAP_SYS_ADMIN and CAP_DAC_READ_SEARCH)"
                             )));
                         }
-                        // SAFETY: an inotify descriptor and a NUL-terminated path.
-                        let wd = unsafe { libc::inotify_add_watch(fd, path.as_ptr(), MASK) };
-                        if wd < 0 {
-                            let error = io::Error::last_os_error();
-                            if error.raw_os_error() == Some(libc::ENOENT) {
-                                return Ok(Visit::Skip);
+                        let wd = match linux::inotify_add_watch(fd, SysPath::new(path), MASK) {
+                            Ok(wd) => wd.0,
+                            Err(Errno::NoEnt) => return Ok(Visit::Skip),
+                            Err(errno) => {
+                                let error = io::Error::from_raw_os_error(i32::from(errno.raw()));
+                                return Err(io::Error::other(format!(
+                                    "watching {} with inotify, {} directories into {top}: {error}{}",
+                                    path.to_string_lossy(),
+                                    wds.len(),
+                                    if errno == Errno::NoSpc {
+                                        " (the most the system lets a user watch: \
+                                         fs.inotify.max_user_watches)"
+                                    } else {
+                                        ""
+                                    }
+                                )));
                             }
-                            return Err(io::Error::other(format!(
-                                "watching {} with inotify, {} directories into {top}: {error}{}",
-                                path.to_string_lossy(),
-                                wds.len(),
-                                if error.raw_os_error() == Some(libc::ENOSPC) {
-                                    " (the most the system lets a user watch: \
-                                     fs.inotify.max_user_watches)"
-                                } else {
-                                    ""
-                                }
-                            )));
-                        }
+                        };
                         dirs.push(rel);
                         wds.push(wd);
                         Ok(Visit::List(None))
@@ -374,36 +389,33 @@ impl Tree {
     /// kept when there are any: with fanotify unless the process lacks `CAP_SYS_ADMIN` or
     /// `CAP_DAC_READ_SEARCH` (the call fails with `EPERM`), whose start is a constant number of
     /// system calls; with inotify then, whose start is a [`Walk`] left to the caller. Any other
-    /// failure of fanotify's is the watch's.
+    /// failure of fanotify's is the watch's. An inotify `spare` is of a start fanotify refused,
+    /// and a process gains no privilege after, so its start is inotify's without asking
+    /// fanotify again: an unprivileged `fanotify_init` succeeds (Linux 5.13 on) and only the
+    /// mark after it is refused, so each such ask would make and drop fanotify's tables.
     pub(crate) fn begin(
         spare: Option<Spare>,
         root: &Path,
         dir: &FileName,
         nonblocking: bool,
     ) -> io::Result<Begun> {
-        let (fanotify, inotify) = match spare {
-            Some(Spare::Fanotify(room)) => (Some(room), None),
-            Some(Spare::Inotify(room)) => (None, Some(room)),
-            None => (None, None),
+        let fanotify = match spare {
+            Some(Spare::Fanotify(room)) => Some(room),
+            Some(Spare::Inotify(room)) => return Ok(Begun::Walk(Walk::of(room, dir, nonblocking))),
+            None => None,
         };
         #[cfg(test)]
         let fanotify_refused = FANOTIFY_REFUSED.get();
         #[cfg(not(test))]
         let fanotify_refused = false;
         let started = match fanotify_refused {
-            true => Err(io::Error::from_raw_os_error(libc::EPERM)),
+            true => Err(io::Error::from_raw_os_error(i32::from(Errno::Perm.raw()))),
             false => crate::fanotify::Fanotify::new(root, dir, nonblocking, fanotify),
         };
         match started {
             Ok(it) => Ok(Begun::Watching(Tree(Kind::Fanotify(it)))),
-            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
-                let mut room = match inotify {
-                    Some(room) => room,
-                    None => Room::new()?,
-                };
-                room.top.clear();
-                room.top.push_str(dir.as_str());
-                Ok(Begun::Walk(Walk { room, nonblocking }))
+            Err(error) if error.raw_os_error() == Some(i32::from(Errno::Perm.raw())) => {
+                Ok(Begun::Walk(Walk::of(Room::new()?, dir, nonblocking)))
             }
             Err(error) => Err(error),
         }
@@ -506,21 +518,21 @@ impl Tree {
         mut each: impl FnMut(Done),
     ) -> io::Result<()> {
         loop {
-            let mut fds = [libc::pollfd { fd: self.raw(), events: libc::POLLIN, revents: 0 }];
-            let ready = match crate::raw::poll(&mut fds, 0) {
+            let mut fds = [PollFd::new(Fd::new(self.raw()), PollEvents::IN)];
+            let ready = match linux::ppoll(&mut fds, Some(Timespec::ZERO), None) {
                 Ok(ready) => ready,
-                Err(error) if error.raw_os_error() == Some(libc::EINTR) => continue,
-                Err(error) => return Err(error),
+                Err(Errno::Intr) => continue,
+                Err(errno) => return Err(io::Error::from_raw_os_error(i32::from(errno.raw()))),
             };
-            if ready == 0 || fds[0].revents & libc::POLLIN == 0 {
+            if ready == 0 || !fds[0].found().contains(PollEvents::IN) {
                 return Ok(());
             }
             match self.read(buffer) {
                 Ok(0) => return Ok(()),
                 Ok(n) => each(self.take(&buffer[..n])),
                 Err(error) => match error.raw_os_error() {
-                    Some(libc::EINTR) => {}
-                    Some(libc::EAGAIN) => return Ok(()),
+                    Some(code) if code == i32::from(Errno::Intr.raw()) => {}
+                    Some(code) if code == i32::from(Errno::Again.raw()) => return Ok(()),
                     _ => return Err(error),
                 },
             }
@@ -529,11 +541,8 @@ impl Tree {
 
     /// One read of the queued events into `buffer`: how many bytes.
     pub(crate) fn read(&self, buffer: &mut [u8]) -> io::Result<usize> {
-        // SAFETY: `buffer` is a live, exclusive buffer of `buffer.len()` bytes the call writes
-        // at most that many of, and the descriptor is this tree's, open while `self` is
-        // borrowed (closed only by `end`, which takes it).
-        let n = unsafe { libc::read(self.raw(), buffer.as_mut_ptr().cast(), buffer.len()) };
-        usize::try_from(n).map_err(|_| io::Error::last_os_error())
+        linux::read(Fd::new(self.raw()), buffer)
+            .map_err(|errno| io::Error::from_raw_os_error(i32::from(errno.raw())))
     }
 }
 
@@ -813,8 +822,9 @@ fn list(fd: RawFd, buffer: &mut [u8], mut each: impl FnMut(&[u8], bool)) {
     loop {
         // SAFETY: an open directory and a buffer of `buffer.len()` bytes, which the call
         // writes at most.
-        let got =
-            unsafe { libc::syscall(libc::SYS_getdents64, fd, buffer.as_mut_ptr(), buffer.len()) };
+        let got = unsafe {
+            libc::syscall(linux::nr::GETDENTS64 as core::ffi::c_long, fd, buffer.as_mut_ptr(), buffer.len())
+        };
         if got <= 0 {
             return;
         }
@@ -833,8 +843,8 @@ fn list(fd: RawFd, buffer: &mut [u8], mut each: impl FnMut(&[u8], bool)) {
                 continue;
             }
             let is_dir = match kind {
-                libc::DT_DIR => true,
-                libc::DT_UNKNOWN => is_dir_at(fd, name),
+                DT_DIR => true,
+                DT_UNKNOWN => is_dir_at(fd, name),
                 _ => false,
             };
             each(name, is_dir);
@@ -846,17 +856,11 @@ fn list(fd: RawFd, buffer: &mut [u8], mut each: impl FnMut(&[u8], bool)) {
 /// for a file system that gives no entry's type.
 fn is_dir_at(dir: RawFd, name: &[u8]) -> bool {
     let mut c = [0u8; 256];
-    if name.len() >= c.len() {
+    let Ok(path) = SysPath::in_buffer(name, &mut c) else {
         return false;
-    }
-    c[..name.len()].copy_from_slice(name);
-    let mut stat = MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: an open directory, a NUL-terminated name and a `stat` to fill.
-    let got = unsafe {
-        libc::fstatat(dir, c.as_ptr().cast(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW)
     };
-    // SAFETY: the call succeeded, so it filled the `stat`.
-    got == 0 && unsafe { stat.assume_init_ref() }.st_mode & libc::S_IFMT == libc::S_IFDIR
+    linux::task::fstatat(Fd::new(dir), path, AtFlags::NO_FOLLOW)
+        .is_ok_and(|stat| stat.st_mode & S_IFMT == S_IFDIR)
 }
 
 struct Inotify {
@@ -868,7 +872,7 @@ struct Inotify {
 pub(crate) struct Room {
     /// Each directory watched, by its watch, relative to the root ("" for the root), in
     /// `names`.
-    dirs: HashMap<i32, Span, Global>,
+    dirs: Map<i32, Span, FixedState, Global>,
     names: Strings,
     root: Vec<u8>,
     /// The watched directory. inotify watches an inode, not a name: once it is deleted or
@@ -892,7 +896,7 @@ pub(crate) struct Room {
 impl Room {
     fn new() -> io::Result<Room> {
         Ok(Room {
-            dirs: HashMap::new_in(Global),
+            dirs: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             names: Strings::new()?,
             root: Vec::new_in(Global),
             top: String::new(),
@@ -911,14 +915,12 @@ impl Inotify {
     /// Watches `room.top` under `root` and every directory under it, into `room`'s tables: a
     /// walk of the whole tree, under a span naming the directory.
     fn new(root: &Path, nonblocking: bool, room: Room) -> io::Result<Inotify> {
-        let flags = libc::IN_CLOEXEC | if nonblocking { libc::IN_NONBLOCK } else { 0 };
-        // SAFETY: no pointers; a descriptor of its own or -1.
-        let fd = unsafe { libc::inotify_init1(flags) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: the call returned a descriptor of its own.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let flags = InotifyFlags::CLOSE_ON_EXEC
+            | if nonblocking { InotifyFlags::NONBLOCK } else { InotifyFlags::NONE };
+        let fd = linux::inotify_init1(flags)
+            .map_err(|errno| io::Error::from_raw_os_error(i32::from(errno.raw())))?;
+        // SAFETY: into_raw transfers the new descriptor's sole ownership.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd.into_raw()) };
         let mut room = room;
         room.root.clear();
         room.root.extend_from_slice(root.as_os_str().as_bytes());
@@ -1027,7 +1029,7 @@ impl Inotify {
     /// Watches `rel` and the directories under it: a start's walk. A directory made after it is
     /// a [`Grow`]'s.
     fn add_tree(&mut self, rel: &str) -> io::Result<()> {
-        let fd = self.fd.as_raw_fd();
+        let fd = Fd::new(self.fd.as_raw_fd());
         let Room { dirs, names, root, walker, .. } = &mut self.room;
         let tree = rel;
         walker.walk(
@@ -1042,24 +1044,23 @@ impl Inotify {
                         dirs.len()
                     )));
                 }
-                // SAFETY: an inotify descriptor and a NUL-terminated path.
-                let wd = unsafe { libc::inotify_add_watch(fd, path.as_ptr(), MASK) };
-                if wd < 0 {
-                    let error = io::Error::last_os_error();
+                let wd = match linux::inotify_add_watch(fd, SysPath::new(path), MASK) {
+                    Ok(wd) => wd.0,
                     // Gone before it was watched: its removal is an event of its parent's.
-                    if error.raw_os_error() == Some(libc::ENOENT) && !dirs.is_empty() {
-                        return Ok(Visit::Skip);
+                    Err(Errno::NoEnt) if !dirs.is_empty() => return Ok(Visit::Skip),
+                    Err(errno) => {
+                        let error = io::Error::from_raw_os_error(i32::from(errno.raw()));
+                        if errno == Errno::NoSpc {
+                            return Err(io::Error::other(format!(
+                                "watching {} with inotify: {} directories watched, the most the \
+                                 system lets a user watch (fs.inotify.max_user_watches): {error}",
+                                path.to_string_lossy(),
+                                dirs.len()
+                            )));
+                        }
+                        return Err(error);
                     }
-                    if error.raw_os_error() == Some(libc::ENOSPC) {
-                        return Err(io::Error::other(format!(
-                            "watching {} with inotify: {} directories watched, the most the \
-                             system lets a user watch (fs.inotify.max_user_watches): {error}",
-                            path.to_string_lossy(),
-                            dirs.len()
-                        )));
-                    }
-                    return Err(error);
-                }
+                };
                 let span = names.push(rel.as_bytes());
                 if let Some(was) = dirs.insert(wd, span) {
                     names.free(was);
@@ -1094,7 +1095,7 @@ impl Inotify {
             let event = &bytes[at..(at + HEAD + len).min(bytes.len())];
             let name_bytes = &event[HEAD..];
             at += HEAD + len;
-            if mask & libc::IN_Q_OVERFLOW != 0 {
+            if mask & InotifyMask::OVERFLOW.bits() != 0 {
                 // What was dropped may be the watched directory's own end.
                 self.room.batch.push(&self.room.top);
                 *lost = true;
@@ -1111,7 +1112,7 @@ impl Inotify {
                 }
                 continue;
             }
-            if mask & libc::IN_IGNORED != 0 {
+            if mask & InotifyMask::IGNORED.bits() != 0 {
                 if let Some(span) = self.room.dirs.remove(&wd) {
                     let top = self.room.names.str(span) == self.room.top;
                     self.room.names.free(span);
@@ -1124,7 +1125,9 @@ impl Inotify {
             }
             let Some(&span) = self.room.dirs.get(&wd) else { continue };
             let dir = self.room.names.str(span);
-            if mask & (libc::IN_DELETE_SELF | libc::IN_MOVE_SELF) != 0 && dir == self.room.top {
+            if mask & (InotifyMask::DELETE_SELF | InotifyMask::MOVE_SELF).bits() != 0
+                && dir == self.room.top
+            {
                 *lost = true;
             }
             rel.clear();
@@ -1136,7 +1139,9 @@ impl Inotify {
                 }
                 push_lossy(rel, &name_bytes[..end]);
             }
-            if mask & libc::IN_ISDIR != 0 && mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0 {
+            if mask & InotifyMask::IS_DIR.bits() != 0
+                && mask & (InotifyMask::CREATE | InotifyMask::MOVED_TO).bits() != 0
+            {
                 self.room.fresh.push(rel);
             }
             self.room.batch.push(rel);
@@ -1171,8 +1176,8 @@ mod tests {
         for seed in 0..32 {
             let mut rng = crate::sim::Rng::new(seed);
             let mut strings = Strings::new().unwrap();
-            let mut ours: HashMap<u32, Span, Global> = HashMap::new_in(Global);
-            let mut theirs: HashMap<u32, String, Global> = HashMap::new_in(Global);
+            let mut ours: Map<u32, Span, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
+            let mut theirs: Map<u32, String, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
             for step in 0..4_000u32 {
                 let key = rng.below(64) as u32;
                 if rng.below(3) == 0 {
@@ -1203,6 +1208,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A start given an inotify watch's spare, which only a start fanotify refused leaves, is
+    /// inotify's and allocates nothing: it does not ask fanotify again. The control is the
+    /// start before the fix, which made fanotify's tables first (a 2 MiB reservation and a
+    /// table of 2^16 heads), on every watch of an unprivileged process; and which, where
+    /// fanotify is allowed, is fanotify's, so this fails with or without the privilege.
+    #[test]
+    fn a_start_with_an_inotify_spare_is_inotify_s_and_allocates_nothing() {
+        let root = crate::temp::TempDir::for_test("blaze-watch-spare-");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let src = FileName::new("src").unwrap();
+        let mut room = Room::new().unwrap();
+        // The name's room, as a watch's before it ended has.
+        room.top.push_str("src");
+        let begun = blaze_alloc_count::assert_at_most(0, "a start with an inotify spare", || {
+            Tree::begin(Some(Spare::Inotify(room)), &root, &src, true)
+        });
+        assert!(matches!(begun, Ok(Begun::Walk(ref walk)) if walk.dir() == "src"));
+        drop(begun);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A batch tells each valid name once, sorted, and allocates the names and their vector

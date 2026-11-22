@@ -48,20 +48,19 @@ use blaze_core::{
     sim::{Faults, Sim},
     wait::Deadline,
 };
-use blaze_mem::Frame;
 use blaze_rng::SplitMix64;
 
 use crate::{
     Plant, Stopped,
-    args::Args,
+    args::{ArgList, Args},
     audio::Audio,
     automation::Automation,
-    clock::Clock,
+    clock::{Born, Clock},
     code::Code,
     cx::Cx,
     device::{Bluetooth, Camera, Clipboard, Location, Notify, Screen, Serial, Usb},
     disk::{Disk, DiskCounts},
-    env::Env,
+    env::{Env, Vars},
     fs::Fs,
     gpu::Gpu,
     host::{Exit, Host, HostFacts},
@@ -73,7 +72,6 @@ use crate::{
     opener::Opener,
     out::{Out, Stream},
     power::Power,
-    requests::Http,
     rng::Rng,
     roots::Roots,
     streams::Streams,
@@ -82,6 +80,22 @@ use crate::{
     user::User,
     window::Window,
 };
+
+/// What a world reads and does without its lock: the native clock, inline file calls, lent
+/// writes (std.md, "End state: efficiency", pieces 6, 7 and 11).
+mod fast;
+mod native_in;
+/// [`Io::sip_key`]: a hash key from the world's random source.
+mod sip_key;
+/// [`LentDriver`]: the world's backend lent to a state machine over `blaze_core::Driver`
+/// (blaze-cas's plain store under the command), fenced to one directory.
+mod lend;
+pub use lend::LentDriver;
+#[cfg(test)]
+mod tests;
+
+pub(crate) use blaze_core::threads::inline::Lent;
+pub(crate) use fast::ReadAllLent;
 
 /// The bounds bstd would otherwise pick for its caller, said once where the [`Io`] is made
 /// (docs/v2/plan/design/std.md, "The second rule": a bound is an argument, never a default).
@@ -118,6 +132,16 @@ impl Limits {
         close_most: 1024,
         trace_most: 1 << 16,
     };
+
+    /// As [`Limits::USUAL`], with global trace recording off (`trace_most: 0`): `Cx::span` and
+    /// `Cx::event` take no world lock on high-core workloads where worker telemetry is used
+    /// instead.
+    pub const QUIET: Limits = Limits {
+        abandon_wait: Duration::from_secs(1),
+        poll_fuel: 1 << 16,
+        close_most: 1024,
+        trace_most: 0,
+    };
 }
 
 /// What the simulation's generator of [`Io::rng`] starts from, besides the seed: so it draws
@@ -131,6 +155,9 @@ enum Backend {
     Native(Box<blaze_core::Native>),
     // alloc: once per simulated world.
     Sim(Box<Sim>),
+    /// A hosted program's: every reach a call through its host's table ([`crate::guest`]).
+    // alloc: once per hosted run.
+    Guest(Box<crate::guest::Guest>),
 }
 
 impl Backend {
@@ -139,6 +166,7 @@ impl Backend {
             #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
             Backend::Native(driver) => driver.submit(effects),
             Backend::Sim(sim) => sim.submit(effects),
+            Backend::Guest(guest) => guest.submit(effects),
         }
     }
 
@@ -147,6 +175,7 @@ impl Backend {
             #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
             Backend::Native(driver) => driver.poll(out, until),
             Backend::Sim(sim) => sim.poll(out, until),
+            Backend::Guest(guest) => guest.poll(out),
         }
     }
 
@@ -155,17 +184,70 @@ impl Backend {
             #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
             Backend::Native(driver) => driver.now(),
             Backend::Sim(sim) => sim.now(),
+            Backend::Guest(guest) => guest.now(),
+        }
+    }
+
+    fn wall_ns(&self) -> u64 {
+        match self {
+            #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
+            Backend::Native(driver) => driver.wall_ns(),
+            Backend::Sim(sim) => sim.wall_ns(),
+            Backend::Guest(guest) => guest.wall_ns(),
+        }
+    }
+
+    fn boot(&self) -> Result<blaze_core::Boot, blaze_core::NoBoot> {
+        match self {
+            #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
+            Backend::Native(driver) => driver.boot(),
+            Backend::Sim(sim) => Driver::boot(&**sim),
+            // A guest's host table carries no boot: the guest says so, never a made-up one.
+            Backend::Guest(_) => Err(blaze_core::NoBoot { source: "a guest's host table", why: String::from("it carries no boot") }),
+        }
+    }
+
+    /// `parts`, in order, on the standard stream `stream`, as one write: the driver's one
+    /// reach for output, one call per flush of an [`Out`]'s buffer. Not an [`Effect`]: the
+    /// native driver performs one on a thread of its own per stream, which a `hello` cannot
+    /// afford, so the write is made here, on the calling thread, by the backend that owns the
+    /// stream. A simulated world's streams are its [`SimHost`]'s ([`Io::write_out`]).
+    fn write_out(&mut self, stream: Stream, parts: &[&[u8]]) -> Result<(), String> {
+        match self {
+            #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
+            Backend::Native(_) => crate::rt::write_out(stream, parts),
+            // alloc: an error's message.
+            Backend::Sim(_) => Err(String::from("bstd: a simulated world's streams are its host's, and it has none")),
+            // alloc: an error's message.
+            Backend::Guest(guest) => guest.write(stream, parts).map_err(|error| error.to_string()),
+        }
+    }
+
+    /// What `stream` is drawn on: the kernel's answer for a native world (`rt::tty`), read when
+    /// asked; a simulated world's streams are its host's (`SimHost::ttys`, set from
+    /// [`SimWorld::ttys`]), so its backend has none; the hosted wire does not carry it yet.
+    fn tty(&mut self, stream: Stream) -> crate::term::Tty {
+        match self {
+            #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
+            Backend::Native(_) => crate::rt::tty::read(stream),
+            Backend::Sim(_) | Backend::Guest(_) => crate::term::Tty::NotTerminal,
         }
     }
 
     /// A poll brought nothing before `until`: the simulation has nothing that completes by
     /// then, so its clock moves to `until`, as a real wait sleeps to it. A real driver's
-    /// clock moves by itself.
+    /// clock moves by itself. [`Deadline::NEVER`] is no time to move to: a real wait with no
+    /// deadline blocks until something completes, so the clock stays, and the caller's poll
+    /// fuel ends the wait as [`Stopped::Stalled`] (moving it to `Duration::MAX` left a clock
+    /// that every later delay overflowed).
     fn idle_until(&mut self, until: Deadline) {
         match self {
             #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
             Backend::Native(_) => {}
+            // Every escaped effect completed inside its call: nothing is left to come.
+            Backend::Guest(_) => {}
             Backend::Sim(sim) => {
+                let Some(until) = until.finite() else { return };
                 let now = sim.now();
                 if !until.passed(now) {
                     sim.advance(until.get().saturating_sub(now));
@@ -174,13 +256,14 @@ impl Backend {
         }
     }
 
-    /// A test's view: the lib asks no driver how much it holds.
-    #[cfg(test)]
+    /// How many effects the driver holds that have not completed: what the end of a native
+    /// `main` drains ([`Io::drain`]), and a test's view.
     fn in_flight(&self) -> usize {
         match self {
             #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
             Backend::Native(driver) => driver.in_flight(),
             Backend::Sim(sim) => sim.in_flight(),
+            Backend::Guest(guest) => guest.in_flight(),
         }
     }
 
@@ -189,6 +272,7 @@ impl Backend {
             #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
             Backend::Native(_) => None,
             Backend::Sim(sim) => Some(sim),
+            Backend::Guest(_) => None,
         }
     }
 }
@@ -200,6 +284,8 @@ pub(crate) enum Ends {
     Once,
     /// A listen's: it ends with [`Done::Unlistened`] or [`Done::Failed`].
     Stream,
+    /// A watch's or a journal's: it ends with [`Done::Unwatched`] or [`Done::Failed`].
+    Watch,
 }
 
 /// Everything behind one [`Io`].
@@ -214,11 +300,15 @@ struct World {
     got: Vec<Completion>,
     /// Tags whose waiter stopped: their completions are dropped as they arrive.
     abandoned: Vec<(Tag, Ends)>,
-    /// The generator [`Io::rng`] forks from.
-    rng: SplitMix64,
+    /// The generator [`Io::rng`] forks from: `None` in a native world until its first fork,
+    /// which draws its seed from the host then (std.md, "What a program pays for at start").
+    rng: Option<SplitMix64>,
     /// Every file an effect named, and whether the effect changes it, while `record` is on: a
     /// test's view of where its capabilities reached.
     touched: Vec<(FileName, bool)>,
+    /// Every effect handed to the driver, in order, while `record` is on: a test's view of
+    /// what a call asked of the device.
+    asked: Vec<Effect>,
     record: bool,
     /// For each file whose bytes or name an effect of this world changed, the number of the
     /// last effect that did (its tag, plus one): the file's generation, which a
@@ -231,25 +321,95 @@ struct World {
     host: HostFacts,
     /// The status the simulated process exited with.
     exited: Option<i32>,
+    /// What standard output and standard error are drawn on, read through the backend at the
+    /// first ask ([`Io::tty`]) and kept.
+    ttys: [Option<crate::term::Tty>; 2],
+    /// What was said on standard output and standard error and not yet written, in that
+    /// order ([`crate::out`], "Buffering"): inline, so the buffer is part of the world's one
+    /// allocation, and one a world, so every `Out` of it keeps its lines in order.
+    pending: [crate::out::Pending; 2],
+    /// How many folders above the root were granted ([`Io::above_most`]).
+    above: u8,
     /// The simulated host behind the capabilities blaze-core has no effect for: `None` in a
     /// real world, which has no provider for them.
     // alloc: once per simulated world.
     hosted: Option<Box<SimHost>>,
-    /// The simulated disk's ledger ([`crate::disk`]): what was paid, and which names a crash
-    /// may undo. `None` in a real world.
+    /// The simulated disk's ledger ([`crate::disk`]): what was paid. `None` in a real world.
     // alloc: once per simulated world.
     disk: Option<Box<Disk>>,
-    plant: Plant,
 }
 
 /// One handle to the process's driver. Cloning it copies authority it holds and adds none.
-#[derive(Clone)]
 pub struct Io {
-    world: Arc<Lock<World>>,
-    env: Arc<[(String, String)]>,
-    args: Arc<[String]>,
+    reach: Reach,
     offers: Offers,
     limits: Limits,
+    /// The tests' planted bug: [`Plant::None`] but in their controls.
+    plant: Plant,
+}
+
+// Written out, not derived: a derived `Clone` calls each field's `clone`, three functions
+// more on the hosted hello's path (ladder README, "What the hosted hello executes"); the
+// `Copy` fields are copied.
+impl Clone for Io {
+    fn clone(&self) -> Io {
+        Io { reach: self.reach.clone(), offers: self.offers, limits: self.limits, plant: self.plant }
+    }
+}
+
+/// Where an [`Io`]'s world is.
+#[derive(Clone)]
+enum Reach {
+    /// A native or simulated world: shared by the `Io`s cloned from it, on any thread, behind
+    /// its lock; with what is read or done without the lock beside it ([`fast::Beside`]: the
+    /// native clock and inline file calls).
+    ///
+    /// `workers` is the world's per-worker state (D171, [`crate::workers`]): the cells its
+    /// tasks' `on_worker` holds, made with the world or handed in ([`Io::on_workers`]).
+    Shared { world: Arc<Lock<World>>, env: Vars, args: ArgList, beside: fast::Beside, workers: crate::workers::Workers },
+    /// A hosted run's ([`crate::guest::Run`]): found through the calling thread's run, never
+    /// held, so cloning and dropping an `Io` of it touches nothing. Its hot calls (a write,
+    /// the clock, a grant, the exit) go straight to the host's table with no lock; the rest
+    /// (the escape's effects) through a world made at its first use ([`Io::world`]).
+    Hosted,
+}
+
+/// A hosted run's world for what is not on its hot path: made at the first effect sent
+/// through the escape ([`crate::guest::Run`] keeps it for the run).
+pub(crate) struct Escape(Lock<World>);
+
+impl Escape {
+    /// The world over the host's `table`: a [`Backend::Guest`] with no environment, no
+    /// trace kept (a hosted run's spans are its host's to see), `limits`; the escape's
+    /// encodings made in `alloc`, the run's heap.
+    pub(crate) fn new(table: crate::wire::HostTable, limits: Limits, alloc: blaze_own::SharedAlloc<'static>) -> Escape {
+        let world = World::new(Start {
+            // alloc: once per hosted run that sends an effect, the escape's driver.
+            driver: Backend::Guest(Box::new(crate::guest::Guest::new(table, alloc))),
+            seed: None,
+            // The hosted wire carries no folders above its root.
+            above: 0,
+            env: Vars::given(Vec::new()),
+            args: ArgList::given(Vec::new()),
+            host: HostFacts {
+                pid: 0,
+                cores: core::num::NonZero::<usize>::MIN,
+                // alloc: once per hosted run that sends an effect.
+                name: Arc::from(""),
+                // alloc: once per hosted run that sends an effect.
+                born: Born::Unknown(Arc::from("the hosted wire does not carry the process's start yet")),
+                build_id: None,
+                // The hosted wire does not carry the program's path.
+                exe: None,
+            },
+            offers: crate::guest::OFFERS,
+            limits,
+            hosted: None,
+            disk: None,
+            plant: Plant::None,
+        });
+        Escape(Lock::new("bstd.io.world", world))
+    }
 }
 
 /// The table of what a host offers, one flag a root capability, and what is made from it.
@@ -396,10 +556,31 @@ pub struct SimWorld {
     pub host: HostFacts,
     /// What its program is offered: [`Offers::ALL`] unless a test withholds some.
     pub offers: Offers,
+    /// What standard output and standard error are drawn on, in that order: not terminals
+    /// unless a test says so.
+    pub ttys: [crate::term::Tty; 2],
+    /// The folders above its root, nearest first ([`crate::fs::Fs::ancestors`]): none unless a
+    /// test says so.
+    pub above: Vec<blaze_core::sim::SimAbove>,
+    /// How many of them are granted: all by default.
+    pub top: u8,
     /// The bounds its waits, closes and trace end by.
     #[blaze::policy]
     pub limits: Limits,
+    /// How many simulated workers its tasks move between (D171, [`crate::workers`]): each has
+    /// its own cell. [`SIM_WORKERS`] unless a test says so; 0 seats its roots as a real
+    /// world's are, on leased caller cells.
+    #[blaze::policy]
+    pub models: u32,
 }
+
+/// The simulated workers of a [`SimWorld`] unless a test says otherwise: enough that a task
+/// that moves at each wait lands on a cell other than its last.
+pub const SIM_WORKERS: u32 = 4;
+
+/// What the simulation's workers' streams start from, besides the seed: so they draw apart
+/// from the world's own generator.
+const WORKERS_SALT: u64 = 0x5745_524B_4552_5331;
 
 impl SimWorld {
     /// The world of [`Io::sim`]: no faults beyond latency, no environment, no arguments, the
@@ -417,6 +598,11 @@ impl SimWorld {
             args: Vec::new(),
             host: HostFacts::simulated(),
             offers: Offers::ALL,
+            ttys: [crate::term::Tty::NotTerminal; 2],
+            // alloc: none, no folders above.
+            above: Vec::new(),
+            top: u8::MAX,
+            models: SIM_WORKERS,
         }
     }
 }
@@ -429,10 +615,15 @@ impl SimWorld {
 pub struct NativeWorld<'a> {
     pub root: &'a crate::rt::RootPath,
     pub threads: usize,
-    pub env: Vec<(String, String)>,
-    pub args: Vec<String>,
+    pub env: Vars,
+    pub args: ArgList,
     pub host_name: Arc<str>,
-    pub seed: u64,
+    /// The seed of [`Io::rng`]'s generator: `None` draws it from the host's secure source at
+    /// the first [`Io::rng`], so a program that never asks for randomness never draws.
+    pub seed: Option<u64>,
+    /// How many folders above `root` it may read ([`crate::fs::Fs::ancestors`]): every one
+    /// up to the filesystem's root (`u8::MAX`) for a command, none for a launched program.
+    pub above: u8,
     /// The bounds its waits, closes and trace end by.
     pub limits: Limits,
 }
@@ -440,9 +631,11 @@ pub struct NativeWorld<'a> {
 /// What a world starts from, whichever its driver.
 struct Start {
     driver: Backend,
-    seed: u64,
-    env: Vec<(String, String)>,
-    args: Vec<String>,
+    seed: Option<u64>,
+    /// The granted depth above the root ([`Io::above_most`]).
+    above: u8,
+    env: Vars,
+    args: ArgList,
     host: HostFacts,
     offers: Offers,
     limits: Limits,
@@ -488,54 +681,213 @@ impl Io {
 
     /// `world` with `plant` planted: [`Plant::None`] but for the tests' controls.
     pub(crate) fn planted(world: SimWorld, plant: Plant) -> Io {
+        // The world's workers (D171): its `models` simulated workers' cells and bstd's own
+        // fields, each worker's stream drawn from the world's seed.
+        let setup = crate::workers::WorkersSetup {
+            limits: crate::workers::Limits::BARE,
+            seed: Some(world.seed ^ WORKERS_SALT),
+            models: world.models,
+        };
+        let workers = match crate::workers::Workers::bare(setup) {
+            Ok(workers) => workers,
+            Err(error) => panic!("bstd::Io::simulated of seed {}: {error}", world.seed),
+        };
+        Io::planted_on(world, plant, workers)
+    }
+
+    /// [`Io::simulated`] over `workers`, made by a test's main with its slots registered
+    /// ([`crate::workers::WorkersOpts`]): its tasks' `on_worker` holds `workers`' cells.
+    pub fn simulated_on(world: SimWorld, workers: crate::workers::Workers) -> Io {
+        Io::planted_on(world, Plant::None, workers)
+    }
+
+    /// This world's handle, its tasks' per-worker state `workers` instead (D171): what main
+    /// does once after registering its slots, before it makes the root it runs on. Contexts
+    /// made from the old handle keep the old cells; nothing is shared between the two.
+    pub fn on_workers(&self, workers: crate::workers::Workers) -> Io {
+        let mut io = self.clone();
+        match &mut io.reach {
+            Reach::Shared { workers: held, .. } => *held = workers,
+            Reach::Hosted => crate::guest::Run::current().set_workers(workers),
+        }
+        io
+    }
+
+    /// The world's per-worker state: what `Cx::on_worker` holds a cell of.
+    pub(crate) fn workers(&self) -> &crate::workers::Workers {
+        match &self.reach {
+            Reach::Shared { workers, .. } => workers,
+            Reach::Hosted => crate::guest::Run::current().workers(),
+        }
+    }
+
+    fn planted_on(world: SimWorld, plant: Plant, workers: crate::workers::Workers) -> Io {
         Io::over(Start {
             // alloc: once per simulated world.
-            driver: Backend::Sim(Box::new(Sim::new(world.seed, world.faults))),
-            seed: world.seed ^ RNG_SALT,
-            env: world.env,
-            args: world.args,
+            driver: Backend::Sim(Box::new({
+                let mut sim = Sim::new(world.seed, world.faults);
+                sim.set_above(world.above);
+                sim
+            })),
+            seed: Some(world.seed ^ RNG_SALT),
+            above: world.top,
+            env: Vars::given(world.env),
+            args: ArgList::given(world.args),
             host: world.host,
             offers: world.offers,
             limits: world.limits,
             // alloc: once per simulated world, its host.
-            hosted: Some(Box::new(SimHost::new())),
+            hosted: Some(Box::new(SimHost { ttys: world.ttys, ..SimHost::new() })),
             // alloc: once per simulated world, its disk's ledger.
-            disk: Some(Box::new(Disk::new(world.seed))),
+            disk: Some(Box::new(Disk::new())),
             plant,
-        })
+        }, workers)
     }
 
     /// The target's own driver over `world.root`.
+    ///
+    /// The authority to touch the real system from nowhere: it reaches the process's root
+    /// itself. Its one home is [`Io::native_in`], which takes the root (`&blaze_core::Os`);
+    /// this form goes in batch B1 (port27/bstd-capabilities.md) with its callers moved to
+    /// `native_in` (an entry's `Os::process()`, a test's `bstd::test::native`).
     #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
     pub fn native(world: NativeWorld<'_>) -> Result<Io, OpenError> {
-        let refused = |why: String| OpenError {
-            // alloc: an error's message.
-            root: world.root.display().to_string(),
-            why,
-        };
-        // alloc: an error's message.
-        let cores = blaze_core::cores::machine().map_err(|error| refused(error.to_string()))?;
-        // alloc: an error's message.
-        let driver = blaze_core::native(world.root, world.threads).map_err(|error| refused(error.to_string()))?;
-        Ok(Io::over(Start {
-            // alloc: once per process, the driver.
-            driver: Backend::Native(Box::new(driver)),
-            seed: world.seed,
-            env: world.env,
-            args: world.args,
-            host: HostFacts { pid: crate::rt::process_id(), cores, name: world.host_name },
-            offers: crate::host::OFFERS,
-            limits: world.limits,
-            hosted: None,
-            disk: None,
-            plant: Plant::None,
-        }))
+        Io::native_in(blaze_core::Os::process(), world)
     }
 
-    fn over(start: Start) -> Io {
-        let Start { driver, seed, env, args, host, offers, limits, hosted, disk, plant } = start;
-        let world = World {
+    /// The world of the hosted run the calling thread is in ([`crate::guest::Run`]), offering
+    /// `offers`. Its state is the run's, found through the thread at each reach, so this
+    /// value holds none: an `Io` of it used on another thread, or after the run, stops with a
+    /// panic naming that. The wire carries no host facts yet, so `offers` withholds `host`.
+    pub(crate) fn hosted(offers: Offers, limits: Limits) -> Io {
+        debug_assert!(!offers.host, "a hosted world has no host facts to offer");
+        Io { reach: Reach::Hosted, offers, limits, plant: Plant::None }
+    }
+
+    /// Whether a hosted world's host grants the parameter `name` of kind `kind`: what a
+    /// hosted program's start asks for each of `main`'s parameters ([`crate::guest::grant`]).
+    pub(crate) fn guest_grant(&self, kind: &str, name: &str) -> Result<(), crate::guest::WireError> {
+        match &self.reach {
+            Reach::Hosted => crate::guest::grant_of(&crate::guest::Run::current().table, kind, name),
+            Reach::Shared { .. } => Err(crate::guest::WireError { entry: "grant", refusal: crate::wire::Refusal::Unknown }),
+        }
+    }
+
+    /// The world's lock: a shared world's, or a hosted run's escape, made now if this is its
+    /// first use. Everything off a hosted run's hot path reaches its world here.
+    /// How many folders above the root this world may read ([`crate::fs::Fs::ancestors`]):
+    /// none for a hosted run, whose wire carries none.
+    pub(crate) fn above_most(&self) -> u8 {
+        match &self.reach {
+            Reach::Hosted => 0,
+            Reach::Shared { .. } => self.world().lock().above,
+        }
+    }
+
+    fn world(&self) -> &Lock<World> {
+        // The tests' count of reaches of the lock (io/tests.rs, `native_now_takes_no_lock`).
+        #[cfg(test)]
+        self.counted(|seen| &seen.locks);
+        match &self.reach {
+            Reach::Shared { world, .. } => world,
+            Reach::Hosted => &crate::guest::Run::current().escape().0,
+        }
+    }
+
+    fn over(start: Start, workers: crate::workers::Workers) -> Io {
+        let (offers, limits, plant) = (start.offers, start.limits, start.plant);
+        // clone: the world's environment and command line, `Arc`s.
+        let (env, args) = (start.env.clone(), start.args.clone());
+        // Chosen once, from the driver, before it moves under the lock.
+        let beside = fast::Beside::of(&start.driver, limits.trace_most);
+        Io {
+            // alloc: once per world.
+            reach: Reach::Shared { world: Arc::new(Lock::new("bstd.io.world", World::new(start))), env, args, beside, workers },
+            offers,
+            limits,
+            plant,
+        }
+    }
+}
+
+/// A world's standard error as a `core::fmt::Write`, each piece one raw write: what an exit
+/// says a refused flush with, allocating nothing.
+struct RawErr<'a>(&'a Io);
+
+impl core::fmt::Write for RawErr<'_> {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        match self.0.write_out(Stream::Err, &[text.as_bytes()]) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(core::fmt::Error),
+        }
+    }
+}
+
+/// Where `stream`'s per-stream state sits in a world's pairs (`ttys`, `pending`,
+/// `SimHost::writes`).
+fn stream_at(stream: Stream) -> usize {
+    match stream {
+        Stream::Out => 0,
+        Stream::Err => 1,
+    }
+}
+
+/// Whether `stream` is drawn on a terminal, from a world's borrowed parts: what [`Io::tty`]
+/// answers, for a caller that holds the lock already.
+fn is_terminal(
+    driver: &mut Backend,
+    hosted: &Option<Box<SimHost>>,
+    ttys: &mut [Option<crate::term::Tty>; 2],
+    stream: Stream,
+) -> bool {
+    let at = stream_at(stream);
+    let tty = match hosted.as_deref() {
+        Some(host) => host.ttys[at],
+        None => *ttys[at].get_or_insert_with(|| driver.tty(stream)),
+    };
+    matches!(tty, crate::term::Tty::Terminal(_))
+}
+
+/// `parts` on `stream` as one write, with nothing before it: the simulated host keeps and
+/// counts it ([`SimHost::writes`]), a real world's backend makes it.
+fn emit(driver: &mut Backend, hosted: &mut Option<Box<SimHost>>, stream: Stream, parts: &[&[u8]]) -> Result<(), String> {
+    match hosted.as_deref_mut() {
+        Some(host) => {
+            host.writes[stream_at(stream)] += 1;
+            let kept = match stream {
+                Stream::Out => &mut host.out,
+                Stream::Err => &mut host.err,
+            };
+            for part in parts {
+                kept.extend_from_slice(part);
+            }
+            Ok(())
+        }
+        None => driver.write_out(stream, parts),
+    }
+}
+
+/// A buffer's write ([`crate::out::Pending`]): recorded as the span `bstd.out.write` opened
+/// inside `parent`, then made. Recorded here, under the lock the write holds, so an append
+/// that writes nothing records nothing and takes the lock once.
+fn written(
+    driver: &mut Backend,
+    hosted: &mut Option<Box<SimHost>>,
+    trace: &mut Trace,
+    stream: Stream,
+    parent: &'static str,
+    parts: &[&[u8]],
+) -> Result<(), String> {
+    trace.push(Record { at: driver.now(), span: "bstd.out.write", kind: RecordKind::Opened { parent } });
+    emit(driver, hosted, stream, parts)
+}
+
+impl World {
+    fn new(start: Start) -> World {
+        let Start { driver, seed, above, env: _, args: _, host, offers: _, limits, hosted, disk, plant: _ } = start;
+        World {
             driver,
+            above,
             next: 0,
             // alloc: the effects' queue, grown once to the most made between waits.
             effects: Vec::new(),
@@ -545,31 +897,25 @@ impl Io {
             got: Vec::new(),
             // alloc: the tags of waits that stopped.
             abandoned: Vec::new(),
-            rng: SplitMix64::new(seed),
+            rng: seed.map(SplitMix64::new),
             // alloc: none until a test records.
             touched: Vec::new(),
+            asked: Vec::new(),
             record: false,
             // alloc: none until a file is changed.
             changed: BTreeMap::new(),
             trace: Trace::new(limits.trace_most),
             host,
             exited: None,
+            ttys: [None; 2],
+            pending: [crate::out::Pending::new(), crate::out::Pending::new()],
             hosted,
             disk,
-            plant,
-        };
-        Io {
-            // alloc: once per world.
-            world: Arc::new(Lock::new("bstd.io.world", world)),
-            // alloc: once per world, its environment.
-            env: env.into(),
-            // alloc: once per world, its command line.
-            args: args.into(),
-            offers,
-            limits,
         }
     }
+}
 
+impl Io {
     /// The bounds this world was made with.
     #[blaze::nopanic]
     #[blaze::noalloc]
@@ -582,10 +928,18 @@ impl Io {
     /// driver's clock, with a frame of its own that hands out at most `scratch` bytes
     /// ([`crate::mem::TASK_FRAME`] is the usual value; it is named at the call, never
     /// assumed). Every wait under it ends by `budget`.
+    ///
+    /// Built plainly, for what a program that never waits uses: `Duration::MAX` is no deadline
+    /// (the clock is not read for it), and the frame is made at its first use
+    /// ([`Cx::frame`]), so a root no one allocates in costs one allocation, its task's
+    /// placement. A frame reserves nothing until it hands out bytes, so making it later
+    /// refuses nothing it would have refused here.
     pub fn cx(&self, budget: Duration, scratch: usize) -> Result<Cx, Stopped> {
-        let frame = Frame::with_reserve(scratch, blaze_mem::Tag::Frames)
-            .map_err(|_| Stopped::OutOfMemory { arena: "main's frame", asked: scratch })?;
-        Ok(Cx::root(Deadline::after(self.now(), budget), frame, self.clone()))
+        let deadline = match budget {
+            Duration::MAX => None,
+            budget => Some(Deadline::after(self.now(), budget)),
+        };
+        Ok(Cx::root(deadline, scratch, self.clone()))
     }
 
     /// What the host offers: fixed when this `Io` was made.
@@ -623,7 +977,36 @@ impl Io {
     /// A generator of its own, forked from the world's: seeded in the simulation. `None` when
     /// the host offers no randomness.
     pub fn rng(&self) -> Option<Rng> {
-        self.offered(|it| it.rng).then(|| Rng::new(self.world.lock().rng.next_u64()))
+        self.offered(|it| it.rng).then(|| {
+            let seeded = self.world().lock().rng.is_some();
+            // The seed is one `Effect::Random` through the driver, drawn at the first ask and
+            // kept: every later number is the generator's, so a run is replayed by its seed.
+            let seed = if seeded { None } else { Some(self.draw_seed()) };
+            let mut world = self.world().lock();
+            let rng = match (&mut world.rng, seed) {
+                (Some(rng), _) => rng,
+                (slot @ None, Some(seed)) => slot.insert(SplitMix64::new(seed)),
+                (None, None) => unreachable!("the generator was there under the lock, and nothing takes it away"),
+            };
+            Rng::new(rng.next_u64())
+        })
+    }
+
+    /// Eight bytes of the driver's secure source, asked as one [`Effect::Random`]. A driver
+    /// that does not answer within [`Limits::abandon_wait`], or fails, is a host that cannot
+    /// give randomness, which `rng` offered: that panics, naming it.
+    fn draw_seed(&self) -> u64 {
+        let tag = self.submit(|tag| Effect::Random { len: 8, tag });
+        let until = Deadline::after(self.now(), self.limits.abandon_wait);
+        match self.settle(tag, until, "bstd.io.rng.seed") {
+            Ok(Done::Random(bytes)) if bytes.len() == 8 => {
+                let mut seed = [0; 8];
+                seed.copy_from_slice(&bytes);
+                u64::from_le_bytes(seed)
+            }
+            Ok(done) => panic!("bstd: Io::rng's seed: the driver answered {done:?}, not 8 random bytes"),
+            Err(stopped) => panic!("bstd: Io::rng's seed: the driver did not answer: {stopped}"),
+        }
     }
 
     pub fn need_rng(&self) -> Result<Rng, Missing> {
@@ -633,7 +1016,15 @@ impl Io {
     /// Every variable of the world's environment, if the host offers it; narrow it with
     /// [`Env::only`].
     pub fn env(&self) -> Option<Env> {
-        self.offered(|it| it.env).then(|| Env::new(Arc::clone(&self.env), self.plant()))
+        self.offered(|it| it.env).then(|| {
+            let vars = match &self.reach {
+                // clone: an `Arc`, or the process's borrowed block.
+                Reach::Shared { env, .. } => env.clone(),
+                // The wire carries no environment yet.
+                Reach::Hosted => Vars::given(Vec::new()),
+            };
+            Env::new(vars, self.plant())
+        })
     }
 
     pub fn need_env(&self) -> Result<Env, Missing> {
@@ -642,7 +1033,15 @@ impl Io {
 
     /// The command line, if the host hands one over.
     pub fn args(&self) -> Option<Args> {
-        self.offered(|it| it.args).then(|| Args::new(Arc::clone(&self.args)))
+        self.offered(|it| it.args).then(|| {
+            let args = match &self.reach {
+                // clone: an `Arc`, or the process's borrowed block.
+                Reach::Shared { args, .. } => args.clone(),
+                // Asked of the host at this first ask, and kept for the run.
+                Reach::Hosted => crate::guest::Run::current().args().clone(),
+            };
+            Args::new(args)
+        })
     }
 
     pub fn need_args(&self) -> Result<Args, Missing> {
@@ -668,42 +1067,158 @@ impl Io {
     }
 
     /// Standard output, if the host offers it.
+    ///
+    /// Written plainly (no closure), as [`Io::err`]: it is on every hello's path.
     pub fn out(&self) -> Option<Out> {
-        self.offered(|it| it.out).then(|| Out::new(self.clone(), Stream::Out))
+        match self.offers.out || self.plant == Plant::OffersIgnored {
+            true => Some(Out::new(self.clone(), Stream::Out)),
+            false => None,
+        }
     }
 
     /// Standard output, which `main` requires.
     pub fn need_out(&self) -> Result<Out, Missing> {
-        self.out().ok_or(Missing { capability: "out" })
+        match self.out() {
+            Some(out) => Ok(out),
+            None => Err(Missing { capability: "out" }),
+        }
     }
 
     /// Standard error, if the host offers it: an [`Out`] of the other stream.
     pub fn err(&self) -> Option<Out> {
-        self.offered(|it| it.err).then(|| Out::new(self.clone(), Stream::Err))
+        match self.offers.err || self.plant == Plant::OffersIgnored {
+            true => Some(Out::new(self.clone(), Stream::Err)),
+            false => None,
+        }
     }
 
     /// Standard error, which `main` requires.
     pub fn need_err(&self) -> Result<Out, Missing> {
-        self.err().ok_or(Missing { capability: "err" })
+        match self.err() {
+            Some(err) => Ok(err),
+            None => Err(Missing { capability: "err" }),
+        }
     }
 
-    /// `parts`, in order, on this world's `stream`, as one write: kept by the simulated host
-    /// ([`SimHost::out`], [`SimHost::err`]), or written to the process's by `rt`.
-    pub(crate) fn write_out(&self, stream: Stream, parts: &[&[u8]]) -> Result<(), String> {
-        let mut world = self.world.lock();
-        match world.hosted.as_deref_mut() {
-            Some(host) => {
-                let kept = match stream {
-                    Stream::Out => &mut host.out,
-                    Stream::Err => &mut host.err,
-                };
-                for part in parts {
-                    kept.extend_from_slice(part);
-                }
-                Ok(())
-            }
-            None => crate::rt::write_out(stream, parts),
+    /// Standard input, if the host offers the standard streams (the offer `out` is: one for
+    /// all three).
+    pub fn input(&self) -> Option<crate::input::In> {
+        match self.offers.out || self.plant == Plant::OffersIgnored {
+            true => Some(crate::input::In::new(self.clone())),
+            false => None,
         }
+    }
+
+    /// Standard input, which `main` requires.
+    pub fn need_input(&self) -> Result<crate::input::In, Missing> {
+        self.input().ok_or(Missing { capability: "input" })
+    }
+
+    /// Whether standard input is a terminal: the kernel's answer for a native world
+    /// (descriptor 0, read when asked), never for a simulated world (its host scripts no
+    /// terminal input) or a hosted run (the wire does not carry it).
+    pub(crate) fn input_is_terminal(&self) -> bool {
+        if let Reach::Hosted = self.reach {
+            return false;
+        }
+        let mut world = self.world().lock();
+        let World { driver, .. } = &mut *world;
+        match driver {
+            #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
+            Backend::Native(_) => matches!(crate::rt::tty::read_fd(0), crate::term::Tty::Terminal(_)),
+            Backend::Sim(_) | Backend::Guest(_) => false,
+        }
+    }
+
+    /// `parts`, in order, on this world's `stream`, now: what the stream's buffer holds is
+    /// written first (one write), then `parts` as one write. Kept by the simulated host
+    /// ([`SimHost::out`], [`SimHost::err`]), or written to the process's by `rt`.
+    /// A hosted run's goes straight to its host's `write` ([`crate::guest::write_to`]).
+    pub(crate) fn write_out(&self, stream: Stream, parts: &[&[u8]]) -> Result<(), String> {
+        if let Reach::Hosted = self.reach {
+            return match crate::guest::write_to(&crate::guest::Run::current().table, stream, parts) {
+                Ok(()) => Ok(()),
+                // alloc: an error's message.
+                Err(error) => Err(error.to_string()),
+            };
+        }
+        let mut world = self.world().lock();
+        let World { driver, hosted, pending, trace, .. } = &mut *world;
+        pending[stream_at(stream)]
+            .flush(&mut |held: &[&[u8]]| written(&mut *driver, &mut *hosted, &mut *trace, stream, "bstd.io.write_out", held))?;
+        emit(driver, hosted, stream, parts)
+    }
+
+    /// `bytes` appended to `stream`'s buffer ([`crate::out`], "Buffering"), which is written
+    /// when full; `end` when they end a call, which writes it when the stream is a terminal.
+    /// Each write is recorded as the span `bstd.out.write` inside `parent`. A hosted run holds
+    /// no buffer: its bytes go to its host as they come, as one write each.
+    pub(crate) fn put_out(&self, stream: Stream, parent: &'static str, bytes: &[u8], end: bool) -> Result<(), String> {
+        if let Reach::Hosted = self.reach {
+            if bytes.is_empty() {
+                return Ok(());
+            }
+            return self.write_out(stream, &[bytes]);
+        }
+        let at = stream_at(stream);
+        let mut world = self.world().lock();
+        let World { driver, hosted, ttys, pending, trace, .. } = &mut *world;
+        let terminal = end && is_terminal(&mut *driver, &*hosted, &mut *ttys, stream);
+        let mut write =
+            |parts: &[&[u8]]| -> Result<(), String> { written(&mut *driver, &mut *hosted, &mut *trace, stream, parent, parts) };
+        pending[at].put(bytes, &mut write)?;
+        if terminal {
+            pending[at].flush(&mut write)?;
+        }
+        Ok(())
+    }
+
+    /// What `stream`'s buffer holds, written now as one write (recorded inside `parent`);
+    /// nothing when it is empty or the world is a hosted run's, which holds none.
+    pub(crate) fn flush_out(&self, stream: Stream, parent: &'static str) -> Result<(), String> {
+        if let Reach::Hosted = self.reach {
+            return Ok(());
+        }
+        let mut world = self.world().lock();
+        let World { driver, hosted, pending, trace, .. } = &mut *world;
+        pending[stream_at(stream)].flush(&mut |parts: &[&[u8]]| written(&mut *driver, &mut *hosted, &mut *trace, stream, parent, parts))
+    }
+
+    /// Both streams' buffers written, standard output first; both are tried, and the first
+    /// refusal is the error. What the entry calls when `main` ends, and [`Io::exit`].
+    pub(crate) fn flush_streams(&self, parent: &'static str) -> Result<(), crate::out::OutError> {
+        let out = self.flush_out(Stream::Out, parent);
+        let err = self.flush_out(Stream::Err, parent);
+        match (out, err) {
+            (Err(said), _) => Err(crate::out::OutError { stream: Stream::Out, why: crate::out::OutWhy::Host(said) }),
+            (Ok(()), Err(said)) => Err(crate::out::OutError { stream: Stream::Err, why: crate::out::OutWhy::Host(said) }),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    /// How many bytes `stream`'s buffer holds: a test's view of what is not written yet.
+    #[cfg(test)]
+    pub(crate) fn held_out(&self, stream: Stream) -> usize {
+        self.world().lock().pending[stream_at(stream)].held()
+    }
+
+    /// What `stream` is drawn on, read through the backend once and kept: a simulated world's
+    /// from its host, which a test sets ([`SimWorld::ttys`]).
+    pub(crate) fn tty(&self, stream: Stream) -> crate::term::Tty {
+        let at = match stream {
+            Stream::Out => 0,
+            Stream::Err => 1,
+        };
+        if let Reach::Hosted = self.reach {
+            // The wire does not carry it yet (`Backend::tty`).
+            return crate::term::Tty::NotTerminal;
+        }
+        let mut world = self.world().lock();
+        let World { driver, hosted, ttys, .. } = &mut *world;
+        if let Some(host) = hosted.as_deref() {
+            return host.ttys[at];
+        }
+        *ttys[at].get_or_insert_with(|| driver.tty(stream))
     }
 
     /// Sockets, if the host offers them (a wasm worker does not).
@@ -718,8 +1233,14 @@ impl Io {
     /// The graphics device, if this world has one: a native macOS world does; the simulation
     /// and other targets do not yet ([`Gpu`], a placeholder until the GPU plan's device).
     pub fn gpu(&self) -> Option<Gpu> {
-        let native = self.world.lock().driver.sim().is_none();
+        let native = self.world().lock().driver.sim().is_none();
         Gpu::offered(native)
+    }
+
+    /// The graphics device, which `main` requires (a whole `gpu` grant): refused by name where
+    /// the world has none (the simulation, and every target but native macOS for now).
+    pub fn need_gpu(&self) -> Result<Gpu, Missing> {
+        self.gpu().ok_or(Missing { capability: "gpu" })
     }
 
     /// The terminal as a device, if the host offers one (the simulation does).
@@ -910,12 +1431,14 @@ impl Io {
 
     /// Requests the host makes for the program, if it offers that (a wasm worker's `fetch`;
     /// today the simulation's routes alone). A program that has a `Net` makes its own with
-    /// [`Http::over`].
-    pub fn http(&self) -> Option<Http> {
-        self.offered(|it| it.http).then(|| Http::host(self.clone()))
+    /// [`Http::over`]. Behind bstd's `net` feature.
+    #[cfg(feature = "requests")]
+    pub fn http(&self) -> Option<crate::requests::Http> {
+        self.offered(|it| it.http).then(|| crate::requests::Http::host(self.clone()))
     }
 
-    pub fn need_http(&self) -> Result<Http, Missing> {
+    #[cfg(feature = "requests")]
+    pub fn need_http(&self) -> Result<crate::requests::Http, Missing> {
         self.http().ok_or(Missing { capability: "http" })
     }
 
@@ -931,28 +1454,53 @@ impl Io {
 
     /// `f` on the simulated host, for a test to script what its devices will say and read
     /// what was done to them, and for the capabilities it answers; `None` in a real world,
-    /// which has no provider for them.
+    /// which has no provider for them. What the streams' buffers hold is handed to the host
+    /// first (a write each, as a flush makes), so `f` reads all that was said, in order.
     pub fn script<R>(&self, f: impl FnOnce(&mut SimHost) -> R) -> Option<R> {
-        self.world.lock().hosted.as_deref_mut().map(f)
+        let mut world = self.world().lock();
+        let World { driver, hosted, pending, trace, .. } = &mut *world;
+        let host = hosted.as_deref_mut()?;
+        for stream in [Stream::Out, Stream::Err] {
+            let held = &mut pending[stream_at(stream)];
+            if held.held() == 0 {
+                continue;
+            }
+            // A simulated host takes every write, so this flush cannot fail: the closure says
+            // so in its type.
+            let kept: Result<(), core::convert::Infallible> = held.flush(&mut |parts: &[&[u8]]| {
+                trace.push(Record { at: driver.now(), span: "bstd.out.write", kind: RecordKind::Opened { parent: "bstd.io.script" } });
+                host.writes[stream_at(stream)] += 1;
+                let kept = match stream {
+                    Stream::Out => &mut host.out,
+                    Stream::Err => &mut host.err,
+                };
+                for part in parts {
+                    kept.extend_from_slice(part);
+                }
+                Ok(())
+            });
+            let Ok(()) = kept;
+        }
+        Some(f(host))
     }
 
     /// `f` on the simulation, for a test to change the world (advance the clock, fail syncs,
     /// hold a lock); `None` on a real driver.
     pub fn with_sim<R>(&self, f: impl FnOnce(&mut Sim) -> R) -> Option<R> {
-        self.world.lock().driver.sim().map(f)
+        self.world().lock().driver.sim().map(f)
     }
 
     /// The simulated machine loses power ([`Sim::crash`]): every effect in flight is gone,
     /// and with it what this `Io` kept for their waiters; each file keeps what was flushed
-    /// and a prefix of what was not, and the name changes no name sync covered are kept as a
-    /// prefix too, the rest undone ([`crate::disk`]). `false` on a real driver.
+    /// and a prefix of what was not, and the name changes no directory sync covered may be
+    /// undone (blaze-core's `sim`). `false` on a real driver.
     pub fn crash(&self) -> bool {
-        let mut world = self.world.lock();
+        let mut world = self.world().lock();
         let World { driver, got, abandoned, polled, effects, disk, .. } = &mut *world;
         let Some(sim) = driver.sim() else { return false };
         sim.crash();
         if let Some(disk) = disk {
-            disk.crashed(sim);
+            disk.crashed();
         }
         got.clear();
         abandoned.clear();
@@ -964,30 +1512,66 @@ impl Io {
     /// `f` on what the world's tasks recorded through their contexts ([`Cx::span`],
     /// [`Cx::event`]).
     pub fn trace<R>(&self, f: impl FnOnce(&Trace) -> R) -> R {
-        f(&self.world.lock().trace)
+        let mut world = self.world().lock();
+        if let Reach::Shared { beside, .. } = &self.reach {
+            let dropped = beside.trace.take_dropped();
+            if dropped > 0 {
+                world.trace.add_dropped(dropped);
+            }
+        }
+        f(&world.trace)
     }
 
     /// The status the simulated process exited with, if it did ([`Host::exit`]).
     pub fn exited(&self) -> Option<i32> {
-        self.world.lock().exited
+        self.world().lock().exited
     }
 
     /// A record of `span`, now on the driver's clock.
+    /// A hosted run keeps none: its spans are its host's to see (run.md, "The hosted world").
+    /// Once `trace_most` is 0 or full, takes no world lock: `trace_most == 0` returns at once,
+    /// and a full trace counts its drops atomically beside the lock.
     pub(crate) fn record_trace(&self, span: &'static str, kind: RecordKind) {
-        let mut world = self.world.lock();
+        let Reach::Shared { beside, .. } = &self.reach else {
+            return;
+        };
+        if self.limits.trace_most == 0 {
+            return;
+        }
+        if !beside.trace.is_open() {
+            beside.trace.drop_one();
+            return;
+        }
+        let mut world = self.world().lock();
         let at = world.driver.now();
-        world.trace.push(Record { at, span, kind });
+        if !world.trace.push(Record { at, span, kind }) {
+            beside.trace.close();
+        }
     }
 
     pub(crate) fn host_facts<R>(&self, f: impl FnOnce(&HostFacts) -> R) -> R {
-        f(&self.world.lock().host)
+        f(&self.world().lock().host)
     }
 
     /// The process ends with `status`: a real one exits; the simulated one remembers it and
-    /// unwinds the calling task with an [`Exit`] payload.
+    /// unwinds the calling task with an [`Exit`] payload. What the streams' buffers hold is
+    /// written first; a refused write turns a status of 0 into 1, said on standard error.
     pub(crate) fn exit(&self, status: i32) -> ! {
+        // A hosted program's run is ended by its host: its table's `exit` does not return.
+        if let Reach::Hosted = self.reach {
+            crate::guest::exit_to(&crate::guest::Run::current().table, status);
+        }
+        let status = match self.flush_streams("bstd.host.exit") {
+            Ok(()) => status,
+            Err(error) => {
+                // The stream that refused may be standard error itself: nothing is left to
+                // say it on then, and the status still says the run failed.
+                let _unsaid = core::fmt::write(&mut RawErr(self), format_args!("{error}\n"));
+                if status == 0 { 1 } else { status }
+            }
+        };
         let simulated = {
-            let mut world = self.world.lock();
+            let mut world = self.world().lock();
             let simulated = world.driver.sim().is_some();
             if simulated {
                 world.exited = Some(status);
@@ -1001,60 +1585,167 @@ impl Io {
         crate::rt::resume_unwind(Box::new(Exit { status }))
     }
 
-    /// The driver's clock.
+    /// The driver's clock: a native world's read beside its lock, with none taken (the
+    /// driver's own clock, on the instant it began: [`fast::Time::Native`]); a simulated
+    /// world's virtual clock under its lock, which moves only inside the driver's own calls.
     pub(crate) fn now(&self) -> Duration {
-        self.world.lock().driver.now()
+        match &self.reach {
+            Reach::Shared { beside, .. } => match beside.now() {
+                Some(now) => now,
+                None => self.world().lock().driver.now(),
+            },
+            Reach::Hosted => crate::guest::now_of(&crate::guest::Run::current().table),
+        }
     }
 
+    /// The driver's wall clock, in ns since the Unix epoch ([`blaze_core::Driver::wall_ns`]).
+    pub(crate) fn wall_ns(&self) -> u64 {
+        match &self.reach {
+            Reach::Shared { world, .. } => world.lock().driver.wall_ns(),
+            Reach::Hosted => crate::guest::wall_ns_of(&crate::guest::Run::current().table),
+        }
+    }
+
+    /// Which boot of the machine this is ([`blaze_core::Driver::boot`]): read once by the
+    /// native driver as it was made; in the simulation, drawn anew at every power cut. For what
+    /// is trusted within one boot (a pack verified once per boot); never part of a key.
+    pub fn boot(&self) -> Result<blaze_core::Boot, blaze_core::NoBoot> {
+        match &self.reach {
+            Reach::Shared { world, .. } => world.lock().driver.boot(),
+            Reach::Hosted => Err(blaze_core::NoBoot { source: "a hosted guest", why: String::from("its host table carries no boot") }),
+        }
+    }
+
+    /// A native world over `root`, beside this one, for a second tree the program may write
+    /// ([`crate::fs::Fs::home`]): this world's limits, no environment, no arguments, nothing
+    /// above its root, one file thread. `None` when this world is not native: the simulation
+    /// keeps every tree under its one root, and a hosted guest has no second tree.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
+    pub(crate) fn beside(&self, root: &crate::rt::RootPath) -> Option<Result<Io, OpenError>> {
+        let Reach::Shared { world, .. } = &self.reach else { return None };
+        if !matches!(world.lock().driver, Backend::Native(_)) {
+            return None;
+        }
+        Some(Io::native(NativeWorld {
+            root,
+            above: 0,
+            threads: 1,
+            // alloc: none, an empty environment and command line.
+            env: Vars::given(Vec::new()),
+            args: ArgList::given(Vec::new()), // alloc: as above.
+            // alloc: once per second tree, the host's name (empty, as the start's).
+            host_name: Arc::from(""),
+            seed: None,
+            limits: self.limits,
+        }))
+    }
+
+    /// No native driver on this target: no second tree.
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi")))]
+    pub(crate) fn beside(&self, _root: &crate::rt::RootPath) -> Option<Result<Io, OpenError>> {
+        None
+    }
+
+    /// Whether the system keeps a journal of changes across a restart, so an
+    /// [`Effect::Journal`] from a saved cursor names what changed while nothing ran: macOS
+    /// (FSEvents' per-volume store) and Windows (NTFS's USN journal) do; Linux does not, and
+    /// there a journal costs a watch's start (an inotify walk of every folder) to say only
+    /// that everything is lost. The simulation's by the journal it plays
+    /// ([`blaze_core::sim::Sim::journal`]); a hosted program's world has none it can reach.
+    pub(crate) fn keeps_journal(&self) -> bool {
+        match &self.reach {
+            Reach::Shared { world, .. } => match &world.lock().driver {
+                #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
+                Backend::Native(_) => cfg!(any(target_os = "macos", windows)),
+                Backend::Sim(sim) => sim.journal() != blaze_core::sim::Journal::None,
+                Backend::Guest(_) => false,
+            },
+            Reach::Hosted => false,
+        }
+    }
+
+    /// Whether this world is the simulation's.
+    pub(crate) fn is_sim(&self) -> bool {
+        match &self.reach {
+            Reach::Shared { world, .. } => matches!(world.lock().driver, Backend::Sim(_)),
+            Reach::Hosted => false,
+        }
+    }
+
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn plant(&self) -> Plant {
-        self.world.lock().plant
+        self.plant
     }
 
     /// Start recording the files effects name ([`Io::touched`]).
     #[cfg(test)]
     pub(crate) fn record(&self) {
-        self.world.lock().record = true;
+        if let Reach::Shared { beside, .. } = &self.reach {
+            beside.recording.store(true, core::sync::atomic::Ordering::Release);
+        }
+        self.world().lock().record = true;
     }
 
     /// The files effects named since [`Io::record`], and whether each effect changed it.
     #[cfg(test)]
     pub(crate) fn touched(&self) -> Vec<(FileName, bool)> {
         // clone: a test's copy of the record.
-        self.world.lock().touched.clone()
+        self.world().lock().touched.clone()
+    }
+
+    /// The effects handed to the driver since [`Io::record`], in order, the record emptied.
+    #[cfg(test)]
+    pub(crate) fn asked(&self) -> Vec<Effect> {
+        core::mem::take(&mut self.world().lock().asked)
     }
 
     /// `effect` of a fresh tag, handed to the driver, then waited for under `cx`: one call.
-    /// A `cx` that stopped already asks nothing of the driver.
+    /// A `cx` that stopped already asks nothing of the driver. On a native world whose driver
+    /// gives inline calls, a blocking file call of blaze-core's table is made on this thread
+    /// instead, its `Done` the queue's ([`fast`]); every other effect, and every effect of a
+    /// simulated world, is queued and waited for as before.
     pub(crate) fn call(&self, cx: &Cx, effect: impl FnOnce(Tag) -> Effect) -> Result<Done, Stopped> {
-        cx.stopped_by(self.now())?;
-        let tag = self.submit(effect);
-        cx.wait(self, tag, Ends::Once)
+        let began = self.now();
+        cx.stopped_by(began)?;
+        // The meter (D169): the call's time as its asker waited, by its kind (counted at the
+        // stamp, `fast::stamp`), on this world's clock.
+        let mut kind = blaze_meter::Call::Other;
+        let effect = |tag| {
+            let effect = effect(tag);
+            kind = effect.metered();
+            effect
+        };
+        let done = match self.inline_files() {
+            Some(files) => self.call_inline(cx, files, effect),
+            None => {
+                let tag = self.submit(effect);
+                cx.wait(self, tag, Ends::Once)
+            }
+        };
+        let ns = u64::try_from(self.now().saturating_sub(began).as_nanos()).unwrap_or(u64::MAX);
+        // The call's time on the worker the asker is on (D171): its meter cell, not the
+        // thread's. Its count stays at the stamp (`fast::stamp`), which has no context: both
+        // are read together by `Meter::now_with` of the worker's tally.
+        // The telemetry's effect row of `kind` too (D178): its count and time; the bytes moved
+        // are not known at this seam (0: the report's bytes column counts only what a driver
+        // reports, which none does yet).
+        cx.on_worker(|w| {
+            w.meter().call_took(kind, ns);
+            if let Some((_, cell)) = w.telemetry() {
+                cell.effect(kind, 0, ns);
+            }
+        });
+        done
     }
 
     /// `effect` of a fresh tag, handed to the driver now.
     pub(crate) fn submit(&self, effect: impl FnOnce(Tag) -> Effect) -> Tag {
-        let mut world = self.world.lock();
-        let tag = Tag(world.next);
-        world.next += 1;
-        let effect = effect(tag);
-        if world.record {
-            touch(&mut world.touched, &effect);
-        }
-        change(&mut world.changed, &effect, tag.0 + 1);
-        let World { driver, effects, disk, .. } = &mut *world;
-        // A machine whose power `bstd::test` cut takes nothing: its ledger is told nothing.
-        if let (Some(disk), Some(sim)) = (disk.as_deref_mut(), driver.sim().filter(|sim| !sim.is_off())) {
-            disk.submitted(sim, &effect);
-        }
-        effects.push(effect);
-        driver.submit(effects);
-        // Under `bstd::test` the armed simulation cuts the power at an effect of its seed's: the
-        // world crashes and the program's start ends here, unwound, with the lock let go first.
-        let cut = driver.sim().is_some_and(Sim::cut_due);
-        drop(world);
-        if cut {
-            crate::simtest::power_lost(self);
-        }
+        let mut world = self.world().lock();
+        let effect = fast::stamp(&mut world, effect);
+        let tag = effect.tag();
+        self.hand_over(world, effect);
         tag
     }
 
@@ -1063,13 +1754,13 @@ impl Io {
     /// removed). Changes by another process are not seen: blaze-core's `Meta` carries no
     /// inode or change time to compare (std.md, "still implicit").
     pub(crate) fn generation(&self, name: &FileName) -> u64 {
-        self.world.lock().changed.get(name).copied().unwrap_or(0)
+        self.world().lock().changed.get(name).copied().unwrap_or(0)
     }
 
     /// A number no other call of this world was given: a tag's, taken for a name made beside
     /// another (a publish's temporary file).
     pub(crate) fn fresh(&self) -> u64 {
-        let mut world = self.world.lock();
+        let mut world = self.world().lock();
         let fresh = world.next;
         world.next += 1;
         fresh
@@ -1079,43 +1770,37 @@ impl Io {
     /// read, flushes, waits for the device, clones and the bytes they forced out. `None` on a
     /// real driver, which keeps no ledger.
     pub fn disk(&self) -> Option<DiskCounts> {
-        self.world.lock().disk.as_deref().map(Disk::counts)
+        self.world().lock().disk.as_deref().map(Disk::counts)
     }
 
     /// A caller waited for the device (a flush it did not return before): counted.
     pub(crate) fn waited_for_device(&self) {
-        if let Some(disk) = self.world.lock().disk.as_deref_mut() {
+        if !self.has_disk() {
+            return;
+        }
+        if let Some(disk) = self.world().lock().disk.as_deref_mut() {
             disk.waited();
         }
     }
 
     /// A sync of the directory `dir`'s names completed and was waited for
-    /// ([`Effect::SyncDir`]): the simulated disk's ledger makes them durable and counts the
-    /// wait. `true` in a simulated world, which has a ledger; `false` in a real one, where
-    /// the disk itself did it.
-    pub(crate) fn names_synced(&self, dir: &str) -> bool {
-        match self.world.lock().disk.as_deref_mut() {
-            Some(disk) => {
-                disk.sync_names(dir);
-                disk.waited();
-                true
-            }
-            None => false,
+    /// ([`Effect::SyncDir`]): the simulated disk's ledger counts the sync and the wait; a
+    /// real world has no ledger.
+    pub(crate) fn names_synced(&self) {
+        if !self.has_disk() {
+            return;
         }
-    }
-
-    /// Whether this world's rename has synced its directories by the time it completes: a
-    /// real driver's does (blaze-core's `Effect::Rename`); the simulation's ledger is told by
-    /// a directory sync.
-    pub(crate) fn rename_syncs_names(&self) -> bool {
-        self.world.lock().disk.is_none()
+        if let Some(disk) = self.world().lock().disk.as_deref_mut() {
+            disk.names_synced();
+            disk.waited();
+        }
     }
 
     /// How many effects the driver holds that have not completed: a test's view of whether
     /// anything a wait gave back is still in flight.
     #[cfg(test)]
     pub(crate) fn in_flight(&self) -> usize {
-        self.world.lock().driver.in_flight()
+        self.world().lock().driver.in_flight()
     }
 
     /// The next completion of the one-shot `tag`, waited for until `until` heeding no
@@ -1147,16 +1832,51 @@ impl Io {
         }
     }
 
+    /// Every effect handed to the driver ended, waited for until `until`: what a command does
+    /// before it exits without a teardown, so a write-back or a name sync begun and not waited
+    /// for (`Unsynced::Started`) has reached the kernel, not died with a thread. Past `until`,
+    /// or after [`Limits::poll_fuel`] polls in a row that bring nothing, the stop says how
+    /// many were left.
+    pub(crate) fn drain(&self, until: Deadline) -> Result<(), Stopped> {
+        let span = "bstd::rt: the effects in flight at the end of main";
+        let mut idle = 0;
+        while self.world().lock().driver.in_flight() > 0 {
+            if until.passed(self.now()) {
+                return Err(Stopped::Deadline { span, at: until.get() });
+            }
+            if idle == self.limits.poll_fuel {
+                return Err(Stopped::Stalled { span, polls: idle });
+            }
+            match self.poll(until) {
+                0 => idle += 1,
+                _ => idle = 0,
+            }
+        }
+        Ok(())
+    }
+
     /// The tag's waiter is gone: its completions are dropped as they arrive.
     pub(crate) fn forget(&self, tag: Tag, ends: Ends) {
-        self.world.lock().abandoned.push((tag, ends));
+        self.world().lock().abandoned.push((tag, ends));
     }
 
     /// The next completion of `tag`, if one was polled: taken for its waiter.
     pub(crate) fn take(&self, tag: Tag) -> Option<Done> {
-        let mut world = self.world.lock();
+        let mut world = self.world().lock();
         let at = world.got.iter().position(|it| it.tag == tag)?;
         Some(world.got.remove(at).done)
+    }
+
+    /// The first already-polled completion matching any tag in `tags`, returning `(index, done)`.
+    pub(crate) fn take_any(&self, tags: &[Tag]) -> Option<(usize, Done)> {
+        let mut world = self.world().lock();
+        for (pos, item) in world.got.iter().enumerate() {
+            if let Some(idx) = tags.iter().position(|&t| t == item.tag) {
+                let done = world.got.remove(pos).done;
+                return Some((idx, done));
+            }
+        }
+        None
     }
 
     /// One poll of the driver, waiting at most until `until`: what it brought kept for each
@@ -1164,7 +1884,7 @@ impl Io {
     /// moved nothing moves the simulation's clock to `until`, as a real wait sleeps to it. The
     /// step of [`Cx::wait`], the one wait.
     pub(crate) fn poll(&self, until: Deadline) -> usize {
-        let mut world = self.world.lock();
+        let mut world = self.world().lock();
         let World { driver, polled, got, abandoned, disk, .. } = &mut *world;
         let moved = driver.poll(polled, until);
         for completion in polled.drain(..) {
@@ -1189,6 +1909,7 @@ fn keep(got: &mut Vec<Completion>, abandoned: &mut Vec<(Tag, Ends)>, completion:
     let last = match abandoned[at].1 {
         Ends::Once => true,
         Ends::Stream => matches!(completion.done, Done::Unlistened | Done::Failed(_)),
+        Ends::Watch => matches!(completion.done, Done::Unwatched | Done::Failed(_)),
     };
     if last {
         abandoned.swap_remove(at);
@@ -1212,6 +1933,7 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
         | Effect::Barrier { file, .. }
         | Effect::WriteBack { file, .. }
         | Effect::Truncate { file, .. }
+        | Effect::MapWrite { file, .. }
         | Effect::Write { file, .. }
         | Effect::WriteUnsynced { file, .. }
         | Effect::WriteAt { file, .. }
@@ -1239,12 +1961,19 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
             named(like, false);
             named(file, false);
         }
-        Effect::List { dir, .. } | Effect::Entries { dir, .. } | Effect::Watch { dir, .. } => named(dir, false),
-        Effect::Private { dir, .. }
-        | Effect::MakeDir { dir, .. }
-        | Effect::RemoveDir { dir, .. }
-        | Effect::SyncDir { dir, .. } => named(dir, true),
-        Effect::Journal { dir, .. } => named(dir, false),
+        Effect::Watch { dir, .. } => named(dir, false),
+        Effect::Private { dir, .. } | Effect::MakeDir { dir, .. } | Effect::RemoveDir { dir, .. } => named(dir, true),
+        // The root has no name to record.
+        Effect::List { dir, .. } | Effect::Entries { dir, .. } | Effect::Journal { dir, .. } => {
+            if let Some(dir) = dir.name() {
+                named(dir, false);
+            }
+        }
+        Effect::SyncDir { dir, .. } => {
+            if let Some(dir) = dir.name() {
+                named(dir, true);
+            }
+        }
         // A batch of reads names each part's file, and changes none.
         Effect::ReadMany { parts, .. } => {
             for part in parts {
@@ -1275,7 +2004,11 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
         | Effect::ReadStdin { .. }
         | Effect::WriteOut { .. }
         | Effect::Now { .. }
-        | Effect::Random { .. } => {}
+        | Effect::Random { .. }
+        | Effect::Roots { .. }
+        // The folders above the root are not under it: they have no name of the root's.
+        | Effect::Ancestors { .. }
+        | Effect::Above { .. } => {}
     }
 }
 
@@ -1286,7 +2019,9 @@ fn change(changed: &mut BTreeMap<FileName, u64>, effect: &Effect, stamp: u64) {
     match effect {
         Effect::Append { file, .. }
         | Effect::Truncate { file, .. }
+        | Effect::MapWrite { file, .. }
         | Effect::Write { file, .. }
+        | Effect::WriteUnsynced { file, .. }
         | Effect::WriteAt { file, .. }
         | Effect::WriteFrom { file, .. } => {
             // clone: the table's key, a refcount.
@@ -1295,7 +2030,8 @@ fn change(changed: &mut BTreeMap<FileName, u64>, effect: &Effect, stamp: u64) {
         Effect::Remove { file, .. } => {
             changed.remove(file);
         }
-        Effect::Rename { from, to, .. } => {
+        // A rename changes the names whether or not it syncs them.
+        Effect::Rename { from, to, .. } | Effect::RenameUnsynced { from, to, .. } => {
             changed.remove(from);
             // clone: the table's key, a refcount.
             changed.insert(to.clone(), stamp);
@@ -1307,13 +2043,13 @@ fn change(changed: &mut BTreeMap<FileName, u64>, effect: &Effect, stamp: u64) {
         // Everything else leaves every file's bytes and names as they were: a barrier orders
         // what was written and a prewarm asks the page cache to read ahead, as a sync and a
         // write-back change no byte.
-        Effect::ReadAll { .. } | Effect::Read { .. } | Effect::ReadInto { .. } | Effect::ReadMany { .. } | Effect::ReadLink { .. } | Effect::Sync { .. } | Effect::Barrier { .. } | Effect::Prewarm { .. } | Effect::WriteBack { .. } | Effect::SyncDir { .. } | Effect::WriteUnsynced { .. } | Effect::List { .. } | Effect::RenameUnsynced { .. } | Effect::Mode { .. } | Effect::Seal { .. } | Effect::Private { .. } | Effect::Times { .. } | Effect::Stat { .. } | Effect::Lstat { .. } | Effect::Lock { .. } | Effect::Unlock { .. } | Effect::Watch { .. } | Effect::Journal { .. } | Effect::Unwatch { .. } | Effect::Stamp { .. } | Effect::Entries { .. } | Effect::Flush { .. } | Effect::Timer { .. } | Effect::Map { .. } | Effect::Spawn { .. } | Effect::Kill { .. } | Effect::Listen { .. } | Effect::Unlisten { .. } | Effect::Connect { .. } | Effect::Recv { .. } | Effect::Send { .. } | Effect::Hangup { .. } | Effect::Pressure { .. } | Effect::Bind { .. } | Effect::SendTo { .. } | Effect::RecvFrom { .. } | Effect::Unbind { .. } | Effect::Resolve { .. } | Effect::ReadStdin { .. } | Effect::WriteOut { .. } | Effect::Now { .. } | Effect::Random { .. } | Effect::MakeDir { .. } | Effect::RemoveDir { .. } => {}
+        Effect::ReadAll { .. } | Effect::Read { .. } | Effect::ReadInto { .. } | Effect::ReadMany { .. } | Effect::ReadLink { .. } | Effect::Sync { .. } | Effect::Barrier { .. } | Effect::Prewarm { .. } | Effect::WriteBack { .. } | Effect::SyncDir { .. } | Effect::List { .. } | Effect::Mode { .. } | Effect::Seal { .. } | Effect::Private { .. } | Effect::Times { .. } | Effect::Stat { .. } | Effect::Lstat { .. } | Effect::Lock { .. } | Effect::Unlock { .. } | Effect::Watch { .. } | Effect::Journal { .. } | Effect::Unwatch { .. } | Effect::Stamp { .. } | Effect::Entries { .. } | Effect::Flush { .. } | Effect::Timer { .. } | Effect::Map { .. } | Effect::Spawn { .. } | Effect::Kill { .. } | Effect::Listen { .. } | Effect::Unlisten { .. } | Effect::Connect { .. } | Effect::Recv { .. } | Effect::Send { .. } | Effect::Hangup { .. } | Effect::Pressure { .. } | Effect::Bind { .. } | Effect::SendTo { .. } | Effect::RecvFrom { .. } | Effect::Unbind { .. } | Effect::Resolve { .. } | Effect::ReadStdin { .. } | Effect::WriteOut { .. } | Effect::Now { .. } | Effect::Random { .. } | Effect::Roots { .. } | Effect::MakeDir { .. } | Effect::RemoveDir { .. } | Effect::Ancestors { .. } | Effect::Above { .. } => {}
     }
 }
 
 impl fmt::Debug for Io {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut world = self.world.lock();
+        let mut world = self.world().lock();
         let kind = match world.driver.sim() {
             Some(_) => "simulated",
             None => "native",

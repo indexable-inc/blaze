@@ -1,0 +1,15 @@
+{
+ "id": "scope-frame-unnamed-and-peak-unattributed",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane MEM",
+ "where": "crates/blaze-cli/src/names/metered.rs (new), names/scope.rs prepare, blaze-scope resolve.rs expand_decls (Render), crate_scope.rs unmet_reaches",
+ "what": "tempo's cold check held a 2.32 GB crate scope frame (core) and the profile could only say 'a crate scope'. A metered Par now prints `scope frame by stretch`: Render took 1.07 GB grown + 242 MB abandoned over 13,600 expansions, from a transient 64-byte row per token grown from empty and a clone of every expansion's token stream. Both are gone (core's frame 2.32 GB -> 1.88 GB). Separately 1,118 pooled resolutions decoded every dependency only to answer Need; prepare now reads the reach lists from the records' heads in place and asks first.",
+ "cost": "most of a session, half of it waiting on tempo runs (each 8-10 min) to get one profile",
+ "cause": "the Par hooks marked the solve's stretches but the CLI passed Serial, which recorded nothing; and the peak footprint (29 GB) has no row saying which frames or allocations held it at its peak",
+ "whys": "rows sum bytes per kind or name the largest frame, but footprint is a time maximum over concurrent workers and committed pages, which no row samples",
+ "class": "a peak measure with no attribution: a fix to the largest frame can leave the peak unmoved and nothing says why",
+ "prevention": "wanted: a footprint row sampled at the command's peak naming each worker's committed frame bytes and the kind it ran, plus non-frame allocations (Global, wasm memories)",
+ "annoyance": "the shared repl main lane interleaves other lanes' cell output into mine; use a lane name",
+ "workaround": "the stretch row for the largest crate scope",
+ "state": "open"
+}

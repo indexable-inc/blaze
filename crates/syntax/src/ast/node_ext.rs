@@ -5,9 +5,7 @@
 
 use std::{fmt, iter::successors};
 
-use itertools::Itertools;
 use parser::SyntaxKind;
-use smallvec::{SmallVec, smallvec};
 use syntax_tree::TextSize;
 
 use crate::{
@@ -224,12 +222,12 @@ impl ast::Meta {
     }
 
     /// Includes `cfg_attr()` inner metas (without considering the predicate).
-    pub fn skip_cfg_attrs(self) -> SmallVec<[ast::Meta; 1]> {
+    pub fn skip_cfg_attrs(self) -> Vec<ast::Meta> {
         match self {
             ast::Meta::CfgAttrMeta(meta) => {
                 meta.metas().flat_map(|meta| meta.skip_cfg_attrs()).collect()
             }
-            _ => smallvec![self],
+            _ => vec![self],
         }
     }
 
@@ -268,10 +266,10 @@ impl ast::Attr {
     }
 
     /// Includes `cfg_attr()` inner metas (without considering the predicate).
-    pub fn skip_cfg_attrs(&self) -> SmallVec<[ast::Meta; 1]> {
+    pub fn skip_cfg_attrs(&self) -> Vec<ast::Meta> {
         match self.meta() {
             Some(meta) => meta.skip_cfg_attrs(),
-            None => SmallVec::new(),
+            None => Vec::new(),
         }
     }
 }
@@ -304,6 +302,8 @@ impl ast::DocComment {
     }
 
     /// Returns the textual content of a doc comment node as a single string with prefix and suffix removed.
+    /// Raw: a block's CR LFs keep their CRs; its value, each break one LF, is
+    /// `parser::line_break::doc_comment_value`'s.
     pub fn text(&self) -> &str {
         let shape = self.shape();
         let text = &self.text_with_markers()[Self::PREFIX_LEN.into()..];
@@ -311,7 +311,14 @@ impl ast::DocComment {
             // The `*/` may not exist because of recovery.
             text.strip_suffix("*/").unwrap_or(text)
         } else {
-            text
+            // The token ends before its LF, so a CR LF break leaves its CR in it
+            // (parser::line_break).
+            let followed_by_lf = self
+                .syntax
+                .first_token()
+                .and_then(|it| it.next_token())
+                .is_some_and(|it| it.text().starts_with('\n'));
+            parser::line_break::line_comment_text(text, followed_by_lf)
         }
     }
 }
@@ -489,8 +496,9 @@ impl ast::UseTreeList {
         // Returns true iff there is a single subtree and it is not the self keyword. The braces in
         // `use x::{self};` are necessary and so we should not remove them.
         let has_single_subtree_that_is_not_self = |u: &ast::UseTreeList| {
-            let use_trees = u.use_trees().filter(|use_tree| !editor.deleted(use_tree.syntax()));
-            if let Some((single_subtree,)) = use_trees.collect_tuple() {
+            let mut use_trees =
+                u.use_trees().filter(|use_tree| !editor.deleted(use_tree.syntax()));
+            if let (Some(single_subtree), None) = (use_trees.next(), use_trees.next()) {
                 // We have a single subtree, check whether it is self.
 
                 let is_self = single_subtree.path().as_ref().is_some_and(|path| {
@@ -848,8 +856,8 @@ pub struct SlicePatComponents {
 impl ast::SlicePat {
     pub fn components(&self) -> SlicePatComponents {
         let mut args = self.pats().peekable();
-        let prefix = args
-            .peeking_take_while(|p| match p {
+        let prefix = std::iter::from_fn(|| {
+            args.next_if(|p| match p {
                 ast::Pat::RestPat(_) => false,
                 ast::Pat::IdentPat(bp) => !matches!(bp.pat(), Some(ast::Pat::RestPat(_))),
                 ast::Pat::RefPat(rp) => match rp.pat() {
@@ -859,7 +867,8 @@ impl ast::SlicePat {
                 },
                 _ => true,
             })
-            .collect();
+        })
+        .collect();
         let slice = args.next();
         let suffix = args.collect();
 
@@ -1075,12 +1084,6 @@ impl RangeItem for ast::RangePat {
             }
         })
     }
-}
-
-/// Whether a token is written between the ends of a range pattern: `..`, `..=`, or the `...`
-/// that editions before 2021 take for `..=`.
-fn is_range_pat_op(kind: SyntaxKind) -> bool {
-    matches!(kind, T![..] | T![..=] | T![...])
 }
 
 impl ast::TokenTree {

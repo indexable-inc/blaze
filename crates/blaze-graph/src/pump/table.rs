@@ -22,7 +22,7 @@
 
 use std::{cell::UnsafeCell, iter, marker::PhantomData, mem, ptr};
 
-use crossbeam_queue::SegQueue;
+use blaze_queue::SegQueue;
 
 use super::Lock;
 use crate::{
@@ -295,7 +295,7 @@ pub(super) struct Runs<V> {
     table: AtomicPtr<Table<V>>,
     /// The tables grows replaced, freed with the runs: an operation that read one before its
     /// grow, or a claim of a run in it, may be using it still.
-    retired: SegQueue<Box<Table<V>>>,
+    retired: SegQueue<Box<Table<V>>, std::alloc::Global>,
     /// Held by a grow, and by a count of the runs, which sees each run once.
     grow: Lock<()>,
     _owns: PhantomData<Box<Table<V>>>,

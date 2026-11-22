@@ -1,0 +1,36 @@
+[package]
+name = "blaze-facts"
+description = "The one interface the constant evaluator and the code builder ask the front end through (backend-next.md, D119 rule 9): one `Fact` question enum, one `Answer` enum, one `Facts::ask`, and `Reads`, which records each question and the digest of its answer, so an evaluated constant's or a built function's key gets its read list from the asks it made"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# Only the crates that define what the questions name. blaze-build, blaze-consteval and
+# blaze-ladder depend on this crate, never the other way: their own answer types enter through
+# `Vocab`.
+[dependencies]
+# `ItemKey`, `Name`, `PTy`, `PTys`, `PNode`, `List`, `ExprId`, `PatId`, `Adt`, `FnSig`,
+# `StableHasher`: the checker's portable names and its hasher.
+blaze-typeck.workspace = true
+# `ContentId`: a code identity, an instance key.
+blaze-ids.workspace = true
+# `Vec` for the read list and the term walk, in the allocator the caller gives.
+blaze-own.workspace = true
+# The term digests' memo. By path, as blaze-typeck takes it: the workspace entry turns on
+# adapters to crates from outside the workspace.
+blaze-hash.workspace = true
+
+[dev-dependencies]
+# `testing::heap()`: the tests' root allocator capability (D102).
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

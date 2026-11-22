@@ -17,17 +17,14 @@ blaze-ids.workspace = true
 blaze-mem.workspace = true
 blaze-phf.workspace = true
 rustc_lexer.workspace = true
-rustc-literal-escaper.workspace = true
-smallvec.workspace = true
 stdx.workspace = true
-tracing.workspace = true
+blaze-trace.workspace = true
 
 edition.workspace = true
-winnow.workspace = true
 
 [dev-dependencies]
-crossbeam-channel.workspace = true
-expect-test.workspace = true
+blaze-core.workspace = true
+test-utils.workspace = true
 
 blaze-alloc-count.workspace = true
 blaze-sim.workspace = true

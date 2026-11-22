@@ -326,11 +326,11 @@ mod tests {
     /// one after, around to itself, until the test lets them go.
     fn job(k: usize, ready: &Barrier, gate: &(Lock<bool>, Signal)) {
         let _span = match k {
-            0 => tracing::info_span!(target: "blaze", "job a").entered(),
-            1 => tracing::info_span!(target: "blaze", "job b").entered(),
-            _ => tracing::info_span!(target: "blaze", "job c").entered(),
+            0 => blaze_trace::info_span!(target: "blaze", "job a").entered(),
+            1 => blaze_trace::info_span!(target: "blaze", "job b").entered(),
+            _ => blaze_trace::info_span!(target: "blaze", "job c").entered(),
         };
-        let _wait = tracing::info_span!(target: "blaze", "waits on the next job").entered();
+        let _wait = blaze_trace::info_span!(target: "blaze", "waits on the next job").entered();
         ready.wait();
         let (released, cv) = gate;
         let mut released = released.lock();
@@ -436,7 +436,7 @@ mod tests {
             }
         }
         let mut done = Done(Some(lost));
-        let (tx, rx) = crossbeam_channel::unbounded::<()>();
+        let (tx, rx) = blaze_core::chan::unbounded::<()>();
         pool.submit(None, move || _ = sched::wait(Wait::Key(lost)), move |_| _ = tx.send(()));
         blaze_graph::spin::SpinWait::within("the job to park", Duration::from_secs(60), || {
             pool.parked() == 1
@@ -447,7 +447,7 @@ mod tests {
         // The loop's turns on a virtual clock, a turn each 100 ms of it and 25 ms of the
         // host's, past the pool's two-second stall check: 15 s of the clock.
         for _ in 0..150 {
-            drop(tracing::info_span!("loop turn").entered());
+            drop(blaze_trace::info_span!("loop turn").entered());
             let jobs = Progress { jobs: pool.ended(), queries: 7, steps: 3, working: 0 };
             let spans = Progress { jobs: flight::progress(), queries: 7, steps: 3, working: 0 };
             said = said.or(by_jobs.tick(now, jobs, true));
@@ -620,9 +620,9 @@ mod tests {
                 .name("worker running".to_owned())
                 .spawn_scoped(scope, || {
                     let _unit =
-                        tracing::info_span!(target: "blaze", "unit bodies", krate = "sonic-rs")
+                        blaze_trace::info_span!(target: "blaze", "unit bodies", krate = "sonic-rs")
                             .entered();
-                    let _query = tracing::info_span!(
+                    let _query = blaze_trace::info_span!(
                         target: "blaze",
                         "infer_query",
                         function = "sonic_rs::serde::de::Deserializer::parse",

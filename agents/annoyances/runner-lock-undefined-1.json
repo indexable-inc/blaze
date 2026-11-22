@@ -1,0 +1,14 @@
+{
+ "id": "runner-lock-undefined-1",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), write-only lane I, piece 'bodies written by expansions are checked and covered' on rebuild-1115",
+ "where": "/Volumes/Projects/blaze-int-1112-notes/runner.py line 29",
+ "what": "Every `runner.py ask` stops at start-up with `NameError: name 'LOCK' is not defined`: `ME = {..., \"lock\": LOCK, ...}` (line 29) reads LOCK before line 32 defines it (the two-worker edit, WORKERS on line 28). The lane's only allowed command cannot run, so the piece is written but neither trialled nor admitted.",
+ "cost": "two asks refused with no build; the piece waits for the runner",
+ "cause": "a module-level name used before its assignment in the runner's own edit",
+ "whys": "the runner is edited in place while lanes ask, with no check that it still imports",
+ "class": "the one build door edited live with no smoke run of its own",
+ "prevention": "edit runner.py as a copy and swap it in after `python3 -I runner.py --help` (or an ask of a no-op lane) runs; or move ME below LOCK",
+ "workaround": "none for a lane that may run only the runner: report and wait",
+ "state": "open"
+}

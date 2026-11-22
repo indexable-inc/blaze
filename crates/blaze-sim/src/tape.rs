@@ -209,6 +209,10 @@ struct State {
     discarded: bool,
     overran: bool,
     clamped: u32,
+    /// What `vec` keeps to replay an earlier element's choices (src/shape.rs, S2): the choices
+    /// drawn while a list is open, and the values a replayed element draws past the prefix.
+    #[cfg(feature = "edge-first")]
+    shaping: crate::shape::Shaping,
 }
 
 impl State {
@@ -230,6 +234,9 @@ impl State {
         self.discarded = false;
         self.overran = false;
         self.clamped = 0;
+        // A list a panic left open, or a replay it left installed, ends with its case.
+        #[cfg(feature = "edge-first")]
+        self.shaping.clear();
     }
 
     /// The next prefix value lowered to `most` (a lowered one counted in `clamped`), or `None`
@@ -256,6 +263,19 @@ impl State {
 )]
 fn count(len: usize) -> u32 {
     u32::try_from(len).unwrap_or(u32::MAX)
+}
+
+/// The stop rule of a list of `min..=max` elements: past `min` it ends once in this many turns,
+/// half its free room plus one, at most [`MOST_STOP_ONE_IN`]. `min <= max`.
+#[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
+#[expect(
+    blaze::as_cast,
+    reason = "a count of elements, `usize` to `u64`, widens on every target blaze builds"
+)]
+pub(crate) fn list_stop_one_in(min: usize, max: usize) -> u64 {
+    (((max - min) / 2 + 1) as u64).min(MOST_STOP_ONE_IN)
 }
 
 /// The lock a tape's handles share. It is only ever tried: a second draw while one is under way
@@ -317,6 +337,8 @@ impl Tape {
             discarded: false,
             overran: false,
             clamped: 0,
+            #[cfg(feature = "edge-first")]
+            shaping: crate::shape::Shaping::new(),
         };
         state.start(prefix, tail);
         Tape {
@@ -388,6 +410,28 @@ impl Tape {
         body(&mut *guard)
     }
 
+    /// `body` on what `vec` keeps for replay (src/shape.rs), under the lock as `with`.
+    #[cfg(feature = "edge-first")]
+    pub(crate) fn with_shaping<R>(
+        &self,
+        label: &'static str,
+        body: impl FnOnce(&mut crate::shape::Shaping) -> R,
+    ) -> R {
+        self.with(label, |state| body(&mut state.shaping))
+    }
+
+    /// `draw` for src/shape.rs: one choice in `0..=most` (calm 0), `canonical` of a raw draw on
+    /// a seeded tail; recorded, bounded and replayed as every draw is.
+    #[cfg(feature = "edge-first")]
+    pub(crate) fn draw_shaped(
+        &self,
+        label: &'static str,
+        most: u64,
+        canonical: impl FnOnce(u64) -> u64,
+    ) -> u64 {
+        self.draw(label, most, canonical)
+    }
+
     /// The one draw every method makes: one choice in `0..=most`. From the prefix, the next
     /// value lowered to `most` (counted in `clamped`); past it, 0 on a calm tail, or `canonical`
     /// of one raw `SplitMix64` draw on a seeded one. A recorded tape holds its bound first and
@@ -401,6 +445,12 @@ impl Tape {
                 state.overran = true;
                 return Err(state.most_choices);
             }
+            // While `vec` replays an earlier element, every draw takes the next of its copied
+            // values, so the copy stays in step whichever source gives this draw (S2,
+            // src/shape.rs): the prefix still wins, and a calm tail stays calm, so a recorded
+            // tape replays to itself and a shrunk one is what its values say.
+            #[cfg(feature = "edge-first")]
+            let replayed = state.shaping.next_replayed();
             let value = match state.next_given(most) {
                 Some(value) => {
                     #[cfg(test)]
@@ -409,12 +459,24 @@ impl Tape {
                 }
                 None => match &mut state.tail {
                     Tail::Calm => 0,
-                    Tail::Seeded(rng) => canonical(rng.next_u64()),
+                    Tail::Seeded(rng) => {
+                        #[cfg(feature = "edge-first")]
+                        let value = match replayed {
+                            // Already canonical; lowered to fit a draw that changed its bound.
+                            Some(copied) => copied.min(most),
+                            None => canonical(rng.next_u64()),
+                        };
+                        #[cfg(not(feature = "edge-first"))]
+                        let value = canonical(rng.next_u64());
+                        value
+                    }
                 },
             };
             if recording == Recording::Kept {
                 state.choices.push(Choice { value, most, label });
             }
+            #[cfg(feature = "edge-first")]
+            state.shaping.drew(Choice { value, most, label });
             Ok(value)
         });
         match drawn {
@@ -618,7 +680,41 @@ impl Tape {
 
     /// A list of `sizes` elements, each `element`'s draws in a span, so deleting a span deletes
     /// an element. Calm is the least size.
+    ///
+    /// With blaze-sim's feature `edge-first` (S2, src/shape.rs): the length may be an edge size
+    /// (`edge_ints::size`), and an element may replay an earlier element's choices (an equal
+    /// element, no `Clone` needed) or them with the last one moved by one (a neighbour). Without
+    /// it, exactly the choices of the stop rule alone, in the same order.
     pub fn vec<T>(
+        &self,
+        sizes: core::ops::RangeInclusive<usize>,
+        label: &'static str,
+        element: impl FnMut(&Tape) -> T,
+    ) -> Vec<T> {
+        self.vec_now(sizes, label, element)
+    }
+
+    /// `vec` with `edge-first` on: the shaped list of src/shape.rs, replay on.
+    #[cfg(feature = "edge-first")]
+    fn vec_now<T>(
+        &self,
+        sizes: core::ops::RangeInclusive<usize>,
+        label: &'static str,
+        element: impl FnMut(&Tape) -> T,
+    ) -> Vec<T> {
+        crate::shape::vec_shaped(
+            self,
+            sizes,
+            label,
+            element,
+            crate::shape::Elements::Free,
+            crate::shape::Repetition::On,
+        )
+    }
+
+    /// `vec` with `edge-first` off: the list as it has always been drawn.
+    #[cfg(not(feature = "edge-first"))]
+    fn vec_now<T>(
         &self,
         sizes: core::ops::RangeInclusive<usize>,
         label: &'static str,
@@ -626,11 +722,7 @@ impl Tape {
     ) -> Vec<T> {
         let (min, max) = (*sizes.start(), *sizes.end());
         assert!(min <= max, "the list `{label}` has no size: {min}..={max} is empty");
-        #[expect(
-            blaze::as_cast,
-            reason = "a count of elements, `usize` to `u64`, widens on every target blaze builds"
-        )]
-        let stop = (((max - min) / 2 + 1) as u64).min(MOST_STOP_ONE_IN);
+        let stop = list_stop_one_in(min, max);
         let mut out = Vec::with_capacity_in(min, Global);
         // Bounded by `max`, and past `min` each turn draws, so a recorded tape's bound holds it.
         while out.len() < max {
@@ -652,33 +744,70 @@ impl Tape {
 
     /// In `range`; uniform when it has at most 256 values, else small offsets from its start and
     /// its ends more often; calm is its start. An empty range panics, naming the label.
+    ///
+    /// With the feature `edge-first`, an edge value of the range first, about one draw in four
+    /// (`edge_ints::in_range`: the range's ends, their neighbours, its middle, and every value of
+    /// the one table that lies inside it); the calm kind leaves the draw above unchanged.
     pub fn int_in<T: Int>(&self, range: core::ops::RangeInclusive<T>, label: &'static str) -> T {
         let (lo, hi) = (range.start().to_ordered(), range.end().to_ordered());
         assert!(lo <= hi, "the range of `{label}` is empty");
+        #[cfg(feature = "edge-first")]
+        if let Some(edge) =
+            crate::edge_ints::in_range(self, lo, hi, crate::edge_ints::Width::of::<T>(), label)
+        {
+            return T::from_ordered(edge);
+        }
+        T::from_ordered(self.ordered_in(lo, hi, label))
+    }
+
+    /// `int_in`'s draw without its edge values, on the ordered line (`lo <= hi`): uniform when
+    /// the range has at most 256 values; else one in eight a small offset back from the end, two
+    /// in eight uniform, the rest a small offset from the start. For a range of at most 2^64
+    /// values it draws what `int_in` drew before 128-bit integers and the edge values, choice for
+    /// choice, so every recorded tape replays to the same values.
+    pub(crate) fn ordered_in(&self, lo: u128, hi: u128, label: &'static str) -> u128 {
         let width = hi - lo;
-        if width < UNIFORM_VALUES {
-            return T::from_ordered(lo + self.below(width + 1, label));
+        if width < u128::from(UNIFORM_VALUES) {
+            // `width + 1` is at most 256, one `below`.
+            return lo + self.below_wide(Some(width + 1), label);
         }
         let kind = self.below(INT_KINDS, label);
         if kind >= UNIFORM_FROM {
-            // A width of `u64::MAX` is the whole `u64` range, one raw draw.
-            let offset = match width.checked_add(1) {
-                Some(values) => self.below(values, label),
-                None => self.next_u64(label),
-            };
-            return T::from_ordered(lo + offset);
+            // A width of `u128::MAX` is the whole `u128` range: `None` values past it.
+            return lo + self.below_wide(width.checked_add(1), label);
         }
-        // The bit length of `width`, at least 9 here.
-        let length = u64::from(u64::BITS - width.leading_zeros());
-        let bits = self.below(length + 1, label);
-        // An offset of `u64::BITS` bits is any `u64`, one raw draw.
-        let offset = if bits == u64::from(u64::BITS) {
-            self.next_u64(label)
-        } else {
-            self.below(1 << bits, label)
-        };
-        let offset = offset.min(width);
-        T::from_ordered(if kind == SMALL_FROM_END { hi - offset } else { lo + offset })
+        // The bit length of `width`, 9 to 128 here.
+        let length = u128::BITS - width.leading_zeros();
+        let bits = self.below(u64::from(length) + 1, label);
+        // 2^bits offsets; `bits` is at most 128, and 2^128 is `None` (any `u128`). A `bits` past
+        // a `u32` cannot be drawn: it too is "past the line", `None`.
+        let offsets = u32::try_from(bits).ok().and_then(|bits| 1u128.checked_shl(bits));
+        let offset = self.below_wide(offsets, label).min(width);
+        if kind == SMALL_FROM_END { hi - offset } else { lo + offset }
+    }
+
+    /// Below `values` (`None` is 2^128, every `u128`; `Some(0)` is 0, drawing as `below(0)`
+    /// does); calm is 0. Up to 2^64 values it is one `below`, or at exactly 2^64 one raw draw,
+    /// as `int_in` always drew; past it, two raw draws, the high one first, taken modulo `values`
+    /// (uneven by at most `values / 2^128`).
+    fn below_wide(&self, values: Option<u128>, label: &'static str) -> u128 {
+        const RAW: u128 = 1 << u64::BITS;
+        match values {
+            Some(values) if values < RAW => {
+                // Below 2^64, so it fits a `u64`.
+                u128::from(self.below(u64::try_from(values).unwrap_or(u64::MAX), label))
+            }
+            Some(RAW) => u128::from(self.next_u64(label)),
+            values => {
+                let high = u128::from(self.next_u64(label));
+                let low = u128::from(self.next_u64(label));
+                let raw = (high << u64::BITS) | low;
+                match values {
+                    Some(values) => raw % values,
+                    None => raw,
+                }
+            }
+        }
     }
 
     /// Notes a line for the report, at the number of choices drawn so far.
@@ -706,6 +835,42 @@ impl Tape {
         });
     }
 
+    /// Notes that the case got to the typed reach point `point` (limits.rs): `reached` of its
+    /// id's path, so [`Config::must_reach_points`] can require it by type.
+    ///
+    /// [`Config::must_reach_points`]: crate::search::Config::must_reach_points
+    pub fn reach(&self, point: impl crate::limits::Point) {
+        self.reached(point.id().path());
+    }
+
+    /// A limit between `smallest` (the least legal value) and `shipped`, drawn for a simulation
+    /// (D165; limits.rs): seven draws in sixteen give `smallest` (calm is `smallest`, so a
+    /// shrunk failure is at the tightest cap), four `smallest + 1`, two `smallest + 2`, one a
+    /// uniform value of the whole range and two `shipped`; never past `shipped`. When `smallest`
+    /// equals `shipped` the limit is fixed and nothing is drawn. A `smallest` above `shipped`
+    /// panics naming `label`.
+    pub fn limit<T: Int>(&self, shipped: T, smallest: T, label: &'static str) -> T {
+        let (low, high) = (smallest.to_ordered(), shipped.to_ordered());
+        assert!(
+            low <= high,
+            "the limit `{label}`: its smallest legal value is above the value it ships with"
+        );
+        if low == high {
+            return shipped;
+        }
+        let kind = self.below(crate::limits::LIMIT_KINDS, label);
+        let value = match crate::limits::limit_of_kind(kind, low, high) {
+            Some(value) => value,
+            None => self.ordered_in(low, high, label),
+        };
+        T::from_ordered(value)
+    }
+
+    /// A component's limits drawn as one span (`Limits::draw`, limits.rs).
+    pub fn limits<L: crate::limits::Limits>(&self) -> L {
+        self.span("limits", L::draw)
+    }
+
     /// Ends the case as not counted: sets `discarded` and panics.
     #[blaze::noalloc]
     pub fn discard(&self) -> ! {
@@ -730,34 +895,44 @@ mod sealed {
     pub trait Sealed {}
 }
 
-/// The integers `Tape::int` draws: u8, u16, u32, u64, usize, i8, i16, i32, i64, isize. Sealed.
+/// The integers `Tape::int` draws: u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128,
+/// isize. Sealed.
 pub trait Int: Copy + sealed::Sealed {
-    /// The value as a `u64` in the same order as the type's values, so the distance between two
+    /// The type's width in bits.
+    const BITS: u32;
+    /// Whether the type is signed.
+    const SIGNED: bool;
+    /// The value as a `u128` in the same order as the type's values, so the distance between two
     /// values is the difference of theirs.
-    fn to_ordered(self) -> u64;
-    /// The inverse of `to_ordered`, for a `u64` it gives.
-    fn from_ordered(ordered: u64) -> Self;
+    fn to_ordered(self) -> u128;
+    /// The inverse of `to_ordered`, for a `u128` it gives.
+    fn from_ordered(ordered: u128) -> Self;
     /// `Tape::int` for this type.
     fn draw_int(tape: &Tape, label: &'static str) -> Self;
 }
 
-/// The bit that turns a two's complement `i64` into a `u64` of the same order.
-const SIGN: u64 = 1 << 63;
+/// The bit that turns a two's complement `i128` into a `u128` of the same order: where 0 sits on
+/// the ordered line of a signed type (`edge_ints` places the table's values from it).
+pub(crate) const SIGN: u128 = 1 << 127;
 
 macro_rules! unsigned {
     ($($t:ty),*) => {$(
         impl sealed::Sealed for $t {}
 
-        #[allow(clippy::unnecessary_cast, reason = "one body for every width, u64 among them")]
+        #[allow(clippy::unnecessary_cast, reason = "one body for every width, u128 among them")]
         impl Int for $t {
-            fn to_ordered(self) -> u64 {
-                self as u64
+            const BITS: u32 = <$t>::BITS;
+            const SIGNED: bool = false;
+
+            fn to_ordered(self) -> u128 {
+                self as u128
             }
 
-            fn from_ordered(ordered: u64) -> $t {
+            fn from_ordered(ordered: u128) -> $t {
                 ordered as $t
             }
 
+            /// `int_in` over the whole type, which with `edge-first` reads the table first.
             fn draw_int(tape: &Tape, label: &'static str) -> $t {
                 tape.int_in(0..=<$t>::MAX, label)
             }
@@ -769,25 +944,40 @@ macro_rules! signed {
     ($($t:ty => $u:ty),*) => {$(
         impl sealed::Sealed for $t {}
 
-        #[allow(clippy::unnecessary_cast, reason = "one body for every width, i64 among them")]
+        #[allow(clippy::unnecessary_cast, reason = "one body for every width, i128 among them")]
         impl Int for $t {
-            fn to_ordered(self) -> u64 {
-                (self as i64 as u64) ^ SIGN
+            const BITS: u32 = <$t>::BITS;
+            const SIGNED: bool = true;
+
+            fn to_ordered(self) -> u128 {
+                (self as i128 as u128) ^ SIGN
             }
 
-            fn from_ordered(ordered: u64) -> $t {
-                (ordered ^ SIGN) as i64 as $t
+            fn from_ordered(ordered: u128) -> $t {
+                (ordered ^ SIGN) as i128 as $t
             }
 
-            /// The unsigned draw of the same width, zigzag-decoded (0, -1, 1, -2, ..), so calm
-            /// is 0 and small magnitudes are common.
+            /// With `edge-first`, an edge value of the whole signed type first (about one draw in
+            /// four: 0, -1, MIN, -129, 2^k-1, ..); then, as always, the unsigned draw of the same
+            /// width without its own edge values, zigzag-decoded (0, -1, 1, -2, ..), so calm is 0
+            /// and small magnitudes are common. With the feature off it draws exactly what it drew.
             fn draw_int(tape: &Tape, label: &'static str) -> $t {
-                let zigzag: $u = tape.int_in(0..=<$u>::MAX, label);
+                #[cfg(feature = "edge-first")]
+                if let Some(edge) = crate::edge_ints::in_range(
+                    tape,
+                    <$t>::MIN.to_ordered(),
+                    <$t>::MAX.to_ordered(),
+                    crate::edge_ints::Width::of::<$t>(),
+                    label,
+                ) {
+                    return <$t>::from_ordered(edge);
+                }
+                let zigzag = <$u>::from_ordered(tape.ordered_in(0, <$u>::MAX.to_ordered(), label));
                 ((zigzag >> 1) as $t) ^ -((zigzag & 1) as $t)
             }
         }
     )*};
 }
 
-unsigned!(u8, u16, u32, u64, usize);
-signed!(i8 => u8, i16 => u16, i32 => u32, i64 => u64, isize => usize);
+unsigned!(u8, u16, u32, u64, u128, usize);
+signed!(i8 => u8, i16 => u16, i32 => u32, i64 => u64, i128 => u128, isize => usize);

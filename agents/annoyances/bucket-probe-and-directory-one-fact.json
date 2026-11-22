@@ -1,0 +1,15 @@
+{
+ "id": "bucket-probe-and-directory-one-fact",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane VW",
+ "where": "crates/blaze-ladder/src/front2/buckets/records.rs bucket_read; seen as front2 reads.rs ReadsError::TwoAnswers on a body checked over the impl tables (tests/front2_tables_task.rs)",
+ "what": "a body whose impl question went through the impl tables was refused with 'the fact CrateBucket {..} has two answers (0000000000000001, 7c51b760df9dbb56)'. A NoImplsOf bucket probe (answer: may hold, 1) and the directory read of the same bucket (answer: the bucket's digest) were both named `hash.mark()`, so one fact got two answers",
+ "cost": "one runner round",
+ "cause": "two different reads mapped to one fact name",
+ "whys": "BucketRead's `bucket` field is one u64 for three kinds of read (a trait probe, a bucket probe, a directory lookup); only the trait probe had its own domain",
+ "class": "two reads with different answers under one fact (rule 21)",
+ "prevention": "done: a bucket probe is named in its own domain (PROBE_BUCKET_DOMAIN); front2_tables_task checks every body over the tables",
+ "annoyance": "the runner cuts a failing test's output, so the second failure of a test is not seen until the first is fixed",
+ "workaround": "ask again",
+ "state": "fixed"
+}

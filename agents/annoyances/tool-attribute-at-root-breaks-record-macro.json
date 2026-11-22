@@ -1,0 +1,10 @@
+{
+ "id": "tool-attribute-at-root-breaks-record-macro",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), wave-1124-sansio, the blaze-format-core and blaze-format allocator port",
+ "where": "crates/blaze-format-core/src/lib.rs (root attributes), declared.rs and verified.rs (the exported `record!` and `__record_fields!`)",
+ "what": "C7 asks for `#![blaze::sans_io]` at a crate's root. blaze-format-core defines `#[macro_export]` macros that call each other by `$crate::__record_fields!`. rustc treats a crate whose root carries a tool inner attribute as macro-expanded and then refuses that path (`macro_expanded_macro_exports_accessed_by_absolute_paths`, rust-lang/rust#52234), so the attribute went on each module that defines no exported macro instead, as blaze-sim does. Nothing was compiled to confirm this; it follows the comment already in blaze-sim.",
+ "cost": "about twenty minutes reading blaze-sim's root to find why it carries the attribute per module",
+ "cause": "the gate's sans_io check reads the root only, and rustc's macro-expanded heuristic counts a tool inner attribute",
+ "fix": "the gate should accept `#![blaze::sans_io]` on every module of a crate that exports macros, or blaze-lints should read a crate-level marker that is not an inner attribute (a Cargo metadata key)"
+}

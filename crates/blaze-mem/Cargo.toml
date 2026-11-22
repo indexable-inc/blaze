@@ -14,15 +14,22 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+# `String<A>`, `format_in!` and `format_into!` are blaze-own's, re-exported; `std` for its
+# `AsRef<OsStr>` and `AsRef<Path>`.
+blaze-own = { workspace = true, features = ["std"] }
 blaze-reclaim.workspace = true
-crossbeam-channel.workspace = true
-parking_lot.workspace = true
+# D169's meter: the allocator's, the frames' and the memory layer's calls add to its
+# thread-local cells (counted.rs, tag.rs, syscalls.rs).
+blaze-meter.workspace = true
+# `blaze_mem::swiss`, re-exported.
+blaze-swiss.workspace = true
 
 [target.'cfg(unix)'.dependencies]
+blaze-sys.workspace = true
 libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys.workspace = true
+blaze-sys.workspace = true
 
 [target.'cfg(blaze_check)'.dependencies]
 blaze-check.workspace = true

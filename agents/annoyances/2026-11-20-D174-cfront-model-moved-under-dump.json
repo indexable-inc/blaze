@@ -1,0 +1,8 @@
+{
+  "date": "2026-11-20",
+  "model": "claude-opus-5-5",
+  "lane": "D174 blaze-cc",
+  "area": "blaze-cc decls v2 against blaze-c's model; the clang helper written without clang's headers",
+  "annoyance": "blaze-c's model (crates/blaze-c/src/model.rs) gained columns while the decls format was being written against it (Function.linkage and body, Variable.linkage and init returning a VarId, MacroValue::Slot and AddressOf, Linkage/VarId/VarInit exported at the root): a format that spells the builder's calls goes stale silently until the next compile. The machine has LLVM 23's headers (~/.blaze/native/sha256-e95fc3b4.../include/llvm) but no clang headers, so the helper's clang API names could not be checked, only LLVM's VFS and OutputBackend.",
+  "workaround": "Before finishing a format over another lane's model, re-read model.rs's mtime and the `pub use model::{..}` list in blaze-c/src/lib.rs, and grep its builder signatures. Mark the clang names UNSURE in the helper's tail comment; the first build with llvm.py `\"cfront\": true` is their check."
+}

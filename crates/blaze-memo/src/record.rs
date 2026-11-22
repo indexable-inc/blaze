@@ -445,11 +445,38 @@ fn name_entry(head: &Head, out: &mut dyn fmt::Write) {
     let _ = write!(out, "an entry of {} (key hash {:#018x})", head.kind.name(), head.hash);
 }
 
+/// Linear O(|a| + |b|) two-way merge of two sorted, deduplicated read lists into `out`.
+fn merge_two_dedup<A: Allocator>(a: &[Read], b: &[Read], out: &mut Vec<Read, A>) {
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            Ordering::Less => {
+                out.push(a[i]);
+                i += 1;
+            }
+            Ordering::Greater => {
+                out.push(b[j]);
+                j += 1;
+            }
+            Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    if i < a.len() {
+        out.extend_from_slice(&a[i..]);
+    }
+    if j < b.len() {
+        out.extend_from_slice(&b[j..]);
+    }
+}
+
 /// `direct` and the direct rows of every entry reachable through `callees`, each entry visited
-/// once (and none below an entry whose flat list is made: that list is taken whole), sorted and
-/// deduplicated, in `alloc`. The walk's own scratch (the visited set and the stack) is on the
-/// global heap and freed at its end. Bounded: each entry is pushed once per row naming it and
-/// expanded once.
+/// once (and none below an entry whose flat list is made: that list is taken whole), merged and
+/// deduplicated in linear passes over the already-sorted slices, in `alloc`. Bounded: each entry
+/// is pushed once per row naming it and expanded once.
 ///
 /// # Panics
 ///
@@ -461,8 +488,10 @@ fn flatten_in<A: Allocator>(
     alloc: A,
     named: &dyn Fn(&mut dyn fmt::Write),
 ) -> Vec<Read, A> {
-    let mut rows = Vec::new_in(alloc);
-    rows.extend_from_slice(direct);
+    let mut slices: Vec<&[Read], Global> = Vec::new_in(Global);
+    if !direct.is_empty() {
+        slices.push(direct);
+    }
     if !callees.is_empty() {
         let mut seen: blaze_hash::HashSet<*const Head, Global> = blaze_hash::HashSet::new_in(Global);
         let mut todo: Vec<*const Head, Global> = Vec::new_in(Global);
@@ -477,15 +506,68 @@ fn flatten_in<A: Allocator>(
             // SAFETY: a callee outlives every entry and run that names it ([`Lists`]).
             let Some(lists) = (unsafe { &*at }).lists() else { continue };
             if let Some(made) = lists.made() {
-                rows.extend_from_slice(made);
+                if !made.is_empty() {
+                    slices.push(made);
+                }
                 continue;
             }
-            rows.extend_from_slice(lists.direct());
+            let d = lists.direct();
+            if !d.is_empty() {
+                slices.push(d);
+            }
             todo.extend_from_slice(lists.callees());
         }
     }
-    rows.sort_unstable();
-    rows.dedup();
+
+    let rows = match slices.len() {
+        0 => Vec::new_in(alloc),
+        1 => {
+            let mut out = Vec::with_capacity_in(slices[0].len(), alloc);
+            out.extend_from_slice(slices[0]);
+            out
+        }
+        2 => {
+            let mut out = Vec::with_capacity_in(slices[0].len() + slices[1].len(), alloc);
+            merge_two_dedup(slices[0], slices[1], &mut out);
+            out
+        }
+        _ => {
+            // Balanced bottom-up pairwise two-way merge: every input slice is already sorted and
+            // deduplicated, so duplicates collapse at each level without a full O(M log M) sort.
+            let mut cur: Vec<Vec<Read, Global>, Global> =
+                Vec::with_capacity_in(slices.len().div_ceil(2), Global);
+            let mut iter = slices.chunks_exact(2);
+            for pair in &mut iter {
+                let mut merged = Vec::with_capacity_in(pair[0].len() + pair[1].len(), Global);
+                merge_two_dedup(pair[0], pair[1], &mut merged);
+                cur.push(merged);
+            }
+            if let [last] = iter.remainder() {
+                let mut owned = Vec::with_capacity_in(last.len(), Global);
+                owned.extend_from_slice(last);
+                cur.push(owned);
+            }
+            while cur.len() > 2 {
+                let mut next: Vec<Vec<Read, Global>, Global> =
+                    Vec::with_capacity_in(cur.len().div_ceil(2), Global);
+                let mut drain = cur.into_iter();
+                while let Some(a) = drain.next() {
+                    match drain.next() {
+                        Some(b) => {
+                            let mut merged = Vec::with_capacity_in(a.len() + b.len(), Global);
+                            merge_two_dedup(&a, &b, &mut merged);
+                            next.push(merged);
+                        }
+                        None => next.push(a),
+                    }
+                }
+                cur = next;
+            }
+            let mut out = Vec::with_capacity_in(cur[0].len() + cur[1].len(), alloc);
+            merge_two_dedup(&cur[0], &cur[1], &mut out);
+            out
+        }
+    };
     one_digest_each(&rows, named);
     rows
 }

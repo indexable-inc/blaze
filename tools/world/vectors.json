@@ -1,0 +1,260 @@
+[
+  {
+    "name": "request open",
+    "json": { "v": 1, "call": "open", "checkout": "/w" },
+    "cbor_hex": "a3 00 01 01 00 02 62 2f 77"
+  },
+  {
+    "name": "request patch: one body",
+    "json": {
+      "v": 1, "call": "patch",
+      "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "edits": [{ "kind": "replace_item", "item": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "text": "fn f() {}" }]
+    },
+    "cbor_hex": "a4 00 01 01 01 02 5820 aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa 03 81 a3 00 04 01 5820 cccccccccccccccc cccccccccccccccc cccccccccccccccc cccccccccccccccc 02 69 66 6e 20 66 28 29 20 7b 7d"
+  },
+  {
+    "name": "request patch: every edit",
+    "json": {
+      "v": 1, "call": "patch",
+      "base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "edits": [
+        { "kind": "write_file", "path": "a.rs", "text": "x" },
+        { "kind": "delete_file", "path": "b.rs" },
+        { "kind": "rename_file", "from": "c.rs", "to": "d.rs" },
+        { "kind": "replace_range", "path": "e.rs", "start": 2, "end": 5, "text": "yz", "expect": "abc" },
+        { "kind": "replace_item", "item": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "text": "fn f() {}" }
+      ]
+    },
+    "cbor_hex": "a4 00 01 01 01 02 5820 aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa 03 85 a3 00 00 01 64 61 2e 72 73 02 61 78 a2 00 01 01 64 62 2e 72 73 a3 00 02 01 64 63 2e 72 73 02 64 64 2e 72 73 a6 00 03 01 64 65 2e 72 73 02 02 03 05 04 62 79 7a 05 63 61 62 63 a3 00 04 01 5820 cccccccccccccccc cccccccccccccccc cccccccccccccccc cccccccccccccccc 02 69 66 6e 20 66 28 29 20 7b 7d"
+  },
+  {
+    "name": "request read: a file",
+    "json": {
+      "v": 1, "call": "read",
+      "world": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "what": { "kind": "file", "path": "src/lib.rs" }
+    },
+    "cbor_hex": "a4 00 01 01 02 02 5820 aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa 03 a2 00 00 01 6a 73 72 63 2f 6c 69 62 2e 72 73"
+  },
+  {
+    "name": "request read: an item",
+    "json": {
+      "v": 1, "call": "read",
+      "world": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "what": { "kind": "item", "key": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
+    },
+    "cbor_hex": "a4 00 01 01 02 02 5820 aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa 03 a2 00 01 01 5820 cccccccccccccccc cccccccccccccccc cccccccccccccccc cccccccccccccccc"
+  },
+  {
+    "name": "request read: the root directory",
+    "json": {
+      "v": 1, "call": "read",
+      "world": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "what": { "kind": "dir", "path": "" }
+    },
+    "cbor_hex": "a4 00 01 01 02 02 5820 aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa 03 a2 00 02 01 60"
+  },
+  {
+    "name": "request check: selected, with lints",
+    "json": {
+      "v": 1, "call": "check",
+      "world": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "select": [
+        { "kind": "path", "path": "src" },
+        { "kind": "item", "key": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
+      ],
+      "lints": true
+    },
+    "cbor_hex": "a5 00 01 01 03 02 5820 aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa 03 82 a2 00 00 01 63 73 72 63 a2 00 01 01 5820 cccccccccccccccc cccccccccccccccc cccccccccccccccc cccccccccccccccc 04 f5"
+  },
+  {
+    "name": "request check: the whole world",
+    "json": {
+      "v": 1, "call": "check",
+      "world": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "select": [],
+      "lints": false
+    },
+    "cbor_hex": "a5 00 01 01 03 02 5820 aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa 03 80 04 f4"
+  },
+  {
+    "name": "request diff",
+    "json": {
+      "v": 1, "call": "diff",
+      "from": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "to": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "cbor_hex": "a4 00 01 01 04 02 5820 aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa 03 5820 bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb"
+  },
+  {
+    "name": "request commit",
+    "json": {
+      "v": 1, "call": "commit",
+      "world": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "onto": "/w",
+      "expect": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "cbor_hex": "a5 00 01 01 05 02 5820 bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb 03 62 2f 77 04 5820 aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa"
+  },
+  {
+    "name": "request explain: a finding",
+    "json": {
+      "v": 1, "call": "explain",
+      "world": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "subject": { "kind": "finding", "id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" }
+    },
+    "cbor_hex": "a4 00 01 01 06 02 5820 bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb 03 a2 00 00 01 5820 dddddddddddddddd dddddddddddddddd dddddddddddddddd dddddddddddddddd"
+  },
+  {
+    "name": "request explain: an item",
+    "json": {
+      "v": 1, "call": "explain",
+      "world": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "subject": { "kind": "item", "key": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
+    },
+    "cbor_hex": "a4 00 01 01 06 02 5820 bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb 03 a2 00 01 01 5820 cccccccccccccccc cccccccccccccccc cccccccccccccccc cccccccccccccccc"
+  },
+  {
+    "name": "response world",
+    "json": { "v": 1, "reply": "world", "world": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+    "cbor_hex": "a3 00 01 01 00 02 5820 bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb"
+  },
+  {
+    "name": "response text",
+    "json": { "v": 1, "reply": "text", "path": "src/lib.rs", "start": 0, "text": "fn f() {}" },
+    "cbor_hex": "a5 00 01 01 02 02 6a 73 72 63 2f 6c 69 62 2e 72 73 03 00 04 69 66 6e 20 66 28 29 20 7b 7d"
+  },
+  {
+    "name": "response listing",
+    "json": {
+      "v": 1, "reply": "listing",
+      "entries": [{ "name": "lib.rs", "kind": "file" }, { "name": "bin", "kind": "dir" }]
+    },
+    "cbor_hex": "a3 00 01 01 03 02 82 a2 00 66 6c 69 62 2e 72 73 01 00 a2 00 63 62 69 6e 01 01"
+  },
+  {
+    "name": "response checked: one finding with a fix",
+    "json": {
+      "v": 1, "reply": "checked",
+      "world": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "findings": [
+        {
+          "id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "code": "E0308",
+          "message": "mismatched types",
+          "at": {
+            "item": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "path": "src/lib.rs",
+            "place": { "start": 9, "end": 13, "line": 3, "column": 14 }
+          },
+          "notes": [{ "message": "expected `u32`", "at": [] }],
+          "fix": [{ "kind": "replace_range", "path": "src/lib.rs", "start": 40, "end": 44, "text": "1u32", "expect": "true" }]
+        }
+      ],
+      "certified": true,
+      "entered": { "names": 0, "heads": 1, "bodies": 1, "lints": 1 },
+      "ms": 7
+    },
+    "cbor_hex": "a7 00 01 01 04 02 5820 bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb 03 81 a6 00 5820 dddddddddddddddd dddddddddddddddd dddddddddddddddd dddddddddddddddd 01 65 45 30 33 30 38 02 70 6d 69 73 6d 61 74 63 68 65 64 20 74 79 70 65 73 03 a3 00 5820 cccccccccccccccc cccccccccccccccc cccccccccccccccc cccccccccccccccc 01 6a 73 72 63 2f 6c 69 62 2e 72 73 02 a4 00 09 01 0d 02 03 03 0e 04 81 a2 00 6e 65 78 70 65 63 74 65 64 20 60 75 33 32 60 01 80 05 81 a6 00 03 01 6a 73 72 63 2f 6c 69 62 2e 72 73 02 18 28 03 18 2c 04 64 31 75 33 32 05 64 74 72 75 65 04 f5 05 a4 00 00 01 01 02 01 03 01 06 07"
+  },
+  {
+    "name": "response checked: clean",
+    "json": {
+      "v": 1, "reply": "checked",
+      "world": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "findings": [],
+      "certified": true,
+      "entered": { "names": 0, "heads": 0, "bodies": 0, "lints": 0 },
+      "ms": 0
+    },
+    "cbor_hex": "a7 00 01 01 04 02 5820 bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb 03 80 04 f5 05 a4 00 00 01 00 02 00 03 00 06 00"
+  },
+  {
+    "name": "response changes: every change",
+    "json": {
+      "v": 1, "reply": "changes",
+      "changes": [
+        { "kind": "file_added", "path": "a.rs" },
+        { "kind": "file_deleted", "path": "b.rs" },
+        { "kind": "file_changed", "path": "c.rs" },
+        { "kind": "item_added", "item": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "path": "c.rs" },
+        { "kind": "item_removed", "item": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "path": "c.rs" },
+        { "kind": "item_changed", "item": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "path": "c.rs" }
+      ]
+    },
+    "cbor_hex": "a3 00 01 01 05 02 86 a2 00 00 01 64 61 2e 72 73 a2 00 01 01 64 62 2e 72 73 a2 00 02 01 64 63 2e 72 73 a3 00 03 01 5820 cccccccccccccccc cccccccccccccccc cccccccccccccccc cccccccccccccccc 02 64 63 2e 72 73 a3 00 04 01 5820 cccccccccccccccc cccccccccccccccc cccccccccccccccc cccccccccccccccc 02 64 63 2e 72 73 a3 00 05 01 5820 cccccccccccccccc cccccccccccccccc cccccccccccccccc cccccccccccccccc 02 64 63 2e 72 73"
+  },
+  {
+    "name": "response committed",
+    "json": { "v": 1, "reply": "committed", "files_written": 2 },
+    "cbor_hex": "a3 00 01 01 06 02 02"
+  },
+  {
+    "name": "response moved",
+    "json": { "v": 1, "reply": "moved", "now": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+    "cbor_hex": "a3 00 01 01 07 02 5820 bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbb"
+  },
+  {
+    "name": "response explained",
+    "json": { "v": 1, "reply": "explained", "why": "the head of f moved", "reads": ["f", "g"] },
+    "cbor_hex": "a4 00 01 01 08 02 73 74 68 65 20 68 65 61 64 20 6f 66 20 66 20 6d 6f 76 65 64 03 82 61 66 61 67"
+  },
+  {
+    "name": "refused: edit",
+    "json": { "v": 1, "reply": "refused", "refusal": { "kind": "edit", "index": 3, "why": "expect_mismatch" } },
+    "cbor_hex": "a3 00 01 01 01 02 a3 00 00 01 03 02 04"
+  },
+  {
+    "name": "refused: no such world",
+    "json": {
+      "v": 1, "reply": "refused",
+      "refusal": { "kind": "no_such_world", "world": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+    },
+    "cbor_hex": "a3 00 01 01 01 02 a2 00 01 01 5820 aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaa"
+  },
+  {
+    "name": "refused: not a checkout",
+    "json": { "v": 1, "reply": "refused", "refusal": { "kind": "not_a_checkout", "checkout": "/w" } },
+    "cbor_hex": "a3 00 01 01 01 02 a2 00 02 01 62 2f 77"
+  },
+  {
+    "name": "refused: no such path",
+    "json": { "v": 1, "reply": "refused", "refusal": { "kind": "no_such_path", "path": "a.rs" } },
+    "cbor_hex": "a3 00 01 01 01 02 a2 00 03 01 64 61 2e 72 73"
+  },
+  {
+    "name": "refused: no such item",
+    "json": {
+      "v": 1, "reply": "refused",
+      "refusal": { "kind": "no_such_item", "item": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }
+    },
+    "cbor_hex": "a3 00 01 01 01 02 a2 00 04 01 5820 cccccccccccccccc cccccccccccccccc cccccccccccccccc cccccccccccccccc"
+  },
+  {
+    "name": "refused: no such finding",
+    "json": {
+      "v": 1, "reply": "refused",
+      "refusal": { "kind": "no_such_finding", "id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" }
+    },
+    "cbor_hex": "a3 00 01 01 01 02 a2 00 05 01 5820 dddddddddddddddd dddddddddddddddd dddddddddddddddd dddddddddddddddd"
+  },
+  {
+    "name": "refused: wire",
+    "json": {
+      "v": 1, "reply": "refused",
+      "refusal": { "kind": "wire", "at": 12, "what": "unknown_key", "field": "edit", "said": 9 }
+    },
+    "cbor_hex": "a3 00 01 01 01 02 a5 00 06 01 0c 02 03 03 64 65 64 69 74 04 09"
+  },
+  {
+    "name": "refused: io",
+    "json": { "v": 1, "reply": "refused", "refusal": { "kind": "io", "path": "a.rs", "message": "permission denied" } },
+    "cbor_hex": "a3 00 01 01 01 02 a3 00 07 01 64 61 2e 72 73 02 71 70 65 72 6d 69 73 73 69 6f 6e 20 64 65 6e 69 65 64"
+  },
+  {
+    "name": "refused: unsupported",
+    "json": { "v": 1, "reply": "refused", "refusal": { "kind": "unsupported", "call": "check", "why": "not on disk until W1" } },
+    "cbor_hex": "a3 00 01 01 01 02 a3 00 08 01 03 02 74 6e 6f 74 20 6f 6e 20 64 69 73 6b 20 75 6e 74 69 6c 20 57 31"
+  }
+]

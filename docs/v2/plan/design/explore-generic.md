@@ -11,7 +11,7 @@ protocol and the views talk about processes, threads, open spans and tasks; buil
 crates and build scripts are one layer on top.
 
 Today there are two servers. blaze-explore (the daemon's: WebTransport on 127.0.0.1, a pinned
-certificate, Arrow answers, the live `spans`/`counters`/`open` stream; [explore.md](explore.md))
+certificate, Arrow answers, the live `spans`/`counters`/`open` stream; deleted with the daemon on 2026-11-15)
 and ix-prof's loopback HTTP (`/debug/pprof/*` and `/debug/pprof/live`; [ix-prof-format.md](../../../ix-prof-format.md)).
 The page reads only the first, and decodes its live stream wrongly after the first frame.
 
@@ -115,23 +115,9 @@ dictionary cap and restart the streams).
   id is then the span's); its name is the task's. `span.record("progress.done", n)` moves it;
   `Span::follows_from` adds a task edge; the `wait`/`on`/`owner` fields fill `awaits` and
   `waiting_on`. No new macro.
-- **The blaze daemon.** Tasks are the plane's nodes (`blaze_graph::plane`): name the node's
-  (`<pkg> <target>`), layer columns `kind` (`NodeKind`), `crate`, `unit`; state and outcome from
-  `NodeState`; edges from the plane's deps. The loop, which owns the plane, keeps a
-  materialized, versioned task table in `Observe` (so a late session gets its snapshot) and
-  updates it each tick a reader exists; the explorer thread never touches the plane. The thread
-  working on a node is the one whose open span carries it (`OpenSpan.node`, lane
-  fetch-progress). A build script run is held between its steps and in no thread's open stack,
-  so it shows as `running` with no thread under it, which is the truth. Downloads
-  (`blaze_fetch::downloads`, lane fetch-progress) are tasks with `progress_*` in bytes, ids from
-  their own range, and the node waiting on one names it in `waiting_on_task`. Sandboxed build
-  scripts and proc macros have no network, so they do not serve: their telemetry reaches the
-  daemon over the pipe it already has and joins its `Source` as their own processes.
 
 ## The page (indexable-inc/ix, packages/web/src/lib/explore)
 
-Superseded by [explore-core.md](explore-core.md) (2026-11-05): the page's decoding, live state
-and trace layout move to `blaze-explore-core` in wasm, and the views are written from questions.
 What follows is what the TS page shipped (indexable-inc/ix#7612).
 
 
@@ -161,7 +147,5 @@ What follows is what the TS page shipped (indexable-inc/ix#7612).
 3. `protocol`, `layers` and processes in `hello`; the page and both gates read them.
 4. `tasks`, `task_edges` and `open.task` in the core; ix-prof's producer, with a test that reads
    a task, its progress and a follows-from edge back through a session.
-5. The daemon's producer from the plane and the downloads registry (with lane fetch-progress).
-6. The page: the stateful decoder, Running now, Graph (shipped in TS, ix#7612; the rest is
-   [explore-core.md](explore-core.md)).
+6. The page: the stateful decoder, Running now, Graph (shipped in TS, ix#7612).
 7. The feed carries samples, frames, stacks and allocations; the HTTP live stream goes.

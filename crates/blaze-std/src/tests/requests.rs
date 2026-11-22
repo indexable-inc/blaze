@@ -17,7 +17,7 @@ use crate::{
     Cx, Plant, Stopped,
     mem::Bytes,
     net::{Addr, Conn, HostPort, Listener},
-    requests::{Http, HttpError, HttpKind, Method, Request, Response, Wire},
+    requests::{Finished, Http, HttpError, HttpKind, Method, Request, Response, Wire},
     roots::Roots,
     url::Url,
 };
@@ -30,7 +30,13 @@ const TARGETS: [&str; 4] = ["/ok", "/missing", "/big?x=1", "/echo"];
 const METHODS: [Method; 4] = [Method::Get, Method::Post, Method::Put, Method::Delete];
 
 /// How the tests' `Http::over` talks: every field said, as its caller must.
-const WIRE: Wire = Wire { user_agent: "bstd-test", body_most: 1 << 20, reads_most: 1 << 10 };
+pub(super) const WIRE: Wire = Wire {
+    user_agent: "bstd-test",
+    body_most: 1 << 20,
+    reads_most: 1 << 10,
+    wait_most: core::time::Duration::from_secs(5),
+    redirects: crate::requests::NO_REDIRECTS,
+};
 
 /// How the test's server frames an answer's body.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -112,7 +118,7 @@ fn read_request(cx: &Cx, conn: &Conn) -> Result<(Method, String, Vec<u8>), Strin
             let head = std::str::from_utf8(&bytes[..head_end]).map_err(|e| format!("harness: a request's head: {e}"))?;
             let length = head
                 .lines()
-                .find_map(|line| line.strip_prefix("content-length: "))
+                .find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("content-length")).map(|(_, value)| value.trim()))
                 .map_or(Ok(0), str::parse::<usize>)
                 .map_err(|e| format!("harness: a request's content-length: {e}"))?;
             let body = &bytes[head_end + 4..];
@@ -139,7 +145,7 @@ fn answer(cx: &Cx, conn: &Conn, origin: usize, framing: Framing) -> Result<(), S
     let (method, target, body) = read_request(cx, conn)?;
     let url = Url::parse(&format!("http://{}{target}", AT[origin])).map_err(|e| format!("harness: {e}"))?;
     let mut made = cx.bytes();
-    let request = Request { method, url: &url, headers: &[], body: &body };
+    let request = Request { method, url: &url, headers: &[], body: &body, range: None };
     let status = application(&request, &mut made).map_err(|e| format!("harness: {e}"))?;
     let made = made.as_slice();
     let mut wire = format!("HTTP/1.1 {status} Said\r\nserver: test\r\n").into_bytes();
@@ -195,7 +201,7 @@ fn asked(
 ) -> Result<(), String> {
     let url = url(ask);
     let body = vec![ask.body as u8; ask.body];
-    let request = Request { method: METHODS[ask.method], url: &url, headers: &[], body: &body };
+    let request = Request { method: METHODS[ask.method], url: &url, headers: &[], body: &body, range: None };
     let (mut faked, mut made) = (cx.bytes(), cx.bytes());
     let fake: Result<Response, HttpError> = fake.request(cx, &request, &mut faked);
     // The exchange is linear: once begun it is served by the test's server, then finished.
@@ -207,7 +213,14 @@ fn asked(
             if let Err(why) = served {
                 return Err(why);
             }
-            answered
+            match answered {
+                Ok(Finished::Answered(response)) => Ok(response),
+                Ok(Finished::Redirected(next)) => {
+                    let _ = next.finish(cx, &mut made);
+                    return Err(format!("ask {at}: the test's server redirected, which it never does"));
+                }
+                Err(error) => Err(error),
+            }
         }
     };
     let allowed = plan.only.is_none_or(|only| only == ask.origin);

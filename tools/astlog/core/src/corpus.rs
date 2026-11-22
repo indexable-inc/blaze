@@ -9,12 +9,9 @@ use std::path::{Path, PathBuf};
 
 use ast_merge_langs::Lang;
 use blaze_hash::HashMap;
-use snafu::ResultExt as _;
 use std::alloc::Global;
 
-use crate::error::{
-    Error, LanguageSnafu, ParseFileSnafu, ReadFileSnafu, UnknownLanguageSnafu, WalkSnafu,
-};
+use crate::error::{Error, SourceError};
 
 /// One value in a relation row: a syntax node, derived text or a count.
 pub type Value = astlog_engine::Value<NodeRef>;
@@ -73,8 +70,8 @@ pub struct Corpus {
 
 impl Corpus {
     /// Load `paths` into parsed trees. Directories are walked recursively
-    /// (gitignore-aware via [`ignore`]) and files without a known grammar are
-    /// skipped; an explicitly listed file must have a known grammar.
+    /// (gitignore-aware, see the `walk` module) and files without a known grammar
+    /// are skipped; an explicitly listed file must have a known grammar.
     ///
     /// # Errors
     ///
@@ -87,7 +84,7 @@ impl Corpus {
                 collect_dir(path, &mut sources)?;
             } else {
                 let lang = ast_merge_langs::detect(path)
-                    .ok_or_else(|| UnknownLanguageSnafu { path: path.clone() }.build())?;
+                    .ok_or_else(|| SourceError::UnknownLanguage { path: path.clone() })?;
                 sources.push((path.clone(), lang));
             }
         }
@@ -133,14 +130,11 @@ impl Corpus {
 }
 
 fn collect_dir(path: &Path, sources: &mut Vec<(PathBuf, Lang)>) -> Result<(), Error> {
-    for entry in ignore::Walk::new(path) {
-        let entry = entry.context(WalkSnafu { path })?;
-        let is_file = entry.file_type().is_some_and(|ty| ty.is_file());
-        if !is_file {
-            continue;
-        }
-        if let Some(lang) = ast_merge_langs::detect(entry.path()) {
-            sources.push((entry.into_path(), lang));
+    let mut files = Vec::new_in(Global);
+    crate::walk::files(path, &mut files)?;
+    for file in files {
+        if let Some(lang) = ast_merge_langs::detect(&file) {
+            sources.push((file, lang));
         }
     }
     Ok(())
@@ -151,9 +145,16 @@ fn load_file(
     path: PathBuf,
     lang: Lang,
 ) -> Result<SourceFile, Error> {
-    let text = std::fs::read_to_string(&path).context(ReadFileSnafu { path: &path })?;
-    parser.set_language(&lang.to_tree_sitter()).context(LanguageSnafu { path: &path })?;
-    let tree = parser.parse(&text, None).ok_or_else(|| ParseFileSnafu { path: &path }.build())?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(source) => return Err(SourceError::ReadFile { path, source }.into()),
+    };
+    if let Err(source) = parser.set_language(&lang.to_tree_sitter()) {
+        return Err(SourceError::Language { path, source }.into());
+    }
+    let Some(tree) = parser.parse(&text, None) else {
+        return Err(SourceError::ParseFile { path }.into());
+    };
     let table = build_node_table(&tree);
     let line_starts = build_line_starts(&text);
     Ok(SourceFile { path, lang, text, nodes: table.nodes, line_starts, by_id: table.by_id, tree })

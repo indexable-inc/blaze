@@ -1,0 +1,31 @@
+[package]
+name = "blaze-format-tiers"
+description = "blaze v2's compression by tier for blaze-format buffers: hot plain columns, warm bit-packed SIMD-BP128 columns, cold per-column codecs under zstd with a dictionary per kind"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# Split out of blaze-format on 2026-11-15 so that the record format's closure is workspace crates
+# only: zstd (through zstd-sys's build, cc, jobserver, getrandom) is this crate's alone, and only
+# the store (blaze-cas) and the crates naming a schema's columns depend on it.
+# By path: the workspace entry turns on its `serde`, which would bring serde.
+blaze-format.workspace = true
+# By path, not `.workspace`: the workspace entry turns on blaze-ids' adapter feature (serde),
+# which a member's entry cannot turn off.
+blaze-ids.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+blaze-v2-proof.workspace = true
+
+[lints]
+workspace = true

@@ -1,15 +1,18 @@
 //! A package at a version in a source: `src/workspace/package_id.rs` of cargo 1.99.0
 //! (5f94df4789).
 
-use anyhow::{Result, anyhow};
-use blaze_ids::{Domain, Interner, Sharded};
+use blaze_ids::{Domain, Interner, Shards, Sharded};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ptr;
 
+use crate::error::ResolveError;
 use crate::interning::InternedString;
 use crate::package_id_spec::PackageIdSpec;
 use crate::source_id::SourceId;
+use crate::version::{Version, parse_version};
+
+type Result<T, E = ResolveError> = std::result::Result<T, E>;
 
 /// Interned like [`SourceId`], so it copies for free. Equal when the name, the version
 /// (build metadata included) and the source (as [`SourceId`] compares, without its precise)
@@ -22,7 +25,7 @@ pub struct PackageId {
 #[derive(PartialOrd, Eq, Ord)]
 struct PackageIdInner {
     name: InternedString,
-    version: semver::Version,
+    version: Version,
     source_id: SourceId,
 }
 
@@ -79,13 +82,18 @@ impl PackageId {
         version: &str,
         sid: SourceId,
     ) -> Result<PackageId> {
-        let v = version.parse()?;
-        Ok(PackageId::new(name.into(), v, sid))
+        let name = name.into();
+        let v = parse_version(version).map_err(|error| ResolveError::Version {
+            what: format!("package `{name}`"),
+            text: version.to_owned(),
+            error,
+        })?;
+        Ok(PackageId::new(name, v, sid))
     }
 
-    pub fn new(name: InternedString, version: semver::Version, source_id: SourceId) -> PackageId {
+    pub fn new(name: InternedString, version: Version, source_id: SourceId) -> PackageId {
         let inner = PackageIdInner { name, version, source_id };
-        let ids = PACKAGE_IDS.get_or_init(Sharded::new);
+        let ids = PACKAGE_IDS.get_or_init(|| Sharded::new(Shards::for_this_machine()));
         let mut hasher = blaze_ids::Hasher::of(&PACKAGE_ID);
         hasher.std(&inner);
         let at = ids.intern(hasher.finish(), || inner);
@@ -96,7 +104,7 @@ impl PackageId {
         self.inner.name
     }
 
-    pub fn version(self) -> &'static semver::Version {
+    pub fn version(self) -> &'static Version {
         &self.inner.version
     }
 
@@ -130,10 +138,14 @@ impl PackageId {
     /// Reads `name version (source-url)`, the form of the old lock files' `[metadata]` keys
     /// and dependency lists, and of [`PackageId::serialized`].
     pub fn from_serialized(string: &str) -> Result<PackageId> {
-        let invalid = || anyhow!("invalid serialized PackageId");
+        let invalid = || ResolveError::SerializedPackageId { text: string.to_owned() };
         let (name, rest) = string.split_once(' ').ok_or_else(invalid)?;
         let (version, rest) = rest.split_once(' ').ok_or_else(invalid)?;
-        let version = version.parse()?;
+        let version = parse_version(version).map_err(|error| ResolveError::Version {
+            what: format!("package id `{string}`"),
+            text: version.to_owned(),
+            error,
+        })?;
         let url = rest.strip_prefix('(').and_then(|r| r.strip_suffix(')')).ok_or_else(invalid)?;
         let source_id = SourceId::from_url(url)?;
         Ok(PackageId::new(name.into(), version, source_id))

@@ -18,12 +18,11 @@
 //! Calibrated on the record it came from (the same cores, today's policy), the predicted idle
 //! share should be the measured one; a change of cores or policy then says what it would buy.
 
-use std::{
-    cmp::Reverse,
-    collections::{BinaryHeap, VecDeque},
-};
+use std::{alloc::Global, collections::VecDeque};
 
-use super::{Model, State, Totals, Waker};
+use blaze_kit::Heap4;
+
+use super::{Model, Totals, Waker};
 use crate::flight::WaitedOn;
 
 /// Which runnable job a free core takes.
@@ -403,7 +402,10 @@ struct Replay<'a> {
     transcript: &'a Transcript,
     policy: Policy,
     overhead_ns: i64,
-    events: BinaryHeap<Reverse<(i64, u64, Ev)>>,
+    /// The events due, least `(time, seq)` first: `seq` is unique, so events at one time come
+    /// in the order they were pushed. A heap, not a timer wheel: times are any `i64` ns, and
+    /// the wheel's order within a slot is not this one.
+    events: Heap4<(i64, u64, Ev), Global>,
     seq: u64,
     ready: VecDeque<u32>,
     free: u32,
@@ -425,7 +427,7 @@ impl<'a> Replay<'a> {
             policy,
             overhead_ns,
             // alloc: once a replay
-            events: BinaryHeap::with_capacity(n),
+            events: Heap4::with_capacity_in(n, Global),
             seq: 0,
             // alloc: once a replay
             ready: VecDeque::new(),
@@ -461,13 +463,13 @@ impl<'a> Replay<'a> {
 
     fn push(&mut self, t: i64, ev: Ev) {
         self.seq += 1;
-        self.events.push(Reverse((t, self.seq, ev)));
+        self.events.push((t, self.seq, ev));
     }
 
     fn run(mut self) -> Outcome {
         let mut out_of_fuel = true;
         for _ in 0..self.fuel() {
-            let Some(Reverse((t, _, ev))) = self.events.pop() else {
+            let Some((t, _, ev)) = self.events.pop() else {
                 out_of_fuel = false;
                 break;
             };

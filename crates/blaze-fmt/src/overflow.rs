@@ -7,8 +7,8 @@ use std::cmp::min;
 use crate::ast;
 use crate::ast::token::Delimiter;
 use crate::span::Span;
-use itertools::Itertools;
-use tracing::debug;
+use stdx::iter::IterExt;
+use blaze_trace::debug;
 
 use crate::closures;
 use crate::config::StyleEdition;

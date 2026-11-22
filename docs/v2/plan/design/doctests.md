@@ -68,7 +68,7 @@ passes alone. None has been found yet; the outcome comparison below lists any it
 ## The rules, ported from rustdoc
 
 All in `crates/blaze-doc` (front end crate; `semantics-in-front-end`), from rust-lang/rust
-master of 2026-11-02 (the pinned nightly's line; `harness/toolchain`).
+master of 2026-11-02 (the pinned nightly's line; `pins/toolchain`).
 
 | rule | rustdoc | blaze |
 |---|---|---|

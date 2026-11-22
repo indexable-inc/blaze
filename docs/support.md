@@ -26,13 +26,13 @@ will build: what blaze cannot build fails the build with the reason.
 
 ## Toolchain
 
-One toolchain: the dated nightly in `harness/toolchain`, `nightly-2026-10-25` today, which
+One toolchain: the dated nightly in `pins/toolchain`, `nightly-2026-10-25` today, which
 says `rustc 1.101.0-nightly (12433c307 2026-10-24)` (rust-lang/rust 12433c307b5a, LLVM
 23.1.4). blaze links against what rustc built, so it must agree with that rustc on symbol
 mangling (v0), type layout, the unstable Rust ABI, vtable layout and `TypeId` hashes, and
 everything that mirrors rustc is taken from that one commit: `crates/rustc_abi` is its
 `compiler/rustc_abi`, blaze's proc-macro server (`crates/proc-macro-srv`) follows its
-`proc_macro` bridge, and the answers to rustc's questions (`crates/blaze-units/src/stdlib/rustc.json`) are what that
+`proc_macro` bridge, and the answers to rustc's questions (`pins/answers/rustc.json`) are what that
 rustc says on x86-64 Linux, AArch64 Linux and arm64 macOS. Stable Rust is not supported as a
 toolchain of its own: a stable release's code builds because the nightly builds it. The pin
 moves to a newer nightly with `harness/toolchain_bump.py`
@@ -150,17 +150,17 @@ Coroutine bodies are never optimized.
 
 A program that takes edits with `blaze-live` has its hot functions compiled again while it
 runs, at LLVM `-O3` with what they call built in and then with a profile, and patched in
-([tiers.md](tiers.md)). macOS arm64 with `--features llvm` only, like live edits; on by
+(tiers.md, deleted). macOS arm64 with `--features llvm` only, like live edits; on by
 default there, off with `BLAZE_TIER=off`.
 
 | | macOS arm64 | elsewhere |
 |---|---|---|
-| Sampling, under 1% of a core at 500 Hz | yes (local, 2026-10-20) | no: live edits are macOS only (Linux would sample with `perf_event_open`, [tiers.md](tiers.md#linux)) |
+| Sampling, under 1% of a core at 500 Hz | yes (local, 2026-10-20) | no: live edits are macOS only (Linux would sample with `perf_event_open`) |
 | The sampler stops once the worker reading it is gone | yes (local, by killing the worker) | no |
 | Levels 2 and 3, output identical to cargo's | yes, `harness/tiers.py` (local) | no |
 | An edit demotes a tiered function in the same build | yes, `harness/tiers.py` (local) | no |
 | An edit does not wait for a compile at a higher level | yes (local, with LLVM's part stretched to a second) | no |
-| Code no patch can hold stays out, the program is not started over | yes (local, 12 runs of the Life benchmark under one daemon, [tiers.md](tiers.md#code-no-patch-can-hold)) | no |
+| Code no patch can hold stays out, the program is not started over | yes (local, 12 runs of the Life benchmark under one daemon) | no |
 | `BLAZE_TIER=off` changes nothing | yes, `harness/tiers.py` (local) | does not apply |
 | Within 10% of a release build | within 6% of a release build that checks overflow as the dev profile does, which is as far as the tiered code may go, and 88% of release, on the Life benchmark under load | no |
 

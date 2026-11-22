@@ -13,14 +13,15 @@
 //! cast to a double before the division.
 
 use std::{
+    alloc::Global,
     collections::{BTreeMap, BTreeSet},
     path::Path,
-    sync::Arc,
 };
 
-use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
+use blaze_columns::Field;
 
 use crate::{
+    columns::{Batch, BatchError, Column},
     history::{Pin, manifest::Scope},
     schema,
     tables::{self, Cells, Rows, TableError},
@@ -341,7 +342,7 @@ pub fn last_with_memory(dir: &Path) -> Result<Option<u64>, TableError> {
 /// Every part of `blaze explain memory` of `build`, each view's at most `limit` rows where it
 /// takes one: its batches (none for no row), in [`Part::ALL`]'s order. The tables are read once,
 /// those of one build only as far as the manifest can tell (`Scope::Build`).
-pub fn answer(dir: &Path, build: u64, limit: u64) -> Result<Vec<(Part, Vec<RecordBatch>)>, TableError> {
+pub fn answer(dir: &Path, build: u64, limit: u64) -> Result<Vec<(Part, Vec<Batch>)>, TableError> {
     let pin = Pin::take(dir).map_err(TableError::History)?;
     let scope = Scope::Build(build);
     let facts = Facts {
@@ -764,32 +765,37 @@ pub fn give_backs(facts: &Facts, build: u64, limit: u64) -> Vec<(f64, &Span)> {
 
 // --- The answers as the views' batches --------------------------------------------------
 
-fn column(array: impl arrow_array::Array + 'static) -> ArrayRef {
-    Arc::new(array) // alloc: an answer's column
+fn doubles(values: impl IntoIterator<Item = Option<f64>>) -> Column {
+    Column::options(values, Global) // alloc: an answer's column
 }
 
-fn doubles(values: impl IntoIterator<Item = Option<f64>>) -> ArrayRef {
-    column(values.into_iter().collect::<Float64Array>())
+fn bigints(values: impl IntoIterator<Item = Option<i64>>) -> Column {
+    Column::options(values, Global) // alloc: an answer's column
 }
 
-fn bigints(values: impl IntoIterator<Item = Option<i64>>) -> ArrayRef {
-    column(values.into_iter().collect::<Int64Array>())
-}
-
-fn varchars<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> ArrayRef {
-    column(values.into_iter().collect::<StringArray>())
+fn varchars<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Column {
+    Column::opt_texts_of(values, Global) // alloc: an answer's column
 }
 
 /// The view's answer: one batch of `columns`, or none for no row, as DuckDB's answer reads.
-fn batches(view: &'static str, columns: Vec<(&'static str, ArrayRef)>) -> Result<Vec<RecordBatch>, TableError> {
+/// Every column nullable, as DuckDB's answers are.
+fn batches(view: &'static str, columns: Vec<(&'static str, Column)>) -> Result<Vec<Batch>, TableError> {
     if columns.first().is_none_or(|(_, it)| it.is_empty()) {
         return Ok(Vec::new()); // alloc: none
     }
-    let batch = RecordBatch::try_from_iter(columns).map_err(|error| TableError::Answer { view, error })?;
+    // alloc: the answer's fields and columns
+    let (mut fields, mut cells) =
+        (blaze_own::Vec::with_capacity_in(columns.len(), Global), blaze_own::Vec::with_capacity_in(columns.len(), Global));
+    for (name, column) in columns {
+        fields.push(Field::new(name, column.ty(), true));
+        cells.push(column);
+    }
+    let batch = Batch::try_new(fields, cells)
+        .map_err(|error| TableError::Answer { view, error: BatchError { table: view, error } })?;
     Ok(vec![batch]) // alloc: the answer
 }
 
-fn timeline_batch(rows: &[Minute]) -> Result<Vec<RecordBatch>, TableError> {
+fn timeline_batch(rows: &[Minute]) -> Result<Vec<Batch>, TableError> {
     let g = |f: fn(&Minute) -> Option<f64>| doubles(rows.iter().map(|it| f(it).map(gib)));
     batches(
         Part::Timeline.view(),
@@ -805,7 +811,7 @@ fn timeline_batch(rows: &[Minute]) -> Result<Vec<RecordBatch>, TableError> {
     )
 }
 
-fn peak_tasks_batch(rows: &[PeakTask<'_>]) -> Result<Vec<RecordBatch>, TableError> {
+fn peak_tasks_batch(rows: &[PeakTask<'_>]) -> Result<Vec<Batch>, TableError> {
     let g = |f: fn(&PeakTask<'_>) -> Option<u64>| {
         doubles(rows.iter().map(|it| f(it).map(|it| gib(it as f64))))
     };
@@ -830,7 +836,7 @@ fn peak_tasks_batch(rows: &[PeakTask<'_>]) -> Result<Vec<RecordBatch>, TableErro
     )
 }
 
-fn at_peak_batch(rows: &[Area]) -> Result<Vec<RecordBatch>, TableError> {
+fn at_peak_batch(rows: &[Area]) -> Result<Vec<Batch>, TableError> {
     let g = |f: fn(&Area) -> Option<f64>| doubles(rows.iter().map(f));
     let kind = |it: &Area| Some(if it.process { "process" } else { "tag" });
     batches(
@@ -848,7 +854,7 @@ fn at_peak_batch(rows: &[Area]) -> Result<Vec<RecordBatch>, TableError> {
     )
 }
 
-fn sites_batch(part: Part, rows: &[Site<'_>], held: bool) -> Result<Vec<RecordBatch>, TableError> {
+fn sites_batch(part: Part, rows: &[Site<'_>], held: bool) -> Result<Vec<Batch>, TableError> {
     // alloc: the answer's columns
     let mut columns = vec![
         ("site", varchars(rows.iter().map(|it| Some(it.site)))),
@@ -864,7 +870,7 @@ fn sites_batch(part: Part, rows: &[Site<'_>], held: bool) -> Result<Vec<RecordBa
     batches(part.view(), columns)
 }
 
-fn give_backs_batch(rows: &[(f64, &Span)]) -> Result<Vec<RecordBatch>, TableError> {
+fn give_backs_batch(rows: &[(f64, &Span)]) -> Result<Vec<Batch>, TableError> {
     batches(
         Part::GiveBacks.view(),
         // alloc: the answer's columns

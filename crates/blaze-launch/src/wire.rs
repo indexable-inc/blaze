@@ -19,7 +19,14 @@
 //! caller's buffer and read in place, borrowing its text, byte strings and lists
 //! ([`List`]) from the frame.
 
+mod bytes;
 pub mod cbor;
+pub mod data;
+pub mod fault;
+mod native;
+mod personality;
+pub mod run;
+mod thread_locals;
 
 use alloc::vec::Vec;
 use core::alloc::Allocator;
@@ -63,6 +70,8 @@ pub enum WireError {
     Schema { said: u64 },
     /// An item longer than a frame carries.
     Long { len: u64 },
+    /// A run-wire message ([`run`]) of another run schema.
+    RunSchema { said: u64 },
 }
 
 impl fmt::Display for WireError {
@@ -85,6 +94,11 @@ impl fmt::Display for WireError {
             WireError::Long { len } => {
                 write!(f, "a message of {len} bytes, longer than {LONGEST_FRAME}")
             }
+            WireError::RunSchema { said } => write!(
+                f,
+                "a run-wire message of schema {said}; this run wire (blaze run and its program) is schema {}",
+                run::RUN_SCHEMA
+            ),
         }
     }
 }

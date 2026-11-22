@@ -1,0 +1,15 @@
+{
+ "id": "frozen-head-table-keyed-by-reader-want",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane RA3",
+ "where": "crates/blaze-cli/src/engine_seeds.rs (RequestTable, StretchHeads); engine_heads.rs heads_of payload",
+ "what": "The request's frozen-heads table keyed member heads by the frozen record's want bytes (a LibKey of the head task's own scope) while a body asked by the want its own unit's names made, and the head task named its cells a third way (head_cell, by text). Two member heads a body read were frozen again at a seed ('frozen now and not put: 2 a member's').",
+ "cost": "a whole piece: a write-only lane cannot print which cells missed, so the profile line had to learn to name them first",
+ "cause": "three names for one member head: the head task's cell (by text), the table's key (want bytes of the writer's scope), the body's ask (want of the reader's scope)",
+ "whys": "the table was built as a plain map from want to bytes before head cells were named by text (lane EY), and nothing made the seed place a want the way widen places a read",
+ "class": "a lookup keyed by a value one side computes in its own unit, where the other side's key is by text",
+ "prevention": "done: a member head is found by engine_heads.rs Owners::place over the reader's names (the one placing widen and heads_of_crate use), its record read by the entry task's cell, which the head task's payload now carries; the profile names every member head frozen at a seed by path, want kind and why",
+ "annoyance": "the lane cannot run the test that would print the two cells, so the fix is the design's and the line that names them is the evidence the coordinator reads",
+ "workaround": "the profile line 'frozen now and not put: N a member's ...; first `path` (kind: why)'",
+ "state": "fixed, pending the coordinator's run"
+}

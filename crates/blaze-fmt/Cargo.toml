@@ -14,25 +14,24 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-anyhow.workspace = true
-# The versions the pinned nightly's rustfmt is built with (rust-lang/rust's Cargo.lock at
-# 12433c307): widths, grapheme breaks and the line diff of `--check` are theirs.
+blaze-own.workspace = true
+blaze-data.workspace = true
+blaze-toml.workspace = true
+blaze-semver.workspace = true
+# The version the pinned nightly's rustfmt is built with (rust-lang/rust's Cargo.lock at
+# 12433c307): the line diff of `--check` is its.
 annotate-snippets.workspace = true
 # The user's home directory (`blaze_core::home`), the one answer to it.
 blaze-core.workspace = true
-blaze-serde.workspace = true
 diff.workspace = true
-unicode-segmentation.workspace = true
-rustfmt-unicode-width.workspace = true
-unicode-properties = { workspace = true, features = ["general-category"] }
-itertools.workspace = true
-# `required_version` in a rustfmt.toml is a semver requirement.
-semver.workspace = true
+# Widths, legacy grapheme clusters and General_Category=Po, where rustfmt reads unicode-width
+# 0.1.14, unicode-segmentation and unicode-properties.
+blaze-unicode.workspace = true
+# The iterator adaptors rustfmt's code calls (`stdx::iter`); syntax brings stdx in already.
+stdx.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-thiserror.workspace = true
-toml.workspace = true
-tracing.workspace = true
+blaze-trace.workspace = true
 
 blaze-manifest.workspace = true
 intern.workspace = true
@@ -43,10 +42,10 @@ syntax.workspace = true
 
 # `cargo fmt -q` sends rustfmt's standard output to /dev/null, as cargo-fmt does its child's.
 [target.'cfg(unix)'.dependencies]
-libc.workspace = true
+blaze-sys.workspace = true
 
 [dev-dependencies]
-expect-test.workspace = true
+test-utils.workspace = true
 
 [lints]
 workspace = true

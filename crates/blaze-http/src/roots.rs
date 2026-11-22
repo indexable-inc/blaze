@@ -1,29 +1,36 @@
 //! The TLS every `https` connection of blaze's HTTP client makes: rustls on ring at its safe
-//! default versions, checking servers against the machine's roots, with no client certificate
-//! and no ALPN (this client speaks HTTP/1.1 only, as hyper-rustls's HTTP/1-only connector
-//! offered none). Not part of the core: it reads the machine's certificate files, once, as the
-//! client is made.
+//! default versions, checking servers against the roots it is given (rule 75), with no client
+//! certificate and no ALPN (this client speaks HTTP/1.1 only). The roots are the operating
+//! system's, read when a client first connects ([`system`]), or a configured bundle's
+//! ([`with_der`]); never a list built in.
 
 use std::{fmt, sync::Arc};
+
+/// Where [`system`] looks on Linux, from the caller's environment (rule 75).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use blaze_core::trust::Places;
 
 /// Why the client's TLS can't be set up.
 #[derive(Debug)]
 pub enum TlsSetup {
-    /// The machine's certificates gave no root to check servers with: `skipped` were found
-    /// that did not parse, and `errors` is what went wrong reading them, as
-    /// rustls-native-certs said it.
-    NoRoots { skipped: usize, errors: Vec<String> },
+    /// No root was given to check servers with.
+    NoRoots,
+    /// The machine's store gave no root, or would not read: every place looked.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Untrusted(blaze_core::trust::TrustError),
     /// rustls on ring refused its safe default TLS versions: why.
     Versions(String),
+    /// The root at `at` of the list given was refused by rustls: why.
+    BadRoot { at: usize, why: String },
 }
 
 impl fmt::Display for TlsSetup {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TlsSetup::NoRoots { skipped, errors } => write!(
-                f,
-                "the machine's certificates cannot be read: no root certificate to check servers with ({skipped} did not parse; errors loading them: {errors:?})"
-            ),
+            TlsSetup::NoRoots => f.write_str("no root certificate was given to check servers with"),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            TlsSetup::Untrusted(error) => write!(f, "{error}"),
+            TlsSetup::BadRoot { at, why } => write!(f, "root {at} of the trust anchors given is refused: {why}"),
             TlsSetup::Versions(why) => {
                 write!(f, "rustls on ring has no safe default TLS versions: {why}")
             }
@@ -33,28 +40,37 @@ impl fmt::Display for TlsSetup {
 
 impl std::error::Error for TlsSetup {}
 
-/// rustls on ring with the machine's roots, as hyper-rustls's `with_native_roots` read them: a
-/// certificate that does not parse is skipped, none at all is [`TlsSetup::NoRoots`].
-pub fn native() -> Result<Arc<rustls::ClientConfig>, TlsSetup> {
-    with_roots(native_roots()?)
+/// rustls on ring with the machine's roots, read now from the operating system's store
+/// ([`blaze_core::trust::system`]: Security.framework opened at this call on macOS, the PEM
+/// bundles `places` and the standard paths name on Linux). Call it when a client first
+/// connects, never at start; a store that gives no root is [`TlsSetup::Untrusted`] naming every
+/// place looked.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn system(places: blaze_core::trust::Places<'_>) -> Result<Arc<rustls::ClientConfig>, TlsSetup> {
+    let roots = blaze_core::trust::system(places, std::alloc::Global).map_err(TlsSetup::Untrusted)?;
+    with_der(roots.each())
 }
 
-/// The machine's roots, as [`native`] reads them: for a client that makes its own rustls
-/// config (h3's, with ALPN `h3` and resumption).
-pub fn native_roots() -> Result<rustls::RootCertStore, TlsSetup> {
-    let found = rustls_native_certs::load_native_certs();
+/// rustls on ring checking servers against the roots whose DERs `ders` gives: the system's,
+/// as `blaze_core::trust` read them on first use, or a configured bundle's. A DER rustls
+/// cannot take is [`TlsSetup::BadRoot`] naming its place in the list, never skipped; none is
+/// [`TlsSetup::NoRoots`].
+pub fn with_der<'d>(ders: impl Iterator<Item = &'d [u8]>) -> Result<Arc<rustls::ClientConfig>, TlsSetup> {
     let mut roots = rustls::RootCertStore::empty();
-    let (added, skipped) = roots.add_parsable_certificates(found.certs);
-    if added == 0 {
-        // alloc: an error's message, made only when it fails.
-        let errors = found.errors.iter().map(ToString::to_string).collect();
-        return Err(TlsSetup::NoRoots { skipped, errors });
+    for (at, der) in ders.enumerate() {
+        roots
+            .add(rustls::pki_types::CertificateDer::from_slice(der))
+            // alloc: an error's message, made only when it fails.
+            .map_err(|e| TlsSetup::BadRoot { at, why: e.to_string() })?;
     }
-    Ok(roots)
+    if roots.is_empty() {
+        return Err(TlsSetup::NoRoots);
+    }
+    with_roots(roots)
 }
 
 /// rustls on ring at its safe default versions, checking servers against `roots`, with no
-/// client certificate and no ALPN: [`native`]'s, and a test's with its own root.
+/// client certificate and no ALPN.
 pub fn with_roots(roots: rustls::RootCertStore) -> Result<Arc<rustls::ClientConfig>, TlsSetup> {
     // alloc: the client's TLS setup, made once with it.
     let provider = Arc::new(rustls::crypto::ring::default_provider());

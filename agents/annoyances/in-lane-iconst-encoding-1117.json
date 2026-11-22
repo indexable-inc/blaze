@@ -1,0 +1,14 @@
+{
+ "id": "in-lane-iconst-encoding-1117",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane IN (intrinsics tempo refuses) on rebuild-1115",
+ "where": "crates/blaze-lir/src/builder.rs `iconst` and op.rs `Operands::constant`; crates/blaze-build/src/intrinsics/target/sha3.rs `rotate_amount`",
+ "what": "Reading back an integer constant from LIR to check an immediate (xar's rotate amount) has three encodings to know: `iconst` of 32 bits or fewer is one word, `iconst` of a wider type is one word holding a sign-extended i32, and anything else is `iconst_wide` with `const_words()` words. `Operands::constant()` reads `const_words()` words, which is wrong for `iconst` of an i64 (it reads past the one word). simd.rs `const_index` and sha3.rs each decode it by hand.",
+ "cost": "about ten minutes, caught by reading builder.rs before the build",
+ "cause": "no one accessor on a view answers 'the value of this integer constant, if it is one'",
+ "whys": "the compact iconst form was added to builder.rs without a matching reader; each reader decodes the words itself",
+ "class": "an encoding with several forms and no reader invites a decode that is right for one form only",
+ "prevention": "wanted: `View::int_const(value) -> Option<u128>` in blaze-lir covering iconst and iconst_wide, and the hand decoders (simd.rs const_index, sha3.rs rotate_amount, the barrier immediate) moved to it",
+ "workaround": "sha3.rs decodes both forms itself, refusing iconst_wide as out of range",
+ "state": "open"
+}

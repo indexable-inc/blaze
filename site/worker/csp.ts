@@ -5,13 +5,15 @@
  * Files get it through `assetHeaders` (worker/http.ts; a `_headers` file does not apply once every request runs the
  * worker first). Its own module, without the worker's generated imports, so graph/serve.ts sends the same policy.
  */
-export function csp({ wasm = false } = {}): string {
+export function csp({ wasm = false, localViewer = false } = {}): string {
 	return [
 		"default-src 'self'",
 		wasm ? "script-src 'self' 'wasm-unsafe-eval'" : "script-src 'self'",
 		"style-src 'self'",
 		"img-src 'self'",
-		"connect-src 'self'",
+		localViewer
+			? "connect-src 'self' http://127.0.0.1:41937 ws://127.0.0.1:41937 https://127.0.0.1:41937"
+			: "connect-src 'self'",
 		"frame-src 'none'",
 		"form-action 'self'",
 		"frame-ancestors 'none'",

@@ -1,0 +1,184 @@
+[package]
+name = "blaze-cli"
+description = "The `blaze` binary on the new item layer (docs/v2/plan/design/drive.md, \"The system side\"): `check`, `run` and `test` as one blaze-drive request each, its effects performed through bstd (the sweep, the store, the tasks, printing, the profile)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "blaze"
+path = "src/main.rs"
+doctest = false
+
+# D112 interim (N7): the multi-call fact shim a native build script finds first on its PATH
+# as sw_vers / pkg-config; a separate tiny binary, installed beside `blaze` (built by the same
+# `cargo build -p blaze-cli --bins`).
+[[bin]]
+name = "blaze-fact-shim"
+path = "src/bin/blaze-fact-shim.rs"
+doctest = false
+required-features = ["sandbox"]
+
+[dependencies]
+# The request machine, its records and keys, the line table and the profile.
+blaze-drive.workspace = true
+# The execution engine (engine.md, D131): `blaze engine-check` drives a request through it
+# (engine_check.rs, engine_pool.rs, engine_tasks.rs) beside the old machine until the switch.
+blaze-engine.workspace = true
+# The answer's stored form read in place (engine_answer_rows.rs), beside the page form until
+# the switch (runtime.md D5).
+blaze-answer.workspace = true
+# The store under the command (D114 (b), store/plain_place.rs): blaze-cas's plain store, its
+# vocabulary (blaze-keyed's `Namespace`, `Tag`, `StoreError`), and the arena's index by key.
+blaze-cas.workspace = true
+blaze-keyed.workspace = true
+blaze-hash.workspace = true
+# The checkout's journal helper (journal_ask.rs, journal_helper.rs): its session, its wire and
+# its places (blaze-watch helper.rs, since.rs).
+blaze-watch.workspace = true
+# The system, reached only through bstd: the files, the output, the host's core count, frames.
+# `requests`: bstd's `Http` alone (blaze-h1 over `Net`), for the shared cache's http origin.
+blaze-std = { workspace = true, features = ["requests"] }
+# `outline`: a file's text to its items, the `FileItems` task's work.
+blaze-file-items.workspace = true
+# `tokenize`: the literal `include_str!`/`include_bytes!` calls a file's outline lists as data
+# parts (data_include.rs).
+blaze-lex.workspace = true
+# A body's parse for its `BodyCheck` task: the entry blaze-lower's `lower_body` parses with.
+parser.workspace = true
+# `Edition`, `ItemDetail`, `ItemKind`: the outline's value types.
+blaze-surface.workspace = true
+# `suggest::pick`: the type checker's fix for an unknown name, made a finding (fix.rs).
+blaze-typeck.workspace = true
+# `BlazeEdition`: the one home of the blaze editions' spellings (std.md, "The blaze edition").
+edition.workspace = true
+# `ContentId`: file and item digests. By path: the workspace entry turns on serde adapters.
+blaze-ids.workspace = true
+# The macOS SDK, resolved once at the command's edge (`SDKROOT`, else xcrun): the native
+# build-script runner takes its folder, and the scripts' keys its identity (sdk.rs, scripts.rs).
+blaze-apple-sdk.workspace = true
+# Vec, SortedMap, VecDeque in the command's frame.
+blaze-own.workspace = true
+# R4 (run.md): the kept body record's reader (engine_body_record.rs, `blaze_body::kept`).
+blaze-body.workspace = true
+# `syscalls::snapshot`: the memory layer's own system calls, counted and timed, for the profile's
+# `memory` line (rule 17).
+blaze-mem.workspace = true
+# D169's meter: what each phase, stage, task and body used (phases.rs, engine_pool.rs), and the
+# store's asks and puts (engine_records.rs, engine_store.rs).
+blaze-meter.workspace = true
+# `blaze run`'s program after its check: the walking skeleton's straight line, lower to call
+# (tests/ladder/README.md).
+blaze-ladder.workspace = true
+# The run parent (run_parent.rs): the run wire to the launcher's run mode, the records' ISA, and
+# the BLAKE3 a record's file is named by (blaze-launch-rt `run_mode::Folder`).
+blaze-launch.workspace = true
+# engine_native.rs `send_of`: the image's descriptor (its words' names, one home) and the
+# platform's symbol spelling (`resolve::mangle`), to pair each word with its Rust export.
+blaze-native.workspace = true
+# `record::Symbol`: the entry line's symbol (blaze-ladder run/special.rs `EntryLine`), kept in
+# the start list's head (start_list.rs) and rebuilt from it.
+blaze-code.workspace = true
+blaze-emit.workspace = true
+blaze-blake3.workspace = true
+# The shared cache's read path (remote-read.md): a named origin folder read by range, checked
+# against a signed head. Without `bucket`: no HTTP client, no TLS, in this binary's graph.
+blaze-remote = { workspace = true, default-features = false }
+# An `http://` origin (store.rs `HttpOrigin`): bstd's `Http` (its `requests` feature, below)
+# drives blaze-h1's HTTP/1.1 core on bstd's `Net`: ranged GETs, bounded replies, no TLS stack.
+# blaze-h1 itself for the names of its refusals (`Why`) and `Range`.
+blaze-h1.workspace = true
+# The findings' frames, their wording table and the closing line (blaze_report::frame).
+blaze-report.workspace = true
+# `blaze run`'s live status line: the run's events (`Step`, `Watch`) and the line's sans-IO core.
+blaze-screen.workspace = true
+# The workspace's layout (`layout::Layout`), sans-IO: members, targets, dependencies, each on its
+# line. Without `cargo`: no serde, on blaze's own crates only.
+blaze-manifest = { workspace = true, default-features = false }
+# What each crate is given with nothing in its manifest (`implicit`), the one rule.
+blaze-unit-graph.workspace = true
+# The `MacroModule` task (macros.rs): a module's identity, its key and the module store's lookup;
+# and the `Script` task (scripts.rs, D115): a build script's run, so `runtime` always.
+blaze-proc-macro = { workspace = true, features = ["runtime"] }
+# A build script's outputs record, its environment's `links` metadata and the probe table
+# (scripts.rs).
+blaze-build-script.workspace = true
+# `procs`: a macro crate's module identity from the lock and the graph (one home, procs.rs);
+# `procs-run`: the build scripts' shared setup (script_setting.rs `ScriptSetup`, which the
+# census's exporter calls too).
+blaze-world = { workspace = true, features = ["procs-run"] }
+# The toolchain this binary opens (`PINNED`), its manifest and packs read from the shelf.
+blaze-toolchain.workspace = true
+# The names step's per-crate entry (names.rs).
+blaze-scope.workspace = true
+# `blaze test`'s plan, head, postings, results and report (test_args.rs, test_loop.rs).
+blaze-run.workspace = true
+blaze-id.workspace = true
+blaze-expand.workspace = true
+# The lock's units (`plan`) and the machine that fetches them (fetch.rs). The plan is needed
+# without `fetch` too: a unit the store lacks is then a finding naming it. blaze-drive's
+# `fetch_task` already brings this crate into the graph either way.
+blaze-fetch.workspace = true
+# HTTPS for the fetch machine (`fetch`): HTTP/1.1 over rustls on ring; no h3, and no
+# `native-roots` (the trust anchors come from the effect the fetch lane is adding).
+blaze-http = { workspace = true, optional = true }
+# The fetched source records mapped read-only for the dependency graph (`Mapping::map_file`,
+# graph.rs); with `fetch`, a git commit's record written in place (`reserve::Reserve`), on a
+# driver of its own over the records' folder.
+blaze-core.workspace = true
+# A unit's and a refusal's words (`Show`), as blaze-fetch writes them.
+blaze-text.workspace = true
+# `check`'s lints (lints.rs): the rules over a file's lint units, their findings and words; the
+# root manifest's `[workspace.metadata.blaze] lints` step read with blaze-toml.
+blaze-lint.workspace = true
+blaze-toml.workspace = true
+
+[features]
+default = ["fetch", "sandbox"]
+# The network: the `Fetch` task asks for each lock entry's sources over HTTPS. Without it the
+# binary opens no socket, and a lock entry whose sources the store lacks is a finding.
+fetch = ["dep:blaze-http"]
+# The proc-macro sandbox (Wasmtime), linked into `blaze`: no helper process, one code path. A
+# command that expands nothing does not run it; without it the binary still looks modules up.
+sandbox = ["blaze-proc-macro/runtime"]
+# A trusted builder's blaze (CI's; D136): `blaze store publish` signs and writes a published
+# set to a folder, and the command's store writes the toolchain's public records `PUBLIC`. Off by
+# default: a developer's blaze refuses `blaze store publish` by name and writes only `LOCAL`.
+publish = ["blaze-remote/sign"]
+# The call census (D190 step 2): `check` checks each body a second time under both call rules
+# and prints the comparison at the end of the bodies' profile lines. A measuring build only:
+# the census's own type check doubles the bodies' time.
+call-census = []
+
+[dev-dependencies]
+# `blaze_meter::testing::stop`: the meter's readers off, for the on/off byte-equality test.
+blaze-meter = { workspace = true, features = ["testing"] }
+# The names fixture runs a real worker pool over its simulated filesystem.
+blaze-std = { workspace = true, features = ["testing"] }
+# `check` and `control`: the sweep's simulation and its planted-bug control.
+blaze-sim.workspace = true
+# proc_callers.rs: a member's macro served as the command serves it, asked as the shim asks.
+blaze-wasi.workspace = true
+# `blaze_own::testing::heap()`: the tests' root allocator capability (D102).
+blaze-own = { workspace = true, features = ["std", "testing"] }
+# fetch_tests.rs: a `.crate` made in the test (a gzip of a tar) and its SHA-256, the lock's pin.
+blaze-tar.workspace = true
+blaze-deflate.workspace = true
+blaze-sha256.workspace = true
+# The HTTP origin's test publishes a signed origin (`read::publish`, behind `sign`) of segments
+# sealed by blaze-cas.
+blaze-remote = { workspace = true, default-features = false, features = ["sign"] }
+# world_run.rs: a program's LIR run on the reference evaluator, with fuel.
+blaze-lir = { workspace = true, features = ["eval"] }
+# world_comptime.rs: the D175 rung compared by `first_difference`.
+blaze-comptime.workspace = true
+# engine_check_tests.rs: a check's stack high water (`posix::thread::stack_high_water`, macOS).
+blaze-sys.workspace = true
+
+[lints]
+workspace = true

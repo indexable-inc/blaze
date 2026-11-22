@@ -6,10 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::rc::Rc;
 
-use anyhow::bail;
-
 use super::features::CliFeatures;
-use super::{CargoResult, HashMap, HashSet};
+use super::{CargoResult, FixedState, Map, MapOpts, Set};
 use crate::dependency::Dependency;
 use crate::edit_distance::{closest_msg, edit_distance};
 use crate::interning::InternedString;
@@ -71,11 +69,11 @@ fn collect_matching_features(
     let summary_features = member.features();
 
     // Dependency name -> dependency
-    let dependencies: HashMap<InternedString, &Dependency, Global> =
+    let dependencies: Map<InternedString, &Dependency, FixedState, Global> =
         member.dependencies().iter().map(|dep| (dep.name_in_toml(), dep)).collect();
 
     // Features that enable optional dependencies
-    let optional_dependency_names: HashSet<_, Global> = dependencies
+    let optional_dependency_names: Set<_, FixedState, Global> = dependencies
         .iter()
         .filter(|(_, dep)| dep.is_optional())
         .map(|(name, _)| name)
@@ -302,18 +300,18 @@ fn report_unknown_features_error(
     };
 
     if !missing_packages_with_the_features.is_empty() {
-        write!(
+        let _ = write!(
             &mut msg,
             "\nhelp: package{} with the missing feature{}: {}",
             if missing_packages_with_the_features.len() != 1 { "s" } else { "" },
             if unknown.len() != 1 { "s" } else { "" },
             missing_packages_with_the_features.join(", ")
-        )?;
+        );
     } else {
         let suggestions =
             missing_feature_spelling_suggestions(&selected_members, cli_features, found_features);
         if !suggestions.is_empty() {
-            write!(
+            let _ = write!(
                 &mut msg,
                 "\nhelp: there {}: {}",
                 if suggestions.len() == 1 {
@@ -322,11 +320,11 @@ fn report_unknown_features_error(
                     "are similarly named features"
                 },
                 suggestions.join(", ")
-            )?;
+            );
         }
     }
 
-    bail!("{msg}")
+    Err(crate::ResolveError::UnknownFeatures { report: msg })
 }
 
 /// New command-line feature selection behavior with resolver = "2" or the
@@ -366,7 +364,7 @@ fn members_with_features_new<'a>(
                 })
                 .find(|msg| !msg.is_empty())
                 .unwrap_or_default();
-            bail!("cannot specify features for packages outside of workspace{hint}");
+            return Err(crate::ResolveError::FeaturesOutsideWorkspace { hint });
         }
         // Add all members from the workspace so we can ensure `-p nonmember`
         // is in the resolve graph.
@@ -387,8 +385,8 @@ fn members_with_features_old<'a>(
 ) -> Vec<(&'a Summary, CliFeatures)> {
     // Split off any features with the syntax `member-name/feature-name` into a map
     // so that those features can be applied directly to those workspace-members.
-    let mut member_specific_features: HashMap<InternedString, BTreeSet<FeatureValue>, Global> =
-        HashMap::new_in(Global);
+    let mut member_specific_features: Map<InternedString, BTreeSet<FeatureValue>, FixedState, Global> =
+        Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     // Features for the member in the current directory.
     let mut cwd_features = BTreeSet::new();
     for feature in cli_features.features.iter() {

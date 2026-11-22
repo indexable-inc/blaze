@@ -1,0 +1,15 @@
+{
+ "id": "frozen-enum-ctors-by-origin",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane FL",
+ "where": "crates/blaze-ladder/src/front2/project/head_digest.rs want_heads (Want::Adt arm)",
+ "what": "a seeded body `match r { Ok(v) => .., Err(()) => 0 }` said E0423 \"found `Error`\": core's Result cell was frozen without its Ok/Err ctor fn heads, so the seeded store's fn_sig(Ok) was None and the pattern's FnDef printed as the portable Error node",
+ "cost": "about 20 minutes of reading: the message `found `Error`` reads like a name, but it is PNode::Error's Debug in check.rs ty_shown",
+ "cause": "want_heads found an ADT's ctors by key origin (Origin::Member), which only a struct's ctor has; an enum variant's ctor key is checker_of(its library key) and no origin names it",
+ "whys": "two ways to name one ctor (member key for a struct, library key prefix for a variant); the search used one",
+ "class": "a record's member list derived from a side index (key origins) instead of the row that owns them",
+ "prevention": "done: ctors come from the ADT row's own variant keys; test head_tests.rs a_seeded_store_answers_every_ctor_lookup_as_lowering; BZFZ 4",
+ "annoyance": "a type that is not portable is shown as `Error` in a diagnostic's found text, which hides what it was (a FnDef)",
+ "workaround": "read check.rs ty_shown before trusting a `found` word",
+ "state": "fixed"
+}

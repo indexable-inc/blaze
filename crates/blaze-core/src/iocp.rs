@@ -62,33 +62,35 @@ use std::{
     collections::VecDeque,
     fmt, io,
     mem::ManuallyDrop,
-    os::windows::io::{AsRawHandle as _, OwnedHandle, OwnedSocket},
+    os::windows::io::{OwnedHandle, OwnedSocket},
     path::{Path, PathBuf},
     sync::Arc,
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_mem::{Slab, Tag as MemTag};
-use crossbeam_channel::{Receiver, Sender};
+use crate::chan::{Receiver, Sender};
 use std::alloc::Global;
-use windows_sys::Win32::{
-    Foundation::{
+use blaze_sys::windows::{
+    Handle, Socket,
+    foundation::{
         ERROR_BROKEN_PIPE, ERROR_CONNECTION_ABORTED, ERROR_HANDLE_EOF, ERROR_NETNAME_DELETED,
-        ERROR_NO_DATA, ERROR_NOTIFY_ENUM_DIR, ERROR_OPERATION_ABORTED, HANDLE,
+        ERROR_NO_DATA, ERROR_NOTIFY_ENUM_DIR, ERROR_OPERATION_ABORTED,
+        JOB_OBJECT_MSG_JOB_MEMORY_LIMIT,
     },
-    Networking::WinSock::{SOCKET, WSAECONNRESET},
-    Storage::FileSystem::{ReadFile, WriteFile},
-    System::{
-        IO::{CancelIoEx, OVERLAPPED_ENTRY},
-        SystemServices::JOB_OBJECT_MSG_JOB_MEMORY_LIMIT,
-    },
+    fs::{ReadFile, WriteFile},
+    io::{CancelIoEx, OVERLAPPED_ENTRY},
+    net::WSAECONNRESET,
 };
 
 use self::{
     rundirs::RunDirs,
-    sys::{BUFFER, Buffer, Buffers, Head, KEY_EXIT, KEY_IO, KEY_JOB, KEY_WAKE, KEY_WARM, Port},
+    sys::{
+        BUFFER, Buffer, Buffers, Head, KEY_EXIT, KEY_IO, KEY_JOB, KEY_WAKE, KEY_WARM, Port,
+        handle_of,
+    },
 };
 use crate::{
     Address, Command, Completion, Confine, Confined, Conn, Cursor, Done, Driver, Effect, FileName,
@@ -143,7 +145,7 @@ enum Op {
     /// whose handle `raw` is open while the request is on it.
     Read {
         file: FileId,
-        raw: HANDLE,
+        raw: Handle,
         bytes: Vec<u8>,
         at: u64,
         want: usize,
@@ -151,7 +153,7 @@ enum Op {
     /// `bytes` written at `at`, or at the end where `None` (an append).
     Write {
         file: FileId,
-        raw: HANDLE,
+        raw: Handle,
         bytes: Vec<u8>,
         at: Option<u64>,
         put: usize,
@@ -198,14 +200,14 @@ enum Op {
     /// is on it.
     Recv {
         conn: ConnId,
-        socket: SOCKET,
+        socket: Socket,
         bytes: Vec<u8>,
         most: usize,
         flags: UnsafeCell<u32>,
     },
     Send {
         conn: ConnId,
-        socket: SOCKET,
+        socket: Socket,
         bytes: Vec<u8>,
         put: usize,
     },
@@ -213,7 +215,7 @@ enum Op {
 
 impl Op {
     /// What the request is on: what cancelling it names.
-    fn handle(&self) -> HANDLE {
+    fn handle(&self) -> Handle {
         match self {
             Op::Read { raw, .. } | Op::Write { raw, .. } => *raw,
             Op::Watch(watching) => watching.raw(),
@@ -221,10 +223,10 @@ impl Op {
             Op::Output { pipe, .. }
             | Op::Input { pipe, .. }
             | Op::Frames { pipe, .. }
-            | Op::Answers { pipe, .. } => pipe.as_raw_handle(),
-            Op::Accept(accepting) => net::raw(&accepting.listener.socket) as HANDLE,
-            Op::Connect { connecting, .. } => connecting.raw() as HANDLE,
-            Op::Recv { socket, .. } | Op::Send { socket, .. } => *socket as HANDLE,
+            | Op::Answers { pipe, .. } => handle_of(pipe),
+            Op::Accept(accepting) => net::raw(&accepting.listener.socket).as_handle(),
+            Op::Connect { connecting, .. } => connecting.raw().as_handle(),
+            Op::Recv { socket, .. } | Op::Send { socket, .. } => socket.as_handle(),
         }
     }
 }
@@ -285,7 +287,7 @@ impl Request {
                 // SAFETY: as for a read; the buffer is the request's until it ends (`let_go`).
                 sys::pending(unsafe {
                     ReadFile(
-                        pipe.as_raw_handle(),
+                        handle_of(pipe),
                         buffer.ptr(),
                         BUFFER as u32,
                         std::ptr::null_mut(),
@@ -299,7 +301,7 @@ impl Request {
                 // SAFETY: as for a write.
                 sys::pending(unsafe {
                     WriteFile(
-                        pipe.as_raw_handle(),
+                        handle_of(pipe),
                         rest.as_ptr(),
                         len(rest.len()),
                         std::ptr::null_mut(),
@@ -557,7 +559,7 @@ pub struct Iocp {
     /// The launcher runs are handed to now.
     warm_now: Option<WarmId>,
     /// The runs in flight in it, by the run the frame names.
-    runs: HashMap<u64, SpawnId, Global>,
+    runs: Map<u64, SpawnId, FixedState, Global>,
     /// The last run handed.
     run: u64,
     /// Frames not yet written to the launcher, in the order of their spawns.
@@ -566,8 +568,8 @@ pub struct Iocp {
     failing: Vec<SpawnId>,
     dirs: RunDirs,
     files: Slab<Cached>,
-    readers: HashMap<FileName, FileId, Global>,
-    appenders: HashMap<FileName, FileId, Global>,
+    readers: Map<FileName, FileId, FixedState, Global>,
+    appenders: Map<FileName, FileId, FixedState, Global>,
     /// Every request in flight. Dropped only once none is (`Drop`): the kernel may write any
     /// of their entries until its packet is taken.
     requests: ManuallyDrop<Slab<Request>>,
@@ -580,11 +582,11 @@ pub struct Iocp {
     ready: Vec<Completion>,
     /// By ticks since `start`: due, then the order they were asked for.
     timers: Wheel<Tag>,
-    watches: HashMap<Tag, Id, Global>,
-    journals: HashMap<Tag, Journaling, Global>,
-    listens: HashMap<Tag, Id, Global>,
+    watches: Map<Tag, Id, FixedState, Global>,
+    journals: Map<Tag, Journaling, FixedState, Global>,
+    listens: Map<Tag, Id, FixedState, Global>,
     spawns: Slab<Spawned>,
-    spawning: HashMap<Tag, SpawnId, Global>,
+    spawning: Map<Tag, SpawnId, FixedState, Global>,
     conns: Slab<Connection>,
     entries: [OVERLAPPED_ENTRY; ENTRIES],
     /// The file locks of [`Effect::Lock`], each taken as it is asked for.
@@ -603,9 +605,9 @@ pub struct Iocp {
 // tied to the thread that made it; the driver is used from one thread at a time (`&mut self`).
 unsafe impl Send for Iocp {}
 
-fn reserved<K, V>() -> HashMap<K, V, Global> {
+fn reserved<K, V>() -> Map<K, V, FixedState, Global> {
     // alloc: setup, the room of a map of what is named by tag.
-    HashMap::with_capacity_in(TAGGED, Global)
+    Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(TAGGED) })
 }
 
 impl Iocp {
@@ -616,8 +618,8 @@ impl Iocp {
         let port = Arc::new(Port::new()?);
         // Every work sends one thing back, and at most `WORK` are at the threads: neither
         // channel is ever full.
-        let (sender, back) = crossbeam_channel::bounded(WORK);
-        let (work, queue) = crossbeam_channel::bounded::<Work>(WORK);
+        let (sender, back) = crate::chan::bounded(WORK);
+        let (work, queue) = crate::chan::bounded::<Work>(WORK);
         // alloc: setup, the flag the threads share.
         let woken = Arc::new(Wake::new());
         #[cfg(test)]
@@ -670,9 +672,9 @@ impl Iocp {
             dirs,
             files: Slab::new(FILES, MemTag::Io).map_err(mem)?,
             // alloc: setup, room for every handle kept.
-            readers: HashMap::with_capacity_in(CACHED, Global),
+            readers: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(CACHED) }),
             // alloc: as above.
-            appenders: HashMap::with_capacity_in(CACHED, Global),
+            appenders: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(CACHED) }),
             requests: ManuallyDrop::new(Slab::new(REQUESTS, MemTag::Io).map_err(mem)?),
             stale: 0,
             buffers: ManuallyDrop::new(Buffers::new(BUFFERS).map_err(mem)?),
@@ -804,7 +806,7 @@ impl Iocp {
 
     /// The handle `file` is read or appended through, opened and kept by its name if it is
     /// not yet, with a request on it: [`release`] it as the request ends.
-    fn cached(&mut self, file: &FileName, access: files::Access) -> io::Result<(FileId, HANDLE)> {
+    fn cached(&mut self, file: &FileName, access: files::Access) -> io::Result<(FileId, Handle)> {
         let names = match access {
             files::Access::Append => &self.appenders,
             _ => &self.readers,
@@ -812,10 +814,10 @@ impl Iocp {
         if let Some(&id) = names.get(file) {
             let cached = self.files.get_mut(id).expect("a handle kept by its name is open");
             cached.users += 1;
-            return Ok((id, cached.handle.as_raw_handle()));
+            return Ok((id, handle_of(&cached.handle)));
         }
         let handle = self.open(file, access)?;
-        self.port.associate_skipping(handle.as_raw_handle())?;
+        self.port.associate_skipping(handle_of(&handle))?;
         let names = match access {
             files::Access::Append => &mut self.appenders,
             _ => &mut self.readers,
@@ -825,7 +827,7 @@ impl Iocp {
                 unname(&mut self.files, id);
             }
         }
-        let raw = handle.as_raw_handle();
+        let raw = handle_of(&handle);
         let id = self.files.insert(Cached { handle, users: 1, named: true });
         // clone: a handle opened, kept by its name.
         names.insert(file.clone(), id);
@@ -853,8 +855,8 @@ impl Iocp {
                     self.ready.push(Completion { tag, done: Done::Written });
                     return Ok(());
                 }
-                self.port.associate_skipping(handle.as_raw_handle())?;
-                let raw = handle.as_raw_handle();
+                self.port.associate_skipping(handle_of(&handle))?;
+                let raw = handle_of(&handle);
                 let id = self.files.insert(Cached { handle, users: 1, named: false });
                 let request =
                     self.request(tag, Op::Write { file: id, raw, bytes, at: Some(at), put: 0 });
@@ -933,10 +935,13 @@ impl Iocp {
             | Effect::Seal { .. }
             | Effect::Private { .. }
             | Effect::Map { .. }
+            | Effect::MapWrite { .. }
             | Effect::Stamp { .. }
             | Effect::Entries { .. }
             | Effect::MakeDir { .. }
-            | Effect::RemoveDir { .. }) => {
+            | Effect::RemoveDir { .. }
+            | Effect::Ancestors { .. }
+            | Effect::Above { .. }) => {
                 self.to_threads(Work::File(effect));
                 Ok(())
             }
@@ -946,6 +951,11 @@ impl Iocp {
             }
             Effect::Random { len, tag } => {
                 self.ready.push(Completion { tag, done: crate::host::random(len) });
+                Ok(())
+            }
+            // Refused by name: `crate::trust` reads no store of Windows.
+            Effect::Roots { cert_file, cert_dir, tag } => {
+                self.ready.push(Completion { tag, done: crate::host::roots(cert_file, cert_dir) });
                 Ok(())
             }
             // Not yet: a datagram socket or a standard stream waited on here needs its overlapped
@@ -968,7 +978,13 @@ impl Iocp {
                 self.timers.try_insert(due, tag).map_err(io::Error::other)?;
                 Ok(())
             }
-            Effect::Journal { dir, since, tag } => {
+            // The USN reader resolves names against a watched directory's handle; the root's
+            // journal is not built here yet: refused by name, never narrowed.
+            Effect::Journal { dir: crate::DirName::Root, .. } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a journal of the driver's root: the IOCP driver journals named directories only",
+            )),
+            Effect::Journal { dir: crate::DirName::Named(dir), since, tag } => {
                 if self.watches.contains_key(&tag) || self.journals.contains_key(&tag) {
                     return Err(watched_already(tag));
                 }
@@ -1028,8 +1044,10 @@ impl Iocp {
                 )))
             }
             Effect::Spawn { command, tag } => self.spawn(command, tag),
-            Effect::Listen { at, tag } => self.listen(at, tag),
-            Effect::Connect { at, tag } => self.connect(at, tag),
+            // Windows sets its own no-delay and takes no options yet (out of scope: no Windows
+            // target now); the field is not read here.
+            Effect::Listen { at, tag, .. } => self.listen(at, tag),
+            Effect::Connect { at, tag, .. } => self.connect(at, tag),
             Effect::Recv { conn, most, into, tag } => {
                 let (id, connection) = match self.connection(conn) {
                     Ok(it) => it,
@@ -1163,7 +1181,7 @@ impl Iocp {
         let associated = [Some(&stdout), Some(&stderr), stdin.as_ref()]
             .into_iter()
             .flatten()
-            .try_for_each(|pipe| port.associate(pipe.as_raw_handle()));
+            .try_for_each(|pipe| port.associate(handle_of(pipe)));
         if let Err(error) = associated {
             drop((stdin, stdout, stderr));
             abandon(Some(&process), &job, &mut finish, &mut self.dirs);
@@ -1254,7 +1272,7 @@ impl Iocp {
         let associated = [Some(&stdout), Some(&stderr), stdin.as_ref()]
             .into_iter()
             .flatten()
-            .try_for_each(|pipe| port.associate(pipe.as_raw_handle()));
+            .try_for_each(|pipe| port.associate(handle_of(pipe)));
         if let Err(error) = associated {
             drop(remote);
             abandon(None, &job, &mut finish, &mut self.dirs);
@@ -1299,8 +1317,8 @@ impl Iocp {
         let confined = self.warm.as_ref().expect("asked only with a warm launcher");
         let warm::Launched { process, pid, control, answers } =
             warm::launch(confined, process::serial())?;
-        self.port.associate(control.as_raw_handle())?;
-        self.port.associate(answers.as_raw_handle())?;
+        self.port.associate(handle_of(&control))?;
+        self.port.associate(handle_of(&answers))?;
         let buffer = self.buffers.take()?;
         let port = &self.port;
         let id = self.warms.insert_with(|id| Warm {
@@ -1508,7 +1526,7 @@ impl Iocp {
             io::Error::new(error.kind(), format!("listening at {at:?}: {error}"))
         };
         let listener = net::listen(&self.root, &at).map_err(context)?;
-        self.port.associate(net::raw(&listener.socket) as HANDLE).map_err(context)?;
+        self.port.associate(net::raw(&listener.socket).as_handle()).map_err(context)?;
         let request = self.request(tag, Op::Accept(net::Accepting::new(listener)));
         self.listens.insert(tag, request);
         self.put(request);
@@ -1530,7 +1548,7 @@ impl Iocp {
         let port = &self.port;
         let Request { head, op, .. } = self.requests.get_mut(id).expect("just made");
         let Op::Connect { connecting, at } = op else { unreachable!("just made") };
-        let associate = |socket: &OwnedSocket| port.associate(net::raw(socket) as HANDLE);
+        let associate = |socket: &OwnedSocket| port.associate(net::raw(socket).as_handle());
         // SAFETY: the head of the request just made, and the `Connecting` in its entry, kept in
         // place until the connect's completion is taken; on an error none comes, and the request
         // is let go below.
@@ -1635,7 +1653,7 @@ impl Iocp {
         let shut = net::hang_up(&connection.socket);
         // What is in flight on it ends now: a receive as empty, a send as failed (`ended`).
         // SAFETY: an open socket; no `OVERLAPPED` names every request on it.
-        unsafe { CancelIoEx(net::raw(&connection.socket) as HANDLE, std::ptr::null()) };
+        unsafe { CancelIoEx(net::raw(&connection.socket).as_handle(), std::ptr::null()) };
         for (recv, _, into) in connection.recvs.drain(..) {
             self.ready.push(Completion { tag: recv, done: Done::Read(into) });
         }
@@ -1862,7 +1880,7 @@ impl Iocp {
                         Ok(_) => {
                             let port = &self.port;
                             let taken = accepting.take().and_then(|socket| {
-                                port.associate(net::raw(&socket) as HANDLE)?;
+                                port.associate(net::raw(&socket).as_handle())?;
                                 Ok(socket)
                             });
                             match taken {
@@ -2104,7 +2122,7 @@ impl Iocp {
                 Back::Done(completion) => self.ready.push(completion),
                 Back::Connected { tag, at, made } => {
                     let made = made.and_then(|socket| {
-                        self.port.associate(net::raw(&socket) as HANDLE)?;
+                        self.port.associate(net::raw(&socket).as_handle())?;
                         Ok(socket)
                     });
                     self.connected(tag, &at, made);
@@ -2326,7 +2344,7 @@ impl Drop for Iocp {
             // not by then is left to the job's end; what it wrote is removed with its dirs.
             let deadline = Deadline::after(clock.now(), GIVE_BACK);
             let what = "the warm launcher to exit as the driver is dropped";
-            _ = wait::signaled(what, warm.process.as_raw_handle(), Some(deadline), &clock);
+            _ = wait::signaled(what, handle_of(&warm.process), Some(deadline), &clock);
             drop(warm.waiting.take());
         }
         for (_, spawned) in self.spawns.iter_mut().filter(|(_, it)| it.process.is_none()) {
@@ -2336,6 +2354,13 @@ impl Drop for Iocp {
         for worker in self.workers.drain(..) {
             _ = worker.join();
         }
+    }
+}
+
+impl Iocp {
+    /// [`Driver::now`]'s clock as a value read with no `&self` (`Kqueue::clock`'s doc).
+    pub fn clock(&self) -> crate::wait::Monotonic {
+        crate::wait::Monotonic::since(self.start)
     }
 }
 
@@ -2448,6 +2473,10 @@ impl Driver for Iocp {
 
     fn wall_ns(&self) -> u64 {
         crate::system_wall_ns()
+    }
+
+    fn boot(&self) -> Result<crate::Boot, crate::NoBoot> {
+        crate::boot::system()
     }
 }
 
@@ -2631,7 +2660,7 @@ fn abandon(
         let clock = Monotonic::new();
         let deadline = Some(Deadline::after(clock.now(), GIVE_BACK));
         let what = "an abandoned run's process to exit after its job was killed";
-        _ = wait::signaled(what, process.as_raw_handle(), deadline, &clock);
+        _ = wait::signaled(what, handle_of(process), deadline, &clock);
     }
     if let Some(dir) = finish.scratch.take() {
         dirs.remove(dir);
@@ -2649,11 +2678,11 @@ mod tests {
         collections::BTreeMap,
         ffi::OsString,
         io::{Read as _, Write as _},
-        os::windows::io::{AsRawHandle as _, FromRawHandle as _, RawHandle},
+        os::windows::io::{FromRawHandle as _, RawHandle},
         process::Stdio,
     };
 
-    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+    use blaze_sys::windows::threading::AssignProcessToJobObject;
 
     use super::*;
     use crate::{
@@ -2971,7 +3000,7 @@ mod tests {
             .spawn();
         let Ok(mut ping) = ping else { return could_not };
         // SAFETY: an open job and the process just made.
-        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), ping.as_raw_handle()) } == 0 {
+        if !unsafe { AssignProcessToJobObject(handle_of(job), handle_of(&ping)) }.is_true() {
             _ = ping.kill();
             _ = ping.wait();
             return could_not;
@@ -3150,8 +3179,8 @@ mod tests {
     fn round_trip(root: &Path, at: Address) {
         let mut driver = Iocp::new(root, 1).unwrap();
         let mut effects = vec![
-            Effect::Listen { at: at.clone(), tag: Tag(1) },
-            Effect::Connect { at, tag: Tag(2) },
+            Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) },
+            Effect::Connect { at, options: crate::sockopt::Tcp::DEFAULT, tag: Tag(2) },
         ];
         let (mut server, mut client) = (None, None);
         let mut ends = Vec::new();
@@ -3213,13 +3242,13 @@ mod tests {
         let root = dir("taken");
         let mut driver = Iocp::new(&root, 1).unwrap();
         let mut out = Vec::new();
-        driver.submit(&mut vec![Effect::Listen { at: Address::Unix(name("s")), tag: Tag(1) }]);
+        driver.submit(&mut vec![Effect::Listen { at: Address::Unix(name("s")), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) }]);
         driver.poll(&mut out, Deadline::PASSED);
         assert!(out.is_empty(), "{out:?}");
         let seen = run(
             &mut driver,
             vec![
-                Effect::Listen { at: Address::Unix(name("s")), tag: Tag(2) },
+                Effect::Listen { at: Address::Unix(name("s")), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(2) },
                 Effect::Unlisten { tag: Tag(1) },
             ],
         );
@@ -3250,7 +3279,7 @@ mod tests {
                 Effect::Unlisten { tag: Tag(2) },
                 Effect::Recv { conn: Conn(77), most: 8, into: b"kept".to_vec(), tag: Tag(3) },
                 Effect::Hangup { conn: Conn(77), tag: Tag(4) },
-                Effect::Connect { at: Address::Unix(name("nobody")), tag: Tag(5) },
+                Effect::Connect { at: Address::Unix(name("nobody")), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(5) },
                 Effect::Kill { tag: Tag(6) },
             ],
         );
@@ -3372,8 +3401,8 @@ mod tests {
                     18 => {
                         Effect::Rename { from: file.clone(), to: name("vfs/moved"), tag: Tag(19) }
                     }
-                    19 => Effect::List { dir: name("vfs"), tag: Tag(20) },
-                    20 => Effect::List { dir: name("missing"), tag: Tag(21) },
+                    19 => Effect::List { dir: name("vfs").into(), tag: Tag(20) },
+                    20 => Effect::List { dir: name("missing").into(), tag: Tag(21) },
                     21 => Effect::WriteAt {
                         file: name("missing"),
                         at: 0,
@@ -3481,7 +3510,7 @@ mod tests {
         since: Cursor,
         enough: impl Fn(&[Journaled]) -> bool,
     ) -> Vec<Journaled> {
-        driver.submit(&mut vec![Effect::Journal { dir: name(dir), since, tag: Tag(7) }]);
+        driver.submit(&mut vec![Effect::Journal { dir: crate::DirName::Named(name(dir)), since, tag: Tag(7) }]);
         let mut batches = Vec::new();
         let mut out = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -3550,9 +3579,11 @@ mod tests {
         }
         assert!(files.iter().all(|it| it.starts_with("src")), "{files:?}");
         // Unprivileged records have no names: a removal or an old name is its directory's.
+        // The watched directory's own names lost are `whole` (one rule with the root's).
         let lost: Vec<_> = batches.iter().flat_map(|it| it.lost.iter().cloned()).collect();
-        assert!(lost.contains(&(name("src"), Lost::Unnamed)), "{lost:?}");
-        assert!(lost.iter().all(|(_, why)| *why == Lost::Unnamed), "{lost:?}");
+        let whole: Vec<_> = batches.iter().filter_map(|it| it.whole).collect();
+        assert!(whole.contains(&Lost::Unnamed), "{whole:?}");
+        assert!(lost.iter().all(|(_, why)| *why == Lost::Unnamed) && whole.iter().all(|why| *why == Lost::Unnamed), "{lost:?} {whole:?}");
         let (volume_now, id_now, next) = usn(batches.last().unwrap().cursor);
         assert_eq!((volume_now, id_now), (volume, id));
         assert!(next > at);
@@ -3576,7 +3607,7 @@ mod tests {
         ] {
             let batches = journal(&mut driver, "src", since, |it| !it.is_empty());
             assert!(batches[0].caught_up, "{batches:?}");
-            assert_eq!(batches[0].lost, [(name("src"), Lost::Reset)]);
+            assert_eq!((batches[0].lost.as_slice(), batches[0].whole), (&[][..], Some(Lost::Reset)));
             let (volume_now, id_now, _) = usn(batches[0].cursor);
             assert_eq!((volume_now, id_now), (volume, id));
         }
@@ -3627,18 +3658,21 @@ mod tests {
             &mut driver,
             vec![
                 Effect::Stamp { files: Arc::new(names.clone()), tag: Tag(1) },
-                Effect::Entries { dir: name("a"), tag: Tag(2) },
-                Effect::Entries { dir: name("a/missing"), tag: Tag(3) },
-                Effect::Entries { dir: name("a/f"), tag: Tag(4) },
+                Effect::Entries { dir: name("a").into(), tag: Tag(2) },
+                Effect::Entries { dir: name("a/missing").into(), tag: Tag(3) },
+                Effect::Entries { dir: name("a/f").into(), tag: Tag(4) },
             ],
         );
         assert_eq!(seen[&1], Done::Stamped(stamps.clone()));
         // The listing's stamps are the ones a handle of each gives.
-        let mut wanted = vec![(name("a/d"), dir_), (name("a/f"), file), (name("a/j"), junction)];
-        if symlink {
-            wanted.push((name("a/s"), link));
+        let mut wanted = crate::ListingBuilder::new(name("a"));
+        for (leaf, stamp) in [("d", dir_), ("f", file), ("j", junction)] {
+            wanted.push(leaf.as_bytes(), stamp).unwrap();
         }
-        assert_eq!(seen[&2], Done::Entries(wanted));
+        if symlink {
+            wanted.push(b"s", link).unwrap();
+        }
+        assert_eq!(seen[&2], Done::Entries(Box::new(wanted.finish().unwrap())));
         assert!(
             matches!(seen[&3], Done::Failed(_)) && matches!(seen[&4], Done::Failed(_)),
             "{seen:?}"
@@ -3713,7 +3747,7 @@ mod tests {
         };
         let mut heard = Vec::new();
         driver.submit(&mut vec![
-            Effect::Journal { dir: name("src"), since: Cursor::None, tag: Tag(7) },
+            Effect::Journal { dir: crate::DirName::Named(name("src")), since: Cursor::None, tag: Tag(7) },
             Effect::Flush { watch: Tag(7), tag: Tag(8) },
         ]);
         until(&mut driver, Tag(8), &mut heard);
@@ -3757,7 +3791,7 @@ mod tests {
         for seed in 0..64 {
             let mut rng = crate::sim::Rng::new(seed);
             let mut slab: Slab<Model> = Slab::new(1 << 12, MemTag::Io).unwrap();
-            let mut map: HashMap<u64, Tag, Global> = HashMap::new_in(Global);
+            let mut map: Map<u64, Tag, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
             let mut next = 0u64;
             let (mut live, mut ended): (Vec<(u64, Of)>, Vec<(u64, Of)>) = (Vec::new(), Vec::new());
             for _ in 0..2000 {
@@ -4088,10 +4122,11 @@ mod tests {
         let mut out = Vec::with_capacity(16);
         driver.submit(&mut vec![Effect::Listen {
             at: Address::Tcp("127.0.0.1:0".parse().unwrap()),
+            options: crate::sockopt::Tcp::DEFAULT,
             tag: Tag(1),
         }]);
         let at = driver.local_addr(Tag(1)).unwrap();
-        driver.submit(&mut vec![Effect::Connect { at: Address::Tcp(at), tag: Tag(2) }]);
+        driver.submit(&mut vec![Effect::Connect { at: Address::Tcp(at), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(2) }]);
         until(&mut driver, &mut out, 2);
         let (mut server, mut client) = (None, None);
         for it in out.drain(..) {

@@ -146,7 +146,7 @@ naming its replacement (rule 11). The call sites are in the identity lane's hand
    package the closure's roots are built from (`hir-ty-codegen`, and `blaze-item-hash`, whose
    `BodyFacts` is installed into the front end through a `dyn` hook; registry packages by lock
    checksum, checkout ones by their files), the workspace manifests and cargo's configuration
-   files (the root's, those above it and `$CARGO_HOME`'s), `harness/toolchain`, LLVM by its pin
+   files (the root's, those above it and `$CARGO_HOME`'s), `pins/toolchain`, LLVM by its pin
    (llvm.json's version, commit and the sha256 of the release for `TARGET` and `HOST`, and the
    prefix's `blaze-llvm.json` when set, checked by vendor/llvm-sys/pin.rs, which the build
    script includes), `$RUSTC -vV` and the build's `TARGET`, `PROFILE`, cfgs, features,

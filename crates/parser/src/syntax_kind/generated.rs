@@ -365,6 +365,10 @@ pub enum SyntaxKind {
     // blaze's record types (`#![blaze::records]`, docs/v2/plan/design/records.md), after the
     // others too.
     RECORD_TYPE,
+    // An outline lexer's token for a whole `fn` body (`LexedStr::new_outline`), after the
+    // others too. Only a lexer token: the parser's input has it as a `{` of this contextual
+    // kind, which the parser takes as a lazy `BLOCK_EXPR`, so no tree holds this kind.
+    LAZY_BODY,
     #[doc(hidden)]
     __LAST,
 }
@@ -486,6 +490,7 @@ impl SyntaxKind {
             | SPEC_CLAUSE
             | UNION_TYPE
             | RECORD_TYPE
+            | LAZY_BODY
             | OR_PAT
             | PARAM
             | PARAM_LIST

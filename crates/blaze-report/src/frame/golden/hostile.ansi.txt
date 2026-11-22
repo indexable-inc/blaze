@@ -1,0 +1,8 @@
+[0;1;31merror  [0ma message with [0;7m␛[0m]0;title[0;7m␇[0m and [0;7m␛[0m[2J in it
+  [0;2m╭─ [0msrc/␛[2Jevil.rs[0;2m:3:14[0m
+[0;2m1 │ fn evil() {[0m
+[0;2m2 │     let s = "[0;2;7m␛[0;2m]0;pwned[0;2;7m␇␛[0;2m[2J";[0m
+[0;2m3 │     [0mlet t [0;2m= "[0;1;7m␛[0;1m]8;;http://[0;2mevil.example[0;7m␛[0;2m\\click[0;7m␛[0;2m]8;;[0;7m␛[0;2m\\"; // [0;7m\u{202e}[0;2mdesrever[0m
+  [0;2m│              [0;31m^^^^^^^^^^^^[0m
+  [0;2m│              ╰─ [0;31mlabel [0;7;31m␛[0;31m[5m blinks[0m
+  [0;2m╰─ blaze explain evil␛[31m[0m

@@ -19,10 +19,12 @@
 //! launches is told so (`wait/choice.rs`), and a blaze there waits with direct system calls
 //! (`wait/direct.rs`); a process not told so that meets the filter fails here, naming it.
 
+use blaze_sys::{Errno, Fd, Timespec, linux, posix::{proc, signal::siginfo_t, types::{off_t, pid_t}}};
+use core::ffi::{c_int, c_short, c_uint, c_void};
 use std::{
     cell::RefCell,
     io,
-    os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd},
+    os::fd::RawFd,
     ptr,
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
     time::Duration,
@@ -53,8 +55,8 @@ const ENTER_EXT_ARG: u32 = 1 << 3;
 const ENTER_ABS_TIMER: u32 = 1 << 5;
 const ENTER_EXT_ARG_REG: u32 = 1 << 6;
 
-const REGISTER_ENABLE_RINGS: libc::c_uint = 12;
-const REGISTER_MEM_REGION: libc::c_uint = 34;
+const REGISTER_ENABLE_RINGS: c_uint = 12;
+const REGISTER_MEM_REGION: c_uint = 34;
 const MEM_REGION_TYPE_USER: u32 = 1;
 const MEM_REGION_REG_WAIT_ARG: u64 = 1;
 const REG_WAIT_TS: u32 = 1 << 0;
@@ -68,8 +70,8 @@ const FUTEX2_U32_SHARED: i32 = 0x02;
 /// `FUTEX_BITSET_MATCH_ANY`.
 const FUTEX_ANY: u64 = 0xffff_ffff;
 
-const OFF_SQ_RING: libc::off_t = 0;
-const OFF_SQES: libc::off_t = 0x1000_0000;
+const OFF_SQ_RING: off_t = 0;
+const OFF_SQES: off_t = 0x1000_0000;
 
 /// Requests in flight at once: the wait's, its cancel and a wake.
 const ENTRIES: u32 = 8;
@@ -83,55 +85,6 @@ const LETTING_GO: Duration = Duration::from_secs(5);
 /// The size of the registered region: one page, the wait argument at 0 and its mask after.
 const REGION: usize = 4096;
 const MASK_AT: usize = 64;
-
-#[allow(dead_code, reason = "a layout of linux/io_uring.h, read by the kernel")]
-#[expect(blaze::unwired, reason = "wired: a kernel ABI layout whose fields the kernel reads, not Rust")]
-#[repr(C)]
-#[derive(Default)]
-struct SqOffsets {
-    head: u32,
-    tail: u32,
-    ring_mask: u32,
-    ring_entries: u32,
-    flags: u32,
-    dropped: u32,
-    array: u32,
-    resv1: u32,
-    user_addr: u64,
-}
-
-#[allow(dead_code, reason = "a layout of linux/io_uring.h, read by the kernel")]
-#[expect(blaze::unwired, reason = "wired: a kernel ABI layout whose fields the kernel reads, not Rust")]
-#[repr(C)]
-#[derive(Default)]
-struct CqOffsets {
-    head: u32,
-    tail: u32,
-    ring_mask: u32,
-    ring_entries: u32,
-    overflow: u32,
-    cqes: u32,
-    flags: u32,
-    resv1: u32,
-    user_addr: u64,
-}
-
-#[allow(dead_code, reason = "a layout of linux/io_uring.h, read by the kernel")]
-#[expect(blaze::unwired, reason = "wired: a kernel ABI layout whose fields the kernel reads, not Rust")]
-#[repr(C)]
-#[derive(Default)]
-struct Params {
-    sq_entries: u32,
-    cq_entries: u32,
-    flags: u32,
-    sq_thread_cpu: u32,
-    sq_thread_idle: u32,
-    features: u32,
-    wq_fd: u32,
-    resv: [u32; 3],
-    sq_off: SqOffsets,
-    cq_off: CqOffsets,
-}
 
 #[allow(dead_code, reason = "a layout of linux/io_uring.h, read by the kernel")]
 #[expect(blaze::unwired, reason = "wired: a kernel ABI layout whose fields the kernel reads, not Rust")]
@@ -161,16 +114,6 @@ struct Cqe {
     user_data: u64,
     res: i32,
     flags: u32,
-}
-
-/// `struct __kernel_timespec`.
-#[allow(dead_code, reason = "a layout of linux/io_uring.h, read by the kernel")]
-#[expect(blaze::unwired, reason = "wired: a kernel ABI layout whose fields the kernel reads, not Rust")]
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct Timespec {
-    sec: i64,
-    nsec: i64,
 }
 
 /// `struct io_uring_reg_wait`: one wait's argument in the registered region.
@@ -213,25 +156,24 @@ struct MemRegionReg {
 
 /// A mapping, unmapped when dropped.
 struct Map {
-    at: *mut u8,
+    at: ptr::NonNull<u8>,
     len: usize,
 }
 
 impl Map {
     /// `len` bytes of `fd` at `offset`, or anonymous memory for `fd` -1.
-    fn new(fd: RawFd, len: usize, offset: libc::off_t) -> io::Result<Map> {
+    fn new(fd: RawFd, len: usize, offset: off_t) -> io::Result<Map> {
         let flags = match fd {
-            -1 => libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_POPULATE,
-            _ => libc::MAP_SHARED | libc::MAP_POPULATE,
+            -1 => linux::MapFlags::PRIVATE | linux::MapFlags::ANONYMOUS | linux::MapFlags::POPULATE,
+            _ => linux::MapFlags::SHARED | linux::MapFlags::POPULATE,
         };
-        // SAFETY: a new mapping the kernel places; nothing of this process is overwritten.
+        // SAFETY: the kernel places a new mapping. Shared ring words are accessed through
+        // raw pointers and atomics according to the io_uring ownership protocol.
         let at = unsafe {
-            libc::mmap(ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, flags, fd, offset)
-        };
-        if at == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
+            linux::mmap(None, len, linux::Prot::READ | linux::Prot::WRITE, flags, (fd != -1).then(|| Fd::new(fd)), offset.cast_unsigned())
         }
-        Ok(Map { at: at.cast(), len })
+        .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))?;
+        Ok(Map { at, len })
     }
 
     /// The `T` at `offset`, checked against the mapping.
@@ -242,21 +184,21 @@ impl Map {
             size_of::<T>(),
             self.len,
         );
-        self.at.wrapping_add(offset).cast()
+        self.at.as_ptr().wrapping_add(offset).cast()
     }
 }
 
 impl Drop for Map {
     fn drop(&mut self) {
-        // SAFETY: the mapping `new` made, unmapped once.
-        unsafe { libc::munmap(self.at.cast(), self.len) };
+        // SAFETY: the mapping is owned by this Map and no user accesses it after drop.
+        _ = unsafe { linux::munmap(self.at, self.len) };
     }
 }
 
 /// A thread's wait ring.
 struct WaitRing {
     // Closed first: the kernel ends what is in flight, then the memory it names goes.
-    fd: OwnedFd,
+    fd: linux::OwnedFd,
     sq_head: *const AtomicU32,
     sq_tail: *const AtomicU32,
     sq_mask: u32,
@@ -271,7 +213,7 @@ struct WaitRing {
     wait: *mut RegWait,
     /// What a `waitid` writes of its child, and a sleep's absolute time: the kernel's until
     /// the request ends.
-    info: Box<libc::siginfo_t>,
+    info: Box<siginfo_t>,
     sleep: Box<Timespec>,
     /// A cancel that did not end its request in time: the ring is let go after this wait.
     lost: bool,
@@ -286,25 +228,15 @@ fn errno() -> i32 {
 
 /// `CLOCK_MONOTONIC` now.
 fn monotonic() -> io::Result<Duration> {
-    let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    // SAFETY: a timespec for the kernel to write.
-    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(Duration::new(u64::try_from(now.tv_sec).unwrap_or(0), now.tv_nsec as u32))
+    let now = linux::clock_gettime(linux::ClockId::Monotonic)
+        .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))?;
+    Ok(Duration::new(u64::try_from(now.sec).unwrap_or(0), now.nsec as u32))
 }
 
-fn timespec(at: Duration) -> Timespec {
-    Timespec {
-        sec: i64::try_from(at.as_secs()).unwrap_or(i64::MAX),
-        nsec: at.subsec_nanos().into(),
-    }
-}
-
-fn register(fd: RawFd, opcode: libc::c_uint, arg: *const libc::c_void, n: libc::c_uint) -> i64 {
+fn register(fd: RawFd, opcode: c_uint, arg: *const c_void, n: c_uint) -> i64 {
     // SAFETY: `arg` points at the structure `opcode` reads (or is null for none), live for the
     // call; the kernel copies what it keeps.
-    unsafe { libc::syscall(libc::SYS_io_uring_register, fd, opcode, arg, n) }
+    unsafe { libc::syscall(linux::nr::IO_URING_REGISTER as core::ffi::c_long, fd, opcode, arg, n) }
 }
 
 impl WaitRing {
@@ -319,36 +251,29 @@ impl WaitRing {
                 ),
             )
         };
-        let mut params = Params {
+        let mut params = linux::UringParams {
             flags: SETUP_SUBMIT_ALL | SETUP_R_DISABLED | SETUP_SINGLE_ISSUER | SETUP_DEFER_TASKRUN,
-            ..Params::default()
+            ..linux::UringParams::default()
         };
-        // SAFETY: `params` is the `io_uring_params` the call reads and fills.
-        let fd = unsafe {
-            libc::syscall(libc::SYS_io_uring_setup, ENTRIES, &raw mut params as *mut libc::c_void)
-        };
-        if fd < 0 {
-            let error = io::Error::last_os_error();
+        let fd = linux::io_uring_setup(ENTRIES, &mut params).map_err(|error| {
             // The sandbox's filter answers so, as a kernel with no io_uring does.
-            let step = match error.raw_os_error() {
-                Some(libc::ENOSYS) => {
+            let step = match error {
+                Errno::NoSys => {
                     "io_uring_setup (a kernel with no io_uring answers so, and so does blaze's sandbox to what it \
                      runs: a blaze the sandbox launched waits with direct system calls when its environment has \
                      the launcher's `__BLAZE_SANDBOXED=1`, which this process's has not)"
                 }
                 _ => "io_uring_setup",
             };
-            return Err(refused(step, error));
-        }
-        // SAFETY: the call returned a descriptor of its own.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
+            refused(step, io::Error::from_raw_os_error(i32::from(error.raw())))
+        })?;
         let (sq, cq) = (&params.sq_off, &params.cq_off);
         let sq_len = sq.array as usize + params.sq_entries as usize * size_of::<u32>();
         let cq_len = cq.cqes as usize + params.cq_entries as usize * size_of::<Cqe>();
-        let rings = Map::new(fd.as_raw_fd(), sq_len.max(cq_len), OFF_SQ_RING)
+        let rings = Map::new(fd.fd().raw(), sq_len.max(cq_len), OFF_SQ_RING)
             .map_err(|error| refused("mapping its rings", error))?;
         let sqe_map =
-            Map::new(fd.as_raw_fd(), params.sq_entries as usize * size_of::<Sqe>(), OFF_SQES)
+            Map::new(fd.fd().raw(), params.sq_entries as usize * size_of::<Sqe>(), OFF_SQES)
                 .map_err(|error| refused("mapping its requests", error))?;
         let array: *mut u32 = rings.at(sq.array as usize);
         for index in 0..params.sq_entries {
@@ -363,7 +288,7 @@ impl WaitRing {
         // SAFETY: as above; the kernel reads it at each waiting enter.
         unsafe {
             wait.write(RegWait {
-                ts: Timespec::default(),
+                ts: Timespec::ZERO,
                 min_wait_usec: 0,
                 flags: 0,
                 sigmask: mask as u64,
@@ -373,7 +298,7 @@ impl WaitRing {
             });
         };
         let desc = RegionDesc {
-            user_addr: region.at as u64,
+            user_addr: region.at.as_ptr() as u64,
             size: REGION as u64,
             flags: MEM_REGION_TYPE_USER,
             ..RegionDesc::default()
@@ -383,11 +308,11 @@ impl WaitRing {
             flags: MEM_REGION_REG_WAIT_ARG,
             resv: [0; 2],
         };
-        if register(fd.as_raw_fd(), REGISTER_MEM_REGION, ptr::from_ref(&reg).cast(), 1) < 0 {
+        if register(fd.fd().raw(), REGISTER_MEM_REGION, ptr::from_ref(&reg).cast(), 1) < 0 {
             return Err(refused("registering its wait region", io::Error::last_os_error()));
         }
         // Enabled by the thread that waits on it, its one issuer.
-        if register(fd.as_raw_fd(), REGISTER_ENABLE_RINGS, ptr::null(), 0) < 0 {
+        if register(fd.fd().raw(), REGISTER_ENABLE_RINGS, ptr::null(), 0) < 0 {
             return Err(refused("enabling it", io::Error::last_os_error()));
         }
         // SAFETY: the kernel put each ring's mask, a `u32` it never changes, at its offset.
@@ -406,9 +331,8 @@ impl WaitRing {
             cqes: rings.at(cq.cqes as usize),
             tail: 0,
             wait,
-            // SAFETY: all-zero bytes is a valid `siginfo_t` and `Timespec`.
-            info: Box::new(unsafe { std::mem::zeroed() }), // alloc: once per thread's ring.
-            sleep: Box::new(Timespec::default()),          // alloc: once per thread's ring.
+            info: Box::new(siginfo_t::ZERO), // alloc: once per thread's ring.
+            sleep: Box::new(Timespec::ZERO), // alloc: once per thread's ring.
             lost: false,
             fd,
             _rings: rings,
@@ -438,7 +362,7 @@ impl WaitRing {
         // SAFETY: the kernel's counter, as in `push`.
         let head = unsafe { (*self.sq_head).load(Ordering::Acquire) };
         let submit = self.tail.wrapping_sub(head);
-        let (min, mut flags, arg, size): (u32, u32, *const libc::c_void, usize) = match wait {
+        let (min, mut flags, arg, size): (u32, u32, *const c_void, usize) = match wait {
             true => (
                 1,
                 ENTER_GETEVENTS | ENTER_EXT_ARG | ENTER_EXT_ARG_REG,
@@ -449,8 +373,8 @@ impl WaitRing {
         };
         if wait {
             let (ts, ts_flags) = match left {
-                Some(left) => (timespec(monotonic()?.saturating_add(left)), REG_WAIT_TS),
-                None => (Timespec::default(), 0),
+                Some(left) => (Timespec::from_duration(monotonic()?.saturating_add(left)), REG_WAIT_TS),
+                None => (Timespec::ZERO, 0),
             };
             if ts_flags != 0 {
                 flags |= ENTER_ABS_TIMER;
@@ -466,8 +390,8 @@ impl WaitRing {
         // the registered region (0, its one wait argument), not a pointer.
         let entered = unsafe {
             libc::syscall(
-                libc::SYS_io_uring_enter,
-                self.fd.as_raw_fd(),
+                linux::nr::IO_URING_ENTER as core::ffi::c_long,
+                self.fd.fd().raw(),
                 submit,
                 min,
                 flags,
@@ -479,9 +403,9 @@ impl WaitRing {
             return Ok(Once::Ready(()));
         }
         match errno() {
-            libc::EINTR => Ok(Once::Interrupted),
-            libc::ETIME => Ok(Once::TimedOut),
-            libc::EBUSY | libc::EAGAIN => Ok(Once::Ready(())),
+            code if code == i32::from(Errno::Intr.raw()) => Ok(Once::Interrupted),
+            code if code == i32::from(linux::ETIME.raw()) => Ok(Once::TimedOut),
+            code if code == i32::from(Errno::Busy.raw()) || code == i32::from(Errno::Again.raw()) => Ok(Once::Ready(())),
             error => Err(io::Error::from_raw_os_error(error)),
         }
     }
@@ -535,7 +459,7 @@ impl WaitRing {
         match waited {
             Ok(Waited::Ready(res)) => Ok(Waited::Ready(res)),
             Ok(Waited::Deadline) => match self.cancel(what)? {
-                res if res == -libc::ECANCELED => Ok(Waited::Deadline),
+                res if res == -i32::from(Errno::Canceled.raw()) => Ok(Waited::Deadline),
                 // It ended between the deadline and the cancel: what it ended with.
                 res => Ok(Waited::Ready(res)),
             },
@@ -612,7 +536,7 @@ impl WaitRing {
         match self.wait_for(what, sqe, deadline, clock)? {
             Waited::Deadline => Ok(Waited::Deadline),
             // Woken, or the word no longer held `expected`: the parker looks again.
-            Waited::Ready(res) if res >= 0 || res == -libc::EAGAIN => Ok(Waited::Ready(())),
+            Waited::Ready(res) if res >= 0 || res == -i32::from(Errno::Again.raw()) => Ok(Waited::Ready(())),
             Waited::Ready(res) => Err(WaitError::io(what, io::Error::from_raw_os_error(-res))),
         }
     }
@@ -638,15 +562,15 @@ impl WaitRing {
     fn waitid(
         &mut self,
         what: &'static str,
-        pid: libc::pid_t,
+        pid: pid_t,
         keep: bool,
         deadline: Option<Deadline>,
         clock: &impl Clock,
     ) -> Result<Waited<()>, WaitError> {
-        let options = libc::WEXITED | if keep { libc::WNOWAIT } else { 0 };
+        let options = proc::WEXITED | if keep { proc::WNOWAIT } else { 0 };
         let sqe = Sqe {
             opcode: OP_WAITID,
-            len: libc::P_PID as u32,
+            len: proc::P_PID,
             fd: pid,
             file_index: options as u32,
             off: ptr::from_mut(&mut *self.info) as u64,
@@ -663,15 +587,15 @@ impl WaitRing {
         &mut self,
         what: &'static str,
         fd: RawFd,
-        events: libc::c_short,
+        events: c_short,
         deadline: Option<Deadline>,
         clock: &impl Clock,
-    ) -> Result<Waited<libc::c_short>, WaitError> {
+    ) -> Result<Waited<c_short>, WaitError> {
         let sqe =
             Sqe { opcode: OP_POLL_ADD, fd, op_flags: u32::from(events as u16), ..Sqe::default() };
         match self.wait_for(what, sqe, deadline, clock)? {
             Waited::Deadline => Ok(Waited::Deadline),
-            Waited::Ready(res) if res >= 0 => Ok(Waited::Ready(res as libc::c_short)),
+            Waited::Ready(res) if res >= 0 => Ok(Waited::Ready(res as c_short)),
             Waited::Ready(res) => Err(WaitError::io(what, io::Error::from_raw_os_error(-res))),
         }
     }
@@ -684,7 +608,7 @@ impl WaitRing {
     ) -> Result<(), WaitError> {
         let left = deadline.left(clock.now());
         let at = monotonic().map_err(|error| WaitError::io(what, error))?.saturating_add(left);
-        *self.sleep = timespec(at);
+        *self.sleep = Timespec::from_duration(at);
         let sqe = Sqe {
             opcode: OP_TIMEOUT,
             addr: ptr::from_ref(&*self.sleep) as u64,
@@ -695,7 +619,7 @@ impl WaitRing {
         match self.wait_for(what, sqe, Some(deadline), clock)? {
             // The ring's timeout fired (`ETIME`), or the deadline passed on the wait's clock.
             Waited::Deadline => Ok(()),
-            Waited::Ready(res) if res == -libc::ETIME || res >= 0 => Ok(()),
+            Waited::Ready(res) if res == -i32::from(linux::ETIME.raw()) || res >= 0 => Ok(()),
             Waited::Ready(res) => Err(WaitError::io(what, io::Error::from_raw_os_error(-res))),
         }
     }
@@ -758,18 +682,7 @@ impl Futex for Futexes {
             })
             .unwrap_or(false);
         if !woke {
-            // SAFETY: a wake of a word of this process; the kernel reads no memory of it.
-            unsafe {
-                libc::syscall(
-                    libc::SYS_futex,
-                    word.as_ptr(),
-                    libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
-                    1,
-                    ptr::null::<libc::timespec>(),
-                    ptr::null::<u32>(),
-                    0,
-                )
-            };
+            super::direct::word_wake(word, false);
         }
     }
 }
@@ -795,7 +708,7 @@ pub(crate) fn wait_shared(
 pub(crate) struct Kids;
 
 impl Children for Kids {
-    type Reaped = (libc::c_int, libc::rusage);
+    type Reaped = (c_int, libc::rusage);
 
     fn reap_now(&mut self, pid: i32) -> io::Result<Option<Self::Reaped>> {
         let mut status = 0;
@@ -804,15 +717,15 @@ impl Children for Kids {
         // `WNOHANG` never blocks; an interruption is retried a few times, then is the error.
         for _ in 0..4 {
             // SAFETY: live locals the call writes and does not keep.
-            let reaped = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, &mut rusage) };
+            let reaped = unsafe { libc::wait4(pid, &mut status, proc::WNOHANG, &mut rusage) };
             match reaped {
                 0 => return Ok(None),
                 n if n == pid => return Ok(Some((status, rusage))),
-                _ if errno() == libc::EINTR => {}
+                _ if errno() == i32::from(Errno::Intr.raw()) => {}
                 _ => return Err(io::Error::last_os_error()),
             }
         }
-        Err(io::Error::from_raw_os_error(libc::EINTR))
+        Err(io::Error::from_raw_os_error(i32::from(Errno::Intr.raw())))
     }
 
     fn exited<C: Clock>(
@@ -831,10 +744,10 @@ impl Children for Kids {
 pub(crate) fn poll(
     what: &'static str,
     fd: RawFd,
-    events: libc::c_short,
+    events: c_short,
     deadline: Option<Deadline>,
     clock: &impl Clock,
-) -> Result<Waited<libc::c_short>, WaitError> {
+) -> Result<Waited<c_short>, WaitError> {
     with_ring(what, |ring| ring.poll(what, fd, events, deadline, clock))
 }
 

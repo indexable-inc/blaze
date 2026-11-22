@@ -26,7 +26,7 @@ use std::{
 };
 
 use blaze_mem::scratch;
-use crossbeam_queue::ArrayQueue;
+use blaze_queue::ArrayQueue;
 use crate::lock::Lock;
 
 use crate::wait::{Clock as _, Deadline};
@@ -45,7 +45,7 @@ static READYING: Lock<()> = Lock::new("core.cgroup.readying", ());
 /// The paths of cgroups that ended, each taken by one made after: a spawn's cgroup allocates
 /// nothing once as many have ended as run at once.
 // alloc: the queue's `SPARES` slots, once a process
-static SPARE: LazyLock<ArrayQueue<Vec<u8>>> = LazyLock::new(|| ArrayQueue::new(SPARES));
+static SPARE: LazyLock<ArrayQueue<Vec<u8>, std::alloc::Global>> =LazyLock::new(|| ArrayQueue::new(SPARES));
 
 /// The most paths kept in [`SPARE`].
 const SPARES: usize = 64;
@@ -398,7 +398,7 @@ fn parent() -> io::Result<&'static Path> {
 /// The file whose memory pressure an [`crate::Effect::Pressure`] arms its PSI trigger on: the
 /// process's own cgroup's `memory.pressure` where the memory controller is delegated to it, so
 /// the pressure counted is the daemon's and its builds' (in cgroups below it), else the whole
-/// system's, `/proc/pressure/memory` (docs/memory-budget.md section 7, "Pressure"). Read
+/// system's, `/proc/pressure/memory`. Read
 /// without readying the cgroup: watching pressure moves no process.
 pub(crate) fn pressure_file() -> PathBuf {
     // alloc: the paths, once per watch of memory pressure (one per daemon).

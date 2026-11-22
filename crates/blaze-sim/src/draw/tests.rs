@@ -349,8 +349,10 @@ fn char_never_gives_a_surrogate_and_reaches_past_ascii() {
     }
     assert!(basic && astral, "past ASCII in the basic plane {basic}, past it {astral}");
     // The first code point past the surrogates, and the last scalar value, from their counts.
-    assert_eq!(Tape::replay(&[5, 0xD800]).char("c"), '\u{E000}');
-    assert_eq!(Tape::replay(&[7, u64::MAX]).char("c"), '\u{10FFFF}');
+    // With `edge-first` a calm gate (0) comes first: the plain draw (src/edge_text.rs).
+    let gate: &[u64] = if cfg!(feature = "edge-first") { &[0] } else { &[] };
+    assert_eq!(Tape::replay(&[gate, &[5, 0xD800]].concat()).char("c"), '\u{E000}');
+    assert_eq!(Tape::replay(&[gate, &[7, u64::MAX]].concat()).char("c"), '\u{10FFFF}');
 }
 
 #[test]

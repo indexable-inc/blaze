@@ -12,9 +12,8 @@
 //! [`check_overlaps`] (apply is order-independent within a file because it
 //! splices right-to-left).
 
+use std::fmt;
 use std::path::PathBuf;
-
-use snafu::Snafu;
 
 /// A source file the applier reads: its path and current contents. A named
 /// alias (not a bare `(PathBuf, String)`) so signatures returning these stay
@@ -40,11 +39,7 @@ pub struct FileRewrite {
 
 /// Two edits in the same file cover overlapping byte ranges, so applying both
 /// is ambiguous. Reported instead of silently producing a corrupt splice.
-#[derive(Debug, Snafu)]
-#[snafu(display(
-    "overlapping edits in {}: [{first_start}, {first_end}) overlaps [{second_start}, {second_end})",
-    path.display()
-))]
+#[derive(Debug)]
 pub struct OverlapError {
     pub path: PathBuf,
     pub first_start: usize,
@@ -52,6 +47,20 @@ pub struct OverlapError {
     pub second_start: usize,
     pub second_end: usize,
 }
+
+impl fmt::Display for OverlapError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { path, first_start, first_end, second_start, second_end } = self;
+        write!(
+            f,
+            "overlapping edits in {}: [{first_start}, {first_end}) overlaps [{second_start}, \
+             {second_end})",
+            path.display()
+        )
+    }
+}
+
+impl std::error::Error for OverlapError {}
 
 /// Fail if any two edits in the same file overlap.
 ///
@@ -70,14 +79,13 @@ pub fn check_overlaps(paths: &[PathBuf], edits: &[Edit]) -> Result<(), OverlapEr
         // `edits` is sorted, so the pair overlaps exactly when the later edit
         // starts before the earlier one ends.
         if first.file == second.file && second.start < first.end {
-            return OverlapSnafu {
+            return Err(OverlapError {
                 path: paths.get(first.file).cloned().unwrap_or_default(),
                 first_start: first.start,
                 first_end: first.end,
                 second_start: second.start,
                 second_end: second.end,
-            }
-            .fail();
+            });
         }
     }
     Ok(())
@@ -131,11 +139,8 @@ pub fn unified_diff(files: &[Source], rewrites: &[FileRewrite]) -> String {
             .find(|(path, _)| *path == rewrite.path)
             .map_or("", |(_, text)| text.as_str());
         let label = rewrite.path.display();
-        let diff = similar::TextDiff::from_lines(original, &rewrite.content)
-            .unified_diff()
-            .header(&format!("a/{label}"), &format!("b/{label}"))
-            .to_string();
-        out.push_str(&diff);
+        let (old_label, new_label) = (format!("a/{label}"), format!("b/{label}"));
+        stdx::myers::unified(&mut out, original, &rewrite.content, &old_label, &new_label, 3);
     }
     out
 }

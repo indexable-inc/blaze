@@ -1,0 +1,39 @@
+[package]
+name = "blaze-format-core"
+description = "the part of blaze v2's zero-copy format that defines and reads records: the traits, the in-place views, the column and row helpers, the writer and `record!`, on `core` alone; blaze-format adds the tiers, the cursor and the codecs on top and re-exports all of this"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# With none on, this crate is `#![no_std]` with no `extern crate alloc` and no crate from outside
+# the workspace (docs/v2/plan/design/bottom.md, "No `std` and no `alloc` in blaze's own code").
+[features]
+# `alloc`'s `Vec<u8, A>` as a writer's buffer, in an allocator the caller names, and the two
+# deprecated global-heap items callers not yet ported use (`Writer::on_the_global_heap_until_ported`,
+# `Aligned`). `Writer` has no default allocator; `Persist`, `to_bytes`, `read_verified` and
+# `AlignedIn` are on `core` with no feature. blaze-format turns it on (its `std` feature), for the
+# crates that still hold their buffers in `alloc` (D25, 2026-11-11; D170).
+alloc = []
+
+[dependencies]
+# By path, not `.workspace`: the workspace entry turns on blaze-ids' adapter feature (serde),
+# which a member's entry cannot turn off.
+blaze-ids.workspace = true
+blaze-own.workspace = true
+
+[dev-dependencies]
+# `verified_tests`: the property test, the fuzz and its planted controls.
+blaze-sim.workspace = true
+# `testing::heap()`, a test's allocator (D170 C1: no `Global` in tests either), and `Inline`.
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

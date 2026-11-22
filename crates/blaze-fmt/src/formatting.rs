@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::ast;
 use crate::span::Span;
-use tracing::debug;
+use blaze_trace::debug;
 
 use self::newline_style::apply_newline_style;
 use crate::comment::{CharClasses, FullCodeCharKind};

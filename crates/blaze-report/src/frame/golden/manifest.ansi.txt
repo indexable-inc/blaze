@@ -1,0 +1,7 @@
+[0;1;31merror  [0mthis build of blaze cannot read the dependency [0;2m`[0;1mbstd[0;2m` [0myet
+  [0;2m╭─ [0mCargo.toml[0;2m:7:1[0m
+[0;2m6 │ [dependencies][0m
+[0;2m7 │ [0;1mbstd [0;2m= { [0mpackage [0;2m= "blaze-std", [0mpath [0;2m= "/Volumes/Projects/blaze-macbuild-11…[0m
+  [0;2m│ [0;31m^^^^[0m
+  [0;2m│ ╰─ [0;31mnothing this package gets from it is checked[0m
+  [0;2m╰─ blaze explain dependency-not-read[0m

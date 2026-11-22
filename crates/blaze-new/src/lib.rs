@@ -3,20 +3,30 @@
 //! what cargo writes, byte for byte: the manifest, the source file, the ignore file, the
 //! repository, and the workspace's `members`. For a package of a blaze edition
 //! (docs/v2/plan/design/std.md, "The blaze edition: opting in") the manifest says
-//! `edition = "blaze-2026.11"` and the source is on bstd: a `main` that takes `&Cx` and `Io`
-//! and writes its line through `Out`. Which it writes when no edition is asked is
+//! `edition = "blaze-2026.11"` and the source is on bstd: a `main` that takes `&Cx` and the
+//! one grant it uses, `out: Out` (D104), and writes its line through it. Which it writes when no edition is asked is
 //! [`default_edition`]. cargo runs rustfmt on the source file it writes, which is formatted already;
 //! blaze runs no rustfmt. A git repository is made by `git init`, where cargo has libgit2.
+//!
+//! The manifest is written by blaze-toml's writers in the layout cargo's toml_edit gives a new
+//! document; the root manifest's `members` gets the new package by a [`blaze_toml::Edit`],
+//! which keeps every other byte and follows the array's own layout (where cargo's toml_edit,
+//! pushing and then sorting, can leave a sorted one-line array's spaces out of place).
 
+#![feature(allocator_api)]
+
+use std::alloc::Global;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 
-use anyhow::{Context as _, anyhow, bail};
-use cargo_util_schemas::manifest::PackageName;
-use toml_edit::{Array, Value};
+use blaze_data::Value;
+use blaze_manifest::error::ManifestError;
+use blaze_manifest::schema::PackageName;
+use blaze_toml::{Document, EditError, Item, Limits, Origin, write_string};
 
 /// The edition `cargo new` writes when none is asked.
 const LATEST_STABLE: &str = "2024";
@@ -53,11 +63,12 @@ pub fn default_edition(bstd: bool) -> &'static str {
     }
 }
 
-/// The `main.rs` of a package of a blaze edition: its world as parameters, its line through
-/// the `Out` capability, any error of either call returned to the entry.
+/// The `main.rs` of a package of a blaze edition: each grant it uses named as a parameter
+/// (D104: here only standard output, `out: Out`), its line through it, the write's error
+/// returned to the entry.
 const BLAZE_MAIN: &str = "\
-fn main(cx: &Cx, io: Io) -> Result<(), Error> {
-    io.need_out()?.line(cx, \"Hello, world!\")?;
+fn main(cx: &Cx, out: Out) -> Result<(), Error> {
+    out.line(cx, \"Hello, world!\")?;
     Ok(())
 }
 ";
@@ -169,6 +180,166 @@ struct MkOptions<'a> {
     bstd: Option<&'a str>,
 }
 
+/// What a file operation was doing, in cargo's words for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Doing {
+    /// `failed to read `{path}``.
+    Read,
+    /// `failed to open: {path}`, an ignore file.
+    Open,
+    /// `failed to write: {path}`, an ignore file.
+    Append,
+    /// `failed to write `{path}``.
+    Write,
+    /// `failed to create directory `{path}``.
+    CreateDir,
+}
+
+/// Why `new` or `init` refused, or failed, in cargo's words; the cause, where there is one, is
+/// its [`source`](core::error::Error::source), as cargo's `Caused by:` shows it.
+#[derive(Debug)]
+pub enum NewError {
+    /// `--bin` and `--lib` both.
+    BothKinds,
+    /// No directory name to take the package's name from.
+    NoName { path: PathBuf },
+    NonUnicodeName { name: OsString },
+    /// A name that is no package name: blaze-manifest's refusal, then the help.
+    InvalidName { error: ManifestError, help: String },
+    Keyword { name: String, help: String },
+    /// `deps`, `examples`, `build` or `incremental`, for a package with a binary.
+    ArtifactName { name: String, help: String },
+    /// `test`.
+    TestName { help: String },
+    WindowsReserved { name: String, help: String },
+    /// Two binaries `init` found, either of which could be the main one.
+    TwoBinaries { first: String, second: String },
+    TwoLibraries { first: String, second: String },
+    /// `new` of a path that is there.
+    Exists { path: PathBuf },
+    /// `init` of the home directory.
+    InHome,
+    /// `init` where a Cargo.toml is.
+    IsPackage,
+    /// `init` with more than one repository's directory there and no `--vcs`.
+    ManyVcs,
+    /// A line of an ignore file that is not UTF-8: its index from 0, as cargo counts it.
+    IgnoreNotUtf8 { line: usize },
+    Io { doing: Doing, path: PathBuf, error: std::io::Error },
+    /// A version control program that did not start.
+    Spawn { program: &'static str, error: std::io::Error },
+    /// One that started and failed.
+    Exited { program: &'static str, status: ExitStatus },
+    /// `git init` failed: its standard error.
+    GitInit { path: PathBuf, stderr: String },
+    /// A blaze edition asked for with no bstd to give it.
+    NeedsBstd { edition: String },
+    /// An entry of the root manifest's `members`, or of its `exclude` when `exclude`, that is
+    /// not a string, as written.
+    NotAString { exclude: bool, written: String },
+    Pattern { pattern: String, error: blaze_glob::PatternError },
+    /// The root manifest's `members` could not be edited.
+    Edit { path: PathBuf, error: EditError<Global> },
+    NoParent { path: PathBuf },
+    /// The package's path and the workspace's are not both absolute.
+    NotRelative { package: PathBuf, workspace: PathBuf },
+    NonUnicodePath { path: PathBuf },
+    /// What making the package was refused or failed by.
+    Create { name: String, path: PathBuf, source: Box<NewError> },
+}
+
+impl fmt::Display for NewError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NewError::BothKinds => f.write_str("can't specify both lib and binary outputs"),
+            NewError::NoName { path } => {
+                write!(f, "cannot auto-detect package name from path {:?} ; use --name to override", path.as_os_str())
+            }
+            NewError::NonUnicodeName { name } => write!(f, "cannot create package with a non-unicode name: {name:?}"),
+            NewError::InvalidName { error, help } => write!(f, "{error}{help}"),
+            NewError::Keyword { name, help } => write!(f, "invalid package name `{name}`: it is a Rust keyword{help}"),
+            NewError::ArtifactName { name, help } => {
+                write!(f, "invalid package name `{name}`: it conflicts with cargo's build directory names{help}")
+            }
+            NewError::TestName { help } => {
+                write!(f, "invalid package name `test`: it conflicts with Rust's built-in test library{help}")
+            }
+            NewError::WindowsReserved { name, help } => {
+                write!(f, "invalid package name `{name}`: it is a reserved Windows filename{help}")
+            }
+            NewError::TwoBinaries { first, second } => write!(
+                f,
+                "multiple possible binary sources found:\n  {first}\n  {second}\n\
+                 cannot automatically generate Cargo.toml as the main target would be ambiguous"
+            ),
+            NewError::TwoLibraries { first, second } => {
+                write!(f, "cannot have a package with multiple libraries, found both `{first}` and `{second}`")
+            }
+            NewError::Exists { path } => {
+                write!(f, "destination `{}` already exists\n\nUse `cargo init` to initialize the directory", path.display())
+            }
+            NewError::InHome => f.write_str(
+                "cannot create package in the home directory\n\n\
+                 help: use `cargo init <path>` to create a package in a different directory",
+            ),
+            NewError::IsPackage => f.write_str(
+                "`cargo init` cannot be run on existing Cargo packages\n\
+                 help: use `cargo new` to create a package in a new subdirectory",
+            ),
+            NewError::ManyVcs => f.write_str(
+                "more than one of .hg, .git, .pijul, .fossil configurations found and the ignore file can't be filled in as a result. specify --vcs to override detection",
+            ),
+            NewError::IgnoreNotUtf8 { line } => write!(f, "Character at line {line} is invalid. Cargo only supports UTF-8."),
+            NewError::Io { doing, path, .. } => match doing {
+                Doing::Read => write!(f, "failed to read `{}`", path.display()),
+                Doing::Open => write!(f, "failed to open: {}", path.display()),
+                Doing::Append => write!(f, "failed to write: {}", path.display()),
+                Doing::Write => write!(f, "failed to write `{}`", path.display()),
+                Doing::CreateDir => write!(f, "failed to create directory `{}`", path.display()),
+            },
+            NewError::Spawn { program, .. } => write!(f, "could not execute process `{program}` (never executed)"),
+            NewError::Exited { program, status } => write!(f, "process didn't exit successfully: `{program}` ({status})"),
+            NewError::GitInit { path, stderr } => write!(f, "failed to make a git repository at `{}`: {stderr}", path.display()),
+            NewError::NeedsBstd { edition } => write!(
+                f,
+                "a package of the blaze edition `{edition}` needs bstd, which blaze does not ship with \
+                 itself yet (docs/v2/plan/design/std.md, row S5d): say where its package is with \
+                 `--bstd <PATH>` (crates/blaze-std of blaze's source)"
+            ),
+            NewError::NotAString { exclude: true, written } => write!(f, "invalid non-string exclude path `{written}`"),
+            NewError::NotAString { exclude: false, written } => write!(f, "invalid non-string member `{written}`"),
+            NewError::Pattern { pattern, .. } => write!(f, "cannot build glob pattern from `{pattern}`"),
+            NewError::Edit { path, error } => write!(f, "failed to add the package to `members` in `{}`: {error}", path.display()),
+            NewError::NoParent { path } => {
+                write!(f, "workspace root manifest doesn't have a parent directory `{}`", path.display())
+            }
+            NewError::NotRelative { package, workspace } => write!(
+                f,
+                "path comparison requires two absolute paths; package_path: `{}`, workspace_path: `{}`",
+                package.display(),
+                workspace.display()
+            ),
+            NewError::NonUnicodePath { path } => write!(f, "invalid unicode component in path `{}`", path.display()),
+            NewError::Create { name, path, .. } => write!(f, "failed to create package `{name}` at `{}`", path.display()),
+        }
+    }
+}
+
+impl core::error::Error for NewError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            NewError::Io { error, .. } | NewError::Spawn { error, .. } => Some(error),
+            NewError::Pattern { error, .. } => Some(error),
+            NewError::Create { source, .. } => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+fn io_error(doing: Doing, path: &Path) -> impl FnOnce(std::io::Error) -> NewError + '_ {
+    move |error| NewError::Io { doing, path: path.to_path_buf(), error }
+}
+
 impl NewOptions {
     pub fn new(
         version_control: Option<VersionControl>,
@@ -178,10 +349,10 @@ impl NewOptions {
         name: Option<String>,
         edition: Option<String>,
         registry: Option<String>,
-    ) -> anyhow::Result<NewOptions> {
+    ) -> Result<NewOptions, NewError> {
         let auto_detect_kind = !bin && !lib;
         let kind = match (bin, lib) {
-            (true, true) => bail!("can't specify both lib and binary outputs"),
+            (true, true) => return Err(NewError::BothKinds),
             (false, true) => NewProjectKind::Lib,
             (_, false) => NewProjectKind::Bin,
         };
@@ -198,19 +369,12 @@ impl NewOptions {
     }
 }
 
-fn get_name<'a>(path: &'a Path, opts: &'a NewOptions) -> anyhow::Result<&'a str> {
+fn get_name<'a>(path: &'a Path, opts: &'a NewOptions) -> Result<&'a str, NewError> {
     if let Some(ref name) = opts.name {
         return Ok(name);
     }
-    let file_name = path.file_name().ok_or_else(|| {
-        anyhow!(
-            "cannot auto-detect package name from path {:?} ; use --name to override",
-            path.as_os_str()
-        )
-    })?;
-    file_name
-        .to_str()
-        .ok_or_else(|| anyhow!("cannot create package with a non-unicode name: {file_name:?}"))
+    let file_name = path.file_name().ok_or_else(|| NewError::NoName { path: path.to_path_buf() })?;
+    file_name.to_str().ok_or_else(|| NewError::NonUnicodeName { name: file_name.to_owned() })
 }
 
 fn is_keyword(name: &str) -> bool {
@@ -241,7 +405,7 @@ fn check_name(
     show_name_help: bool,
     has_bin: bool,
     shell: &mut impl Shell,
-) -> anyhow::Result<()> {
+) -> Result<(), NewError> {
     // If --name is already used to override, no point in suggesting it again as a fix.
     let name_help = if show_name_help {
         "\nnote: the directory name is used as the package name\
@@ -268,26 +432,22 @@ fn check_name(
         }
         help
     };
-    PackageName::new(name).map_err(|err| anyhow!("{err}{}", bin_help()))?;
+    PackageName::new(name)
+        .map_err(|err| NewError::InvalidName { error: ManifestError::Resolve(err), help: bin_help() })?;
 
     if is_keyword(name) {
-        bail!("invalid package name `{name}`: it is a Rust keyword{}", bin_help());
+        return Err(NewError::Keyword { name: name.to_owned(), help: bin_help() });
     }
     if is_conflicting_artifact_name(name) {
         if has_bin {
-            bail!(
-                "invalid package name `{name}`: it conflicts with cargo's build directory names{name_help}"
-            );
+            return Err(NewError::ArtifactName { name: name.to_owned(), help: name_help.to_owned() });
         }
         shell.warn(&format!(
             "package `{name}` will not support binary executables with that name, it conflicts with cargo's build directory names"
         ));
     }
     if name == "test" {
-        bail!(
-            "invalid package name `test`: it conflicts with Rust's built-in test library{}",
-            bin_help()
-        );
+        return Err(NewError::TestName { help: bin_help() });
     }
     if ["core", "std", "alloc", "proc_macro", "proc-macro"].contains(&name) {
         shell.warn(&format!(
@@ -298,7 +458,7 @@ fn check_name(
     }
     if is_windows_reserved(name) {
         if cfg!(windows) {
-            bail!("invalid package name `{name}`: it is a reserved Windows filename{name_help}");
+            return Err(NewError::WindowsReserved { name: name.to_owned(), help: name_help.to_owned() });
         }
         shell.warn(&format!(
             "package name `{name}` is a reserved Windows filename\n\
@@ -340,7 +500,7 @@ fn detect_source_paths_and_types(
     path: &Path,
     name: &str,
     detected_files: &mut Vec<SourceFileInformation>,
-) -> anyhow::Result<()> {
+) -> Result<(), NewError> {
     enum H {
         Bin,
         Lib,
@@ -361,9 +521,10 @@ fn detect_source_paths_and_types(
         let bin = match handling {
             H::Bin => true,
             H::Lib => false,
-            H::Detect => std::fs::read_to_string(path.join(&pp))
-                .with_context(|| format!("failed to read `{}`", path.join(&pp).display()))?
-                .contains("fn main"),
+            H::Detect => {
+                let file = path.join(&pp);
+                std::fs::read_to_string(&file).map_err(io_error(Doing::Read, &file))?.contains("fn main")
+            }
         };
         detected_files.push(SourceFileInformation { relative_path: pp, bin });
     }
@@ -374,23 +535,15 @@ fn detect_source_paths_and_types(
     for i in detected_files.iter() {
         if i.bin {
             if let Some(x) = duplicates_checker.get(name) {
-                bail!(
-                    "\
-multiple possible binary sources found:
-  {}
-  {}
-cannot automatically generate Cargo.toml as the main target would be ambiguous",
-                    x.relative_path,
-                    i.relative_path
-                );
+                return Err(NewError::TwoBinaries {
+                    first: x.relative_path.clone(),
+                    second: i.relative_path.clone(),
+                });
             }
             duplicates_checker.insert(name, i);
         } else {
             if let Some(plp) = previous_lib_relpath {
-                bail!(
-                    "cannot have a package with multiple libraries, found both `{plp}` and `{}`",
-                    i.relative_path
-                )
+                return Err(NewError::TwoLibraries { first: plp.to_owned(), second: i.relative_path.clone() });
             }
             previous_lib_relpath = Some(&i.relative_path);
         }
@@ -424,17 +577,13 @@ pub fn new(
     opts: &NewOptions,
     settings: &Settings<'_>,
     shell: &mut impl Shell,
-) -> anyhow::Result<()> {
+) -> Result<(), NewError> {
     let path = &opts.path;
     let name = get_name(path, opts)?;
     shell.status("Creating", &format!("{} `{name}` package", opts.kind));
 
     if path.exists() {
-        bail!(
-            "destination `{}` already exists\n\n\
-             Use `cargo init` to initialize the directory",
-            path.display()
-        )
+        return Err(NewError::Exists { path: path.clone() });
     }
     check_path(path, shell);
     let is_bin = opts.kind.is_bin();
@@ -449,21 +598,22 @@ pub fn new(
         registry: opts.registry.as_deref(),
         bstd: opts.bstd.as_deref(),
     };
-    mk(settings, shell, &mkopts)
-        .with_context(|| format!("failed to create package `{name}` at `{}`", path.display()))
+    mk(settings, shell, &mkopts).map_err(creating(name, path))
+}
+
+/// `error` as what making the package `name` at `path` failed by.
+fn creating<'a>(name: &'a str, path: &'a Path) -> impl FnOnce(NewError) -> NewError + 'a {
+    move |error| NewError::Create { name: name.to_owned(), path: path.to_path_buf(), source: Box::new(error) }
 }
 
 pub fn init(
     opts: &NewOptions,
     settings: &Settings<'_>,
     shell: &mut impl Shell,
-) -> anyhow::Result<NewProjectKind> {
+) -> Result<NewProjectKind, NewError> {
     let path = &opts.path;
     if settings.home.is_some_and(|home| path == home) {
-        bail!(
-            "cannot create package in the home directory\n\n\
-             help: use `cargo init <path>` to create a package in a different directory"
-        )
+        return Err(NewError::InHome);
     }
     let name = get_name(path, opts)?;
     let mut src_paths_types = vec![];
@@ -472,10 +622,7 @@ pub fn init(
     shell.status("Creating", &format!("{} package", opts.kind));
 
     if path.join("Cargo.toml").exists() {
-        bail!(
-            "`cargo init` cannot be run on existing Cargo packages\n\
-             help: use `cargo new` to create a package in a new subdirectory"
-        )
+        return Err(NewError::IsPackage);
     }
     check_path(path, shell);
 
@@ -493,11 +640,10 @@ pub fn init(
         src_paths_types[0].bin = has_bin
     } else if src_paths_types.len() > 1 && !has_bin {
         // Both lib and bin files were found and the user would like both treated as libs.
-        bail!(
-            "cannot have a package with multiple libraries, found both `{}` and `{}`",
-            src_paths_types[0].relative_path,
-            src_paths_types[1].relative_path
-        )
+        return Err(NewError::TwoLibraries {
+            first: src_paths_types[0].relative_path.clone(),
+            second: src_paths_types[1].relative_path.clone(),
+        });
     }
 
     check_name(name, opts.name.is_none(), has_bin, shell)?;
@@ -517,9 +663,7 @@ pub fn init(
             }
         }
         if num_detected_vcses > 1 {
-            bail!(
-                "more than one of .hg, .git, .pijul, .fossil configurations found and the ignore file can't be filled in as a result. specify --vcs to override detection"
-            );
+            return Err(NewError::ManyVcs);
         }
     }
 
@@ -532,8 +676,7 @@ pub fn init(
         registry: opts.registry.as_deref(),
         bstd: opts.bstd.as_deref(),
     };
-    mk(settings, shell, &mkopts)
-        .with_context(|| format!("failed to create package `{name}` at `{}`", path.display()))?;
+    mk(settings, shell, &mkopts).map_err(creating(name, path))?;
     Ok(kind)
 }
 
@@ -570,13 +713,13 @@ impl IgnoreList {
 
     /// What is appended to the ignore file `existing` for `vcs`: the entries it lacks, and
     /// those it has commented out.
-    fn format_existing(&self, existing: &[u8], vcs: VersionControl) -> anyhow::Result<String> {
+    fn format_existing(&self, existing: &[u8], vcs: VersionControl) -> Result<String, NewError> {
         let mut existing_items = Vec::new();
         for (i, line) in existing.split(|it| *it == b'\n').enumerate() {
             let line = line.strip_suffix(b"\r").unwrap_or(line);
             match std::str::from_utf8(line) {
                 Ok(s) => existing_items.push(s.to_owned()),
-                Err(_) => bail!("Character at line {i} is invalid. Cargo only supports UTF-8."),
+                Err(_) => return Err(NewError::IgnoreNotUtf8 { line: i }),
             }
         }
         let ignore_items = self.items(vcs);
@@ -609,7 +752,7 @@ fn write_ignore_file(
     base_path: &Path,
     list: &IgnoreList,
     vcs: VersionControl,
-) -> anyhow::Result<()> {
+) -> Result<(), NewError> {
     // Fossil only supports project-level settings in a dedicated subdirectory.
     if vcs == VersionControl::Fossil {
         create_dir_all(&base_path.join(".fossil-settings"))?;
@@ -628,10 +771,7 @@ fn write_ignore_file(
     for fp_ignore in files {
         let ignore = match std::fs::read(&fp_ignore) {
             Err(err) if err.kind() == ErrorKind::NotFound => list.format_new(vcs),
-            Err(err) => {
-                return Err(anyhow::Error::new(err)
-                    .context(format!("failed to open: {}", fp_ignore.display())));
-            }
+            Err(err) => return Err(io_error(Doing::Open, &fp_ignore)(err)),
             Ok(existing) => list.format_existing(&existing, vcs)?,
         };
         use std::io::Write as _;
@@ -639,16 +779,14 @@ fn write_ignore_file(
             .append(true)
             .create(true)
             .open(&fp_ignore)
-            .with_context(|| format!("failed to open: {}", fp_ignore.display()))?;
-        file.write_all(ignore.as_bytes())
-            .with_context(|| format!("failed to write: {}", fp_ignore.display()))?;
+            .map_err(io_error(Doing::Open, &fp_ignore))?;
+        file.write_all(ignore.as_bytes()).map_err(io_error(Doing::Append, &fp_ignore))?;
     }
     Ok(())
 }
 
-fn create_dir_all(path: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(path)
-        .with_context(|| format!("failed to create directory `{}`", path.display()))
+fn create_dir_all(path: &Path) -> Result<(), NewError> {
+    std::fs::create_dir_all(path).map_err(io_error(Doing::CreateDir, path))
 }
 
 #[expect(clippy::disallowed_methods, reason = "each program is given the directory it runs in")]
@@ -659,13 +797,10 @@ fn command(program: &str, dir: &Path) -> Command {
 }
 
 /// Runs a version control program as cargo runs it, its output shown, failing as cargo fails.
-fn exec(program: &str, cwd: &Path, args: &[&std::ffi::OsStr]) -> anyhow::Result<()> {
-    let status = command(program, cwd)
-        .args(args)
-        .status()
-        .with_context(|| format!("could not execute process `{program}` (never executed)"))?;
+fn exec(program: &'static str, cwd: &Path, args: &[&std::ffi::OsStr]) -> Result<(), NewError> {
+    let status = command(program, cwd).args(args).status().map_err(|error| NewError::Spawn { program, error })?;
     if !status.success() {
-        bail!("process didn't exit successfully: `{program}` ({status})");
+        return Err(NewError::Exited { program, status });
     }
     Ok(())
 }
@@ -708,7 +843,7 @@ fn existing_vcs_repo(path: &Path, cwd: &Path) -> bool {
 }
 
 /// Makes the repository of `vcs` at `path`, unless there is one.
-fn init_vcs(path: &Path, vcs: VersionControl, cwd: &Path) -> anyhow::Result<()> {
+fn init_vcs(path: &Path, vcs: VersionControl, cwd: &Path) -> Result<(), NewError> {
     let os = |it: &Path| it.as_os_str().to_owned();
     match vcs {
         VersionControl::Git => {
@@ -718,13 +853,10 @@ fn init_vcs(path: &Path, vcs: VersionControl, cwd: &Path) -> anyhow::Result<()> 
                     .args(["init", "--quiet"])
                     .stdin(Stdio::null())
                     .output()
-                    .context("could not execute process `git` (never executed)")?;
+                    .map_err(|error| NewError::Spawn { program: "git", error })?;
                 if !done.status.success() {
-                    bail!(
-                        "failed to make a git repository at `{}`: {}",
-                        path.display(),
-                        String::from_utf8_lossy(&done.stderr).trim()
-                    );
+                    let stderr = String::from_utf8_lossy(&done.stderr).trim().to_owned();
+                    return Err(NewError::GitInit { path: path.to_path_buf(), stderr });
                 }
             }
         }
@@ -757,7 +889,7 @@ fn find_root_manifest_for_wd(path: &Path) -> Option<PathBuf> {
     path.ancestors().map(|it| it.join("Cargo.toml")).find(|it| it.exists())
 }
 
-fn mk(settings: &Settings<'_>, shell: &mut impl Shell, opts: &MkOptions<'_>) -> anyhow::Result<()> {
+fn mk(settings: &Settings<'_>, shell: &mut impl Shell, opts: &MkOptions<'_>) -> Result<(), NewError> {
     let path = opts.path;
     let name = opts.name;
 
@@ -777,86 +909,52 @@ fn mk(settings: &Settings<'_>, shell: &mut impl Shell, opts: &MkOptions<'_>) -> 
     write_ignore_file(path, &ignore, vcs)?;
 
     // `Cargo.toml`, with the `[lib]` and `[[bin]]` sections needed.
-    let mut manifest = toml_edit::DocumentMut::new();
-    manifest["package"] = toml_edit::Item::Table(toml_edit::Table::new());
-    manifest["package"]["name"] = toml_edit::value(name);
-    manifest["package"]["version"] = toml_edit::value("0.1.0");
     let edition = opts.edition.unwrap_or(default_edition(opts.bstd.is_some()));
     // A blaze edition's, when the package is of one; a value that is no edition's is the
     // command line's to refuse, and is written as asked, as cargo writes it.
     let blaze = edition::BlazeEdition::from_manifest(edition).ok().flatten();
     if blaze.is_some() && !BSTD_SHIPS && opts.bstd.is_none() {
-        bail!(
-            "a package of the blaze edition `{edition}` needs bstd, which blaze does not ship with \
-             itself yet (docs/v2/plan/design/std.md, row S5d): say where its package is with \
-             `--bstd <PATH>` (crates/blaze-std of blaze's source)"
-        );
+        return Err(NewError::NeedsBstd { edition: edition.to_owned() });
     }
-    manifest["package"]["edition"] = toml_edit::value(edition);
-    if let Some(registry) = opts.registry {
-        let mut array = toml_edit::Array::default();
-        array.push(registry);
-        manifest["package"]["publish"] = toml_edit::value(array);
-    }
-    manifest["dependencies"] = toml_edit::Item::Table(toml_edit::Table::default());
+    let mut manifest = NewManifest::new(name, edition, opts.registry);
     // The crate a blaze edition calls `std`, named until blaze ships it ([`BSTD_SHIPS`]).
     if let (Some(_), Some(bstd)) = (blaze, opts.bstd) {
-        let mut dependency = toml_edit::InlineTable::new();
-        dependency.insert("package", "blaze-std".into());
-        dependency.insert("path", bstd.into());
-        manifest["dependencies"][edition::BlazeEdition::STD] = toml_edit::value(dependency);
+        manifest.std = Some(bstd);
     }
 
     for i in &opts.source_files {
         if i.bin {
             if i.relative_path != "src/main.rs" {
-                let mut bin = toml_edit::Table::new();
-                bin["name"] = toml_edit::value(name);
-                bin["path"] = toml_edit::value(i.relative_path.clone());
-                manifest["bin"]
-                    .or_insert(toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()))
-                    .as_array_of_tables_mut()
-                    .expect("bin is an array of tables")
-                    .push(bin);
+                manifest.bins.push(i.relative_path.as_str());
             }
         } else if i.relative_path != "src/lib.rs" {
-            let mut lib = toml_edit::Table::new();
-            lib["path"] = toml_edit::value(i.relative_path.clone());
-            manifest["lib"] = toml_edit::Item::Table(lib);
+            manifest.lib = Some(i.relative_path.as_str());
         }
     }
 
     let manifest_path = blaze_manifest::paths::normalize_path(&path.join("Cargo.toml"));
     if let Some(root_manifest_path) = find_root_manifest_for_wd(&manifest_path) {
-        let root_manifest = std::fs::read_to_string(&root_manifest_path)
-            .with_context(|| format!("failed to read `{}`", root_manifest_path.display()))?;
+        let root_manifest =
+            std::fs::read_to_string(&root_manifest_path).map_err(io_error(Doing::Read, &root_manifest_path))?;
         // The root manifest may not be valid; inheriting its workspace's keys is a best effort
-        // that blocks nothing.
-        if let Ok(mut workspace_document) = root_manifest.parse::<toml_edit::DocumentMut>() {
+        // that blocks nothing, and `check_workspace` below says why it does not read.
+        if let Ok(workspace_document) = Document::parse_in(&root_manifest, Limits::CARGO, Global) {
             let display_path = get_display_path(&root_manifest_path, path)?;
+            let workspace = workspace_document.root().get("workspace");
             let can_be_a_member = can_be_workspace_member(&display_path, &workspace_document)?;
             if can_be_a_member {
-                if let Some(workspace_package_keys) = workspace_document
-                    .get("workspace")
+                // toml_edit's `as_table`: a `[workspace.package]` or dotted table, not an
+                // inline one.
+                if let Some(workspace_package_keys) = workspace
                     .and_then(|workspace| workspace.get("package"))
-                    .and_then(|package| package.as_table())
+                    .filter(|package| package.is_table() && package.origin() != Origin::Inline)
                 {
-                    inherit_workspace_package_keys(opts, &mut manifest, workspace_package_keys)
+                    manifest.inherit(opts, workspace_package_keys);
                 }
-                if workspace_document
-                    .get("workspace")
-                    .and_then(|workspace| workspace.get("lints"))
-                    .is_some()
-                {
-                    let mut table = toml_edit::Table::new();
-                    table["workspace"] = toml_edit::value(true);
-                    manifest["lints"] = toml_edit::Item::Table(table);
+                if workspace.and_then(|workspace| workspace.get("lints")).is_some() {
+                    manifest.lints = true;
                 }
-                if update_manifest_with_new_member(
-                    &root_manifest_path,
-                    &mut workspace_document,
-                    &display_path,
-                )? {
+                if update_manifest_with_new_member(&root_manifest_path, &workspace_document, &display_path)? {
                     let member = Path::new(&display_path).file_name().and_then(|it| it.to_str());
                     let root = root_manifest_path.parent().unwrap_or(Path::new(""));
                     shell.status(
@@ -872,8 +970,7 @@ fn mk(settings: &Settings<'_>, shell: &mut impl Shell, opts: &MkOptions<'_>) -> 
         }
     }
 
-    std::fs::write(&manifest_path, manifest.to_string())
-        .with_context(|| format!("failed to write `{}`", manifest_path.display()))?;
+    std::fs::write(&manifest_path, manifest.text().as_str()).map_err(io_error(Doing::Write, &manifest_path))?;
 
     // The source files, with their directories, unless they are there.
     for i in &opts.source_files {
@@ -912,7 +1009,7 @@ mod tests {
         };
         if !path_of_source_file.is_file() {
             std::fs::write(&path_of_source_file, default_file_content)
-                .with_context(|| format!("failed to write `{}`", path_of_source_file.display()))?;
+                .map_err(io_error(Doing::Write, &path_of_source_file))?;
         }
     }
 
@@ -929,114 +1026,199 @@ mod tests {
     Ok(())
 }
 
-/// Has the new manifest inherit each key of the workspace's `[workspace.package]`, but an
-/// edition or registry the command line names.
-fn inherit_workspace_package_keys(
-    opts: &MkOptions<'_>,
-    manifest: &mut toml_edit::DocumentMut,
-    workspace_package_keys: &toml_edit::Table,
-) {
-    for (key, _) in workspace_package_keys {
-        if key == "edition" && opts.edition.is_some() {
-            continue;
+/// The new package's manifest, laid out as cargo's toml_edit lays out the new document it
+/// builds: `[package]`'s keys in the order they are set (a key inherited from the workspace
+/// taken out and put last, as `key.workspace = true`), then `[dependencies]`, each `[[bin]]`,
+/// `[lib]` and `[lints]`, a blank line before every header after the first.
+struct NewManifest<'a> {
+    name: &'a str,
+    /// Each key of `[package]`, with its value or, inherited, none.
+    package: Vec<(String, Option<PackageValue<'a>>)>,
+    /// Where bstd's package is, for the `std` dependency of a blaze edition.
+    std: Option<&'a str>,
+    /// The path of each `[[bin]]`, named as the package is.
+    bins: Vec<&'a str>,
+    lib: Option<&'a str>,
+    /// `[lints] workspace = true`.
+    lints: bool,
+}
+
+/// A value of the new `[package]`.
+enum PackageValue<'a> {
+    Text(&'a str),
+    /// `publish = ["<registry>"]`.
+    Registry(&'a str),
+}
+
+impl<'a> NewManifest<'a> {
+    fn new(name: &'a str, edition: &'a str, registry: Option<&'a str>) -> NewManifest<'a> {
+        let mut package = vec![
+            ("name".to_owned(), Some(PackageValue::Text(name))),
+            ("version".to_owned(), Some(PackageValue::Text("0.1.0"))),
+            ("edition".to_owned(), Some(PackageValue::Text(edition))),
+        ];
+        if let Some(registry) = registry {
+            package.push(("publish".to_owned(), Some(PackageValue::Registry(registry))));
         }
-        if key == "publish" && opts.registry.is_some() {
-            continue;
-        }
-        let package = manifest["package"].as_table_mut().expect("package is a table");
-        package.remove(key);
-        let mut table = toml_edit::Table::new();
-        table.set_dotted(true);
-        table["workspace"] = toml_edit::value(true);
-        package.insert(key, toml_edit::Item::Table(table));
+        NewManifest { name, package, std: None, bins: Vec::new(), lib: None, lints: false }
     }
+
+    /// Each key of the workspace's `[workspace.package]` inherited, but an edition or registry
+    /// the command line names.
+    fn inherit(&mut self, opts: &MkOptions<'_>, workspace_package_keys: Item<'_, '_, Global>) {
+        for key in workspace_package_keys.children().map(|it| it.key()) {
+            if key == "edition" && opts.edition.is_some() {
+                continue;
+            }
+            if key == "publish" && opts.registry.is_some() {
+                continue;
+            }
+            self.package.retain(|(it, _)| it != key);
+            self.package.push((key.to_owned(), None));
+        }
+    }
+
+    fn text(&self) -> blaze_own::String<Global> {
+        let mut out = blaze_own::String::new_in(Global);
+        out.push_str("[package]\n");
+        for (key, value) in &self.package {
+            blaze_toml::write_key(key, &mut out);
+            match value {
+                Some(PackageValue::Text(text)) => {
+                    out.push_str(" = ");
+                    write_string(text, &mut out);
+                }
+                Some(PackageValue::Registry(registry)) => {
+                    out.push_str(" = [");
+                    write_string(registry, &mut out);
+                    out.push(']');
+                }
+                None => out.push_str(".workspace = true"),
+            }
+            out.push('\n');
+        }
+        out.push_str("\n[dependencies]\n");
+        if let Some(bstd) = self.std {
+            blaze_toml::write_key(edition::BlazeEdition::STD, &mut out);
+            out.push_str(" = { package = ");
+            write_string("blaze-std", &mut out);
+            out.push_str(", path = ");
+            write_string(bstd, &mut out);
+            out.push_str(" }\n");
+        }
+        for path in &self.bins {
+            out.push_str("\n[[bin]]\nname = ");
+            write_string(self.name, &mut out);
+            out.push_str("\npath = ");
+            write_string(path, &mut out);
+            out.push('\n');
+        }
+        if let Some(path) = self.lib {
+            out.push_str("\n[lib]\npath = ");
+            write_string(path, &mut out);
+            out.push('\n');
+        }
+        if self.lints {
+            out.push_str("\n[lints]\nworkspace = true\n");
+        }
+        out
+    }
+}
+
+fn text_value(text: &str) -> Value<Global> {
+    Value::Text(blaze_own::String::from_str_in(text, Global))
+}
+
+/// The text of `item` as `doc` writes it, for a message.
+fn written(doc: &Document<'_, Global>, item: Item<'_, '_, Global>) -> String {
+    doc.text()[item.span()].to_owned()
 }
 
 /// Adds the new package to `[workspace.members]`, unless a pattern there matches it already;
 /// with no `members`, makes them. Whether the root manifest was written.
 fn update_manifest_with_new_member(
     root_manifest_path: &Path,
-    workspace_document: &mut toml_edit::DocumentMut,
+    workspace_document: &Document<'_, Global>,
     display_path: &str,
-) -> anyhow::Result<bool> {
-    let Some(workspace) = workspace_document.get_mut("workspace") else {
+) -> Result<bool, NewError> {
+    let Some(workspace) = workspace_document.root().get("workspace") else {
         return Ok(false);
     };
-    if let Some(members) = workspace.get_mut("members").and_then(|members| members.as_array_mut()) {
-        for member in members.iter() {
-            let pat =
-                member.as_str().with_context(|| format!("invalid non-string member `{member}`"))?;
-            let pattern = glob::Pattern::new(pat)
-                .with_context(|| format!("cannot build glob pattern from `{pat}`"))?;
-            if pattern.matches(display_path) {
-                return Ok(false);
+    let edit_error = |error| NewError::Edit { path: root_manifest_path.to_path_buf(), error };
+    let mut edit = blaze_toml::Edit::new_in(workspace_document, Global);
+    // toml_edit's `as_array_mut`: an array written `[ ]`, not one of tables.
+    match workspace.get("members").filter(|members| members.is_array() && members.origin() == Origin::Value) {
+        Some(members) => {
+            let mut pats = Vec::with_capacity(members.len());
+            for member in members.children() {
+                let Some(pat) = member.as_str() else {
+                    return Err(NewError::NotAString { exclude: false, written: written(workspace_document, member) });
+                };
+                let pattern = blaze_glob::Pattern::new(pat)
+                    .map_err(|error| NewError::Pattern { pattern: pat.to_owned(), error })?;
+                if pattern.matches(display_path) {
+                    return Ok(false);
+                }
+                pats.push(pat);
             }
+            // cargo pushes and then sorts a sorted list, stably: the new member goes after every
+            // member not above it.
+            let index = match pats.is_sorted() {
+                true => pats.iter().position(|it| *it > display_path).unwrap_or(pats.len()),
+                false => pats.len(),
+            };
+            edit.insert(members, index, &text_value(display_path)).map_err(edit_error)?;
         }
-        let was_sorted = members.iter().map(Value::as_str).is_sorted();
-        members.push(display_path);
-        if was_sorted {
-            members.sort_by(|lhs, rhs| lhs.as_str().cmp(&rhs.as_str()));
+        None => {
+            let mut list = blaze_own::Vec::with_capacity_in(1, Global);
+            list.push(text_value(display_path));
+            edit.set(workspace, "members", &Value::List(list)).map_err(edit_error)?;
         }
-    } else {
-        let mut array = Array::new();
-        array.push(display_path);
-        workspace["members"] = toml_edit::value(array);
     }
-    write_atomic(root_manifest_path, workspace_document.to_string().as_bytes())?;
+    let text = edit.finish().map_err(edit_error)?;
+    write_atomic(root_manifest_path, text.as_str().as_bytes())?;
     Ok(true)
 }
 
 /// Writes `contents` to `path` by a file beside it renamed over it.
-fn write_atomic(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), NewError> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let temp = dir.join(format!(".{}.blaze-new", std::process::id()));
-    std::fs::write(&temp, contents)
-        .with_context(|| format!("failed to write `{}`", temp.display()))?;
-    if let Ok(meta) = std::fs::metadata(path) {
-        let _ = std::fs::set_permissions(&temp, meta.permissions());
-    }
-    std::fs::rename(&temp, path).with_context(|| format!("failed to write `{}`", path.display()))
+    std::fs::write(&temp, contents).map_err(io_error(Doing::Write, &temp))?;
+    let meta = std::fs::metadata(path).map_err(io_error(Doing::Read, path))?;
+    std::fs::set_permissions(&temp, meta.permissions()).map_err(io_error(Doing::Write, &temp))?;
+    std::fs::rename(&temp, path).map_err(io_error(Doing::Write, path))
 }
 
 /// The package's path relative to the workspace root, by `/`.
-fn get_display_path(root_manifest_path: &Path, package_path: &Path) -> anyhow::Result<String> {
-    let workspace_root = root_manifest_path.parent().with_context(|| {
-        format!(
-            "workspace root manifest doesn't have a parent directory `{}`",
-            root_manifest_path.display()
-        )
-    })?;
-    let relpath = pathdiff::diff_paths(package_path, workspace_root).with_context(|| {
-        format!(
-            "path comparison requires two absolute paths; package_path: `{}`, workspace_path: `{}`",
-            package_path.display(),
-            workspace_root.display()
-        )
+fn get_display_path(root_manifest_path: &Path, package_path: &Path) -> Result<String, NewError> {
+    let workspace_root =
+        root_manifest_path.parent().ok_or_else(|| NewError::NoParent { path: root_manifest_path.to_path_buf() })?;
+    let relpath = pathdiff::diff_paths(package_path, workspace_root).ok_or_else(|| NewError::NotRelative {
+        package: package_path.to_path_buf(),
+        workspace: workspace_root.to_path_buf(),
     })?;
     let mut components = Vec::new();
     for comp in relpath.iter() {
-        let comp = comp.to_str().with_context(|| {
-            format!("invalid unicode component in path `{}`", relpath.display())
-        })?;
+        let comp = comp.to_str().ok_or_else(|| NewError::NonUnicodePath { path: relpath.clone() })?;
         components.push(comp);
     }
     Ok(components.join("/"))
 }
 
 /// Whether `[workspace.exclude]` leaves the package out.
-fn can_be_workspace_member(
-    display_path: &str,
-    workspace_document: &toml_edit::DocumentMut,
-) -> anyhow::Result<bool> {
+fn can_be_workspace_member(display_path: &str, workspace_document: &Document<'_, Global>) -> Result<bool, NewError> {
+    // toml_edit's `as_array`: an array written `[ ]`, not one of tables.
     if let Some(exclude) = workspace_document
+        .root()
         .get("workspace")
         .and_then(|workspace| workspace.get("exclude"))
-        .and_then(|exclude| exclude.as_array())
+        .filter(|exclude| exclude.is_array() && exclude.origin() == Origin::Value)
     {
-        for member in exclude {
-            let pat = member
-                .as_str()
-                .with_context(|| format!("invalid non-string exclude path `{member}`"))?;
+        for member in exclude.children() {
+            let Some(pat) = member.as_str() else {
+                return Err(NewError::NotAString { exclude: true, written: written(workspace_document, member) });
+            };
             if pat == display_path {
                 return Ok(false);
             }

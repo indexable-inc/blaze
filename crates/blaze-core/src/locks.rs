@@ -15,7 +15,7 @@ use std::{
     path::Path,
 };
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 
 use crate::{Done, FileName, IoError, LockMode, Tag, fs};
 
@@ -27,7 +27,7 @@ pub(crate) fn failed(error: &io::Error) -> Done {
 
 /// The locks a driver holds, each by the tag of the [`crate::Effect::Lock`] that took it.
 pub(crate) struct Locks {
-    held: HashMap<Tag, File, Global>,
+    held: Map<Tag, File, FixedState, Global>,
 }
 
 impl Drop for Locks {
@@ -44,7 +44,7 @@ impl Drop for Locks {
 impl Locks {
     pub(crate) fn new() -> Locks {
         // alloc: none until the first lock; then a few entries, for the driver's life.
-        Locks { held: HashMap::new_in(Global) }
+        Locks { held: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }) }
     }
 
     /// The lock of `file` under `root` taken in `mode` without waiting, kept under `tag`:

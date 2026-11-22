@@ -1,0 +1,14 @@
+{
+ "id": "body-env-no-environment",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane MY",
+ "where": "crates/blaze-cli/src/run_names.rs names_records (JobTexts env: None) for body jobs; crates/blaze-cli/src/body_types.rs prepare",
+ "what": "clap-root's derive(Parser) bodies call `::core::env!(\"CARGO_PKG_NAME\")`/`(\"CARGO_PKG_VERSION\")`; check printed 'lowering refused (Lowered: Macro Failed(Expand(Host(HostError Env, ..'. The names were in the crate's table; the body job's texts simply had no environment, by design comment ('None (a body job's): every env! .. refused'), because a body job reads the crate list record and makes no world, and the list carried no environment.",
+ "cost": "about twenty minutes to find: the refusal said `HostError Env` and not which variable or why (no environment at all vs an unknown name)",
+ "cause": "the crate list (the world-free reader's one source) carried no environment facts, so the body host's one home (CrateEnv) could not be made in a body job",
+ "class": "a fact the world has and the world-free record lacks: every world-free reader silently loses it and refuses",
+ "prevention": "done: the list carries each crate's EnvFacts (CrateEnv::facts, version 3) and `differences` compares them, so a world fact missing from the list counts as a difference in the list's round-trip test",
+ "annoyance": "HostError is Copy and carries no name, so a refused env! cannot say which variable; the printed note says only `HostError Env`",
+ "workaround": "read the expansion's text by hand",
+ "state": "fixed (the env); open (naming the variable in the refusal)"
+}

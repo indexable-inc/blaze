@@ -1,0 +1,10 @@
+{
+  "date": "2026-11-20",
+  "model": "claude-opus-5-5",
+  "lane": "W1 group c (blaze-launch fork)",
+  "area": "blaze-own Vec as a drop-in for alloc's Vec; ast-grep field patterns",
+  "annoyance": "Moving a table from `alloc::vec::Vec<T, A>` to `blaze_own::Vec<T, A>` looks like a type swap, but blaze-own's `remove`, `swap_remove`, `insert`, `contains` and `position` are `#[deprecated]` (renamed `remove_shift`, `remove_swap`, `insert_shift`, `scan_for`), so the swap turns into warnings the gate denies, and `Default` is missing for a non-global allocator, so every `core::mem::take(&mut vec)` must become `mem::replace(.., Vec::new_in(alloc))`. Separately, `ast-grep run -p '$R.why' -r '$R.why()'` (a field read to a method call) matched nothing and printed nothing, not `Applied 0 changes`: a silent no-op looks like success.",
+  "workaround": "grep the moved tables' method names against `#[deprecated` in blaze-own/src/vec.rs and rename them with ast-grep (`$V.swap_remove($I)` -> `$V.remove_swap($I)`); edit field-to-method sites by hand and grep that the new form is there.",
+  "fix": "A blaze lint with a fix for each deprecated blaze-own name (rule 13), and a short migration table at the top of blaze-own/src/vec.rs naming the alloc Vec methods that differ.",
+  "state": "open"
+}

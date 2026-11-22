@@ -1,0 +1,32 @@
+[package]
+name = "blaze-cert"
+description = "A trait goal's check result as a checkable certificate (docs/v2/plan/design/certificates.md): the derivation as rows in columns, read in place with every limit checked, a checker that proves it by matching only (no inference, no search), and the questions the solver's choice rested on, so a moved content read costs one linear check and a fetched certificate is checked, not believed"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# blaze's own crates only.
+[dependencies]
+# `Vec` and `Alloc`: every column and scratch table, in the allocator the caller names.
+blaze-own.workspace = true
+# The solver's vocabulary (terms, predicates, canonical words), its `Facts` and the recorder
+# `Ask` every read goes through, and its portable import (`fold`).
+blaze-solve.workspace = true
+# `idx`, `len32`: integer conversions in place of `as`.
+blaze-int.workspace = true
+
+[dev-dependencies]
+blaze-own = { workspace = true, features = ["std", "testing"] }
+# The test language and its in-memory world: the goals the differential test solves and checks.
+blaze-solve = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

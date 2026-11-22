@@ -17,15 +17,11 @@
 use std::alloc::Global;
 use std::fmt;
 
+use blaze_script::regex;
+
 use blaze_hash::{HashMap, HashSet};
 
-use snafu::ResultExt as _;
-
-use crate::error::{
-    ArityMismatchSnafu, BuiltinAritySnafu, DslSnafu, Error, LintSeveritySnafu, LintVarSnafu,
-    RegexSnafu, TemplateVarSnafu, UnboundBuiltinArgSnafu, UnboundHeadVarSnafu,
-    UnboundSourceArgSnafu, UnknownRelationSnafu, UnsafeNegationSnafu, UnstratifiableProgramSnafu,
-};
+use crate::error::Error;
 use crate::sexpr::{self, Sexpr};
 
 /// What a fact source adds to the language: its atoms, its actions and its template syntax.
@@ -146,11 +142,12 @@ pub(crate) const CASES: &[&str] = &["snake", "camel", "pascal", "upper-snake", "
 /// The builtins whose arity is a least: `text-capture` binds one variable per capture group.
 const VARIADIC: &[&str] = &["text-capture"];
 
-/// The most bytes one compiled regex may take, its lazy DFA's cache included. The `regex` crate
-/// matches in time linear in the text; this bounds the memory a rules file's pattern takes.
-pub(crate) const MAX_REGEX_BYTES: usize = 1 << 20;
+/// The most instructions one compiled regex may have. The matcher (`blaze_script::regex`) runs
+/// in time linear in the text and holds a thread per instruction; this bounds the memory a rules
+/// file's pattern takes.
+pub(crate) const MAX_REGEX_INSTRUCTIONS: usize = 1 << 14;
 
-/// `pattern` compiled within [`MAX_REGEX_BYTES`].
+/// `pattern` compiled within [`MAX_REGEX_INSTRUCTIONS`].
 ///
 /// # Errors
 ///
@@ -161,11 +158,13 @@ fn compile_regex<S: std::error::Error + 'static>(
     pattern: &str,
     line: usize,
 ) -> Result<regex::Regex, Error<S>> {
-    regex::RegexBuilder::new(pattern)
-        .size_limit(MAX_REGEX_BYTES)
-        .dfa_size_limit(MAX_REGEX_BYTES)
-        .build()
-        .context(RegexSnafu { line, name: name.to_owned(), pattern: pattern.to_owned() })
+    regex::Regex::with_limit(pattern, MAX_REGEX_INSTRUCTIONS)
+        .map_err(|source| Error::Regex {
+            line,
+            name: name.to_owned(),
+            pattern: pattern.to_owned(),
+            source,
+        })
 }
 
 #[derive(Debug)]
@@ -330,13 +329,12 @@ impl<L: Language> Program<L> {
                 "rewrite" => rewrites.push(parse_rewrite::<L>(items, form.line())?),
                 "lint" => lints.push(parse_lint::<L>(items, form.line())?),
                 other => {
-                    return DslSnafu {
+                    return Err(Error::Dsl {
                         line: form.line(),
                         message: format!(
                             "expected (rule ...), (rewrite ...), or (lint ...), got `{other}`"
                         ),
-                    }
-                    .fail();
+                    });
                 }
             }
         }
@@ -359,27 +357,25 @@ impl<L: Language> Program<L> {
         let arities = self.arities();
         for rule in &self.rules {
             if builtin(&rule.name).is_some() || L::claims(&rule.name) || is_form(&rule.name) {
-                return DslSnafu {
+                return Err(Error::Dsl {
                     line: rule.line,
                     message: format!("rule head `{}` shadows a builtin", rule.name),
-                }
-                .fail();
+                });
             }
             let expected = arities.get(rule.name.as_str()).copied();
             if expected != Some(rule.head_vars.len()) {
-                return ArityMismatchSnafu {
+                return Err(Error::ArityMismatch {
                     name: rule.name.clone(),
                     expected: expected.unwrap_or(rule.head_vars.len()),
                     got: rule.head_vars.len(),
                     line: rule.line,
-                }
-                .fail();
+                });
             }
             check_atoms(&rule.body, &arities)?;
             let bound = check_modes(&rule.body)?;
             for var in &rule.head_vars {
                 if !bound.contains(var.as_str()) {
-                    return UnboundHeadVarSnafu { line: rule.line, var: var.clone() }.fail();
+                    return Err(Error::UnboundHeadVar { line: rule.line, var: var.clone() });
                 }
             }
         }
@@ -428,7 +424,7 @@ impl<L: Language> Program<L> {
                 Some(name) if pass == passes => {
                     let line = self.rules.iter().find(|r| r.name == name).map_or(0, |r| r.line);
                     let cycle = negative_cycle(&edges).join(", ");
-                    return UnstratifiableProgramSnafu { cycle, line }.fail();
+                    return Err(Error::UnstratifiableProgram { cycle, line });
                 }
                 Some(_) => {}
             }
@@ -469,19 +465,18 @@ impl<L: Language> Program<L> {
     /// head variables.
     fn check_lint(&self, lint: &Lint) -> Result<(), LError<L>> {
         let Some(rule) = self.rules.iter().find(|rule| rule.name == lint.relation) else {
-            return UnknownRelationSnafu { name: lint.relation.clone(), line: lint.line }.fail();
+            return Err(Error::UnknownRelation { name: lint.relation.clone(), line: lint.line });
         };
         for segment in &lint.message.segments {
             let Segment::Var(var) = segment else {
                 continue;
             };
             if !rule.head_vars.contains(var) {
-                return LintVarSnafu {
+                return Err(Error::LintVar {
                     relation: lint.relation.clone(),
                     var: var.clone(),
                     line: lint.message.line,
-                }
-                .fail();
+                });
             }
         }
         Ok(())
@@ -546,7 +541,7 @@ fn check_atoms<A, S: std::error::Error + 'static>(
                     continue;
                 }
                 let expected = *arities.get(app.name.as_str()).ok_or_else(|| {
-                    UnknownRelationSnafu { name: app.name.clone(), line: app.line }.build()
+                    Error::UnknownRelation { name: app.name.clone(), line: app.line }
                 })?;
                 check_arity(app, expected, false)?;
                 continue;
@@ -561,14 +556,13 @@ fn check_atoms<A, S: std::error::Error + 'static>(
         // A counted atom must name a defined relation (not a builtin: builtins are filters,
         // not finite relations to scan) with matching arity.
         if builtin(&relation.name).is_some() {
-            return DslSnafu {
+            return Err(Error::Dsl {
                 line: relation.line,
                 message: format!("{filter} cannot read the builtin `{}`", relation.name),
-            }
-            .fail();
+            });
         }
         let expected = *arities.get(relation.name.as_str()).ok_or_else(|| {
-            UnknownRelationSnafu { name: relation.name.clone(), line: relation.line }.build()
+            Error::UnknownRelation { name: relation.name.clone(), line: relation.line }
         })?;
         check_arity(relation, expected, false)?;
     }
@@ -579,7 +573,7 @@ fn check_atoms<A, S: std::error::Error + 'static>(
 /// compiled at load (a variable pattern would make what matches depend on corpus text, which no
 /// rule needs), and `text-capture` binds exactly one variable per capture group.
 fn check_builtin<S: std::error::Error + 'static>(app: &AppAtom, arity: usize) -> Result<(), Error<S>> {
-    let dsl = |message: String| DslSnafu { line: app.line, message }.fail();
+    let dsl = |message: String| Err(Error::Dsl { line: app.line, message });
     if VARIADIC.contains(&app.name.as_str()) {
         if app.args.len() < arity {
             return dsl(format!(
@@ -687,16 +681,14 @@ fn check_arity<S: std::error::Error + 'static>(
         return Ok(());
     }
     if builtin {
-        return BuiltinAritySnafu {
+        return Err(Error::BuiltinArity {
             name: app.name.clone(),
             expected,
             got: app.args.len(),
             line: app.line,
-        }
-        .fail();
+        });
     }
-    ArityMismatchSnafu { name: app.name.clone(), expected, got: app.args.len(), line: app.line }
-        .fail()
+    Err(Error::ArityMismatch { name: app.name.clone(), expected, got: app.args.len(), line: app.line })
 }
 
 /// The variables a body binds, checking left to right that every argument an atom needs is bound
@@ -724,12 +716,11 @@ pub(crate) fn check_modes<A, S: std::error::Error + 'static>(
                         if let Term::Var(var) = &app.args[need]
                             && !bound.contains(var.as_str())
                         {
-                            return UnboundBuiltinArgSnafu {
+                            return Err(Error::UnboundBuiltinArg {
                                 line: app.line,
                                 name: app.name.clone(),
                                 arg: var.clone(),
-                            }
-                            .fail();
+                            });
                         }
                     }
                 }
@@ -755,27 +746,25 @@ pub(crate) fn check_modes<A, S: std::error::Error + 'static>(
                         } else {
                             "`, `"
                         });
-                    return UnboundSourceArgSnafu {
+                    return Err(Error::UnboundSourceArg {
                         line: source.line,
                         name: source.name.clone(),
                         arg,
-                    }
-                    .fail();
+                    });
                 }
                 bound.extend(vars(&source.args));
             }
             BodyAtom::Negation(neg) => {
                 for var in vars(&neg.args) {
                     if !bound.contains(var) {
-                        return UnsafeNegationSnafu { var: var.to_owned(), line: neg.line }.fail();
+                        return Err(Error::UnsafeNegation { var: var.to_owned(), line: neg.line });
                     }
                 }
             }
             BodyAtom::NegatedSource(source) => {
                 for var in vars(&source.args) {
                     if !bound.contains(var) {
-                        return UnsafeNegationSnafu { var: var.to_owned(), line: source.line }
-                            .fail();
+                        return Err(Error::UnsafeNegation { var: var.to_owned(), line: source.line });
                     }
                 }
             }
@@ -784,13 +773,12 @@ pub(crate) fn check_modes<A, S: std::error::Error + 'static>(
                 // would read as a join with nothing it can join.
                 for var in vars(&count.inner.args) {
                     if !bound.contains(var) && mentioned(&body[at + 1..], var) {
-                        return DslSnafu {
+                        return Err(Error::Dsl {
                             line: count.line,
                             message: format!(
                                 "`{var}` is local to the (count ...) and cannot be used after it"
                             ),
-                        }
-                        .fail();
+                        });
                     }
                 }
                 if let Term::Var(var) = &count.result {
@@ -798,14 +786,13 @@ pub(crate) fn check_modes<A, S: std::error::Error + 'static>(
                     // column is local to the count and unset once the rows are counted, so the
                     // result has nothing to equal and the rule derives nothing.
                     if !bound.contains(var.as_str()) && vars(&count.inner.args).any(|it| it == var) {
-                        return DslSnafu {
+                        return Err(Error::Dsl {
                             line: count.line,
                             message: format!(
                                 "`{var}` is the (count ...)'s result and an argument it counts over; \
                                  name the counted column apart"
                             ),
-                        }
-                        .fail();
+                        });
                     }
                     bound.insert(var);
                 }
@@ -864,7 +851,7 @@ fn check_action<X, S: std::error::Error + 'static>(
     }
     for var in used {
         if !bound.contains(var) {
-            return TemplateVarSnafu { var: var.to_owned(), line }.fail();
+            return Err(Error::TemplateVar { var: var.to_owned(), line });
         }
     }
     Ok(())
@@ -875,28 +862,27 @@ fn expect_list<'a, S: std::error::Error + 'static>(
     what: &str,
 ) -> Result<ListForm<'a>, Error<S>> {
     let Sexpr::List { items, line } = form else {
-        return DslSnafu { line: form.line(), message: format!("{what} must be a list") }.fail();
+        return Err(Error::Dsl { line: form.line(), message: format!("{what} must be a list") });
     };
     let Some((Sexpr::Atom { text, .. }, rest)) = items.split_first() else {
-        return DslSnafu { line: *line, message: format!("{what} must start with an atom") }.fail();
+        return Err(Error::Dsl { line: *line, message: format!("{what} must start with an atom") });
     };
     Ok((text, rest))
 }
 
 fn parse_rule<L: Language>(items: &[Sexpr], line: usize) -> Result<Rule<L::Atom>, LError<L>> {
     let Some((head, body)) = items.split_first() else {
-        return DslSnafu { line, message: "(rule ...) needs a head".to_owned() }.fail();
+        return Err(Error::Dsl { line, message: "(rule ...) needs a head".to_owned() });
     };
     let (name, head_args) = expect_list(head, "rule head")?;
     let head_vars = head_args
         .iter()
         .map(|arg| match arg {
             Sexpr::Atom { text, .. } if parse_int(text).is_none() => Ok(text.clone()),
-            other => DslSnafu {
+            other => Err(Error::Dsl {
                 line: other.line(),
                 message: "rule head arguments must be variables".to_owned(),
-            }
-            .fail(),
+            }),
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Rule { name: name.to_owned(), head_vars, body: parse_body::<L>(body)?, line })
@@ -907,7 +893,7 @@ fn parse_rewrite<L: Language>(
     line: usize,
 ) -> Result<Rewrite<L::Atom, L::Action>, LError<L>> {
     let Some((Sexpr::Atom { text: name, .. }, rest)) = items.split_first() else {
-        return DslSnafu { line, message: "(rewrite ...) needs a name".to_owned() }.fail();
+        return Err(Error::Dsl { line, message: "(rewrite ...) needs a name".to_owned() });
     };
     // The trailing forms that are actions; everything before them is the body.
     let mut actions = Vec::new();
@@ -920,14 +906,13 @@ fn parse_rewrite<L: Language>(
         body_end -= 1;
     }
     if actions.is_empty() {
-        return DslSnafu {
+        return Err(Error::Dsl {
             line,
             message: "(rewrite ...) needs a final action: (replace var \"template\"), \
                       (delete var), (insert-before var \"template\") or (insert-after var \
                       \"template\")"
                 .to_owned(),
-        }
-        .fail();
+        });
     }
     actions.reverse();
     Ok(Rewrite { name: name.clone(), body: parse_body::<L>(&rest[..body_end])?, actions, line })
@@ -963,11 +948,10 @@ fn parse_action<L: Language>(form: &Sexpr) -> Result<Option<Action<L::Action>>, 
         ) => (target, parse_template::<L::Error>(L::TEMPLATE, template, *line)?),
         _ => {
             let shape = if kind == TextKind::Delete { "var" } else { "var \"template\"" };
-            return DslSnafu {
+            return Err(Error::Dsl {
                 line: form.line(),
                 message: format!("{head} form is ({head} {shape})"),
-            }
-            .fail();
+            });
         }
     };
     Ok(Some(Action::Text(TextAction { kind, target: target.clone(), template, line: form.line() })))
@@ -980,17 +964,16 @@ fn parse_lint<L: Language>(items: &[Sexpr], line: usize) -> Result<Lint, LError<
         Sexpr::Str { text: message, line: message_line },
     ] = items
     else {
-        return DslSnafu {
+        return Err(Error::Dsl {
             line,
             message: "lint form is (lint <relation> <error|warning> \"message\")".to_owned(),
-        }
-        .fail();
+        });
     };
     let severity = match severity.as_str() {
         "error" => Severity::Error,
         "warning" => Severity::Warning,
         other => {
-            return LintSeveritySnafu { got: other.to_owned(), line: *severity_line }.fail();
+            return Err(Error::LintSeverity { got: other.to_owned(), line: *severity_line });
         }
     };
     Ok(Lint {
@@ -1009,41 +992,36 @@ fn parse_body_atom<L: Language>(form: &Sexpr) -> Result<BodyAtom<L::Atom>, LErro
     let (name, args) = expect_list(form, "body atom")?;
     if name == "not" {
         let [inner] = args else {
-            return DslSnafu {
+            return Err(Error::Dsl {
                 line: form.line(),
                 message: "not form is (not (<relation> args...))".to_owned(),
-            }
-            .fail();
+            });
         };
         return match parse_body_atom::<L>(inner)? {
             BodyAtom::App(app) => Ok(BodyAtom::Negation(app)),
             BodyAtom::Source(source) => Ok(BodyAtom::NegatedSource(source)),
-            _ => DslSnafu {
+            _ => Err(Error::Dsl {
                 line: form.line(),
                 message: "(not ...) may only negate a relation or a source atom".to_owned(),
-            }
-            .fail(),
+            }),
         };
     }
     if name == "count" {
         let [result, inner] = args else {
-            return DslSnafu {
+            return Err(Error::Dsl {
                 line: form.line(),
                 message: "count form is (count <var> (<relation> args...))".to_owned(),
-            }
-            .fail();
+            });
         };
         let BodyAtom::App(app) = parse_body_atom::<L>(inner)? else {
-            return DslSnafu {
+            return Err(Error::Dsl {
                 line: form.line(),
                 message: "(count ...) may only count a relation atom".to_owned(),
-            }
-            .fail();
+            });
         };
         let [result] = terms::<L::Error>(std::slice::from_ref(result))?.try_into().map_err(
             |_: Vec<Term>| {
-                DslSnafu { line: form.line(), message: "count result is one term".to_owned() }
-                    .build()
+                Error::Dsl { line: form.line(), message: "count result is one term".to_owned() }
             },
         )?;
         return Ok(BodyAtom::Count(CountAtom { result, inner: app, line: form.line() }));
@@ -1082,11 +1060,10 @@ pub fn terms<S: std::error::Error + 'static>(args: &[Sexpr]) -> Result<Vec<Term>
                 Ok(parse_int(text).map_or_else(|| Term::Var(text.clone()), Term::Int))
             }
             Sexpr::Str { text, .. } => Ok(Term::Text(text.clone())),
-            Sexpr::List { line, .. } => DslSnafu {
+            Sexpr::List { line, .. } => Err(Error::Dsl {
                 line: *line,
                 message: "atom arguments are variables, numbers or strings".to_owned(),
-            }
-            .fail(),
+            }),
         })
         .collect()
 }
@@ -1142,22 +1119,20 @@ fn parse_braces<S: std::error::Error + 'static>(
                         Some('}') => break,
                         Some(c) => var.push(c),
                         None => {
-                            return DslSnafu {
+                            return Err(Error::Dsl {
                                 line,
                                 message: "unclosed `{` in template".to_owned(),
-                            }
-                            .fail();
+                            });
                         }
                     }
                 }
                 segments.push(Segment::Var(var));
             }
             '}' => {
-                return DslSnafu {
+                return Err(Error::Dsl {
                     line,
                     message: "stray `}` in template (escape as `}}`)".to_owned(),
-                }
-                .fail();
+                });
             }
             other => lit.push(other),
         }
@@ -1188,7 +1163,7 @@ fn parse_dollar<S: std::error::Error + 'static>(
         rest = &rest[at + 1..];
         let (var, after) = if let Some(braced) = rest.strip_prefix('{') {
             let Some(end) = braced.find('}') else {
-                return DslSnafu { line, message: "unclosed `${` in template".to_owned() }.fail();
+                return Err(Error::Dsl { line, message: "unclosed `${` in template".to_owned() });
             };
             (&braced[..end], &braced[end + 1..])
         } else if let Some(run) = rest.strip_prefix("$$")
@@ -1202,11 +1177,10 @@ fn parse_dollar<S: std::error::Error + 'static>(
         } else if ident(rest) > 0 {
             (&rest[..ident(rest)], &rest[ident(rest)..])
         } else {
-            return DslSnafu {
+            return Err(Error::Dsl {
                 line,
                 message: "stray `$` in template (a literal `$` is `$$`)".to_owned(),
-            }
-            .fail();
+            });
         };
         if !lit.is_empty() {
             segments.push(Segment::Lit(std::mem::take(&mut lit)));

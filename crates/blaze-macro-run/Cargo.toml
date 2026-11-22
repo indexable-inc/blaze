@@ -1,0 +1,36 @@
+[package]
+name = "blaze-macro-run"
+description = "A proc macro run as blaze's own code (D175, D193 point 1, piece 0): the pinned proc_macro bridge's server in the macro's own process, a sans-IO session over blaze-comptime's protocol, the call and outcome bytes between blaze and that process, and the host's checks that every token, mark and diagnostic coming back is one it may take; no_std, the allocator passed in"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `Vec` in the caller's allocator.
+blaze-own.workspace = true
+# The protocol between the macro's process and blaze: grants, the host's and the guest's
+# machines, the frame wire (rule 30: not redefined here).
+blaze-comptime.workspace = true
+# The call's and the outcome's tokens as blaze holds them (`TokenStream`, `TokenKind`,
+# `TokenOrigin`), `lex` (the one lexer the host checks the macro's tokens by), and `Produced`, the
+# outcome blaze-expand takes from a proc macro's run.
+blaze-expand.workspace = true
+# `ContentId`: the digest of the `place:file` read `Span::file` makes.
+blaze-id.workspace = true
+
+[dev-dependencies]
+# `blaze_own::testing::heap()`: a test's root allocator (D102), never `Global`.
+blaze-own = { workspace = true, features = ["testing"] }
+# The tests' grants: one package root, its globs and its mount.
+blaze-roots.workspace = true
+
+[lints]
+workspace = true

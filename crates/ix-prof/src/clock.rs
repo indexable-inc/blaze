@@ -9,7 +9,16 @@ pub const CLOCK: &str = "darwin CLOCK_UPTIME_RAW";
 #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
 pub const CLOCK: &str = "std Instant since the profiler started";
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use blaze_sys::posix::io::{ClockId, clock_gettime};
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn clock_ns(clock: ClockId) -> Option<i64> {
+    let at = clock_gettime(clock).ok()?;
+    Some(at.sec * 1_000_000_000 + at.nsec)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn clock_ns(clock: libc::clockid_t) -> Option<i64> {
     let mut at = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: `at` is a timespec to write.
@@ -21,8 +30,10 @@ fn clock_ns(clock: libc::clockid_t) -> Option<i64> {
 /// several processes line up (on Linux, the clock perf stamps samples with).
 pub fn now_ns() -> i64 {
     #[cfg(target_os = "linux")]
-    let ns = clock_ns(libc::CLOCK_MONOTONIC);
-    #[cfg(target_vendor = "apple")]
+    let ns = clock_ns(ClockId::Monotonic);
+    #[cfg(target_os = "macos")]
+    let ns = clock_ns(ClockId::UptimeRaw);
+    #[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
     let ns = clock_ns(libc::CLOCK_UPTIME_RAW);
     #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
     let ns: Option<i64> = None;
@@ -34,7 +45,11 @@ pub fn now_ns() -> i64 {
 
 /// The calling thread's CPU time, where the system counts it.
 pub fn thread_cpu_ns() -> Option<i64> {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        clock_ns(ClockId::ThreadCpu)
+    }
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     {
         clock_ns(libc::CLOCK_THREAD_CPUTIME_ID)
     }
@@ -53,13 +68,17 @@ pub fn unix_ns() -> i64 {
 
 /// The operating system's number for this thread, as `perf` and `top` show it.
 pub fn os_tid() -> u64 {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        blaze_sys::posix::thread::thread_id()
+    }
+    #[cfg(target_os = "android")]
     {
         // SAFETY: `gettid` has no precondition.
         let tid = unsafe { libc::gettid() };
         tid as u64
     }
-    #[cfg(target_vendor = "apple")]
+    #[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
     {
         let mut tid = 0u64;
         // SAFETY: a null thread is the calling one; `tid` is a `u64` to write.

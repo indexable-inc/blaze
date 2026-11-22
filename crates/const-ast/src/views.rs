@@ -211,57 +211,95 @@ cursor!(
 #[derive(Clone, Copy)]
 pub struct Item<'a>(Node<'a>);
 
+/// Base kind number for O(1) `[u64; 4]` node-kind bitsets (covers 256 node kinds from `ABI`).
+const KIND_BASE: u16 = ABI;
+
+const fn kind_set(kinds: &[u16]) -> [u64; 4] {
+    let mut bits = [0u64; 4];
+    let mut i = 0;
+    while i < kinds.len() {
+        let kind = kinds[i];
+        if kind < KIND_BASE {
+            panic!("const_ast: node kind below KIND_BASE");
+        }
+        let bit = (kind - KIND_BASE) as usize;
+        if bit >= 256 {
+            panic!("const_ast: node kind out of [u64; 4] bitset range");
+        }
+        bits[bit >> 6] |= 1u64 << (bit & 63);
+        i += 1;
+    }
+    bits
+}
+
+#[inline]
+const fn in_kind_set(set: &[u64; 4], kind: u16) -> bool {
+    if kind < KIND_BASE {
+        return false;
+    }
+    let bit = (kind - KIND_BASE) as usize;
+    bit < 256 && ((set[bit >> 6] >> (bit & 63)) & 1) != 0
+}
+
+const ITEM_KINDS: [u64; 4] = kind_set(&[
+    ASM_EXPR,
+    CONST,
+    ENUM,
+    EXTERN_BLOCK,
+    EXTERN_CRATE,
+    FN,
+    IMPL,
+    MACRO_CALL,
+    MACRO_DEF,
+    MACRO_RULES,
+    MODULE,
+    STATIC,
+    STRUCT,
+    TRAIT,
+    TYPE_ALIAS,
+    UNION,
+    USE,
+]);
+
+const HAS_NAME_KINDS: [u64; 4] = kind_set(&[
+    CONST,
+    ENUM,
+    FN,
+    MACRO_DEF,
+    MACRO_RULES,
+    MODULE,
+    STATIC,
+    STRUCT,
+    TRAIT,
+    TYPE_ALIAS,
+    UNION,
+]);
+
+const HAS_GENERICS_KINDS: [u64; 4] =
+    kind_set(&[CONST, ENUM, FN, IMPL, STRUCT, TRAIT, TYPE_ALIAS, UNION]);
+
 /// The kinds `ast::Item` is one of.
+#[inline]
 const fn is_item(kind: u16) -> bool {
-    kind == ASM_EXPR
-        || kind == CONST
-        || kind == ENUM
-        || kind == EXTERN_BLOCK
-        || kind == EXTERN_CRATE
-        || kind == FN
-        || kind == IMPL
-        || kind == MACRO_CALL
-        || kind == MACRO_DEF
-        || kind == MACRO_RULES
-        || kind == MODULE
-        || kind == STATIC
-        || kind == STRUCT
-        || kind == TRAIT
-        || kind == TYPE_ALIAS
-        || kind == UNION
-        || kind == USE
+    in_kind_set(&ITEM_KINDS, kind)
 }
 
 /// The kinds that are `HasName`.
+#[inline]
 const fn has_name_kind(kind: u16) -> bool {
-    kind == CONST
-        || kind == ENUM
-        || kind == FN
-        || kind == MACRO_DEF
-        || kind == MACRO_RULES
-        || kind == MODULE
-        || kind == STATIC
-        || kind == STRUCT
-        || kind == TRAIT
-        || kind == TYPE_ALIAS
-        || kind == UNION
+    in_kind_set(&HAS_NAME_KINDS, kind)
 }
 
 /// The kinds of items that are `HasVisibility`: all but `asm!`, `extern { .. }` and macro calls.
+#[inline]
 const fn has_visibility_kind(kind: u16) -> bool {
     kind != ASM_EXPR && kind != EXTERN_BLOCK && kind != MACRO_CALL
 }
 
 /// The kinds that are `HasGenericParams`.
+#[inline]
 const fn has_generics_kind(kind: u16) -> bool {
-    kind == CONST
-        || kind == ENUM
-        || kind == FN
-        || kind == IMPL
-        || kind == STRUCT
-        || kind == TRAIT
-        || kind == TYPE_ALIAS
-        || kind == UNION
+    in_kind_set(&HAS_GENERICS_KINDS, kind)
 }
 
 impl<'a> Item<'a> {
@@ -1093,23 +1131,31 @@ impl<'a> GenericArgList<'a> {
 #[derive(Clone, Copy)]
 pub struct Type<'a>(Node<'a>);
 
+const TYPE_KINDS: [u64; 4] = kind_set(&[
+    ARRAY_TYPE,
+    DYN_TRAIT_TYPE,
+    FN_PTR_TYPE,
+    FOR_TYPE,
+    IMPL_TRAIT_TYPE,
+    INFER_TYPE,
+    MACRO_TYPE,
+    NEVER_TYPE,
+    PAREN_TYPE,
+    PATH_TYPE,
+    PATTERN_TYPE,
+    PTR_TYPE,
+    REF_TYPE,
+    SLICE_TYPE,
+    TUPLE_TYPE,
+    UNION_TYPE,
+    RECORD_TYPE,
+    UNSAFE_BINDER_TYPE,
+]);
+
 /// The kinds `ast::Type` is one of.
+#[inline]
 const fn is_type(kind: u16) -> bool {
-    kind == ARRAY_TYPE
-        || kind == DYN_TRAIT_TYPE
-        || kind == FN_PTR_TYPE
-        || kind == FOR_TYPE
-        || kind == IMPL_TRAIT_TYPE
-        || kind == INFER_TYPE
-        || kind == MACRO_TYPE
-        || kind == NEVER_TYPE
-        || kind == PAREN_TYPE
-        || kind == PATH_TYPE
-        || kind == PATTERN_TYPE
-        || kind == PTR_TYPE
-        || kind == REF_TYPE
-        || kind == SLICE_TYPE
-        || kind == TUPLE_TYPE
+    in_kind_set(&TYPE_KINDS, kind)
 }
 
 impl<'a> Type<'a> {
@@ -1203,29 +1249,10 @@ node!(
     SliceType = SLICE_TYPE
 );
 
-/// The types of a tuple type, in order.
-#[derive(Clone, Copy)]
-pub struct TupleTypeFields<'a>(Children<'a>);
-
-impl<'a> TupleTypeFields<'a> {
-    /// The next one.
-    #[allow(clippy::should_implement_trait)]
-    pub const fn next(&mut self) -> Option<Type<'a>> {
-        while let Some(node) = self.0.next() {
-            if let Some(it) = Type::cast(node) {
-                return Some(it);
-            }
-        }
-        None
-    }
-}
-
-impl<'a> Iterator for TupleTypeFields<'a> {
-    type Item = Type<'a>;
-    fn next(&mut self) -> Option<Type<'a>> {
-        TupleTypeFields::next(self)
-    }
-}
+cursor!(
+    /// The types of a tuple type, in order.
+    TupleTypeFields of Type
+);
 
 impl<'a> PathType<'a> {
     /// The path (`ast::PathType::path`).

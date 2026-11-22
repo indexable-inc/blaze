@@ -6,9 +6,9 @@
 //! and `}}` escape literal braces.
 
 use ast_merge_langs::Lang;
-use astlog_engine::{BuiltinAritySnafu, DslSnafu, Needs, Parsed, Sexpr, TemplateSyntax, Term};
+use astlog_engine::{Needs, Parsed, Sexpr, TemplateSyntax, Term};
 
-use crate::error::{Error, SourceError, UnknownLangNameSnafu};
+use crate::error::{Error, SourceError};
 
 /// The tree-sitter fact source, as the language sees it.
 #[derive(Debug)]
@@ -51,13 +51,12 @@ impl astlog_engine::Language for TreeSitter {
             "match" => parse_match(args, line).map(Some),
             "no-descendant" | "attached-sibling" => {
                 if args.len() != 3 {
-                    return BuiltinAritySnafu {
+                    return Err(Error::BuiltinArity {
                         line,
-                        name: head,
+                        name: head.to_owned(),
                         expected: 3usize,
                         got: args.len(),
-                    }
-                    .fail();
+                    });
                 }
                 let value = if head == "no-descendant" {
                     Atom::NoDescendant
@@ -82,7 +81,8 @@ impl astlog_engine::Language for TreeSitter {
 fn parse_match(args: &[Sexpr], line: usize) -> Result<Parsed<Atom>, Error> {
     let [Sexpr::Atom { text: lang_name, line: lang_line }, Sexpr::Str { text: query, .. }] = args
     else {
-        return DslSnafu { line, message: "match form is (match <lang> \"<query>\")" }.fail();
+        let message = "match form is (match <lang> \"<query>\")".to_owned();
+        return Err(Error::Dsl { line, message });
     };
     let mut captures: Vec<String> = Vec::new();
     for name in capture_names(query) {
@@ -111,7 +111,7 @@ fn resolve_lang(name: &str, line: usize) -> Result<Lang, Error> {
         }
     }
     ast_merge_langs::detect_from_extension(&lowered)
-        .ok_or_else(|| UnknownLangNameSnafu { name: name.to_owned(), line }.build().into())
+        .ok_or_else(|| SourceError::UnknownLangName { name: name.to_owned(), line }.into())
 }
 
 /// Capture names mentioned in a tree-sitter query source (`@name`).

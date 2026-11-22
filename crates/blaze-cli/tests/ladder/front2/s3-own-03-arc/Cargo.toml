@@ -1,0 +1,4 @@
+[package]
+name = "ladder-s3-own-03-arc"
+version = "0.1.0"
+edition = "2024"

@@ -1,0 +1,14 @@
+{
+ "id": "ladder-lower-1",
+ "date": "2026-11-15",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane ladder-lower under the ladder lead",
+ "where": "crates/blaze-ladder/src/lower.rs against blaze-typeck's body form",
+ "what": "The body form keeps no literal values (`Lit::Int(suffix)`, `Lit::ByteStr(len)`), so a lowering that feeds both the checker and a builder must carry values in a side column; and the shared lanecheck lock plus crates underneath breaking (blaze-surface's lang_items.rs) left the crate unverified for long stretches though it uses neither blaze-surface nor blaze-file-items.",
+ "cost": "about twenty minutes waiting on the lock and on another lane's breakage",
+ "cause": "the body form was designed for the checker alone; the ladder crate's manifest lists dependencies it does not yet use",
+ "whys": "typeck needs only a literal's kind; the builder needs its value; the walking skeleton links both off one lowering",
+ "class": "a record shaped for one consumer forces its second consumer to carry a parallel column",
+ "prevention": "open: give the body form (or blaze-lower's record) a literal-value column read by blaze-build; drop unused manifest dependencies so a lane is not blocked by crates it does not call",
+ "workaround": "Body::int_value, pat_int_value and byte_str in blaze-ladder",
+ "state": "open"
+}

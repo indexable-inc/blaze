@@ -1,0 +1,33 @@
+{
+  "rows": [
+    {
+      "name": "synstructure",
+      "versions": ">=0.13, <0.15",
+      "files": ["src/lib.rs", "src/macros.rs"],
+      "find": "all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"wasi\"))",
+      "replace": "any()",
+      "reason": "The gate dates from when proc_macro did not exist on WebAssembly; in blaze's sandbox (wasm32-wasip1) it does, so `extern crate proc_macro`, `decl_derive!` and `decl_attribute!` must not be switched off there.",
+      "decision": "D58",
+      "upstream": "https://github.com/mystor/synstructure",
+      "issue": "",
+      "digests": []
+    },
+    {
+      "name": "syn",
+      "versions": "=1.0.109",
+      "files": ["src/buffer.rs", "src/export.rs", "src/lib.rs", "src/parse.rs"],
+      "find": "all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"wasi\"))",
+      "replace": "any()",
+      "reason": "syn 1.x switches its proc_macro surface off on WebAssembly (`Parser::parse`, `parse_macro_input!`'s function, `TokenBuffer::new`, `extern crate proc_macro`); in blaze's sandbox (wasm32-wasip1) proc_macro exists, so quickcheck_macros 1.0.0's `syn::Item::parse.parse(input)` must compile there.",
+      "decision": "D58",
+      "upstream": "https://github.com/dtolnay/syn",
+      "issue": "",
+      "digests": [
+        { "version": "1.0.109", "file": "src/buffer.rs", "sha256": "4d15f35273d485261be4f1a765ae03abc1daee9fc9dac5fb4f9b624d6b22cb58" },
+        { "version": "1.0.109", "file": "src/export.rs", "sha256": "0cf50d70c32d5fddba8b1193032df62e560237c113df3e86ba26b565cc82838e" },
+        { "version": "1.0.109", "file": "src/lib.rs", "sha256": "de155fed49dffb1756ca8b76d82209fe8bc80c4dda6684f669e98835147869a5" },
+        { "version": "1.0.109", "file": "src/parse.rs", "sha256": "7b2f8caddf25a5734cbcdf7cbf043cbf9afbc07b484966cd59ddfcec9f970fb3" }
+      ]
+    }
+  ]
+}

@@ -1,8 +1,8 @@
 //! The plain store's thin driver: [`Plain`]'s effects carried out on a [`Driver`] (the native
 //! one, or the simulation in tests), reads into a caller's buffer by `pread`, the fetch-on-miss
-//! seam (blaze-keyed's [`Source`] and [`Verifier`]: one home, rule 30), and the store a root's
-//! settings choose ([`Opened`]).
+//! seam (blaze-keyed's [`Source`] and [`Verifier`]: one home, rule 30).
 
+use std::alloc::Allocator;
 use std::{
     alloc::Global,
     collections::BTreeMap,
@@ -16,13 +16,13 @@ use blaze_ids::ContentId;
 use blaze_keyed::{
     exec::RecordRef,
     kind::{Namespace, Tag},
-    store::{FOOTER, HEADER, Located, Put, Refused, SegmentId, SegmentLen, SegmentRef, Source, Statement, StoreError, StoreFile, Verifier},
+    store::{FOOTER, HEADER, Holder, Located, Put, Refused, SegmentId, SegmentLen, SegmentRef, Source, Statement, StoreError, StoreFile, TwoValues, Verifier},
 };
 
 use super::{
-    core::{Batch, Committed, Got, Plain, PlainConfig, PutError, Report, Sliced, TAGS},
+    core::{Batch, Committed, Found, Got, LentRecord, Liveness, Plain, PlainConfig, Probe, Probes, PutError, Report, Scrubbed, Sliced, TAGS},
     format::{self, Segment},
-    settings::{Form, Settings},
+    settings::Settings,
 };
 use crate::{Corrupt, Key};
 
@@ -137,7 +137,8 @@ impl Source for LocalDir {
                 let hit = format::find_ranged(segment, described.count, &key.key, |at, out| self.read_at(&digest, index_at + at, out))?;
                 if let Some((_, entry)) = hit {
                     if entry.tag != key.tag {
-                        return Err(StoreError::TwoValues { tag: key.tag, key: key.key });
+                        // A read of kind `key.tag` met another kind's record (rule 21).
+                        return Err(StoreError::TwoValues(TwoValues { key: key.key, tag: key.tag, len: None, held_tag: entry.tag, held_len: u64::from(entry.len), held: Holder::Committed, differs_at: None }));
                     }
                     *slot = Some(Located { segment: reference, at: entry.at, len: entry.len });
                 }
@@ -160,30 +161,52 @@ impl Source for LocalDir {
     }
 }
 
-/// The plain store driven on the calling thread.
-pub struct Driven<D: Driver = Native> {
+/// The plain store driven on the calling thread, what it keeps in the caller's `A`. The
+/// effect queues stay blaze-core's process-heap vectors (`Driver::submit`, `Driver::poll`).
+pub struct Driven<D: Driver, A: Allocator + Clone> {
     driver: D,
     root: PathBuf,
-    core: Plain,
+    core: Plain<A>,
     effects: Vec<Effect>,
     done: Vec<Completion>,
     /// Completions of the driver's own effects, by tag.
     own: Vec<Completion>,
     /// Each mapped segment opened once more for `pread` ([`Driven::get_into`]), native only.
     files: BTreeMap<FileName, std::fs::File>,
+    /// The test's power cut ([`Driven::cut`]).
+    #[cfg(test)]
+    cut: Option<Cut>,
 }
 
-impl Driven<Native> {
+/// Where a test's power cut falls ([`Driven::cut`]): every run from then on stops, as if the
+/// process and the machine went down there.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Cut {
+    /// After this many more completions.
+    After(u32),
+    /// At the first completion after a run's flip landed: between the flip and what its
+    /// commit asks after it (a late sync), a window a drawn count almost never hits.
+    AtFlip,
+}
+
+impl<A: Allocator + Clone> Driven<Native, A> {
     /// The plain store in `root/plain`, made if missing, on the native driver over `root`. It
     /// reads and writes the namespaces `settings` name ([`Settings::reads`],
-    /// [`Settings::writes`]): everything [`Namespace::LOCAL`] by default.
-    pub fn open(root: &Path, settings: &Settings) -> Result<Driven<Native>, StoreError> {
+    /// [`Settings::writes`]): everything [`Namespace::LOCAL`] by default. What it keeps is in
+    /// `alloc`, the caller's.
+    pub fn open(root: &Path, settings: &Settings, alloc: A) -> Result<Driven<Native, A>, StoreError> {
         let dir = FileName::new("plain").expect("a relative name");
         let at = root.join(dir.as_str());
         std::fs::create_dir_all(&at).map_err(|e| os("mkdir", "the plain store's directory", &e))?;
         exclude_from_backup(&at)?;
         let driver = blaze_core::native(root, 2).map_err(|e| os("making the native driver", "the store's root", &e))?;
         let nonce = nonce();
+        let spelled = root.as_os_str().as_encoded_bytes();
+        let mut own_root = Vec::with_capacity_in(spelled.len(), alloc.clone());
+        own_root.extend_from_slice(spelled);
+        let mut machine = Vec::with_capacity_in(1, alloc.clone());
+        machine.push(own_root);
         let cfg = PlainConfig {
             dir,
             tags: STORE_TAGS,
@@ -192,27 +215,34 @@ impl Driven<Native> {
             boot: boot().unwrap_or(nonce),
             nonce,
             durable: settings.durable,
-            page: blaze_mem::page_size() as u32,
-            writes: settings.writes(),
-            reads: settings.reads(),
+            // The store's own root, in the spelling it was opened by; the caller adds the
+            // checkout's and the home's ([`Driven::machine`]).
+            machine,
+            writes: settings.writes(alloc.clone()),
+            reads: settings.reads(alloc.clone()),
+            // The keyed handle's callers root nothing of their own.
+            liveness: Liveness::Everything,
+            lock_step: crate::plain::LockStep::Backoff,
         };
-        let mut it = Driven::with(driver, root, cfg)?;
+        let mut it = Driven::with(driver, root, cfg, alloc)?;
         it.open_files()?;
         Ok(it)
     }
 
     /// The record under `key` read into `out` by one `pread` of its proved segment (no mapping
     /// is touched, nothing is checked); its tag, or `None` when no namespace read holds it.
-    pub fn get_into(&self, key: &Key, out: &mut Vec<u8>) -> Result<Option<Tag>, StoreError> {
+    pub fn get_into(&mut self, key: &Key, out: &mut Vec<u8>) -> Result<Option<Tag>, StoreError> {
         use std::os::unix::fs::FileExt;
-        let Some(placed) = self.core.locate(key) else {
+        let Some(found) = self.get(key)? else { return Ok(None) };
+        let Some(placed) = self.core.placed(found) else {
             // Put and not yet committed: in memory.
-            return Ok(self.core.get(key).map(|got| {
-                out.clear();
-                out.extend_from_slice(got.bytes);
-                got.tag
-            }));
+            let got = self.core.got(found);
+            out.clear();
+            out.extend_from_slice(got.bytes);
+            return Ok(Some(got.tag));
         };
+        // A segment mapped at this probe is opened for pread now, once.
+        self.open_files()?;
         let file = self.files.get(&placed.file).ok_or(StoreError::Other { what: "a segment mapped and not opened for pread" })?;
         out.resize(placed.len as usize, 0);
         file.read_exact_at(out, placed.at).map_err(|e| os("pread", "a plain store's segment", &e))?;
@@ -232,40 +262,107 @@ impl Driven<Native> {
     }
 
     /// [`Driven::commit_with`], then the new segments opened for `pread`.
-    pub fn commit(&mut self, batches: Vec<Batch>) -> Result<Committed, StoreError> {
+    pub fn commit(&mut self, batches: &[&Batch]) -> Result<Committed<A>, StoreError> {
         let committed = self.commit_with(batches)?;
         self.open_files()?;
         Ok(committed)
     }
 }
 
-impl<D: Driver> Driven<D> {
-    /// The store `cfg` names, opened on `driver` (whose root is `root`).
-    pub fn with(driver: D, root: &Path, cfg: PlainConfig) -> Result<Driven<D>, StoreError> {
-        let mut it = Driven {
+impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
+    /// The store `cfg` names, opened on `driver` (whose root is `root`), what it keeps in
+    /// `alloc`.
+    pub fn with(driver: D, root: &Path, cfg: PlainConfig<A>, alloc: A) -> Result<Driven<D, A>, StoreError> {
+        Driven::with_core(driver, root, Plain::new(cfg, alloc))
+    }
+
+    /// [`Driven::with`], its store opened with `plant`.
+    #[cfg(test)]
+    pub(crate) fn planted(driver: D, root: &Path, cfg: PlainConfig<A>, alloc: A, plant: super::core::Plant) -> Result<Driven<D, A>, StoreError> {
+        let mut it = Driven::bare(driver, root, Plain::planted(cfg, alloc, plant));
+        it.core.open(&mut it.effects);
+        it.opened()
+    }
+
+    /// A power cut where `at` says (`None`: none).
+    #[cfg(test)]
+    pub(crate) fn cut(&mut self, at: Option<Cut>) {
+        self.cut = at;
+    }
+
+    fn bare(driver: D, root: &Path, core: Plain<A>) -> Driven<D, A> {
+        Driven {
             driver,
             root: root.to_owned(),
-            core: Plain::new(cfg),
+            core,
             effects: Vec::new_in(Global),
             done: Vec::new_in(Global),
             own: Vec::new_in(Global),
             files: BTreeMap::new(),
-        };
+            #[cfg(test)]
+            cut: None,
+        }
+    }
+
+    fn with_core(driver: D, root: &Path, core: Plain<A>) -> Result<Driven<D, A>, StoreError> {
+        let mut it = Driven::bare(driver, root, core);
         it.core.open(&mut it.effects);
+        it.opened()
+    }
+
+    /// The open (asked already) run to its end and its report handed.
+    fn opened(mut self) -> Result<Driven<D, A>, StoreError> {
+        let it = &mut self;
         it.run("opening the plain store")?;
         if !it.core.ready() {
             // Its driver went idle first.
             return Err(StoreError::Unfinished { what: "an open" });
         }
         for lost in &it.core.report().lost {
-            tracing::warn!(target: "blaze_cas::plain", file = %lost.file, records = ?lost.records, "lost in a power cut: {}", lost.why);
+            blaze_trace::warn!(target: "blaze_cas::plain", file = %lost.file, records = ?lost.records, "lost in a power cut: {}", lost.why);
         }
         // Handed: this open returns with its report ([`Driven::report`]), so the marks of the
         // losses it names may be cleared by this process's next flip (or
         // [`Driven::acknowledge`]). An open that fails hands nothing, and the marks stay for
         // the next.
         it.core.handed();
-        Ok(it)
+        it.unroot_holed()?;
+        Ok(self)
+    }
+
+    /// D200: before any reader sees the store, every root that reaches a record a power cut
+    /// took is dropped, by one flip, so a reader finds a root whole or no root, never a root
+    /// with a hole (a lost record is rebuilt as on a first run).
+    ///
+    /// When: only when this open can have lost something a root reaches: the generation names
+    /// a root ([`Plain::names_a_root`]) and an earlier boot's unsealed tail (from the rows, [`Plain::earlier_tail`]), or the open
+    /// reported losses (a mark an earlier open left: its unrooting flip did not land). Then
+    /// every row is mapped and the tail checked whole (the check its first probe would make
+    /// this boot anyway), and only if something is lost are the roots walked
+    /// ([`Plain::holed_roots`]: a find for each root, index and named key).
+    ///
+    /// Crash-safe and idempotent: the unrooting is one flip, which also clears the marks of
+    /// the losses this open reported ([`Plain::handed`]), so a kill before it lands leaves the
+    /// roots and the marks both, and the next open, seeing the marks, walks and drops again; a
+    /// kill after leaves no root and no mark. Never half a root: a root is one manifest row.
+    fn unroot_holed(&mut self) -> Result<(), StoreError> {
+        if !self.core.names_a_root() || (!self.core.earlier_tail() && self.core.report().lost.is_empty()) {
+            return Ok(());
+        }
+        self.map_all()?;
+        if self.core.report().lost.is_empty() || self.core.keeps_holed_root() {
+            return Ok(());
+        }
+        let holed = self.core.holed_roots();
+        if holed.is_empty() {
+            return Ok(());
+        }
+        for name in holed.iter() {
+            blaze_trace::warn!(target: "blaze_cas::plain", root = %name, "a root reached a record lost in a power cut: dropped before any reader saw it (D200); what it named is made again as on a first run");
+            self.core.unroot(name);
+        }
+        self.commit_with(&[])?;
+        Ok(())
     }
 
     /// One flip that clears the "lost, not yet reported" marks of the losses this open
@@ -281,8 +378,10 @@ impl<D: Driver> Driven<D> {
 
     /// Runs until nothing is in flight, the store's completions to it, the driver's own kept.
     fn run(&mut self, what: &'static str) -> Result<(), StoreError> {
-        let _span = tracing::info_span!("plain.wait", what).entered();
+        let _span = blaze_trace::info_span!("plain.wait", what).entered();
         let mut since = self.driver.now();
+        #[cfg(test)]
+        let flipped_from = self.core.generation();
         loop {
             self.driver.submit(&mut self.effects);
             if self.driver.in_flight() == 0 {
@@ -297,6 +396,23 @@ impl<D: Driver> Driven<D> {
             }
             let wall = self.driver.wall_ns();
             for completion in self.done.drain(..) {
+                #[cfg(test)]
+                {
+                    let now = match &mut self.cut {
+                        Some(Cut::After(0)) => true,
+                        Some(Cut::After(left)) => {
+                            *left -= 1;
+                            false
+                        }
+                        Some(Cut::AtFlip) => self.core.generation() != flipped_from,
+                        None => false,
+                    };
+                    if now {
+                        // The power cut: this completion and the rest, of every run, reach nothing.
+                        self.cut = Some(Cut::After(0));
+                        return Err(StoreError::Unfinished { what: "a run the test's power cut stopped" });
+                    }
+                }
                 if self.core.owns(completion.tag) {
                     self.core.complete(completion, wall, &mut self.effects);
                 } else {
@@ -310,11 +426,11 @@ impl<D: Driver> Driven<D> {
         }
     }
 
-    pub fn core(&self) -> &Plain {
+    pub fn core(&self) -> &Plain<A> {
         &self.core
     }
 
-    pub(crate) fn core_mut(&mut self) -> &mut Plain {
+    pub(crate) fn core_mut(&mut self) -> &mut Plain<A> {
         &mut self.core
     }
 
@@ -322,21 +438,110 @@ impl<D: Driver> Driven<D> {
         &mut self.driver
     }
 
+    /// The driver back, the store let go of (a test's simulation, crashed and opened again).
+    pub fn into_driver(self) -> D {
+        self.driver
+    }
+
     pub fn report(&self) -> &Report {
         self.core.report()
     }
 
-    pub fn get(&self, key: &Key) -> Option<Got<'_>> {
-        self.core.get(key)
+    /// The record under `key` in the namespaces read, found by [`Plain::find`]: a segment
+    /// mapped at the first probe that reaches it (at most one a step, each step run to its
+    /// completion), an earlier boot's unsealed segment checked whole at its first hit. Read the
+    /// bytes with [`Driven::got`]. `None`: absent. The command's main thread reads this way;
+    /// pool tasks read through the handle after [`Driven::map_all`].
+    pub fn get(&mut self, key: &Key) -> Result<Option<Found>, StoreError> {
+        let before = self.core.probes().probes;
+        let lost = self.core.report().lost.len();
+        // Bounded: each map is of a row not mapped before, and the generation names few.
+        let found = loop {
+            let now = self.driver.wall_ns();
+            match self.core.find_read(key, now, &mut self.effects)? {
+                Probe::Hit(found) => break Some(found),
+                Probe::Absent => break None,
+                Probe::Map => self.run("mapping a segment at its first probe")?,
+            }
+        };
+        self.core.count_get(before);
+        self.hand_losses(lost);
+        Ok(found)
     }
 
-    pub fn has(&self, key: &Key) -> bool {
-        self.core.has(key)
+    /// The NEWEST record under `key` in [`Namespace::LOCAL`] ([`Plain::find_newest`]): what a
+    /// pointer is read by. Mapped as [`Driven::get`] maps; read the bytes with [`Driven::got`].
+    pub fn newest(&mut self, key: &Key) -> Result<Option<Found>, StoreError> {
+        let before = self.core.probes().probes;
+        let lost = self.core.report().lost.len();
+        // Bounded: each map is of a row not mapped before, and the generation names few.
+        let found = loop {
+            let now = self.driver.wall_ns();
+            match self.core.find_newest(Namespace::LOCAL, key, now, &mut self.effects)? {
+                Probe::Hit(found) => break Some(found),
+                Probe::Absent => break None,
+                Probe::Map => self.run("mapping a segment at a pointer's first probe")?,
+            }
+        };
+        self.core.count_get(before);
+        self.hand_losses(lost);
+        Ok(found)
     }
 
-    /// The explicit scrub ([`Plain::scrub`]): every record's CRC-32C against its bytes now.
-    pub fn scrub(&self) -> Vec<Corrupt> {
-        self.core.scrub()
+    /// The bytes of what [`Driven::get`] found, in place, borrowed from the store.
+    pub fn got(&self, found: Found) -> Got<'_> {
+        self.core.got(found)
+    }
+
+    pub fn has(&mut self, key: &Key) -> Result<bool, StoreError> {
+        Ok(self.get(key)?.is_some())
+    }
+
+    /// Every row mapped and every parked row checked: whole from now on ([`Plain::map_all`]).
+    /// The command asks it once, when the request's first pool task is about to start (the
+    /// handle cannot map); a commit, a compaction slice, a scrub and a fetch ask it first.
+    pub fn map_all(&mut self) -> Result<(), StoreError> {
+        let lost = self.core.report().lost.len();
+        let now = self.driver.wall_ns();
+        if !self.core.map_all(now, &mut self.effects)? {
+            return Ok(());
+        }
+        self.run("mapping every segment named")?;
+        if !self.core.whole() {
+            return Err(StoreError::Unfinished { what: "mapping every segment named" });
+        }
+        self.hand_losses(lost);
+        Ok(())
+    }
+
+    /// Losses found after the open (a first probe's check, a map of a file gone): logged and
+    /// handed, as the open's are ([`Driven::opened`]).
+    fn hand_losses(&mut self, from: usize) {
+        let lost = &self.core.report().lost;
+        if lost.len() <= from {
+            return;
+        }
+        for lost in &lost[from..] {
+            blaze_trace::warn!(target: "blaze_cas::plain", file = %lost.file, records = ?lost.records, "lost in a power cut: {}", lost.why);
+        }
+        self.core.handed();
+    }
+
+    /// `(segments mapped, segments named)`: `--stats` "segments mapped N of M named".
+    pub fn mapped_of_named(&self) -> (u32, u32) {
+        self.core.mapped_of_named()
+    }
+
+    /// What the gets probed: `--stats` "probes per get (mean, most)".
+    pub fn probes(&self) -> Probes {
+        self.core.probes()
+    }
+
+    /// The explicit scrub ([`Plain::scrub`]): every record's CRC-32C against its bytes now,
+    /// over a whole store.
+    pub fn scrub(&mut self) -> Result<Vec<Corrupt, A>, StoreError> {
+        self.map_all()?;
+        Ok(self.core.scrub())
     }
 
     pub fn put(&mut self, key: Key, namespace: Namespace, tag: Tag, value: &[u8]) -> Result<Put, PutError> {
@@ -344,7 +549,48 @@ impl<D: Driver> Driven<D> {
     }
 
     pub fn root(&mut self, name: &str, keys: &[Key]) -> Result<Key, StoreError> {
+        self.root_names_held(name, keys, &|_| false)?;
         self.core.root(name, keys)
+    }
+
+    /// D200's set-time guard, the one home of it: every key a root record names directly is
+    /// `own` (put by the caller and not yet handed to this store: a `Lent`'s arena) or found
+    /// as [`Driven::get`] finds (put uncommitted here, or committed in a namespace read; a row
+    /// mapped at its first probe), else [`StoreError::RootNamesUnheld`] naming the root and
+    /// the first such key. A name no one put is a writer's bug, refused here on every boot;
+    /// what a power cut lost is the open's ([`Driven::unroot_holed`]).
+    ///
+    /// Cost, per key: `own` (a `Lent`'s hash lookup), then this store's held batches (a
+    /// `BTreeMap` lookup per namespace), then the rows in probe order (a binary search of each
+    /// row's sorted entries, until a hit). An indexed root names its indexes alone here; what an
+    /// index holds is not looked for. Counted in [`super::PutPath::root_probes`].
+    pub(crate) fn root_names_held(&mut self, name: &str, keys: &[Key], own: &dyn Fn(&Key) -> bool) -> Result<(), StoreError> {
+        // Bounded before any probe: the bound the root's own setting refuses past
+        // (`ROOT_KEYS_MOST` direct records, `ROOT_INDEXES_MOST` indexes: equal).
+        if keys.len() > super::core::ROOT_KEYS_MOST {
+            return Err(StoreError::IndexOver { keys: keys.len() as u64, most: super::core::ROOT_KEYS_MOST as u64 });
+        }
+        self.core.count_root_probes(keys.len() as u64);
+        for key in keys {
+            if own(key) || self.get(key)?.is_some() {
+                continue;
+            }
+            return Err(StoreError::RootNamesUnheld { root: name.to_owned(), key: key.0 });
+        }
+        Ok(())
+    }
+
+    /// [`Driven::root_for`], with `own` the caller's puts not yet handed here
+    /// ([`Driven::root_names_held`]).
+    pub(crate) fn root_for_owned(&mut self, name: &str, keys: &[Key], life_ns: u64, own: &dyn Fn(&Key) -> bool) -> Result<Key, StoreError> {
+        self.root_names_held(name, keys, own)?;
+        self.core.root_for(name, keys, life_ns)
+    }
+
+    /// [`Driven::root_through`], with `own` the caller's puts not yet handed here.
+    pub(crate) fn root_through_owned(&mut self, name: &str, indexes: &[Key], life_ns: u64, own: &dyn Fn(&Key) -> bool) -> Result<Key, StoreError> {
+        self.root_names_held(name, indexes, own)?;
+        self.core.root_through(name, indexes, life_ns)
     }
 
     pub fn unroot(&mut self, name: &str) {
@@ -353,9 +599,20 @@ impl<D: Driver> Driven<D> {
 
     /// Writes the store's puts and `batches` as one segment for each namespace that holds
     /// records, and flips to a generation naming them, driven until done.
-    pub fn commit_with(&mut self, batches: Vec<Batch>) -> Result<Committed, StoreError> {
+    pub fn commit_with(&mut self, batches: &[&Batch]) -> Result<Committed<A>, StoreError> {
+        self.commit_records(batches, &[])
+    }
+
+    /// [`Driven::commit_with`] with `records` lent where they lie (core.rs
+    /// [`Plain::commit_records`]): a `Lent`'s shared arena, copied once, by the layout.
+    pub fn commit_records(&mut self, batches: &[&Batch], records: &[LentRecord<'_>]) -> Result<Committed<A>, StoreError> {
+        // After the answer: what is left unmapped is mapped, so the layout refuses two values
+        // under one key against every row. A commit with nothing to lay out maps nothing.
+        if self.core.holds_uncommitted() || batches.iter().any(|it| !it.is_empty()) || !records.is_empty() {
+            self.map_all()?;
+        }
         let now = self.driver.wall_ns();
-        self.core.commit(batches, now, &mut self.effects)?;
+        self.core.commit_records(batches, records, now, &mut self.effects)?;
         self.run("committing")?;
         match self.core.take_committed() {
             Some(outcome) => outcome,
@@ -363,18 +620,19 @@ impl<D: Driver> Driven<D> {
         }
     }
 
-    /// Up to `slices` compaction slices, each bounded by [`super::SLICE_BYTES`], until one says
-    /// there is no more. Lowers the calling thread first ([`lower_this_thread`]): call it after
+    /// Up to `slices` compaction slices until one says there is no more: a pruning or sweeping
+    /// slice bounded by [`super::SLICE_BYTES`], a tiered merge by the amortisation (module doc). Lowers the calling thread first ([`lower_this_thread`]): call it after
     /// the command has answered, or from its own invocation, never before a build's first read.
-    pub fn compact(&mut self, slices: u32) -> Result<Vec<Sliced>, StoreError> {
+    pub fn compact(&mut self, slices: u32) -> Result<Vec<Sliced, A>, StoreError> {
         lower_this_thread()?;
         self.slices(slices)
     }
 
     /// [`Driven::compact`] on the calling thread as it is: for a caller that runs it beside
     /// builds on a thread it lowered itself.
-    pub(crate) fn slices(&mut self, slices: u32) -> Result<Vec<Sliced>, StoreError> {
-        let mut out = Vec::new_in(Global);
+    pub(crate) fn slices(&mut self, slices: u32) -> Result<Vec<Sliced, A>, StoreError> {
+        self.map_all()?;
+        let mut out = Vec::new_in(self.core.alloc().clone());
         for _ in 0..slices {
             if !self.core.compact(&mut self.effects) {
                 return Err(StoreError::Busy { phase: self.core.what() });
@@ -389,6 +647,87 @@ impl<D: Driver> Driven<D> {
         Ok(out)
     }
 
+    /// After the answer: one cleanup slice written with no lock, for the next commit's flip to
+    /// name ([`Plain::fold_slice`]), on a lowered thread. Whether one is parked; a slice that
+    /// found nothing to do is [`Driven::take_sliced`]'s at once.
+    pub fn fold_slice(&mut self) -> Result<bool, StoreError> {
+        lower_this_thread()?;
+        self.map_all()?;
+        if self.core.fold_slice(&mut self.effects)? {
+            self.run("writing a cleanup slice")?;
+        }
+        Ok(self.core.slice_parked())
+    }
+
+    /// The last slice's outcome, once: a folded one's after the commit that flipped it.
+    pub fn take_sliced(&mut self) -> Option<Sliced> {
+        self.core.take_sliced()
+    }
+
+    /// [`Plain::root_for`].
+    pub fn root_for(&mut self, name: &str, keys: &[Key], life_ns: u64) -> Result<Key, StoreError> {
+        self.root_for_owned(name, keys, life_ns, &|_| false)
+    }
+
+    /// [`Plain::index`].
+    pub fn index(&mut self, keys: &[Key]) -> Result<Key, StoreError> {
+        self.core.index(keys)
+    }
+
+    /// [`Plain::root_through`].
+    pub fn root_through(&mut self, name: &str, indexes: &[Key], life_ns: u64) -> Result<Key, StoreError> {
+        self.root_through_owned(name, indexes, life_ns, &|_| false)
+    }
+
+    /// [`Plain::index_beside`].
+    pub fn index_beside(&mut self, owner: Key, keys: &[Key]) -> Result<Key, StoreError> {
+        self.core.index_beside(owner, keys)
+    }
+
+    /// [`Plain::release_lease`].
+    pub fn release_lease(&mut self) {
+        self.core.release_lease()
+    }
+
+    /// The exit tail sealed ([`Plain::seal`]): a command calls it after it answered, before or
+    /// beside [`Driven::compact`], on a lowered thread. One barrier per segment this boot wrote
+    /// and none sealed, then one flip; the next boot's open proves them with no byte read.
+    /// Whether anything was sealed.
+    pub fn seal(&mut self) -> Result<bool, StoreError> {
+        lower_this_thread()?;
+        if !self.core.seal(&mut self.effects) {
+            return Ok(false);
+        }
+        self.run("sealing the exit tail")?;
+        Ok(true)
+    }
+
+    /// One slice of the background pass ([`Plain::scrub_next`]), on a lowered thread: the
+    /// helper a command leaves after its answer calls it until it returns `None` (every sealed
+    /// segment walked this boot) or the helper expires. A rot it finds is in
+    /// [`Driven::report`]'s losses, handed to the caller with the slice.
+    pub fn scrub_next(&mut self, budget_bytes: u64) -> Result<Option<Scrubbed>, StoreError> {
+        lower_this_thread()?;
+        self.map_all()?;
+        let Some(slice) = self.core.scrub_next(budget_bytes, &mut self.effects) else { return Ok(None) };
+        if !self.core.ready() {
+            self.run("recording the background pass")?;
+        }
+        if slice.rot.is_some() {
+            // Handed to the caller with the slice: the next flip clears its mark.
+            self.core.handed();
+        }
+        Ok(Some(slice))
+    }
+
+    /// Adds `paths` (the checkout's, the home's, in each spelling the caller knows) to what a
+    /// put into a shared namespace is scanned for ([`super::PlainConfig::machine`]).
+    pub fn machine(&mut self, paths: &[&Path]) {
+        for path in paths {
+            self.core.machine(path.as_os_str().as_encoded_bytes());
+        }
+    }
+
     /// Fetches what `source` holds of `keys` in `namespace` (one of the namespaces the store
     /// reads, and the only one asked): each segment it names is verified ([`Verifier`]: before
     /// a byte of it is fetched), fetched whole, checked once (its digest is its id, its
@@ -398,34 +737,39 @@ impl<D: Driver> Driven<D> {
     /// The fetch buffer is the global heap, not the caller's frame: the bytes are handed to the
     /// segment's write ([`Effect::WriteUnsynced`] owns a `Vec<u8>` of the global heap), so a
     /// frame's buffer would be copied once more.
-    pub fn fetch_missing(&mut self, source: &mut dyn Source, verifier: &dyn Verifier, namespace: Namespace, keys: &[RecordRef]) -> Result<Vec<u64>, StoreError> {
+    pub fn fetch_missing(&mut self, source: &mut dyn Source, verifier: &dyn Verifier, namespace: Namespace, keys: &[RecordRef]) -> Result<Vec<u64, A>, StoreError> {
         if !self.core.reads().contains(&namespace) {
             return Err(StoreError::Other { what: "a fetch from a namespace this store does not read: a key is never answered from a namespace the caller did not ask for" });
         }
-        let mut missing: Vec<RecordRef> = Vec::with_capacity_in(keys.len(), Global);
+        // What is held is asked of every row, not of the mapped ones alone.
+        self.map_all()?;
+        let alloc = self.core.alloc().clone();
+        let mut missing: Vec<RecordRef, A> = Vec::with_capacity_in(keys.len(), alloc.clone());
         missing.extend(keys.iter().filter(|it| self.core.get_in(&[namespace], &Key(it.key)).is_none()).copied());
         missing.sort_unstable_by(|a, b| a.key.cmp(&b.key));
         missing.dedup_by(|a, b| a.key == b.key);
         if missing.is_empty() {
-            return Ok(Vec::new_in(Global));
+            return Ok(Vec::new_in(alloc));
         }
-        let mut found: Vec<Option<Located>> = Vec::with_capacity_in(missing.len(), Global);
+        let mut found: Vec<Option<Located>, A> = Vec::with_capacity_in(missing.len(), alloc.clone());
         found.resize(missing.len(), None);
         source.find(namespace, &missing, &mut found)?;
         let mut segments: BTreeMap<SegmentId, SegmentRef> = BTreeMap::new();
         for it in found.into_iter().flatten() {
             segments.insert(it.segment.digest(), it.segment);
         }
-        let mut wanted = Vec::with_capacity_in(segments.len(), Global);
+        let mut wanted = Vec::with_capacity_in(segments.len(), alloc);
         wanted.extend(segments.into_values());
         self.pull(source, verifier, namespace, &wanted)
     }
 
     /// Fetches whole segments a source names (a bundle: std for a toolchain, target and cfg
     /// set), each verified and checked as [`Driven::fetch_missing`] says, and names them here.
-    pub fn pull(&mut self, source: &mut dyn Source, verifier: &dyn Verifier, namespace: Namespace, wanted: &[SegmentRef]) -> Result<Vec<u64>, StoreError> {
-        let mut adopted = Vec::with_capacity_in(wanted.len(), Global);
-        let mut ids = Vec::with_capacity_in(wanted.len(), Global);
+    pub fn pull(&mut self, source: &mut dyn Source, verifier: &dyn Verifier, namespace: Namespace, wanted: &[SegmentRef]) -> Result<Vec<u64, A>, StoreError> {
+        // The adopted segments are mapped as their flip lands: a whole store.
+        self.map_all()?;
+        let mut adopted = Vec::with_capacity_in(wanted.len(), self.core.alloc().clone());
+        let mut ids = Vec::with_capacity_in(wanted.len(), self.core.alloc().clone());
         for (i, want) in wanted.iter().enumerate() {
             let segment = want.digest();
             let statement = source.statement(want)?;
@@ -465,8 +809,9 @@ impl<D: Driver> Driven<D> {
         Ok(ids)
     }
 
-    /// Marks segments as pushed to a shared bucket: compaction never rewrites them.
-    pub fn publish(&mut self, ids: Vec<u64>) -> Result<(), StoreError> {
+    /// Marks segments as pushed to a shared bucket: compaction never rewrites them. `ids` in
+    /// the store's allocator ([`Plain::alloc`]).
+    pub fn publish(&mut self, ids: Vec<u64, A>) -> Result<(), StoreError> {
         self.core.publish(ids, &mut self.effects)?;
         self.run("marking segments published")
     }
@@ -549,23 +894,4 @@ fn nonce() -> u64 {
     let here = 0u8;
     let address = (&here as *const u8 as usize as u64).to_le_bytes();
     format::id_of("blaze plain store nonce 1", &[&std::process::id().to_le_bytes(), &blaze_core::system_wall_ns().to_le_bytes(), &address])
-}
-
-/// The store a root's settings (`<root>/store.json`) choose: the packs, as before, or the plain
-/// store.
-pub enum Opened {
-    Packs(crate::Driven),
-    Plain(Driven<Native>),
-}
-
-impl Opened {
-    pub fn open(root: &Path) -> Result<Opened, String> {
-        let settings = Settings::read(root)?;
-        match settings.form {
-            Form::Packs => crate::Driven::open(root).map(Opened::Packs),
-            // The packs' open says its failure as text; the plain store's typed error is
-            // printed beside it.
-            Form::Plain => Driven::open(root, &settings).map(Opened::Plain).map_err(|it| it.to_string()),
-        }
-    }
 }

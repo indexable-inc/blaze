@@ -1,0 +1,44 @@
+[package]
+name = "blaze-run"
+description = "`blaze run` and `blaze test` as sans-IO state machines (docs/v2/plan/design/run.md): the parent that answers a running program's needs, the program's slot words and epochs, heat and the optimizing tier, the registry of live runs and its event stream, and the test index that says which tests an edit affects"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# The crate's small types (keys, record handles, slots, threads) are its own until the crates
+# that own them are built on the new item layer; lib.rs says which each becomes.
+[dependencies]
+# `events`: a run's event stream as records in columns. Its `record!` names `::std`, the one
+# reason the crate links std. By path: the workspace entry turns on its `serde`.
+blaze-format.workspace = true
+# Every collection: `Vec`, `VecDeque`, `SortedMap`, `SortedSet`, `Soa` (no `alloc`).
+blaze-own.workspace = true
+# The two insert-heavy maps (the tier's reverse map, the suite's postings), where a sorted
+# vector would shift its tail on almost every insert.
+blaze-hash.workspace = true
+# `wire` and `zygote`: a test report's digest (a torn report is refused) and the digest of a
+# test's whole output; `child`: an outside read's name.
+blaze-blake3.workspace = true
+# `property`: the parent's machine over a tape-search test's case board (`board::Board`) and
+# blaze-sim's sans-IO `shrink::Shrinker`, run in the parent (test.md, A, "The case board").
+blaze-sim.workspace = true
+
+[dev-dependencies]
+# `check` and `control`: every machine's simulation and its planted-bug controls.
+blaze-sim.workspace = true
+# `Alloc::global()`, the handle the simulations hand every machine.
+blaze-own = { workspace = true, features = ["std"] }
+# `sim/declare.rs`: the run wire's bytes (`blaze_launch::wire::run`) between the parent and
+# the simulated program.
+blaze-launch.workspace = true
+
+[lints]
+workspace = true

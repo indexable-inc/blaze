@@ -154,6 +154,68 @@ impl Flight for Scheduled {
     }
 }
 
+/// Threshold past which [`Alone`] promotes its active-flight table from a compact inline vector
+/// to an O(1) hash map, avoiding linear scans under lock when many flights are active.
+const ALONE_MAP_THRESHOLD: usize = 16;
+
+enum AloneHeld {
+    Inline(Vec<(FlightKey, JobId), Global>),
+    Map(blaze_hash::HashMap<FlightKey, JobId, Global>),
+}
+
+impl AloneHeld {
+    fn new() -> AloneHeld {
+        AloneHeld::Inline(Vec::new_in(Global))
+    }
+
+    /// Returns `None` after claiming `key` for `me`, or `Some(holder)` if `key` is already held.
+    fn try_claim(&mut self, key: FlightKey, me: JobId) -> Option<JobId> {
+        match self {
+            AloneHeld::Inline(vec) => {
+                if let Some((_, holder)) = vec.iter().find(|(it, _)| *it == key) {
+                    return Some(*holder);
+                }
+                if vec.len() >= ALONE_MAP_THRESHOLD {
+                    let mut map = blaze_hash::HashMap::new_in(Global);
+                    for (k, v) in vec.drain(..) {
+                        map.insert(k, v);
+                    }
+                    map.insert(key, me);
+                    *self = AloneHeld::Map(map);
+                } else {
+                    vec.push((key, me));
+                }
+                None
+            }
+            AloneHeld::Map(map) => {
+                if let Some(&holder) = map.get(&key) {
+                    return Some(holder);
+                }
+                map.insert(key, me);
+                None
+            }
+        }
+    }
+
+    fn release(&mut self, key: FlightKey) {
+        match self {
+            AloneHeld::Inline(vec) => {
+                // Fast path: non-cycle flights release in strict LIFO order.
+                if vec.last().is_some_and(|(it, _)| *it == key) {
+                    vec.pop();
+                    return;
+                }
+                let at = vec.iter().position(|(it, _)| *it == key).expect("held while it ran");
+                vec.swap_remove(at);
+            }
+            AloneHeld::Map(map) => {
+                let removed = map.remove(&key);
+                debug_assert!(removed.is_some(), "held while it ran");
+            }
+        }
+    }
+}
+
 /// The single flight of one task: nothing waits, so a database on it is driven by one task at a
 /// time (a test's database, `base_db::Db::for_tests`, whose batches run on the calling thread).
 ///
@@ -164,12 +226,12 @@ impl Flight for Scheduled {
 /// the key, this flight and what to take instead ([`Scheduled`]), and never answers `Mine` (the
 /// asker would be told it is in a cycle with a run on another task's stack) or waits.
 pub struct Alone {
-    held: Lock<Vec<(FlightKey, JobId), Global>>,
+    held: Lock<AloneHeld>,
 }
 
 impl Alone {
     pub fn new() -> Alone {
-        Alone { held: Lock::new("memo.alone.held", Vec::new_in(Global)) }
+        Alone { held: Lock::new("memo.alone.held", AloneHeld::new()) }
     }
 }
 
@@ -201,14 +263,7 @@ impl Flight for Alone {
         run: &mut dyn FnMut() -> Hold,
     ) -> Flown<'f> {
         let me = sched::job_here();
-        let holder = {
-            let mut held = self.held.lock();
-            let holder = held.iter().find(|(it, _)| *it == key).map(|(_, holder)| *holder);
-            if holder.is_none() {
-                held.push((key, me));
-            }
-            holder
-        };
+        let holder = self.held.lock().try_claim(key, me);
         // Decided with the lock let go: the panic and `named` run with no guard held.
         match holder {
             None => {}
@@ -218,10 +273,7 @@ impl Flight for Alone {
         struct Release<'a>(&'a Alone, FlightKey);
         impl Drop for Release<'_> {
             fn drop(&mut self) {
-                let mut held = self.0.held.lock();
-                let at =
-                    held.iter().position(|(it, _)| *it == self.1).expect("held while it ran");
-                held.swap_remove(at);
+                self.0.held.lock().release(self.1);
             }
         }
         let release = Release(self, key);
@@ -284,5 +336,30 @@ mod tests {
                 .expect("an ask of a free key does not panic")
         });
         assert!(after, "another task runs a key nobody holds");
+    }
+
+    #[test]
+    fn alone_promotes_past_inline_threshold_and_tracks_mine() {
+        let alone = Alone::new();
+        fn nest(alone: &Alone, depth: u8, limit: u8) {
+            let mut raw = [0u8; 32];
+            raw[0] = depth;
+            let key = FlightKey(raw);
+            let flown = alone.single(key, &named, &mut || {
+                if depth + 1 < limit {
+                    nest(alone, depth + 1, limit);
+                } else {
+                    // Re-entering key 0 while 24 flights are active must still answer `Mine`.
+                    let first = FlightKey([0u8; 32]);
+                    assert!(matches!(alone.single(first, &named, &mut || Hold::End), Flown::Mine));
+                }
+                Hold::End
+            });
+            assert!(matches!(flown, Flown::Ran));
+        }
+        nest(&alone, 0, 24);
+        // After unwinding all 24 flights, key 0 is free again.
+        let again = alone.single(FlightKey([0u8; 32]), &named, &mut || Hold::End);
+        assert!(matches!(again, Flown::Ran));
     }
 }

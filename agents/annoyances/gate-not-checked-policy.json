@@ -1,0 +1,14 @@
+{
+ "id": "gate-not-checked-policy",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane G (the gate before the start, run.md D124) under rebuild-1115",
+ "where": "crates/blaze-drive/src/request.rs (Config::is_error, Request::with_not_checked) and blaze-cli main.rs print.rs (types-not-checked)",
+ "what": "The drive knew only one level of a finding (`Config::is_error`); 'an item the check could not check' (blaze-cli's `types-not-checked`, check's exit 4) existed only in the cli's printer, so `run` under any gate started a program over a check that said `main` was not checked. Adding the second policy to `Config` would have touched six sim files' Config literals outside the lane, so it went in as a builder (`Request::with_not_checked`) whose default counts no finding as unchecked: a caller that forgets it gets a gate that ignores unchecked items, quietly.",
+ "cost": "about twenty minutes to trace where exit 4 is decided (main.rs close, print.rs shown.unchecked) and why the machine never saw it",
+ "cause": "a finding's level is decided in two places (the drive's is_error, the cli printer's rule comparisons) with no one type naming the levels",
+ "whys": "findings carry no level (rule 81); the command's policy was a bool predicate; incompleteness was added later in the printer only",
+ "class": "a policy split between the machine and its printer lets a gate decide on a different fact than the status",
+ "prevention": "owed: replace `Config::is_error: fn(u16) -> bool` with `Config::level: fn(u16) -> Level { Error, NotChecked, Advice }` in one batch over every Config literal, drop `with_not_checked`, and have print.rs read the same function",
+ "workaround": "builder with a default of no rule; blaze-cli passes `rule == body_types::TYPES_NOT_CHECKED`",
+ "state": "open"
+}

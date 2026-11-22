@@ -1,0 +1,8 @@
+[0;1;31merror  [0ma bare [0;2m`[0;1mas[0;2m` [0mcast to an integer
+   [0;2m╭─ [0msrc/fold.rs[0;2m:34:18[0m
+ [0;2m2 │ pub fn fold(rows: &[Row]) -> Total {[0m
+   [0;2m⋮[0m
+[0;2m34 │     [0mtotal[0;2m.[0mfinish[0;2m([0;1mrows.len() as u64[0;2m)[0m
+   [0;2m│                  [0;31m^^^^^^^^^^^^^^^^^[0m
+   [0;2m│                  ╰─ [0;31muse `u64::try_from`[0m
+   [0;2m╰─ blaze explain lint:casts[0m

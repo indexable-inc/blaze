@@ -7,9 +7,10 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::path::Path;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map};
 use serde::Deserialize;
-use serde_untagged::UntaggedEnumVisitor;
+use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
+use serde::de::{self, Unexpected, Visitor};
 use std::alloc::Global;
 
 use super::{ConfigRelativePath, OptValue, PathAndArgs, StringList, Value};
@@ -37,10 +38,26 @@ pub enum SslVersionConfig {
 
 impl<'de> Deserialize<'de> for SslVersionConfig {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        UntaggedEnumVisitor::new()
-            .string(|single| Ok(SslVersionConfig::Single(single.to_owned())))
-            .map(|map| map.deserialize().map(SslVersionConfig::Range))
-            .deserialize(deserializer)
+        struct V;
+
+        impl<'de> Visitor<'de> for V {
+            type Value = SslVersionConfig;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a string or map")
+            }
+
+            fn visit_str<E: de::Error>(self, single: &str) -> Result<SslVersionConfig, E> {
+                Ok(SslVersionConfig::Single(single.to_owned()))
+            }
+
+            fn visit_map<M: de::MapAccess<'de>>(self, map: M) -> Result<SslVersionConfig, M::Error> {
+                SslVersionConfigRange::deserialize(MapAccessDeserializer::new(map))
+                    .map(SslVersionConfig::Range)
+            }
+        }
+
+        deserializer.deserialize_any(V)
     }
 }
 
@@ -88,10 +105,35 @@ pub enum JobsConfig {
 
 impl<'de> Deserialize<'de> for JobsConfig {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        UntaggedEnumVisitor::new()
-            .i32(|int| Ok(JobsConfig::Integer(int)))
-            .string(|string| Ok(JobsConfig::String(string.to_owned())))
-            .deserialize(deserializer)
+        struct V;
+
+        impl<'de> Visitor<'de> for V {
+            type Value = JobsConfig;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an integer or string")
+            }
+
+            fn visit_i64<E: de::Error>(self, int: i64) -> Result<JobsConfig, E> {
+                match i32::try_from(int) {
+                    Ok(int) => Ok(JobsConfig::Integer(int)),
+                    Err(_) => Err(E::invalid_value(Unexpected::Signed(int), &self)),
+                }
+            }
+
+            fn visit_u64<E: de::Error>(self, int: u64) -> Result<JobsConfig, E> {
+                match i32::try_from(int) {
+                    Ok(int) => Ok(JobsConfig::Integer(int)),
+                    Err(_) => Err(E::invalid_value(Unexpected::Unsigned(int), &self)),
+                }
+            }
+
+            fn visit_str<E: de::Error>(self, string: &str) -> Result<JobsConfig, E> {
+                Ok(JobsConfig::String(string.to_owned()))
+            }
+        }
+
+        deserializer.deserialize_any(V)
     }
 }
 
@@ -148,10 +190,29 @@ enum BuildTargetConfigInner {
 
 impl<'de> Deserialize<'de> for BuildTargetConfigInner {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        UntaggedEnumVisitor::new()
-            .string(|one| Ok(BuildTargetConfigInner::One(one.to_owned())))
-            .seq(|many| many.deserialize().map(BuildTargetConfigInner::Many))
-            .deserialize(deserializer)
+        struct V;
+
+        impl<'de> Visitor<'de> for V {
+            type Value = BuildTargetConfigInner;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a string or array")
+            }
+
+            fn visit_str<E: de::Error>(self, one: &str) -> Result<BuildTargetConfigInner, E> {
+                Ok(BuildTargetConfigInner::One(one.to_owned()))
+            }
+
+            fn visit_seq<S: de::SeqAccess<'de>>(
+                self,
+                many: S,
+            ) -> Result<BuildTargetConfigInner, S::Error> {
+                Vec::<String>::deserialize(SeqAccessDeserializer::new(many))
+                    .map(BuildTargetConfigInner::Many)
+            }
+        }
+
+        deserializer.deserialize_any(V)
     }
 }
 
@@ -234,17 +295,33 @@ impl<'de> Deserialize<'de> for EnvConfigValueInner {
             relative: bool,
         }
 
-        UntaggedEnumVisitor::new()
-            .string(|simple| Ok(EnvConfigValueInner::Simple(simple.to_owned())))
-            .map(|map| {
-                let w: WithOptions = map.deserialize()?;
+        struct V;
+
+        impl<'de> Visitor<'de> for V {
+            type Value = EnvConfigValueInner;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a string or map")
+            }
+
+            fn visit_str<E: de::Error>(self, simple: &str) -> Result<EnvConfigValueInner, E> {
+                Ok(EnvConfigValueInner::Simple(simple.to_owned()))
+            }
+
+            fn visit_map<M: de::MapAccess<'de>>(
+                self,
+                map: M,
+            ) -> Result<EnvConfigValueInner, M::Error> {
+                let w = WithOptions::deserialize(MapAccessDeserializer::new(map))?;
                 Ok(EnvConfigValueInner::WithOptions {
                     value: w.value,
                     force: w.force,
                     relative: w.relative,
                 })
-            })
-            .deserialize(deserializer)
+            }
+        }
+
+        deserializer.deserialize_any(V)
     }
 }
 
@@ -272,7 +349,7 @@ impl EnvConfigValue {
     }
 }
 
-pub type EnvConfig = HashMap<String, EnvConfigValue, Global>;
+pub type EnvConfig = std::collections::BTreeMap<String, EnvConfigValue>;
 
 /// A token or key, which `Debug` does not show.
 #[derive(Clone, Deserialize)]

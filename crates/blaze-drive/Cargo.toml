@@ -1,0 +1,53 @@
+[package]
+name = "blaze-drive"
+description = "The drive's names, keys, records, answer pages and task types on the new item layer (docs/v2/plan/design/drive.md), sans-IO, which the engine builds on: tasks keyed from text, read lists of whole and cell reads, the answer pages' forward and reverse index, verified reads by path, and the Fetch and UnitGraph tasks"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# Decision D105: the drive writes every record's envelope and read list and decides what stands,
+# so its code is part of every producer's row.
+[package.metadata.blaze]
+producer = ["expander", "lowering", "body-checker", "names", "code-builder"]
+
+[lib]
+doctest = false
+
+[dependencies]
+# Vec, SortedMap, VecDeque with the allocator always named: the crate's only collections.
+blaze-own.workspace = true
+# `ItemKey`, `CrateItemKey`, `ContentId`: every item and file is named by its key.
+blaze-id.workspace = true
+# `Hasher`: the BLAKE3 every key is. By path: the workspace entry turns on serde adapters.
+blaze-ids.workspace = true
+# `FormatError`: why a handed record is refused, named in `HeldError`. blaze-surface does not
+# re-export it. By path: the workspace entry turns on its `serde`.
+blaze-format.workspace = true
+# The UnitGraph task (unit_graph_task.rs): the resolution, the sources reader and the record.
+blaze-unit-graph.workspace = true
+# `Lock`: the one lock reader, which the UnitGraph task reads the lock's bytes with.
+blaze-manifest = { workspace = true, default-features = false }
+# The Fetch task (fetch_task.rs): the plan's units, their outcomes and why one failed.
+blaze-fetch.workspace = true
+# A failed unit's finding, shown into the caller's allocator.
+blaze-text.workspace = true
+# `DigestKey` for `Key`: a store key's table hash is its digest's first word (key.rs). No cycle:
+# blaze-hash depends on blaze-own and blaze-swiss only.
+blaze-hash.workspace = true
+
+[dev-dependencies]
+# `Oid`: a git unit in the Fetch task's test.
+blaze-git-fetch.workspace = true
+# `check` and `control`: the property tests (condition.rs, verified.rs, pointers.rs, table.rs)
+# and their planted-bug controls.
+blaze-sim.workspace = true
+# `blaze_own::testing::heap()`: the tests' root allocator capability (D102).
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

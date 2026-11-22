@@ -1,0 +1,15 @@
+{
+ "id": "head-step-relowered-text",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), joiner lane, D161 loops 2 and 4",
+ "where": "crates/blaze-ladder/src/front2/heads.rs `Store::ensure_seeded`, `Store::step`; check.rs `make` (MOST_CONSTS)",
+ "what": "Every step of a head after a need parsed the item's text again (`lower`) and re-ran its builder from the top; a constant need dropped the whole fill and ran it again up to 64 times.",
+ "cost": "not measured here; tables/cost.rs `census.made_again` and `stopped_ns` count the stopped steps and their time",
+ "cause": "the stack held only wants, so all a step made before its need was dropped when it stopped",
+ "whys": "the builders are straight-line code that return `Why::Need` at any depth; no frame kept their progress",
+ "class": "a restart where a wait belongs (checker-nine-restart-layers)",
+ "prevention": "the stack holds a `HeadFrame` with the frame's lowering (built, never compiled); a cursor per builder, then NeedConst as a yield, then blaze-ask's Asker (typeck.md 'Head making waits')",
+ "annoyance": "write-only lane: the cursor per builder touches nine builders in a 3,000-line file and cannot be written safely without a compile between builders",
+ "workaround": "step 1 written, the rest specified in order",
+ "state": "open"
+}

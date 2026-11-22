@@ -1,22 +1,119 @@
 //! `cargo metadata --no-deps --format-version 1`: the workspace's members as cargo prints them,
 //! in its field order (`src/ops/cargo_metadata.rs` and `src/workspace/package.rs` there).
 
+use std::alloc::Global;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
-use anyhow::bail;
-use cargo_util_schemas::core::PackageIdSpec;
-use cargo_util_schemas::manifest::{Hints, RustVersion};
+use blaze_data::Value;
+use blaze_resolve::{PackageIdSpec, RustVersion};
+use blaze_semver::Version;
 use serde::Serialize;
 
 use crate::dependency::SerializedDependency;
+use crate::error::ManifestError;
 use crate::files::Files;
 use crate::manifest::{Context, Manifest};
 use crate::paths::{ancestors, normalize_path};
+use crate::schema::Hints;
 use crate::targets::SerializedTarget;
 use crate::workspace::Workspace;
 
 const VERSION: u32 = 1;
+
+/// Why no manifest could be chosen for `cargo metadata`, in cargo's words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataError {
+    /// `--manifest-path` names nothing.
+    NoManifestPath { path: PathBuf },
+    /// `--manifest-path` names a directory; `child` is its `Cargo.toml` when that exists.
+    ManifestPathIsDir { path: PathBuf, child: Option<PathBuf> },
+    /// `--manifest-path` names a file other than `Cargo.toml`.
+    NotCargoToml { path: PathBuf },
+    /// `--manifest-path` names a script.
+    Embedded { path: PathBuf },
+    /// No `Cargo.toml` from `cwd` up; `lowercase` when a `cargo.toml` was seen.
+    NotFound { cwd: PathBuf, lowercase: bool },
+}
+
+impl fmt::Display for MetadataError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MetadataError::NoManifestPath { path } => {
+                write!(f, "manifest path `{}` does not exist", path.display())
+            }
+            MetadataError::ManifestPathIsDir { path, child } => {
+                write!(f, "manifest path `{}` is a directory but expected a file", path.display())?;
+                if let Some(child) = child {
+                    write!(f, "\nhelp: {} exists", child.display())?;
+                }
+                Ok(())
+            }
+            MetadataError::NotCargoToml { path } => write!(
+                f,
+                "the manifest-path must be a path to a Cargo.toml file: `{}`",
+                path.display()
+            ),
+            MetadataError::Embedded { path } => {
+                write!(f, "embedded manifest `{}` requires `-Zscript`", path.display())
+            }
+            MetadataError::NotFound { cwd, lowercase } => {
+                write!(f, "could not find `Cargo.toml` in `{}` or any parent directory", cwd.display())?;
+                if *lowercase {
+                    f.write_str(", but found cargo.toml please try to rename it to Cargo.toml")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl core::error::Error for MetadataError {}
+
+/// A value serialized as its `Display`: a version, a `rust-version`.
+pub struct Shown<'a, T: fmt::Display>(pub &'a T);
+
+impl<T: fmt::Display> Serialize for Shown<'_, T> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self.0)
+    }
+}
+
+/// A manifest's unread value (`metadata`, a hint) as JSON: maps in manifest order.
+pub struct Data<'a>(pub &'a Value<Global>);
+
+impl Serialize for Data<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        match self.0 {
+            Value::Null => s.serialize_unit(),
+            Value::Bool(b) => s.serialize_bool(*b),
+            Value::Int(i) => match (i.as_u64(), i.as_i64()) {
+                (Some(u), _) => s.serialize_u64(u),
+                (None, Some(n)) => s.serialize_i64(n),
+                (None, None) => s.serialize_i128(i.as_i128()),
+            },
+            Value::Float(x) => s.serialize_f64(*x),
+            Value::Text(t) => s.serialize_str(t.as_str()),
+            Value::Bytes(b) => s.serialize_bytes(b),
+            Value::List(list) => {
+                let mut seq = s.serialize_seq(Some(list.len()))?;
+                for it in list.iter() {
+                    seq.serialize_element(&Data(it))?;
+                }
+                seq.end()
+            }
+            Value::Map(map) => {
+                let mut out = s.serialize_map(Some(map.len()))?;
+                for (k, v) in map.iter() {
+                    out.serialize_entry(k, &Data(v))?;
+                }
+                out.end()
+            }
+        }
+    }
+}
 
 #[derive(Serialize)]
 pub struct ExportInfo<'a, R = ()> {
@@ -28,14 +125,14 @@ pub struct ExportInfo<'a, R = ()> {
     build_directory: PathBuf,
     version: u32,
     workspace_root: &'a Path,
-    metadata: Option<&'a toml::Value>,
+    metadata: Option<Data<'a>>,
 }
 
 /// A package as `cargo metadata` prints it.
 #[derive(Serialize)]
 pub struct SerializedPackage<'a> {
     pub name: &'a str,
-    pub version: &'a semver::Version,
+    pub version: Shown<'a, Version<Global>>,
     pub id: PackageIdSpec,
     pub license: Option<&'a str>,
     pub license_file: Option<&'a str>,
@@ -45,7 +142,7 @@ pub struct SerializedPackage<'a> {
     pub targets: Vec<SerializedTarget<'a>>,
     pub features: BTreeMap<&'a str, Vec<String>>,
     pub manifest_path: &'a Path,
-    pub metadata: Option<&'a toml::Value>,
+    pub metadata: Option<Data<'a>>,
     pub publish: Option<&'a [String]>,
     pub authors: &'a [String],
     pub categories: &'a [String],
@@ -59,7 +156,7 @@ pub struct SerializedPackage<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metabuild: Option<&'a [String]>,
     pub default_run: Option<&'a str>,
-    pub rust_version: Option<&'a RustVersion>,
+    pub rust_version: Option<Shown<'a, RustVersion>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hints: Option<SerializedHints<'a>>,
 }
@@ -69,8 +166,8 @@ pub struct SerializedPackage<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct SerializedHints<'a> {
-    pub min_opt_level: Option<&'a toml::Value>,
-    pub mostly_unused: Option<&'a toml::Value>,
+    pub min_opt_level: Option<Data<'a>>,
+    pub mostly_unused: Option<Data<'a>>,
 }
 
 impl SerializedPackage<'_> {
@@ -92,7 +189,7 @@ pub fn export_package<'a>(manifest_path: &'a Path, m: &'a Manifest) -> Serialize
     let meta = &m.metadata;
     SerializedPackage {
         name: &m.package_id.name,
-        version: &m.package_id.version,
+        version: Shown(&m.package_id.version),
         id: m.package_id.to_spec(),
         license: meta.license.as_deref(),
         license_file: meta.license_file.as_deref(),
@@ -107,7 +204,7 @@ pub fn export_package<'a>(manifest_path: &'a Path, m: &'a Manifest) -> Serialize
             .map(|(k, v)| (k.as_str(), v.iter().map(|fv| fv.to_string()).collect()))
             .collect(),
         manifest_path,
-        metadata: m.custom_metadata.as_ref(),
+        metadata: m.custom_metadata.as_ref().map(Data),
         publish: m.publish.as_deref(),
         authors: &meta.authors,
         categories: &meta.categories,
@@ -120,16 +217,18 @@ pub fn export_package<'a>(manifest_path: &'a Path, m: &'a Manifest) -> Serialize
         links: meta.links.as_deref(),
         metabuild: m.metabuild.as_deref(),
         default_run: m.default_run.as_deref(),
-        rust_version: meta.rust_version.as_ref(),
+        rust_version: meta.rust_version.as_ref().map(Shown),
         hints: m.hints.as_ref().map(|it: &Hints| SerializedHints {
             min_opt_level: None,
-            mostly_unused: it.mostly_unused.as_ref(),
+            mostly_unused: it.mostly_unused.as_ref().map(Data),
         }),
     }
 }
 
 /// What `cargo metadata --no-deps` prints for the workspace.
-pub fn export_no_deps<'a, F: Files>(ws: &'a Workspace<'_, F>) -> anyhow::Result<ExportInfo<'a>> {
+pub fn export_no_deps<'a, F: Files>(
+    ws: &'a Workspace<'_, F>,
+) -> Result<ExportInfo<'a>, ManifestError> {
     let packages = ws.members().map(|(path, m)| export_package(path, m)).collect();
     export(ws, packages, None)
 }
@@ -142,7 +241,7 @@ pub fn export<'a, R, F: Files>(
     ws: &'a Workspace<'_, F>,
     packages: Vec<SerializedPackage<'a>>,
     resolve: Option<R>,
-) -> anyhow::Result<ExportInfo<'a, R>> {
+) -> Result<ExportInfo<'a, R>, ManifestError> {
     Ok(ExportInfo {
         packages,
         workspace_members: ws.members().map(|(_, m)| m.package_id.to_spec()).collect(),
@@ -155,7 +254,7 @@ pub fn export<'a, R, F: Files>(
         build_directory: ws.build_dir()?,
         version: VERSION,
         workspace_root: ws.root(),
-        metadata: ws.custom_metadata(),
+        metadata: ws.custom_metadata().map(Data),
     })
 }
 
@@ -164,7 +263,7 @@ pub fn export<'a, R, F: Files>(
 pub fn root_manifest<F: Files>(
     manifest_path: Option<&Path>,
     ctx: &Context<F>,
-) -> anyhow::Result<PathBuf> {
+) -> Result<PathBuf, MetadataError> {
     let cwd = ctx.config.cwd();
     let files = ctx.files();
     let Some(manifest_path) = manifest_path else {
@@ -172,23 +271,16 @@ pub fn root_manifest<F: Files>(
     };
     let path = normalize_path(&cwd.join(manifest_path));
     if !files.exists(&path) {
-        bail!("manifest path `{}` does not exist", manifest_path.display())
+        return Err(MetadataError::NoManifestPath { path: manifest_path.to_owned() });
     } else if files.is_dir(&path) {
         let child_path = path.join("Cargo.toml");
-        let suggested_path = if files.exists(&child_path) {
-            format!("\nhelp: {} exists", child_path.display())
-        } else {
-            String::new()
-        };
-        bail!(
-            "manifest path `{}` is a directory but expected a file{suggested_path}",
-            manifest_path.display()
-        )
+        let child = files.exists(&child_path).then_some(child_path);
+        return Err(MetadataError::ManifestPathIsDir { path: manifest_path.to_owned(), child });
     } else if !path.ends_with("Cargo.toml") && !is_embedded(&path) {
-        bail!("the manifest-path must be a path to a Cargo.toml file: `{}`", path.display())
+        return Err(MetadataError::NotCargoToml { path });
     }
     if is_embedded(&path) {
-        bail!("embedded manifest `{}` requires `-Zscript`", path.display())
+        return Err(MetadataError::Embedded { path });
     }
     Ok(path)
 }
@@ -198,7 +290,7 @@ fn is_embedded(path: &Path) -> bool {
     ext == Some(std::ffi::OsStr::new("rs")) || ext.is_none()
 }
 
-fn find_root_manifest_for_wd<F: Files>(files: &F, cwd: &Path) -> anyhow::Result<PathBuf> {
+fn find_root_manifest_for_wd<F: Files>(files: &F, cwd: &Path) -> Result<PathBuf, MetadataError> {
     let mut invalid_cargo_toml_path_exists = false;
     for current in ancestors(cwd, None) {
         let manifest = current.join("Cargo.toml");
@@ -209,11 +301,5 @@ fn find_root_manifest_for_wd<F: Files>(files: &F, cwd: &Path) -> anyhow::Result<
             invalid_cargo_toml_path_exists = true;
         }
     }
-    if invalid_cargo_toml_path_exists {
-        bail!(
-            "could not find `Cargo.toml` in `{}` or any parent directory, but found cargo.toml please try to rename it to Cargo.toml",
-            cwd.display()
-        )
-    }
-    bail!("could not find `Cargo.toml` in `{}` or any parent directory", cwd.display())
+    Err(MetadataError::NotFound { cwd: cwd.to_owned(), lowercase: invalid_cargo_toml_path_exists })
 }

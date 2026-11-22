@@ -1,0 +1,20 @@
+[package]
+name = "blaze-int"
+description = "Integer conversions that say what they do, in place of `as` (after Zig's `@intCast`, `@truncate` and the separate wrapping and saturating operators): `widen` only where no value is lost, `narrow` checked with a typed error, `narrow_or_stop` where failure is a bug, `truncate` and `saturate` on purpose, `to_signed`/`to_unsigned` of equal width; every one `const` through `Cast::<S, T>`; `no_std`, no dependencies, no `unsafe`"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# Nothing: `core` only. Every crate's integer conversions go through this one.
+[dependencies]
+
+[lints]
+workspace = true

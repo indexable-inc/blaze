@@ -15,6 +15,8 @@ use blaze_rng::SplitMix64;
 
 #[cfg(test)]
 use crate::shrink;
+use crate::limits::{Point, PointId};
+use crate::observe::{ObserveMode, Tally};
 use crate::shrink::Shrinker;
 use crate::tape::{Record, Tail, Tape};
 use crate::text::{self, TextError};
@@ -36,12 +38,19 @@ pub struct Config {
     pub shrink_runs: u32,
     pub most_choices: u32,
     pub given: Given,
-    /// Points some case has to reach, or the check fails.
+    /// Points some case has to reach, or the check fails, as text. Deprecated (D165): a point is
+    /// a typed value now, required with `must_reach_points`.
     pub must_reach: &'static [&'static str],
+    /// Typed reach points (limits.rs, [`points!`](crate::points)) some passing case has to reach,
+    /// or the run ends `Verdict::Unreached` naming each missed point's path.
+    pub must_reach_points: &'static [PointId],
+    /// What the search does with what it observed of its passing cases (observe.rs): print it
+    /// (`ObserveMode::Observe`, the default) or, once built, fail on it.
+    pub observe: ObserveMode,
 }
 
 impl Config {
-    /// 256 cases from seed 0, 1,000 shrink runs, `Tape::MOST_CHOICES`, nothing given.
+    /// 256 cases from seed 0, 1,000 shrink runs, `Tape::MOST_CHOICES`, nothing given, observed.
     pub const DEFAULT: Config = Config {
         cases: 256,
         first: 0,
@@ -49,7 +58,19 @@ impl Config {
         most_choices: Tape::MOST_CHOICES,
         given: Given::NOTHING,
         must_reach: &[],
+        must_reach_points: &[],
+        observe: ObserveMode::Observe,
     };
+
+    /// What the search does with what it observed (observe.rs).
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub const fn observe(mut self, mode: ObserveMode) -> Config {
+        self.observe = mode;
+        self
+    }
 
     /// [`Config::DEFAULT`] with `cases` cases.
     #[blaze::pure]
@@ -92,13 +113,26 @@ impl Config {
         self
     }
 
-    /// Points some passing case has to reach.
+    /// Points some passing case has to reach, as text. Deprecated (D165): declare the points with
+    /// [`points!`](crate::points), note them with `Tape::reach` and require them with
+    /// [`Config::must_reach_points`].
     #[blaze::pure]
     #[blaze::nopanic]
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub const fn must_reach(mut self, points: &'static [&'static str]) -> Config {
         self.must_reach = points;
+        self
+    }
+
+    /// Typed reach points some passing case has to reach: `&[LogPoint::Full.id()]`, or every
+    /// point of an enum with `<LogPoint as Point>::IDS`.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub const fn must_reach_points(mut self, points: &'static [PointId]) -> Config {
+        self.must_reach_points = points;
         self
     }
 
@@ -251,6 +285,31 @@ impl core::fmt::Display for Broke {
 }
 
 impl std::error::Error for Broke {}
+
+/// What broke a case, typed (D165): the oracle's finding as a value of its own error type `E`
+/// (the component's typed error, or a small invariant enum the test defines), or the harness's
+/// own fault. A control names the invariant it must trip as a pattern over `E`
+/// ([`plants!`](crate::plants)), never as words of a message; `E`'s `Display` is only what a
+/// person reads. [`Broke`] is the untyped form, kept while callers move.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Broken<E> {
+    /// The oracle saw the invariant `E` broken: a finding.
+    Oracle(E),
+    /// The test itself went wrong (a model out of step, a bound of the harness's own). The text is
+    /// for a person; nothing matches on it.
+    Harness(String),
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for Broken<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Broken::Oracle(broken) => write!(f, "the oracle: {broken}"),
+            Broken::Harness(why) => write!(f, "the harness: {why}"),
+        }
+    }
+}
+
+impl<E: core::fmt::Display + core::fmt::Debug> std::error::Error for Broken<E> {}
 
 /// Where a failure came from: two failures are the same when their origins are equal.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -413,6 +472,8 @@ pub struct Search {
     drew: bool,
     /// The points passing cases reached, each once.
     reached: Vec<&'static str, Global>,
+    /// What the passing cases of the run drew (observe.rs).
+    tally: Tally,
     found: Option<Found>,
     shrinker: Option<Shrinker>,
     /// The tape the final run replays: the shrinker's best.
@@ -424,7 +485,8 @@ pub struct Search {
 
 impl Search {
     /// A search of `config`. A `Given` with a tape and a seed or a count (which `Given::parse`
-    /// refuses) panics, naming both.
+    /// refuses) panics, naming both. `ObserveMode::Enforce` is judged by the driver once the
+    /// search is done (check.rs `enforced`), from `tally`; the search itself observes either way.
     #[blaze::pure]
     #[blaze::nonblocking]
     pub fn new(config: Config) -> Search {
@@ -459,6 +521,7 @@ impl Search {
             choices: 0,
             drew: false,
             reached: Vec::new_in(Global),
+            tally: Tally::new(),
             found: None,
             shrinker: None,
             least: Vec::new_in(Global),
@@ -480,6 +543,43 @@ impl Search {
         search
     }
 
+    /// A search that starts at a failure another phase found (the guided phase, guided.rs): it
+    /// shrinks `record`, the failing case's record, and runs the least tape once more, as it does
+    /// for a failure of its own. The failure has no seed, since a guided case is a tape; `case` is
+    /// which case it was, from 1, of `config.cases`, the cases that phase ran.
+    #[blaze::pure]
+    #[blaze::nonblocking]
+    pub(crate) fn after_failure(
+        config: Config,
+        record: &Record,
+        failure: Failure,
+        case: u32,
+    ) -> Search {
+        let mut search = Search::new(config.given(Given::NOTHING));
+        // `new` of a run of no cases is already done: what follows replaces that.
+        search.verdict = None;
+        search.ran = case;
+        search.drew = true;
+        let found = Found { seed: None, case, failure, first_len: choices_of(record) };
+        if search.config.shrink_runs == 0 {
+            let cases = search.count;
+            search.done(Verdict::Failed(Failed {
+                seed: None,
+                case,
+                cases,
+                failure: found.failure,
+                first_len: found.first_len,
+                least: record.clone(),
+                shrink_runs: 0,
+            }));
+            return search;
+        }
+        search.shrinker = Some(Shrinker::new(record, search.config.shrink_runs));
+        search.found = Some(found);
+        search.stage = Stage::Shrink;
+        search
+    }
+
     /// The most choices a case of this search may draw.
     #[blaze::pure]
     #[blaze::nopanic]
@@ -487,6 +587,34 @@ impl Search {
     #[blaze::nonblocking]
     pub(crate) fn most_choices(&self) -> u32 {
         self.config.most_choices
+    }
+
+    /// What the passing cases of the run drew so far (observe.rs); whole once the search is done.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn tally(&self) -> &Tally {
+        &self.tally
+    }
+
+    /// The points the passing cases of the run reached so far, each once, in the order first
+    /// reached: typed points (`Tape::reach`) as their ids' paths, and the deprecated text points.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn reached(&self) -> &[&'static str] {
+        &self.reached
+    }
+
+    /// Whether some passing case of the run reached the typed point `point`.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn reached_point(&self, point: impl Point) -> bool {
+        self.reached.contains(&point.id().path())
     }
 
     /// The most cases this search proposes: its cases, its shrink runs and the final run.
@@ -657,6 +785,7 @@ impl Search {
                         self.reached.push(*point);
                     }
                 }
+                self.tally.case(record);
             }
             Ended::Discarded => self.discarded += 1,
             Ended::Failed(failure) => {
@@ -762,15 +891,16 @@ impl Search {
         self.done(verdict);
     }
 
-    /// The points of `Config::must_reach` no passing case reached, each once, in their order;
-    /// none when `reach` waives them.
+    /// The points of `Config::must_reach`, then of `Config::must_reach_points` (as their paths),
+    /// no passing case reached, each once, in their order; none when `reach` waives them.
     fn missing(&self, reach: Reach) -> Vec<&'static str, Global> {
         let mut missing = Vec::new_in(Global);
         match reach {
             Reach::Asked => {
-                for point in self.config.must_reach {
-                    if !self.reached.contains(point) && !missing.contains(point) {
-                        missing.push(*point);
+                let typed = self.config.must_reach_points.iter().map(|point| point.path());
+                for point in self.config.must_reach.iter().copied().chain(typed) {
+                    if !self.reached.contains(&point) && !missing.contains(&point) {
+                        missing.push(point);
                     }
                 }
             }

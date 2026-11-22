@@ -1,0 +1,15 @@
+{
+ "id": "producer-row-own-files",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane KR",
+ "where": "crates/blaze-cli/src/producers.rs and home.rs row_of (the per-kind tools, also the new engine's via engine_store.rs tools); crates/blaze-producers (the walk); crates/blaze-cli/Cargo.toml `producer-own`",
+ "what": "the owner's `blaze check` stopped with two values under one key; a newer blaze on a copy of the home was clean. Every record kind but the Whole ones was keyed by a source row: a digest of named crates' closures plus blaze-cli's own files alone. The producing functions are all in blaze-cli and call crates in no row (names/scope.rs puts blaze_ladder::native_links::table_digest into the CrateScope record; body_types.rs maps verdicts through blaze-lint; macros.rs calls blaze-world), and blaze-cli's `sandbox` feature turns the proc-macro runtime on or off, which no source digest holds.",
+ "cost": "an owner's check stopped; a lane to diagnose (CL) and one to fix (KR)",
+ "cause": "rows named by hand per crate (`producer-own`: a crate's own files without its closure) while the function that makes the record lives in the entry and runs its whole graph",
+ "whys": "D105 piece 2 wanted records kept across releases; the runners had not moved out of the entry, so the row could only be the binary, and the list stood in for it",
+ "class": "a key that names less code than made its value: any identity digested from a list of crates rather than from the crate holding the producing function, and any digest of sources that misses the build's features and profile",
+ "prevention": "done: every row is the binary's linker id (producers.rs); blaze-producers refuses `producer-own` by name; tests home.rs another_build_moves_every_kinds_key and blaze-producers a_row_covers_every_crate_its_producer_calls",
+ "annoyance": "the store's records carry no build identity, so a two-values refusal cannot say which build wrote the stored value; old-home detection checks folder names only",
+ "workaround": "none needed now",
+ "state": "fixed"
+}

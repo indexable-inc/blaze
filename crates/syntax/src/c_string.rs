@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use rustc_literal_escaper::{EscapeError, MixedUnit, unescape_c_str};
+use parser::unescape::{EscapeError, MixedUnit, unescape_c_str};
 
 /// The value of a C string literal with `text` between its quotes.
 /// The text has the line endings of a source file the compiler has read, which are `\n` only.

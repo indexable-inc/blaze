@@ -1,0 +1,132 @@
+[package]
+name = "blaze-proc-macro"
+description = "Proc macros as wasm32-wasip1 modules in Wasmtime: the module records, a fresh sandboxed instance per call, blaze's server of the pinned proc_macro bridge over blaze-expand's tokens, and expansion records keyed by the module's digest and the input, with the reads each run made"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# Decision D105: an expansion runs a proc macro's wasm here, so this crate is the expander's too.
+[package.metadata.blaze]
+producer = ["expander"]
+
+[lib]
+doctest = false
+
+[features]
+# Running a module: Wasmtime, the bridge server, the host, the hook and build scripts. Without
+# it: a module's identity and key, the module store's lookup and the expansion records' key and
+# lookup (what a command that expands nothing asks).
+runtime = ["dep:wasmtime", "dep:tracing", "dep:blaze-unit-graph", "dep:blaze-format", "dep:blaze-id", "dep:blaze-base-tools"]
+default = ["runtime"]
+
+[dependencies]
+# The expansion records' files through the effect layer (`record::OnDir`).
+blaze-std.workspace = true
+# `jobserver.rs`: its named lock (`blaze_core::lock`, taken with a bound where no `Cx` is
+# held: a native run's lease, its drop). Already below blaze-std; no new crate is built.
+blaze-core.workspace = true
+# `spawn_route.rs`, `spawn_records.rs`: the spawn seam's records and the `Executor` trait (W1).
+blaze-spawn.workspace = true
+# A build script's environment, outputs, key and compiler answers (`script.rs`); without the
+# runtime too: `module::package_files` walks a path package by its one rule (`served::in_package`).
+blaze-build-script.workspace = true
+# `spawn_route.rs` `program_found`: the pinned base tool set's program names (D192), the closed
+# list a spawned program is looked up in; a name outside it is `NotFound`, as on a machine
+# without it.
+blaze-base-tools = { workspace = true, optional = true }
+# The pinned nightly in a module's key and the clang pin table (pins/, read at compile time).
+blaze-pins.workspace = true
+# The macOS SDK's version from its `SDKSettings.json`: the native runs' key holds it (native_unit.rs).
+blaze-apple-sdk.workspace = true
+# `TokenStream`, `Produced`, `ProcDiagnostic`, `TokenOrigin`, `lex`: the hook's types.
+blaze-expand.workspace = true
+# `Alloc`, `AVec`: the output is made in the caller's allocator.
+blaze-own = { workspace = true, features = ["std"] }
+# `ContentId`, `Hasher`: the expansion's base key and the reads' digests.
+blaze-ids.workspace = true
+# `CrateItemKey`: the crate a proc macro's definition names (`hook.rs`).
+blaze-id = { workspace = true, optional = true }
+# The record with its reads: base key, read-lists, answers.
+blaze-record.workspace = true
+# The module record's key, as the bootstrap builder computes it.
+blaze-sha256.workspace = true
+# A compiler probe's answer is read into a frame (spawn_route.rs `spawn_probe`).
+blaze-mem.workspace = true
+# The bridge's byte cursor (`wire.rs`).
+blaze-format = { workspace = true, optional = true }
+# WASI preview 1's calls, over the sandbox's `System`.
+blaze-wasi.workspace = true
+wasmtime = { workspace = true, optional = true }
+# The span a worker waiting on another's load of a module opens (`host.rs`).
+tracing = { workspace = true, optional = true }
+# `script_unit.rs`: a unit graph's build-script units, run for the units they serve.
+blaze-unit-graph = { workspace = true, optional = true }
+# `module.rs`: a module key's lock closure walks the lock blaze-manifest's one reader read
+# (`lock::Lock`, sans-IO, on blaze-own; rule 30).
+blaze-manifest = { workspace = true, default-features = false }
+# The source corrections (`blaze_fetch::correct`, D58): a corrected package's pin in a module's
+# closure names the row's digest, so the module key changes when the row does.
+blaze-fetch.workspace = true
+# `native_script.rs` (D177): a native script's hermetic spec names its roots, mounts and
+# read paths (blaze-roots: blaze-own and blaze-blake3 only, already below blaze-std).
+blaze-roots.workspace = true
+# `jobserver.rs`, `fact_pins.rs`: the fifo and the pins' files, by system call.
+libc.workspace = true
+
+[dev-dependencies]
+# `blaze_own::testing::heap()`: a test's root allocator (D102).
+blaze-own = { workspace = true, features = ["std", "testing"] }
+# `clang_shelf`: the pinned C toolchain's archive fetched over HTTPS, streamed (D69).
+blaze-http.workspace = true
+# A test's table of source corrections, read with the lexer's scalar width.
+blaze-lex.workspace = true
+# The example's check that an expansion's output outlines as items.
+blaze-file-items.workspace = true
+# The simulation tests' tapes and planted-bug controls.
+blaze-sim.workspace = true
+# `native_unit`'s test builds a unit graph by hand: a unit's edition.
+edition.workspace = true
+# `tempo_scripts`: the graph of a workspace (blaze-unit-graph, a dependency, over the lock
+# and the manifests) and its packages' files from the fetch store's records.
+blaze-manifest = { workspace = true, default-features = false }
+# `tempo_scripts`: the build scripts' shared setup `blaze check` opens too (blaze-world
+# script_setting.rs `ScriptSetup`: the probe tables over the graph's world, the spawn setting,
+# the native runner), over the pinned toolchain read from the shelf. A dev-dependency cycle,
+# which Cargo allows: the example links the one library both name.
+blaze-world = { workspace = true, features = ["procs-run"] }
+blaze-toolchain.workspace = true
+# `tempo_pipeline`: the real expansion pipeline (`lower_file`, `ByName::with_procs`) over a
+# checkout, the hook behind it. By path, as blaze-real takes it.
+blaze-lower.workspace = true
+blaze-surface.workspace = true
+# `tempo_pipeline`: each body checked as blaze-real's stage h does (`to_typeck`'s table).
+blaze-typeck.workspace = true
+
+# N7 (D112): a native script's `sw_vers` answered by the fact shim; the test binary is both the
+# script and the shim (argv[0]), so it has its own main.
+[[test]]
+name = "native_fact_shim"
+harness = false
+required-features = ["runtime"]
+
+# N8 (D112): a native script reads a wasm producer's header through its laid, read-only tree;
+# the test binary is also the script, so it has its own main.
+[[test]]
+name = "native_dep_tree"
+harness = false
+required-features = ["runtime"]
+
+# A native script is told `NUM_JOBS` and `CARGO_MAKEFLAGS` naming the command's jobserver and
+# takes a token from it inside its sandbox (jobserver.rs); the test binary is also the script.
+[[test]]
+name = "native_jobs"
+harness = false
+required-features = ["runtime"]
+
+[lints]
+workspace = true

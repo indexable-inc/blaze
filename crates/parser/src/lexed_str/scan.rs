@@ -19,7 +19,7 @@
 //! second set of rules: the tests check both agree at every offset of every test file.
 
 use blaze_phf::{name_hash_finish, name_hash_start, name_hash_word};
-use rustc_literal_escaper::{Mode, unescape_byte, unescape_byte_str, unescape_char, unescape_str};
+use crate::unescape::{Mode, unescape_byte, unescape_byte_str, unescape_char, unescape_str};
 
 use super::{
     CHECKPOINT, KIND_BITS, LONG, LexedStr, can_be_raw,
@@ -202,8 +202,10 @@ enum Closed {
 /// simple ones a block at a time, and each special one [`special`] decides in the same window
 /// when it ends in its block, so a block of text pays the window once however many special
 /// tokens it has. Gives where it stopped: the text's end, the start of a run the byte after it
-/// may continue ([`STOPS`]), or a special start, for [`special`] or `rustc_lexer`.
-pub(super) fn simple<const HASH: bool>(
+/// may continue ([`STOPS`]), or a special start, for [`special`] or `rustc_lexer`. With
+/// `OUTLINE` it stops at every `{` too, before lexing it: the outline lexer asks there whether
+/// the brace opens a `fn` body ([`super::members`]).
+pub(super) fn simple<const HASH: bool, const OUTLINE: bool>(
     res: &mut LexedStr<'_>,
     classes: &Classes<'_>,
     edition: Edition,
@@ -235,6 +237,9 @@ pub(super) fn simple<const HASH: bool>(
             // The starts before the first special one (all of them without one).
             let mut run = bits & first_hard.wrapping_sub(1);
             if run != 0 && p < at {
+                if OUTLINE && bytes[p] == b'{' {
+                    break 'window Closed::Stop;
+                }
                 // The token carried in from a block before, the one that may be long.
                 let e = at + run.trailing_zeros() as usize;
                 run &= run - 1;
@@ -244,6 +249,9 @@ pub(super) fn simple<const HASH: bool>(
                 p = e;
             }
             while run != 0 {
+                if OUTLINE && bytes[p] == b'{' {
+                    break 'window Closed::Stop;
+                }
                 let e = at + run.trailing_zeros() as usize;
                 run &= run - 1;
                 window[n & 63] = pack_short::<HASH>(text, p, e, edition, names);
@@ -256,7 +264,9 @@ pub(super) fn simple<const HASH: bool>(
             }
             let e = at + first_hard.trailing_zeros() as usize;
             let after = bytes.get(e).copied().unwrap_or(0);
-            if STOPS[after as usize] & FLAGS[bytes[p] as usize] != 0 {
+            if STOPS[after as usize] & FLAGS[bytes[p] as usize] != 0
+                || OUTLINE && bytes[p] == b'{'
+            {
                 break Closed::Stop;
             }
             window[n & 63] =
@@ -335,7 +345,9 @@ pub(super) fn special(text: &str, at: usize, classes: &Classes<'_>) -> Option<(S
                     Some(b'/') if byte(at + 3) != Some(b'/') => SyntaxKind::OUTER_DOC_COMMENT,
                     _ => SyntaxKind::COMMENT,
                 };
-                Some((kind, classes.next_bit(NEWLINE, at + 2) - at))
+                let end = classes.next_bit(NEWLINE, at + 2);
+                // A doc comment's bare CR is the converter's error to report.
+                (kind == SyntaxKind::COMMENT || !classes.bare_cr(bytes, at..end)).then_some((kind, end - at))
             }
             Some(b'*') => block_comment(bytes, at, classes),
             _ => Some((T![/], 1)),
@@ -347,13 +359,143 @@ pub(super) fn special(text: &str, at: usize, classes: &Classes<'_>) -> Option<(S
         b'"' => {
             let (close, escaped) = close_quote(bytes, at + 1, classes)?;
             let end = suffix_end(bytes, close + 1, classes)?;
-            (!escaped || clean_str(&text[at + 1..close], Mode::Str))
-                .then_some((SyntaxKind::STRING, end - at))
+            let clean = match escaped {
+                true => clean_str(&text[at + 1..close], Mode::Str),
+                // A bare CR is the converter's error to report; a CR LF is a line break.
+                false => !classes.bare_cr(bytes, at + 1..close),
+            };
+            clean.then_some((SyntaxKind::STRING, end - at))
         }
         b'\'' => lifetime_or_char(text, at, classes),
         b'r' | b'b' => prefixed(text, at, classes),
         b'`' | b'\\' | 0x00..=0x08 | 0x0E..=0x1F | 0x7F => Some((SyntaxKind::ERROR, 1)),
         _ => None,
+    }
+}
+
+/// The length of the `fn` body whose `{` is at `at`, through the `}` that closes it, when an
+/// outline may leave it unparsed: what [`crate::outline::lazy_block_len`] answers of its tokens,
+/// found from the byte classes with no token made. `None` (lex the body as any text) where that
+/// answers `None`, and where this cannot see the tokens for certain: a token [`special`] leaves
+/// to `rustc_lexer` (a lexer error, a token an edition splits, a byte of 0x80 or more outside a
+/// string or comment), any identifier `builtin`, and the text's end.
+///
+/// The bytes from one special start to the next are simple tokens, a brace or bracket each its
+/// own; so only the braces, brackets and `<` there are read, and each special token is skipped
+/// whole by [`special`]: a string, raw string, char, byte, lifetime or (nested) block comment
+/// holds no brace that counts (`'}'`, `r#"}"#`, `/* } */`). A quote or `#` right after an
+/// identifier is a prefixed token from the identifier's start (`b'}'`, `br#"}"#`, `r#x`), as the
+/// lexer reads it.
+///
+/// The refusals are `lazy_block_len`'s, in the order it meets them: an outer attribute or doc
+/// comment right before a `}`, a `#` or `<` right before a brace, and an attribute opened 64
+/// brackets deep; "right before" is of the next token that is not whitespace or a comment.
+pub(super) fn body_len(text: &str, at: usize, classes: &Classes<'_>) -> Option<usize> {
+    let bytes = text.as_bytes();
+    debug_assert_eq!(bytes[at], b'{');
+    let ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let (mut depth, mut brackets) = (0usize, 0usize);
+    // `lazy_block_len`'s attribute stack, a bit per bracket depth.
+    let mut attributes: u64 = 0;
+    let mut p = at;
+    loop {
+        let s = classes.next_bit(SPECIAL, p);
+        let mut i = p;
+        while i < s {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i + 1 - at);
+                    }
+                }
+                b'[' => brackets += 1,
+                b']' => {
+                    brackets = brackets.saturating_sub(1);
+                    let top = if brackets < 64 { 1u64 << brackets } else { 0 };
+                    if attributes & top != 0 {
+                        attributes &= !top;
+                        if next_token_byte(text, i + 1, classes)? == b'}' {
+                            return None;
+                        }
+                    }
+                }
+                b'<' => {
+                    if matches!(next_token_byte(text, i + 1, classes)?, b'{' | b'}') {
+                        return None;
+                    }
+                }
+                b'b' if !ident_byte(bytes[i - 1])
+                    && bytes[i..].starts_with(b"builtin")
+                    && bytes.get(i + 7).is_none_or(|&b| !ident_byte(b)) =>
+                {
+                    return None;
+                }
+                _ => (),
+            }
+            i += 1;
+        }
+        if s >= bytes.len() {
+            return None;
+        }
+        // A quote or `#` right after an identifier: the token is the prefixed one from the
+        // identifier's start, whose bytes were read above as the simple ones they are.
+        let mut start = s;
+        if s > p && matches!(bytes[s], b'"' | b'\'' | b'#') && ident_byte(bytes[s - 1]) {
+            while start > p && ident_byte(bytes[start - 1]) {
+                start -= 1;
+            }
+        }
+        let (kind, len) = special(text, start, classes)?;
+        #[cfg(test)]
+        if kind == SyntaxKind::CHAR
+            && &text[start..start + len] == "'}'"
+            && plant::on(plant::Plant::CharCloses)
+        {
+            // The planted bug: the char's `}` taken for a close.
+            depth -= 1;
+            if depth == 0 {
+                return Some(start + 2 - at);
+            }
+        }
+        match kind {
+            T![#] => match next_token_byte(text, start + 1, classes)? {
+                b'[' if brackets < 64 => attributes |= 1 << brackets,
+                b'[' => return None,
+                b'{' | b'}' => return None,
+                _ => (),
+            },
+            SyntaxKind::OUTER_DOC_COMMENT => {
+                if next_token_byte(text, start + len, classes)? == b'}' {
+                    return None;
+                }
+            }
+            _ => (),
+        }
+        p = start + len;
+    }
+}
+
+/// The first byte of the token at or after `at` that is not whitespace or a comment, as the
+/// parser's input has it; `None` at the text's end or at a comment [`special`] leaves to
+/// `rustc_lexer`. A byte of 0x80 or more is given as it is: [`body_len`] refuses it when it gets
+/// there, which it does before the body ends.
+fn next_token_byte(text: &str, mut at: usize, classes: &Classes<'_>) -> Option<u8> {
+    let bytes = text.as_bytes();
+    loop {
+        let b = *bytes.get(at)?;
+        match b {
+            b'\t' | b'\n' | 0x0B | 0x0C | b'\r' | b' ' => at += 1,
+            b'/' if matches!(bytes.get(at + 1), Some(b'/' | b'*')) => {
+                let (kind, len) = special(text, at, classes)?;
+                if kind != SyntaxKind::COMMENT {
+                    return Some(b);
+                }
+                at += len;
+            }
+            _ => return Some(b),
+        }
     }
 }
 
@@ -461,7 +603,9 @@ fn block_comment(bytes: &[u8], at: usize, classes: &Classes<'_>) -> Option<(Synt
                 depth -= 1;
                 from = found + 2;
                 if depth == 0 {
-                    return Some((kind, from - at));
+                    // A doc comment's bare CR is the converter's error to report.
+                    return (kind == SyntaxKind::COMMENT || !classes.bare_cr(bytes, at..from))
+                        .then_some((kind, from - at));
                 }
             }
             _ => from = found + 1,
@@ -519,7 +663,7 @@ fn close_single(bytes: &[u8], i: usize) -> Option<usize> {
 /// would report has no message.
 fn clean_str(text: &str, mode: Mode) -> bool {
     let mut clean = true;
-    let mut check = |error: Option<rustc_literal_escaper::EscapeError>| {
+    let mut check = |error: Option<crate::unescape::EscapeError>| {
         clean &= error.is_none_or(|e| err_to_msg(&e, mode).is_empty());
     };
     match mode {
@@ -633,7 +777,42 @@ fn raw_string(
             Some(_) => from = found + 1,
         }
     };
+    // A bare CR is the converter's error to report.
+    if classes.bare_cr(bytes, open + 1..close) {
+        return None;
+    }
     Some((kind, suffix_end(bytes, close, classes)? - at))
+}
+
+/// The outline lexer's planted bugs and its switch, for the tests' controls (rule 23): set for
+/// one thread by [`plant::with`].
+#[cfg(test)]
+pub(crate) mod plant {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Plant {
+        Clean,
+        /// [`super::body_len`] takes the `}` of a `'}'` char for a close.
+        CharCloses,
+        /// No body is skipped: the outline lexer lexes every token, as [`super::super::LexedStr::new`].
+        SkipOff,
+    }
+
+    std::thread_local! {
+        static PLANTED: Cell<Plant> = const { Cell::new(Plant::Clean) };
+    }
+
+    pub(crate) fn on(plant: Plant) -> bool {
+        PLANTED.with(Cell::get) == plant
+    }
+
+    pub(crate) fn with<R>(plant: Plant, body: impl FnOnce() -> R) -> R {
+        let before = PLANTED.with(|p| p.replace(plant));
+        let out = body();
+        PLANTED.with(|p| p.set(before));
+        out
+    }
 }
 
 #[cfg(test)]

@@ -47,12 +47,12 @@ pub fn crc32c(bytes: &[u8]) -> u32 {
 /// The CRC-32C of `a` followed by `bytes`, given `crc == crc32c(a)`.
 pub fn extend(crc: u32, bytes: &[u8]) -> u32 {
     #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("sse4.2") {
+    if blaze_blake3::cpu::has(blaze_blake3::cpu::Feature::Sse42) {
         // SAFETY: the CPU has SSE4.2, checked just above.
         return !unsafe { x86::raw(!crc, bytes) };
     }
     #[cfg(target_arch = "aarch64")]
-    if std::arch::is_aarch64_feature_detected!("crc") {
+    if blaze_blake3::cpu::has(blaze_blake3::cpu::Feature::Crc) {
         // SAFETY: the CPU has the CRC instructions, checked just above.
         return !unsafe { arm::raw(!crc, bytes) };
     }
@@ -183,7 +183,7 @@ fn combine(table: &Shift, a: u32, b: u32, c: u32) -> u32 {
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use std::arch::x86_64::{_mm_crc32_u8, _mm_crc32_u64};
+    use core::arch::x86_64::{_mm_crc32_u8, _mm_crc32_u64};
 
     use super::{ROUNDS, combine, word};
 
@@ -220,7 +220,7 @@ mod x86 {
 
 #[cfg(target_arch = "aarch64")]
 mod arm {
-    use std::arch::aarch64::{__crc32cb, __crc32cd};
+    use core::arch::aarch64::{__crc32cb, __crc32cd};
 
     use super::{ROUNDS, combine, word};
 
@@ -326,10 +326,12 @@ mod tests {
 
     #[test]
     fn every_path_is_the_bitwise_definition() {
-        let buffer = noise(300 + 16, 1);
+        // Under Miri, enough lengths to cross whole words and every remainder.
+        let (offsets, most) = if cfg!(miri) { (4, 40) } else { (16, 300) };
+        let buffer = noise(most + 16, 1);
         let mut rng = SplitMix64::new(2);
-        for offset in 0..16 {
-            for len in 0..=300 {
+        for offset in 0..offsets {
+            for len in 0..=most {
                 let bytes = &buffer[offset..offset + len];
                 let want = bitwise(bytes);
                 let start = rng.next_u32();
@@ -369,10 +371,15 @@ mod tests {
             100_001,
             1 << 20,
         ];
-        let buffer = noise((1 << 20) + 16, 3);
+        // Under Miri, each side of one `SMALL` and one `STREAM` round and a round of each.
+        let miri_lens = [1535, 1536, 1537, 3072 + 9, 12_287, 12_288, 12_289, 12_288 + 1536];
+        let (lens, offsets): (&[usize], &[usize]) =
+            if cfg!(miri) { (&miri_lens, &[0, 1, 7]) } else { (&lens, &[0, 1, 3, 7, 8, 15]) };
+        let longest = lens.iter().copied().max().expect("lengths");
+        let buffer = noise(longest.max(65_536) + 16, 3);
         let mut rng = SplitMix64::new(4);
-        for offset in [0, 1, 3, 7, 8, 15] {
-            for len in lens {
+        for &offset in offsets {
+            for &len in lens {
                 let bytes = &buffer[offset..offset + len];
                 let start = rng.next_u32();
                 let want = extend_portable(start, bytes);
@@ -382,15 +389,17 @@ mod tests {
                 }
             }
         }
-        assert_eq!(crc32c(&buffer[..65_536]), bitwise(&buffer[..65_536]));
+        let checked = if cfg!(miri) { 4096 } else { 65_536 };
+        assert_eq!(crc32c(&buffer[..checked]), bitwise(&buffer[..checked]));
     }
 
     #[test]
     fn extend_continues_a_crc() {
-        let bytes = noise(50_000, 5);
+        let (len, splits) = if cfg!(miri) { (13_000, 6) } else { (50_000, 200) };
+        let bytes = noise(len, 5);
         let mut rng = SplitMix64::new(6);
         let whole = crc32c(&bytes);
-        for _ in 0..200 {
+        for _ in 0..splits {
             let at = rng.index(bytes.len() + 1);
             let (a, b) = bytes.split_at(at);
             assert_eq!(extend(crc32c(a), b), whole, "split at {at}");
@@ -410,7 +419,9 @@ mod tests {
         let mut rng = SplitMix64::new(7);
         for (stream, table) in ROUNDS {
             let zeros = vec![0u8; stream];
-            for state in [0, 1, !0, 0x8000_0000].into_iter().chain((0..100).map(|_| rng.next_u32()))
+            let random = if cfg!(miri) { 2 } else { 100 };
+            for state in
+                [0, 1, !0, 0x8000_0000].into_iter().chain((0..random).map(|_| rng.next_u32()))
             {
                 assert_eq!(shift(table, state), portable(state, &zeros), "{stream}: {state:#x}");
             }
@@ -421,9 +432,10 @@ mod tests {
     /// a corruption the image and the store name.
     #[test]
     fn one_flipped_bit_changes_the_crc() {
-        let mut bytes = noise(4096, 8);
+        let len = if cfg!(miri) { 256 } else { 4096 };
+        let mut bytes = noise(len, 8);
         let whole = crc32c(&bytes);
-        for bit in (0..4096 * 8).step_by(13) {
+        for bit in (0..len * 8).step_by(13) {
             bytes[bit / 8] ^= 1 << (bit % 8);
             assert_ne!(crc32c(&bytes), whole, "bit {bit}");
             bytes[bit / 8] ^= 1 << (bit % 8);
@@ -432,15 +444,16 @@ mod tests {
 
     #[test]
     fn a_crc_allocates_nothing() {
-        let bytes = noise(70_000, 9);
+        let bytes = noise(if cfg!(miri) { 13_000 } else { 70_000 }, 9);
         let crc = blaze_alloc_count::assert_at_most(0, "crc32c", || crc32c(&bytes));
         assert_eq!(crc, extend_portable(0, &bytes));
     }
 
     #[test]
     fn matches_the_bitwise_definition() {
-        blaze_sim::check(Config::DEFAULT, |tape| {
-            let bytes: Vec<u8> = tape.bytes(0..=39_999, "bytes");
+        blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
+            // Under Miri, short inputs: every_path_agrees_on_groups takes the long rounds.
+            let bytes: Vec<u8> = tape.bytes(0..=if cfg!(miri) { 2_000 } else { 39_999 }, "bytes");
             let at: usize = tape.int_in(0..=bytes.len(), "at");
             let want = bitwise(&bytes);
             assert_eq!(crc32c(&bytes), want);

@@ -1,0 +1,205 @@
+# The core's rules (src/assembly.rs, src/trait_goals.rs, src/eval.rs): param-env candidates and
+# how they merge with impls, higher-ranked bounds, projections in where-clauses, and inductive
+# cycles. References: vendor/rustc_next_trait_solver/src/solve/trait_goals.rs
+# merge_trait_candidates, assembly/mod.rs, search_graph.
+
+# ---- overlapping where-clauses (trait_goals.rs merge_trait_candidates) ----
+
+case where_bounds_equal_merge = trait_goals.rs merge_trait_candidates try_merge_candidates
+# Two identical where-bounds give equal responses: they merge.
+trait Foo
+params T
+env T: Foo; T: Foo
+goal T: Foo => yes
+
+case where_bounds_overlap_ambiguous = trait_goals.rs merge_trait_candidates bail_with_ambiguity
+# Two where-bounds that constrain ?0 differently: ambiguity.
+trait Foo<X>
+params T
+env T: Foo<u8>; T: Foo<u16>
+goal T: Foo<?0> => maybe
+
+case where_bounds_overlap_one_applies = trait_goals.rs merge_trait_candidates
+trait Foo<X>
+params T
+env T: Foo<u8>; T: Foo<u16>
+goal T: Foo<u16> => yes
+goal T: Foo<u32> => no
+
+case where_bound_shadows_impl = trait_goals.rs merge_trait_candidates has_non_global_where_bounds
+# A non-global where-bound means only where-bounds are merged: the impl's u32 is not offered.
+trait Foo<X>
+impl<U> Foo<u32> for U
+params T
+env T: Foo<u8>
+goal T: Foo<?0> => yes ?0 = u8
+
+case global_where_bound_dropped_for_impl = trait_goals.rs merge_trait_candidates only_global_where_bounds
+# A global where-bound is dropped when an impl applies too: the impl's u16 is taken.
+trait Foo<X>
+impl Foo<u16> for u32
+env u32: Foo<u8>
+goal u32: Foo<?0> => yes ?0 = u16
+
+case global_where_bound_alone = trait_goals.rs merge_trait_candidates only_global_where_bounds
+trait Foo<X>
+env u32: Foo<u8>
+goal u32: Foo<?0> => yes ?0 = u8
+
+# ---- higher-ranked bounds (binders over types: the solver's rules are the same as for regions) ----
+
+case hr_goal_blanket_impl = eval_ctxt/mod.rs enter_forall
+# A binder in the goal is instantiated with placeholders; a blanket `?Sized` impl covers them.
+trait Foo
+impl<T: ?Sized> Foo for T
+goal for<X> X: Foo => yes
+
+case hr_goal_implicit_sized_fails = eval_ctxt/mod.rs enter_forall
+# The impl's implicit `T: Sized` asks `!X: Sized`, which no clause proves for a placeholder.
+trait Foo
+impl<T> Foo for T
+goal for<X> X: Foo => no
+
+case hr_goal_concrete_impl_fails = eval_ctxt/mod.rs enter_forall
+# A placeholder is rigid: `impl Foo for u32` does not cover every X.
+trait Foo
+impl Foo for u32
+goal for<X> X: Foo => no
+
+case hr_goal_nested_requirement = eval_ctxt/mod.rs enter_forall
+# `Vec<!X>: Clone` needs `!X: Clone`, which nothing proves for a placeholder.
+goal for<X> Vec<X>: Clone => no
+
+case hr_env_assumption_instantiated = assembly/mod.rs assemble_param_env_candidates (instantiate_binder_with_infer)
+# A higher-ranked where-bound is instantiated with fresh variables to match the goal.
+trait Foo<X>
+params T
+env for<X> T: Foo<X>
+goal T: Foo<u8> => yes
+goal T: Foo<Vec<u16>> => yes
+
+case hr_env_proves_hr_goal = eval_ctxt/mod.rs enter_forall
+trait Foo<X>
+params T
+env for<X> T: Foo<X>
+goal for<Y> T: Foo<Y> => yes
+
+case hr_env_does_not_prove_wider_goal = eval_ctxt/mod.rs enter_forall
+# `T: Foo<u8>` does not prove `T: Foo<!Y>` for every Y.
+trait Foo<X>
+params T
+env T: Foo<u8>
+goal for<Y> T: Foo<Y> => no
+
+# ---- projections in where-clauses ----
+
+case impl_where_projection_holds = trait_goals.rs consider_impl_candidate (where-clauses as nested goals)
+trait Foo
+impl<I> Foo for I where I: Iterator<Item = u8>
+goal Vec<u8>: Foo => yes
+goal Vec<u16>: Foo => no
+
+case impl_where_projection_bound = trait_goals.rs consider_impl_candidate (where-clauses as nested goals)
+# `<I as Iterator>::Item: Bar` normalizes the item before it proves Bar.
+trait Bar
+impl Bar for u8
+trait Foo
+impl<I: Iterator> Foo for I where <I as Iterator>::Item: Bar
+goal Vec<u8>: Foo => yes
+goal Vec<u16>: Foo => no
+
+case env_projection_feeds_impl_where = trait_goals.rs consider_impl_candidate
+# The impl's projection where-clause on a param is proven by the env's binding.
+trait Bar
+impl Bar for u8
+trait Foo
+impl<I: Iterator> Foo for I where <I as Iterator>::Item: Bar
+params T
+env T: Iterator<Item = u8>
+goal T: Foo => yes
+
+case impl_where_projection_infers = trait_goals.rs consider_impl_candidate
+# Proving the impl's where-clause constrains the goal's variable through the projection.
+trait Foo<X>
+impl<I: Iterator> Foo<<I as Iterator>::Item> for I
+goal Vec<u16>: Foo<?0> => yes ?0 = u16
+
+# ---- impls with where-clauses, nested (the cost example's goals) ----
+
+case nested_impl_where_clauses = trait_goals.rs consider_impl_candidate
+# Ints are Clone through core's impls, not a builtin (structural_traits.rs copy/clone).
+impl Clone for u32
+goal u32: Clone => yes
+goal Vec<Vec<Vec<u32>>>: Clone => yes
+goal Vec<Vec<f32>>: Clone => no
+
+case nested_impl_where_clauses_param = trait_goals.rs consider_impl_candidate
+params T
+env T: Clone
+goal Vec<Vec<T>>: Clone => yes
+
+# ---- cycles (search_graph) ----
+
+case misc_trait_cycle_overflows = eval_ctxt/mod.rs step_kind_to_nested (CurrentGoalKind::Misc)
+# A cycle through a non-coinductive trait's where-clause is `PathKind::ForcedAmbiguity` in the
+# pinned reference: ambiguous by overflow, not `NoSolution` as the old solver answered.
+trait Foo
+struct S
+impl Foo for S where S: Foo
+goal S: Foo => overflow
+
+case where_bound_cuts_cycle = trait_goals.rs merge_trait_candidates has_non_global_where_bounds
+# The impl would cycle, but the where-bound applies with no constraints: the impl is never asked.
+trait Foo
+impl<U> Foo for Vec<U> where Vec<U>: Foo
+params T
+env Vec<T>: Foo
+goal Vec<T>: Foo => yes
+
+case growing_goal_overflows = search_graph/mod.rs stack_overflow_result
+# Each step asks about a larger type: the depth limit answers ambiguous by overflow.
+trait Foo
+impl<T> Foo for T where Vec<T>: Foo
+goal u8: Foo => overflow
+
+# ---- `where const` conditions (blaze's `blaze_comptime`; eval.rs const_holds) ----
+
+case where_const_true_holds = eval.rs const_holds
+trait Flat
+impl<T> Flat for T where const yes(T)
+goal u8: Flat => yes
+
+case where_const_false_fails = eval.rs const_holds
+# `false` fails the impl's goal; nothing else is tried.
+trait Flat
+impl<T> Flat for T where const no(T)
+goal u8: Flat => no
+
+case where_const_error_fails = eval.rs const_holds
+# An evaluation error is never true.
+trait Flat
+impl<T> Flat for T where const err(T)
+goal u8: Flat => no
+
+case where_const_generic_undecided = eval.rs const_holds
+# Over a generic parameter the condition is not decided: the clause fails, even one that would
+# hold at every type.
+trait Flat
+impl<T> Flat for T where const yes(T)
+params U
+goal U: Flat => no
+
+case where_const_inference_variable_stalls = eval.rs const_holds
+trait Flat
+impl<T> Flat for T where const yes(T)
+goal ?0: Flat => maybe
+
+case where_const_assumed_in_env = eval.rs const_holds
+# Inside an item with the same clause, the assumption meets it at the same arguments, whatever
+# the condition's value would be; at other arguments it does not.
+trait Flat
+impl<T> Flat for T where const no(T)
+params U V
+env const no(U)
+goal U: Flat => yes
+goal V: Flat => no

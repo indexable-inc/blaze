@@ -153,9 +153,10 @@ fn golden_failed() -> Failed {
 
 #[test]
 fn the_report_of_a_failure_is_exactly_this() {
-    let said =
-        report(&Verdict::Failed(golden_failed()), Location::caller(), Some("queue_keeps_messages"));
-    let expected = "\
+    let at = Location::caller();
+    let said = report(&Verdict::Failed(golden_failed()), at, Some("queue_keeps_messages"));
+    let expected = format!(
+        "\
 blaze-sim: `queue_keeps_messages` failed at seed 41 (case 42 of 256): the queue lost a message
   at src/queue.rs:10:5
 least tape: 7 choices, from 4812, in 318 shrink runs
@@ -163,7 +164,12 @@ least tape: 7 choices, from 4812, in 318 shrink runs
 not calm: op = 3 of 0..=5 | kill = 1 of 0..=1 | deliver = 2 of 0..=3
 notes:
   [4] killed after the second write
-replay: BLAZE_SIM_TAPE='3 0*2 1 0*2 2'   (the case as found: BLAZE_SIM_SEED=41)";
+replay: BLAZE_SIM_TAPE='3 0*2 1 0*2 2'   (the case as found: BLAZE_SIM_SEED=41)
+blaze-sim keep: queue_keeps_messages v{} 3 0*2 1 0*2 2  # ????-??-?? the queue lost a message
+  add it to sim-kept.tapes beside the Cargo.toml of the crate holding {}, with today's date for ????-??-??, and replay it first with `blaze_sim::check_kept(config, blaze_sim::sim_kept!(), body)`",
+        crate::kept::PRIMITIVES,
+        at.file()
+    );
     assert_eq!(said, expected, "\n{said}\n");
 }
 

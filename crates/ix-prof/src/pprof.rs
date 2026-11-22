@@ -2,7 +2,7 @@
 //! and read by hand: the wire format is small and this keeps the output byte-stable. Gzipped
 //! on write, as `go tool pprof` expects; read gzipped or not.
 
-use std::{collections::BTreeMap, io::Read as _, io::Write as _};
+use std::collections::BTreeMap;
 
 use crate::{
     profile::{Frame, FrameKind},
@@ -245,10 +245,12 @@ impl View {
     /// The view as a gzipped `profile.proto`, what `go tool pprof` reads.
     pub fn to_pprof(&self) -> Vec<u8> {
         let proto = self.to_pprof_proto();
-        let mut gz =
-            flate2::GzBuilder::new().mtime(0).write(Vec::new(), flate2::Compression::default());
-        gz.write_all(&proto).expect("writing to a Vec does not fail");
-        gz.finish().expect("writing to a Vec does not fail")
+        // alloc: the gzipped profile, then the caller's copy of it (blaze-own's vector has no
+        // move into std's).
+        let mut gz = blaze_own::Vec::new_in(std::alloc::Global);
+        blaze_deflate::gzip(&proto, blaze_deflate::Level::Default, std::alloc::Global, &mut gz)
+            .expect("gzip into memory fails only when memory runs out");
+        gz.as_slice().to_vec()
     }
 
     /// Reads a pprof profile, gzipped or not. Gunzipped, it may be at most
@@ -256,18 +258,22 @@ impl View {
     pub fn from_pprof(data: &[u8]) -> Result<View, Error> {
         let raw;
         let proto = if data.starts_with(&[0x1f, 0x8b]) {
-            let mut out = Vec::new();
-            flate2::read::GzDecoder::new(data)
-                .take(MAX_PPROF_BYTES + 1)
-                .read_to_end(&mut out)
-                .map_err(|it| Error(format!("gunzip: {it}")))?;
-            if out.len() as u64 > MAX_PPROF_BYTES {
-                return Err(Error(format!(
+            let limits = blaze_deflate::Limits {
+                most_out: MAX_PPROF_BYTES,
+                // DEFLATE's own largest ratio: no valid profile is refused for it.
+                most_ratio: 1032,
+                // The header is part of `data`: saturated at the most a `u32` says.
+                most_header: u32::try_from(data.len()).unwrap_or(u32::MAX),
+            };
+            let mut out = blaze_own::Vec::new_in(std::alloc::Global);
+            blaze_deflate::gunzip(data, limits, std::alloc::Global, &mut out).map_err(|it| match it.why {
+                blaze_deflate::Why::OutputOver { .. } => Error(format!(
                     "the gzipped profile is over {MAX_PPROF_BYTES} bytes unpacked: refused (gunzip it and pass the file)"
-                )));
-            }
+                )),
+                _ => Error(format!("gunzip of the pprof profile: {it}")),
+            })?;
             raw = out;
-            &raw[..]
+            raw.as_slice()
         } else {
             data
         };

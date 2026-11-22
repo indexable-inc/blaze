@@ -1,0 +1,10 @@
+{
+ "id": "base-additions-brief-facts",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), wave-1124-sansio lane BASE ADDITIONS",
+ "where": "crates/blaze-std/src/clock.rs:97; crates/blaze-core/Cargo.toml; crates/blaze-tar/src/read.rs:486; crates/blaze-blake3/src/cpu.rs",
+ "what": "The brief called blaze-std clock.rs:97 a Clock trait and treated blaze-int as a crate below everything. clock.rs:97 is a struct (it would implement the new blaze_int::Clock), and blaze-core does not depend on blaze-int, so moving blaze-core's wait::retry::Clock onto it first adds that dependency. Separately: blaze-tar converts a checked archive name with from_utf8(..).unwrap_or(\"\"), a quiet fallback after the check, and blaze-blake3's cpu.rs is a second CPU detector with a static cache, on libc's getauxval, beside the new blaze_sys::cpu.",
+ "cost": "about twenty minutes of reading to correct the brief's two premises before writing the migration table",
+ "cause": "briefs written from memory of the tree, not from a grep of it",
+ "fix": "a brief that names a file:line says what is there (trait, struct, dependency) from a grep made while writing it"
+}

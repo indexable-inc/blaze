@@ -10,8 +10,6 @@
 //! cannot open a session from a browser; the token keeps out a local process that is not a
 //! browser, which sends any Origin it likes.
 
-use base64::Engine as _;
-
 /// The page.
 pub const PAGE: &str = "https://ix.dev/explore";
 /// The path of the session's CONNECT.
@@ -65,7 +63,8 @@ impl std::fmt::Debug for Token {
 
 /// The hash the page pins a certificate by: the SHA-256 of its DER, base64url, no padding.
 pub fn certhash(der: &[u8]) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blaze_sha256::digest(der))
+    // alloc: the hash's text, then the caller's copy of it, once a server starts.
+    blaze_base64::URL_SAFE_NO_PAD.encode_in(&blaze_sha256::digest(der), std::alloc::Global).as_str().to_owned()
 }
 
 /// The link to the explorer of the server on `port`.

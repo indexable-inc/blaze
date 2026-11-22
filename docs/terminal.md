@@ -112,6 +112,43 @@ dark. The 24-bit values meet WCAG AA (4.5 or more) against black, `#1c1c1c`, `#1
 success and failure, and running and waiting, are a few ΔE apart: hue does not tell them
 apart, their glyph and word do, and failure is bold. A command is underlined at every depth.
 
+## While `run` works
+
+`blaze run` is lazy: it checks, finds the program's crates and starts the program, and each
+function is found or built at its first call. On a terminal its error stream shows ONE live line
+while it works, never wrapped and cut to the width less a column:
+
+```text
+▶ checking · 0.3s
+▶ opening names · 1.2s
+▶ compiling std::io::stdio::_print · 37 made, 12 found · 2.4s
+```
+
+The word is the stage (`checking`, `finding crates`, `reading body ids`, `opening names`,
+`finding roots`) or `compiling` while a first call is answered, with the function's path (cut
+in its middle, `std::…stdio::_print`, then left out when it does not fit); then the functions
+built (`made`) and found in the store so far, and the time since the command began. Without
+UTF-8 the glyph is `>` and the separator `-`.
+
+Nothing is drawn in the first 100 ms, and the line is redrawn at most every 50 ms. It is
+drawn at the cursor with the cursor saved and restored and autowrap off, and erased in place
+(EL), so it never moves what is on the terminal and leaves no partial line. It is erased before
+the program starts; from then on the terminal is the program's, and the line shows only while
+the program is blocked on a first call the command is answering and has been for 100 ms,
+erased before the answer frees it. It is erased before a line of the command's own, and at the
+end on every path out (an error and a panic too). Off a terminal (a pipe, a file, `CI`,
+`TERM=dumb`, `BLAZE_UI=plain`) nothing is drawn.
+
+Built: the run's events (blaze-screen `Step`, to one `Watch` handed in from main.rs: a stage
+begun, a function being answered and how, the program started, a need waited on and answered,
+a line of the command's), the core (`RunStatus`, sans-IO, on the injected clock) and its bytes
+(`encode_status`), and the driver (blaze-cli run_line.rs: a ticker thread on a named signal
+for what time makes due; the command's thread writes the erases at once). `check` and
+`engine-check` can emit the same events; they do not yet. Not built: a program that writes from
+another thread while one of its threads waits on a first call can meet the line; a line the
+command's store writes mid-request (a remote's warning) is not announced, so it can be written
+over a drawn line.
+
 ## After a `run`
 
 The program a `run` becomes is attached to the terminal itself, with no pipe or pty between:
@@ -159,8 +196,10 @@ Everything a command writes to stdout and stderr outside the screen goes through
 (`blaze --version | head -1`) ends the command quietly with status 141, where std's `println!`
 panics; `crates/blaze-report/tests/prints.txt` counts std's macros left, a crate a row.
 
-`progress` every 10 s of a build under way, never sooner; the diagnostics as before; one `ok`
-or `failed` line always (and `blaze: hint fixable=2 run="blaze check --fix"` when warnings
+`progress` every 10 s of a build under way, never sooner; the diagnostics as before; one
+closing line always: `failed` with the error count (exit 1), or, for `check` while a stage it is
+defined to run is not built, `incomplete · NOT checked: <stages>` (exit 3, `blaze explain 3`),
+never `ok` over a stage it did not run; `ok` (exit 0) only when every stage ran (and `blaze: hint fixable=2 run="blaze check --fix"` when warnings
 have a fix), `key=value` with a value quoted when it is not one word. No start
 line: it says nothing its reader did not type. stdout is the program's and the JSON messages',
 unchanged. Test executables write libtest's own output, and the run ends with its counts

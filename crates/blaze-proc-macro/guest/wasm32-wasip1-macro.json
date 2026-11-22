@@ -1,0 +1,78 @@
+{
+ "arch": "wasm32",
+ "binary-format": "wasm",
+ "crt-objects-fallback": "true",
+ "crt-static-allows-dylibs": true,
+ "crt-static-default": true,
+ "crt-static-respected": true,
+ "data-layout": "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20",
+ "dll-prefix": "",
+ "dll-suffix": ".wasm",
+ "dynamic-linking": true,
+ "eh-frame-header": false,
+ "emit-debug-gdb-scripts": false,
+ "entry-name": "__main_void",
+ "env": "p1",
+ "exe-suffix": ".wasm",
+ "generate-arange-section": false,
+ "has-thread-local": true,
+ "is-like-wasm": true,
+ "linker": "rust-lld",
+ "linker-flavor": "wasm-lld",
+ "linker-is-gnu": false,
+ "lld-flavor": "wasm",
+ "llvm-args": [
+  "-wasm-use-legacy-eh=false"
+ ],
+ "llvm-target": "wasm32-wasip1",
+ "main-needs-argc-argv": false,
+ "max-atomic-width": 64,
+ "only-cdylib": false,
+ "os": "wasi",
+ "panic-strategy": "abort",
+ "pre-link-args": {
+  "wasm-lld": [
+   "-z",
+   "stack-size=1048576",
+   "--stack-first",
+   "--no-demangle"
+  ],
+  "wasm-lld-cc": [
+   "-Wl,-z",
+   "-Wl,stack-size=1048576",
+   "-Wl,--stack-first",
+   "-Wl,--no-demangle",
+   "--target=wasm32-wasip1"
+  ]
+ },
+ "pre-link-objects-fallback": {
+  "dynamic-dylib": [
+   "crt1-reactor.o"
+  ],
+  "dynamic-nopic-exe": [
+   "crt1-command.o"
+  ],
+  "dynamic-pic-exe": [
+   "crt1-command.o"
+  ],
+  "static-dylib": [
+   "crt1-reactor.o"
+  ],
+  "static-nopic-exe": [
+   "crt1-command.o"
+  ],
+  "static-pic-exe": [
+   "crt1-command.o"
+  ],
+  "wasi-reactor-exe": [
+   "crt1-reactor.o"
+  ]
+ },
+ "relocation-model": "static",
+ "singlethread": true,
+ "target-family": [
+  "wasm"
+ ],
+ "target-pointer-width": 32,
+ "tls-model": "local-exec"
+}

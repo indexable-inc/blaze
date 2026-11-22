@@ -6,7 +6,7 @@
 
 use std::alloc::Global;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 
 use super::{Model, State};
 
@@ -218,7 +218,7 @@ pub fn critical(model: &Model) -> Path {
 /// span, lane), in path order; `None` where no span of the lane is open.
 pub fn segments(model: &Model, path: &Path) -> Vec<(i64, i64, Option<usize>, usize)> {
     // alloc: once a report
-    let mut cuts: HashMap<usize, Vec<(i64, i64, usize)>, Global> = HashMap::new_in(Global);
+    let mut cuts: Map<usize, Vec<(i64, i64, usize)>, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     // alloc: once a report
     let mut out = Vec::new();
     for link in path.links.iter().filter(|it| it.kind == LinkKind::Ran) {
@@ -299,8 +299,8 @@ pub struct OnPath {
 /// tie), and the path's running time under none.
 pub fn by_query(model: &Model, path: &Path) -> Vec<OnPath> {
     // alloc: once a report
-    let mut sums: HashMap<(Option<&str>, Option<&str>), (i64, u64), Global> =
-        HashMap::new_in(Global);
+    let mut sums: Map<(Option<&str>, Option<&str>), (i64, u64), FixedState, Global> =
+        Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     for (from, to, span, _) in segments(model, path) {
         let key = span.map_or((None, None), |it| {
             (Some(model.spans[it].name.as_str()), model.spans[it].subject())

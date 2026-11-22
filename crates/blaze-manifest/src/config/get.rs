@@ -1,17 +1,42 @@
 //! `cargo config get` as cargo 1.99 prints it (`src/ops/cargo_config.rs`): the oracle the
 //! harness reads the configuration through.
 
-use std::borrow::Cow;
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::path::Path;
 use std::str::FromStr;
 
-use anyhow::{anyhow, bail};
 use serde_json::json;
 
+use super::error::{ConfigError, ConfigWhat};
+use super::key::{push_toml_key, push_toml_string};
 use super::{Config, ConfigKey, ConfigValue as CV, Definition};
-use crate::diagnostic::report;
 use crate::files::Disk;
+
+/// A value as one POSIX shell word, as cargo 1.99 prints environment variables (shell-escape
+/// 0.1.5's `unix::escape`): bare when every character is in `[A-Za-z0-9-_=/,.+]` and there is
+/// one, else in single quotes with `'` and `!` written `'\'` `'` and `'\!'`.
+struct ShellWord<'v>(&'v str);
+
+impl fmt::Display for ShellWord<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let bare = |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '=' | '/' | ',' | '.' | '+');
+        if !self.0.is_empty() && self.0.chars().all(bare) {
+            return f.write_str(self.0);
+        }
+        f.write_char('\'')?;
+        for ch in self.0.chars() {
+            match ch {
+                '\'' | '!' => {
+                    f.write_str("'\\")?;
+                    f.write_char(ch)?;
+                    f.write_char('\'')?;
+                }
+                _ => f.write_char(ch)?,
+            }
+        }
+        f.write_char('\'')
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigFormat {
@@ -21,25 +46,21 @@ pub enum ConfigFormat {
 }
 
 impl FromStr for ConfigFormat {
-    type Err = anyhow::Error;
+    type Err = ConfigError;
 
-    fn from_str(s: &str) -> anyhow::Result<Self> {
+    fn from_str(s: &str) -> Result<Self, ConfigError> {
         match s {
             "toml" => Ok(ConfigFormat::Toml),
             "json" => Ok(ConfigFormat::Json),
             "json-value" => Ok(ConfigFormat::JsonValue),
-            f => bail!("unknown config format `{f}`"),
+            f => Err(ConfigError::new(ConfigWhat::UnknownFormat { format: f.to_owned() })),
         }
     }
 }
 
 impl std::fmt::Display for ConfigFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            ConfigFormat::Toml => "toml",
-            ConfigFormat::Json => "json",
-            ConfigFormat::JsonValue => "json-value",
-        })
+        f.write_str(format_name(*self))
     }
 }
 
@@ -67,7 +88,8 @@ pub fn main(
     let mut config = match Config::load(cwd, env, &[]) {
         Ok(config) => config,
         Err(err) => {
-            return (101, Output { stdout: String::new(), stderr: report(&err, cwd) + "\n" });
+            let stderr = format!("error: {}\n", err.report());
+            return (101, Output { stdout: String::new(), stderr });
         }
     };
     let result = parse_args(args).and_then(|args| {
@@ -92,34 +114,23 @@ pub fn main(
             (0, Output { stdout: output.stdout, stderr })
         }
         Err(err) => {
-            if let Some(usage) = err.downcast_ref::<UsageError>() {
-                stderr.push_str(&usage.0);
+            if let ConfigWhat::Usage { text } = err.what() {
+                stderr.push_str(text);
                 return (1, Output { stdout: String::new(), stderr });
             }
-            let _ = writeln!(stderr, "{}", report(&err, cwd));
+            let _ = writeln!(stderr, "error: {}", err.report());
             (101, Output { stdout: String::new(), stderr })
         }
     }
 }
 
-/// A command line cargo's argument parser refuses: printed as it is, exit code 1.
-#[derive(Debug)]
-struct UsageError(String);
-
-impl std::fmt::Display for UsageError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for UsageError {}
-
-fn invalid_value(value: &str, arg: &str, possible: &str) -> anyhow::Error {
-    UsageError(format!(
-        "error: invalid value '{value}' for '{arg}'\n  [possible values: {possible}]\n\n\
-         For more information, try '--help'.\n"
-    ))
-    .into()
+fn invalid_value(value: &str, arg: &str, possible: &str) -> ConfigError {
+    ConfigError::new(ConfigWhat::Usage {
+        text: format!(
+            "error: invalid value '{value}' for '{arg}'\n  [possible values: {possible}]\n\n\
+             For more information, try '--help'.\n"
+        ),
+    })
 }
 
 struct Args {
@@ -130,7 +141,7 @@ struct Args {
     merged: bool,
 }
 
-fn parse_args(args: &[String]) -> anyhow::Result<Args> {
+fn parse_args(args: &[String]) -> Result<Args, ConfigError> {
     let mut parsed = Args {
         config: Vec::new(),
         key: None,
@@ -149,7 +160,9 @@ fn parse_args(args: &[String]) -> anyhow::Result<Args> {
             inline
                 .clone()
                 .or_else(|| args.next())
-                .ok_or_else(|| anyhow!("a value is required for '{name} <VALUE>'"))
+                .ok_or_else(|| {
+                    ConfigError::new(ConfigWhat::ValueRequired { name: name.clone() })
+                })
         };
         match name.as_str() {
             "-Zunstable-options" => {}
@@ -170,26 +183,38 @@ fn parse_args(args: &[String]) -> anyhow::Result<Args> {
                 };
             }
             _ if !arg.starts_with('-') => subcommand.push(arg),
-            _ => bail!("unexpected argument '{arg}' found"),
+            _ => {
+                return Err(ConfigError::new(ConfigWhat::UnexpectedArgument { arg: arg.clone() }));
+            }
         }
     }
     match subcommand.as_slice() {
         [config, get] if config == "config" && get == "get" => {}
         [config, get, key] if config == "config" && get == "get" => parsed.key = Some(key.clone()),
-        _ => bail!("expected `config get [KEY]`, found `{}`", subcommand.join(" ")),
+        _ => {
+            let found = subcommand.join(" ");
+            return Err(ConfigError::new(ConfigWhat::ExpectedConfigGet { found }));
+        }
     }
     Ok(parsed)
 }
 
+/// The name a format is spelled with on the command line.
+fn format_name(format: ConfigFormat) -> &'static str {
+    match format {
+        ConfigFormat::Toml => "toml",
+        ConfigFormat::Json => "json",
+        ConfigFormat::JsonValue => "json-value",
+    }
+}
+
 /// `cargo config get`. The command is unstable, so the cargo that runs it reads its `unstable`
 /// table on start, which loads the files: an error in them is an error here even unmerged.
-pub fn get(config: &Config<Disk>, opts: &GetOptions<'_>) -> anyhow::Result<Output> {
+pub fn get(config: &Config<Disk>, opts: &GetOptions<'_>) -> Result<Output, ConfigError> {
     config.ensure_loaded()?;
     if opts.show_origin && !matches!(opts.format, ConfigFormat::Toml) {
-        bail!(
-            "the `{}` format does not support --show-origin, try the `toml` format instead",
-            opts.format
-        );
+        let format = format_name(opts.format);
+        return Err(ConfigError::new(ConfigWhat::NoShowOrigin { format }));
     }
     let key = match opts.key {
         Some(key) => ConfigKey::parse(key),
@@ -197,9 +222,9 @@ pub fn get(config: &Config<Disk>, opts: &GetOptions<'_>) -> anyhow::Result<Outpu
     };
     let mut out = Output::default();
     if opts.merged {
-        let cv = config
-            .get_cv_with_env(&key)?
-            .ok_or_else(|| anyhow!("config value `{key}` is not set"))?;
+        let cv = config.get_cv_with_env(&key)?.ok_or_else(|| {
+            ConfigError::new(ConfigWhat::NotSet { key: key.to_string() })
+        })?;
         match opts.format {
             ConfigFormat::Toml => print_toml(&mut out.stdout, opts, &key, &cv),
             ConfigFormat::Json => print_json(&mut out.stdout, &key, &cv, true),
@@ -215,7 +240,7 @@ pub fn get(config: &Config<Disk>, opts: &GetOptions<'_>) -> anyhow::Result<Outpu
                         let _ = writeln!(
                             out.stdout,
                             "# {k}={}",
-                            shell_escape::escape(Cow::Borrowed(v))
+                            ShellWord(v)
                         );
                     }
                 }
@@ -225,7 +250,7 @@ pub fn get(config: &Config<Disk>, opts: &GetOptions<'_>) -> anyhow::Result<Outpu
                     );
                     for (k, v) in env {
                         let _ =
-                            writeln!(out.stderr, "{k}={}", shell_escape::escape(Cow::Borrowed(v)));
+                            writeln!(out.stderr, "{k}={}", ShellWord(v));
                     }
                 }
             }
@@ -233,9 +258,10 @@ pub fn get(config: &Config<Disk>, opts: &GetOptions<'_>) -> anyhow::Result<Outpu
     } else {
         match opts.format {
             ConfigFormat::Toml => print_toml_unmerged(config, &mut out.stdout, opts, &key)?,
-            format => bail!(
-                "the `{format}` format does not support --merged=no, try the `toml` format instead"
-            ),
+            format => {
+                let format = format_name(format);
+                return Err(ConfigError::new(ConfigWhat::NoMergedNo { format }));
+            }
         }
     }
     Ok(out)
@@ -254,17 +280,45 @@ fn maybe_env<'a>(
     (!env.is_empty()).then_some(env)
 }
 
-fn cv_to_toml(cv: &CV) -> toml_edit::Value {
+/// `cv` as an inline TOML value, as `toml_edit` writes one by default: `[a, b]`, `{ k = v }`,
+/// `{}`, a table's keys in order.
+fn write_toml(cv: &CV, out: &mut String) {
     match cv {
-        CV::String(s, _) => toml_edit::Value::from(s.as_str()),
-        CV::Integer(i, _) => toml_edit::Value::from(*i),
-        CV::Boolean(b, _) => toml_edit::Value::from(*b),
-        CV::List(l, _) => toml_edit::Value::from_iter(l.iter().map(cv_to_toml)),
-        CV::Table(t, _) => toml_edit::Value::from_iter({
+        CV::String(s, _) => push_toml_string(s, out),
+        CV::Integer(i, _) => {
+            let _ = write!(out, "{i}");
+        }
+        CV::Boolean(b, _) => {
+            let _ = write!(out, "{b}");
+        }
+        CV::List(l, _) => {
+            out.push('[');
+            for (i, cv) in l.iter().enumerate() {
+                if i != 0 {
+                    out.push_str(", ");
+                }
+                write_toml(cv, out);
+            }
+            out.push(']');
+        }
+        CV::Table(t, _) => {
+            if t.is_empty() {
+                out.push_str("{}");
+                return;
+            }
             let mut t: Vec<_> = t.iter().collect();
             t.sort_by_key(|t| t.0);
-            t.into_iter().map(|(k, v)| (k, cv_to_toml(v)))
-        }),
+            out.push_str("{ ");
+            for (i, (k, v)) in t.into_iter().enumerate() {
+                if i != 0 {
+                    out.push_str(", ");
+                }
+                push_toml_key(k, out);
+                out.push_str(" = ");
+                write_toml(v, out);
+            }
+            out.push_str(" }");
+        }
     }
 }
 
@@ -279,19 +333,24 @@ fn print_toml(out: &mut String, opts: &GetOptions<'_>, key: &ConfigKey, cv: &CV)
         CV::Integer(val, def) => {
             let _ = writeln!(out, "{key} = {val}{}", origin(def));
         }
-        CV::String(val, def) => {
-            let _ = writeln!(out, "{key} = {}{}", toml_edit::Value::from(val), origin(def));
+        CV::String(_, def) => {
+            let _ = write!(out, "{key} = ");
+            write_toml(cv, out);
+            let _ = writeln!(out, "{}", origin(def));
         }
         CV::List(vals, _) => {
             if opts.show_origin {
                 let _ = writeln!(out, "{key} = [");
                 for cv in vals {
-                    let _ = writeln!(out, "    {}, # {}", cv_to_toml(cv), cv.definition());
+                    out.push_str("    ");
+                    write_toml(cv, out);
+                    let _ = writeln!(out, ", # {}", cv.definition());
                 }
                 out.push_str("]\n");
             } else {
-                let vals: toml_edit::Array = vals.iter().map(cv_to_toml).collect();
-                let _ = writeln!(out, "{key} = {vals}");
+                let _ = write!(out, "{key} = ");
+                write_toml(cv, out);
+                out.push('\n');
             }
         }
         CV::Table(table, _) => {
@@ -347,14 +406,14 @@ fn print_toml_unmerged(
     out: &mut String,
     opts: &GetOptions<'_>,
     key: &ConfigKey,
-) -> anyhow::Result<()> {
+) -> Result<(), ConfigError> {
     let print_table = |out: &mut String, cv: &CV| {
         let _ = writeln!(out, "# {}", cv.definition());
         print_toml(out, opts, &ConfigKey::new(), cv);
         out.push('\n');
     };
 
-    fn trim_cv(mut cv: &mut CV, key: &ConfigKey) -> anyhow::Result<bool> {
+    fn trim_cv(mut cv: &mut CV, key: &ConfigKey) -> Result<bool, ConfigError> {
         for (i, part) in key.parts().enumerate() {
             match cv {
                 CV::Table(map, _) => {
@@ -369,11 +428,11 @@ fn print_toml_unmerged(
                     for part in key.parts().take(i) {
                         key_so_far.push(part);
                     }
-                    bail!(
-                        "expected table for configuration key `{key_so_far}`, but found {} in {}",
-                        cv.desc(),
-                        cv.definition()
-                    )
+                    return Err(ConfigError::new(ConfigWhat::NotATable {
+                        key: key_so_far.to_string(),
+                        found: cv.desc(),
+                        definition: cv.definition().clone(),
+                    }));
                 }
             }
         }
@@ -392,7 +451,7 @@ fn print_toml_unmerged(
     if !env.is_empty() {
         out.push_str("# Environment variables\n");
         for (k, v) in env {
-            let _ = writeln!(out, "# {k}={}", shell_escape::escape(Cow::Borrowed(v)));
+            let _ = writeln!(out, "# {k}={}", ShellWord(v));
         }
         out.push('\n');
     }
@@ -403,4 +462,25 @@ fn print_toml_unmerged(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ShellWord;
+
+    /// shell-escape 0.1.5's own cases for `unix::escape`.
+    #[test]
+    fn shell_words() {
+        let cases = [
+            ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_=/,.+", "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_=/,.+"),
+            ("--aaa=bbb-ccc", "--aaa=bbb-ccc"),
+            ("linker=gcc -L/foo -Wl,bar", "'linker=gcc -L/foo -Wl,bar'"),
+            (r#"--features="default""#, r#"'--features="default"'"#),
+            (r#"'!\$`\\\n "#, r#"''\'''\!'\$`\\\n '"#),
+            ("", "''"),
+        ];
+        for (raw, word) in cases {
+            assert_eq!(ShellWord(raw).to_string(), word, "{raw:?}");
+        }
+    }
 }

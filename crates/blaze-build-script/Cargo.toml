@@ -1,6 +1,6 @@
 [package]
 name = "blaze-build-script"
-description = "Build scripts run as cargo runs them: the environment cargo 1.99 gives a script, what it prints read as cargo reads it, and who receives what"
+description = "A build script's run as blaze keys and keeps it, sans-IO: the instruction lines it prints read into typed values, the environment it is given computed from its unit, the record of its outputs (instructions and the files it wrote into OUT_DIR) and the record's key; the census of a workspace's scripts as an example"
 publish = false
 
 version.workspace = true
@@ -14,17 +14,36 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-blaze-core.workspace = true
-blaze-hash.workspace = true
-blaze-mem.workspace = true
-blaze-serde.workspace = true
-memchr.workspace = true
-serde.workspace = true
-serde_derive.workspace = true
+# `Alloc`, `AVec`, `String`: every owner in the caller's allocator.
+blaze-own.workspace = true
+# `ContentId`, `Hasher`: the record's base key and the digests of what a run read.
+blaze-ids.workspace = true
+# A unit's cfgs, features, kind and target: what the environment is computed from.
+blaze-unit-graph.workspace = true
+# `ExpandCx`: `cx::ScriptCx` lays the outputs over a crate's expansion host (sans-IO, so the
+# names library takes it too).
+blaze-expand.workspace = true
+# `Oid`: the commit a fetched git source is (D54), and later the object store's reader.
+blaze-git-fetch.workspace = true
+# `SpawnRequest`: a deferred C request made a request for the deterministic sandbox (`c_request`).
+blaze-spawn.workspace = true
+# `lang_features`: what `#![feature(name)]` of a language feature is (probe_ask's decider).
+blaze-surface.workspace = true
+# The pinned nightly's version answers and the clang pin table (pins/, read at compile time).
+blaze-pins.workspace = true
+# `c_tasks_probe`: pins/answers/clang.json read with the no_std pull reader (no tree built).
+blaze-json.workspace = true
 
 [dev-dependencies]
-blaze-alloc-count.workspace = true
-blaze-ids.workspace = true
+# `Alloc::global()` in the tests and the census; `testing::heap()`, a test's root allocator (D102).
+blaze-own = { workspace = true, features = ["std", "testing"] }
+# The census's entry frame and each test's top frame: memory from the OS, handed down.
+blaze-mem.workspace = true
+blaze-sim.workspace = true
+# The census reads the lock and every package's manifest, as blaze-unit-graph's example does.
+blaze-manifest = { workspace = true, default-features = false }
+# The census reads sources from the fetch store's records (`PackView`), never cargo's caches.
+blaze-fetch.workspace = true
 
 [lints]
 workspace = true

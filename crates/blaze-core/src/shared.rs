@@ -1,7 +1,6 @@
 //! A small file of `u64` words mapped shared by every process that opens it, with waits and
 //! wakes on its words across processes: the driver of a ledger every blaze process of one user
-//! counts in (`blaze_graph::shared_ledger`, docs/v2/plan/design/end-state/memory.md section
-//! 4.5), with no daemon to own it.
+//! counts in (`blaze_graph::shared_ledger`), with no daemon to own it.
 //!
 //! [`Shared::open_or_create`] opens the file, or makes it: the first process writes the whole
 //! file (its header, then zeros) under a name of its own and links it into place, so every
@@ -28,6 +27,7 @@ use std::{
     sync::atomic::AtomicU64,
 };
 
+use blaze_sys::posix::{io::{MapFlags, Prot, munmap}, thread::geteuid};
 use crate::wait::{Clock, Deadline, WaitError, Waited};
 
 #[cfg(not(target_endian = "little"))]
@@ -79,8 +79,7 @@ impl Shared {
             Err(other) => return Err(io("open")(other)),
         };
         let meta = file.metadata().map_err(io("stat"))?;
-        // SAFETY: a read of this process's effective user id.
-        let mine = unsafe { libc::geteuid() };
+        let mine = geteuid();
         if meta.uid() != mine {
             return Err(error(SharedWhy::Owner { uid: meta.uid(), mine }));
         }
@@ -134,7 +133,7 @@ impl Drop for Shared {
     fn drop(&mut self) {
         // SAFETY: the mapping `map` made, of this length, unmapped once; no `&` to its words
         // outlives `self`.
-        _ = unsafe { libc::munmap(self.words.as_ptr().cast(), self.len * WORD) };
+        _ = unsafe { munmap(self.words.cast(), self.len * WORD) };
     }
 }
 
@@ -178,8 +177,8 @@ fn map(file: &File, len: usize) -> io::Result<NonNull<AtomicU64>> {
         libc::mmap(
             std::ptr::null_mut(),
             len * WORD,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
+            (Prot::READ | Prot::WRITE).bits() as core::ffi::c_int,
+            MapFlags::SHARED.bits() as core::ffi::c_int,
             file.as_raw_fd(),
             0,
         )

@@ -13,7 +13,7 @@
 
 use std::alloc::Global;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 
 use super::Mode;
 
@@ -140,7 +140,7 @@ fn age(row: &WaitRow) -> (u64, u64, u64) {
 /// order of the snapshot's rows (each thread has at most one row, as the registry keeps it).
 pub fn analyze(snapshot: &Snapshot, now_ns: u64, threshold_ns: u64) -> Vec<Stall> {
     // alloc: a watchdog's check, once a threshold passes.
-    let mut by_thread: HashMap<u64, usize, Global> = HashMap::new_in(Global);
+    let mut by_thread: Map<u64, usize, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     for (i, row) in snapshot.waits.iter().enumerate() {
         by_thread.insert(row.thread, i);
     }
@@ -149,7 +149,7 @@ pub fn analyze(snapshot: &Snapshot, now_ns: u64, threshold_ns: u64) -> Vec<Stall
     let mut stalls: Vec<Stall> = Vec::new();
     let mut seen_cycles: Vec<Vec<u64>> = Vec::new(); // alloc: as above
     // head -> (index of the stall in `stalls`, the direct waiter its `holds` is taken from)
-    let mut convoys: HashMap<u64, (usize, WaitRow), Global> = HashMap::new_in(Global);
+    let mut convoys: Map<u64, (usize, WaitRow), FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     for row in &snapshot.waits {
         // The walk from this wait, bounded by the number of waits (`bounded-progress`).
         let mut path: Vec<usize> = Vec::new(); // alloc: as above

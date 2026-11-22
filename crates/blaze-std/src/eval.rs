@@ -69,7 +69,7 @@
 //!
 //! # Memory
 //!
-//! [`Eval::memo`] keeps its entries in two generations, each a map ([`HashMap`]) and its values in
+//! [`Eval::memo`] keeps its entries in two generations, each a map ([`Map`]) and its values in
 //! an arena of [`Mem`] of half the byte limit. A new entry goes to the young one; when that
 //! holds half the entry limit, or its arena is full, the old generation's entries are dropped
 //! whole, its arena is reset, and the two swap. So no entry is freed piecemeal (an arena is a
@@ -102,14 +102,49 @@ use crate::{
     Plant, Stopped,
     cx::Cx,
     id::{ContentHasher, ContentId},
-    map::HashMap,
+    map::{FixedState, Map, MapOpts},
     mem::{Arena, Mem},
     sync::{LocalLock, LocalShared},
 };
 
 /// A function marked `#[blaze::memo]`: its item type, and nothing else. The trait solver
 /// implements it (`core::reflect::MemoPoint`, a lang item); no impl of it can be written.
+#[cfg(blaze)]
 pub use core::reflect::MemoPoint;
+
+/// What blaze's `MemoPoint` is under rustc, which has no such lang item: every type, by one
+/// blanket impl, so no other impl can be written. Weaker than blaze's (std.md, "Two
+/// builders"): rustc does not hold a memo point to `#[blaze::memo]` nor to `#[blaze::pure]`,
+/// so a closure or an unmarked function is taken too; only blaze refuses them.
+#[cfg(not(blaze))]
+pub trait MemoPoint {}
+
+#[cfg(not(blaze))]
+impl<F: ?Sized> MemoPoint for F {}
+
+/// A point's code identity under rustc, which has no `core::reflect::code_id_of`: the BLAKE3
+/// of the instance's `TypeId` (as its `Debug` prints all 128 bits) under [`POINT_DOMAIN`].
+/// Weaker than blaze's: it is one process's identity, equal for one instance and different for
+/// two, not the content of the code, so it says nothing across builds; and a point that calls
+/// itself is not refused. Enough for `Eval::memo`, which keeps nothing past the process.
+#[cfg(not(blaze))]
+fn code_id_of<F: ?Sized>() -> ContentId {
+    struct Feed(ContentHasher);
+    impl fmt::Write for Feed {
+        fn write_str(&mut self, text: &str) -> fmt::Result {
+            self.0.update(text.as_bytes());
+            Ok(())
+        }
+    }
+    let mut into = Feed(ContentHasher::new(POINT_DOMAIN));
+    // A `TypeId`'s `Debug` writes into a hasher, which never fails.
+    let _ = fmt::Write::write_fmt(&mut into, format_args!("{:?}", core::mem::type_info::of::<F>()));
+    into.0.finish()
+}
+
+/// The domain of a point's identity under rustc ([`MemoPoint`]'s plain form).
+#[cfg(not(blaze))]
+const POINT_DOMAIN: &str = "bstd eval point by TypeId 1";
 
 /// The domain of a [`Key`]: the arguments of one call of a memo point.
 pub const KEY_DOMAIN: &str = "bstd eval key 1";
@@ -142,8 +177,11 @@ impl Point {
     pub fn of_type<F: MemoPoint>() -> Point {
         // A constant of each instance of `F`: its value is in the code identity of whatever
         // names it, so a point's own identity covers the points it calls.
-        let code = const { core::reflect::code_id_of::<F>() };
-        Point { code: ContentId(code), path: core::any::type_name::<F>() }
+        #[cfg(blaze)]
+        let code = ContentId(const { core::reflect::code_id_of::<F>() });
+        #[cfg(not(blaze))]
+        let code = code_id_of::<F>();
+        Point { code, path: core::any::type_name::<F>() }
     }
 
     /// Its code identity.
@@ -824,7 +862,7 @@ where
         let this = self.key.map(|key| Called { point: self.point, key });
         let parent = match self.cx.plant() {
             Plant::NestedUnderGrandparent => self.parent,
-            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned => this,
+            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates | Plant::AncestorsUnbounded => this,
         };
         let mut running = Running { eval: self.top, cx: self.cx, parent };
         self.out = Some((self.f)(&mut Nested { door: &mut running }, args));
@@ -892,7 +930,7 @@ struct Generations {
 
 struct Generation {
     /// `None` only inside [`Generation::empty`], between dropping the map and making the next.
-    entries: Option<HashMap<Called, Kept, Alloc>>,
+    entries: Option<Map<Called, Kept, FixedState, Alloc>>,
     alloc: Alloc,
 }
 
@@ -900,7 +938,7 @@ impl Generation {
     fn new(arena: Arena) -> Generation {
         // alloc: once per generation of an evaluator, the owner of its arena's frame.
         let alloc = LocalShared::new(arena.into_frame());
-        Generation { entries: Some(HashMap::new_in(LocalShared::clone(&alloc))), alloc }
+        Generation { entries: Some(Map::new(MapOpts { hasher: FixedState, alloc: LocalShared::clone(&alloc), capacity: None })), alloc }
     }
 
     fn get(&self, slot: &Called) -> Option<&Kept> {
@@ -925,7 +963,7 @@ impl Generation {
                  which were dropped",
             )
             .reset();
-        self.entries = Some(HashMap::new_in(LocalShared::clone(&self.alloc)));
+        self.entries = Some(Map::new(MapOpts { hasher: FixedState, alloc: LocalShared::clone(&self.alloc), capacity: None }));
         dropped
     }
 
@@ -963,7 +1001,7 @@ impl Memo {
         let plant = cx.plant();
         let point = match plant {
             Plant::MemoSharesPoints => Point::none(),
-            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned => call.point(),
+            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates | Plant::AncestorsUnbounded => call.point(),
         };
         let slot = Called { point, key: call.key() };
         {
@@ -1028,7 +1066,7 @@ impl Memo {
 /// reads it once the work is done; [`Provenance`] writes it.
 pub struct Graph<'m> {
     arena: &'m Arena,
-    edges: LocalLock<HashMap<Called, Vec<Called, &'m Frame>, &'m Frame>>,
+    edges: LocalLock<Map<Called, Vec<Called, &'m Frame>, FixedState, &'m Frame>>,
     /// The calls the program made itself, in the order it first made them.
     roots: LocalLock<Vec<Called, &'m Frame>>,
     /// The first call that could not be recorded: the arena had no room.
@@ -1042,7 +1080,7 @@ impl<'m> Graph<'m> {
     pub fn new_in(arena: &'m Arena) -> Graph<'m> {
         Graph {
             arena,
-            edges: LocalLock::new(HashMap::new_in(arena.alloc())),
+            edges: LocalLock::new(Map::new(MapOpts { hasher: FixedState, alloc: arena.alloc(), capacity: None })),
             roots: LocalLock::new(Vec::new_in(arena.alloc())),
             failed: LocalLock::new(None),
         }

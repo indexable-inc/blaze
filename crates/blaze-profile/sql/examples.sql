@@ -1076,7 +1076,7 @@ ORDER BY executed DESC, written DESC NULLS LAST, query
 LIMIT $limit
 
 -- name: validity
--- says: how a build's rows of an earlier view were proved unchanged (the validity census: `query_counts`' `proved_*` and `edge_*` columns summed over its queries, each row counted under the first proof to answer): by each shortcut that looks at no edge, in the order the engine asks them (the seal, durability, the input summary, the floor by each, a changed-set walk's end, a walk's reach), and by comparing edges (the claim-free walk, the claimed path), each with its share of them all in percent; then, with no share, the walk-end and reach proofs a fetch asked before any other, the rows left on walks that gave up, and the edges compared. A shortcut at 0 on every row of the edit loop is one to delete (docs/v2/plan/design/end-state.md); null counts are a history from before the census
+-- says: how a build's rows of an earlier view were proved unchanged (the validity census: `query_counts`' `proved_*` and `edge_*` columns summed over its queries, each row counted under the first proof to answer): by each shortcut that looks at no edge, in the order the engine asks them (the seal, durability, the input summary, the floor by each, a changed-set walk's end, a walk's reach), and by comparing edges (the claim-free walk, the claimed path), each with its share of them all in percent; then, with no share, the walk-end and reach proofs a fetch asked before any other, the rows left on walks that gave up, and the edges compared. A shortcut at 0 on every row of the edit loop is one to delete; null counts are a history from before the census
 WITH census AS (
     SELECT
         CAST(sum(q.proved_seal) AS BIGINT) AS seal,

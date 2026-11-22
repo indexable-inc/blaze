@@ -64,8 +64,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_mem::{RegionVec, Tag as MemTag};
+use blaze_sys::{Errno, Fd, Path as SysPath, linux, posix::proc::PATH_MAX};
 use std::alloc::{Allocator, Global};
 
 use crate::{
@@ -133,15 +134,6 @@ fn planted(plant: Plant) -> bool {
     PLANT.get() == plant
 }
 
-const CLASS_NOTIF: u32 = 0x0;
-const CLOEXEC: u32 = 0x1;
-const NONBLOCK: u32 = 0x2;
-const REPORT_DIR_FID: u32 = 0x400;
-const REPORT_NAME: u32 = 0x800;
-
-const MARK_ADD: u32 = 0x1;
-const MARK_FILESYSTEM: u32 = 0x100;
-
 const MODIFY: u64 = 0x2;
 const ATTRIB: u64 = 0x4;
 const CLOSE_WRITE: u64 = 0x8;
@@ -202,8 +194,8 @@ enum Kind {
 /// Whether `error` is of opening a directory gone, or made unreadable, since an event named it.
 fn gone(error: &io::Error) -> bool {
     matches!(
-        error.raw_os_error(),
-        Some(libc::ENOENT | libc::ENOTDIR | libc::ESTALE | libc::EACCES | libc::ELOOP)
+        error.raw_os_error().and_then(|code| u16::try_from(code).ok()).map(Errno::from_raw),
+        Some(Errno::NoEnt | Errno::NotDir | Errno::Stale | Errno::Acces | Errno::Loop)
     )
 }
 
@@ -215,7 +207,7 @@ const SEEN: usize = 1 << 16;
 /// each lookup hashes the key once and compares the bytes of the entries of its hash.
 struct Dirs<V> {
     /// The first entry of each hash.
-    heads: HashMap<u64, u32, Global>,
+    heads: Map<u64, u32, FixedState, Global>,
     entries: RegionVec<Entry<V>>,
     /// The first entry let go, the rest through their `next`.
     free: u32,
@@ -245,7 +237,7 @@ impl<V: Copy> Dirs<V> {
     fn new(heads: usize) -> io::Result<Dirs<V>> {
         Ok(Dirs {
             // alloc: setup, once per room, reused by every watch after.
-            heads: HashMap::with_capacity_in(heads, Global),
+            heads: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(heads) }),
             entries: RegionVec::new(DIRS, MemTag::Io).map_err(io::Error::other)?,
             free: NONE,
             len: 0,
@@ -420,19 +412,17 @@ impl Fanotify {
         nonblocking: bool,
         room: Option<Room>,
     ) -> io::Result<Fanotify> {
-        let flags = CLASS_NOTIF
-            | CLOEXEC
-            | REPORT_DIR_FID
-            | REPORT_NAME
-            | if nonblocking { NONBLOCK } else { 0 };
-        let event_flags = (libc::O_RDONLY | libc::O_CLOEXEC) as libc::c_uint;
-        // SAFETY: no pointers; a descriptor of its own or -1.
-        let fd = unsafe { libc::syscall(libc::SYS_fanotify_init, flags, event_flags) };
-        if fd < 0 {
-            let error = io::Error::last_os_error();
-            return Err(match error.raw_os_error() {
-                Some(libc::EPERM) => error,
-                Some(libc::EINVAL) => io::Error::new(
+        let flags = linux::FanInit::CLASS_NOTIF
+            | linux::FanInit::CLOSE_ON_EXEC
+            | linux::FanInit::REPORT_DIR_FID
+            | linux::FanInit::REPORT_NAME
+            | if nonblocking { linux::FanInit::NONBLOCK } else { linux::FanInit::NONE };
+        let event_flags = linux::OpenFlags::READ | linux::OpenFlags::CLOSE_ON_EXEC;
+        let fd = linux::fanotify_init(flags, event_flags).map_err(|errno| {
+            let error = io::Error::from_raw_os_error(i32::from(errno.raw()));
+            match errno {
+                Errno::Perm => error,
+                Errno::Inval => io::Error::new(
                     io::ErrorKind::Unsupported,
                     // alloc: the error of a watch that failed.
                     format!(
@@ -442,10 +432,10 @@ impl Fanotify {
                     ),
                 ),
                 _ => named(&error, "fanotify_init"),
-            });
-        }
-        // SAFETY: the call returned a descriptor of its own.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
+            }
+        })?;
+        // SAFETY: into_raw transfers the new open descriptor's sole ownership.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd.into_raw()) };
         let mut room = match room {
             Some(room) => room,
             None => Room::new()?,
@@ -676,7 +666,10 @@ impl Fanotify {
             // directory and those above it are learned at the start, so the end of the watched
             // directory is placed even where its parent went too. So a directory gone that was
             // never learned is dropped as outside, and its place is cached so (`place`).
-            Err(error) if matches!(error.raw_os_error(), Some(libc::ESTALE | libc::ENOENT)) => {
+            Err(error) if matches!(
+                error.raw_os_error().and_then(|code| u16::try_from(code).ok()).map(Errno::from_raw),
+                Some(Errno::Stale | Errno::NoEnt)
+            ) => {
                 let Some(((), name)) = known.get(key) else {
                     GONE.fetch_add(1, Ordering::Relaxed);
                     return Ok(Kind::Outside);
@@ -707,22 +700,18 @@ fn mark<A: Allocator>(
     if mounts.iter().any(|it| it.fsid == fsid) {
         return Ok((fsid, handle));
     }
-    // SAFETY: a fanotify descriptor and a NUL-terminated path.
-    let marked = unsafe {
-        libc::syscall(
-            libc::SYS_fanotify_mark,
-            fanotify,
-            MARK_ADD | MARK_FILESYSTEM,
-            MASK,
-            libc::AT_FDCWD,
-            path.as_ptr(),
-        )
-    };
+    let marked = linux::fanotify_mark(
+        Fd::new(fanotify),
+        linux::FanMark::ADD | linux::FanMark::FILESYSTEM,
+        linux::FanMask::from_bits(MASK),
+        linux::CWD,
+        SysPath::new(path),
+    );
     *calls += 1;
-    if marked != 0 {
-        let error = io::Error::last_os_error();
-        return Err(match error.raw_os_error() {
-            Some(libc::EXDEV | libc::EOPNOTSUPP | libc::ENODEV) => io::Error::new(
+    if let Err(errno) = marked {
+        let error = io::Error::from_raw_os_error(i32::from(errno.raw()));
+        return Err(match errno {
+            Errno::XDev | Errno::OpNotSupp | Errno::NoDev => io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!(
                     "fanotify cannot watch the file system of {} by file handles: {error}",
@@ -748,7 +737,7 @@ fn mark<A: Allocator>(
 /// missing.
 fn no_handles(error: io::Error, path: &CStr) -> io::Error {
     match error.raw_os_error() {
-        Some(libc::EOPNOTSUPP) => io::Error::new(
+        Some(code) if code == i32::from(Errno::OpNotSupp.raw()) => io::Error::new(
             io::ErrorKind::Unsupported,
             format!(
                 "the file system of {} gives no file handles, which watching it with fanotify \
@@ -986,25 +975,20 @@ impl Key {
 
 /// The id of the file system of `fd`, as fanotify's events carry it.
 fn fsid(fd: RawFd) -> io::Result<[u8; 8]> {
-    // SAFETY: all zeros is a valid `statfs`; the call fills it.
-    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-    // SAFETY: an open descriptor and a `statfs` to write.
-    if unsafe { libc::fstatfs(fd, &mut stat) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let stat = linux::fstatfs(Fd::new(fd))
+        .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))?;
     Ok(fsid_of(&stat))
 }
 
 /// The id of the file system that holds `path`, as fanotify's events carry it.
 fn fsid_at(path: &CStr) -> io::Result<[u8; 8]> {
-    crate::raw::statfs(path).map(|stat| fsid_of(&stat))
+    linux::task::statfs(SysPath::new(path))
+        .map(|stat| fsid_of(&stat))
+        .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))
 }
 
-fn fsid_of(stat: &libc::statfs) -> [u8; 8] {
-    // SAFETY: `fsid_t` is two `int`s (`__kernel_fsid_t`), whose field libc keeps private, so no
-    // safe read of it exists; `transmute` checks the sizes match, and every bit pattern is an
-    // `[i32; 2]`.
-    let words: [i32; 2] = unsafe { std::mem::transmute(stat.f_fsid) };
+fn fsid_of(stat: &linux::Statfs) -> [u8; 8] {
+    let words = stat.fsid;
     let mut fsid = [0; 8];
     fsid[..4].copy_from_slice(&words[0].to_ne_bytes());
     fsid[4..].copy_from_slice(&words[1].to_ne_bytes());
@@ -1013,23 +997,23 @@ fn fsid_of(stat: &libc::statfs) -> [u8; 8] {
 
 /// The handle of the directory open as `fd`, on the stack.
 fn handle_of(fd: RawFd) -> io::Result<Handle> {
-    name_to_handle(fd, c"", libc::AT_EMPTY_PATH)
+    name_to_handle(fd, c"", linux::AtFlags::EMPTY_PATH.bits() as core::ffi::c_int)
 }
 
 /// The handle of the directory at `path`, links followed, on the stack: no descriptor opened,
 /// so a directory this process may only pass through is had too.
 fn handle_at(path: &CStr) -> io::Result<Handle> {
-    name_to_handle(libc::AT_FDCWD, path, libc::AT_SYMLINK_FOLLOW)
+    name_to_handle(linux::CWD.raw(), path, linux::AtFlags::FOLLOW.bits() as core::ffi::c_int)
 }
 
-fn name_to_handle(fd: RawFd, path: &CStr, flags: libc::c_int) -> io::Result<Handle> {
+fn name_to_handle(fd: RawFd, path: &CStr, flags: core::ffi::c_int) -> io::Result<Handle> {
     let mut handle = Handle { bytes: MAX_HANDLE as u32, kind: 0, handle: [0; MAX_HANDLE] };
-    let mut mount_id: libc::c_int = 0;
+    let mut mount_id: core::ffi::c_int = 0;
     // SAFETY: a descriptor (open, or `AT_FDCWD`) with a NUL-terminated path (empty with
     // `AT_EMPTY_PATH`), a handle with room for `bytes` bytes, and an int for the mount's id.
     let got = unsafe {
         libc::syscall(
-            libc::SYS_name_to_handle_at,
+            linux::nr::NAME_TO_HANDLE_AT as core::ffi::c_long,
             fd,
             path.as_ptr(),
             &raw mut handle,
@@ -1053,10 +1037,10 @@ fn open_by_handle(mount: RawFd, kind: i32, bytes: &[u8]) -> io::Result<OwnedFd> 
     // SAFETY: an open descriptor and a handle of `bytes` bytes; a descriptor of its own or -1.
     let fd = unsafe {
         libc::syscall(
-            libc::SYS_open_by_handle_at,
+            linux::nr::OPEN_BY_HANDLE_AT as core::ffi::c_long,
             mount,
             &raw mut handle,
-            libc::O_PATH | libc::O_CLOEXEC,
+            linux::OpenFlags::PATH.with(linux::OpenFlags::CLOSE_ON_EXEC).bits() as core::ffi::c_int,
         )
     };
     if fd < 0 {
@@ -1072,29 +1056,21 @@ fn path_of(fd: &OwnedFd, link: &mut Vec<u8>) -> io::Result<usize> {
     let mut proc = [0u8; 32];
     _ = write!(&mut proc[..], "/proc/self/fd/{}\0", fd.as_raw_fd());
     let proc = CStr::from_bytes_until_nul(&proc).expect("a NUL written after the digits");
-    if link.len() < libc::PATH_MAX as usize {
-        link.resize(libc::PATH_MAX as usize, 0);
+    if link.len() < PATH_MAX as usize {
+        link.resize(PATH_MAX as usize, 0);
     }
-    // SAFETY: a NUL-terminated path, and `link.len()` bytes to write the link into, which the
-    // call writes at most.
-    let got = unsafe { libc::readlink(proc.as_ptr(), link.as_mut_ptr().cast(), link.len()) };
-    if got < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let len = got as usize;
-    if len == link.len() {
-        return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
-    }
-    match link[..len].ends_with(b" (deleted)") {
-        true => Err(io::Error::from_raw_os_error(libc::ESTALE)),
-        false => Ok(len),
+    let target = linux::readlinkat(linux::CWD, SysPath::new(proc), link)
+        .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))?;
+    match target.ends_with(b" (deleted)") {
+        true => Err(io::Error::from_raw_os_error(i32::from(Errno::Stale.raw()))),
+        false => Ok(target.len()),
     }
 }
 
 /// `root` with its links resolved (`realpath(3)`, as [`std::fs::canonicalize`] does), into
 /// `into`.
 fn canonical(root: &Path, into: &mut PathBuf) -> io::Result<()> {
-    let mut resolved = [0 as libc::c_char; libc::PATH_MAX as usize];
+    let mut resolved = [0 as core::ffi::c_char; PATH_MAX as usize];
     blaze_mem::scratch::with_bytes(|c| {
         c.extend_from_slice(root.as_os_str().as_bytes());
         c.push(0);
@@ -1115,7 +1091,7 @@ fn canonical(root: &Path, into: &mut PathBuf) -> io::Result<()> {
 /// `error` with what was being done, except a bare `EPERM`, which says a privilege is missing.
 fn keep_eperm(error: io::Error, what: &str) -> io::Error {
     match error.raw_os_error() {
-        Some(libc::EPERM) => error,
+        Some(code) if code == i32::from(Errno::Perm.raw()) => error,
         _ => named(&error, what),
     }
 }
@@ -1222,7 +1198,7 @@ mod tests {
         for seed in 0..32 {
             let mut rng = crate::sim::Rng::new(seed);
             let mut ours: Dirs<u64> = Dirs::new(64).unwrap();
-            let mut theirs: HashMap<Vec<u8>, (u64, String), Global> = HashMap::new_in(Global);
+            let mut theirs: Map<Vec<u8>, (u64, String), FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
             for step in 0..4_000u64 {
                 let handle = [rng.below(8) as u8, rng.below(8) as u8];
                 let key = Key::of(&[seed as u8; 8], 1, &handle[..1 + rng.below(2) as usize]);
@@ -1344,7 +1320,7 @@ mod tests {
     fn privileged(root: &Path, dir: &FileName) -> Option<Fanotify> {
         match Fanotify::new(root, dir, true, None) {
             Ok(it) => Some(it),
-            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+            Err(error) if error.raw_os_error() == Some(i32::from(Errno::Perm.raw())) => {
                 eprintln!("skipped: fanotify needs CAP_SYS_ADMIN and CAP_DAC_READ_SEARCH: {error}");
                 None
             }
@@ -1361,17 +1337,19 @@ mod tests {
         let clock = crate::wait::Monotonic::new();
         let deadline = crate::wait::Deadline::after(clock.now(), Duration::from_secs(10));
         while !heard.contains(until) {
-            let mut fds = [libc::pollfd { fd: watch.raw(), events: libc::POLLIN, revents: 0 }];
+            let mut fds = [libc::pollfd {
+                fd: watch.raw(),
+                events: linux::PollEvents::IN.bits(),
+                revents: 0,
+            }];
             let waited =
                 crate::wait::readable("a test's fanotify events", &mut fds, Some(deadline), &clock)
                     .unwrap();
             if matches!(waited, crate::wait::Waited::Deadline) {
                 break;
             }
-            // SAFETY: the buffer has room for what is read.
-            let n = unsafe { libc::read(watch.raw(), buffer.as_mut_ptr().cast(), buffer.len()) };
-            if n > 0 {
-                let Done::Changed { files, .. } = watch.take(&buffer[..n as usize]) else {
+            if let Ok(n @ 1..) = linux::read(Fd::new(watch.raw()), &mut buffer) {
+                let Done::Changed { files, .. } = watch.take(&buffer[..n]) else {
                     unreachable!()
                 };
                 heard.extend(files);
@@ -1420,18 +1398,16 @@ mod tests {
             let root = crate::temp::TempDir::for_test("blaze-fanotify-mount-");
             std::fs::create_dir_all(root.join("src/sub")).unwrap();
             let sub = std::ffi::CString::new(root.join("src/sub").as_os_str().as_bytes()).unwrap();
-            // SAFETY: NUL-terminated strings and no data.
-            let mounted = unsafe {
-                libc::mount(
-                    c"tmpfs".as_ptr(),
-                    sub.as_ptr(),
-                    c"tmpfs".as_ptr(),
-                    0,
-                    std::ptr::null(),
-                )
-            };
-            if mounted != 0 {
-                eprintln!("skipped: mounting a tmpfs: {}", io::Error::last_os_error());
+            let tmpfs = SysPath::new(c"tmpfs");
+            if let Err(error) = linux::task::mount(
+                Some(tmpfs),
+                SysPath::new(&sub),
+                Some(tmpfs),
+                linux::task::MountFlags::NONE,
+                None,
+            ) {
+                let error = io::Error::from_raw_os_error(i32::from(error.raw()));
+                eprintln!("skipped: mounting a tmpfs: {error}");
                 return None;
             }
             let src = FileName::new("src").unwrap();
@@ -1439,14 +1415,15 @@ mod tests {
             let watch = Fanotify::new(&root, &src, true, None);
             PLANT.set(Plant::None);
             let unmount = || {
-                // SAFETY: a NUL-terminated path.
-                assert_eq!(unsafe { libc::umount2(sub.as_ptr(), libc::MNT_DETACH) }, 0);
+                let unmounted =
+                    linux::task::umount2(SysPath::new(&sub), linux::task::UnmountFlags::DETACH);
+                assert_eq!(unmounted.map_or(-1, |()| 0), 0);
             };
             let mut watch = match watch {
                 Ok(it) => it,
                 Err(error) => {
                     unmount();
-                    match error.raw_os_error() == Some(libc::EPERM)
+                    match error.raw_os_error() == Some(i32::from(Errno::Perm.raw()))
                         || error.kind() == io::ErrorKind::Unsupported
                     {
                         // A kernel whose tmpfs has no fsid fanotify takes (before 6.7) cannot
@@ -1518,7 +1495,7 @@ mod tests {
         for round in 0..2 {
             let mut watch = match Fanotify::new(&root, &src, true, room.take()) {
                 Ok(it) => it,
-                Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+                Err(error) if error.raw_os_error() == Some(i32::from(Errno::Perm.raw())) => {
                     eprintln!(
                         "skipped: fanotify needs CAP_SYS_ADMIN and CAP_DAC_READ_SEARCH: {error}"
                     );
@@ -1537,7 +1514,11 @@ mod tests {
             let deadline = crate::wait::Deadline::after(clock.now(), Duration::from_secs(10));
             let want = FileName::new(&format!("{deep}/lib.rs")).unwrap();
             while !heard.contains(&want) {
-                let mut fds = [libc::pollfd { fd: watch.raw(), events: libc::POLLIN, revents: 0 }];
+                let mut fds = [libc::pollfd {
+                    fd: watch.raw(),
+                    events: linux::PollEvents::IN.bits(),
+                    revents: 0,
+                }];
                 // Until an event comes or the deadline passes; the watch reads nonblocking.
                 let waited = crate::wait::readable(
                     "the fanotify watch's events",
@@ -1549,11 +1530,8 @@ mod tests {
                 if matches!(waited, crate::wait::Waited::Deadline) {
                     break;
                 }
-                // SAFETY: the buffer has room for what is read.
-                let n =
-                    unsafe { libc::read(watch.raw(), buffer.as_mut_ptr().cast(), buffer.len()) };
-                if n > 0 {
-                    let Done::Changed { files, .. } = watch.take(&buffer[..n as usize]) else {
+                if let Ok(n @ 1..) = linux::read(Fd::new(watch.raw()), &mut buffer) {
+                    let Done::Changed { files, .. } = watch.take(&buffer[..n]) else {
                         unreachable!()
                     };
                     heard.extend(files);

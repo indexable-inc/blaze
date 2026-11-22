@@ -1,0 +1,10 @@
+{
+  "date": "2026-11-20",
+  "model": "claude-opus-5-5",
+  "lane": "W1 group b (codec and format crates)",
+  "area": "blaze-sim `plants!` with a production plant seam (blaze-own planted.rs)",
+  "annoyance": "`plants!` declares the plant enum itself and implements blaze-sim's `Plant` for it, but blaze-sim is a dev-dependency: a shipped function generic over `Planted<P>` needs `P` declared in the shipped crate, so `plants!` cannot declare it. Every crate ends with two enums of the same variants, the production `XPlant` (implementing `Plants`) and a test `XControl` from `plants!`, joined by a hand-written `fn planted(self) -> XPlant` (blaze-engine ready_sim.rs does the same). The planted.rs and control.rs docs show `plants!` as if it declared the seam's enum.",
+  "workaround": "One production `XPlant` per crate in src/plant.rs; one `plants!` enum per oracle in the tests, each mapping its variants to `XPlant` by `planted()`, so an oracle names only the plants it judges.",
+  "fix": "A `plants!` form that takes an existing `Plants` enum (`plants! { impl for XPlant breaks XBroken { .. } }`), writing only the `Plant` impl, so a variant without its pattern still does not compile and no mapping is written by hand.",
+  "state": "open"
+}

@@ -67,6 +67,32 @@ pub(crate) fn random(len: usize) -> Done {
     Done::Random(bytes)
 }
 
+/// [`Effect::Roots`](crate::Effect::Roots): the machine's trust anchors, read now; asked once,
+/// on a process's first connection. Where [`crate::trust`] reads no store, refused by name.
+pub(crate) fn roots(cert_file: Option<String>, cert_dir: Option<String>) -> Done {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let places = crate::trust::Places {
+            cert_file: cert_file.as_deref().map(std::ffi::OsStr::new),
+            cert_dir: cert_dir.as_deref().map(std::ffi::OsStr::new),
+        };
+        match crate::trust::system(places, std::alloc::Global) {
+            // alloc: once per process, its roots.
+            Ok(roots) => Done::Roots(Box::new(roots)),
+            // alloc: an error path.
+            Err(error) => Done::Untrusted(Box::new(error)),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (cert_file, cert_dir);
+        // alloc: an error path.
+        Done::Failed(IoError(String::from(
+            "Effect::Roots is refused on this target: crate::trust reads the stores of macOS and Linux only",
+        )))
+    }
+}
+
 /// `effect`, a socket's or a standard stream's, refused where the driver has none: the IOCP
 /// driver's and WASI's. Its buffer comes back as [`Effect::Send`]'s and [`Effect::Recv`]'s do.
 ///
@@ -122,6 +148,7 @@ pub(crate) fn refused(effect: crate::Effect) -> Done {
 
 #[cfg(unix)]
 mod unix {
+    use blaze_sys::posix::io::PollEvents;
     use std::{
         alloc::Global,
         io,
@@ -133,9 +160,9 @@ mod unix {
         },
     };
 
-    use blaze_hash::HashMap;
-    use crossbeam_channel::{Receiver, Sender};
-    use crossbeam_queue::SegQueue;
+    use blaze_hash::{FixedState, Map, MapOpts};
+    use crate::chan::{Receiver, Sender};
+    use blaze_queue::SegQueue;
 
     use crate::{
         Completion, Dgram, Done, Effect, IoError, RECV_MOST, Stream, Tag,
@@ -181,10 +208,12 @@ mod unix {
         socket: UdpSocket,
         local: SocketAddr,
         options: Options,
+        /// Its buffers as the kernel said them once bound.
+        buffers: crate::sockopt::Buffers,
         /// Fired as it is unbound.
         stop: Stop,
         /// The receives asked of it, in order, for its one receiving thread.
-        receives: SegQueue<Receive>,
+        receives: SegQueue<Receive, std::alloc::Global>,
         /// What its receiving thread parks on while `receives` is empty.
         parker: Parker,
         /// Whether its receiving thread was started.
@@ -242,7 +271,7 @@ mod unix {
         /// Made with the first effect that waits.
         shared: Option<Arc<Shared>>,
         /// Each socket bound, by its [`Dgram`].
-        socks: HashMap<u64, Arc<Bound>, Global>,
+        socks: Map<u64, Arc<Bound>, FixedState, Global>,
         /// The next socket's name: from 1, never named twice.
         next: u64,
         /// The queues of the threads that write the standard output and error, and read the
@@ -258,7 +287,7 @@ mod unix {
             Host {
                 sink,
                 shared: None,
-                socks: HashMap::new_in(Global),
+                socks: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
                 next: 1,
                 stdout: None,
                 stderr: None,
@@ -280,6 +309,7 @@ mod unix {
                     | Effect::WriteOut { .. }
                     | Effect::Now { .. }
                     | Effect::Random { .. }
+                    | Effect::Roots { .. }
             )
         }
 
@@ -306,15 +336,29 @@ mod unix {
             match effect {
                 Effect::Now { tag } => self.tell(tag, super::wall()),
                 Effect::Random { len, tag } => self.tell(tag, super::random(len)),
+                // On a thread of its own, as a resolve: macOS's keychain calls go through
+                // securityd, and the driver's thread never waits on another process.
+                Effect::Roots { cert_file, cert_dir, tag } => {
+                    let started = self.shared().and_then(|shared| {
+                        spawn("blaze-host-roots", move || {
+                            let done = super::roots(cert_file, cert_dir);
+                            shared.sink.tell(Completion { tag, done });
+                        })
+                    });
+                    if let Err(error) = started {
+                        // alloc: an error path.
+                        self.tell(tag, Done::Failed(IoError(format!("Effect::Roots: starting its thread: {error}"))));
+                    }
+                }
                 Effect::Bind { at, options, tag } => {
                     let sock = Dgram(self.next);
                     let done = match bind(sock, at, options) {
                         Ok(bound) => {
                             self.next += 1;
-                            let local = bound.local;
+                            let (local, buffers) = (bound.local, bound.buffers);
                             // Once per socket bound, shared with its receiving thread.
                             self.socks.insert(sock.0, Arc::new_in(bound, Global));
-                            Done::Bound { sock, local }
+                            Done::Bound { sock, local, buffers }
                         }
                         Err((what, error)) => Done::Failed(IoError(format!(
                             "binding a UDP socket at {at} ({options:?}): {what}: {error}"
@@ -499,7 +543,7 @@ mod unix {
                     }
                 },
             };
-            if let Err(crossbeam_channel::SendError(write)) = queue.send(Write { tag, bytes }) {
+            if let Err(crate::chan::SendError(write)) = queue.send(Write { tag, bytes }) {
                 let done = Done::unsent(
                     write.bytes,
                     format_args!("writing {stream}: its thread has ended"),
@@ -512,7 +556,7 @@ mod unix {
         fn stream_thread(&mut self, stream: Stream) -> io::Result<Sender<Write>> {
             let shared = self.shared()?;
             // alloc: once per stream written, the queue of its writes.
-            let (send, take): (Sender<Write>, Receiver<Write>) = crossbeam_channel::unbounded();
+            let (send, take): (Sender<Write>, Receiver<Write>) = crate::chan::unbounded();
             spawn("blaze-host-out", move || {
                 while let Ok(Write { tag, bytes }) = take.recv() {
                     let done = write_all(&shared, stream, bytes);
@@ -533,7 +577,7 @@ mod unix {
                 let started = self.shared().and_then(|shared| {
                     // alloc: once per host that reads its input, the queue of its reads.
                     let (send, take): (Sender<Read>, Receiver<Read>) =
-                        crossbeam_channel::unbounded();
+                        crate::chan::unbounded();
                     spawn("blaze-host-in", move || {
                         while let Ok(Read { tag, most, into }) = take.recv() {
                             let done = read_input(&shared, most, into);
@@ -556,7 +600,7 @@ mod unix {
                 }
             }
             let queue = self.stdin.as_ref().expect("started above");
-            if let Err(crossbeam_channel::SendError(read)) = queue.send(Read { tag, most, into }) {
+            if let Err(crate::chan::SendError(read)) = queue.send(Read { tag, most, into }) {
                 let why = "reading the standard input: its thread has ended";
                 self.tell(tag, Done::unread(read.into, why));
             }
@@ -588,12 +632,18 @@ mod unix {
     ) -> Result<Bound, (&'static str, io::Error)> {
         let socket: UdpSocket = udp::bind(at, options)?;
         let local = socket.local_addr().map_err(|error| ("its address", error))?;
+        let buffers = {
+            use std::os::fd::AsRawFd as _;
+            crate::sockopt::buffers(socket.as_raw_fd(), at.is_ipv6())
+        }
+        .map_err(|error| ("its buffers read back", error))?;
         let stop = Stop::new().map_err(|error| ("its stop", error))?;
         Ok(Bound {
             sock,
             socket,
             local,
             options,
+            buffers,
             stop,
             receives: SegQueue::new(),
             parker: Parker::new(),
@@ -635,17 +685,17 @@ mod unix {
     fn wait_for(
         what: &'static str,
         fd: BorrowedFd<'_>,
-        events: libc::c_short,
+        events: core::ffi::c_short,
         stop: Option<&Stop>,
         shared: &Shared,
     ) -> Woke {
         let mut fds = [
             libc::pollfd { fd: fd.as_raw_fd(), events, revents: 0 },
-            libc::pollfd { fd: shared.stop.read.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: shared.stop.read.as_raw_fd(), events: PollEvents::IN.bits(), revents: 0 },
             // A second look at the host's stop where there is no socket's: the same either way.
             libc::pollfd {
                 fd: stop.unwrap_or(&shared.stop).read.as_raw_fd(),
-                events: libc::POLLIN,
+                events: PollEvents::IN.bits(),
                 revents: 0,
             },
         ];
@@ -666,7 +716,7 @@ mod unix {
         loop {
             let what = "room in a UDP socket's buffer for an Effect::SendTo";
             let peer = batch.heads.get(at.run).map(|it| it.peer);
-            match wait_for(what, bound.socket.as_fd(), libc::POLLOUT, Some(&bound.stop), shared) {
+            match wait_for(what, bound.socket.as_fd(), PollEvents::OUT.bits(), Some(&bound.stop), shared) {
                 Woke::Ready => {}
                 Woke::Stopped => {
                     return bound.failed(batch, false, peer, None, "unbound with the send in flight");
@@ -730,7 +780,7 @@ mod unix {
                 }
             }
             let what = "a datagram for an Effect::RecvFrom";
-            match wait_for(what, bound.socket.as_fd(), libc::POLLIN, Some(&bound.stop), shared) {
+            match wait_for(what, bound.socket.as_fd(), PollEvents::IN.bits(), Some(&bound.stop), shared) {
                 Woke::Ready => {}
                 Woke::Stopped => {
                     return bound.failed(into, true, None, None, "unbound with the receive in flight");
@@ -818,7 +868,7 @@ mod unix {
         let mut at = 0;
         while at < bytes.len() {
             let what = "room in a standard stream for an Effect::WriteOut";
-            match wait_for(what, fd, libc::POLLOUT, None, shared) {
+            match wait_for(what, fd, PollEvents::OUT.bits(), None, shared) {
                 Woke::Ready => {}
                 Woke::Stopped => {
                     return Done::unsent(bytes, format_args!("writing {stream}: the driver ended"));
@@ -854,7 +904,7 @@ mod unix {
         let fd = input.as_fd();
         loop {
             let what = "the standard input for an Effect::ReadStdin";
-            match wait_for(what, fd, libc::POLLIN, None, shared) {
+            match wait_for(what, fd, PollEvents::IN.bits(), None, shared) {
                 Woke::Ready => {}
                 Woke::Stopped => {
                     let why = "reading the standard input: the driver ended";

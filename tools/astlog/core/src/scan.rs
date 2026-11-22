@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use blaze_hash::HashMap;
 use std::alloc::Global;
 
-use astlog_engine::{InternalSnafu, Lint, LintNoNodeSnafu, Segment, Severity};
+use astlog_engine::{Lint, Segment, Severity};
 
 use crate::corpus::{Corpus, Value};
 use crate::error::Error;
@@ -135,10 +135,9 @@ fn for_each_candidate(
 ) -> Result<(), Error> {
     for lint in &program.lints {
         let relation = db.relations.get(&lint.relation).ok_or_else(|| {
-            InternalSnafu {
+            Error::Internal {
                 what: format!("lint relation `{}` missing from database", lint.relation),
             }
-            .build()
         })?;
         for row in relation.rows() {
             let node = row
@@ -148,7 +147,7 @@ fn for_each_candidate(
                     Value::Text(_) | Value::Int(_) => None,
                 })
                 .ok_or_else(|| {
-                    LintNoNodeSnafu { rule: lint.relation.clone(), line: lint.line }.build()
+                    Error::LintNoNode { rule: lint.relation.clone(), line: lint.line }
                 })?;
             let info = corpus.node_info(node);
             let start = corpus.position(node.file, info.start);
@@ -186,14 +185,13 @@ fn render_message(
             Segment::Lit(lit) => message.push_str(lit),
             Segment::Var(var) => {
                 let index = columns.iter().position(|column| column == var).ok_or_else(|| {
-                    InternalSnafu {
+                    Error::Internal {
                         what: format!(
                             "lint `{}` message variable `{var}` survived checking \
                                  without a relation column",
                             lint.relation
                         ),
                     }
-                    .build()
                 })?;
                 message.push_str(&one_line(&corpus.value_text(&row[index])));
             }

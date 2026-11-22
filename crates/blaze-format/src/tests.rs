@@ -1,11 +1,27 @@
 use std::mem::offset_of;
 
 use blaze_ids::ContentId;
+use blaze_own::Alloc;
 
 use crate::{
-    Aligned, FormatError, HEADER_LEN, Persist, Record, Rel, Slice, SpanRef, Spans, Str, Writer,
-    buffer_id, header, open, open_as, open_verified, read_verified, record, schema, to_bytes,
+    AlignedIn, FormatError, HEADER_LEN, Own, Persist, Record, Rel, Slice, SpanRef, Spans, Str,
+    Writer, WriterOpts, buffer_id, header, open, open_as, open_verified, read_verified, record,
+    schema, to_bytes,
 };
+
+/// The test's allocator (D170 C1: a test names one too).
+fn heap() -> Alloc<'static> {
+    blaze_own::testing::heap().alloc()
+}
+
+/// A buffer this file writes: in blaze's own vector, on the test's heap.
+type Bytes = blaze_own::Vec<u8, Alloc<'static>>;
+type Aligned = AlignedIn<Alloc<'static>>;
+
+/// `bytes` at the format's alignment, on the test's heap.
+fn aligned(bytes: &[u8]) -> Aligned {
+    AlignedIn::copy_from(bytes, heap())
+}
 
 #[test]
 fn plain_records_are_checked_by_their_bounds() {
@@ -20,18 +36,18 @@ fn plain_records_are_checked_by_their_bounds() {
     const { assert!(<u32 as Record>::SHALLOW_PLAIN && <crate::RelSpan as Record>::SHALLOW_PLAIN) };
     const { assert!(!<Leaf as Record>::SHALLOW_PLAIN && !<bool as Record>::SHALLOW_PLAIN) };
     const { assert!(!<[Leaf; 2] as Record>::SHALLOW_PLAIN && !<Counted as Record>::SHALLOW_PLAIN) };
-    let buffer = Aligned::copy_from(&written(1));
+    let buffer = aligned(&written(1));
     let root = open::<Root>(&buffer).unwrap();
     assert_eq!(root.numbers.get(&buffer), &[1, 2, 3]);
     assert!(matches!(
-        open::<Root>(&Aligned::copy_from(&written(2))),
+        open::<Root>(&aligned(&written(2))),
         Err(FormatError::Invalid { .. })
     ));
 }
 
 #[test]
 fn a_verified_open_reads_only_the_buffer_its_key_names() {
-    let buffer = Aligned::copy_from(&written(1));
+    let buffer = aligned(&written(1));
     let key = buffer_id(&buffer);
     assert_eq!(key, ContentId::of(crate::BUFFER_DOMAIN, &buffer));
     let root = open_verified::<Root>(&buffer, Root::SCHEMA, key).unwrap();
@@ -40,7 +56,7 @@ fn a_verified_open_reads_only_the_buffer_its_key_names() {
     let mut changed = written(1);
     let last = changed.len() - 1;
     changed[last] ^= 1;
-    let changed = Aligned::copy_from(&changed);
+    let changed = aligned(&changed);
     assert_eq!(
         open_verified::<Root>(&changed, Root::SCHEMA, key).err(),
         Some(FormatError::Hash { found: buffer_id(&changed), wanted: key })
@@ -52,7 +68,7 @@ fn a_verified_open_reads_only_the_buffer_its_key_names() {
 
     let mut spans = Spans::new(ContentId::of("blaze v2 test 1", b"fn main"));
     spans.push(3, 4);
-    let bytes = Aligned::copy_from(&to_bytes(&spans));
+    let bytes = aligned(&to_bytes(&spans, Own(heap())));
     let read = read_verified::<Spans>(&bytes, buffer_id(&bytes)).unwrap();
     assert_eq!(read.to_spans(), spans);
     assert!(matches!(read_verified::<Spans>(&bytes, key), Err(FormatError::Hash { .. })));
@@ -78,11 +94,11 @@ record! {
     }
 }
 
-fn written(flag: u8) -> Vec<u8> {
-    written_by(Writer::new(Root::SCHEMA), flag)
+fn written(flag: u8) -> Bytes {
+    written_by(Writer::new(WriterOpts { schema: Root::SCHEMA, alloc: Own(heap()), capacity: None }), flag)
 }
 
-fn written_by(mut out: Writer, flag: u8) -> Vec<u8> {
+fn written_by(mut out: Writer<Own<Alloc<'static>>>, flag: u8) -> Bytes {
     let leaf = out.push(&Leaf { value: 7, flag: true, pad: [0; 7] });
     let numbers = out.push_slice(&[1u32, 2, 3]);
     let name = out.push_str("blaze");
@@ -109,7 +125,7 @@ fn written_by(mut out: Writer, flag: u8) -> Vec<u8> {
 
 #[test]
 fn a_buffer_reads_in_place() {
-    let buffer = Aligned::copy_from(&written(1));
+    let buffer = aligned(&written(1));
     let root = open::<Root>(&buffer).unwrap();
     assert_eq!(root.leaf.get(&buffer), Some(&Leaf { value: 7, flag: true, pad: [0; 7] }));
     assert_eq!(root.numbers.get(&buffer), &[1, 2, 3]);
@@ -180,7 +196,7 @@ record! {
 #[test]
 fn a_get_after_open_checks_only_what_it_reaches_directly() {
     const NODES: usize = 50;
-    let mut out = Writer::new(Nodes::SCHEMA);
+    let mut out = Writer::new(WriterOpts { schema: Nodes::SCHEMA, alloc: Own(heap()), capacity: None });
     let parts: Vec<(u64, u64)> = (0..NODES as u32)
         .map(|n| {
             (
@@ -206,7 +222,7 @@ fn a_get_after_open_checks_only_what_it_reaches_directly() {
     let root =
         Nodes { nodes: Slice::between(root_at + offset_of!(Nodes, nodes) as u64, at, NODES) };
     assert_eq!(out.push(&root), root_at);
-    let buffer = Aligned::copy_from(&out.finish(root_at));
+    let buffer = aligned(&out.finish(root_at));
 
     checks();
     let root = open::<Nodes>(&buffer).unwrap();
@@ -237,7 +253,7 @@ fn a_reused_buffer_writes_the_same_bytes_in_its_own_allocation() {
 #[test]
 fn a_buffer_reads_the_same_wherever_it_is() {
     let bytes = written(1);
-    let (a, b) = (Aligned::copy_from(&bytes), Aligned::copy_from(&bytes));
+    let (a, b) = (aligned(&bytes), aligned(&bytes));
     let (ra, rb) = (open::<Root>(&a).unwrap(), open::<Root>(&b).unwrap());
     assert_eq!(ra.numbers.get(&a), rb.numbers.get(&b));
     assert_eq!(ra.leaf.get(&a), rb.leaf.get(&b));
@@ -245,7 +261,7 @@ fn a_buffer_reads_the_same_wherever_it_is() {
 
 #[test]
 fn a_reader_of_another_schema_refuses() {
-    let buffer = Aligned::copy_from(&written(1));
+    let buffer = aligned(&written(1));
     assert_eq!(
         open_as::<Root>(&buffer, schema("root 2")).unwrap_err(),
         FormatError::Schema { found: Root::SCHEMA, wanted: schema("root 2") }
@@ -256,16 +272,16 @@ fn a_reader_of_another_schema_refuses() {
 #[test]
 fn not_a_buffer_is_refused() {
     let bytes = written(1);
-    assert!(matches!(open::<Root>(&Aligned::copy_from(&bytes[..20])), Err(FormatError::Header(_))));
+    assert!(matches!(open::<Root>(&aligned(&bytes[..20])), Err(FormatError::Header(_))));
     let mut magic = bytes.clone();
     magic[0] = b'X';
-    assert!(matches!(open::<Root>(&Aligned::copy_from(&magic)), Err(FormatError::Header(_))));
+    assert!(matches!(open::<Root>(&aligned(&magic)), Err(FormatError::Header(_))));
     let mut longer = bytes.clone();
     longer.extend([0; 16]);
-    assert!(matches!(open::<Root>(&Aligned::copy_from(&longer)), Err(FormatError::Header(_))));
+    assert!(matches!(open::<Root>(&aligned(&longer)), Err(FormatError::Header(_))));
     let mut shifted = vec![0];
-    shifted.extend(&bytes);
-    let shifted = Aligned::copy_from(&shifted);
+    shifted.extend_from_slice(&bytes);
+    let shifted = aligned(&shifted);
     assert_eq!(
         open::<Root>(&shifted[1..]).unwrap_err(),
         FormatError::Header("not at an address aligned to 16 bytes")
@@ -274,15 +290,15 @@ fn not_a_buffer_is_refused() {
 
 #[test]
 fn an_invalid_value_is_refused() {
-    let buffer = Aligned::copy_from(&written(2));
+    let buffer = aligned(&written(2));
     assert!(matches!(open::<Root>(&buffer), Err(FormatError::Invalid { .. })));
 }
 
-fn with_root(edit: impl FnOnce(&mut Vec<u8>, usize)) -> Aligned {
+fn with_root(edit: impl FnOnce(&mut Bytes, usize)) -> Aligned {
     let mut bytes = written(1);
-    let root = header(&Aligned::copy_from(&bytes)).unwrap().root as usize;
+    let root = header(&aligned(&bytes)).unwrap().root as usize;
     edit(&mut bytes, root);
-    Aligned::copy_from(&bytes)
+    aligned(&bytes)
 }
 
 fn set_i32(bytes: &mut [u8], at: usize, value: i32) {
@@ -328,7 +344,7 @@ fn text_that_is_not_utf8_is_refused() {
 #[test]
 #[should_panic(expected = "leaves the buffer")]
 fn following_into_another_buffer_panics() {
-    let (a, b) = (Aligned::copy_from(&written(1)), Aligned::copy_from(&written(1)));
+    let (a, b) = (aligned(&written(1)), aligned(&written(1)));
     let root = open::<Root>(&a).unwrap();
     root.numbers.get(&b);
 }
@@ -340,7 +356,7 @@ fn spans_round_trip() {
     let a = spans.push(0, 7);
     let b = spans.push(3, 2);
     assert_eq!(b, SpanRef { anchor, index: 1 });
-    let bytes = Aligned::copy_from(&to_bytes(&spans));
+    let bytes = aligned(&to_bytes(&spans, Own(heap())));
     let read = Spans::read(&bytes).unwrap();
     assert_eq!(read.anchor, anchor);
     assert_eq!(read.get(a), spans.get(a));
@@ -349,7 +365,7 @@ fn spans_round_trip() {
     assert_eq!(read.get(other), None);
     assert_eq!(read.to_spans(), spans);
     let empty = Spans::new(anchor);
-    let bytes = Aligned::copy_from(&to_bytes(&empty));
+    let bytes = aligned(&to_bytes(&empty, Own(heap())));
     assert_eq!(Spans::read(&bytes).unwrap().spans, &[]);
 }
 

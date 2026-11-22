@@ -19,38 +19,30 @@
 //!
 //! [`rustc_parse::lexer`]: ../rustc_parse/lexer/index.html
 
-// tidy-alphabetical-start
-// We want to be able to build this crate with a stable compiler,
-// so no `#![feature]` attributes should be added.
-#![deny(unstable_features)]
-// tidy-alphabetical-end
+// blaze: upstream builds this crate on a stable compiler (`#![deny(unstable_features)]`); it is
+// blaze's own now, a sans-IO core on `core` alone, so it takes the tool attributes every
+// blaze crate does. Every line here that says `blaze` is blaze's, to keep at a re-vendor.
+#![no_std]
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core, blaze::std_use, blaze::implicit_allocator, blaze::process_static)]
+#![forbid(unsafe_code)]
+
+// blaze: the tests' `format!`, `String` and `test_utils`.
+#[cfg(test)]
+extern crate std;
 
 #[cfg(test)]
 mod tests;
 
-use std::str::Chars;
+use core::str::Chars;
 
 use LiteralKind::*;
 use TokenKind::*;
-pub use unicode_ident::UNICODE_VERSION;
-use unicode_properties::UnicodeEmoji;
-
-// Make sure that the Unicode version of the dependencies is the same.
-const _: () = {
-    let properties = unicode_properties::UNICODE_VERSION;
-    let ident = unicode_ident::UNICODE_VERSION;
-
-    if properties.0 != ident.0 as u64
-        || properties.1 != ident.1 as u64
-        || properties.2 != ident.2 as u64
-    {
-        panic!(
-            "unicode-properties and unicode-ident must use the same Unicode version, \
-            `unicode_properties::UNICODE_VERSION` and `unicode_ident::UNICODE_VERSION` are \
-            different."
-        );
-    }
-};
+// blaze: upstream reads `unicode-ident` and `unicode-properties`, whose versions it checks are
+// equal; blaze reads both properties from its one table crate, of one version.
+pub use blaze_unicode::UNICODE_VERSION;
 
 /// Parsed token.
 /// It doesn't contain information about data that has been parsed,
@@ -332,10 +324,27 @@ pub fn tokenize(
     frontmatter_allowed: FrontmatterAllowed,
 ) -> impl Iterator<Item = Token> {
     let mut cursor = Cursor::new(input, frontmatter_allowed);
-    std::iter::from_fn(move || {
+    core::iter::from_fn(move || {
         let token = cursor.advance_token();
         if token.kind != TokenKind::Eof { Some(token) } else { None }
     })
+}
+
+/// blaze: the byte index in `text` of the first `\n` followed by `dashes` dashes, as
+/// `text.find(&format!("\n{:-<1$}", "", dashes))` gives it, with no allocation.
+fn find_newline_fence(text: &str, dashes: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(at) = memchr::memchr(b'\n', &bytes[from..]) {
+        let newline = from + at;
+        // Too few bytes left after this newline: none after a later one either.
+        let fence = bytes.get(newline + 1..newline + 1 + dashes)?;
+        if fence.iter().all(|&b| b == b'-') {
+            return Some(newline);
+        }
+        from = newline + 1;
+    }
+    None
 }
 
 /// True if `c` is considered a whitespace according to Rust language definition.
@@ -389,14 +398,14 @@ pub fn is_horizontal_whitespace(c: char) -> bool {
 /// a formal definition of valid identifier name.
 pub fn is_id_start(c: char) -> bool {
     // This is XID_Start OR '_' (which formally is not a XID_Start).
-    c == '_' || unicode_ident::is_xid_start(c)
+    c == '_' || blaze_unicode::is_xid_start(c)
 }
 
 /// True if `c` is valid as a non-first character of an identifier.
 /// See [Rust language reference](https://doc.rust-lang.org/reference/identifiers.html) for
 /// a formal definition of valid identifier name.
 pub fn is_id_continue(c: char) -> bool {
-    unicode_ident::is_xid_continue(c)
+    blaze_unicode::is_xid_continue(c)
 }
 
 /// The passed string is lexically an identifier.
@@ -678,7 +687,7 @@ impl<'a> Cursor<'a> {
                 Literal { kind, suffix_start }
             }
             // Identifier starting with an emoji. Only lexed for graceful error recovery.
-            c if !c.is_ascii() && c.is_emoji_char() => self.invalid_ident(),
+            c if !c.is_ascii() && blaze_unicode::is_emoji(c) => self.invalid_ident(),
             _ => Unknown,
         };
         if matches!(self.frontmatter_allowed, FrontmatterAllowed::Yes)
@@ -719,10 +728,12 @@ impl<'a> Cursor<'a> {
         let invalid_infostring = self.first() != '\n';
 
         let mut found = false;
-        let nl_fence_pattern = format!("\n{:-<1$}", "", length_opening as usize);
-        if let Some(closing) = self.as_str().find(&nl_fence_pattern) {
+        // blaze: upstream formats `"\n"` and the dashes into a `String` to `find` it; this finds
+        // the same first match with no allocation.
+        let fence_len = 1 + length_opening as usize;
+        if let Some(closing) = find_newline_fence(self.as_str(), length_opening as usize) {
             // candidate found
-            self.bump_bytes(closing + nl_fence_pattern.len());
+            self.bump_bytes(closing + fence_len);
             // in case like
             // ---cargo
             // --- blahblah
@@ -848,7 +859,7 @@ impl<'a> Cursor<'a> {
         // we see a prefix here, it is definitely an unknown prefix.
         match self.first() {
             '#' | '"' | '\'' => UnknownPrefix,
-            c if !c.is_ascii() && c.is_emoji_char() => self.invalid_ident(),
+            c if !c.is_ascii() && blaze_unicode::is_emoji(c) => self.invalid_ident(),
             _ => Ident,
         }
     }
@@ -857,7 +868,7 @@ impl<'a> Cursor<'a> {
         // Start is already eaten, eat the rest of identifier.
         self.eat_while(|c| {
             const ZERO_WIDTH_JOINER: char = '\u{200d}';
-            is_id_continue(c) || (!c.is_ascii() && c.is_emoji_char()) || c == ZERO_WIDTH_JOINER
+            is_id_continue(c) || (!c.is_ascii() && blaze_unicode::is_emoji(c)) || c == ZERO_WIDTH_JOINER
         });
         // An invalid identifier followed by '#' or '"' or '\'' could be
         // interpreted as an invalid literal prefix. We don't bother doing that

@@ -10,20 +10,30 @@
 //! prints nothing; on any other thread, or outside a search, it calls the hook that was there
 //! before.
 
+use core::cell::Cell;
+use core::fmt;
+use core::sync::atomic::Ordering;
 use std::alloc::Global;
-use std::cell::Cell;
 use std::panic::{self, AssertUnwindSafe, Location, PanicHookInfo};
 use std::sync::Once;
+use std::{env, fs::File, os::unix::fs::FileExt};
 
+use crate::board::{
+    self, BoardError, CaseOrigin, Declared, Ending, Page, PageError, Plan, Seeds, Shape, Tally,
+    TailWord, Writer,
+};
 #[cfg(test)]
 use crate::search::Plant;
 use crate::search::{
-    Broke, Config, Ended, Failed, Failure, Given, GivenError, Next, Origin, SEED, SEEDS, Search,
-    TAPE, Verdict,
+    Broke, Broken, Config, Ended, Failed, Failure, Given, GivenError, Next, Origin, Passed, SEED,
+    SEEDS, Search, TAPE, Verdict,
 };
+use crate::observe::{self, ObserveMode};
 use crate::tape::{Record, Tail, Tape};
 use crate::text;
 
+#[cfg(test)]
+mod board_tests;
 #[cfg(test)]
 mod tests;
 
@@ -52,6 +62,22 @@ impl Outcome for Result<(), Broke> {
             Ok(()) => Ended::Passed,
             Err(Broke::Oracle(text)) => Ended::Failed(Failure { origin: Origin::Oracle, text }),
             Err(Broke::Harness(text)) => Ended::Failed(Failure { origin: Origin::Harness, text }),
+        }
+    }
+}
+
+impl<E: fmt::Display> Outcome for Result<(), Broken<E>> {
+    /// The typed oracle's finding as the search records a failure: its origin is the oracle, its
+    /// text the error's `Display` (a control judges the typed value itself, control.rs).
+    #[blaze::pure]
+    #[blaze::nonblocking]
+    fn ended(self) -> Ended {
+        match self {
+            Ok(()) => Ended::Passed,
+            Err(Broken::Oracle(broken)) => {
+                Ended::Failed(Failure { origin: Origin::Oracle, text: broken.to_string() })
+            }
+            Err(Broken::Harness(text)) => Ended::Failed(Failure { origin: Origin::Harness, text }),
         }
     }
 }
@@ -200,8 +226,44 @@ impl Drop for Inside {
 }
 
 /// Runs the search over `body` and gives its verdict. Reads nothing from outside: `config` is all.
+/// A verdict judges no observation, so `ObserveMode::Enforce` is refused by name here (the
+/// driver's entry points, `check`, `simulate` and `controls`, judge it).
 pub fn search<O: Outcome>(config: Config, body: impl FnMut(&Tape) -> O) -> Verdict {
+    config.observe.refused_without_driver();
     drive(Search::new(config), body)
+}
+
+/// What `ObserveMode::Enforce` says of a run that passed: under `mode` Enforce, a passing
+/// `verdict` whose `tally` has "never varied" lines fails, and this is the text it fails with
+/// (D165), naming each label; `None` when the run is not failed by it.
+pub(crate) fn enforced(
+    mode: ObserveMode,
+    verdict: &Verdict,
+    tally: &observe::Tally,
+    place: &str,
+) -> Option<String> {
+    match (mode, verdict) {
+        (ObserveMode::Enforce, Verdict::Passed(passed)) => {
+            let mut lines = observed_lines();
+            if tally.never_varied_into(&mut lines) == 0 {
+                return None;
+            }
+            Some(format!(
+                "blaze-sim: `{place}`: under `ObserveMode::Enforce`, a draw that took one value in every passing case (of {} cases) fails the run, since none of its other values was tested (D165):\n{lines}",
+                passed.cases
+            ))
+        }
+        (ObserveMode::Observe, _)
+        | (
+            ObserveMode::Enforce,
+            Verdict::Failed(_)
+            | Verdict::NotAFunction { .. }
+            | Verdict::DrewNothing { .. }
+            | Verdict::AllDiscarded { .. }
+            | Verdict::Unreached { .. }
+            | Verdict::Misfit { .. },
+        ) => None,
+    }
 }
 
 /// `search` with a bug planted in the search, for a control.
@@ -214,12 +276,29 @@ pub(crate) fn search_planted<O: Outcome>(
     drive(Search::planted(config, plant), body)
 }
 
+/// `search`, also giving back the search that ran, which holds what its passing cases drew
+/// (`Search::tally`, observe.rs). Reads nothing from outside.
+pub(crate) fn search_observing<O: Outcome>(
+    config: Config,
+    body: impl FnMut(&Tape) -> O,
+) -> (Verdict, Search) {
+    drive_observing(Search::new(config), body)
+}
+
 /// Runs `search`'s proposals on one tape and one record, kept across cases.
+fn drive<O: Outcome>(search: Search, body: impl FnMut(&Tape) -> O) -> Verdict {
+    drive_observing(search, body).0
+}
+
+/// `drive`, giving back the search with its verdict.
 #[expect(
     blaze::std_use,
     reason = "the hook hands a body's panic to its search through this thread's kept panic: emptied before each run, taken after it"
 )]
-fn drive<O: Outcome>(mut search: Search, mut body: impl FnMut(&Tape) -> O) -> Verdict {
+fn drive_observing<O: Outcome>(
+    mut search: Search,
+    mut body: impl FnMut(&Tape) -> O,
+) -> (Verdict, Search) {
     install_hook();
     let _inside = Inside::enter();
     let tape = Tape::new(&[], Tail::Calm, search.most_choices());
@@ -235,7 +314,10 @@ fn drive<O: Outcome>(mut search: Search, mut body: impl FnMut(&Tape) -> O) -> Ve
                 | Verdict::AllDiscarded { .. }
                 | Verdict::Unreached { .. }
                 | Verdict::Misfit { .. }),
-            ) => return verdict.clone(),
+            ) => {
+                let verdict = verdict.clone();
+                return (verdict, search);
+            }
             Next::Run(proposal) => proposal,
         };
         tape.reset(proposal.prefix, proposal.tail);
@@ -288,13 +370,412 @@ fn decide<O: Outcome>(
     }
 }
 
+/// `search` run from a case board (board.rs; test.md, "The case board"): the check numbered
+/// `check` in its process tells `board` each case before the body runs it (its number, then its
+/// tape: prefix and tail) and how the run ended; nothing is caught. A body that panics ends the
+/// child where blaze builds it (no unwinding), and the board says which case was running and on
+/// which tape; under an unwinding build the panic leaves this function with the board saying the
+/// same. A discard or an overrun panics in the tape, so it ends the child too: the runner tells
+/// it from a body's panic by the panic's place (wire.rs `Place`: `Tape::discard`, the draw).
+///
+/// When `check` is the board's target it runs the plan's given tapes first, each on a calm tail,
+/// then the plan's seed range (or, under `Seeds::Declared`, the cases `config` declares), with
+/// the plan's most choices when it gives some; any other check runs its declared cases. The run
+/// stops at the first failure, unshrunk: on a board the runner shrinks, in fresh children. The
+/// verdict numbers cases across the given tapes and the seeds. Reads nothing from outside.
+pub fn search_on_board<O: Outcome, P: Page>(
+    config: Config,
+    check: u32,
+    plan: &Plan<'_>,
+    board: &mut Writer<P>,
+    body: impl FnMut(&Tape) -> O,
+) -> Result<Verdict, BoardError> {
+    let mut observed = observe::Tally::new();
+    search_on_board_observing(config, check, plan, board, body, &mut observed)
+}
+
+/// `search_on_board`, also leaving in `observed` what the passing cases of its seed phase drew
+/// (observe.rs; the given tapes before it are not a run and are not tallied), for
+/// `ObserveMode::Enforce`.
+fn search_on_board_observing<O: Outcome, P: Page>(
+    config: Config,
+    check: u32,
+    plan: &Plan<'_>,
+    board: &mut Writer<P>,
+    mut body: impl FnMut(&Tape) -> O,
+    observed: &mut observe::Tally,
+) -> Result<Verdict, BoardError> {
+    let shape = board.shape();
+    let target = check == shape.target_check;
+    let declared = Declared {
+        first: config.first,
+        cases: config.cases,
+        shrink_runs: config.shrink_runs,
+        most_choices: config.most_choices,
+    };
+    let mut config = config.shrink_runs(0);
+    let mut given_run = 0;
+    if target {
+        if shape.budget.most_choices != 0 {
+            config = config.most_choices(shape.budget.most_choices);
+        }
+        match shape.seeds {
+            Seeds::Declared => {}
+            Seeds::Range { first, count } => {
+                config.first = first;
+                config.cases = count;
+                config.given = Given::NOTHING;
+            }
+        }
+        given_run = plan.tapes_len();
+    }
+    board.begin(check, given_run, Declared { most_choices: config.most_choices, ..declared })?;
+    let tape = Tape::new(&[], Tail::Calm, config.most_choices);
+    let mut record = Record::new();
+    let mut tally = Tally::ZERO;
+    let mut case: u32 = 0;
+    if given_run > 0 {
+        let mut prefix = vec![0u64; plan.longest()];
+        for given in plan.tapes() {
+            case += 1;
+            let values = given.copy_into(&mut prefix)?;
+            board.start_case(case, tally, TailWord::Calm, values)?;
+            tape.reset(values, Tail::Calm);
+            let outcome = body(&tape);
+            tape.finish(&mut record);
+            tally.choices += drawn(&record);
+            match ended_on_board(&record, outcome) {
+                Ended::Passed => tally.passed += 1,
+                Ended::Discarded => tally.discarded += 1,
+                Ended::Failed(failure) => {
+                    let verdict = Verdict::Failed(Failed {
+                        seed: None,
+                        case,
+                        cases: given_run,
+                        failure,
+                        first_len: drawn_u32(&record),
+                        least: record.clone(),
+                        shrink_runs: 0,
+                    });
+                    return end_on_board(board, case, tally, verdict);
+                }
+            }
+        }
+    }
+    let given_tally = tally;
+    let seeds = match (&config.given.tape, config.given.seed) {
+        (Some(_), _) | (None, Some(_)) => 1,
+        (None, None) => config.given.seeds.unwrap_or(config.cases),
+    };
+    if seeds == 0 && given_run > 0 {
+        let verdict = if tally.choices == 0 {
+            Verdict::DrewNothing { cases: given_run }
+        } else if tally.passed == 0 {
+            Verdict::AllDiscarded { cases: given_run }
+        } else {
+            Verdict::Passed(Passed {
+                cases: given_run,
+                discarded: tally.discarded,
+                choices: tally.choices,
+            })
+        };
+        return end_on_board(board, case, tally, verdict);
+    }
+    let mut search = Search::new(config);
+    let most_runs = search.most_runs();
+    for _ in 0..=most_runs {
+        let proposal = match search.next() {
+            Next::Done(verdict) => {
+                let verdict = with_given(verdict.clone(), given_run, given_tally);
+                observed.clone_from(search.tally());
+                return end_on_board(board, case, tally, verdict);
+            }
+            Next::Run(proposal) => proposal,
+        };
+        case += 1;
+        let tail = match &proposal.tail {
+            Tail::Calm => TailWord::Calm,
+            // A proposal's stream is fresh: its state is its seed.
+            Tail::Seeded(stream) => TailWord::Seeded(stream.state()),
+        };
+        board.start_case(case, tally, tail, proposal.prefix)?;
+        tape.reset(proposal.prefix, proposal.tail);
+        let outcome = body(&tape);
+        tape.finish(&mut record);
+        tally.choices += drawn(&record);
+        let ended = ended_on_board(&record, outcome);
+        match &ended {
+            Ended::Passed => tally.passed += 1,
+            Ended::Discarded => tally.discarded += 1,
+            Ended::Failed(_) => {}
+        }
+        search.ran(&record, ended);
+    }
+    panic!(
+        "blaze-sim: the search on the case board proposed more than its {most_runs} runs (its cases and no shrink runs)"
+    )
+}
+
+/// The choices a record holds.
+#[expect(
+    blaze::as_cast,
+    reason = "a count of choices, `usize` to `u64`, widens on every target blaze builds"
+)]
+fn drawn(record: &Record) -> u64 {
+    record.choices.len() as u64
+}
+
+/// The choices a record holds, which its case's `most_choices`, a `u32`, bounds.
+fn drawn_u32(record: &Record) -> u32 {
+    u32::try_from(record.choices.len()).expect("a case draws at most its `most_choices`, a `u32`")
+}
+
+/// How a case on a board ended: there is no panic to catch, and a discard or an overrun panics
+/// in the tape, so what is left is what the body returned.
+fn ended_on_board<O: Outcome>(record: &Record, outcome: O) -> Ended {
+    if record.discarded {
+        return Ended::Discarded;
+    }
+    if record.overran {
+        let text = "the case drew more than its bound of choices".to_owned();
+        return Ended::Failed(Failure { origin: Origin::Overran, text });
+    }
+    outcome.ended()
+}
+
+/// The seed phase's verdict with the given tapes before it counted in: a pass counts their
+/// cases, a failure is numbered after them.
+fn with_given(verdict: Verdict, given_run: u32, given: Tally) -> Verdict {
+    match verdict {
+        Verdict::Passed(passed) => Verdict::Passed(Passed {
+            cases: passed.cases + given_run,
+            discarded: passed.discarded + given.discarded,
+            choices: passed.choices + given.choices,
+        }),
+        Verdict::Failed(failed) => Verdict::Failed(Failed {
+            case: failed.case + given_run,
+            cases: failed.cases + given_run,
+            ..failed
+        }),
+        Verdict::DrewNothing { cases } => Verdict::DrewNothing { cases: cases + given_run },
+        Verdict::AllDiscarded { cases } => Verdict::AllDiscarded { cases: cases + given_run },
+        Verdict::Unreached { cases, missing } => {
+            Verdict::Unreached { cases: cases + given_run, missing }
+        }
+        verdict @ (Verdict::NotAFunction { .. } | Verdict::Misfit { .. }) => verdict,
+    }
+}
+
+/// Writes how the run ended after case `case` on the board, and gives the verdict back.
+fn end_on_board<P: Page>(
+    board: &mut Writer<P>,
+    case: u32,
+    tally: Tally,
+    verdict: Verdict,
+) -> Result<Verdict, BoardError> {
+    let ending = match &verdict {
+        Verdict::Passed(_) => Ending::Passed,
+        Verdict::Failed(failed) => Ending::Failed {
+            origin: CaseOrigin::of(&failed.failure.origin)?,
+            record: &failed.least,
+            text: &failed.failure.text,
+        },
+        Verdict::DrewNothing { .. } => Ending::DrewNothing,
+        Verdict::AllDiscarded { .. } => Ending::AllDiscarded,
+        Verdict::Unreached { missing, .. } => Ending::Unreached { missing: missing.as_slice() },
+        Verdict::Misfit { clamped, unused, .. } => {
+            Ending::Misfit { clamped: *clamped, unused: *unused }
+        }
+        Verdict::NotAFunction { .. } => return Err(BoardError::NotAFunction),
+    };
+    board.end(case, tally, ending)?;
+    Ok(verdict)
+}
+
+/// The process's checks on its case board.
+mod on_board {
+    #![expect(
+        blaze::global_state,
+        blaze::process_static,
+        reason = "a case board is one per process (descriptor 4): the count of the checks that took it numbers them for the runner, and the flag keeps two from writing it at once"
+    )]
+
+    use core::sync::atomic::{AtomicBool, AtomicU32};
+
+    /// The checks that have taken the board: the next one is this plus 1.
+    pub(super) static CHECKS: AtomicU32 = AtomicU32::new(0);
+    /// A check is on the board now.
+    pub(super) static BUSY: AtomicBool = AtomicBool::new(false);
+}
+
+/// A check's turn on the board: taken by `take`, given back when dropped (a panic's unwinding
+/// among the ways).
+struct OnBoard;
+
+impl OnBoard {
+    /// The turn and the check's number, from 1 in the process; a second check on the board at
+    /// once panics naming the rule.
+    fn take() -> (OnBoard, u32) {
+        if on_board::BUSY.swap(true, Ordering::AcqRel) {
+            panic!(
+                "blaze-sim: two checks at once on the case board (descriptor 4): a board tells one check's cases at a time, so under `blaze test` a test runs its checks one after another"
+            );
+        }
+        let check = on_board::CHECKS.fetch_add(1, Ordering::AcqRel) + 1;
+        (OnBoard, check)
+    }
+}
+
+impl Drop for OnBoard {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    fn drop(&mut self) {
+        on_board::BUSY.store(false, Ordering::Release);
+    }
+}
+
+/// The board's descriptor as a page: each write a positioned write (`pwrite`) at its offset,
+/// in call order, which the runner reads after the child has ended.
+struct FilePage {
+    file: File,
+}
+
+impl Page for FilePage {
+    #[expect(
+        blaze::std_use,
+        reason = "the board is a descriptor the runner gave: a positioned write is the one way to it without unsafe code, which this crate forbids"
+    )]
+    fn put(&mut self, at: usize, bytes: &[u8]) -> Result<(), PageError> {
+        let refused = |os: Option<i32>| PageError { at, len: bytes.len(), os };
+        let Ok(offset) = u64::try_from(at) else { return Err(refused(None)) };
+        self.file.write_all_at(bytes, offset).map_err(|error| refused(error.raw_os_error()))
+    }
+}
+
+/// The board the runner gave, when [`board::SETTING`] says one is on descriptor 4: that
+/// descriptor, opened through [`board::DESCRIPTOR_PATH`] (no unsafe code). A setting naming
+/// another descriptor, or a descriptor that does not open, panics naming it (rule 3: never run
+/// as if no board were given).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the driver is the entry point: the one place blaze-sim reads what the runner gave"
+)]
+#[expect(
+    blaze::std_use,
+    reason = "the driver is the entry point: the runner's setting is read from the test process's environment, and its board is the descriptor it names"
+)]
+#[expect(
+    blaze::env_read,
+    reason = "the driver is the entry point: the board's setting is read here once, and the board handed to `check_on_board`"
+)]
+fn board_by_the_runner() -> Option<File> {
+    let value = env::var_os(board::SETTING)?;
+    if value != board::DESCRIPTOR {
+        panic!(
+            "blaze-sim: `{}` is `{}`: the case board is on descriptor {} alone (test.md, \"The case board\")",
+            board::SETTING,
+            value.display(),
+            board::DESCRIPTOR
+        );
+    }
+    match File::options().read(true).write(true).open(board::DESCRIPTOR_PATH) {
+        Ok(file) => Some(file),
+        Err(error) => panic!(
+            "blaze-sim: `{}` says a case board is on descriptor {}, and `{}` did not open: {error}",
+            board::SETTING,
+            board::DESCRIPTOR,
+            board::DESCRIPTOR_PATH
+        ),
+    }
+}
+
+/// Stops the check: the runner's board is refused, naming what of it.
+fn board_refused(what: &str, error: &dyn fmt::Display) -> ! {
+    panic!("blaze-sim: the case board on descriptor {}: {what}: {error}", board::DESCRIPTOR)
+}
+
+/// `check` on the runner's board in `file`: its header and plan read and checked, the check
+/// numbered, `search_on_board`, then one line for a pass and `report` for anything else.
+#[expect(
+    blaze::std_use,
+    reason = "the board is a descriptor the runner gave: its length and its plan are read with positioned reads"
+)]
+fn check_on_board<O: Outcome>(
+    config: Config,
+    file: File,
+    at: &Location<'_>,
+    body: impl FnMut(&Tape) -> O,
+) {
+    let page_len = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => board_refused("its length did not read", &error),
+    };
+    let Ok(page_len) = usize::try_from(page_len) else {
+        board_refused("its length is past this machine's addresses", &page_len)
+    };
+    let mut head = [0u8; board::HEADER];
+    let head_len = page_len.min(board::HEADER);
+    if let Err(error) = file.read_exact_at(&mut head[..head_len], 0) {
+        board_refused("its header did not read", &error);
+    }
+    let shape = match Shape::open(&head[..head_len], page_len) {
+        Ok(shape) => shape,
+        Err(error) => board_refused("its header", &error),
+    };
+    let mut front = vec![0u8; shape.tape_at()];
+    if let Err(error) = file.read_exact_at(&mut front, 0) {
+        board_refused("its plan did not read", &error);
+    }
+    let plan = match Plan::open(&shape, &front) {
+        Ok(plan) => plan,
+        Err(error) => board_refused("its plan", &error),
+    };
+    let (_turn, check) = OnBoard::take();
+    let mut writer = Writer::new(FilePage { file }, shape);
+    let mode = config.observe;
+    let mut observed = observe::Tally::new();
+    let verdict =
+        match search_on_board_observing(config, check, &plan, &mut writer, body, &mut observed) {
+            Ok(verdict) => verdict,
+            Err(error) => board_refused("a write", &error),
+        };
+    let here = with_test_name(|test| place(at, test));
+    if let Some(refused) = enforced(mode, &verdict, &observed, &here) {
+        panic!("{refused}");
+    }
+    match &verdict {
+        Verdict::Passed(passed) => {
+            say_passed(&here, passed.cases, passed.choices);
+        }
+        Verdict::Failed(_)
+        | Verdict::NotAFunction { .. }
+        | Verdict::DrewNothing { .. }
+        | Verdict::AllDiscarded { .. }
+        | Verdict::Unreached { .. }
+        | Verdict::Misfit { .. } => panic!("{}", report_here(&verdict, at)),
+    }
+}
+
 /// `search` with what the person gave in the environment, then: prints one line for a pass,
 /// panics with `report` for anything else.
 /// What the person gave in the environment replaces what `config` was given; when they gave
 /// nothing, `config`'s own stands.
+/// Under `blaze test`, when the runner gives a case board ([`board::SETTING`], descriptor 4),
+/// the board's plan says which cases run (`search_on_board`) and nothing is caught; giving a
+/// seed, a count or a tape as well is refused, naming both.
 #[track_caller]
 pub fn check<O: Outcome>(config: Config, body: impl FnMut(&Tape) -> O) {
     let given = given_by_the_person();
+    if let Some(file) = board_by_the_runner() {
+        if given != Given::NOTHING {
+            panic!(
+                "blaze-sim: a case board (`{}`) and `{SEED}`, `{SEEDS}` or `{TAPE}` were both given: under a board the runner's plan alone says which cases run",
+                board::SETTING
+            );
+        }
+        check_on_board(config, file, Location::caller(), body);
+        return;
+    }
     let given = if given == Given::NOTHING { config.given.clone() } else { given };
     check_given(config, given, body);
 }
@@ -305,10 +786,18 @@ pub fn check<O: Outcome>(config: Config, body: impl FnMut(&Tape) -> O) {
 #[track_caller]
 pub fn check_given<O: Outcome>(config: Config, given: Given, body: impl FnMut(&Tape) -> O) {
     let at = Location::caller();
-    let verdict = search(config.given(given), body);
+    let mode = config.observe;
+    let (verdict, searched) = search_observing(config.given(given), body);
+    let mut observed = observed_lines();
+    searched.tally().lines_into(&mut observed);
+    say_observed(at, &observed);
+    let here = with_test_name(|test| place(at, test));
+    if let Some(refused) = enforced(mode, &verdict, searched.tally(), &here) {
+        panic!("{refused}");
+    }
     match &verdict {
         Verdict::Passed(passed) => {
-            say_passed(&with_test_name(|test| place(at, test)), passed.cases, passed.choices);
+            say_passed(&here, passed.cases, passed.choices);
         }
         Verdict::Failed(_)
         | Verdict::NotAFunction { .. }
@@ -328,7 +817,7 @@ const MAIN_THREAD: &str = "main";
     blaze::std_use,
     reason = "the test harness names the thread it runs a test on after the test: the thread's name is the one place the test's name is"
 )]
-fn with_test_name<R>(then: impl FnOnce(Option<&str>) -> R) -> R {
+pub(crate) fn with_test_name<R>(then: impl FnOnce(Option<&str>) -> R) -> R {
     let thread = std::thread::current();
     then(thread.name().filter(|name| *name != MAIN_THREAD))
 }
@@ -390,8 +879,38 @@ fn say_passed(place: &str, cases: u32, choices: u64) {
     println!("blaze-sim: {place}: {cases} cases, {choices} choices");
 }
 
+/// Prints the observe block (observe.rs) of the check at `at`, when `lines` has any: once, after
+/// the search and so after the test's own output, on standard error, where a failing check's
+/// `report` goes. Fails nothing (`ObserveMode::Observe`).
+#[expect(
+    clippy::print_stderr,
+    reason = "the observe block goes to standard error beside a check's report"
+)]
+#[expect(
+    blaze::std_use,
+    reason = "the observe block goes to the test's own standard error, which the test harness captures through `eprint!` alone"
+)]
+#[expect(
+    blaze::effect_breadth,
+    reason = "one `eprint!`: std's `_eprint` brings IO, blocking, locking and allocating and its arguments' formatting panicking, so any function that prints a line has all five"
+)]
+pub(crate) fn say_observed(at: &Location<'_>, lines: &str) {
+    if lines.is_empty() {
+        return;
+    }
+    let mut block = observed_lines();
+    observe::block(&with_test_name(|test| place(at, test)), lines, &mut block);
+    eprint!("{block}");
+}
+
+/// An empty buffer for observe lines (observe.rs) on the test process's heap: the driver is the
+/// one place that names the allocator they go in (see the crate's `blaze::hot_alloc` note).
+pub(crate) fn observed_lines() -> blaze_own::String<Global> {
+    blaze_own::String::new_in(Global)
+}
+
 /// The test's name, or else `file:line` of the check.
-fn place(at: &Location<'_>, test: Option<&str>) -> String {
+pub(crate) fn place(at: &Location<'_>, test: Option<&str>) -> String {
     match test {
         Some(test) => test.to_owned(),
         None => format!("{}:{}", at.file(), at.line()),
@@ -404,7 +923,13 @@ fn place(at: &Location<'_>, test: Option<&str>) -> String {
 pub fn report(verdict: &Verdict, at: &Location<'_>, test: Option<&str>) -> String {
     let place = place(at, test);
     match verdict {
-        Verdict::Failed(failed) => report_failed(failed, &place),
+        Verdict::Failed(failed) => {
+            let mut out = report_failed(failed, &place);
+            // The ONE line to keep (piece S3): a failure found once is replayed forever.
+            #[expect(clippy::let_underscore_must_use, reason = "writing to a `String` cannot fail")]
+            let _ = crate::kept::keep_lines(&mut out, failed, &place, at);
+            out
+        }
         Verdict::Passed(passed) => {
             format!(
                 "blaze-sim: `{place}` passed: {} cases ({} discarded), {} choices",

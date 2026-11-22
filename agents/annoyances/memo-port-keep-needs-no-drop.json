@@ -2,7 +2,7 @@
  "id": "memo-port-keep-needs-no-drop",
  "date": "2026-11-13",
  "who": "claude-opus-5-5 (Claude Opus 5.5), lane L3 def-rest of the front-end-on-memo port, port-memo-1113",
- "where": "crates/hir-def (attrs.rs, item_tree.rs, expr_store/*, lang_item.rs, signatures.rs); crates/blaze-memo/src/keep.rs; docs/v2/plan/design/front-end-on-memo.md rule 7",
+ "where": "crates/hir-def (attrs.rs, item_tree.rs, expr_store/*, lang_item.rs, signatures.rs); crates/blaze-memo/src/keep.rs",
  "what": "The spec says owning values (Box, Arc, ArenaMap, Vec, HashMap) become `&'db T` via keep/keep_slice, but `keep` asserts `!needs_drop`, so every value holding a Vec, a Box or an Arc (item trees, stores, source maps, docs, cfg exprs, syntax values) could not be ported as written; and ids grew from 4 to 8 bytes (`Gid`) with no `to_bits`/`from_bits`, so every 32-bit id packing (item scope entries, loc size asserts, persisted id words) had to be redone by guesswork, write-only, with no compile to check the new sizes.",
  "cost": "a mid-lane redesign (`owns`, added by L1 on request), ~50 `owns` sites, and size asserts written from arithmetic, not a compiler",
  "cause": "the spec's per-site rules were written from the engine's attributes, not from the value types they apply to, and the id width change was not costed against the packings that assumed 4-byte ids",

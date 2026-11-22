@@ -1,6 +1,7 @@
 ---
-status: plan
-summary: blaze v2 vfs lane's design: the Merkle tree, heads and views, rebase, the journal with group commit, recovery and compaction, and the disk watcher as one input of transactions.
+status: superseded
+superseded_by: end-state.md#d159-one-body-one-store-one-answer-form-code-made-ahead
+summary: (crates/blaze-vfs deleted 2026-11-20) blaze v2 vfs lane's design: the Merkle tree, heads and views, rebase, the journal with group commit, recovery and compaction, and the disk watcher as one input of transactions.
 date: 2026-10-29
 ---
 # blaze v2: the vfs lane's design
@@ -89,7 +90,7 @@ v2 interface; what changed from it is below.
 
 ## The disk as input
 
-[`Watcher`](../../../../crates/blaze-vfs/src/watch.rs) is its own state machine with its own tags:
+`Watcher` (crates/blaze-vfs/src/watch.rs, deleted 2026-11-20) is its own state machine with its own tags:
 
 - Each `Done::Changed` is a batch. Every path in it is stat-ed and read at once (one round
   trip); the read counts only if the stat says a file. Batches commit in the order they were

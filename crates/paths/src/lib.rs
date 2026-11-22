@@ -1,4 +1,4 @@
-//! Thin wrappers around [`camino::Utf8PathBuf`], distinguishing
+//! Thin wrappers around [`Utf8PathBuf`], distinguishing
 //! between absolute and relative paths.
 
 // `#![blaze::trust]` below names blaze's tool; inert under rustc.
@@ -6,8 +6,10 @@
 #![register_tool(blaze)]
 #![blaze::trust(
     unsafe,
-    reason = "`&Utf8Path` viewed as `&AbsPath` or `&RelPath`, each `#[repr(transparent)]` over `Utf8Path`, so the two share layout and pointer metadata"
+    reason = "`&Utf8Path` viewed as `&AbsPath` or `&RelPath`, and `&Path` as `&Utf8Path`, each `#[repr(transparent)]` over the other, so they share layout and pointer metadata; a UTF-8 path's text lent as `&str` unchecked (`utf8`)"
 )]
+
+mod utf8;
 
 use std::{
     borrow::Borrow,
@@ -16,7 +18,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub use camino::{Utf8Component, Utf8Components, Utf8Path, Utf8PathBuf, Utf8Prefix};
+pub use utf8::{Utf8Component, Utf8Components, Utf8Path, Utf8PathBuf};
 
 /// A [`Utf8PathBuf`] that is guaranteed to be absolute.
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, Hash)]

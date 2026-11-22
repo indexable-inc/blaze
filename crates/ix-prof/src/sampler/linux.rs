@@ -9,6 +9,7 @@ use std::{
 };
 
 use super::{DEPTH, Sample, Sink, Unsampled};
+use blaze_sys::{linux::sample::gettid, posix::types::pid_t};
 use crate::perf::{Counter, Event, Record};
 
 pub(super) const HOW: &str =
@@ -21,7 +22,7 @@ const EVERY: Duration = Duration::from_millis(100);
 const DATA_PAGES: usize = 16;
 
 /// One thread's task clock, through blaze's one perf reader ([`crate::perf`]).
-fn open(tid: libc::pid_t, hz: u32) -> Result<Event, std::io::Error> {
+fn open(tid: pid_t, hz: u32) -> Result<Event, std::io::Error> {
     Event::open(tid, Counter::TaskClock { hz, switches: false }, DEPTH as u16, DATA_PAGES)
 }
 
@@ -45,8 +46,7 @@ fn drain(event: &Event, period_ns: u64, batch: &mut Vec<Sample>) {
 
 /// Whether the kernel opens an event on this thread, with what it says when it does not.
 pub(super) fn check(hz: u32) -> Result<(), Unsampled> {
-    // SAFETY: `gettid` has no precondition.
-    let tid = unsafe { libc::gettid() };
+    let tid = gettid();
     match open(tid, hz) {
         Ok(event) => {
             drop(event);
@@ -64,7 +64,7 @@ pub(super) fn check(hz: u32) -> Result<(), Unsampled> {
 }
 
 /// The threads of the process now, but the sampler's.
-fn threads(own: libc::pid_t, into: &mut Vec<libc::pid_t>) {
+fn threads(own: pid_t, into: &mut Vec<pid_t>) {
     into.clear();
     let Ok(dir) = std::fs::read_dir("/proc/self/task") else { return };
     for entry in dir.flatten() {
@@ -79,11 +79,10 @@ fn threads(own: libc::pid_t, into: &mut Vec<libc::pid_t>) {
 /// The sampler's loop, until `stop`.
 pub(super) fn run(hz: u32, sink: &Sink, stop: &AtomicBool) {
     let period_ns = 1_000_000_000 / u64::from(hz);
-    // SAFETY: `gettid` has no precondition.
-    let own = unsafe { libc::gettid() };
-    let mut events: BTreeMap<libc::pid_t, Event> = BTreeMap::new();
-    let mut refused: BTreeSet<libc::pid_t> = BTreeSet::new();
-    let mut now: Vec<libc::pid_t> = Vec::new();
+    let own = gettid();
+    let mut events: BTreeMap<pid_t, Event> = BTreeMap::new();
+    let mut refused: BTreeSet<pid_t> = BTreeSet::new();
+    let mut now: Vec<pid_t> = Vec::new();
     let mut batch: Vec<Sample> = Vec::with_capacity(4096);
     let mut names: Vec<(u64, String)> = Vec::new();
     while !stop.load(Ordering::Relaxed) {

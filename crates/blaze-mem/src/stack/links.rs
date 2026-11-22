@@ -1,7 +1,7 @@
 //! A table of stack links over a reserved region, one `AtomicU32` per index, committed as
 //! indices are made.
 
-use std::mem;
+use core::mem;
 
 use super::{Links, NONE};
 use crate::{MemError, Region, Tag, sync::atomic::AtomicU32};

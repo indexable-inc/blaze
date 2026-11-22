@@ -69,6 +69,20 @@ const UNIX_ONLY: &str = "a process spawn, a kill, a listen, a connect, a receive
 /// Values in slots of their own, each named by a [`Tag`] and by a generational handle: what a
 /// driver keeps of the spawns, watches and listens in flight. A handle of one removed, or
 /// replaced by another of its tag, names nothing.
+/// File calls made on the asker's own thread: [`inline::Inline`], what a native driver whose
+/// file calls are this module's blocking calls hands out ([`crate::Driver::inline_files`]).
+pub mod inline;
+/// Which lane of file threads an effect waits in: the kqueue driver's dispatcher, sans IO.
+pub mod lanes;
+/// How the kqueue driver's file threads open the file of an effect a kept descriptor serves.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code, reason = "mmap of a kept descriptor, under Effect::Map's contract")]
+pub mod opening;
+/// A thread's QoS class on macOS, and the guard that holds a stretch of work at one.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code, reason = "pthread_get_qos_class_np and pthread_set_qos_class_self_np of the calling thread")]
+pub mod qos;
+
 #[cfg_attr(
     target_os = "wasi",
     allow(dead_code, reason = "WASI keeps no spawns, watches or listens")
@@ -78,7 +92,7 @@ const UNIX_ONLY: &str = "a process spawn, a kill, a listen, a connect, a receive
     expect(blaze::unwired, reason = "wired off WASI; WASI keeps no spawns, watches or listens")
 )]
 pub(crate) mod tagged {
-    use blaze_hash::HashMap;
+    use blaze_hash::{FixedState, Map, MapOpts};
     use blaze_mem::{Slab, Tag as MemTag};
     use std::alloc::Global;
 
@@ -96,7 +110,7 @@ pub(crate) mod tagged {
 
     pub(crate) struct Tagged<T> {
         slab: Slab<Entry<T>>,
-        by_tag: HashMap<Tag, Id<T>, Global>,
+        by_tag: Map<Tag, Id<T>, FixedState, Global>,
     }
 
     impl<T> Tagged<T> {
@@ -109,7 +123,7 @@ pub(crate) mod tagged {
                 Err(error) => panic!("{error}"),
             };
             // alloc: once per driver, the room of the tags in flight at once.
-            let by_tag = HashMap::with_capacity_in(reserve, Global);
+            let by_tag = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(reserve) });
             Tagged { slab, by_tag }
         }
 
@@ -183,7 +197,7 @@ pub(crate) mod tagged {
 
     #[cfg(test)]
     mod tests {
-        use blaze_hash::HashMap;
+        use blaze_hash::{FixedState, Map, MapOpts};
         use std::alloc::Global;
 
         use super::Tagged;
@@ -194,7 +208,7 @@ pub(crate) mod tagged {
             for seed in 0..50 {
                 let mut rng = Rng::new(seed);
                 let mut tagged = Tagged::new(4);
-                let mut model: HashMap<Tag, u64, Global> = HashMap::new_in(Global);
+                let mut model: Map<Tag, u64, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
                 let mut ids = Vec::new();
                 for step in 0..2000u64 {
                     let tag = Tag(rng.below(16));
@@ -424,6 +438,8 @@ impl Shared {
 
 pub struct Threads {
     start: Instant,
+    /// The machine's boot, read once as the driver is made ([`crate::Driver::boot`]).
+    boot: Result<crate::Boot, crate::NoBoot>,
     shared: Arc<Shared>,
     /// What the threads told, taken from their mailbox at once.
     inbox: VecDeque<Told>,
@@ -538,6 +554,7 @@ impl Threads {
         let host = crate::host::Host::new(Arc::new(HostSink(Arc::clone(&shared))));
         Threads {
             start: Instant::now(),
+            boot: crate::boot::system(),
             shared,
             // alloc: once per driver, swapped with the mailbox's queue.
             inbox: VecDeque::with_capacity(RESERVE),
@@ -757,10 +774,18 @@ impl Threads {
     #[cfg(target_os = "linux")]
     fn watch(
         &mut self,
-        dir: crate::FileName,
+        dir: crate::DirName,
         since: Option<crate::Cursor>,
         tag: Tag,
     ) -> io::Result<()> {
+        // The inotify walk names each folder under a named one; bstd asks no journal on Linux
+        // (it keeps none), so the root is refused by name ([`crate::journal::root_not_journaled`]'s rule).
+        let crate::DirName::Named(dir) = dir else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a journal of the driver's root: the threads driver journals named directories only on Linux",
+            ));
+        };
         if let Some(old) = self.watches.remove(tag) {
             old.control.stop();
             self.in_flight -= 1;
@@ -772,7 +797,7 @@ impl Threads {
             None => linux::Control::new()?,
         };
         control.reset();
-        let first = since.as_ref().map(|since| crate::journal::first_on_linux(&dir, since));
+        let first = since.as_ref().map(crate::journal::first_on_linux);
         // clone: the watch's control, kept by the driver.
         let (watch, _) = self.watches.insert(tag, Watching { control: control.clone() });
         #[cfg(test)]
@@ -860,7 +885,7 @@ impl Threads {
     #[cfg(target_os = "macos")]
     fn watch(
         &mut self,
-        dir: crate::FileName,
+        dir: crate::DirName,
         since: Option<crate::Cursor>,
         tag: Tag,
     ) -> io::Result<()> {
@@ -870,7 +895,7 @@ impl Threads {
         let watch = match self.spare.pop() {
             Some(watch) => watch,
             // clone: once per watch made, the state its sink tells into.
-            None => crate::fsevents::Watch::new(Sink(Arc::clone(&self.shared)))?,
+            None => crate::fsevents::Watch::new(Sink(Arc::clone(&self.shared)), &self.shared.root)?,
         };
         let (id, _) = self.watches.insert(tag, Watching(watch));
         let (_, Watching(watch)) = self.watches.by_id_mut(id).expect("inserted above");
@@ -950,7 +975,7 @@ impl Threads {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn watch(
         &mut self,
-        _: crate::FileName,
+        _: crate::DirName,
         since: Option<crate::Cursor>,
         _: Tag,
     ) -> io::Result<()> {
@@ -1004,9 +1029,9 @@ impl Threads {
     }
 
     #[cfg(unix)]
-    fn listen(&mut self, at: &crate::Address, tag: Tag) -> io::Result<()> {
+    fn listen(&mut self, at: &crate::Address, options: &crate::sockopt::Tcp, tag: Tag) -> io::Result<()> {
         use std::os::fd::{AsRawFd as _, OwnedFd};
-        let listener = crate::net::listen(&self.shared.root, at)?;
+        let listener = crate::net::listen(&self.shared.root, at, options)?;
         let (read_end, write_end) = std::io::pipe()?;
         let (read_end, write_end) = (OwnedFd::from(read_end), OwnedFd::from(write_end));
         crate::net::set_cloexec(read_end.as_raw_fd())?;
@@ -1099,6 +1124,22 @@ fn at<R>(
     blaze_mem::scratch::with_path(|path| {
         path.push(root);
         path.push(file.as_str());
+        f(path)
+    })
+}
+
+/// `f` of the directory `dir` under `root` ([`crate::DirName::Root`] is `root` itself), joined
+/// in the thread's path buffer.
+fn at_dir<R>(
+    root: &Path,
+    dir: &crate::DirName,
+    f: impl FnOnce(&Path) -> io::Result<R>,
+) -> io::Result<R> {
+    blaze_mem::scratch::with_path(|path| {
+        path.push(root);
+        if let Some(name) = dir.name() {
+            path.push(name.as_str());
+        }
         f(path)
     })
 }
@@ -1308,7 +1349,7 @@ fn run_kept(root: &Path, kept: &Descriptors, effect: Effect) -> io::Result<Done>
             fs::sync(path)?;
             Ok(Done::Synced)
         }),
-        Effect::SyncDir { dir, .. } => at(root, &dir, |path| {
+        Effect::SyncDir { dir, .. } => at_dir(root, &dir, |path| {
             fs::sync_dir(path)?;
             Ok(Done::Synced)
         }),
@@ -1383,18 +1424,24 @@ fn run_kept(root: &Path, kept: &Descriptors, effect: Effect) -> io::Result<Done>
             Ok(Done::Stat(at(root, &file, |path| fs::stat(path, false))?))
         }
         #[cfg(any(unix, target_os = "wasi"))]
-        Effect::Stamp { files, .. } => Ok(Done::Stamped(fs::stamps(root, &files)?)),
+        Effect::Stamp { files, .. } => {
+            crate::journal::stamp_rows(&files)?;
+            Ok(Done::Stamped(fs::stamps(root, &files)?))
+        }
         #[cfg(any(unix, target_os = "wasi"))]
         Effect::Entries { dir, .. } => {
-            Ok(Done::Entries(at(root, &dir, |path| fs::entries(path, &dir))?))
+            Ok(Done::Entries(Box::new(at_dir(root, &dir, |path| fs::entries(path, &dir))?)))
         }
         #[cfg(windows)]
-        Effect::Stamp { files, .. } => Ok(Done::Stamped(crate::iocp::stamps(root, &files)?)),
+        Effect::Stamp { files, .. } => {
+            crate::journal::stamp_rows(&files)?;
+            Ok(Done::Stamped(crate::iocp::stamps(root, &files)?))
+        }
         #[cfg(windows)]
         Effect::Entries { dir, .. } => {
-            Ok(Done::Entries(at(root, &dir, |path| crate::iocp::entries(path, &dir))?))
+            Ok(Done::Entries(Box::new(at_dir(root, &dir, |path| crate::iocp::entries(path, &dir))?)))
         }
-        Effect::List { dir, .. } => Ok(Done::Listed(at(root, &dir, |path| fs::list(path, &dir))?)),
+        Effect::List { dir, .. } => Ok(Done::Listed(at_dir(root, &dir, |path| fs::list(path, &dir))?)),
         Effect::Remove { file, .. } => at(root, &file, |path| {
             fs::remove(path)?;
             Ok(Done::Removed)
@@ -1407,8 +1454,13 @@ fn run_kept(root: &Path, kept: &Descriptors, effect: Effect) -> io::Result<Done>
         Effect::RemoveDir { dir, .. } => at(root, &dir, |path| std::fs::remove_dir(path))
             .map(|()| Done::RemovedDir)
             .map_err(|error| named(&dir, &error)),
+        Effect::Ancestors { most, .. } => Ok(Done::Ancestors(fs::ancestors(root, most)?)),
+        Effect::Above { op, name, .. } => fs::above(root, op, &name),
         Effect::Map { file, extent, .. } => Ok(Done::Mapped(
             at(root, &file, |path| fs::map_extent(path, extent)).map_err(|error| named(&file, &error))?,
+        )),
+        Effect::MapWrite { file, len, .. } => Ok(Done::MappedWrite(
+            at(root, &file, |path| fs::map_write(path, len)).map_err(|error| named(&file, &error))?,
         )),
         Effect::Lock { .. } | Effect::Unlock { .. } => {
             unreachable!("file locks are kept by the driver, which takes each as it is asked for")
@@ -1435,7 +1487,8 @@ fn run_kept(root: &Path, kept: &Descriptors, effect: Effect) -> io::Result<Done>
         | Effect::ReadStdin { .. }
         | Effect::WriteOut { .. }
         | Effect::Now { .. }
-        | Effect::Random { .. } => {
+        | Effect::Random { .. }
+        | Effect::Roots { .. } => {
             unreachable!(
                 "timers, watches, processes, sockets, the standard streams, the clock and \
                  randomness are kept by the driver"
@@ -1547,7 +1600,7 @@ enum Stage {
     /// Not yet started, and a kill came first: killed as it starts.
     Killed,
     /// Started and not yet reaped: its pid is no one else's.
-    Running(libc::pid_t),
+    Running(blaze_sys::posix::types::pid_t),
     /// Exited, or never started: nothing to kill.
     Exited,
 }
@@ -1564,7 +1617,7 @@ impl Life {
     }
 
     /// `pid` started: killed at once where a kill came first.
-    fn started(&self, pid: libc::pid_t) {
+    fn started(&self, pid: blaze_sys::posix::types::pid_t) {
         let mut stage = lock(&self.0);
         if let Stage::Killed = *stage {
             crate::process::kill(pid);
@@ -1603,6 +1656,7 @@ enum Errand {
     },
     Connect {
         at: crate::Address,
+        options: crate::sockopt::Tcp,
         tag: Tag,
     },
     Recv {
@@ -1775,7 +1829,7 @@ impl Errand {
                 };
                 Some(Told::Exited { spawn, completion: Completion { tag, done } })
             }
-            Errand::Connect { at, tag } => Some(match crate::net::connect(&shared.root, &at) {
+            Errand::Connect { at, options, tag } => Some(match crate::net::connect(&shared.root, &at, &options) {
                 Ok(socket) => Told::Connected { tag, socket },
                 Err(error) => failed(tag, error),
             }),
@@ -1857,13 +1911,14 @@ fn accept_until_stopped(
     listen: Id<Listening>,
     tag: Tag,
 ) -> Option<Done> {
+    use blaze_sys::posix::io::PollEvents;
     use std::os::fd::AsRawFd as _;
     // alloc: an error path.
     let failed = |error: io::Error| Some(Done::Failed(IoError(error.to_string())));
     loop {
         let mut fds = [
-            libc::pollfd { fd: listener.fd(), events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: stop.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: listener.fd(), events: PollEvents::IN.bits(), revents: 0 },
+            libc::pollfd { fd: stop.as_raw_fd(), events: PollEvents::IN.bits(), revents: 0 },
         ];
         match crate::raw::poll(&mut fds, -1) {
             Ok(_) => {}
@@ -1904,7 +1959,7 @@ struct Watching {
 #[cfg(all(test, target_os = "linux"))]
 impl Threads {
     /// Each watch's start from here waits at `gate` ([`crate::watch::Gate`]).
-    pub(crate) fn gate_walks(&mut self, gate: crossbeam_channel::Receiver<()>) {
+    pub(crate) fn gate_walks(&mut self, gate: crate::chan::Receiver<()>) {
         self.walk_gate = Some(gate);
     }
 
@@ -1931,6 +1986,7 @@ struct Starting {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use blaze_sys::{Errno, linux::PollEvents};
     use std::{
         io,
         os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd},
@@ -2090,13 +2146,13 @@ mod linux {
         let (stop, wake) = (control.stop.as_raw_fd(), control.wake.as_raw_fd());
         loop {
             let mut fds = [
-                libc::pollfd { fd: tree.raw(), events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: stop, events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: tree.raw(), events: PollEvents::IN.bits(), revents: 0 },
+                libc::pollfd { fd: stop, events: PollEvents::IN.bits(), revents: 0 },
+                libc::pollfd { fd: wake, events: PollEvents::IN.bits(), revents: 0 },
             ];
             match crate::raw::poll(&mut fds, -1) {
                 Ok(_) => {}
-                Err(error) if error.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(error) if error.raw_os_error() == Some(i32::from(Errno::Intr.raw())) => continue,
                 // alloc: an error path.
                 Err(error) => return Some(Done::Failed(IoError(error.to_string()))),
             }
@@ -2188,6 +2244,13 @@ fn no_watch(watch: Tag) -> String {
     )
 }
 
+impl Threads {
+    /// [`Driver::now`]'s clock as a value read with no `&self` (`Kqueue::clock`'s doc).
+    pub fn clock(&self) -> crate::wait::Monotonic {
+        crate::wait::Monotonic::since(self.start)
+    }
+}
+
 impl Driver for Threads {
     fn submit(&mut self, effects: &mut Vec<Effect>) {
         // The one now of every timer in this submit, as the ring driver's: timers asked
@@ -2207,7 +2270,7 @@ impl Driver for Threads {
                     self.timers.insert(now.saturating_add(wheel::ticks(after)), tag);
                 }
                 Effect::Watch { dir, tag } => {
-                    if let Err(error) = self.watch(dir, None, tag) {
+                    if let Err(error) = self.watch(crate::DirName::Named(dir), None, tag) {
                         // alloc: an error path.
                         self.tell(tag, Done::Failed(IoError(error.to_string())));
                     }
@@ -2271,8 +2334,8 @@ impl Driver for Threads {
                     }
                 }
                 #[cfg(unix)]
-                Effect::Listen { at, tag } => {
-                    if let Err(error) = self.listen(&at, tag) {
+                Effect::Listen { at, options, tag } => {
+                    if let Err(error) = self.listen(&at, &options, tag) {
                         // alloc: an error path.
                         self.tell(tag, Done::Failed(IoError(error.to_string())));
                     }
@@ -2287,9 +2350,9 @@ impl Driver for Threads {
                     ),
                 },
                 #[cfg(unix)]
-                Effect::Connect { at, tag } => {
+                Effect::Connect { at, options, tag } => {
                     self.in_flight += 1;
-                    self.dispatch(Errand::Connect { at, tag });
+                    self.dispatch(Errand::Connect { at, options, tag });
                 }
                 #[cfg(unix)]
                 Effect::Recv { conn, most, into, tag } => match self.socket(conn) {
@@ -2334,6 +2397,9 @@ impl Driver for Threads {
                 Effect::Now { tag } => self.tell(tag, crate::host::wall()),
                 #[cfg(not(unix))]
                 Effect::Random { len, tag } => self.tell(tag, crate::host::random(len)),
+                // Refused by name where `crate::trust` reads no store (Windows, WASI).
+                #[cfg(not(unix))]
+                Effect::Roots { cert_file, cert_dir, tag } => self.tell(tag, crate::host::roots(cert_file, cert_dir)),
                 #[cfg(not(unix))]
                 effect @ (Effect::Bind { .. }
                 | Effect::SendTo { .. }
@@ -2417,5 +2483,9 @@ impl Driver for Threads {
 
     fn wall_ns(&self) -> u64 {
         crate::system_wall_ns()
+    }
+
+    fn boot(&self) -> Result<crate::Boot, crate::NoBoot> {
+        self.boot.clone()
     }
 }

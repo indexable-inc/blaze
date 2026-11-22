@@ -1,11 +1,13 @@
 ---
-status: current
-summary: What blaze removes from disk and when: the collector of build dirs, shared std stores, temporaries and trash; the pacer that works harder as a volume fills, leases, records, roots and the grace, and why nothing in use is removed; the daemon's store under the home's budget, its pins and what a build says of it.
+status: superseded
+superseded_by: v2/plan/design/end-state.md#d159-one-body-one-store-one-answer-form-code-made-ahead
+date: 2026-11-20
+summary: (crates/blaze-gc, deleted 2026-11-20 with nothing live calling it) What blaze removes from disk and when: the collector of build dirs, shared std stores, temporaries and trash; the pacer that works harder as a volume fills, leases, records, roots and the grace, and why nothing in use is removed; the daemon's store under the home's budget, its pins and what a build says of it.
 ---
 # Collecting what blaze keeps on disk
 
 blaze writes outside the checkout only: a build dir per workspace under blaze's root
-(`<root>/build/<name>-<id>`, [cargo.md](cargo.md#where-a-build-writes)), the daemon's state
+(`<root>/build/<name>-<id>`), the daemon's state
 (`<root>/v2`), and one standard library store per code of what makes std's records (the front
 end's, the code generator's and blaze-cargo's code identities, `serve::RecordMakers` in
 crates/blaze-cargo, never the executable's bytes), shared by every daemon of the machine
@@ -188,14 +190,13 @@ directory, keeps it: the rename needs the exclusive lock, which the collector on
 (`try_lock`, never waiting) and does not get while the lease is held.
 
 - A daemon's job takes its build dir's lease before anything is built into it and holds it until
-  no task, placing or run of the job is left (`crates/blaze-cargo/src/serve/job.rs`,
-  `lease_build_dirs`, reached through `Steps::lease` so the daemon's simulated tests, whose
-  build dirs are not on disk, take none). It is taken on the worker pool, as the job's first step, never on the
+  no task, placing or run of the job is left (the daemon, deleted on 2026-11-15, took it in
+  `lease_build_dirs`). It is taken on the worker pool, as the job's first step, never on the
   daemon's loop: it only tries the lock, and while a collector holds it exclusively, or its
   lease file's nonce is not whole yet, the step gives way and is posted again, for at most
   `lease::GIVE_WAY` (11 s: the 10 s after which a short nonce is abandoned and repaired, and a
   second), then a typed error naming the dir and what it waited on (`lease::Wait`). A
-  daemon holds its shared std store's lease for its life (`crates/blaze-cargo/src/serve.rs`),
+  daemon held its shared std store's lease for its life,
   taken once at start, waiting at most a second (`SHARED_WAIT`) and checking inside the wait
   that the file it waits on is still the dir's. The locks are the kernel's `flock`s, so they hold
   across processes, and a crash leaves none behind.
@@ -309,7 +310,7 @@ unused. With no build dir found, the end of the last run the check passed (kept 
 with whether the check ran) stands in for it, so a clock set forward while the daemon was down
 is refused too; a run that stopped before the check, or failed it, vouches for no time.
 
-In the daemon (`crates/blaze-cargo/src/serve/gc.rs`) the loop only feeds the collector and takes
+In the daemon (deleted on 2026-11-15) the loop only fed the collector and takes
 its decisions; each scan, rename and unlink runs as a job of the worker pool in the class the
 collector's priority names ([Pacing](#pacing-how-hard-it-works)). Each phase has a span (`gc
 scan`, `gc mark`, `gc sweep`, `gc unlink`, `gc ledger write`).
@@ -374,8 +375,8 @@ and begun afresh, never silently.
 
 ## The store's budget and collector
 
-Built 2026-11-12 (lane storegc-1112): the core is `crates/blaze-cas/src/collect.rs`, its
-driver `crates/blaze-cargo/src/serve/collect.rs`, its simulation
+Built 2026-11-12 (lane storegc-1112): the core is `crates/blaze-cas/src/collect.rs` (its
+driver went with the daemon), its simulation
 `crates/blaze-cas/src/tests/collect.rs`. What is not built is under [Not done yet](#not-done-yet).
 
 **Budget.** One number for a home (`<root>`), the tightest of three, each set in its
@@ -468,10 +469,6 @@ hang or answer by accident, and nothing waits on the answer since the collector 
 work. At the budget the build proceeds and the line says what is kept; a build fails only
 when a write fails for want of space, as [above](#pacing-how-hard-it-works).
 
-**Measured by** `harness/storegc.py` (one JSON value): a home filled by several generated
-programs, the budget set to a share of what it holds, body edits before, during and after the
-collection, the bytes at each step, and what `blaze gc --dry-run` says is kept.
-
 ## Every byte has an owner
 
 The class this closes: bytes under a home that no collector knows, and bytes a collector knows
@@ -538,7 +535,7 @@ does, when no daemon holds the home); a build's output does not warn with the ho
 guard is not called from a test that builds; `sources/` and `toolchains/` have no collector;
 a home made for a lane or a test has no lifetime. The design for the last: each home registers
 itself in the machine's list (`<machine>/homes.json`: path, creator, made, expires; written
-whole under the list's lock as a daemon first starts on the home; `BLAZE_HOME_EXPIRES` or a
+whole under the list's lock as a daemon first starts on the home; BLAZE_HOME_EXPIRES or a
 default of 7 days for a home outside `~/.cache`, none for the user's own), `blaze cache homes`
 lists them with sizes and expiry, and a collection on any home removes a listed home that is
 past its expiry, whose collector lock is free and whose directory still carries the list's
@@ -555,8 +552,7 @@ nonce, by the same rename into its own trash.
   flags of use over on a worker (`FlagCarry`, `store flags carry`), and until that is back the
   store forgets nothing; a store with no index table yet (under 65,536 records) forgets
   nothing; the index table is built on a worker (`blaze-cas/src/rebuild.rs`, 2026-11-12, not yet run; a daemon with no collector still builds it in a commit); the period's scan
-  walks every row and reads every chunk list each period (on a worker); the daemon's own
-  measurement (`harness/storegc.py`) has not been run.
+  walks every row and reads every chunk list each period (on a worker); it has not been measured.
 
 - Records an older blaze made (every record's key covers the code of what made it, so a
   rebuilt blaze reads none of an older one's: a home used by rebuilt compilers for a day held

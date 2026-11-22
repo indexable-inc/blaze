@@ -1,6 +1,7 @@
 use std::{
     alloc::Global,
     hash::{BuildHasher, Hash, Hasher},
+    vec::Vec,
 };
 
 use blaze_sim::Config;
@@ -44,6 +45,7 @@ fn hashes<T: Hash>(keys: impl Iterator<Item = T>) -> Vec<u64> {
 // 1.1 on average. FxHash puts the high-bits keys 110 groups deep on average.
 
 #[test]
+#[cfg_attr(miri, ignore = "a statistic of the safe hash over 57,000 keys: no unsafe code")]
 fn sequential_ids_spread_over_the_table() {
     let (longest, mean) = probes(&hashes(0..57_000u32));
     assert!(
@@ -53,12 +55,14 @@ fn sequential_ids_spread_over_the_table() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "a statistic of the safe hash over 57,000 keys: no unsafe code")]
 fn aligned_pointers_spread_over_the_table() {
     let (longest, mean) = probes(&hashes((0..57_000usize).map(|it| 0x7f12_3456_0000 + 64 * it)));
     assert!(longest <= 16 && mean < 1.2, "pointers: longest probe {longest} groups, mean {mean}");
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "a statistic of the safe hash over 3,500 keys: no unsafe code")]
 fn keys_that_differ_in_their_high_bits_spread_over_the_table() {
     let (longest, mean) = probes(&hashes((0..3_500u64).map(|it| it << 52)));
     assert!(longest <= 16 && mean < 1.2, "high bits: longest probe {longest} groups, mean {mean}");
@@ -156,9 +160,74 @@ fn a_lookup_on_a_hash_allocates_nothing() {
     });
 }
 
+/// The port of foldhash's fast hasher (`fold`) gives foldhash 0.2.0's hashes under its fixed
+/// seed, `with_seed` and the default alike, for any run of writes: byte strings of every length
+/// past each of its paths (16, 128 and 256 bytes) and integers of every width, which fill and
+/// fold its sponge at every offset.
+#[test]
+fn fold_is_foldhash() {
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
+        let seed: u64 = if tape.coin("default seed") { 0 } else { tape.int("seed") };
+        let mut ours = FixedHasher::with_seed(seed);
+        let mut theirs = foldhash::fast::FixedState::with_seed(seed).build_hasher();
+        let mut bytes = [0u8; 600];
+        tape.fill(&mut bytes, "bytes");
+        for _ in 0..tape.below(24, "writes") {
+            match tape.below(7, "write") {
+                0 => {
+                    let len = if tape.one_in(3, "long") {
+                        tape.index(bytes.len() + 1, "long length")
+                    } else {
+                        tape.index(33, "short length")
+                    };
+                    let from = tape.index(bytes.len() - len + 1, "offset");
+                    ours.write(&bytes[from..from + len]);
+                    theirs.write(&bytes[from..from + len]);
+                }
+                1 => {
+                    let it = tape.int::<u8>("u8");
+                    ours.write_u8(it);
+                    theirs.write_u8(it);
+                }
+                2 => {
+                    let it = tape.int::<u16>("u16");
+                    ours.write_u16(it);
+                    theirs.write_u16(it);
+                }
+                3 => {
+                    let it = tape.int::<u32>("u32");
+                    ours.write_u32(it);
+                    theirs.write_u32(it);
+                }
+                4 => {
+                    let it = tape.int::<u64>("u64");
+                    ours.write_u64(it);
+                    theirs.write_u64(it);
+                }
+                5 => {
+                    let it = u128::from(tape.int::<u64>("u128 high")) << 64
+                        | u128::from(tape.int::<u64>("u128 low"));
+                    ours.write_u128(it);
+                    theirs.write_u128(it);
+                }
+                _ => {
+                    let it = tape.int::<u64>("usize") as usize;
+                    ours.write_usize(it);
+                    theirs.write_usize(it);
+                }
+            }
+            assert_eq!(ours.finish(), theirs.finish(), "seed {seed:#x}");
+        }
+        assert_eq!(
+            FixedState.hash_one(&bytes[..]),
+            foldhash::fast::FixedState::default().hash_one(&bytes[..])
+        );
+    });
+}
+
 #[test]
 fn hashes_as_the_copies_did() {
-    blaze_sim::check(Config::DEFAULT, |tape| {
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
         let bytes: [u8; 32] = tape.array("bytes", |tape| tape.int::<u8>("byte"));
         let word: u64 = tape.int("word");
         assert_eq!(key_hash_of(&Id(bytes)), reference_of(&Id(bytes)));
@@ -228,7 +297,7 @@ fn the_streaming_hasher_is_siphash_of_the_bytes_written() {
         state ^= state << 17;
         state
     };
-    for round in 0..2000 {
+    for round in 0..if cfg!(miri) { 40 } else { 2000 } {
         let key = SipKey::new(next(), next());
         let mut ours = key.hasher();
         let [k0, k1] = key.words();
@@ -361,6 +430,7 @@ fn hash_cost() {
 /// never below the longest walk of honest keys: sequential integers placed by the fixed hash in
 /// linear-probing tables filled to half, the most an adaptive index holds before it grows.
 #[test]
+#[cfg_attr(miri, ignore = "a statistic of the safe hash in tables of up to 2^16 slots: no unsafe code")]
 fn honest_keys_never_walk_the_refused_run() {
     use crate::adaptive::refused_run;
     assert_eq!([refused_run(4), refused_run(9), refused_run(27)], [169, 187, 252]);
@@ -390,4 +460,230 @@ fn honest_keys_never_walk_the_refused_run() {
             );
         }
     }
+}
+
+/// A map of `held` keys below `range` (some removed again, so dead slots stand in probes),
+/// each key's value `value(key)`.
+fn map_of<V>(
+    tape: &blaze_sim::Tape,
+    range: u64,
+    value: impl Fn(u64) -> V,
+) -> HashMap<u64, V, Global> {
+    let mut map = HashMap::new_in(Global);
+    for _ in 0..tape.below(if cfg!(miri) { 60 } else { 500 }, "held") {
+        let key = tape.below(range, "key");
+        if tape.one_in(5, "remove") {
+            map.remove(&key);
+        } else {
+            map.insert(key, value(key));
+        }
+    }
+    map
+}
+
+/// `count` keys to ask, from twice the held range (so about half are absent), every batch
+/// holding a duplicate.
+fn asked(tape: &blaze_sim::Tape, range: u64, count: usize) -> Vec<u64> {
+    let mut keys: Vec<u64> = (0..count).map(|_| tape.below(2 * range, "asked")).collect();
+    if count > 1 {
+        let to = tape.index(count, "duplicate to");
+        keys[to] = keys[tape.index(count, "duplicate from")];
+    }
+    keys
+}
+
+/// `get_many` and `get_many_into` answer what `get` answers of each key, duplicates and absent
+/// keys among them: on entries narrow enough that a group's slots are prefetched with its word
+/// (`u64` to `u32`) and wide enough that only the matched slot is (`u64` to 64 bytes), on a
+/// set, on borrowed `str` keys, and across the slice form's batch boundaries.
+#[test]
+fn get_many_is_get_of_each() {
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
+        let range = 1 + tape.below(400, "range");
+
+        let narrow = map_of(tape, range, |key| key as u32);
+        let keys = asked(tape, range, 8);
+        let many = narrow.get_many(core::array::from_fn::<_, 8, _>(|at| &keys[at]));
+        for (at, key) in keys.iter().enumerate() {
+            assert_eq!(many[at], narrow.get(key), "narrow: key {key} of {keys:?}");
+        }
+        let keys = asked(tape, range, tape.index(40, "slice length"));
+        let mut out = std::vec![None; keys.len()];
+        narrow.get_many_into(&keys, &mut out);
+        for (at, key) in keys.iter().enumerate() {
+            assert_eq!(out[at], narrow.get(key), "narrow slice: key {key} at {at}");
+        }
+
+        let wide = map_of(tape, range, |key| [key; 8]);
+        let keys = asked(tape, range, 5);
+        let many = wide.get_many(core::array::from_fn::<_, 5, _>(|at| &keys[at]));
+        for (at, key) in keys.iter().enumerate() {
+            assert_eq!(many[at], wide.get(key), "wide: key {key} of {keys:?}");
+        }
+        let keys = asked(tape, range, tape.index(40, "wide slice length"));
+        let mut out = std::vec![None; keys.len()];
+        wide.get_many_into(&keys, &mut out);
+        for (at, key) in keys.iter().enumerate() {
+            assert_eq!(out[at], wide.get(key), "wide slice: key {key} at {at}");
+        }
+
+        let mut set: crate::HashSet<u64, Global> = crate::HashSet::new_in(Global);
+        set.extend(narrow.keys().copied());
+        let keys = asked(tape, range, 4);
+        let many = set.get_many(core::array::from_fn::<_, 4, _>(|at| &keys[at]));
+        let mut out = std::vec![None; keys.len()];
+        set.get_many_into(&keys, &mut out);
+        for (at, key) in keys.iter().enumerate() {
+            assert_eq!(many[at], set.get(key), "set: key {key} of {keys:?}");
+            assert_eq!(out[at], set.get(key), "set slice: key {key} of {keys:?}");
+        }
+
+        let mut names: HashMap<std::string::String, u64, Global> = HashMap::new_in(Global);
+        names.extend(narrow.keys().map(|&key| (std::format!("k{key}"), key)));
+        let asked_names: Vec<std::string::String> =
+            asked(tape, range, 3).iter().map(|key| std::format!("k{key}")).collect();
+        let many = names.get_many(core::array::from_fn::<_, 3, _>(|at| asked_names[at].as_str()));
+        for (at, name) in asked_names.iter().enumerate() {
+            assert_eq!(many[at], names.get(name.as_str()), "names: {name} of {asked_names:?}");
+        }
+    });
+}
+
+/// `get_or_insert_with` on a tape of `str` keys (with removals between, so dead slots and
+/// full tables are met) is `get`, then `insert` on a miss, against a map driven that way;
+/// its `make` runs once per key it puts, and never for a held key. The set's form likewise.
+#[test]
+fn get_or_insert_with_is_get_then_insert() {
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
+        let mut ours: HashMap<std::string::String, u64, Global> = HashMap::new_in(Global);
+        let mut model: HashMap<std::string::String, u64, Global> = HashMap::new_in(Global);
+        let mut set: crate::HashSet<std::string::String, Global> = crate::HashSet::new_in(Global);
+        let (mut made, mut put, mut set_made) = (0usize, 0usize, 0usize);
+        let range = 1 + tape.below(200, "range");
+        for step in 0..tape.below(if cfg!(miri) { 80 } else { 600 }, "steps") {
+            let name = std::format!("k{}", tape.below(range, "key"));
+            if tape.one_in(6, "remove") {
+                assert_eq!(ours.remove(name.as_str()), model.remove(name.as_str()));
+                set.remove(name.as_str());
+                continue;
+            }
+            let expected = match model.get(name.as_str()) {
+                Some(&held) => held,
+                None => {
+                    model.insert(name.clone(), step);
+                    put += 1;
+                    step
+                }
+            };
+            let got = ours.get_or_insert_with(name.as_str(), |key| {
+                made += 1;
+                (std::string::String::from(key), step)
+            });
+            assert_eq!(*got, expected, "{name} at step {step}");
+            let held = set.get_or_insert_with(name.as_str(), |key| {
+                set_made += 1;
+                std::string::String::from(key)
+            });
+            assert_eq!(held, &name);
+            assert_eq!(ours.len(), model.len());
+        }
+        assert_eq!(made, put, "`make` once per key put, never on a hit");
+        assert_eq!(set_made, put, "the set's `make` likewise");
+        for (key, value) in model.iter() {
+            assert_eq!(ours.get(key.as_str()), Some(value));
+        }
+        let tried = ours.try_get_or_insert_with("absent-key", |key| (std::string::String::from(key), 7));
+        assert_eq!(tried.ok().map(|value| *value), Some(7));
+    });
+}
+
+/// The keys a case inserts: up to 200, from a small range so that some repeat.
+fn keys_of(tape: &blaze_sim::Tape) -> Vec<u64> {
+    let count = tape.index(201, "keys");
+    (0..count).map(|_| tape.below(300, "key")).collect() // alloc: a case's keys
+}
+
+/// D126: `Map::new` and `Set::new` make what the constructors they replace made. With
+/// `capacity: None` it is `new_in`; with `Some(n)` it is `with_capacity_in(n, ..)`: the same
+/// capacity, and after the same inserts the same contents in the same iteration order, so the
+/// sweep from one to the other changes no program's output.
+#[test]
+fn new_with_options_is_the_old_constructors() {
+    use crate::{Map, MapOpts, Set, SetOpts};
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
+        let keys = keys_of(tape);
+        let room = if tape.coin("reserve") { Some(tape.index(500, "capacity")) } else { None };
+
+        let mut new: Map<u64, u64, FixedState, Global> =
+            Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: room });
+        let mut old: HashMap<u64, u64, Global> = match room {
+            None => HashMap::new_in(Global),
+            Some(n) => HashMap::with_capacity_in(n, Global),
+        };
+        assert_eq!(new.capacity(), old.capacity(), "capacity {room:?}");
+        if room.is_none() {
+            assert_eq!(new.capacity(), 0, "`capacity: None` reserves nothing");
+        }
+        let mut set: Set<u64, FixedState, Global> =
+            Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: room });
+        let mut old_set: crate::HashSet<u64, Global> = match room {
+            None => crate::HashSet::new_in(Global),
+            Some(n) => crate::HashSet::with_capacity_in(n, Global),
+        };
+        assert_eq!(set.capacity(), old_set.capacity(), "set capacity {room:?}");
+        for (step, &key) in keys.iter().enumerate() {
+            assert_eq!(new.insert(key, step as u64), old.insert(key, step as u64));
+            assert_eq!(set.insert(key), old_set.insert(key));
+        }
+        assert_eq!(new.capacity(), old.capacity());
+        assert!(new.iter().eq(old.iter()), "the same pairs in the same order");
+        assert!(set.iter().eq(old_set.iter()), "the same keys in the same order");
+
+        let tried: Map<u64, u64, FixedState, Global> =
+            Map::try_new(MapOpts { hasher: FixedState, alloc: Global, capacity: room })
+                .unwrap_or_else(|failure| panic!("{room:?}: {failure:?}"));
+        assert_eq!(tried.capacity(), old_capacity(room));
+    });
+}
+
+/// The capacity `with_capacity_in(n, ..)` gives, or `new_in`'s for `None`.
+fn old_capacity(room: Option<usize>) -> usize {
+    match room {
+        None => HashMap::<u64, u64, Global>::new_in(Global).capacity(),
+        Some(n) => HashMap::<u64, u64, Global>::with_capacity_in(n, Global).capacity(),
+    }
+}
+
+/// D125: a keyed table is made the same way, its key as the hasher; two tables under two
+/// different keys hold the same contents after the same inserts (their order may differ: it is
+/// the key's).
+#[test]
+fn a_keyed_table_takes_its_key_as_the_hasher() {
+    use crate::{Map, MapOpts, Set, SetOpts, SipKey};
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 128 }), |tape| {
+        let keys = keys_of(tape);
+        let first = SipKey::new(tape.int("k0"), tape.int("k1"));
+        let mut second = SipKey::new(tape.int("k2"), tape.int("k3"));
+        if second == first {
+            second = SipKey::new(first.words()[0] ^ 1, first.words()[1]);
+        }
+        let mut a: Map<u64, u64, SipKey, Global> =
+            Map::new(MapOpts { hasher: first, alloc: Global, capacity: None });
+        let mut b: Map<u64, u64, SipKey, Global> =
+            Map::new(MapOpts { hasher: second, alloc: Global, capacity: Some(keys.len()) });
+        let mut set: Set<u64, SipKey, Global> =
+            Set::new(SetOpts { hasher: second, alloc: Global, capacity: None });
+        for (step, &key) in keys.iter().enumerate() {
+            assert_eq!(a.insert(key, step as u64), b.insert(key, step as u64));
+            set.insert(key);
+        }
+        assert_eq!(a.len(), b.len());
+        assert_eq!(set.len(), a.len());
+        assert!(a.iter().all(|(key, value)| b.get(key) == Some(value) && set.contains(key)));
+        let mut a_pairs: Vec<(u64, u64)> = a.iter().map(|(k, v)| (*k, *v)).collect(); // alloc: the test's copy
+        let mut b_pairs: Vec<(u64, u64)> = b.iter().map(|(k, v)| (*k, *v)).collect(); // alloc: the test's copy
+        a_pairs.sort_unstable();
+        b_pairs.sort_unstable();
+        assert_eq!(a_pairs, b_pairs);
+    });
 }

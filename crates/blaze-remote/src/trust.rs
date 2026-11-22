@@ -1,5 +1,7 @@
-//! Trust: Ed25519 signatures by `ring` 0.17 (`ring::signature::ED25519`), the same
-//! implementation blaze-global and blaze-pack use.
+//! Trust: Ed25519. Every signature is verified by blaze-ed25519 (RFC 8032's strict check,
+//! remote-read.md, "Ed25519, written here"), in both of the crate's shapes; a refusal carries
+//! that crate's reason ([`Why::Signature`]) and is never retried. Signing ([`Signer`]) holds a
+//! secret and is `ring` 0.17's, built only under the `sign` feature: blaze writes no signer.
 //!
 //! - An anchor key is trusted per namespace in settings. It signs key lists only, and is kept
 //!   offline by the owner.
@@ -30,12 +32,15 @@ use blaze_ids::ContentId;
 pub use blaze_keyed::kind::Tier;
 use blaze_keyed::store::{Refused, SegmentRef, StoreError, Verifier, WireError};
 pub use blaze_keyed::store::Statement;
-use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+#[cfg(feature = "sign")]
+use ring::signature::{Ed25519KeyPair, KeyPair};
 
 use crate::{
     name::Toolchain,
-    wire::{Bounded, hex, key_at, put_u32, put_u64, sig_at, u32_at, u64_at},
+    wire::{Bounded, hex, key_at, sig_at, u32_at, u64_at},
 };
+#[cfg(feature = "sign")]
+use crate::wire::{put_u32, put_u64};
 
 /// An Ed25519 public key.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -53,6 +58,20 @@ impl fmt::Display for PublicKey {
     }
 }
 
+/// The keys a published set (published/set.rs) is believed from with nothing named: the
+/// trusted builders' (CI's, later the remote workers'), compiled into blaze (D137), never read
+/// from a file a project or a toolchain manifest could change. EMPTY until CI has its key: so
+/// today every published set is believed only through the key a command names for its origin
+/// (`--origin-key`), and with none named a set is refused `UnknownSigner`, by name.
+pub const PUBLISHED_KEYS: &[PublicKey] = &[];
+
+/// The one answer to "is `signer` trusted for this origin": one of the compiled-in
+/// [`PUBLISHED_KEYS`], or one of `named`, the keys the command granted that origin by name
+/// (`--origin-key`; none named: empty). Nothing else makes a key trusted.
+pub fn trusted_for(signer: &PublicKey, named: &[PublicKey]) -> bool {
+    PUBLISHED_KEYS.contains(signer) || named.contains(signer)
+}
+
 impl fmt::Debug for PublicKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "PublicKey({self})")
@@ -60,17 +79,20 @@ impl fmt::Debug for PublicKey {
 }
 
 /// A signing key: an Ed25519 seed held only in memory. Its Debug shows the public key alone.
+#[cfg(feature = "sign")]
 pub struct Signer {
     pair: Ed25519KeyPair,
     public: PublicKey,
 }
 
+#[cfg(feature = "sign")]
 impl fmt::Debug for Signer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Signer {{ public: {}, seed: <redacted> }}", self.public)
     }
 }
 
+#[cfg(feature = "sign")]
 impl Signer {
     /// The signer of a 32-byte seed.
     pub fn from_seed(seed: &[u8; 32]) -> Signer {
@@ -89,7 +111,9 @@ impl Signer {
         self.public
     }
 
-    pub(crate) fn sign(&self, domain: &str, body: &[u8]) -> [u8; 64] {
+    /// Its signature over `domain || 0x00 || body`, the form every object of this crate but a
+    /// statement is signed in.
+    pub fn sign(&self, domain: &str, body: &[u8]) -> [u8; 64] {
         let mut message = Vec::with_capacity(domain.len() + 1 + body.len());
         message.extend_from_slice(domain.as_bytes());
         message.push(0);
@@ -105,25 +129,35 @@ impl Signer {
     }
 }
 
-/// Whether `statement`'s signature holds over its body under the key it names. Counted once.
-fn statement_holds(statement: &Statement) -> bool {
+/// Whether `statement`'s signature holds over its body under the key it names, by
+/// blaze-ed25519: `Err` carries its reason. Counted once.
+fn statement_holds(statement: &Statement) -> Result<(), blaze_ed25519::Refused> {
     note(Check::Signature, statement.signature[..32].try_into().expect("32 bytes"));
     if crate::planted(crate::Plant::SkipSignature) {
-        return true;
+        return Ok(());
     }
-    UnparsedPublicKey::new(&ED25519, &statement.signer).verify(&statement.body(), &statement.signature).is_ok()
+    blaze_ed25519::verify(&statement.signer, &statement.body(), &statement.signature)
 }
 
-pub(crate) fn verify_sig(key: &PublicKey, domain: &str, body: &[u8], signature: &[u8; 64]) -> bool {
+/// Whether `signature` is `key`'s over `domain || 0x00 || body`, by blaze-ed25519 (its parts
+/// hashed in turn, nothing copied): `Err` carries its reason. Counted once.
+pub(crate) fn verify_sig(key: &PublicKey, domain: &str, body: &[u8], signature: &[u8; 64]) -> Result<(), blaze_ed25519::Refused> {
     note(Check::Signature, signature[..32].try_into().expect("32 bytes"));
     if crate::planted(crate::Plant::SkipSignature) {
-        return true;
+        return Ok(());
     }
-    let mut message = Vec::with_capacity(domain.len() + 1 + body.len());
-    message.extend_from_slice(domain.as_bytes());
-    message.push(0);
-    message.extend_from_slice(body);
-    UnparsedPublicKey::new(&ED25519, &key.0).verify(&message, signature).is_ok()
+    blaze_ed25519::verify_parts(&key.0, &[domain.as_bytes(), &[0], body], signature)
+}
+
+/// Whether `signature` is `key`'s over `domain || 0x00 || bound || body`: a signature bound to
+/// what `bound` names (a published set's id, published/set.rs), so it stands for that alone.
+/// Counted once, as [`verify_sig`].
+pub(crate) fn verify_bound(key: &PublicKey, domain: &str, bound: &[u8], body: &[u8], signature: &[u8; 64]) -> Result<(), blaze_ed25519::Refused> {
+    note(Check::Signature, signature[..32].try_into().expect("32 bytes"));
+    if crate::planted(crate::Plant::SkipSignature) {
+        return Ok(());
+    }
+    blaze_ed25519::verify_parts(&key.0, &[domain.as_bytes(), &[0], bound, body], signature)
 }
 
 /// What a check was of.
@@ -197,8 +231,8 @@ pub fn swap_checks(client: ClientChecks) -> ClientChecks {
 /// Why an object was refused.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Why {
-    /// Its signature does not verify under the key it names.
-    Signature,
+    /// Its signature does not verify under the key it names: blaze-ed25519's reason.
+    Signature(blaze_ed25519::Refused),
     /// Its signer is not in the namespace's key list (or, for a key list, not an anchor).
     UnknownSigner,
     /// Its signer is revoked.
@@ -268,7 +302,7 @@ impl fmt::Display for Refusal {
 impl fmt::Display for Why {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Why::Signature => write!(f, "its signature does not verify"),
+            Why::Signature(why) => write!(f, "its signature does not verify: {why}"),
             Why::UnknownSigner => write!(f, "its signer is not trusted for this namespace"),
             Why::Revoked => write!(f, "its signer is revoked"),
             Why::NotValid { from, until, at } => write!(f, "its signer is valid {from}..{until} (unix s), not at {at}"),
@@ -339,6 +373,7 @@ pub const KEYS_MOST: usize = 1024;
 pub const KEY_LIST_MOST: u64 = (KEYS_HEADER + KEYS_MOST * KEY_ENTRY + 96) as u64;
 
 impl KeyList {
+    #[cfg(feature = "sign")]
     pub fn encode(&self, anchor: &Signer) -> Vec<u8> {
         let mut out = Vec::with_capacity(KEYS_HEADER + self.keys.len() * KEY_ENTRY + 96);
         out.extend_from_slice(b"BLRK");
@@ -381,8 +416,8 @@ impl KeyList {
         if !anchors.contains(&anchor) {
             return Err(Refusal::new(object, Some(anchor.to_string()), Why::UnknownSigner));
         }
-        if !verify_sig(&anchor, KEYS_DOMAIN, &bytes[..body_len], &sig_at(bytes, body_len)) {
-            return Err(Refusal::new(object, Some(anchor.to_string()), Why::Signature));
+        if let Err(why) = verify_sig(&anchor, KEYS_DOMAIN, &bytes[..body_len], &sig_at(bytes, body_len)) {
+            return Err(Refusal::new(object, Some(anchor.to_string()), Why::Signature(why)));
         }
         let found = u64_at(bytes, 8);
         if found != namespace.0 && !crate::planted(crate::Plant::SkipNamespace) {
@@ -476,7 +511,8 @@ impl Verifier for Bound<'_> {
             Err(Why::NotValid { .. }) => return Err(Refused::Expired { signer, issued: statement.issued }),
             Err(_) => return Err(Refused::Untrusted { signer }),
         }
-        if !statement_holds(statement) {
+        // blaze-keyed's `Refused::Signature` has no field for blaze-ed25519's reason.
+        if statement_holds(statement).is_err() {
             return Err(Refused::Signature { signer });
         }
         Ok(())

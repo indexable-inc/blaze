@@ -1,0 +1,12 @@
+{
+ "id": "rd2-units-record-head",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Opus 5.5), lane RD2",
+ "where": "crates/blaze-cli/src/engine_units.rs `read_back`, engine_store.rs `put_all`",
+ "what": "A units-stage record is put with a plain head: no parts, no findings. So reading the unit graph back means making its `MacroModule` parts again from the graph's bytes (macros.rs `parts`), and a graph sealed with no crate list (a world that was not made) cannot be read back, because its finding is not kept in the record. The names world is also still made again from the graph's bytes on read-back: NamesStage takes an owned `Names` (engine_names.rs is another lane's file), not a view over the stored crate list.",
+ "cost": "a second derivation of the parts on every read-back; the names world made again on each command (rule 77)",
+ "cause": "units records were written before anything read them back",
+ "workaround": "parts made again from the graph section; a list-less graph is discovered in full (UnitsCause::World)",
+ "fix": "put units records whole, with parts and findings, through put_all; give NamesStage a view over the stored crate list",
+ "state": "open"
+}

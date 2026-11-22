@@ -7,7 +7,7 @@
 //!
 //! fn main() {
 //!     let _prof = ix_prof::start_from_env().expect("ix-prof"); // IX_PROF=<dir> turns it on
-//!     tracing_subscriber::registry().with(ix_prof::layer()).init(); // optional: spans
+//!     _ = blaze_trace::install(ix_prof::layer()); // optional: spans
 //!     // ...
 //! }
 //! ```
@@ -487,7 +487,7 @@ fn halt(session: &Session) {
     let ticking = session.ticker.lock().take();
     if let Some(ticking) = ticking {
         ticking.thread().unpark();
-        let _wait = tracing::info_span!(target: "blaze::ix_prof", "join", wait = "thread", on = "ix-prof-ticker").entered();
+        let _wait = blaze_trace::info_span!(target: "blaze::ix_prof", "join", wait = "thread", on = "ix-prof-ticker").entered();
         let _ = ticking.join();
     }
     #[cfg(all(feature = "http", unix))]

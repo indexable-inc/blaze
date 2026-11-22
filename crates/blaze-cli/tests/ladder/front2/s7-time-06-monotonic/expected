@@ -1,0 +1,13 @@
+status 0
+stdout
+went backwards: 0
+slept at least 20ms: true
+true
+None
+1.5s 250µs 7ns
+90.25s
+2 500
+None
+1.235ms
+Ok(10s)
+true

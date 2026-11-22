@@ -371,8 +371,8 @@ fn a_task_gets_the_scratch_its_spawn_names() {
     let io = world(14, Plant::None);
     let cx = root(&io);
     let scope = cx.scope();
-    let small = scope.spawn("small", 64 << 10, |cx| -> Result<(), Stopped> { cx.bytes().try_extend(&vec![0; 8 << 20]) });
-    let roomy = scope.spawn("roomy", TASK_FRAME, |cx| -> Result<(), Stopped> { cx.bytes().try_extend(&vec![0; 1 << 20]) });
+    let small = scope.may_overlap("small", 64 << 10, |cx| -> Result<(), Stopped> { cx.bytes().try_extend(&vec![0; 8 << 20]) });
+    let roomy = scope.may_overlap("roomy", TASK_FRAME, |cx| -> Result<(), Stopped> { cx.bytes().try_extend(&vec![0; 1 << 20]) });
     let (small, roomy) = (small.join(&cx), roomy.join(&cx));
     let joined = scope.join(&cx);
     assert!(roomy.is_ok(), "{roomy:?}");

@@ -5,8 +5,8 @@ use std::{
 };
 
 use blaze_format::{
-    Aligned, FormatError, Part, Persist, Record, Rel, SchemaHash, Slice, Writer, buffer_id,
-    open_as, schema_of, to_bytes,
+    Aligned, FormatError, Own, Part, Persist, Record, Rel, SchemaHash, Slice, Writer, WriterIn,
+    buffer_id, open_as, schema_of, to_bytes,
 };
 use blaze_ids::{ContentId, Domain, Hasher, Idx, Interner, rng::SplitMix64 as Rng};
 
@@ -77,7 +77,7 @@ mod records {
     }
 }
 
-fn write_leaf(leaf: &Leaf, out: &mut Writer) -> u64 {
+fn write_leaf<P: WriterIn>(leaf: &Leaf, out: &mut Writer<P>) -> u64 {
     let name = out.push_str(&leaf.name);
     let at = out.next::<LeafRoot>();
     let name = match leaf.name.is_empty() {
@@ -101,7 +101,7 @@ impl Persist for Leaf {
     ]);
     type Ref<'a> = (u64, &'a str);
 
-    fn write(&self, out: &mut Writer) -> u64 {
+    fn write<P: WriterIn>(&self, out: &mut Writer<P>) -> u64 {
         write_leaf(self, out)
     }
 
@@ -126,7 +126,7 @@ impl Persist for Pair {
     ]);
     type Ref<'a> = ((u64, &'a str), (u64, &'a str));
 
-    fn write(&self, out: &mut Writer) -> u64 {
+    fn write<P: WriterIn>(&self, out: &mut Writer<P>) -> u64 {
         let left = write_leaf(self.left.get(), out);
         let right = write_leaf(self.right.get(), out);
         let at = out.next::<PairRoot>();
@@ -221,6 +221,30 @@ fn hits_reads_and_compares_allocate_nothing() {
         let mut hasher = DefaultHasher::new();
         a.hash(&mut hasher);
         hasher.finish()
+    });
+}
+
+/// `intern_many` gives each value the handle `intern` gives it, whether it was interned
+/// before, is new, or comes twice in one batch.
+#[test]
+fn intern_many_is_intern_of_each() {
+    blaze_sim::check(blaze_sim::Config::cases(if cfg!(miri) { 16 } else { 64 }), |tape| {
+        let cons = HashCons::<Leaf>::new();
+        let range = 1 + tape.below(200, "range");
+        for _ in 0..tape.below(300, "before") {
+            cons.intern(leaf(tape.below(range, "held"), "v"));
+        }
+        for _ in 0..3 {
+            let mut asked: [u64; 8] = std::array::from_fn(|_| tape.below(2 * range, "asked"));
+            asked[7] = asked[tape.index(7, "duplicated")];
+            let many = cons.intern_many(asked.map(|n| leaf(n, "v")));
+            for (at, &n) in asked.iter().enumerate() {
+                let one = cons.intern(leaf(n, "v"));
+                assert_eq!(many[at], one, "{n} at {at} of {asked:?}");
+                assert_eq!(many[at].idx(), one.idx());
+                assert_eq!(*many[at].get(), leaf(n, "v"));
+            }
+        }
     });
 }
 
@@ -413,8 +437,9 @@ fn a_handle_hashes_as_its_fingerprint() {
 fn a_handle_persists_as_its_value() {
     let leaves = leaked::<Leaf>();
     let handle = leaves.intern(leaf(5, "five"));
-    let bytes = to_bytes(&handle);
-    assert_eq!(bytes, to_bytes(handle.get()));
+    let heap = Own(blaze_own::testing::heap().alloc());
+    let bytes = to_bytes(&handle, heap);
+    assert_eq!(bytes, to_bytes(handle.get(), heap));
     let buffer = Aligned::copy_from(&bytes);
     assert_eq!(<Interned<'static, Leaf> as Persist>::read(&buffer).unwrap(), (5, "five"));
     let fresh = HashCons::<Leaf>::new();

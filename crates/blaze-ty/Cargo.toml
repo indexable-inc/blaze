@@ -1,0 +1,33 @@
+[package]
+name = "blaze-ty"
+description = "blaze's type representation and inference tables, written new: one arena per type-checking task in columns (a type is a 4-byte id, hash-consed through a SIMD tag probe of 24-slot cache-line groups), flags computed at intern time, union-find variable tables under one undo log, an iterative relate with variance, the occurs check and generalization, folding and substitution with a per-pass memo, canonicalization for the trait solver, the portable form for records and printing; `no_std`, no recursion, no `unsafe`"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# Bottom crates only. blaze-id by path, as blaze-typeck takes blaze-hash: the workspace entries of
+# the crates below turn on adapter features this crate does not want in its graph.
+[dependencies]
+# `ItemKey`: what an item is in a portable type and in a canonical key.
+blaze-id.workspace = true
+# Integer conversions that say what they do, in place of `as`.
+blaze-int.workspace = true
+# `Vec` and `Alloc<'a>`: every column, in the allocator the task names.
+blaze-own.workspace = true
+
+[dev-dependencies]
+# `Alloc::global()`, for tests and the cost example.
+blaze-own = { workspace = true, features = ["std", "testing"] }
+# `check` and `control`: the properties in `src/tests.rs`.
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

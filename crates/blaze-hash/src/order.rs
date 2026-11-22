@@ -11,8 +11,9 @@
 //!
 //! How it differs from the `indexmap` crate it replaces in blaze's own code:
 //!
-//! - The allocator is in the type and has no default, as for every table here
-//!   ([`OrderMap::new_in`], [`OrderMap::with_capacity_in`]); there is no `new()`.
+//! - The allocator is in the type and has no default, as for every table here, and the hasher
+//!   is named as a value (D125); both are fields of the one constructor's options (D126):
+//!   `OrderMap::new(OrderMapOpts { hasher: FixedState, alloc: frame, capacity: None })`.
 //! - The table holds `u32` indices, not `usize`: half the table's memory, and a lookup's probe
 //!   reads half as many cache lines of it. A map holds at most `u32::MAX` entries, and one
 //!   more is a panic that says so.
@@ -28,14 +29,11 @@
 //! insert appends; iteration is a walk of a vector. [`OrderMap::with_capacity_in`] makes two
 //! allocations (the entries, the table) and none after while the map stays within it.
 
-use std::{
-    alloc::Allocator,
-    fmt,
-    hash::{BuildHasher, Hash},
-    ops::Index,
-};
+use core::{alloc::Allocator, fmt, ops::Index};
 
-use hashbrown::{Equivalent, HashTable};
+use blaze_own::Vec;
+
+use crate::{Equivalent, KeyHash, raw::RawTable};
 
 /// One entry: the key's hash, kept so that the table is rebuilt and searched without the key.
 struct Slot<K, V> {
@@ -55,7 +53,7 @@ impl<K: Clone, V: Clone> Clone for Slot<K, V> {
 pub struct OrderMap<K, V, S, A: Allocator + Clone> {
     entries: Vec<Slot<K, V>, A>,
     /// The index in `entries` of each entry, found by the entry's hash.
-    table: HashTable<u32, A>,
+    table: RawTable<u32, A>,
     hasher: S,
 }
 
@@ -68,50 +66,92 @@ fn held(at: usize) -> u32 {
     }
 }
 
-impl<K, V, S: Default, A: Allocator + Clone> OrderMap<K, V, S, A> {
-    /// An empty map in `alloc`: no allocation until the first insert.
-    #[inline]
-    pub fn new_in(alloc: A) -> Self {
-        Self::with_hasher_in(S::default(), alloc)
-    }
+/// What an [`OrderMap`] is made from ([`OrderMap::new`], rule 83 options-struct): every field is
+/// written at every use, the hasher too (D125):
+/// `OrderMap::new(OrderMapOpts { hasher: FixedState, alloc: frame, capacity: None })`.
+///
+/// A call's named arguments: write it as a literal in the call that takes it (rule 83).
+#[blaze::args]
+#[derive(Clone, Copy, Debug)]
+pub struct OrderMapOpts<S, A> {
+    /// The hasher, as a value (`FixedState` for ordinary keys, a [`SipKey`](crate::SipKey) for
+    /// keys an outsider picks). It decides no iteration order: that is the inserts'.
+    pub hasher: S,
+    /// The allocator the entries and the index table are in.
+    pub alloc: A,
+    /// Entries room is made for at once: `None` allocates nothing until the first insert,
+    /// `Some(n)` makes two allocations with room for `n` and none after until it holds more.
+    pub capacity: Option<usize>,
+}
 
-    /// An empty map in `alloc` with room for `capacity` entries: two allocations, and none
-    /// after until it holds more.
+impl<K, V, S, A: Allocator + Clone> OrderMap<K, V, S, A> {
+    /// The map `opts` describe: empty, on `opts.hasher` in `opts.alloc`, with room for
+    /// `opts.capacity` entries. A map of an iterator's pairs is `new` then [`Extend::extend`]
+    /// (a key given twice keeps its first place and its last value).
     #[inline]
-    pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
-        Self::with_capacity_and_hasher_in(capacity, S::default(), alloc)
+    pub fn new(opts: OrderMapOpts<S, A>) -> Self {
+        let capacity = opts.capacity.unwrap_or(0);
+        OrderMap {
+            // clone: the allocator's handle, once per map: the entries and the table each hold one.
+            entries: Vec::with_capacity_in(capacity, opts.alloc.clone()),
+            table: RawTable::with_capacity_in(capacity, opts.alloc),
+            hasher: opts.hasher,
+        }
     }
 }
 
-impl<K: Eq + Hash, V, S: BuildHasher + Default, A: Allocator + Clone> OrderMap<K, V, S, A> {
-    /// The map of `iter`'s pairs in `alloc`, in `iter`'s order; a key given twice keeps its
-    /// first place and its last value.
+impl<K, V, S: Default, A: Allocator + Clone> OrderMap<K, V, S, A> {
+    /// An empty map in `alloc` on `S::default()`.
+    ///
+    /// D126: goes at the sweep; write
+    /// `OrderMap::new(OrderMapOpts { hasher, alloc, capacity: None })`.
+    #[inline]
+    pub fn new_in(alloc: A) -> Self {
+        OrderMap::new(OrderMapOpts { hasher: S::default(), alloc, capacity: None })
+    }
+
+    /// An empty map in `alloc` on `S::default()` with room for `capacity` entries.
+    ///
+    /// D126: goes at the sweep; write
+    /// `OrderMap::new(OrderMapOpts { hasher, alloc, capacity: Some(n) })`.
+    #[inline]
+    pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
+        OrderMap::new(OrderMapOpts { hasher: S::default(), alloc, capacity: Some(capacity) })
+    }
+}
+
+impl<K: Eq, V, S: KeyHash<K> + Default, A: Allocator + Clone> OrderMap<K, V, S, A> {
+    /// The map of `iter`'s pairs in `alloc` on `S::default()`, in `iter`'s order; a key given
+    /// twice keeps its first place and its last value.
+    ///
+    /// D126: goes at the sweep; write `OrderMap::new(OrderMapOpts { hasher, alloc, capacity })`,
+    /// then `extend`.
     pub fn from_iter_in<I: IntoIterator<Item = (K, V)>>(iter: I, alloc: A) -> Self {
         let iter = iter.into_iter();
-        let mut map = Self::with_capacity_in(iter.size_hint().0, alloc);
+        let capacity = Some(iter.size_hint().0);
+        let mut map = OrderMap::new(OrderMapOpts { hasher: S::default(), alloc, capacity });
         map.extend(iter);
         map
     }
 }
 
 impl<K, V, S, A: Allocator + Clone> OrderMap<K, V, S, A> {
-    /// An empty map in `alloc` whose keys are hashed by `hasher`: how a map of keys an attacker
-    /// may pick is made, with a [`SipKey`](crate::SipKey).
+    /// An empty map on `hasher` in `alloc`.
+    ///
+    /// D126: goes at the sweep; write
+    /// `OrderMap::new(OrderMapOpts { hasher, alloc, capacity: None })`.
     #[inline]
     pub fn with_hasher_in(hasher: S, alloc: A) -> Self {
-        // clone: the allocator's handle, once per map: the entries and the table each hold one.
-        OrderMap { entries: Vec::new_in(alloc.clone()), table: HashTable::new_in(alloc), hasher }
+        OrderMap::new(OrderMapOpts { hasher, alloc, capacity: None })
     }
 
-    /// [`OrderMap::with_capacity_in`] with `hasher`.
+    /// An empty map on `hasher` in `alloc` with room for `capacity` entries.
+    ///
+    /// D126: goes at the sweep; write
+    /// `OrderMap::new(OrderMapOpts { hasher, alloc, capacity: Some(n) })`.
     #[inline]
     pub fn with_capacity_and_hasher_in(capacity: usize, hasher: S, alloc: A) -> Self {
-        OrderMap {
-            // clone: the allocator's handle, once per map.
-            entries: Vec::with_capacity_in(capacity, alloc.clone()),
-            table: HashTable::with_capacity_in(capacity, alloc),
-            hasher,
-        }
+        OrderMap::new(OrderMapOpts { hasher, alloc, capacity: Some(capacity) })
     }
 
     #[inline]
@@ -216,8 +256,8 @@ impl<K, V, S, A: Allocator + Clone> OrderMap<K, V, S, A> {
         // The entry that was last is at `index` now, unless the removed one was the last.
         if let Some(moved) = self.entries.get(index) {
             let was = held(self.entries.len());
-            match self.table.find_mut(moved.hash, |&at| at == was) {
-                Some(at) => *at = held(index),
+            match self.table.find(moved.hash, |&at| at == was) {
+                Some(slot) => *self.table.get_mut(slot) = held(index),
                 None => unreachable!("every entry's index is in the table"),
             }
         }
@@ -252,11 +292,11 @@ impl<K, V, S, A: Allocator + Clone> OrderMap<K, V, S, A> {
 
     /// Takes the index `at` of an entry with `hash` out of the table.
     fn unlink(&mut self, hash: u64, at: u32) {
-        match self.table.find_entry(hash, |&it| it == at) {
-            Ok(entry) => {
-                entry.remove();
+        match self.table.find(hash, |&it| it == at) {
+            Some(slot) => {
+                self.table.remove(slot);
             }
-            Err(_) => unreachable!("every entry's index is in the table"),
+            None => unreachable!("every entry's index is in the table"),
         }
     }
 
@@ -270,14 +310,20 @@ impl<K, V, S, A: Allocator + Clone> OrderMap<K, V, S, A> {
     }
 }
 
-impl<K: Eq + Hash, V, S: BuildHasher, A: Allocator + Clone> OrderMap<K, V, S, A> {
-    /// Where `key` is, and its hash.
+impl<K: Eq, V, S: KeyHash<K>, A: Allocator + Clone> OrderMap<K, V, S, A> {
+    /// Where `key` is, and its hash: by the one seam every table hashes at ([`KeyHash`]), so a
+    /// `PlainKey` on `FixedState` is hashed by its bytes and a `DigestKey` on `DigestState` is
+    /// its word, as in [`HashMap`](crate::HashMap).
     #[inline]
-    fn find<Q: Hash + Equivalent<K> + ?Sized>(&self, key: &Q) -> (u64, Option<usize>) {
-        let hash = self.hasher.hash_one(key);
+    fn find<Q: Equivalent<K> + ?Sized>(&self, key: &Q) -> (u64, Option<usize>)
+    where
+        S: KeyHash<Q>,
+    {
+        // Named, as `S` is `KeyHash` of both `K` and `Q` here.
+        let hash = <S as KeyHash<Q>>::hash_key(&self.hasher, key);
         let entries = &self.entries;
-        let at = self.table.find(hash, |&at| key.equivalent(&entries[at as usize].key));
-        (hash, at.map(|&at| at as usize))
+        let slot = self.table.find(hash, |&at| key.equivalent(&entries[at as usize].key));
+        (hash, slot.map(|slot| *self.table.get(slot) as usize))
     }
 
     /// `value` under `key`, at the end when the key is new; a key already held keeps its
@@ -291,7 +337,7 @@ impl<K: Eq + Hash, V, S: BuildHasher, A: Allocator + Clone> OrderMap<K, V, S, A>
     pub fn insert_full(&mut self, key: K, value: V) -> (usize, Option<V>) {
         let (hash, at) = self.find(&key);
         match at {
-            Some(at) => (at, Some(std::mem::replace(&mut self.entries[at].value, value))),
+            Some(at) => (at, Some(core::mem::replace(&mut self.entries[at].value, value))),
             None => (self.push(hash, key, value), None),
         }
     }
@@ -317,18 +363,27 @@ impl<K: Eq + Hash, V, S: BuildHasher, A: Allocator + Clone> OrderMap<K, V, S, A>
     }
 
     #[inline]
-    pub fn get<Q: Hash + Equivalent<K> + ?Sized>(&self, key: &Q) -> Option<&V> {
+    pub fn get<Q: Equivalent<K> + ?Sized>(&self, key: &Q) -> Option<&V>
+    where
+        S: KeyHash<Q>,
+    {
         self.find(key).1.map(|at| &self.entries[at].value)
     }
 
     #[inline]
-    pub fn get_mut<Q: Hash + Equivalent<K> + ?Sized>(&mut self, key: &Q) -> Option<&mut V> {
+    pub fn get_mut<Q: Equivalent<K> + ?Sized>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        S: KeyHash<Q>,
+    {
         self.find(key).1.map(|at| &mut self.entries[at].value)
     }
 
     /// The entry of `key` with its index.
     #[inline]
-    pub fn get_full<Q: Hash + Equivalent<K> + ?Sized>(&self, key: &Q) -> Option<(usize, &K, &V)> {
+    pub fn get_full<Q: Equivalent<K> + ?Sized>(&self, key: &Q) -> Option<(usize, &K, &V)>
+    where
+        S: KeyHash<Q>,
+    {
         let at = self.find(key).1?;
         let entry = &self.entries[at];
         Some((at, &entry.key, &entry.value))
@@ -336,24 +391,36 @@ impl<K: Eq + Hash, V, S: BuildHasher, A: Allocator + Clone> OrderMap<K, V, S, A>
 
     /// The index of `key` in insertion order.
     #[inline]
-    pub fn get_index_of<Q: Hash + Equivalent<K> + ?Sized>(&self, key: &Q) -> Option<usize> {
+    pub fn get_index_of<Q: Equivalent<K> + ?Sized>(&self, key: &Q) -> Option<usize>
+    where
+        S: KeyHash<Q>,
+    {
         self.find(key).1
     }
 
     #[inline]
-    pub fn contains_key<Q: Hash + Equivalent<K> + ?Sized>(&self, key: &Q) -> bool {
+    pub fn contains_key<Q: Equivalent<K> + ?Sized>(&self, key: &Q) -> bool
+    where
+        S: KeyHash<Q>,
+    {
         self.find(key).1.is_some()
     }
 
     /// Removes `key` as [`OrderMap::swap_remove_index`] does: O(1), the last entry takes its
     /// place.
-    pub fn swap_remove<Q: Hash + Equivalent<K> + ?Sized>(&mut self, key: &Q) -> Option<V> {
+    pub fn swap_remove<Q: Equivalent<K> + ?Sized>(&mut self, key: &Q) -> Option<V>
+    where
+        S: KeyHash<Q>,
+    {
         let at = self.find(key).1?;
         self.swap_remove_index(at).map(|(_, value)| value)
     }
 
     /// Removes `key` as [`OrderMap::shift_remove_index`] does: O(n), the order is kept.
-    pub fn shift_remove<Q: Hash + Equivalent<K> + ?Sized>(&mut self, key: &Q) -> Option<V> {
+    pub fn shift_remove<Q: Equivalent<K> + ?Sized>(&mut self, key: &Q) -> Option<V>
+    where
+        S: KeyHash<Q>,
+    {
         let at = self.find(key).1?;
         self.shift_remove_index(at).map(|(_, value)| value)
     }
@@ -363,13 +430,15 @@ impl<K: Eq + Hash, V, S: BuildHasher, A: Allocator + Clone> OrderMap<K, V, S, A>
     where
         K: Ord,
     {
-        self.entries.sort_by(|a, b| a.key.cmp(&b.key));
+        // Unstable is exact here: the keys are distinct, so there are no ties to keep in order
+        // (and core has no stable sort, which needs a buffer).
+        self.entries.sort_unstable_by(|a, b| a.key.cmp(&b.key));
         self.relink();
     }
 }
 
 /// The entries of an [`OrderMap`] in insertion order.
-pub struct Iter<'a, K, V>(std::slice::Iter<'a, Slot<K, V>>);
+pub struct Iter<'a, K, V>(core::slice::Iter<'a, Slot<K, V>>);
 
 impl<K, V> Clone for Iter<'_, K, V> {
     fn clone(&self) -> Self {
@@ -401,7 +470,7 @@ impl<K, V> DoubleEndedIterator for Iter<'_, K, V> {
 impl<K, V> ExactSizeIterator for Iter<'_, K, V> {}
 
 /// The entries of an [`OrderMap`] in insertion order, their values to change.
-pub struct IterMut<'a, K, V>(std::slice::IterMut<'a, Slot<K, V>>);
+pub struct IterMut<'a, K, V>(core::slice::IterMut<'a, Slot<K, V>>);
 
 impl<'a, K, V> Iterator for IterMut<'a, K, V> {
     type Item = (&'a K, &'a mut V);
@@ -427,7 +496,7 @@ impl<K, V> DoubleEndedIterator for IterMut<'_, K, V> {
 impl<K, V> ExactSizeIterator for IterMut<'_, K, V> {}
 
 /// The entries of an [`OrderMap`] taken by value, in insertion order.
-pub struct IntoIter<K, V, A: Allocator>(std::vec::IntoIter<Slot<K, V>, A>);
+pub struct IntoIter<K, V, A: Allocator>(blaze_own::vec::IntoIter<Slot<K, V>, A>);
 
 impl<K, V, A: Allocator> Iterator for IntoIter<K, V, A> {
     type Item = (K, V);
@@ -482,7 +551,7 @@ impl<'a, K, V, S, A: Allocator + Clone> IntoIterator for &'a mut OrderMap<K, V, 
     }
 }
 
-impl<K: Eq + Hash, V, S: BuildHasher, A: Allocator + Clone> Extend<(K, V)>
+impl<K: Eq, V, S: KeyHash<K>, A: Allocator + Clone> Extend<(K, V)>
     for OrderMap<K, V, S, A>
 {
     fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
@@ -542,36 +611,78 @@ impl<K, V, S, A: Allocator + Clone> Index<usize> for OrderMap<K, V, S, A> {
 /// allocator `A`: an [`OrderMap`] of its values to nothing.
 pub struct OrderSet<T, S, A: Allocator + Clone>(OrderMap<T, (), S, A>);
 
-impl<T, S: Default, A: Allocator + Clone> OrderSet<T, S, A> {
-    /// An empty set in `alloc`: no allocation until the first insert.
-    #[inline]
-    pub fn new_in(alloc: A) -> Self {
-        OrderSet(OrderMap::new_in(alloc))
-    }
+/// What an [`OrderSet`] is made from ([`OrderSet::new`]), as [`OrderMapOpts`] for a map:
+/// `OrderSet::new(OrderSetOpts { hasher: FixedState, alloc: frame, capacity: None })`.
+///
+/// A call's named arguments: write it as a literal in the call that takes it (rule 83).
+#[blaze::args]
+#[derive(Clone, Copy, Debug)]
+pub struct OrderSetOpts<S, A> {
+    /// The hasher, as a value (D125); it decides no iteration order.
+    pub hasher: S,
+    /// The allocator the values and the index table are in.
+    pub alloc: A,
+    /// Values room is made for at once: `None` allocates nothing until the first insert,
+    /// `Some(n)` reserves room for `n`.
+    pub capacity: Option<usize>,
+}
 
-    /// An empty set in `alloc` with room for `capacity` values: two allocations, and none
-    /// after until it holds more.
+impl<T, S, A: Allocator + Clone> OrderSet<T, S, A> {
+    /// The set `opts` describe: empty, on `opts.hasher` in `opts.alloc`, with room for
+    /// `opts.capacity` values. A set of an iterator's values is `new` then [`Extend::extend`]
+    /// (each value at the place it first came).
     #[inline]
-    pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
-        OrderSet(OrderMap::with_capacity_in(capacity, alloc))
+    pub fn new(opts: OrderSetOpts<S, A>) -> Self {
+        OrderSet(OrderMap::new(OrderMapOpts {
+            hasher: opts.hasher,
+            alloc: opts.alloc,
+            capacity: opts.capacity,
+        }))
     }
 }
 
-impl<T: Eq + Hash, S: BuildHasher + Default, A: Allocator + Clone> OrderSet<T, S, A> {
-    /// The set of `iter`'s values in `alloc`, each at the place it first came.
+impl<T, S: Default, A: Allocator + Clone> OrderSet<T, S, A> {
+    /// An empty set in `alloc` on `S::default()`.
+    ///
+    /// D126: goes at the sweep; write
+    /// `OrderSet::new(OrderSetOpts { hasher, alloc, capacity: None })`.
+    #[inline]
+    pub fn new_in(alloc: A) -> Self {
+        OrderSet::new(OrderSetOpts { hasher: S::default(), alloc, capacity: None })
+    }
+
+    /// An empty set in `alloc` on `S::default()` with room for `capacity` values.
+    ///
+    /// D126: goes at the sweep; write
+    /// `OrderSet::new(OrderSetOpts { hasher, alloc, capacity: Some(n) })`.
+    #[inline]
+    pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
+        OrderSet::new(OrderSetOpts { hasher: S::default(), alloc, capacity: Some(capacity) })
+    }
+}
+
+impl<T: Eq, S: KeyHash<T> + Default, A: Allocator + Clone> OrderSet<T, S, A> {
+    /// The set of `iter`'s values in `alloc` on `S::default()`, each at the place it first came.
+    ///
+    /// D126: goes at the sweep; write `OrderSet::new(OrderSetOpts { hasher, alloc, capacity })`,
+    /// then `extend`.
     pub fn from_iter_in<I: IntoIterator<Item = T>>(iter: I, alloc: A) -> Self {
         let iter = iter.into_iter();
-        let mut set = Self::with_capacity_in(iter.size_hint().0, alloc);
+        let capacity = Some(iter.size_hint().0);
+        let mut set = OrderSet::new(OrderSetOpts { hasher: S::default(), alloc, capacity });
         set.extend(iter);
         set
     }
 }
 
 impl<T, S, A: Allocator + Clone> OrderSet<T, S, A> {
-    /// An empty set in `alloc` whose values are hashed by `hasher`.
+    /// An empty set on `hasher` in `alloc`.
+    ///
+    /// D126: goes at the sweep; write
+    /// `OrderSet::new(OrderSetOpts { hasher, alloc, capacity: None })`.
     #[inline]
     pub fn with_hasher_in(hasher: S, alloc: A) -> Self {
-        OrderSet(OrderMap::with_hasher_in(hasher, alloc))
+        OrderSet::new(OrderSetOpts { hasher, alloc, capacity: None })
     }
 
     #[inline]
@@ -638,9 +749,31 @@ impl<T, S, A: Allocator + Clone> OrderSet<T, S, A> {
     pub fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
         self.0.retain(|it, ()| keep(it));
     }
+
+    /// Takes every value out in insertion order and keeps the memory, as [`OrderSet::clear`]
+    /// does. The index table is emptied first, so a drain dropped part way leaves an empty set.
+    pub fn drain(&mut self) -> impl Iterator<Item = T> + '_ {
+        self.0.table.clear();
+        self.0.entries.drain(..).map(|slot| slot.key)
+    }
 }
 
-impl<T: Eq + Hash, S: BuildHasher, A: Allocator + Clone> OrderSet<T, S, A> {
+/// The key of a set's entry, as the borrowing iterator gives it.
+fn set_value<'a, T>((it, ()): (&'a T, &'a ())) -> &'a T {
+    it
+}
+
+impl<'a, T, S, A: Allocator + Clone> IntoIterator for &'a OrderSet<T, S, A> {
+    type Item = &'a T;
+    type IntoIter = core::iter::Map<Iter<'a, T, ()>, fn((&'a T, &'a ())) -> &'a T>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter().map(set_value as fn((&'a T, &'a ())) -> &'a T)
+    }
+}
+
+impl<T: Eq, S: KeyHash<T>, A: Allocator + Clone> OrderSet<T, S, A> {
     /// Adds `value` at the end if it is not held: whether it was added.
     #[inline]
     pub fn insert(&mut self, value: T) -> bool {
@@ -654,29 +787,44 @@ impl<T: Eq + Hash, S: BuildHasher, A: Allocator + Clone> OrderSet<T, S, A> {
     }
 
     #[inline]
-    pub fn contains<Q: Hash + Equivalent<T> + ?Sized>(&self, value: &Q) -> bool {
+    pub fn contains<Q: Equivalent<T> + ?Sized>(&self, value: &Q) -> bool
+    where
+        S: KeyHash<Q>,
+    {
         self.0.contains_key(value)
     }
 
     /// The value held that equals `value`.
     #[inline]
-    pub fn get<Q: Hash + Equivalent<T> + ?Sized>(&self, value: &Q) -> Option<&T> {
+    pub fn get<Q: Equivalent<T> + ?Sized>(&self, value: &Q) -> Option<&T>
+    where
+        S: KeyHash<Q>,
+    {
         self.0.get_full(value).map(|(_, it, ())| it)
     }
 
     /// The index of `value` in insertion order.
     #[inline]
-    pub fn get_index_of<Q: Hash + Equivalent<T> + ?Sized>(&self, value: &Q) -> Option<usize> {
+    pub fn get_index_of<Q: Equivalent<T> + ?Sized>(&self, value: &Q) -> Option<usize>
+    where
+        S: KeyHash<Q>,
+    {
         self.0.get_index_of(value)
     }
 
     /// Removes `value` as [`OrderMap::swap_remove`] does: whether it was held.
-    pub fn swap_remove<Q: Hash + Equivalent<T> + ?Sized>(&mut self, value: &Q) -> bool {
+    pub fn swap_remove<Q: Equivalent<T> + ?Sized>(&mut self, value: &Q) -> bool
+    where
+        S: KeyHash<Q>,
+    {
         self.0.swap_remove(value).is_some()
     }
 
     /// Removes `value` as [`OrderMap::shift_remove`] does: whether it was held.
-    pub fn shift_remove<Q: Hash + Equivalent<T> + ?Sized>(&mut self, value: &Q) -> bool {
+    pub fn shift_remove<Q: Equivalent<T> + ?Sized>(&mut self, value: &Q) -> bool
+    where
+        S: KeyHash<Q>,
+    {
         self.0.shift_remove(value).is_some()
     }
 
@@ -718,7 +866,7 @@ impl<T, S, A: Allocator + Clone> IntoIterator for OrderSet<T, S, A> {
     }
 }
 
-impl<T: Eq + Hash, S: BuildHasher, A: Allocator + Clone> Extend<T> for OrderSet<T, S, A> {
+impl<T: Eq, S: KeyHash<T>, A: Allocator + Clone> Extend<T> for OrderSet<T, S, A> {
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         let iter = iter.into_iter();
         self.reserve(iter.size_hint().0);

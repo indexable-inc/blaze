@@ -21,11 +21,13 @@
 //!   `{"namespace": "public", "serial": N, "issued": unix_s, "keys": [{"key": "<64 hex>",
 //!   "roles": ["build", "root"], "from": unix_s, "until": unix_s}], "out": "<path>"}`.
 
-use std::path::Path;
+use std::alloc::Allocator;
+use std::{alloc::Global, path::Path};
 
 use blaze_cas::plain::{Driven, Namespace, Settings as StoreSettings};
-use serde::Deserialize;
+use blaze_data::{Cursor, FromValue, ShapeError};
 
+use crate::settings::{opt_text, read_json, texts};
 use crate::{
     bucket::{Bucket, Failure, drive},
     bundle::BundleId,
@@ -46,23 +48,24 @@ pub const USAGE: &str = "blaze cache status | blaze cache pull <toolchain> <targ
 /// Makes the bucket a command talks to: the HTTP driver, or a test's fake.
 pub type Connect<'c> = &'c mut dyn FnMut(&Settings) -> Result<Box<dyn Bucket>, Failure>;
 
-/// `blaze cache <words>` over HTTPS.
-pub fn main(root: &Path, env: Env<'_>, words: &[&str], now_s: u64) -> Result<String, String> {
-    run(root, env, words, now_s, &mut |settings| Ok(Box::new(crate::http::HttpBucket::new(settings)?) as Box<dyn Bucket>))
+/// `blaze cache <words>` over HTTPS, the store opened in `alloc` (the command's).
+#[cfg(feature = "bucket")]
+pub fn main<A: Allocator + Clone>(root: &Path, env: Env<'_>, words: &[&str], now_s: u64, alloc: A) -> Result<String, String> {
+    run(root, env, words, now_s, &mut |settings| Ok(Box::new(crate::http::HttpBucket::new(settings)?) as Box<dyn Bucket>), alloc)
 }
 
 /// `blaze cache <words>`, the bucket made by `connect` (called only when the cache contacts
-/// a bucket and the command needs one).
-pub fn run(root: &Path, env: Env<'_>, words: &[&str], now_s: u64, connect: Connect<'_>) -> Result<String, String> {
+/// a bucket and the command needs one), the store opened in `alloc`.
+pub fn run<A: Allocator + Clone>(root: &Path, env: Env<'_>, words: &[&str], now_s: u64, connect: Connect<'_>, alloc: A) -> Result<String, String> {
     match words {
         ["status"] => {
             let settings = Settings::read(root, env)?;
             let store = StoreSettings::read(root)?;
-            Ok(format!("{}{}", store_status(&store), status(&settings)))
+            Ok(format!("{}{}", store_status(&store, alloc), status(&settings)))
         }
-        ["pull", toolchain, target, cfg] => pull(root, env, toolchain, target, cfg, "public", connect),
-        ["pull", toolchain, target, cfg, namespace] => pull(root, env, toolchain, target, cfg, namespace, connect),
-        ["push", json] => push(root, env, json, now_s, connect),
+        ["pull", toolchain, target, cfg] => pull(root, env, toolchain, target, cfg, "public", connect, alloc),
+        ["pull", toolchain, target, cfg, namespace] => pull(root, env, toolchain, target, cfg, namespace, connect, alloc),
+        ["push", json] => push(root, env, json, now_s, connect, alloc),
         ["keys", "public"] => keys_public(root, env),
         ["keys", "sign", json] => keys_sign(env, json),
         _ => Err(USAGE.to_owned()),
@@ -80,9 +83,10 @@ fn space_said(namespace: Namespace) -> String {
 /// What `status` says of the store's namespaces, from its settings alone (`<root>/store.json`):
 /// which it reads and which it writes, and, when no organisation is set and `trusted_writer` is
 /// off, that nothing it writes leaves this machine. Contacts nothing.
-pub fn store_status(store: &StoreSettings) -> String {
-    let list = |it: Vec<Namespace>| it.into_iter().map(space_said).collect::<Vec<_>>().join(", ");
-    let mut out = format!("the store reads namespaces {}; it writes {}\n", list(store.reads()), list(store.writes()));
+pub fn store_status<A: Allocator + Clone>(store: &StoreSettings, alloc: A) -> String {
+    // The two namespace lists are made in the caller's allocator (blaze-cas plain/settings.rs).
+    let list = |it: Vec<Namespace, A>| it.into_iter().map(space_said).collect::<Vec<_>>().join(", ");
+    let mut out = format!("the store reads namespaces {}; it writes {}\n", list(store.reads(alloc.clone())), list(store.writes(alloc)));
     if let Some(org) = &store.org {
         out.push_str(&format!("organisation {org:?}: namespace {}\n", space_said(Namespace::named(org))));
     }
@@ -144,7 +148,7 @@ fn contacts_nothing(settings: &Settings) -> String {
     format!("{}nothing was contacted", status(settings))
 }
 
-fn pull(root: &Path, env: Env<'_>, toolchain: &str, target: &str, cfg: &str, namespace: &str, connect: Connect<'_>) -> Result<String, String> {
+fn pull<A: Allocator + Clone>(root: &Path, env: Env<'_>, toolchain: &str, target: &str, cfg: &str, namespace: &str, connect: Connect<'_>, alloc: A) -> Result<String, String> {
     let settings = Settings::read(root, env)?;
     if settings.contacts().is_none() {
         return Err(contacts_nothing(&settings));
@@ -153,13 +157,13 @@ fn pull(root: &Path, env: Env<'_>, toolchain: &str, target: &str, cfg: &str, nam
     let ns = name::namespace_named(namespace).map_err(|it| it.to_string())?;
     let trusted = trusted(&settings, id.toolchain.clone(), ns)?;
     let store_settings = StoreSettings::read(root)?;
-    if !store_settings.reads().contains(&ns) {
+    if !store_settings.reads(alloc.clone()).contains(&ns) {
         return Err(format!(
             "namespace {namespace} is not one this store reads ({}); nothing was contacted. An organisation's namespace is read once `org` names it in the store's settings",
-            store_settings.reads().into_iter().map(space_said).collect::<Vec<_>>().join(", ")
+            store_settings.reads(alloc.clone()).into_iter().map(space_said).collect::<Vec<_>>().join(", ")
         ));
     }
-    let mut driven = Driven::open(root, &store_settings).map_err(|it| it.to_string())?;
+    let mut driven = Driven::open(root, &store_settings, alloc).map_err(|it| it.to_string())?;
     let mut bucket = connect(&settings).map_err(|it| it.to_string())?;
     let mut remote = Remote::new(&mut *bucket, &settings.root, trusted);
     let (bundle, segments) = remote.bundle_ahead(ns, &id).map_err(|it| it.to_string())?;
@@ -180,35 +184,41 @@ fn pull(root: &Path, env: Env<'_>, toolchain: &str, target: &str, cfg: &str, nam
     ))
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+/// `namespace` is `public` and `tier` `top` when absent; unknown fields refused.
 struct PushInput {
     toolchain: String,
-    #[serde(default = "public")]
     namespace: String,
     /// `top` or `fast` ([`tier_named`]).
-    #[serde(default = "top")]
     tier: String,
     bundle: Option<BundleInput>,
 }
 
-fn public() -> String {
-    "public".to_owned()
+impl FromValue<Global> for PushInput {
+    fn from_value(c: &Cursor<'_, '_, Global>) -> Result<PushInput, ShapeError<Global>> {
+        c.deny_unknown(&["toolchain", "namespace", "tier", "bundle"])?;
+        Ok(PushInput {
+            toolchain: c.field("toolchain")?.text()?.to_owned(),
+            namespace: opt_text(c, "namespace")?.unwrap_or_else(|| "public".to_owned()),
+            tier: opt_text(c, "tier")?.unwrap_or_else(|| "top".to_owned()),
+            bundle: c.opt("bundle")?,
+        })
+    }
 }
 
-fn top() -> String {
-    "top".to_owned()
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct BundleInput {
     target: String,
     cfg: String,
 }
 
-fn push(root: &Path, env: Env<'_>, json: &str, now_s: u64, connect: Connect<'_>) -> Result<String, String> {
-    let input: PushInput = serde_json::from_str(json).map_err(|e| format!("blaze cache push: {e}: {USAGE}"))?;
+impl FromValue<Global> for BundleInput {
+    fn from_value(c: &Cursor<'_, '_, Global>) -> Result<BundleInput, ShapeError<Global>> {
+        c.deny_unknown(&["target", "cfg"])?;
+        Ok(BundleInput { target: c.field("target")?.text()?.to_owned(), cfg: c.field("cfg")?.text()?.to_owned() })
+    }
+}
+
+fn push<A: Allocator + Clone>(root: &Path, env: Env<'_>, json: &str, now_s: u64, connect: Connect<'_>, alloc: A) -> Result<String, String> {
+    let input: PushInput = read_json(json.as_bytes()).map_err(|e| format!("blaze cache push: {e}: {USAGE}"))?;
     let settings = Settings::read(root, env)?;
     if settings.contacts().is_none() {
         return Err(contacts_nothing(&settings));
@@ -238,7 +248,7 @@ fn push(root: &Path, env: Env<'_>, json: &str, now_s: u64, connect: Connect<'_>)
     let ns = name::namespace_named(&input.namespace).map_err(|it| it.to_string())?;
     let store_settings = StoreSettings::read(root)?;
     let store_file = root.join(blaze_cas::plain::settings::FILE);
-    let mut driven = Driven::open(root, &store_settings).map_err(|it| it.to_string())?;
+    let mut driven = Driven::open(root, &store_settings, alloc.clone()).map_err(|it| it.to_string())?;
     if !store_settings.trusted_writer {
         // By construction: a machine that is not a trusted writer files everything in
         // namespace local, so its store holds nothing of a namespace that can be pushed.
@@ -249,12 +259,12 @@ fn push(root: &Path, env: Env<'_>, json: &str, now_s: u64, connect: Connect<'_>)
             store_file.display()
         ));
     }
-    let pushable: Vec<Namespace> = store_settings.writes().into_iter().filter(|it| *it != Namespace::LOCAL).collect();
+    let pushable: Vec<Namespace> = store_settings.writes(alloc.clone()).into_iter().filter(|it| *it != Namespace::LOCAL).collect();
     if !pushable.contains(&ns) {
         return Err(format!(
             "namespace {} is not one this store writes ({}, set in {}); nothing pushed",
             input.namespace,
-            store_settings.writes().into_iter().map(space_said).collect::<Vec<_>>().join(", "),
+            store_settings.writes(alloc.clone()).into_iter().map(space_said).collect::<Vec<_>>().join(", "),
             store_file.display()
         ));
     }
@@ -262,8 +272,11 @@ fn push(root: &Path, env: Env<'_>, json: &str, now_s: u64, connect: Connect<'_>)
     let key_list_path = settings.key_list.as_ref().expect("checked");
     let key_list = std::fs::read(key_list_path).map_err(|e| format!("{}: {e}", key_list_path.display()))?;
 
-    let mut ids = Vec::new();
+    let mut ids = Vec::new_in(alloc);
     let mut other = 0usize;
+    // The store opens lazily (a segment mapped at its first probe): a push reads every
+    // segment's bytes, so every one is mapped first.
+    driven.map_all().map_err(|it| it.to_string())?;
     let mut segments: Vec<&[u8]> = Vec::new();
     let mut digests = Vec::new();
     for (id, _) in driven.core().segments() {
@@ -350,8 +363,7 @@ fn keys_public(root: &Path, env: Env<'_>) -> Result<String, String> {
     Ok(out)
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Every field required; unknown fields refused.
 struct SignInput {
     namespace: String,
     serial: u64,
@@ -360,19 +372,48 @@ struct SignInput {
     out: std::path::PathBuf,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+impl FromValue<Global> for SignInput {
+    fn from_value(c: &Cursor<'_, '_, Global>) -> Result<SignInput, ShapeError<Global>> {
+        c.deny_unknown(&["namespace", "serial", "issued", "keys", "out"])?;
+        let mut keys = Vec::new();
+        c.field("keys")?.each(|it| {
+            keys.push(it.get::<KeyInput>()?);
+            Ok::<(), ShapeError<Global>>(())
+        })?;
+        Ok(SignInput {
+            namespace: c.field("namespace")?.text()?.to_owned(),
+            serial: c.req("serial")?,
+            issued: c.req("issued")?,
+            keys,
+            out: std::path::PathBuf::from(c.field("out")?.text()?),
+        })
+    }
+}
+
+/// `revoked` false when absent; unknown fields refused.
 struct KeyInput {
     key: String,
     roles: Vec<String>,
     from: u64,
     until: u64,
-    #[serde(default)]
     revoked: bool,
 }
 
+impl FromValue<Global> for KeyInput {
+    fn from_value(c: &Cursor<'_, '_, Global>) -> Result<KeyInput, ShapeError<Global>> {
+        c.deny_unknown(&["key", "roles", "from", "until", "revoked"])?;
+        Ok(KeyInput {
+            key: c.field("key")?.text()?.to_owned(),
+            roles: texts(&c.field("roles")?)?,
+            from: c.req("from")?,
+            until: c.req("until")?,
+            revoked: c.opt("revoked")?.unwrap_or(false),
+        })
+    }
+}
+
 fn keys_sign(env: Env<'_>, json: &str) -> Result<String, String> {
-    let input: SignInput = serde_json::from_str(json).map_err(|e| format!("blaze cache keys sign: {e}: {USAGE}"))?;
+    let input: SignInput = read_json(json.as_bytes()).map_err(|e| format!("blaze cache keys sign: {e}: {USAGE}"))?;
     let Some(anchor) = anchor_seed(env)? else {
         return Err(Failure::NotConfigured { missing: vec!["the anchor seed (BLAZE_CACHE_ANCHOR_SEED)".to_owned()] }.to_string());
     };

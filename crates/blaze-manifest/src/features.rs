@@ -1,17 +1,121 @@
 //! Editions, resolver versions and `cargo-features`, as the cargo of the pinned nightly
-//! (`harness/toolchain`) knows them (`src/workspace/features.rs` and `src/resolver/types.rs`
+//! (`pins/toolchain`) knows them (`src/workspace/features.rs` and `src/resolver/types.rs`
 //! there). blaze builds with that nightly only, so its channel is `nightly`: a listed unstable
 //! feature is activated, as nightly cargo activates it.
 
+use std::alloc::Global;
 use std::fmt;
 use std::str::FromStr;
 
-use anyhow::bail;
-use semver::Version;
+use blaze_semver::Version;
 
-/// The cargo whose behaviour this crate has, the pinned nightly's, in the form cargo prints
-/// itself (`cargo -vV`; commit cad07cf8e597397fff5d0f6cb79c9f870c0b1dd2).
-pub const CARGO_VERSION: &str = "1.101.0-nightly (cad07cf8e 2026-10-23)";
+/// What an `edition` or a `cargo-features` entry refuses, in cargo's words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeatureError {
+    /// `blaze-..` that names no blaze edition.
+    NoBlazeEdition { written: String },
+    /// A blaze edition this blaze does not know.
+    UnknownBlazeEdition(edition::UnknownBlazeEdition),
+    /// A year after 2024 that this cargo does not know yet.
+    NewerEdition { written: String },
+    /// Any other edition value.
+    UnknownEdition { written: String },
+    /// A `cargo-features` entry naming no feature; `cli` when a `-Z` flag of that name exists.
+    UnknownFeature { name: String, cli: bool },
+    /// The same `cargo-features` entry twice.
+    AlreadyActivated { name: String },
+    /// A feature cargo removed.
+    Removed { name: String, version: &'static str, is_local: bool, docs: &'static str },
+    /// An unstable feature the manifest did not list.
+    Required { name: String, is_local: bool, docs: &'static str, hint: Option<String> },
+}
+
+impl fmt::Display for FeatureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FeatureError::NoBlazeEdition { written } => {
+                write!(f, "`{written}` is no blaze edition")
+            }
+            FeatureError::UnknownBlazeEdition(unknown) => write!(f, "{unknown}"),
+            FeatureError::NewerEdition { written } => write!(
+                f,
+                "this version of Cargo is older than the `{written}` edition, \
+                 and only supports `2015`, `2018`, `2021`, and `2024` editions."
+            ),
+            FeatureError::UnknownEdition { written } => write!(
+                f,
+                "supported edition values are `2015`, `2018`, `2021`, or `2024`, \
+                 but `{written}` is unknown"
+            ),
+            FeatureError::UnknownFeature { name, cli } => {
+                write!(f, "unknown Cargo.toml feature `{name}`\n\n")?;
+                if name.contains('_') {
+                    f.write_str("Feature names must use '-' instead of '_'.\n")
+                } else {
+                    if *cli {
+                        write!(
+                            f,
+                            "This feature can be enabled via -Z{name} or the `[unstable]` \
+                             section in config.toml.\n"
+                        )?;
+                    }
+                    f.write_str(
+                        "See https://doc.rust-lang.org/nightly/cargo/reference/unstable.html for more information.\n",
+                    )
+                }
+            }
+            FeatureError::AlreadyActivated { name } => {
+                write!(f, "the cargo feature `{name}` has already been activated")
+            }
+            FeatureError::Removed { name, version, is_local, docs } => {
+                write!(f, "the cargo feature `{name}` has been removed in the {version} release\n\n")?;
+                if *is_local {
+                    f.write_str("Remove the feature from Cargo.toml to remove this error.\n")?;
+                } else {
+                    write!(
+                        f,
+                        "This package cannot be used with this version of Cargo, as the \
+                         unstable feature `{name}` is no longer supported.\n"
+                    )?;
+                }
+                writeln!(f, "{}", see_docs(docs))
+            }
+            FeatureError::Required { name, is_local, docs, hint } => {
+                write!(
+                    f,
+                    "feature `{name}` is required\n\n\
+                     The package requires the Cargo feature called `{name}`, but that feature is \
+                     not stabilized in this version of Cargo ({}).\n",
+                    blaze_pins::CARGO_VERSION
+                )?;
+                if *is_local {
+                    write!(
+                        f,
+                        "Consider adding `cargo-features = [\"{name}\"]` to the top of Cargo.toml \
+                         (above the [package] table) to tell Cargo you are opting in to use this \
+                         unstable feature.\n"
+                    )?;
+                } else {
+                    f.write_str("Consider trying a more recent nightly release.\n")?;
+                }
+                write!(
+                    f,
+                    "See https://doc.rust-lang.org/nightly/cargo/{docs} for more information about the status of this feature.\n"
+                )?;
+                if let Some(hint) = hint {
+                    writeln!(f, "{hint}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl core::error::Error for FeatureError {}
+
+fn see_docs(docs: &str) -> String {
+    format!("See {} for more information about using this feature.", cargo_docs_link(docs))
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Edition {
@@ -70,7 +174,7 @@ impl Edition {
     ];
 
     /// The release that stabilized it.
-    pub fn first_version(&self) -> Option<Version> {
+    pub fn first_version(&self) -> Option<Version<Global>> {
         match self {
             Edition::Edition2015 => None,
             Edition::Edition2018 => Some(Version::new(1, 31, 0)),
@@ -111,8 +215,9 @@ impl fmt::Display for Edition {
 }
 
 impl FromStr for Edition {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> anyhow::Result<Edition> {
+    type Err = FeatureError;
+    fn from_str(s: &str) -> Result<Edition, FeatureError> {
+        let written = || s.to_owned();
         match s {
             "2015" => Ok(Edition::Edition2015),
             "2018" => Ok(Edition::Edition2018),
@@ -122,18 +227,14 @@ impl FromStr for Edition {
             s if s.starts_with(edition::BlazeEdition::MANIFEST_PREFIX) => {
                 match edition::BlazeEdition::from_manifest(s) {
                     Ok(Some(blaze)) => Ok(Edition::of_blaze(blaze)),
-                    Ok(None) => bail!("`{s}` is no blaze edition"),
-                    Err(unknown) => bail!("{unknown}"),
+                    Ok(None) => Err(FeatureError::NoBlazeEdition { written: written() }),
+                    Err(unknown) => Err(FeatureError::UnknownBlazeEdition(unknown)),
                 }
             }
-            s if s.parse().is_ok_and(|y: u16| y > 2024 && y < 2050) => bail!(
-                "this version of Cargo is older than the `{s}` edition, \
-                 and only supports `2015`, `2018`, `2021`, and `2024` editions."
-            ),
-            s => bail!(
-                "supported edition values are `2015`, `2018`, `2021`, or `2024`, \
-                 but `{s}` is unknown"
-            ),
+            s if s.parse().is_ok_and(|y: u16| y > 2024 && y < 2050) => {
+                Err(FeatureError::NewerEdition { written: written() })
+            }
+            _ => Err(FeatureError::UnknownEdition { written: written() }),
         }
     }
 }
@@ -291,7 +392,7 @@ impl Features {
         features: &[String],
         warnings: &mut Vec<String>,
         is_local: bool,
-    ) -> anyhow::Result<Features> {
+    ) -> Result<Features, FeatureError> {
         let mut ret = Features { activated: Vec::new(), enabled: Vec::new(), is_local };
         for name in features {
             ret.add(name, warnings)?;
@@ -300,54 +401,29 @@ impl Features {
         Ok(ret)
     }
 
-    fn add(&mut self, name: &str, warnings: &mut Vec<String>) -> anyhow::Result<()> {
+    fn add(&mut self, name: &str, warnings: &mut Vec<String>) -> Result<(), FeatureError> {
         let Some(feature) = status(name) else {
-            let mut msg = format!("unknown Cargo.toml feature `{name}`\n\n");
-            if name.contains('_') {
-                msg.push_str("Feature names must use '-' instead of '_'.\n");
-            } else {
-                if CLI_UNSTABLE.contains(&name.replace('-', "_").as_str()) {
-                    msg.push_str(&format!(
-                        "This feature can be enabled via -Z{name} or the `[unstable]` section \
-                         in config.toml.\n"
-                    ));
-                }
-                msg.push_str(
-                    "See https://doc.rust-lang.org/nightly/cargo/reference/unstable.html for more information.\n",
-                );
-            }
-            bail!(msg)
+            let cli = CLI_UNSTABLE.contains(&name.replace('-', "_").as_str());
+            return Err(FeatureError::UnknownFeature { name: name.to_owned(), cli });
         };
         if self.enabled.contains(&feature.name) {
-            bail!("the cargo feature `{name}` has already been activated");
+            return Err(FeatureError::AlreadyActivated { name: name.to_owned() });
         }
-        let see_docs = format!(
-            "See {} for more information about using this feature.",
-            cargo_docs_link(feature.docs)
-        );
         match feature.status {
             Status::Stable => warnings.push(format!(
                 "the cargo feature `{name}` has been stabilized in the {} release and is no \
-                 longer necessary to be listed in the manifest\n  {see_docs}",
-                feature.version
+                 longer necessary to be listed in the manifest\n  {}",
+                feature.version,
+                see_docs(feature.docs)
             )),
             Status::Unstable => {}
             Status::Removed => {
-                let mut msg = format!(
-                    "the cargo feature `{name}` has been removed in the {} release\n\n",
-                    feature.version
-                );
-                if self.is_local {
-                    msg.push_str("Remove the feature from Cargo.toml to remove this error.\n");
-                } else {
-                    msg.push_str(&format!(
-                        "This package cannot be used with this version of Cargo, as the \
-                         unstable feature `{name}` is no longer supported.\n"
-                    ));
-                }
-                msg.push_str(&see_docs);
-                msg.push('\n');
-                bail!(msg)
+                return Err(FeatureError::Removed {
+                    name: name.to_owned(),
+                    version: feature.version,
+                    is_local: self.is_local,
+                    docs: feature.docs,
+                });
             }
         }
         self.enabled.push(feature.name);
@@ -366,38 +442,24 @@ impl Features {
 
     /// Fails as nightly cargo does for a manifest that uses an unstable feature it did not
     /// list in `cargo-features`.
-    pub fn require(&self, feature: &Feature) -> anyhow::Result<()> {
+    pub fn require(&self, feature: &Feature) -> Result<(), FeatureError> {
         self.require_with_hint(feature, None)
     }
 
-    pub fn require_with_hint(&self, feature: &Feature, hint: Option<&str>) -> anyhow::Result<()> {
+    pub fn require_with_hint(
+        &self,
+        feature: &Feature,
+        hint: Option<&str>,
+    ) -> Result<(), FeatureError> {
         if self.is_enabled(feature) {
             return Ok(());
         }
-        let name = feature.name.replace('_', "-");
-        let mut msg = format!(
-            "feature `{name}` is required\n\n\
-             The package requires the Cargo feature called `{name}`, but that feature is not \
-             stabilized in this version of Cargo ({CARGO_VERSION}).\n"
-        );
-        if self.is_local {
-            msg.push_str(&format!(
-                "Consider adding `cargo-features = [\"{name}\"]` to the top of Cargo.toml \
-                 (above the [package] table) to tell Cargo you are opting in to use this \
-                 unstable feature.\n"
-            ));
-        } else {
-            msg.push_str("Consider trying a more recent nightly release.\n");
-        }
-        msg.push_str(&format!(
-            "See https://doc.rust-lang.org/nightly/cargo/{} for more information about the status of this feature.\n",
-            feature.docs
-        ));
-        if let Some(hint) = hint {
-            msg.push_str(hint);
-            msg.push('\n');
-        }
-        bail!("{msg}")
+        Err(FeatureError::Required {
+            name: feature.name.replace('_', "-"),
+            is_local: self.is_local,
+            docs: feature.docs,
+            hint: hint.map(str::to_owned),
+        })
     }
 }
 

@@ -14,14 +14,23 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-data.workspace = true
+blaze-toml.workspace = true
 serde = { workspace = true, features = ["derive"] }
 sonic-rs.workspace = true
-toml.workspace = true
-unicode-width.workspace = true
+blaze-unicode.workspace = true
+# The frame's highlighting: blaze's own lexer.
+blaze-lex.workspace = true
+# The frame's text and scratch: in the caller's allocator.
+blaze-own.workspace = true
+blaze-text.workspace = true
 
 [dev-dependencies]
 blaze-protocol.workspace = true
 stdx.workspace = true
+# The frame's properties and their planted-bug control.
+blaze-sim.workspace = true
+blaze-own = { workspace = true, features = ["std", "testing"] }
 
 [lints]
 workspace = true

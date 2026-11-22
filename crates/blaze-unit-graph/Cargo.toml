@@ -1,0 +1,45 @@
+[package]
+name = "blaze-unit-graph"
+description = "Which features and cfgs each crate of a workspace's graph is compiled with, by cargo's documented rules, sans-IO: from the manifests (blaze-manifest's layout), the lock (blaze-manifest's lock), a target description and what was asked, the units (each crate once per configuration) with their features, cfg atoms, edition, dependencies by extern name, and kind"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `String`, `Vec`, `BTreeMap`: every owner in the caller's allocator.
+blaze-own.workspace = true
+# The packages' facts (`layout::Member`) and the lock (`lock::Lock`), on blaze's own crates only.
+blaze-manifest = { workspace = true, default-features = false }
+# A registry dependency's requirement, matched against the lock's versions when two of one name are locked.
+blaze-semver.workspace = true
+# `[target.'cfg(..)'.dependencies]`: the predicate parsed by the one cfg parser.
+blaze-cond.workspace = true
+# `PackageEdition`: a unit's edition as its manifest wrote it.
+edition.workspace = true
+# `sources`: a dependency's manifests read in place from its sources' record (`PackView`), found
+# by the fetch plan's `SourceId`; a git commit's id.
+blaze-fetch.workspace = true
+blaze-git-fetch.workspace = true
+# `sources`: the fetch crate's refusals shown in our errors (`Shown`).
+blaze-text.workspace = true
+# `record`: the source digest a graph's record is keyed by (`Hasher`, `ContentId`); by path, as
+# blaze-fetch takes it, without the workspace line's serde feature.
+blaze-ids.workspace = true
+# `sources`: a git commit's manifests scanned for `package.name`, as cargo finds a git package.
+blaze-toml.workspace = true
+
+[dev-dependencies]
+# `Alloc::global()` in the tests and the example.
+blaze-own = { workspace = true, features = ["std", "testing"] }
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

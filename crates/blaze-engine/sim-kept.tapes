@@ -1,0 +1,6 @@
+# blaze-engine's kept failing tapes (docs/v2/plan/design/test.md, piece S3), compiled in by
+# `blaze_sim::sim_kept!()` and replayed first by `blaze_sim::check_kept`.
+# One line a tape, as a failure's report prints it after `blaze-sim keep: `:
+#   <test path> v<primitives version> <tape>  # <date> <one line why>
+# Lines are only added; a line whose test is renamed moves to the new path.
+owed_rows_sim::owed_rows_hold_over_histories v1 0*9 3 0*31 1 1 0*7 1 0*7 1 0*8 1  # 2026-11-18 request 4: 0 owed rows reported, 1 in the model (an owed script's text edited out of scope and back: held under its stale plan)

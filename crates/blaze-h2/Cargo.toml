@@ -1,0 +1,28 @@
+[package]
+name = "blaze-h2"
+description = "blaze's own HTTP/2 (RFC 9113) with HPACK (RFC 7541) as a sans-IO machine: bytes in, bytes out, events out, time in; client first, the server role the same machine with the other preface; every cap the caller's, every refusal a typed error naming the frame, the stream and the RFC rule; `no_std`, every buffer in the allocator passed in"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The stream table, the HPACK tables, the header lists and the byte queues, in the caller's
+# allocator (`Alloc<'_>`).
+blaze-own.workspace = true
+
+[dev-dependencies]
+# `Alloc::global()` in the tests.
+blaze-own = { workspace = true, features = ["std", "testing"] }
+# Property tests and planted-bug controls.
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

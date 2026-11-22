@@ -1,0 +1,35 @@
+[package]
+name = "blaze-malloc"
+description = "blaze's general-purpose allocator: a heap per thread with no lock or atomic on its own blocks, size classes 12.5% apart served from spans found by address arithmetic, frees from other threads handed back through a lock-free queue per heap, large sizes straight from blaze-mem's regions, and heaps of ended threads adopted whole (docs/v2/plan/design/malloc.md)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The page source: `Region` (reserve, commit, purge, reuse, release), the kernel's virtual memory
+# in one home (AGENTS.md rule 30).
+blaze-mem.workspace = true
+# The one bounded spin, for the two caches' short lock.
+blaze-spin.workspace = true
+
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+
+[dev-dependencies]
+blaze-rng.workspace = true
+blaze-sim.workspace = true
+
+# The allocator against the system's, row by row, with the floor each row is judged by.
+[[example]]
+name = "cost"
+
+[lints]
+workspace = true

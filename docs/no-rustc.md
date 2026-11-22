@@ -37,10 +37,10 @@ A blaze extension is not a rustc run: code that opts into one need not build und
 2. **Proc macros are compiled by blaze and run by blaze**, as `wasm32-wasip1` in Wasmtime
    (`crates/blaze-macro-eval`).
 3. **Build scripts are compiled, linked and run by blaze.** `RUSTC` names blaze while they run
-   (`crates/blaze-engine/src/as_rustc.rs`), so their probes are answered by blaze, from the data
+   (`crates/blaze-cargo/src/as_rustc.rs`), so their probes are answered by blaze, from the data
    `harness/answers.py` writes at a toolchain bump (`crates/blaze-cargo/src/answers/own.rs`).
 4. **The cold build is entirely blaze's**: no first build by cargo and rustc.
-5. **Tests and doctests are built by the daemon**; no rustdoc runs.
+5. **Tests and doctests are built by blaze**; no rustdoc runs.
 6. **No wrapper and no fallback**: there is no `blaze-rustc`, and no build is handed to cargo.
 
 ## The plan
@@ -51,7 +51,7 @@ below still finds is the list after it.
 
 | Step | What it removed |
 |---|---|
-| A | nothing: every rustc run counted, new ones refused (`scripts/src/bin/rustcsites.rs`, `harness/norustc.py`) |
+| A | nothing: every rustc run counted, new ones refused (`scripts/src/bin/rustcsites.rs`) |
 | B | every question asked of rustc (`-vV`, `--print cfg`): blaze answers |
 | C | the assembler run for `asm!` |
 | D | the fallback on an error: blaze's verdict is the final word |
@@ -67,9 +67,9 @@ below still finds is the list after it.
 
 ## What is left
 
-`blaze run -q -p scripts --bin rustcsites` (CI's `scripts` job) counts, per file under `crates/`, the places
-that start rustc, rustdoc, cargo or rustup or read which one to start, and holds them to
-`harness/norustc/sites.json`: one more in a file fails, and a place that goes lowers the count
+`scripts/src/bin/rustcsites.rs` (CI's `scripts` job) counts, per file under `crates/`, the places
+that start rustc, rustdoc, cargo or rustup or read which one to start, and holds them to the
+counts it recorded: one more in a file fails, and a place that goes lowers the count
 (`--record`). On 2026-11-10 it counts three places in two files, and none of them starts rustc:
 
 | Place | What it is | Why it is still counted | What removes it |
@@ -85,13 +85,7 @@ Outside `crates/`, which the counter does not read, cargo or rustc still run in:
 
 | Place | What runs | What removes it |
 |---|---|---|
-| `harness/v2/engine.py`, `reference_env` and `cargo` | plain cargo with the pinned nightly, to fetch sources for the proof scripts (`cargo fetch`, `cargo vendor`, `cargo metadata`); nothing it builds is compared | blaze's own `fetch` and `vendor` as commands (`crates/blaze-metadata` has both; `metadata` is wired) |
-| `.github/workflows/nix-live.yaml`, the demo jobs | `cargo build --locked` of `demo/life`, on purpose: it checks the demo builds with rustc as a user's would | deleting the flake and that workflow (decided 2026-11-04) |
-| `tools/nix/unit_graph.py` and `tools/nix/unit_build.py` | cargo's unit graph, and one rustc per unit in the flake's per-unit builds | the same deletion |
-
-`harness/norustc.py` (the release train) measures the same thing from outside: how often rustc
-and rustdoc run when `harness/norustc/fixture` is built, edited, tested, doctested and checked
-with blaze, which has to be never.
+| `tools/nix/unit_graph.py` and `tools/nix/unit_build.py` | cargo's unit graph, and one rustc per unit in the flake's per-unit builds | deleting the flake (decided 2026-11-04) |
 
 The long form of this page (the measurements of October 2026, each step's design and the lanes
 that did them) is in git: `git show 9112d5e40e:docs/no-rustc.md`.

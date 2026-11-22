@@ -1,0 +1,15 @@
+{
+ "id": "dollar-crate-lost-in-rewritten-texts",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane NA",
+ "where": "crates/blaze-scope/src/resolve.rs (the statements branch of the expansion's NotItems case; make_blocks), crates/blaze-scope/src/nested_input.rs ExpansionTokens::moved, task/lower.rs BodySrc.tokens",
+ "what": "tempo: 27 \"no `assert` in `crate`\" in the antithesis members. antithesis_sdk's assert_sometimes! writes a block whose `#[$crate::linkme::distributed_slice($crate::assert::ANTITHESIS_CATALOG)] static ..` is a statement; the names stage reads the statements as items (statements_as_items) and a macro-written body's block as a module (make_blocks), both texts COPIED from the expansion, and a call in them took its input as that text lexed again, where another crate's `$crate` is the plain keyword `crate`. linkme's output `crate::assert::ANTITHESIS_CATALOG! {..}` was then looked for in the calling crate.",
+ "cost": "about two hours; the first fixture shapes (item-level `$p:path`, `$t:tt`, `$e:expr`) passed on the old tree, the bug needs a statement call or a macro-written body",
+ "cause": "a rewritten text carried no tokens of the expansion it was copied from, so its calls fell back to lexing text",
+ "whys": "token marks live on ExpansionTokens; the two rewrites report the slices they copy (Copied) for marks, but nothing moved the tokens with them",
+ "class": "a text rewritten from an expansion that keeps the marks' map but not the tokens: any `$crate` (or other hygiene context) of a call inside it is lost",
+ "prevention": "done: ExpansionTokens::moved places the expansion's tokens by the same Copied list; both rewrites and a block's body pass them on; test crates/blaze-cli/tests/check_dollar_crate_through_an_argument.rs",
+ "annoyance": "the runner keeps only cargo's ---- stdout ---- blocks, so `-- --nocapture` hides a failing test's words; the names stage does not report an unresolved path in a const's TYPE (`const _: $crate::m::Y = ..` says nothing), so the first control could not fail",
+ "workaround": "run without --nocapture; the control is a macro path instead",
+ "state": "fixed"
+}

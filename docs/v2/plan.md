@@ -6,8 +6,8 @@ date: 2026-11-09
 # blaze: the plan
 
 blaze is the Rust build system and compiler for coding agents: an edit comes back as running code
-and a structured result in tens of milliseconds, on a warm daemon that every branch, pull request
-and CI job shares. This page is the whole plan. Three more things hold the rest:
+and a structured result in tens of milliseconds, from records any checkout, pull request and CI
+job shares; a command answers and exits ([bottom](plan/design/bottom.md)). This page is the whole plan. Three more things hold the rest:
 
 - **[plan/objectives.md](plan/objectives.md)**: every objective, the check that decides it, and
   where it stands. Work is picked from there and nowhere else.
@@ -30,8 +30,8 @@ AGENTS.md is the law for how code is written and landed. The plan adds what the 
 3. **Within 10% of the bound.** A component has a least possible cost from arithmetic on its work
    and the hardware. One a program can measure is in [bounds.md](plan/bounds.md); more than 10%
    off is a bug.
-4. **One of each.** One identity scheme, one query engine, one store, one scheduler, one memory
-   budget, one span stream, one API. Two mechanisms for one job is a defect: merge them and ban
+4. **One of each.** One identity scheme, one record form, one store, one scheduler, one memory
+   measure, one span stream, one API. Two mechanisms for one job is a defect: merge them and ban
    the loser's name (AGENTS.md `one-concept-one-home`).
 5. **Everything is ours.** Any crate, vendored dependency, format or interface changes when it
    makes blaze faster and keeps Rust's meaning.
@@ -39,8 +39,8 @@ AGENTS.md is the law for how code is written and landed. The plan adds what the 
    clock.
 7. **It just works.** Real projects build and pass their own tests with no flags. rustc and cargo
    are references, not specs.
-8. **Never take the machine down.** Work is admitted against a memory budget; what does not fit
-   stops with an error that names it.
+8. **Never take the machine down.** Footprint is the measure and the kernel's limit the ceiling;
+   what does not fit stops with an error that names it.
 
 ## The design
 
@@ -50,15 +50,13 @@ are that idea at each layer, and each names the one thing the others must use.
 
 ### 1. Source is a Merkle tree
 
-The daemon's source of truth is a content-addressed tree, not the disk. A **view** (a branch, a
+The source of truth is a content-addressed tree, not the disk. A **view** (a branch, a
 pull request, a CI job, an agent's what-if patch) is a root hash; unchanged subtrees are shared.
 An edit is an atomic transaction that makes a new root. What changed is the diff of two roots,
-which skips equal subtrees by hash. Disk is one writer and one projection. While the daemon is
-up the OS reports changes (fanotify on Linux, FSEvents on macOS, the USN journal on Windows);
-after a restart the journals, or on Linux one parallel statx sweep, say what changed, and no file
-is read whose metadata did not move.
-Specs: [vfs](plan/design/vfs.md), [vfs-sync](plan/design/vfs-sync.md),
-[restore](plan/design/restore.md).
+which skips equal subtrees by hash. Disk is one writer and one projection. A command's stat
+sweep against one small table says what changed, and no file is read whose metadata did not
+move.
+Specs: [vfs](plan/design/vfs.md), [vfs-sync](plan/design/vfs-sync.md).
 
 ### 2. Identity is content, never a name or a place
 
@@ -70,16 +68,12 @@ path, checkout, home or toolchain location.
 Specs: [code-identity](plan/design/code-identity.md), [item-hash](plan/design/item-hash.md),
 [name-free-identity](plan/design/name-free-identity.md), [caching](plan/design/caching.md).
 
-### 3. One query engine, pull and push
+### 3. Records pulled at item grain
 
-`blaze-query` is the front end's only database: one concrete `&Db`, `Sync`, shared by reference,
-every call static. A result is remembered with the fingerprints of what it read; it is reused
-when those still match (early cutoff at interfaces, so a body edit reruns that body's queries
-and nothing else). The few relations where checking on demand costs the whole graph (name
-resolution, impl tables, trait candidates) are instead maintained on the write side by deltas, as
-DBSP does. `blaze why` answers "why did this rerun" from the recorded reads, never by guessing.
-Language semantics live only here.
-Specs: [frontend](plan/design/frontend.md), [dbsp](plan/design/dbsp.md), [why](plan/design/why.md),
+A question about one item reads or makes one small record keyed from text; a record is valid by
+its key or by its read list, so a body edit reruns that body's tasks and nothing else. `blaze
+why` answers "why did this rerun" from the recorded reads, never by guessing. Language semantics
+live only in the front end. Specs: [bottom](plan/design/bottom.md), [frontend](plan/design/frontend.md), [dbsp](plan/design/dbsp.md), [why](plan/design/why.md),
 [kernel](plan/design/kernel.md).
 
 ### 4. Data is columns
@@ -113,11 +107,10 @@ Every kernel wait goes through one deadline wait, every lock is a named lock tha
 waited behind whom, and every core is a sans-IO state machine with a thin driver (io_uring,
 kqueue, IOCP, simulation), which is what makes deterministic simulation tests possible. Memory is
 one pool run like a database buffer pool: every byte belongs to a running task's frame or to a
-named cache, tasks are admitted by measured peak, and one evictor keeps the sum under the budget.
+named cache; footprint is measured, and nothing admits work by memory.
 Specs: [scheduler](plan/design/scheduler.md), [fibers](plan/design/fibers.md),
 [concurrency](plan/design/concurrency.md), [deadline-waits](plan/design/deadline-waits.md),
-[named-locks](plan/design/named-locks.md), [memory](plan/design/memory.md),
-[memory-budget](../memory-budget.md), [memory-pool](../memory-pool.md).
+[named-locks](plan/design/named-locks.md), [memory](plan/design/memory.md).
 
 ### 7. Code per function, and no link in the dev loop
 
@@ -133,7 +126,7 @@ the same way, so dev code is fast without any edit waiting for an optimizer. Dep
 compiled optimized once, shared by every checkout through the store, and arrive as one premapped
 image. A release build goes
 through blaze's pinned LLVM with per-function summaries, and blaze's own linker writes ELF,
-Mach-O and COFF in parallel, in place. blaze never runs rustc; what still does is listed in
+Mach-O and COFF in parallel (`blaze export`). blaze never runs rustc; what still does is listed in
 [no-rustc](../no-rustc.md).
 Specs: [compile-time](plan/design/compile-time.md), [codegen](plan/design/codegen.md),
 [icf](plan/design/icf.md), [polymorph](plan/design/polymorph.md),
@@ -154,22 +147,18 @@ Specs: [proc-macros](plan/design/proc-macros.md), [doctests](plan/design/doctest
 
 ### 9. One interface
 
-The agent API is one versioned schema in deterministic CBOR over a Unix socket and HTTP; the CLI
-is a client of it. Everything blaze says is data first (a `Report`: headline, rule, facts, fixes),
+Everything blaze says is data first (a `Report`: headline, rule, facts, fixes),
 rendered for a terminal or handed to an agent as is. Diagnostics are judged by usefulness, with
-cargo's JSON kept where tools parse it. CI is the same daemon: a webhook makes a view per pull
-request, and the check run is the build and the tests that view reaches.
-Specs: [structured-output](plan/design/structured-output.md), [ci](plan/design/ci.md).
+cargo's JSON kept where tools parse it.
+Spec: [structured-output](plan/design/structured-output.md).
 
 ### 10. One span stream
 
 Every stretch of worker time and every wait is a span in one recorder (blaze's own, not
 `tracing`). The stream is kept as Parquet history; `blaze explain`, `blaze debug sql`, `blaze
-debug diff`, the live build view and the explorer all read that one stream.
+debug diff` and the profile read that one stream.
 Specs: [profiling](../profiling.md), [ix-prof-format](../ix-prof-format.md),
 [no-tracing](plan/design/no-tracing.md), [profile-history](plan/design/profile-history.md),
-[build-view](plan/design/build-view.md), [explore](plan/design/explore.md),
-[explore-core](plan/design/explore-core.md), [explore-generic](plan/design/explore-generic.md),
 [http3-sans-io](plan/design/http3-sans-io.md), [perf-history](plan/design/perf-history.md).
 
 ### 11. Proof by check, not by review
@@ -304,8 +293,7 @@ spec in place. When a section here stops being true, fix it in the same change.
 
 Decided; object with evidence, don't work around.
 
-- One warm daemon per project; branches, pull requests and CI jobs are views, not forks. A VM
-  fork is for tenants and untrusted whole jobs.
+- No daemon: a command answers and exits; branches, pull requests and CI jobs share records.
 - No IDE and no MCP. The agent API is the interface.
 - No GPU in the compiler; SIMD and huge pages are chosen at run time and every path is
   bit-identical.

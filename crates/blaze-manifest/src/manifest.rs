@@ -7,26 +7,27 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, anyhow, bail};
-use blaze_hash::HashMap;
-use cargo_platform::Platform;
-use cargo_util_schemas::core::{PackageIdSpec, PartialVersion};
-use cargo_util_schemas::manifest::{
-    self, Hints, InheritableField, InheritablePackage, PackageName, PathBaseName, RustVersion,
-    StringOrBool, TomlDependency, TomlDetailedDependency, TomlInheritedDependency, TomlLints,
-    TomlManifest, TomlPackage, TomlPackageBuild, TomlWorkspace, VecStringOrBool,
-};
+use blaze_data::Value;
+use blaze_hash::{FixedState, Map, MapOpts};
+use blaze_resolve::{PackageIdSpec, PartialVersion, Platform, RustVersion};
+use blaze_semver::{Comparator, Op, Version, VersionReq};
 use std::alloc::Global;
 use url::Url;
 
 use crate::config::Config;
+use crate::error::{Context as During, ManifestError, ResultExt as _};
+use crate::schema::{
+    self as manifest, Hints, InheritableField, InheritablePackage, PackageName, PathBaseName,
+    StringOrBool, TomlDependency, TomlDetailedDependency, TomlInheritedDependency,
+    TomlLints, TomlManifest, TomlPackage, TomlPackageBuild, TomlWorkspace, VecStringOrBool,
+};
 use crate::config::path::ConfigRelativePath;
 use crate::dependency::{DepKind, Dependency, FeatureMap, build_summary_features};
 use crate::diagnostic::ManifestDiagnostic;
 use crate::edit_distance::closest_msg;
 use crate::features::{Edition, Feature, Features, ResolveBehavior};
 use crate::files::Files;
-use crate::paths::normalize_path;
+use crate::paths::{normalize_path, relative_to};
 use crate::profiles::validate_profiles;
 use crate::source::{self, CRATES_IO_INDEX, CRATES_IO_REGISTRY, GitReference, SourceId, into_url};
 use crate::targets::{self, Target};
@@ -37,12 +38,12 @@ use crate::workspace::find_workspace_root;
 /// Every file is read through the configuration's [`Files`].
 pub struct Context<F: Files> {
     pub config: Config<F>,
-    pub(crate) ws_roots: RefCell<HashMap<PathBuf, WorkspaceRootConfig, Global>>,
+    pub(crate) ws_roots: RefCell<Map<PathBuf, WorkspaceRootConfig, FixedState, Global>>,
 }
 
 impl<F: Files> Context<F> {
     pub fn new(config: Config<F>) -> Context<F> {
-        Context { config, ws_roots: RefCell::new(HashMap::new_in(Global)) }
+        Context { config, ws_roots: RefCell::new(Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None })) }
     }
 
     pub fn files(&self) -> &F {
@@ -54,7 +55,7 @@ impl<F: Files> Context<F> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackageId {
     pub name: String,
-    pub version: semver::Version,
+    pub version: Version<Global>,
     pub source_id: SourceId,
 }
 
@@ -75,7 +76,7 @@ impl PackageId {
         PackageIdSpec::new(self.name.clone())
             .with_version(PartialVersion::from(self.version.clone()))
             .with_url(self.source_id.url().clone())
-            .with_kind(source::spec_kind(self.source_id.kind()))
+            .with_kind(self.source_id.kind().clone()) // clone: the spec owns its kind, once per spec
     }
 }
 
@@ -113,7 +114,7 @@ pub struct WorkspaceRootConfig {
     pub default_members: Option<Vec<String>>,
     pub exclude: Vec<String>,
     pub inheritable: InheritableFields,
-    pub custom_metadata: Option<toml::Value>,
+    pub custom_metadata: Option<Value<Global>>,
 }
 
 impl WorkspaceRootConfig {
@@ -156,7 +157,7 @@ impl WorkspaceRootConfig {
         &self,
         files: &F,
         globs: &'g [String],
-    ) -> anyhow::Result<Vec<(PathBuf, Option<&'g str>)>> {
+    ) -> Result<Vec<(PathBuf, Option<&'g str>)>, ManifestError> {
         let mut expanded_list = Vec::new();
         for glob in globs {
             let pathbuf = self.root_dir.join(glob);
@@ -177,14 +178,14 @@ impl WorkspaceRootConfig {
     }
 }
 
-fn expand_member_path<F: Files>(files: &F, path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+fn expand_member_path<F: Files>(files: &F, path: &Path) -> Result<Vec<PathBuf>, ManifestError> {
     let Some(path) = path.to_str() else {
         return Ok(Vec::new());
     };
     let res = crate::files::glob(files, path)
-        .with_context(|| format!("could not parse pattern `{path}`"))?;
+        .context(|| During::Pattern { pattern: path.to_owned() })?;
     res.into_iter()
-        .map(|p| p.with_context(|| format!("unable to match path to pattern `{path}`")))
+        .map(|p| p.context(|| During::PatternMatch { pattern: path.to_owned() }))
         .collect()
 }
 
@@ -200,9 +201,9 @@ pub struct InheritableFields {
 macro_rules! package_field_getter {
     ( $(($key:literal, $field:ident -> $ret:ty),)* ) => (
         $(
-            fn $field(&self) -> anyhow::Result<$ret> {
+            fn $field(&self) -> Result<$ret, ManifestError> {
                 let Some(val) = self.package.as_ref().and_then(|p| p.$field.as_ref()) else {
-                    bail!("`workspace.package.{}` was not defined", $key);
+                    return Err(InvalidManifest::WorkspacePackageField { key: $key }.into());
                 };
                 Ok(val.clone())
             }
@@ -225,15 +226,19 @@ impl InheritableFields {
         ("publish",       publish       -> VecStringOrBool),
         ("repository",    repository    -> String),
         ("rust-version",  rust_version  -> RustVersion),
-        ("version",       version       -> semver::Version),
+        ("version",       version       -> Version<Global>),
     }
 
-    fn get_dependency(&self, name: &str, package_root: &Path) -> anyhow::Result<TomlDependency> {
+    fn get_dependency(
+        &self,
+        name: &str,
+        package_root: &Path,
+    ) -> Result<TomlDependency, ManifestError> {
         let Some(deps) = &self.dependencies else {
-            bail!("`workspace.dependencies` was not defined");
+            return Err(InvalidManifest::WorkspaceDependencies.into());
         };
         let Some(dep) = deps.get(name) else {
-            bail!("`dependency.{name}` was not found in `workspace.dependencies`");
+            return Err(InvalidManifest::WorkspaceDependency { name: name.to_owned() }.into());
         };
         let mut dep = dep.clone();
         if let TomlDependency::Detailed(detailed) = &mut dep
@@ -246,27 +251,31 @@ impl InheritableFields {
         Ok(dep)
     }
 
-    fn lints(&self) -> anyhow::Result<TomlLints> {
+    fn lints(&self) -> Result<TomlLints, ManifestError> {
         let Some(val) = &self.lints else {
-            bail!("`workspace.lints` was not defined");
+            return Err(InvalidManifest::WorkspaceLints.into());
         };
         Ok(val.clone())
     }
 
-    fn license_file(&self, package_root: &Path) -> anyhow::Result<String> {
+    fn license_file(&self, package_root: &Path) -> Result<String, ManifestError> {
         let Some(license_file) = self.package.as_ref().and_then(|p| p.license_file.as_ref()) else {
-            bail!("`workspace.package.license-file` was not defined");
+            return Err(InvalidManifest::WorkspacePackageField { key: "license-file" }.into());
         };
         resolve_relative_path("license-file", &self.ws_root, package_root, license_file)
     }
 
-    fn readme<F: Files>(&self, files: &F, package_root: &Path) -> anyhow::Result<StringOrBool> {
+    fn readme<F: Files>(
+        &self,
+        files: &F,
+        package_root: &Path,
+    ) -> Result<StringOrBool, ManifestError> {
         let Some(readme) = normalize_package_readme(
             files,
             &self.ws_root,
             self.package.as_ref().and_then(|p| p.readme.as_ref()),
         ) else {
-            bail!("`workspace.package.readme` was not defined");
+            return Err(InvalidManifest::WorkspacePackageField { key: "readme" }.into());
         };
         resolve_relative_path("readme", &self.ws_root, package_root, &readme)
             .map(StringOrBool::String)
@@ -283,18 +292,19 @@ pub(crate) fn resolve_relative_path(
     old_root: &Path,
     new_root: &Path,
     rel_path: &str,
-) -> anyhow::Result<String> {
+) -> Result<String, ManifestError> {
     let joined_path = normalize_path(&old_root.join(rel_path));
-    match pathdiff::diff_paths(joined_path, new_root) {
-        None => Err(anyhow!(
-            "`{label}` was defined in {} but could not be resolved with {}",
-            old_root.display(),
-            new_root.display()
-        )),
-        Some(path) => Ok(path
-            .to_str()
-            .ok_or_else(|| anyhow!("`{label}` resolved to non-UTF value (`{}`)", path.display()))?
-            .to_owned()),
+    match relative_to(&joined_path, new_root) {
+        None => Err(InvalidManifest::Unrelatable {
+            label: label.to_owned(),
+            old_root: old_root.to_owned(),
+            new_root: new_root.to_owned(),
+        }
+        .into()),
+        Some(path) => match path.to_str() {
+            Some(text) => Ok(text.to_owned()),
+            None => Err(InvalidManifest::NotUtf8Path { label: label.to_owned(), path }.into()),
+        },
     }
 }
 
@@ -323,10 +333,10 @@ pub struct Manifest {
     pub features: FeatureMap,
     pub targets: Vec<Target>,
     pub metadata: ManifestMetadata,
-    pub custom_metadata: Option<toml::Value>,
+    pub custom_metadata: Option<Value<Global>>,
     pub publish: Option<Vec<String>>,
     pub replace: Vec<(PackageIdSpec, Dependency)>,
-    pub patch: HashMap<Url, Vec<Dependency>, Global>,
+    pub patch: Map<Url, Vec<Dependency>, FixedState, Global>,
     pub workspace: WorkspaceConfig,
     pub unstable_features: Features,
     pub edition: Edition,
@@ -342,7 +352,7 @@ pub struct Manifest {
 #[derive(Debug)]
 pub struct VirtualManifest {
     pub replace: Vec<(PackageIdSpec, Dependency)>,
-    pub patch: HashMap<Url, Vec<Dependency>, Global>,
+    pub patch: Map<Url, Vec<Dependency>, FixedState, Global>,
     pub workspace: WorkspaceConfig,
     pub unstable_features: Features,
     pub resolve_behavior: Option<ResolveBehavior>,
@@ -368,26 +378,28 @@ impl EitherManifest {
 /// Reads the manifest at `path`, a package or a virtual workspace.
 /// `bytes`, the manifest at `path`, parsed: not UTF-8, or TOML that is no manifest, is cargo's
 /// error naming `path` (with the TOML error's snippet).
-pub fn parse_manifest(path: &Path, bytes: &[u8]) -> anyhow::Result<TomlManifest> {
+pub fn parse_manifest(path: &Path, bytes: &[u8]) -> Result<TomlManifest, ManifestError> {
     let contents = std::str::from_utf8(bytes)
-        .map_err(|_| anyhow!("path at `{}` was not valid utf-8", path.display()))?;
-    toml::from_str(contents).map_err(|e| ManifestDiagnostic::from_toml(e, contents, path))
+        .map_err(|_| ManifestError::NotUtf8 { path: path.to_owned() })?;
+    let doc = blaze_toml::Document::parse_in(contents, blaze_toml::Limits::CARGO, Global)
+        .map_err(|e| ManifestDiagnostic::toml(e, contents, path))?;
+    TomlManifest::read(doc.root()).map_err(|e| ManifestDiagnostic::schema(e, contents, path))
 }
 
 pub fn read_manifest<F: Files>(
     path: &Path,
     source_id: SourceId,
     ctx: &Context<F>,
-) -> anyhow::Result<EitherManifest> {
+) -> Result<EitherManifest, ManifestError> {
     let ext = path.extension();
     if ext.is_none() || ext == Some(std::ffi::OsStr::new("rs")) {
-        bail!("parsing `{}` requires `-Zscript`", path.display());
+        return Err(InvalidManifest::RequiresScript { path: path.to_owned() }.into());
     }
     let original_toml = ctx.files().manifest(path)?;
 
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
-    (|| {
+    (|| -> Result<EitherManifest, ManifestError> {
         let empty = Vec::new();
         let cargo_features = original_toml.cargo_features.as_ref().unwrap_or(&empty);
         let features = Features::new(cargo_features, &mut warnings, source_id.is_path())?;
@@ -428,17 +440,17 @@ pub fn read_manifest<F: Files>(
                     EitherManifest::Virtual(Box::new(m))
                 })
         } else {
-            bail!("manifest is missing either a `[package]` or a `[workspace]`")
+            Err(InvalidManifest::NeitherPackageNorWorkspace.into())
         }
     })()
-    .with_context(|| format!("failed to parse manifest at `{}`", path.display()))
+    .context(|| During::ParseManifest { path: path.to_owned() })
 }
 
 fn to_workspace_config(
     original_toml: &TomlManifest,
     manifest_file: &Path,
     warnings: &mut Vec<String>,
-) -> anyhow::Result<WorkspaceConfig> {
+) -> Result<WorkspaceConfig, ManifestError> {
     match (
         original_toml.workspace.as_ref(),
         original_toml.package().and_then(|p| p.workspace.as_ref()),
@@ -448,10 +460,12 @@ fn to_workspace_config(
             if let Some(ws_deps) = &toml_config.dependencies {
                 for (name, dep) in ws_deps {
                     if dep.is_optional() {
-                        bail!("{name} is optional, but workspace dependencies cannot be optional");
+                        let name = name.to_string();
+                        return Err(InvalidManifest::OptionalWorkspaceDependency { name }.into());
                     }
                     if dep.is_public() {
-                        bail!("{name} is public, but workspace dependencies cannot be public");
+                        let name = name.to_string();
+                        return Err(InvalidManifest::PublicWorkspaceDependency { name }.into());
                     }
                 }
             }
@@ -461,10 +475,7 @@ fn to_workspace_config(
             ))))
         }
         (None, root) => Ok(WorkspaceConfig::Member { root: root.cloned() }),
-        (Some(..), Some(..)) => bail!(
-            "cannot configure both `package.workspace` and \
-             `[workspace]`, only one can be specified"
-        ),
+        (Some(..), Some(..)) => Err(InvalidManifest::BothWorkspaces.into()),
     }
 }
 
@@ -482,7 +493,7 @@ struct Inherit<'a, F: Files> {
 }
 
 impl<F: Files> Inherit<'_, F> {
-    fn fields(&self) -> anyhow::Result<&InheritableFields> {
+    fn fields(&self) -> Result<&InheritableFields, ManifestError> {
         if let Some(fields) = self.fields.get() {
             return Ok(fields);
         }
@@ -490,7 +501,7 @@ impl<F: Files> Inherit<'_, F> {
         Ok(self.fields.get_or_init(|| fields))
     }
 
-    fn ws_root(&self) -> anyhow::Result<&Path> {
+    fn ws_root(&self) -> Result<&Path, ManifestError> {
         self.fields().map(InheritableFields::ws_root)
     }
 }
@@ -503,7 +514,7 @@ fn normalize_toml<F: Files>(
     ctx: &Context<F>,
     warnings: &mut Vec<String>,
     errors: &mut Vec<String>,
-) -> anyhow::Result<TomlManifest> {
+) -> Result<TomlManifest, ManifestError> {
     let package_root = manifest_file.parent().unwrap();
     let files = ctx.files();
 
@@ -699,14 +710,7 @@ fn normalize_toml<F: Files>(
         normalized_toml.hints = original_toml.hints.clone();
         normalized_toml.badges = original_toml.badges.clone();
     } else if let Some(field) = original_toml.requires_package().next() {
-        let suggestion = if field == "lints" {
-            "\nhelp: a similar field exists: `[workspace.lints]`"
-        } else {
-            ""
-        };
-        bail!(
-            "this virtual manifest specifies a `{field}` section, which is not allowed{suggestion}"
-        );
+        return Err(InvalidManifest::VirtualWithPackageField { field }.into());
     }
 
     Ok(normalized_toml)
@@ -717,7 +721,7 @@ fn normalize_patch<F: Files>(
     original_patch: Option<&BTreeMap<String, BTreeMap<PackageName, TomlDependency>>>,
     inherit: &Inherit<'_, F>,
     features: &Features,
-) -> anyhow::Result<Option<BTreeMap<String, BTreeMap<PackageName, TomlDependency>>>> {
+) -> Result<Option<BTreeMap<String, BTreeMap<PackageName, TomlDependency>>>, ManifestError> {
     let Some(patch) = original_patch else {
         return Ok(None);
     };
@@ -727,9 +731,9 @@ fn normalize_patch<F: Files>(
         for (pkg, dep) in packages {
             let dep = if let TomlDependency::Detailed(dep) = dep {
                 let mut dep = dep.clone();
-                normalize_path_dependency(config, &mut dep, inherit, features).with_context(
-                    || format!("resolving path for patch of ({pkg}) for source ({name})"),
-                )?;
+                normalize_path_dependency(config, &mut dep, inherit, features).context(|| {
+                    During::PatchPath { package: pkg.to_string(), source: name.clone() }
+                })?;
                 TomlDependency::Detailed(dep)
             } else {
                 dep.clone()
@@ -744,15 +748,13 @@ fn normalize_patch<F: Files>(
 fn field_inherit_with<T>(
     field: InheritableField<T>,
     label: &str,
-    get_ws_inheritable: impl FnOnce() -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
+    get_ws_inheritable: impl FnOnce() -> Result<T, ManifestError>,
+) -> Result<T, ManifestError> {
     match field {
         InheritableField::Value(value) => Ok(value),
-        InheritableField::Inherit(_) => get_ws_inheritable().with_context(|| {
-            format!(
-                "error inheriting `{label}` from workspace root manifest's `workspace.package.{label}`",
-            )
-        }),
+        InheritableField::Inherit(_) => {
+            get_ws_inheritable().context(|| During::InheritField { label: label.to_owned() })
+        }
     }
 }
 
@@ -761,7 +763,7 @@ fn normalize_package_toml<F: Files>(
     manifest_file: &Path,
     inherit: &Inherit<'_, F>,
     features: &Features,
-) -> anyhow::Result<Box<TomlPackage>> {
+) -> Result<Box<TomlPackage>, ManifestError> {
     let package_root = manifest_file.parent().unwrap();
     let files = inherit.ctx.files();
     macro_rules! inherit_field {
@@ -781,7 +783,7 @@ fn normalize_package_toml<F: Files>(
         original_package
             .name
             .clone()
-            .ok_or_else(|| anyhow::format_err!("missing field `package.name`"))?,
+            .ok_or(InvalidManifest::MissingPackageName)?,
     );
     let version = inherit_field!(version, "version");
     let authors = inherit_field!(authors, "authors");
@@ -859,7 +861,6 @@ fn normalize_package_toml<F: Files>(
         repository,
         resolver: original_package.resolver.clone(),
         metadata: original_package.metadata.clone(),
-        _invalid_cargo_features: Default::default(),
     }))
 }
 
@@ -890,7 +891,7 @@ fn normalize_dependencies<F: Files>(
     inherit: &Inherit<'_, F>,
     package_root: &Path,
     warnings: &mut Vec<String>,
-) -> anyhow::Result<Option<BTreeMap<PackageName, manifest::InheritableDependency>>> {
+) -> Result<Option<BTreeMap<PackageName, manifest::InheritableDependency>>, ManifestError> {
     let Some(dependencies) = orig_deps else {
         return Ok(None);
     };
@@ -899,12 +900,15 @@ fn normalize_dependencies<F: Files>(
         let mut resolved = match v {
             manifest::InheritableDependency::Value(value) => value.clone(),
             manifest::InheritableDependency::Inherit(w) => {
-                inner_dependency_inherit_with(w, name_in_toml, inherit, package_root, edition, warnings)
-                    .with_context(|| {
-                        format!(
-                            "error inheriting `{name_in_toml}` from workspace root manifest's `workspace.dependencies.{name_in_toml}`",
-                        )
-                    })?
+                inner_dependency_inherit_with(
+                    w,
+                    name_in_toml,
+                    inherit,
+                    package_root,
+                    edition,
+                    warnings,
+                )
+                .context(|| During::InheritDependency { name: name_in_toml.to_string() })?
             }
         };
         if let TomlDependency::Detailed(ref mut d) = resolved {
@@ -935,7 +939,7 @@ fn normalize_dependencies<F: Files>(
                 }
             }
             normalize_path_dependency(config, d, inherit, features)
-                .with_context(|| format!("resolving path dependency {name_in_toml}"))?;
+                .context(|| During::PathDependency { name: name_in_toml.to_string() })?;
         }
         deps.insert(name_in_toml.clone(), manifest::InheritableDependency::Value(resolved));
     }
@@ -949,13 +953,13 @@ fn normalize_path_dependency<F: Files>(
     detailed_dep: &mut TomlDetailedDependency,
     inherit: &Inherit<'_, F>,
     features: &Features,
-) -> anyhow::Result<()> {
+) -> Result<(), ManifestError> {
     if let Some(base) = detailed_dep.base.take() {
         if let Some(path) = detailed_dep.path.as_mut() {
             let new_path = lookup_path_base(&base, config, inherit, features)?.join(&path);
             *path = new_path.to_str().unwrap().to_owned();
         } else {
-            bail!("`base` can only be used with path dependencies");
+            return Err(InvalidManifest::BaseWithoutPath.into());
         }
     }
     Ok(())
@@ -968,7 +972,7 @@ fn lookup_path_base<F: Files>(
     config: &Config<F>,
     inherit: &Inherit<'_, F>,
     features: &Features,
-) -> anyhow::Result<PathBuf> {
+) -> Result<PathBuf, ManifestError> {
     features.require(Feature::path_bases)?;
     if let Some(path) =
         config.get::<Option<ConfigRelativePath>>(&format!("path-bases.{}", base.as_str()))?
@@ -977,10 +981,7 @@ fn lookup_path_base<F: Files>(
     }
     match base.as_str() {
         "workspace" => Ok(inherit.ws_root()?.to_path_buf()),
-        _ => bail!(
-            "path base `{base}` is undefined. \
-             You must add an entry for `{base}` in the Cargo configuration [path-bases] table."
-        ),
+        _ => Err(InvalidManifest::UndefinedPathBase { base: base.to_string() }.into()),
     }
 }
 
@@ -988,7 +989,7 @@ fn load_inheritable_fields<F: Files>(
     ctx: &Context<F>,
     normalized_path: &Path,
     workspace_config: &WorkspaceConfig,
-) -> anyhow::Result<InheritableFields> {
+) -> Result<InheritableFields, ManifestError> {
     match workspace_config {
         WorkspaceConfig::Root(root) => Ok(root.inheritable.clone()),
         WorkspaceConfig::Member { root: Some(path_to_root) } => {
@@ -998,7 +999,7 @@ fn load_inheritable_fields<F: Files>(
         WorkspaceConfig::Member { root: None } => {
             match find_workspace_root(normalized_path, ctx)? {
                 Some(path_to_root) => inheritable_from_path(ctx, path_to_root),
-                None => Err(anyhow!("failed to find a workspace root")),
+                None => Err(InvalidManifest::NoWorkspaceRoot.into()),
             }
         }
     }
@@ -1007,7 +1008,7 @@ fn load_inheritable_fields<F: Files>(
 fn inheritable_from_path<F: Files>(
     ctx: &Context<F>,
     workspace_path: PathBuf,
-) -> anyhow::Result<InheritableFields> {
+) -> Result<InheritableFields, ManifestError> {
     let workspace_path_root = workspace_path.parent().unwrap();
     if let Some(ws_root) = ctx.ws_roots.borrow().get(workspace_path_root) {
         return Ok(ws_root.inheritable.clone());
@@ -1019,22 +1020,19 @@ fn inheritable_from_path<F: Files>(
             ctx.ws_roots.borrow_mut().insert(workspace_path, (**root).clone());
             Ok(root.inheritable.clone())
         }
-        _ => bail!("root of a workspace inferred but wasn't a root: {}", workspace_path.display()),
+        _ => Err(InvalidManifest::InferredRootNotRoot { path: workspace_path }.into()),
     }
 }
 
 fn lints_inherit_with(
     lints: manifest::InheritableLints,
-    get_ws_inheritable: impl FnOnce() -> anyhow::Result<TomlLints>,
-) -> anyhow::Result<TomlLints> {
+    get_ws_inheritable: impl FnOnce() -> Result<TomlLints, ManifestError>,
+) -> Result<TomlLints, ManifestError> {
     if lints.workspace {
         if !lints.lints.is_empty() {
-            bail!(
-                "cannot override `workspace.lints` in `lints`, either remove the overrides or `lints.workspace = true` and manually specify the lints"
-            );
+            return Err(InvalidManifest::OverrideWorkspaceLints.into());
         }
-        get_ws_inheritable()
-            .context("error inheriting `lints` from workspace root manifest's `workspace.lints`")
+        get_ws_inheritable().context(|| During::InheritLints)
     } else {
         Ok(lints.lints)
     }
@@ -1047,7 +1045,7 @@ fn inner_dependency_inherit_with<F: Files>(
     package_root: &Path,
     edition: Edition,
     warnings: &mut Vec<String>,
-) -> anyhow::Result<TomlDependency> {
+) -> Result<TomlDependency, ManifestError> {
     let ws_dep = inherit.fields()?.get_dependency(name, package_root)?;
     let mut merged_dep = match ws_dep {
         TomlDependency::Simple(ws_version) => {
@@ -1107,12 +1105,16 @@ pub(crate) fn deprecated_underscore<T>(
     kind: &str,
     edition: Edition,
     warnings: &mut Vec<String>,
-) -> anyhow::Result<()> {
+) -> Result<(), ManifestError> {
     let old_path = new_path.replace('-', "_");
     if old.is_some() && Edition::Edition2024 <= edition {
-        bail!(
-            "`{old_path}` is unsupported as of the 2024 edition; instead use `{new_path}`\n(in the `{name}` {kind})"
-        );
+        return Err(InvalidManifest::UnderscoreKey {
+            old_path,
+            new_path: new_path.to_owned(),
+            name: name.to_owned(),
+            kind: kind.to_owned(),
+        }
+        .into());
     } else if old.is_some() && new.is_some() {
         warnings.push(format!(
             "`{old_path}` is redundant with `{new_path}`, preferring `{new_path}` in the `{name}` {kind}"
@@ -1135,10 +1137,10 @@ fn to_real_manifest<F: Files>(
     manifest_file: &Path,
     ctx: &Context<F>,
     warnings: &mut Vec<String>,
-) -> anyhow::Result<Manifest> {
+) -> Result<Manifest, ManifestError> {
     let package_root = manifest_file.parent().unwrap();
     if !ctx.files().is_dir(package_root) {
-        bail!("package root '{}' is not a directory", package_root.display());
+        return Err(InvalidManifest::RootNotDirectory { path: package_root.to_owned() }.into());
     }
 
     let normalized_package =
@@ -1153,16 +1155,19 @@ fn to_real_manifest<F: Files>(
     let edition = if let Some(edition) =
         normalized_package.normalized_edition().expect("previously normalized")
     {
-        let edition: Edition = edition.parse().context("failed to parse the `edition` key")?;
+        let edition: Edition = edition.parse().context(|| During::EditionKey)?;
         if let Some(pkg_msrv) = &rust_version
             && let Some(edition_msrv) = edition.first_version()
         {
-            let edition_msrv = RustVersion::try_from(edition_msrv).unwrap();
+            let edition_msrv =
+                RustVersion::new(edition_msrv.major, edition_msrv.minor, edition_msrv.patch);
             if !edition_msrv.is_compatible_with(&pkg_msrv.to_partial()) {
-                bail!(
-                    "rust-version {pkg_msrv} is incompatible with the version ({edition_msrv}) required by \
-                         the specified edition ({edition})",
-                )
+                return Err(InvalidManifest::EditionRustVersion {
+                    rust_version: pkg_msrv.clone(),
+                    edition_version: edition_msrv,
+                    edition,
+                }
+                .into());
             }
         }
         edition
@@ -1173,8 +1178,7 @@ fn to_real_manifest<F: Files>(
                 .filter(|e| {
                     e.first_version()
                         .map(|e| {
-                            RustVersion::try_from(e)
-                                .unwrap()
+                            RustVersion::new(e.major, e.minor, e.patch)
                                 .is_compatible_with(&pkg_msrv.to_partial())
                         })
                         .unwrap_or_default()
@@ -1213,7 +1217,7 @@ fn to_real_manifest<F: Files>(
 
     if original_toml.project.is_some() {
         if Edition::Edition2024 <= edition {
-            bail!("`[project]` is not supported as of the 2024 Edition, please use `[package]`");
+            return Err(InvalidManifest::Project.into());
         } else {
             warnings.push("`[project]` is deprecated in favor of `[package]`".to_owned());
         }
@@ -1229,9 +1233,7 @@ fn to_real_manifest<F: Files>(
     ) {
         (None, None) => None,
         (Some(s), None) | (None, Some(s)) => Some(ResolveBehavior::from_manifest(s)?),
-        (Some(_), Some(_)) => {
-            bail!("cannot specify `resolver` field in both `[workspace]` and `[package]`")
-        }
+        (Some(_), Some(_)) => return Err(InvalidManifest::TwoResolvers.into()),
     };
 
     let targets = targets::to_targets(
@@ -1245,19 +1247,13 @@ fn to_real_manifest<F: Files>(
     )?;
 
     if targets.iter().all(|t| t.is_custom_build()) {
-        bail!(
-            "no targets specified in the manifest\n\
-             either src/lib.rs, src/main.rs, a [lib] section, or \
-             [[bin]] section must be present"
-        )
+        return Err(InvalidManifest::NoTargets.into());
     }
 
     if let Some(links) = &normalized_package.links
         && !targets.iter().any(|t| t.is_custom_build())
     {
-        bail!(
-            "package specifies that it links to `{links}` but does not have a custom build script"
-        )
+        return Err(InvalidManifest::LinksWithoutBuild { links: links.clone() }.into());
     }
 
     for (name, _) in original_toml.target.iter().flatten() {
@@ -1304,16 +1300,13 @@ fn to_real_manifest<F: Files>(
     let patch = patch(&normalized_toml, &mut manifest_ctx)?;
 
     {
-        let mut names_sources = HashMap::new_in(Global);
+        let mut names_sources = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for dep in &deps {
             let name = dep.name_in_toml();
             let prev = names_sources.insert(name, &dep.source_id);
             if prev.is_some() && prev != Some(&dep.source_id) {
-                bail!(
-                    "Dependency '{name}' has different source paths depending on the build \
-                     target. Each dependency must have a single canonical source path \
-                     irrespective of build target."
-                );
+                let name = name.to_owned();
+                return Err(InvalidManifest::SourcePerTarget { name }.into());
             }
         }
     }
@@ -1371,12 +1364,12 @@ fn to_real_manifest<F: Files>(
         None => version.is_none().then_some(vec![]),
     };
     if version.is_none() && publish != Some(vec![]) {
-        bail!("`package.publish` requires `package.version` be specified");
+        return Err(InvalidManifest::PublishWithoutVersion.into());
     }
 
     let package_id = PackageId {
         name: package_name.to_string(),
-        version: version.cloned().unwrap_or_else(|| semver::Version::new(0, 0, 0)),
+        version: version.cloned().unwrap_or(Version::new(0, 0, 0)),
         source_id,
     };
     // BTreeMap: `closest_msg` in `build_summary_features` breaks ties in its key order.
@@ -1401,19 +1394,14 @@ note: only a feature named `default` will be enabled by default"
     {
         let suggestion =
             closest_msg(run, targets.iter().filter(|t| t.is_bin()), |t| t.name.as_str(), "target");
-        bail!("default-run target `{run}` not found{suggestion}");
+        return Err(InvalidManifest::DefaultRun { run: run.clone(), suggestion }.into());
     }
 
     if normalized_package.im_a_teapot.is_some() {
-        features.require(Feature::test_dummy_unstable).context(
-            "the `im-a-teapot` manifest key is unstable and may not work properly in England",
-        )?;
+        features.require(Feature::test_dummy_unstable).context(|| During::ImATeapot)?;
     }
     if normalized_package.default_target.is_some() || normalized_package.forced_target.is_some() {
-        features.require(Feature::per_package_target).context(
-            "the `package.default-target` and `package.forced-target` \
-             manifest keys are unstable and may not work properly",
-        )?;
+        features.require(Feature::per_package_target).context(|| During::PerPackageTarget)?;
     }
 
     if normalized_package.license_file.is_some() && normalized_package.license.is_some() {
@@ -1457,7 +1445,7 @@ fn to_virtual_manifest<F: Files>(
     source_id: SourceId,
     manifest_file: &Path,
     ctx: &Context<F>,
-) -> anyhow::Result<VirtualManifest> {
+) -> Result<VirtualManifest, ManifestError> {
     let mut deps = Vec::new();
     let mut warnings = Vec::new();
     let (replace, patch) = {
@@ -1481,7 +1469,7 @@ fn to_virtual_manifest<F: Files>(
         .map(ResolveBehavior::from_manifest)
         .transpose()?;
     if let WorkspaceConfig::Member { .. } = &workspace_config {
-        bail!("virtual manifests must be configured with [workspace]");
+        return Err(InvalidManifest::VirtualMember.into());
     }
     Ok(VirtualManifest {
         replace,
@@ -1507,7 +1495,7 @@ fn gather_dependencies<F: Files>(
     manifest_ctx: &mut ManifestContext<'_, '_, F>,
     normalized_deps: Option<&BTreeMap<PackageName, manifest::InheritableDependency>>,
     kind: Option<DepKind>,
-) -> anyhow::Result<()> {
+) -> Result<(), ManifestError> {
     let Some(dependencies) = normalized_deps else {
         return Ok(());
     };
@@ -1522,40 +1510,33 @@ fn gather_dependencies<F: Files>(
 fn replace<F: Files>(
     me: &TomlManifest,
     manifest_ctx: &mut ManifestContext<'_, '_, F>,
-) -> anyhow::Result<Vec<(PackageIdSpec, Dependency)>> {
+) -> Result<Vec<(PackageIdSpec, Dependency)>, ManifestError> {
     if me.patch.is_some() && me.replace.is_some() {
-        bail!("cannot specify both [replace] and [patch]");
+        return Err(InvalidManifest::ReplaceAndPatch.into());
     }
     let mut replace = Vec::new();
     for (spec, replacement) in me.replace.iter().flatten() {
-        let mut spec = PackageIdSpec::parse(spec).with_context(|| {
-            format!(
-                "replacements must specify a valid semver \
-                 version to replace, but `{spec}` does not"
-            )
-        })?;
+        let mut spec =
+            PackageIdSpec::parse(spec).context(|| During::ReplaceSpec { spec: spec.clone() })?;
         if spec.url().is_none() {
-            spec.set_url(CRATES_IO_INDEX.parse().unwrap());
+            spec = spec.with_url(CRATES_IO_INDEX.parse().unwrap());
         }
         if replacement.is_version_specified() {
-            bail!(
-                "replacements cannot specify a version \
-                 requirement, but found one for `{spec}`"
-            );
+            return Err(InvalidManifest::ReplaceWithVersion { spec: spec.to_string() }.into());
         }
         let mut dep = dep_to_dependency(replacement, spec.name(), manifest_ctx, None)?;
-        let version = spec.version().ok_or_else(|| {
-            anyhow!("replacements must specify a version to replace, but `{spec}` does not")
-        })?;
-        dep.req = Some(semver::VersionReq {
-            comparators: vec![semver::Comparator {
-                op: semver::Op::Exact,
-                major: version.major,
-                minor: Some(version.minor),
-                patch: Some(version.patch),
-                pre: version.pre.clone(),
-            }],
+        let Some(version) = spec.version() else {
+            return Err(InvalidManifest::ReplaceWithoutVersion { spec: spec.to_string() }.into());
+        };
+        let mut comparators = blaze_own::Vec::new_in(Global);
+        comparators.push(Comparator {
+            op: Op::Exact,
+            major: version.major,
+            minor: Some(version.minor),
+            patch: Some(version.patch),
+            pre: version.pre.clone(),
         });
+        dep.req = Some(VersionReq { comparators });
         replace.push((spec, dep));
     }
     Ok(replace)
@@ -1564,30 +1545,22 @@ fn replace<F: Files>(
 fn patch<F: Files>(
     me: &TomlManifest,
     manifest_ctx: &mut ManifestContext<'_, '_, F>,
-) -> anyhow::Result<HashMap<Url, Vec<Dependency>, Global>> {
-    let mut patch = HashMap::new_in(Global);
+) -> Result<Map<Url, Vec<Dependency>, FixedState, Global>, ManifestError> {
+    let mut patch = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     for (toml_url, deps) in me.patch.iter().flatten() {
         let url = match &toml_url[..] {
             CRATES_IO_REGISTRY => CRATES_IO_INDEX.parse().unwrap(),
             _ => manifest_ctx
                 .config
                 .registry_index(toml_url)
-                .or_else(|_| into_url(toml_url))
-                .with_context(|| {
-                    format!(
-                        "[patch] entry `{toml_url}` should be a URL or registry name{}",
-                        if toml_url == "crates" {
-                            "\nFor crates.io, use [patch.crates-io] (with a dash)"
-                        } else {
-                            ""
-                        }
-                    )
-                })?,
+                .map_err(ManifestError::from)
+                .or_else(|_| into_url(toml_url).map_err(ManifestError::from))
+                .context(|| During::PatchEntry { url: toml_url.clone() })?,
         };
         let deps = deps
             .iter()
             .map(|(name, dep)| dep_to_dependency(dep, name, manifest_ctx, None))
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>, ManifestError>>()?;
         patch.insert(url, deps);
     }
     Ok(patch)
@@ -1598,7 +1571,7 @@ fn dep_to_dependency<F: Files>(
     name_in_toml: &str,
     manifest_ctx: &mut ManifestContext<'_, '_, F>,
     kind: Option<DepKind>,
-) -> anyhow::Result<Dependency> {
+) -> Result<Dependency, ManifestError> {
     let simple;
     let orig = match orig {
         TomlDependency::Simple(version) => {
@@ -1609,12 +1582,9 @@ fn dep_to_dependency<F: Files>(
         TomlDependency::Detailed(details) => details,
     };
 
+    let name = || name_in_toml.to_owned();
     if orig.version.is_none() && orig.path.is_none() && orig.git.is_none() {
-        bail!(
-            "dependency ({name_in_toml}) specified without \
-             providing a local path, Git repository, version, or \
-             workspace dependency to use"
-        );
+        return Err(InvalidManifest::DependencyWithoutSource { name: name() }.into());
     }
 
     if let Some(version) = &orig.version
@@ -1630,7 +1600,8 @@ fn dep_to_dependency<F: Files>(
     if orig.git.is_none() {
         for (key, key_name) in [(&orig.branch, "branch"), (&orig.tag, "tag"), (&orig.rev, "rev")] {
             if key.is_some() {
-                bail!("key `{key_name}` is ignored for dependency ({name_in_toml}).");
+                let name = name();
+                return Err(InvalidManifest::GitKeyWithoutGit { key: key_name, name }.into());
             }
         }
     }
@@ -1638,22 +1609,12 @@ fn dep_to_dependency<F: Files>(
     if let Some(features) = &orig.features {
         for feature in features {
             if feature.contains('/') {
-                bail!(
-                    "feature `{feature}` in dependency `{name_in_toml}` is not allowed to contain slashes\n\
-                     If you want to enable features of a transitive dependency, \
-                     the direct dependency needs to re-export those features from \
-                     the `[features]` table."
-                );
+                let feature = feature.clone();
+                return Err(InvalidManifest::FeatureSlash { feature, name: name() }.into());
             }
             if feature.starts_with("dep:") {
-                bail!(
-                    "feature `{feature}` in dependency `{name_in_toml}` is not allowed to use explicit \
-                     `dep:` syntax\n\
-                     If you want to enable an optional dependency, specify the name \
-                     of the optional dependency without the `dep:` prefix, or specify \
-                     a feature from the dependency's `[features]` table that enables \
-                     the optional dependency."
-                );
+                let feature = feature.clone();
+                return Err(InvalidManifest::FeatureDepSyntax { feature, name: name() }.into());
             }
         }
     }
@@ -1689,30 +1650,28 @@ fn dep_to_dependency<F: Files>(
         && !crate::dependency::Artifact::asks_gpu(&artifact.0)
         && !manifest_ctx.config.bindeps()
     {
-        bail!("`artifact = …` requires `-Z bindeps` ({name_in_toml})");
+        return Err(InvalidManifest::ArtifactWithoutBindeps { name: name() }.into());
     }
     match (&orig.artifact, orig.lib, orig.target.as_deref()) {
         (Some(artifact), lib, target) => {
             let artifact =
                 crate::dependency::Artifact::parse(&artifact.0, lib.unwrap_or(false), target)?;
             if dep.kind != DepKind::Build && artifact.target.as_deref() == Some("target") {
-                bail!(
-                    r#"`target = "target"` in normal- or dev-dependencies has no effect ({name_in_toml})"#
-                );
+                return Err(InvalidManifest::TargetTargetNotBuild { name: name() }.into());
             }
             if artifact.is_gpu() && dep.kind == DepKind::Build {
-                bail!(
-                    "artifact `gpu` (blaze's device build) is for a normal or dev dependency, not a build dependency ({name_in_toml})"
-                );
+                return Err(InvalidManifest::GpuBuildDependency { name: name() }.into());
             }
             dep.artifact = Some(artifact);
         }
         (None, Some(_), _) => {
-            bail!("'lib' specifier cannot be used without an 'artifact = …' value ({name_in_toml})")
+            let name = name();
+            return Err(InvalidManifest::ArtifactKeyWithoutArtifact { key: "lib", name }.into());
         }
-        (None, None, Some(_)) => bail!(
-            "'target' specifier cannot be used without an 'artifact = …' value ({name_in_toml})"
-        ),
+        (None, None, Some(_)) => {
+            let name = name();
+            return Err(InvalidManifest::ArtifactKeyWithoutArtifact { key: "target", name }.into());
+        }
         (None, None, None) => {}
     }
     Ok(dep)
@@ -1722,29 +1681,32 @@ fn to_dependency_source_id<F: Files>(
     orig: &TomlDetailedDependency,
     name_in_toml: &str,
     manifest_ctx: &mut ManifestContext<'_, '_, F>,
-) -> anyhow::Result<SourceId> {
+) -> Result<SourceId, ManifestError> {
     match (
         orig.git.as_ref(),
         orig.path.as_ref(),
         orig.registry.as_deref(),
         orig.registry_index.as_ref(),
     ) {
-        (Some(_git), Some(_path), _, _) => bail!(
-            "dependency ({name_in_toml}) specification is ambiguous. \
-             Only one of `git` or `path` is allowed.",
-        ),
-        (_, _, Some(_registry), Some(_registry_index)) => bail!(
-            "dependency ({name_in_toml}) specification is ambiguous. \
-             Only one of `registry` or `registry-index` is allowed.",
-        ),
+        (Some(_git), Some(_path), _, _) => Err(InvalidManifest::Ambiguous {
+            name: name_in_toml.to_owned(),
+            keys: "`git` or `path`",
+        }
+        .into()),
+        (_, _, Some(_registry), Some(_registry_index)) => Err(InvalidManifest::Ambiguous {
+            name: name_in_toml.to_owned(),
+            keys: "`registry` or `registry-index`",
+        }
+        .into()),
         (Some(git), None, _, _) => {
             let n_details =
                 [&orig.branch, &orig.tag, &orig.rev].iter().filter(|d| d.is_some()).count();
             if n_details > 1 {
-                bail!(
-                    "dependency ({name_in_toml}) specification is ambiguous. \
-                     Only one of `branch`, `tag` or `rev` is allowed.",
-                );
+                return Err(InvalidManifest::Ambiguous {
+                    name: name_in_toml.to_owned(),
+                    keys: "`branch`, `tag` or `rev`",
+                }
+                .into());
             }
             let reference = orig
                 .branch
@@ -1761,25 +1723,28 @@ fn to_dependency_source_id<F: Files>(
                      use `rev = \"{fragment}\"` in the dependency declaration.",
                 ));
             }
-            SourceId::for_git(&loc, reference)
+            Ok(SourceId::for_git(&loc, reference)?)
         }
         (None, Some(path), _, _) => {
             if manifest_ctx.source_id.is_path() {
                 let path = manifest_ctx.file.parent().unwrap().join(path);
-                SourceId::for_path(&normalize_path(&path))
+                Ok(SourceId::for_path(&normalize_path(&path))?)
             } else {
                 Ok(manifest_ctx.source_id)
             }
         }
         (None, None, Some(registry), None) => source::alt_registry(manifest_ctx.config, registry),
         (None, None, None, Some(registry_index)) => {
-            SourceId::for_registry(&into_url(registry_index)?)
+            Ok(SourceId::for_registry(&into_url(registry_index)?)?)
         }
         (None, None, None, None) => source::crates_io(manifest_ctx.config),
     }
 }
 
-fn verify_lints(lints: Option<&TomlLints>, warnings: &mut Vec<String>) -> anyhow::Result<()> {
+fn verify_lints(
+    lints: Option<&TomlLints>,
+    warnings: &mut Vec<String>,
+) -> Result<(), ManifestError> {
     let Some(lints) = lints else {
         return Ok(());
     };
@@ -1795,15 +1760,233 @@ supported tools: {}",
         }
         for name in lints.keys() {
             if let Some((prefix, suffix)) = name.split_once("::") {
-                if tool == prefix || (tool == "rust" && supported.contains(&prefix)) {
-                    bail!(
-                        "`lints.{tool}.{name}` is not valid lint name; try `lints.{prefix}.{suffix}`"
-                    )
-                } else {
-                    bail!("`lints.{tool}.{name}` is not a valid lint name")
+                let known_prefix = tool == prefix || (tool == "rust" && supported.contains(&prefix));
+                let try_instead = known_prefix.then(|| format!("lints.{prefix}.{suffix}"));
+                return Err(InvalidManifest::LintName {
+                    lint: format!("lints.{tool}.{name}"),
+                    try_instead,
                 }
+                .into());
             }
         }
     }
     Ok(())
 }
+
+/// A manifest that parses and fits the schema but that cargo refuses, each with cargo's message.
+#[derive(Debug)]
+pub enum InvalidManifest {
+    WorkspacePackageField { key: &'static str },
+    WorkspaceDependencies,
+    WorkspaceDependency { name: String },
+    WorkspaceLints,
+    Unrelatable { label: String, old_root: PathBuf, new_root: PathBuf },
+    NotUtf8Path { label: String, path: PathBuf },
+    RequiresScript { path: PathBuf },
+    NeitherPackageNorWorkspace,
+    OptionalWorkspaceDependency { name: String },
+    PublicWorkspaceDependency { name: String },
+    BothWorkspaces,
+    VirtualWithPackageField { field: &'static str },
+    MissingPackageName,
+    BaseWithoutPath,
+    UndefinedPathBase { base: String },
+    NoWorkspaceRoot,
+    InferredRootNotRoot { path: PathBuf },
+    OverrideWorkspaceLints,
+    UnderscoreKey { old_path: String, new_path: String, name: String, kind: String },
+    RootNotDirectory { path: PathBuf },
+    EditionRustVersion {
+        rust_version: RustVersion,
+        edition_version: RustVersion,
+        edition: Edition,
+    },
+    Project,
+    TwoResolvers,
+    NoTargets,
+    LinksWithoutBuild { links: String },
+    SourcePerTarget { name: String },
+    PublishWithoutVersion,
+    DefaultRun { run: String, suggestion: String },
+    VirtualMember,
+    ReplaceAndPatch,
+    ReplaceWithVersion { spec: String },
+    ReplaceWithoutVersion { spec: String },
+    DependencyWithoutSource { name: String },
+    GitKeyWithoutGit { key: &'static str, name: String },
+    FeatureSlash { feature: String, name: String },
+    FeatureDepSyntax { feature: String, name: String },
+    ArtifactWithoutBindeps { name: String },
+    TargetTargetNotBuild { name: String },
+    GpuBuildDependency { name: String },
+    ArtifactKeyWithoutArtifact { key: &'static str, name: String },
+    Ambiguous { name: String, keys: &'static str },
+    LintName { lint: String, try_instead: Option<String> },
+}
+
+impl fmt::Display for InvalidManifest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use InvalidManifest as I;
+        match self {
+            I::WorkspacePackageField { key } => {
+                write!(f, "`workspace.package.{key}` was not defined")
+            }
+            I::WorkspaceDependencies => f.write_str("`workspace.dependencies` was not defined"),
+            I::WorkspaceDependency { name } => {
+                write!(f, "`dependency.{name}` was not found in `workspace.dependencies`")
+            }
+            I::WorkspaceLints => f.write_str("`workspace.lints` was not defined"),
+            I::Unrelatable { label, old_root, new_root } => write!(
+                f,
+                "`{label}` was defined in {} but could not be resolved with {}",
+                old_root.display(),
+                new_root.display()
+            ),
+            I::NotUtf8Path { label, path } => {
+                write!(f, "`{label}` resolved to non-UTF value (`{}`)", path.display())
+            }
+            I::RequiresScript { path } => {
+                write!(f, "parsing `{}` requires `-Zscript`", path.display())
+            }
+            I::NeitherPackageNorWorkspace => {
+                f.write_str("manifest is missing either a `[package]` or a `[workspace]`")
+            }
+            I::OptionalWorkspaceDependency { name } => {
+                write!(f, "{name} is optional, but workspace dependencies cannot be optional")
+            }
+            I::PublicWorkspaceDependency { name } => {
+                write!(f, "{name} is public, but workspace dependencies cannot be public")
+            }
+            I::BothWorkspaces => f.write_str(
+                "cannot configure both `package.workspace` and `[workspace]`, only one can be \
+                 specified",
+            ),
+            I::VirtualWithPackageField { field } => {
+                write!(
+                    f,
+                    "this virtual manifest specifies a `{field}` section, which is not allowed"
+                )?;
+                if *field == "lints" {
+                    f.write_str("\nhelp: a similar field exists: `[workspace.lints]`")?;
+                }
+                Ok(())
+            }
+            I::MissingPackageName => f.write_str("missing field `package.name`"),
+            I::BaseWithoutPath => f.write_str("`base` can only be used with path dependencies"),
+            I::UndefinedPathBase { base } => write!(
+                f,
+                "path base `{base}` is undefined. You must add an entry for `{base}` in the Cargo \
+                 configuration [path-bases] table."
+            ),
+            I::NoWorkspaceRoot => f.write_str("failed to find a workspace root"),
+            I::InferredRootNotRoot { path } => {
+                write!(f, "root of a workspace inferred but wasn't a root: {}", path.display())
+            }
+            I::OverrideWorkspaceLints => f.write_str(
+                "cannot override `workspace.lints` in `lints`, either remove the overrides or \
+                 `lints.workspace = true` and manually specify the lints",
+            ),
+            I::UnderscoreKey { old_path, new_path, name, kind } => write!(
+                f,
+                "`{old_path}` is unsupported as of the 2024 edition; instead use `{new_path}`\n\
+                 (in the `{name}` {kind})"
+            ),
+            I::RootNotDirectory { path } => {
+                write!(f, "package root '{}' is not a directory", path.display())
+            }
+            I::EditionRustVersion { rust_version, edition_version, edition } => write!(
+                f,
+                "rust-version {rust_version} is incompatible with the version ({edition_version}) \
+                 required by the specified edition ({edition})"
+            ),
+            I::Project => f.write_str(
+                "`[project]` is not supported as of the 2024 Edition, please use `[package]`",
+            ),
+            I::TwoResolvers => {
+                f.write_str("cannot specify `resolver` field in both `[workspace]` and `[package]`")
+            }
+            I::NoTargets => f.write_str(
+                "no targets specified in the manifest\neither src/lib.rs, src/main.rs, a [lib] \
+                 section, or [[bin]] section must be present",
+            ),
+            I::LinksWithoutBuild { links } => write!(
+                f,
+                "package specifies that it links to `{links}` but does not have a custom build \
+                 script"
+            ),
+            I::SourcePerTarget { name } => write!(
+                f,
+                "Dependency '{name}' has different source paths depending on the build target. \
+                 Each dependency must have a single canonical source path irrespective of build \
+                 target."
+            ),
+            I::PublishWithoutVersion => {
+                f.write_str("`package.publish` requires `package.version` be specified")
+            }
+            I::DefaultRun { run, suggestion } => {
+                write!(f, "default-run target `{run}` not found{suggestion}")
+            }
+            I::VirtualMember => {
+                f.write_str("virtual manifests must be configured with [workspace]")
+            }
+            I::ReplaceAndPatch => f.write_str("cannot specify both [replace] and [patch]"),
+            I::ReplaceWithVersion { spec } => write!(
+                f,
+                "replacements cannot specify a version requirement, but found one for `{spec}`"
+            ),
+            I::ReplaceWithoutVersion { spec } => write!(
+                f,
+                "replacements must specify a version to replace, but `{spec}` does not"
+            ),
+            I::DependencyWithoutSource { name } => write!(
+                f,
+                "dependency ({name}) specified without providing a local path, Git repository, \
+                 version, or workspace dependency to use"
+            ),
+            I::GitKeyWithoutGit { key, name } => {
+                write!(f, "key `{key}` is ignored for dependency ({name}).")
+            }
+            I::FeatureSlash { feature, name } => write!(
+                f,
+                "feature `{feature}` in dependency `{name}` is not allowed to contain slashes\n\
+                 If you want to enable features of a transitive dependency, the direct dependency \
+                 needs to re-export those features from the `[features]` table."
+            ),
+            I::FeatureDepSyntax { feature, name } => write!(
+                f,
+                "feature `{feature}` in dependency `{name}` is not allowed to use explicit `dep:` \
+                 syntax\nIf you want to enable an optional dependency, specify the name of the \
+                 optional dependency without the `dep:` prefix, or specify a feature from the \
+                 dependency's `[features]` table that enables the optional dependency."
+            ),
+            I::ArtifactWithoutBindeps { name } => {
+                write!(f, "`artifact = …` requires `-Z bindeps` ({name})")
+            }
+            I::TargetTargetNotBuild { name } => write!(
+                f,
+                "`target = \"target\"` in normal- or dev-dependencies has no effect ({name})"
+            ),
+            I::GpuBuildDependency { name } => write!(
+                f,
+                "artifact `gpu` (blaze's device build) is for a normal or dev dependency, not a \
+                 build dependency ({name})"
+            ),
+            I::ArtifactKeyWithoutArtifact { key, name } => write!(
+                f,
+                "'{key}' specifier cannot be used without an 'artifact = …' value ({name})"
+            ),
+            I::Ambiguous { name, keys } => write!(
+                f,
+                "dependency ({name}) specification is ambiguous. Only one of {keys} is allowed."
+            ),
+            I::LintName { lint, try_instead: Some(instead) } => {
+                write!(f, "`{lint}` is not valid lint name; try `{instead}`")
+            }
+            I::LintName { lint, try_instead: None } => {
+                write!(f, "`{lint}` is not a valid lint name")
+            }
+        }
+    }
+}
+
+impl core::error::Error for InvalidManifest {}

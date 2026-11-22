@@ -1,0 +1,15 @@
+{
+ "id": "by-value-seam-methods-shadow-inherent",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane CELL",
+ "where": "crates/blaze-scope/src/names/seam.rs (ScopeRead, RootRead) beside blaze-surface's ScopeView and CrateRootView inherent methods; met in crates/blaze-scope/src/names_cells.rs",
+ "what": "With `ScopeRead`/`RootRead` in scope, `view.globs()`, `view.textual()`, `root.macro_use()` and `root.head()` pick the TRAIT method (it takes `self` by value, found before the inherent `&self` one), so the call takes other arguments or returns `Globs` instead of an iterator, and `head()` needs a type annotation for `N`. Three compile rounds to see it.",
+ "cost": "three runner rounds, about two minutes",
+ "cause": "the seam's methods share names with the views' inherent methods but differ in receiver and signature",
+ "whys": "the seam was written to read like the views; Rust's method probe takes by-value matches first",
+ "class": "a trait sharing method names but not signatures with an inherent API of the types it is implemented for",
+ "prevention": "not done: rename the seam's methods (e.g. `edges`, `textual_before`, `macro_use_at`) or make the receiver `&self`; today names_cells.rs calls the inherent ones by path (`ScopeView::globs(&view)`)",
+ "annoyance": "the runner hides a passing test's printed floor line (no --nocapture)",
+ "workaround": "call the inherent method by its path",
+ "state": "open"
+}

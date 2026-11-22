@@ -1,0 +1,35 @@
+[package]
+name = "blaze-world-api"
+description = "The world interface's schema, version 1 (docs/v2/plan/design/world.md, row W0): a world is a value named by its tree's digest; open, patch, read, check, diff, commit and explain as one request and one response each, in deterministic CBOR with integer keys and limits checked before allocation; the JSON rendering; and the sans-IO session of one connection. Nothing behind it yet; tools/world/ is its TypeScript client"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The one deterministic CBOR: its head writers and its bounded field reader.
+blaze-cbor.workspace = true
+# The JSON rendering is a `Value` (blaze-json writes and reads its text).
+blaze-data.workspace = true
+# `ItemKey`: the item a read, a target, a finding or an edit names.
+blaze-id.workspace = true
+# `Vec` and `String` in the caller's allocator.
+blaze-own.workspace = true
+
+[dev-dependencies]
+# The golden vectors' file is JSON (tools/world/vectors.json).
+blaze-json.workspace = true
+# The allocator the tests hand in.
+blaze-mem.workspace = true
+# The round trip as a property.
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

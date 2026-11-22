@@ -1,0 +1,10 @@
+error  an `async` block is not supported by this build of blaze yet
+  ╭─ src/run.rs:2:22
+1 │ fn run() {
+2 │     let task = spawn(async {
+  │                      ^^^^^^^
+  ⋮
+8 │     });
+  │     ^
+  │     ╰─ this block
+  ╰─ blaze explain ladder:async

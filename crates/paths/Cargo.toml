@@ -12,8 +12,8 @@ rust-version.workspace = true
 [lib]
 doctest = false
 
+# Nothing: `Utf8Path` is this crate's own (`utf8`).
 [dependencies]
-camino.workspace = true
 
 [lints]
 workspace = true

@@ -1,0 +1,8 @@
+error  a bare `as` cast to an integer
+   ╭─ src/fold.rs:34:18
+ 2 │ pub fn fold(rows: &[Row]) -> Total {
+   ⋮
+34 │     total.finish(rows.len() as u64)
+   │                  ^^^^^^^^^^^^^^^^^
+   │                  ╰─ use `u64::try_from`
+   ╰─ blaze explain lint:casts

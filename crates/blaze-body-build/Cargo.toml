@@ -1,0 +1,37 @@
+[package]
+name = "blaze-body-build"
+description = "One drop-elaborated body (blaze-body) at one instance's ground arguments to one LIR function: blocks to blocks, rows to instructions, deciding nothing the body says (docs/v2/plan/design/backend-next.md, \"One lowering\", D119); the second instantiation of the build seam beside blaze-build's walk"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The input: the verified body (`Verified`) and its rows.
+blaze-body.workspace = true
+# The pieces that do not depend on the walk: `Adts` (the facts seam), `Subst`, `Built`, `Instance`,
+# `ground`, `Layouts`, `needs_drop`, `PanicConst`, and the ABI and scalar helpers this crate asks
+# to be made public (the report lists each).
+blaze-build.workspace = true
+# The output: one function's columns, made with `Builder` and checked on finish.
+blaze-lir.workspace = true
+# `PTy`, `PTys`, `PNode`, `ItemKey`, `List`: the body's types and the ground table.
+blaze-typeck.workspace = true
+# `Alloc`: the allocator grounding's scratch columns are in.
+blaze-own.workspace = true
+
+[dev-dependencies]
+# The evaluator every test runs the built function on.
+blaze-lir = { workspace = true, features = ["eval"] }
+# `Alloc::global()`, named only at the tests' top.
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

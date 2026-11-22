@@ -1,12 +1,17 @@
 //! What every record of this crate is written and read with: a column's place, a record's
 //! string table, offsets in a buffer, and the checks a view makes once when it is read.
 
-use core::alloc::Allocator;
 use core::ops::Range;
 
 use blaze_format::{FormatError, Record, Slice, Writer};
+use blaze_own::{AVec, Alloc};
 
 use crate::error::BuildError;
+
+/// A finished record's bytes, as blaze-format's [`Writer::finish`] hands them back: its
+/// `std` vector until blaze-format moves onto blaze-own, the one place this crate names `std`'s
+/// collections outside a `record!` expansion.
+pub type RecordBytes<'a> = std::vec::Vec<u8, Alloc<'a>>;
 
 /// No row: a parent at the top, an item index not given.
 pub(crate) const NONE: u32 = u32::MAX;
@@ -53,8 +58,8 @@ pub(crate) fn count(len: usize, table: &'static str) -> Result<u32, BuildError> 
     u32::try_from(len).map_err(|_| BuildError::TooLarge { table })
 }
 
-/// Where a column was written: nowhere when it is empty. Generic over the writer's allocator,
-/// which blaze-format's `Placed` is not.
+/// Where a column was written: nowhere when it is empty. Over the writer's allocator, which
+/// blaze-format's `Placed` is not.
 #[derive(Clone, Copy)]
 pub(crate) struct Column {
     at: u64,
@@ -63,7 +68,7 @@ pub(crate) struct Column {
 
 impl Column {
     /// Writes `values` as a column; an empty one writes nothing.
-    pub(crate) fn push<T: Record, A: Allocator>(out: &mut Writer<A>, values: &[T]) -> Column {
+    pub(crate) fn push<T: Record>(out: &mut Writer<Alloc<'_>>, values: &[T]) -> Column {
         match values.is_empty() {
             true => Column { at: 0, len: 0 },
             false => Column { at: out.push_slice(values), len: values.len() },
@@ -81,10 +86,10 @@ impl Column {
 
 /// Pushes `root` as the last record of `out` and finishes the buffer with it as its root.
 /// `make` builds the root from where it will be written, so its slices can be made.
-pub(crate) fn finish_with<R: Record, A: Allocator>(
-    mut out: Writer<A>,
+pub(crate) fn finish_with<'a, R: Record>(
+    mut out: Writer<Alloc<'a>>,
     make: impl FnOnce(u64) -> R,
-) -> Vec<u8, A> {
+) -> RecordBytes<'a> {
     let at = out.next::<R>();
     let root = make(at);
     let written = out.push(&root);
@@ -98,13 +103,13 @@ pub(crate) fn finish_with<R: Record, A: Allocator>(
 /// A builder pushes each name into a staging table as it is given, and at its end into the
 /// record's table in the record's own order ([`Strings::moved`]): two builders given the same
 /// rows in another order write equal bytes (rule 25).
-pub(crate) struct Strings<A: Allocator> {
-    bytes: Vec<u8, A>,
+pub(crate) struct Strings<'a> {
+    bytes: AVec<'a, u8>,
 }
 
-impl<A: Allocator> Strings<A> {
-    pub(crate) fn new_in(alloc: A) -> Strings<A> {
-        Strings { bytes: Vec::new_in(alloc) }
+impl<'a> Strings<'a> {
+    pub(crate) fn new_in(alloc: Alloc<'a>) -> Strings<'a> {
+        Strings { bytes: AVec::new_in(alloc) }
     }
 
     /// Appends `text`, refused when the table would pass `u32::MAX` bytes.
@@ -123,9 +128,9 @@ impl<A: Allocator> Strings<A> {
     }
 
     /// Appends the text `text` names in `staging` to this table.
-    pub(crate) fn moved<B: Allocator>(
+    pub(crate) fn moved(
         &mut self,
-        staging: &Strings<B>,
+        staging: &Strings<'_>,
         text: Text,
         table: &'static str,
     ) -> Result<Text, BuildError> {
@@ -177,20 +182,6 @@ pub(crate) fn check_increasing<T: Record, K: Ord>(
     match rows.windows(2).find(|pair| key(&pair[0]) >= key(&pair[1])) {
         None => Ok(()),
         Some(pair) => Err(FormatError::Invalid { at: at_of_record(&pair[1], buffer), what }),
-    }
-}
-
-/// Whether `index`, a row's reference to another row, is [`NONE`] or below `len`.
-pub(crate) fn check_index<T: Record>(
-    index: u32,
-    len: usize,
-    row: &T,
-    buffer: &[u8],
-    what: &'static str,
-) -> Result<(), FormatError> {
-    match index == NONE || wide(index) < len {
-        true => Ok(()),
-        false => Err(FormatError::Invalid { at: at_of_record(row, buffer), what }),
     }
 }
 

@@ -1,0 +1,15 @@
+{
+ "id": "runner-hides-passing-counters",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane SW",
+ "where": "the build queue (/Volumes/Projects/blaze-int-1112-notes/runner.py ask) and crates/blaze-ladder/tests/front2_solver_cost.rs",
+ "what": "a cost test prints its counter table with println!, but the runner shows a test's output only when it fails, so reading the counters after a change took a temporary panic! at the end of the test, one extra queue round, and care to remove it before the admitting ask. Separately, blaze-solve has two traits named Source (facts::Source, the pull, and assembly::Source, a candidate's origin), so eval.rs imports the first as FactSource.",
+ "cost": "three extra queue rounds (about 3 minutes each) and the risk of admitting a test that always panics",
+ "cause": "the runner reports pass/fail lines only; a measurement test has no channel for its numbers on a pass",
+ "whys": "the queue was built for verdicts, not for measurements; cost tests are both",
+ "class": "a measurement read through a failure: any counter wanted on a pass has to fail a test to be seen",
+ "prevention": "wanted: `runner.py ask --show <test>` printing a named test's stdout on a pass, or the runner keeping each test's stdout in a file named in its answer",
+ "annoyance": "temporary panics to see counters; two traits named Source in one crate",
+ "workaround": "a panic!(\"...TEMPORARY...\") removed before the admitting ask",
+ "state": "open"
+}

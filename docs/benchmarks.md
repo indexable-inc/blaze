@@ -1,6 +1,7 @@
 ---
-status: current
-summary: How long an edit takes to build, the memory and disk it uses and how fast its programs run, against cargo, on three platforms.
+status: record
+summary: blaze v1's benchmarks against cargo on three platforms (edit, memory, disk, runtime), measured by harness/bench.py, deleted with the daemon on 2026-11-15.
+date: 2026-10-25
 ---
 # Benchmarks
 
@@ -485,7 +486,7 @@ builds it in a few minutes on the same machine. Its build needs `nix develop .#b
 ## Fairness
 
 - Same machine, same source, same moment: the two builds alternate after every edit.
-- Same toolchain on both sides: the pinned nightly (`harness/toolchain`, `nightly-2026-10-25`;
+- Same toolchain on both sides: the pinned nightly (`pins/toolchain`, `nightly-2026-10-25`;
   the runs dated before 2026-10-25 were on Rust 1.99.0), from the flake's
   `devShells.bench`, which also pins LLVM 23 for the LLVM tier.
 - Cargo is warm and incremental: the dev profile's default (`CARGO_INCREMENTAL` unset).
@@ -529,7 +530,7 @@ into a target directory of its own, right after plain cargo, on the same source:
 The flags go in through `--config target.'cfg(all())'.rustflags`, which cargo adds to each
 project's own (helix sets `--cfg tokio_unstable` there; `RUSTFLAGS` would replace it).
 `-Zshare-generics` is not a column: it is already on in every debug build. The nightly is
-`harness/toolchain`'s, `rust-bin.nightly.<date>` with `rustc-codegen-cranelift-preview`, from
+`pins/toolchain`'s, `rust-bin.nightly.<date>` with `rustc-codegen-cranelift-preview`, from
 the flake (`BLAZE_NIGHTLY`; `rust-bin.nightly."2026-10-09"` in the runs before 2026-10-25). A setup that cannot build a project is reported as failed and not timed
 after that.
 
@@ -648,9 +649,9 @@ when:
 It then draws [the trends](#over-time) again (`harness/benchcharts.py`, after the history below is
 appended) and commits those files to main as `github-actions[bot]` with `[skip ci]` in the
 message (so the commit starts no other workflow), once for every platform, rebasing onto main if
-main moved during the run (`.github/scripts/bench_commit.py`, which bench-counts.yaml and
-live-latency.yaml commit through too). bench-readme, bench-counts and live-latency each draw
-every trend, so two of them running at once can conflict in the trend charts and sections: a
+main moved during the run (`.github/scripts/bench_commit.py`, which bench-counts.yaml
+commits through too). bench-readme and bench-counts each draw
+every trend, so the two running at once can conflict in the trend charts and sections: a
 conflict only there is settled by drawing them again from the merged history, and one anywhere
 else stops the commit with the files named. It pushes with the secret `BLAZE_BOT_TOKEN`, a repository admin's token, which
 the ruleset on main lets past its required check; the job's own `GITHUB_TOKEN` is refused
@@ -740,17 +741,9 @@ builds now is a regression whatever its time. On a regression the workflow opens
 labelled `bench-regression` with a table of what moved (or comments on the one already open),
 writes the table to the run's summary and fails.
 
-Live edits are checked the same way. `.github/workflows/live-latency.yaml` runs every night on
-main on a GitHub macOS arm64 runner (`macos-15`), times edits of the four live programs through
-`blaze build` (`harness/live_latency.py cargo`; its socket, burst and replay modes are refused
-until they are clients of `blaze_api::client`, [live.md](live.md#latency-under-typing)), appends
-one line for all of them to `docs/benchmarks/history/macos-arm64-live.jsonl`, checks the p50
-and p90 of each program and mode (floor 1 ms), and draws the trends again before it commits. A shared runner is noisier than the benchmark
-machine; the band widens with the spread its own history shows.
-
 ## Run it yourself
 
-As v1 was measured (against v2 this stops where [the top of the page](#benchmarks) says), on any of the platforms with Nix (or with the pinned nightly of `harness/toolchain`, the pinned LLVM 23 and Python 3 installed; ripgrep's run searches blaze's `library/`, not a rust-src):
+As v1 was measured (against v2 this stops where [the top of the page](#benchmarks) says), on any of the platforms with Nix (or with the pinned nightly of `pins/toolchain`, the pinned LLVM 23 and Python 3 installed; ripgrep's run searches blaze's `library/`, not a rust-src):
 
 ```
 nix develop .#bench
@@ -776,11 +769,6 @@ every table and chart again from the stored results.
 
 ## Caveats
 
-- Live edits (the patch applied to a running program) work on macOS on Apple silicon only and are
-  measured there by `harness/live_latency.py`, one edit at a time through `blaze build` (its
-  per-keystroke modes wait on a `blaze_api::client` port): [live.md](live.md#latency-under-typing)
-  has the numbers once measured on a MacBook, and
-  `history/macos-arm64-live.jsonl` the runs.
 - One machine, one OS. The numbers on a laptop will differ; the ratios are what carries over.
 - Cold is the least precise number here: five runs at most, each minutes long on the large
   projects.

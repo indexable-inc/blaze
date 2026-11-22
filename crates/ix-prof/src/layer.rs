@@ -1,18 +1,21 @@
-//! The tracing layer, a driver: each span's life (new, record, enter, exit, close) into the
+//! The tracing sink, a driver: each span's life (new, record, enter, exit, close) into the
 //! recorder, with the thread's CPU time and allocation counts at enter and exit. Off, each
 //! callback is one relaxed load.
 //!
 //! A span is a wait when it has a field `wait` (its kind), with `on` (what it waits for) and
 //! `owner` (who will wake it); `kind = "poll"` and `task = <id>` mark an async poll.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use tracing::{
-    Subscriber,
-    field::{Field, Visit},
-    span::{Attributes, Id, Record},
+use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    sync::atomic::{AtomicU64, Ordering},
 };
-use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
+
+use blaze_core::lock::Lock;
+use blaze_trace::{
+    Attributes, Event, Id, Metadata, Parent, Record, Sink,
+    field::{Field, Visit},
+};
 
 use crate::{
     clock,
@@ -20,19 +23,28 @@ use crate::{
     profile::SpanKind,
 };
 
-/// The layer; `tracing_subscriber::registry().with(ix_prof::layer())`.
+/// The sink; `blaze_trace::install(ix_prof::layer())` at the program's entry.
 pub struct ProfLayer {
     _private: (),
 }
 
-pub fn layer() -> ProfLayer {
-    ProfLayer { _private: () }
+static LAYER: ProfLayer = ProfLayer { _private: () };
+
+pub fn layer() -> &'static ProfLayer {
+    &LAYER
 }
 
-/// The span's number in the profile: tracing's ids are reused once a span closes.
-struct Mine(u64);
-
+/// A span's id is its number in the profile, never reused. 0 is a span begun while off.
 static NEXT: AtomicU64 = AtomicU64::new(1);
+
+/// The handles of a span past its first (a `Span` cloned): it closes when the last drops.
+/// Empty unless a span is cloned.
+static EXTRA: Lock<BTreeMap<u64, u32>> = Lock::unrecorded("ix_prof.layer.extra", BTreeMap::new());
+
+thread_local! {
+    /// The spans this thread is inside, innermost last: a span's parent when it names none.
+    static ENTERED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
 
 #[derive(Default)]
 struct Fields {
@@ -59,19 +71,22 @@ fn usage() -> Usage {
     }
 }
 
-impl<S> Layer<S> for ProfLayer
-where
-    S: Subscriber + for<'a> LookupSpan<'a>,
-{
-    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+impl Sink for ProfLayer {
+    fn enabled(&self, _: &'static Metadata<'static>) -> bool {
+        crate::recording()
+    }
+
+    fn new_span(&self, attrs: &Attributes<'_>) -> Id {
         if !crate::recording() {
-            return;
+            return Id::from_u64(0);
         }
-        let Some(span) = ctx.span(id) else { return };
+        let mine = NEXT.fetch_add(1, Ordering::Relaxed);
         crate::alloc::quiet(|| {
-            let mine = NEXT.fetch_add(1, Ordering::Relaxed);
-            let parent = span.parent().and_then(|p| p.extensions().get::<Mine>().map(|it| it.0));
-            span.extensions_mut().insert(Mine(mine));
+            let parent = match attrs.parent_of() {
+                Parent::Explicit(id) => Some(id.into_u64()).filter(|it| *it != 0),
+                Parent::Root => None,
+                Parent::Current => ENTERED.with(|it| it.borrow().last().copied()),
+            };
             let mut fields = Fields::default();
             attrs.record(&mut fields);
             let meta = attrs.metadata();
@@ -102,16 +117,14 @@ where
                 r.span_new(new, now);
             });
         });
+        Id::from_u64(mine)
     }
 
-    fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
-        if !crate::recording() {
+    fn record(&self, id: &Id, values: &Record<'_>) {
+        let mine = id.into_u64();
+        if !crate::recording() || mine == 0 {
             return;
         }
-        let Some(mine) = ctx.span(id).and_then(|s| s.extensions().get::<Mine>().map(|it| it.0))
-        else {
-            return;
-        };
         crate::alloc::quiet(|| {
             let mut fields = Fields::default();
             values.record(&mut fields);
@@ -119,43 +132,59 @@ where
         });
     }
 
-    fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
-        if !crate::recording() {
+    fn event(&self, _: &Event<'_>) {}
+
+    fn enter(&self, id: &Id) {
+        let mine = id.into_u64();
+        ENTERED.with(|it| it.borrow_mut().push(mine));
+        if !crate::recording() || mine == 0 {
             return;
         }
-        let Some(mine) = ctx.span(id).and_then(|s| s.extensions().get::<Mine>().map(|it| it.0))
-        else {
-            return;
-        };
         let (now, usage) = (clock::now_ns(), usage());
         crate::alloc::quiet(|| {
             crate::with_recorder(|r| r.span_enter(mine, clock::os_tid(), now, usage))
         });
     }
 
-    fn on_exit(&self, id: &Id, ctx: Context<'_, S>) {
-        if !crate::recording() {
+    fn exit(&self, id: &Id) {
+        let mine = id.into_u64();
+        ENTERED.with(|it| {
+            let mut entered = it.borrow_mut();
+            if let Some(at) = entered.iter().rposition(|it| *it == mine) {
+                entered.remove(at);
+            }
+        });
+        if !crate::recording() || mine == 0 {
             return;
         }
         let (now, usage) = (clock::now_ns(), usage());
-        let Some(mine) = ctx.span(id).and_then(|s| s.extensions().get::<Mine>().map(|it| it.0))
-        else {
-            return;
-        };
         crate::alloc::quiet(|| {
             crate::with_recorder(|r| r.span_exit(mine, clock::os_tid(), now, usage))
         });
     }
 
-    fn on_close(&self, id: Id, ctx: Context<'_, S>) {
-        if !crate::recording() {
-            return;
+    fn clone_span(&self, id: &Id) -> Id {
+        *EXTRA.lock().entry(id.into_u64()).or_insert(0) += 1;
+        *id
+    }
+
+    fn try_close(&self, id: Id) -> bool {
+        let mine = id.into_u64();
+        {
+            let mut extra = EXTRA.lock();
+            if let Some(more) = extra.get_mut(&mine) {
+                *more -= 1;
+                if *more == 0 {
+                    extra.remove(&mine);
+                }
+                return false;
+            }
+        }
+        if !crate::recording() || mine == 0 {
+            return true;
         }
         let now = clock::now_ns();
-        let Some(mine) = ctx.span(&id).and_then(|s| s.extensions().get::<Mine>().map(|it| it.0))
-        else {
-            return;
-        };
         crate::alloc::quiet(|| crate::with_recorder(|r| r.span_close(mine, now)));
+        true
     }
 }

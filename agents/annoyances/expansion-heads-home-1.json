@@ -1,0 +1,14 @@
+{
+ "id": "expansion-heads-home-1",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), write-only lane R8 (a `Signature` for heads a workspace macro wrote)",
+ "where": "crates/blaze-cli/src/signature.rs, crates/blaze-cli/src/body_types/heads.rs, crates/blaze-drive/src/request.rs (`locate`), crates/blaze-cli/src/work.rs (Signature routing)",
+ "what": "The natural home of a head a macro wrote is its expansion (the CrateScope record holds the expansion texts), but a Signature must be homed in a file: request.rs `locate` folds a BodyCheck/Signature key from the home file's Surface and Owners, and work.rs routes Signature to the home file's body job. So expansion heads are folded into the Signature of the file entry their outermost call is at, and the readers re-derive the crate's expanded items (each_item over the crate) once per job.",
+ "cost": "a design choice forced by two files owned by other lanes; a second walk of each crate's items per body job that reads a macro-written head",
+ "cause": "Signature parts are only listed by a file's outline job, and the drive's key fold assumes a file home",
+ "whys": "the CrateScope out is the exports digest plus files read, not the expansion texts, so an edit of a private macro_rules in another file of the crate that leaves exports equal may not rerun the entry's Signature (its source is the call text, its reads the job's)",
+ "class": "a record kind whose home is fixed to files while some of its subjects live in expansions",
+ "prevention": "wanted: the CrateScope out covers each expansion's text digest (names/expansion_texts.rs rows already hold one), or the Signature's reads include the defining macro's record; a test that edits a macro_rules body in another file and asserts the caller reruns",
+ "workaround": "entry-grain Signature (signature.rs, \"A HEAD A MACRO WROTE\")",
+ "state": "open"
+}

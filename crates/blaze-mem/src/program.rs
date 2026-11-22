@@ -27,7 +27,7 @@
 //! every `Ref32` is valid from when it is made until the process exits, which is what
 //! `'static` says.
 
-use std::{
+use core::{
     fmt,
     marker::PhantomData,
     mem::{ManuallyDrop, align_of, size_of},
@@ -99,7 +99,7 @@ impl fmt::Display for ProgramError {
     }
 }
 
-impl std::error::Error for ProgramError {}
+impl core::error::Error for ProgramError {}
 
 /// The handle that allocates in the process's program arena. One exists; it is not `Clone`.
 /// `alloc` takes `&mut self`, so there is one writer and no concurrent bump: code that
@@ -231,9 +231,9 @@ impl<T: ProgramLifetime> PartialEq for Ref32<T> {
 
 impl<T: ProgramLifetime> Eq for Ref32<T> {}
 
-impl<T: ProgramLifetime> std::hash::Hash for Ref32<T> {
+impl<T: ProgramLifetime> core::hash::Hash for Ref32<T> {
     #[inline]
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.units.hash(state);
     }
 }

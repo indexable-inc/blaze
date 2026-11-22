@@ -1,0 +1,9 @@
+[package]
+name = "ladder-x0-const-assoc-01"
+version = "0.1.0"
+edition = "2024"
+
+# The rung is not about overflow and declares no `panic_const_*_overflow` lang fn: it
+# builds with the release setting (D101; the dev default would need those lang fns).
+[profile.dev]
+overflow-checks = false

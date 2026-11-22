@@ -1,0 +1,33 @@
+[package]
+name = "blaze-data"
+description = "The one format-neutral value that blaze's formats (deterministic CBOR, JSON, TOML) read into and write from: null, bool, exact integers, floats, text, bytes, lists and maps in insertion order with a sorted view; typed reading whose errors name the path; hand-written `ToValue`/`FromValue`; the `value!` macro; `no_std`, no `alloc`, the allocator passed in"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `String`, `Vec`: every owner takes the caller's allocator.
+blaze-own.workspace = true
+
+[features]
+# `ToValue`/`FromValue` for std's `String`, `Vec` and (unix) `PathBuf`, for callers that still
+# hold std types.
+std = []
+
+[dev-dependencies]
+# `blaze_own::testing::heap()`, the tests' allocator.
+blaze-own = { workspace = true, features = ["testing"] }
+# Properties: a map agrees with a model map under any inserts and removes; with a planted-bug
+# control.
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

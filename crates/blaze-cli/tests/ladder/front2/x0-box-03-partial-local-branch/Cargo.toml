@@ -1,0 +1,8 @@
+[package]
+name = "ladder-x0-box-03-partial-local-branch"
+version = "0.1.0"
+edition = "2024"
+
+# Not about overflow: the log stays small; built with the release setting (D101).
+[profile.dev]
+overflow-checks = false

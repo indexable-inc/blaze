@@ -9,8 +9,9 @@ description: "Conventions for blaze's documents, scripts and agent-facing interf
 
 ## no-mcp (rule 33)
 
-No MCP. Agent-facing interfaces are a Unix socket or HTTP with one versioned schema in deterministic
-CBOR; the CLI is a client of the same API.
+No MCP. An agent-facing interface is a Unix socket or HTTP with one versioned schema in
+deterministic CBOR (blaze-protocol's encoding); what a command says is a typed `Report`
+(blaze-report), the same value an agent reads.
 
 See [docs/v2/plan.md#9-one-interface](../../../docs/v2/plan.md#9-one-interface).
 

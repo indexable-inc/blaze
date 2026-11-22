@@ -67,7 +67,8 @@ fn atom<A: Allocator>(expr: &Expr<'_, A>) -> bool {
         | ExprKind::InList { .. }
         | ExprKind::InParam { .. }
         | ExprKind::Between { .. }
-        | ExprKind::Like { .. } => false,
+        | ExprKind::Like { .. }
+        | ExprKind::Analytic(_) => false,
     }
 }
 
@@ -571,6 +572,8 @@ impl<W: fmt::Write> Printer<'_, W> {
                 self.list_at(args, below)?;
                 self.str(")")
             }
+            // The printer writes the subset; the query grammar's forms are not in it.
+            ExprKind::Analytic(_) => Err(fmt::Error),
         }
     }
 }

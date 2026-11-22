@@ -1,5 +1,8 @@
-//! Operator-facing rendering for a Rust error and its source chain.
+//! Operator-facing rendering for a Rust error and its source chain, and the command-line reader
+//! ([`args`]) whose refusals it renders: the two ends of a command the person runs.
 #![expect(clippy::print_stderr, reason = "`main` prints the error chain on stderr for CLIs")]
+
+pub mod args;
 
 /// Render `error: source: deeper source` without internal type or backtrace
 /// noise. This is suitable for terminal errors and language-binding exceptions.

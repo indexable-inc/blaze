@@ -272,6 +272,9 @@ pub(super) fn kernels() -> Vec<(&'static str, fn(&[u8; 64]) -> Raw)> {
 #[derive(Clone, Copy)]
 pub(super) struct Classes<'b> {
     pub(super) blocks: &'b [Block],
+    /// Whether the text may hold a CR, asked once per text by the lexer, which sets it
+    /// ([`Classes::bare_cr`]): nearly no file does, and then no string or comment token asks.
+    pub(super) cr: bool,
 }
 
 impl<'b> Classes<'b> {
@@ -301,7 +304,16 @@ impl<'b> Classes<'b> {
             tail[class] |= past;
         }
         words.extend_from_slice(&finish(tail, &mut carry));
-        Classes { blocks: words.as_chunks::<5>().0 }
+        // Every range asked until the lexer, which scanned the text for a CR once, says none is
+        // there (`Converter::cr`): the answer is right either way, only the cost differs.
+        Classes { blocks: words.as_chunks::<5>().0, cr: true }
+    }
+
+    /// Whether `bytes[range]` holds a bare CR ([`crate::line_break::has_bare_cr`]): `false` at
+    /// once for a text with no CR, the one scan for it made when the classes were.
+    #[inline]
+    pub(super) fn bare_cr(&self, bytes: &[u8], range: core::ops::Range<usize>) -> bool {
+        self.cr && crate::line_break::has_bare_cr(bytes, range)
     }
 
     /// The first offset at or after `at` (at most the text's length) with a bit in `class`;
@@ -668,7 +680,7 @@ mod tests {
                     let classes = Classes::with(text, kernel, &mut words);
                     assert_eq!(classes.blocks, scalar, "{name} on {} bytes", text.len());
                 }
-                let classes = Classes { blocks: &scalar };
+                let classes = Classes { blocks: &scalar, cr: crate::line_break::has_cr(text) };
                 for at in 0..text.len() {
                     let b = text[at];
                     let end = if ident(b) {

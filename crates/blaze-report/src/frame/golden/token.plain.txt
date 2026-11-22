@@ -1,0 +1,8 @@
+error  cannot find `undefined_name` here
+  ╭─ src/total.rs:3:11
+1 │ fn total(items: &[u32]) -> u32 {
+2 │     let sum = items.iter().sum::<u32>();
+3 │     sum + undefined_name
+  │           ^^^^^^^^^^^^^^
+  │           ╰─ not in scope
+  ╰─ blaze explain resolve:unknown

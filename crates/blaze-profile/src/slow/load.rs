@@ -2,7 +2,7 @@
 //! ([`crate::sql`]), the time model and its critical path ([`crate::time`]), and the [`Facts`]
 //! the model does not hold.
 
-use arrow_array::RecordBatch;
+use crate::columns::Batch;
 
 use super::{
     BuildFacts, Died, DiedSpan, DiedThread, Facts, Gap, Memory, MissGroup, PanicFacts, Problem,
@@ -292,7 +292,7 @@ pub fn problems_sql(build: Option<u64>, limit: u64) -> Result<String, TimeError>
 }
 
 /// What [`problems_sql`]'s answer says, in the view's order: each with its build.
-pub fn problems_by_build(batches: &[RecordBatch]) -> Result<Vec<(u64, Problem)>, TimeError> {
+pub fn problems_by_build(batches: &[Batch]) -> Result<Vec<(u64, Problem)>, TimeError> {
     // alloc: once a report
     let mut out = Vec::new();
     for (batch, row) in rows(batches) {
@@ -312,7 +312,7 @@ pub fn problems_by_build(batches: &[RecordBatch]) -> Result<Vec<(u64, Problem)>,
     Ok(out)
 }
 
-fn problems(batches: &[RecordBatch]) -> Result<Vec<Problem>, TimeError> {
+fn problems(batches: &[Batch]) -> Result<Vec<Problem>, TimeError> {
     Ok(problems_by_build(batches)?.into_iter().map(|(_, it)| it).collect())
 }
 
@@ -371,7 +371,7 @@ fn span_stacks_sql(build: u64, window: Option<(i64, i64)>, of: &str, spans: &str
 }
 
 /// What [`span_stacks_sql`]'s answer says, sorted as [`Facts::span_stacks`] promises.
-fn span_stacks(batches: &[RecordBatch]) -> Result<Vec<SpanStack>, TimeError> {
+fn span_stacks(batches: &[Batch]) -> Result<Vec<SpanStack>, TimeError> {
     // alloc: once a report
     let mut out = Vec::new();
     for (batch, row) in rows(batches) {
@@ -434,7 +434,7 @@ pub(crate) fn recorder_sql(build: u64, t0: i64, t1: i64, of: &str) -> String {
 }
 
 /// What [`recorder_sql`]'s answer says.
-pub(crate) fn recorder(batches: &[RecordBatch]) -> Result<Recorder, TimeError> {
+pub(crate) fn recorder(batches: &[Batch]) -> Result<Recorder, TimeError> {
     let Some((batch, row)) = rows(batches).next() else { return Ok(Recorder::default()) };
     const T: &str = "counters";
     Ok(Recorder {
@@ -449,12 +449,12 @@ pub(crate) fn recorder(batches: &[RecordBatch]) -> Result<Recorder, TimeError> {
     })
 }
 
-fn rows(batches: &[RecordBatch]) -> impl Iterator<Item = (&RecordBatch, usize)> {
+fn rows(batches: &[Batch]) -> impl Iterator<Item = (&Batch, usize)> {
     batches.iter().flat_map(|batch| (0..batch.num_rows()).map(move |row| (batch, row)))
 }
 
 fn text(
-    batch: &RecordBatch,
+    batch: &Batch,
     table: &'static str,
     column: &'static str,
     row: usize,
@@ -464,7 +464,7 @@ fn text(
 }
 
 fn uint(
-    batch: &RecordBatch,
+    batch: &Batch,
     table: &'static str,
     column: &'static str,
     row: usize,
@@ -473,7 +473,7 @@ fn uint(
 }
 
 fn int(
-    batch: &RecordBatch,
+    batch: &Batch,
     table: &'static str,
     column: &'static str,
     row: usize,
@@ -492,7 +492,7 @@ fn build_row_sql(build: u64) -> String {
     )
 }
 
-fn build_row(batches: &[RecordBatch], build: u64) -> Result<BuildFacts, TimeError> {
+fn build_row(batches: &[Batch], build: u64) -> Result<BuildFacts, TimeError> {
     let mut it = BuildFacts { id: build, ..BuildFacts::default() };
     if let Some((batch, row)) = rows(batches).next() {
         const T: &str = "builds";
@@ -517,7 +517,7 @@ fn threads_sql(spans: &str) -> String {
     )
 }
 
-fn threads(batches: &[RecordBatch]) -> Result<Vec<ThreadName>, TimeError> {
+fn threads(batches: &[Batch]) -> Result<Vec<ThreadName>, TimeError> {
     // alloc: once a report
     let mut out = Vec::new();
     for (batch, row) in rows(batches) {
@@ -552,7 +552,7 @@ fn span_kinds_sql(spans: &str, folded: &str) -> String {
     )
 }
 
-fn span_kinds(batches: &[RecordBatch]) -> Result<Vec<SpanKind>, TimeError> {
+fn span_kinds(batches: &[Batch]) -> Result<Vec<SpanKind>, TimeError> {
     // alloc: once a report
     let mut out = Vec::new();
     for (batch, row) in rows(batches) {
@@ -580,7 +580,7 @@ fn thread_cpu_sql(spans: &str) -> String {
     )
 }
 
-fn thread_cpu(batches: &[RecordBatch]) -> Result<Vec<ThreadCpu>, TimeError> {
+fn thread_cpu(batches: &[Batch]) -> Result<Vec<ThreadCpu>, TimeError> {
     // alloc: once a report
     let mut out = Vec::new();
     for (batch, row) in rows(batches) {
@@ -652,7 +652,7 @@ fn account_sql(build: u64) -> String {
 
 /// The build's account, when the history holds one.
 fn account(
-    batches: &[RecordBatch],
+    batches: &[Batch],
     build: u64,
 ) -> Result<Option<crate::account::AccountRow>, TimeError> {
     let Some((batch, row)) = rows(batches).next() else { return Ok(None) };
@@ -750,7 +750,7 @@ fn misses_sql(build: u64) -> String {
     )
 }
 
-fn misses(batches: &[RecordBatch]) -> Result<Vec<MissGroup>, TimeError> {
+fn misses(batches: &[Batch]) -> Result<Vec<MissGroup>, TimeError> {
     // alloc: once a report
     let mut out = Vec::new();
     for (batch, row) in rows(batches) {
@@ -789,7 +789,7 @@ fn query_counts_sql(build: u64) -> String {
     )
 }
 
-fn query_counts(batches: &[RecordBatch]) -> Result<Vec<QueryCount>, TimeError> {
+fn query_counts(batches: &[Batch]) -> Result<Vec<QueryCount>, TimeError> {
     // alloc: once a report
     let mut out = Vec::new();
     for (batch, row) in rows(batches) {
@@ -825,7 +825,7 @@ fn memory_sql(build: u64, t0: i64, t1: i64, of: &str) -> String {
     )
 }
 
-fn memory(batches: &[RecordBatch]) -> Result<Memory, TimeError> {
+fn memory(batches: &[Batch]) -> Result<Memory, TimeError> {
     let Some((batch, row)) = rows(batches).next() else { return Ok(Memory::default()) };
     const T: &str = "counters";
     Ok(Memory {

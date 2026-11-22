@@ -4,7 +4,7 @@
 
 use std::{collections::BTreeMap, fmt::Write as _, path::Path};
 
-use regex::Regex;
+use blaze_script::regex::Regex;
 
 use crate::view::{Sample, View};
 

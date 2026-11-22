@@ -64,6 +64,12 @@ pub enum ProcsOp {
     List,
     Signal,
     Inspect,
+    /// Starting a linked child ([`Spawner::start_linked`]).
+    StartLinked,
+    /// Waiting for a linked child ([`Linked::wait_until`]).
+    WaitLinked,
+    /// Killing a linked child's group ([`Linked::kill_group`]).
+    KillGroup,
 }
 
 /// A call on other processes that failed: the call, the process (none for a list) and how.
@@ -164,3 +170,28 @@ impl fmt::Debug for Procs {
         write!(f, "Procs({:?})", self.allowed)
     }
 }
+
+/// D177: one way to run a program hermetically.
+#[cfg(unix)]
+pub mod hermetic;
+
+// Children started linked to this process (test zygote, run parent): a native world's only.
+#[cfg(unix)]
+mod linked;
+#[cfg(unix)]
+pub use self::linked::{
+    BorrowedFd, Exit, Linked, LinkedSpec, Spawner, Waited,
+    run::{
+        CHILD_FD, ChannelError, Input, Message, OutPipe, Output, PREFIX, ParentDeath, Pipes, Read, Reaped, Run,
+        RunChild, RunError, RunFault, RunSpec, RunStep, RunWaited, Served, ServedEnd, Started, Streams, whole_messages,
+    },
+    sim_child::{Act, MOST_DELAY, SimChild},
+    sim_term::{OnTerminate, SIGTERM, TermChild},
+};
+/// The run parent's own signals while its program runs (decision D103): SIGINT and SIGQUIT
+/// ignored, SIGTERM forwarded and then the program's end waited for a bounded grace.
+pub use blaze_core::run_signals::{Arrived, GRACE, ParentSignals, Relay, RelayAct, Scripted, SignalError};
+/// A command's own stop and status requests while it works (`blaze engine-check`).
+pub use blaze_core::run_signals::{By, Requests};
+#[cfg(unix)]
+pub use blaze_core::run_signals::{Asked, Held};

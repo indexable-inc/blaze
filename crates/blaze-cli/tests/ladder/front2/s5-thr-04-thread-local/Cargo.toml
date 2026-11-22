@@ -1,0 +1,4 @@
+[package]
+name = "ladder-s5-thr-04-thread-local"
+version = "0.1.0"
+edition = "2024"

@@ -1,0 +1,14 @@
+{
+ "id": "proc-macro-harness-on-target-side",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane WS",
+ "where": "crates/blaze-unit-graph/src/resolve.rs (root units, Kind::TestLib), crates/blaze-scope/src/units.rs and units/macro_side.rs, crates/blaze-world/src/list.rs",
+ "what": "tempo's check failed `Script(..)`: sha3-asm 0.1.9's native build script asked to run for wasm32-wasip1, with keccak_asm and sha3_asm on the macro side. No proc macro needs asm-keccak: the member proc macro's lib test harness was made a TARGET unit, so it took the target's unified features (the node's alloy-primitives/asm-keccak), and the macro side copied that closure.",
+ "cost": "about an hour of reading the unit graph, the units list and the macro side",
+ "cause": "a proc macro's harness is the proc macro's code compiled as a test, which cargo builds for the host with host features; the graph keyed it on the target side",
+ "whys": "the macro side took its closure from the harness's target-side deps; the world read a crate's side from its index (`>= macro_from`), so the member proc macro and harness also read their build-script run and cfg as the target's",
+ "class": "a unit built for one side but keyed or featured on the other leaks that side's features and facts across",
+ "prevention": "done: the harness of a proc-macro root is a host unit with host features; units.rs keeps it as a root; macro_side gives the member proc macro and harness the side's cfg and lists them in `UnitCrates::built_for_macro`; `UnitCrates::macro_side` is the one answer of a crate's side; tests `a_proc_macro_test_harness_is_on_the_host_side` (blaze-unit-graph) and `every_owner_is_checked_on_the_side_it_is_built_for` (blaze-world)",
+ "workaround": "none needed now",
+ "state": "fixed"
+}

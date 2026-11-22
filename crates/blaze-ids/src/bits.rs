@@ -8,8 +8,8 @@
 //!   `const` ([`Bits::with_bit`], [`Bits::has_bit`], [`Bits::or`]) for sets made at compile
 //!   time;
 //! - [`BitSlice`] and [`BitSliceMut`]: a view of words held elsewhere (a matrix row, a column
-//!   of mapped bytes, a `SmallVec` or `ThinVec` set of a smaller field, which are also storage
-//!   of their own).
+//!   of mapped bytes, a `Box<[u64]>` or `[u64; W]` set of a smaller field, which are also
+//!   storage of their own).
 //!
 //! Beside it: [`BitMatrix`], rows of one width in one buffer (a dataflow's entry sets, one per
 //! block); [`Ranked`], a fixed set that counts the members before each word, so a member's
@@ -23,11 +23,13 @@
 
 use std::{alloc::Allocator, fmt, hash, iter::FusedIterator, marker::PhantomData, ops::Range};
 
+// The storage and persistence of crates from outside the workspace, each behind the feature
+// of its name, which the crates above that use them turn on (the root manifest's entry): this
+// crate itself depends on none (docs/v2/plan/design/bottom.md, "Also decided on 2026-11-15").
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use smallvec::SmallVec;
-use thin_vec::ThinVec;
 
-use crate::sync::atomic::{AtomicU64, Ordering};
+use blaze_swiss::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
 mod tests;
@@ -199,63 +201,6 @@ impl WordsMut for &mut [u64] {
     #[inline]
     fn words_mut(&mut self) -> &mut [u64] {
         self
-    }
-}
-
-impl<const N: usize> Words for SmallVec<[u64; N]>
-where
-    [u64; N]: smallvec::Array<Item = u64>,
-{
-    #[inline]
-    fn words(&self) -> &[u64] {
-        self
-    }
-}
-
-impl<const N: usize> WordsMut for SmallVec<[u64; N]>
-where
-    [u64; N]: smallvec::Array<Item = u64>,
-{
-    #[inline]
-    fn words_mut(&mut self) -> &mut [u64] {
-        self
-    }
-}
-
-impl<const N: usize> GrowWords for SmallVec<[u64; N]>
-where
-    [u64; N]: smallvec::Array<Item = u64>,
-{
-    fn resize_words(&mut self, len: usize) {
-        self.resize(len, 0); // alloc: inline up to N words
-    }
-
-    fn shrink_words(&mut self) {
-        self.shrink_to_fit();
-    }
-}
-
-impl Words for ThinVec<u64> {
-    #[inline]
-    fn words(&self) -> &[u64] {
-        self
-    }
-}
-
-impl WordsMut for ThinVec<u64> {
-    #[inline]
-    fn words_mut(&mut self) -> &mut [u64] {
-        self
-    }
-}
-
-impl GrowWords for ThinVec<u64> {
-    fn resize_words(&mut self, len: usize) {
-        self.resize(len, 0); // alloc: a growable set's words, grown to its domain once
-    }
-
-    fn shrink_words(&mut self) {
-        self.shrink_to_fit();
     }
 }
 
@@ -731,12 +676,14 @@ impl<S: Words, I> fmt::Debug for Bits<S, I> {
 }
 
 /// Its words, as `S` writes them: a `Vec` set persists as the `Vec`.
+#[cfg(feature = "serde")]
 impl<S: Serialize, I> Serialize for Bits<S, I> {
     fn serialize<Z: Serializer>(&self, serializer: Z) -> Result<Z::Ok, Z::Error> {
         self.words.serialize(serializer)
     }
 }
 
+#[cfg(feature = "serde")]
 impl<'de, S: Deserialize<'de>, I> Deserialize<'de> for Bits<S, I> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         S::deserialize(deserializer).map(Bits::from_words)

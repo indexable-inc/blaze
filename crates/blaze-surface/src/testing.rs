@@ -2,19 +2,22 @@
 //! hand, for the tests of this crate and of the crates that ask through the two traits (the
 //! `testing` feature).
 
-use std::alloc::Global;
-
 use blaze_format::{Aligned, FormatError};
 use blaze_id::{ContentId, CrateItemKey, ItemKey, NoItem};
+use blaze_own::{AVec, Alloc};
 
-use crate::crate_facts::{CrateGraphView, LangItemsView, NoImplsOfView};
+use crate::crate_graph::CrateGraphView;
+use crate::impl_index::NoImplsOfView;
+use crate::lang_items::LangItemsView;
 use crate::error::SurfaceError;
 use crate::file_items::FileItemsView;
 use crate::items::{Items, Source};
 use crate::key_index::{KeyEntry, KeyIndexView};
 use crate::module_decls::ModuleDeclsView;
 use crate::module_scope::ScopeView;
-use crate::names::{CrateRootView, MacroDefView, ModuleFileView, TextualEntryView};
+use crate::macro_def::MacroDefView;
+use crate::crate_root::CrateRootView;
+use crate::names::{ModuleFileView, TextualEntryView};
 use crate::proof::HasText;
 
 /// Which record a buffer given to [`MemSurface::insert`] is.
@@ -55,10 +58,11 @@ impl Fact {
 /// The records and the file texts of one crate, held in memory. Each buffer is checked whole
 /// when it is inserted; a question reads it in place again, the check standing (a test double:
 /// the store's reader checks a segment once and hands out views with no check).
-pub struct MemSurface {
+pub struct MemSurface<'a> {
     krate: CrateItemKey,
-    records: Vec<(Fact, ContentId, Aligned), Global>,
-    texts: Vec<(ContentId, Vec<u8, Global>), Global>,
+    records: AVec<'a, (Fact, ContentId, Aligned)>,
+    texts: AVec<'a, (ContentId, AVec<'a, u8>)>,
+    alloc: Alloc<'a>,
 }
 
 /// The view of a buffer [`MemSurface::insert`] checked.
@@ -66,10 +70,10 @@ fn checked<T>(view: Result<T, FormatError>) -> T {
     view.unwrap_or_else(|error| panic!("a record checked when it was inserted: {error}"))
 }
 
-impl MemSurface {
-    /// An empty surface of the crate `krate`.
-    pub fn new(krate: CrateItemKey) -> MemSurface {
-        MemSurface { krate, records: Vec::new_in(Global), texts: Vec::new_in(Global) }
+impl<'a> MemSurface<'a> {
+    /// An empty surface of the crate `krate`, its tables in `alloc`.
+    pub fn new_in(krate: CrateItemKey, alloc: Alloc<'a>) -> MemSurface<'a> {
+        MemSurface { krate, records: AVec::new_in(alloc), texts: AVec::new_in(alloc), alloc }
     }
 
     /// Holds `bytes`, a record of `fact`, under the key its view names (the file, the module,
@@ -87,7 +91,11 @@ impl MemSurface {
             Fact::MacroDef => MacroDefView::read(&buffer)?.head().item.0,
             Fact::KeyIndex => KeyIndexView::read(&buffer)?.module().0,
             Fact::LangItems => LangItemsView::read(&buffer)?.krate().0,
-            Fact::CrateGraph => CrateGraphView::read(&buffer)?.root().0,
+            // One graph per build, of every crate: filed under the crate this surface is of.
+            Fact::CrateGraph => {
+                CrateGraphView::read(&buffer)?;
+                self.krate.0
+            }
             Fact::NoImplsOf => NoImplsOfView::read(&buffer)?.krate().0,
         };
         self.records.retain(|(held, at, _)| (*held, *at) != (fact, key));
@@ -98,8 +106,7 @@ impl MemSurface {
     /// Holds `text` as the text of the file with content `file`.
     pub fn insert_text(&mut self, file: ContentId, text: &str) {
         self.texts.retain(|(at, _)| *at != file);
-        let mut bytes = Vec::with_capacity_in(text.len(), Global);
-        bytes.extend_from_slice(text.as_bytes());
+        let bytes = AVec::from_slice_in(text.as_bytes(), self.alloc);
         self.texts.push((file, bytes));
     }
 
@@ -124,7 +131,7 @@ impl MemSurface {
     }
 }
 
-impl Items for MemSurface {
+impl Items for MemSurface<'_> {
     fn entry(&self, item: ItemKey) -> Result<KeyEntry, SurfaceError> {
         let missing = NoItem { krate: self.krate, key: item };
         if !item.is_of(self.krate) {
@@ -181,7 +188,7 @@ impl Items for MemSurface {
     }
 }
 
-impl Source for MemSurface {
+impl Source for MemSurface<'_> {
     fn krate(&self) -> CrateItemKey {
         self.krate
     }

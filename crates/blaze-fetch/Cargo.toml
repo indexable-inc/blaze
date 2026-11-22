@@ -1,6 +1,6 @@
 [package]
 name = "blaze-fetch"
-description = "blaze's one way to get bytes by their hash: a digest (sha256, sha512, blake3) looked up in blaze's store, downloaded only when the store lacks it, checked in one streaming pass, kept by BLAKE3 with a side index from the digest"
+description = "The sources of a project's dependencies, from its Cargo.lock: a fetch plan, a sans-IO machine that asks for each registry crate and git commit, checks it against the lock (SHA-256, or git's own ids from the pinned commit) before a byte is unpacked, and hands back one content-addressed record of its files a source; and the digests and tree listing source pins are written in"
 publish = false
 
 version.workspace = true
@@ -14,32 +14,44 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-blaze-core.workspace = true
-# Where objects and the side index live: blaze's content-addressed store, keyed by BLAKE3.
-blaze-cas.workspace = true
-blaze-format.workspace = true
-blaze-ids.workspace = true
+# The allocator as a value and the owning types every table here is kept in.
+blaze-own.workspace = true
+# Text without `core::fmt`: URLs and every error's words.
+blaze-text.workspace = true
+# The lock file's one reader (`lock`), without the cargo-compatible reader.
+blaze-manifest = { workspace = true, default-features = false }
+# A `.crate`'s check (SHA-256) and HMAC-free digests; SHA-512 for pins (`digest`).
 blaze-sha256.workspace = true
-crossbeam-channel.workspace = true
-papaya.workspace = true
-# The lock on one download's meter (`downloads`), held for a field update.
-# A partial download's lock (`fetcher::Part`), let go of as it drops.
-stdx.workspace = true
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
-# The one checked unpacker of a tar stream (`unpack`), and the times cargo's rules give its files.
-tar.workspace = true
-filetime.workspace = true
-# SHA-512 only; SHA-256 is blaze-sha256's.
-sha2.workspace = true
-tracing.workspace = true
-# A tree's paths compared as a case- and normalization-insensitive disk (APFS) compares them.
-unicode-normalization.workspace = true
+blaze-ed25519.workspace = true
+# Record keys (`Hasher`, `ContentId`) and BLAKE3 of files and listings.
+blaze-ids.workspace = true
+# Hex for pins.
+blaze-format.workspace = true
+# A path's caseless form, so no two files of a record are one on a case-insensitive disk.
+blaze-unicode.workspace = true
+# gzip and tar: a `.crate`, inflated and read under the limits given, every path checked.
+blaze-deflate.workspace = true
+blaze-tar.workspace = true
+# A git commit: protocol v2's request and answer, the pack read and its tree walked.
+blaze-git-fetch.workspace = true
+# Source corrections (`correct`, D58): the table read strictly, crate versions matched, files
+# lexed by the tree's lexer.
+blaze-data.workspace = true
+blaze-json.workspace = true
+blaze-semver.workspace = true
+blaze-lex.workspace = true
 
 [dev-dependencies]
-# The resume property test (`tests::a_cut_download_resumes_and_keeps_only_the_pinned_bytes`).
+# The simulation: `check` and `control`.
 blaze-sim.workspace = true
-tempfile.workspace = true
+# `Alloc::global()`, at the example's top and in tests.
+blaze-own = { workspace = true, features = ["std", "testing"] }
+# The examples' entry frame and each test's top frame: memory from the OS, handed down.
+blaze-mem.workspace = true
+# The example's HTTPS: blaze-http's client on its driver thread, the machine's roots.
+blaze-http.workspace = true
+# The example's store: records made in place (`blaze_core::reserve`) on the native driver.
+blaze-core.workspace = true
 
 [lints]
 workspace = true

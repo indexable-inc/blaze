@@ -1,6 +1,8 @@
 //! macOS's waits: `kevent` for the kqueue driver, `mach_wait_until` for a sleep, and the
 //! wait on an address (`os_sync_wait_on_address_with_deadline`) for a [`super::Parker`].
 
+use blaze_sys::{Errno, Timespec, posix::thread};
+use core::ffi::c_int;
 use std::{
     convert::Infallible,
     ffi::c_void,
@@ -12,7 +14,7 @@ use std::{
 
 use crate::atomic::AtomicU32;
 
-use super::{Clock, Deadline, Once, WaitError, Waited, parking::Futex, unix::timespec, until};
+use super::{Clock, Deadline, Once, WaitError, Waited, parking::Futex, until};
 
 /// `struct mach_timebase_info`: mach time units are `numer / denom` nanoseconds.
 #[repr(C)]
@@ -29,12 +31,12 @@ struct Timebase {
 // drops it fails CI naming it.
 unsafe extern "C" {
     fn mach_absolute_time() -> u64;
-    fn mach_timebase_info(info: *mut Timebase) -> libc::c_int;
-    fn mach_wait_until(deadline: u64) -> libc::c_int;
+    fn mach_timebase_info(info: *mut Timebase) -> c_int;
+    fn mach_wait_until(deadline: u64) -> c_int;
 }
 
 /// `KERN_ABORTED`: the wait was interrupted.
-const KERN_ABORTED: libc::c_int = 14;
+const KERN_ABORTED: c_int = 14;
 
 // The wait on an address and its wake (rule macos-private-apis; docs/macos.md, "Parking"):
 // libplatform's `os_sync_wait_on_address_with_deadline`, `os_sync_wait_on_address` and
@@ -51,28 +53,18 @@ const KERN_ABORTED: libc::c_int = 14;
 // each wait and each wake, and the wake took that lock; this is one call each on the word
 // the park's core already keeps, with nothing else shared.
 //
-// There is no other park on macOS (rule no-fallback). A blaze started on a macOS before 14.4
-// does not start: dyld stops it, naming the symbol it could not bind
-// (`_os_sync_wait_on_address_with_deadline`). The test below resolves each at run time, so a
-// system that drops one fails CI naming it.
-//
-// SAFETY: the signatures are the header's: `os_sync_wait_on_address_flags_t`,
+// There is no other park on macOS (rule no-fallback). They are reached through blaze-sys's
+// table of calls found at first use (`blaze_sys::macos::cold`), not bound at load: a program
+// that never parks never pays for them. A blaze on a macOS before 14.4 stops at its first park,
+// naming the symbol it could not find. The test below and blaze-sys's
+// `every_cold_symbol_exists` resolve each at run time, so a system that drops one fails CI
+// naming it. The signatures are the header's, in the table: `os_sync_wait_on_address_flags_t`,
 // `os_sync_wake_by_address_flags_t` and `os_clockid_t` are `uint32_t` options and `size` is a
 // `size_t`; each returns an `int`, -1 with `errno` set on an error.
-unsafe extern "C" {
-    fn os_sync_wait_on_address(addr: *mut c_void, value: u64, size: usize, flags: u32)
-    -> libc::c_int;
-    fn os_sync_wait_on_address_with_deadline(
-        addr: *mut c_void,
-        value: u64,
-        size: usize,
-        flags: u32,
-        clockid: u32,
-        deadline: u64,
-    ) -> libc::c_int;
-    fn os_sync_wake_by_address_any(addr: *mut c_void, size: usize, flags: u32) -> libc::c_int;
-    fn os_sync_wake_by_address_all(addr: *mut c_void, size: usize, flags: u32) -> libc::c_int;
-}
+use blaze_sys::macos::cold::{
+    os_sync_wait_on_address, os_sync_wait_on_address_with_deadline, os_sync_wake_by_address_all,
+    os_sync_wake_by_address_any,
+};
 
 /// `OS_CLOCK_MACH_ABSOLUTE_TIME` (<os/clock.h>): the one clock a deadline may be on.
 const OS_CLOCK_MACH_ABSOLUTE_TIME: u32 = 32;
@@ -106,6 +98,41 @@ fn timebase() -> io::Result<(u32, u32)> {
     Ok((base.numer, base.denom))
 }
 
+/// How long ago this process began, on `mach_absolute_time`'s clock, the one `Instant` and so
+/// every driver's `now()` reads (it stops while the machine sleeps, as they do).
+///
+/// `proc_pid_rusage(RUSAGE_INFO_V4)` (<libproc.h>, public) gives `ri_proc_start_abstime`, the
+/// exec's instant on that same clock, so the age is one subtraction with no clock between.
+/// It beats `proc_pidinfo(PROC_PIDTBSDINFO)` and the `kern.proc.pid` sysctl, the other two
+/// ways: they give the start as wall-clock microseconds, which a wall-clock step moves and
+/// which would have to be set against a second clock read at another instant.
+pub(crate) fn process_age() -> io::Result<Duration> {
+    let mut info = std::mem::MaybeUninit::<thread::rusage_info_v4>::zeroed();
+    // SAFETY: the flavour says the buffer is a `rusage_info_v4`, which `info` is, for the
+    // kernel to fill; this process's own id needs no right.
+    let got = unsafe {
+        thread::proc_pid_rusage(thread::getpid(), thread::RUSAGE_INFO_V4, info.as_mut_ptr().cast())
+    };
+    if got != 0 {
+        let error = io::Error::last_os_error();
+        // alloc: an error.
+        return Err(io::Error::new(error.kind(), format!("proc_pid_rusage(RUSAGE_INFO_V4): {error}")));
+    }
+    // sys/resource.h: ri_proc_start_abstime is word 8 following the UUID in rusage_info_v4.
+    const START_ABSTIME: usize = 8;
+    // SAFETY: filled by the call that returned 0.
+    let began = unsafe { info.assume_init() }.words[START_ABSTIME];
+    let (numer, denom) = timebase()?;
+    // SAFETY: a read of Mach's clock.
+    let now = unsafe { mach_absolute_time() };
+    let ticks = now.checked_sub(began).ok_or_else(|| {
+        // alloc: an error.
+        io::Error::other(format!("proc_pid_rusage: the process began at {began}, after now ({now})"))
+    })?;
+    let ns = u128::from(ticks) * u128::from(numer) / u128::from(denom);
+    Ok(Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX)))
+}
+
 /// The time on `mach_absolute_time`'s clock `left` from now, rounded up to a unit; the
 /// clock's end where that is past it.
 fn mach_after(left: Duration) -> io::Result<u64> {
@@ -128,56 +155,85 @@ impl Futex for Addresses {
         deadline: Option<Deadline>,
         clock: &C,
     ) -> Result<Waited<()>, WaitError> {
-        until(what, clock, deadline, |left| {
-            let addr = word.as_ptr().cast::<c_void>();
-            let value = u64::from(expected);
-            let got = match left {
-                // The absolute time of this call alone, from what is left now.
-                Some(left) => {
-                    let at = mach_after(left)?;
-                    // SAFETY: `word` is alive and aligned for the call, which only reads it;
-                    // the thread blocks until a wake of the address, a signal or `at`.
-                    unsafe {
-                        os_sync_wait_on_address_with_deadline(
-                            addr,
-                            value,
-                            WORD,
-                            PRIVATE,
-                            OS_CLOCK_MACH_ABSOLUTE_TIME,
-                            at,
-                        )
-                    }
-                }
-                // wakes: the parker's `unpark`, an `os_sync_wake_by_address_any` of this word
-                // SAFETY: as above, with no limit.
-                None => unsafe { os_sync_wait_on_address(addr, value, WORD, PRIVATE) },
-            };
-            // Woken, or the word no longer held `expected`: the parker looks at it again.
-            if got >= 0 {
-                return Ok(Once::Ready(()));
-            }
-            let error = io::Error::last_os_error();
-            match error.raw_os_error() {
-                Some(libc::EINTR) => Ok(Once::Interrupted),
-                Some(libc::ETIMEDOUT) => Ok(Once::TimedOut),
-                // The header's two transient returns under low memory (the kernel could not
-                // allocate, or could not page the word in to read it; the word is a live
-                // reference, so `EFAULT` is never a bad address): waited for again.
-                Some(libc::ENOMEM | libc::EFAULT) => Ok(Once::Spurious),
-                // alloc: an error.
-                _ => Err(io::Error::new(
-                    error.kind(),
-                    format!("os_sync_wait_on_address_with_deadline: {error}"),
-                )),
-            }
-        })
+        until(what, clock, deadline, |left| address_once(word, expected, left))
     }
 
     fn wake(&self, word: &AtomicU32) {
-        // `ENOENT`, no thread waits on the word, is not an error of a wake: the parker took
-        // its token before it blocked. Nothing else can fail a wake of a live aligned word.
-        // SAFETY: a wake of a word of this process; the kernel reads no memory of it.
-        _ = unsafe { os_sync_wake_by_address_any(word.as_ptr().cast(), WORD, PRIVATE) };
+        word_wake(word, false);
+    }
+}
+
+/// The wait of a lock's word ([`super::word_wait`]): the same call as a park's, any number of
+/// threads on one word, and no row of its own in the wait-for graph (the lock's is the row).
+pub(crate) fn word_wait(
+    what: &'static str,
+    word: &AtomicU32,
+    expected: u32,
+    deadline: Option<Deadline>,
+    clock: &impl Clock,
+) -> Result<Waited<()>, WaitError> {
+    super::unlisted(what, clock, deadline, |left| address_once(word, expected, left))
+}
+
+/// The wake of a word: one waiter (`os_sync_wake_by_address_any`) or every one
+/// (`os_sync_wake_by_address_all`), of this process.
+pub(crate) fn word_wake(word: &AtomicU32, all: bool) {
+    let addr = word.as_ptr().cast::<c_void>();
+    // `ENOENT`, no thread waits on the word, is not an error of a wake: the waiter looked at
+    // the word again before it blocked. Nothing else can fail a wake of a live aligned word.
+    // SAFETY: a wake of a word of this process; the kernel reads no memory of it.
+    _ = unsafe {
+        match all {
+            true => os_sync_wake_by_address_all(addr, WORD, PRIVATE),
+            false => os_sync_wake_by_address_any(addr, WORD, PRIVATE),
+        }
+    };
+}
+
+/// One wait on `word`'s address while it holds `expected`, for at most `left` (no limit for
+/// `None`): the call of a park and of a lock's word alike.
+fn address_once(word: &AtomicU32, expected: u32, left: Option<Duration>) -> io::Result<Once<()>> {
+    let addr = word.as_ptr().cast::<c_void>();
+    let value = u64::from(expected);
+    let got = match left {
+        // The absolute time of this call alone, from what is left now.
+        Some(left) => {
+            let at = mach_after(left)?;
+            // SAFETY: `word` is alive and aligned for the call, which only reads it; the thread
+            // blocks until a wake of the address, a signal or `at`.
+            unsafe {
+                os_sync_wait_on_address_with_deadline(
+                    addr,
+                    value,
+                    WORD,
+                    PRIVATE,
+                    OS_CLOCK_MACH_ABSOLUTE_TIME,
+                    at,
+                )
+            }
+        }
+        // wakes: the parker's `unpark` or a lock's release, an `os_sync_wake_by_address_*` of
+        // this word
+        // SAFETY: as above, with no limit.
+        None => unsafe { os_sync_wait_on_address(addr, value, WORD, PRIVATE) },
+    };
+    // Woken, or the word no longer held `expected`: the waiter looks at it again.
+    if got >= 0 {
+        return Ok(Once::Ready(()));
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(code) if code == i32::from(Errno::Intr.raw()) => Ok(Once::Interrupted),
+        Some(code) if code == i32::from(Errno::TimedOut.raw()) => Ok(Once::TimedOut),
+        // The header's two transient returns under low memory (the kernel could not allocate,
+        // or could not page the word in to read it; the word is a live reference, so `EFAULT`
+        // is never a bad address): waited for again.
+        Some(code) if code == i32::from(Errno::NoMem.raw()) || code == i32::from(Errno::Fault.raw()) => Ok(Once::Spurious),
+        // alloc: an error.
+        _ => Err(io::Error::new(
+            error.kind(),
+            format!("os_sync_wait_on_address_with_deadline: {error}"),
+        )),
     }
 }
 
@@ -222,10 +278,10 @@ pub(crate) fn wait_shared(
         }
         let error = io::Error::last_os_error();
         match error.raw_os_error() {
-            Some(libc::EINTR) => Ok(Once::Interrupted),
-            Some(libc::ETIMEDOUT) => Ok(Once::TimedOut),
+            Some(code) if code == i32::from(Errno::Intr.raw()) => Ok(Once::Interrupted),
+            Some(code) if code == i32::from(Errno::TimedOut.raw()) => Ok(Once::TimedOut),
             // The header's transient returns under low memory: waited for again.
-            Some(libc::ENOMEM | libc::EFAULT) => Ok(Once::Spurious),
+            Some(code) if code == i32::from(Errno::NoMem.raw()) || code == i32::from(Errno::Fault.raw()) => Ok(Once::Spurious),
             // alloc: an error.
             _ => Err(io::Error::new(
                 error.kind(),
@@ -266,10 +322,10 @@ pub(crate) unsafe fn kevent(
 ) -> Result<Waited<usize>, WaitError> {
     let too_many =
         || WaitError::io(what, io::Error::new(io::ErrorKind::InvalidInput, "too many kevents"));
-    let mut nchanges = libc::c_int::try_from(nchanges).map_err(|_| too_many())?;
-    let room = libc::c_int::try_from(room).map_err(|_| too_many())?;
+    let mut nchanges = c_int::try_from(nchanges).map_err(|_| too_many())?;
+    let room = c_int::try_from(room).map_err(|_| too_many())?;
     until(what, clock, deadline, |left| {
-        let timeout = left.map(timespec);
+        let timeout = left.map(Timespec::from_duration);
         let timeout = timeout.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
         // SAFETY: the caller's changes and room, and a timeout that outlives the call.
         let got = unsafe { kevent_once(kq, changes, nchanges, events, room, timeout) };
@@ -282,7 +338,7 @@ pub(crate) unsafe fn kevent(
         }
         let error = io::Error::last_os_error();
         match error.raw_os_error() {
-            Some(libc::EINTR) => Ok(Once::Interrupted),
+            Some(code) if code == i32::from(Errno::Intr.raw()) => Ok(Once::Interrupted),
             _ => Err(error),
         }
     })
@@ -300,13 +356,14 @@ pub(crate) unsafe fn kevent(
 unsafe fn kevent_once(
     kq: RawFd,
     changes: *const libc::kevent,
-    nchanges: libc::c_int,
+    nchanges: c_int,
     events: *mut libc::kevent,
-    room: libc::c_int,
-    timeout: *const libc::timespec,
-) -> libc::c_int {
-    // SAFETY: the caller's pointers, valid for the counts given.
-    unsafe { libc::kevent(kq, changes, nchanges, events, room, timeout) }
+    room: c_int,
+    timeout: *const Timespec,
+) -> c_int {
+    // SAFETY: the caller's pointers are valid for the counts given. Timespec has the
+    // macOS timespec layout (two signed 64-bit fields in C order), including its alignment.
+    unsafe { libc::kevent(kq, changes, nchanges, events, room, timeout.cast()) }
 }
 
 /// Sleeps until `deadline` on `clock`. Each call is a `mach_wait_until` to what is left on
@@ -335,6 +392,7 @@ pub fn sleep_until(
 
 #[cfg(test)]
 mod tests {
+    use blaze_sys::{Errno, posix::thread::{RTLD_DEFAULT, symbol}};
     use std::{
         sync::{Arc, atomic::Ordering},
         time::Duration,
@@ -352,13 +410,23 @@ mod tests {
     #[test]
     fn the_mach_calls_of_a_sleep_resolve() {
         for name in [c"mach_wait_until", c"mach_absolute_time", c"mach_timebase_info"] {
-            // SAFETY: a lookup of a NUL-terminated name in every image loaded.
-            let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+            // SAFETY: RTLD_DEFAULT is the loader's handle for every loaded image.
+            let found = unsafe { symbol(RTLD_DEFAULT, name) };
             assert!(
-                !found.is_null(),
+                found.is_some(),
                 "{name:?} is gone from this macOS: wait::sleep_until needs it"
             );
         }
+    }
+
+    /// The process began before now, and not long before: the test binary started it within
+    /// this run, and a second look is no younger than the first.
+    #[test]
+    fn the_process_began_a_moment_ago() {
+        let first = super::process_age().expect("the process's start");
+        let second = super::process_age().expect("the process's start");
+        assert!(first > Duration::ZERO && first < Duration::from_secs(3600), "{first:?}");
+        assert!(second >= first, "{second:?} then {first:?}");
     }
 
     /// The calls a park is built on resolve at run time (rule macos-private-apis): a macOS
@@ -370,10 +438,10 @@ mod tests {
             c"os_sync_wait_on_address",
             c"os_sync_wake_by_address_any",
         ] {
-            // SAFETY: a lookup of a NUL-terminated name in every image loaded.
-            let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+            // SAFETY: RTLD_DEFAULT is the loader's handle for every loaded image.
+            let found = unsafe { symbol(RTLD_DEFAULT, name) };
             assert!(
-                !found.is_null(),
+                found.is_some(),
                 "{name:?} is gone from this macOS (it is there from 14.4): wait::Parker \
                  needs it, and there is no other park"
             );
@@ -385,10 +453,10 @@ mod tests {
     #[test]
     fn the_shared_address_waits_resolve() {
         for name in [c"os_sync_wait_on_address_with_deadline", c"os_sync_wake_by_address_all"] {
-            // SAFETY: a lookup of a NUL-terminated name in every image loaded.
-            let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+            // SAFETY: RTLD_DEFAULT is the loader's handle for every loaded image.
+            let found = unsafe { symbol(RTLD_DEFAULT, name) };
             assert!(
-                !found.is_null(),
+                found.is_some(),
                 "{name:?} is gone from this macOS (it is there from 14.4): wait::wait_shared \
                  needs it, and there is no other cross-process wait"
             );
@@ -405,7 +473,7 @@ mod tests {
         let error = std::io::Error::last_os_error();
         assert_eq!(
             error.raw_os_error(),
-            Some(libc::ENOENT),
+            Some(i32::from(Errno::NoEnt.raw())),
             "a wake of a word nobody waits on fails with something other than ENOENT: {error}"
         );
         false

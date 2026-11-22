@@ -1,0 +1,30 @@
+[package]
+name = "blaze-kit"
+description = "blaze's specialized collections, each measured against the plain form it replaces: typed tables (`Table`, `TableSet`, `TableMap`, branded indices), `InlineVec` (inline, then spilled), `UnionFind` with snapshots, `SparseSet`, `IntervalSet`, `ChunkedBitSet`, `Heap4`, `TimerWheel`, integer column codecs (bit-packing, RLE, Parquet's RLE/bit-packed hybrid, delta + zigzag + LEB128, `Dict`) and `StaticSearch`; `no_std`, every one in an allocator its caller names"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# The bottom crates only: a mistake here cannot stop what everything else sits on. blaze-hash
+# (by path, without the workspace entry's `serde` and `shared` features, as blaze-ids takes it)
+# is for `Dict`'s value-to-code table alone; it sits on blaze-own and blaze-swiss.
+[dependencies]
+blaze-hash.workspace = true
+blaze-int.workspace = true
+blaze-own.workspace = true
+
+[dev-dependencies]
+# `blaze_own::testing`: the counting and failing allocators and `every_failure`.
+blaze-own = { workspace = true, features = ["testing"] }
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

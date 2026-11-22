@@ -1,0 +1,8 @@
+{
+  "date": "2026-11-17",
+  "model": "claude-opus-5-5",
+  "lane": "RA1",
+  "area": "front2 buckets.rs / check.rs / world_items.rs: answering impl questions mid-check through &self",
+  "annoyance": "A write-only lane brief allows Read, Grep, Glob, Edit and Write, but this lane's harness offered no Grep or Glob tool, only Bash; read-only greps went through Bash. `Buckets` had a dozen public fields read directly by tests and examples, so moving them under one RefCell touched eight test files for field reads alone. `super::index::Index` already names the impl index's input, so the brief's `RefCell<Index>` is `RefCell<BucketIndex>`.",
+  "workaround": "Bash grep/sed -n for read-only search only; tests read the moved fields through `Buckets::index()` (a `Ref<BucketIndex>`)."
+}

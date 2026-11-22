@@ -62,7 +62,7 @@ pub(crate) struct PErr {
 
 impl PErr {
     pub(crate) fn cancel(self) {
-        tracing::trace!(span = ?self.span, "macro argument: {}", self.message);
+        blaze_trace::trace!(span = ?self.span, "macro argument: {}", self.message);
     }
 }
 

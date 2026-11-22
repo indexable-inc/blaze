@@ -11,7 +11,7 @@ use std::{
 
 use blaze_graph::{pool::Pool, sched::Event, topology::Topology};
 use blaze_mem::{Tag, frame};
-use crossbeam_channel::unbounded;
+use blaze_core::chan::unbounded;
 
 /// Parked at once over four workers, a round's jobs.
 const JOBS: usize = 64;

@@ -1,0 +1,14 @@
+status 0
+stdout
+1 + 2 * 3 => 7
+(1 + 2) * 3 => 9
+x = 10 / 4 => x = 2.5
+x * 2 - -1 => 6
+y => error: unknown name y
+2 / (x - 2.5) => error: division by zero
+3 $ 4 => error: bad character '$' at 2
+(1 + 2 => error: unexpected None
+1 2 => error: unexpected Num(2.0)
+0.1 + 0.2 => 0.30000000000000004
+y = x * x => y = 6.25
+vars: x=2.5 y=6.25

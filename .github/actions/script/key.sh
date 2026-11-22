@@ -6,8 +6,9 @@
 # Why the key covers every input of what `build.sh` makes (AGENTS.md keys-cover-every-input):
 # the binaries are what the pinned release builds from these, and nothing else is read:
 # - the compiler: .github/blaze-version (the release, with its own toolchain; rule own-nightly),
-#   harness/toolchain (the nightly blaze pins), and the runner's OS and architecture;
-# - the sources: every file under scripts/ and crates/blaze-script/, by content;
+#   pins/toolchain (the nightly blaze pins), and the runner's OS and architecture;
+# - the sources: every file under scripts/, crates/blaze-script/, crates/blaze-pins/ and pins/
+#   (which blaze-pins includes), by content;
 # - the dependencies: the Cargo.lock blocks of the scripts package's whole dependency closure
 #   (name, version, registry and checksum, so each crate's source is fixed by its checksum); a
 #   package in it with no checksum (a path or a [patch]) is refused below, as its source is not
@@ -27,7 +28,7 @@ set -euo pipefail
 sha() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; }
 die() { echo "::error::$*" >&2; echo "key.sh: $*" >&2; exit 1; }
 
-for need in .github/blaze-version harness/toolchain Cargo.toml Cargo.lock .cargo/config.toml scripts/Cargo.toml crates/blaze-script/Cargo.toml; do
+for need in .github/blaze-version pins/toolchain Cargo.toml Cargo.lock .cargo/config.toml scripts/Cargo.toml crates/blaze-script/Cargo.toml; do
   [ -f "$need" ] || die "no $need in $(pwd -P): run from the checkout's top, with this file checked out"
 done
 export LC_ALL=C
@@ -58,7 +59,7 @@ closure=$(awk '
         i = ids[k]
         if (w[2] != "" && ver[i] != w[2]) continue
         if (seen[i]++) continue
-        if (!sum[i] && name[i] != "scripts" && name[i] != "blaze-script") { print "UNHASHED " name[i] " " ver[i]; exit }
+        if (!sum[i] && name[i] != "scripts" && name[i] != "blaze-script" && name[i] != "blaze-pins") { print "UNHASHED " name[i] " " ver[i]; exit }
         printf "%s", text[i]
         m = split(deps[i], ds, "|"); for (j = 2; j <= m; j++) q[++t] = ds[j]
       }
@@ -83,11 +84,11 @@ manifest=$(awk -v direct=" $direct " '
 
 digest=$({
   printf 'blaze-version %s\n' "$(cat .github/blaze-version)"
-  printf 'toolchain %s\n' "$(cat harness/toolchain)"
+  printf 'toolchain %s\n' "$(cat pins/toolchain)"
   printf 'host %s %s\n' "$(uname -s)" "$(uname -m)"
   printf 'checkout %s\n' "$(pwd -P)"
   printf 'direct %s\n' "$direct"
-  find scripts crates/blaze-script .github/actions/script -type f ! -path '*/target/*' | sort | while read -r f; do
+  find scripts crates/blaze-script crates/blaze-pins pins .github/actions/script -type f ! -path '*/target/*' | sort | while read -r f; do
     printf 'file %s %s\n' "$f" "$(sha < "$f" | cut -d' ' -f1)"
   done
   printf '%s\n' "$closure" "$manifest"

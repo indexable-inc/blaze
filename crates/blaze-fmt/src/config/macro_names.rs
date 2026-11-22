@@ -2,12 +2,11 @@
 
 //! This module contains types and functions to support formatting specific macros.
 
-use itertools::Itertools;
+use stdx::iter::IterExt;
 use std::{fmt, str};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json as json;
-use thiserror::Error;
 
 /// Defines the name of a macro.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Deserialize, Serialize)]
@@ -78,11 +77,20 @@ impl fmt::Display for MacroSelectors {
     }
 }
 
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum MacroSelectorsError {
-    #[error("{0}")]
     Json(json::Error),
 }
+
+impl fmt::Display for MacroSelectorsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MacroSelectorsError::Json(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl core::error::Error for MacroSelectorsError {}
 
 // This impl is needed for `Config::override_value` to work for use in tests.
 impl str::FromStr for MacroSelectors {

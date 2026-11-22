@@ -80,12 +80,10 @@ bands in `blaze-graph`'s `sched`.
 
    A waiter raises the owner of what it waits on to its own band. A job queued past a bound
    rises a band, so nothing starves (`bounded-progress`).
-7. **Every scarce thing is admitted.** Cores, memory, IO threads and LLVM instances are budgets
-   the scheduler grants. A node carries a predicted peak footprint, learned like its cost;
-   admission is by footprint (`one-memory-measure`). A finished node's result is a record in the
-   buffer pool, so memory in use is the work in flight plus what the pool chooses to keep, and
-   the pool gives pages back under pressure by value per byte. A build that does not fit runs
-   narrower, never past the ceiling.
+7. **Withdrawn (2026-11-16).** Nothing is admitted by memory (rule 50): footprint is measured,
+   the kernel's limit is the ceiling, and there is no buffer pool. Waits, claims and memory are
+   as [parallel.md](parallel.md), "End state (architect, 2026-11-16)", says; where that page
+   and this one differ (a daemon, single flight across builds, a graph in memory), it holds.
 8. **Tiers are nodes.** `code(f, tier 0)` (blaze's own fast backend) and `code(f, optimized)`
    (LLVM) are different nodes with different keys. A request's goal says which tier answers it:
    `edit` is done when every function the program can reach has tier 0 code, or, when running

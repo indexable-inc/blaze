@@ -1,0 +1,27 @@
+[package]
+name = "blaze-base64"
+description = "base64 (RFC 4648) with no dependencies: the standard and URL-safe alphabets, padded and unpadded, encoded into the caller's buffer, decoded canonically with typed errors that name the byte offset; `no_std`, no `alloc`"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `Vec<u8, A>` and `String<A>` for the forms that allocate, in the allocator the caller names.
+blaze-own.workspace = true
+
+[dev-dependencies]
+# Properties: decode(encode(x)) == x for every engine, and the planted-bug control.
+blaze-sim.workspace = true
+# `blaze_own::testing::heap()`: a test's root allocator (D102), in place of `Global`.
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

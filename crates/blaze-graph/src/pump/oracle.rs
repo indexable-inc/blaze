@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use blaze_core::chan::{Receiver, Sender, unbounded};
 use blaze_sim::{Config, Tape};
 
 use super::{Flights, NotHeld, sharded::Sharded};
@@ -583,7 +583,7 @@ impl Watch {
         *PLACE.lock() = String::from("starting the actors");
         let (ended, watched) = unbounded::<()>();
         std::thread::spawn(move || {
-            if watched.recv_timeout(CASE) != Err(crossbeam_channel::RecvTimeoutError::Timeout) {
+            if watched.recv_timeout(CASE) != Err(blaze_core::chan::RecvTimeoutError::Timeout) {
                 return;
             }
             let at = PLACE.lock().clone();

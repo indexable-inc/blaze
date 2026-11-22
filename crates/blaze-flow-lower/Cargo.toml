@@ -1,0 +1,30 @@
+[package]
+name = "blaze-flow-lower"
+description = "The lowering from a type-checked body to its flow (docs/v2/plan/design/flow.md, decision D61): typed body in, flow out, or a typed refusal naming the form"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# core and alloc only beside the two crates it joins; the allocator is a value the caller passes.
+[dependencies]
+blaze-flow.workspace = true
+blaze-typeck.workspace = true
+blaze-own.workspace = true
+# The one call rule (D156): the contract the lowering's calls are switched onto (one_call.rs).
+blaze-borrow.workspace = true
+
+[dev-dependencies]
+# `fixture`: hand-written bodies checked by the real type checker, lowered and checked here.
+blaze-typeck = { workspace = true, features = ["testing"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

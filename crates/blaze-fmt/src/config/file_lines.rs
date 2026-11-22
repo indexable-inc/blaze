@@ -2,7 +2,7 @@
 
 //! This module contains types and functions to support formatting specific line ranges.
 
-use itertools::Itertools;
+use stdx::iter::IterExt;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,7 +11,6 @@ use std::{cmp, fmt, iter, str};
 use crate::span::SourceFile;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, ser};
 use serde_json as json;
-use thiserror::Error;
 
 /// A range of lines in a file, inclusive of both ends.
 pub struct LineRange {
@@ -298,13 +297,22 @@ fn canonicalize_path_string(file: &FileName) -> Option<FileName> {
     }
 }
 
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum FileLinesError {
-    #[error("{0}")]
     Json(json::Error),
-    #[error("Can't canonicalize {0}")]
     CannotCanonicalize(FileName),
 }
+
+impl fmt::Display for FileLinesError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FileLinesError::Json(e) => write!(f, "{e}"),
+            FileLinesError::CannotCanonicalize(file) => write!(f, "Can't canonicalize {file}"),
+        }
+    }
+}
+
+impl core::error::Error for FileLinesError {}
 
 // This impl is needed for `Config::override_value` to work for use in tests.
 impl str::FromStr for FileLines {

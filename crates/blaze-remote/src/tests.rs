@@ -814,11 +814,14 @@ fn no_cache_or_a_disabled_one_contacts_nothing() {
         let settings = Settings::read(&dir, &no_env).expect("read");
         assert!(settings.contacts().is_none());
         assert!(crate::cmd::status(&settings).contains("nothing leaves this machine"));
+        // Both stop before the store opens: its allocator holds no byte, and an empty one
+        // refuses any (a run that opened the store would fail here, loudly).
+        let no_store = blaze_own::fixed::Inline::<0>::new();
         for words in [&["pull", TOOLCHAIN, "aarch64-apple-darwin", "std"][..], &["push", r#"{"toolchain": "nightly-2026-11-13"}"#]] {
             let out = crate::cmd::run(&dir, &no_env, words, 0, &mut |_| {
                 made += 1;
                 Ok(Box::new(Fake::new(&store, &Tape::seeded(1), Faults::default())) as Box<dyn Bucket>)
-            });
+            }, &no_store);
             assert!(out.is_err_and(|it| it.contains("nothing was contacted")), "{words:?}");
         }
     }
@@ -851,10 +854,13 @@ fn a_push_from_a_machine_that_is_not_a_trusted_writer_sends_nothing() {
     };
     let store = fake::shared();
     let mut made = 0;
+    // The push opens the local store before it is refused (an empty arena aborted this test on
+    // 2026-11-17: an allocation refused inside the open): an arena of the test's own, made here.
+    let no_store = blaze_own::fixed::Inline::<262144>::new();
     let out = crate::cmd::run(&dir, &env, &["push", r#"{"toolchain": "nightly-2026-11-13"}"#], 0, &mut |_| {
         made += 1;
         Ok(Box::new(Fake::new(&store, &Tape::seeded(1), Faults::default())) as Box<dyn Bucket>)
-    });
+    }, &no_store);
     let why = out.expect_err("refused");
     assert!(why.contains("`trusted_writer` is off") && why.contains("nothing pushed"), "{why}");
     assert!(!why.contains(&secret) && !why.contains(&seed), "a secret shown: {why}");
@@ -863,6 +869,7 @@ fn a_push_from_a_machine_that_is_not_a_trusted_writer_sends_nothing() {
 }
 
 #[test]
+#[cfg(feature = "bucket")]
 fn settings_never_show_a_secret() {
     let mut seed = [0u8; 32];
     Tape::seeded(15).fill(&mut seed, "seed");
@@ -1024,11 +1031,13 @@ fn a_machine_that_is_not_a_trusted_writer_writes_only_local() {
         }
     }
     let off = blaze_cas::plain::Settings { org: Some("acme".to_owned()), ..Default::default() };
-    assert_eq!(off.writes(), vec![Namespace::LOCAL]);
-    let said = crate::cmd::store_status(&blaze_cas::plain::Settings::default());
+    // The lists' allocator, made here (a few namespaces: an arena inside the test's frame).
+    let lists = blaze_own::fixed::Inline::<1024>::new();
+    assert_eq!(off.writes(&lists)[..], [Namespace::LOCAL]);
+    let said = crate::cmd::store_status(&blaze_cas::plain::Settings::default(), &lists);
     assert!(said.contains("nothing of it leaves this machine") && said.contains("trusted_writer is off"), "{said}");
     let on = blaze_cas::plain::Settings { trusted_writer: true, ..Default::default() };
-    assert!(crate::cmd::store_status(&on).contains("trusted_writer is on"));
+    assert!(crate::cmd::store_status(&on, &lists).contains("trusted_writer is on"));
 }
 
 #[test]
@@ -1309,4 +1318,22 @@ fn batches_and_outcomes_round_trip() {
         let outcome = Outcome { action: made.key, status, logs, usage: Usage { cpu_ns: tape.int::<u64>("cpu ns"), peak_bytes: tape.int::<u64>("peak bytes") } };
         assert_eq!(Outcome::decode(&outcome.encode(), made).expect("decodes"), outcome);
     });
+}
+
+#[test]
+fn find_cache_trim_evicts_lru_and_preserves_hot_blocks() {
+    use crate::find::{BLOCKS_CACHED, Cache};
+    let mut cache = Cache::default();
+    let shard = ContentId([7u8; 32]);
+    // Insert BLOCKS_CACHED + 4 blocks (0..BLOCKS_CACHED+4).
+    for i in 0..(BLOCKS_CACHED + 4) {
+        cache.keep_block(shard, i, Vec::new());
+    }
+    // Re-touch block 0 so it becomes the most recently used and survives LRU eviction.
+    cache.keep_block(shard, 0, Vec::new());
+    cache.trim_blocks();
+    assert!(cache.block(&shard, 0).is_some(), "re-touched hot block 0 must stay cached");
+    assert!(cache.block(&shard, 1).is_none(), "oldest cold block 1 must be evicted");
+    assert!(cache.block(&shard, 4).is_none(), "cold block 4 must be evicted");
+    assert!(cache.block(&shard, BLOCKS_CACHED + 3).is_some(), "newest block must stay cached");
 }

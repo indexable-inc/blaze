@@ -1,0 +1,15 @@
+{
+ "id": "run-line-runner-stopped",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane RS",
+ "where": "/Volumes/Projects/blaze-int-1112-notes/runner/ (stop and stop-real since 15:19) and runner.py ask",
+ "what": "lane RS asked at 15:36 for step 1 of `blaze run`'s live line; the queue held 13 requests and the runner had a `stop` file since 15:19, so nothing was served. `ask` says only 'N request(s) ahead of it' and then waits up to 50 minutes in silence; the Bash tool moved it to the background after 180 s, with its output piped through tail, so nothing showed that the queue was stopped.",
+ "cost": "about 20 minutes spent waiting and reading the queue's folder to find the stop file",
+ "cause": "ask does not look for the runner's stop file before it waits",
+ "whys": "the stop is the coordinator's switch, and a lane cannot see it from the ask's words",
+ "class": "a wait on a server that is not serving, with nothing saying so",
+ "prevention": "wanted: ask prints 'the runner is stopped (runner/stop since HH:MM): your request stays filed' and exits at once when the stop file is there",
+ "annoyance": "no word that the runner is stopped; the request stays filed after the ask is stopped, so a later serve of it is answered to no one",
+ "workaround": "read runner/stop and runner/log.md; stop the ask; go on writing; ask again once it serves",
+ "state": "open"
+}

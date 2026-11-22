@@ -1,0 +1,11 @@
+{
+ "id": "read-names-move-under-one-key",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane TV (incremental correctness of `blaze check`)",
+ "where": "crates/blaze-drive/src/request.rs (`Walk`, `follow`, `valued`, `made_split`), crates/blaze-cli/src/run_ids.rs (`record_reads`), crates/blaze-cli/src/tests/signature_grain_tests.rs",
+ "what": "After a first check, removing a fn another body calls made the drive refuse the caller's BodyCheck as `TwoValues { field: \"reads\" }`: the caller's key (its text) stood while the NAMES it read moved with an answer (its callee's file no longer held the callee), and every make put its shape at the task key, so the second shape under one key was taken for a second value. Then, past the drive: a removed module-level item (free fn, struct) is still not its reader's error: fresh it is a front2 gap (`Resolve(Path(PathError { .. why: Empty }))`), and incrementally the reader files `ItemStale` naming the removed item. Also met: the shared REPL's main lane let another lane overwrite a binding (use your own lane), and no Grep tool in this session (rg() in the REPL instead).",
+ "cost": "R9's removal test ignored; every edit that removes an item a body reads broke `blaze check` with a refusal instead of the error",
+ "cause": "what a task reads is a function of its key AND the answers to its earlier reads; the record layout assumed it a function of the key alone (one shape per task key)",
+ "workaround": "shapes are chained: a shape at the task key names the first reads; the value key of today's answers to them holds the record, or another shape (reads that followed from those answers), at most key::MOST_SHAPE_STEPS steps (rule 18). A make puts its shape in the hole its walk found, never over a held key. Two records under one key with every shared read answered alike are still refused (sim control `control_read_names_from_a_hidden_input_are_two_values`); the old layout is the plant `Plant::ShapeAtTaskKey`. The front-end half is open: test `a_module_level_item_removed_is_its_readers_error` (ignored) names it.",
+ "state": "drive fixed; front2 half open"
+}

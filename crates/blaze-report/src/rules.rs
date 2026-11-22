@@ -38,8 +38,8 @@ pub const RULES: &[Rule] = &[
     },
     Rule {
         id: "llvm:pin",
-        title: "blaze links only the LLVM crates/hir-ty-codegen/llvm.json pins",
-        text: "blaze links exactly one LLVM: the version and commit crates/hir-ty-codegen/llvm.json pins, built \
+        title: "blaze links only the LLVM pins/llvm.json pins",
+        text: "blaze links exactly one LLVM: the version and commit pins/llvm.json pins, built \
                by `.github/scripts/llvm.py build`, which writes `blaze-llvm.json` into the prefix it makes. \
                llvm-sys's build script finds it only through LLVM_SYS_231_PREFIX: no other variable, no PATH, \
                no Homebrew. A stock LLVM, or a build at another commit, is refused, since code generated against \

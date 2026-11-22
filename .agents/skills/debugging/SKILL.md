@@ -1,6 +1,6 @@
 ---
 name: debugging
-description: "How to find out why a blaze build did what it did from its profile parquet. Covers where the files are, the tables (spans, query_counts, provenance, key_parts, misses, task spans), how to run DuckDB (`blaze debug sql`, `blaze explain`, `BLAZE_DUCKDB`), and ready queries for top time by span, what reran and why, diffing two runs' keys, memory by task, admission waits and a cycle that won't settle. Also the method: reproduce, capture, query, claim a cause, remove it and watch the effect go. Adding spans and making a speed claim are `perf-and-tracing`; how memory is meant to be held is `memory-and-data`. Load before debugging a slow, rerunning, memory-hungry or non-converging build, before writing a query over the profile, and before making a claim about why a build did something."
+description: "How to find out why a blaze build did what it did from its profile parquet. Covers where the files are, the tables (spans, provenance, key_parts, misses, task spans), how to run DuckDB (`blaze debug sql`, `blaze explain`, `BLAZE_DUCKDB`; the commands are parked with blaze-cargo's CLI), and ready queries for top time by span, what reran and why, diffing two runs' keys, memory by task and a cycle that won't settle. Also the method: reproduce, capture, query, claim a cause, remove it and watch the effect go. Adding spans and making a speed claim are `perf-and-tracing`; how memory is meant to be held is `memory-and-data`. Load before debugging a slow, rerunning, memory-hungry or non-converging build, before writing a query over the profile, and before making a claim about why a build did something."
 ---
 
 # Debugging blaze from its profile
@@ -10,13 +10,13 @@ description: "How to find out why a blaze build did what it did from its profile
 ## ask-the-profile-first (rule 17)
 
 Every build already records its footprint and live bytes, each task's peak memory, its spans, its
-waits and what it reran and why, in `<BLAZE_HOME>/v2/profile/*.parquet` (every command writes it,
-with a daemon or without; a path that writes none is unfinished: `slow-is-p0-traced`). A why
-question (slow, rerunning, memory-hungry, idle workers, hung) starts with `blaze explain
-footprint_per_build`, `memory` or `worker_states` (and `task_memory` or `admission_waits` while
-admission exists), `blaze why`, or a `blaze debug sql` query on the home that showed it, and quotes
-the rows. A guess or a fresh experiment comes only after the rows can't answer, and then the gap
-gets a span or counter.
+waits and what it reran and why, in `<BLAZE_HOME>/v2/profile/*.parquet` (every command writes it; a
+path that writes none is unfinished: `slow-is-p0-traced`). A why question (slow, rerunning,
+memory-hungry, idle workers, hung) starts with `blaze explain footprint_per_build`, `memory` or
+`worker_states`, `blaze why`, or a `blaze debug sql` query on the home that showed it (these
+commands are parked with blaze-cargo's CLI; until the new command line has them, DuckDB over the
+parquet files), and quotes the rows. A guess or a fresh experiment comes only after the rows can't
+answer, and then the gap gets a span or counter.
 
 ## claims-from-evidence (rule 61)
 
@@ -158,7 +158,7 @@ The commands that run SQL (`blaze slow`, the problems `blaze why` adds, `blaze e
    (relative, empty, missing), it is that command's error, naming the variable, the path and
    `unset BLAZE_DUCKDB`; nothing else is tried.
 2. Unset: the DuckDB blaze pins (1.5.5, by SHA-256 per host in `DUCKDB_PINS`,
-   `crates/blaze-cargo/src/serve/observe.rs`), fetched once through the daemon's store with a
+   blaze-cargo's `serve/observe.rs`, deleted with the daemon), fetched once through the store with a
    line saying so and laid out at `<state>/duckdb/1.5.5-<sha16>/duckdb`
    (`crates/blaze-cargo/src/cli/duckdb.rs`). A failed fetch names the URL and the file.
 

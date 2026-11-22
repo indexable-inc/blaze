@@ -9,7 +9,8 @@ use blaze_core::temp::TempDir;
 use blaze_manifest::Config;
 use blaze_manifest::config::{CompileKind, Flags, Replacement};
 use blaze_manifest::files::Disk;
-use cargo_platform::Cfg;
+use blaze_manifest::schema::{ProfilePackageSpec, TomlDebugInfo, TomlOptLevel};
+use blaze_resolve::Cfg;
 
 struct Tree {
     root: PathBuf,
@@ -29,7 +30,7 @@ impl Tree {
         std::fs::create_dir_all(root.join("home")).unwrap();
         // Not the `\\?\` form `canonicalize` gives on Windows, which a path read back from a
         // `file:` URL is not, as cargo's is not.
-        Tree { root: dunce::canonicalize(root).unwrap(), _dir: dir }
+        Tree { root: std::fs::canonicalize(root).unwrap(), _dir: dir }
     }
 
     fn config(&self, env: &[(&str, &str)]) -> Config<Disk> {
@@ -227,11 +228,11 @@ fn profile_tables_read_as_manifest_profiles_with_their_variables() {
         ("CARGO_PROFILE_DEV_INCREMENTAL", "false"),
     ]);
     let dev = config.config_profile("dev").unwrap().unwrap().val;
-    let json = serde_json::to_value(&dev).unwrap();
-    assert_eq!(json["opt-level"], "s");
-    assert_eq!(json["debug"], "line-tables-only");
-    assert_eq!(json["incremental"], false);
-    assert_eq!(json["package"]["*"]["opt-level"], 3);
+    assert_eq!(dev.opt_level, Some(TomlOptLevel("s".to_owned())));
+    assert_eq!(dev.debug, Some(TomlDebugInfo::LineTablesOnly));
+    assert_eq!(dev.incremental, Some(false));
+    let all = &dev.package.as_ref().unwrap()[&ProfilePackageSpec::All];
+    assert_eq!(all.opt_level, Some(TomlOptLevel("3".to_owned())));
     let custom = config.config_profile("custom").unwrap().unwrap().val;
     assert_eq!(custom.inherits.as_deref(), Some("release"));
     assert!(config.config_profile("bench").unwrap().is_none());

@@ -1,0 +1,135 @@
+# What a body's environment holds: which clauses `C: Trait` implies, and whether the
+# environment must be normalized first.
+#
+# The reference's rule (rustc_hir_analysis collect/predicates_of.rs
+# `explicit_implied_clauses_of`, `PredicateFilter::SelfAndAssociatedTypeBounds`; elaborated by
+# rustc_type_ir elaborate.rs): `trait Tr: Super<A: B>` implies `Self: Super` AND
+# `<Self as Super>::A: B` (RFC 2289); a `where` predicate is implied only when its bounded type
+# is `Self`, so `trait Tr: Super where <Self as Super>::A: B` does NOT imply the bound
+# (rust-lang/rust#20671; the Reference, "Traits", "Supertraits"). Tempo's crypto stack takes
+# the first form everywhere: primeorder 0.14 `PrimeCurveParams: Curve<FieldBytesSize:
+# sec1::ModulusSize> + ..`, ecdsa 0.17 `EcdsaCurve: Curve<FieldBytesSize: Add<Output:
+# ArraySize<..>>> + ..`, with impls that write only `where C: PrimeCurveParams`.
+#
+# The environment: rustc normalizes it once before use (traits/mod.rs
+# `normalize_param_env_or_error`). blaze-solve does not: an env clause is matched lazily
+# (`Cx::eq`, `Relate::Lazy`), each non-rigid alias met becoming a nested projection goal under
+# the same env. The `env_normalized_*` cases are where the two could part: a clause holding a
+# projection the impl normalizes, matched against the normalized term and against an
+# inference variable, and the same with a where-bound that keeps the projection rigid (FL3's
+# rule, shadow.solve). Each answer is the normalized environment's.
+
+trait Curve { type FieldBytesSize; }
+trait ModulusSize
+trait PcpWhere: Curve where <Self as Curve>::FieldBytesSize: ModulusSize
+trait Pcp: Curve<FieldBytesSize: ModulusSize>
+trait Ecdsa: Curve<FieldBytesSize: Add<u32, Output: ModulusSize>>
+trait Bnd2 { type B: ModulusSize; }
+trait De
+struct Wrap<S>(S)
+impl<S: ModulusSize> De for Wrap<S>
+trait PartialOrd<Rhs>
+trait It2 { type Item; }
+struct Iter2<T>(T)
+impl<T> It2 for Iter2<T> { type Item = &T; }
+trait Tr2<X>
+
+# --- (a) a trait where-clause on a projection of `Self`: not implied ---
+
+case where_on_projection_not_implied = collect/predicates_of.rs explicit_implied_clauses_of (a where predicate whose bounded type is not Self)
+params C
+env C: PcpWhere
+goal <C as Curve>::FieldBytesSize: ModulusSize => no
+
+case where_on_projection_supertrait_still_implied = collect/predicates_of.rs explicit_implied_clauses_of (the header bound)
+params C
+env C: PcpWhere
+goal C: Curve => yes
+
+# --- (a') an associated item constraint in the supertrait list: implied ---
+
+case header_assoc_bound_implied = collect/predicates_of.rs explicit_implied_clauses_of (SelfAndAssociatedTypeBounds)
+params C
+env C: Pcp
+goal <C as Curve>::FieldBytesSize: ModulusSize => yes
+
+case header_assoc_bound_control = elaborate.rs elaborate (the cause removed: only `C: Curve`)
+params C
+env C: Curve
+goal <C as Curve>::FieldBytesSize: ModulusSize => no
+
+case header_assoc_bound_nested = collect/predicates_of.rs explicit_implied_clauses_of (`Super<A: Tr<B: C>>`, ecdsa's EcdsaCurve)
+params C
+env C: Ecdsa
+goal <<C as Curve>::FieldBytesSize as Add<u32>>::Output: ModulusSize => yes
+
+case header_assoc_bound_nested_middle = collect/predicates_of.rs explicit_implied_clauses_of (the outer constraint's trait bound)
+params C
+env C: Ecdsa
+goal <C as Curve>::FieldBytesSize: Add<u32> => yes
+
+case header_assoc_bound_nested_control = elaborate.rs elaborate (the other constraint's trait is no bound of the inner alias)
+params C
+env C: Ecdsa
+goal <C as Curve>::FieldBytesSize: ModulusSize => no
+
+# --- (b) an associated type's item bound: yes (alias.solve alias_bound_trait is the same rule) ---
+
+case item_bound_implied = assembly/mod.rs assemble_alias_bound_candidates (SelfBounds)
+params T
+env T: Bnd2
+goal <T as Bnd2>::B: ModulusSize => yes
+
+# --- (c) an impl where-clause on two projections, and through an impl ---
+
+case two_projection_where_clause = assembly/mod.rs assemble_param_env_candidates (the clause as written)
+params P Q
+env P: Deref; Q: Deref; <P as Deref>::Target: PartialOrd<<Q as Deref>::Target>
+goal <P as Deref>::Target: PartialOrd<<Q as Deref>::Target> => yes
+
+case two_projection_where_clause_infers_rhs = assembly/mod.rs assemble_param_env_candidates (the one candidate fixes Rhs)
+params P Q
+env P: Deref; Q: Deref; <P as Deref>::Target: PartialOrd<<Q as Deref>::Target>
+goal <P as Deref>::Target: PartialOrd<?0> => yes
+
+case two_projection_where_clause_other_rhs = assembly/mod.rs assemble_param_env_candidates (rigid aliases of two params differ)
+params P Q
+env P: Deref; Q: Deref; <P as Deref>::Target: PartialOrd<<Q as Deref>::Target>
+goal <P as Deref>::Target: PartialOrd<<P as Deref>::Target> => no
+
+case through_impl_header_assoc_bound = trait_goals.rs consider_impl_candidate (impl<S: ModulusSize> De for Wrap<S>, S the implied bound's alias)
+params C
+env C: Pcp
+goal Wrap<<C as Curve>::FieldBytesSize>: De => yes
+
+case through_impl_where_not_implied = trait_goals.rs consider_impl_candidate (the control: the bound written as a trait where-clause)
+params C
+env C: PcpWhere
+goal Wrap<<C as Curve>::FieldBytesSize>: De => no
+
+# --- the environment, normalized or matched lazily ---
+
+case env_normalized_concrete = traits/mod.rs normalize_param_env_or_error (the env clause is `u8: Tr2<&T>`)
+params T
+env u8: Tr2<<Iter2<T> as It2>::Item>
+goal u8: Tr2<&T> => yes
+
+case env_normalized_infers_normal_form = traits/mod.rs normalize_param_env_or_error (the variable takes the normalized term, not the alias)
+params T
+env u8: Tr2<<Iter2<T> as It2>::Item>
+goal u8: Tr2<?0> => yes ?0 = &T
+
+case env_normalized_other = traits/mod.rs normalize_param_env_or_error (another term is not the clause's)
+params T
+env u8: Tr2<<Iter2<T> as It2>::Item>
+goal u8: Tr2<&u8> => no
+
+case env_normalized_rigid_under_where_bound = traits/mod.rs normalize_param_env_or_error (normalized under itself: `Iter2<T>: It2` keeps the alias rigid)
+params T
+env Iter2<T>: It2; u8: Tr2<<Iter2<T> as It2>::Item>
+goal u8: Tr2<&T> => no
+
+case env_normalized_rigid_under_where_bound_itself = traits/mod.rs normalize_param_env_or_error (the rigid alias is the clause's own)
+params T
+env Iter2<T>: It2; u8: Tr2<<Iter2<T> as It2>::Item>
+goal u8: Tr2<<Iter2<T> as It2>::Item> => yes

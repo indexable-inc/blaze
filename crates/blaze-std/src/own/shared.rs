@@ -37,18 +37,21 @@ pub enum Released<#[blaze::linear] T> {
 }
 
 macro_rules! shared {
-    ($(#[$doc:meta])* $name:ident, $inner:ident) => {
+    ($(#[$doc:meta])* $name:ident, $inner:ident, $home:ty) => {
         $(#[$doc])*
         #[blaze::holds]
         pub struct $name<#[blaze::linear] T: ?Sized> {
             inner: $inner<T>,
+            /// Where the handle was made: for the one-thread handle, checked in a debug build
+            /// when it ends (`crate::sync::home`); nothing for the other.
+            home: $home,
         }
 
         impl<T> $name<T> {
             /// A handle to `value`, which is not of a linear type (one that is goes in through
             /// [`holding`](Self::holding)).
             pub fn new(value: T) -> $name<T> {
-                $name { inner: $inner::new(value) }
+                $name { inner: $inner::new(value), home: <$home>::here() }
             }
         }
 
@@ -57,7 +60,11 @@ macro_rules! shared {
             /// the value comes back from the last [`release`](Self::release).
             #[blaze::consumes]
             pub fn holding(value: T) -> $name<T> {
-                $name { inner: $inner::new(value) }
+                // Under rustc `Acyclic` is held of every type (own.rs): the walk is asserted
+                // here, for the instance, as it is compiled.
+                #[cfg(not(blaze))]
+                let () = const { assert!(super::reach::none::<T, super::reach::Cycle>()) };
+                $name { inner: $inner::new(value), home: <$home>::here() }
             }
 
             /// Ends this handle. The last one gives the value back.
@@ -73,7 +80,7 @@ macro_rules! shared {
         impl<#[blaze::linear] T: ?Sized + Acyclic> $name<T> {
             /// Another handle to the same value, to be released as this one is.
             pub fn share(&self) -> $name<T> {
-                $name { inner: $inner::clone(&self.inner) }
+                $name { inner: $inner::clone(&self.inner), home: <$home>::here() }
             }
         }
 
@@ -96,7 +103,7 @@ macro_rules! shared {
 
         impl<T: ?Sized> Clone for $name<T> {
             fn clone(&self) -> $name<T> {
-                $name { inner: $inner::clone(&self.inner) }
+                $name { inner: $inner::clone(&self.inner), home: <$home>::here() }
             }
         }
 
@@ -171,12 +178,23 @@ macro_rules! shared {
     };
 }
 
-shared! {
-    /// A counted handle safe across threads (`Arc` underneath). See the module's doc.
-    Shared, Arc
+/// The home of a handle safe across threads: none.
+struct AnyThread;
+
+impl AnyThread {
+    fn here() -> AnyThread {
+        AnyThread
+    }
 }
 
 shared! {
-    /// A counted handle for one thread (`Rc` underneath). See the module's doc.
-    LocalShared, Rc
+    /// A counted handle safe across threads (`Arc` underneath). See the module's doc.
+    Shared, Arc, AnyThread
+}
+
+shared! {
+    /// A counted handle for one thread (`Rc` underneath). See the module's doc. Each handle
+    /// checks, in a debug build, that it ends on the thread that made it
+    /// ([`crate::sync::home`]).
+    LocalShared, Rc, crate::sync::home::OneThread
 }

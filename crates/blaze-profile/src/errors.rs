@@ -8,13 +8,15 @@
 //! error has one, else one of blaze's ([`Kind`]), from what its message says. An error that
 //! names functions blaze could not compile ([`REFUSED_SAYS`]) is a row a function named.
 
-use arrow_array::{
-    ArrayRef, DictionaryArray, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
-    types::UInt32Type,
-};
-use arrow_schema::ArrowError;
+use std::alloc::Global;
 
-use crate::{batches, schema};
+use blaze_columns::{ColumnError, Texts};
+use blaze_hash::{FixedState, Map, MapOpts};
+
+use crate::{
+    columns::{self, Batch, BatchError, Column},
+    schema,
+};
 
 /// What the first line of an error naming the functions blaze could not compile says
 /// (blaze-cargo's `REFUSED_SAYS`, the same words).
@@ -352,31 +354,49 @@ fn header<'a>(line: &'a str, level: &str) -> Option<(Option<&'a str>, &'a str)> 
     Some((Some(code), message))
 }
 
-fn column(array: impl arrow_array::Array + 'static) -> ArrayRef {
-    // alloc: a batch's column, once a flush
-    std::sync::Arc::new(array)
-}
-
-fn dict<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
-    column(values.collect::<DictionaryArray<UInt32Type>>())
+/// A dictionary column of `values`, each distinct text keyed the first time it comes, null
+/// where `None`.
+pub(crate) fn dict<'a>(values: impl Iterator<Item = Option<&'a str>>) -> Result<Column, ColumnError> {
+    // alloc: a column's distinct texts and their keys, once a flush
+    let mut texts = Texts::new_in(Global);
+    let mut keys_of: Map<&'a str, u32, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
+    let mut keys = Vec::new(); // alloc: a column's keys, once a flush
+    for value in values {
+        let key = match value {
+            None => None,
+            Some(text) => {
+                let next = u32::try_from(texts.len())
+                    .map_err(|_| ColumnError::Offsets { why: "pass u32::MAX distinct values" })?;
+                Some(*keys_of.entry(text).or_insert_with(|| {
+                    texts.push(text);
+                    next
+                }))
+            }
+        };
+        keys.push(key);
+    }
+    Column::dict(keys, texts, Global)
 }
 
 /// The `errors` rows of `rows`.
-pub fn batch(rows: &[ErrorRow]) -> Result<RecordBatch, ArrowError> {
+pub fn batch(rows: &[ErrorRow]) -> Result<Batch, BatchError> {
+    let err = BatchError::of(&schema::ERRORS);
     // alloc: a batch's columns, once a flush
-    let columns: Vec<ArrayRef> = vec![
-        column(UInt64Array::from_iter_values(rows.iter().map(|it| it.build_id))),
-        column(Int64Array::from_iter(rows.iter().map(|it| it.t_ns))),
-        dict(rows.iter().map(|it| it.krate.as_deref())),
-        column(StringArray::from_iter(rows.iter().map(|it| it.unit.as_deref()))),
-        dict(rows.iter().map(|it| Some(it.kind.as_str()))),
-        column(StringArray::from_iter(rows.iter().map(|it| it.function.as_deref()))),
-        column(StringArray::from_iter_values(rows.iter().map(|it| it.message.as_str()))),
-        column(StringArray::from_iter(rows.iter().map(|it| it.detail.as_deref()))),
-        column(StringArray::from_iter(rows.iter().map(|it| it.file.as_deref()))),
-        column(UInt32Array::from_iter(rows.iter().map(|it| it.line))),
-    ];
-    RecordBatch::try_new(batches::schema_of(&schema::ERRORS), columns)
+    columns::batch(
+        &schema::ERRORS,
+        [
+            Column::values(rows.iter().map(|it| it.build_id), Global),
+            Column::options(rows.iter().map(|it| it.t_ns), Global),
+            dict(rows.iter().map(|it| it.krate.as_deref())).map_err(err)?,
+            Column::opt_texts_of(rows.iter().map(|it| it.unit.as_deref()), Global),
+            dict(rows.iter().map(|it| Some(it.kind.as_str()))).map_err(err)?,
+            Column::opt_texts_of(rows.iter().map(|it| it.function.as_deref()), Global),
+            Column::texts_of(rows.iter().map(|it| it.message.as_str()), Global),
+            Column::opt_texts_of(rows.iter().map(|it| it.detail.as_deref()), Global),
+            Column::opt_texts_of(rows.iter().map(|it| it.file.as_deref()), Global),
+            Column::options(rows.iter().map(|it| it.line), Global),
+        ],
+    )
 }
 
 #[cfg(test)]
@@ -513,6 +533,6 @@ blaze time: 279376.8 ms: client 279376.7 (100%), unaccounted 0.0 (0%)
         let rows = from_log(LOG);
         let batch = batch(&rows).unwrap();
         assert_eq!(batch.num_rows(), rows.len());
-        assert_eq!(batch.schema(), batches::schema_of(&schema::ERRORS));
+        assert_eq!(batch.fields(), columns::fields(&schema::ERRORS));
     }
 }

@@ -10,7 +10,7 @@
 //! (also checked in debug builds); where the value is untrusted or near the top of its range,
 //! use `checked_align_up`.
 
-use std::ops::Range;
+use core::ops::Range;
 
 macro_rules! align_fns {
     ($t:ty, $up:ident, $checked_up:ident, $down:ident, $is_aligned:ident, $padding:ident, $range:ident) => {

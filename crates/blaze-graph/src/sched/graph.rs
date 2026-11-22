@@ -5,7 +5,7 @@
 //! pool is. It knows nothing of cores: each job's home (its driver and its id there) says
 //! where a woken job goes. No IO, no clock.
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use std::alloc::Global;
 
 use super::{CLIENT, CounterId, Cycle, JobId, MAX_JOBS, NONE};
@@ -128,7 +128,7 @@ pub(crate) struct Graph {
     dfs: Vec<u32>,
 
     // Per key flight.
-    keys: HashMap<Key, u32, Global>, // alloc: a graph's key index, for the graph's life, longer than any task
+    keys: Map<Key, u32, FixedState, Global>, // alloc: a graph's key index, for the graph's life, longer than any task
     key_name: Vec<Key>,
     key_claimer: Vec<u32>,
     key_waiters: Vec<u32>,
@@ -270,7 +270,7 @@ impl Graph {
             jobs: Paged::new(VACANT),
             epoch: 0,
             dfs: Vec::with_capacity(64),
-            keys: HashMap::with_capacity_in(jobs, Global), // alloc: a graph's key index, for the graph's life, longer than any task
+            keys: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(jobs) }), // alloc: a graph's key index, for the graph's life, longer than any task
             key_name: Vec::with_capacity(jobs),
             key_claimer: Vec::with_capacity(jobs),
             key_waiters: Vec::with_capacity(jobs),
@@ -1166,12 +1166,6 @@ impl Graph {
         }
         self.freed_counters.append(&mut other.freed_counters);
         self.freed_keys.append(&mut other.freed_keys);
-    }
-
-    /// The job that makes `key`'s current flight, if a job does.
-    pub(crate) fn claimer(&self, key: Key) -> Option<JobId> {
-        let claimer = self.key_claimer[*self.keys.get(&key)? as usize];
-        (claimer != NONE).then_some(JobId(claimer))
     }
 
     /// The job `job`'s wait ends with: the one it waits for, or the claimer of the key it

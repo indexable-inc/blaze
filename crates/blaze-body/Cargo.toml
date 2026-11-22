@@ -1,0 +1,31 @@
+[package]
+name = "blaze-body"
+description = "The body, one complete typed generic form per body (docs/v2/plan/design/backend-next.md, \"One lowering\", D119): locals, places, constants, statements and terminators with unwind edges as fixed-width rows, the borrow facts of the flow, a builder, a text form, a verifier that returns a proof, and the record read in place"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# core only beside the crates it names; the allocator is a value the caller passes in.
+[dependencies]
+# `Vec`: every table, in the allocator the builder is given.
+blaze-own.workspace = true
+# `PTy`, `ItemKey`, `List`, `ExprId`, `PatId`, `Mutbl`: the checked record's portable types and
+# ids, which a body's types and identities are (the handles blaze-flow-lower lowers with).
+blaze-typeck.workspace = true
+# `record!`, `Writer`, `Slice`, `open_as`: the record, on `core` alone. By path, as blaze-lower
+# names it.
+blaze-format-core.workspace = true
+# `HashMap`, `FixedState`: the builder's interning indexes (places, constants, the type overlay),
+# in the builder's allocator. By path, as blaze-typeck names it (no serde, no shared tables).
+blaze-hash.workspace = true
+
+[lints]
+workspace = true

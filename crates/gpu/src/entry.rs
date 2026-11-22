@@ -2,11 +2,16 @@
 //! [`Param`]), the varyings' fields (through [`Varying`]), what it returns (through [`Output`]),
 //! and the slot each resource is bound at, assigned by [`layout`], the one home of that rule.
 //!
-//! `#[gpu::vertex]`, `#[gpu::fragment]` and `#[gpu::kernel]` write, next to the function, a module of its name
-//! holding its [`EntryDesc`] (`ENTRY`) and one [`Slot`] per resource parameter, named like the
-//! parameter. The host binds through those; the device backend reads the same constants by
+//! `#[gpu::vertex]`, `#[gpu::fragment]` and `#[gpu::kernel]` write, next to the function, a module
+//! of its name holding its [`EntryDesc`] (`ENTRY`) and one [`Slot`] per resource parameter, named
+//! like the parameter. The host binds through those; the device backend reads the same constants by
 //! const evaluation, so the two can't number differently.
-use crate::vec::{IVec2, IVec4, UVec2, UVec3, UVec4, Vec2, Vec3, Vec4};
+
+use crate::mat::{Mat2, Mat3, Mat4};
+use crate::vec::{IVec2, IVec3, IVec4, UVec2, UVec3, UVec4, Vec2, Vec3, Vec4};
+use core::cell::UnsafeCell;
+use core::marker::PhantomData;
+use core::ops::Deref;
 
 /// Which stage an entry point is.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -25,9 +30,31 @@ pub enum ValueTy {
     Vec3,
     Vec4,
     U32,
+    UVec2,
+    UVec3,
     UVec4,
     I32,
     IVec2,
+    IVec3,
+    IVec4,
+}
+
+impl ValueTy {
+    /// Whether this type is an integer scalar or vector (which must use `Flat` interpolation).
+    #[inline]
+    pub const fn is_integer(self) -> bool {
+        matches!(
+            self,
+            Self::U32
+                | Self::UVec2
+                | Self::UVec3
+                | Self::UVec4
+                | Self::I32
+                | Self::IVec2
+                | Self::IVec3
+                | Self::IVec4
+        )
+    }
 }
 
 /// How a varying is carried from the vertex stage's corners to a fragment.
@@ -169,6 +196,44 @@ impl EntryDesc {
         }
         None
     }
+
+    /// Flat Vulkan/WGSL `(group, binding)` for parameter `param_index`: resources are numbered
+    /// sequentially `0, 1, 2, ...` in group `0` in parameter order, while built-ins and varyings
+    /// return `None`.
+    pub const fn wgsl_binding(&self, param_index: usize) -> Option<(u32, u32)> {
+        if param_index >= self.params.len() {
+            return None;
+        }
+        if matches!(self.params[param_index].slot.table, Table::None) {
+            return None;
+        }
+        let mut binding = 0u32;
+        let mut i = 0usize;
+        while i < param_index {
+            if !matches!(self.params[i].slot.table, Table::None) {
+                binding += 1;
+            }
+            i += 1;
+        }
+        Some((0, binding))
+    }
+
+    /// Flat Vulkan/WGSL `(group, binding)` for the storage-buffer sizes table, immediately after
+    /// the last resource parameter in group `0`, or `None` when this entry binds no storage buffer.
+    pub const fn wgsl_sizes_binding(&self) -> Option<(u32, u32)> {
+        if self.sizes.is_none() {
+            return None;
+        }
+        let mut binding = 0u32;
+        let mut i = 0usize;
+        while i < self.params.len() {
+            if !matches!(self.params[i].slot.table, Table::None) {
+                binding += 1;
+            }
+            i += 1;
+        }
+        Some((0, binding))
+    }
 }
 
 /// The most threads a workgroup holds: Metal's `maxTotalThreadsPerThreadgroup` on every GPU
@@ -285,10 +350,9 @@ pub const fn layout<const N: usize>(names: [&'static str; N], kinds: [Kind; N]) 
 
 /// Where an entry point with these parameters binds the sizes of its storage buffers: the buffer
 /// slot after its last buffer, when it has a storage buffer (`&[T]` or `&RawOut<T>`); the one
-/// home of that rule,
-/// which the device backend reads back from `EntryDesc::sizes` by const evaluation. A slice's
-/// length on the device is its buffer's size over its stride, and Metal gives a shader no buffer's
-/// size, so the host passes them (naga's MSL `sizes_buffer`).
+/// home of that rule, which the device backend reads back from `EntryDesc::sizes` by const
+/// evaluation. A slice's length on the device is its buffer's size over its stride, and Metal
+/// gives a shader no buffer's size, so the host passes them.
 pub const fn sizes_slot(params: &[ParamDesc]) -> Option<Slot> {
     let (mut storage, mut next) = (false, 0u32);
     let mut i = 0;
@@ -306,7 +370,10 @@ pub const fn sizes_slot(params: &[ParamDesc]) -> Option<Slot> {
     if !storage {
         return None;
     }
-    assert!(next < MAX_BUFFERS, "an entry point binds storage buffers in all 31 of Metal's buffer slots, leaving none for their sizes");
+    assert!(
+        next < MAX_BUFFERS,
+        "an entry point binds storage buffers in all 31 of Metal's buffer slots, leaving none for their sizes"
+    );
     Some(Slot { table: Table::Buffer, index: next })
 }
 
@@ -325,7 +392,7 @@ pub const fn layout_fields<const N: usize>(names: [&'static str; N], kinds: [Fie
             }
             FieldKind::Value { ty, interp } => {
                 // Integers are not interpolated: Metal, Vulkan and WebGPU each refuse one that isn't flat.
-                if let ValueTy::U32 | ValueTy::UVec4 | ValueTy::I32 | ValueTy::IVec2 = ty {
+                if ty.is_integer() {
                     assert!(
                         matches!(interp, Interp::Flat),
                         "an integer varying must be Flat<T>: integers are not interpolated"
@@ -374,7 +441,54 @@ pub trait Output {
 /// # Safety
 ///
 /// Every bit pattern of `size_of::<Self>()` bytes is a valid `Self`, and `Self` has no padding.
-pub unsafe trait Pod: Copy + 'static {}
+pub unsafe trait Pod: Copy + 'static {
+    /// Views `self` as its exact byte representation (zero copy, no uninitialized padding).
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        let ptr = (&raw const *self).cast::<u8>();
+        let len = core::mem::size_of::<Self>();
+        // SAFETY: `Self: Pod` has no padding, so all `size_of::<Self>()` bytes starting at `ptr`
+        // are initialized and valid for reading for the lifetime of `&self`.
+        unsafe { core::slice::from_raw_parts(ptr, len) }
+    }
+
+    /// Views `self` as a mutable byte slice.
+    #[inline]
+    fn as_bytes_mut(&mut self) -> &mut [u8] {
+        let ptr = (&raw mut *self).cast::<u8>();
+        let len = core::mem::size_of::<Self>();
+        // SAFETY: `Self: Pod` accepts every bit pattern and has no padding, so mutating any byte
+        // within `size_of::<Self>()` preserves validity of `Self`.
+        unsafe { core::slice::from_raw_parts_mut(ptr, len) }
+    }
+
+    /// Zero-copy borrows `bytes` as `&Self` if its length equals `size_of::<Self>()` and its
+    /// pointer meets `align_of::<Self>()`.
+    #[inline]
+    fn from_bytes(bytes: &[u8]) -> Option<&Self> {
+        if bytes.len() != core::mem::size_of::<Self>() {
+            return None;
+        }
+        let ptr = bytes.as_ptr().cast::<Self>();
+        if !ptr.is_aligned() {
+            return None;
+        }
+        // SAFETY: `bytes.len() == size_of::<Self>()`, `ptr` is aligned to `align_of::<Self>()`,
+        // all bytes are initialized, and `Self: Pod` allows any bit pattern.
+        Some(unsafe { &*ptr })
+    }
+
+    /// Copies a `Self` from `bytes` (alignment-independent) if `bytes.len() == size_of::<Self>()`.
+    #[inline]
+    fn from_bytes_copy(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != core::mem::size_of::<Self>() {
+            return None;
+        }
+        let ptr = bytes.as_ptr().cast::<Self>();
+        // SAFETY: `bytes.len() == size_of::<Self>()` and `Self: Pod` accepts every bit pattern.
+        Some(unsafe { core::ptr::read_unaligned(ptr) })
+    }
+}
 
 macro_rules! pod {
     ($($t:ty),+) => {$(
@@ -382,7 +496,7 @@ macro_rules! pod {
         unsafe impl Pod for $t {}
     )+};
 }
-pod!(f32, u32, i32, Vec2, Vec3, Vec4, UVec2, UVec3, UVec4, IVec2, IVec4);
+pod!(f32, u32, i32, Vec2, Vec3, Vec4, UVec2, UVec3, UVec4, IVec2, IVec3, IVec4, Mat2, Mat3, Mat4);
 // SAFETY: an array of `Pod` has no padding between its elements and every bit pattern is a value.
 unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
 
@@ -401,7 +515,20 @@ macro_rules! value {
         }
     )+};
 }
-value!(f32 => F32, Vec2 => Vec2, Vec3 => Vec3, Vec4 => Vec4, u32 => U32, UVec4 => UVec4, i32 => I32, IVec2 => IVec2);
+value!(
+    f32 => F32,
+    Vec2 => Vec2,
+    Vec3 => Vec3,
+    Vec4 => Vec4,
+    u32 => U32,
+    UVec2 => UVec2,
+    UVec3 => UVec3,
+    UVec4 => UVec4,
+    i32 => I32,
+    IVec2 => IVec2,
+    IVec3 => IVec3,
+    IVec4 => IVec4
+);
 
 impl Output for Vec4 {
     const OUT: Out = Out::Color;
@@ -442,10 +569,10 @@ impl Param for InstanceIndex {
 }
 
 /// A kernel thread's identity: where it is in the grid, in its workgroup, and which workgroup.
-/// Only the kernel ABI makes one: it is not `Copy` or `Clone` and has no public constructor, so
-/// the safe writes plan.md adds can key on it (docs/future/gpu/plan.md, "Memory safety by
-/// construction").
-#[derive(Debug, PartialEq)]
+/// Only the kernel ABI (and [`crate::cpu`] dispatch) makes one: it is not `Copy` or `Clone` and has
+/// no public constructor, so safe disjoint views ([`crate::compute::Out`],
+/// [`crate::compute::SharedWrite`]) can key on it.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Thread {
     global: UVec3,
     local: UVec3,
@@ -453,28 +580,40 @@ pub struct Thread {
 }
 
 impl Thread {
-    /// A Thread for this crate's tests; nothing else makes one but the kernel ABI.
+    #[inline]
+    pub(crate) const fn new(global: UVec3, local: UVec3, group: UVec3) -> Thread {
+        Thread { global, local, group }
+    }
+
+    /// A Thread for this crate's tests; nothing else makes one outside the kernel ABI and CPU
+    /// dispatcher.
     #[cfg(test)]
     pub(crate) fn new_for_tests(global: UVec3, local: UVec3, group: UVec3) -> Thread {
-        Thread { global, local, group }
+        Self::new(global, local, group)
     }
 
     /// The thread's position in the whole grid (`SV_DispatchThreadID`): `group * threads + local`.
     #[inline]
-    pub fn global(&self) -> UVec3 {
+    pub const fn global(&self) -> UVec3 {
         self.global
     }
 
     /// The thread's position in its workgroup (`SV_GroupThreadID`).
     #[inline]
-    pub fn local(&self) -> UVec3 {
+    pub const fn local(&self) -> UVec3 {
         self.local
     }
 
     /// The workgroup's position in the grid (`SV_GroupID`).
     #[inline]
-    pub fn group(&self) -> UVec3 {
+    pub const fn group(&self) -> UVec3 {
         self.group
+    }
+
+    /// Linear index of this thread within a workgroup of size `threads`.
+    #[inline]
+    pub const fn local_index(&self, threads: UVec3) -> usize {
+        ((self.local.z * threads.y + self.local.y) * threads.x + self.local.x) as usize
     }
 }
 
@@ -482,17 +621,26 @@ impl Param for Thread {
     const KIND: Kind = Kind::Thread;
 }
 
-/// A storage buffer of `T`s that a kernel reads and writes: plan.md's raw writer. Indexing is
-/// checked against [`RawOut::len`] (a failed check ends the invocation, like every panic on the
-/// device); what a check can't see, two threads touching one element in one launch, is why
-/// [`RawOut::read`] and [`RawOut::write`] are `unsafe`. Only the device has one, like
-/// [`Texture2d`]: the methods' host bodies panic naming themselves.
-pub struct RawOut<T> {
-    _device_only: (),
-    _of: core::marker::PhantomData<T>,
-}
+/// A storage buffer of `T`s that a kernel reads and writes: indexing is checked against
+/// [`RawOut::len`] (a failed check ends the invocation); what a check can't see — two threads
+/// touching one element in one launch — is why [`RawOut::read`] and [`RawOut::write`] are `unsafe`.
+///
+/// On the host, construct a slice-backed view via [`RawOut::from_slice`], with zero heap
+/// allocations and borrow-checked lifetime safety.
+#[repr(transparent)]
+pub struct RawOut<T>([UnsafeCell<T>]);
 
 impl<T: Pod> RawOut<T> {
+    /// Views a host mutable slice as a `&RawOut<T>` for CPU kernel execution.
+    #[inline]
+    pub fn from_slice(slice: &mut [T]) -> &Self {
+        let ptr = (&raw mut *slice) as *const [UnsafeCell<T>] as *const Self;
+        // SAFETY: `RawOut<T>` is `#[repr(transparent)]` over `[UnsafeCell<T>]`, and `UnsafeCell<T>`
+        // is `#[repr(transparent)]` over `T`. Exclusive access to `&mut [T]` guarantees no other
+        // references exist for the returned shared borrow lifetime.
+        unsafe { &*ptr }
+    }
+
     /// How many `T`s the buffer holds.
     #[inline]
     pub fn len(&self) -> usize {
@@ -513,7 +661,8 @@ impl<T: Pod> RawOut<T> {
     #[inline]
     pub unsafe fn read(&self, i: usize) -> T {
         assert!(i < self.len(), "RawOut::read past the end");
-        self.load(i)
+        // SAFETY: Caller guarantees no concurrent write to element `i`; bounds checked above.
+        unsafe { self.load(i) }
     }
 
     /// Writes `v` at element `i`. Past the end, the invocation ends.
@@ -524,31 +673,34 @@ impl<T: Pod> RawOut<T> {
     #[inline]
     pub unsafe fn write(&self, i: usize, v: T) {
         assert!(i < self.len(), "RawOut::write past the end");
-        self.store(i, v)
+        // SAFETY: Caller guarantees exclusive access to element `i`; bounds checked above.
+        unsafe { self.store(i, v) }
     }
 
-    // The three the device backend lowers by path (blaze-shader's intrinsics table).
+    // The three methods lowered by path on the device backend, backed by the host slice on CPU.
 
     #[inline(never)]
     fn count(&self) -> usize {
-        crate::intrinsic::device_only("RawOut::len")
+        self.0.len()
     }
 
     #[inline(never)]
-    fn load(&self, i: usize) -> T {
-        let _ = i;
-        crate::intrinsic::device_only("RawOut::read")
+    unsafe fn load(&self, i: usize) -> T {
+        let ptr = self.0[i].get();
+        // SAFETY: Caller ensures no concurrent write to `self.0[i]` and `T: Copy`.
+        unsafe { *ptr }
     }
 
     #[inline(never)]
-    fn store(&self, i: usize, v: T) {
-        let _ = (i, v);
-        crate::intrinsic::device_only("RawOut::write")
+    unsafe fn store(&self, i: usize, v: T) {
+        let ptr = self.0[i].get();
+        // SAFETY: Caller ensures exclusive access to `self.0[i]`.
+        unsafe { *ptr = v; }
     }
 }
 
 impl<T: Pod> Param for &RawOut<T> {
-    const KIND: Kind = Kind::RawOut { stride: size_of::<T>() as u32 };
+    const KIND: Kind = Kind::RawOut { stride: core::mem::size_of::<T>() as u32 };
 }
 
 /// `SV_Position`: written by the vertex stage as the clip position, read by the fragment stage as
@@ -576,7 +728,7 @@ impl<T: Value> Varying for Linear<T> {
     const KIND: FieldKind = FieldKind::Value { ty: T::TY, interp: Interp::Linear };
 }
 
-impl<T> core::ops::Deref for Flat<T> {
+impl<T> Deref for Flat<T> {
     type Target = T;
     #[inline]
     fn deref(&self) -> &T {
@@ -584,7 +736,7 @@ impl<T> core::ops::Deref for Flat<T> {
     }
 }
 
-impl<T> core::ops::Deref for Linear<T> {
+impl<T> Deref for Linear<T> {
     type Target = T;
     #[inline]
     fn deref(&self) -> &T {
@@ -593,22 +745,175 @@ impl<T> core::ops::Deref for Linear<T> {
 }
 
 impl<T: Pod> Param for &T {
-    const KIND: Kind = Kind::Uniform { size: size_of::<T>() as u32 };
+    const KIND: Kind = Kind::Uniform { size: core::mem::size_of::<T>() as u32 };
 }
 
 impl<T: Pod> Param for &[T] {
-    const KIND: Kind = Kind::Storage { stride: size_of::<T>() as u32 };
+    const KIND: Kind = Kind::Storage { stride: core::mem::size_of::<T>() as u32 };
 }
 
-/// A sampled 2D texture of four floats. Only the device has one: the host can't make it, so a
-/// fragment stage that samples runs only there (until plan.md's CPU backend).
-pub struct Texture2d {
-    _device_only: (),
+/// Texture filtering mode for [`Sampler`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Filter {
+    Nearest,
+    Linear,
 }
 
-/// A sampler. Only the device has one, like [`Texture2d`].
+/// Texture coordinate addressing mode for [`Sampler`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AddressMode {
+    ClampToEdge,
+    Repeat,
+    MirroredRepeat,
+}
+
+/// A texture sampler with filtering and addressing modes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Sampler {
-    _device_only: (),
+    pub filter: Filter,
+    pub address_u: AddressMode,
+    pub address_v: AddressMode,
+}
+
+impl Sampler {
+    pub const NEAREST_CLAMP: Self = Self::new(Filter::Nearest, AddressMode::ClampToEdge);
+    pub const LINEAR_CLAMP: Self = Self::new(Filter::Linear, AddressMode::ClampToEdge);
+    pub const LINEAR_REPEAT: Self = Self::new(Filter::Linear, AddressMode::Repeat);
+
+    /// Creates a sampler with the same addressing mode on U and V.
+    #[inline]
+    pub const fn new(filter: Filter, address: AddressMode) -> Self {
+        Self { filter, address_u: address, address_v: address }
+    }
+
+    /// Creates a sampler with independent U and V addressing modes.
+    #[inline]
+    pub const fn with_address(filter: Filter, address_u: AddressMode, address_v: AddressMode) -> Self {
+        Self { filter, address_u, address_v }
+    }
+}
+
+impl Default for Sampler {
+    #[inline]
+    fn default() -> Self {
+        Self::LINEAR_CLAMP
+    }
+}
+
+/// A sampled 2D RGBA32F texture (with optional mip chain).
+///
+/// On the host, construct one backed by a caller slice via [`Texture2d::from_rgba32f`] or
+/// [`Texture2d::from_rgba32f_mips`], returning a [`HostTexture2d`] guard that dereferences to
+/// `&Texture2d` with zero heap allocations.
+pub struct Texture2d {
+    width: u32,
+    height: u32,
+    mip_levels: u32,
+    ptr: *const Vec4,
+    len: usize,
+}
+
+/// Lifetime-bound host handle owning a slice-backed [`Texture2d`].
+pub struct HostTexture2d<'a> {
+    inner: Texture2d,
+    _borrow: PhantomData<&'a [Vec4]>,
+}
+
+// SAFETY: `HostTexture2d` holds an immutable borrow of `&'a [Vec4]` (`Vec4: Sync`), never mutated.
+unsafe impl Send for HostTexture2d<'_> {}
+// SAFETY: `HostTexture2d` is read-only and shares only immutable `&[Vec4]` reads.
+unsafe impl Sync for HostTexture2d<'_> {}
+
+impl Deref for HostTexture2d<'_> {
+    type Target = Texture2d;
+    #[inline]
+    fn deref(&self) -> &Texture2d {
+        &self.inner
+    }
+}
+
+impl Texture2d {
+    /// Constructs a single-mip RGBA32F host texture from a tightly packed row-major `pixels` slice
+    /// of length at least `width * height`.
+    pub fn from_rgba32f(width: u32, height: u32, pixels: &[Vec4]) -> HostTexture2d<'_> {
+        Self::from_rgba32f_mips(width, height, 1, pixels)
+    }
+
+    /// Constructs a mip-chained RGBA32F host texture where mip levels `0..mip_levels` are stored
+    /// contiguously in `pixels` (level `l` has dimensions `(width >> l).max(1) × (height >> l).max(1)`).
+    pub fn from_rgba32f_mips(width: u32, height: u32, mip_levels: u32, pixels: &[Vec4]) -> HostTexture2d<'_> {
+        assert!(width > 0 && height > 0, "Texture2d dimensions must be non-zero");
+        assert!(mip_levels > 0, "Texture2d must have at least one mip level");
+        let needed = mip_chain_texels(width, height, mip_levels);
+        assert!(
+            pixels.len() >= needed,
+            "Texture2d pixel slice too small: need {needed} texels, got {}",
+            pixels.len()
+        );
+        HostTexture2d {
+            inner: Texture2d {
+                width,
+                height,
+                mip_levels,
+                ptr: pixels.as_ptr(),
+                len: needed,
+            },
+            _borrow: PhantomData,
+        }
+    }
+
+    /// Width of mip level 0 in texels.
+    #[inline]
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Height of mip level 0 in texels.
+    #[inline]
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Number of mip levels stored in this texture.
+    #[inline]
+    pub const fn mip_levels(&self) -> u32 {
+        self.mip_levels
+    }
+
+    /// Returns `(mip_width, mip_height, mip_texels)` for `level` (clamped to `mip_levels - 1`).
+    pub(crate) fn mip_slice(&self, level: u32) -> (u32, u32, &[Vec4]) {
+        let clamped = if level >= self.mip_levels { self.mip_levels - 1 } else { level };
+        let mut offset = 0usize;
+        let mut w = self.width;
+        let mut h = self.height;
+        let mut cur = 0u32;
+        while cur < clamped {
+            offset += (w as usize) * (h as usize);
+            w = (w >> 1).max(1);
+            h = (h >> 1).max(1);
+            cur += 1;
+        }
+        let count = (w as usize) * (h as usize);
+        // SAFETY: `Texture2d` can only be constructed via `HostTexture2d<'a>` from a valid
+        // `&'a [Vec4]` of length at least `self.len`, and `offset + count <= self.len`.
+        let all = unsafe { core::slice::from_raw_parts(self.ptr, self.len) };
+        (w, h, &all[offset..offset + count])
+    }
+}
+
+/// Total number of texels required for a 2D mip chain of `mip_levels` starting at `width × height`.
+pub const fn mip_chain_texels(width: u32, height: u32, mip_levels: u32) -> usize {
+    let mut total = 0usize;
+    let mut w = width;
+    let mut h = height;
+    let mut i = 0u32;
+    while i < mip_levels {
+        total += (w as usize) * (h as usize);
+        w = if (w >> 1) > 0 { w >> 1 } else { 1 };
+        h = if (h >> 1) > 0 { h >> 1 } else { 1 };
+        i += 1;
+    }
+    total
 }
 
 impl Param for &Texture2d {

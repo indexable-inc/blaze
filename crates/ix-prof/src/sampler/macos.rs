@@ -11,13 +11,15 @@ use std::{
 };
 
 use super::{DEPTH, OFF_CPU_EVERY, Sample, Sink, Unsampled};
+use blaze_sys::posix::{
+    proc::{TH_STATE_RUNNING, kern_return_t, natural_t},
+    thread::{self, KERN_SUCCESS, mach_msg_type_number_t, mach_port_t as Port, thread_flavor_t},
+};
 
 pub(super) const HOW: &str = "every thread (task_threads), running ones each tick and blocked ones every 10th, stopped (thread_suspend) and its frame pointers walked";
 
 /// How often the samples taken are handed to the sink.
 const KEEP_EVERY: Duration = Duration::from_millis(100);
-
-type Port = libc::mach_port_t;
 
 unsafe extern "C" {
     static mach_task_self_: Port;
@@ -25,22 +27,21 @@ unsafe extern "C" {
     fn task_threads(
         task: Port,
         list: *mut *mut Port,
-        count: *mut libc::mach_msg_type_number_t,
-    ) -> libc::kern_return_t;
-    fn mach_port_deallocate(task: Port, name: Port) -> libc::kern_return_t;
-    fn vm_deallocate(task: Port, address: usize, size: usize) -> libc::kern_return_t;
-    fn thread_suspend(target: Port) -> libc::kern_return_t;
-    fn thread_resume(target: Port) -> libc::kern_return_t;
+        count: *mut mach_msg_type_number_t,
+    ) -> kern_return_t;
+    fn mach_port_deallocate(task: Port, name: Port) -> kern_return_t;
+    fn vm_deallocate(task: Port, address: usize, size: usize) -> kern_return_t;
+    fn thread_suspend(target: Port) -> kern_return_t;
+    fn thread_resume(target: Port) -> kern_return_t;
     fn thread_get_state(
         target: Port,
-        flavor: libc::thread_flavor_t,
-        state: *mut libc::natural_t,
-        count: *mut libc::mach_msg_type_number_t,
-    ) -> libc::kern_return_t;
-    fn pthread_from_mach_thread_np(port: Port) -> libc::pthread_t;
+        flavor: thread_flavor_t,
+        state: *mut natural_t,
+        count: *mut mach_msg_type_number_t,
+    ) -> kern_return_t;
 }
 
-const ARM_THREAD_STATE64: libc::thread_flavor_t = 6;
+const ARM_THREAD_STATE64: thread_flavor_t = 6;
 
 /// `arm_thread_state64_t`.
 #[repr(C)]
@@ -55,8 +56,7 @@ struct State {
     pad: u32,
 }
 
-const STATE_COUNT: libc::mach_msg_type_number_t =
-    (size_of::<State>() / size_of::<libc::natural_t>()) as _;
+const STATE_COUNT: mach_msg_type_number_t = (size_of::<State>() / size_of::<natural_t>()) as _;
 const _: () = assert!(STATE_COUNT == 68);
 
 /// User addresses on arm64 macOS are below 2^47; above are tag bits.
@@ -74,26 +74,24 @@ struct Bounds {
 fn bounds(port: Port) -> Option<(Bounds, Option<String>)> {
     // SAFETY: `pthread_from_mach_thread_np` looks the port up in the thread list under its
     // lock and gives null for a thread that is not a pthread or is gone.
-    let thread = unsafe { pthread_from_mach_thread_np(port) };
-    // SAFETY: `pthread_t` is a pointer or an integer by libc version; all zeros is null in both.
-    let null: libc::pthread_t = unsafe { std::mem::zeroed() };
-    if thread == null {
+    let thread = unsafe { thread::pthread_from_mach_thread_np(port) };
+    if thread.is_null() {
         return None;
     }
     // SAFETY: these validate `thread` against the thread list under its lock, and give 0 for
     // a thread that has gone since.
-    let high = unsafe { libc::pthread_get_stackaddr_np(thread) } as u64;
+    let high = unsafe { thread::pthread_get_stackaddr_np(thread) } as u64;
     // SAFETY: as above.
-    let size = unsafe { libc::pthread_get_stacksize_np(thread) } as u64;
+    let size = unsafe { thread::pthread_get_stacksize_np(thread) } as u64;
     let mut tid = 0u64;
     // SAFETY: as above; `tid` is a u64 to write. A gone thread is an error, left at 0.
-    unsafe { libc::pthread_threadid_np(thread, &mut tid) };
+    unsafe { thread::pthread_threadid_np(thread, &mut tid) };
     if high == 0 || size == 0 || tid == 0 {
         return None;
     }
-    let mut name = [0 as libc::c_char; 64];
+    let mut name = [0 as core::ffi::c_char; 64];
     // SAFETY: `name` is 64 bytes to write a NUL-terminated name into.
-    let named = unsafe { libc::pthread_getname_np(thread, name.as_mut_ptr(), name.len()) } == 0;
+    let named = unsafe { thread::pthread_getname_np(thread, name.as_mut_ptr(), name.len()) } == 0;
     // SAFETY: on success the buffer holds a NUL-terminated string.
     let name = named
         .then(|| unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }.to_string_lossy().into_owned())
@@ -107,28 +105,7 @@ pub(super) fn check(_hz: u32) -> Result<(), Unsampled> {
 
 /// Whether the thread is on a CPU now: a thread blocked in the kernel uses none.
 fn running(port: Port) -> bool {
-    let mut info = libc::thread_basic_info {
-        user_time: libc::time_value_t { seconds: 0, microseconds: 0 },
-        system_time: libc::time_value_t { seconds: 0, microseconds: 0 },
-        cpu_usage: 0,
-        policy: 0,
-        run_state: 0,
-        flags: 0,
-        suspend_count: 0,
-        sleep_time: 0,
-    };
-    let mut count = libc::THREAD_BASIC_INFO_COUNT;
-    // SAFETY: `info` is a `thread_basic_info` of `count` words to fill; a dead port is an
-    // error, not undefined behavior.
-    let got = unsafe {
-        libc::thread_info(
-            port,
-            libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
-            (&raw mut info).cast(),
-            &mut count,
-        )
-    };
-    got == libc::KERN_SUCCESS && info.run_state == libc::TH_STATE_RUNNING
+    thread::thread_basic_info_of(port).is_ok_and(|info| info.run_state == TH_STATE_RUNNING)
 }
 
 pub(super) fn run(hz: u32, sink: &Sink, stop: &AtomicBool) {
@@ -147,9 +124,9 @@ pub(super) fn run(hz: u32, sink: &Sink, stop: &AtomicBool) {
         let started = Instant::now();
         tick = tick.wrapping_add(1);
         let mut list: *mut Port = std::ptr::null_mut();
-        let mut count: libc::mach_msg_type_number_t = 0;
+        let mut count: mach_msg_type_number_t = 0;
         // SAFETY: `list` and `count` are written with an array of send rights the caller owns.
-        if unsafe { task_threads(task, &mut list, &mut count) } == libc::KERN_SUCCESS {
+        if unsafe { task_threads(task, &mut list, &mut count) } == KERN_SUCCESS {
             for i in 0..count as usize {
                 // SAFETY: `list` holds `count` ports.
                 let port = unsafe { *list.add(i) };
@@ -201,7 +178,7 @@ fn sample(port: Port, b: Bounds, on_cpu: bool, weight_ns: u64) -> Option<Sample>
     };
     // SAFETY: a live thread's port, not this thread's; a thread that has gone since its bounds
     // were read fails here, so a stopped thread's stack is the one `b` describes.
-    if unsafe { thread_suspend(port) } != libc::KERN_SUCCESS {
+    if unsafe { thread_suspend(port) } != KERN_SUCCESS {
         return None;
     }
     let mut state = State::default();
@@ -209,12 +186,12 @@ fn sample(port: Port, b: Bounds, on_cpu: bool, weight_ns: u64) -> Option<Sample>
     // SAFETY: `state` is an `arm_thread_state64_t` of `count` words to fill, of the stopped thread.
     let got =
         unsafe { thread_get_state(port, ARM_THREAD_STATE64, (&raw mut state).cast(), &mut count) };
-    if got == libc::KERN_SUCCESS {
+    if got == KERN_SUCCESS {
         walk(&state, b.low, b.high, &mut sample);
     }
     // SAFETY: the thread suspended above, resumed once.
     unsafe { thread_resume(port) };
-    (got == libc::KERN_SUCCESS && sample.depth > 0).then_some(sample)
+    (got == KERN_SUCCESS && sample.depth > 0).then_some(sample)
 }
 
 /// The stopped thread's PC, then the return address of each frame record from its frame

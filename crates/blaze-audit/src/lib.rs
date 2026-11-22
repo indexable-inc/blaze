@@ -23,7 +23,6 @@
 
 pub mod advisory;
 pub mod audit;
-pub mod cargo_lock;
 pub mod date;
 pub mod fetch;
 pub mod pins;

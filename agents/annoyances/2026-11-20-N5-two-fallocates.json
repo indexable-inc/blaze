@@ -1,0 +1,13 @@
+{
+  "id": "two-fallocates-one-undeclared",
+  "date": "2026-11-20",
+  "who": "claude-opus-5-5 (Claude Opus 5.5), lane N5 (no C library on Linux)",
+  "where": "crates/blaze-sys/src/linux/block.rs (fallocate, D182) and linux/fdctl.rs (fallocate, lane N3)",
+  "what": "grep for fallocate under linux/ found block.rs's typed fallocate first; I re-exported it, but block.rs is not declared in linux/mod.rs, so the path does not resolve. fdctl.rs (declared) has its own fallocate with FallocateFlags. Two typed homes for one call.",
+  "cost": "one wrong re-export, fixed after lane N3 said so",
+  "cause": "two pieces (D182 block, D180 N3) each wrote the call in the same hour; neither home was declared when the other was written",
+  "class": "a concept with two homes written in parallel (rule 30)",
+  "prevention": "the D182 lane should call linux::fdctl::fallocate and delete block.rs's copy; check linux/mod.rs before reusing an item found by grep",
+  "workaround": "posix::proc uses crate::linux::fdctl::{fallocate, FallocateFlags}",
+  "state": "open"
+}

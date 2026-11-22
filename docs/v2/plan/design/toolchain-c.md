@@ -16,7 +16,7 @@ error naming it and how to get ours, never a quiet use of the machine's.
 ## What comes from the machine today
 
 LLVM is pinned already: `vendor/llvm-sys/pin.rs` accepts only the prefix whose `blaze-llvm.json`
-matches `crates/hir-ty-codegen/llvm.json`, built by `.github/scripts/llvm.py` and fetched by sha256
+matches `pins/llvm.json`, built by `.github/scripts/llvm.py` and fetched by sha256
 (the flake's `blaze-llvm`). The std source is pinned too: `library/`, digest-checked
 (`crates/blaze-cargo/src/toolchain/library.rs`). What still comes from the machine and changes
 generated code (audit of 2026-11-02, line numbers of that tree):

@@ -268,8 +268,7 @@ fn resident_pages(at: NonNull<u8>, len: usize) -> usize {
     let mut flags = vec![0u8; len / page];
     // SAFETY: the range is mapped (a committed part of a class's region) and `flags` has a
     // byte per page.
-    let rc = unsafe { libc::mincore(at.as_ptr().cast(), len, flags.as_mut_ptr()) };
-    assert_eq!(rc, 0, "mincore: {}", std::io::Error::last_os_error());
+    unsafe { blaze_sys::posix::io::mincore(at, len, &mut flags) }.expect("mincore");
     flags.iter().filter(|&&flag| flag & 1 != 0).count()
 }
 

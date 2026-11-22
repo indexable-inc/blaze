@@ -205,10 +205,10 @@ mod tests {
 
     /// Runs `f` on `worker`'s thread and gives back what it made.
     fn on<R: Send + 'static>(
-        worker: &crossbeam_channel::Sender<Box<dyn FnOnce() + Send>>,
+        worker: &blaze_core::chan::Sender<Box<dyn FnOnce() + Send>>,
         f: impl FnOnce() -> R + Send + 'static,
     ) -> R {
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx, rx) = blaze_core::chan::unbounded();
         worker.send(Box::new(move || tx.send(f()).unwrap())).unwrap();
         rx.recv_timeout(std::time::Duration::from_secs(60)).expect("the worker ran the call")
     }
@@ -231,7 +231,7 @@ mod tests {
     fn jobs_swapped_crosswise_onto_threads_whose_slots_are_held_each_see_their_own() {
         let workers: Vec<_> = (0..2u32)
             .map(|at| {
-                let (tx, rx) = crossbeam_channel::unbounded::<Box<dyn FnOnce() + Send>>();
+                let (tx, rx) = blaze_core::chan::unbounded::<Box<dyn FnOnce() + Send>>();
                 let thread = std::thread::spawn(move || {
                     SLOT.set(Some(vec![900 + at]));
                     for f in rx {

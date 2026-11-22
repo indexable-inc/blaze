@@ -1,6 +1,6 @@
 [package]
 name = "blaze-launcher"
-description = "blaze's launcher (docs/v2/plan/design/launcher.md): the process a program built for `edit` runs in. The file at cargo's path is a clone of this binary beside a sidecar naming the program; it asks the daemon for the program's code, a function at its first call, and takes edits while the program runs"
+description = "blaze's launcher (docs/v2/plan/design/launcher.md): the process a program runs in under `blaze run` and `blaze test`. The file it runs from is a clone of this binary beside a sidecar naming the program and the socket that serves its code records; it asks for a function's code at its first call"
 publish = false
 
 version.workspace = true
@@ -16,15 +16,33 @@ path = "src/main.rs"
 test = false
 doctest = false
 
-# On `std`, not bstd, for the reason blaze-launch's documentation gives.
+# The launcher's own start is on `std`; a hosted program's host is bstd's (`Hosting` over the
+# process's world, run.md "Every program runs in the child"). The old reason for keeping bstd
+# out, that cargo could not build it, no longer holds: blaze-cli links blaze-std under cargo.
 [dependencies]
 blaze-launch.workspace = true
 blaze-launch-rt.workspace = true
-crossbeam-channel.workspace = true
+# A hosted entry's host table: `bstd::hosting::Hosting` over a native `Io`, made only for one.
+blaze-std.workspace = true
+# The process's wait driver, chosen first in `main` (direct system calls: THREADS.md D6).
+blaze-core.workspace = true
+# The run mode's allocator, named once in `main` and handed down.
+blaze-own = { workspace = true, features = ["std"] }
+
+# A `comptime:` entry (D175, comptime.rs): the layer's C functions, installed over the
+# compile-time host's descriptor; the protocol's frame form.
+blaze-comptime-sys = { workspace = true, features = ["child"] }
+blaze-comptime.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-blaze-core.workspace = true
 libc.workspace = true
+# comptime.rs: the host's descriptor read, written and polled to a deadline, the clock, the
+# page size and the process's end, through the one wrapper (no new `libc::` use).
+blaze-sys.workspace = true
+
+[dev-dependencies]
+blaze-blake3.workspace = true
+blaze-code.workspace = true
 
 [lints]
 workspace = true

@@ -1,0 +1,15 @@
+{
+ "id": "served-script-reads-bypass-bstd",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), journal writer",
+ "where": "crates/blaze-cli/src/script_sandbox.rs TreeRead::answer/disk_node and git_answer, reached from sweep.rs follow_served",
+ "what": "tempo's no-op sweep statted 191 of 1249 rows for 45-52 ms (about 0.25 ms a row). About 29 of them are build scripts' served reads (files, listings, stats, git facts), asked again on every request; they go through std::fs::canonicalize, a whole-file read and hash, and git status walks of the worktree, none of it through the bstd effect layer, so the profile cannot name their time.",
+ "cost": "most of an hour finding where the 45 ms goes without a span for it",
+ "cause": "the served tree's answers were written for the sandbox, then reused by the sweep, outside bstd",
+ "whys": "the sweep stats through bstd, but a served row's check re-runs the sandbox's answer path, which was never ported",
+ "class": "work outside the effect layer: untimed by spans, unsimulated, and never cheaper than its slowest std call",
+ "prevention": "partly: each served ask is now a span with 'asked' and 'answered' events (sweep.rs), and a ServedReach rule skips them when one journal of the whole checkout named nothing; still to do: TreeRead on bstd (one open per row, stamp then hash only on change) and an incremental git status",
+ "annoyance": "no span covered the stretch, and Cx::span records only an opening, so a stretch is timed by two events",
+ "workaround": "bracket a stretch with cx.event pairs",
+ "state": "open"
+}

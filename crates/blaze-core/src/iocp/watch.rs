@@ -8,12 +8,13 @@
 
 use std::{
     io,
-    os::windows::io::{AsRawHandle as _, OwnedHandle},
+    os::windows::io::OwnedHandle,
     path::Path,
 };
 
-use windows_sys::Win32::{
-    Storage::FileSystem::{
+use blaze_sys::windows::{
+    Bool, Handle,
+    fs::{
         CreateFileW, FILE_ACTION_ADDED, FILE_ACTION_RENAMED_NEW_NAME, FILE_ATTRIBUTE_DIRECTORY,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
         FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION,
@@ -22,7 +23,7 @@ use windows_sys::Win32::{
         GetFileAttributesW, GetLongPathNameW, INVALID_FILE_ATTRIBUTES, OPEN_EXISTING,
         ReadDirectoryChangesW,
     },
-    System::IO::OVERLAPPED,
+    io::OVERLAPPED,
 };
 
 use super::sys::{self, BUFFER, Buffer, Paths};
@@ -74,7 +75,7 @@ impl Watching {
                 std::ptr::null(),
                 OPEN_EXISTING,
                 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
-                std::ptr::null_mut(),
+                Handle::NULL,
             )
         };
         let handle = sys::owned(handle).map_err(|error| {
@@ -85,8 +86,8 @@ impl Watching {
         Ok(Watching { handle, dir, buffer, stopping: false })
     }
 
-    pub(super) fn raw(&self) -> windows_sys::Win32::Foundation::HANDLE {
-        self.handle.as_raw_handle()
+    pub(super) fn raw(&self) -> Handle {
+        sys::handle_of(&self.handle)
     }
 
     /// Asks for the next changes, into the buffer, completing on the port through
@@ -108,7 +109,7 @@ impl Watching {
                 self.raw(),
                 self.buffer.ptr().cast(),
                 BUFFER as u32,
-                1,
+                Bool::TRUE,
                 FILTER,
                 std::ptr::null_mut(),
                 overlapped,

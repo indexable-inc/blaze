@@ -4,8 +4,7 @@
 
 mod block;
 
-use itertools::Itertools;
-use rustc_literal_escaper::{
+use parser::unescape::{
     EscapeError, unescape_byte, unescape_byte_str, unescape_c_str, unescape_char, unescape_str,
 };
 use syntax_tree::Direction;
@@ -21,7 +20,7 @@ use crate::{
 };
 
 pub(crate) fn validate(root: Node<'_>, errors: &mut Vec<SyntaxError>) {
-    let _p = tracing::info_span!(target: "blaze", "parser::validate").entered();
+    let _p = blaze_trace::info_span!(target: "blaze", "parser::validate").entered();
     // FIXME:
     // * Add unescape validation of raw string literals and raw byte string literals
     // * Add validation of doc comments are being attached to nodes
@@ -40,7 +39,7 @@ pub(crate) fn validate_outline(
     mut body: impl FnMut(u32, &mut Vec<SyntaxError>) -> bool,
     errors: &mut Vec<SyntaxError>,
 ) {
-    let _p = tracing::info_span!(target: "blaze", "parser::validate_outline").entered();
+    let _p = blaze_trace::info_span!(target: "blaze", "parser::validate_outline").entered();
     let mut lazies = lazies.iter().peekable();
     let mut preorder = root.preorder();
     while let Some(event) = preorder.next() {
@@ -464,7 +463,7 @@ fn validate_trait_object_ty_plus(ty: ast::DynTraitType<'_>) -> Option<SyntaxErro
     let dyn_token = ty.dyn_token()?;
     let preceding_token = skip_trivia_token(dyn_token.prev_token()?, Direction::Prev)?;
     let tbl = ty.type_bound_list()?;
-    let more_than_one_bound = tbl.bounds().next_tuple::<(_, _)>().is_some();
+    let more_than_one_bound = tbl.bounds().nth(1).is_some();
 
     if more_than_one_bound && !matches!(preceding_token.kind(), T!['('] | T![<] | T![=]) {
         Some(SyntaxError::new("ambiguous `+` in a type", ty.syntax().text_range()))
@@ -478,7 +477,7 @@ fn validate_impl_object_ty_plus(ty: ast::ImplTraitType<'_>) -> Option<SyntaxErro
     let dyn_token = ty.impl_token()?;
     let preceding_token = skip_trivia_token(dyn_token.prev_token()?, Direction::Prev)?;
     let tbl = ty.type_bound_list()?;
-    let more_than_one_bound = tbl.bounds().next_tuple::<(_, _)>().is_some();
+    let more_than_one_bound = tbl.bounds().nth(1).is_some();
 
     if more_than_one_bound && !matches!(preceding_token.kind(), T!['('] | T![<] | T![=]) {
         Some(SyntaxError::new("ambiguous `+` in a type", ty.syntax().text_range()))

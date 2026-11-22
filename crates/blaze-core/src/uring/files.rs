@@ -13,7 +13,8 @@
 //!
 //! Where an open (or a link, or a clone's target) finds a directory missing and the effect
 //! makes it, the request makes each directory of its path in turn (`IORING_OP_MKDIRAT`, an
-//! existing one answering `EEXIST`), as `create_dir_all` does, then asks its chain again; a
+//! existing one answering `EEXIST`), as `create_dir_all` does, each one it made synced into
+//! its parent (the folders rule on `Effect`, `Uring::sync_made`), then asks its chain again; a
 //! second `ENOENT` fails it. The kernel reads every name, and writes every `statx`, in the
 //! request's arena of [`ops::Paths`], which never moves and is never read as a slice.
 
@@ -28,6 +29,7 @@ use std::{
 };
 
 use blaze_mem::RegionVec;
+use blaze_sys::{linux::OpenFlags, posix::proc};
 
 use super::{
     flight::{error, failed, filled, raw, spare_of},
@@ -75,30 +77,34 @@ pub(super) const LOADS: usize = 1024;
 pub(super) const SPREAD_LEAST: usize = 64;
 
 /// `struct statx`'s size, and the mask of what [`Kind::Stat`] asks of it: the type, the mode,
-/// the modification time and the size.
+/// the modification and change times, the inode and the size (the device `statx` always
+/// fills).
 const STATX_SIZE: usize = 256;
-const STATX_META: u32 = 0x0001 | 0x0002 | 0x0040 | 0x0200;
+const STATX_META: u32 = 0x0001 | 0x0002 | 0x0040 | 0x0080 | 0x0100 | 0x0200;
 const STATX_MTIME: u32 = 0x0040;
+const STATX_CTIME: u32 = 0x0080;
+const STATX_INO: u32 = 0x0100;
 /// How a kept file is opened: for reading and appending.
-const KEEP: i32 = libc::O_RDWR | libc::O_APPEND;
+const KEEP: i32 = OpenFlags::READ_WRITE.with(OpenFlags::APPEND).bits() as i32;
 /// How a kept file for reads into and writes from memory is opened: for reading and writing at
-/// offsets, never made (its asker makes it first).
-const POSITIONAL_KEEP: i32 = libc::O_RDWR;
+/// offsets, never made (its asker makes it first); kept by a read alone ([`READ_ONLY`]),
+/// `O_RDONLY`, as a file sealed read-only refuses an open for writing (`Kept::read_only`).
+const POSITIONAL_KEEP: i32 = OpenFlags::READ_WRITE.bits() as i32;
 /// How a directory is opened to be synced.
-const DIR: i32 = libc::O_RDONLY | libc::O_DIRECTORY;
+const DIR: i32 = OpenFlags::READ.with(OpenFlags::DIRECTORY).bits() as i32;
 
 /// The open of `path` with `flags` and `mode`, into `slot` of the table (no `O_CLOEXEC`: the
 /// kernel refuses it for a slot, which no `exec` inherits) or, with [`NO_SLOT`], to a
 /// descriptor of the driver's own.
 fn open(path: *const u8, flags: i32, mode: u32, slot: u32, link: u8, user_data: u64) -> Sqe {
     let (flags, index) = match slot {
-        NO_SLOT => (flags | libc::O_CLOEXEC, 0),
+        NO_SLOT => (flags | OpenFlags::CLOSE_ON_EXEC.bits() as i32, 0),
         slot => (flags, slot + 1),
     };
     Sqe {
         opcode: OP_OPENAT,
         flags: link,
-        fd: libc::AT_FDCWD,
+        fd: linux::CWD.raw(),
         addr: path as u64,
         len: mode,
         op_flags: flags as u32,
@@ -127,7 +133,7 @@ fn sync_of(hot: &Hot, slot: u32, link: u8, user_data: u64) -> Sqe {
 fn unlink(path: *const u8, flags: i32, user_data: u64) -> Sqe {
     Sqe {
         opcode: OP_UNLINKAT,
-        fd: libc::AT_FDCWD,
+        fd: linux::CWD.raw(),
         addr: path as u64,
         op_flags: flags as u32,
         user_data,
@@ -138,7 +144,7 @@ fn unlink(path: *const u8, flags: i32, user_data: u64) -> Sqe {
 fn statx(path: *const u8, mask: u32, into: *const u8, user_data: u64) -> Sqe {
     Sqe {
         opcode: OP_STATX,
-        fd: libc::AT_FDCWD,
+        fd: linux::CWD.raw(),
         addr: path as u64,
         len: mask,
         // The `struct statx` written.
@@ -154,10 +160,10 @@ fn two_names(opcode: u8, from: *const u8, to: *const u8, link: u8, user_data: u6
     Sqe {
         opcode,
         flags: link,
-        fd: libc::AT_FDCWD,
+        fd: linux::CWD.raw(),
         addr: from as u64,
         // The new name's directory, and the new name.
-        len: libc::AT_FDCWD as u32,
+        len: linux::CWD.raw() as u32,
         off: to as u64,
         user_data,
         ..Sqe::default()
@@ -547,7 +553,7 @@ impl Uring {
         let whole = hot.flags & WHOLE != 0;
         if hot.phase == OPENING {
             // A file that is not there reads as empty, as a journal not yet written does.
-            if res == -libc::ENOENT && whole {
+            if res == -i32::from(Errno::NoEnt.raw()) && whole {
                 return Step::Ends(Some(Done::Read(ops::NO_BYTES)));
             }
             if res < 0 {
@@ -749,7 +755,7 @@ impl Uring {
     fn refused_request(&mut self, id: Id, why: &str) {
         let hot = *self.ops.get(id).expect("a request in flight");
         if hot.kind == Kind::Open {
-            self.unkept(Handle::from_bits(hot.of), -libc::ENFILE, why);
+            self.unkept(Handle::from_bits(hot.of), -i32::from(Errno::NFile.raw()), why);
         } else {
             // alloc: an error.
             self.ready
@@ -775,7 +781,7 @@ impl Uring {
             (_, MAKING) => {
                 sqes[0] = Sqe {
                     opcode: OP_MKDIRAT,
-                    fd: libc::AT_FDCWD,
+                    fd: linux::CWD.raw(),
                     addr: name(4) as u64,
                     len: 0o777,
                     user_data: ud(0),
@@ -813,7 +819,7 @@ impl Uring {
                     return 1;
                 }
                 // Through the page cache, always ([`Uring::write_at`]): never `O_DIRECT`.
-                let flags = libc::O_WRONLY;
+                let flags = OpenFlags::WRITE.bits() as i32;
                 // An empty write only opens the file, which must be there.
                 let more = !buf.is_empty();
                 sqes[0] = open(name(0), flags, 0, slot, if more { SQE_IO_LINK } else { 0 }, ud(0));
@@ -832,7 +838,7 @@ impl Uring {
                 let mut n = 0;
                 if hot.phase == OPENING {
                     sqes[0] = open(name(2), DIR, 0, dir, SQE_IO_LINK, ud(0));
-                    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL;
+                    let flags = (OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUSIVE).bits() as i32;
                     sqes[1] = open(name(0), flags, 0o644, temporary, SQE_IO_LINK, ud(1));
                     n = 2;
                 }
@@ -879,13 +885,17 @@ impl Uring {
                 1
             }
             (Kind::Open, _) => {
+                let positional = match hot.flags & READ_ONLY != 0 {
+                    true => OpenFlags::READ.bits() as i32,
+                    false => POSITIONAL_KEEP,
+                };
                 let flags = match (hot.flags & ops::POSITIONAL != 0, hot.flags & DIRECT != 0) {
-                    (true, true) => POSITIONAL_KEEP | libc::O_DIRECT,
-                    (true, false) => POSITIONAL_KEEP,
+                    (true, true) => positional | OpenFlags::DIRECT.bits() as i32,
+                    (true, false) => positional,
                     // Made where missing is opened to append, a sync's too (`Kept::read_only`).
                     (false, _) => match (hot.flags & MAKE != 0, hot.flags & READ_ONLY != 0) {
-                        (true, _) => KEEP | libc::O_CREAT,
-                        (false, true) => libc::O_RDONLY,
+                        (true, _) => KEEP | OpenFlags::CREATE.bits() as i32,
+                        (false, true) => OpenFlags::READ.bits() as i32,
                         (false, false) => KEEP,
                     },
                 };
@@ -905,32 +915,32 @@ impl Uring {
                 // A symbolic link is never cloned through, and a FIFO does not block the open.
                 sqes[0] = open(
                     name(0),
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                    (OpenFlags::READ | OpenFlags::NO_FOLLOW | OpenFlags::NONBLOCK).bits() as i32,
                     0,
                     NO_SLOT,
                     SQE_IO_LINK,
                     ud(0),
                 );
-                let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL;
+                let flags = (OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUSIVE).bits() as i32;
                 // A new file's mode, 0o666 less the umask, as every driver's clone and write.
                 sqes[1] = open(name(1), flags, 0o666, NO_SLOT, 0, ud(1));
                 2
             }
             (Kind::Map, _) => {
-                sqes[0] = open(name(0), libc::O_RDONLY, 0, NO_SLOT, 0, ud(0));
+                sqes[0] = open(name(0), OpenFlags::READ.bits() as i32, 0, NO_SLOT, 0, ud(0));
                 1
             }
             (Kind::Stat, _) => {
                 sqes[0] = statx(name(0), STATX_META, name(4), ud(0));
                 if hot.flags & NO_FOLLOW != 0 {
-                    sqes[0].op_flags = libc::AT_SYMLINK_NOFOLLOW as u32;
+                    sqes[0].op_flags = linux::AtFlags::NO_FOLLOW.bits();
                 }
                 1
             }
             (Kind::Load, phase) => {
                 let spread = if self.loading >= SPREAD_LEAST { SQE_ASYNC } else { 0 };
                 sqes[0] = match phase {
-                    OPENING => open(name(0), libc::O_RDONLY, 0, NO_SLOT, spread, ud(0)),
+                    OPENING => open(name(0), OpenFlags::READ.bits() as i32, 0, NO_SLOT, spread, ud(0)),
                     _ => {
                         let (addr, len) = spare_of(buf, buf.capacity());
                         let (fd, off) = (raw(&cold.fds[0]), cold.at + buf.len() as u64);
@@ -980,9 +990,9 @@ impl Uring {
             Kind::Open => self.opened(id, hot, results[0]),
             Kind::Remove => match (results[0], hot.phase) {
                 (0, _) => Step::Ends(Some(Done::Removed)),
-                (res, _) if res == -libc::ENOENT => Step::Ends(Some(Done::Removed)),
+                (res, _) if res == -i32::from(Errno::NoEnt.raw()) => Step::Ends(Some(Done::Removed)),
                 // Linux's `unlink` of a directory.
-                (res, OPENING) if res == -libc::EISDIR => {
+                (res, OPENING) if res == -i32::from(Errno::IsDir.raw()) => {
                     self.ops.get_mut(id).expect("in flight").phase = EMPTYING;
                     Step::Again
                 }
@@ -990,7 +1000,7 @@ impl Uring {
             },
             Kind::Link => match results[0] {
                 0 => Step::Ends(Some(Done::Linked)),
-                res if res == -libc::ENOENT && hot.flags & MADE == 0 => {
+                res if res == -i32::from(Errno::NoEnt.raw()) && hot.flags & MADE == 0 => {
                     self.make_parents(id).unwrap_or_else(|| Step::Ends(failed(res)))
                 }
                 res => Step::Ends(failed(res)),
@@ -1035,7 +1045,7 @@ impl Uring {
         self.ops.get_mut(id).expect("in flight").phase = OPENED;
         match (put < len, res) {
             (false, _) => self.close_written(id),
-            (true, 0) => Step::Ends(failed(-libc::EIO)),
+            (true, 0) => Step::Ends(failed(-i32::from(Errno::Io.raw()))),
             (true, _) => Step::Again,
         }
     }
@@ -1062,7 +1072,7 @@ impl Uring {
         if hot.phase == OPENING {
             let dir = results[0];
             if !self.opened_slot(id, 1, dir) {
-                if dir == -libc::ENOENT && hot.flags & MADE == 0 {
+                if dir == -i32::from(Errno::NoEnt.raw()) && hot.flags & MADE == 0 {
                     if let Some(step) = self.make_parents(id) {
                         return step;
                     }
@@ -1082,7 +1092,7 @@ impl Uring {
             self.ops.get_mut(id).expect("in flight").phase = OPENED;
             return Step::Again;
         }
-        let wrote = if wrote == 0 && put < len { -libc::EIO } else { wrote };
+        let wrote = if wrote == 0 && put < len { -i32::from(Errno::Io.raw()) } else { wrote };
         if let Some(res) = [wrote, synced, renamed].into_iter().find(|it| *it < 0) {
             self.ops.get_mut(id).expect("in flight").phase = UNLINKING;
             self.ops.cold_mut(id).at = u64::from(res.unsigned_abs());
@@ -1097,9 +1107,21 @@ impl Uring {
             cold.names[3] != cold.names[2]
         };
         if !self.opened_slot(id, 0, results[0]) {
-            if results[0] == -libc::ENOENT && hot.flags & MADE == 0 {
-                if let Some(step) = self.make_parents(id) {
-                    return step;
+            if results[0] == -i32::from(Errno::NoEnt.raw()) && hot.flags & MADE == 0 {
+                // A rename of nothing makes nothing (`Effect::Rename`): the source looked at
+                // (an `lstat` on the driver thread, on this error path only) before any
+                // directory of the target is made.
+                let from = self.name_of(id, 0);
+                let there = crate::fs::source_there(std::path::Path::new(std::ffi::OsStr::from_bytes(from.to_bytes())));
+                match there {
+                    Ok(true) => {
+                        if let Some(step) = self.make_parents(id) {
+                            return step;
+                        }
+                    }
+                    Ok(false) => return self.failed_on(id, "renaming", 0, -i32::from(Errno::NoEnt.raw())),
+                    // alloc: an error.
+                    Err(error) => return Step::Ends(Some(Done::Failed(IoError(error.to_string())))),
                 }
             }
             return self.failed_on(id, "opening", 2, results[0]);
@@ -1154,7 +1176,7 @@ impl Uring {
                 Err(error) => {
                     // alloc: an error.
                     let why = error.to_string();
-                    self.unkept(file, -libc::ENOMEM, &why);
+                    self.unkept(file, -i32::from(Errno::NoMem.raw()), &why);
                     return Step::Ends(None);
                 }
             }
@@ -1162,7 +1184,7 @@ impl Uring {
             return Step::Again;
         }
         let make = self.kept.get(file).expect("held by its open").make;
-        if res == -libc::ENOENT && hot.flags & MAKE == 0 && make {
+        if res == -i32::from(Errno::NoEnt.raw()) && hot.flags & MAKE == 0 && make {
             // A read asked before the first request that makes it: the reads fail as the
             // file is missing, and it is opened again to be made.
             // alloc: an error.
@@ -1174,7 +1196,7 @@ impl Uring {
             open.flags = open.flags & !READ_ONLY | MAKE;
             return Step::Again;
         }
-        if res == -libc::ENOENT && hot.flags & MAKE != 0 && hot.flags & MADE == 0 {
+        if res == -i32::from(Errno::NoEnt.raw()) && hot.flags & MAKE != 0 && hot.flags & MADE == 0 {
             if let Some(step) = self.make_parents(id) {
                 return step;
             }
@@ -1222,7 +1244,7 @@ impl Uring {
                 self.queue(id);
                 continue;
             };
-            let done = match whole && res == -libc::ENOENT {
+            let done = match whole && res == -i32::from(Errno::NoEnt.raw()) {
                 true => Done::Read(mem::take(self.ops.buf_mut(id))),
                 false => Done::Failed(IoError(why.to_owned())), // alloc: clone: an error.
             };
@@ -1250,7 +1272,8 @@ impl Uring {
                     crate::CLONE_OF_NO_FILE
                 )))));
             }
-            let why = match matches!(-res, libc::EOPNOTSUPP | libc::EXDEV | libc::EINVAL) {
+            let errno = u16::try_from(-res).ok().map(Errno::from_raw);
+            let why = match matches!(errno, Some(Errno::OpNotSupp | Errno::XDev | Errno::Inval)) {
                 // alloc: an error path.
                 true => format!(
                     "the file system of {to} ({}) cannot share blocks with {from} ({}): {}; blaze does not copy \
@@ -1271,7 +1294,7 @@ impl Uring {
             [from, to].map(|it| (it >= 0).then(|| unsafe { OwnedFd::from_raw_fd(it) }));
         // A failed first open cancels the second: nothing was made.
         let Some(source) = source else {
-            if from == -libc::ELOOP {
+            if from == -i32::from(Errno::Loop.raw()) {
                 let name = self.name_of(id, 0).to_string_lossy();
                 // alloc: an error path.
                 return Step::Ends(Some(Done::Failed(IoError(format!(
@@ -1296,7 +1319,7 @@ impl Uring {
         };
         let Some(target) = target else {
             drop(source);
-            if to == -libc::ENOENT && hot.flags & MADE == 0 {
+            if to == -i32::from(Errno::NoEnt.raw()) && hot.flags & MADE == 0 {
                 if let Some(step) = self.make_parents(id) {
                     return step;
                 }
@@ -1313,10 +1336,10 @@ impl Uring {
         let mut kind_bits = 0u32;
         let errno = match regular {
             Ok((false, mode)) => {
-                kind_bits = mode & libc::S_IFMT;
-                libc::EINVAL
+                kind_bits = mode & proc::S_IFMT;
+                i32::from(Errno::Inval.raw())
             }
-            Err(error) => error.raw_os_error().unwrap_or(libc::EIO),
+            Err(error) => error.raw_os_error().unwrap_or(i32::from(Errno::Io.raw())),
             Ok((true, _)) => {
                 // No io_uring op shares blocks: one `FICLONE` of the two files the ring opened,
                 // on a thread of its own, never here. The call waits for the device where the
@@ -1392,7 +1415,7 @@ impl Uring {
     }
 
     fn statted(&mut self, id: Id, hot: Hot, res: i32) -> Step {
-        if res == -libc::ENOENT {
+        if res == -i32::from(Errno::NoEnt.raw()) {
             return Step::Ends(Some(Done::Stat(None)));
         }
         if res < 0 {
@@ -1401,15 +1424,20 @@ impl Uring {
         let statx = self.statx_of(id, &hot);
         let wide = |at: usize| u64::from(word(&statx, at)) | u64::from(word(&statx, at + 4)) << 32;
         let (mask, mode, size) = (word(&statx, 0), word(&statx, 28) & 0xffff, wide(40));
-        let (seconds, nanos) = (wide(112) as i64, word(&statx, 120));
-        let modified_ns = match (mask & STATX_MTIME != 0, u64::try_from(seconds)) {
+        // `stx_mtime` at 112 and `stx_ctime` at 96, each a 64-bit second and a 32-bit nanosecond.
+        let time = |at: usize, bit: u32| match (mask & bit != 0, u64::try_from(wide(at) as i64)) {
             (true, Ok(seconds)) => {
-                seconds.saturating_mul(1_000_000_000).saturating_add(u64::from(nanos))
+                seconds.saturating_mul(1_000_000_000).saturating_add(u64::from(word(&statx, at + 8)))
             }
             _ => 0,
         };
-        let dir = mode & libc::S_IFMT == libc::S_IFDIR;
-        Step::Ends(Some(Done::Stat(Some(crate::Meta { len: size, dir, modified_ns }))))
+        let (modified_ns, changed_ns) = (time(112, STATX_MTIME), time(96, STATX_CTIME));
+        let ino = if mask & STATX_INO != 0 { wide(32) } else { 0 };
+        // `stx_dev_major` at 136 and `stx_dev_minor` at 140, as `st_dev` encodes them.
+        let dev = proc::makedev(word(&statx, 136), word(&statx, 140));
+        let dir = mode & proc::S_IFMT == proc::S_IFDIR;
+        let meta = crate::Meta { len: size, dir, modified_ns, changed_ns, ino, dev };
+        Step::Ends(Some(Done::Stat(Some(meta))))
     }
 
     /// The request `id`, whose path's directory was missing, makes the directories its path
@@ -1432,8 +1460,13 @@ impl Uring {
 
     /// A directory of the request `id`'s path made with `res`.
     fn made(&mut self, id: Id, res: i32) -> Step {
-        if res < 0 && res != -libc::EEXIST {
+        if res < 0 && res != -i32::from(Errno::Exist.raw()) {
             return self.failed_on(id, "making", 4, res);
+        }
+        if res == 0
+            && let Err(error) = self.sync_made(id)
+        {
+            return Step::Ends(Some(Done::Failed(IoError(error.to_string())))); // alloc: an error.
         }
         match self.next_parent(id) {
             Ok(true) => Step::Again,
@@ -1443,6 +1476,29 @@ impl Uring {
                 Step::Again
             }
             Err(error) => Step::Ends(Some(Done::Failed(IoError(error.to_string())))), // alloc: an error.
+        }
+    }
+
+    /// The directory the request `id` just made (its fifth name) synced into its parent: the
+    /// folders rule, on [`crate::Effect`], which `fs.rs`'s `make_parent` keeps for the other
+    /// drivers. On the driver's thread, not through the ring, which breaks this module's rule
+    /// that no call on a name is the thread's (the `path_calls` tests in `uring.rs` would trap
+    /// its open where a request makes a directory): paid once per directory made, which is
+    /// rare beside the requests. The end state is a phase after `MAKING` that chains an
+    /// `IORING_OP_OPENAT` of the parent into a slot, an `IORING_OP_FSYNC` of it and its close.
+    /// A directory another request made meanwhile (`EEXIST` here) is synced by that request,
+    /// before it completes.
+    fn sync_made(&self, id: Id) -> io::Result<()> {
+        let hot = *self.ops.get(id).expect("in flight");
+        let at = self.ops.cold(id).names[4];
+        // SAFETY: the fifth name is the directory `next_parent` put NUL-terminated in the
+        // request's arena, which the request holds while in flight.
+        let made = unsafe { self.paths.name(arena_of(&hot), at) };
+        let made = std::path::Path::new(std::ffi::OsStr::from_bytes(made.to_bytes()));
+        match made.parent().filter(|it| !it.as_os_str().is_empty()) {
+            // durable: the folders rule; a directory's own name is its parent's.
+            Some(parent) => File::open(parent)?.sync_all(),
+            None => Ok(()),
         }
     }
 
@@ -1526,8 +1582,9 @@ fn share_blocks(source: &File, target: OwnedFd, from: &str, to: &str) -> Done {
     };
     drop(target);
     _ = std::fs::remove_file(to);
-    let code = failed.raw_os_error().unwrap_or(libc::EIO);
-    let why = match matches!(code, libc::EOPNOTSUPP | libc::EXDEV | libc::EINVAL) {
+    let code = failed.raw_os_error().unwrap_or(i32::from(Errno::Io.raw()));
+    let errno = u16::try_from(code).ok().map(Errno::from_raw);
+    let why = match matches!(errno, Some(Errno::OpNotSupp | Errno::XDev | Errno::Inval)) {
         // alloc: an error path.
         true => format!(
             "the file system of {to} ({}) cannot share blocks with {from} ({}): {}; blaze does not copy \

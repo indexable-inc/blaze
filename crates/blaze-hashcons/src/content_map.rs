@@ -3,7 +3,8 @@
 //!
 //! `insert(value)` gives the value's [`ContentId`] ([`content_of`]: the type's domain, then
 //! what [`Consed::hash_content`] feeds), and stores the value unless an equal one is held;
-//! `get(&id)` lends it. The table is a [`ByHash`]: the id is a hash already, so a lookup
+//! `get(&id)` lends it. The table is a [`Map`] on [`BuildKeyHasher`]: the id is a hash
+//! already, so a lookup
 //! hashes nothing, and BLAKE3 runs once per insert, over the value. It is in the allocator
 //! its type names, as every single-owner table is.
 //!
@@ -11,7 +12,7 @@
 //! lock-free reads), hands out a dense [`Idx`](blaze_ids::Idx) and a handle that compares by
 //! address, never frees a value, and lives on the global heap for the process. This one has
 //! one owner, no index, removes, and dies with its allocator. They are the same pair as
-//! `SharedMap` and `HashMap`, and they agree on what a value's id is ([`content_of`]), so a
+//! `SharedMap` and `Map`, and they agree on what a value's id is ([`content_of`]), so a
 //! value moved from one to the other keeps its id.
 //!
 //! The trust rule: an id is trusted only where this map computed it. A value that comes with
@@ -21,14 +22,14 @@
 
 use std::{alloc::Allocator, any::type_name, fmt};
 
-use blaze_hash::{ByHash, hash_map::Entry};
+use blaze_hash::{BuildKeyHasher, Map, MapOpts, hash_map::Entry};
 use blaze_ids::ContentId;
 
 use crate::{Consed, content_of};
 
 /// Values of `V`, each stored once, by content ID, in the allocator `A`.
 pub struct ContentMap<V, A: Allocator> {
-    held: ByHash<ContentId, V, A>,
+    held: Map<ContentId, V, BuildKeyHasher, A>,
 }
 
 /// A value whose content is not what the id it came with says.
@@ -55,13 +56,13 @@ impl std::error::Error for Mismatch {}
 impl<V, A: Allocator> ContentMap<V, A> {
     /// An empty map in `alloc`: no allocation until the first insert.
     pub fn new_in(alloc: A) -> Self {
-        ContentMap { held: ByHash::new_in(alloc) }
+        ContentMap { held: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: alloc, capacity: None }) }
     }
 
     /// An empty map in `alloc` with room for `capacity` values: one allocation, and none
     /// after until it holds more.
     pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
-        ContentMap { held: ByHash::with_capacity_in(capacity, alloc) }
+        ContentMap { held: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: alloc, capacity: Some(capacity) }) }
     }
 
     pub fn len(&self) -> usize {

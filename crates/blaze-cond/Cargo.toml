@@ -1,0 +1,28 @@
+[package]
+name = "blaze-cond"
+description = "Presence conditions (docs/v2/plan/design/conditions.md): the boolean function of a request's cfg variables under which an entry exists, as a hash-consed reduced ordered decision diagram with complement edges in an arena of columns; and/or/not/ite, implication, restriction, quantification, support (a record's cfg read list), counting and a witness within the space's valid configurations, an irredundant sum of products for text, a portable form two builders write equal, and Rust's cfg syntax lowered to it; `no_std`, its allocator a value"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# The bottom crates only. blaze-blake3 derives each variable's stable key from its name.
+[dependencies]
+blaze-blake3.workspace = true
+blaze-int.workspace = true
+blaze-own.workspace = true
+
+[dev-dependencies]
+# `blaze_own::testing::heap()` for the tests and `Heap::process()` for the cost example's `main`.
+blaze-own = { workspace = true, features = ["std", "testing"] }
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

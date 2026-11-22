@@ -9,7 +9,7 @@ include!("../pin.rs");
 mod tests {
     use super::*;
 
-    const LLVM_JSON: &str = include_str!("../../../crates/hir-ty-codegen/llvm.json");
+    const LLVM_JSON: &str = include_str!("../../../pins/llvm.json");
 
     fn pin() -> Pin {
         Pin::parse(LLVM_JSON).expect("llvm.json parses")

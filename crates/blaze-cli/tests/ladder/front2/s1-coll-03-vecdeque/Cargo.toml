@@ -1,0 +1,4 @@
+[package]
+name = "ladder-s1-coll-03-vecdeque"
+version = "0.1.0"
+edition = "2024"

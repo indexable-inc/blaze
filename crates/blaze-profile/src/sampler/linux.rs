@@ -99,7 +99,7 @@ impl Thread {
         if !self.live {
             return None;
         }
-        let clock = (!(self.tid as libc::clockid_t)) << 3 | 6;
+        let clock = (!(self.tid as blaze_sys::posix::types::clockid_t)) << 3 | 6;
         let mut at = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         // SAFETY: `at` is a timespec to fill; an id of no thread fails with EINVAL.
         let got = unsafe { libc::clock_gettime(clock, &mut at) };
@@ -121,7 +121,7 @@ const fn counter(hz: u32) -> Counter {
 
 impl Events {
     fn open(tid: u64, hz: u32) -> Result<Events, std::io::Error> {
-        let clock = Event::open(tid as libc::pid_t, counter(hz), DEPTH as u16, DATA_PAGES)?;
+        let clock = Event::open(tid as blaze_sys::posix::types::pid_t, counter(hz), DEPTH as u16, DATA_PAGES)?;
         Ok(Events { tid, clock, switched: Switches::default() })
     }
 }
@@ -279,8 +279,7 @@ fn drain(
 /// Whether the kernel opens the event on this thread, with what it says when it does not:
 /// the one way Linux samples, no other is tried.
 pub(super) fn check() -> Result<(), Unsampled> {
-    // SAFETY: `gettid` has no precondition.
-    let tid = unsafe { libc::gettid() } as u64;
+    let tid = blaze_sys::posix::thread::thread_id();
     Events::open(tid, super::HZ).map(drop).map_err(|why| {
         let paranoid =
             std::fs::read_to_string("/proc/sys/kernel/perf_event_paranoid").unwrap_or_default();
@@ -441,7 +440,7 @@ mod tests {
             // alloc: a test's thread name
             .name("span-spinner".to_owned())
             .spawn(|| {
-                let entered = tracing::info_span!(target: "blaze", "spinning in a span").entered();
+                let entered = blaze_trace::info_span!(target: "blaze", "spinning in a span").entered();
                 let ring = crate::flight::ring().expect("a thread that records spans has a ring");
                 let span = ring.innermost();
                 spins_in_a_span(Instant::now() + Duration::from_millis(1500));

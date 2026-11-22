@@ -1,4 +1,6 @@
-use expect_test::{Expect, expect};
+use std::{format, string::String};
+
+use test_utils::{Expect, expect};
 
 use super::*;
 
@@ -8,6 +10,28 @@ fn check_raw_str(s: &str, expected: Result<u8, RawStrError>) {
     cursor.bump();
     let res = cursor.raw_double_quoted_string(0);
     assert_eq!(res, expected);
+}
+
+/// blaze: the frontmatter's closing fence found with no allocation is upstream's
+/// `find(&format!(..))`, on every text of up to seven bytes of `\n`, `-` and `a`, for every
+/// fence of zero to four dashes.
+#[test]
+fn newline_fence_is_upstreams_find() {
+    const ALPHABET: [char; 3] = ['\n', '-', 'a'];
+    for len in 0..=7u32 {
+        for code in 0..3usize.pow(len) {
+            let mut text = String::new();
+            let mut rest = code;
+            for _ in 0..len {
+                text.push(ALPHABET[rest % 3]);
+                rest /= 3;
+            }
+            for dashes in 0..=4usize {
+                let upstream = text.find(&format!("\n{:-<1$}", "", dashes));
+                assert_eq!(find_newline_fence(&text, dashes), upstream, "{text:?} with {dashes} dashes");
+            }
+        }
+    }
 }
 
 #[test]

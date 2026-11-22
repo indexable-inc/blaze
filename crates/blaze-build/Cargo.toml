@@ -1,0 +1,51 @@
+[package]
+name = "blaze-build"
+description = "A type-checked body to LIR: blaze-typeck's body form and its record (`Checked`) to one LIR function, with explicit stacks and no recursion on the input; every local in a stack slot, control flow as blocks, calls by function reference (crates/blaze-cli/tests/ladder/README.md)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The input: the body form (`BodyView`), the check's record (`Checked`), portable types.
+blaze-typeck.workspace = true
+# The output: one function's columns, made with `Builder` and checked with `verify`.
+blaze-lir.workspace = true
+# `Alloc`: the allocator `Checked` is in.
+blaze-own.workspace = true
+# `Identity`: the flow layer's table of identities a coroutine's state is keyed by (ASYNC.md P8).
+blaze-flow-lower.workspace = true
+# `ContentId` and `Hasher`: an instance's key. By path: the workspace entry turns on serde adapters.
+blaze-ids.workspace = true
+# `tls`: the thread-local descriptor, row and table forms (one home with the emitter and the
+# launcher's run mode).
+blaze-code.workspace = true
+# `testing`: `read_back`, a value's record read through emitted code (blaze-consteval's
+# layout-drift test).
+blaze-emit = { workspace = true, optional = true }
+blaze-inproc = { workspace = true, optional = true }
+
+[features]
+testing = ["dep:blaze-emit", "dep:blaze-inproc"]
+
+[dev-dependencies]
+# `InferCtx`: the bodies of the tests are checked before they are built. `testing`: the
+# checker's fixture world (`fixture::{Fx, Bb}`), whose trait facts the trait-object tests use.
+blaze-typeck = { workspace = true, features = ["testing"] }
+# The evaluator a built function's result is compared with.
+blaze-lir = { workspace = true, features = ["eval"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
+blaze-sim.workspace = true
+# Thread-locals' two-thread test: the getter emitted and run for real.
+blaze-emit.workspace = true
+blaze-inproc.workspace = true
+
+[lints]
+workspace = true

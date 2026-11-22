@@ -12,8 +12,13 @@ use std::ffi::{CString, c_int, c_void};
 use std::ops::Range;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::time::Duration;
+
+use blaze_sys::linux::{self, MapFlags, OpenFlags, Prot, fdctl};
+use blaze_sys::posix::{proc::PT_LOAD, signal, types};
+use blaze_sys::{Errno as SysErrno, Fd, Path as SysPath};
 
 use super::Rights;
 use super::unix::protection;
@@ -119,34 +124,31 @@ impl Object {
     pub fn create(name: &str, len: u64) -> Result<Object, Error> {
         let name = CString::new(format!("blaze-inproc:{name}"))
             .map_err(|_| Error::new(format!("a memory object named {name:?}")))?;
-        // SAFETY: `name` is a NUL-terminated string live for the call.
-        let fd = unsafe {
-            libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
-        };
-        if fd < 0 {
-            let error = std::io::Error::last_os_error();
-            let hint = if error.raw_os_error() == Some(libc::EACCES) {
+        let fd = fdctl::memfd_create(
+            SysPath::new(&name),
+            fdctl::MemfdFlags::CLOSE_ON_EXEC | fdctl::MemfdFlags::ALLOW_SEALING,
+        )
+        .map_err(|errno| {
+            let error = std::io::Error::from_raw_os_error(errno.raw().into());
+            let hint = if errno == SysErrno::Acces {
                 " (vm.memfd_noexec is 2?)"
             } else {
                 ""
             };
-            return Err(Error::new(format!("memfd_create: {error}{hint}")));
-        }
-        // SAFETY: `fd` was just made and is owned by nothing else.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let size = libc::off_t::try_from(len)
+            Error::new(format!("memfd_create: {error}{hint}"))
+        })?;
+        let size = types::off_t::try_from(len)
             .map_err(|_| Error::new(format!("a memory object of {len} bytes")))?;
-        // SAFETY: `fd` is an open memfd.
-        if unsafe { libc::ftruncate(fd.as_raw_fd(), size) } != 0 {
-            return Err(os(&format!("sizing a memory object to {len:#x} bytes")));
-        }
-        // SAFETY: `fd` is an open memfd made with MFD_ALLOW_SEALING.
-        if unsafe {
-            libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, libc::F_SEAL_SHRINK | libc::F_SEAL_GROW)
-        } != 0
-        {
-            return Err(os("sealing a memory object's size"));
-        }
+        linux::ftruncate(fd.fd(), size as u64).map_err(|errno| {
+            let error = std::io::Error::from_raw_os_error(errno.raw().into());
+            Error::new(format!("sizing a memory object to {len:#x} bytes: {error}"))
+        })?;
+        fdctl::add_seals(fd.fd(), fdctl::Seals::SHRINK | fdctl::Seals::GROW).map_err(|errno| {
+            let error = std::io::Error::from_raw_os_error(errno.raw().into());
+            Error::new(format!("sealing a memory object's size: {error}"))
+        })?;
+        // SAFETY: into_raw transfers sole ownership of the open memfd.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd.into_raw()) };
         Ok(Object { fd, len })
     }
 
@@ -170,13 +172,18 @@ impl Object {
     fn read_only(&self) -> Result<OwnedFd, Error> {
         let path = CString::new(format!("/proc/self/fd/{}", self.fd.as_raw_fd()))
             .map_err(|_| Error::new("a /proc path"))?;
-        // SAFETY: `path` is a NUL-terminated string live for the call.
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-        if fd < 0 {
-            return Err(os("reopening a memory object read-only through /proc/self/fd"));
-        }
-        // SAFETY: `fd` was just opened and is owned by nothing else.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        let fd = linux::openat(
+            linux::CWD,
+            SysPath::new(&path),
+            OpenFlags::READ | OpenFlags::CLOSE_ON_EXEC,
+            0,
+        )
+        .map_err(|errno| {
+            let error = std::io::Error::from_raw_os_error(errno.raw().into());
+            Error::new(format!("reopening a memory object read-only through /proc/self/fd: {error}"))
+        })?;
+        // SAFETY: into_raw transfers sole ownership of the reopened file.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd.into_raw()) })
     }
 }
 
@@ -198,7 +205,7 @@ impl Drop for View {
         if self.len != 0 {
             // SAFETY: `at..at + len` is this view's own mapping, which nothing borrows once it
             // drops (every borrow is of `self`).
-            unsafe { libc::munmap(self.at.cast(), self.len) };
+            let _ = unsafe { linux::munmap(NonNull::new_unchecked(self.at), self.len) };
         }
     }
 }
@@ -343,7 +350,7 @@ impl Drop for Exec {
     fn drop(&mut self) {
         // SAFETY: `at..at + len` is this `Exec`'s own mapping; every slice of it borrowed `self`
         // or ended with `Exec::new`'s `write`.
-        unsafe { libc::munmap(self.at.cast(), self.len) };
+        let _ = unsafe { linux::munmap(NonNull::new_unchecked(self.at), self.len) };
     }
 }
 
@@ -358,19 +365,20 @@ impl Exec {
         let len = code_pages + data.next_multiple_of(page);
         // SAFETY: an anonymous mapping at no fixed address: nothing of this process is replaced.
         let at = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
+            linux::mmap(
+                None,
                 len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
+                Prot::READ | Prot::WRITE,
+                MapFlags::PRIVATE | MapFlags::ANONYMOUS,
+                None,
                 0,
             )
-        };
-        if at == libc::MAP_FAILED {
-            return Err(os(&format!("mmap of {len:#x} bytes of code and data")));
         }
-        let exec = Exec { at: at.cast(), code_pages, len, data };
+        .map_err(|errno| {
+            let error = std::io::Error::from_raw_os_error(errno.raw().into());
+            Error::new(format!("mmap of {len:#x} bytes of code and data: {error}"))
+        })?;
+        let exec = Exec { at: at.as_ptr(), code_pages, len, data };
         // SAFETY: the fresh mapping of `len` readable and writable bytes, which nothing else
         // refers to; `code <= code_pages` and `code_pages + data <= len`, so the slices are
         // disjoint and in it. `write` can't keep them past its return (they borrow for the call).
@@ -382,13 +390,10 @@ impl Exec {
         };
         write(code_bytes, data_bytes);
         // SAFETY: the code's pages of the mapping above, which nothing writes from here on.
-        if unsafe { libc::mprotect(exec.at.cast(), code_pages, libc::PROT_READ | libc::PROT_EXEC) }
-            != 0
-        {
-            return Err(os(&format!(
-                "mprotect of {code_pages:#x} bytes of code to read and execute"
-            )));
-        }
+        unsafe { linux::mprotect(at, code_pages, Prot::READ | Prot::EXEC) }.map_err(|errno| {
+            let error = std::io::Error::from_raw_os_error(errno.raw().into());
+            Error::new(format!("mprotect of {code_pages:#x} bytes of code to read and execute: {error}"))
+        })?;
         // SAFETY: the code's pages, mapped readable.
         unsafe { sync_icache(exec.at as usize, exec.at as usize + code) };
         Ok(exec)
@@ -402,9 +407,6 @@ impl Exec {
         self.at as u64 + self.code_pages as u64
     }
 
-    /// The code's pages are executable for every thread: nothing to do.
-    pub fn after_fork() {}
-
     pub fn data(&mut self) -> &mut [u8] {
         // SAFETY: the data's `data` bytes after the code's pages, writable and in the mapping,
         // which lives as long as `self`; `&mut self` makes this the only borrow.
@@ -413,7 +415,7 @@ impl Exec {
 }
 
 fn mapping(access: Access) -> c_int {
-    if access == Access::Copy { libc::MAP_PRIVATE } else { libc::MAP_SHARED }
+    (if access == Access::Copy { MapFlags::PRIVATE } else { MapFlags::SHARED }).bits() as c_int
 }
 
 /// The first `len` bytes of `fd` mapped wherever the kernel finds room, for the rest of the
@@ -426,12 +428,20 @@ fn map_anywhere(fd: RawFd, len: u64, access: Access) -> Result<u64, Error> {
     // SAFETY: `fd` is an open memory object; with no address the kernel picks free space, so
     // nothing of this process is replaced.
     let mapped = unsafe {
-        libc::mmap(std::ptr::null_mut(), len_usize, protection(access), mapping(access), fd, 0)
-    };
-    if mapped == libc::MAP_FAILED {
-        return Err(os(&format!("mmap of {len:#x} bytes")));
+        linux::mmap(
+            None,
+            len_usize,
+            Prot::from_bits(protection(access) as u32),
+            MapFlags::from_bits(mapping(access) as u32),
+            Some(Fd::new(fd)),
+            0,
+        )
     }
-    Ok(mapped as u64)
+    .map_err(|errno| {
+        let error = std::io::Error::from_raw_os_error(errno.raw().into());
+        Error::new(format!("mmap of {len:#x} bytes: {error}"))
+    })?;
+    Ok(mapped.as_ptr() as u64)
 }
 
 /// The daemon's side of a run process: a pidfd of it, which names that process even once its
@@ -442,13 +452,12 @@ pub struct Remote {
 
 impl Remote {
     pub fn of(pid: u32) -> Result<Remote, Error> {
-        // SAFETY: pidfd_open takes a process ID and flags and returns a new descriptor or -1.
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
-        if fd < 0 {
-            return Err(os(&format!("pidfd_open of process {pid}")));
-        }
-        // SAFETY: just made, owned by nothing else.
-        Ok(Remote { process: unsafe { OwnedFd::from_raw_fd(fd as RawFd) } })
+        let fd = linux::pidfd_open(pid as types::pid_t).map_err(|errno| {
+            let error = std::io::Error::from_raw_os_error(errno.raw().into());
+            Error::new(format!("pidfd_open of process {pid}: {error}"))
+        })?;
+        // SAFETY: into_raw transfers sole ownership of the new pidfd.
+        Ok(Remote { process: unsafe { OwnedFd::from_raw_fd(fd.into_raw()) } })
     }
 
     pub fn map(&self, object: u32, _: Access) -> Result<u64, Error> {
@@ -467,14 +476,16 @@ impl Remote {
         // SAFETY: `process` is an open pidfd; no siginfo, no flags.
         let sent = unsafe {
             libc::syscall(
-                libc::SYS_pidfd_send_signal,
+                linux::nr::PIDFD_SEND_SIGNAL as core::ffi::c_long,
                 self.process.as_raw_fd(),
-                libc::SIGKILL,
-                std::ptr::null::<libc::siginfo_t>(),
+                signal::SIGKILL,
+                std::ptr::null::<signal::siginfo_t>(),
                 0u32,
             )
         };
-        if sent != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+        if sent != 0
+            && std::io::Error::last_os_error().raw_os_error() != Some(SysErrno::Srch.raw().into())
+        {
             return Err(os("pidfd_send_signal"));
         }
         Ok(())
@@ -484,16 +495,16 @@ impl Remote {
 /// Sleeps on a futex that is not private, so a word of a shared mapping is the same futex in
 /// every process that maps it.
 pub fn wait(word: &AtomicU64, expected: u32, timeout: Duration) -> bool {
-    let time = libc::timespec {
-        tv_sec: timeout.as_secs().min(i32::MAX as u64) as libc::time_t,
-        tv_nsec: timeout.subsec_nanos() as libc::c_long,
+    let time = blaze_sys::Timespec {
+        sec: timeout.as_secs().min(i32::MAX as u64) as types::time_t,
+        nsec: i64::from(timeout.subsec_nanos()),
     };
     // SAFETY: `word` is live and 8-aligned, so its first four bytes are an aligned `u32`, the
     // low half on these little-endian targets, which the kernel reads atomically; `time` is
     // live for the call; FUTEX_WAIT reads nothing else.
     let got = unsafe {
         libc::syscall(
-            libc::SYS_futex,
+            linux::nr::FUTEX as core::ffi::c_long,
             word.as_ptr().cast::<u32>(),
             libc::FUTEX_WAIT,
             expected,
@@ -502,14 +513,14 @@ pub fn wait(word: &AtomicU64, expected: u32, timeout: Duration) -> bool {
             0u32,
         )
     };
-    got == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ETIMEDOUT)
+    got == 0 || std::io::Error::last_os_error().raw_os_error() != Some(SysErrno::TimedOut.raw().into())
 }
 
 pub fn wake(word: &AtomicU64) {
     // SAFETY: as in `wait`; FUTEX_WAKE reads nothing of the word.
     unsafe {
         libc::syscall(
-            libc::SYS_futex,
+            linux::nr::FUTEX as core::ffi::c_long,
             word.as_ptr().cast::<u32>(),
             libc::FUTEX_WAKE,
             i32::MAX,
@@ -563,12 +574,10 @@ pub fn recv_objects(channel: &mut Channel, count: usize) -> Result<Vec<Granted>,
         let fd = channel.stream().take_fd().ok_or_else(|| {
             Error::new(format!("the grant came with {index} descriptors of {count}"))
         })?;
-        // SAFETY: a zeroed `stat` is a valid one: plain integers.
-        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: `fd` is open; `stat` is live and writable.
-        if unsafe { libc::fstat(fd.as_raw_fd(), &raw mut stat) } != 0 {
-            return Err(os(&format!("granted object {index}")));
-        }
+        let stat = linux::task::fstat(Fd::new(fd.as_raw_fd())).map_err(|errno| {
+            let error = std::io::Error::from_raw_os_error(errno.raw().into());
+            Error::new(format!("granted object {index}: {error}"))
+        })?;
         out.push(Granted { fd, len: stat.st_size as u64 });
     }
     if channel.stream().take_fd().is_some() {
@@ -620,7 +629,7 @@ pub fn overlay(
         let at = overlay.at.wrapping_add(slide);
         let len = usize::try_from(overlay.len)
             .map_err(|_| Error::new(format!("an overlay of {:#x} bytes", overlay.len)))?;
-        let offset = libc::off_t::try_from(overlay.offset)
+        let offset = types::off_t::try_from(overlay.offset)
             .map_err(|_| Error::new(format!("an overlay at offset {:#x}", overlay.offset)))?;
         // SAFETY: `at..at + len` is, by `Grant::check` against the headers the system loader
         // mapped, either one of this executable's code segments, whose bytes the object holds
@@ -633,7 +642,7 @@ pub fn overlay(
                 at as *mut c_void,
                 len,
                 protection(overlay.access),
-                mapping(overlay.access) | libc::MAP_FIXED,
+                mapping(overlay.access) | MapFlags::FIXED.bits() as c_int,
                 object.fd.as_raw_fd(),
                 offset,
             )
@@ -661,7 +670,7 @@ pub fn own_image() -> Result<(u64, &'static [u8]), Error> {
         for index in 0..usize::from(info.dlpi_phnum) {
             // SAFETY: `dlpi_phdr` points at `dlpi_phnum` program headers of the object, mapped.
             let header = unsafe { &*info.dlpi_phdr.add(index) };
-            if header.p_type == libc::PT_LOAD && header.p_offset == 0 {
+            if header.p_type == PT_LOAD && header.p_offset == 0 {
                 *found = Some((
                     info.dlpi_addr.wrapping_add(header.p_vaddr),
                     header.p_filesz.min(header.p_memsz),
@@ -703,19 +712,20 @@ pub fn clone_file(from: &Path, to: &Path) -> Result<bool, Error> {
         .create_new(true)
         .open(to)
         .map_err(|it| fail(to, it))?;
-    // SAFETY: both descriptors are open, the target writable and empty; FICLONE only shares
-    // the source's blocks into it.
-    if unsafe { libc::ioctl(target.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) } == 0 {
-        return Ok(true);
-    }
-    let error = std::io::Error::last_os_error();
+    let errno = match linux::ficlone(Fd::new(target.as_raw_fd()), Fd::new(source.as_raw_fd())) {
+        Ok(()) => return Ok(true),
+        Err(errno) => errno,
+    };
     drop(target);
     std::fs::remove_file(to).map_err(|it| fail(to, it))?;
-    match error.raw_os_error() {
-        Some(libc::EXDEV | libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL | libc::ENOSYS) => {
+    match errno {
+        SysErrno::XDev | SysErrno::OpNotSupp | SysErrno::NoTty | SysErrno::Inval | SysErrno::NoSys => {
             Ok(false)
         }
-        _ => Err(Error::new(format!("cloning {} to {}: {error}", from.display(), to.display()))),
+        _ => {
+            let error = std::io::Error::from_raw_os_error(errno.raw().into());
+            Err(Error::new(format!("cloning {} to {}: {error}", from.display(), to.display())))
+        }
     }
 }
 
@@ -741,6 +751,5 @@ pub fn service() -> Option<String> {
 }
 
 pub fn thread_id() -> u64 {
-    // SAFETY: gettid has no preconditions.
-    unsafe { libc::syscall(libc::SYS_gettid) as u64 }
+    linux::sample::gettid() as u64
 }

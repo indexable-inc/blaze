@@ -23,7 +23,8 @@ pub(crate) fn private(dir: &Path, name: &FileName) -> io::Result<Option<(FileNam
     }
     os::close(dir)?;
     let start = name.as_str().len() + 1;
-    for (file, _) in super::list(dir, name)? {
+    // clone: the listing's name of the store, a refcount.
+    for (file, _) in super::list(dir, &crate::DirName::Named(name.clone()))? {
         // alloc: once per file of the store, at its open
         let path = dir.join(&file.as_str()[start..]);
         match os::under(&path, &gate) {
@@ -49,10 +50,14 @@ mod os {
     };
 
     use crate::Access;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use blaze_sys::posix::types::uid_t;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    use libc::uid_t;
 
     /// What the bits of a file under the directory must not have, and whose it must be.
     pub(super) struct Gate {
-        user: libc::uid_t,
+        user: uid_t,
         refused: u32,
     }
 
@@ -83,7 +88,7 @@ mod os {
         Ok(of(&std::fs::metadata(path)?, gate.user, gate.refused))
     }
 
-    fn of(meta: &std::fs::Metadata, user: libc::uid_t, refused: u32) -> Access {
+    fn of(meta: &std::fs::Metadata, user: uid_t, refused: u32) -> Access {
         if meta.uid() != user {
             Access::OtherUser
         } else if meta.mode() & refused != 0 {
@@ -143,17 +148,17 @@ mod os {
         ptr,
     };
 
-    use windows_sys::Win32::{
-        Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, LocalFree},
-        Security::{
-            ACL,
-            Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
-            DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetTokenInformation, IsWellKnownSid,
-            OWNER_SECURITY_INFORMATION, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
-            WinBuiltinAdministratorsSid, WinCreatorOwnerRightsSid, WinLocalSystemSid,
+    use blaze_sys::windows::{
+        Handle,
+        foundation::{CloseHandle, ERROR_SUCCESS, LocalFree},
+        fs::{FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL},
+        security::{
+            ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetSecurityInfo,
+            GetTokenInformation, IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSID, SE_FILE_OBJECT,
+            TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid,
+            WinCreatorOwnerRightsSid, WinLocalSystemSid,
         },
-        Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL},
-        System::Threading::{GetCurrentProcess, OpenProcessToken},
+        threading::{GetCurrentProcess, OpenProcessToken},
     };
 
     use crate::Access;
@@ -195,7 +200,7 @@ mod os {
     }
 
     /// A handle that is closed when this is dropped.
-    struct Token(HANDLE);
+    struct Token(Handle);
 
     impl Drop for Token {
         fn drop(&mut self) {
@@ -233,10 +238,10 @@ mod os {
     }
 
     fn user() -> io::Result<Vec<u64>> {
-        let mut token: HANDLE = ptr::null_mut();
+        let mut token = Handle::NULL;
         // SAFETY: `GetCurrentProcess` takes nothing and returns the process's pseudo-handle,
         // which needs no closing; `token` is where the token's handle goes.
-        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        if !unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_true() {
             return Err(io::Error::last_os_error());
         }
         let token = Token(token);
@@ -250,7 +255,7 @@ mod os {
         let got = unsafe {
             GetTokenInformation(token.0, TokenUser, buffer.as_mut_ptr().cast(), room, &mut len)
         };
-        if got == 0 {
+        if !got.is_true() {
             return Err(io::Error::last_os_error());
         }
         Ok(buffer)
@@ -264,9 +269,9 @@ mod os {
     unsafe fn trusted(sid: PSID, user: PSID) -> bool {
         // SAFETY: both are valid identifiers, by the caller.
         unsafe {
-            EqualSid(sid, user) != 0
-                || IsWellKnownSid(sid, WinLocalSystemSid) != 0
-                || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
+            EqualSid(sid, user).is_true()
+                || IsWellKnownSid(sid, WinLocalSystemSid).is_true()
+                || IsWellKnownSid(sid, WinBuiltinAdministratorsSid).is_true()
         }
     }
 
@@ -282,7 +287,7 @@ mod os {
         // are where the owner, the list and the descriptor that holds both are put.
         let status = unsafe {
             GetSecurityInfo(
-                file.as_raw_handle(),
+                Handle::from_raw(file.as_raw_handle()),
                 SE_FILE_OBJECT,
                 OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
                 &mut owner,
@@ -309,7 +314,7 @@ mod os {
         for at in 0..u32::from(entries) {
             let mut entry: *mut c_void = ptr::null_mut();
             // SAFETY: `list` is a valid list and `at` is below its count of entries.
-            if unsafe { GetAce(list, at, &mut entry) } == 0 {
+            if !unsafe { GetAce(list, at, &mut entry) }.is_true() {
                 return Ok(Access::Unknown);
             }
             // SAFETY: every entry starts with its kind, flags and size, then a mask and an
@@ -328,7 +333,7 @@ mod os {
             // SAFETY: `sid` is in the list, which the descriptor keeps alive, and `user` in the
             // gate's buffer; the owner's own rights are the owner's, who was found trusted.
             let known =
-                unsafe { trusted(sid, user) || IsWellKnownSid(sid, WinCreatorOwnerRightsSid) != 0 };
+                unsafe { trusted(sid, user) || IsWellKnownSid(sid, WinCreatorOwnerRightsSid).is_true() };
             if !known {
                 return Ok(Access::OthersWrite);
             }

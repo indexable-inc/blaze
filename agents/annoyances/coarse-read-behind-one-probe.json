@@ -1,0 +1,15 @@
+{
+ "id": "coarse-read-behind-one-probe",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane BH1",
+ "where": "crates/blaze-ladder/src/front2/tables/view.rs incoherent_crates; crates/blaze-cli/src/engine_bodies.rs widen (ImplBucket of no crate); crates/blaze-cli/src/signature.rs signature_source",
+ "what": "One private fn added re-entered 66 of 72 bodies (g200823). The cause was not a names read: any inherent method probe on a primitive (i64::wrapping_add, str::len) asks the whole graph's incoherent-impl fact, recorded as one ImplBucket read of no crate, which widen turned into every scope crate's CrateScope record WHOLE. The existing test of the same claim (adding_a_private_fn_rechecks_one_body) passed because its fixture is u32 `+` arithmetic and never probes a primitive's methods. Separately, the head key held the file's surface, so every head of the file moved with any sibling.",
+ "cost": "most of a lane's context reading the read path end to end (recorder, cell_id, widen, heads_of, names_cells) before the one line was found",
+ "cause": "the read was recorded at a grain no cell had (a fact over a set of crates) and the engine widened it silently; the profile printed the moved record but not that the read was a widening",
+ "whys": "a coarse read and a cell-grain read look the same in the read list; the profile's cause line named the definer task, not the cell kind",
+ "class": "a widened read invisible in the profile",
+ "prevention": "the profile's 'entered because' lines now print the moved cell's kind (whole record, names cell, head cell, ...); a fixture for a large-crate claim should include primitive method probes",
+ "annoyance": "a write-only lane cannot run the tiny fixture to read the profile, so the 11 heads 'read moved CrateScope' stay a hypothesis until the coordinator runs it",
+ "workaround": "listed as UNSURE in the report",
+ "state": "open"
+}

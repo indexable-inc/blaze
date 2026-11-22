@@ -14,13 +14,11 @@ doctest = false
 
 [dependencies]
 blaze-core.workspace = true
-itertools.workspace = true
-tracing.workspace = true
+blaze-trace.workspace = true
 # Think twice before adding anything here
 
 [dev-dependencies]
 blaze-sim.workspace = true
-crossbeam-channel.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 stacker.workspace = true

@@ -1,16 +1,17 @@
 //! blaze's HTTP, sans-IO: the HTTP/1.1 client, a synchronous state machine ([`Client`]) that
 //! owns no socket, runtime, thread, timer or clock, and its driver on blaze-core's effects
 //! ([`driver`]), which does the IO for it on the native driver (io_uring, kqueue) or the
-//! simulation; and HTTP/3 with WebTransport ([`h3`]), a core of the same shape over
-//! quinn-proto with its own driver contract and driver on the same effects ([`h3::driver`]).
-//! No runtime is under either: a caller's executor polls the handles' futures, or
-//! [`mailbox::block_on`] does on the calling thread.
+//! simulation; and, behind the `h3` feature, HTTP/3 with WebTransport (`h3`), a core of the
+//! same shape over quinn-proto with its own driver contract and driver on the same effects.
+//! No runtime is under either: each driver's thread runs one plain blocking loop over its
+//! machine, and a caller waits for an answer with one timed receive ([`mailbox::answer`]).
 //!
 //! # The core
 //!
 //! [`Client`] speaks HTTP/1.1 over TLS (rustls's own sans-IO connection) or plain TCP: it writes
-//! requests ([`h1`]), parses answers' heads with `httparse`, reads bodies framed by
-//! `Content-Length`, `chunked` or the connection's close, decodes gzip where it asked for it,
+//! requests and reads answers with blaze-h1 (heads and bodies framed by `Content-Length`,
+//! `chunked` or the connection's close, ambiguous framing refused), asks only the addresses
+//! blaze-url checks (ASCII hosts, no user part), decodes gzip where it asked for it,
 //! holds each body to its bound, follows redirects (at most [`REDIRECTS`]), keeps connections
 //! between requests in a pool keyed by origin (scheme, host, port) with an idle expiry and an
 //! idle cap, goes through the proxy its config names for an origin ([`proxy`]: an HTTP
@@ -56,8 +57,9 @@
 //!    is first. Every request ends by its deadline, so no wait of the asker's is open.
 //!
 //! The core has no recorder. The driver's waits go through blaze-core: its loop's poll of the
-//! driver, and an asker's park in [`mailbox::block_on`], named by what it waits for
-//! (every-wait-says-what).
+//! driver to its deadline, and an asker's timed receive in [`mailbox::answer`], which takes
+//! how long it may wait and, when that passes, is [`mailbox::Unanswered::TimedOut`] naming what
+//! it waited for (every-wait-says-what).
 //!
 //! # What the core reads that is not its input
 //!
@@ -73,9 +75,10 @@
 pub mod client;
 pub mod driver;
 mod gzip;
-pub mod h1;
+#[cfg(feature = "h3")]
 pub mod h3;
 pub mod mailbox;
+mod method;
 mod pool;
 pub mod proxy;
 pub mod proxy_env;
@@ -85,8 +88,10 @@ mod tls;
 #[cfg(test)]
 mod tests;
 
+pub use blaze_h1::Range;
 pub use client::{
     Client, Completion, Config, ConnId, Error, Event, IDLE_FOR, IDLE_MOST, Io, Kind, REDIRECTS,
     Request, RequestId, Step, WINDOW,
 };
+pub use method::Method;
 pub use proxy::{Proxies, Proxy, ProxyError, ProxyKind};

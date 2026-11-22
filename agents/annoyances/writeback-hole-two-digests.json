@@ -1,0 +1,15 @@
+{
+ "id": "writeback-hole-two-digests",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane TWO",
+ "where": "crates/blaze-typeck/src/rules/writeback.rs (selected_rows over the body's reads) and lib.rs run; seen as front2 body_reads.rs Digests::file refusing",
+ "what": "tempo's census refused 17-19 constants (jiff/jiff-core bounds: `<impl DurationUnits>::to_span::LIMIT`, fractional_time_to_span::MIN_MICROS) with 'two read-list digests under one body'. The refusal named neither list, so the first step was making it name the differing rows. The second check read one row more: ImplsOf(Bounds, Param), asked by writeback's instance selection. On a fresh store that bucket was a hole, answered by its stand-in (an empty slice) AFTER the run's holed check, so the record was made from the stand-in and the question left out of the read list; a store an earlier constant's evaluation had filled answered it.",
+ "cost": "about two hours, most of it before the diff named the row; a backtrace probe in the world's impls_of found the caller in one run",
+ "cause": "writeback reads the world after `run` checked `holed()`, so a hole met in writeback was never a need",
+ "whys": "the hole design (answer with a stand-in, refuse the result) was enforced at one point, before writeback, while writeback still reads; nothing checked holes where the record is made",
+ "class": "a read after the last hole check: any world read past that point makes a record from a stand-in and a read list that depends on what the store held",
+ "prevention": "done: writeback returns Outcome and turns a hole met in it into Outcome::Need; the refusal names both lists' differing rows by item path (body_reads.rs ReadsDiff); test front2_const_reads_once reproduces the shape in three orders",
+ "annoyance": "the runner shows a failing test's stdout only without --nocapture; the shared repl's main lane lets another lane's cell overwrite a variable (use a lane name)",
+ "workaround": "none needed now",
+ "state": "fixed"
+}

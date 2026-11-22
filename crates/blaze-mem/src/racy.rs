@@ -16,7 +16,7 @@
 //! Relaxed loads on x86-64 and arm64 are plain moves, so a copy costs what `copy_from_slice` of
 //! the same length does a word at a time; the store's optimistic reads are 16 to 96 bytes.
 
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 const WORD: usize = size_of::<u64>();
 

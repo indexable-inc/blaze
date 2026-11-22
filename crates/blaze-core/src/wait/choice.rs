@@ -12,6 +12,7 @@
 //! and the choice changes nothing.
 
 use std::{
+    env,
     ffi::OsString,
     fmt,
     sync::atomic::{AtomicU8, Ordering},
@@ -41,6 +42,11 @@ const WAITED: u8 = 3;
 
 static CHOSEN: AtomicU8 = AtomicU8::new(UNCHOSEN);
 
+/// [`waits_of`] and [`choose_from`]: the choice from the mark's value its caller read.
+mod given;
+
+pub use given::{choose_from, waits_of};
+
 /// [`SANDBOXED`] with a value the launcher never sets.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an error, off every hot path
 pub struct MarkRefused(pub OsString);
@@ -69,18 +75,23 @@ impl std::error::Error for MarkRefused {}
 /// # Panics
 ///
 /// As [`choose`].
+///
+/// Ambient (rule 75): reads this process's environment from nowhere. The capability form is
+/// [`choose_from`] of the value its caller read from its `Env`. Deleted by batch P5-choice once
+/// its callers have moved.
 #[allow(
     clippy::disallowed_methods,
     reason = "the launcher's mark, read once at the entry point, typed, with no default for another value"
 )]
 pub fn choose_from_env() -> Result<Waits, MarkRefused> {
-    let waits = match std::env::var_os(SANDBOXED) {
-        None => Waits::Ring,
-        Some(mark) if mark == "1" => Waits::Direct,
-        Some(mark) => return Err(MarkRefused(mark)),
-    };
-    choose(waits);
-    Ok(waits)
+    match env::var_os(SANDBOXED) {
+        None => choose_from(None),
+        Some(mark) => match mark.to_str() {
+            Some(text) => choose_from(Some(text)),
+            // Not text, so not the launcher's `1`: refused naming it, as any other value.
+            None => Err(MarkRefused(mark)),
+        },
+    }
 }
 
 /// Chooses this process's driver, once.

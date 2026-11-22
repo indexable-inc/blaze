@@ -1,0 +1,10 @@
+[package]
+name = "ladder-x0-int-07-u128"
+version = "0.1.0"
+edition = "2024"
+
+# The rung is about 128-bit values, not overflow: the release setting (D101). With the dev
+# default its checked `*` needs `umul_overflow`/`smul_overflow` at 128 bits, which the baseline
+# tier does not emit yet (WRONG-NOTES.md "Runner 6").
+[profile.dev]
+overflow-checks = false

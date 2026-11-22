@@ -32,6 +32,8 @@ use std::{
     sync::atomic::{AtomicU8, Ordering},
 };
 
+use crate::host::{HostMemory, HugeChoice};
+
 /// The variable that chooses the pages of every huge region of the process.
 pub const VAR: &str = "BLAZE_HUGE_PAGES";
 
@@ -73,16 +75,47 @@ static CHOSEN: AtomicU8 = AtomicU8::new(0);
 /// The pages of a region that asks for huge pages in this process: what `BLAZE_HUGE_PAGES`
 /// names, checked against what the system has. An error names the variable, its value and
 /// what to do.
+// to remove: callers pass HostMemory (bstd move): blaze-core reads the variable and the
+// files at boot and calls `chosen_in`; this reads them here.
 pub fn chosen() -> io::Result<Pages> {
     if let Some(pages) = Pages::from_u8(CHOSEN.load(Ordering::Relaxed)) {
         return Ok(pages);
     }
-    let pages = choose(std::env::var_os(VAR).as_deref())?;
+    let huge_pages = choice(std::env::var_os(VAR).as_deref())?;
+    chosen_in(&crate::os::host_memory_here(huge_pages))
+}
+
+/// As [`chosen`], from the host's memory facts given (read once at boot by blaze-core): the
+/// first call decides ([`pages_for`]), sets the process's transparent huge page policy and
+/// keeps the choice; every later call, and every
+/// [`Region::reserve_huge`](crate::Region::reserve_huge), takes the choice kept. An error is
+/// not kept.
+pub fn chosen_in(host: &HostMemory) -> io::Result<Pages> {
+    if let Some(pages) = Pages::from_u8(CHOSEN.load(Ordering::Relaxed)) {
+        return Ok(pages);
+    }
+    let pages = pages_for(host)?;
     // Before the choice is published: a reservation that sees it sees the process policy set.
     // Two threads choosing at once both set the same flag.
     THP.store(crate::os::opt_out_unadvised(pages) as u8, Ordering::Relaxed);
     CHOSEN.store(pages as u8, Ordering::Relaxed);
     Ok(pages)
+}
+
+/// The pages `host`'s huge-page choice gives on that host, nothing kept and nothing read:
+/// transparent huge pages where Linux offers them (else base pages), the reserved pool when it
+/// has pages (else an error naming the pool), base pages for `off`.
+pub fn pages_for(host: &HostMemory) -> io::Result<Pages> {
+    match host.huge_pages {
+        HugeChoice::Transparent => {
+            Ok(if host.transparent_offered() { Pages::Transparent } else { Pages::Base })
+        }
+        HugeChoice::Reserved => {
+            crate::os::reserved_pool_in(host.huge_pool_2m)?;
+            Ok(Pages::Reserved)
+        }
+        HugeChoice::Never => Ok(Pages::Base),
+    }
 }
 
 /// What the process told Linux about transparent huge pages for memory no region of ours
@@ -120,8 +153,8 @@ impl Thp {
     }
 }
 
-impl std::fmt::Display for Thp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Thp {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             Thp::Unset => "unset",
             Thp::AdvisedOnly => "advised only",
@@ -147,35 +180,32 @@ pub fn thp() -> Thp {
 /// # Safety
 ///
 /// The range is a live mapping the caller owns.
-pub unsafe fn keep_base_pages(ptr: std::ptr::NonNull<u8>, bytes: usize) {
+pub unsafe fn keep_base_pages(ptr: core::ptr::NonNull<u8>, bytes: usize) {
     // SAFETY: the caller's contract.
     unsafe { crate::os::keep_base_pages(ptr, bytes) };
 }
 
 /// The pages `value` of `BLAZE_HUGE_PAGES` chooses on this system.
+// to remove: callers pass HostMemory (bstd move): this reads the host's files here.
 #[cold]
 pub(crate) fn choose(value: Option<&OsStr>) -> io::Result<Pages> {
-    match value.map(OsStr::to_str) {
-        None | Some(Some("" | "transparent")) => Ok(transparent()),
-        Some(Some("reserved")) => {
-            crate::os::reserved_pool()?;
-            Ok(Pages::Reserved)
-        }
-        Some(Some("off")) => Ok(Pages::Base),
-        Some(_) => Err(io::Error::new(
+    pages_for(&crate::os::host_memory_here(choice(value)?))
+}
+
+/// The choice `value` of `BLAZE_HUGE_PAGES` names (unset: [`HugeChoice::UNSET`]). An error
+/// names the variable, its value and the names it takes.
+#[cold]
+pub fn choice(value: Option<&OsStr>) -> io::Result<HugeChoice> {
+    let Some(value) = value else { return Ok(HugeChoice::UNSET) };
+    match value.to_str().and_then(HugeChoice::from_setting) {
+        Some(choice) => Ok(choice),
+        None => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             // alloc: the error of a misspelled setting, once
             format!(
-                "{VAR}={:?} names no pages: use `transparent` (the default), `reserved` (Linux's \
-                 hugetlb pool) or `off`",
-                value.unwrap_or_default()
+                "{VAR}={value:?} names no pages: use `transparent` (the default), `reserved` \
+                 (Linux's hugetlb pool) or `off`"
             ),
         )),
     }
-}
-
-/// Transparent huge pages where the system has them on, else base pages: what the machine
-/// offers without setup.
-fn transparent() -> Pages {
-    if crate::os::transparent_offered() { Pages::Transparent } else { Pages::Base }
 }

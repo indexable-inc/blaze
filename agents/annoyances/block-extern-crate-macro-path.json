@@ -1,0 +1,15 @@
+{
+ "id": "block-extern-crate-macro-path",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane SB",
+ "where": "crates/blaze-ladder/src/front2/scoped.rs (`ScopedBy::resolve`), crates/blaze-lower/src/by_name.rs (`PathAt`), front2/body.rs `lower_at`",
+ "what": "every serde derive's `const _: () = { extern crate serde as _serde; _serde::__require_serde_not_serde_core!(); .. };` was refused on engine-check: 'a path in module <crate root>: segment 0: not found'. A body's macro call was resolved at the body's module only, never at the block the call is written in, though the names library had made that block a module binding `_serde`.",
+ "cost": "an hour reading the old path against the task path for a difference: both share lower_at and ScopedBy, and the old `check` of serde-root profiled 'certificate stood', so its 0 errors were not a fresh check of these bodies",
+ "cause": "MacroNames::resolve was given the call's mark but not where in the body's text the call is, so it could not find the block",
+ "whys": "the block-module design (blaze-scope blocks.rs) was wired into paths (world_paths.rs via the locals' scope table) but not into the macro resolver, which runs during lowering, before the scope table exists",
+ "class": "a call-site macro path whose first segment an item of an enclosing block binds (`extern crate .. as`, `use`)",
+ "prevention": "done: PathAt carries the call's item-relative range; ScopedBy reads a call-site path at the innermost written block's module (same scan and keys as the library); tests front2_block_extern_crate (task vs today's path) and blaze-cli engine_block_extern_crate (command, with a planted E0308)",
+ "annoyance": "a mini's old-command output was a certificate hit, which looks like a fresh 0 errors; the queue took over an hour per ask at 15:20",
+ "workaround": "read the profile's 'certificate stood' before comparing two commands",
+ "state": "fixed, pending the queue"
+}

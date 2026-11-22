@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use crate::config::config_type_macro::config_type;
-use itertools::Itertools;
+use stdx::iter::IterExt;
 use serde::de::{SeqAccess, Visitor};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -451,6 +451,14 @@ impl<'a> IntoIterator for &'a IgnoreList {
 }
 
 impl IgnoreList {
+    /// The list a rustfmt.toml's `ignore` names, before `add_prefix` gives it the file's directory.
+    pub(crate) fn from_paths(path_set: HashSet<PathBuf>) -> IgnoreList {
+        IgnoreList {
+            path_set,
+            rustfmt_toml_path: PathBuf::new(),
+        }
+    }
+
     pub fn add_prefix(&mut self, dir: &Path) {
         self.rustfmt_toml_path = dir.to_path_buf();
     }

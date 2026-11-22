@@ -113,14 +113,13 @@ impl Key {
     /// `raw` as a key, or why it is none.
     ///
     /// The contract: a key is 1 to [`KEY_MOST`] bytes.
+    #[core::contracts::ensures(|r: &Result<Key, KeyError>| match r {
+        Ok(key) => !key.as_str().is_empty() && key.as_str().len() <= KEY_MOST,
+        Err(_) => true,
+    })]
     #[blaze::pure]
     #[blaze::nonblocking]
-    pub fn new(raw: &str) -> (r: Result<Key, KeyError>)
-        ensures match &r {
-            Ok(key) => !key.as_str().is_empty() && key.as_str().len() <= KEY_MOST,
-            Err(_) => true,
-        }
-    {
+    pub fn new(raw: &str) -> Result<Key, KeyError> {
         if let Some(why) = refused(raw) {
             // alloc: an error's message.
             return Err(KeyError { key: raw.to_owned(), why });
@@ -258,12 +257,18 @@ impl<#[blaze::linear] P: Rights> Kv<P> {
 
     /// Every key of the store, sorted, in `frame`. A file beneath the directory that is no
     /// key's (in a directory of its own, or with a name no [`Key`] has) is not the store's
-    /// and is not listed.
+    /// and is not listed. A key is one part of a path, so the store's own folder is listed one
+    /// level ([`crate::fs::Dir::own_entries_if_there`]), never at depth: a folder beneath it is skipped
+    /// unread.
     pub fn list<'a>(&self, cx: &Cx, frame: &'a Frame) -> Result<Vec<Key, &'a Frame>, KvError> {
-        let files = self.dir.list(cx, frame).map_err(|error| Self::refuse(KvOp::List, None, error))?;
+        let listed = self.dir.own_entries_if_there(cx).map_err(|error| Self::refuse(KvOp::List, None, error))?;
         let mut keys = Vec::new_in(frame);
-        for (path, _) in &files {
-            let Ok(key) = Key::new(path.as_str()) else { continue };
+        let Some(entries) = listed else { return Ok(keys) };
+        for (name, kind) in entries.iter() {
+            if kind == crate::fs::EntryKind::Dir {
+                continue;
+            }
+            let Ok(key) = Key::new(name) else { continue };
             keys.try_reserve(1).map_err(|_| {
                 let stopped = Stopped::OutOfMemory { arena: "bstd::kv list", asked: size_of::<Key>() };
                 // clone: an error's name of the store's directory, a refcount.
@@ -302,7 +307,7 @@ impl Kv<ReadWrite> {
     pub fn put_synced(&self, cx: &Cx, key: &Key, value: &[u8]) -> Result<(), KvError> {
         let put = match cx.plant() {
             Plant::KvPutUnsynced => self.dir.publish_unsynced(cx, key.path(), Content::bytes(value), Unsynced::No).map(|_| ()),
-            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned => self.dir.publish_synced(cx, key.path(), Content::bytes(value)).map(|_| ()),
+            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates | Plant::AncestorsUnbounded => self.dir.publish_synced(cx, key.path(), Content::bytes(value)).map(|_| ()),
         };
         put.map_err(|error| Self::refuse(KvOp::Put, Some(key), error))
     }

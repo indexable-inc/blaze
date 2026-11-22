@@ -1,0 +1,15 @@
+{
+ "id": "borrows-facts-wrapper-drops-methods",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane BW",
+ "where": "crates/blaze-ladder/src/front2/borrows_nested.rs (NestedFacts), crates/blaze-flow-lower/src/lib.rs (trait Facts)",
+ "what": "a new Facts method (object_trait_lifetimes, for the Unsize to `&dyn Tr` rule) was answered in BorrowFacts but never reached the lowering: every body is lowered through NestedFacts, which forwards each method by hand, and a method it does not forward silently takes the trait's default `None` (not known), so the fix looked inert with no error",
+ "cost": "one test round and a reading of the facts dump to see the method was never asked",
+ "cause": "Facts has defaulted methods returning `None`, so a wrapper that forgets one compiles and quietly answers 'not known'",
+ "whys": "the defaults exist so tests' small Facts impls need not write every method; the same defaults let a forwarding wrapper drop a method",
+ "class": "any forwarding impl of a trait with defaulted methods (NestedFacts over BorrowFacts, any future wrapper)",
+ "prevention": "wanted: no defaults on Facts (each impl names every answer), or a lint that a forwarding impl overrides every defaulted method; done for now: NestedFacts forwards object_trait_lifetimes",
+ "annoyance": "the runner keeps 30 lines of a failure, so a test printing flows must join them into long lines; a typeck panic ('node 6 is not a type', blaze-typeck infer/mod.rs:154) from `fn f<'a>(c: &'a mut Chan) -> impl Future<Output = Option<u8>> + 'static { c.pop() }` (with `async fn pop(&mut self)`) aborts the whole test instead of failing one body",
+ "workaround": "the test joins each wrong body's flow into lines of at most 1100 bytes; the panicking control was left out of front2_borrows_tempo",
+ "state": "open"
+}

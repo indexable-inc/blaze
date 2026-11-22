@@ -1,7 +1,7 @@
 ---
 status: plan
-summary: A proposal to change how target.md finds a body, a surface and a unit manifest. Today each is keyed by its text and everything reachable from it by name, with a read list checked and the record copied under a new key when the key moves. Proposed, each is found by what it read, so an unrelated edit moves no key, nothing is refiled or copied, and correctness rests on one claim (the read set is complete) and not two. Says what was found in the code, the change as an outside review amended it, why it is sound, its cost against the floor, and what it does to the crates built on blaze-keyed. Decided (D39); blaze-keyed, blaze-host and blaze-unitkey are built on it on main; blaze-front is built on it over the ported front end.
-date: 2026-11-13
+summary: A proposal to change how target.md finds a body, a surface and a unit manifest. Today each is keyed by its text and everything reachable from it by name, with a read list checked and the record copied under a new key when the key moves. Proposed, each is found by what it read, so an unrelated edit moves no key, nothing is refiled or copied, and correctness rests on one claim (the read set is complete) and not two. Says what was found in the code, the change as an outside review amended it, why it is sound, its cost against the floor, and what it does to the crates built on blaze-keyed. Decided (D39); blaze-keyed, blaze-host and blaze-unitkey are built on it on main; blaze-front is built on it over the ported front end. Ends with the edit loop's end state per stage, its floors, the gap and the pieces (architect, 2026-11-16).
+date: 2026-11-16
 ---
 # Read-addressed records: find a result by what it read
 
@@ -227,3 +227,125 @@ digest, and that cost is stated: a line added above a reached function re-keys t
 3. In the same piece, not after it (review): the driver hosted for real on hello-world, a
    surface from source and one body checked from records, so that how many facts a body reads
    and how often a shape changes are seen before more is built on the interface.
+
+## End state: what an edit costs (architect, 2026-11-16)
+
+What a command redoes and reuses, stage by stage. Mechanism: the drive's (`key::task_key` =
+H(tool, kind, subject, source), `key::value_key` = H(key, sorted reads), answers.rs); the
+pipeline stands: drive.md, "End state: the whole pipeline on the command". Rules 77, 21, 65, 71,
+74, 52, 25. certificate.md stays superseded (bottom.md 9); caches.md inventories the old layer
+(daemon, query memos, crate images) and goes with it, its hash domains moved beside `domains`;
+caching.md's rules 1-3 (typed, place-free key fields) stand.
+
+| Stage | Key (text, before the work) | Value | Read list | Proof left | (a) none | (b) body | (c) signature | (d) comment above |
+|---|---|---|---|---|---|---|---|---|
+| Change detection | none: a pointer per (tool, request shape) | leaf table: path, stamp, content id | none | `Unchanged` per leaf | journal or stats | 1 file hashed | 1 file hashed | 1 file hashed |
+| Manifests, lock (`Units`) | manifests', lock's bytes, listings read | units | absent manifests probed | units digest | certificate | stands | stands | stands |
+| Unit graph | lock bytes, manifests, target, host, toolchain id (`record::Source`) | graph (BUG1) | none | graph digest | certificate | stands | stands | stands |
+| Outline (`FileItems`) | file bytes, edition | items; per item a names, a signature and a body digest, position-free; file starts; line table | none | the three digests | certificate | 1 file (1 item when large) | 1 file | 1 file: the only stage that runs |
+| Surface (file) | the file's names digests (kind, name, visibility, name-making attributes; whole hash under a derive or attribute macro) | out = key | none | surface digest | certificate | equal: stop | equal unless a name moved: stop | equal: stop |
+| Crate names | crate identity, its surfaces' digests | names, items, exports records | questions to other crates, answer digests (asked.rs) | exports digest | certificate | stands | stands | stands |
+| Macro expansion | expander code id, input tokens, call-site hygiene | tokens with origins | env, cfg, files read | tokens digest | certificate | stands (a call in the body: redone) | stands unless its input moved | stands |
+| Signature (split) | crate identity, item key, signature digest | lowered head with lifetimes | each path's answer, aliases' heads | head digest | certificate | stands | 1 head redone | stands |
+| Impl candidates | per crate: crate identity, items-record digest | `NoImplsOf`, directory, buckets (blaze-surface impl_index.rs) | each header's trait path and self head answers | bucket digests | certificate | stands | 1 bucket when a header moved | stands |
+| Body type check | crate identity, item key, body and signature digests (self as "self") | types, findings item-relative, made facts | (question, answer digest), blaze-typeck `ReadList` | result digest; made facts' digest | certificate | 1 body | readers replayed; moved ones redone | stands |
+| Borrow check | in the body task, after types | verdict, findings | heads' lifetimes | `Checked` proof | certificate | 1 body | as types | stands |
+| Lowered code | body result digest | LIR | layouts | code identity | certificate | 1 body | bodies whose result moved | stands |
+| Instance code | body result digest, type-argument keys, settings, inlinees' instance keys | code, relocations | layouts | instance key | certificate | 1 instance | as above | stands |
+| Program manifest | link settings, instance keys | instances, image digest | none | manifest key | certificate | 1 entry patched | entries patched | stands |
+| Test result | entry's reach digest (read-addressed.md, "Tests") | pass, output | outside reads | none | certificate | tests reaching it | same | stands once lines leave the digest |
+| Finding printing | finding id: lint, item, message, arguments | none | none | none | stored, printed | new and fixed only | same | re-placed by the new line table, nothing checked |
+
+**Who read this.** The answer table (answers.rs) is the reverse index on disk: a row per name
+(key, address, `readers`), paged by the subject's leading bits under a root; a changed name's
+readers are one page read; an edit writes the touched pages, the root and the pointer, no
+fsync. End state: pages by bytes (at most 64 KiB), not 512 rows (a body row reads ~150 facts
+of 65 bytes: a 512-row page would be ~5 MB); a row holds its shape's digest and the shape is
+its own record, so rows are fixed-width; past 4,096 pages the root is two-level (8 KiB
+rewritten, not 32 bytes a page). Size: tempo's names read lists 35.8 MB (measured), readers
+the same again. No row holds a file position (rule 71): `Row::place` does today.
+
+**Early cutoff.** An out digest is compared where its readers' rows are read; equal ends the
+walk (32 bytes). Surface: names digests, not signature digests, so a type edit never re-solves
+names; crate names: exports digest, then question-grain answers (asked.rs); signature: head
+digest; body: made-facts digest (empty for most), so a body edit dirties no reader; instance:
+code digest. An equal digest is the proof that covers everything below it.
+
+**Floors** (estimates: stat ~1.5 us, pread ~5 us, outline 1 us a line, a body 0.4 to 1.6 ms
+from the measured 640 to 2,578 a second). tempo, ~870 checkout files (drive.md): (a) exec 1 ms
++ pointer 1 pread + journal 1 ms or 870 stats 1.3 ms + certificate key (BLAKE3, ~60 KB) + 1
+probe and 1 pread = 3 ms (today 27.9 to 37 ms); (b) (a) + 1 outline (1k lines, 1 ms) + 1 body
+typed and borrow-checked (~2 ms) + ~20 head preads + 3 page writes and the pointer = 7 ms
+(`run`: + 1 instance, ~2 ms); (c) (b) less the body + 1 head (65 us) + 1 readers page + N
+replays (~20 us each) + the moved bodies / cores = 6 ms + N x 1.6 ms / cores (today 138.1 ms,
+one crate's names re-solved; with names digests names do not run); (d) (a) + 1 outline + 1
+record = 5 ms. blaze (4,581 files): (a) 3 ms by journal, 9 ms by stats (installed build:
+120 ms); (b) to (d) as tempo plus the larger sweep.
+
+**One home, many builds.** Every record is valid by its key, which holds the tool; nothing is
+named `last`. The pointer is a hint for the forward walk: one per (tool, request shape) in
+`<checkout>/.blaze/v2/at/`, 8 kept. Two tool builds, two targets, `check` and `test` keep their
+own; two worktrees share every record (no path in a key). A missing pointer costs a walk.
+
+**Fresh clone.** The certificate key is the tool, the request and every (path, content id): a
+clone of a commit CI checked hashes its files (tempo's 409,322 lines, ~15 MB, ~2 ms on 8 cores)
+and asks the bucket once. Hit: the answer, no task. Miss: one batched round trip for what the
+walk names; public crates from the bucket, the workspace's only where the organisation opts in.
+
+**Against the best.** Salsa and rust-analyzer: early cutoff by out digest is matched;
+durability is "a checksummed archive or the toolchain is never statted"; the graph is on disk,
+so a restart costs nothing, at a pread per page where salsa chases a pointer. rustc
+incremental decodes its whole dep graph each session; here only touched pages, at item grain.
+Bazel, Buck2 (DICE): file and action digests and a shared cache matched, without their daemon
+or target grain. Zig: per-declaration dependencies, here kept on disk. Hack: saved naming table
+and on-disk fan-out table are this design. Sorbet's fast path is the Surface cutoff.
+TypeScript build info: signature cutoff per file, here per item. Unison: a body's key is its
+own text with itself as "self". Shake, Incremental: value cutoff; Shake's traces are the read
+lists. No daemon costs ~1 ms of process start and ~5 us page reads, a few hundred an edit; it
+buys a free restart, no memory between edits, and no invalidation bug living in a process.
+
+### Gap (code read 2026-11-16, tree blaze-fresh-1115)
+
+| Stage | Today, with evidence | Missing | Cost today | Reached |
+|---|---|---|---|---|
+| Change detection | sweep.rs `Follow::follow` stats every leaf; the pointer `.blaze/v2/last` (seal.rs `PATH`) is one per checkout; request.rs `begin` drops a `last` of another tool and walks from the units | journal; a pointer per (tool, shape) | 27.9 to 37 ms repeat (tempo names step) | yes |
+| Manifests, unit graph | `Units` keyed by the layout's reads; blaze-unit-graph record.rs `Source` (BUG1): records | none | not measured | yes |
+| Outline | work.rs `outline_file`: `FileItems` keyed by `file_source(content, edition)`: a record; whole file | per-item re-outline | 1 us a line | yes |
+| Surface | blaze-file-items lib.rs `surface` hashes each item's `signature_hash` | a names digest per item | a type edit re-solves its crate: 138.1 ms | yes |
+| Crate names | names.rs `run`: `world` builds every crate's inputs per command, then `resolve_crate` over the whole crate | world by key; module grain | 138.1 ms an edit; 29.5 s, 2.3 GB cold | yes |
+| Expansion | blaze-expand key.rs, record.rs exist; work.rs `builds(Expansion)` false; expanded inside each solve | records on the command path | not measured | inside names |
+| Signature | front2 heads.rs `Store`: HashMaps per run; `builds(Signature)` false | head records, a task | 65 us a head | no |
+| Impl candidates | front2 buckets.rs `Buckets::new` files every impl header per run; blaze-surface `build_impl_index` has no caller outside its crates | per-crate records, built from resolved headers | ~190 ms a run (harness) | no |
+| Body type check | blaze-typeck `check` returns `Checked` with its `ReadList`; nothing keeps it or replays it; work.rs `whole(BodyCheck)` false | the record, its read list kept, replay | 0.4 to 1.6 ms a body, every body every run | no |
+| Borrow check, code, instances | blaze-flow; drive run.rs `code_name` (run only) | in the body task | not measured | run only |
+| Answer table | answers.rs `Row::place` file-relative; pages by 512 rows; flat root | byte-sized pages, shape records, two-level root | not measured | yes |
+| Certificate | request.rs `cert_of`, BDC3; blaze-certify used only by blaze-profile history.rs | one home (rule 30) | in the repeat | yes |
+
+### Pieces (largest saving per edit first; one writer each; drive.md's pieces 1 to 17 stand and
+are cited as "drive N")
+
+1. POINTER PER BUILD. blaze-cli seal.rs, main.rs `request`; blaze-drive request.rs `begin`: the
+   pointer at `.blaze/v2/at/<hex16 of H(tool, shape)>`, 8 kept. Test: tool A, tool B, edit,
+   tool A: A walks forward (`profile.forward`), never from the units. Saves a whole walk.
+2. NAMES DIGEST. blaze-file-items: a per-item names digest beside `signature_hash`;
+   `Outline::surface` hashes it. Test: `fn f(x: u8)` to `u16` leaves `surface()` equal; a
+   rename, a `pub` or a new `#[derive]` moves it. Saves ~130 ms per type edit on tempo.
+3. BODY REPLAY (written, below). blaze-typeck replay.rs: a kept `ReadList` asked again of
+   today's world; `Holds`, or the first question that moved. With drive 7, 8.
+4. READ LIST BYTES (after 3). blaze-typeck: `ReadList` to bytes and back (question tag, fixed
+   fields, answer digest widened to 32 bytes: rule 21). Test: round trip equal on every suite body.
+5. BODY RECORDS IN THE TASK (after 3, 4, drive 7). work.rs `BodyCheck`: key from the body
+   digests; on a key hit, replay; `Holds` keeps it. Test: a signature edit replays N, redoes
+   the moved ones; a round trip equals a fresh check in bytes. Saves bodies x 1 ms per command.
+6. WORLD BY KEY (drive "No per-command world"). names.rs `world`: only the solved crate's and
+   its dependencies' inputs. Test: one crate re-solved opens one crate's files. With 2.
+7. IMPL INDEX RECORDS (drive 12). Rows from resolved headers into `build_impl_index`; front2
+   `Buckets` reads them through `blaze_impls::candidates`. Saves ~190 ms a run.
+8. ANSWER PAGES. answers.rs: no `place` in a row, pages by bytes, a two-level root, a shape
+   record per row. Test: (d) writes only the `FileItems` row's page; sim round trip.
+9. JOURNAL (macOS). blaze-cli sweep.rs: FSEvents since the stored event id; stats elsewhere.
+   Test (sim): an event-less repeat makes no stat. Saves ~1 to 30 ms a repeat.
+10. PER-ITEM OUTLINE. blaze-file-items: re-outline from the item before the edit. Test: a
+    30k-line file's body edit outlines one item.
+
+At once: 1, 2, 3, 8, 9, 10 (separate files); then 4, 6, 7; then 5.

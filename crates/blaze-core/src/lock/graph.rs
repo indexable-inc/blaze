@@ -44,14 +44,14 @@ impl Owner {
     }
 }
 
-/// Every wait in progress. A lock of the lock module's own, touched only on slow paths and by
-/// the watchdog, which records nothing of itself (it is the registry).
-#[expect(clippy::disallowed_types, reason = "the lock module's own registry, on slow paths only")]
+/// Every wait in progress. A raw lock of the lock module's own, touched only on slow paths and
+/// by the watchdog, which records nothing of itself (it is the registry); its own wait has no
+/// row ([`crate::wait::word_wait`]), so registering never registers.
 #[expect(
     blaze::process_static,
     reason = "the waits in progress, each removed as it ends: bounded by the threads waiting at once"
 )]
-static WAITS: parking_lot::Mutex<Vec<Entry>> = parking_lot::Mutex::new(Vec::new());
+static WAITS: super::raw::Mutex<Vec<Entry>> = super::raw::Mutex::new(Vec::new());
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 

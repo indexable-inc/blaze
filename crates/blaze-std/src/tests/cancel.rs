@@ -71,7 +71,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
             }
             let ended = &mut ended;
             let (clock, dir) = (&clock, &dir);
-            let task = s.spawn(NAMES[at], TASK_FRAME, move |cx| -> Result<(), String> {
+            let task = s.may_overlap(NAMES[at], TASK_FRAME, move |cx| -> Result<(), String> {
                 match kind {
                     Kind::Fails => return Err("this task fails".to_owned()),
                     Kind::Panics => panic!("this task panics (a planted panic of the cancel test)"),

@@ -1,0 +1,9 @@
+# The third-party packages each workspace crate depends on, by its package name
+# (docs/v2/plan/design/bottom.md, "Also decided on 2026-11-15": none, in the end). `direct`:
+# named in its normal and build dependencies; `dev`: in its dev-dependencies only; `closure`:
+# reached by its normal and build dependencies, through the workspace's crates and Cargo.lock.
+# A package is a name and a version. `(all)` is the workspace's, each package once. Only
+# shrinks; a crate with no row is held to 0. Written by scripts/src/bin/thirdparty.rs
+# (`{"command": "write"}`), checked in CI; docs/v2/plan/third-party.md says what replaces each.
+# crate	direct	dev	closure
+(all)	0	0	0

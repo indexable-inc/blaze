@@ -1,0 +1,28 @@
+[package]
+name = "blaze-cbor"
+description = "blaze's one deterministic CBOR (RFC 8949, section 4.2.1: shortest heads and floats, definite lengths, map keys in bytewise order of their encoding): writers of each head, the bounded field reader records are read with, the streaming event form blaze-json has, and the bridge to blaze-data's `Value` in both directions; every non-canonical input refused at its offset; `no_std`, no `alloc`, the allocator passed in"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The format-neutral value the bridge reads into and writes from (itself on blaze-own alone).
+blaze-data.workspace = true
+# `Vec` in the caller's allocator: what every writer appends to.
+blaze-own.workspace = true
+
+[dev-dependencies]
+blaze-mem.workspace = true
+# The round trip against `Value`, with a planted-bug control.
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

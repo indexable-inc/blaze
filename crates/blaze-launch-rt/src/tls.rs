@@ -19,6 +19,11 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(target_os = "macos")]
+use blaze_sys::posix::thread::{self, pthread_key_t};
+#[cfg(not(target_os = "macos"))]
+use libc::pthread_key_t;
+
 /// One thread-local static of the program: what [`get`] makes a thread's copy from. Lives
 /// as long as the process (the records leak one a static).
 #[repr(C)]
@@ -45,20 +50,25 @@ static KEY: AtomicUsize = AtomicUsize::new(0);
 
 /// Makes the launcher's one pthread key, once. Called by the control thread before the first
 /// thread-local static is defined, so before any thread can reach [`get`].
-pub fn key() -> Result<libc::pthread_key_t, i32> {
+pub fn key() -> Result<pthread_key_t, i32> {
     match KEY.load(Ordering::Acquire) {
         0 => {
-            let mut key: libc::pthread_key_t = 0;
-            // SAFETY: `key` is a live local the call fills; `ended` is a function of the
-            // destructor's signature that lives as long as the process.
-            let refused = unsafe { libc::pthread_key_create(&mut key, Some(ended)) };
-            if refused != 0 {
-                return Err(refused);
-            }
+            #[cfg(target_os = "macos")]
+            let key = thread::key_create(Some(ended)).map_err(|error| i32::from(error.raw()))?;
+            #[cfg(not(target_os = "macos"))]
+            let key = {
+                let mut key: pthread_key_t = 0;
+                // SAFETY: the key is a live out-parameter and ended is a process-lifetime destructor.
+                let refused = unsafe { libc::pthread_key_create(&mut key, Some(ended)) };
+                if refused != 0 {
+                    return Err(refused);
+                }
+                key
+            };
             KEY.store(key as usize + 1, Ordering::Release);
             Ok(key)
         }
-        made => Ok((made - 1) as libc::pthread_key_t),
+        made => Ok((made - 1) as pthread_key_t),
     }
 }
 
@@ -74,6 +84,10 @@ unsafe extern "C" fn ended(table: *mut c_void) {
         // copy. Setting the value again has the system call this again in its next round
         // (POSIX: up to PTHREAD_DESTRUCTOR_ITERATIONS, at least 4).
         if let Ok(key) = key() {
+            #[cfg(target_os = "macos")]
+            // SAFETY: this live key's destructor expects the table the current thread owns.
+            let _ = unsafe { thread::set_specific(key, table.cast()) };
+            #[cfg(not(target_os = "macos"))]
             // SAFETY: the key is this module's; the value is the table this thread owns.
             unsafe { libc::pthread_setspecific(key, table.cast()) };
         }
@@ -99,12 +113,20 @@ unsafe extern "C" fn ended(table: *mut c_void) {
 unsafe extern "C" fn get(var: *const Var) -> *mut u8 {
     // SAFETY: the caller's contract.
     let var = unsafe { &*var };
-    let key = (KEY.load(Ordering::Acquire) - 1) as libc::pthread_key_t;
+    let key = (KEY.load(Ordering::Acquire) - 1) as pthread_key_t;
+    #[cfg(target_os = "macos")]
+    // SAFETY: the caller guarantees the key has been created and it is never deleted.
+    let mut table = unsafe { thread::pthread_getspecific(key) }.cast::<Table>();
+    #[cfg(not(target_os = "macos"))]
     // SAFETY: the key was made (the caller's contract); reads this thread's value of it.
     let mut table = unsafe { libc::pthread_getspecific(key) }.cast::<Table>();
     if table.is_null() {
         // alloc: one table a thread that touches a thread-local, freed as the thread ends.
         table = Box::into_raw(Box::new(Table { copies: Vec::new(), rounds: 0 }));
+        #[cfg(target_os = "macos")]
+        // SAFETY: this live key's destructor expects the newly boxed table for this thread.
+        let _ = unsafe { thread::set_specific(key, table.cast()) };
+        #[cfg(not(target_os = "macos"))]
         // SAFETY: the key is this module's; the value is a table this thread now owns.
         unsafe { libc::pthread_setspecific(key, table.cast()) };
     }

@@ -14,14 +14,17 @@ mod macros;
 pub mod assert;
 pub mod child;
 pub mod edit_distance;
+pub mod either;
 pub mod file_lock;
+pub mod iter;
 pub mod lend;
 pub mod list;
+pub mod myers;
 pub mod panic_context;
 pub mod tempfile;
 pub mod time;
 
-pub use itertools;
+pub use either::Either;
 pub use lend::lend;
 
 #[inline(always)]

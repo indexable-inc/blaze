@@ -1,0 +1,38 @@
+[package]
+name = "blaze-cad-field"
+description = "The implicit CAD kernel's bottom (D183): a hash-consed field graph built from named options with exactness in its types, placement kept apart from geometry and parameters quantized before they are keyed; a tape compiler; three interpreters over one tape (points in SIMD with a bit-equal scalar twin, intervals with choices and simplification, forward-mode gradients); and the inspection primitives a model and its checks call (bounds, classify, distance between, section, ray). `no_std`, no `alloc`, no registry package"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# Deterministic functions (every sin, atan2 and pow a field takes), the lane seam the point
+# interpreter is written over, Vec3, Affine3, Aabb3 and the outward-rounded Interval.
+blaze-math.workspace = true
+# Authored lengths (whole nanometres) and angles (whole micro-arcseconds): what a key holds.
+blaze-units.workspace = true
+# The arena's vectors in a handed allocator, and the plant seam.
+blaze-own.workspace = true
+# Every node's digest and every tape's digest.
+blaze-blake3.workspace = true
+# The hash-consing tables (digest to node, op to value) with a fixed hasher.
+blaze-hash.workspace = true
+# The errors print by `Show` (names, quantities, what is accepted).
+blaze-text.workspace = true
+
+[dev-dependencies]
+# Properties and controls (`check`, `controls`, typed `plants!`).
+blaze-sim.workspace = true
+# `blaze_own::testing::heap()` for the tests and `Heap::process()` for the cost example.
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

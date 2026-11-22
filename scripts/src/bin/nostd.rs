@@ -239,7 +239,7 @@ fn under(path: &str, prefix: &str) -> bool {
 
 fn toml_of(path: &Path) -> toml::Table {
     let Some(text) = read_text(path) else { fail(SCRIPT, &format!("{} cannot be read as UTF-8 text", path.display())) };
-    text.parse::<toml::Table>().unwrap_or_else(|e| fail(SCRIPT, &format!("{} is not TOML: {e}", path.display())))
+    toml::parse(&text).unwrap_or_else(|e| fail(SCRIPT, &format!("{} is not TOML: {}", path.display(), e.display(&text))))
 }
 
 /// Each crate of `crates/`, by package name, with its root source file.
@@ -251,11 +251,12 @@ fn crate_roots(root: &Path) -> BTreeMap<String, PathBuf> {
     let mut roots = BTreeMap::new();
     for manifest in manifests {
         let dir = manifest.parent().unwrap_or(root);
-        let package = toml_of(&manifest).get("package").and_then(toml::Value::as_table).cloned().unwrap_or_default();
+        let manifest = toml_of(&manifest);
+        let package = manifest.get("package").and_then(toml::Value::as_map);
         for candidate in ["src/lib.rs", "src/main.rs"] {
             let source = dir.join(candidate);
             if source.is_file() {
-                let name = match package.get("name").and_then(toml::Value::as_str) {
+                let name = match package.and_then(|it| it.get("name")).and_then(toml::Value::as_str) {
                     Some(name) => name.to_owned(),
                     None => dir.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default(),
                 };
@@ -274,12 +275,12 @@ type Locked = (String, bool, Vec<String>);
 /// The lock file's packages.
 fn lock_packages(root: &Path) -> Vec<Locked> {
     let lock = toml_of(&root.join("Cargo.lock"));
-    let packages = lock.get("package").and_then(toml::Value::as_array).cloned().unwrap_or_default();
+    let packages = lock.get("package").and_then(toml::Value::as_list).unwrap_or_default();
     packages
         .iter()
         .map(|p| {
             let name = p.get("name").and_then(toml::Value::as_str).unwrap_or_else(|| fail(SCRIPT, "a package of Cargo.lock has no name"));
-            let deps = p.get("dependencies").and_then(toml::Value::as_array).cloned().unwrap_or_default();
+            let deps = p.get("dependencies").and_then(toml::Value::as_list).unwrap_or_default();
             let deps = deps.iter().filter_map(toml::Value::as_str).map(|d| d.split(' ').next().unwrap_or(d).to_owned()).collect();
             (name.to_owned(), p.get("source").is_none(), deps)
         })

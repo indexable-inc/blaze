@@ -1,0 +1,38 @@
+[package]
+name = "blaze-tier"
+description = "Piece 0 of code generation on the item layer (docs/v2/plan/design/backend-next.md, D97-D99): the types every tier, table, sampler and optimizer piece is written against: the `Tier` seam, the emitted record's loop map, polls and read list, the template table's format and the trait it is read through, a target's register description, the offer set, the sample ring's entry, the profile and startup records, and the two record keys. Types only: no logic beyond checked constructors."
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `View` and `Op`: what every tier compiles, and the operation a template serves.
+blaze-lir.workspace = true
+# `CodeRecord`, `Symbol`, `SiteKind`: the code record is blaze-code's; piece 0 adds only the
+# sections it lacks (the loop map, the polls, the read list).
+blaze-code.workspace = true
+# `InstanceKey`, `CodeId`, `SlotId`, `tier::Callee`, `parent::Read`: the run's keys and the read
+# list's row are blaze-run's; reused, not copied.
+blaze-run.workspace = true
+# `AVec` and `Alloc`: every list in the caller's allocator.
+blaze-own.workspace = true
+# The domain-separated BLAKE3 `Hasher`: the digest that ends every `bzcode03` record. By path,
+# as blaze-code takes it: the workspace entry turns on its `serde` adapter.
+blaze-ids.workspace = true
+
+[dev-dependencies]
+blaze-own = { workspace = true, features = ["std", "testing"] }
+# tests/features.rs checks the feature table row by row against rustc's tables and the
+# apple-m1 CPU set this crate holds (`TargetArch::rustc_table`, `cpus::features`).
+target-features.workspace = true
+
+[lints]
+workspace = true

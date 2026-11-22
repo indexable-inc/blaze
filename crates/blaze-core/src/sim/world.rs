@@ -28,9 +28,9 @@ use std::time::Duration;
 use blaze_sim::{Broke, Config, Tape, check, control};
 
 use super::host::Plant;
-use super::{Cut, FAULT, Faults, Op, Sim, SimFile};
+use super::{Cuts, FAULT, Faults, Named as SimNamed, Op, Sim, SimFile};
 use crate::world::asks::{Ask, Landing, Told, World, unsynced};
-use crate::world::disk::{Barrier, Change, Disk, File, Kept, SECTOR, Torn, sectors};
+use crate::world::disk::{Barrier, Change, Crash, Disk, File, Kept, Named, SECTOR, Torn, sectors};
 use crate::{Cache, Completion, Done, Driver, Effect, FileName, Memory, Tag, wait::Deadline};
 
 /// The names a run uses, in their order: a file's number in the world is its place here.
@@ -118,19 +118,6 @@ fn same_file(sim: &Sim, name: &FileName, ours: &SimFile, theirs: &File) -> Resul
             theirs.barriers
         ));
     }
-    let undo = ours.undo.as_ref().map(|undo| {
-        // clone: a test's copy of what a crash would put back
-        (undo.was.as_ref().map(|was| was.durable.clone()), undo.from.as_ref().map(number))
-    });
-    // clone: the same, of the world's
-    let theirs_undo = theirs.undo.as_ref().map(|undo| (undo.was.clone(), undo.from));
-    if undo != theirs_undo {
-        return Err(format!(
-            "{name}: a crash may undo {} in the simulation and {} in the world",
-            undone(&undo),
-            undone(&theirs_undo)
-        ));
-    }
     let read = sim.contents(name);
     let theirs_read = theirs.contents();
     if read != theirs_read {
@@ -157,15 +144,24 @@ fn said(changes: &[Change]) -> String {
     format!("[{}]", each.join(", "))
 }
 
-fn undone(undo: &Option<(Option<Vec<u8>>, Option<u64>)>) -> String {
-    match undo {
-        None => "nothing".to_owned(),
-        Some((was, from)) => format!(
-            "a file that held {} and came from {}",
-            was.as_ref().map_or("no file".to_owned(), |it| format!("{} bytes", it.len())),
-            from.map_or("no name".to_owned(), |it| NAMES[it as usize].to_owned())
-        ),
-    }
+/// A change of a name of the simulation's as the world's: the names by number, and what an
+/// undo puts back as its durable bytes. A directory's change has no world's form (the world is
+/// one directory of files) and is the harness's error, by name.
+fn named(named: &SimNamed) -> Result<Named, Broke> {
+    // clone: a test's copy of what a crash would put back
+    let was = |was: &Option<SimFile>| was.as_ref().map(|it| it.durable.clone());
+    Ok(match named {
+        SimNamed::Put { file, was: before } => Named::Put { file: number(file), was: was(before) },
+        SimNamed::Gone { file, was } => Named::Gone { file: number(file), was: was.durable.clone() },
+        SimNamed::Moved { from, to, was: before } => {
+            Named::Moved { from: number(from), to: number(to), was: was(before) }
+        }
+        SimNamed::MadeDir { dir } | SimNamed::RemovedDir { dir } => {
+            return Err(harness(format!(
+                "{dir}: a directory's change of a name, which the disk world (one directory of files) does not hold"
+            )));
+        }
+    })
 }
 
 /// The refinement's relation: the simulation's disk is the world's.
@@ -196,6 +192,13 @@ fn same(sim: &Sim, world: &Disk) -> Result<(), Broke> {
                 )));
             }
         }
+    }
+    let names: Vec<Named> = sim.names.iter().map(|change| named(&change.named)).collect::<Result<_, _>>()?;
+    if names != world.names {
+        return Err(oracle(format!(
+            "the changes of names a crash may undo are {names:?} in the simulation and {:?} in the world",
+            world.names
+        )));
     }
     if sim.files.len() != there || world.files.len() != there {
         return Err(harness(format!(
@@ -282,8 +285,9 @@ fn tell(sim: &Sim, world: &mut Disk, flying: Flying, done: &Done) -> Result<(), 
         }
         // Written out and not durable: nothing a crash keeps changes.
         Effect::WriteBack { .. } => true,
+        // The run's names are all in its one directory.
         Effect::SyncDir { .. } => {
-            world.flush();
+            world.sync_names();
             true
         }
         Effect::Write { file, bytes, .. } => {
@@ -511,7 +515,7 @@ fn draw(tape: &Tape, memory: &Memory, tag: u64) -> Effect {
         7 => Effect::Write { file: file(), bytes: bytes(), tag },
         8 => Effect::Rename { from: file(), to: file(), tag },
         9 => Effect::Remove { file: file(), tag },
-        10 => Effect::SyncDir { dir: FileName::new("w").expect("a name"), tag },
+        10 => Effect::SyncDir { dir: FileName::new("w").expect("a name").into(), tag },
         11 => Effect::WriteBack { file: file(), tag },
         _ => {
             // Whole sectors of the test's memory, at a sector's offset in the file.
@@ -539,30 +543,18 @@ fn file_of(effect: &Effect) -> Option<&FileName> {
 
 /// The cut the simulation drew, as the world's: one [`Kept`] for each file in the order of
 /// the names.
-fn kept(sim: &Sim, cuts: &[Cut]) -> Result<Vec<Kept>, Broke> {
+fn kept(sim: &Sim, cuts: &Cuts) -> Result<Crash, Broke> {
     let mut out = Vec::new();
-    for cut in cuts {
-        let file = sim.files.get(&cut.name).ok_or_else(|| harness(format!("a cut of {}, which is not there", cut.name)))?;
-        let torn = match (file.ops.get(cut.kept), cut.torn.as_slice()) {
-            (_, []) => Torn::Nothing,
-            (Some(Op::Append(_)), [Op::Append(part)]) | (Some(Op::At(..)), [Op::At(_, part)]) => {
-                Torn::Prefix(part.len())
-            }
-            (Some(Op::Sectors(at, bytes)), parts) => {
-                let mut mask = vec![false; sectors(bytes.len())];
-                for part in parts {
-                    match part {
-                        Op::At(sector, _) => mask[(*sector - *at) as usize / SECTOR] = true,
-                        other => return Err(harness(format!("a write from memory torn to {other:?}"))),
-                    }
-                }
-                Torn::Sectors(mask)
-            }
-            (next, torn) => return Err(harness(format!("{next:?} torn to {torn:?}"))),
-        };
-        out.push(Kept { whole: cut.kept, torn, undone: cut.undone });
+    for cut in &cuts.files {
+        if sim.files.get(&cut.name).is_none() {
+            return Err(harness(format!("a cut of {}, which is not there", cut.name)));
+        }
+        // The simulation draws the world's own tear: the same value, nothing to translate.
+        // clone: a test's copy of the tear
+        out.push(Kept { whole: cut.kept, torn: cut.torn.clone() });
     }
-    Ok(out)
+    // clone: a test's copy of which changes of names the crash undoes
+    Ok(Crash { kept: out, undone: cuts.undone.clone() })
 }
 
 /// The asks' world told `told` of `tag`, which must be an answer it allows; and the points the
@@ -624,6 +616,10 @@ fn holds(tape: &Tape, plant: Option<Plant>) -> Result<(), Broke> {
     if let Some(plant) = plant {
         sim.plant(plant);
     }
+    // The world is one directory of files: the folder its names are in is there, durably,
+    // before any effect, so no effect makes it (a folder an effect makes is a change of a name
+    // the world does not hold).
+    sim.mkdir(&FileName::new("w").expect("a name"));
     let memory = memory();
     let mut world = Disk::new();
     let mut asks = World::new();
@@ -716,10 +712,10 @@ fn holds(tape: &Tape, plant: Option<Plant>) -> Result<(), Broke> {
                     "the simulation drew a cut the world does not allow: {cut:?} of {world:?}"
                 )));
             }
-            if cut.iter().any(|it| it.undone) {
+            if cut.undone.iter().any(|it| *it) {
                 tape.reached("a crash that undoes");
             }
-            if cut.iter().any(|it| it.torn != Torn::Nothing) {
+            if cut.kept.iter().any(|it| it.torn != Torn::Nothing) {
                 tape.reached("a crash that tears");
             }
             if !asks.allows_crash(&sectors_landed, &cut) {
@@ -831,6 +827,13 @@ fn the_oracle_catches_a_sync_that_makes_less_durable_than_it_owes() {
     control(config(), None, Some(Plant::SyncCoversLess), "an answer the world does not allow", holds);
 }
 
+/// The planted bug, the simulation's loose rule until 2026-11-16: a file's sync makes its name
+/// durable too. The world keeps the change of the name until its directory is synced.
+#[test]
+fn the_oracle_catches_a_file_sync_that_keeps_its_name() {
+    control(config(), None, Some(Plant::FileSyncKeepsName), "the changes of names a crash may undo", holds);
+}
+
 /// The asks' world alone: a sync asked after two appends were told owes both, so an answer
 /// that covers one is refused and one that covers two is allowed; once an earlier sync of the
 /// file, asked after the first append, is told to cover it, the later sync owes one, and an
@@ -874,7 +877,8 @@ fn the_oracle_catches_a_crash_that_lands_what_no_write_in_flight_has() {
     assert!(asks.ask(15, Ask::Sync { file: 0 }));
     assert!(asks.ask(16, Ask::WriteFrom { file: 0, at: 512, bytes: vec![16; 1436] }));
     let landings = [Landing { ask: 2, sector: 1 }, Landing { ask: 0, sector: 1 }, Landing { ask: 0, sector: 2 }];
-    let all = [Kept { whole: 3, torn: Torn::Nothing, undone: false }];
+    // The whole-file write synced its name: no change of a name is left for a crash to undo.
+    let all = Crash { kept: vec![Kept { whole: 3, torn: Torn::Nothing }], undone: Vec::new() };
     for refused in [
         vec![Landing { ask: 0, sector: 1 }, Landing { ask: 0, sector: 1 }],
         vec![Landing { ask: 2, sector: 3 }],

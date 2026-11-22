@@ -1,5 +1,5 @@
 //! A wait for a child process to a deadline: how a test waits for the program it runs (rule
-//! `bounded-progress`, `blaze::unbounded_test_wait` in docs/lints.md). `Child::wait` has no
+//! `bounded-progress`, `blaze::unbounded_test_wait`). `Child::wait` has no
 //! deadline, so a child that hangs holds its test, and the whole run, for as long as nobody
 //! looks; a child that has not exited by the deadline is killed here instead, and the caller's
 //! test fails naming what hung.

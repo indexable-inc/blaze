@@ -1,30 +1,23 @@
-//! The flight recorder's rows ([`flight::Read`]) as Arrow record batches of the schema's tables:
-//! what the Parquet history writes, the live feed sends as IPC, and the explorer reads. Names
-//! the ring keeps as numbers (sites and [`flight::Sym`]s) are resolved here, once per distinct
-//! number a batch, into each dictionary column's values.
+//! The flight recorder's rows ([`flight::Read`]) as batches of the schema's tables
+//! ([`crate::columns`]): what the Parquet history writes, the live feed sends as Arrow IPC, and
+//! the explorer reads. Names the ring keeps as numbers (sites and [`flight::Sym`]s) are resolved
+//! here, once per distinct number a batch, into each dictionary column's values.
 
-use std::{
-    sync::{Arc, OnceLock},
-    time::Instant,
-};
+use std::{alloc::Global, sync::OnceLock, time::Instant};
 
-use arrow_array::{
-    Array, ArrayRef, BooleanArray, DictionaryArray, Float64Array, Int64Array, RecordBatch,
-    StringArray, UInt16Array, UInt32Array, UInt64Array,
-    builder::{ListBuilder, StringDictionaryBuilder, UInt64Builder},
-    types::UInt32Type,
-};
-use arrow_schema::{ArrowError, DataType, SchemaRef};
-use blaze_hash::HashMap;
-use std::alloc::Global;
+use blaze_columns::{ColumnError, Texts, Values};
+use blaze_hash::{FixedState, Map, MapOpts};
+use blaze_own::Vec as Buf;
 
+pub use crate::columns::{Batch, BatchError};
 use crate::{
+    columns::{self, Column},
     flight::{
         self, CounterRow, EventRow, FieldRow, FieldValue, FoldRow, OpenSpan, Plot, Read,
         SpanRow, SwitchRow, ThreadNow, WaitedOn,
     },
     sampler::Sample,
-    schema::{self, Table},
+    schema,
     span,
 };
 
@@ -46,76 +39,96 @@ impl Process<'static> {
     }
 }
 
-/// The Arrow schema of `table`, made once a process.
-pub fn schema_of(table: &'static Table) -> SchemaRef {
-    const ALL: usize = schema::TABLES.len() + schema::RESULTS.len();
-    static SCHEMAS: [OnceLock<SchemaRef>; ALL] = [const { OnceLock::new() }; ALL];
-    let at = schema::TABLES
-        .iter()
-        .chain(&schema::RESULTS)
-        .position(|it| it.name == table.name)
-        .unwrap_or_else(|| unreachable!("{} is a table of the schema", table.name));
-    let it = &SCHEMAS[at];
-    // clone: an `Arc` of a schema made once
-    it.get_or_init(|| Arc::new(crate::arrow::schema(table))).clone()
+/// A column of `values`, none null.
+fn values<T: blaze_columns::Native>(values: impl IntoIterator<Item = T>) -> Column {
+    // alloc: a column, once a batch, never per row
+    Column::values(values, Global)
 }
 
-/// A column of a batch.
-fn column(array: impl Array + 'static) -> ArrayRef {
+/// A column of `values`, null where `None`.
+fn options<T: blaze_columns::Native>(values: impl IntoIterator<Item = Option<T>>) -> Column {
     // alloc: a column, once a batch, never per row
-    Arc::new(array)
+    Column::options(values, Global)
 }
 
 /// A dictionary column being built: each distinct number given a key the first time, its
 /// string looked up then.
 struct Dict {
-    keys_of: HashMap<u64, u32, Global>,
-    values: Vec<std::sync::Arc<str>>,
+    keys_of: Map<u64, u32, FixedState, Global>,
+    values: Texts<Global>,
 }
 
 impl Dict {
     fn new() -> Dict {
-        // alloc: a dictionary's values, once a column a batch
-        Dict { keys_of: HashMap::new_in(Global), values: Vec::new() }
+        Dict { keys_of: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), values: Texts::new_in(Global) }
     }
 
-    fn key<T: Into<std::sync::Arc<str>>>(&mut self, number: u64, text: impl FnOnce() -> T) -> u32 {
-        let next = self.values.len() as u32;
+    fn key<T: AsRef<str>>(&mut self, number: u64, text: impl FnOnce() -> T) -> u32 {
+        let next = u32::try_from(self.values.len()).unwrap_or(u32::MAX);
         let values = &mut self.values;
         *self.keys_of.entry(number).or_insert_with(|| {
-            // alloc: once per distinct value a column a batch (a refcount for a name's)
-            values.push(text().into());
+            // alloc: once per distinct value a column a batch, into its one text buffer
+            values.push(text().as_ref());
             next
         })
     }
 
-    fn finish(self, keys: UInt32Array) -> Result<ArrayRef, ArrowError> {
-        let values = column(StringArray::from_iter_values(self.values.iter().map(|it| &**it)));
-        Ok(column(DictionaryArray::<UInt32Type>::try_new(keys, values)?))
+    fn finish(self, keys: impl IntoIterator<Item = Option<u32>>) -> Result<Column, ColumnError> {
+        Column::dict(keys, self.values, Global)
     }
 }
 
-/// A dictionary column of `values`, keyed as they come.
-fn dict<'a>(values: impl Iterator<Item = &'a str>) -> ArrayRef {
-    column(values.collect::<DictionaryArray<UInt32Type>>())
+/// A dictionary column being built over text: each distinct text given a key the first time.
+struct TextDict<'t> {
+    keys_of: Map<&'t str, u32, FixedState, Global>,
+    values: Texts<Global>,
+}
+
+impl<'t> TextDict<'t> {
+    fn new() -> TextDict<'t> {
+        TextDict { keys_of: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), values: Texts::new_in(Global) }
+    }
+
+    fn key(&mut self, text: &'t str) -> u32 {
+        let next = u32::try_from(self.values.len()).unwrap_or(u32::MAX);
+        let values = &mut self.values;
+        *self.keys_of.entry(text).or_insert_with(|| {
+            // alloc: once per distinct value a column a batch, into its one text buffer
+            values.push(text);
+            next
+        })
+    }
+}
+
+/// A dictionary column of `values`, keyed as they come, null where `None`.
+fn dict<'a>(values: impl Iterator<Item = Option<&'a str>>) -> Result<Column, ColumnError> {
+    let mut dict = TextDict::new();
+    // alloc: a batch's keys, once a column
+    let keys: std::vec::Vec<Option<u32>> = values.map(|it| it.map(|it| dict.key(it))).collect();
+    Column::dict(keys, dict.values, Global)
 }
 
 /// A dictionary column of one value, `rows` times; null throughout when `value` is `None`.
-fn constant(value: Option<&str>, rows: usize) -> Result<ArrayRef, ArrowError> {
-    let values = column(StringArray::from_iter_values(value));
-    let keys = match value {
-        Some(_) => UInt32Array::from_value(0, rows),
-        None => UInt32Array::new_null(rows),
-    };
-    Ok(column(DictionaryArray::<UInt32Type>::try_new(keys, values)?))
+fn constant(value: Option<&str>, rows: usize) -> Result<Column, ColumnError> {
+    let mut values = Texts::new_in(Global);
+    if let Some(value) = value {
+        values.push(value);
+    }
+    Column::dict(std::iter::repeat_n(value.map(|_| 0), rows), values, Global)
 }
 
 fn build_id(build: u32) -> Option<u64> {
     (build != 0).then_some(u64::from(build))
 }
 
+/// A list's end, as list offsets hold it.
+fn offset(elements: usize) -> Result<u32, ColumnError> {
+    u32::try_from(elements).map_err(|_| ColumnError::Offsets { why: "pass u32::MAX elements" })
+}
+
 /// The `spans` rows of `spans`, all from `process`.
-pub fn spans(spans: &[SpanRow], process: Process<'_>) -> Result<RecordBatch, ArrowError> {
+pub fn spans(spans: &[SpanRow], process: Process<'_>) -> Result<Batch, BatchError> {
+    let err = BatchError::of(&schema::SPANS);
     let rows = spans.len();
     let (mut threads, mut names, mut targets, mut kinds) =
         (Dict::new(), Dict::new(), Dict::new(), Dict::new());
@@ -130,56 +143,50 @@ pub fn spans(spans: &[SpanRow], process: Process<'_>) -> Result<RecordBatch, Arr
         // A site of this process, or of a dead one whose rows a postmortem read back.
         let meta = flight::site_text(row.site);
         let name = meta.map_or("?", |it| it.name);
-        thread_keys.push(threads.key(u64::from(row.thread_name), || {
+        thread_keys.push(Some(threads.key(u64::from(row.thread_name), || {
             flight::name(row.thread_name).unwrap_or_else(|| "?".into())
-        }));
-        name_keys.push(names.key(u64::from(row.site), || name));
-        target_keys.push(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target)));
+        })));
+        name_keys.push(Some(names.key(u64::from(row.site), || name)));
+        target_keys.push(Some(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target))));
         // A rust-analyzer query's span is named for its query.
         kind_keys.push(name.ends_with("_query").then(|| kinds.key(u64::from(row.site), || name)));
     }
     // alloc: a batch's list of columns, once a read
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema::SPANS.columns.len());
+    let mut columns: Vec<Column> = Vec::with_capacity(schema::SPANS.columns.len());
     columns.extend([
-        column(UInt64Array::from_iter(spans.iter().map(|it| build_id(it.build)))),
-        constant(process.commit, rows)?,
-        column(UInt32Array::from_value(process.pid, rows)),
-        constant(Some(process.name), rows)?,
-        column(UInt32Array::from_iter_values(spans.iter().map(|it| it.thread))),
-        threads.finish(UInt32Array::from(thread_keys))?,
-        column(UInt64Array::from_iter_values(spans.iter().map(|it| it.span_id))),
-        column(UInt64Array::from_iter(
-            spans.iter().map(|it| (it.parent != 0).then_some(it.parent)),
-        )),
-        column(UInt16Array::from_iter_values(spans.iter().map(|it| it.depth))),
-        names.finish(UInt32Array::from(name_keys))?,
-        targets.finish(UInt32Array::from(target_keys))?,
-        column(Int64Array::from_iter_values(spans.iter().map(|it| it.start_ns))),
-        column(Int64Array::from_iter_values(spans.iter().map(|it| it.dur_ns))),
-        column(Int64Array::from_iter(spans.iter().map(|it| it.self_cpu_ns.map(|it| it as i64)))),
-        column(UInt64Array::from_iter(spans.iter().map(|it| it.alloc.map(|it| it.bytes)))),
-        column(UInt64Array::from_iter(spans.iter().map(|it| it.alloc.map(|it| it.count)))),
-        kinds.finish(UInt32Array::from(kind_keys))?,
+        options(spans.iter().map(|it| build_id(it.build))),
+        constant(process.commit, rows).map_err(err)?,
+        Column::repeat(process.pid, rows, Global),
+        constant(Some(process.name), rows).map_err(err)?,
+        values(spans.iter().map(|it| it.thread)),
+        threads.finish(thread_keys).map_err(err)?,
+        values(spans.iter().map(|it| it.span_id)),
+        options(spans.iter().map(|it| (it.parent != 0).then_some(it.parent))),
+        values(spans.iter().map(|it| it.depth)),
+        names.finish(name_keys).map_err(err)?,
+        targets.finish(target_keys).map_err(err)?,
+        values(spans.iter().map(|it| it.start_ns)),
+        values(spans.iter().map(|it| it.dur_ns)),
+        options(spans.iter().map(|it| it.self_cpu_ns.map(|it| it as i64))),
+        options(spans.iter().map(|it| it.alloc.map(|it| it.bytes))),
+        options(spans.iter().map(|it| it.alloc.map(|it| it.count))),
+        kinds.finish(kind_keys).map_err(err)?,
     ]);
     let (generic, typed) = span::CELLS.split_at(span::GENERIC);
     for cells in generic {
         columns.push(span_column(spans, cells)?);
     }
     columns.extend([
-        column(UInt64Array::from_iter(spans.iter().map(|it| it.copied.map(|it| it.copies)))),
-        column(UInt64Array::from_iter(spans.iter().map(|it| it.copied.map(|it| it.bytes)))),
+        options(spans.iter().map(|it| it.copied.map(|it| it.copies))),
+        options(spans.iter().map(|it| it.copied.map(|it| it.bytes))),
         // Null where it folded none: most spans.
-        column(UInt64Array::from_iter(
-            spans.iter().map(|it| (it.folded_spans != 0).then_some(it.folded_spans)),
-        )),
-        column(Int64Array::from_iter(
-            spans.iter().map(|it| (it.folded_spans != 0).then_some(it.folded_ns)),
-        )),
+        options(spans.iter().map(|it| (it.folded_spans != 0).then_some(it.folded_spans))),
+        options(spans.iter().map(|it| (it.folded_spans != 0).then_some(it.folded_ns))),
     ]);
     for cells in typed {
         columns.push(span_column(spans, cells)?);
     }
-    RecordBatch::try_new(schema_of(&schema::SPANS), columns)
+    columns::batch(&schema::SPANS, columns)
 }
 
 /// A text column of `texts`, its bytes allocated once at their exact size. Until 2026-11-12
@@ -187,24 +194,16 @@ pub fn spans(spans: &[SpanRow], process: Process<'_>) -> Result<RecordBatch, Arr
 /// of tempo the largest site of the `profile` tag's heap churn, 22.25 GiB of 135.31 in blocks
 /// of 6.3 MB on average (`alloc_samples`, site `GenericByteBuilder::append_value::<&str>`,
 /// under `in_row_batches::<SpanRow, ..>`; int-1112 d45e70ddc).
-fn texts_column(texts: &[Option<std::sync::Arc<str>>]) -> ArrayRef {
-    let bytes: usize = texts.iter().map(|it| it.as_deref().map_or(0, str::len)).sum();
+fn texts_column(texts: &[Option<std::sync::Arc<str>>]) -> Column {
     // alloc: a batch's column, once a read, at its size
-    let mut column_of = arrow_array::builder::StringBuilder::with_capacity(texts.len(), bytes);
-    for text in texts {
-        match text {
-            Some(text) => column_of.append_value(&**text),
-            None => column_of.append_null(),
-        }
-    }
-    column(column_of.finish())
+    Column::opt_texts(texts, Global)
 }
 
 /// The column of `spans` a span kind's field fills ([`span::CELLS`]), as its schema types it.
-fn span_column(spans: &[SpanRow], cells: &span::Cells) -> Result<ArrayRef, ArrowError> {
+fn span_column(spans: &[SpanRow], cells: &span::Cells) -> Result<Column, BatchError> {
     let words = spans.iter().map(|it| it.said().get(cells.at));
     Ok(match cells.column.ty {
-        schema::Type::U64 => column(UInt64Array::from_iter(words.map(cells.number))),
+        schema::Type::U64 => options(words.map(cells.number)),
         schema::Type::Utf8 => {
             // alloc: a batch's texts, once a read
             let texts: Vec<Option<std::sync::Arc<str>>> = words.map(cells.text).collect();
@@ -212,83 +211,89 @@ fn span_column(spans: &[SpanRow], cells: &span::Cells) -> Result<ArrayRef, Arrow
         }
         schema::Type::Dict => {
             let mut values = Dict::new();
-            let keys: UInt32Array = words
+            // alloc: a batch's keys, once a column a read
+            let keys: Vec<Option<u32>> = words
                 .map(|word| {
                     (word != 0).then(|| {
                         values.key(word, || (cells.text)(word).unwrap_or_else(|| "?".into()))
                     })
                 })
                 .collect();
-            values.finish(keys)?
+            values.finish(keys).map_err(BatchError::of(&schema::SPANS))?
         }
         other => {
-            // alloc: an error, once
-            return Err(ArrowError::SchemaError(format!(
-                "the spans column `{}` is {other:?}, which no span field fills",
-                cells.column.name
-            )));
+            return Err(BatchError {
+                table: schema::SPANS.name,
+                error: ColumnError::Type {
+                    at: schema::SPANS.column(cells.column.name).unwrap_or(usize::MAX),
+                    field: columns::column_type(cells.column.ty),
+                    column: columns::column_type(other),
+                },
+            });
         }
     })
 }
 
 /// The `counters` rows of `counters`, all from `process`.
-pub fn counters(counters: &[CounterRow], process: Process<'_>) -> Result<RecordBatch, ArrowError> {
+pub fn counters(counters: &[CounterRow], process: Process<'_>) -> Result<Batch, BatchError> {
+    let err = BatchError::of(&schema::COUNTERS);
     let rows = counters.len();
     let mut names = Dict::new();
-    let name_keys = UInt32Array::from_iter_values(counters.iter().map(|it| match it.plot {
-        // A named counter's own name: `?` when it was let go before this read.
-        Plot::Named => names.key(1 << 32 | u64::from(it.named), || {
-            flight::name(it.named).unwrap_or_else(|| "?".into())
-        }),
-        plot => names.key(plot as u64, || plot.name()),
-    }));
+    // alloc: a batch's keys, once a read
+    let name_keys: Vec<Option<u32>> = counters
+        .iter()
+        .map(|it| {
+            Some(match it.plot {
+                // A named counter's own name: `?` when it was let go before this read.
+                Plot::Named => names.key(1 << 32 | u64::from(it.named), || {
+                    flight::name(it.named).unwrap_or_else(|| "?".into())
+                }),
+                plot => names.key(plot as u64, || plot.name()),
+            })
+        })
+        .collect();
     // alloc: a batch's list of columns, once a read
-    let columns: Vec<ArrayRef> = vec![
-        column(UInt64Array::from_iter(counters.iter().map(|it| build_id(it.build)))),
-        column(UInt32Array::from_value(process.pid, rows)),
-        names.finish(name_keys)?,
-        column(Int64Array::from_iter_values(counters.iter().map(|it| it.t_ns))),
-        column(Float64Array::from_iter_values(counters.iter().map(|it| it.value as f64))),
-        column(UInt32Array::from_iter(counters.iter().map(|it| it.fiber.map(|(fiber, _)| fiber)))),
-        column(UInt64Array::from_iter(counters.iter().map(|it| it.fiber.map(|(_, job)| job)))),
+    let columns: Vec<Column> = vec![
+        options(counters.iter().map(|it| build_id(it.build))),
+        Column::repeat(process.pid, rows, Global),
+        names.finish(name_keys).map_err(err)?,
+        values(counters.iter().map(|it| it.t_ns)),
+        values(counters.iter().map(|it| it.value as f64)),
+        options(counters.iter().map(|it| it.fiber.map(|(fiber, _)| fiber))),
+        options(counters.iter().map(|it| it.fiber.map(|(_, job)| job))),
     ];
-    RecordBatch::try_new(schema_of(&schema::COUNTERS), columns)
+    columns::batch(&schema::COUNTERS, columns)
 }
 
 /// The `open` rows of `threads`, read at `at_ns`, all from `process`.
-pub fn open(
-    threads: &[ThreadNow],
-    at_ns: i64,
-    process: Process<'_>,
-) -> Result<RecordBatch, ArrowError> {
+pub fn open(threads: &[ThreadNow], at_ns: i64, process: Process<'_>) -> Result<Batch, BatchError> {
+    let err = BatchError::of(&schema::OPEN);
     let rows = threads.iter().map(|it| it.open.len()).sum();
     let spans = || {
         threads.iter().flat_map(|thread| thread.open.iter().enumerate().map(move |it| (thread, it)))
     };
+    // alloc: a batch's texts, once a read of the threads, at their size
+    let texts = |text: fn(&OpenSpan) -> Option<&str>| -> Vec<Option<&str>> {
+        spans().map(|(_, (_, span))| text(span)).collect()
+    };
     // alloc: a batch's list of columns, once a read of the threads
-    let columns: Vec<ArrayRef> = vec![
-        column(UInt32Array::from_value(process.pid, rows)),
-        column(UInt32Array::from_iter_values(spans().map(|(thread, _)| thread.tid as u32))),
-        dict(spans().map(|(thread, _)| thread.name.as_str())),
-        column(UInt16Array::from_iter_values(spans().map(|(_, (depth, _))| depth as u16))),
-        dict(spans().map(|(_, (_, span))| span.name)),
-        dict(spans().map(|(_, (_, span))| span.target)),
-        column(Int64Array::from_iter_values(
-            spans().map(|(_, (_, span))| at_ns - span.for_ns as i64),
-        )),
-        column(
-            spans()
-                .map(|(_, (_, span))| span.krate.as_deref())
-                .collect::<DictionaryArray<UInt32Type>>(),
-        ),
-        column(StringArray::from_iter(spans().map(|(_, (_, span))| span.function.as_deref()))),
-        column(StringArray::from_iter(spans().map(|(_, (_, span))| span.unit.as_deref()))),
-        column(StringArray::from_iter(spans().map(|(_, (_, span))| span.awaits.as_deref()))),
-        column(UInt64Array::from_iter(spans().map(|(_, (_, span))| span.owner))),
-        column(Int64Array::from_value(at_ns, rows)),
-        column(UInt64Array::from_iter(threads.iter().flat_map(|thread| nearest_tasks(&thread.open)))),
+    let columns: Vec<Column> = vec![
+        Column::repeat(process.pid, rows, Global),
+        values(spans().map(|(thread, _)| thread.tid as u32)),
+        dict(spans().map(|(thread, _)| Some(thread.name.as_str()))).map_err(err)?,
+        values(spans().map(|(_, (depth, _))| depth as u16)),
+        dict(spans().map(|(_, (_, span))| Some(span.name))).map_err(err)?,
+        dict(spans().map(|(_, (_, span))| Some(span.target))).map_err(err)?,
+        values(spans().map(|(_, (_, span))| at_ns - span.for_ns as i64)),
+        dict(spans().map(|(_, (_, span))| span.krate.as_deref())).map_err(err)?,
+        Column::opt_texts(&texts(|span| span.function.as_deref()), Global),
+        Column::opt_texts(&texts(|span| span.unit.as_deref()), Global),
+        Column::opt_texts(&texts(|span| span.awaits.as_deref()), Global),
+        options(spans().map(|(_, (_, span))| span.owner)),
+        Column::repeat(at_ns, rows, Global),
+        options(threads.iter().flat_map(|thread| nearest_tasks(&thread.open))),
     ];
-    RecordBatch::try_new(schema_of(&schema::OPEN), columns)
+    columns::batch(&schema::OPEN, columns)
 }
 
 /// Each of a thread's open spans' `task` (outermost first): the nearest task among the span
@@ -303,62 +308,71 @@ fn nearest_tasks(open: &[OpenSpan]) -> impl Iterator<Item = Option<u64>> + '_ {
     })
 }
 
-/// The `samples` rows of `samples`, each frame named by `frames` (the frames of every address
-/// in them, by the address each is looked up at: [`crate::symbols::frames`]), all from
-/// `process`. `at` is one reading of both clocks: an `Instant` and the schema's nanoseconds then
-/// ([`crate::clock::mono_ns`]).
-pub(crate) fn samples(
-    samples: &[Sample],
-    frames: &HashMap<u64, Vec<String>, Global>,
-    at: (Instant, i64),
-    process: Process<'_>,
-) -> Result<RecordBatch, ArrowError> {
-    let rows = samples.len();
-    let schema = schema_of(&schema::SAMPLES);
-    let list_field = |name: &str| {
-        let at = schema::SAMPLES.column(name).unwrap_or_else(|| unreachable!("samples has {name}"));
-        let DataType::List(item) = schema.field(at).data_type() else {
-            unreachable!("{name} is a list (arrow.rs)")
-        };
-        // clone: an `Arc` of the schema's field, once a batch
-        item.clone()
-    };
-    let mut stacks = ListBuilder::new(StringDictionaryBuilder::<UInt32Type>::new())
-        .with_field(list_field("stack"));
-    let mut pcs = ListBuilder::new(UInt64Builder::new()).with_field(list_field("stack_pcs"));
-    for sample in samples {
-        let stack = &sample.pcs[..usize::from(sample.depth)];
+/// The `stack` (each frame's names, outermost first) and `stack_pcs` (the raw addresses,
+/// outermost first) columns of stacks given innermost first, each frame named by `frames`
+/// ([`crate::symbols::frames`]).
+fn stack_columns<'s>(
+    stacks: impl Iterator<Item = &'s [u64]>,
+    frames: &Map<u64, Vec<String>, FixedState, Global>,
+) -> Result<[Column; 2], ColumnError> {
+    let mut names = TextDict::new();
+    // alloc: a batch's two list columns, once a read
+    let (mut name_ends, mut keys) = (Buf::from_elem_in(0u32, 1, Global), Buf::new_in(Global));
+    // alloc: a batch's two list columns, once a read
+    let (mut pc_ends, mut pcs) = (Buf::from_elem_in(0u32, 1, Global), Buf::new_in(Global));
+    for stack in stacks {
         // Outermost first; the sampler keeps the innermost first.
         for (i, pc) in stack.iter().enumerate().rev() {
             // Every address has its frames ([`crate::symbols::frames`]): `?` only for a caller
             // that named fewer.
             let named = frames.get(&crate::symbols::lookup(i, *pc)).map_or(&[][..], Vec::as_slice);
             for name in named {
-                stacks.values().append_value(name);
+                keys.push(names.key(name));
             }
             if named.is_empty() {
-                stacks.values().append_value("?");
+                keys.push(names.key("?"));
             }
-            pcs.values().append_value(*pc);
+            pcs.push(*pc);
         }
-        stacks.append(true);
-        pcs.append(true);
+        name_ends.push(offset(keys.len())?);
+        pc_ends.push(offset(pcs.len())?);
     }
+    Ok([
+        Column::list(name_ends, None, Values::Dict { keys, values: names.values })?,
+        Column::list(pc_ends, None, Values::U64(pcs))?,
+    ])
+}
+
+/// The `samples` rows of `samples`, each frame named by `frames` (the frames of every address
+/// in them, by the address each is looked up at: [`crate::symbols::frames`]), all from
+/// `process`. `at` is one reading of both clocks: an `Instant` and the schema's nanoseconds then
+/// ([`crate::clock::mono_ns`]).
+pub(crate) fn samples(
+    samples: &[Sample],
+    frames: &Map<u64, Vec<String>, FixedState, Global>,
+    at: (Instant, i64),
+    process: Process<'_>,
+) -> Result<Batch, BatchError> {
+    let err = BatchError::of(&schema::SAMPLES);
+    let rows = samples.len();
+    let [stacks, pcs] =
+        stack_columns(samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]), frames)
+            .map_err(err)?;
     let t_ns = |it: &Sample| at.1 - at.0.saturating_duration_since(it.at).as_nanos() as i64;
     // alloc: a batch's list of columns, once a read
-    let columns: Vec<ArrayRef> = vec![
-        column(UInt64Array::from_iter(samples.iter().map(|it| build_id(it.build)))),
-        column(UInt32Array::from_value(process.pid, rows)),
-        column(UInt32Array::from_iter_values(samples.iter().map(|it| it.tid as u32))),
-        column(Int64Array::from_iter_values(samples.iter().map(t_ns))),
-        column(stacks.finish()),
-        column(UInt64Array::from_iter(samples.iter().map(|it| (it.span != 0).then_some(it.span)))),
-        dict(samples.iter().map(|it| if it.on_cpu { "on" } else { "off" })),
-        column(pcs.finish()),
-        column(UInt64Array::from_iter(samples.iter().map(|it| (it.job != 0).then_some(it.job)))),
-        column(UInt32Array::from_iter(samples.iter().map(|it| (it.fiber != 0).then_some(it.fiber)))),
+    let columns: Vec<Column> = vec![
+        options(samples.iter().map(|it| build_id(it.build))),
+        Column::repeat(process.pid, rows, Global),
+        values(samples.iter().map(|it| it.tid as u32)),
+        values(samples.iter().map(t_ns)),
+        stacks,
+        options(samples.iter().map(|it| (it.span != 0).then_some(it.span))),
+        dict(samples.iter().map(|it| Some(if it.on_cpu { "on" } else { "off" }))).map_err(err)?,
+        pcs,
+        options(samples.iter().map(|it| (it.job != 0).then_some(it.job))),
+        options(samples.iter().map(|it| (it.fiber != 0).then_some(it.fiber))),
     ];
-    RecordBatch::try_new(schema, columns)
+    columns::batch(&schema::SAMPLES, columns)
 }
 
 /// The `alloc_samples` rows of `samples` (the heap sampler's, [`crate::heap`]), each frame
@@ -367,10 +381,10 @@ pub(crate) fn samples(
 /// of both clocks, as for [`samples`].
 pub(crate) fn alloc_samples(
     samples: &[crate::heap::HeapSample],
-    frames: &HashMap<u64, Vec<String>, Global>,
+    frames: &Map<u64, Vec<String>, FixedState, Global>,
     at: (Instant, i64),
     process: Process<'_>,
-) -> Result<RecordBatch, ArrowError> {
+) -> Result<Batch, BatchError> {
     heap_samples(&schema::ALLOC_SAMPLES, None, samples, frames, at, process)
 }
 
@@ -378,11 +392,11 @@ pub(crate) fn alloc_samples(
 /// ([`crate::heap::held`]): [`alloc_samples`]' columns of each, then the reading's time.
 pub(crate) fn held_samples(
     samples: &[crate::heap::HeapSample],
-    frames: &HashMap<u64, Vec<String>, Global>,
+    frames: &Map<u64, Vec<String>, FixedState, Global>,
     at: (Instant, i64),
     read_ns: i64,
     process: Process<'_>,
-) -> Result<RecordBatch, ArrowError> {
+) -> Result<Batch, BatchError> {
     heap_samples(&schema::HELD_SAMPLES, Some(read_ns), samples, frames, at, process)
 }
 
@@ -392,68 +406,41 @@ fn heap_samples(
     table: &'static schema::Table,
     read_ns: Option<i64>,
     samples: &[crate::heap::HeapSample],
-    frames: &HashMap<u64, Vec<String>, Global>,
+    frames: &Map<u64, Vec<String>, FixedState, Global>,
     at: (Instant, i64),
     process: Process<'_>,
-) -> Result<RecordBatch, ArrowError> {
+) -> Result<Batch, BatchError> {
+    let err = BatchError::of(table);
     let rows = samples.len();
-    let schema = schema_of(table);
-    let list_field = |name: &str| {
-        let at = table
-            .column(name)
-            .unwrap_or_else(|| unreachable!("{} has {name}", table.name));
-        let DataType::List(item) = schema.field(at).data_type() else {
-            unreachable!("{name} is a list (arrow.rs)")
-        };
-        // clone: an `Arc` of the schema's field, once a batch
-        item.clone()
-    };
-    let mut stacks = ListBuilder::new(StringDictionaryBuilder::<UInt32Type>::new())
-        .with_field(list_field("stack"));
-    let mut pcs = ListBuilder::new(UInt64Builder::new()).with_field(list_field("stack_pcs"));
-    for sample in samples {
-        let stack = &sample.pcs[..usize::from(sample.depth)];
-        // Outermost first; the sampler keeps the innermost first.
-        for (i, pc) in stack.iter().enumerate().rev() {
-            let named = frames.get(&crate::symbols::lookup(i, *pc)).map_or(&[][..], Vec::as_slice);
-            for name in named {
-                stacks.values().append_value(name);
-            }
-            if named.is_empty() {
-                stacks.values().append_value("?");
-            }
-            pcs.values().append_value(*pc);
-        }
-        stacks.append(true);
-        pcs.append(true);
-    }
+    let [stacks, pcs] =
+        stack_columns(samples.iter().map(|it| &it.pcs[..usize::from(it.depth)]), frames)
+            .map_err(err)?;
     let t_ns = |it: &crate::heap::HeapSample| {
         at.1 - at.0.saturating_duration_since(it.at).as_nanos() as i64
     };
-    let tags: DictionaryArray<UInt32Type> =
-        samples.iter().map(|it| it.tag.map(blaze_mem::Tag::name)).collect();
+    // alloc: a batch's sites, once a read
+    let sites: Vec<Option<_>> = samples
+        .iter()
+        .map(|it| crate::heap::site_of(&it.pcs[..usize::from(it.depth)], frames))
+        .collect();
     // alloc: a batch's list of columns, once a read
-    let mut columns: Vec<ArrayRef> = vec![
-        column(UInt64Array::from_iter(samples.iter().map(|it| build_id(it.build)))),
-        column(UInt32Array::from_value(process.pid, rows)),
-        column(UInt32Array::from_iter_values(samples.iter().map(|it| it.tid as u32))),
-        column(Int64Array::from_iter_values(samples.iter().map(t_ns))),
-        column(UInt64Array::from_iter_values(samples.iter().map(|it| it.weight))),
-        column(stacks.finish()),
-        column(UInt64Array::from_iter(samples.iter().map(|it| (it.span != 0).then_some(it.span)))),
-        column(pcs.finish()),
-        column(tags),
-        column(UInt64Array::from_iter_values(samples.iter().map(|it| it.bytes))),
-        column(StringArray::from_iter(
-            samples
-                .iter()
-                .map(|it| crate::heap::site_of(&it.pcs[..usize::from(it.depth)], frames)),
-        )),
+    let mut columns: Vec<Column> = vec![
+        options(samples.iter().map(|it| build_id(it.build))),
+        Column::repeat(process.pid, rows, Global),
+        values(samples.iter().map(|it| it.tid as u32)),
+        values(samples.iter().map(t_ns)),
+        values(samples.iter().map(|it| it.weight)),
+        stacks,
+        options(samples.iter().map(|it| (it.span != 0).then_some(it.span))),
+        pcs,
+        dict(samples.iter().map(|it| it.tag.map(blaze_mem::Tag::name))).map_err(err)?,
+        values(samples.iter().map(|it| it.bytes)),
+        Column::opt_texts(&sites, Global),
     ];
     if let Some(read_ns) = read_ns {
-        columns.push(column(Int64Array::from_value(read_ns, rows))); // alloc: one column more
+        columns.push(Column::repeat(read_ns, rows, Global)); // alloc: one column more
     }
-    RecordBatch::try_new(schema, columns)
+    columns::batch(table, columns)
 }
 
 /// A code image a flush's `stack_pcs` addresses are in ([`crate::symbols::ImagesWritten`]), or
@@ -478,68 +465,73 @@ pub(crate) fn images(
     boot: Option<&str>,
     seen_ns: i64,
     process: Process<'_>,
-) -> Result<RecordBatch, ArrowError> {
+) -> Result<Batch, BatchError> {
+    let err = BatchError::of(&schema::IMAGES);
     let rows = images.len();
+    // alloc: a batch's texts, once a flush with new images
+    let texts = |text: fn(&ImageRow) -> Option<&str>| -> Vec<Option<&str>> {
+        images.iter().map(text).collect()
+    };
     // alloc: a batch's list of columns, once a flush with new images
-    let columns: Vec<ArrayRef> = vec![
-        column(UInt32Array::from_value(process.pid, rows)),
-        constant(boot, rows)?,
-        column(Int64Array::from_value(seen_ns, rows)),
-        column(StringArray::from_iter_values(images.iter().map(|it| it.path.as_str()))),
-        column(StringArray::from_iter(images.iter().map(|it| it.build_id.as_deref()))),
-        column(StringArray::from_iter(images.iter().map(|it| it.blake3.as_deref().ok()))),
-        column(StringArray::from_iter(
-            images.iter().map(|it| it.blake3.as_ref().err().map(String::as_str)),
-        )),
-        column(UInt64Array::from_iter_values(images.iter().map(|it| it.base))),
-        column(UInt64Array::from_iter_values(images.iter().map(|it| it.size))),
-        column(UInt64Array::from_iter_values(images.iter().map(|it| it.slide))),
-        dict(images.iter().map(|it| it.names)),
+    let columns: Vec<Column> = vec![
+        Column::repeat(process.pid, rows, Global),
+        constant(boot, rows).map_err(err)?,
+        Column::repeat(seen_ns, rows, Global),
+        Column::texts_of(images.iter().map(|it| it.path.as_str()), Global),
+        Column::opt_texts(&texts(|it| it.build_id.as_deref()), Global),
+        Column::opt_texts(&texts(|it| it.blake3.as_deref().ok()), Global),
+        Column::opt_texts(&texts(|it| it.blake3.as_ref().err().map(String::as_str)), Global),
+        values(images.iter().map(|it| it.base)),
+        values(images.iter().map(|it| it.size)),
+        values(images.iter().map(|it| it.slide)),
+        dict(images.iter().map(|it| Some(it.names))).map_err(err)?,
     ];
-    RecordBatch::try_new(schema_of(&schema::IMAGES), columns)
+    columns::batch(&schema::IMAGES, columns)
 }
 
 /// The `switches` rows of `switches`, all from `process`.
-pub fn switches(switches: &[SwitchRow], process: Process<'_>) -> Result<RecordBatch, ArrowError> {
+pub fn switches(switches: &[SwitchRow], process: Process<'_>) -> Result<Batch, BatchError> {
+    let err = BatchError::of(&schema::SWITCHES);
     let rows = switches.len();
     let (mut threads, mut events, mut kinds) = (Dict::new(), Dict::new(), Dict::new());
     // alloc: a batch's keys, once a read
     let (mut thread_keys, mut event_keys, mut kind_keys) =
         (Vec::with_capacity(rows), Vec::with_capacity(rows), Vec::with_capacity(rows));
     for row in switches {
-        thread_keys.push(threads.key(u64::from(row.thread_name), || {
+        thread_keys.push(Some(threads.key(u64::from(row.thread_name), || {
             flight::name(row.thread_name).unwrap_or_else(|| "?".into())
-        }));
-        event_keys.push(events.key(row.event as u64, || row.event.name()));
+        })));
+        event_keys.push(Some(events.key(row.event as u64, || row.event.name())));
         kind_keys.push(row.waited.map(|(on, _)| kinds.key(on as u64, || on.name())));
     }
     let value = |row: &SwitchRow| {
         row.waited.filter(|(on, _)| *on != WaitedOn::Moved).map(|(_, value)| value)
     };
     // alloc: a batch's list of columns, once a read
-    let columns: Vec<ArrayRef> = vec![
-        column(UInt64Array::from_iter(switches.iter().map(|it| build_id(it.build)))),
-        column(UInt32Array::from_value(process.pid, rows)),
-        column(UInt32Array::from_iter_values(switches.iter().map(|it| it.thread))),
-        threads.finish(UInt32Array::from(thread_keys))?,
-        column(Int64Array::from_iter_values(switches.iter().map(|it| it.t_ns))),
-        events.finish(UInt32Array::from(event_keys))?,
-        column(UInt64Array::from_iter_values(switches.iter().map(|it| it.job))),
-        column(UInt32Array::from_iter_values(switches.iter().map(|it| it.fiber))),
-        column(UInt32Array::from_iter_values(switches.iter().map(|it| it.core))),
-        kinds.finish(UInt32Array::from(kind_keys))?,
-        column(UInt64Array::from_iter(switches.iter().map(value))),
-        column(UInt64Array::from_iter(switches.iter().map(|it| it.by))),
-        column(Int64Array::from_iter(switches.iter().map(|it| it.since_ns))),
-        column(UInt64Array::from_iter(switches.iter().map(|it| it.began_as))),
-        column(Int64Array::from_iter(switches.iter().map(|it| it.queued_ns))),
-        column(Int64Array::from_iter(switches.iter().map(|it| it.cpu_ns.map(|it| it as i64)))),
+    let columns: Vec<Column> = vec![
+        options(switches.iter().map(|it| build_id(it.build))),
+        Column::repeat(process.pid, rows, Global),
+        values(switches.iter().map(|it| it.thread)),
+        threads.finish(thread_keys).map_err(err)?,
+        values(switches.iter().map(|it| it.t_ns)),
+        events.finish(event_keys).map_err(err)?,
+        values(switches.iter().map(|it| it.job)),
+        values(switches.iter().map(|it| it.fiber)),
+        values(switches.iter().map(|it| it.core)),
+        kinds.finish(kind_keys).map_err(err)?,
+        options(switches.iter().map(value)),
+        options(switches.iter().map(|it| it.by)),
+        options(switches.iter().map(|it| it.since_ns)),
+        options(switches.iter().map(|it| it.began_as)),
+        options(switches.iter().map(|it| it.queued_ns)),
+        options(switches.iter().map(|it| it.cpu_ns.map(|it| it as i64))),
     ];
-    RecordBatch::try_new(schema_of(&schema::SWITCHES), columns)
+    columns::batch(&schema::SWITCHES, columns)
 }
 
 /// The `events` rows of `events`, all from `process`.
-pub fn events(events: &[EventRow], process: Process<'_>) -> Result<RecordBatch, ArrowError> {
+pub fn events(events: &[EventRow], process: Process<'_>) -> Result<Batch, BatchError> {
+    let err = BatchError::of(&schema::EVENTS);
     let rows = events.len();
     let (mut threads, mut levels, mut targets, mut names) =
         (Dict::new(), Dict::new(), Dict::new(), Dict::new());
@@ -552,48 +544,49 @@ pub fn events(events: &[EventRow], process: Process<'_>) -> Result<RecordBatch, 
     );
     for row in events {
         let meta = flight::site_text(row.site);
-        thread_keys.push(threads.key(u64::from(row.thread_name), || {
+        thread_keys.push(Some(threads.key(u64::from(row.thread_name), || {
             flight::name(row.thread_name).unwrap_or_else(|| "?".into())
-        }));
-        level_keys.push(levels.key(u64::from(row.site), || meta.map_or("?", |it| it.level)));
-        target_keys.push(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target)));
-        name_keys.push(names.key(u64::from(row.site), || meta.map_or("?", |it| it.name)));
+        })));
+        level_keys.push(Some(levels.key(u64::from(row.site), || meta.map_or("?", |it| it.level))));
+        target_keys.push(Some(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target))));
+        name_keys.push(Some(names.key(u64::from(row.site), || meta.map_or("?", |it| it.name))));
     }
     // alloc: a batch's messages, once a read
     let messages: Vec<Option<std::sync::Arc<str>>> =
         events.iter().map(|it| flight::name(it.message)).collect();
     // alloc: a batch's list of columns, once a read
-    let columns: Vec<ArrayRef> = vec![
-        column(UInt64Array::from_iter(events.iter().map(|it| build_id(it.build)))),
-        column(UInt32Array::from_value(process.pid, rows)),
-        column(UInt32Array::from_iter_values(events.iter().map(|it| it.thread))),
-        threads.finish(UInt32Array::from(thread_keys))?,
-        column(Int64Array::from_iter_values(events.iter().map(|it| it.t_ns))),
-        column(UInt64Array::from_iter(events.iter().map(|it| (it.job != 0).then_some(it.job)))),
-        levels.finish(UInt32Array::from(level_keys))?,
-        targets.finish(UInt32Array::from(target_keys))?,
-        names.finish(UInt32Array::from(name_keys))?,
-        column(StringArray::from_iter(messages.iter().map(|it| it.as_deref()))),
-        column(UInt64Array::from_iter(events.iter().map(|it| (it.span != 0).then_some(it.span)))),
-        column(UInt64Array::from_iter_values(events.iter().map(|it| it.event_id))),
+    let columns: Vec<Column> = vec![
+        options(events.iter().map(|it| build_id(it.build))),
+        Column::repeat(process.pid, rows, Global),
+        values(events.iter().map(|it| it.thread)),
+        threads.finish(thread_keys).map_err(err)?,
+        values(events.iter().map(|it| it.t_ns)),
+        options(events.iter().map(|it| (it.job != 0).then_some(it.job))),
+        levels.finish(level_keys).map_err(err)?,
+        targets.finish(target_keys).map_err(err)?,
+        names.finish(name_keys).map_err(err)?,
+        texts_column(&messages),
+        options(events.iter().map(|it| (it.span != 0).then_some(it.span))),
+        values(events.iter().map(|it| it.event_id)),
     ];
-    RecordBatch::try_new(schema_of(&schema::EVENTS), columns)
+    columns::batch(&schema::EVENTS, columns)
 }
 
 /// The `event_fields` rows of `fields`, all from `process`: a field's key is its callsite's
 /// name for it, looked up once a batch for each site and place.
-pub fn event_fields(fields: &[FieldRow], process: Process<'_>) -> Result<RecordBatch, ArrowError> {
+pub fn event_fields(fields: &[FieldRow], process: Process<'_>) -> Result<Batch, BatchError> {
+    let err = BatchError::of(&schema::EVENT_FIELDS);
     let rows = fields.len();
     let (mut keys, mut kinds) = (Dict::new(), Dict::new());
     // alloc: a batch's keys, once a read
     let (mut key_keys, mut kind_keys) = (Vec::with_capacity(rows), Vec::with_capacity(rows));
     for row in fields {
-        key_keys.push(keys.key(u64::from(row.site) << 8 | u64::from(row.index), || {
+        key_keys.push(Some(keys.key(u64::from(row.site) << 8 | u64::from(row.index), || {
             flight::meta(row.site)
                 .and_then(|it| it.fields().iter().nth(usize::from(row.index)))
                 .map_or("?", |it| it.name())
-        }));
-        kind_keys.push(kinds.key(row.value.kind(), || row.value.kind_name()));
+        })));
+        kind_keys.push(Some(kinds.key(row.value.kind(), || row.value.kind_name())));
     }
     // alloc: a batch's texts, once a read
     let texts: Vec<Option<std::sync::Arc<str>>> = fields
@@ -604,36 +597,37 @@ pub fn event_fields(fields: &[FieldRow], process: Process<'_>) -> Result<RecordB
         })
         .collect();
     // alloc: a batch's list of columns, once a read
-    let columns: Vec<ArrayRef> = vec![
-        column(UInt64Array::from_iter(fields.iter().map(|it| build_id(it.build)))),
-        column(UInt32Array::from_value(process.pid, rows)),
-        column(UInt64Array::from_iter_values(fields.iter().map(|it| it.event_id))),
-        column(UInt16Array::from_iter_values(fields.iter().map(|it| it.ordinal))),
-        keys.finish(UInt32Array::from(key_keys))?,
-        kinds.finish(UInt32Array::from(kind_keys))?,
-        column(Int64Array::from_iter(fields.iter().map(|it| match it.value {
+    let columns: Vec<Column> = vec![
+        options(fields.iter().map(|it| build_id(it.build))),
+        Column::repeat(process.pid, rows, Global),
+        values(fields.iter().map(|it| it.event_id)),
+        values(fields.iter().map(|it| it.ordinal)),
+        keys.finish(key_keys).map_err(err)?,
+        kinds.finish(kind_keys).map_err(err)?,
+        options(fields.iter().map(|it| match it.value {
             FieldValue::I64(it) => Some(it),
             _ => None,
-        }))),
-        column(UInt64Array::from_iter(fields.iter().map(|it| match it.value {
+        })),
+        options(fields.iter().map(|it| match it.value {
             FieldValue::U64(it) => Some(it),
             _ => None,
-        }))),
-        column(Float64Array::from_iter(fields.iter().map(|it| match it.value {
+        })),
+        options(fields.iter().map(|it| match it.value {
             FieldValue::F64(it) => Some(it),
             _ => None,
-        }))),
-        column(BooleanArray::from_iter(fields.iter().map(|it| match it.value {
+        })),
+        options(fields.iter().map(|it| match it.value {
             FieldValue::Bool(it) => Some(it),
             _ => None,
-        }))),
+        })),
         texts_column(&texts),
     ];
-    RecordBatch::try_new(schema_of(&schema::EVENT_FIELDS), columns)
+    columns::batch(&schema::EVENT_FIELDS, columns)
 }
 
 /// The `folded` rows of a read: its sums of short spans.
-pub fn folded(folds: &[FoldRow], process: Process<'_>) -> Result<RecordBatch, ArrowError> {
+pub fn folded(folds: &[FoldRow], process: Process<'_>) -> Result<Batch, BatchError> {
+    let err = BatchError::of(&schema::FOLDED);
     let rows = folds.len();
     let (mut threads, mut names, mut targets) = (Dict::new(), Dict::new(), Dict::new());
     let (mut parents, mut parent_targets) = (Dict::new(), Dict::new());
@@ -645,11 +639,11 @@ pub fn folded(folds: &[FoldRow], process: Process<'_>) -> Result<RecordBatch, Ar
         (Vec::with_capacity(rows), Vec::with_capacity(rows));
     for row in folds {
         let meta = flight::site_text(row.site);
-        thread_keys.push(threads.key(u64::from(row.thread_name), || {
+        thread_keys.push(Some(threads.key(u64::from(row.thread_name), || {
             flight::name(row.thread_name).unwrap_or_else(|| "?".into())
-        }));
-        name_keys.push(names.key(u64::from(row.site), || meta.map_or("?", |it| it.name)));
-        target_keys.push(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target)));
+        })));
+        name_keys.push(Some(names.key(u64::from(row.site), || meta.map_or("?", |it| it.name))));
+        target_keys.push(Some(targets.key(u64::from(row.site), || meta.map_or("?", |it| it.target))));
         let parent = (row.parent_site != 0).then(|| flight::site_text(row.parent_site));
         parent_keys.push(parent.map(|meta| {
             parents.key(u64::from(row.parent_site), || meta.map_or("?", |it| it.name))
@@ -659,30 +653,30 @@ pub fn folded(folds: &[FoldRow], process: Process<'_>) -> Result<RecordBatch, Ar
         }));
     }
     // alloc: a batch's list of columns, once a read
-    let columns: Vec<ArrayRef> = vec![
-        column(UInt64Array::from_iter(folds.iter().map(|it| build_id(it.build)))),
-        column(UInt32Array::from_value(process.pid, rows)),
-        column(UInt32Array::from_iter_values(folds.iter().map(|it| it.thread))),
-        threads.finish(UInt32Array::from(thread_keys))?,
-        names.finish(UInt32Array::from(name_keys))?,
-        targets.finish(UInt32Array::from(target_keys))?,
-        column(UInt32Array::from_iter_values(folds.iter().map(|it| u32::from(it.root)))),
-        column(Int64Array::from_iter_values(folds.iter().map(|it| it.from_ns))),
-        column(Int64Array::from_iter_values(folds.iter().map(|it| it.to_ns))),
-        column(UInt64Array::from_iter_values(folds.iter().map(|it| it.spans))),
-        column(Int64Array::from_iter_values(folds.iter().map(|it| it.dur_ns))),
-        column(Int64Array::from_iter_values(folds.iter().map(|it| it.max_dur_ns))),
-        column(Int64Array::from_iter(folds.iter().map(|it| it.self_cpu_ns.map(|it| it as i64)))),
-        column(UInt64Array::from_iter(folds.iter().map(|it| it.alloc.map(|it| it.bytes)))),
-        column(UInt64Array::from_iter(folds.iter().map(|it| it.alloc.map(|it| it.count)))),
-        parents.finish(UInt32Array::from(parent_keys))?,
-        parent_targets.finish(UInt32Array::from(parent_target_keys))?,
+    let columns: Vec<Column> = vec![
+        options(folds.iter().map(|it| build_id(it.build))),
+        Column::repeat(process.pid, rows, Global),
+        values(folds.iter().map(|it| it.thread)),
+        threads.finish(thread_keys).map_err(err)?,
+        names.finish(name_keys).map_err(err)?,
+        targets.finish(target_keys).map_err(err)?,
+        values(folds.iter().map(|it| u32::from(it.root))),
+        values(folds.iter().map(|it| it.from_ns)),
+        values(folds.iter().map(|it| it.to_ns)),
+        values(folds.iter().map(|it| it.spans)),
+        values(folds.iter().map(|it| it.dur_ns)),
+        values(folds.iter().map(|it| it.max_dur_ns)),
+        options(folds.iter().map(|it| it.self_cpu_ns.map(|it| it as i64))),
+        options(folds.iter().map(|it| it.alloc.map(|it| it.bytes))),
+        options(folds.iter().map(|it| it.alloc.map(|it| it.count))),
+        parents.finish(parent_keys).map_err(err)?,
+        parent_targets.finish(parent_target_keys).map_err(err)?,
     ];
-    RecordBatch::try_new(schema_of(&schema::FOLDED), columns)
+    columns::batch(&schema::FOLDED, columns)
 }
 
 /// Both tables of a read: `spans` then `counters`.
-pub fn of(read: &Read, process: Process<'_>) -> Result<[RecordBatch; 2], ArrowError> {
+pub fn of(read: &Read, process: Process<'_>) -> Result<[Batch; 2], BatchError> {
     Ok([spans(&read.spans, process)?, counters(&read.counters, process)?])
 }
 
@@ -690,16 +684,20 @@ pub fn of(read: &Read, process: Process<'_>) -> Result<[RecordBatch; 2], ArrowEr
 mod tests {
     use std::time::Duration;
 
-    use arrow_array::{Array, cast::AsArray};
-
     use super::*;
+    use crate::schema::Table;
+
+    /// Row `row` of column `name` of `batch`, a batch of `table`.
+    fn column<'b>(batch: &'b Batch, table: &Table, name: &str) -> &'b Column {
+        batch.column(table.column(name).unwrap())
+    }
 
     #[test]
     fn a_read_is_a_batch_of_each_table_in_the_schema() {
         crate::install();
         std::thread::spawn(|| {
             let _build = flight::building(9);
-            let _span = tracing::info_span!(target: "blaze", "batched", krate = "app").entered();
+            let _span = blaze_trace::info_span!(target: "blaze", "batched", krate = "app").entered();
             flight::plot(flight::Plot::Queued, 4);
         })
         .join()
@@ -708,7 +706,7 @@ mod tests {
         flight::window(Duration::from_secs(60), &mut read);
         let process = Process { pid: 7, name: "blaze test", commit: Some("abc") };
         let [spans, counters] = of(&read, process).unwrap();
-        assert_eq!(spans.schema().metadata()["blaze.table"], "spans");
+        assert_eq!(spans.fields(), columns::fields(&schema::SPANS));
         assert_eq!(spans.num_rows(), read.spans.len());
         assert_eq!(counters.num_rows(), read.counters.len());
         let at = read
@@ -716,22 +714,14 @@ mod tests {
             .iter()
             .position(|it| flight::meta(it.site).map(|it| it.name()) == Some("batched"))
             .expect("the span was read");
-        let column = |name: &str| spans.column(schema::SPANS.column(name).unwrap());
-        let dict = |name: &str, row: usize| {
-            let it = column(name).as_dictionary::<UInt32Type>();
-            let values = it.values().as_string::<i32>();
-            it.keys().is_valid(row).then(|| values.value(it.keys().value(row) as usize).to_owned())
-        };
-        assert_eq!(dict("name", at).as_deref(), Some("batched"));
-        assert_eq!(dict("crate", at).as_deref(), Some("app"));
-        assert_eq!(dict("commit", at).as_deref(), Some("abc"));
-        assert_eq!(dict("query_kind", at), None);
-        assert_eq!(
-            column("build_id").as_primitive::<arrow_array::types::UInt64Type>().value(at),
-            9
-        );
-        let plotted = counters.column(schema::COUNTERS.column("value").unwrap());
-        assert!(plotted.as_primitive::<arrow_array::types::Float64Type>().values().contains(&4.0));
+        let text = |name: &str| column(&spans, &schema::SPANS, name).text(at);
+        assert_eq!(text("name"), Some("batched"));
+        assert_eq!(text("crate"), Some("app"));
+        assert_eq!(text("commit"), Some("abc"));
+        assert_eq!(text("query_kind"), None);
+        assert_eq!(column(&spans, &schema::SPANS, "build_id").int(at), Some(9));
+        let plotted = column(&counters, &schema::COUNTERS, "value").f64s().unwrap();
+        assert!(plotted.values().contains(&4.0));
     }
 
     /// A named counter is a `counters` row whose `name` is its own, kept once a process.
@@ -748,13 +738,11 @@ mod tests {
         flight::window(Duration::from_secs(600), &mut read);
         let process = Process { pid: 7, name: "blaze test", commit: None };
         let batch = counters(&read.counters, process).unwrap();
-        let plot = batch.column(schema::COUNTERS.column("name").unwrap()).as_dictionary::<UInt32Type>();
-        let names = plot.values().as_string::<i32>();
-        let values = batch.column(schema::COUNTERS.column("value").unwrap());
-        let values = values.as_primitive::<arrow_array::types::Float64Type>();
+        let names = column(&batch, &schema::COUNTERS, "name");
+        let values = column(&batch, &schema::COUNTERS, "value");
         let mut ours: Vec<f64> = (0..batch.num_rows())
-            .filter(|it| names.value(plot.keys().value(*it) as usize) == "owner bytes: batches test")
-            .map(|it| values.value(it))
+            .filter(|it| names.text(*it) == Some("owner bytes: batches test"))
+            .filter_map(|it| values.float(it))
             .collect();
         ours.sort_by(f64::total_cmp);
         assert_eq!(ours, [41.0, 42.0]);
@@ -766,9 +754,6 @@ mod tests {
     /// (docs/v2/plan/design/profile-names.md#proof).
     #[test]
     fn names_given_on_many_threads_read_back_from_parquet_as_recorded() {
-        use bytes::Bytes;
-        use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
-
         const THREADS: usize = 6;
         crate::install();
         std::thread::scope(|scope| {
@@ -779,7 +764,7 @@ mod tests {
                         let _build = flight::building(31);
                         let krate = format!("round_trip_crate_{t}");
                         let function = format!("round_trip::{}::f", "segment".repeat(t * 3));
-                        let _span = tracing::info_span!(
+                        let _span = blaze_trace::info_span!(
                             target: "blaze",
                             "names round trip",
                             krate = krate.as_str(),
@@ -787,16 +772,16 @@ mod tests {
                         )
                         .entered();
                         let item = format!("round trip item {t}");
-                        tracing::info!(target: "blaze", item = item.as_str(), "round trip event {t}");
+                        blaze_trace::info!(target: "blaze", item = item.as_str(), "round trip event {t}");
                     })
                     .unwrap();
             }
             // Opened here, named and closed on another thread: its names go in as links.
-            let span = tracing::info_span!(
+            let span = blaze_trace::info_span!(
                 target: "blaze",
                 "names round trip moved",
                 krate = "round_trip_opened_here",
-                function = tracing::field::Empty
+                function = blaze_trace::field::Empty
             );
             std::thread::Builder::new()
                 .name("names round trip closer".to_owned())
@@ -829,43 +814,27 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         let process = Process { pid: 7, name: "blaze test", commit: None };
-        let parquet = |batch: RecordBatch| {
-            // alloc: a test's file
-            let mut bytes = Vec::new();
-            let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), None).unwrap();
-            writer.write(&batch).unwrap();
-            writer.close().unwrap();
-            // Read back as one batch however many rows it is: the window holds every row the
-            // process's rings do, the tests' beside this one included, and the reader's own
-            // batch is 1024 rows.
-            let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes))
-                .unwrap()
-                .with_batch_size(batch.num_rows().max(1))
-                .build()
-                .unwrap();
-            let mut batches = reader.map(Result::unwrap);
-            let back = batches.next().unwrap();
+        let parquet = |table: &'static Table, batch: Batch| {
+            let bytes = blaze_parquet::write(
+                columns::fields(table),
+                &[batch],
+                &columns::metadata(table),
+                blaze_parquet::Options::DEFAULT,
+                Global,
+            )
+            .unwrap();
+            let file = blaze_parquet::File::open(&bytes, Global).unwrap();
+            // Read back as one batch: the window holds every row the process's rings do, the
+            // tests' beside this one included, fewer than a row group's.
+            let mut batches = file.read_all().unwrap().into_iter();
+            let back = batches.next().unwrap_or_else(|| columns::batch(table, columns::fields(table).iter().map(|it| Column::nulls(it.ty, 0, Global))).unwrap());
             assert!(batches.next().is_none(), "the rows written are read back as one batch");
-            assert_eq!(back.num_rows(), batch.num_rows());
             back
         };
-        let text = |batch: &RecordBatch, table: &Table, name: &str, row: usize| {
-            let column = batch.column(table.column(name).unwrap());
-            match column.data_type() {
-                arrow_schema::DataType::Dictionary(..) => {
-                    let it = column.as_dictionary::<UInt32Type>();
-                    let values = it.values().as_string::<i32>();
-                    it.keys()
-                        .is_valid(row)
-                        .then(|| values.value(it.keys().value(row) as usize).to_owned())
-                }
-                _ => {
-                    let it = column.as_string::<i32>();
-                    it.is_valid(row).then(|| it.value(row).to_owned())
-                }
-            }
+        let text = |batch: &Batch, table: &Table, name: &str, row: usize| {
+            column(batch, table, name).text(row).map(str::to_owned)
         };
-        let spans = parquet(spans(&read.spans, process).unwrap());
+        let spans = parquet(&schema::SPANS, spans(&read.spans, process).unwrap());
         let rows = |name: &str| -> Vec<(Option<String>, Option<String>)> {
             (0..spans.num_rows())
                 .filter(|it| text(&spans, &schema::SPANS, "name", *it).as_deref() == Some(name))
@@ -897,7 +866,7 @@ mod tests {
             )],
             "a span opened on one thread and closed on another"
         );
-        let events = parquet(super::events(&read.events, process).unwrap());
+        let events = parquet(&schema::EVENTS, super::events(&read.events, process).unwrap());
         let mut messages: Vec<String> = (0..events.num_rows())
             .filter_map(|it| text(&events, &schema::EVENTS, "message", it))
             .filter(|it| it.starts_with("round trip event "))
@@ -906,7 +875,7 @@ mod tests {
         let mut want: Vec<String> = (0..THREADS).map(|t| format!("round trip event {t}")).collect();
         want.sort();
         assert_eq!(messages, want, "each thread's event message");
-        let fields = parquet(event_fields(&read.fields, process).unwrap());
+        let fields = parquet(&schema::EVENT_FIELDS, event_fields(&read.fields, process).unwrap());
         let mut items: Vec<String> = (0..fields.num_rows())
             .filter_map(|it| text(&fields, &schema::EVENT_FIELDS, "value_str", it))
             .filter(|it| it.starts_with("round trip item "))
@@ -937,7 +906,7 @@ mod tests {
             job: 5 << 32 | 3,
             fiber: 2,
         };
-        let frames: HashMap<u64, Vec<String>, Global> = [
+        let frames: Map<u64, Vec<String>, FixedState, Global> = [
             (0x10, &["typeck", "typeck::inlined"][..]),
             (0x20, &["build"][..]),
             (0x30, &["main"][..]),
@@ -948,29 +917,17 @@ mod tests {
         let process = Process { pid: 7, name: "blaze serve", commit: None };
         let batch = samples(&[sample], &frames, (now, 1_000), process).unwrap();
         assert_eq!(batch.num_rows(), 1);
-        let column = |name: &str| batch.column(schema::SAMPLES.column(name).unwrap());
-        let stack = column("stack").as_list::<i32>().value(0);
-        let named = stack.as_dictionary::<UInt32Type>();
-        let values = named.values().as_string::<i32>();
-        let named: Vec<&str> =
-            named.keys().values().iter().map(|it| values.value(*it as usize)).collect();
+        let column = |name: &str| column(&batch, &schema::SAMPLES, name);
+        let named: Vec<&str> = column("stack").lists().unwrap().texts(0).unwrap().collect();
         assert_eq!(named, ["main", "build", "typeck", "typeck::inlined"]);
-        let raw = column("stack_pcs").as_list::<i32>().value(0);
-        assert_eq!(
-            raw.as_primitive::<arrow_array::types::UInt64Type>().values().as_ref(),
-            [0x31, 0x21, 0x10]
-        );
-        assert_eq!(column("span_id").as_primitive::<arrow_array::types::UInt64Type>().value(0), 41);
-        assert_eq!(column("build_id").as_primitive::<arrow_array::types::UInt64Type>().value(0), 9);
-        let cpu = column("cpu").as_dictionary::<UInt32Type>();
-        assert_eq!(cpu.values().as_string::<i32>().value(cpu.keys().value(0) as usize), "off");
-        let t_ns = column("t_ns");
-        assert_eq!(t_ns.as_primitive::<arrow_array::types::Int64Type>().value(0), 1_000);
-        assert_eq!(
-            column("job").as_primitive::<arrow_array::types::UInt64Type>().value(0),
-            5 << 32 | 3
-        );
-        assert_eq!(column("fiber").as_primitive::<arrow_array::types::UInt32Type>().value(0), 2);
+        let raw = column("stack_pcs").lists().unwrap().slice::<u64>(0).unwrap().to_vec();
+        assert_eq!(raw, [0x31, 0x21, 0x10]);
+        assert_eq!(column("span_id").int(0), Some(41));
+        assert_eq!(column("build_id").int(0), Some(9));
+        assert_eq!(column("cpu").text(0), Some("off"));
+        assert_eq!(column("t_ns").int(0), Some(1_000));
+        assert_eq!(column("job").int(0), Some(5 << 32 | 3));
+        assert_eq!(column("fiber").int(0), Some(2));
     }
 
     /// A sample outside any span and build has those columns null, not 0.
@@ -989,11 +946,10 @@ mod tests {
             fiber: 0,
         };
         let process = Process { pid: 7, name: "blaze serve", commit: None };
-        let batch = samples(&[sample], &HashMap::new_in(Global), (now, 1_000), process).unwrap();
-        assert!(batch.column(schema::SAMPLES.column("span_id").unwrap()).is_null(0));
-        assert!(batch.column(schema::SAMPLES.column("build_id").unwrap()).is_null(0));
-        assert!(batch.column(schema::SAMPLES.column("job").unwrap()).is_null(0));
-        assert!(batch.column(schema::SAMPLES.column("fiber").unwrap()).is_null(0));
+        let batch = samples(&[sample], &Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), (now, 1_000), process).unwrap();
+        for name in ["span_id", "build_id", "job", "fiber"] {
+            assert!(column(&batch, &schema::SAMPLES, name).is_null(0), "{name}");
+        }
     }
 
     #[test]
@@ -1026,19 +982,12 @@ mod tests {
         let unsaid = SpanRow { span_id: 12, self_cpu_ns: None, typed: Said::EMPTY.typed, ..said };
         let batch =
             spans(&[said, unsaid], Process { pid: 7, name: "blaze serve", commit: None }).unwrap();
-        let column = |name: &str| batch.column(schema::SPANS.column(name).unwrap());
-        let u64s = |name: &str| {
-            let it = column(name).as_primitive::<arrow_array::types::UInt64Type>();
-            [0, 1].map(|row| it.is_valid(row).then(|| it.value(row)))
-        };
-        let cpu = column("self_cpu_ns").as_primitive::<arrow_array::types::Int64Type>();
-        assert_eq!([0, 1].map(|row| cpu.is_valid(row).then(|| cpu.value(row))), [Some(700), None]);
-        assert_eq!(u64s("steps"), [Some(4_200_000), None]);
-        assert_eq!(u64s("peak_bytes"), [Some(48 << 20), None]);
-        let outcome = column("outcome").as_dictionary::<UInt32Type>();
-        let values = outcome.values().as_string::<i32>();
-        assert_eq!(values.value(outcome.keys().value(0) as usize), "ok");
-        assert!(!outcome.keys().is_valid(1));
+        let ints = |name: &str| [0, 1].map(|row| column(&batch, &schema::SPANS, name).int(row));
+        assert_eq!(ints("self_cpu_ns"), [Some(700), None]);
+        assert_eq!(ints("steps"), [Some(4_200_000), None]);
+        assert_eq!(ints("peak_bytes"), [Some(48 << 20), None]);
+        let outcome = column(&batch, &schema::SPANS, "outcome");
+        assert_eq!((outcome.text(0), outcome.text(1)), (Some("ok"), None));
     }
 
     #[test]

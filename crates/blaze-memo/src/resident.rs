@@ -39,27 +39,96 @@ struct Bytes {
 
 type RecordEntry = Entry<(u16, ContentId), Bytes>;
 
+struct ResidentArena {
+    slot: Box<Slot, Global>,
+    held: u64,
+    /// Deterministic creation sequence number (oldest first when evicting selectively).
+    seq: u64,
+    sealed: bool,
+}
+
 /// A table of records per arena, bounded by bytes.
 pub struct Resident {
-    arenas: Vec<Option<(Box<Slot, Global>, u64)>, Global>,
+    arenas: Vec<Option<ResidentArena>, Global>,
     cap_bytes: u64,
     bytes: u64,
+    next_seq: u64,
+    /// When false (`Resident::new`), over-cap wipes every arena wholesale to refine
+    /// `blaze_keyed::memo::Resident` answer-for-answer; when true (`Resident::new_selective`),
+    /// evicts unsealed arenas first (largest/oldest) until under cap, preserving sealed arenas.
+    selective: bool,
 }
 
 impl Resident {
     pub fn new(cap_bytes: u64) -> Resident {
-        Resident { arenas: Vec::new_in(Global), cap_bytes, bytes: 0 }
+        Resident { arenas: Vec::new_in(Global), cap_bytes, bytes: 0, next_seq: 0, selective: false }
+    }
+
+    /// A [`Resident`] configured with selective unsealed-first arena eviction on `cap_bytes`.
+    pub fn new_selective(cap_bytes: u64) -> Resident {
+        Resident { arenas: Vec::new_in(Global), cap_bytes, bytes: 0, next_seq: 0, selective: true }
+    }
+
+    /// Enables selective unsealed-first eviction on `cap_bytes`.
+    pub fn with_selective_eviction(mut self) -> Resident {
+        self.selective = true;
+        self
+    }
+
+    /// Marks `arena` sealed so selective eviction drops unsealed arenas first before touching it.
+    pub fn seal_arena(&mut self, arena: Arena) {
+        if let Some(Some(entry)) = self.arenas.get_mut(arena as usize) {
+            entry.sealed = true;
+        }
+    }
+
+    /// Unmarks `arena` as sealed.
+    pub fn unseal_arena(&mut self, arena: Arena) {
+        if let Some(Some(entry)) = self.arenas.get_mut(arena as usize) {
+            entry.sealed = false;
+        }
+    }
+
+    /// Whether `arena` is currently held and marked sealed.
+    pub fn is_sealed(&self, arena: Arena) -> bool {
+        self.arenas.get(arena as usize).and_then(|it| it.as_ref()).is_some_and(|it| it.sealed)
     }
 
     fn find(&self, arena: Arena, tag: u16, id: ContentId) -> Option<&RecordEntry> {
-        let (slot, _) = self.arenas.get(arena as usize)?.as_ref()?;
+        let entry = self.arenas.get(arena as usize)?.as_ref()?;
         let key = (tag, id);
-        let head = slot.trie.get(hash_of(&RECORD, &key), |head: &Head| {
+        let head = entry.slot.trie.get(hash_of(&RECORD, &key), |head: &Head| {
             // SAFETY: every entry of this table is a `RecordEntry`.
             unsafe { RecordEntry::of(head) }.key == key
         })?;
         // SAFETY: as above.
         Some(unsafe { RecordEntry::of(head) })
+    }
+
+    fn evict_selective(&mut self, incoming_arena: Arena, needed: u64) {
+        while self.bytes + needed > self.cap_bytes {
+            let victim = self
+                .arenas
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, slot)| slot.as_ref().map(|entry| (idx, entry)))
+                .min_by_key(|(idx, entry)| {
+                    (
+                        entry.sealed,
+                        *idx == incoming_arena as usize,
+                        std::cmp::Reverse(entry.held),
+                        entry.seq,
+                        *idx,
+                    )
+                })
+                .map(|(idx, _)| idx);
+            let Some(idx) = victim else {
+                break;
+            };
+            if let Some(dropped) = self.arenas[idx].take() {
+                self.bytes -= dropped.held;
+            }
+        }
     }
 }
 
@@ -81,11 +150,21 @@ impl Memo for Resident {
         }
         let len = record.len() as u64;
         if self.bytes + len > self.cap_bytes {
-            // Over the bound: every arena goes, wholesale; they refill from the store.
-            self.arenas.clear();
-            self.bytes = 0;
-            if len > self.cap_bytes {
-                return;
+            if self.selective {
+                if len > self.cap_bytes {
+                    return;
+                }
+                if self.find(arena, K::TAG.0, key.id()).is_some() {
+                    return;
+                }
+                self.evict_selective(arena, len);
+            } else {
+                // Over the bound: every arena goes, wholesale; they refill from the store.
+                self.arenas.clear();
+                self.bytes = 0;
+                if len > self.cap_bytes {
+                    return;
+                }
             }
         }
         if self.find(arena, K::TAG.0, key.id()).is_some() {
@@ -96,11 +175,18 @@ impl Memo for Resident {
         if self.arenas.len() <= at {
             self.arenas.resize_with(at + 1, || None);
         }
-        let (slot, held) = self.arenas[at].get_or_insert_with(|| {
+        let seq = self.next_seq;
+        let entry_slot = self.arenas[at].get_or_insert_with(|| {
+            self.next_seq = seq + 1;
             let id = ArenaId::new(arena, 0);
-            (Box::new_in(Slot::new(id, Tag::Store, 0, 1), Global), 0)
+            ResidentArena {
+                slot: Box::new_in(Slot::new(id, Tag::Store, 0, 1), Global),
+                held: 0,
+                seq,
+                sealed: false,
+            }
         });
-        let slot: &Slot = slot;
+        let slot: &Slot = &entry_slot.slot;
         let key = (K::TAG.0, key.id());
         let hash = hash_of(&RECORD, &key);
         let entry = with_local(slot, |local| -> *const RecordEntry {
@@ -125,15 +211,15 @@ impl Memo for Resident {
                 .is_ok()
         });
         debug_assert!(fresh, "looked up absent above, and `&mut self` excludes a racer");
-        *held += len;
+        entry_slot.held += len;
         self.bytes += len;
     }
 
     fn drop_arena(&mut self, arena: Arena) {
         if let Some(it) = self.arenas.get_mut(arena as usize)
-            && let Some((_, held)) = it.take()
+            && let Some(dropped) = it.take()
         {
-            self.bytes -= held;
+            self.bytes -= dropped.held;
         }
     }
 

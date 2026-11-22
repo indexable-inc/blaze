@@ -1,15 +1,15 @@
 //! PNG's container and filters (ISO/IEC 15948, W3C PNG): the chunks, IHDR, the five filters,
-//! and the zlib stream ([`super::zlib`]) across the IDAT chunks.
+//! and the zlib stream across the IDAT chunks (`blaze_deflate`: inflated straight into the rows'
+//! one buffer, and deflated at its fast level).
 
 #![blaze::sans_io]
 
 use alloc::vec::Vec;
 use core::alloc::Allocator;
 
-use super::{
-    ChunkName, Color, Depth, Image, ImageError, Limits, decode_bytes, row_bytes,
-    zlib::{Crc, Inflate, compress, zeroed},
-};
+use blaze_deflate::{Crc32 as Crc, Level, ZlibInto};
+
+use super::{ChunkName, Color, Depth, Image, ImageError, Limits, decode_bytes, row_bytes};
 
 pub(crate) const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
@@ -192,34 +192,30 @@ pub(crate) fn decode<A: Allocator>(bytes: &[u8], alloc: A, limits: Limits) -> Re
         asked,
         most: limits.bytes as u64,
     })?;
-    let raw = (asked - 1) as usize;
+    let raw = asked as usize;
     let after_ihdr = chunks.at;
     let mut idats = idat_count(bytes, after_ihdr, color)?;
 
-    // The one allocation: the rows with their filter bytes, and one byte to prove the stream
-    // ends where the header says.
-    let mut buf: Vec<u8, A> = zeroed(raw + 1, alloc, "the image's rows")?;
-    let mut inflate = Inflate::new();
+    // The one allocation: the rows with their filter bytes. The stream is inflated straight
+    // into it, and one that would write past it is refused there.
+    let mut buf: Vec<u8, A> = zeroed(raw, alloc, "the image's rows")?;
+    let limits = blaze_deflate::Limits { most_out: raw as u64, most_ratio: blaze_deflate::MAX_RATIO, most_header: 0 };
+    let mut inflate = ZlibInto::new(limits);
     let mut chunks = Chunks { bytes, at: after_ihdr };
+    // Bytes after the stream's end are ignored, as libpng does (it warns of them).
     while idats > 0 {
         let Some(chunk) = chunks.next()? else { break };
         if chunk.name != IDAT {
             continue;
         }
         idats -= 1;
-        inflate.feed(chunk.data, idats > 0, &mut buf)?;
-        if inflate.written() > raw {
-            return Err(ImageError::DataSize { expected: raw as u64, got: inflate.written() as u64 });
-        }
-        if inflate.done() {
+        if inflate.feed(chunk.data, &mut buf).map_err(ImageError::Inflate)?.done {
             break;
         }
     }
-    if !inflate.done() {
-        return Err(ImageError::Inflate { why: "the zlib stream does not end within the IDAT chunks" });
-    }
-    if inflate.written() != raw {
-        return Err(ImageError::DataSize { expected: raw as u64, got: inflate.written() as u64 });
+    inflate.finish().map_err(ImageError::Inflate)?;
+    if inflate.written() != raw as u64 {
+        return Err(ImageError::DataSize { expected: raw as u64, got: inflate.written() });
     }
     let bpp = (color.channels() * depth.bytes()) as usize;
     unfilter(&mut buf, height, stride, bpp)?;
@@ -327,6 +323,15 @@ fn color_type(color: Color) -> u8 {
     }
 }
 
+/// `len` zeroed values in `alloc`, its failure named `what`.
+fn zeroed<T: Copy + Default, A: Allocator>(len: usize, alloc: A, what: &'static str) -> Result<Vec<T, A>, ImageError> {
+    let mut v = Vec::new_in(alloc);
+    v.try_reserve_exact(len)
+        .map_err(|_| ImageError::OutOfMemory { what, asked: len.saturating_mul(size_of::<T>()) })?;
+    v.resize(len, T::default());
+    Ok(v)
+}
+
 /// A chunk: its length, name, data and CRC, onto `out` (whose room is reserved).
 fn chunk<A: Allocator>(out: &mut Vec<u8, A>, name: ChunkName, data: &[u8]) {
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
@@ -362,7 +367,9 @@ pub(crate) fn encode<A: Allocator + Clone, B: Allocator>(image: &Image<B>, alloc
             raw.push(filtered(kind, row, up, i, bpp));
         }
     }
-    let z = compress(&raw, alloc.clone())?;
+    let mut z = blaze_own::Vec::new_in(alloc.clone());
+    blaze_deflate::zlib(&raw, Level::Fast, alloc.clone(), &mut z)
+        .map_err(ImageError::Deflate)?;
     drop(raw);
 
     let idats = z.len().div_ceil(IDAT_MOST).max(1);

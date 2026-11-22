@@ -36,6 +36,8 @@ mod parsing;
 mod ptr;
 #[allow(unsafe_code)]
 mod raw;
+#[expect(unsafe_code, reason = "an inline text is read back as `str` without checking its UTF-8 again")]
+mod small_str;
 mod syntax_error;
 mod syntax_node;
 #[cfg(test)]
@@ -58,7 +60,7 @@ use std::{cell::RefCell, marker::PhantomData};
 use blaze_mem::scratch::Scratch;
 
 use stdx::format_to;
-use triomphe::Arc;
+use std::sync::Arc;
 
 pub use crate::{
     ast::{AstNode, AstToken},
@@ -70,8 +72,8 @@ pub use crate::{
     },
 };
 pub use parser::{BlazeEdition, Edition, Extensions, LexedStr, SyntaxKind, T, UnknownBlazeEdition};
-pub use rustc_literal_escaper as unescape;
-pub use smol_str::{SmolStr, SmolStrBuilder, ToSmolStr, format_smolstr};
+pub use parser::unescape;
+pub use crate::small_str::SmolStr;
 pub use syntax_tree::{
     Direction, Expand, FlatTree, FlatTreeBuilder, IMAGE_LAYOUT, NodeOrToken, SyntaxText, Text,
     TextRange, TextSize, TokenAtOffset, WalkEvent, api::Preorder,
@@ -502,7 +504,7 @@ impl ast::Expr {
     /// [`ast::Expr::parse`] under `extensions`, the syntax extensions of the crate whose
     /// source `text` is from.
     pub fn parse_with(text: &str, edition: Edition, extensions: Extensions) -> Parse<ast::Expr> {
-        let _p = tracing::info_span!(target: "blaze", "Expr::parse").entered();
+        let _p = blaze_trace::info_span!(target: "blaze", "Expr::parse").entered();
         let entry = parser::TopEntryPoint::Expr;
         let (tree, errors) = parsing::parse_text_at(&text.into(), entry, edition, extensions);
         let root = tree.root();
@@ -520,7 +522,7 @@ impl ast::MacroStmts {
     /// Parses `text` as the statements a macro call in statement position expands to, as
     /// rustc retries an expansion that is no expression (`failed_to_match_macro`).
     pub fn parse(text: &str, edition: Edition) -> Parse<ast::MacroStmts> {
-        let _p = tracing::info_span!(target: "blaze", "MacroStmts::parse").entered();
+        let _p = blaze_trace::info_span!(target: "blaze", "MacroStmts::parse").entered();
         let entry = parser::TopEntryPoint::MacroStmts;
         let (tree, errors) =
             parsing::parse_text_at(&text.into(), entry, edition, Extensions::NONE);
@@ -536,11 +538,11 @@ impl<T> Drop for Parse<T> {
         let Some(tree) = self.tree.take().and_then(Tree::into_unique) else {
             return;
         };
-        static PARSE_DROP_THREAD: std::sync::OnceLock<crossbeam_channel::Sender<FlatTree>> =
+        static PARSE_DROP_THREAD: std::sync::OnceLock<blaze_core::chan::Sender<FlatTree>> =
             std::sync::OnceLock::new();
         PARSE_DROP_THREAD
             .get_or_init(|| {
-                let (sender, receiver) = crossbeam_channel::unbounded::<FlatTree>();
+                let (sender, receiver) = blaze_core::chan::unbounded::<FlatTree>();
                 std::thread::Builder::new()
                     .name("ParseNodeDropper".to_owned())
                     .spawn(move || {
@@ -585,7 +587,7 @@ impl SourceFile {
         edition: Edition,
         extensions: Extensions,
     ) -> Parse<SourceFile> {
-        let _p = tracing::info_span!(target: "blaze", "SourceFile::parse").entered();
+        let _p = blaze_trace::info_span!(target: "blaze", "SourceFile::parse").entered();
         let (tree, errors) = parsing::parse_text(&text.into(), edition, extensions, false);
         let root = tree.root();
 
@@ -609,7 +611,7 @@ impl SourceFile {
         edition: Edition,
         extensions: Extensions,
     ) -> Parse<SourceFile> {
-        let _p = tracing::info_span!(target: "blaze", "SourceFile::parse_outline").entered();
+        let _p = blaze_trace::info_span!(target: "blaze", "SourceFile::parse_outline").entered();
         let (tree, errors) = parsing::parse_text(&text.into(), edition, extensions, true);
         let root = tree.root();
 

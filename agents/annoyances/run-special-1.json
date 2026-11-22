@@ -1,0 +1,14 @@
+{
+ "id": "run-special-1",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane E (the entry and the special records) under rebuild-1115",
+ "where": "crates/blaze-ladder/src/front2/start.rs `linked_lang_start`, front2/program/run_entry.rs `RootStart::of_names` against front2/source.rs `NamesSource`",
+ "what": "Making the start rule generic over `NamesSource` (D124) needed three facts the trait has no method for: crate 0's root attributes (`#![no_core]`/`#![no_std]`), the crates a program links (linked.rs `Linked::of` takes `&Names` only), and which crate is Rust's `std` (`graph().sysroot()`). The lane does not own source.rs, so the code is written against named methods (`root_attrs`, `linked`, `sysroot_std`) that another lane must add before anything compiles; blaze-cli program.rs also changed under the lane (a `today` parameter appeared mid-edit).",
+ "cost": "about twenty minutes to find and name the three, and to re-read program.rs before editing it",
+ "cause": "linked.rs and the start rule were written over the solved names; the trait grew question by question for the body path, and the start path never asked",
+ "whys": "the start rule ran only after a solve; nothing asked it over records until the lazy parent; a write-only lane cannot add a trait method it does not own",
+ "class": "a rule written over the solved names hides facts the records source must answer, found only when a caller asks it over records",
+ "prevention": "open: the three methods in source.rs (lane M); then `Linked::of` over a `NamesSource` so the link rule has one generic home",
+ "workaround": "code written against the named methods, each with an OWED comment",
+ "state": "open"
+}

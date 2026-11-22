@@ -68,7 +68,8 @@
 //!
 //! # Trust
 //!
-//! [`trust`]: Ed25519, implemented by `ring` 0.17. A segment's digest covers every byte of it
+//! [`trust`]: Ed25519, verified by blaze-ed25519 in every shape; signing is `ring` 0.17's, built
+//! only under the `sign` feature (remote-read.md, "Ed25519, written here"). A segment's digest covers every byte of it
 //! (header, payloads, index), so a statement that binds (namespace, toolchain, tier, segment
 //! digest, length, record count) to a builder binds every key in the segment to its value's
 //! digest. Each namespace trusts the anchor keys in its settings. Anchors sign key lists, and
@@ -99,32 +100,46 @@
 
 pub mod bucket;
 pub mod bundle;
+#[cfg(feature = "sign")]
 pub mod cmd;
 pub mod exec;
 pub mod expire;
 pub mod find;
+#[cfg(feature = "bucket")]
 pub mod http;
+#[cfg(feature = "bucket")]
 pub mod http3;
 pub mod name;
 pub mod privacy;
+pub mod published;
+// The published set's simulation (published.md), outside the sans-IO module it drives.
+#[cfg(all(test, feature = "sign"))]
+#[path = "published/tests.rs"]
+mod published_tests;
 pub mod pull;
+#[cfg(feature = "sign")]
 pub mod push;
+pub mod read;
+#[cfg(feature = "sign")]
 pub mod s3;
 pub mod segment;
+#[cfg(feature = "sign")]
 pub mod settings;
 pub mod shard;
 pub mod trust;
 mod wire;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sign"))]
 mod fake;
-#[cfg(test)]
+#[cfg(all(test, feature = "bucket"))]
 mod http3_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "sign"))]
 mod tests;
 
 pub use bucket::{Bucket, Failure, Machine, Step, drive};
-pub use trust::{PublicKey, Refusal, Signer, Trusted, Why};
+#[cfg(feature = "sign")]
+pub use trust::Signer;
+pub use trust::{PublicKey, Refusal, Trusted, Why};
 pub use wire::Bounded;
 
 /// A bug planted by a test, to show the oracle catches it: only ever in this crate's tests.
@@ -144,6 +159,18 @@ pub enum Plant {
     RootBeforeShards,
     /// A segment of an organisation's namespace is pushed to public.
     SkipPrivacy,
+    /// The read path: a head is taken without its signature checked.
+    HeadUnsigned,
+    /// The read path: a payload is answered found before its value digest is checked.
+    PayloadBeforeDigest,
+    /// The read path: a record's length from the index is asked without its bound checked.
+    SizeFromWire,
+    /// The read path: a payload range is asked one byte late.
+    RangeOffByOne,
+    /// The read path: a segment's second and later payload ranges are answered unchecked.
+    SecondRangeUnverified,
+    /// The published set: a record of a namespace other than the public one is admitted.
+    PrivateAdmitted,
 }
 
 #[cfg(test)]

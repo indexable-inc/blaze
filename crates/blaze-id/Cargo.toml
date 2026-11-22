@@ -14,11 +14,12 @@ repository.workspace = true
 # interned id is a `compile_fail` doc test, and its control a doc test that compiles.
 
 [dependencies]
+# By path, not `.workspace`: the workspace entries turn on the adapter features the crates above
+# need, which a member's entry cannot turn off, so this crate's own graph would hold them.
 # `ContentId` and `Fingerprint`: the hashes a key is made of.
 blaze-ids.workspace = true
 # `HashMap`: what a carried table is.
 blaze-hash.workspace = true
-serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 blaze-sim.workspace = true

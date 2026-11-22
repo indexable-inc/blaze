@@ -63,17 +63,30 @@
 //!   beneath its directory by the name's form (no root, no `..`), not by the kernel's
 //!   resolution: a symbolic link inside a directory is followed by the driver. Both need an
 //!   open that returns a handle with rights, resolved beneath a directory.
-//! - A real driver's rename syncs its directories itself, so a rename, and a publish, costs
-//!   that sync whatever [`Durable`] says: `Durable::No` is honest about what is promised, not
-//!   yet about what is paid. It needs a rename effect that does not sync.
+//! - A rename is one of two effects: an `_unsynced` call's is `Effect::RenameUnsynced`,
+//!   which syncs nothing; a `_synced` call's is `Effect::Rename`, which syncs both
+//!   directories (`F_FULLFSYNC` on macOS; the simulation as the drivers do) before it
+//!   completes, so its `sync_names` pays no second sync. Which one goes is the call's types: the unsynced
+//!   rename takes the caller's [`Unsynced`], the synced one gives the proof `sync_names`
+//!   takes.
 //! - A directory's names are synced by an effect (`Effect::SyncDir`), which every `_synced`
-//!   name change and [`Dir::sync_names`] wait for. The driver's root itself has no name an
-//!   effect can carry: a name directly beneath it is [`FsKind::NoNameSync`] on a real driver.
+//!   name change and [`Dir::sync_names`] wait for; the driver's root is named
+//!   `DirName::Root` there, so a name directly beneath it is synced as any other.
 //! - [`Unsynced::Started`] begins the file's write-back (`Effect::WriteBack`) once the
 //!   change is made, and for a name change its directory's sync (`Effect::SyncDir`), and
 //!   waits for neither: their ends are dropped as they arrive. A write-back makes no file, so
 //!   one still in flight brings nothing back of a file removed or renamed away meanwhile.
-//! - A directory is there once a file under it is (no effect makes an empty one).
+//! - A directory is there once made, by [`Dir::make_dir`] (`Effect::MakeDir`) or by a file's
+//!   making under it. One made by a file's making is durable as it is made, whichever effect
+//!   made it (blaze-core's folders rule, on `Effect`): so a `_synced` call, whose last steps
+//!   sync its file and its name into its directory, is durable from the root down, in a
+//!   directory an earlier `_unsynced` call or `create` made too. Before 2026-11-20 it was not:
+//!   `publish_synced` placed its temporary file with a truncate that made the directory and
+//!   synced only the names in it, so a crash lost the published file with the directory. One
+//!   made by `make_dir` is durable once its parent is synced (`make_dir_synced`). A directory
+//!   stays until [`Dir::remove_dir`] removes it, which it does only when
+//!   it is empty: the last file under it going leaves it there, as on a real disk (the
+//!   conformance suite, blaze-core's `conform/fs.rs`, holds the simulated disk to that).
 //! - A read's bytes come back in a buffer the driver made (`Done::Read`), so
 //!   [`File::read_all`] and `copy_to` pass through one global allocation each read; the page
 //!   pool (std.md, S1f) replaces it with a view.
@@ -81,7 +94,7 @@
 use alloc::{format, string::String, sync::Arc, vec::Vec};
 use core::{fmt, marker::PhantomData, num::NonZero};
 
-use blaze_core::{Done, Effect, FileName};
+use blaze_core::{DirName, Done, Effect, FileName, Tag};
 use blaze_mem::Frame;
 
 use crate::{
@@ -93,17 +106,144 @@ use crate::{
     mem::Bytes,
     path::Path,
     pending::{self, Pending},
+    unfinished::Unfinished,
 };
+
+// The folders above the start folder, read-only.
+mod ancestors;
+pub use ancestors::{Ancestor, AncestorError, AncestorKind};
+
+// Many paths looked at in one effect: the batched stat; and sorted paths of many folders, each
+// folder listed whole or its paths stamped, chosen by a count (`Dir::facts_of`).
+mod looks;
+pub use looks::{ByCount, EachPath, Facts, FactsError, Look, Looks, Strategy, Whole};
+#[cfg(test)]
+pub(crate) use looks::SkipsLast;
+
+// A file read whose length the caller knows: one read of len + 1, no stat before it.
+mod read_sized;
+pub use read_sized::SizedError;
+
+// A whole file mapped read-only (`Dir::map_read`): a large plain array read in place.
+mod map_read;
+
+// The boot the files are read in (`Fs::boot`): the files capability's own fact (D104 B1).
+mod boot;
+
+// A walk over folders, bounded by its caller: the visitor chooses each folder's sub-folders.
+mod walk;
+
+// Directories made empty and removed empty (`Dir::make_dir`, `Dir::remove_dir`).
+mod dirs;
+
+// What changed beneath a folder since a saved place in the system's journal of changes, asked
+// with no process having been alive in between (`Dir::changes_since`).
+mod journal;
+pub use journal::{CHANGES_MOST, Changes, HeldChanges, JournalError, ReplayTimes};
+
+// A folder made the user's alone (`Dir::make_private`): the journal helper's socket folder.
+mod private;
+pub use private::PrivateError;
+
+// Linear group-commit file transactions (`Dir::txn`): N publishes/renames/removals, 1 dir sync.
+mod txn;
+pub use txn::{Committed, Txn};
+pub use blaze_core::{Cursor, Lost};
+#[cfg(test)]
+pub(crate) use dirs::DirsPlant;
+#[cfg(test)]
+pub(crate) use walk::WalkPlant;
+pub use walk::{Enter, WalkError, WalkLimit, WalkLimits, Walked};
 
 mod sealed {
     pub trait Sealed {}
     impl Sealed for super::ReadOnly {}
     impl Sealed for super::ReadWrite {}
+    impl Sealed for super::Subtree {}
+    impl Sealed for super::Flat {}
 }
 
 /// What a holder may do: [`ReadOnly`] or [`ReadWrite`].
 pub trait Rights: sealed::Sealed {
     const WRITE: bool;
+}
+
+/// How far beneath a directory a [`Dir`] may reach: [`Subtree`] (this folder and every descendant
+/// beneath it) or [`Flat`] (this folder's direct children only; no `subdir`, no `walk`, no `/`
+/// in a [`Leaf`]). Narrowing (`Dir::flat`) is monotone and never widens.
+pub trait Scope: sealed::Sealed {
+    const RECURSIVE: bool;
+}
+
+/// This folder and every descendant beneath it (the default scope of [`Dir`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Subtree;
+
+/// Direct children of this folder only: cannot traverse into subdirectories (`subdir` and `walk`
+/// do not exist on `Dir<P, Flat>`), and operations accept only single-segment [`Leaf`] names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Flat;
+
+impl Scope for Subtree {
+    const RECURSIVE: bool = true;
+}
+
+impl Scope for Flat {
+    const RECURSIVE: bool = false;
+}
+
+/// A single-segment entry name inside one folder: a valid [`Path`] containing no `/` separator.
+/// Used by [`Dir<P, Flat>`] so directory traversal is ruled out by the type system.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)] // clone: refcount over FileName
+pub struct Leaf(Path);
+
+/// Why [`Leaf::new`] refused a name.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
+pub enum LeafError {
+    /// Not a valid relative [`Path`] (empty, rooted, `.`, `..`, `\`, or NUL).
+    Path(crate::path::PathError),
+    /// Contains a `/` separator and therefore names a nested path rather than a direct child.
+    Nested { raw: String },
+}
+
+impl fmt::Display for LeafError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LeafError::Path(e) => fmt::Display::fmt(e, f),
+            LeafError::Nested { raw } => write!(f, "leaf name {raw:?} contains `/`: a flat Dir accesses only direct children"),
+        }
+    }
+}
+
+impl core::error::Error for LeafError {}
+
+impl Leaf {
+    /// Parses `raw` as a single-segment leaf name with no `/` separator.
+    pub fn new(raw: &str) -> Result<Leaf, LeafError> {
+        let path = Path::new(raw).map_err(LeafError::Path)?;
+        if path.as_str().as_bytes().contains(&b'/') {
+            return Err(LeafError::Nested { raw: alloc::borrow::ToOwned::to_owned(raw) });
+        }
+        Ok(Leaf(path))
+    }
+
+    /// This leaf as a single-segment [`Path`].
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    /// This leaf's UTF-8 text.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
 }
 
 /// Reads only.
@@ -116,7 +256,25 @@ pub struct ReadOnly;
 /// directory stays an ordinary value.
 #[blaze::linear]
 #[derive(PartialEq, Eq, Debug)]
-pub struct ReadWrite(());
+pub struct ReadWrite(Unfinished);
+
+impl ReadWrite {
+    /// The right to change a file, held by the `File` its caller's caller opened.
+    #[track_caller]
+    fn held() -> ReadWrite {
+        ReadWrite(Unfinished::new("fs::File<ReadWrite>", "close(cx, durable), close_synced(cx) or close_unsynced(unsynced)"))
+    }
+
+    /// The file it was held by was closed: the one way a `ReadWrite` ends.
+    #[blaze::consumes]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    fn finished(self) {
+        let ReadWrite(unfinished) = self;
+        unfinished.finished();
+    }
+}
 
 impl Rights for ReadOnly {
     const WRITE: bool = false;
@@ -125,11 +283,135 @@ impl Rights for ReadWrite {
     const WRITE: bool = true;
 }
 
-/// What a file or directory is.
+/// What an entry of a listing is ([`Entries::kind`]): blaze-core's, one byte each.
+pub use blaze_core::Kind as EntryKind;
+
+/// What is directly in one folder ([`Dir::entries`], or the directory itself,
+/// [`Dir::own_entries`]): each entry's own name, kind and length as columns, sorted by the
+/// names' bytes, read by index (`0..len()`) or found by name. No `Vec` of pairs is made: a
+/// caller that wants one entry's path asks for that one ([`Entries::path`]).
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: a test keeping what it saw
+pub struct Entries {
+    listing: alloc::boxed::Box<blaze_core::Listing>,
+    /// The folder listed, beneath the directory it was asked of; `None` for that directory.
+    path: Option<Path>,
+}
+
+impl Entries {
+    /// The folder listed, beneath the directory it was asked of; `None` when the listing is of
+    /// that directory itself.
+    pub fn folder(&self) -> Option<&Path> {
+        self.path.as_ref()
+    }
+
+    pub fn len(&self) -> usize {
+        self.listing.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.listing.is_empty()
+    }
+
+    /// Entry `i`'s own name: one part, UTF-8, never `.` or `..`.
+    #[track_caller]
+    pub fn name(&self, i: usize) -> &str {
+        self.listing.leaf(i).as_str()
+    }
+
+    #[track_caller]
+    pub fn kind(&self, i: usize) -> EntryKind {
+        self.listing.kind(i)
+    }
+
+    /// Entry `i`'s length in bytes (a symbolic link's own, not followed).
+    #[track_caller]
+    pub fn len_of(&self, i: usize) -> u64 {
+        self.listing.stamp(i).size
+    }
+
+    /// Whether entry `i` has an execute bit set (of its own mode, a link not followed).
+    #[track_caller]
+    pub fn executable(&self, i: usize) -> bool {
+        self.listing.stamp(i).executable()
+    }
+
+    /// The kinds, in the names' order: a walk that wants the folders reads a byte each.
+    pub fn kinds(&self) -> &[EntryKind] {
+        self.listing.kinds()
+    }
+
+    /// The index of the entry named `name` (one part), by binary search.
+    pub fn find(&self, name: &str) -> Option<usize> {
+        self.listing.find(name)
+    }
+
+    /// Each entry's own name and kind, in order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, EntryKind)> + '_ {
+        self.listing.iter().zip(self.listing.kinds()).map(|((leaf, _), kind)| (leaf.as_str(), *kind))
+    }
+
+    /// Entry `i`'s path beneath the directory the listing was asked of (`folder/name`, or
+    /// `name` for that directory's own listing), made; refused for a name a [`Path`] cannot
+    /// hold (one with a `\`, which Unix allows).
+    #[track_caller]
+    pub fn path(&self, i: usize) -> Result<Path, crate::path::PathError> {
+        match &self.path {
+            Some(folder) => {
+                // alloc: one path made, the caller's.
+                let joined = format!("{}/{}", folder.as_str(), self.name(i));
+                Path::new(&joined)
+            }
+            None => Path::new(self.name(i)),
+        }
+    }
+}
+
+/// What a file or directory is, and the [`Stamp`] of this version of it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Meta {
     pub len: u64,
     pub dir: bool,
+    pub stamp: Stamp,
+}
+
+/// What identifies one version of a file, from the call that found it: equal stamps of one
+/// name at two looks say its bytes did not change between them, with one exception below.
+/// Compared whole, for equality only; nothing of it is ordered or read alone.
+///
+/// macOS fills it from the `getattrlistbulk` that lists a directory (`ATTR_CMN_DEVID`,
+/// `FILEID`, `MODTIME`, `CHGTIME`: one call per buffer of entries, where a `stat` each costs
+/// a call each), Linux from `fstatat`/`statx` of each entry; the simulation's change on every
+/// write, as each write moves its times.
+///
+/// What it cannot prove: a write that keeps the length and lands within the file system's
+/// clock step of the look before it (a racy write) leaves the stamp equal. A caller trusts an
+/// equal stamp only when its times are more than that step before the first look began (the
+/// sweep's `settled`); a file system with no inode numbers, or none that are stable (some
+/// network mounts, FAT), gives stamps that prove nothing, which `ino == 0` says.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Stamp {
+    pub len: u64,
+    /// The content's last change, in ns since the epoch on the file system's clock.
+    pub modified_ns: u64,
+    /// The inode's last change (a chmod, a rename, a link): every change moves it.
+    pub changed_ns: u64,
+    /// The inode and the device it is on: a file replaced by a rename, or one on another
+    /// mount, has another pair.
+    pub ino: u64,
+    pub dev: u64,
+}
+
+impl Meta {
+    fn of(meta: &blaze_core::Meta) -> Meta {
+        let stamp = Stamp {
+            len: meta.len,
+            modified_ns: meta.modified_ns,
+            changed_ns: meta.changed_ns,
+            ino: meta.ino,
+            dev: meta.dev,
+        };
+        Meta { len: meta.len, dir: meta.dir, stamp }
+    }
 }
 
 
@@ -238,9 +520,44 @@ enum Kind<'a> {
     CloneOf(&'a Flushed),
     CopyOf { of: &'a File<ReadOnly>, chunk: NonZero<usize> },
     PatchOf { base: &'a Flushed, patches: &'a [Patch<'a>] },
+    Parts { parts: &'a [&'a [u8]], most: NonZero<usize> },
+    PartsOf { parts: &'a [FilePart<'a>], then: &'a [u8], chunk: NonZero<usize> },
+}
+
+/// One range of a [`Content::parts_of`]: the `len` bytes `of` holds from `at`.
+#[derive(Clone, Copy, Debug)]
+pub struct FilePart<'a> {
+    pub of: &'a File<ReadOnly>,
+    pub at: u64,
+    pub len: u64,
 }
 
 impl<'a> Content<'a> {
+    /// These ranges of files end to end, then `then`, read and appended through one buffer of
+    /// `chunk` bytes: a file made of pieces of other files with memory for one chunk, never
+    /// for the sum (a merge of files larger than any frame). A range its file does not hold
+    /// whole fails the publish, naming the file; the path then holds what it held before.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub const fn parts_of(parts: &'a [FilePart<'a>], then: &'a [u8], chunk: NonZero<usize>) -> Content<'a> {
+        Content { kind: Kind::PartsOf { parts, then, chunk } }
+    }
+
+    /// These slices end to end, written in order by appends of at most `most` bytes each: a
+    /// gathered write. Each byte is copied once, into the effect that writes it (blaze-core's
+    /// `Effect` owns its bytes); nothing is joined into one buffer first, so a file of many
+    /// pieces costs its maker no second copy of them. The path holds all of it or what it held
+    /// before, as with [`Content::bytes`]: the appends go to the temporary file.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub const fn parts(parts: &'a [&'a [u8]], most: NonZero<usize>) -> Content<'a> {
+        Content { kind: Kind::Parts { parts, most } }
+    }
+
     /// These bytes, written.
     #[blaze::pure]
     #[blaze::nopanic]
@@ -337,6 +654,14 @@ pub enum FsOp {
     SyncNames,
     Close,
     List,
+    Entries,
+    MakeDir,
+    RemoveDir,
+    /// What changed beneath a folder since a saved place in the system's journal
+    /// ([`Dir::changes_since`]).
+    Journal,
+    /// A folder made the user's alone ([`Dir::make_private`]).
+    Private,
 }
 
 impl FsOp {
@@ -359,6 +684,11 @@ impl FsOp {
             FsOp::SyncNames => "sync_names",
             FsOp::Close => "close",
             FsOp::List => "list",
+            FsOp::Entries => "entries",
+            FsOp::MakeDir => "make_dir",
+            FsOp::RemoveDir => "remove_dir",
+            FsOp::Journal => "changes_since",
+            FsOp::Private => "make_private",
         }
     }
 }
@@ -378,15 +708,14 @@ pub enum FsKind {
     Stopped(Stopped),
     /// The directory it came from has a quota ([`Dir::quota`]) with no room for it.
     OverQuota(Over),
-    /// The names directly beneath the driver's root were to be made durable, and no effect
-    /// can name the root to sync it (a `FileName` names something beneath it): refused,
-    /// never said durable. The change itself was made. A name in any directory beneath the
-    /// root is synced ([`blaze_core::Effect::SyncDir`]).
-    NoNameSync,
     /// A [`Flushed`] was to be cloned and its file was changed after the flush it stands
     /// for (by effect `changed_at` of this world; the flush saw `flushed_at`): the clone
     /// would make the kernel write the new bytes out first. Nothing was cloned.
     Stale { flushed_at: u64, changed_at: u64 },
+    /// A whole-file read ([`File::read_all`]) found the file's length moved while it read: the
+    /// open file's `fstat` said `stated` bytes and the read found `read` (one more: it grew).
+    /// Nothing was added.
+    Moved { stated: u64, read: u64 },
     /// The driver failed it, saying this.
     Driver(String),
     /// The driver answered with a completion of another kind: a driver's bug.
@@ -397,8 +726,28 @@ pub enum FsKind {
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
 pub struct FsError {
     pub op: FsOp,
-    pub path: FileName,
+    /// The file or directory, under the driver's root; the root itself shows as `.`.
+    pub path: DirName,
     pub kind: FsKind,
+}
+
+/// What an [`FsError`] names: a file's name, or a directory's that may be the root.
+trait Named {
+    fn named(&self) -> DirName;
+}
+
+impl Named for FileName {
+    fn named(&self) -> DirName {
+        // clone: an error's name of its file, a refcount.
+        DirName::Named(self.clone())
+    }
+}
+
+impl Named for DirName {
+    fn named(&self) -> DirName {
+        // clone: an error's name of its directory, a refcount.
+        self.clone()
+    }
 }
 
 impl fmt::Display for FsError {
@@ -415,18 +764,17 @@ impl fmt::Display for FsError {
             ),
             FsKind::Stopped(stopped) => write!(f, "bstd::fs {op} of {path}: {stopped}"),
             FsKind::OverQuota(over) => write!(f, "bstd::fs {op} of {path}: its directory's quota: {over}"),
-            FsKind::NoNameSync => write!(
-                f,
-                "bstd::fs {op} of {path}: its directory is the driver's root, whose names no effect can \
-                 sync (a name beneath a directory of the root is synced): the change was made and is not \
-                 said durable (rule no-fallback)"
-            ),
             FsKind::Stale { flushed_at, changed_at } => write!(
                 f,
                 "bstd::fs {op} of {path}: the file was changed after it was flushed (the flush saw \
                  change {flushed_at}, and change {changed_at} came after), so a clone would wait for \
                  its writeback: nothing was cloned (flush it again, `Written::from(flushed).flush(cx)`, \
                  or copy it)"
+            ),
+            FsKind::Moved { stated, read } => write!(
+                f,
+                "bstd::fs {op} of {path}: the file's length moved while it was read ({stated} bytes at its open, \
+                 {read} read): it is being written; nothing was read"
             ),
             FsKind::Driver(said) => write!(f, "bstd::fs {op} of {path}: {said}"),
             FsKind::Answered(done) => {
@@ -438,10 +786,46 @@ impl fmt::Display for FsError {
 
 impl core::error::Error for FsError {}
 
+/// The user's home could not be opened as a second tree ([`Fs::home`]): the home and why.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
+pub struct HomeError {
+    pub home: String,
+    pub why: HomeWhy,
+}
+
+/// Why [`Fs::home`] refused.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
+pub enum HomeWhy {
+    /// The home's path does not start at the filesystem's root.
+    NotAbsolute,
+    /// A part of it is `.` or `..`, or empty.
+    Dotted,
+    /// No driver could be made over it, the driver saying this.
+    Open(String),
+    /// The folder in it could not be opened: a file is there, or the wait stopped.
+    Fs(FsError),
+    /// This world has no second tree (a hosted guest).
+    NoSecondTree,
+}
+
+impl fmt::Display for HomeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let home = &self.home;
+        match &self.why {
+            HomeWhy::NotAbsolute => write!(f, "the home `{home}` is not an absolute path"),
+            HomeWhy::Dotted => write!(f, "the home `{home}` has an empty, `.` or `..` part"),
+            HomeWhy::Open(why) => write!(f, "no driver over the home `{home}`: {why}"),
+            HomeWhy::Fs(error) => write!(f, "in the home `{home}`: {error}"),
+            HomeWhy::NoSecondTree => write!(f, "the home `{home}`: this world has no tree beside its root"),
+        }
+    }
+}
+
+impl core::error::Error for HomeError {}
+
 impl FsError {
-    fn new(op: FsOp, path: &FileName, kind: FsKind) -> FsError {
-        // clone: an error's name of its file, a refcount.
-        FsError { op, path: path.clone(), kind }
+    fn new(op: FsOp, path: &(impl Named + ?Sized), kind: FsKind) -> FsError {
+        FsError { op, path: path.named(), kind }
     }
 
     /// The stop, if the wait stopped.
@@ -451,13 +835,13 @@ impl FsError {
     pub fn stopped(&self) -> Option<&Stopped> {
         match &self.kind {
             FsKind::Stopped(stopped) => Some(stopped),
-            FsKind::NotFound | FsKind::IsADirectory | FsKind::NotADirectory | FsKind::Exists | FsKind::OverQuota(..) | FsKind::NoNameSync | FsKind::Stale { .. } | FsKind::Driver(..) | FsKind::Answered(..) => None,
+            FsKind::NotFound | FsKind::IsADirectory | FsKind::NotADirectory | FsKind::Exists | FsKind::OverQuota(..) | FsKind::Stale { .. } | FsKind::Moved { .. } | FsKind::Driver(..) | FsKind::Answered(..) => None,
         }
     }
 }
 
 /// `done`, which was not what `op` expects, as its error.
-fn unexpected(op: FsOp, path: &FileName, done: Done) -> FsError {
+fn unexpected(op: FsOp, path: &(impl Named + ?Sized), done: Done) -> FsError {
     let kind = match done {
         // alloc: an error's message.
         Done::Failed(error) => FsKind::Driver(error.0),
@@ -472,8 +856,8 @@ fn call(
     io: &Io,
     cx: &Cx,
     op: FsOp,
-    path: &FileName,
-    effect: impl FnOnce(blaze_core::Tag) -> Effect,
+    path: &(impl Named + ?Sized),
+    effect: impl FnOnce(Tag) -> Effect,
 ) -> Result<Done, FsError> {
     io.call(cx, effect).map_err(|stopped| FsError::new(op, path, FsKind::Stopped(stopped)))
 }
@@ -521,45 +905,43 @@ fn started(io: &Io, name: &FileName, unsynced: Unsynced) {
 
 /// What an `_unsynced` call does once its change to a name (a rename, a remove) is made:
 /// for [`Unsynced::Started`] the sync of `name`'s directory is begun ([`Effect::SyncDir`])
-/// and not waited for. The names of the driver's root, which no effect can name, are left.
+/// and not waited for; of a name directly beneath the driver's root, the root's.
 fn names_started(io: &Io, name: &FileName, unsynced: Unsynced) {
-    match (unsynced, FileName::new(dir_of(name))) {
-        (Unsynced::Started, Some(dir)) => {
+    match unsynced {
+        Unsynced::Started => {
+            let dir = FileName::new(dir_of(name)).map_or(DirName::Root, DirName::Named);
             let tag = io.submit(|tag| Effect::SyncDir { dir, tag });
             io.forget(tag, Ends::Once);
         }
-        (Unsynced::Started, None) | (Unsynced::No, _) => {}
+        Unsynced::No => {}
     }
 }
 
 /// The names of `name`'s directory made durable and waited for, for a `_synced` call: the
-/// directory's sync ([`Effect::SyncDir`]). `renamed` says the name change was a rename: a
-/// real driver's rename has synced its directories itself by the time it completes, so no
-/// second sync is paid there. A name directly beneath the driver's root has no directory an
-/// effect can name: [`FsKind::NoNameSync`] on a real driver (the simulation's ledger is told
-/// directly).
-fn sync_names(io: &Io, cx: &Cx, op: FsOp, name: &FileName, renamed: bool) -> Result<(), FsError> {
+/// directory's sync ([`Effect::SyncDir`]). `renamed` is the proof that the name change was
+/// a syncing rename ([`rename_synced`]): every driver's, the simulation's included, has synced
+/// its directories itself by the time it completes, so no second sync is paid. A name
+/// directly beneath the driver's root syncs the root ([`DirName::Root`]).
+fn sync_names(io: &Io, cx: &Cx, op: FsOp, name: &FileName, renamed: Option<Renamed>) -> Result<(), FsError> {
     if io.plant() == Plant::DurableSkipsNameSync {
         return Ok(());
     }
-    if renamed && io.rename_syncs_names() {
+    if let Some(Renamed(())) = renamed {
+        // The syncing rename synced its directories and was waited for: one wait for the names,
+        // counted as a directory sync would be.
+        io.names_synced();
         return Ok(());
     }
     sync_dir(io, cx, op, name, dir_of(name))
 }
 
 /// The directory `dir`'s names synced and waited for, on behalf of the call `op` on `path`.
-fn sync_dir(io: &Io, cx: &Cx, op: FsOp, path: &FileName, dir: &str) -> Result<(), FsError> {
-    let Some(named) = FileName::new(dir) else {
-        cx.stopped_by(io.now()).map_err(|stopped| FsError::new(op, path, FsKind::Stopped(stopped)))?;
-        return match io.names_synced(dir) {
-            true => Ok(()),
-            false => Err(FsError::new(op, path, FsKind::NoNameSync)),
-        };
-    };
+fn sync_dir(io: &Io, cx: &Cx, op: FsOp, path: &(impl Named + ?Sized), dir: &str) -> Result<(), FsError> {
+    // The driver's root (`dir` empty) is synced as any directory: `DirName::Root`.
+    let named = FileName::new(dir).map_or(DirName::Root, DirName::Named);
     match call(io, cx, op, path, |tag| Effect::SyncDir { dir: named, tag })? {
         Done::Synced => {
-            io.names_synced(dir);
+            io.names_synced();
             Ok(())
         }
         done => Err(unexpected(op, path, done)),
@@ -586,11 +968,53 @@ fn truncate(io: &Io, cx: &Cx, op: FsOp, name: &FileName, len: u64) -> Result<(),
     }
 }
 
-/// `from` renamed over `to`: a reader sees the old `to` or the new.
-fn rename(io: &Io, cx: &Cx, op: FsOp, from: &FileName, to: &FileName) -> Result<(), FsError> {
+/// Proof that a durable call's rename completed through [`Effect::Rename`], which on a real
+/// driver syncs the directories of both names before it completes: what [`sync_names`] takes
+/// to skip a second sync there. Only [`rename_synced`] makes one, so an `_unsynced` call that
+/// reached for the syncing rename holds a proof it has no use for (`must_use`), and an
+/// `_unsynced` call that renames at all must hand over its [`Unsynced`] ([`rename_unsynced`]).
+#[must_use = "a durable rename's names are made durable only through `sync_names`, which takes this"]
+struct Renamed(());
+
+/// `from` renamed over `to` with nothing synced ([`Effect::RenameUnsynced`]): a reader sees
+/// the old `to` or the new, and a crash may undo it. Its `Unsynced` is the caller's own
+/// policy, which only an `_unsynced` call holds: a durable call cannot reach this rename
+/// without making one up, nor an unsynced call the syncing one without dropping a
+/// [`Renamed`].
+fn rename_unsynced(io: &Io, cx: &Cx, op: FsOp, from: &FileName, to: &FileName, _: Unsynced) -> Result<(), FsError> {
+    if io.plant() == Plant::UnsyncedRenameSyncs {
+        return rename_by(io, cx, op, from, to, |from, to, tag| Effect::Rename { from, to, tag });
+    }
+    rename_by(io, cx, op, from, to, |from, to, tag| Effect::RenameUnsynced { from, to, tag })
+}
+
+/// `from` renamed over `to` by [`Effect::Rename`]: on a real driver both directories' names
+/// are synced by the time it completes (`F_FULLFSYNC` on macOS), which the [`Renamed`] it
+/// gives says to [`sync_names`].
+fn rename_synced(io: &Io, cx: &Cx, op: FsOp, from: &FileName, to: &FileName) -> Result<Renamed, FsError> {
+    rename_by(io, cx, op, from, to, |from, to, tag| Effect::Rename { from, to, tag })?;
+    Ok(Renamed(()))
+}
+
+/// The one place bstd submits a rename, as `effect` makes it; only [`rename_unsynced`] and
+/// [`rename_synced`] call it. Under [`Plant::PublishBeforeRename`] a publish's rename is
+/// handed to the driver and not waited for: the planted bug of the durability tests.
+fn rename_by(
+    io: &Io,
+    cx: &Cx,
+    op: FsOp,
+    from: &FileName,
+    to: &FileName,
+    effect: fn(FileName, FileName, Tag) -> Effect,
+) -> Result<(), FsError> {
     // clone: the effect's names, refcounts.
     let (old, new) = (from.clone(), to.clone());
-    match call(io, cx, op, from, |tag| Effect::Rename { from: old, to: new, tag })? {
+    if op == FsOp::Publish && io.plant() == Plant::PublishBeforeRename {
+        let tag = io.submit(|tag| effect(old, new, tag));
+        io.forget(tag, Ends::Once);
+        return Ok(());
+    }
+    match call(io, cx, op, from, |tag| effect(old, new, tag))? {
         Done::Renamed => Ok(()),
         done => Err(unexpected(op, from, done)),
     }
@@ -665,7 +1089,7 @@ fn stat(io: &Io, cx: &Cx, op: FsOp, name: &FileName) -> Result<Option<Meta>, FsE
     // clone: the effect's name, a refcount.
     let file = name.clone();
     match call(io, cx, op, name, |tag| Effect::Stat { file, tag })? {
-        Done::Stat(meta) => Ok(meta.map(|it| Meta { len: it.len, dir: it.dir })),
+        Done::Stat(meta) => Ok(meta.as_ref().map(Meta::of)),
         done => Err(unexpected(op, name, done)),
     }
 }
@@ -715,31 +1139,80 @@ impl Fs {
                 Err(FsError::new(FsOp::OpenDir, path.name(), FsKind::NotADirectory))
             }
             // clone: the directory's name, a refcount.
-            Some(_) | None => Ok(Dir { io: self.io.clone(), base: path.name().clone(), quota: None, rights: PhantomData }),
+            Some(_) | None => Ok(Dir { io: self.io.clone(), base: DirName::Named(path.name().clone()), quota: None, rights: PhantomData, scope: PhantomData }),
         }
+    }
+
+    /// `folder` beneath the user's home `home`, read and write, made by the first file made in
+    /// it: a second tree beside the driver's root, for what outlives one project (a command's
+    /// machine-wide store). `home` is an absolute path the program's start read from its
+    /// environment and hands down (rule 75); nothing here reads a variable. Natively it is a
+    /// second driver over `home`; the simulation keeps every tree under its one root, so there
+    /// `home` names a folder beneath it. A path that is not absolute or has `.` or `..` in it,
+    /// a file where `folder` should be, or a driver that cannot be made over `home`, is a
+    /// [`HomeError`] naming `home`.
+    pub fn home(&self, cx: &Cx, home: &str, folder: &Path) -> Result<Dir<ReadWrite>, HomeError> {
+        // alloc: an error's path.
+        let refused = |why| HomeError { home: String::from(home), why };
+        let Some(below) = home.strip_prefix('/') else { return Err(refused(HomeWhy::NotAbsolute)) };
+        let below = below.trim_end_matches('/');
+        if below.split('/').any(|part| part == "." || part == "..") {
+            return Err(refused(HomeWhy::Dotted));
+        }
+        let (tree, at) = match self.io.beside(crate::rt::RootPath::new(home)) {
+            Some(Ok(io)) => (Fs::new(io), folder.clone()),
+            Some(Err(error)) => return Err(refused(HomeWhy::Open(error.why))),
+            None if self.io.is_sim() => {
+                let joined = match below.is_empty() {
+                    true => folder.clone(),
+                    false => Path::new(below).map_err(|_| refused(HomeWhy::Dotted))?.join(folder),
+                };
+                // clone: authority held, a refcount.
+                (self.clone(), joined)
+            }
+            None => return Err(refused(HomeWhy::NoSecondTree)),
+        };
+        tree.open_dir(cx, &at).map_err(|error| refused(HomeWhy::Fs(error)))
+    }
+
+    /// The driver's root itself, read and write: the folder the program was given (for a
+    /// command, the one it started in), listed and synced as any other. It is always there,
+    /// so nothing is asked of the driver to make it; and it is [`DirName::Root`], with nothing
+    /// of its absolute path in it, so none enters a key.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn root(&self) -> Dir<ReadWrite> {
+        // clone: authority held, a refcount.
+        Dir { io: self.io.clone(), base: DirName::Root, quota: None, rights: PhantomData, scope: PhantomData }
     }
 }
 
-/// A directory: the files beneath it, by relative path only.
-pub struct Dir<#[blaze::linear] P: Rights> {
+/// A directory capability: `P` is its [`Rights`] (`ReadOnly` or `ReadWrite`) and `S` is its
+/// [`Scope`] ([`Subtree`] by default, or [`Flat`] for direct children only). Narrowing
+/// (`read_only`, `flat`, `subdir`, `quota`) is monotone and never widens.
+pub struct Dir<#[blaze::linear] P: Rights, S: Scope = Subtree> {
     io: Io,
-    base: FileName,
+    /// Where it is under the driver's root, or the root itself.
+    base: DirName,
     /// The bytes that may still be written through it, if it has a quota ([`Dir::quota`]).
     quota: Option<Arc<Budget>>,
     rights: PhantomData<P>,
+    scope: PhantomData<S>,
 }
 
-impl<#[blaze::linear] P: Rights> Clone for Dir<P> {
-    fn clone(&self) -> Dir<P> {
+impl<#[blaze::linear] P: Rights, S: Scope> Clone for Dir<P, S> {
+    fn clone(&self) -> Dir<P, S> {
         // clone: authority held, copied: a refcount each.
-        Dir { io: self.io.clone(), base: self.base.clone(), quota: self.quota.clone(), rights: PhantomData }
+        Dir { io: self.io.clone(), base: self.base.clone(), quota: self.quota.clone(), rights: PhantomData, scope: PhantomData }
     }
 }
 
-impl<#[blaze::linear] P: Rights> fmt::Debug for Dir<P> {
+impl<#[blaze::linear] P: Rights, S: Scope> fmt::Debug for Dir<P, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let rights = if P::WRITE { "ReadWrite" } else { "ReadOnly" };
-        write!(f, "Dir<{rights}>({})", self.base)
+        let scope = if S::RECURSIVE { "Subtree" } else { "Flat" };
+        write!(f, "Dir<{rights}, {scope}>({})", self.base)
     }
 }
 
@@ -747,9 +1220,11 @@ impl Dir<ReadWrite> {
     /// The directory named `base` under the driver's root, read and write: for a capability
     /// that holds a directory's name as authority ([`crate::user::User::home`]).
     pub(crate) fn at(io: &Io, base: FileName) -> Dir<ReadWrite> {
-        Dir { io: io.clone(), base, quota: None, rights: PhantomData }
+        Dir { io: io.clone(), base: DirName::Named(base), quota: None, rights: PhantomData, scope: PhantomData }
     }
+}
 
+impl<S: Scope> Dir<ReadWrite, S> {
     /// The same directory with a quota: at most `bytes` bytes are written through the `Dir`
     /// this returns, through its subdirectories and through the files opened from them,
     /// counted by bstd. A write with no room left ends in [`FsKind::OverQuota`], and nothing
@@ -767,15 +1242,14 @@ impl Dir<ReadWrite> {
     /// driver's to bound, with an effect blaze-core does not have yet.
     ///
     /// The contract: the directory it gives has at most `bytes` left, whatever it is inside.
-    pub fn quota(&self, bytes: u64) -> (r: Dir<ReadWrite>)
-        ensures match r.quota_left() {
-            Some(left) => left <= bytes,
-            None => false,
-        }
-    {
+    #[core::contracts::ensures(move |r: &Dir<ReadWrite, S>| match r.quota_left() {
+        Some(left) => left <= bytes,
+        None => false,
+    })]
+    pub fn quota(&self, bytes: u64) -> Dir<ReadWrite, S> {
         // clone: authority held, narrowed: a refcount each, the budget this one is inside too.
         let quota = Some(Budget::new(bytes, self.quota.clone()));
-        Dir { io: self.io.clone(), base: self.base.clone(), quota, rights: PhantomData }
+        Dir { io: self.io.clone(), base: self.base.clone(), quota, rights: PhantomData, scope: PhantomData }
     }
 
     /// The bytes that may still be written through it; `None` with no quota.
@@ -786,30 +1260,103 @@ impl Dir<ReadWrite> {
     }
 }
 
-impl<#[blaze::linear] P: Rights> Dir<P> {
-    /// Where it is, under the driver's root.
+impl<#[blaze::linear] P: Rights, S: Scope> Dir<P, S> {
+    /// Where it is, under the driver's root, or the root itself.
     #[blaze::nopanic]
     #[blaze::noalloc]
     #[blaze::nonblocking]
-    pub fn name(&self) -> &FileName {
+    pub fn name(&self) -> &DirName {
         &self.base
     }
 
+    /// The same directory, read only (preserves [`Scope`]).
+    pub fn read_only(&self) -> Dir<ReadOnly, S> {
+        // clone: authority held, narrowed: a refcount each.
+        Dir { io: self.io.clone(), base: self.base.clone(), quota: self.quota.clone(), rights: PhantomData, scope: PhantomData }
+    }
+
+    /// Narrows this directory to [`Flat`] scope: only direct children ([`Leaf`] names) may be
+    /// accessed; `subdir` and `walk` are absent at compile time. Monotone and never widens.
+    pub fn flat(&self) -> Dir<P, Flat> {
+        // clone: authority held, narrowed: a refcount each.
+        Dir { io: self.io.clone(), base: self.base.clone(), quota: self.quota.clone(), rights: PhantomData, scope: PhantomData }
+    }
+}
+
+impl<#[blaze::linear] P: Rights> Dir<P, Flat> {
+    #[inline]
+    fn as_subtree_for_leaf(&self) -> Dir<P, Subtree> {
+        // clone: internal delegation ONLY for validated single-segment `Leaf` names.
+        Dir { io: self.io.clone(), base: self.base.clone(), quota: self.quota.clone(), rights: PhantomData, scope: PhantomData }
+    }
+
+    /// What is directly in this folder itself, one level (no descent into child directories).
+    pub fn own_entries(&self, cx: &Cx) -> Result<Entries, FsError> {
+        self.as_subtree_for_leaf().own_entries(cx)
+    }
+
+    /// Metadata for direct child `leaf`, or `None` if absent.
+    pub fn stat_leaf(&self, cx: &Cx, leaf: &Leaf) -> Result<Option<Meta>, FsError> {
+        self.as_subtree_for_leaf().stat(cx, leaf.as_path())
+    }
+
+    /// Opens direct child `leaf` read-only, whatever this directory's rights.
+    pub fn open_read_leaf(&self, cx: &Cx, leaf: &Leaf) -> Result<File<ReadOnly>, FsError> {
+        self.as_subtree_for_leaf().open_read(cx, leaf.as_path())
+    }
+}
+
+impl Dir<ReadOnly, Flat> {
+    /// Opens direct child `leaf` read-only.
+    pub fn open_leaf(&self, cx: &Cx, leaf: &Leaf) -> Result<File<ReadOnly>, FsError> {
+        self.open_read_leaf(cx, leaf)
+    }
+}
+
+impl Dir<ReadWrite, Flat> {
+    /// Opens direct child `leaf` read-write (linear: must be explicitly closed).
+    #[track_caller]
+    pub fn open_leaf(&self, cx: &Cx, leaf: &Leaf) -> Result<File<ReadWrite>, FsError> {
+        self.as_subtree_for_leaf().open(cx, leaf.as_path())
+    }
+
+    /// Creates direct child `leaf` empty, read-write.
+    #[track_caller]
+    pub fn create_leaf(&self, cx: &Cx, leaf: &Leaf) -> Result<File<ReadWrite>, FsError> {
+        self.as_subtree_for_leaf().create(cx, leaf.as_path())
+    }
+
+    /// Atomically publishes `content` at direct child `leaf`, synced.
+    pub fn publish_leaf_synced(&self, cx: &Cx, leaf: &Leaf, content: Content<'_>) -> Result<Published<Flushed>, FsError> {
+        self.as_subtree_for_leaf().publish_synced(cx, leaf.as_path(), content)
+    }
+
+    /// Atomically publishes `content` at direct child `leaf`, unsynced.
+    pub fn publish_leaf_unsynced(&self, cx: &Cx, leaf: &Leaf, content: Content<'_>, unsynced: Unsynced) -> Result<Published<Written>, FsError> {
+        self.as_subtree_for_leaf().publish_unsynced(cx, leaf.as_path(), content, unsynced)
+    }
+
+    /// Removes direct child `leaf`, synced.
+    pub fn remove_leaf_synced(&self, cx: &Cx, leaf: &Leaf) -> Result<(), FsError> {
+        self.as_subtree_for_leaf().remove_synced(cx, leaf.as_path())
+    }
+
+    /// Removes direct child `leaf`, unsynced.
+    pub fn remove_leaf_unsynced(&self, cx: &Cx, leaf: &Leaf, unsynced: Unsynced) -> Result<(), FsError> {
+        self.as_subtree_for_leaf().remove_unsynced(cx, leaf.as_path(), unsynced)
+    }
+}
+
+impl<#[blaze::linear] P: Rights> Dir<P> {
     /// The directory `path` beneath this one, with the same rights or fewer.
     pub fn subdir(&self, path: &Path) -> Dir<P> {
         let base = match self.io.plant() {
             // clone: the planted bug keeps the parent's name, a refcount.
             Plant::SubdirKeepsParent => self.base.clone(),
-            Plant::None | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned => self.beneath(path),
+            Plant::None | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates | Plant::AncestorsUnbounded => DirName::Named(self.beneath(path)),
         };
         // clone: the quota shared, a refcount.
-        Dir { io: self.io.clone(), base, quota: self.quota.clone(), rights: PhantomData }
-    }
-
-    /// The same directory, read only.
-    pub fn read_only(&self) -> Dir<ReadOnly> {
-        // clone: authority held, narrowed: a refcount each.
-        Dir { io: self.io.clone(), base: self.base.clone(), quota: self.quota.clone(), rights: PhantomData }
+        Dir { io: self.io.clone(), base, quota: self.quota.clone(), rights: PhantomData, scope: PhantomData }
     }
 
     /// The world it is in: for a capability made from a directory ([`crate::local::Local`]).
@@ -829,12 +1376,21 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
     /// Every file beneath this directory, at any depth, sorted by name, in `frame`: each one's
     /// path relative to this directory, and what it is. A directory that is not there yet (no
     /// file was made under it) has none.
+    ///
+    /// DEPRECATED, to be deleted: unbounded (on a checkout with a build folder it listed
+    /// 374,012 entries for seconds and then overflowed its frame). Use [`Dir::walk`], whose
+    /// caller chooses each folder's sub-folders and names its limits, or [`Dir::entries`] for
+    /// one level. Its last caller is blaze-cli's `program.rs`; once that moves, this function
+    /// goes, and its name is banned in `.clippy.toml`.
     pub fn list<'a>(&self, cx: &Cx, frame: &'a Frame) -> Result<Vec<(Path, Meta), &'a Frame>, FsError> {
         let mut found = Vec::new_in(frame);
-        match stat(&self.io, cx, FsOp::List, &self.base)? {
-            None => return Ok(found),
-            Some(Meta { dir: false, .. }) => return Err(FsError::new(FsOp::List, &self.base, FsKind::NotADirectory)),
-            Some(_) => {}
+        // The root is always there; a named directory may not be yet.
+        if let DirName::Named(base) = &self.base {
+            match stat(&self.io, cx, FsOp::List, base)? {
+                None => return Ok(found),
+                Some(Meta { dir: false, .. }) => return Err(FsError::new(FsOp::List, base, FsKind::NotADirectory)),
+                Some(_) => {}
+            }
         }
         // clone: the effect's name, a refcount.
         let dir = self.base.clone();
@@ -842,9 +1398,9 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
             Done::Listed(listed) => listed,
             done => return Err(unexpected(FsOp::List, &self.base, done)),
         };
-        let start = self.base.as_str().len() + 1;
+        let start = self.base.start();
         for (name, meta) in listed.iter().filter(|(_, meta)| !meta.dir) {
-            let rest = name.is_under(&self.base).then(|| name.as_str().get(start..)).flatten();
+            let rest = self.base.holds(name).then(|| name.as_str().get(start..)).flatten();
             let beneath = rest.and_then(|rest| Path::new(rest).ok());
             let Some(path) = beneath else {
                 // alloc: an error's message.
@@ -855,16 +1411,64 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
                 let stopped = Stopped::OutOfMemory { arena: "bstd::fs list", asked: size_of::<(Path, Meta)>() };
                 FsError::new(FsOp::List, &self.base, FsKind::Stopped(stopped))
             })?;
-            found.push((path, Meta { len: meta.len, dir: false }));
+            found.push((path, Meta::of(meta)));
         }
         Ok(found)
     }
 
+    /// What is directly in the folder `path` beneath this directory, one level, as columns
+    /// sorted by the names' bytes ([`Entries`]); `None` when nothing is there. One
+    /// `getattrlistbulk` pass a buffer on macOS, a `statx` an entry on Linux. The columns are
+    /// the driver's, moved here whole: nothing is copied into pairs. A name that is not UTF-8,
+    /// and a folder past the listing's caps (2^20 entries, 64 MiB of names), fail naming the
+    /// folder (blaze-core's `listing`).
+    pub fn entries(&self, cx: &Cx, path: &Path) -> Result<Option<Entries>, FsError> {
+        let name = self.beneath(path);
+        match stat(&self.io, cx, FsOp::Entries, &name)? {
+            None => return Ok(None),
+            Some(Meta { dir: false, .. }) => return Err(FsError::new(FsOp::Entries, &name, FsKind::NotADirectory)),
+            Some(_) => {}
+        }
+        // clone: the folder's path beneath this directory, a refcount.
+        self.list_one(cx, DirName::Named(name), Some(path.clone())).map(Some)
+    }
+
+    /// What is directly in this directory itself, one level: the same columns, caps and order
+    /// as [`Dir::entries`], for the root and a named directory alike. The directory gone, or
+    /// a file in its place, fails naming it. [`Entries::folder`] is `None`, and
+    /// [`Entries::path`] is the entry's own name.
+    pub fn own_entries(&self, cx: &Cx) -> Result<Entries, FsError> {
+        // clone: the directory's name, a refcount.
+        self.list_one(cx, self.base.clone(), None)
+    }
+
+    /// The one listing of `dir` (named `path` beneath this directory, or this one).
+    fn list_one(&self, cx: &Cx, dir: DirName, path: Option<Path>) -> Result<Entries, FsError> {
+        // clone: the effect's name, a refcount.
+        let asked = dir.clone();
+        let listing = match call(&self.io, cx, FsOp::Entries, &dir, |tag| Effect::Entries { dir: asked, tag })? {
+            Done::Entries(listing) => listing,
+            done => return Err(unexpected(FsOp::Entries, &dir, done)),
+        };
+        if listing.dir() != &dir {
+            // alloc: an error's message.
+            let said = format!("a listing of {}, not of the folder asked", listing.dir());
+            return Err(FsError::new(FsOp::Entries, &dir, FsKind::Answered(said)));
+        }
+        Ok(Entries { listing, path })
+    }
+
     /// The name of `path` beneath this directory.
     fn beneath(&self, path: &Path) -> FileName {
-        // alloc: once per name joined.
-        let joined = format!("{}/{}", self.base, path.as_str());
-        FileName::new(&joined).expect("a directory's name and a path joined are a name")
+        match &self.base {
+            // clone: the path's name under the root, a refcount.
+            DirName::Root => path.name().clone(),
+            DirName::Named(base) => {
+                // alloc: once per name joined.
+                let joined = format!("{base}/{}", path.as_str());
+                FileName::new(&joined).expect("a directory's name and a path joined are a name")
+            }
+        }
     }
 
     /// The name `raw` would have beneath this directory if its `..` were resolved by text:
@@ -872,7 +1476,8 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
     #[cfg(test)]
     pub(crate) fn beneath_by_text(&self, raw: &str) -> Option<FileName> {
         // alloc: a test's planted join.
-        let mut parts: Vec<&str> = self.base.as_str().split('/').collect();
+        let base = self.base.name().map_or("", FileName::as_str);
+        let mut parts: Vec<&str> = base.split('/').filter(|it| !it.is_empty()).collect();
         for part in raw.split('/') {
             match part {
                 ".." => _ = parts.pop(),
@@ -919,6 +1524,156 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
     pub fn read_all(&self, cx: &Cx, path: &Path, into: &mut Bytes<'_>) -> Result<usize, FsError> {
         self.open_read(cx, path)?.read_all(cx, into)
     }
+
+    /// Kernel-confined whole-file read: opens `path` strictly beneath this directory without
+    /// following any symbolic link in any directory component or final leaf (`openat`+`O_NOFOLLOW`
+    /// on Unix, `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` on Linux; component `Lstat` check
+    /// in simulations) and reads straight into `into`'s uninitialized spare capacity (zero
+    /// `memset(0)`, zero intermediate copy, zero global world lock).
+    pub fn read_all_confined(&self, cx: &Cx, path: &Path, into: &mut Bytes<'_>) -> Result<usize, FsError> {
+        let name = self.beneath(path);
+        if let Some(lent) = self.io.read_all_confined(cx, &name, into) {
+            return match lent {
+                Ok(crate::io::ReadAllLent::Read(len)) => Ok(len),
+                Ok(crate::io::ReadAllLent::Moved { stated, read }) => Err(FsError::new(FsOp::Read, &name, FsKind::Moved { stated, read })),
+                Ok(crate::io::ReadAllLent::Failed(error)) => Err(FsError::new(FsOp::Read, &name, FsKind::Driver(error.0))),
+                Err(stopped) => Err(FsError::new(FsOp::Read, &name, FsKind::Stopped(stopped))),
+            };
+        }
+        // Simulation / guest fallback: verify no component along `path` is a symlink via batched `looks` (`Effect::Stamp`).
+        let raw_rel = path.as_str();
+        let mut prefixes: Vec<Path, &blaze_mem::Frame> = Vec::new_in(cx.frame());
+        for (idx, _) in raw_rel.match_indices('/') {
+            let sub = Path::new(&raw_rel[..idx]).expect("prefix of valid Path is valid");
+            let _ = prefixes.try_reserve(1);
+            prefixes.push(sub);
+        }
+        let looks = self.looks(cx, prefixes.iter().chain(core::iter::once(path)))?;
+        for (i, sub) in prefixes.iter().enumerate() {
+            match looks.get(i).map(|l| l.kind) {
+                Some(EntryKind::Dir) => {}
+                Some(EntryKind::Gone) => return Err(FsError::new(FsOp::Read, &name, FsKind::NotFound)),
+                _ => return Err(FsError::new(FsOp::Read, &self.beneath(sub), FsKind::Driver("symbolic link refused in confined read".into()))),
+            }
+        }
+        match looks.get(prefixes.len()).map(|l| l.kind) {
+            Some(EntryKind::File) => {}
+            Some(EntryKind::Dir) => return Err(FsError::new(FsOp::Read, &name, FsKind::IsADirectory)),
+            Some(EntryKind::Gone) => return Err(FsError::new(FsOp::Read, &name, FsKind::NotFound)),
+            _ => return Err(FsError::new(FsOp::Read, &name, FsKind::Driver("symbolic link refused in confined read".into()))),
+        }
+        let file = name.clone();
+        match call(&self.io, cx, FsOp::Read, &name, |tag| Effect::ReadAll { file, tag })? {
+            Done::Read(bytes) => {
+                into.try_extend(&bytes)
+                    .map_err(|stopped| FsError::new(FsOp::Read, &name, FsKind::Stopped(stopped)))?;
+                Ok(bytes.len())
+            }
+            other => Err(unexpected(FsOp::Read, &name, other)),
+        }
+    }
+
+    /// Reads all of `paths` beneath this directory concurrently into the matching `out` buffers,
+    /// returning the total bytes appended.
+    ///
+    /// Uses one batched [`Dir::looks`] (`Effect::Stamp`) to verify existence and pre-reserve exact
+    /// lengths, then overlaps up to 64 `Effect::ReadAll` ops in flight at once via `Cx::wait_any`
+    /// so `io_uring` and multi-lane thread drivers saturate disk concurrency instead of serializing
+    /// file reads one by one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `paths.len() != out.len()`.
+    pub fn read_all_many(&self, cx: &Cx, paths: &[&Path], out: &mut [Bytes<'_>]) -> Result<usize, FsError> {
+        assert_eq!(paths.len(), out.len(), "bstd::fs::Dir::read_all_many: paths and out length mismatch");
+        if paths.is_empty() {
+            cx.check().map_err(|stopped| FsError::new(FsOp::Read, &self.base, FsKind::Stopped(stopped)))?;
+            return Ok(0);
+        }
+        // 1. One batched Stamp verifies every path exists and is a regular file, and tells us its size.
+        let looks = self.looks(cx, paths.iter().copied())?;
+        let mut names: Vec<FileName, &blaze_mem::Frame> = Vec::new_in(cx.frame());
+        names
+            .try_reserve(paths.len())
+            .map_err(|_| FsError::new(FsOp::Read, &self.base, FsKind::Stopped(Stopped::OutOfMemory { arena: "bstd::fs::read_all_many", asked: paths.len() * size_of::<FileName>() })))?;
+        for (i, path) in paths.iter().enumerate() {
+            let name = self.beneath(path);
+            match looks.get(i) {
+                Some(look) if look.kind == EntryKind::File => {
+                    if let Ok(len) = usize::try_from(look.len) {
+                        out[i]
+                            .try_reserve(len)
+                            .map_err(|stopped| FsError::new(FsOp::Read, &name, FsKind::Stopped(stopped)))?;
+                    }
+                    names.push(name);
+                }
+                Some(look) if look.kind == EntryKind::Gone => {
+                    return Err(FsError::new(FsOp::Read, &name, FsKind::NotFound));
+                }
+                Some(look) if look.kind == EntryKind::Dir => {
+                    return Err(FsError::new(FsOp::Read, &name, FsKind::IsADirectory));
+                }
+                _ => {
+                    return Err(FsError::new(FsOp::Read, &name, FsKind::NotFound));
+                }
+            }
+        }
+        // 2. Overlap up to WINDOW concurrent ReadAll ops and drain completions as they land.
+        const WINDOW: usize = 64;
+        let cap = paths.len().min(WINDOW);
+        let mut tags: Vec<Tag, &blaze_mem::Frame> = Vec::new_in(cx.frame());
+        let mut indices: Vec<usize, &blaze_mem::Frame> = Vec::new_in(cx.frame());
+        let _ = tags.try_reserve(cap);
+        let _ = indices.try_reserve(cap);
+        let mut next = 0usize;
+        let mut total = 0usize;
+        let submit_one = |io: &Io, name: &FileName| {
+            let file = name.clone();
+            io.submit(|tag| Effect::ReadAll { file, tag })
+        };
+        while next < names.len() && tags.len() < cap {
+            tags.push(submit_one(&self.io, &names[next]));
+            indices.push(next);
+            next += 1;
+        }
+        while !tags.is_empty() {
+            let waited = cx.wait_any(&self.io, &tags);
+            let (slot, done) = match waited {
+                Ok(pair) => pair,
+                Err(stopped) => {
+                    for &t in &tags {
+                        self.io.forget(t, crate::io::Ends::Once);
+                    }
+                    return Err(FsError::new(FsOp::Read, &self.base, FsKind::Stopped(stopped)));
+                }
+            };
+            tags.swap_remove(slot);
+            let idx = indices.swap_remove(slot);
+            match done {
+                Done::Read(bytes) => {
+                    if let Err(stopped) = out[idx].try_extend(&bytes) {
+                        for &t in &tags {
+                            self.io.forget(t, crate::io::Ends::Once);
+                        }
+                        return Err(FsError::new(FsOp::Read, &names[idx], FsKind::Stopped(stopped)));
+                    }
+                    total += bytes.len();
+                }
+                other => {
+                    for &t in &tags {
+                        self.io.forget(t, crate::io::Ends::Once);
+                    }
+                    return Err(unexpected(FsOp::Read, &names[idx], other));
+                }
+            }
+            if next < names.len() {
+                tags.push(submit_one(&self.io, &names[next]));
+                indices.push(next);
+                next += 1;
+            }
+        }
+        Ok(total)
+    }
 }
 
 impl Dir<ReadOnly> {
@@ -931,22 +1686,24 @@ impl Dir<ReadOnly> {
 impl Dir<ReadWrite> {
     /// The file at `path`, read and write: finished with one of [`File::close`]'s forms. A
     /// missing one is [`FsKind::NotFound`]: an open never makes a file.
+    #[track_caller]
     pub fn open(&self, cx: &Cx, path: &Path) -> Result<File<ReadWrite>, FsError> {
         let name = self.beneath(path);
         self.found(cx, &name)?;
         // clone: the quota shared, a refcount.
-        Ok(File { io: self.io.clone(), name, quota: self.quota.clone(), made: false, rights: ReadWrite(()) })
+        Ok(File { io: self.io.clone(), name, quota: self.quota.clone(), made: false, rights: ReadWrite::held() })
     }
 
     /// The file at `path` made empty, in place (a file there is cut to nothing, not
     /// replaced: a reader of it sees it empty), and its directories made. Nothing of it is
     /// durable, its name included, until its close says so: finished with one of
     /// [`File::close`]'s forms. To replace a file all at once, [`Dir::publish`].
+    #[track_caller]
     pub fn create(&self, cx: &Cx, path: &Path) -> Result<File<ReadWrite>, FsError> {
         let name = self.beneath(path);
         truncate(&self.io, cx, FsOp::Create, &name, 0)?;
         // clone: the quota shared, a refcount.
-        Ok(File { io: self.io.clone(), name, quota: self.quota.clone(), made: true, rights: ReadWrite(()) })
+        Ok(File { io: self.io.clone(), name, quota: self.quota.clone(), made: true, rights: ReadWrite::held() })
     }
 
     /// That nothing is at `name`, for a call that makes a new file and never replaces one.
@@ -970,6 +1727,80 @@ impl Dir<ReadWrite> {
                         // alloc: the effect's bytes, which blaze-core's `Effect` owns.
                         append(&self.io, cx, FsOp::Publish, &temp, bytes.to_vec())
                     })?;
+                }
+                How::Written
+            }
+            Kind::Parts { parts, most } => {
+                truncate(&self.io, cx, FsOp::Publish, &temp, 0)?;
+                let mut left: usize = parts.iter().map(|part| part.len()).sum();
+                let mut rest = parts.iter();
+                let mut part: &[u8] = &[];
+                // Each turn appends at least one byte of the `left` it counts down: bounded.
+                while left > 0 {
+                    let room = left.min(most.get());
+                    // alloc: the effect's bytes, which blaze-core's `Effect` owns.
+                    let mut bytes = Vec::with_capacity(room);
+                    while bytes.len() < room {
+                        if part.is_empty() {
+                            match rest.next() {
+                                Some(next) => part = next,
+                                None => break,
+                            }
+                            continue;
+                        }
+                        let take = part.len().min(room - bytes.len());
+                        bytes.extend_from_slice(&part[..take]);
+                        part = &part[take..];
+                    }
+                    if bytes.is_empty() {
+                        break;
+                    }
+                    left -= bytes.len();
+                    within(&self.io, quota, FsOp::Publish, &temp, bytes.len() as u64, || append(&self.io, cx, FsOp::Publish, &temp, bytes))?;
+                }
+                How::Written
+            }
+            Kind::PartsOf { parts, then, chunk } => {
+                truncate(&self.io, cx, FsOp::Publish, &temp, 0)?;
+                let room = chunk.get();
+                let flush = |full: Vec<u8>| within(&self.io, quota, FsOp::Publish, &temp, full.len() as u64, || append(&self.io, cx, FsOp::Publish, &temp, full));
+                // alloc: the effect's bytes, which blaze-core's `Effect` owns; one chunk at a time.
+                let mut bytes: Vec<u8> = Vec::with_capacity(room);
+                for part in parts {
+                    let of = part.of.name();
+                    let (mut at, end) = (part.at, part.at.saturating_add(part.len));
+                    // Each turn reads at least one byte toward `end`, or fails: bounded.
+                    while at < end {
+                        if bytes.len() == room {
+                            flush(core::mem::replace(&mut bytes, Vec::with_capacity(room)))?;
+                        }
+                        let len = (end - at).min((room - bytes.len()) as u64) as usize;
+                        // clone: the effect's name, a refcount.
+                        let file = of.clone();
+                        let read = match call(&self.io, cx, FsOp::Publish, of, |tag| Effect::Read { file, at, len, tag })? {
+                            Done::Read(read) => read,
+                            done => return Err(unexpected(FsOp::Publish, of, done)),
+                        };
+                        if read.is_empty() || read.len() > len {
+                            // alloc: an error's words.
+                            let said = format!("{} bytes read at {at} of a part that ends at {end}", read.len());
+                            return Err(FsError::new(FsOp::Publish, of, FsKind::Answered(said)));
+                        }
+                        bytes.extend_from_slice(&read);
+                        at += read.len() as u64;
+                    }
+                }
+                let mut rest = then;
+                while !rest.is_empty() {
+                    if bytes.len() == room {
+                        flush(core::mem::replace(&mut bytes, Vec::with_capacity(room)))?;
+                    }
+                    let take = rest.len().min(room - bytes.len());
+                    bytes.extend_from_slice(&rest[..take]);
+                    rest = &rest[take..];
+                }
+                if !bytes.is_empty() {
+                    flush(bytes)?;
                 }
                 How::Written
             }
@@ -1004,20 +1835,6 @@ impl Dir<ReadWrite> {
             }
         };
         Ok((temp, how))
-    }
-
-    /// The temporary file `temp` renamed over `name`: the moment a reader stops seeing the
-    /// old contents and sees the new. Under [`Plant::PublishBeforeRename`] the rename is
-    /// handed to the driver and not waited for: the planted bug of the durability tests.
-    fn swap_in(&self, cx: &Cx, temp: &FileName, name: &FileName) -> Result<(), FsError> {
-        if self.io.plant() == Plant::PublishBeforeRename {
-            // clone: the effect's names, refcounts.
-            let (from, to) = (temp.clone(), name.clone());
-            let tag = self.io.submit(|tag| Effect::Rename { from, to, tag });
-            self.io.forget(tag, Ends::Once);
-            return Ok(());
-        }
-        rename(&self.io, cx, FsOp::Publish, temp, name)
     }
 
     /// `path` made to hold `content`, replaced all at once, as durable as `durable` says:
@@ -1057,7 +1874,8 @@ impl Dir<ReadWrite> {
     ) -> Result<Published<Written>, FsError> {
         let name = self.beneath(path);
         let (temp, how) = self.place(cx, &name, content)?;
-        self.swap_in(cx, &temp, &name)?;
+        // The moment a reader stops seeing the old contents and sees the new; nothing synced.
+        rename_unsynced(&self.io, cx, FsOp::Publish, &temp, &name, unsynced)?;
         started(&self.io, &name, unsynced);
         names_started(&self.io, &name, unsynced);
         cx.event(how.says());
@@ -1072,8 +1890,8 @@ impl Dir<ReadWrite> {
         let name = self.beneath(path);
         let (temp, how) = self.place(cx, &name, content)?;
         let flushed = Written::of(&self.io, temp).flush(cx)?;
-        self.swap_in(cx, flushed.name(), &name)?;
-        sync_names(&self.io, cx, FsOp::Publish, &name, true)?;
+        let renamed = rename_synced(&self.io, cx, FsOp::Publish, flushed.name(), &name)?;
+        sync_names(&self.io, cx, FsOp::Publish, &name, Some(renamed))?;
         cx.event(how.says());
         // The name's generation is its rename's: the bytes were flushed as the temporary file,
         // and nothing changed them since.
@@ -1103,7 +1921,7 @@ impl Dir<ReadWrite> {
     pub fn remove_synced(&self, cx: &Cx, path: &Path) -> Result<(), FsError> {
         let name = self.beneath(path);
         remove(&self.io, cx, FsOp::Remove, &name)?;
-        sync_names(&self.io, cx, FsOp::Remove, &name, false)
+        sync_names(&self.io, cx, FsOp::Remove, &name, None)
     }
 
     /// `from` renamed over `to`, both beneath this directory, replacing what `to` held all
@@ -1128,7 +1946,7 @@ impl Dir<ReadWrite> {
         unsynced: Unsynced,
     ) -> Result<(), FsError> {
         let (from, to) = (self.beneath(from), self.beneath(to));
-        rename(&self.io, cx, FsOp::Rename, &from, &to)?;
+        rename_unsynced(&self.io, cx, FsOp::Rename, &from, &to, unsynced)?;
         started(&self.io, &to, unsynced);
         names_started(&self.io, &to, unsynced);
         Ok(())
@@ -1141,21 +1959,20 @@ impl Dir<ReadWrite> {
     /// it ([`Dir::publish_synced`]).
     pub fn rename_replacing_synced(&self, cx: &Cx, from: &Path, to: &Path) -> Result<(), FsError> {
         let (from, to) = (self.beneath(from), self.beneath(to));
-        rename(&self.io, cx, FsOp::Rename, &from, &to)?;
+        let renamed = rename_synced(&self.io, cx, FsOp::Rename, &from, &to)?;
         flush_wait(&self.io, cx, FsOp::Rename, &to)?;
-        sync_names(&self.io, cx, FsOp::Rename, &to, true)
+        sync_names(&self.io, cx, FsOp::Rename, &to, Some(renamed))
     }
 
     /// The names directly in this directory made durable: every file made in it, renamed
     /// into it or removed from it by a call that has returned stays so through a crash. It
     /// waits for the device ([`blaze_core::Effect::SyncDir`]). A file's bytes are its own
-    /// flush. The driver's root itself, which no effect can name, is
-    /// [`FsKind::NoNameSync`] on a real driver.
+    /// flush. The driver's root is synced as any directory (`DirName::Root`).
     pub fn sync_names(&self, cx: &Cx) -> Result<(), FsError> {
         if self.io.plant() == Plant::DurableSkipsNameSync {
             return Ok(());
         }
-        sync_dir(&self.io, cx, FsOp::SyncNames, &self.base, self.base.as_str())
+        sync_dir(&self.io, cx, FsOp::SyncNames, &self.base, self.base.name().map_or("", FileName::as_str))
     }
 }
 
@@ -1392,46 +2209,53 @@ impl<#[blaze::linear] P: Rights> File<P> {
 
     /// A read of up to `into.len()` bytes at `at` into `into`, in flight: its outcome, once
     /// waited for, is how many bytes it read, fewer at the end of the file.
-    pub fn read_into<'buf>(&'buf self, into: &'buf mut [u8], at: u64) -> Pending<'buf, Result<usize, FsError>> {
+    #[track_caller]
+    pub fn read_into<'buf>(&'buf self, into: &'buf mut [u8], at: u64) -> Pending<'buf, ReadInto<'buf>> {
         // clone: the effect's name, a refcount.
         let file = self.name.clone();
         let len = into.len();
-        let name = &self.name;
         let effect = |tag| Effect::Read { file, at, len, tag };
-        pending::start(&self.io, "bstd::fs read_into", into, effect, move |into: &mut [u8], done| {
-            match done {
-                Ok(Done::Read(bytes)) if bytes.len() <= into.len() => {
-                    into[..bytes.len()].copy_from_slice(&bytes);
-                    Ok(bytes.len())
-                }
-                Ok(done) => Err(unexpected(FsOp::Read, name, done)),
-                Err(stopped) => Err(FsError::new(FsOp::Read, name, FsKind::Stopped(stopped))),
-            }
-        })
+        pending::start(&self.io, "bstd::fs read_into", into, effect, ReadInto { name: &self.name })
     }
 
-    /// Up to `len` bytes at `at` added to `into`, fewer at the end of the file; how many. Its
-    /// [`File::read_into`], waited for.
+    /// Up to `len` bytes at `at` added to `into`, fewer at the end of the file; how many.
+    /// One `Effect::Read` through `Io::call`, which looks at the context's deadline first: on
+    /// a native driver with inline calls the `pread` runs on this thread, with no handoff to
+    /// the driver's threads; the simulation queues it, as `read_into` does, the same effect it
+    /// can fail, delay and reorder.
     pub fn read_at(&self, cx: &Cx, at: u64, len: usize, into: &mut Bytes<'_>) -> Result<usize, FsError> {
-        let stopped = |stopped| FsError::new(FsOp::Read, &self.name, FsKind::Stopped(stopped));
-        cx.stopped_by(self.io.now()).map_err(stopped)?;
-        let start = into.len();
-        let slot = into.grow_zeroed(len).map_err(stopped)?;
-        let read = self.read_into(slot, at).wait(cx);
-        match read {
-            Ok(read) => {
-                into.truncate(start + read);
-                Ok(read)
+        // clone: the effect's name, a refcount.
+        let file = self.name.clone();
+        match call(&self.io, cx, FsOp::Read, &self.name, |tag| Effect::Read { file, at, len, tag })? {
+            Done::Read(bytes) if bytes.len() <= len => {
+                into.try_extend(&bytes)
+                    .map_err(|stopped| FsError::new(FsOp::Read, &self.name, FsKind::Stopped(stopped)))?;
+                Ok(bytes.len())
             }
-            Err(error) => {
-                into.truncate(start);
-                Err(error)
-            }
+            done => Err(unexpected(FsOp::Read, &self.name, done)),
         }
     }
 
     /// The whole file added to `into`; how many bytes.
+    ///
+    /// On a native world with inline calls the bytes are read straight into `into`: it grows
+    /// once by the file's length (from the open file's `fstat`) and one byte, one `pread`
+    /// fills it, and nothing is copied after the kernel's copy (`Io::read_all_lent`; the growing
+    /// copy of a driver's `Vec` was 3.35% of a one-function edit on tempo, 2026-11-20). A file
+    /// whose length moved between that `fstat` and the read is refused by name
+    /// ([`FsKind::Moved`]), `into` as it was: no second read (a writer still writing races a
+    /// retry the same way; rule no-fallback). Elsewhere (the simulation, a guest's escape) one
+    /// `Effect::ReadAll`, whose bytes are added as before.
     pub fn read_all(&self, cx: &Cx, into: &mut Bytes<'_>) -> Result<usize, FsError> {
+        if let Some(lent) = self.io.read_all_lent(cx, &self.name, into) {
+            return match lent {
+                Ok(crate::io::ReadAllLent::Read(len)) => Ok(len),
+                Ok(crate::io::ReadAllLent::Moved { stated, read }) => Err(FsError::new(FsOp::Read, &self.name, FsKind::Moved { stated, read })),
+                // alloc: an error's message.
+                Ok(crate::io::ReadAllLent::Failed(error)) => Err(FsError::new(FsOp::Read, &self.name, FsKind::Driver(error.0))),
+                Err(stopped) => Err(FsError::new(FsOp::Read, &self.name, FsKind::Stopped(stopped))),
+            };
+        }
         // clone: the effect's name, a refcount.
         let file = self.name.clone();
         let done = call(&self.io, cx, FsOp::Read, &self.name, |tag| Effect::ReadAll { file, tag })?;
@@ -1446,12 +2270,61 @@ impl<#[blaze::linear] P: Rights> File<P> {
     }
 }
 
+/// Completion state for [`File::read_into`], stored inline inside [`Pending`] (zero heap alloc).
+pub struct ReadInto<'buf> {
+    name: &'buf FileName,
+}
+
+impl<'buf> pending::Complete<'buf> for ReadInto<'buf> {
+    type Output = Result<usize, FsError>;
+
+    fn complete(self, into: &'buf mut [u8], done: Result<Done, Stopped>) -> Self::Output {
+        match done {
+            Ok(Done::Read(bytes)) if bytes.len() <= into.len() => {
+                into[..bytes.len()].copy_from_slice(&bytes);
+                Ok(bytes.len())
+            }
+            Ok(done) => Err(unexpected(FsOp::Read, self.name, done)),
+            Err(stopped) => Err(FsError::new(FsOp::Read, self.name, FsKind::Stopped(stopped))),
+        }
+    }
+}
+
+/// Completion state for [`File::write_from`], stored inline inside [`Pending`] (zero heap alloc).
+pub enum WriteFrom<'buf> {
+    InFlight { name: &'buf FileName, quota: Option<&'buf Budget>, asked: u64, after: bool },
+    Refused(FsError),
+}
+
+impl<'buf> pending::Complete<'buf> for WriteFrom<'buf> {
+    type Output = Result<(), FsError>;
+
+    fn complete(self, _: &'buf mut [u8], done: Result<Done, Stopped>) -> Self::Output {
+        match self {
+            WriteFrom::Refused(err) => Err(err),
+            WriteFrom::InFlight { name, quota, asked, after } => match done {
+                Ok(Done::Written) => match quota {
+                    Some(quota) if after => quota.take(asked).map_err(|over| FsError::new(FsOp::WriteAt, name, FsKind::OverQuota(over))),
+                    _ => Ok(()),
+                },
+                Ok(done) => Err(unexpected(FsOp::WriteAt, name, done)),
+                Err(stopped) => Err(FsError::new(FsOp::WriteAt, name, FsKind::Stopped(stopped))),
+            },
+        }
+    }
+}
+
 impl File<ReadWrite> {
-    /// The bytes handed to the driver at the file's end, within the quota.
+    /// The bytes handed to the driver at the file's end, within the quota: lent for the call
+    /// ([`Io::write_lent`]), so a native world writes them with no copy and the simulation
+    /// queues its own copy, as before.
     fn append_bytes(&self, cx: &Cx, bytes: &[u8]) -> Result<(), FsError> {
         within(&self.io, self.quota.as_deref(), FsOp::Append, &self.name, bytes.len() as u64, || {
-            // alloc: the effect's bytes, which blaze-core's `Effect` owns.
-            append(&self.io, cx, FsOp::Append, &self.name, bytes.to_vec())
+            match self.io.write_lent(cx, &self.name, crate::io::Lent::End, bytes) {
+                Ok(Done::Appended) => Ok(()),
+                Ok(done) => Err(unexpected(FsOp::Append, &self.name, done)),
+                Err(stopped) => Err(FsError::new(FsOp::Append, &self.name, FsKind::Stopped(stopped))),
+            }
         })
     }
 
@@ -1472,6 +2345,41 @@ impl File<ReadWrite> {
         Ok(())
     }
 
+    /// Appends every slice in `parts` in order in a single write call (coalescing multiple
+    /// non-empty slices in an ephemeral [`Cx::scratch`] buffer so nothing escapes to the task
+    /// frame or global heap).
+    pub fn append_vectored_unsynced(&self, cx: &Cx, parts: &[&[u8]], unsynced: Unsynced) -> Result<(), FsError> {
+        let mut non_empty = 0usize;
+        let mut single: &[u8] = &[];
+        let mut total = 0usize;
+        for &p in parts {
+            if !p.is_empty() {
+                non_empty += 1;
+                single = p;
+                total = total.saturating_add(p.len());
+            }
+        }
+        if non_empty == 0 {
+            return cx.check().map_err(|s| FsError::new(FsOp::Append, &self.name, FsKind::Stopped(s)));
+        }
+        if non_empty == 1 {
+            return self.append_unsynced(cx, single, unsynced);
+        }
+        let reserve = total.saturating_add(4096);
+        cx.scratch(reserve, |scx| {
+            let mut buf = Bytes::with_capacity_in(scx.frame(), "bstd::fs::append_vectored", total)
+                .map_err(|s| FsError::new(FsOp::Append, &self.name, FsKind::Stopped(s)))?;
+            for &p in parts {
+                if !p.is_empty() {
+                    buf.try_extend(p)
+                        .map_err(|s| FsError::new(FsOp::Append, &self.name, FsKind::Stopped(s)))?;
+                }
+            }
+            self.append_unsynced(scx, buf.as_slice(), unsynced)
+        })
+        .map_err(|s| FsError::new(FsOp::Append, &self.name, FsKind::Stopped(s)))?
+    }
+
     /// `bytes` added at the end, then the file flushed: once this returns a crash keeps
     /// them, and everything written to the file before them.
     pub fn append_synced(&self, cx: &Cx, bytes: &[u8]) -> Result<(), FsError> {
@@ -1481,10 +2389,10 @@ impl File<ReadWrite> {
 
     /// A write of `from` at `at`, past the end making it longer, in flight; not flushed. The
     /// bytes are copied as it starts (see [`crate::pending`]), and stay lent until it ends.
-    pub fn write_from<'buf>(&'buf self, from: &'buf [u8], at: u64) -> Pending<'buf, Result<(), FsError>> {
+    #[track_caller]
+    pub fn write_from<'buf>(&'buf self, from: &'buf [u8], at: u64) -> Pending<'buf, WriteFrom<'buf>> {
         let name = &self.name;
         let asked = from.len() as u64;
-        let over = move |over| FsError::new(FsOp::WriteAt, name, FsKind::OverQuota(over));
         // The planted bug of the budget tests: the quota is looked at once the bytes are written.
         let after = self.io.plant() == Plant::BudgetCheckedAfter;
         let quota = self.quota.as_deref();
@@ -1493,23 +2401,14 @@ impl File<ReadWrite> {
             _ => None,
         };
         if let Some(short) = short {
-            return pending::refused(&self.io, "bstd::fs write_from", Err(over(short)));
+            return pending::refused(&self.io, "bstd::fs write_from", WriteFrom::Refused(FsError::new(FsOp::WriteAt, name, FsKind::OverQuota(short))));
         }
         // clone: the effect's name, a refcount.
         let file = self.name.clone();
         // alloc: the effect's bytes, which blaze-core's `Effect` owns.
         let bytes = from.to_vec();
         let effect = |tag| Effect::WriteAt { file, at, bytes, tag };
-        pending::start(&self.io, "bstd::fs write_from", &mut [], effect, move |_: &mut [u8], done| {
-            match done {
-                Ok(Done::Written) => match quota {
-                    Some(quota) if after => quota.take(asked).map_err(over),
-                    _ => Ok(()),
-                },
-                Ok(done) => Err(unexpected(FsOp::WriteAt, name, done)),
-                Err(stopped) => Err(FsError::new(FsOp::WriteAt, name, FsKind::Stopped(stopped))),
-            }
-        })
+        pending::start(&self.io, "bstd::fs write_from", &mut [], effect, WriteFrom::InFlight { name, quota, asked, after })
     }
 
     /// `bytes` written at `at`, past the end making it longer, as durably as `durable`
@@ -1521,12 +2420,20 @@ impl File<ReadWrite> {
         }
     }
 
-    /// `bytes` written at `at`, not flushed: its [`File::write_from`], waited for. It never
-    /// waits for the device.
+    /// `bytes` written at `at`, not flushed: what [`File::write_from`] waited for does, with
+    /// the bytes lent for the call (`Io::write_lent`): a native world writes them with no
+    /// copy, the simulation queues its own copy as `write_from` did. Within the quota as
+    /// `write_from` is. It never waits for the device.
     pub fn write_at_unsynced(&self, cx: &Cx, at: u64, bytes: &[u8], unsynced: Unsynced) -> Result<(), FsError> {
         cx.stopped_by(self.io.now())
             .map_err(|stopped| FsError::new(FsOp::WriteAt, &self.name, FsKind::Stopped(stopped)))?;
-        self.write_from(bytes, at).wait(cx)?;
+        within(&self.io, self.quota.as_deref(), FsOp::WriteAt, &self.name, bytes.len() as u64, || {
+            match self.io.write_lent(cx, &self.name, crate::io::Lent::At(at), bytes) {
+                Ok(Done::Written) => Ok(()),
+                Ok(done) => Err(unexpected(FsOp::WriteAt, &self.name, done)),
+                Err(stopped) => Err(FsError::new(FsOp::WriteAt, &self.name, FsKind::Stopped(stopped))),
+            }
+        })?;
         started(&self.io, &self.name, unsynced);
         Ok(())
     }
@@ -1535,6 +2442,40 @@ impl File<ReadWrite> {
     pub fn write_at_synced(&self, cx: &Cx, at: u64, bytes: &[u8]) -> Result<(), FsError> {
         self.write_at_unsynced(cx, at, bytes, Unsynced::No)?;
         self.flush(cx)
+    }
+
+    /// Writes every slice in `parts` contiguously starting at `at` in a single write call
+    /// (coalescing multiple non-empty slices in an ephemeral [`Cx::scratch`] buffer).
+    pub fn write_vectored_unsynced(&self, cx: &Cx, at: u64, parts: &[&[u8]], unsynced: Unsynced) -> Result<(), FsError> {
+        let mut non_empty = 0usize;
+        let mut single: &[u8] = &[];
+        let mut total = 0usize;
+        for &p in parts {
+            if !p.is_empty() {
+                non_empty += 1;
+                single = p;
+                total = total.saturating_add(p.len());
+            }
+        }
+        if non_empty == 0 {
+            return cx.check().map_err(|s| FsError::new(FsOp::WriteAt, &self.name, FsKind::Stopped(s)));
+        }
+        if non_empty == 1 {
+            return self.write_at_unsynced(cx, at, single, unsynced);
+        }
+        let reserve = total.saturating_add(4096);
+        cx.scratch(reserve, |scx| {
+            let mut buf = Bytes::with_capacity_in(scx.frame(), "bstd::fs::write_vectored", total)
+                .map_err(|s| FsError::new(FsOp::WriteAt, &self.name, FsKind::Stopped(s)))?;
+            for &p in parts {
+                if !p.is_empty() {
+                    buf.try_extend(p)
+                        .map_err(|s| FsError::new(FsOp::WriteAt, &self.name, FsKind::Stopped(s)))?;
+                }
+            }
+            self.write_at_unsynced(scx, at, buf.as_slice(), unsynced)
+        })
+        .map_err(|s| FsError::new(FsOp::WriteAt, &self.name, FsKind::Stopped(s)))?
     }
 
     /// The file cut or grown to `len`, as durably as `durable` says: [`File::set_len_unsynced`]
@@ -1590,7 +2531,7 @@ impl File<ReadWrite> {
     #[blaze::consumes]
     pub fn close_unsynced(self, unsynced: Unsynced) -> Result<Written, FsError> {
         let File { io, name, quota: _, made: _, rights } = self;
-        crate::consume(rights);
+        rights.finished();
         started(&io, &name, unsynced);
         Ok(Written::of(&io, name))
     }
@@ -1601,14 +2542,14 @@ impl File<ReadWrite> {
     #[blaze::consumes]
     pub fn close_synced(self, cx: &Cx) -> Result<Flushed, FsError> {
         let File { io, name, quota: _, made, rights } = self;
-        crate::consume(rights);
+        rights.finished();
         let seen = io.generation(&name);
         if io.plant() == Plant::CloseSkipsSync {
             return Ok(Flushed::of(&io, name, seen));
         }
         flush_wait(&io, cx, FsOp::Close, &name)?;
         if made {
-            sync_names(&io, cx, FsOp::Close, &name, false)?;
+            sync_names(&io, cx, FsOp::Close, &name, None)?;
         }
         Ok(Flushed::of(&io, name, seen))
     }
@@ -1642,6 +2583,7 @@ pub struct Buffered<'f, 'a> {
     file: &'f File<ReadWrite>,
     held: Bytes<'a>,
     capacity: usize,
+    unfinished: Unfinished,
 }
 
 impl File<ReadWrite> {
@@ -1649,6 +2591,7 @@ impl File<ReadWrite> {
     /// with [`Buffered::finish`]. With no room for it in `frame` it is
     /// [`Stopped::OutOfMemory`], naming the buffer.
     #[blaze::nonblocking]
+    #[track_caller]
     pub fn buffered<'f, 'a>(
         &'f self,
         frame: &'a Frame,
@@ -1657,7 +2600,12 @@ impl File<ReadWrite> {
         let mut held = Bytes::new_in(frame, "bstd::fs buffered");
         held.try_reserve(capacity.get())
             .map_err(|stopped| FsError::new(FsOp::Append, &self.name, FsKind::Stopped(stopped)))?;
-        Ok(Buffered { file: self, held, capacity: capacity.get() })
+        Ok(Buffered {
+            file: self,
+            held,
+            capacity: capacity.get(),
+            unfinished: Unfinished::new("fs::Buffered", "finish(cx)"),
+        })
     }
 }
 
@@ -1713,7 +2661,8 @@ impl Buffered<'_, '_> {
     /// one way a `Buffered` ends.
     #[blaze::consumes]
     pub fn finish(self, cx: &Cx) -> Result<usize, FsError> {
-        let Buffered { file, held, capacity: _ } = self;
+        let Buffered { file, held, capacity: _, unfinished } = self;
+        unfinished.finished();
         if held.is_empty() {
             return Ok(0);
         }

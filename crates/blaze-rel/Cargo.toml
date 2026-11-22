@@ -1,0 +1,36 @@
+[package]
+name = "blaze-rel"
+description = "blaze's own query engine for the build profile (docs/v2/plan/design/query.md), in place of DuckDB: SQL in blaze-sql's query grammar planned into relational operators and a semi-naive fixpoint, run over tables of blaze-columns batches, answered as blaze-data values, an aligned text table or JSON lines; `no_std`, on blaze-own, no IO"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The parser: the query grammar (`blaze_sql::parse::parse_script`) and its tree.
+blaze-sql.workspace = true
+# Every buffer, in the allocator the caller names.
+blaze-own.workspace = true
+# The tables' chunks: named columns of one length.
+blaze-columns.workspace = true
+# The answer's cells.
+blaze-data.workspace = true
+# The interner's and the hash operators' maps.
+blaze-hash.workspace = true
+
+[dev-dependencies]
+# Properties: the hash join and hash aggregate against nested-loop and sort-based models, with
+# a planted-bug control.
+blaze-sim.workspace = true
+# The acceptance test: the profile's schema, views.sql and examples.sql.
+blaze-profile.workspace = true
+
+[lints]
+workspace = true

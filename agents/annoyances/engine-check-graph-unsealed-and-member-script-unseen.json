@@ -1,0 +1,15 @@
+{
+ "id": "engine-check-graph-unsealed-and-member-script-unseen",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane ER",
+ "where": "crates/blaze-cli/src/engine_units.rs `discover` (the UnitGraph record); crates/blaze-cli/tests/build_scripts.rs",
+ "what": "Two traps met while making the engine's Scripts stage. (1) engine_units.rs `discover` published the UnitGraph record without the crate-list section work.rs's UnitGraph arm seals onto it (work.rs `seal_graph`), so every reader that opens the record's two sections through the store (a Script job, a proc-macro module's lookup: graph_payload.rs `sections`) would have been refused 'no trailer mark'. (2) tests/build_scripts.rs, the one test of a member build script run by a command, fails on the green tree for the OLD `blaze check` too: the member app's build.rs is not seen as a script at all (no lookup failure, no cfg: 'cannot find function `made`'), so no binary test can run a script today.",
+ "cost": "about twenty minutes reading; (2) is not diagnosed (no runs in a lane: the cause is somewhere between the layout's `RawBuild::Auto` listing, the unit graph's `build_script` and blaze-world list.rs `Script::Read`)",
+ "cause": "(1) two producers of one record (work.rs and engine_units.rs) with the sealing step in only one; (2) unknown",
+ "whys": "(1) the record's form is assembled at its producer instead of by one function both call",
+ "class": "a record made in two places, one copy missing a step",
+ "prevention": "(1) done: discover seals with the same `seal_graph`; better: one function `graph_record(made, world)` that both call (rule 30). (2) owed: a lane with runs bisects build_scripts.rs on the green history",
+ "annoyance": "a test file that is red on green is invisible until a lane asks for it",
+ "workaround": "admitted the stage with the engine_check and scripts unit tests; the build_scripts tests (two new for engine-check) wait on (2)",
+ "state": "open"
+}

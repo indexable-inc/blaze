@@ -10,9 +10,9 @@ use std::alloc::Global;
 use std::collections::VecDeque;
 
 use blaze_fetch::Digest;
+use blaze_manifest::lock::{Lock, LockPackage as Package, LockSource as Source};
 
 use crate::advisory::{Database, Informational};
-use crate::cargo_lock::{Lock, Package, Source};
 use crate::date::Date;
 use crate::pins::SourcePins;
 use crate::policy::{Settings, Severity, judged};
@@ -70,7 +70,8 @@ pub fn verify_database(pins: &SourcePins, path: &str, found: &Digest) -> Result<
 
 /// What the audit reads.
 pub struct Input<'a> {
-    pub lock: &'a Lock,
+    /// Read by the one lock reader (`blaze_manifest::lock`, rule 30).
+    pub lock: &'a Lock<'a>,
     /// The workspace's members, by package name: where chains start. Empty: every package
     /// with no source.
     pub members: &'a [String],
@@ -92,7 +93,7 @@ fn named(package: &Package) -> String {
 /// The shortest chain from a member to each package: for each, its parent on that chain.
 /// Breadth first from the members in name order over dependencies in (name, version,
 /// source) order, so the chain does not depend on the order of the lock's packages.
-fn parents(lock: &Lock, members: &[String]) -> Vec<Option<usize>, Global> {
+fn parents(lock: &Lock<'_>, members: &[String]) -> Vec<Option<usize>, Global> {
     let mut parent: Vec<Option<usize>, Global> = Vec::with_capacity_in(lock.packages.len(), Global);
     parent.resize(lock.packages.len(), None);
     let mut seen: Vec<bool, Global> = Vec::with_capacity_in(lock.packages.len(), Global);
@@ -100,11 +101,11 @@ fn parents(lock: &Lock, members: &[String]) -> Vec<Option<usize>, Global> {
     let mut roots: Vec<usize, Global> = Vec::new_in(Global);
     roots.extend((0..lock.packages.len()).filter(|&at| {
         let it = &lock.packages[at];
-        it.source == Source::Path && (members.is_empty() || members.contains(&it.name))
+        it.source == Source::Path && (members.is_empty() || members.iter().any(|m| m.as_str() == it.name.as_str()))
     }));
     roots.sort_by(|a, b| {
         let (a, b) = (&lock.packages[*a], &lock.packages[*b]);
-        (&a.name, &a.version).cmp(&(&b.name, &b.version))
+        (a.name.as_str(), &a.version).cmp(&(b.name.as_str(), &b.version))
     });
     let mut queue: VecDeque<usize, Global> = VecDeque::new_in(Global);
     for root in roots {
@@ -113,7 +114,8 @@ fn parents(lock: &Lock, members: &[String]) -> Vec<Option<usize>, Global> {
     }
     // Bounded: each package enters the queue once.
     while let Some(at) = queue.pop_front() {
-        for &dep in &lock.packages[at].deps {
+        for dep in lock.packages[at].deps.iter() {
+            let dep = dep.index();
             if !seen[dep] {
                 seen[dep] = true;
                 parent[dep] = Some(at);
@@ -124,7 +126,7 @@ fn parents(lock: &Lock, members: &[String]) -> Vec<Option<usize>, Global> {
     parent
 }
 
-fn chain(lock: &Lock, parent: &[Option<usize>], at: usize) -> Vec<String, Global> {
+fn chain(lock: &Lock<'_>, parent: &[Option<usize>], at: usize) -> Vec<String, Global> {
     let mut out = Vec::new_in(Global);
     let mut here = Some(at);
     // Bounded: a parent is set once, from a package already seen, so the chain has no cycle
@@ -149,21 +151,21 @@ pub fn audit(input: Input<'_>) -> Report {
     // The locked package a refusal is about: the least version of that name from that source,
     // so it does not depend on the order of the lock's packages.
     let find = |why: &PinRefused| {
-        let from = |it: &Package| match (why, &it.source) {
+        let from = |it: &Package<'_>| match (why, &it.source) {
             (
                 PinRefused::Missing { url, commit, .. }
                 | PinRefused::Mismatch { url, commit, .. }
                 | PinRefused::Tree { url, commit, .. }
                 | PinRefused::NoCommit { url, commit, .. },
                 Source::Git { url: u, commit: c, .. },
-            ) => u == url && c == commit,
-            (PinRefused::NoChecksum { version, registry, .. }, Source::Registry { url, .. }) => {
-                url == registry && &it.version.to_string() == version
+            ) => u.as_str() == url.as_str() && c.as_str() == commit.as_str(),
+            (PinRefused::NoChecksum { version, registry, .. }, Source::Registry { .. }) => {
+                it.source_text.as_str() == registry.as_str() && &it.version.to_string() == version
             }
             _ => false,
         };
         (0..lock.packages.len())
-            .filter(|&at| lock.packages[at].name == why.package() && from(&lock.packages[at]))
+            .filter(|&at| lock.packages[at].name.as_str() == why.package() && from(&lock.packages[at]))
             .min_by(|a, b| lock.packages[*a].version.cmp(&lock.packages[*b].version))
     };
 
@@ -220,13 +222,15 @@ pub fn audit(input: Input<'_>) -> Report {
         DatabaseInput::Read { path, tree, database } => {
             let mut elsewhere = 0usize;
             for (at, package) in lock.packages.iter().enumerate() {
-                let from_crates_io = matches!(&package.source, Source::Registry { url, .. } if CRATES_IO.contains(&url.as_str()));
+                let from_crates_io = matches!(&package.source, Source::Registry { .. }) && CRATES_IO.contains(&package.source_text.as_str());
                 if !from_crates_io {
                     elsewhere += usize::from(!database.of(&package.name).is_empty() && package.source != Source::Path);
                     continue;
                 }
+                // The advisories' ranges are in `Global`: the lock's version, copied there.
+                let locked = package.version.clone_in(Global);
                 for advisory in database.of(&package.name) {
-                    if !affected(&advisory.patched_reqs, &advisory.unaffected_reqs, &package.version) {
+                    if !affected(&advisory.patched_reqs, &advisory.unaffected_reqs, &locked) {
                         continue;
                     }
                     let (rule, base) = match advisory.informational {
@@ -258,7 +262,7 @@ pub fn audit(input: Input<'_>) -> Report {
                     finding.advisory = Some(advisory.id.clone());
                     finding.title = advisory.title.clone();
                     finding.chain = chain(lock, &parent, at);
-                    if let Some((fixed, compatible)) = fix(&advisory.patched_reqs, &package.version) {
+                    if let Some((fixed, compatible)) = fix(&advisory.patched_reqs, &locked) {
                         finding.compatible = compatible;
                         if compatible {
                             finding.change = Some(match finding.chain.as_slice() {
@@ -327,12 +331,14 @@ pub fn audit(input: Input<'_>) -> Report {
             let mut missing = 0usize;
             let mut first_why = None;
             for (at, package) in lock.packages.iter().enumerate() {
-                let Source::Registry { url, .. } = &package.source else {
+                let Source::Registry { .. } = &package.source else {
                     continue;
                 };
+                // The registry as `Cargo.lock` names it: its `source`, prefix and all.
+                let url = package.source_text.as_str();
                 let said = match index.file(url, &package.name) {
                     None => Yanked::NotChecked("blaze has no index file of it".to_owned()),
-                    Some(bytes) => yanked(&package.name, &package.version, &bytes),
+                    Some(bytes) => yanked(&package.name, &package.version.clone_in(Global), &bytes),
                 };
                 match said {
                     Yanked::No => {}

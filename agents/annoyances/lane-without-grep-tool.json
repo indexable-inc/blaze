@@ -1,0 +1,12 @@
+{
+ "id": "lane-without-grep-tool",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane RE1",
+ "where": "the write-only lane brief (LANES-1810.md: Read, Grep, Glob, Edit, Write only) against the tools the lane was given",
+ "what": "The brief names Grep and Glob, but the lane had neither: searching the tree went through the repl's typed rg and Bun.file reads. That worked, but the brief and the tool list disagree, and a lane that takes the brief at its word looks for a tool it does not have.",
+ "cost": "a few minutes, plus refused repl cells (untyped lambdas, a TS2774 on an optional call) on the first searches",
+ "cause": "the brief lists tools by name and does not say where each one comes from in a given harness",
+ "whys": "the brief was written for one harness's tool set and the lanes run in another",
+ "class": "a brief that names a tool the lane lacks",
+ "fix": "the brief says 'search with rg (the repl's `rg`, or Grep where there is one)' rather than naming one tool"
+}

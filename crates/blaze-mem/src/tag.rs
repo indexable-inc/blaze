@@ -29,10 +29,10 @@
 
 use std::{cell::Cell, fmt, sync::OnceLock};
 
-// `std`'s even under `cfg(blaze_check)`: the counters are process-wide statics every test
+// `core`'s even under `cfg(blaze_check)`: the counters are process-wide statics every test
 // shares, and a model execution restarts a checker atomic from its initial value and writes
 // its own newest value back, which would drop the bytes of regions alive outside the model.
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 /// The subsystem memory is held for.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -146,6 +146,9 @@ impl Tag {
         Tag::ALL.into_iter().find(|tag| tag.name() == name)
     }
 }
+
+// The meter counts frames by a tag's index: every tag has its cell (blaze-meter `TAGS`).
+const _: () = assert!(Tag::COUNT <= blaze_meter::TAGS, "raise blaze-meter's TAGS");
 
 const _: () = {
     let mut i = 0;
@@ -543,6 +546,8 @@ pub fn task_ended(tag: Tag, peak: usize, copied: Copied) {
             it.set(Copied { copies: was.copies + copied.copies, bytes: was.bytes + copied.bytes });
         });
     }
+    // The thread's meter (D169): a task's frame reset, and the most it held, by its tag.
+    blaze_meter::frame_reset(tag.index(), as_u64(peak));
     if peak == 0 {
         return;
     }
@@ -559,6 +564,8 @@ pub fn task_ended(tag: Tag, peak: usize, copied: Copied) {
 const FREES_FOLD_AT: usize = 256 << 10;
 
 pub(crate) fn committed(bytes: usize) {
+    // The thread's meter (D169): pages committed on the thread that asked for them.
+    blaze_meter::add(blaze_meter::Count::Mapped, as_u64(bytes));
     let now = COMMITTED.now.fetch_add(as_u64(bytes), Ordering::Relaxed) + as_u64(bytes);
     raise(&COMMITTED.high_water, now);
 }
@@ -775,6 +782,13 @@ pub fn snapshot() -> Snapshot {
         purged: crate::chunks::cached().cold,
         heap_committed: HEAP_COMMITTED.get().map(|committed| committed()),
     }
+}
+
+/// The most the global heap held of blocks allocated outside any task (of every block where the
+/// global allocator keeps none by tag): [`Snapshot::heap_outside`]'s high water, as each fold
+/// ([`heap_moved`]) left it.
+pub fn heap_outside_high_water() -> u64 {
+    HEAP_OUTSIDE.high_water.load(Ordering::Relaxed)
 }
 
 /// A heap count as held bytes: one below 0 (a free folded in before its allocation) is 0.

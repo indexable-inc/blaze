@@ -13,9 +13,19 @@ repository.workspace = true
 [lib]
 doctest = false
 
+[features]
+# test.md "End state: the search itself" (D95): edge values first and the shapes of lists; off until the harvest.
+edge-first = []
+
 [dependencies]
+# `AString`, `String<A>` and `Alloc`: a drawn name, and the observe block's lines, in the caller's allocator.
+blaze-own.workspace = true
 # `SplitMix64`: a seeded tape is its stream.
 blaze-rng.workspace = true
+
+[dev-dependencies]
+# `Alloc::global()`, which the tests name (blaze-own's `std` feature).
+blaze-own = { workspace = true, features = ["std"] }
 
 [lints]
 workspace = true

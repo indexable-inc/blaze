@@ -83,7 +83,7 @@ and, in a workspace that pins an older release (`[workspace.metadata.blaze] vers
     this workspace pins blaze 0.20261027.2, 8 days behind 0.20261104.3: blaze pin 0.20261104.3
 
 Each is said on every command while it holds, even one release behind. A release that is
-**yanked** (known broken; [release.md](release.md#yanking-a-release) says how a release is
+**yanked** (known broken; [release.md](release.md) says how a release is
 yanked) is said louder, on every command, under CI too, with the reason and what moves off it:
 
     warning: blaze 0.20261101.0 is YANKED: miscompiles drops (#1234)

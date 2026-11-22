@@ -1,0 +1,36 @@
+[package]
+name = "blaze-stage"
+description = "One typed stage protocol for the check engine (docs/v2/plan/design/stage.md): a stage says how its tasks are planned, what one task does and what its record is; a sans-IO driver alone owns the pool's schedule, each task's frame, the phase's arena, the commit, the merge in task order, stop, status, the profile's rows and how a failure reaches the tasks that wait on it"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `Vec` and `Alloc`: the phase's columns and the driver's slots, in the allocator its caller hands in.
+blaze-own.workspace = true
+# `idx` and `len32`: row numbers to indices and back, in place of `as`.
+blaze-int.workspace = true
+# `ContentId` and `Hasher`: a record's key and its digest, in a named domain.
+blaze-ids.workspace = true
+# `ItemKey`: the item a finding's place is relative to (rule 71).
+blaze-id.workspace = true
+# `Stage`: which of the engine's seven stages a protocol instance is (one concept, one home: rule 30).
+blaze-engine.workspace = true
+
+[dev-dependencies]
+# The simulation: generated phases, completion in any order, stops, failing commits, stalls, panics.
+blaze-sim.workspace = true
+# `Root`: each case's phase arena and frames, made at the case's top from the OS, refusing a live
+# block at its drop (law g).
+blaze-mem.workspace = true
+
+[lints]
+workspace = true

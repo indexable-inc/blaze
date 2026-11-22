@@ -1,5 +1,5 @@
 //! [`crate::Effect::Stamp`] and [`crate::Effect::Entries`] on Windows: what a file is now, as
-//! much as a sweep compares (docs/v2/plan/design/restore.md).
+//! much as a sweep compares.
 //!
 //! A name is stamped by a handle that asks for its attributes only, with every opener let in
 //! and a link or junction opened itself: its file index (the NTFS file reference number), its
@@ -9,16 +9,17 @@
 
 use std::{
     io,
-    os::windows::io::{AsRawHandle as _, OwnedHandle},
+    os::windows::io::OwnedHandle,
     path::{Path, PathBuf},
 };
 
-use windows_sys::Win32::{
-    Foundation::{
+use blaze_sys::windows::{
+    Handle,
+    foundation::{
         ERROR_BAD_PATHNAME, ERROR_DIRECTORY, ERROR_FILE_NOT_FOUND, ERROR_INVALID_NAME,
         ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND,
     },
-    Storage::FileSystem::{
+    fs::{
         BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO,
@@ -107,7 +108,7 @@ fn open(wide: &[u16], rights: u32, flags: u32) -> io::Result<OwnedHandle> {
             std::ptr::null(),
             OPEN_EXISTING,
             flags,
-            std::ptr::null_mut(),
+            Handle::NULL,
         )
     })
 }
@@ -131,7 +132,7 @@ fn drive(name: &str) -> Option<(&str, &str)> {
 
 /// The stamp of what `handle` is open on.
 fn stamp_of(handle: &OwnedHandle) -> io::Result<Stamp> {
-    let raw = handle.as_raw_handle();
+    let raw = sys::handle_of(handle);
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: an open handle and room for one `BY_HANDLE_FILE_INFORMATION`.
     sys::check(unsafe { GetFileInformationByHandle(raw, &mut info) })?;
@@ -163,6 +164,9 @@ fn stamp_of(handle: &OwnedHandle) -> io::Result<Stamp> {
         size: u64::from(info.nFileSizeHigh) << 32 | u64::from(info.nFileSizeLow),
         mtime_ns: ns(basic.LastWriteTime),
         ctime_ns: ns(basic.ChangeTime),
+        // 0, as this system's `Meta` (fs.rs `meta_of`: std's stable `Metadata` has no volume
+        // serial): a stamp proves what a stat does, no more and no less.
+        dev: 0,
         mode: mode(basic.FileAttributes, tag.ReparseTag),
     })
 }
@@ -268,6 +272,8 @@ fn entry(bytes: &[u8]) -> Option<(&[u8], Stamp)> {
             size: i64_at(40)? as u64,
             mtime_ns: ns(i64_at(24)?),
             ctime_ns: ns(i64_at(32)?),
+            // As `stamp_of`'s.
+            dev: 0,
             mode: mode(attributes, tag),
         },
     ))
@@ -275,13 +281,13 @@ fn entry(bytes: &[u8]) -> Option<(&[u8], Stamp)> {
 
 /// What is directly in `dir` (named `name` under the root), each with its stamp, sorted by
 /// name; links and junctions are stamped themselves.
-pub(crate) fn entries(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, Stamp)>> {
+pub(crate) fn entries(dir: &Path, name: &crate::DirName) -> io::Result<crate::Listing> {
     thread_local! {
         // alloc: once per thread, the buffer every listing on it fills.
         static BUFFER: std::cell::RefCell<Box<[u64]>> = std::cell::RefCell::new(vec![0u64; LISTING / 8].into_boxed_slice());
     }
     let root;
-    let dir = match drive(name.as_str()) {
+    let dir = match name.name().and_then(|name| drive(name.as_str())) {
         Some((drive, "")) => {
             root = PathBuf::from(format!("{drive}\\"));
             &root
@@ -291,33 +297,31 @@ pub(crate) fn entries(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, 
     BUFFER.with_borrow_mut(|buffer| list(dir, name, buffer))
 }
 
-fn list(dir: &Path, name: &FileName, buffer: &mut [u64]) -> io::Result<Vec<(FileName, Stamp)>> {
+fn list(dir: &Path, name: &crate::DirName, buffer: &mut [u64]) -> io::Result<crate::Listing> {
     // alloc: an error path.
     let named =
         |error: io::Error| io::Error::new(error.kind(), format!("{}: {error}", dir.display()));
     let wide = sys::path(dir).map_err(named)?;
     let handle = open(&wide, FILE_LIST_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS).map_err(named)?;
     let mut class = FileIdBothDirectoryRestartInfo;
-    // alloc: the entries the listing answers with, once per listing.
-    let mut found = Vec::new();
-    let mut text = String::with_capacity(name.as_str().len() + 256);
+    // clone: the listing's directory, a refcount.
+    let mut found = crate::ListingBuilder::new(name.clone());
+    // alloc: once per listing, the name an entry's UTF-16 is decoded into.
+    let mut text = String::with_capacity(256);
     loop {
         // SAFETY: an open directory handle and a buffer of the length given, 8-aligned as the
         // class's entries are.
         let ok = unsafe {
             GetFileInformationByHandleEx(
-                handle.as_raw_handle(),
+                sys::handle_of(&handle),
                 class,
                 buffer.as_mut_ptr().cast(),
                 LISTING as u32,
             )
         };
-        if ok == 0 {
+        if !ok.is_true() {
             return match sys::last() {
-                ERROR_NO_MORE_FILES => {
-                    found.sort_unstable_by(|a: &(FileName, Stamp), b| a.0.cmp(&b.0));
-                    Ok(found)
-                }
+                ERROR_NO_MORE_FILES => Ok(found.finish()?),
                 _ => Err(named(io::Error::last_os_error())),
             };
         }
@@ -337,9 +341,6 @@ fn list(dir: &Path, name: &FileName, buffer: &mut [u64]) -> io::Result<Vec<(File
             let next = word::<4>(rest, 0).map(u32::from_le_bytes).ok_or_else(malformed)? as usize;
             let units = leaf.chunks_exact(2).map(|it| u16::from_le_bytes([it[0], it[1]]));
             text.clear();
-            text.push_str(name.as_str());
-            text.push('/');
-            let start = text.len();
             for unit in char::decode_utf16(units) {
                 let Ok(unit) = unit else {
                     return Err(named(io::Error::new(
@@ -349,13 +350,8 @@ fn list(dir: &Path, name: &FileName, buffer: &mut [u64]) -> io::Result<Vec<(File
                 };
                 text.push(unit);
             }
-            if !matches!(&text[start..], "." | "..") {
-                let file = FileName::new(&text).ok_or_else(|| {
-                    // alloc: an error path.
-                    named(io::Error::new(io::ErrorKind::InvalidData, format!("{text}: not a name")))
-                })?;
-                found.push((file, stamp));
-            }
+            // `.` and `..` are left out by the listing's own rule.
+            found.push(text.as_bytes(), stamp)?;
             if next == 0 {
                 break;
             }
@@ -390,7 +386,7 @@ mod tests {
         assert_eq!(name, "lib.rs".encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>());
         assert_eq!(
             stamp,
-            Stamp { ino: 42, size: 7, mtime_ns: 3000, ctime_ns: 4000, mode: 0o100444 }
+            Stamp { ino: 42, size: 7, mtime_ns: 3000, ctime_ns: 4000, dev: 0, mode: 0o100444 }
         );
         assert_eq!(entry(&bytes[..bytes.len() - 1]), None);
     }

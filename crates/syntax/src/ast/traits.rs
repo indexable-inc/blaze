@@ -1,7 +1,7 @@
 //! Various traits that are implemented by ast nodes.
 //!
 //! The implementations are usually trivial, and live in generated.rs
-use either::Either;
+use stdx::Either;
 
 use crate::{
     SyntaxKind, SyntaxNode, SyntaxToken, T,

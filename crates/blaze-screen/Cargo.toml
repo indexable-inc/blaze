@@ -19,11 +19,11 @@ blaze-protocol.workspace = true
 # What the terminal does (`terminal::Terminal`), for the encoder.
 blaze-report.workspace = true
 serde = { workspace = true, features = ["derive"] }
-unicode-width.workspace = true
+blaze-unicode.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true
-expect-test.workspace = true
+test-utils.workspace = true
 serde_json.workspace = true
 
 [lints]

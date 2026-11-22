@@ -1,0 +1,25 @@
+[package]
+name = "blaze-lex"
+description = "The first stage at the speed of the vector unit: byte classes by nibble tables, rustc_lexer's exact tokens, a fn-body skipper that does not tokenize, and UTF-8 validation (Keiser-Lemire), in core::simd."
+publish = false
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-int.workspace = true
+blaze-memchr.workspace = true
+blaze-unicode.workspace = true
+
+[dev-dependencies]
+blaze-sim.workspace = true
+rustc_lexer.workspace = true
+
+[lints]
+workspace = true

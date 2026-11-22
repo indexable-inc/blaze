@@ -179,8 +179,7 @@ The daemon image's references are checked as it opens: a checksum-valid record t
 what the image lacks is `DbError::Dangling`, the start is refused naming the file, and nothing
 of it is used. The engine's "an ID this database never gave" panic names the file, layout and
 hash the process restored from. `blaze doctor [--json]` runs the same checks on the files with
-no daemon, prints the command that sets the state aside whole, and deletes nothing. Spec:
-[restore.md](restore.md). The cause of 2026-11-10's forged key was not found.
+no daemon, prints the command that sets the state aside whole, and deletes nothing. The cause of 2026-11-10's forged key was not found.
 
 ## j. `blaze why` never guesses (built: 45ffd373db; the cap's accounting fixed by 2449b43295)
 

@@ -1,0 +1,4 @@
+# The programs tests/command_rungs.rs requires to PASS through the real `blaze` command, one
+# name a line, as the test prints it. A name covers its `(check)` line too. This list only
+# grows: a name is added when its program passes, and never taken out.
+hello-blaze

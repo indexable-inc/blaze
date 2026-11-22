@@ -2,7 +2,7 @@
 
 use std::{cmp::Ordering, ops::Range};
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::radix;
 use std::alloc::Global;
 use stdx::format_to;
@@ -96,7 +96,8 @@ impl EditPlan {
         }
 
         let mut entries = vec![PlanEntry::default(); changes.len()];
-        let mut regions_by_tree = HashMap::<SyntaxNode, Vec<ChangedRegion>, Global>::default();
+        let mut regions_by_tree: Map<SyntaxNode, Vec<ChangedRegion>, FixedState, Global> =
+            Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
 
         for (index, change) in changes.iter().enumerate() {
             let target_tree = change.target_parent().tree_top();
@@ -209,7 +210,8 @@ impl EditPlan {
         changes: &[Change],
         mut node_depth: impl FnMut(SyntaxNode) -> usize,
     ) -> bool {
-        let mut previous = HashMap::<(SyntaxNode, usize), TextRange, Global>::default();
+        let mut previous: Map<(SyntaxNode, usize), TextRange, FixedState, Global> =
+            Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for change in changes {
             if !matches!(change.change_kind(), ChangeKind::Replace | ChangeKind::ReplaceRange) {
                 continue;
@@ -540,7 +542,7 @@ struct PreparedElement {
 
 /// Owns all evolving trees involved in executing an edit plan.
 struct TreeStore {
-    states: HashMap<SyntaxNode, TreeState, Global>,
+    states: Map<SyntaxNode, TreeState, FixedState, Global>,
 }
 
 impl TreeStore {
@@ -549,7 +551,8 @@ impl TreeStore {
         annotations: Vec<(SyntaxElement, SyntaxAnnotation)>,
         mappings: &SyntaxMapping,
     ) -> Self {
-        let mut states = HashMap::<SyntaxNode, TreeState, Global>::default();
+        let mut states: Map<SyntaxNode, TreeState, FixedState, Global> =
+            Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for (order, (element, annotation)) in annotations.into_iter().enumerate() {
             let element = mappings.upmap_element(&element);
             let tree = element.tree_top();
@@ -634,8 +637,8 @@ impl TreeStore {
             u32::from(element.text_range().start())
         });
 
-        let mut annotations =
-            HashMap::<SyntaxAnnotation, Vec<(usize, SyntaxElement)>, Global>::default();
+        let mut annotations: Map<SyntaxAnnotation, Vec<(usize, SyntaxElement)>, FixedState, Global> =
+            Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for annotation in state.annotations {
             if let Some(element) = annotation.path.resolve(&new_root) {
                 annotations
@@ -662,7 +665,8 @@ impl TreeStore {
 pub(super) fn apply_edits(editor: SyntaxEditor) -> SyntaxEdit {
     let SyntaxEditor { root, changes, annotations, make } = editor;
     let mappings = make.take();
-    let mut node_depths = HashMap::<SyntaxNode, usize, Global>::default();
+    let mut node_depths: Map<SyntaxNode, usize, FixedState, Global> =
+        Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     let mut node_depth = |node: SyntaxNode| {
         *node_depths.entry(node).or_insert_with_key(|node| node.ancestors().count())
     };
@@ -674,7 +678,7 @@ pub(super) fn apply_edits(editor: SyntaxEditor) -> SyntaxEdit {
             return SyntaxEdit {
                 old_root: root.clone(),
                 new_root: root,
-                annotations: HashMap::new_in(Global),
+                annotations: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
                 changed_elements: Vec::new(),
             };
         }

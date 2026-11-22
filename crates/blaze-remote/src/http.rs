@@ -13,8 +13,10 @@
 //! - No header, address with a query, or body is ever logged or put in a reply: a failure says
 //!   the object, the status and the client's kind of error.
 //!
-//! The wait for answers ([`Bucket::wait`]) parks in `blaze_http::mailbox::block_on`, named
-//! (every-wait-says-what), and is bounded by the asks' deadlines.
+//! The wait for answers ([`Bucket::wait`]) is one timed receive, `blaze_http::mailbox::answer`,
+//! named (every-wait-says-what) and bounded by the earliest deadline in flight plus
+//! [`ANSWER_SLACK`]: the driver answers every ask by its deadline, so a wait past that is the
+//! driver's failure, and every ask in flight is answered with it.
 
 use std::{
     alloc::Global,
@@ -23,10 +25,11 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use blaze_core::chan::{self, Receiver, Sender};
 use blaze_http::{
-    Client, Config, Request,
+    Client, Config, Method, Range, Request,
     driver::{Fetched, Handle},
-    mailbox::{self, Rx, Tx},
+    mailbox,
 };
 
 use crate::{
@@ -38,6 +41,10 @@ use crate::{
 
 /// The most bytes an S3 answer that is not an object may be (XML of a multipart upload).
 pub const XML_MOST: u64 = 1 << 20;
+
+/// How long past the earliest deadline in flight [`Bucket::wait`] waits for the driver's
+/// answer: the driver's clock and this one read the same time apart by at most this.
+pub const ANSWER_SLACK: Duration = Duration::from_secs(1);
 
 /// Where requests go and with what.
 #[derive(Clone, Debug)]
@@ -79,12 +86,12 @@ pub fn request(access: &Access, op: Op, unix_s: u64) -> Result<(Request, Want), 
     let anonymous = anonymous(&op);
     if anonymous && let Some(public_url) = &access.public_url {
         let url = s3::public(public_url, op.name());
-        let (method, want, most, headers) = match op {
-            Op::Get { range: Some((at, len)), most, .. } => (http::Method::GET, Want::Get { ranged: true }, most.min(len), vec![("range".to_owned(), format!("bytes={at}-{}", at + len.max(1) - 1))]),
-            Op::Get { most, .. } => (http::Method::GET, Want::Get { ranged: false }, most, Vec::new()),
-            _ => (http::Method::HEAD, Want::Head, 0, Vec::new()),
+        let (method, want, most, range) = match op {
+            Op::Get { range: Some((at, len)), most, .. } => (Method::Get, Want::Get { ranged: true }, most.min(len), Some(range_of(at, len))),
+            Op::Get { most, .. } => (Method::Get, Want::Get { ranged: false }, most, None),
+            _ => (Method::Head, Want::Head, 0, None),
         };
-        return Ok((Request { method, url, headers, body: Vec::new(), gzip: false, most, https_only: true }, want));
+        return Ok((Request { method, url, headers: Vec::new(), body: Vec::new(), gzip: false, most, https_only: true, range }, want));
     }
     let (Some(endpoint), Some(bucket), Some(credentials)) = (&access.endpoint, &access.bucket, &access.credentials) else {
         let mut missing = Vec::new();
@@ -104,27 +111,42 @@ pub fn request(access: &Access, op: Op, unix_s: u64) -> Result<(Request, Want), 
     };
     let name = op.name().to_owned();
     let sign = |method: &str, query: &[(&str, &str)], extra: &[(&str, String)], body: &[u8]| s3::sign(method, endpoint, bucket, &name, query, extra, body, credentials, unix_s);
+    let op_range = match &op {
+        Op::Get { range, .. } => *range,
+        _ => None,
+    };
     let (method, want, most, signed, body) = match op {
         Op::Get { range, most, .. } => {
             let extra: Vec<(&str, String)> = range.map(|(at, len)| ("range", format!("bytes={at}-{}", at + len.max(1) - 1))).into_iter().collect();
             let most = range.map_or(most, |(_, len)| most.min(len));
-            (http::Method::GET, Want::Get { ranged: range.is_some() }, most, sign("GET", &[], &extra, b""), Vec::new())
+            (Method::Get, Want::Get { ranged: range.is_some() }, most, sign("GET", &[], &extra, b""), Vec::new())
         }
-        Op::Head { .. } => (http::Method::HEAD, Want::Head, 0, sign("HEAD", &[], &[], b""), Vec::new()),
-        Op::Put { bytes, cond, .. } => (http::Method::PUT, Want::Put, XML_MOST, sign("PUT", &[], &cond_header(&cond), &bytes), bytes),
-        Op::Begin { .. } => (http::Method::POST, Want::Begin, XML_MOST, sign("POST", &[("uploads", "")], &[], b""), Vec::new()),
+        Op::Head { .. } => (Method::Head, Want::Head, 0, sign("HEAD", &[], &[], b""), Vec::new()),
+        Op::Put { bytes, cond, .. } => (Method::Put, Want::Put, XML_MOST, sign("PUT", &[], &cond_header(&cond), &bytes), bytes),
+        Op::Begin { .. } => (Method::Post, Want::Begin, XML_MOST, sign("POST", &[("uploads", "")], &[], b""), Vec::new()),
         Op::Part { upload, number, bytes, .. } => {
             let number = number.to_string();
-            (http::Method::PUT, Want::Part, XML_MOST, sign("PUT", &[("partNumber", number.as_str()), ("uploadId", upload.as_str())], &[], &bytes), bytes)
+            (Method::Put, Want::Part, XML_MOST, sign("PUT", &[("partNumber", number.as_str()), ("uploadId", upload.as_str())], &[], &bytes), bytes)
         }
         Op::Finish { upload, parts, cond, .. } => {
             let body = s3::complete_body(&parts);
-            (http::Method::POST, Want::Finish, XML_MOST, sign("POST", &[("uploadId", upload.as_str())],&cond_header(&cond), &body), body)
+            (Method::Post, Want::Finish, XML_MOST, sign("POST", &[("uploadId", upload.as_str())],&cond_header(&cond), &body), body)
         }
     };
-    // The client sends its own host header; the signed one is the same value.
-    let headers = signed.headers.into_iter().filter(|(k, _)| k != "host").collect();
-    Ok((Request { method, url: signed.url, headers, body, gzip: false, most, https_only: true }, want))
+    // The client writes `Host` and `Range` itself, from the URL and the typed range; the signed
+    // values are the same bytes (`bytes=a-b`), so the signature holds.
+    let range = match op_range {
+        Some((at, len)) => Some(range_of(at, len)),
+        None => None,
+    };
+    let headers = signed.headers.into_iter().filter(|(k, _)| k != "host" && k != "range").collect();
+    Ok((Request { method, url: signed.url, headers, body, gzip: false, most, https_only: true, range }, want))
+}
+
+/// The inclusive byte range `len` bytes from `at` covers, as the client writes it (`bytes=a-b`);
+/// one byte at least.
+fn range_of(at: u64, len: u64) -> Range {
+    Range { first: at, last: Some(at + len.max(1) - 1) }
 }
 
 fn header<'h>(headers: &'h [(String, String)], name: &str) -> Option<&'h str> {
@@ -170,10 +192,11 @@ pub struct HttpBucket {
     access: Arc<Access, Global>,
     start: Instant,
     /// Where the driver hands each ask's answer, by its key.
-    to_us: Tx<(u64, Fetched)>,
-    answers: Rx<(u64, Fetched)>,
-    /// Each ask in flight in the driver, by its key: its ticket, its object and how to read it.
-    asked: BTreeMap<u64, (Ticket, String, Want), Global>,
+    to_us: Sender<(u64, Fetched)>,
+    answers: Receiver<(u64, Fetched)>,
+    /// Each ask in flight in the driver, by its key: its ticket, its object, how to read it
+    /// and its deadline (ms on [`Bucket::now_ms`]'s clock).
+    asked: BTreeMap<u64, (Ticket, String, Want, u64), Global>,
     next_key: u64,
     /// Replies made without asking (a request that could not be made), for the next wait.
     ready: Vec<(Ticket, Reply), Global>,
@@ -196,11 +219,13 @@ impl HttpBucket {
             });
         }
         let access = Access { endpoint: bucket.endpoint.clone(), bucket: bucket.name.clone(), public_url: bucket.public_url.clone(), credentials: settings.credentials.clone() };
-        let tls = blaze_http::roots::native().map_err(|e| Failure::Misused(format!("the machine's TLS roots: {e}")))?;
+        let (cert_file, cert_dir) = (std::env::var_os("SSL_CERT_FILE"), std::env::var_os("SSL_CERT_DIR"));
+        let places = blaze_http::roots::Places { cert_file: cert_file.as_deref(), cert_dir: cert_dir.as_deref() };
+        let tls = blaze_http::roots::system(places).map_err(|e| Failure::Misused(format!("the machine's TLS roots: {e}")))?;
         let proxies = blaze_http::proxy_env::from_env().map_err(|e| Failure::Misused(format!("the proxy settings: {e}")))?;
         let config = Config { idle_most: crate::push::IN_FLIGHT, proxies, redirects: 0, ..Config::new(tls, "blaze (https://github.com/indexable-inc/blaze)", Duration::from_secs(30)) };
         let http = Handle::spawn(Client::new(config), crate::push::IN_FLIGHT).map_err(|e| Failure::Misused(format!("starting the cache's HTTP driver: {e}")))?;
-        let (to_us, answers) = mailbox::channel(None);
+        let (to_us, answers) = chan::unbounded();
         Ok(HttpBucket {
             http,
             access: Arc::new_in(access, Global),
@@ -234,7 +259,7 @@ impl Bucket for HttpBucket {
                 Ok((req, want)) => {
                     let key = self.next_key;
                     self.next_key += 1;
-                    self.asked.insert(key, (ticket, object, want));
+                    self.asked.insert(key, (ticket, object, want, deadline_ms));
                     let allowed = Duration::from_millis(deadline_ms.saturating_sub(now));
                     self.http.fetch(req, allowed, key, &self.to_us);
                 }
@@ -251,13 +276,17 @@ impl Bucket for HttpBucket {
         if self.in_flight == 0 {
             return out;
         }
-        if self.ready.is_empty() {
-            // Bounded: the driver answers every ask by its deadline, on its clock. This holds
-            // a sender, so `None` (every sender gone) cannot come while it lives.
-            match mailbox::block_on("the cache's HTTP answers", None, self.answers.recv()) {
+        // `in_flight` counts the ready replies too: with none ready, an ask is in the driver.
+        if self.ready.is_empty()
+            && let Some(earliest) = self.asked.values().map(|(_, _, _, deadline_ms)| *deadline_ms).min()
+        {
+            // The driver answers every ask by its deadline, on its clock. This holds a sender,
+            // so `None` (every sender gone) cannot come while it lives.
+            let within = Duration::from_millis(earliest.saturating_sub(self.now_ms())) + ANSWER_SLACK;
+            match mailbox::answer("the cache's HTTP answers", &self.answers, within) {
                 Ok(Some((key, answer))) => self.answered(key, answer, &mut out),
                 Ok(None) => self.fail_all("the HTTP driver ended", &mut out),
-                Err(blocked) => self.fail_all(&format!("waiting for the HTTP driver: {blocked}"), &mut out),
+                Err(unanswered) => self.fail_all(&format!("waiting for the HTTP driver: {unanswered}"), &mut out),
             }
         }
         self.taken(&mut out);
@@ -273,9 +302,8 @@ impl HttpBucket {
     /// Adds every answer ready to `out`, and counts what `out` holds as taken.
     fn taken(&mut self, out: &mut Vec<(Ticket, Reply)>) {
         out.append(&mut self.ready);
-        // `Err` is every sender gone, which cannot be while this holds one; `Ok(None)` is
-        // nothing more ready.
-        while let Ok(Some((key, answer))) = self.answers.try_recv() {
+        // `Err` is nothing more ready (every sender gone cannot be while this holds one).
+        while let Ok((key, answer)) = self.answers.try_recv() {
             self.answered(key, answer, out);
         }
         self.in_flight -= out.len();
@@ -290,7 +318,7 @@ impl HttpBucket {
 impl HttpBucket {
     /// The reply to the ask `key`.
     fn answered(&mut self, key: u64, answer: Fetched, out: &mut Vec<(Ticket, Reply)>) {
-        let Some((ticket, object, want)) = self.asked.remove(&key) else {
+        let Some((ticket, object, want, _)) = self.asked.remove(&key) else {
             panic!("blaze-remote's HTTP bucket: the driver answered key {key}, which names no ask in flight")
         };
         out.push((ticket, fetched(&object, want, answer)));
@@ -298,7 +326,7 @@ impl HttpBucket {
 
     /// Every ask in flight answered [`Reply::Failed`] with `why`: the driver can answer none.
     fn fail_all(&mut self, why: &str, out: &mut Vec<(Ticket, Reply)>) {
-        for (_, (ticket, object, _)) in std::mem::take(&mut self.asked) {
+        for (_, (ticket, object, _, _)) in std::mem::take(&mut self.asked) {
             out.push((ticket, Reply::Failed { why: format!("{object}: {why}") }));
         }
     }

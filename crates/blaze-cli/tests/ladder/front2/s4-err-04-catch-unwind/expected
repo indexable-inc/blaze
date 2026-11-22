@@ -1,0 +1,11 @@
+status 0
+stdout
+guard inner dropped
+caught: Some("boom")
+Some("bad value 7") None
+Ok(42)
+true
+Some(17)
+inner caught: true
+Ok(5)
+done

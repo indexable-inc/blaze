@@ -20,8 +20,11 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use blaze_launch::{Frame, FrameKind, Slot, Thread};
-use crossbeam_queue::SegQueue;
+use blaze_queue::SegQueue;
 
+use blaze_core::wait::{Clock, Deadline, Monotonic};
+
+use crate::stub_wait::{self, Answer, Waiters};
 use crate::{arch, sys};
 
 /// What a thread tells the core.
@@ -38,8 +41,9 @@ pub enum Told {
 #[derive(Debug)]
 pub enum Event {
     Thread(Told),
-    /// A stub fired: `thread` waits on `reply` for `slot`'s code.
-    Need { slot: Slot, thread: Thread, reply: Arc<sys::Handoff<Bound>> },
+    /// A stub fired: `thread` waits in row `row` of the stub waiters for `slot`'s code, and
+    /// is answered once, through `Waiters::answer` (stub_wait.rs).
+    Need { slot: Slot, thread: Thread, row: u32 },
     /// One frame's item from the daemon.
     Frame(Vec<u8>),
     /// The daemon's socket ended, and why.
@@ -48,16 +52,6 @@ pub enum Event {
     Stop,
 }
 
-/// The answer a stub waits for.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Bound {
-    /// The slot's word names code: call through it.
-    Code,
-    /// The function does not compile: the program stops with the daemon's diagnostic.
-    Refused(String),
-    /// No code can come: the daemon is gone or the control thread failed, and why.
-    Lost(String),
-}
 
 /// The words, the epoch and the queue of one launcher.
 pub struct Shared {
@@ -79,12 +73,19 @@ pub struct Shared {
     stubs: usize,
     /// The address of slot 0's entry thunk.
     thunks: usize,
-    /// What threads say to the control thread, in the order they said it, and the bell that
-    /// wakes it. A queue and a pthread condition variable, not a channel: a program thread
-    /// says things here at any point of its life, its end included (`sys::Handoff` says
-    /// why that rules a channel out).
-    queue: SegQueue<Event>,
-    bell: sys::Handoff<()>,
+    /// What threads say to the control thread, in the order they said it. A queue, not a
+    /// channel: a program thread says things here at any point of its life, its end included
+    /// (`sys::Handoff` says why that rules a channel out). A stub's need is not here: it is a
+    /// row of `waiters`, which allocates nothing.
+    queue: SegQueue<Event, std::alloc::Global>,
+    /// The control thread's bell: a counter each [`Shared::ring`] adds one to and wakes
+    /// (`blaze_core::wait::wake_shared`), which the control thread sleeps on in
+    /// [`Shared::wait`]. One word for the queue and the waiters' ring alike, so a stub (which
+    /// may run in a signal handler) rings it with an atomic add and a kernel wake: no lock,
+    /// no allocation.
+    bell: AtomicU64,
+    /// The rows stubs wait in, reserved at the start (stub_wait.rs, THREADS.md D6).
+    pub(crate) waiters: Waiters,
     /// The process the launcher was made in: a forked child of it has these words and no
     /// control thread.
     pid: u32,
@@ -99,12 +100,14 @@ impl Shared {
     /// `table` is the address of `slots` words, `stubs` that of the stub region's head and
     /// `thunks` that of slot 0's entry thunk, all in a `sys::Code` mapping (which is never
     /// unmapped); `area` is the code area's addresses.
+    /// `waiters` are the rows a stub waits in (`Waiters::reserve`).
     pub(crate) fn new(
         slots: u32,
         table: usize,
         stubs: usize,
         thunks: usize,
         area: Range<usize>,
+        waiters: Waiters,
     ) -> Shared {
         Shared {
             table,
@@ -116,7 +119,8 @@ impl Shared {
             stubs,
             thunks,
             queue: SegQueue::new(),
-            bell: sys::Handoff::new(),
+            bell: AtomicU64::new(0),
+            waiters,
             pid: std::process::id(),
         }
     }
@@ -160,7 +164,7 @@ impl Shared {
     /// Puts `event` on the control thread's queue and rings its bell.
     pub(crate) fn send(&self, event: Event) {
         self.queue.push(event);
-        self.bell.put(());
+        self.ring();
     }
 
     /// Puts `event` on the queue without ringing: for a run of events one [`Shared::ring`]
@@ -170,26 +174,52 @@ impl Shared {
         self.queue.push(event);
     }
 
-    /// Rings the control thread's bell for what [`Shared::push`] queued.
+    /// Rings the control thread's bell: for what [`Shared::push`] queued, and for a row a stub
+    /// pushed onto the waiters' ring. An atomic add and a kernel wake: what a stub in a signal
+    /// handler may call.
     pub(crate) fn ring(&self) {
-        self.bell.put(());
+        // Release: what was pushed before is seen by the control thread's acquire of the bell.
+        self.bell.fetch_add(1, Ordering::Release);
+        blaze_core::wait::wake_shared(&self.bell);
     }
 
-    /// The next event, when one is there.
+    /// The next event, when one is there: the queue first (a thread's birth before its need),
+    /// then a row a stub pushed onto the waiters' ring.
     pub(crate) fn next(&self) -> Option<Event> {
-        self.queue.pop()
+        if let Some(event) = self.queue.pop() {
+            return Some(event);
+        }
+        self.waiters.popped().map(|it| Event::Need { slot: Slot(it.slot), thread: Thread(it.thread), row: it.row })
     }
+
+    /// How long the control thread sleeps before it looks again with nothing rung: a look,
+    /// not a retry (an idle launcher waits as long as its program runs).
+    const IDLE_LOOK: core::time::Duration = core::time::Duration::from_secs(60);
 
     /// Waits for the next event: the control thread's one wait while it has nothing to do.
     pub(crate) fn wait(&self) -> Event {
+        let clock = Monotonic::new();
         loop {
-            if let Some(event) = self.queue.pop() {
+            // The bell is read before the look: a ring after this load changes the word, so
+            // the kernel's wait below returns at once rather than sleep past it.
+            let rung = self.bell.load(Ordering::Acquire);
+            if let Some(event) = self.next() {
                 return event;
             }
-            // The wait: for a thread to say something (a report, a stub's need, a frame of
-            // the daemon's, the word to stop). It has no bound: an idle launcher waits as
-            // long as its program runs.
-            self.bell.take();
+            // The wait: for a thread to say something (a report, a stub's row, a frame of the
+            // daemon's, the word to stop), to a look every `IDLE_LOOK`. The kernel compares
+            // the bell's low half with `rung` as it blocks.
+            let deadline = Deadline::after(clock.now(), Self::IDLE_LOOK);
+            let waited = blaze_core::wait::wait_shared(
+                "the launcher's control thread: its next event (table::Shared::wait)",
+                &self.bell,
+                rung as u32,
+                deadline,
+                &clock,
+            );
+            if let Err(why) = waited {
+                stop_control(&why);
+            }
         }
     }
 
@@ -360,25 +390,31 @@ pub(crate) extern "C" fn resolve(stub: usize, context: *const c_void) -> *const 
         // A forked child of a threaded process may hold any lock another thread held at the
         // fork, so it says this with one `write` and ends with `_exit`, as a signal handler
         // would.
-        // SAFETY: a write of a live constant to descriptor 2, then the process's end.
-        unsafe {
-            libc::write(2, WHY.as_ptr().cast(), WHY.len());
-            libc::_exit(127)
-        }
+        let _ = blaze_sys::posix::io::write(blaze_sys::Fd::STDERR, WHY);
+        blaze_sys::posix::signal::exit_now(127)
     }
     // Nothing below may need a thread-local of the launcher's: a stub can fire while its
-    // thread is ending, after they are gone (`sys::Handoff`).
-    let reply = Arc::new(sys::Handoff::new());
+    // thread is ending, after they are gone (`sys::Handoff`). And nothing below allocates
+    // or takes a lock but the safepoint's report: a stub can fire inside a signal handler
+    // (THREADS.md D6, stub_wait.rs).
     let thread = Thread(CURRENT.try_with(Cell::get).unwrap_or(0));
-    shared.send(Event::Need { slot: Slot(slot as u32), thread, reply: Arc::clone(&reply) });
-    // The wait: this thread, for the control thread's answer about `slot`. It has no clock:
-    // it ends when the daemon answers the need (code, or a refusal) or its socket closes,
-    // each of which the control thread turns into an answer here.
-    // The wait: this thread, for the control thread's answer about `slot`. It has no clock:
-    // it ends when the daemon answers the need (code, or a refusal) or its socket closes,
-    // each of which the control thread turns into an answer here.
-    match reply.take() {
-        Bound::Code => {
+    let row = match shared.waiters.claim(slot as u32, thread.0) {
+        Ok(row) => row,
+        Err(full) => full.stop(),
+    };
+    shared.ring();
+    // The wait: this thread, for the control thread's answer about `slot`, to the stub bound
+    // (rule 18): the control thread answers every row it pops, with code, a refusal or why
+    // none can come; past the bound the process stops, naming the slot.
+    let clock = Monotonic::new();
+    let deadline = Deadline::after(clock.now(), stub_wait::STUB_BOUND);
+    let answer = match shared.waiters.wait(row, deadline, &clock) {
+        Ok(answer) => answer,
+        Err(overran) => overran.stop(),
+    };
+    shared.waiters.release(row);
+    match answer {
+        Answer::Bound => {
             // The resolver's exit is a safepoint (launcher.md, section 1): a thread that
             // began as a mutator reports its stack here while a batch waits.
             if thread.0 != 0 && shared.waiting.load(Ordering::Relaxed) != 0 {
@@ -390,17 +426,30 @@ pub(crate) extern "C" fn resolve(stub: usize, context: *const c_void) -> *const 
             }
             word as *const usize
         }
-        Bound::Refused(diagnostic) => stop(slot, &diagnostic),
-        Bound::Lost(why) => stop(slot, &why),
+        // The control thread said why (`stub_wait::say_no_code`) before it answered.
+        Answer::Refused | Answer::Lost => stub_wait::stop_said(),
     }
 }
 
-/// Stops the process: slot `slot` was called and has no code, for `why`.
+/// Stops the process: slot `slot` was called and has no code, for `why`. One `write` and
+/// `_exit`, as a stub in a signal handler may (`stub_wait::Line`).
 fn stop(slot: usize, why: &str) -> ! {
+    stub_wait::Line::new()
+        .text("blaze: the function of slot ")
+        .number(slot as u64)
+        .text(" was called and has no code: ")
+        .text(why)
+        .text("\n")
+        .stop()
+}
+
+/// The control thread's kernel wait failed: no stub could be answered any more, so the
+/// process stops, naming the wait (rule 18). The control thread is no signal handler.
+fn stop_control(why: &blaze_core::wait::WaitError) -> ! {
     use std::io::Write;
 
     let mut to = std::io::stderr().lock();
     // The process ends below whether or not its last words could be written.
-    drop(writeln!(to, "blaze: the function of slot {slot} was called and has no code: {why}"));
+    drop(writeln!(to, "blaze: the launcher's control thread could not wait for its next event: {why}"));
     std::process::exit(101)
 }

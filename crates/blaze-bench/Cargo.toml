@@ -19,8 +19,9 @@ blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
 blaze-memo.workspace = true
+blaze-own = { workspace = true, features = ["std", "testing"] }
 blaze-profile.workspace = true
-tracing.workspace = true
+blaze-trace.workspace = true
 
 [[bench]]
 name = "store"

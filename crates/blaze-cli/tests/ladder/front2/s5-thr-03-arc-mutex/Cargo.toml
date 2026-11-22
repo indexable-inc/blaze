@@ -1,0 +1,4 @@
+[package]
+name = "ladder-s5-thr-03-arc-mutex"
+version = "0.1.0"
+edition = "2024"

@@ -8,7 +8,9 @@
 //! Plant: [`Plant::JoinDropsFailure`], a join that says the scope went well though a task
 //! failed.
 
-use std::{cell::RefCell, time::Duration};
+use std::time::Duration;
+
+use blaze_core::lock::Lock;
 
 use blaze_sim::{Config, Tape};
 
@@ -67,20 +69,21 @@ enum Did {
 }
 
 /// Each task's start and end, recorded as they happen; an end is recorded by a guard, so a
-/// panic records one too.
+/// panic records one too. Behind locks: a task's closure is `Send`, and under `Threads` runs on
+/// a worker.
 struct Log {
-    started: RefCell<Vec<usize>>,
-    ended: RefCell<Vec<usize>>,
-    did: RefCell<Vec<(usize, Did)>>,
+    started: Lock<Vec<usize>>,
+    ended: Lock<Vec<usize>>,
+    did: Lock<Vec<(usize, Did)>>,
 }
 
 struct Ends<'a>(&'a Log, usize);
 
 impl Drop for Ends<'_> {
     fn drop(&mut self) {
-        self.0.ended.borrow_mut().push(self.1);
+        self.0.ended.lock().push(self.1);
         if std::thread::panicking() {
-            self.0.did.borrow_mut().push((self.1, Did::Panicked));
+            self.0.did.lock().push((self.1, Did::Panicked));
         }
     }
 }
@@ -130,7 +133,11 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
 /// The plan's scope over `file`, and the oracle on it. A scope is linear, so nothing here
 /// returns while it is live: what is wrong is kept in `wrong` and returned after its join.
 fn scoped(plan: &Plan, io: &Io, cx: &Cx, clock: &Clock, file: &File<ReadWrite>) -> Result<(), String> {
-    let log = Log { started: RefCell::new(Vec::new()), ended: RefCell::new(Vec::new()), did: RefCell::new(Vec::new()) };
+    let log = Log {
+        started: Lock::new("test.started", Vec::new()),
+        ended: Lock::new("test.ended", Vec::new()),
+        did: Lock::new("test.did", Vec::new()),
+    };
     let mut wrong: Vec<String> = Vec::new();
     let scope = cx.scope();
     for (at, &kind) in plan.tasks.iter().enumerate() {
@@ -138,16 +145,16 @@ fn scoped(plan: &Plan, io: &Io, cx: &Cx, clock: &Clock, file: &File<ReadWrite>) 
             scope.cancel();
         }
         let log = &log;
-        let task = scope.spawn(NAMES[at], TASK_FRAME, move |cx| -> Result<(), String> {
-            log.started.borrow_mut().push(at);
+        let task = scope.may_overlap(NAMES[at], TASK_FRAME, move |cx| -> Result<(), String> {
+            log.started.lock().push(at);
             let _ends = Ends(log, at);
             let did = act(cx, kind, clock, file);
             // clone: the test's record of what the closure returned.
-            log.did.borrow_mut().push((at, Did::Returned(did.clone())));
+            log.did.lock().push((at, Did::Returned(did.clone())));
             did
         });
         let joined = task.join(cx);
-        let did = log.did.borrow().iter().find(|(it, _)| *it == at).map(|(_, did)| did.clone());
+        let did = log.did.lock().iter().find(|(it, _)| *it == at).map(|(_, did)| did.clone());
         let fits = match (&did, &joined) {
             (Some(Did::Returned(Ok(()))), Ok(())) => true,
             (Some(Did::Returned(Err(said))), Err(TaskError { task, why: TaskWhy::Failed(why), .. })) => {
@@ -162,7 +169,7 @@ fn scoped(plan: &Plan, io: &Io, cx: &Cx, clock: &Clock, file: &File<ReadWrite>) 
     }
     let running = scope.running();
     let joined = scope.join(cx);
-    let (started, ended) = (log.started.borrow().len(), log.ended.borrow().len());
+    let (started, ended) = (log.started.lock().len(), log.ended.lock().len());
     if running != 0 || started != ended {
         wrong.push(format!("the scope joined with {running} running: {started} tasks started and {ended} ended"));
     }

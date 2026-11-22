@@ -1,0 +1,305 @@
+# Auto traits and well-formedness (src/structural.rs). References:
+# vendor/rustc_next_trait_solver/src/solve/trait_goals.rs consider_auto_trait_candidate and
+# disqualify_auto_trait_candidate_due_to_possible_impl, solve/assembly/structural_traits.rs
+# instantiate_constituent_tys_for_auto_trait, solve/eval_ctxt/mod.rs compute_well_formed_goal
+# (whose obligations come from rustc_trait_selection traits/wf.rs, not vendored).
+
+struct List<T>(Option<Box<List<T>>>, T)
+struct Node(Box<Node>)
+struct A(Box<B>)
+struct B(Option<Box<A>>)
+fn foo(u8) -> u16
+
+# ---- structural impls ----
+
+case auto_prim_yes = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+goal u8: Send => yes
+
+case auto_tuple_yes = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+goal (u8, String): Send => yes
+
+case auto_adt_fields_yes = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+goal String: Sync => yes
+
+case auto_ref_yes = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+goal &'static u8: Send => yes
+
+case auto_ref_to_rc_no = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+goal &'static Rc<u8>: Send => no
+
+case auto_array_of_rc_no = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+goal [Rc<u8>; 3]: Send => no
+
+case auto_slice_yes = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+goal [u8]: Sync => yes
+
+case auto_str_yes = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+goal str: Send => yes
+
+case auto_tuple_with_rc_no = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+goal (u8, Rc<u8>): Send => no
+
+case auto_enum_variant_rc_no = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+enum Mixed { u8 | Rc<u8> }
+goal Mixed: Send => no
+
+case auto_raw_ptr_pointee = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+# core's `impl<T: ?Sized> !Send for *const T` is not in this world: the structural rule
+# looks through the pointer to Rc<u8>, which is !Send.
+goal *const Rc<u8>: Send => no
+
+case auto_fn_def_yes = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+goal fn#foo: Send => yes
+
+case auto_fn_ptr_yes = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+goal fn(u8) -> u8: Sync => yes
+
+case auto_never_yes = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+goal !: Send => yes
+
+case auto_error_yes = trait_goals.rs::consider_error_guaranteed_candidate
+goal _: Send => yes
+
+case auto_closure_upvars_yes = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+goal closure#0<fn, fn(()) -> u8, (u8, &'static String)>: Send => yes
+
+case auto_closure_rc_upvar_no = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+goal closure#0<fn, fn(()) -> u8, (Rc<u8>,)>: Send => no
+
+case auto_phantom_data_yes = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+goal PhantomData<u8>: Send => yes
+
+case auto_phantom_data_rc_no = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+goal PhantomData<Rc<u8>>: Send => no
+
+# ---- explicit and negative impls disqualify the structural rule ----
+
+case auto_negative_impl_no = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
+goal Rc<u8>: Send => no
+
+case auto_negative_impl_sync_no = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
+goal Rc<u8>: Sync => no
+
+case auto_negative_goal_holds = trait_goals.rs::consider_impl_candidate
+goal Rc<u8>: !Send => yes
+
+case auto_negative_goal_without_impl_no = trait_goals.rs::consider_auto_trait_candidate
+# Auto traits have no builtin negative impl.
+goal u8: !Send => no
+
+case auto_explicit_impl_holds = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
+goal Cell<u8>: Send => yes
+
+case auto_explicit_impl_where_clause_fails = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
+goal Cell<Rc<u8>>: Send => no
+
+case auto_explicit_negative_cell_sync_no = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
+goal Cell<u8>: Sync => no
+
+case auto_local_negative_impl_no = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
+auto trait Marker
+impl !Marker for u16
+goal u16: Marker => no
+
+case auto_local_structural_yes = trait_goals.rs::consider_auto_trait_candidate
+auto trait Marker
+impl !Marker for u16
+goal u8: Marker => yes
+
+case auto_local_explicit_impl_overrides_no = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
+# The explicit impl's where-clause fails; the structural rule (NoClone has no fields, so it
+# would hold) is disqualified by the impl's existence.
+auto trait Marker
+struct NoClone
+impl<T: Clone> Marker for Vec<T>
+goal Vec<NoClone>: Marker => no
+
+case auto_local_explicit_impl_holds = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
+auto trait Marker
+impl<T: Clone> Marker for Vec<T>
+goal Vec<String>: Marker => yes
+
+# ---- cycles (auto traits are coinductive) ----
+
+case auto_cycle_list_yes = trait_goals.rs::consider_auto_trait_candidate
+goal List<u8>: Send => yes
+
+case auto_cycle_list_rc_no = trait_goals.rs::consider_auto_trait_candidate
+goal List<Rc<u8>>: Send => no
+
+case auto_cycle_self_box_yes = trait_goals.rs::consider_auto_trait_candidate
+goal Node: Send => yes
+
+case auto_cycle_mutual_yes = trait_goals.rs::consider_auto_trait_candidate
+goal A: Sync => yes
+
+# An opaque whose hidden type names the opaque itself (a recursive `async fn`'s future holds
+# `Pin<Box<its own opaque>>` across its await): the auto rule sees the hidden type
+# (structural.rs), and the opaque inside it normalizes to itself, rigid (alias.rs
+# `normalize_opaque_type`, analysis), so the auto goal meets itself on coinductive edges only.
+# Revealing the hidden type in normalization met the opaque's own normalization inductively
+# over blaze-typeck's Terms (whose relation generalizes the nested opaque into a projection
+# goal): overflow for both cases below there (blaze-typeck suite `solver_cases_over_terms`).
+case auto_cycle_opaque_self_yes = trait_goals.rs::consider_auto_trait_candidate (opaque_types.rs normalize_opaque_type)
+opaque Of: Clone = (u32, Box<opaque#Of>)
+goal opaque#Of: Send => yes
+
+case auto_cycle_opaque_self_rc_no = trait_goals.rs::consider_auto_trait_candidate (opaque_types.rs normalize_opaque_type)
+opaque Og: Clone = (Rc<u8>, Box<opaque#Og>)
+goal opaque#Og: Send => no
+
+# ---- nested ADTs, answered through the auto-trait summaries (auto_summary.rs) ----
+# Each step a summary takes is one the rule takes; where an impl may apply it stops.
+
+case auto_summary_nested_yes = trait_goals.rs::consider_auto_trait_candidate
+struct S1<T>(Option<T>, (u8, T), [T; 2])
+struct S2<T>(S1<T>, Box<S1<T>>, &'static S1<T>)
+goal S2<u8>: Send => yes
+
+case auto_summary_nested_rc_no = trait_goals.rs::consider_auto_trait_candidate
+struct S1<T>(Option<T>, (u8, T), [T; 2])
+struct S2<T>(S1<T>, Box<S1<T>>, &'static S1<T>)
+goal S2<Rc<u8>>: Send => no
+
+case auto_summary_inner_explicit_impl_no = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
+# Cell's own impls decide its auto traits: its `!Sync` two levels down.
+struct C1<T>(Cell<T>, u8)
+struct C2<T>(Option<C1<T>>)
+goal C2<u8>: Sync => no
+
+case auto_summary_inner_explicit_impl_where_no = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
+struct C1<T>(Cell<T>, u8)
+struct C2<T>(Option<C1<T>>)
+goal C2<Rc<u8>>: Send => no
+
+case auto_summary_inner_explicit_impl_yes = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
+struct C1<T>(Cell<T>, u8)
+struct C2<T>(Option<C1<T>>)
+goal C2<u8>: Send => yes
+
+case auto_summary_local_negative_no = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
+auto trait Mark
+struct In(u8)
+impl !Mark for In
+struct O1<T>(T, In)
+struct O2<T>(Option<O1<T>>, T)
+goal O2<u8>: Mark => no
+
+case auto_summary_recursive_yes = trait_goals.rs::consider_auto_trait_candidate
+struct S1<T>(Option<T>, (u8, T), [T; 2])
+goal S1<List<u8>>: Send => yes
+
+case auto_summary_recursive_rc_no = trait_goals.rs::consider_auto_trait_candidate
+struct S1<T>(Option<T>, (u8, T), [T; 2])
+goal S1<List<Rc<u8>>>: Send => no
+
+case auto_summary_param_env_yes = trait_goals.rs::consider_auto_trait_candidate
+# A where-clause of the trait: the summary is not used (a param-env candidate competes).
+struct S1<T>(Option<T>, (u8, T), [T; 2])
+params T
+env T: Send
+goal S1<T>: Send => yes
+
+case auto_summary_param_no = trait_goals.rs::consider_auto_trait_candidate
+struct S1<T>(Option<T>, (u8, T), [T; 2])
+params T
+goal S1<T>: Send => no
+
+# ---- no structural impl ----
+
+case owner_summary_field_args = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+# Cell has its own Send impl, so this field must be imported even with summaries enabled.
+struct Packet<A, B>(fn(A) -> (), Cell<B>)
+goal Packet<Rc<u8>, u16>: Send => yes
+goal Packet<u16, Rc<u8>>: Send => no
+
+case owner_adt_field_args = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+# An environment clause for Send takes the ordinary, unsummarized field path.
+struct Packet<A, B>(fn(A) -> (), Cell<B>)
+params X
+env X: Send
+goal Packet<Rc<u8>, X>: Send => yes
+goal Packet<X, Rc<u8>>: Send => no
+
+case auto_dyn_with_auto_bound_yes = assembly/mod.rs::assemble_object_bound_candidates
+goal dyn Debug + Send: Send => yes
+
+case auto_dyn_without_bound_no = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
+goal dyn Debug: Send => no
+
+case auto_dyn_other_auto_no = assembly/mod.rs::assemble_object_bound_candidates
+# The Reference, "Trait object types": the object implements "its auto traits": those listed only.
+goal dyn Debug + Sync: Send => no
+
+case auto_param_no = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
+params T
+goal T: Send => no
+
+case auto_param_env_yes = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
+params T
+env T: Send
+goal T: Send => yes
+
+case auto_through_param_env_yes = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+params T
+env T: Send
+goal Vec<T>: Send => yes
+
+case auto_through_param_no = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+params T
+goal Vec<T>: Send => no
+
+case auto_foreign_no = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
+foreign Ext
+goal Ext: Send => no
+
+case auto_ty_var_maybe = assembly/mod.rs::assemble_and_evaluate_candidates
+goal ?0: Send => maybe
+
+case auto_int_var_maybe = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
+goal ?i0: Send => maybe
+
+# ---- well-formedness ----
+
+case wf_slice_of_unsized_no = eval_ctxt/mod.rs::compute_well_formed_goal
+# wf.rs: a slice's element must be Sized.
+goal wf([str]) => no
+
+case wf_tuple_unsized_middle_no = eval_ctxt/mod.rs::compute_well_formed_goal
+# wf.rs: every tuple element but the last must be Sized.
+goal wf((str, u8)) => no
+
+case wf_tuple_unsized_tail_yes = eval_ctxt/mod.rs::compute_well_formed_goal
+goal wf((u8, str)) => yes
+
+case wf_ref_yes = eval_ctxt/mod.rs::compute_well_formed_goal
+goal wf(&'static str) => yes
+
+case wf_array_yes = eval_ctxt/mod.rs::compute_well_formed_goal
+goal wf([u8; 3]) => yes
+
+case wf_ty_var_maybe = eval_ctxt/mod.rs::compute_well_formed_goal
+goal wf(?0) => maybe
+
+case wf_adt_yes = eval_ctxt/mod.rs::compute_well_formed_goal
+goal wf(Vec<u8>) => yes
+
+case wf_adt_implicit_sized_no = eval_ctxt/mod.rs::compute_well_formed_goal
+# unsure: needs AdtDef::where_clauses to hold the implicit `T: Sized` of Vec's parameter
+goal wf(Vec<[u8]>) => no
+
+case wf_nested_no = eval_ctxt/mod.rs::compute_well_formed_goal
+# The inner slice is checked by its own WellFormed goal.
+goal wf(&'static [[u8]]) => no
+
+case wf_dyn_yes = eval_ctxt/mod.rs::compute_well_formed_goal
+# unsure: needs Debug dyn compatible in the test world (the DynCompatible obligation)
+goal wf(dyn Debug) => yes
+
+case wf_fn_ptr_unsized_input_yes = eval_ctxt/mod.rs::compute_well_formed_goal
+# wf.rs: a fn pointer's inputs need only be well-formed, not Sized.
+goal wf(fn(str) -> u8) => yes
+
+case wf_projection_yes = eval_ctxt/mod.rs::compute_well_formed_goal
+# unsure: the alias may be normalized before the WellFormed goal is asked
+goal wf(<u32 as Add<u32>>::Output) => yes

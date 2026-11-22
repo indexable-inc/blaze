@@ -1,3 +1,0 @@
-[workspace]
-members = ["app", "items", "mac"]
-resolver = "3"

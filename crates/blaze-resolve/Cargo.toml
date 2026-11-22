@@ -14,24 +14,21 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-own.workspace = true
+blaze-toml.workspace = true
+blaze-semver.workspace = true
 blaze-core.workspace = true
-anyhow.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true
-blaze-serde.workspace = true
 blaze-source.workspace = true
-cargo-platform.workspace = true
 imbl.workspace = true
-semver.workspace = true
 serde = { workspace = true, features = ["derive"] }
 stdx.workspace = true
-toml.workspace = true
-tracing.workspace = true
-unicode-ident.workspace = true
+blaze-trace.workspace = true
+blaze-unicode.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-blaze-spin.workspace = true
 serde_json.workspace = true
 
 [lints]

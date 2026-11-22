@@ -12,6 +12,14 @@
 //! edge's arguments against its block's parameters, landing blocks reached by unwind edges
 //! alone, and every use dominated by its value. The builder runs it in debug builds, and in
 //! release builds behind a check mode ([`crate::Builder::finish_checked`]).
+//!
+//! A coroutine body's `suspend` is, here, a two-way edge like any other: both of its blocks
+//! exist, take no parameters and are not landing blocks, and what it returns is the
+//! signature's. A value made before a `suspend` may be used after it, since in the body the
+//! suspending block dominates what follows. There is no "pass done" flag: the coroutine pass
+//! ([`crate::coroutine`]) leaves no `suspend`, enters each resume block from a switch at the
+//! head, and so the dominance rule above, unchanged, is what refuses in its output any value
+//! that would cross a poll outside the state.
 
 use std::fmt;
 
@@ -19,7 +27,7 @@ use crate::{
     flags::Ordering,
     func::{
         AsmOperandKind, AsmPieceRec, Block, BlockKind, Conv, Ext, MemAttrsRec, NONE, ParamKind,
-        ParamRec, RefKind, SCOPE_IN, SigId, SigRec, SlotKind, Value, View,
+        ParamRec, PositionField, RefKind, SCOPE_IN, SigId, SigRec, SlotKind, Value, View,
     },
     op::{End, Field, Layout, Op, Res, Values, WalkError, Word, walk},
     ty::{Form, Scalar, Ty},
@@ -87,10 +95,78 @@ fn optional(field: u32, rows: usize) -> bool {
     field as usize <= rows
 }
 
-/// Checks `view` all the way: [`structure`], then what it means.
-pub fn verify(view: View<'_>) -> Result {
+/// THE PROOF THAT A VIEW IS LIR (D163, rule 74): a [`View`] that [`verify`] checked all the
+/// way. Its field is private, so the one way to hold a `Verified` is to have verified the view
+/// (or to own a [`VerifiedFunc`], whose one constructor verifies): an emitter that takes it
+/// (blaze-emit `emit`, `emit_record`, blaze-tier `Tier::emit`) cannot be handed unchecked LIR,
+/// and checks nothing again.
+///
+/// ```compile_fail
+/// // Outside this module no proof is made by hand: its field is private.
+/// fn forge(view: blaze_lir::View<'_>) -> blaze_lir::Verified<'_> { blaze_lir::Verified { view } }
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct Verified<'v> {
+    view: View<'v>,
+}
+
+impl<'v> Verified<'v> {
+    /// The view the proof is of.
+    pub fn view(self) -> View<'v> {
+        self.view
+    }
+
+    /// An owned copy, in `alloc`, carrying the proof: the copy's columns are the proven view's
+    /// bytes, so it is the same function and is not checked again.
+    pub fn to_verified_in<A: core::alloc::Allocator + Clone>(self, alloc: A) -> VerifiedFunc<A> {
+        VerifiedFunc { func: self.view.to_func_in(alloc) }
+    }
+}
+
+/// An owned function that [`verify`] checked all the way: what a builder hands an emitter
+/// (blaze-build `Built::func`), so the proof travels with the function and the emitter takes
+/// [`VerifiedFunc::verified`] without checking again (rule 74). Read only: a change to the
+/// function needs [`VerifiedFunc::into_func`] and a new [`VerifiedFunc::new`], which verifies
+/// again; nothing mutates a verified function in place.
+#[derive(Debug)]
+pub struct VerifiedFunc<A: core::alloc::Allocator> {
+    func: crate::Func<A>,
+}
+
+impl<A: core::alloc::Allocator> VerifiedFunc<A> {
+    /// `func` verified all the way ([`verify`]), or the rule it breaks.
+    pub fn new(func: crate::Func<A>) -> core::result::Result<VerifiedFunc<A>, VerifyError> {
+        verify(func.view())?;
+        Ok(VerifiedFunc { func })
+    }
+
+    /// The proof, borrowed: what an emitter takes.
+    pub fn verified(&self) -> Verified<'_> {
+        Verified { view: self.func.view() }
+    }
+
+    /// The function's view (verified; [`VerifiedFunc::verified`] when a proof is wanted).
+    pub fn view(&self) -> View<'_> {
+        self.func.view()
+    }
+
+    /// The function, read only.
+    pub fn func(&self) -> &crate::Func<A> {
+        &self.func
+    }
+
+    /// The function, its proof given up: changing it needs a new [`VerifiedFunc::new`].
+    pub fn into_func(self) -> crate::Func<A> {
+        self.func
+    }
+}
+
+/// Checks `view` all the way: [`structure`], then what it means. The answer is the proof
+/// ([`Verified`]) every emitter takes.
+pub fn verify(view: View<'_>) -> core::result::Result<Verified<'_>, VerifyError> {
     structure(view)?;
-    semantics(&view)
+    semantics(&view)?;
+    Ok(Verified { view })
 }
 
 /// Checks what every reader of `view` relies on: lengths, tags, ranges and indices.
@@ -329,7 +405,7 @@ fn structure_tables(view: &View<'_>) -> Result {
             Some(RefKind::Data) if rec.place as usize >= view.datas.len() => {
                 return Err(row("refs", r, "data past `datas`"));
             }
-            Some(RefKind::Data | RefKind::Func | RefKind::Static | RefKind::Tls) => {}
+            Some(RefKind::Data | RefKind::Func | RefKind::Static | RefKind::Tls | RefKind::Vtable) => {}
         }
     }
     for (r, rec) in view.datas.iter().enumerate() {
@@ -347,6 +423,24 @@ fn structure_tables(view: &View<'_>) -> Result {
                 || reloc.offset as u64 + ptr_bytes as u64 > rec.bytes_len as u64
             {
                 return Err(row("datas", r, "an address past its data or naming no reference"));
+            }
+        }
+        if !within(rec.positions_first, rec.positions_len, view.data_positions.len()) {
+            return Err(row("datas", r, "source positions past `data_positions`"));
+        }
+        let positions = &view.data_positions[rec.positions_first as usize..][..rec.positions_len as usize];
+        let mut end = 0u64;
+        for position in positions {
+            let at = position.offset as u64;
+            if PositionField::from_word(position.field).is_none() || at + 4 > rec.bytes_len as u64 {
+                return Err(row("datas", r, "a source position of no known field, or past its data"));
+            }
+            if at < end {
+                return Err(row("datas", r, "source positions not by ascending offset, or overlapping"));
+            }
+            end = at + 4;
+            if relocs.iter().any(|it| (it.offset as u64) < end && at < it.offset as u64 + ptr_bytes as u64) {
+                return Err(row("datas", r, "a source position overlapping an address"));
             }
         }
     }
@@ -440,7 +534,7 @@ fn tiles(ranges: impl Iterator<Item = (u32, u32)>, total: usize) -> bool {
 /// Each list table's rows lie one after another in their columns, in row order, and fill
 /// them: so one function has one encoding, and equal functions are equal bytes.
 fn canonical(view: &View<'_>) -> Result {
-    let checks: [(&'static str, bool); 8] = [
+    let checks: [(&'static str, bool); 9] = [
         ("compounds", tiles(view.compounds.iter().map(|it| (it.first, it.len)), view.compound_tys.len())),
         (
             "sigs",
@@ -451,6 +545,7 @@ fn canonical(view: &View<'_>) -> Result {
         ),
         ("datas", tiles(view.datas.iter().map(|it| (it.bytes_first, it.bytes_len)), view.data_bytes.len())),
         ("datas", tiles(view.datas.iter().map(|it| (it.relocs_first, it.relocs_len)), view.data_relocs.len())),
+        ("datas", tiles(view.datas.iter().map(|it| (it.positions_first, it.positions_len)), view.data_positions.len())),
         ("intrinsics", tiles(view.intrinsics.iter().map(|it| (it.name_first, it.name_len)), view.names.len())),
         ("asms", tiles(view.asms.iter().map(|it| (it.pieces_first, it.pieces_len)), view.asm_pieces.len())),
         ("asms", tiles(view.asms.iter().map(|it| (it.operands_first, it.operands_len)), view.asm_operands.len())),
@@ -531,6 +626,8 @@ enum EdgeKind<'a> {
     Unwind,
     /// An `asm_br`'s label.
     Label,
+    /// A `suspend`'s resume or cancel block.
+    Suspend,
 }
 
 /// Calls `f` with every edge from the terminator `at`.
@@ -564,6 +661,40 @@ fn edges<'a>(view: &View<'a>, at: usize, mut f: impl FnMut(Edge<'a>)) {
         for &label in operands.blocks() {
             f(Edge { to: Block(label), kind: EdgeKind::Label });
         }
+    } else if op == Op::Suspend {
+        operands.imm();
+        f(Edge { to: operands.block(), kind: EdgeKind::Suspend });
+        f(Edge { to: operands.block(), kind: EdgeKind::Suspend });
+    }
+}
+
+/// The value a `switch` scrutinises, when `block`'s ONE incoming edge is that switch's default
+/// with no arguments: then every run that reaches `block` has just compared that value with
+/// each case and matched none. `None` when any other edge reaches it, or none does. One scan
+/// of the terminators (the edges' one reader, [`edges`]); what the emitter asks of an
+/// `unreachable` that begins its block, to say where the value it fell through on is held
+/// (blaze-emit pass.rs, blaze-code record.rs `Held`).
+pub fn sole_switch_default(view: &View<'_>, block: Block) -> Option<Value> {
+    let mut reached = 0u32;
+    let mut scrutinee = None;
+    for b in 0..view.blocks() {
+        let at = view.terminator(Block(b as u32));
+        edges(view, at, |edge| reached += u32::from(edge.to == block));
+        if reached > 1 {
+            return None;
+        }
+        if view.op(at) == Op::Switch {
+            let mut operands = view.operands(at);
+            let value = operands.value();
+            let default = operands.target();
+            if default.block == block && default.args.is_empty() {
+                scrutinee = Some(value);
+            }
+        }
+    }
+    match reached {
+        1 => scrutinee,
+        _ => None,
     }
 }
 
@@ -772,6 +903,8 @@ fn semantics(view: &View<'_>) -> Result {
                 EdgeKind::Unwind => (!kind.is_landing()).then_some("an unwind edge to a block that is not a landing block"),
                 EdgeKind::Label => (kind.is_landing() || !params.is_empty())
                     .then_some("a label to a block with parameters or a landing block"),
+                EdgeKind::Suspend => (kind.is_landing() || !params.is_empty())
+                    .then_some("a suspend whose resume or cancel block has parameters or is a landing block"),
             };
         });
         if let Some(rule) = bad {
@@ -1017,7 +1150,7 @@ fn types(
             let ok = if op == Op::FuncAddr {
                 kind == Some(RefKind::Func)
             } else if op == Op::DataAddr {
-                matches!(kind, Some(RefKind::Static | RefKind::Data))
+                matches!(kind, Some(RefKind::Static | RefKind::Data | RefKind::Vtable))
             } else {
                 kind == Some(RefKind::Tls)
             };
@@ -1195,6 +1328,17 @@ fn types(
             )
         }
         Op::Resume => need(t(o.value()) == Ty::PTR, "a resume of a value that is not the exception pointer"),
+        Op::Suspend => {
+            o.imm();
+            o.block();
+            o.block();
+            let values = o.values();
+            need(
+                values.len() == own.rets.len() && values.iter().zip(own.rets).all(|(v, r)| t(v).0 == r.ty),
+                "a suspend whose returns are not its signature's",
+            )
+        }
+        Op::Cancelled => Ok(()),
     }
 }
 

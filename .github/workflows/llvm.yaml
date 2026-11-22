@@ -1,6 +1,6 @@
 name: llvm
 
-# Builds the LLVM every native blaze links (crates/hir-ty-codegen/llvm.json: our fork
+# Builds the LLVM every native blaze links (pins/llvm.json: our fork
 # indexable-inc/llvm, ix/23.x, LLVM 23.1.4 with our fixes, the commit ix-aot pins) on each runner
 # a release of blaze is built on, and Windows, with .github/scripts/llvm.py, and puts the
 # archives into the R2 bucket blaze-releases (`native/<name>`, under llvm.json's `release`,
@@ -103,5 +103,5 @@ jobs:
       - name: Pins
         run: |
           python3 .github/scripts/llvm.py "$(jq -nc --arg root "$RUNNER_TEMP/llvm" '{command: "pin", root: $root}')"
-          { echo '`crates/hir-ty-codegen/llvm.json` for these builds:'; echo '```json'; cat crates/hir-ty-codegen/llvm.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-          cat crates/hir-ty-codegen/llvm.json
+          { echo '`pins/llvm.json` for these builds:'; echo '```json'; cat pins/llvm.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          cat pins/llvm.json

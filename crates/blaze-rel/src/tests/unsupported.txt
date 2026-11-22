@@ -1,0 +1,2 @@
+query utilization_per_second	no function `unnest`: a table-producing function over `range(..)`
+query errors_by_kind	a correlated scalar subquery

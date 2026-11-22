@@ -62,14 +62,15 @@ impl Wake for SimWake {
 struct Post {
     at: Duration,
     // dyn: a test's act, given once per message and run once.
-    post: Box<dyn FnOnce(), Global>,
+    // `Send`: a simulated world crosses to bstd's pool workers inside its `Io`.
+    post: Box<dyn FnOnce() + Send, Global>,
 }
 
 /// Another process on the machine ([`Sim::other_process`]).
 struct Other {
     tags: Range<u64>,
     // dyn: a test's process, given once and called once per completion of its own.
-    step: Box<dyn FnMut(Duration, Completion, &mut Vec<Effect>), Global>,
+    step: Box<dyn FnMut(Duration, Completion, &mut Vec<Effect>) + Send, Global>,
 }
 
 /// The simulation's waker and what acts beside its poller.
@@ -166,7 +167,7 @@ impl Sim {
     /// rule: before the poll looks or between the look and the park (drawn from the seed), or
     /// while it is parked. Every act runs once, in the order due, the order given among those
     /// due at once.
-    pub fn wake_at(&mut self, at: Duration, post: impl FnOnce() + 'static) {
+    pub fn wake_at(&mut self, at: Duration, post: impl FnOnce() + Send + 'static) {
         let at = at.max(self.now);
         let posts = &mut self.wakes_mut("wake_at").posts;
         let place = posts.partition_point(|it| it.at <= at);
@@ -190,7 +191,7 @@ impl Sim {
     pub fn other_process(
         &mut self,
         tags: Range<u64>,
-        step: impl FnMut(Duration, Completion, &mut Vec<Effect>) + 'static,
+        step: impl FnMut(Duration, Completion, &mut Vec<Effect>) + Send + 'static,
     ) {
         let others = &mut self.wakes_mut("other_process").others;
         if let Some(clash) = others.iter().find(|it| it.tags.start < tags.end && tags.start < it.tags.end) {
@@ -277,12 +278,13 @@ impl Sim {
 
 #[cfg(test)]
 mod tests {
-    use std::{alloc::Global, cell::RefCell, rc::Rc, time::Duration};
+    use std::{alloc::Global, sync::Arc, time::Duration};
 
     use blaze_sim::{Broke, Config, Tape};
 
     use crate::{
         Driver as _, Effect, Tag,
+        lock::Lock,
         sim::{Faults, Sim},
         wait::Deadline,
     };
@@ -318,16 +320,17 @@ mod tests {
         let Some(waker) = sim.waker() else {
             return Err(Broke::Harness("Sim::give_wakers gave no waker".to_owned()));
         };
-        let inbox: Rc<RefCell<Vec<(usize, Duration), Global>>, Global> =
-            Rc::new_in(RefCell::new(Vec::new_in(Global)), Global);
+        // Locked: another thread's act is `Send` (`Sim::wake_at`).
+        let inbox: Arc<Lock<Vec<(usize, Duration), Global>>, Global> =
+            Arc::new_in(Lock::new("test.inbox", Vec::new_in(Global)), Global);
         let gaps = tape.vec(1..=12, "posts", |tape| Duration::from_micros(tape.int_in(0..=30_000u64, "gap us")));
         let mut at = Duration::ZERO;
         for (i, gap) in gaps.iter().enumerate() {
             at += *gap;
             // clone: the inbox and the waker, for the other thread's act
-            let (inbox, waker) = (Rc::clone(&inbox), waker.clone());
+            let (inbox, waker) = (Arc::clone(&inbox), waker.clone());
             sim.wake_at(at, move || {
-                inbox.borrow_mut().push((i, at));
+                inbox.lock().push((i, at));
                 waker.wake();
             });
         }
@@ -340,7 +343,7 @@ mod tests {
         let mut seen = 0;
         for _ in 0..TURNS_MOST {
             let now = sim.now();
-            taken.append(&mut *inbox.borrow_mut());
+            taken.append(&mut *inbox.lock());
             for (i, posted) in taken.drain(..) {
                 if posted != now {
                     return Err(Broke::Oracle(format!("message {i}, posted at {posted:?}, was read at {now:?}: {LATE}")));

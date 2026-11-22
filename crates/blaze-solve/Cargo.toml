@@ -1,0 +1,41 @@
+[package]
+name = "blaze-solve"
+description = "blaze's own trait solver (docs/v2/plan/design/solve.md): Rust's semantics as the pinned nightly's next-generation solver implements them, ported rule by rule from vendor/rustc_next_trait_solver, on a data-oriented engine: goals, obligations and candidates as fixed-size rows in columns, an explicit stack, the reference's search graph for cycles, wake lists for stalled obligations, a ground fast path, a SIMD fingerprint prefilter over impl buckets, and solved goals as records valid by their read lists"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# blaze's own crates only (bottom.md section 13: zero third-party crates).
+[dependencies]
+# `Vec` and `Alloc`: every column, pool and stack, in the allocator the caller names.
+blaze-own.workspace = true
+# `HashMap`: the task cache's index from a canonical input's hash to its row. By path, not the
+# workspace entry, which turns on the `serde` and `shared` adapters and crates from outside.
+blaze-hash.workspace = true
+
+[features]
+# The test language, its arena and its in-memory world (src/testing/), on `std`: for this crate's
+# tests (always on under `cfg(test)`) and `examples/cost.rs`.
+testing = ["blaze-own/std", "blaze-own/testing"]
+
+[dev-dependencies]
+blaze-own = { workspace = true, features = ["std", "testing"] }
+# The cost example's entry frame and each test's top frame: memory from the OS, handed down.
+blaze-mem.workspace = true
+# `check`, `control`: the prefilter's property and its planted-bug control.
+blaze-sim.workspace = true
+
+[[example]]
+name = "cost"
+required-features = ["testing"]
+
+[lints]
+workspace = true

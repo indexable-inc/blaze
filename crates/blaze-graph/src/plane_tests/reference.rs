@@ -10,7 +10,7 @@
 
 use std::{cmp::Reverse, collections::BTreeSet};
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_protocol::events::{Event, Level, NodeState, Record};
 use std::alloc::Global;
 
@@ -94,10 +94,10 @@ struct Request {
 pub(crate) struct Plane<M = NoMemo> {
     config: PlaneConfig,
     nodes: Vec<Node>,
-    index: HashMap<NodeId, usize, Global>, // alloc: a test's model
+    index: Map<NodeId, usize, FixedState, Global>, // alloc: a test's model
     tasks: Vec<Task>,
     requests: Vec<Request>,
-    request_index: HashMap<RequestId, usize, Global>, // alloc: a test's model
+    request_index: Map<RequestId, usize, FixedState, Global>, // alloc: a test's model
     /// Rooms of `nodes`, `tasks` and `requests` given back, taken again first.
     free_nodes: Vec<usize>,
     free_tasks: Vec<usize>,
@@ -105,7 +105,7 @@ pub(crate) struct Plane<M = NoMemo> {
     next_seq: u64,
     memo: M,
     /// Keys of tasks not yet settled.
-    flight: HashMap<Key, usize, Global>, // alloc: a test's model
+    flight: Map<Key, usize, FixedState, Global>, // alloc: a test's model
     running: [usize; 2],
     /// The virtual time of each pool: that of the request not idle that started a task last.
     vclock: [u128; 2],
@@ -148,16 +148,16 @@ impl<M: Memo> Plane<M> {
         Ok(Plane {
             config,
             nodes: Vec::new(),
-            index: HashMap::new_in(Global), // alloc: a test's model
+            index: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: a test's model
             tasks: Vec::new(),
             requests: Vec::new(),
-            request_index: HashMap::new_in(Global), // alloc: a test's model
+            request_index: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: a test's model
             free_nodes: Vec::new(),
             free_tasks: Vec::new(),
             free_requests: Vec::new(),
             next_seq: 0,
             memo,
-            flight: HashMap::new_in(Global), // alloc: a test's model
+            flight: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: a test's model
             running: [0; 2],
             vclock: [0; 2],
             idle_vclock: [0; 2],
@@ -503,7 +503,7 @@ impl<M: Memo> Plane<M> {
     /// `nodes`, each after its deps of them, or why they cannot be added to request `r`.
     /// Nothing of them is added yet.
     fn check(&self, r: usize, nodes: Vec<Spec>) -> Result<Vec<Spec>, Error> {
-        let mut new: HashMap<NodeId, usize, Global> = HashMap::new_in(Global); // alloc: a test's model
+        let mut new: Map<NodeId, usize, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }); // alloc: a test's model
         for (at, spec) in nodes.iter().enumerate() {
             if self.index.contains_key(&spec.id) || new.insert(spec.id, at).is_some() {
                 return Err(Error::Twice(spec.id));

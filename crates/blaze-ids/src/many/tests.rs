@@ -1,6 +1,6 @@
 //! The leading blocks are the same chaining values however many lanes compress them, and on
 //! AVX-512 when the CPU has it; the last blocks are the same IDs at every width and on every
-//! x86 path; the register transposes are the scalar one.
+//! x86 path; the register transposes (`blaze_blake3::lanes`') are the scalar one.
 
 use super::*;
 
@@ -9,21 +9,28 @@ fn noise(len: usize, seed: u64) -> Vec<u8> {
     (0..len).map(|_| rng.next_u64() as u8).collect()
 }
 
-#[cfg(all(
-    target_endian = "little",
-    any(
-        all(target_arch = "x86_64", target_os = "linux"),
-        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")),
-    ),
-))]
+/// Block counts of a chunk to test: under Miri the first two and the last, else every one.
+fn block_counts(from: usize) -> Vec<usize> {
+    if cfg!(miri) {
+        vec![from, from + 1, CHUNK_LEN / BLOCK_LEN - 1]
+    } else {
+        (from..CHUNK_LEN / BLOCK_LEN).collect()
+    }
+}
+
+/// Inputs and member counts: under Miri each side of 8 and 16 lanes, else up to 37.
+const INPUTS: usize = if cfg!(miri) { 17 } else { 37 };
+const COUNTS: &[usize] =
+    if cfg!(miri) { &[0, 1, 8, 9, 16, 17] } else { &[0, 1, 7, 8, 9, 15, 16, 17, 37] };
+
 #[test]
 fn leading_blocks_are_alike_at_every_width() {
     let key = words_of(&b3::context_key("blaze v2 many lanes 1"));
-    for blocks in 1..CHUNK_LEN / BLOCK_LEN {
+    for blocks in block_counts(1) {
         let inputs: Vec<Vec<u8>> =
-            (0..37).map(|n| noise(blocks * BLOCK_LEN + 1 + n % 60, n as u64)).collect();
+            (0..INPUTS).map(|n| noise(blocks * BLOCK_LEN + 1 + n % 60, n as u64)).collect();
         let inputs: Vec<&[u8]> = inputs.iter().map(Vec::as_slice).collect();
-        for count in [0, 1, 7, 8, 9, 15, 16, 17, 37] {
+        for &count in COUNTS {
             let members: Vec<u32> = (0..count as u32).rev().collect();
             let (mut eight, mut sixteen, mut dispatched) = (Vec::new(), Vec::new(), Vec::new());
             leading_lanes_of::<8>(&key, &inputs, &members, blocks, &mut eight);
@@ -31,7 +38,7 @@ fn leading_blocks_are_alike_at_every_width() {
             leading_lanes(&key, &inputs, &members, blocks, &mut dispatched);
             assert_eq!(eight, sixteen, "{blocks} blocks, {count} members");
             assert_eq!(eight, dispatched, "{blocks} blocks, {count} members");
-            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            #[cfg(target_arch = "x86_64")]
             {
                 if std::arch::is_x86_feature_detected!("avx512f") {
                     let mut wide = Vec::new();
@@ -55,7 +62,7 @@ fn scalar_columns<const S: usize>(rows: &[[u32; 16]; S]) -> [[u32; S]; 16] {
 #[test]
 fn register_transposes_are_the_scalar_one() {
     let mut rng = crate::rng::SplitMix64::new(7);
-    for _ in 0..64 {
+    for _ in 0..if cfg!(miri) { 4 } else { 64 } {
         let rows: [[u32; 16]; 16] =
             std::array::from_fn(|_| std::array::from_fn(|_| rng.next_u64() as u32));
         assert_eq!(columns(&rows), scalar_columns(&rows));
@@ -74,7 +81,7 @@ fn back_transposes_are_the_scalar_one() {
         std::array::from_fn(|lane| std::array::from_fn(|word| columns[word][lane]))
     }
     let mut rng = crate::rng::SplitMix64::new(11);
-    for _ in 0..64 {
+    for _ in 0..if cfg!(miri) { 4 } else { 64 } {
         let sixteen: [[u32; 16]; 8] =
             std::array::from_fn(|_| std::array::from_fn(|_| rng.next_u64() as u32));
         assert_eq!(rows_of(&sixteen), scalar(&sixteen));
@@ -92,7 +99,7 @@ fn back_transposes_are_the_scalar_one() {
 #[test]
 fn a_last_block_reads_as_its_zero_padded_copy() {
     let bytes = noise(3 * BLOCK_LEN, 5);
-    for from in 0..BLOCK_LEN {
+    for from in 0..if cfg!(miri) { 9 } else { BLOCK_LEN } {
         for len in 0..=BLOCK_LEN {
             let last = &bytes[from..from + len];
             let mut block = [0; BLOCK_LEN];
@@ -113,15 +120,15 @@ fn last_block_alone(input: &[u8], cv: &[u32; 8], group: usize) -> ContentId {
 #[test]
 fn last_blocks_are_alike_at_every_width_and_on_every_path() {
     let key = words_of(&b3::context_key("blaze v2 many lanes 1"));
-    for group in 0..CHUNK_LEN / BLOCK_LEN {
-        let inputs: Vec<Vec<u8>> = (0..37)
+    for group in block_counts(0) {
+        let inputs: Vec<Vec<u8>> = (0..INPUTS)
             .map(|n| noise(group * BLOCK_LEN + 1 + (n * 7) % BLOCK_LEN, n as u64 + 100))
             .collect();
         let inputs: Vec<&[u8]> = inputs.iter().map(Vec::as_slice).collect();
         let mut rng = crate::rng::SplitMix64::new(group as u64);
         let after: Vec<[u32; 8]> =
-            (0..37).map(|_| std::array::from_fn(|_| rng.next_u64() as u32)).collect();
-        for count in [0, 1, 7, 8, 9, 15, 16, 17, 37] {
+            (0..INPUTS).map(|_| std::array::from_fn(|_| rng.next_u64() as u32)).collect();
+        for &count in COUNTS {
             let members: Vec<u32> = (0..count as u32).rev().collect();
             let starts: [(Start<'_>, &str); 2] = [
                 (Start::Key(&key), "from the key"),
@@ -180,7 +187,7 @@ fn last_blocks_are_alike_at_every_width_and_on_every_path() {
 #[test]
 fn one_lane_from_the_key_is_blake3() {
     let key = words_of(&b3::context_key("blaze v2 many lanes 1"));
-    for len in 0..=BLOCK_LEN {
+    for len in (0..=BLOCK_LEN).step_by(if cfg!(miri) { 8 } else { 1 }) {
         let input = noise(len, len as u64);
         let mut expected = blake3::Hasher::new_derive_key("blaze v2 many lanes 1");
         expected.update(&input);

@@ -105,7 +105,7 @@ across files depends on the keys merged before it in `FxHashMap` order; blaze do
 
 The comparison harness on dev-aws-8, 2026-10-25, at commit 00a37aa505 of this branch:
 cargo 1.99.0 and blaze-manifest on every workspace of its corpus and the
-projects of `harness/bench.py`, each from its root with a `CARGO_HOME` of the harness's own, the
+projects of harness/bench.py (deleted since), each from its root with a `CARGO_HOME` of the harness's own, the
 JSON compared as text with the root and `CARGO_HOME` replaced, key order included.
 
 | Part | Equal | Total |
@@ -205,7 +205,7 @@ target (seen by a `RUSTC_WRAPPER` that prints them) against those v1's `plan.rs`
 (`cargo-answer --rustflags`). The trees: the harness's toolchain fixtures (`build.target`,
 `[target.'cfg(..)']` tables, `RUSTFLAGS` per target and a forced `[env] RUSTC_BOOTSTRAP=-1`,
 which cargo hands the rustc it asks, so the stable channel's cfgs print), the config fixtures,
-`harness/norustc/fixture` and the bench projects.
+harness/norustc/fixture (deleted since) and the bench projects.
 
 On the ix VM nc-toolq (Linux AArch64), 2026-10-27: 35 of 35 equal, 575 questions, 219 of them
 refused by both (the config fixtures have no package, and some have broken files).

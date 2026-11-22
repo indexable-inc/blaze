@@ -1,661 +1,196 @@
-//! The walk that makes an [`Outline`]: the parser's event stream for the whole file, read once
-//! with a stack of the nodes open at each step and, beside it, the entries open at each step.
-//!
-//! Each raw token the parser takes is found in the lexer's tokens (trivia skipped), given to
-//! every open node that has no start yet, and fed to the hashers of every open entry. A node
-//! the outline reads is recognised by its kind and its parent's role ([`Role`]); what it holds
-//! is taken when it closes, from its range or from the tokens recorded while it was open (a
-//! visibility, a rename, an attribute). No node is kept past its exit.
+//! What makes an [`Outline`]: the item grammar's sink that writes the rows as each item closes
+//! ([`rows`]), and here what it reads a node by: which kinds are items, lists and named
+//! entries, how a visibility, a rename and an attribute are read off their tokens, and the
+//! worker's scratch the making grows in.
 
-use std::alloc::Allocator;
-
-use blaze_hash::ByHash;
-use blaze_ids::{ContentId, Hasher};
+use blaze_ids::ContentId;
+use blaze_own::{AVec, Alloc, Vec};
+use blaze_surface::{
+    Attr, AttrKind, AttrSpan, ErrorOrigin, Item, ItemDetail, ItemFlags, ItemIndex, Range, Rename,
+    SyntaxError, WrittenVis,
+};
 use parser::{
-    Edition, LexedStr, OutlineStep, Step,
+    Edition, LexedStr,
     SyntaxKind::{self, *},
 };
 
-use crate::{
-    Attr, AttrKind, AttrSpan, ErrorOrigin, ITEM_DOMAIN, Item, ItemIndex, ItemKind, Outline, Range,
-    Rename, SIGNATURE_DOMAIN, SyntaxError, Visibility, usize_of,
-};
-
-/// The domain of an unnamed entry's head: its signature tokens outside its attributes, which
-/// stand for its name among its siblings.
-const HEAD_DOMAIN: &str = "blaze v2 file item head 1";
-
-/// The domain of a sibling group's key: the parent, the kind and the name (or head).
-const SIBLING_DOMAIN: &str = "blaze v2 file item siblings 1";
+use crate::flags::Scan;
+use crate::Outline;
+use crate::digest::{By, Compress, Feed, Keyed, Lexed, digest};
 
 /// What an entry is before the walk closes it.
 const PLACEHOLDER: Item = Item {
-    kind: ItemKind::Error,
+    detail: ItemDetail::Error,
     parent: None,
     end: ItemIndex(0),
     range: Range::new(0, 0),
     name: None,
-    visibility: Visibility::Private,
+    visibility: WrittenVis::Private,
     signature: Range::new(0, 0),
     body: None,
     attrs: AttrSpan { start: 0, end: 0 },
     disambiguator: 0,
     hash: ContentId([0; 32]),
     signature_hash: ContentId([0; 32]),
+    flags: ItemFlags::NONE,
 };
 
-pub(crate) fn outline<A: Allocator + Clone>(text: &str, edition: Edition, alloc: A) -> Outline<A> {
-    assert!(
-        u32::try_from(text.len()).is_ok(),
-        "a source file of {} bytes: an outline's ranges are u32 pairs",
-        text.len()
-    );
-    let lexed = LexedStr::new(edition, text);
-    let input = lexed.to_input(edition);
-    let output = parser::TopEntryPoint::SourceFile.parse(input.tokens());
-    let mut walk = Walk::new(text, &lexed, edition, alloc);
-    for step in output.steps() {
-        match step {
-            OutlineStep::Step(Step::Token { n_input_tokens, .. }) => {
-                for _ in 0..n_input_tokens {
-                    walk.token();
-                }
-            }
-            // `x.0.1`: one float token, then the node it ends and, past a second field, the
-            // one the parser left open for it (`Output`'s depth accounting).
-            OutlineStep::Step(Step::FloatSplit { ends_in_dot }) => {
-                walk.token();
-                walk.exit();
-                if !ends_in_dot {
-                    walk.exit();
-                }
-            }
-            OutlineStep::Step(Step::Enter { kind }) => walk.enter(kind),
-            OutlineStep::Step(Step::Exit) => walk.exit(),
-            OutlineStep::Step(Step::Error { msg }) => walk.parser_error(msg),
-            OutlineStep::Lazy { kind, .. } => {
-                unreachable!("a full parse's output holds a lazy {kind:?}")
-            }
+/// What an outline's making grows and no caller keeps, one set per worker at the most it ever
+/// held (`blaze_mem::scratch`, docs/v2/plan/design/memory.md, "Scratch buffers reused per
+/// worker"), like the lexer's tokens: the outline as the sink appends to it and the sink's
+/// working vectors. In a bump frame two vectors that grow by turns copy each other at every
+/// step, and a working vector is never freed while a kept one is above it, so the frame would
+/// hold twice the outline and the working set beside it; here the frame takes the outline
+/// once, at its exact size ([`Outline::copy_in`]), and the worker's set stops growing once
+/// warm. The heap is `Alloc::global`'s, named here and nowhere else in the crate.
+struct Buffers {
+    out: Outline<'static>,
+    working: Working<'static>,
+}
+
+impl Default for Buffers {
+    fn default() -> Buffers {
+        let alloc = Alloc::global();
+        Buffers {
+            out: Outline {
+                items: Vec::new_in(alloc),
+                attrs: Vec::new_in(alloc),
+                file_attrs: AttrSpan::default(),
+                errors: Vec::new_in(alloc),
+                messages: Vec::new_in(alloc),
+                keys: Vec::new_in(alloc),
+                names: Vec::new_in(alloc),
+                file_names: crate::names_digest::file_names_digest("", &[]),
+                own_flags: ItemFlags::NONE,
+                flags: ItemFlags::NONE,
+            },
+            working: Working::new_in(alloc),
         }
     }
-    walk.finish()
 }
 
-/// Whose a list or an attribute is: the file's, or an entry's.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Owner {
-    File,
-    Item(ItemIndex),
+std::thread_local! {
+    /// The thread's [`Buffers`], when none is lent.
+    static BUFFERS: core::cell::Cell<Option<Buffers>> = const { core::cell::Cell::new(None) };
 }
 
-/// What a node is to the outline.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Role {
-    /// Nothing the outline reads by itself.
-    Plain,
-    /// An entry: its [`Open`] is the top of [`Walk::open`] while it is open.
-    Entry,
-    /// A node whose node children are entries of the owner: the file, or an entry's body.
-    List(Owner),
-    /// An entry's body that is not a list: a block, a token tree, a value.
-    Body,
-    /// An entry's visibility or rename, read from its recorded tokens.
-    Decode,
-    /// An attribute or doc comment of the owner, read from its recorded tokens.
-    Attr(Owner),
+impl blaze_mem::scratch::Shelved for Buffers {
+    fn empty(&mut self) {
+        let Buffers { out, working } = self;
+        let Outline { items, attrs, file_attrs, errors, messages, keys, names, file_names, own_flags, flags } = out;
+        items.clear();
+        attrs.clear();
+        errors.clear();
+        messages.clear();
+        keys.clear();
+        names.clear();
+        *file_names = crate::names_digest::file_names_digest("", &[]);
+        *file_attrs = AttrSpan::default();
+        *own_flags = ItemFlags::NONE;
+        *flags = ItemFlags::NONE;
+        // The working vectors are cleared by the next outline, each as it starts.
+        let Working { rows: _, columns: _, digest: _ } = working;
+    }
+
+    fn held(&self) -> usize {
+        self.out.items.capacity() + self.working.columns.held()
+    }
+
+    fn unshelve() -> Option<Buffers> {
+        BUFFERS.try_with(core::cell::Cell::take).ok().flatten()
+    }
+
+    fn shelve(self) {
+        // A thread that is ending: the buffers are freed.
+        let _ = BUFFERS.try_with(|shelf| shelf.set(Some(self)));
+    }
 }
 
-/// An open node.
-struct Frame {
-    kind: SyntaxKind,
-    /// Where its first token starts, once it has one.
-    start: Option<u32>,
-    role: Role,
-    /// It is within the body of a `fn`, `const` or `static` (the top open entry).
-    in_body: bool,
+/// The working vectors of an outline's making, which no outline keeps: the token columns the
+/// grammar and its sink read, the sink's stacks, and the digests' scratch. One set serves text
+/// after text, cleared and never freed (rule 11; docs/v2/plan/design/memory.md, the frame
+/// reset per item).
+pub(crate) struct Working<'a> {
+    rows: rows::Stacks<'a>,
+    columns: rows::Columns<'a>,
+    digest: crate::digest::Scratch<'a>,
 }
 
-/// A token recorded while a [`Role::Decode`] or [`Role::Attr`] node is open.
+pub(crate) mod rows;
+pub(crate) mod token_outline;
+
+impl<'a> Working<'a> {
+    /// Empty: nothing is allocated until the first outline.
+    pub(crate) fn new_in(alloc: Alloc<'a>) -> Working<'a> {
+        Working {
+            rows: rows::Stacks::new_in(alloc),
+            columns: rows::Columns::new_in(alloc),
+            digest: crate::digest::Scratch::new_in(alloc),
+        }
+    }
+}
+
+/// Whether the parser has a `{ .. }` body that holds an item or a macro call at any depth
+/// (an `is_item` node) among input tokens `from..from + len`, when the tokens may say so: false
+/// only when none of them can start one. Every item but a macro call starts with its keyword
+/// (`fn`, `struct`, `enum`, `trait`, `impl`, `const`, `static`, `type`, `mod`, `use`,
+/// `extern`, `macro`, or the contextual `union`); `macro_rules!` and every macro call have a
+/// `!` right after a path, whose last token is an identifier, a path keyword or a generic
+/// argument list's `>`. The grammar takes a `!` there as a call's (`path_expr`, `type_path`,
+/// `path_or_macro_pat`) unless it is a joint `!=` in an expression or type; only a pattern
+/// right before a joint `!=` (`let a != b`), which nothing valid has, is a call this misses.
+/// A `const` right after `*` is a pointer type's, never an item's.
+fn may_hold_items(input: parser::Tokens<'_>, from: usize, len: usize) -> bool {
+    let mut prev = EOF;
+    for at in from..from + len {
+        let kind = input.kind(at);
+        let item = match kind {
+            FN_KW | STRUCT_KW | ENUM_KW | TRAIT_KW | IMPL_KW | STATIC_KW | TYPE_KW | MOD_KW
+            | USE_KW | EXTERN_KW | MACRO_KW => true,
+            CONST_KW => prev != STAR,
+            IDENT => input.contextual_kind(at) == UNION_KW,
+            BANG => {
+                matches!(prev, IDENT | SELF_KW | SUPER_KW | CRATE_KW | SELF_TYPE_KW | R_ANGLE)
+                    && !(input.is_joint(at) && input.kind(at + 1) == EQ)
+            }
+            _ => false,
+        };
+        if item {
+            return true;
+        }
+        prev = kind;
+    }
+    false
+}
+
+/// How an outline reads a `fn` body: parsed with the rest, or left unparsed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bodies {
+    /// Every body parsed: the definition the skipping outline is tested equal to.
+    Parsed,
+    /// A body the grammar may leave unparsed (`parser::lazy_block_len`) is parsed only when its
+    /// tokens may hold an item or a macro call ([`may_hold_items`]), and then only as far as
+    /// the first statement that does (`parser::Sink::satisfied`). The whole text is lexed
+    /// either way, so the lexer's findings are the same; the parser's findings inside a body
+    /// left unparsed are not the outline's: they are found when the body is parsed for its own
+    /// record.
+    Skipped,
+}
+
+/// A token of a visibility, a rename or an attribute, recorded for reading it
+/// ([`visibility_of`], [`rename_of`], [`attr_of`]).
 #[derive(Clone, Copy)]
 struct Tok {
     kind: SyntaxKind,
     range: Range,
 }
 
-/// An open entry. Its ranges are the file's until it closes.
-struct Open {
-    index: ItemIndex,
-    parent: Option<ItemIndex>,
-    syntax: SyntaxKind,
-    whole: Hasher,
-    signature: Hasher,
-    /// For an entry with no name: its signature tokens outside its attributes.
-    head: Option<Hasher>,
-    head_fed: bool,
-    start: Option<u32>,
-    /// The end of its last token so far.
-    last_end: Option<u32>,
-    body_open: bool,
-    /// One of its own attributes is open.
-    attr_open: bool,
-    /// Where its tokens before the body, a direct `=` or a direct `;` end.
-    before_body: Option<u32>,
-    before_eq: Option<u32>,
-    before_semi: Option<u32>,
-    after_colon: bool,
-    after_eq: bool,
-    name: Option<Range>,
-    visibility: Visibility,
-    rename: Option<Rename>,
-    tree: Option<Range>,
-    path: Option<Range>,
-    input: Option<Range>,
-    abi: Option<Range>,
-    ty: Option<Range>,
-    /// A variant's discriminant or a field's default.
-    value: Option<Range>,
-    body: Option<Range>,
-    holds_items: bool,
-    attrs: AttrSpan,
-    children: u32,
-}
-
-struct Walk<'t, 'l, A: Allocator + Clone> {
-    text: &'t str,
-    lexed: &'l LexedStr<'t>,
-    edition: u8,
-    /// The next lexer token.
-    pos: usize,
-    /// Where token `pos` starts, or the trivia before it.
-    offset: u32,
-    /// The end of the last token the parser took.
-    prev_end: Option<u32>,
-    frames: Vec<Frame, A>,
-    open: Vec<Open, A>,
-    /// The depth of the node whose tokens are being recorded into `tokens`.
-    recorded: Option<usize>,
-    tokens: Vec<Tok, A>,
-    /// How many entries of each sibling key the walk has closed.
-    siblings: ByHash<ContentId, u32, A>,
-    file_children: u32,
-    out: Outline<A>,
-}
-
-impl<'t, 'l, A: Allocator + Clone> Walk<'t, 'l, A> {
-    fn new(text: &'t str, lexed: &'l LexedStr<'t>, edition: Edition, alloc: A) -> Self {
-        Walk {
-            text,
-            lexed,
-            edition: edition_byte(edition),
-            pos: 0,
-            offset: 0,
-            prev_end: None,
-            frames: Vec::new_in(alloc.clone()),
-            open: Vec::new_in(alloc.clone()),
-            recorded: None,
-            tokens: Vec::new_in(alloc.clone()),
-            siblings: ByHash::new_in(alloc.clone()),
-            file_children: 0,
-            out: Outline {
-                items: Vec::new_in(alloc.clone()),
-                attrs: Vec::new_in(alloc.clone()),
-                file_attrs: AttrSpan::default(),
-                errors: Vec::new_in(alloc.clone()),
-                messages: Vec::new_in(alloc),
-            },
-        }
-    }
-
-    fn token_len(&self, at: usize) -> u32 {
-        u32::try_from(self.lexed.text_len(at)).expect("a token of a file under 4 GiB")
-    }
-
-    fn skip_trivia(&mut self) {
-        while self.pos < self.lexed.len() && self.lexed.kind(self.pos).is_trivia() {
-            self.offset += self.token_len(self.pos);
-            self.pos += 1;
-        }
-    }
-
-    /// The kind of the `skip`-th token from `pos` that is not trivia.
-    fn peek(&self, skip: usize) -> Option<SyntaxKind> {
-        let mut seen = 0;
-        for at in self.pos..self.lexed.len() {
-            let kind = self.lexed.kind(at);
-            if kind.is_trivia() {
-                continue;
-            }
-            if seen == skip {
-                return Some(kind);
-            }
-            seen += 1;
-        }
-        None
-    }
-
-    /// Whether the attribute or doc comment starting at `pos` is an inner one.
-    fn next_is_inner(&self) -> bool {
-        match self.peek(0) {
-            Some(INNER_DOC_COMMENT) => true,
-            Some(POUND) => self.peek(1) == Some(BANG),
-            _ => false,
-        }
-    }
-
-    /// The parser took one raw token.
-    fn token(&mut self) {
-        self.skip_trivia();
-        assert!(self.pos < self.lexed.len(), "the parser took a token past the lexer's last");
-        let kind = self.lexed.kind(self.pos);
-        let range = Range::new(self.offset, self.offset + self.token_len(self.pos));
-        let touches = self.prev_end == Some(range.start);
-        for frame in self.frames.iter_mut().rev() {
-            if frame.start.is_some() {
-                break;
-            }
-            frame.start = Some(range.start);
-        }
-        if self.frames.last().is_some_and(|frame| frame.role == Role::Entry) {
-            let open = self.open.last_mut().expect("an entry's node has its open entry");
-            let before = open.last_end.unwrap_or(range.start);
-            match kind {
-                SEMICOLON => open.before_semi = Some(before),
-                EQ => {
-                    open.before_eq.get_or_insert(before);
-                    open.after_eq = true;
-                }
-                COLON => open.after_colon = true,
-                _ => {}
-            }
-        }
-        if self.recorded.is_some() {
-            self.tokens.push(Tok { kind, range });
-        }
-        let bytes = range.of(self.text).as_bytes();
-        for open in self.open.iter_mut() {
-            // Whether it touches the token before it in this entry: never for its first.
-            let joint = [u8::from(touches && open.last_end.is_some())];
-            open.whole.update(&joint).part(bytes);
-            if !open.body_open {
-                open.signature.update(&joint).part(bytes);
-                if !open.attr_open
-                    && let Some(head) = &mut open.head
-                {
-                    head.update(&[u8::from(touches && open.head_fed)]).part(bytes);
-                    open.head_fed = true;
-                }
-            }
-            open.start.get_or_insert(range.start);
-            open.last_end = Some(range.end);
-        }
-        self.prev_end = Some(range.end);
-        self.offset = range.end;
-        self.pos += 1;
-    }
-
-    fn enter(&mut self, kind: SyntaxKind) {
-        let Some(parent) = self.frames.last() else {
-            assert_eq!(kind, SOURCE_FILE, "a source file's parse starts with its root");
-            self.frames.push(Frame {
-                kind,
-                start: None,
-                role: Role::List(Owner::File),
-                in_body: false,
-            });
-            return;
-        };
-        let (parent_kind, parent_role, in_body) = (parent.kind, parent.role, parent.in_body);
-        if in_body && is_item(kind) {
-            // A node in a body is under the body's entry, the top open one: none opens inside.
-            self.open.last_mut().expect("a body's entry is open").holds_items = true;
-        }
-        let (role, opens_body) = match parent_role {
-            Role::List(owner) => (self.list_child(kind, parent_kind, owner), false),
-            Role::Entry => self.entry_child(kind),
-            Role::Plain | Role::Body | Role::Decode | Role::Attr(_) => (Role::Plain, false),
-        };
-        if matches!(role, Role::Decode | Role::Attr(_)) {
-            self.recorded = Some(self.frames.len());
-            self.tokens.clear();
-        }
-        self.frames.push(Frame { kind, start: None, role, in_body: in_body || opens_body });
-    }
-
-    /// A node entered in a list: an attribute of the list's owner, or an entry.
-    fn list_child(&mut self, kind: SyntaxKind, list: SyntaxKind, owner: Owner) -> Role {
-        let children = match owner {
-            Owner::File => self.file_children,
-            Owner::Item(_) => self.open.last().expect("a list's owner is open").children,
-        };
-        // An inner attribute before the first item is the owner's; any other at item level
-        // (an outer one with no item, an inner one after an item) is an error entry.
-        if matches!(kind, ATTR | DOC_COMMENT)
-            && is_item_list(list)
-            && children == 0
-            && self.next_is_inner()
-        {
-            return Role::Attr(owner);
-        }
-        self.open_entry(kind, owner);
-        Role::Entry
-    }
-
-    fn open_entry(&mut self, syntax: SyntaxKind, owner: Owner) {
-        let index = ItemIndex(
-            u32::try_from(self.out.items.len()).expect("an outline's entries are counted in u32"),
-        );
-        self.out.items.push(PLACEHOLDER);
-        let parent = match owner {
-            Owner::File => {
-                self.file_children += 1;
-                None
-            }
-            Owner::Item(parent) => {
-                self.open.last_mut().expect("a list's owner is open").children += 1;
-                Some(parent)
-            }
-        };
-        let at = u32::try_from(self.out.attrs.len()).expect("attributes are counted in u32");
-        let mut whole = Hasher::new(ITEM_DOMAIN);
-        whole.update(&[self.edition]);
-        let mut signature = Hasher::new(SIGNATURE_DOMAIN);
-        signature.update(&[self.edition]);
-        self.open.push(Open {
-            index,
-            parent,
-            syntax,
-            whole,
-            signature,
-            head: (!is_named(syntax)).then(|| Hasher::new(HEAD_DOMAIN)),
-            head_fed: false,
-            start: None,
-            last_end: None,
-            body_open: false,
-            attr_open: false,
-            before_body: None,
-            before_eq: None,
-            before_semi: None,
-            after_colon: false,
-            after_eq: false,
-            name: None,
-            visibility: Visibility::Private,
-            rename: None,
-            tree: None,
-            path: None,
-            input: None,
-            abi: None,
-            ty: None,
-            value: None,
-            body: None,
-            holds_items: false,
-            attrs: AttrSpan { start: at, end: at },
-            children: 0,
-        });
-    }
-
-    /// A node entered directly in the top open entry, and whether it opens a body whose
-    /// items and macro calls the entry is to say it holds.
-    fn entry_child(&mut self, kind: SyntaxKind) -> (Role, bool) {
-        let next = self.peek(0);
-        let here = self.offset;
-        let open = self.open.last_mut().expect("an entry's node has its open entry");
-        match kind {
-            ATTR | DOC_COMMENT => {
-                open.attr_open = true;
-                return (Role::Attr(Owner::Item(open.index)), false);
-            }
-            VISIBILITY | RENAME => return (Role::Decode, false),
-            _ => {}
-        }
-        let starts_body = open.body.is_none()
-            && !open.body_open
-            && match open.syntax {
-                FN => kind == BLOCK_EXPR,
-                MODULE => kind == ITEM_LIST,
-                TRAIT | IMPL => kind == ASSOC_ITEM_LIST,
-                EXTERN_BLOCK => kind == EXTERN_ITEM_LIST,
-                ENUM => kind == VARIANT_LIST,
-                STRUCT | UNION | VARIANT => matches!(kind, RECORD_FIELD_LIST | TUPLE_FIELD_LIST),
-                MACRO_RULES | MACRO_CALL => kind == TOKEN_TREE,
-                // `macro m($x:expr) { .. }`: the arguments are a `( .. )`, the body a `{ .. }`.
-                MACRO_DEF => kind == TOKEN_TREE && next == Some(L_CURLY),
-                CONST | STATIC => open.after_eq,
-                _ => false,
-            };
-        if !starts_body {
-            return (Role::Plain, false);
-        }
-        open.body_open = true;
-        open.before_body = Some(open.last_end.unwrap_or(here));
-        let role = match is_list(kind) {
-            true => Role::List(Owner::Item(open.index)),
-            false => Role::Body,
-        };
-        (role, matches!(open.syntax, FN | CONST | STATIC))
-    }
-
-    fn exit(&mut self) {
-        let frame = self.frames.pop().expect("the parser's exits match its enters");
-        let range = match frame.start {
-            Some(start) => {
-                Range::new(start, self.prev_end.expect("a node with a token has its token's end"))
-            }
-            None => Range::new(self.offset, self.offset),
-        };
-        let recorded = self.recorded == Some(self.frames.len());
-        match frame.role {
-            Role::Entry => self.close_entry(range),
-            Role::Attr(owner) => self.close_attr(owner, frame.kind, range),
-            Role::Decode => self.decode(frame.kind),
-            Role::List(_) | Role::Body | Role::Plain => {}
-        }
-        if self.frames.last().is_some_and(|parent| parent.role == Role::Entry) {
-            self.direct_child(frame.kind, frame.role, range);
-        }
-        if recorded {
-            self.recorded = None;
-            self.tokens.clear();
-        }
-    }
-
-    /// A node directly in the top open entry closed over `range`.
-    fn direct_child(&mut self, kind: SyntaxKind, role: Role, range: Range) {
-        let open = self.open.last_mut().expect("an entry's node has its open entry");
-        // A node with no token before the entry's first: the entry starts where it does.
-        open.start.get_or_insert(range.start);
-        match role {
-            Role::Body | Role::List(_) => {
-                open.body = Some(range);
-                open.body_open = false;
-                if open.syntax == MACRO_CALL {
-                    open.input = Some(range);
-                }
-                return;
-            }
-            Role::Attr(_) | Role::Decode | Role::Entry => return,
-            Role::Plain => {}
-        }
-        match (open.syntax, kind) {
-            (_, NAME) => {
-                open.name.get_or_insert(range);
-            }
-            (EXTERN_CRATE, NAME_REF) => {
-                open.name.get_or_insert(range);
-            }
-            (USE, USE_TREE) => open.tree = Some(range),
-            (MACRO_CALL, PATH) => open.path = Some(range),
-            (EXTERN_BLOCK, ABI) => open.abi = Some(range),
-            (RECORD_FIELD, _) if open.after_colon && open.ty.is_none() => open.ty = Some(range),
-            (TUPLE_FIELD, _) if kind != MUT_RESTRICTION && open.ty.is_none() => {
-                open.ty = Some(range)
-            }
-            (VARIANT | RECORD_FIELD, _) if open.after_eq && open.value.is_none() => {
-                open.value = Some(range)
-            }
-            _ => {}
-        }
-    }
-
-    /// A visibility or rename of the top open entry closed: read it from its tokens.
-    fn decode(&mut self, kind: SyntaxKind) {
-        let tokens = &self.tokens;
-        let open = self.open.last_mut().expect("an entry's node has its open entry");
-        match kind {
-            VISIBILITY => open.visibility = visibility_of(tokens),
-            RENAME => open.rename = rename_of(tokens),
-            _ => unreachable!("only a visibility or a rename is decoded, not a {kind:?}"),
-        }
-    }
-
-    fn close_attr(&mut self, owner: Owner, kind: SyntaxKind, range: Range) {
-        let (inner, attr) = attr_of(kind, &self.tokens, self.text);
-        let base = match owner {
-            Owner::File => 0,
-            Owner::Item(_) => self
-                .open
-                .last()
-                .expect("an attribute's owner is open")
-                .start
-                .expect("an attribute's first token started its owner"),
-        };
-        let attr = match attr {
-            AttrKind::Path { literal } => AttrKind::Path { literal: relative(literal, base) },
-            other => other,
-        };
-        self.out.attrs.push(Attr { range: relative(range, base), inner, kind: attr });
-        let end = u32::try_from(self.out.attrs.len()).expect("attributes are counted in u32");
-        match owner {
-            Owner::File => self.out.file_attrs.end = end,
-            Owner::Item(_) => {
-                let open = self.open.last_mut().expect("an attribute's owner is open");
-                open.attrs.end = end;
-                open.attr_open = false;
-            }
-        }
-    }
-
-    fn close_entry(&mut self, range: Range) {
-        let open = self.open.pop().expect("an entry's node has its open entry");
-        let start = open.start.unwrap_or(range.start);
-        let end = range.end.max(start);
-        let rel = |part: Range| relative(part, start);
-        let signature_end = match open.syntax {
-            CONST | STATIC => open.before_eq.or(open.before_body),
-            _ => open.before_body,
-        }
-        .or(open.before_semi)
-        .unwrap_or(end)
-        .max(start);
-        let attrs = &self.out.attrs[usize_of(open.attrs.start)..usize_of(open.attrs.end)];
-        let kind = match open.syntax {
-            FN => ItemKind::Fn { body_holds_items: open.holds_items },
-            STRUCT => ItemKind::Struct,
-            ENUM => ItemKind::Enum,
-            UNION => ItemKind::Union,
-            TRAIT if open.before_eq.is_some() => ItemKind::TraitAlias,
-            TRAIT => ItemKind::Trait,
-            IMPL => ItemKind::Impl,
-            CONST => ItemKind::Const { body_holds_items: open.holds_items },
-            STATIC => ItemKind::Static { body_holds_items: open.holds_items },
-            TYPE_ALIAS => ItemKind::TypeAlias,
-            MODULE => ItemKind::Mod {
-                inline: open.body.is_some(),
-                path: attrs.iter().find_map(|attr| match attr.kind {
-                    AttrKind::Path { literal } if !attr.inner => Some(literal),
-                    _ => None,
-                }),
-            },
-            USE => ItemKind::Use { tree: open.tree.map(rel) },
-            EXTERN_CRATE => ItemKind::ExternCrate {
-                rename: open.rename.map(|rename| match rename {
-                    Rename::Name(name) => Rename::Name(rel(name)),
-                    Rename::Underscore => Rename::Underscore,
-                }),
-            },
-            EXTERN_BLOCK => ItemKind::ExternBlock { abi: open.abi.map(rel) },
-            MACRO_RULES => ItemKind::MacroRules {
-                exported: attrs.iter().any(|attr| !attr.inner && attr.kind == AttrKind::MacroExport),
-            },
-            MACRO_DEF => ItemKind::MacroDef,
-            MACRO_CALL => {
-                ItemKind::MacroCall { path: open.path.map(rel), input: open.input.map(rel) }
-            }
-            VARIANT => ItemKind::Variant { discriminant: open.value.map(rel) },
-            RECORD_FIELD | TUPLE_FIELD => {
-                ItemKind::Field { ty: open.ty.map(rel), default: open.value.map(rel) }
-            }
-            ERROR | ATTR | DOC_COMMENT => ItemKind::Error,
-            syntax => ItemKind::Unhandled { syntax },
-        };
-        let mut sibling = Hasher::new(SIBLING_DOMAIN);
-        sibling
-            .update(&open.parent.map_or(0u64, |parent| u64::from(parent.0) + 1).to_le_bytes())
-            .update(&[tag_of(kind)]);
-        match (&open.head, open.syntax) {
-            (Some(head), _) => {
-                sibling.id(&head.finish());
-            }
-            // A tuple field is told apart by its position alone.
-            (None, TUPLE_FIELD) => {}
-            (None, _) => {
-                sibling.opt_part(open.name.map(|name| {
-                    let name = name.of(self.text);
-                    name.strip_prefix("r#").unwrap_or(name)
-                }));
-            }
-        }
-        let count = self.siblings.entry(sibling.finish()).or_insert(0);
-        let disambiguator = *count;
-        *count += 1;
-        let after = u32::try_from(self.out.items.len()).expect("an outline's entries are counted in u32");
-        self.out.items[open.index.at()] = Item {
-            kind,
-            parent: open.parent,
-            end: ItemIndex(after),
-            range: Range::new(start, end),
-            name: open.name.map(rel),
-            visibility: match open.visibility {
-                Visibility::In { path } => Visibility::In { path: rel(path) },
-                Visibility::WithoutIn { path } => Visibility::WithoutIn { path: rel(path) },
-                other => other,
-            },
-            signature: Range::new(0, signature_end - start),
-            body: open.body.map(rel),
-            attrs: open.attrs,
-            disambiguator,
-            hash: open.whole.finish(),
-            signature_hash: open.signature.finish(),
-        };
-    }
-
-    fn parser_error(&mut self, message: &str) {
-        let range = Range::new(self.offset, self.offset);
-        self.push_error(range, ErrorOrigin::Parser, message);
-    }
-
-    fn push_error(&mut self, range: Range, origin: ErrorOrigin, message: &str) {
-        let start = u32::try_from(self.out.messages.len()).expect("messages under 4 GiB");
-        self.out.messages.extend_from_slice(message.as_bytes());
-        let end = u32::try_from(self.out.messages.len()).expect("messages under 4 GiB");
-        self.out.errors.push(SyntaxError { range, origin, message: Range::new(start, end) });
-    }
-
-    fn finish(mut self) -> Outline<A> {
-        assert!(
-            self.frames.is_empty() && self.open.is_empty(),
-            "the parser's output closes every node it opens"
-        );
-        let lexed = self.lexed;
-        for (token, message) in lexed.errors() {
-            let at = lexed.text_range(token);
-            let range = Range::new(
-                u32::try_from(at.start).expect("a file under 4 GiB"),
-                u32::try_from(at.end).expect("a file under 4 GiB"),
-            );
-            self.push_error(range, ErrorOrigin::Lexer, message);
-        }
-        self.out
-    }
+/// Pushes an error at `range` with `message`, copied onto the end of `messages`.
+fn push_error(errors: &mut AVec<'_, SyntaxError>, messages: &mut AVec<'_, u8>, range: Range, origin: ErrorOrigin, message: &str) {
+    let start = u32::try_from(messages.len()).expect("messages under 4 GiB");
+    messages.extend_from_slice(message.as_bytes());
+    let end = u32::try_from(messages.len()).expect("messages under 4 GiB");
+    errors.push(SyntaxError { range, origin, message: Range::new(start, end) });
 }
 
 /// `part`, a range of the file inside an item starting at `base`, relative to the item.
@@ -695,6 +230,18 @@ fn is_item(kind: SyntaxKind) -> bool {
             | UNION
             | USE
     )
+}
+
+/// Whether a direct child supplies the outline entry's name. For `extern crate x as y;`
+/// the name is the crate reference `x`: scope lowering resolves that target, then uses
+/// the separate rename to determine the local binding.
+fn is_name_child(entry: SyntaxKind, child: SyntaxKind) -> bool {
+    matches!((entry, child), (_, NAME) | (EXTERN_CRATE, NAME_REF))
+}
+
+/// Syntax kinds the text outline classifies as errors when it makes a row for them.
+fn is_error_entry(kind: SyntaxKind) -> bool {
+    matches!(kind, ERROR | ATTR | DOC_COMMENT)
 }
 
 /// The kinds of entry told apart from their siblings by name: the rest, by their head.
@@ -737,36 +284,36 @@ fn is_list(kind: SyntaxKind) -> bool {
 }
 
 /// The kind of an entry as one byte of its sibling key: its variant, not its payload.
-fn tag_of(kind: ItemKind) -> u8 {
+fn tag_of(kind: ItemDetail) -> u8 {
     match kind {
-        ItemKind::Fn { .. } => 0,
-        ItemKind::Struct => 1,
-        ItemKind::Enum => 2,
-        ItemKind::Union => 3,
-        ItemKind::Trait => 4,
-        ItemKind::TraitAlias => 5,
-        ItemKind::Impl => 6,
-        ItemKind::Const { .. } => 7,
-        ItemKind::Static { .. } => 8,
-        ItemKind::TypeAlias => 9,
-        ItemKind::Mod { .. } => 10,
-        ItemKind::Use { .. } => 11,
-        ItemKind::ExternCrate { .. } => 12,
-        ItemKind::ExternBlock { .. } => 13,
-        ItemKind::MacroRules { .. } => 14,
-        ItemKind::MacroDef => 15,
-        ItemKind::MacroCall { .. } => 16,
-        ItemKind::Variant { .. } => 17,
-        ItemKind::Field { .. } => 18,
-        ItemKind::Error => 19,
-        ItemKind::Unhandled { .. } => 20,
+        ItemDetail::Fn { .. } => 0,
+        ItemDetail::Struct => 1,
+        ItemDetail::Enum => 2,
+        ItemDetail::Union => 3,
+        ItemDetail::Trait => 4,
+        ItemDetail::TraitAlias => 5,
+        ItemDetail::Impl => 6,
+        ItemDetail::Const { .. } => 7,
+        ItemDetail::Static { .. } => 8,
+        ItemDetail::TypeAlias => 9,
+        ItemDetail::Mod { .. } => 10,
+        ItemDetail::Use { .. } => 11,
+        ItemDetail::ExternCrate { .. } => 12,
+        ItemDetail::ExternBlock { .. } => 13,
+        ItemDetail::MacroRules { .. } => 14,
+        ItemDetail::MacroDef => 15,
+        ItemDetail::MacroCall { .. } => 16,
+        ItemDetail::Variant { .. } => 17,
+        ItemDetail::Field { .. } => 18,
+        ItemDetail::Error => 19,
+        ItemDetail::Unhandled { .. } => 20,
     }
 }
 
 /// A visibility from its tokens: `pub`, then `( .. )` or nothing. Ranges are the file's.
-fn visibility_of(tokens: &[Tok]) -> Visibility {
+fn visibility_of(tokens: &[Tok]) -> WrittenVis<Range> {
     let Some(paren) = tokens.get(1).filter(|token| token.kind == L_PAREN) else {
-        return Visibility::Pub;
+        return WrittenVis::Pub;
     };
     let inside = match tokens {
         [_, _, inside @ .., close] if close.kind == R_PAREN => inside,
@@ -778,19 +325,19 @@ fn visibility_of(tokens: &[Tok]) -> Visibility {
         _ => Range::new(paren.range.end, paren.range.end),
     };
     match inside {
-        [only] if only.kind == CRATE_KW => Visibility::Crate,
-        [only] if only.kind == SUPER_KW => Visibility::Super,
-        [only] if only.kind == SELF_KW => Visibility::SelfOnly,
-        [first, path @ ..] if first.kind == IN_KW => Visibility::In { path: span(path) },
-        path => Visibility::WithoutIn { path: span(path) },
+        [only] if only.kind == CRATE_KW => WrittenVis::Crate,
+        [only] if only.kind == SUPER_KW => WrittenVis::Super,
+        [only] if only.kind == SELF_KW => WrittenVis::SelfOnly,
+        [first, path @ ..] if first.kind == IN_KW => WrittenVis::In(span(path)),
+        path => WrittenVis::WithoutIn(span(path)),
     }
 }
 
 /// An `extern crate`'s rename from its tokens: `as`, then a name or `_`.
-fn rename_of(tokens: &[Tok]) -> Option<Rename> {
+fn rename_of(tokens: &[Tok]) -> Option<Rename<Range>> {
     match tokens.get(1) {
         Some(token) if token.kind == UNDERSCORE => Some(Rename::Underscore),
-        Some(token) => Some(Rename::Name(token.range)),
+        Some(token) => Some(Rename::To(token.range)),
         None => None,
     }
 }

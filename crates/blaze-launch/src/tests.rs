@@ -2,22 +2,35 @@
 //! ([`sim`]); the wire's bytes against blaze-protocol's check of the deterministic encoding
 //! ([`wire`]); and here, what one call of the core refuses and what the area gives back.
 
+mod fault_callers_wire;
+mod fault_regs_wire;
+mod fault_wire;
+mod grants;
 mod image;
+mod observe;
 mod record;
+mod run_wire;
 mod sim;
+mod telemetry;
 mod wire;
+
+use blaze_own::Alloc;
 
 use crate::area::Area;
 use crate::{
-    Bind, CodeId, Config, Edit, Error, Frame, FrameKind, KEPT, Kept, Launch, Range, Slot, Target,
-    Thread, Tier, Txn, Write,
+    Bind, CodeId, Config, Edit, Error, Frame, FrameKind, Range, Slot, Target, Thread, Tier, Txn,
+    Write,
 };
+
+/// The core as it ships, its tables in the tests' heap.
+type Launch = crate::Launch<Alloc<'static>>;
 
 const CONFIG: Config =
     Config { slots: 4, area: 4096, page: 256, gate_head: 16, gate_entry: 16, gate_align: 16 };
 
-fn alloc() -> Kept {
-    KEPT
+/// The tests' root allocator (D170 C1), in place of the global heap.
+fn alloc() -> Alloc<'static> {
+    blaze_own::testing::heap().alloc()
 }
 
 fn bind(slot: u32, len: u64) -> Bind {
@@ -36,7 +49,7 @@ fn rebind(launch: &mut Launch, txn: u64) {
 }
 
 /// A core with every slot declared, and the writes of that taken.
-fn core() -> (Launch, Vec<Write, Kept>) {
+fn core() -> (Launch, Vec<Write, Alloc<'static>>) {
     let mut launch = Launch::new(CONFIG, alloc()).expect("the config is whole");
     let mut out = Vec::new_in(alloc());
     assert_eq!(launch.declare(CONFIG.slots, &mut out), Ok(Slot(0)));

@@ -2,8 +2,9 @@
 //! `src/util/canonical_url.rs` and `cargo-util-schemas`' `core/source_kind.rs` of cargo 1.99.0
 //! (5f94df4789).
 
-use anyhow::{Result, anyhow, bail};
-use blaze_ids::{ContentId, Domain, Interner, Sharded};
+use blaze_ids::{ContentId, Domain, Interner, Shards, Sharded};
+use blaze_semver::{Limits, Version};
+use std::alloc::Global;
 use std::cmp::{self, Ordering};
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -11,7 +12,10 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use url::Url;
 
+use crate::error::SourceError;
 use crate::interning::InternedString;
+
+type Result<T, E = SourceError> = std::result::Result<T, E>;
 
 /// The git index of crates.io, which is what `Cargo.lock` and package ids name crates.io by,
 /// whichever protocol fetches it.
@@ -172,7 +176,7 @@ impl CanonicalUrl {
         let mut url = url.clone();
 
         if url.cannot_be_a_base() {
-            bail!("invalid url `{}`: cannot-be-a-base-URLs are not supported", url)
+            return Err(SourceError::CannotBeABase { url: url.to_string() });
         }
 
         if url.path().ends_with('/') {
@@ -268,7 +272,7 @@ static REGISTRY_NAMES: std::sync::OnceLock<Sharded<KeyOf>> = std::sync::OnceLock
 static REGISTRY_NAME: Domain = Domain::new("blaze-source registry name 1");
 
 fn registry_names() -> &'static Sharded<KeyOf> {
-    REGISTRY_NAMES.get_or_init(Sharded::new)
+    REGISTRY_NAMES.get_or_init(|| Sharded::new(Shards::for_this_machine()))
 }
 
 /// The key of a registry in [`REGISTRY_NAMES`]. `std` hashing is only ever compared within
@@ -284,7 +288,7 @@ fn registry_name_id(kind: &SourceKind, canonical_url: &CanonicalUrl) -> ContentI
 #[derive(Eq, PartialEq, Clone, Debug, Hash)]
 pub enum Precise {
     Locked,
-    Updated { name: InternedString, from: semver::Version, to: semver::Version },
+    Updated { name: InternedString, from: Version<Global>, to: Version<Global> },
     GitUrlFragment(String),
 }
 
@@ -316,7 +320,7 @@ impl KeyOf {
 }
 
 fn path_to_url(path: &Path) -> Result<Url> {
-    file_url(path).map_err(|()| anyhow!("invalid path url `{}`", path.display()))
+    file_url(path).map_err(|()| SourceError::InvalidPathUrl { path: path.to_owned() })
 }
 
 /// [`Url::from_file_path`]. On Windows the daemon roots every path at `/`, a drive its first
@@ -366,7 +370,7 @@ fn percent_decoded(text: &str) -> Result<String, ()> {
 }
 
 fn str_to_url(s: &str) -> Result<Url> {
-    Url::parse(s).map_err(|e| anyhow!("invalid url `{}`: {}", s, e))
+    Url::parse(s).map_err(|error| SourceError::InvalidUrl { url: s.to_owned(), error })
 }
 
 impl SourceId {
@@ -389,7 +393,7 @@ impl SourceId {
     }
 
     fn wrap(inner: SourceIdInner) -> SourceId {
-        let ids = SOURCE_IDS.get_or_init(Sharded::new);
+        let ids = SOURCE_IDS.get_or_init(|| Sharded::new(Shards::for_this_machine()));
         let mut hasher = blaze_ids::Hasher::of(&SOURCE_ID);
         hasher.std(&inner);
         let at = ids.intern(hasher.finish(), || inner);
@@ -408,7 +412,7 @@ impl SourceId {
     /// `registry+URL`, `sparse+URL`, `path+file://...`. Registry ids come back locked.
     pub fn from_url(string: &str) -> Result<SourceId> {
         let (kind, url) =
-            string.split_once('+').ok_or_else(|| anyhow!("invalid source `{}`", string))?;
+            string.split_once('+').ok_or_else(|| SourceError::NoKind { source: string.to_owned() })?;
 
         match kind {
             "git" => {
@@ -431,7 +435,10 @@ impl SourceId {
                 let url = str_to_url(url)?;
                 SourceId::new(SourceKind::Path, url, None)
             }
-            kind => Err(anyhow!("unsupported source protocol: {}", kind)),
+            kind => Err(SourceError::UnsupportedProtocol {
+                kind: kind.to_owned(),
+                source: string.to_owned(),
+            }),
         }
     }
 
@@ -615,7 +622,7 @@ impl SourceId {
     pub fn precise_registry_version(
         self,
         pkg: &str,
-    ) -> Option<(&'static semver::Version, &'static semver::Version)> {
+    ) -> Option<(&'static Version<Global>, &'static Version<Global>)> {
         match &self.inner.precise {
             Some(Precise::Updated { name, from, to }) if name == pkg => Some((from, to)),
             _ => None,
@@ -659,19 +666,11 @@ impl SourceId {
     pub fn with_precise_registry_version(
         self,
         name: InternedString,
-        version: semver::Version,
+        version: Version<Global>,
         precise: &str,
     ) -> Result<SourceId> {
-        let to = semver::Version::parse(precise).map_err(|e| {
-            let message = if let Some(stripped) = precise.strip_prefix('v') {
-                format!(
-                    "the version provided, `{precise}` is not a valid SemVer version\n\n\
-                     help: try changing the version to `{stripped}`"
-                )
-            } else {
-                format!("invalid version format for precise version `{precise}`")
-            };
-            anyhow::Error::new(e).context(message)
+        let to = Version::parse_in(precise, Limits::CARGO, Global).map_err(|error| {
+            SourceError::PreciseVersion { precise: precise.to_owned(), error }
         })?;
         Ok(SourceId::wrap(SourceIdInner {
             precise: Some(Precise::Updated { name, from: version, to }),
@@ -1051,15 +1050,16 @@ mod tests {
 
     #[test]
     fn precise_update() {
+        let v1 = || Version::parse_in("1.0.0", Limits::CARGO, Global).unwrap();
         let id = SourceId::crates_io()
-            .with_precise_registry_version("serde".into(), "1.0.0".parse().unwrap(), "1.0.5")
+            .with_precise_registry_version("serde".into(), v1(), "1.0.5")
             .unwrap();
         let (from, to) = id.precise_registry_version("serde").unwrap();
         assert_eq!((from.to_string(), to.to_string()), ("1.0.0".to_owned(), "1.0.5".to_owned()));
         assert!(id.precise_registry_version("log").is_none());
         let err = SourceId::crates_io()
-            .with_precise_registry_version("serde".into(), "1.0.0".parse().unwrap(), "v1.0.5")
+            .with_precise_registry_version("serde".into(), v1(), "v1.0.5")
             .unwrap_err();
-        assert!(format!("{err:#}").contains("try changing the version to `1.0.5`"));
+        assert!(format!("{err}").contains("try changing the version to `1.0.5`"));
     }
 }

@@ -3,8 +3,7 @@
 
   tools/nix/unit_graph.py   # cargo --unit-graph per target triple + cargo metadata -> tools/nix/units/<project>.json
 
-Two projects: the daemon (the workspace at the repo root, `-p blaze-engine`) and the Game of Life demo
-(demo/life, its own workspace and lock). Each `tools/nix/units/<project>.json` is read by tools/nix/units.nix,
+One project: the Game of Life demo (demo/life, its own workspace and lock). Each `tools/nix/units/<project>.json` is read by tools/nix/units.nix,
 which picks `systems.<nix system>` and makes one derivation per unit, calling rustc directly
 (tools/nix/unit_build.py). Platform-specific dependencies (num_threads -> libc
 on apple, inotify on linux, ...) differ per target, so each nix system gets its own graph. Rerun whenever
@@ -40,7 +39,6 @@ TARGETS = {
 }
 # project -> (directory with its Cargo.toml/Cargo.lock, extra cargo flags).
 PROJECTS = {
-    "daemon": (".", ["-p", "blaze-engine"]),
     "life": ("demo/life", []),
 }
 UNITS_DIR = ROOT / "tools" / "nix" / "units"
@@ -228,7 +226,7 @@ def write_units(project: str, project_dir: Path, graphs: dict[str, dict], meta: 
 
 async def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("projects", nargs="*", help="daemon and/or life; default: all")
+    ap.add_argument("projects", nargs="*", help="life; default: all")
     args = ap.parse_args()
     if unknown := [p for p in args.projects if p not in PROJECTS]:
         ap.error(f"unknown project {unknown}")

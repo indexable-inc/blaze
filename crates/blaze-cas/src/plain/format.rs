@@ -11,29 +11,124 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::{alloc::Global, cmp::Ordering};
+use std::alloc::Global;
 
+use blaze_format::rows;
 use blaze_ids::{ContentId, crc32c};
 use blaze_keyed::{
     exec::RecordRef,
     kind::{Namespace, Tag},
-    store::{ALIGN, ENTRY, FOOTER, HEADER, SEGMENT_MOST, SegmentId, StoreError},
+    store::{ALIGN, ENTRY, FOOTER, HEADER, Holder, RowRefused, SEGMENT_MOST, SegmentId, StoreError, TwoValues},
 };
 
 /// The format of a plain store's own files: its head slots and its manifests. Formats 1 and 2
 /// shared their number with the segments'; format 3 gives each retired row a mark, "lost, not
-/// yet reported" ([`LostMark`]), in the u32 that format 2 kept zero. A head or a manifest of
-/// another format is refused naming both; there is no migration: the store is rebuilt from
-/// what made it.
-pub const FORMAT: u32 = 3;
+/// yet reported" ([`LostMark`]), in the u32 that format 2 kept zero; format 4 adds a segment
+/// row's flag 4, sealed ([`Segment::sealed`]), which format 3 refused as a row no commit
+/// writes; format 5 gives each root an expiry ([`Root::expires_ns`]) and adds the leases a
+/// running command holds ([`Lease`], counted in the header's last word, which format 4 kept
+/// zero), and a segment row's touch ([`Segment::touched`], a u64 at its end). A head or a manifest of another format is refused naming both; there is no
+/// migration: the store is rebuilt from what made it.
+pub const FORMAT: u32 = 5;
 
 /// The format of a plain segment, which outlives any one store (a published segment is shared
 /// through a bucket): its own number, so a change to the store's own files never changes a
 /// segment's bytes or digest. Format 1 put a kind's byte in an entry's place (bits 56..64);
 /// format 2 puts blaze-keyed's [`Tag`] there (bits 40..56, the u16 little-endian at bytes
-/// 37..39 of the entry). A segment of another format is refused naming both.
-pub const SEGMENT_FORMAT: u32 = 2;
+/// 37..39 of the entry); format 3 has the bytes of format 2 and a new meaning of a reserved
+/// tag (blaze-keyed `ReservedTag`): an expansion record has its own (`u16::MAX - 9`), where
+/// format 2 filed it under the index's (`u16::MAX - 6`), which the reach walk follows. A
+/// segment of another format is refused naming both; a home's store of format 2 is another
+/// form's folder, reported and rebuilt (blaze-cli store/forms.rs), never read.
+pub const SEGMENT_FORMAT: u32 = 3;
 
+/// EVERY FORM A BLAZE MUST AGREE ON TO READ A STORE'S FOLDER (D160), each with the letter its
+/// number takes in the folder's name: `f` the store's own files ([`FORMAT`]), `s` its segments
+/// ([`SEGMENT_FORMAT`]). A store's folder is named by all of them ([`PlaceName`]): a blaze of
+/// another form opens (makes) a folder of its own beside it, and never stops because another
+/// blaze wrote a store. A format constant of the store's files added to this file and not here
+/// fails the test `every_store_format_names_the_place` (plain/tests.rs), which counts them.
+///
+/// A record's own form inside a segment (a startup image's, plain/image.rs; a drive record's)
+/// is not here: a record is found by its key, and its form is its key's (rule 21).
+pub const FORMS: [(u8, u32); 2] = [(b'f', FORMAT), (b's', SEGMENT_FORMAT)];
+
+/// The name of a store's folder of one set of [`FORMS`]: each form's letter and its number in
+/// decimal, in order: `f5s3` for this blaze. Why letters and numbers, not a digest of them: the
+/// name says to a person (and to the note that lists other folders) which forms a folder holds,
+/// a newer one sorts after an older one of the same width, and the forms are few (a digest would
+/// hide them for nothing: the name is no key, and nothing is shared by it).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PlaceName {
+    bytes: [u8; PlaceName::MOST],
+    len: u8,
+}
+
+impl PlaceName {
+    /// The longest name: each form a letter and at most ten digits.
+    const MOST: usize = FORMS.len() * 11;
+
+    /// This blaze's folder: [`FORMS`] as they are.
+    pub const THIS: PlaceName = PlaceName::of(FORMS);
+
+    /// The name of the folder of `forms`.
+    pub const fn of(forms: [(u8, u32); FORMS.len()]) -> PlaceName {
+        let mut bytes = [0u8; PlaceName::MOST];
+        let mut len = 0;
+        let mut i = 0;
+        while i < forms.len() {
+            bytes[len] = forms[i].0;
+            len += 1;
+            let n = forms[i].1;
+            let mut digits = 1;
+            let mut rest = n / 10;
+            while rest > 0 {
+                digits += 1;
+                rest /= 10;
+            }
+            let mut d = 0;
+            let mut rest = n;
+            while d < digits {
+                bytes[len + digits - 1 - d] = b'0' + (rest % 10) as u8;
+                rest /= 10;
+                d += 1;
+            }
+            len += digits;
+            i += 1;
+        }
+        PlaceName { bytes, len: len as u8 }
+    }
+
+    /// The name, in a const too (blaze-cli joins it to the store's root at compile time).
+    pub const fn as_str(&self) -> &str {
+        match core::str::from_utf8(self.bytes.split_at(self.len as usize).0) {
+            Ok(it) => it,
+            Err(_) => panic!("a place name is letters and digits"),
+        }
+    }
+
+    /// The forms a folder named `leaf` holds, when it is a store's folder name: each of
+    /// [`FORMS`]' letters in order, each followed by a decimal number with no leading zero.
+    /// Anything else is no store's folder (`None`), and nothing reads, notes or removes it.
+    pub fn parse(leaf: &str) -> Option<[(u8, u32); FORMS.len()]> {
+        let mut out = FORMS;
+        let mut rest = leaf.as_bytes();
+        for slot in out.iter_mut() {
+            let (&letter, after) = rest.split_first()?;
+            if letter != slot.0 {
+                return None;
+            }
+            let digits = after.iter().take_while(|it| it.is_ascii_digit()).count();
+            if digits == 0 || digits > 10 || (digits > 1 && after[0] == b'0') {
+                return None;
+            }
+            let number: u64 = after[..digits].iter().fold(0u64, |n, d| n * 10 + u64::from(d - b'0'));
+            slot.1 = u32::try_from(number).ok()?;
+            rest = &after[digits..];
+        }
+        rest.is_empty().then_some(out)
+    }
+}
 /// What a head slot starts with.
 pub(crate) const HEAD_MAGIC: [u8; 4] = *b"BLPH";
 
@@ -57,7 +152,7 @@ pub(crate) const OFFSET_MOST: u64 = (1 << 40) * ALIGN;
 const MANIFEST_HEADER: usize = 32;
 
 /// One segment's row in a manifest.
-const SEGMENT_ROW: usize = 80;
+const SEGMENT_ROW: usize = 88;
 
 /// `at` rounded up to [`ALIGN`].
 pub const fn aligned(at: u64) -> u64 {
@@ -308,16 +403,24 @@ pub(crate) fn segment_digest(bytes: &[u8]) -> ContentId {
 /// the lowest key, 64..96 the highest, 96..128 zero. The payloads follow at [`HEADER`].
 pub(crate) fn header(namespace: Namespace, run: &[u8], index_at: u64) -> [u8; HEADER] {
     let count = run.len() / ENTRY;
+    // An empty run's keys are zero: the bytes of an all-zero id.
+    let (lowest, highest) = if count == 0 { (ContentId([0; 32]), ContentId([0; 32])) } else { (id_at(run, 0), id_at(run, (count - 1) * ENTRY)) };
+    header_of(namespace, count as u32, lowest, highest, index_at)
+}
+
+/// THE ONE HOME of a segment's header bytes ([`header`]'s layout): `count` entries, the
+/// lowest key `lowest` and the highest `highest` (zero for an empty run), the index at
+/// `index_at`. A streamed copy says these before its run exists (it counted them in its first
+/// walk).
+pub(crate) fn header_of(namespace: Namespace, count: u32, lowest: ContentId, highest: ContentId, index_at: u64) -> [u8; HEADER] {
     let mut out = [0u8; HEADER];
     out[0..4].copy_from_slice(&SEGMENT_MAGIC);
     out[4..8].copy_from_slice(&SEGMENT_FORMAT.to_le_bytes());
     out[8..16].copy_from_slice(&namespace.0.to_le_bytes());
-    out[16..20].copy_from_slice(&(count as u32).to_le_bytes());
+    out[16..20].copy_from_slice(&count.to_le_bytes());
     out[24..32].copy_from_slice(&index_at.to_le_bytes());
-    if count > 0 {
-        out[32..64].copy_from_slice(&run[0..32]);
-        out[64..96].copy_from_slice(&run[(count - 1) * ENTRY..(count - 1) * ENTRY + 32]);
-    }
+    out[32..64].copy_from_slice(&lowest.0);
+    out[64..96].copy_from_slice(&highest.0);
     out
 }
 
@@ -367,11 +470,11 @@ pub(crate) fn seal_parts<'p>(namespace: Namespace, run: &[u8], index_at: u64, pa
 }
 
 /// A whole segment of `namespace` holding `records` (each its key and tag, and its payload):
-/// the payloads in the order given, the index sorted by key, the first of a duplicate key kept
-/// (the rest dropped unread: one key names one value, rule 21, which the store's put and a
-/// push's comparison enforce), laid out into `out` (cleared first) by the store's one writer
-/// ([`seal_parts`]). What it wrote, described. A commit of the same puts, in the same order,
-/// writes the same bytes.
+/// the payloads and the index in key order, the first given of a duplicate key kept (the rest
+/// dropped unread: one key names one value, rule 21, which the store's put and a push's
+/// comparison enforce), laid out into `out` (cleared first) by the store's one writer
+/// ([`seal_parts`]). What it wrote, described. A commit of the same records, put in any order
+/// on any workers, writes the same bytes.
 ///
 /// A segment of zero records is valid: header, no payloads, an empty index at [`HEADER`], the
 /// footer (176 bytes); [`check_segment`] accepts it and reads no record from it.
@@ -381,9 +484,9 @@ pub fn seal_segment<A: core::alloc::Allocator>(namespace: Namespace, records: &[
     // Stable: of two records of one key the first given stays first, and is the one kept.
     order.sort_by(|a, b| records[*a].0.key.cmp(&records[*b].0.key));
     order.dedup_by(|b, a| records[*a].0.key == records[*b].0.key);
-    // The payloads lie in the order given.
-    let mut laid = order.clone();
-    laid.sort_unstable();
+    // The payloads lie in key order, as a commit lays them: the bytes are the records', not
+    // the order they came in (rule 25).
+    let laid = order;
     let mut entries: Vec<Entry, Global> = Vec::with_capacity_in(laid.len(), Global);
     let mut at = HEADER as u64;
     for &i in &laid {
@@ -552,6 +655,17 @@ pub struct Segment {
     /// It is in a shared bucket (pulled, or pushed): compaction never rewrites it, it only
     /// lets go of this machine's copy.
     pub published: bool,
+    /// Its bytes are on the media, in order before the flip that set this (store-next.md, the
+    /// exit tail): a barrier covered its file and completed before that flip was asked, or an
+    /// open of a later boot read it whole from the disk. An open of a new boot proves it by
+    /// this row with no byte read ([`super::verified::Verified::sealed`]); one not sealed, the
+    /// tail of the boot before, is checked whole as before.
+    pub sealed: bool,
+    /// The newest generation whose commit set a root naming a record of it that the commit
+    /// did not write (a record reused by key): a cleanup slice planned before that generation
+    /// may have judged the record dead, so it does not replace this segment ([`super::core`],
+    /// the reach sweep). Zero: never.
+    pub touched: u64,
 }
 
 impl Segment {
@@ -569,6 +683,8 @@ impl Segment {
             boot: 0,
             local: true,
             published: false,
+            sealed: false,
+            touched: 0,
         }
     }
 
@@ -579,6 +695,133 @@ impl Segment {
     /// Its sorted run of entries, out of the file's bytes (`file`: the whole segment).
     pub fn run<'a>(&self, file: &'a [u8]) -> &'a [u8] {
         &file[self.index_at as usize..self.index_at as usize + self.count as usize * ENTRY]
+    }
+}
+
+/// THE SHAPE A SEGMENT MAY HAVE, the one home of it (rules 74, 76): a file of `len` bytes
+/// whose index of `count` entries starts at `index_at` is at most `most` bytes (the store's
+/// segment cap, [`SEGMENT_MOST`] outside a simulation), its index starts at a multiple of
+/// [`ALIGN`], and the index and the footer end at its length. What a commit's layout and a
+/// merge's copy ask before a byte of the segment is written, and what [`Row::new`] asks of a
+/// row before it is written into a manifest or read out of one.
+pub(crate) fn shape(len: u64, index_at: u64, count: u32, most: u64) -> Result<(), RowRefused> {
+    if len > most {
+        return Err(RowRefused::TooLong { len, most });
+    }
+    if !index_at.is_multiple_of(ALIGN) {
+        return Err(RowRefused::Unaligned { index_at, align: ALIGN });
+    }
+    let end = index_at.checked_add(u64::from(count) * ENTRY as u64 + FOOTER as u64);
+    if end != Some(len) {
+        return Err(RowRefused::NotItsEnd { index_at, count, end, len });
+    }
+    Ok(())
+}
+
+/// A segment row's fields as a manifest's bytes hold them: its flags as their word (1 here,
+/// 2 published, 4 sealed), so a word no commit writes can be named.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct RowFields {
+    pub digest: ContentId,
+    pub len: u64,
+    pub index_at: u64,
+    pub count: u32,
+    pub flags: u32,
+    pub namespace: Namespace,
+    pub generation: u64,
+    pub boot: u64,
+    pub touched: u64,
+}
+
+impl RowFields {
+    /// `seg`'s fields, its flags as their word.
+    pub(crate) fn of(seg: &Segment) -> RowFields {
+        RowFields {
+            digest: seg.digest,
+            len: seg.len,
+            index_at: seg.index_at,
+            count: seg.count,
+            flags: u32::from(seg.local) | u32::from(seg.published) << 1 | u32::from(seg.sealed) << 2,
+            namespace: seg.namespace,
+            generation: seg.generation,
+            boot: seg.boot,
+            touched: seg.touched,
+        }
+    }
+
+    /// The fields of the row at `bytes[at..at + SEGMENT_ROW]`.
+    fn read(bytes: &[u8], at: usize) -> RowFields {
+        RowFields {
+            digest: id_at(bytes, at),
+            len: u64_at(bytes, at + 32),
+            index_at: u64_at(bytes, at + 40),
+            count: u32_at(bytes, at + 48),
+            flags: u32_at(bytes, at + 52),
+            namespace: Namespace(u64_at(bytes, at + 56)),
+            generation: u64_at(bytes, at + 64),
+            boot: u64_at(bytes, at + 72),
+            touched: u64_at(bytes, at + 80),
+        }
+    }
+}
+
+/// A ROW A COMMIT WRITES: the one definition of it (rules 74, 76). Its only constructor,
+/// [`Row::new`], checks it, and a manifest's bytes hold only rows of this type: the commit
+/// encodes through it ([`Manifest::encode`]) and the open decodes through it
+/// ([`Manifest::decode`]), so a manifest its own open would refuse is never written; the flip
+/// that would write one is refused, naming the segment and what is wrong with its row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Row(RowFields);
+
+impl Row {
+    /// `fields` as a row of a manifest of generation `manifest`, in a store whose segments are
+    /// at most `most` bytes: its [`shape`], a generation and a touch no newer than the
+    /// manifest's, flags at most 7. Else why not, with the values.
+    pub(crate) fn new(fields: RowFields, manifest: u64, most: u64) -> Result<Row, RowRefused> {
+        shape(fields.len, fields.index_at, fields.count, most)?;
+        if fields.generation > manifest {
+            return Err(RowRefused::NewerGeneration { row: fields.generation, manifest });
+        }
+        if fields.touched > manifest {
+            return Err(RowRefused::NewerTouch { row: fields.touched, manifest });
+        }
+        if fields.flags > 7 {
+            return Err(RowRefused::Flags { flags: fields.flags });
+        }
+        Ok(Row(fields))
+    }
+
+    /// The segment the row names.
+    pub(crate) fn segment(&self) -> Segment {
+        let it = self.0;
+        Segment {
+            id: u64::from_le_bytes(it.digest.0[0..8].try_into().expect("8 bytes")),
+            digest: it.digest,
+            len: it.len,
+            index_at: it.index_at,
+            count: it.count,
+            local: it.flags & 1 != 0,
+            published: it.flags & 2 != 0,
+            sealed: it.flags & 4 != 0,
+            namespace: it.namespace,
+            generation: it.generation,
+            boot: it.boot,
+            touched: it.touched,
+        }
+    }
+
+    /// Its [`SEGMENT_ROW`] bytes, the one writer of a row.
+    fn encode_into<A: core::alloc::Allocator>(&self, out: &mut Vec<u8, A>) {
+        let it = self.0;
+        out.extend_from_slice(&it.digest.0);
+        out.extend_from_slice(&it.len.to_le_bytes());
+        out.extend_from_slice(&it.index_at.to_le_bytes());
+        out.extend_from_slice(&it.count.to_le_bytes());
+        out.extend_from_slice(&it.flags.to_le_bytes());
+        out.extend_from_slice(&it.namespace.0.to_le_bytes());
+        out.extend_from_slice(&it.generation.to_le_bytes());
+        out.extend_from_slice(&it.boot.to_le_bytes());
+        out.extend_from_slice(&it.touched.to_le_bytes());
     }
 }
 
@@ -604,7 +847,9 @@ pub(crate) fn find_ranged(
         let span = hi - lo;
         let window = PROBE_WINDOW.min(span);
         let guess = if reads < 2 {
-            lo + ((u128::from(want.saturating_sub(lo_prefix)) * u128::from(span)) / u128::from((hi_prefix - lo_prefix).max(1))) as u64
+            let prefix_span = (hi_prefix - lo_prefix).max(1);
+            // The remaining row count is bounded by the segment's u32 count.
+            lo + rows::interpolated_offset(want.saturating_sub(lo_prefix), prefix_span, span as u32)
         } else {
             lo + span / 2
         };
@@ -713,49 +958,76 @@ impl LostMark {
     }
 }
 
-/// A named root: the store's own record (tag [`super::ROOT_TAG`]) listing the keys compaction
-/// keeps for it.
+/// A named root: the store's own record (tag [`blaze_keyed::kind::ReservedTag::Root`]) listing the keys compaction
+/// keeps for it, until `expires_ns` on the wall clock the flips pass in ([`NEVER`]: kept until
+/// it is unset). A root past its expiry keeps nothing, and the next flip drops it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Root {
     pub name: String,
     pub key: ContentId,
     pub generation: u64,
+    pub expires_ns: u64,
 }
 
-/// What one generation holds: its segments (oldest first), its roots, its retired files.
+/// No expiry: a root set with no life ([`super::core::Plain::root`]) or a lease never let go.
+pub(crate) const NEVER: u64 = u64::MAX;
+
+/// What a running command holds while its records are not yet named by a root: every segment
+/// of generation `since` or newer is kept whole, and no file retired after `opened_ns` (less
+/// the grace) is unlinked, until `expires_ns`. Set by the holder's commits, let go by its last;
+/// a process that dies holding one is let go of by the clock.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Lease {
+    /// The holder's [`super::core::PlainConfig::nonce`].
+    pub holder: u64,
+    /// The generation the holder opened on, plus one: the first its commits can name.
+    pub since: u64,
+    /// The wall clock at the holder's open.
+    pub opened_ns: u64,
+    pub expires_ns: u64,
+}
+
+/// What one generation holds: its segments (oldest first), its roots, its leases, its retired
+/// files.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub(crate) struct Manifest {
     pub generation: u64,
     pub segments: Vec<Segment>,
     pub roots: Vec<Root>,
+    pub leases: Vec<Lease>,
     pub retired: Vec<Retired>,
 }
 
+/// One lease row: holder u64, since u64, opened ns u64, expires ns u64.
+const LEASE_ROW: usize = 32;
+
 impl Manifest {
     /// Bytes 0..4 magic `BLPM`, 4..8 format, 8..16 generation, 16..20 segments `s`, 20..24
-    /// retired `r`, 24..28 roots `t`, 28..32 zero; then `s` x 80 (digest 32, length u64, index
-    /// offset u64, entries u32, flags u32 (1 here, 2 published), namespace u64, generation
-    /// u64, boot u64), `r` x 24 (id u64, 1 for a log u32, the mark u32 ([`LostMark::encode`]:
-    /// zero for none, never set on a log), since ns u64), and `t` roots, each 32 key, 8
-    /// generation, 2 name length, the name's UTF-8, zeros to a multiple of 8. Little-endian.
-    pub(crate) fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity_in(MANIFEST_HEADER + SEGMENT_ROW * self.segments.len() + 24 * self.retired.len(), Global);
+    /// retired `r`, 24..28 roots `t`, 28..32 leases `l`; then `s` x 88 (digest 32, length u64,
+    /// index offset u64, entries u32, flags u32 (1 here, 2 published, 4 sealed), namespace u64,
+    /// generation u64, boot u64, touched u64), `r` x 24 (id u64, 1 for a log u32, the mark u32
+    /// ([`LostMark::encode`]: zero for none, never set on a log), since ns u64), `l` x 32
+    /// ([`Lease`]: holder, since, opened ns, expires ns, each u64), and `t` roots, each 32 key,
+    /// 8 generation, 8 expiry ns, 2 name length, the name's UTF-8, zeros to a multiple of 8.
+    /// Little-endian.
+    ///
+    /// Each segment row is written through [`Row::new`], the check [`Manifest::decode`] reads
+    /// it through, in a store whose segments are at most `most` bytes: a row the open would
+    /// refuse is [`StoreError::Row`] here, naming the segment, its row's byte and why, and no
+    /// byte of the manifest is handed on.
+    pub(crate) fn encode(&self, most: u64) -> Result<Vec<u8>, StoreError> {
+        let mut out = Vec::with_capacity_in(MANIFEST_HEADER + SEGMENT_ROW * self.segments.len() + 24 * self.retired.len() + LEASE_ROW * self.leases.len(), Global);
         out.extend_from_slice(&MANIFEST_MAGIC);
         out.extend_from_slice(&FORMAT.to_le_bytes());
         out.extend_from_slice(&self.generation.to_le_bytes());
         out.extend_from_slice(&(self.segments.len() as u32).to_le_bytes());
         out.extend_from_slice(&(self.retired.len() as u32).to_le_bytes());
         out.extend_from_slice(&(self.roots.len() as u32).to_le_bytes());
-        out.extend_from_slice(&[0u8; 4]);
-        for it in &self.segments {
-            out.extend_from_slice(&it.digest.0);
-            out.extend_from_slice(&it.len.to_le_bytes());
-            out.extend_from_slice(&it.index_at.to_le_bytes());
-            out.extend_from_slice(&it.count.to_le_bytes());
-            out.extend_from_slice(&(u32::from(it.local) | u32::from(it.published) << 1).to_le_bytes());
-            out.extend_from_slice(&it.namespace.0.to_le_bytes());
-            out.extend_from_slice(&it.generation.to_le_bytes());
-            out.extend_from_slice(&it.boot.to_le_bytes());
+        out.extend_from_slice(&(self.leases.len() as u32).to_le_bytes());
+        for (i, it) in self.segments.iter().enumerate() {
+            let at = (MANIFEST_HEADER + SEGMENT_ROW * i) as u64;
+            let row = Row::new(RowFields::of(it), self.generation, most).map_err(|why| StoreError::Row { generation: self.generation, segment: it.id, at, why })?;
+            row.encode_into(&mut out);
         }
         for it in &self.retired {
             out.extend_from_slice(&it.id.to_le_bytes());
@@ -763,22 +1035,31 @@ impl Manifest {
             out.extend_from_slice(&LostMark::encode(it.lost).to_le_bytes());
             out.extend_from_slice(&it.since_ns.to_le_bytes());
         }
+        for it in &self.leases {
+            out.extend_from_slice(&it.holder.to_le_bytes());
+            out.extend_from_slice(&it.since.to_le_bytes());
+            out.extend_from_slice(&it.opened_ns.to_le_bytes());
+            out.extend_from_slice(&it.expires_ns.to_le_bytes());
+        }
         for root in &self.roots {
             out.extend_from_slice(&root.key.0);
             out.extend_from_slice(&root.generation.to_le_bytes());
+            out.extend_from_slice(&root.expires_ns.to_le_bytes());
             out.extend_from_slice(&(root.name.len() as u16).to_le_bytes());
             out.extend_from_slice(root.name.as_bytes());
             while !out.len().is_multiple_of(8) {
                 out.push(0);
             }
         }
-        out
+        Ok(out)
     }
 
     /// The manifest `bytes` hold, or why not: [`StoreError::Format`] for one of another format
-    /// (format 2's, before retired rows were marked, is refused so, rule 26), else
-    /// [`StoreError::Manifest`] naming what is wrong and the byte it is at.
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Manifest, StoreError> {
+    /// (format 2's, before retired rows were marked, is refused so, rule 26), a segment row
+    /// [`Row::new`] refuses (segments at most `most` bytes) [`StoreError::Row`] naming the
+    /// segment, the row's byte and why with its values, else [`StoreError::Manifest`] naming
+    /// what is wrong and the byte it is at.
+    pub(crate) fn decode(bytes: &[u8], most: u64) -> Result<Manifest, StoreError> {
         let generation = if bytes.len() >= 16 { u64_at(bytes, 8) } else { 0 };
         let bad = |what: &'static str, at: usize| StoreError::Manifest { generation, what, at: at as u64 };
         let short = || bad("it is cut short", bytes.len());
@@ -791,33 +1072,19 @@ impl Manifest {
         if u32_at(bytes, 4) != FORMAT {
             return Err(StoreError::Format { what: "a plain store's manifest", found: u32_at(bytes, 4), wanted: FORMAT });
         }
-        let (s, r, t) = (u32_at(bytes, 16) as usize, u32_at(bytes, 20) as usize, u32_at(bytes, 24) as usize);
-        let fixed = MANIFEST_HEADER.saturating_add(SEGMENT_ROW.saturating_mul(s)).saturating_add(24usize.saturating_mul(r));
+        let (s, r, t, l) = (u32_at(bytes, 16) as usize, u32_at(bytes, 20) as usize, u32_at(bytes, 24) as usize, u32_at(bytes, 28) as usize);
+        let rows = MANIFEST_HEADER.saturating_add(SEGMENT_ROW.saturating_mul(s)).saturating_add(24usize.saturating_mul(r));
+        let fixed = rows.saturating_add(LEASE_ROW.saturating_mul(l));
         if bytes.len() < fixed {
             return Err(short());
         }
         let mut segments = Vec::with_capacity_in(s, Global);
         for i in 0..s {
             let at = MANIFEST_HEADER + SEGMENT_ROW * i;
-            let digest = id_at(bytes, at);
-            let flags = u32_at(bytes, at + 52);
-            let it = Segment {
-                id: u64::from_le_bytes(digest.0[0..8].try_into().expect("8 bytes")),
-                digest,
-                len: u64_at(bytes, at + 32),
-                index_at: u64_at(bytes, at + 40),
-                count: u32_at(bytes, at + 48),
-                local: flags & 1 != 0,
-                published: flags & 2 != 0,
-                namespace: Namespace(u64_at(bytes, at + 56)),
-                generation: u64_at(bytes, at + 64),
-                boot: u64_at(bytes, at + 72),
-            };
-            let end = it.index_at.checked_add(u64::from(it.count) * ENTRY as u64 + FOOTER as u64);
-            if !it.index_at.is_multiple_of(ALIGN) || it.len > SEGMENT_MOST || end != Some(it.len) || it.generation > generation || flags > 3 {
-                return Err(bad("a segment row is not one a commit writes (its index unaligned, its length past 4 GiB or not its index's end, its generation newer than the manifest's, or flags past 3)", at));
-            }
-            segments.push(it);
+            let fields = RowFields::read(bytes, at);
+            let segment = u64::from_le_bytes(fields.digest.0[0..8].try_into().expect("8 bytes"));
+            let row = Row::new(fields, generation, most).map_err(|why| StoreError::Row { generation, segment, at: at as u64, why })?;
+            segments.push(row.segment());
         }
         let mut retired = Vec::with_capacity_in(r, Global);
         for i in 0..r {
@@ -833,24 +1100,34 @@ impl Manifest {
             }
             retired.push(Retired { id: u64_at(bytes, at), log, since_ns: u64_at(bytes, at + 16), lost });
         }
+        let mut leases = Vec::with_capacity_in(l, Global);
+        for i in 0..l {
+            let at = rows + LEASE_ROW * i;
+            let it = Lease { holder: u64_at(bytes, at), since: u64_at(bytes, at + 8), opened_ns: u64_at(bytes, at + 16), expires_ns: u64_at(bytes, at + 24) };
+            if it.since > generation || leases.iter().any(|other: &Lease| other.holder == it.holder) {
+                return Err(bad("a lease row is not one a flip writes (its generation newer than the manifest's, or a second lease of one holder)", at));
+            }
+            leases.push(it);
+        }
         let mut roots = Vec::with_capacity_in(t, Global);
         let mut at = fixed;
         for _ in 0..t {
-            if bytes.len() < at + 42 {
+            if bytes.len() < at + 50 {
                 return Err(short());
             }
             let key = id_at(bytes, at);
             let generation = u64_at(bytes, at + 32);
-            let len = u16::from_le_bytes([bytes[at + 40], bytes[at + 41]]) as usize;
-            let Some(name) = bytes.get(at + 42..at + 42 + len) else { return Err(short()) };
-            let name = std::str::from_utf8(name).map_err(|_| bad("a root's name is not UTF-8", at + 42))?.to_owned();
-            roots.push(Root { name, key, generation });
-            at = (at + 42 + len).div_ceil(8) * 8;
+            let expires_ns = u64_at(bytes, at + 40);
+            let len = u16::from_le_bytes([bytes[at + 48], bytes[at + 49]]) as usize;
+            let Some(name) = bytes.get(at + 50..at + 50 + len) else { return Err(short()) };
+            let name = std::str::from_utf8(name).map_err(|_| bad("a root's name is not UTF-8", at + 50))?.to_owned();
+            roots.push(Root { name, key, generation, expires_ns });
+            at = (at + 50 + len).div_ceil(8) * 8;
         }
         if at != bytes.len() {
             return Err(bad("its fields end before its last byte", at));
         }
-        Ok(Manifest { generation, segments, roots, retired })
+        Ok(Manifest { generation, segments, roots, leases, retired })
     }
 
     /// The bytes its segments hold.
@@ -888,7 +1165,7 @@ impl Entry {
     pub fn decode(bytes: &[u8]) -> Result<Entry, &'static str> {
         let place = u64_at(bytes, 32);
         if place >> 56 != 0 {
-            return Err("an entry's place has bits 56..64 set, which no entry of format 2 sets");
+            return Err("an entry's place has bits 56..64 set, which no entry of format 2 or 3 sets");
         }
         Ok(Entry::read(bytes))
     }
@@ -916,45 +1193,63 @@ pub(crate) fn key_at(run: &[u8], i: usize) -> ContentId {
     id_at(run, i * ENTRY)
 }
 
-fn prefix_at(run: &[u8], i: usize) -> u64 {
-    u64::from_be_bytes(run[i * ENTRY..i * ENTRY + 8].try_into().expect("8 bytes"))
+/// The position of `key` in `run`, entries sorted by key: `blaze_format::rows`' lookup, the one
+/// home for rows sorted by a digest. Keys are hashes, spread evenly, so it interpolates on their
+/// first eight bytes, each guess between the least and most prefix its probes have bounded the
+/// range by, then bisects: the probes land on the first guess's page and the key's, where
+/// bisection alone takes some twenty over a run of millions, and a run whose keys are not even
+/// still costs at most `rows::most_probes(n)`, a binary search's plus `rows::INTERPOLATIONS`.
+///
+/// No entry is read but the probes (store-next.md): the first guess interpolates over the whole
+/// key space (`0`, `u64::MAX`), so a lookup in a cold run reads the pages its probes land on and
+/// not the run's first and last (two pages a segment, before).
+pub(crate) fn find(run: &[u8], key: &ContentId) -> Option<usize> {
+    find_by(run.len() / ENTRY, key, |i| &run[i * ENTRY..i * ENTRY + 32])
 }
 
-/// The position of `key` in `run`, entries sorted by key. Keys are hashes, spread evenly, so
-/// the first steps interpolate on their first eight bytes (about one probe of a page for a
-/// run of millions, where bisection takes some twenty); bisection finishes, so a run whose
-/// keys are not even still costs at most `3 + log2(n)` probes.
-pub(crate) fn find(run: &[u8], key: &ContentId) -> Option<usize> {
-    let want = u64::from_be_bytes(key.0[0..8].try_into().expect("8 bytes"));
-    let (mut lo, mut hi) = (0usize, run.len() / ENTRY);
-    let mut guesses = 0;
-    while lo < hi {
-        let mid = if guesses < 3 && hi - lo > 8 {
-            guesses += 1;
-            let (first, last) = (prefix_at(run, lo), prefix_at(run, hi - 1));
-            if want < first || want > last {
-                return None;
-            }
-            match last - first {
-                0 => lo + (hi - lo) / 2,
-                span => lo + ((u128::from(want - first) * (hi - 1 - lo) as u128) / u128::from(span)) as usize,
-            }
-        } else {
-            lo + (hi - lo) / 2
-        };
-        match run[mid * ENTRY..mid * ENTRY + 32].cmp(&key.0[..]) {
-            Ordering::Equal => return Some(mid),
-            Ordering::Less => lo = mid + 1,
-            Ordering::Greater => hi = mid,
+/// [`find`] over `n` entries whose `i`th key `key_of` reads: the entries a lookup touches are
+/// the `i` it asks for, which a test counts as pages.
+pub(crate) fn find_by<'a>(n: usize, key: &ContentId, key_of: impl FnMut(usize) -> &'a [u8]) -> Option<usize> {
+    rows::seek_from(0, n, 0, &key.0, key_of).ok()
+}
+
+/// The positions of `keys` in a run of `n` entries whose `i`th key `key_of` reads, in the
+/// order `keys` were given: what [`find_by`] answers for each, found in one pass. The keys are
+/// sorted as the run is, and each is sought from where the one before it ended, never before:
+/// the run's pages are touched in ascending order, a page the keys share probed once for all of
+/// them, where one lookup a key starts each from the whole run (store-next.md, "Batches").
+/// Public for the shared cache's reader (blaze-remote's `read`), which seeks a fetched index
+/// page of another stride with it (remote-read.md): one interpolation, one home.
+pub fn find_many<'a>(n: usize, keys: &[ContentId], mut key_of: impl FnMut(usize) -> &'a [u8]) -> Vec<Option<usize>, Global> {
+    // alloc: once per batch, the order its keys are sought in and its answers
+    let mut order: Vec<usize, Global> = Vec::with_capacity_in(keys.len(), Global);
+    order.extend(0..keys.len());
+    order.sort_unstable_by(|a, b| keys[*a].cmp(&keys[*b]));
+    let mut found: Vec<Option<usize>, Global> = Vec::with_capacity_in(keys.len(), Global);
+    found.resize(keys.len(), None);
+    // Each key sought from where the one before it ended: every entry before has a key below.
+    let mut seeker = rows::Seeker::new();
+    let mut last: Option<(&ContentId, Option<usize>)> = None;
+    for at in order {
+        let key = &keys[at];
+        if let Some((before, answer)) = last
+            && before == key
+        {
+            found[at] = answer;
+            continue;
         }
+        let answer = seeker.seek(n, &key.0, &mut key_of).ok();
+        found[at] = answer;
+        last = Some((key, answer));
     }
-    None
+    found
 }
 
 /// `entries` as one sorted run, each key once. Two entries of one key that are not one record
 /// (two values under one key, rule 21) stop it with [`StoreError::TwoValues`], naming the key
-/// and the later record's tag.
-pub(crate) fn sorted_run(mut entries: Vec<Entry>) -> Result<Vec<u8>, StoreError> {
+/// and the later record's tag. The run is the process heap: it is moved whole into the
+/// segment's write (blaze-core's effect owns it); `entries` may be in any allocator.
+pub(crate) fn sorted_run<B: core::alloc::Allocator>(mut entries: Vec<Entry, B>) -> Result<Vec<u8>, StoreError> {
     entries.sort_unstable_by(|a, b| a.key.cmp(&b.key));
     let mut out = Vec::with_capacity_in(entries.len() * ENTRY, Global);
     let mut last: Option<Entry> = None;
@@ -962,7 +1257,18 @@ pub(crate) fn sorted_run(mut entries: Vec<Entry>) -> Result<Vec<u8>, StoreError>
         match last {
             Some(kept) if kept.key == entry.key => {
                 if !kept.same_record(&entry) {
-                    return Err(StoreError::TwoValues { tag: entry.tag, key: entry.key });
+                    // Only the two index entries are at hand: lengths and kinds, no bytes. Both
+                    // are committed records (compaction's input; a commit's layout refused
+                    // its own two values before it runs this).
+                    return Err(StoreError::TwoValues(TwoValues {
+                        key: entry.key,
+                        tag: entry.tag,
+                        len: Some(u64::from(entry.len)),
+                        held_tag: kept.tag,
+                        held_len: u64::from(kept.len),
+                        held: Holder::Committed,
+                        differs_at: None,
+                    }));
                 }
             }
             _ => {

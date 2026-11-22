@@ -1,0 +1,106 @@
+{
+  "comment": "D65/D69: the pinned C toolchain native build scripts run with (clang, libclang, llvm-ar), the LLVM project's own release of the LLVM version llvm.json pins (23.1.4) until our fork's archive carries a clang (.github/scripts/llvm.py). Read by blaze_build_script::native::pin. `sysroots`: the C library headers per target; macOS takes the machine's SDK by version and the headers read (D69), Linux a pinned glibc sysroot: none pinned yet (null).",
+  "version": "23.1.4",
+  "version_text_comment": "Brief P: what the pinned clang prints as its first `--version` line is `clang version <version> (<repository> <revision>)`; both read from the macOS archive's bin/clang-23 (its baked VCS repository and revision). Read by blaze_build_script::fact_pins.",
+  "repository": "https://github.com/llvm/llvm-project",
+  "revision": "7a941dfb2877a0b8cf30323fefa85ad019e0b0f5",
+  "release": "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.4",
+  "targets": {
+    "aarch64-apple-darwin": {
+      "name": "LLVM-23.1.4-macOS-ARM64.tar.xz",
+      "size": 1570051292,
+      "sha256": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef"
+    },
+    "aarch64-unknown-linux-gnu": {
+      "name": "LLVM-23.1.4-Linux-ARM64.tar.xz",
+      "size": 1829686400,
+      "sha256": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91"
+    }
+  },
+  "sysroots": {
+    "aarch64-apple-darwin": "macos-sdk",
+    "aarch64-unknown-linux-gnu": null
+  },
+  "shelf_programs_comment": "shelf-pins: each program placed on a host's shelf, pinned one by one beside the archive's digest: per program row, `member` is its path in the archive and `sha256` the member's own SHA-256; its place on the shelf is the member without the archive's top folder (one of blaze_build_script::toolchain::SHELF_MEMBERS). The step that places a program checks the extracted member against its row and refuses it by name when no row pins it or the digest differs (blaze_build_script::shelf_pins::place_member). A host tool's `shelf` names one of these rows. `names` is sorted and each row's last field.",
+  "shelf_programs": {
+    "aarch64-apple-darwin": {
+      "clang-23": {
+        "member": "LLVM-23.1.4-macOS-ARM64/bin/clang-23",
+        "sha256": "2f6a5494a1199c5518dadeb58713d4994bcead1769f10d9270ed61d1e2fdc0ec"
+      },
+      "libclang.dylib": {
+        "member": "LLVM-23.1.4-macOS-ARM64/lib/libclang.dylib",
+        "sha256": "2fd690db9b2013ec952063ae2a5e35c0a7a92147fdc208d58c3d26b370c63957"
+      },
+      "lld": {
+        "member": "LLVM-23.1.4-macOS-ARM64/bin/lld",
+        "sha256": "51b6110ff5035c690208f7afe681234a3eec83501ee5db46c0234f25bd5d2a6b"
+      },
+      "llvm-ar": {
+        "member": "LLVM-23.1.4-macOS-ARM64/bin/llvm-ar",
+        "sha256": "3aad9f41e23b5315e93e852b3d044021f05f52904a4af6c28af51b465da9678d"
+      },
+      "llvm-nm": {
+        "member": "LLVM-23.1.4-macOS-ARM64/bin/llvm-nm",
+        "sha256": "cf4c3e2d35b1455d70eee38209bda0315724d8d407025656198a696c890b0d0b"
+      },
+      "names": "clang-23 libclang.dylib lld llvm-ar llvm-nm"
+    },
+    "aarch64-unknown-linux-gnu": {
+      "names": ""
+    }
+  },
+  "host_tools_comment": "D71: the only programs other than the C toolchain a native build script may start, per host target. `names`: the tools, space-separated, sorted. Per tool: `path`, the resolved real path (no link), granted read and execute; `reads`, space-separated folders its runtime needs, granted read-only (perl: libperl.dylib, privlib and archlib are /System/Library/Perl/<v>, vendorlib /System/Library/Perl/Extras/<v>, from libperl's own Config.pm; the site folder /Library/Perl is NOT granted: user-installed modules are not keyed); `runs`, space-separated real paths of the programs the tool itself starts, granted execute and each keyed by its digest (perl's piped `open` of a command with a quote in it, as cryptogams' keccak1600-armv8.pl opens arm-xlate.pl, starts /bin/sh, which reads the link /private/var/select/sh and starts /bin/bash on this host); `needed_by`, the scripts' packages known to start it, space-separated, sorted; `runs_out_dir`, yes or no: whether the tool starts programs the script wrote under its OUT_DIR, so the script's sandbox may start anything there and the pinned linker (D112: sh runs tikv-jemalloc-sys's configure, which compiles, links and runs its test programs). nm-row: a row gives its program either as `path` (on the machine) or as `shelf` (the name of its program's row in `shelf_programs`, which pins the archive member by digest and gives its place on the shelf; a tool with no row cannot be granted, shelf-pins: nm is the row llvm-nm, the shelf's bin/llvm-nm, from the same LLVM as its clang and lld, never the machine's /usr/bin/nm xcrun shim); `env`, where given, is the variable the script is told the program's real path in (NM), and that row's folder is not on PATH; a shelf row must give one. make is the real binary xcrun resolves /usr/bin/make to (the shim and xcrun are not granted); make's runs are what jemalloc's Makefile.in recipes start with no shell (GNU make execs a recipe line holding no shell syntax directly: `@mkdir -p`, `rm -f`, `ln -sf`, `echo`, `@touch`, `@true`, `$(INSTALL)`); sh's runs are what jemalloc's configure, config.sub, Makefile recipes and include scripts start, read from their text. The tool's binary digest and its row's `runs_out_dir` are in the run key and the record is marked `host-tool`: it never enters the shared cache. `interim`: a row whose grant widens the sandbox (runs_out_dir yes) says it holds only for D112's interim, records local (checked by host_tools' tests). Read by blaze_build_script::host_tools.",
+  "host_tools": {
+    "aarch64-apple-darwin": {
+      "hostname": {
+        "path": "/bin/hostname",
+        "reads": "",
+        "runs": "",
+        "needed_by": "tikv-jemalloc-sys",
+        "runs_out_dir": "no"
+      },
+      "make": {
+        "path": "/Applications/Xcode.app/Contents/Developer/usr/bin/make",
+        "reads": "/private/var/select/sh",
+        "runs": "/bin/bash /bin/echo /bin/ln /bin/mkdir /bin/mv /bin/rm /bin/rmdir /bin/sh /usr/bin/install /usr/bin/touch /usr/bin/true",
+        "needed_by": "tikv-jemalloc-sys",
+        "runs_out_dir": "no"
+      },
+      "nm": {
+        "shelf": "llvm-nm",
+        "env": "NM",
+        "reads": "",
+        "runs": "",
+        "needed_by": "tikv-jemalloc-sys",
+        "runs_out_dir": "no"
+      },
+      "perl": {
+        "path": "/usr/bin/perl",
+        "reads": "/System/Library/Perl /private/var/select/sh",
+        "runs": "/bin/bash /bin/sh",
+        "needed_by": "sha3-asm",
+        "runs_out_dir": "no"
+      },
+      "sh": {
+        "path": "/bin/sh",
+        "reads": "/private/var/select/sh",
+        "runs": "/bin/bash /bin/cat /bin/chmod /bin/cp /bin/expr /bin/ln /bin/ls /bin/mkdir /bin/mv /bin/rm /bin/rmdir /usr/bin/awk /usr/bin/basename /usr/bin/diff /usr/bin/dirname /usr/bin/grep /usr/bin/install /usr/bin/mktemp /usr/bin/sed /usr/bin/sort /usr/bin/tr",
+        "needed_by": "tikv-jemalloc-sys",
+        "runs_out_dir": "yes",
+        "interim": "D112 interim: this row's grant (sh may start what the script wrote under OUT_DIR and the script's links use the shelf's bin/ld64.lld and bin/lld) holds only until the deterministic sandbox runs build scripts; its records stay local (marked host-tool) and are never offered to a shared cache"
+      },
+      "uname": {
+        "path": "/usr/bin/uname",
+        "reads": "",
+        "runs": "",
+        "needed_by": "tikv-jemalloc-sys",
+        "runs_out_dir": "no"
+      },
+      "names": "hostname make nm perl sh uname"
+    },
+    "aarch64-unknown-linux-gnu": {
+      "names": ""
+    }
+  }
+}

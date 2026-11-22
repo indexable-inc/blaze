@@ -1,9 +1,10 @@
 //! blaze's one lock home (rule `standard-structures`, docs/v2/plan/design/named-locks.md): a
 //! mutex [`Lock`], a reader-writer lock [`ReadLock`] and a condition [`Signal`], each named at
-//! construction (`Lock::new("store.packs", ..)`) and built on `parking_lot`. Every other lock
-//! in the tree is banned in `.clippy.toml`.
+//! construction (`Lock::new("store.packs", ..)`) and built on blaze's own word locks
+//! ([`raw`]: a futex word on Linux, the wait on an address on macOS). Every other lock in the
+//! tree is banned in `.clippy.toml`.
 //!
-//! The fast path is `parking_lot`'s: an uncontended acquire is its one compare-and-swap, and a
+//! The fast path is [`raw`]'s: an uncontended acquire is its one compare-and-swap, and a
 //! release adds one relaxed load of a counter on the same cache line. Nothing reads a clock,
 //! a thread-local or the profiler until an acquire has to wait. Then, on the slow path only:
 //!
@@ -23,15 +24,27 @@
 //! holder stamp (shared holders are not stamped), so the wait-for graph draws no edge for it.
 //!
 //! The probe is the process's ([`install`], which blaze-profile calls when it starts) or the
-//! lock's own ([`Lock::probed`], for a simulation). With none, a contended lock just waits:
-//! there is nothing to record into. [`Lock::enqueue`] is the slow path split in two halves
-//! that never block, so a deterministic simulation drives the same recording code a real
-//! wait runs.
-
-#![expect(
-    clippy::disallowed_types,
-    reason = "the one lock home: it wraps parking_lot's locks, which are banned everywhere else"
-)]
+//! lock's own ([`Lock::probed`], for a simulation). [`Lock::enqueue`] is the slow path split in
+//! two halves that never block, so a deterministic simulation drives the same recording code a
+//! real wait runs.
+//!
+//! **Every contended acquire is metered, with or without a probe** (D171, D179; docs/v2/plan/
+//! design/lock-policy.md, "A lock earns its place"): on its way out the waiter hands its lock's
+//! name, how it waited (a reader behind a writer, a writer behind readers), its wait and the
+//! holder it waited behind (the holder's task, [`blaze_meter::doing`], and its hold) to
+//! [`blaze_meter::lock_waited`], into the thread's lock table, which a task's `Used` and the
+//! profile's `locks:` section read. Without a probe the clock is the lock's own: an [`Instant`]
+//! its contention slot took when it was made, read only on a slow path. A lock with no
+//! contention has no slot and pays nothing.
+//!
+//! THE FAST PATH, unchanged (rule 67): `lock`, `read`, `write` and their `try_` forms are the
+//! raw lock's one compare-and-swap and the owner stamp (one relaxed store); a guard's drop is
+//! one relaxed store and one relaxed load of `waiting`. Everything this file records is behind
+//! `lock_slow`, `read_slow`, `write_slow` (each `#[cold] #[inline(never)]`, entered only after
+//! the CAS failed), `try_lock_for` after its failed try, `enqueue`, and `Meta::released`
+//! (`#[cold]`, entered only when `waiting` is not zero): no added instruction on a take or a
+//! release that nobody waited behind. Acquires are not counted, so a lock never contended is not
+//! seen by the record (counting one would be an add on every take).
 
 use std::{
     any::type_name,
@@ -44,6 +57,7 @@ use std::{
 };
 
 pub mod graph;
+pub(crate) mod raw;
 pub mod stall;
 #[cfg(test)]
 mod tests;
@@ -92,6 +106,11 @@ pub struct Held {
     /// Whether `hold_ns` is from its acquire (it waited for the lock itself) or only from when
     /// the first of the current waiters began (it took the lock without waiting).
     pub whole: bool,
+    /// The task its thread ran ([`blaze_meter::doing`]): `""` for a thread that runs none.
+    pub doing: &'static str,
+    /// How long it had held the lock when the first of the current waiters began: known only
+    /// for a whole hold (`None` otherwise, as its acquire time was never read).
+    pub before_ns: Option<u64>,
 }
 
 /// One acquire that had to wait: what the profile's `lock_waits` table holds a row of.
@@ -187,20 +206,36 @@ struct Contention {
     /// When the first of the current waiters began, on the probe's clock.
     since_ns: AtomicU64,
     /// The last holder that let go while someone waited, for the next waiter to take.
-    held: parking_lot::Mutex<Option<Held>>,
+    held: raw::Mutex<Option<Held>>,
+    /// The lock's own clock when it has no probe: nanoseconds from this instant, taken when the
+    /// slot was made (its first contended acquire), read only on a slow path.
+    base: Instant,
+    /// The control's planted bug ([`Lock::probed_planted`]); `None` in shipped code.
+    plant: LockPlant,
 }
 
 impl Contention {
-    fn new(probe: Option<&'static dyn Probe>) -> Contention {
+    fn new(probe: Option<&'static dyn Probe>, plant: LockPlant) -> Contention {
         Contention {
             probe,
             since_ns: AtomicU64::new(0),
-            held: parking_lot::Mutex::new(None),
+            held: raw::Mutex::new(None),
+            base: Instant::now(),
+            plant,
         }
     }
 }
 
-/// What every lock carries besides the `parking_lot` lock: its name, how many wait for it now,
+/// How a waiter in `mode` waited behind a holder in `holder`, for the meter.
+fn behind(mode: Mode, holder: Option<Mode>) -> blaze_meter::Behind {
+    match (mode, holder) {
+        (Mode::Read, _) => blaze_meter::Behind::ReadBehindWrite,
+        (Mode::Write, Some(Mode::Read)) => blaze_meter::Behind::WriteBehindRead,
+        _ => blaze_meter::Behind::Holder,
+    }
+}
+
+/// What every lock carries besides its [`raw`] lock: its name, how many wait for it now,
 /// and its contention slot.
 struct Meta {
     name: &'static str,
@@ -262,7 +297,7 @@ impl Meta {
             return it;
         }
         // alloc: once a lock's life, on its first contended acquire; freed with the lock.
-        let made = Box::into_raw(Box::new(Contention::new(None)));
+        let made = Box::into_raw(Box::new(Contention::new(None, LockPlant::None)));
         match self.contention.compare_exchange(
             ptr::null_mut(),
             made,
@@ -277,25 +312,38 @@ impl Meta {
         }
     }
 
+    /// Now on this lock's clock: the probe's, else the slot's own instant (at least 1, since 0
+    /// means "taken without waiting" to a guard).
+    fn now_ns(probe: Option<&'static dyn Probe>, slot: &Contention) -> u64 {
+        match probe {
+            Some(probe) => probe.now_ns(),
+            None => u64::try_from(slot.base.elapsed().as_nanos()).unwrap_or(u64::MAX).max(1),
+        }
+    }
+
     /// The release of a guard taken at `site` in `mode` (`acquired_ns` 0: without waiting),
-    /// when someone waits: leaves the holder in the slot for the next waiter.
+    /// when someone waits: leaves the holder in the slot for the next waiter, with or without a
+    /// probe (the meter takes it).
     #[cold]
     #[inline(never)]
     fn released(&self, site: &'static Location<'static>, mode: Mode, acquired_ns: u64) {
-        let Some(probe) = self.probe() else { return };
+        let probe = self.probe();
         let slot = self.slot_or_make();
-        let now = probe.now_ns();
+        let now = Meta::now_ns(probe, slot);
+        let since = slot.since_ns.load(Ordering::Relaxed);
         let (from, whole) = match acquired_ns {
-            0 => (slot.since_ns.load(Ordering::Relaxed), false),
+            0 => (since, false),
             at => (at, true),
         };
         let held = Held {
             site,
             mode,
-            span: probe.span(),
-            thread: probe.thread(),
+            span: probe.map_or(0, |probe| probe.span()),
+            thread: probe.map_or(0, |probe| probe.thread()),
             hold_ns: now.saturating_sub(from),
             whole,
+            doing: blaze_meter::doing(),
+            before_ns: whole.then(|| since.saturating_sub(acquired_ns)),
         };
         *slot.held.lock() = Some(held);
     }
@@ -334,6 +382,19 @@ struct Waiting<'a> {
     ended: bool,
 }
 
+/// A planted bug for the lock record's control (rule 53): set on a probed lock's slot only.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LockPlant {
+    None,
+    /// A contended acquire is charged to the meter under another lock's name.
+    ChargesAnotherName,
+}
+
+impl crate::planted::Plants for LockPlant {}
+
+/// The name a [`LockPlant::ChargesAnotherName`] lock charges its waits under.
+pub const PLANTED_OTHER_NAME: &str = "lock.planted.another";
+
 impl<'a> Waiting<'a> {
     fn begin(
         meta: &'a Meta,
@@ -342,16 +403,16 @@ impl<'a> Waiting<'a> {
         value_type: &'static str,
     ) -> Waiting<'a> {
         let probe = meta.probe();
-        let (start_ns, span, token) = match probe {
-            None => (0, 0, 0),
-            Some(probe) => {
-                let slot = meta.slot_or_make();
-                let start = probe.now_ns();
-                if meta.waiting.fetch_add(1, Ordering::Relaxed) == 0 {
-                    slot.since_ns.store(start, Ordering::Relaxed);
-                }
-                (start, probe.span(), probe.wait_begin(Awaits::Lock(meta.name, mode)))
-            }
+        // The slot and the waiting count, with or without a probe: the holder's release leaves
+        // itself for the meter too.
+        let slot = meta.slot_or_make();
+        let start_ns = Meta::now_ns(probe, slot);
+        if meta.waiting.fetch_add(1, Ordering::Relaxed) == 0 {
+            slot.since_ns.store(start_ns, Ordering::Relaxed);
+        }
+        let (span, token) = match probe {
+            None => (0, 0),
+            Some(probe) => (probe.span(), probe.wait_begin(Awaits::Lock(meta.name, mode))),
         };
         // With no probe there is no clock to age a wait by, so the graph does not see it: the
         // daemon, whose watchdog reads the graph, always has the profiler's probe installed.
@@ -363,29 +424,56 @@ impl<'a> Waiting<'a> {
             Some(site),
             Some(&meta.owner),
         ));
-        Waiting { meta, probe, site, mode, value_type, start_ns, span, token, _registered: registered, ended: false }
+        Waiting {
+            meta,
+            probe,
+            site,
+            mode,
+            value_type,
+            start_ns,
+            span,
+            token,
+            _registered: registered,
+            ended: false,
+        }
+    }
+
+    /// The wait ended at `now` (taken, or given up), behind `holder`: its record in the
+    /// thread's lock table and meter ([`blaze_meter::lock_waited`]), under the lock's name.
+    fn charge(&self, slot: &Contention, now: u64, holder: Option<Held>) {
+        let name = match slot.plant {
+            LockPlant::None => self.meta.name,
+            LockPlant::ChargesAnotherName => PLANTED_OTHER_NAME,
+        };
+        let metered = holder.map(|it| blaze_meter::LockHolder { doing: it.doing, hold_ns: it.hold_ns, whole: it.whole });
+        blaze_meter::lock_waited(name, behind(self.mode, holder.map(|it| it.mode)), now.saturating_sub(self.start_ns), metered);
     }
 
     /// The lock taken: ends the span, records the wait, and gives the guard's acquire time.
     fn taken(mut self) -> u64 {
         self.ended = true;
         self._registered = None;
-        let Some(probe) = self.probe else { return 0 };
-        probe.wait_end(self.token);
+        if let Some(probe) = self.probe {
+            probe.wait_end(self.token);
+        }
         self.meta.waiting.fetch_sub(1, Ordering::Relaxed);
-        let now = probe.now_ns();
-        let holder = self.meta.slot().and_then(|it| it.held.lock().take());
-        probe.record(&LockWait {
-            lock: self.meta.name,
-            value_type: self.value_type,
-            mode: self.mode,
-            site: self.site,
-            span: self.span,
-            thread: probe.thread(),
-            start_ns: self.start_ns,
-            wait_ns: now.saturating_sub(self.start_ns),
-            holder,
-        });
+        let slot = self.meta.slot_or_make();
+        let now = Meta::now_ns(self.probe, slot);
+        let holder = slot.held.lock().take();
+        self.charge(slot, now, holder);
+        if let Some(probe) = self.probe {
+            probe.record(&LockWait {
+                lock: self.meta.name,
+                value_type: self.value_type,
+                mode: self.mode,
+                site: self.site,
+                span: self.span,
+                thread: probe.thread(),
+                start_ns: self.start_ns,
+                wait_ns: now.saturating_sub(self.start_ns),
+                holder,
+            });
+        }
         // 0 means "took it without waiting" to a release.
         now.max(1)
     }
@@ -393,21 +481,27 @@ impl<'a> Waiting<'a> {
 
 impl Drop for Waiting<'_> {
     fn drop(&mut self) {
-        if !self.ended
-            && let Some(probe) = self.probe
-        {
-            probe.wait_end(self.token);
-            self.meta.waiting.fetch_sub(1, Ordering::Relaxed);
+        if self.ended {
+            return;
         }
+        // Given up (a timed acquire that timed out, a simulation's dropped wait): a wait with no
+        // holder, charged all the same.
+        if let Some(probe) = self.probe {
+            probe.wait_end(self.token);
+        }
+        self.meta.waiting.fetch_sub(1, Ordering::Relaxed);
+        let slot = self.meta.slot_or_make();
+        let now = Meta::now_ns(self.probe, slot);
+        self.charge(slot, now, None);
     }
 }
 
 // --- Lock -------------------------------------------------------------------------------------
 
-/// A named mutex: `parking_lot::Mutex` whose waits the profile sees.
+/// A named mutex: a [`raw::Mutex`] whose waits the profile sees.
 pub struct Lock<T: ?Sized> {
     meta: Meta,
-    raw: parking_lot::Mutex<T>,
+    raw: raw::Mutex<T>,
 }
 
 /// The guard of a [`Lock`].
@@ -417,29 +511,34 @@ pub struct LockGuard<'a, T: ?Sized> {
     site: &'static Location<'static>,
     /// When it was taken, on the probe's clock; 0 when it was taken without waiting.
     acquired_ns: u64,
-    inner: parking_lot::MutexGuard<'a, T>,
+    inner: raw::MutexGuard<'a, T>,
 }
 
 impl<T> Lock<T> {
     /// A lock named `name` (what the profile and `blaze debug locks` call it: say what it
     /// guards, `"store.packs"`, `"sched.ready"`) holding `value`.
     pub const fn new(name: &'static str, value: T) -> Lock<T> {
-        let raw = parking_lot::Mutex::new(value);
+        let raw = raw::Mutex::new(value);
         Lock { meta: Meta::new(name, false), raw }
     }
 
     /// A lock on the recording path itself (the profiler's), which never records its waits:
     /// recording them would take it again.
     pub const fn unrecorded(name: &'static str, value: T) -> Lock<T> {
-        let raw = parking_lot::Mutex::new(value);
+        let raw = raw::Mutex::new(value);
         Lock { meta: Meta::new(name, true), raw }
     }
 
     /// A lock that records into `probe` rather than the process's: a simulation's.
     pub fn probed(name: &'static str, value: T, probe: &'static dyn Probe) -> Lock<T> {
+        Lock::probed_planted(name, value, probe, LockPlant::None)
+    }
+
+    /// [`Lock::probed`] with a planted bug in its record: the lock record's control.
+    pub fn probed_planted(name: &'static str, value: T, probe: &'static dyn Probe, plant: LockPlant) -> Lock<T> {
         let lock = Lock::new(name, value);
         // alloc: a simulation's lock, made with its slot.
-        let slot = Box::into_raw(Box::new(Contention::new(Some(probe))));
+        let slot = Box::into_raw(Box::new(Contention::new(Some(probe), plant)));
         lock.meta.contention.store(slot, Ordering::Release);
         lock
     }
@@ -490,7 +589,7 @@ impl<T: ?Sized> Lock<T> {
     }
 
     /// The lock, waiting at most `most` for it; a wait that ends with the lock is recorded (one
-    /// that times out only opens and closes its span).
+    /// that times out opens and closes its span, and is charged to the meter with no holder).
     #[track_caller]
     pub fn try_lock_for(&self, most: Duration) -> Option<LockGuard<'_, T>> {
         let site = Location::caller();
@@ -594,12 +693,12 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for Lock<T> {
 
 // --- ReadLock ---------------------------------------------------------------------------------
 
-/// A named reader-writer lock: `parking_lot::RwLock` whose waits the profile sees. Reach for it
+/// A named reader-writer lock: a [`raw::RwLock`] whose waits the profile sees. Reach for it
 /// only where reads hold the lock long; a value read often and written rarely is an arc-swap
 /// or RCU, never a `ReadLock` (`blaze debug locks` says which).
 pub struct ReadLock<T: ?Sized> {
     meta: Meta,
-    raw: parking_lot::RwLock<T>,
+    raw: raw::RwLock<T>,
 }
 
 /// A shared read of a [`ReadLock`].
@@ -608,7 +707,7 @@ pub struct ReadGuard<'a, T: ?Sized> {
     meta: &'a Meta,
     site: &'static Location<'static>,
     acquired_ns: u64,
-    inner: parking_lot::RwLockReadGuard<'a, T>,
+    inner: raw::RwLockReadGuard<'a, T>,
 }
 
 /// The exclusive write of a [`ReadLock`].
@@ -617,19 +716,19 @@ pub struct WriteGuard<'a, T: ?Sized> {
     meta: &'a Meta,
     site: &'static Location<'static>,
     acquired_ns: u64,
-    inner: parking_lot::RwLockWriteGuard<'a, T>,
+    inner: raw::RwLockWriteGuard<'a, T>,
 }
 
 impl<T> ReadLock<T> {
     /// A lock named `name` holding `value`; see [`Lock::new`].
     pub const fn new(name: &'static str, value: T) -> ReadLock<T> {
-        let raw = parking_lot::RwLock::new(value);
+        let raw = raw::RwLock::new(value);
         ReadLock { meta: Meta::new(name, false), raw }
     }
 
     /// A lock on the recording path itself; see [`Lock::unrecorded`].
     pub const fn unrecorded(name: &'static str, value: T) -> ReadLock<T> {
-        let raw = parking_lot::RwLock::new(value);
+        let raw = raw::RwLock::new(value);
         ReadLock { meta: Meta::new(name, true), raw }
     }
 
@@ -702,6 +801,34 @@ impl<T: ?Sized> ReadLock<T> {
         })
     }
 
+    #[inline]
+    #[track_caller]
+    pub fn try_read_for(&self, timeout: Duration) -> Option<ReadGuard<'_, T>> {
+        let site = Location::caller();
+        if let Some(inner) = self.raw.try_read() {
+            return Some(ReadGuard { meta: &self.meta, site, acquired_ns: 0, inner });
+        }
+        let waiting = Waiting::begin(&self.meta, site, Mode::Read, type_name::<T>());
+        let inner = self.raw.try_read_for(timeout)?;
+        let acquired_ns = waiting.taken();
+        Some(ReadGuard { meta: &self.meta, site, acquired_ns, inner })
+    }
+
+    #[inline]
+    #[track_caller]
+    pub fn try_write_for(&self, timeout: Duration) -> Option<WriteGuard<'_, T>> {
+        let site = Location::caller();
+        if let Some(inner) = self.raw.try_write() {
+            self.meta.stamp();
+            return Some(WriteGuard { meta: &self.meta, site, acquired_ns: 0, inner });
+        }
+        let waiting = Waiting::begin(&self.meta, site, Mode::Write, type_name::<T>());
+        let inner = self.raw.try_write_for(timeout)?;
+        self.meta.stamp();
+        let acquired_ns = waiting.taken();
+        Some(WriteGuard { meta: &self.meta, site, acquired_ns, inner })
+    }
+
     pub fn get_mut(&mut self) -> &mut T {
         self.raw.get_mut()
     }
@@ -767,17 +894,42 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for ReadLock<T> {
 
 // --- Signal -----------------------------------------------------------------------------------
 
-/// A named condition on a [`Lock`]: `parking_lot::Condvar`, each wait inside a span naming it.
-/// Only a driver thread or the pool's idle park waits on one (`deadline-waits`): a fiber parks
-/// on the scheduler instead.
+/// Runs `wait`, a wait for a notify of the signal `name` (a [`Signal`]'s, a
+/// [`crate::chan`]'s), inside its span and wait-graph row; `left` is the time from now to its
+/// deadline (`None`: it has none), which the row says on the probe's clock.
+pub(crate) fn signal_span<R>(
+    name: &'static str,
+    left: Option<Duration>,
+    wait: impl FnOnce() -> R,
+) -> R {
+    let probe = installed();
+    let token = probe.map(|it| it.wait_begin(Awaits::Signal(name)));
+    let registered = probe.map(|probe| {
+        let now_ns = probe.now_ns();
+        let deadline_ns = left
+            .map(|it| now_ns.saturating_add(u64::try_from(it.as_nanos()).unwrap_or(u64::MAX)));
+        graph::register(stall::Blocked::Signal(name), probe.span(), now_ns, deadline_ns, None, None)
+    });
+    let result = wait();
+    drop(registered);
+    if let (Some(probe), Some(token)) = (probe, token) {
+        probe.wait_end(token);
+    }
+    result
+}
+
+/// A named condition on a [`Lock`]: a [`raw::Cond`], each wait inside a span naming it. Only
+/// a driver thread or the pool's idle park waits on one (`deadline-waits`): a fiber parks on
+/// the scheduler instead. A wait may end with no notify, as any condition's: wait in a loop on
+/// what it is for ([`Signal::wait_while`]).
 pub struct Signal {
     name: &'static str,
-    raw: parking_lot::Condvar,
+    raw: raw::Cond,
 }
 
 impl Signal {
     pub const fn new(name: &'static str) -> Signal {
-        let raw = parking_lot::Condvar::new();
+        let raw = raw::Cond::new();
         Signal { name, raw }
     }
 
@@ -788,86 +940,88 @@ impl Signal {
     /// Runs `wait` inside the signal's span and wait-graph row; `left` is the time from now to
     /// its deadline (`None`: it has none), which the row says on the probe's clock.
     fn span<R>(&self, left: Option<Duration>, wait: impl FnOnce() -> R) -> R {
-        let probe = installed();
-        let token = probe.map(|it| it.wait_begin(Awaits::Signal(self.name)));
-        let registered = probe.map(|probe| {
-            let now_ns = probe.now_ns();
-            let deadline_ns = left.map(|it| {
-                now_ns.saturating_add(u64::try_from(it.as_nanos()).unwrap_or(u64::MAX))
-            });
-            graph::register(
-                stall::Blocked::Signal(self.name),
-                probe.span(),
-                now_ns,
-                deadline_ns,
-                None,
-                None,
-            )
-        });
-        let result = wait();
-        drop(registered);
-        if let (Some(probe), Some(token)) = (probe, token) {
-            probe.wait_end(token);
-        }
-        result
+        signal_span(self.name, left, wait)
     }
 
     /// Waits for a notify, letting `guard`'s lock go meanwhile.
     pub fn wait<T: ?Sized>(&self, guard: &mut LockGuard<'_, T>) {
-        self.span(None, || self.raw.wait(&mut guard.inner));
+        self.span(None, || _ = self.raw.wait(&mut guard.inner, None));
     }
 
     /// Waits while `condition` holds.
     pub fn wait_while<T: ?Sized>(
         &self,
         guard: &mut LockGuard<'_, T>,
-        condition: impl FnMut(&mut T) -> bool,
+        mut condition: impl FnMut(&mut T) -> bool,
     ) {
-        self.span(None, || self.raw.wait_while(&mut guard.inner, condition));
+        self.span(None, || {
+            while condition(&mut *guard.inner) {
+                self.raw.wait(&mut guard.inner, None);
+            }
+        });
     }
 
     /// Waits for a notify by `deadline`: whether the deadline passed first.
     pub fn wait_until<T: ?Sized>(&self, guard: &mut LockGuard<'_, T>, deadline: Instant) -> bool {
         let left = deadline.saturating_duration_since(Instant::now());
-        self.span(Some(left), || self.raw.wait_until(&mut guard.inner, deadline).timed_out())
+        self.span(Some(left), || self.raw.wait(&mut guard.inner, Some(left)))
     }
 
     /// Waits for a notify for at most `most`: whether it passed first.
     pub fn wait_for<T: ?Sized>(&self, guard: &mut LockGuard<'_, T>, most: Duration) -> bool {
-        self.span(Some(most), || self.raw.wait_for(&mut guard.inner, most).timed_out())
+        self.span(Some(most), || self.raw.wait(&mut guard.inner, Some(most)))
     }
 
-    /// Waits while `condition` holds, by `deadline`: whether the deadline passed first.
+    /// Waits while `condition` holds, by `deadline`: whether the deadline passed first (with
+    /// `condition` still holding).
     pub fn wait_while_until<T: ?Sized>(
         &self,
         guard: &mut LockGuard<'_, T>,
         condition: impl FnMut(&mut T) -> bool,
         deadline: Instant,
     ) -> bool {
-        let left = deadline.saturating_duration_since(Instant::now());
-        self.span(Some(left), || {
-            self.raw.wait_while_until(&mut guard.inner, condition, deadline).timed_out()
-        })
+        let now = Instant::now();
+        let left = deadline.saturating_duration_since(now);
+        self.span(Some(left), || Self::wait_while_within(&self.raw, guard, condition, now, left))
     }
 
-    /// Waits while `condition` holds, for at most `most`: whether it passed first.
+    /// Waits while `condition` holds, for at most `most`: whether it passed first (with
+    /// `condition` still holding).
     pub fn wait_while_for<T: ?Sized>(
         &self,
         guard: &mut LockGuard<'_, T>,
         condition: impl FnMut(&mut T) -> bool,
         most: Duration,
     ) -> bool {
-        self.span(Some(most), || {
-            self.raw.wait_while_for(&mut guard.inner, condition, most).timed_out()
-        })
+        let now = Instant::now();
+        self.span(Some(most), || Self::wait_while_within(&self.raw, guard, condition, now, most))
     }
 
-    pub fn notify_one(&self) -> bool {
-        self.raw.notify_one()
+    /// The loop of the two waits above: each wait is given what is left now of `most` from
+    /// `start`.
+    fn wait_while_within<T: ?Sized>(
+        raw: &raw::Cond,
+        guard: &mut LockGuard<'_, T>,
+        mut condition: impl FnMut(&mut T) -> bool,
+        start: Instant,
+        most: Duration,
+    ) -> bool {
+        while condition(&mut *guard.inner) {
+            let left = most.saturating_sub(start.elapsed());
+            if left.is_zero() {
+                return true;
+            }
+            raw.wait(&mut guard.inner, Some(left));
+        }
+        false
     }
 
-    pub fn notify_all(&self) -> usize {
-        self.raw.notify_all()
+    pub fn notify_one(&self) {
+        self.raw.notify(false);
+    }
+
+    pub fn notify_all(&self) {
+        self.raw.notify(true);
     }
 }
 
@@ -876,3 +1030,52 @@ impl fmt::Debug for Signal {
         f.debug_struct("Signal").field("name", &self.name).finish()
     }
 }
+
+// --- The shared map's lock (decision D64) -----------------------------------------------------
+
+/// The lock blaze-hash's shared map takes for a shard's writers: this crate's [`Lock`], so a
+/// writer's wait is a named, recorded deadline wait. blaze-hash sits below this crate and cannot
+/// name it, so its map takes the lock as a type parameter and this is the one instantiation.
+pub enum MapLock {}
+
+// SAFETY: a `Lock` hands its value to one guard at a time, and its release happens before the
+// next acquire (the raw lock's Release unlock and Acquire lock).
+#[expect(unsafe_code, reason = "the shared map's lock contract (D64): `Lock` is a mutex")]
+unsafe impl blaze_hash::shared::ShardLock for MapLock {
+    type Lock<T> = Lock<T>;
+    type Guard<'a, T: 'a> = LockGuard<'a, T>;
+
+    fn new<T>(name: &'static str, value: T) -> Lock<T> {
+        Lock::new(name, value)
+    }
+
+    #[track_caller]
+    fn lock<T>(lock: &Lock<T>) -> LockGuard<'_, T> {
+        lock.lock()
+    }
+}
+
+/// A map of ordinary keys shared between threads (rule standard-structures): read with no lock,
+/// written under a shard's [`MapLock`]; made by `SharedMap::new_in(name, alloc)`, `name` saying
+/// what it holds. The `.clippy.toml` ban on `blaze_hash::SharedMap` keeps every other crate on
+/// this instantiation.
+#[expect(clippy::disallowed_types, reason = "the one instantiation of the shared map (D64)")]
+pub type SharedMap<K, V, A> = blaze_hash::SharedMap<K, V, A, MapLock>;
+
+/// A set shared between threads, as [`SharedMap`].
+#[expect(clippy::disallowed_types, reason = "the one instantiation of the shared set (D64)")]
+pub type SharedSet<K, A> = blaze_hash::SharedSet<K, A, MapLock>;
+
+/// A map on hashes shared between threads, indexed by the hash itself, as [`SharedMap`].
+#[expect(clippy::disallowed_types, reason = "the one instantiation of the shared map (D64)")]
+pub type SharedByHash<K, V, A> = blaze_hash::SharedByHash<K, V, A, MapLock>;
+
+/// [`SharedMap`] on a named hasher `S`: for digest keys, `blaze_hash::DigestState`, which takes
+/// a key's digest word as its hash (blaze-hash digest.rs) where `SharedMap`'s `FixedState` runs
+/// `Hash` over every byte.
+#[expect(clippy::disallowed_types, reason = "the one instantiation of the shared map (D64)")]
+pub type SharedMapBy<K, V, S, A> = blaze_hash::shared::Map<K, V, S, A, MapLock>;
+
+/// [`SharedSet`] on a named hasher `S`, as [`SharedMapBy`].
+#[expect(clippy::disallowed_types, reason = "the one instantiation of the shared set (D64)")]
+pub type SharedSetBy<K, S, A> = blaze_hash::shared::Set<K, S, A, MapLock>;

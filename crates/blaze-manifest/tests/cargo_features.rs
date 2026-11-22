@@ -8,7 +8,7 @@ use blaze_core::temp::TempDir;
 use blaze_manifest::files::Disk;
 use blaze_manifest::metadata::root_manifest;
 use blaze_manifest::profiles::Profiles;
-use blaze_manifest::{Config, Context, Workspace};
+use blaze_manifest::{Config, Context, ManifestError, Workspace};
 
 /// A fresh directory holding `files`, each a path under it and its text, and the path to it
 /// cargo is given; the directory goes when the first drops.
@@ -23,7 +23,7 @@ fn tree(name: &str, files: &[(&str, &str)]) -> (TempDir, PathBuf) {
     std::fs::create_dir_all(root.join("cargo-home")).unwrap();
     // As cargo is given it: not the `\\?\` form `canonicalize` gives on Windows, which a
     // path read back from a `file:` URL is not.
-    let root = dunce::canonicalize(root).unwrap();
+    let root = std::fs::canonicalize(root).unwrap();
     (dir, root)
 }
 
@@ -36,7 +36,7 @@ fn context(root: &Path) -> Context<Disk> {
 }
 
 /// The workspace at `root`, or the error reading it, with its causes.
-fn workspace<'c>(ctx: &'c Context<Disk>) -> anyhow::Result<Workspace<'c, Disk>> {
+fn workspace<'c>(ctx: &'c Context<Disk>) -> Result<Workspace<'c, Disk>, ManifestError> {
     let manifest = root_manifest(None, ctx)?;
     Workspace::new(&manifest, ctx)
 }

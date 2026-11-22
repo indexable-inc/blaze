@@ -1,14 +1,14 @@
 //! [`Local`] and [`LocalTable`]: an item as a small number inside one task (docs/v2/plan/design/
 //! bottom.md, point 3).
 
-use core::alloc::Allocator;
 use core::cmp::Ordering;
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_id::ItemKey;
+use blaze_own::{AVec, Alloc};
 
 use crate::error::SurfaceError;
 
@@ -92,17 +92,17 @@ impl<T> fmt::Debug for Local<T> {
 
 /// A task's numbering of the items it asks about: an [`ItemKey`] gets a [`Local`] the first
 /// time it is interned, and the same one after; a `Local` maps back to its key. It lives as
-/// long as the task, in the allocator `A` the task names (its frame), and is never kept.
-pub struct LocalTable<T, A: Allocator + Clone> {
-    keys: Vec<ItemKey, A>,
-    locals: HashMap<ItemKey, u32, A>,
+/// long as the task, in the allocator the task names (its frame), and is never kept.
+pub struct LocalTable<'a, T> {
+    keys: AVec<'a, ItemKey>,
+    locals: Map<ItemKey, u32, FixedState, Alloc<'a>>,
     of: PhantomData<fn() -> T>,
 }
 
-impl<T, A: Allocator + Clone> LocalTable<T, A> {
+impl<'a, T> LocalTable<'a, T> {
     /// An empty table in `alloc`. It allocates nothing until its first intern.
-    pub fn new_in(alloc: A) -> LocalTable<T, A> {
-        LocalTable { keys: Vec::new_in(alloc.clone()), locals: HashMap::new_in(alloc), of: PhantomData }
+    pub fn new_in(alloc: Alloc<'a>) -> LocalTable<'a, T> {
+        LocalTable { keys: AVec::new_in(alloc), locals: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }), of: PhantomData }
     }
 
     /// The local of `key`, numbered now if the task has not asked about it before.

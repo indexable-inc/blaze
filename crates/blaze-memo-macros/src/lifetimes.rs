@@ -3,7 +3,7 @@
 
 // alloc: expansion time, once per annotated item; no query runs this
 
-use blaze_hash::HashSet;
+use blaze_hash::{FixedState, Set, SetOpts};
 use proc_macro2::Span;
 use quote::quote;
 use std::alloc::Global;
@@ -131,14 +131,14 @@ pub(crate) fn names(ty: &Type, lifetime: &Lifetime) -> bool {
 /// A database lifetime for a function that declares none: `'db`, or `'db2`, .. when a binder
 /// in its signature already has that name.
 pub(crate) fn conjure(signature: &syn::Signature, also: Option<&Type>, span: Span) -> Lifetime {
-    struct Used(HashSet<String, Global>);
+    struct Used(Set<String, FixedState, Global>);
     impl VisitMut for Used {
         fn visit_lifetime_mut(&mut self, lifetime: &mut Lifetime) {
             // alloc: expansion time
             self.0.insert(lifetime.ident.to_string());
         }
     }
-    let mut used = Used(HashSet::new_in(Global));
+    let mut used = Used(Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }));
     // clone: expansion time, a signature searched
     used.visit_signature_mut(&mut signature.clone());
     if let Some(ty) = also {

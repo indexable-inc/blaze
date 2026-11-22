@@ -8,7 +8,7 @@ bump.
     python3 tools/v2/solver_sync.py '{"nightly": "nightly-2026-10-27"}'
 
 Input (inline JSON, a file's path, or `-`):
-- `nightly`: the nightly to move to, `nightly-YYYY-MM-DD`. It must be the one `harness/toolchain`
+- `nightly`: the nightly to move to, `nightly-YYYY-MM-DD`. It must be the one `pins/toolchain`
   pins.
 - `root`: the workspace; empty for the one holding this script.
 - `checkout`: a rust-lang/rust git checkout already at the nightly's commit, with the five
@@ -243,9 +243,10 @@ def sync(given: Input) -> None:
     if not NIGHTLY.fullmatch(given.nightly):
         raise Failed(f"field nightly is nightly-YYYY-MM-DD, not {given.nightly!r}")
     root = Path(given.root) if given.root else Path(__file__).resolve().parents[2]
-    pinned = (root / "harness" / "toolchain").read_text().strip()
+    # The given root's pin, by path (harness/toolchain_pins.py reads its own checkout's).
+    pinned = (root / "pins" / "toolchain").read_text().strip()
     if pinned != given.nightly:
-        raise Failed(f"harness/toolchain pins {pinned}, not {given.nightly}: the solver follows the pin")
+        raise Failed(f"pins/toolchain pins {pinned}, not {given.nightly}: the solver follows the pin")
     vendor = root / "vendor"
     series = {crate: read_series(vendor / crate) for crate in CRATES}
     commit = commit_of(given.nightly)

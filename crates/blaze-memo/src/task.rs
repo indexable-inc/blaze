@@ -9,7 +9,7 @@
 use std::{
     alloc::Global,
     cell::{Cell, RefCell},
-    fmt::{self, Write as _},
+    fmt,
     num::NonZeroUsize,
     ptr,
     sync::Once,
@@ -39,6 +39,9 @@ pub fn register() {
     });
 }
 
+/// Threshold past which [`Book`] switches from linear scans to hash-indexed bucket chains.
+const BOOK_INDEX_THRESHOLD: usize = 16;
+
 /// A fixpoint member's value in its head's round, or an inner head's last value.
 struct Prov {
     kind: &'static Kind,
@@ -49,6 +52,9 @@ struct Prov {
     /// The value of round `round`, in the member's arena.
     value: *const (),
     round: u32,
+    /// Intrusive link to the earlier `Prov` in `Book::provs` sharing `(kind, hash)`, or
+    /// `usize::MAX` if none (populated once `provs_index` is built).
+    prev_same: usize,
     /// What publishes the member's entry when its head settles: its value in the last round is
     /// final then (the head's value and every inner head's stood still, and a member is a
     /// function of them).
@@ -73,11 +79,17 @@ pub(crate) struct Settle {
 struct Book {
     round: u32,
     provs: Vec<Prov, Global>,
+    /// Hash index from `(kind_ptr, hash)` to the latest index in `provs` (built lazily once
+    /// `provs.len() > BOOK_INDEX_THRESHOLD` to eliminate O(M²×R) cycle scans).
+    provs_index: Option<blaze_hash::HashMap<(usize, u64), usize, Global>>,
     /// An inner head's value moved this round.
     moved: bool,
     /// The first [`MOVERS_NAMED`] members whose value moved this round, by name and key: what a
     /// head that does not settle names in its panic ([`Moved::named`]).
     movers: Vec<String, Global>,
+    /// Hash index from `(kind_ptr, hash)` to the latest index in `keeps` (built lazily once
+    /// `keeps.len() > BOOK_INDEX_THRESHOLD`).
+    keeps_index: Option<blaze_hash::HashMap<(usize, u64), usize, Global>>,
     /// The flight of every fixpoint member run so far, held by this task until the head
     /// settles: another task asking a member waits (for the head) instead of running it again,
     /// so no member's function runs on two tasks in one snapshot. Declared last: dropped
@@ -90,10 +102,125 @@ impl Book {
         Book {
             round: 0,
             provs: Vec::new_in(Global),
+            provs_index: None,
             moved: false,
             movers: Vec::new_in(Global),
+            keeps_index: None,
             keeps: Vec::new_in(Global),
         }
+    }
+
+    fn push_prov(&mut self, mut prov: Prov) {
+        let idx = self.provs.len();
+        if self.provs_index.is_none() && idx >= BOOK_INDEX_THRESHOLD {
+            let mut map = blaze_hash::HashMap::new_in(Global);
+            for (i, existing) in self.provs.iter_mut().enumerate() {
+                let k = (ptr::from_ref(existing.kind) as usize, existing.hash);
+                existing.prev_same = map.insert(k, i).unwrap_or(usize::MAX);
+            }
+            self.provs_index = Some(map);
+        }
+        if let Some(map) = &mut self.provs_index {
+            let k = (ptr::from_ref(prov.kind) as usize, prov.hash);
+            prov.prev_same = map.insert(k, idx).unwrap_or(usize::MAX);
+        }
+        self.provs.push(prov);
+    }
+
+    fn push_keep(&mut self, mut kept: KeptMember) {
+        let idx = self.keeps.len();
+        if self.keeps_index.is_none() && idx >= BOOK_INDEX_THRESHOLD {
+            let mut map = blaze_hash::HashMap::new_in(Global);
+            for (i, existing) in self.keeps.iter_mut().enumerate() {
+                let k = (ptr::from_ref(existing.kind) as usize, existing.hash);
+                existing.prev_same = map.insert(k, i).unwrap_or(usize::MAX);
+            }
+            self.keeps_index = Some(map);
+        }
+        if let Some(map) = &mut self.keeps_index {
+            let k = (ptr::from_ref(kept.kind) as usize, kept.hash);
+            kept.prev_same = map.insert(k, idx).unwrap_or(usize::MAX);
+        }
+        self.keeps.push(kept);
+    }
+
+    /// Whether `keeps` holds a flight matching `(kind, hash, key)`.
+    ///
+    /// # Safety
+    ///
+    /// `key` must point to a value of `kind`'s key type.
+    unsafe fn has_keep(&self, kind: &'static Kind, hash: u64, key: *const ()) -> bool {
+        if let Some(map) = &self.keeps_index {
+            let Some(&head) = map.get(&(ptr::from_ref(kind) as usize, hash)) else {
+                return false;
+            };
+            let mut cur = head;
+            while cur != usize::MAX {
+                let it = &self.keeps[cur];
+                // SAFETY: `kind` matched and the caller guarantees `key` has `kind`'s key type.
+                if ptr::eq(it.kind, kind) && it.hash == hash && unsafe { (it.same_key)(it.key, key) } {
+                    return true;
+                }
+                cur = it.prev_same;
+            }
+            return false;
+        }
+        self.keeps.iter().any(|it| {
+            // SAFETY: `kind` matched first and the caller guarantees `key` has `kind`'s key type.
+            ptr::eq(it.kind, kind) && it.hash == hash && unsafe { (it.same_key)(it.key, key) }
+        })
+    }
+
+    /// The latest provisional value for `(kind, hash, key)` across any round (or `only_round` when
+    /// `Some`), or null if absent.
+    ///
+    /// # Safety
+    ///
+    /// `key` must point to a value of `kind`'s key type.
+    unsafe fn find_prov(
+        &self,
+        kind: &'static Kind,
+        hash: u64,
+        key: *const (),
+        only_round: Option<u32>,
+    ) -> *const () {
+        if let Some(map) = &self.provs_index {
+            let Some(&head) = map.get(&(ptr::from_ref(kind) as usize, hash)) else {
+                return ptr::null();
+            };
+            let mut cur = head;
+            while cur != usize::MAX {
+                let it = &self.provs[cur];
+                if let Some(want) = only_round {
+                    if it.round < want {
+                        // `provs` is pushed in non-decreasing round order, so earlier entries
+                        // in this chain cannot match `want`.
+                        break;
+                    }
+                    if it.round != want {
+                        cur = it.prev_same;
+                        continue;
+                    }
+                }
+                // SAFETY: `kind` matched and the caller guarantees `key` has `kind`'s key type.
+                if ptr::eq(it.kind, kind) && it.hash == hash && unsafe { (it.same_key)(it.key, key) } {
+                    return it.value;
+                }
+                cur = it.prev_same;
+            }
+            return ptr::null();
+        }
+        self.provs
+            .iter()
+            .rev()
+            .find(|it| {
+                only_round.is_none_or(|want| it.round == want)
+                    && ptr::eq(it.kind, kind)
+                    && it.hash == hash
+                    // SAFETY: `kind` matched first and caller guarantees `key` has `kind`'s key type.
+                    && unsafe { (it.same_key)(it.key, key) }
+            })
+            .map_or(ptr::null(), |it| it.value)
     }
 }
 
@@ -114,6 +241,8 @@ struct KeptMember {
     hash: u64,
     key: *const (),
     same_key: unsafe fn(*const (), *const ()) -> bool,
+    /// Intrusive link to the earlier `KeptMember` sharing `(kind, hash)`, or `usize::MAX`.
+    prev_same: usize,
     /// Borrows the snapshot's flight, erased to `'static`: the book lives on the stack of a
     /// fetch that borrows the snapshot, which holds the flight (`Config::flight`), so the
     /// flight outlives it.
@@ -156,11 +285,12 @@ pub(crate) fn keep_flight(member: Member, kept: crate::flight::Kept<'_>) {
         std::mem::transmute::<crate::flight::Kept<'_>, crate::flight::Kept<'static>>(kept)
     };
     let mut book = head.book.borrow_mut();
-    book.get_or_insert_with(Book::new).keeps.push(KeptMember {
+    book.get_or_insert_with(Book::new).push_keep(KeptMember {
         kind: member.kind,
         hash: member.hash,
         key: member.key,
         same_key: member.same_key,
+        prev_same: usize::MAX,
         _held: held,
     });
 }
@@ -189,11 +319,9 @@ pub(crate) fn here(kind: &'static Kind, hash: u64, key: *const ()) -> Here {
         if !run.is_recorder() && run.matches(kind, hash, key) {
             return Here::Running;
         }
-        if let Some(book) = run.book.borrow().as_ref() {
+        if !kept && let Some(book) = run.book.borrow().as_ref() {
             // SAFETY: the keys are of `kind`'s key type, matched first.
-            kept |= book.keeps.iter().any(|it| {
-                ptr::eq(it.kind, kind) && it.hash == hash && unsafe { (it.same_key)(it.key, key) }
-            });
+            kept = unsafe { book.has_keep(kind, hash, key) };
         }
         // SAFETY: an outer run is below on the same stack.
         at = unsafe { run.outer.as_ref() };
@@ -751,12 +879,8 @@ fn join(run: &Run, head: &Run) {
 fn last_of(head: &Run, kind: &'static Kind, hash: u64, key: *const ()) -> *const () {
     let book = head.book.borrow();
     let Some(book) = book.as_ref() else { return ptr::null() };
-    book.provs
-        .iter()
-        .rev()
-        // SAFETY: the keys are of `kind`'s key type, matched first.
-        .find(|it| ptr::eq(it.kind, kind) && it.hash == hash && unsafe { (it.same_key)(it.key, key) })
-        .map_or(ptr::null(), |it| it.value)
+    // SAFETY: the keys are of `kind`'s key type, matched first.
+    unsafe { book.find_prov(kind, hash, key, None) }
 }
 
 /// The value a fixpoint member of a cycle on this task's stack had this round, if it ran:
@@ -771,17 +895,9 @@ pub(crate) fn provisional(kind: &'static Kind, hash: u64, key: *const ()) -> *co
         let found = {
             let book = run.book.borrow();
             book.as_ref().and_then(|book| {
-                book.provs
-                    .iter()
-                    .rev()
-                    // SAFETY: as in `last_of`.
-                    .find(|it| {
-                        it.round == book.round
-                            && ptr::eq(it.kind, kind)
-                            && it.hash == hash
-                            && unsafe { (it.same_key)(it.key, key) }
-                    })
-                    .map(|it| it.value)
+                // SAFETY: as in `last_of`.
+                let value = unsafe { book.find_prov(kind, hash, key, Some(book.round)) };
+                (!value.is_null()).then_some(value)
             })
         };
         if let Some(value) = found {
@@ -820,13 +936,15 @@ pub(crate) fn member_done(
     if moved && book.movers.len() < MOVERS_NAMED {
         book.movers.push(run.name().to_string());
     }
-    book.provs.push(Prov {
+    let round = book.round;
+    book.push_prov(Prov {
         kind: run.kind,
         hash: run.hash,
         key,
         same_key: run.same_key,
         value,
-        round: book.round,
+        round,
+        prev_same: usize::MAX,
         settle,
     });
 }

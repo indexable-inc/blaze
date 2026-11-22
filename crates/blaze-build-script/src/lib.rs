@@ -1,57 +1,88 @@
-//! Build scripts run as cargo 1.99 runs them, with nothing of cargo's: the environment a
-//! script is given ([`env`]), the run itself ([`run`]), what it prints read as cargo reads it
-//! ([`output`]) and who receives what ([`apply`]), for blaze to run the scripts it compiles without cargo (no-rustc
-//! step I, [#89]) and in its sandbox ([#147]).
+//! A build script's run as blaze keys and keeps it (docs/v2/plan/design/build-scripts.md), sans-IO.
 //!
-//! What a run is made from is a plain description ([`unit::Unit`]) that blaze's manifest
-//! reader and resolver fill, every value cargo always gives a script filled
-//! ([`unit::Unit::check`]); this crate reads no manifest, asks no cargo and runs no script
-//! (blaze's sandbox does). A script is any executable the caller places (`Unit::script`);
-//! nothing here assumes where or by what it was compiled.
+//! A build script is user code: it runs only in the sandbox (rule 9), as a `wasm32-wasip1`
+//! module in crates/blaze-proc-macro's runner, with the environment Cargo documents and nothing
+//! else. This crate is the part of that run that does no IO:
 //!
-//! For blaze v2 (docs/v2/plan.md): scripts that only print constant directives are read
-//! rather than run ([`elide`](mod@elide), #1296); the environment says what cargo sets from the unit and
-//! what it passes through ([`Env::origin`], #805); and what cargo's rule watches of a run
-//! is data ([`watch`]), for a run keyed as cargo keys it (#1450).
+//! - [`instr`]: the instruction lines a script prints, read into typed values, every documented
+//!   form of the old `cargo:` and the new `cargo::` syntax, the output bounded before it is read;
+//! - [`env`]: the environment a script is given, computed from its unit;
+//! - [`outputs`]: the record of a run (instructions and the files written into `OUT_DIR`),
+//!   bounded, read in place, round-tripping byte for byte;
+//! - [`key`]: the record's base key, over every input known before the run;
+//! - [`probe`]: the compiler a script spawns, answered by blaze (never rustc: rule 1);
+//! - [`git`]: the `git` a script spawns, answered from the checkout's `.git`, read-only (D53);
+//! - [`cx`]: the outputs laid over a crate's expansion host (`env!("OUT_DIR")`, `include!`).
 //!
-//! Each reads its input in one pass over borrowed bytes: what a script prints is read line by
-//! line into a [`output::Sink`] ([`output::read`]), the root file elision reads is lexed a
-//! token at a time ([`elide::lex::Tokens`]), and a run is judged from its bytes alone
-//! ([`run::judge`]). docs/v2/plan.md says how each compares with the
-//! fastest known way.
-//!
-//! [#89]: https://github.com/indexable-inc/blaze/issues/89
-//! [#147]: https://github.com/indexable-inc/blaze/issues/147
+//! `examples/census.rs` is the census of a workspace's scripts by reading alone.
 
-#![feature(allocator_api, allocator_ext)]
+#![feature(allocator_api, register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
 #![forbid(unsafe_code)]
 
-pub mod apply;
-pub mod elide;
+pub mod c_request;
+pub mod c_tasks;
+pub mod c_tasks_built;
+pub mod c_tasks_probe;
+pub mod c_tasks_tree;
+pub mod cx;
+pub mod dep_paths;
 pub mod env;
-pub mod output;
-pub mod run;
-pub mod unit;
-pub mod watch;
-
-pub use elide::{elide, verify};
-pub use env::{Env, Origin, env, envify};
-pub use output::{Output, parse, read};
-pub use unit::Unit;
-pub use watch::{Watched, watched, watched_in};
+pub mod fact_pins;
+pub mod fact_shim;
+pub mod facts;
+pub mod git;
+mod git_attributes;
+mod git_ignore;
+mod git_objects;
+pub mod host_tools;
+pub mod instr;
+pub mod key;
+pub mod metadata_ask;
+pub mod native;
+pub mod outputs;
+pub mod pinned;
+pub mod probe;
+pub mod probe_ask;
+pub mod probe_check;
+pub mod served;
+#[cfg(test)]
+mod served_ban_tests;
+pub mod shelf_pins;
+pub mod toolchain;
 
 #[cfg(test)]
-#[global_allocator]
-static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+mod c_request_tests;
+#[cfg(test)]
+mod c_tasks_probe_tests;
+#[cfg(test)]
+mod c_tasks_tests;
+#[cfg(test)]
+mod c_tasks_tree_tests;
+#[cfg(test)]
+mod nm_row_tests;
+#[cfg(test)]
+mod shelf_pins_tests;
+#[cfg(test)]
+mod fact_pins_tests;
+#[cfg(test)]
+mod facts_tests;
+#[cfg(test)]
+mod git_attributes_tests;
+#[cfg(test)]
+mod git_link_tests;
+#[cfg(test)]
+mod git_tests;
+#[cfg(test)]
+mod metadata_ask_tests;
+#[cfg(test)]
+mod probe_ask_tests;
+#[cfg(test)]
+mod probe_check_tests;
+#[cfg(test)]
+mod tests;
 
-/// What cargo would fail with, in cargo's words.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Error(pub String);
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Error {}
+pub use env::{Env, Given, Jobs, RunEnv, env};
+pub use instr::{Instr, Line, parse};
+pub use key::{CMode, KeyInputs, base};
+pub use outputs::{Outputs, OutputsRef};

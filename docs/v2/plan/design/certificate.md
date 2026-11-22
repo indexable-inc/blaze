@@ -1,5 +1,6 @@
 ---
-status: plan
+status: superseded
+superseded_by: bottom.md#9-the-driver
 summary: The request certificate: one store record a request shape and content that says "this request is answered already, by these outputs", checked by the daemon's loop before any plan, view walk or job; the walk is what happens when it does not hold, and it starts at the units that read the input that moved.
 date: 2026-11-12
 ---

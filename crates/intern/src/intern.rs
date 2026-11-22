@@ -21,7 +21,6 @@ use std::{
 };
 
 use blaze_hash::LazyKey;
-use std::alloc::Global;
 
 use crate::{
     sync::OnceLock,
@@ -246,6 +245,8 @@ pub use crate::_impl_internable as impl_internable;
 
 #[cfg(test)]
 mod tests {
+    use std::alloc::Global;
+
     use super::*;
 
     #[derive(PartialEq, Eq, Hash, Debug)]
@@ -382,14 +383,18 @@ mod tests {
     struct Keyed(Vec<u8>);
     impl_internable!(Keyed);
 
-    /// Interning against an `HashMap` from value to the address of its first handle, over
+    /// Interning against a `Map` from value to the address of its first handle, over
     /// seeded values that collide often: a value seen before gets that handle, a new one a
     /// handle of its own, and every handle reads its value.
     #[test]
     fn interning_agrees_with_a_map_model() {
         let mut rng = blaze_ids::rng::SplitMix64::new(0x1a7e);
-        let mut model: blaze_hash::HashMap<Vec<u8>, *const Keyed, Global> =
-            blaze_hash::HashMap::new_in(Global); // alloc: a test's model
+        let mut model: blaze_hash::Map<Vec<u8>, *const Keyed, blaze_hash::FixedState, Global> =
+            blaze_hash::Map::new(blaze_hash::MapOpts {
+                hasher: blaze_hash::FixedState,
+                alloc: Global,
+                capacity: None,
+            }); // alloc: a test's model
         for _ in 0..20_000 {
             let len = rng.index(24);
             let bytes: Vec<u8> = (0..len).map(|_| b"ab\0"[rng.index(3)]).collect();

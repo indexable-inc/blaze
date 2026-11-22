@@ -1,0 +1,373 @@
+# Builtin impl candidates (src/builtin.rs): sizedness, copy/clone, the Fn family, FnPtr, Tuple,
+# Pointee, DiscriminantKind, Destruct, Unsize and object candidates. References:
+# vendor/rustc_next_trait_solver/src/solve/trait_goals.rs (consider_builtin_*),
+# solve/assembly/structural_traits.rs and solve/assembly/mod.rs.
+#
+# core's impls for primitives and shared references are not builtin (the reference answers
+# NoSolution for them and lets the impls in core apply); the prelude has none, so they are
+# declared here as core declares them. Arrays get none: a case below shows the builtin rule
+# gives nothing for them.
+
+extern impl Copy for u32
+extern impl Clone for u32
+extern impl Copy for u8
+extern impl Clone for u8
+extern impl<T: ?Sized> Copy for &T
+extern impl<T: ?Sized> Clone for &T
+extern struct Wrap<T: ?Sized>(u8, T)
+fn foo(u8) -> u16
+fn id<T>(T) -> T
+unsafe fn danger(u8) -> u8
+trait Super
+trait Sub: Super
+
+# ---- Sized and MetaSized ----
+
+case sized_str_no = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
+goal str: Sized => no
+
+case sized_slice_no = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
+goal [u8]: Sized => no
+
+case sized_dyn_no = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
+goal dyn Debug: Sized => no
+
+case sized_tuple_unsized_tail_no = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
+goal (u8, [u8]): Sized => no
+
+case sized_tuple_yes = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
+goal (u8, u16): Sized => yes
+
+case sized_unit_yes = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
+goal (): Sized => yes
+
+case sized_adt_unsized_tail_no = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
+goal Wrap<[u8]>: Sized => no
+
+case sized_adt_sized_tail_yes = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
+goal Wrap<u8>: Sized => yes
+
+case owner_sized_tail_args = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
+struct TailPair<H, T: ?Sized>(H, T)
+goal TailPair<u8, u16>: Sized => yes
+goal TailPair<u8, [u16]>: Sized => no
+
+case sized_adt_str_tail_no = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
+struct Tail(u8, str)
+goal Tail: Sized => no
+
+case meta_sized_adt_str_tail_yes = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
+struct Tail(u8, str)
+goal Tail: MetaSized => yes
+
+case sized_ty_var_maybe = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
+goal ?0: Sized => maybe
+
+case sized_int_var_yes = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
+goal ?i0: Sized => yes
+
+case sized_foreign_no = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
+foreign Ext
+goal Ext: Sized => no
+
+case meta_sized_foreign_no = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
+foreign Ext
+goal Ext: MetaSized => no
+
+case meta_sized_str_yes = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
+goal str: MetaSized => yes
+
+case meta_sized_dyn_yes = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
+goal dyn Debug: MetaSized => yes
+
+case sized_ref_to_unsized_yes = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
+goal &'static [u8]: Sized => yes
+
+case sized_slice_of_param_no = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
+params T
+goal [T]: Sized => no
+
+case sized_fn_ptr_yes = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
+goal fn(u8) -> u16: Sized => yes
+
+# ---- Copy and Clone ----
+
+case copy_prim_by_core_impl = structural_traits.rs::instantiate_constituent_tys_for_copy_clone_trait
+# The builtin rule answers NoSolution for u32; the declared core impl proves it.
+goal u32: Copy => yes
+
+case copy_tuple_yes = structural_traits.rs::instantiate_constituent_tys_for_copy_clone_trait
+goal (u32, u8): Copy => yes
+
+case copy_tuple_with_string_no = structural_traits.rs::instantiate_constituent_tys_for_copy_clone_trait
+goal (u32, String): Copy => no
+
+case clone_tuple_with_string_yes = structural_traits.rs::instantiate_constituent_tys_for_copy_clone_trait
+goal (u32, String): Clone => yes
+
+case copy_mut_ref_no = structural_traits.rs::instantiate_constituent_tys_for_copy_clone_trait
+goal &'static mut u32: Copy => no
+
+case clone_mut_ref_no = structural_traits.rs::instantiate_constituent_tys_for_copy_clone_trait
+goal &'static mut u32: Clone => no
+
+case copy_shared_ref_yes = structural_traits.rs::instantiate_constituent_tys_for_copy_clone_trait
+goal &'static String: Copy => yes
+
+case copy_fn_def_yes = structural_traits.rs::instantiate_constituent_tys_for_copy_clone_trait
+goal fn#foo: Copy => yes
+
+case clone_fn_def_yes = structural_traits.rs::instantiate_constituent_tys_for_copy_clone_trait
+goal fn#foo: Clone => yes
+
+case copy_fn_ptr_yes = structural_traits.rs::instantiate_constituent_tys_for_copy_clone_trait
+goal fn(u8) -> u8: Copy => yes
+
+case copy_closure_copy_upvars_yes = structural_traits.rs::instantiate_constituent_tys_for_copy_clone_trait
+goal closure#0<fn, fn((u8,)) -> u8, (u32, &'static String)>: Copy => yes
+
+case copy_closure_string_upvar_no = structural_traits.rs::instantiate_constituent_tys_for_copy_clone_trait
+goal closure#0<fn, fn((u8,)) -> u8, (String,)>: Copy => no
+
+case clone_closure_string_upvar_yes = structural_traits.rs::instantiate_constituent_tys_for_copy_clone_trait
+goal closure#0<fn, fn((u8,)) -> u8, (String,)>: Clone => yes
+
+case copy_closure_mut_ref_upvar_no = structural_traits.rs::instantiate_constituent_tys_for_copy_clone_trait
+goal closure#0<fnmut, fn((u8,)) -> u8, (&'static mut u32,)>: Copy => no
+
+case copy_array_no_builtin = structural_traits.rs::instantiate_constituent_tys_for_copy_clone_trait
+# Arrays are Copy by an impl in core, which this world does not declare: the builtin rule
+# alone gives NoSolution.
+goal [u32; 3]: Copy => no
+
+case clone_str_no = structural_traits.rs::instantiate_constituent_tys_for_copy_clone_trait
+goal str: Clone => no
+
+case copy_adt_without_impl_no = structural_traits.rs::instantiate_constituent_tys_for_copy_clone_trait
+goal Vec<u8>: Copy => no
+
+case copy_int_var_maybe = structural_traits.rs::instantiate_constituent_tys_for_copy_clone_trait
+# Two core impls (u8, u32) may apply to an integer variable.
+goal ?i0: Copy => maybe
+
+case clone_ty_var_maybe = trait_goals.rs::consider_builtin_copy_clone_candidate
+goal ?0: Clone => maybe
+
+# ---- Fn, FnMut, FnOnce ----
+
+case fn_def_fn_yes = trait_goals.rs::consider_builtin_fn_trait_candidates
+goal fn#foo: Fn<(u8,)> => yes
+
+case fn_def_fn_mut_yes = trait_goals.rs::consider_builtin_fn_trait_candidates
+goal fn#foo: FnMut<(u8,)> => yes
+
+case fn_def_fn_once_yes = trait_goals.rs::consider_builtin_fn_trait_candidates
+goal fn#foo: FnOnce<(u8,)> => yes
+
+case fn_def_wrong_args_no = trait_goals.rs::consider_builtin_fn_trait_candidates
+goal fn#foo: Fn<(u16,)> => no
+
+case fn_def_infers_args = trait_goals.rs::consider_builtin_fn_trait_candidates
+goal fn#foo: Fn<?0> => yes ?0 = (u8,)
+
+case fn_def_generic_yes = structural_traits.rs::extract_tupled_inputs_and_output_from_callable
+goal fn#id<u8>: Fn<(u8,)> => yes
+
+case fn_def_unsafe_no = structural_traits.rs::extract_tupled_inputs_and_output_from_callable
+goal fn#danger: FnOnce<(u8,)> => no
+
+case fn_ptr_fn_yes = structural_traits.rs::extract_tupled_inputs_and_output_from_callable
+goal fn(u8) -> u16: Fn<(u8,)> => yes
+
+case fn_ptr_unsized_output_no = trait_goals.rs::consider_builtin_fn_trait_candidates
+# The output must be Sized.
+goal fn(u8) -> str: Fn<(u8,)> => no
+
+case closure_fn_kind_fn_yes = structural_traits.rs::extract_tupled_inputs_and_output_from_callable
+goal closure#0<fn, fn((u8,)) -> u8, ()>: Fn<(u8,)> => yes
+
+case closure_fn_mut_kind_fn_no = structural_traits.rs::extract_tupled_inputs_and_output_from_callable
+goal closure#0<fnmut, fn((u8,)) -> u8, ()>: Fn<(u8,)> => no
+
+case closure_fn_mut_kind_fn_mut_yes = structural_traits.rs::extract_tupled_inputs_and_output_from_callable
+goal closure#0<fnmut, fn((u8,)) -> u8, ()>: FnMut<(u8,)> => yes
+
+case closure_fn_once_kind_fn_mut_no = structural_traits.rs::extract_tupled_inputs_and_output_from_callable
+goal closure#0<fnonce, fn((u8,)) -> u8, ()>: FnMut<(u8,)> => no
+
+case closure_fn_once_kind_fn_once_yes = structural_traits.rs::extract_tupled_inputs_and_output_from_callable
+goal closure#0<fnonce, fn((u8,)) -> u8, ()>: FnOnce<(u8,)> => yes
+
+case closure_unknown_kind_fn_maybe = structural_traits.rs::extract_tupled_inputs_and_output_from_callable
+goal closure#0<?K, fn((u8,)) -> u8, ()>: Fn<(u8,)> => maybe
+
+case closure_unknown_kind_fn_once_yes = structural_traits.rs::extract_tupled_inputs_and_output_from_callable
+# Every closure implements FnOnce, whatever its kind.
+goal closure#0<?K, fn((u8,)) -> u8, ()>: FnOnce<(u8,)> => yes
+
+case not_callable_no = trait_goals.rs::consider_builtin_fn_trait_candidates
+goal u32: FnOnce<()> => no
+
+# ---- FnPtr, Tuple, Pointee, DiscriminantKind, Destruct, errors ----
+
+case fn_ptr_trait_yes = trait_goals.rs::consider_builtin_fn_ptr_trait_candidate
+goal fn(u8) -> u8: FnPtr => yes
+
+case fn_ptr_trait_no = trait_goals.rs::consider_builtin_fn_ptr_trait_candidate
+goal u8: FnPtr => no
+
+case fn_ptr_trait_negative_rigid_yes = trait_goals.rs::consider_builtin_fn_ptr_trait_candidate
+goal u8: !FnPtr => yes
+
+case fn_ptr_trait_negative_of_fn_ptr_no = trait_goals.rs::consider_builtin_fn_ptr_trait_candidate
+goal fn(u8) -> u8: !FnPtr => no
+
+case fn_ptr_trait_negative_param_no = trait_goals.rs::consider_builtin_fn_ptr_trait_candidate
+# A parameter is not known rigid: neither FnPtr nor !FnPtr holds.
+params T
+goal T: !FnPtr => no
+
+case tuple_yes = trait_goals.rs::consider_builtin_tuple_candidate
+goal (u8, u16): Tuple => yes
+
+case tuple_unit_yes = trait_goals.rs::consider_builtin_tuple_candidate
+goal (): Tuple => yes
+
+case tuple_no = trait_goals.rs::consider_builtin_tuple_candidate
+goal u8: Tuple => no
+
+case pointee_yes = trait_goals.rs::consider_builtin_pointee_candidate
+goal str: Pointee => yes
+
+case pointee_param_yes = trait_goals.rs::consider_builtin_pointee_candidate
+params T
+goal T: Pointee => yes
+
+# `Pointee::Metadata` (core/src/ptr/metadata.rs, on `Pointee`: "For sized types ... `()`";
+# "For the `str` type, metadata is the length in bytes as `usize`"; "For slice types like `[T]`,
+# metadata is the length in items as `usize`"; "For trait objects like `dyn SomeTrait`, metadata
+# is `DynMetadata<Self>`"; "For structs whose last field is a DST, metadata is the metadata for
+# the last field"). A parameter not known `Sized` keeps its projection.
+case metadata_sized_unit = normalizes_to.rs::consider_builtin_pointee_candidate
+goal <u8 as Pointee>::Metadata == () => yes
+
+case metadata_sized_not_usize = normalizes_to.rs::consider_builtin_pointee_candidate
+goal <u8 as Pointee>::Metadata == usize => no
+
+case metadata_slice_usize = normalizes_to.rs::consider_builtin_pointee_candidate
+goal <[u8] as Pointee>::Metadata == ?0 => yes ?0 = usize
+
+case metadata_str_usize = normalizes_to.rs::consider_builtin_pointee_candidate
+goal <str as Pointee>::Metadata == usize => yes
+
+case metadata_dyn = normalizes_to.rs::consider_builtin_pointee_candidate
+goal <dyn Debug as Pointee>::Metadata == DynMetadata<dyn Debug> => yes
+
+case metadata_struct_tail = normalizes_to.rs::consider_builtin_pointee_candidate
+struct Tail(u8, str)
+goal <Tail as Pointee>::Metadata == usize => yes
+
+case metadata_tuple_tail = normalizes_to.rs::consider_builtin_pointee_candidate
+goal <(u8, [u16]) as Pointee>::Metadata == usize => yes
+
+case metadata_sized_param_unit = normalizes_to.rs::consider_builtin_pointee_candidate
+params T
+env T: Sized
+goal <T as Pointee>::Metadata == () => yes
+
+case metadata_unsized_param_rigid = normalizes_to.rs::consider_builtin_pointee_candidate
+params T
+env T: ?Sized
+goal <T as Pointee>::Metadata == ?0 => yes ?0 = rigid <T as Pointee>::Metadata
+
+# std's `Node` (std/src/sys/sync/rwlock/queue.rs:178) ends in `Atomic<bool>`, whose one field is
+# `UnsafeCell<T::Storage>` (core/src/sync/atomic.rs:384) with `bool`'s `Storage = Align1<u8>`
+# (atomic.rs:334): the tail is an alias, normalized before it is walked (normalizes_to.rs
+# `consider_builtin_pointee_candidate` answers a struct by `<tail as Pointee>::Metadata`, a nested
+# projection whose self type is normalized first). `null_mut::<Node>()` needs exactly this goal
+# (`T: Thin`, `Thin = Pointee<Metadata = ()> + PointeeSized`, core/src/ptr/metadata.rs). Without
+# the fix the walk stops at the unnormalized alias and answers it rigid: the goal fails.
+case metadata_alias_tail_normalized_unit = normalizes_to.rs::consider_builtin_pointee_candidate
+trait PtPrim { type Storage; }
+struct PtAlign<X>(X)
+impl PtPrim for bool { type Storage = PtAlign<u8>; }
+struct PtCell<X>(X)
+struct PtAtom<X>(PtCell<<X as PtPrim>::Storage>)
+struct PtNode(u8, PtAtom<bool>)
+goal <PtNode as Pointee>::Metadata == () => yes
+
+# The same walk ends at a slice through the alias: the normalized tail decides, not a guess.
+case metadata_alias_tail_normalized_slice = normalizes_to.rs::consider_builtin_pointee_candidate
+trait PtPrim { type Storage: ?Sized; }
+impl PtPrim for bool { type Storage = [u8]; }
+struct PtTail<X>(u8, <X as PtPrim>::Storage)
+goal <PtTail<bool> as Pointee>::Metadata == ?0 => yes ?0 = usize
+
+# Control: a struct whose tail is a parameter not known `Sized` stays the rigid projection of
+# that parameter, by name (no guess of `()`).
+case metadata_unsized_param_tail_rigid = normalizes_to.rs::consider_builtin_pointee_candidate
+params T
+env T: ?Sized
+struct PtWrap<X: ?Sized>(u8, X)
+goal <PtWrap<T> as Pointee>::Metadata == ?0 => yes ?0 = rigid <T as Pointee>::Metadata
+
+case discriminant_kind_yes =trait_goals.rs::consider_builtin_discriminant_kind_candidate
+goal Option<u8>: DiscriminantKind => yes
+
+case destruct_yes = trait_goals.rs::consider_builtin_destruct_candidate
+goal String: Destruct => yes
+
+case error_self_copy_yes = trait_goals.rs::consider_error_guaranteed_candidate
+goal _: Copy => yes
+
+# ---- Unsize ----
+
+case unsize_array_to_slice_yes = trait_goals.rs::consider_builtin_array_unsize
+goal [u8; 3]: Unsize<[u8]> => yes
+
+case unsize_array_to_other_slice_no = trait_goals.rs::consider_builtin_array_unsize
+goal [u8; 3]: Unsize<[u16]> => no
+
+case unsize_to_dyn_yes = trait_goals.rs::consider_builtin_unsize_to_dyn_candidate
+# unsure: needs the test world to mark Debug dyn compatible (TraitFlags::DYN_COMPATIBLE)
+goal String: Unsize<dyn Debug> => yes
+
+case unsize_unsized_to_dyn_no = trait_goals.rs::consider_builtin_unsize_to_dyn_candidate
+goal [u8]: Unsize<dyn Debug> => no
+
+case unsize_to_dyn_unimplemented_no = trait_goals.rs::consider_builtin_unsize_to_dyn_candidate
+goal Rc<u8>: Unsize<dyn Debug> => no
+
+case unsize_dyn_drop_auto_yes = trait_goals.rs::consider_builtin_upcast_to_principal
+# unsure: needs Debug dyn compatible in the test world
+goal dyn Debug + Send: Unsize<dyn Debug> => yes
+
+case unsize_dyn_add_auto_no = trait_goals.rs::consider_builtin_upcast_to_principal
+goal dyn Debug: Unsize<dyn Debug + Send> => no
+
+case unsize_dyn_upcast_yes = trait_goals.rs::consider_builtin_dyn_upcast_candidates
+# unsure: needs Sub and Super dyn compatible in the test world
+goal dyn Sub: Unsize<dyn Super> => yes
+
+case unsize_struct_tail_yes = trait_goals.rs::consider_builtin_struct_unsize
+goal Wrap<[u8; 3]>: Unsize<Wrap<[u8]>> => yes
+
+case unsize_ty_var_maybe = trait_goals.rs::consider_structural_builtin_unsize_candidates
+goal ?0: Unsize<[u8]> => maybe
+
+# ---- object candidates ----
+
+case object_principal_yes = assembly/mod.rs::assemble_object_bound_candidates
+# unsure: needs Debug dyn compatible in the test world
+goal dyn Debug: Debug => yes
+
+case object_supertrait_yes = assembly/mod.rs::assemble_object_bound_candidates
+# unsure: needs Sub dyn compatible in the test world
+goal dyn Sub: Super => yes
+
+case object_with_projection_yes = structural_traits.rs::predicates_for_object_candidate
+# unsure: needs Iterator dyn compatible in the test world
+goal dyn Iterator<Item = u8>: Iterator => yes
+
+case object_unrelated_trait_no = assembly/mod.rs::assemble_object_bound_candidates
+goal dyn Debug: Clone => no

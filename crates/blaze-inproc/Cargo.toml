@@ -13,40 +13,19 @@ repository.workspace = true
 [lib]
 doctest = false
 
-# Run by the coordinator as a dev run under blaze: a program that checks it is its own
-# executable at cargo's path, symbolizes its backtrace and was attached by its start hook.
-[[example]]
-name = "inproc-exact"
-path = "programs/exact.rs"
-test = false
-
-# A test binary blaze runs on its code memory: every test process its harness's fork server
-# forks was attached by the start hook before `main`. Run by the coordinator under blaze
-# (`blaze test -p blaze-inproc`); built by cargo it has no start hook and checks nothing.
-[[test]]
-name = "inproc-test-run"
-path = "programs/test_run.rs"
-
-[features]
-# The daemon's side (`host`): launches a run through `blaze-core`'s `Effect::Spawn`. The run
-# process links the crate without it, or only its runtime (`blaze-inproc-rt`, which blaze links
-# into every dev executable whose dependencies don't).
-host = ["dep:blaze-core"]
-
 [dependencies]
-blaze-core = { workspace = true, optional = true }
 blaze-inproc-rt.workspace = true
 blaze-mem.workspace = true
-crossbeam-channel.workspace = true
+# The one channel (`blaze_core::chan`); a test sleeps mid-write through `blaze_core::wait`.
+blaze-core.workspace = true
 
 [dev-dependencies]
-# The test that sleeps mid-write sleeps through `blaze_core::wait` (rule deadline-waits).
-blaze-core.workspace = true
 blaze-ids.workspace = true
 blaze-inproc-rt = { workspace = true, features = ["testing"] }
 blaze-spin.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
+blaze-sys.workspace = true
 libc.workspace = true
 
 [lints]

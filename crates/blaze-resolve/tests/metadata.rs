@@ -4,6 +4,7 @@
 // The fixtures are cargo's output for a workspace at `/ws` on Linux: `path+file:///ws` ids,
 // which a Windows path is not, and `/ws` is no absolute path there.
 #![cfg(unix)]
+#![feature(allocator_api)]
 
 #[path = "resolver/helpers.rs"]
 mod helpers;

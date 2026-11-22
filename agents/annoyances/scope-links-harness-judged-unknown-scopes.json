@@ -1,0 +1,14 @@
+{
+ "id": "scope-links-harness-judged-unknown-scopes",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane SC under rebuild-1115",
+ "where": "crates/blaze-scope/src/links.rs `links_agree`, cells/agree.rs `Cells::links_agree`, tests/module_links.rs `links_agree_on_drawn_crates`",
+ "what": "D116's equality harness ran a drawn crate alone (its dependency and prelude unsolved) and compared the tables against written scopes the run had left unknown: `use crate::z as p` was 'old Absent' only because the core could not decide `p`'s value namespace through a glob of the extern `m1`. The command (cells/switch.rs) refuses such a scope (`Unwritten::Unknown`) before the same check; the library path skipped that refusal. Under it sat two more disagreements the drawn test never reached: a macro_rules! redefined after a child's `mod` line (the Textual table kept the last definition alone, `TextualCut`), and a plain first segment found in a call's output (R6, an outer extern crate taken first) that the tables walked as decided.",
+ "cost": "about an hour; the runner cuts long panic lines, so a drawn world had to be printed one compact line per module to be read",
+ "cause": "the refusal of unknown scopes lived in the command's driver, not in the check it guards",
+ "whys": "two drivers of one check; the check trusted its caller to hand it decided scopes; the drawn test called the weaker driver",
+ "class": "a check whose precondition is enforced by one caller and not by the check itself",
+ "prevention": "done: `Cells::links_agree` refuses a scope with unknowns itself (`Disagreement::Unknown`); the drawn test solves dependencies first (`cells::links_agree_world`); cut rows in the Textual table; first segments from a call or glob are `Unfollowed::Prelude`. Also: this lane edited one test file with a python script (rule 72 says edit tools only); not repeated",
+ "workaround": "none needed now",
+ "state": "fixed"
+}

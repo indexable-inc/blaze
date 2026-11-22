@@ -52,7 +52,7 @@ and still take that build ([#105](https://github.com/indexable-inc/blaze/issues/
 Before a record is written, the store hashes that key together with the store format, what
 blaze was built from and the toolchain's commit. What it was built from is a hash
 `crates/blaze-engine/build.rs` takes of every file of the workspace's crates and the vendored
-ones, of `Cargo.toml`, `Cargo.lock`, `.cargo/config.toml` and `harness/toolchain`, of the
+ones, of `Cargo.toml`, `Cargo.lock`, `.cargo/config.toml` and `pins/toolchain`, of the
 features, the target and whether debug assertions are on. An entry is
 therefore found by any build of blaze from the same sources on any machine, for the same
 toolchain: a CI runner that builds blaze for a commit that changes only the harnesses or

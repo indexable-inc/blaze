@@ -1,0 +1,14 @@
+{
+ "id": "nested-input-by-text-offset",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), write-only lane E3 under rebuild-1115",
+ "where": "crates/blaze-scope/src/nested_input.rs, resolve.rs expand_decls, task/lower.rs CallSrc",
+ "what": "A call written inside an expansion carries its input as `&str`, a slice of the rendered text, and the outline that finds the call is the rendered text outlined. To take the input as tokens, I have to map the slice's bytes back to stream tokens through the renderer's byte places. Calls in a text rewritten after rendering (statements read as items, a block's module) have no places, so they still lex their inputs from text. The lane also had no Grep or Glob tool, so all searching went through the REPL's rg.",
+ "cost": "about an hour working out the places and words mapping, and a byte-offset bridge where an index should be",
+ "cause": "the outline and CallSrc address calls by text, and the text is the only thing they share with the tokens",
+ "whys": "blaze-file-items outlines text; the expansion is rendered to text for it; nothing outlines the token record yet (piece 3 of E3)",
+ "class": "a second address space (bytes of a rendered text) kept beside the tokens, joined by offsets",
+ "prevention": "outline the expansion's token record directly (blaze_file_items over blaze-tokens) so a call's input is a TokenRange; then the places and words bridge and offset_in go",
+ "workaround": "ExpansionTokens::input maps input bytes to a token range using the renderer's places, and refuses by name (NestedInputError) when it cannot",
+ "state": "open"
+}

@@ -17,6 +17,8 @@ doctest = false
 # says why and when it moves). The hash and the signature check are its driver's, handed in
 # (`Hashes`, `Signatures`).
 [dependencies]
+# The deterministic CBOR's one home; `cbor` here fits it to this crate's `alloc` `Vec`.
+blaze-cbor.workspace = true
 blaze-report.workspace = true
 
 [lints]

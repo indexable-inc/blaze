@@ -1,0 +1,33 @@
+[package]
+name = "blaze-squeeze"
+description = "How blaze's records are squeezed for cold storage and transfer, never on the edit loop's read path: the measurement of every scheme on real records (examples/squeeze.rs, the table in docs/v2/plan/design/columns.md), and zstd with a dictionary trained per record kind, the dictionary itself a content-keyed record a compressed record names"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The one zstd of the tree (C zstd 1.5.7, vendor/zstd-sys; `zdict_builder` trains a dictionary).
+zstd.workspace = true
+# A dictionary's name: the BLAKE3 content id of its bytes in a domain of its own.
+blaze-ids.workspace = true
+
+[dev-dependencies]
+# Round trips, corrupt and truncated input, planted bugs: blaze's own property engine.
+blaze-sim.workspace = true
+# The measurement (examples/squeeze.rs): real records of the new layer and the profile.
+blaze-columns.workspace = true
+blaze-parquet.workspace = true
+blaze-file-items.workspace = true
+blaze-surface.workspace = true
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

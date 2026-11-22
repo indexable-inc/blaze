@@ -1,0 +1,7 @@
+[package]
+name = "ladder-x0-int-15-add-wraps-release"
+version = "0.1.0"
+edition = "2024"
+
+[profile.dev]
+overflow-checks = false

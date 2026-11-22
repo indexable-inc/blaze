@@ -1,0 +1,28 @@
+status 0
+stdout
+scope end
+drop b
+drop a
+drop f1
+drop f2
+drop v0
+drop v1
+drop t0
+drop t1
+drop x
+after mem::drop
+drop temp-underscore
+after let _
+after let _kept
+len 12
+drop temp-in-expr
+drop opt
+after take true
+holding old
+drop old
+after assign new
+moved once moved
+end
+drop moved
+drop new
+drop kept

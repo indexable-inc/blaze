@@ -37,7 +37,7 @@ mod tests;
 use std::fmt;
 
 use blaze_graph::wait::OwnedBy;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use std::alloc::Global;
 
 use crate::flight::{Switched, WaitedOn};
@@ -449,8 +449,8 @@ impl Input {
             });
         }
         // alloc: the dump's fields by event, once a dump
-        let mut fields: HashMap<u64, Vec<(String, crate::logs::Value)>, Global> =
-            HashMap::new_in(Global);
+        let mut fields: Map<u64, Vec<(String, crate::logs::Value)>, FixedState, Global> =
+            Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for it in &read.fields {
             let key = flight::meta(it.site)
                 .and_then(|meta| meta.fields().iter().nth(usize::from(it.index)))
@@ -517,10 +517,7 @@ pub enum TimeError {
         error: crate::sql::SqlError,
     },
     /// A derived table's batch could not be made.
-    Arrow {
-        table: &'static str,
-        error: arrow_schema::ArrowError,
-    },
+    Batch(crate::columns::BatchError),
     /// A derived table could not be written into the history.
     History(crate::history::HistoryError),
     /// The rows of a daemon that died could not be read back from its flight recorder's
@@ -587,8 +584,8 @@ impl fmt::Display for TimeError {
                 write!(f, "the column {table}.{column} {why}")
             }
             TimeError::Sql { doing, error } => write!(f, "{doing}: {error}"),
-            TimeError::Arrow { table, error } => {
-                write!(f, "making the rows of the derived table {table}: {error}")
+            TimeError::Batch(error) => {
+                write!(f, "making the rows of the derived table {}: {}", error.table, error.error)
             }
             TimeError::History(error) => {
                 write!(f, "writing a derived table into the history: {error}")
@@ -1092,7 +1089,7 @@ pub struct Model {
     pub anomalies: Anomalies,
     /// Each job lane by the numbers its rows name it by: its own, and the `began_as` its
     /// `started` row gave, which its `job` span and the jobs it spawned before then name.
-    jobs: HashMap<(u32, u64), usize, Global>,
+    jobs: Map<(u32, u64), usize, FixedState, Global>,
 }
 
 impl Model {
@@ -1152,8 +1149,8 @@ impl Model {
     /// Puts each event on its lane: the job its row names, else its span's, else its thread's.
     fn lay_events(&mut self, events: Vec<EventIn>) {
         // alloc: once a model with events
-        let spans: HashMap<(u32, u64), usize, Global> = if events.is_empty() {
-            HashMap::new_in(Global)
+        let spans: Map<(u32, u64), usize, FixedState, Global> = if events.is_empty() {
+            Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None })
         } else {
             self.spans.iter().enumerate().map(|(i, it)| ((it.process, it.span_id), i)).collect()
         };
@@ -1275,10 +1272,10 @@ impl Model {
 }
 
 /// Each thread's switches' instants, in order, by (process, thread).
-type Threads = HashMap<(u32, u32), Vec<i64>, Global>;
+type Threads = Map<(u32, u32), Vec<i64>, FixedState, Global>;
 
 fn thread_rows(switches: &[SwitchIn]) -> Threads {
-    let mut threads: Threads = HashMap::new_in(Global);
+    let mut threads: Threads = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     // A ready row is written by whichever job runs on the thread, so it switches nothing there;
     // a job's `since_ns` is a switch of its thread, where it began.
     for it in switches.iter().filter(|it| it.event != Event::Ready) {
@@ -1395,7 +1392,7 @@ enum Doing {
 impl Builder {
     fn job_lanes(&mut self, switches: &[SwitchIn]) {
         // alloc: each job's rows, once a model
-        let mut jobs: HashMap<(u32, u64), Vec<SwitchIn>, Global> = HashMap::new_in(Global);
+        let mut jobs: Map<(u32, u64), Vec<SwitchIn>, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for it in switches.iter().filter(|it| !matches!(it.event, Event::Idle | Event::Woke)) {
             // alloc: a job's rows, once a job a model
             jobs.entry((it.process, it.job)).or_default().push(*it);
@@ -1597,7 +1594,7 @@ impl Builder {
     fn finish(self, build: u64, spans: Vec<SpanIn>, workers: Vec<Worker>) -> Model {
         let count = spans.len();
         // alloc: once a model
-        let mut jobs: HashMap<(u32, u64), usize, Global> = HashMap::new_in(Global);
+        let mut jobs: Map<(u32, u64), usize, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for (l, lane) in self.lanes.iter().enumerate() {
             if let LaneId::Job { process, job } = lane.id {
                 jobs.insert((process, job), l);
@@ -1642,7 +1639,7 @@ impl Model {
     /// interval ran inside.
     fn lay_spans(&mut self) {
         // alloc: once a model
-        let mut index: HashMap<(u32, u64), usize, Global> = HashMap::new_in(Global);
+        let mut index: Map<(u32, u64), usize, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for (i, it) in self.spans.iter().enumerate() {
             index.insert((it.process, it.span_id), i);
         }
@@ -1726,7 +1723,7 @@ impl Model {
             return;
         }
         // alloc: once a model
-        let mut index: HashMap<(u32, u64), usize, Global> = HashMap::new_in(Global);
+        let mut index: Map<(u32, u64), usize, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for (i, it) in self.spans.iter().enumerate() {
             index.insert((it.process, it.span_id), i);
         }
@@ -1836,7 +1833,7 @@ impl Model {
                 .push(lane.spans.iter().copied().filter(|&i| self.spans[i].is_wait()).collect());
         }
         // alloc: once a model
-        let ready: HashMap<usize, Option<u64>, Global> = ready_by.iter().copied().collect();
+        let ready: Map<usize, Option<u64>, FixedState, Global> = ready_by.iter().copied().collect();
         let jobs = &self.jobs;
         let named = |process: u32, job: u64, found: fn(usize) -> Waker| {
             jobs.get(&(process, job)).copied().map_or(Waker::NoLane { job }, found)
@@ -1905,7 +1902,7 @@ impl Model {
         // alloc: once a model
         let mut under: Vec<Totals> = vec![Totals::default(); self.spans.len()];
         // alloc: once a model
-        let mut last_child_end: HashMap<usize, i64, Global> = HashMap::new_in(Global);
+        let mut last_child_end: Map<usize, i64, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for lane in &self.lanes {
             for &i in &lane.spans {
                 let span = &self.spans[i];

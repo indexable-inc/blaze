@@ -1,0 +1,4 @@
+[package]
+name = "ladder-x0-clo-08-fn-pointers"
+version = "0.1.0"
+edition = "2024"

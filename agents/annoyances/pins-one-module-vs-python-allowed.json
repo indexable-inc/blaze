@@ -1,0 +1,15 @@
+{
+ "id": "pins-one-module-vs-python-allowed",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), writer lane for D162 (one pins/ folder)",
+ "where": "tools/python-allowed.txt; harness/toolchain_pins.py; tools/ratchets/third-party.txt",
+ "what": "The brief asked for one Python module that every script reads the pins through. tools/python-allowed.txt refuses any new .py file, so a fresh `pins.py` could not be added. The existing harness/toolchain_pins.py (the writer of rust.txt) became the reader too, and scripts outside harness/ reach it with sys.path. Separately, tools/ratchets/third-party.txt says `(all) 0 0 0`, but about 50 workspace members name third-party packages (libc, serde, wasmtime, zstd...). It is a written ratchet that was never rewritten, not a measurement.",
+ "cost": "about ten minutes to find the allow-list; the third-party row needs a `thirdparty write` that a write-only lane cannot run",
+ "cause": "the allow-list freezes file names, not concepts; the third-party list's `(all)` row was hand-set to the goal rather than written by the tool",
+ "whys": "an allow-list of files makes 'add the right module' and 'add a stray script' look the same",
+ "class": "a frozen list standing in for a rule",
+ "prevention": "let python-allowed.txt name modules by role, or let a rename keep a row; run `thirdparty {\"command\": \"write\"}` once so the list is what the tool measures",
+ "annoyance": "a write-only lane cannot rewrite a measured ratchet",
+ "workaround": "reused harness/toolchain_pins.py; the third-party row is left for the main agent to rewrite",
+ "state": "open"
+}

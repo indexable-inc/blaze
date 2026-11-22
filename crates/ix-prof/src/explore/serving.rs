@@ -195,7 +195,7 @@ enum At {
     /// Read (or refused as it was read), waiting to be decided.
     Read(Result<Vec<u8, Global>, OpError>),
     /// Its answer is a job's. Dropping `stop` tells the source to stop.
-    Asked { job: JobId, stop: Option<crossbeam_channel::Sender<()>> },
+    Asked { job: JobId, stop: Option<blaze_core::chan::Sender<()>> },
     /// Its answer handed to the endpoint. With `close`, it ends at the answer's
     /// acknowledgement (or the page's stop) and its session is closed then; without, it ends
     /// when QUIC took the answer.
@@ -657,7 +657,7 @@ impl Serving {
                 self.set(stream, At::Asked { job, stop: None });
             }
             Step::Op { name } => {
-                let (stop, stopping) = crossbeam_channel::bounded::<()>(0);
+                let (stop, stopping) = blaze_core::chan::bounded::<()>(0);
                 let work = Work::Op { name, request: bytes, started_ns, stop: stopping };
                 let job = self.jobs.ask(work, For::Op { stream });
                 self.set(stream, At::Asked { job, stop: Some(stop) });

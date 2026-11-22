@@ -1,0 +1,31 @@
+[package]
+name = "blaze-ask"
+description = "The checker's one ask (decision D161): a fact a task lacks is named as a typed need, settled before entry by the gate where its text names it, and otherwise claimed once and made on an explicit, bounded work stack, read where another task made it, or parked on, the asker's work kept; a cycle of needs is a typed error naming its items"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `ClaimTable`: one slot per need's key, the owner, the waiters and the cycle walk.
+blaze-core.workspace = true
+# `ContentId` and its domain hash: a need's subject and its key.
+blaze-ids.workspace = true
+# `Vec` and `Alloc`: the work stack and the board's rows, in the allocator the caller hands in.
+blaze-own.workspace = true
+
+[dev-dependencies]
+# The simulation: bodies with needs met late, made by any task in any order; its controls.
+blaze-sim.workspace = true
+# `blaze_own::testing::heap()`: the tests' root allocator capability (D102).
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

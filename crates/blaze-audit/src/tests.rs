@@ -4,12 +4,12 @@ use std::alloc::Global;
 use std::collections::BTreeMap;
 
 use blaze_fetch::{Algo, Digest};
+use blaze_semver::{Limits, Op};
 use blaze_sim::{Config, Tape};
-use semver::{Op, Version, VersionReq};
 
 use crate::advisory::{Advisory, AdvisoryRefused, Database, MOST_ADVISORY_BYTES};
 use crate::audit::{DatabaseInput, Index, Input, audit, verify_database};
-use crate::cargo_lock::{Lock, LockRefused, MOST_LOCK_BYTES};
+use blaze_manifest::lock::Lock;
 use crate::date::Date;
 use crate::fetch::{Effect, Event, Fetch, Refused};
 use crate::pins::{DatabasePin, GitPin, SourcePins};
@@ -18,6 +18,24 @@ use crate::source::{OutsidePath, PinRefused, Trees, check, require_git};
 use crate::tree::{Kind, TreeFile, TreeRefused, digest};
 use crate::version::{admits, affected, fix};
 use crate::{STALE_ACCEPTANCE, UNMAINTAINED, VULNERABLE, WEAK_SOURCE_PIN, YANKED};
+
+type Version = blaze_semver::Version<Global>;
+type VersionReq = blaze_semver::VersionReq<Global>;
+
+fn version(text: &str) -> Version {
+    Version::parse_in(text, Limits::CARGO, Global).unwrap_or_else(|why| panic!("`{text}` is a version: {why}"))
+}
+
+fn version_req(text: &str) -> VersionReq {
+    VersionReq::parse_in(text, Limits::CARGO, Global).unwrap_or_else(|why| panic!("`{text}` parses: {why}"))
+}
+
+/// `text` read as TOML and lowered, as a manifest's table is handed to [`Settings::parse`].
+fn toml_value(text: &str) -> blaze_data::Value<Global> {
+    blaze_toml::Document::parse_in(text, blaze_toml::Limits::CARGO, Global)
+        .unwrap_or_else(|why| panic!("`{text}` is TOML: {}", why.display(text)))
+        .to_value_in(Global)
+}
 
 // ---------------------------------------------------------------------------------------
 // The matcher against a brute-force model.
@@ -74,8 +92,7 @@ fn model_affected(ranges: &[Vec<Cmp>], v: (u64, u64, u64)) -> bool {
 
 fn req(range: &[Cmp]) -> VersionReq {
     let text: Vec<String> = range.iter().map(Cmp::text).collect();
-    let text = text.join(", ");
-    VersionReq::parse(&text).unwrap_or_else(|why| panic!("`{text}` parses: {why}"))
+    version_req(&text.join(", "))
 }
 
 /// Parts up to this, so small ranges meet small versions often.
@@ -135,7 +152,7 @@ fn the_matcher_agrees_with_the_model() {
 }
 
 /// The matcher with a planted bug: `^0.m.p` taken to keep the major only, as for `^1.m.p`.
-fn planted_admits(c: &semver::Comparator, v: &Version) -> bool {
+fn planted_admits(c: &blaze_semver::Comparator<Global>, v: &Version) -> bool {
     if c.op == Op::Caret && c.major == 0 {
         return v >= &Version::new(0, c.minor.unwrap_or(0), c.patch.unwrap_or(0)) && v.major == 0;
     }
@@ -166,14 +183,14 @@ fn the_oracle_catches_a_caret_that_keeps_only_the_major() {
 
 #[test]
 fn a_pre_release_after_the_fix_has_the_fix() {
-    let patched = [VersionReq::parse(">= 1.2.3").unwrap()];
-    assert!(!affected(&patched, &[], &Version::parse("1.3.0-rc.1").unwrap()));
-    assert!(affected(&patched, &[], &Version::parse("1.2.3-rc.1").unwrap()));
+    let patched = [version_req(">= 1.2.3")];
+    assert!(!affected(&patched, &[], &version("1.3.0-rc.1")));
+    assert!(affected(&patched, &[], &version("1.2.3-rc.1")));
 }
 
 #[test]
 fn the_fix_is_the_least_patched_start_above_the_version() {
-    let patched = [VersionReq::parse(">= 2.0.1").unwrap(), VersionReq::parse("^1.4.2").unwrap()];
+    let patched = [version_req(">= 2.0.1"), version_req("^1.4.2")];
     assert_eq!(fix(&patched, &Version::new(1, 4, 0)), Some((Version::new(1, 4, 2), true)));
     assert_eq!(fix(&patched, &Version::new(1, 9, 0)), Some((Version::new(2, 0, 1), false)));
     assert_eq!(fix(&patched, &Version::new(2, 1, 0)), None);
@@ -275,12 +292,6 @@ fn an_oversized_advisory_is_refused_before_it_is_read() {
     assert!(matches!(&said, Err(AdvisoryRefused::TooBig { file, .. }) if file == "crates/foo/RUSTSEC-2026-0101.md"), "{said:?}");
 }
 
-#[test]
-fn an_oversized_lock_is_refused_before_it_is_read() {
-    let text = vec![b'#'; MOST_LOCK_BYTES + 1];
-    assert_eq!(Lock::parse(&text), Err(LockRefused::TooBig { bytes: MOST_LOCK_BYTES + 1 }));
-}
-
 // ---------------------------------------------------------------------------------------
 // A workspace: a lock, a database, settings, pins.
 
@@ -299,14 +310,19 @@ fn blocks() -> Vec<String> {
     ]
 }
 
-fn lock_of(order: &[usize]) -> Lock {
+/// `text` read by the one lock reader, in the global allocator.
+fn read_lock(text: &str) -> Lock<'static> {
+    Lock::read(text.as_bytes(), blaze_own::testing::heap().alloc()).unwrap()
+}
+
+fn lock_of(order: &[usize]) -> Lock<'static> {
     let blocks = blocks();
     let mut text = "version = 4\n".to_owned();
     for at in order {
         text.push('\n');
         text.push_str(&blocks[*at]);
     }
-    Lock::parse(text.as_bytes()).unwrap()
+    read_lock(&text)
 }
 
 fn database() -> Database {
@@ -358,8 +374,7 @@ impl Index for NoYanks {
 }
 
 fn settings(accept: &str) -> Settings {
-    let text = format!("accept = [{accept}]\n");
-    let table: toml::Value = toml::from_str(&text).unwrap();
+    let table = toml_value(&format!("accept = [{accept}]\n"));
     Settings::parse(Some(&table)).unwrap()
 }
 
@@ -443,7 +458,7 @@ fn an_acceptance_that_matches_nothing_is_stale() {
 #[test]
 fn an_acceptance_needs_a_reason_and_an_expiry() {
     let parse = |accept: &str| {
-        let table: toml::Value = toml::from_str(&format!("accept = [{accept}]\n")).unwrap();
+        let table = toml_value(&format!("accept = [{accept}]\n"));
         Settings::parse(Some(&table)).map_err(|it| it.to_string())
     };
     let said = parse("{ id = \"RUSTSEC-2026-0101\", reason = \" \", until = \"2027-01-01\" }").unwrap_err();
@@ -522,7 +537,7 @@ fn an_outside_path_is_refused_unless_allowed() {
     let pins = pinned_fork(tree_of("fork"));
     let (refused, _) = check(&lock, &outside, &pins, &Settings::default(), &mut fork_on_disk(Ok(None)));
     assert!(matches!(&refused[..], [PinRefused::OutsidePath { package, .. }] if package == "local"), "{refused:?}");
-    let table: toml::Value = toml::from_str("allow-unpinned-paths = [\"local\"]").unwrap();
+    let table = toml_value("allow-unpinned-paths = [\"local\"]");
     let allowed = Settings::parse(Some(&table)).unwrap();
     let (refused, _) = check(&lock, &outside, &pins, &allowed, &mut fork_on_disk(Ok(None)));
     assert_eq!(refused, []);
@@ -531,7 +546,7 @@ fn an_outside_path_is_refused_unless_allowed() {
 #[test]
 fn a_registry_package_without_a_checksum_is_refused() {
     let text = "version = 4\n\n[[package]]\nname = \"foo\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
-    let lock = Lock::parse(text.as_bytes()).unwrap();
+    let lock = read_lock(text);
     let (refused, _) = check(&lock, &[], &SourcePins::default(), &Settings::default(), &mut fork_on_disk(Ok(None)));
     assert!(matches!(&refused[..], [PinRefused::NoChecksum { package, .. }] if package == "foo"), "{refused:?}");
 }
@@ -552,19 +567,19 @@ fn pins_read_back_what_they_render_and_refuse_sha1() {
     pins.advisories = Some(DatabasePin { from: Some(("https://example.com/db".to_owned(), "b".repeat(40))), tree: tree_of("db") });
     let mut text = String::new();
     pins.render(&mut text);
-    let doc: toml::Table = toml::from_str(&text).unwrap();
+    let doc = blaze_toml::Document::parse_in(&text, blaze_toml::Limits::CARGO, Global).unwrap();
     let mut again = SourcePins::default();
     let bad = |why: String| why;
-    again.parse_git(&doc["git"], &bad).unwrap();
-    again.parse_advisories(&doc["advisories"], &bad).unwrap();
+    again.parse_git(doc.root().get("git").unwrap(), &bad).unwrap();
+    again.parse_advisories(doc.root().get("advisories").unwrap(), &bad).unwrap();
     assert_eq!(again, pins);
     let mut twice = String::new();
     again.render(&mut twice);
     assert_eq!(twice, text, "a render is a fixed point");
 
     let weak = format!("[git.\"{FORK}\"]\n{COMMIT} = \"sha1:{}\"\n", "0".repeat(40));
-    let doc: toml::Table = toml::from_str(&weak).unwrap();
-    let said = SourcePins::default().parse_git(&doc["git"], &bad).unwrap_err();
+    let doc = blaze_toml::Document::parse_in(&weak, blaze_toml::Limits::CARGO, Global).unwrap();
+    let said = SourcePins::default().parse_git(doc.root().get("git").unwrap(), &bad).unwrap_err();
     assert!(said.contains("sha1") || said.contains("SHA-1"), "{said}");
 }
 

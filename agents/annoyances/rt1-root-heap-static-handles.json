@@ -1,0 +1,15 @@
+{
+ "id": "rt1-root-heap-static-handles",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane RT1",
+ "where": "crates/blaze-ladder/src/run.rs (Built, run_with), crates/blaze-ladder/src/trap.rs (Trap::new), crates/blaze-proc-macro/src/host.rs (Runtime), crates/blaze-std/src/mem.rs (bstd::mem::Heap)",
+ "what": "porting tests to a root heap made at the test's top meets types with no lifetime that hold tables over Alloc<'static> (Built, RunError::Trapped's strings, proc-macro Runtime): a borrowed root cannot reach them, so each such test either waits for the type to take a lifetime or uses Root::leak",
+ "cost": "most of the lane's reading: finding which 'static demands are a type's missing lifetime and which are only a signature's",
+ "cause": "the ambient heap made 'static handles free, so types were written without an allocator lifetime",
+ "whys": "Heap::process() and testing::heap() returned &'static; nothing made a type state how long its allocator lives",
+ "class": "a type holding allocator-backed values with no lifetime parameter",
+ "prevention": "Root::leak is counted in its own ratchet column (tools/ratchets/alloc-global.txt `leak`), test code included, so each 'static demand shows and falls",
+ "annoyance": "Grep and Glob were missing in this lane's session; read-only grep through Bash stood in",
+ "workaround": "grep/sed -n through Bash, read-only",
+ "state": "open"
+}

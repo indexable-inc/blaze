@@ -1,0 +1,9 @@
+fn element_end(words: &Words<'_, '_>, at: usize, alloc: Alloc<'_>) -> Result<usize, ExtentError> {
+    words.extent(Prefix::Expr, at, alloc)
+}
+
+fn writes_a_turbofish(out: &mut Out<'_, '_>) -> Written {
+    punct(out, ':', Spacing::Joint)?;
+    // astlog-ignore: expand-hand-extent (a token the expansion writes)
+    punct(out, '<', Spacing::Alone)
+}

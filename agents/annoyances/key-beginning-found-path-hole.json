@@ -1,0 +1,15 @@
+{
+ "id": "key-beginning-found-path-hole",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane ND",
+ "where": "crates/blaze-ladder/src/front2/tables/view.rs key_beginning, member_owner, variant_of; crates/blaze-scope/src/names_cells.rs",
+ "what": "key_beginning's found path recorded only the key's own Item cell, but its answer is 'the ONE key beginning so': a second key added with the same 16-byte prefix turns the answer into a refusal and moved no cell the body read. The not-found paths of key_beginning, member_owner and variant_of read the whole items section, so every edit of a crate re-entered every body that asked one of them of a free item.",
+ "cost": "small to fix; the hole cannot be shown with real keys in a fixture (BLAKE3 keys never share 16 bytes), so the test is at the cell level with hand-made keys",
+ "cause": "a cell chosen for what the found answer names (the key) rather than for everything the answer is a function of (every key with the prefix)",
+ "whys": "the view recorded a read per answer case, each case picking the nearest existing cell; no cell answered a by-key search, so 'not found' fell back to a whole section",
+ "class": "a search's cell keyed by its result, not by its question: any 'the unique X' answer whose uniqueness lives outside the found row",
+ "prevention": "done: MemberOf, VariantOf and Beginning cells keyed by the question, a row only where the search finds something (absent = not found), read on both paths; tests a_second_key_with_a_prefix_moves_its_beginning and the_items_search_cells_agree_with_the_record",
+ "annoyance": "the queue was paused (battery) while the brief asked to keep writing; the runner cuts the directory when the ask runs, so a half-made next piece can land in the cut",
+ "workaround": "write each next-piece edit whole so the directory compiles at every save",
+ "state": "fixed"
+}

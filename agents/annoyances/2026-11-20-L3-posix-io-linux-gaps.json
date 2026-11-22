@@ -1,0 +1,8 @@
+{
+  "date": "2026-11-20",
+  "model": "claude-opus-5-5",
+  "lane": "L3",
+  "area": "blaze-sys posix::io over linux/ and macos.rs (D180, libc out)",
+  "annoyance": "The typed Linux layer looks complete but is not: its `mod raw` is private, so a sibling module cannot make a raw system call, and fcntl, dup, dup2, ioctl, preadv, mincore, msync, fallocate and memfd_create are missing from it; ClockId lacks the CPU-time clocks, MapFlags lacks HUGETLB/HUGE_2MB, Advice lacks DONTFORK, the futex calls are private-only, and Advice::raw and sample's ItimerSpec are private, so a test cannot compare them with libc. On macOS the cold table looks like 'all of libSystem' but lacks mmap, munmap, mprotect, msync, close, write, dup, dup2, pipe, poll, nanosleep and localtime_r.",
+  "workaround": "posix/io declares the missing Linux calls against glibc in `sys_fd`/`sys_mem` modules marked 'to move into linux/', and the missing macOS ones as plain externs in `sys_*` modules; the lane report lists each edit to linux/ and macos.rs."
+}

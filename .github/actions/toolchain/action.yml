@@ -1,12 +1,12 @@
-# Rust (the nightly in harness/toolchain) and the LLVM 23 blaze pins
-# (crates/hir-ty-codegen/llvm.json), on any of the runners CI uses (hosted, and ix's). `llvm: build` is Nix
+# Rust (the nightly in pins/toolchain) and the LLVM 23 blaze pins
+# (pins/llvm.json), on any of the runners CI uses (hosted, and ix's). `llvm: build` is Nix
 # with the flake's dev shell fetched: a build of blaze, which links LLVM, runs in it
 # (`nix develop --command cargo build ...`), linked statically against that LLVM with the dev
 # shell's C toolchain and libc. `llvm: run` puts the pinned LLVM's tools the harnesses read with
 # (llvm-dwarfdump) on PATH; `llvm: none` is neither. Windows has no Nix: it fetches the same
 # pinned build with .github/scripts/llvm.py, which has llvm-pdbutil besides.
 name: toolchain
-description: Rust (the nightly in harness/toolchain) and LLVM 23
+description: Rust (the nightly in pins/toolchain) and LLVM 23
 inputs:
   components:
     description: rustup components besides rust-src (see below), space separated
@@ -21,10 +21,10 @@ runs:
   using: composite
   steps:
     - uses: ./.github/actions/rustup
-    - name: Rust (the nightly in harness/toolchain)
+    - name: Rust (the nightly in pins/toolchain)
       shell: bash
       run: |
-        tc=$(cat harness/toolchain)
+        tc=$(cat pins/toolchain)
         # No rust-src: blaze compiles the standard library only from its own library/
         # (docs/toolchain.md) and reads no toolchain's rust-src.
         components=""
@@ -67,7 +67,7 @@ runs:
       uses: actions/cache@v6
       with:
         path: C:\llvm
-        key: llvm-${{ hashFiles('crates/hir-ty-codegen/llvm.json') }}-x86_64-pc-windows-msvc
+        key: llvm-${{ hashFiles('pins/llvm.json') }}-x86_64-pc-windows-msvc
     - if: runner.os == 'Windows' && inputs.llvm != 'none' && steps.llvm-windows.outputs.cache-hit != 'true'
       uses: actions/setup-python@v7
       with:

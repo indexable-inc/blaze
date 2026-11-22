@@ -1,0 +1,17 @@
+// tools/world/, run by Bun. Checked with site/'s TypeScript and Bun types: `site/node_modules/.bin/tsc -p tools/world`
+// after `bun install --cwd site`; tested with `bun test tools/world/client.test.ts`.
+{
+	"compilerOptions": {
+		"target": "esnext",
+		"lib": ["esnext"],
+		"module": "esnext",
+		"moduleResolution": "bundler",
+		"allowImportingTsExtensions": true,
+		"typeRoots": ["../../site/node_modules/@types"],
+		"types": ["bun"],
+		"strict": true,
+		"noEmit": true,
+		"skipLibCheck": true
+	},
+	"include": ["*.ts"]
+}

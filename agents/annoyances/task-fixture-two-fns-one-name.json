@@ -1,0 +1,15 @@
+{
+ "id": "task-fixture-two-fns-one-name",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane VC",
+ "where": "crates/blaze-ladder/tests/front2_tables_task.rs (APP fixture); crates/blaze-ladder/src/front2/tables/task.rs check_body",
+ "what": "lane VB left an OPEN find: `pick` calls `longer<'a, 'b: 'a>` but its read list held no read of `longer`'s head cell, read as a dropped FnSig fact. The fixture defined two fns named `pick` (`pick<T: Clone>` and `pick(x: &u8)`); the test's name walk found the generic one, which calls `clone`, not `longer`. Renamed to `pick_longer`, the read is there and the edit dirties it. The program (E0428 in Rust) was checked without any refusal of the second definition.",
+ "cost": "about twenty minutes reading the fact path before reading the fixture",
+ "cause": "an ill-formed fixture accepted silently: the names layer keeps one of two items of one name and namespace in a module, no error",
+ "whys": "no refusal of a duplicate definition in blaze-scope's names (E0428): the fixture's author saw no error",
+ "class": "a duplicate item name in one module and namespace accepted: a program rustc refuses, and a test whose subject is not what it names",
+ "prevention": "open: blaze-scope should refuse a second definition of one name in one namespace of a module, naming both (lane CI's crate); the new control every_head_the_check_touches_is_read checks every body's held program heads against its read list",
+ "annoyance": "the held-heads control cannot compare core's heads: a per-body store makes heads as NEEDS of other heads (the Sized chain a trait's head needs), which no check reads; telling those from looked-up heads needs a lookup log in heads.rs (lane FL's file)",
+ "workaround": "the control compares the program crate's heads only",
+ "state": "fixture fixed; duplicate-name refusal open"
+}

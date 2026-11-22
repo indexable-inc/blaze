@@ -1,0 +1,34 @@
+# `ByHash` and `ByHashSet`: the table on keys that are hashes already, its hasher
+# `BuildKeyHasher::default()`. One file for the pair's three constructors each, since each
+# rewrite's text differs only by the type (a rule list, each its own `fix`).
+id: explicit-hasher-by-hash-new-in
+language: rust
+severity: hint
+message: "D125/D126: write the hasher; `Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None })`"
+rule:
+  pattern: ByHash::new_in($A)
+fix: "Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: $A, capacity: None })"
+---
+id: explicit-hasher-by-hash-with-capacity-in
+language: rust
+severity: hint
+message: "D125/D126: write the hasher; `Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc, capacity: Some(n) })`"
+rule:
+  pattern: ByHash::with_capacity_in($N, $A)
+fix: "Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: $A, capacity: Some($N) })"
+---
+id: explicit-hasher-by-hash-set-new-in
+language: rust
+severity: hint
+message: "D125/D126: write the hasher; `Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None })`"
+rule:
+  pattern: ByHashSet::new_in($A)
+fix: "Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc: $A, capacity: None })"
+---
+id: explicit-hasher-by-hash-set-with-capacity-in
+language: rust
+severity: hint
+message: "D125/D126: write the hasher; `Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc, capacity: Some(n) })`"
+rule:
+  pattern: ByHashSet::with_capacity_in($N, $A)
+fix: "Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc: $A, capacity: Some($N) })"

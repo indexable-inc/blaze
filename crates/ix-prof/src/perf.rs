@@ -1,7 +1,7 @@
 //! blaze's one `perf_event_open` reader, shared by ix-prof's sampler (`sampler/linux.rs`) and
 //! blaze-profile's (`blaze_profile::sampler`): an event on one thread of this process, its
 //! records (samples, context switches, losses) read from its mapped ring by a thread that
-//! never blocks on it. No feature gate: it needs nothing but `libc`.
+//! never blocks on it. Available on Linux without a feature gate.
 //!
 //! One counter, the thread's task clock: a sample every `1/hz` of its CPU time, user mode only
 //! (`exclude_kernel`), with the user call chain the kernel walks by frame pointer and a time on
@@ -16,10 +16,11 @@
 //! counts the kernel needs `kernel.perf_event_paranoid` 1 or `CAP_PERFMON`. So a switch out
 //! comes with its time and whether it was a preemption, never the stack it blocked in.
 
-use std::{
-    ffi::c_void,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use core::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use blaze_sys::linux::{self, MapFlags, OwnedFd, Prot};
+use blaze_sys::posix::types::{c_int, c_long, c_ulong, pid_t};
 
 const PERF_TYPE_SOFTWARE: u32 = 1;
 const PERF_COUNT_SW_TASK_CLOCK: u64 = 1;
@@ -33,7 +34,7 @@ const SAMPLE_ID_ALL: u64 = 1 << 18;
 const EXCLUDE_CALLCHAIN_KERNEL: u64 = 1 << 21;
 const USE_CLOCKID: u64 = 1 << 25;
 const CONTEXT_SWITCH: u64 = 1 << 26;
-const PERF_FLAG_FD_CLOEXEC: libc::c_ulong = 8;
+const PERF_FLAG_FD_CLOEXEC: c_ulong = 8;
 const PERF_RECORD_LOST: u32 = 2;
 const PERF_RECORD_SAMPLE: u32 = 9;
 const PERF_RECORD_LOST_SAMPLES: u32 = 13;
@@ -149,8 +150,8 @@ impl Chain<'_> {
 
 /// One event on one thread: its file and its mapped ring. Dropping it closes both.
 pub struct Event {
-    fd: libc::c_int,
-    map: *mut c_void,
+    _fd: OwnedFd,
+    map: NonNull<u8>,
     len: usize,
     page: usize,
     data_pages: usize,
@@ -164,7 +165,7 @@ impl Event {
     /// Opens `counter` on the thread `tid` of this process (any CPU), its call chains at most
     /// `max_stack` deep, with a ring of `data_pages` pages (a power of two) after its header.
     pub fn open(
-        tid: libc::pid_t,
+        tid: pid_t,
         counter: Counter,
         max_stack: u16,
         data_pages: usize,
@@ -174,48 +175,36 @@ impl Event {
         // call reads it and returns a new file or -1.
         let fd = unsafe {
             libc::syscall(
-                libc::SYS_perf_event_open,
+                linux::nr::PERF_EVENT_OPEN as c_long,
                 &raw const attr,
                 tid,
-                -1 as libc::c_int,
-                -1 as libc::c_int,
+                -1 as c_int,
+                -1 as c_int,
                 PERF_FLAG_FD_CLOEXEC,
             )
         };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let fd = fd as libc::c_int;
         // SAFETY: `sysconf` has no precondition.
         let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096);
         let data_pages = data_pages.max(1).next_power_of_two();
         let len = page * (1 + data_pages);
-        // SAFETY: a shared mapping of the event's file, of the length the kernel asks for (a
-        // header page and a power of two of pages); checked for failure below.
+        // SAFETY: perf_event_open returned a new descriptor owned only by this event.
+        let fd = unsafe { OwnedFd::from_raw(fd as c_int) };
+        // SAFETY: a fresh shared perf ring. Head and tail are accessed atomically and the
+        // reader copies records before advancing the tail that lets the kernel overwrite them.
         let map = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
-        if map == libc::MAP_FAILED {
-            let why = std::io::Error::last_os_error();
-            // SAFETY: `fd` is the event's file, closed once here.
-            unsafe { libc::close(fd) };
-            return Err(why);
-        }
-        Ok(Event { fd, map, len, page, data_pages })
+            linux::mmap(None, len, Prot::READ | Prot::WRITE, MapFlags::SHARED, Some(fd.fd()), 0)
+        }.map_err(|why| std::io::Error::from_raw_os_error(i32::from(why.raw())))?;
+        Ok(Event { _fd: fd, map, len, page, data_pages })
     }
 
     /// `perf_event_mmap_page`'s `data_head` and `data_tail`, at bytes 1024 and 1032.
     fn head_tail(&self) -> (&AtomicU64, &AtomicU64) {
         let (head, tail) = (
-            self.map.wrapping_byte_add(1024).cast::<u64>(),
-            self.map.wrapping_byte_add(1032).cast::<u64>(),
+            self.map.as_ptr().wrapping_add(1024).cast::<u64>(),
+            self.map.as_ptr().wrapping_add(1032).cast::<u64>(),
         );
         // SAFETY: the header page is mapped for the event's life and the kernel keeps these two
         // `u64`s, 8-aligned, at these offsets in it; the kernel writes `data_head` and the
@@ -231,7 +220,7 @@ impl Event {
         let size = self.page * self.data_pages;
         let start = at as usize % size;
         let first = out.len().min(size - start);
-        let data = self.map.wrapping_byte_add(self.page).cast::<u8>().cast_const();
+        let data = self.map.as_ptr().wrapping_add(self.page).cast_const();
         // SAFETY: bytes `[start, start + first)` of the data area, which follows the header
         // page inside the mapping; the kernel does not write them until `data_tail` passes
         // them, and `out` is a separate buffer of at least `first` bytes.
@@ -277,10 +266,8 @@ impl Event {
 
 impl Drop for Event {
     fn drop(&mut self) {
-        // SAFETY: the mapping made in `open`, of `len`, unmapped once.
-        unsafe { libc::munmap(self.map, self.len) };
-        // SAFETY: the event's file, closed once.
-        unsafe { libc::close(self.fd) };
+        // SAFETY: the mapping made in `open`, of `len`; no reader can use it after drop.
+        let _ = unsafe { linux::munmap(self.map, self.len) };
     }
 }
 

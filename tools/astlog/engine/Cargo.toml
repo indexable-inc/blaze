@@ -12,8 +12,8 @@ repository.workspace = true
 
 [dependencies]
 blaze-hash.workspace = true
-regex.workspace = true
-snafu.workspace = true
+# `text-match`, `text-capture` and `text-replace` patterns (`blaze_script::regex`).
+blaze-script.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true

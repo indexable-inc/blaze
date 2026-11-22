@@ -1,0 +1,8 @@
+{
+  "date": "2026-11-17",
+  "model": "claude-opus-5-5",
+  "lane": "VH",
+  "area": "blaze-typeck portable.rs PTys / OwnTys; front2 body.rs lowering seam",
+  "annoyance": "A blaze-typeck unit test cannot exercise a Stable column: the crate forbids unsafe, and no safe type can hand out `&[T]` over cells that grow through `&self` (`OnceCell` slots give `&[OnceCell<T>]`, a `RefCell<Vec<T>>` gives a guard, not a slice). Every test of the live view therefore lives in blaze-ladder (front2/rows.rs) over the real `StableColumn`. Also: `PTys::len()` reads like the table's length but is a snapshot's; a bound over what an id may reach must use `len_now()`.",
+  "workaround": "Tests of the live view are in crates/blaze-ladder/src/front2/rows.rs beside `a_stable_type_table_interns_alike_through_a_shared_borrow`; the owned form is covered by blaze-typeck's own tests through the same accessors."
+}

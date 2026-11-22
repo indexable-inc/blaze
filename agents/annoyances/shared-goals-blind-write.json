@@ -1,0 +1,15 @@
+{
+ "id": "shared-goals-blind-write",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane RA4",
+ "where": "crates/blaze-solve/src/eval.rs (Solver, evaluate_root, finish), share.rs; blaze-ladder front2 tables/goals.rs",
+ "what": "plan row A4 (trait goals shared by every body) written write-only: ~900 lines across the solver, typeck and the ladder with no compile, so every borrow and lifetime around Solver's scratch buffers (taken with mem::replace to dodge &mut self conflicts) is unverified until the coordinator builds it",
+ "cost": "the session's context ran out once mid-design; the summary carried the design",
+ "cause": "the brief's design spans three crates and an engine seam; the lane may run nothing",
+ "whys": "write-only lanes trade compile feedback for parallelism; a solver change of this size has many small borrow shapes",
+ "class": "large cross-crate change written blind",
+ "prevention": "split such rows in two lanes: solver seam + its tests first (compiled), the ladder plumbing second",
+ "annoyance": "the brief's least-key rule for cycles does not match this solver: non-root cycle members never reach the global cache, so only the root is put and no least-key choice exists",
+ "workaround": "stated in the report",
+ "state": "open"
+}

@@ -1,0 +1,30 @@
+[package]
+name = "blaze-watch"
+description = "blaze's monitor plumbing as sans-IO machines (docs/v2/plan/design/watch.md): the per-thread event rings a running command emits into without a lock, the flight recorder over the same rings, the channel transport with credit flow control and resume by sequence number, the viewer's core (live runs, pages over HTTP/1.1 and server-sent events, pairing, toggles, expiry, the relay uplink) and the compact recording format"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# Zero third-party crates, and no crate of this workspace that has any: every collection is
+# blaze-own's. The deterministic CBOR is blaze-cbor, named here as `cbor` (its one home,
+# rule 30; blaze-pack takes it from there too).
+[dependencies]
+blaze-cbor.workspace = true
+blaze-own.workspace = true
+# The rings (`blaze_trace::ring`, their one home): the emitter is their 64-byte width.
+blaze-trace.workspace = true
+
+[dev-dependencies]
+# `check` and `control`: every machine's simulation and its planted-bug controls.
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

@@ -30,61 +30,35 @@ use std::{io::Write, path::Path, time::Duration};
 use blaze_script::{Value, pyfmt::repr, run_within};
 
 const SCRIPT: &str = "gate_changes.py";
-/// What the build of blaze and the unit tests (blaze-platform.yaml's `build` and `tests` jobs,
-/// tiers gate and warm) read. A path ending in `/` is the directory and everything under it.
+/// What blaze.yaml's `cargo` job (cargo check and the unit tests, tiers gate and warm) reads. A
+/// path ending in `/` is the directory and everything under it.
 const CODE: &[&str] = &[
-    // The workspace's crates, with their test data and crates/hir-ty-codegen/llvm.json (the LLVM
-    // the blaze action fetches).
+    // The workspace's crates, with their test data.
     "crates/",
-    // The patched crates of [patch.crates-io], hashed into BLAZE_SOURCES (blaze-engine/build.rs).
+    // The patched crates of [patch.crates-io].
     "vendor/",
-    // ix's linter and rewriter, workspace members, and the rules the workspace check runs.
+    // ix's linter and rewriter, workspace members.
     "tools/astlog/",
-    // The workspace, the lock file (the build is --locked) and cargo's config ([env]).
+    // The workspace, the lock file (the job is --locked) and cargo's config ([env]).
     "Cargo.toml",
     "Cargo.lock",
     ".cargo/",
-    // Found by blaze-fmt's and blaze-lints' search up from a directory; not known to be unread
-    // by their tests.
+    // Found by blaze-fmt's search up from a directory; not known to be unread by its tests.
     ".rustfmt.toml",
     ".clippy.toml",
-    // The pinned nightly: compiled into blaze-cargo.
-    "harness/toolchain",
-    // The tests job runs it, and holds its failures to the known ones.
-    "harness/unittests.py",
-    "harness/failures.py",
-    "harness/known-failures.toml",
-    // What fetches and checks the pinned LLVM for the build (.github/actions/blaze). No Nix:
-    // neither job reads the flake.
-    ".github/scripts/llvm.py",
-    // The profile-gate job: its script, its known list, and the flake that pins its DuckDB (its
-    // fixtures are under crates/).
-    "harness/profile_gate.py",
-    "harness/profile-gate-known.toml",
-    // The same job's smoke of the budget harness against the blaze the build made: the script,
-    // the engine adapter and its layout of a daemon's home, the fixture it builds, its result.
-    "harness/v2/budgets.py",
-    "harness/v2/guards.py",
-    "harness/v2/guards-known.toml",
-    "harness/v2/engine.py",
-    "harness/v2/fixture.py",
-    "harness/v2/report.py",
-    "harness/storelib.py",
-    "flake.nix",
-    "flake.lock",
-    // The release of blaze that builds and tests blaze (.github/actions/blaze), and its installer.
-    ".github/blaze-version",
-    "site/install.sh",
+    // The pinned nightly the job runs, and every other fact of the pin (pins/README.md).
+    "pins/",
     // The gate's jobs, and the actions they use.
     ".github/workflows/blaze.yaml",
-    ".github/workflows/blaze-platform.yaml",
     ".github/actions/toolchain/",
-    ".github/actions/blaze/",
-    // The check job's built scripts (`changed`): their cache key and their build.
+    ".github/actions/rustup/",
+    // The check job's built scripts (`changed`): their cache key and their build, and the release
+    // of blaze that builds them (.github/actions/blaze).
     ".github/actions/script/",
-    // The package of the repository's scripts (scripts/src/bin/<name>.rs), a workspace member the
-    // build checks, among them the workspace check's fast tier (`changed`, which packages a change
-    // touches); their library is crates/blaze-script, under crates/ above.
+    ".github/actions/blaze/",
+    ".github/blaze-version",
+    // The package of the repository's scripts (scripts/src/bin/<name>.rs), a workspace member;
+    // their library is crates/blaze-script, under crates/ above.
     "scripts/",
 ];
 /// What the warm tier (a push to main) reads besides: the std cases of the smoke corpus, run

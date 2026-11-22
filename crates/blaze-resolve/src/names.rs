@@ -1,10 +1,12 @@
 //! Which package and feature names cargo accepts: `cargo-util-schemas`' `restricted_names.rs`
 //! of cargo 1.99.0 (5f94df4789).
 
-use anyhow::{Result, bail};
+use crate::error::ResolveError;
 
-fn invalid(ch: char, what: &str, name: &str, reason: &str) -> anyhow::Error {
-    anyhow::anyhow!("invalid character `{ch}` in {what}: `{name}`, {reason}")
+type Result<T, E = ResolveError> = std::result::Result<T, E>;
+
+fn invalid(ch: char, what: &'static str, name: &str, reason: &'static str) -> ResolveError {
+    ResolveError::NameChar { ch, what, name: name.to_owned(), reason }
 }
 
 /// A package name: each `::`-separated part a Unicode identifier that may also have `-`, and
@@ -20,16 +22,21 @@ pub fn validate_registry_name(name: &str) -> Result<()> {
     validate_name(name, "registry name")
 }
 
-fn validate_name(name: &str, what: &str) -> Result<()> {
+/// A `[path-bases]` name, checked as cargo-util-schemas checks one.
+pub fn validate_path_base_name(name: &str) -> Result<()> {
+    validate_name(name, "path base name")
+}
+
+fn validate_name(name: &str, what: &'static str) -> Result<()> {
     if name.is_empty() {
-        bail!("{what} cannot be empty");
+        return Err(ResolveError::EmptyName { what });
     }
     let mut chars = name.chars();
     if let Some(ch) = chars.next() {
         if ch.is_ascii_digit() {
             return Err(invalid(ch, what, name, "the name cannot start with a digit"));
         }
-        if !(unicode_ident::is_xid_start(ch) || ch == '_') {
+        if !(blaze_unicode::is_xid_start(ch) || ch == '_') {
             return Err(invalid(
                 ch,
                 what,
@@ -39,7 +46,7 @@ fn validate_name(name: &str, what: &str) -> Result<()> {
         }
     }
     for ch in chars {
-        if !(unicode_ident::is_xid_continue(ch) || ch == '-') {
+        if !(blaze_unicode::is_xid_continue(ch) || ch == '-') {
             return Err(invalid(
                 ch,
                 what,
@@ -55,17 +62,17 @@ fn validate_name(name: &str, what: &str) -> Result<()> {
 pub fn validate_feature_name(name: &str) -> Result<()> {
     let what = "feature name";
     if name.is_empty() {
-        bail!("{what} cannot be empty");
+        return Err(ResolveError::EmptyName { what });
     }
     if name.starts_with("dep:") {
-        bail!("feature named `{name}` is not allowed to start with `dep:`");
+        return Err(ResolveError::FeatureNameDep { name: name.to_owned() });
     }
     if name.contains('/') {
         return Err(invalid('/', what, name, "feature name is not allowed to contain slashes"));
     }
     let mut chars = name.chars();
     if let Some(ch) = chars.next()
-        && !(unicode_ident::is_xid_start(ch) || ch == '_' || ch.is_ascii_digit())
+        && !(blaze_unicode::is_xid_start(ch) || ch == '_' || ch.is_ascii_digit())
     {
         return Err(invalid(
             ch,
@@ -76,7 +83,7 @@ pub fn validate_feature_name(name: &str) -> Result<()> {
         ));
     }
     for ch in chars {
-        if !(unicode_ident::is_xid_continue(ch) || ch == '-' || ch == '+' || ch == '.') {
+        if !(blaze_unicode::is_xid_continue(ch) || ch == '-' || ch == '+' || ch == '.') {
             return Err(invalid(
                 ch,
                 what,

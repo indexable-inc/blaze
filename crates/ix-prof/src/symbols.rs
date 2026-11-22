@@ -114,12 +114,25 @@ impl Table {
             std::str::from_utf8(data.get(at..end)?).ok()?;
             Some((u32::try_from(at).ok()?, u32::try_from(name.len()).ok()?))
         };
+        // An assembler's local label names no function: `.Lfunc_end<n>` marks where the
+        // function before it ends, which is the next function's start, and sorts before that
+        // function's name at the same address (`.` before `_`), so the dedup below kept the
+        // label (a naked function's end label reaches Mach-O's table on 2026-11 nightlies).
+        // A label starts with `.L` (ELF), or with `L` or `l` on Mach-O, where every C or Rust
+        // symbol starts with `_`; on ELF a C function may start with `l` (`lseek`), so that
+        // rule is Mach-O's alone.
+        let macho = object.format() == object::BinaryFormat::MachO;
+        let label = |name: &[u8]| name.starts_with(b".L") || (macho && matches!(name.first(), Some(b'L' | b'l')));
         // alloc: the symbols while they are sorted, once a process
         let mut symbols: Vec<(u64, u32, u32, u32)> = object
             .symbols()
             .filter(|it| it.kind() == SymbolKind::Text && it.address() != 0)
             .filter_map(|it| {
-                let (at, len) = place(it.name_bytes().ok()?)?;
+                let name = it.name_bytes().ok()?;
+                if label(name) {
+                    return None;
+                }
+                let (at, len) = place(name)?;
                 Some((it.address(), u32::try_from(it.size()).unwrap_or(u32::MAX), at, len))
             })
             .collect();
@@ -333,6 +346,21 @@ fn map(path: &Path) -> Result<&'static [u8], String> {
     if len == 0 {
         return Err(format!("{} is empty", path.display()));
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use blaze_sys::posix::io::{self, MapFlags, Prot};
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // SAFETY: this requests a fresh private mapping at an address chosen by the kernel.
+    let at = unsafe {
+        io::mmap(
+            None, len, Prot::READ, MapFlags::PRIVATE,
+            Some(blaze_sys::Fd::new(file.as_raw_fd())), 0,
+        )
+    }
+    .map_err(|why| {
+        format!("mapping {}: {}", path.display(), std::io::Error::from_raw_os_error(i32::from(why.raw())))
+    })?
+    .as_ptr();
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     // SAFETY: a new read-only private mapping of `len` bytes of a file opened above; the
     // mapping outlives the descriptor, which closes as `file` drops.
     let at = unsafe {
@@ -345,6 +373,7 @@ fn map(path: &Path) -> Result<&'static [u8], String> {
             0,
         )
     };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     if at == libc::MAP_FAILED {
         return Err(format!("mapping {}: {}", path.display(), std::io::Error::last_os_error()));
     }
@@ -713,7 +742,7 @@ fn inlined(at: u64) -> Vec<String> {
 #[cfg(target_os = "macos")]
 fn slide() -> Option<u64> {
     // SAFETY: image 0 is the main executable, which dyld loaded before `main`.
-    let slide = unsafe { libc::_dyld_get_image_vmaddr_slide(0) };
+    let slide = unsafe { blaze_sys::posix::thread::_dyld_get_image_vmaddr_slide(0) };
     Some(slide as u64)
 }
 
@@ -721,9 +750,9 @@ fn slide() -> Option<u64> {
 fn slide() -> Option<u64> {
     unsafe extern "C" fn first(
         info: *mut libc::dl_phdr_info,
-        _size: libc::size_t,
-        out: *mut libc::c_void,
-    ) -> libc::c_int {
+        _size: usize,
+        out: *mut core::ffi::c_void,
+    ) -> core::ffi::c_int {
         // SAFETY: the loader gives a valid entry for the length of the call, and `out` is the
         // `u64` `slide` passed below.
         let addr = unsafe { (*info).dlpi_addr };
@@ -747,17 +776,21 @@ fn slide() -> Option<u64> {
 /// exported symbol and its address.
 #[cfg(unix)]
 fn loaded(pc: u64) -> Option<(u64, Option<String>, Option<String>, u64)> {
+    #[cfg(target_os = "macos")]
+    let info = blaze_sys::posix::thread::address_info(pc as *const core::ffi::c_void)?;
+    #[cfg(not(target_os = "macos"))]
     let mut info = libc::Dl_info {
         dli_fname: std::ptr::null(),
         dli_fbase: std::ptr::null_mut(),
         dli_sname: std::ptr::null(),
         dli_saddr: std::ptr::null_mut(),
     };
+    #[cfg(not(target_os = "macos"))]
     // SAFETY: `info` is a `Dl_info` to fill; `dladdr` only reads the loader's tables.
-    if unsafe { libc::dladdr(pc as *const libc::c_void, &mut info) } == 0 {
+    if unsafe { libc::dladdr(pc as *const core::ffi::c_void, &mut info) } == 0 {
         return None;
     }
-    let text = |ptr: *const libc::c_char| {
+    let text = |ptr: *const core::ffi::c_char| {
         // SAFETY: `dladdr` set it to a NUL-terminated string the loader keeps for the
         // object's life, or left it null.
         (!ptr.is_null())

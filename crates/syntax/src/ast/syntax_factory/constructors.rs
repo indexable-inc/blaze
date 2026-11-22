@@ -5,7 +5,7 @@
     reason = "rust-analyzer's owned-node builder API; goes with the handles as format moves to views"
 )]
 
-use either::Either;
+use stdx::Either;
 
 use crate::{
     AstNode, Edition, NodeOrToken, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken,

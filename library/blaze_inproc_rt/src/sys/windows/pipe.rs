@@ -5,44 +5,41 @@
 //! the first instance is made with `FILE_FLAG_FIRST_PIPE_INSTANCE` (no process squats the name
 //! before the daemon), and every peer's token is checked to be this user's.
 
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use std::sync::{Mutex, PoisonError};
-use windows_sys::Win32::Foundation::{
+
+use blaze_sys::windows::foundation::{
     ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY,
-    ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, SECURITY_DESCRIPTOR_REVISION,
+    SYSTEM_MANDATORY_LABEL_NO_WRITE_UP, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
-use windows_sys::Win32::Security::{
+use blaze_sys::windows::fs::{
+    CreateFileW, FILE_ALL_ACCESS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
+    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_WRITE_DATA, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, SYNCHRONIZE, WriteFile,
+};
+use blaze_sys::windows::io::{
+    CancelIoEx, ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId,
+    GetOverlappedResult, OVERLAPPED, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, PeekNamedPipe, WaitNamedPipeW,
+};
+use blaze_sys::windows::security::{
     ACL, ACL_REVISION, AddAccessAllowedAce, AddMandatoryAce, CopySid, CreateWellKnownSid, EqualSid,
     GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor, PSID, SECURITY_ATTRIBUTES,
     SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE, SetSecurityDescriptorDacl,
     SetSecurityDescriptorSacl, TOKEN_QUERY, TOKEN_USER, TokenUser, WELL_KNOWN_SID_TYPE,
     WinBuiltinAnyPackageSid, WinLowLabelSid,
 };
-use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ALL_ACCESS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
-    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_WRITE_DATA, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
-    ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, SYNCHRONIZE, WriteFile,
-};
-use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
-use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, PeekNamedPipe,
-    WaitNamedPipeW,
-};
-use windows_sys::Win32::System::SystemServices::{
-    SECURITY_DESCRIPTOR_REVISION, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
-};
-use windows_sys::Win32::System::Threading::{
+use blaze_sys::windows::threading::{
     CreateEventW, GetCurrentProcess, INFINITE, OpenProcess, OpenProcessToken,
     PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
 };
-use windows_sys::core::BOOL;
+use blaze_sys::windows::{Bool, Handle};
 
-use super::os;
+use super::{handle_of, os};
 use crate::Error;
 
 const PIPES: &str = r"\\.\pipe\";
@@ -55,18 +52,19 @@ const CONNECTING: Duration = Duration::from_secs(30);
 /// never make an instance of it (`FILE_APPEND_DATA`, which would let it answer start hooks).
 const CONNECT: u32 = FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 
-fn check(ok: BOOL, what: &str) -> Result<(), Error> {
-    if ok == 0 { Err(os(what)) } else { Ok(()) }
+fn check(ok: Bool, what: &str) -> Result<(), Error> {
+    if ok.is_true() { Ok(()) } else { Err(os(what)) }
 }
 
 fn event() -> Result<OwnedHandle, Error> {
     // SAFETY: an unnamed manual-reset event, not signaled; value-only arguments.
-    let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+    let event =
+        unsafe { CreateEventW(std::ptr::null(), Bool::TRUE, Bool::FALSE, std::ptr::null()) };
     if event.is_null() {
         return Err(os("CreateEventW for a pipe's transfers"));
     }
     // SAFETY: just made, owned by nothing else.
-    Ok(unsafe { OwnedHandle::from_raw_handle(event) })
+    Ok(unsafe { OwnedHandle::from_raw_handle(event.raw()) })
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -128,12 +126,11 @@ impl Stream {
     fn transfer(
         &mut self,
         what: &str,
-        start: impl FnOnce(HANDLE, *mut OVERLAPPED) -> BOOL,
+        start: impl FnOnce(Handle, *mut OVERLAPPED) -> Bool,
     ) -> Result<Option<u32>, Error> {
-        let pipe = self.pipe.as_raw_handle();
-        let mut overlapped =
-            OVERLAPPED { hEvent: self.event.as_raw_handle(), ..Default::default() };
-        if start(pipe, &mut overlapped) == 0 {
+        let pipe = handle_of(&self.pipe);
+        let mut overlapped = OVERLAPPED { hEvent: handle_of(&self.event), ..Default::default() };
+        if !start(pipe, &mut overlapped).is_true() {
             let error = std::io::Error::last_os_error();
             if hung_up(&error) {
                 return Ok(None);
@@ -143,7 +140,7 @@ impl Stream {
             }
         }
         // SAFETY: waits on the event this stream owns.
-        let waited = unsafe { WaitForSingleObject(self.event.as_raw_handle(), self.timeout) };
+        let waited = unsafe { WaitForSingleObject(handle_of(&self.event), self.timeout) };
         let timed_out = waited == WAIT_TIMEOUT;
         if waited != WAIT_OBJECT_0 {
             // SAFETY: cancels the transfer `overlapped` names, if it is still running.
@@ -152,7 +149,7 @@ impl Stream {
         let mut done = 0u32;
         // SAFETY: waits until the transfer `overlapped` names is over, done, failed or
         // cancelled; writes only `done`.
-        if unsafe { GetOverlappedResult(pipe, &overlapped, &mut done, 1) } != 0 {
+        if unsafe { GetOverlappedResult(pipe, &overlapped, &mut done, Bool::TRUE) }.is_true() {
             return Ok(Some(done));
         }
         let error = std::io::Error::last_os_error();
@@ -171,7 +168,7 @@ impl Stream {
         // SAFETY: peeks no bytes, writes only `available`; the pipe is open while `self` is.
         let ok = unsafe {
             PeekNamedPipe(
-                self.pipe.as_raw_handle(),
+                handle_of(&self.pipe),
                 std::ptr::null_mut(),
                 0,
                 std::ptr::null_mut(),
@@ -179,7 +176,7 @@ impl Stream {
                 std::ptr::null_mut(),
             )
         };
-        ok == 0 && hung_up(&std::io::Error::last_os_error())
+        !ok.is_true() && hung_up(&std::io::Error::last_os_error())
     }
 
     pub fn set_timeout(&mut self, timeout: Option<Duration>) -> Result<(), Error> {
@@ -235,7 +232,7 @@ impl Listener {
         let mut pid = 0;
         // SAFETY: a query of the pipe this listener owns; writes only `pid`.
         check(
-            unsafe { GetNamedPipeClientProcessId(pipe.as_raw_handle(), &mut pid) },
+            unsafe { GetNamedPipeClientProcessId(handle_of(&pipe), &mut pid) },
             "GetNamedPipeClientProcessId",
         )?;
         let peer = Sid::of_process(pid)?;
@@ -252,7 +249,7 @@ fn instance(name: &[u16], security: &Security, first: bool) -> Result<OwnedHandl
     let attributes = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: security.descriptor(),
-        bInheritHandle: 0,
+        bInheritHandle: Bool::FALSE,
     };
     let mut mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
     if first {
@@ -272,18 +269,18 @@ fn instance(name: &[u16], security: &Security, first: bool) -> Result<OwnedHandl
             &attributes,
         )
     };
-    if pipe == INVALID_HANDLE_VALUE {
+    if pipe.is_invalid() {
         return Err(os("CreateNamedPipeW of blaze-inproc's pipe"));
     }
     // SAFETY: just made, owned by nothing else.
-    Ok(unsafe { OwnedHandle::from_raw_handle(pipe) })
+    Ok(unsafe { OwnedHandle::from_raw_handle(pipe.raw()) })
 }
 
 fn wait_for_client(pipe: &OwnedHandle, event: &OwnedHandle) -> Result<(), Error> {
-    let mut overlapped = OVERLAPPED { hEvent: event.as_raw_handle(), ..Default::default() };
+    let mut overlapped = OVERLAPPED { hEvent: handle_of(event), ..Default::default() };
     // SAFETY: starts waiting for a client on `pipe`; `overlapped` lives until the wait below is
     // over.
-    if unsafe { ConnectNamedPipe(pipe.as_raw_handle(), &mut overlapped) } != 0 {
+    if unsafe { ConnectNamedPipe(handle_of(pipe), &mut overlapped) }.is_true() {
         return Ok(());
     }
     let error = std::io::Error::last_os_error();
@@ -296,7 +293,7 @@ fn wait_for_client(pipe: &OwnedHandle, event: &OwnedHandle) -> Result<(), Error>
     // SAFETY: waits until the connect `overlapped` names is over; then the system no longer
     // touches it.
     check(
-        unsafe { GetOverlappedResult(pipe.as_raw_handle(), &overlapped, &mut done, 1) },
+        unsafe { GetOverlappedResult(handle_of(pipe), &overlapped, &mut done, Bool::TRUE) },
         "ConnectNamedPipe",
     )
 }
@@ -319,12 +316,12 @@ pub fn connect(address: &str) -> Result<Stream, Error> {
                 std::ptr::null(),
                 OPEN_EXISTING,
                 FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-                std::ptr::null_mut(),
+                Handle::NULL,
             )
         };
-        if pipe != INVALID_HANDLE_VALUE {
+        if !pipe.is_invalid() {
             // SAFETY: just opened, owned by nothing else.
-            return Stream::new(unsafe { OwnedHandle::from_raw_handle(pipe) });
+            return Stream::new(unsafe { OwnedHandle::from_raw_handle(pipe.raw()) });
         }
         let error = std::io::Error::last_os_error();
         let left = deadline.saturating_duration_since(Instant::now());
@@ -367,35 +364,36 @@ impl Sid {
 
     fn of_process(pid: u32) -> Result<Sid, Error> {
         // SAFETY: value-only arguments; the handle it returns is checked and owned below.
-        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        let process =
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, Bool::FALSE, pid) };
         if process.is_null() {
             return Err(os(format_args!("OpenProcess of the peer {pid}")));
         }
         // SAFETY: just opened, owned by nothing else.
-        let process = unsafe { OwnedHandle::from_raw_handle(process) };
-        token_user(process.as_raw_handle())
+        let process = unsafe { OwnedHandle::from_raw_handle(process.raw()) };
+        token_user(handle_of(&process))
     }
 
     fn equal(&self, other: &Sid) -> bool {
         // SAFETY: both are SIDs CopySid or CreateWellKnownSid wrote.
-        unsafe { EqualSid(self.ptr(), other.ptr()) != 0 }
+        unsafe { EqualSid(self.ptr(), other.ptr()) }.is_true()
     }
 }
 
 /// The user of the process `process` names.
-fn token_user(process: HANDLE) -> Result<Sid, Error> {
-    let mut token = std::ptr::null_mut();
+fn token_user(process: Handle) -> Result<Sid, Error> {
+    let mut token = Handle::NULL;
     // SAFETY: opens the token of a process handle the caller holds; writes only `token`.
     check(unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }, "OpenProcessToken")?;
     // SAFETY: just opened, owned by nothing else.
-    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let token = unsafe { OwnedHandle::from_raw_handle(token.raw()) };
     let mut buffer = [0u64; (size_of::<TOKEN_USER>() + SECURITY_MAX_SID_SIZE as usize).div_ceil(8)];
     let mut len = 0;
     // SAFETY: writes at most the buffer's size into it; the buffer is 8-aligned, as TOKEN_USER is.
     check(
         unsafe {
             GetTokenInformation(
-                token.as_raw_handle(),
+                handle_of(&token),
                 TokenUser,
                 buffer.as_mut_ptr().cast(),
                 size_of_val(&buffer) as u32,
@@ -472,8 +470,14 @@ impl Security {
                 InitializeSecurityDescriptor(at, SECURITY_DESCRIPTOR_REVISION),
                 "InitializeSecurityDescriptor",
             )?;
-            check(SetSecurityDescriptorDacl(at, 1, dacl_at, 0), "SetSecurityDescriptorDacl")?;
-            check(SetSecurityDescriptorSacl(at, 1, sacl_at, 0), "SetSecurityDescriptorSacl")?;
+            check(
+                SetSecurityDescriptorDacl(at, Bool::TRUE, dacl_at, Bool::FALSE),
+                "SetSecurityDescriptorDacl",
+            )?;
+            check(
+                SetSecurityDescriptorSacl(at, Bool::TRUE, sacl_at, Bool::FALSE),
+                "SetSecurityDescriptorSacl",
+            )?;
         }
         Ok(Security { descriptor, _dacl: dacl, _sacl: sacl })
     }

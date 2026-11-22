@@ -32,13 +32,13 @@
 //!   made, freed when dropped (`crate::exec`). `fn new(code: usize, data: usize, write: impl
 //!   FnOnce(&mut [u8], &mut [u8])) -> Result<Exec, Error>`: `write` gets the code's `code`
 //!   bytes and the data's `data`, writable, at the addresses they run at, on the calling
-//!   thread; then the code is made read and execute (Linux `mprotect`, macOS `MAP_JIT` with
-//!   `pthread_jit_write_protect_np`, Windows `VirtualProtectEx`) with the instruction cache
-//!   maintenance `View::publish` does. The data is within 1 GiB of every code byte.
-//!   `fn code_address(&self) -> u64`, `fn data_address(&self) -> u64`,
-//!   `fn data(&mut self) -> &mut [u8]`. `fn after_fork()`: makes the calling thread, the one
-//!   thread of a child just forked, able to run every `Exec`'s code (macOS: its `MAP_JIT`
-//!   pages executable, `pthread_jit_write_protect_np(1)`; nothing elsewhere), async-signal-safe.
+//!   thread; then the code is made read and execute for good (Linux and macOS `mprotect`,
+//!   Windows `VirtualProtectEx`) with the instruction cache maintenance `View::publish` does.
+//!   No page is writable and executable at once, and none depends on a thread's state, so a
+//!   child forked from the process runs the code with nothing to do first. (macOS: the pages
+//!   carry no signature, so `new` refuses in a process that enforces code signing.) The data
+//!   is within 1 GiB of every code byte. `fn code_address(&self) -> u64`,
+//!   `fn data_address(&self) -> u64`, `fn data(&mut self) -> &mut [u8]`.
 //! - `struct Stream` (`Send`): a connected byte stream of the channel.
 //!   `fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error>` (0 when the peer hung up),
 //!   `fn write_all(&mut self, bytes: &[u8]) -> Result<(), Error>`,

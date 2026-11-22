@@ -1,23 +1,23 @@
 name: release
 
-# A tag `v0.YYYYMMDD.N` (a dated version, .github/scripts/train_release.py) builds blaze for
-# Linux (x86_64, aarch64) and macOS (aarch64), puts every asset into the R2 bucket blaze-releases (where blaze fetches
-# it from, .github/scripts/r2.py) and makes a GitHub release of that name: a `.tar.xz` and a `.tar.gz` per target (`blaze` a hard link to `blaze-engine`), a `.sha256` of each, SHA256SUMS and B3SUMS (a pin's fetch checks every list a release has, crates/blaze-engine/src/versions.rs),
-# the standard library's source `library-<digest>.tar.xz` (docs/toolchain.md), bstd's
-# `bstd-<digest>.tar.xz` (harness/library.py `archive`), and the
-# notes (what docs/CHANGELOG.md's [Unreleased] gained and what was merged since the release before). The release is a prerelease, the canary channel's,
-# until promote.yaml makes it stable (docs/release.md). Every tag (canary.yaml's, train_release.py's)
-# is on a commit of main as it is: no release commits a version to main, whose Cargo.toml stays
-# at `0.0.0`. The build is told which release it is by `BLAZE_RELEASE`, the tag, which only
-# crates/blaze-engine/build.rs reads, so a release changes no other crate and no build of main
-# misses blaze's store after it. The notes are .github/scripts/canary.py notes's. A tag pushed by
-# hand starts it; the trains' and canary.yaml's tags start it by dispatch on the tag, since a tag
-# the workflow's own token makes starts no workflow. A manual run on a branch builds and checks
-# the same archives without releasing, as `0.0.0-dev`.
+# Builds and publishes `blaze` (`blaze-cli`) for macOS ARM64, Linux x86-64, and Linux ARM64.
+# Uploads all release assets + SHA256SUMS + B3SUMS + library archive to Cloudflare R2
+# (`blaze-releases`, served at https://blaze-releases.ix.dev) and GitHub Releases, and updates
+# the `canary` (and optionally `stable`) channel pointers.
 on:
   push:
-    tags: ["v*"]
+    tags: ["v0.*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and publish (e.g. v0.20261122.0)"
+        required: true
+        type: string
+      promote_stable:
+        description: "Also promote this release to the stable channel and Latest"
+        required: false
+        default: true
+        type: boolean
 
 concurrency:
   group: release-${{ github.ref }}
@@ -27,43 +27,43 @@ permissions:
   contents: read
 
 env:
-  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
   BLAZE_CORES: all
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: 10
 
 jobs:
-  notes:
-    name: version and notes
+  prepare:
+    name: prepare release
     runs-on: [ix, arm64]
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
-      version: ${{ steps.notes.outputs.version }}
-      bstd: ${{ steps.bstd.outputs.digest }}
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      promote_stable: ${{ steps.meta.outputs.promote_stable }}
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      # On a tag: its version, and what changed since the release before. On a branch: the
-      # tree's `0.0.0-dev`, and notes that say it is no release.
-      - id: notes
+      - id: meta
         env:
-          TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_STABLE: ${{ inputs.promote_stable }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
         run: |
-          jq -n --arg tag "$TAG" --arg notes "$RUNNER_TEMP/notes.md" '{tag: $tag, notes: $notes}' > "$RUNNER_TEMP/notes.json"
-          python3 -I .github/scripts/canary.py notes "$RUNNER_TEMP/notes.json"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: notes
-          path: ${{ runner.temp }}/notes.md
-          if-no-files-found: error
-      # library/, which a blaze with no checkout of its commit downloads once and checks
-      # against its digest (crates/blaze-cargo/src/cargo/toolchain/library.rs). The digest is
-      # BLAKE3, by the uv workspace's `blake3` (the Rust crate through PyO3): no system package.
+          if [ "$REF_TYPE" = "tag" ]; then
+            TAG="$REF_NAME"
+            PROMOTE="true"
+          else
+            TAG="$INPUT_TAG"
+            PROMOTE="${INPUT_STABLE:-true}"
+          fi
+          VER="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "promote_stable=$PROMOTE" >> "$GITHUB_OUTPUT"
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: '0.13.5'
-          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403
           enable-cache: false
       - run: |
           uv run --frozen python harness/library.py archive "{\"out\": \"$RUNNER_TEMP/library\"}"
@@ -72,115 +72,55 @@ jobs:
           name: library
           path: ${{ runner.temp }}/library/library-*.tar.xz
           if-no-files-found: error
-      # bstd's tree, which a release ships beside the library as `bstd-<digest>.tar.xz`
-      # (crates/blaze-std, the crates it depends on by path and a workspace of just them;
-      # harness/library.py `archive`): its digest is the build's BLAZE_BSTD_DIGEST below, so
-      # every target's blaze names the one archive made here (crates/blaze-new's BSTD_DIGEST).
-      - id: bstd
-        run: |
-          uv run --frozen python harness/library.py archive "{\"out\": \"$RUNNER_TEMP/bstd\", \"tree\": \"bstd\"}" | tee -a "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: bstd
-          path: ${{ runner.temp }}/bstd/bstd-*.tar.xz
-          if-no-files-found: error
 
   build:
     name: ${{ matrix.target }}
-    needs: notes
-    # On GitHub's hosted runners, Linux too: the binaries are built on the oldest hosted Ubuntu so
-    # that they ask for an old glibc (build_release.py refuses one newer than RHEL 9's), and the
-    # ix runner image is Ubuntu 24.04, whose glibc 2.39 headers bind C code to newer symbols
-    # (docs/harness.md "ix runners"). TODO(sysroot): build Linux on ix against an older glibc
-    # sysroot (docs/v2/plan/design/toolchain-c.md) once blaze can target one; it has no --sysroot today.
+    needs: prepare
     runs-on: ${{ matrix.os }}
-    # A store blaze's release has not compiled into, which a release's always is: about 97
-    # minutes on hosted Linux x86-64 and longer on macOS's 7 GB runner (blaze-platform.yaml's
-    # build), under the hosted runner's 6-hour cap.
-    timeout-minutes: 330
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
           - { target: aarch64-apple-darwin, os: macos-15 }
-          # The oldest hosted Ubuntu, so that the binaries ask for an old glibc.
           - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
     env:
-      # `cargo binstall` and install.sh find the archive and its binaries by this name
-      # ([package.metadata.binstall] in crates/blaze-engine/Cargo.toml).
-      NAME: blaze-v${{ needs.notes.outputs.version }}-${{ matrix.target }}
+      NAME: blaze-v${{ needs.prepare.outputs.version }}-${{ matrix.target }}
+      BLAZE_RELEASE: ${{ needs.prepare.outputs.version }}
     steps:
       - uses: actions/checkout@v7
-      # blaze builds blaze (AGENTS.md rule blaze-builds-blaze): the stage 0 .github/blaze-version
-      # names, with its own Rust, and the pinned LLVM (LLVM_SYS_231_PREFIX), as blaze-platform.yaml's
-      # build job has them; no rustup, no cargo, no Nix. The store's project is this job's own and
-      # nothing pushes it, so it pulls nothing: a release's binaries come from a clean build.
-      - id: blaze
-        uses: ./.github/actions/blaze
-        with:
-          job: release
-          llvm: true
-      # build_release.py runs in the repository's Python workspace (typed_input).
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-        with:
-          version: '0.13.5'
-          enable-cache: false
-      # `blaze --version` names the commit and its date (UTC), as rustc does:
-      # `blaze 0.20261028.9 (fb82b09 2026-10-28)` (crates/blaze-engine/build.rs).
-      - run: |
-          echo "BLAZE_GIT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
-          echo "BLAZE_GIT_DATE=$(TZ=UTC0 git show -s --date=format-local:%Y-%m-%d --format=%cd HEAD)" >> "$GITHUB_ENV"
-      # Which release this is, the one place it is said: blaze-engine's build.rs makes it the
-      # version `--version` prints and a pin names, and a release's builds fetch the standard
-      # library from the release's assets (the step `Standard library` below; shipped.rs).
-      - if: github.ref_type == 'tag'
-        run: echo "BLAZE_RELEASE=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
-      # The bstd this release ships (the notes job's archive), which its blaze places and reads
-      # sealed (crates/blaze-cargo/src/cli/store.rs `shipped`): on a tag only, since a build of a
-      # branch is no release and has no assets to fetch it from.
-      - if: github.ref_type == 'tag'
-        env:
-          BSTD: ${{ needs.notes.outputs.bstd }}
+      - name: Install pinned nightly toolchain
         run: |
-          [ ${#BSTD} -eq 64 ] || { echo "::error::the notes job gave no bstd digest (got '$BSTD')"; exit 1; }
-          echo "BLAZE_BSTD_DIGEST=$BSTD" >> "$GITHUB_ENV"
-      # The `dist` profile, with LLVM, as every native blaze has (blaze-engine's default
-      # `native`): build_release.py refuses a binary that loads libLLVM or a C++ runtime, or on
-      # Linux asks for a glibc newer than RHEL 9's. PGO is off: blaze applies only a profile
-      # trained on its own build (tools/pgo/pgo.py), which it cannot make while it refuses
-      # `-C profile-generate`; `"pgo": "pinned"` stops with that error (build_release.py).
-      # TODO(stage 0 with --deny): a release is to deny `blaze::todo` (docs/v2/plan/design/
-      # proved-unreachable.md), and a build runs no lints. No step here denies it yet: run
-      # `blaze check --workspace --deny blaze::todo` before this build once
-      # .github/blaze-version's release takes the option (docs/cargo.md#lints).
-      - name: blaze build -p blaze-engine --profile dist
-        run: |
-          uv run --frozen --no-dev python .github/scripts/build_release.py \
-            '{"target": "${{ matrix.target }}", "out": "shipped", "pgo": "off"}'
+          tc="$(cat pins/toolchain)"
+          rustup toolchain install "$tc" --profile minimal --no-self-update
+          rustup default "$tc"
+          rustc --version
+      - name: Build release blaze binary
         env:
           MACOSX_DEPLOYMENT_TARGET: "13.0"
-      - name: Archive
         run: |
-          mkdir "$NAME"
-          cp LICENSE-APACHE LICENSE-MIT README.md docs/CHANGELOG.md "$NAME"
-          cp shipped/* "$NAME"
-          # `blaze` and `blaze-engine` are one program (both run blaze_engine::main, which
-          # goes by neither name), linked twice: shipped once, as a hard link, which tar keeps,
-          # so the archive holds one copy.
-          ln -f "$NAME/blaze-engine" "$NAME/blaze"
-          "$NAME/blaze-engine" --version | tee /dev/stderr | sed -n 1p | grep -E "^blaze ${{ needs.notes.outputs.version }} \([0-9a-f]{7}( [0-9]{4}-[0-9]{2}-[0-9]{2})?\)$"
-          # `blaze` runs the one beside it.
-          "$NAME/blaze" --version | grep -F "blaze ${{ needs.notes.outputs.version }} "
-          # The `.tar.xz` is what blaze fetches for a pin, `blaze update` and install.sh, a
-          # third of the `.tar.gz`; the `.tar.gz` stays for blazes from before, which fetch only
-          # it. `-T0` splits it into blocks only past 192 MiB of input, which costs little.
+          tc="$(cat pins/toolchain)"
+          cargo +"$tc" build --release --locked -p blaze-cli --bin blaze
+      - name: Archive and checksum
+        run: |
+          mkdir -p "$NAME"
+          cp LICENSE-APACHE LICENSE-MIT README.md "$NAME/"
+          cp target/release/blaze "$NAME/blaze"
+          chmod 755 "$NAME/blaze"
+          "$NAME/blaze" --version
+          "$NAME/blaze" toolchain
           command -v xz >/dev/null || brew install xz
           tar cf - "$NAME" | xz -9e -T0 > "$NAME.tar.xz"
           tar czf "$NAME.tar.gz" "$NAME"
-          shasum -a 256 "$NAME.tar.xz" > "$NAME.tar.xz.sha256"
-          shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
-          ls -l "$NAME.tar.xz" "$NAME.tar.gz"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$NAME.tar.xz" > "$NAME.tar.xz.sha256"
+            sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+          else
+            shasum -a 256 "$NAME.tar.xz" > "$NAME.tar.xz.sha256"
+            shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+          fi
+          ls -lh "$NAME.tar.xz" "$NAME.tar.gz"
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.NAME }}
@@ -188,143 +128,99 @@ jobs:
             ${{ env.NAME }}.tar.xz*
             ${{ env.NAME }}.tar.gz*
           if-no-files-found: error
-      # Why the daemon ended, when it did (the client does not say).
-      - if: failure()
-        uses: ./.github/actions/daemon-log
 
-  # ix.dev/explore reads this release's profile schema (.github/scripts/explore_page.py): the
-  # page deploys from indexable-inc/ix and refuses a daemon whose schema it does not read, so a
-  # release ahead of it would show users only that refusal (0.20261105.1, schema 5, page 1).
-  explore-page:
-    name: ix.dev/explore reads this schema
+  publish:
+    name: publish release and channels
+    needs: [prepare, build]
     runs-on: [ix, arm64]
-    timeout-minutes: 5
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      PROMOTE_STABLE: ${{ needs.prepare.outputs.promote_stable }}
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: '0.13.5'
-          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403
           enable-cache: false
-      - run: uv run --frozen python .github/scripts/explore_page.py '{}'
-
-  publish:
-    name: GitHub release
-    needs: [notes, build, explore-page]
-    if: github.ref_type == 'tag'
-    runs-on: [ix, arm64, ix-mode-cold]
-    timeout-minutes: 10
-    permissions:
-      contents: write
-      actions: write
-    steps:
-      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           path: out
           merge-multiple: true
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-        with:
-          version: '0.13.5'
-          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu (ix runners are arm64)
-          enable-cache: false
-      # SHA256SUMS and B3SUMS, `<hex>  <name>` a line as sha256sum and b3sum write them; BLAKE3 is
-      # the uv workspace's `blake3`, so the runner needs no system package for it.
-      - name: Checksums
+      - name: Generate SHA256SUMS and B3SUMS
         run: |
-          uv run --frozen python .github/scripts/checksums.py '{"dir": "out"}'
-      # Every asset into R2 before the GitHub release is made: R2 is where blaze fetches a release
-      # from (https://blaze-releases.ix.dev/v<version>/<asset>, r2.py; docs/release.md "Where
-      # the bytes are"), so a release GitHub lists is one blaze can fetch. A run without the
-      # token fails here, with no release made.
-      - name: the R2 token is set
-        env:
-          TOKEN: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
-        run: |
-          if [ -z "$TOKEN" ]; then
-            echo "::error::$GITHUB_REF_NAME is not released: blaze fetches it from R2, and the secret CLOUDFLARE_R2_API_TOKEN is not set in $GITHUB_REPOSITORY's Actions secrets"
-            exit 1
-          fi
-      - name: R2's objects
+          uv run --frozen python - <<'EOF'
+          import hashlib, pathlib, blake3
+          out = pathlib.Path("out")
+          archives = sorted(
+              p for p in out.iterdir()
+              if p.is_file() and p.name.startswith("blaze-") and (p.name.endswith(".tar.gz") or p.name.endswith(".tar.xz"))
+          )
+          sha_lines = []
+          b3_lines = []
+          for p in archives:
+              data = p.read_bytes()
+              sha_lines.append(f"{hashlib.sha256(data).hexdigest()}  {p.name}\n")
+              b3_lines.append(f"{blake3.blake3(data).hexdigest()}  {p.name}\n")
+          (out / "SHA256SUMS").write_text("".join(sha_lines))
+          (out / "B3SUMS").write_text("".join(b3_lines))
+          EOF
+          cat out/SHA256SUMS
+          cat out/B3SUMS
+      - name: Plan R2 release upload
         id: r2
         run: |
-          { echo 'r2<<R2'; python3 -I .github/scripts/r2.py "{\"kind\": \"release\", \"tag\": \"$GITHUB_REF_NAME\", \"dir\": \"out\"}"; echo R2; } >> "$GITHUB_OUTPUT"
-      - name: Into R2
+          { echo 'r2<<R2'; python3 -I .github/scripts/r2.py "{\"kind\": \"release\", \"tag\": \"$TAG\", \"dir\": \"out\"}"; echo R2; } >> "$GITHUB_OUTPUT"
+      - name: Upload release assets to R2
         uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           command: |
             ${{ steps.r2.outputs.r2 }}
-      - name: Release
+      - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           shopt -s nullglob
-          # GitHub refuses a release body over 125,000 characters; the full section stays in docs/CHANGELOG.md.
-          python3 - <<'EOF'
-          import os
-          p = "out/notes.md"; text = open(p).read(); cap = 120_000
-          if len(text) > cap:
-              url = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/blob/{os.environ['GITHUB_REF_NAME']}/docs/CHANGELOG.md"
-              text = text[: text.rfind("\n", 0, cap)] + f"\n\n... The full notes are in [docs/CHANGELOG.md]({url}).\n"
-              open(p, "w").write(text)
-          EOF
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
-            --title "blaze $GITHUB_REF_NAME" --notes-file out/notes.md \
-            out/blaze-*.tar.xz out/blaze-*.tar.xz.sha256 out/blaze-*.tar.gz out/blaze-*.tar.gz.sha256 out/SHA256SUMS out/B3SUMS out/library-*.tar.xz out/bstd-*.tar.xz
-      # A canary: promote.yaml tests the archives just published and makes this same release
-      # stable when they pass (docs/release.md). By dispatch, since a release this token
-      # publishes starts no `release:` workflow. The canary pointer moves in `metadata`.
-      - name: Promotion
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow run promote.yaml --repo "$GITHUB_REPOSITORY" --ref main -f tag="$GITHUB_REF_NAME"
-
-  # The canary pointer (what a workspace pinned to canary reads) and latest.json (what every blaze
-  # daemon reads every few minutes, docs/release.md, "latest.json") name this release.
-  metadata:
-    name: pointers and latest.json
-    needs: publish
-    if: github.ref_type == 'tag'
-    runs-on: [ix, arm64, ix-mode-cold]
-    timeout-minutes: 10
-    # One at a time across release.yaml, promote.yaml and yank.yaml: each writes the pointers and
-    # latest.json from the releases as they are when it runs, so the last one to run is right. A
-    # run the group cancels while it waits behind a newer one loses nothing.
-    concurrency:
-      group: release-metadata
-      cancel-in-progress: false
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v7
-      # Only GH_TOKEN: the Cloudflare token reaches no script, only wrangler-action below.
-      - name: pointers and latest.json
-        id: metadata
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash # -eo pipefail: a failing promote.py fails the step through the tee
-        run: |
-          python3 -I .github/scripts/promote.py metadata '{"out": "latest.json", "channels": "channels"}' | tee -a "$GITHUB_STEP_SUMMARY"
-          # The pointers in R2 too, where blaze reads them (r2.py, docs/release.md "Where the bytes are").
-          { echo 'r2<<R2'; python3 -I .github/scripts/r2.py '{"kind": "channels", "dir": "channels"}'; echo R2; } >> "$GITHUB_OUTPUT"
-      # The token R2 takes latest.json with: Object Read & Write on the bucket blaze-releases
-      # alone (docs/release.md, "latest.json"). Checked here, after the pointers moved, so a
-      # missing secret fails the run without holding a release back.
-      - name: the R2 token is set
-        env:
-          TOKEN: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
-        run: |
-          if [ -z "$TOKEN" ]; then
-            echo "::error::the channels' pointers and latest.json are not in R2: the secret CLOUDFLARE_R2_API_TOKEN is not set in $GITHUB_REPOSITORY's Actions secrets"
-            exit 1
+          ASSETS=(out/blaze-*.tar.xz out/blaze-*.tar.xz.sha256 out/blaze-*.tar.gz out/blaze-*.tar.gz.sha256 out/SHA256SUMS out/B3SUMS out/library-*.tar.xz)
+          NOTES="Blaze $TAG — native zero-Wasm proc-macro & hermetic build-script pipeline, Sota AArch64 backend (memory, spilling, scalar FP), ThinArc/ThinVec, Rust Lean 4 kernel checker, and blaze-lint jank rules."
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${ASSETS[@]}"
+            if [ "$PROMOTE_STABLE" = "true" ]; then
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease=false --latest
+            fi
+          else
+            FLAGS=(--title "blaze $TAG" --notes "$NOTES")
+            if [ "$PROMOTE_STABLE" = "true" ]; then
+              FLAGS+=(--latest)
+            else
+              FLAGS+=(--prerelease)
+            fi
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" "${FLAGS[@]}" "${ASSETS[@]}"
           fi
-      - name: Publish the pointers and latest.json
+      - name: Update stable and canary channel pointers
+        id: channels
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p channels
+          printf '%s\n' "$VERSION" > channels/canary
+          if [ "$PROMOTE_STABLE" = "true" ]; then
+            printf '%s\n' "$VERSION" > channels/stable
+          else
+            curl -fsSL https://blaze-releases.ix.dev/channels/stable > channels/stable
+          fi
+          gh release upload channels --repo "$GITHUB_REPOSITORY" --clobber channels/stable channels/canary
+          { echo 'r2<<R2'; python3 -I .github/scripts/r2.py '{"kind": "channels", "dir": "channels"}'; echo R2; } >> "$GITHUB_OUTPUT"
+      - name: Upload channel pointers to R2
         uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           command: |
-            ${{ steps.metadata.outputs.r2 }}
-            r2 object put blaze-releases/latest.json --file=latest.json --content-type=application/json --cache-control=public,max-age=60 --remote
+            ${{ steps.channels.outputs.r2 }}

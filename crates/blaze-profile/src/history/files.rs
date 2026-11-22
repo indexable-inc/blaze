@@ -37,7 +37,6 @@ use std::{
 };
 
 use blaze_core::{Completion, Done, Effect, Extent, FileName, IoError, LockMode, Mapping, Meta, Tag};
-use parquet::file::properties::WriterProperties;
 
 use super::{
     CompactError, HistoryError, OWNER,
@@ -328,9 +327,6 @@ struct State {
     manifest: Manifest,
     /// Crash records a flush wrote the rows of: the next commit consumes them, then they go.
     listing: crash::Written,
-    /// Each table's writer properties, by its place in [`crate::schema::TABLES`]: what a
-    /// merge writes with.
-    properties: Vec<WriterProperties>,
 }
 
 impl State {
@@ -634,7 +630,7 @@ impl Read {
                         }
                         Ok(Done::Stat(None)) => {
                             let dir = cx.dir.clone(); // clone: a refcount
-                            cx.ask(Wait::Files, |tag| Effect::List { dir, tag });
+                            cx.ask(Wait::Files, |tag| Effect::List { dir: dir.into(), tag });
                             self.stage = Reading::List;
                         }
                         Ok(other) => {
@@ -1664,7 +1660,7 @@ impl Reap {
                         }
                         Ok(Done::Stat(Some(_))) => {
                             let dir = cx.file(PINS);
-                            cx.ask(Wait::Reap, |tag| Effect::List { dir, tag });
+                            cx.ask(Wait::Reap, |tag| Effect::List { dir: dir.into(), tag });
                             self.stage = Reaping::ListPins;
                             return Step::Pending;
                         }
@@ -1890,7 +1886,12 @@ impl Compact {
             .collect();
         // alloc: once a flush
         let names: Vec<Name> = ours.iter().map(|&at| st.kept[at].name).collect();
-        let merges = compact::plan(&names, ended)
+        // The plan lives only until its merges are turned into names below: a frame of its own,
+        // freed when this returns.
+        let frame = blaze_mem::Frame::new(blaze_mem::Tag::Profile).expect("a compaction plan's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        let merges = compact::plan(&names, ended, alloc)
             .into_iter()
             .map(|merge| Merge {
                 // clone: a merge's names, once a merge
@@ -2043,11 +2044,7 @@ impl Compact {
                             }
                         }
                     }
-                    let table = self.current().output.table;
-                    let Some(properties) = st.properties.get(table) else {
-                        unreachable!("a merge's table is one of the history's")
-                    };
-                    match merge::Concat::new(inputs, properties) {
+                    match merge::Concat::new(inputs) {
                         Ok(it) => self.concat = Some(it),
                         Err(failed) => return Step::Ready(Err(self.concat_failed(cx, failed))),
                     }
@@ -2774,7 +2771,7 @@ impl Open {
                     Step::Ready(Ok(held)) => {
                         self.held = Some(held);
                         let dir = cx.dir.clone(); // clone: a refcount
-                        cx.ask(Wait::Files, |tag| Effect::List { dir, tag });
+                        cx.ask(Wait::Files, |tag| Effect::List { dir: dir.into(), tag });
                         self.stage = Opening::List;
                         return Step::Pending;
                     }
@@ -3540,7 +3537,7 @@ impl RecoverDead {
                         st.seq = last.max(manifest.flushed()) + 1;
                         st.manifest = manifest;
                         let dir = cx.dir.clone(); // clone: a refcount
-                        cx.ask(Wait::Files, |tag| Effect::List { dir, tag });
+                        cx.ask(Wait::Files, |tag| Effect::List { dir: dir.into(), tag });
                         self.stage = Dying::List;
                         return Step::Pending;
                     }
@@ -3632,7 +3629,7 @@ impl PinJob {
                     match check(only(done.take()), || cx.path(PINS), doing) {
                         Ok(Done::Stat(Some(_))) => {
                             let dir = cx.file(PINS);
-                            cx.ask(Wait::Files, |tag| Effect::List { dir, tag });
+                            cx.ask(Wait::Files, |tag| Effect::List { dir: dir.into(), tag });
                             self.stage = Pinning::List;
                             return Step::Pending;
                         }
@@ -3805,15 +3802,8 @@ impl Unpin {
 // --- The core -----------------------------------------------------------------------------
 
 impl<H: Host> Files<H> {
-    /// The core of the history in `dir` under the driver's root `root`, with each table's
-    /// writer properties (what its merges write with), by its place in
-    /// [`crate::schema::TABLES`].
-    pub(crate) fn new(
-        host: H,
-        root: PathBuf,
-        dir: FileName,
-        properties: Vec<WriterProperties>,
-    ) -> Files<H> {
+    /// The core of the history in `dir` under the driver's root `root`.
+    pub(crate) fn new(host: H, root: PathBuf, dir: FileName) -> Files<H> {
         Files {
             host,
             root,
@@ -3832,7 +3822,6 @@ impl<H: Host> Files<H> {
                 reaping: false,
                 manifest: Manifest::new(),
                 listing: crash::Written::default(),
-                properties,
             },
             // alloc: once a core
             io: Io { next: 0, asked: Vec::new(), now: Duration::ZERO, wait: Wait::Nothing },
@@ -3867,10 +3856,6 @@ impl<H: Host> Files<H> {
 
     pub(crate) fn host(&self) -> &H {
         &self.host
-    }
-
-    pub(crate) fn host_mut(&mut self) -> &mut H {
-        &mut self.host
     }
 
     /// The history's directory under the driver's root.

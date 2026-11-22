@@ -91,12 +91,21 @@ pub struct Options {
     /// the option permits runs, it does not ask for them. A receive on a socket with it must
     /// give each slot [`RUN_MOST`] bytes, as the kernel's runs fill one, or it is refused.
     pub coalesce: bool,
+    /// The socket's tuning (buffers, reuse, DSCP, path-MTU mode), set before its bind:
+    /// [`crate::sockopt::UdpOptions`]; [`crate::sockopt::check_udp`] refuses an option the
+    /// system lacks by name, and a pair of this value's options that contradict.
+    pub tuning: crate::sockopt::UdpOptions,
 }
 
 impl Options {
-    /// What QUIC wants of its socket: every option on.
-    pub const QUIC: Options =
-        Options { ecn: true, local_address: true, dont_fragment: true, coalesce: true };
+    /// What QUIC wants of its socket: every option on, the tuning the system's.
+    pub const QUIC: Options = Options {
+        ecn: true,
+        local_address: true,
+        dont_fragment: true,
+        coalesce: true,
+        tuning: crate::sockopt::UdpOptions::DEFAULT,
+    };
 }
 
 /// A run's head: who it is to or from, and where its bytes are in the batch.

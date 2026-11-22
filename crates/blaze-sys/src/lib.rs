@@ -18,9 +18,34 @@
 //!
 //! What a target has not built is an [`Unbuilt`]: a typed refusal naming the operation and the
 //! target, never another route (rule no-fallback).
+//!
+//! No C library on Linux: blaze-sys references no C-library symbol there (the check is
+//! `scripts/src/bin/sys_imports.rs` over the rlib's undefined symbols, which must be empty).
+//! The vDSO's `clock_gettime` is found from `AT_SYSINFO_EHDR` (`linux::vdso`), kernel code
+//! and not the C library. On macOS the floor is libSystem: Apple keeps no stable system call
+//! numbers and requires calls through libSystem, always dynamically linked, so blaze-sys
+//! declares libSystem's functions itself; the imported set is the ratchet
+//! `tools/ratchets/blaze-sys-libsystem.txt`.
+//!
+//! Is it faster? Not per call: a C wrapper costs a few nanoseconds against a system call's
+//! hundred or more, and the vDSO's clock is used either way. The gains are elsewhere: a Linux
+//! program built on blaze-sys alone can be a static binary with its own entry, so no dynamic
+//! loader runs at start; no `errno` thread-local is touched, the error is the return value;
+//! calls can be batched through the ring (io_uring) instead of one transition each; and the
+//! layer between blaze and the kernel is one we control, typed per operation, with nothing
+//! of the C library's state (locks, atfork handlers, cached pids) to reason about.
+//!
+//! No minimum kernel version, and the best form on each (D185): what the kernel offers is
+//! probed once into `linux::probe::KernelFacts` (never parsed from `uname`), and each
+//! operation with several forms is a slot in `linux::slot` whose form is chosen from those
+//! facts, or refused by name when no form exists. The probe table, the slot table and the
+//! honest floor (today set by blaze-core's wait ring, not by blaze-sys) are in
+//! `linux::probe`'s docs. macOS has the same shape in `macos_facts::MacFacts`.
 
 #![cfg_attr(not(test), no_std)]
 #![feature(register_tool, custom_inner_attributes)]
+// `openat` and `ioctl` of macOS's table of calls found at first use are defined here (variadic).
+#![cfg_attr(target_os = "macos", feature(c_variadic))]
 #![register_tool(blaze)]
 #![blaze::trust(
     unsafe,
@@ -34,16 +59,47 @@
 mod errno;
 #[macro_use]
 mod flags;
+pub mod cpu;
 mod types;
 
+pub use cpu::{CpuError, CpuFeatures};
 pub use errno::Errno;
-pub use types::{Fd, Path, Timespec};
+pub use types::{Fd, Path, Timespec, WindowSize};
 
 #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub mod linux;
 
 #[cfg(target_os = "macos")]
 pub mod macos;
+/// The measured experiment of rule 45 (2026-11-20): libsystem_kernel's own entries and the raw
+/// trap as strategies beside libSystem's public calls, one seam; the default stays `Public`.
+#[cfg(target_os = "macos")]
+pub mod macos_kernel;
+/// D182: a block device's facts on macOS (`DKIOC*`), preallocation and hole punching.
+#[cfg(target_os = "macos")]
+pub mod macos_block;
+/// macOS's facts, probed once (D185): the OS version and which private entries exist.
+#[cfg(target_os = "macos")]
+pub mod macos_facts;
+
+#[cfg(unix)]
+pub mod posix;
+
+/// The process's facts (page size, clock ticks, capability words, the vDSO's address): one
+/// value handed in, with one source per kind of process (D185).
+#[cfg(unix)]
+pub mod facts;
+
+/// D177: Seatbelt and a process group's kill, for a hermetic run.
+#[cfg(target_os = "macos")]
+pub mod seatbelt;
+
+/// bstd's sampler's memory and frame-pointer walk (D178): every `unsafe` of the sampler.
+pub mod sample;
+
+/// The Mach thread calls of bstd's sampler (D178).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod macos_sample;
 
 #[cfg(windows)]
 pub mod windows;

@@ -1,0 +1,77 @@
+[package]
+name = "blaze-scope"
+description = "Name resolution of the item layer (docs/v2/plan/design/bottom.md, \"Name resolution without resolving a crate\"): a sans-IO machine that computes one module's scope from its own declarations and per-name reads of other modules' scopes, a group machine that solves a cycle of modules found at run time as a least fixpoint, and the read list each scope is valid by"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# The producers this crate's code makes values for (decision D105,
+# docs/v2/plan/design/producer-id.md): its source and its workspace dependencies' are the row.
+[package.metadata.blaze]
+producer = ["names"]
+
+[lib]
+doctest = false
+
+[dependencies]
+# `ItemKey`, `CrateItemKey`, `ContentId`: every module, item and crate is named by its key.
+blaze-id.workspace = true
+# `HashMap`: the machine's single-owner indexes, in the allocator it is made in.
+blaze-hash.workspace = true
+# The words of the item layer (`Namespace`, `Def`, `Binding`, `Visibility`, ...), the working
+# forms of the records the machine reads and writes (`DeclsBuilder`, `CrateRootBuilder`,
+# `ScopeBuilder`) and `Items`, which `RecordFacts` reads them through: one home for each.
+blaze-surface.workspace = true
+# `Vec`: every list of the machine, in the allocator it is made in.
+blaze-own.workspace = true
+# lib_features.rs: `Vector`, the walk's search across comments and strings. No cycle:
+# blaze-own already depends on it.
+blaze-memchr.workspace = true
+# task/lower.rs: `Outline`, a file's items, which the source lowering reads.
+blaze-file-items.workspace = true
+# task/lower.rs: `Hasher`, the keys of the lowered items and the cfg's digest.
+blaze-ids.workspace = true
+# resolve.rs: the item macros a crate's names need, expanded as the fill names them.
+blaze-expand.workspace = true
+# resolve.rs: `OutputsRef`, a crate's build-script outputs read in place from their record, and
+# `cx::ScriptCx`, which lays them over the expansion host (`env!("OUT_DIR")`, `include!` of a
+# generated file). No cycle: blaze-build-script depends on blaze-own, blaze-ids,
+# blaze-unit-graph and blaze-expand only.
+blaze-build-script.workspace = true
+# resolve.rs: `FormatError`, why a record written does not read back.
+blaze-format.workspace = true
+# graph.rs: `Implicit`, what a unit is given without naming it (its `std`, its prelude), from
+# its one home.
+blaze-unit-graph.workspace = true
+# units.rs: `Lock`, each workspace unit's package as the lock writes it (its key).
+blaze-manifest = { workspace = true, default-features = false }
+# units.rs: `ToolchainView`, the installed toolchain's units the workspace's std, core and alloc are.
+blaze-toolchain.workspace = true
+# units.rs: `PackageEdition`, a unit's edition, for `implicit`.
+edition.workspace = true
+
+[dev-dependencies]
+blaze-sim.workspace = true
+# tests/target_facts.rs: `cpus::features`, the pinned rustc's features of each CPU, which the
+# target's feature list must equal.
+target-features.workspace = true
+# `Alloc::global()`: the tests' allocator handle.
+blaze-own = { workspace = true, features = ["std", "testing"] }
+# `Root`: the root heap a test makes at its top (tests/pkg_meta_env.rs, tests/attr_path_from_expansion.rs).
+blaze-mem.workspace = true
+# `testing::MemSurface`: the records the fixtures write, read back through `RecordFacts`.
+blaze-surface = { workspace = true, features = ["testing"] }
+# examples/crates.rs: the workspaces' manifests read through `layout::Layout` (sans-IO).
+blaze-manifest = { workspace = true, default-features = false }
+# examples/workspace.rs: `PackView`, a registry package's and a toolchain crate's files, read in place.
+blaze-fetch.workspace = true
+# examples/crates.rs: `PackageEdition`, `BlazeEdition::prelude`: what a blaze edition puts in scope.
+edition.workspace = true
+
+[lints]
+workspace = true

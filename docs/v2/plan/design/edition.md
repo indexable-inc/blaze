@@ -117,7 +117,8 @@ features some of them are written with):
 `with` clause (a parameter passed by name from the caller's scope, so the functions in between
 need not list it) would only save typing in the middle of a call chain. It is not built, and it
 is reconsidered only if threading turns out to be the main complaint once blaze's own crates are
-on bstd. `main` is `fn main(cx: &Cx, io: Io)`.
+on bstd. `main` names each capability it uses (D104): `fn main(cx: &Cx, out: Out)`, each grant
+by its type and name; a whole `Io` cannot be asked for.
 
 **10. `&uniq`.**
 - `&uniq T`, `&uniq self`, `&uniq expr` and `ref uniq` in patterns are exactly `&mut T`,
@@ -259,3 +260,7 @@ With live patching for redefinition, the tool and the code base are one language
 - **Handles need no mark at the use**; the off switch is an effect.
 - **Capabilities are plain parameters.** `with` is deferred.
 - **The syntax is otherwise Rust's.**
+- **bstd's extern name is `std`** (2026-11-16, [std](std.md#the-blaze-edition-opting-in),
+  [toolchain](toolchain.md)): blaze gives the crate bstd under that one name with no manifest
+  line; `bstd::..` is a finding whose fix rewrites it to `std::..`.
+- **No opt-in to Rust's `std`**: under the edition Rust's `std` has no name in the crate.

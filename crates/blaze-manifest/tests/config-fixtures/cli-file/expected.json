@@ -89,7 +89,7 @@
   ],
   "code": 101,
   "stdout": "",
-  "stderr": "error: failed to parse value from --config argument `conf/missing.toml` as a dotted key expression\n\nCaused by:\n  TOML parse error at line 1, column 18\n    |\n  1 | conf/missing.toml\n    |                  ^\n  key with no value, expected `=`\n"
+  "stderr": "error: failed to parse value from --config argument `conf/missing.toml` as a dotted key expression\n\nCaused by:\n  TOML parse error at line 1, column 5\n    |\n  1 | conf/missing.toml\n    |     ^\n  key with no value, expected `=`\n"
  },
  {
   "args": [

@@ -1,0 +1,31 @@
+[package]
+name = "blaze-answer"
+description = "The answer's stored form (docs/v2/plan/design/runtime.md, piece F0) as a sans-IO core: dense task and cell ids, rows of fixed columns read in place, a generation per cell for validity, the reverse index as signed sorted runs, immutable segments under a root keyed by the tree's digest"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# Vec and BTreeMap with the allocator always named: the crate's only collections.
+blaze-own.workspace = true
+# `ContentId`: keys, outs, sources and segment ids.
+blaze-id.workspace = true
+# `Name`, `Kind`, `Key` and `Cell`: what the dictionary maps to dense ids, kept as the engine has them.
+blaze-drive.workspace = true
+
+[dev-dependencies]
+# `check` and `control`: the history simulation and its planted-bug controls.
+blaze-sim.workspace = true
+# `blaze_own::testing::heap()`: the tests' root allocator capability (D102).
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

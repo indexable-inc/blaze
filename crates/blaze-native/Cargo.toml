@@ -1,0 +1,31 @@
+[package]
+name = "blaze-native"
+description = "The native libraries a program links (C, C++ and assembly from build scripts) read from their own bytes: ar archives (BSD and GNU), Mach-O MH_OBJECT for arm64 and ELF64 ET_REL for aarch64, into one object model of sections, symbols, relocations, compact unwind rows and COMDAT groups; sans-IO, borrowing the bytes in place (NATIVE.md section 3, piece W1)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `Vec` and `Alloc`: every table in the allocator the caller names.
+blaze-own.workspace = true
+# `resolve`: the lookup tables (name to definition), blaze-hash's map.
+blaze-hash.workspace = true
+# `layout`: the one A64 `adrp` and low-12 encoders (blaze-code a64.rs), shared with the
+# whole-program layouts and the launcher's thunks (rule 30).
+blaze-code.workspace = true
+
+[dev-dependencies]
+# `Alloc::global()`, the handle the older tests hand every function; `testing::heap()`, the
+# test's root allocator capability (D102) the newer ones take.
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

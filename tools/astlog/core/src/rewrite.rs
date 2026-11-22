@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use astlog_engine::{Planned, PlannedAction, TextKind};
 
 use crate::corpus::{Corpus, NodeRef};
-use crate::error::{Error, OverlappingEditsSnafu};
+use crate::error::{Error, SourceError};
 use crate::program::Action;
 
 pub use edit_applier::{Edit, FileRewrite};
@@ -48,14 +48,13 @@ pub(crate) fn collect(
     let paths: Vec<PathBuf> = corpus.files.iter().map(|file| file.path.clone()).collect();
     edit_applier::check_overlaps(&paths, &edits).map_err(|error| {
         Error::from(
-            OverlappingEditsSnafu {
+            SourceError::OverlappingEdits {
                 path: error.path,
                 first_start: error.first_start,
                 first_end: error.first_end,
                 second_start: error.second_start,
                 second_end: error.second_end,
-            }
-            .build(),
+            },
         )
     })?;
     Ok(edits)

@@ -300,7 +300,7 @@ mod arch {
 
     /// A mapped stack with an unmapped guard page below it.
     pub(super) struct Stack {
-        base: *mut libc::c_void,
+        base: *mut core::ffi::c_void,
         len: usize,
         /// The stack pointer of the first switch into it.
         first: *mut u8,
@@ -311,34 +311,39 @@ mod arch {
             // SAFETY: `sysconf` reads a constant of the system.
             let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
             let len = size.max(64 << 10).next_multiple_of(page) + page;
-            // SAFETY: a new private anonymous mapping, at an address the kernel picks.
+            // SAFETY: this asks for a fresh private anonymous mapping at a kernel-chosen
+            // address, and no references into the range exist before this call.
             let base = unsafe {
-                libc::mmap(
-                    ptr::null_mut(),
+                blaze_sys::posix::io::mmap(
+                    None,
                     len,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANON,
-                    -1,
+                    blaze_sys::posix::io::Prot::READ | blaze_sys::posix::io::Prot::WRITE,
+                    blaze_sys::posix::io::MapFlags::PRIVATE | blaze_sys::posix::io::MapFlags::ANONYMOUS,
+                    None,
                     0,
                 )
-            };
-            assert!(
-                base != libc::MAP_FAILED,
-                "blaze-check: mapping a {len}-byte coroutine stack: {}",
-                io::Error::last_os_error()
-            );
+            }
+            .unwrap_or_else(|error| {
+                panic!(
+                    "blaze-check: mapping a {len}-byte coroutine stack: {}",
+                    io::Error::from_raw_os_error(error.raw() as i32)
+                )
+            });
             // SAFETY: the first page of the mapping just made: an overflow faults there.
-            let guarded = unsafe { libc::mprotect(base, page, libc::PROT_NONE) };
-            assert!(
-                guarded == 0,
-                "blaze-check: protecting a coroutine stack's guard page: {}",
-                io::Error::last_os_error()
-            );
-            let top = (base as usize + len) & !15;
+            let guarded = unsafe {
+                blaze_sys::posix::io::mprotect(base, page, blaze_sys::posix::io::Prot::NONE)
+            };
+            if let Err(error) = guarded {
+                panic!(
+                    "blaze-check: protecting a coroutine stack's guard page: {}",
+                    io::Error::from_raw_os_error(error.raw() as i32)
+                );
+            }
+            let top = (base.as_ptr() as usize + len) & !15;
             // SAFETY: `top` is the 16-aligned end of the mapping, which is writable for far more
             // than the frame `first_frame` writes below it.
             let first = unsafe { first_frame(top as *mut usize, entry, arg as usize) };
-            Stack { base, len, first }
+            Stack { base: base.as_ptr().cast(), len, first }
         }
 
         pub(super) fn leak(&mut self) {
@@ -350,7 +355,8 @@ mod arch {
         fn drop(&mut self) {
             if self.len != 0 {
                 // SAFETY: the mapping `new` made, which no frame uses: the coroutine is idle.
-                unsafe { libc::munmap(self.base, self.len) };
+                let base = unsafe { std::ptr::NonNull::new_unchecked(self.base.cast::<u8>()) };
+                let _ = unsafe { blaze_sys::posix::io::munmap(base, self.len) };
             }
         }
     }
@@ -480,7 +486,7 @@ mod arch {
 mod arch {
     use std::{ffi::c_void, io, ptr};
 
-    use windows_sys::Win32::System::Threading::{
+    use blaze_sys::windows::threading::{
         ConvertFiberToThread, ConvertThreadToFiberEx, CreateFiberEx, DeleteFiber, IsThreadAFiber,
         SwitchToFiber,
     };
@@ -585,7 +591,7 @@ mod arch {
         pub(crate) fn new() -> Host {
             // SAFETY: asks whether this thread is a fiber already.
             assert!(
-                unsafe { IsThreadAFiber() } == 0,
+                !unsafe { IsThreadAFiber() }.is_true(),
                 "blaze-check: a model runs on a thread that is already a fiber"
             );
             // SAFETY: converts this thread, which is not a fiber, into one.

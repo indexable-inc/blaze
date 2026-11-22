@@ -106,7 +106,7 @@ impl<A: Allocator> OsString<A> {
 
 impl<A: Allocator> From<String<A>> for OsString<A> {
     fn from(text: String<A>) -> OsString<A> {
-        OsString { bytes: text.into_bytes() }
+        OsString { bytes: super::into_std_bytes(text) }
     }
 }
 
@@ -320,7 +320,7 @@ impl<A: Allocator> PathBuf<A> {
 
 impl<A: Allocator> From<String<A>> for PathBuf<A> {
     fn from(text: String<A>) -> PathBuf<A> {
-        PathBuf { bytes: text.into_bytes() }
+        PathBuf { bytes: super::into_std_bytes(text) }
     }
 }
 

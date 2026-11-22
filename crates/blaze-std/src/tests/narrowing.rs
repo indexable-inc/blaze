@@ -48,7 +48,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     let sub = top.subdir(&path("sub"));
     // Where `sub` is: the oracle's yardstick, whatever the narrowing says.
     let beneath = blaze_core::FileName::new("top/sub").ok_or("harness: the name top/sub")?;
-    if plant == Plant::None && sub.name() != &beneath {
+    if plant == Plant::None && sub.name().name() != Some(&beneath) {
         return Err(format!("subdir sub of top is named {}, not {beneath}", sub.name()));
     }
     write_synced(&cx, &sub, &path("f"), b"one").map_err(|e| format!("harness: {e}"))?;

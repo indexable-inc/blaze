@@ -30,7 +30,7 @@ use std::{
 };
 
 use blaze_mem::Tag;
-use crossbeam_queue::SegQueue;
+use blaze_queue::SegQueue;
 
 pub use global::Holders;
 
@@ -594,7 +594,7 @@ static SEGMENTS: [AtomicPtr<Slot>; SEGMENT_COUNT] =
     blaze::process_static,
     reason = "free slot numbers of the arena's fixed segment table: at most the most accounts open at once"
 )]
-static FREE_SLOTS: SegQueue<usize> = SegQueue::new();
+static FREE_SLOTS: SegQueue<usize, std::alloc::Global> =SegQueue::new();
 
 /// How many slots were ever taken: the next index when none is free.
 static MADE_SLOTS: AtomicUsize = AtomicUsize::new(0);

@@ -16,7 +16,7 @@ use blaze_rng::SplitMix64;
 
 use crate::{
     AppendVec, Arena, Block, Built, Column, Frame, HUGE_PAGE, Handle, MemError, Pool, Region,
-    RegionVec, Revisions, Slab, Tag, chunks, frame,
+    RegionVec, Revisions, Slab, Tag, chunks, counted, frame,
     huge::{self, Pages},
     pool,
     revision::PublishError,
@@ -353,20 +353,20 @@ fn unadvised_memory_follows_the_process_opt_out_on_linux() {
     let bytes = 64 << 20;
     // SAFETY: a fresh anonymous mapping, unmapped below.
     let base = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
+        blaze_sys::posix::io::mmap(
+            None,
             bytes,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
+            blaze_sys::posix::io::Prot::READ | blaze_sys::posix::io::Prot::WRITE,
+            blaze_sys::posix::io::MapFlags::PRIVATE | blaze_sys::posix::io::MapFlags::ANONYMOUS,
+            None,
             0,
         )
-    };
-    assert_ne!(base, libc::MAP_FAILED, "mmap: {}", std::io::Error::last_os_error());
-    touch_sparsely(base.cast(), bytes);
-    let kib = anon_huge_kib(base.addr());
+    }
+    .expect("mmap");
+    touch_sparsely(base.as_ptr(), bytes);
+    let kib = anon_huge_kib(base.as_ptr().addr());
     // SAFETY: the mapping made above, no longer used.
-    unsafe { libc::munmap(base, bytes) };
+    unsafe { blaze_sys::posix::io::munmap(base, bytes) }.expect("munmap");
     assert_eq!(
         kib, 0,
         "an unadvised mapping has {kib} KiB on huge pages under the process policy {thp}"
@@ -472,15 +472,17 @@ fn apple_silicon_has_no_superpages_for_anonymous_memory() {
         libc::mmap(
             std::ptr::null_mut(),
             HUGE_PAGE,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANON | libc::MAP_PRIVATE,
-            libc::VM_FLAGS_SUPERPAGE_SIZE_2MB,
+            (blaze_sys::posix::io::Prot::READ | blaze_sys::posix::io::Prot::WRITE).bits() as _,
+            (blaze_sys::posix::io::MapFlags::ANONYMOUS | blaze_sys::posix::io::MapFlags::PRIVATE).bits() as _,
+            blaze_sys::posix::proc::VM_FLAGS_SUPERPAGE_SIZE_2MB,
             0,
         )
     };
     if at != libc::MAP_FAILED {
         // SAFETY: the mapping just made, which nothing else knows of.
-        unsafe { libc::munmap(at, HUGE_PAGE) };
+        if let Some(at) = std::ptr::NonNull::new(at.cast()) {
+            let _ = unsafe { blaze_sys::posix::io::munmap(at, HUGE_PAGE) };
+        }
     }
     assert_eq!(
         at,
@@ -1821,6 +1823,38 @@ fn heap_of_names_the_heap_outside_any_task_and_opens_no_task() {
     assert_eq!(frame::running_tag(), None, "the holder ends with heap_of");
 }
 
+/// The blind spot of 2026-11-17 (tempo's check: 30.19 GB of footprint, 2.67 GB of it in counted
+/// regions): a block of the global heap is counted once the binary installs `counted::Counted`.
+/// One block of a whole batch, on a thread of its own (so no other count of that thread is
+/// unfolded), moves the heap outside any task by its size at its allocation and back at its
+/// free, and raises the high water to at least it. The counters are process-wide and only grow
+/// (`allocated`, `freed`, the high water), so other tests running beside this one can only add.
+#[test]
+fn counted_heap_counts_a_block_at_its_allocation_and_its_free() {
+    let size = (counted::BATCH as usize) * 4;
+    let layout = Layout::from_size_align(size, 16).expect("layout");
+    std::thread::spawn(move || {
+        let before = tag::snapshot();
+        // SAFETY: `layout` has a non-zero size; the block is freed below with the same layout.
+        #[allow(unsafe_code)]
+        let block = unsafe { std::alloc::GlobalAlloc::alloc(&counted::Counted, layout) };
+        assert!(!block.is_null());
+        let held = tag::snapshot();
+        assert!(held.heap_outside_allocated >= before.heap_outside_allocated + size as u64, "the allocation is counted at once: a whole batch folds");
+        assert!(tag::heap_outside_high_water() >= size as u64);
+        #[cfg(target_os = "macos")]
+        assert!(held.heap_committed.is_some_and(|zones| zones >= size as u64), "on macOS the malloc zones say what they committed");
+        // SAFETY: `block` came from `Counted` with `layout` just above.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::alloc::GlobalAlloc::dealloc(&counted::Counted, block, layout)
+        };
+        assert!(tag::snapshot().heap_outside_freed >= before.heap_outside_freed + size as u64, "the free is counted at once");
+    })
+    .join()
+    .expect("the counting thread");
+}
+
 /// A reset gives back more chunks than one `give_all` run moves: every one leaves the arena's
 /// tag, none is lost or given twice (a second arena takes them all again, each once), and the
 /// warm request allocates nothing from the global allocator.
@@ -2131,7 +2165,7 @@ fn pool_a_producer_and_a_consumer_move_batches_and_reuse_descriptors() {
     const ROUNDS: u64 = 400;
     const EACH: u64 = 1000;
     let pool = Pool::<u64>::new(1 << 20, Tag::Io).expect("reserve");
-    let (send, take) = crossbeam_channel::bounded::<Vec<pool::Pooled<'_, u64>>>(4);
+    let (send, take) = std::sync::mpsc::sync_channel::<Vec<pool::Pooled<'_, u64>>>(4);
     thread::scope(|scope| {
         let pool = &pool;
         scope.spawn(move || {
@@ -2799,7 +2833,7 @@ fn a_frame_string_stays_utf8_across_pushes_pops_and_truncation() {
         assert_eq!(text, "aé");
         let bytes = text.clone().into_bytes();
         assert!(text::String::from_utf8(bytes).is_ok());
-        let mut bad: Vec<u8, &Frame> = Vec::new_in(frame);
+        let mut bad: blaze_own::Vec<u8, &Frame> = blaze_own::Vec::new_in(frame);
         bad.extend_from_slice(b"a\xff");
         let refused = text::String::from_utf8(bad).expect_err("0xff is not UTF-8");
         assert_eq!(refused.utf8_error().valid_up_to(), 1);

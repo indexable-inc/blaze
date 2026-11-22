@@ -1027,7 +1027,10 @@ fn explore_within(config: Config, most: usize) -> Result<Explored, String> {
         let (source, end) = stepped[row];
         targets[start..end as usize].iter().map(move |&to| (to, source))
     });
-    let sources = blaze_radix::Csr::build(count, edges);
+    // The tests' root allocator (D170 C1): this model is test code and is handed none. It holds
+    // the table and is the sort's scratch.
+    let heap = blaze_own::testing::heap().alloc();
+    let sources = blaze_radix::Csr::build_in(count, edges, heap, heap);
     drop((stepped, targets));
     let mut reaches = vec![false; count];
     let mut work: Vec<u32> = Vec::new();

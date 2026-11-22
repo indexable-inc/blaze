@@ -22,16 +22,12 @@
 //! Replay: a failure prints its least tape and the line that replays it; the plan, the
 //! simulator's seed in it, is a note of the report.
 
-use std::sync::Arc;
-
-use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, cast::AsArray, types::Int64Type};
-use arrow_schema::{DataType, Field, Schema};
+use blaze_columns::{Batch, Column, Field, Scalar, Type};
 use blaze_core::{
     Driver,
     sim::{Faults, Sim},
 };
 use blaze_sim::{Broke, Config, Tape};
-use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
 
 use super::*;
 use crate::{panics::Kind as PanicKind, schema};
@@ -177,38 +173,36 @@ fn table(name: &str) -> usize {
     }
 }
 
-/// The rows' ids as a Parquet file of one `Int64` column, written with `properties`: every file
-/// of the test has this schema, so any of one table merge.
-fn parquet_of(rows: &[i64], properties: &WriterProperties) -> Vec<u8> {
-    // alloc: a test's file
-    let schema = Arc::new(Schema::new(vec![Field::new("row", DataType::Int64, false)]));
-    // alloc: a test's file
-    let column: ArrayRef = Arc::new(Int64Array::from(rows.to_vec()));
-    let batch = match RecordBatch::try_new(Arc::clone(&schema), vec![column]) {
+/// The one column of every file of the test.
+const ROW: Field<Global> = Field::new("row", Type::One(Scalar::I64), false);
+
+/// The rows' ids as a Parquet file of one `Int64` column: every file of the test has this
+/// schema, so any of one table merge.
+fn parquet_of(rows: &[i64]) -> Vec<u8> {
+    let fields = blaze_own::Vec::from_iter_in([ROW], Global);
+    let columns = blaze_own::Vec::from_iter_in([Column::values(rows.iter().copied(), Global)], Global);
+    let batch = match Batch::try_new(fields, columns) {
         Ok(it) => it,
         Err(error) => panic!("a batch of {} rows: {error}", rows.len()),
     };
-    // clone: writer properties, once a test's file
-    let written = ArrowWriter::try_new(Vec::new(), schema, Some(properties.clone()))
-        .and_then(|mut writer| writer.write(&batch).and_then(|()| writer.into_inner()));
-    match written {
-        Ok(bytes) => bytes,
+    match blaze_parquet::write(&[ROW], &[batch], &[], blaze_parquet::Options::DEFAULT, Global) {
+        // alloc: a test's file, as the bytes a placed file holds
+        Ok(bytes) => bytes.to_vec(),
         Err(error) => panic!("writing a test's file of {} rows: {error}", rows.len()),
     }
 }
 
 /// Every row of a Parquet file, or why it does not decode whole.
 fn rows_of(bytes: Vec<u8>) -> Result<Vec<i64>, String> {
-    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
-        .and_then(|it| it.build())
+    let batches = blaze_parquet::File::open(&bytes, Global)
+        .and_then(|it| it.read_all())
         .map_err(|error| error.to_string())?;
     // alloc: a file's rows, once an oracle
     let mut rows = Vec::new();
-    for batch in reader {
-        let batch = batch.map_err(|error| error.to_string())?;
-        let Some(column) = batch.column(0).as_primitive_opt::<Int64Type>() else {
+    for batch in batches.iter() {
+        let Some(column) = batch.column(0).i64s() else {
             // alloc: an oracle's finding
-            return Err(format!("its column is {}, not Int64", batch.column(0).data_type()));
+            return Err(format!("its column is {:?}, not Int64", batch.column(0).ty()));
         };
         rows.extend(column.values().iter().copied());
     }
@@ -226,10 +220,10 @@ fn entry(rows: usize, pid: u32) -> Entry {
     }
 }
 
-fn placed(name: Name, rows: &[i64], pid: u32, properties: &[WriterProperties]) -> Placed {
+fn placed(name: Name, rows: &[i64], pid: u32) -> Placed {
     Placed {
         file: name.file_name(),
-        bytes: parquet_of(rows, &properties[name.table]),
+        bytes: parquet_of(rows),
         entry: entry(rows.len(), pid),
     }
 }
@@ -326,8 +320,6 @@ fn panic_row(pid: u32, t_ns: i64, row: i64) -> PanicRow {
 /// A process of the simulation: alive while it is the newest.
 struct TestHost {
     pid: u32,
-    /// What a postmortem's files are written with (the `spans` table's).
-    properties: Vec<WriterProperties>,
 }
 
 impl Host for TestHost {
@@ -362,7 +354,7 @@ impl Host for TestHost {
                         last: dead.seq,
                         level: 0,
                     };
-                    files.push(placed(name, &rows, dead.pid, &self.properties));
+                    files.push(placed(name, &rows, dead.pid));
                 }
                 Recovery::Files { nonce, files }
             }
@@ -535,7 +527,6 @@ struct World {
     sim: Sim,
     dir: FileName,
     plant: Plant,
-    properties: Vec<WriterProperties>,
     /// Every row ever handed to the history or left in a crash record: what is owed, once.
     rows: BTreeSet<i64>,
     next_row: i64,
@@ -559,8 +550,6 @@ impl World {
             sim: Sim::new(plan.seed, faults),
             dir,
             plant,
-            // alloc: each table's properties, once a run
-            properties: schema::TABLES.iter().map(|it| super::super::properties(it)).collect(),
             rows: BTreeSet::new(),
             next_row: 1,
             next_pid: FIRST_PID,
@@ -590,10 +579,9 @@ impl World {
         'process: loop {
             let pid = self.next_pid;
             self.next_pid += 1;
-            let host = TestHost { pid, properties: self.properties.clone() }; // clone: once a process
-            // clone: the directory's name and the properties, once a process
-            let mut files =
-                Files::new(host, PathBuf::from(ROOT), self.dir.clone(), self.properties.clone());
+            let host = TestHost { pid };
+            // clone: the directory's name, once a process
+            let mut files = Files::new(host, PathBuf::from(ROOT), self.dir.clone());
             files.plant(self.plant);
             loop {
                 // alloc: the job's name, once an open
@@ -715,7 +703,7 @@ impl World {
             spans = Some(files.len());
             let name =
                 Name { build: self.build, table: table("spans"), first: seq, last: seq, level: 0 };
-            files.push(placed(name, &live.held, live.pid, &self.properties));
+            files.push(placed(name, &live.held, live.pid));
         }
         let mut panics = None;
         let mut consumed = None;
@@ -726,7 +714,7 @@ impl World {
                 Name { build: self.build, table: table("panics"), first: seq, last: seq, level: 0 };
             // alloc: a flush's crash rows
             let rows: Vec<i64> = live.crashes.iter().map(|it| it.2).collect();
-            files.push(placed(name, &rows, live.pid, &self.properties));
+            files.push(placed(name, &rows, live.pid));
             let written = crash::Written {
                 // clone: a record's name, once a flush
                 files: live.crashes.iter().map(|it| it.0.clone()).collect(),
@@ -1360,7 +1348,6 @@ struct ReaderPin {
 struct KeptWorld {
     sim: Sim,
     dir: FileName,
-    properties: Vec<WriterProperties>,
     files: Files<TestHost>,
     pid: u32,
     keep: usize,
@@ -1381,15 +1368,14 @@ struct KeptWorld {
 fn opened_core(
     sim: &mut Sim,
     dir: &FileName,
-    properties: &[WriterProperties],
     pid: u32,
     keep: usize,
     cap: u64,
     rule: CapRule,
 ) -> Result<(Files<TestHost>, u64), Broke> {
-    let host = TestHost { pid, properties: properties.to_vec() }; // clone: once a process
-    // clone: the directory's name and the properties, once a process
-    let mut files = Files::new(host, PathBuf::from(ROOT), dir.clone(), properties.to_vec());
+    let host = TestHost { pid };
+    // clone: the directory's name, once a process
+    let mut files = Files::new(host, PathBuf::from(ROOT), dir.clone());
     files.keep_builds(keep);
     files.cap_rule(rule);
     files.open(cap, Vec::new());
@@ -1417,13 +1403,10 @@ impl KeptWorld {
         };
         let mut sim = Sim::new(seed, faults);
         let Some(dir) = FileName::new(DIR) else { unreachable!("`{DIR}` is a name") };
-        let properties: Vec<WriterProperties> =
-            schema::TABLES.iter().map(|it| super::super::properties(it)).collect();
-        let (files, seq) = opened_core(&mut sim, &dir, &properties, FIRST_PID, keep, cap, rule)?;
+        let (files, seq) = opened_core(&mut sim, &dir, FIRST_PID, keep, cap, rule)?;
         Ok(KeptWorld {
             sim,
             dir,
-            properties,
             files,
             pid: FIRST_PID,
             keep,
@@ -1487,7 +1470,7 @@ impl KeptWorld {
             }
             let named = of.last().copied().unwrap_or(0);
             let name = Name { build: named, table: table("spans"), first: seq, last: seq, level: 0 };
-            let mut file = placed(name, &ids, self.pid, &self.properties);
+            let mut file = placed(name, &ids, self.pid);
             file.entry.builds = of.first().zip(of.last()).map(|(&lo, &hi)| [lo, hi]);
             placing.push(file);
         }
@@ -1542,7 +1525,7 @@ impl KeptWorld {
         self.running.clear();
         self.pid += 1;
         let (files, seq) =
-            opened_core(&mut self.sim, &self.dir, &self.properties, self.pid, self.keep, self.cap, self.rule)?;
+            opened_core(&mut self.sim, &self.dir, self.pid, self.keep, self.cap, self.rule)?;
         self.files = files;
         self.seq = seq;
         // With nothing running the open's trim has nothing new to decide: the same files.

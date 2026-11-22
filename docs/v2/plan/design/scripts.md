@@ -110,9 +110,9 @@ TOML, regex, tar and the hashes are the crates already in `Cargo.lock` (`serde_j
     experimental = ["capabilities"]
     ---
     /// Checks the ledger's rows and writes its table.
-    struct Input { /** check, write, pick or run */ command: Command, /** the checkout */ root: Path }
+    struct Input { /** check, write, pick or run */ command: Command }
 
-    fn main(cx: &Cx, io: Io, input: Input) -> Result<(), Error> { .. }
+    fn main(cx: &Cx, out: Out, checkout: Dir<ReadWrite>, input: Input) -> Result<(), Error> { .. }
 
 - **Single file.** `blaze run path/to/script.rs`, `blaze path/to/script.rs` and the shebang
   line. The file is a crate root. Its manifest is cargo's `-Zscript` front matter, unchanged, so
@@ -140,9 +140,10 @@ TOML, regex, tar and the hashes are the crates already in `Cargo.lock` (`serde_j
   same no-op lane followed by an exec of the kept executable, with no second process between.
   With no daemon running the command starts one, as every build does, and the first script pays
   for it; there is no in-process route (rule no-fallback).
-- **bstd is the library.** `main` gets the task's `Cx` and the root `Io` and narrows it
-  (`io.fs().open_dir(..)`, `io.env().only(..)`), so a script's signature and first lines say
-  what it can touch. Against bstd on `lang-int-1110` (docs/v2/plan/design/std.md there, and
+- **bstd is the library.** `main` gets the task's `Cx` and each grant it names (D104: a whole
+  `Io` cannot be asked for: `checkout: Dir<ReadWrite>`, `env: Env`, ...) and narrows them
+  (`checkout.subdir(..)`, `env.only(..)`), so a script's signature says what it can touch.
+  Against bstd on `lang-int-1110` (docs/v2/plan/design/std.md there, and
   `crates/blaze-std/src`):
 
   | need | bstd has | missing, for the bstd lane |

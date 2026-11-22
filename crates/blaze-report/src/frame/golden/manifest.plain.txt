@@ -1,0 +1,7 @@
+error  this build of blaze cannot read the dependency `bstd` yet
+  ╭─ Cargo.toml:7:1
+6 │ [dependencies]
+7 │ bstd = { package = "blaze-std", path = "/Volumes/Projects/blaze-macbuild-11…
+  │ ^^^^
+  │ ╰─ nothing this package gets from it is checked
+  ╰─ blaze explain dependency-not-read

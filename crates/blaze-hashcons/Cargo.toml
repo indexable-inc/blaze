@@ -16,13 +16,16 @@ doctest = false
 [dependencies]
 blaze-core.workspace = true
 blaze-format.workspace = true
-# `ContentMap`'s table: `ByHash`, keyed by the content ID itself.
+# `ContentMap`'s table: a `Map` on `BuildKeyHasher`, keyed by the content ID itself.
 blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+# `testing::heap()`, the allocator `to_bytes` is handed in the tests (D170 C1: no `Global`).
+blaze-own = { workspace = true, features = ["testing"] }
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

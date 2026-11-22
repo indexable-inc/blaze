@@ -1,6 +1,6 @@
 [package]
 name = "blaze-std"
-description = "bstd, blaze's own capability-based standard library (docs/v2/plan/design/std.md): one Io over blaze-core's drivers and its simulation, capabilities made only from it or by narrowing, a task context (Cx) with a deadline, cancellation, a span and a frame, and memory from named allocators; and the facade over blaze's piece crates (mem, bytes, map, id, sync, cell, sort, digest, record, report, quic, http, test)"
+description = "bstd, blaze's own capability-based standard library (docs/v2/plan/design/std.md): one Io over blaze-core's drivers and its simulation, capabilities made only from it or by narrowing, a task context (Cx) with a deadline, cancellation, a span and a frame, and memory from named allocators; and the facade over blaze's piece crates (mem, vec, boxed, rows, soa, text, bits, paths, bytes, map, set, id, sync, cell, sort, digest, record, report, quic, http, test)"
 publish = false
 
 version.workspace = true
@@ -17,7 +17,13 @@ doctest = false
 [dependencies]
 blaze-core.workspace = true
 blaze-mem.workspace = true
+# D169's meter: every effect counted by kind where it is stamped, its time where `Io::call`
+# waits for it (io/fast.rs, io.rs).
+blaze-meter.workspace = true
 blaze-rng.workspace = true
+# D177's hermetic run (procs/hermetic): its roots, mounts and checked read list. blaze-roots sits
+# on blaze-own and blaze-blake3 alone, neither of which depends on bstd.
+blaze-roots.workspace = true
 # The facade (lib.rs, "Batteries"): each re-exported under bstd's names, none depending on bstd.
 blaze-alloc-count.workspace = true
 blaze-bytes.workspace = true
@@ -26,29 +32,87 @@ blaze-format.workspace = true
 blaze-hash.workspace = true
 # `map::ContentMap`: values stored once, by content.
 blaze-hashcons.workspace = true
-# The sans-IO cores only: its `tokio` feature (the drivers) stays off.
-blaze-http.workspace = true
-# A request's method, as blaze-http's h1 request writer takes it (`requests::Http::over`).
-http.workspace = true
+# The sans-IO cores only: its `tokio` feature (the drivers) stays off. Behind `net`.
+blaze-http = { workspace = true, optional = true }
+# HTTP/1.1's request writer and response parser (`requests::Http::over`). Behind `net`.
+blaze-h1 = { workspace = true, optional = true }
+# `url` and `net::HostPort`: checked addresses, their one home.
+blaze-url.workspace = true
+# blaze's test engine, for `#[bstd::test]`'s DRAWN parameters (D109). Behind `sim-draws`, which a
+# crate turns on in its [dev-dependencies]: a build without tests never compiles it.
+blaze-sim = { workspace = true, optional = true }
 blaze-ids.workspace = true
+# The run spec (`spec`): a strict data model, and JSON with sorted keys.
+blaze-data.workspace = true
+blaze-json.workspace = true
+# The hosted wire's escape (`guest::codec`): deterministic CBOR, the tree's strict format.
+blaze-cbor.workspace = true
+# `sync`'s new primitives and `par`: Vec, VecDeque, Box, Arc with an allocator always named.
+blaze-own.workspace = true
+# `id::Table`, `bits::ChunkedBitSet`, `vec::InlineVec` and the rest of the forms (D120). blaze-kit
+# sits on blaze-own, blaze-hash and blaze-int alone, none of which depends on bstd.
+blaze-kit.workspace = true
+# `out::Held` is a `blaze_text::Put`: `Out::line_with` takes a chain of typed writers.
+blaze-text.workspace = true
 blaze-phf.workspace = true
 blaze-radix.workspace = true
 blaze-reclaim.workspace = true
 blaze-report.workspace = true
 blaze-sha256.workspace = true
 blaze-spin.workspace = true
-# bstd::image's inflate: miniz_oxide's no-alloc core, into the buffer decode sized and limited.
-miniz_oxide.workspace = true
+# bstd::image's zlib: inflated straight into the buffer decode sized and limited, and deflated.
+blaze-deflate = { workspace = true, optional = true }
 
 # bstd::video's VideoToolbox provider (src/video/videotoolbox.rs).
+# The runtime's own system calls (a stream's terminal facts; on macOS the topology and QoS,
+# through the table of calls found at first use).
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+blaze-sys.workspace = true
+
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-core-foundation.workspace = true
-objc2-core-media.workspace = true
-objc2-core-video.workspace = true
-objc2-video-toolbox.workspace = true
+objc2-core-foundation = { workspace = true, optional = true }
+objc2-core-media = { workspace = true, optional = true }
+objc2-core-video = { workspace = true, optional = true }
+objc2-video-toolbox = { workspace = true, optional = true }
+
+# A bstd program pays at start only for what it calls (std.md, "What a program pays for at
+# start"): the default is the core a command-line tool needs (files, output, the host's core
+# count, frames, threads, time, text, the capabilities with no dependency of their own), and
+# each heavy area, with the dependencies it links, is behind its feature. A crate that uses one
+# names it in its own manifest.
+[features]
+default = []
+# `bstd::quic` and `bstd::http` (and `requests`): QUIC and blaze-http's client, which bring
+# rustls, ring, quinn-proto and the rest. blaze-cli builds none of it (it takes `requests`
+# alone, below). `net::Net` itself is
+# blaze-core's effects and needs no feature.
+net = ["requests", "dep:blaze-http", "blaze-http/h3"]
+# `bstd::requests` (`Http`) alone: blaze-h1's sans-IO HTTP/1.1 core driven over `Net`, with no
+# TLS stack and none of blaze-http. blaze-cli's shared-cache origin turns on this one.
+requests = ["dep:blaze-h1"]
+# `#[bstd::test]`'s drawn parameters (D109): `fn t(cx: &Cx, xs: Vec<u32, _>)`, each value drawn
+# from a tape by blaze-sim, shrunk and replayed. Turn it on in [dev-dependencies] only.
+sim-draws = ["dep:blaze-sim"]
+# `bstd::image`: PNG decode and encode, and its zlib.
+image = ["dep:blaze-deflate"]
+# `bstd::test::native`: a test's native world, from a test's root of real-OS authority
+# (`blaze_core::testing::os()`); a crate's dev-dependencies turn it on, never its build.
+testing = ["blaze-core/testing", "blaze-own/testing"]
+# `bstd::video`: the MP4 muxer, and the HEVC encoder on VideoToolbox on macOS, which links
+# VideoToolbox, CoreMedia, CoreVideo, CoreFoundation, IOSurface, libobjc and Foundation.
+video = [
+    "dep:objc2-core-foundation",
+    "dep:objc2-core-media",
+    "dep:objc2-core-video",
+    "dep:objc2-video-toolbox",
+]
 
 [dev-dependencies]
 blaze-sim.workspace = true
+# `blaze_own::testing::heap()`: a test's root allocator capability (D102).
+blaze-own = { workspace = true, features = ["testing"] }
+# `blaze_core::testing::os()`: a test's root of real-OS authority (`bstd::test::native`).
+blaze-core = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

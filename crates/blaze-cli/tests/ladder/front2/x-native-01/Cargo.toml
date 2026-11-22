@@ -1,0 +1,16 @@
+[package]
+name = "ladder-x-native-01"
+version = "0.1.0"
+edition = "2024"
+
+# The C file is compiled by the build script through `cc` (NATIVE.md W11). `cc` in the
+# script's closure makes it a NATIVE script (blaze-build-script native.rs TOOLCHAIN_CLASS,
+# D65/D112): run confined, the shelf's clang the only compiler it sees. The version is
+# tempo's (its Cargo.lock), so a home that fetched tempo holds it.
+[build-dependencies]
+cc = "=1.6.0"
+
+# The rung is not about overflow and declares no `panic_const_*_overflow` lang fn: it
+# builds with the release setting (D101; the dev default would need those lang fns).
+[profile.dev]
+overflow-checks = false

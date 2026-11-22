@@ -39,37 +39,79 @@
 //! - [`verify`]: the structure every reader relies on, then types, flags and dominance.
 //! - [`print`] and [`parse`]: the text form, which round-trips byte for byte.
 //! - [`persist`]: the blaze-format record, the columns as one buffer read in place.
+//! - [`coroutine`]: the pass that splits a coroutine body, the one place `suspend` and
+//!   `cancelled` are taken.
 //!
 //! The crate is a sans-IO core: it reads no clock, file or thread.
 
+#![forbid(unsafe_code)]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
+/// LIR's integer arithmetic, one home: what the evaluator runs and the simplify stage folds by.
+mod arith;
+/// Bodies by identity and what a direct call reaches: the evaluator's and the inliner's seam.
+pub mod body;
 pub mod builder;
+/// The coroutine pass (decision D73): a body with `suspend`s to its `poll`, its state's drop
+/// glue and the state's layout.
+pub mod coroutine;
+/// The reference evaluator backends are tested against: in this crate's tests, and for a
+/// backend's tests through the `eval` feature. Never in a build.
+#[cfg(any(test, feature = "eval"))]
+pub mod eval;
 pub mod flags;
 pub mod func;
+/// The trivial inliner (D98's first point): small loop-free bodies and `#[inline(always)]`
+/// spliced in front of the fast tier.
+pub mod inline;
+/// Legalize (INTRINSICS.md 3.2, 3.5): vectors to scalars, `f16` widened, `f128` to
+/// compiler_builtins calls, in front of the Reference and Fast tiers only.
+pub mod legalize;
+pub mod loop_entry;
+/// Cross-function bottom-up Tarjan SCC ThinLTO and JIT tier-up planning.
+pub mod lto;
 pub mod op;
 pub mod parse;
 pub mod persist;
+/// PGO site and body weight tables for guided inlining, LTO, and JIT tier-up.
+pub mod pgo;
 pub mod print;
+/// The linear simplify stage in front of the Fast tier (backend-next.md D100 point 1): scalar
+/// replacement of slots that do not escape, then (S2) propagation and dead code.
+pub mod simplify;
+/// ThinLTO function summaries for cost-model inlining and incremental early cutoff.
+pub mod summary;
 pub mod ty;
 pub mod verify;
 
-pub use builder::{BuildError, Builder, Full, Requests, RequestsOnly, Sink};
+pub use builder::{BuildError, Builder, DataPosition, Full, Requests, RequestsOnly, Sink};
+pub use func::PositionField;
 pub use flags::{AtomicRmw, FlagClass, FlagKind, Flags, FloatCond, IntCond, Ordering};
 pub use func::{Block, BlockKind, Func, Head, Value, View};
 pub use op::{End, Field, Info, Layout, Op, Operands, Res};
 pub use parse::{ParseError, parse};
 pub use print::print;
+pub use simplify::egraph;
 pub use ty::{Scalar, Ty};
-pub use verify::{VerifyError, verify};
+pub use verify::{Verified, VerifiedFunc, VerifyError, verify};
 
 /// The version of what LIR's bytes mean: its operations, their operands and flags, its types
 /// and tables. Part of the record's schema ([`persist::SCHEMA`]) and of every key of a LIR, so
-/// a change to any of them is a new version.
-pub const VERSION: u64 = 1;
+/// a change to any of them is a new version. 3: data rows hold source positions
+/// (`DataRec::positions_first`/`positions_len`, the `data_positions` column), filled when the
+/// program is placed (rule 71); 2 had none.
+pub const VERSION: u64 = 3;
 
 #[cfg(test)]
+mod coroutine_tests;
+#[cfg(test)]
+mod inline_tests;
+#[cfg(test)]
+mod loop_entry_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tiers;

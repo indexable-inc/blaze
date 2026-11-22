@@ -12,7 +12,7 @@ use std::borrow::Cow;
 use crate::ast;
 use crate::span::Span;
 use crate::span::symbol::Ident;
-use tracing::debug;
+use blaze_trace::debug;
 
 use crate::comment::{combine_strs_with_missing_comments, contains_comment};
 use crate::rewrite::RewriteContext;

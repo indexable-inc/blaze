@@ -12,6 +12,10 @@
 //! [`check`] is steps 1 and 2 and the only maker of a [`Checked`] statement, which is all a
 //! driver's `prepare` takes: text decided at run time has no way to an engine.
 //!
+//! A second grammar, the query grammar ([`query`], [`parse::parse_script`]), is the analytic
+//! SQL of the build profile's views, for blaze-rel (docs/v2/plan/design/query.md). It shares
+//! the lexer, the parser and the expression tree; [`infer`] refuses its forms by name.
+//!
 //! The crate owns no IO, clock or thread, and allocates only in the allocator it is handed, so
 //! the compiler runs it in const evaluation and a test runs it as it is.
 
@@ -32,6 +36,7 @@ pub mod infer;
 mod lex;
 pub mod parse;
 pub mod print;
+pub mod query;
 pub mod render;
 pub mod same;
 pub mod schema;

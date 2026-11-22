@@ -1,0 +1,15 @@
+{
+ "id": "reach-sweep-blocked-by-drive-answer-graph",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane RC7",
+ "where": "crates/blaze-cli/src/store.rs set_last / last_root; crates/blaze-drive answers.rs (Last, pages, rows' `at`); crates/blaze-cli/src/store/plain_place.rs config (liveness)",
+ "what": "turning on Liveness::Reached was the goal; the code store and start list are now rooted (store/roots.rs, one index record per program root), but the drive's answer is a graph several levels deep (the sealed Last names cert and the page-table root by key, the pages name rows, each row names its `at` record) and `set_last` roots only the sealed record. Reach is one level, so the sweep would drop every answer page after one command. The run_ids and run_names tables keyed by the certificate are rooted by nothing.",
+ "cost": "most of the lane: the census had to read the drive's answer format to find it, and the sweep stays off",
+ "cause": "records were written with Liveness::Everything in force, so nothing forced a writer to name what it wrote",
+ "whys": "the store's liveness was a config flag rather than a type every writer passes through; rooting was opt-in per writer",
+ "class": "a record a later command reads that no root names: invisible until the sweep is on",
+ "prevention": "partial: Rooted<Class> handles (store/roots.rs), the program root, an index-record primitive in blaze-cas with a simulation test and a planted bug. Next: blaze-drive writes one index record per answer page (the page's row keys and `at` keys) and set_last roots the checkout's page indexes through Plain::root_through; run_ids/run_names put their records' keys into the same checkout index; a toolchain class needs CodeStore to take a class argument",
+ "annoyance": "write-only lane: no compiler feedback on a cross-crate change; the census needed reading four crates by grep",
+ "workaround": "none",
+ "state": "open"
+}

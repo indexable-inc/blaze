@@ -1,0 +1,17 @@
+[package]
+name = "blaze-pins"
+description = "The pinned toolchain's facts as constants (D162): the files of the repository's one `pins/` folder (the nightly, rustc's and cargo's version lines, the commit, the archives' digests, LLVM's and clang's pin tables, the recorded compiler answers) read at compile time by `const fn` parsers, a malformed pin failing the build with the file and line; the only crate that includes a file outside its own folder; no dependency, so every crate can take the facts from it"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true

@@ -1,0 +1,8 @@
+{
+ "id": "union-pattern-e0027-and-queue-output",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane US",
+ "where": "crates/blaze-typeck/src/rules/pat.rs (Pat::Struct), and the build queue's test output",
+ "what": "Two things met while adding E0133. (1) A union's struct pattern `let U { a } = u` was refused with E0027 'pattern does not mention field `b`': the missing-fields check ran for unions, which the Reference says name exactly one field (E0784). Fixed in pat.rs; a union pattern that names other than one field is now E0784. (2) The queue cuts a failing test's stdout after about 30 lines, so a table test that prints every row hides the wrong rows; print only the wrong rows and a count. A plain `-p <crate>` with no target is refused; `--lib` works.",
+ "fix": "pat.rs union arm; tests print only failures"
+}

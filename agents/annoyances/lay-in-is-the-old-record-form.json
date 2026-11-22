@@ -1,0 +1,15 @@
+{
+ "id": "lay-in-is-the-old-record-form",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), writer lane on crates/blaze-cunit",
+ "where": "crates/blaze-launch/src/image.rs:897 lay_in, crates/blaze-launch/src/record.rs (LAYOUT 1 CBOR Record) beside crates/blaze-code/src/record.rs (bzcode07) and place.rs place",
+ "what": "the brief asked for a round trip of C records 'through the launcher's lay_in'. lay_in lays out the daemon-era CBOR Record (native fixup kinds Abs64/Call26/AdrpPage21/Got*/Tlv*, DWARF unwind with personality and LSDA). The live run places blaze-code records one at a time through place::place (launch-rt run_mode.rs). Two record forms both called 'the record', and lay_in's richer fixup set looks like the obvious target for C objects.",
+ "cost": "about twenty minutes reading both forms before choosing; a lane that took the name at its word would have built C records in the form the run no longer places",
+ "cause": "the old form and its layout were kept after the run moved to blaze-code's form; lay_in's only callers are its tests and launch-rt drive/records",
+ "whys": "rule 30 (one concept, one home) was not applied when blaze-code's record became the placed form",
+ "class": "a superseded form kept live under the same name as its replacement",
+ "prevention": "wanted: delete blaze-launch record.rs/lay_in with drive/records, or mark the module superseded in its doc and ban new callers",
+ "annoyance": "the name 'record' means two formats in two crates",
+ "workaround": "blaze-cunit lowers to blaze-code's CodeRecord and Datum, and its round trip goes through blaze_code::place::place",
+ "state": "open"
+}

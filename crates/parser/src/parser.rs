@@ -1,41 +1,31 @@
 //! See [`Parser`].
 
-use std::{borrow::Cow, num::NonZeroU32};
+use std::borrow::Cow;
 
 use crate::{
     Edition,
-    SyntaxKind::{self, EOF, ERROR, TOMBSTONE},
+    SyntaxKind::{self, EOF, ERROR},
     T, TokenSet,
-    event::{self, Event, Events},
+    event::Events,
     input::Tokens,
+    sink::{EventSink, Sink},
 };
-
-/// Build a forward-parent offset. The offset is always ≥ 1 because the
-/// forward-parent event is created *after* the event it forwards to, so
-/// `NonZeroU32` is always valid here. Panics only on a parser bug.
-#[inline]
-fn fwd_parent(offset: u32) -> NonZeroU32 {
-    NonZeroU32::new(offset).expect("forward-parent offset must be non-zero")
-}
 
 /// `Parser` struct provides the low-level API for
 /// navigating through the stream of tokens and
 /// constructing the parse tree. The actual parsing
 /// happens in the [`grammar`](super::grammar) module.
 ///
-/// However, the result of this `Parser` is not a real
-/// tree, but rather a flat stream of events of the form
-/// "start expression, consume number literal,
-/// finish expression". See `Event` docs for more.
-pub(crate) struct Parser<'t> {
+/// What it makes is not a real tree: each step (a node opened, a token taken, a node
+/// finished as a kind) goes to its [`Sink`], `S`. With the [`EventSink`] that is a flat stream
+/// of events of the form "start expression, consume number literal, finish expression"; see
+/// `Event` docs for more.
+pub(crate) struct Parser<'t, S: Sink = EventSink> {
     /// The tokens, an [`crate::Input`]'s or a token tree's words where they lie.
     inp: Tokens<'t>,
     pos: usize,
-    /// The thread's event list, lent until [`event::process`] is done with it.
-    events: blaze_mem::scratch::Lent<Events>,
-    /// Side table of error messages. `Event::Error { err }` carries an index
-    /// into this vec, keeping `Event` itself a flat 8-byte enum.
-    errors: Vec<Cow<'static, str>>,
+    /// Where every step of the parse goes.
+    sink: S,
     /// Nodes started and errors made since the last token was consumed. A loop that consumes
     /// nothing still starts a node or makes an error each turn (or asks to bump at `EOF`), so
     /// counting those, and not every kind test, catches it.
@@ -66,13 +56,34 @@ const PARSER_STEP_LIMIT: usize = if cfg!(debug_assertions) { 150_000 } else { 15
 impl<'t> Parser<'t> {
     pub(super) fn new(inp: impl Into<Tokens<'t>>) -> Parser<'t> {
         let inp = inp.into();
+        Parser::with_sink(inp, false, EventSink::for_tokens(inp.len()))
+    }
+
+    /// A parser for a macro fragment: a bare `T is PAT` is not taken as a type
+    /// ([`Parser::bare_pattern_types`]).
+    pub(super) fn new_fragment(inp: impl Into<Tokens<'t>>) -> Parser<'t> {
+        Parser { bare_pattern_types: false, ..Parser::new(inp) }
+    }
+
+    pub(super) fn new_outline(inp: impl Into<Tokens<'t>>) -> Parser<'t> {
+        Parser { outline: true, ..Parser::new(inp) }
+    }
+
+    pub(crate) fn finish(self) -> (blaze_mem::scratch::Lent<Events>, Vec<Cow<'static, str>>) {
+        (self.sink.events, self.sink.errors)
+    }
+}
+
+impl<'t, S: Sink> Parser<'t, S> {
+    /// A parser of `inp` whose steps go to `sink`; `outline` is whether `fn` bodies are
+    /// skipped as lazy nodes ([`crate::outline`]).
+    pub(super) fn with_sink(inp: Tokens<'t>, outline: bool, sink: S) -> Parser<'t, S> {
         Parser {
             inp,
             pos: 0,
-            events: event::lend_events(inp.len()),
-            errors: Vec::new(), // alloc: empty until the first syntax error, an error path
+            sink,
             steps: 0,
-            outline: false,
+            outline,
             closed_curlies: None,
             bare_pattern_types: true,
             unions: inp.any_extensions().error_unions(),
@@ -80,10 +91,15 @@ impl<'t> Parser<'t> {
         }
     }
 
-    /// A parser for a macro fragment: a bare `T is PAT` is not taken as a type
-    /// ([`Parser::bare_pattern_types`]).
-    pub(super) fn new_fragment(inp: impl Into<Tokens<'t>>) -> Parser<'t> {
-        Parser { bare_pattern_types: false, ..Parser::new(inp) }
+    /// The parse done: its sink.
+    pub(super) fn into_sink(self) -> S {
+        self.sink
+    }
+
+    /// The index of the next token, as a [`Sink`] is told it.
+    #[inline]
+    fn at_token(&self) -> u32 {
+        self.pos as u32
     }
 
     /// Whether a bare `T is PAT` is a type here (`#![blaze::pattern_types]`).
@@ -94,7 +110,7 @@ impl<'t> Parser<'t> {
     /// Runs `parse` on the base type of a `builtin#pattern_type(T is PAT)`: until a delimiter
     /// opens ([`Parser::with_unions`] with `true`), the `is` after a path type is left for the
     /// builtin.
-    pub(crate) fn with_pattern_base(&mut self, parse: impl FnOnce(&mut Parser<'t>)) {
+    pub(crate) fn with_pattern_base(&mut self, parse: impl FnOnce(&mut Parser<'t, S>)) {
         let before = std::mem::replace(&mut self.pattern_base, true);
         parse(self);
         self.pattern_base = before;
@@ -125,7 +141,7 @@ impl<'t> Parser<'t> {
     /// before. Inside a delimiter a type is also no longer the base of a
     /// `builtin#pattern_type` ([`Parser::with_pattern_base`]): `Foo<E is E::A>` there is a bare
     /// pattern type again.
-    pub(crate) fn with_unions(&mut self, allowed: bool, parse: impl FnOnce(&mut Parser<'t>)) {
+    pub(crate) fn with_unions(&mut self, allowed: bool, parse: impl FnOnce(&mut Parser<'t, S>)) {
         let pattern_base = self.pattern_base && !allowed;
         let pattern_base_before = std::mem::replace(&mut self.pattern_base, pattern_base);
         let allowed = allowed && self.inp.any_extensions().error_unions();
@@ -135,13 +151,16 @@ impl<'t> Parser<'t> {
         self.pattern_base = pattern_base_before;
     }
 
-    pub(super) fn new_outline(inp: impl Into<Tokens<'t>>) -> Parser<'t> {
-        Parser { outline: true, ..Parser::new(inp) }
-    }
-
     /// In an outline, the number of tokens of the `fn` body at the current `{` when it can be
-    /// left unparsed ([`crate::outline::lazy_block_len`]).
+    /// left unparsed ([`crate::outline::lazy_block_len`]). A body the lexer made one
+    /// [`SyntaxKind::LAZY_BODY`] token ([`crate::LexedStr::new_outline`]; a `{` whose contextual
+    /// kind says so) has no tokens to parse: it is that one token, lazy in any parse.
     pub(crate) fn lazy_body(&self) -> Option<u32> {
+        if self.inp.kind(self.pos) == T!['{']
+            && self.inp.contextual_kind(self.pos) == SyntaxKind::LAZY_BODY
+        {
+            return Some(1);
+        }
         if !self.outline {
             return None;
         }
@@ -150,20 +169,23 @@ impl<'t> Parser<'t> {
 
     /// Skips the next `n_input_tokens` tokens as one lazy node of `kind`.
     pub(crate) fn bump_lazy(&mut self, kind: SyntaxKind, n_input_tokens: u32) {
+        let at = self.at_token();
         self.pos += n_input_tokens as usize;
         self.steps = 0;
-        self.push_event(Event::Lazy { kind, n_input_tokens });
+        self.sink.lazy(kind, n_input_tokens, at);
     }
 
     /// Runs `parse` with every body in it parsed, in an outline too.
-    pub(crate) fn in_full(&mut self, parse: impl FnOnce(&mut Parser<'t>)) {
+    pub(crate) fn in_full(&mut self, parse: impl FnOnce(&mut Parser<'t, S>)) {
         let outline = std::mem::replace(&mut self.outline, false);
         parse(self);
         self.outline = outline;
     }
 
-    pub(crate) fn finish(self) -> (blaze_mem::scratch::Lent<Events>, Vec<Cow<'static, str>>) {
-        (self.events, self.errors)
+    /// Whether the sink has all it reads of this parse ([`Sink::satisfied`]).
+    #[inline]
+    pub(crate) fn satisfied(&self) -> bool {
+        self.sink.satisfied()
     }
 
     /// Returns the kind of the current token.
@@ -194,6 +216,10 @@ impl<'t> Parser<'t> {
             let mut unclosed = Vec::new(); // alloc: once a parse, an error path
             for at in 0..inp.len() {
                 match inp.kind(at) {
+                    // A whole body in one token ([`Parser::lazy_body`]): closed by itself.
+                    T!['{'] if inp.contextual_kind(at) == SyntaxKind::LAZY_BODY => {
+                        closed[at] = true
+                    }
                     T!['{'] => unclosed.push(at),
                     T!['}'] => {
                         if let Some(it) = unclosed.pop() {
@@ -341,9 +367,16 @@ impl<'t> Parser<'t> {
     /// belong to the same node.
     pub(crate) fn start(&mut self) -> Marker {
         self.step();
-        let pos = self.events.len() as u32;
-        self.push_event(Event::tombstone());
-        Marker::new(pos)
+        let at = self.at_token();
+        Marker::new(self.sink.start(at))
+    }
+
+    /// Starts a node that will be completed as `kind`, a list whose children are items,
+    /// variants or fields ([`Sink::start_list`]): never abandoned, never preceded.
+    pub(crate) fn start_list(&mut self, kind: SyntaxKind) -> Marker {
+        self.step();
+        let at = self.at_token();
+        Marker::new(self.sink.start_list(kind, at))
     }
 
     /// Consume the next token. Panics if the parser isn't currently at `kind`.
@@ -364,30 +397,17 @@ impl<'t> Parser<'t> {
     /// Advances the parser by one token
     pub(crate) fn split_float(&mut self, mut marker: Marker) -> (bool, Marker) {
         assert!(self.at(SyntaxKind::FLOAT_NUMBER));
-        // we have parse `<something>.`
-        // `<something>`.0.1
-        // here we need to insert an extra event
-        //
-        // `<something>`. 0. 1;
-        // here we need to change the follow up parse, the return value will cause us to emulate a dot
-        // the actual splitting happens later
+        // `<something>.0.1`: a node is opened around `marker`'s, which ends inside the token;
+        // `<something>. 0. 1`: the return value makes the caller emulate a dot.
+        // The sink splits the token ([`Sink::split_float`]).
         let ends_in_dot = !self.inp.is_joint(self.pos);
         if !ends_in_dot {
-            let new_marker = self.start();
-            let idx = marker.pos as usize;
-            match &mut self.events[idx] {
-                Event::Start { forward_parent, kind } => {
-                    *kind = SyntaxKind::FIELD_EXPR;
-                    *forward_parent = Some(fwd_parent(new_marker.pos - marker.pos));
-                }
-                _ => unreachable!(),
-            }
-            marker.done = true;
-            marker = new_marker;
-        };
+            // The node opened around `marker`'s is a step, as every started node is.
+            self.step();
+        }
+        marker.pos = self.sink.split_float(marker.pos, ends_in_dot, self.at_token());
         self.pos += 1;
         self.steps = 0;
-        self.push_event(Event::FloatSplitHack { ends_in_dot });
         (ends_in_dot, marker)
     }
 
@@ -416,9 +436,8 @@ impl<'t> Parser<'t> {
     /// A fixed message is kept borrowed; only a formatted one is an owned `String`.
     pub(crate) fn error<T: Into<Cow<'static, str>>>(&mut self, message: T) {
         self.step();
-        let err = self.errors.len() as u32;
-        self.errors.push(message.into());
-        self.push_event(Event::Error { err });
+        let at = self.at_token();
+        self.sink.error(message.into(), at);
     }
 
     /// Consume the next token if it is `kind` or emit an error
@@ -490,11 +509,7 @@ impl<'t> Parser<'t> {
         self.pos += n_raw_tokens as usize;
         debug_assert!(self.pos <= self.inp.len(), "a bump past the end of the input");
         self.steps = 0;
-        self.push_event(Event::Token { kind, n_raw_tokens });
-    }
-
-    fn push_event(&mut self, event: Event) {
-        self.events.push(event);
+        self.sink.token(kind, n_raw_tokens);
     }
 
     pub(crate) fn current_edition(&self) -> Edition {
@@ -534,31 +549,18 @@ impl Marker {
     /// Finishes the syntax tree node and assigns `kind` to it,
     /// and mark the create a `CompletedMarker` for possible future
     /// operation like `.precede()` to deal with forward_parent.
-    pub(crate) fn complete(mut self, p: &mut Parser<'_>, kind: SyntaxKind) -> CompletedMarker {
+    pub(crate) fn complete<S: Sink>(mut self, p: &mut Parser<'_, S>, kind: SyntaxKind) -> CompletedMarker {
         self.done = true;
-        let idx = self.pos as usize;
-        match &mut p.events[idx] {
-            Event::Start { kind: slot, .. } => {
-                *slot = kind;
-            }
-            _ => unreachable!(),
-        }
-        p.push_event(Event::Finish);
-        let end_pos = p.events.len() as u32;
-        CompletedMarker::new(self.pos, end_pos, kind)
+        let at = p.at_token();
+        let done = p.sink.complete(self.pos, kind, at);
+        CompletedMarker::new(done.start, done.end, kind)
     }
 
     /// Abandons the syntax tree node. All its children
     /// are attached to its parent instead.
-    pub(crate) fn abandon(mut self, p: &mut Parser<'_>) {
+    pub(crate) fn abandon<S: Sink>(mut self, p: &mut Parser<'_, S>) {
         self.done = true;
-        let idx = self.pos as usize;
-        if idx == p.events.len() - 1 {
-            assert!(matches!(
-                p.events.pop(),
-                Some(Event::Start { kind: TOMBSTONE, forward_parent: None })
-            ));
-        }
+        p.sink.abandon(self.pos, p.at_token());
     }
 }
 
@@ -586,44 +588,25 @@ impl CompletedMarker {
     /// Append a new `START` events as `[START, FINISH, NEWSTART]`,
     /// then mark `NEWSTART` as `START`'s parent with saving its relative
     /// distance to `NEWSTART` into forward_parent(=2 in this case);
-    pub(crate) fn precede(self, p: &mut Parser<'_>) -> Marker {
-        let new_pos = p.start();
-        let idx = self.start_pos as usize;
-        match &mut p.events[idx] {
-            Event::Start { forward_parent, .. } => {
-                *forward_parent = Some(fwd_parent(new_pos.pos - self.start_pos));
-            }
-            _ => unreachable!(),
-        }
-        new_pos
+    pub(crate) fn precede<S: Sink>(self, p: &mut Parser<'_, S>) -> Marker {
+        p.step();
+        let at = p.at_token();
+        Marker::new(p.sink.precede(self.start_pos, at))
     }
 
     /// Extends this completed marker *to the left* up to `m`.
-    pub(crate) fn extend_to(self, p: &mut Parser<'_>, mut m: Marker) -> CompletedMarker {
-        m.done = true;
-        let idx = m.pos as usize;
-        match &mut p.events[idx] {
-            Event::Start { forward_parent, .. } => {
-                *forward_parent = Some(fwd_parent(self.start_pos - m.pos));
-            }
-            _ => unreachable!(),
+    pub(crate) fn extend_to<S: Sink>(mut self, p: &mut Parser<'_, S>, mut m: Marker) -> CompletedMarker {
+            m.done = true;
+            self.start_pos = p.sink.extend_to(self.start_pos, m.pos);
+            self
         }
-        self
-    }
 
     pub(crate) fn kind(&self) -> SyntaxKind {
         self.kind
     }
 
-    pub(crate) fn last_token(&self, p: &Parser<'_>) -> Option<SyntaxKind> {
-        let end_pos = self.end_pos as usize;
-        debug_assert_eq!(p.events[end_pos - 1], Event::Finish);
-        p.events[..end_pos].iter().rev().find_map(|event| match event {
-            Event::Token { kind, .. } => Some(*kind),
-            // A lazy node is a balanced `{ ... }`.
-            Event::Lazy { .. } => Some(T!['}']),
-            _ => None,
-        })
+    pub(crate) fn last_token<S: Sink>(&self, p: &Parser<'_, S>) -> Option<SyntaxKind> {
+        p.sink.last_token(self.end_pos, p.inp)
     }
 }
 

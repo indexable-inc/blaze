@@ -1,0 +1,12 @@
+status 0
+stdout
+1000 128 22 72 65 -37 -8 -2 true
+guard far dropped
+2
+1000 128 22 72 65 -37 -8 -2 true
+guard far dropped
+caught: Some("attempt to add with overflow")
+guard inner dropped
+guard outer dropped
+true
+done

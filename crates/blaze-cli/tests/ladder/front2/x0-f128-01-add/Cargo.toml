@@ -1,0 +1,4 @@
+[package]
+name = "ladder-x0-f128-01-add"
+version = "0.1.0"
+edition = "2024"

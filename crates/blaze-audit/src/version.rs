@@ -11,34 +11,40 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use semver::{Comparator, Op, Prerelease, Version, VersionReq};
+use std::alloc::Global;
 
-fn at(major: u64, minor: u64, patch: u64) -> Version {
+use blaze_semver::{Comparator, Op, Prerelease, Version, VersionReq};
+
+fn at(major: u64, minor: u64, patch: u64) -> Version<Global> {
     Version::new(major, minor, patch)
 }
 
 /// The least version: `major.minor.patch-0`, below every pre-release of it.
-fn floor(major: u64, minor: u64, patch: u64) -> Version {
-    Version { pre: Prerelease::new("0").expect("`0` is a pre-release"), ..at(major, minor, patch) }
+fn floor(major: u64, minor: u64, patch: u64) -> Version<Global> {
+    let pre = match Prerelease::new_in("0", Global) {
+        Ok(pre) => pre,
+        Err(why) => unreachable!("`0` is a pre-release: {why}"),
+    };
+    Version { pre, ..at(major, minor, patch) }
 }
 
 /// One end of the versions a comparator admits: a version, and whether it is itself in.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct End {
-    pub at: Version,
+    pub at: Version<Global>,
     pub inclusive: bool,
 }
 
-fn inclusive(at: Version) -> Option<End> {
+fn inclusive(at: Version<Global>) -> Option<End> {
     Some(End { at, inclusive: true })
 }
 
-fn exclusive(at: Version) -> Option<End> {
+fn exclusive(at: Version<Global>) -> Option<End> {
     Some(End { at, inclusive: false })
 }
 
 /// The interval of versions `c` admits: its low and its high end, none where unbounded.
-pub fn bounds(c: &Comparator) -> (Option<End>, Option<End>) {
+pub fn bounds(c: &Comparator<Global>) -> (Option<End>, Option<End>) {
     let (major, minor, patch) = (c.major, c.minor, c.patch);
     let given = Version { pre: c.pre.clone(), ..at(major, minor.unwrap_or(0), patch.unwrap_or(0)) };
     let whole = minor.is_some() && patch.is_some();
@@ -75,14 +81,11 @@ pub fn bounds(c: &Comparator) -> (Option<End>, Option<End>) {
             };
             (inclusive(given), exclusive(high))
         }
-        // `Op` is non-exhaustive; a comparator of a kind this does not know admits nothing,
-        // so a version is never called patched by a rule not read.
-        _ => (exclusive(at(u64::MAX, u64::MAX, u64::MAX)), exclusive(floor(0, 0, 0))),
     }
 }
 
 /// Whether `version` satisfies `c`, by order.
-pub fn admits(c: &Comparator, version: &Version) -> bool {
+pub fn admits(c: &Comparator<Global>, version: &Version<Global>) -> bool {
     let (low, high) = bounds(c);
     let above = low.is_none_or(|it| if it.inclusive { version >= &it.at } else { version > &it.at });
     let below = high.is_none_or(|it| if it.inclusive { version <= &it.at } else { version < &it.at });
@@ -90,17 +93,17 @@ pub fn admits(c: &Comparator, version: &Version) -> bool {
 }
 
 /// Whether `version` is in the range `req`: every comparator admits it.
-pub fn within(req: &VersionReq, version: &Version) -> bool {
+pub fn within(req: &VersionReq<Global>, version: &Version<Global>) -> bool {
     req.comparators.iter().all(|c| admits(c, version))
 }
 
 /// Whether `version` is affected: in no `patched` and no `unaffected` range.
-pub fn affected(patched: &[VersionReq], unaffected: &[VersionReq], version: &Version) -> bool {
+pub fn affected(patched: &[VersionReq<Global>], unaffected: &[VersionReq<Global>], version: &Version<Global>) -> bool {
     !patched.iter().chain(unaffected).any(|req| within(req, version))
 }
 
 /// Whether cargo counts `b` compatible with `a`: the same left-most non-zero part.
-pub fn compatible(a: &Version, b: &Version) -> bool {
+pub fn compatible(a: &Version<Global>, b: &Version<Global>) -> bool {
     match (a.major, a.minor) {
         (0, 0) => b.major == 0 && b.minor == 0 && b.patch == a.patch,
         (0, minor) => b.major == 0 && b.minor == minor,
@@ -112,8 +115,8 @@ pub fn compatible(a: &Version, b: &Version) -> bool {
 /// whether that is semver-compatible with `version` (so only the lock moves). The least is
 /// the one to name: versions above `version` in its compatible line all come before every
 /// version past that line, so a compatible fix, when there is one, is the least.
-pub fn fix(patched: &[VersionReq], version: &Version) -> Option<(Version, bool)> {
-    let mut least: Option<Version> = None;
+pub fn fix(patched: &[VersionReq<Global>], version: &Version<Global>) -> Option<(Version<Global>, bool)> {
+    let mut least: Option<Version<Global>> = None;
     for req in patched {
         // Where the range starts: its highest low end, the pre-release floor `-0` dropped
         // (no one publishes `-0`; the release is what a person asks for).

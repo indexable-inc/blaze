@@ -12,16 +12,13 @@
 //! concurrency"). Outside a model it is the order the calls ran in. The history's own
 //! bookkeeping is `std`'s, invisible to the model: it adds no schedule point.
 
-use blaze_hash::hash_map::Entry;
 use std::{
+    collections::{BTreeMap, btree_map::Entry},
     fmt::{self, Debug},
-    hash::{BuildHasher, Hash},
+    hash::{Hash, Hasher},
     panic::Location,
     sync::atomic::{AtomicU32, Ordering::Relaxed},
 };
-
-use blaze_hash::{FixedState, HashMap};
-use std::alloc::Global;
 
 use crate::{clock::Clock, rt};
 
@@ -59,12 +56,8 @@ impl<S: Spec> Event<S> {
 }
 
 /// The operations of one execution, each with its thread, result, call and return.
-#[expect(
-    clippy::disallowed_types,
-    reason = "below blaze-core: blaze-check is a dependency of blaze-core; the history a model's threads record into"
-)]
 pub struct History<S: Spec> {
-    events: parking_lot::Mutex<Vec<Event<S>>>,
+    events: crate::held::Mutex<Vec<Event<S>>>,
     clock: AtomicU32,
 }
 
@@ -75,12 +68,8 @@ impl<S: Spec> Default for History<S> {
 }
 
 impl<S: Spec> History<S> {
-    #[expect(
-        clippy::disallowed_types,
-        reason = "below blaze-core: blaze-check is a dependency of blaze-core; `History::events`"
-    )]
     pub fn new() -> History<S> {
-        History { events: parking_lot::Mutex::new(Vec::with_capacity(MAX_OPS)), clock: AtomicU32::new(0) }
+        History { events: crate::held::Mutex::new(Vec::with_capacity(MAX_OPS)), clock: AtomicU32::new(0) }
     }
 
     /// Runs `run` as the operation `op` of the calling thread, and records it with its result.
@@ -131,7 +120,7 @@ impl<S: Spec> History<S> {
             // alloc: each operation's happens-before set, once per check
             .collect();
         // alloc: the memo, once per check
-        let mut memo = Memo { seen: Vec::new(), first: HashMap::new_in(Global) };
+        let mut memo = Memo { seen: Vec::new(), first: BTreeMap::new() };
         let root = memo.insert(0, init).expect("an empty memo holds nothing");
         if !linearizable(&events, &before, 0, root, &mut memo) {
             panic!(
@@ -160,7 +149,33 @@ const NONE: u32 = u32::MAX;
 /// of pairs needs a second clone to keep one while the search goes on with the other.
 struct Memo<S> {
     seen: Vec<(u64, S, u32)>,
-    first: HashMap<u64, u32, Global>,
+    /// Keyed by the pair's hash, so an ordered map needs no hasher of its own. The model
+    /// checker sits below blaze-hash (whose table is checked by it), so it cannot use its maps.
+    first: BTreeMap<u64, u32>,
+}
+
+/// The memo's hash of a pair: a multiply and fold per word. Pairs with one hash are told apart
+/// by comparing them (the chain in `seen`), so its quality costs time, never a wrong answer.
+struct Mix(u64);
+
+impl Hasher for Mix {
+    fn finish(&self) -> u64 {
+        self.0 ^ (self.0 >> 29)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(u64::from(byte));
+        }
+    }
+
+    fn write_u64(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(23) ^ word).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+
+    fn write_usize(&mut self, word: usize) {
+        self.write_u64(word as u64);
+    }
 }
 
 impl<S: Spec> Memo<S> {
@@ -171,7 +186,9 @@ impl<S: Spec> Memo<S> {
                   refusal from the linearizability check"
     )]
     fn insert(&mut self, done: u64, state: S) -> Option<u32> {
-        let hash = FixedState.hash_one((done, &state));
+        let mut mix = Mix(0);
+        (done, &state).hash(&mut mix);
+        let hash = mix.finish();
         let at = u32::try_from(self.seen.len()).expect("a memo of fewer than 2^32 states");
         match self.first.entry(hash) {
             Entry::Occupied(mut head) => {

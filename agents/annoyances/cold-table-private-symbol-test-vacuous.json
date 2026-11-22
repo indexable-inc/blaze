@@ -1,0 +1,15 @@
+{
+ "id": "cold-table-private-symbol-test-vacuous",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), writer of D169 (the meter)",
+ "where": "crates/blaze-sys/src/macos.rs: the cold table's #[no_mangle] entries and the test every_declared_symbol_exists (dlsym RTLD_DEFAULT)",
+ "what": "Adding a private call (thread_selfcounts) to the cold table, the natural step is to list it in SYMBOLS so the existence test covers it. But the cold table defines a #[no_mangle] symbol of the same name in this binary, so dlsym(RTLD_DEFAULT) finds blaze's own definition and the test passes even where libSystem lacks the call. Also: an earlier note said ru_minflt is rest[4] of the Linux rusage tail; rest starts at ru_ixrss, so minflt is rest[3] and majflt rest[4].",
+ "cost": "about a quarter of an hour to see the existence test would be vacuous",
+ "cause": "one test resolves by RTLD_DEFAULT while the cold table shadows the names it checks",
+ "whys": "the cold table was added after the existence test; nothing says a cold name must be checked with RTLD_NEXT",
+ "class": "a symbol-existence check that can find the checker's own definition",
+ "prevention": "done for this call: COLD_PRIVATE lists cold private calls, and the_meters_calls_exist_and_answer resolves them with RTLD_NEXT; wanted: every cold entry checked by RTLD_NEXT in one test",
+ "annoyance": "none beyond the above",
+ "workaround": "check cold names with dlsym(RTLD_NEXT)",
+ "state": "open"
+}

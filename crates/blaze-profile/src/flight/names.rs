@@ -24,7 +24,7 @@
 
 use std::{alloc::Global, sync::Arc};
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 
 use super::{KIND_PLOT, WORDS};
 
@@ -165,8 +165,8 @@ pub struct Local {
     from: u64,
     /// The next index to give.
     next: u16,
-    texts: HashMap<Box<str>, u16, Global>,
-    links: HashMap<Token, u16, Global>,
+    texts: Map<Box<str>, u16, FixedState, Global>,
+    links: Map<Token, u16, FixedState, Global>,
     /// [`GEN_ROWS`] and [`INDEX_MAX`], smaller in the DST so it reaches many generations.
     gen_rows: u64,
     index_max: u16,
@@ -190,9 +190,9 @@ impl Local {
             // Past the last index: the first name begins a generation.
             next: index_max + 1,
             // alloc: once per thread that names, its table for one generation at a time
-            texts: HashMap::new_in(Global),
+            texts: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             // alloc: as above
-            links: HashMap::new_in(Global),
+            links: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             gen_rows: gen_rows.max(1),
             index_max,
             plant: Plant::None,
@@ -511,7 +511,7 @@ pub struct Streams {
     plant: Plant,
     /// Texts of names open spans hold ([`Streams::hold`]), and the read they were last held at:
     /// a span open past [`RETAIN`] generations of its ring still reads its names as it closes.
-    held: HashMap<Token, (Arc<str>, u64), Global>,
+    held: Map<Token, (Arc<str>, u64), FixedState, Global>,
     /// Reads [`Streams::hold`] was told of.
     reads: u64,
     /// Ids no definition held resolves: written over unread, of a generation let go, or after

@@ -19,7 +19,7 @@
 //! with the cache that emptied it and fills its next spill; descriptors move between caches
 //! four at a time, so the empty stack costs a quarter of a compare-and-swap per batch.
 
-use std::{
+use core::{
     fmt,
     marker::PhantomData,
     mem,
@@ -271,7 +271,7 @@ impl<'p, T> Cache<'p, T> {
     /// Takes the value out and keeps its slot for the next allocation.
     #[inline]
     pub fn free(&mut self, pooled: Pooled<'p, T>) -> T {
-        debug_assert!(std::ptr::eq(pooled.pool, self.pool), "a Pooled of another pool");
+        debug_assert!(core::ptr::eq(pooled.pool, self.pool), "a Pooled of another pool");
         let pooled = mem::ManuallyDrop::new(pooled);
         // SAFETY: the slot holds the value `pooled` owned, read out once; `pooled` is
         // forgotten, so it neither drops the value nor returns the slot.
@@ -724,7 +724,7 @@ impl<'p, T> Limbo<'p, T> {
     /// batch). A grace older than one held already is held as the newer one: later, never
     /// sooner.
     pub fn hold(&mut self, grace: Grace, pooled: Pooled<'p, T>) {
-        assert!(std::ptr::eq(pooled.pool, self.cache.pool), "a Pooled of another pool");
+        assert!(core::ptr::eq(pooled.pool, self.cache.pool), "a Pooled of another pool");
         let pooled = mem::ManuallyDrop::new(pooled);
         let grace = match self.held.last() {
             Some(last) if self.head < self.held.len() => grace.max(last.grace),

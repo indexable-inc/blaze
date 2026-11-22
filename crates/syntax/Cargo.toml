@@ -18,16 +18,11 @@ blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
 blaze-phf.workspace = true
-crossbeam-channel.workspace = true
-either.workspace = true
-itertools.workspace = true
+# The one channel (`blaze_core::chan`): the thread that drops parsed trees.
+blaze-core.workspace = true
 rustc_lexer.workspace = true
 syntax-tree.workspace = true
-rustc-literal-escaper.workspace = true
-smol_str.workspace = true
-triomphe.workspace = true
-tracing.workspace = true
-smallvec.workspace = true
+blaze-trace.workspace = true
 
 parser.workspace = true
 stdx.workspace = true
@@ -35,7 +30,6 @@ stdx.workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-graph.workspace = true
-expect-test.workspace = true
 rustc_apfloat.workspace = true
 
 test-utils.workspace = true

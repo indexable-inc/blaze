@@ -1,0 +1,10 @@
+{
+  "date": "2026-11-20",
+  "model": "claude-opus-5-5",
+  "lane": "wave-1124-sansio T0 (make the gate real), the no_std check of D173",
+  "area": "tools/ratchets/, scripts/src/bin/ambient/sansio.rs, scripts/src/bin/thirdparty.rs, the root justfile",
+  "annoyance": "tools/ratchets/sans-io.txt, which the CI step `sans-IO and bstd only go down` checks, was never written: the step fails on any tree until `sansio-write` runs. There was no one command that runs the whole gate by hand (no justfile), so a lane could not tell which lists its change moves without reading the workflow; and nothing computed which crates the shipped binaries reach, though D170 and D173 judge only those.",
+  "workaround": "T0 adds `just lint`, `just lint-write` and `just lint-report`; thirdparty.rs writes tools/ratchets/reached.txt (the crates blaze-cli and blaze-launcher reach by normal and build dependencies) and its `check` holds it to the manifests; sansio.rs reads it for the `bare` column. The first `just lint-write` makes sans-io.txt and reached.txt.",
+  "fix": "A gate step that every file the gate reads exists and has a writer the gate runs; `just lint` as the one local entry, kept equal to the CI steps by a test that compares their lists of commands.",
+  "state": "open"
+}

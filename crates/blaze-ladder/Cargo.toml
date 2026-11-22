@@ -1,0 +1,125 @@
+[package]
+name = "blaze-ladder"
+description = "The `blaze run` walking skeleton (crates/blaze-cli/tests/ladder/README.md): a program's source files to running code in this process, through the new layer's pieces in a straight line; its own lowering and world stand in for blaze-lower and the item layer until they answer, each named in the README's shortcut list"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# The producers this crate's code makes values for (decision D105,
+# docs/v2/plan/design/producer-id.md): front2 checks bodies and the run path builds code, both
+# here, so both rows hold the whole crate until it is split.
+[package.metadata.blaze]
+producer = ["body-checker", "code-builder"]
+
+[lib]
+doctest = false
+
+[dependencies]
+# The profile's `panic` as the root manifest writes it (`layout::panic::ProfilePanic`):
+# `panic_strategy::of_profile` maps it to the builder's strategy. The bare reader only.
+blaze-manifest = { workspace = true, default-features = false }
+# `outline`: each file's items, and the parser's events for bodies and signatures.
+blaze-file-items.workspace = true
+blaze-surface.workspace = true
+# The impl tables' lookups (front2/buckets/records.rs, engine.md E3): `candidates_in` over the
+# records blaze-surface writes.
+blaze-impls.workspace = true
+# The engine's task and result (engine.md, D131): the body task (front2/tables/task.rs) is
+# entered as a `Task` and answers a `Done`.
+blaze-engine.workspace = true
+# The checker's one ask (D161): the census a body task's meter keeps (front2 tables/cost.rs).
+blaze-ask.workspace = true
+# The engine's names, kinds, keys and cells (blaze-drive key.rs, cells.rs): the impl tables
+# task's result in the engine's form (front2/buckets/records.rs `impl_tables_task`), and the
+# body task's reads as `Name`/`Cell` ids.
+blaze-drive.workspace = true
+parser.workspace = true
+# The body form, the checker and its type context (`InferCtx`).
+blaze-typeck = { workspace = true }
+# front2/tables/goals.rs: the shared goal table implements the solver's `GoalShare` seam
+# (tests/front2_solver_cost.rs names its question kinds too).
+blaze-solve = { workspace = true }
+blaze-own = { workspace = true, features = ["std"] }
+# Signatures and bodies lowered from text, and bodies converted to the checker's form.
+blaze-lower.workspace = true
+blaze-hash.workspace = true
+# The command's frame: a body's local items are kept in it for the command (front2/locals.rs).
+blaze-mem.workspace = true
+# A checked body to LIR, and LIR to AArch64 code (the baseline tier).
+blaze-build.workspace = true
+# front2/borrows.rs: a checked body lowered to its flow, then the move and borrow checks.
+blaze-flow.workspace = true
+blaze-flow-lower.workspace = true
+# R4 (run.md): the checked body lowered once to blaze-body's form and kept with its table
+# (front2 tables/task.rs `keep_checked`).
+blaze-body.workspace = true
+blaze-body-lower.workspace = true
+blaze-emit.workspace = true
+# The code record's form (`bzcode03`) and its declared section (D106): `declare`, `Declares`.
+blaze-tier.workspace = true
+# A `const` item's value: evaluated once, its record the build reads (`Adts::const_value`).
+blaze-consteval.workspace = true
+# The slot table and code area the program's bodies are placed in, and its wire types.
+blaze-launch.workspace = true
+blaze-launch-rt.workspace = true
+# `Executable`: dual-mapped W^X in-process code execution for Tier 0 direct LIR comptime (zero libc).
+blaze-inproc.workspace = true
+# `ContentId`: a placed body's record id, by its bytes.
+blaze-ids.workspace = true
+# The program's native library record (src/natives.rs, NATIVE.md W7): blaze-native's readers, resolve
+# and layout, blaze-export's Mach-O dylib writer, and the build script's outputs record it reads.
+blaze-native.workspace = true
+blaze-export.workspace = true
+blaze-build-script.workspace = true
+# Code records (src/code_records.rs): `Symbol`, the sealed record and its reader. By path, as
+# blaze-emit names it: it has no workspace entry.
+blaze-code.workspace = true
+# `Tier`: the tier a code record's key names (src/code_records.rs).
+blaze-run.workspace = true
+# `Func`: the LIR a code record is emitted from, an instance's or the thread-local getter's
+# (src/code_records.rs `make_entry`).
+blaze-lir.workspace = true
+blaze-sys.workspace = true
+# `dlsym`: an outside symbol's address in this process.
+libc.workspace = true
+# The program's crates: the toolchain's verified packs, their units and edition rule, and
+# every crate's names resolved together (src/crates.rs).
+blaze-toolchain.workspace = true
+blaze-fetch.workspace = true
+blaze-unit-graph.workspace = true
+edition.workspace = true
+blaze-scope.workspace = true
+blaze-id.workspace = true
+# A body's macro calls expanded through the names library (front2/body.rs: blaze-lower's
+# `Scoped` and `ByName`, whose host is an `ExpandCx`).
+blaze-expand.workspace = true
+# crates.rs `DirShelf`: the toolchain's packs mapped read-only (`blaze_core::Mapping`), never
+# copied to the heap.
+blaze-core.workspace = true
+
+[dev-dependencies]
+# The store the command keeps records in (`plain::Driven`, `plain::Lent`), for the tests that
+# write and read records through it.
+blaze-cas.workspace = true
+blaze-sim.workspace = true
+# tests/hosted.rs: the host table a hosted rung is started with, its calls recorded.
+blaze-std.workspace = true
+# tests/front2_borrows.rs: `blaze_own::testing::heap()`, the test's root allocator.
+blaze-own = { workspace = true, features = ["std", "testing"] }
+# tests/toolchain_store/mod.rs: the `names` producer's digest in the prepared std world's key.
+blaze-producers.workspace = true
+
+[features]
+# D161 step 3's oracle over every body any test checks (front2 tables/task.rs `compare_asks`):
+# each body run under `AsksMet::Again` and `AsksMet::Once` first, a difference a panic naming
+# the body, what the one ask made and both results. `cargo test -p blaze-ladder --features
+# asks-oracle` is the ONE entry: no fixture is skipped, none is listed.
+asks-oracle = []
+
+[lints]
+workspace = true

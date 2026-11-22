@@ -14,8 +14,13 @@
 //! shift-and-mask steps (the unrolled form of protobuf's `ReadVarint64` and `varint-simd`, no
 //! BMI2 `pext`, which is slow on AMD before Zen 3). The encode is the same steps backwards and
 //! one 8-byte store. docs/v2/plan/design/data.md gives the bound.
+//!
+//! The writers append to `blaze_own::Vec<u8, A>` in the caller's allocator ([`write_u64_in`],
+//! [`write_i64_in`]); the `std` feature keeps the deprecated forms over `std`'s `Vec<u8>` for
+//! the callers not yet ported.
 
-use std::fmt;
+use core::alloc::Allocator;
+use core::fmt;
 
 /// The most bytes a 64-bit value takes.
 pub const MAX_LEN: usize = 10;
@@ -54,7 +59,7 @@ impl fmt::Display for LebError {
     }
 }
 
-impl std::error::Error for LebError {}
+impl core::error::Error for LebError {}
 
 /// How many bytes `value` takes unsigned.
 #[inline]
@@ -108,39 +113,129 @@ const fn encode(value: u64, len: usize, signed: bool) -> [u8; MAX_LEN] {
     [word[0], word[1], word[2], word[3], word[4], word[5], word[6], word[7], ninth, tenth]
 }
 
-/// Appends the first `len` of `bytes`: one 8-byte store when the vector has room for 8, so a
-/// vector sized exactly never grows for it.
-#[inline]
-fn append(out: &mut Vec<u8>, bytes: &[u8; MAX_LEN], len: usize) {
-    if len <= 8 && out.capacity() - out.len() >= 8 {
-        let start = out.len();
-        out.extend_from_slice(&bytes[..8]);
-        out.truncate(start + len);
-    } else {
-        out.extend_from_slice(&bytes[..len]);
+/// What the writers append to: blaze's own `blaze_own::Vec<u8, A>`, and `alloc`'s `Vec<u8>`
+/// until its callers pass an allocator. Private: one body per writer, two buffers under it.
+trait Bytes {
+    fn filled(&self) -> usize;
+    fn room(&self) -> usize;
+    fn push_byte(&mut self, byte: u8);
+    fn append_slice(&mut self, bytes: &[u8]);
+    fn cut(&mut self, len: usize);
+}
+
+// to remove: callers pass an allocator (bstd move); the `std` feature's, deprecated.
+#[cfg(feature = "std")]
+impl Bytes for std::vec::Vec<u8> {
+    #[inline]
+    fn filled(&self) -> usize {
+        self.len()
+    }
+    #[inline]
+    fn room(&self) -> usize {
+        self.capacity()
+    }
+    #[inline]
+    fn push_byte(&mut self, byte: u8) {
+        self.push(byte);
+    }
+    #[inline]
+    fn append_slice(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+    #[inline]
+    fn cut(&mut self, len: usize) {
+        self.truncate(len);
     }
 }
 
-/// Appends `value` unsigned.
+impl<A: Allocator> Bytes for blaze_own::Vec<u8, A> {
+    #[inline]
+    fn filled(&self) -> usize {
+        self.len()
+    }
+    #[inline]
+    fn room(&self) -> usize {
+        self.capacity()
+    }
+    #[inline]
+    fn push_byte(&mut self, byte: u8) {
+        self.push(byte);
+    }
+    #[inline]
+    fn append_slice(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+    #[inline]
+    fn cut(&mut self, len: usize) {
+        self.truncate(len);
+    }
+}
+
+/// Appends the first `len` of `bytes`: one 8-byte store when the vector has room for 8, so a
+/// vector sized exactly never grows for it.
 #[inline]
-pub fn write_u64(out: &mut Vec<u8>, value: u64) {
+fn append<B: Bytes>(out: &mut B, bytes: &[u8; MAX_LEN], len: usize) {
+    if len <= 8 && out.room() - out.filled() >= 8 {
+        let start = out.filled();
+        out.append_slice(&bytes[..8]);
+        out.cut(start + len);
+    } else {
+        out.append_slice(&bytes[..len]);
+    }
+}
+
+#[inline]
+fn push_u64<B: Bytes>(out: &mut B, value: u64) {
     if value < 0x80 {
-        out.push(value as u8);
+        out.push_byte(value as u8);
         return;
     }
     let len = len_u64(value);
     append(out, &encode(value, len, false), len);
 }
 
-/// Appends `value` signed.
 #[inline]
-pub fn write_i64(out: &mut Vec<u8>, value: i64) {
+fn push_i64<B: Bytes>(out: &mut B, value: i64) {
     if (-64..64).contains(&value) {
-        out.push(value as u8 & 0x7f);
+        out.push_byte(value as u8 & 0x7f);
         return;
     }
     let len = len_i64(value);
     append(out, &encode(value as u64, len, true), len);
+}
+
+/// DEPRECATED (the `std` feature): appends `value` unsigned to a vector on the global heap.
+/// [`write_u64_in`] replaces it.
+// to remove: callers pass an allocator (bstd move): they hold a `blaze_own::Vec` and call
+// [`write_u64_in`].
+#[cfg(feature = "std")]
+#[inline]
+pub fn write_u64(out: &mut std::vec::Vec<u8>, value: u64) {
+    push_u64(out, value);
+}
+
+/// DEPRECATED (the `std` feature): appends `value` signed to a vector on the global heap.
+/// [`write_i64_in`] replaces it.
+// to remove: callers pass an allocator (bstd move): they hold a `blaze_own::Vec` and call
+// [`write_i64_in`].
+#[cfg(feature = "std")]
+#[inline]
+pub fn write_i64(out: &mut std::vec::Vec<u8>, value: i64) {
+    push_i64(out, value);
+}
+
+/// Appends `value` unsigned to `out`, a vector in the caller's allocator: the same bytes as
+/// [`write_u64`].
+#[inline]
+pub fn write_u64_in<A: Allocator>(out: &mut blaze_own::Vec<u8, A>, value: u64) {
+    push_u64(out, value);
+}
+
+/// Appends `value` signed to `out`, a vector in the caller's allocator: the same bytes as
+/// [`write_i64`].
+#[inline]
+pub fn write_i64_in<A: Allocator>(out: &mut blaze_own::Vec<u8, A>, value: i64) {
+    push_i64(out, value);
 }
 
 /// Writes `value` unsigned at the start of `place`, touching only the bytes it takes, and says

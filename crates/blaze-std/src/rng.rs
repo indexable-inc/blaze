@@ -1,7 +1,8 @@
 //! Random numbers (docs/v2/plan/design/std.md, `Rng`): blaze's one SplitMix64, forked from
-//! the world's generator. Seeded in the simulation; on a real driver seeded by the entry
-//! ([`crate::io::NativeWorld::seed`]) until blaze-core has an effect that asks the system for
-//! randomness. Not for keys or anything an attacker may predict.
+//! the world's generator. Seeded in the simulation; on a real driver by one `Effect::Random`
+//! of the system's secure source at the first ask ([`crate::io::Io::rng`]). Not for keys or
+//! anything an attacker may predict: every output inverts to the generator's state, and every
+//! generator of a world forks from one stream. A hash key is [`crate::io::Io::sip_key`].
 //!
 //! The generator itself is re-exported as it is ([`SplitMix64`], its [`mix`] and [`GAMMA`]),
 //! for a sans-IO core that is handed a seed rather than the capability.

@@ -24,14 +24,38 @@ blaze-keyed.workspace = true
 blaze-ids.workspace = true
 # Hex.
 blaze-format.workspace = true
-# Ed25519 (statements, roots, key lists), SHA-256 and HMAC (SigV4).
-ring.workspace = true
+# Ed25519 verification (statements, roots, key lists, bundles, heads), written here: no feature,
+# no third-party code (remote-read.md, "Ed25519, written here").
+blaze-ed25519.workspace = true
+# Only what holds a secret: Ed25519 signing (a builder's or anchor's seed) and SigV4's
+# SHA-256 and HMAC (the bucket's secret key). Linked only under `sign` (remote-read.md;
+# bottom.md's exceptions); blaze writes no signer of its own.
+ring = { workspace = true, optional = true }
 # The HTTP driver: blaze-http's sans-IO client on its driver on blaze-core's effects.
-blaze-http.workspace = true
-http.workspace = true
+blaze-http = { workspace = true, optional = true }
+# blaze's one channel (`chan`), on which the HTTP driver hands back each ask's answer.
+blaze-core = { workspace = true, optional = true }
+# The allocator as a value (`Alloc<'_>`) and the owning types the read path keeps its tables in.
+blaze-own.workspace = true
 # Settings and the commands' typed input.
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
+blaze-data.workspace = true
+blaze-json.workspace = true
+
+[features]
+# The bucket's HTTP drivers (S3 over HTTP/1.1, anonymous reads over HTTP/3) and `blaze cache`'s
+# entry point over them. Off for the binary's read path (`read`, a folder origin), which then
+# brings no TLS or QUIC stack (remote-read.md).
+default = ["bucket"]
+# A bucket's drivers sign every request (SigV4) and a pusher signs what it pushes.
+bucket = ["dep:blaze-http", "dep:blaze-core", "blaze-http/h3", "sign"]
+# Code that holds a secret key: `Signer`, pushing (`push`, `cmd`, `settings`, `s3`), the
+# encoders of signed objects, and `read::publish`. Off, nothing of `ring` is linked; every
+# verification is on in both shapes.
+sign = ["dep:ring"]
+
+[[example]]
+name = "seal_origin"
+required-features = ["sign"]
 
 [dev-dependencies]
 # An independent SHA-256 for the SigV4 test's own HMAC chain (the signer uses `ring`'s).

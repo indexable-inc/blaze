@@ -1,0 +1,31 @@
+[package]
+name = "blaze-sort"
+description = "blaze's sorting, searching and comparing, the algorithm chosen by the element type: radix sorts for keys with an order-preserving unsigned image (`RadixKey`), a stable radix sort by key for any type, branch-free search, vector `position`, `==` and `cmp` for plain keys; a fast path is taken only where its result equals the general path's for every input; `no_std`, scratch only from a named allocator"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `Alloc<'_>`, the allocator handle a sort's scratch comes from, `RawBuf` and `AllocFailure`.
+blaze-own.workspace = true
+# `PlainKey`: `==` is byte equality, the condition of the vector `position`, `==` and `cmp`.
+# By path, without the workspace entry's `serde` and `shared` features (as blaze-kit takes it).
+blaze-hash.workspace = true
+# `u8` search for one-byte plain keys.
+blaze-memchr.workspace = true
+
+[dev-dependencies]
+blaze-own = { workspace = true, features = ["std", "testing"] }
+blaze-rng.workspace = true
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

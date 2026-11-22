@@ -1,13 +1,13 @@
 //! [`KeyIndex`]: a page of a crate's index of its items' keys, one per module, so finding an
 //! item from its key ([`crate::Items::place`], blaze-id's `resolve`) is one probe.
 
-use core::alloc::Allocator;
 use core::mem::offset_of;
 
-use blaze_format::{FormatError, Slice, Writer};
+use blaze_format::{FormatError, Slice, Writer, WriterOpts};
 use blaze_id::{ContentId, ItemKey};
+use blaze_own::{AVec, Alloc};
 
-use crate::column::{Column, check_increasing, finish_with, key_of_word, key_word};
+use crate::column::{Column, RecordBytes, check_increasing, finish_with, key_of_word, key_word};
 use crate::error::BuildError;
 use crate::kind::{Place, PlaceTag};
 
@@ -44,15 +44,15 @@ pub struct KeyEntry {
 /// The writer of a module's [`KeyIndex`] page: the keys of its items (and of the items inside
 /// them: variants, fields, associated items). Sorted by key at the end; two places for one key
 /// are refused.
-pub struct KeyIndex<A: Allocator + Clone> {
+pub struct KeyIndex<'a> {
     module: ItemKey,
-    rows: Vec<KeyRow, A>,
-    alloc: A,
+    rows: AVec<'a, KeyRow>,
+    alloc: Alloc<'a>,
 }
 
-impl<A: Allocator + Clone> KeyIndex<A> {
-    pub fn new_in(module: ItemKey, alloc: A) -> KeyIndex<A> {
-        KeyIndex { module, rows: Vec::new_in(alloc.clone()), alloc }
+impl<'a> KeyIndex<'a> {
+    pub fn new_in(module: ItemKey, alloc: Alloc<'a>) -> KeyIndex<'a> {
+        KeyIndex { module, rows: AVec::new_in(alloc), alloc }
     }
 
     pub fn entry(&mut self, entry: KeyEntry) {
@@ -67,14 +67,14 @@ impl<A: Allocator + Clone> KeyIndex<A> {
         });
     }
 
-    pub fn finish(mut self) -> Result<Vec<u8, A>, BuildError> {
+    pub fn finish(mut self) -> Result<RecordBytes<'a>, BuildError> {
         self.rows.sort_unstable_by_key(|row| (row.key, row.parent, row.origin, row.index, row.place));
         self.rows.dedup();
         if let Some(pair) = self.rows.windows(2).find(|pair| pair[0].key == pair[1].key) {
             return Err(BuildError::Twice { table: "KeyIndex rows", key: pair[1].key });
         }
         crate::column::count(self.rows.len(), "KeyIndex rows")?;
-        let mut out = Writer::new_in(<KeyIndexRoot as blaze_format::Record>::SCHEMA, self.alloc.clone());
+        let mut out = Writer::new(WriterOpts { schema: <KeyIndexRoot as blaze_format::Record>::SCHEMA, alloc: self.alloc, capacity: None });
         let rows = Column::push(&mut out, &self.rows);
         Ok(finish_with(out, |at| KeyIndexRoot {
             module: self.module.0,

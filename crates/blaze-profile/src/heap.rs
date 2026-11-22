@@ -296,7 +296,7 @@ pub(crate) fn site<'a>(mut innermost_first: impl Iterator<Item = &'a str>) -> Op
 /// ([`crate::symbols::frames`]: outermost first, so an inlined function's come last).
 pub(crate) fn site_of<'a>(
     pcs: &[u64],
-    frames: &'a blaze_hash::HashMap<u64, Vec<String>, std::alloc::Global>,
+    frames: &'a blaze_hash::Map<u64, Vec<String>, blaze_hash::FixedState, std::alloc::Global>,
 ) -> Option<&'a str> {
     site(pcs.iter().enumerate().flat_map(|(i, pc)| {
         frames

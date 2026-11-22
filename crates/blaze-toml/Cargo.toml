@@ -1,0 +1,34 @@
+[package]
+name = "blaze-toml"
+description = "TOML 1.0 as a format: a reader into a document that keeps every key's and value's byte range in columns (tables, arrays of tables, inline tables, dotted keys, every string form, integers in every radix, floats with inf and nan, typed dates and times), lowered to blaze-data's `Value` on demand; a writer of a `Value` as a document or an inline value; and an editor that sets a key or adds to an array keeping every other byte; typed errors with byte offset and line; bounded; `no_std`, no `alloc`"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The format-neutral value a document lowers to and the writer writes.
+blaze-data.workspace = true
+# `Soa` columns for the document's nodes; `String` and `Vec` in the caller's allocator.
+blaze-own.workspace = true
+# The errors' and datetimes' text: `Show`, with `Shown` for `Display` where `core::error::Error`
+# and `{}` users want it.
+blaze-text.workspace = true
+
+[dev-dependencies]
+# Properties: write then read gives a value back, and an edit changes only what it names;
+# with a planted-bug control.
+blaze-sim.workspace = true
+# `testing::every_failure`: each allocation of a parse refused in turn comes back as the
+# document's typed memory error, never a panic.
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

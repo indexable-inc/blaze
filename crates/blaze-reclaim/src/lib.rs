@@ -24,8 +24,15 @@
     unsafe,
     reason = "epoch reclamation: the per-thread slot blocks are leaked and never freed, so a `&'static` to one is sound, and a retired value is freed (`Box::from_raw`) only once its grace has passed and no task can still read it"
 )]
+// Not yet `#![no_std]`, `#![blaze::sans_io]` or the deny lints: the domain is process state
+// (`EPOCH`, `FIRST`, the thread-local `LOCAL` and `SCANS`) and `Limbo`, `Passed` and the slot
+// blocks are on the global heap. They go as one port with the four users (blaze-graph's
+// scheduler, blaze-mem, blaze-hash, blaze-std): a `Domain` value the executor owns and hands
+// in, each worker's slot a value its context carries (as `park`/`unpark` already move it), and
+// `Limbo<A>` with a named allocator; proven by the model-checker DST in `model.rs` (rule 43)
+// before it lands (wave-1124-sansio, W1 group a's report).
 
-use std::{cell::Cell, marker::PhantomData, mem::ManuallyDrop, num::NonZeroUsize, ptr};
+use core::{cell::Cell, marker::PhantomData, mem::ManuallyDrop, num::NonZeroUsize, ptr};
 
 use crate::sync::{
     atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence},
@@ -84,7 +91,7 @@ impl Block {
 }
 
 fn blocks() -> impl Iterator<Item = &'static Block> {
-    std::iter::successors(Some(&FIRST), |block| block.next())
+    core::iter::successors(Some(&FIRST), |block| block.next())
 }
 
 /// A slot no thread holds, taken for this one.

@@ -9,7 +9,7 @@
 //! ```text
 //! error: llvm-sys can't find LLVM  [llvm: pin]
 //!   ┌ build script of llvm-sys 231.0.1  (vendor/llvm-sys)
-//!   │ needs LLVM 23.1.4 (e152d9fa), pinned in crates/hir-ty-codegen/llvm.json
+//!   │ needs LLVM 23.1.4 (e152d9fa), pinned in pins/llvm.json
 //!   │ LLVM_SYS_231_PREFIX is not set
 //!   └ blocks 247 packages, including blaze-engine
 //!
@@ -45,18 +45,22 @@
 //! said, from the global heap.
 
 #![forbid(unsafe_code)]
-#![feature(register_tool, custom_inner_attributes)]
+#![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 // The field order promised above, held by `blaze::cbor_field_order`.
 #![blaze::canonical_cbor]
 
+pub mod finding;
+pub mod frame;
 pub mod out;
 pub mod palette;
+pub mod query;
 mod render;
 pub mod rules;
 pub mod say;
 pub mod script;
 pub mod terminal;
+pub mod ui;
 #[cfg(test)]
 mod tests;
 

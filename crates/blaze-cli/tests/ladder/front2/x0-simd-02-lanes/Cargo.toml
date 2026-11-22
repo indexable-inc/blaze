@@ -1,0 +1,4 @@
+[package]
+name = "ladder-x0-simd-02-lanes"
+version = "0.1.0"
+edition = "2024"

@@ -1,0 +1,13 @@
+[0;1;36mnote  [0mtake a slice: [0;2m`[0;1m&[String][0;2m`[0m
+[0;1;33mwarning  [0mthis [0;2m`[0;1m.clone()[0;2m` [0mcopies a vector
+         only read
+  [0;2m,- [0msrc/copy.rs[0;2m:1:16[0m
+[0;2m1 | [0mfn copy[0;2m([0mnames[0;2m: [0;1m&Vec<String>[0;2m) -> [0mu[0;2m...[0m
+  [0;2m|                [0;36m^^^^^^^^^^^^[0m
+  [0;2m| [0;36mtake a slice: `&[String]`[0m
+[0;32m+ [0;2m| fn copy(names: [0;2;9m&Vec<String>[0;32m&[Stri[0;2m...[0m
+[0;2m2 |     [0mlet names [0;2m= [0mnames[0;1m.clone()[0;2m;[0m
+  [0;2m|                      [0;33m^^^^^^^^[0m
+  [0;2m|                      `- [0;33mnot needed[0m
+[0;32m+ [0;2m|     let names = names[0;2;9m.clone()[0;2m;[0m
+  [0;2m`- blaze explain lint:slices[0m

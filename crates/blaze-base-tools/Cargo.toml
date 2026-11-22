@@ -1,0 +1,34 @@
+[package]
+name = "blaze-base-tools"
+description = "The one home of the pinned base tool set a sandboxed build step runs (D192, docs/v2/plan/design/base-tools.md): pins/base-tools.json read into a `BaseSet` (a PENDING set a typed refusal), a program obtained only from the set (a missing one the `command not found` a machine without it prints), the step's guest PATH and fixed environment, the Seatbelt lines that grant the set's folder and nothing of the OS, the fixed uname and hostname answers, and the key part a step that ran a program must hold (a linear token); `no_std`, no `alloc`, sans-IO"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `Alloc`, `AVec`, `AString`: every owner in the caller's allocator.
+blaze-own.workspace = true
+# pins/base-tools.json read with the tree's no_std pull reader and written with its event
+# writer (the schema's round trip).
+blaze-json.workspace = true
+# `Int`: the archive's size as a JSON integer, exactly.
+blaze-data.workspace = true
+# The checked-in pins/base-tools.json (the one crate that includes a pin file).
+blaze-pins.workspace = true
+# A step's tools part: the set's digest and what came from the machine, hashed under one domain.
+blaze-blake3.workspace = true
+
+[dev-dependencies]
+# `blaze_own::testing::heap()`: a test's root allocator (D102), in place of `Global`.
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

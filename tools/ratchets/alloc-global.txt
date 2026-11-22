@@ -1,0 +1,30 @@
+# The calls that reach the process's heap with no caller handing it (decision D102, rule 75),
+# outside test code, by crate (its directory under crates/): `Alloc::global()`,
+# `SharedAlloc::global()`, `testing::heap()` (a test's root) and `Heap::process()` (the
+# program's entry's); and `Root::leak(` (a root heap made `'static`), in test code too.
+# Only falls; a crate with no row is held to 0 in every column.
+# Written by scripts/src/bin/ambient.rs (`{"command": "heap-write"}`), checked by
+# `{"command": "heap-check"}`.
+# crate	global	shared_global	test_heap	process	leak
+blaze-build-script	1	0	0	0	0
+blaze-cli	47	11	0	0	0
+blaze-consteval	9	0	0	0	0
+blaze-emit	1	0	0	0	0
+blaze-expand	16	0	0	0	0
+blaze-export	4	0	0	0	0
+blaze-fetch	2	0	0	0	0
+blaze-file-items	1	0	0	0	0
+blaze-ladder	126	0	0	0	0
+blaze-launch-rt	1	0	0	0	0
+blaze-launcher	0	1	0	0	0
+blaze-lower	7	0	0	0	0
+# RT1 (2026-11-17): src/root_tests.rs `a_leaked_root_gives_static_handles`, the one test of the leak form itself.
+blaze-mem	0	0	0	0	1
+blaze-proc-macro	28	0	0	0	0
+blaze-profile	2	0	0	0	0
+blaze-real	49	0	0	0	0
+blaze-scope	3	0	0	0	0
+blaze-solve	3	0	0	0	0
+blaze-std	0	0	0	2	0
+blaze-typeck	7	0	0	0	0
+blaze-world	3	0	0	0	0

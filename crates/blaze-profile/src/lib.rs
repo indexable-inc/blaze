@@ -27,9 +27,9 @@
 use std::{path::Path, sync::OnceLock, time::Instant};
 
 pub mod account;
-pub mod arrow;
 pub mod batches;
 pub mod clock;
+pub mod columns;
 pub mod crash;
 pub mod describe;
 pub mod diff;
@@ -48,6 +48,7 @@ pub mod logs;
 pub mod memory;
 pub mod panics;
 pub mod perf;
+pub mod pgo;
 pub mod reading;
 pub mod sampler;
 pub mod schema;
@@ -67,6 +68,7 @@ pub mod views;
 pub mod watchdog;
 
 pub use flight::{FiberStack, Plot, fiber_stack, moved, plot};
+pub use pgo::{PgoError, PgoProfile, SiteWeight};
 pub use watchdog::{Stall, Watchdog};
 
 /// When this process began, as near as it can tell: the first call, which `main` makes.
@@ -78,7 +80,9 @@ pub fn began() -> Instant {
 /// Has every info-level span of the target `blaze` and every rust-analyzer query kept by the
 /// flight recorder, and carries fiber jobs' spans with them.
 pub fn install() {
-    _ = tracing::subscriber::set_global_default(Recorder);
+    // The process's one entry sink (blaze_trace, "The one ambient hook"); a second install
+    // (another test of the same binary) finds it there already.
+    _ = blaze_trace::install(&Recorder);
     carry_with_fiber_jobs();
 }
 
@@ -299,10 +303,18 @@ pub fn built(built: Built) {
 pub fn thread_cpu() -> Option<u64> {
     #[cfg(unix)]
     {
+        #[cfg(target_os = "macos")]
+        {
+            let at = blaze_sys::posix::io::clock_gettime(blaze_sys::posix::io::ClockId::ThreadCpu).ok()?;
+            return Some((at.sec as u64) * 1_000_000_000 + at.nsec as u64);
+        }
+        #[cfg(target_os = "linux")]
+        {
         let mut at = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         // SAFETY: `at` is a timespec to write.
         if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut at) } == 0 {
             return Some(at.tv_sec as u64 * 1_000_000_000 + at.tv_nsec as u64);
+        }
         }
     }
     None
@@ -315,7 +327,7 @@ struct Recorder;
 impl Recorder {
     /// A span is kept at [`LEVEL`] or above by [`keeps`]; an event by [`logs::keeps_event`]:
     /// WARN and ERROR of any target, INFO by `keeps`, DEBUG of a `blaze` target that opts in.
-    fn wanted(meta: &tracing::Metadata<'_>) -> bool {
+    fn wanted(meta: &blaze_trace::Metadata<'_>) -> bool {
         if meta.is_event() {
             logs::keeps_event(meta.target(), meta.name(), *meta.level())
         } else {
@@ -329,7 +341,7 @@ impl Recorder {
 pub const TARGET: &str = "blaze";
 
 /// The least severe level of a span kept. An event's levels are [`logs::keeps_event`]'s.
-pub const LEVEL: tracing::Level = tracing::Level::INFO;
+pub const LEVEL: blaze_trace::Level = blaze_trace::Level::INFO;
 
 /// Whether a span or event of `target` named `name`, at a level [`keeps_level`] keeps, is kept: a
 /// `blaze` one (its target starts with [`TARGET`]) or a rust-analyzer query's span (`*_query`;
@@ -344,12 +356,7 @@ pub fn keeps(target: &str, name: &str) -> bool {
 /// Whether spans of the level `tracing` names `level` (`"info"`, `"DEBUG"`, `"3"`) are kept;
 /// false for a name that is no level's.
 pub fn keeps_level(level: &str) -> bool {
-    level.parse::<tracing::Level>().is_ok_and(|it| it <= LEVEL)
-}
-
-/// Whether spans of `meta` are kept; those that are get a site in the flight recorder.
-fn wants(meta: &'static tracing::Metadata<'static>) -> bool {
-    Recorder::wanted(meta) && flight::register(meta).is_some()
+    level.parse::<blaze_trace::Level>().is_ok_and(|it| it <= LEVEL)
 }
 
 /// The site of a callsite [`Recorder::enabled`] said yes to, given it here if it has none yet.
@@ -361,13 +368,13 @@ fn wants(meta: &'static tracing::Metadata<'static>) -> bool {
 /// (`batches::tests::names_given_on_many_threads_read_back_from_parquet_as_recorded`).
 /// [`flight::register`] waits for the registration under way and gives its site. `None` for a
 /// callsite not wanted, or past the flight recorder's table.
-fn site_of(meta: &'static tracing::Metadata<'static>) -> Option<u16> {
+fn site_of(meta: &'static blaze_trace::Metadata<'static>) -> Option<u16> {
     flight::site(meta).or_else(|| if Recorder::wanted(meta) { flight::register(meta) } else { None })
 }
 
 /// The id of a span beginning now: [`flight::UNRECORDED`] for a callsite past the flight
 /// recorder's table.
-fn opened(span: &tracing::span::Attributes<'_>) -> u64 {
+fn opened(span: &blaze_trace::span::Attributes<'_>) -> u64 {
     let Some(site) = site_of(span.metadata()) else { return flight::UNRECORDED };
     flight::opened(span, site)
 }
@@ -377,58 +384,40 @@ pub(crate) fn closed(id: u64) -> bool {
     flight::closed(id).is_some()
 }
 
-impl tracing::Subscriber for Recorder {
-    fn register_callsite(
-        &self,
-        meta: &'static tracing::Metadata<'static>,
-    ) -> tracing::subscriber::Interest {
-        if wants(meta) {
-            tracing::subscriber::Interest::always()
-        } else {
-            tracing::subscriber::Interest::never()
-        }
+impl blaze_trace::Sink for Recorder {
+    /// Wanted ([`Recorder::wanted`]) and given a site in the flight recorder: asked once a site.
+    fn enabled(&self, meta: &'static blaze_trace::Metadata<'static>) -> bool {
+        Self::wanted(meta) && site_of(meta).is_some()
     }
 
-    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
-        // DEBUG for the events of `blaze` targets that opt in ([`logs::keeps_event`]); each
-        // callsite's interest decides the rest once.
-        Some(tracing::level_filters::LevelFilter::DEBUG)
+    fn new_span(&self, span: &blaze_trace::span::Attributes<'_>) -> blaze_trace::span::Id {
+        blaze_trace::span::Id::from_u64(opened(span))
     }
 
-    fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
-        Self::wanted(meta)
-    }
-
-    fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(opened(span))
-    }
-
-    fn clone_span(&self, id: &tracing::span::Id) -> tracing::span::Id {
+    fn clone_span(&self, id: &blaze_trace::span::Id) -> blaze_trace::span::Id {
         flight::cloned(id.into_u64());
-        tracing::span::Id::from_u64(id.into_u64())
+        blaze_trace::span::Id::from_u64(id.into_u64())
     }
 
-    fn record(&self, id: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+    fn record(&self, id: &blaze_trace::span::Id, values: &blaze_trace::span::Record<'_>) {
         flight::recorded(id.into_u64(), values);
     }
 
-    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-
-    fn event(&self, event: &tracing::Event<'_>) {
+    fn event(&self, event: &blaze_trace::Event<'_>) {
         if let Some(site) = site_of(event.metadata()) {
             flight::evented(event, site);
         }
     }
 
-    fn enter(&self, id: &tracing::span::Id) {
+    fn enter(&self, id: &blaze_trace::span::Id) {
         flight::entered(id.into_u64());
     }
 
-    fn exit(&self, id: &tracing::span::Id) {
+    fn exit(&self, id: &blaze_trace::span::Id) {
         flight::exited(id.into_u64());
     }
 
-    fn try_close(&self, id: tracing::span::Id) -> bool {
+    fn try_close(&self, id: blaze_trace::span::Id) -> bool {
         closed(id.into_u64())
     }
 }
@@ -461,14 +450,14 @@ mod tests {
         use blaze_graph::wait::{WaitOn, wait};
         install();
         let tid = std::thread::spawn(|| {
-            let unit = tracing::info_span!(
+            let unit = blaze_trace::info_span!(
                 target: "blaze",
                 "unit codegen",
                 krate = "build-script-build",
                 unit = "serde v1.0.219 (build script)"
             )
             .entered();
-            let par = tracing::info_span!(target: "blaze", "par").entered();
+            let par = blaze_trace::info_span!(target: "blaze", "par").entered();
             wait(WaitOn::Scope(13), None, || {});
             drop(par);
             drop(unit);
@@ -607,7 +596,7 @@ mod tests {
         let before = flight::progress();
         let started = Instant::now();
         for _ in 0..N {
-            let _span = tracing::info_span!(target: "blaze", "measured").entered();
+            let _span = blaze_trace::info_span!(target: "blaze", "measured").entered();
         }
         let span_ns = started.elapsed().as_nanos() / u128::from(N);
         assert!(flight::progress() - before >= u64::from(N), "every span was recorded");
@@ -631,7 +620,7 @@ mod tests {
         let started = Instant::now();
         for _ in 0..N {
             let _span =
-                tracing::info_span!(target: "blaze", "unit bodies", krate = "serde", unit = "serde v1.0.219 (lib)")
+                blaze_trace::info_span!(target: "blaze", "unit bodies", krate = "serde", unit = "serde v1.0.219 (lib)")
                     .entered();
         }
         let visited_ns = per(started);

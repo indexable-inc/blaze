@@ -1,0 +1,14 @@
+{
+ "id": "run-ids-4",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), write-only lane I, piece 'the BodyCheck record lists the checker keys it covered' on rebuild-1115",
+ "where": "crates/blaze-cli/src/body_types.rs and work.rs, shared on disk with lane R8 (body_types/heads.rs)",
+ "what": "The runner lays a lane's whole files over the green tree. body_types.rs and work.rs hold this lane's one edit each AND lane R8's unadmitted edits (heads::handed_reads, HeadReads, a six-argument FileTypes::check), so every ask fails in R8's lines until R8 is admitted. A trial with R8's heads.rs laid in (--no-admit) was clean, 14 run_ids tests passing.",
+ "cost": "the piece cannot be admitted on its own; three asks spent on errors that are not this lane's",
+ "cause": "the runner's unit is a whole file, and two lanes write one file",
+ "whys": "lanes share files by design (at most four per file), but admission is per file, not per hunk",
+ "class": "a shared file couples two lanes' admission",
+ "prevention": "the runner admits a lane's hunks (a diff against green) rather than its files, or the coordinator admits two lanes' pieces of one file as one batch",
+ "workaround": "ask again after R8 is admitted; the coordinator may admit both in one cut",
+ "state": "open"
+}

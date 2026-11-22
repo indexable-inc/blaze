@@ -18,15 +18,20 @@ doctest = false
 # spelling (`blake3:<hex>`) and refusal of weak algorithms by name.
 blaze-fetch.workspace = true
 # The advisories' version ranges and the lock's exact versions.
-semver.workspace = true
+blaze-semver.workspace = true
+# `Cargo.lock`, read by the one lock reader (rule 30; the audit's own reader is gone).
+blaze-manifest = { workspace = true, default-features = false }
 # The advisories' front matter, blaze.lock's tables and the workspace's settings.
-toml.workspace = true
+blaze-toml.workspace = true
 # `--json`, and the sparse index's lines the yanked check reads.
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
+blaze-data.workspace = true
+blaze-json.workspace = true
+blaze-own.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true
+# `Alloc::global()`: the tests' locks are read in the global allocator.
+blaze-own = { workspace = true, features = ["std", "testing"] }
 
 [lints]
 workspace = true

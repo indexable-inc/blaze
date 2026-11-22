@@ -1,0 +1,73 @@
+[package]
+name = "blaze-world"
+description = "One world for run and check: a project's unit graph made into the names library's inputs (every crate's root, extern prelude, cfg and edition), each crate's files read in place from a checkout, the fetch store or the toolchain shelf through a reader passed in"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# The producers this crate's code makes values for (decision D105,
+# docs/v2/plan/design/producer-id.md): its source and its workspace dependencies' are the row.
+[package.metadata.blaze]
+producer = ["names"]
+
+[lib]
+doctest = false
+
+[features]
+# `Checkout`: a workspace's own files read from a folder on disk (the one reader that does IO).
+std = ["dep:blaze-core"]
+# `procs`: a macro crate's module identity and its lookup in the module store (src/procs.rs),
+# without the sandbox runtime.
+procs = ["std", "dep:blaze-proc-macro"]
+# `procs-run`: the proc-macro hook's registration over the module store, with the runtime.
+procs-run = ["procs", "blaze-proc-macro/runtime"]
+default = ["std"]
+
+[dependencies]
+# Every owner in the caller's allocator.
+blaze-own.workspace = true
+# The graph this crate reads: units, their features, cfg, edition, dependencies; `implicit`.
+blaze-unit-graph.workspace = true
+# A unit's package in the lock: its name, version and source (a crate's key).
+blaze-manifest = { workspace = true, default-features = false }
+# What this crate makes: `CrateInput`, `Sysroot`, `SourceTexts`, `resolve_crates`.
+blaze-scope.workspace = true
+# `Edition`, the names library's.
+blaze-surface.workspace = true
+# `CrateItemKey`, `ContentId`.
+blaze-id.workspace = true
+# `PackView`: a fetched package's files and a toolchain crate's, read in place.
+blaze-fetch.workspace = true
+# The source corrections' lexer width (`blaze_fetch::correct`, D58).
+blaze-lex.workspace = true
+# The toolchain's manifest and packs, through the caller's `Shelf`.
+blaze-toolchain.workspace = true
+# `PackageEdition`.
+edition.workspace = true
+# src/script.rs: `OutputsRef`, a build script's outputs record read in place (its cfgs join the
+# served unit's; the record itself is the expansion host's `OUT_DIR`).
+blaze-build-script.workspace = true
+# `Checkout`'s named lock.
+blaze-core = { workspace = true, optional = true }
+# src/procs.rs: the hook a macro crate is registered in, and its module lookup.
+blaze-proc-macro = { workspace = true, optional = true }
+
+[dev-dependencies]
+blaze-own = { workspace = true, features = ["std", "testing"] }
+# examples/names.rs `--procs`: the proc-macro runner (its hook) and the definition types.
+blaze-proc-macro = { workspace = true, features = ["runtime"] }
+# examples/names.rs: the registration (src/procs.rs) behind its feature.
+blaze-world = { workspace = true, features = ["procs-run"] }
+blaze-expand.workspace = true
+# examples/names.rs: every producer's id (D105).
+blaze-ids.workspace = true
+# examples/names.rs `--records`: a checkout file's surface (what a crate's names read of it).
+blaze-file-items.workspace = true
+
+[lints]
+workspace = true

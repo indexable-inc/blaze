@@ -10,20 +10,25 @@ use astlog_core::Analysis;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 /// Every rules file with a test below.
-const TESTED: &[&str] = &["rust-locks"];
+const TESTED: &[&str] = &["expand-hand-extent", "rust-locks"];
 
 fn rules_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../rules")
 }
 
-/// `fixture` analyzed by `rules` as a Rust file. The temporary directory holds the file the
-/// analysis read, so it lives as long as the analysis.
+/// `fixture` analyzed by `rules` as the Rust file `place` (a relative path: what a rule's
+/// `file-path` sees). The temporary directory holds the file the analysis read, so it lives as
+/// long as the analysis.
 fn analyze(
     rules: &str,
     fixture: &Path,
+    place: &Path,
 ) -> Result<(tempfile::TempDir, Analysis), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
-    let source = dir.path().join("fixture.rs");
+    let source = dir.path().join(place);
+    if let Some(parent) = source.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     std::fs::copy(fixture, &source)?;
     let analysis = astlog_core::analyze(rules, &[source])?;
     Ok((dir, analysis))
@@ -38,8 +43,16 @@ fn check(name: &str) -> TestResult {
     let rules = std::fs::read_to_string(rules_dir().join(format!("{name}.astlog")))?;
     let fixtures = rules_dir().join("tests").join(name);
     let bad = fixtures.join("bad.fixture");
+    // Where the fixtures are placed: `fixture.rs`, or the path a `path` file names (a rule
+    // scoped by `file-path` to one tree).
+    let named = fixtures.join("path");
+    let place = if named.exists() {
+        PathBuf::from(std::fs::read_to_string(&named)?.trim())
+    } else {
+        PathBuf::from("fixture.rs")
+    };
 
-    let (_dir, analysis) = analyze(&rules, &bad)?;
+    let (_dir, analysis) = analyze(&rules, &bad, &place)?;
     let expected = std::fs::read_to_string(fixtures.join("bad.expected"))?;
     assert_eq!(
         findings(&analysis)?,
@@ -65,13 +78,18 @@ fn check(name: &str) -> TestResult {
         if !(file.starts_with("good") && file.ends_with(".fixture")) {
             continue;
         }
-        let (_dir, analysis) = analyze(&rules, &path)?;
+        let (_dir, analysis) = analyze(&rules, &path, &place)?;
         assert_eq!(findings(&analysis)?, Vec::<String>::new(), "{name}: {file}'s findings");
         assert!(analysis.edits.is_empty(), "{name}: {file} needs a fix: {}", analysis.diff());
         goods += 1;
     }
     assert!(goods >= 1, "{name}: no good fixture");
     Ok(())
+}
+
+#[test]
+fn expand_hand_extent() -> TestResult {
+    check("expand-hand-extent")
 }
 
 #[test]

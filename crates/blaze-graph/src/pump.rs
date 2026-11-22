@@ -548,7 +548,7 @@ mod tests {
 
     use blaze_alloc_count::{Used, measure};
     use blaze_ids::rng::SplitMix64 as Rng;
-    use crossbeam_channel::unbounded;
+    use blaze_core::chan::unbounded;
 
     use super::{Flights, LEAST};
     use crate::{

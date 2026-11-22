@@ -22,9 +22,16 @@
 //! ([`Sim::output`]); the wall clock is the seed's start ([`Sim::wall_start`]) plus the virtual
 //! clock, and random bytes are the seed's numbers.
 //!
-//! The simulated disk's directories are those some file is under; a directory made empty is
-//! one more, there until removed, through a crash too. Watches and journals are told of none,
-//! and [`Effect::Entries`] and [`Effect::Stamp`] do not see one with nothing under it.
+//! The simulated disk's directories are those made: by [`Effect::MakeDir`], by the making of
+//! a file under one not there (a driver makes a file's directories with it: `fs.rs`'s
+//! `making_parent`, [`Sim::make_parents`]), or by something outside the state machine. Each is
+//! there until removed, empty or not, as a real one is: none goes because its last file did
+//! (the loose rule before 2026-11-20, under which `RemoveDir` of such a folder failed and
+//! `MakeDir` of it succeeded where a disk answers the reverse; the conformance suite,
+//! `conform/fs.rs`, holds the two to one answer). A directory's making and its removal are
+//! changes of a name of its parent's, which a crash may undo until the parent is synced
+//! (`dir_names.rs`). A file made under a name that is a file is refused, as `ENOTDIR` refuses
+//! it, and so is one made where a directory is ([`Sim::cannot_make`]). Watches are told of no directory's making or removal.
 
 use std::{
     collections::VecDeque,
@@ -87,6 +94,54 @@ pub(super) enum Plant {
     /// A sync that completes makes durable one change fewer than it covered, when it covers
     /// at least one.
     SyncCoversLess,
+    /// The loose rule: a file's sync makes its name durable too, as if its directory were
+    /// synced.
+    FileSyncKeepsName,
+    /// The loose rule for directories: a directory made or removed is durable as it is, as if
+    /// its parent were synced (nothing journaled: `dir_names.rs`).
+    DirNamesDurable,
+    /// An effect that makes the directories a file is made under syncs none of them into its
+    /// parent (the folders rule, on `Effect`, broken): the drivers' bug before 2026-11-20
+    /// (`fs.rs`'s `make_parent` was `create_dir_all`, which syncs nothing), under which a
+    /// crash loses a file `Effect::Write` called durable with the folder it was made in, and
+    /// a file synced with its name into a folder an earlier unsynced effect made.
+    MadeParentsNotSynced,
+}
+
+/// Who makes the directories a file is made under ([`Sim::make_parents`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Maker {
+    /// An effect: each directory a change of a name of its parent's, journaled and the parent
+    /// synced at once, as the drivers sync it before the effect completes (the folders rule,
+    /// on `Effect`); under [`Plant::MadeParentsNotSynced`], left for a crash to undo.
+    Effect,
+    /// Something outside the state machine (a person, a checkout): durable at once, as the
+    /// file it makes them for is ([`Sim::change`]).
+    Outside,
+}
+
+/// What a name above another is when that one cannot be made under it: the text a refusal
+/// carries after the name, as the native drivers' `ENOTDIR` says it.
+pub(super) const NOT_A_DIRECTORY: &str = "is not a directory";
+
+/// What a name that is a directory is when a file is made under it: the refusal's text.
+pub(super) const IS_A_DIRECTORY: &str = "is a directory";
+
+/// What a name there is when another, spelled otherwise, would be one name with it on a disk
+/// that folds case ([`Sim::folds_onto`]): the refusal's text.
+pub(super) const ONE_NAME_FOLDED: &str =
+    "is one name with it on a disk that folds case, so the simulated disk makes neither twice";
+
+/// Whether `a` and `b` are one name on a disk that folds case: equal with each character
+/// lowered (`char::to_lowercase`; ASCII compared without it). Unicode's full folding (`ß` and
+/// `ss`) and APFS's own tables fold more: a pair only they fold is not refused here (UNSURE in
+/// D167's report; blaze-fetch's `casefold` table is the full one and blaze-core does not name
+/// it).
+fn folded_one(a: &str, b: &str) -> bool {
+    if a.is_ascii() && b.is_ascii() {
+        return a.eq_ignore_ascii_case(b);
+    }
+    a.chars().flat_map(char::to_lowercase).eq(b.chars().flat_map(char::to_lowercase))
 }
 
 /// A UDP socket bound, and the datagrams it got and no receive took yet.
@@ -153,8 +208,16 @@ pub(super) struct Host {
     stderr: Vec<u8>,
     /// The wall clock at the virtual clock's start.
     wall: Duration,
-    /// Directories made empty and not removed, sorted.
-    made: Vec<FileName>,
+    /// Every directory there but the root, sorted: made by [`Effect::MakeDir`], by the making
+    /// of a file under it ([`Sim::make_parents`]) or from outside, and not removed since.
+    /// The one record of which directories there are: a stat, a listing, a stamp and the
+    /// journal's disk all read it ([`super::journal::Tree`]).
+    pub(super) made: Vec<FileName>,
+    /// The trust anchors [`Effect::Roots`] answers ([`Sim::roots`]); none, a store with no
+    /// root.
+    roots: Option<crate::trust::Roots<std::alloc::Global>>,
+    /// How many times [`Effect::Roots`] was asked ([`Sim::roots_read`]).
+    roots_read: u32,
     plant: Option<Plant>,
 }
 
@@ -188,6 +251,8 @@ impl Host {
             wall: Duration::from_secs(1_700_000_000 + seed % 1_000_000_000),
             // alloc: none until a directory is made.
             made: Vec::new(),
+            roots: None,
+            roots_read: 0,
             plant: None,
         }
     }
@@ -247,6 +312,18 @@ impl Sim {
         let mut kept = Vec::with_capacity_in(addresses.len(), std::alloc::Global);
         kept.extend_from_slice(addresses);
         self.host.names.push((name.to_owned(), kept));
+    }
+
+    /// From now on [`Effect::Roots`] answers `roots`; until a test calls this, the world's
+    /// store has none, and the effect is told [`Done::Untrusted`].
+    pub fn roots(&mut self, roots: crate::trust::Roots<std::alloc::Global>) {
+        self.host.roots = Some(roots);
+    }
+
+    /// How many times [`Effect::Roots`] has been asked: a client reads the roots on its first
+    /// connection only.
+    pub fn roots_read(&self) -> u32 {
+        self.host.roots_read
     }
 
     /// `bytes` come next on the standard input, after what the test gave before.
@@ -354,6 +431,21 @@ impl Sim {
                 let done = self.random(len);
                 self.tell(tag, done, Of::Op);
             }
+            Effect::Roots { tag, .. } => {
+                self.host.roots_read += 1;
+                let done = match &self.host.roots {
+                    // clone: the world's roots, once per ask; alloc: the completion's box.
+                    Some(roots) => Done::Roots(Box::new(roots.clone())),
+                    // alloc: an error path.
+                    None => Done::Untrusted(Box::new(crate::trust::TrustError {
+                        looked: vec![crate::trust::Looked {
+                            place: crate::trust::Place::System("the simulation's world (Sim::roots never called)"),
+                            why: crate::trust::Why::NoCertificate,
+                        }],
+                    })),
+                };
+                self.tell(tag, done, Of::Op);
+            }
             _ => unreachable!("only the host's effects are handed here"),
         }
     }
@@ -391,6 +483,11 @@ impl Sim {
         if self.rng.one_in(u64::from(self.faults.fail_one_in)) {
             return self.fail(tag).done;
         }
+        // The simulation has every option; it refuses what contradicts, as a host does.
+        if let Err(refused) = crate::sockopt::check_udp(&options, crate::sockopt::Platform::Simulated) {
+            // alloc: an error's message.
+            return Done::Failed(IoError(format!("binding a UDP socket at {at}: {refused}")));
+        }
         let port = match at.port() {
             0 => match self.free_port(at) {
                 Some(port) => port,
@@ -412,7 +509,8 @@ impl Sim {
         self.host.next_sock += 1;
         // alloc: none until a datagram lands.
         self.host.socks.push(Bound { id, local, options, inbox: VecDeque::new() });
-        Done::Bound { sock: Dgram(id), local }
+        let buffers = crate::sockopt::Buffers::simulated(options.tuning.recv_buffer, options.tuning.send_buffer);
+        Done::Bound { sock: Dgram(id), local, buffers }
     }
 
     /// The next port no socket at `at`'s address has, from the one after the last given: at
@@ -673,8 +771,9 @@ impl Sim {
     }
 
     /// The machine loses power: every socket goes, with what was on its way to one and every
-    /// receive and read waiting. What was written stays written, what was read stays read, and
-    /// a directory made stays made.
+    /// receive and read waiting. What was written stays written and what was read stays read;
+    /// what a crash does to a directory made or removed is `Sim::crash_with`'s, by its name
+    /// (`dir_names.rs`).
     pub(super) fn host_crash(&mut self) {
         self.host.socks.clear();
         self.host.flying.clear();
@@ -683,9 +782,132 @@ impl Sim {
         self.host.read_told = Duration::ZERO;
     }
 
-    /// Whether `name` is a directory: one made, or one some file or directory made is under.
+    /// Whether `name` is a directory there ([`Host::made`]); the root is one and is no name.
     pub(super) fn is_dir(&self, name: &FileName) -> bool {
-        self.host.made.binary_search(name).is_ok() || self.anything_under(name)
+        self.host.made.binary_search(name).is_ok()
+    }
+
+    /// The directories above `file` that are not there, made top down, as a driver makes a
+    /// file's directories with the file (`fs.rs`'s `make_parent`): each one is there from now
+    /// on until removed. Made by an effect ([`Maker::Effect`]), whichever effect, each is a
+    /// change of a name of its parent's, journaled as [`Effect::MakeDir`]'s is, and its parent
+    /// synced at once, as the drivers sync it before the effect completes: THE RULE for a
+    /// folder no call asked for, that its making makes it durable, so a durable call under it
+    /// (a file synced and its name synced into the folder) is durable from the root down,
+    /// whichever effect made the folder and however long before. The planted bug
+    /// ([`Plant::MadeParentsNotSynced`]) syncs none: the drivers before 2026-11-20, under
+    /// which bstd's `publish_synced`, `close_synced`, kv puts and blaze-core's `Reserve` lost
+    /// a synced file with the folder an earlier unsynced effect of theirs had made. Made from
+    /// outside, durable at once, with nothing journaled. How many were made: the nearest `n`
+    /// directories above `file`, since every directory's own directories are there. A name
+    /// above `file` that is a file is refused before any effect gets here
+    /// ([`Sim::cannot_make`]).
+    pub(super) fn make_parents(&mut self, file: &FileName, maker: Maker) -> usize {
+        let mut made = 0;
+        for (at, _) in file.as_str().match_indices('/') {
+            let dir = &file.as_str()[..at];
+            let Err(slot) = self.host.made.binary_search_by(|it| it.as_str().cmp(dir)) else {
+                continue;
+            };
+            let dir = FileName::new(dir).expect("a part of a name is a name");
+            // clone: the journal's own name of it, a refcount.
+            self.host.made.insert(slot, dir.clone());
+            match maker {
+                Maker::Effect => {
+                    self.dir_named(super::Named::MadeDir { dir });
+                    if !self.planted(Plant::MadeParentsNotSynced) {
+                        // The parent's names synced: the folder's own name with them.
+                        self.sync_names(file.as_str()[..at].rsplit_once('/').map_or("", |(up, _)| up));
+                    }
+                }
+                Maker::Outside => self.names.retain(|change| !change.named.touches(&dir)),
+            }
+            made += 1;
+        }
+        made
+    }
+
+    /// `dir` and each directory above it not there, made by something outside the state
+    /// machine (a checkout, a test's setup), durably: no crash undoes them, as
+    /// [`Sim::change`] makes a file.
+    pub fn mkdir(&mut self, dir: &FileName) {
+        self.make_parents(dir, Maker::Outside);
+        if let Err(slot) = self.host.made.binary_search(dir) {
+            // clone: the disk's own name of it, a refcount.
+            self.host.made.insert(slot, dir.clone());
+            self.names.retain(|change| !change.named.touches(dir));
+        }
+    }
+
+    /// `effect`, which makes a file's name where it is missing, refused where a name above it
+    /// is a file (`ENOTDIR`) or the name itself is a directory (`EISDIR`): a real driver's
+    /// open, rename or link fails there and makes nothing. Checked before any fault is drawn,
+    /// as [`Sim::refused_write`] is.
+    pub(super) fn cannot_make(&self, effect: &Effect) -> Option<Done> {
+        let made = match effect {
+            Effect::Append { file, .. }
+            | Effect::Truncate { file, .. }
+            | Effect::MapWrite { file, .. }
+            | Effect::Write { file, .. }
+            | Effect::WriteUnsynced { file, .. }
+            | Effect::Sync { file, .. }
+            | Effect::Barrier { file, .. }
+            | Effect::Lock { file, .. } => file,
+            Effect::Rename { to, .. }
+            | Effect::RenameUnsynced { to, .. }
+            | Effect::CopyData { to, .. }
+            | Effect::Clone { to, .. }
+            | Effect::Link { to, .. } => to,
+            _ => return None,
+        };
+        if self.is_dir(made) {
+            // alloc: an error's message.
+            return Some(Done::Failed(IoError(format!("{made} {IS_A_DIRECTORY}"))));
+        }
+        if let Some(above) = self.file_above(made) {
+            // alloc: an error's message.
+            return Some(Done::Failed(IoError(format!("{made}: {above} {NOT_A_DIRECTORY}"))));
+        }
+        if self.files.contains_key(made) {
+            return None;
+        }
+        let other = self.folds_onto(made)?;
+        // A rename that changes only a name's case is one name on both kinds of disk.
+        if let Effect::Rename { from, .. } | Effect::RenameUnsynced { from, .. } = effect
+            && from == other
+        {
+            return None;
+        }
+        // alloc: an error's message.
+        Some(Done::Failed(IoError(format!("{made}: {other} {ONE_NAME_FOLDED}"))))
+    }
+
+    /// The nearest name above `name` that is a file, where one is: no name under it can be
+    /// made or looked at (`ENOTDIR`). One lookup per directory of its path.
+    pub(super) fn file_above(&self, name: &FileName) -> Option<FileName> {
+        let name = name.as_str();
+        name.match_indices('/')
+            .map(|(at, _)| FileName::new(&name[..at]).expect("a part of a name is a name"))
+            .filter(|above| self.files.contains_key(above))
+            .last()
+    }
+
+    /// A name there, file or directory, spelled otherwise than `made` or a directory above it
+    /// but one name with it on a disk that folds case (APFS and NTFS as formatted by default):
+    /// the simulated disk refuses to make it, stricter than every real disk, since on one that
+    /// folds the second name is the first and on one that does not they are two
+    /// (`conform/fs.rs`, `a_name_spelled_two_ways`). Never asked of a name there already.
+    pub(super) fn folds_onto(&self, made: &FileName) -> Option<&FileName> {
+        let made = made.as_str();
+        let ends = made.match_indices('/').map(|(at, _)| at).chain([made.len()]);
+        for end in ends {
+            let part = &made[..end];
+            let mut names = self.files.keys().chain(self.host.made.iter());
+            if let Some(other) = names.find(|it| it.as_str() != part && folded_one(it.as_str(), part)) {
+                return Some(other);
+            }
+        }
+        None
     }
 
     /// Whether a file, or a directory made, is under `dir`, not `dir` itself.
@@ -697,14 +919,9 @@ impl Sim {
     /// The directories made under `dir`, `dir` not one of them.
     pub(super) fn made_under<'a>(
         &'a self,
-        dir: &'a FileName,
+        dir: &'a crate::DirName,
     ) -> impl Iterator<Item = &'a FileName> + 'a {
-        self.host.made.iter().filter(move |it| *it != dir && it.is_under(dir))
-    }
-
-    /// Whether `dir` is a directory made.
-    pub(super) fn was_made(&self, dir: &FileName) -> bool {
-        self.host.made.binary_search(dir).is_ok()
+        self.host.made.iter().filter(move |it| dir.name() != Some(*it) && dir.holds(it))
     }
 
     /// [`Effect::MakeDir`] on the simulated disk.
@@ -712,6 +929,10 @@ impl Sim {
         if self.files.contains_key(&dir) || self.is_dir(&dir) {
             // alloc: an error's message.
             return Done::Failed(IoError(format!("{dir}: it is there already")));
+        }
+        if let Some(other) = self.folds_onto(&dir) {
+            // alloc: an error's message.
+            return Done::Failed(IoError(format!("{dir}: {other} {ONE_NAME_FOLDED}")));
         }
         if let Some((parent, _)) = dir.as_str().rsplit_once('/') {
             let parent = FileName::new(parent).expect("a part of a name is a name");
@@ -727,7 +948,9 @@ impl Sim {
             }
         }
         let at = self.host.made.binary_search(&dir).expect_err("not made, looked up above");
-        self.host.made.insert(at, dir);
+        // clone: the journal's own name of it, a refcount.
+        self.host.made.insert(at, dir.clone());
+        self.dir_named(super::Named::MadeDir { dir });
         Done::MadeDir
     }
 
@@ -755,11 +978,17 @@ impl Sim {
                 self.changed(&file);
             }
             self.host.made.retain(|it| !it.is_under(dir));
+            self.disk.dir_gone(dir);
+            // clone: the journal's own name of it, a refcount.
+            self.dir_named(super::Named::RemovedDir { dir: dir.clone() });
             return Done::RemovedDir;
         }
         match self.host.made.binary_search(dir) {
             Ok(at) => {
                 self.host.made.remove(at);
+                self.disk.dir_gone(dir);
+                // clone: the journal's own name of it, a refcount.
+                self.dir_named(super::Named::RemovedDir { dir: dir.clone() });
                 Done::RemovedDir
             }
             // alloc: an error's message.
@@ -776,6 +1005,8 @@ impl Sim {
         }
     }
 }
+
+mod dir_names;
 
 #[cfg(test)]
 mod tests;

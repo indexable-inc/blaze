@@ -1,0 +1,4 @@
+[package]
+name = "x0-async-rec-01"
+version = "0.1.0"
+edition = "2024"

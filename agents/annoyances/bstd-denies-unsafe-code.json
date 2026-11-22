@@ -1,0 +1,8 @@
+{
+ "id": "bstd-denies-unsafe-code",
+ "date": "2026-11-20",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), D178 telemetry writer",
+ "where": "crates/blaze-std/src/lib.rs `#![deny(unsafe_code)]`; the D178 sampler (telemetry/sampler.rs, sampler/mac.rs, sampler/linux.rs)",
+ "what": "I wrote the sampler's one-writer ring cell, the Mach suspend/resume calls and the signal handler's stack reads as `unsafe` inside bstd. The crate denies unsafe_code, except in modules declared with `#[expect(unsafe_code, reason = ...)]` (rt.rs, sync.rs, task.rs). The brief did not say so and nothing in the sampler's files showed it; the coordinator's build found 21 errors and the half-written module blocked every crate above bstd.",
+ "fix": "Every `unsafe` of the sampler now lives in blaze-sys: src/sample.rs (the ring, the slot's one-writer cell, the walk), macos_sample.rs (`enter`, `sample`) and linux/sample.rs (`install`, `enter`, `stop`, a private handler). bstd's drivers are safe. Before writing a raw call in a crate, grep its lib.rs for `deny(unsafe_code)`; declare a new module only once its file is whole."
+}

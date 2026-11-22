@@ -11,9 +11,6 @@ proc-macro = true
 doctest = false
 
 [dependencies]
-proc-macro2 = "1.0.107"
-quote = "1.0.47"
-syn = { version = "2.0.117", features = ["full"] }
 
 [lints]
 workspace = true

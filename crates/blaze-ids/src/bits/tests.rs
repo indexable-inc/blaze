@@ -1,8 +1,6 @@
 use std::{collections::BTreeSet, sync::Arc, thread};
 
 use blaze_sim::Config;
-use smallvec::SmallVec;
-use thin_vec::ThinVec;
 
 use crate::rng::SplitMix64;
 
@@ -54,13 +52,17 @@ fn filled_holds_exactly_the_bits_below_its_size() {
 /// A set in a frame's `Vec` grows, resets and truncates like a [`BitSet`] given the same
 /// members.
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "blaze-mem's frame reserves with mmap and mprotect, which Miri does not run; a growing BitSet's Vec is bits_are_a_set's"
+)]
 fn a_set_in_an_allocators_vec_matches_a_bitset() {
     let frame = blaze_mem::Frame::new(blaze_mem::Tag::Intern).expect("reserve");
     let mut rng = SplitMix64::new(0x5851_f42d_4c95_7f2d);
     let mut held: Bits<Vec<u64, &blaze_mem::Frame>, u32> = Bits::from_words(Vec::new_in(&frame));
     let mut plain = BitSet::<u32>::default();
-    for round in 0..64 {
-        for _ in 0..200 {
+    for round in 0..if cfg!(miri) { 6 } else { 64 } {
+        for _ in 0..if cfg!(miri) { 40 } else { 200 } {
             let at = rng.index(5000) as u32;
             assert_eq!(held.insert_growing(at), plain.insert_growing(at));
         }
@@ -85,7 +87,7 @@ fn a_set_in_an_allocators_vec_matches_a_bitset() {
 #[test]
 fn ranges_match_a_bit_at_a_time() {
     let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
-    for _ in 0..2000 {
+    for _ in 0..if cfg!(miri) { 60 } else { 2000 } {
         let size = 1 + rng.index(300);
         let mut fast = BitSet::<usize>::new(size);
         let mut slow = vec![false; size];
@@ -257,7 +259,7 @@ fn bits_are_a_set() {
             assert_eq!(bits.first(), None);
             continue;
         }
-        for _ in 0..2_000 {
+        for _ in 0..if cfg!(miri) { 200 } else { 2_000 } {
             let at = rng.index(len) as u32;
             match rng.index(3) {
                 0 => {
@@ -288,8 +290,8 @@ fn bits_are_a_set() {
 /// hir-def's lists of impls: a bit per position pushed beside the list, past its end clear.
 #[test]
 fn a_set_kept_beside_a_list_has_the_lists_words() {
-    let mut beside = Bits::<ThinVec<u64>>::default();
-    let mut other = Bits::<ThinVec<u64>>::default();
+    let mut beside = Bits::<Vec<u64>>::default();
+    let mut other = Bits::<Vec<u64>>::default();
     for at in 0..65 {
         beside.set_growing(at, at % 2 == 0);
         other.set_growing(at, at % 2 == 0);
@@ -299,10 +301,10 @@ fn a_set_kept_beside_a_list_has_the_lists_words() {
     assert!(beside.contains(64) && !beside.contains(63) && !beside.contains(65));
 }
 
-/// hir-def's enum variants: inline up to 64, cut to the variants kept.
+/// hir-def's enum variants: cut to the variants kept.
 #[test]
-fn a_small_set_is_inline_and_truncates() {
-    let mut set = Bits::<SmallVec<[u64; 1]>>::new(130);
+fn a_small_set_truncates() {
+    let mut set = Bits::<Vec<u64>>::new(130);
     set.insert(1);
     set.insert(70);
     set.insert(129);
@@ -312,7 +314,7 @@ fn a_small_set_is_inline_and_truncates() {
     set.truncate(64);
     set.shrink_to_fit();
     assert_eq!(set.iter().collect::<Vec<_>>(), [1]);
-    assert!(!set.into_words().spilled());
+    assert_eq!(set.into_words().len(), 1);
 }
 
 /// A view of words held elsewhere reads as the set it is.
@@ -442,7 +444,7 @@ fn reads_and_writes_allocate_nothing() {
 /// The shared set against the reference copy, op by op.
 #[test]
 fn the_set_is_the_reference() {
-    blaze_sim::check(Config::DEFAULT, |tape| {
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
         let len: usize = tape.int_in(1..=399, "len");
         let ops: Vec<(u8, usize)> = tape.vec(0..=199, "ops", |tape| {
             (tape.int_in(0..=3, "op"), tape.int_in(0..=len - 1, "at"))
@@ -476,7 +478,7 @@ fn the_set_is_the_reference() {
 /// the changed flag a dataflow iterates on.
 #[test]
 fn set_operations_are_the_references() {
-    blaze_sim::check(Config::DEFAULT, |tape| {
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
         let len: usize = tape.int_in(1..=299, "len");
         let a: Vec<usize> = tape.vec(0..=99, "a", |tape| tape.int_in(0..=len - 1, "member"));
         let b: Vec<usize> = tape.vec(0..=99, "b", |tape| tape.int_in(0..=len - 1, "member"));
@@ -524,7 +526,7 @@ fn set_operations_are_the_references() {
 /// Iteration from both ends at once meets in the middle with every member once.
 #[test]
 fn both_ends_meet() {
-    blaze_sim::check(Config::DEFAULT, |tape| {
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
         let words: Vec<u64> = tape.vec(0..=5, "words", |tape| tape.int("word"));
         let backs: Vec<bool> = tape.vec(0..=399, "backs", |tape| tape.bool("from the back"));
         let set = BitSlice::<usize>::from_words(&words[..]);
@@ -548,7 +550,7 @@ fn both_ends_meet() {
 /// A splice of a range of one set into another at an offset, against a bit at a time.
 #[test]
 fn a_range_ors_in_at_an_offset() {
-    blaze_sim::check(Config::DEFAULT, |tape| {
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
         let words: Vec<u64> = tape.vec(1..=4, "words", |tape| tape.int("word"));
         let into: Vec<u64> = tape.vec(1..=4, "into", |tape| tape.int("word"));
         let x: usize = tape.int_in(0..=words.len() * 64, "x");
@@ -573,7 +575,7 @@ fn a_range_ors_in_at_an_offset() {
 /// A rank against a count of the reference's members below it.
 #[test]
 fn a_rank_counts_the_members_below() {
-    blaze_sim::check(Config::DEFAULT, |tape| {
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
         let bools: Vec<bool> = tape.vec(1..=499, "bools", |tape| tape.bool("member"));
         let ranked = Ranked::from_bools(bools.iter().copied());
         let mut below = 0;

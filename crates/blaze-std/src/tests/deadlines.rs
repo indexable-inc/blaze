@@ -68,7 +68,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
         Ok(file) => file,
         Err(error) => return Err(format!("harness: {error}")),
     };
-    let (slow_name, held_name): (FileName, FileName) = (slow.name().clone(), held.name().clone());
+    let (slow_name, held_name): (FileName, FileName) = (path("slow").name().clone(), path("held").name().clone());
     io.with_sim(|sim| {
         sim.slow_writes(slow_name, SLOW);
         sim.hold_syncs(held_name);

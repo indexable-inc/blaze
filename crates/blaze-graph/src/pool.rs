@@ -1086,7 +1086,7 @@ impl Pool {
             #[cfg(blaze_check)]
             unreachable!("the model checker's targets have threads");
         }
-        let (ready_tx, ready_rx) = crossbeam_channel::unbounded::<io::Result<()>>();
+        let (ready_tx, ready_rx) = blaze_core::chan::unbounded::<io::Result<()>>();
         let mut threads = Vec::with_capacity(deques.len());
         let mut failed = None;
         for (index, deque) in deques.into_iter().enumerate() {
@@ -2954,9 +2954,9 @@ fn cannot_go_on(broken: &Broken) -> ! {
 /// worker, whose turn can't drive the pools; the panic names the channel. And as
 /// [`block_until`] does, when nothing left could send.
 pub(crate) fn recv<T>(
-    rx: &crossbeam_channel::Receiver<T>,
+    rx: &blaze_core::chan::Receiver<T>,
     name: &'static str,
-) -> Result<T, crossbeam_channel::RecvError> {
+) -> Result<T, blaze_core::chan::RecvError> {
     if THREADS {
         return rx.recv();
     }
@@ -2971,11 +2971,11 @@ pub(crate) fn recv<T>(
             got.set(Some(Ok(it)));
             true
         }
-        Err(crossbeam_channel::TryRecvError::Disconnected) => {
-            got.set(Some(Err(crossbeam_channel::RecvError)));
+        Err(blaze_core::chan::TryRecvError::Disconnected) => {
+            got.set(Some(Err(blaze_core::chan::RecvError)));
             true
         }
-        Err(crossbeam_channel::TryRecvError::Empty) => false,
+        Err(blaze_core::chan::TryRecvError::Empty) => false,
     });
     got.into_inner()
         .unwrap_or_else(|| unreachable!("`block_until` returns once the channel `{name}` answered"))
@@ -3075,17 +3075,17 @@ fn bind_to(cpu: &Cpu) -> io::Result<()> {
 /// of 2026-11-02: workers at `utility` got about 2% of a core each). A pool made where the
 /// budget can't be read (it panics at once in [`crate::exec::shared`]) is not lowered.
 #[cfg(target_os = "macos")]
-fn worker_qos() -> libc::qos_class_t {
+fn worker_qos() -> blaze_sys::posix::proc::qos_class_t {
     match blaze_core::cores::get() {
-        Ok(cores) if cores.lowered() => libc::qos_class_t::QOS_CLASS_DEFAULT,
-        _ => libc::qos_class_t::QOS_CLASS_USER_INITIATED,
+        Ok(cores) if cores.lowered() => blaze_sys::posix::proc::QOS_CLASS_DEFAULT,
+        _ => blaze_sys::posix::proc::QOS_CLASS_USER_INITIATED,
     }
 }
 
 #[cfg(target_os = "macos")]
 fn bind_to(cpu: &Cpu) -> io::Result<()> {
     // SAFETY: sets the calling thread's own QoS class; no memory is passed.
-    let got = unsafe { libc::pthread_set_qos_class_self_np(worker_qos(), 0) };
+    let got = unsafe { blaze_sys::posix::thread::pthread_set_qos_class_self_np(worker_qos(), 0) };
     if got == 0 {
         Ok(())
     } else {
@@ -3120,7 +3120,7 @@ mod tests {
 
     use blaze_alloc_count::measure;
     use blaze_ids::rng::SplitMix64 as Rng;
-    use crossbeam_channel::{bounded, unbounded};
+    use blaze_core::chan::{bounded, unbounded};
     use blaze_core::lock::Lock;
 
     use super::{
@@ -3209,7 +3209,7 @@ mod tests {
             pool: &Pool,
             fill: u64,
             drops: &Arc<AtomicUsize>,
-            tx: crossbeam_channel::Sender<(usize, u64)>,
+            tx: blaze_core::chan::Sender<(usize, u64)>,
             job: usize,
         ) -> u64 {
             let in_place = closure::<N>(fill, Dropped(Arc::clone(drops)));
@@ -3288,7 +3288,7 @@ mod tests {
     fn a_warm_submit_from_outside_allocates_nothing() {
         let pool = Pool::new(&Topology::flat(2), false).unwrap();
         let (tx, rx) = bounded::<usize>(64);
-        let round = |senders: Vec<crossbeam_channel::Sender<usize>>| {
+        let round = |senders: Vec<blaze_core::chan::Sender<usize>>| {
             for (job, tx) in senders.into_iter().enumerate() {
                 pool.submit(None, move || job, move |it| _ = tx.send(it.unwrap()));
             }
@@ -4911,6 +4911,19 @@ mod tests {
         assert!(rx.recv_timeout(LONG).unwrap());
     }
 
+    /// The pool's class is as it was before the after-answer class came (2026-11-21):
+    /// `user-initiated`, or `default` where the process is lowered; never the after-answer
+    /// class (`utility`, blaze_core::threads::qos::AFTER_ANSWER), which only the work after the
+    /// answer takes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_pools_class_is_unchanged_by_the_after_answer_class() {
+        let lowered = matches!(blaze_core::cores::get(), Ok(cores) if cores.lowered());
+        let wanted = if lowered { blaze_sys::posix::proc::QOS_CLASS_DEFAULT } else { blaze_sys::posix::proc::QOS_CLASS_USER_INITIATED };
+        assert_eq!(super::worker_qos(), wanted);
+        assert_ne!(super::worker_qos(), blaze_core::threads::qos::AFTER_ANSWER.raw());
+    }
+
     /// Every worker of a bound pool runs at one class ([`super::worker_qos`]: `user-initiated`,
     /// or `default` at background priority), whatever the performance level of its CPU: none
     /// at `utility` or `background`, which a loaded host starves while the
@@ -4930,13 +4943,13 @@ mod tests {
             pool.submit(
                 None,
                 move || {
-                    let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+                    let mut class = blaze_sys::posix::proc::QOS_CLASS_UNSPECIFIED;
                     let mut relative = 0;
                     // SAFETY: the calling thread's own class and priority, written into the two
                     // locals; the class is one of `qos_class_t`'s, as the kernel only has those.
                     let got = unsafe {
-                        libc::pthread_get_qos_class_np(
-                            libc::pthread_self(),
+                        blaze_sys::posix::thread::pthread_get_qos_class_np(
+                            blaze_sys::posix::thread::pthread_self(),
                             &mut class,
                             &mut relative,
                         )
@@ -5001,7 +5014,7 @@ mod broken {
         time::Duration,
     };
 
-    use crossbeam_channel::bounded;
+    use blaze_core::chan::bounded;
 
     use super::{Pool, Unable, park_plant};
     use crate::topology::{Cpu, Topology};

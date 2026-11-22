@@ -22,6 +22,7 @@ use crate::{
     io::Io,
     mem::Bytes,
     narrow::Allowed,
+    unfinished::Unfinished,
     url::Origin,
 };
 
@@ -107,6 +108,7 @@ impl Streams {
     /// bytes it holds that the peer sent and no [`Stream::recv`] has taken: a send whose
     /// reply would pass it fails with [`Refused::InboxFull`] and keeps none of the reply, so
     /// what a stream holds is bounded by a number its opener said.
+    #[track_caller]
     pub fn open(&self, cx: &Cx, origin: &Origin, inbox_most: usize) -> Result<Stream, StreamsError> {
         // clone: an error's name of its origin, refcounts.
         let refuse = |kind| StreamsError { op: StreamsOp::Open, origin: origin.clone(), kind };
@@ -122,7 +124,13 @@ impl Streams {
             Provider::Handler(_) => {}
         }
         // clone: the stream's provider and origin, refcounts; alloc: none, an empty inbox.
-        Ok(Stream { provider: self.provider.clone(), origin: origin.clone(), inbox: VecDeque::new(), inbox_most })
+        Ok(Stream {
+            provider: self.provider.clone(),
+            origin: origin.clone(),
+            inbox: VecDeque::new(),
+            inbox_most,
+            unfinished: Unfinished::new("streams::Stream", "finish(cx)"),
+        })
     }
 }
 
@@ -147,6 +155,7 @@ pub struct Stream {
     inbox: VecDeque<u8>,
     /// The most bytes `inbox` holds: said by [`Streams::open`]'s caller.
     inbox_most: usize,
+    unfinished: Unfinished,
 }
 
 impl Stream {
@@ -229,7 +238,8 @@ impl Stream {
     /// received is dropped. The one way a `Stream` ends.
     #[blaze::consumes]
     pub fn finish(self, cx: &Cx) -> Result<(), StreamsError> {
-        let Stream { provider, origin, inbox: _, inbox_most: _ } = self;
+        let Stream { provider, origin, inbox: _, inbox_most: _, unfinished } = self;
+        unfinished.finished();
         let finished = match &provider {
             Provider::Host(io) => hosted::call(io, cx, |host| {
                 host.streams.finished += 1;

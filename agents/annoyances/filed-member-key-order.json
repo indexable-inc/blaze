@@ -1,0 +1,14 @@
+{
+ "id": "filed-member-key-order",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane FH (engine piece E2a, frozen heads)",
+ "where": "crates/blaze-ladder/src/front2/project/head_digest.rs `want_at_entry` (an impl fn's want), against blaze-cli order_tests.rs `reversed_order_answers_alike`",
+ "what": "The `Signature` outs of `impl Area for Rect`'s `area` and `impl Rect`'s `new` and `square` moved with the order a file job checked its bodies in, and the reads of every body that read them moved with them.",
+ "cost": "one ignored test (lane PAR) and an hour of reading",
+ "cause": "the entry's want asked the key map for the impl fn's FILED member key (`Keys::filed_member`), which exists only once the impl's head was made in that job's world: made before, the want was found and the out held the head's digest; not yet, the out held the tokens alone",
+ "whys": "a member key is filed as a side effect of making its container's head; the key itself is a pure function of the container and the name (`member_key_of`); the lookup read the side effect instead of computing the key",
+ "class": "an answer that reads a per-job table's side effect (what was filed, interned or made so far) instead of a pure function of the item moves with the job's history",
+ "prevention": "done: the key is computed (`member_key_of`); frozen heads (front2/tables/head.rs) are made in a store of their own and tested forward, reversed and alone for equal bytes, with a planted job-local id the test must catch (head_tests.rs)",
+ "workaround": "none needed now",
+ "state": "fixed"
+}

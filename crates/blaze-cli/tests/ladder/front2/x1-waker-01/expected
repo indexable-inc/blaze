@@ -1,0 +1,5 @@
+status 42
+stdout
+static: polls 3, clones 1, wakes 1, wake_by_ref 1, drops 1
+generic One: polls 3, clones 1, wakes 1, wake_by_ref 1, drops 1
+generic Ten: polls 3, clones 10, wakes 10, wake_by_ref 10, drops 10

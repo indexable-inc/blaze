@@ -1,0 +1,4 @@
+[package]
+name = "ladder-x0-move-13-ref-mut-through-ref"
+version = "0.1.0"
+edition = "2024"

@@ -21,8 +21,16 @@
 //! assert_eq!(TABLE.get("lot"), None);
 //! ```
 
-#![cfg_attr(not(test), no_std)]
+#![no_std]
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::sans_io]
+#![deny(blaze::sans_io_core, blaze::std_use, blaze::implicit_allocator, blaze::process_static)]
 #![forbid(unsafe_code)]
+
+// The tests' growable name sets and `format!`: `core` has neither.
+#[cfg(test)]
+extern crate std;
 
 const K0: u64 = 0x243f_6a88_85a3_08d3;
 const K1: u64 = 0x1319_8a2e_0370_7344;
@@ -383,6 +391,8 @@ macro_rules! name_phf_table {
 
 #[cfg(test)]
 mod tests {
+    use std::{borrow::ToOwned, boxed::Box, format, string::String, vec, vec::Vec};
+
     use super::*;
 
     const KEYWORDS: &[&str] = &[
@@ -391,11 +401,14 @@ mod tests {
         "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct",
         "super", "trait", "true", "try", "type", "unsafe", "use", "where", "while", "yield", "gen",
     ];
-    crate::phf_table!(static TABLE = KEYWORDS;);
+    // By the bare name (textual scope), not `crate::`: the crate-root tool attribute
+    // `#![blaze::sans_io]` makes the crate's contents macro-expanded, and rustc refuses an
+    // absolute path to a macro-expanded `#[macro_export]` macro of the same crate (#52234).
+    phf_table!(static TABLE = KEYWORDS;);
     const EMPTY_KEYS: &[&str] = &[];
-    crate::phf_table!(static NONE = EMPTY_KEYS;);
+    phf_table!(static NONE = EMPTY_KEYS;);
     const ONE_KEY: &[&str] = &[""];
-    crate::phf_table!(static ONE = ONE_KEY;);
+    phf_table!(static ONE = ONE_KEY;);
 
     /// Every key lands on its own slot, and nothing else is found.
     fn check<const S: usize, const B: usize>(table: &Phf<S, B>, others: &[&str]) {
@@ -471,7 +484,7 @@ mod tests {
     const _: () =
         assert!(bytes_eq(b"lint", b"lint") && !bytes_eq(b"lint", b"lints") && bytes_eq(b"", b""));
 
-    crate::name_phf_table!(static BY_NAME = KEYWORDS;);
+    name_phf_table!(static BY_NAME = KEYWORDS;);
 
     /// `intern`'s `value_hash` as it was written before it moved here, closures and all: the
     /// hash images' symbol indices are laid out by.

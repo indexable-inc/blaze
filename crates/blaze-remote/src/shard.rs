@@ -26,9 +26,11 @@ use blaze_ids::ContentId;
 
 use crate::{
     segment::{SegmentId, SegmentRef},
-    trust::{PublicKey, Refusal, Signer, Why, verify_sig},
+    trust::{PublicKey, Refusal, Why, verify_sig},
     wire::{Bounded, id_at, key_at, put_u32, put_u64, sig_at, u32_at, u64_at},
 };
+#[cfg(feature = "sign")]
+use crate::trust::Signer;
 
 pub const ENTRY: usize = 128;
 pub const BLOCK_ENTRIES: usize = 256;
@@ -320,6 +322,7 @@ pub struct Root {
 }
 
 impl Root {
+    #[cfg(feature = "sign")]
     pub fn encode(&self, signer: &Signer) -> Vec<u8> {
         let mut out = Vec::with_capacity(80 + self.runs.iter().map(|it| 16 + it.shards.len() * 72).sum::<usize>() + 96);
         out.extend_from_slice(b"BLRR");
@@ -360,8 +363,8 @@ impl Root {
         }
         let body = bytes.len() - 64;
         let signer = PublicKey(key_at(bytes, body - 32));
-        if !verify_sig(&signer, ROOT_DOMAIN, &bytes[..body], &sig_at(bytes, body)) {
-            return Err(Refusal::new(object, Some(signer.to_string()), Why::Signature));
+        if let Err(why) = verify_sig(&signer, ROOT_DOMAIN, &bytes[..body], &sig_at(bytes, body)) {
+            return Err(Refusal::new(object, Some(signer.to_string()), Why::Signature(why)));
         }
         if u64_at(bytes, 8) != namespace.0 && !crate::planted(crate::Plant::SkipNamespace) {
             return Err(refuse(Why::Namespace { found: u64_at(bytes, 8), wanted: namespace.0 }));

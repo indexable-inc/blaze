@@ -1,0 +1,64 @@
+[package]
+name = "blaze-real"
+description = "blaze's stages on a real checkout (tempo, reth, blaze itself): a harness that calls each stage's public functions and prints what it covered, what stopped it and what it cost (docs/v2/plan/design/tempo.md)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `tokenize`: a file's tokens, which the macro census reads.
+blaze-lex.workspace = true
+# `AVec`, `Alloc`: the census's token column, in the caller's allocator.
+blaze-own.workspace = true
+
+[dev-dependencies]
+blaze-own = { workspace = true, features = ["std"] }
+# `layout::Layout`: the workspace's members, targets, dependencies and features; `lock::Lock`:
+# Cargo.lock.
+blaze-manifest = { workspace = true, default-features = false }
+# `outline`: every file's items.
+blaze-file-items.workspace = true
+# The outline's types.
+blaze-surface.workspace = true
+# `lint`, `Units`: the token lints over every item.
+blaze-lint.workspace = true
+# `prepare`, `expand_prepared`, `lex`: `macro_rules!` calls in item position.
+blaze-expand.workspace = true
+# `ContentId`, `CrateItemKey`: a definition's crate, as the expander names it.
+blaze-id.workspace = true
+# `Edition`: a manifest's edition, mapped to the front end's.
+edition.workspace = true
+# `lower_body`, `typeck::to_typeck`: every body lowered and converted, as the ladder does.
+# By path, as blaze-ladder takes it.
+blaze-lower.workspace = true
+# `PortableTys`, `ItemKey`: what `to_typeck` writes into.
+blaze-typeck.workspace = true
+# Stage h's body calls resolved through the workspace's names (`Names::item_at`,
+# `definition_of`), made as blaze-scope's `workspace` example makes them: the unit graph, the
+# toolchain's packs, the fetch store's records, `unit_crates` and `resolve_crates`.
+blaze-scope.workspace = true
+blaze-unit-graph.workspace = true
+blaze-fetch.workspace = true
+blaze-toolchain.workspace = true
+# Stage h''s proc-macro calls run by blaze-proc-macro's hook over the module store.
+blaze-proc-macro = { workspace = true, features = ["runtime"] }
+# Stage h''s `env!` and `include*!` with each crate's build-script outputs in view: the
+# records read by blaze-world's `ScriptRecords`, laid over the host by `ScriptCx`.
+blaze-world = { workspace = true, features = ["procs-run"] }
+blaze-build-script.workspace = true
+# `run::refusals`: names, check, build and emit of one small program, for the `extensions`
+# example's probe of each language extension. By path, as blaze-lower.
+blaze-ladder.workspace = true
+# The frame `Front2::new` keeps a body's local items in (tempo_front).
+blaze-mem.workspace = true
+
+[lints]
+workspace = true

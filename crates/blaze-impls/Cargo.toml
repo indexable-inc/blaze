@@ -1,0 +1,34 @@
+[package]
+name = "blaze-impls"
+description = "The impl index, lang items and crate graph records of the item layer (docs/v2/plan/design/bottom.md): pure builders and read-in-place views, so which impls of a trait could apply to a self type, and which item a lang item is, are one or two probes of small records, never a walk of a crate"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `Record`, `Slice`, `Writer`, `open_as`: every record here is a blaze-format buffer, read in place.
+# By path: the workspace entry turns on its `serde`, which would bring serde.
+blaze-format.workspace = true
+# `ItemKey`, `CrateItemKey`, `ContentId`, `Portable`: what every record names an item and a crate by.
+blaze-id.workspace = true
+# Integer conversions that say what they do: a bit's place widened to an index.
+blaze-int.workspace = true
+# The records the lookups read (`CrateGraphView`, `NoImplsOfView`, `DirectoryView`,
+# `BucketView`, `LangItemsView`), their builders and their row types: one home, re-exported.
+blaze-surface.workspace = true
+
+[dev-dependencies]
+blaze-sim.workspace = true
+# `Alloc::global()`: the handle the tests build records in.
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

@@ -64,14 +64,13 @@ impl Budget {
     ///
     /// The contract: a refusal names what was asked, and what it says was used never passes
     /// the limit it names.
+    #[core::contracts::ensures(move |r: &Result<(), Over>| match r {
+        Ok(()) => true,
+        Err(over) => over.asked == bytes && over.used <= over.limit,
+    })]
     #[blaze::noalloc]
     #[blaze::nonblocking]
-    pub(crate) fn take(&self, bytes: u64) -> (r: Result<(), Over>)
-        ensures match &r {
-            Ok(()) => true,
-            Err(over) => over.asked == bytes && over.used <= over.limit,
-        }
-    {
+    pub(crate) fn take(&self, bytes: u64) -> Result<(), Over> {
         self.take_here(bytes)?;
         let Some(outer) = &self.outer else { return Ok(()) };
         if let Err(over) = outer.take(bytes) {

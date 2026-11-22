@@ -1,0 +1,7 @@
+fn element_end(list: &[Token], at: usize) -> usize {
+    match list[at].kind {
+        TokenKind::Punct { char: ',', .. } => at + 1,
+        TokenKind::Punct { char: '<', .. } => at,
+        _ => at,
+    }
+}

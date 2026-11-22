@@ -1,0 +1,11 @@
+status 42
+stdout
+thread 1: count 1000, text 1000
+dropped 1
+thread 2: count 1000, text 1000
+dropped 2
+thread 3: count 1000, text 1000
+dropped 3
+thread 4: count 1000, text 1000
+dropped 4
+main: count 7

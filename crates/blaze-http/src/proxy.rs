@@ -35,11 +35,9 @@
 
 #![blaze::sans_io]
 
-use std::{ffi::OsString, fmt, io::Write as _, net::IpAddr};
+use std::{alloc::Global, ffi::OsString, fmt, io::Write as _, net::IpAddr};
 
-use base64::Engine as _;
-
-use crate::h1;
+use blaze_url::{HostPort, HostPortWhy};
 
 /// A proxy's port when its address names none: curl's.
 pub const DEFAULT_PORT: u16 = 1080;
@@ -92,7 +90,7 @@ impl Credentials {
         // alloc: one per connection through a proxy with a user, its header's value.
         let pair = format!("{}:{password}", self.user);
         // alloc: one per connection through a proxy with a user, its header's value.
-        format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(pair))
+        format!("Basic {}", blaze_base64::STANDARD.encode_in(pair.as_bytes(), std::alloc::Global))
     }
 }
 
@@ -343,33 +341,35 @@ fn parse_proxy(var: &'static str, value: &str) -> Result<Proxy, ProxyError> {
             "`{scheme}://` is no proxy scheme (http, socks4, socks4a, socks5 or socks5h)"
         )));
     };
-    // A scheme of no default port, so that one said (`:80`) is kept as said; url's messages
-    // never quote what they parse.
-    // alloc: one per proxy variable set, read once as a client is made.
-    let url = url::Url::parse(&format!("proxy://{rest}"))
-        // alloc: an error's message, made only when it fails.
-        .map_err(|e| refuse(format!("it is not a proxy's address: {e}")))?;
-    // alloc: one per proxy variable set, the host the driver resolves.
-    let host = match url.host() {
-        Some(url::Host::Domain(it)) if !it.is_empty() => it.to_owned(),
-        Some(url::Host::Ipv4(it)) => it.to_string(),
-        Some(url::Host::Ipv6(it)) => it.to_string(),
-        // alloc: an error's message, made only when it fails.
-        Some(url::Host::Domain(_)) | None => return Err(refuse("it names no host".to_owned())),
+    // `[user[:password]@]host[:port]`, a path, query or fragment after it dropped as curl
+    // drops them. The messages never quote the value: it may hold a password.
+    let rest = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let (userinfo, at) = match rest.rsplit_once('@') {
+        Some((userinfo, at)) => (Some(userinfo), at),
+        None => (None, rest),
     };
-    let port = url.port().unwrap_or(DEFAULT_PORT);
+    if at.is_empty() {
+        // alloc: an error's message, made only when it fails.
+        return Err(refuse("it names no host".to_owned()));
+    }
+    // A port said (`:80`) is kept as said; none is curl's.
+    let checked = match HostPort::parse(at) {
+        Err(e) if e.why == HostPortWhy::NoPort => HostPort::new(at, DEFAULT_PORT),
+        parsed => parsed,
+    };
+    // alloc: an error's message, made only when it fails.
+    let checked = checked.map_err(|e| refuse(format!("its host and port {}", e.why.says())))?;
+    // alloc: one per proxy variable set, the host the driver resolves (an IPv6 one bare).
+    let host = checked.host().strip_prefix('[').and_then(|it| it.strip_suffix(']')).unwrap_or(checked.host()).to_owned();
+    let port = checked.port();
     let decode = |part: &str| {
-        percent_encoding::percent_decode_str(part)
-            .decode_utf8()
-            // alloc: one per proxy credential, read once as a client is made.
-            .map(|it| it.into_owned())
-            // alloc: an error's message, made only when it fails.
-            .map_err(|_| {
-                refuse("its user or password is not UTF-8 once percent-decoded".to_owned())
-            })
+        // alloc: an error's message, made only when it fails.
+        percent_decoded(part).ok_or_else(|| refuse("its user or password is not UTF-8 once percent-decoded".to_owned()))
     };
-    let user = decode(url.username())?;
-    let password = url.password().map(decode).transpose()?;
+    let (user, password) = match userinfo.map(|it| it.split_once(':').map_or((it, None), |(user, password)| (user, Some(password)))) {
+        Some((user, password)) => (decode(user)?, password.map(decode).transpose()?),
+        None => (String::new(), None),
+    };
     let auth = (!user.is_empty() || password.is_some()).then_some(Credentials { user, password });
     if let Some(auth) = &auth {
         match kind {
@@ -397,6 +397,29 @@ fn parse_proxy(var: &'static str, value: &str) -> Result<Proxy, ProxyError> {
         }
     }
     Ok(Proxy { kind, host, port, auth })
+}
+
+/// `part` with each `%XX` (two hex digits) made the byte it names, a `%` not so followed kept
+/// as it is (as the WHATWG URL standard decodes); none once it is not UTF-8.
+fn percent_decoded(part: &str) -> Option<String> {
+    let bytes = part.as_bytes();
+    // alloc: one per proxy credential, read once as a client is made.
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let hex = |i: usize| bytes.get(i).and_then(|&b| (b as char).to_digit(16));
+        match (bytes[at], hex(at + 1), hex(at + 2)) {
+            (b'%', Some(high), Some(low)) => {
+                out.push((high * 16 + low) as u8);
+                at += 3;
+            }
+            (byte, ..) => {
+                out.push(byte);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// `host:port`, an IPv6 host in brackets.
@@ -525,9 +548,11 @@ impl Handshake {
                 }
                 State::Done => return Ok(Some(std::mem::take(&mut self.input))),
                 State::Connect => {
-                    let head = match h1::parse_head(&self.input, false) {
-                        Ok(Some(head)) => head,
-                        Ok(None) => return Ok(None),
+                    // The head is read from the start each time more comes, at most
+                    // `ANSWER.most_head` bytes: a parser kept between calls would save little.
+                    let mut head = blaze_h1::Response::new_in(crate::client::ANSWER, false, Global);
+                    let fed = match head.feed_head(&self.input) {
+                        Ok(fed) => fed,
                         Err(why) => {
                             // alloc: an error's message, made only when it fails.
                             return Err(format!(
@@ -536,8 +561,12 @@ impl Handshake {
                             ));
                         }
                     };
-                    if !(200..300).contains(&head.status) {
-                        let hint = match head.status {
+                    if !head.has_head() {
+                        return Ok(None);
+                    }
+                    let status = head.status();
+                    if !(200..300).contains(&status) {
+                        let hint = match status {
                             407 => {
                                 " (it wants credentials: name them in the proxy's address, http://user:password@host:port)"
                             }
@@ -548,10 +577,10 @@ impl Handshake {
                             "the proxy {} refused to tunnel to {}: {}{hint}",
                             self.proxy.at(),
                             authority(&self.host, self.port),
-                            head.status,
+                            status,
                         ));
                     }
-                    self.input.drain(..head.len);
+                    self.input.drain(..fed.consumed);
                     self.state = State::Done;
                 }
                 State::Socks5Method => {

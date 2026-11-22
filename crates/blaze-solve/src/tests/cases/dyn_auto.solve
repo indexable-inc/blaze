@@ -1,0 +1,176 @@
+# Auto traits through trait objects and deep blanket impls, at the nesting depth of tempo's
+# alloy providers (FillProvider<JoinFill<..>, RootProvider> behind `&` and `&&`). The false
+# `error[types]` findings of the tempo run (2026-11-18) came from one cause: a `dyn` principal
+# whose dyn compatibility the world could not decide (`Future`, `Stream`: a gap) was taken as
+# not compatible, which removes every object candidate, so `dyn Future + Send: Send` answered
+# No. References: vendor/rustc_next_trait_solver/src/solve/assembly/mod.rs
+# assemble_object_bound_candidates ("Do not consider built-in object impls for dyn-incompatible
+# types"), trait_goals.rs consider_auto_trait_candidate, search_graph (coinduction, overflow).
+
+# The prelude's `Box<T>(T)` holds its `T` inline (its parameter implicitly `Sized`), so in this
+# world `Box<dyn Tr>` is NOT `Sized` (an ADT is `Sized` by its tail field), and anything holding
+# one is unsized and fails every impl's implicit `P: Sized`. The real Box and Arc are pointers
+# (`Box<T: ?Sized, A>(Unique<T>, A)`, `Arc<T: ?Sized, A> { ptr: NonNull<ArcInner<T>>, .. }`):
+# `Heap` and `Arc` here are pointer-shaped as they are, with Arc's own `?Sized` impls
+# (alloc/src/sync.rs: `unsafe impl<T: ?Sized + Sync + Send, A: Allocator + Send> Send for
+# Arc<T, A>`).
+extern struct Heap<T: ?Sized>(*const T)
+extern struct Arc<T: ?Sized>(*const T)
+extern impl<T: ?Sized + Send + Sync> Send for Arc<T>
+extern impl<T: ?Sized + Send + Sync> Sync for Arc<T>
+
+trait Fut { type Output; }
+dyn_undecided trait Stream { type Item; }
+trait Transport: Send + Sync
+trait Net
+struct Eth
+impl Net for Eth
+trait Tx<N>
+trait Prov<N>: Send + Sync
+struct Gas
+struct Nonce
+struct Chain
+struct Blob
+struct Wallet
+struct NoTx
+struct Join<L, R>(L, R)
+impl<N> Tx<N> for Gas
+impl<N> Tx<N> for Nonce
+impl<N> Tx<N> for Chain
+impl<N> Tx<N> for Blob
+impl<N> Tx<N> for Wallet
+impl<N, L: Tx<N>, R: Tx<N>> Tx<N> for Join<L, R>
+struct Root(Arc<dyn Transport>, Heap<dyn Fut<Output = u8> + Send + Sync>)
+struct RootRc(Rc<u8>)
+impl<N> Prov<N> for Root
+impl<N> Prov<N> for RootRc
+struct Fill<F, P>(F, P)
+impl<N, F: Tx<N>, P: Prov<N>> Prov<N> for Fill<F, P>
+impl<N, T: Prov<N> + ?Sized> Prov<N> for &T
+# The real shape (alloy-provider fillers/mod.rs: `pub struct FillProvider<F, P, N = Ethereum>
+# { filler: F, provider: P, _pd: PhantomData<fn() -> N> }`, `impl<F, P, N> Provider<N> for
+# FillProvider<F, P, N> where F: TxFiller<N>, P: Provider<N>, N: Network`; RootProvider<N =
+# Ethereum> likewise): the network is IN the self type. A second network makes `?: Net`
+# ambiguous as alloy's Ethereum and AnyNetwork (and tempo's own) do.
+struct Op
+impl Net for Op
+struct RootN<N>(Arc<dyn Transport>, PhantomData<fn() -> N>)
+impl<N: Net> Prov<N> for RootN<N>
+struct FillN<F, P, N>(F, P, PhantomData<fn() -> N>)
+impl<F: Tx<N>, P: Prov<N>, N: Net> Prov<N> for FillN<F, P, N>
+
+# ---- the object rule: a listed auto trait, an auto supertrait ----
+
+case dyn_listed_send_yes = assembly/mod.rs::assemble_object_bound_candidates
+goal dyn Fut<Output = u8> + Send: Send => yes
+goal Box<dyn Fut<Output = u8> + Send>: Send => yes
+
+case dyn_unlisted_sync_no = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
+goal dyn Fut<Output = u8> + Send: Sync => no
+
+case dyn_auto_supertrait_yes = assembly/mod.rs::assemble_object_bound_candidates (elaborated supertraits)
+# `trait Transport: Send + Sync`: the object implements its supertraits (the Reference, "Trait
+# object types").
+goal dyn Transport: Send => yes
+goal dyn Transport: Sync => yes
+goal Arc<dyn Transport>: Send => yes
+goal Arc<Heap<dyn Transport>>: Sync => yes
+
+case world_box_dyn_unsized = structural_traits.rs::instantiate_constituent_tys_for_sizedness_trait
+# Pins the world's shape the nest cases rest on: the prelude's inline `Box<dyn Tr>` is unsized
+# (its tail is the object), the pointer-shaped `Heap<dyn Tr>` is `Sized`, and so is a struct
+# holding it. The first nest run (2026-11-18) failed eight goals on `Box` here, not the solver.
+goal Box<dyn Transport>: Sized => no
+goal Heap<dyn Transport>: Sized => yes
+goal Root: Sized => yes
+
+# ---- an undecided principal stops, never answers No (rule 3) ----
+
+case dyn_undecided_stops = assembly/mod.rs::assemble_object_bound_candidates (trait_is_dyn_compatible)
+goal dyn Stream<Item = u8> + Send: Send => dyn_undecided
+goal Box<dyn Stream<Item = u8> + Send>: Send => dyn_undecided
+goal wf(dyn Stream<Item = u8>) => dyn_undecided
+
+case dyn_undecided_control = assembly/mod.rs::assemble_object_bound_candidates
+# The control beside it: the same goals over a decided principal answer.
+goal dyn Fut<Output = u8> + Send: Send => yes
+goal Box<u8>: Send => yes
+
+# ---- the nest, at tempo's depth ----
+
+case nest_root_send_sync_yes = trait_goals.rs::consider_auto_trait_candidate
+goal Root: Send => yes
+goal Root: Sync => yes
+
+case nest_fill_prov_yes = trait_goals.rs::consider_impl_candidate
+goal Fill<Join<Gas, Join<Nonce, Join<Chain, Join<Blob, Wallet>>>>, Root>: Prov<Eth> => yes
+goal &'static Fill<Join<Gas, Join<Nonce, Join<Chain, Join<Blob, Wallet>>>>, Root>: Prov<Eth> => yes
+goal &'static &'static Fill<Join<Gas, Join<Nonce, Join<Chain, Join<Blob, Wallet>>>>, Root>: Prov<Eth> => yes
+goal Fill<Join<Gas, Join<Nonce, Join<Chain, Join<Blob, Wallet>>>>, Root>: Send => yes
+
+case nest_fill_prov_infer_two_params_maybe = trait_goals.rs::consider_impl_candidate
+# The two-parameter shape (no network in the self type): one impl applies at each level (`&T`,
+# then `Fill`, `Root`, the `Tx` leaves), and nothing in the self type names the network, so no
+# nested goal fixes `?0`. Every impl's `N` is implicitly `Sized`, and `?0: Sized` with a
+# variable self type is ambiguous (the reference's forced ambiguity on an inference variable),
+# so the answer is maybe, as rustc's: the goal holds only once something else fixes `?0`.
+goal &'static Fill<Join<Gas, Join<Nonce, Join<Chain, Join<Blob, Wallet>>>>, Root>: Prov<?0> => maybe
+
+case nest_fill_n_prov_infer_yes = trait_goals.rs::consider_impl_candidate
+# The real shape with its network written (or its default `N = Eth` applied where the type is
+# lowered): one impl per level, and the `FillN` impl's self type fixes `N := Eth`, which its
+# trait reference `Prov<N>` passes to `?0`. Yes with the constraint.
+goal &'static &'static FillN<Join<Gas, Join<Nonce, Join<Chain, Join<Blob, Wallet>>>>, RootN<Eth>, Eth>: Prov<?0> => yes ?0 = Eth
+goal FillN<Join<Gas, Join<Nonce, Join<Chain, Join<Blob, Wallet>>>>, RootN<Eth>, Eth>: Send => yes
+
+case nest_fill_n_prov_open_network_maybe = trait_goals.rs::consider_impl_candidate
+# The real shape with its network NOT fixed in the self type (`?1`: a default not applied, or an
+# expression whose `N` nothing constrains): the impls unify `?0 := ?1`, and `?1: Net` has two
+# impls (`Eth`, `Op`), so it is ambiguous: maybe, never no. This is the miniature of a
+# `Provider<_>` goal left open; whatever fixes `?1` (the default, a later use) decides it.
+goal &'static FillN<Join<Gas, Join<Nonce, Join<Chain, Join<Blob, Wallet>>>>, RootN<?1>, ?1>: Prov<?0> => maybe
+
+case nest_fill_n_wrong_network_no = trait_goals.rs::consider_impl_candidate
+# The negative beside it: a network that is no `Net` fails.
+goal FillN<Gas, RootN<u8>, u8>: Prov<u8> => no
+
+case nest_leaf_not_tx_no = trait_goals.rs::consider_impl_candidate
+# One leaf (`NoTx`) has no `Tx` impl: the whole nest fails.
+goal &'static Fill<Join<Gas, Join<Nonce, Join<Chain, Join<Blob, NoTx>>>>, Root>: Prov<Eth> => no
+
+case nest_rc_not_send_no = trait_goals.rs::consider_auto_trait_candidate
+goal Fill<Join<Gas, Wallet>, RootRc>: Send => no
+
+# ---- PhantomData<fn() -> N>, a self-referential Arc ----
+
+case phantom_fn_send_yes = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+# A fn pointer is Send and Sync whatever it returns: `PhantomData<fn() -> Rc<u8>>` is Send.
+struct Marked<N>(PhantomData<fn() -> N>, u8)
+goal Marked<Rc<u8>>: Send => yes
+goal Marked<Rc<u8>>: Sync => yes
+
+case phantom_owned_rc_no = structural_traits.rs::instantiate_constituent_tys_for_auto_trait
+# The control: owning the `Rc` (not a fn returning it) is not Send.
+struct Owned<N>(PhantomData<N>, u8)
+goal Owned<Rc<u8>>: Send => no
+
+case arc_self_cycle_yes = search_graph (coinductive: auto-trait goals through an impl's where-clauses)
+# `Arc<T>: Send` needs `T: Send + Sync`; `Inner` holds an `Arc<Inner>`, so the goal meets
+# itself through the impl's where-clause, a coinductive cycle that holds.
+struct Inner(Option<Arc<Inner>>, u8)
+goal Inner: Send => yes
+goal Inner: Sync => yes
+
+case arc_self_cycle_rc_no = search_graph
+struct InnerRc(Option<Arc<InnerRc>>, Rc<u8>)
+goal InnerRc: Send => no
+
+# ---- real recursion past the limit is overflow, not "unsatisfied" ----
+
+case recursion_past_limit_overflows = search_graph (recursion limit)
+# Each step asks the goal of a larger type, so no cycle closes: the depth limit is reached and
+# the answer is overflow (rustc: E0275), never No.
+trait Deep
+struct Grow<T>(T)
+impl<T> Deep for Grow<T> where Grow<Vec<T>>: Deep
+goal Grow<u8>: Deep => overflow

@@ -1,0 +1,15 @@
+{
+ "id": "ra3-frozen-heads-wiring",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane RA3",
+ "where": "crates/blaze-cli/src/engine_seeds.rs, engine_bodies.rs run_stretch, crates/blaze-ladder/src/front2/tables/seeds.rs",
+ "what": "wiring the request's frozen heads into the engine's Bodies phase. Three things cost time: (1) the session had no Grep or Glob tool, so every signature was read through read-only grep and sed -n; (2) a worker cannot read the store (PlainPlace and Lent hold RefCells, CommandStore is not Sync), so the dependency heads 'found in the store' must be loaded on the coordinator before the phase, not looked up lazily by the body that needs one; (3) FrozenTable held AVec over Alloc, which is not Sync, although the table is documented as shared read-only by every worker; it needed an unsafe Sync impl with a stated reason.",
+ "cost": "about an hour of reading signatures by grep",
+ "cause": "the store's read path is single-threaded by type; Alloc carries no Sync even for a read-only holder",
+ "whys": "the store was built for one coordinator; the frozen table was built and tested on one worker (the cost test)",
+ "class": "a shared read-only structure whose element type is not Sync for a reason that only applies to mutation",
+ "prevention": "not done: a Sync read handle on the store (a mapped segment read by key from any worker) would let a body read a dependency head in place, on demand, instead of the coordinator loading every listed head per request",
+ "annoyance": "Grep and Glob missing in the lane's session",
+ "workaround": "read-only grep and sed -n through Bash, as the brief allowed",
+ "state": "open"
+}

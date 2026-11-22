@@ -22,7 +22,7 @@
 //! `(values)`, `[blocks]` or `[lanes]`, an immediate in decimal, a constant as hex words
 //! from the most significant, and rows of the tables as `refN`, `sN`, `ssN`, `iN`, `aN`.
 
-use std::fmt::{self, Write as _};
+use std::fmt;
 
 use crate::{
     flags::{AtomicRmw, FloatCond, IntCond, Shown},
@@ -222,7 +222,22 @@ fn tables(view: &View<'_>, out: &mut impl fmt::Write) -> fmt::Result {
             }
             write!(out, "{} ref{} {}", reloc.offset, reloc.target, reloc.addend)?;
         }
-        out.write_str("]\n")?;
+        out.write_char(']')?;
+        // Written only when there are some, so a row without them prints as before positions
+        // existed.
+        let positions = view.data_positions_of(crate::func::DataId(r as u32));
+        if !positions.is_empty() {
+            out.write_str(" positions [")?;
+            for (i, position) in positions.iter().enumerate() {
+                if i > 0 {
+                    out.write_str(", ")?;
+                }
+                let field = crate::func::PositionField::from_word(position.field).map_or("?", crate::func::PositionField::name);
+                write!(out, "{} {field} 0x{:032x} {}", position.offset, position.item_key(), position.site)?;
+            }
+            out.write_char(']')?;
+        }
+        out.write_char('\n')?;
     }
     for (r, rec) in view.intrinsics.iter().enumerate() {
         write!(out, "intrinsic i{r} = ")?;

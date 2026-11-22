@@ -1,6 +1,6 @@
 [package]
 name = "blaze-hash"
-description = "blaze v2's in-memory hashing: maps and sets on foldhash with a fixed seed, and the identity hasher for keys that are hashes already"
+description = "blaze v2's in-memory hashing: maps and sets on a port of foldhash with a fixed seed, and the identity hasher for keys that are hashes already"
 publish = false
 
 version.workspace = true
@@ -13,17 +13,33 @@ repository.workspace = true
 [lib]
 doctest = false
 
+# Adapters to crates from outside the workspace, which the crates above turn on (the root
+# manifest's `blaze-hash` entry): with none on, this crate's dependencies are blaze-own and
+# blaze-swiss, workspace crates with no dependency from outside it (docs/v2/plan/design/bottom.md,
+# "Also decided on 2026-11-15").
+[features]
+# (`serde`, serde's forms of `Map` and `Set`, was removed on 2026-11-20: `hash_set` says why.)
+# `SharedMap`, `SharedSet` and `SharedByHash`: sharded tables read with no lock (`shared`),
+# whose unlinked entries `blaze-reclaim` frees once no reader can hold them.
+shared = ["dep:blaze-reclaim"]
+
 [dependencies]
-foldhash.workspace = true
-hashbrown.workspace = true
-papaya.workspace = true
-serde.workspace = true
+blaze-own.workspace = true
+blaze-reclaim = { workspace = true, optional = true }
+blaze-swiss.workspace = true
+
+# The shared tables' atomics, lock and tracked entries, explored by the model checker.
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+# The tests and the cost example make their tables with the tests' root allocator (`blaze_own::testing::heap`).
+blaze-own = { workspace = true, features = ["std", "testing"] }
 blaze-sim.workspace = true
-# What `IndexMap` replaces: the other side of `collections_cost`'s rows.
-indexmap.workspace = true
+# What `fold` is a port of: `fold_is_foldhash` holds it to this, and `hash_cost` measures its
+# random-seeded form.
+foldhash.workspace = true
 
 [lints]
 workspace = true

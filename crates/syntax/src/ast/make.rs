@@ -18,8 +18,8 @@
 
 mod quote;
 
-use either::Either;
-use itertools::Itertools;
+use stdx::Either;
+use stdx::iter::IterExt;
 use parser::{Edition, T};
 use stdx::{format_to, format_to_acc, never};
 use syntax_tree::NodeOrToken;
@@ -283,8 +283,10 @@ fn merge_gen_params(
         (Some(ps), None) => Some(ps),
         (Some(ps), Some(bs)) => {
             // make sure lifetime is placed before other generic params
-            let generic_params = ps.generic_params().merge_by(bs.generic_params(), |_, b| {
-                !matches!(b, ast::GenericParam::LifetimeParam(_))
+            let (mut ps, mut bs) = (ps.generic_params().peekable(), bs.generic_params().peekable());
+            let generic_params = std::iter::from_fn(move || match (ps.peek(), bs.peek()) {
+                (Some(_), Some(ast::GenericParam::LifetimeParam(_))) | (None, _) => bs.next(),
+                (Some(_), _) => ps.next(),
             });
             Some(generic_param_list(generic_params))
         }
@@ -1132,7 +1134,12 @@ pub fn type_bound(bound: ast::Type) -> ast::TypeBound {
 pub fn type_bound_list(
     bounds: impl IntoIterator<Item = ast::TypeBound>,
 ) -> Option<ast::TypeBoundList> {
-    let bounds = bounds.into_iter().map(|it| it.to_string()).unique().join(" + ");
+    let mut seen = Vec::new();
+    let bounds = bounds
+        .into_iter()
+        .map(|it| it.to_string())
+        .filter(|it| !seen.contains(it) && { seen.push(it.clone()); true })
+        .join(" + ");
     if bounds.is_empty() {
         return None;
     }
@@ -1468,12 +1475,12 @@ pub mod tokens {
 
 #[cfg(test)]
 mod tests {
-    use expect_test::expect;
+    use test_utils::expect;
 
     use super::*;
 
     #[track_caller]
-    fn check(node: impl AstNode, expect: expect_test::Expect) {
+    fn check(node: impl AstNode, expect: test_utils::Expect) {
         let node_debug = format!("{:#?}", node.syntax());
         expect.assert_eq(&node_debug);
     }

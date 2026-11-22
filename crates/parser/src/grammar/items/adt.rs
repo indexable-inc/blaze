@@ -4,20 +4,20 @@ use super::*;
 
 // test struct_item
 // struct S {}
-pub(super) fn strukt(p: &mut Parser<'_>, m: Marker) {
+pub(super) fn strukt<S: Sink>(p: &mut Parser<'_, S>, m: Marker) {
     p.bump(T![struct]);
     struct_or_union(p, m, true);
 }
 
 // test union_item
 // struct U { i: i32, f: f32 }
-pub(super) fn union(p: &mut Parser<'_>, m: Marker) {
+pub(super) fn union<S: Sink>(p: &mut Parser<'_, S>, m: Marker) {
     assert!(p.at_contextual_kw(T![union]));
     p.bump_remap(T![union]);
     struct_or_union(p, m, false);
 }
 
-fn struct_or_union(p: &mut Parser<'_>, m: Marker, is_struct: bool) {
+fn struct_or_union<S: Sink>(p: &mut Parser<'_, S>, m: Marker, is_struct: bool) {
     name_r(p, ITEM_RECOVERY_SET);
     generic_params::opt_generic_param_list(p);
     match p.current() {
@@ -52,7 +52,7 @@ fn struct_or_union(p: &mut Parser<'_>, m: Marker, is_struct: bool) {
     m.complete(p, if is_struct { STRUCT } else { UNION });
 }
 
-pub(super) fn enum_(p: &mut Parser<'_>, m: Marker) {
+pub(super) fn enum_<S: Sink>(p: &mut Parser<'_, S>, m: Marker) {
     p.bump(T![enum]);
     name_r(p, ITEM_RECOVERY_SET);
     generic_params::opt_generic_param_list(p);
@@ -65,9 +65,9 @@ pub(super) fn enum_(p: &mut Parser<'_>, m: Marker) {
     m.complete(p, ENUM);
 }
 
-pub(crate) fn variant_list(p: &mut Parser<'_>) {
+pub(crate) fn variant_list<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T!['{']));
-    let m = p.start();
+    let m = p.start_list(VARIANT_LIST);
     p.bump(T!['{']);
     while !p.at(EOF) && !p.at(T!['}']) {
         if p.at(T!['{']) {
@@ -82,7 +82,7 @@ pub(crate) fn variant_list(p: &mut Parser<'_>) {
     p.expect(T!['}']);
     m.complete(p, VARIANT_LIST);
 
-    fn variant(p: &mut Parser<'_>) {
+    fn variant<S: Sink>(p: &mut Parser<'_, S>) {
         let m = p.start();
         attributes::outer_attrs(p);
         if p.at(IDENT) {
@@ -119,9 +119,9 @@ pub(crate) fn variant_list(p: &mut Parser<'_>) {
 
 // test record_field_list
 // struct S { a: i32, b: f32, unsafe c: u8 }
-pub(crate) fn record_field_list(p: &mut Parser<'_>) {
+pub(crate) fn record_field_list<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T!['{']));
-    let m = p.start();
+    let m = p.start_list(RECORD_FIELD_LIST);
     p.bump(T!['{']);
     while !p.at(T!['}']) && !p.at(EOF) {
         if p.at(T!['{']) {
@@ -136,7 +136,7 @@ pub(crate) fn record_field_list(p: &mut Parser<'_>) {
     p.expect(T!['}']);
     m.complete(p, RECORD_FIELD_LIST);
 
-    fn record_field(p: &mut Parser<'_>) {
+    fn record_field<S: Sink>(p: &mut Parser<'_, S>) {
         let m = p.start();
         // test record_field_attrs
         // struct S { #[attr] f: f32 }
@@ -198,9 +198,9 @@ const TUPLE_FIELD_FIRST: TokenSet =
 // test_err tuple_field_list_recovery
 // struct S(struct S;
 // struct S(A,,B);
-fn tuple_field_list(p: &mut Parser<'_>) {
+fn tuple_field_list<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T!['(']));
-    let m = p.start();
+    let m = p.start_list(TUPLE_FIELD_LIST);
     delimited(
         p,
         T!['('],

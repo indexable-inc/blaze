@@ -6,8 +6,8 @@
 //!   keys XOR their AND, read in one pass that also stops on input already in order.
 //! - Up to [`SMALL`] elements it is an insertion sort.
 //! - From [`PARALLEL`] elements each pass counts and scatters by chunks on several workers
-//!   (as mold sorts): those of the pool the calling thread works for, named by the hook
-//!   [`set_ambient`] (`blaze-graph`'s `Pool` installs it), or those given to [`on`]. A stable
+//!   (as mold sorts): those given to [`on`] (or, deprecated, those of the pool the calling
+//!   thread works for, named by the process-wide hook [`set_ambient`]). A stable
 //!   sort's output is one permutation whatever the chunking, so it is the same on any number of
 //!   threads.
 //!
@@ -32,11 +32,15 @@
     reason = "a parallel scatter: jobs write disjoint ranges of one buffer at once (`Parts`), which the `unsafe trait Workers` promises run exactly once each before `run` returns; and a CSR's items set to their length once every place is written"
 )]
 
+// Not yet `#![no_std]`: the scratch of `sort`, `sort_pairs`, `sort_by_key` and the parallel
+// counters are `Vec`s on the global heap (`Vec::new()`, `vec!`, `collect`), the public scratch
+// is a `Vec<T>` (`sort_copy_by_key_in`), a parallel pass catches a job's panic to free its
+// buffers first (`catch_unwind`, std's), and the deprecated `set_ambient` keeps its `OnceLock`.
+// Each goes as one port with this crate's thirteen users (wave-1124-sansio, W1 group a's
+// report).
+use core::{mem::MaybeUninit, ops::Range, panic::AssertUnwindSafe, slice};
 use std::{
-    mem::MaybeUninit,
-    ops::Range,
-    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
-    slice,
+    panic::{catch_unwind, resume_unwind},
     sync::OnceLock,
 };
 
@@ -152,13 +156,21 @@ unsafe impl Workers for Serial {
 
 /// Gives `with` the workers of the pool the calling thread works for, and says whether there
 /// was one (it does not call `with` when not).
+///
+/// Deprecated with [`set_ambient`].
 // dyn: this crate is below the pool's and can't name it; asked once per sort from `PARALLEL` items.
 pub type Ambient = fn(with: &mut dyn FnMut(&dyn Workers)) -> bool;
 
+/// The hook [`set_ambient`] installs: process state (rule 75), kept only for the deprecated
+/// ambient sorts, and gone with their last caller.
 static HOOK: OnceLock<Ambient> = OnceLock::new();
 
 /// Installs the hook a sort from [`PARALLEL`] elements asks for its thread's workers. The first
 /// hook installed stays.
+///
+/// Deprecated: a process-wide hook (rule 75); the caller names its workers with [`on`] (or
+/// [`Radix::SERIAL`]). Goes with its last caller, blaze-graph's pool.rs:982, once the ambient
+/// sorts' callers name their workers.
 pub fn set_ambient(hook: Ambient) {
     _ = HOOK.set(hook);
 }
@@ -172,7 +184,13 @@ pub struct Radix<'a> {
 
 impl Radix<'static> {
     /// Sorts with the workers of the pool the calling thread works for, if it does.
+    ///
+    /// Deprecated: asks the process-wide hook (rule 75); use [`on`] with the caller's workers or
+    /// [`Radix::SERIAL`]. Goes with the free sorts below, its callers.
     pub const AMBIENT: Radix<'static> = Radix { workers: None };
+
+    /// Sorts on the calling thread alone ([`Serial`]), at any size.
+    pub const SERIAL: Radix<'static> = Radix { workers: Some(&Serial) };
 }
 
 /// Sorts on `workers` from [`PARALLEL`] elements.
@@ -182,23 +200,28 @@ pub fn on(workers: &dyn Workers) -> Radix<'_> {
 }
 
 /// Sorts `keys` ascending.
+///
+/// Deprecated, as each free sort here is: sorts with [`Radix::AMBIENT`]'s hook; use
+/// `radix::on(workers).sort(..)` or `Radix::SERIAL.sort(..)`. The free sorts go with their last
+/// callers (blaze-v2-proof, blaze-format-tiers, blaze-resolve, blaze-core's uring, blaze-manifest,
+/// syntax-tree, blaze-ids, blaze-graph, syntax; listed in wave-1124-sansio, W1 group a's report).
 pub fn sort<K: Key>(keys: &mut [K]) {
     Radix::AMBIENT.sort(keys);
 }
 
-/// Sorts `pairs` by key, stably: pairs of one key keep their order.
+/// Sorts `pairs` by key, stably: pairs of one key keep their order. Deprecated as [`sort`] is.
 pub fn sort_pairs<K: Key>(pairs: &mut [(K, u32)]) {
     Radix::AMBIENT.sort_pairs(pairs);
 }
 
 /// Sorts `items` by `key` stably, calling `key` once per item (as `slice::sort_by_cached_key`).
-/// At most 2^32 items.
+/// At most 2^32 items. Deprecated as [`sort`] is.
 pub fn sort_by_key<T, K: Key>(items: &mut [T], key: impl FnMut(&T) -> K) {
     Radix::AMBIENT.sort_by_key(items, key);
 }
 
 /// Sorts `items` by `key` stably, calling `key` once per item and pass: for small `Copy` items
-/// whose key is a field or a cheap packing of fields.
+/// whose key is a field or a cheap packing of fields. Deprecated as [`sort`] is.
 pub fn sort_copy_by_key<T: Copy + Send + Sync, K: Key>(
     items: &mut [T],
     key: impl Fn(&T) -> K + Sync,
@@ -208,7 +231,8 @@ pub fn sort_copy_by_key<T: Copy + Send + Sync, K: Key>(
 
 /// [`sort_copy_by_key`] in the caller's `scratch`, whose contents after are unspecified: below
 /// [`PARALLEL`] items (or with no workers) and 2^32 items, a sort whose `scratch` has the
-/// capacity for `items` allocates nothing, its counters being on the stack.
+/// capacity for `items` allocates nothing, its counters being on the stack. Deprecated as
+/// [`sort`] is.
 pub fn sort_copy_by_key_in<T: Copy + Send + Sync, K: Key>(
     items: &mut [T],
     key: impl Fn(&T) -> K + Sync,
@@ -532,7 +556,7 @@ fn passes<E: Copy, K: Key, C: Count>(
             }
             resume_unwind(panic);
         }
-        std::mem::swap(&mut src, &mut dst);
+        core::mem::swap(&mut src, &mut dst);
     }
     if plan.len % 2 == 1 {
         items.copy_from_slice(scratch);

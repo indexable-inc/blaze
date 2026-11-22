@@ -42,7 +42,8 @@ and BLAZE_HOME set:
     no-op      `blaze run` again, nothing changed: the same line
     body-edit  the printed number changed, `blaze run`: the new line
     comment    a comment line added at the top, `blaze run`: the line of the body edit
-    check      `blaze check`: exit 0
+    check      `blaze check`: exit 3 and its "incomplete" closing line while a stage `check` is
+               defined to run is not built (blaze-cli work.rs `CHECK_STAGES`); exit 0 once all are
     stop       `blaze stop`: exit 0 (it exits 0 saying "no daemon is running" when none is)
 
 The four `run` steps are a chain: after one fails, the rest of the chain is skipped (each is an
@@ -128,6 +129,14 @@ enum Step {
 }
 
 /// Every step, in the order each project runs them and its quote lists them.
+/// `blaze check`'s exit status while a stage it is defined to run is not built: 3, "incomplete"
+/// (blaze-cli main.rs `INCOMPLETE`, `blaze explain 3`). The stages are blaze-cli work.rs
+/// `CHECK_STAGES`, which this script cannot reach; the day every one is `true`, `check` exits 0
+/// and this turns 0 with it, so the smoke run never passes a check that said less than it did.
+const CHECK_STATUS: i32 = 3;
+/// The word of `check`'s closing line while stages are missing ("incomplete · NOT checked: ..").
+const CHECK_SAYS: &str = "incomplete";
+
 const STEPS: [Step; 6] = [Step::Cold, Step::NoOp, Step::BodyEdit, Step::Comment, Step::Check, Step::Stop];
 
 impl Step {
@@ -602,11 +611,25 @@ impl Smoke {
             Ok(Ended::Exited(measured)) => measured,
         };
         let wall = Duration::from_nanos(measured.wall_ns);
-        let outcome = match measured.status {
-            0 => Outcome::Ok,
-            -1 => Outcome::Failed("was ended by a signal".to_owned()),
-            status => Outcome::Failed(format!("exited {status}")),
+        let outcome = match (step, measured.status) {
+            (Step::Check, CHECK_STATUS) => Outcome::Ok,
+            (Step::Check, status) => Outcome::Failed(format!("exited {status}, where `check` exits {CHECK_STATUS} while stages are missing")),
+            (_, 0) => Outcome::Ok,
+            (_, -1) => Outcome::Failed("was ended by a signal".to_owned()),
+            (_, status) => Outcome::Failed(format!("exited {status}")),
         };
+        if matches!(outcome, Outcome::Ok) && step == Step::Check {
+            let out = log.with_extension("out");
+            let outcome = match read_text_lossy(&out) {
+                Err(e) => Outcome::Failed(format!("its output {}: {e}", out.display())),
+                Ok(text) if text.lines().any(|it| it.contains(CHECK_SAYS)) => Outcome::Ok,
+                Ok(text) => Outcome::Failed(format!(
+                    "exited {CHECK_STATUS} and printed no `{CHECK_SAYS}` line (its last line: `{}`)",
+                    text.lines().last().unwrap_or("").trim_end()
+                )),
+            };
+            return (outcome, Some(wall));
+        }
         if !matches!(outcome, Outcome::Ok) || !step.in_chain() {
             return (outcome, Some(wall));
         }

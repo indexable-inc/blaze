@@ -117,6 +117,9 @@ the lookup's 2 KiB slot digests; nothing is per function or per row beyond one f
 
 ## 5. Home
 
+The old path's (the daemon). On the rebuilt path the home is crates/blaze-run (`plan`,
+`postings`) and the end state is test.md, "End state (architect, 2026-11-16)".
+
 Selection lives in `crates/blaze-testsel`:
 
 - `ask`: the shape (the asks as bytes, canonical) and the value payload.

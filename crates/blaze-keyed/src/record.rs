@@ -31,7 +31,7 @@
 
 use core::{alloc::Allocator, fmt, mem::offset_of};
 
-use blaze_format::{FormatError, Record, Slice, Writer};
+use blaze_format::{FormatError, Record, Slice, Writer, WriterOpts};
 use blaze_ids::{ContentId, Hasher};
 
 use crate::kind::{Key, Kind, Shape, Tag, UnitChunk, UnitManifest};
@@ -606,7 +606,7 @@ impl<'a> PlanView<'a> {
 
 /// The bytes of a plan's payload, in `alloc`. Floor: one copy of its parts.
 pub fn write_plan_payload<A: Allocator>(edges: &[PlanEdge], args: &[u8], describe: &[u8], alloc: A) -> Vec<u8, A> {
-    let mut out = Writer::new_in(PlanPayload::SCHEMA, alloc);
+    let mut out = Writer::new(WriterOpts { schema: PlanPayload::SCHEMA, alloc: alloc, capacity: None });
     let edges_at = out.push_slice(edges);
     // Bytes go in as buffers, as a traced record's payload does.
     let args_at = out.push_buffer(args);
@@ -753,7 +753,7 @@ impl<'a> KeptParts<'a> {
 
 /// The bytes of a kept program's payload, in `alloc`. Floor: one copy of its parts.
 pub fn write_kept<A: Allocator>(parts: &KeptParts<'_>, alloc: A) -> Vec<u8, A> {
-    let mut out = Writer::new_in(ProgramKeptRoot::SCHEMA, alloc);
+    let mut out = Writer::new(WriterOpts { schema: ProgramKeptRoot::SCHEMA, alloc: alloc, capacity: None });
     let manifests_at = out.push_slice(parts.manifests);
     let rows_at = out.push_slice(parts.rows);
     let targets_at = out.push_slice(parts.targets);
@@ -1124,7 +1124,7 @@ fn head_of<K: Kind>(key: &Key<K>) -> RecordHead {
 
 /// A [`Traced`] record of kind `K` filed at `key`.
 pub fn write_traced<K: Kind<Root = Traced>>(key: &Key<K>, reads: &[Fact], facts: &[Fact], payload: &[u8]) -> Vec<u8> {
-    let mut out = Writer::new(Traced::SCHEMA);
+    let mut out = Writer::on_the_global_heap_until_ported(Traced::SCHEMA);
     let reads_at = out.push_slice(reads);
     let facts_at = out.push_slice(facts);
     // Aligned as a buffer is: a payload that is itself a blaze-format buffer (a surface's
@@ -1153,7 +1153,7 @@ pub fn write_read<K: Kind<Root = Traced>>(key: Key<K>, reads: &[Fact], facts: &[
 
 /// An [`Opaque`] record of kind `K`.
 pub fn write_opaque<K: Kind<Root = Opaque>>(key: &Key<K>, payload: &[u8]) -> Vec<u8> {
-    let mut out = Writer::new(Opaque::SCHEMA);
+    let mut out = Writer::on_the_global_heap_until_ported(Opaque::SCHEMA);
     // Aligned as a buffer is: a payload that is itself a blaze-format buffer (a surface's
     // sections, a file image) is opened in place, where the record is mapped.
     let payload_at = out.push_buffer(payload);
@@ -1168,7 +1168,7 @@ pub fn write_opaque<K: Kind<Root = Opaque>>(key: &Key<K>, payload: &[u8]) -> Vec
 
 /// A shape trie node at `at` holding `ids` (sorted, each once).
 pub fn write_shape(at: &Key<Shape>, ids: &[ContentId]) -> Vec<u8> {
-    let mut out = Writer::new(ShapeRoot::SCHEMA);
+    let mut out = Writer::on_the_global_heap_until_ported(ShapeRoot::SCHEMA);
     let ids_at = out.push_slice(ids);
     let at_root = out.next::<ShapeRoot>();
     let root = ShapeRoot {
@@ -1181,7 +1181,7 @@ pub fn write_shape(at: &Key<Shape>, ids: &[ContentId]) -> Vec<u8> {
 
 /// A mark at `at`.
 pub fn write_mark<K: Kind<Root = MarkRoot>>(at: &Key<K>, manifest: ContentId, surface: ContentId, universe: ContentId) -> Vec<u8> {
-    let mut out = Writer::new(MarkRoot::SCHEMA);
+    let mut out = Writer::on_the_global_heap_until_ported(MarkRoot::SCHEMA);
     let root = MarkRoot { head: head_of(at), manifest, surface, universe };
     let root_at = out.push(&root);
     out.finish(root_at)
@@ -1222,7 +1222,7 @@ pub fn write_chunk(parts: &ChunkParts<'_>) -> (Key<UnitChunk>, Vec<u8>) {
     hash_u32s(&mut hasher, parts.postings);
     hash_u32s(&mut hasher, parts.posting_at);
     let key: Key<UnitChunk> = Key::from_id(hasher.finish());
-    let mut out = Writer::new(ChunkRoot::SCHEMA);
+    let mut out = Writer::on_the_global_heap_until_ported(ChunkRoot::SCHEMA);
     let entries_at = out.push_slice(parts.entries);
     let shapes_at = out.push_slice(parts.shapes);
     let dictionary_at = out.push_slice(parts.dictionary);
@@ -1280,7 +1280,7 @@ pub fn write_manifest(parts: &ManifestParts<'_>) -> (Key<UnitManifest>, Vec<u8>)
         hasher.id(&row.id).id(&row.digest).id(maker);
     }
     let key: Key<UnitManifest> = Key::from_id(hasher.finish());
-    let mut out = Writer::new(ManifestRoot::SCHEMA);
+    let mut out = Writer::on_the_global_heap_until_ported(ManifestRoot::SCHEMA);
     let files_at = out.push_slice(parts.files);
     let dictionary_at = out.push_slice(parts.dictionary);
     let readers_at = out.push_slice(parts.readers);

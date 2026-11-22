@@ -25,12 +25,13 @@
 //!
 //! Nothing here reads a clock, a file or a lock: an account is a function of rows.
 
-use std::{collections::BTreeSet, fmt::Write as _};
+use std::{alloc::Global, collections::BTreeSet, fmt::Write as _};
 
-use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
-use arrow_schema::ArrowError;
-
-use crate::{batches, facts::QueryCountRow, schema};
+use crate::{
+    columns::{self, Batch, BatchError, Column},
+    facts::QueryCountRow,
+    schema,
+};
 
 /// Who writes an input of the query engine, told by the input's kind.
 ///
@@ -666,17 +667,17 @@ impl AccountRow {
 }
 
 /// The `accounts` rows of `rows`.
-pub fn accounts(rows: &[AccountRow]) -> Result<RecordBatch, ArrowError> {
-    let count = |of: fn(&AccountRow) -> u64| -> ArrayRef {
+pub fn accounts(rows: &[AccountRow]) -> Result<Batch, BatchError> {
+    let count = |of: fn(&AccountRow) -> u64| -> Column {
         // alloc: a batch's column, once a flush
-        std::sync::Arc::new(UInt64Array::from_iter_values(rows.iter().map(of)))
+        Column::values(rows.iter().map(of), Global)
     };
-    let text = |of: fn(&AccountRow) -> Option<&str>| -> ArrayRef {
+    let text = |of: fn(&AccountRow) -> Option<&str>| -> Column {
         // alloc: a batch's column, once a flush
-        std::sync::Arc::new(StringArray::from_iter(rows.iter().map(of)))
+        Column::opt_texts_of(rows.iter().map(of), Global)
     };
     // alloc: a batch's columns, once a flush
-    let columns: Vec<ArrayRef> = vec![
+    let columns: Vec<Column> = vec![
         count(|it| it.build_id),
         count(|it| it.written),
         count(|it| it.written_source),
@@ -716,7 +717,7 @@ pub fn accounts(rows: &[AccountRow]) -> Result<RecordBatch, ArrowError> {
         count(|it| it.history_dropped),
         text(|it| it.alarms.as_deref()),
     ];
-    RecordBatch::try_new(batches::schema_of(&schema::ACCOUNTS), columns)
+    columns::batch(&schema::ACCOUNTS, columns)
 }
 
 // --- The ledger: causes as a required argument ---------------------------------------------
@@ -1092,7 +1093,7 @@ mod tests {
         let mut files = Vec::new();
         walk(&crates, &mut files);
         let mut unnamed = Vec::new();
-        let mut inputs = 0;
+        let mut inputs = Vec::new();
         for file in files {
             let Ok(text) = std::fs::read_to_string(&file) else { continue };
             let lines: Vec<&str> = text.lines().collect();
@@ -1106,7 +1107,7 @@ mod tests {
                 }) else {
                     continue;
                 };
-                inputs += 1;
+                inputs.push(name.clone());
                 // A crate slot's writer is its kind's (`Writer::of_slot`), held below.
                 if name != CRATE_SLOT && Writer::of_input(&name) == Writer::Unattributed {
                     unnamed.push(format!("{name} ({})", file.display()));
@@ -1124,7 +1125,14 @@ mod tests {
                 }
             }
         }
-        assert!(inputs >= 20, "the walk found {inputs} inputs: it no longer reads the tree's");
+        // The control that the walk reads the tree: an input the tree is known to define. A
+        // count of inputs was the control while the old layer's dozens of inputs were in the
+        // tree; with that layer deleted (2026-11-16) few are left, so a count would say
+        // nothing. If `FrontEnd` moves or goes, name another input the tree defines here.
+        assert!(
+            inputs.iter().any(|it| it == "FrontEnd"),
+            "the walk found {inputs:?} and not blaze-item-hash's `FrontEnd`: it no longer reads the tree's"
+        );
         assert_eq!(unnamed, Vec::<String>::new(), "inputs with no writer in `Writer::of_input`");
     }
 

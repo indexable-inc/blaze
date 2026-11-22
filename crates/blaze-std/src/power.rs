@@ -14,6 +14,7 @@ use crate::{
     cx::Cx,
     hosted::{self, Refused},
     io::Io,
+    unfinished::Unfinished,
 };
 
 /// The battery's state.
@@ -66,13 +67,17 @@ impl Power {
     }
 
     /// The machine kept awake until the guard is ended.
+    #[track_caller]
     pub fn keep_awake(&self, cx: &Cx) -> Result<Awake, PowerError> {
         let held = hosted::call(&self.io, cx, |host| {
             host.awake += 1;
             Ok(())
         });
         match held {
-            Ok(()) => Ok(Awake { hold: Hold { io: self.io.clone(), on: true } }),
+            Ok(()) => Ok(Awake {
+                hold: Hold { io: self.io.clone(), on: true },
+                unfinished: Unfinished::new("power::Awake", "end(cx)"),
+            }),
             Err(kind) => Err(PowerError { op: PowerOp::KeepAwake, kind }),
         }
     }
@@ -89,6 +94,7 @@ impl fmt::Debug for Power {
 #[must_use = "a hold on the machine's sleep is ended with end(cx)"]
 pub struct Awake {
     hold: Hold,
+    unfinished: Unfinished,
 }
 
 /// A hold's abandonment path.
@@ -117,6 +123,7 @@ impl Awake {
     /// The hold let go, whatever `cx` says. The one way an `Awake` ends.
     #[blaze::consumes]
     pub fn end(mut self, cx: &Cx) -> Result<(), PowerError> {
+        self.unfinished.finished();
         cx.event("bstd::power: hold on sleep ended");
         match self.hold.release() {
             Some(()) => Ok(()),

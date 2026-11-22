@@ -1,0 +1,15 @@
+{
+ "id": "heads-store-tables-mmap-per-body",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane RP3",
+ "where": "crates/blaze-ladder/src/front2/rows.rs (Rows, StableColumn), heads.rs Store::new, lifetimes.rs Lives::new_in, source.rs Records::text_marks, tables/recorder.rs",
+ "what": "tempo engine-check --workers 16 spent its stack samples in three places that were per-call work a key or a proof should skip: (A) every head and body of an expansion re-opened and re-verified its origin column (OriginsRef::open via item_site::marks_of); (B) each heads table and each type column reserved its own blaze_mem region (mmap at the first row, munmap at the drop), and a store is made per head and per body; (C) the read recorder pushed every repeat and sorted the whole tape at finish.",
+ "cost": "a lane of reading; no build or run in the lane (write-only)",
+ "cause": "(A) marks_of opened bytes and nothing kept the view; (B) Rows and StableColumn owned an AppendVec each instead of taking the store's allocator; (C) Recorder::read had no membership test",
+ "whys": "each was written for one call and later called per body; the per-body cost was invisible until a profile of a whole workspace named it",
+ "class": "a value verified or reserved where it is used instead of once where it is made",
+ "prevention": "done in RP3: Records keeps each expansion's opened marks (Opened::origins counts opens), ExpansionText::column opens once when made, Rows/StableColumn take the handed allocator (SharedSegs; copy-on-grow column), Recorder keeps a seen set and a last-read fast path with a ReadTally printed by the Bodies stage",
+ "annoyance": "Grep and Glob were missing in this session, so every search went through read-only grep in Bash; a write-only lane cannot check that a new integration test is the only test in its binary except by reading",
+ "workaround": "grep/sed -n through Bash, as LANES-1810 allows",
+ "state": "fixed, unbuilt (coordinator compiles)"
+}
