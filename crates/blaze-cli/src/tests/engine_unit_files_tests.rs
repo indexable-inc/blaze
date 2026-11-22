@@ -412,7 +412,12 @@ fn check_result(io: &Io, opts: engine_check::Opts<'static>) -> Result<engine_che
     let err = io.need_err().expect("err");
     let mut phases = boxed(|| Phases::new(io.need_clock().expect("a clock")));
     let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, View::Person, "/ws", cx.frame());
-    engine_check::check(&cx, io, &root, opts, &mut shown, &mut phases, &out, &err)
+    let fs = io.need_fs().expect("files");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    let args = io.args();
+    let net = io.net();
+    engine_check::check(&cx, &fs, &host, &mut rng, args.as_ref(), net.as_ref(), &root, opts, &mut shown, &mut phases, &out, &err)
 }
 
 /// The profile's count of the rows checked at a unit's view ("view rows N checked").

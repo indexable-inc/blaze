@@ -36,7 +36,7 @@ use bstd::env::VarName;
 use bstd::mem::{Bytes, Frame};
 use bstd::out::Out;
 use bstd::path::Path;
-use bstd::{Cx, Io};
+use bstd::Cx;
 
 use crate::engine_answer::{PagesRead, Stored, Unreadable};
 use crate::engine_ready_edit::{self as edit, Moved, Woken, page_for};
@@ -147,13 +147,25 @@ pub(crate) enum Mode {
 
 /// The command. Its arguments: for [`Mode::Dry`] the edited file's path, checkout-relative;
 /// none for [`Mode::Keys`]. The checkout is the working directory.
-pub(crate) fn run(cx: &Cx, io: &Io, out: &Out, phases: &mut Phases, heap: &'static blaze_own::Heap, mode: Mode) -> Result<Status, CliError> {
-    let args = io.need_args()?;
+#[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one specific capability")]
+pub(crate) fn run(
+    cx: &Cx,
+    args: &bstd::args::Args,
+    fs: &bstd::fs::Fs,
+    env: Option<&bstd::env::Env>,
+    host: &bstd::host::Host,
+    rng: &mut bstd::rng::Rng,
+    out: &Out,
+    err: &Out,
+    phases: &mut Phases,
+    heap: &'static blaze_own::Heap,
+    mode: Mode,
+) -> Result<Status, CliError> {
     let target = match mode {
         Mode::Dry => args.get(2).filter(|word| !word.starts_with("--")).ok_or(CliError::Usage("blaze engine-dry <file>: a source file's path in the checkout, as its crate names it"))?,
         Mode::Keys => "",
     };
-    let flags = crate::flags(&args)?;
+    let flags = crate::flags(args)?;
     let frame = cx.frame();
     let target = work::held_str(target, frame);
     // The command's edge, as engine_check.rs `edge` reads it, only what the store needs.
@@ -163,19 +175,15 @@ pub(crate) fn run(cx: &Cx, io: &Io, out: &Out, phases: &mut Phases, heap: &'stat
     let _ = flags.dir;
     let driver = flags.driver;
     let checkout = crate::checkout::checkout(None, frame)?;
-    let fs = io.need_fs()?;
-    let located = crate::run_package::locate(cx, &fs, &checkout, frame)?;
+    let located = crate::run_package::locate(cx, fs, &checkout, frame)?;
     let root = located.root;
-    let host = io.need_host()?;
     let producers = crate::producers::table(host.build_id()?.as_bytes());
     let tools = crate::engine_store::tools(&crate::home::tools(&producers, crate::lints::Lints::NONE.rules));
-    let env = io.env();
-    let var = |name: &str| -> Option<&str> { env.as_ref()?.get(&VarName::new(name).ok()?).ok().flatten() };
-    let err = io.need_err()?;
+    let var = |name: &str| -> Option<&str> { env?.get(&VarName::new(name).ok()?).ok().flatten() };
     let setup = phases.now();
-    let opened = crate::store::open_for_command(cx, io, var("HOME"), &root, located.at, phases.clock(), &err, heap)?;
+    let opened = crate::store::open_for_command(cx, fs, host, rng, var("HOME"), &root, located.at, phases.clock(), err, heap)?;
     let erased = blaze_own::Erased::new(frame);
-    let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), &err, erased.handle())?;
+    let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), err, erased.handle())?;
     let request_mem = crate::engine_phase_mem::RequestMem::new()?;
     let alloc = request_mem.shared();
     let answer_root = crate::engine_answer::root_name(located.at, frame);

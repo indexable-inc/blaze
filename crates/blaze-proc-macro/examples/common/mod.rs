@@ -12,7 +12,7 @@ use blaze_proc_macro::{
 /// The expansion records under the folder `store`, through a world this program opens over it.
 pub fn expansion_records(store: &Path) -> DirStore {
     let (io, root) = native_world(store).unwrap_or_else(|error| panic!("the records at {}: {error}", store.display()));
-    DirStore::expansions(&io, &root)
+    DirStore::expansions(io.spawner(), io.boot().ok(), &root)
 }
 
 /// The modules in the store, read through their identities: a key the crate computes

@@ -550,8 +550,8 @@ impl<'f> Served<'f> {
     /// relative to the folder the process was started in, resolved by one `realpath`
     /// ([`script_sandbox::RealRoot::of_start`]). No environment variable is read (`PWD` is
     /// ambient and may be stale or unset, rule 75). `Err` names the path and the OS's error.
-    pub(crate) fn at_edge(io: &bstd::Io, checkout: &str, frame: &'f Frame) -> Result<Served<'f>, script_sandbox::RootUnresolved> {
-        if io.with_sim(|_| ()).is_some() {
+    pub(crate) fn at_edge(simulated: bool, checkout: &str, frame: &'f Frame) -> Result<Served<'f>, script_sandbox::RootUnresolved> {
+        if simulated {
             return Ok(Served::Simulated);
         }
         let root = script_sandbox::RealRoot::of_start(crate::scripts::checkout_path(checkout), blaze_own::planted::NoPlant)?;

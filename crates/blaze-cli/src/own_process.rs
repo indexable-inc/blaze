@@ -194,11 +194,10 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
     counted: &mut Option<crate::run_parent::RunTally>,
     frame: &Frame,
 ) -> Result<u8, OwnError> {
-    let io = launch.io;
-    let env = io.need_env().map_err(OwnError::Missing)?;
-    let fs = io.need_fs().map_err(OwnError::Missing)?;
-    let host = io.need_host().map_err(OwnError::Missing)?;
-    let err = io.need_err().map_err(OwnError::Missing)?;
+    let env = launch.env.ok_or(OwnError::Missing(bstd::io::Missing { capability: "env" }))?;
+    let fs = launch.fs;
+    let host = launch.host;
+    let err = launch.err;
     // 1. The records folder, under the home the command was started with (rule 75: read here,
     // at the edge, from the command's own environment), and the lazy parent: nothing built.
     // The folder is the launcher's `BLAZE_LAUNCH_STORE` either way (the program's native

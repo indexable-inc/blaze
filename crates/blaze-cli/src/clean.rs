@@ -290,15 +290,14 @@ pub const NOTHING: &str = "nothing to remove";
 /// `blaze clean [dir] [--store]`: each folder removed printed as it goes ("removed <path>: <n>
 /// files, <bytes> bytes freed"), or "nothing to remove"; exit status 0. A refusal stops it
 /// before anything more is removed.
-pub fn run(cx: &Cx, io: &bstd::Io, args: &bstd::args::Args, out: &bstd::out::Out) -> Result<bstd::entry::Status, crate::CliError> {
+pub fn run(cx: &Cx, fs: &bstd::fs::Fs, env: Option<&bstd::env::Env>, args: &bstd::args::Args, out: &bstd::out::Out) -> Result<bstd::entry::Status, crate::CliError> {
     // The home, read here at the edge (rule 75).
-    let env = io.env();
-    let home = env.as_ref().and_then(|env| env.get(&bstd::env::VarName::new("HOME").ok()?).ok().flatten());
-    run_with(cx, io, args.each().skip(2), home, out)
+    let home = env.and_then(|env| env.get(&bstd::env::VarName::new("HOME").ok()?).ok().flatten());
+    run_with(cx, fs, args.each().skip(2), home, out)
 }
 
 /// [`run`] on the words after `clean` and the home `HOME` names.
-pub fn run_with<'w>(cx: &Cx, io: &bstd::Io, words: impl Iterator<Item = &'w str>, home: Option<&str>, out: &bstd::out::Out) -> Result<bstd::entry::Status, crate::CliError> {
+pub fn run_with<'w>(cx: &Cx, fs: &bstd::fs::Fs, words: impl Iterator<Item = &'w str>, home: Option<&str>, out: &bstd::out::Out) -> Result<bstd::entry::Status, crate::CliError> {
     let mut dir = None;
     let mut with_store = false;
     let mut with_all = false;
@@ -315,7 +314,6 @@ pub fn run_with<'w>(cx: &Cx, io: &bstd::Io, words: impl Iterator<Item = &'w str>
         }
     }
     let frame = cx.frame();
-    let fs = io.need_fs()?;
     let checkout = crate::checkout::checkout(dir, frame)?;
     let (root, lead) = match &checkout {
         crate::checkout::Checkout::Under(under) => (fs.open_dir(cx, under)?, bstd::mem::format_in!(frame, "{under}/")),

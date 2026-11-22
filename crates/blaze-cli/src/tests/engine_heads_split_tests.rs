@@ -81,7 +81,10 @@ fn head_rows(io: &Io, g: blaze_own::Alloc<'static>) -> (blaze_ids::ContentId, u3
     let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
     let err = io.need_err().expect("err");
     let mut phases = Phases::new(io.need_clock().expect("a clock"));
-    let judged = crate::engine_why::with_kept(&cx, io, &root, &opts(io, 2, false), &mut phases, &err, |kept| {
+    let fs = io.need_fs().expect("files");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    let judged = crate::engine_why::with_kept(&cx, &fs, &host, &mut rng, &root, &opts(io, 2, false), &mut phases, &err, |kept| {
         let mut each: blaze_own::Vec<(blaze_drive::Name, blaze_ids::ContentId), blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(g);
         for (name, row) in kept.answer.rows.iter().filter(|(name, _)| name.kind == blaze_drive::Kind::Signature) {
             let mut h = blaze_ids::Hasher::new("blaze-cli test: one head row");

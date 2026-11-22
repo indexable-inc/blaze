@@ -380,7 +380,7 @@ fn recorded_answers_a_second_time_without_the_inner_executor() {
     let _ = std::fs::remove_dir_all(&store);
     std::fs::create_dir_all(&store).expect("a temporary folder");
     let (io, root) = native_world(&store).unwrap_or_else(|error| panic!("the records' world: {error}"));
-    let records = DirStore::build_scripts(&io, &root);
+    let records = DirStore::build_scripts(io.spawner(), io.boot().ok(), &root);
     let calls = AtomicU32::new(0);
     let recorded = Recorded { inner: Counting { calls: &calls }, records: &records };
     let text = |value: &str| blaze_own::String::from_str_in(value, alloc);

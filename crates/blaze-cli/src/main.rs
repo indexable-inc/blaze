@@ -553,19 +553,29 @@ fn telemetry_level(args: &bstd::args::Args) -> bstd::telemetry::Level {
 /// The status: 0 for a check that passed; `blaze run`'s, the status its program's `main` ended with.
 fn run(cx: &Cx, io: Io, heap: bstd::mem::Heap) -> Result<Status, Error> {
     let heap = heap.root();
-    let mut phases = Phases::new(io.need_clock()?);
+    let clock = io.need_clock()?;
+    let mut phases = Phases::new(clock.clone());
     let out = io.need_out()?;
     let err = io.need_err()?;
+    let args = io.need_args()?;
+    let fs = io.need_fs()?;
+    let env = io.env();
+    let net = io.net();
+    let host = io.need_host()?;
+    let mut rng = io.need_rng()?;
+    // Every capability this command can use has been extracted at the entry edge; drop `Io`
+    // immediately so nothing below `run` ever holds the whole world (D104).
+    drop(io);
     phases.mark("output handles");
     // `run` and `test` start a program: every error of theirs is returned before it starts
     // (the in-process run returns the program's status as `Ok`), so it is blaze's own.
-    let starts_a_program = io.args().is_some_and(|args| matches!(args.get(1), Some("run" | "test")));
+    let starts_a_program = matches!(args.get(1), Some("run" | "test"));
     // A failure of `check` or `explain` is printed in one place, bstd's exit path (`error: `
     // and its message), with status 1.
     // (A `Ran` holding `RunError::Trapped` was matched here: no constructor ever made one, as
     // `Ran` is made only from `Program`, whose every constructor is a manifest refusal; a trap
     // in the program's own process is the run loop's words, run_loop.rs `LoopError`.)
-    match command(cx, &io, &out, &err, &mut phases, heap) {
+    match command(cx, &args, &fs, env.as_ref(), net.as_ref(), &host, &clock, &mut rng, &out, &err, &mut phases, heap) {
         // D86 and the ladder's L6: any failure of `run` or `test` before the program starts
         // (manifest, check, build, start, or a stub that stopped it) exits `program::NOT_RUN`,
         // never 1, which a program's `main` returning `Err` also exits with (std's
@@ -591,31 +601,44 @@ fn words<'o>(command: Command, out: &'o Out, err: &'o Out) -> &'o Out {
 /// What `blaze build` is told: the two commands that do what it would.
 const NO_BUILD: &str = "`blaze run` compiles what the program reaches and runs it; `blaze export` (not built yet) writes the program as a file";
 
-fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'static blaze_own::Heap) -> Result<Status, CliError> {
-    let args = io.need_args()?;
+#[expect(clippy::too_many_arguments, reason = "top-level command dispatcher: each argument one specific capability extracted at main")]
+fn command(
+    cx: &Cx,
+    args: &Args,
+    fs: &bstd::fs::Fs,
+    env: Option<&bstd::env::Env>,
+    net: Option<&bstd::net::Net>,
+    host: &bstd::host::Host,
+    clock: &bstd::clock::Clock,
+    rng: &mut bstd::rng::Rng,
+    out: &Out,
+    err: &Out,
+    phases: &mut Phases,
+    heap: &'static blaze_own::Heap,
+) -> Result<Status, CliError> {
     match args.get(1) {
         // `check` IS the execution engine (check_command.rs over engine_check.rs): one checker
         // (rule 30). `engine-check` is its old name, an alias until the scripts that type it
         // are moved.
-        Some("check" | "engine-check") => check_command::run(cx, io, out, phases, heap),
-        Some("why") => engine_check::why(cx, io, out, phases, heap),
+        Some("check" | "engine-check") => check_command::run(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap),
+        Some("why") => engine_check::why(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap),
         // Hidden: the edit path's forward wake over the stored answer, dry (D187; engine_dry.rs).
-        Some("engine-dry") => engine_dry::run(cx, io, out, phases, heap, engine_dry::Mode::Dry),
+        Some("engine-dry") => engine_dry::run(cx, args, fs, env, host, rng, out, err, phases, heap, engine_dry::Mode::Dry),
         // Hidden: the stored answer's root and page keys, to compare two drivers' answers.
-        Some("engine-keys") => engine_dry::run(cx, io, out, phases, heap, engine_dry::Mode::Keys),
+        Some("engine-keys") => engine_dry::run(cx, args, fs, env, host, rng, out, err, phases, heap, engine_dry::Mode::Keys),
         // `run` and `test` start from the engine's answer (engine_start.rs, D147): the engine's
         // check, then the program or the tests over what it stored.
-        Some("run") => engine_start::command(cx, io, out, err, phases, heap, Command::Run),
-        Some("test") => engine_start::command(cx, io, out, err, phases, heap, Command::Test),
+        Some("run") => engine_start::command(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap, Command::Run),
+        Some("test") => engine_start::command(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap, Command::Test),
         // The commands are `check`, `run`, `test` and, later, `export`: there is no `build`.
         Some("build") => Err(CliError::NoSuchCommand { command: "build", instead: NO_BUILD }),
         Some("export") => Err(CliError::NotBuilt { command: "export" }),
         Some("explain") => explain(cx, args.get(2), out),
         // The checkout's state, and with `--store` the home's store, removed (clean.rs).
-        Some("clean") => clean::run(cx, io, &args, out),
+        Some("clean") => clean::run(cx, fs, env, args, out),
         // Hidden: the checkout's journal helper, run by hand until a command starts one
         // (journal_ask.rs `HelperStart`): one stream held open, asks answered on its socket.
-        Some("journal-helper") => journal_helper::run(cx, io, &args, out),
+        Some("journal-helper") => journal_helper::run(cx, fs, clock, host, rng, env, args, out),
         Some("--version" | "-V" | "version") => {
             let ver = option_env!("BLAZE_RELEASE").unwrap_or(env!("CARGO_PKG_VERSION"));
             let tc = include_str!("../../../pins/toolchain").trim();
@@ -627,7 +650,7 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'
             out.line(cx, format_args!("Rust {tc}"))?;
             Ok(Status::OK)
         }
-        Some("store") => store::publish_command::run(cx, io, out, err, heap),
+        Some("store") => store::publish_command::run(cx, args, fs, env, clock, host, rng, out, err, heap),
         Some(_) | None => Err(CliError::Usage("the command is check, run, test, clean or explain")),
     }
 }
@@ -1043,7 +1066,12 @@ mod tests {
         let mut phases = crate::tests::engine_check_tests::boxed(|| Phases::new(io.need_clock().expect("a clock")));
         let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, view, at.shown, frame);
         shown.each = each;
-        let mut ask = |mut shown| engine_check::check(&cx, io, &root, opts(), &mut shown, &mut phases, &out, &err).map(|checked| (checked, shown));
+        let fs = io.need_fs().expect("files");
+        let host = io.need_host().expect("host");
+        let mut rng = io.need_rng().expect("rng");
+        let args = io.args();
+        let net = io.net();
+        let mut ask = |mut shown| engine_check::check(&cx, &fs, &host, &mut rng, args.as_ref(), net.as_ref(), &root, opts(), &mut shown, &mut phases, &out, &err).map(|checked| (checked, shown));
         let (checked, shown) = match fix {
             None => ask(shown).unwrap_or_else(|error| panic!("the check answers: {error:?}")),
             Some(selectors) => match fix_then_check::<W, engine_check::Checked>(&cx, &root, selectors, (blaze_report::frame::Caps::LINES, view, at.shown), frame, &out, &mut ask) {

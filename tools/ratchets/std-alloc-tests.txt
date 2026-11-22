@@ -33,7 +33,7 @@ blaze-cad	3	0	0	8	0	0	0	0	0	0
 blaze-cad-field	6	0	0	19	0	0	0	0	0	0
 blaze-cad-mesh	7	0	0	18	0	0	0	0	0	0
 blaze-cad-out	3	0	0	10	0	0	0	0	0	0
-blaze-cad-picture	2	0	0	4	0	0	0	0	0	0
+blaze-cad-picture	2	0	0	5	0	0	0	0	0	0
 blaze-cas	62	0	8	394	5	0	2	0	0	0
 blaze-cast	0	0	0	3	0	0	0	0	0	0
 blaze-cbor	3	0	0	0	0	0	1	0	0	0
@@ -90,7 +90,6 @@ blaze-lex	13	0	0	21	2	0	1	0	0	0
 blaze-lint	6	0	0	2	0	0	0	0	0	0
 blaze-lint-defs	12	0	0	34	0	0	0	0	0	1
 blaze-lir	26	0	2	107	0	0	0	0	0	0
-blaze-live	2	0	0	0	0	0	0	0	0	0
 blaze-lower	175	2	0	163	0	0	4	0	0	0
 blaze-macro-run	2	0	0	3	0	0	0	0	0	0
 blaze-malloc	9	7	5	41	0	4	12	0	0	1

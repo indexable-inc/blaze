@@ -69,7 +69,10 @@ pub(super) fn why(io: &Io, target: &str) -> std::string::String {
     let err = io.need_err().expect("err");
     let mut phases = Phases::new(io.need_clock().expect("clock"));
     let before = stdout(io).len();
-    if let Err(error) = crate::engine_why::explain(&cx, io, &root, &lang_opts(io, false), target, &mut phases, &out, &err) {
+    let fs = io.need_fs().expect("files");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    if let Err(error) = crate::engine_why::explain(&cx, &fs, &host, &mut rng, &root, &lang_opts(io, false), target, &mut phases, &out, &err) {
         panic!("why {target} answers: {error:?}");
     }
     stdout(io).split_off(before)

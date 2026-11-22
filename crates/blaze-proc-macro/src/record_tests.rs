@@ -44,8 +44,7 @@ fn oracle(store: &DirStore) -> Result<(), FilesError> {
 /// One start: the oracle on what the folder holds, every put, the oracle again.
 fn program(io: &Io, plant: RecordPlant) -> Result<(), FilesError> {
     let dir = io.need_fs().map_err(|_| FilesError::NoTree)?.root();
-    // clone: the world, a refcount.
-    let store = DirStore::on(OnDir { io: io.clone(), dir }, plant);
+    let store = DirStore::on(OnDir { cx: io.spawner(), boot: io.boot().ok(), dir }, plant);
     oracle(&store)?;
     let mut value = [0; LONGEST];
     for k in 0..KEYS {

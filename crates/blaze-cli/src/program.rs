@@ -13,18 +13,24 @@ use blaze_manifest::layout::panic;
 use blaze_manifest::layout::profile::{self, BuiltinProfile};
 use blaze_manifest::layout::ManifestId;
 use bstd::Cx;
-use bstd::fs::{Dir, ReadWrite};
-use bstd::io::Io;
+use bstd::env::Env;
+use bstd::fs::{Dir, Fs, ReadWrite};
+use bstd::host::Host;
 use bstd::mem::{Bytes, Frame};
+use bstd::out::Out;
 use bstd::path::Path;
 
 use crate::CliError;
 
-/// What `blaze run` hands the program: the command's world, which program (`-p`, `--bin`:
-/// run_package.rs), the grants named on its command line (`--grant name=value`, run.md), and
-/// the words after `--`.
+/// What `blaze run` hands the program: the specific capabilities the launcher uses (`fs`, `env`,
+/// `host`, `out`, `err`), which program (`-p`, `--bin`: run_package.rs), the grants named on its
+/// command line (`--grant name=value`, run.md), and the words after `--`.
 pub struct Launch<'a> {
-    pub io: &'a Io,
+    pub fs: &'a Fs,
+    pub env: Option<&'a Env>,
+    pub host: &'a Host,
+    pub out: &'a Out,
+    pub err: &'a Out,
     pub select: crate::run_package::Select<'a>,
     pub grants: &'a [(&'a str, &'a str)],
     pub args: &'a [&'a str],

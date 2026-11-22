@@ -21,7 +21,7 @@ blaze-c	2
 blaze-cas	233
 blaze-cbor	7
 blaze-check	7
-blaze-cli	71
+blaze-cli	76
 blaze-columns	29
 blaze-cond	3
 blaze-consteval	47
@@ -59,7 +59,6 @@ blaze-launcher	2
 blaze-lint	6
 blaze-lint-defs	1
 blaze-lir	210
-blaze-live	1
 blaze-lower	20
 blaze-manifest	298
 blaze-mem	5
@@ -71,7 +70,7 @@ blaze-own	90
 blaze-pack	1
 blaze-parquet	96
 blaze-pg	2
-blaze-proc-macro	161
+blaze-proc-macro	158
 blaze-producers	12
 blaze-profile	168
 blaze-protocol	10
@@ -92,7 +91,7 @@ blaze-sort	3
 blaze-source	6
 blaze-sql	3
 blaze-squeeze	3
-blaze-std	408
+blaze-std	410
 blaze-surface	1
 blaze-swiss	3
 blaze-tar	13

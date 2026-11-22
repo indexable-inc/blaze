@@ -34,7 +34,8 @@ fn world(files: &[(&str, &str)]) -> Io {
 fn clean(io: &Io, words: &[&str]) -> (Result<bstd::entry::Status, CliError>, std::string::String) {
     let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
     let before = io.script(|host| host.out.len()).expect("a simulated world");
-    let result = super::run_with(&cx, io, words.iter().copied(), Some("/h"), &io.need_out().expect("out"));
+    let fs = io.need_fs().expect("fs");
+    let result = super::run_with(&cx, &fs, words.iter().copied(), Some("/h"), &io.need_out().expect("out"));
     let said = io.script(|host| host.out[before..].to_vec()).expect("a simulated world");
     (result, std::string::String::from_utf8(said).expect("text"))
 }

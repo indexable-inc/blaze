@@ -20,7 +20,7 @@
 use std::path::Path;
 
 use bstd::args::ArgList;
-use bstd::cx::Cx;
+use bstd::cx::{Cx, CxSpawn};
 use bstd::env::Vars;
 use bstd::fs::{Content, Dir, Durable, FsError, FsKind, ReadWrite};
 use bstd::io::{Io, Limits, NativeWorld, OpenError};
@@ -61,16 +61,12 @@ enum Held {
     Replaced,
 }
 
-/// The records' one home: a directory of the effect layer, with the world it came from.
-///
-/// It holds the world (`Io`), not a task's `Cx`: a `Cx` is one task's and not `Sync`, while
-/// the store is shared by every worker expanding, and `blaze_expand::ExpandCx::run_proc_macro`
-/// hands no `Cx` down (its 25 implementors sit in six lanes' crates). So each read or publish
-/// is its own root context from this world, ending [`RECORD_BUDGET`] from its start: the
-/// authority is passed in (rule 75); what it lacks is the caller's cancel (DEBT: when a run
-/// carries its task's `Cx`, it takes that one; NOTES.md of bstd-1116).
+/// The records' one home: a directory of the effect layer, a narrow `CxSpawn` capability to create
+/// per-operation root contexts without holding a whole `Io`, and the machine's boot id (when known)
+/// so whole-table vouchers stay valid within one boot.
 pub struct OnDir {
-    pub io: Io,
+    pub cx: CxSpawn,
+    pub boot: Option<blaze_core::Boot>,
     pub dir: Dir<ReadWrite>,
 }
 
@@ -80,7 +76,7 @@ impl OnDir {
     }
 
     fn cx(&self, name: &RecordName) -> Result<Cx, FilesError> {
-        self.io.cx(RECORD_BUDGET, TASK_FRAME).map_err(|_| FilesError::Stopped { name: *name })
+        self.cx.cx(RECORD_BUDGET, TASK_FRAME).map_err(|_| FilesError::Stopped { name: *name })
     }
 
     /// The bytes at `name`, in a buffer of the file's own length (no frame, no fixed block: a
@@ -228,21 +224,20 @@ pub struct DirStore {
 
 impl DirStore {
     /// The expansion records, `proc-macro/records` beneath the store's folder `store`.
-    pub fn expansions(io: &Io, store: &Dir<ReadWrite>) -> DirStore {
-        DirStore::within(io, store, "proc-macro/records")
+    pub fn expansions(cx: CxSpawn, boot: Option<blaze_core::Boot>, store: &Dir<ReadWrite>) -> DirStore {
+        DirStore::within(cx, boot, store, "proc-macro/records")
     }
 
     /// The spawn answers' records (`spawn_records::Recorded`), `build-script/records` beneath the
     /// store's folder `store`. A script run itself is kept by no store here: its only cache is
     /// the command's `Script` task record (D115).
-    pub fn build_scripts(io: &Io, store: &Dir<ReadWrite>) -> DirStore {
-        DirStore::within(io, store, "build-script/records")
+    pub fn build_scripts(cx: CxSpawn, boot: Option<blaze_core::Boot>, store: &Dir<ReadWrite>) -> DirStore {
+        DirStore::within(cx, boot, store, "build-script/records")
     }
 
-    fn within(io: &Io, store: &Dir<ReadWrite>, at: &'static str) -> DirStore {
+    fn within(cx: CxSpawn, boot: Option<blaze_core::Boot>, store: &Dir<ReadWrite>, at: &'static str) -> DirStore {
         let at = BPath::new(at).expect("a records folder's name is a relative path by construction");
-        // clone: the world, a refcount.
-        DirStore::on(OnDir { io: io.clone(), dir: store.subdir(&at) }, RecordPlant::None)
+        DirStore::on(OnDir { cx, boot, dir: store.subdir(&at) }, RecordPlant::None)
     }
 
     /// The expansion records under `<store>/proc-macro/records`, over a world opened here.
@@ -251,7 +246,7 @@ impl DirStore {
     /// caller makes [`DirStore::expansions`] from its own.
     pub fn new(store: &Path) -> DirStore {
         match native_world(store) {
-            Ok((io, root)) => DirStore::expansions(&io, &root),
+            Ok((io, root)) => DirStore::expansions(io.spawner(), io.boot().ok(), &root),
             Err(error) => panic!("the expansion records at {}: {error}", store.display()),
         }
     }

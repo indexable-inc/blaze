@@ -612,8 +612,13 @@ mod parallel {
         let err = io.need_err().unwrap();
         let mut phases = Phases::new(io.need_clock().unwrap());
         let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, View::Person, "/ws", cx.frame());
+        let fs = io.need_fs().unwrap();
+        let host = io.need_host().unwrap();
+        let mut rng = io.need_rng().unwrap();
+        let args = io.args();
+        let net = io.net();
         let (answer, mut names) = crate::engine_names::schedule_test::capture(false, false, || {
-            crate::engine_scripts::with_runner(runner, || engine_check::check(&cx, &io, &root, opts, &mut shown, &mut phases, &out, &err))
+            crate::engine_scripts::with_runner(runner, || engine_check::check(&cx, &fs, &host, &mut rng, args.as_ref(), net.as_ref(), &root, opts, &mut shown, &mut phases, &out, &err))
         });
         // Compare the serialized value for every task by identity, including dependent pkg.
         names.sort_unstable_by_key(|row| row.name);

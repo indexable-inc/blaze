@@ -160,6 +160,12 @@ impl Host {
         self.io.host_facts(|facts| facts.exe.as_ref().map(Arc::clone)).ok_or(Missing { capability: "exe" })
     }
 
+    /// The machine's current boot identifier, used by stores to distinguish segments written in
+    /// this boot from earlier ones (without holding a whole `Io`).
+    pub fn boot(&self) -> Result<blaze_core::Boot, blaze_core::NoBoot> {
+        self.io.boot()
+    }
+
     /// Other processes, if the host offers them (the simulation does): its own entry of
     /// [`Offers`], apart from this process's own facts and exit.
     pub fn procs(&self) -> Option<Procs> {
