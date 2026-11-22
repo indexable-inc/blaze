@@ -373,15 +373,27 @@ impl Io {
         Ok(done)
     }
 
-    /// The whole of `file` read straight into `into`, which grows once by the file's length
-    /// and one byte (`Bytes::grow_zeroed`) and is cut back to what the file holds: on a native
-    /// world with inline calls ([`Inline::read_all_lent`]), with no `Vec` made and no copy.
-    /// `None`: this world has no inline calls (the simulation, which keeps every effect on its
-    /// queue to reorder, fail and crash; a guest's escape): the caller asks `Effect::ReadAll`,
-    /// the other instantiation of the seam, as before. On every outcome but `Read`, `into` is
-    /// as it was. The effect it stands for is stamped as `ReadAll` (the meter, a test's
-    /// record), as `write_lent` stamps its own.
+    /// The whole of `file` read straight into `into`'s uninitialized spare capacity (zero
+    /// `memset(0)`, zero intermediate `Vec`, zero copy, zero global `world` lock when not
+    /// recording). On every outcome but `Read`, `into` is untouched.
     pub(crate) fn read_all_lent(&self, cx: &Cx, file: &FileName, into: &mut crate::mem::Bytes<'_>) -> Option<Result<ReadAllLent, Stopped>> {
+        self.read_all_inline(cx, file, into, false)
+    }
+
+    /// Kernel-confined, zero-memset whole-file read: opens `file` strictly beneath this world's
+    /// root `dirfd` via `openat`/`O_NOFOLLOW` (Linux: `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`),
+    /// rejecting any symlink at any component with `ELOOP`.
+    pub(crate) fn read_all_confined(&self, cx: &Cx, file: &FileName, into: &mut crate::mem::Bytes<'_>) -> Option<Result<ReadAllLent, Stopped>> {
+        self.read_all_inline(cx, file, into, true)
+    }
+
+    fn read_all_inline(
+        &self,
+        cx: &Cx,
+        file: &FileName,
+        into: &mut crate::mem::Bytes<'_>,
+        confined: bool,
+    ) -> Option<Result<ReadAllLent, Stopped>> {
         let files = self.inline_files()?;
         let began = self.now();
         if let Err(stopped) = cx.stopped_by(began) {
@@ -396,50 +408,25 @@ impl Io {
             blaze_meter::call(blaze_meter::Call::Read);
             blaze_meter::Call::Read
         };
-        let start = into.len();
-        let mut refused: Option<Stopped> = None;
-        // Both moved into the closure, which is called once and returns a borrow of `room`.
-        let (room, refused_at) = (&mut *into, &mut refused);
-        let read = files.read_all_lent(file, move |len| {
-            let asked = usize::try_from(len).ok().and_then(|len| len.checked_add(1));
-            let Some(asked) = asked else {
-                *refused_at = Some(Stopped::OutOfMemory { arena: "bstd::fs read_all", asked: usize::MAX });
-                return None;
-            };
-            match room.grow_zeroed(asked) {
-                Ok(room) => Some(room),
-                Err(stopped) => {
-                    *refused_at = Some(stopped);
-                    None
-                }
-            }
-        });
+        let arena = into.arena();
+        let read = if confined {
+            files.read_all_confined_into_vec(file, into.as_vec_mut())
+        } else {
+            files.read_all_into_vec(file, into.as_vec_mut())
+        };
         #[cfg(test)]
         self.counted(|seen| &seen.inline);
         // The meter (D169): the call's time by its kind, as `Io::call` takes it.
         let ns = u64::try_from(self.now().saturating_sub(began).as_nanos()).unwrap_or(u64::MAX);
         cx.on_worker(|w| w.meter().call_took(kind, ns));
         Some(Ok(match read {
-            LentRead::Read { len } => {
-                // `len` fit the room asked above (`usize`), so it fits here.
-                into.truncate(start + len as usize);
-                ReadAllLent::Read(len as usize)
-            }
+            LentRead::Read { len } => ReadAllLent::Read(len as usize),
             LentRead::NoRoom { len } => {
-                into.truncate(start);
-                // The closure sets `refused` whenever it gives no room; the second form names
-                // the same refusal by the length, never a silent empty read.
                 let asked = usize::try_from(len).unwrap_or(usize::MAX);
-                return Some(Err(refused.unwrap_or(Stopped::OutOfMemory { arena: "bstd::fs read_all", asked })));
+                return Some(Err(Stopped::OutOfMemory { arena, asked }));
             }
-            LentRead::Moved { stated, read } => {
-                into.truncate(start);
-                ReadAllLent::Moved { stated, read }
-            }
-            LentRead::Failed(error) => {
-                into.truncate(start);
-                ReadAllLent::Failed(error)
-            }
+            LentRead::Moved { stated, read } => ReadAllLent::Moved { stated, read },
+            LentRead::Failed(error) => ReadAllLent::Failed(error),
         }))
     }
 

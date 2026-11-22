@@ -668,21 +668,52 @@ impl Conn {
     }
 
     /// The bytes the peer sent since the last receive, at most `most`, added to `into`; how
-    /// many, 0 once the peer has hung up. Its [`Conn::read_into`], waited for.
+    /// many, 0 once the peer has hung up. Receives directly via `Effect::Recv` and appends into
+    /// `into` without pre-zeroing `most` bytes or making a second copy.
     pub fn recv(&self, cx: &Cx, most: usize, into: &mut Bytes<'_>) -> Result<usize, NetError> {
-        let stopped = |stopped| error(NetOp::Recv, &self.peer, NetKind::Stopped(stopped));
+        let peer = &self.peer;
+        let stopped = |stopped| error(NetOp::Recv, peer, NetKind::Stopped(stopped));
         cx.stopped_by(self.link.io.now()).map_err(stopped)?;
-        let start = into.len();
-        let slot = into.grow_zeroed(most).map_err(stopped)?;
-        let read = self.read_into(slot).wait(cx);
-        match read {
-            Ok(read) => {
-                into.truncate(start + read);
-                Ok(read)
+        let budget = self.budget.as_deref();
+        let mut ask = most;
+        if let Some(budget) = budget {
+            ask = ask.min(usize::try_from(budget.left()).unwrap_or(usize::MAX));
+            let short = match ask {
+                0 if most > 0 => Some(budget.over(most as u64)),
+                _ => budget.take(ask as u64).err(),
+            };
+            if let Some(short) = short {
+                return Err(error(NetOp::Recv, peer, NetKind::OverLimit(short)));
             }
-            Err(error) => {
-                into.truncate(start);
-                Err(error)
+        }
+        let conn = self.link.conn;
+        let done = self.link.io.call(cx, |tag| Effect::Recv { conn, most: ask, into: Vec::new(), tag });
+        match done {
+            Ok(Done::Read(bytes)) if bytes.len() <= ask => {
+                if let Some(budget) = budget {
+                    budget.give_back((ask - bytes.len()) as u64);
+                }
+                let n = bytes.len();
+                into.try_extend(&bytes).map_err(stopped)?;
+                Ok(n)
+            }
+            Ok(Done::Broken { error: why, .. }) => {
+                if let Some(budget) = budget {
+                    budget.give_back(ask as u64);
+                }
+                Err(error(NetOp::Recv, peer, NetKind::Driver(why.0)))
+            }
+            Ok(other) => {
+                if let Some(budget) = budget {
+                    budget.give_back(ask as u64);
+                }
+                Err(unexpected(NetOp::Recv, peer, other))
+            }
+            Err(why) => {
+                if let Some(budget) = budget {
+                    budget.give_back(ask as u64);
+                }
+                Err(stopped(why))
             }
         }
     }

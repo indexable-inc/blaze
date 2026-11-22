@@ -665,5 +665,130 @@ fn native_readonly_inline_calls_and_quiet_spans_take_zero_world_locks() {
     assert!(inline_done >= 40, "expected >= 40 inline read ops, got {inline_done}");
 }
 
+#[cfg(unix)]
+#[test]
+fn dir_read_all_confined_blocks_leaf_and_intermediate_symlink_escapes() {
+    let base = std::env::temp_dir().join(format!("bstd-confined-{}", std::process::id()));
+    let root_path = base.join("root");
+    let outside = base.join("outside");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(root_path.join("sub")).expect("root/sub");
+    std::fs::create_dir_all(&outside).expect("outside");
+
+    std::fs::write(root_path.join("sub/good.txt"), b"inside-ok").expect("good file");
+    std::fs::write(outside.join("secret.txt"), b"TOP-SECRET").expect("outside secret");
+    std::os::unix::fs::symlink(outside.join("secret.txt"), root_path.join("leaf_escape")).expect("leaf symlink");
+    std::os::unix::fs::symlink(&outside, root_path.join("dir_escape")).expect("dir symlink");
+
+    let io = crate::rt::open_native(
+        blaze_core::testing::os(),
+        crate::args::ArgList::given(Vec::new()),
+        crate::env::Vars::given(Vec::new()),
+        &root_path,
+        0,
+    )
+    .expect("native io");
+    let cx = io.cx(Duration::from_secs(10), TASK_FRAME).expect("root cx");
+    let dir = io.need_fs().expect("fs").root();
+    let seen = io.seen().expect("seen");
+
+    let before = seen.locks.load(Ordering::Relaxed);
+    let mut good = cx.bytes();
+    let n = dir.read_all_confined(&cx, &path("sub/good.txt"), &mut good).expect("confined good read");
+    assert_eq!(n, 9);
+    assert_eq!(good.as_slice(), b"inside-ok");
+    assert_eq!(seen.locks.load(Ordering::Relaxed) - before, 0, "confined native read must take 0 global world locks");
+
+    // Both leaf symlink and intermediate directory symlink MUST be refused by the kernel (ELOOP).
+    let mut leak1 = cx.bytes();
+    assert!(dir.read_all_confined(&cx, &path("leaf_escape"), &mut leak1).is_err(), "leaf symlink escape must be refused");
+    assert!(leak1.as_slice().is_empty());
+
+    let mut leak2 = cx.bytes();
+    assert!(dir.read_all_confined(&cx, &path("dir_escape/secret.txt"), &mut leak2).is_err(), "dir symlink escape must be refused");
+    assert!(leak2.as_slice().is_empty());
+
+    drop((good, leak1, leak2));
+    drop((dir, cx, io));
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn pending_wait_set_multiplexes_n_ops_and_conn_recv_skips_zero_fill() {
+    use crate::pending::WaitSet;
+
+    let io = world(13, Plant::None);
+    let cx = root(&io);
+    let dir = io.need_fs().expect("fs").open_dir(&cx, &path("data")).expect("dir");
+
+    // 1. Seed 12 files, open them read-only, push 12 `File::read_into` ops into ONE `WaitSet`.
+    let mut txn = dir.txn();
+    let mut files = Vec::with_capacity(12);
+    for i in 0..12usize {
+        let p = path(&format!("w{i:02}"));
+        let body = format!("waitset-item-{i:02}");
+        txn.publish(&cx, &p, Content::bytes(body.as_bytes())).expect("stage");
+    }
+    txn.commit_unsynced(&cx, Unsynced::No).expect("commit");
+    let ro = dir.read_only();
+    for i in 0..12usize {
+        files.push(ro.open(&cx, &path(&format!("w{i:02}"))).expect("open"));
+    }
+    let mut bufs: Vec<[u8; 32]> = vec![[0u8; 32]; 12];
+    let mut got_len = vec![None::<usize>; 12];
+    {
+        let mut set = WaitSet::new(&cx);
+        for (i, (file, buf)) in files.iter().zip(bufs.iter_mut()).enumerate() {
+            if let Err((stopped, pending)) = set.push(i, file.read_into(buf, 0)) {
+                let _ = pending.wait(&cx);
+                panic!("waitset push failed: {stopped:?}");
+            }
+        }
+        assert_eq!(set.len(), 12);
+        // Pull first 4 via `next`, drain remaining 8 via `drain`.
+        for _ in 0..4 {
+            let (id, res) = set.next(&cx).expect("non-empty").expect("ok");
+            got_len[id] = Some(res.expect("read ok"));
+        }
+        assert_eq!(set.len(), 8);
+        set.drain(&cx, |id, res| {
+            got_len[id] = Some(res.expect("drain read ok"));
+        })
+        .expect("drain succeeds");
+    }
+    for i in 0..12usize {
+        let n = got_len[i].expect("every id completed");
+        let want = format!("waitset-item-{i:02}");
+        assert_eq!(&bufs[i][..n], want.as_bytes());
+    }
+
+    // 2. Verify `Conn::recv` (zero-memset path) round-trips with exact byte budget refund.
+    let net = io.need_net().expect("net").limit(64);
+    let addr = Addr::Tcp(HostPort::new("127.0.0.1", 9093).expect("addr"));
+    let mut listener = match net.listen(&cx, &addr) {
+        Ok(l) => l,
+        Err(e) => panic!("listen: {e}"),
+    };
+    let client = match net.connect(&cx, &addr) {
+        Ok(c) => c,
+        Err(e) => panic!("connect: {e}"),
+    };
+    let server = match listener.accept(&cx) {
+        Ok(s) => s,
+        Err(e) => panic!("accept: {e}"),
+    };
+    client.send_vectored(&cx, &[b"hello-", b"recv"]).expect("send");
+    let mut into = cx.bytes();
+    let n = server.recv(&cx, 32, &mut into).expect("recv");
+    assert_eq!(n, 10);
+    assert_eq!(into.as_slice(), b"hello-recv");
+    // 64 total budget - 10 sent - 10 received = 44 remaining (unused 22 refunded accurately!).
+    assert_eq!(net.limit_left(), Some(44));
+    let _ = client.finish(&cx);
+    let _ = server.finish(&cx);
+    let _ = listener.close(&cx);
+}
+
+
 
 

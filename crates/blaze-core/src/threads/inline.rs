@@ -37,16 +37,18 @@
 //! calls. The asker's deadline is looked at before the call (bstd's `Io::call`), never during
 //! it: hence the table.
 
+use core::alloc::Allocator;
 use std::{io, path::Path, sync::Arc};
 
-use crate::{Done, Effect, FileName, IoError, descriptors::Descriptors};
+use crate::{Done, Effect, FileName, IoError, descriptors::Descriptors, fs::beneath::RootDir};
 
 /// What a driver lets its asker do on the asker's own thread: the file calls of the table in
-/// the module's doc, with the driver's root and its kept descriptors. Cheap to clone (two
-/// counts); `Send + Sync`, held beside the asker's lock, never under it.
+/// the module's doc, with the driver's root, its cached root `dirfd`, and its kept descriptors.
+/// Cheap to clone (`Arc` counts); `Send + Sync`, held beside the asker's lock, never under it.
 #[derive(Clone)]
 pub struct Inline {
     root: Arc<Path>,
+    root_dir: Arc<RootDir>,
     kept: Arc<Descriptors>,
     /// The planted bug of `inline_and_queued_calls_end_equal`: a failed inline call answers
     /// as an empty read, swallowing the error the queued route reports.
@@ -130,8 +132,10 @@ fn named(effect: &Effect) -> Option<FileName> {
 impl Inline {
     /// The inline calls of a driver over `root` whose threads read through `kept`.
     pub(crate) fn new(root: Arc<Path>, kept: Arc<Descriptors>) -> Inline {
+        let root_dir = Arc::new(RootDir::open(&root));
         Inline {
             root,
+            root_dir,
             kept,
             #[cfg(test)]
             swallow: false,
@@ -185,6 +189,39 @@ impl Inline {
     pub fn read_all_lent<'b>(&self, file: &FileName, room: impl FnOnce(u64) -> Option<&'b mut [u8]>) -> LentRead {
         let done = crate::lock::io_wait("read all", file.as_str(), || {
             super::at(&self.root, file, |path| crate::fs::read_whole_into(path, room))
+        });
+        match done {
+            Ok(read) => read,
+            #[cfg(test)]
+            Err(_) if self.swallow => LentRead::Read { len: 0 },
+            // alloc: an error path.
+            Err(error) => LentRead::Failed(IoError(error.to_string())),
+        }
+    }
+
+    /// Zero-memset [`Effect::ReadAll`] straight into `into`'s uninitialized spare capacity:
+    /// `open`, `fstat`, `try_reserve(len + 1)` (NO zero-fill), `pread` into `spare_capacity_mut`,
+    /// `set_len(old + len)`.
+    pub fn read_all_into_vec<A: Allocator>(&self, file: &FileName, into: &mut Vec<u8, A>) -> LentRead {
+        let done = crate::lock::io_wait("read all", file.as_str(), || {
+            super::at(&self.root, file, |path| crate::fs::beneath::read_whole_into_vec(path, into))
+        });
+        match done {
+            Ok(read) => read,
+            #[cfg(test)]
+            Err(_) if self.swallow => LentRead::Read { len: 0 },
+            // alloc: an error path.
+            Err(error) => LentRead::Failed(IoError(error.to_string())),
+        }
+    }
+
+    /// Kernel-confined, zero-memset whole-file read: opens `file` strictly beneath this driver's
+    /// cached root `dirfd` via `openat`/`O_NOFOLLOW` (or Linux `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`),
+    /// rejecting any symbolic link in any directory component or final leaf with `ELOOP`, and
+    /// reads straight into `into`'s uninitialized spare capacity.
+    pub fn read_all_confined_into_vec<A: Allocator>(&self, file: &FileName, into: &mut Vec<u8, A>) -> LentRead {
+        let done = crate::lock::io_wait("read all confined", file.as_str(), || {
+            crate::fs::beneath::read_whole_confined_into_vec(&self.root_dir, &self.root, file, into)
         });
         match done {
             Ok(read) => read,

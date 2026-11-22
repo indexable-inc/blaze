@@ -5,6 +5,8 @@
 #[allow(unsafe_code, reason = "mmap and MapViewOfFile, and the byte view of what they map")]
 mod mapped;
 
+pub(crate) mod beneath;
+
 pub(crate) use mapped::{map, map_extent, map_write};
 pub use mapped::{Advice, MapOptions, Mapped, MappedWrite, granularity};
 
@@ -321,21 +323,25 @@ pub(crate) fn read(path: &Path, at: u64, len: usize) -> io::Result<Vec<u8>> {
 }
 
 /// [`crate::Effect::Read`]: up to `len` bytes of the file at `path` from `at`, fewer only at
-/// its end.
+/// its end. Reads directly into uninitialized spare capacity via `pread` (zero `memset(0)`).
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn read(path: &Path, at: u64, len: usize) -> io::Result<Vec<u8>> {
     let file = std::fs::File::open(path)?;
-    // alloc: the read's payload.
-    let mut bytes = vec![0; len];
-    let mut read = 0;
-    while read < len {
-        let n = read_at(&file, &mut bytes[read..], at + read as u64)?;
+    // alloc: the read's payload (uninitialized until kernel `pread` fills it).
+    let mut bytes = Vec::with_capacity(len);
+    let spare = &mut bytes.spare_capacity_mut()[..len];
+    let mut filled = 0;
+    while filled < len {
+        let n = beneath::read_at_uninit(&file, &mut spare[filled..], at + filled as u64)?;
         if n == 0 {
             break;
         }
-        read += n;
+        filled += n;
     }
-    bytes.truncate(read);
+    #[expect(unsafe_code, reason = "pread initialized exactly `filled` bytes within reserved capacity `len`")]
+    unsafe {
+        bytes.set_len(filled);
+    }
     Ok(bytes)
 }
 

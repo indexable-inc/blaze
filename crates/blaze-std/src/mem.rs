@@ -212,6 +212,15 @@ impl<'a> Bytes<'a> {
         &mut self.bytes
     }
 
+    /// Backing `Vec` for zero-memset direct kernel reads in `blaze-core` (keeps `blaze-std`
+    /// 100% `#![deny(unsafe_code)]`).
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn as_vec_mut(&mut self) -> &mut Vec<u8, &'a Frame> {
+        &mut self.bytes
+    }
+
     /// `more` added at the end, or [`Stopped::OutOfMemory`] with the bytes as they were.
     #[blaze::noalloc]
     #[blaze::nonblocking]

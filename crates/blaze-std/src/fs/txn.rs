@@ -182,8 +182,8 @@ impl<'dir> Txn<'dir> {
                 }
             }
         }
-        // 2. Apply all renames and removals unsynced and collect unique parent directories.
-        let mut dirs: Vec<DirName> = Vec::new();
+        // 2. Apply all renames and removals unsynced and collect unique parent directories in `cx.frame()`.
+        let mut dirs: Vec<DirName, &blaze_mem::Frame> = Vec::new_in(cx.frame());
         let mut track_dir = |name: &FileName| {
             let dir_str = dir_of(name);
             let parent = if dir_str.is_empty() {
@@ -192,7 +192,6 @@ impl<'dir> Txn<'dir> {
                 DirName::Named(FileName::new(dir_str).expect("a file's parent directory is a valid name"))
             };
             if !dirs.contains(&parent) {
-                // alloc: one unique parent dir in the transaction.
                 dirs.push(parent);
             }
         };

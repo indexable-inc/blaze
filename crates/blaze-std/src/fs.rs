@@ -1366,6 +1366,54 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
         self.open_read(cx, path)?.read_all(cx, into)
     }
 
+    /// Kernel-confined whole-file read: opens `path` strictly beneath this directory without
+    /// following any symbolic link in any directory component or final leaf (`openat`+`O_NOFOLLOW`
+    /// on Unix, `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` on Linux; component `Lstat` check
+    /// in simulations) and reads straight into `into`'s uninitialized spare capacity (zero
+    /// `memset(0)`, zero intermediate copy, zero global world lock).
+    pub fn read_all_confined(&self, cx: &Cx, path: &Path, into: &mut Bytes<'_>) -> Result<usize, FsError> {
+        let name = self.beneath(path);
+        if let Some(lent) = self.io.read_all_confined(cx, &name, into) {
+            return match lent {
+                Ok(crate::io::ReadAllLent::Read(len)) => Ok(len),
+                Ok(crate::io::ReadAllLent::Moved { stated, read }) => Err(FsError::new(FsOp::Read, &name, FsKind::Moved { stated, read })),
+                Ok(crate::io::ReadAllLent::Failed(error)) => Err(FsError::new(FsOp::Read, &name, FsKind::Driver(error.0))),
+                Err(stopped) => Err(FsError::new(FsOp::Read, &name, FsKind::Stopped(stopped))),
+            };
+        }
+        // Simulation / guest fallback: verify no component along `path` is a symlink via batched `looks` (`Effect::Stamp`).
+        let raw_rel = path.as_str();
+        let mut prefixes: Vec<Path, &blaze_mem::Frame> = Vec::new_in(cx.frame());
+        for (idx, _) in raw_rel.match_indices('/') {
+            let sub = Path::new(&raw_rel[..idx]).expect("prefix of valid Path is valid");
+            let _ = prefixes.try_reserve(1);
+            prefixes.push(sub);
+        }
+        let looks = self.looks(cx, prefixes.iter().chain(core::iter::once(path)))?;
+        for (i, sub) in prefixes.iter().enumerate() {
+            match looks.get(i).map(|l| l.kind) {
+                Some(EntryKind::Dir) => {}
+                Some(EntryKind::Gone) => return Err(FsError::new(FsOp::Read, &name, FsKind::NotFound)),
+                _ => return Err(FsError::new(FsOp::Read, &self.beneath(sub), FsKind::Driver("symbolic link refused in confined read".into()))),
+            }
+        }
+        match looks.get(prefixes.len()).map(|l| l.kind) {
+            Some(EntryKind::File) => {}
+            Some(EntryKind::Dir) => return Err(FsError::new(FsOp::Read, &name, FsKind::IsADirectory)),
+            Some(EntryKind::Gone) => return Err(FsError::new(FsOp::Read, &name, FsKind::NotFound)),
+            _ => return Err(FsError::new(FsOp::Read, &name, FsKind::Driver("symbolic link refused in confined read".into()))),
+        }
+        let file = name.clone();
+        match call(&self.io, cx, FsOp::Read, &name, |tag| Effect::ReadAll { file, tag })? {
+            Done::Read(bytes) => {
+                into.try_extend(&bytes)
+                    .map_err(|stopped| FsError::new(FsOp::Read, &name, FsKind::Stopped(stopped)))?;
+                Ok(bytes.len())
+            }
+            other => Err(unexpected(FsOp::Read, &name, other)),
+        }
+    }
+
     /// Reads all of `paths` beneath this directory concurrently into the matching `out` buffers,
     /// returning the total bytes appended.
     ///

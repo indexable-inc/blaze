@@ -22,6 +22,7 @@
 //! cannot ask the driver to stop the op: it waits for it to end, which is why it never
 //! returns before the op is done.
 
+use alloc::vec::Vec;
 use core::{fmt, marker::PhantomData};
 
 use blaze_core::{Done, Effect, Tag, wait::Deadline};
@@ -231,6 +232,182 @@ pub fn wait_both<'a, 'b, A: Complete<'a>, B: Complete<'b>>(
         Ok(Either::First((a, second))) => (a, second.wait(cx)),
         Ok(Either::Second((first, b))) => (first.wait(cx), b),
         Err((_stopped, first, second)) => (first.wait(cx), second.wait(cx)),
+    }
+}
+
+struct Slot<'buf, C: Complete<'buf>> {
+    id: usize,
+    into: &'buf mut [u8],
+    from: PhantomData<&'buf [u8]>,
+    finish: C,
+    tag: Option<Tag>,
+    span: &'static str,
+}
+
+/// Abandonment guard for [`WaitSet`]: settles any tags still in flight on unwind.
+struct SettleMany<'f> {
+    io: Io,
+    tags: Vec<Tag, &'f blaze_mem::Frame>,
+    tag_to_slot: Vec<usize, &'f blaze_mem::Frame>,
+}
+
+impl Drop for SettleMany<'_> {
+    fn drop(&mut self) {
+        if self.tags.is_empty() {
+            return;
+        }
+        let until = Deadline::after(self.io.now(), self.io.limits().abandon_wait);
+        for &tag in &self.tags {
+            let _ = self.io.settle(tag, until, "bstd::pending::WaitSet");
+        }
+        self.tags.clear();
+        self.tag_to_slot.clear();
+    }
+}
+
+/// Linear N-way I/O multiplexer for homogeneous [`Pending<'buf, C>`] operations (e.g. N
+/// concurrent file reads or socket receives), allocated explicitly in `cx.frame()` (zero
+/// `Global` heap allocations, zero `Box<dyn FnOnce>`, `#![deny(unsafe_code)]`, `#[blaze::linear]`).
+#[blaze::linear]
+#[must_use = "a WaitSet is finished with drain(cx, on_done) or cancel_all(cx, give_up)"]
+pub struct WaitSet<'f, 'buf, C: Complete<'buf>> {
+    slots: Vec<Slot<'buf, C>, &'f blaze_mem::Frame>,
+    settle: SettleMany<'f>,
+    unfinished: Unfinished,
+}
+
+impl<'f, 'buf, C: Complete<'buf>> WaitSet<'f, 'buf, C> {
+    /// Creates an empty linear [`WaitSet`] backed explicitly by `cx.frame()`.
+    #[track_caller]
+    pub fn new(cx: &'f Cx) -> WaitSet<'f, 'buf, C> {
+        let frame = cx.frame();
+        WaitSet {
+            slots: Vec::new_in(frame),
+            settle: SettleMany {
+                io: cx.io().clone(),
+                tags: Vec::new_in(frame),
+                tag_to_slot: Vec::new_in(frame),
+            },
+            unfinished: Unfinished::new("pending::WaitSet", "drain(cx, on_done) or cancel_all(cx, give_up)"),
+        }
+    }
+
+    /// Transfers linear ownership of `pending` into this set under caller `id`. If `cx.frame()`
+    /// cannot fit another slot, returns `Err((Stopped::OutOfMemory, pending))` with `pending`
+    /// still armed and untouched so the caller can wait or cancel it cleanly.
+    pub fn push(&mut self, id: usize, pending: Pending<'buf, C>) -> Result<(), (Stopped, Pending<'buf, C>)> {
+        let oom = |asked| Stopped::OutOfMemory { arena: "bstd::pending::WaitSet", asked };
+        if self.slots.try_reserve(1).is_err() {
+            return Err((oom(size_of::<Slot<'buf, C>>()), pending));
+        }
+        if pending.settle.tag.is_some() {
+            if self.settle.tags.try_reserve(1).is_err() {
+                return Err((oom(size_of::<Tag>()), pending));
+            }
+            if self.settle.tag_to_slot.try_reserve(1).is_err() {
+                return Err((oom(size_of::<usize>()), pending));
+            }
+        }
+        let Pending { into, from, finish, mut settle, unfinished } = pending;
+        unfinished.finished();
+        settle.armed = false;
+        let idx = self.slots.len();
+        if let Some(tag) = settle.tag {
+            self.settle.tags.push(tag);
+            self.settle.tag_to_slot.push(idx);
+        }
+        self.slots.push(Slot { id, into, from, finish, tag: settle.tag, span: settle.span });
+        Ok(())
+    }
+
+    /// How many operations remain in this set.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Whether no operations remain in this set.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Waits for the next operation in this set to complete, returning `None` when the set is
+    /// empty, `Some(Ok((id, output)))` when an op finishes, or `Some(Err(stopped))` if `cx`
+    /// stopped before any op completed (leaving remaining ops intact for `cancel_all`).
+    pub fn next(&mut self, cx: &Cx) -> Option<Result<(usize, C::Output), Stopped>> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        // Immediately complete any op that was refused before reaching the driver.
+        if let Some(pos) = self.slots.iter().position(|s| s.tag.is_none()) {
+            let slot = self.remove_slot(pos);
+            let out = slot.finish.complete(slot.into, Err(Stopped::Cancelled { span: slot.span }));
+            return Some(Ok((slot.id, out)));
+        }
+        match cx.wait_any(&self.settle.io, &self.settle.tags) {
+            Ok((tag_pos, done)) => {
+                let slot_pos = self.settle.tag_to_slot[tag_pos];
+                let slot = self.remove_slot(slot_pos);
+                let out = slot.finish.complete(slot.into, Ok(done));
+                Some(Ok((slot.id, out)))
+            }
+            Err(stopped) => Some(Err(stopped)),
+        }
+    }
+
+    /// Drains every remaining operation in completion order, invoking `on_done(id, output)` for
+    /// each. If `cx` stops mid-drain, settles all remaining in-flight ops up to `cx.deadline()`
+    /// before returning `Err(stopped)` so nothing lands after return.
+    #[blaze::consumes]
+    pub fn drain(mut self, cx: &Cx, mut on_done: impl FnMut(usize, C::Output)) -> Result<(), Stopped> {
+        while let Some(step) = self.next(cx) {
+            match step {
+                Ok((id, out)) => on_done(id, out),
+                Err(stopped) => {
+                    let give_up = cx.deadline().max(Deadline::after(self.settle.io.now(), self.settle.io.limits().abandon_wait));
+                    self.cancel_all(cx, give_up);
+                    return Err(stopped);
+                }
+            }
+        }
+        let WaitSet { unfinished, .. } = self;
+        unfinished.finished();
+        Ok(())
+    }
+
+    /// Cancels/settles every remaining operation in this set up to `give_up` and consumes the
+    /// linear `WaitSet`.
+    #[blaze::consumes]
+    pub fn cancel_all(self, cx: &Cx, give_up: Deadline) {
+        let WaitSet { mut slots, mut settle, unfinished } = self;
+        unfinished.finished();
+        for tag in settle.tags.drain(..) {
+            let _ = settle.io.settle(tag, give_up, cx.name());
+        }
+        settle.tag_to_slot.clear();
+        slots.clear();
+    }
+
+    fn remove_slot(&mut self, slot_pos: usize) -> Slot<'buf, C> {
+        let last_slot = self.slots.len() - 1;
+        let removed = self.slots.swap_remove(slot_pos);
+        if removed.tag.is_some()
+            && let Some(tpos) = self.settle.tag_to_slot.iter().position(|&s| s == slot_pos)
+        {
+            self.settle.tags.swap_remove(tpos);
+            self.settle.tag_to_slot.swap_remove(tpos);
+        }
+        if slot_pos != last_slot
+            && let Some(moved) = self.settle.tag_to_slot.iter_mut().find(|s| **s == last_slot)
+        {
+            *moved = slot_pos;
+        }
+        removed
     }
 }
 
