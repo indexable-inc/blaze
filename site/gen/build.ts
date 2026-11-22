@@ -27,6 +27,7 @@
 import { createHash } from 'node:crypto';
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, watch, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { buildExplorePage } from '../explore/build';
 import { buildGraphPage } from '../graph/build';
 import { benchScript } from './bench';
 import { raceScript } from './bench/race';
@@ -210,6 +211,8 @@ async function build() {
 	cpSync(path.join(root, 'static'), dist, { recursive: true });
 	// The code graph page, at <base>/graph, standalone (graph/README.md).
 	await buildGraphPage(dist);
+	// The live explore page, at <base>/explore, standalone (site/explore/).
+	await buildExplorePage(dist);
 	// The installer, at <base>/install.sh, from site/; the worker also answers <base>/ with it for curl
 	// (`curl -fsSL https://ix.dev/blaze | sh`).
 	cpSync(path.join(root, 'install.sh'), path.join(dist, 'install.sh'));

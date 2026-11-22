@@ -599,28 +599,146 @@ fn lock_source(lock: &str, name: &str, version: &str) -> Option<Option<String>> 
     None
 }
 
-/// The folder of the package named `name` under `checkout`: the one whose `Cargo.toml` says
-/// `name = "<name>"` before its first table after `[package]`. Walked with a stack of
-/// folders, `target` and dot-folders left out.
-fn package_dir(checkout: &Path, name: &str) -> Result<Option<PathBuf>, Failure> {
-    let wanted = format!("name = {name:?}");
-    let mut stack = vec![checkout.to_owned()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).map_err(io(&dir))? {
-            let entry = entry.map_err(io(&dir))?;
-            let path = entry.path();
-            let base = entry.file_name();
-            let kind = entry.file_type().map_err(io(&path))?;
-            if kind.is_dir() {
-                if base != "target" && !base.to_string_lossy().starts_with('.') {
-                    stack.push(path);
+/// A member of the checkout's workspace as cargo reads it: its `package.name`, its version (an
+/// inherited `version.workspace = true` is the root's `workspace.package.version`; none written
+/// is cargo's `0.0.0`) and its folder.
+struct PathPackage {
+    name: String,
+    version: String,
+    dir: PathBuf,
+}
+
+/// The checkout's workspace members, read with blaze-manifest's layout reader (the one reader of
+/// a workspace, crates/blaze-manifest/src/layout) the first time a run asks for a path package,
+/// and kept for the run. A lock's path package is a member (cargo makes a path dependency under
+/// the root one too), found by its manifest's `package.name` as TOML reads it: a manifest that
+/// opens with a comment (turso's `# Copyright 2024 the Limbo authors..` above `[package]`) is
+/// read like any other, where a scan of the text before its first table found no name.
+struct Members<'c> {
+    checkout: &'c Path,
+    read: std::cell::OnceCell<Result<Vec<PathPackage>, Failure>>,
+}
+
+/// The most passes the layout reader is given: a pass asks for everything it can see it needs,
+/// so their number is the depth of the search (the root, the members' globs, path
+/// dependencies, the target folders), never the number of files (rule 18: a bound, not a loop).
+const LAYOUT_PASSES: usize = 64;
+
+impl<'c> Members<'c> {
+    fn new(checkout: &'c Path) -> Members<'c> {
+        Members { checkout, read: std::cell::OnceCell::new() }
+    }
+
+    /// The folder of the member `wanted` names: matched by name, then its version checked
+    /// against the lock's (inherited from the root's `[workspace.package]` where it says so).
+    fn find(&self, wanted: &Wanted, alloc: blaze_own::Alloc<'_>) -> Result<PathBuf, Failure> {
+        let root = self.checkout.join("Cargo.toml");
+        let members = match self.read.get_or_init(|| read_members(self.checkout, alloc)) {
+            Ok(members) => members,
+            Err(failure) => {
+                return Err(Failure::Manifest { path: root, why: format!("the workspace could not be read as cargo reads it (blaze_manifest::layout): {failure}") });
+            }
+        };
+        let named: Vec<&PathPackage> = members.iter().filter(|it| it.name == wanted.name).collect();
+        match named.as_slice() {
+            [] => Err(Failure::Manifest {
+                path: root,
+                why: format!(
+                    "the lock names the path package {} {}, and none of the workspace's {} members is named so (read as cargo reads it, blaze_manifest::layout); a path package outside the workspace's members is not built by this tool",
+                    wanted.name,
+                    wanted.version,
+                    members.len()
+                ),
+            }),
+            [one] if one.version == wanted.version => Ok(one.dir.clone()),
+            [one] => Err(Failure::Manifest {
+                path: one.dir.join("Cargo.toml"),
+                why: format!(
+                    "the member {} is version {} (its `package.version`, or the root's `workspace.package.version` it inherits), and the lock names {} {}",
+                    one.name, one.version, wanted.name, wanted.version
+                ),
+            }),
+            more => Err(Failure::Manifest {
+                path: root,
+                why: format!("{} members are named {}: {}", more.len(), wanted.name, more.iter().map(|it| it.dir.display().to_string()).collect::<Vec<_>>().join(", ")),
+            }),
+        }
+    }
+}
+
+/// The checkout's workspace members: blaze_manifest's sans-IO layout reader, started at the
+/// checkout's root and answered from its files. A file or folder that is not there is answered
+/// `None`, as the reader asks; any other error reading one stops the read, naming it.
+fn read_members(checkout: &Path, alloc: blaze_own::Alloc<'_>) -> Result<Vec<PathPackage>, Failure> {
+    use blaze_manifest::layout::{Entry, Layout, Need, Pass};
+    let absent = |error: &std::io::Error| matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory);
+    let root = checkout.join("Cargo.toml");
+    let mut reader = Layout::new("", alloc).map_err(|why| Failure::Manifest { path: root.clone(), why: why.to_string() })?;
+    for _ in 0..LAYOUT_PASSES {
+        let needs = match reader.pass().map_err(|why| Failure::Manifest { path: root.clone(), why: why.to_string() })? {
+            Pass::Done(units) => {
+                let mut out = Vec::with_capacity(units.members.len());
+                for member in units.members.iter() {
+                    let dir = member.dir.as_str();
+                    out.push(PathPackage {
+                        name: member.name.as_str().to_owned(),
+                        version: member.version.as_ref().map_or("0.0.0", |it| it.as_str()).to_owned(),
+                        dir: if dir.is_empty() { checkout.to_owned() } else { checkout.join(dir) },
+                    });
                 }
-            } else if base == "Cargo.toml" && read(&path)?.split("\n[").next().is_some_and(|package| package.lines().any(|line| line.trim() == wanted)) {
-                return Ok(Some(dir));
+                return Ok(out);
+            }
+            Pass::Need(needs) => needs,
+        };
+        for need in needs.iter() {
+            match need {
+                Need::Manifest(path) => {
+                    let file = checkout.join(path.as_str());
+                    let text = match std::fs::read_to_string(&file) {
+                        Ok(text) => Some(text),
+                        Err(error) if absent(&error) => None,
+                        Err(error) => return Err(Failure::Io { path: file, error }),
+                    };
+                    reader.manifest(path.as_str(), text.as_deref()).map_err(|why| Failure::Manifest { path: file.clone(), why: why.to_string() })?;
+                }
+                Need::Listing(dir) => {
+                    let folder = checkout.join(dir.as_str());
+                    let listed: Option<Vec<(String, bool)>> = match std::fs::read_dir(&folder) {
+                        Ok(entries) => {
+                            let mut names = Vec::new();
+                            for entry in entries {
+                                let entry = entry.map_err(io(&folder))?;
+                                let path = entry.path();
+                                let kind = entry.file_type().map_err(io(&path))?;
+                                // A link to a folder is a folder, as cargo's walk follows it; a
+                                // dangling link is no folder, as the OS says.
+                                let is_dir = kind.is_dir() || (kind.is_symlink() && std::fs::metadata(&path).is_ok_and(|it| it.is_dir()));
+                                let name = entry.file_name().into_string().map_err(|name| Failure::Manifest {
+                                    path: folder.clone(),
+                                    why: format!("the entry {name:?} is not UTF-8, which a workspace's paths must be"),
+                                })?;
+                                names.push((name, is_dir));
+                            }
+                            Some(names)
+                        }
+                        Err(error) if absent(&error) => None,
+                        Err(error) => return Err(Failure::Io { path: folder, error }),
+                    };
+                    let entries: Option<Vec<Entry<'_>>> = listed.as_ref().map(|names| names.iter().map(|(name, is_dir)| Entry { name, is_dir: *is_dir }).collect());
+                    reader.listing(dir.as_str(), entries.as_deref());
+                }
             }
         }
     }
-    Ok(None)
+    Err(Failure::Manifest { path: root, why: format!("the layout reader did not finish in {LAYOUT_PASSES} passes") })
+}
+
+/// The `package.name` a manifest's text gives, as TOML reads it; `None` for a manifest with
+/// none (a virtual workspace's root). A text that is no TOML is the error, for the caller to
+/// name.
+fn manifest_package_name(text: &str, alloc: blaze_own::Alloc<'_>) -> Result<Option<String>, blaze_toml::Error> {
+    let doc = blaze_toml::Document::parse_in(text, blaze_toml::Limits::CARGO, alloc)?;
+    Ok(doc.root().get("package").and_then(|package| package.get("name")).and_then(|name| name.as_str()).map(str::to_owned))
 }
 
 /// Where a crate's sources are, as the checkout's lock pins them.
@@ -642,7 +760,7 @@ enum Origin {
 /// `SourceId::Git { commit }.key()` and opened by `PackView::open_source`, which refuses it
 /// unless it holds that commit's files; every path is the pack's, already held inside its
 /// folder by the fetch.
-fn git_origin(args: &Args, wanted: &Wanted, source: &str) -> Result<Origin, Failure> {
+fn git_origin(args: &Args, wanted: &Wanted, source: &str, alloc: blaze_own::Alloc<'_>) -> Result<Origin, Failure> {
     let lock = args.checkout.join("Cargo.lock");
     let refuse = |why: String| Failure::Manifest { path: lock.clone(), why: format!("{} {}: {why}", wanted.name, wanted.version) };
     let commit = source.rsplit_once('#').map(|it| it.1).unwrap_or("");
@@ -660,7 +778,6 @@ fn git_origin(args: &Args, wanted: &Wanted, source: &str) -> Result<Origin, Fail
     let view = blaze_fetch::PackView::open_source(&id, &bytes)
         .map_err(|why| Failure::Manifest { path: record.clone(), why: format!("the record of commit {commit}: {}", blaze_text::Shown(&why)) })?;
     let root = args.work.join("git").join(commit);
-    let wanted_line = format!("name = {:?}", wanted.name);
     let mut found: Option<String> = None;
     for file in view.files() {
         let out = root.join(file.path);
@@ -668,10 +785,26 @@ fn git_origin(args: &Args, wanted: &Wanted, source: &str) -> Result<Origin, Fail
             write(&out, file.bytes)?;
         }
         let is_manifest = file.path == "Cargo.toml" || file.path.ends_with("/Cargo.toml");
-        if is_manifest
-            && std::str::from_utf8(file.bytes)
-                .is_ok_and(|text| text.split("\n[").next().is_some_and(|package| package.lines().any(|line| line.trim() == wanted_line)))
-        {
+        if !is_manifest {
+            continue;
+        }
+        // Every manifest of the commit is a candidate, as cargo walks a git source; its name is
+        // read as TOML (a comment may open it). One that is no TOML is no package, as cargo
+        // skips a malformed package there; it is named, not passed over in silence.
+        let name = match std::str::from_utf8(file.bytes) {
+            Ok(text) => match manifest_package_name(text, alloc) {
+                Ok(name) => name,
+                Err(why) => {
+                    println!("{SCRIPT}: {} {}: commit {commit}: {} is no TOML ({}), so no package", wanted.name, wanted.version, file.path, why.display(text));
+                    None
+                }
+            },
+            Err(_) => {
+                println!("{SCRIPT}: {} {}: commit {commit}: {} is not UTF-8, so no package", wanted.name, wanted.version, file.path);
+                None
+            }
+        };
+        if name.as_deref() == Some(wanted.name.as_str()) {
             let folder = file.path.strip_suffix("Cargo.toml").unwrap_or("").trim_end_matches('/');
             // The shortest such folder: a package copied into a test fixture deeper down is not it.
             if found.as_ref().is_none_or(|held| folder.len() < held.len()) {
@@ -687,25 +820,22 @@ fn git_origin(args: &Args, wanted: &Wanted, source: &str) -> Result<Origin, Fail
 }
 
 impl Origin {
-    /// Finds `wanted` in the lock and, for a path package, in the checkout; for a git one, in
-    /// the fetch store.
-    fn of(args: &Args, lock: &str, wanted: &Wanted) -> Result<Origin, Failure> {
+    /// Finds `wanted` in the lock and, for a path package, among the checkout's workspace
+    /// `members`; for a git one, in the fetch store.
+    fn of(args: &Args, lock: &str, members: &Members<'_>, wanted: &Wanted, alloc: blaze_own::Alloc<'_>) -> Result<Origin, Failure> {
         let checkout = &args.checkout;
         let not_locked = || Failure::NotLocked { name: wanted.name.clone(), version: wanted.version.clone() };
         match lock_source(lock, &wanted.name, &wanted.version).ok_or_else(not_locked)? {
             Some(source) if source.starts_with("registry+") => {
                 Ok(Origin::Registry { checksum: checksum(lock, &wanted.name, &wanted.version).ok_or_else(not_locked)? })
             }
-            Some(source) if source.starts_with("git+") => git_origin(args, wanted, &source),
+            Some(source) if source.starts_with("git+") => git_origin(args, wanted, &source, alloc),
             Some(source) => Err(Failure::Manifest {
                 path: checkout.join("Cargo.lock"),
                 why: format!("{} {} comes from {source}, which this tool does not build yet", wanted.name, wanted.version),
             }),
             None => {
-                let dir = package_dir(checkout, &wanted.name)?.ok_or_else(|| Failure::Manifest {
-                    path: checkout.to_owned(),
-                    why: format!("the lock names the path package {} {}, and no Cargo.toml here names it", wanted.name, wanted.version),
-                })?;
+                let dir = members.find(wanted, alloc)?;
                 let path = dir.join("Cargo.toml");
                 let manifest = inherit(&read(&path)?, &read(&checkout.join("Cargo.toml"))?, checkout, &path)?;
                 Ok(Origin::Path { files: files_digest(&dir)?, dir, manifest })
@@ -1818,7 +1948,8 @@ fn main_with(args: &Args, heap: &blaze_own::Heap) -> i32 {
     let shim_text = read(&shim_path).unwrap_or_else(|failure| fail(failure));
     let lock = read(&args.checkout.join("Cargo.lock")).unwrap_or_else(|failure| fail(failure));
     let me = std::env::current_exe().unwrap_or_else(|error| fail(Failure::Io { path: PathBuf::from("current_exe"), error })).into_os_string();
-    let origins: Vec<Result<Origin, Failure>> = args.crates.iter().map(|wanted| Origin::of(&args, &lock, wanted)).collect();
+    let members = Members::new(&args.checkout);
+    let origins: Vec<Result<Origin, Failure>> = args.crates.iter().map(|wanted| Origin::of(args, &lock, &members, wanted, heap.alloc())).collect();
     let plan = Plan {
         args,
         offline: false,
@@ -2136,6 +2267,84 @@ version = "1"
             assert!(!made.contains("dev-dependencies"), "{made}");
         }
         println!("render keeps the target alias and inline build dependency; both dev tables are omitted");
+    }
+
+    /// A workspace in a fresh folder: `files` as (relative path, text).
+    fn workspace(name: &str, files: &[(&str, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("blaze-pmm-members-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (path, text) in files {
+            write(&dir.join(path), text).unwrap_or_else(|failure| panic!("{failure}"));
+        }
+        dir
+    }
+
+    fn wanted(name: &str, version: &str) -> Wanted {
+        Wanted { name: name.to_owned(), version: version.to_owned(), features: None }
+    }
+
+    /// turso's root: a virtual workspace that opens with a comment and gives its members their
+    /// version.
+    const TURSO_ROOT: &str = "# Copyright 2023-2026 the Turso authors. All rights reserved. MIT license.\n\n[workspace]\nresolver = \"2\"\nmembers = [\n    \"core\",\n    \"macros\",\n]\n\n[workspace.package]\nversion = \"0.9.0-pre.6\"\nedition = \"2021\"\n";
+    /// turso's macros/Cargo.toml as it is: line 1 a comment, `version.workspace = true`.
+    const TURSO_MACROS: &str = "# Copyright 2024 the Limbo authors. All rights reserved. MIT license.\n\n[package]\nname = \"turso_macros\"\nversion.workspace = true\nedition.workspace = true\n\n[lib]\nproc-macro = true\n\n[dependencies]\nquote = \"1.0.38\"\n";
+    const TURSO_CORE: &str = "# Copyright 2023-2025 the Turso authors. All rights reserved. MIT license.\n\n[package]\nname = \"turso_core\"\nversion.workspace = true\nedition.workspace = true\n\n[lib]\nname = \"turso_core\"\npath = \"lib.rs\"\n";
+
+    /// turso's first check (2026-11-21): "the lock names the path package turso_macros
+    /// 0.9.0-pre.6, and no Cargo.toml here names it", 1,741 errors and ~11,000 bodies behind it:
+    /// the old walk read only the text before a manifest's first "\n[", which for a manifest
+    /// opening with a comment is the comment. Read as cargo reads the workspace, the member is
+    /// found and its inherited version matches; the twin without the comment is found the same.
+    /// Controls, each removing the cause of a find: a lock version the member does not have is
+    /// refused naming both; a manifest that names the package outside the workspace's members (a
+    /// fixture) is not a member, so not found. Prints "members: turso_macros at macros ..".
+    #[test]
+    fn a_member_manifest_that_opens_with_a_comment_is_found_by_its_name() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let fixture = "[package]\nname = \"turso_fixture\"\nversion = \"0.9.0-pre.6\"\n";
+        let files = [
+            ("Cargo.toml", TURSO_ROOT),
+            ("macros/Cargo.toml", TURSO_MACROS),
+            ("macros/src/lib.rs", ""),
+            ("core/Cargo.toml", TURSO_CORE),
+            ("core/lib.rs", ""),
+            ("testing/fixture/Cargo.toml", fixture),
+            ("testing/fixture/src/lib.rs", ""),
+        ];
+        let dir = workspace("comment", &files);
+        let members = Members::new(&dir);
+        let found = members.find(&wanted("turso_macros", "0.9.0-pre.6"), alloc).unwrap_or_else(|failure| panic!("not found: {failure}"));
+        assert_eq!(found, dir.join("macros"));
+        let core = members.find(&wanted("turso_core", "0.9.0-pre.6"), alloc).unwrap_or_else(|failure| panic!("not found: {failure}"));
+        assert_eq!(core, dir.join("core"));
+
+        let twin_text = TURSO_MACROS.split_once("\n\n").expect("the comment line").1;
+        let twin_files = [("Cargo.toml", TURSO_ROOT), ("macros/Cargo.toml", twin_text), ("macros/src/lib.rs", ""), ("core/Cargo.toml", TURSO_CORE), ("core/lib.rs", "")];
+        let twin = workspace("twin", &twin_files);
+        let twin_found = Members::new(&twin).find(&wanted("turso_macros", "0.9.0-pre.6"), alloc).unwrap_or_else(|failure| panic!("twin not found: {failure}"));
+        assert_eq!(twin_found, twin.join("macros"));
+
+        let Err(Failure::Manifest { why: version, .. }) = members.find(&wanted("turso_macros", "0.9.0-pre.5"), alloc) else { panic!("another version was found") };
+        assert!(version.contains("version 0.9.0-pre.6") && version.contains("turso_macros 0.9.0-pre.5"), "{version}");
+        let Err(Failure::Manifest { why: outside, .. }) = members.find(&wanted("turso_fixture", "0.9.0-pre.6"), alloc) else { panic!("a manifest outside the members was taken for one") };
+        assert!(outside.contains("none of the workspace's 2 members"), "{outside}");
+        println!("members: turso_macros at macros, twin at macros | other version: {version} | fixture: {outside}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&twin);
+    }
+
+    /// A git source's manifests are read for their `package.name` as TOML: one opening with a
+    /// comment names its package; a virtual root names none; a text that is no TOML is the error
+    /// git_origin names. Prints "git names: Some(..) None error".
+    #[test]
+    fn a_manifests_package_name_is_read_as_toml() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let named = manifest_package_name(TURSO_MACROS, alloc).unwrap_or_else(|why| panic!("{}", why.display(TURSO_MACROS)));
+        assert_eq!(named.as_deref(), Some("turso_macros"));
+        let virtual_root = manifest_package_name(TURSO_ROOT, alloc).unwrap_or_else(|why| panic!("{}", why.display(TURSO_ROOT)));
+        assert_eq!(virtual_root, None);
+        assert!(manifest_package_name("[package\nname = 1", alloc).is_err());
+        println!("git names: {named:?} {virtual_root:?} error");
     }
 
     /// The drift the first run of tempo's 79 had: syn 1.0.109 compiled where the lock gives

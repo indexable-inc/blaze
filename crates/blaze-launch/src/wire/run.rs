@@ -34,8 +34,49 @@ use crate::{Slot, Thread, Tier};
 /// ([`WireError::RunSchema`]). 2: `Up::Fault` carries the code around the pc and the thread's
 /// registers (wire/fault.rs). 3: `Up::Fault` carries the faulting thread's callers, its
 /// frame-pointer chain (wire/fault.rs `Callers`). 4: `Down::Positioned` publishes a code
-/// record with this run's source-position values.
-pub const RUN_SCHEMA: u32 = 4;
+/// record with this run's source-position values. 5: `Down::Hooks` toggles observe/span stubs
+/// dynamically on a live run and `Down::Promote` carries an optimized record's inlined callee
+/// read list for automatic hook-toggle deoptimization.
+pub const RUN_SCHEMA: u32 = 5;
+
+/// What observe stub (or plain execution) [`Down::Hooks`] selects for a slot.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum HookKind {
+    /// Remove any observe stub and jump straight to the slot's effective body.
+    Plain,
+    /// Per-function call counter stub.
+    Count,
+    /// Per-thread entry-mark bitmap stub.
+    Mark,
+    /// Entry-only runtime hook stub.
+    Hook,
+    /// Entry+exit shadow-stack span hook stub (records duration and parent-child span tree).
+    Span,
+}
+
+impl HookKind {
+    fn name(self) -> &'static str {
+        match self {
+            HookKind::Plain => "plain",
+            HookKind::Count => "count",
+            HookKind::Mark => "mark",
+            HookKind::Hook => "hook",
+            HookKind::Span => "span",
+        }
+    }
+
+    fn read(from: &mut Reader<'_>) -> Result<HookKind, WireError> {
+        let at = from.at();
+        match from.text()? {
+            "plain" => Ok(HookKind::Plain),
+            "count" => Ok(HookKind::Count),
+            "mark" => Ok(HookKind::Mark),
+            "hook" => Ok(HookKind::Hook),
+            "span" => Ok(HookKind::Span),
+            _ => Err(WireError::Variant { at }),
+        }
+    }
+}
 
 /// A function instance as a code record names it: the bytes of blaze-code's `record::Symbol`
 /// (the item's stable id and its type arguments by content). This crate depends on no other,
@@ -127,6 +168,14 @@ pub enum Down<'a> {
     /// once, before the first `Publish` of a record naming the descriptor: the child makes the
     /// descriptor and the key (wire/thread_locals.rs).
     ThreadLocals { descriptor: Symbol, ender: Symbol },
+    /// Toggle a live observe stub on or off for `slot`. Putting a stub on a callee also
+    /// retreats any optimized caller that inlined it back to its fast body until `Plain`.
+    Hooks { slot: Slot, kind: HookKind },
+    /// Place an optimized record for `slot` with its inlined callee read list (`inlined`,
+    /// wire slot numbers) and optional source-position `values`. If any slot in `inlined` is
+    /// currently observed, the optimized body is kept ready but `slot` stays on its fast body
+    /// until every inlined callee returns to plain.
+    Promote { slot: Slot, record: RecordId, inlined: List<'a, Slot>, values: &'a [u8] },
 }
 
 impl Listed<'_> for Declared {
@@ -293,6 +342,24 @@ impl<'a> Down<'a> {
             Down::Native { library, words } => native::write(to, library, words),
             Down::Data { data } => data::write(to, data),
             Down::ThreadLocals { descriptor, ender } => thread_locals::write(to, descriptor, ender),
+            Down::Hooks { slot, kind } => {
+                variant(to, "Hooks", 2);
+                to.text("kind");
+                to.text(kind.name());
+                to.text("slot");
+                to.uint(u64::from(slot.0));
+            }
+            Down::Promote { slot, record, inlined, values } => {
+                variant(to, "Promote", 4);
+                to.text("slot");
+                to.uint(u64::from(slot.0));
+                to.text("record");
+                to.bytes(&record.0);
+                to.text("values");
+                to.bytes(values);
+                to.text("inlined");
+                inlined.write(to);
+            }
             Down::Failed { need, why } => {
                 variant(to, "Failed", 2);
                 to.text("why");
@@ -344,6 +411,26 @@ impl<'a> Down<'a> {
             thread_locals::NAME => {
                 let (descriptor, ender) = thread_locals::read(&mut from)?;
                 Down::ThreadLocals { descriptor, ender }
+            }
+            "Hooks" => {
+                from.map(2, "Hooks, a map of 2")?;
+                from.key("kind")?;
+                let kind = HookKind::read(&mut from)?;
+                from.key("slot")?;
+                let slot = Slot(from.uint32("a slot past the 32 bits a table has")?);
+                Down::Hooks { slot, kind }
+            }
+            "Promote" => {
+                from.map(4, "Promote, a map of 4")?;
+                from.key("slot")?;
+                let slot = Slot(from.uint32("a slot past the 32 bits a table has")?);
+                from.key("record")?;
+                let record = RecordId(id(&mut from, "a record id is 32 bytes")?);
+                from.key("values")?;
+                let values = from.bytes()?;
+                from.key("inlined")?;
+                let inlined = List::read(&mut from)?;
+                Down::Promote { slot, record, inlined, values }
             }
             "Failed" => {
                 from.map(2, "Failed, a map of 2")?;

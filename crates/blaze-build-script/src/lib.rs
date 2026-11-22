@@ -24,6 +24,7 @@ pub mod c_request;
 pub mod c_tasks;
 pub mod c_tasks_built;
 pub mod c_tasks_probe;
+pub mod c_tasks_tree;
 pub mod cx;
 pub mod dep_paths;
 pub mod env;
@@ -51,6 +52,8 @@ mod c_request_tests;
 mod c_tasks_probe_tests;
 #[cfg(test)]
 mod c_tasks_tests;
+#[cfg(test)]
+mod c_tasks_tree_tests;
 #[cfg(test)]
 mod nm_row_tests;
 #[cfg(test)]

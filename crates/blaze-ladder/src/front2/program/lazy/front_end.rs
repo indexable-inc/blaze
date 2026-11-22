@@ -377,8 +377,8 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
         self.check_one_by(key, super::fill::Typer::Check)
     }
 
-    fn ctor_row(&mut self, key: ItemKey) -> Result<Option<usize>, crate::run::RunError> {
-        self.ctor_row_key(key).map_err(|e| crate::run::RunError::Front2(Front2Refusal::Lazy(e)))
+    fn head_row(&mut self, key: ItemKey) -> Result<Option<usize>, crate::run::RunError> {
+        self.head_row_key(key).map(Some).map_err(|e| crate::run::RunError::Front2(Front2Refusal::Lazy(e)))
     }
 
     fn done(&mut self, i: usize) {

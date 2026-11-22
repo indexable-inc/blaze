@@ -90,6 +90,11 @@ pub enum PNode {
     ExProj { trait_: ItemKey, name: Name, args: List, term: PTy },
     /// A trait object's auto trait (`+ Send`).
     ExAuto(ItemKey),
+    /// An extern type (`extern { type T; }`, feature `extern_types`; core's `Code`, which
+    /// `FnPtr::as_ptr` points to), by its item: equal only to itself; no size and no alignment
+    /// (neither `Sized` nor `MetaSized`), so a pointer to it is thin; no fields, no drop glue;
+    /// no auto trait unless an impl says so (rustc's `ty::Foreign`). A leaf: no children.
+    Foreign(ItemKey),
 }
 
 /// A borrowed portable table: a base (the shared table as it stood, read in place) and the
@@ -190,7 +195,8 @@ impl<'a> PTys<'a> {
                 out.extend([term]);
             }
             PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Float(_) | PNode::Str
-            | PNode::Never | PNode::Param(_) | PNode::ConstParam(_) | PNode::Infer | PNode::Error | PNode::ExAuto(_) => {}
+            | PNode::Never | PNode::Param(_) | PNode::ConstParam(_) | PNode::Infer | PNode::Error | PNode::ExAuto(_)
+            | PNode::Foreign(_) => {}
         }
         Ok(())
     }
@@ -366,6 +372,7 @@ pub(crate) fn node_children(t: PTys<'_>, n: PNode, out: &mut blaze_own::Vec<u32,
         | PNode::ConstParam(_)
         | PNode::Error
         | PNode::ExAuto(_)
+        | PNode::Foreign(_)
         | PNode::Future(..)
         | PNode::Infer => Ok(()),
         PNode::ConstValue { ty: p, .. } | PNode::Ref(_, p) | PNode::Ptr(_, p) | PNode::Slice(p) => {
@@ -525,6 +532,10 @@ pub(crate) fn hash_node(n: &PNode, h: &mut StableHasher) {
             h.tag(28);
             h.u128(k.0);
         }
+        PNode::Foreign(k) => {
+            h.tag(30);
+            h.u128(k.0);
+        }
     }
 }
 
@@ -569,7 +580,8 @@ pub(crate) fn hash_node_shape(n: &PNode, h: &mut StableHasher) {
         | PNode::Infer
         | PNode::Error
         | PNode::ConstParam(_)
-        | PNode::ExAuto(_)) => leaf,
+        | PNode::ExAuto(_)
+        | PNode::Foreign(_)) => leaf,
     };
     hash_node(&shape, h);
 }
@@ -959,7 +971,8 @@ impl<'a> PortableTys<'a> {
                 PNode::ExProj { trait_, name, args: self.intern_list(&children[..n])?, term: children[n] }
             }
             PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Float(_) | PNode::Str
-            | PNode::Never | PNode::Param(_) | PNode::ConstParam(_) | PNode::Infer | PNode::Error | PNode::ExAuto(_) => node,
+            | PNode::Never | PNode::Param(_) | PNode::ConstParam(_) | PNode::Infer | PNode::Error | PNode::ExAuto(_)
+            | PNode::Foreign(_) => node,
         };
         self.intern(node)
     }

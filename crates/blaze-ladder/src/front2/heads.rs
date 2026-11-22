@@ -3086,12 +3086,25 @@ impl<'n> Store<'n> {
         let marks = self.marks(names, key, v.item())?;
         let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
         let generics = own_generics(&b, &mut self.tys, module, v, 0, &mut ps, &mut cs)?;
-        // A free `type T;` with no type is an extern type (the Reference has a free alias
-        // without a type as an error; core's `unsafe extern "C" { pub type Code; }`, the
-        // pointee of `FnPtr::as_ptr`'s `NonNull<Code>`). It is its own unsized nominal type,
-        // which the checker's portable form has no node for (`PNode` lacks `Foreign`, though
-        // blaze-ty's `TyKind::Foreign` and the solver's `Shape::Foreign` exist).
-        let t = v.head_opt(head::TY).ok_or(Why::Unsupported("an extern type (`extern { type T; }`): the checker's portable type has no foreign node", Range::new(0, 0)))?;
+        // A free `type T;` with no type is an extern type (the Reference, "Type aliases": a
+        // free alias without a type is an error, so the only accepted form is a foreign item:
+        // feature `extern_types`, core's `unsafe extern "C" { pub type Code; }`, the pointee of
+        // `FnPtr::as_ptr`'s `NonNull<Code>`). It is its own nominal type with no size, no
+        // fields and no generics (rustc refuses a generic one, E0044): `PNode::Foreign` of its
+        // own key, which a path naming it reads as an alias of no parameters stands for.
+        // GAP (named): the outline does not say whether the item is in an `extern` block, so
+        // a typeless free alias outside one (which rustc refuses) is read the same way.
+        let Some(t) = v.head_opt(head::TY) else {
+            if generics != 0 {
+                return Err(Why::Unsupported("an extern type with generic parameters (rustc: E0044)", Range::new(0, 0)));
+            }
+            let foreign = intern(&mut self.tys, PNode::Foreign(checker_of(key)))?;
+            // No parameters: no defaults row (read as none) and no region slots.
+            self.maps.alias_slots.remove(&key);
+            self.maps.aliases.insert(key, Some((0, foreign)));
+            self.maps.const_params.insert(key, cs);
+            return Ok(());
+        };
         // A bound on an alias's parameter is not checked where the alias is used, but it is
         // what `T::X` in the aliased type is read through (core's `ChangeOutputType`).
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &cs, body: None };

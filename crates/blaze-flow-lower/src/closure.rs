@@ -560,6 +560,7 @@ pub(crate) fn node_kind(n: PNode) -> &'static str {
         PNode::Slice(_) => "slice",
         PNode::Pat(..) => "pattern type",
         PNode::Adt(..) => "adt",
+        PNode::Foreign(_) => "extern type",
         PNode::FnDef(..) => "fn item",
         PNode::FnPtr(..) => "fn ptr",
         PNode::Closure { .. } => "closure",

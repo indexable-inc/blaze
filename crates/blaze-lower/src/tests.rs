@@ -532,6 +532,7 @@ impl Expand for NoMacros {
         _: &str,
         _: Option<crate::mark_site::TextMark>,
         _: &str,
+        _: crate::InputMarks<'_>,
         _: Edition,
         _: &mut dyn crate::Cfg,
         _: &mut crate::BodyOut<'_>,

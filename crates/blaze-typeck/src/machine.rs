@@ -1646,6 +1646,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             | TyView::ConstParam(_)
             | TyView::ConstInfer(_)
             | TyView::ExAuto(_)
+            | TyView::Foreign(_)
             | TyView::Error => {}
         }
     }
@@ -1721,7 +1722,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             ConstValue { ty, bits } => ConstValue { ty: self.normalized_child(ty, done), bits },
             // The caller handles projections through the solver. Leaves have no children to rebuild.
             Alias { .. } | Bool | Char | Int(_) | Uint(_) | Float(_) | Str | Never | Param(_)
-            | Infer(_) | ConstParam(_) | ConstInfer(_) | ExAuto(_) | Error => return Ok(original),
+            | Infer(_) | ConstParam(_) | ConstInfer(_) | ExAuto(_) | Foreign(_) | Error => return Ok(original),
         };
         if rebuilt == view { Ok(original) } else { self.mk(rebuilt) }
     }
@@ -2172,6 +2173,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 TyView::ExProj { trait_, name, args_term: self.mk_list(&v)? }
             }
             PNode::ExAuto(k) => TyView::ExAuto(k),
+            PNode::Foreign(k) => TyView::Foreign(k),
             PNode::Infer => match mode {
                 Lower::Body => return self.fresh(),
                 Lower::Args(_) | Lower::CoroutineArgs { .. } | Lower::Assumed => return Err(CheckError::Malformed(Malformed::HoleInAnswer).into()),
@@ -2421,6 +2423,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             TyView::Closure(..) | TyView::ClosureOf { .. } | TyView::Future(..) | TyView::CoroutineOf { .. } => Shape::Closure,
             TyView::Param(_) => Shape::Param,
             TyView::Opaque(k, _) => Shape::Opaque(k),
+            TyView::Foreign(k) => Shape::Foreign(k),
             TyView::Dynamic(l) => Shape::Dynamic(self.principal(l)),
             TyView::Alias { .. } | TyView::Infer(_) | TyView::Error => return None,
             // A const term or an object's row is no self type.

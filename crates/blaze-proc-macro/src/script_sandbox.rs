@@ -584,6 +584,10 @@ pub struct ScriptSandbox {
     /// The C requests deferred, each argv joined by NUL, with the `OUT_DIR` state it saw (an
     /// index of `c_states`).
     pub(crate) c_requests: Vec<(String, u32)>,
+    /// Each deferred process-tree request (c_tasks.rs `is_tree`: `sh configure`, `make`): its
+    /// index in `c_requests`, the guest folder it was spawned in, and the environment the
+    /// child was given (spawn_route.rs `child_env`, sorted by name, each name once).
+    pub(crate) c_trees: Vec<(u32, String, Vec<(String, String)>)>,
     /// The `OUT_DIR` states the deferred requests saw, and the bytes of their files by digest
     /// (blaze-build-script outputs.rs, THE C INPUTS).
     pub(crate) c_states: Vec<OutState>,
@@ -727,6 +731,7 @@ impl ScriptSandbox {
             refused: None,
             exit: None,
             c_requests: Vec::new(),
+            c_trees: Vec::new(),
             c_states: Vec::new(),
             c_held: BTreeMap::new(),
             c_held_bytes: 0,
@@ -1166,6 +1171,12 @@ impl ScriptSandbox {
                 let argv: Vec<&str> = spawned.argv.iter().map(String::as_str).collect();
                 let mut text = String::new();
                 blaze_build_script::c_tasks::rooted(&argv, &cwd, &mut text).expect("script_sandbox: writing to a String does not fail");
+                // A process tree runs later with the folder and environment it was spawned
+                // with (outputs.rs `CTree`): `configure` reads CC, CFLAGS and the rest.
+                if blaze_build_script::c_tasks::is_tree(program) {
+                    let env = crate::spawn_route::child_env(&self.script.env, &spawned);
+                    self.c_trees.push((self.c_requests.len() as u32, cwd.clone(), env));
+                }
                 self.c_requests.push((text, state));
                 (0, Vec::new(), Vec::new())
             }

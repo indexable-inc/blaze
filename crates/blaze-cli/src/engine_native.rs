@@ -487,6 +487,20 @@ pub(crate) fn image_for<'r>(cx: &Cx, standing: &mut Standing<'r, '_>, closure: &
     handed.sort_unstable();
 
     let order = native_image::closure(&list, root, &handed, &scratch);
+    // Each crate's script as it ran (the deferred record, when its C was deferred), read in
+    // place before any crate's C runs: a reader's `links` trees are its producers' records as
+    // its script saw them, and `order` puts a producer after its readers
+    // (native_runner_c.rs `Producers`).
+    let mut ran: Vec<(usize, ScriptIn<'_>), &Frame> = Vec::with_capacity_in(order.len(), &scratch);
+    for r in order.iter().copied() {
+        let Some(bytes) = list.script(r) else { continue };
+        let package = list.name(r);
+        let Some(name) = native_image::script_name(bytes) else { return Err(NativeError::ScriptKind { package: held(package, ask) }) };
+        let Some(run) = names(name) else { return Err(NativeError::NoScript { package: held(package, ask), script: name }) };
+        let payload = native_image::payload_in_place(&cx, store, &run).map_err(NativeError::Store)?;
+        ran.push((r, ScriptIn { name, out: run.out, payload }));
+    }
+    let producers = crate::native_runner_c::Producers { scripts: &ran, graph: sections.graph };
     let mut crates: Vec<CrateIn<'_>, &Frame> = Vec::with_capacity_in(order.len(), &scratch);
     for r in order.iter().copied() {
         let (package, key) = (list.name(r), list.key(r));
@@ -496,19 +510,15 @@ pub(crate) fn image_for<'r>(cx: &Cx, standing: &mut Standing<'r, '_>, closure: &
         let scope = blaze_drive::key::crate_scope_name(&key);
         let Some(scope_in) = names(scope) else { return Err(NativeError::NoNames { package: held(package, ask) }) };
         let table = table_of(&cx, store, &scope_in, package, ask)?;
-        let script = match list.script(r) {
+        let script = match ran.iter().find(|(at, _)| *at == r).map(|(_, script)| *script) {
             None => None,
-            Some(bytes) => {
-                let Some(name) = native_image::script_name(bytes) else { return Err(NativeError::ScriptKind { package: held(package, ask) }) };
-                let Some(run) = names(name) else { return Err(NativeError::NoScript { package: held(package, ask), script: name }) };
-                let payload = native_image::payload_in_place(&cx, store, &run).map_err(NativeError::Store)?;
-                let script = ScriptIn { name, out: run.out, payload };
+            Some(script) => {
                 // The built record's in place of one whose C requests were deferred: its out is
                 // the built key, so the image's key moves with the compiles' inputs.
                 match c_tasks.as_mut() {
                     None => Some(script),
                     Some(c) => {
-                        let (script, report) = crate::native_runner_c::built_for(&cx, c, store, &list, r, package, script, &scratch).map_err(|why| NativeError::CTasks {
+                        let (script, report) = crate::native_runner_c::built_for(&cx, c, store, &list, r, package, script, &producers, &scratch).map_err(|why| NativeError::CTasks {
                             package: held(package, ask),
                             words: held(bstd::mem::format_in!(&scratch, "{why}").as_str(), ask),
                         })?;

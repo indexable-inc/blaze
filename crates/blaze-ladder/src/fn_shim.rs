@@ -73,7 +73,7 @@ pub(crate) fn fn_shim_owner<P: FrontEnd>(program: &P, adts: &dyn Adts, called: I
 /// `Named1::Untabled`, a vtable's untabled word): the item is checked, which tables its row,
 /// and the instance is made again; this time `fn_shim_owner` finds the row and the shim is
 /// declared. A ctor's fn item (`.map(Some)`) is tabled the same way (`MakerState::ensure_one`
-/// makes a ctor's row by `ctor_row`).
+/// makes a ctor's row by `head_row`).
 pub(crate) fn untabled_owner<P: FrontEnd>(program: &P, adts: &dyn Adts, called: Instance, ground: &PortableTys<'_>) -> Option<Instance> {
     let view = ground.view();
     let &first = view.list(called.args).ok()?.first()?;

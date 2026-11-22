@@ -770,6 +770,7 @@ pub(crate) fn empty_view(owner: ItemKey, types: PTys<'_>) -> BodyView<'_> {
         asm_clobbers: &[],
         asm_text: "",
         call_arg_ints: &[],
+        legacy_args: &[],
         unsafe_blocks: &[],
         expr_editions: &[],
         pat_editions: &[],

@@ -83,6 +83,16 @@ struct Def<'b> {
 }
 
 fn expanding_defs<'t>(defs: &[Def<'_>], text: &'t str) -> Lowered<'static, 't> {
+    let mut expander = by_name(defs);
+    let l = match lower_body_expanding(text, Edition::E2024, &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()) {
+        Ok(l) => l,
+        Err(need) => panic!("{text}: needs {:?}", need.atoms),
+    };
+    l
+}
+
+/// The expander of `defs`: each prepared once, found by its last name.
+fn by_name(defs: &[Def<'_>]) -> ByName<'static, 'static, Host> {
     let mut rules: StdVec<(&'static str, Prepared<'static>)> = StdVec::new();
     for d in defs {
         let stream = lex(d.body, Edition::E2024, Alloc::global()).expect("the rules lex");
@@ -94,12 +104,7 @@ fn expanding_defs<'t>(defs: &[Def<'_>], text: &'t str) -> Lowered<'static, 't> {
         rules.push((d.name, prepare(def).expect("the rules compile")));
     }
     let rules: &'static [(&'static str, Prepared<'static>)] = Box::leak(rules.into_boxed_slice());
-    let mut expander = ByName::new(rules, at(), Host, Alloc::global());
-    let l = match lower_body_expanding(text, Edition::E2024, &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()) {
-        Ok(l) => l,
-        Err(need) => panic!("{text}: needs {:?}", need.atoms),
-    };
-    l
+    ByName::new(rules, at(), Host, Alloc::global())
 }
 
 pub(crate) fn dump_of(l: &Lowered<'_, '_>) -> String {
@@ -1268,4 +1273,154 @@ fn a_callers_label_resolves_through_a_macro() {
     let fwd = ("fwd", "($l:lifetime) => { to!($l); }");
     let kinds = label_diags(&[to, fwd], "fn f() { 'outer: loop { fwd!('outer); } }");
     assert!(kinds.is_empty(), "a lifetime at a nested call's end is whole: {kinds:?}");
+}
+
+/// `inner!`, a `macro_rules!` that takes an expression after `k:` (as tracing's `callsite2!`
+/// takes `kind: $kind:expr`), as a body call and as an item call.
+const INNER: (&str, &str) = ("inner", "(k: $k:expr) => { $k }");
+const INNER_ITEM: (&str, &str) = ("inner_item", "(k: $k:expr) => { const C: u8 = $k; }");
+
+/// `text`, the copy of an item a macro wrote (front2 locals.rs), its body lowered with `defs`
+/// and a mark of the defining crate at each byte of `marked` (where `mark_site::column_of_copy`
+/// starts a word's row: a `$crate`'s `$`).
+fn expanding_marked<'t>(defs: &[(&'static str, &str)], text: &'t str, marked: &[u32]) -> Lowered<'static, 't> {
+    let defs: StdVec<Def> = defs.iter().map(|&(name, body)| Def { name, body, macro2: false }).collect();
+    let mut expander = by_name(&defs);
+    let mark = crate::mark_site::TextMark { site: at().site, transparency: blaze_expand::Transparency::SemiOpaque, edition: Edition::E2024 };
+    let rows: StdVec<(u32, crate::mark_site::TextMark)> = marked.iter().map(|&at| (at, mark)).collect();
+    let column = crate::mark_site::column_of_copy(text, &rows, Alloc::global()).expect("the copy's column writes");
+    let column: &'static [u8] = Box::leak(StdVec::from(&column[..]).into_boxed_slice());
+    let (column, _) = blaze_expand::origin_column::OriginsRef::open(column).expect("the copy's column opens");
+    let marks = crate::mark_site::ItemMarks::of(text, blaze_scope::crate_roots::TextMarks { text, column }).expect("the marks are of the text");
+    match crate::lower_body_expanding_marked(marks, Edition::E2024, &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()) {
+        Ok(l) => l,
+        Err(need) => panic!("{text}: needs {:?}", need.atoms),
+    }
+}
+
+/// The unhandled rows' reasons of `l`, and its dump.
+fn outcome(l: &Lowered<'_, '_>) -> (StdVec<Why>, String) {
+    (l.view().unhandled().map(|u| u.why).collect(), dump_of(l))
+}
+
+/// A call written in the copy of an item a macro wrote takes its input with the copy's marks
+/// (by_name.rs `ByName::input`, blaze-expand `lex_marked`): the `$crate` the macro wrote is one
+/// identifier, `k: $k:expr` matches, and the path stays `$crate`'s. The Reference, "Macros By
+/// Example", "Hygiene": `$crate` "refers to the crate defining the macro". The real site:
+/// tracing 0.1.44's `event!` writes `static __CALLSITE: .. = $crate::callsite2! { .., kind:
+/// $crate::metadata::Kind::EVENT, .. }` in a fn body (tempo t1500: 14 tests NOT RUN, "Binding:
+/// `expected expression`"). NEGATIVE TWIN: the same text unmarked, a `$crate` written outside
+/// any macro, stays the expansion's error (rustc: "expected expression, found `$`"). CONTROL:
+/// the call with no `$crate` lowers clean marked or not. Expected: `test expand_tests::
+/// a_copied_items_body_call_reads_its_dollar_crate_by_its_mark ... ok`.
+#[test]
+fn a_copied_items_body_call_reads_its_dollar_crate_by_its_mark() {
+    let text = "fn f() -> u8 { inner!{ k: $crate::K } }";
+    let dollar = u32::try_from(text.find("$crate").expect("the text writes `$crate`")).expect("a short text");
+    let l = expanding_marked(&[INNER], text, &[dollar]);
+    let (whys, dump) = outcome(&l);
+    assert!(whys.is_empty(), "{whys:?}\n{dump}");
+    assert!(l.view().diags.is_empty(), "{dump}");
+    assert!(dump.contains("(path $crate K)"), "{dump}");
+
+    let l = expanding_marked(&[INNER], text, &[]);
+    let (whys, dump) = outcome(&l);
+    assert_eq!(whys, vec![Why::ExpansionFailed], "an unmarked `$crate` is `$` and `crate`\n{dump}");
+
+    let plain = "fn f() -> u8 { inner!{ k: K } }";
+    for marked in [&[][..], &[0u32][..]] {
+        let l = expanding_marked(&[INNER], plain, marked);
+        let (whys, dump) = outcome(&l);
+        assert!(whys.is_empty(), "{whys:?}\n{dump}");
+        assert!(dump.contains("(path K)"), "{dump}");
+    }
+}
+
+/// Each start of `words` in `text`, ascending: where the copy's column starts a marked word's
+/// row (every word the expansion that wrote the item made, in the real site).
+fn starts_of(text: &str, words: &[&str]) -> StdVec<u32> {
+    let mut at: StdVec<u32> = words.iter().flat_map(|w| text.match_indices(w).map(|(i, _)| u32::try_from(i).expect("a short text"))).collect();
+    at.sort_unstable();
+    at.dedup();
+    at
+}
+
+/// A local of a macro-written item's text keeps its binding through an inner call's input
+/// (blaze-expand `TextMark::as_outer_mark`: a re-lexed word's mark is transparent, so its local
+/// hygiene is the 0 the item text's own words have, machine.rs `hygiene_at`). The Reference,
+/// "Macros By Example", "Hygiene": locals are looked up at the definition site; a binder and a
+/// use one expansion wrote are of one context, whatever inner call the use is handed through.
+/// The real site: proptest's `proptest!` writes the test fn with `let mut config = ..;` and
+/// hands `config` to `$crate::` helper calls in the same body (tempo a1630: 590 E0425
+/// "cannot find value `config`" and the like, in `proptest!`, `hardfork!`, `paste!`,
+/// `bitflags!` bodies, after the call input took the copy's marks).
+///
+/// Shapes, each with every `config` (and `$crate`) marked as the expansion wrote them:
+/// (1) the outer's `let` used inside the inner call's input (with tracing's `$crate` beside it,
+/// which must stay `$crate`'s); (2) the inner call's input binding a name the outer's text then
+/// reads. NEGATIVE TWIN: a local the INNER macro writes is not the outer's (rustc: E0425).
+/// CONTROL: the same texts unmarked (the input lexed by `lex`, as before marks were kept)
+/// bind the same. Expected: `test expand_tests::
+/// a_copied_items_local_keeps_its_binding_through_an_inner_calls_input ... ok`.
+#[test]
+fn a_copied_items_local_keeps_its_binding_through_an_inner_calls_input() {
+    let id = ("id", "(k: $k:expr) => { $k }");
+    let bind = ("bind", "($i:ident) => { let $i = 1; }");
+    let shape1 = "fn f() -> u8 { let config = 1; id!{ k: $crate::g(config) } }";
+    let shape2 = "fn f() -> u8 { bind!(config); config }";
+    for (how, marked) in [("marked", true), ("control: unmarked", false)] {
+        let rows = |text: &str| if marked { starts_of(text, &["config", "$crate"]) } else { StdVec::new() };
+        // (1) Without marks a `$crate` is `$` and `crate` (the d1 twin): the control's shape 1
+        // has no `$crate`.
+        let one = if marked { shape1.to_string() } else { shape1.replace("$crate::", "") };
+        let l = expanding_marked(&[id], &one, &rows(&one));
+        let (whys, dump) = outcome(&l);
+        assert!(whys.is_empty(), "{how} (1): {whys:?}\n{dump}");
+        let v = l.view();
+        let configs = binds(&v, "config");
+        assert_eq!(configs.len(), 1, "{how} (1): one `let config`\n{dump}");
+        assert_eq!(locals(&v), configs, "{how} (1): the inner call's `config` is the outer's `let`\n{dump}");
+        if marked {
+            assert!(dump.contains("(path $crate g)"), "{how} (1): `$crate` stays the defining crate's\n{dump}");
+        }
+        // (2)
+        let l = expanding_marked(&[bind], shape2, &rows(shape2));
+        let (whys, dump) = outcome(&l);
+        assert!(whys.is_empty(), "{how} (2): {whys:?}\n{dump}");
+        let v = l.view();
+        let configs = binds(&v, "config");
+        assert_eq!(configs.len(), 1, "{how} (2): the input's `config` is bound\n{dump}");
+        assert_eq!(locals(&v), configs, "{how} (2): the outer's `config` reads the input's binding\n{dump}");
+        // NEGATIVE TWIN: the inner macro's own `y` is hidden from the outer's `y`.
+        let mk = ("mk", "() => { let y = 1; }");
+        let twin = "fn f() { mk!(); y; }";
+        let l = expanding_marked(&[mk], twin, &if marked { starts_of(twin, &["y", "mk"]) } else { StdVec::new() });
+        let (whys, dump) = outcome(&l);
+        assert!(whys.is_empty(), "{how} twin: {whys:?}\n{dump}");
+        assert_eq!(binds(&l.view(), "y").len(), 1, "{how} twin: the macro's `let y`\n{dump}");
+        assert!(locals(&l.view()).is_empty(), "{how} twin: the outer's `y` is no local of the macro's\n{dump}");
+    }
+}
+
+/// The same seam at item position (driver.rs `macro_call`, `Expand::expand`'s `input_marks`):
+/// an item macro's expansion writes an item call whose input holds the macro's `$crate`; the
+/// call's input is lexed with the expansion's word marks. NEGATIVE TWIN: the item call written
+/// in the file with `$crate` fails (rustc: "expected expression, found `$`"). CONTROL: an
+/// expansion writing the call with no `$crate` expands both calls. Expected: `test
+/// expand_tests::an_expansions_item_call_reads_its_dollar_crate_by_its_mark ... ok`.
+#[test]
+fn an_expansions_item_call_reads_its_dollar_crate_by_its_mark() {
+    let outer = ("outer", "() => { inner_item!{ k: $crate::K } }");
+    let (stats, records) = lower_items(&[outer, INNER_ITEM], "outer!{}");
+    assert_eq!((stats.macro_calls_expanded, stats.macro_calls_failed), (2, 0), "{:#?}", records.0);
+    let unclean: StdVec<_> = records.0.iter().filter(|(_, _, d)| d.starts_with("UNCLEAN")).collect();
+    assert!(unclean.is_empty(), "{unclean:#?}");
+    assert!(records.0.iter().any(|(t, _, d)| t.contains("const C") && d.contains("(path $crate K)")), "{:#?}", records.0);
+
+    let (stats, _) = lower_items(&[INNER_ITEM], "inner_item!{ k: $crate::K }");
+    assert_eq!((stats.macro_calls_expanded, stats.macro_calls_failed), (0, 1), "a `$crate` written in a file is refused");
+
+    let plain = ("plain", "() => { inner_item!{ k: K } }");
+    let (stats, records) = lower_items(&[plain, INNER_ITEM], "plain!{}");
+    assert_eq!((stats.macro_calls_expanded, stats.macro_calls_failed), (2, 0), "{:#?}", records.0);
 }

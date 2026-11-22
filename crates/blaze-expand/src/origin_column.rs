@@ -64,19 +64,36 @@ impl TextMark {
     }
 
     /// The stream mark a token of a text keeps when the text is lexed again
-    /// ([`crate::tokens::lex_marked`]): this mark's site, transparency and edition, of an
-    /// earlier expansion ([`crate::MarkOf::Outer`], never `This`: a call's input holds no mark of
-    /// the call's own, `ExpandError::Unsealed`). The column does not keep which expansion wrote
-    /// the token, only these three, so the expansion is named by them: a key hashed from the
-    /// mark's bytes. Two tokens of one text with equal marks are one expansion's to
-    /// [`crate::local_hygiene`] then, as they already are to the text's own lowering, which
-    /// reads the same column.
+    /// ([`crate::tokens::lex_marked`]): this mark's site and edition, of an earlier expansion
+    /// ([`crate::MarkOf::Outer`], never `This`: a call's input holds no mark of the call's own,
+    /// `ExpandError::Unsealed`), named by a key hashed from the mark's bytes (the column does
+    /// not keep which expansion wrote the token), and TRANSPARENT.
+    ///
+    /// Why transparent: a word keeps through the round trip the syntax context the text's own
+    /// lowering gives it. That lowering keys a local or a label of the item's text by its name
+    /// alone (blaze-lower machine.rs `hygiene_at` is 0 for every word of the item's text), so a
+    /// binder the expansion wrote there (`let mut config = ..;`, proptest's `proptest!`) and its
+    /// use inside an inner call's input (`$crate::proptest_helper!(.. config ..)`) must have equal
+    /// [`crate::local_hygiene`]: 0, which only a transparent mark gives (the Reference, "Macros
+    /// By Example", "Hygiene": locals resolve at the definition site's context, and both tokens
+    /// are of one expansion). A semi-opaque mark here made the use a different local and every
+    /// such body E0425 (tempo a1630: 590 errors in `proptest!`, `hardfork!`, `paste!`,
+    /// `bitflags!` bodies). What the mark still gives is all a non-opaque mark ever gave a path:
+    /// `$crate` (its site's crate, blaze-scope crate_roots.rs), the edition, and a path read at
+    /// the call. A token the INNER macro writes gets that call's own mark over it, so the inner
+    /// macro's locals stay hidden from the outer's tokens.
+    ///
+    /// GAP (named): an opaque (`macro`) mark is made transparent too, so a path of an item text a
+    /// `macro` wrote, handed through an inner call's input, is read at the call and not at the
+    /// `macro`'s module (as before marks were kept on inputs). Keeping it needs the item text's
+    /// own locals keyed by their marks (`hygiene_at` from the mark column), which is the end
+    /// state of item-text hygiene: one rule for both sides.
     pub fn as_outer_mark(self) -> crate::tokens::Mark {
         let mut hasher = blaze_ids::Hasher::new("blaze v2 text mark expansion 1");
         hasher.part(&self.to_bytes());
         crate::tokens::Mark {
             of: crate::tokens::MarkOf::Outer(hasher.finish()),
-            transparency: self.transparency,
+            transparency: crate::Transparency::Transparent,
             edition: self.edition,
             site: self.site,
         }

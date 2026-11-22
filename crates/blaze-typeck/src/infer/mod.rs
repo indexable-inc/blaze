@@ -890,6 +890,7 @@ impl<'x, 'a> Seen<'x, 'a> {
             TyKind::FloatVar(v) => TyView::Infer(Var { kind: VarKind::Float, index: v }),
             TyKind::Error => TyView::Error,
             TyKind::Dynamic(preds, _) => TyView::Dynamic(list(preds)),
+            TyKind::Foreign(d) => TyView::Foreign(key(d)),
             TyKind::NotAType => {
                 let Some(p) = tys.as_pred(self.bty(t)) else { return bad(U::NeitherTypeNorPred) };
                 match tys.pred_kind(p) {
@@ -1783,6 +1784,10 @@ impl<'a> TypeCtx for InferCtx<'a> {
             TyView::ExAuto(k) => {
                 let d = self.terms.bdef(SDef(k.0));
                 self.terms.cx.tys.ex_auto(d)
+            }
+            TyView::Foreign(k) => {
+                let d = self.terms.bdef(SDef(k.0));
+                self.terms.cx.tys.foreign(d)
             }
         };
         Ok(Ty(t.node().bits()))

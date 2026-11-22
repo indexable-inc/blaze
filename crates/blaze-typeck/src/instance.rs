@@ -261,6 +261,7 @@ pub(crate) fn import<S: ClosureSource>(cx: &mut InferCtx<'_>, src: &mut S, types
             TyView::ExProj { trait_, name, args_term: cx.mk_list(&v)? }
         }
         PNode::ExAuto(k) => TyView::ExAuto(k),
+        PNode::Foreign(k) => TyView::Foreign(k),
         PNode::Closure { owner, ordinal, args } => {
             let args = import_list(cx, src, types, args, subst, d)?;
             return src.closure_of(cx, owner, ordinal, args, d);
@@ -409,6 +410,7 @@ pub(crate) fn export_as(cx: &mut Exporter<'_, '_>, t: Ty, ground: &mut PortableT
             PNode::ExProj { trait_, name, args: ground.intern_list(args)?, term }
         }
         TyView::ExAuto(k) => PNode::ExAuto(k),
+        TyView::Foreign(k) => PNode::Foreign(k),
         TyView::ClosureOf { owner, ordinal, args, .. } => match export_list(cx, args, ground, d)? {
             Some(args) => PNode::Closure { owner, ordinal, args },
             None => return Ok(None),
@@ -487,6 +489,7 @@ pub(crate) fn shape_of(v: TyView, cx: &InferCtx<'_>) -> Option<Shape> {
         TyView::FnPtr(l, _) => Shape::FnPtr(cx.list_len(l).saturating_sub(1)),
         TyView::Closure(..) | TyView::ClosureOf { .. } | TyView::Future(..) | TyView::CoroutineOf { .. } => Shape::Closure,
         TyView::Opaque(k, _) => Shape::Opaque(k),
+        TyView::Foreign(k) => Shape::Foreign(k),
         TyView::Dynamic(l) => Shape::Dynamic(principal(cx, l)),
         TyView::Param(_) | TyView::Alias { .. } | TyView::Infer(_) | TyView::Error => return None,
         TyView::ConstValue { .. } | TyView::ConstParam(_) | TyView::ConstInfer(_) => return None,

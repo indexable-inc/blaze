@@ -393,6 +393,12 @@ pub struct BodyView<'b> {
     /// `#[rustc_legacy_const_generics]` callee takes as a const generic reads it
     /// (rules/legacy_const.rs); the lowering, which holds the text, fills it.
     pub call_arg_ints: &'b [(ExprId, u128)],
+    /// The const term of each call argument that is an anonymous constant at a
+    /// `#[rustc_legacy_const_generics]` position (`f(a, 32 - 12)`'s `32 - 12`), keyed by the
+    /// argument as written, ascending by its id: valued by the lowering's caller at the
+    /// parameter's type (blaze-lower `Types::legacy_term`); a hole (`PNode::Infer`) where it
+    /// left a gap, which `const_gaps` lists (rules/legacy_const.rs).
+    pub legacy_args: &'b [(ExprId, PTy)],
     /// Every block written `unsafe { .. }` (or made so by a desugaring the lowering owns, as
     /// `.await`'s), ascending by id: the unsafety check's contexts (rules/unsafety.rs). A block
     /// written by a macro's expansion is here as any other: an operation inside the expanded
@@ -536,6 +542,13 @@ impl<'b> BodyView<'b> {
     pub(crate) fn call_arg_int(&self, e: ExprId) -> Option<u128> {
         let i = self.call_arg_ints.binary_search_by_key(&e, |&(x, _)| x).ok()?;
         self.call_arg_ints.get(i).map(|&(_, v)| v)
+    }
+
+    /// The const term of the legacy const generic argument `e`, when the lowering gave it
+    /// (`legacy_args`).
+    pub(crate) fn legacy_arg(&self, e: ExprId) -> Option<PTy> {
+        let i = self.legacy_args.binary_search_by_key(&e, |&(x, _)| x).ok()?;
+        self.legacy_args.get(i).map(|&(_, t)| t)
     }
 
     /// Whether the block `e` is written `unsafe` ([`BodyView::unsafe_blocks`]).

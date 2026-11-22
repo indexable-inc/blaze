@@ -156,7 +156,7 @@ fn a_macro_written_heads_constant_reads_by_its_tokens_marks() {
         println!("{l}");
     }
     assert_eq!(got.len(), clean.len(), "{}", lines.join("\n"));
-    for ((n, o), &want) in got.iter().zip(clean) {
+    for ((n, o), want) in got.iter().zip(clean) {
         if want {
             assert_eq!(o, "clean", "`{n}` must check clean\n{}", lines.join("\n"));
         } else {

@@ -17,6 +17,7 @@
 //!          | "extrait " item | "fnptr " L " 0xH" | "closure " item " N" | "coroutine " item " N"
 //!          | "future eN " T " " T | "param N" | "constparam N" | "alias " item " nH"
 //!          | "exproj " item " nH " T | "constvalue " T " 0xH" | "dynamic " L | "exauto kH"
+//!          | "foreign kH"
 //! L       := "<N,N>"                         (a list's start and length)
 //! local   := "local _N: T " kind [" mut"] [" !"]   ("!": its own place is of a Drop type)
 //! kind    := "return" | "arg N" | "binding patN" | "temp eN " role | "flag _N"
@@ -307,6 +308,7 @@ fn ty_node<W: Write>(w: &mut W, n: PNode) -> fmt::Result {
             list(w, l)
         }
         PNode::ExAuto(k) => write!(w, "exauto k{:x}", k.0),
+        PNode::Foreign(k) => write!(w, "foreign k{:x}", k.0),
     }
 }
 
@@ -855,6 +857,7 @@ impl<A: Allocator + Clone> Parser<A> {
             "constvalue" => PNode::ConstValue { ty: Self::ty(c)?, bits: Self::hex(c, "0x")? },
             "dynamic" => PNode::Dynamic(Self::list(c)?),
             "exauto" => PNode::ExAuto(ItemKey(Self::hex(c, "k")?)),
+            "foreign" => PNode::Foreign(ItemKey(Self::hex(c, "k")?)),
             _ => return Err(c.err(ParseWhat::Expected("a type"))),
         };
         Ok(n)

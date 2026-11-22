@@ -115,6 +115,9 @@ pub fn needs_drop<'g, E>(
             | PNode::Ptr(..)
             | PNode::FnDef(..)
             | PNode::FnPtr(..) => {}
+            // An extern type has no drop glue: it is never owned by value (no size), and
+            // what it holds is foreign code's to free.
+            PNode::Foreign(_) => {}
             // A pattern type's values are its base's (an integer, `char` or raw pointer).
             PNode::Pat(base, _) => todo.push(base),
             PNode::Tuple(l) => {

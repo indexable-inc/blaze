@@ -396,6 +396,7 @@ fn children(t: PTys<'_>, n: PNode, out: &mut Vec<u32, Alloc<'_>>) -> Result<(), 
         | PNode::ConstParam(_)
         | PNode::Error
         | PNode::ExAuto(_)
+        | PNode::Foreign(_)
         | PNode::Infer => Ok(()),
         PNode::Future(_, o, i) => {
             out.push(o.0);
@@ -469,7 +470,10 @@ fn shape(n: PNode) -> PNode {
         | PNode::Infer
         | PNode::Error
         | PNode::ConstParam(_)
-        | PNode::ExAuto(_)) => leaf,
+        | PNode::ExAuto(_)
+        // Its own variant: the derived `Hash` gives it its own discriminant (the last, so no
+        // earlier node's digest moves).
+        | PNode::Foreign(_)) => leaf,
     }
 }
 

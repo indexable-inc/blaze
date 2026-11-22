@@ -524,7 +524,8 @@ fn head(node: PNode) -> Option<PNode> {
     let p = PTy(0);
     let l = List::EMPTY;
     Some(match node {
-        PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Float(_) | PNode::Str | PNode::Never => node,
+        PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Float(_) | PNode::Str | PNode::Never
+        | PNode::Foreign(_) => node,
         PNode::Tuple(_) => PNode::Tuple(l),
         PNode::Ref(m, _) => PNode::Ref(m, p),
         PNode::Ptr(m, _) => PNode::Ptr(m, p),
@@ -626,7 +627,8 @@ fn rebuild_in(out: &mut PortableTys<'_>, node: PNode, kids: &[PTy]) -> Result<PT
             PNode::ExProj { trait_, name, args: out.intern_list(&kids[..n])?, term: kids[n] }
         }
         PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Float(_) | PNode::Str
-        | PNode::Never | PNode::Param(_) | PNode::ConstParam(_) | PNode::Infer | PNode::Error | PNode::ExAuto(_) => node,
+        | PNode::Never | PNode::Param(_) | PNode::ConstParam(_) | PNode::Infer | PNode::Error | PNode::ExAuto(_)
+        | PNode::Foreign(_) => node,
     };
     out.intern(node)
 }

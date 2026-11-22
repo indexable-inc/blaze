@@ -241,6 +241,7 @@ impl BodyBuf {
             asm_clobbers: &[],
             asm_text: self.asm_text,
             call_arg_ints: &self.call_arg_ints,
+            legacy_args: &[],
             unsafe_blocks: &self.unsafe_blocks,
             // A test body is one edition's text: no word of it was written by another's macro.
             expr_editions: &[],

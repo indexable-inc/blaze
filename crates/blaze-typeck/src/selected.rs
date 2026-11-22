@@ -140,6 +140,8 @@ pub(crate) fn may_relate(tys: PTys<'_>, roots: &[PTy], alloc: Alloc<'_>) -> Resu
         match node {
             PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Float(_) | PNode::Str | PNode::Never
             | PNode::ConstParam(_) | PNode::ConstValue { .. } | PNode::ExAuto(_) => {}
+            // An extern type has no generics, so no region.
+            PNode::Foreign(_) => {}
             PNode::Tuple(_) | PNode::Array(..) | PNode::Slice(_) | PNode::Ptr(..) | PNode::Pat(..) => tys.children_of(node, &mut stack)?,
             PNode::Ref(..) | PNode::Dynamic(_) | PNode::Param(_) | PNode::Adt(..) | PNode::FnDef(..) | PNode::FnPtr(..)
             | PNode::Closure { .. } | PNode::Coroutine { .. } | PNode::Future(..) | PNode::Opaque(..) | PNode::Alias { .. }

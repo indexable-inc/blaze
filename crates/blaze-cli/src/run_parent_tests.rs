@@ -75,6 +75,8 @@ pub(super) fn frames(bytes: &[u8]) -> std::vec::Vec<std::string::String> {
                 std::format!("Data {data:?}")
             }
             Down::ThreadLocals { descriptor, ender } => std::format!("ThreadLocals {} {}", descriptor.0[0], ender.0[0]),
+            Down::Hooks { slot, kind } => std::format!("Hooks {} {kind:?}", slot.0),
+            Down::Promote { slot, record, inlined, .. } => std::format!("Promote {} {} {}", slot.0, record.0[0], inlined.len()),
         });
         at += len;
     }

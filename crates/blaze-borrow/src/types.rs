@@ -351,7 +351,8 @@ impl RegionTypes for Columns<'_> {
             | PNode::Error
             | PNode::ConstValue { .. }
             | PNode::ConstParam(_)
-            | PNode::ExAuto(_) => Kids::None,
+            | PNode::ExAuto(_)
+            | PNode::Foreign(_) => Kids::None,
         })
     }
 

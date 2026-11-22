@@ -467,11 +467,12 @@ impl<E: Expand> Expand for Noted<'_, E> {
         path: &str,
         path_mark: Option<blaze_lower::mark_site::TextMark>,
         input: &str,
+        input_marks: blaze_lower::InputMarks<'_>,
         edition: Edition,
         cfg: &mut dyn blaze_lower::Cfg,
         out: &mut BodyOut<'_>,
     ) -> Expansion {
-        let e = self.inner.expand(path, path_mark, input, edition, cfg, out);
+        let e = self.inner.expand(path, path_mark, input, input_marks, edition, cfg, out);
         self.note("item call", path, e)
     }
 

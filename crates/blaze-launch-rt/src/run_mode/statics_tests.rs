@@ -281,6 +281,7 @@ fn run_declaring(
             Act::Stub { slot } => memory.stub(slot),
             Act::Statics => mode.place_statics(&store, &mut memory),
             Act::ThreadLocals => mode.make_thread_locals(&mut memory),
+            Act::Hook { slot, kind } => mode.hook(slot, kind, &mut memory),
             Act::Place { slot, record } => mode.place(slot, record, &store, &mut memory, Plant::None, &mut acts),
             Act::Wake { .. } => Ok(()),
             Act::Promote { .. } => panic!("this simulation publishes no optimized record"),

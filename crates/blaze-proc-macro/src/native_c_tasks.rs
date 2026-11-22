@@ -37,21 +37,33 @@
 //! argv, `\0` shown as a space) and clang's first [`c_tasks::ERROR_LINES`] lines of standard
 //! error, the laid host folders shown as their guest spellings ([`ShelfClang`]).
 //!
-//! A process-tree request (tikv-jemalloc-sys's `sh configure`, `make`) is refused by name for
-//! now ([`TasksError::Trees`]): its task is the next piece.
+//! 0. Before all of it, a crate's process-tree requests (tikv-jemalloc-sys's `sh configure`,
+//!    `make`, `make install`) run as ONE task (c_tasks_tree.rs `run_tree`): found by key, or run
+//!    once by [`ShelfTree`] in the Seatbelt grant against `OUT_DIR` laid from the state they saw,
+//!    in a deterministic environment, under one deadline ([`TREE_DEADLINE`]) with capped output
+//!    and the process group killed past either; its files are stored files of the built record.
 
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::time::Duration;
 use std::path::Path;
 
-use blaze_build_script::c_tasks::{self, CCompiler, CStore, Compiled, FileRef, GuestRoots, Looked, Made, PlanError, Request, TaskError, Toolchain};
+use blaze_build_script::c_tasks::{self, CCompiler, CStore, Compiled, FileRef, GuestRoots, Looked, Made, PlanError, Refused, Request, TaskError, Toolchain};
 use blaze_build_script::c_tasks_built::Report;
-use blaze_build_script::outputs::OutputsRef;
+use blaze_build_script::c_tasks_tree::{self, FIXED_ENV, TREE_LINES, TreeError, TreeExit, TreeJob, TreeRan, TreeRunner};
+use blaze_build_script::host_tools::{self, HostTool};
+use blaze_build_script::key::HostToolKey;
+use blaze_build_script::native::Grant;
+use blaze_build_script::outputs::{FileLimits, Outputs, OutputsRef, StoredFile};
+use blaze_core::wait::Deadline;
+use blaze_ids::ContentId;
 use blaze_own::{AString, AVec, Alloc, Heap, SharedAlloc, String, Vec};
-use bstd::procs::hermetic::{Hermetic, HermeticCapOpts};
+use blaze_roots::{Digest, Mount, Root, RootId, RootKind, Roots};
+use bstd::procs::Exit;
+use bstd::procs::hermetic::{Capture, ClockSpec, Fault, Hermetic, HermeticCapOpts, HermeticOpts, HermeticSpec, HermeticStreams, Level, Program, ReportSpec, Stop};
 
 use crate::native_c::{DiskFacts, FileArea, GuestToday, Laid, ShelfClang};
+use crate::native_script::{NATIVE_BUDGET, OutDir, listed_under, store_out_dir};
 use crate::record::native_world;
 
 /// Each compile's deadline: the slowest of aws-lc's objects is far under it.
@@ -81,6 +93,9 @@ pub struct CTasksSetting<'s> {
 #[derive(Debug)]
 pub struct TasksRun<'a, 'b> {
     pub made: AVec<'a, Made<'b>>,
+    /// The files the crate's process tree made or changed under `OUT_DIR`, sorted by name
+    /// (c_tasks_tree.rs `run_tree`): stored files of the built record.
+    pub tree: AVec<'a, StoredFile<'a>>,
     pub report: Report,
 }
 
@@ -99,8 +114,8 @@ pub enum TasksError<'a, 'b> {
     Refused { package: &'b str, source: &'b str, command: AString<'a>, words: AString<'a> },
     /// A worker could not start (its world, frame or task folder).
     Worker { package: &'b str, words: AString<'a> },
-    /// Process-tree requests, not run yet.
-    Trees { package: &'b str, requests: u32 },
+    /// The process tree (`sh configure`, `make`) gave no files (c_tasks_tree.rs).
+    Tree(TreeError<'a, 'b>),
 }
 
 impl fmt::Display for TasksError<'_, '_> {
@@ -119,10 +134,7 @@ impl fmt::Display for TasksError<'_, '_> {
             TasksError::Lay { package, state, words } => write!(f, "the C of {package}: OUT_DIR as its requests saw it (state {state}) could not be laid: {}", words.as_str()),
             TasksError::Refused { package, source, command, words } => write!(f, "the C of {package}: `{source}` could not be compiled: {}: {}", words.as_str(), command.as_str()),
             TasksError::Worker { package, words } => write!(f, "the C of {package}: a compile worker could not start: {}", words.as_str()),
-            TasksError::Trees { package, requests } => write!(
-                f,
-                "the C of {package}: {requests} process-tree requests (`sh configure`, `make`) are not run yet (native_c_tasks.rs): its archives are not built"
-            ),
+            TasksError::Tree(error) => write!(f, "{error}"),
         }
     }
 }
@@ -178,6 +190,7 @@ pub fn run_tasks<'a, 'b>(
     roots: GuestRoots<'_>,
     demand: &[&str],
     toolchain: &Toolchain<'_>,
+    trees: &TreeTools<'_>,
     store: &mut dyn CStore,
     alloc: Alloc<'a>,
 ) -> Result<TasksRun<'a, 'b>, TasksError<'a, 'b>> {
@@ -187,10 +200,21 @@ pub fn run_tasks<'a, 'b>(
     let started = clock.now().since_start();
 
     let plan = c_tasks::plan(outputs, &roots, demand, alloc).map_err(|why| TasksError::Task(TaskError::Plan { package, why }))?;
-    if !plan.trees.is_empty() {
-        return Err(TasksError::Trees { package, requests: plan.trees.len() as u32 });
-    }
-    let c_tasks::Plan { units, planned, archives, counts, .. } = plan;
+    let c_tasks::Plan { units, planned, archives, counts, trees: tree_requests } = plan;
+
+    // The process tree first (c_tasks_tree.rs): what it makes is under `OUT_DIR`, found by its
+    // key or run once, sandboxed, by [`ShelfTree`].
+    let tree = match tree_requests.is_empty() {
+        true => Vec::new_in(alloc),
+        false => {
+            let mut keyed: AVec<'a, (&str, [u8; 32])> = Vec::with_capacity_in(sources.len(), alloc);
+            keyed.extend(sources.iter().filter(|laid| laid.guest != roots.out).map(|laid| (laid.guest, laid.digest)));
+            let inputs = c_tasks_tree::TreeInputs { toolchain, tools: trees.keys, os_build: trees.os_build, sources: &keyed, runner: TREE_RUNNER };
+            let mut runner = ShelfTree { setting, sources, roots, tools: trees, demand };
+            let done = c_tasks_tree::run_tree(package, outputs, &roots, &tree_requests, &inputs, &mut runner, store, alloc).map_err(TasksError::Tree)?;
+            done.files
+        }
+    };
     let planned = planned as usize;
     let mut texts: Vec<&'b str, SharedAlloc<'static>> = Vec::new_in(setting.heap.shared());
     texts.extend(outputs.c_requests());
@@ -318,7 +342,7 @@ pub fn run_tasks<'a, 'b>(
         made.push(one);
     }
     report.ms = clock.now().since_start().saturating_sub(started).as_millis() as u64;
-    Ok(TasksRun { made, report })
+    Ok(TasksRun { made, tree, report })
 }
 
 /// Lays the `OUT_DIR` state `state` of `outputs` at `folder` (made anew: a folder left by an
@@ -541,4 +565,546 @@ fn worker<'b>(
         answers.push((at as u32, bytes));
     }
     Ok(answers)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The process tree
+
+/// A tree's deadline, all its steps together (rule 18): jemalloc's `configure` and `make` on
+/// one job are a few minutes.
+pub const TREE_DEADLINE: Duration = Duration::from_secs(20 * 60);
+
+/// Standard output and error kept of one step; past it the step is stopped (rule 18).
+const TREE_STREAM: u32 = 4 << 20;
+
+/// Every laid file's modification time (2000-01-01): `make` compares times, and a laid tree's
+/// must be the same on every machine and older than anything a step writes.
+const LAID_MTIME: u64 = 946_684_800;
+
+/// The runner's form, in the tree's key (c_tasks_tree.rs `TreeInputs::runner`): what
+/// [`ShelfTree`] adds to the environment and how it lays the state. A change to either is a
+/// new form.
+pub const TREE_RUNNER: &str = "native_c_tasks ShelfTree 1";
+
+/// The host tools one crate's tree may start (pins/clang.json `host_tools`, `granted` to its
+/// package), each by its SHA-256 (native_runner_c.rs), and the OS build their libraries and
+/// shells are of.
+#[derive(Clone, Copy)]
+pub struct TreeTools<'t> {
+    pub tools: &'t [HostTool<'t>],
+    pub keys: &'t [HostToolKey<'t>],
+    pub os_build: &'t str,
+}
+
+/// `package`'s [`TreeTools`] on this machine: the tools the table grants it (pins/clang.json
+/// `host_tools` for `host`), each program at its real path keyed by its SHA-256 (a tool under
+/// its name, each program it starts under `<tool>+<path>`, as native_unit.rs keys a native
+/// script's), and the OS build (`/System/Library/CoreServices/SystemVersion.plist`, fact_pins.rs
+/// `read_apple_userland`, the one place it is read). Held in `alloc` for the command. A program
+/// whose path is not its real path is refused: the grant names real paths (Seatbelt matches
+/// them), and a link's target could change under an equal key.
+pub fn tree_tools<'a>(package: &str, host: &'static str, shelf: &str, alloc: Alloc<'a>) -> Result<TreeTools<'a>, AString<'a>> {
+    let words = |text: std::string::String| String::from_str_in(&text, alloc);
+    let leak = |text: &str| -> &'a str {
+        let bytes: &'a mut [u8] = Vec::from_slice_in(text.as_bytes(), alloc).leak();
+        // A copy of a `str`'s bytes is UTF-8.
+        core::str::from_utf8(bytes).unwrap_or_default()
+    };
+    let table = host_tools::host_tools(blaze_pins::CLANG_JSON, host, alloc).map_err(|e| words(format!("the host tools' table: {e}")))?;
+    let tools: AVec<'a, HostTool<'static>> = host_tools::granted(&table, package, alloc);
+    let mut keys: AVec<'a, HostToolKey<'a>> = Vec::new_in(alloc);
+    for tool in tools.iter() {
+        for (at, program) in tool.programs_in(shelf, alloc).into_iter().enumerate() {
+            let program = program.as_str();
+            let real = std::fs::canonicalize(program).map_err(|e| words(format!("{program}: {e}")))?;
+            if real.as_os_str() != program {
+                return Err(words(format!("the host tool `{}` is granted at {program}, whose real path is {}: the table names real paths", tool.name, real.display())));
+            }
+            let bytes = std::fs::read(program).map_err(|e| words(format!("{program}: {e}")))?;
+            let name = match at {
+                0 => leak(tool.name),
+                _ => leak(&format!("{}+{program}", tool.name)),
+            };
+            keys.push(HostToolKey::of(tool, name, blaze_sha256::digest(&bytes)));
+        }
+    }
+    let text = crate::fact_pins::read_apple_userland(alloc).map_err(|e| words(format!("the OS build: {e}")))?;
+    let userland = blaze_build_script::fact_pins::apple_userland(text.plist.as_str(), text.darwin_release.as_str()).map_err(|e| words(format!("the OS build: {e}")))?;
+    let os_build = leak(userland.build_version);
+    Ok(TreeTools { tools: tools.leak(), keys: keys.leak(), os_build })
+}
+
+/// The digest of what a crate's tree is run with beyond its record (its tools, the OS build,
+/// the runner's form): the built record's key holds it (c_tasks_built.rs `built_key`), so a
+/// changed tool or OS build is another built record, never the old one found (rule 21).
+pub fn tree_tools_digest(trees: &TreeTools<'_>) -> [u8; 32] {
+    let mut hasher = blaze_ids::Hasher::new("native_c_tasks tree tools 1");
+    hasher.part(TREE_RUNNER.as_bytes()).part(trees.os_build.as_bytes());
+    hasher.update(&(trees.keys.len() as u64).to_le_bytes());
+    for key in trees.keys {
+        hasher.part(key.name.as_bytes()).part(&key.digest).update(&[u8::from(key.runs_out_dir)]);
+    }
+    hasher.finish().0
+}
+
+/// The tree strategy of the command (c_tasks_tree.rs [`TreeRunner`]): each step a hermetic
+/// run at `Level::Inputs` under the Seatbelt grant (rule 9), against `OUT_DIR` laid from the
+/// state the steps saw at `<work>/trees/<key>/out`; its environment the recorded one with each
+/// guest folder made its host folder, the C toolchain the shelf's, and [`FIXED_ENV`].
+struct ShelfTree<'s> {
+    setting: &'s CTasksSetting<'s>,
+    /// The laid roots (the script's own `OUT_DIR` among them is replaced by the tree's).
+    sources: &'s [Laid<'s>],
+    roots: GuestRoots<'s>,
+    tools: &'s TreeTools<'s>,
+    /// What the crate's link lines ask for, relative to `OUT_DIR`: a demanded file the tree
+    /// left with a host folder in it is refused (rule 25), never left out.
+    demand: &'s [&'s str],
+}
+
+/// A byte that ends a word of a command line or a variable's value: a guest folder begins
+/// only after one (or after a flag's letters: `-I/out/include`).
+fn ends_word(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'=' | b':' | b'"' | b'\'' | b',')
+}
+
+/// A byte of a file or folder name: a guest spelling followed by one is another name
+/// (`/out` is not `/outer`).
+fn names_on(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+}
+
+/// `text` with each guest folder of `pairs` (guest, host; longest guest first) made its host
+/// folder where a word begins with it, or a flag's letters do (`-I/out/x`, `--prefix=/out`).
+/// A guest spelling inside a word (`a/out`) or followed by a name's byte is left as it is.
+fn to_host<'a>(text: &str, pairs: &[(&str, &str)], alloc: Alloc<'a>) -> AString<'a> {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity_in(text.len(), alloc);
+    let (mut word, mut slashed, mut copied, mut at) = (0usize, false, 0usize, 0usize);
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if ends_word(byte) {
+            (word, slashed) = (at + 1, false);
+            at += 1;
+            continue;
+        }
+        if byte == b'/' && !slashed {
+            slashed = true;
+            let before = &text[word..at];
+            if before.is_empty() || before.starts_with('-') {
+                let rest = &text[at..];
+                let found = pairs.iter().find(|(guest, _)| rest.starts_with(guest) && !bytes.get(at + guest.len()).is_some_and(|next| names_on(*next)));
+                if let Some((guest, host)) = found {
+                    out.push_str(&text[copied..at]);
+                    out.push_str(host);
+                    at += guest.len();
+                    copied = at;
+                    continue;
+                }
+            }
+        }
+        at += 1;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// `text` with each host folder of `pairs` (guest, host) shown as its guest spelling, the
+/// longest host first: what an error shows (rule 19) and a file is checked against.
+fn to_guest<'a>(text: &str, pairs: &[(&str, &str)], alloc: Alloc<'a>) -> AString<'a> {
+    let mut by_host: AVec<'a, (&str, &str)> = Vec::with_capacity_in(pairs.len(), alloc);
+    by_host.extend_from_slice(pairs);
+    by_host.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    let mut shown = String::from_str_in(text, alloc);
+    for (guest, host) in by_host.iter() {
+        shown = replace_all(shown.as_str(), host, guest, alloc);
+    }
+    shown
+}
+
+fn replace_all<'a>(text: &str, from: &str, to: &str, alloc: Alloc<'a>) -> AString<'a> {
+    let mut out = String::new_in(alloc);
+    let mut rest = text;
+    while let Some(at) = rest.find(from) {
+        out.push_str(&rest[..at]);
+        out.push_str(to);
+        rest = &rest[at + from.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The shelf program a C toolchain variable's first word names, by its file name: the tree's
+/// compiler and archiver are always the pinned ones (`cc`, `gcc` and `clang` are the shelf's
+/// `clang`; `c++`, `g++`, `clang++` its `clang++`; `ar` its `llvm-ar`); `None` leaves the word.
+fn shelf_program(word: &str) -> Option<&'static str> {
+    let name = word.rsplit('/').next().unwrap_or(word);
+    match name {
+        "cc" | "gcc" | "clang" | "clang-23" => Some("bin/clang"),
+        "c++" | "g++" | "clang++" => Some("bin/clang++"),
+        "ar" | "llvm-ar" => Some("bin/llvm-ar"),
+        _ => None,
+    }
+}
+
+/// A variable's value made one string from parts.
+fn joined<'a>(parts: &[&str], alloc: Alloc<'a>) -> AString<'a> {
+    let mut out = String::new_in(alloc);
+    for part in parts {
+        out.push_str(part);
+    }
+    out
+}
+
+fn refused_words<'a>(parts: &[&str], alloc: Alloc<'a>) -> Refused<'a> {
+    Refused { words: joined(parts, alloc) }
+}
+
+/// Whether `bytes` holds `needle` anywhere.
+fn holds(bytes: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && bytes.windows(needle.len()).any(|window| window == needle)
+}
+
+/// Lays `entries` (an `OUT_DIR` state: c_tasks.rs `laid_state`) at `folder`, made anew: each
+/// file at [`LAID_MTIME`], one that begins `#!` executable (`make` starts a tree's own
+/// `install-sh` by its path).
+fn lay_tree<'a>(entries: &[(&str, Option<&[u8]>)], folder: &str, alloc: Alloc<'a>) -> Result<(), AString<'a>> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let words = |text: &str| String::from_str_in(text, alloc);
+    let laid_at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(LAID_MTIME);
+    for (name, bytes) in entries {
+        if name.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
+            return Err(words(&format!("the state names `{name}`, which is not a path under OUT_DIR")));
+        }
+        let path = format!("{folder}/{name}");
+        let failed = |e: std::io::Error| words(&format!("{path}: {e}"));
+        match bytes {
+            None => std::fs::create_dir_all(&path).map_err(failed)?,
+            Some(bytes) => {
+                if let Some((parent, _)) = path.rsplit_once('/') {
+                    std::fs::create_dir_all(parent).map_err(failed)?;
+                }
+                std::fs::write(&path, bytes).map_err(failed)?;
+                let file = std::fs::File::options().write(true).open(&path).map_err(failed)?;
+                file.set_modified(laid_at).map_err(failed)?;
+                let mode = if bytes.starts_with(b"#!") { 0o755 } else { 0o644 };
+                file.set_permissions(std::fs::Permissions::from_mode(mode)).map_err(failed)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+impl ShelfTree<'_> {
+    /// The folders a step reads, each a tree root by what names it: the laid roots, the SDK,
+    /// the shelf, each granted tool's runtime folders (by the tool's digest).
+    fn read_roots<'a>(&self, alloc: Alloc<'a>) -> AVec<'a, (&str, [u8; 32])> {
+        let mut out: AVec<'a, (&str, [u8; 32])> = Vec::new_in(alloc);
+        for laid in self.sources.iter().filter(|laid| laid.guest != self.roots.out) {
+            out.push((laid.host, laid.digest));
+        }
+        out.push((self.setting.sdk.host, self.setting.sdk.digest));
+        out.push((self.setting.shelf.host, self.setting.shelf.digest));
+        for tool in self.tools.tools {
+            let digest = self.tools.keys.iter().find(|key| key.name == tool.name).map_or([0; 32], |key| key.digest);
+            for folder in tool.read_folders() {
+                if !out.iter().any(|(seen, _)| *seen == folder) {
+                    out.push((folder, digest));
+                }
+            }
+        }
+        out
+    }
+}
+
+impl TreeRunner for ShelfTree<'_> {
+    fn run<'a>(&mut self, job: &TreeJob<'_, '_>, outputs: &OutputsRef<'_>, key: ContentId, alloc: Alloc<'a>) -> Result<TreeRan<'a>, Refused<'a>> {
+        let setting = self.setting;
+        let (shelf, sdk) = (setting.shelf.host, setting.sdk.host);
+        let fail = |parts: &[&str]| refused_words(parts, alloc);
+
+        // 1. The tree's folder made anew, the state laid as its `out`, its own `tmp`.
+        let named = hex(&key.0, alloc);
+        let folder = joined(&[setting.work, "/trees/", named.as_str()], alloc);
+        let out = joined(&[folder.as_str(), "/out"], alloc);
+        let tmp = joined(&[folder.as_str(), "/tmp"], alloc);
+        match std::fs::remove_dir_all(folder.as_str()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(fail(&[folder.as_str(), ": ", &error.to_string()])),
+        }
+        for made in [out.as_str(), tmp.as_str()] {
+            std::fs::create_dir_all(made).map_err(|e| fail(&[made, ": ", &e.to_string()]))?;
+        }
+        let mut laid = c_tasks::laid_state(outputs, job.state, alloc).map_err(|why| fail(&["its OUT_DIR state: ", &why.to_string()]))?;
+        laid.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        lay_tree(&laid, out.as_str(), alloc).map_err(|words| Refused { words })?;
+
+        // 2. Each guest folder and its host folder, the longest guest first.
+        let mut pairs: AVec<'a, (&str, &str)> = Vec::new_in(alloc);
+        pairs.push((self.roots.out, out.as_str()));
+        for laid in self.sources.iter().filter(|laid| laid.guest != self.roots.out) {
+            pairs.push((laid.guest, laid.host));
+        }
+        pairs.push((setting.sdk.guest, sdk));
+        pairs.push((setting.shelf.guest, shelf));
+        pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        // What a file is checked against and an error shows: every host folder, `tmp` too.
+        let mut shown = pairs.clone();
+        shown.push(("/tmp", tmp.as_str()));
+
+        // 3. The grant: the shelf's compilers and archiver, the linker when a tool runs what
+        // the tree built (D112), each granted tool and what it starts; read the roots; write
+        // the tree's folder alone.
+        let runs_out_dir = host_tools::runs_out_dir(self.tools.tools);
+        let linker: &[&str] = if runs_out_dir { &["bin/ld64.lld", "bin/lld"] } else { &[] };
+        let mut held: AVec<'a, AString<'a>> = Vec::new_in(alloc);
+        for name in ["bin/clang-23", "bin/clang", "bin/clang++", "bin/llvm-ar"].iter().chain(linker) {
+            held.push(joined(&[shelf, "/", name], alloc));
+        }
+        for tool in self.tools.tools {
+            held.extend(tool.programs_in(shelf, alloc));
+        }
+        let mut exec: AVec<'a, &str> = Vec::with_capacity_in(held.len(), alloc);
+        exec.extend(held.iter().map(|program| program.as_str()));
+        let read_roots = self.read_roots(alloc);
+        let mut reads: AVec<'a, &str> = Vec::with_capacity_in(read_roots.len(), alloc);
+        reads.extend(read_roots.iter().map(|(folder, _)| *folder));
+        let out_only = [out.as_str()];
+        let exec_under: &[&str] = if runs_out_dir { &out_only } else { &[] };
+        let writes = [folder.as_str()];
+
+        // 4. The roots: each read folder a tree root by its digest, the tree's folder the
+        // output root (`out` and `tmp` under it).
+        let mut root_list: AVec<'a, Root<'_>> = Vec::with_capacity_in(read_roots.len() + 1, alloc);
+        let mut mounts: AVec<'a, Mount<'_>> = Vec::with_capacity_in(read_roots.len() + 1, alloc);
+        for (at, (folder, digest)) in read_roots.iter().enumerate() {
+            let at = u8::try_from(at).map_err(|_| fail(&["more than 255 folders read by a process tree"]))?;
+            root_list.push(Root { name: "a folder a process tree reads", kind: RootKind::Tree { tree: Digest(*digest) } });
+            mounts.push(Mount { spelling: folder.as_bytes(), root: RootId(at) });
+        }
+        let output = RootId(u8::try_from(root_list.len()).map_err(|_| fail(&["more than 255 folders read by a process tree"]))?);
+        root_list.push(Root { name: "a process tree's folder", kind: RootKind::Output });
+        mounts.push(Mount { spelling: folder.as_bytes(), root: output });
+        let files = OutDir { root: output, folder: folder.as_str() };
+
+        // 5. The world, its clock and the hermetic capability: one deadline for every step.
+        let (world, _) = native_world(std::path::Path::new(setting.work)).map_err(|e| fail(&["the tree's world: ", &e.to_string()]))?;
+        let spawner = world.need_host().and_then(|host| host.spawner()).map_err(|missing| fail(&["the tree's world has no ", missing.capability]))?;
+        let clock = world.need_clock().map_err(|missing| fail(&["the tree's world has no ", missing.capability]))?;
+        let hermetic = Hermetic::new(HermeticCapOpts { spawner, clock: world.need_clock().map_err(|missing| fail(&["the tree's world has no ", missing.capability]))? });
+        let cx = world.cx(TREE_DEADLINE.saturating_add(Duration::from_secs(60)), bstd::mem::TASK_FRAME).map_err(|_| fail(&["the tree's world stopped"]))?;
+        let ends = clock.now().since_start().saturating_add(TREE_DEADLINE);
+        let path = host_tools::path_folders(self.tools.tools, alloc);
+        let mut path_value: AString<'a> = String::new_in(alloc);
+        for folder in path.iter() {
+            if !path_value.is_empty() {
+                path_value.push(':');
+            }
+            path_value.push_str(folder);
+        }
+        let tool_env = host_tools::tool_env(self.tools.tools, shelf, alloc);
+
+        for step in job.steps.iter() {
+            let request = step.request;
+            let mut argv = step.argv();
+            let Some(first) = argv.next() else { return Err(fail(&["a process-tree request with no program"])) };
+            // The program: a granted tool by its name, or (a tool that runs what the tree
+            // built) a program under OUT_DIR by its guest path.
+            let (program, digest) = match first.contains('/') {
+                true => {
+                    let host = to_host(first, &pairs, alloc);
+                    if !runs_out_dir || !host.as_str().starts_with(out.as_str()) {
+                        return Err(fail(&["`", first, "` is under no folder a process tree may start a program from"]));
+                    }
+                    (host, key.0)
+                }
+                false => {
+                    let Some(tool) = self.tools.tools.iter().find(|tool| tool.name == first) else {
+                        return Err(fail(&["`", first, "` is not a host tool the table grants this package (pins/clang.json `host_tools`)"]));
+                    };
+                    let Some(keyed) = self.tools.keys.iter().find(|keyed| keyed.name == tool.name) else {
+                        return Err(fail(&["the host tool `", first, "` has no digest"]));
+                    };
+                    (tool.program_in(shelf, alloc), keyed.digest)
+                }
+            };
+            let mut held_args: AVec<'a, AString<'a>> = Vec::new_in(alloc);
+            held_args.extend(argv.map(|arg| to_host(arg, &pairs, alloc)));
+            let mut args: AVec<'a, &str> = Vec::with_capacity_in(held_args.len(), alloc);
+            args.extend(held_args.iter().map(|arg| arg.as_str()));
+            let cwd = to_host(step.tree.cwd, &pairs, alloc);
+
+            // The environment: the recorded one at host folders, then the run's own.
+            let mut vars: AVec<'a, (AString<'a>, AString<'a>)> = Vec::new_in(alloc);
+            for (name, value) in step.tree.env() {
+                if matches!(name, "MAKEFLAGS" | "MFLAGS" | "CARGO_MAKEFLAGS") && value.contains("jobserver") {
+                    return Err(fail(&["the process tree's `", name, "` names a jobserver, which a tree run alone cannot be given"]));
+                }
+                let mut value = to_host(value, &pairs, alloc);
+                if matches!(name, "CC" | "CXX" | "AR") {
+                    let (word, rest) = value.as_str().split_once(' ').unwrap_or((value.as_str(), ""));
+                    if let Some(member) = shelf_program(word) {
+                        let space = if rest.is_empty() { "" } else { " " };
+                        value = joined(&[shelf, "/", member, space, rest], alloc);
+                    }
+                }
+                vars.push((String::from_str_in(name, alloc), value));
+            }
+            let set = |vars: &AVec<'a, (AString<'a>, AString<'a>)>, name: &str| vars.iter().any(|(set, _)| set.as_str() == name);
+            if !set(&vars, "AR") {
+                vars.push((String::from_str_in("AR", alloc), joined(&[shelf, "/bin/llvm-ar"], alloc)));
+            }
+            if !set(&vars, "RANLIB") {
+                vars.push((String::from_str_in("RANLIB", alloc), joined(&[shelf, "/bin/llvm-ar s"], alloc)));
+            }
+            let mut maps: AString<'a> = String::new_in(alloc);
+            for (guest, host) in shown.iter() {
+                maps.push_str(" -ffile-prefix-map=");
+                maps.push_str(host);
+                maps.push('=');
+                maps.push_str(guest);
+            }
+            maps.push_str(" -Wno-unused-command-line-argument");
+            // The maps on the flags the tree's compiles take (`CFLAGS` always, `CXXFLAGS` when
+            // the script set it): no host folder reaches an object's debug information.
+            for flags in ["CFLAGS", "CXXFLAGS"] {
+                match vars.iter().rposition(|(name, _)| name.as_str() == flags) {
+                    Some(at) => vars[at].1.push_str(maps.as_str()),
+                    None if flags == "CFLAGS" => vars.push((String::from_str_in(flags, alloc), String::from_str_in(maps.as_str().trim_start(), alloc))),
+                    None => {}
+                }
+            }
+            for (name, value) in tool_env.iter() {
+                vars.push((name.clone(), value.clone()));
+            }
+            vars.push((String::from_str_in("MACOSX_DEPLOYMENT_TARGET", alloc), String::from_str_in(blaze_build_script::toolchain::MACOS_MIN, alloc)));
+            vars.push((String::from_str_in("PATH", alloc), path_value.clone()));
+            vars.push((String::from_str_in("SDKROOT", alloc), String::from_str_in(sdk, alloc)));
+            vars.push((String::from_str_in("TMPDIR", alloc), tmp.clone()));
+            for (name, value) in FIXED_ENV {
+                vars.push((String::from_str_in(name, alloc), String::from_str_in(value, alloc)));
+            }
+            // Sorted by name, a later value of one name the one kept.
+            vars.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+            let mut env: AVec<'a, (&str, &str)> = Vec::with_capacity_in(vars.len(), alloc);
+            for (name, value) in vars.iter() {
+                match env.last_mut() {
+                    Some(last) if last.0 == name.as_str() => *last = (name.as_str(), value.as_str()),
+                    _ => env.push((name.as_str(), value.as_str())),
+                }
+            }
+
+            // The grant said as the Seatbelt profile would say it, before anything runs.
+            blaze_build_script::native::seatbelt_with(&Grant { program: program.as_str(), exec: &exec, read: &reads, write: &writes }, exec_under, alloc)
+                .map_err(|why| fail(&["the Seatbelt grant of a process tree: ", &why.to_string()]))?;
+            let roots = Roots::new(&root_list).map_err(|_| fail(&["the roots of a process tree were refused"]))?;
+            let now = clock.now().since_start();
+            let left = ends.saturating_sub(now);
+            if left.is_zero() {
+                return Ok(TreeRan::Failed { request, exit: TreeExit::Deadline, last_lines: String::new_in(alloc) });
+            }
+            let name = program.as_str().rsplit('/').next().unwrap_or(program.as_str());
+            let spec = HermeticSpec::new(HermeticOpts {
+                program: Program::Stored { name, digest: Digest(digest), path: program.as_str() },
+                args: &args,
+                env: &env,
+                roots,
+                mounts: &mounts,
+                cwd: cwd.as_str(),
+                helpers: &exec,
+                helper_folders: exec_under,
+                channels: &[],
+                clock: ClockSpec::Fixed { unix_secs: 0 },
+                seed: 0,
+                budget: NATIVE_BUDGET.of(left),
+                deadline: Deadline::after(now, left),
+                streams: HermeticStreams { stdout: Capture::Keep { most: TREE_STREAM }, stderr: Capture::Keep { most: TREE_STREAM } },
+                level: Level::Inputs,
+                report: ReportSpec::WholeRoots,
+            })
+            .map_err(|error| refused_words(&["the process tree's spec was refused: ", &format!("{:?} ({:?})", error.fault, error.rule)], alloc))?;
+            let ran = match hermetic.run(&cx, &spec, &files, alloc) {
+                Ok(ran) => ran,
+                Err(error) => {
+                    return match error.fault {
+                        Fault::Stopped(Stop::Deadline) => Ok(TreeRan::Failed { request, exit: TreeExit::Deadline, last_lines: String::new_in(alloc) }),
+                        Fault::Stopped(_) => Ok(TreeRan::Failed { request, exit: TreeExit::Over, last_lines: String::new_in(alloc) }),
+                        fault => Err(refused_words(&["the process tree was refused: ", &format!("{fault:?} ({:?})", error.rule)], alloc)),
+                    };
+                }
+            };
+            let exit = match ran.exit {
+                Exit::Exited(0) => continue,
+                Exit::Exited(code) => TreeExit::Code(code),
+                Exit::Signaled(signal) => TreeExit::Signal(signal),
+            };
+            let lines = c_tasks_tree::last_lines(&ran.stderr, TREE_LINES, alloc);
+            return Ok(TreeRan::Failed { request, exit, last_lines: to_guest(lines.as_str(), &shown, alloc) });
+        }
+
+        // 6. What the tree made or changed under `out`: a file equal to its laid bytes is the
+        // state's, not the tree's; one holding a host folder is left out (a log, a depfile:
+        // rule 25), unless the link asks for it, which is refused.
+        let listed = listed_under(out.as_str()).map_err(|e| fail(&["the tree's OUT_DIR could not be listed: ", &e.to_string()]))?;
+        let demand = self.demand;
+        let demanded = |name: &str| demand.iter().any(|asked| *asked == name);
+        let mut kept: std::vec::Vec<crate::native_script::Listed> = std::vec::Vec::with_capacity(listed.len());
+        let mut left_out = 0u32;
+        for entry in listed {
+            let name = entry.name.as_str();
+            if entry.kind != bstd::fs::EntryKind::File {
+                if demanded(name) {
+                    return Err(fail(&["the process tree left `", name, "`, which the link asks for, as no plain file"]));
+                }
+                left_out += 1;
+                continue;
+            }
+            let bytes = std::fs::read(format!("{}/{name}", out.as_str())).map_err(|e| fail(&[name, ": ", &e.to_string()]))?;
+            let same = laid.binary_search_by(|(laid_name, _)| (*laid_name).cmp(name)).ok().and_then(|at| laid[at].1).is_some_and(|was| was == bytes.as_slice());
+            if same {
+                continue;
+            }
+            if shown.iter().any(|(_, host)| holds(&bytes, host.as_bytes())) || holds(&bytes, folder.as_bytes()) {
+                if demanded(name) {
+                    return Err(fail(&["the process tree's `", name, "`, which the link asks for, holds a folder of this machine (rule 25: equal inputs, equal bytes)"]));
+                }
+                left_out += 1;
+                continue;
+            }
+            kept.push(entry);
+        }
+        let mut holder = Outputs::new_in(self.roots.out, alloc);
+        store_out_dir(out.as_str(), setting.area, &kept, &mut holder, FileLimits { bytes: u64::MAX, files: c_tasks_tree::MOST_TREE_FILES }, alloc)
+            .map_err(|e| fail(&["the tree's files could not be stored: ", &e.to_string()]))?;
+        std::fs::remove_dir_all(folder.as_str()).map_err(|e| fail(&[folder.as_str(), ": ", &e.to_string()]))?;
+        Ok(TreeRan::Made { files: core::mem::replace(&mut holder.stored, Vec::new_in(alloc)), left_out })
+    }
+}
+
+#[cfg(test)]
+mod tree_spelling_tests {
+    use super::{shelf_program, to_guest, to_host};
+
+    /// A guest folder is made its host folder where a word or a flag's letters begin with it,
+    /// never inside a word or a longer name; shown again, the host folders are their guests.
+    #[test]
+    fn guest_folders_are_made_host_folders_at_word_starts_only() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let pairs = [("/package", "/h/pkg"), ("/out", "/h/t/out")];
+        let host = to_host("--prefix=/out -I/package/include /outer a/out /out/lib:/package CC=/out/x", &pairs, alloc);
+        assert_eq!(host.as_str(), "--prefix=/h/t/out -I/h/pkg/include /outer a/out /h/t/out/lib:/h/pkg CC=/h/t/out/x");
+        assert_eq!(to_host("/out", &pairs, alloc).as_str(), "/h/t/out", "a whole word");
+        assert_eq!(to_host("x-/out", &pairs, alloc).as_str(), "x-/out", "CONTROL: a flag starts with '-'");
+        let shown = to_guest("error: /h/t/out/src/a.c:1: no /h/pkg/b.h", &pairs, alloc);
+        assert_eq!(shown.as_str(), "error: /out/src/a.c:1: no /package/b.h");
+    }
+
+    #[test]
+    fn a_toolchain_word_is_the_shelf_member_of_its_name() {
+        assert_eq!(shelf_program("/usr/bin/cc"), Some("bin/clang"));
+        assert_eq!(shelf_program("g++"), Some("bin/clang++"));
+        assert_eq!(shelf_program("ar"), Some("bin/llvm-ar"));
+        assert_eq!(shelf_program("ccache"), None);
+    }
 }

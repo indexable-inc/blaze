@@ -184,6 +184,8 @@ fn layout_err(error: LayoutError) -> TyErr {
         Refusal::NoAdt(adt) => TyErr::Other(BuildError::NoAdt { adt }),
         Refusal::Ground(error) | Refusal::FieldGround { error, .. } => ground_err(error),
         Refusal::Missing(m) => TyErr::Other(BuildError::MissingRecord { item: m.item }),
+        // A clean check never holds an extern type by value (it is not `Sized`).
+        Refusal::NoSize(_) => TyErr::Malformed("an extern type held by value: it has no size"),
     }
 }
 
@@ -562,6 +564,10 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     /// The fields of the environment of the closure being built when one holds a captured
     /// place below its binding (walk/moves/env_places.rs).
     env_places: moves::env_places::EnvPlaces<A>,
+    /// Each whole binding the closure or coroutine being built captures, bound at its
+    /// capture's home ([`Walk::bind_capture_at`]): a binding of an enclosing body, which this
+    /// body owns only when `own` says so (a by-value capture of an `FnOnce` body).
+    captured: Vec<PatId, A>,
     /// `Some` while a coroutine's body is built (coroutine.rs `run_coroutine`).
     co: Option<coroutine::Co>,
     /// `Some` while a coroutine's body is built into a state laid from types: the flow's table
@@ -865,6 +871,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         scope_marks: Vec::new_in(alloc.clone()),
         moves: moves::Moves::new_in(alloc.clone()),
         env_places: moves::env_places::EnvPlaces::new_in(alloc.clone()),
+        captured: Vec::new_in(alloc.clone()),
         co: None,
         names: None,
         cleanup: false,
@@ -1029,6 +1036,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             PNode::Str => return Err(TyErr::Unsupported("str")),
             PNode::Slice(_) => return Err(TyErr::Unsupported("a slice")),
             PNode::Dynamic(_) => return Err(TyErr::Unsupported("a trait object (`dyn`)")),
+            // Unsized with no metadata: only ever behind a (thin) pointer.
+            PNode::Foreign(_) => return Err(TyErr::Malformed("an extern type held by value: it has no size")),
             PNode::ExTrait(..) | PNode::ExProj { .. } | PNode::ExAuto(_) => {
                 return Err(TyErr::Malformed("a trait object's predicate row as a type"));
             }
@@ -1950,6 +1959,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         }
         let repr = self.local_repr(p)?;
         self.slots[p.ix()] = Some((Home::At(at.0, at.1), repr));
+        self.captured.push(p);
         Ok(())
     }
 
@@ -2452,6 +2462,13 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 _ => return Ok(None),
             }
         }
+    }
+
+    /// Whether binding `p` is a WHOLE binding the closure or coroutine this walk builds
+    /// captures (an environment field with no projection, bound by [`Walk::bind_capture_at`]),
+    /// so its home is the capture's, not a slot of this body.
+    fn captured_whole(&self, p: PatId) -> bool {
+        self.captured.contains(&p)
     }
 
     /// Whether `e` is a place expression (a local, a field, an index, a dereference), through
@@ -3702,6 +3719,24 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                             self.set_flag(p, true);
                             self.hold_all(p);
                             self.init[p.ix()] = true;
+                        }
+                        // A whole binding this closure captures and does not own: by reference
+                        // (its home is the enclosing body's binding, behind the field's pointer:
+                        // closure.rs `bind_capture_at`), or by value in an `Fn`/`FnMut` body
+                        // (the environment's field, borrowed with the environment). The
+                        // Reference, "Assignment expressions": "It then has the effect of first
+                        // dropping the value at the assigned place, unless the place is an
+                        // uninitialized local variable or an uninitialized field of a local
+                        // variable", then moving the value in. A captured binding is
+                        // initialized (a capture reads it: E0381), and its owner, the
+                        // enclosing body or the environment, drops what this store leaves
+                        // there. tempo consensus-config `read_secret_inner`'s closure 0
+                        // (`read_result = Err(..)` through a `&mut` capture), t1530.
+                        Some(p) if self.captured_whole(p) => {
+                            let Repr::Agg(l) = repr else { return Err(malformed("a value that needs drop not held as an aggregate")) };
+                            let g = self.layouts[l as usize].ty;
+                            self.drop_at(g, at)?;
+                            self.store(v, repr, at)?;
                         }
                         Some(_) => return Err(malformed("an assignment to a binding that needs drop and is not owned")),
                         None => {

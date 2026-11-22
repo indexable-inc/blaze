@@ -6,7 +6,7 @@
 use blaze_protocol::cbor;
 use blaze_sim::{Config, Tape};
 
-use crate::wire::run::{Declared, Down, Failure, Needed, RUN_SCHEMA, Symbol, Up};
+use crate::wire::run::{Declared, Down, Failure, HookKind, Needed, RUN_SCHEMA, Symbol, Up};
 use crate::wire::{Ask, List, RecordId, WireError, split};
 use crate::{Slot, Thread, Tier};
 
@@ -17,6 +17,8 @@ enum Owned {
     Declare { pairs: Vec<Declared> },
     Publish { slot: u32, optimized: bool, record: [u8; 32] },
     Positioned { slot: u32, optimized: bool, record: [u8; 32], values: Vec<u8> },
+    Hooks { slot: u32, kind: HookKind },
+    Promote { slot: u32, record: [u8; 32], inlined: Vec<Slot>, values: Vec<u8> },
     Failed { need: Needed, why: OwnedFailure },
 }
 
@@ -48,6 +50,13 @@ impl Owned {
                 slot: Slot(*slot),
                 tier: if *optimized { Tier::Optimized } else { Tier::Zero },
                 record: RecordId(*record),
+                values,
+            }),
+            Owned::Hooks { slot, kind } => Message::Down(Down::Hooks { slot: Slot(*slot), kind: *kind }),
+            Owned::Promote { slot, record, inlined, values } => Message::Down(Down::Promote {
+                slot: Slot(*slot),
+                record: RecordId(*record),
+                inlined: List::of(inlined),
                 values,
             }),
             Owned::Failed { need, why } => {
@@ -94,7 +103,7 @@ fn need(tape: &Tape) -> Needed {
 }
 
 fn owned(tape: &Tape) -> Owned {
-    match tape.below(5, "message") {
+    match tape.below(7, "message") {
         0 => Owned::Need { need: need(tape), thread: number(tape) },
         1 => {
             let count = tape.below(5, "pairs") as usize;
@@ -108,6 +117,21 @@ fn owned(tape: &Tape) -> Owned {
             record: bytes32(tape),
             values: (0..tape.range(1..8, "position fields")).flat_map(|_| small(tape).max(1).to_le_bytes()).collect(),
         },
+        4 => Owned::Hooks {
+            slot: small(tape),
+            kind: [HookKind::Plain, HookKind::Count, HookKind::Mark, HookKind::Hook, HookKind::Span]
+                [tape.index(5, "hook kind")],
+        },
+        5 => {
+            let count = tape.below(5, "inlined") as usize;
+            let inlined = (0..count).map(|_| Slot(small(tape))).collect();
+            Owned::Promote {
+                slot: small(tape),
+                record: bytes32(tape),
+                inlined,
+                values: (0..tape.below(4, "values")).flat_map(|_| small(tape).to_le_bytes()).collect(),
+            }
+        }
         _ => {
             let why = match tape.below(5, "failure") {
                 0 => OwnedFailure::Unresolved,
@@ -176,7 +200,7 @@ const NEED: [u8; 46] = [
     0, 0, 0, 42, // the frame's length
     0xa3, // a map of 3
     0x62, b'i', b'd', 0x01, //
-    0x63, b'r', b'u', b'n', 0x04, // the run schema
+    0x63, b'r', b'u', b'n', 0x05, // the run schema
     0x64, b'b', b'o', b'd', b'y', //
     0xa1, 0x64, b'N', b'e', b'e', b'd', //
     0xa2, //
@@ -189,7 +213,7 @@ const NEED: [u8; 46] = [
 /// Expected: passes with no output.
 #[test]
 fn a_need_by_slot_is_these_bytes() {
-    assert_eq!(RUN_SCHEMA, 4, "a schema step changes the pinned bytes: update NEED");
+    assert_eq!(RUN_SCHEMA, 5, "a schema step changes the pinned bytes: update NEED");
     let need = Up::Need { need: Needed::Slot(Slot(3)), thread: Thread(7) };
     assert_eq!(encoded(&Message::Up(need), 1), NEED);
     assert_eq!(cbor::check(&NEED[4..]).map_err(|it| it.to_string()), Ok(()));

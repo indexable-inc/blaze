@@ -229,7 +229,7 @@ impl core::fmt::Display for ConstFail {
             ConstFail::TooManyLengths { item, most } => write!(f, "constant {item:?}: one head named more than {most} array-length constants"),
             ConstFail::AdtRow { item, adt, why } => write!(f, "constant {item:?}: a layout it reads needs the row of ADT {adt:?}: {why}"),
             ConstFail::TraitConstNoSelf { item, constant } => write!(f, "constant {item:?}: the trait's constant {constant:?} is read with no `Self` (a checked body's constant path holds no arguments yet): no impl can be selected"),
-            ConstFail::NoImplConst { trait_, self_ty, constant } => write!(f, "no impl of trait {trait_:?} holds for the type {self_ty:?} to give its constant {constant:?} (rule: the value is the definition in the impl the solver selects for the trait reference, or the trait's default where that impl writes none)"),
+            ConstFail::NoImplConst { trait_, self_ty, constant } => write!(f, "no impl of trait {trait_:?} holds for the type {self_ty:?} to give its associated item {constant:?} (rule: the value is the definition in the impl the solver selects for the trait reference, or the trait's default where that impl writes none)"),
             ConstFail::NoTraitConst { trait_, constant } => write!(f, "trait {trait_:?} declares no constant under the key {constant:?}"),
             ConstFail::QPathType { constant } => write!(f, "the trait's constant {constant:?}: a qualified path in a head has a value only at `bool`, `char` or an integer type of at most 16 bytes"),
             ConstFail::QPathCycle { need } => write!(f, "the qualified constant {need:?} needs itself: an impl header of its own selection writes it"),
@@ -474,9 +474,10 @@ impl<'n, S: NamesSource<'n>> ConstsWorld<'_, 'n, S> {
         }
     }
 
-    /// Whether `item` is a member of a trait (its call is selected at the instance).
-    fn of_trait(&self, item: ItemKey) -> bool {
-        self.store.fns.get(&item).and_then(|f| f.container).is_some_and(|c| self.store.trait_defs.contains_key(&c))
+    /// The trait that declares fn `item`, when it is a trait's member (its call or its fn
+    /// pointer is selected at the instance).
+    fn trait_fn(&self, item: ItemKey) -> Option<ItemKey> {
+        self.store.fns.get(&item).and_then(|f| f.container).filter(|c| self.store.trait_defs.contains_key(c))
     }
 }
 
@@ -558,14 +559,25 @@ impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
     }
 
     fn resolve(&self, item: ItemKey, args: List, ground: &mut PortableTys<'_>, alloc: Alloc<'_>) -> Option<(ItemKey, List)> {
-        // A trait's constant first: it has a row in `Store::fns` whose container is the trait
-        // (heads.rs `trait_members`), which `of_trait` would take for a trait's fn. Selected by
-        // the checker's solver (const_select.rs); what it asks the records to make is noted
-        // with the projections' (`project`), its refusal kept in `selected`: either way `None`
-        // here, and [`Consts::value`] makes the fills and evaluates again, or refuses by name.
-        // A default selected is the trait's own item at the same arguments: asked again, the
-        // answer is the same (the selection is idempotent).
-        if let Some((trait_, _)) = self.trait_const(item) {
+        // A trait's constant (it has a row in `Store::fns` whose container is the trait:
+        // heads.rs `trait_members`) or a trait's fn, selected by the checker's solver
+        // (const_select.rs); what it asks the records to make is noted with the projections'
+        // (`project`), its refusal kept in `selected`: either way `None` here, and
+        // [`Consts::value`] makes the fills and evaluates again, or refuses by name. A default
+        // selected is the trait's own item at the same arguments: asked again, the answer is
+        // the same (the selection is idempotent).
+        //
+        // A trait's fn as its constant is (the Reference, "Associated Items": an associated
+        // item named through a trait at a type is the definition in the impl of that trait for
+        // that type, or the trait's default where the impl writes none): the fn pointer a
+        // constant makes of `<T as Tr>::f`, or a call of it, is that definition's instance
+        // (rustc reifies `Instance::resolve`'s answer, compiler/rustc_middle/src/ty/instance.rs;
+        // specialization picks the most specific impl there). alloc's `in_place_collect`
+        // `from_iter` (`const { if .. { from_iter_in_place } else { SpecFromIterNested::<T,
+        // I>::from_iter } }`) at tempo's `[Bytes, Map<IntoIter<Vec<u8>>, ..>]` was refused
+        // "the world has no impl for an associated item" (t1545): every trait fn was `None`.
+        let trait_ = self.trait_const(item).map(|(t, _)| t).or_else(|| self.trait_fn(item));
+        if let Some(trait_) = trait_ {
             return match super::const_select::select_once(self.names, self.keys, self.index, self.store, self.project.buckets(), item, trait_, args, ground, alloc) {
                 super::const_select::Selection::Selected { item, args } => Some((item, args)),
                 super::const_select::Selection::Asked { fills, gaps } => {
@@ -577,9 +589,6 @@ impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
                     None
                 }
             };
-        }
-        if self.of_trait(item) {
-            return None;
         }
         Some((item, args))
     }

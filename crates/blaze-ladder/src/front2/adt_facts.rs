@@ -939,6 +939,12 @@ fn hash_node(h: &mut StableHasher, n: &LaidNode) {
             h.tag(10);
             h.u128(k.0);
         }
+        // An extern type, by its item: a tag no earlier node had, so no digest made before it
+        // moves.
+        N::Foreign(k) => {
+            h.tag(12);
+            h.u128(k.0);
+        }
         N::Bool
         | N::Char
         | N::Int(_)

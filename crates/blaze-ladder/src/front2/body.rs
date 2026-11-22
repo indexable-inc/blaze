@@ -396,6 +396,24 @@ struct BodyTypes<'b, S> {
     /// made of it in return position ([`super::async_output`]): the coroutine's output
     /// `to_typeck` reads, never lowered again in the body's env (which has no return opaques).
     async_ret: Option<(lf::TypeId, PTy)>,
+    /// The fn heads made so far (`Store::fns`): a callee's `#[rustc_legacy_const_generics]`
+    /// positions ([`Types::legacy_term`]).
+    legacy: &'b dyn LegacyPositions,
+}
+
+/// A fn's `#[rustc_legacy_const_generics(..)]` positions, by its key: what
+/// [`BodyTypes::legacy_term`](Types::legacy_term) reads of the fn heads made so far, as a
+/// trait object so the body's types need no lifetime of the heads' texts.
+trait LegacyPositions {
+    /// The positions as written (heads.rs `FnHead::legacy_const_generics`, empty for a fn
+    /// without the attribute); `None` while the fn's head is not made.
+    fn legacy_positions(&self, item: ItemKey) -> Option<&[u32]>;
+}
+
+impl LegacyPositions for super::rows::Rows<ItemKey, FnHead<'_>, Alloc<'static>> {
+    fn legacy_positions(&self, item: ItemKey) -> Option<&[u32]> {
+        self.get(&item).map(|head| &head.legacy_const_generics[..])
+    }
 }
 
 impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
@@ -513,6 +531,53 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
             }
         };
         self.arg_term(made, view, c, Some(at))
+    }
+
+    /// A call argument at a `#[rustc_legacy_const_generics]` position, written as an
+    /// expression: rustc (compiler/rustc_ast_lowering/src/expr.rs `lower_legacy_const_generics`)
+    /// makes it the fn's next own const generic argument, an anonymous constant, so
+    /// `vshrq_n_u32(v, 32 - 12)` is `vshrq_n_u32::<{ 32 - 12 }>(v)` (chacha20 0.10.2's neon
+    /// `rotate_left!`, t1545). Valued by the one home for written constants
+    /// ([`BodyTypes::const_text_in`]) at the declared type of that parameter: the `j`th
+    /// listed position fills own const parameter `j` (the attribute's check admits only const
+    /// generics on such a fn: blaze-diagnostics checks/attrs/check.rs). A callee this does not
+    /// resolve to a fn with that position listed is `None`, and the checker refuses the
+    /// argument by name (blaze-typeck rules/legacy_const.rs).
+    fn legacy_term(&mut self, view: &View<'_>, path: blaze_typeck::PathIdx, position: u32, arg: ExprId, tys: &mut PortableTys<'_>) -> Result<Option<ConstTerm>, Refused> {
+        let at = view.expr_range(arg)?;
+        let range = view.site(at)?;
+        let callee = match self.legacy_callee(view, path) {
+            Ok(Some(callee)) => callee,
+            Ok(None) => return Ok(None),
+            Err(why) => {
+                self.failed = Some(why);
+                return Err(Refused::Form { what: "the callee of a call with a legacy const generic argument", range });
+            }
+        };
+        let Some(positions) = self.legacy.legacy_positions(checker_of(callee)) else {
+            // The head is not made. Making it costs this body a whole conversion round (and
+            // the seeded path cannot add one), so it is asked for only when the callee's text
+            // writes the attribute at all: a fn whose text does not has no listed position,
+            // and its argument is an ordinary value. The text only filters; the positions are
+            // read from the head once it is made.
+            let written = self.builder.resolver.names.text_of(callee).is_some_and(|t| t.text.contains("rustc_legacy_const_generics"));
+            if !written {
+                return Ok(None);
+            }
+            self.failed = Some(Why::Need(callee));
+            return Err(Refused::Form { what: "the callee of a call with a legacy const generic argument", range });
+        };
+        let Some(j) = positions.iter().position(|&p| p == position) else { return Ok(None) };
+        let want = match super::types::Heads::const_params(self.builder.heads, callee) {
+            Some(consts) => consts.iter().find(|(i, _)| *i as usize == j).map(|&(_, t)| t),
+            None => {
+                self.failed = Some(Why::Need(callee));
+                return Err(Refused::Form { what: "the callee of a call with a legacy const generic argument", range });
+            }
+        };
+        let scope = scope_within(view, at)?;
+        let made = self.const_text_in(view, at, tys, want, scope, "a legacy const generic argument");
+        self.written_term(made, view, at, None).map(Some)
     }
 
     /// [`Types::const_arg`], with what blaze cannot value yet a GAP ([`const_gap`]): the body
@@ -673,20 +738,27 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
     /// ([`const_gap`]), or the refusal. A GAT receiver needs its value for the projection,
     /// so a gap there retains the evaluator's reason and the argument's site.
     fn arg_term(&mut self, made: Result<PTy, Refused>, view: &View<'_>, c: lf::ConstIdx, at: Option<ArgAt>) -> Result<ConstTerm, Refused> {
+        let written = view.const_range(c)?;
+        self.written_term(made, view, written, at)
+    }
+
+    /// [`BodyTypes::arg_term`] of a constant written at `written` of the body (a const
+    /// argument's text, or a legacy const generic argument's expression).
+    fn written_term(&mut self, made: Result<PTy, Refused>, view: &View<'_>, written: blaze_lower::BodyRange, at: Option<ArgAt>) -> Result<ConstTerm, Refused> {
         let refused = match made {
             Ok(t) => return Ok(ConstTerm::Is(t)),
             Err(refused) => refused,
         };
         let Some(why) = &self.failed else { return Err(refused) };
-        let written = match why {
-            Why::ConstPath(..) => view.text_at(view.const_range(c)?)?,
+        let text = match why {
+            Why::ConstPath(..) => view.text_at(written)?,
             _ => "",
         };
-        let Some(gap) = const_gap(why, written) else { return Err(refused) };
+        let Some(gap) = const_gap(why, text) else { return Err(refused) };
         if let Some(at) = at && gat_segment(view, at)?.is_some() {
             return Err(Refused::Form {
                 what: "an unvalued const argument on a generic associated type's segment in a value path (`<T as Tr>::Out::<{ .. }>::x`)",
-                range: view.site(view.const_range(c)?)?,
+                range: view.site(written)?,
             });
         }
         self.failed = None;
@@ -699,7 +771,15 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
     /// (an expression naming an item of the body is then a constant of the body,
     /// [`BodyTypes::body_anon`]).
     fn const_arg_in(&mut self, view: &View<'_>, c: lf::ConstIdx, tys: &mut PortableTys<'_>, want: Option<PTy>, scope: Option<lf::ScopeId>) -> Result<PTy, Refused> {
-        let at = view.const_range(c)?;
+        self.const_text_in(view, view.const_range(c)?, tys, want, scope, "a const argument")
+    }
+
+    /// The constant written at `at` of the body (a const argument's text, or a legacy const
+    /// generic argument's expression): [`BodyTypes::const_arg_in`]'s reading, refused as
+    /// `what`. One home for both, so `f::<{ 32 - 12 }>(a)` and `f(a, 32 - 12)` under
+    /// `#[rustc_legacy_const_generics(1)]` are valued alike, as rustc lowers the second to the
+    /// first.
+    fn const_text_in(&mut self, view: &View<'_>, at: blaze_lower::BodyRange, tys: &mut PortableTys<'_>, want: Option<PTy>, scope: Option<lf::ScopeId>, what: &'static str) -> Result<PTy, Refused> {
         let range = view.site(at)?;
         let source = view.text_at(at)?;
         let marks = view.marks_in(at, self.mark_alloc)?;
@@ -736,7 +816,7 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
             Ok(t) => Ok(t),
             Err(why) => {
                 self.failed = Some(why);
-                Err(Refused::Form { what: "a const argument", range })
+                Err(Refused::Form { what, range })
             }
         }
     }
@@ -874,6 +954,36 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
             Err(why) => return Some(Err(why)),
         };
         Some(super::types::intern(tys, ty).and_then(|t| super::types::intern(tys, blaze_typeck::PNode::ConstValue { ty: t, bits })))
+    }
+
+    /// The free fn a call's plain-path callee `path` names, resolved as [`BodyTypes::arg_param`]
+    /// resolves a path (the module's names at the path's own spelling and site): `None` for
+    /// any other item, a path a generic parameter or a block of the body may name, or a path
+    /// the module does not resolve whole. Those are the checker's to read (blaze-typeck
+    /// rules/legacy_const.rs reads its own callee).
+    fn legacy_callee(&self, view: &View<'_>, path: blaze_typeck::PathIdx) -> Result<Option<LibKey>, Why> {
+        use crate::resolve::{Kind, Ns};
+        let Ok((abs, texts, segs, range)) = super::types::path_texts_of(view, path, false) else { return Ok(None) };
+        if texts.is_empty() || segs.iter().any(|s| !matches!(s.kind, lf::SegKind::Ident | lf::SegKind::Crate | lf::SegKind::DollarCrate | lf::SegKind::SelfMod | lf::SegKind::Super)) {
+            return Ok(None);
+        }
+        if self.env.params.iter().any(|(n, _)| *n == Name::of(texts[0])) {
+            return Ok(None);
+        }
+        if self.locals.head(self.owner).is_some() {
+            return Ok(None);
+        }
+        if let Some(b) = self.locals.body(self.owner) {
+            if b.rows.iter().any(|r| r.name == texts[0] || r.name == super::glob_uses::GLOB) {
+                return Ok(None);
+            }
+        }
+        let site = super::item_site::written_site(&self.builder.resolver, self.builder.marks, self.env.module, view, path, abs, texts[0], range)?;
+        let Ok(found) = self.builder.resolver.path_with(site.module, site.dollar_crate, abs, &texts[..], Ns::Value) else { return Ok(None) };
+        if found.consumed as usize != texts.len() || !matches!(found.kind, Kind::Fn) {
+            return Ok(None);
+        }
+        Ok(Some(found.key))
     }
 
     /// The declared type of the const parameter that the argument at `at` fills, when the
@@ -1331,6 +1441,7 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
             locals: &store.locals,
             owner,
             async_ret,
+            legacy: &store.fns,
         };
         // Each round converts into a fresh overlay of the records' table (read in place, never
         // copied): a refused round's types are dropped with it, none reaches `store.tys`, and

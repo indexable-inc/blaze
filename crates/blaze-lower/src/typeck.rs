@@ -154,6 +154,19 @@ pub trait Types {
     fn takes_const_gaps(&self) -> bool {
         false
     }
+
+    /// A value argument `arg` (argument number `position`) of a call whose callee is the
+    /// plain path `path`, when the argument is no literal, no `-` of one and no path. If the
+    /// path names a fn under `#[rustc_legacy_const_generics]` that lists `position`, the
+    /// argument is that fn's next own const generic argument, an ANONYMOUS CONSTANT (rustc,
+    /// compiler/rustc_ast_lowering/src/expr.rs `lower_legacy_const_generics`: `f(a, 32 - 12)`
+    /// is `f::<{ 32 - 12 }>(a)`), valued as a const argument is ([`Types::const_term_at`]):
+    /// `Some(term)`. `None` when the path names no such fn or the position is not listed. The
+    /// default is `None`: a caller that resolves no names leaves the checker's refusal.
+    fn legacy_term(&mut self, view: &View<'_>, path: PathIdx, position: u32, arg: ExprId, tys: &mut PortableTys<'_>) -> Result<Option<ConstTerm>, Refused> {
+        let _ = (view, path, position, arg, tys);
+        Ok(None)
+    }
 }
 
 impl ConstGapWhy {
@@ -281,6 +294,8 @@ pub enum ConstSite {
     Arg,
     /// The length of `[x; len]`.
     RepeatLen,
+    /// A call argument at a `#[rustc_legacy_const_generics]` position ([`Types::legacy_term`]).
+    LegacyArg,
 }
 
 /// One const term of a body left a hole: why, where it is written and its range in the
@@ -363,6 +378,10 @@ pub struct TypeckBody<'a> {
     /// that is one, as written without a sign; ascending by the literal's id
     /// (`BodyView::call_arg_ints`: a `#[rustc_legacy_const_generics]` callee's const argument).
     pub call_arg_ints: AVec<'a, (ExprId, u128)>,
+    /// The const term of each call argument that is an anonymous constant at a
+    /// `#[rustc_legacy_const_generics]` position ([`Types::legacy_term`]), keyed by the
+    /// argument as written; ascending by its id (`BodyView::legacy_args`).
+    pub legacy_args: AVec<'a, (ExprId, PTy)>,
     /// Every block written `unsafe` (`BlockKind::Unsafe`), ascending: expressions are converted
     /// in ascending order (`BodyView::unsafe_blocks`, blaze-typeck rules/unsafety.rs).
     pub unsafe_blocks: AVec<'a, ExprId>,
@@ -415,6 +434,7 @@ impl<'a> TypeckBody<'a> {
             asm_clobbers: &self.asm_clobbers,
             asm_text: self.asm_text.as_str(),
             call_arg_ints: &self.call_arg_ints,
+            legacy_args: &self.legacy_args,
             unsafe_blocks: &self.unsafe_blocks,
             expr_editions: &self.expr_editions,
             pat_editions: &self.pat_editions,
@@ -729,6 +749,37 @@ impl Conv<'_, '_, '_, '_, '_> {
             if let Some((value, _)) = int_literal(text) {
                 self.out.call_arg_ints.push((x, value));
             }
+        }
+        Ok(())
+    }
+
+    /// Each argument of the call of `callee` with `args` that is an anonymous constant at a
+    /// `#[rustc_legacy_const_generics]` position: its term, by the caller
+    /// ([`Types::legacy_term`]), into `legacy_args`. Only a plain path callee can name such a
+    /// fn (blaze-typeck rules/legacy_const.rs). The forms blaze-typeck's `legacy_term` reads
+    /// itself are not asked (a literal, `-` of one, a path or a local, through parentheses),
+    /// so a call costs a question only for an argument written as an expression. A gap is a
+    /// hole with the gap listed ([`Conv::term`]).
+    fn legacy_args(&mut self, callee: ExprId, args: List) -> Result<(), Refused> {
+        let Expr::Path(path) = self.v.expr(callee)? else { return Ok(()) };
+        for (position, &a) in self.v.ids(args)?.iter().enumerate() {
+            let arg = ExprId(a);
+            let mut x = arg;
+            while let Expr::Paren(inner) = self.v.expr(x)? {
+                x = inner;
+            }
+            let own = match self.v.expr(x)? {
+                Expr::Lit(_) | Expr::Path(_) | Expr::Local { .. } | Expr::Missing => true,
+                Expr::Unary { op: UnOp::Neg, operand } => matches!(self.v.expr(operand)?, Expr::Lit(_) | Expr::Paren(_)),
+                _ => false,
+            };
+            if own {
+                continue;
+            }
+            let Some(term) = self.types.legacy_term(self.v, path, len(position), arg, self.tys)? else { continue };
+            let r = self.v.expr_range(arg)?;
+            let t = self.term(term, ConstSite::LegacyArg, r)?;
+            self.out.legacy_args.push((arg, t));
         }
         Ok(())
     }
@@ -1064,6 +1115,7 @@ impl Conv<'_, '_, '_, '_, '_> {
             Expr::Yield { .. } => return self.refuse("`yield`", r),
             Expr::Call { callee, args } => {
                 self.call_arg_ints(args)?;
+                self.legacy_args(callee, args)?;
                 tc::Expr::Call { callee, args: self.exprs(args)? }
             }
             Expr::MethodCall { row, scope } => {
@@ -1341,6 +1393,7 @@ pub fn to_typeck<'a>(
         asm_clobbers: Vec::new_in(alloc),
         asm_text: blaze_own::AString::new_in(alloc),
         call_arg_ints: Vec::new_in(alloc),
+        legacy_args: Vec::new_in(alloc),
         unsafe_blocks: Vec::new_in(alloc),
         expr_editions: Vec::new_in(alloc),
         pat_editions: Vec::new_in(alloc),
@@ -1411,6 +1464,9 @@ pub fn to_typeck<'a>(
     // binary-searches the column (`BodyView::call_arg_int`). One literal is the argument of
     // one call, so no id repeats.
     c.out.call_arg_ints.sort_unstable_by_key(|&(x, _)| x);
+    // The same for the legacy arguments' terms (`BodyView::legacy_arg`); one argument is
+    // one call's, so no id repeats.
+    c.out.legacy_args.sort_unstable_by_key(|&(x, _)| x);
     for i in 0..view.pats.len() {
         let id = PatId(len(i));
         let ed = view.mark_of_pat(id)?.map_or(body_edition, |m| edition(m.edition));

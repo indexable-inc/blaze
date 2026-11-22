@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<title>blaze explore — live runs &amp; telemetry</title>
+	<link rel="stylesheet" href="explore/explore.css" />
+</head>
+<body>
+	<header class="topbar">
+		<div class="brand">
+			<span class="dot" id="conn-dot"></span>
+			<strong>blaze explore</strong>
+			<span class="muted" id="conn-label">Connecting…</span>
+		</div>
+		<div class="controls">
+			<button id="btn-pause" type="button">Pause</button>
+			<button id="btn-clear" type="button">Clear</button>
+		</div>
+	</header>
+
+	<div class="layout">
+		<aside class="runs">
+			<div class="section-head">Live &amp; Recent Runs</div>
+			<div id="run-list" class="run-list">
+				<div class="empty">Run <code>blaze run</code> to stream live spans, heap allocations, I/O and threads here.</div>
+			</div>
+		</aside>
+
+		<main class="main">
+			<nav class="tabs" role="tablist">
+				<button class="tab active" data-tab="spans" type="button">Spans &amp; Hooks</button>
+				<button class="tab" data-tab="heap" type="button">Heap (Allocations)</button>
+				<button class="tab" data-tab="io" type="button">I/O, Locks &amp; Threads</button>
+			</nav>
+
+			<section class="summary-bar" id="summary-bar"></section>
+
+			<section class="panel active" id="panel-spans">
+				<table class="grid">
+					<thead>
+						<tr>
+							<th>Slot / Function</th>
+							<th class="num">Calls</th>
+							<th class="num">Total</th>
+							<th class="num">Avg</th>
+							<th class="num">Max</th>
+							<th>Live Hook</th>
+						</tr>
+					</thead>
+					<tbody id="spans-body"></tbody>
+				</table>
+			</section>
+
+			<section class="panel" id="panel-heap">
+				<div class="heap-cards" id="heap-cards"></div>
+				<table class="grid">
+					<thead>
+						<tr>
+							<th>Allocation Call Stack (PC frames)</th>
+							<th class="num">Allocs</th>
+							<th class="num">Allocated</th>
+							<th class="num">Retained (Est.)</th>
+							<th>Share</th>
+						</tr>
+					</thead>
+					<tbody id="heap-body"></tbody>
+				</table>
+			</section>
+
+			<section class="panel" id="panel-io">
+				<table class="grid">
+					<thead>
+						<tr>
+							<th>Time</th>
+							<th>Kind / Op</th>
+							<th class="num">Thread</th>
+							<th class="num">Duration</th>
+							<th>Detail</th>
+						</tr>
+					</thead>
+					<tbody id="io-body"></tbody>
+				</table>
+			</section>
+		</main>
+	</div>
+
+	<script type="module" src="explore/explore.js"></script>
+</body>
+</html>

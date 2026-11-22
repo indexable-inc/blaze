@@ -122,6 +122,9 @@ pub enum Refusal<'a> {
     /// no ground form: `projection` is `(trait, associated type)` when a projection no impl
     /// answered is why; `None` for another grounding refusal (an opaque type not answered).
     FieldGround { adt: ItemKey, field: u32, name: blaze_typeck::Name, projection: Option<(ItemKey, blaze_typeck::Name)> },
+    /// A layout asked of the extern type `item` (`extern { type T; }`): it has no size or
+    /// alignment (blaze-build `layout::Refusal::NoSize`). Final: no later fact gives it one.
+    NoSize { item: ItemKey },
 }
 
 /// A refusal of one constant: the constant, where, and what.
@@ -206,6 +209,7 @@ impl fmt::Display for ConstError<'_> {
                     None => write!(f, "grounding its type was refused"),
                 }
             }
+            Refusal::NoSize { item } => write!(f, "the extern type {:#x} has no size or alignment: it is never laid out by value", item.0),
         }
     }
 }

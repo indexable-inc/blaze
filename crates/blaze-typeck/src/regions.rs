@@ -184,7 +184,8 @@ pub fn region_arity<F: Arity + ?Sized>(t: PTy, node: PNode, facts: &F) -> Result
         | PNode::Error
         | PNode::ConstValue { .. }
         | PNode::ConstParam(_)
-        | PNode::ExAuto(_) => Ok(0),
+        | PNode::ExAuto(_)
+        | PNode::Foreign(_) => Ok(0),
     }
 }
 
@@ -226,7 +227,8 @@ fn kids<'a>(tys: PTys<'a>, t: PTy, node: PNode) -> Result<Kids<'a>, RegionError>
         | PNode::Error
         | PNode::ConstValue { .. }
         | PNode::ConstParam(_)
-        | PNode::ExAuto(_) => Kids::None,
+        | PNode::ExAuto(_)
+        | PNode::Foreign(_) => Kids::None,
     })
 }
 

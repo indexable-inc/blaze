@@ -65,6 +65,8 @@ crates/blaze-launch-host/src/start.rs	MAGIC	none
 crates/blaze-launch/src/image.rs	MAGIC	none
 crates/blaze-launch/src/image.rs	VERSION	none
 crates/blaze-launch/src/record.rs	LAYOUT	none
+crates/blaze-launch/src/telemetry.rs	MAGIC	not persisted: shared-memory ring for a live run
+crates/blaze-launch/src/telemetry.rs	VERSION	not persisted: shared-memory ring for a live run
 crates/blaze-launch/src/wire.rs	SCHEMA	not persisted: the launcher's messages
 crates/blaze-link/src/beside.rs	MH_MAGIC_64	not persisted: Mach-O's, not blaze's
 crates/blaze-link/src/macho/chained.rs	POINTER_FORMAT	not persisted: Mach-O's, not blaze's

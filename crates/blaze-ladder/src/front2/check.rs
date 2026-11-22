@@ -912,6 +912,8 @@ pub(super) fn ty_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, tys: tc::
                 seq.push(Step::Ty(term));
             }
             Ok(tc::PNode::ExAuto(a)) => seq.push(Step::Text(item_shown(r, a))),
+            // An extern type: its path, as an ADT with no arguments.
+            Ok(tc::PNode::Foreign(k)) => seq.push(Step::Text(item_shown(r, k))),
             // A type the check left undecided (the error type): rustc's `{unknown}`, never
             // the node's `Debug` name `Error`, which reads as a type named `Error`.
             Ok(tc::PNode::Error) => seq.push(Step::Lit("{unknown}")),
@@ -1622,7 +1624,8 @@ fn holds_param(v: tc::PTys<'_>, args: tc::List) -> Result<bool, tc::CheckError> 
             | tc::PNode::Never
             | tc::PNode::Infer
             | tc::PNode::Error
-            | tc::PNode::ExAuto(_) => None,
+            | tc::PNode::ExAuto(_)
+            | tc::PNode::Foreign(_) => None,
             tc::PNode::Closure { args: l, .. } | tc::PNode::Coroutine { args: l, .. } => Some(l),
             tc::PNode::Ref(_, a) | tc::PNode::Ptr(_, a) | tc::PNode::Slice(a) | tc::PNode::ConstValue { ty: a, .. } => {
                 work.push(a);

@@ -338,9 +338,17 @@ pub(crate) fn launch_env<'e, A: Allocator>(
     grants: Option<&'e str>,
     out: &mut Vec<(&'e str, &'e str), A>,
 ) {
-    // BLAZE_LAUNCH_NATIVE is the parent's word alone (own_process.rs sets it when the image
-    // holds native code): one of the command's own is never passed on.
-    const OURS: [&str; 5] = ["BLAZE_LAUNCH_FD", "BLAZE_LAUNCH_STORE", "BLAZE_LAUNCH_ENTRY", "BLAZE_LAUNCH_NATIVE", blaze_launch::grants::VAR];
+    // BLAZE_LAUNCH_NATIVE and BLAZE_LAUNCH_TELEMETRY are the parent's word alone: one of the
+    // command's own is never passed on.
+    const OURS: [&str; 7] = [
+        "BLAZE_LAUNCH_FD",
+        "BLAZE_LAUNCH_STORE",
+        "BLAZE_LAUNCH_ENTRY",
+        "BLAZE_LAUNCH_NATIVE",
+        blaze_launch::grants::VAR,
+        blaze_launch::telemetry::VAR,
+        "BLAZE_LAUNCH_EXPLORE",
+    ];
     for (name, value) in env {
         if !OURS.contains(&name) {
             out.push((name, value));

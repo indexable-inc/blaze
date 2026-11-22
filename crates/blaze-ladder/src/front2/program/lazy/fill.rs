@@ -168,15 +168,30 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         Ok(())
     }
 
-    /// The seam's `ctor_row`: the ctor `key`'s row, made once by [`Self::row`] (a ctor's arm:
-    /// no body, no `extern` block asked). `Ok(None)` for a key that is no ctor of a made ADT
-    /// head (the store's `ctors`): the head of the ADT a body names is made when that body is
-    /// checked (`adt_rows`), so a ctor the walk reaches is filed by then.
-    pub(super) fn ctor_row_key(&mut self, key: ItemKey) -> Result<Option<usize>, LazyRefusal> {
-        if !self.store.ctors.contains_key(&key) {
-            return Ok(None);
+    /// The seam's `head_row`: fn item `key`'s row from its head, made once, no body lowered or
+    /// checked. Its head is made first by THE one rule for a key's want (front2 fill.rs
+    /// `want_of_key`): a fn's signature, an impl member's `MemberFn`, a trait's members, and
+    /// for a ctor its ADT's head (a tuple struct's ctor is a member key with no library key,
+    /// which `target_of` refuses, so it is not asked here). Then the row as a callee's
+    /// (`callee_row`: a trait's fn called by its trait's path tabled as declared, a ctor by
+    /// `row`'s ctor arm, an `extern` fn and an intrinsic as `row` places them).
+    ///
+    /// The fn item an instance's ARGUMENTS hold is the case no body's check covers (t1530, 36
+    /// tests: `Result::map` at `NonZero::<u64>::new`, `Option::map` at `Into::into`, fastrand's
+    /// `try_with_rng(Rng::fork)`, a fn handed to `OnceLock::get_or_init`): the body that named
+    /// it as a value was found by its record, so nothing of this run made its head and the
+    /// build's `Adts::abi` had no answer.
+    pub(super) fn head_row_key(&mut self, key: ItemKey) -> Result<usize, LazyRefusal> {
+        if let Some(&i) = self.rows.by_key.get(&key) {
+            return Ok(i as usize);
         }
-        self.row(key, false).map(Some)
+        self.locate(key)?;
+        if !self.store.fns.contains_key(&key) && !self.store.ctors.contains_key(&key) {
+            let want = crate::front2::fill::want_of_key(self.front.names, &self.front.keys, key)
+                .map_err(|e| LazyRefusal::Head { item: self.refused_shown(key), why: format!("head_row (lazy/fill.rs) of a fn item: {e}").into_boxed_str() })?;
+            self.make_want(want, key, "head_row (a fn item with no body checked)")?;
+        }
+        self.callee_row(key)
     }
 
     /// The seam's `done`: row `i`'s body is dropped (its head facts stay).
@@ -543,10 +558,11 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         self.item_shown(k).boxed()
     }
 
-    /// `k` for a person (front2 item_shown.rs `ItemShown`, the one printer): its path, or for
-    /// a path-less item where it is written, and its key.
+    /// `k` for a person (front2 item_shown.rs `ItemShown`, the one printer): its path (a
+    /// body-local item's through the item whose body declares it, `ItemShown::of_in`), or
+    /// for a path-less item where it is written, and its key.
     pub fn item_shown(&self, k: ItemKey) -> crate::front2::item_shown::ItemShown {
-        crate::front2::item_shown::ItemShown::of(self.front.names, &self.front.keys, k)
+        crate::front2::item_shown::ItemShown::of_in(self.front.names, &self.front.keys, &self.store, k)
     }
 
     /// Byte `site` of item `item`'s text (item-relative, as a code record's trap row holds it,

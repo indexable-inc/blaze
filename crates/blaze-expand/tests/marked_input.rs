@@ -29,8 +29,7 @@
 use blaze_expand::origin_column::TextMark;
 use blaze_expand::{
     Call, CallSite, Ctx, DefAt, DefSite, Diagnostic, Edition, ExpandCx, Expanded, Expansion, Export, HostAsk, HostError,
-    HostWhy, IncludeAs, Included, LocalInner, MacroDefinition, MarkOf, Place, PlaceOf, ProcCall, Produced, Raw, Spacing,
-    TokenKind, TokenOrigin, TokenStream, Transparency, call_key, expand, lex, lex_marked,
+    HostWhy, IncludeAs, Included, LocalInner, MacroDefinition, MarkOf, Place, PlaceOf, ProcCall, Produced, Raw, TokenKind, TokenOrigin, TokenStream, Transparency, call_key, expand, lex, lex_marked,
 };
 use blaze_id::{ContentId, CrateItemKey};
 use blaze_own::Alloc;
@@ -262,7 +261,7 @@ fn a_copied_items_call_reads_its_dollar_crate_by_its_mark() {
         let mark = args.hygiene(args.tokens()[i].ctx).mark.expect("the copy's `$crate` keeps its mark");
         assert_eq!(mark.site, tracing_site());
         assert!(matches!(mark.of, MarkOf::Outer(_)), "an input holds no mark of the call's own: {mark:?}");
-        assert!(matches!(args.tokens()[i].kind, TokenKind::Ident { raw: Raw::No, spacing: Spacing::Alone | Spacing::Joint | Spacing::JointHidden }));
+        assert!(matches!(args.tokens()[i].kind, TokenKind::Ident { raw: Raw::No, .. }));
     }
     let exp = call(&def, &args);
     assert_eq!(diags(&exp), Vec::<String>::new(), "{}", show(&exp.tokens));
@@ -326,14 +325,15 @@ fn the_reduced_fields_reach_fieldsets_base_case() {
         let tokens = &exp.tokens;
         // A recursive step is `$crate :: fieldset ! ( .. )`; the base case is not.
         let bang = (0..tokens.len()).find(|&i| matches!(tokens.tokens()[i].kind, TokenKind::Punct { char: '!', .. }));
-        let recursive = tokens.len() > 0 && tokens.text_at(0) == "$crate" && bang.is_some_and(|b| tokens.text_at(b - 1) == "fieldset");
+        let recursive = !tokens.is_empty() && tokens.text_at(0) == "$crate" && bang.is_some_and(|b| tokens.text_at(b - 1) == "fieldset");
         if !recursive {
             let shown = show(tokens);
             assert!(shown.starts_with("& Bracket( \"message\" ,") || shown.starts_with("& Bracket( message ,"), "{shown}");
             let (x, n) = (shown.find("__tracing_stringify ! Paren( x )Paren"), shown.find("__tracing_stringify ! Paren( n )Paren"));
             assert!(x.is_some() && n.is_some() && x < n, "x's name, then n's: {shown}");
-            // The entry, `x = ?..`, `n = ..`, the remainder, then the base case.
-            assert_eq!(steps, [Some(13), Some(1), Some(3), Some(12), Some(0)]);
+            // The entry (arm 14), `x = ?..` (1), `n = ..` (3), the remainder (13), then the base
+            // case (0).
+            assert_eq!(steps, [Some(14), Some(1), Some(3), Some(13), Some(0)]);
             return;
         }
         let open = bang.expect("a recursive step has its `!`") + 1;

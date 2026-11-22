@@ -104,6 +104,7 @@ pub(crate) fn impl_var_kinds<'a>(h: &ImplHeader<'_>, alloc: Alloc<'a>) -> Result
             | PNode::Param(_)
             | PNode::Error
             | PNode::ExAuto(_)
+            | PNode::Foreign(_)
             | PNode::Infer => {}
         }
     }

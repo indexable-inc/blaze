@@ -419,6 +419,7 @@ pub fn copy_ground(from: PTys<'_>, args: &[PTy], into: &mut PortableTys<'_>, scr
                 PNode::ExTrait(key, l) => PNode::ExTrait(key, map_list(l, &mut list)?),
                 PNode::ExProj { trait_, name, args, term } => PNode::ExProj { trait_, name, args: map_list(args, &mut list)?, term: m(term)? },
                 PNode::ExAuto(key) => PNode::ExAuto(key),
+                PNode::Foreign(key) => PNode::Foreign(key),
             };
             mapped[at] = into.intern(node).map_err(|_| CopyFail::Full)?;
         }

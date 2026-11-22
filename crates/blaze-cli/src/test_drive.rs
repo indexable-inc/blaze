@@ -984,11 +984,18 @@ pub(crate) struct EntryCheck<'c, 'h> {
     pub names: NamesRecords<'h>,
     pub builder: Builder,
     pub tables: Alloc<'static>,
+    /// Why its suite's native image could not be had ([`Suite::native`]): every row's refusal.
+    pub image: Result<(), &'c str>,
     said: AString<'c>,
 }
 
 impl Refuse for EntryCheck<'_, '_> {
     fn refusal(&mut self, row: u32) -> Result<Option<&str>, OneError> {
+        if let Err(why) = self.image {
+            self.said.clear();
+            write!(self.said, "its test program's native image: {why}").map_err(|_| OneError::Profile { why: Box::from("a refusal's words did not fit in memory") })?;
+            return Ok(Some(self.said.as_str()));
+        }
         let test = key_of(&self.tests, row)?;
         let frame = Frame::new(bstd::mem::Tag::Other).map_err(OneError::Frame)?;
         let erased = blaze_own::Erased::new(&frame);
@@ -1031,6 +1038,27 @@ pub(crate) struct Launched<'c, 'h> {
     pub lent: &'c CommandLent,
     pub tables: Alloc<'static>,
     pub watch: &'c dyn Watch,
+    /// Its suite's native library ([`Suite::native`]), as `blaze run` starts its program
+    /// (own_process.rs `run_own`): named in the start (`BLAZE_LAUNCH_NATIVE`), told as the first
+    /// frame (`Down::Native`, before the personality and any `Declare`), and the one file the
+    /// profile lets the launcher map executable. `None` sends neither.
+    pub native: Option<crate::engine_native::NativeSend<'c>>,
+}
+
+/// The test profile with the one grant a native image needs: `dlopen` maps `<store>/<64 hex>`
+/// executable, which `(deny default)` refuses (blaze-launch-rt native_lib.rs, step 2). That one
+/// file, by its literal path, nothing else: it is the parent's own record, named by its key.
+fn with_native<'a>(mut profile: AString<'a>, store: &str, native: Option<crate::engine_native::NativeSend<'_>>) -> Result<AString<'a>, OneError> {
+    let Some(send) = native else { return Ok(profile) };
+    if store.contains(['"', '\\', '\n']) || !send.hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(OneError::Profile { why: Box::from("the native library's path holds a quote, a backslash or a line break, which a profile string cannot hold") });
+    }
+    profile.push_str("(allow file-map-executable (literal \"");
+    profile.push_str(store);
+    profile.push_str("/");
+    profile.push_str(send.hex);
+    profile.push_str("\"))\n");
+    Ok(profile)
 }
 
 impl RunOne for Launched<'_, '_> {
@@ -1157,6 +1185,11 @@ impl Launched<'_, '_> {
         let mut needs = Needs::new(alloc);
         let mut ahead = std::vec::Vec::new_in(alloc);
         let mut placed = Vec::new_in(alloc);
+        // The native library first, before any `Declare`: the child hands its entry over only
+        // once it has loaded it (own_process.rs `run_own`, the same order).
+        if let Some(send) = self.native {
+            needs.tell_native(send.library, send.words, &mut ahead).map_err(|cause| test_parent_error(&mut lazy, cause))?;
+        }
         let head = run_parent::ahead_of(None, &mut lazy, &mut needs, &mut placed, &mut ahead)
             .map_err(|cause| test_parent_error(&mut lazy, cause))?;
         let line = head.line;
@@ -1169,8 +1202,13 @@ impl Launched<'_, '_> {
         let package = self.place.vars;
         let command = self.env.iter().copied().filter(|(name, _)| *name != "TMPDIR" && package.binary_search_by(|(set, _)| set.cmp(name)).is_err());
         run_parent::launch_env(command, self.store, entry.as_str(), None, &mut vars);
+        // `launch_env` left out any `BLAZE_LAUNCH_NATIVE` of the command's own: the parent's word.
+        if let Some(send) = self.native {
+            vars.push(("BLAZE_LAUNCH_NATIVE", send.hex));
+        }
         // 4. The profile (blaze-run child.rs, the one test profile), the launcher under it.
         let profile = blaze_run::child::seatbelt(temp.as_str(), None, alloc).map_err(|why| OneError::Profile { why: Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) })?;
+        let profile = with_native(profile, self.store, self.native)?;
         let mut args = Vec::with_capacity_in(self.args.len() + 3, frame);
         args.extend_from_slice(&["-p", profile.as_str(), self.launcher]);
         args.extend_from_slice(self.args);
@@ -1598,6 +1636,12 @@ pub(crate) struct Suite<'s, 'h> {
     pub builder: Builder,
     /// Where its tests run and what of their package they are told ([`package_run`]).
     pub place: PackageRun<'s>,
+    /// Its test program's native image (engine_native.rs `image_for`, engine_start.rs
+    /// `run_tests`): `Ok(Some(..))` when the C of a crate it links is in it, told to every test's
+    /// start before any of its code ([`Launched::native`]); `Err(why)`: the image could not be
+    /// had, and each of its tests is NOT RUN with `why` ([`EntryCheck`]), never started without
+    /// the C it may call (rule 3).
+    pub native: Result<Option<crate::engine_native::NativeSend<'s>>, &'s str>,
 }
 
 /// Where a package's tests run and what of the package they are told at run time, as
@@ -1774,8 +1818,9 @@ pub(crate) fn run_suites<'h>(
             temps: dir, temp: temp.as_str(), env: vars.as_slice(), place: suite.place, tests, names: suite.names, ids,
             builder: suite.builder, lent, tables, watch,
             args: if tests.harnessed() { &[] } else { args },
+            native: suite.native.ok().flatten(),
         });
-        checks.push(EntryCheck { tests, names: suite.names, builder: suite.builder, tables, said: String::new_in(alloc) });
+        checks.push(EntryCheck { tests, names: suite.names, builder: suite.builder, tables, image: suite.native.map(|_| ()), said: String::new_in(alloc) });
         for at in 0..tests.len() {
             let mut row = asked(unit, record_row(tests, at)?, args);
             // Custom harnesses receive the raw arguments themselves.
@@ -1880,5 +1925,39 @@ mod package_run_tests {
         assert_eq!(root.dir, "/w/one", "the workspace's root package runs in the checkout's root");
         assert!(matches!(package_run(Some("/w/one"), facts(SeenRoot::Package), alloc), Err(PackageRunError::NotMember { krate: "tempo_hardfork" })));
         assert!(matches!(package_run(None, facts(member), alloc), Err(PackageRunError::NoRoot { krate: "tempo_hardfork" })));
+    }
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+    use crate::engine_native::NativeSend;
+
+    const HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    fn send(hex: &'static str) -> NativeSend<'static> {
+        NativeSend { library: blaze_launch::wire::RecordId([7; 32]), hex, words: &[] }
+    }
+
+    /// A test program whose image holds C gets one grant more than the test profile: its
+    /// library, by literal path, mapped executable (what `dlopen` needs under `deny default`;
+    /// t1545's `blst_p2_uncompress` was a test started without it). Without an image the profile
+    /// is the test profile byte for byte; a path a profile string cannot hold is refused by name.
+    #[test]
+    fn the_native_library_is_the_one_file_mapped_executable() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let plain = || blaze_run::child::seatbelt("/h/.blaze/v2/test/tmp/1/0/3", None, alloc).unwrap_or_else(|why| panic!("{why}"));
+        let bare = plain();
+        let kept = with_native(plain(), "/h/.blaze/v2/records", None).unwrap_or_else(|why| panic!("{why}"));
+        assert_eq!(kept.as_str(), bare.as_str(), "no image: the test profile unchanged");
+
+        let granted = with_native(plain(), "/h/.blaze/v2/records", Some(send(HEX))).unwrap_or_else(|why| panic!("{why}"));
+        let line = "(allow file-map-executable (literal \"/h/.blaze/v2/records/00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\"))\n";
+        assert_eq!(granted.as_str().strip_prefix(bare.as_str()), Some(line), "the test profile, then the one grant");
+        assert_eq!(granted.as_str().matches("file-map-executable").count(), 1, "one file, nothing wider");
+
+        // PLANTED: a store path with a quote would end the profile's string early.
+        assert!(matches!(with_native(plain(), "/h/\"/records", Some(send(HEX))), Err(OneError::Profile { .. })));
+        assert!(matches!(with_native(plain(), "/h/records", Some(send("../x"))), Err(OneError::Profile { .. })));
     }
 }

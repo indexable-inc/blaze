@@ -88,6 +88,14 @@ pub struct BodyCall<'s> {
     /// word as written in a file. Where the name is looked up is `mark_site::site_of` of it.
     pub path_mark: Option<crate::mark_site::TextMark>,
     pub input: CallInput<'s>,
+    /// The marks of the input's words when the input is text ([`CallInput::Text`]): the words
+    /// of an item a macro wrote keep theirs ([`crate::lower_body_expanding_marked`]), and the
+    /// call's input is lexed with them (blaze-expand `lex_marked`), so a `$crate` the expansion
+    /// wrote is one identifier of the defining crate (tracing's `event!` writes `static
+    /// __CALLSITE: .. = $crate::callsite2! { .., level: $crate::Level::DEBUG, .. }` in a body).
+    /// Empty for a text as written in a file. Not read for [`CallInput::Expanded`], whose
+    /// tokens carry their contexts.
+    pub input_marks: InputMarks<'s>,
     /// The whole call's range in the body's text (past the item's length: in an expansion
     /// appended to it), for a finding about it.
     pub range: Range,
@@ -111,6 +119,43 @@ pub struct BodyCall<'s> {
     /// the statement"; proptest 1.11.0's `prop_assert!` writes `if !$cond { extern crate alloc;
     /// let message = alloc::format!(..); .. }`).
     pub expansions: Expansions<'s>,
+}
+
+/// The marks of a call's input text ([`BodyCall::input_marks`]): the body's mark rows (each
+/// marked word's start in the body's text, ascending, and its [`crate::mark_site::TextMark`]
+/// bytes, one [`blaze_expand::origin_column::MARK`] row per start) that fall in the input, and
+/// where the input starts, so a mark is asked by its byte offset in the input's text.
+#[derive(Clone, Copy, Debug)]
+pub struct InputMarks<'s> {
+    at: u32,
+    starts: &'s [u32],
+    bytes: &'s [u8],
+}
+
+impl<'s> InputMarks<'s> {
+    /// No marks: an input as written in a file.
+    pub const NONE: InputMarks<'static> = InputMarks { at: 0, starts: &[], bytes: &[] };
+
+    /// The rows `starts` (with their `bytes`) of an input starting at byte `at` of the text
+    /// the rows are in (a body's grown text, or an item's).
+    pub(crate) fn new(at: u32, starts: &'s [u32], bytes: &'s [u8]) -> InputMarks<'s> {
+        debug_assert_eq!(starts.len() * blaze_expand::origin_column::MARK, bytes.len(), "one mark's bytes per start");
+        InputMarks { at, starts, bytes }
+    }
+
+    /// Whether no word of the input has a mark.
+    pub fn is_empty(&self) -> bool {
+        self.starts.is_empty()
+    }
+
+    /// The mark of the word starting at byte `offset` of the input's text.
+    pub fn mark_at(&self, offset: u32) -> Option<crate::mark_site::TextMark> {
+        use blaze_expand::origin_column::MARK;
+        let i = self.starts.binary_search(&self.at.checked_add(offset)?).ok()?;
+        // Written with `TextMark::to_bytes`, by the machine (machine.rs `mark_item`,
+        // `append_expansion`) or by `ExpansionWords::mark_rows`, and by nothing else.
+        Some(crate::mark_site::TextMark::from_bytes(&self.bytes[i * MARK..(i + 1) * MARK]).expect("a mark the machine wrote reads back"))
+    }
 }
 
 /// The expansions a body's lowering has appended to the item's text so far, as a reader of
@@ -218,11 +263,14 @@ pub trait Expand {
     /// lexed again. `cfg` is the set the file is lowered under: a `cfg!` or `cfg_select!` of
     /// the call is answered by it, as the items' `#[cfg]`s are ([`crate::cfg_outcome`]), the
     /// one home of that answer in item and body position alike, never the expander's host.
+    /// `input_marks` are the marks of `input`'s words when a macro wrote the text the call is
+    /// in ([`BodyCall::input_marks`], the same seam): [`InputMarks::NONE`] for a file's call.
     fn expand(
         &mut self,
         path: &str,
         path_mark: Option<crate::mark_site::TextMark>,
         input: &str,
+        input_marks: InputMarks<'_>,
         edition: Edition,
         cfg: &mut dyn crate::Cfg,
         out: &mut BodyOut<'_>,
@@ -414,6 +462,22 @@ impl<'a> ExpansionWords<'a> {
             Some(r) if r.start <= at => self.marks[i],
             _ => None,
         }
+    }
+
+    /// The marks of the words inside `range` as [`InputMarks`] rows: each marked word's start
+    /// (in this words' text, ascending: the words are in order) and its mark's bytes. An item
+    /// call's input in a text a macro wrote is lexed with them ([`Expand::expand`]).
+    fn mark_rows(&self, range: Range, alloc: Alloc<'a>) -> (AVec<'a, u32>, AVec<'a, u8>) {
+        let mut starts = Vec::new_in(alloc);
+        let mut bytes = Vec::new_in(alloc);
+        let first = self.ranges.partition_point(|r| r.start < range.start);
+        for (r, mark) in self.ranges[first..].iter().zip(&self.marks[first..]).take_while(|(r, _)| r.start < range.end) {
+            if let Some(mark) = mark {
+                starts.push(r.start);
+                bytes.extend_from_slice(&mark.to_bytes());
+            }
+        }
+        (starts, bytes)
     }
 
     /// Whether any word carries a mark: when none does, every path in the text is as written
@@ -971,7 +1035,12 @@ impl<'a> Driver<'_, 'a> {
         }
         let mut out = BodyOut::new_in(self.alloc);
         let path_mark = own.and_then(|w| w.mark_at(path.start));
-        let expansion = expand.expand(path.of(text), path_mark, input.of(text), self.edition, &mut *self.cfg, &mut out);
+        let (starts, bytes) = match own {
+            Some(w) => w.mark_rows(input, self.alloc),
+            None => (Vec::new_in(self.alloc), Vec::new_in(self.alloc)),
+        };
+        let input_marks = InputMarks::new(input.start, &starts, &bytes);
+        let expansion = expand.expand(path.of(text), path_mark, input.of(text), input_marks, self.edition, &mut *self.cfg, &mut out);
         self.queue_expansion(expansion, &out, depth, jobs);
     }
 }

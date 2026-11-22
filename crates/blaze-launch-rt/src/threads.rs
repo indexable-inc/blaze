@@ -99,6 +99,11 @@ unsafe extern "C" fn ended(ending: *mut c_void) {
     if let Some(entered) = sampled {
         crate::sample::register::leave(entered);
     }
+    let _ = crate::telemetry::emit(crate::telemetry::Event::thread_lifecycle(
+        crate::telemetry::current_thread_id(),
+        false,
+        crate::telemetry::now_ns(),
+    ));
     drop(me);
 }
 
@@ -117,6 +122,11 @@ extern "C" fn run(born: *mut c_void) -> *mut c_void {
     // Registered with the sampler (its port or CPU timer, its stack bounds) before a byte of the
     // program runs on this thread.
     let sampled = crate::sample::register::enter(me.thread().0);
+    let _ = crate::telemetry::emit(crate::telemetry::Event::thread_lifecycle(
+        crate::telemetry::current_thread_id(),
+        true,
+        crate::telemetry::now_ns(),
+    ));
     // alloc: one `Ending` a thread, freed by the key's destructor as the thread ends.
     let ending = Box::into_raw(Box::new(Ending { me, rounds: 0, sampled }));
     let key = KEY.load(Ordering::Acquire) - 1;

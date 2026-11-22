@@ -62,6 +62,7 @@ pub mod launch;
 pub mod observe;
 pub mod place;
 pub mod record;
+pub mod telemetry;
 pub mod wire;
 
 #[cfg(test)]

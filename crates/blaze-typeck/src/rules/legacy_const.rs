@@ -23,9 +23,11 @@
 //! The constant of an argument: an integer literal's value (`BodyView::call_arg_ints`, the
 //! lowering's), `-` of one at a fixed-width signed type, `true`/`false`, a const parameter of
 //! the body's item, or a constant item with no generics. Any other constant expression (a
-//! block, arithmetic, a `const fn` call) is an anonymous constant of the body, a named gap until
-//! the body's anonymous constants are evaluated; a value that is no constant (a local) is
-//! E0435 in rustc, a named gap here too until the checker has that code.
+//! block, arithmetic, a `const fn` call) is an anonymous constant of the body, valued by the
+//! lowering's caller, the one home of written constants (blaze-lower `Types::legacy_term`,
+//! `BodyView::legacy_args`): its term, or a hole with the gap listed. A caller that resolves no
+//! names gives none, and that argument is refused by name. A value that is no constant (a
+//! local) is E0435 in rustc, a named gap here too until the checker has that code.
 
 use crate::body::{Expr, Lit, UnOp};
 use crate::diag::{About, At, DiagCode};
@@ -209,7 +211,16 @@ impl<'w, 'a, W: World, C: TypeCtx> Machine<'_, 'w, '_, 'a, W, C> {
                 }
             }
             Expr::Missing => Ok(self.common.err),
-            _ => Err(CheckError::Unported("a legacy const generic argument that is no literal, const parameter or constant (an anonymous constant in a body)").into()),
+            // An anonymous constant (rustc's `lower_legacy_const_generics`: `f(a, 32 - 12)` is
+            // `f::<{ 32 - 12 }>(a)`; chacha20's neon `rotate_left!`), valued by the lowering's
+            // caller at the parameter's type (blaze-lower `Types::legacy_term`), keyed by the
+            // argument as written. `lower_len` reads any lowered const term: a hole (a gap the
+            // caller listed in `const_gaps`) is a fresh const variable. The caller unifies it
+            // with the parameter (`bind_legacy_consts`).
+            _ => match self.body.legacy_arg(arg) {
+                Some(t) => self.lower_len(t, At::Expr(arg)),
+                None => Err(CheckError::Unported("a legacy const generic argument that is no literal, const parameter or constant (an anonymous constant in a body the lowering's caller did not value)").into()),
+            },
         }
     }
 }

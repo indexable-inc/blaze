@@ -733,7 +733,8 @@ fn copy_reached<'a>(
             | PNode::Never
             | PNode::Param(_)
             | PNode::ConstParam(_)
-            | PNode::ExAuto(_)) => n,
+            | PNode::ExAuto(_)
+            | PNode::Foreign(_)) => n,
             PNode::ConstValue { ty, bits } => PNode::ConstValue { ty: m(ty, &mapped)?, bits },
             PNode::Tuple(a) => PNode::Tuple(l(a, &mapped, out)?),
             PNode::Ref(mu, a) => PNode::Ref(mu, m(a, &mapped)?),
@@ -780,6 +781,7 @@ fn children(n: PNode) -> (Option<PTy>, Option<PTy>, Option<List>) {
         | PNode::Param(_)
         | PNode::ConstParam(_)
         | PNode::ExAuto(_)
+        | PNode::Foreign(_)
         | PNode::Infer
         | PNode::Error => (None, None, None),
         PNode::ConstValue { ty, .. } => (Some(ty), None, None),

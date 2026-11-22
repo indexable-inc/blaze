@@ -19,7 +19,7 @@ use blaze_ids::ContentId;
 use blaze_own::{AString, AVec, Alloc, Vec};
 use blaze_surface::Edition;
 
-use crate::driver::{BodyCall, BodyOut, CallInput, Expand, Expansion, LocalForm, LocalMacro};
+use crate::driver::{BodyCall, BodyOut, CallInput, Expand, Expansion, InputMarks, LocalForm, LocalMacro};
 
 /// How deep eager inputs nest (`concat!(concat!(..))`) before the call is refused.
 pub const EAGER_DEPTH: u32 = 8;
@@ -523,11 +523,18 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
         }
     }
 
-    /// The tokens inside `call`'s delimiters.
-    fn input(&self, input: CallInput<'_>, edition: Edition) -> Result<TokenStream<'a>, Refused<'a>> {
+    /// The tokens inside `call`'s delimiters. A text input is lexed with its words' `marks`
+    /// (blaze-expand `lex_marked`): the call's input as the expansion that wrote the item made
+    /// it, each `$crate` one identifier of its crate (the Reference, "Macros By Example",
+    /// "Hygiene").
+    fn input(&self, input: CallInput<'_>, marks: InputMarks<'_>, edition: Edition) -> Result<TokenStream<'a>, Refused<'a>> {
         match input {
             CallInput::Text(text) => {
-                let lexed = lex(text, edition, self.alloc).map_err(|e| Refused::Failed(Failure::Lex(e)))?;
+                let lexed = match marks.is_empty() {
+                    true => lex(text, edition, self.alloc),
+                    false => blaze_expand::lex_marked(text, edition, &|at| marks.mark_at(at), self.alloc),
+                }
+                .map_err(|e| Refused::Failed(Failure::Lex(e)))?;
                 let len = lexed.len();
                 if len < 2 {
                     return Err(Refused::Failed(Failure::NoDelimiters));
@@ -731,13 +738,14 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
         path: &str,
         path_mark: Option<crate::mark_site::TextMark>,
         input: &str,
+        input_marks: InputMarks<'_>,
         edition: Edition,
         cfg: &mut dyn crate::Cfg,
         out: &mut BodyOut<'_>,
     ) -> Expansion {
         let at = PathAt { mark: path_mark, written: None, block: None };
         let result = self
-            .input(CallInput::Text(input), edition)
+            .input(CallInput::Text(input), input_marks, edition)
             .and_then(|input| self.call(path, at, &input, edition, Inside::Plain, 0, &[], Some(cfg)));
         match result {
             Ok((key, tokens)) => {
@@ -775,7 +783,7 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
         }
         let before = self.reads.list().len();
         let result = self
-            .input(call.input, call.edition)
+            .input(call.input, call.input_marks, call.edition)
             .and_then(|input| self.call(call.path, at, &input, call.edition, Inside::Plain, 0, call.locals, Some(cfg)));
         // Its reads (an eager input's nested calls' included) joined on success and on the
         // call's error alike (`call`): placed at this call.

@@ -235,6 +235,10 @@ impl Certificate {
         Certificate(standing.root.0)
     }
 
+    pub(crate) const fn prefix(&self) -> [u8; 4] {
+        [self.0[0], self.0[1], self.0[2], self.0[3]]
+    }
+
     /// FOR TESTS ONLY: a certificate of `bytes`, with no answer behind it. A test that writes a
     /// list under one certificate and reads it under another names both so.
     #[cfg(test)]

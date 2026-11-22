@@ -218,9 +218,9 @@ impl<'a, P: FrontEnd> FrontEnd for Asked<'a, P> {
         r
     }
 
-    fn ctor_row(&mut self, key: ItemKey) -> Result<Option<usize>, RunError> {
-        let r = self.inner.ctor_row(key);
-        self.note(format_args!("ctor_row {key:?}"), |o| match &r {
+    fn head_row(&mut self, key: ItemKey) -> Result<Option<usize>, RunError> {
+        let r = self.inner.head_row(key);
+        self.note(format_args!("head_row {key:?}"), |o| match &r {
             Ok(Some(_)) => o.write_str("a row"),
             Ok(None) => o.write_str("none"),
             Err(e) => write!(o, "refused: {e}"),

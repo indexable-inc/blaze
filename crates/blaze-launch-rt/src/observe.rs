@@ -78,6 +78,7 @@ pub enum Kind {
     Count,
     Mark,
     Hook,
+    Span,
 }
 
 /// The bytes of a count stub (AArch64), including its trailing body-word `.quad`.
@@ -86,9 +87,12 @@ pub const COUNT_STUB: usize = 64;
 /// The bytes of a mark stub (AArch64), including its trailing body-word `.quad`.
 #[cfg(target_arch = "aarch64")]
 pub const MARK_STUB: usize = 48;
-/// The bytes of a hook stub (AArch64): `adr x16, .; b hook_entry; .quad body`.
+/// The bytes of a hook stub (AArch64): `adr x16, .; b hook_entry; .quad slot; .quad body`.
 #[cfg(target_arch = "aarch64")]
 pub const HOOK_STUB: usize = 24;
+/// The bytes of a span stub (AArch64): `adr x16, .; b span_entry; .quad slot; .quad body`.
+#[cfg(target_arch = "aarch64")]
+pub const SPAN_STUB: usize = 24;
 /// The bytes of a veneer (AArch64): `ldr x17, .+8; br x17; .quad target`.
 #[cfg(target_arch = "aarch64")]
 pub const VENEER: usize = 16;
@@ -106,6 +110,7 @@ pub const fn body_offset(kind: Kind) -> usize {
         Kind::Count => 56,
         Kind::Mark => 40,
         Kind::Hook => 16,
+        Kind::Span => 16,
     }
 }
 
@@ -294,10 +299,17 @@ pub fn mark(at: u64, tp_off: u32, slot: u32, body: u64) -> Result<[u8; MARK_STUB
     Ok(bytes)
 }
 
-/// A hook stub at `at`: `adr x16, .; b entry; .quad body`. The branch is near (±128 MiB):
+/// A hook stub at `at`: `adr x16, .; b entry; .quad 0; .quad body`. The branch is near (±128 MiB):
 /// `entry` is [`hook_entry`] or a [`veneer`] to it in the same mapping.
 #[cfg(target_arch = "aarch64")]
 pub fn hook_stub(at: u64, entry: u64, body: u64) -> Result<[u8; HOOK_STUB], OutOfReach> {
+    hook_stub_slot(at, entry, 0, body)
+}
+
+/// A hook stub at `at` carrying its `slot` id at offset 8 so [`hook_resolve`] identifies the
+/// slot in one load with no table lookup: `adr x16, .; b entry; .quad slot; .quad body`.
+#[cfg(target_arch = "aarch64")]
+pub fn hook_stub_slot(at: u64, entry: u64, slot: u32, body: u64) -> Result<[u8; HOOK_STUB], OutOfReach> {
     use a64::*;
 
     let delta = entry.wrapping_sub(at + 4) as i64;
@@ -307,8 +319,16 @@ pub fn hook_stub(at: u64, entry: u64, body: u64) -> Result<[u8; HOOK_STUB], OutO
     let code: [u32; 2] = [adr_here(16), b(delta)];
     let mut bytes = [0u8; HOOK_STUB];
     emit(&code, &mut bytes);
+    bytes[8..16].copy_from_slice(&u64::from(slot).to_le_bytes());
     bytes[16..24].copy_from_slice(&body.to_le_bytes());
     Ok(bytes)
+}
+
+/// An entry+exit span stub at `at` carrying its `slot` id at offset 8:
+/// `adr x16, .; b entry; .quad slot; .quad body`, where `entry` is [`span_entry`] or a veneer.
+#[cfg(target_arch = "aarch64")]
+pub fn span_stub(at: u64, entry: u64, slot: u32, body: u64) -> Result<[u8; SPAN_STUB], OutOfReach> {
+    hook_stub_slot(at, entry, slot, body)
 }
 
 /// A veneer: `ldr x17, .+8; br x17; .quad target`, for a branch whose target is beyond
@@ -385,16 +405,303 @@ pub unsafe extern "C" fn hook_entry() {
 static HOOKED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// What a hook stub calls: `stub` is the stub's address, `retaddr` the caller's return address.
-/// Derives the slot and hands both to the monitor. Stores no word.
-///
-/// The runtime wiring (which monitor, how it is reached) is `blaze-run`'s; this is the seam.
+/// Reads the embedded slot id from `[stub + 8]` and pushes a [`crate::telemetry::EventKind::HookHit`]
+/// into the active shared-memory telemetry ring. Stores no slot word.
 #[cfg(target_arch = "aarch64")]
 extern "C" fn hook_resolve(stub: usize, retaddr: usize) {
-    // The control thread knows each stub's slot; this seam hands the raw pair on. Until the
-    // monitor is wired (blaze-run), it only reads its arguments so they are live.
-    let _ = (stub, retaddr);
+    // SAFETY: `stub` is a live 24-byte `hook_stub_slot` whose bytes `8..16` hold `u64::from(slot)`.
+    let slot = unsafe { ((stub + 8) as *const u64).read() } as u32;
+    let tid = crate::telemetry::current_thread_id();
+    let ts = crate::telemetry::now_ns();
+    let _ = crate::telemetry::emit(crate::telemetry::Event::hook_hit(
+        tid,
+        blaze_launch::Slot(slot),
+        ts,
+        retaddr as u64,
+    ));
     #[cfg(test)]
     HOOKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Entry trampoline for [`span_stub`]: saves all argument registers (`x0..x18`, `q0..q7`, `x29`,
+/// `x30`), calls [`span_enter`] with `(stub, real_lr, caller_sp)`. If [`span_enter`] returns a
+/// non-zero exit trampoline address ([`span_exit`]), replaces the saved `x30` slot before
+/// restoring `sp` to the exact `caller_sp` (keeping stack-passed arguments untouched) and
+/// tail-branching to `[x16 + 16]` (the slot's body word).
+///
+/// # Safety
+///
+/// Reached only from a [`span_stub`] (`x16 = stub`, `x30 = caller's return address`).
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn span_entry() {
+    core::arch::naked_asm!(
+        "stp x29, x30, [sp, #-288]!",
+        "mov x29, sp",
+        "stp x0, x1, [sp, #16]",
+        "stp x2, x3, [sp, #32]",
+        "stp x4, x5, [sp, #48]",
+        "stp x6, x7, [sp, #64]",
+        "stp x8, x9, [sp, #80]",
+        "stp x10, x11, [sp, #96]",
+        "stp x12, x13, [sp, #112]",
+        "stp x14, x15, [sp, #128]",
+        "stp x16, x18, [sp, #144]",
+        "stp q0, q1, [sp, #160]",
+        "stp q2, q3, [sp, #192]",
+        "stp q4, q5, [sp, #224]",
+        "stp q6, q7, [sp, #256]",
+        "mov x0, x16",
+        "mov x1, x30",
+        "add x2, sp, #288",
+        "bl {enter}",
+        "cbz x0, 2f",
+        "str x0, [sp, #8]",
+        "2:",
+        "ldp q6, q7, [sp, #256]",
+        "ldp q4, q5, [sp, #224]",
+        "ldp q2, q3, [sp, #192]",
+        "ldp q0, q1, [sp, #160]",
+        "ldp x16, x18, [sp, #144]",
+        "ldp x14, x15, [sp, #128]",
+        "ldp x12, x13, [sp, #112]",
+        "ldp x10, x11, [sp, #96]",
+        "ldp x8, x9, [sp, #80]",
+        "ldp x6, x7, [sp, #64]",
+        "ldp x4, x5, [sp, #48]",
+        "ldp x2, x3, [sp, #32]",
+        "ldp x0, x1, [sp, #16]",
+        "ldp x29, x30, [sp], #288",
+        "ldr x16, [x16, #16]",
+        "br x16",
+        enter = sym span_enter,
+    )
+}
+
+/// Exit trampoline reached when a [`span_stub`]-hooked callee executes `ret`. Preserves every
+/// AAPCS64 / Rust return register (`x0..x8`, `q0..q7`, `x18`, `x29`), pops the thread's
+/// [`blaze_launch::telemetry::ShadowStack`] via [`span_leave`], emits `SpanExit`, and returns
+/// to `real_lr`.
+///
+/// # Safety
+///
+/// Reached only via a callee returning after [`span_entry`] installed `x30 = span_exit`.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn span_exit() {
+    core::arch::naked_asm!(
+        "stp x29, x30, [sp, #-240]!",
+        "mov x29, sp",
+        "stp x0, x1, [sp, #16]",
+        "stp x2, x3, [sp, #32]",
+        "stp x4, x5, [sp, #48]",
+        "stp x6, x7, [sp, #64]",
+        "stp x8, x18, [sp, #80]",
+        "stp q0, q1, [sp, #96]",
+        "stp q2, q3, [sp, #128]",
+        "stp q4, q5, [sp, #160]",
+        "stp q6, q7, [sp, #192]",
+        "add x0, sp, #240",
+        "bl {leave}",
+        "str x0, [sp, #8]",
+        "ldp q6, q7, [sp, #192]",
+        "ldp q4, q5, [sp, #160]",
+        "ldp q2, q3, [sp, #128]",
+        "ldp q0, q1, [sp, #96]",
+        "ldp x8, x18, [sp, #80]",
+        "ldp x6, x7, [sp, #64]",
+        "ldp x4, x5, [sp, #48]",
+        "ldp x2, x3, [sp, #32]",
+        "ldp x0, x1, [sp, #16]",
+        "ldp x29, x30, [sp], #240",
+        "ret",
+        leave = sym span_leave,
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+std::thread_local! {
+    static SHADOW: core::cell::RefCell<blaze_launch::telemetry::ShadowStack> =
+        const { core::cell::RefCell::new(blaze_launch::telemetry::ShadowStack::new()) };
+}
+
+#[cfg(target_arch = "aarch64")]
+extern "C" fn span_enter(stub: usize, real_lr: usize, caller_sp: usize) -> usize {
+    // SAFETY: `stub` is a live 24-byte `span_stub` whose bytes `8..16` hold `u64::from(slot)`.
+    let slot = blaze_launch::Slot(unsafe { ((stub + 8) as *const u64).read() } as u32);
+    let tid = crate::telemetry::current_thread_id();
+    let ts = crate::telemetry::now_ns();
+    let outcome = SHADOW.try_with(|cell| {
+        let mut stack = cell.borrow_mut();
+        stack.enter(slot, real_lr as u64, caller_sp as u64, ts, |unwound| {
+            crate::telemetry::record_unwound_span();
+            let _ = crate::telemetry::emit(crate::telemetry::Event::span_unwound(
+                tid,
+                unwound.slot,
+                ts,
+                unwound.duration_ns,
+                unwound.span,
+                unwound.parent,
+            ));
+        })
+    });
+    match outcome {
+        Ok(blaze_launch::telemetry::EnterOutcome::Hooked { span, parent }) => {
+            let _ = crate::telemetry::emit(crate::telemetry::Event::span_enter(
+                tid,
+                slot,
+                ts,
+                real_lr as u64,
+                span,
+                parent,
+            ));
+            span_exit as *const () as usize
+        }
+        Ok(blaze_launch::telemetry::EnterOutcome::Overflow) => {
+            crate::telemetry::record_shadow_overflow();
+            0
+        }
+        Err(_) => 0,
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+extern "C" fn span_leave(current_sp: usize) -> usize {
+    let tid = crate::telemetry::current_thread_id();
+    let ts = crate::telemetry::now_ns();
+    let left = SHADOW.try_with(|cell| {
+        let mut stack = cell.borrow_mut();
+        stack.leave(current_sp as u64, ts, |unwound| {
+            crate::telemetry::record_unwound_span();
+            let _ = crate::telemetry::emit(crate::telemetry::Event::span_unwound(
+                tid,
+                unwound.slot,
+                ts,
+                unwound.duration_ns,
+                unwound.span,
+                unwound.parent,
+            ));
+        })
+    });
+    match left {
+        Ok(Ok(span)) => {
+            let _ = crate::telemetry::emit(crate::telemetry::Event::span_exit(
+                tid,
+                span.slot,
+                ts,
+                span.duration_ns,
+                span.span,
+                span.parent,
+            ));
+            span.real_lr as usize
+        }
+        // Should never happen: `span_exit` is only installed when `span_enter` pushed.
+        _ => std::process::abort(),
+    }
+}
+
+/// Restores every `[fp + 8] == span_exit` saved return address on the current thread's AArch64
+/// frame-pointer chain back to its authentic `real_lr` from the thread's shadow stack and
+/// emits [`crate::telemetry::EventKind::SpanUnwound`] events. Called right before
+/// `_Unwind_RaiseException` so libunwind walks authentic return addresses with zero custom
+/// unwinder hacks.
+#[cfg(target_arch = "aarch64")]
+pub fn restore_unwind_frames() -> usize {
+    const MAX_FRAMES: usize = 512;
+    let exit_addr = span_exit as *const () as usize as u64;
+    let tid = crate::telemetry::current_thread_id();
+    let ts = crate::telemetry::now_ns();
+    // Drain active shadow entries into a stack buffer (zero heap allocation, bounded to
+    // SHADOW_DEPTH).
+    let mut drained = [0u64; blaze_launch::telemetry::SHADOW_DEPTH];
+    let mut drained_len = 0usize;
+    let _ = SHADOW.try_with(|cell| {
+        let mut stack = cell.borrow_mut();
+        if stack.depth() == 0 {
+            return;
+        }
+        stack.unwind_all(ts, |u| {
+            if drained_len < drained.len() {
+                drained[drained_len] = u.real_lr;
+                drained_len += 1;
+            }
+            crate::telemetry::record_unwound_span();
+            let _ = crate::telemetry::emit(crate::telemetry::Event::span_unwound(
+                tid,
+                u.slot,
+                ts,
+                u.duration_ns,
+                u.span,
+                u.parent,
+            ));
+        });
+    });
+    if drained_len == 0 {
+        return 0;
+    }
+    let Ok((low, high)) = crate::sys::stack() else {
+        return 0;
+    };
+    let mut fp: usize;
+    // SAFETY: reads current thread's AArch64 frame pointer `x29`.
+    unsafe { core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack)) };
+    let mut next_drained = 0usize;
+    let mut restored = 0usize;
+    for _ in 0..MAX_FRAMES {
+        if fp == 0 || fp % 8 != 0 || fp < low || fp.saturating_add(16) > high {
+            break;
+        }
+        // SAFETY: `fp..fp + 16` is 8-aligned inside this thread's live stack.
+        let prev_fp = unsafe { (fp as *const usize).read() };
+        let saved_lr_ptr = (fp + 8) as *mut u64;
+        let saved_lr = unsafe { saved_lr_ptr.read() };
+        if saved_lr == exit_addr {
+            // Skip tail-call siblings whose saved `real_lr` was itself `span_exit`.
+            while next_drained < drained_len && drained[next_drained] == exit_addr {
+                next_drained += 1;
+            }
+            if next_drained < drained_len {
+                // SAFETY: restoring the authentic caller return address in this thread's own
+                // stack frame record before libunwind walks it.
+                unsafe { saved_lr_ptr.write(drained[next_drained]) };
+                next_drained += 1;
+                restored += 1;
+            }
+        }
+        if prev_fp <= fp {
+            break;
+        }
+        fp = prev_fp;
+    }
+    restored
+}
+
+/// Launcher-owned wrapper for `_Unwind_RaiseException` bound by `run_mode/bind.rs`
+/// (`LauncherOwn`). Restores any active `span_exit` frames on this thread before delegating to
+/// the real system unwinder, so panics and `catch_unwind` work seamlessly through `span_stub`.
+///
+/// # Safety
+///
+/// Called with the standard Itanium ABI `_Unwind_Exception` pointer.
+#[cfg(target_arch = "aarch64")]
+pub unsafe extern "C" fn unwind_raise_exception(exception: *mut core::ffi::c_void) -> core::ffi::c_int {
+    let _ = restore_unwind_frames();
+    #[cfg(target_os = "macos")]
+    let raw = unsafe {
+        blaze_sys::posix::thread::dlsym(
+            blaze_sys::posix::thread::RTLD_DEFAULT,
+            c"_Unwind_RaiseException".as_ptr(),
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
+    let raw = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"_Unwind_RaiseException".as_ptr()) };
+    if raw.is_null() {
+        std::process::abort();
+    }
+    // SAFETY: `raw` is the system's `_Unwind_RaiseException`.
+    let real: unsafe extern "C" fn(*mut core::ffi::c_void) -> core::ffi::c_int =
+        unsafe { core::mem::transmute(raw) };
+    unsafe { real(exception) }
 }
 
 #[cfg(all(test, target_arch = "aarch64"))]
@@ -547,6 +854,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         mark: u64,
         hook: u64,
+        span: u64,
         /// The pthread key whose value is the bitmap base (macOS).
         #[cfg(target_os = "macos")]
         key: thread::pthread_key_t,
@@ -586,8 +894,15 @@ mod tests {
             let veneer_at = 128u64;
             code.write(veneer_at as usize, &veneer(hook_entry as *const () as usize as u64)).expect("veneer written");
             let hook_at = 192u64;
-            let stub = hook_stub(base + hook_at, base + veneer_at, body).expect("in reach");
+            let stub = hook_stub_slot(base + hook_at, base + veneer_at, 42, body).expect("in reach");
             code.write(hook_at as usize, &stub).expect("hook stub written");
+
+            // span_entry through its own veneer.
+            let span_veneer_at = 256u64;
+            code.write(span_veneer_at as usize, &veneer(span_entry as *const () as usize as u64)).expect("span veneer written");
+            let span_at = 320u64;
+            let sstub = span_stub(base + span_at, base + span_veneer_at, 77, body).expect("in reach");
+            code.write(span_at as usize, &sstub).expect("span stub written");
 
             Rig {
                 code,
@@ -595,6 +910,7 @@ mod tests {
                 #[cfg(target_os = "macos")]
                 mark: base + mark_at,
                 hook: base + hook_at,
+                span: base + span_at,
                 #[cfg(target_os = "macos")]
                 key,
             }
@@ -642,6 +958,13 @@ mod tests {
                     let veneer = read(self.hook - 64, 2);
                     assert_eq!(&veneer[..2], &[0x5800_0051, 0xd61f_0220], "the veneer as it will run");
                     self.hook
+                }
+                Kind::Span => {
+                    let words = read(self.span, 1);
+                    assert_eq!(words[0], 0x1000_0010, "adr x16, .");
+                    let veneer = read(self.span - 64, 2);
+                    assert_eq!(&veneer[..2], &[0x5800_0051, 0xd61f_0220], "the span veneer as it will run");
+                    self.span
                 }
             }
         }
@@ -778,5 +1101,155 @@ mod tests {
     #[test]
     fn the_hook_stub_keeps_x8_and_a_struct_returned_by_pointer() {
         x8_through(Kind::Hook);
+    }
+
+    #[test]
+    fn the_span_stub_passes_eight_integer_and_eight_float_arguments() {
+        sixteen_through(Kind::Span);
+    }
+
+    #[test]
+    fn the_span_stub_keeps_x8_and_a_struct_returned_by_pointer() {
+        x8_through(Kind::Span);
+    }
+
+    /// Twelve integer arguments: 8 in x0..x7 and 4 on the caller's stack `[sp + 0..32]`.
+    /// Proves `span_entry` leaves `sp` completely untouched for stack-passed arguments!
+    #[expect(clippy::too_many_arguments, reason = "proves stack-passed arguments past x7 survive span_entry")]
+    extern "C" fn twelve_ints(
+        a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64,
+        s0: u64, s1: u64, s2: u64, s3: u64,
+    ) -> u64 {
+        a.wrapping_mul(1)
+            .wrapping_add(b.wrapping_mul(2))
+            .wrapping_add(c.wrapping_mul(3))
+            .wrapping_add(d.wrapping_mul(5))
+            .wrapping_add(e.wrapping_mul(7))
+            .wrapping_add(f.wrapping_mul(11))
+            .wrapping_add(g.wrapping_mul(13))
+            .wrapping_add(h.wrapping_mul(17))
+            .wrapping_add(s0.wrapping_mul(19))
+            .wrapping_add(s1.wrapping_mul(23))
+            .wrapping_add(s2.wrapping_mul(29))
+            .wrapping_add(s3.wrapping_mul(31))
+    }
+
+    #[test]
+    fn the_span_stub_preserves_stack_arguments_and_records_nested_spans() {
+        let _guard = crate::telemetry::TEST_GLOBAL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Allocate an aligned in-memory telemetry ring and install it globally for this test.
+        let cap = 256u32;
+        let bytes = crate::telemetry::Telemetry::bytes_for(cap).expect("bytes");
+        let layout = core::alloc::Layout::from_size_align(bytes, 128).expect("layout");
+        let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+        let base = core::ptr::NonNull::new(raw).expect("nonnull");
+        let ring = unsafe { crate::telemetry::Telemetry::init(base, bytes, cap) }.expect("init");
+        crate::telemetry::install_global(base, bytes).expect("install");
+
+        // 1. 12 integer args (4 on stack!) through Kind::Span.
+        let rig = Rig::new(twelve_ints as *const () as usize as u64);
+        let at = rig.stub(Kind::Span);
+        type Twelve = extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64;
+        let direct = twelve_ints(1, 2, 3, 4, 5, 6, 7, 8, 100, 200, 300, 400);
+        let call: Twelve = unsafe { core::mem::transmute::<usize, Twelve>(at as usize) };
+        let got = call(1, 2, 3, 4, 5, 6, 7, 8, 100, 200, 300, 400);
+        assert_eq!(got, direct, "stack arguments must survive span_entry/span_exit unchanged");
+
+        // 2. Nested call: outer (slot 10) calls inner (slot 20) through two span stubs.
+        extern "C" fn inner_fn(x: u64) -> u64 {
+            x.wrapping_mul(3).wrapping_add(1)
+        }
+        static INNER_STUB_ADDR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        extern "C" fn outer_fn(x: u64) -> u64 {
+            let f: extern "C" fn(u64) -> u64 = unsafe {
+                core::mem::transmute(INNER_STUB_ADDR.load(core::sync::atomic::Ordering::Acquire))
+            };
+            f(x) + 10
+        }
+
+        let page = crate::sys::page().expect("page");
+        let mut code = Code::map(page).expect("code");
+        let cbase = code.base() as u64;
+        code.write(0, &veneer(span_entry as *const () as usize as u64)).expect("veneer");
+        let outer_stub = span_stub(cbase + 64, cbase, 10, outer_fn as *const () as usize as u64).expect("outer");
+        let inner_stub = span_stub(cbase + 128, cbase, 20, inner_fn as *const () as usize as u64).expect("inner");
+        code.write(64, &outer_stub).expect("write outer");
+        code.write(128, &inner_stub).expect("write inner");
+        INNER_STUB_ADDR.store((cbase + 128) as usize, core::sync::atomic::Ordering::Release);
+
+        // Drain the twelve_ints events first (filtered to this thread so concurrent thread tests don't interfere).
+        let my_tid = crate::telemetry::current_thread_id();
+        let mut events = Vec::new();
+        ring.drain(64, |e| {
+            if e.thread == my_tid {
+                events.push(e);
+            }
+        });
+        assert_eq!(events.len(), 2, "twelve_ints emits SpanEnter + SpanExit");
+        assert_eq!(events[0].event_kind(), Some(crate::telemetry::EventKind::SpanEnter));
+        assert_eq!(events[1].event_kind(), Some(crate::telemetry::EventKind::SpanExit));
+        assert_eq!(events[0].slot_or_op, 77);
+        assert_eq!(events[0].b, events[1].b, "matching SpanId on enter and exit");
+
+        events.clear();
+        let outer_call: extern "C" fn(u64) -> u64 = unsafe { core::mem::transmute((cbase + 64) as usize) };
+        assert_eq!(outer_call(5), 26);
+
+        ring.drain(64, |e| {
+            if e.thread == my_tid {
+                events.push(e);
+            }
+        });
+        assert_eq!(events.len(), 4, "outer+inner emits 4 span events: {events:?}");
+        assert_eq!(events[0].event_kind(), Some(crate::telemetry::EventKind::SpanEnter));
+        assert_eq!(events[0].slot_or_op, 10);
+        assert_eq!(events[1].event_kind(), Some(crate::telemetry::EventKind::SpanEnter));
+        assert_eq!(events[1].slot_or_op, 20);
+        assert_eq!(events[1].c, events[0].b, "inner's parent SpanId must equal outer's SpanId");
+        assert_eq!(events[2].event_kind(), Some(crate::telemetry::EventKind::SpanExit));
+        assert_eq!(events[2].slot_or_op, 20);
+        assert_eq!(events[3].event_kind(), Some(crate::telemetry::EventKind::SpanExit));
+        assert_eq!(events[3].slot_or_op, 10);
+
+        // 3. Deep recursion past SHADOW_DEPTH (256) returns exact value and records overflows.
+        static REC_STUB_ADDR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        extern "C" fn recurse(n: u64) -> u64 {
+            if n == 0 {
+                return 0;
+            }
+            let f: extern "C" fn(u64) -> u64 = unsafe {
+                core::mem::transmute(REC_STUB_ADDR.load(core::sync::atomic::Ordering::Acquire))
+            };
+            1 + f(n - 1)
+        }
+        let rec_stub = span_stub(cbase + 192, cbase, 30, recurse as *const () as usize as u64).expect("rec");
+        code.write(192, &rec_stub).expect("write rec");
+        REC_STUB_ADDR.store((cbase + 192) as usize, core::sync::atomic::Ordering::Release);
+        let rec_call: extern "C" fn(u64) -> u64 = unsafe { core::mem::transmute((cbase + 192) as usize) };
+        let depth = (blaze_launch::telemetry::SHADOW_DEPTH as u64) + 20;
+        assert_eq!(rec_call(depth), depth, "deep recursion past SHADOW_DEPTH must compute exact result");
+        assert!(ring.stats().shadow_overflows >= 20, "overflows must be counted, not silent");
+
+        // 4. Panic + catch_unwind through span_stub after restore_unwind_frames restores LR.
+        extern "C-unwind" fn panicking_callee(trigger: u64) -> u64 {
+            if trigger != 0 {
+                let restored = restore_unwind_frames();
+                assert!(restored >= 1, "must restore at least one span_exit frame on stack");
+                panic!("intentional panic through span_stub");
+            }
+            99
+        }
+        let panic_stub = span_stub(cbase + 256, cbase, 40, panicking_callee as *const () as usize as u64).expect("panic stub");
+        code.write(256, &panic_stub).expect("write panic stub");
+        let panic_call: extern "C-unwind" fn(u64) -> u64 = unsafe { core::mem::transmute((cbase + 256) as usize) };
+        let caught = std::panic::catch_unwind(|| panic_call(1));
+        assert!(caught.is_err(), "panic through span_stub must be caught cleanly by catch_unwind");
+        assert!(ring.stats().unwound_spans >= 1, "unwound span must be counted");
+        // Subsequent normal call after caught panic still works cleanly!
+        assert_eq!(panic_call(0), 99);
+
+        crate::telemetry::clear_global();
+        unsafe { std::alloc::dealloc(raw, layout) };
     }
 }

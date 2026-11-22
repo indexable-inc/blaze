@@ -104,6 +104,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             | TyView::ConstParam(_)
             | TyView::ConstInfer(_)
             | TyView::ExAuto(_)
+            | TyView::Foreign(_)
             | TyView::Error => {}
         }
     }
@@ -373,6 +374,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     PNode::ExProj { trait_, name, args: ex.out.intern_list(args)?, term }
                 }
                 TyView::ExAuto(k) => PNode::ExAuto(k),
+                TyView::Foreign(k) => PNode::Foreign(k),
                 // A variable is `holds_var` above.
                 TyView::Infer(_) | TyView::ConstInfer(_) | TyView::Error => PNode::Error,
             };
@@ -833,7 +835,8 @@ fn first_unknown(r: Recs<'_, '_>, alloc: Alloc<'_>) -> Result<Option<crate::erro
             | PNode::Never
             | PNode::Param(_)
             | PNode::ConstParam(_)
-            | PNode::ExAuto(_) => false,
+            | PNode::ExAuto(_)
+            | PNode::Foreign(_) => false,
             PNode::Ref(_, c) | PNode::Ptr(_, c) | PNode::Slice(c) | PNode::ConstValue { ty: c, .. } => one(c),
             PNode::Closure { args, .. } | PNode::Coroutine { args, .. } => any(args)?,
             PNode::Array(a, b) | PNode::Future(_, a, b) => one(a) || one(b),

@@ -299,6 +299,8 @@ fn node<A: Allocator>(tys: PTys<'_>, t: PTy, out: &mut String<A>, seq: &mut Vec<
         PNode::Infer => return not("a hole `_` (not a ground type)"),
         PNode::Error => return not("the error type"),
         PNode::ExTrait(..) | PNode::ExProj { .. } | PNode::ExAuto(_) => return not("a `dyn` predicate outside its `dyn` type"),
+        // An extern type is named by its path, as an ADT with no arguments.
+        PNode::Foreign(item) => seq.push(Piece::Path(item)),
     }
     Ok(())
 }

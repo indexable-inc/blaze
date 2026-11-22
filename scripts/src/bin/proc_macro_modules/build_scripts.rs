@@ -570,7 +570,8 @@ pub(super) fn main_with(text: &str, heap: &blaze_own::Heap) -> i32 {
         Origin::Git { commit, path, dir, manifest } => Origin::Git { commit, path, dir, manifest: script_only(&manifest) },
         origin => origin,
     };
-    let origins: Vec<Result<Origin, Failure>> = args.crates.iter().map(|wanted| Origin::of(args, &lock, wanted).map(cut)).collect();
+    let members = Members::new(&args.checkout);
+    let origins: Vec<Result<Origin, Failure>> = args.crates.iter().map(|wanted| Origin::of(args, &lock, &members, wanted, heap.alloc()).map(cut)).collect();
     let plan = Plan {
         args,
         offline: native.is_some(),

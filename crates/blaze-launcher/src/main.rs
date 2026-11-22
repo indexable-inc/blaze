@@ -158,8 +158,8 @@ const HOSTED_FILE_THREADS: usize = 1;
 /// `comptime:` entry (D175) is a compile-time program: its host on descriptor 4 (comptime.rs).
 /// Never returns: the program, or for a compile-time one this launcher, ends the process.
 fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::SharedAlloc<'static>) -> ! {
-    use blaze_launch::grants;
-    use blaze_launch_rt::run_mode::{self, Dlsym, End, EntryForm, Folder, Handed, STOPPED, Start};
+    use blaze_launch::{grants, telemetry};
+    use blaze_launch_rt::run_mode::{self, Dlsym, End, EntryForm, Folder, Handed, LauncherOwn, ObservedBind, STOPPED, Start};
     use std::os::fd::{FromRawFd, OwnedFd};
 
     if fd.as_encoded_bytes() != b"3" {
@@ -212,6 +212,17 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
             &format!("{} is set and BLAZE_LAUNCH_ENTRY names no hosted entry: grants are a hosted program's", grants::VAR),
         ),
     };
+    // Optional per-run shared-memory telemetry ring file (`BLAZE_LAUNCH_TELEMETRY`): read once
+    // and removed before any program thread starts.
+    let telemetry_path = match (std::env::var_os(telemetry::VAR), start.form) {
+        (None, _) => None,
+        (Some(_), EntryForm::Comptime) => stop(
+            CANNOT_RUN,
+            &format!("{} is set for a compile-time program, which runs walled under Table", telemetry::VAR),
+        ),
+        (Some(path), _) => Some(path),
+    };
+    let explore_auto = std::env::var_os("BLAZE_LAUNCH_EXPLORE").is_some_and(|v| v == "1");
     // SAFETY: one thread runs (nothing has been started yet), so nothing reads the environment
     // while it changes.
     unsafe {
@@ -220,7 +231,52 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
         std::env::remove_var("BLAZE_LAUNCH_ENTRY");
         std::env::remove_var("BLAZE_LAUNCH_NATIVE");
         std::env::remove_var(grants::VAR);
+        std::env::remove_var(telemetry::VAR);
+        std::env::remove_var("BLAZE_LAUNCH_EXPLORE");
     }
+    let telemetry_on = match telemetry_path {
+        Some(path) => {
+            let path_buf = PathBuf::from(&path);
+            let meta_path = path_buf.with_extension("meta");
+            let pkg = std::env::args_os()
+                .next()
+                .and_then(|s| s.into_string().ok())
+                .unwrap_or_else(|| String::from("program"));
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            let _ = std::fs::write(&meta_path, format!("pid={}\npackage={pkg}\nstarted_ms={now_ms}\n", std::process::id()));
+            let Ok(cpath) = CString::new(path.into_vec()) else {
+                stop(CANNOT_RUN, &format!("{} holds a NUL byte", telemetry::VAR));
+            };
+            let mapped = match blaze_launch_rt::telemetry::MappedRing::attach_file(&cpath) {
+                Ok(ring) => ring,
+                Err(_) => match blaze_launch_rt::telemetry::MappedRing::create(
+                    &cpath,
+                    blaze_launch_rt::telemetry::DEFAULT_CAP,
+                ) {
+                    Ok(ring) => ring,
+                    Err(why) => stop(CANNOT_RUN, &format!("{} could not open telemetry ring: {why}", telemetry::VAR)),
+                },
+            };
+            let _ = mapped.install_forever();
+            if explore_auto {
+                if let (Ok(exe), Some(runs_dir)) = (std::env::current_exe(), path_buf.parent()) {
+                    let _ = std::process::Command::new(exe)
+                        .arg("--open-explore")
+                        .arg("--runs-dir")
+                        .arg(runs_dir)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                }
+            }
+            true
+        }
+        None => false,
+    };
     // SAFETY: asks whether descriptor 3 is open; changes nothing.
     if unsafe { libc::fcntl(3, libc::F_GETFD) } == -1 {
         stop(CANNOT_RUN, "BLAZE_LAUNCH_FD is 3 and descriptor 3 is not open: start the program with `blaze run`");
@@ -230,11 +286,38 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
     let socket = unsafe { OwnedFd::from_raw_fd(3) };
     let store = store.into_vec();
     let folder = Folder::new(&store);
-    // An ordinary run binds C names in this process's images and ends through `exit`: `run`
-    // returns only when the program could not start.
-    let ordinary = |socket, handed| match run_mode::run(socket, &folder, start.entry, native, handed, Dlsym, End::Exit, shared) {
-        Ok(status) => stop(STOPPED, &format!("the run returned status {status} where it ends the process (End::Exit)")),
-        Err(why) => why.to_string(),
+    // An ordinary run always goes through `LauncherOwn<Dlsym>` (so `pthread_create` registers
+    // every user thread with the sampler/epoch table and `_Unwind_RaiseException` restores
+    // span_exit frames). When `BLAZE_LAUNCH_TELEMETRY` is set, `ObservedBind` layers zero-touch
+    // alloc/IO/mutex telemetry on top; otherwise plain `LauncherOwn<Dlsym>` pays zero overhead.
+    let ordinary = |socket, handed| {
+        let ran = if telemetry_on {
+            run_mode::run(
+                socket,
+                &folder,
+                start.entry,
+                native,
+                handed,
+                ObservedBind::new(LauncherOwn::new(Dlsym)),
+                End::Exit,
+                shared,
+            )
+        } else {
+            run_mode::run(
+                socket,
+                &folder,
+                start.entry,
+                native,
+                handed,
+                LauncherOwn::new(Dlsym),
+                End::Exit,
+                shared,
+            )
+        };
+        match ran {
+            Ok(status) => stop(STOPPED, &format!("the run returned status {status} where it ends the process (End::Exit)")),
+            Err(why) => why.to_string(),
+        }
     };
     let why = match form {
         // Nothing of the hosted world is made for these: the start stays the launcher's own.
@@ -332,6 +415,81 @@ fn make_host(
     bstd::hosting::Hosting::new(io, args, grants, EXCHANGE, shared)
 }
 
+fn viewer_config_from_args() -> blaze_launch_rt::viewer::ViewerConfig {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let mut cfg = blaze_launch_rt::viewer::ViewerConfig::for_home(&home);
+    let mut args = std::env::args().skip(2);
+    while let Some(arg) = args.next() {
+        if arg == "--runs-dir" {
+            if let Some(dir) = args.next() {
+                cfg.runs_dir = PathBuf::from(dir);
+            }
+        } else if arg == "--port" {
+            if let Some(p) = args.next().and_then(|s| s.parse::<u16>().ok()) {
+                cfg.port = p;
+            }
+        }
+    }
+    cfg
+}
+
+/// Runs the local loopback telemetry viewer daemon until idle expiry.
+fn run_viewer_daemon() -> ! {
+    let cfg = viewer_config_from_args();
+    match blaze_launch_rt::viewer::start(cfg) {
+        Ok(handle) => {
+            handle.wait();
+            std::process::exit(0);
+        }
+        Err(why) => {
+            // Another viewer is already listening on the port: exit quietly with 0.
+            let _ = writeln!(std::io::stderr().lock(), "{why}");
+            std::process::exit(0);
+        }
+    }
+}
+
+/// Ensures the local loopback viewer daemon is running and opens `https://ix.dev/blaze/explore`
+/// (or local `/explore` when `BLAZE_EXPLORE_LOCAL=1`) ONLY when `active_viewers == 0`.
+fn ensure_viewer_and_open_explore() -> ! {
+    let cfg = viewer_config_from_args();
+    let mut active = blaze_launch_rt::viewer::probe_active_viewers(cfg.port);
+    if active.is_none() {
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = std::process::Command::new(exe)
+                .arg("--viewer")
+                .arg("--runs-dir")
+                .arg(&cfg.runs_dir)
+                .arg("--port")
+                .arg(cfg.port.to_string())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            // Bounded wait (20 * 25ms = 500ms) for the local viewer to bind.
+            for _ in 0..20 {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                active = blaze_launch_rt::viewer::probe_active_viewers(cfg.port);
+                if active.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+    let no_open = std::env::var_os("BLAZE_NO_OPEN").is_some();
+    if !no_open && active == Some(0) {
+        let url = if std::env::var_os("BLAZE_EXPLORE_LOCAL").is_some() {
+            format!("http://127.0.0.1:{}/explore", cfg.port)
+        } else {
+            String::from(blaze_launch_rt::viewer::DEFAULT_EXPLORE_URL)
+        };
+        let _ = blaze_launch_rt::viewer::open_browser_url(&url);
+    }
+    std::process::exit(0);
+}
+
 fn main() {
     // Before any thread and any wait: a stub's wait and the control thread's use direct
     // system calls, which keep no per-thread state (THREADS.md D6; blaze_launch_rt::stub_wait).
@@ -345,6 +503,13 @@ fn main() {
     let os = blaze_core::Os::process();
     if let Some(fd) = std::env::var_os("BLAZE_LAUNCH_FD") {
         run_mode(fd, os, shared);
+    }
+    if let Some(first) = std::env::args().nth(1) {
+        if first == "--viewer" {
+            run_viewer_daemon();
+        } else if first == "--open-explore" {
+            ensure_viewer_and_open_explore();
+        }
     }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,

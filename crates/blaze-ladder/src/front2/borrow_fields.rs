@@ -258,7 +258,9 @@ fn field_row<'a, F: Arity + ?Sized>(tys: tc::PTys<'_>, root: tc::PTy, arity: &F,
             | tc::PNode::Error
             | tc::PNode::ExTrait(..)
             | tc::PNode::ExProj { .. }
-            | tc::PNode::ExAuto(_) => {}
+            | tc::PNode::ExAuto(_)
+            // An extern type has no generics, so no region position.
+            | tc::PNode::Foreign(_) => {}
         }
     }
     if taken != col.len() {

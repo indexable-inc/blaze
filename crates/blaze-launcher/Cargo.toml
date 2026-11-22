@@ -40,5 +40,9 @@ libc.workspace = true
 # page size and the process's end, through the one wrapper (no new `libc::` use).
 blaze-sys.workspace = true
 
+[dev-dependencies]
+blaze-blake3.workspace = true
+blaze-code.workspace = true
+
 [lints]
 workspace = true

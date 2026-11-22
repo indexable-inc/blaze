@@ -430,6 +430,36 @@ impl ItemShown {
         ItemShown { path: path.map(String::into_boxed_str), written, key: k.0.to_be_bytes() }
     }
 
+    /// [`ItemShown::of`] with the store's body-local items. A fn, static, const or impl
+    /// declared in a block has no names row, so `of` had no path for it (curve25519-dalek's
+    /// `fn m` in `<&FieldElement51 as Mul>::mul`, tempo's tests t1530). Its path is the path of
+    /// the item whose body declares it, followed by each local's declared name (row_path.rs
+    /// `RowPath::of`, the one reading of it: an impl's segment is its header), as rustc spells
+    /// a local item (`a::f::m`); its key is its own. The walk goes through at most 64 owners
+    /// (rule 18). Past that, or at a segment no declaration names, this is [`ItemShown::of`]'s
+    /// answer, never a guess.
+    pub fn of_in<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &super::heads::Store<'n>, k: ItemKey) -> ItemShown {
+        let mut idents: std::vec::Vec<String> = std::vec::Vec::new();
+        let mut at = k;
+        for _ in 0..64 {
+            let Some(local) = store.locals.head(at) else {
+                if idents.is_empty() {
+                    break;
+                }
+                let outer = Self::of(names, keys, at);
+                idents.reverse();
+                let path = outer.path.map(|p| format!("{p}::{}", idents.join("::")).into_boxed_str());
+                return ItemShown { path, written: outer.written, key: k.0.to_be_bytes() };
+            };
+            match super::row_path::RowPath::of(names, keys, store, at) {
+                Ok(p) => idents.push(p.ident().to_string()),
+                Err(_) => break,
+            }
+            at = local.enclosing;
+        }
+        Self::of(names, keys, k)
+    }
+
     /// A library key `lib` over `names`.
     pub fn of_lib<'n, S: NamesSource<'n>>(names: S, lib: LibKey) -> ItemShown {
         let [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15, ..] = lib.0.0;

@@ -196,3 +196,136 @@ pub fn read(bytes: &[u8], most_slots: usize, slots: &mut AVec<'_, SlotId>) -> Re
     }
     Ok(Request::Toggle { hooks, on })
 }
+
+/// Default loopback port for `blaze-launcher --viewer` (matches `site/explore/protocol.ts`).
+pub const DEFAULT_VIEWER_PORT: u16 = 41937;
+
+/// Hosted Explore UI URL opened by default when no viewer tab is connected.
+pub const EXPLORE_URL: &str = "https://ix.dev/blaze/explore";
+
+/// Default idle expiry for the local viewer helper (rule 70: no immortal daemon without runs or tabs).
+pub const DEFAULT_IDLE_EXPIRY_NS: u64 = 120 * 1_000_000_000;
+
+/// Inputs to the sans-IO "should `blaze run` open a browser tab?" decision.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct OpenInput {
+    /// Number of Explore tabs currently connected to the local viewer (`/api/info`).
+    pub active_viewers: u32,
+    /// True when stdin/stderr is an interactive terminal (never pop tabs in CI/piped scripts).
+    pub interactive_tty: bool,
+    /// True when `BLAZE_NO_OPEN=1` (or equivalent opt-out) is set.
+    pub suppressed_by_env: bool,
+    /// True when the local viewer daemon is reachable on loopback.
+    pub viewer_reachable: bool,
+}
+
+/// The pure decision of whether to launch the browser for `ix.dev/blaze/explore`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OpenDecision {
+    /// Open the Explore URL: zero tabs are currently connected.
+    OpenBrowser,
+    /// Do NOT open a duplicate tab: at least one Explore tab is already connected live.
+    AlreadyOpen { active_viewers: u32 },
+    /// Suppressed because the user opted out (`BLAZE_NO_OPEN`).
+    SuppressedByEnv,
+    /// Suppressed because the invocation is non-interactive (CI, tests, pipes).
+    SuppressedNonInteractive,
+    /// Suppressed because the local viewer did not come up on loopback.
+    SuppressedViewerUnavailable,
+}
+
+/// Pure decision function: opens a browser tab if and only if interactive, not opted out,
+/// the local viewer is reachable, and `active_viewers == 0`.
+pub const fn decide_open(input: OpenInput) -> OpenDecision {
+    if input.suppressed_by_env {
+        OpenDecision::SuppressedByEnv
+    } else if !input.interactive_tty {
+        OpenDecision::SuppressedNonInteractive
+    } else if !input.viewer_reachable {
+        OpenDecision::SuppressedViewerUnavailable
+    } else if input.active_viewers > 0 {
+        OpenDecision::AlreadyOpen { active_viewers: input.active_viewers }
+    } else {
+        OpenDecision::OpenBrowser
+    }
+}
+
+/// Action returned by [`ViewerLifecycle::step`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ViewerAction {
+    KeepAlive,
+    ExpireIdle,
+}
+
+/// Sans-IO idle-expiry machine for the local viewer daemon (rule 70: `no-state-between-requests`).
+/// Stays alive while at least one run OR one browser tab is active; expires once both have been
+/// zero continuously for `idle_expiry_ns`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ViewerLifecycle {
+    idle_since_ns: Option<u64>,
+    idle_expiry_ns: u64,
+}
+
+impl ViewerLifecycle {
+    pub const fn new(idle_expiry_ns: u64) -> Self {
+        Self { idle_since_ns: None, idle_expiry_ns }
+    }
+
+    pub fn step(&mut self, now_ns: u64, active_viewers: u32, active_runs: u32) -> ViewerAction {
+        if active_viewers > 0 || active_runs > 0 {
+            self.idle_since_ns = None;
+            return ViewerAction::KeepAlive;
+        }
+        let since = *self.idle_since_ns.get_or_insert(now_ns);
+        if now_ns.saturating_sub(since) >= self.idle_expiry_ns {
+            ViewerAction::ExpireIdle
+        } else {
+            ViewerAction::KeepAlive
+        }
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::*;
+
+    #[test]
+    fn open_decision_opens_only_when_zero_viewers_and_interactive() {
+        assert_eq!(
+            decide_open(OpenInput { active_viewers: 0, interactive_tty: true, suppressed_by_env: false, viewer_reachable: true }),
+            OpenDecision::OpenBrowser
+        );
+        assert_eq!(
+            decide_open(OpenInput { active_viewers: 1, interactive_tty: true, suppressed_by_env: false, viewer_reachable: true }),
+            OpenDecision::AlreadyOpen { active_viewers: 1 }
+        );
+        assert_eq!(
+            decide_open(OpenInput { active_viewers: 0, interactive_tty: false, suppressed_by_env: false, viewer_reachable: true }),
+            OpenDecision::SuppressedNonInteractive
+        );
+        assert_eq!(
+            decide_open(OpenInput { active_viewers: 0, interactive_tty: true, suppressed_by_env: true, viewer_reachable: true }),
+            OpenDecision::SuppressedByEnv
+        );
+        assert_eq!(
+            decide_open(OpenInput { active_viewers: 0, interactive_tty: true, suppressed_by_env: false, viewer_reachable: false }),
+            OpenDecision::SuppressedViewerUnavailable
+        );
+    }
+
+    #[test]
+    fn viewer_lifecycle_expires_only_after_continuous_idle() {
+        let mut lc = ViewerLifecycle::new(100);
+        // Active run keeps alive.
+        assert_eq!(lc.step(0, 0, 1), ViewerAction::KeepAlive);
+        assert_eq!(lc.step(500, 0, 1), ViewerAction::KeepAlive);
+        // Both drop to 0 at t=600.
+        assert_eq!(lc.step(600, 0, 0), ViewerAction::KeepAlive);
+        assert_eq!(lc.step(699, 0, 0), ViewerAction::KeepAlive);
+        // A browser connects at t=699 -> resets idle timer!
+        assert_eq!(lc.step(699, 1, 0), ViewerAction::KeepAlive);
+        assert_eq!(lc.step(750, 0, 0), ViewerAction::KeepAlive);
+        assert_eq!(lc.step(849, 0, 0), ViewerAction::KeepAlive);
+        assert_eq!(lc.step(850, 0, 0), ViewerAction::ExpireIdle);
+    }
+}

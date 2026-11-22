@@ -59,6 +59,7 @@ impl Expand for NoExpand {
         _: &str,
         _: Option<blaze_lower::mark_site::TextMark>,
         _: &str,
+        _: blaze_lower::InputMarks<'_>,
         _: Edition,
         _: &mut dyn Cfg,
         _: &mut blaze_lower::BodyOut<'_>,

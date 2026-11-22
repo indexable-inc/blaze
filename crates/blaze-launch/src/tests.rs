@@ -11,6 +11,7 @@ mod observe;
 mod record;
 mod run_wire;
 mod sim;
+mod telemetry;
 mod wire;
 
 use blaze_own::Alloc;

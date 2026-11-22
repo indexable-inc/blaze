@@ -15,9 +15,10 @@
 //!   ([`Pinned`]): a registry `.crate` the lock's checksum pins, or a git commit;
 //! - the archives asked for (the demand), in order.
 //!
-//! A dependency's `OUT_DIR` a compile reads (`DEP_*_INCLUDE`) is not named again: its values are
-//! in the script's out, and its files are its own script's outputs, whose out moves with them
-//! under the same pinned package.
+//! - each `links` dependency's tree the requests name ([`crate::c_tasks::dep_roots`]), by its
+//!   guest spelling and what names its laid tree: a producer's `OUT_DIR` by its script record's
+//!   key, its served tree (`/deps/<links>`) by its package's files. The reader's out holds only
+//!   the spellings, so a producer bumped under equal text is another built record (rule 21).
 //!
 //! A crate whose files can change (a workspace member, a path dependency) has no pinned key and
 //! no built record: its objects are found through their path sets, against today's files.
@@ -39,8 +40,12 @@ pub struct Pinned {
     pub files: [u8; 32],
 }
 
-/// The built record's key: the module's list, in that order.
-pub fn built_key(script_out: ContentId, toolchain: &Toolchain<'_>, pinned: Pinned, demand: &[&str]) -> ContentId {
+/// The built record's key: the module's list, in that order, then `tree`: for a crate with
+/// process-tree requests, the digest of what its tree runs with beyond its record (the granted
+/// host tools by SHA-256, the OS build, the runner's form: blaze-proc-macro native_c_tasks.rs
+/// `tree_tools_digest`). `None` adds nothing, so a crate with no tree keeps its key. `deps`:
+/// each laid `links` dependency's tree (guest spelling, digest), sorted by spelling.
+pub fn built_key(script_out: ContentId, toolchain: &Toolchain<'_>, pinned: Pinned, demand: &[&str], deps: &[(&str, [u8; 32])], tree: Option<[u8; 32]>) -> ContentId {
     let mut hasher = Hasher::new(FORM);
     hasher
         .part(b"built")
@@ -54,6 +59,14 @@ pub fn built_key(script_out: ContentId, toolchain: &Toolchain<'_>, pinned: Pinne
         .update(&(demand.len() as u64).to_le_bytes());
     for name in demand {
         hasher.part(name.as_bytes());
+    }
+    // After the demand's count and parts: no demand list ends where this begins.
+    hasher.update(&(deps.len() as u64).to_le_bytes());
+    for (guest, digest) in deps {
+        hasher.part(guest.as_bytes()).part(digest);
+    }
+    if let Some(tree) = tree {
+        hasher.part(b"tree").part(&tree);
     }
     hasher.finish()
 }

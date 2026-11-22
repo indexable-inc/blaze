@@ -260,6 +260,41 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
     if let Some(send) = native {
         vars.push(("BLAZE_LAUNCH_NATIVE", send.hex));
     }
+    // Live shared-memory telemetry ring + Explore tab auto-open (non-comptime, opt-out via
+    // `BLAZE_NO_TELEMETRY=1` / `BLAZE_NO_OPEN=1`, auto-open only on interactive terminals).
+    let no_telemetry = VarName::new("BLAZE_NO_TELEMETRY")
+        .ok()
+        .and_then(|name| env.get(&name).ok().flatten())
+        .is_some();
+    let no_open = VarName::new("BLAZE_NO_OPEN")
+        .ok()
+        .and_then(|name| env.get(&name).ok().flatten())
+        .is_some();
+    let telem_path = if line.form != EntryForm::Comptime && !no_telemetry {
+        if let Ok(runs_rel) = Path::new(".blaze/v2/runs") {
+            let _ = fs.home(cx, home, &runs_rel);
+        }
+        let cert = today.certificate.prefix();
+        let run_tag = bstd::mem::format_in!(
+            frame,
+            "{}/.blaze/v2/runs/{}-{:02x}{:02x}{:02x}{:02x}.telem",
+            home.trim_end_matches('/'),
+            package,
+            cert[0],
+            cert[1],
+            cert[2],
+            cert[3],
+        );
+        Some(run_tag)
+    } else {
+        None
+    };
+    if let Some(ref path) = telem_path {
+        vars.push((blaze_launch::telemetry::VAR, path.as_str()));
+        if err.is_terminal() && !no_open {
+            vars.push(("BLAZE_LAUNCH_EXPLORE", "1"));
+        }
+    }
     let spawner = host.spawner().map_err(OwnError::Missing)?;
     // The program's command line, for every entry form: its name first (`arg0`, the binary
     // target's), then the words after `--`.

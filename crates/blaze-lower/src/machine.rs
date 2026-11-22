@@ -592,6 +592,18 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             .filter_map(move |l| def_site::form_of(text, l).map(|form| crate::driver::LocalMacro { name: l.name.of(text), form }))
     }
 
+    /// The marks of `request`'s input's words, as [`Machine::mark_at`] reads them: the rows
+    /// whose start is inside the input (the item's own words', or an expansion's when the input
+    /// text spans one; [`Machine::call_input`]).
+    pub(crate) fn input_marks(&self, request: &Request) -> crate::driver::InputMarks<'_> {
+        use blaze_expand::origin_column::MARK;
+        let r = request.input;
+        let starts = &self.out.mark_starts;
+        let first = starts.partition_point(|&s| s < r.start);
+        let past = starts.partition_point(|&s| s < r.end);
+        crate::driver::InputMarks::new(r.start, &starts[first..past], &self.out.mark_bytes[first * MARK..past * MARK])
+    }
+
     /// Where `request`'s input is: the item's text, or tokens of an expansion lowered here.
     pub(crate) fn call_input(&self, request: &Request) -> crate::driver::CallInput<'_> {
         let r = request.input;

@@ -768,6 +768,10 @@ pub enum Refusal {
     /// A record the layout reads is not made yet (an explicit discriminant's value): nothing
     /// was cached, so asking again once it exists lays the type out afresh.
     Missing(Missing),
+    /// An extern type (`extern { type T; }`, `PNode::Foreign`), by its item: it has no size
+    /// and no alignment, so nothing lays it out by value (a pointer to it is thin:
+    /// `pointee_tail`). Typeck refuses `size_of::<T>()` of one (it is not `Sized`).
+    NoSize(ItemKey),
 }
 
 /// A fact [`LayoutFacts`] cannot answer yet: the record of `item` (an enum whose explicit
@@ -798,6 +802,7 @@ impl fmt::Display for LayoutError {
                 write!(f, "type {t}: field {field} (name {:#x}) of ADT {:#x}: grounding its type: {error}", name.0, adt.0)
             }
             Refusal::Missing(m) => write!(f, "type {t}: the record of item {:#x} (an explicit discriminant) is not made yet", m.item.0),
+            Refusal::NoSize(key) => write!(f, "type {t}: the extern type {:#x} has no size or alignment: it is never laid out by value", key.0),
         }
     }
 }
@@ -1529,6 +1534,7 @@ impl<A: Allocator + Clone> Layouts<A> {
             PNode::ExTrait(..) | PNode::ExProj { .. } | PNode::ExAuto(_) => {
                 return Err(Refusal::Malformed("a trait object's predicate row as a type"));
             }
+            PNode::Foreign(key) => return Err(Refusal::NoSize(key)),
             PNode::Param(_) | PNode::Alias { .. } | PNode::Opaque(..) | PNode::Infer | PNode::Error => {
                 return Err(Refusal::Malformed("a type with no ground form"));
             }

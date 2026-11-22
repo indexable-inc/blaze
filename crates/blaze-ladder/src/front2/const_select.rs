@@ -58,8 +58,9 @@ pub enum SelectWhy {
     NoLibraryTrait,
 }
 
-/// The trait's constant `constant` of `trait_`, asked at `Self` = `self_ty` (`None`: the
-/// arguments hold no `Self`), and why no definition was selected.
+/// The trait's constant or fn `constant` of `trait_` (consts.rs `ConstsWorld::resolve`), asked
+/// at `Self` = `self_ty` (`None`: the arguments hold no `Self`), and why no definition was
+/// selected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConstSelectRefused {
     pub constant: ItemKey,
@@ -71,7 +72,7 @@ pub struct ConstSelectRefused {
 impl core::fmt::Display for ConstSelectRefused {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let ConstSelectRefused { constant, trait_, self_ty, why } = self;
-        write!(f, "the constant {constant:?} of trait {trait_:?} at `Self` = {self_ty:?} selects no definition (rule: the impl the solver selects for the trait reference, or the trait's default where that impl writes none): ")?;
+        write!(f, "the associated item {constant:?} of trait {trait_:?} at `Self` = {self_ty:?} selects no definition (rule: the impl the solver selects for the trait reference, or the trait's default where that impl writes none): ")?;
         match why {
             SelectWhy::NoImpl => write!(f, "no impl of the trait holds for that type"),
             SelectWhy::Solver(e) => write!(f, "{e}"),

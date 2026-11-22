@@ -76,6 +76,8 @@ pub(crate) fn held_coroutines<'a>(
             | PNode::ExTrait(..)
             | PNode::ExProj { .. }
             | PNode::ExAuto(_)
+            // An extern type: no fields, and never held by value (it has no size).
+            | PNode::Foreign(_)
             | PNode::ConstValue { .. } => {}
             PNode::Tuple(l) => todo.extend_from_slice(ground.view().list(l).map_err(past)?),
             // The element; the length is a constant.

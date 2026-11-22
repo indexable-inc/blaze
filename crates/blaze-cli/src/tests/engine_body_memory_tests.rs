@@ -663,12 +663,17 @@ fn the_read_grains_are_a_stored_row_and_an_edit_reads_no_crate_facts() {
         let (ids, lines, checked) = said(&io, false);
         crate::engine_bodies::PLANT_GRAINS_REBUILT.with(|plant| plant.set(false));
         let text = profile(&io);
-        (cold, grains_line(&text), pages_read(&text), ids, lines, checked.status.0, body_rows(&io))
+        // Which rows the edit asked of the stored answer, by kind (rule 17: the profile names
+        // what grows before anyone guesses): the page assert below quotes it at each `n`.
+        let asked = text.lines().find(|line| line.starts_with("stored answer rows asked ")).map_or_else(|| std::string::String::from("(no `stored answer rows asked` line)"), std::string::String::from);
+        (cold, grains_line(&text), pages_read(&text), ids, lines, checked.status.0, body_rows(&io), asked)
     };
     let mut pages = std::vec::Vec::new();
+    let mut asked_at = std::vec::Vec::new();
     for n in [2usize, 8] {
-        let (cold, edit, kept_pages, ids, lines, status, rows) = run(n, false);
-        let (_, control, control_pages, control_ids, control_lines, control_status, control_rows) = run(n, true);
+        let (cold, edit, kept_pages, ids, lines, status, rows, asked) = run(n, false);
+        let (_, control, control_pages, control_ids, control_lines, control_status, control_rows, _) = run(n, true);
+        asked_at.push((n, asked));
         assert!(!cold.3 && cold.1 == cold.0, "cold, no record is kept: every crate's facts are read ({cold:?})");
         assert!(edit.3, "the edit takes the grains from the record ({edit:?})");
         assert_eq!((edit.1, edit.2), (0, 0), "the edit entered no names or tables task: no crate's facts are read ({edit:?})");
@@ -676,7 +681,7 @@ fn the_read_grains_are_a_stored_row_and_an_edit_reads_no_crate_facts() {
         assert_eq!((&ids, &lines, status, &rows), (&control_ids, &control_lines, control_status, &control_rows), "a record taken and the list read whole answer alike at {n}");
         pages.push((kept_pages.0 + kept_pages.1, control_pages.0 + control_pages.1));
     }
-    assert_eq!(pages[0].0, pages[1].0, "taken from the record, the edit's page reads do not grow with the crates: {pages:?}");
+    assert_eq!(pages[0].0, pages[1].0, "taken from the record, the edit's page reads do not grow with the crates: {pages:?}; the edit's rows asked: {asked_at:?}");
     assert!(pages[1].1 > pages[0].1, "the planted control's page reads grow with the crates: {pages:?}");
     println!("READ GRAINS: edit pages {} at 2, {} at 8 dependents; rebuilt {}, {}", pages[0].0, pages[1].0, pages[0].1, pages[1].1);
 }

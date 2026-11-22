@@ -674,3 +674,301 @@ pub extern \"C-unwind\" fn main() -> i32 {
         40,
     );
 }
+
+// (e) A fn item held by an instance's ARGUMENTS whose naming body is FOUND by its record.
+
+/// `generic`'s BodyCheck key moved (its text edited, as tests/d106_records.rs `Edited` moves
+/// one), every other item's [`EveryItem`]'s: a second walk finds `main`'s record and makes only
+/// `generic`'s instance, in a fresh process that checks no body naming the fn item.
+struct Rekeyed(ItemKey);
+
+impl BodyIds for Rekeyed {
+    fn body_check(&self, item: ItemKey) -> Option<BodyId<'_>> {
+        if item != self.0 {
+            let every: &'static EveryItem = &EveryItem;
+            return every.body_check(item);
+        }
+        Some(BodyId { key: Hasher::new("d106 callables every item").part(&item.0.to_le_bytes()[..]).part(b"edited").finish(), reads: &READS })
+    }
+
+    fn today(&self, fact: &[u8; 32]) -> Option<[u8; 32]> {
+        EveryItem.today(fact)
+    }
+
+    fn crate_fact(&self, item: ItemKey) -> Option<Read> {
+        EveryItem.crate_fact(item)
+    }
+}
+
+/// The stop's shape (tempo's tests t1530, 36 of them: "fn item ..: the build's `Adts` gave no
+/// ABI for it" at `Result::map` with `NonZero::<u64>::new`, `Option::map` with `Into::into`,
+/// fastrand's `try_with_rng(Rng::fork)`, a fn handed to `OnceLock::get_or_init`): the body that
+/// passes a fn item as a value was found by its record, so no check of this process made the
+/// item's head, and the build of the generic's instance asks the item's ABI (`Adts::abi`) as
+/// it builds `f(x)` at `F` = the item's type. The Reference, "Function item types": the value
+/// is zero-sized and its type "explicitly identifies the function", so the call is a call of
+/// that fn with its own ABI. The make takes the item's row from its head
+/// (run/make_one.rs `held_owners`, `FrontEnd::head_row`).
+///
+/// The control is the first walk of the same text: `main` made in the same process, its check
+/// made the head, which passed before the fix too. The second walk is the cause: `main`
+/// found, only `generic` made (before the fix, `NoAbi` there). Then run whole to `want`.
+/// Prints "d106 callables <name>: first <counts>; caller found <counts>; status <n>".
+fn row_with_caller_found(name: &str, tail: &str, generic: &str, want: u8) {
+    let text = program(tail);
+    let f = fixture(&text);
+    let main = fn_named(&f, "main");
+    let callee = fn_named(&f, generic);
+    let mut store = MemoryStore::new_in(alloc());
+    let (_, first) = walk_records(main, &EveryItem, &mut store, &builder(), &producer(), &mut Maker::new(reader(&f), Some(main), &builder(), alloc()), alloc())
+        .unwrap_or_else(|e| panic!("{name}: the control (main checked in this process) refused: {e}"));
+    let (_, second) = walk_records(main, &Rekeyed(callee), &mut store, &builder(), &producer(), &mut Maker::new(reader(&f), Some(main), &builder(), alloc()), alloc())
+        .unwrap_or_else(|e| panic!("{name}: the walk with main's record found and `{generic}` made refused: {e}"));
+    assert_eq!(second.made, 1, "{name}: only `{generic}`'s instance is made the second time: {second}");
+    assert!(second.found >= 1, "{name}: main's record is found the second time: {second}");
+    let status = run_whole(&text).unwrap_or_else(|e| panic!("{name}: the whole run refused: {e}"));
+    println!("d106 callables {name}: first {first}; caller found {second}; status {status}");
+    assert_eq!(status, want, "{name}: the status computed through the call");
+}
+
+/// A free fn: `double` passed to `apply_mut`, made with `main` found: `double(21)` = 42.
+#[test]
+fn a_held_fn_item_made_with_its_caller_found() {
+    row_with_caller_found(
+        "free fn item, caller found",
+        "
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    apply_mut(double, 21) as i32
+}
+",
+        "apply_mut",
+        42,
+    );
+}
+
+/// An inherent impl's fn (fastrand's `try_with_rng(Rng::fork)`, `NonZero::new`): `S::twice`
+/// passed to `apply_fn`: `twice(20)` = 40.
+#[test]
+fn a_held_impl_fn_item_made_with_its_caller_found() {
+    row_with_caller_found(
+        "impl fn item, caller found",
+        "
+struct S;
+
+impl S {
+    fn twice(x: u8) -> u8 {
+        x * 2
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    apply_fn(S::twice, 20) as i32
+}
+",
+        "apply_fn",
+        40,
+    );
+}
+
+/// A trait's fn by its trait's path (`Option::map(Into::into)`): `<u8 as Triple>::triple`
+/// passed to `apply_once`, resolved to the impl's at the build: `triple(13)` = 39.
+#[test]
+fn a_held_trait_fn_item_made_with_its_caller_found() {
+    row_with_caller_found(
+        "trait fn item, caller found",
+        "
+trait Triple {
+    fn triple(x: u8) -> u8;
+}
+
+impl Triple for u8 {
+    fn triple(x: u8) -> u8 {
+        x * 3
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    apply_once(<u8 as Triple>::triple, 13) as i32
+}
+",
+        "apply_once",
+        39,
+    );
+}
+
+/// A generic fn item (`NonZero::<u64>::new`'s `<u64>`): `id::<u8>` passed to `apply_fn`:
+/// `id(37)` = 37.
+#[test]
+fn a_held_generic_fn_item_made_with_its_caller_found() {
+    row_with_caller_found(
+        "generic fn item, caller found",
+        "
+fn id<T>(x: T) -> T {
+    x
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    apply_fn(id::<u8>, 37) as i32
+}
+",
+        "apply_fn",
+        37,
+    );
+}
+
+/// A tuple struct's ctor (the Reference: "the constructor of a tuple-like struct" yields a
+/// value of its fn item type too; its ABI is the Rust ABI): `W` passed to `apply_w`, made with
+/// `main` found; its ADT's head is made from the ctor's key (`want_of_key`): `W(42).0` = 42.
+#[test]
+fn a_held_ctor_made_with_its_caller_found() {
+    row_with_caller_found(
+        "tuple struct ctor, caller found",
+        "
+struct W(u8);
+
+fn apply_w<F: FnOnce(u8) -> W>(f: F, x: u8) -> u8 {
+    f(x).0
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    apply_w(W, 42) as i32
+}
+",
+        "apply_w",
+        42,
+    );
+}
+
+// (f) A trait implemented for primitives BY A MACRO, its projection and method asked at an
+// instance's ground arguments (tempo t1530, 13 tests: arbitrary 1.4.2's `int_in_range_impl<T:
+// Int>` at `u64` and `usize`, "the world has no answer to ImplsOf(<trait>, Uint(U64))"; its
+// `impl_int!` writes `impl Int for $ty { type Unsigned = $unsigned_ty; .. }` once per integer,
+// unstructured.rs:865). The Reference, "Macros By Example": a macro invocation in item
+// position expands to items, so each `impl Int for u64` is an impl of the crate as if written
+// there, and `<u64 as Int>::Unsigned` normalizes by it. A LEAD, not a proven cause: the twin
+// writes the same impls by hand, the control calls the macro-made impl with no generic
+// instance; which of the three fails says whether the macro or the instance-time question is
+// the cause.
+
+/// The trait and a generic that normalizes its projection at the instance (`T::Unsigned`).
+const INT_TRAIT: &str = "
+trait Int {
+    type Unsigned;
+    fn to_unsigned(self) -> Self::Unsigned;
+}
+
+fn spread<T: Int>(x: T) -> T::Unsigned {
+    x.to_unsigned()
+}
+";
+
+/// The site's shape: the impls written by `impl_int!`, `spread` at `u64` and `u8`: 40 + 2.
+#[test]
+fn a_macro_made_primitive_impl_at_an_instance() {
+    row(
+        "macro-made primitive impl at an instance",
+        &format!(
+            "{INT_TRAIT}
+macro_rules! impl_int {{
+    ( $( $ty:ty : $unsigned_ty:ty ; )* ) => {{
+        $(
+            impl Int for $ty {{
+                type Unsigned = $unsigned_ty;
+
+                fn to_unsigned(self) -> Self::Unsigned {{
+                    self as $unsigned_ty
+                }}
+            }}
+        )*
+    }}
+}}
+
+impl_int! {{
+    u8: u8;
+    u64: u64;
+}}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    spread(40u64) as i32 + spread(2u8) as i32
+}}
+"
+        ),
+        42,
+    );
+}
+
+/// The twin: the same impls written by hand, `spread` at `u64` and `u8`: 40 + 2.
+#[test]
+fn a_written_primitive_impl_at_an_instance() {
+    row(
+        "written primitive impl at an instance",
+        &format!(
+            "{INT_TRAIT}
+impl Int for u8 {{
+    type Unsigned = u8;
+
+    fn to_unsigned(self) -> Self::Unsigned {{
+        self as u8
+    }}
+}}
+
+impl Int for u64 {{
+    type Unsigned = u64;
+
+    fn to_unsigned(self) -> Self::Unsigned {{
+        self as u64
+    }}
+}}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    spread(40u64) as i32 + spread(2u8) as i32
+}}
+"
+        ),
+        42,
+    );
+}
+
+/// The control: the macro-made impl's fn called by its path, no generic instance asks the
+/// impl: 40 + 2.
+#[test]
+fn a_macro_made_primitive_impl_called_by_path() {
+    row(
+        "macro-made primitive impl by path",
+        &format!(
+            "{INT_TRAIT}
+macro_rules! impl_int {{
+    ( $( $ty:ty : $unsigned_ty:ty ; )* ) => {{
+        $(
+            impl Int for $ty {{
+                type Unsigned = $unsigned_ty;
+
+                fn to_unsigned(self) -> Self::Unsigned {{
+                    self as $unsigned_ty
+                }}
+            }}
+        )*
+    }}
+}}
+
+impl_int! {{
+    u8: u8;
+    u64: u64;
+}}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    <u64 as Int>::to_unsigned(40) as i32 + <u8 as Int>::to_unsigned(2) as i32
+}}
+"
+        ),
+        42,
+    );
+}

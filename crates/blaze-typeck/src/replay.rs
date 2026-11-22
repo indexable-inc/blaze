@@ -235,6 +235,7 @@ mod tests {
             asm_clobbers: &[],
             asm_text: "",
             call_arg_ints: &[],
+            legacy_args: &[],
             unsafe_blocks: &[],
             expr_editions: &[],
             pat_editions: &[],

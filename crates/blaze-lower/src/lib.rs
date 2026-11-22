@@ -465,7 +465,7 @@ pub use blaze_surface::{Edition, Range};
 
 pub use crate::columns::{BodyRange, Columns, Head, LoweredRoot, Open, TextAt, View, head, open};
 pub use crate::driver::{
-    BodyCall, BodyOut, Bound, CallInput, EXPANSION_BUDGET, EXPANSION_DEPTH, Expand, Expansion, Expansions, FileStats, ItemRef, Outcome,
+    BodyCall, BodyOut, Bound, CallInput, EXPANSION_BUDGET, EXPANSION_DEPTH, Expand, Expansion, Expansions, FileStats, InputMarks, ItemRef, Outcome,
     Refusal, Sink, Source, What, lower_file,
 };
 pub use crate::form::*;

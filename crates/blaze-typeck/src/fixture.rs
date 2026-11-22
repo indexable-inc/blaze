@@ -157,6 +157,7 @@ fn shape_of(t: PTys<'_>, p: PTy) -> Option<Shape> {
         PNode::FnDef(k, _) => Shape::FnDef(k),
         PNode::FnPtr(l, _) => Shape::FnPtr(l.len.saturating_sub(1)),
         PNode::Opaque(k, _) => Shape::Opaque(k),
+        PNode::Foreign(k) => Shape::Foreign(k),
         PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => Shape::Closure,
         PNode::Param(_) | PNode::Alias { .. } | PNode::Infer | PNode::Error => return None,
         PNode::ConstValue { .. } | PNode::ConstParam(_) => return None,
@@ -1483,6 +1484,7 @@ impl Bb {
             asm_clobbers: &[],
             asm_text: "",
             call_arg_ints: &self.call_arg_ints,
+            legacy_args: &[],
             unsafe_blocks: &self.unsafe_blocks,
             expr_editions: &self.expr_editions,
             pat_editions: &self.pat_editions,
@@ -1656,6 +1658,7 @@ pub fn show(fx: &Fx, t: PTys<'_>, p: PTy) -> String {
             format!("{}<{}>::{:x} = {}", fx.name_of(trait_), list(args), name.0, show(fx, t, term))
         }
         PNode::ExAuto(k) => String::from(fx.name_of(k)),
+        PNode::Foreign(k) => String::from(fx.name_of(k)),
     }
 }
 

@@ -83,6 +83,9 @@ pub(super) enum NotConstParamTy {
     Closure,
     /// `dyn Trait`.
     TraitObject,
+    /// An extern type (`extern { type T; }`), by value or behind `&`: core gives it no
+    /// `ConstParamTy_` impl.
+    ExternType,
     /// A generic parameter (E0770).
     Parameter,
     /// `<T as Tr>::X` or an opaque type: the type is not known at the head.
@@ -107,6 +110,7 @@ impl NotConstParamTy {
             NotConstParamTy::Never => "a const parameter of type `!` (E0741: no `ConstParamTy_` impl)",
             NotConstParamTy::Closure => "a const parameter of a closure or async block type (E0741: no `ConstParamTy_` impl)",
             NotConstParamTy::TraitObject => "a const parameter of a trait object type (E0741: no `ConstParamTy_` impl)",
+            NotConstParamTy::ExternType => "a const parameter of an extern type (E0741: no `ConstParamTy_` impl)",
             NotConstParamTy::Parameter => "a const parameter whose type names a generic parameter (E0770)",
             NotConstParamTy::Projection => "a const parameter whose type is a projection or an opaque type",
             NotConstParamTy::PatternType => "a const parameter of a pattern type",
@@ -173,6 +177,7 @@ pub(super) fn admits(tys: &PortableTys<'_>, t: PTy, alloc: Alloc<'_>) -> Result<
             PNode::Never => return Err(NotConstParamTy::Never),
             PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => return Err(NotConstParamTy::Closure),
             PNode::Dynamic(_) => return Err(NotConstParamTy::TraitObject),
+            PNode::Foreign(_) => return Err(NotConstParamTy::ExternType),
             PNode::Param(_) | PNode::ConstParam(_) => return Err(NotConstParamTy::Parameter),
             PNode::Alias { .. } | PNode::Opaque(..) => return Err(NotConstParamTy::Projection),
             PNode::Pat(..) => return Err(NotConstParamTy::PatternType),

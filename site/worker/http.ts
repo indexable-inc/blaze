@@ -11,6 +11,8 @@ export function plain(body: string, status: number, headers: HeadersInit = {}): 
 
 /** The code graph page (site/graph/), under the base: it compiles its layout simulation's wasm. */
 const GRAPH = '/graph';
+/** The live explore page (site/explore/), under the base: streams live runs from the local viewer. */
+const EXPLORE = '/explore';
 
 /**
  * The build of the client scripts and styles the site's pages run with (gen/build.ts). Sent with every page as
@@ -24,7 +26,7 @@ export const ASSETS = buildJson.assets;
 export function assetHeaders(res: Response, path = ''): Response {
 	const out = new Response(res.body, res);
 	out.headers.set(ASSETS_HEADER, ASSETS);
-	out.headers.set('content-security-policy', csp({ wasm: path === GRAPH }));
+	out.headers.set('content-security-policy', csp({ wasm: path === GRAPH, localViewer: path === EXPLORE }));
 	out.headers.set('x-content-type-options', 'nosniff');
 	out.headers.set('referrer-policy', 'strict-origin-when-cross-origin');
 	return out;

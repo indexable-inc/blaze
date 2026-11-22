@@ -180,7 +180,10 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// `impl_header_regions`, and those walks are given its trait column); a 31 record of such an
 /// impl left its regions refused (`NotLaid/ImplTraitLifetimes/..`). Same format, new content
 /// for the same key (rule 21).
-pub const VERSION: u32 = 32;
+/// 33: the term tag 26 (`T_FOREIGN`, an extern type `extern { type T; }` by its item) is new:
+/// heads.rs `alias` files a type with no `= ..` as one (core's `Code`, the type of
+/// `FnPtr::as_ptr`'s `NonNull<Code>`), where a 32 record refused it.
+pub const VERSION: u32 = 33;
 /// The digest domains: the record's out digest, a fn text's check, the regions digest.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -227,6 +230,7 @@ const T_DYNAMIC: u8 = 22;
 const T_EX_TRAIT: u8 = 23;
 const T_EX_PROJ: u8 = 24;
 const T_EX_AUTO: u8 = 25;
+const T_FOREIGN: u8 = 26;
 
 /// Where to read an opaque's bounds even when an unrelated head first exposes its type.
 /// A trait method's checker key is `owner`; its bounds are in its trait's `Members` cell.
@@ -1824,7 +1828,8 @@ impl Out<'_, '_, '_> {
             | PNode::Param(_)
             | PNode::Error
             | PNode::ConstParam(_)
-            | PNode::ExAuto(_) => {}
+            | PNode::ExAuto(_)
+            | PNode::Foreign(_) => {}
             PNode::Ref(_, t) | PNode::Ptr(_, t) | PNode::Slice(t) | PNode::ConstValue { ty: t, .. } => self.kids.push(t),
             PNode::Array(e, len) => {
                 self.kids.push(e);
@@ -2008,6 +2013,10 @@ impl Out<'_, '_, '_> {
             }
             PNode::ExAuto(k) => {
                 self.t8(T_EX_AUTO);
+                self.tkey(k);
+            }
+            PNode::Foreign(k) => {
+                self.t8(T_FOREIGN);
                 self.tkey(k);
             }
             PNode::Infer => return Err(E::Unencoded { what: "an inference hole `_` (a body's type, never a head's)" }),
@@ -2453,6 +2462,7 @@ impl<'r> In<'r, '_, '_> {
                 PNode::ExProj { trait_, name, args, term: self.ty(W)? }
             }
             T_EX_AUTO => PNode::ExAuto(self.key("a trait object's auto trait")?),
+            T_FOREIGN => PNode::Foreign(self.key("an extern type")?),
             byte => return Err(E::Byte { what: "a term's tag", byte }),
         };
         self.intern(n)

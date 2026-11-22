@@ -26,11 +26,18 @@
 //! Not yet, each refused by name ([`CTaskWhy`]):
 //! - a crate whose files can change (a workspace member, a path dependency): it has no pinned
 //!   key (c_tasks_built.rs), and its package would be the checkout's folder, not a pack;
-//! - a request that names a `links` dependency's tree (`/deps/<links>/..`) or `OUT_DIR`: only
-//!   the package and the script's own `OUT_DIR` are laid (c_tasks.rs `GuestRoots::root_of`
-//!   refuses a `/deps` path as a host path, naming the request and the argument);
-//! - process-tree requests (tikv-jemalloc-sys's `sh configure`, `make`): native_c_tasks.rs
-//!   `TasksError::Trees`.
+//! - a request that names a `links` dependency that is a workspace member (its `/deps/<links>`
+//!   tree is the checkout's folder, not a pack).
+//!
+//! A `links` dependency's trees a request names (c_tasks.rs `dep_roots`: librocksdb-sys reads
+//! lz4-sys's and zstd-sys's) are laid read-only beside the package: a producer's `OUT_DIR` from
+//! its script record as the reader's script saw it (`<work>/dep/<key>`), its served tree
+//! (`/deps/<links>`) from its pack; each joins the built key by its digest ([`Producers`]).
+//!
+//! Process-tree requests (tikv-jemalloc-sys's `sh configure`, `make`) run as one task before
+//! the compiles (native_c_tasks.rs `ShelfTree`, blaze-build-script c_tasks_tree.rs): the host
+//! tools the table grants the crate and the OS build join the built key
+//! (`tree_tools_digest`).
 //!
 //! FLOOR (rule 67): a hit costs one hash of the key's inputs and one get; the floor of a miss
 //! is clang's own time on the misses spread over the workers, plus laying the package once.
@@ -39,6 +46,7 @@ use core::fmt;
 
 use blaze_build_script::c_tasks::{self, CStore, CompilerKind, GuestRoots, StoreFailed, Toolchain};
 use blaze_build_script::c_tasks_built::{self, Pinned, Report};
+use blaze_build_script::dep_paths::DEPS_ROOT;
 use blaze_build_script::outputs::OutputsRef;
 use blaze_drive::Key;
 use blaze_ids::{ContentId, Hasher};
@@ -263,6 +271,7 @@ pub(crate) fn built_for<'s, 'm: 's>(
     r: usize,
     package: &'s str,
     script: ScriptIn<'m>,
+    producers: &Producers<'_, 'm>,
     scratch: &'s Frame,
 ) -> Result<(ScriptIn<'s>, Option<Report>), CTaskWhy<'s>> {
     let cx = cx.span("native: a crate's deferred C requests");
@@ -287,7 +296,32 @@ pub(crate) fn built_for<'s, 'm: 's>(
         (setup.compiler, setup.sdk_key)
     };
     let toolchain = Toolchain { kind: CompilerKind::ShelfClang, compiler, sdk: &sdk_key, target: crate::graph::TRIPLE };
-    let key = c_tasks_built::built_key(script.out, &toolchain, Pinned { source: source.0, files }, &demand_text);
+    // A crate with process-tree requests (`sh configure`, `make`): the host tools the table
+    // grants it and the OS build, read and keyed once (native_c_tasks.rs `tree_tools`); their
+    // digest is in the built key, so a changed tool is another built record (rule 21).
+    let has_tree = outputs.c_requests().any(|text| c_tasks::is_tree(text.split('\0').next().unwrap_or("")));
+    let trees = match has_tree {
+        false => None,
+        true => {
+            let shelf = c.setup(scratch)?.setting.shelf.as_str();
+            let tools = native_c_tasks::tree_tools(package, crate::graph::TRIPLE, shelf, alloc)
+                .map_err(|words| CTaskWhy::Setup { words: kept(scratch, format_args!("the C of {package}: its process tree's host tools: {}", words.as_str())) })?;
+            Some(tools)
+        }
+    };
+    let tree_digest = trees.as_ref().map(native_c_tasks::tree_tools_digest);
+    let roots = GuestRoots { package: blaze_expand::seen::PACKAGE_ROOT, out: outputs.out_dir(), builds: GUEST_BUILDS, deps: DEPS_ROOT, sysroot: GUEST_SDK };
+    // Each `links` dependency's tree the requests name (librocksdb-sys: zstd-sys's `OUT_DIR`,
+    // `/deps/zstd`), found and keyed before anything is laid: a hit lays nothing.
+    let named = c_tasks::dep_roots(&outputs, &roots, alloc);
+    let mut graph_links: Option<AVec<'_, (AString<'_>, AString<'_>, AString<'_>)>> = None;
+    let mut deps: AVec<'_, DepTree<'m>> = Vec::with_capacity_in(named.len(), alloc);
+    for guest in named.iter().copied() {
+        deps.push(dep_tree(list, producers, guest, &mut graph_links, alloc, scratch)?);
+    }
+    let mut dep_keys: AVec<'_, (&str, [u8; 32])> = Vec::with_capacity_in(deps.len(), alloc);
+    dep_keys.extend(deps.iter().map(|dep| (dep.guest, dep.digest)));
+    let key = c_tasks_built::built_key(script.out, &toolchain, Pinned { source: source.0, files }, &demand_text, &dep_keys, tree_digest);
 
     // One get: the built record, read in place.
     let held = store.get(&cx, Key(key)).map_err(|e| CTaskWhy::Built { words: kept(scratch, format_args!("the store: {e}")) })?;
@@ -301,10 +335,24 @@ pub(crate) fn built_for<'s, 'm: 's>(
 
     // A miss: the package laid, the tasks run, the built record put.
     let (package_dir, package_digest) = lay_package(&cx, c, list, r, files, scratch)?;
+    let mut sources: AVec<'_, Laid<'_>> = Vec::with_capacity_in(1 + deps.len(), alloc);
+    sources.push(Laid { guest: blaze_expand::seen::PACKAGE_ROOT, host: package_dir, digest: package_digest, name: "the package" });
+    // Each read-only: granted read, never written (native_c.rs `Laid`).
+    for dep in deps.iter() {
+        let (host, name) = match dep.source {
+            DepSource::Out { script } => (lay_dep_out(c, script, dep.digest, scratch)?, "a `links` dependency's OUT_DIR"),
+            DepSource::Tree { r: producer, files } => {
+                let (host, digest) = lay_package(&cx, c, list, producer, files, scratch)?;
+                if digest != dep.digest {
+                    return Err(CTaskWhy::Lay { words: kept(scratch, format_args!("{}: its package laid under another digest than it was keyed by", dep.guest)) });
+                }
+                (host, "a `links` dependency's package")
+            }
+        };
+        sources.push(Laid { guest: dep.guest, host, digest: dep.digest, name });
+    }
     let setup = c.setup.as_ref().expect("native_runner_c: set up above");
     let setup_shelf = setup.setting.shelf.as_str();
-    let roots = GuestRoots { package: blaze_expand::seen::PACKAGE_ROOT, out: outputs.out_dir(), builds: GUEST_BUILDS, sysroot: GUEST_SDK };
-    let sources = [Laid { guest: blaze_expand::seen::PACKAGE_ROOT, host: package_dir, digest: package_digest, name: "the package" }];
     let setting = CTasksSetting {
         clang: setup.clang.as_str(),
         shelf: Laid { guest: GUEST_SHELF, host: setup_shelf, digest: setup.compiler, name: "the pinned clang's shelf" },
@@ -316,7 +364,8 @@ pub(crate) fn built_for<'s, 'm: 's>(
         heap: c.heap,
     };
     let mut on = OnCStore { store, cx: &cx, failed: None };
-    let ran_tasks = native_c_tasks::run_tasks(&setting, package, &outputs, &sources, roots, &demand_text, &toolchain, &mut on, alloc);
+    let trees = trees.unwrap_or(native_c_tasks::TreeTools { tools: &[], keys: &[], os_build: "" });
+    let ran_tasks = native_c_tasks::run_tasks(&setting, package, &outputs, &sources, roots, &demand_text, &toolchain, &trees, &mut on, alloc);
     let run = match ran_tasks {
         Ok(run) => run,
         Err(error) => {
@@ -328,7 +377,7 @@ pub(crate) fn built_for<'s, 'm: 's>(
             });
         }
     };
-    let built = c_tasks::built(&outputs, &run.made, alloc).map_err(|e| CTaskWhy::Built { words: kept(scratch, format_args!("its archives as stored files: {e:?}")) })?;
+    let built = c_tasks::built(&outputs, &run.made, &run.tree, alloc).map_err(|e| CTaskWhy::Built { words: kept(scratch, format_args!("its archives as stored files: {e:?}")) })?;
     // The built record: the magic, then a `Script` payload (how it ran, the outputs).
     let mut body: AVec<'_, u8> = Vec::new_in(alloc);
     body.push(ran as u8);
@@ -342,6 +391,139 @@ pub(crate) fn built_for<'s, 'm: 's>(
     Ok((ScriptIn { name: script.name, out: key, payload }, Some(run.report)))
 }
 
+/// What the image holds for its readers' `links` trees (engine_native.rs `image_for`): every
+/// crate's script record as it ran (the deferred one when its C was deferred: what a reader's
+/// script saw), and the unit graph record (graph_payload.rs `Sections::graph`), whose units name
+/// each package's `links`; it is decoded only when a reader names `/deps/<links>`.
+pub(crate) struct Producers<'p, 'm> {
+    pub(crate) scripts: &'p [(usize, ScriptIn<'m>)],
+    pub(crate) graph: &'p [u8],
+}
+
+/// One `links` dependency's tree a reader's requests name: its guest spelling, what names it
+/// in the built key, and where its files come from.
+struct DepTree<'m> {
+    guest: &'m str,
+    digest: [u8; 32],
+    source: DepSource<'m>,
+}
+
+#[derive(Clone, Copy)]
+enum DepSource<'m> {
+    /// A producer's `OUT_DIR` (`<builds>/<name>-<config>/out`): its script record's files, the
+    /// record by its key.
+    Out { script: ScriptIn<'m> },
+    /// The tree a producer was served (`/deps/<links>`): crate `r`'s package, by its files.
+    Tree { r: usize, files: [u8; 32] },
+}
+
+/// The producer of `guest` (c_tasks.rs `dep_roots`), keyed: an `OUT_DIR` by the script record
+/// whose `OUT_DIR` it is (one per package and config), a `/deps/<links>` tree by the package
+/// whose `links` it is (one per graph, the cargo book's "links"). None, or a producer whose
+/// files can change, is refused naming the spelling (rule 3); nothing is guessed.
+fn dep_tree<'m, 's, 'a>(
+    list: &CrateList<'_>,
+    producers: &Producers<'_, 'm>,
+    guest: &'m str,
+    graph_links: &mut Option<AVec<'a, (AString<'a>, AString<'a>, AString<'a>)>>,
+    alloc: Alloc<'a>,
+    scratch: &'s Frame,
+) -> Result<DepTree<'m>, CTaskWhy<'s>> {
+    let lay = |what: fmt::Arguments<'_>| CTaskWhy::Lay { words: kept(scratch, what) };
+    let Some(links) = guest.strip_prefix(DEPS_ROOT).and_then(|rest| rest.strip_prefix('/')) else {
+        let found = producers.scripts.iter().find(|(_, script)| {
+            crate::scripts::payload_parts(script.payload).and_then(|(_, record)| OutputsRef::open(record).ok()).is_some_and(|opened| opened.out_dir() == guest)
+        });
+        let Some((_, script)) = found else {
+            return Err(lay(format_args!("a request names `{guest}`, the OUT_DIR of no build script this program links")));
+        };
+        return Ok(DepTree { guest, digest: script.out.0, source: DepSource::Out { script: *script } });
+    };
+    if graph_links.is_none() {
+        let decoded = blaze_unit_graph::record::decode(producers.graph, alloc).map_err(|why| lay(format_args!("the unit graph, for `{guest}`: {why:?}")))?;
+        let mut rows: AVec<'a, (AString<'a>, AString<'a>, AString<'a>)> = Vec::new_in(alloc);
+        for unit in decoded.graph.units.iter() {
+            if let Some(of) = unit.links.as_ref() {
+                rows.push((String::from_str_in(of.as_str(), alloc), String::from_str_in(unit.name.as_str(), alloc), String::from_str_in(unit.version.as_str(), alloc)));
+            }
+        }
+        *graph_links = Some(rows);
+    }
+    let rows = graph_links.as_ref().map_or(&[][..], |rows| rows.as_slice());
+    let Some((_, name, version)) = rows.iter().find(|(of, _, _)| of.as_str() == links) else {
+        return Err(lay(format_args!("a request names `{guest}`, and no package of the graph has `links = \"{links}\"`")));
+    };
+    let fetched = (0..list.len()).find_map(|at| {
+        if list.package(at) != name.as_str() || list.version(at) != version.as_str() {
+            return None;
+        }
+        match <CrateList<'_> as CrateTable<'_>>::place(list, at) {
+            Place::Fetched { files, .. } => Some((at, files)),
+            _ => None,
+        }
+    });
+    let Some((at, files)) = fetched else {
+        return Err(lay(format_args!(
+            "a request names `{guest}`, and `{} {}` (`links = \"{links}\"`) is no fetched package of this program: a workspace member's tree is not laid for a C task yet",
+            name.as_str(),
+            version.as_str()
+        )));
+    };
+    Ok(DepTree { guest, digest: package_digest(list, at, files).0, source: DepSource::Tree { r: at, files } })
+}
+
+/// A producer's `OUT_DIR` laid read-only from its script record (`<work>/dep/<key>`, made once:
+/// written beside and renamed into place), its real path.
+fn lay_dep_out<'s>(c: &CTasks<'_>, script: ScriptIn<'_>, key: [u8; 32], scratch: &'s Frame) -> Result<&'s str, CTaskWhy<'s>> {
+    let lay = |what: fmt::Arguments<'_>| CTaskWhy::Lay { words: kept(scratch, what) };
+    let hex = crate::fetch::key_hex(&ContentId(key));
+    let hex = core::str::from_utf8(&hex).map_err(|_| lay(format_args!("a digest's hex is not text")))?;
+    let setup = c.setup.as_ref().expect("native_runner_c: set up before a dependency is laid");
+    let folder = bstd::mem::format_in!(scratch, "{}/dep/{hex}", setup.setting.work.as_str());
+    let folder: &'s str = crate::work::held_str(folder.as_str(), scratch);
+    if !std::fs::metadata(folder).is_ok_and(|m| m.is_dir()) {
+        let (opened, area) = crate::native_image::script_outputs(script.payload, c.home).map_err(|why| lay(format_args!("a `links` dependency's record: {why:?}")))?;
+        let opened = opened.with_area(&area);
+        let part = bstd::mem::format_in!(scratch, "{folder}.part-{}", std::process::id());
+        match std::fs::remove_dir_all(part.as_str()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(lay(format_args!("{}: {error}", part.as_str()))),
+        }
+        std::fs::create_dir_all(part.as_str()).map_err(|e| lay(format_args!("{}: {e}", part.as_str())))?;
+        for (name, file) in opened.all_files() {
+            if name.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
+                return Err(lay(format_args!("a `links` dependency's record names `{name}`, which is not a path under OUT_DIR")));
+            }
+            let bytes = opened.bytes_of(file).map_err(|e| lay(format_args!("{}/{name}: {e}", opened.out_dir())))?;
+            let path = bstd::mem::format_in!(scratch, "{}/{name}", part.as_str());
+            if let Some((parent, _)) = path.as_str().rsplit_once('/') {
+                std::fs::create_dir_all(parent).map_err(|e| lay(format_args!("{parent}: {e}")))?;
+            }
+            std::fs::write(path.as_str(), bytes).map_err(|e| lay(format_args!("{}: {e}", path.as_str())))?;
+        }
+        match std::fs::rename(part.as_str(), folder) {
+            Ok(()) => {}
+            Err(_) if std::fs::metadata(folder).is_ok_and(|m| m.is_dir()) => {
+                std::fs::remove_dir_all(part.as_str()).map_err(|e| lay(format_args!("{}: {e}", part.as_str())))?;
+            }
+            Err(error) => return Err(lay(format_args!("{folder}: {error}"))),
+        }
+    }
+    let real = std::fs::canonicalize(folder).map_err(|e| lay(format_args!("{folder}: {e}")))?;
+    let real = real.to_str().ok_or_else(|| lay(format_args!("{folder}: its real path is not UTF-8")))?;
+    Ok(crate::work::held_str(real, scratch))
+}
+
+/// What names crate `r`'s laid package: the pack's files and the package's folder in it.
+fn package_digest(list: &CrateList<'_>, r: usize, files: [u8; 32]) -> ContentId {
+    let shown = list.shown_from(r);
+    let dir = shown.strip_prefix('/').and_then(|rest| rest.split_once('/')).map_or("", |(_, dir)| dir.trim_end_matches('/'));
+    let mut digest = Hasher::new("blaze-cli c tasks laid package 1");
+    digest.update(&files).update(&(dir.len() as u64).to_le_bytes()).update(dir.as_bytes());
+    digest.finish()
+}
+
 /// Crate `r`'s package laid from its pack under the work folder (made once: written beside and
 /// renamed into place, so a folder there is whole), and its digest (the pack's files and the
 /// package's folder in it).
@@ -353,9 +535,7 @@ fn lay_package<'s>(cx: &Cx, c: &mut CTasks<'_>, list: &CrateList<'_>, r: usize, 
     // The package's folder in its pack: `/<k>/<dir>/` (a git commit's), `/<k>/` (a crate's).
     let shown = list.shown_from(r);
     let dir = shown.strip_prefix('/').and_then(|rest| rest.split_once('/')).map_or("", |(_, dir)| dir.trim_end_matches('/'));
-    let mut digest = Hasher::new("blaze-cli c tasks laid package 1");
-    digest.update(&files).update(&(dir.len() as u64).to_le_bytes()).update(dir.as_bytes());
-    let digest = digest.finish();
+    let digest = package_digest(list, r, files);
     let hex = crate::fetch::key_hex(&digest);
     let hex = core::str::from_utf8(&hex).map_err(|_| lay(format_args!("a digest's hex is not text")))?;
     let setup = c.setup.as_ref().expect("native_runner_c: set up before a package is laid");

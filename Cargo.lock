@@ -1282,6 +1282,8 @@ dependencies = [
 name = "blaze-launcher"
 version = "0.0.0"
 dependencies = [
+ "blaze-blake3",
+ "blaze-code",
  "blaze-comptime",
  "blaze-comptime-sys",
  "blaze-core",

@@ -423,9 +423,17 @@ impl ScriptRuntime {
 /// its files (blaze-build-script outputs.rs, THE C INPUTS): a state's file whose bytes are the
 /// record's own file of that name is [`Snap::Final`], any other held once by digest.
 pub(crate) fn c_inputs<'a>(sandbox: &ScriptSandbox, outputs: &mut Outputs<'a>, alloc: Alloc<'a>) {
-    use blaze_build_script::outputs::{CRequest, CState, Snap, snap_digest};
+    use blaze_build_script::outputs::{CRequest, CState, CTree, Snap, snap_digest};
     for (argv, state) in &sandbox.c_requests {
         outputs.c_requests.push(CRequest { argv: blaze_own::String::from_str_in(argv, alloc), state: *state });
+    }
+    // Each process tree's folder and environment, by ascending request (outputs.rs `CTree`).
+    for (request, cwd, env) in &sandbox.c_trees {
+        let mut owned = blaze_own::Vec::with_capacity_in(env.len(), alloc);
+        for (name, value) in env {
+            owned.push((blaze_own::String::from_str_in(name, alloc), blaze_own::String::from_str_in(value, alloc)));
+        }
+        outputs.c_trees.push(CTree { request: *request, cwd: blaze_own::String::from_str_in(cwd, alloc), env: owned });
     }
     // Each final file's digest, taken once and only for a name a state holds.
     let mut finals: std::collections::BTreeMap<&str, Option<[u8; 32]>> = std::collections::BTreeMap::new();

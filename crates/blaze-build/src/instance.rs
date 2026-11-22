@@ -259,6 +259,9 @@ fn node_head(node: PNode) -> Result<(u8, u128, Option<u32>), BuildError> {
         PNode::ExTrait(key, _) => (17, key.0, None),
         PNode::ExProj { trait_, name, .. } => (18, (u128::from(name.0) << 64) | u128::from(trait_.0), None),
         PNode::ExAuto(key) => (19, key.0, None),
+        // An extern type, by its item (no children). A tag no earlier node had, so no key
+        // made before it changes.
+        PNode::Foreign(key) => (24, key.0, None),
         // A closure (typeck.md, "A closure's identity"): its owner and its ORDINAL among the
         // owner body's closures (never a body-local expression id); its children the owner's
         // arguments. Its signature, kind and environment are facts of that identity.
@@ -520,6 +523,7 @@ fn map_tree(
                 PNode::ExProj { trait_, name, args: map_list(args, &mut list)?, term: mapped[term.0 as usize] }
             }
             PNode::ExAuto(key) => PNode::ExAuto(key),
+            PNode::Foreign(key) => PNode::Foreign(key),
             PNode::Infer | PNode::Error => return Err(BuildError::Malformed { what: "a hole or error type after a clean check" }),
         };
         mapped[at] = ground.intern(node).map_err(|_| BuildError::Malformed { what: "the ground table is full" })?;
@@ -556,6 +560,7 @@ pub fn each_child(from: PTys<'_>, node: PNode, out: &mut Vec<PTy, Alloc<'_>>) ->
             out.push(term);
         }
         PNode::ExAuto(_)
+        | PNode::Foreign(_)
         | PNode::Bool
         | PNode::Char
         | PNode::Int(_)

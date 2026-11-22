@@ -23,7 +23,8 @@ use crate::code::{
 /// 2: the root gains `ty_base` and `list_base` after `reserved`, and the overlay's two slices
 /// (`tys`, `ty_lists`) after `known`; the statement tags 24 (`SET_DISCRIMINANT`) and 25
 /// (`DEINIT`) are new.
-pub const VERSION: u32 = 2;
+/// 3: the type tag 31 (`FOREIGN`, an extern type: `PNode::Foreign`) is new.
+pub const VERSION: u32 = 3;
 
 blaze_format_core::record! {
     /// A body record's root: the version, the overlay's bases, then one slice per table of

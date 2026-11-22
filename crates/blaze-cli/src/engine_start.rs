@@ -355,6 +355,24 @@ pub(crate) fn run_program(
     }
 }
 
+/// The crates a test program may link, its own crate first (engine_native.rs `image_for`'s
+/// `closure`): every crate of the answer's crate list. The image walks the test unit's own
+/// dependencies from it (native_image.rs `closure`, link order its own), so a crate the test
+/// does not reach is never read; the run's closure (run_names.rs `closure_in`) is a body walk's,
+/// which a test program has none of before its tests start. COST: O(crates) keys, per suite.
+fn suite_closure<'a>(list: &blaze_world::crate_list::CrateList<'_>, test: usize, alloc: Alloc<'a>) -> blaze_own::AVec<'a, crate::engine_seeds::CrateAt> {
+    use blaze_world::crate_list::CrateGraph as _;
+    // Only `key` is read (`image_for` checks the walk's crates against the keys handed).
+    let at_of = |at: usize| {
+        let key = list.key(at);
+        crate::engine_seeds::CrateAt { prefix: key.prefix(), key, names_at: None, member: list.member(at), closed: !list.member(at) }
+    };
+    let mut closure: blaze_own::AVec<'a, crate::engine_seeds::CrateAt> = blaze_own::Vec::with_capacity_in(list.len(), alloc);
+    closure.push(at_of(test));
+    closure.extend((0..list.len()).filter(|at| *at != test).map(at_of));
+    closure
+}
+
 /// `blaze test` over the check's answer: the selected packages' suites from the answer's rows,
 /// the body ids, then each suite under the lazy parent (test_drive.rs `run_suites`). A test
 /// that calls a body whose check does not run (D151) is NOT RUN naming that body; the others run.
@@ -434,6 +452,26 @@ pub(crate) fn run_tests(
         let began = phases.now();
         let ids = body_ids(cx, &mut standing, list, &asked, alloc)?;
         let ids_ns = phases.since(began);
+        // Each suite's native image, as `run` has its program's (engine_native.rs `image_for`):
+        // the C of every crate its test program links (a build script's deferred C built by
+        // native_runner_c.rs), made once and found by its key after, told to every test's start
+        // before any of its code (test_drive.rs `Launched`). One that cannot be had leaves that
+        // suite's tests NOT RUN naming why (test_drive.rs `EntryCheck`), the others run.
+        // NOT DONE: a proc-macro crate's tests (the macro side, native_image.rs `linked`) get no
+        // image, as `image_for` links target-side crates only; a C name one calls stays its
+        // test's `dlsym` failure, named by the launcher.
+        let mut images = blaze_own::Vec::with_capacity_in(inventory.suites.len(), frame);
+        for (_, unit) in &inventory.suites {
+            if !crate::native_image::linked(list, unit.at) {
+                images.push(Ok(None));
+                continue;
+            }
+            let closure = suite_closure(list, unit.at, alloc);
+            let image = crate::engine_native::image_for(cx, &mut standing, &closure)
+                .map(|image| image.send)
+                .map_err(|error| crate::work::held_str(bstd::mem::format_in!(frame, "{error}").as_str(), frame));
+            images.push(image);
+        }
         let overflow = program::dev_overflow(cx, root, frame)?;
         let panic = blaze_ladder::panic_strategy::of_profile(blaze_world::panic::TEST_PROFILE);
         // Boxed in the process heap: the error outlives this frame to `main`'s print.
@@ -454,7 +492,7 @@ pub(crate) fn run_tests(
         // Each test unit runs in its package's root, told its package's variables (test_drive.rs
         // `PackageRun`): the checkout's absolute root as the edge resolved it.
         let checkout = standing.place.served.root_text();
-        for (found, unit) in &inventory.suites {
+        for (at, (found, unit)) in inventory.suites.iter().enumerate() {
             let place = crate::test_drive::package_run(checkout, list.env_facts(unit.at), alloc)
                 .map_err(|why| CliError::Start(StartError::TestPlace { shown: std::boxed::Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) }))?;
             let names = run_names::names_of(
@@ -463,7 +501,7 @@ pub(crate) fn run_tests(
             )
             .map_err(CliError::RunNames)?;
             let builder = crate::run_parent::builder_for(unit.edition.name(), overflow, panic, producer, isa).map_err(parent)?;
-            runnable.push(crate::test_drive::Suite { names, builder, unit: *unit, place });
+            runnable.push(crate::test_drive::Suite { names, builder, unit: *unit, place, native: images[at] });
         }
         let ran = crate::test_drive::run_suites(cx, io, &runnable, &ids, config, launch.args, standing.lent, heap.alloc(), watch, frame);
         end_procs(cx, &maker, err, "test")?;

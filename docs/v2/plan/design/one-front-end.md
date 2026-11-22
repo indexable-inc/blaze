@@ -104,7 +104,7 @@ Only the whole path can:
 Only the lazy path can:
 - make a program from names RECORDS without the solve (`from_records`, `NamesSource` over
   `Records`): `blaze run` in its own process;
-- check one body (`check_one`), make a ctor row alone (`ctor_row`), drop a done body (`done`);
+- check one body (`check_one`), make a ctor's or a held fn item's row from its head alone (`head_row`), drop a done body (`done`);
 - evaluate a static on demand (`static_value`), name a member the keys never filed
   (`lang_trait_fn`), name an impl's member by its header (`item_named`), build an intrinsic from
   its fallback body when the walk had not lowered it.

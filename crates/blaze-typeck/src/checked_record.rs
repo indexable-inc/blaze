@@ -22,7 +22,7 @@
 //! Layout, little-endian, nothing of the machine (rule 25):
 //!
 //! ```text
-//! magic "bzchkd05" | u32 column count (28) | u32 rows per column, in [`Col`] order
+//! magic "bzchkd06" | u32 column count (28) | u32 rows per column, in [`Col`] order
 //! | each column's rows, fixed width ([`Col::width`]), unused bytes zero
 //! ```
 //!
@@ -54,7 +54,8 @@ use crate::world::{CtorKind, Def, Needs, Prim, Question, ReadList, Shape};
 /// its places, rules/closure.rs `analyze_closures`), no longer `NeedsCapturePlaces`; and a
 /// borrow of a `repr(packed)` struct's field captures the struct (capture_places.rs
 /// `packed_field`).
-pub const CHECKED_RECORD_MAGIC: [u8; 8] = *b"bzchkd05";
+/// 06: a type node may be an extern type (`PNode::Foreign`, node tag 30).
+pub const CHECKED_RECORD_MAGIC: [u8; 8] = *b"bzchkd06";
 
 /// The record's columns, in the order the header and the body lay them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -572,6 +573,10 @@ fn put_node(p: &mut Put, n: PNode) {
             p.u8(29);
             p.key(k);
         }
+        PNode::Foreign(k) => {
+            p.u8(30);
+            p.key(k);
+        }
     }
 }
 
@@ -660,6 +665,7 @@ fn get_node(g: &mut Get<'_>, b: Bounds) -> Result<PNode, E> {
         27 => PNode::ExTrait(g.key()?, b.list(g)?),
         28 => PNode::ExProj { trait_: g.key()?, name: Name(g.u64()?), args: b.list(g)?, term: b.ty(g, me)? },
         29 => PNode::ExAuto(g.key()?),
+        30 => PNode::Foreign(g.key()?),
         _ => return Err(g.bad(tag)),
     })
 }

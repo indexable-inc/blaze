@@ -31,6 +31,8 @@ enum Broke {
     Wrong,
     Stale,
     Lost,
+    InlinedBypass,
+    StuckDeopt,
 }
 
 /// What the oracle found: the promise, and the machine's account of it.
@@ -47,6 +49,8 @@ impl fmt::Display for Found {
             Broke::Wrong => "wrong",
             Broke::Stale => "stale",
             Broke::Lost => "lost",
+            Broke::InlinedBypass => "inlined-bypass",
+            Broke::StuckDeopt => "stuck-deopt",
         };
         write!(f, "{name}: {}", self.what)
     }
@@ -90,9 +94,11 @@ struct Sim {
     bodyword: Vec<Option<u64>>,
     /// The control thread's stores not yet carried out.
     pending: VecDeque<ObserveWrite>,
-    /// Every body address published for each slot, and the latest.
+    /// Every body address published for each slot, its fast body, its optimized body + inlined
+    /// callees, and the latest expected effective body.
     published: Vec<Vec<u64>>,
-    latest: Vec<Option<u64>>,
+    fast: Vec<Option<u64>>,
+    opt: Vec<Option<(u64, Vec<u32>)>>,
     /// Whether each slot is in an observation window, and its kind.
     observed: Vec<Option<Kind>>,
     threads: [Thread; THREADS],
@@ -110,11 +116,23 @@ impl Sim {
             bodyword: vec![None; SLOTS as usize],
             pending: VecDeque::new(),
             published: vec![Vec::new(); SLOTS as usize],
-            latest: vec![None; SLOTS as usize],
+            fast: vec![None; SLOTS as usize],
+            opt: vec![None; SLOTS as usize],
             observed: vec![None; SLOTS as usize],
             threads: [Thread::Idle; THREADS],
             next_addr: 1000,
         }
+    }
+
+    fn expected_body(&self, slot: usize) -> Option<u64> {
+        let fast = self.fast[slot]?;
+        let Some((opt_addr, ref inlined)) = self.opt[slot] else {
+            return Some(fast);
+        };
+        let any_observed = inlined
+            .iter()
+            .any(|&c| c as usize != slot && self.observed[c as usize].is_some());
+        if any_observed { Some(fast) } else { Some(opt_addr) }
     }
 
     fn queue(&mut self) {
@@ -138,8 +156,29 @@ impl Sim {
         let body = self.next_addr;
         self.next_addr += 1;
         self.published[slot.0 as usize].push(body);
-        self.latest[slot.0 as usize] = Some(body);
+        self.fast[slot.0 as usize] = Some(body);
+        self.opt[slot.0 as usize] = None;
         self.overlay.publish(slot, body, &mut self.out);
+        self.queue();
+    }
+
+    fn publish_optimized(&mut self, slot: Slot, inlined_mask: u8) {
+        if self.fast[slot.0 as usize].is_none() {
+            return;
+        }
+        let body = self.next_addr;
+        self.next_addr += 1;
+        let mut callees = Vec::new();
+        let mut callee_slots = Vec::new();
+        for c in 0..SLOTS {
+            if (inlined_mask & (1 << c)) != 0 && c != slot.0 {
+                callees.push(c);
+                callee_slots.push(Slot(c));
+            }
+        }
+        self.published[slot.0 as usize].push(body);
+        self.opt[slot.0 as usize] = Some((body, callees));
+        self.overlay.publish_optimized(slot, body, &callee_slots, &mut self.out);
         self.queue();
     }
 
@@ -213,18 +252,42 @@ impl Sim {
         }
         for slot in 0..SLOTS {
             let s = slot as usize;
-            let Some(latest) = self.latest[s] else {
+            let Some(expected) = self.expected_body(s) else {
                 continue;
             };
-            // The body word holds the latest published body: a publish wrote it.
-            if self.bodyword[s] != Some(latest) {
+            // Check inlining-deopt invariants specifically before generic staleness so the
+            // oracle distinguishes deopt failures from plain publish staleness.
+            if let Some((opt_addr, ref inlined)) = self.opt[s] {
+                let any_observed = inlined
+                    .iter()
+                    .any(|&c| c as usize != s && self.observed[c as usize].is_some());
+                if any_observed && self.bodyword[s] == Some(opt_addr) {
+                    return Err(found(
+                        Broke::InlinedBypass,
+                        format!(
+                            "slot {slot} stayed on optimized body {opt_addr} while an inlined callee ({inlined:?}) is observed"
+                        ),
+                    ));
+                }
+                if !any_observed && self.bodyword[s] == self.fast[s] && Some(opt_addr) != self.fast[s] {
+                    return Err(found(
+                        Broke::StuckDeopt,
+                        format!(
+                            "slot {slot} stayed on fast body {:?} after all inlined callees returned to plain",
+                            self.fast[s]
+                        ),
+                    ));
+                }
+            }
+            // The body word holds the effective published body: a publish wrote it.
+            if self.bodyword[s] != Some(expected) {
                 return Err(found(
                     Broke::Stale,
-                    format!("slot {slot}'s body word is {:?}, not the latest body {latest}", self.bodyword[s]),
+                    format!("slot {slot}'s body word is {:?}, not the expected body {expected}", self.bodyword[s]),
                 ));
             }
             match self.observed[s] {
-                // An observed, quiescent slot names its stub: every call is counted or marked.
+                // An observed, quiescent slot names its stub: every call is counted, marked or hooked.
                 Some(_) => {
                     if !matches!(self.word[s], Slotword::Stub { .. }) {
                         return Err(found(
@@ -233,12 +296,12 @@ impl Sim {
                         ));
                     }
                 }
-                // A plain, quiescent slot names the latest body outright.
+                // A plain, quiescent slot names the effective body outright.
                 None => {
-                    if self.word[s] != Slotword::Body(latest) {
+                    if self.word[s] != Slotword::Body(expected) {
                         return Err(found(
                             Broke::Stale,
-                            format!("slot {slot} is plain but its word names {:?}, not {latest}", self.word[s]),
+                            format!("slot {slot} is plain but its word names {:?}, not {expected}", self.word[s]),
                         ));
                     }
                 }
@@ -251,6 +314,7 @@ impl Sim {
 #[derive(Clone, Copy, Debug)]
 enum Op {
     Publish(u32),
+    PublishOptimized(u32, u8),
     Observe(u32, Kind),
     Plain(u32),
     Apply,
@@ -267,21 +331,23 @@ fn pick(tape: &Tape, max: usize, label: &'static str) -> usize {
 fn op(tape: &Tape) -> Op {
     let slot = pick(tape, SLOTS as usize - 1, "slot") as u32;
     let thread = pick(tape, THREADS - 1, "thread");
-    match pick(tape, 9, "op") {
+    match pick(tape, 10, "op") {
         0 | 1 => Op::Publish(slot),
-        2 => Op::Observe(
+        2 => Op::PublishOptimized(slot, pick(tape, (1 << SLOTS) - 1, "inlined") as u8),
+        3 => Op::Observe(
             slot,
-            match pick(tape, 2, "kind") {
+            match pick(tape, 3, "kind") {
                 0 => Kind::Count,
                 1 => Kind::Mark,
-                _ => Kind::Hook,
+                2 => Kind::Hook,
+                _ => Kind::Span,
             },
         ),
-        3 => Op::Plain(slot),
-        4 | 5 => Op::Apply,
-        6 => Op::LoadWord(thread, slot),
-        7 => Op::LoadBody(thread),
-        8 => Op::Finish(thread),
+        4 => Op::Plain(slot),
+        5 | 6 => Op::Apply,
+        7 => Op::LoadWord(thread, slot),
+        8 => Op::LoadBody(thread),
+        9 => Op::Finish(thread),
         _ => Op::Settle,
     }
 }
@@ -292,6 +358,10 @@ fn run(ops: &[Op], plant: Plant) -> Result<(), Found> {
         let step = match the_op {
             Op::Publish(slot) => {
                 sim.publish(Slot(slot));
+                Ok(())
+            }
+            Op::PublishOptimized(slot, mask) => {
+                sim.publish_optimized(Slot(slot), mask);
                 Ok(())
             }
             Op::Observe(slot, kind) => {
@@ -368,6 +438,40 @@ fn the_oracle_catches_a_publish_that_skips_the_body_word() {
         Op::Settle,
     ];
     the_oracle_catches(&ops, Plant::PublishSkipsBody, Broke::Stale);
+}
+
+#[test]
+fn the_oracle_catches_skip_deopt_when_an_inlined_callee_is_observed() {
+    let ops = [
+        Op::Publish(0),
+        Op::Publish(1),
+        Op::Settle,
+        // Slot 0 promoted, inlining slot 1 (bit 1 = 0b10).
+        Op::PublishOptimized(0, 0b10),
+        Op::Settle,
+        // Observing slot 1 must retreat slot 0 back to its fast body.
+        Op::Observe(1, Kind::Span),
+        Op::Settle,
+        // Returning slot 1 to plain re-promotes slot 0 back to its optimized body.
+        Op::Plain(1),
+        Op::Settle,
+    ];
+    the_oracle_catches(&ops, Plant::SkipDeoptOnObserve, Broke::InlinedBypass);
+}
+
+#[test]
+fn the_oracle_catches_promoting_while_an_inlined_callee_is_observed() {
+    let ops = [
+        Op::Publish(0),
+        Op::Publish(1),
+        Op::Settle,
+        Op::Observe(1, Kind::Span),
+        Op::Settle,
+        // Slot 0 promoted while slot 1 is already observed: must stay on fast body until plain.
+        Op::PublishOptimized(0, 0b10),
+        Op::Settle,
+    ];
+    the_oracle_catches(&ops, Plant::PublishOptWhileCalleeObserved, Broke::InlinedBypass);
 }
 
 /// A thread that loaded a stub before the body word was set reads it after: with the body word

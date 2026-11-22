@@ -823,6 +823,28 @@ fn a_documented_attributed_nested_functions_call_site_uses_its_own_body() {
         "outer() as i32", "#[inline(always)]\n    fn sample", "tracked(17)", "    /// Helper");
 }
 
+/// A fn declared in a body is printed by the path of the item whose body declares it and its
+/// own name, as rustc spells a local item (`outer::sample`): front2 item_shown.rs
+/// `ItemShown::of_in`. tempo t1530's NOT RUN lines named curve25519-dalek's `fn m` (local to
+/// `<&FieldElement51 as Mul>::mul`) "an item the names source holds no path for". The control
+/// is the cause removed: before the enclosing body is checked the store holds no local row
+/// for it, and the printer has no path (`None`), as every body-local item had before the fix.
+#[test]
+fn a_body_local_fn_is_named_by_its_enclosing_items_path() {
+    let text = format!("{SITE_HEAD}fn outer() -> u8 {{\n    fn sample() -> u8 {{ 1 }}\n    sample()\n}}\n#[unsafe(no_mangle)] pub extern \"C\" fn main() -> i32 {{ outer() as i32 }}");
+    let text: &'static str = Box::leak(text.into_boxed_str());
+    with_programs(text, |names, whole, lazy| {
+        let local = (0..whole.fn_count()).map(|i| whole.function(i)).find(|f| f.path.rsplit("::").next() == Some("sample")).expect("the local fn's row in the whole program");
+        let key = local.key;
+        assert_eq!(lazy.item_named(key), None, "control: no local row before its enclosing body is checked");
+        let (outer, _, _) = names.items(0).find(|&(k, _, _)| names.name_of(k) == Some("outer") && names.kind_of_item(k) == Some(blaze_surface::ItemKind::Function)).expect("outer");
+        lazy.check_one(checker_of(outer)).expect("check the enclosing body").expect("outer has a body");
+        let named = lazy.item_named(key).expect("a body-local fn has a path through its enclosing item");
+        println!("BODY-LOCAL FN NAMED: {named}");
+        assert!(named.ends_with("outer::sample"), "rustc's spelling of a local item: {named}");
+    });
+}
+
 /// The twin: a doc comment and no attribute; the site counts from `fn`.
 #[test]
 fn a_documented_nested_functions_call_site_uses_its_own_body() {

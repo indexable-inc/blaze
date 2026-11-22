@@ -17,7 +17,8 @@
 //!   run: the instance's tabled fn, and each owner its ground ARGUMENTS hold (`held_owners`: a
 //!   closure's or coroutine's owner, whose facts the layouts read, and an opaque type's
 //!   defining fn), and each async block's owner a coroutine demand names. A fn ITEM type in the
-//!   arguments is not checked: this instance reads none of its body.
+//!   arguments is not checked: this instance reads none of its body. Its row is made from its
+//!   head ([`FrontEnd::head_row`]): the build reads its ABI and signature.
 //! - `eval_consts` (every `const` and `static` of the program): not run. The record walk takes a
 //!   front end that evaluates each constant at its arguments (`evaluates_at_args`): the per-item
 //!   pull `const_at::needs_of` + `const_at::pull` for THIS instance. The old front is refused by
@@ -314,7 +315,7 @@ impl MakerState {
         // A ctor has no body to check: its row is made, and its instance built as a fn
         // ([`build_one`]'s ctor arm).
         if program.ctor_of(key).is_some() {
-            let at = program.ctor_row(key)?;
+            let at = program.head_row(key)?;
             self.asked.insert_shift(slot, (key, at));
             return Ok(at);
         }
@@ -403,9 +404,23 @@ pub fn make_instance<P: FrontEnd, T: Typing<P>>(
     // checked body's types. Read from the ground tree, not by the program's rows: a lazy front
     // end has no row for an owner until it is checked (front2/program/lazy `fn_index`), so a
     // filter by row skipped `rand::rngs::thread::rng` for `LocalKey::try_with` at its closure.
-    let owners = held_owners(&*program, state.work.ground.view(), args, tabled, alloc)?;
+    let (owners, items) = held_owners(&*program, state.work.ground.view(), args, tabled, alloc)?;
     for &owner in owners.iter() {
         state.ensure(program, typing, owner, checks)?;
+    }
+    // Each fn item whose TYPE the arguments hold: its row from its head, its body not checked
+    // (this instance reads none of it; its own instance is the walk's, found or made). The
+    // Reference, "Function item types": "When referred to, a function item, or the
+    // constructor of a tuple-like struct or enum variant, yields a zero-sized value of its
+    // function item type. That type explicitly identifies the function", so calling the value
+    // calls that fn with its own ABI and signature, which the build asks (`Adts::abi`) as it
+    // builds the call `f(x)` at `F` = the item's type, before any reference is named. The body
+    // that named the item as a value may have been found by its record and not checked in
+    // this run, so no check made that head (t1530, 36 tests: "the build's `Adts` gave no ABI
+    // for it" at `Result::map` with `NonZero::<u64>::new`, `Option::map` with `Into::into`,
+    // fastrand's `try_with_rng(Rng::fork)`, a fn handed to `OnceLock::get_or_init`).
+    for &item in items.iter() {
+        program.head_row(item)?;
     }
     // The constants this instance reads at its ground arguments, pulled before the build
     // (front2/const_at.rs): a plain instance's own body only, as in build_from.
@@ -467,14 +482,16 @@ let step = build_one(&*program, &bodies, work, i, instance, entry);
 
 /// The owners the ground arguments `args` of an instance of `tabled` hold, each once, in the
 /// order first met: a closure's or a coroutine's owner, and an opaque type's defining fn; never
-/// `tabled` itself (checked first). Each distinct node is visited once (ground types are
-/// interned: one id per type), so the walk is linear in the arguments' distinct nodes; bounded
-/// (rule 18).
-fn held_owners<'a, P: FrontEnd>(program: &P, ground: blaze_typeck::PTys<'_>, args: blaze_typeck::List, tabled: ItemKey, alloc: Alloc<'a>) -> Result<AVec<'a, ItemKey>, RunError> {
+/// `tabled` itself (checked first); and `.1`, each fn item whose type they hold (`PNode::FnDef`,
+/// a closure's parent arguments included), each once, whose row the make takes from its head.
+/// Each distinct node is visited once (ground types are interned: one id per type), so the
+/// walk is linear in the arguments' distinct nodes; bounded (rule 18).
+fn held_owners<'a, P: FrontEnd>(program: &P, ground: blaze_typeck::PTys<'_>, args: blaze_typeck::List, tabled: ItemKey, alloc: Alloc<'a>) -> Result<(AVec<'a, ItemKey>, AVec<'a, ItemKey>), RunError> {
     /// The most distinct type nodes one instance's arguments are walked through (rule 18).
     const MOST_NODES: usize = 1 << 20;
     let malformed = |_| RunError::OneBody { key: tabled, why: "an instance's ground arguments refer past their table (make_one.rs `held_owners`)" };
     let mut owners: AVec<'a, ItemKey> = blaze_own::Vec::new_in(alloc);
+    let mut items: AVec<'a, ItemKey> = blaze_own::Vec::new_in(alloc);
     let mut seen: AVec<'a, blaze_typeck::PTy> = blaze_own::Vec::new_in(alloc);
     let mut todo: AVec<'a, blaze_typeck::PTy> = blaze_own::Vec::new_in(alloc);
     todo.extend_from_slice(ground.list(args).map_err(malformed)?);
@@ -485,6 +502,11 @@ fn held_owners<'a, P: FrontEnd>(program: &P, ground: blaze_typeck::PTys<'_>, arg
         }
         seen.insert_shift(slot, t);
         let node = ground.node(t).map_err(malformed)?;
+        if let blaze_typeck::PNode::FnDef(item, _) = node
+            && !items.contains(&item)
+        {
+            items.push(item);
+        }
         let owner = match node {
             blaze_typeck::PNode::Closure { owner, .. } | blaze_typeck::PNode::Coroutine { owner, .. } => Some(owner),
             blaze_typeck::PNode::Opaque(opaque, _) => program.opaque_of(opaque).map(|(owner, _)| owner),
@@ -498,7 +520,7 @@ fn held_owners<'a, P: FrontEnd>(program: &P, ground: blaze_typeck::PTys<'_>, arg
         }
         ground.children_of(node, &mut todo).map_err(malformed)?;
     }
-    Ok(owners)
+    Ok((owners, items))
 }
 
 /// The per-item constant pull of build_from's step (`const_at::needs_of`, `const_at::pull`).
@@ -833,7 +855,7 @@ fn name_ref<'p, P: FrontEnd>(
     // `at`: the arguments of the instance whose body makes this call (its `Self` first).
     let Some(c) = program.fn_index(callee.item) else {
         // Owed a row whatever names it: a ctor's ([`Step::Table`] makes it by the seam's
-        // `ctor_row`), a selected impl's fn, and a fn the body names as a VALUE, which its
+        // `head_row`), a selected impl's fn, and a fn the body names as a VALUE, which its
         // caller's check does not table as a callee (bstd `main!`'s `guest::start(table,
         // hosted)`: the local `hosted` passed as a fn item, hello world's stop of 2026-11-17
         // g080047). A fn a check of it tables no row for is refused when met again.

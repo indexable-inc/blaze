@@ -997,7 +997,8 @@ pub fn head_eq(a: PNode, b: PNode) -> bool {
         | (PNode::FnDef(x, _), PNode::FnDef(y, _))
         | (PNode::Opaque(x, _), PNode::Opaque(y, _))
         | (PNode::ExTrait(x, _), PNode::ExTrait(y, _))
-        | (PNode::ExAuto(x), PNode::ExAuto(y)) => x == y,
+        | (PNode::ExAuto(x), PNode::ExAuto(y))
+        | (PNode::Foreign(x), PNode::Foreign(y)) => x == y,
         (PNode::FnPtr(_, h), PNode::FnPtr(_, g)) => h == g,
         (PNode::Alias { trait_: t, name: n, .. }, PNode::Alias { trait_: u, name: m, .. })
         | (PNode::ExProj { trait_: t, name: n, .. }, PNode::ExProj { trait_: u, name: m, .. }) => t == u && n == m,

@@ -155,7 +155,8 @@ fn ground_own(cx: &mut GroundCx<'_, '_, '_>, ty: PTy, depth: u32) -> Result<PTy,
         | PNode::Float(_)
         | PNode::Str
         | PNode::Never
-        | PNode::ExAuto(_) => node,
+        | PNode::ExAuto(_)
+        | PNode::Foreign(_) => node,
         PNode::Param(i) | PNode::ConstParam(i) => return arg(cx, i),
         PNode::Tuple(l) => PNode::Tuple(ground_own_list(cx, l, d)?),
         PNode::Ref(m, t) => PNode::Ref(m, ground_own(cx, t, d)?),

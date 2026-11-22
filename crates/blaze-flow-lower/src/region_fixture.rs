@@ -413,7 +413,8 @@ fn import(from: PTys<'_>, t: PTy, into: &mut PortableTys<'_>) -> PTy {
         | PNode::Infer
         | PNode::Error
         | PNode::ConstParam(_)
-        | PNode::ExAuto(_) => node,
+        | PNode::ExAuto(_)
+        | PNode::Foreign(_) => node,
         PNode::Tuple(l) => PNode::Tuple(import_list(from, l, into)),
         PNode::Ref(m, c) => PNode::Ref(m, import(from, c, into)),
         PNode::Ptr(m, c) => PNode::Ptr(m, import(from, c, into)),

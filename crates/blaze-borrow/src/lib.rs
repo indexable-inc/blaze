@@ -194,11 +194,12 @@ pub enum Head {
     ExTrait,
     ExProj,
     ExAuto,
+    Foreign,
     Unread,
 }
 
 impl Head {
-    pub const ALL: [Head; 31] = [
+    pub const ALL: [Head; 32] = [
         Head::Bool,
         Head::Char,
         Head::Int,
@@ -229,6 +230,7 @@ impl Head {
         Head::ExTrait,
         Head::ExProj,
         Head::ExAuto,
+        Head::Foreign,
         Head::Unread,
     ];
 
@@ -269,6 +271,7 @@ impl Head {
             N::ExTrait(..) => Head::ExTrait,
             N::ExProj { .. } => Head::ExProj,
             N::ExAuto(_) => Head::ExAuto,
+            N::Foreign(_) => Head::Foreign,
         }
     }
 
@@ -304,6 +307,7 @@ impl Head {
             Head::ExTrait => "trait ref",
             Head::ExProj => "projection predicate",
             Head::ExAuto => "auto trait",
+            Head::Foreign => "extern type",
             Head::Unread => "unread",
         }
     }

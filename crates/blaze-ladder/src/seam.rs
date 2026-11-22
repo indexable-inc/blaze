@@ -229,12 +229,17 @@ pub trait FrontEnd {
     fn check_one(&mut self, key: ItemKey) -> Result<Option<(usize, Checked<'static>)>, RunError> {
         Err(RunError::OneBody { key, why: "this front end checks only the whole program (`FrontEnd::check_all`); the record walk asks one body at a time (`FrontEnd::check_one`)" })
     }
-    /// D106: the row of the ctor `key` (a tuple struct's or tuple variant's, [`FrontEnd::ctor_of`]
-    /// answers it), made once: its index. A ctor has no body to check (`check_one` lowers a
-    /// body), and the record walk builds its instance as a fn (blaze-build `build_ctor_fn`).
+    /// D106: the row of fn item `key` made from its HEAD alone, once, no body checked: its
+    /// index. Two kinds ask it. A ctor (a tuple struct's or tuple variant's,
+    /// [`FrontEnd::ctor_of`] answers it) has no body to check (`check_one` lowers a body), and
+    /// the record walk builds its instance as a fn (blaze-build `build_ctor_fn`). And a fn
+    /// item whose TYPE an instance's ground arguments hold (`Option::map` at `F` =
+    /// `NonZero::new`'s type, run/make_one.rs `held_owners`): the build reads its ABI and
+    /// signature (`Adts::abi`) as it builds the call `f(x)`, and the body that named the item
+    /// as a value may have been found by its record, so no check of this run made its head.
     /// `Ok(None)`: no row for it. A front end that tables every row up front answers by
     /// [`FrontEnd::fn_index`].
-    fn ctor_row(&mut self, key: ItemKey) -> Result<Option<usize>, RunError> {
+    fn head_row(&mut self, key: ItemKey) -> Result<Option<usize>, RunError> {
         Ok(self.fn_index(key))
     }
     /// D106: the instance of fn `i` the walk asked for is made; a lazy program may drop that

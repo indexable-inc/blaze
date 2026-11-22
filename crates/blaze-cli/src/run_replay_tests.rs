@@ -109,6 +109,7 @@ fn said(bytes: &[u8], firsts: bool) -> std::vec::Vec<Said> {
             Down::Personality { slot } => out.push(Said::Personality(*slots.get(&slot.0).expect("a personality slot never declared"))),
             Down::Failed { .. } => out.push(Said::Failed),
             Down::Native { .. } => out.push(Said::Native),
+            Down::Hooks { .. } | Down::Promote { .. } => {}
         }
         at += len;
     }

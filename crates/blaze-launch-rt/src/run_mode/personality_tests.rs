@@ -220,6 +220,7 @@ fn run(bind: bool) -> Seen {
             Act::Native { record } => panic!("the personality tests send no native library: {record:?}"),
             Act::Statics => panic!("the personality tests send no static"),
             Act::ThreadLocals => panic!("the personality tests send no thread-local"),
+            Act::Hook { slot, kind } => mode.hook(slot, kind, &mut memory).expect("hook"),
         }
     }
     Seen { placed, memory, p_local }

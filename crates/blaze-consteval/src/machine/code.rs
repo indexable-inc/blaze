@@ -534,6 +534,7 @@ impl Refusal<'_> {
             Refusal::NeedsDrop { what } => Refusal::NeedsDrop { what },
             Refusal::Projection { trait_, name } => Refusal::Projection { trait_, name },
             Refusal::FieldGround { adt, field, name, projection } => Refusal::FieldGround { adt, field, name, projection },
+            Refusal::NoSize { item } => Refusal::NoSize { item },
             Refusal::Panic { .. } | Refusal::Cycle { .. } => Refusal::Malformed { what: "a refusal with parts kept in code" },
         }
     }
@@ -547,6 +548,7 @@ impl Refusal<'_> {
             Refusal::NeedsDrop { what } => Refusal::NeedsDrop { what },
             Refusal::Projection { trait_, name } => Refusal::Projection { trait_: *trait_, name: *name },
             Refusal::FieldGround { adt, field, name, projection } => Refusal::FieldGround { adt: *adt, field: *field, name: *name, projection: *projection },
+            Refusal::NoSize { item } => Refusal::NoSize { item: *item },
             Refusal::MutableStatic { item } => Refusal::MutableStatic { item: *item },
             Refusal::NotConstFn { item } => Refusal::NotConstFn { item: *item },
             Refusal::UnknownIntrinsic { item } => Refusal::UnknownIntrinsic { item: *item },

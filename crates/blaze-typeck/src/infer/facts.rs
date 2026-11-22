@@ -787,6 +787,7 @@ impl<'a> FactCache<'a> {
                     K::ExProj(SDef(d), list(args)?, ty(term)?)
                 }
                 PNode::ExAuto(k) => K::ExAuto(SDef(k.0)),
+                PNode::Foreign(k) => K::Foreign(SDef(k.0)),
                 PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } | PNode::Infer => {
                     return Err(CheckError::Malformed(Malformed::BodyTypeInRecord(q)).into());
                 }

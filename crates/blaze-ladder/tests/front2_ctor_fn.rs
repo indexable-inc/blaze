@@ -363,7 +363,7 @@ const LANG_CRATES: [usize; 1] = [0];
 /// [`DROP_PROGRAM`] over NAMES RECORDS (the lazy program behind `run::make_one::Maker`, what
 /// `blaze run` reads, tests/d106_records.rs's setup): solved once, its records written, the
 /// solve dropped, then walked from `main` by the record walk. Every reached instance is made,
-/// `S`'s ctor fn (its row made by the seam's `ctor_row`, built by `build_ctor_fn`) and the
+/// `S`'s ctor fn (its row made by the seam's `head_row`, built by `build_ctor_fn`) and the
 /// `FnOnce` shim of it among them; nothing is refused.
 /// Prints `CTOR OVER RECORDS: <counts>`.
 #[test]

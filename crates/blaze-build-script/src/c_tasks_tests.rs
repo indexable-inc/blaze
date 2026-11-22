@@ -28,7 +28,7 @@ use crate::outputs::{CRequest, CState, Outputs, OutputsRef, Snap, snap_digest};
 const OUT: &str = "/target/debug/build/foo-1/out";
 
 fn roots() -> GuestRoots<'static> {
-    GuestRoots { package: "/package", out: OUT, builds: "/target/debug/build", sysroot: "/sdk" }
+    GuestRoots { package: "/package", out: OUT, builds: "/target/debug/build", deps: "/deps", sysroot: "/sdk" }
 }
 
 fn own<'a>(text: &str, alloc: Alloc<'a>) -> AString<'a> {
@@ -664,21 +664,29 @@ fn tempos_argument_shapes_read_as_clang_takes_them() {
 fn the_built_key_moves_with_each_input() {
     use crate::c_tasks_built::{Pinned, built_key, encode_built, open_built};
     let pinned = Pinned { source: [1; 32], files: [2; 32] };
-    let base = built_key(ContentId([9; 32]), &toolchain(7), pinned, &["static=foo"]);
-    assert_eq!(base, built_key(ContentId([9; 32]), &toolchain(7), pinned, &["static=foo"]), "a key from equal inputs is equal");
+    let dep = [("/deps/zstd", [6; 32])];
+    let key = |out: u8, tc: &Toolchain<'_>, pinned: Pinned, demand: &[&str], deps: &[(&str, [u8; 32])], tree: Option<[u8; 32]>| built_key(ContentId([out; 32]), tc, pinned, demand, deps, tree);
+    let base = key(9, &toolchain(7), pinned, &["static=foo"], &dep, None);
+    assert_eq!(base, key(9, &toolchain(7), pinned, &["static=foo"], &dep, None), "a key from equal inputs is equal");
     let sdk = Toolchain { sdk: b"26.2 25C56", ..toolchain(7) };
+    let tree = key(9, &toolchain(7), pinned, &["static=foo"], &dep, Some([4; 32]));
     let moved = [
-        ("the script's out", built_key(ContentId([8; 32]), &toolchain(7), pinned, &["static=foo"])),
-        ("the compiler", built_key(ContentId([9; 32]), &toolchain(6), pinned, &["static=foo"])),
-        ("the SDK", built_key(ContentId([9; 32]), &sdk, pinned, &["static=foo"])),
-        ("the source", built_key(ContentId([9; 32]), &toolchain(7), Pinned { source: [3; 32], ..pinned }, &["static=foo"])),
-        ("the files", built_key(ContentId([9; 32]), &toolchain(7), Pinned { files: [3; 32], ..pinned }, &["static=foo"])),
-        ("the demand", built_key(ContentId([9; 32]), &toolchain(7), pinned, &["static=foo", "static=bar"])),
-        ("the demand's split", built_key(ContentId([9; 32]), &toolchain(7), pinned, &["static=fo", "o"])),
+        ("the script's out", key(8, &toolchain(7), pinned, &["static=foo"], &dep, None)),
+        ("the compiler", key(9, &toolchain(6), pinned, &["static=foo"], &dep, None)),
+        ("the SDK", key(9, &sdk, pinned, &["static=foo"], &dep, None)),
+        ("the source", key(9, &toolchain(7), Pinned { source: [3; 32], ..pinned }, &["static=foo"], &dep, None)),
+        ("the files", key(9, &toolchain(7), Pinned { files: [3; 32], ..pinned }, &["static=foo"], &dep, None)),
+        ("the demand", key(9, &toolchain(7), pinned, &["static=foo", "static=bar"], &dep, None)),
+        ("the demand's split", key(9, &toolchain(7), pinned, &["static=fo", "o"], &dep, None)),
+        ("a dependency tree's digest", key(9, &toolchain(7), pinned, &["static=foo"], &[("/deps/zstd", [7; 32])], None)),
+        ("a dependency tree's spelling", key(9, &toolchain(7), pinned, &["static=foo"], &[("/deps/lz4", [6; 32])], None)),
+        ("no dependency tree", key(9, &toolchain(7), pinned, &["static=foo"], &[], None)),
+        ("a tree's tools", tree),
     ];
-    for (what, key) in moved {
-        assert_ne!(key, base, "{what} is not in the built key");
+    for (what, moved_key) in moved {
+        assert_ne!(moved_key, base, "{what} is not in the built key");
     }
+    assert_ne!(tree, key(9, &toolchain(7), pinned, &["static=foo"], &dep, Some([5; 32])), "a changed tool or OS build is another built record");
     let alloc = blaze_own::testing::heap().alloc();
     let record = script_record(alloc);
     let mut payload: AVec<'_, u8> = Vec::new_in(alloc);
@@ -688,4 +696,27 @@ fn the_built_key_moves_with_each_input() {
     encode_built(&payload, &mut built);
     assert_eq!(open_built(&built), Some(&payload[..]));
     assert_eq!(open_built(&payload), None, "CONTROL: a script payload is no built record");
+}
+
+/// Every `links` dependency's tree a request names is found (librocksdb-sys's
+/// `-I/deps/zstd/zstd/lib`, a producer's `OUT_DIR` whole or after `=`), each once; the
+/// package, the script's own `OUT_DIR` and a word that only holds a guest spelling are not.
+#[test]
+fn the_dependency_trees_a_request_names_are_found() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut outputs = Outputs::new_in(OUT, alloc);
+    let requests: [&[&str]; 2] = [
+        &["cc", "-I/deps/zstd/zstd/lib", "-I", "/target/debug/build/lz4-sys-2/out/include", "-o", "/target/debug/build/foo-1/out/a.o", "-c", "/package/a.c"],
+        &["cc", "-iquote=/deps/zstd/x", "-DP=a/deps/no", "-I/package/i", "-o", "/target/debug/build/foo-1/out/b.o", "-c", "/deps/lz4/b.c"],
+    ];
+    for argv in requests {
+        outputs.c_requests.push(CRequest { argv: joined(argv, alloc), state: 0 });
+    }
+    outputs.c_states.push(CState { entries: Vec::new_in(alloc) });
+    let mut bytes = Vec::new_in(alloc);
+    outputs.encode(&mut bytes);
+    let opened = OutputsRef::open(&bytes).unwrap_or_else(|e| panic!("{e:?}"));
+    let found = crate::c_tasks::dep_roots(&opened, &roots(), alloc);
+    assert_eq!(found.as_slice(), ["/deps/lz4", "/deps/zstd", "/target/debug/build/lz4-sys-2/out"]);
+    assert_eq!(roots().root_of("/deps"), None, "CONTROL: `/deps` itself names no producer");
 }

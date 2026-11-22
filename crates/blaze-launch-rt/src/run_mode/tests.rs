@@ -197,6 +197,7 @@ fn carry(
             Act::Native { record } => panic!("this simulation's parent sends no native library: {record:?}"),
             Act::Statics => panic!("this simulation's parent sends no static"),
             Act::ThreadLocals => panic!("this simulation's parent sends no thread-local"),
+            Act::Hook { slot, kind } => mode.hook(slot, kind, memory).expect("hook"),
         }
     }
     acts.clear();

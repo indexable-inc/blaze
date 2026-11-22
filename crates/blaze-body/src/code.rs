@@ -212,6 +212,7 @@ pub mod ty_tag {
     pub const EX_TRAIT: u32 = 28;
     pub const EX_PROJ: u32 = 29;
     pub const EX_AUTO: u32 = 30;
+    pub const FOREIGN: u32 = 31;
 }
 
 /// The statement tags. 0 is no form.
@@ -983,6 +984,10 @@ pub fn encode_ty(n: PNode) -> TyWords {
             put_key(&mut w, 0, k);
             ty_tag::EX_AUTO
         }
+        PNode::Foreign(k) => {
+            put_key(&mut w, 0, k);
+            ty_tag::FOREIGN
+        }
     };
     TyWords { w, tag }
 }
@@ -1023,6 +1028,7 @@ pub fn decode_ty(r: TyWords) -> Option<PNode> {
         ty_tag::CONST_VALUE => PNode::ConstValue { ty: PTy(w[0]), bits: join([w[1], w[2], w[3], w[4]]) },
         ty_tag::DYNAMIC => PNode::Dynamic(list_at(w, 0)),
         ty_tag::EX_AUTO => PNode::ExAuto(key_at(w, 0)),
+        ty_tag::FOREIGN => PNode::Foreign(key_at(w, 0)),
         _ => return None,
     };
     (encode_ty(n) == r).then_some(n)
@@ -1062,7 +1068,8 @@ pub fn ty_children(n: PNode, mut ty: impl FnMut(PTy), mut list: impl FnMut(List)
         | PNode::ConstParam(_)
         | PNode::Infer
         | PNode::Error
-        | PNode::ExAuto(_) => {}
+        | PNode::ExAuto(_)
+        | PNode::Foreign(_) => {}
     }
 }
 
@@ -1099,6 +1106,7 @@ pub fn map_ty_lists(n: PNode, mut f: impl FnMut(List) -> List) -> PNode {
         | PNode::Error
         | PNode::ConstValue { .. }
         | PNode::ConstParam(_)
-        | PNode::ExAuto(_) => n,
+        | PNode::ExAuto(_)
+        | PNode::Foreign(_) => n,
     }
 }

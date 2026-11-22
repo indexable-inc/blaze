@@ -825,7 +825,12 @@ pub enum BuildError {
     /// Expression `expr` (none: a drop the build inserted) needs lang item fn `name`, which
     /// [`Adts::lang_fn`] does not know.
     NoLangFn { expr: Option<ExprId>, name: &'static str },
-    /// Selecting a type's `Drop` impl failed ([`Adts::drop_impl`]).
+    /// A question to the program's impls failed: selecting an ADT's `Drop` impl
+    /// ([`Adts::drop_impl`]), normalizing a projection at ground arguments (the ladder's
+    /// `normalized`, `<u64 as Int>::Unsigned`), resolving a coroutine's callee. Shown as the
+    /// solver's own error, never as a `Drop` question it was not (tempo t1530: 13 tests showed
+    /// "selecting a `Drop` impl" for `ImplsOf(<a trait>, u64)` in arbitrary's
+    /// `int_in_range_impl<T: Int>`; a primitive's drop asks no solver, the ladder's `drop_impl`).
     Select(blaze_typeck::ResolveError),
     /// [`Adts::abi`] gave no ABI for fn `item`, built or called.
     NoAbi { item: ItemKey },
@@ -963,7 +968,7 @@ impl fmt::Display for BuildError {
             BuildError::NoLangFn { expr: None, name } => {
                 write!(f, "a value's drop needs the `{name}` lang item fn, which the program does not declare")
             }
-            BuildError::Select(error) => write!(f, "selecting a `Drop` impl: {error}"),
+            BuildError::Select(error) => write!(f, "selecting an impl: {error}"),
             BuildError::NoAbi { item } => {
                 write!(f, "fn item {:#x}: the build's `Adts` gave no ABI for it", item.0)
             }

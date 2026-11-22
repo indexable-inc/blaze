@@ -265,6 +265,18 @@ impl Sim {
                     words.len()
                 )));
             }
+            Down::Hooks { slot, kind } => {
+                return Err(Broke::Oracle(format!(
+                    "the parent sent `Hooks` ({kind:?}) for slot {}: this simulation's parent toggles no hooks",
+                    slot.0
+                )));
+            }
+            Down::Promote { slot, .. } => {
+                return Err(Broke::Oracle(format!(
+                    "the parent sent `Promote` for slot {}: this simulation's parent does not promote",
+                    slot.0
+                )));
+            }
             Down::Data { data } => {
                 return Err(Broke::Oracle(format!("the parent sent `Data` with {} statics: this simulation's manifest has no static", data.len())));
             }

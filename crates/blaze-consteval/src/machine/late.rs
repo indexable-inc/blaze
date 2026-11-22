@@ -106,6 +106,7 @@ impl Wait {
             | Refusal::Cycle { .. }
             | Refusal::Unsupported { .. }
             | Refusal::Malformed { .. }
+            | Refusal::NoSize { .. }
             | Refusal::Literal(_) => None,
         }
     }

@@ -125,6 +125,9 @@ pub enum TyView {
     /// last (blaze-ty's `ex_projection` row, read without interning).
     ExProj { trait_: ItemKey, name: Name, args_term: TyList },
     ExAuto(ItemKey),
+    /// An extern type (`PNode::Foreign`'s view; blaze-ty's `TyKind::Foreign`): itself only, no
+    /// size, no fields, no deref, no method but its inherent impls' and its traits'.
+    Foreign(ItemKey),
 }
 
 impl TyView {

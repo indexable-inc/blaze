@@ -70,11 +70,13 @@ pub mod stub_wait;
 pub mod symbols;
 pub mod sys;
 pub mod table;
+pub mod telemetry;
 pub mod threads;
 pub mod tls;
 pub mod jit_debug;
 pub mod unwind;
 pub mod unwind_reg;
+pub mod viewer;
 pub mod waits;
 pub mod zygote;
 

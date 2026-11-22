@@ -513,6 +513,8 @@ fn term(h: &mut Hasher, t: PTy, types: PTys<'_>) -> Result<(), Stop> {
                 (28u8, trait_, name, n).hash(&mut Fed(h));
             }
             PNode::ExAuto(key) => (29u8, key).hash(f),
+            // An extern type, by its item: a tag no earlier node had.
+            PNode::Foreign(key) => (30u8, key).hash(f),
         }
     }
     Ok(())

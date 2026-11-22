@@ -25,13 +25,22 @@
 //!   c-requests  argv (the program first), joined by NUL
 //! then the stored files, a u32 count and its entries:
 //!   stored      name, u64 length, u32 mode (`0o100644` or `0o100755`), 32 bytes SHA-256
-//! then the C inputs, three sections, each a u32 count and its entries:
+//! then the C inputs, four sections, each a u32 count and its entries:
 //!   c-states    u32 count, then each entry: name, u8 kind (0 a folder, 1 held, 2 final),
 //!               [32 bytes digest, held only]; sorted by name
 //!   c-at        u32 state, one per c-request, in order (the count is c-requests')
+//!   c-trees     u32 request (a c-request's index; ascending, distinct), cwd (absolute), then
+//!               a u32 count of (name, value), sorted by name, distinct
 //!   c-bytes     32 bytes digest, u64 offset, u64 length; sorted by digest, distinct; then
 //!               the bytes, at each offset from the end of the entries
 //! ```
+//!
+//! A PROCESS TREE's request (`sh configure`, `make`: c_tasks.rs `is_tree`) reads more than its
+//! argv: the folder it was spawned in and its environment (`CC`, `CFLAGS`, `MAKEFLAGS`: what
+//! tikv-jemalloc-sys hands its `configure`). Both are kept for it ([`CTree`]), as the script's
+//! sandbox gave them (guest paths), so the tree runs later as it was asked. A compile or an
+//! `ar` keeps neither: its argv is rooted when recorded (c_tasks.rs `rooted`) and it reads no
+//! variable the C tasks do not set.
 //!
 //! THE C INPUTS. A deferred request is a promise to run LATER what the script asked NOW, so it
 //! reads `OUT_DIR` as it was at the spawn, never as the script left it: aws-lc-sys writes
@@ -79,10 +88,11 @@ use blaze_own::{AString, AVec, Alloc, String, Vec};
 use crate::instr::{self, Instr, Line, LinkTo, Malformed, OutputError, OutputLimits, SearchKind};
 
 /// The record's layout word: `bzbsout` and the layout's number. `bzbsout5` added the stored
-/// files, `bzbsout6` the C inputs; a `bzbsout5` record is another layout
-/// ([`RecordError::Layout`]) and the run key holds this word (`key.rs`), so an old home's
-/// records are never found and are made again (rule 26).
-pub const LAYOUT: u64 = u64::from_le_bytes(*b"bzbsout6");
+/// files, `bzbsout6` the C inputs, `bzbsout7` the process trees' folder and environment
+/// ([`CTree`]); a `bzbsout6` record is another layout ([`RecordError::Layout`]) and the run key
+/// holds this word (`key.rs`), so an old home's records are never found and are made again
+/// (rule 26).
+pub const LAYOUT: u64 = u64::from_le_bytes(*b"bzbsout7");
 
 /// The domain of [`snap_digest`].
 pub const SNAP_DOMAIN: &str = "blaze build-script c input 1";
@@ -98,6 +108,40 @@ pub struct CRequest<'a> {
     pub argv: AString<'a>,
     /// An index of [`Outputs::c_states`].
     pub state: u32,
+}
+
+/// What a process-tree request was spawned with beyond its argv (the module's A PROCESS
+/// TREE): the guest folder it ran in and its environment, sorted by name, each name once.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CTree<'a> {
+    /// An index of [`Outputs::c_requests`].
+    pub request: u32,
+    /// The guest folder it was spawned in, absolute.
+    pub cwd: AString<'a>,
+    pub env: AVec<'a, (AString<'a>, AString<'a>)>,
+}
+
+/// A [`CTree`] read in place ([`OutputsRef::c_trees`]).
+#[derive(Clone, Copy, Debug)]
+pub struct CTreeRef<'b> {
+    pub request: u32,
+    pub cwd: &'b str,
+    bytes: &'b [u8],
+    env_at: usize,
+    env_n: u32,
+}
+
+impl<'b> CTreeRef<'b> {
+    /// Its environment, sorted by name.
+    pub fn env(&self) -> impl Iterator<Item = (&'b str, &'b str)> + use<'b> {
+        let mut cur = Cursor { bytes: self.bytes, at: self.env_at };
+        (0..self.env_n).map_while(move |_| Some((cur.text().ok()?, cur.text().ok()?)))
+    }
+
+    /// The value of `name` in its environment.
+    pub fn var(&self, name: &str) -> Option<&'b str> {
+        self.env().find(|(n, _)| *n == name).map(|(_, v)| v)
+    }
 }
 
 /// One entry of an `OUT_DIR` state.
@@ -311,6 +355,8 @@ pub struct Outputs<'a> {
     /// The bytes of each [`Snap::Held`] file, by digest: sorted, distinct
     /// ([`Outputs::hold_c_bytes`]).
     pub c_bytes: AVec<'a, ([u8; 32], AVec<'a, u8>)>,
+    /// Each process-tree request's folder and environment, by ascending request.
+    pub c_trees: AVec<'a, CTree<'a>>,
 }
 
 /// How much a script may write into `OUT_DIR`.
@@ -366,6 +412,7 @@ impl<'a> Outputs<'a> {
             stored: Vec::new_in(alloc),
             c_states: Vec::new_in(alloc),
             c_bytes: Vec::new_in(alloc),
+            c_trees: Vec::new_in(alloc),
         }
     }
 
@@ -512,6 +559,12 @@ impl<'a> Outputs<'a> {
         count(out, self.c_requests.len());
         for request in self.c_requests.iter() {
             out.extend_from_slice(&request.state.to_le_bytes());
+        }
+        count(out, self.c_trees.len());
+        for tree in self.c_trees.iter() {
+            out.extend_from_slice(&tree.request.to_le_bytes());
+            text(out, &tree.cwd);
+            pairs(out, &tree.env);
         }
         count(out, self.c_bytes.len());
         let mut offset = 0u64;
@@ -676,6 +729,8 @@ pub struct OutputsRef<'b> {
     /// start (after its count) and count. `c_blobs` is where the held bytes start.
     c_states: (usize, u32),
     c_at: (usize, u32),
+    /// The process trees' section ([`CTree`]): its start (after its count) and count.
+    c_trees: (usize, u32),
     c_bytes: (usize, u32),
     c_blobs: usize,
     /// Where its stored files' bytes are read; `None` until [`OutputsRef::with_area`].
@@ -703,6 +758,19 @@ fn c_entry<'b>(cur: &mut Cursor<'b>) -> Result<(&'b str, Snap), RecordError> {
 
 /// The width of one `c-bytes` entry: digest, offset, length.
 const C_BYTES_ENTRY: usize = 32 + 8 + 8;
+
+/// One `c-trees` entry, read whole (its environment's texts read once, so `cur` is past it).
+fn c_tree_entry<'b>(bytes: &'b [u8], cur: &mut Cursor<'b>) -> Result<CTreeRef<'b>, RecordError> {
+    let request = cur.u32()?;
+    let cwd = cur.text()?;
+    let env_n = cur.u32()?;
+    let env_at = cur.at;
+    for _ in 0..env_n {
+        cur.text()?;
+        cur.text()?;
+    }
+    Ok(CTreeRef { request, cwd, bytes, env_at, env_n })
+}
 
 /// One stored file's entry, checked.
 fn stored_entry<'b>(cur: &mut Cursor<'b>) -> Result<StoredRef<'b>, RecordError> {
@@ -807,6 +875,24 @@ impl<'b> OutputsRef<'b> {
             }
         }
         let n = cur.u32()?;
+        let c_trees = (cur.at, n);
+        let mut last_request: Option<u32> = None;
+        for _ in 0..n {
+            let at = cur.at;
+            let tree = c_tree_entry(bytes, &mut cur)?;
+            if tree.request >= starts[11].1 || last_request.is_some_and(|last| last >= tree.request) || !tree.cwd.starts_with('/') {
+                return Err(RecordError::CInput { at });
+            }
+            last_request = Some(tree.request);
+            let mut last_name: Option<&str> = None;
+            for (name, _) in tree.env() {
+                if last_name.is_some_and(|last| last >= name) {
+                    return Err(RecordError::CInput { at });
+                }
+                last_name = Some(name);
+            }
+        }
+        let n = cur.u32()?;
         let c_bytes = (cur.at, n);
         let mut last: Option<&[u8]> = None;
         let mut offset = 0u64;
@@ -826,7 +912,7 @@ impl<'b> OutputsRef<'b> {
         if cur.at != bytes.len() {
             return Err(RecordError::Trailing { at: cur.at });
         }
-        let opened = OutputsRef { bytes, out_dir, starts, stored_at, c_states, c_at, c_bytes, c_blobs, area: None };
+        let opened = OutputsRef { bytes, out_dir, starts, stored_at, c_states, c_at, c_trees, c_bytes, c_blobs, area: None };
         // Each held digest has its bytes (a final file is looked up by name where it is laid).
         let mut cur = Cursor { bytes, at: c_states.0 };
         for _ in 0..c_states.1 {
@@ -848,6 +934,19 @@ impl<'b> OutputsRef<'b> {
         let (at, n) = self.c_at;
         let mut cur = Cursor { bytes: self.bytes, at };
         (0..n).map_while(move |_| cur.u32().ok())
+    }
+
+    /// Each process-tree request's folder and environment ([`CTree`]), by ascending request.
+    pub fn c_trees(&self) -> impl Iterator<Item = CTreeRef<'b>> + use<'b> {
+        let (at, n) = self.c_trees;
+        let bytes = self.bytes;
+        let mut cur = Cursor { bytes, at };
+        (0..n).map_while(move |_| c_tree_entry(bytes, &mut cur).ok())
+    }
+
+    /// The folder and environment of request `request`, when it is a process tree's.
+    pub fn c_tree(&self, request: u32) -> Option<CTreeRef<'b>> {
+        self.c_trees().find(|tree| tree.request == request)
     }
 
     /// How many `OUT_DIR` states the requests saw.
@@ -1088,6 +1187,11 @@ impl<'b> OutputsRef<'b> {
                 state.for_each(|(name, snap)| entries.push((own(name, alloc), snap)));
             }
             out.c_states.push(CState { entries });
+        }
+        for tree in self.c_trees() {
+            let mut env = Vec::new_in(alloc);
+            tree.env().for_each(|(a, b)| env.push((own(a, alloc), own(b, alloc))));
+            out.c_trees.push(CTree { request: tree.request, cwd: own(tree.cwd, alloc), env });
         }
         let (start, n) = self.c_bytes;
         for at in 0..n as usize {

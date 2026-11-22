@@ -226,7 +226,9 @@ fn request_text<'b>(outputs: &OutputsRef<'b>, error: &RequestError) -> &'b str {
 pub enum GuestRoot<'b> {
     Package,
     Out,
-    /// A dependency's guest `OUT_DIR` (`DEP_*_INCLUDE`), named by its whole spelling.
+    /// A `links` dependency's tree, named by its whole spelling: its guest `OUT_DIR`
+    /// (`<builds>/<name>/out`, `DEP_*_INCLUDE`) or the tree it was served
+    /// (`<deps>/<links>`, dep_paths.rs `DepMount::Tree`).
     Dep(&'b str),
     Sysroot,
 }
@@ -241,6 +243,9 @@ pub struct GuestRoots<'g> {
     /// The folder every crate's build folder is under (`/target/debug/build`): a dependency's
     /// `OUT_DIR` is `<builds>/<name>/out`.
     pub builds: &'g str,
+    /// Where a reading script sees each `links` producer's served tree
+    /// (dep_paths.rs [`crate::dep_paths::DEPS_ROOT`]): `<deps>/<links>`.
+    pub deps: &'g str,
     /// The guest sysroot the script's `SDKROOT` names (a fixed spelling, never the host's).
     pub sysroot: &'g str,
 }
@@ -260,6 +265,15 @@ impl<'g> GuestRoots<'g> {
         if under(path, self.sysroot) {
             return Some(GuestRoot::Sysroot);
         }
+        // `<deps>/<links>`: one plain part names the producer (no two packages of a graph
+        // share a `links` value, the cargo book's "links").
+        if let Some(rest) = path.strip_prefix(self.deps).and_then(|rest| rest.strip_prefix('/')) {
+            let links = rest.split('/').next().unwrap_or("");
+            if links.is_empty() || links == "." {
+                return None;
+            }
+            return Some(GuestRoot::Dep(&path[..self.deps.len() + 1 + links.len()]));
+        }
         let rest = path.strip_prefix(self.builds)?.strip_prefix('/')?;
         let (name, after) = rest.split_once('/')?;
         let after_out = after.strip_prefix("out")?;
@@ -269,6 +283,38 @@ impl<'g> GuestRoots<'g> {
         let end = self.builds.len() + 1 + name.len() + 1 + "out".len();
         Some(GuestRoot::Dep(&path[..end]))
     }
+}
+
+/// Every `links` dependency's tree ([`GuestRoot::Dep`]) the record's deferred requests name, in
+/// an argument (whole, after a flag's letters `-I/..`, or after `=`, `:` or `,`) or in a process
+/// tree's folder or environment: what the runner must lay before any of them runs. Sorted,
+/// each once.
+pub fn dep_roots<'a, 'b>(outputs: &OutputsRef<'b>, roots: &GuestRoots<'_>, alloc: Alloc<'a>) -> AVec<'a, &'b str> {
+    let mut found: AVec<'a, &'b str> = Vec::new_in(alloc);
+    let scan = |text: &'b str, found: &mut AVec<'a, &'b str>| {
+        for piece in text.split(['\0', ' ', '\t', '\n', '=', ':', ',', '"', '\'']) {
+            let path = match piece.find('/') {
+                Some(0) => piece,
+                Some(at) if piece.starts_with('-') && !piece[..at].contains('/') => &piece[at..],
+                _ => continue,
+            };
+            if let Some(GuestRoot::Dep(root)) = roots.root_of(path) {
+                found.push(root);
+            }
+        }
+    };
+    for text in outputs.c_requests() {
+        scan(text, &mut found);
+    }
+    for tree in outputs.c_trees() {
+        scan(tree.cwd, &mut found);
+        for (_, value) in tree.env() {
+            scan(value, &mut found);
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
 }
 
 /// Whether `path` is `root` or under it.
@@ -343,9 +389,16 @@ pub fn read<'a, 'b>(request: u32, state: u32, text: &'b str, roots: &GuestRoots<
         "cc" | "clang" | "gcc" => compile(request, state, Driver::Clang, &argv, roots, alloc),
         "c++" | "clang++" | "g++" => compile(request, state, Driver::ClangXx, &argv, roots, alloc),
         "ar" | "llvm-ar" => append(request, &argv, roots, alloc),
-        "sh" | "make" | "gmake" | "cmake" | "perl" => Ok(Request::Tree { request }),
+        _ if is_tree(program) => Ok(Request::Tree { request }),
         _ => Ok(Request::Probe { request }),
     }
+}
+
+/// Whether a deferred spawn of `program` is a process-tree request ([`Request::Tree`]): its
+/// grain is the whole tree it starts (c_tasks_tree.rs). The one home of the names: the script
+/// sandbox keeps a tree request's folder and environment by it (outputs.rs `CTree`).
+pub fn is_tree(program: &str) -> bool {
+    matches!(name_of(program), "sh" | "make" | "gmake" | "cmake" | "perl")
 }
 
 /// A deferred spawn's argv as its record holds it: joined by NUL, each RELATIVE path argument
@@ -1448,13 +1501,22 @@ pub fn run_crate<'a, 'b, C: CCompiler>(
 
 /// The script's outputs as the link reads them after its tasks ran: the record's own, its
 /// requests dropped (they ran: natives.rs `DeferredC` fires only on a record whose requests did
-/// not), each archive a stored file at its name. The caller encodes it
-/// ([`crate::Outputs::encode`]) and opens it with the file area the archives were put in.
-pub fn built<'a>(outputs: &OutputsRef<'_>, made: &[Made<'_>], alloc: Alloc<'a>) -> Result<crate::Outputs<'a>, crate::outputs::FileError> {
+/// not), with their states and process trees' folders; each file the process tree made or
+/// changed (`tree`, c_tasks_tree.rs `run_tree`) a stored file at its name, in place of the
+/// script's own file of that name; each archive a stored file at its name. The caller encodes
+/// it ([`crate::Outputs::encode`]) and opens it with the file area the files were put in.
+pub fn built<'a>(outputs: &OutputsRef<'_>, made: &[Made<'_>], tree: &[crate::outputs::StoredFile<'_>], alloc: Alloc<'a>) -> Result<crate::Outputs<'a>, crate::outputs::FileError> {
     let mut owned = outputs.to_owned(alloc);
     owned.c_requests.clear();
     owned.c_states.clear();
     owned.c_bytes.clear();
+    owned.c_trees.clear();
+    for file in tree {
+        let name = file.name.as_str();
+        owned.files.retain(|f| f.name.as_str() != name);
+        owned.stored.retain(|f| f.name.as_str() != name);
+        owned.add_stored(name, file.len, file.mode, file.sha256, crate::outputs::FileLimits::DEFAULT, alloc)?;
+    }
     for one in made {
         owned.add_stored(one.name, one.file.len, crate::outputs::FileMode::Plain, one.file.sha256, crate::outputs::FileLimits::DEFAULT, alloc)?;
     }

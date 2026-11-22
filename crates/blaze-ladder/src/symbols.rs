@@ -46,6 +46,8 @@
 //! | 20 | closure | the owner's key (16), its ordinal (4) |
 //! | 21 | fn pointer | the header byte (`FnPtrHeader::bits`) |
 //! | 22 | async block's future | its ordinal (4) |
+//! | 23 | another body's future (`PNode::Coroutine`) | the owner's key (16), its ordinal (4) |
+//! | 24 | extern type (`PNode::Foreign`) | the item's key (16) |
 //!
 //! A type with no ground form (a parameter, an alias, an opaque type, a hole, an error) is
 //! refused by name ([`SymbolError::NotGround`]).
@@ -444,6 +446,12 @@ fn head(node: PNode, out: &mut AVec<'_, u8>) -> Result<(), SymbolError> {
             key(out, owner);
             out.extend_from_slice(&ordinal.to_le_bytes());
         }
+        // An extern type: its item's key, no children (a tag no earlier name held, so no
+        // symbol made before it moves).
+        PNode::Foreign(k) => {
+            out.push(24);
+            key(out, k);
+        }
         PNode::Param(_) => return Err(SymbolError::NotGround { what: "a generic parameter" }),
         PNode::ConstParam(_) => return Err(SymbolError::NotGround { what: "a const generic parameter" }),
         PNode::Alias { .. } => return Err(SymbolError::NotGround { what: "a projection not normalized" }),
@@ -538,7 +546,7 @@ fn decode_forest(r: &mut Reader<'_>, ground: &mut PortableTys<'_>, scratch: Allo
         match tag {
             0 | 1 | 5 | 6 | 7 | 10 | 11 | 15 | 16 => {}
             2 | 3 | 4 | 8 | 9 | 21 => wide = u128::from(r.u8()?),
-            12 | 13 | 14 | 17 | 19 => wide = r.u128()?,
+            12 | 13 | 14 | 17 | 19 | 24 => wide = r.u128()?,
             18 => {
                 wide = r.u128()?;
                 name_part = r.u64()?;
@@ -634,6 +642,7 @@ fn intern_node(o: Open, kids: &[PTy], ground: &mut PortableTys<'_>) -> Result<PT
             PNode::FnPtr(list(ground, kids)?, header)
         }
         23 => PNode::Coroutine { owner: ItemKey(o.wide), ordinal: o.ordinal, args: list(ground, kids)? },
+        24 => exactly(0).map(|()| PNode::Foreign(ItemKey(o.wide)))?,
         tag => return Err(SymbolError::UnknownTag { tag, at: 0 }),
     };
     ground.intern(node).map_err(|_| SymbolError::TableFull)

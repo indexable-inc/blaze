@@ -849,7 +849,7 @@ fn ground_list(ground: &mut PortableTys<'_>, args: &[PTy], types: PTys<'_>) -> O
                 args: ground_of_list(ground, types, &map, args)?,
                 term: *map.get(term.0 as usize)?,
             },
-            leaf @ PNode::ExAuto(_) => leaf,
+            leaf @ (PNode::ExAuto(_) | PNode::Foreign(_)) => leaf,
             PNode::ConstValue { ty, bits } => PNode::ConstValue { ty: *map.get(ty.0 as usize)?, bits },
             leaf @ (PNode::Bool
             | PNode::ConstParam(_)

@@ -168,7 +168,8 @@ pub fn children<'t>(tys: tc::PTys<'t>, t: tc::PTy, node: tc::PNode) -> Result<(&
         | N::Error
         | N::ConstValue { .. }
         | N::ConstParam(_)
-        | N::ExAuto(_) => (&[], None),
+        | N::ExAuto(_)
+        | N::Foreign(_) => (&[], None),
     })
 }
 

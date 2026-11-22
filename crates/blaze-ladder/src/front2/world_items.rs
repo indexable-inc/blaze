@@ -146,6 +146,7 @@ impl core::fmt::Display for Gap {
                 let site = match gap.site {
                     ConstSite::Arg => "const argument",
                     ConstSite::RepeatLen => "array repeat length",
+                    ConstSite::LegacyArg => "legacy const generic argument",
                 };
                 let why = match gap.why {
                     ConstGapWhy::NoEvaluator => "its converter evaluates no constant",

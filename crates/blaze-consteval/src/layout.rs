@@ -71,6 +71,7 @@ fn stop(e: &blaze_build::layout::LayoutError) -> Stop {
             None => Refusal::Unsupported { what: "a field type with no ground form" },
         },
         L::FieldGround { adt, field, name, ref error } => Refusal::FieldGround { adt, field, name, projection: projection_of(error) },
+        L::NoSize(item) => Refusal::NoSize { item },
     })
 }
 

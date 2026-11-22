@@ -385,7 +385,7 @@ fn same_head(a: PNode, b: PNode) -> bool {
         (N::Tuple(x), N::Tuple(y)) | (N::Dynamic(x), N::Dynamic(y)) => x.len == y.len,
         (N::Ref(m, _), N::Ref(n, _)) | (N::Ptr(m, _), N::Ptr(n, _)) => m == n,
         (N::Array(..), N::Array(..)) | (N::Slice(_), N::Slice(_)) => true,
-        (N::Adt(k, _), N::Adt(j, _)) | (N::FnDef(k, _), N::FnDef(j, _)) | (N::ExTrait(k, _), N::ExTrait(j, _)) => k == j,
+        (N::Adt(k, _), N::Adt(j, _)) | (N::FnDef(k, _), N::FnDef(j, _)) | (N::ExTrait(k, _), N::ExTrait(j, _)) | (N::Foreign(k), N::Foreign(j)) => k == j,
         (N::FnPtr(_, h), N::FnPtr(_, g)) => h == g,
         (N::Alias { trait_: t, name: n, .. }, N::Alias { trait_: u, name: m, .. }) | (N::ExProj { trait_: t, name: n, .. }, N::ExProj { trait_: u, name: m, .. }) => {
             t == u && n == m

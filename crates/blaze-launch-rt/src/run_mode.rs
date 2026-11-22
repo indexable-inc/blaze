@@ -80,7 +80,8 @@ use blaze_code::image::ImageError;
 use blaze_code::place::{At, PlaceError, Words};
 use blaze_code::record::{CodeView, DecodeError, Space, Symbol as CodeSymbol, Target};
 use blaze_code::unwind::UnwindError;
-use blaze_launch::wire::run::{Declared, Down, Failure, Needed, Symbol as WireSymbol, Up};
+use blaze_launch::observe::{Kind as ObserveKind, Observe, ObserveWrite, Slotword};
+use blaze_launch::wire::run::{Declared, Down, Failure, HookKind, Needed, Symbol as WireSymbol, Up};
 use blaze_launch::wire::{RecordId, WireError, split};
 use blaze_launch::{Slot, Thread, Tier};
 use blaze_own::{ADeque, AVec, Alloc, Vec, VecDeque};
@@ -164,6 +165,9 @@ pub enum Act {
     /// Make the run's thread-local descriptor and key, as the parent's `ThreadLocals` said
     /// ([`RunMode::make_thread_locals`]): before any record naming a thread-local.
     ThreadLocals,
+    /// Toggle a live observe stub on or off for `slot` (`Down::Hooks`): installs/removes the
+    /// stub and automatically retreats/re-promotes any optimized caller that inlined `slot`.
+    Hook { slot: SlotId, kind: HookKind },
 }
 
 /// Where a record's code is placed: the area in first-call order, or the hot region in the order
@@ -287,6 +291,24 @@ pub trait Memory {
     /// report, and its memory keeps nothing (the one method with a body here: an observer).
     fn note(&mut self, row: fault_report::Row) {
         let _ = row;
+    }
+    /// Ensures an observe stub of `kind` exists for `slot` and returns its run-view address.
+    /// Emitted once per `(slot, kind)`; its body word is updated separately by
+    /// [`Memory::store_body_word`].
+    fn ensure_observe_stub(&mut self, slot: SlotId, kind: ObserveKind) -> Result<u64, RunModeError> {
+        let _ = (slot, kind);
+        Err(RunModeError::NotBuilt { what: "observe stubs on this memory implementation" })
+    }
+    /// Atomically stores `body` into the body word of every observe stub emitted for `slot`.
+    fn store_body_word(&mut self, slot: SlotId, body: u64) -> Result<(), RunModeError> {
+        let _ = (slot, body);
+        Ok(())
+    }
+    /// Atomically stores `target` (a plain body address or an observe stub address) into
+    /// `slot`'s slot word.
+    fn store_slot_word(&mut self, slot: SlotId, target: u64) -> Result<(), RunModeError> {
+        let _ = (slot, target);
+        Ok(())
     }
 }
 
@@ -588,9 +610,12 @@ pub struct RunMode<'a> {
     slots: Numbering<'a>,
     /// The parent's bytes not yet a whole frame.
     inbox: AVec<'a, u8>,
-    /// One input per emitted placement, including ordinary publications with zero rows.
+    /// One input per emitted placement, including ordinary publications with zero rows and
+    /// optional inlined callee slots for optimized promotions.
     /// A repeated answer that FirstCall coalesces has no placement and takes no entry.
-    position_inputs: ADeque<'a, (Act, AVec<'a, u8>)>,
+    position_inputs: ADeque<'a, (Act, AVec<'a, u8>, AVec<'a, Slot>)>,
+    /// The unified two-word observe + inlining-deoptimization state machine for every slot.
+    observe: Observe<Alloc<'a>>,
     /// Frames for the parent, written by the driver ([`RunMode::outbox`]). The wire's encoder
     /// writes onto `alloc`'s vector, so this one is that type, in the run's allocator.
     outbox: std::vec::Vec<u8, Alloc<'a>>,
@@ -640,6 +665,7 @@ impl<'a> RunMode<'a> {
             },
             inbox: Vec::new_in(alloc),
             position_inputs: VecDeque::new_in(alloc),
+            observe: Observe::new(0, alloc),
             outbox: std::vec::Vec::new_in(alloc),
             said: Vec::new_in(alloc),
             next_id: 1,
@@ -764,6 +790,27 @@ impl<'a> RunMode<'a> {
                 Ok(())
             }
             Down::ThreadLocals { descriptor, ender } => self.tell_thread_locals(descriptor, ender, out),
+            Down::Hooks { slot, kind } => {
+                let local = self.slots.local(slot)?;
+                out.push(Act::Hook { slot: local, kind });
+                Ok(())
+            }
+            Down::Promote { slot, record, inlined, values } => {
+                let local = self.slots.local(slot)?;
+                let state = self.slots.first.state(local)?;
+                if !matches!(state, first_call::State::Bound(_)) {
+                    return Err(RunModeError::NotBuilt {
+                        what: "a record at the optimized tier for a slot whose fast code is not bound yet",
+                    });
+                }
+                let mut local_inlined: AVec<'a, Slot> = Vec::new_in(self.alloc);
+                for callee_wire in inlined.iter() {
+                    let callee_local = self.slots.local(callee_wire)?;
+                    local_inlined.push(Slot(callee_local.0));
+                }
+                self.queue_placement_with_inlined(Act::Promote { slot: local, record }, values, local_inlined, out);
+                Ok(())
+            }
             Down::Failed { need, why } => {
                 let local = match need {
                     Needed::Slot(slot) => self.slots.local(slot)?,
@@ -823,7 +870,18 @@ impl<'a> RunMode<'a> {
     }
 
     fn queue_placement(&mut self, act: Act, values: &[u8], out: &mut AVec<'_, Act>) {
-        self.position_inputs.push_back((act, Vec::from_slice_in(values, self.alloc)));
+        let empty = Vec::new_in(self.alloc);
+        self.queue_placement_with_inlined(act, values, empty, out);
+    }
+
+    fn queue_placement_with_inlined(
+        &mut self,
+        act: Act,
+        values: &[u8],
+        inlined: AVec<'a, Slot>,
+        out: &mut AVec<'_, Act>,
+    ) {
+        self.position_inputs.push_back((act, Vec::from_slice_in(values, self.alloc), inlined));
         out.push(act);
     }
 
@@ -989,6 +1047,33 @@ impl<'a> RunMode<'a> {
         Ok(())
     }
 
+    /// Carries [`Act::Hook`]: installs or removes an observe stub on `slot` through the unified
+    /// `Observe` overlay, automatically retreating/re-promoting any optimized caller whose
+    /// inlined read list includes `slot`.
+    pub fn hook(&mut self, slot: SlotId, kind: HookKind, memory: &mut impl Memory) -> Result<(), RunModeError> {
+        let obs_slot = Slot(slot.0);
+        let mut writes = std::vec::Vec::new_in(self.alloc);
+        match kind {
+            HookKind::Plain => {
+                self.observe.plain(&[obs_slot], &mut writes);
+            }
+            HookKind::Count | HookKind::Mark | HookKind::Hook | HookKind::Span => {
+                let obs_kind = match kind {
+                    HookKind::Count => ObserveKind::Count,
+                    HookKind::Mark => ObserveKind::Mark,
+                    HookKind::Hook => ObserveKind::Hook,
+                    HookKind::Span => ObserveKind::Span,
+                    HookKind::Plain => unreachable!(),
+                };
+                if self.observe.body(obs_slot).is_some() {
+                    let stub_addr = memory.ensure_observe_stub(slot, obs_kind)?;
+                    self.observe.observe(&[obs_slot], obs_kind, |_| stub_addr, &mut writes);
+                }
+            }
+        }
+        apply_observe_writes(memory, &writes)
+    }
+
     /// Places `record` as `slot`'s code in `region` and publishes it.
     fn lay(
         &mut self,
@@ -1003,11 +1088,11 @@ impl<'a> RunMode<'a> {
             Region::Area => Act::Place { slot, record },
             Region::Hot => Act::Promote { slot, record },
         };
-        let queued = self.position_inputs.front().map(|(act, _)| *act);
+        let queued = self.position_inputs.front().map(|(act, _, _)| *act);
         if queued != Some(placement) {
             return Err(RunModeError::PositionOrder { placement, queued });
         }
-        let (_, values) = self.position_inputs.pop_front().expect("the placement at the front was just checked");
+        let (_, values, inlined) = self.position_inputs.pop_front().expect("the placement at the front was just checked");
         let bytes = source.bytes(record)?;
         let view = CodeView::read(bytes).map_err(|why| RunModeError::Decode { record, why })?;
         let unwind = blaze_code::unwind::read(view).map_err(|why| RunModeError::Unwind { record, why })?;
@@ -1061,7 +1146,16 @@ impl<'a> RunMode<'a> {
             relro: &relro,
             entry: entry.map(|(at, parts)| (at, &entry_bytes[..], parts)),
         };
-        let mut publication = Publication { memory, placing: &placing, failed: None };
+        // Decide the exact body-word / slot-word stores through the unified Observe overlay
+        // (preserving active observe stubs and keeping callers on fast tier while any inlined
+        // callee is observed).
+        let mut obs_writes = std::vec::Vec::new_in(self.alloc);
+        match region {
+            Region::Area => self.observe.publish(Slot(slot.0), code_at, &mut obs_writes),
+            Region::Hot => self.observe.publish_optimized(Slot(slot.0), code_at, inlined.as_slice(), &mut obs_writes),
+        }
+        let plain_store = obs_writes.iter().any(|w| matches!(w, ObserveWrite::Slot { slot: s, to: Slotword::Body(addr) } if *s == Slot(slot.0) && *addr == code_at));
+        let mut publication = Publication { memory, placing: &placing, obs_writes: &obs_writes, plain_store, failed: None };
         let order = match plant {
             Plant::None => code_unwind::Plant::None,
             Plant::StoreBeforeRegister => code_unwind::Plant::RegisterAfterStore,
@@ -1229,11 +1323,30 @@ impl<M: Memory> Words for Binder<'_, '_, M> {
     }
 }
 
+/// Applies `ObserveWrite` operations in the exact order emitted by `Observe`: body words
+/// before any slot word pointing at a stub.
+fn apply_observe_writes(memory: &mut impl Memory, writes: &[ObserveWrite]) -> Result<(), RunModeError> {
+    for &write in writes {
+        match write {
+            ObserveWrite::Body { slot, body } => memory.store_body_word(SlotId(slot.0), body)?,
+            ObserveWrite::Slot { slot, to } => match to {
+                Slotword::Body(addr) | Slotword::Stub { at: addr, .. } => {
+                    memory.store_slot_word(SlotId(slot.0), addr)?
+                }
+                Slotword::Lazy => {}
+            },
+        }
+    }
+    Ok(())
+}
+
 /// code_unwind's four steps over a [`Memory`]: the first failure is kept and every later step
 /// is skipped (a word is never stored over code that was not copied).
 struct Publication<'m, 'p, M: Memory> {
     memory: &'m mut M,
     placing: &'m Placing<'p>,
+    obs_writes: &'m [ObserveWrite],
+    plain_store: bool,
     failed: Option<RunModeError>,
 }
 
@@ -1242,7 +1355,23 @@ impl<M: Memory> code_unwind::Effects for Publication<'_, '_, M> {
         if self.failed.is_some() {
             return;
         }
-        if let Err(why) = self.memory.carry(step, self.placing) {
+        let res = match step {
+            Step::Store if !self.plain_store => apply_observe_writes(self.memory, self.obs_writes),
+            Step::Store => {
+                // Keep every body word updated before the plain slot-word store.
+                for &w in self.obs_writes {
+                    if let ObserveWrite::Body { slot, body } = w {
+                        if let Err(why) = self.memory.store_body_word(SlotId(slot.0), body) {
+                            self.failed = Some(why);
+                            return;
+                        }
+                    }
+                }
+                self.memory.carry(Step::Store, self.placing)
+            }
+            other => self.memory.carry(other, self.placing),
+        };
+        if let Err(why) = res {
             self.failed = Some(why);
         }
     }
@@ -1511,11 +1640,16 @@ struct NativeMemory<'a, B: Bind> {
     data_base: u64,
     /// The next free byte of the data area, from its base.
     data_next: usize,
-    /// The program's native library once loaded (`Act::Native`): from then on every C name is
-    /// bound through its handle (the image, then the libraries it loaded: native_lib.rs
-    /// [`crate::native_lib::bind`]), never `bind`. `None` for a run whose start named no
-    /// library (BLAZE_LAUNCH_NATIVE unset): its C names bind through `bind` as before.
+    /// The program's native library once loaded (`Act::Native`): from then on every C name not
+    /// claimed by [`Bind::intercept`] is bound through its handle (`native_lib::bind`).
     natives: Option<crate::native_lib::DlNatives>,
+    /// Shared veneers for `observe::hook_entry` and `observe::span_entry` (reachable within
+    /// ±128 MiB from every observe stub placed in the code area).
+    hook_veneer: u64,
+    span_veneer: u64,
+    /// Emitted observe stubs per `(slot, kind)` with their run-view address (each emitted once;
+    /// its trailing `.quad body` is updated atomically by `store_body_word`).
+    observe_stubs: AVec<'a, (SlotId, ObserveKind, u64)>,
 }
 
 /// The writable data area's length: address space only, each page backed by the kernel on its
@@ -1553,7 +1687,21 @@ impl<'a, B: Bind> NativeMemory<'a, B> {
         let context = std::sync::Arc::into_raw(std::sync::Arc::clone(&shared)) as u64;
         let entry = crate::arch::resolver as usize as u64;
         code.write(layout.stubs, &crate::arch::stub_head(context, entry)).map_err(RunModeError::Sys)?;
-        let next = layout.area;
+        let mut next = layout.area;
+        #[cfg(target_arch = "aarch64")]
+        let (hook_veneer, span_veneer) = {
+            let hv_off = next;
+            code.write(hv_off, &crate::observe::veneer(crate::observe::hook_entry as *const () as usize as u64))
+                .map_err(RunModeError::Sys)?;
+            next += crate::observe::VENEER;
+            let sv_off = next;
+            code.write(sv_off, &crate::observe::veneer(crate::observe::span_entry as *const () as usize as u64))
+                .map_err(RunModeError::Sys)?;
+            next += crate::observe::VENEER;
+            ((base + hv_off) as u64, (base + sv_off) as u64)
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let (hook_veneer, span_veneer) = (0u64, 0u64);
         let hot_next = layout.hot;
         let at = |offset: usize| (base + offset) as u64;
         let regions = fault_report::Regions {
@@ -1573,7 +1721,23 @@ impl<'a, B: Bind> NativeMemory<'a, B> {
         // written and so before any program code runs.
         unsafe { fault_report::install(regions) }?;
         let data_base = map_data()?;
-        Ok(NativeMemory { bind, code, layout, base: base as u64, next, hot_next, outside: Vec::new_in(alloc), shared, unwind, data_base, data_next: 0, natives: None })
+        Ok(NativeMemory {
+            bind,
+            code,
+            layout,
+            base: base as u64,
+            next,
+            hot_next,
+            outside: Vec::new_in(alloc),
+            shared,
+            unwind,
+            data_base,
+            data_next: 0,
+            natives: None,
+            hook_veneer,
+            span_veneer,
+            observe_stubs: Vec::new_in(alloc),
+        })
     }
 
     fn at(&self, offset: usize) -> u64 {
@@ -1633,13 +1797,17 @@ impl<B: Bind> Memory for NativeMemory<'_, B> {
                 let Ok(cname) = core::ffi::CStr::from_bytes_until_nul(&cname) else {
                     return Err(refused("its name is longer than 511 bytes or holds a NUL"));
                 };
-                // A run with its native library: through the library's handle (NATIVE.md 3.7: a
-                // name resolves against the program's declared libraries, not against what the
-                // launcher happened to load). Without one, the run's strategy
-                // (run_mode/bind.rs): the process's images, or the table.
-                let address = match self.natives.as_mut() {
-                    Some(natives) => crate::native_lib::bind(Some(natives), record, symbol, name)?,
-                    None => self.bind.address(name, cname).map_err(refused)?,
+                // 1. Runtime-owned interception (`LauncherOwn`, `ObservedBind`) always runs
+                //    first, even when a native library is loaded, so `pthread_create`,
+                //    `_Unwind_RaiseException`, and telemetry wrappers are never bypassed.
+                // 2. Otherwise, a run with its native library binds through the library handle;
+                //    without one, through the run's strategy (`Dlsym` or `Table`).
+                let address = match self.bind.intercept(name) {
+                    Some(addr) => addr,
+                    None => match self.natives.as_mut() {
+                        Some(natives) => crate::native_lib::bind(Some(natives), record, symbol, name)?,
+                        None => self.bind.address(name, cname).map_err(|err| refused(err.reason()))?,
+                    },
                 };
                 self.code.store(self.layout.outside + count as usize * 8, address).map_err(RunModeError::Sys)?;
                 self.outside.insert_shift(at, (symbol, count));
@@ -1748,6 +1916,68 @@ impl<B: Bind> Memory for NativeMemory<'_, B> {
 
     fn note(&mut self, row: fault_report::Row) {
         fault_report::note(row);
+    }
+
+    fn ensure_observe_stub(&mut self, slot: SlotId, kind: ObserveKind) -> Result<u64, RunModeError> {
+        if let Some(&(_, _, addr)) = self.observe_stubs.iter().find(|&&(s, k, _)| s == slot && k == kind) {
+            return Ok(addr);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let (stub_bytes, at) = match kind {
+                ObserveKind::Hook => {
+                    let at = self.reserve(crate::observe::HOOK_STUB, 8)?;
+                    let bytes = crate::observe::hook_stub_slot(at, self.hook_veneer, slot.0, 0)
+                        .map_err(RunModeError::Reach)?;
+                    (bytes, at)
+                }
+                ObserveKind::Span => {
+                    let at = self.reserve(crate::observe::SPAN_STUB, 8)?;
+                    let bytes = crate::observe::span_stub(at, self.span_veneer, slot.0, 0)
+                        .map_err(RunModeError::Reach)?;
+                    (bytes, at)
+                }
+                ObserveKind::Count | ObserveKind::Mark => {
+                    return Err(RunModeError::NotBuilt {
+                        what: "count/mark observe stubs in run_mode (use Hook or Span)",
+                    });
+                }
+            };
+            self.code.write(self.offset(at), &stub_bytes).map_err(RunModeError::Sys)?;
+            self.observe_stubs.push((slot, kind, at));
+            Ok(at)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = (slot, kind);
+            Err(RunModeError::NotBuilt { what: "observe stubs on non-AArch64" })
+        }
+    }
+
+    fn store_body_word(&mut self, slot: SlotId, body: u64) -> Result<(), RunModeError> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            for i in 0..self.observe_stubs.len() {
+                let (s, k, at) = self.observe_stubs[i];
+                if s == slot {
+                    let rt_kind = match k {
+                        ObserveKind::Count => crate::observe::Kind::Count,
+                        ObserveKind::Mark => crate::observe::Kind::Mark,
+                        ObserveKind::Hook => crate::observe::Kind::Hook,
+                        ObserveKind::Span => crate::observe::Kind::Span,
+                    };
+                    let body_off = self.offset(at) + crate::observe::body_offset(rt_kind);
+                    self.code.store(body_off, body).map_err(RunModeError::Sys)?;
+                }
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = (slot, body);
+        Ok(())
+    }
+
+    fn store_slot_word(&mut self, slot: SlotId, target: u64) -> Result<(), RunModeError> {
+        self.code.store(self.layout.words + slot.index() * 8, target).map_err(RunModeError::Sys)
     }
 }
 
@@ -2138,6 +2368,7 @@ fn control<S: RecordSource + RecordFiles, B: Bind>(
                 Act::Promote { slot, record } => mode.promote(slot, record, source, &mut memory, Plant::None),
                 Act::Statics => mode.place_statics(source, &mut memory),
                 Act::ThreadLocals => mode.make_thread_locals(&mut memory),
+                Act::Hook { slot, kind } => mode.hook(slot, kind, &mut memory),
                 Act::Wake { thread, slot } => {
                     match waiting.iter().position(|(at, who, _)| *at == slot && *who == thread) {
                         Some(index) => {
@@ -2260,7 +2491,7 @@ fn load_library<S: RecordFiles, B: Bind>(mode: &mut RunMode<'_>, source: &S, mem
     Ok(loaded)
 }
 
-pub use bind::{Bind, Dlsym, Table, TableError};
+pub use bind::{Bind, BindError, Dlsym, LauncherOwn, ObservedBind, Table, TableError};
 pub use thread_locals::ThreadKey;
 
 #[cfg(test)]

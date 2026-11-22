@@ -245,6 +245,7 @@ pub(crate) fn shape_of(t: PTys<'_>, p: PTy) -> Option<Shape> {
         PNode::Slice(_) => Shape::Slice,
         PNode::Pat(..) => Shape::Pat,
         PNode::Adt(k, _) => Shape::Adt(k),
+        PNode::Foreign(k) => Shape::Foreign(k),
         PNode::FnDef(k, _) => Shape::FnDef(k),
         PNode::FnPtr(l, _) => Shape::FnPtr(l.len.saturating_sub(1)),
         PNode::Opaque(k, _) => Shape::Opaque(k),
