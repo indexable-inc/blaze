@@ -74,6 +74,13 @@ enum DragOp {
         max_scroll: f32,
         grab_off: f32,
     },
+    VScrollSource {
+        track_y: f32,
+        track_h: f32,
+        thumb_h: f32,
+        max_scroll: f32,
+        grab_off: f32,
+    },
     MinimapScrub {
         bar_x: f32,
         bar_w: f32,
@@ -179,6 +186,8 @@ enum Action {
     ClearHeapWindow,
     JumpToTraceTime(f64),
     OpenUrl(String),
+    JumpSource(String, u32),
+    SourceBack,
 }
 
 struct HitZone {
@@ -211,6 +220,7 @@ enum HoverTarget {
     Port(crate::model::SocketInfo),
     MapCard(u32),
     HeapSite(crate::model::HeapSiteComp),
+    CodeSym(crate::rust_ide::SymDef),
 }
 
 pub struct UiApp {
@@ -233,9 +243,15 @@ pub struct UiApp {
     pane_max_scroll: HashMap<PaneId, f32>,
     source_scroll_x: f32,
     source_max_scroll_x: f32,
+    source_scroll_y: f32,
+    source_max_scroll_y: f32,
+    source_box_rect: Rect,
+    source_auto_center: Option<(String, u32)>,
 
-    // Active inspection & popover state
+    // Active inspection & Post-IDE navigation state
     pub inspected_slot: Option<u32>,
+    pub code_view: Option<(String, u32)>,
+    pub code_history: Vec<(String, u32)>,
     pub layout_menu_open: bool,
 
     // Flame Graph state
@@ -267,6 +283,7 @@ pub struct UiApp {
     leaves: Vec<LeafLayout>,
     splitters: Vec<SplitterLayout>,
     vscrolls: Vec<VScrollHit>,
+    vscroll_source: Option<VScrollHit>,
     hscroll_source: Option<HScrollHit>,
     minimap_hit: Option<MinimapHit>,
     radar_hit: Option<RadarHit>,
@@ -304,7 +321,13 @@ impl UiApp {
             pane_max_scroll: HashMap::new(),
             source_scroll_x: 0.0,
             source_max_scroll_x: 0.0,
+            source_scroll_y: 0.0,
+            source_max_scroll_y: 0.0,
+            source_box_rect: Rect::default(),
+            source_auto_center: None,
             inspected_slot: None,
+            code_view: None,
+            code_history: Vec::new(),
             layout_menu_open: false,
             flame_inverted: false,
             flame_zoom_name: None,
@@ -328,6 +351,7 @@ impl UiApp {
             leaves: Vec::new(),
             splitters: Vec::new(),
             vscrolls: Vec::new(),
+            vscroll_source: None,
             hscroll_source: None,
             minimap_hit: None,
             radar_hit: None,
@@ -357,12 +381,47 @@ impl UiApp {
         if file.is_empty() || line == 0 {
             return;
         }
+        if self.world.file_lines.contains_key(file) || self.world.pending_files.contains(file) {
+            return;
+        }
         let key = (file.to_string(), line);
         if self.world.sources.contains_key(&key) || self.world.pending_sources.contains(&key) {
             return;
         }
+        self.world.pending_files.insert(file.to_string());
         self.world.pending_sources.insert(key);
         self.commands.push(format!("source:{file}|{line}"));
+    }
+
+    fn def_cache_key(from_file: &str, q: &crate::rust_ide::CrossFileQuery) -> String {
+        format!(
+            "{}|{}|{}|{}|{}",
+            from_file,
+            q.prefix.as_deref().unwrap_or(""),
+            q.import_path.as_deref().unwrap_or(""),
+            q.want_kind,
+            q.ident
+        )
+    }
+
+    fn queue_def_if_needed(&mut self, from_file: &str, q: &crate::rust_ide::CrossFileQuery) {
+        if q.ident.is_empty() {
+            return;
+        }
+        let key = Self::def_cache_key(from_file, q);
+        if self.world.workspace_defs.contains_key(&key) || self.world.pending_defs.contains(&key) {
+            return;
+        }
+        self.world.pending_defs.insert(key.clone());
+        self.commands.push(format!(
+            "def:{}\t{}\t{}\t{}\t{}\t{}",
+            key,
+            q.ident,
+            from_file,
+            q.prefix.as_deref().unwrap_or(""),
+            q.import_path.as_deref().unwrap_or(""),
+            q.want_kind
+        ));
     }
 
     fn hit_point(&self, x: f32, y: f32) -> Option<&HitZone> {
@@ -485,6 +544,18 @@ impl UiApp {
                 self.source_scroll_x = (frac * max_scroll).clamp(0.0, max_scroll);
                 self.desired_cursor = "grabbing";
             }
+            DragOp::VScrollSource {
+                track_y,
+                track_h,
+                thumb_h,
+                max_scroll,
+                grab_off,
+            } => {
+                let travel = (track_h - thumb_h).max(1.0);
+                let frac = ((y - grab_off - track_y) / travel).clamp(0.0, 1.0);
+                self.source_scroll_y = (frac * max_scroll).clamp(0.0, max_scroll);
+                self.desired_cursor = "grabbing";
+            }
             DragOp::MinimapScrub {
                 bar_x,
                 bar_w,
@@ -594,6 +665,7 @@ impl UiApp {
 
     fn update_idle_cursor(&mut self, x: f32, y: f32) {
         if self.vscrolls.iter().any(|v| v.track.contains(x, y))
+            || self.vscroll_source.map(|v| v.track.contains(x, y)).unwrap_or(false)
             || self.hscroll_source.map(|h| h.track.contains(x, y)).unwrap_or(false)
             || self.radar_hit.map(|r| r.rect.contains(x, y)).unwrap_or(false)
         {
@@ -711,6 +783,26 @@ impl UiApp {
                 grab_off,
             };
             return;
+        }
+        if let Some(vs) = self.vscroll_source {
+            if vs.track.contains(x, y) {
+                let grab_off = if vs.thumb.contains(x, y) {
+                    y - vs.thumb.y
+                } else {
+                    let travel = (vs.track.h - vs.thumb.h).max(1.0);
+                    let frac = ((y - vs.thumb.h * 0.5 - vs.track.y) / travel).clamp(0.0, 1.0);
+                    self.source_scroll_y = (frac * vs.max_scroll).clamp(0.0, vs.max_scroll);
+                    vs.thumb.h * 0.5
+                };
+                self.drag_op = DragOp::VScrollSource {
+                    track_y: vs.track.y,
+                    track_h: vs.track.h,
+                    thumb_h: vs.thumb.h,
+                    max_scroll: vs.max_scroll,
+                    grab_off,
+                };
+                return;
+            }
         }
         if let Some(hs) = self.hscroll_source {
             if hs.track.contains(x, y) {
@@ -928,12 +1020,24 @@ impl UiApp {
                 }
             }
             PaneId::Inspector => {
-                if dy.abs() > 0.25 {
-                    let cur = self.scroll_of(PaneId::Inspector);
-                    self.set_scroll(PaneId::Inspector, cur + dy);
-                }
-                if dx.abs() > 0.25 && self.source_max_scroll_x > 0.0 {
-                    self.source_scroll_x = (self.source_scroll_x + dx).clamp(0.0, self.source_max_scroll_x);
+                if self.source_box_rect.contains(x, y) {
+                    if dy.abs() > 0.25 && self.source_max_scroll_y > 0.0 {
+                        self.source_scroll_y = (self.source_scroll_y + dy).clamp(0.0, self.source_max_scroll_y);
+                    } else if dy.abs() > 0.25 {
+                        let cur = self.scroll_of(PaneId::Inspector);
+                        self.set_scroll(PaneId::Inspector, cur + dy);
+                    }
+                    if dx.abs() > 0.25 && self.source_max_scroll_x > 0.0 {
+                        self.source_scroll_x = (self.source_scroll_x + dx).clamp(0.0, self.source_max_scroll_x);
+                    }
+                } else {
+                    if dy.abs() > 0.25 {
+                        let cur = self.scroll_of(PaneId::Inspector);
+                        self.set_scroll(PaneId::Inspector, cur + dy);
+                    }
+                    if dx.abs() > 0.25 && self.source_max_scroll_x > 0.0 {
+                        self.source_scroll_x = (self.source_scroll_x + dx).clamp(0.0, self.source_max_scroll_x);
+                    }
                 }
             }
             other => {
@@ -1033,7 +1137,42 @@ impl UiApp {
             Action::FlameZoom(name) => self.flame_zoom_name = name,
             Action::InspectSlot(slot) => {
                 self.inspected_slot = Some(slot);
+                self.code_view = None;
+                self.source_scroll_x = 0.0;
+                if let Some(&fe) = self.world.slot_entity.get(&slot) {
+                    if let Some(f) = self.world.fns.get(fe) {
+                        if !f.file.is_empty() && f.line > 0 {
+                            self.source_auto_center = Some((f.file.clone(), f.line));
+                        }
+                    }
+                }
                 self.dock.focus_or_open(PaneId::Inspector);
+            }
+            Action::JumpSource(file, line) => {
+                // Save current location into navigation history for `← Back`
+                if let Some(cur) = self.current_code_loc() {
+                    if cur != (file.clone(), line) {
+                        self.code_history.push(cur);
+                        if self.code_history.len() > 32 {
+                            self.code_history.remove(0);
+                        }
+                    }
+                }
+                self.code_view = Some((file.clone(), line));
+                self.source_scroll_x = 0.0;
+                self.source_auto_center = Some((file.clone(), line));
+                self.queue_source_if_needed(&file, line);
+                self.dock.focus_or_open(PaneId::Inspector);
+            }
+            Action::SourceBack => {
+                if let Some((file, line)) = self.code_history.pop() {
+                    self.code_view = Some((file.clone(), line));
+                    self.source_scroll_x = 0.0;
+                    self.source_auto_center = Some((file.clone(), line));
+                    self.queue_source_if_needed(&file, line);
+                } else {
+                    self.code_view = None;
+                }
             }
             Action::SetHook(slot, hook) => {
                 if let Some(&e) = self.world.slot_entity.get(&slot) {
@@ -1100,7 +1239,9 @@ impl UiApp {
 
         self.hits.clear();
         self.vscrolls.clear();
+        self.vscroll_source = None;
         self.hscroll_source = None;
+        self.source_box_rect = Rect::default();
         self.minimap_hit = None;
         self.radar_hit = None;
         self.heap_chart_hit = None;
@@ -2243,14 +2384,20 @@ impl UiApp {
     ) {
         self.draw.card(r.x, r.y, r.w, r.h, 7.0, col::BG2, col::LINE);
         self.draw.icon(icon, r.x + 10.0, r.y + 8.0, 12.0, color);
-        self.draw.text(r.x + 26.0, r.y + 7.5, 10.0, col::INK3, title);
+        let tw_title = self.draw.text(r.x + 26.0, r.y + 7.5, 10.0, col::INK3, title);
+        let title_end = r.x + 26.0 + tw_title + 8.0;
 
-        let pw_txt = self.draw.measure_text(primary, 10.5);
-        let sw_txt = self.draw.measure_text(sub, 9.5);
-        self.draw
-            .text(r.x + r.w - pw_txt - sw_txt - 16.0, r.y + 7.0, 10.5, col::INK1, primary);
-        self.draw
-            .text(r.x + r.w - sw_txt - 10.0, r.y + 8.0, 9.5, color, sub);
+        let pw_txt = self.draw.measure_text(primary, 10.2);
+        let sw_txt = self.draw.measure_text(sub, 9.2);
+        let both_x = r.x + r.w - pw_txt - sw_txt - 16.0;
+        if both_x >= title_end {
+            self.draw.text(both_x, r.y + 7.2, 10.2, col::INK1, primary);
+            self.draw
+                .text(r.x + r.w - sw_txt - 10.0, r.y + 8.0, 9.2, color, sub);
+        } else if r.x + r.w - pw_txt - 10.0 >= title_end {
+            self.draw
+                .text(r.x + r.w - pw_txt - 10.0, r.y + 7.2, 10.2, col::INK1, primary);
+        }
 
         let px = r.x + 10.0;
         let py = r.y + 28.0;
@@ -3507,10 +3654,14 @@ impl UiApp {
                 self.draw.rect(x0, ry, w, 1.0, col::LINE);
             }
             let is_sel = self.inspected_slot == Some(f.slot);
+            let is_hov = self.is_hovered(x0, ry, w, row_h);
             if is_sel {
                 self.draw.rect(x0 + 1.0, ry + 1.0, w - 2.0, row_h - 1.0, col::FIRE_SOFT);
-            } else if self.is_hovered(x0, ry, w, row_h) {
+            } else if is_hov {
                 self.draw.rect(x0 + 1.0, ry + 1.0, w - 2.0, row_h - 1.0, [1.0, 1.0, 1.0, 0.035]);
+            }
+            if is_hov {
+                self.hover_target = Some(HoverTarget::MapCard(f.slot));
             }
 
             let self_ns = f.total_ns.saturating_sub(f.child_ns);
@@ -3635,7 +3786,12 @@ impl UiApp {
         let x0 = area.x + pad;
         let w = (area.w - pad * 2.0 - 6.0).max(280.0);
         let scroll = self.scroll_of(PaneId::HeapDiff);
-        let mut y0 = sub_y + 30.0 - scroll;
+        let body_top = sub_y + 28.0;
+        let body_h = (area.y + area.h - body_top).max(20.0);
+        let mut y0 = body_top + 2.0 - scroll;
+
+        // Clip scrolled content cleanly below the fixed Take Snapshot / Window subbar!
+        self.draw.push_clip(area.x, body_top, area.w, body_h);
 
         // Visual Heap Composition Strip (segmented site breakdown + human KPIs)
         let palette = [col::FIRE, col::SERIES2, col::OK, col::WARN, col::SERIES4];
@@ -3727,6 +3883,7 @@ impl UiApp {
             };
             self.draw
                 .text(x0 + 10.0, y0 + head_h + 11.0, 10.5, col::INK3, empty_msg);
+            self.draw.pop_clip();
             self.pane_max_scroll.insert(PaneId::HeapDiff, 0.0);
             return;
         }
@@ -3749,24 +3906,47 @@ impl UiApp {
             let dot_col = palette[ri % palette.len()];
             self.draw.circle(cx[0] + 4.0, ry + 12.5, 3.0, dot_col);
 
-            // Line 1: Resolved function name + callers
+            // Line 1: Bold primary allocating fn + subtle immediate caller (no repetitive 3-frame text wall!)
             let site_max = (cx[1] - cx[0] - 20.0).max(60.0);
-            let disp = if s.display_stack.is_empty() {
-                s.key.as_str()
-            } else {
-                s.display_stack.as_str()
-            };
-            self.draw
-                .text_max(cx[0] + 13.0, ry + 6.0, 10.2, col::INK1, disp, site_max);
+            let primary_fn = if s.top_fn.is_empty() { s.key.as_str() } else { s.top_fn.as_str() };
+            let pw_fn = self
+                .draw
+                .text_max(cx[0] + 13.0, ry + 6.0, 10.4, col::INK1, primary_fn, site_max);
+            if let Some(caller) = s.display_stack.split(" → ").nth(1) {
+                let rem = site_max - pw_fn - 6.0;
+                if rem >= 54.0 {
+                    self.draw.text_max(
+                        cx[0] + 13.0 + pw_fn + 6.0,
+                        ry + 6.5,
+                        9.4,
+                        col::INK4,
+                        &format!("← {caller}"),
+                        rem,
+                    );
+                }
+            }
 
-            // Line 2: source file:line + thread attribution
-            let loc_meta = if !s.file.is_empty() && s.line > 0 {
-                format!("{}:{} · t#{}", short_path(&s.file), s.line, s.thread)
-            } else {
-                format!("t#{} · {}", s.thread, s.key)
-            };
-            self.draw
-                .text_max(cx[0] + 13.0, ry + 21.0, 9.2, col::INK3, &loc_meta, site_max);
+            // Line 2: Compact basename `file.rs:line` + tiny thread pill `[t#N]`
+            let mut mx = cx[0] + 13.0;
+            if !s.file.is_empty() && s.line > 0 {
+                let loc = format!("{}:{}", file_base(&s.file), s.line);
+                mx += self
+                    .draw
+                    .text_max(mx, ry + 21.5, 9.2, col::INK3, &loc, (site_max - 42.0).max(40.0))
+                    + 8.0;
+            }
+            if s.thread > 0 {
+                self.draw.badge(
+                    mx,
+                    ry + 19.5,
+                    14.5,
+                    8.5,
+                    &format!("t#{}", s.thread),
+                    col::INK3,
+                    col::BG3,
+                    col::LINE,
+                );
+            }
 
             // Status diagnostic badge (`LEAK` / `GROWING` / `CHURN` / `OK`)
             let live_cnt = s.allocs.saturating_sub(s.frees);
@@ -3826,9 +4006,16 @@ impl UiApp {
             } else {
                 "fixed".into()
             };
-            self.draw.text(cx[3], ry + 21.0, 9.0, col::INK3, &range_s);
+            self.draw.text_max(
+                cx[3],
+                ry + 21.0,
+                9.0,
+                col::INK3,
+                &range_s,
+                (cx[4] - cx[3] - 8.0).max(24.0),
+            );
 
-            // Alloc / Free + survival %
+            // Alloc / Free + visual inline survival meter (visual primitive instead of noisy text!)
             self.draw.text(
                 cx[4],
                 ry + 7.0,
@@ -3836,23 +4023,31 @@ impl UiApp {
                 col::INK2,
                 &format!("{} / {}", s.allocs, s.frees),
             );
-            let surv_s = if live_cnt == 0 {
-                "100% freed".into()
+            let meter_w = (cx[5] - cx[4] - 46.0).clamp(26.0, 56.0);
+            self.draw.rrect(cx[4], ry + 23.5, meter_w, 4.0, 2.0, col::BG4);
+            let surv_col = if survival >= 0.85 && s.allocs >= 4 {
+                col::DANGER
+            } else if survival >= 0.45 {
+                col::WARN
             } else {
-                format!("{live_cnt} live ({:.0}%)", survival * 100.0)
+                col::OK
             };
+            if survival > 0.01 {
+                self.draw.rrect(
+                    cx[4],
+                    ry + 23.5,
+                    (meter_w * survival as f32).clamp(3.0, meter_w),
+                    4.0,
+                    2.0,
+                    surv_col,
+                );
+            }
             self.draw.text(
-                cx[4],
-                ry + 21.0,
-                9.0,
-                if survival >= 0.85 && s.allocs >= 4 {
-                    col::DANGER
-                } else if live_cnt == 0 {
-                    col::OK
-                } else {
-                    col::INK3
-                },
-                &surv_s,
+                cx[4] + meter_w + 6.0,
+                ry + 20.0,
+                8.8,
+                surv_col,
+                &format!("{:.0}%", survival * 100.0),
             );
 
             // Retained net + total allocated
@@ -3892,8 +4087,9 @@ impl UiApp {
                 self.draw.text(cx[6], ry + 12.5, 10.0, col::INK4, "—");
             }
         }
-        let content_h = (y0 + scroll - area.y) + table_h + 16.0;
-        self.draw_vscrollbar(PaneId::HeapDiff, area.x + area.w - 9.0, area.y, area.h, content_h);
+        self.draw.pop_clip();
+        let content_h = (y0 + scroll - body_top) + table_h + 16.0;
+        self.draw_vscrollbar(PaneId::HeapDiff, area.x + area.w - 9.0, body_top, body_h, content_h);
     }
 
     // -----------------------------------------------------------------------
@@ -4199,6 +4395,26 @@ impl UiApp {
     // Pane: Modular Read-Only Post-IDE Inspector (Dockable Anywhere + Expandable!)
     // -----------------------------------------------------------------------
 
+    fn current_code_loc(&self) -> Option<(String, u32)> {
+        if let Some(ref cv) = self.code_view {
+            return Some(cv.clone());
+        }
+        let slot = self.inspected_slot.or_else(|| {
+            self.world
+                .fns
+                .iter()
+                .max_by_key(|(_, f)| f.total_ns)
+                .map(|(_, f)| f.slot)
+        })?;
+        let fe = self.world.slot_entity.get(&slot)?;
+        let f = self.world.fns.get(*fe)?;
+        if !f.file.is_empty() && f.line > 0 {
+            Some((f.file.clone(), f.line))
+        } else {
+            None
+        }
+    }
+
     fn render_inspector_pane(&mut self, area: Rect) {
         self.draw
             .rect(area.x, area.y, area.w, area.h, [0.071, 0.071, 0.076, 1.0]);
@@ -4215,7 +4431,7 @@ impl UiApp {
                 area.y + 14.0,
                 11.0,
                 col::INK3,
-                "Click any span, flame frame, or Code Map node",
+                "Click any function, allocation site, or span to inspect code",
             );
             return;
         };
@@ -4227,17 +4443,38 @@ impl UiApp {
             return;
         };
 
-        if !f.file.is_empty() && f.line > 0 {
-            self.queue_source_if_needed(&f.file, f.line);
+        let (cur_file, cur_line) = self
+            .code_view
+            .clone()
+            .unwrap_or_else(|| (f.file.clone(), f.line));
+        if !cur_file.is_empty() && cur_line > 0 {
+            self.queue_source_if_needed(&cur_file, cur_line);
         }
 
         let pad = 14.0;
         let scroll = self.scroll_of(PaneId::Inspector);
         let mut y = area.y + 12.0 - scroll;
 
-        self.draw
-            .text_max(area.x + pad, y, 12.5, col::INK1, &f.name, area.w - 86.0);
-        if !f.file.is_empty() && f.line > 0 {
+        // Top header: optional `← Back` button when jumped via Go-to-Definition + function name + `Open ↗`
+        let mut hx_left = area.x + pad;
+        if !self.code_history.is_empty() {
+            self.draw_btn(hx_left, y - 3.0, 56.0, 22.0, "← Back", false, Action::SourceBack);
+            hx_left += 64.0;
+        }
+        let header_title = if self.code_view.is_some() {
+            format!("{}:{}", file_base(&cur_file), cur_line)
+        } else {
+            f.name.clone()
+        };
+        self.draw.text_max(
+            hx_left,
+            y,
+            12.2,
+            col::INK1,
+            &header_title,
+            (area.x + area.w - hx_left - 72.0).max(60.0),
+        );
+        if !cur_file.is_empty() && cur_line > 0 {
             self.draw_btn(
                 area.x + area.w - 66.0,
                 y - 3.0,
@@ -4245,18 +4482,18 @@ impl UiApp {
                 22.0,
                 "Open ↗",
                 false,
-                Action::OpenEditor(f.file.clone(), f.line),
+                Action::OpenEditor(cur_file.clone(), cur_line),
             );
         }
         y += 18.0;
 
-        let loc_str = if !f.file.is_empty() {
-            format!("{}:{}", short_path(&f.file), f.line)
+        let loc_str = if !cur_file.is_empty() {
+            format!("{}:{}", short_path(&cur_file), cur_line)
         } else {
             format!("slot #{slot}")
         };
         self.draw
-            .text_max(area.x + pad, y, 10.0, col::INK3, &loc_str, area.w - pad * 2.0);
+            .text_max(area.x + pad, y, 9.8, col::INK3, &loc_str, area.w - pad * 2.0);
         y += 18.0;
 
         let mut bx = area.x + pad;
@@ -4398,73 +4635,234 @@ impl UiApp {
             y += 28.0;
         }
 
-        self.draw.text(area.x + pad, y, 9.5, col::INK3, "SOURCE");
+        // Full-file virtualized Post-IDE Rust Source Viewer (hover symbols, click Go-to-Definition, zero random cutoffs!)
+        let full_lines_opt = self.world.file_lines.get(&cur_file).cloned();
+        let line_count = full_lines_opt.as_ref().map(|v| v.len()).unwrap_or(0);
+        let src_hdr = if line_count > 0 {
+            format!("SOURCE · {} ({} lines)", file_base(&cur_file), line_count)
+        } else {
+            "SOURCE".into()
+        };
+        self.draw
+            .text_max(area.x + pad, y, 9.5, col::INK3, &src_hdr, (area.w - pad * 2.0).max(60.0));
         y += 15.0;
-        let line_h = 16.5;
-        let num_lines = self
-            .world
-            .sources
-            .get(&(f.file.clone(), f.line))
-            .map(|v| v.len())
-            .unwrap_or(6);
+
+        let line_h = 17.0_f32;
         let unscrolled_y = (y + scroll) - area.y;
-        let box_h = ((num_lines as f32 * line_h) + 14.0).max((area.h - unscrolled_y - 12.0).max(90.0));
-        let box_w = (area.w - pad * 2.0 - 6.0).max(80.0);
-        let code_gutter = 38.0;
-        let code_view_w = (box_w - code_gutter - 8.0).max(40.0);
-        let max_line_w = self
-            .world
-            .sources
-            .get(&(f.file.clone(), f.line))
-            .map(|lines| {
-                lines
-                    .iter()
-                    .map(|(_, t)| self.draw.measure_text(t, 10.2) + 16.0)
-                    .fold(0.0_f32, f32::max)
-            })
-            .unwrap_or(0.0);
+        let box_h = (area.h - unscrolled_y - 12.0).max(260.0);
+        let box_w = (area.w - pad * 2.0 - 6.0).max(120.0);
+        let code_gutter = 42.0;
+        let vbar_w = 10.0;
+        let code_view_w = (box_w - code_gutter - vbar_w - 6.0).max(40.0);
+
+        let total_code_h = (line_count as f32) * line_h + 18.0;
+        let inner_view_h = (box_h - 14.0).max(40.0);
+        self.source_max_scroll_y = (total_code_h - inner_view_h).max(0.0);
+
+        // Auto-center `cur_line` (4 lines from top of SOURCE box) whenever inspecting a new slot or jumping!
+        if let Some((ref af, al)) = self.source_auto_center {
+            if af == &cur_file && line_count > 0 {
+                let target_y = (al.saturating_sub(5) as f32) * line_h;
+                self.source_scroll_y = target_y.clamp(0.0, self.source_max_scroll_y);
+                self.source_auto_center = None;
+            }
+        } else if line_count > 0 && self.source_scroll_y == 0.0 && cur_line > 8 {
+            let target_y = (cur_line.saturating_sub(5) as f32) * line_h;
+            self.source_scroll_y = target_y.clamp(0.0, self.source_max_scroll_y);
+        }
+        self.source_scroll_y = self.source_scroll_y.clamp(0.0, self.source_max_scroll_y);
+
+        // Find active heap allocation site for this slot (to render an inline inlay badge on the target line!)
+        let slot_heap_badge: Option<(String, col::Rgba)> = if self.code_view.is_none() {
+            self.world
+                .heap_sites
+                .iter()
+                .map(|(_, s)| s)
+                .find(|s| s.slot == Some(slot) && s.allocs > 0)
+                .map(|s| {
+                    let avg = s.total_bytes / s.allocs.max(1);
+                    let live = s.allocs.saturating_sub(s.frees);
+                    let surv = live as f64 / s.allocs.max(1) as f64;
+                    if s.allocs >= 4 && surv >= 0.85 && s.retained_bytes > 0 {
+                        (format!("LEAK · {}/alloc · {}", fmt_bytes(avg as i64), fmt_bytes(s.retained_bytes as i64)), col::DANGER)
+                    } else if s.retained_bytes > 0 {
+                        (format!("{} retained · {}/alloc", fmt_bytes(s.retained_bytes as i64), fmt_bytes(avg as i64)), col::WARN)
+                    } else {
+                        (format!("CHURN · {} tot", fmt_bytes(s.total_bytes as i64)), col::SERIES2)
+                    }
+                })
+        } else {
+            None
+        };
+
+        // Measure max visible line width for horizontal scrollbar (fast: only visible window + margin!)
+        let first_vis = ((self.source_scroll_y / line_h).floor() as usize).min(line_count.saturating_sub(1));
+        let vis_count = ((inner_view_h / line_h).ceil() as usize + 3).min(line_count.saturating_sub(first_vis));
+        let max_line_w = if let Some(ref fl) = full_lines_opt {
+            fl.iter()
+                .skip(first_vis)
+                .take(vis_count)
+                .map(|t| self.draw.measure_text(t, 10.2) + 120.0)
+                .fold(0.0_f32, f32::max)
+        } else {
+            0.0
+        };
         self.source_max_scroll_x = (max_line_w - code_view_w).max(0.0);
         self.source_scroll_x = self.source_scroll_x.clamp(0.0, self.source_max_scroll_x);
         let has_hscroll = self.source_max_scroll_x > 2.0;
-        let box_h = box_h + if has_hscroll { 12.0 } else { 0.0 };
 
+        self.source_box_rect = Rect {
+            x: area.x + pad,
+            y,
+            w: box_w,
+            h: box_h,
+        };
         self.draw
             .card(area.x + pad, y, box_w, box_h, 7.0, [0.055, 0.055, 0.060, 1.0], col::LINE);
 
+        let code_clip_h = box_h - if has_hscroll { 14.0 } else { 2.0 };
         self.draw
-            .push_clip(area.x + pad + 1.0, y + 1.0, box_w - 2.0, box_h - 2.0);
-        if let Some(lines) = self.world.sources.get(&(f.file.clone(), f.line)) {
-            let mut ly = y + 7.0;
-            for (n, text) in lines {
-                let is_t = *n == f.line;
+            .push_clip(area.x + pad + 1.0, y + 1.0, box_w - 2.0, code_clip_h);
+
+        let mut pending_def_req: Option<(String, crate::rust_ide::CrossFileQuery)> = None;
+        if let Some(ref full_lines) = full_lines_opt {
+            let graph = self
+                .world
+                .file_graphs
+                .get(&cur_file)
+                .cloned()
+                .unwrap_or_default();
+            let adv = 10.2 * self.draw.advance_ratio;
+            let code_x0 = area.x + pad + code_gutter + 2.0;
+
+            for idx in first_vis..(first_vis + vis_count).min(full_lines.len()) {
+                let n = (idx + 1) as u32;
+                let text = &full_lines[idx];
+                let ly = y + 7.0 + (idx as f32) * line_h - self.source_scroll_y;
+                if ly < y + 1.0 || ly + line_h > y + code_clip_h {
+                    continue;
+                }
+                let is_t = n == cur_line;
                 if is_t {
                     self.draw
-                        .rect(area.x + pad + 1.0, ly - 1.0, box_w - 2.0, line_h, col::FIRE_SOFT);
+                        .rect(area.x + pad + 1.0, ly - 1.0, box_w - 2.0 - vbar_w, line_h, col::FIRE_SOFT);
                 }
                 // Sticky line numbers
                 self.draw.text(
-                    area.x + pad + 8.0,
+                    area.x + pad + 6.0,
                     ly + 1.5,
-                    9.8,
+                    9.6,
                     if is_t { col::FIRE } else { col::INK4 },
                     &format!("{n:>4}"),
                 );
-                // Horizontally scrollable syntax-highlighted Rust code (clipped cleanly after line numbers!)
-                self.draw.push_clip(
-                    area.x + pad + code_gutter,
-                    ly - 1.0,
-                    code_view_w,
-                    line_h + 2.0,
-                );
-                self.draw.rust_code_line(
-                    area.x + pad + code_gutter + 2.0 - self.source_scroll_x,
-                    ly + 1.5,
-                    10.2,
-                    max_line_w + 40.0,
-                    text,
-                );
+
+                // Interactive identifier hover & Go-to-Definition inside the Rust code line!
+                let line_hovered = self.mouse_inside
+                    && self.mouse_x >= code_x0
+                    && self.mouse_x <= code_x0 + code_view_w
+                    && self.mouse_y >= ly.max(y)
+                    && self.mouse_y < (ly + line_h).min(y + code_clip_h);
+
+                self.draw
+                    .push_clip(area.x + pad + code_gutter, ly - 1.0, code_view_w, line_h + 2.0);
+                let draw_x = code_x0 - self.source_scroll_x;
+                self.draw
+                    .rust_code_line(draw_x, ly + 1.5, 10.2, max_line_w + 60.0, text);
+
+                // Inline inlay hints: heap allocation calls or target-line perf/leak summary!
+                let line_px = self.draw.measure_text(text, 10.2);
+                let inlay_x = draw_x + line_px + 12.0;
+                if is_t {
+                    if let Some((ref badge_s, bcol)) = slot_heap_badge {
+                        self.draw.badge(
+                            inlay_x,
+                            ly + 0.5,
+                            14.5,
+                            8.4,
+                            badge_s,
+                            bcol,
+                            col::with_alpha(bcol, 0.14),
+                            col::with_alpha(bcol, 0.4),
+                        );
+                    }
+                } else if let Some(alloc_tag) = crate::rust_ide::find_alloc_hint(text) {
+                    self.draw.badge(
+                        inlay_x,
+                        ly + 0.5,
+                        14.5,
+                        8.4,
+                        alloc_tag,
+                        col::SERIES2,
+                        col::SERIES2_SOFT,
+                        col::with_alpha(col::SERIES2, 0.35),
+                    );
+                }
+
+                // Token-aware, scope-graph-backed semantic hover & Go-to-Definition!
+                if line_hovered {
+                    let rel_x = (self.mouse_x - draw_x).max(0.0);
+                    let char_col = (rel_x / adv.max(1.0)).floor() as usize;
+                    if let Some(hit) = crate::rust_ide::ident_at_col(full_lines, idx, char_col) {
+                        let resolved = match crate::rust_ide::resolve_hit(&cur_file, full_lines, &graph, n, &hit) {
+                            crate::rust_ide::ResolveOutcome::Resolved(mut sym) => {
+                                // Enrich param/local target_type (e.g. `event: Event`) from scoped crate graph
+                                if sym.snippet.is_empty() {
+                                    if let Some(ref tt) = sym.target_type.clone() {
+                                        let imp = graph.imports.get(tt);
+                                        let q = crate::rust_ide::CrossFileQuery {
+                                            ident: imp.map(|x| x.orig_name.clone()).unwrap_or_else(|| tt.clone()),
+                                            prefix: None,
+                                            import_path: imp.map(|x| x.path.clone()),
+                                            want_kind: "type",
+                                        };
+                                        let ck = Self::def_cache_key(&cur_file, &q);
+                                        if let Some(Some(ws_def)) = self.world.workspace_defs.get(&ck) {
+                                            sym.snippet = ws_def.snippet.clone();
+                                            if sym.doc.is_empty() {
+                                                sym.doc = ws_def.doc.clone();
+                                            }
+                                            sym.file = ws_def.file.clone();
+                                            sym.line = ws_def.line;
+                                        } else if !self.world.workspace_defs.contains_key(&ck) {
+                                            pending_def_req = Some((cur_file.clone(), q));
+                                        }
+                                    }
+                                }
+                                Some(sym)
+                            }
+                            crate::rust_ide::ResolveOutcome::NeedCrossFile(q) => {
+                                let ck = Self::def_cache_key(&cur_file, &q);
+                                if let Some(cached) = self.world.workspace_defs.get(&ck) {
+                                    cached.clone()
+                                } else {
+                                    pending_def_req = Some((cur_file.clone(), q));
+                                    None
+                                }
+                            }
+                            crate::rust_ide::ResolveOutcome::None => None,
+                        };
+
+                        if let Some(sym) = resolved {
+                            let ux0 = draw_x + (hit.col_start as f32) * adv;
+                            let uw = ((hit.col_end - hit.col_start) as f32) * adv;
+                            let can_jump = !sym.file.is_empty() && sym.line > 0 && !(sym.file == cur_file && sym.line == n);
+                            let ucol = if can_jump { col::FIRE } else { col::SERIES2 };
+                            self.draw.rect(ux0, ly + line_h - 2.5, uw, 1.3, ucol);
+                            if can_jump {
+                                self.push_hit(
+                                    ux0.max(code_x0),
+                                    ly,
+                                    uw,
+                                    line_h,
+                                    Action::JumpSource(sym.file.clone(), sym.line),
+                                    "pointer",
+                                );
+                            }
+                            self.hover_target = Some(HoverTarget::CodeSym(sym));
+                        }
+                    }
+                }
                 self.draw.pop_clip();
-                ly += line_h;
             }
         } else {
             self.draw.text(
@@ -4472,8 +4870,58 @@ impl UiApp {
                 y + 12.0,
                 10.2,
                 col::INK3,
-                if f.file.is_empty() { "No source path" } else { "Loading…" },
+                if cur_file.is_empty() { "No source path" } else { "Loading full file…" },
             );
+        }
+        if let Some((from, q)) = pending_def_req {
+            self.queue_def_if_needed(&from, &q);
+        }
+        self.draw.pop_clip();
+
+        // Dedicated vertical scrollbar inside SOURCE box (+ fire tick mark showing active target line!)
+        if self.source_max_scroll_y > 1.0 && line_count > 0 {
+            let track = Rect {
+                x: area.x + pad + box_w - 9.0,
+                y: y + 4.0,
+                w: 6.0,
+                h: (code_clip_h - 8.0).max(24.0),
+            };
+            let thumb_h = ((inner_view_h / total_code_h.max(1.0)) * track.h).clamp(24.0, track.h);
+            let thumb_y = track.y + (self.source_scroll_y / self.source_max_scroll_y) * (track.h - thumb_h);
+            let thumb = Rect {
+                x: track.x,
+                y: thumb_y,
+                w: 6.0,
+                h: thumb_h,
+            };
+            let dragging = matches!(self.drag_op, DragOp::VScrollSource { .. });
+            let hov = self.is_hovered(track.x - 3.0, track.y, track.w + 6.0, track.h);
+            self.draw
+                .rrect(track.x, track.y, track.w, track.h, 3.0, [0.09, 0.09, 0.10, 0.9]);
+            // Subtle target-line marker on scrollbar track
+            let t_norm = ((cur_line.saturating_sub(1) as f32) / line_count.max(1) as f32).clamp(0.0, 1.0);
+            self.draw
+                .rect(track.x - 1.0, track.y + t_norm * track.h, track.w + 2.0, 2.0, col::FIRE);
+            self.draw.rrect(
+                thumb.x,
+                thumb.y,
+                thumb.w,
+                thumb.h,
+                3.0,
+                if dragging {
+                    col::FIRE
+                } else if hov {
+                    col::INK2
+                } else {
+                    [0.36, 0.36, 0.39, 0.85]
+                },
+            );
+            self.vscroll_source = Some(VScrollHit {
+                pane: PaneId::Inspector,
+                track,
+                thumb,
+                max_scroll: self.source_max_scroll_y,
+            });
         }
 
         // Draggable horizontal scrollbar inside SOURCE box when lines overflow horizontally
@@ -4516,7 +4964,6 @@ impl UiApp {
                 max_scroll: self.source_max_scroll_x,
             });
         }
-        self.draw.pop_clip();
 
         let total_h = (y + scroll - area.y) + box_h + 16.0;
         self.draw_vscrollbar(PaneId::Inspector, area.x + area.w - 9.0, area.y, area.h, total_h);
@@ -4618,244 +5065,235 @@ impl UiApp {
     }
 
     fn render_hover_card(&mut self, css_w: f32, css_h: f32, target: HoverTarget) {
-        let title;
-        let mut subtitle = String::new();
-        let mut metrics = String::new();
+        let icon;
+        let mut icon_col = col::FIRE;
+        let title: String;
+        let mut loc_tag = String::new();
         let mut badge_txt = String::new();
         let mut badge_col = col::FIRE;
+        let mut rust_sig: Option<String> = None;
+        let mut stats: Vec<(&'static str, String, col::Rgba)> = Vec::new();
+        let mut bars: Vec<(String, String, f32, col::Rgba)> = Vec::new();
+        let mut chips: Vec<(String, col::Rgba)> = Vec::new();
+        let mut chips_is_chain = false;
+        let mut note: Option<String> = None;
         let mut code_key: Option<(String, u32)> = None;
-        let mut extra_lines: Vec<String> = Vec::new();
+        let mut inline_snippet: Option<(Vec<(u32, String)>, u32)> = None;
 
         match target {
             HoverTarget::Bar(bar) => match bar.kind {
                 BarKind::Span => {
+                    icon = Icon::Flame;
                     title = self.world.fn_name(bar.slot_or_op);
                     if let Some(&fe) = self.world.slot_entity.get(&bar.slot_or_op) {
                         if let Some(f) = self.world.fns.get(fe) {
                             let self_ns = f.total_ns.saturating_sub(f.child_ns);
-                            metrics = format!(
-                                "dur {} · self {} · P95 {} · {}×",
-                                fmt_ns(bar.dur_ns),
-                                fmt_ns(self_ns),
-                                fmt_ns(percentile(&f.samples, 0.95)),
-                                f.calls
-                            );
+                            stats.push(("DUR", fmt_ns(bar.dur_ns), col::INK1));
+                            stats.push(("SELF", fmt_ns(self_ns), col::FIRE));
+                            stats.push(("P95", fmt_ns(percentile(&f.samples, 0.95)), col::WARN));
+                            stats.push(("CALLS", format!("{}×", f.calls), col::OK));
                             if !f.file.is_empty() && f.line > 0 {
-                                subtitle = format!("{}:{}", short_path(&f.file), f.line);
+                                loc_tag = format!("{}:{}", file_base(&f.file), f.line);
                                 code_key = Some((f.file.clone(), f.line));
                             }
                         }
                     }
                     if bar.cpu != CPU_UNKNOWN {
                         let is_e = (bar.flags & 0x10) != 0;
-                        badge_txt = format!("Core #{} · {}", bar.cpu, if is_e { "E" } else { "P" });
+                        badge_txt = format!("C{} · {}", bar.cpu, if is_e { "E" } else { "P" });
                         badge_col = if is_e { col::SERIES2 } else { col::OK };
                     }
                 }
                 BarKind::Lock => {
-                    title = "pthread_mutex_lock stall".into();
-                    badge_txt = "LOCK WAIT".into();
+                    icon = Icon::Lock;
+                    icon_col = col::DANGER;
+                    title = "Mutex Stall".into();
+                    badge_txt = fmt_ns(bar.dur_ns);
                     badge_col = col::DANGER;
-                    metrics = format!("wait {} · waiter Thread #{}", fmt_ns(bar.dur_ns), bar.thread);
+                    stats.push(("WAITER", format!("t#{}", bar.thread), col::DANGER));
                     if bar.holder_thread > 0 {
-                        subtitle = format!(
-                            "Blocked by Thread #{} in {}",
-                            bar.holder_thread,
-                            self.world.pc_label(bar.holder_pc)
-                        );
+                        stats.push(("HOLDER", format!("t#{}", bar.holder_thread), col::WARN));
                     }
-                    extra_lines.push(format!(
-                        "waiter in {} · mutex 0x{:x}",
-                        self.world.pc_label(bar.waiter_pc),
-                        bar.mutex_ptr
-                    ));
+                    stats.push(("MUTEX", format!("0x{:x}", bar.mutex_ptr), col::INK2));
+                    chips.push((self.world.pc_label(bar.waiter_pc), col::DANGER));
+                    if bar.holder_pc != 0 {
+                        chips.push((self.world.pc_label(bar.holder_pc), col::WARN));
+                        chips_is_chain = true;
+                    }
                     if let Some(sym) = self.world.resolve_pc(bar.holder_pc) {
                         if !sym.file.is_empty() && sym.line > 0 {
+                            loc_tag = format!("{}:{}", file_base(&sym.file), sym.line);
                             code_key = Some((sym.file.clone(), sym.line));
                         }
                     }
                 }
                 BarKind::Heap => {
-                    let caller = self.world.pc_label(bar.holder_pc);
-                    title = format!("Heap alloc · {}", fmt_bytes(bar.bytes as i64));
-                    badge_txt = format!("Thread #{}", bar.thread);
+                    icon = Icon::Memory;
+                    icon_col = col::SERIES2;
+                    title = self.world.pc_label(bar.holder_pc);
+                    badge_txt = fmt_bytes(bar.bytes as i64);
                     badge_col = col::SERIES2;
-                    subtitle = format!("allocated in {caller}");
-                    metrics = format!("ptr 0x{:x} · pc 0x{:x}", bar.mutex_ptr, bar.holder_pc);
+                    stats.push(("SIZE", fmt_bytes(bar.bytes as i64), col::SERIES2));
+                    stats.push(("THREAD", format!("t#{}", bar.thread), col::INK1));
+                    stats.push(("PTR", format!("0x{:x}", bar.mutex_ptr), col::INK2));
                     if let Some(sym) = self.world.resolve_pc(bar.holder_pc) {
                         if !sym.file.is_empty() && sym.line > 0 {
+                            loc_tag = format!("{}:{}", file_base(&sym.file), sym.line);
                             code_key = Some((sym.file.clone(), sym.line));
                         }
                     }
                 }
                 BarKind::Io => {
+                    icon = Icon::Lock;
+                    icon_col = col::WARN;
                     title = format!("I/O {}", io_op_name(bar.slot_or_op));
-                    badge_txt = format!("Thread #{}", bar.thread);
+                    badge_txt = fmt_ns(bar.dur_ns);
                     badge_col = col::WARN;
-                    metrics = format!("duration {} · fd {}", fmt_ns(bar.dur_ns), bar.arg);
+                    stats.push(("WAIT", fmt_ns(bar.dur_ns), col::WARN));
+                    stats.push(("THREAD", format!("t#{}", bar.thread), col::INK1));
+                    stats.push(("FD", format!("#{}", bar.arg), col::INK2));
                 }
             },
             HoverTarget::ThreadGutter(tid) => {
+                icon = Icon::Cpu;
+                icon_col = col::SERIES2;
                 title = format!("Thread #{tid}");
                 badge_col = col::SERIES2;
                 if let Some(&te) = self.world.thread_entity.get(&tid) {
                     if let Some(tc) = self.world.threads.get(te) {
                         if tc.last_cpu != CPU_UNKNOWN {
                             let is_e = (tc.last_flags & 0x10) != 0;
-                            badge_txt = format!("Core #{} ({})", tc.last_cpu, if is_e { "E-core" } else { "P-core" });
+                            badge_txt = format!("C{} · {}", tc.last_cpu, if is_e { "E" } else { "P" });
+                            badge_col = if is_e { col::SERIES2 } else { col::OK };
                         }
-                        subtitle = if tc.parent_tid > 0 {
-                            format!("Spawned by Thread #{}", tc.parent_tid)
-                        } else {
-                            "Process main thread".into()
-                        };
-                        metrics = format!("{} core migrations", tc.migrations);
-                        if tc.spawn_frames[0] != 0 {
-                            extra_lines.push(format!(
-                                "spawn: {} → {} → {}",
-                                self.world.pc_label(tc.spawn_frames[0]),
-                                self.world.pc_label(tc.spawn_frames[1]),
-                                self.world.pc_label(tc.spawn_frames[2]),
-                            ));
+                        stats.push((
+                            "PARENT",
+                            if tc.parent_tid > 0 { format!("t#{}", tc.parent_tid) } else { "main".into() },
+                            col::INK1,
+                        ));
+                        stats.push((
+                            "CORE HOPS",
+                            tc.migrations.to_string(),
+                            if tc.migrations >= 10 { col::FIRE } else { col::INK1 },
+                        ));
+                        chips_is_chain = true;
+                        for &pc in &tc.spawn_frames {
+                            if pc != 0 {
+                                chips.push((self.world.pc_label(pc), col::INK2));
+                            }
                         }
                     }
                 }
             }
             HoverTarget::Flame(name, tot, slf, calls, root_tot) => {
+                icon = Icon::Flame;
                 title = name;
                 let pct = (tot as f64 / root_tot.max(1) as f64) * 100.0;
                 let spct = (slf as f64 / root_tot.max(1) as f64) * 100.0;
                 badge_txt = format!("{pct:.1}%");
                 badge_col = col::FIRE;
-                metrics = format!("total {} · self {} ({spct:.1}%) · {calls}×", fmt_ns(tot), fmt_ns(slf));
+                stats.push(("TOTAL", fmt_ns(tot), col::INK1));
+                stats.push(("SELF", fmt_ns(slf), col::FIRE));
+                stats.push(("CALLS", format!("{calls}×"), col::OK));
+                bars.push(("Self share".into(), format!("{spct:.1}%"), (spct as f32 / 100.0).clamp(0.0, 1.0), col::FIRE));
             }
             HoverTarget::Core(c) => {
+                icon = Icon::Cpu;
                 let top = &self.world.topology;
                 let is_e = top.p_cores > 0 && (c as u32) >= top.p_cores;
                 let live_pct = ((self.world.cpu_live_us[c] / 500_000.0) * 100.0).clamp(0.0, 100.0);
                 let busy_us = self.world.cpu_busy_us[c];
                 let evs = self.world.cpu_events[c];
-                title = format!(
-                    "Core {:02} · {}",
-                    c,
-                    if is_e { "Efficiency Core" } else { "Performance Core" }
-                );
-                badge_txt = format!("{live_pct:.0}%");
+                icon_col = if is_e { col::SERIES2 } else { col::FIRE };
+                title = format!("Core {:02}", c);
+                badge_txt = if is_e { "E-CORE".into() } else { "P-CORE".into() };
                 badge_col = if is_e {
                     if live_pct > 35.0 { col::WARN } else { col::SERIES2 }
-                } else if live_pct > 75.0 {
-                    col::DANGER
                 } else {
                     col::FIRE
                 };
-                let mut active: Vec<String> = self
+                stats.push(("LOAD", format!("{live_pct:.0}%"), badge_col));
+                stats.push(("CPU TIME", fmt_ns(busy_us * 1_000), col::INK1));
+                stats.push(("EVENTS", evs.to_string(), col::INK2));
+                bars.push(("Utilization".into(), format!("{live_pct:.0}%"), (live_pct / 100.0).clamp(0.0, 1.0), badge_col));
+                let mut active: Vec<(u32, u64)> = self
                     .world
                     .threads
                     .iter()
                     .filter(|(_, t)| t.last_cpu as usize == c)
-                    .map(|(_, t)| format!("t#{} ({} hops)", t.tid, t.migrations))
+                    .map(|(_, t)| (t.tid, t.migrations))
                     .collect();
-                active.sort();
-                subtitle = if active.is_empty() {
-                    "Idle — no thread currently pinned here".into()
-                } else {
-                    format!("Active threads: {}", active.join(", "))
-                };
-                metrics = format!("cumulative {} CPU · {} events", fmt_ns(busy_us * 1_000), evs);
-                if is_e {
-                    extra_lines.push("E-core: lower clock & smaller L2 cache than P-cores.".into());
-                    extra_lines.push("Hot request/worker threads here add tail latency.".into());
-                } else {
-                    extra_lines.push("P-core: full clock & private L1d — ideal for hot paths.".into());
-                    extra_lines.push("Click -> open full CPU topology & thread hops.".into());
+                active.sort_by_key(|(tid, _)| *tid);
+                for (tid, hops) in active {
+                    chips.push((format!("t#{tid} · {hops} hops"), if hops >= 10 { col::FIRE } else { col::INK2 }));
                 }
+                note = Some(if is_e {
+                    "Efficiency core: lower clock & smaller L2 cache.".into()
+                } else {
+                    "Performance core: full clock & private L1d cache.".into()
+                });
             }
             HoverTarget::Anomaly(ins) => {
-                title = ins.title.clone();
-                badge_txt = ins.metric.clone();
+                icon = insight_icon(ins.category);
                 badge_col = match ins.severity {
                     2 => col::DANGER,
                     1 => col::FIRE,
                     _ => col::OK,
                 };
-                subtitle = ins.detail.clone();
+                icon_col = badge_col;
+                title = ins.title.clone();
+                badge_txt = ins.metric.clone();
                 match ins.category {
                     "CPU" => {
-                        metrics = "OS scheduler moved threads across CPU cores (hops).".into();
-                        extra_lines.push("Each hop flushes private L1/L2 caches & stalls pipelines.".into());
-                        extra_lines.push("Pin worker threads or reduce short-lived wakeups.".into());
-                        extra_lines.push("Click -> inspect per-core topology & thread hops.".into());
+                        stats.push(("TOTAL HOPS", self.world.total_migrations.to_string(), col::DANGER));
+                        stats.push(("THREADS", self.world.threads.len().to_string(), col::INK1));
+                        note = Some("Core hops flush private L1/L2 caches and stall pipelines.".into());
                     }
                     "ECORE" => {
-                        metrics = "Hot thread scheduled onto a low-power Efficiency core.".into();
-                        extra_lines.push("E-cores run at lower frequency with smaller caches.".into());
-                        extra_lines.push("Raise thread QoS (UserInteractive) to keep on P-cores.".into());
-                        extra_lines.push("Click -> open CPU topology.".into());
+                        stats.push(("CLUSTER", "Efficiency".into(), col::WARN));
+                        stats.push(("P-CORES", format!("{} avail", self.world.topology.p_cores), col::OK));
+                        note = Some("Hot thread scheduled on low-clock E-core; raise QoS.".into());
                     }
                     "HEAP" => {
                         let sites = self.world.heap_sites_for_window(None);
                         let tot_ret = self.world.total_retained_bytes().max(1);
-                        metrics = format!(
-                            "Retained heap is growing ({} live ptrs).",
-                            self.world.live_ptrs.len()
-                        );
-                        for s in sites.iter().take(3) {
-                            let pct = (s.retained_bytes as f64 / tot_ret as f64) * 100.0;
-                            let lbl = if s.top_fn.is_empty() { s.key.as_str() } else { s.top_fn.as_str() };
-                            extra_lines.push(format!(
-                                "· {} · {} ({:.0}%)",
-                                lbl,
-                                fmt_bytes(s.retained_bytes as i64),
-                                pct
-                            ));
+                        stats.push(("RETAINED", fmt_bytes(tot_ret as i64), col::DANGER));
+                        stats.push(("LIVE OBJS", self.world.live_ptrs.len().to_string(), col::INK1));
+                        let pal = [col::FIRE, col::SERIES2, col::OK];
+                        for (i, s) in sites.iter().take(3).enumerate() {
+                            let frac = (s.retained_bytes as f64 / tot_ret as f64).clamp(0.0, 1.0) as f32;
+                            let lbl = if s.top_fn.is_empty() { s.key.clone() } else { s.top_fn.clone() };
+                            bars.push((lbl, fmt_bytes(s.retained_bytes as i64), frac, pal[i % pal.len()]));
                         }
-                        extra_lines.push("Click -> open Heap · Drag HEAP chart to slice window.".into());
                     }
                     "LOCK" => {
-                        metrics = "Thread blocked waiting for a mutex held by another thread.".into();
-                        extra_lines.push("Contended locks serialize parallel work & spike P99.".into());
-                        extra_lines.push("Shorten critical section or switch to sharded/lock-free.".into());
-                        extra_lines.push("Click -> open Locks & I/O waiter/holder attribution.".into());
+                        let cnt = self.world.io_rows.iter().filter(|r| r.kind == "sync_wait").count();
+                        stats.push(("WAITS", format!("{cnt}×"), col::DANGER));
+                        stats.push(("PEAK", ins.metric.clone(), col::WARN));
+                        note = Some("Contended mutex serializes parallel workers.".into());
                     }
                     "IO" => {
-                        metrics = "Thread stalled inside a blocking OS read/write/fsync.".into();
-                        extra_lines.push("Blocking syscalls starve the worker thread while waiting.".into());
-                        extra_lines.push("Click -> open Locks & I/O syscall table.".into());
-                    }
-                    "FD" => {
-                        metrics = format!(
-                            "{} open file descriptors ({} sockets) on pid {}.",
-                            self.world.resources.fd_count,
-                            self.world.resources.sockets.len(),
-                            self.world.resources.pid
-                        );
-                        extra_lines.push("Check for unclosed files or leaked client connections.".into());
+                        stats.push(("PEAK WAIT", ins.metric.clone(), col::WARN));
+                        note = Some("Blocking OS syscall stalls worker thread.".into());
                     }
                     "HOT" | "TAIL" => {
                         if let Some(slot) = ins.target_slot {
                             if let Some(&fe) = self.world.slot_entity.get(&slot) {
                                 if let Some(f) = self.world.fns.get(fe) {
-                                    metrics = format!(
-                                        "P50 {} · P95 {} · P99 {} · {}× calls",
-                                        fmt_ns(percentile(&f.samples, 0.5)),
-                                        fmt_ns(percentile(&f.samples, 0.95)),
-                                        fmt_ns(percentile(&f.samples, 0.99)),
-                                        f.calls
-                                    );
+                                    stats.push(("P50", fmt_ns(percentile(&f.samples, 0.5)), col::INK2));
+                                    stats.push(("P95", fmt_ns(percentile(&f.samples, 0.95)), col::WARN));
+                                    stats.push(("P99", fmt_ns(percentile(&f.samples, 0.99)), col::DANGER));
+                                    stats.push(("CALLS", format!("{}×", f.calls), col::OK));
                                     if !f.file.is_empty() && f.line > 0 {
+                                        loc_tag = format!("{}:{}", file_base(&f.file), f.line);
                                         code_key = Some((f.file.clone(), f.line));
                                     }
                                 }
                             }
                         }
-                        if metrics.is_empty() {
-                            metrics = "Dominates CPU time or exhibits high tail-latency variance.".into();
-                        }
-                        extra_lines.push("Click -> inspect source, callers & hook mode.".into());
                     }
                     _ => {
-                        metrics = "Automatic anomaly detected from live telemetry.".into();
-                        extra_lines.push("Click -> inspect details.".into());
+                        note = Some(ins.detail.clone());
                     }
                 }
             }
@@ -4865,59 +5303,43 @@ impl UiApp {
                 alloc_bytes,
                 slope,
             } => {
+                icon = Icon::Memory;
                 let origin = self.world.trace_origin_ms.unwrap_or(ts_ms);
-                title = format!("Retained Heap · {}", fmt_bytes(retained as i64));
+                title = format!("Heap @ +{}", fmt_span((ts_ms - origin).max(0.0)));
                 badge_txt = if slope.abs() >= 1024.0 {
                     format!("{}{}/s", if slope > 0.0 { "+" } else { "" }, fmt_bytes(slope as i64))
                 } else {
                     "stable".into()
                 };
                 badge_col = if slope > 32_768.0 { col::DANGER } else { col::SERIES2 };
-                subtitle = format!(
-                    "@ +{} · +{} allocated in 0.5s bucket",
-                    fmt_span((ts_ms - origin).max(0.0)),
-                    fmt_bytes(alloc_bytes as i64)
-                );
+                icon_col = badge_col;
+                stats.push(("RETAINED", fmt_bytes(retained as i64), col::INK1));
+                stats.push(("0.5s ALLOC", format!("+{}", fmt_bytes(alloc_bytes as i64)), col::SERIES2));
+                stats.push(("SLOPE", badge_txt.clone(), badge_col));
                 let sites = self.world.heap_sites_for_window(self.heap_window);
                 let tot_ret: u64 = sites.iter().map(|s| s.retained_bytes).sum::<u64>().max(1);
-                metrics = if self.heap_window.is_some() {
-                    "Top stacks inside dragged window:".into()
-                } else {
-                    "Top retaining call stacks right now:".into()
-                };
-                for s in sites.iter().take(3) {
-                    let pct = (s.retained_bytes as f64 / tot_ret as f64) * 100.0;
-                    let lbl = if s.top_fn.is_empty() { s.key.as_str() } else { s.top_fn.as_str() };
-                    extra_lines.push(format!(
-                        "· {} · {} ({:.0}%)",
-                        lbl,
-                        fmt_bytes(s.retained_bytes as i64),
-                        pct
-                    ));
+                let pal = [col::FIRE, col::SERIES2, col::OK];
+                for (i, s) in sites.iter().take(3).enumerate() {
+                    let frac = (s.retained_bytes as f64 / tot_ret as f64).clamp(0.0, 1.0) as f32;
+                    let lbl = if s.top_fn.is_empty() { s.key.clone() } else { s.top_fn.clone() };
+                    bars.push((lbl, fmt_bytes(s.retained_bytes as i64), frac, pal[i % pal.len()]));
                 }
-                extra_lines.push("Click -> open Heap · Drag horizontally -> slice window".into());
+                note = Some("Drag horizontally to slice & filter Heap below.".into());
             }
             HoverTarget::StallPoint {
                 ts_ms,
                 lock_ns,
                 io_ns,
             } => {
+                icon = Icon::Lock;
                 let origin = self.world.trace_origin_ms.unwrap_or(ts_ms);
-                title = format!("Thread Stalls · {}", fmt_ns(lock_ns.saturating_add(io_ns)));
-                badge_txt = if lock_ns > 0 && io_ns > 0 {
-                    "LOCK + I/O".into()
-                } else if lock_ns > 0 {
-                    "MUTEX".into()
-                } else {
-                    "I/O".into()
-                };
+                let tot = lock_ns.saturating_add(io_ns).max(1);
+                title = format!("Stalls @ +{}", fmt_span((ts_ms - origin).max(0.0)));
+                badge_txt = fmt_ns(lock_ns.saturating_add(io_ns));
                 badge_col = if lock_ns > 0 { col::DANGER } else { col::WARN };
-                subtitle = format!(
-                    "@ +{} · Lock {} · I/O {}",
-                    fmt_span((ts_ms - origin).max(0.0)),
-                    fmt_ns(lock_ns),
-                    fmt_ns(io_ns)
-                );
+                icon_col = badge_col;
+                bars.push(("Mutex wait".into(), fmt_ns(lock_ns), (lock_ns as f64 / tot as f64) as f32, col::DANGER));
+                bars.push(("Blocking I/O".into(), fmt_ns(io_ns), (io_ns as f64 / tot as f64) as f32, col::WARN));
                 if let Some(last_lock) = self
                     .world
                     .io_rows
@@ -4925,62 +5347,48 @@ impl UiApp {
                     .rev()
                     .find(|r| r.kind == "sync_wait" && r.holder_thread > 0)
                 {
-                    metrics = format!(
-                        "Latest lock wait: t#{} ← t#{} ({})",
-                        last_lock.thread,
-                        last_lock.holder_thread,
-                        fmt_ns(last_lock.dur_ns)
-                    );
-                } else {
-                    metrics = "Blocking mutex waits & OS I/O stalls in this 0.5s bucket.".into();
+                    chips.push((
+                        format!("t#{} ← t#{} ({})", last_lock.thread, last_lock.holder_thread, self.world.pc_label(last_lock.holder_pc)),
+                        col::DANGER,
+                    ));
                 }
-                extra_lines.push("Click -> jump directly to this spike in Trace.".into());
             }
             HoverTarget::Port(s) => {
+                icon = Icon::Layers;
+                icon_col = col::OK;
                 title = format!("{} {}", s.proto, s.local);
                 let is_listen = s.state.eq_ignore_ascii_case("LISTEN");
                 badge_txt = s.state.clone();
                 badge_col = if is_listen { col::OK } else { col::SERIES2 };
-                subtitle = format!(
-                    "pid {} · {} open FDs · {} sockets",
-                    self.world.resources.pid,
-                    self.world.resources.fd_count,
-                    self.world.resources.sockets.len()
-                );
-                metrics = if !s.remote.is_empty() {
-                    format!("Peer: {}", s.remote)
-                } else {
-                    "Live bound port via OS / bstd process introspection.".into()
-                };
-                if is_listen && s.port > 0 {
-                    extra_lines.push(format!("Click -> open http://127.0.0.1:{} in browser.", s.port));
+                stats.push(("PID", self.world.resources.pid.to_string(), col::INK1));
+                stats.push(("OPEN FDS", self.world.resources.fd_count.to_string(), col::INK2));
+                stats.push(("SOCKETS", self.world.resources.sockets.len().to_string(), col::OK));
+                if !s.remote.is_empty() {
+                    chips.push((format!("peer {}", s.remote), col::SERIES2));
                 }
             }
             HoverTarget::MapCard(slot) => {
+                icon = Icon::Flame;
                 if let Some(&fe) = self.world.slot_entity.get(&slot) {
                     if let Some(f) = self.world.fns.get(fe) {
                         title = f.name.clone();
                         let self_ns = f.total_ns.saturating_sub(f.child_ns);
-                        metrics = format!(
-                            "self {} · total {} · P95 {} · {}×",
-                            fmt_ns(self_ns),
-                            fmt_ns(f.total_ns),
-                            fmt_ns(percentile(&f.samples, 0.95)),
-                            f.calls
-                        );
+                        stats.push(("SELF", fmt_ns(self_ns), col::FIRE));
+                        stats.push(("TOTAL", fmt_ns(f.total_ns), col::INK1));
+                        stats.push(("P95", fmt_ns(percentile(&f.samples, 0.95)), col::WARN));
+                        stats.push(("CALLS", format!("{}×", f.calls), col::OK));
                         if !f.file.is_empty() && f.line > 0 {
-                            subtitle = format!("{}:{}", short_path(&f.file), f.line);
+                            loc_tag = format!("{}:{}", file_base(&f.file), f.line);
                             code_key = Some((f.file.clone(), f.line));
                         }
                         if f.lock_contended {
-                            badge_txt = "LOCK WAIT".into();
+                            badge_txt = "LOCK".into();
                             badge_col = col::DANGER;
                         } else if f.last_cpu != CPU_UNKNOWN {
                             let is_e = (f.last_flags & 0x10) != 0;
-                            badge_txt = format!("Core #{} · {}", f.last_cpu, if is_e { "E" } else { "P" });
+                            badge_txt = format!("C{} · {}", f.last_cpu, if is_e { "E" } else { "P" });
                             badge_col = if is_e { col::SERIES2 } else { col::OK };
                         }
-                        extra_lines.push("Click -> open full Code inspector & hook controls.".into());
                     } else {
                         title = format!("slot #{slot}");
                     }
@@ -4989,8 +5397,9 @@ impl UiApp {
                 }
             }
             HoverTarget::HeapSite(s) => {
+                icon = Icon::Memory;
                 title = if s.top_fn.is_empty() {
-                    "Heap allocation site".into()
+                    "Heap site".into()
                 } else {
                     s.top_fn.clone()
                 };
@@ -5001,53 +5410,67 @@ impl UiApp {
                     0.0
                 };
                 if s.allocs >= 4 && survival >= 0.85 && s.retained_bytes > 0 {
-                    badge_txt = "LEAK SUSPECT".into();
+                    badge_txt = "LEAK".into();
                     badge_col = col::DANGER;
                 } else if s.retained_bytes > 0 && survival >= 0.45 {
                     badge_txt = "GROWING".into();
                     badge_col = col::WARN;
                 } else if s.allocs >= 6 && s.retained_bytes == 0 {
-                    badge_txt = "HIGH CHURN".into();
+                    badge_txt = "CHURN".into();
                     badge_col = col::SERIES2;
                 } else {
-                    badge_txt = format!("{} live", live_cnt);
+                    badge_txt = "OK".into();
                     badge_col = col::OK;
                 }
-                subtitle = if !s.file.is_empty() && s.line > 0 {
-                    format!("{}:{} · Thread #{}", short_path(&s.file), s.line, s.thread)
-                } else {
-                    format!("Thread #{} · {}", s.thread, s.key)
-                };
-                let avg = if s.allocs > 0 { s.total_bytes / s.allocs } else { 0 };
-                metrics = format!(
-                    "{} retained ({} total) · avg {} · {} allocs / {} frees",
-                    fmt_bytes(s.retained_bytes as i64),
-                    fmt_bytes(s.total_bytes as i64),
-                    fmt_bytes(avg as i64),
-                    s.allocs,
-                    s.frees
-                );
-                if !s.display_stack.is_empty() {
-                    extra_lines.push(format!("stack: {}", s.display_stack));
-                }
-                if s.allocs >= 4 && survival >= 0.85 && s.retained_bytes > 0 {
-                    extra_lines.push(format!(
-                        "{live_cnt} of {} allocations never freed ({:.0}% live) — likely leak or unbounded cache.",
-                        s.allocs,
-                        survival * 100.0
-                    ));
-                } else if s.allocs >= 6 && s.retained_bytes == 0 {
-                    extra_lines.push(format!(
-                        "All {} allocs ({}) freed — temporary buffer churn; consider reusing a pool.",
-                        s.allocs,
-                        fmt_bytes(s.total_bytes as i64)
-                    ));
-                } else {
-                    extra_lines.push(format!("raw pcs: {}", s.key));
-                }
+                icon_col = badge_col;
                 if !s.file.is_empty() && s.line > 0 {
+                    loc_tag = format!("{}:{}", file_base(&s.file), s.line);
                     code_key = Some((s.file.clone(), s.line));
-                    extra_lines.push("Click -> open allocating function in Code inspector.".into());
+                }
+                let avg = if s.allocs > 0 { s.total_bytes / s.allocs } else { 0 };
+                stats.push(("RETAINED", fmt_bytes(s.retained_bytes as i64), if s.retained_bytes > 0 { col::INK1 } else { col::INK3 }));
+                stats.push(("AVG BLOCK", fmt_bytes(avg as i64), col::INK1));
+                stats.push(("ALLOC/FREE", format!("{} / {}", s.allocs, s.frees), col::INK2));
+                stats.push(("THREAD", format!("t#{}", s.thread), col::SERIES2));
+
+                let surv_lbl = if live_cnt == 0 {
+                    "0% live (all freed)".into()
+                } else {
+                    format!("{:.0}% live ({live_cnt} unfreed)", survival * 100.0)
+                };
+                bars.push(("Survival".into(), surv_lbl, survival as f32, badge_col));
+
+                // Call-stack breadcrumb chips (`[cache::scan_buckets] → [index::query_postings] → ...`)
+                chips_is_chain = true;
+                for frame in s.display_stack.split(" → ").take(3) {
+                    if !frame.is_empty() {
+                        chips.push((frame.to_string(), col::INK2));
+                    }
+                }
+            }
+            HoverTarget::CodeSym(sym) => {
+                icon = Icon::Code;
+                title = sym.name.clone();
+                badge_txt = sym.kind.to_ascii_uppercase();
+                badge_col = match sym.kind.as_str() {
+                    "alloc" => col::FIRE,
+                    "param" | "local" | "self" | "field" => col::SERIES2,
+                    "fn" | "method" => col::OK,
+                    "struct" | "enum" | "variant" => col::WARN,
+                    _ => col::INK2,
+                };
+                icon_col = badge_col;
+                if !sym.file.is_empty() && sym.line > 0 {
+                    loc_tag = format!("{}:{}", file_base(&sym.file), sym.line);
+                }
+                if !sym.sig.is_empty() {
+                    rust_sig = Some(sym.sig.clone());
+                }
+                if !sym.doc.is_empty() {
+                    note = Some(sym.doc.clone());
+                }
+                if !sym.snippet.is_empty() {
+                    inline_snippet = Some((sym.snippet.iter().take(5).cloned().collect(), sym.line));
                 }
             }
         }
@@ -5055,51 +5478,82 @@ impl UiApp {
         if let Some((ref file, line)) = code_key {
             self.queue_source_if_needed(file, line);
         }
-        let code_lines: Option<Vec<(u32, String)>> = code_key.as_ref().and_then(|k| {
-            let v = self.world.sources.get(k)?;
-            let target = k.1;
-            let start_idx = v
-                .iter()
-                .position(|(n, _)| *n >= target.saturating_sub(1))
-                .unwrap_or(0);
-            Some(v.iter().skip(start_idx).take(5).cloned().collect())
-        });
-
-        let has_code = code_lines.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
-        let badge_w = if !badge_txt.is_empty() {
-            self.draw.measure_text(&badge_txt, 9.0) + 26.0
+        let code_peek: Option<(Vec<(u32, String)>, u32)> = if let Some(s) = inline_snippet {
+            Some(s)
+        } else if let Some((ref file, line)) = code_key {
+            self.world.snippet_for(file, line, 5).map(|v| (v, line))
         } else {
-            12.0
+            None
         };
-        let mut ideal_w = (self.draw.measure_text(&title, 11.2) + badge_w + 24.0)
-            .max(self.draw.measure_text(&subtitle, 9.8) + 26.0)
-            .max(self.draw.measure_text(&metrics, 10.0) + 26.0);
-        for line in &extra_lines {
-            ideal_w = ideal_w.max(self.draw.measure_text(line, 9.8) + 26.0);
+
+        // Compute clean card width from primitives
+        let has_code = code_peek.as_ref().map(|(v, _)| !v.is_empty()).unwrap_or(false);
+        let badge_w = if !badge_txt.is_empty() {
+            self.draw.measure_text(&badge_txt, 8.8) + 18.0
+        } else {
+            0.0
+        };
+        let loc_w = if !loc_tag.is_empty() {
+            self.draw.measure_text(&loc_tag, 9.0) + 12.0
+        } else {
+            0.0
+        };
+        let mut ideal_w = self.draw.measure_text(&title, 11.2) + badge_w + loc_w + 46.0;
+        if let Some(ref sig) = rust_sig {
+            ideal_w = ideal_w.max(self.draw.measure_text(sig, 9.8) + 34.0);
         }
-        if let Some(ref cl) = code_lines {
+        if !stats.is_empty() {
+            ideal_w = ideal_w.max((stats.len() as f32) * 96.0 + 24.0);
+        }
+        if !chips.is_empty() {
+            let mut cw = 24.0;
+            for (i, (c, _)) in chips.iter().enumerate() {
+                cw += self.draw.measure_text(c, 9.0) + 16.0;
+                if chips_is_chain && i + 1 < chips.len() {
+                    cw += 14.0;
+                }
+            }
+            ideal_w = ideal_w.max(cw.min(540.0));
+        }
+        if let Some(ref n) = note {
+            ideal_w = ideal_w.max(self.draw.measure_text(n, 9.4) + 28.0);
+        }
+        if let Some((ref cl, _)) = code_peek {
             for (_, text) in cl {
-                ideal_w = ideal_w.max(self.draw.measure_text(text, 9.8) + 54.0);
+                ideal_w = ideal_w.max(self.draw.measure_text(text, 9.6) + 52.0);
             }
         }
-        let max_card_w = (css_w - 24.0).clamp(320.0, 560.0);
-        let min_card_w = (if has_code { 420.0_f32 } else { 340.0_f32 }).min(max_card_w);
+        let max_card_w = (css_w - 24.0).clamp(320.0, 540.0);
+        let min_card_w = (if has_code || !stats.is_empty() { 380.0_f32 } else { 300.0_f32 }).min(max_card_w);
         let card_w = ideal_w.clamp(min_card_w, max_card_w);
-        let inner_w = (card_w - 22.0).max(180.0);
+        let inner_w = (card_w - 20.0).max(160.0);
 
-        let wrapped_metrics = wrap_hover_line(&self.draw, &metrics, 10.0, inner_w);
-        let mut wrapped_extra: Vec<String> = Vec::with_capacity(extra_lines.len());
-        for line in &extra_lines {
-            wrapped_extra.extend(wrap_hover_line(&self.draw, line, 9.8, inner_w));
+        let wrapped_note: Vec<String> = note
+            .as_deref()
+            .map(|n| wrap_hover_line(&self.draw, n, 9.4, inner_w))
+            .unwrap_or_default();
+
+        // Compute exact height from active primitives
+        let mut zone1_h = 30.0; // header
+        if rust_sig.is_some() {
+            zone1_h += 28.0;
         }
+        if !stats.is_empty() {
+            zone1_h += 44.0;
+        }
+        if !bars.is_empty() {
+            zone1_h += (bars.len() as f32) * 20.0 + 4.0;
+        }
+        if !chips.is_empty() {
+            zone1_h += 24.0;
+        }
+        if !wrapped_note.is_empty() {
+            zone1_h += (wrapped_note.len() as f32) * 14.5 + 4.0;
+        }
+        zone1_h += 6.0;
 
-        let zone1_h = 26.0
-            + if subtitle.is_empty() { 0.0 } else { 14.0 }
-            + (wrapped_metrics.len().max(1) as f32) * 15.0
-            + (wrapped_extra.len() as f32) * 15.0
-            + 8.0;
-        let zone2_h = if let Some(ref cl) = code_lines {
-            if cl.is_empty() { 0.0 } else { 14.0 + cl.len() as f32 * 15.0 }
+        let zone2_h = if let Some((ref cl, _)) = code_peek {
+            if cl.is_empty() { 0.0 } else { 12.0 + (cl.len() as f32) * 15.0 }
         } else {
             0.0
         };
@@ -5116,45 +5570,124 @@ impl UiApp {
 
         self.draw.begin_overlay();
         self.draw
-            .rrect(cx + 3.0, cy + 5.0, card_w, card_h, 8.0, [0.0, 0.0, 0.0, 0.55]);
+            .rrect(cx + 3.0, cy + 5.0, card_w, card_h, 8.0, [0.0, 0.0, 0.0, 0.58]);
         self.draw
             .card(cx, cy, card_w, card_h, 8.0, [0.068, 0.068, 0.074, 0.99], col::LINE2);
 
+        // 1. Header primitive: Icon + Title + right loc_tag + status badge
         let mut y = cy + 9.0;
-        let bw = if !badge_txt.is_empty() {
-            let w = self.draw.measure_text(&badge_txt, 9.0) + 12.0;
+        self.draw.icon(icon, cx + 10.0, y + 0.5, 12.0, icon_col);
+        let mut rx_right = cx + card_w - 10.0;
+        if !badge_txt.is_empty() {
+            let bw = self.draw.measure_text(&badge_txt, 8.8) + 12.0;
+            rx_right -= bw;
             self.draw.badge(
-                cx + card_w - w - 10.0,
-                y - 1.0,
+                rx_right,
+                y - 1.5,
                 16.0,
-                9.0,
+                8.8,
                 &badge_txt,
                 badge_col,
-                col::BG3,
+                col::with_alpha(badge_col, 0.14),
                 col::with_alpha(badge_col, 0.45),
             );
-            w + 16.0
-        } else {
-            10.0
-        };
-        self.draw
-            .text_max(cx + 11.0, y, 11.2, col::INK1, &title, card_w - bw - 14.0);
-        y += 16.0;
-        if !subtitle.is_empty() {
+            rx_right -= 8.0;
+        }
+        if !loc_tag.is_empty() {
+            let lw = self.draw.measure_text(&loc_tag, 9.0);
+            if rx_right - lw > cx + 96.0 {
+                rx_right -= lw;
+                self.draw.text(rx_right, y + 1.0, 9.0, col::INK4, &loc_tag);
+                rx_right -= 8.0;
+            }
+        }
+        self.draw.text_max(
+            cx + 27.0,
+            y - 0.5,
+            11.0,
+            col::INK1,
+            &title,
+            (rx_right - (cx + 27.0)).max(60.0),
+        );
+        y += 22.0;
+
+        // 2. Optional syntax-highlighted Rust signature strip
+        if let Some(ref sig) = rust_sig {
             self.draw
-                .text_max(cx + 11.0, y, 9.8, col::INK3, &subtitle, inner_w);
-            y += 14.0;
-        }
-        for line in &wrapped_metrics {
-            self.draw.text_max(cx + 11.0, y, 10.0, col::INK2, line, inner_w);
-            y += 15.0;
-        }
-        for line in &wrapped_extra {
-            self.draw.text_max(cx + 11.0, y, 9.8, col::INK3, line, inner_w);
-            y += 15.0;
+                .card(cx + 10.0, y, inner_w, 22.0, 4.0, [0.050, 0.050, 0.056, 1.0], col::LINE);
+            self.draw
+                .rust_code_line(cx + 16.0, y + 4.5, 9.6, inner_w - 12.0, sig);
+            y += 28.0;
         }
 
-        if let (Some(cl), Some((_, target_line))) = (code_lines, code_key) {
+        // 3. KPI Stat Tile Grid primitive
+        if !stats.is_empty() {
+            let th = 36.0;
+            self.draw
+                .card(cx + 10.0, y, inner_w, th, 5.0, col::BG2, col::LINE);
+            let cell_w = inner_w / stats.len() as f32;
+            for (i, (lbl, val, c)) in stats.iter().enumerate() {
+                let sx = cx + 10.0 + i as f32 * cell_w;
+                if i > 0 {
+                    self.draw.rect(sx, y + 4.0, 1.0, th - 8.0, col::LINE);
+                }
+                self.draw.text(sx + 8.0, y + 5.0, 8.0, col::INK4, lbl);
+                self.draw
+                    .text_max(sx + 8.0, y + 17.5, 10.4, *c, val, cell_w - 14.0);
+            }
+            y += th + 8.0;
+        }
+
+        // 4. Visual Meter / Horizontal Bar primitive
+        if !bars.is_empty() {
+            for (lbl, right, frac, c) in &bars {
+                let lw = (inner_w * 0.34).clamp(76.0, 150.0);
+                let rw = self.draw.measure_text(right, 9.2);
+                let bx = cx + 10.0 + lw + 8.0;
+                let bw = (cx + 10.0 + inner_w - rw - 8.0 - bx).max(36.0);
+                self.draw.text_max(cx + 10.0, y + 1.5, 9.2, col::INK2, lbl, lw);
+                self.draw.rrect(bx, y + 5.5, bw, 5.5, 2.5, col::BG4);
+                if *frac > 0.005 {
+                    self.draw
+                        .rrect(bx, y + 5.5, (bw * frac.clamp(0.0, 1.0)).max(3.5), 5.5, 2.5, *c);
+                }
+                self.draw
+                    .text(cx + 10.0 + inner_w - rw, y + 1.5, 9.2, col::INK1, right);
+                y += 20.0;
+            }
+            y += 4.0;
+        }
+
+        // 5. Pill / Call-Stack Breadcrumb Chips primitive
+        if !chips.is_empty() {
+            let mut px = cx + 10.0;
+            let limit_x = cx + 10.0 + inner_w;
+            for (i, (txt, c)) in chips.iter().enumerate() {
+                let cw = (self.draw.measure_text(txt, 8.8) + 12.0).min(limit_x - px);
+                if cw < 24.0 {
+                    break;
+                }
+                self.draw.rrect(px, y, cw, 17.0, 4.0, col::BG3);
+                self.draw.border(px, y, cw, 17.0, 4.0, 1.0, col::LINE);
+                self.draw
+                    .text_max(px + 6.0, y + 2.5, 8.8, *c, txt, cw - 12.0);
+                px += cw + 4.0;
+                if chips_is_chain && i + 1 < chips.len() && px + 14.0 < limit_x {
+                    self.draw.text(px + 1.0, y + 2.0, 9.0, col::INK4, "→");
+                    px += 13.0;
+                }
+            }
+            y += 24.0;
+        }
+
+        // 6. Optional compact micro-caption
+        for line in &wrapped_note {
+            self.draw.text_max(cx + 10.0, y, 9.3, col::INK3, line, inner_w);
+            y += 14.5;
+        }
+
+        // 7. 5-Line Syntax-Highlighted Rust Source Peek Zone
+        if let Some((cl, target_line)) = code_peek {
             if !cl.is_empty() {
                 let z2_y = cy + zone1_h;
                 self.draw.rect(cx + 1.0, z2_y, card_w - 2.0, 1.0, col::LINE);
@@ -5175,12 +5708,12 @@ impl UiApp {
                     self.draw.text(
                         cx + 8.0,
                         ly + 1.0,
-                        9.5,
+                        9.2,
                         if is_t { col::FIRE } else { col::INK4 },
                         &format!("{n:>4}"),
                     );
                     self.draw
-                        .rust_code_line(cx + 38.0, ly + 1.0, 9.8, card_w - 46.0, &text);
+                        .rust_code_line(cx + 38.0, ly + 1.0, 9.6, card_w - 46.0, &text);
                     ly += 15.0;
                 }
             }
@@ -5338,4 +5871,8 @@ fn wrap_hover_line(draw: &DrawList, text: &str, size: f32, max_w: f32) -> Vec<St
         out.push(cur);
     }
     out
+}
+
+fn file_base(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }

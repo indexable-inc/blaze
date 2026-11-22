@@ -4,4 +4,31 @@ version = 4
 
 [[package]]
 name = "blaze-explore-wasm"
-version = "0.1.0"
+version = "0.0.0"
+dependencies = [
+ "blaze-lex",
+]
+
+[[package]]
+name = "blaze-int"
+version = "0.0.0"
+
+[[package]]
+name = "blaze-lex"
+version = "0.0.0"
+dependencies = [
+ "blaze-int",
+ "blaze-memchr",
+ "blaze-unicode",
+]
+
+[[package]]
+name = "blaze-memchr"
+version = "0.0.0"
+dependencies = [
+ "blaze-int",
+]
+
+[[package]]
+name = "blaze-unicode"
+version = "0.0.0"

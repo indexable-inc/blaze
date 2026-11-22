@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ecs::{Column, Entity, EntityAlloc, Rel, RelGraph};
+use crate::rust_ide::{CompilerItemRow, FileGraph, SymDef};
 use crate::telemetry::{Event, EventKind, CPU_UNKNOWN};
 
 pub const MAX_SAMPLES: usize = 16_384;
@@ -306,9 +307,14 @@ pub struct ProfilerWorld {
     pub slot_locs: HashMap<u32, (String, u32, bool)>,
     pub pc_symbols: HashMap<u64, PcSym>,
 
-    // Cached Rust source snippets (`(file, line) -> lines`)
+    // Cached Rust source files (full-file + parsed IDE symbols + cross-file defs)
     pub sources: HashMap<(String, u32), Vec<(u32, String)>>,
     pub pending_sources: HashSet<(String, u32)>,
+    pub file_lines: HashMap<String, Vec<String>>,
+    pub file_graphs: HashMap<String, FileGraph>,
+    pub pending_files: HashSet<String>,
+    pub workspace_defs: HashMap<String, Option<SymDef>>,
+    pub pending_defs: HashSet<String>,
 
     // Live OS process resources (open listening ports, TCP/UDP sockets, open FDs)
     pub resources: ProcessResources,
@@ -366,6 +372,11 @@ impl ProfilerWorld {
             pc_symbols: HashMap::new(),
             sources: HashMap::new(),
             pending_sources: HashSet::new(),
+            file_lines: HashMap::new(),
+            file_graphs: HashMap::new(),
+            pending_files: HashSet::new(),
+            workspace_defs: HashMap::new(),
+            pending_defs: HashSet::new(),
             resources: ProcessResources::default(),
         }
     }
@@ -1668,6 +1679,7 @@ impl ProfilerWorld {
             return;
         };
         let line = v.get_u64("line").unwrap_or(1) as u32;
+        let is_full = v.get_bool("full").unwrap_or(false);
         let mut lines = Vec::new();
         if let Some(arr) = v.get_arr("lines") {
             for item in arr {
@@ -1676,9 +1688,102 @@ impl ProfilerWorld {
                 lines.push((n, text));
             }
         }
-        let key = (file.to_string(), line);
-        self.pending_sources.remove(&key);
-        self.sources.insert(key, lines);
+        let fstr = file.to_string();
+        self.pending_files.remove(&fstr);
+        self.pending_sources.remove(&(fstr.clone(), line));
+        if is_full || lines.first().map(|(n, _)| *n == 1).unwrap_or(false) {
+            let full_vec: Vec<String> = lines.iter().map(|(_, t)| t.clone()).collect();
+            if let Some(g) = v.get("graph") {
+                let mut rows = Vec::new();
+                if let Some(arr) = g.get_arr("items") {
+                    for it in arr {
+                        rows.push(CompilerItemRow {
+                            kind: it.get_str("kind").unwrap_or("").to_string(),
+                            name: it.get_str("name").unwrap_or("").to_string(),
+                            owner: it.get_str("owner").unwrap_or("").to_string(),
+                            sig: it.get_str("sig").unwrap_or("").to_string(),
+                            ty: it.get_str("ty").unwrap_or("").to_string(),
+                            doc: it.get_str("doc").unwrap_or("").to_string(),
+                            line: it.get_u64("line").unwrap_or(1) as u32,
+                            start_line: it.get_u64("start_line").unwrap_or(1) as u32,
+                            end_line: it.get_u64("end_line").unwrap_or(1) as u32,
+                        });
+                    }
+                }
+                let uses: Vec<String> = g
+                    .get_arr("uses")
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                let submods: Vec<String> = g
+                    .get_arr("submods")
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                let graph = FileGraph::from_compiler(&fstr, &full_vec, rows, uses, submods);
+                self.file_graphs.insert(fstr.clone(), graph);
+            }
+            self.file_lines.insert(fstr.clone(), full_vec);
+        }
+        self.sources.insert((fstr, line), lines);
+    }
+
+    pub fn ingest_def_json(&mut self, json: &str) {
+        let Some(v) = parse_json(json) else {
+            return;
+        };
+        let Some(key) = v.get_str("key").or_else(|| v.get_str("ident")) else {
+            return;
+        };
+        let ident = v.get_str("ident").unwrap_or(key);
+        self.pending_defs.remove(key);
+        if !v.get_bool("found").unwrap_or(false) {
+            self.workspace_defs.insert(key.to_string(), None);
+            return;
+        }
+        let mut snippet = Vec::new();
+        if let Some(arr) = v.get_arr("snippet") {
+            for item in arr {
+                let n = item.get_u64("n").unwrap_or(0) as u32;
+                let text = item.get_str("text").unwrap_or("").to_string();
+                snippet.push((n, text));
+            }
+        }
+        let line = v.get_u64("line").unwrap_or(1) as u32;
+        let def = SymDef {
+            kind: v.get_str("kind").unwrap_or("sym").to_string(),
+            name: v.get_str("display_name").unwrap_or(ident).to_string(),
+            sig: v.get_str("sig").unwrap_or("").to_string(),
+            doc: v.get_str("doc").unwrap_or("").to_string(),
+            file: v.get_str("file").unwrap_or("").to_string(),
+            line,
+            start_line: v.get_u64("start_line").unwrap_or(line as u64) as u32,
+            end_line: v.get_u64("end_line").unwrap_or(line as u64) as u32,
+            owner: None,
+            target_type: None,
+            fields: Vec::new(),
+            snippet,
+        };
+        self.workspace_defs.insert(key.to_string(), Some(def));
+    }
+
+    /// Returns a 5-line (or `count`-line) snippet centered at `line - 1` from full loaded files or snippet cache.
+    pub fn snippet_for(&self, file: &str, line: u32, count: usize) -> Option<Vec<(u32, String)>> {
+        if let Some(full) = self.file_lines.get(file) {
+            if !full.is_empty() {
+                let start = (line as usize).saturating_sub(2).min(full.len().saturating_sub(1));
+                let end = (start + count).min(full.len());
+                let mut out = Vec::with_capacity(end - start);
+                for i in start..end {
+                    out.push(((i + 1) as u32, full[i].clone()));
+                }
+                return Some(out);
+            }
+        }
+        let v = self.sources.get(&(file.to_string(), line))?;
+        let start_idx = v
+            .iter()
+            .position(|(n, _)| *n >= line.saturating_sub(1))
+            .unwrap_or(0);
+        Some(v.iter().skip(start_idx).take(count).cloned().collect())
     }
 }
 

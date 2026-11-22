@@ -41,12 +41,13 @@ pub mod dock;
 pub mod ecs;
 pub mod gpu;
 pub mod model;
+pub mod rust_ide;
 pub mod ui;
 
 use std::cell::UnsafeCell;
 use ui::UiApp;
 
-const IO_BUF_CAP: usize = 256 * 1024;
+const IO_BUF_CAP: usize = 1024 * 1024;
 const CMD_BUF_CAP: usize = 32 * 1024;
 
 struct State {
@@ -143,6 +144,16 @@ pub extern "C" fn ingest_resources(byte_len: u32) {
     if let Ok(s) = core::str::from_utf8(&st.io_buf[..len]) {
         let app = st.app.get_or_insert_with(UiApp::new);
         app.world.ingest_resources_json(s);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ingest_def(byte_len: u32) {
+    let st = unsafe { state_mut() };
+    let len = (byte_len as usize).min(IO_BUF_CAP);
+    if let Ok(s) = core::str::from_utf8(&st.io_buf[..len]) {
+        let app = st.app.get_or_insert_with(UiApp::new);
+        app.world.ingest_def_json(s);
     }
 }
 

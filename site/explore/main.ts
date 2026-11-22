@@ -25,6 +25,7 @@ interface WasmExports {
 	ingest_topology(byteLen: number): void;
 	ingest_source(byteLen: number): void;
 	ingest_resources(byteLen: number): void;
+	ingest_def(byteLen: number): void;
 	active_pid(): number;
 	set_connection(connected: number, detailLen: number): void;
 	on_pointer_move(x: number, y: number): void;
@@ -474,6 +475,19 @@ async function boot(): Promise<void> {
 					const [file, line] = cmd.slice(7).split('|');
 					void fetchApi(`/api/source?file=${encodeURIComponent(file)}&line=${line}`).then((txt) => {
 						if (txt) wasm.ingest_source(writeIoStr(txt));
+					});
+				} else if (cmd.startsWith('def:')) {
+					const [key, ident, from, prefix, imp, kind] = cmd.slice(4).split('\t');
+					const qs = new URLSearchParams({
+						key: key || ident || '',
+						ident: ident || '',
+						from: from || '',
+						prefix: prefix || '',
+						import: imp || '',
+						kind: kind || 'any',
+					});
+					void fetchApi(`/api/def?${qs.toString()}`).then((txt) => {
+						if (txt) wasm.ingest_def(writeIoStr(txt));
 					});
 				} else if (cmd.startsWith('toggle:')) {
 					const [run, slot, kind] = cmd.slice(7).split('|');

@@ -870,22 +870,14 @@ fn read_source_snippet_json(query: &str) -> Option<String> {
         return None;
     }
     let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > 256 * 1024 {
+    if !meta.is_file() || meta.len() > 512 * 1024 {
         return None;
     }
     let content = std::fs::read_to_string(path).ok()?;
-    let start = line.saturating_sub(2).max(1);
-    let end = line.saturating_add(13);
-    let mut out = format!(r#"{{"file":"{}","line":{line},"lines":["#, escape_json(&path_str));
+    let mut out = format!(r#"{{"file":"{}","line":{line},"full":true,"lines":["#, escape_json(&path_str));
     let mut first = true;
-    for (idx, text) in content.lines().enumerate() {
+    for (idx, text) in content.lines().take(2500).enumerate() {
         let ln = idx + 1;
-        if ln < start {
-            continue;
-        }
-        if ln > end {
-            break;
-        }
         if !first {
             out.push(',');
         }

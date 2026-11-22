@@ -709,109 +709,102 @@ impl DrawList {
         let adv = size * self.advance_ratio;
         let bytes = code.as_bytes();
         let len = bytes.len();
-        let mut i = 0;
         let mut cx = x;
         let limit_x = x + max_w;
+        let mut off = 0usize;
+        let mut toks = blaze_lex::tokenize(code, blaze_lex::FrontmatterAllowed::No, blaze_lex::Cpu::SCALAR).peekable();
+        let mut attr_depth = 0i32;
 
-        while i < len && cx + adv <= limit_x {
-            let b = bytes[i];
-            // Line comment `//...`
-            if b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
-                let rest = &code[i..];
-                self.text_max(cx, y, size, col::SYN_CMT, rest, limit_x - cx);
-                return;
+        while let Some(tok) = toks.next() {
+            if cx + adv > limit_x {
+                break;
             }
-            // String literal `"..."`
-            if b == b'"' {
-                let start = i;
-                i += 1;
-                while i < len {
-                    if bytes[i] == b'\\' && i + 1 < len {
-                        i += 2;
-                        continue;
+            let end = (off + tok.len as usize).min(len);
+            let slice = &code[off..end];
+            let prev_off = off;
+            off = end;
+
+            match tok.kind {
+                blaze_lex::TokenKind::Whitespace => {
+                    for ch in slice.chars() {
+                        cx += if ch == '\t' { adv * 2.0 } else { adv };
                     }
-                    if bytes[i] == b'"' {
-                        i += 1;
-                        break;
+                }
+                blaze_lex::TokenKind::LineComment { .. } | blaze_lex::TokenKind::BlockComment { .. } => {
+                    cx += self.text_max(cx, y, size, col::SYN_CMT, slice, limit_x - cx);
+                }
+                blaze_lex::TokenKind::Literal { kind, .. } => {
+                    let c = match kind {
+                        blaze_lex::LiteralKind::Int { .. } | blaze_lex::LiteralKind::Float { .. } => col::SYN_NUM,
+                        _ => col::SYN_STR,
+                    };
+                    cx += self.text_max(cx, y, size, c, slice, limit_x - cx);
+                }
+                blaze_lex::TokenKind::Lifetime { .. } | blaze_lex::TokenKind::RawLifetime => {
+                    cx += self.text_max(cx, y, size, col::SYN_TY, slice, limit_x - cx);
+                }
+                blaze_lex::TokenKind::Ident | blaze_lex::TokenKind::RawIdent => {
+                    let is_macro = matches!(toks.peek().map(|t| t.kind), Some(blaze_lex::TokenKind::Bang));
+                    let color = if attr_depth > 0 || is_macro {
+                        col::SYN_MAC
+                    } else if is_rust_kw(slice) {
+                        col::SYN_KW
+                    } else if is_rust_type(slice) || slice.as_bytes().first().map(|b| b.is_ascii_uppercase()).unwrap_or(false) {
+                        col::SYN_TY
+                    } else {
+                        col::INK1
+                    };
+                    cx += self.text_max(cx, y, size, color, slice, limit_x - cx);
+                }
+                blaze_lex::TokenKind::Pound => {
+                    let next_k = toks.peek().map(|t| t.kind);
+                    if matches!(next_k, Some(blaze_lex::TokenKind::OpenBracket | blaze_lex::TokenKind::Bang)) {
+                        attr_depth = attr_depth.max(1);
                     }
-                    i += 1;
+                    cx += self.text_max(cx, y, size, col::SYN_MAC, slice, limit_x - cx);
                 }
-                let tok = &code[start..i];
-                cx += self.text_max(cx, y, size, col::SYN_STR, tok, limit_x - cx);
-                continue;
-            }
-            // Attribute `#[...]`
-            if b == b'#' && i + 1 < len && (bytes[i + 1] == b'[' || bytes[i + 1] == b'!') {
-                let rest = &code[i..];
-                self.text_max(cx, y, size, col::SYN_MAC, rest, limit_x - cx);
-                return;
-            }
-            // Identifier / keyword / type / macro
-            if b.is_ascii_alphabetic() || b == b'_' {
-                let start = i;
-                while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                    i += 1;
-                }
-                let is_macro = i < len && bytes[i] == b'!';
-                if is_macro {
-                    i += 1;
-                }
-                let tok = &code[start..i];
-                let color = if is_macro {
-                    col::SYN_MAC
-                } else if is_rust_kw(tok) {
-                    col::SYN_KW
-                } else if is_rust_type(tok) || tok.as_bytes()[0].is_ascii_uppercase() {
-                    col::SYN_TY
-                } else {
-                    col::INK1
-                };
-                cx += self.text_max(cx, y, size, color, tok, limit_x - cx);
-                continue;
-            }
-            // Number
-            if b.is_ascii_digit() {
-                let start = i;
-                while i < len
-                    && (bytes[i].is_ascii_hexdigit()
-                        || bytes[i] == b'_'
-                        || bytes[i] == b'x'
-                        || bytes[i] == b'.')
-                {
-                    i += 1;
-                }
-                let tok = &code[start..i];
-                cx += self.text_max(cx, y, size, col::SYN_NUM, tok, limit_x - cx);
-                continue;
-            }
-            // Tab -> 2 spaces for compact source peeks
-            if b == b'\t' {
-                cx += adv * 2.0;
-                i += 1;
-                continue;
-            }
-            // 2-char Berkeley Mono OpenType ligature (`->`, `=>`, `::`, `!=`, `==`, `<=`, `>=`, `..`)
-            if i + 1 < len {
-                if let Some(lig_idx) = match_ligature_bytes(bytes[i], bytes[i + 1]) {
-                    if cx + adv * 2.0 <= limit_x {
-                        let scale = size / 28.0;
-                        let lig_w = 48.0 * scale;
-                        let gh = 40.0 * scale;
-                        let lig_pad_x = (lig_w - adv * 2.0) * 0.5;
-                        self.push_ligature(cx - lig_pad_x, y - size * 0.14, lig_w, gh, lig_idx, col::INK2);
+                blaze_lex::TokenKind::OpenBracket => {
+                    if attr_depth > 0 {
+                        attr_depth += 1;
                     }
-                    cx += adv * 2.0;
-                    i += 2;
-                    continue;
+                    let c = if attr_depth > 0 { col::SYN_MAC } else { col::INK2 };
+                    cx += self.text_max(cx, y, size, c, slice, limit_x - cx);
+                }
+                blaze_lex::TokenKind::CloseBracket => {
+                    let c = if attr_depth > 0 { col::SYN_MAC } else { col::INK2 };
+                    if attr_depth > 0 {
+                        attr_depth = (attr_depth - 1).max(0);
+                        if attr_depth == 1 {
+                            attr_depth = 0;
+                        }
+                    }
+                    cx += self.text_max(cx, y, size, c, slice, limit_x - cx);
+                }
+                _ => {
+                    // Combine adjacent 2-char Berkeley Mono OpenType ligatures (`->`, `=>`, `!=`, `==`, `<=`, `>=`, `..`)
+                    if slice.len() == 1 && prev_off + 1 < len {
+                        if let Some(next_tok) = toks.peek() {
+                            if next_tok.len == 1 {
+                                if let Some(lig_idx) = match_ligature_bytes(bytes[prev_off], bytes[prev_off + 1]) {
+                                    toks.next();
+                                    off += 1;
+                                    if cx + adv * 2.0 <= limit_x {
+                                        let scale = size / 28.0;
+                                        let lig_w = 48.0 * scale;
+                                        let gh = 40.0 * scale;
+                                        let lig_pad_x = (lig_w - adv * 2.0) * 0.5;
+                                        self.push_ligature(cx - lig_pad_x, y - size * 0.14, lig_w, gh, lig_idx, col::INK2);
+                                    }
+                                    cx += adv * 2.0;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    let c = if attr_depth > 0 { col::SYN_MAC } else { col::INK2 };
+                    cx += self.text_max(cx, y, size, c, slice, limit_x - cx);
                 }
             }
-            // Punctuation / whitespace
-            if b != b' ' {
-                let s = &code[i..i + 1];
-                self.text_max(cx, y, size, col::INK2, s, limit_x - cx);
-            }
-            cx += adv;
-            i += 1;
         }
     }
 }

@@ -16,3 +16,5 @@ __pycache__/
 
 # The Hypervisor.framework sandbox experiment is kept out of the repository (the owner, 2026-11-16).
 /crates/blaze-hvbox/
+
+/site/explore/wasm/target/
