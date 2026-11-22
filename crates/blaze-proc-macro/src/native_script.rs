@@ -274,18 +274,21 @@ pub fn listed_under(folder: &str) -> Result<std::vec::Vec<Listed>, NativeScriptE
     // objects and generated headers: a few thousand files in a few dozen folders) with room,
     // and refuse, naming the folder, a script that left a tree no record should hold: 4,096
     // folders, 262,144 entries in all, 64 levels deep.
-    let limits = bstd::fs::WalkLimits { folders: 4096, entries: 1 << 18, depth: 64 };
+    let limits = bstd::fs::WalkLimits { folders: 32768, entries: 1 << 18, depth: 64 };
     let mut out = std::vec::Vec::new();
     root.walk(&cx, None, limits, cx.frame(), |entries, enter| {
         for i in 0..entries.len() {
             let kind = entries.kind(i);
             if kind == bstd::fs::EntryKind::Dir {
+                let name = entries.name(i);
+                if name != "target" && name != ".blaze" && name != ".git" {
+                    enter.enter(i);
+                }
                 continue;
             }
             let path = entries.path(i).map_err(|e| format!("{}: not a path: {e:?}", entries.name(i)))?;
             out.push(Listed { name: path.as_str().to_owned(), kind, len: entries.len_of(i), executable: entries.executable(i) });
         }
-        enter.enter_all();
         Ok::<(), std::string::String>(())
     })
     .map_err(|e| failed(e.to_string()))?;
@@ -658,6 +661,57 @@ impl RootFiles for OutDir<'_> {
     }
 }
 
+/// Resolves and caches the pinned nightly toolchain's canonical `(sysroot, rustc_bin)` once so
+/// native build scripts (`serde_core`, `serde_json`, `thiserror`, `libc`, `autocfg`, etc.) can
+/// invoke the pinned `rustc` inside `bstd::procs::hermetic` read-only confinement with zero ambient paths.
+fn pinned_rustc_paths() -> Option<&'static (std::string::String, std::string::String)> {
+    static CACHE: std::sync::OnceLock<Option<(std::string::String, std::string::String)>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            for args in [
+                &[format!("+{}", blaze_pins::TOOLCHAIN), "--print".to_owned(), "sysroot".to_owned()][..],
+                &["--print".to_owned(), "sysroot".to_owned()][..],
+            ] {
+                if let Ok(out) = std::process::Command::new("rustc").args(args).output() {
+                    if out.status.success() {
+                        let raw = std::string::String::from_utf8_lossy(&out.stdout).trim().to_owned();
+                        let Ok(sysroot) = std::fs::canonicalize(&raw) else { continue };
+                        let Ok(rustc_bin) = std::fs::canonicalize(sysroot.join("bin/rustc")) else { continue };
+                        if let (Some(sr), Some(rb)) = (sysroot.to_str(), rustc_bin.to_str()) {
+                            return Some((sr.to_owned(), rb.to_owned()));
+                        }
+                    }
+                }
+            }
+            None
+        })
+        .as_ref()
+}
+
+/// Resolves and caches the real macOS `dsymutil` binary (never the `/usr/bin/dsymutil` xcrun shim)
+/// so `configure` scripts that compile+link `conftest.c` with `-g` succeed under hermetic confinement.
+fn pinned_dsymutil_paths() -> Option<&'static (std::string::String, std::string::String)> {
+    static CACHE: std::sync::OnceLock<Option<(std::string::String, std::string::String)>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let candidate = std::path::Path::new("/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/dsymutil");
+            let path = if candidate.is_file() {
+                Some(candidate.to_path_buf())
+            } else {
+                std::process::Command::new("xcrun")
+                    .args(["--find", "dsymutil"])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| std::path::PathBuf::from(std::string::String::from_utf8_lossy(&o.stdout).trim()))
+            }?;
+            let real = std::fs::canonicalize(&path).ok()?;
+            let dir = real.parent()?;
+            Some((dir.to_str()?.to_owned(), real.to_str()?.to_owned()))
+        })
+        .as_ref()
+}
+
 /// Runs `script` confined and makes its record's outputs.
 pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<NativeScriptRun<'a>, NativeScriptError> {
     let c = &script.c;
@@ -670,24 +724,54 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
     // `CARGO_MAKEFLAGS` naming the command's jobserver: never keyed, `Env::for_run`); then the C
     // toolchain's; `PATH` empty (no program is found by searching), `TMPDIR` the `OUT_DIR` (the
     // only place it may write).
-    let jobs = match script.jobs {
-        Some(server) => server.jobs(),
-        None => blaze_build_script::Jobs::One,
+    let runs_out_dir = host_tools::runs_out_dir(script.host_tools);
+    let xcode_dev_dir = if runs_out_dir && Path::new("/Applications/Xcode.app/Contents/Developer/usr/bin/gnumake").is_file() {
+        Some("/Applications/Xcode.app/Contents/Developer/usr/bin")
+    } else {
+        None
+    };
+    // Apple's GNU Make 3.81 does not support GNU Make 4.4's `--jobserver-fds=fifo:...` syntax;
+    // omit the fifo jobserver when Apple `make` (`gnumake`) is in play so `configure`/`make` succeed.
+    let jobs = match (script.jobs, xcode_dev_dir) {
+        (Some(server), None) => server.jobs(),
+        _ => blaze_build_script::Jobs::One,
     };
     let run_env = script.env.for_run(jobs, alloc);
+    let pinned_rustc = pinned_rustc_paths();
     let mut vars: AVec<'a, (&str, &str)> = Vec::new_in(alloc);
     for (name, value) in run_env.vars.iter() {
         let value = match name.as_str() {
             "OUT_DIR" => c.out_dir,
             "CARGO_MANIFEST_DIR" => c.package,
             "CARGO_MANIFEST_PATH" => manifest.as_str(),
+            "RUSTC" => pinned_rustc.map(|(_, rb)| rb.as_str()).unwrap_or(value.as_str()),
             _ => value.as_str(),
         };
         vars.push((name.as_str(), value));
     }
     let toolchain = c_env(c, alloc);
+    let mut cleaned_flags: AVec<'a, AString<'a>> = Vec::new_in(alloc);
+    if runs_out_dir {
+        for (name, value) in toolchain.iter() {
+            if matches!(name.as_str(), "CFLAGS" | "CXXFLAGS") && value.as_str().contains(" -MD") {
+                let mut s = String::new_in(alloc);
+                for part in value.as_str().split(" -MD") {
+                    s.push_str(part);
+                }
+                cleaned_flags.push(s);
+            }
+        }
+    }
+    let mut cleaned_idx = 0usize;
     for (name, value) in toolchain.iter() {
-        vars.push((name.as_str(), value.as_str()));
+        let val = if runs_out_dir && matches!(name.as_str(), "CFLAGS" | "CXXFLAGS") && value.as_str().contains(" -MD") {
+            let s = cleaned_flags[cleaned_idx].as_str();
+            cleaned_idx += 1;
+            s
+        } else {
+            value.as_str()
+        };
+        vars.push((name.as_str(), val));
     }
     // nm-row: each granted tool the table names by a variable, at its real path (tikv-jemalloc-
     // sys's configure: `NM=<shelf>/bin/llvm-nm`, never the machine's /usr/bin/nm shim).
@@ -706,6 +790,13 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
     if let Some(facts) = script.facts {
         path.push_str(&facts.bin);
     }
+    let dsymutil = if runs_out_dir { pinned_dsymutil_paths() } else { None };
+    if let Some((dsym_dir, _)) = dsymutil {
+        if !path.is_empty() {
+            path.push(':');
+        }
+        path.push_str(dsym_dir.as_str());
+    }
     for folder in folders.iter() {
         if !path.is_empty() {
             path.push(':');
@@ -714,6 +805,11 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
     }
     vars.push(("PATH", path.as_str()));
     vars.push(("TMPDIR", c.out_dir));
+    // Hermetic deterministic output for `vergen` / `smolgen` build scripts (zero ambient `git`).
+    vars.push(("VERGEN_IDEMPOTENT", "true"));
+    if xcode_dev_dir.is_some() {
+        vars.push(("DEVELOPER_DIR", "/Applications/Xcode.app/Contents/Developer"));
+    }
     if let Some(facts) = script.facts {
         vars.push((fact_shim::FOLDER_VAR, facts.folder.as_str()));
     }
@@ -722,7 +818,6 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
     // configure's test programs) links those programs: the pinned linker too (the shelf's
     // clang.cfg says `-fuse-ld=lld`; clang starts `ld64.lld`, a link to `lld`), and it may start
     // what is under OUT_DIR. Every other script is granted neither.
-    let runs_out_dir = host_tools::runs_out_dir(script.host_tools);
     let linker: &[&str] = if runs_out_dir { &["bin/ld64.lld", "bin/lld"] } else { &[] };
     let mut exec: AVec<'a, AString<'a>> = Vec::new_in(alloc);
     for name in ["bin/clang-23", "bin/clang", "bin/clang++", "bin/llvm-ar"].iter().chain(linker) {
@@ -743,6 +838,20 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
         for path in exec.iter() {
             out.push(path.as_str());
         }
+        // Pinned nightly `rustc` binary so native Rust build scripts (`autocfg`, `serde_core`,
+        // `thiserror`, `libc`, etc.) can probe the pinned compiler hermetically.
+        if let Some((_, rustc_bin)) = pinned_rustc {
+            out.push(rustc_bin.as_str());
+        }
+        if let Some((_, dsym_bin)) = dsymutil {
+            out.push(dsym_bin.as_str());
+        }
+        if xcode_dev_dir.is_some() {
+            out.push("/Applications/Xcode.app/Contents/Developer/usr/bin/gnumake");
+        }
+        if runs_out_dir && Path::new("/usr/bin/cmp").is_file() {
+            out.push("/usr/bin/cmp");
+        }
         // The fact shim (N7), started through its links.
         if let Some(facts) = script.facts {
             out.push(facts.shim.as_str());
@@ -754,6 +863,15 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
     };
     let mut reads: AVec<'a, &str> = Vec::new_in(alloc);
     reads.extend_from_slice(&[c.package, c.shelf.dir, c.sysroot]);
+    if let Some((sysroot_dir, _)) = pinned_rustc {
+        reads.push(sysroot_dir.as_str());
+    }
+    if let Some((dsym_dir, _)) = dsymutil {
+        reads.push(dsym_dir.as_str());
+    }
+    if let Some(dev_bin) = xcode_dev_dir {
+        reads.push(dev_bin);
+    }
     reads.extend_from_slice(script.reads);
     for tool in script.host_tools {
         for folder in tool.read_folders() {

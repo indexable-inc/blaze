@@ -60,6 +60,7 @@ use crate::{
     rc::{self, Rc},
     soa::{CloneColumns, Columns, Soa},
     sorted::{SortedMap, SortedSet},
+    thin_arc::{ThinArc, ThinStr},
     vec::{Refused, Vec},
 };
 
@@ -99,6 +100,10 @@ impl<T: ?Sized, A: AllocatorClone> Share for arc::Weak<T, A> {}
 impl<T: ?Sized, A: AllocatorClone> Share for Rc<T, A> {}
 
 impl<T: ?Sized, A: AllocatorClone> Share for rc::Weak<T, A> {}
+
+impl<H, T, A: Allocator> Share for ThinArc<H, T, A> {}
+
+impl<A: Allocator> Share for ThinStr<A> {}
 
 impl<T: ?Sized> Share for &T {}
 

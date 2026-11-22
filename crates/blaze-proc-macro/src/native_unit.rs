@@ -58,6 +58,51 @@ pub fn placed(graph: &UnitGraph<'_>, script: UnitId, mode: Mode, alloc: Alloc<'_
     toolchain::placement(native::closure(graph, script, alloc), mode, graph.units[script.index()].name.as_str())
 }
 
+/// Like [`placed`], but honors the D175 zero-Wasm fast path: whenever `store` holds a native
+/// host binary record (`script.bin`, `target <host>`) for `script` and does not hold a legacy
+/// `module.wasm` record, places `script` on [`Runner::Native`] so it runs confined under
+/// `bstd::procs::hermetic` (macOS Seatbelt / Linux Landlock + seccomp) with zero Wasm.
+pub fn placed_in_store(
+    store: &Path,
+    graph: &UnitGraph<'_>,
+    script: UnitId,
+    mode: Mode,
+    host: &str,
+    alloc: Alloc<'_>,
+) -> Runner {
+    let base = placed(graph, script, mode, alloc);
+    if matches!(base, Runner::Native { .. }) {
+        return base;
+    }
+    let Some(unit) = graph.units.get(script.index()) else { return base };
+    let features: std::vec::Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
+    let has_native = crate::script_unit::module_of_native(
+        store,
+        unit.name.as_str(),
+        unit.version.as_str(),
+        &features,
+        host,
+    )
+    .ok()
+    .flatten()
+    .is_some();
+    if has_native {
+        let has_wasm = crate::script_unit::module_of(
+            store,
+            unit.name.as_str(),
+            unit.version.as_str(),
+            &features,
+        )
+        .ok()
+        .flatten()
+        .is_some();
+        if !has_wasm {
+            return Runner::Native { because: script };
+        }
+    }
+    base
+}
+
 /// What a command gives its native scripts. Every path absolute and canonical (Seatbelt matches
 /// resolved paths).
 #[derive(Clone, Copy, Debug)]
@@ -220,6 +265,12 @@ fn fresh_folder(work: &str, rel: &str, files: &[(String, std::vec::Vec<u8>)], pa
         let file = root.create(&cx, &path).map_err(|e| failed(format!("{name}: {e}")))?;
         file.write_at(&cx, 0, bytes, Durable::No).map_err(|e| failed(format!("{name}: {e}")))?;
         file.close(&cx, Durable::No).map_err(|e| failed(format!("{name}: {e}")))?;
+        #[cfg(unix)]
+        if bytes.starts_with(b"#!") {
+            use std::os::unix::fs::PermissionsExt as _;
+            let full = format!("{work}/{under}");
+            let _ = std::fs::set_permissions(&full, std::fs::Permissions::from_mode(0o755));
+        }
     }
     if files.is_empty() {
         remove(&folder, marker).map_err(|e| failed(e.to_string()))?;
@@ -274,7 +325,7 @@ pub fn native_outputs<'a>(
     // below), as a wasm reader's key does; the run is given the values as IT sees them (laid
     // below). A value under neither of a producer's trees is refused here, naming it.
     let dep_error = |why: LayError| NativeUnitError::DepLinks { package: package.clone(), why };
-    let viewed = dep_mount::view(&tree, producers, deps, alloc).map_err(|e| dep_error(LayError::View(e)))?;
+    let viewed = dep_mount::view_with_stored(&tree, producers, deps, alloc).map_err(|e| dep_error(LayError::View(e)))?;
     let mut keyed: AVec<'a, DepMetadata<'_>> = Vec::new_in(alloc);
     for (dep, value) in deps.iter().zip(viewed.values.iter()) {
         keyed.push(DepMetadata { links: dep.links, key: dep.key, value: value.as_str() });
@@ -340,18 +391,25 @@ pub fn native_outputs<'a>(
     // The package on disk (a workspace member's folder as it is; a fetched package written out
     // under its key) and an empty `OUT_DIR`.
     let key_hex = hex(&base.0);
-    let (package_dir, listed): (String, std::vec::Vec<String>) = match &tree {
+    let (package_dir, workspace_read, listed): (String, Option<String>, std::vec::Vec<String>) = match &tree {
         // Already the resolved root (`RealRoot`, the edge's one realpath, as Seatbelt matches
-        // paths): not resolved again.
+        // paths): not resolved again. For a workspace member (`root.seen()` = `/workspace/<rel>`),
+        // `package_dir` (CARGO_MANIFEST_DIR + cwd) is `<workspace>/<rel>`, while the workspace
+        // root itself remains granted read-only so workspace-relative reads still succeed.
         Tree::Dir(dir) => {
-            let real = dir.path().to_str().ok_or_else(|| NativeUnitError::Files { package: package.clone(), folder: dir.path().display().to_string(), why: "not UTF-8".to_owned() })?.to_owned();
-            let names = listed_under(&real).map_err(|e| NativeUnitError::Files { package: package.clone(), folder: real.clone(), why: e.to_string() })?;
+            let ws_real = dir.path().to_str().ok_or_else(|| NativeUnitError::Files { package: package.clone(), folder: dir.path().display().to_string(), why: "not UTF-8".to_owned() })?.to_owned();
+            let seen_str = root.seen().to_string();
+            let rel = seen_str.strip_prefix("/workspace").unwrap_or("").trim_start_matches('/');
+            let pkg_path = if rel.is_empty() { dir.path().to_path_buf() } else { std::fs::canonicalize(dir.path().join(rel)).unwrap_or_else(|_| dir.path().join(rel)) };
+            let pkg_real = pkg_path.to_str().ok_or_else(|| NativeUnitError::Files { package: package.clone(), folder: pkg_path.display().to_string(), why: "not UTF-8".to_owned() })?.to_owned();
+            let names = listed_under(&ws_real).map_err(|e| NativeUnitError::Files { package: package.clone(), folder: ws_real.clone(), why: e.to_string() })?;
             let names = names.into_iter().map(|listed| listed.name).collect();
-            (real, names)
+            let extra_read = (pkg_real != ws_real).then_some(ws_real);
+            (pkg_real, extra_read, names)
         }
         Tree::Mem { files, .. } => {
             let dir = fresh_folder(native.work, &format!("pkg/{key_hex}"), files, &package)?;
-            (dir, files.iter().map(|(n, _)| n.clone()).collect())
+            (dir, None, files.iter().map(|(n, _)| n.clone()).collect())
         }
     };
     let out_dir = fresh_folder(native.work, &format!("out/{key_hex}"), &[], &package)?;
@@ -364,22 +422,6 @@ pub fn native_outputs<'a>(
     let facts_error = |e: native_facts::NativeFactsError| NativeUnitError::Facts { package: package.clone(), why: e.to_string() };
     let shim = native_facts::placed_shim(native.work).map_err(facts_error)?;
     let facts = native_facts::prepare(&shim, native.work, &key_hex, pins, alloc).map_err(facts_error)?;
-    // Brief N8: the producers' trees laid read-only under this run's own folder, each value as
-    // this run sees it; what the script prints under them is kept in the record's form.
-    let laid = dep_mount::native::lay(native.work, &format!("deps/{key_hex}"), producers, deps, alloc).map_err(dep_error)?;
-    let mut run_deps: AVec<'a, DepMetadata<'_>> = Vec::new_in(alloc);
-    for (dep, value) in deps.iter().zip(laid.values.iter()) {
-        run_deps.push(DepMetadata { links: dep.links, key: dep.key, value: value.as_str() });
-    }
-    let run_env = blaze_build_script::env(&Given { deps: &run_deps, ..given }, alloc);
-    let mut dep_reads: AVec<'a, &str> = Vec::new_in(alloc);
-    for folder in laid.folders.iter() {
-        dep_reads.push(folder.as_str());
-    }
-    let mut dep_shown: AVec<'a, (&str, &str)> = Vec::new_in(alloc);
-    for (real, shown) in laid.shown.iter() {
-        dep_shown.push((real.as_str(), shown.as_str()));
-    }
     // The home's file area: each file the script leaves goes there by digest, renamed, never
     // read whole (librocksdb-sys's 810 MB archive); made once, canonical as Seatbelt's paths.
     let area = setting.store.join(blaze_build_script::outputs::FILE_AREA);
@@ -387,6 +429,25 @@ pub fn native_outputs<'a>(
     std::fs::create_dir_all(&area).map_err(|e| area_failed(e.to_string()))?;
     let area = std::fs::canonicalize(&area).map_err(|e| area_failed(e.to_string()))?;
     let area = area.to_str().ok_or_else(|| area_failed("not UTF-8".to_owned()))?.to_owned();
+    // Brief N8: the producers' trees laid read-only under this run's own folder, each value as
+    // this run sees it; what the script prints under them is kept in the record's form.
+    let laid = dep_mount::native::lay_with_area(native.work, &format!("deps/{key_hex}"), Some(Path::new(&area)), producers, deps, alloc).map_err(dep_error)?;
+    let mut run_deps: AVec<'a, DepMetadata<'_>> = Vec::new_in(alloc);
+    for (dep, value) in deps.iter().zip(laid.values.iter()) {
+        run_deps.push(DepMetadata { links: dep.links, key: dep.key, value: value.as_str() });
+    }
+    let run_env = blaze_build_script::env(&Given { deps: &run_deps, ..given }, alloc);
+    let mut dep_reads: AVec<'a, &str> = Vec::new_in(alloc);
+    if let Some(ref ws) = workspace_read {
+        dep_reads.push(ws.as_str());
+    }
+    for folder in laid.folders.iter() {
+        dep_reads.push(folder.as_str());
+    }
+    let mut dep_shown: AVec<'a, (&str, &str)> = Vec::new_in(alloc);
+    for (real, shown) in laid.shown.iter() {
+        dep_shown.push((real.as_str(), shown.as_str()));
+    }
     let run = NativeScript {
         key: base,
         files: &area,

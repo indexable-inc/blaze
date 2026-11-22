@@ -69,11 +69,12 @@ impl RootMarks {
     /// equal. The rules they add ([`RootMarks::rules`]) are a function of it, so a key that has
     /// it covers them.
     pub const fn key(&self) -> u64 {
-        (self.denied as u64)
-            | (self.no_std as u64) << 32
-            | (self.sans_io as u64) << 33
-            | (self.driver as u64) << 34
-            | (self.trust_unsafe as u64) << 35
+        const _: () = assert!(Rule::COUNT < 60, "RootMarks::key reserves bits 60..64 for flags");
+        self.denied
+            | (self.no_std as u64) << 60
+            | (self.sans_io as u64) << 61
+            | (self.driver as u64) << 62
+            | (self.trust_unsafe as u64) << 63
     }
 
     /// Whether the file denies or forbids `rule`'s lint.

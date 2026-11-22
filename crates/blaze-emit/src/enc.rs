@@ -335,6 +335,16 @@ pub(crate) const fn ldp_post(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
     0xa8c0_0000 | ((((off / 8) as u32) & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
 }
 
+/// `stp dt, dt2, [rn, #off]!` (C7.2.309, SIMD&FP 64-bit pre-index), `off` a multiple of 8 in -512..=504.
+pub(crate) const fn stp_pre_d(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
+    0x6d80_0000 | ((((off / 8) as u32) & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
+}
+
+/// `ldp dt, dt2, [rn], #off` (C7.2.155, SIMD&FP 64-bit post-index), `off` a multiple of 8 in -512..=504.
+pub(crate) const fn ldp_post_d(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
+    0x6cc0_0000 | ((((off / 8) as u32) & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
+}
+
 // PC-relative (C6.2.168, 10): `words` and `bytes` from this instruction.
 
 /// `ldr xt, <pc + 4 * words>`.
@@ -547,6 +557,22 @@ pub(crate) const fn fbin(opcode: u32, double: bool, rd: Reg, rn: Reg, rm: Reg) -
 /// `fneg`.
 pub(crate) const fn fneg(double: bool, rd: Reg, rn: Reg) -> u32 {
     0x1e21_4000 | ftype(double) | (rn << 5) | rd
+}
+
+/// `fmov dd, dn` / `fmov sd, sn` (C7.2.119, register).
+pub(crate) const fn fmov_reg(double: bool, rd: Reg, rn: Reg) -> u32 {
+    0x1e20_4000 | ftype(double) | (rn << 5) | rd
+}
+
+/// `fcsel dd, dn, dm, cond` / `fcsel sd, sn, sm, cond` (C7.2.67).
+pub(crate) const fn fcsel(double: bool, rd: Reg, rn: Reg, rm: Reg, cond: Cond) -> u32 {
+    0x1e20_0c00 | ftype(double) | (rm << 16) | ((cond as u32) << 12) | (rn << 5) | rd
+}
+
+/// Scalar FP 1-source by opcode (`000001` fabs, `000011` fsqrt, `001000` frintn, `001001` frintp,
+/// `001010` frintm, `001011` frintz, `001100` frinta).
+pub(crate) const fn fp1_op(opcode: u32, double: bool, rd: Reg, rn: Reg) -> u32 {
+    0x1e20_4000 | ftype(double) | (opcode << 15) | (rn << 5) | rd
 }
 
 /// `fcmp n, m`: NZCV is 0110 equal, 1000 less, 0010 greater, 0011 unordered.
@@ -914,6 +940,12 @@ pub(crate) enum Ftype {
 /// rounded once.
 pub(crate) const fn fmadd(ft: Ftype, rd: Reg, rn: Reg, rm: Reg, ra: Reg) -> u32 {
     0x1f00_0000 | ((ft as u32) << 22) | (rm << 16) | (ra << 10) | (rn << 5) | rd
+}
+
+/// `fmsub d, n, m, a` of `ft` (C7.2.126): `0001 1111 ftype 0 Rm 1 Ra Rn Rd`, `d = a - n * m`
+/// rounded once.
+pub(crate) const fn fmsub(ft: Ftype, rd: Reg, rn: Reg, rm: Reg, ra: Reg) -> u32 {
+    0x1f00_8000 | ((ft as u32) << 22) | (rm << 16) | (ra << 10) | (rn << 5) | rd
 }
 
 /// The opcode of a floating-point data-processing (1 source) form (C4.1.96): `fsqrt` 000011,

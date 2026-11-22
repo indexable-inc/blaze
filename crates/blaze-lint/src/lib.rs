@@ -64,7 +64,7 @@ mod tests;
 
 use blaze_own::{AVec, Alloc};
 
-pub use allowed::{ALLOWED_STATICS, Allowed, AllowedStatic, statics_of_path};
+pub use allowed::{ALLOWED_STATICS, Allowed, AllowedStatic, is_hermetic_path, statics_of_path};
 pub use engine::Scratch;
 pub use fix::{FixError, apply, apply_all};
 pub use marks::{OwnHeads, RootMarks};
@@ -247,6 +247,15 @@ pub enum Rule {
     /// `#[proc_macro_attribute]`) where Blaze's `comptime` reflection should be used instead.
     /// The lint `blaze::proc_macro_derive`.
     ProcMacroDef = 33,
+    /// Double heap indirection via `Arc<Vec<...>>` or `Arc<String>` in type syntax where
+    /// `blaze_own::ThinArc` / `blaze_own::ThinStr` gives a single 8-byte thin pointer and a single
+    /// allocation. The lint `blaze::double_indirection_arc`.
+    DoubleIndirectionArc = 34,
+    /// Raw `"sandbox-exec"` or `"/usr/bin/sandbox-exec"` process spawn outside
+    /// `bstd::procs::hermetic`, where `bstd::procs::hermetic::Hermetic` provides cross-platform
+    /// macOS Seatbelt + Linux Landlock/seccomp from one sans-IO `Plan`.
+    /// The lint `blaze::raw_sandbox_exec`.
+    RawSandboxExec = 35,
 }
 
 impl Rule {
@@ -288,6 +297,8 @@ impl Rule {
         Rule::AnonTupleReturn,
         Rule::HandWrittenDerivable,
         Rule::ProcMacroDef,
+        Rule::DoubleIndirectionArc,
+        Rule::RawSandboxExec,
     ];
 
     /// The ten rules ported from blaze's scripts: what [`Step::Strict`] runs. The rules after
@@ -345,6 +356,8 @@ impl Rule {
             Rule::AnonTupleReturn => "anon-tuple-return",
             Rule::HandWrittenDerivable => "hand-written-derivable",
             Rule::ProcMacroDef => "proc-macro-def",
+            Rule::DoubleIndirectionArc => "double-indirection-arc",
+            Rule::RawSandboxExec => "raw-sandbox-exec",
         }
     }
 
@@ -374,6 +387,8 @@ impl Rule {
             Rule::AnonTupleReturn => Some("anon_tuple_return"),
             Rule::HandWrittenDerivable => Some("hand_written_derivable"),
             Rule::ProcMacroDef => Some("proc_macro_derive"),
+            Rule::DoubleIndirectionArc => Some("double_indirection_arc"),
+            Rule::RawSandboxExec => Some("raw_sandbox_exec"),
             _ => None,
         }
     }
@@ -580,6 +595,10 @@ pub enum Template {
     HandWrittenDiscriminant = 280,
     /// A `#[proc_macro*]` attribute where Blaze `comptime` reflection belongs.
     ProcMacroDef = 290,
+    /// `Arc<Vec<...>>` or `Arc<String>` in type syntax; argument: the inner type (`Vec` or `String`).
+    DoubleIndirectionArc = 300,
+    /// Literal `"sandbox-exec"` or `"/usr/bin/sandbox-exec"` outside `bstd::procs::hermetic`.
+    RawSandboxExec = 310,
 }
 
 impl Template {
@@ -616,6 +635,8 @@ impl Template {
             270 => Rule::AnonTupleReturn,
             280 => Rule::HandWrittenDerivable,
             290 => Rule::ProcMacroDef,
+            300 => Rule::DoubleIndirectionArc,
+            310 => Rule::RawSandboxExec,
             _ => Rule::VariantCount,
         }
     }
@@ -693,6 +714,8 @@ impl Template {
             Template::AnonTupleReturn => "anon-tuple-return",
             Template::HandWrittenDiscriminant => "hand-written-discriminant",
             Template::ProcMacroDef => "proc-macro-def",
+            Template::DoubleIndirectionArc => "double-indirection-arc",
+            Template::RawSandboxExec => "raw-sandbox-exec",
         }
     }
 }
@@ -948,6 +971,9 @@ pub struct Scope {
     /// The crate root carries a valid `#![blaze::trust(unsafe, reason = "..")]` grant
     /// ([`RootMarks::trust_unsafe`]): what `workspace-unsafe` reads.
     pub trust_unsafe: bool,
+    /// The file belongs to `bstd::procs::hermetic` ([`is_hermetic_path`]), which is allowed to
+    /// invoke the OS's `sandbox-exec` binary directly: what `raw-sandbox-exec` reads.
+    pub in_hermetic: bool,
     pub context: Context,
 }
 
@@ -966,6 +992,7 @@ impl Scope {
             statics: 0,
             lock_reason: false,
             trust_unsafe: false,
+            in_hermetic: false,
             context: Context {
                 clone_above: Walk::NONE,
                 clone_after: None,
@@ -988,6 +1015,12 @@ impl Scope {
     /// ([`RootMarks::scope`]).
     pub const fn with_trust_unsafe(self) -> Scope {
         Scope { trust_unsafe: true, ..self }
+    }
+
+    /// The same scope inside `bstd::procs::hermetic`, where invoking `sandbox-exec` directly is
+    /// permitted ([`is_hermetic_path`]).
+    pub const fn in_hermetic(self) -> Scope {
+        Scope { in_hermetic: true, ..self }
     }
 
     /// The same scope in a file with these facts of its own text and crate: the IO module
@@ -1057,7 +1090,8 @@ impl Scope {
             | (c.recursion_above as u64) << 27
             | (self.sans_io as u64) << 35
             | (self.own_heads.0 as u64) << 36
-            | (self.statics as u64) << 44
+            | ((self.statics & 0x7FFF) as u64) << 44
+            | (self.in_hermetic as u64) << 59
             | (self.lock_reason as u64) << 60
             | (self.trust_unsafe as u64) << 61
             | (seqcst_bits >> 4) << 62

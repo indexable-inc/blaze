@@ -167,6 +167,7 @@ covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it
 - **41. docs-say-what-they-are**: Front matter says current, plan, record or superseded; current docs are kept true.
 - **42. scripts-take-typed-input**: A script takes one JSON value parsed into a frozen dataclass, not flags or env vars.
 - **49. docs-stay-small**: The plan, the ledger, the bounds and one spec per unbuilt design; delete what stops being true.
+- **85. lint-every-jank**: Whenever you encounter janky, fragile, or anti-pattern code (e.g. double-indirection `Arc<Vec<T>>`/`Arc<String>`, raw `libc::mmap`/`sandbox-exec` outside `blaze-inproc`/`bstd::procs::hermetic`, hand-rolled workarounds), add a `blaze-lint` rule to flag it — or auto-fix it where safe and deterministic — so the pattern can never recur.
 
 ## Code Review Rules
 

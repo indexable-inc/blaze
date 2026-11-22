@@ -47,7 +47,10 @@ use core::{
     ptr::NonNull,
 };
 
-use crate::{Arc, BTreeMap, BTreeSet, Box, Lists, Paths, Rc, Soa, SortedMap, SortedSet, String, Texts, Vec, VecDeque};
+use crate::{
+    Arc, BTreeMap, BTreeSet, Box, Lists, Paths, Rc, Soa, SortedMap, SortedSet, String, Texts, ThinArc, ThinArcSlice,
+    ThinStr, ThinVec, Vec, VecDeque,
+};
 #[cfg(test)]
 use crate::plant::{self, Plant};
 
@@ -607,3 +610,11 @@ pub type ALists<'a, T> = Lists<T, Alloc<'a>>;
 pub type ATexts<'a> = Texts<Alloc<'a>>;
 /// A [`Paths`] over the handle: directories and files as rows, each name once a directory.
 pub type APaths<'a> = Paths<Alloc<'a>>;
+/// A [`ThinArc`] over the handle (still one pointer, 8 bytes: the handle lives in the heap header).
+pub type AThinArc<'a, H, T> = ThinArc<H, T, Alloc<'a>>;
+/// A [`ThinArcSlice`] over the handle (one pointer, 8 bytes).
+pub type AThinArcSlice<'a, T> = ThinArcSlice<T, Alloc<'a>>;
+/// A [`ThinStr`] over the handle (one pointer, 8 bytes).
+pub type AThinStr<'a> = ThinStr<Alloc<'a>>;
+/// A [`ThinVec`] over the handle.
+pub type AThinVec<'a, T> = ThinVec<T, Alloc<'a>>;

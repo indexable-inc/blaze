@@ -109,10 +109,16 @@ pub(crate) fn run_is_public(crate_public: bool, ran_as: RanAs) -> bool {
     crate_public && ran_as == RanAs::Wasm
 }
 
-/// How the run of build-script unit `script` is placed: D112's one choice point, made before
-/// anything runs; the same function the job asks (`job`), so the key and the run agree.
-pub(crate) fn placement(graph: &UnitGraph<'_>, script: UnitId, alloc: Alloc<'_>) -> RanAs {
-    RanAs::of(&placed(graph, script, MODE, alloc))
+/// How the run of build-script unit `script` is placed: D112 / D175 zero-Wasm choice point,
+/// made before anything runs; the same function the job asks (`job`), so the key and the run agree.
+pub(crate) fn placement(home: Option<&str>, graph: &UnitGraph<'_>, script: UnitId, alloc: Alloc<'_>) -> RanAs {
+    match home {
+        Some(home) => {
+            let store = Path::new(home).join(STORE_UNDER_HOME);
+            RanAs::of(&blaze_proc_macro::native_unit::placed_in_store(&store, graph, script, MODE, crate::graph::TRIPLE, alloc))
+        }
+        None => RanAs::of(&placed(graph, script, MODE, alloc)),
+    }
 }
 
 /// A `Script` record's payload split into how it ran and its outputs record (`bzbsout`, read
@@ -910,9 +916,9 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
         Ok(served) => served,
         Err(ran) => return ran,
     };
-    // The one choice point (D112), before anything runs: a script placed native needs the
-    // command's native setting, or fails naming why it has none.
-    let runner = placed(graph, job.script, MODE, alloc);
+    // The one choice point (D112 / D175 zero-Wasm), before anything runs: a script placed native
+    // needs the command's native setting, or fails naming why it has none.
+    let runner = blaze_proc_macro::native_unit::placed_in_store(&shared.store, graph, job.script, MODE, crate::graph::TRIPLE, alloc);
     let ran_as = RanAs::of(&runner);
     let native = match (runner, &shared.native) {
         // No SDK: a function of the run's key, which holds "no SDK" ([`Shared::no_sdk`]), so
@@ -924,16 +930,15 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
     };
     let setting = Setting {
         store: &shared.store,
-        // Its crates' side's target (ruling D115 (2)); HOST and every other machine fact from
-        // the pinned table, never the machine (rule 25).
-        target: match job.side {
-            Side::Target => crate::graph::TRIPLE,
-            Side::Macro => MACRO_TARGET,
+        // Its crates' side's target (ruling D115 (2)); native zero-Wasm macro scripts run for host.
+        target: match (job.side, ran_as) {
+            (Side::Target, _) | (Side::Macro, RanAs::Native) => crate::graph::TRIPLE,
+            (Side::Macro, RanAs::Wasm) => MACRO_TARGET,
         },
         host: crate::graph::TRIPLE,
-        table: Arc::clone(match job.side {
-            Side::Target => &shared.table,
-            Side::Macro => &shared.macro_table,
+        table: Arc::clone(match (job.side, ran_as) {
+            (Side::Target, _) | (Side::Macro, RanAs::Native) => &shared.table,
+            (Side::Macro, RanAs::Wasm) => &shared.macro_table,
         }),
         // The probe checker (blaze-proc-macro script_probes.rs) is off: the pinned table
         // answers until the engine's checker has answered the real probes' ladder

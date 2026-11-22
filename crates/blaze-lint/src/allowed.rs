@@ -40,8 +40,19 @@ pub const ALLOWED_STATICS: [AllowedStatic; 5] = [
     AllowedStatic { krate: "blaze-trace", name: "PROFILE", why: Allowed::ProfileRing },
 ];
 
-// A file's rows are a bit each in its scope's `u16` mask.
-const _: () = assert!(ALLOWED_STATICS.len() <= 16, "the allowed statics fit Scope::statics");
+// A file's rows are a bit each in the low 15 bits of `Scope::statics` (bit 15 is reserved in
+// `Scope::key` for `in_hermetic`).
+const _: () = assert!(ALLOWED_STATICS.len() <= 15, "the allowed statics fit Scope::statics");
+
+/// Whether `path` (relative to the workspace's root) belongs to `bstd::procs::hermetic`, the one
+/// module allowed to invoke the OS's `sandbox-exec` binary directly (`Rule::RawSandboxExec`).
+pub fn is_hermetic_path(path: &str) -> bool {
+    let rest = path
+        .strip_prefix("crates/blaze-std/src/procs/")
+        .or_else(|| path.strip_prefix("crates/bstd/src/procs/"))
+        .or_else(|| path.strip_prefix("bstd/src/procs/"));
+    matches!(rest, Some("hermetic.rs")) || rest.is_some_and(|r| r.starts_with("hermetic/"))
+}
 
 /// The rows of the crate the file at `path` (relative to the workspace's root,
 /// `crates/<crate>/..`) is in, as [`crate::Scope::statics`]'s mask; none for a file outside

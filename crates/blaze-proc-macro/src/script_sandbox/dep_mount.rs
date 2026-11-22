@@ -54,9 +54,11 @@ pub struct DepProducer {
     /// The files it left in `OUT_DIR`, by path from it, sorted (its outputs record's files).
     pub out: Arc<Vec<(String, Vec<u8>)>>,
     /// The names of the files its outputs record names and does not hold (a native script's,
-    /// in the home's file area), sorted: its `OUT_DIR` is not served while any is
-    /// ([`DepViewError::StoredOut`]); they are never read into `out`.
+    /// in the home's file area), sorted: its `OUT_DIR` is not served to wasm scripts while any is
+    /// ([`DepViewError::StoredOut`]); native scripts materialize them from the file area.
     pub stored: Arc<Vec<String>>,
+    /// The `(name, sha256)` pairs of stored files in the home's file area, sorted by name.
+    pub stored_files: Arc<Vec<(String, [u8; 32])>>,
     /// The scripts upstream of it (its transitive `links_inputs` closure), each with its
     /// `links`, once, sorted by `links` (brief S1b): its metadata may forward their paths
     /// (aws-lc-rs re-emits aws-lc-sys's `include`), which its readers are then served too.
@@ -70,8 +72,18 @@ impl DepProducer {
         let mut out: Vec<(String, Vec<u8>)> = outputs.files.iter().map(|file| (file.name.as_str().to_owned(), file.bytes.to_vec())).collect();
         // `Outputs::add_file` keeps them sorted; sorted here too, so `Tree::Mem`'s search holds.
         out.sort_by(|a, b| a.0.cmp(&b.0));
-        let stored = outputs.stored.iter().map(|file| file.name.as_str().to_owned()).collect();
-        DepProducer { tree, root, out_dir: outputs.out_dir.as_str().to_owned(), out: Arc::new(out), stored: Arc::new(stored), upstream: Arc::new(Vec::new()) }
+        let stored: Vec<String> = outputs.stored.iter().map(|file| file.name.as_str().to_owned()).collect();
+        let mut stored_files: Vec<(String, [u8; 32])> = outputs.stored.iter().map(|file| (file.name.as_str().to_owned(), file.sha256)).collect();
+        stored_files.sort_by(|a, b| a.0.cmp(&b.0));
+        DepProducer {
+            tree,
+            root,
+            out_dir: outputs.out_dir.as_str().to_owned(),
+            out: Arc::new(out),
+            stored: Arc::new(stored),
+            stored_files: Arc::new(stored_files),
+            upstream: Arc::new(Vec::new()),
+        }
     }
 
     /// The producer of a run whose outputs RECORD is `outputs` (read in place: what a reader of
@@ -81,8 +93,18 @@ impl DepProducer {
     pub fn of_record(tree: Tree, root: ScriptRoot, outputs: &blaze_build_script::OutputsRef<'_>) -> DepProducer {
         let mut out: Vec<(String, Vec<u8>)> = outputs.files().map(|(path, bytes)| (path.to_owned(), bytes.to_vec())).collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
-        let stored = outputs.stored().map(|file| file.name.to_owned()).collect();
-        DepProducer { tree, root, out_dir: outputs.out_dir().to_owned(), out: Arc::new(out), stored: Arc::new(stored), upstream: Arc::new(Vec::new()) }
+        let stored: Vec<String> = outputs.stored().map(|file| file.name.to_owned()).collect();
+        let mut stored_files: Vec<(String, [u8; 32])> = outputs.stored().map(|file| (file.name.to_owned(), *file.sha256)).collect();
+        stored_files.sort_by(|a, b| a.0.cmp(&b.0));
+        DepProducer {
+            tree,
+            root,
+            out_dir: outputs.out_dir().to_owned(),
+            out: Arc::new(out),
+            stored: Arc::new(stored),
+            stored_files: Arc::new(stored_files),
+            upstream: Arc::new(Vec::new()),
+        }
     }
 
     /// This producer with `upstream`, its closure ([`DepProducer::closure`] of its inputs).
@@ -112,6 +134,11 @@ impl DepProducer {
 enum Served {
     /// Files whose content is in the reader's key: a producer's `OUT_DIR`, or its fetched tree.
     Keyed(Arc<Vec<(String, Vec<u8>)>>),
+    /// Native producer's `OUT_DIR` with inline files and content-addressed stored files.
+    Stored {
+        inline: Arc<Vec<(String, Vec<u8>)>>,
+        stored: Arc<Vec<(String, [u8; 32])>>,
+    },
     /// The reader's own tree (a member producer of the reader's workspace): reads recorded.
     ReaderTree,
 }
@@ -254,10 +281,20 @@ pub struct Viewed<'a> {
 /// makes the mounts the plan names; `reader` is the tree the reading script is served. The
 /// wasm sight of [`resolve`].
 pub fn view<'a>(reader: &Tree, producers: &[(&str, &DepProducer)], deps: &[DepMetadata<'_>], alloc: Alloc<'a>) -> Result<Viewed<'a>, DepViewError> {
+    view_inner(reader, producers, deps, false, alloc)
+}
+
+/// Like [`view`], but permits native producers whose `OUT_DIR` files are stored in the
+/// home's content-addressed file area (keyed by `(name, sha256)`).
+pub fn view_with_stored<'a>(reader: &Tree, producers: &[(&str, &DepProducer)], deps: &[DepMetadata<'_>], alloc: Alloc<'a>) -> Result<Viewed<'a>, DepViewError> {
+    view_inner(reader, producers, deps, true, alloc)
+}
+
+fn view_inner<'a>(reader: &Tree, producers: &[(&str, &DepProducer)], deps: &[DepMetadata<'_>], allow_stored: bool, alloc: Alloc<'a>) -> Result<Viewed<'a>, DepViewError> {
     let resolved = resolve(Sight::Wasm, producers, deps, alloc)?;
     let mut mounts: Vec<Mounted> = Vec::new();
     for &(mount, producer) in resolved.serve.iter() {
-        mounts.push(mounted(mount, producer, reader)?);
+        mounts.push(mounted(mount, producer, reader, allow_stored)?);
     }
     mounts.sort_by(|a, b| a.parts.cmp(&b.parts));
     // One mount serves every pair under it (two pairs under one `OUT_DIR`, say).
@@ -317,13 +354,17 @@ pub(crate) fn resolve<'p, 'a>(sight: Sight<'_>, producers: &[(&'p str, &'p DepPr
 }
 
 /// The mount `mount` of a plan made against `producer`, as `reader`'s sandbox serves it.
-fn mounted(mount: DepMount<'_>, producer: &DepProducer, reader: &Tree) -> Result<Mounted, DepViewError> {
+fn mounted(mount: DepMount<'_>, producer: &DepProducer, reader: &Tree, allow_stored: bool) -> Result<Mounted, DepViewError> {
     let (links, at, served) = match mount {
         DepMount::Out { links, at } => {
             if let Some(file) = producer.stored.first() {
-                return Err(DepViewError::StoredOut { links: links.to_owned(), file: file.clone() });
+                if !allow_stored {
+                    return Err(DepViewError::StoredOut { links: links.to_owned(), file: file.clone() });
+                }
+                (links, at.to_owned(), Served::Stored { inline: Arc::clone(&producer.out), stored: Arc::clone(&producer.stored_files) })
+            } else {
+                (links, at.to_owned(), Served::Keyed(Arc::clone(&producer.out)))
             }
-            (links, at.to_owned(), Served::Keyed(Arc::clone(&producer.out)))
         }
         DepMount::Tree { links } => {
             let served = match (&producer.tree, reader) {
@@ -359,6 +400,16 @@ fn content_id(mounts: &[Mounted]) -> ContentId {
                     hasher.part(path.as_bytes()).part(bytes);
                 }
             }
+            Served::Stored { inline, stored } => {
+                hasher.update(&[3]).update(&(inline.len() as u64).to_le_bytes());
+                for (path, bytes) in inline.iter() {
+                    hasher.part(path.as_bytes()).part(bytes);
+                }
+                hasher.update(&(stored.len() as u64).to_le_bytes());
+                for (path, digest) in stored.iter() {
+                    hasher.part(path.as_bytes()).update(digest);
+                }
+            }
             // The reader's own tree: its reads are in the reader's read list.
             Served::ReaderTree => {
                 hasher.update(&[2]);
@@ -391,7 +442,7 @@ impl ScriptSandbox {
     fn dep_node(&mut self, mount: usize, rel: String, op: super::NodeRead) -> Result<Option<Node<'static>>, Stop> {
         let script = Arc::clone(&self.script);
         match &script.deps.mounts[mount].served {
-            Served::Keyed(files) => {
+            Served::Keyed(files) | Served::Stored { inline: files, .. } => {
                 let tree = Tree::Mem { files: Arc::clone(files), git: None };
                 match tree.node(&rel) {
                     Ok(found) => Ok(found.map(owned)),
@@ -477,6 +528,7 @@ mod tests {
             out_dir: SYS_OUT.to_owned(),
             out: files(&[("include/a.h", header)]),
             stored: Arc::new(Vec::new()),
+            stored_files: Arc::new(Vec::new()),
             upstream: Arc::new(Vec::new()),
         }
     }
@@ -674,10 +726,11 @@ mod tests {
             out_dir: A_OUT.to_owned(),
             out: files(&[("include/x.h", header)]),
             stored: Arc::new(Vec::new()),
+            stored_files: Arc::new(Vec::new()),
             upstream: Arc::new(Vec::new()),
         };
         let b_over = |a: &DepProducer| {
-            DepProducer { tree: Tree::Mem { files: files(&[]), git: None }, root: ScriptRoot::package(), out_dir: B_OUT.to_owned(), out: files(&[]), stored: Arc::new(Vec::new()), upstream: Arc::new(Vec::new()) }
+            DepProducer { tree: Tree::Mem { files: files(&[]), git: None }, root: ScriptRoot::package(), out_dir: B_OUT.to_owned(), out: files(&[]), stored: Arc::new(Vec::new()), stored_files: Arc::new(Vec::new()), upstream: Arc::new(Vec::new()) }
                 .with_upstream(DepProducer::closure(&[("a", a)]))
         };
         let a_made = a(b"#define X 1\n");

@@ -188,6 +188,7 @@ pub const fn is_perf_rule(rule: Rule) -> bool {
             | Rule::SeqCstUnexplained
             | Rule::RawSync
             | Rule::BlockingOnPool
+            | Rule::DoubleIndirectionArc
     )
 }
 

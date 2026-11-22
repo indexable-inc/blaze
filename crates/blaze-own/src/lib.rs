@@ -135,6 +135,8 @@ pub mod spec;
 pub mod testing;
 pub mod text;
 pub mod texts;
+pub mod thin_arc;
+pub mod thin_vec;
 pub mod vec;
 
 // A test-only switch that plants a known bug, for the oracles' controls (rule 53).
@@ -142,8 +144,8 @@ pub mod vec;
 mod plant;
 
 pub use alloc_ref::{
-    AArc, ABTreeMap, ABTreeSet, ABox, ADeque, ALists, APaths, ARc, ASoa, ASortedMap, ASortedSet, AString, ATexts, AVec,
-    Alloc, Erased, Headed, Header, SharedAlloc,
+    AArc, ABTreeMap, ABTreeSet, ABox, ADeque, ALists, APaths, ARc, ASoa, ASortedMap, ASortedSet, AString, ATexts,
+    AThinArc, AThinArcSlice, AThinStr, AThinVec, AVec, Alloc, Erased, Headed, Header, SharedAlloc,
 };
 #[cfg(any(test, feature = "std"))]
 pub use alloc_ref::Heap;
@@ -166,6 +168,8 @@ pub use rc::Rc;
 pub use soa::Soa;
 pub use sorted::{SortedMap, SortedSet};
 pub use text::{FromUtf8Error, String};
+pub use thin_arc::{ThinArc, ThinArcSlice, ThinStr};
+pub use thin_vec::ThinVec;
 pub use vec::{CollectIn, Refused, Vec};
 
 #[cfg(test)]

@@ -284,6 +284,9 @@ pub struct ModuleRecord {
     /// the module's machine code, keyed by what it is made from (host.rs `Runtime::code_key`),
     /// not by this record's key.
     pub compiled: PathBuf,
+    /// When `Some`, this proc-macro module is a native host `.dylib`/`.so` executed directly
+    /// through `NativeServerPool` (zero Wasmtime, zero `-Zbuild-std`, D175 fast path).
+    pub native_dylib: Option<PathBuf>,
 }
 
 /// A store's folder of compiled module code, under the store (host.rs, "Compiled records").
@@ -339,12 +342,28 @@ impl std::fmt::Display for ModuleError {
 
 impl std::error::Error for ModuleError {}
 
-/// Whether `store` holds `id`'s module, by its key: the wasm's digest as the record states it,
-/// the module's bytes not read. What a command that expands nothing asks; a compile checks
-/// the bytes when it reads them ([`ModuleRecord::wasm`]).
+fn native_dylib_filename() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "native.dylib"
+    } else if cfg!(target_os = "windows") {
+        "native.dll"
+    } else {
+        "native.so"
+    }
+}
+
+/// Whether `store` holds `id`'s module, by its key: the native `.dylib`'s digest (zero Wasm!)
+/// when present, else the wasm's digest as the record states it.
 pub fn find_module(store: &Path, id: &CrateId<'_>) -> Result<(String, String), ModuleError> {
     let key = module_key(id);
-    let path = store.join("proc-macro/modules").join(&key).join("wasm-sha256");
+    let dir = store.join("proc-macro/modules").join(&key);
+    let dylib_digest = dir.join("dylib-sha256");
+    if let Ok(held) = std::fs::read(&dylib_digest) {
+        if dir.join(native_dylib_filename()).is_file() {
+            return Ok((key, String::from_utf8_lossy(&held).trim().to_owned()));
+        }
+    }
+    let path = dir.join("wasm-sha256");
     match std::fs::read(&path) {
         Ok(held) => Ok((key, String::from_utf8_lossy(&held).trim().to_owned())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(ModuleError::Missing { name: id.name.to_owned(), version: id.version.to_owned(), key }),
@@ -352,11 +371,13 @@ pub fn find_module(store: &Path, id: &CrateId<'_>) -> Result<(String, String), M
     }
 }
 
-/// The record of `id` in `store`.
+/// The record of `id` in `store` (prefers native `.dylib`/`.so` over `module.wasm` when present).
 pub fn read_module(store: &Path, id: &CrateId<'_>) -> Result<ModuleRecord, ModuleError> {
     let key = module_key(id);
     let dir = store.join("proc-macro/modules").join(&key);
-    if !dir.join("wasm-sha256").exists() {
+    let native_path = dir.join(native_dylib_filename());
+    let is_native = dir.join("dylib-sha256").is_file() && native_path.is_file();
+    if !is_native && !dir.join("wasm-sha256").exists() {
         return Err(ModuleError::Missing { name: id.name.to_owned(), version: id.version.to_owned(), key });
     }
     let read = |file: &str| -> Result<Vec<u8>, ModuleError> {
@@ -364,8 +385,7 @@ pub fn read_module(store: &Path, id: &CrateId<'_>) -> Result<ModuleRecord, Modul
         std::fs::read(&path).map_err(|error| ModuleError::Io { path, error })
     };
     let text = |file: &str| -> Result<String, ModuleError> { Ok(String::from_utf8_lossy(&read(file)?).into_owned()) };
-    // The wasm is not read here: a compile reads and checks it ([`ModuleRecord::wasm`]).
-    let held = text("wasm-sha256")?.trim().to_owned();
+    let held = text(if is_native { "dylib-sha256" } else { "wasm-sha256" })?.trim().to_owned();
     let mut macros = Vec::new();
     for line in text("macros")?.lines() {
         let bad = || ModuleError::Macros { key: key.clone(), line: line.to_owned() };
@@ -381,8 +401,28 @@ pub fn read_module(store: &Path, id: &CrateId<'_>) -> Result<ModuleRecord, Modul
         let helpers = parts.next().unwrap_or("").split(',').filter(|it| !it.is_empty()).map(str::to_owned).collect();
         macros.push(Exported { index, kind, name, helpers });
     }
-    let decls = text("decls")?.trim().to_owned();
-    Ok(ModuleRecord { key, name: id.name.to_owned(), version: id.version.to_owned(), wasm_sha256: held, macros, decls, dir, compiled: store.join(COMPILED_DIR) })
+    let decls = if is_native {
+        dir.join("decls")
+            .is_file()
+            .then(|| text("decls").ok())
+            .flatten()
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    } else {
+        text("decls")?.trim().to_owned()
+    };
+    Ok(ModuleRecord {
+        key,
+        name: id.name.to_owned(),
+        version: id.version.to_owned(),
+        wasm_sha256: held,
+        macros,
+        decls,
+        dir,
+        compiled: store.join(COMPILED_DIR),
+        native_dylib: is_native.then_some(native_path),
+    })
 }
 
 #[cfg(test)]

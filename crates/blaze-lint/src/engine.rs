@@ -13,11 +13,11 @@ use blaze_own::{AVec, Alloc};
 use crate::matcher::{DEAD, Live, NO_SEQ};
 use crate::sequences::{
     ArgOf, BANG, BAR, BRACE, CLOSE, Cut, DOT, DOTDOT, Guard, LT, MAX_WORD_LEN, MIN_WORD_LEN, NE, NO_WORD, OPEN, OTHER,
-    SEP, SEQS, TRIE, W_ALLOC, W_AS, W_BLOCK_ON, W_CLONE, W_EXPECT, W_EXTERN, W_FILE, W_FN, W_FOR, W_GLOBAL, W_IMPL,
-    W_INSTANT, W_JOIN, W_LIBC, W_LOCK, W_MOD, W_ORDERING, W_RECV, W_RUSTIX, W_SELF, W_SEQCST, W_STD, W_STRING,
-    W_SYSTEM_TIME, W_THREAD_LOCAL, W_TRAIT, W_TYPE, W_UNSAFE, W_UNWRAP, W_USE, W_WAIT, WC_COLLECTION, WC_DEFINING,
-    WC_DISPATCHED, WC_IO_MODULE, WC_IO_TYPE, WC_LOCK_TYPE, WC_PRINT_MACRO, WC_RENAME, WC_SANS_IO, WC_STATIC, WORD,
-    WORD_CLASS, WORD_FIRST_BY_LEN,
+    SEP, SEQS, TRIE, W_ALLOC, W_ARC, W_AS, W_BLOCK_ON, W_CLONE, W_EXPECT, W_EXTERN, W_FILE, W_FN, W_FOR, W_GLOBAL,
+    W_IMPL, W_INSTANT, W_JOIN, W_LIBC, W_LOCK, W_MOD, W_ORDERING, W_RECV, W_RUSTIX, W_SELF, W_SEQCST, W_STD, W_STRING,
+    W_SYSTEM_TIME, W_THREAD_LOCAL, W_TRAIT, W_TYPE, W_UNSAFE, W_UNWRAP, W_USE, W_VEC, W_WAIT, WC_COLLECTION,
+    WC_DEFINING, WC_DISPATCHED, WC_IO_MODULE, WC_IO_TYPE, WC_LOCK_TYPE, WC_PRINT_MACRO, WC_RENAME, WC_SANS_IO,
+    WC_STATIC, WORD, WORD_CLASS, WORD_FIRST_BY_LEN,
 };
 use crate::{
     Arg, Block, Cost, Finding, Findings, Fix, LintError, Mark, ONLY_OWN, Owner, Rule, RuleSet, Run, Scope, Span,
@@ -728,6 +728,12 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                 K::P(b'#') => self.attribute(i, t),
                 K::Ident => self.on_word(i, t),
                 K::Raw => self.defining = false,
+                K::Lit => {
+                    if !self.scope.in_hermetic && self.rules.runs(Rule::RawSandboxExec) {
+                        self.cost.add(Rule::RawSandboxExec);
+                        self.raw_sandbox_exec(t);
+                    }
+                }
                 _ => {}
             }
             i += 1;
@@ -784,6 +790,7 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
             statics: self.scope.statics,
             lock_reason: self.scope.lock_reason || self.reasoned(t.start),
             trust_unsafe: self.scope.trust_unsafe,
+            in_hermetic: self.scope.in_hermetic,
             context,
         };
         self.children.push(scope);
@@ -892,9 +899,15 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
         }
         const EXTRA: u16 = WC_COLLECTION | WC_RENAME | WC_STATIC | WC_SANS_IO | WC_LOCK_TYPE;
         if class & EXTRA != 0 {
-            if class & WC_COLLECTION != 0 && rules.runs(Rule::Ambient) && !self.in_use && !was_defining {
-                self.cost.add(Rule::Ambient);
-                self.collection(i, t, word_id);
+            if class & WC_COLLECTION != 0 && !self.in_use && !was_defining {
+                if rules.runs(Rule::Ambient) {
+                    self.cost.add(Rule::Ambient);
+                    self.collection(i, t, word_id);
+                }
+                if word_id == W_ARC && rules.runs(Rule::DoubleIndirectionArc) {
+                    self.cost.add(Rule::DoubleIndirectionArc);
+                    self.double_indirection_arc(i, t);
+                }
             }
             if class & WC_RENAME != 0 && rules.runs(Rule::Renamed) {
                 self.cost.add(Rule::Renamed);
@@ -1662,6 +1675,94 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                 match_tok.end,
                 Some(Arg::Int(int_arms)),
             );
+        }
+    }
+
+    /// Flags `Arc<Vec<...>>` and `Arc<String>` (including path-qualified forms and optional
+    /// allocator parameters) in type syntax, advising `blaze_own::ThinArc` / `blaze_own::ThinStr`.
+    fn double_indirection_arc(&mut self, i: usize, arc_tok: Tok) {
+        if self.method(i) || !matches!(self.tok(i + 1), Some(t) if t.k == K::P(b'<')) {
+            return;
+        }
+        let mut k = i + 2;
+        if self.colons_at(k) {
+            k += 2;
+        }
+        let Some(last) = self.path_end(k) else { return };
+        let inner_tok = self.toks[last];
+        let limit = (i + 128).min(self.toks.len());
+        let after_inner = match inner_tok.word {
+            W_VEC => {
+                if !matches!(self.tok(last + 1), Some(t) if t.k == K::P(b'<')) {
+                    return;
+                }
+                let Some(vec_close) = self.closing_angle_from(last + 1, 0, limit) else { return };
+                vec_close + 1
+            }
+            W_STRING => match self.tok(last + 1).map(|t| t.k) {
+                Some(K::P(b'>' | b',')) => last + 1,
+                Some(K::P(b'<')) => {
+                    let Some(str_close) = self.closing_angle_from(last + 1, 0, limit) else { return };
+                    str_close + 1
+                }
+                _ => return,
+            },
+            _ => return,
+        };
+        let arc_close = match self.tok(after_inner).map(|t| t.k) {
+            Some(K::P(b'>')) => after_inner,
+            Some(K::P(b',')) => {
+                let Some(close) = self.closing_angle_from(after_inner + 1, 1, limit) else { return };
+                close
+            }
+            _ => return,
+        };
+        let end = self.toks[arc_close].end;
+        self.push(
+            Template::DoubleIndirectionArc,
+            arc_tok.start,
+            end,
+            Some(Arg::Span(Span::new(inner_tok.start, inner_tok.end))),
+        );
+    }
+
+    /// Finds the closing `>` that brings angle depth from `initial_depth` to 0, starting at token
+    /// `start` up to `limit`, bailing on a hole or an unmatched `;`/`{`/`}`.
+    fn closing_angle_from(&self, start: usize, initial_depth: usize, limit: usize) -> Option<usize> {
+        let mut angle_depth = initial_depth;
+        let mut group_depth = 0usize;
+        let mut j = start;
+        // Bounded: one turn per token up to `limit`.
+        while j < limit {
+            let t = self.tok(j)?;
+            match t.k {
+                K::Hole => return None,
+                K::P(b';' | b'{' | b'}') if group_depth == 0 => return None,
+                K::P(b'(' | b'[') => group_depth += 1,
+                K::P(b')' | b']') => group_depth = group_depth.checked_sub(1)?,
+                K::P(b'<') if group_depth == 0 => angle_depth += 1,
+                K::P(b'>') if group_depth == 0 && !self.arrow(j) => {
+                    angle_depth = angle_depth.checked_sub(1)?;
+                    if angle_depth == 0 {
+                        return Some(j);
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        None
+    }
+
+    /// Flags literal `"sandbox-exec"` or `"/usr/bin/sandbox-exec"` outside `bstd::procs::hermetic`.
+    fn raw_sandbox_exec(&mut self, t: Tok) {
+        // Minimum length is `"sandbox-exec"` (14 bytes including quotes).
+        if t.end - t.start < 14 {
+            return;
+        }
+        let Some(inner) = unquote_string_literal(self.str_of(t)) else { return };
+        if is_sandbox_exec_program(inner) {
+            self.push(Template::RawSandboxExec, t.start, t.end, None);
         }
     }
 
@@ -3215,4 +3316,26 @@ fn carries_primitive_meaning(name: &str) -> bool {
         idx += 1;
     }
     false
+}
+
+/// Strips optional `b`/`c`/`r` prefix, raw `#` delimiters, and outer `"` quotes from a
+/// string-like literal token, returning its inner text (or `None` for char literals, etc.).
+#[inline]
+fn unquote_string_literal(lit: &str) -> Option<&str> {
+    let rest = lit
+        .strip_prefix("br")
+        .or_else(|| lit.strip_prefix("cr"))
+        .or_else(|| lit.strip_prefix('r'))
+        .map(|raw| raw.trim_matches('#'))
+        .or_else(|| lit.strip_prefix('b'))
+        .or_else(|| lit.strip_prefix('c'))
+        .unwrap_or(lit);
+    rest.strip_prefix('"')?.strip_suffix('"')
+}
+
+/// True when `inner` names the macOS `sandbox-exec` binary directly (bare or `/usr/bin/`).
+#[inline]
+fn is_sandbox_exec_program(inner: &str) -> bool {
+    let base = inner.strip_prefix("/usr/bin/").unwrap_or(inner);
+    base.len() == 12 && base.starts_with("sandbox-") && base.ends_with("exec")
 }

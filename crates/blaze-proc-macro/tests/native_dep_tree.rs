@@ -87,6 +87,7 @@ fn producer() -> DepProducer {
         out_dir: LZ4_OUT.to_owned(),
         out: Arc::new(vec![("include/lz4.h".to_owned(), HEADER.to_vec())]),
         stored: Arc::new(std::vec::Vec::new()),
+        stored_files: Arc::new(std::vec::Vec::new()),
         upstream: Arc::new(std::vec::Vec::new()),
     }
 }

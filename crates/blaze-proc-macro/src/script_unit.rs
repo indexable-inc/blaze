@@ -385,7 +385,7 @@ pub fn outputs<'a>(
     if unit.kind != UnitKind::BuildScript {
         return Err(UnitScriptError::NotAScript { unit: script });
     }
-    match placed(graph, script, setting.mode, alloc) {
+    match crate::native_unit::placed_in_store(setting.store, graph, script, setting.mode, setting.host, alloc) {
         Runner::Wasm => {
             let prepared = prepare(runtime, setting, graph, script, tree, root, deps, alloc)?;
             runtime.run(&prepared.loaded, prepared.script, &prepared.env, alloc).map_err(UnitScriptError::Script)
@@ -438,7 +438,7 @@ pub fn outputs_viewing_on<'a>(
     if unit.kind != UnitKind::BuildScript {
         return Err(UnitScriptError::NotAScript { unit: script });
     }
-    match placed(graph, script, setting.mode, alloc) {
+    match crate::native_unit::placed_in_store(setting.store, graph, script, setting.mode, setting.host, alloc) {
         Runner::Wasm => {
             let viewed = dep_mount::view(&tree, producers, deps, alloc).map_err(|why| UnitScriptError::DepView { package: package(unit), why })?;
             let seen: Vec<DepMetadata<'_>> =
@@ -446,7 +446,9 @@ pub fn outputs_viewing_on<'a>(
             let prepared = prepare_viewing_on(runtime, setting, graph, script, side_cfg, tree, root, &seen, viewed.views, alloc)?;
             runtime.run(&prepared.loaded, prepared.script, &prepared.env, alloc).map_err(UnitScriptError::Script)
         }
-        Runner::Native { .. } if side_cfg.is_some() => Err(UnitScriptError::NativeOnSide { package: package(unit), target: setting.target.to_owned() }),
+        Runner::Native { .. } if side_cfg.is_some() && setting.target != setting.host => {
+            Err(UnitScriptError::NativeOnSide { package: package(unit), target: setting.target.to_owned() })
+        }
         Runner::Native { because } => {
             let serves = served(graph, script).ok_or_else(|| UnitScriptError::ServesNothing { package: package(unit) })?;
             native_outputs(setting, graph, script, serves, because, tree, root, deps, producers, alloc).map_err(UnitScriptError::Native)

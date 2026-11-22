@@ -1384,7 +1384,7 @@ fn make_world<'f>(
     for (at, script) in script_units(world.crates.iter().map(|krate| krate.origin), |unit| graph.units[unit.index()].build_script) {
         // The module is looked up for the run's placement (D112): a native run's record is a
         // host binary, a wasm run's a module.
-        let ran_as = crate::scripts::placement(graph, script, heap);
+        let ran_as = crate::scripts::placement(Some(home), graph, script, heap);
         placements.push((at, ran_as));
         let script = &graph.units[script.index()];
         script_roots.push((at, script.root.as_str()));

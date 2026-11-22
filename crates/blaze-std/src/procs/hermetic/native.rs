@@ -114,6 +114,9 @@ impl<'s, 'a, C: Confiner> NativePort<'s, 'a, C> {
         let killed = blaze_sys::linux::kill_group(group, SIGKILL as u32);
         match killed {
             Ok(()) | Err(blaze_sys::Errno::Srch) => Ok(()),
+            // On macOS, `killpg` returns `EPERM` when the child group has already exited/reaped.
+            #[cfg(target_os = "macos")]
+            Err(blaze_sys::Errno::Perm) => Ok(()),
             Err(errno) => Err(Fault::Host { call: "killpg (the child's group)", code: errno.raw() }),
         }
     }

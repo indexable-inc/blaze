@@ -22,7 +22,7 @@ mod regalloc;
 #[cfg(test)]
 mod tests;
 
-use blaze_code::record::{CodeRecord, Site, SiteKind, TrapSource};
+use blaze_code::record::{CodeRecord, NO_TARGET, OWN_RELRO, Site, SiteKind, TrapSource};
 use blaze_lir::{
     Op, Verified,
     egraph::{RegBudget, sota_optimize_fixpoint},
@@ -109,14 +109,23 @@ impl<F: Tier> Tier for Sota<F> {
     }
 }
 
-/// Converts a `Sota`-emitted AArch64 [`Emitted`] record into `blaze-code`'s [`CodeRecord`] (`bzcode01`)
+/// Converts a `Sota`-emitted AArch64 [`Emitted`] record into `blaze-code`'s [`CodeRecord`] (`bzcode07`)
 /// for direct use by `blaze-ladder` (`blaze run` / `blaze test`) on AArch64.
+///
+/// Only accepts relocation & metadata patterns `CodeRecord` can encode cleanly; returns `None`
+/// otherwise so `emit_sota_record_measured` falls back to `emit_record_sourced`.
 fn emitted_to_code_record<'a>(emitted: Emitted<'a>, alloc: Alloc<'a>) -> Option<(CodeRecord<'a>, u32)> {
+    if !emitted.words.is_empty() || !emitted.traps.is_empty() || !emitted.position_slots.is_empty() {
+        return None;
+    }
+    blaze_code::unwind::Frame::of_word(emitted.frame).ok()?;
+
     let mut rec = CodeRecord::new_in(alloc);
     let insts = u32::try_from(emitted.code.len()).ok()?;
     rec.code = emitted.code;
     rec.relro = emitted.relro;
     rec.frame = emitted.frame;
+    rec.pads = emitted.pads;
     rec.code_align = emitted.code_align;
     rec.relro_align = emitted.relro_align;
 
@@ -134,17 +143,49 @@ fn emitted_to_code_record<'a>(emitted: Emitted<'a>, alloc: Alloc<'a>) -> Option<
         }
     }
 
-    // Pair `GotPage21` + `GotPageOff12` relocations into `CodeRecord`'s `SiteKind::Call`.
+    // Pair `GotPage21` + `GotPageOff12` into `SiteKind::Call` / `SiteKind::Load`, and
+    // `Page21` + `PageOff12 { scale: 0 }` (targeting `OWN_RELRO`) into `SiteKind::Relro`.
     let mut i = 0;
     while i < emitted.relocs.len() {
         let r = emitted.relocs[i];
-        if r.kind == RelocKind::GotPage21
+        if !r.in_relro
+            && r.kind == RelocKind::GotPage21
+            && r.addend == 0
             && i + 1 < emitted.relocs.len()
+            && !emitted.relocs[i + 1].in_relro
             && emitted.relocs[i + 1].kind == RelocKind::GotPageOff12
             && emitted.relocs[i + 1].at == r.at + 4
+            && emitted.relocs[i + 1].target == r.target
+            && emitted.relocs[i + 1].addend == 0
+            && (r.at as usize) + 8 <= rec.code.len()
         {
             let target = *target_remap.get(r.target as usize)?;
-            rec.sites.push(Site { at: r.at, kind: SiteKind::Call, target, addend: 0 });
+            let ldr_at = r.at as usize + 4;
+            let ldr_word = u32::from_le_bytes([
+                rec.code[ldr_at],
+                rec.code[ldr_at + 1],
+                rec.code[ldr_at + 2],
+                rec.code[ldr_at + 3],
+            ]);
+            let ldr_rt = ldr_word & 0x1f;
+            let is_call = ldr_rt == 16 && blaze_tier::record::calls(&rec.code, r.at + 4);
+            let kind = if is_call { SiteKind::Call } else { SiteKind::Load };
+            rec.sites.push(Site { at: r.at, kind, target, addend: 0 });
+            i += 2;
+        } else if !r.in_relro
+            && r.kind == RelocKind::Page21
+            && r.target == OWN_RELRO
+            && r.addend >= 0
+            && i + 1 < emitted.relocs.len()
+            && !emitted.relocs[i + 1].in_relro
+            && emitted.relocs[i + 1].kind == (RelocKind::PageOff12 { scale: 0 })
+            && emitted.relocs[i + 1].at == r.at + 4
+            && emitted.relocs[i + 1].target == OWN_RELRO
+            && emitted.relocs[i + 1].addend == r.addend
+            && (r.at as usize) + 8 <= rec.code.len()
+            && (r.addend as u64) < (rec.relro.len() as u64)
+        {
+            rec.sites.push(Site { at: r.at, kind: SiteKind::Relro, target: NO_TARGET, addend: r.addend as u32 });
             i += 2;
         } else {
             return None;

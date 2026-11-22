@@ -17,7 +17,7 @@ use crate::matcher::{LIVE, Live, NO_SEQ, Pattern, Trie, nodes_for};
 use crate::sequences::{OTHER, PATTERNS, TRIE};
 use crate::{
     ALLOWED_STATICS, FixError, Findings, Level, OwnHeads, RootMarks, Rule, RuleSet, Scope, Span, Step, Template, TestBits, Unit, Units, Variants, apply,
-    apply_all, lint, lint_in, show_message, statics_of_path,
+    apply_all, is_hermetic_path, lint, lint_in, show_message, statics_of_path,
 };
 
 const FILE: Scope = Scope::file(TestBits::NONE, false, false);
@@ -644,6 +644,8 @@ fn new_rules_are_off_until_named() {
         Rule::ProcessStatic,
         Rule::SansIoCore,
         Rule::LockWithoutReason,
+        Rule::DoubleIndirectionArc,
+        Rule::RawSandboxExec,
     ] {
         assert!(!Step::Strict.rules().runs(rule), "{} runs in strict", rule.name());
         assert!(Step::Strict.rules().with(rule).runs(rule));
@@ -1908,4 +1910,177 @@ fn dup_and_health_scanner() {
         kinds(Rule::ProcMacroDef, "#[proc_macro_derive(Foo)] pub fn foo(ts: TokenStream) -> TokenStream { ts }"),
         vec!["proc-macro-def"]
     );
+}
+
+#[test]
+fn double_indirection_arc() {
+    let rule = Rule::DoubleIndirectionArc;
+    let only = RuleSet::only(&[rule]);
+
+    assert_eq!(rule.name(), "double-indirection-arc");
+    assert_eq!(Rule::from_name("double-indirection-arc"), Some(rule));
+    assert_eq!(rule.lint(), Some("double_indirection_arc"));
+    assert_eq!(Rule::from_lint("double_indirection_arc"), Some(rule));
+    assert_eq!(Template::DoubleIndirectionArc.rule(), rule);
+    assert!(crate::pgo::is_perf_rule(rule));
+
+    let marks = RootMarks::read("#![deny(blaze::double_indirection_arc)]\n");
+    assert!(marks.denies(rule));
+    assert!(marks.rules(Step::Rust.rules()).runs(rule));
+    assert_ne!(marks.key(), RootMarks::read("#![blaze::driver]\n").key());
+
+    // Positive detections: bare, path-qualified, allocator-parameterized, nested types.
+    assert_eq!(
+        found(&only, "struct S { data: Arc<Vec<u8>> }", FILE),
+        [("double-indirection-arc", "Arc<Vec<u8>>")]
+    );
+    assert_eq!(
+        found(&only, "struct S { name: Arc<String> }", FILE),
+        [("double-indirection-arc", "Arc<String>")]
+    );
+    assert_eq!(
+        found(&only, "type T = Arc<Vec<Held>, Global>;", FILE),
+        [("double-indirection-arc", "Arc<Vec<Held>, Global>")]
+    );
+    assert_eq!(
+        found(&only, "type T = Arc<Vec<(String, Vec<u8>), Global>, Global>;", FILE),
+        [("double-indirection-arc", "Arc<Vec<(String, Vec<u8>), Global>, Global>")]
+    );
+    assert_eq!(
+        found(&only, "fn f(x: &std::sync::Arc<std::vec::Vec<u32>>) -> alloc::sync::Arc<alloc::string::String> { todo!() }", FILE),
+        [
+            ("double-indirection-arc", "Arc<std::vec::Vec<u32>>"),
+            ("double-indirection-arc", "Arc<alloc::string::String>"),
+        ]
+    );
+    assert_eq!(
+        found(&only, "fn f() -> Option<Arc<String, A>> { None }", FILE),
+        [("double-indirection-arc", "Arc<String, A>")]
+    );
+    assert_eq!(
+        found(&only, "fn f(v: Arc<blaze_own::String<A>, A>) {}", FILE),
+        [("double-indirection-arc", "Arc<blaze_own::String<A>, A>")]
+    );
+    assert_eq!(
+        found(&only, "fn f(v: Arc<Vec<fn() -> u8>>) {}", FILE),
+        [("double-indirection-arc", "Arc<Vec<fn() -> u8>>")]
+    );
+    assert_eq!(
+        found(&only, "fn f(v: Arc<Vec<[u8; 4]>>) {}", FILE),
+        [("double-indirection-arc", "Arc<Vec<[u8; 4]>>")]
+    );
+
+    // Messages advise ThinArc for Arc<Vec<...>> and ThinStr for Arc<String>.
+    let alloc = blaze_own::testing::heap().alloc();
+    let msg_src = "struct S { a: Arc<Vec<u8>>, b: Arc<String> }";
+    let mut out = Findings::new_in(alloc);
+    assert!(lint(&only, &Unit { text: msg_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    let mut said = StdVec::new();
+    for f in out.list.iter() {
+        let mut line = OwnString::new_in(alloc);
+        show_message(&only, msg_src, &out, f, &mut line);
+        said.push(line.as_str().to_string());
+    }
+    assert_eq!(said.len(), 2);
+    assert!(said[0].contains("blaze_own::ThinArc") && said[0].contains("thin pointer"), "{said:?}");
+    assert!(said[1].contains("blaze_own::ThinStr") && said[1].contains("thin pointer"), "{said:?}");
+
+    // Negative clean controls.
+    none(rule, &[
+        "struct S { data: Arc<[u8]>, name: Arc<str> }",
+        "struct S { data: blaze_own::ThinArc<u8>, name: blaze_own::ThinStr }",
+        "struct S { inner: Arc<Mutex<Vec<u8>>>, lock: Arc<RwLock<String>> }",
+        "struct S { item: Arc<MyStruct>, list: Arc<MyVec<u8>> }",
+        "struct Arc<T>(T);",
+        "use std::sync::Arc;",
+        "fn f() { let a = Arc::new(vec![1]); let b = Arc::new(String::new()); }",
+        "fn f(it: Arc<String::IntoIter>) {}",
+        "fn f() { let s = \"Arc<Vec<u8>> Arc<String>\"; }",
+        "fn f() {\n    // Arc<Vec<u8>> Arc<String>\n}",
+        "#[test]\nfn t() { let x: Arc<Vec<u8>> = g(); }",
+        "#[cfg(test)]\nmod t {\n    type X = Arc<String>;\n}",
+    ]);
+}
+
+#[test]
+fn raw_sandbox_exec() {
+    let rule = Rule::RawSandboxExec;
+    let only = RuleSet::only(&[rule]);
+
+    assert_eq!(rule.name(), "raw-sandbox-exec");
+    assert_eq!(Rule::from_name("raw-sandbox-exec"), Some(rule));
+    assert_eq!(rule.lint(), Some("raw_sandbox_exec"));
+    assert_eq!(Rule::from_lint("raw_sandbox_exec"), Some(rule));
+    assert_eq!(Template::RawSandboxExec.rule(), rule);
+    assert!(!crate::pgo::is_perf_rule(rule));
+
+    let marks = RootMarks::read("#![deny(blaze::raw_sandbox_exec)]\n");
+    assert!(marks.denies(rule));
+    assert!(marks.rules(Step::Rust.rules()).runs(rule));
+    assert_ne!(marks.key(), RootMarks::read("#![blaze::trust(unsafe, reason = \"x\")]\n").key());
+
+    // Positive detections outside bstd::procs::hermetic.
+    assert_eq!(
+        found(&only, "fn f() { Command::new(\"sandbox-exec\"); }", FILE),
+        [("raw-sandbox-exec", "\"sandbox-exec\"")]
+    );
+    assert_eq!(
+        found(&only, "fn f() { Command::new(\"/usr/bin/sandbox-exec\"); }", FILE),
+        [("raw-sandbox-exec", "\"/usr/bin/sandbox-exec\"")]
+    );
+    assert_eq!(
+        found(&only, "const SANDBOX_EXEC: &str = \"/usr/bin/sandbox-exec\";", FILE),
+        [("raw-sandbox-exec", "\"/usr/bin/sandbox-exec\"")]
+    );
+    assert_eq!(
+        kinds(rule, "fn f() { let _ = r#\"/usr/bin/sandbox-exec\"#; let _ = b\"sandbox-exec\"; let _ = c\"/usr/bin/sandbox-exec\"; }"),
+        ["raw-sandbox-exec", "raw-sandbox-exec", "raw-sandbox-exec"]
+    );
+
+    // Message advises bstd::procs::hermetic::Hermetic and Plan.
+    let alloc = blaze_own::testing::heap().alloc();
+    let msg_src = "fn f() { Command::new(\"/usr/bin/sandbox-exec\"); }";
+    let mut out = Findings::new_in(alloc);
+    assert!(lint(&only, &Unit { text: msg_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 1);
+    let mut line = OwnString::new_in(alloc);
+    show_message(&only, msg_src, &out, &out.list[0], &mut line);
+    assert!(
+        line.as_str().contains("bstd::procs::hermetic::Hermetic") && line.as_str().contains("Plan"),
+        "{}",
+        line.as_str()
+    );
+
+    // Inside bstd::procs::hermetic: allowed, and child items inherit the scope.
+    let hermetic = FILE.in_hermetic();
+    assert_ne!(hermetic.key(), FILE.key());
+    assert!(found(&only, "const SANDBOX_EXEC: &str = \"/usr/bin/sandbox-exec\";", hermetic).is_empty());
+    assert!(found(&only, "fn f() { Command::new(\"sandbox-exec\"); }", hermetic).is_empty());
+
+    let mod_text = "mod m {\n    fn g() {}\n}";
+    let start = mod_text.find("fn g").unwrap() as u32;
+    let holes = [Span::new(start, start + "fn g() {}".len() as u32)];
+    out.clear();
+    let linted = lint(&only, &Unit { text: mod_text, holes: &holes, scope: hermetic }, alloc, &mut out).unwrap();
+    assert_eq!(linted.children.len(), 1);
+    assert!(linted.children[0].in_hermetic);
+
+    // Path helper recognizes bstd::procs::hermetic and rejects other paths.
+    assert!(is_hermetic_path("crates/blaze-std/src/procs/hermetic.rs"));
+    assert!(is_hermetic_path("crates/blaze-std/src/procs/hermetic/seatbelt.rs"));
+    assert!(is_hermetic_path("crates/bstd/src/procs/hermetic/native.rs"));
+    assert!(!is_hermetic_path("crates/blaze-std/src/procs/hermetic_extra.rs"));
+    assert!(!is_hermetic_path("crates/blaze-cli/src/test_drive.rs"));
+    assert!(!is_hermetic_path("crates/other/src/procs/hermetic/seatbelt.rs"));
+
+    // Negative clean controls outside hermetic.
+    none(rule, &[
+        "fn f() { bstd::procs::hermetic::Hermetic::run(plan); }",
+        "fn f() { Command::new(\"/usr/bin/env\"); }",
+        "fn f() { let msg = \"failed to run sandbox-exec\"; }",
+        "fn f() { let bin = \"sandbox-exec-helper\"; }",
+        "fn f() {\n    // /usr/bin/sandbox-exec\n    /* sandbox-exec */\n}",
+        "#[test]\nfn t() { Command::new(\"/usr/bin/sandbox-exec\"); }",
+        "#[cfg(test)]\nmod t {\n    const S: &str = \"sandbox-exec\";\n}",
+    ]);
 }

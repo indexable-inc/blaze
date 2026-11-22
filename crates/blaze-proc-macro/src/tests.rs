@@ -277,6 +277,7 @@ fn module_in(dir: &Path, wasm: Vec<u8>, macros: u32) -> ModuleRecord {
         decls: "decls".to_owned(),
         dir: dir.to_owned(),
         compiled: dir.join("compiled"),
+        native_dylib: None,
     }
 }
 

@@ -164,6 +164,9 @@ pub struct ProcMacros<'r> {
     limits: Limits,
     crates: Vec<MacroCrate>,
     findings: Mutex<Vec<Finding>>,
+    /// Warm pool of native `rust-analyzer-proc-macro-srv` workers for zero-Wasm `.dylib`/`.so`
+    /// proc-macro modules (D175 fast path; spawned lazily only when a native module runs).
+    native_pool: Arc<crate::native_bridge::NativeServerPool>,
     /// Each package a call was expanded in, with its crate name's results and its own
     /// verdicts on them: sorted by the package's address, which a slot keeps alive, so a
     /// package is found by identity with no hash of it a call.
@@ -203,6 +206,7 @@ impl<'r> ProcMacros<'r> {
             limits,
             crates: Vec::new(),
             findings: Mutex::new(Vec::new()),
+            native_pool: Arc::new(crate::native_bridge::NativeServerPool::new()),
             slots: Mutex::new(Vec::new()),
             tables: Mutex::new(Vec::new()),
         }
@@ -339,10 +343,18 @@ impl<'r> ProcMacros<'r> {
     /// load is reported once, as its first call would. Gives how many modules were compiled
     /// (the rest came from their compiled records).
     pub fn load_all(&self, workers: usize) -> Result<u64, RuntimeError> {
-        // The crates with a module, in the order `modules` lists theirs: the loads come back so.
-        let modules: Vec<&ModuleRecord> = self.crates.iter().filter_map(|it| it.module.as_ref().ok()).collect();
+        // Skip native `.dylib` modules — they expand directly via `NativeServerPool` (zero Wasmtime!).
+        let modules: Vec<&ModuleRecord> = self
+            .crates
+            .iter()
+            .filter_map(|it| it.module.as_ref().ok())
+            .filter(|m| m.native_dylib.is_none())
+            .collect();
+        if modules.is_empty() {
+            return Ok(0);
+        }
         let before = self.runtime.compiles();
-        let with = self.crates.iter().filter(|it| it.module.is_ok());
+        let with = self.crates.iter().filter(|it| it.module.as_ref().is_ok_and(|m| m.native_dylib.is_none()));
         for (macro_crate, loaded) in with.zip(self.runtime.load_all(&modules, workers)?) {
             if let Err(error) = loaded
                 && !macro_crate.reported.swap(true, Ordering::Relaxed)
@@ -387,6 +399,9 @@ impl<'r> ProcMacros<'r> {
         let name = def.proc_name().unwrap_or("");
         if module.find(kind, name).is_none() {
             return Some(Finding::NoSuchMacro { krate: macro_crate.label.clone(), name: name.to_owned(), kind });
+        }
+        if module.native_dylib.is_some() {
+            return None;
         }
         match macro_crate.loaded(self.runtime, module) {
             Ok(_) => None,
@@ -440,6 +455,93 @@ impl<'r> ProcMacros<'r> {
                 return Err(failed);
             }
         };
+        // Native zero-Wasm fast path (D175): expand directly via `NativeServerPool` on host `.dylib`/`.so`.
+        if let Some(ref dylib) = module.native_dylib {
+            let real_dir: Option<String> = match &package.files {
+                crate::sandbox::Files::Folder(dir) => {
+                    let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+                    Some(canon.to_string_lossy().into_owned())
+                }
+                crate::sandbox::Files::Member { workspace, root } => {
+                    let seen = root.seen().to_string();
+                    let rel = seen.strip_prefix("/workspace").unwrap_or("").trim_start_matches('/');
+                    let base = if workspace.as_os_str().is_empty() { std::path::PathBuf::from(".") } else { workspace.clone() };
+                    let full = if rel.is_empty() { base } else { base.join(rel) };
+                    let canon = std::fs::canonicalize(&full).unwrap_or(full);
+                    Some(canon.to_string_lossy().into_owned())
+                }
+                crate::sandbox::Files::Listed(files) => {
+                    // Materialize `Cargo.toml` once by content digest so fetched-crate proc macros
+                    // (`proc-macro-crate`, `jsonrpsee`, `derive_more`, etc.) can read `$CARGO_MANIFEST_DIR/Cargo.toml`.
+                    files.iter().find(|(name, _)| name == "Cargo.toml").and_then(|(_, bytes)| {
+                        let digest = blaze_sha256::digest(bytes);
+                        let mut hex = String::with_capacity(64);
+                        for b in digest {
+                            use core::fmt::Write;
+                            let _ = write!(&mut hex, "{b:02x}");
+                        }
+                        let dir = std::env::temp_dir().join("blaze-pm-manifests").join(&hex);
+                        let manifest = dir.join("Cargo.toml");
+                        if !manifest.is_file() {
+                            let _ = std::fs::create_dir_all(&dir);
+                            let tmp = dir.join(format!(".Cargo.toml.{}", std::process::id()));
+                            if std::fs::write(&tmp, bytes).is_ok() {
+                                let _ = std::fs::rename(&tmp, &manifest);
+                            }
+                        }
+                        let canon = std::fs::canonicalize(&dir).unwrap_or(dir);
+                        Some(canon.to_string_lossy().into_owned())
+                    })
+                }
+            };
+            let mut env_owned: Vec<(String, String)> = package
+                .env
+                .vars()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect();
+            if let Some(ref dir) = real_dir {
+                let manifest_path = std::path::Path::new(dir).join("Cargo.toml").to_string_lossy().into_owned();
+                let mut had_dir = false;
+                let mut had_path = false;
+                for (k, v) in &mut env_owned {
+                    if k == "CARGO_MANIFEST_DIR" {
+                        *v = dir.clone();
+                        had_dir = true;
+                    } else if k == "CARGO_MANIFEST_PATH" {
+                        *v = manifest_path.clone();
+                        had_path = true;
+                    }
+                }
+                if !had_dir {
+                    env_owned.push(("CARGO_MANIFEST_DIR".to_owned(), dir.clone()));
+                }
+                if !had_path {
+                    env_owned.push(("CARGO_MANIFEST_PATH".to_owned(), manifest_path));
+                }
+            }
+            let env_refs: Vec<(&str, &str)> = env_owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            match self.native_pool.expand_macro(dylib, &export.name, call, edition, &env_refs, real_dir.as_deref(), alloc) {
+                Ok(produced) => {
+                    let mut mark = parts.start();
+                    let kept = slot.results.insert(self.store, base, &produced);
+                    mark.lap(Part::Keep);
+                    if let Err(error) = kept {
+                        self.report(Finding::Record { base, error });
+                    }
+                    return Ok(produced);
+                }
+                Err(err) => {
+                    let expand_err = ExpandError {
+                        krate: macro_crate.label.clone(),
+                        name: export.name.clone(),
+                        error: CallError::Failed(err.to_string()),
+                    };
+                    let refused = RunRefused { host: expand_err.error.host_error(), call: Some(expand_err.error.clone()) };
+                    self.report(Finding::Call { base, error: expand_err });
+                    return Err(refused);
+                }
+            }
+        }
         let loaded = macro_crate.loaded(self.runtime, module);
         mark.lap(Part::Load);
         let loaded = match loaded {

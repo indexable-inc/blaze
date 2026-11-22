@@ -210,6 +210,18 @@ pub fn show_message<P: Put + ?Sized>(rules: &RuleSet, item: &str, findings: &Fin
         Template::ProcMacroDef => {
             out.str("`").str(range).str("` defines a proc macro: under Blaze, prefer `bstd::comptime` reflection (`#[cfg(blaze)] comptime fn`) to avoid proc-macro build overhead");
         }
+        Template::DoubleIndirectionArc => {
+            let replacement = match span(0) {
+                Some("String") => "`blaze_own::ThinStr`",
+                Some("Vec") => "`blaze_own::ThinArc`",
+                _ => "`blaze_own::ThinArc` / `blaze_own::ThinStr`",
+            };
+            out.str("`").str(range).str("` causes double heap indirection: use ").str(replacement);
+            out.str(" (single 8-byte thin pointer + single allocation)");
+        }
+        Template::RawSandboxExec => {
+            out.str("raw ").str(range).str(" process spawn outside `bstd::procs::hermetic`: use `bstd::procs::hermetic::Hermetic` for cross-platform macOS Seatbelt and Linux Landlock/seccomp from one sans-IO `Plan`");
+        }
         Template::VariantCount | Template::VariantCountMany => {
             let names = || {
                 args.iter().filter_map(|arg| match arg {
