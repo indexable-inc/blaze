@@ -71,7 +71,8 @@ mod tests;
 
 pub use asset::{
     AssetFidelityPolicy, AssetPreset, AssetReport, BudgetInput, BudgetStatus, ExportedPart, GameAsset, GameAssetOpts,
-    PartFeature, PartFeatureReport, PartReport, allocate_budgets, build_game_asset,
+    PartFeature, PartFeatureReport, PartReport, PublishCheckOpts, PublishFailure, PublishPlant, PublishProof, allocate_budgets,
+    build_game_asset, build_game_asset_planted, publish_game_asset,
 };
 pub use blaze_cad_mesh::{
     CreaseProfile, CreaseProfileOpts, DecimateStats, Decimated, FeatureProtect, FeatureRegion, FeatureZone, GridSizing,
@@ -124,6 +125,14 @@ pub enum ModelError {
     EmptySolid { function: &'static str, arg: &'static str },
     /// A part's name already taken in the model.
     DuplicateName { name: Name },
+    /// A [`PartFeature`] targets a part name that does not exist in the model/export.
+    UnknownFeaturePart { part: Name, feature: Name },
+    /// Two [`PartFeature`] targets on the same part share the same feature name.
+    DuplicateFeatureName { part: Name, feature: Name },
+    /// A [`FeatureTarget`] has an invalid region or tolerance.
+    InvalidFeatureTarget { part: Name, feature: Name, reason: &'static str },
+    /// The asset failed [`PublishCheckOpts`] (budget, part fidelity, or requested feature targets).
+    PublishRejected(PublishFailure),
     /// A part id the model never gave.
     NoPart { id: u32 },
     /// More parts than the model's cap.
@@ -243,6 +252,12 @@ impl From<SvgError> for ModelError {
 impl From<PngError> for ModelError {
     fn from(e: PngError) -> ModelError {
         ModelError::Png(e)
+    }
+}
+
+impl From<PublishFailure> for ModelError {
+    fn from(e: PublishFailure) -> ModelError {
+        ModelError::PublishRejected(e)
     }
 }
 
@@ -439,6 +454,10 @@ impl<'a> Model<'a> {
     pub fn mark_feature(&mut self, id: PartId, target: FeatureTarget) -> Result<(), ModelError> {
         let at = usize::try_from(id.0).map_err(|_| ModelError::NoPart { id: id.0 })?;
         let part_name = self.parts.get(at).ok_or(ModelError::NoPart { id: id.0 })?.name;
+        asset::validate_feature_target(part_name, &target)?;
+        if self.features.iter().any(|pf| pf.part == part_name && pf.target.name == target.name) {
+            return Err(ModelError::DuplicateFeatureName { part: part_name, feature: target.name });
+        }
         self.features
             .try_push(PartFeature { part: part_name, target })
             .map_err(|_| ModelError::Alloc { what: "the model's critical features" })
@@ -505,11 +524,12 @@ pub mod prelude {
         FidelityMetrics, FidelityOpts, FidelityReport, FitOpts, GameAsset, GameAssetOpts, GridSizing, InterferenceOpts,
         LodProjection, Material, MaterialRole, MeshLimits, MeshPartOpts, MinWallOpts, Model, ModelError, ModelOpts,
         OverhangFace, OverhangOpts, Part, PartBudget, PartFeature, PartFeatureReport, PartId, PartOpts, PartReport, PieceCache,
-        PieceCacheOpts, RoundEdgesOpts, SectionSvgOpts, StlUnit, Stop, Target, Topology, TriangleBudget, Up, Verdict,
-        allocate_budgets, assemble, auto_grid, build_game_asset, check_mesh_fidelity, check_mesh_fidelity_report, crease_profile,
-        decimate_mesh, draft_angle_check, export_glb, export_section_svg, export_stl, fits_within, gyroid, intersect_all,
-        mass_properties, mesh_part, min_wall, mm3, no_interference, no_interference_assembly, overhang_check, part_tape, picture,
-        picture_exported_scene, picture_mesh, picture_studio, placed_tape, round_edges, topology, union_all,
+        PieceCacheOpts, PublishCheckOpts, PublishFailure, PublishProof, RoundEdgesOpts, SectionSvgOpts, StlUnit, Stop, Target,
+        Topology, TriangleBudget, Up, Verdict, allocate_budgets, assemble, auto_grid, build_game_asset, check_mesh_fidelity,
+        check_mesh_fidelity_report, crease_profile, decimate_mesh, draft_angle_check, export_glb, export_section_svg, export_stl,
+        fits_within, gyroid, intersect_all, mass_properties, mesh_part, min_wall, mm3, no_interference, no_interference_assembly,
+        overhang_check, part_tape, picture, picture_exported_scene, picture_mesh, picture_studio, placed_tape,
+        publish_game_asset, round_edges, topology, union_all,
     };
 }
 

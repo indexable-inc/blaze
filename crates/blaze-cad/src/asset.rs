@@ -8,24 +8,25 @@
 
 use blaze_cad_field::{CadPlant, Detail, Graph, Name, Placement};
 use blaze_cad_mesh::{
-    COS_32_DEGREES, DecimateOpts, Decimated, DecomposeOpts, FeatureProtect, FeatureZone, GridSizing, HullOpts, LodOpts,
-    MaterialRole, Mesh, MeshLimits, MeshOpts, MeshView, Meshed, PieceCache, Source, Stop, Target, auto_grid, convex_hull,
-    decimate, decompose, lod_chain, mesh, mesh_cached, topology,
+    COS_32_DEGREES, DecimateOpts, Decimated, DecomposeOpts, FeatureProtect, FeatureRegion, FeatureZone, GridSizing, HullOpts,
+    LodOpts, MaterialRole, Mesh, MeshLimits, MeshOpts, MeshView, Meshed, PieceCache, Source, Stop, Target, auto_grid,
+    convex_hull, decimate, decompose, lod_chain, mesh, mesh_cached, topology,
 };
 use blaze_cad_out::{Collider, Encoding, GlbOpts, Limits, Lod, MassFacts, Material, Up, glb};
 use blaze_cad_picture::{
     HighlightStyle, MeshHighlight, MeshPictureOpts, MeshScenePart, Picture, View, Wireframe, render_mesh_scene,
 };
 use blaze_math::Aabb3;
-use blaze_own::planted::Planted;
+use blaze_own::planted::{NoPlant, Planted, Plants};
 use blaze_own::{Alloc, Vec};
 use blaze_text::{Put, Show, Writes};
 use blaze_units::{Angle, Density, Length};
 
 use crate::export::{hull_to_mesh, prepare_gpu_mesh};
 use crate::{
-    ColliderMode, ExportLodOpts, FeatureReport, FeatureTarget, FidelityChecked, FidelityOpts, ModelError, Part, PartBudget,
-    PartId, STEEL_ONLY, TriangleBudget, Verdict, check_mesh_fidelity_report, mass_properties, part_tape, transform_of,
+    ColliderMode, ExportLodOpts, FeatureKind, FeatureReport, FeatureTarget, FidelityChecked, FidelityFinding, FidelityOpts,
+    ModelError, Part, PartBudget, PartId, STEEL_ONLY, TriangleBudget, Unsettled, Verdict, check_mesh_fidelity_report,
+    mass_properties, part_tape, transform_of,
 };
 
 /// Scale-aware tessellation and fidelity preset for [`build_game_asset`].
@@ -248,12 +249,257 @@ pub struct PartReport {
     pub fidelity: Option<FidelityChecked>,
 }
 
+/// Planted bugs for strict export validation and publish gating, caught by test controls.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PublishPlant {
+    None,
+    /// Silently ignores a [`PartFeature`] whose `part` name does not match any part in the export.
+    IgnoreUnknownFeaturePart,
+    /// Allows [`AssetReport::check_publish`] to succeed even when fewer feature targets were
+    /// checked/passed than requested.
+    AllowPartialFeatures,
+    /// Allows [`AssetReport::check_publish`] to succeed even when a requested feature target
+    /// missed tolerance.
+    AllowFailedFeature,
+    /// Allows [`AssetReport::check_publish`] to succeed even when a part or bundle exceeded its
+    /// triangle budget.
+    AllowOverBudget,
+}
+
+impl Plants for PublishPlant {}
+
+/// Policy for [`AssetReport::check_publish`], [`GameAsset::check_publish`], and
+/// [`publish_game_asset`].
+#[blaze::args]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PublishCheckOpts {
+    /// Require every part and the bundle total to stay within triangle budgets.
+    pub require_budget: bool = true,
+    /// Require every part to have been fidelity-checked and return `Verdict::Pass`.
+    pub require_fidelity: bool = true,
+    /// Require every requested [`PartFeature`] target to have been evaluated and return
+    /// `Verdict::Pass` (`checked_features == requested_features && passed_features == requested_features`).
+    pub require_all_features: bool = true,
+    /// Optional CI guard: refuse publishing if zero critical feature targets were declared.
+    pub require_non_empty_features: bool = false,
+}
+
+/// Typed refusal returned by [`AssetReport::check_publish`] / [`GameAsset::check_publish`] naming
+/// the exact part, feature, budget, or fidelity rule that blocked publishing.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum PublishFailure {
+    /// A part (`Some(name)`) or the bundle total (`None`) exceeded its triangle budget.
+    BudgetExceeded {
+        part: Option<Name>,
+        written: u64,
+        budget: u32,
+        status: BudgetStatus,
+    },
+    /// Fidelity checking was disabled (`GameAssetOpts::fidelity = None`) while `require_fidelity`
+    /// was enabled.
+    PartFidelityNotChecked { part: Name },
+    /// A part failed its geometric or topological fidelity check.
+    PartFidelityFailed { part: Name, finding: FidelityFinding },
+    /// A part's fidelity check did not settle (`Verdict::Unknown`).
+    PartFidelityUnsettled { part: Name, reason: Unsettled },
+    /// Fewer feature targets were checked or passed than were requested.
+    FeatureTargetMismatch { requested: u32, checked: u32, passed: u32 },
+    /// A requested critical feature target missed its tolerance.
+    FeatureFailed { part: Name, feature: Name, kind: FeatureKind, finding: FidelityFinding },
+    /// A requested critical feature target did not settle (`Verdict::Unknown`).
+    FeatureUnsettled { part: Name, feature: Name, reason: Unsettled },
+    /// `PublishCheckOpts::require_non_empty_features` was set, but no feature targets were declared.
+    NoFeaturesDeclared,
+}
+
+impl Show for PublishFailure {
+    fn show<P: Put + ?Sized>(&self, out: &mut P) {
+        match *self {
+            PublishFailure::BudgetExceeded { part, written, budget, status } => {
+                out.put_str("publish blocked: ");
+                match part {
+                    Some(name) => {
+                        out.put_str("part ");
+                        out.put_str(name.as_str());
+                    }
+                    None => out.put_str("bundle total"),
+                }
+                out.put_str(" wrote ");
+                out.int(written);
+                out.put_str(" tris over budget ");
+                out.int(budget);
+                out.put_str(" (");
+                out.put_str(status.tag());
+                out.put_byte(b')');
+            }
+            PublishFailure::PartFidelityNotChecked { part } => {
+                out.put_str("publish blocked: fidelity check was not run on part ");
+                out.put_str(part.as_str());
+            }
+            PublishFailure::PartFidelityFailed { part, finding } => {
+                out.put_str("publish blocked: part ");
+                out.put_str(part.as_str());
+                out.put_str(" failed fidelity: ");
+                finding.show(out);
+            }
+            PublishFailure::PartFidelityUnsettled { part, reason } => {
+                out.put_str("publish blocked: part ");
+                out.put_str(part.as_str());
+                out.put_str(" fidelity unsettled: ");
+                reason.show(out);
+            }
+            PublishFailure::FeatureTargetMismatch { requested, checked, passed } => {
+                out.put_str("publish blocked: requested ");
+                out.int(requested);
+                out.put_str(" feature targets, checked ");
+                out.int(checked);
+                out.put_str(", passed ");
+                out.int(passed);
+            }
+            PublishFailure::FeatureFailed { part, feature, kind, finding } => {
+                out.put_str("publish blocked: ");
+                out.put_str(part.as_str());
+                out.put_byte(b'.');
+                out.put_str(feature.as_str());
+                out.put_str(" [");
+                out.put_str(kind.tag());
+                out.put_str("] failed: ");
+                finding.show(out);
+            }
+            PublishFailure::FeatureUnsettled { part, feature, reason } => {
+                out.put_str("publish blocked: ");
+                out.put_str(part.as_str());
+                out.put_byte(b'.');
+                out.put_str(feature.as_str());
+                out.put_str(" unsettled: ");
+                reason.show(out);
+            }
+            PublishFailure::NoFeaturesDeclared => {
+                out.put_str("publish blocked: no critical feature targets were declared");
+            }
+        }
+    }
+}
+
+/// Sealed proof minted only by [`AssetReport::check_publish`] / [`GameAsset::check_publish`]
+/// certifying that budgets, part fidelity, and every requested feature target passed (rule 74).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PublishProof {
+    parts: u32,
+    requested_features: u32,
+    passed_features: u32,
+    written_triangles: u64,
+    glb_bytes: u64,
+    _sealed: (),
+}
+
+impl PublishProof {
+    #[inline]
+    pub const fn parts(&self) -> u32 {
+        self.parts
+    }
+
+    #[inline]
+    pub const fn requested_features(&self) -> u32 {
+        self.requested_features
+    }
+
+    #[inline]
+    pub const fn passed_features(&self) -> u32 {
+        self.passed_features
+    }
+
+    #[inline]
+    pub const fn written_triangles(&self) -> u64 {
+        self.written_triangles
+    }
+
+    #[inline]
+    pub const fn glb_bytes(&self) -> u64 {
+        self.glb_bytes
+    }
+}
+
+/// Validate a single [`FeatureTarget`]'s spatial region and tolerances upfront so malformed
+/// feature specs fail immediately by name instead of silently skipping or exploding meshing.
+pub(crate) fn validate_feature_target(part: Name, target: &FeatureTarget) -> Result<(), ModelError> {
+    if target.name.as_str().is_empty() {
+        return Err(ModelError::InvalidFeatureTarget { part, feature: target.name, reason: "feature name must not be empty" });
+    }
+    match target.region {
+        FeatureRegion::Box(b) => {
+            let coords = [b.lo.x, b.lo.y, b.lo.z, b.hi.x, b.hi.y, b.hi.z];
+            if !coords.iter().all(|v| v.is_finite()) || b.is_empty() {
+                return Err(ModelError::InvalidFeatureTarget {
+                    part,
+                    feature: target.name,
+                    reason: "box region must be finite and non-empty (lo <= hi)",
+                });
+            }
+        }
+        FeatureRegion::Ball { center, radius } => {
+            if !(center.x.is_finite() && center.y.is_finite() && center.z.is_finite() && radius > Length::ZERO) {
+                return Err(ModelError::InvalidFeatureTarget {
+                    part,
+                    feature: target.name,
+                    reason: "ball region must have finite center and radius > 0",
+                });
+            }
+        }
+        FeatureRegion::Capsule { a, b, radius } => {
+            let coords = [a.x, a.y, a.z, b.x, b.y, b.z];
+            if !(coords.iter().all(|v| v.is_finite()) && radius > Length::ZERO) {
+                return Err(ModelError::InvalidFeatureTarget {
+                    part,
+                    feature: target.name,
+                    reason: "capsule region must have finite endpoints and radius > 0",
+                });
+            }
+        }
+    }
+    if let Some(me) = target.max_error
+        && me <= Length::ZERO
+    {
+        return Err(ModelError::InvalidFeatureTarget {
+            part,
+            feature: target.name,
+            reason: "max_error must be greater than zero",
+        });
+    }
+    if let Some(mf) = target.min_feature
+        && mf <= Length::ZERO
+    {
+        return Err(ModelError::InvalidFeatureTarget {
+            part,
+            feature: target.name,
+            reason: "min_feature must be greater than zero",
+        });
+    }
+    if let Some(ang) = target.max_normal_error {
+        let rad = ang.as_radians();
+        if !(rad > 0.0 && rad < core::f64::consts::PI) {
+            return Err(ModelError::InvalidFeatureTarget {
+                part,
+                feature: target.name,
+                reason: "max_normal_error must be strictly between 0 and 180 degrees",
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Bundle-level report across every part in a [`GameAsset`]. Implements [`Show`] to render a
 /// concise, deterministic per-part table + per-feature critical-target table + summary footer.
 #[derive(Debug)]
 pub struct AssetReport<'a> {
     pub parts: Vec<PartReport, Alloc<'a>>,
     pub features: Vec<PartFeatureReport, Alloc<'a>>,
+    /// Number of [`PartFeature`] targets requested on the build call.
+    pub requested_features: u32,
+    /// Number of requested [`PartFeature`] targets actually evaluated.
+    pub checked_features: u32,
+    /// Number of evaluated [`PartFeature`] targets that returned `Verdict::Pass`.
+    pub passed_features: u32,
     pub total_meshed: u64,
     pub total_written: u64,
     pub total_vertices: u64,
@@ -261,6 +507,112 @@ pub struct AssetReport<'a> {
     pub glb_bytes: u64,
     pub budget_passed: bool,
     pub fidelity_passed: bool,
+}
+
+impl AssetReport<'_> {
+    /// Strict publish gate: verifies budgets, per-part fidelity, and that EVERY requested feature
+    /// target was evaluated and passed (`checked == requested && passed == requested`), minting a
+    /// [`PublishProof`] on success or returning the exact typed [`PublishFailure`].
+    pub fn check_publish(&self, opts: PublishCheckOpts) -> Result<PublishProof, PublishFailure> {
+        self.check_publish_planted(opts, NoPlant)
+    }
+
+    /// [`AssetReport::check_publish`] with a planted bug, for the test controls.
+    pub fn check_publish_planted(
+        &self,
+        opts: PublishCheckOpts,
+        plant: impl Planted<PublishPlant>,
+    ) -> Result<PublishProof, PublishFailure> {
+        if opts.require_non_empty_features && self.requested_features == 0 {
+            return Err(PublishFailure::NoFeaturesDeclared);
+        }
+        if opts.require_budget && !plant.has(PublishPlant::AllowOverBudget) {
+            for p in self.parts.iter() {
+                if !p.budget_status.ok() {
+                    return Err(PublishFailure::BudgetExceeded {
+                        part: Some(p.name),
+                        written: u64::from(p.written_triangles),
+                        budget: p.budget.unwrap_or(0),
+                        status: p.budget_status,
+                    });
+                }
+            }
+            if let Some(tb) = self.total_budget
+                && self.total_written > u64::from(tb)
+            {
+                return Err(PublishFailure::BudgetExceeded {
+                    part: None,
+                    written: self.total_written,
+                    budget: tb,
+                    status: BudgetStatus::OverNoValidCollapse,
+                });
+            }
+        }
+        if opts.require_all_features {
+            if !plant.has(PublishPlant::AllowFailedFeature) {
+                for pf in self.features.iter() {
+                    match pf.report.verdict {
+                        Verdict::Pass => {}
+                        Verdict::Found(finding) => {
+                            return Err(PublishFailure::FeatureFailed {
+                                part: pf.part,
+                                feature: pf.report.name,
+                                kind: pf.report.kind,
+                                finding,
+                            });
+                        }
+                        Verdict::Unknown(reason) => {
+                            return Err(PublishFailure::FeatureUnsettled {
+                                part: pf.part,
+                                feature: pf.report.name,
+                                reason,
+                            });
+                        }
+                    }
+                }
+            }
+            if !plant.has(PublishPlant::AllowPartialFeatures)
+                && (self.checked_features != self.requested_features
+                    || u32::try_from(self.features.len()).ok() != Some(self.requested_features)
+                    || (!plant.has(PublishPlant::AllowFailedFeature) && self.passed_features != self.requested_features))
+            {
+                return Err(PublishFailure::FeatureTargetMismatch {
+                    requested: self.requested_features,
+                    checked: self.checked_features,
+                    passed: self.passed_features,
+                });
+            }
+        }
+        if opts.require_fidelity {
+            for p in self.parts.iter() {
+                let Some(fc) = p.fidelity else {
+                    return Err(PublishFailure::PartFidelityNotChecked { part: p.name });
+                };
+                match fc.verdict {
+                    Verdict::Pass => {}
+                    Verdict::Found(finding) => {
+                        if plant.has(PublishPlant::AllowFailedFeature)
+                            && matches!(finding, FidelityFinding::FeatureMissed { .. })
+                        {
+                            continue;
+                        }
+                        return Err(PublishFailure::PartFidelityFailed { part: p.name, finding });
+                    }
+                    Verdict::Unknown(reason) => {
+                        return Err(PublishFailure::PartFidelityUnsettled { part: p.name, reason });
+                    }
+                }
+            }
+        }
+        Ok(PublishProof {
+            parts: u32::try_from(self.parts.len()).unwrap_or(u32::MAX),
+            requested_features: self.requested_features,
+            passed_features: self.passed_features,
+            written_triangles: self.total_written,
+            glb_bytes: self.glb_bytes,
+            _sealed: (),
+        })
+    }
 }
 
 impl Show for AssetReport<'_> {
@@ -336,6 +688,12 @@ impl Show for AssetReport<'_> {
         out.put_str(if self.budget_passed { "PASS" } else { "FAIL" });
         out.put_str("\tfidelity=");
         out.put_str(if self.fidelity_passed { "PASS" } else { "FAIL" });
+        if self.requested_features > 0 {
+            out.put_str("\tfeatures=");
+            out.int(self.passed_features);
+            out.put_byte(b'/');
+            out.int(self.requested_features);
+        }
         out.put_byte(b'\n');
         if !self.features.is_empty() {
             out.put_str("FEATURES\tpart\tfeature\tkind\tprotect\ttris\terr_mm\tnorm_deg\tstatus\n");
@@ -463,6 +821,20 @@ impl GameAsset<'_> {
     /// Total triangles written across every part.
     pub fn triangles(&self) -> u64 {
         self.report.total_written
+    }
+
+    /// Strict publish gate: requires budgets, per-part fidelity, and every requested feature
+    /// target to pass according to `opts`, minting a [`PublishProof`] on success or returning the
+    /// exact typed [`PublishFailure`].
+    pub fn check_publish(&self, opts: PublishCheckOpts) -> Result<PublishProof, PublishFailure> {
+        self.report.check_publish(opts)
+    }
+
+    /// Return the publishable GLB bytes once [`Self::check_publish`] has minted a [`PublishProof`]
+    /// (rule 74: verify once and pass the proof forward).
+    #[inline]
+    pub fn publish_glb(&self, _proof: PublishProof) -> &[u8] {
+        &self.glb
     }
 
     /// Render a preview using the **actual exported, decimated, GPU-optimized meshes** at their
@@ -681,21 +1053,83 @@ struct ReadyLod<'s> {
 
 /// Build an entire game asset end to end:
 ///
-/// 1. Scale-aware tessellation (`auto_grid`) using [`GameAssetOpts::preset`] and per-part overrides.
+/// 0. Strict upfront validation: rejects empty part lists, duplicate part names, unknown/misspelled
+///    part names on [`PartFeature`] targets ([`ModelError::UnknownFeaturePart`]), duplicate
+///    `(part, feature)` names ([`ModelError::DuplicateFeatureName`]), and invalid feature regions
+///    or tolerances ([`ModelError::InvalidFeatureTarget`]).
+/// 1. Scale-aware tessellation (`auto_grid`) with per-cell local refinement around marked features.
 /// 2. Phase-1 error-bounded QEM decimation, followed by deterministic [`allocate_budgets`] and
-///    Phase-2 budget-constrained decimation when [`GameAssetOpts::total_budget`] or per-part caps
-///    require further compression.
+///    incremental Phase-2 budget-constrained decimation.
 /// 3. GPU Tipsify vertex-cache and vertex-fetch optimization, optional LOD chains, and optional
 ///    physics collider hulls.
-/// 4. Automatic per-part lost-hole and lost-bevel fidelity checks ([`check_mesh_fidelity`]) and
+/// 4. Automatic per-part and per-feature fidelity checks ([`check_mesh_fidelity_report`]) and
 ///    exact Euler genus calculation.
-/// 5. glTF 2.0 `.glb` export, full per-part [`AssetReport`], and retained previewable meshes.
+/// 5. glTF 2.0 `.glb` export, full [`AssetReport`], retained previewable meshes, and automatic
+///    missed-feature preview highlights.
 pub fn build_game_asset<'a, P: Planted<CadPlant>>(
     g: &Graph<'_, P>,
     parts: &[Part],
     o: GameAssetOpts<'a, '_, '_, '_>,
-    mut cache: Option<&mut PieceCache<'_>>,
+    cache: Option<&mut PieceCache<'_>>,
 ) -> Result<GameAsset<'a>, ModelError> {
+    build_game_asset_planted(g, parts, o, cache, NoPlant)
+}
+
+/// Build an asset and enforce [`PublishCheckOpts`] in one call, returning the asset together with
+/// its [`PublishProof`] or failing with [`ModelError::PublishRejected`] if any budget, part
+/// fidelity check, or requested feature target did not pass.
+pub fn publish_game_asset<'a, P: Planted<CadPlant>>(
+    g: &Graph<'_, P>,
+    parts: &[Part],
+    o: GameAssetOpts<'a, '_, '_, '_>,
+    publish: PublishCheckOpts,
+    cache: Option<&mut PieceCache<'_>>,
+) -> Result<(GameAsset<'a>, PublishProof), ModelError> {
+    let asset = build_game_asset(g, parts, o, cache)?;
+    let proof = asset.check_publish(publish)?;
+    Ok((asset, proof))
+}
+
+/// [`build_game_asset`] with a planted validation bug, for the test controls.
+pub fn build_game_asset_planted<'a, P: Planted<CadPlant>>(
+    g: &Graph<'_, P>,
+    parts: &[Part],
+    o: GameAssetOpts<'a, '_, '_, '_>,
+    mut cache: Option<&mut PieceCache<'_>>,
+    plant: impl Planted<PublishPlant>,
+) -> Result<GameAsset<'a>, ModelError> {
+    // Stage 0: strict upfront validation — never silently ignore a misspelled part name, duplicate
+    // target, or malformed feature region.
+    if parts.is_empty() {
+        return Err(ModelError::Argument {
+            function: "build_game_asset",
+            arg: "parts",
+            accepted: "at least one part",
+        });
+    }
+    for (i, a) in parts.iter().enumerate() {
+        if let Some(rest) = parts.get(i + 1..) {
+            for b in rest {
+                if a.name == b.name {
+                    return Err(ModelError::DuplicateName { name: a.name });
+                }
+            }
+        }
+    }
+    for (fi, pf) in o.features.iter().enumerate() {
+        if !plant.has(PublishPlant::IgnoreUnknownFeaturePart) && !parts.iter().any(|p| p.name == pf.part) {
+            return Err(ModelError::UnknownFeaturePart { part: pf.part, feature: pf.target.name });
+        }
+        validate_feature_target(pf.part, &pf.target)?;
+        if let Some(prevs) = o.features.get(..fi) {
+            for prev in prevs {
+                if prev.part == pf.part && prev.target.name == pf.target.name {
+                    return Err(ModelError::DuplicateFeatureName { part: pf.part, feature: pf.target.name });
+                }
+            }
+        }
+    }
+
     let s = o.scratch;
     let cos_crease = o.cos_crease.unwrap_or_else(|| o.preset.default_cos_crease());
     let default_norm_limit = o
@@ -1098,9 +1532,25 @@ pub fn build_game_asset<'a, P: Planted<CadPlant>>(
         all_budgets_ok = false;
     }
 
+    let requested_features = u32::try_from(o.features.len()).unwrap_or(u32::MAX);
+    let checked_features = u32::try_from(feature_reports.len()).unwrap_or(u32::MAX);
+    let passed_features = u32::try_from(
+        feature_reports
+            .iter()
+            .filter(|pf| matches!(pf.report.verdict, Verdict::Pass))
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    if checked_features != requested_features || passed_features != requested_features {
+        all_fidelity_ok = false;
+    }
+
     let report = AssetReport {
         parts: part_reports,
         features: feature_reports,
+        requested_features,
+        checked_features,
+        passed_features,
         total_meshed,
         total_written,
         total_vertices,
