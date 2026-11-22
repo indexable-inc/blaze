@@ -23,6 +23,7 @@ extern crate std;
 pub mod check;
 pub mod derivation;
 pub mod emit;
+pub mod lean_auto;
 pub mod lean_kernel;
 pub mod questions;
 
@@ -38,6 +39,10 @@ use blaze_solve::tys::Tys;
 pub use check::{CheckError, Checked, Checker, Cost};
 pub use derivation::{BuildError, Builder, Builtin, By, FormatError, Step, StepId, View};
 pub use emit::{Count, Emitter, NotCertifiable};
+pub use lean_auto::{
+    AutoConfig, AutoFailure, AutoOutcome, AutoProof, FailureReason, ProofStep, Strategy,
+    auto_prove, auto_prove_and_register, auto_prove_portfolio,
+};
 pub use questions::{Questions, StandError};
 
 /// What a certificate is today (the module doc's rule).
