@@ -1,10 +1,11 @@
 use blaze_own::Alloc;
 
 use crate::{
-    AlgebraPlant, ConstExpr, ConstGraph, ExprGraph, ExprId, Poly, PolyPlant, Rat, Solution,
-    SymScope, diff, diff::diff_with_plant, emit_rust_fn, emit_rust_multi_fn, eval_dual, expr_cost,
-    expr_to_poly, format_expr, grad, grad_reverse, grad_reverse_with_plant, hessian, jacobian,
-    poly_to_expr, simplify, simplify_poly_expr, solve_for, taylor,
+    AlgebraPlant, ConstExpr, ConstGraph, ExprGraph, ExprId, NewtonOpts, PatNode, Poly, PolyPlant,
+    Rat, RewriteRule, SimplifyOpts, Solution, SymScope, diff, diff::diff_with_plant, emit_rust_fn,
+    emit_rust_multi_fn, eval_dual, eval_newton, expr_cost, expr_to_poly, format_expr, grad,
+    grad_reverse, grad_reverse_with_plant, hessian, jacobian, newton_step, poly_to_expr, simplify,
+    simplify_poly_expr, simplify_with_rules, solve_for, solve_linear_system, taylor,
 };
 
 fn heap() -> Alloc<'static> {
@@ -490,4 +491,177 @@ fn blaze_sim_property_exact_poly_div_gcd_diff_and_planted_bugs() {
     let dual = eval_dual(&g, x2_expr, &[3.0], vx).unwrap();
     let got = buggy_diff.eval_f64(&[3.0]).unwrap();
     assert!(!close(got, dual.deriv, 1e-6), "oracle failed to catch WrongPolyDiffCoeff");
+}
+
+#[test]
+fn select_relu_max_min_clamp_forward_reverse_and_comptime_match_dual_oracle() {
+    // 1. Compile-time `ConstGraph::relu` + `max_expr` + compile-time symbolic diff!
+    const COMPTIME_RELU_DIFF: (ConstGraph<64>, ConstExpr) = {
+        let mut g = ConstGraph::new();
+        let x = g.var(0);
+        let c2 = g.lit(2.0);
+        let two_x = g.mul(c2, x);
+        let r = g.relu(two_x);
+        let df = g.diff(r, 0);
+        (g, df)
+    };
+    const RELU_DF_POS: f64 = COMPTIME_RELU_DIFF.0.eval_const(COMPTIME_RELU_DIFF.1, &[3.0]);
+    const RELU_DF_NEG: f64 = COMPTIME_RELU_DIFF.0.eval_const(COMPTIME_RELU_DIFF.1, &[-3.0]);
+    assert_eq!(RELU_DF_POS, 2.0);
+    assert_eq!(RELU_DF_NEG, 0.0);
+
+    // 2. Runtime `Sym` piecewise graph: f(x, y) = relu(x * y) + max(x, y) - min(x, 2*y) + clamp(x, -1, 1)
+    let s = SymScope::new_in(heap());
+    let (vx, x) = s.var("x");
+    let (vy, y) = s.var("y");
+    let f = (x * y).relu() + x.max(y) - x.min(s.lit(2.0) * y) + x.clamp(s.lit(-1.0), s.lit(1.0));
+    let fid = f.id();
+    // Degenerate select(cond, x, x) must fold to x immediately.
+    let deg = x.select(y, y).id();
+    let yid = y.id();
+    let mut g = s.into_graph();
+    assert_eq!(deg, yid);
+
+    // Forward diff + reverse-mode grad + e-graph simplification must all agree with Dual oracle
+    // on points across multiple branches!
+    let df_dx = diff(&mut g, fid, vx).unwrap();
+    let df_dy = diff(&mut g, fid, vy).unwrap();
+    let rev = grad_reverse(&mut g, fid, &[vx, vy]).unwrap();
+    let simp_f = simplify(&mut g, fid).unwrap();
+    let simp_dx = simplify(&mut g, df_dx).unwrap();
+
+    for env in [[0.4, 1.5], [-0.5, 1.2], [2.5, -0.7], [-2.0, -0.3]] {
+        let dual_x = eval_dual(&g, fid, &env, vx).unwrap();
+        let dual_y = eval_dual(&g, fid, &env, vy).unwrap();
+        assert!(close(g.eval(simp_f, &env).unwrap(), dual_x.val, 1e-12));
+        assert!(close(g.eval(df_dx, &env).unwrap(), dual_x.deriv, 1e-12));
+        assert!(close(g.eval(df_dy, &env).unwrap(), dual_y.deriv, 1e-12));
+        assert!(close(g.eval(rev[0], &env).unwrap(), dual_x.deriv, 1e-12));
+        assert!(close(g.eval(rev[1], &env).unwrap(), dual_y.deriv, 1e-12));
+        assert!(close(g.eval(simp_dx, &env).unwrap(), dual_x.deriv, 1e-12));
+    }
+
+    // Rust SSA emitter produces real `if ... > 0.0_f64 { ... } else { ... }`.
+    let code = emit_rust_fn(&g, "piecewise", fid).unwrap();
+    assert!(code.as_str().contains("> 0.0_f64"), "expected select branch in:\n{}", code.as_str());
+}
+
+#[test]
+fn declarative_custom_rewrite_rules_simplify_domain_identities() {
+    // Declarative `const` user rewrite rules (zero heap, postorder PatNode slices: root is last):
+    //   1. exp(?0) * exp(?1)  =>  exp(?0 + ?1)
+    //   2. ln(?0) + ln(?1)    =>  ln(?0 * ?1)
+    const EXP_MUL_LHS: &[PatNode] = &[
+        PatNode::Var(0),
+        PatNode::Var(1),
+        PatNode::Exp(0),
+        PatNode::Exp(1),
+        PatNode::Mul(2, 3),
+    ];
+    const EXP_MUL_RHS: &[PatNode] = &[
+        PatNode::Var(0),
+        PatNode::Var(1),
+        PatNode::Add(0, 1),
+        PatNode::Exp(2),
+    ];
+    const LN_ADD_LHS: &[PatNode] = &[
+        PatNode::Var(0),
+        PatNode::Var(1),
+        PatNode::Ln(0),
+        PatNode::Ln(1),
+        PatNode::Add(2, 3),
+    ];
+    const LN_ADD_RHS: &[PatNode] = &[
+        PatNode::Var(0),
+        PatNode::Var(1),
+        PatNode::Mul(0, 1),
+        PatNode::Ln(2),
+    ];
+    const RULES: &[RewriteRule<'static>] = &[
+        RewriteRule { name: "exp_mul", lhs: EXP_MUL_LHS, rhs: EXP_MUL_RHS },
+        RewriteRule { name: "ln_add", lhs: LN_ADD_LHS, rhs: LN_ADD_RHS },
+    ];
+
+    let s = SymScope::new_in(heap());
+    let (_, x) = s.var("x");
+    let (_, y) = s.var("y");
+    let e = (x.exp() * y.exp()) + (x.ln() + y.ln());
+    let eid = e.id();
+    let mut g = s.into_graph();
+
+    let cost_before = expr_cost(&g, eid).unwrap();
+    let (simp, _stats) = simplify_with_rules(&mut g, eid, SimplifyOpts::default(), RULES).unwrap();
+    let cost_after = expr_cost(&g, simp).unwrap();
+    assert!(
+        cost_after < cost_before,
+        "expected custom rules to reduce cost ({cost_before} -> {cost_after}): {}",
+        format_expr(&g, simp).unwrap().as_str()
+    );
+    // Semantic equality across sample points!
+    for env in [[1.2, 2.3], [0.5, 4.1], [3.0, 0.7]] {
+        assert!(close(g.eval(eid, &env).unwrap(), g.eval(simp, &env).unwrap(), 1e-12));
+    }
+}
+
+#[test]
+fn symbolic_linear_system_and_exact_newton_raphson_solver() {
+    // 1. Symbolic 2x2 parametric linear system:
+    //    a*x + b*y = u
+    //    c*x + d*y = v
+    //    Solution: x = (u*d - b*v) / (a*d - b*c), y = (a*v - u*c) / (a*d - b*c)
+    let mut g = ExprGraph::new_in(heap());
+    let (_, a) = g.var("a");
+    let (_, b) = g.var("b");
+    let (_, c) = g.var("c");
+    let (_, d) = g.var("d");
+    let (_, u) = g.var("u");
+    let (_, v) = g.var("v");
+
+    let sol = solve_linear_system(&mut g, &[a, b, c, d], &[u, v], 2).unwrap().expect("non-singular");
+    assert_eq!(sol.len(), 2);
+    // Test with a=2, b=1, c=5, d=3 (det = 1), u=4, v=11 => x=1, y=2
+    let env = [2.0, 1.0, 5.0, 3.0, 4.0, 11.0];
+    let x_val = g.eval(sol[0], &env).unwrap();
+    let y_val = g.eval(sol[1], &env).unwrap();
+    assert!(close(x_val, 1.0, 1e-12), "x={x_val}");
+    assert!(close(y_val, 2.0, 1e-12), "y={y_val}");
+
+    // 2. Numeric 3x3 linear system:
+    //    2x + y - z = 8
+    //   -3x - y + 2z = -11
+    //   -2x + y + 2z = -3
+    //    Exact solution: x = 2, y = 3, z = -1
+    let mat3 = [
+        g.lit(2.0), g.lit(1.0), g.lit(-1.0),
+        g.lit(-3.0), g.lit(-1.0), g.lit(2.0),
+        g.lit(-2.0), g.lit(1.0), g.lit(2.0),
+    ];
+    let rhs3 = [g.lit(8.0), g.lit(-11.0), g.lit(-3.0)];
+    let sol3 = solve_linear_system(&mut g, &mat3, &rhs3, 3).unwrap().expect("non-singular 3x3");
+    assert!(close(g.eval(sol3[0], &env).unwrap(), 2.0, 1e-12));
+    assert!(close(g.eval(sol3[1], &env).unwrap(), 3.0, 1e-12));
+    assert!(close(g.eval(sol3[2], &env).unwrap(), -1.0, 1e-12));
+
+    // 3. Exact symbolic Newton-Raphson:
+    //    (a) x^3 - 2 = 0  =>  2^(1/3)
+    let mut g2 = ExprGraph::new_in(heap());
+    let (vx, ex) = g2.var("x");
+    let c3 = g2.lit(3.0);
+    let c2 = g2.lit(2.0);
+    let x3 = g2.pow(ex, c3);
+    let f_cbrt = g2.sub(x3, c2);
+    let step_expr = newton_step(&mut g2, f_cbrt, vx).unwrap();
+    // One Newton step from x0 = 1.0 for x^3 - 2 is 1 - (-1)/3 = 4/3.
+    assert!(close(g2.eval(step_expr, &[1.0]).unwrap(), 4.0 / 3.0, 1e-12));
+
+    let res = eval_newton(&mut g2, f_cbrt, vx, &[0.0], 1.5, NewtonOpts::default()).unwrap();
+    assert!(res.converged);
+    assert!(close(res.root * res.root * res.root, 2.0, 1e-12), "root={}", res.root);
+
+    //    (b) Transcendental Dottie number: cos(x) - x = 0  =>  0.7390851332151607...
+    let cos_x = g2.cos(ex);
+    let f_dottie = g2.sub(cos_x, ex);
+    let dottie = eval_newton(&mut g2, f_dottie, vx, &[0.0], 0.5, NewtonOpts::default()).unwrap();
+    assert!(dottie.converged);
+    assert!(close(blaze_math::cos(dottie.root), dottie.root, 1e-12), "dottie={}", dottie.root);
 }

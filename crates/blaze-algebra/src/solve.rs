@@ -10,6 +10,8 @@
 
 use core::alloc::Allocator;
 
+use blaze_own::Vec as OwnVec;
+
 use crate::{AlgebraError, ExprGraph, ExprId, Op, VarId, diff, simplify, simplify_poly_expr};
 
 /// Symbolic solution of `lhs = rhs` with respect to a target variable `x`.
@@ -219,4 +221,164 @@ fn try_isolate<A: Allocator + Copy>(
         },
         _ => Ok(None),
     }
+}
+
+/// Maximum dimension accepted by [`solve_linear_system`] (`bounded-progress`, rule 18).
+pub const MAX_LINEAR_DIM: usize = 8;
+
+/// Solve a symbolic `n × n` linear system `A * x = b` (`n <= 8`) via exact symbolic Gaussian
+/// elimination + back-substitution, simplifying every solution entry via `Poly` + e-graph.
+///
+/// Returns `Ok(None)` if `n == 0`, `n > MAX_LINEAR_DIM`, slice lengths mismatch, or a pivot is
+/// identically zero (singular system).
+pub fn solve_linear_system<A: Allocator + Copy>(
+    g: &mut ExprGraph<A>,
+    a_row_major: &[ExprId],
+    b: &[ExprId],
+    n: usize,
+) -> Result<Option<OwnVec<ExprId, A>>, AlgebraError> {
+    if n == 0 || n > MAX_LINEAR_DIM || a_row_major.len() != n * n || b.len() != n {
+        return Ok(None);
+    }
+    let alloc = g.alloc();
+    let mut mat: OwnVec<ExprId, A> = OwnVec::with_capacity_in(n * n, alloc);
+    for &e in a_row_major {
+        mat.push(e);
+    }
+    let mut rhs: OwnVec<ExprId, A> = OwnVec::with_capacity_in(n, alloc);
+    for &e in b {
+        rhs.push(e);
+    }
+
+    // Forward elimination with non-zero pivot selection.
+    for col in 0..n {
+        let mut pivot_row = None;
+        for row in col..n {
+            let entry = simplify_poly_expr(g, mat[row * n + col])?;
+            mat[row * n + col] = entry;
+            if g.node(entry)?.as_const() != Some(0.0) {
+                pivot_row = Some(row);
+                break;
+            }
+        }
+        let Some(prow) = pivot_row else {
+            return Ok(None);
+        };
+        if prow != col {
+            for k in col..n {
+                mat.swap(col * n + k, prow * n + k);
+            }
+            rhs.swap(col, prow);
+        }
+        let pivot = mat[col * n + col];
+        for row in (col + 1)..n {
+            let entry = simplify_poly_expr(g, mat[row * n + col])?;
+            if g.node(entry)?.as_const() == Some(0.0) {
+                continue;
+            }
+            let factor = g.div(entry, pivot);
+            mat[row * n + col] = g.lit(0.0);
+            for k in (col + 1)..n {
+                let prod = g.mul(factor, mat[col * n + k]);
+                let diff_e = g.sub(mat[row * n + k], prod);
+                mat[row * n + k] = simplify_poly_expr(g, diff_e)?;
+            }
+            let prod_b = g.mul(factor, rhs[col]);
+            let diff_b = g.sub(rhs[row], prod_b);
+            rhs[row] = simplify_poly_expr(g, diff_b)?;
+        }
+    }
+
+    // Back-substitution.
+    let zero = g.lit(0.0);
+    let mut x: OwnVec<ExprId, A> = OwnVec::with_capacity_in(n, alloc);
+    for _ in 0..n {
+        x.push(zero);
+    }
+    for i in (0..n).rev() {
+        let mut acc = rhs[i];
+        for j in (i + 1)..n {
+            let prod = g.mul(mat[i * n + j], x[j]);
+            acc = g.sub(acc, prod);
+        }
+        let raw = g.div(acc, mat[i * n + i]);
+        let poly_s = simplify_poly_expr(g, raw)?;
+        x[i] = simplify(g, poly_s)?;
+    }
+    Ok(Some(x))
+}
+
+/// Construct the simplified symbolic Newton-Raphson update expression `x - f(x) / f'(x)`.
+pub fn newton_step<A: Allocator + Copy>(
+    g: &mut ExprGraph<A>,
+    f: ExprId,
+    var: VarId,
+) -> Result<ExprId, AlgebraError> {
+    let df = diff(g, f, var)?;
+    let df = simplify_poly_expr(g, df)?;
+    let x = g.intern(Op::Var(var));
+    let ratio = g.div(f, df);
+    let step = g.sub(x, ratio);
+    simplify(g, step)
+}
+
+/// Options bounding deterministic Newton-Raphson root finding (`options-struct`, rule 83).
+#[derive(Clone, Copy, Debug)]
+pub struct NewtonOpts {
+    pub max_iters: u32,
+    pub tol: f64,
+}
+
+impl Default for NewtonOpts {
+    fn default() -> Self {
+        Self { max_iters: 32, tol: 1e-12 }
+    }
+}
+
+/// Named result of [`eval_newton`] (`newtypes-and-named-returns`, rule 85).
+#[derive(Clone, Copy, Debug)]
+pub struct NewtonResult {
+    pub root: f64,
+    pub residual: f64,
+    pub iterations: u32,
+    pub converged: bool,
+}
+
+/// Solve `f(var) = 0` deterministically via exact-derivative Newton-Raphson (`diff(f, var)`),
+/// keeping all other variables in `env` fixed.
+pub fn eval_newton<A: Allocator + Copy>(
+    g: &mut ExprGraph<A>,
+    f: ExprId,
+    var: VarId,
+    env: &[f64],
+    initial_guess: f64,
+    opts: NewtonOpts,
+) -> Result<NewtonResult, AlgebraError> {
+    let v_idx = var.0 as usize;
+    if v_idx >= env.len() {
+        return Err(AlgebraError::UnknownVar { var, env_len: env.len() });
+    }
+    let df = diff(g, f, var)?;
+    let df = simplify_poly_expr(g, df)?;
+    let mut cur_env: OwnVec<f64, A> = OwnVec::with_capacity_in(env.len(), g.alloc());
+    for &v in env {
+        cur_env.push(v);
+    }
+    let mut x = initial_guess;
+    for iter in 0..opts.max_iters {
+        cur_env[v_idx] = x;
+        let fx = g.eval(f, cur_env.as_slice())?;
+        if blaze_math::abs(fx) <= opts.tol {
+            return Ok(NewtonResult { root: x, residual: fx, iterations: iter, converged: true });
+        }
+        let dfx = g.eval(df, cur_env.as_slice())?;
+        if !dfx.is_finite() || blaze_math::abs(dfx) < 1e-15 {
+            return Ok(NewtonResult { root: x, residual: fx, iterations: iter, converged: false });
+        }
+        x -= fx / dfx;
+    }
+    cur_env[v_idx] = x;
+    let fx = g.eval(f, cur_env.as_slice())?;
+    let converged = blaze_math::abs(fx) <= opts.tol;
+    Ok(NewtonResult { root: x, residual: fx, iterations: opts.max_iters, converged })
 }

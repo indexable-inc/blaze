@@ -48,12 +48,17 @@ pub use diff::{
     AlgebraPlant, Dual, diff, eval_dual, grad, grad_reverse, grad_reverse_with_plant, hessian,
     jacobian, nth_diff, taylor,
 };
-pub use egraph::{EGraph, SimplifyOpts, SimplifyStats, expr_cost, simplify, simplify_with};
+pub use egraph::{
+    EGraph, PatNode, RewriteRule, SimplifyOpts, SimplifyStats, expr_cost, simplify, simplify_with,
+    simplify_with_rules,
+};
 pub use emit::{emit_rust_fn, emit_rust_multi_fn, format_expr};
 pub use poly::{
     Monomial, Poly, PolyError, PolyPlant, Rat, expr_to_poly, poly_to_expr, simplify_poly_expr,
 };
-pub use solve::{Solution, solve_for};
+pub use solve::{
+    NewtonOpts, NewtonResult, Solution, eval_newton, newton_step, solve_for, solve_linear_system,
+};
 
 /// Typed variable index inside an [`ExprGraph`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -138,6 +143,9 @@ pub enum Op {
     Sqrt(ExprId),
     Tanh(ExprId),
     Abs(ExprId),
+    /// Piecewise branch: `if cond > 0.0 { then_val } else { else_val }`.
+    /// Enables differentiable `relu`, `max`, `min`, `clamp`, and piecewise CAD/physics fields.
+    Select(ExprId, ExprId, ExprId),
 }
 
 impl Op {
@@ -331,6 +339,40 @@ impl<A: Allocator + Copy> ExprGraph<A> {
         self.intern(Op::Abs(a))
     }
 
+    /// Piecewise branch: `if cond > 0.0 { then_val } else { else_val }`.
+    #[inline]
+    pub fn select(&mut self, cond: ExprId, then_val: ExprId, else_val: ExprId) -> ExprId {
+        self.intern(Op::Select(cond, then_val, else_val))
+    }
+
+    /// Rectified linear unit `max(0, x) = select(x, x, 0)`.
+    #[inline]
+    pub fn relu(&mut self, x: ExprId) -> ExprId {
+        let z = self.lit(0.0);
+        self.select(x, x, z)
+    }
+
+    /// Differentiable piecewise maximum `select(a - b, a, b)`.
+    #[inline]
+    pub fn max_expr(&mut self, a: ExprId, b: ExprId) -> ExprId {
+        let c = self.sub(a, b);
+        self.select(c, a, b)
+    }
+
+    /// Differentiable piecewise minimum `select(b - a, a, b)`.
+    #[inline]
+    pub fn min_expr(&mut self, a: ExprId, b: ExprId) -> ExprId {
+        let c = self.sub(b, a);
+        self.select(c, a, b)
+    }
+
+    /// Differentiable piecewise clamp `min(max(x, lo), hi)`.
+    #[inline]
+    pub fn clamp_expr(&mut self, x: ExprId, lo: ExprId, hi: ExprId) -> ExprId {
+        let ge = self.max_expr(x, lo);
+        self.min_expr(ge, hi)
+    }
+
     fn const_of(&self, id: ExprId) -> Option<f64> {
         self.nodes.get(id.0 as usize).and_then(|op| op.as_const())
     }
@@ -485,6 +527,20 @@ impl<A: Allocator + Copy> ExprGraph<A> {
                 }
                 Op::Abs(a)
             }
+            Op::Select(c, t, e) => {
+                if t == e {
+                    if let Some(&top) = self.nodes.get(t.0 as usize) {
+                        return top;
+                    }
+                }
+                if let Some(cv) = self.const_of(c) {
+                    let chosen = if cv > 0.0 { t } else { e };
+                    if let Some(&cop) = self.nodes.get(chosen.0 as usize) {
+                        return cop;
+                    }
+                }
+                Op::Select(c, t, e)
+            }
             other => other,
         }
     }
@@ -532,6 +588,13 @@ impl<A: Allocator + Copy> ExprGraph<A> {
             Op::Sqrt(a) => blaze_math::sqrt(self.eval_memo(a, env, cache)?),
             Op::Tanh(a) => det_tanh(self.eval_memo(a, env, cache)?),
             Op::Abs(a) => blaze_math::abs(self.eval_memo(a, env, cache)?),
+            Op::Select(c, t, e) => {
+                if self.eval_memo(c, env, cache)? > 0.0 {
+                    self.eval_memo(t, env, cache)?
+                } else {
+                    self.eval_memo(e, env, cache)?
+                }
+            }
         };
         if let Some(slot) = cache.get_mut(idx) {
             *slot = Some(val);
@@ -628,6 +691,12 @@ impl<A: Allocator + Copy> ExprGraph<A> {
                 let sa = self.sub_memo(a, var, replacement, cache)?;
                 self.abs(sa)
             }
+            Op::Select(c, t, e) => {
+                let sc = self.sub_memo(c, var, replacement, cache)?;
+                let st = self.sub_memo(t, var, replacement, cache)?;
+                let se = self.sub_memo(e, var, replacement, cache)?;
+                self.select(sc, st, se)
+            }
         };
         if let Some(slot) = cache.get_mut(idx) {
             *slot = Some(out);
@@ -671,6 +740,11 @@ impl<A: Allocator + Copy> ExprGraph<A> {
                 Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) | Op::Div(a, b) | Op::Pow(a, b) => {
                     stack.push(a);
                     stack.push(b);
+                }
+                Op::Select(c, t, e) => {
+                    stack.push(c);
+                    stack.push(t);
+                    stack.push(e);
                 }
             }
         }
@@ -779,6 +853,31 @@ impl<'g, A: Allocator + Copy> Sym<'g, A> {
         let mut g = self.scope.graph.borrow_mut();
         let e = g.lit(exp);
         let id = g.pow(self.id, e);
+        Self { scope: self.scope, id }
+    }
+
+    pub fn select(self, then_val: Self, else_val: Self) -> Self {
+        let id = self.scope.graph.borrow_mut().select(self.id, then_val.id, else_val.id);
+        Self { scope: self.scope, id }
+    }
+
+    pub fn relu(self) -> Self {
+        let id = self.scope.graph.borrow_mut().relu(self.id);
+        Self { scope: self.scope, id }
+    }
+
+    pub fn max(self, other: Self) -> Self {
+        let id = self.scope.graph.borrow_mut().max_expr(self.id, other.id);
+        Self { scope: self.scope, id }
+    }
+
+    pub fn min(self, other: Self) -> Self {
+        let id = self.scope.graph.borrow_mut().min_expr(self.id, other.id);
+        Self { scope: self.scope, id }
+    }
+
+    pub fn clamp(self, lo: Self, hi: Self) -> Self {
+        let id = self.scope.graph.borrow_mut().clamp_expr(self.id, lo.id, hi.id);
         Self { scope: self.scope, id }
     }
 }

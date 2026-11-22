@@ -165,7 +165,7 @@ pub use deque::VecDeque;
 pub use error::AllocFailure;
 pub use fixed::{FixedString, FixedVec, Full, Inline, Overflow};
 pub use heap4::{Heap4, Heap4Plant};
-pub use make::{CloneIn, DefaultIn, FromIn, FromStrIn, IntoIn, ParseIn, Share};
+pub use make::{CloneIn, DefaultIn, FromIn, FromStrIn, IntoIn, LocalShare, ParseIn, Share};
 pub use packed::{Pack, Packed};
 pub use pod::{AnyBitPattern, CastError, CheckedBitPattern, NoUninit, Pod, TransparentWrapper, Zeroable};
 pub use raw::RawBuf;

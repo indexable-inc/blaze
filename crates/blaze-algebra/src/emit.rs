@@ -30,7 +30,8 @@ fn op_prec(op: Op) -> u8 {
         | Op::Ln(_)
         | Op::Sqrt(_)
         | Op::Tanh(_)
-        | Op::Abs(_) => 5,
+        | Op::Abs(_)
+        | Op::Select(_, _, _) => 5,
         Op::Pow(_, _) => 4,
         Op::Neg(_) => 3,
         Op::Mul(_, _) | Op::Div(_, _) => 2,
@@ -99,6 +100,15 @@ fn fmt_rec<A: Allocator + Copy>(
         Op::Sqrt(a) => fmt_call(g, "sqrt", a, out)?,
         Op::Tanh(a) => fmt_call(g, "tanh", a, out)?,
         Op::Abs(a) => fmt_call(g, "abs", a, out)?,
+        Op::Select(c, t, e) => {
+            out.push_str("select(");
+            fmt_rec(g, c, 0, out)?;
+            out.push_str(", ");
+            fmt_rec(g, t, 0, out)?;
+            out.push_str(", ");
+            fmt_rec(g, e, 0, out)?;
+            out.push(')');
+        }
     }
     if need_parens {
         out.push(')');
@@ -232,6 +242,9 @@ fn emit_ssa_body<A: Allocator + Copy>(
             Op::Abs(a) => {
                 let _ = write!(out, "blaze_math::abs(t{})", a.0);
             }
+            Op::Select(c, t, e) => {
+                let _ = write!(out, "if t{} > 0.0_f64 {{ t{} }} else {{ t{} }}", c.0, t.0, e.0);
+            }
         }
         out.push_str(";\n");
     }
@@ -276,6 +289,11 @@ fn collect_postorder<A: Allocator + Copy>(
         Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) | Op::Div(a, b) | Op::Pow(a, b) => {
             collect_postorder(g, a, visited, order)?;
             collect_postorder(g, b, visited, order)?;
+        }
+        Op::Select(c, t, e) => {
+            collect_postorder(g, c, visited, order)?;
+            collect_postorder(g, t, visited, order)?;
+            collect_postorder(g, e, visited, order)?;
         }
     }
     order.push(id);

@@ -9,7 +9,8 @@ use blaze_own::Alloc;
 
 use crate::{
     BodyAlgebraError, BodyPlant, MathEmitter, MathOp, MathResolver, NoMathCalls, diff_body,
-    diff_body_with_plant, eval_pure_body, grad_bodies, lift_body, simplify_body, splice_body,
+    diff_body_with_plant, eval_pure_body, eval_pure_multi_body, grad_bodies, lift_body,
+    simplify_body, splice_body, splice_multi_body, value_and_grad_body,
 };
 
 fn heap() -> Alloc<'static> {
@@ -73,7 +74,7 @@ fn build_rational_mir() -> Body<Alloc<'static>> {
     let l0 = b.new_local(LocalDecl { ty: f64_ty, kind: LocalKind::Return, mutbl: Mutbl::Mut });
     let lx = b.new_local(LocalDecl { ty: f64_ty, kind: LocalKind::Arg(0), mutbl: Mutbl::Not });
     let ly = b.new_local(LocalDecl { ty: f64_ty, kind: LocalKind::Arg(1), mutbl: Mutbl::Not });
-    let mut temp = |b: &mut BodyBuilder<_>, id: u32| {
+    let temp = |b: &mut BodyBuilder<_>, id: u32| {
         let l = b.new_local(LocalDecl {
             ty: f64_ty,
             kind: LocalKind::Temp(MirExprId(id), Role::Value),
@@ -292,4 +293,75 @@ fn blaze_sim_property_random_mir_bodies_diff_and_eval_match_dual_oracle() {
         }
         Ok(())
     });
+}
+
+#[test]
+fn value_and_grad_body_emits_single_verified_cse_mir_returning_array() {
+    // Build f(x, y) = sin(x * y) + exp(x - y) as a verified MIR body, then run
+    // `value_and_grad_body` to compile [f, df/dx, df/dy] into ONE verified CSE MIR body!
+    let mut g = ExprGraph::new_in(heap());
+    let (vx, ex) = g.var("x");
+    let (vy, ey) = g.var("y");
+    let xy = g.mul(ex, ey);
+    let sxy = g.sin(xy);
+    let xmy = g.sub(ex, ey);
+    let exmy = g.exp(xmy);
+    let root = g.add(sxy, exmy);
+
+    let orig = splice_body(&g, root, &[vx, vy], PTy(0), &TestMath, heap()).unwrap();
+    let v_orig = verify(&orig).unwrap();
+
+    let fused = value_and_grad_body(v_orig, PTy(1), &TestMath, &TestMath, heap()).unwrap();
+    let v_fused = verify(&fused).expect("fused value_and_grad MIR must verify");
+
+    // Verify against independent Dual oracle across multiple inputs.
+    for env in [[0.8, 1.3], [-0.4, 2.1], [1.7, -0.6]] {
+        let out = eval_pure_multi_body(v_fused, &env, &TestMath, heap()).unwrap();
+        assert_eq!(out.len(), 3);
+        let dx = eval_dual(&g, root, &env, vx).unwrap();
+        let dy = eval_dual(&g, root, &env, vy).unwrap();
+        assert!(close(out[0], dx.val, 1e-11), "f mismatch: {} vs {}", out[0], dx.val);
+        assert!(close(out[1], dx.deriv, 1e-11), "df/dx mismatch: {} vs {}", out[1], dx.deriv);
+        assert!(close(out[2], dy.deriv, 1e-11), "df/dy mismatch: {} vs {}", out[2], dy.deriv);
+    }
+
+    // Also verify `splice_multi_body` directly on multiple shared expressions.
+    let direct =
+        splice_multi_body(&g, &[root, xy, sxy], &[vx, vy], PTy(0), PTy(1), &TestMath, heap())
+            .unwrap();
+    let v_direct = verify(&direct).unwrap();
+    let vals = eval_pure_multi_body(v_direct, &[0.5, 2.0], &TestMath, heap()).unwrap();
+    assert_eq!(vals.len(), 3);
+    assert!(close(vals[1], 1.0, 1e-12));
+    assert!(close(vals[2], blaze_math::sin(1.0), 1e-12));
+}
+
+#[test]
+fn select_relu_and_max_splice_into_verified_switch_diamond_mir() {
+    // f(x, y) = relu(x * y) + max(x, y)
+    let mut g = ExprGraph::new_in(heap());
+    let (vx, ex) = g.var("x");
+    let (vy, ey) = g.var("y");
+    let xy = g.mul(ex, ey);
+    let r = g.relu(xy);
+    let m = g.max_expr(ex, ey);
+    let root = g.add(r, m);
+
+    let df_dx = blaze_algebra::diff(&mut g, root, vx).unwrap();
+
+    let mir_f = splice_body(&g, root, &[vx, vy], PTy(0), &TestMath, heap()).unwrap();
+    let v_f = verify(&mir_f).expect("Switch diamond MIR for f must verify");
+    // Two Op::Select nodes => at least 1 + 3 + 3 = 7 basic blocks!
+    assert!(v_f.blocks() >= 7, "expected >= 7 blocks for 2 Select diamonds, got {}", v_f.blocks());
+
+    let mir_dx = splice_body(&g, df_dx, &[vx, vy], PTy(0), &TestMath, heap()).unwrap();
+    let v_dx = verify(&mir_dx).expect("Switch diamond MIR for df/dx must verify");
+
+    for env in [[1.5, 2.0], [-1.5, 2.0], [2.5, -0.5], [-2.0, -3.0]] {
+        let dual = eval_dual(&g, root, &env, vx).unwrap();
+        let got_f = eval_pure_body(v_f, &env, &TestMath, heap()).unwrap();
+        let got_dx = eval_pure_body(v_dx, &env, &TestMath, heap()).unwrap();
+        assert!(close(got_f, dual.val, 1e-12), "f({env:?}): {got_f} vs {}", dual.val);
+        assert!(close(got_dx, dual.deriv, 1e-12), "df/dx({env:?}): {got_dx} vs {}", dual.deriv);
+    }
 }

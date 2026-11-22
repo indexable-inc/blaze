@@ -221,6 +221,14 @@ fn eval_dual_memo<A: Allocator + Copy>(
         Op::Sqrt(a) => eval_dual_memo(g, a, env, wrt, cache)?.sqrt(),
         Op::Tanh(a) => eval_dual_memo(g, a, env, wrt, cache)?.tanh(),
         Op::Abs(a) => eval_dual_memo(g, a, env, wrt, cache)?.abs(),
+        Op::Select(c, t, e) => {
+            let dc = eval_dual_memo(g, c, env, wrt, cache)?;
+            if dc.val > 0.0 {
+                eval_dual_memo(g, t, env, wrt, cache)?
+            } else {
+                eval_dual_memo(g, e, env, wrt, cache)?
+            }
+        }
     };
     if let Some(slot) = cache.get_mut(idx) {
         *slot = Some(d);
@@ -370,6 +378,11 @@ fn diff_memo<A: Allocator + Copy>(
             let du = diff_memo(g, u, wrt, plant, cache)?;
             let sign = g.div(u, id);
             g.mul(sign, du)
+        }
+        Op::Select(c, t, e) => {
+            let dt = diff_memo(g, t, wrt, plant, cache)?;
+            let de = diff_memo(g, e, wrt, plant, cache)?;
+            g.select(c, dt, de)
         }
     };
     if let Some(slot) = cache.get_mut(idx) {
@@ -556,6 +569,13 @@ pub fn grad_reverse_with_plant<A: Allocator + Copy>(
                 let c = g.mul(bar, sign);
                 accum(g, &mut adj, u, c);
             }
+            Op::Select(cond, t, e) => {
+                let z = g.lit(0.0);
+                let ct = g.select(cond, bar, z);
+                let ce = g.select(cond, z, bar);
+                accum(g, &mut adj, t, ct);
+                accum(g, &mut adj, e, ce);
+            }
         }
     }
 
@@ -599,6 +619,11 @@ fn collect_reachable_postorder<A: Allocator + Copy>(
         Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) | Op::Div(a, b) | Op::Pow(a, b) => {
             collect_reachable_postorder(g, a, visited, order)?;
             collect_reachable_postorder(g, b, visited, order)?;
+        }
+        Op::Select(c, t, e) => {
+            collect_reachable_postorder(g, c, visited, order)?;
+            collect_reachable_postorder(g, t, visited, order)?;
+            collect_reachable_postorder(g, e, visited, order)?;
         }
     }
     order.push(id);
