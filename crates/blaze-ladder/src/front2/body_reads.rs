@@ -127,7 +127,7 @@ pub struct ReadsDiff {
 pub const MOST_DIFF_ROWS: usize = 4;
 
 /// The item a question is about, if it names one.
-fn question_item(q: &tc::Question) -> Option<ItemKey> {
+pub(super) fn question_item(q: &tc::Question) -> Option<ItemKey> {
     use tc::Question as Q;
     match *q {
         Q::FnSig(k) | Q::Predicates(k) | Q::Adt(k) | Q::ImplsOf(k, _) | Q::ImplHeader(k) | Q::AssocItem(k, _) | Q::Const(k) | Q::Opaque(k) | Q::Attrs(k) | Q::TraitDef(k) | Q::AssocParent(k) => Some(k),

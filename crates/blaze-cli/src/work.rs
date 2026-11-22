@@ -1498,4 +1498,41 @@ mod tests {
         assert!(found[0].as_ref().is_err_and(|e| e.contains("climbs out")), "{found:?}");
         assert!(found[1].as_ref().is_err_and(|e| e.contains("absolute")), "{found:?}");
     }
+
+    /// Each file [`macro_module_files`] plans for `text` at `path`, with whether it is a slot.
+    fn macro_named(path: &str, owns_dir: bool, text: &str) -> std::vec::Vec<(std::string::String, bool)> {
+        let io = Io::simulated(SimWorld::new(1, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+        let frame = cx.frame();
+        let erased = blaze_own::Erased::new(frame);
+        let outline = blaze_file_items::outline(text, Edition::E2024, erased.handle());
+        let mut out = std::vec::Vec::new();
+        macro_module_files(path, owns_dir, text, &outline, erased.handle(), frame, &mut |file, slot, _| {
+            out.push((std::string::String::from_utf8(file.as_slice().to_vec()).expect("UTF-8"), slot));
+        });
+        out
+    }
+
+    /// A `mod` a macro call's tokens hold is at the file a `mod` written where the call stands
+    /// would be (rustc_expand module.rs: the expansion's module directory and ownership): beside
+    /// a crate root, in `x/` for an `x.rs` module, under the call's enclosing inline modules and
+    /// then those in the tokens, a `#[path]` relative to the file's directory when no inline module
+    /// encloses it. Not planned: an `include!` (its file is the include's), a call in a body, a
+    /// `#[path]` out of the checkout, a computed name.
+    #[test]
+    fn a_macro_call_s_mods_name_the_files_its_expansion_reads() {
+        let root = "cfg_block! {\n    #[cfg(unix)] { mod unix; }\n    #[cfg(windows)] { mod windows; }\n}\n\
+                    mod inl { m! { mod c; mod t { #[path = \"q.rs\"] mod d; } } }\n\
+                    m!(#[path = \"p.rs\"] mod e;);\nm! { #[path = \"../../out.rs\"] mod z; mod $n; }\n\
+                    include!(\"mod_g.rs\");\nfn f() { m! { mod in_body; } }\n";
+        let want = [("src/unix.rs", true), ("src/windows.rs", true), ("src/inl/c.rs", true), ("src/inl/t/q.rs", false), ("src/p.rs", false)];
+        let found = macro_named("src/lib.rs", true, root);
+        assert_eq!(found.iter().map(|(f, s)| (f.as_str(), *s)).collect::<std::vec::Vec<_>>(), want);
+
+        let found = macro_named("src/io.rs", false, "cfg_if! { if #[cfg(unix)] { mod unix; } else { #[path = \"w.rs\"] mod win; } }\n");
+        assert_eq!(found.iter().map(|(f, s)| (f.as_str(), *s)).collect::<std::vec::Vec<_>>(), [("src/io/unix.rs", true), ("src/w.rs", false)]);
+
+        let found = macro_named("core/io/mod.rs", true, "cfg_block! { #[cfg(all(target_family = \"unix\", not(miri)))] { mod unix; pub use unix::UnixIO; } }\n");
+        assert_eq!(found.iter().map(|(f, s)| (f.as_str(), *s)).collect::<std::vec::Vec<_>>(), [("core/io/unix.rs", true)]);
+    }
 }

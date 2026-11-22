@@ -9,14 +9,14 @@ use std::string::{String as StdString, ToString};
 use std::vec;
 use std::vec::Vec as StdVec;
 
-use blaze_manifest::layout::DepKind;
+use blaze_manifest::layout::{DepKind, ExtraKind};
 use blaze_manifest::lock::{Lock, LockId};
 use blaze_own::{Alloc, String, Vec};
 use blaze_sim::{Broke, Config, Tape};
 use edition::{Edition, PackageEdition};
 
 use crate::input::{Ask, Bin, CfgAtom, Dep, DepSource, FeatureDef, FeatureValue, Lib, Package, Platform, Resolver, TargetDesc};
-use crate::{Pass, Plant, Resolution, UnitError, UnitGraph, UnitKind, record};
+use crate::{Extra, LeftOutKind, Pass, Plant, Resolution, UnitError, UnitGraph, UnitKind, record};
 
 /// tempo-primitives and reth-codecs in miniature: dev-dependency unification (src/tests/dev_unify.rs).
 mod dev_unify;
@@ -101,6 +101,8 @@ struct P {
     proc_macro: bool,
     /// Each binary's name and its `required-features`.
     bins: StdVec<(StdString, StdVec<StdString>)>,
+    /// Each integration test, example or bench: its kind, name and `required-features`.
+    extras: StdVec<(ExtraKind, StdString, StdVec<StdString>)>,
     build: bool,
     edition: Edition,
     features: StdVec<(StdString, StdVec<StdString>)>,
@@ -117,6 +119,7 @@ fn pkg(name: &str) -> P {
         lib: true,
         proc_macro: false,
         bins: StdVec::new(),
+        extras: StdVec::new(),
         build: false,
         edition: Edition::Edition2021,
         features: StdVec::new(),
@@ -145,6 +148,11 @@ impl P {
     /// A binary with `required-features = [..]`.
     fn bin_requiring(mut self, name: &str, required: &[&str]) -> P {
         self.bins.push((name.to_owned(), required.iter().map(|f| (*f).to_owned()).collect()));
+        self
+    }
+    /// An integration test, example or bench with `required-features = [..]`.
+    fn extra_requiring(mut self, kind: ExtraKind, name: &str, required: &[&str]) -> P {
+        self.extras.push((kind, name.to_owned(), required.iter().map(|f| (*f).to_owned()).collect()));
         self
     }
     fn build(mut self) -> P {
@@ -210,12 +218,26 @@ impl P {
             }
             bins.push(Bin { name: t(b), root: t(&format!("src/bin/{b}.rs")), required_features });
         }
+        let mut extras = Vec::new_in(a());
+        for (kind, name, required) in self.extras.iter() {
+            let mut required_features = Vec::new_in(a());
+            for f in required.iter() {
+                required_features.push(t(f));
+            }
+            required_features.sort_by(|x: &String<Alloc<'static>>, y: &String<Alloc<'static>>| x.as_str().cmp(y.as_str()));
+            let dir = match kind {
+                ExtraKind::Test => "tests",
+                ExtraKind::Example => "examples",
+                ExtraKind::Bench => "benches",
+            };
+            extras.push(Extra { kind: *kind, name: t(name), root: t(&format!("{dir}/{name}.rs")), harness: true, test: *kind == ExtraKind::Test, required_features });
+        }
         Package {
             name: t(&self.name),
             edition: PackageEdition { syntax: self.edition, blaze: None },
             lib: self.lib.then(|| Lib { crate_name: t(&self.name.replace('-', "_")), root: t("src/lib.rs"), proc_macro: self.proc_macro }),
             bins,
-            extras: Vec::new_in(a()),
+            extras,
             build: self.build.then(|| t("build.rs")),
             links: None,
             features,
@@ -467,6 +489,63 @@ fn required_features_skip_a_binary() {
     assert_eq!(bins(&on, &["nix/signal"]).len(), 1, "nix lacks `signal`: the binary is skipped");
     let signal = Opts { features: vec!["localnet".to_owned(), "nix/signal".to_owned()], ..opts(Resolver::V2) };
     assert_eq!(bins(&signal, &["nix/signal"]).len(), 2, "nix has `signal`: the binary is a unit");
+}
+
+/// An integration test, example or bench whose `required-features` are not all on is no unit
+/// and is said (the Cargo Book, "Cargo Targets", "The `required-features` field": "If any of
+/// the required features are not enabled, the target will be skipped."). turso in miniature
+/// (c1814): `core`'s bench `logical_log_serialization` requires `bench`, bindings/rust's
+/// example `sync_example` requires `sync`; both were checked without them. TWIN: with
+/// `--features bench,sync` both are units and nothing is left out. CONTROL: a target with no
+/// `required-features` beside them is a unit either way, and the binary rule says its own
+/// skip too. The record holds the left-out list: decode gives it back equal.
+#[test]
+fn required_features_skip_a_test_example_or_bench_and_say_so() {
+    let world = [pkg("turso")
+        .member()
+        .feature("bench", &[])
+        .feature("sync", &[])
+        .bin_requiring("turso-sync", &["sync"])
+        .extra_requiring(ExtraKind::Bench, "logical_log_serialization", &["bench"])
+        .extra_requiring(ExtraKind::Example, "sync_example", &["sync"])
+        .extra_requiring(ExtraKind::Example, "both", &["sync", "bench"])
+        .extra_requiring(ExtraKind::Test, "plain", &[])];
+    let tests = Opts { tests: true, ..opts(Resolver::V2) };
+    let graph = solve(&world, &tests).unwrap_or_else(|e| panic!("{e}"));
+    let extras: StdVec<StdString> = lines(&graph).into_iter().filter(|l| l.contains("integration-test:") || l.contains("example:") || l.contains("bench:")).collect();
+    assert_eq!(extras, vec!["turso 1.0.0 integration-test:plain target [] -> turso=turso".to_string()], "only the target with nothing required");
+    let said: StdVec<(LeftOutKind, &str, StdVec<&str>)> =
+        graph.left_out.iter().map(|l| (l.kind, l.name.as_str(), l.off.iter().map(|f| f.as_str()).collect())).collect();
+    assert_eq!(
+        said,
+        vec![
+            (LeftOutKind::Bin, "turso-sync", vec!["sync"]),
+            (LeftOutKind::Example, "both", vec!["bench", "sync"]),
+            (LeftOutKind::Example, "sync_example", vec!["sync"]),
+            (LeftOutKind::Bench, "logical_log_serialization", vec!["bench"]),
+        ],
+        "each skip is said, with what is off"
+    );
+    let note = graph.left_out[3].to_string();
+    assert!(note.contains("bench target `logical_log_serialization` of package `turso`") && note.contains("`bench` is not enabled"), "{note}");
+    let two = graph.left_out[1].to_string();
+    assert!(two.contains("required features `bench`, `sync` are not enabled"), "{two}");
+    let bytes = record::encode(&graph, &tests.target, &mac(), a()).expect("its own cfg");
+    let back = record::decode(&bytes, a()).expect("the record decodes");
+    assert_eq!(back.graph.left_out, graph.left_out, "the record holds the left-out targets");
+
+    let on = Opts { features: vec!["bench".to_owned(), "sync".to_owned()], ..tests.clone() };
+    let graph = solve(&world, &on).unwrap_or_else(|e| panic!("{e}"));
+    let made: StdVec<StdString> = lines(&graph).into_iter().filter(|l| l.contains("example:") || l.contains("bench:") || l.contains(" bin:")).collect();
+    assert_eq!(made.len(), 4, "TWIN: with the features on every target is a unit: {made:?}");
+    assert!(graph.left_out.is_empty(), "TWIN: nothing is left out: {:?}", graph.left_out);
+    // A required name the package lacks is the package's error, never a skip.
+    let wrong = [pkg("turso").member().extra_requiring(ExtraKind::Bench, "b", &["no-such"])];
+    match solve(&wrong, &tests) {
+        Err(UnitError::NoSuchFeature { feature, asked_by, .. }) => assert_eq!((feature.as_str(), asked_by.as_str()), ("no-such", "the required-features of bench b")),
+        Err(e) => panic!("another error: {e}"),
+        Ok(g) => panic!("an unknown required feature was skipped quietly: {:?}", lines(&g)),
+    }
 }
 
 /// Rule 1: `x?/f` does not turn `x` on; when `x` is on for another reason, `f` follows.

@@ -221,6 +221,15 @@ pub enum ParentError {
     /// The walk forward from the roots stepped `most` functions the program has not called and
     /// did not reach `symbol` (rule 18).
     TooFar { symbol: [u8; 32], most: usize },
+    /// A made entry was handed to the parent ([`Lazy::made`]) and no row of it waits for one (a
+    /// bug of the relay, D194).
+    NothingAsked,
+    /// The walk began the row of `symbol` while the row of `asked` waits for its code: one
+    /// child asks one make at a time (D194; a bug of [`Lazy`]).
+    TwoAsked { symbol: [u8; 32], asked: [u8; 32] },
+    /// The row of `symbol` was to be served under [`Codes::Pooled`] before its code (and its
+    /// statics') came: the ready pass steps them first (a bug of [`Lazy::publication`]).
+    NotReady { symbol: [u8; 32] },
 }
 
 impl fmt::Display for ParentError {
@@ -288,6 +297,9 @@ impl fmt::Display for ParentError {
             ParentError::StartList(why) => write!(f, "{rule}: {why}"),
             ParentError::RecordName { record } => write!(f, "{rule}: the record id {} is not a file name of `{RECORDS}`", Hex(record)),
             ParentError::TooFar { symbol, most } => write!(f, "{rule}: the walk forward from the roots stepped {most} functions the program has not called and did not reach symbol {}", Hex(symbol)),
+            ParentError::NothingAsked => write!(f, "{rule}: a made entry was handed back and no row waits for one (run_parent.rs `Lazy::made`, D194)"),
+            ParentError::TwoAsked { symbol, asked } => write!(f, "{rule}: the row of symbol {} was begun while the row of symbol {} waits for its code: one make at a time a child (run_parent.rs `Lazy`, D194)", Hex(symbol), Hex(asked)),
+            ParentError::NotReady { symbol } => write!(f, "{rule}: the row of symbol {} was to be served before its code came (run_parent.rs `Lazy::publication`'s ready pass, D194)", Hex(symbol)),
         }
     }
 }
@@ -389,6 +401,33 @@ pub(crate) enum Resolved<'r> {
     /// No function of the program by that symbol: the need is answered `Failed` with
     /// `Failure::Unresolved`, naming it.
     Unknown,
+    /// Not answered yet: a row on the way waits for its code, made off the command thread
+    /// ([`Codes::Pooled`], D194; [`Lazy::asked`]). The need is not taken: it is asked again once
+    /// the code came ([`Lazy::made`]), and nothing of it was told.
+    Waiting,
+}
+
+/// Where a [`Lazy`]'s code is made (D194, rule 78: the one seam, each tested equal): on the
+/// command thread inside the step (`Serial`, `blaze run`'s and today's), or by a worker of the
+/// command's pool while the command thread only relays (`Pooled`: the walk begins the row,
+/// [`Lazy::asked`] says what to make, [`Lazy::made`] finishes it).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Codes {
+    Serial,
+    Pooled,
+}
+
+/// The make a [`Lazy`] waits for under [`Codes::Pooled`]: what a worker needs, all copied or
+/// `Copy` (the walk and the store stay on the command thread).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Ask<'w> {
+    /// The key the entry is put under; `None`: unkeyed, made for this ask alone.
+    pub key: Option<CodeKey>,
+    pub order: body_ids::Order,
+    /// The row's instance name (body_ids.rs `Walk::name`).
+    pub name: &'w [u8],
+    /// The gate's proof for the row's fn, which the make takes (D163).
+    pub proof: Runnable,
 }
 
 /// The seam a need asks through for a symbol [`Needs`] has not resolved yet. [`Needs`] asks it
@@ -914,6 +953,28 @@ pub(crate) struct Lazy<'r, 'a, F: Front, D: Folder> {
     tally: Tally,
     /// Whether, and for what, the front end was built ([`ensure`]'s first build).
     built: Built,
+    /// Where the code is made ([`Lazy::make_by`]; `Serial` from [`Lazy::new`]).
+    codes: Codes,
+    /// Under `Pooled`: the one row begun and waiting for its code ([`Lazy::asked`]).
+    asked: Option<Asked>,
+    /// Under `Pooled`: the rows the forward walk stepped for the need at hand, kept across
+    /// its waits so the bound [`MOST_WALKED`] is the need's, not each try's.
+    walked: usize,
+    /// Under `Pooled`: the ready pass's work list (a row's statics, then theirs), reused.
+    readying: AVec<'a, usize>,
+}
+
+/// The row begun under [`Codes::Pooled`], its proof and symbol: what [`Lazy::made`] finishes.
+struct Asked {
+    pending: body_ids::Pending,
+    proof: Runnable,
+    symbol: [u8; 32],
+}
+
+/// What one step under either [`Codes`] did: stepped, or begun and waiting for its code.
+enum Took {
+    Stepped(Stepped),
+    Begun,
 }
 
 /// A row of the walk, by its index: the one id [`Ahead`] and [`Cleared`] name a row by.
@@ -1020,7 +1081,76 @@ impl<'r, 'a, F: Front, D: Folder> Lazy<'r, 'a, F, D> {
             named: Vec::new_in(alloc),
             tally: Tally::default(),
             built: Built::No,
+            codes: Codes::Serial,
+            asked: None,
+            walked: 0,
+            readying: Vec::new_in(alloc),
         }
+    }
+
+    /// Where this parent's code is made from now on (before its first need).
+    pub(crate) fn make_by(&mut self, codes: Codes) {
+        self.codes = codes;
+    }
+
+    /// Under [`Codes::Pooled`]: the make the last [`Resolved::Waiting`] waits for; `None` when
+    /// no row waits.
+    pub(crate) fn asked(&self) -> Option<Ask<'_>> {
+        let asked = self.asked.as_ref()?;
+        let started = self.started.as_ref()?;
+        let row = asked.pending.row();
+        Some(Ask { key: asked.pending.key(), order: asked.pending.order(), name: started.walk.name(row), proof: asked.proof })
+    }
+
+    /// The code the waiting row asked for came: `entry`, made by a worker ([`body_ids::Order::make`]).
+    /// The walk finishes the row (puts the entry under its key, reaches what it declares), and
+    /// the row is kept to be served when its need is asked again, as a row stepped ahead is.
+    pub(crate) fn made(&mut self, entry: &[u8]) -> Result<(), ParentError> {
+        let Asked { pending, symbol, .. } = self.asked.take().ok_or(ParentError::NothingAsked)?;
+        let started = self.started.as_mut().ok_or(ParentError::NothingAsked)?;
+        let row = pending.row();
+        let one = started.walk.finish::<RunError>(pending, entry, &mut *self.store, self.front.form(), MOST_WALKED, &mut started.scratch).map_err(|why| ParentError::Walk { symbol, why })?;
+        let stepped = match one.stepped {
+            body_ids::Stepped::Found(key) => Stepped::Found(key),
+            body_ids::Stepped::Made(key) => Stepped::Made(Made::Put(key)),
+            body_ids::Stepped::Unkeyed(unkeyed) => Stepped::Made(Made::Unkeyed(unkeyed)),
+        };
+        say_how(&self.cx.span(FIRST_CALL_SPAN), &self.front, stepped);
+        let kept = match stepped {
+            Stepped::Found(key) => Ahead::Found { row: WalkRow(row), key },
+            Stepped::Made(made) => {
+                let mut kept: AVec<'_, u8> = Vec::new_in(self.alloc);
+                kept.extend_from_slice(entry);
+                Ahead::Made { row: WalkRow(row), made, entry: kept }
+            }
+        };
+        self.ahead.push(kept);
+        Ok(())
+    }
+
+    /// The code the waiting row asked for was refused (`why`, the worker's): the row is given
+    /// back, waiting again, and the refusal is the parent's error naming its symbol, as the
+    /// serial step's would be.
+    pub(crate) fn unmade(&mut self, why: WalkError<RunError>) -> ParentError {
+        let Some(symbol) = self.asked.as_ref().map(|asked| asked.symbol) else { return ParentError::NothingAsked };
+        match self.withdraw() {
+            Ok(()) => ParentError::Walk { symbol, why },
+            Err(lost) => lost,
+        }
+    }
+
+    /// The waiting row's code will not come (its ask was late, or refused to another child):
+    /// the row is given back, waiting again, so the walk holds no row begun.
+    pub(crate) fn withdraw(&mut self) -> Result<(), ParentError> {
+        let Asked { pending, symbol, .. } = self.asked.take().ok_or(ParentError::NothingAsked)?;
+        let started = self.started.as_mut().ok_or(ParentError::NothingAsked)?;
+        started.walk.abandon::<RunError>(pending).map_err(|why| ParentError::Walk { symbol, why })
+    }
+
+    /// The roots this parent's walk started from, once it started: what a worker's maker is
+    /// made of (D194: the same maker the serial step would use, `Front::maker`).
+    pub(crate) fn start(&self) -> Option<&F::Start> {
+        self.started.as_ref().map(|started| &started.start)
     }
 
     /// The start's head from the roots (made now if they are not yet).
@@ -1165,9 +1295,21 @@ fn clear<F: Front>(front: &mut F, started: &mut Started<'_, F::Start, F::Ids, F:
 }
 
 /// ONE step of the walk for the row `cleared` names, under its proof: the body ids and the
-/// maker made if they are not yet, then `Walk::one` in its span, whose event says how it was
-/// answered. The only caller of `Walk::one`.
-fn step<F: Front>(cx: &Cx, front: &mut F, started: &mut Started<'_, F::Start, F::Ids, F::Maker>, store: &mut dyn CodeStore, builder: &Builder, cleared: Cleared) -> Result<Stepped, ParentError> {
+/// maker made if they are not yet, then, under [`Codes::Serial`], `Walk::one` in its span, whose
+/// event says how it was answered (the only caller of `Walk::one`); under [`Codes::Pooled`],
+/// `Walk::begin`: a row found is answered the same, and a row to be made is kept in `asked`
+/// for a worker ([`Took::Begun`]), its event said when its code comes ([`Lazy::made`]).
+#[expect(clippy::too_many_arguments, reason = "the resolver's parts, borrowed apart")]
+fn step<F: Front>(
+    cx: &Cx,
+    front: &mut F,
+    started: &mut Started<'_, F::Start, F::Ids, F::Maker>,
+    store: &mut dyn CodeStore,
+    builder: &Builder,
+    codes: Codes,
+    asked: &mut Option<Asked>,
+    cleared: Cleared,
+) -> Result<Took, ParentError> {
     // The proof was derived from this row by its maker (`Cleared::gated`, `Cleared::placed`):
     // it is this row's body's, by construction, and nothing here compares it again (rule 74).
     // The make takes it (D163): no instance is made without the gate's proof in hand.
@@ -1178,18 +1320,42 @@ fn step<F: Front>(cx: &Cx, front: &mut F, started: &mut Started<'_, F::Start, F:
     let path = if front.watch().paths() { front.path_of(tabled) } else { None };
     front.watch().see(Step::Resolving { path: path.as_deref() });
     let cx = cx.span(FIRST_CALL_SPAN);
-    let one = started
-        .walk
-        .one(row, &heavy.ids, store, builder, &builder.producer, &mut heavy.maker, &proof, front.form(), MOST_WALKED, &mut started.scratch)
-        .map_err(|why| ParentError::Walk { symbol, why })?;
+    let one = match codes {
+        Codes::Serial => {
+            started
+                .walk
+                .one(row, &heavy.ids, store, builder, &builder.producer, &mut heavy.maker, &proof, front.form(), MOST_WALKED, &mut started.scratch)
+                .map_err(|why| ParentError::Walk { symbol, why })?
+                .stepped
+        }
+        Codes::Pooled => {
+            if let Some(waiting) = asked.as_ref() {
+                return Err(ParentError::TwoAsked { symbol, asked: waiting.symbol });
+            }
+            match started.walk.begin::<RunError>(row, &heavy.ids, store, builder, &builder.producer, front.form(), MOST_WALKED, &mut started.scratch).map_err(|why| ParentError::Walk { symbol, why })? {
+                body_ids::Begun::Stepped(one) => one.stepped,
+                body_ids::Begun::Make(pending) => {
+                    *asked = Some(Asked { pending, proof, symbol });
+                    return Ok(Took::Begun);
+                }
+            }
+        }
+    };
     // Total: a step's answer carries its key in the variant (body_ids.rs `Stepped`), and is
     // never waiting.
-    let stepped = match one.stepped {
+    let stepped = match one {
         body_ids::Stepped::Found(key) => Stepped::Found(key),
         body_ids::Stepped::Made(key) => Stepped::Made(Made::Put(key)),
         body_ids::Stepped::Unkeyed(unkeyed) => Stepped::Made(Made::Unkeyed(unkeyed)),
     };
-    cx.event(match stepped {
+    say_how(&cx, front, stepped);
+    Ok(Took::Stepped(stepped))
+}
+
+/// How a row was answered, as an event of `span` (its first call's, [`FIRST_CALL_SPAN`]) and
+/// to the watch: the one place both [`Codes`] say it.
+fn say_how<F: Front>(span: &Cx, front: &F, stepped: Stepped) {
+    span.event(match stepped {
         Stepped::Found(_) => HOW_FOUND,
         Stepped::Made(Made::Put(_)) => HOW_MADE,
         Stepped::Made(Made::Unkeyed(Unkeyed::NoRecord)) => HOW_NO_RECORD,
@@ -1200,11 +1366,25 @@ fn step<F: Front>(cx: &Cx, front: &mut F, started: &mut Started<'_, F::Start, F:
         Stepped::Made(Made::Put(_)) => Answered::Made,
         Stepped::Made(Made::Unkeyed(_)) => Answered::Unkeyed,
     }));
-    Ok(stepped)
 }
 
-/// Row `row` served once: gated and stepped now if it is waiting, else taken from what its step
-/// ahead answered (`twice`: the refusal when it is neither, a row served already).
+/// The row `row` as [`step`] answered it, kept to be served at its own first call ([`Ahead`]):
+/// a made entry copied out of the scratch (the next step's).
+fn ahead_of_step<'a>(row: usize, stepped: Stepped, scratch: &Scratch<'_>, alloc: Alloc<'a>) -> Ahead<'a> {
+    match stepped {
+        Stepped::Found(key) => Ahead::Found { row: WalkRow(row), key },
+        Stepped::Made(made) => {
+            let mut entry: AVec<'_, u8> = Vec::new_in(alloc);
+            entry.extend_from_slice(scratch.made());
+            Ahead::Made { row: WalkRow(row), made, entry }
+        }
+    }
+}
+
+/// Row `row` served once: gated and stepped now if it is waiting (under [`Codes::Serial`]; under
+/// `Pooled` the ready pass stepped it before, so a waiting row here is [`ParentError::NotReady`]),
+/// else taken from what its step ahead answered (`twice`: the refusal when it is neither, a row
+/// served already).
 #[expect(clippy::too_many_arguments, reason = "the resolver's parts, borrowed apart")]
 fn serve<'a, F: Front>(
     cx: &Cx,
@@ -1212,15 +1392,21 @@ fn serve<'a, F: Front>(
     started: &mut Started<'a, F::Start, F::Ids, F::Maker>,
     store: &mut dyn CodeStore,
     builder: &Builder,
+    codes: Codes,
     ahead: &mut AVec<'a, Ahead<'a>>,
     row: usize,
     twice: ParentError,
 ) -> Result<Served<'a>, ParentError> {
     if started.walk.how(row) == How::Waiting {
+        if codes == Codes::Pooled {
+            return Err(ParentError::NotReady { symbol: started.walk.symbol(row).0 });
+        }
         let cleared = clear(front, started, row)?;
-        return Ok(match step(cx, front, started, store, builder, cleared)? {
-            Stepped::Found(key) => Served::Found(key),
-            Stepped::Made(made) => Served::MadeNow(made),
+        return Ok(match step(cx, front, started, store, builder, Codes::Serial, &mut None, cleared)? {
+            Took::Stepped(Stepped::Found(key)) => Served::Found(key),
+            Took::Stepped(Stepped::Made(made)) => Served::MadeNow(made),
+            // `Serial` makes inside the step: it never begins a row.
+            Took::Begun => return Err(ParentError::NotReady { symbol: started.walk.symbol(row).0 }),
         });
     }
     let Some(i) = ahead.iter().position(|one| one.row() == WalkRow(row)) else { return Err(twice) };
@@ -1228,6 +1414,52 @@ fn serve<'a, F: Front>(
         Ahead::Found { key, .. } => Served::Found(key),
         Ahead::Made { made, entry, .. } => Served::MadeAhead(made, entry),
     })
+}
+
+/// THE READY PASS, under [`Codes::Pooled`], before `row` is served: the row, then the statics
+/// its answer will tell (the statics loop's own closure: each declared static or thread-local
+/// not in `told`, then each of theirs), stepped in that order if waiting, each kept in `ahead`,
+/// so the serve after it makes nothing on the command thread. `told` is only read: the serve
+/// tells them. `false`: a row was begun and waits for its code ([`Lazy::asked`]).
+#[expect(clippy::too_many_arguments, reason = "the resolver's parts, borrowed apart")]
+fn ready<'a, F: Front>(
+    cx: &Cx,
+    front: &mut F,
+    started: &mut Started<'a, F::Start, F::Ids, F::Maker>,
+    store: &mut dyn CodeStore,
+    builder: &Builder,
+    asked: &mut Option<Asked>,
+    ahead: &mut AVec<'a, Ahead<'a>>,
+    told: &[[u8; 32]],
+    readying: &mut AVec<'_, usize>,
+    row: usize,
+    alloc: Alloc<'a>,
+) -> Result<bool, ParentError> {
+    readying.clear();
+    readying.push(row);
+    let mut next = 0;
+    while next < readying.len() {
+        let at = readying[next];
+        next += 1;
+        if started.walk.how(at) == How::Waiting {
+            let cleared = clear(front, started, at)?;
+            match step(cx, front, started, store, builder, Codes::Pooled, asked, cleared)? {
+                Took::Stepped(stepped) => ahead.push(ahead_of_step(at, stepped, &started.scratch, alloc)),
+                Took::Begun => return Ok(false),
+            }
+        }
+        // Done now (stepped here, kept ahead, or served before): its declared rows are read.
+        for &callee in started.walk.declared(at) {
+            let callee = callee as usize;
+            if matches!(started.walk.kind(callee), RowKind::Static | RowKind::ThreadLocal)
+                && told.binary_search(&started.walk.symbol(callee).0).is_err()
+                && !readying.contains(&callee)
+            {
+                readying.push(callee);
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// The entry `served` answered: the store's under its key, the scratch's (made now), or the one
@@ -1289,7 +1521,17 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
     }
 
     fn publication(&mut self, symbol: &Symbol, values: &mut AVec<'_, u8>) -> Result<Resolved<'_>, ParentError> {
-        let Lazy { cx, front, folder, store, builder, alloc, started, placed, declares, ahead, told, data, statics, named, tally, built } = self;
+        let Lazy { cx, front, folder, store, builder, alloc, started, placed, declares, ahead, told, data, statics, named, tally, built, codes, asked, walked, readying } = self;
+        let codes = *codes;
+        // A row waits for its code: nothing more is stepped until it comes (one make at a time).
+        if asked.is_some() {
+            return Ok(Resolved::Waiting);
+        }
+        // The forward walk's bound is the need's: under `Pooled` it is kept across the need's
+        // waits, and set back once the need is reached or unknown.
+        if codes == Codes::Serial {
+            *walked = 0;
+        }
         // The profile's why (rule 16): the first need that built the front end, by its symbol.
         if started.is_none() && *built == Built::No {
             *built = Built::Need { symbol: symbol.0 };
@@ -1310,7 +1552,9 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
             if started.walk.how(at) == How::Waiting
                 && let Some(cleared) = Cleared::placed(&started.walk, placed.as_slice(), at)
             {
-                step(cx, front, started, &mut **store, &builder, cleared)?;
+                if let Took::Begun = step(cx, front, started, &mut **store, &builder, codes, asked, cleared)? {
+                    return Ok(Resolved::Waiting);
+                }
                 row = started.walk.row_of(&code);
             }
             at += 1;
@@ -1349,37 +1593,38 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
         // roots, stepping each row still waiting in walk order, at most `MOST_WALKED`, until the
         // walk declares it. Each is kept to be served at its own first call ([`Ahead`]).
         // `Unknown` is left for a symbol no record declares.
-        let mut stepped = 0;
         let mut at = 0;
         while row.is_none() && at < started.walk.len() {
             if started.walk.how(at) == How::Waiting {
-                if stepped == MOST_WALKED {
+                if *walked == MOST_WALKED {
                     return Err(ParentError::TooFar { symbol: symbol.0, most: MOST_WALKED });
                 }
-                stepped += 1;
+                *walked += 1;
                 let cleared = clear(front, started, at)?;
-                let one = match step(cx, front, started, &mut **store, &builder, cleared)? {
-                    Stepped::Found(key) => Ahead::Found { row: WalkRow(at), key },
-                    Stepped::Made(made) => {
-                        let mut entry: AVec<'_, u8> = Vec::new_in(*alloc);
-                        entry.extend_from_slice(started.scratch.made());
-                        Ahead::Made { row: WalkRow(at), made, entry }
-                    }
-                };
-                ahead.push(one);
+                match step(cx, front, started, &mut **store, &builder, codes, asked, cleared)? {
+                    Took::Stepped(stepped) => ahead.push(ahead_of_step(at, stepped, &started.scratch, *alloc)),
+                    // Its code comes later ([`Lazy::made`] keeps it ahead); the walk goes on then.
+                    Took::Begun => return Ok(Resolved::Waiting),
+                }
                 row = started.walk.row_of(&code);
             }
             at += 1;
         }
+        *walked = 0;
         let Some(row) = row else { return Ok(Resolved::Unknown) };
         // A static or a thread-local is no call target: its symbol is never a need (the child
         // binds its word).
         if matches!(started.walk.kind(row), RowKind::Static | RowKind::ThreadLocal) {
             return Ok(Resolved::Unknown);
         }
+        // Under `Pooled`, nothing is made below: the row and the statics its answer tells are
+        // stepped first, each kept ahead, and a row begun waits for its code.
+        if codes == Codes::Pooled && !ready(cx, front, started, &mut **store, &builder, asked, ahead, told.as_slice(), readying, row, *alloc)? {
+            return Ok(Resolved::Waiting);
+        }
         // A row stepped ahead is served once, from what its step answered; any other row that is
         // not waiting was served already.
-        let served = serve(cx, front, started, &mut **store, &builder, ahead, row, ParentError::ResolvedTwice { symbol: symbol.0 })?;
+        let served = serve(cx, front, started, &mut **store, &builder, codes, ahead, row, ParentError::ResolvedTwice { symbol: symbol.0 })?;
         let entry = entry_of(&served, &**store, &started.scratch, symbol.0)?;
         let record = front.record_of(entry).map_err(|why| ParentError::Entry { symbol: symbol.0, why })?;
         prepare_publication(&mut *front, started.start.head().personality, Some(started.walk.tabled(row)), symbol.0, record, values)?;
@@ -1407,7 +1652,7 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
             let at = statics[next];
             next += 1;
             let static_ = started.walk.symbol(at).0;
-            let served = serve(cx, front, started, &mut **store, &builder, ahead, at, ParentError::StaticServed { symbol: static_ })?;
+            let served = serve(cx, front, started, &mut **store, &builder, codes, ahead, at, ParentError::StaticServed { symbol: static_ })?;
             let entry = entry_of(&served, &**store, &started.scratch, static_)?;
             let datum = front.record_of(entry).map_err(|why| ParentError::Entry { symbol: static_, why })?;
             data.push(Datum { symbol: Symbol(static_), record: folder.file(datum)? });
@@ -1860,13 +2105,19 @@ impl<'a> Needs<'a> {
 
     /// Every whole frame at the start of `inbox` answered onto the end of `out`, asking
     /// `resolve` for each symbol not resolved yet: the bytes taken (the rest is a frame not all
-    /// here yet). Each frame takes at least its 4-byte length, so the loop ends.
+    /// here yet). Each frame takes at least its 4-byte length, so the loop ends. A need the
+    /// resolver answers [`Resolved::Waiting`] stops the loop at its frame, not taken: the caller
+    /// serves the rest again once the code came (D194).
     pub(crate) fn serve<R: Resolve + ?Sized, A: Allocator>(&mut self, resolve: &mut R, inbox: &[u8], out: &mut std::vec::Vec<u8, A>) -> Result<usize, ParentError> {
         let mut taken = 0;
         while let Some((item, len)) = split(&inbox[taken..])? {
             let (_, up) = Up::decode(item)?;
             match up {
-                Up::Need { need, .. } => self.answer(need, resolve, out)?,
+                Up::Need { need, .. } => {
+                    if !self.answer(need, resolve, out)? {
+                        return Ok(taken);
+                    }
+                }
                 // No ask: nothing answers it; the first is kept to be said by name.
                 Up::Fault { fault } => {
                     if self.fault.is_none() {
@@ -1879,24 +2130,27 @@ impl<'a> Needs<'a> {
         Ok(taken)
     }
 
-    /// One need answered onto the end of `out`.
-    pub(crate) fn answer<R: Resolve + ?Sized, A: Allocator>(&mut self, need: Needed, resolve: &mut R, out: &mut std::vec::Vec<u8, A>) -> Result<(), ParentError> {
+    /// One need answered onto the end of `out`: `true`; `false` when the resolver answered
+    /// [`Resolved::Waiting`], with nothing told and nothing counted (the need is asked again).
+    pub(crate) fn answer<R: Resolve + ?Sized, A: Allocator>(&mut self, need: Needed, resolve: &mut R, out: &mut std::vec::Vec<u8, A>) -> Result<bool, ParentError> {
         let symbol = match need {
             Needed::Symbol(symbol) => symbol,
             Needed::Slot(slot) => *self.slots.get(slot.0 as usize).ok_or(ParentError::UndeclaredSlot { slot: slot.0 })?,
         };
         match self.met.get(&symbol.0).copied() {
-            Some(Met::Published { slot, record }) => self.publish(slot, record, Stands::Again, out),
-            Some(Met::Unknown { .. }) => self.failed(need, out),
+            Some(Met::Published { slot, record }) => self.publish(slot, record, Stands::Again, out).map(|()| true),
+            Some(Met::Unknown { .. }) => self.failed(need, out).map(|()| true),
             Some(Met::Declared(_)) | None => {
-                self.resolved += 1;
                 let mut values = Vec::new_in(self.alloc);
                 match resolve.publication(&symbol, &mut values)? {
+                    Resolved::Waiting => Ok(false),
                     Resolved::Unknown => {
+                        self.resolved += 1;
                         self.settle_unknown(symbol)?;
-                        self.failed(need, out)
+                        self.failed(need, out).map(|()| true)
                     }
                     Resolved::Record { key, record, declares, data, named } => {
+                        self.resolved += 1;
                         if !values.is_empty() {
                             self.positioned.insert(record.0, values);
                         }
@@ -1909,7 +2163,7 @@ impl<'a> Needs<'a> {
                         // the next list's group: those data, every static named, the row
                         // (start_list.rs version 4; run.md, "Statics in the run").
                         self.publish(slot, record, Stands::Answered { named, data }, out)?;
-                        self.first_answer(Row { symbol, key, record }, named)
+                        self.first_answer(Row { symbol, key, record }, named).map(|()| true)
                     }
                 }
             }

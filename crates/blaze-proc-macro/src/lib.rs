@@ -71,6 +71,8 @@ mod native_setting_tests;
 #[cfg(all(test, feature = "runtime"))]
 mod native_setting_nm_tests;
 #[cfg(all(test, feature = "runtime"))]
+mod script_probes_tests;
+#[cfg(all(test, feature = "runtime"))]
 mod script_tests;
 #[cfg(all(test, feature = "runtime"))]
 mod spawn_route_tests;

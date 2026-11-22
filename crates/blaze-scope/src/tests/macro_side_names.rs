@@ -155,7 +155,7 @@ pub(super) fn graph() -> UnitGraph<'static> {
     units.push(unit(1, "dep", UnitKind::Lib, false, &[]));
     units.push(unit(2, "pm", UnitKind::ProcMacro, true, &[("dep", 3)]));
     units.push(unit(1, "dep", UnitKind::Lib, true, &[]));
-    UnitGraph { units, resolver: Resolver::V3, meta: AVec::new_in(a()) }
+    UnitGraph { units, resolver: Resolver::V3, meta: AVec::new_in(a()), left_out: AVec::new_in(a()) }
 }
 
 /// Each crate's one file, at the root the list gave it: by its name.

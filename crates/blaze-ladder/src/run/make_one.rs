@@ -314,7 +314,9 @@ impl MakerState {
         };
         // A ctor has no body to check: its row is made, and its instance built as a fn
         // ([`build_one`]'s ctor arm).
-        if program.ctor_of(key).is_some() {
+        // The trait's `Clone::clone` has no body either: the one instance tabled at it is a
+        // builtin clone ([`build_one`]'s arm; clone_shim.rs `language_copy_clone`).
+        if program.ctor_of(key).is_some() || program.lang_trait_fn(LangItem::Clone, "clone") == Some(key) {
             let at = program.head_row(key)?;
             self.asked.insert_shift(slot, (key, at));
             return Ok(at);
@@ -447,6 +449,19 @@ let step = build_one(&*program, &bodies, work, i, instance, entry);
                 }
                 return Err(e);
             }
+            // A layout met a type alias's `impl Trait` whose defining fn is not checked yet
+            // (coroutines.rs `opaque_hidden`): that fn is checked, as a lay's owner is
+            // (`Step::Check`), and the instance made again; bounded by the same count, and an
+            // owner asked before is the refusal itself (its check made no row).
+            Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { owner, .. }, .. })
+                if owners < MOST_HELD_COROUTINES && state.asked.binary_search_by_key(&owner, |r| r.0).is_err() =>
+            {
+                owners += 1;
+                if state.ensure(program, typing, owner, checks)?.is_none() {
+                    return Err(unchecked_owner(&*program, i, owner));
+                }
+                continue;
+            }
             step => step?,
         };
         match step {
@@ -528,8 +543,11 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
     let MakerState { checked, tables, work, .. } = &mut *state;
     work.needs.clear();
     let function = program.function(i);
-    // A ctor's fn reads no constant: its fields in, its value out.
-    if instance.item != function.key || (function.kind == FnKind::Ctor && function.body.is_none()) {
+    // A ctor's fn reads no constant: its fields in, its value out. Nor a builtin clone (a copy).
+    if instance.item != function.key
+        || (function.kind == FnKind::Ctor && function.body.is_none())
+        || (function.body.is_none() && crate::clone_shim::language_copy_clone(&*program, instance, &work.ground).is_some())
+    {
         return Ok(());
     }
     let (Some((body, _)), Some(done)) = (function.body, checked.get(i).and_then(Option::as_ref)) else {
@@ -569,9 +587,15 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
         (FnKind::Ctor, None) => program.ctor_of(function.key).map(|(_, variant)| variant),
         _ => None,
     };
+    // The trait's bodiless `Clone::clone` at a fn item or fn pointer: the language's copy
+    // (clone_shim.rs `language_copy_clone`), built with no body.
+    let builtin_clone = match function.body {
+        None if instance.item == function.key => crate::clone_shim::language_copy_clone(program, instance, &work.ground),
+        _ => None,
+    };
     let checked = match (function.body, bodies.checked.get(i).and_then(Option::as_ref)) {
         (Some((body, _)), Some(done)) => Some((body, done)),
-        _ if ctor_row.is_some() => None,
+        _ if ctor_row.is_some() || builtin_clone.is_some() => None,
         _ => return Err(callee_refusal(program, name(), instance.args, instance, crate::callee_shown::CalleeGap::NoBody, work.ground.view())),
     };
     let malformed = |_| RunError::Build { function: name(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None };
@@ -646,6 +670,10 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
                 Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, &adts, Global),
                 None => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, None, &mut subst, &adts, Global),
             }
+        } else if let Some(clone) = builtin_clone {
+            // `Self: Copy` holds for a fn item and a fn pointer by the language (no solver
+            // asked): the clone is a copy of its bytes.
+            blaze_build::build_builtin_clone(clone, true, &mut subst, &adts, Global)
         } else if let Some(variant) = ctor_row {
             // The ctor's own instance (a shim of it was taken above): its fields in, its value out.
             blaze_build::build_ctor_fn(function.key, variant, &program.sig(i), &mut subst, &adts, Global)
@@ -838,6 +866,16 @@ fn name_ref<'p, P: FrontEnd>(
     if let Some(owner) = crate::fn_shim::untabled_owner(program, adts, called, ground) {
         let refusal = callee_refusal(program, name(), at, owner, crate::callee_shown::CalleeGap::NotTabled, ground.view());
         return Ok(Named1::Untabled(owner.item, refusal));
+    }
+    // `Clone::clone` at a fn item or fn pointer: the language's copy, no impl item to select
+    // (clone_shim.rs `language_copy_clone`; t1800: proptest's derived `Clone for Config`
+    // cloning its `fn(..)` field, 30 tests NOT RUN). Tabled at the trait's `clone` row.
+    if let Some(clone) = crate::clone_shim::language_copy_clone(program, called, ground) {
+        let Some(c) = program.fn_index(clone) else {
+            let refusal = callee_refusal(program, name(), at, called, crate::callee_shown::CalleeGap::NotTabled, ground.view());
+            return Ok(Named1::Untabled(clone, refusal));
+        };
+        return reach.declare(program.function(c).key, called, ground, alloc).map(Named1::Instance).map_err(|e| named(e, called, &*ground));
     }
     // A ctor is no trait's fn: it runs as itself, with no world asked (build_from's refs loop).
     // Known by its ADT's head (`ctor_of`), whether or not a row tables it yet: a lazy front end

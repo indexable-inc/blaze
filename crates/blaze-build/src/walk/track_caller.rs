@@ -17,6 +17,15 @@
 //! - **A call from a tracked fn**: its own parameter, forwarded.
 //! - **A caller whose own answer is not said**: refused by name ([`BuildError::TrackCaller`]),
 //!   since forwarding and making a row differ in what the program prints.
+//! - **A call from a `Fn*` shim of a fn item** (closure.rs `run_fn_shim`: `f` passed where
+//!   `F: FnMut(..)` is bound, clap's `.map(unwrap_downcast_into::<T>)`): the shim is never
+//!   tracked (rustc_middle instance.rs `requires_caller_location` answers `false` for
+//!   `ShimKind::FnPtr`), so its call of the tracked fn passes a row of the call's place in the
+//!   shim, which is the shim's own definition (rustc_mir_transform shim.rs `build_call_shim`:
+//!   `span = tcx.def_span(def_id)`, the def being the `Fn*` trait's `call`, `call_mut` or
+//!   `call_once`): [`crate::Adts::def_site`] of the shim's owner. So
+//!   `Some(()).map(tracked_fn)` reports core's `ops/function.rs` at the `Fn*` method, as rustc's
+//!   build does.
 //! - **A tracked fn taken as a fn pointer**: refused by name. Its shim (rustc's `ReifyShim`),
 //!   which passes the fn's own definition site so a pointer of the ordinary signature can call
 //!   it, is not built yet.
@@ -32,7 +41,7 @@ use blaze_lir::func::{Conv, Ext, RefKind, SigId};
 use blaze_lir::{Ty, Value};
 use blaze_typeck::{ExprId, ItemKey, List, Mutbl, PNode, PTy};
 
-use super::{Callee, Pass, Repr, V, Walk, layout_err, malformed};
+use super::{Callee, Pass, Repr, TyErr, V, Walk, layout_err, malformed};
 use crate::intrinsics::{self, Call, IntrinsicCx, IntrinsicError, Out, Site, Which};
 use crate::layout::LayoutCx;
 use crate::{BuildError, CallerSite, Instance};
@@ -62,8 +71,8 @@ const NO_SITE: &str = "the world does not say where the expression is (`Adts::ca
 const NO_EXPR: &str = "a tracked fn called by code the build inserted with no expression to give the call's place";
 const POINTER: &str =
     "a `#[track_caller]` fn taken as a fn pointer: its shim, which passes the fn's own definition site, is not built yet";
-const SHIM: &str =
-    "a `#[track_caller]` fn called through its `Fn*` shim: the shim, which passes the fn's own definition site, is not built yet";
+const NO_DEF_SITE: &str =
+    "a `#[track_caller]` fn called through a `Fn*` shim: the world does not say where the shim's `Fn*` method is defined (`Adts::def_site`), the place the shim passes";
 const VTABLE: &str =
     "a `#[track_caller]` method called through a trait object: its vtable shim, which passes the method's definition site, is not built yet";
 
@@ -105,15 +114,37 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Track::Unsaid => Err(refuse(UNSAID_CALLER)),
             Track::No => {
                 let e = at.ok_or(refuse(NO_EXPR))?;
-                let adt = self.adts.location_adt().ok_or(BuildError::NoLangFn { expr: Some(e), name: "panic_location" })?;
-                let loc_ty = self.ground.intern(PNode::Adt(adt, List::EMPTY)).map_err(|_| malformed("the ground table is full"))?;
-                let ret = self.ground.intern(PNode::Ref(Mutbl::Not, loc_ty)).map_err(|_| malformed("the ground table is full"))?;
+                let (loc_ty, ret) = self.location_tys(Some(e))?;
                 // The call's site is in the CALLER's body (`e` is its expression): a missing site
                 // is named for that body, not for the callee (lane CX18).
                 let site = self.site_of(e, self.body.owner)?;
-                Ok(Some(self.location_row(e, Site::Here(site), loc_ty, ret)?))
+                Ok(Some(self.location_row(Some(e), callee.item, Site::Here(site), loc_ty, ret)?))
             }
         }
+    }
+
+    /// The location a `Fn*` shim (closure.rs `run_fn_shim`, the body's owner the `Fn*` method)
+    /// passes to the fn item `callee` it calls, when `callee` is tracked (module doc): a row of
+    /// the `Fn*` method's definition site, never a forwarded one (the shim is untracked).
+    /// `None`: not tracked, nothing passed.
+    pub(super) fn shim_caller_arg(&mut self, callee: Instance) -> Result<Option<Value>, BuildError> {
+        if self.tracked(callee) != Some(true) {
+            return Ok(None);
+        }
+        let owner = self.body.owner;
+        let adts = self.adts;
+        let site = adts.def_site(owner).ok_or(BuildError::TrackCaller { expr: None, item: callee.item, why: NO_DEF_SITE })?;
+        let (loc_ty, ret) = self.location_tys(None)?;
+        Ok(Some(self.location_row(None, callee.item, Site::Here(site), loc_ty, ret)?))
+    }
+
+    /// `core::panic::Location` (no arguments: `Location<'static>`) and `&Location`, in the
+    /// ground table: a row's type and the hidden parameter's.
+    fn location_tys(&mut self, at: Option<ExprId>) -> Result<(PTy, PTy), BuildError> {
+        let adt = self.adts.location_adt().ok_or(BuildError::NoLangFn { expr: at, name: "panic_location" })?;
+        let loc_ty = self.ground.intern(PNode::Adt(adt, List::EMPTY)).map_err(|_| malformed("the ground table is full"))?;
+        let ret = self.ground.intern(PNode::Ref(Mutbl::Not, loc_ty)).map_err(|_| malformed("the ground table is full"))?;
+        Ok((loc_ty, ret))
     }
 
     /// `caller_location`'s site at intrinsic call `e` of the body being built.
@@ -133,9 +164,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
 
     /// The address of a `Location` data row at `here`, by the one maker of such rows
     /// (intrinsics.rs `location`, which lays the struct out by its layout), for a call of
-    /// tracked fn at `e`: its line and column are source positions of `here`, filled when the
-    /// program is placed.
-    fn location_row(&mut self, e: ExprId, here: Site<'x>, loc_ty: PTy, ret: PTy) -> Result<Value, BuildError> {
+    /// tracked fn `callee` at `at` (none: a shim's call, which has no expression): its line and
+    /// column are source positions of `here`, filled when the program is placed.
+    fn location_row(&mut self, at: Option<ExprId>, callee: ItemKey, here: Site<'x>, loc_ty: PTy, ret: PTy) -> Result<Value, BuildError> {
         let call = Call { which: Which::CallerLocation, generics: &[], args: &[], ret, site: Some((here, loc_ty)) };
         let adts = self.adts;
         let needs_drop = |_: PTy| false;
@@ -144,12 +175,20 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             let mut icx = IntrinsicCx { layouts: &mut self.ls, cx: &mut lcx, needs_drop: &needs_drop, ub_checks: adts.ub_checks(), overflow_checks: adts.overflow_checks() };
             intrinsics::build(&mut self.b, &call, &mut icx)
         };
-        match built {
-            Ok(Out::Scalar(v)) => Ok(v),
-            Ok(_) => Err(malformed("a `Location` row whose address is not one pointer")),
-            Err(IntrinsicError::Shape { which, why }) => Err(BuildError::Intrinsic { expr: e, which, why, unsupported: false }),
-            Err(IntrinsicError::Unsupported { which, why }) => Err(BuildError::Intrinsic { expr: e, which, why, unsupported: true }),
-            Err(IntrinsicError::Layout(error)) => Err(Self::ty_err(e, layout_err(error))),
+        // With no expression the refusal names the tracked fn the row was for.
+        let unplaced = |why| BuildError::TrackCaller { expr: None, item: callee, why };
+        match (built, at) {
+            (Ok(Out::Scalar(v)), _) => Ok(v),
+            (Ok(_), _) => Err(malformed("a `Location` row whose address is not one pointer")),
+            (Err(IntrinsicError::Shape { which, why }), Some(e)) => Err(BuildError::Intrinsic { expr: e, which, why, unsupported: false }),
+            (Err(IntrinsicError::Unsupported { which, why }), Some(e)) => Err(BuildError::Intrinsic { expr: e, which, why, unsupported: true }),
+            (Err(IntrinsicError::Shape { why, .. } | IntrinsicError::Unsupported { why, .. }), None) => Err(unplaced(why)),
+            (Err(IntrinsicError::Layout(error)), Some(e)) => Err(Self::ty_err(e, layout_err(error))),
+            (Err(IntrinsicError::Layout(error)), None) => Err(match layout_err(error) {
+                TyErr::Unsupported(what) => unplaced(what),
+                TyErr::Malformed(what) => malformed(what),
+                TyErr::Other(error) => error,
+            }),
         }
     }
 
@@ -221,16 +260,6 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     pub(super) fn refuse_tracked_pointer(&mut self, e: ExprId, instance: Instance) -> Result<(), BuildError> {
         if self.tracked(instance) == Some(true) {
             return Err(BuildError::TrackCaller { expr: Some(e), item: instance.item, why: POINTER });
-        }
-        Ok(())
-    }
-
-    /// Refuses fn item `instance` as the target of a `Fn*` shim (closure.rs `run_fn_shim`)
-    /// when it is tracked: the shim has no call expression to give the place, and passes no
-    /// location (module doc).
-    pub(super) fn refuse_tracked_shim(&mut self, instance: Instance) -> Result<(), BuildError> {
-        if self.tracked(instance) == Some(true) {
-            return Err(BuildError::TrackCaller { expr: None, item: instance.item, why: SHIM });
         }
         Ok(())
     }

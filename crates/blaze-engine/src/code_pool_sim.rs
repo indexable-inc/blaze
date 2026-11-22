@@ -95,12 +95,14 @@ impl Graph {
 
 /// The reference model: give each child's first demand of a key its next slot, execute
 /// only that key synchronously and remember its result. Exit withdraws unanswered receipts.
+/// The order is each child's own (D194): a child's replies keep its demand order, and no
+/// child's reply waits on another's.
 #[derive(Default)]
 struct Serial {
     slots: [BTreeMap<CodeKey, usize>; 2],
     results: BTreeMap<CodeKey, Outcome>,
-    replies: StdDeque<(Demand, Outcome)>,
-    delivered: Vec<(Demand, Outcome)>,
+    replies: [StdDeque<(Demand, Outcome)>; 2],
+    delivered: [Vec<(Demand, Outcome)>; 2],
 }
 
 impl Serial {
@@ -109,13 +111,13 @@ impl Serial {
         let next = slots.len();
         let slot = Slot(*slots.entry(k).or_insert(next));
         let result = *self.results.entry(k).or_insert_with(|| graph.outcome(k));
-        self.replies.push_back((Demand { child, thread, key: k, slot }, result));
+        self.replies[child.0].push_back((Demand { child, thread, key: k, slot }, result));
     }
 
     fn delivery(&mut self, demand: Demand, result: Outcome) -> Result<(), Broke> {
-        let expected = self.replies.pop_front();
+        let expected = self.replies[demand.child.0].pop_front();
         oracle(expected == Some((demand, result)), || format!("publication order or result: wanted {expected:?}, got {demand:?} {result:?}"))?;
-        self.delivered.push((demand, result));
+        self.delivered[demand.child.0].push((demand, result));
         Ok(())
     }
 }
@@ -170,7 +172,7 @@ impl<'g> Run<'g> {
             Event::Demand { child, thread, key } => self.model.demand(child, thread, key, self.graph),
             Event::Exited(child) => {
                 self.live[child.0] = false;
-                self.model.replies.retain(|(d, _)| d.child != child);
+                self.model.replies[child.0].clear();
             }
             _ => {}
         }
@@ -217,8 +219,10 @@ impl<'g> Run<'g> {
         }
         oracle(pending_hints == self.pool.frontier.len() && pending_hints <= self.pool.opts.frontier,
             || format!("{pending_hints} outstanding hints with {} frontier permits held", self.pool.frontier.len()))?;
-        if let Some((next, _)) = self.model.replies.front() {
-            oracle(!self.settled.contains_key(&next.key), || format!("waiter not woken: {next:?}"))?;
+        for replies in self.model.replies.iter() {
+            if let Some((next, _)) = replies.front() {
+                oracle(!self.settled.contains_key(&next.key), || format!("waiter not woken: {next:?}"))?;
+            }
         }
         Ok(())
     }
@@ -290,7 +294,7 @@ impl<'g> Run<'g> {
         while !self.jobs.is_empty() {
             self.one(tape)?;
         }
-        oracle(self.model.replies.is_empty(), || format!("waiter not woken: {:?}", self.model.replies.front()))?;
+        oracle(self.model.replies.iter().all(StdDeque::is_empty), || format!("waiter not woken: {:?}", self.model.replies.iter().find_map(StdDeque::front)))?;
         for (&k, &result) in &self.model.results {
             let settled = self.pool.find(k).map(|id| self.pool.rows[id].state);
             let expected = match result {
@@ -306,7 +310,7 @@ impl<'g> Run<'g> {
 
     fn ended(&self) -> Result<(), Broke> {
         let drained = self.jobs.is_empty() && self.owners.is_empty() && self.pool.queue.is_empty()
-            && self.pool.frontier.is_empty() && self.pool.pending.is_empty() && self.pool.wait().is_none();
+            && self.pool.frontier.is_empty() && self.pool.children.iter().all(|c| c.pending.is_empty()) && self.pool.wait().is_none();
         oracle(drained, || format!("work survived exit: {:?}", self.pool.wait()))
     }
 }
@@ -410,7 +414,7 @@ fn scenario(tape: &Tape, plant: Plant) -> Result<(), Broke> {
         trace.push((child, thread, i));
     }
     let first_exit = usize::from(tape.coin("first exit"));
-    let replay = |hash_seed| -> Result<Vec<(Demand, Outcome)>, Broke> {
+    let replay = |hash_seed| -> Result<[Vec<(Demand, Outcome)>; 2], Broke> {
         let mut run = Run::new(&graph, workers, frontier, hash_seed, plant)?;
         for &(child, thread, i) in &trace {
             for _ in 0..tape.range(0..7, "completions between demands") {

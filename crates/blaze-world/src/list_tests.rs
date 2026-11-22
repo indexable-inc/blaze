@@ -134,7 +134,7 @@ fn graph(lock: &Lock<'static>) -> &'static UnitGraph<'static> {
     units.push(unit(lock, "dep", UnitKind::Lib, true, &[]));
     units.push(unit(lock, "pm", UnitKind::ProcMacro, true, &[("dep", 1)]));
     units.push(unit(lock, "app", UnitKind::Lib, false, &[("dep", 0), ("pm", 2)]));
-    StdBox::leak(StdBox::new(UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(a()) }))
+    StdBox::leak(StdBox::new(UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(a()), left_out: AVec::new_in(a()) }))
 }
 
 /// [`graph`]'s units in the reverse order (unit `i` is [`graph`]'s `3 - i`): one graph, its
@@ -145,7 +145,7 @@ fn graph_reversed(lock: &Lock<'static>) -> &'static UnitGraph<'static> {
     units.push(unit(lock, "pm", UnitKind::ProcMacro, true, &[("dep", 2)]));
     units.push(unit(lock, "dep", UnitKind::Lib, true, &[]));
     units.push(unit(lock, "dep", UnitKind::Lib, false, &[]));
-    StdBox::leak(StdBox::new(UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(a()) }))
+    StdBox::leak(StdBox::new(UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(a()), left_out: AVec::new_in(a()) }))
 }
 
 /// `app` and `pm` in the checkout at their own directories; `dep` a fetched pack.
@@ -250,7 +250,7 @@ fn hello_on(edition: PackageEdition, shelf_of: ShelfOf) -> World<'static> {
     member.edition = edition;
     let mut units = AVec::new_in(a());
     units.push(member);
-    let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(a()) }));
+    let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(a()), left_out: AVec::new_in(a()) }));
     let mut places = Places { lock, dep: &[] };
     let (id, files) = shelf_of(TRIPLE, crate::fixture::STD, TARGET_CFG, a());
     let mut shelf = Memory(files.into_iter().collect());
@@ -408,7 +408,7 @@ fn sides_world() -> World<'static> {
     let mut pm_script = unit(lock, "pm", UnitKind::BuildScript, true, &[]);
     pm_script.root = t("build.rs");
     units.push(pm_script);
-    let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(a()) }));
+    let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(a()), left_out: AVec::new_in(a()) }));
     let reg = crate::fixture::pack(&[("src/lib.rs", "pub struct Expr;\n")], a());
     let mut places = Places { lock, dep: StdBox::leak(reg.into_boxed_slice()) };
     let (id, mut shelf) = shelf(true);

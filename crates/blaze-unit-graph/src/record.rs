@@ -26,12 +26,13 @@ use blaze_own::{AVec, Alloc, String, Vec};
 use edition::{Edition, PackageEdition};
 
 use crate::resolve::unit_cfg;
-use crate::{Ask, CfgAtom, ExtraUnit, PackageMeta, Resolver, TargetDesc, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
+use crate::{Ask, CfgAtom, ExtraUnit, LeftOut, LeftOutKind, PackageMeta, Resolver, TargetDesc, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
 
 /// The record's form. A change to it is a new magic; an older one is refused by it.
 /// `BUG2`: each package's `CARGO_PKG_*` metadata after the unavailable ids. `BUG3`: no
 /// unavailable ids and no `incomplete` flag: a graph is whole or not made (states.md 35).
-pub const MAGIC: &[u8; 4] = b"BUG3";
+/// `BUG4`: the targets left out by `required-features` after the metadata.
+pub const MAGIC: &[u8; 4] = b"BUG4";
 /// The domain of [`Source`]'s digest.
 pub const SOURCE_DOMAIN: &str = "blaze-unit-graph: what a request's unit graph read, v1";
 
@@ -141,6 +142,23 @@ pub fn encode<'a>(graph: &UnitGraph<'a>, target: &TargetDesc<'a>, host: &TargetD
         w.u32(id.0);
         for value in meta.values() {
             w.text(value);
+        }
+    }
+    // The targets left out by `required-features`, in the graph's order.
+    w.u32(graph.left_out.len() as u32);
+    for left in graph.left_out.iter() {
+        w.u32(left.package.0);
+        w.text(&left.package_name);
+        w.u8(match left.kind {
+            LeftOutKind::Bin => 0,
+            LeftOutKind::Test => 1,
+            LeftOutKind::Example => 2,
+            LeftOutKind::Bench => 3,
+        });
+        w.text(&left.name);
+        w.u32(left.off.len() as u32);
+        for feature in left.off.iter() {
+            w.text(feature);
         }
     }
     Ok(w.0)
@@ -283,10 +301,36 @@ pub fn decode<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Result<Decoded<'a>, RecordR
         }
         meta.push((id, PackageMeta::new(values)));
     }
+    let nl = r.count()?;
+    let mut left_out: AVec<'a, LeftOut<'a>> = Vec::with_capacity_in(nl, alloc);
+    for _ in 0..nl {
+        let package = LockId(r.u32()?);
+        let package_name = r.text()?;
+        let kind = match r.u8()? {
+            0 => LeftOutKind::Bin,
+            1 => LeftOutKind::Test,
+            2 => LeftOutKind::Example,
+            3 => LeftOutKind::Bench,
+            _ => return r.refuse("no such left-out target kind"),
+        };
+        let name = r.text()?;
+        let no = r.count()?;
+        if no == 0 {
+            return r.refuse("a target left out with no feature off");
+        }
+        let mut off = Vec::with_capacity_in(no, alloc);
+        for _ in 0..no {
+            off.push(r.text()?);
+        }
+        if left_out.last().is_some_and(|last: &LeftOut<'a>| (last.package, last.kind, last.name.as_str()) >= (package, kind, name.as_str())) {
+            return r.refuse("left-out targets not strictly by (package, kind, name)");
+        }
+        left_out.push(LeftOut { package, package_name, kind, name, off });
+    }
     if r.at != bytes.len() {
         return r.refuse("bytes after the record");
     }
-    Ok(Decoded { graph: UnitGraph { units, resolver, meta }, target, host })
+    Ok(Decoded { graph: UnitGraph { units, resolver, meta, left_out }, target, host })
 }
 
 /// The digest of what a request's unit graph read: the record's source.

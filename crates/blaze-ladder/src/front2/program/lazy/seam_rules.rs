@@ -206,6 +206,62 @@ pub(in crate::front2::program) fn caller_site<'n, S: PositionSource<'n>>(names: 
     Some(blaze_build::CallerSite { file: names.file_shown(krate, file)?, item, offset })
 }
 
+/// THE DEFINITION-SITE RULE (blaze-build `Adts::def_site`): where fn `item` is defined, in
+/// [`caller_site`]'s form. rustc's `def_span` of a fn is its `sig.span` (rustc_middle
+/// hir/map.rs `hir_span`), which rustc_parse starts at `lo`, the first token after the outer
+/// attributes (item.rs `parse_item_common_`: `let lo = this.token.span;` before the
+/// visibility; function.rs `parse_fn`: `sig_lo.to(sig_hi)`): so the site is the first token of
+/// the declaration that is not an outer attribute or a doc comment (a doc comment is its
+/// `#[doc]`), its visibility included. Counted as [`caller_site`] counts: from the item's
+/// text, or for a written local from its declaration's first token; a fn a macro call writes
+/// whole is placed at the call (byte 0), as [`caller_site`] places its expressions.
+pub(in crate::front2::program) fn def_site<'n, S: PositionSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, item: ItemKey) -> Option<blaze_build::CallerSite<'n>> {
+    let point = body_anchor(names, keys, store, item, 0)?;
+    let (krate, file, first) = point.anchor.placement(names, store.tys.alloc()).ok()?;
+    let file = names.file_shown(krate, file)?;
+    if let Start::Invocation(_) | Start::MemberInvocation(..) = first {
+        return Some(blaze_build::CallerSite { file, item: keys.item(point.anchor.lib()).ok()?, offset: 0 });
+    }
+    let text = point.anchor.text(names)?;
+    let edition = names.edition_of(krate)?;
+    let alloc = store.tys.alloc();
+    match point.local {
+        None => {
+            let at = past_outer_attributes(text, point.offset, edition, alloc)?;
+            Some(blaze_build::CallerSite { file, item: keys.item(point.anchor.lib()).ok()?, offset: at })
+        }
+        Some((live, relative)) => {
+            let declaration = point.offset.checked_sub(relative)?;
+            let (source, first) = local_position::key_at(names, krate, point.anchor, declaration, alloc).ok()?;
+            let at = past_outer_attributes(text, first, edition, alloc)?;
+            Some(blaze_build::CallerSite { file, item: keys.file_source_local(source, live).ok()?, offset: at.checked_sub(first)? })
+        }
+    }
+}
+
+/// The first byte of the first token at or after byte `from` of `text` that is not in an
+/// outer attribute (`#[..]`) or a doc comment (lexed as its `#[doc = ".."]`, blaze-expand
+/// `lex`). `None`: the text does not lex from `from`, or no token follows the attributes.
+fn past_outer_attributes(text: &str, from: u32, edition: blaze_surface::Edition, alloc: Alloc<'_>) -> Option<u32> {
+    use blaze_expand::origin_column::{InputShape, input_places};
+    use blaze_expand::{Delim, TokenKind};
+    let rest = text.get(from as usize..)?;
+    let tokens = blaze_expand::lex(rest, edition, alloc).ok()?;
+    let places = input_places(rest, InputShape::Whole, edition, alloc).ok()?;
+    let list = tokens.tokens();
+    if places.len() != list.len() {
+        return None;
+    }
+    let mut at = 0usize;
+    // Each turn moves past one attribute's closing `]`: the tokens bound the turns.
+    while matches!(list.get(at).map(|t| t.kind), Some(TokenKind::Punct { char: '#', .. }))
+        && matches!(list.get(at + 1).map(|t| t.kind), Some(TokenKind::Open(Delim::Bracket)))
+    {
+        at = tokens.close_of(at + 1)? + 1;
+    }
+    from.checked_add(places.get(at)?.0)
+}
+
 /// THE TRAP-SITE RULE: [`caller_site`]'s offset alone, `expr`'s first byte from its item's
 /// (`View::site`), with no file: what a trap row keeps (blaze-build `Adts::expr_site`). It
 /// needs no shown path, so a toolchain crate's body (core's `AlignmentEnum` copy) keeps its

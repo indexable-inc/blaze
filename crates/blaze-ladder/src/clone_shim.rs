@@ -33,6 +33,29 @@ use blaze_typeck::{ItemKey, LangItem, List, PNode, PTy, PortableTys, ResolveErro
 
 use crate::seam::{FrontEnd, LangRefusal};
 
+/// THE RECORD WALK'S BUILTIN CLONE (run/make_one.rs): `called` as `Clone::clone` at a `Self`
+/// the language makes `Copy` by its TYPE alone, a fn item or a fn pointer (the Reference,
+/// "Special types and traits": `Clone` and `Copy` are implemented for "Function item types"
+/// and "Function pointer types"; core's clone.rs `mod impls`: "Implementations that cannot be
+/// described in Rust are implemented in `traits::SelectionContext::copy_clone_conditions()`",
+/// no impl item); its function is a copy of `Self`'s bytes (rustc_mir_transform shim.rs:
+/// `ty::FnDef(..) | ty::FnPtr(..) => builder.copy_shim()`). The clone's item when it is one,
+/// `None` for any other call. Tabled at the trait's `clone` row (made from its head: it has no
+/// body), keyed by its name `clone::<Self>` alone: `Self: Copy` is `true` for every such
+/// `Self`, so the name covers every input (rule 21). A tuple's or a closure's builtin clone
+/// depends on its fields' `Copy` (an impl elsewhere), which the name does not hold: those stay
+/// the selection refusal they are on this path (run.rs `build_from` keys them by
+/// [`Clones::key_args`]).
+pub(crate) fn language_copy_clone<P: FrontEnd>(program: &P, called: Instance, ground: &PortableTys<'_>) -> Option<ItemKey> {
+    let clone = program.lang_trait_fn(LangItem::Clone, "clone")?;
+    if called.item != clone {
+        return None;
+    }
+    let view = ground.view();
+    let &[me] = view.list(called.args).ok()? else { return None };
+    matches!(view.node(me).ok()?, PNode::FnDef(..) | PNode::FnPtr(..)).then_some(clone)
+}
+
 /// Why a builtin clone's `Self: Copy` has no answer: the solver's (a record it could not make),
 /// or a closure's environment that could not be grounded at its arguments.
 #[derive(Debug)]

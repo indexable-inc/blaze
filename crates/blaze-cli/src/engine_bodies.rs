@@ -3835,7 +3835,9 @@ impl<'f> BodiesStage<'f> {
                     let Ok(Some(row)) = items.file_surface(file) else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
                     let Some(path) = row.path.in_package(list.shown_from(member), g) else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
                     let Some(path) = path.strip_prefix("/0/") else { break 'head crate::engine_member_rows::FileHead::NotOutlined };
-                    let Some(at) = handles.outlined.iter().position(|one| one.path.as_slice() == path.as_bytes()) else {
+                    // The outline this unit reaches, of the file's outlines (one a name it is
+                    // planned by: a `mod x;` slot and a `#[path]` to `x/mod.rs` are two).
+                    let Some(at) = crate::engine_body_plan::outline_at_path(handles.outlined, path.as_bytes(), &reach) else {
                         // A file the request has an outline of but did not read back (the ready
                         // setup's, [`BodiesStage::unread_outlines`]): the phase path would match
                         // it, so a `NotOutlined` head here would key the member's row apart from

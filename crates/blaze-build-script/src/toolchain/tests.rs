@@ -88,16 +88,26 @@ fn bindgen_is_told_the_shelf_resource_dir() {
 #[test]
 fn the_mode_decides_the_runner() {
     let native = Runner::Native { because: UnitId(3) };
+    let wasm = crate::native::Closure { runner: Runner::Wasm, no_wasm: None };
+    let spawns = crate::native::Closure { runner: native, no_wasm: None };
+    let no_wasm = crate::native::Closure { runner: native, no_wasm: Some(UnitId(3)) };
     assert!(NATIVE_EVERY_MODE.is_sorted());
+    assert!(crate::native::NO_WASM_CLASS.is_sorted());
+    assert!(crate::native::TOOLCHAIN_CLASS.is_sorted());
     for mode in [Mode::Check, Mode::Build, Mode::Run] {
-        assert_eq!(placement(Runner::Wasm, mode, "sha3-asm"), Runner::Wasm);
-        assert_eq!(placement(native, mode, "sha3-asm"), native);
+        assert_eq!(placement(wasm, mode, "sha3-asm"), Runner::Wasm);
+        assert_eq!(placement(spawns, mode, "sha3-asm"), native);
+        // turso's pg_query: bindgen in its closure, native in every mode, by no name.
+        assert_eq!(placement(no_wasm, mode, "pg_query"), native);
     }
-    assert_eq!(placement(native, Mode::Check, "zstd-sys"), Runner::Wasm);
-    assert_eq!(placement(native, Mode::Build, "zstd-sys"), native);
-    assert_eq!(placement(native, Mode::Run, "zstd-sys"), native);
+    assert_eq!(placement(spawns, Mode::Check, "zstd-sys"), Runner::Wasm);
+    assert_eq!(placement(spawns, Mode::Build, "zstd-sys"), native);
+    assert_eq!(placement(spawns, Mode::Run, "zstd-sys"), native);
+    // CONTROL (rule 23): pg_query's name with a closure that compiles to wasm checks as wasm:
+    // the closure's class, not the name, placed it.
+    assert_eq!(placement(spawns, Mode::Check, "pg_query"), Runner::Wasm);
     // N7: libusb1-sys checks as wasm (no sw_vers there; pkg-config from the pins) and builds
     // native (its C compile).
-    assert_eq!(placement(native, Mode::Check, "libusb1-sys"), Runner::Wasm);
-    assert_eq!(placement(native, Mode::Build, "libusb1-sys"), native);
+    assert_eq!(placement(spawns, Mode::Check, "libusb1-sys"), Runner::Wasm);
+    assert_eq!(placement(spawns, Mode::Build, "libusb1-sys"), native);
 }

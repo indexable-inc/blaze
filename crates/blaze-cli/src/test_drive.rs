@@ -74,7 +74,12 @@ use crate::code_store::HomeCodeStore;
 use crate::run_names::{Found, TestRows, TestUnit};
 use crate::run_ids::RunIds;
 use crate::run_loop::LoopError as RunLoopError;
-use crate::run_parent::{self, Front, Gate, Lazy, Needs, ParentError, RECORDS, RecordsDir, Resolve, Resolved, RunMaker, Start as _, WRITE_BOUND};
+use crate::run_parent::{self, Codes, Front, Gate, Lazy, Needs, ParentError, RECORDS, RecordsDir, Resolve, Resolved, RunMaker, Start as _, WRITE_BOUND};
+use blaze_engine::SVec;
+use blaze_engine::code_pool::relay::{self as code_relay, Relay as PoolRelay, RelayError, Reply};
+use blaze_engine::code_pool::{Child, Time, Worker};
+use blaze_ladder::run::special::MakerStart;
+use blaze_own::SharedAlloc;
 use crate::store::CommandLent;
 use crate::test_loop::{CannotRun, Effect, Event, LoopConfig, LoopError, Status, SuiteId, TestLoop};
 use crate::test_run::{Answers, ChildEnd, Heard, Host as TestHost, RunError, Runner, Start, Zygotes};
@@ -129,6 +134,10 @@ pub(crate) enum DriveError {
     Print,
     /// A pinned child's storage must come from the caller's process heap.
     ChildHeap,
+    /// [`CODES`] is `Pooled` and this build has no [`CodeWorkers`] for the command (D194 piece 2).
+    NoCodeWorkers,
+    /// The code relay could not be made (its own words, D194).
+    Relay(RelayError),
 }
 
 impl fmt::Display for DriveError {
@@ -147,6 +156,8 @@ impl fmt::Display for DriveError {
             DriveError::Steps { most } => write!(f, "blaze test: the loop took more than {most} steps (rule 18)"),
             DriveError::Print => f.write_str("blaze test: the output stream refused a write"),
             DriveError::ChildHeap => f.write_str("blaze test: the child pool needs the process heap to pin its lazy parents"),
+            DriveError::NoCodeWorkers => f.write_str("blaze test: code made by the command's workers (test_drive.rs `CODES` = `Pooled`, D194) needs workers with their own names records and makers, which are not built yet (D194 piece 2)"),
+            DriveError::Relay(error) => write!(f, "blaze test: {error}"),
         }
     }
 }
@@ -191,6 +202,11 @@ pub(crate) enum OneError {
     Diagnostic(bstd::out::OutError),
     Loop(RunLoopError),
     Signals(SignalError),
+    /// The code relay refused a step (D194: its own words name the child, worker or key).
+    Relay(RelayError),
+    /// The test's code for `instance` was asked of the command's workers and did not come
+    /// within `waited` nanoseconds ([`CODE_WAIT`], D194): the test is stopped, never waited out.
+    CodeLate { instance: crate::run_fault::Named, symbol: [u8; 32], waited: u64 },
 }
 
 impl fmt::Display for OneError {
@@ -221,6 +237,14 @@ impl fmt::Display for OneError {
             OneError::Diagnostic(error) => write!(f, "writing the test's signal report: {error}"),
             OneError::Loop(error) => write!(f, "a test's run: {error}"),
             OneError::Signals(error) => write!(f, "a test's run: the parent's signals: {error}"),
+            OneError::Relay(error) => write!(f, "a test's code: {error}"),
+            OneError::CodeLate { instance, symbol, waited } => write!(
+                f,
+                "a test's code: {} was asked of the command's workers and did not come in {}.{} s (test_drive.rs `CODE_WAIT`, D194; rule 18)",
+                InstanceName(instance, *symbol),
+                waited / 1_000_000_000,
+                waited % 1_000_000_000 / 100_000_000,
+            ),
         }
     }
 }
@@ -239,6 +263,9 @@ pub(crate) struct InstanceRefusal {
 enum RefusalCause {
     Build(ParentError),
     Unresolved,
+    /// Its make was refused while another test asked it too (D194: one make a key in flight);
+    /// the refusal's cause went whole to that test, the relay's child `first` ([`Launched::child_base`]).
+    Elsewhere { first: usize },
 }
 
 #[derive(Debug)]
@@ -280,8 +307,10 @@ impl fmt::Display for InstanceRefusal {
             Some(InstanceSite::Item { item, byte }) => write!(f, " at byte {byte} of item {:#x}", item.0)?,
             None => {}
         }
-        let RefusalCause::Build(cause) = &self.cause else {
-            return f.write_str(": the first-call stub requested this symbol, but the program has no callable record for it");
+        let cause = match &self.cause {
+            RefusalCause::Build(cause) => cause,
+            RefusalCause::Unresolved => return f.write_str(": the first-call stub requested this symbol, but the program has no callable record for it"),
+            RefusalCause::Elsewhere { first } => return write!(f, ": its make was refused, and the cause is said with the test that asked it first (the relay's child {first}, D194)"),
         };
         match cause {
             ParentError::Walk {
@@ -741,6 +770,9 @@ pub(crate) struct Signals {
     /// What the child being polled last began ([`Doing`]): set by its run, read by
     /// [`OneEach`] after each poll, so a turn that held the command thread is named by it.
     doing: Cell<Doing>,
+    /// The polled child's time parked waiting for its code so far (D194): set from its
+    /// [`Running`] before its poll, raised by its run while parked, kept back after; nanoseconds.
+    parked: Cell<u64>,
 }
 
 /// What one child's run was doing on the command thread. Every child is served by that one
@@ -835,7 +867,10 @@ struct Running<'a> {
     row: u32,
     test: TestId,
     began: Nanos,
-    child: Pin<std::boxed::Box<dyn Future<Output = Result<(How, Output<'static>), OneError>> + 'a>>,
+    /// How long its run was parked waiting for its code so far, as its last poll said
+    /// ([`Signals::parked`]): the runner's allowance does not count it (test_run.rs `answer_due`).
+    parked: Nanos,
+    child:Pin<std::boxed::Box<dyn Future<Output = Result<(How, Output<'static>), OneError>> + 'a>>,
 }
 
 /// One pinned parent per sandbox process. The command thread owns the front end, the lazy
@@ -890,7 +925,7 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
             let how = runs.run(row, budget, &mut output, signals).await?;
             Ok((how, output))
         }, *self.running.allocator());
-        self.running.push(Running { row, test, began, child });
+        self.running.push(Running { row, test, began, parked: Nanos(0), child });
         Ok(())
     }
 
@@ -919,9 +954,11 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
             let mut at = 0;
             while at < self.running.len() {
                 self.signals.doing.set(Doing::Idle);
+                self.signals.parked.set(self.running[at].parked.0);
                 let turn = (self.now)();
                 let polled = self.running[at].child.as_mut().poll(&mut context);
                 let nanos = (self.now)().0.saturating_sub(turn.0);
+                self.running[at].parked = Nanos(self.signals.parked.get());
                 if self.longest.is_none_or(|longest| nanos > longest.nanos) {
                     self.longest = Some(Turn { row: self.running[at].row, nanos, doing: self.signals.doing.get() });
                 }
@@ -973,6 +1010,10 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
 
     fn now(&self) -> Nanos {
         (self.now)()
+    }
+
+    fn parked(&self, row: u32) -> Nanos {
+        self.running.iter().find(|running| running.row == row).map_or(Nanos(0), |running| running.parked)
     }
 }
 
@@ -1123,6 +1164,160 @@ impl Refuse for EntryCheck<'_, '_> {
     }
 }
 
+/// Where `blaze test`'s code is made (D194, rule 78: THE seam, one line to flip). `Serial`: in
+/// the turn of the test that asked, on the command thread (today's; one long make holds every
+/// other test's answer). `Pooled`: each make is handed to a worker through [`CodeRelay`], the
+/// command thread only relays, and the asking test is parked, its allowance stopped, until its
+/// code comes or [`CODE_WAIT`] passes. `Pooled` for the real command needs [`CodeWorkers`] made
+/// on the command's pool (piece 2 of D194): until then [`run_suites`] refuses it by name.
+pub(crate) const CODES: Codes = Codes::Serial;
+
+/// How long one test's ask for its code may wait for a worker's make (rule 18): past it the test
+/// is stopped with [`OneError::CodeLate`] naming the instance. The longest make met on tempo was
+/// 77 s (the first real run's stop 3); this is about four of those.
+pub(crate) const CODE_WAIT: Duration = Duration::from_secs(300);
+
+/// The most asks one command's relay takes over its life: the pool's demand budget (rule 18).
+const MOST_ASKS: usize = 1 << 20;
+
+/// The most bytes of made entries the relay keeps at once for later askers (rule 18).
+const MOST_KEPT: usize = 1 << 30;
+
+/// One make handed to a worker (D194): all it needs, owned, so it crosses to the worker's thread.
+#[allow(dead_code, reason = "read by the command's workers, which D194 piece 2 builds")]
+pub(crate) struct Job<'a> {
+    /// The suite whose names records the make reads.
+    pub suite: SuiteId,
+    /// The row's tabled fn and kind (body_ids.rs `Order`).
+    pub order: blaze_ladder::body_ids::Order,
+    /// The row's instance name, copied out of the asking test's walk.
+    pub name: SVec<'a, u8>,
+    /// The gate's proof for the row's fn, which the make takes (D163).
+    pub proof: crate::run_ids::Runnable,
+    /// The asking test's roots as its maker is made of them ([`TestFront::maker`]).
+    pub entry: Option<ItemKey>,
+    pub start: MakerStart,
+}
+
+/// A worker's refusal of one make: the walk's error of it, as the serial step's would be.
+pub(crate) type Unmade = blaze_ladder::body_ids::WalkError<blaze_ladder::run::RunError>;
+
+/// The command's workers as the relay sees them (D194): each is handed at most one make at a
+/// time by the relay, and nothing here waits (the command thread only relays).
+pub(crate) trait CodeWorkers<'a> {
+    /// How many workers: their ids are dense from zero.
+    fn count(&self) -> usize;
+    /// Hands `job` to `worker`, which the relay gave no other make in flight.
+    fn give(&self, worker: Worker, job: Job<'a>) -> Result<(), OneError>;
+    /// One make finished since the last call, if any: the entry's bytes, or the make's refusal.
+    fn finished(&self) -> Option<(Worker, Result<SVec<'a, u8>, Unmade>)>;
+}
+
+/// The relay of D194 over the command's [`CodeWorkers`], shared by every test's run on the
+/// command thread. Its state is borrowed only inside one call, never across a turn (rule 27).
+pub(crate) struct CodeRelay<'a> {
+    relay: RefCell<PoolRelay<'a, Job<'a>, Unmade>>,
+    workers: &'a dyn CodeWorkers<'a>,
+    now: &'a dyn Fn() -> Nanos,
+    alloc: SharedAlloc<'a>,
+    /// A step refused where no error could be returned (a run's end, [`Asking`]'s drop): said by
+    /// the next [`CodeRelay::pump`], so nothing is quietly dropped (rule 3).
+    fault: Cell<Option<RelayError>>,
+}
+
+impl<'a> CodeRelay<'a> {
+    /// A relay for `children` tests (ids dense from zero, [`Launched::child_base`]) over `workers`,
+    /// on the clock `now`; `hash_seed` is the command's (rule 75).
+    #[allow(dead_code, reason = "made by `run_suites` under `Codes::Pooled`, once D194 piece 2 gives it workers")]
+    pub(crate) fn new(children: usize, workers: &'a dyn CodeWorkers<'a>, now: &'a dyn Fn() -> Nanos, alloc: SharedAlloc<'a>, hash_seed: u64) -> Result<CodeRelay<'a>, RelayError> {
+        let opts = code_relay::Options {
+            alloc,
+            hash_seed,
+            children,
+            workers: workers.count(),
+            asks: MOST_ASKS,
+            // Each ask's own `code_wait` bounds every wait a test makes on the relay; the makes
+            // themselves are bounded by the command's deadline, which the task carries.
+            deadline: Time(u64::MAX),
+            code_wait: u64::try_from(CODE_WAIT.as_nanos()).unwrap_or(u64::MAX),
+            most_bytes: MOST_KEPT,
+        };
+        let relay = PoolRelay::new(Time(now().0), opts)?;
+        Ok(CodeRelay { relay: RefCell::new(relay), workers, now, alloc, fault: Cell::new(None) })
+    }
+
+    fn time(&self) -> Time {
+        Time((self.now)().0)
+    }
+
+    /// One turn of relaying, never waiting: every finished make given back, the asks' deadlines
+    /// ticked, every make the pool wants handed to its worker.
+    fn pump(&self) -> Result<(), OneError> {
+        if let Some(fault) = self.fault.take() {
+            return Err(OneError::Relay(fault));
+        }
+        let now = self.time();
+        let mut relay = self.relay.borrow_mut();
+        while let Some((worker, result)) = self.workers.finished() {
+            match result {
+                Ok(bytes) => relay.made(now, worker, bytes),
+                Err(why) => relay.refused(now, worker, why),
+            }
+            .map_err(OneError::Relay)?;
+        }
+        relay.tick(now).map_err(OneError::Relay)?;
+        while let Some((worker, _, job)) = relay.job() {
+            self.workers.give(worker, job)?;
+        }
+        Ok(())
+    }
+
+    /// Child `child` asks for the code of `key` (`None`: unkeyed, its own), to be made by `job`.
+    fn ask(&self, child: Child, key: Option<blaze_ladder::code_records::CodeKey>, job: Job<'a>) -> Result<(), OneError> {
+        let key = key.map(|key| blaze_engine::code_pool::CodeKey(key.0));
+        self.relay.borrow_mut().ask(self.time(), child, key, job).map_err(OneError::Relay)?;
+        self.pump()
+    }
+
+    /// Child `child`'s answer through `with`, once it came; `None` while it has not.
+    fn answer<R>(&self, child: Child, with: impl FnOnce(Reply<'_, Unmade>) -> R) -> Result<Option<R>, OneError> {
+        self.relay.borrow_mut().answer(child, with).map_err(OneError::Relay)
+    }
+}
+
+/// A test's place in the relay for as long as its run lives: its end tells the relay, however
+/// the run ends (its own end, an error, or its future dropped by [`OneEach::kill`]).
+struct Asking<'r, 'a> {
+    code: &'r CodeRelay<'a>,
+    child: Child,
+}
+
+impl Drop for Asking<'_, '_> {
+    fn drop(&mut self) {
+        let now = self.code.time();
+        if let Err(fault) = self.code.relay.borrow_mut().exited(now, self.child)
+            && self.code.fault.get().is_none()
+        {
+            self.code.fault.set(Some(fault));
+        }
+    }
+}
+
+/// A test's run parked on its code (D194): since when (the run's clock) and for which symbol.
+#[derive(Clone, Copy)]
+struct Parked {
+    since: Duration,
+    symbol: [u8; 32],
+}
+
+/// What a parked run's answer was, taken out of the relay's borrow.
+enum Came {
+    Made,
+    Failed(ParentError),
+    Elsewhere { first: Child },
+    Late { waited: u64 },
+}
+
 /// A test's run under the lazy parent, as `blaze run`'s program runs (own_process.rs
 /// `run_own`), with the test's roots, its own folder and profile, piped output and a deadline.
 pub(crate) struct Launched<'c, 'h> {
@@ -1159,6 +1354,13 @@ pub(crate) struct Launched<'c, 'h> {
     /// frame (`Down::Native`, before the personality and any `Declare`), and the one file the
     /// profile lets the launcher map executable. `None` sends neither.
     pub native: Option<crate::engine_native::NativeSend<'c>>,
+    /// Where its code is made ([`CODES`]): `None`, in its own turn (`Serial`); else the
+    /// command's relay (`Pooled`, D194).
+    pub codes: Option<&'c CodeRelay<'c>>,
+    /// Its suite, named in each make it hands a worker ([`Job::suite`]).
+    pub suite: SuiteId,
+    /// Its suite's first child id in the relay: row `n`'s test is child `child_base + n`.
+    pub child_base: usize,
 }
 
 /// The test profile with the one grant a native image needs: `dlopen` maps `<store>/<64 hex>`
@@ -1254,6 +1456,9 @@ struct TestResolve<'r, R> {
 enum TestAnswer {
     Ready(Symbol),
     Unresolved(Symbol),
+    /// Its row waits for its code, made by a worker (run_parent.rs `Codes::Pooled`, D194): the
+    /// need is not taken, and the run parks until the relay answers it.
+    Waiting(Symbol),
 }
 
 impl<R: Resolve> Resolve for TestResolve<'_, R> {
@@ -1267,6 +1472,7 @@ impl<R: Resolve> Resolve for TestResolve<'_, R> {
         self.requested = Some(match answer {
             Resolved::Record { .. } => TestAnswer::Ready(*symbol),
             Resolved::Unknown => TestAnswer::Unresolved(*symbol),
+            Resolved::Waiting => TestAnswer::Waiting(*symbol),
         });
         Ok(answer)
     }
@@ -1281,7 +1487,18 @@ struct FirstCall {
     unkeyed: usize,
 }
 
-impl Launched<'_, '_> {
+impl<'c> Launched<'c, '_> {
+    /// The make `lazy`'s waiting row asked for, handed to the relay as child `child`'s ask: its
+    /// order, name and proof, and the maker its roots make ([`TestFront::maker`]).
+    fn ask_code<'r, D: run_parent::Folder>(&self, code: &'c CodeRelay<'c>, child: Child, lazy: &Lazy<'_, '_, TestFront<'_, '_, 'r>, D>) -> Result<(), OneError> {
+        let start = lazy.start().ok_or(OneError::Parent(ParentError::NothingAsked))?;
+        let ask = lazy.asked().ok_or(OneError::Parent(ParentError::NothingAsked))?;
+        let mut name = SVec::new_in(code.alloc);
+        name.extend_from_slice(ask.name);
+        let job = Job { suite: self.suite, order: ask.order, name, proof: ask.proof, entry: start.maker_entry(), start: start.maker_start };
+        code.ask(child, ask.key, job)
+    }
+
     async fn run_captured(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals, stderr: &mut StderrCapture<'_>, frame: &Frame) -> Result<How, OneError> {
         let cx = self.cx;
         let test = key_of(&self.tests, row)?;
@@ -1299,6 +1516,12 @@ impl Launched<'_, '_> {
         let front = TestFront { names: self.names, ids: self.ids, builder: self.builder, tables: self.tables, alloc, test, exports, harness: self.tests.harnessed(), watch: self.watch };
         let mut codes = HomeCodeStore::new(self.lent);
         let mut lazy = Lazy::new(cx, front, RecordsDir { cx, dir: self.records }, &mut codes, self.builder, alloc);
+        // Its place in the relay, told its end however the run ends (D194).
+        let child = Child(self.child_base + row as usize);
+        let _asking = self.codes.map(|code| Asking { code, child });
+        if self.codes.is_some() {
+            lazy.make_by(Codes::Pooled);
+        }
         let mut needs = Needs::new(alloc);
         let mut ahead = std::vec::Vec::new_in(alloc);
         let mut placed = Vec::new_in(alloc);
@@ -1334,7 +1557,14 @@ impl Launched<'_, '_> {
         let spec = RunSpec { program: SANDBOX_EXEC, arg0: None, args: args.as_slice(), env: vars.as_slice(), dir: self.place.dir, streams: Streams::PIPED, own_group: true, parent_death: ParentDeath::STRONGEST };
         signals.begin(Doing::Starting);
         let Started { child: mut run, pipes: given } = self.spawner.start_served(cx, &spec).map_err(OneError::Start)?;
-        let until = Deadline::after(run.now(), Duration::from_nanos(budget.0));
+        // Its allowance runs from its start, less the time it was parked waiting for its code
+        // (D194): that wait has its own deadline (`CODE_WAIT`) and error, never the test's.
+        let started_at = run.now();
+        let allowance = Duration::from_nanos(budget.0);
+        let mut parked_for = Duration::ZERO;
+        let mut parked: Option<Parked> = None;
+        // Its code came: the inbox kept from the waiting frame on is served again, unread.
+        let mut again = false;
         let stdout = given.stdout.ok_or(OneError::MissingPipe { stream: "stdout" })?;
         let stderr_pipe = given.stderr.ok_or(OneError::MissingPipe { stream: "stderr" })?;
         let mut pipes = [Some(stdout), Some(stderr_pipe)];
@@ -1354,6 +1584,46 @@ impl Launched<'_, '_> {
             let _span = cx.span("blaze test: service one child's pipes, requests and deadline");
             signals.begin(Doing::Relaying);
             let now = run.now();
+            let open_park = parked.map_or(Duration::ZERO, |park| now.saturating_sub(park.since));
+            let until = Deadline::after(started_at, allowance.saturating_add(parked_for).saturating_add(open_park));
+            if let Some(code) = self.codes {
+                code.pump()?;
+                // The runner's watch moves its answer's due by it (test_run.rs `answer_due`).
+                signals.parked.set(u64::try_from(parked_for.saturating_add(open_park).as_nanos()).unwrap_or(u64::MAX));
+            }
+            if let (Some(park), Some(code)) = (parked, self.codes) {
+                let came = code.answer(child, |reply| match reply {
+                    Reply::Made(entry) => match lazy.made(entry) {
+                        Ok(()) => Came::Made,
+                        Err(cause) => Came::Failed(cause),
+                    },
+                    Reply::Refused(why) => Came::Failed(lazy.unmade(why)),
+                    Reply::RefusedElsewhere { first, .. } => Came::Elsewhere { first },
+                    Reply::Late { waited, .. } => Came::Late { waited },
+                })?;
+                if let Some(came) = came {
+                    parked_for = parked_for.saturating_add(open_park);
+                    parked = None;
+                    let stop = match came {
+                        Came::Made => None,
+                        Came::Failed(cause) => Some(test_parent_error(&mut lazy, cause)),
+                        Came::Elsewhere { first } => Some(match lazy.withdraw() {
+                            Ok(()) => OneError::CannotBuild(InstanceRefusal { instance: lazy.name_of(park.symbol), symbol: park.symbol, site: None, cause: RefusalCause::Elsewhere { first: first.0 } }),
+                            Err(cause) => OneError::Parent(cause),
+                        }),
+                        Came::Late { waited } => Some(match lazy.withdraw() {
+                            Ok(()) => OneError::CodeLate { instance: lazy.name_of(park.symbol), symbol: park.symbol, waited },
+                            Err(cause) => OneError::Parent(cause),
+                        }),
+                    };
+                    if let Some(error) = stop {
+                        // Its process waits for code it will never receive.
+                        run.kill().map_err(child_error)?;
+                        return Err(error);
+                    }
+                    again = true;
+                }
+            }
             if until.passed(now) {
                 let killed = run.kill().map_err(child_error)?;
                 break (How::TimedOut { after: budget }, killed.left);
@@ -1379,9 +1649,28 @@ impl Launched<'_, '_> {
                 reply.clear();
             }
             let poll = Deadline::after(run.now(), signals.wait.replace(Duration::ZERO)).min(bound);
-            if open {
-                match run.recv_message(&mut inbox, blaze_launch::wire::LONGEST_FRAME, poll) {
-                    Ok(Message::Whole { len }) => {
+            // Parked, nothing is read or served: its frames wait in the channel, in order.
+            if open && parked.is_none() {
+                let got = if core::mem::take(&mut again) {
+                    // Its code came: the frames kept from the waiting one on, served again.
+                    Some(inbox.len())
+                } else {
+                    match run.recv_message(&mut inbox, blaze_launch::wire::LONGEST_FRAME, poll) {
+                        Ok(Message::Whole { len }) => Some(len),
+                        Ok(Message::Closed) => {
+                            open = false;
+                            None
+                        }
+                        Err(error @ ProcError { fault: RunFault::Channel(ChannelError::Torn { .. }), .. }) => {
+                            torn = Some(error);
+                            open = false;
+                            None
+                        }
+                        Ok(Message::Deadline) => None,
+                        Err(error) => return Err(child_error(error)),
+                    }
+                };
+                if let Some(len) = got {
                         self.watch.see(blaze_screen::Step::Waits);
                         signals.begin(Doing::Serving);
                         let serving = run.now();
@@ -1413,6 +1702,19 @@ impl Launched<'_, '_> {
                                     found: after.found - before.found, unkeyed: after.unkeyed - before.unkeyed,
                                 });
                             }
+                            // Its row waits for its code, made by a worker (D194): the run parks.
+                            Some(TestAnswer::Waiting(Symbol(symbol))) => {
+                                let asked = match self.codes {
+                                    Some(code) => self.ask_code(code, child, &lazy),
+                                    // `Serial` makes inside the step and never waits.
+                                    None => Err(OneError::Parent(ParentError::NotReady { symbol })),
+                                };
+                                if let Err(error) = asked {
+                                    run.kill().map_err(child_error)?;
+                                    return Err(error);
+                                }
+                                parked = Some(Parked { since: run.now(), symbol });
+                            }
                             // Faults and requests for an already answered slot need no resolution.
                             None => {}
                         }
@@ -1423,17 +1725,10 @@ impl Launched<'_, '_> {
                         inbox.copy_within(taken.., 0);
                         inbox.truncate(left);
                         continue;
-                    }
-                    Ok(Message::Closed) => open = false,
-                    Err(error @ ProcError { fault: RunFault::Channel(ChannelError::Torn { .. }), .. }) => {
-                        torn = Some(error);
-                        open = false;
-                    }
-                    Ok(Message::Deadline) => {}
-                    Err(error) => return Err(child_error(error)),
                 }
             }
-            let look = if open { Deadline::PASSED } else { poll };
+            // Parked, the turn's wait is the sweep's interval (as a read's would be).
+            let look = if open && parked.is_none() { Deadline::PASSED } else { poll };
             run = match run.wait(look).map_err(child_error)? {
                 Waited::Ended(reaped) => break (child_outcome(reaped.exit), reaped.left),
                 Waited::Running(running) => running,
@@ -1924,6 +2219,16 @@ pub(crate) fn run_suites<'h>(
         let temp = bstd::mem::format_in!(frame, "{home}/{TEMPS}/{}/{index}", command.as_str());
         dirs.push((dir, temp));
     }
+    // THE seam of D194 ([`CODES`]): `Serial` makes each test's code in its own turn; `Pooled`
+    // relays it to the command's workers, which this build does not make yet (piece 2): refused
+    // by name, never run serially in its place (rule 3).
+    // A borrow, never an owned relay here: `Launched::codes` is `&'c CodeRelay<'c>` (invariant),
+    // so an owned relay in this frame would be borrowed past its own drop (E0597, a1850).
+    let relay: Option<&CodeRelay<'_>> = match CODES {
+        Codes::Serial => None,
+        Codes::Pooled => return Err(DriveError::NoCodeWorkers),
+    };
+    let mut child_base = 0usize;
     let mut launches = Vec::with_capacity_in(suites.len(), alloc);
     let mut checks = Vec::with_capacity_in(suites.len(), alloc);
     let mut locations = Vec::new_in(alloc);
@@ -1942,7 +2247,11 @@ pub(crate) fn run_suites<'h>(
             builder: suite.builder, lent, tables, watch,
             args: if tests.harnessed() { &[] } else { args },
             native: suite.native.ok().flatten(),
+            codes: relay,
+            suite: suite_id,
+            child_base,
         });
+        child_base += tests.len();
         checks.push(EntryCheck { tests, names: suite.names, builder: suite.builder, tables, image: suite.native.map(|native| native.map_or(&[][..], |send| send.items)), said: String::new_in(alloc) });
         for at in 0..tests.len() {
             let mut row = asked(unit, record_row(tests, at)?, args);

@@ -291,6 +291,12 @@ pub trait FrontEnd {
     fn caller_site(&self, _owner: ItemKey, _expr: blaze_typeck::ExprId) -> Option<blaze_build::CallerSite<'_>> {
         None
     }
+    /// Where fn `item` is defined, in [`FrontEnd::caller_site`]'s form (blaze-build
+    /// `Adts::def_site`: rustc's `def_span`, the first token after the fn's outer attributes
+    /// and doc comments). `None`: `item` not tabled, or a front end that does not answer.
+    fn def_site(&self, _item: ItemKey) -> Option<blaze_build::CallerSite<'_>> {
+        None
+    }
     /// The first byte of expression `expr` of `owner`'s body counted from `owner`'s first, with
     /// no file: a trap row's site (blaze-build `Adts::expr_site`). By default the offset of
     /// [`FrontEnd::caller_site`]'s answer; the lazy front end answers from the body alone, so

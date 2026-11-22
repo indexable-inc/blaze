@@ -318,6 +318,8 @@ pub fn decide_stalled_goals<'n, 'a, S: NamesSource<'n>>(
     };
     let scope = body.scope(&spell);
     let mut last: Option<tc::Question> = None;
+    // The records made between rounds, for a refusal past the last (check.rs `rounds_fail`).
+    let mut made = 0u64;
     // The decision's own leak list, from the check's last round's: grown only by the
     // decision's own `OpaqueHiddenUnknown` gaps (opaque_auto.rs `after_auto_gap`), each round
     // adding one opaque or ending, so the rounds are bounded by the opaques it can name.
@@ -350,6 +352,7 @@ pub fn decide_stalled_goals<'n, 'a, S: NamesSource<'n>>(
                     questions.push(q);
                     return Decision::Refused(Refused::Check(CheckFail::NothingToFill { owner, questions }));
                 }
+                made += fills.len() as u64;
                 if let Err(fail) = make_all(r, fills, owner) {
                     return Decision::Refused(Refused::Check(fail));
                 }
@@ -452,7 +455,7 @@ pub fn decide_stalled_goals<'n, 'a, S: NamesSource<'n>>(
     }
     let mut questions = Vec::new_in(Global);
     questions.extend(last);
-    Decision::Refused(Refused::Check(CheckFail::Rounds { owner, last: questions }))
+    Decision::Refused(Refused::Check(super::check::rounds_fail(r, owner, "deciding the stalled goals of an async body", made, questions)))
 }
 
 impl AsyncInteriors<'_> {

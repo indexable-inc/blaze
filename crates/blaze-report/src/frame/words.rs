@@ -64,7 +64,9 @@ pub enum Kind {
     /// A task that failed only because one it needs failed: a note, counted as a failure under
     /// its cause.
     Waited,
-    /// Said, counted as nothing: a view's own line (a group's count), not a check's finding.
+    /// Said, counted as nothing: a view's own line (a group's count), or what the request left
+    /// out by the manifest's own rule (a target whose `required-features` are off), not a
+    /// check's finding.
     Told,
 }
 
@@ -522,6 +524,17 @@ pub const WORDINGS: &[Wording] = &[
         headline: "{0} {1} not checked because {2}: {3}",
         label: "one line for every item under one cause; `--each` draws each",
         args: 4,
+        kind: Kind::Told,
+    },
+    // A root's target the unit graph leaves out by its `required-features` (blaze-unit-graph
+    // `LeftOut`, said by blaze-cli graph.rs): the whole sentence, naming the target and what is off.
+    Wording {
+        area: Area::Cli,
+        number: 46,
+        name: "target-skipped",
+        headline: "{0}",
+        label: "not built, checked or run until those features are on (`--features`, `--all-features`)",
+        args: 1,
         kind: Kind::Told,
     },
     Wording {

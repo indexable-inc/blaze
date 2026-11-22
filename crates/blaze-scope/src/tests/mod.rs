@@ -32,6 +32,7 @@ mod call_scratch;
 mod derive_where_shape;
 mod blocks;
 mod block_cfg;
+mod crate_cfg_off;
 mod macro_blocks;
 mod entry;
 mod failed_call;

@@ -196,9 +196,11 @@
 //! A fn [`Adts::track_caller`] says is tracked takes one hidden last parameter, a pointer to
 //! its caller's `Location`: a call from an untracked fn passes a data row of the call's own
 //! place ([`Adts::caller_site`]), a call from a tracked fn forwards what it was given (the
-//! Reference, "The `track_caller` attribute", [attributes.codegen.track_caller]). A tracked
-//! fn taken as a fn pointer is refused by name ([`BuildError::TrackCaller`]: its shim, which
-//! passes the fn's own definition site, is not built).
+//! Reference, "The `track_caller` attribute", [attributes.codegen.track_caller]). A `Fn*` shim
+//! of a tracked fn item passes a row of the `Fn*` method's definition site ([`Adts::def_site`],
+//! as rustc's call shim does). A tracked fn taken as a fn pointer is refused by name
+//! ([`BuildError::TrackCaller`]: its shim, which passes the fn's own definition site, is not
+//! built).
 
 #![feature(allocator_api)]
 
@@ -577,6 +579,21 @@ pub trait Adts {
         None
     }
 
+    /// Where fn `item` is DEFINED, in [`Adts::caller_site`]'s item-relative form (rule 71):
+    /// rustc's `def_span` of a fn (rustc_middle hir/map.rs `hir_span`: its `sig.span`, which
+    /// rustc_parse function.rs `parse_fn` starts at `sig_lo`, the first token after the outer
+    /// attributes and doc comments, its visibility included), for a fn inside a macro's
+    /// expansion its outermost call's. What a call shim passes as the `Location` of a
+    /// `#[track_caller]` fn it calls: a `Fn*` shim of a fn item passes the site of the `Fn*`
+    /// method it is (rustc_mir_transform shim.rs `build_call_shim`: the call's span is
+    /// `tcx.def_span` of the shim's def, `FnOnce::call_once`, `FnMut::call_mut` or `Fn::call`;
+    /// the shim itself is never tracked, rustc_middle instance.rs `requires_caller_location`).
+    /// No answer is refused with [`BuildError::TrackCaller`].
+    fn def_site(&self, item: ItemKey) -> Option<CallerSite<'_>> {
+        let _ = item;
+        None
+    }
+
     /// Expression `expr` of `owner`'s body as a trap row keeps it: its first byte counted from
     /// `owner`'s first byte (rule 71; for one inside a macro's expansion its outermost call's),
     /// with no file. What a trap's site is (walk.rs `mark_trap`): a trap needs no `file!()`, so
@@ -853,6 +870,12 @@ pub enum BuildError {
     /// A layout read a record that is not made yet: `item`'s (an enum's explicit discriminant).
     /// Nothing was cached; the build can be asked again once the record exists.
     MissingRecord { item: ItemKey },
+    /// A layout needs the hidden type of `impl Trait` type `opaque` (a type alias's: std's
+    /// `backtrace::LazyResolve`, which `Backtrace` holds), read from its defining fn `owner`'s
+    /// check record, and `owner` is not checked in this program. Nothing was cached: a program
+    /// that checks fns on demand checks `owner` and builds again (blaze-ladder run/make_one.rs);
+    /// any other refuses with it.
+    OpaqueOwnerUnchecked { opaque: ItemKey, owner: ItemKey },
     /// A type names ADT `adt`, which [`Adts::adt`] does not describe: the seam tabled no row
     /// for it. The key is kept so the caller can name the ADT by its path.
     NoAdt { adt: ItemKey },
@@ -999,6 +1022,11 @@ impl fmt::Display for BuildError {
             BuildError::MissingRecord { item } => {
                 write!(f, "a layout needs the record of item {:#x} (an explicit discriminant), which is not made yet", item.0)
             }
+            BuildError::OpaqueOwnerUnchecked { opaque, owner } => write!(
+                f,
+                "the hidden type of `impl Trait` type {:#x} needs its defining fn {:#x} checked, which is not in the program (not reached, or it did not check)",
+                opaque.0, owner.0
+            ),
             BuildError::NoAdt { adt } => {
                 write!(f, "a type names ADT {:#x}, which the build's `Adts` does not describe", adt.0)
             }

@@ -350,6 +350,27 @@ impl fmt::Display for Unoutlined {
     }
 }
 
+/// THE OUTLINE A UNIT HOLDS ITS ITEMS RECORD'S FILE AT `path` AS (D191): the file's outlines are
+/// one per name it is planned by, and one file can have two: a `mod config;` plans the slot
+/// `cli/config.rs`, read at `cli/config/mod.rs` (engine_bodies.rs `slot_names`), and another
+/// crate's `#[path = "../../cli/config/mod.rs"] mod config;` plans `cli/config/mod.rs` itself
+/// (work.rs `module_file`; turso's tursodb and tursopg, c1814). A unit's bodies' rows are named
+/// from the outlines its module tree reaches ([`Reach`]), so the one it holds is the one it
+/// reaches (`reach`, sorted: [`reached_under`]). The first outline at `path` held for both, so
+/// the unit that reached the other said it held nothing there and its rows went unchecked, noted
+/// "not part of this build". A unit that reaches no outline at `path` holds the first (the one
+/// there is, but for a file named twice). `None`: no outline is at `path`.
+pub(crate) fn outline_at_path(outlined: &[Outlined<'_>], path: &[u8], reach: &[Name]) -> Option<usize> {
+    let mut first = None;
+    for (at, one) in outlined.iter().enumerate().filter(|(_, one)| one.path.as_slice() == path) {
+        if reach.binary_search(&one.name).is_ok() {
+            return Some(at);
+        }
+        first.get_or_insert(at);
+    }
+    first
+}
+
 /// The files (by name, sorted) a crate's module tree reaches from its root file `root`: the root
 /// and every file a reached outline names as a file part, transitively, as the planner walked
 /// them (engine_check.rs `plan`), cfg-blind: a file two crates reach is in both crates' walks, and

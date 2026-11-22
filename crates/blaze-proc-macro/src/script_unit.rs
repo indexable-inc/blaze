@@ -206,18 +206,33 @@ pub fn records_named(store: &Path, name: &str, version: &str) -> Result<Vec<(Pat
     Ok(found)
 }
 
+/// The process shim this binary's build-script host answers (guest/script_process.rs, as built
+/// into it): the bootstrap builder writes `shim <its SHA-256>` into a wasm module's identity
+/// (scripts proc_macro_modules build_scripts.rs `library`), the same digest of the same file.
+const SHIM: &[u8] = include_bytes!("../guest/script_process.rs");
+
+/// The identity line a wasm module must carry to be run by this host: `shim <sha256 hex>`.
+pub fn shim_line() -> String {
+    format!("shim {}", crate::module::sha256_hex(SHIM))
+}
+
 /// The record whose identity names `name`, `version`, `features` and, for `host`, `target
-/// <host>`; for `None`, one with no `target` line (a wasm module). Two such records are a
-/// typed refusal, never the first in the listing's order.
+/// <host>`; for `None`, one with no `target` line and this host's [`shim_line`] (a wasm module).
+/// Two such records are a typed refusal, never the first in the listing's order.
 fn module_where(store: &Path, name: &str, version: &str, features: &[&str], host: Option<&str>) -> Result<Option<PathBuf>, ModuleLookupError> {
     let mut sorted = features.to_vec();
     sorted.sort_unstable();
     let lines = [format!("name {name}"), format!("version {version}"), format!("features {}", sorted.join(","))];
     let target = host.map(|host| format!("target {host}"));
+    let shim = shim_line();
     let mut fits = records(store)?.into_iter().filter(|(_, identity)| {
+        // A wasm module answers only with the shim this host speaks to: one built with another
+        // is not this ask's record, so a stale module is a named miss (`NoModule`, whose words
+        // show the differing `shim` line), never a run that misreads a reply, and never a second
+        // record beside its rebuild (`Ambiguous`).
         let runner_fits = match &target {
             Some(want) => identity.lines().any(|l| l == want),
-            None => !identity.lines().any(|l| l.starts_with("target ")),
+            None => !identity.lines().any(|l| l.starts_with("target ")) && identity.lines().any(|l| l == shim),
         };
         runner_fits && lines.iter().all(|want| identity.lines().any(|l| l == want))
     });

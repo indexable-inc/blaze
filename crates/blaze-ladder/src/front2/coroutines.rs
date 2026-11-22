@@ -248,8 +248,13 @@ pub(crate) fn opaque_hidden<P: FrontEnd>(
     if callee != owner {
         return opaque_at_impl(program, checked, facts, opaque, owner, callee, callee_args, ground, scratch);
     }
+    // A type alias's `impl Trait` is met by the layout of a type that holds it, never by a
+    // call of its defining fn (std's `Backtrace` holds `LazyLock<Capture, LazyResolve>`, whose
+    // `#[define_opaque(LazyResolve)] fn lazy_resolve` eyre's `DefaultHandler::default_with` never
+    // calls; t1800): a program that checks on demand has no row for it yet. Named, so that
+    // driver checks it and builds again (run/make_one.rs).
     let Some(i) = program.fn_index(owner) else {
-        return Err(refused("an `impl Trait` type whose defining fn is not in the program (not reached, or it did not check)"));
+        return Err(BuildError::OpaqueOwnerUnchecked { opaque, owner });
     };
     let function = program.function(i);
     let (Some(_), Some(done)) = (function.body, checked.get(i).and_then(Option::as_ref)) else {

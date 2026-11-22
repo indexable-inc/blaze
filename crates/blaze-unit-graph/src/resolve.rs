@@ -2,13 +2,13 @@
 //! roots. Both are explicit worklists (no recursion); every set grows only, so the fixpoint is
 //! reached whatever order the work is taken in (the property tests take it in drawn orders).
 
-use blaze_manifest::layout::DepKind;
+use blaze_manifest::layout::{DepKind, ExtraKind};
 use blaze_manifest::lock::{Lock, LockId, LockSource};
 use blaze_own::{AVec, Alloc, BTreeMap, String, Vec};
 
 use crate::input::{Ask, Bin, CfgAtom, DepSource, FeatureValue, Lib, Package, Resolver, TargetDesc};
 use crate::extra::{Extra, has_test_cfg};
-use crate::{Pass, PartialGraph, Plant, Text, Unit, UnitDep, UnitError, UnitGraph, UnitId, UnitKind};
+use crate::{LeftOut, LeftOutKind, Pass, PartialGraph, Plant, Text, Unit, UnitDep, UnitError, UnitGraph, UnitId, UnitKind};
 
 /// An answer to a [`Pass::Need`].
 pub(crate) enum Answer<'a> {
@@ -497,32 +497,40 @@ impl<'l, 'a> Resolution<'l, 'a> {
         Ok(())
     }
 
-    /// Whether every `required-features` entry of the root `id`'s binary `bin` is on, by the
-    /// fixpoint's features of the root's target node (the Cargo Book, "Cargo Targets", "The
-    /// `required-features` field": a feature of the package, or `dep/feature`, which holds when
-    /// the dependency is on with that feature). A name the package lacks is the package's
-    /// error, never a skip. A dependency whose facts are not answered keeps the binary: the
-    /// walk reports that package as needed or unavailable.
-    fn required_on<'s>(&'s self, st: &State<'s, 'a>, id: LockId, package: &Package<'a>, bin: &Bin<'a>) -> Result<bool, UnitError<'a>> {
+    /// The `required-features` entries of the root `id`'s target `kind` `name` that are off,
+    /// sorted as `required` is, by the fixpoint's features of the root's target node (the
+    /// Cargo Book, "Cargo Targets", "The `required-features` field": a feature of the package,
+    /// or `dep/feature`, which holds when the dependency is on with that feature); empty when
+    /// all are on. A name the package lacks is the package's error, never a skip. A dependency
+    /// whose facts are not answered keeps the target (empty): the walk reports that package as
+    /// needed or unavailable. An integration test, example or bench builds with the
+    /// dev-dependencies (rule 8), so its `dep/feature` may name one; a binary's may not.
+    fn required_off<'s>(&'s self, st: &State<'s, 'a>, id: LockId, package: &Package<'a>, kind: LeftOutKind, name: &str, required: &[Text<'a>]) -> Result<AVec<'a, Text<'a>>, UnitError<'a>> {
         let n = node(id, Side::Target) as usize;
+        let mut off = Vec::new_in(self.alloc);
         let asked_by = || {
             let mut by = String::new_in(self.alloc);
-            by.push_str("the required-features of bin ");
-            by.push_str(bin.name.as_str());
+            by.push_str("the required-features of ");
+            by.push_str(kind.table());
+            by.push(' ');
+            by.push_str(name);
             by
         };
-        for text in bin.required_features.iter() {
+        let with_dev = kind != LeftOutKind::Bin;
+        for text in required.iter() {
             let Some((dep_key, feature)) = text.as_str().split_once('/') else {
                 match package.feature(text.as_str()) {
-                    Some(f) if get(&st.feats[n], f) => continue,
-                    Some(_) => return Ok(false),
+                    Some(f) if get(&st.feats[n], f) => {}
+                    Some(_) => off.push(text.clone()),
                     None => return Err(UnitError::NoSuchFeature { package: package.name.clone(), feature: text.clone(), asked_by: asked_by() }),
                 }
+                continue;
             };
             let mut named = false;
             let mut on = false;
             for (e, dep) in package.deps.iter().enumerate() {
-                if dep.key.as_str() != dep_key || dep.kind != DepKind::Normal {
+                let kind_counts = dep.kind == DepKind::Normal || (with_dev && dep.kind == DepKind::Dev);
+                if dep.key.as_str() != dep_key || !kind_counts {
                     continue;
                 }
                 named = true;
@@ -531,7 +539,7 @@ impl<'l, 'a> Resolution<'l, 'a> {
                     continue;
                 }
                 let child_id = self.locked(id, package, e)?;
-                let Answer::Read(child) = &self.answers[child_id.index()] else { return Ok(true) };
+                let Answer::Read(child) = &self.answers[child_id.index()] else { return Ok(Vec::new_in(self.alloc)) };
                 let Some(f) = child.feature(feature) else {
                     return Err(UnitError::NoSuchFeature { package: child.name.clone(), feature: own(feature, self.alloc), asked_by: asked_by() });
                 };
@@ -542,10 +550,10 @@ impl<'l, 'a> Resolution<'l, 'a> {
                 return Err(UnitError::NoSuchDependency { package: package.name.clone(), dep: own(dep_key, self.alloc) });
             }
             if !on {
-                return Ok(false);
+                off.push(text.clone());
             }
         }
-        Ok(true)
+        Ok(off)
     }
 
     /// The units, walked from the roots.
@@ -556,6 +564,7 @@ impl<'l, 'a> Resolution<'l, 'a> {
         let mut keys: AVec<'a, Key> = Vec::new_in(alloc);
         let mut index: BTreeMap<Key, u32, Alloc<'a>> = BTreeMap::new_in(alloc);
         let mut tmp: AVec<'a, Tmp<'s, 'a>> = Vec::new_in(alloc);
+        let mut left_out: AVec<'a, LeftOut<'a>> = Vec::new_in(alloc);
         // Each unit is added as the target it compiles (finding 9): its key's kind is the
         // target's, and its crate name and root are made from it, never an empty text for a
         // kind its package lacks.
@@ -592,16 +601,25 @@ impl<'l, 'a> Resolution<'l, 'a> {
                     };
                 }
             }
+            // A target whose `required-features` are not all on is skipped (the Cargo Book,
+            // "Cargo Targets", "The `required-features` field": "If any of the required
+            // features are not enabled, the target will be skipped."), and said: a
+            // [`LeftOut`] naming it and what is off (rule 3). Checked anyway, tempo's
+            // `tempo-localnet` (`required-features = ["localnet"]`, `localnet = ["dep:nix"]`)
+            // was three false "cannot find `nix`"; turso's bench `logical_log_serialization`
+            // (`bench`) and example `sync_example` (`sync`) were checked without their
+            // features (c1814).
+            let mut skipped = |kind: LeftOutKind, name: &Text<'a>, off: AVec<'a, Text<'a>>| {
+                left_out.push(LeftOut { package: root, package_name: package.name.clone(), kind, name: name.clone(), off });
+            };
             for i in 0..package.bins.len() as u32 {
-                // A binary whose `required-features` are not all on is skipped, its test unit
-                // with it (the Cargo Book, "Cargo Targets", "The `required-features` field":
-                // "If any of the required features are not enabled, the target will be
-                // skipped."). Checked anyway, tempo's `tempo-localnet` (`required-features =
-                // ["localnet"]`, `localnet = ["dep:nix"]`) was three false "cannot find `nix`".
-                if !self.required_on(st, root, package, &package.bins[i as usize])? {
+                // Its test unit goes with it.
+                let bin = &package.bins[i as usize];
+                let off = self.required_off(st, root, package, LeftOutKind::Bin, bin.name.as_str(), &bin.required_features)?;
+                if !off.is_empty() {
+                    skipped(LeftOutKind::Bin, &bin.name, off);
                     continue;
                 }
-                let bin = &package.bins[i as usize];
                 add(root, Target::Bin(i, bin), Side::Target, Side::Target, &mut keys, &mut index, &mut tmp);
                 if self.ask.tests {
                     add(root, Target::TestBin(i, bin), Side::Target, Side::Target, &mut keys, &mut index, &mut tmp);
@@ -613,10 +631,23 @@ impl<'l, 'a> Resolution<'l, 'a> {
             // with `with_test_targets`, for the workspace the user builds).
             if self.ask.tests {
                 for (i, extra) in package.extras.iter().enumerate() {
+                    let kind = match extra.kind {
+                        ExtraKind::Test => LeftOutKind::Test,
+                        ExtraKind::Example => LeftOutKind::Example,
+                        ExtraKind::Bench => LeftOutKind::Bench,
+                    };
+                    let off = self.required_off(st, root, package, kind, extra.name.as_str(), &extra.required_features)?;
+                    if !off.is_empty() {
+                        skipped(kind, &extra.name, off);
+                        continue;
+                    }
                     add(root, Target::Extra(i as u32, extra), Side::Target, Side::Target, &mut keys, &mut index, &mut tmp);
                 }
             }
         }
+        // By (package, kind, name), each once (a root asked twice is one): the record's order.
+        left_out.sort_by(|a: &LeftOut<'a>, b: &LeftOut<'a>| (a.package, a.kind, a.name.as_str()).cmp(&(b.package, b.kind, b.name.as_str())));
+        left_out.dedup_by(|a, b| a.package == b.package && a.kind == b.kind && a.name == b.name);
         let mut next = 0usize;
         while next < keys.len() {
             let key = keys[next];
@@ -734,7 +765,7 @@ impl<'l, 'a> Resolution<'l, 'a> {
                 meta.push((id, package.meta.clone()));
             }
         }
-        Ok(Pass::Done(UnitGraph { units, resolver: self.resolver, meta }))
+        Ok(Pass::Done(UnitGraph { units, resolver: self.resolver, meta, left_out }))
     }
 
     fn unit(&self, st: &State<'_, 'a>, key: Key, package: &Package<'a>, t: &Tmp<'_, 'a>, new_id: &[u32]) -> Unit<'a> {

@@ -231,10 +231,16 @@ pub(crate) fn chained_fixups<'a, 'n, F>(
             // in its top byte (C's `(uintptr_t)&x | 1ull << 63` in a static initializer) keeps
             // the tag in `high8`, as ld64 writes it; only bits 36..55 cannot be held.
             Chain::Rebase { target } => {
-                if target & blaze_native::layout::REBASE_MIDDLE != 0 {
-                    return Err(ChainTooLarge { what: "a chained rebase's target: bits 36..55 set (neither the 36-bit offset nor the top byte)", len: target, at: Some(at) });
+                // The top byte is the pointer's tag, carried in `high8` (bits 36..43; dyld:
+                // header + (high8 << 56 | target)): arm64 non-unique RTTI's bit 63 on a
+                // typeinfo's name (blaze-native layout.rs `apply`, which lays only a tag over an
+                // image place). Bits 36..55 are no image place: refused by the slot, the
+                // writer's own guard behind layout's named refusal.
+                let address = target & blaze_native::layout::REBASE_ADDRESS;
+                if address >= 1 << 36 {
+                    return Err(ChainTooLarge { what: "a chained rebase's 36-bit target (below its top byte, the tag)", len: target, at: Some(at) });
                 }
-                (target & ((1 << 36) - 1)) | ((target >> 56) << 36) | (next << 51)
+                address | ((target >> 56) << 36) | (next << 51)
             }
             Chain::Bind { import } => {
                 if import >= 1 << 24 {

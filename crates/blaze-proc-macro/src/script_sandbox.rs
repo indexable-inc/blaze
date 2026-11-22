@@ -469,6 +469,12 @@ pub enum SpawnRefusal {
     TreeOnDisk { program: String, args: Vec<String> },
     /// A child's output sent somewhere the router does not take (a file, mode 3).
     Mode { program: String, stream: &'static str, mode: u8 },
+    /// A spawn of a program the machine does not have (spawn_route.rs `program_found`, D192)
+    /// that arrived without the shim's `found` question: the module was built with a process
+    /// shim that cannot return `NotFound`, so it is not given an answer it would misread.
+    NotFoundUnasked { program: String, args: Vec<String> },
+    /// The host has no pinned base tool set to look a spawned program up in.
+    NoToolSet(crate::spawn_route::NoToolSet),
 }
 
 /// How a spawn request is not the shim's encoding.
@@ -534,6 +540,12 @@ impl std::fmt::Display for SpawnRefusal {
                 args.join(" ")
             ),
             SpawnRefusal::Mode { program, stream, mode } => write!(f, "spawned `{program}` with its {stream} sent to mode {mode} (a file), which blaze does not take"),
+            SpawnRefusal::NotFoundUnasked { program, args } => write!(
+                f,
+                "spawned `{program} {}`, a program the pinned base tool set does not hold and blaze does not answer (D192): a machine without it says `NotFound`, but this module's process shim spawned without asking (`found`, guest/script_process.rs), so it was built before that question: rebuild the module",
+                args.join(" ")
+            ),
+            SpawnRefusal::NoToolSet(why) => write!(f, "{why}"),
         }
     }
 }
@@ -1091,6 +1103,41 @@ impl ScriptSandbox {
         })
     }
 
+    /// Whether `program` is one the script's machine has (spawn_route.rs `program_found`, D192),
+    /// in a frame of its own; a host with no base tool set stops the script by name.
+    fn look_up(&mut self, program: &str) -> Result<bool, Stop> {
+        let frame = match blaze_mem::Frame::new(blaze_mem::Tag::Other) {
+            Ok(frame) => frame,
+            Err(e) => {
+                let why = format!("no frame to read pins/base-tools.json in: {e}");
+                let no_set = crate::spawn_route::NoToolSet { program: program.to_owned(), host: self.script.host.clone(), why };
+                return Err(self.refuse(Refusal::Spawn(SpawnRefusal::NoToolSet(no_set))));
+            }
+        };
+        let erased = blaze_own::Erased::new(&frame);
+        match crate::spawn_route::program_found(program, &self.script.host, erased.handle()) {
+            Ok(found) => Ok(found),
+            Err(no_set) => Err(self.refuse(Refusal::Spawn(SpawnRefusal::NoToolSet(no_set)))),
+        }
+    }
+
+    /// The shim's `found` question (guest/script_process.rs, asked by `Command::spawn` before
+    /// any child exists): whether the machine has `program`. A program it does not have is the
+    /// OS's `NotFound` to the script (D192), and the read `absent-program\n<host>\n<name>` is
+    /// recorded with its answer, so a later list that holds the program reruns the script
+    /// (rule 21; fact_pins.rs `fact_now` answers it again).
+    pub fn found(&mut self, program: &[u8]) -> Result<bool, Stop> {
+        let Ok(program) = core::str::from_utf8(program) else {
+            return Err(self.refuse(Refusal::Spawn(SpawnRefusal::Malformed(Malformed::NotUtf8("the program")))));
+        };
+        let found = self.look_up(program)?;
+        if !found {
+            let host = self.script.host.clone();
+            self.record(crate::spawn_route::absent_subject(&host, program), Some(crate::spawn_route::absent_digest(&host, program)));
+        }
+        Ok(found)
+    }
+
     /// Answers one spawn the shim made (`guest/script_process.rs`'s encoding): the reply, an
     /// exit code and the two outputs, or the stop of the script.
     pub fn spawn(&mut self, request: &[u8]) -> Result<(), Stop> {
@@ -1105,8 +1152,12 @@ impl ScriptSandbox {
         let args_text: Vec<&str> = args.iter().map(String::as_str).collect();
         let owned = || args.to_vec();
         let name = program.rsplit('/').next().unwrap_or(program);
-        let routed = crate::spawn_route::route(name, &args_text, self.script.c_mode, self.script.spawner.is_some());
+        let found = self.look_up(program)?;
+        let routed = crate::spawn_route::route(name, &args_text, self.script.c_mode, found, self.script.spawner.is_some());
         let (code, stdout, stderr): (i32, Vec<u8>, Vec<u8>) = match routed {
+            crate::spawn_route::Route::NotFound => {
+                return Err(self.refuse(Refusal::Spawn(SpawnRefusal::NotFoundUnasked { program: program.clone(), args: owned() })));
+            }
             crate::spawn_route::Route::Rustc if self.script.probes.is_some() => {
                 let probes = self.script.probes.clone().expect("the arm's guard: the checker is on");
                 self.checked_probe(&probes, &args_text, &spawned, args)?

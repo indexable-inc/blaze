@@ -22,7 +22,7 @@ use blaze_id::ContentId;
 use blaze_manifest::lock::{Lock, LockId};
 use blaze_own::{AVec, Alloc};
 use blaze_unit_graph::record::{self, NotItsCfg, Source};
-use blaze_unit_graph::{Ask, Open, Package, Pass, Records, Resolution, Resolver, SourceError, StoreSources, TargetDesc, Text, UnitError};
+use blaze_unit_graph::{Ask, LeftOut, Open, Package, Pass, Records, Resolution, Resolver, SourceError, StoreSources, TargetDesc, Text, UnitError};
 
 /// The most passes of the resolution: each pass asks for the packages one level deeper, so the
 /// count is the graph's depth (tempo: 9). Past it, [`UnitGraphTaskError::Passes`] (rule 18).
@@ -95,6 +95,9 @@ impl fmt::Display for UnitGraphTaskError<'_> {
 pub struct UnitGraphMade<'a> {
     pub record: AVec<'a, u8>,
     pub findings: AVec<'a, SourceError<'a>>,
+    /// The roots' targets left out by `required-features` (also in the record): the task
+    /// says each as a note, never quietly (rule 3).
+    pub left_out: AVec<'a, LeftOut<'a>>,
 }
 
 /// What one entry of the task answered (drive.md, "For a successor", step 1). The task holds
@@ -147,7 +150,7 @@ pub fn run<'b, 'a, R: Records<'b>>(
                     return Ok(Entry::NotFetched { count: not_fetched });
                 }
                 let record = record::encode(&graph, inputs.target, inputs.host, alloc).map_err(UnitGraphTaskError::Cfg)?;
-                return Ok(Entry::Made(UnitGraphMade { record, findings }));
+                return Ok(Entry::Made(UnitGraphMade { record, findings, left_out: graph.left_out }));
             }
             Pass::Partial(partial) => {
                 // A package not fetched this command is asked again by the next one.

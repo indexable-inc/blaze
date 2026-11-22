@@ -334,7 +334,16 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             self.live = live;
             let (p, mut at) = self.through(p0, at0)?;
             let pat = self.pat(p)?;
-            if Self::peels(pat) {
+            // A path pattern of a reference type (a constant `const TOKEN: &str`) follows no
+            // reference, as the check typed it (blaze-typeck rules/pat.rs `step_pat`, the
+            // Reference, "Binding modes": "Non-reference patterns include all patterns except
+            // bindings, wildcard patterns (`_`), const patterns of reference types, and reference
+            // patterns"; rustc_hir_typeck pat.rs `ResolvedPat::adjust_mode`: a constant is
+            // `AdjustMode::Pass`, "These constants can be of a reference type"). The scrutinee is
+            // matched as it is. Peeled, serde_json 1.0.150's `match name { crate::number::TOKEN
+            // => .., _ => .. }` on `name: &str` (value/ser.rs:276, t1800) was compared at `str`
+            // itself: "pattern 3: str is not built to LIR yet".
+            if Self::peels(pat) && !(matches!(pat, Pat::Path(_)) && self.pat_is_ref(p)?) {
                 at = self.peel(p, at)?;
             }
             match pat {
@@ -618,6 +627,13 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             Pat::Lit(l) | Pat::NegLit(l) => !matches!(l, Lit::Str | Lit::ByteStr(_) | Lit::CStr),
             _ => false,
         }
+    }
+
+    /// Whether pattern `p`'s own type, as the check recorded it, is a reference.
+    fn pat_is_ref(&mut self, p: PatId) -> Result<bool, BuildError> {
+        let t = *self.checked.pat_ty.get(p.ix()).ok_or(malformed("a pattern without a type in the record"))?;
+        let g = self.ground_ty(t).map_err(|error| Self::pat_ty_err(p, error))?;
+        Ok(matches!(self.ground_node(g).map_err(|error| Self::pat_ty_err(p, error))?, PNode::Ref(..)))
     }
 
     /// Follows every reference at `at`; the default binding mode becomes `ref`.

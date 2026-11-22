@@ -1985,6 +1985,11 @@ impl FrontEnd for Front2Program<'_> {
         lazy::seam_rules::caller_site(self.front.names, &self.front.keys, &self.store, owner, row.body.as_ref()?, expr)
     }
 
+    /// By seam_rules.rs `def_site`, from the item's head and the names source.
+    fn def_site(&self, item: ItemKey) -> Option<blaze_build::CallerSite<'_>> {
+        lazy::seam_rules::def_site(self.front.names, &self.front.keys, &self.store, item)
+    }
+
     fn expr_site(&self, owner: ItemKey, expr: ExprId) -> Option<u32> {
         let row = self.fns.get(*self.by_key.get(&owner)?)?;
         lazy::seam_rules::expr_offset(row.body.as_ref()?, expr)

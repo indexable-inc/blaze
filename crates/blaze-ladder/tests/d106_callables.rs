@@ -972,3 +972,93 @@ pub extern \"C-unwind\" fn main() -> i32 {{
         42,
     );
 }
+
+// (g) `Clone::clone` at a FN POINTER or a FN ITEM: the language's impl, no impl item (tempo
+// t1800, 30 tests: proptest 1.x's `#[derive(Clone)] struct Config { .., failure_persistence:
+// .., source_file: .., ..}` with a `fn(..)` field, "calls trait fn `core::clone::Clone::clone`
+// .. with Self a fn pointer: .. no impl of trait .. holds"). The Reference, "Special types and
+// traits": `Clone` and `Copy` are implemented for function item types and function pointer
+// types; core's clone.rs `mod impls`: those "cannot be described in Rust" (no impl item). The
+// record walk's maker had no rule for it (only run.rs `build_from` had, clone_shim.rs
+// `Clones`): it now tables the instance at the trait's `clone` row and builds the copy
+// (clone_shim.rs `language_copy_clone`).
+
+/// The lang `Clone` as core declares it (no default body), and a struct holding a fn pointer
+/// whose `clone` clones the field as `#[derive(Clone)]` writes it.
+const CLONE: &str = "
+#[lang = \"clone\"]
+trait Clone: Sized {
+    fn clone(&self) -> Self;
+}
+
+struct Holder {
+    f: fn(u8) -> u8,
+}
+
+impl Clone for Holder {
+    fn clone(&self) -> Holder {
+        Holder { f: Clone::clone(&self.f) }
+    }
+}
+";
+
+/// The site's shape: two holders of ONE pointer type to two fns, each cloned and called, so a
+/// clone that made the pointer from its type (not its bytes) gives one status for both:
+/// `triple(14) + double(1)` = 44.
+#[test]
+fn a_fn_pointer_field_cloned() {
+    row(
+        "fn pointer field cloned",
+        &format!(
+            "{CLONE}
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    let a = Holder {{ f: triple }};
+    let b = Holder {{ f: double }};
+    let c = Clone::clone(&a);
+    let d = Clone::clone(&b);
+    ((c.f)(14) + (d.f)(1)) as i32
+}}
+"
+        ),
+        44,
+    );
+}
+
+/// The twin: `Clone::clone` at a FN ITEM (zero-sized), the clone called: `add3(40)` = 43.
+#[test]
+fn a_fn_item_cloned() {
+    row(
+        "fn item cloned",
+        &format!(
+            "{CLONE}
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    let g = Clone::clone(&add3);
+    g(40) as i32
+}}
+"
+        ),
+        43,
+    );
+}
+
+/// The control: the holder's pointer called with no clone (the field read as is):
+/// `triple(14) + double(1)` = 44, so a wrong status above is the clone's.
+#[test]
+fn a_fn_pointer_field_called_uncloned() {
+    row(
+        "fn pointer field uncloned",
+        &format!(
+            "{CLONE}
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    let a = Holder {{ f: triple }};
+    let b = Holder {{ f: double }};
+    ((a.f)(14) + (b.f)(1)) as i32
+}}
+"
+        ),
+        44,
+    );
+}

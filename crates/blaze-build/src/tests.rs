@@ -351,6 +351,11 @@ struct TestWorld {
     /// What `Adts::location_adt` answers; when set, `Adts::caller_site` answers
     /// [`TRACK_SITE`] for every expression.
     location: Option<ItemKey>,
+    /// What `Adts::fn_trait_method` answers for each of `Fn`, `FnMut`, `FnOnce`: the item a
+    /// fn shim's body is named by (tests/track_caller.rs).
+    fn_trait_method: Option<ItemKey>,
+    /// What `Adts::def_site` answers for every item (tests/track_caller.rs).
+    def_site: Option<crate::CallerSite<'static>>,
 }
 
 /// Where every expression is, to `Adts::caller_site` (tests/track_caller.rs).
@@ -410,6 +415,8 @@ impl TestWorld {
             planted: crate::Planted::Nothing,
             tracked: Vec::new_in(Global),
             location: None,
+            fn_trait_method: None,
+            def_site: None,
         }
     }
 
@@ -956,6 +963,14 @@ impl Adts for TestAdts<'_> {
 
     fn caller_site(&self, _: ItemKey, _: ExprId) -> Option<crate::CallerSite<'_>> {
         self.world.location.map(|_| TRACK_SITE)
+    }
+
+    fn def_site(&self, _: ItemKey) -> Option<crate::CallerSite<'_>> {
+        self.world.def_site
+    }
+
+    fn fn_trait_method(&self, _: crate::FnTrait) -> Option<ItemKey> {
+        self.world.fn_trait_method
     }
 
     fn location_adt(&self) -> Option<ItemKey> {

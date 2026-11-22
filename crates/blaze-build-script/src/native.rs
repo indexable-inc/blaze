@@ -23,6 +23,25 @@ use blaze_unit_graph::{UnitGraph, UnitId};
 /// wasm runner's probe shim answers.
 pub const TOOLCHAIN_CLASS: [&str; 5] = ["bindgen", "cc", "clang-sys", "cmake", "pkg-config"];
 
+/// The crates that do not compile for `wasm32-wasip1`: a script whose dependency closure holds
+/// one has no wasm module in any mode, so it runs native in `check` too
+/// ([`crate::toolchain::placement`]). `libloading` has no `Library` on wasi; `clang-sys` needs it
+/// (its `runtime` feature, bindgen's default) or links libclang (`static`); `bindgen` holds
+/// `clang-sys`. turso 2026-11-21: pg_query 18.1.0's and turso_sdk_kit's scripts failed to
+/// build as wasm at clang-sys (`cannot find Library in libloading`), though turso_sdk_kit's
+/// build.rs never calls bindgen on macOS: the class is what the closure compiles, not what the
+/// script does. Sorted.
+pub const NO_WASM_CLASS: [&str; 3] = ["bindgen", "clang-sys", "libloading"];
+
+/// What a script's dependency closure says of where it can run ([`closure`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Closure {
+    /// Native when the closure holds a crate of [`TOOLCHAIN_CLASS`] or [`NO_WASM_CLASS`].
+    pub runner: Runner,
+    /// The closure's unit of [`NO_WASM_CLASS`] with the least id: the script cannot be wasm.
+    pub no_wasm: Option<UnitId>,
+}
+
 /// Where a build script runs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Runner {
@@ -33,10 +52,15 @@ pub enum Runner {
     Native { because: UnitId },
 }
 
-/// Where `script` (a build-script unit) runs: native when a unit of a package named in
-/// [`TOOLCHAIN_CLASS`] is in its dependency closure, else wasm. The walk keeps its own stack (no
-/// recursion) and visits each unit once.
+/// Where `script` (a build-script unit) runs: [`closure`]'s runner.
 pub fn runner(graph: &UnitGraph<'_>, script: UnitId, alloc: Alloc<'_>) -> Runner {
+    closure(graph, script, alloc).runner
+}
+
+/// What `script`'s dependency closure says: native when a unit of a package named in
+/// [`TOOLCHAIN_CLASS`] or [`NO_WASM_CLASS`] is in it, else wasm; and its least
+/// [`NO_WASM_CLASS`] unit. The walk keeps its own stack (no recursion) and visits each unit once.
+pub fn closure(graph: &UnitGraph<'_>, script: UnitId, alloc: Alloc<'_>) -> Closure {
     let count = graph.units.len();
     let mut seen: AVec<'_, bool> = Vec::with_capacity_in(count, alloc);
     for _ in 0..count {
@@ -46,7 +70,14 @@ pub fn runner(graph: &UnitGraph<'_>, script: UnitId, alloc: Alloc<'_>) -> Runner
     for dep in graph.units[script.0 as usize].deps.iter() {
         stack.push(dep.unit);
     }
+    let least = |held: Option<UnitId>, at: UnitId| {
+        Some(match held {
+            Some(found) if found.0 < at.0 => found,
+            _ => at,
+        })
+    };
     let mut because: Option<UnitId> = None;
+    let mut no_wasm: Option<UnitId> = None;
     while let Some(at) = stack.pop() {
         let index = at.0 as usize;
         if seen[index] {
@@ -54,20 +85,23 @@ pub fn runner(graph: &UnitGraph<'_>, script: UnitId, alloc: Alloc<'_>) -> Runner
         }
         seen[index] = true;
         let unit = &graph.units[index];
-        if TOOLCHAIN_CLASS.contains(&unit.name.as_str()) {
-            because = Some(match because {
-                Some(found) if found.0 < at.0 => found,
-                _ => at,
-            });
+        let name = unit.name.as_str();
+        let cannot_be_wasm = NO_WASM_CLASS.binary_search(&name).is_ok();
+        if cannot_be_wasm {
+            no_wasm = least(no_wasm, at);
+        }
+        if cannot_be_wasm || TOOLCHAIN_CLASS.binary_search(&name).is_ok() {
+            because = least(because, at);
         }
         for dep in unit.deps.iter() {
             stack.push(dep.unit);
         }
     }
-    match because {
+    let runner = match because {
         Some(because) => Runner::Native { because },
         None => Runner::Wasm,
-    }
+    };
+    Closure { runner, no_wasm }
 }
 
 /// What a native script's process may do. Every path is absolute and canonical (the caller

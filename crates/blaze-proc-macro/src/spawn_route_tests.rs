@@ -21,7 +21,7 @@ use crate::sandbox::Read;
 use crate::script::{ScriptError, ScriptWhy};
 use crate::script_sandbox::{Refusal, Script, ScriptSandbox, SpawnRefusal, Tree};
 use crate::spawn_records::Recorded;
-use crate::spawn_route::{Decoded, PinnedTool, Route, SpawnSetting, child_env, hex, route};
+use crate::spawn_route::{Decoded, PinnedTool, Route, SpawnSetting, child_env, hex, program_found, route};
 
 const LIMITS: RunLimits = RunLimits { fuel: 1 << 26, memory: 16 << 20, out_dir_bytes: 1 << 20, out_dir_files: 16, output: 1 << 20, line: 256 << 10 };
 
@@ -73,6 +73,7 @@ pub(crate) fn script(c_mode: CMode, spawner: Option<Arc<dyn Executor + Send + Sy
 
 fn kind(routed: &Route<'_>) -> &'static str {
     match routed {
+        Route::NotFound => "not found",
         Route::Rustc => "rustc",
         Route::CargoVersion => "cargo version",
         Route::Git => "git",
@@ -117,13 +118,99 @@ fn route_order_is_fixed() {
         ("perl", &["x.pl"], CMode::Deferred, false, "deferred"),
         ("perl", &["x.pl"], CMode::Built, true, "executor"),
         ("perl", &["x.pl"], CMode::Built, false, "refused"),
-        ("bindgen", &["wrapper.h"], CMode::Deferred, true, "executor"),
-        ("bindgen", &["wrapper.h"], CMode::Deferred, false, "refused"),
+        // A program of the pinned base tool set (D192) blaze does not answer: the executor's.
+        ("protoc", &["--version"], CMode::Deferred, true, "executor"),
+        ("python3", &["gen.py"], CMode::Built, false, "refused"),
+        // A program no machine with the set has: the OS's `NotFound`, with or without an
+        // executor, in every mode (libc 0.2.162..0.2.189's `emcc -dumpversion` on every target).
+        ("emcc", &["-dumpversion"], CMode::Deferred, false, "not found"),
+        ("emcc", &["-dumpversion"], CMode::Built, true, "not found"),
+        ("bindgen", &["wrapper.h"], CMode::Deferred, true, "not found"),
+        ("freebsd-version", &[], CMode::Deferred, false, "not found"),
     ];
+    let alloc = blaze_own::testing::heap().alloc();
     for (name, args, c_mode, has_executor, want) in cases {
-        let got = kind(&route(name, args, *c_mode, *has_executor));
+        let found = program_found(name, HOST, alloc).unwrap_or_else(|e| panic!("{e}"));
+        let got = kind(&route(name, args, *c_mode, found, *has_executor));
         assert_eq!(got, *want, "`{name} {}` in {c_mode:?}, executor {has_executor}", args.join(" "));
     }
+}
+
+/// The host the tests' scripts run on (`script` below), a platform of pins/base-tools.json.
+const HOST: &str = "aarch64-apple-darwin";
+
+/// Every name an arm of `route` answers is found: the shim asks `found` before it spawns, so a
+/// name the list missed would be `NotFound` to the script though blaze answers it. PLANTED: a
+/// list without `sh` (whose `-c "git ..."` the git arm answers) is caught.
+#[test]
+fn found_covers_every_answered_route() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let answered: &[(&str, &[&str])] = &[
+        ("rustc", &["-vV"]),
+        ("cargo", &["-V"]),
+        ("git", &["rev-parse", "HEAD"]),
+        ("sh", &["-c", "git rev-parse HEAD"]),
+        ("bash", &["-c", "git rev-parse HEAD"]),
+        ("sh", &["./configure"]),
+        ("pkg-config", &["--libs", "x"]),
+        ("pkgconf", &["--libs", "x"]),
+        ("sw_vers", &["-productVersion"]),
+        ("gcc", &["--version"]),
+        ("c++", &["-?"]),
+        ("xcrun", &["--show-sdk-path"]),
+        ("gmake", &["all"]),
+        ("perl", &["x.pl"]),
+    ];
+    let claimed_without_list = |name: &str, args: &[&str]| !matches!(kind(&route(name, args, CMode::Deferred, true, false)), "refused" | "executor");
+    for (name, args) in answered {
+        assert!(claimed_without_list(name, args), "`{name}` is answered by an arm of route");
+        assert_eq!(program_found(name, HOST, alloc), Ok(true), "`{name} {}` is answered, so it is found", args.join(" "));
+    }
+    let planted = |name: &str| name != "sh" && program_found(name, HOST, alloc) == Ok(true);
+    let missed: Vec<&str> = answered.iter().map(|(name, _)| *name).filter(|name| !planted(name)).collect();
+    assert_eq!(missed, ["sh", "sh"], "the planted list without `sh` is caught");
+    // A path is opened, not looked up on PATH: found, and routed by its last component.
+    assert_eq!(program_found("/opt/emsdk/emcc", HOST, alloc), Ok(true));
+    // A host with no base tool set cannot say: refused by name, never guessed (rule 3).
+    let no_set = program_found("emcc", "x86_64-apple-darwin", alloc).expect_err("no set for x86_64-apple-darwin");
+    assert!(no_set.to_string().contains("x86_64-apple-darwin") && no_set.to_string().contains("D192"), "{no_set}");
+}
+
+/// libc 0.2.186's `Command::new("emcc").arg("-dumpversion").output().ok()?` (turso, c1814):
+/// the shim's `found` is answered "no" and the read `absent-program\n<host>\nemcc` recorded with
+/// its answer; `fact_now` answers that read again equal while emcc is still missing. TWIN:
+/// `python3`, in the set (and answered by no arm), is found and records nothing; a recorded
+/// `absent-program` read of a program the list holds (the set grew) answers `None`, unequal to
+/// any recorded answer, so the script runs again (rule 21). CONTROL: the same spawn from a
+/// module whose shim did not ask (an old module) is refused by name, not answered.
+#[test]
+fn a_missing_program_is_not_found_and_its_absence_is_read() {
+    use crate::fact_pins::{FactNow, fact_now};
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut sandbox = ScriptSandbox::new(script(CMode::Deferred, None, SpawnSetting::off()));
+    assert_eq!(sandbox.found(b"emcc").map_err(|stop| stop.0), Ok(false), "emcc: the OS's NotFound");
+    let subject = format!("absent-program\n{HOST}\nemcc");
+    let read = sandbox.reads.iter().find(|read: &&Read| read.subject == subject).unwrap_or_else(|| panic!("no {subject:?} read: {:?}", sandbox.reads));
+    let Some(digest) = read.digest else { panic!("the absence was recorded without its answer") };
+    assert_eq!(fact_now(&subject, None, alloc), FactNow::Answer(Some(digest)), "answered again equal, with no pins");
+    assert!(crate::spawn_route::is_fact_reply(&subject, alloc), "kept as a derived fact's reply (scripts.rs `admit_reads`)");
+
+    assert_eq!(sandbox.found(b"python3").map_err(|stop| stop.0), Ok(true), "TWIN: python3 is in the set");
+    assert!(!sandbox.reads.iter().any(|read| read.subject.ends_with("\npython3")), "a found program records no absence");
+    let grown = format!("absent-program\n{HOST}\npython3");
+    assert_eq!(fact_now(&grown, None, alloc), FactNow::Answer(None), "TWIN: a program now in the list moves the read");
+
+    let stop = match sandbox.spawn(&shim(&["emcc", "-dumpversion"], false, &[], None, b"", [2, 2])) {
+        Ok(()) => panic!("an unasked spawn of a missing program was answered"),
+        Err(stop) => stop,
+    };
+    assert!(
+        matches!(&sandbox.refused, Some(Refusal::Spawn(SpawnRefusal::NotFoundUnasked { program, .. })) if program == "emcc"),
+        "CONTROL: {:?} ({})",
+        sandbox.refused,
+        stop.0
+    );
+    assert!(stop.0.contains("rebuild the module"), "{}", stop.0);
 }
 
 fn decoded(env_clear: bool, env_ops: &[(bool, &str, &str)]) -> Decoded {
@@ -159,8 +246,8 @@ fn child_env_follows_command_semantics() {
 
 /// The oracle: `perl` in a build with no executor is refused, never deferred (a deferred
 /// tool's empty answer in a build would be a wrong output, not an error).
-fn refuses_perl_in_a_build(route_of: impl for<'s> Fn(&'s str, &'s [&'s str], CMode, bool) -> Route<'s>) -> Result<(), &'static str> {
-    match kind(&route_of("perl", &["x.pl"], CMode::Built, false)) {
+fn refuses_perl_in_a_build(route_of: impl for<'s> Fn(&'s str, &'s [&'s str], CMode, bool, bool) -> Route<'s>) -> Result<(), &'static str> {
+    match kind(&route_of("perl", &["x.pl"], CMode::Built, true, false)) {
         "refused" => Ok(()),
         other => Err(other),
     }
@@ -172,8 +259,8 @@ fn refuses_perl_in_a_build(route_of: impl for<'s> Fn(&'s str, &'s [&'s str], CMo
 #[test]
 fn a_script_spawning_perl_with_the_sandbox_off_is_refused_by_name() {
     assert_eq!(refuses_perl_in_a_build(route), Ok(()), "the router refuses perl in a build with the sandbox off");
-    let planted = refuses_perl_in_a_build(|name, args, c_mode, has_executor| {
-        if name == "perl" && c_mode == CMode::Built { Route::Deferred } else { route(name, args, c_mode, has_executor) }
+    let planted = refuses_perl_in_a_build(|name, args, c_mode, found, has_executor| {
+        if name == "perl" && c_mode == CMode::Built { Route::Deferred } else { route(name, args, c_mode, found, has_executor) }
     });
     assert_eq!(planted, Err("deferred"), "the planted router (perl deferred in a build) is caught");
 

@@ -1,878 +1,494 @@
-import { analyzeInsights, type HeapSiteMetrics, type IoRowMetrics, type SpanMetrics } from './advisor';
-import { FlameGraphView, type FlameNode } from './flamegraph';
-import { fmtSpan, GpuTimeline } from './gpu_timeline';
-import {
-	LiveClient,
-	resolveViewerOrigin,
-	type BuildSummary,
-	type HookKindName,
-	type RunSummary,
-	type ServerMessage,
-	type TelemetryEvent,
-} from './protocol';
+/**
+ * Thin WebGPU + WebSocket + Berkeley Mono Ligature Atlas host shim for `explore_core.wasm`.
+ *
+ * 99% of Blaze Explore (Flecs-style Relational ECS, shared `telemetry.rs` binary ingestion,
+ * layout, hit-testing, Flame Graph, Code Map, CPU Topology, Hot Spots, Heap Diff, Builds,
+ * Advisor, Read-Only Post-IDE Inspector, 2-Zone Hover Cards) runs in pure Rust WASM and
+ * renders on ONE full-viewport WebGPU canvas with zero DOM UI chrome.
+ */
 
-interface SpanRecord {
-	tsMs: number;
-	slot: number;
-	spanId: number;
-	parentId: number;
-	durationNs: number;
-	thread: number;
+const DEFAULT_VIEWER = 'http://127.0.0.1:41937';
+const MAX_RECTS = 32_768;
+const MAX_GLYPHS = 49_152;
+const ATLAS_COLS = 16;
+const ATLAS_ROWS = 8;
+const CELL_W = 24;
+const CELL_H = 40;
+
+interface WasmExports {
+	memory: WebAssembly.Memory;
+	init(advanceRatio: number, webgpuActive: number): void;
+	io_buf_ptr(): number;
+	io_buf_cap(): number;
+	ingest_binary(byteLen: number, nowMs: number): number;
+	ingest_json(byteLen: number): void;
+	ingest_topology(byteLen: number): void;
+	ingest_source(byteLen: number): void;
+	ingest_resources(byteLen: number): void;
+	active_pid(): number;
+	set_connection(connected: number, detailLen: number): void;
+	on_pointer_move(x: number, y: number): void;
+	on_pointer_down(x: number, y: number, shift: number): void;
+	on_pointer_up(x: number, y: number): void;
+	on_dblclick(x: number, y: number): void;
+	on_wheel(x: number, y: number, dx: number, dy: number, ctrlOrMeta: number): void;
+	on_key_down(code: number): void;
+	render_frame(nowMs: number, cssW: number, cssH: number): void;
+	rects_ptr(): number;
+	rects_count(): number;
+	glyphs_ptr(): number;
+	glyphs_count(): number;
+	ov_rects_ptr(): number;
+	ov_rects_count(): number;
+	ov_glyphs_ptr(): number;
+	ov_glyphs_count(): number;
+	cmd_buf_ptr(): number;
+	take_commands_len(): number;
 }
 
-interface SpanAgg {
-	calls: number;
-	totalNs: number;
-	childNs: number;
-	maxNs: number;
-	samples: number[]; // bounded reservoir for P50/P95/P99
-	hook: HookKindName;
+const SDF_WGSL = /* wgsl */ `
+struct Viewport { size: vec2<f32> };
+struct RectInst {
+  rect: vec4<f32>,
+  color: vec4<f32>,
+  style: vec4<f32>,
+};
+struct VsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) px: vec2<f32>,
+  @location(1) rect: vec4<f32>,
+  @location(2) color: vec4<f32>,
+  @location(3) style: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> vp: Viewport;
+@group(0) @binding(1) var<storage, read> insts: array<RectInst>;
+
+@vertex
+fn vs_main(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VsOut {
+  let inst = insts[iid];
+  var pmin = inst.rect.xy;
+  var pmax = inst.rect.zw;
+  if (inst.style.w > 0.5 && inst.style.w < 1.5) {
+    let pad = inst.style.x + 2.0;
+    pmin = min(inst.rect.xy, inst.rect.zw) - vec2<f32>(pad, pad);
+    pmax = max(inst.rect.xy, inst.rect.zw) + vec2<f32>(pad, pad);
+  } else if (inst.style.w > 2.5) {
+    let pad = inst.style.y + 1.5;
+    pmin -= vec2<f32>(pad, pad);
+    pmax += vec2<f32>(pad, pad);
+  } else {
+    pmin -= vec2<f32>(1.0, 1.0);
+    pmax += vec2<f32>(1.0, 1.0);
+  }
+  var uv = array<vec2<f32>, 6>(
+    vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0),
+    vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 1.0),
+  );
+  let p = mix(pmin, pmax, uv[vid]);
+  let ndc = vec2<f32>((p.x / vp.size.x) * 2.0 - 1.0, 1.0 - (p.y / vp.size.y) * 2.0);
+  var out: VsOut;
+  out.pos = vec4<f32>(ndc, 0.0, 1.0);
+  out.px = p;
+  out.rect = inst.rect;
+  out.color = inst.color;
+  out.style = inst.style;
+  return out;
 }
 
-interface HeapSite {
-	allocs: number;
-	frees: number;
-	totalBytes: number;
-	retainedBytes: number;
+fn sd_round_box(p: vec2<f32>, center: vec2<f32>, half_ext: vec2<f32>, r: f32) -> f32 {
+  let q = abs(p - center) - half_ext + vec2<f32>(r, r);
+  return length(max(q, vec2<f32>(0.0, 0.0))) + min(max(q.x, q.y), 0.0) - r;
 }
 
-interface RunState {
-	summary: RunSummary;
-	spans: Map<number, SpanAgg>;
-	spanHistory: SpanRecord[]; // bounded recent span completions for FlameGraph + range filter
-	spanSlotById: Map<number, { slot: number; parentId: number }>;
-	livePtrs: Map<number, { site: string; bytes: number }>;
-	heapSites: Map<string, HeapSite>;
-	heapBaseline: Map<string, number> | null;
-	heapBaselineAt: string | null;
-	ioRows: TelemetryEvent[];
-	totalEvents: number;
+fn sd_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
+  let pa = p - a;
+  let ba = b - a;
+  let h = clamp(dot(pa, ba) / max(dot(ba, ba), 0.0001), 0.0, 1.0);
+  return length(pa - ba * h);
 }
 
-const MAX_SPAN_HISTORY = 4000;
-const MAX_PCT_SAMPLES = 256;
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+  let kind = in.style.w;
+  var alpha = 1.0;
+  if (kind < 0.5) {
+    let center = (in.rect.xy + in.rect.zw) * 0.5;
+    let half_ext = (in.rect.zw - in.rect.xy) * 0.5;
+    let d = sd_round_box(in.px, center, half_ext, in.style.x);
+    alpha = clamp(0.5 - d, 0.0, 1.0);
+  } else if (kind < 1.5) {
+    let d = sd_segment(in.px, in.rect.xy, in.rect.zw) - in.style.x * 0.5;
+    alpha = clamp(0.5 - d, 0.0, 1.0);
+  } else if (kind < 2.5) {
+    let center = (in.rect.xy + in.rect.zw) * 0.5;
+    let d = length(in.px - center) - in.style.x;
+    alpha = clamp(0.5 - d, 0.0, 1.0);
+  } else {
+    let center = (in.rect.xy + in.rect.zw) * 0.5;
+    let half_ext = (in.rect.zw - in.rect.xy) * 0.5;
+    let d = sd_round_box(in.px, center, half_ext, in.style.x);
+    let bw = max(in.style.y, 1.0);
+    let bd = abs(d + bw * 0.5) - bw * 0.5;
+    alpha = clamp(0.5 - bd, 0.0, 1.0);
+  }
+  if (alpha <= 0.002) { discard; }
+  return vec4<f32>(in.color.rgb, in.color.a * alpha);
+}
+`;
 
-const runs = new Map<string, RunState>();
-let builds: BuildSummary[] = [];
-const buildSlots = new Map<string, Record<string, string>>();
-let selectedRunId: string | null = null;
-let selectedSlot: number | null = null;
-let activeTab: 'flame' | 'spans' | 'heap' | 'builds' | 'advisor' | 'io' = 'flame';
-let paused = false;
+const GLYPH_WGSL = /* wgsl */ `
+struct Viewport { size: vec2<f32> };
+struct GlyphInst {
+  rect: vec4<f32>,
+  uv: vec4<f32>,
+  color: vec4<f32>,
+};
+struct VsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+  @location(1) color: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> vp: Viewport;
+@group(0) @binding(1) var<storage, read> glyphs: array<GlyphInst>;
+@group(0) @binding(2) var atlas_samp: sampler;
+@group(0) @binding(3) var atlas_tex: texture_2d<f32>;
 
-const connDot = document.getElementById('conn-dot')!;
-const connLabel = document.getElementById('conn-label')!;
-const gpuChip = document.getElementById('gpu-chip')!;
-const procSelect = document.getElementById('proc-select') as HTMLSelectElement;
-const inlineMetricsEl = document.getElementById('inline-metrics')!;
-const buildsViewEl = document.getElementById('builds-view')!;
-const advisorViewEl = document.getElementById('advisor-view')!;
-const badgeAdvisorEl = document.getElementById('badge-advisor')!;
-const spansBodyEl = document.getElementById('spans-body')!;
-const heapBodyEl = document.getElementById('heap-body')!;
-const ioBodyEl = document.getElementById('io-body')!;
-const btnZoomIn = document.getElementById('btn-zoom-in') as HTMLButtonElement;
-const btnZoomOut = document.getElementById('btn-zoom-out') as HTMLButtonElement;
-const btnPause = document.getElementById('btn-pause') as HTMLButtonElement;
-const pauseLabel = document.getElementById('pause-label')!;
-const btnClear = document.getElementById('btn-clear') as HTMLButtonElement;
-const gpuCanvas = document.getElementById('gpu-canvas') as HTMLCanvasElement;
-const gpuLabels = document.getElementById('gpu-labels') as HTMLCanvasElement;
-const gpuRuler = document.getElementById('gpu-ruler')!;
-const gpuTooltip = document.getElementById('gpu-tooltip')!;
-const gpuSpanLabel = document.getElementById('gpu-span-label')!;
-const btnFollow = document.getElementById('btn-follow') as HTMLButtonElement;
-const selPill = document.getElementById('sel-pill')!;
-const selLabel = document.getElementById('sel-label')!;
-const btnClearSel = document.getElementById('btn-clear-sel') as HTMLButtonElement;
-const traceHero = document.getElementById('trace-hero')!;
-const splitter = document.getElementById('splitter')!;
-const workspace = document.getElementById('workspace')!;
+@vertex
+fn vs_main(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VsOut {
+  let g = glyphs[iid];
+  var c = array<vec2<f32>, 6>(
+    vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0),
+    vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 1.0),
+  );
+  let k = c[vid];
+  let p = mix(g.rect.xy, g.rect.zw, k);
+  let ndc = vec2<f32>((p.x / vp.size.x) * 2.0 - 1.0, 1.0 - (p.y / vp.size.y) * 2.0);
+  var out: VsOut;
+  out.pos = vec4<f32>(ndc, 0.0, 1.0);
+  out.uv = mix(g.uv.xy, g.uv.zw, k);
+  out.color = g.color;
+  return out;
+}
 
-// Flame Graph controls
-const flameCanvas = document.getElementById('flame-canvas') as HTMLCanvasElement;
-const flameTooltip = document.getElementById('flame-tooltip')!;
-const fgTopDown = document.getElementById('fg-topdown') as HTMLButtonElement;
-const fgBottomUp = document.getElementById('fg-bottomup') as HTMLButtonElement;
-const fgSearch = document.getElementById('fg-search') as HTMLInputElement;
-const fgStatus = document.getElementById('fg-status')!;
-const fgReset = document.getElementById('fg-reset') as HTMLButtonElement;
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+  let a = textureSample(atlas_tex, atlas_samp, in.uv).a;
+  if (a <= 0.01) { discard; }
+  return vec4<f32>(in.color.rgb, in.color.a * a);
+}
+`;
 
-// Heap snapshot controls
-const btnHeapSnap = document.getElementById('btn-heap-snap') as HTMLButtonElement;
-const btnHeapClearSnap = document.getElementById('btn-heap-clear-snap') as HTMLButtonElement;
-const heapSnapLabel = document.getElementById('heap-snap-label')!;
-
-const timeline = new GpuTimeline(
-	gpuCanvas,
-	gpuLabels,
-	gpuRuler,
-	gpuTooltip,
-	(kind) => {
-		gpuChip.textContent = kind === 'webgpu' ? 'WebGPU' : '2D';
-		gpuChip.classList.toggle('gpu', kind === 'webgpu');
-	},
-	({ spanMs, following, selectionMs }) => {
-		gpuSpanLabel.textContent = fmtSpan(spanMs);
-		btnFollow.hidden = following;
-		if (selectionMs) {
-			selPill.hidden = false;
-			selLabel.textContent = `Range ${fmtSpan(selectionMs[1] - selectionMs[0])}`;
-		} else {
-			selPill.hidden = true;
+function resolveOrigin(): string {
+	const raw = new URLSearchParams(window.location.search).get('viewer');
+	if (!raw) return DEFAULT_VIEWER;
+	try {
+		const u = new URL(raw);
+		if ((u.protocol === 'http:' || u.protocol === 'https:') && (u.hostname === '127.0.0.1' || u.hostname === 'localhost')) {
+			return u.origin;
 		}
-		scheduleRender();
-	},
-	(sample) => {
-		// Click a bar in the trace to jump to its flame / hotspot detail
-		const st = selectedRunId ? runs.get(selectedRunId) ?? null : null;
-		if (!st) return;
-		if (sample.trackKey.startsWith('t:')) {
-			for (const [slot] of st.spans.entries()) {
-				if (slotName(st, slot) === sample.label) {
-					selectedSlot = slot;
-					render();
-					break;
-				}
-			}
-		} else if (sample.trackKey === 'heap') {
-			switchTab('heap');
-		} else if (sample.trackKey === 'io') {
-			switchTab('io');
-		}
-	},
-);
-
-const flameView = new FlameGraphView(
-	flameCanvas,
-	flameTooltip,
-	({ matchedPct, zoomedName }) => {
-		const parts: string[] = [];
-		if (zoomedName) parts.push(`zoom: ${zoomedName}`);
-		if (matchedPct !== null) parts.push(`matched ${matchedPct.toFixed(1)}%`);
-		fgStatus.textContent = parts.join(' · ');
-		fgReset.hidden = !zoomedName;
-	},
-	(slot) => {
-		selectedSlot = slot;
-	},
-);
-
-btnFollow.onclick = () => timeline.followLive();
-btnZoomIn.onclick = () => timeline.zoomBy(0.55);
-btnZoomOut.onclick = () => timeline.zoomBy(1.8);
-btnClearSel.onclick = () => timeline.clearSelection();
-
-fgTopDown.onclick = () => {
-	fgTopDown.classList.add('active');
-	fgBottomUp.classList.remove('active');
-	flameView.setInverted(false);
-};
-fgBottomUp.onclick = () => {
-	fgBottomUp.classList.add('active');
-	fgTopDown.classList.remove('active');
-	flameView.setInverted(true);
-};
-fgSearch.oninput = () => flameView.setQuery(fgSearch.value);
-fgReset.onclick = () => flameView.resetZoom();
-
-btnHeapSnap.onclick = () => {
-	const st = selectedRunId ? runs.get(selectedRunId) ?? null : null;
-	if (!st) return;
-	const snap = new Map<string, number>();
-	for (const [k, v] of st.heapSites.entries()) snap.set(k, v.retainedBytes);
-	st.heapBaseline = snap;
-	st.heapBaselineAt = new Date().toLocaleTimeString();
-	render();
-};
-btnHeapClearSnap.onclick = () => {
-	const st = selectedRunId ? runs.get(selectedRunId) ?? null : null;
-	if (!st) return;
-	st.heapBaseline = null;
-	st.heapBaselineAt = null;
-	render();
-};
-
-// Draggable splitter
-let resizing = false;
-splitter.addEventListener('pointerdown', (e) => {
-	resizing = true;
-	splitter.classList.add('active');
-	splitter.setPointerCapture(e.pointerId);
-});
-splitter.addEventListener('pointermove', (e) => {
-	if (!resizing) return;
-	const rect = workspace.getBoundingClientRect();
-	const y = e.clientY - rect.top;
-	const pct = Math.max(22, Math.min(82, (y / rect.height) * 100));
-	traceHero.style.flexBasis = `${pct.toFixed(1)}%`;
-	timeline.render();
-	if (activeTab === 'flame') flameView.render();
-});
-const stopResize = () => {
-	if (!resizing) return;
-	resizing = false;
-	splitter.classList.remove('active');
-};
-splitter.addEventListener('pointerup', stopResize);
-splitter.addEventListener('pointercancel', stopResize);
-
-const WF_SERIES = ['var(--series-1)', 'var(--series-2)', 'var(--series-3)', 'var(--series-4)'];
-const IO_OP_NAMES: Record<number, string> = {
-	1: 'open',
-	2: 'close',
-	3: 'read',
-	4: 'write',
-	5: 'connect',
-	6: 'getenv',
-	7: 'mutex_lock',
-};
-
-function fmtNs(ns: number): string {
-	if (ns < 1_000) return `${ns.toFixed(0)} ns`;
-	if (ns < 1_000_000) return `${(ns / 1_000).toFixed(1)} µs`;
-	if (ns < 1_000_000_000) return `${(ns / 1_000_000).toFixed(2)} ms`;
-	return `${(ns / 1_000_000_000).toFixed(2)} s`;
+	} catch {}
+	return DEFAULT_VIEWER;
 }
 
-function fmtBytes(n: number): string {
-	const sign = n < 0 ? '-' : '';
-	const abs = Math.abs(n);
-	if (abs < 1024) return `${sign}${abs} B`;
-	if (abs < 1024 * 1024) return `${sign}${(abs / 1024).toFixed(1)} KiB`;
-	return `${sign}${(abs / (1024 * 1024)).toFixed(2)} MiB`;
+/** Rasterizes Berkeley Mono with OpenType ligatures (`liga` + `calt`) into a 16x8 HiDPI GPU atlas. */
+async function buildBerkeleyMonoAtlas(): Promise<{ canvas: HTMLCanvasElement; advanceRatio: number }> {
+	try {
+		await document.fonts.load('500 28px "Berkeley Mono"');
+		await document.fonts.ready;
+	} catch {}
+
+	const c = document.createElement('canvas');
+	c.width = ATLAS_COLS * CELL_W;
+	c.height = ATLAS_ROWS * CELL_H;
+	c.style.cssText =
+		'position:fixed;left:-9999px;top:-9999px;font-family:"Berkeley Mono",ui-monospace,monospace;font-feature-settings:"liga" 1,"calt" 1;font-variant-ligatures:contextual common-ligatures;';
+	document.body.appendChild(c);
+
+	const ctx = c.getContext('2d')!;
+	const fontPx = 28;
+	ctx.font = `500 ${fontPx}px "Berkeley Mono", ui-monospace, SFMono-Regular, Menlo, monospace`;
+	ctx.fillStyle = '#ffffff';
+	ctx.textAlign = 'center';
+	ctx.textBaseline = 'alphabetic';
+
+	const advanceRatio = ctx.measureText('M').width / fontPx;
+	const baseline = 29;
+
+	// Rows 0..5: ASCII 32..=126
+	for (let i = 0; i <= 94; i++) {
+		const col = i % ATLAS_COLS;
+		const row = Math.floor(i / ATLAS_COLS);
+		ctx.fillText(String.fromCharCode(32 + i), col * CELL_W + CELL_W * 0.5, row * CELL_H + baseline);
+	}
+	// Row 6: Crisp symbols (`·`, `×`, `µ`, `→`, `Δ`, `…`, `—`, `↵`, `↗`)
+	const syms = ['·', '×', 'µ', '→', 'Δ', '…', '—', '↵', '↗'];
+	for (let i = 0; i < syms.length; i++) {
+		ctx.fillText(syms[i], i * CELL_W + CELL_W * 0.5, 6 * CELL_H + baseline);
+	}
+	// Row 7: Double-width Berkeley Mono OpenType ligatures (`->`, `=>`, `::`, `!=`, `==`, `<=`, `>=`, `..`)
+	const ligs = ['->', '=>', '::', '!=', '==', '<=', '>=', '..'];
+	for (let i = 0; i < ligs.length; i++) {
+		ctx.fillText(ligs[i], i * 2 * CELL_W + CELL_W, 7 * CELL_H + baseline);
+	}
+
+	c.remove();
+	return { canvas: c, advanceRatio };
 }
 
-function fmtHex(n: number): string {
-	return n === 0 ? '—' : `0x${n.toString(16)}`;
-}
+async function boot(): Promise<void> {
+	const canvas = document.getElementById('gpu') as HTMLCanvasElement;
+	const [wasmRes, atlas] = await Promise.all([fetch('explore/explore_core.wasm'), buildBerkeleyMonoAtlas()]);
+	const { instance } = await WebAssembly.instantiate(await wasmRes.arrayBuffer(), {});
+	const wasm = instance.exports as unknown as WasmExports;
 
-function percentile(samples: number[], p: number): number {
-	if (samples.length === 0) return 0;
-	const sorted = [...samples].sort((a, b) => a - b);
-	const idx = Math.min(sorted.length - 1, Math.floor(p * (sorted.length - 1)));
-	return sorted[idx];
-}
+	const enc = new TextEncoder();
+	const dec = new TextDecoder();
+	const writeIo = (bytes: Uint8Array): number => {
+		const len = Math.min(bytes.byteLength, wasm.io_buf_cap());
+		new Uint8Array(wasm.memory.buffer, wasm.io_buf_ptr(), len).set(bytes.subarray(0, len));
+		return len;
+	};
+	const writeIoStr = (s: string): number => writeIo(enc.encode(s));
 
-function escapeHtml(s: string): string {
-	return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
+	// Boot WebGPU (2 pipelines: SDF geometry + Berkeley Mono ligature glyph atlas)
+	const nav = navigator as unknown as { gpu?: any };
+	const adapter = await nav.gpu?.requestAdapter();
+	const device = await adapter?.requestDevice();
+	const gpuCtx = device ? (canvas.getContext('webgpu') as any) : null;
+	const webgpuOk = Boolean(device && gpuCtx);
+	wasm.init(atlas.advanceRatio, webgpuOk ? 1 : 0);
 
-function slotName(st: RunState, slot: number): string {
-	const key = String(slot);
-	return st.summary.slots[key] ?? buildSlots.get(st.summary.package)?.[key] ?? `slot #${slot}`;
-}
+	let sdfPipe: any, glyphPipe: any, sdfBG: any, glyphBG: any, vpBuf: any, rectBuf: any, glyphBuf: any;
+	if (webgpuOk) {
+		const fmt = nav.gpu.getPreferredCanvasFormat();
+		gpuCtx.configure({ device, format: fmt, alphaMode: 'premultiplied' });
 
-function switchTab(tab: 'flame' | 'spans' | 'heap' | 'builds' | 'advisor' | 'io'): void {
-	activeTab = tab;
-	document.querySelectorAll<HTMLButtonElement>('.tab').forEach((b) => {
-		b.classList.toggle('active', b.dataset.tab === tab);
-	});
-	document.querySelectorAll('.panel').forEach((p) => p.classList.remove('active'));
-	document.getElementById(`panel-${tab}`)?.classList.add('active');
-	render();
-}
-
-function ensureRun(summary: RunSummary): RunState {
-	let st = runs.get(summary.id);
-	if (!st) {
-		st = {
-			summary,
-			spans: new Map(),
-			spanHistory: [],
-			spanSlotById: new Map(),
-			livePtrs: new Map(),
-			heapSites: new Map(),
-			heapBaseline: null,
-			heapBaselineAt: null,
-			ioRows: [],
-			totalEvents: 0,
+		const blend = {
+			color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+			alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
 		};
-		runs.set(summary.id, st);
-		if (!selectedRunId) selectedRunId = summary.id;
-	} else {
-		st.summary = { ...st.summary, ...summary, slots: { ...st.summary.slots, ...summary.slots } };
-	}
-	return st;
-}
+		const sdfMod = device.createShaderModule({ code: SDF_WGSL });
+		const glyphMod = device.createShaderModule({ code: GLYPH_WGSL });
 
-function ingestEvent(ev: TelemetryEvent): void {
-	let st = runs.get(ev.run);
-	if (!st) {
-		st = ensureRun({
-			id: ev.run,
-			pid: 0,
-			package: ev.run,
-			alive: true,
-			started_ms: Date.now(),
-			stats: { cap: 0, pushed: 0, popped: 0, dropped: 0, shadow_overflows: 0, unwound_spans: 0 },
-			slots: {},
+		sdfPipe = device.createRenderPipeline({
+			layout: 'auto',
+			vertex: { module: sdfMod, entryPoint: 'vs_main' },
+			fragment: { module: sdfMod, entryPoint: 'fs_main', targets: [{ format: fmt, blend }] },
+			primitive: { topology: 'triangle-list' },
+		});
+		glyphPipe = device.createRenderPipeline({
+			layout: 'auto',
+			vertex: { module: glyphMod, entryPoint: 'vs_main' },
+			fragment: { module: glyphMod, entryPoint: 'fs_main', targets: [{ format: fmt, blend }] },
+			primitive: { topology: 'triangle-list' },
+		});
+
+		vpBuf = device.createBuffer({ size: 16, usage: 0x0040 | 0x0008 });
+		rectBuf = device.createBuffer({ size: MAX_RECTS * 48, usage: 0x0080 | 0x0008 });
+		glyphBuf = device.createBuffer({ size: MAX_GLYPHS * 48, usage: 0x0080 | 0x0008 });
+
+		const tex = device.createTexture({
+			size: [atlas.canvas.width, atlas.canvas.height, 1],
+			format: 'rgba8unorm',
+			usage: 0x04 | 0x02 | 0x10,
+		});
+		device.queue.copyExternalImageToTexture({ source: atlas.canvas }, { texture: tex }, [
+			atlas.canvas.width,
+			atlas.canvas.height,
+		]);
+		const samp = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+
+		sdfBG = device.createBindGroup({
+			layout: sdfPipe.getBindGroupLayout(0),
+			entries: [
+				{ binding: 0, resource: { buffer: vpBuf } },
+				{ binding: 1, resource: { buffer: rectBuf } },
+			],
+		});
+		glyphBG = device.createBindGroup({
+			layout: glyphPipe.getBindGroupLayout(0),
+			entries: [
+				{ binding: 0, resource: { buffer: vpBuf } },
+				{ binding: 1, resource: { buffer: glyphBuf } },
+				{ binding: 2, resource: samp },
+				{ binding: 3, resource: tex.createView() },
+			],
 		});
 	}
-	st.totalEvents += 1;
-	const nowMs = Date.now();
 
-	if (ev.kind === 'span_exit' || ev.kind === 'span_unwound') {
-		let agg = st.spans.get(ev.slot_or_op);
-		if (!agg) {
-			agg = { calls: 0, totalNs: 0, childNs: 0, maxNs: 0, samples: [], hook: 'span' };
-			st.spans.set(ev.slot_or_op, agg);
-		}
-		agg.calls += 1;
-		agg.totalNs += ev.a;
-		if (ev.a > agg.maxNs) agg.maxNs = ev.a;
-		if (agg.samples.length < MAX_PCT_SAMPLES) {
-			agg.samples.push(ev.a);
-		} else {
-			agg.samples[agg.calls % MAX_PCT_SAMPLES] = ev.a;
-		}
-
-		// Track parent->child hierarchy for Flame Graph & exact Self Time
-		const spanId = ev.b;
-		const parentId = ev.c;
-		if (spanId !== 0) {
-			st.spanSlotById.set(spanId, { slot: ev.slot_or_op, parentId });
-			if (st.spanSlotById.size > 6000) {
-				const first = st.spanSlotById.keys().next().value;
-				if (first !== undefined) st.spanSlotById.delete(first);
-			}
-		}
-		if (parentId !== 0) {
-			const parentInfo = st.spanSlotById.get(parentId);
-			if (parentInfo) {
-				const pAgg = st.spans.get(parentInfo.slot);
-				if (pAgg) pAgg.childNs += ev.a;
-			}
-		}
-
-		st.spanHistory.push({
-			tsMs: nowMs,
-			slot: ev.slot_or_op,
-			spanId,
-			parentId,
-			durationNs: ev.a,
-			thread: ev.thread,
-		});
-		if (st.spanHistory.length > MAX_SPAN_HISTORY) st.spanHistory.shift();
-
-		const name = slotName(st, ev.slot_or_op);
-		const durMs = Math.max(0.25, ev.a / 1_000_000);
-		const hot = ev.a >= 100_000_000 || (parentId === 0 && ev.a >= 80_000_000);
-		const depth = parentId !== 0 ? 1 : 0;
-		timeline.push({
-			startMs: nowMs - durMs,
-			endMs: nowMs,
-			trackKey: `t:${ev.thread}`,
-			depth,
-			color: hot ? [0.85, 0.28, 0.11, 0.92] : depth > 0 ? [0.16, 0.49, 0.82, 0.88] : [0.11, 0.56, 0.41, 0.88],
-			label: name,
-			durationText: fmtNs(ev.a),
-			detail: `${fmtNs(ev.a)} · t#${ev.thread}`,
-		});
-	} else if (ev.kind === 'hook_hit') {
-		let agg = st.spans.get(ev.slot_or_op);
-		if (!agg) {
-			agg = { calls: 0, totalNs: 0, childNs: 0, maxNs: 0, samples: [], hook: 'hook' };
-			st.spans.set(ev.slot_or_op, agg);
-		}
-		agg.calls += 1;
-	} else if (ev.kind === 'alloc') {
-		const siteKey = `${fmtHex(ev.c)} → ${fmtHex(ev.d)} → ${fmtHex(ev.e)}`;
-		let site = st.heapSites.get(siteKey);
-		if (!site) {
-			site = { allocs: 0, frees: 0, totalBytes: 0, retainedBytes: 0 };
-			st.heapSites.set(siteKey, site);
-		}
-		site.allocs += 1;
-		site.totalBytes += ev.b;
-		site.retainedBytes += ev.b;
-		if (ev.a !== 0) st.livePtrs.set(ev.a, { site: siteKey, bytes: ev.b });
-		timeline.push({
-			startMs: nowMs - 14,
-			endMs: nowMs,
-			trackKey: 'heap',
-			depth: 0,
-			color: [0.22, 0.52, 0.88, 0.88],
-			label: fmtBytes(ev.b),
-			durationText: '',
-			detail: `alloc ${fmtBytes(ev.b)} · ${fmtHex(ev.c)} · t#${ev.thread}`,
-		});
-	} else if (ev.kind === 'free') {
-		const live = st.livePtrs.get(ev.a);
-		if (live) {
-			const site = st.heapSites.get(live.site);
-			if (site) {
-				site.frees += 1;
-				site.retainedBytes = Math.max(0, site.retainedBytes - (ev.b > 0 ? ev.b : live.bytes));
-			}
-			st.livePtrs.delete(ev.a);
-		}
-	} else if (
-		ev.kind === 'io' ||
-		ev.kind === 'sync_wait' ||
-		ev.kind === 'thread_birth' ||
-		ev.kind === 'thread_end'
-	) {
-		st.ioRows.push(ev);
-		if (st.ioRows.length > 300) st.ioRows.shift();
-		const durMs = Math.max(10, ev.a / 1_000_000);
-		const opLabel = IO_OP_NAMES[ev.slot_or_op] ?? ev.kind;
-		timeline.push({
-			startMs: nowMs - durMs,
-			endMs: nowMs,
-			trackKey: 'io',
-			depth: 0,
-			color: ev.kind === 'sync_wait' ? [0.95, 0.38, 0.35, 0.92] : [0.85, 0.58, 0.19, 0.88],
-			label: opLabel,
-			durationText: fmtNs(ev.a),
-			detail: `${fmtNs(ev.a)} · t#${ev.thread}`,
-		});
-	}
-}
-
-function buildFlameTree(st: RunState, sel: [number, number] | null): FlameNode {
-	const root: FlameNode = {
-		name: `all (${st.summary.package})`,
-		slot: -1,
-		totalNs: 0,
-		selfNs: 0,
-		calls: 0,
-		maxNs: 0,
-		children: new Map(),
-	};
-	const records = sel
-		? st.spanHistory.filter((r) => r.tsMs >= sel[0] && r.tsMs <= sel[1])
-		: st.spanHistory;
-
-	const childSumBySpan = new Map<number, number>();
-	for (const r of records) {
-		if (r.parentId !== 0) {
-			childSumBySpan.set(r.parentId, (childSumBySpan.get(r.parentId) ?? 0) + r.durationNs);
-		}
-	}
-
-	for (const r of records) {
-		// Reconstruct stack path root -> ... -> r (bounded to depth 12)
-		const chain: Array<{ slot: number; name: string }> = [{ slot: r.slot, name: slotName(st, r.slot) }];
-		let pid = r.parentId;
-		for (let d = 0; d < 12 && pid !== 0; d++) {
-			const info = st.spanSlotById.get(pid);
-			if (!info) break;
-			chain.push({ slot: info.slot, name: slotName(st, info.slot) });
-			pid = info.parentId;
-		}
-		chain.reverse();
-
-		const selfNs = Math.max(0, r.durationNs - (childSumBySpan.get(r.spanId) ?? 0));
-		if (chain.length === 1) {
-			root.totalNs += r.durationNs;
-			root.calls += 1;
-		}
-
-		let cur = root;
-		for (let i = 0; i < chain.length; i++) {
-			const seg = chain[i];
-			let next = cur.children.get(seg.name);
-			if (!next) {
-				next = {
-					name: seg.name,
-					slot: seg.slot,
-					totalNs: 0,
-					selfNs: 0,
-					calls: 0,
-					maxNs: 0,
-					children: new Map(),
-				};
-				cur.children.set(seg.name, next);
-			}
-			if (i === chain.length - 1) {
-				next.totalNs += r.durationNs;
-				next.selfNs += selfNs;
-				next.calls += 1;
-				if (r.durationNs > next.maxNs) next.maxNs = r.durationNs;
-			}
-			cur = next;
-		}
-	}
-	// Ensure root total covers children even if a parent wasn't seen in a sliced selection window.
-	let childTotal = 0;
-	for (const ch of root.children.values()) childTotal += ch.totalNs;
-	if (childTotal > root.totalNs) root.totalNs = childTotal;
-	return root;
-}
-
-let renderScheduled = false;
-function scheduleRender(): void {
-	if (renderScheduled) return;
-	renderScheduled = true;
-	requestAnimationFrame(() => {
-		renderScheduled = false;
-		render();
+	// Input forwarding (100% handled in Rust WASM!)
+	canvas.addEventListener('pointermove', (e) => wasm.on_pointer_move(e.clientX, e.clientY));
+	canvas.addEventListener('pointerdown', (e) => {
+		if (e.button !== 0) return;
+		canvas.setPointerCapture(e.pointerId);
+		wasm.on_pointer_down(e.clientX, e.clientY, e.shiftKey ? 1 : 0);
 	});
-}
+	const up = (e: PointerEvent) => wasm.on_pointer_up(e.clientX, e.clientY);
+	canvas.addEventListener('pointerup', up);
+	canvas.addEventListener('pointercancel', up);
+	canvas.addEventListener('pointerleave', () => wasm.on_pointer_move(-1, -1));
+	canvas.addEventListener('dblclick', (e) => wasm.on_dblclick(e.clientX, e.clientY));
+	canvas.addEventListener(
+		'wheel',
+		(e) => {
+			e.preventDefault();
+			wasm.on_wheel(e.clientX, e.clientY, e.deltaX, e.deltaY, e.ctrlKey || e.metaKey ? 1 : 0);
+		},
+		{ passive: false },
+	);
+	window.addEventListener('keydown', (e) => {
+		const code = e.key === 'Escape' ? 27 : e.key.length === 1 ? e.key.charCodeAt(0) : 0;
+		if (code) wasm.on_key_down(code);
+	});
 
-function collectCurrentMetrics(st: RunState | null): {
-	spans: SpanMetrics[];
-	heapSites: HeapSiteMetrics[];
-	ioRows: IoRowMetrics[];
-} {
-	if (!st) return { spans: [], heapSites: [], ioRows: [] };
-	const spans: SpanMetrics[] = [];
-	for (const [slot, agg] of st.spans.entries()) {
-		spans.push({
-			slot,
-			name: slotName(st, slot),
-			calls: agg.calls,
-			totalNs: agg.totalNs,
-			maxNs: agg.maxNs,
-		});
-	}
-	const heapSites: HeapSiteMetrics[] = [];
-	for (const [stack, site] of st.heapSites.entries()) {
-		heapSites.push({ stack, ...site });
-	}
-	const ioRows: IoRowMetrics[] = st.ioRows.map((ev) => ({
-		kind: ev.kind,
-		op: ev.slot_or_op,
-		thread: ev.thread,
-		durationNs: ev.a,
-	}));
-	return { spans, heapSites, ioRows };
-}
-
-function syncProcessPicker(): void {
-	const entries = [...runs.values()];
-	if (entries.length === 0) {
-		if (procSelect.options.length !== 1 || procSelect.options[0].value !== '') {
-			procSelect.innerHTML = '<option value="">no active run</option>';
+	// Loopback WebSocket + Topology + Source loader (direct into WASM linear memory!)
+	const viewerOrigin = resolveOrigin();
+	const origins = window.location.origin !== viewerOrigin ? [viewerOrigin, window.location.origin] : [viewerOrigin];
+	const fetchApi = async (path: string): Promise<string | null> => {
+		for (const base of origins) {
+			try {
+				const r = await fetch(`${base}${path}`, { cache: 'no-store' });
+				if (r.ok) return await r.text();
+			} catch {}
 		}
-		return;
-	}
-	const sig = entries.map((r) => `${r.summary.id}:${r.summary.alive ? 1 : 0}`).join('|');
-	if (procSelect.dataset.sig !== sig) {
-		procSelect.dataset.sig = sig;
-		procSelect.innerHTML = entries
-			.map(
-				(r) =>
-					`<option value="${escapeHtml(r.summary.id)}">${escapeHtml(r.summary.package)} (pid ${r.summary.pid || '—'}${r.summary.alive ? '' : ' · exit'})</option>`,
-			)
-			.join('');
-	}
-	if (selectedRunId) procSelect.value = selectedRunId;
-}
-
-procSelect.onchange = () => {
-	selectedRunId = procSelect.value || null;
-	render();
-};
-
-function render(): void {
-	timeline.render();
-	syncProcessPicker();
-
-	const st = selectedRunId ? runs.get(selectedRunId) ?? null : null;
-	const { spans, heapSites, ioRows } = collectCurrentMetrics(st);
-	const insights = analyzeInsights(builds, st?.summary ?? null, spans, heapSites, ioRows);
-
-	const totalErrors = builds.reduce((s, b) => s + b.errors, 0);
-	const totalWarnings = builds.reduce((s, b) => s + b.warnings, 0);
-	const latestBuild = builds[0] ?? null;
-	const cacheHitPct =
-		latestBuild && latestBuild.reached > 0
-			? Math.round((latestBuild.found / latestBuild.reached) * 100)
-			: null;
-	let totalRetained = 0;
-	for (const s of heapSites) totalRetained += s.retainedBytes;
-
-	inlineMetricsEl.innerHTML = [
-		cacheHitPct !== null
-			? `<span class="im">cache <strong class="${cacheHitPct >= 80 ? 'ok' : 'fire'}">${cacheHitPct}%</strong></span>`
-			: '',
-		st ? `<span class="im">heap <strong>${fmtBytes(totalRetained)}</strong></span>` : '',
-		`<span class="im"><strong class="${totalErrors > 0 ? 'err' : 'ok'}">${totalErrors}</strong> err · <strong class="${totalWarnings > 0 ? 'fire' : ''}">${totalWarnings}</strong> warn</span>`,
-		st ? `<span class="im"><strong>${st.totalEvents.toLocaleString()}</strong> ev</span>` : '',
-	].join('');
-
-	badgeAdvisorEl.textContent = String(insights.length);
-	badgeAdvisorEl.classList.toggle('hot', insights.length > 0);
-
-	// 1. Flame Graph tab
-	if (activeTab === 'flame') {
-		if (st) {
-			flameView.setData(buildFlameTree(st, timeline.getSelection()));
-		} else {
-			flameView.render();
-		}
-	}
-
-	// 2. Hot Spots (Self / Total / P50 / P95 / P99 / Max + live Hook toggles)
-	if (activeTab === 'spans') {
-		spansBodyEl.innerHTML = '';
-		if (!st || st.spans.size === 0) {
-			spansBodyEl.innerHTML = '<tr><td colspan="10" class="quiet">—</td></tr>';
-		} else {
-			const totalSpanNs = spans.reduce((acc, s) => acc + s.totalNs, 0);
-			const sorted = [...st.spans.entries()].sort((a, b) => b[1].totalNs - a[1].totalNs);
-			for (const [slot, agg] of sorted) {
-				const name = slotName(st, slot);
-				const selfNs = Math.max(0, agg.totalNs - agg.childNs);
-				const pct = totalSpanNs > 0 ? (agg.totalNs / totalSpanNs) * 100 : 0;
-				const p50 = percentile(agg.samples, 0.5);
-				const p95 = percentile(agg.samples, 0.95);
-				const p99 = percentile(agg.samples, 0.99);
-				const tr = document.createElement('tr');
-				if (selectedSlot === slot) tr.className = 'row-sel';
-				tr.innerHTML = `
-					<td class="primary">${escapeHtml(name)}</td>
-					<td>${agg.calls.toLocaleString()}</td>
-					<td class="primary">${fmtNs(selfNs)}</td>
-					<td>${fmtNs(agg.totalNs)}</td>
-					<td class="bar-cell">
-						<div class="bar-track" title="${pct.toFixed(1)}%"><div class="bar-fill${pct >= 25 ? ' hot' : ''}" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div>
-					</td>
-					<td>${fmtNs(p50)}</td>
-					<td>${fmtNs(p95)}</td>
-					<td>${fmtNs(p99)}</td>
-					<td>${fmtNs(agg.maxNs)}</td>
-					<td><div class="seg"></div></td>
-				`;
-				const seg = tr.querySelector('.seg')!;
-				for (const kind of ['plain', 'count', 'hook', 'span'] as HookKindName[]) {
-					const b = document.createElement('button');
-					b.textContent = kind;
-					if (agg.hook === kind) b.classList.add('active');
-					b.onclick = () => {
-						agg.hook = kind;
-						void client.toggleHook(st.summary.id, slot, kind);
-						render();
-					};
-					seg.appendChild(b);
-				}
-				spansBodyEl.appendChild(tr);
-			}
-		}
-	}
-
-	// 3. Heap & Snapshot Diff tab
-	if (activeTab === 'heap') {
-		const hasBaseline = Boolean(st?.heapBaseline);
-		btnHeapClearSnap.hidden = !hasBaseline;
-		heapSnapLabel.textContent = hasBaseline
-			? `Diff vs snapshot (${st?.heapBaselineAt})`
-			: st
-				? `${fmtBytes(totalRetained)} retained · ${st.livePtrs.size} live`
-				: '—';
-		heapBodyEl.innerHTML = '';
-		if (!st || heapSites.length === 0) {
-			heapBodyEl.innerHTML = '<tr><td colspan="7" class="quiet">—</td></tr>';
-		} else {
-			const maxRetained = heapSites.reduce((m, s) => Math.max(m, s.retainedBytes), 1);
-			const sortedHeap = [...heapSites].sort((a, b) => b.retainedBytes - a.retainedBytes);
-			for (const site of sortedHeap) {
-				const pct = (site.retainedBytes / maxRetained) * 100;
-				let deltaHtml = '—';
-				let deltaClass = '';
-				if (st.heapBaseline) {
-					const prev = st.heapBaseline.get(site.stack) ?? 0;
-					const diff = site.retainedBytes - prev;
-					deltaHtml = `${diff >= 0 ? '+' : ''}${fmtBytes(diff)}`;
-					deltaClass = diff > 0 ? 'delta-pos' : diff < 0 ? 'delta-neg' : '';
-				}
-				const tr = document.createElement('tr');
-				tr.innerHTML = `
-					<td class="primary">${escapeHtml(site.stack)}</td>
-					<td>${site.allocs.toLocaleString()}</td>
-					<td>${site.frees.toLocaleString()}</td>
-					<td>${fmtBytes(site.totalBytes)}</td>
-					<td class="primary">${fmtBytes(site.retainedBytes)}</td>
-					<td class="${deltaClass}">${deltaHtml}</td>
-					<td class="bar-cell"><div class="bar-track"><div class="bar-fill heap" style="width:${Math.min(100, pct).toFixed(1)}%"></div></div></td>
-				`;
-				heapBodyEl.appendChild(tr);
-			}
-		}
-	}
-
-	// 4. Builds tab
-	if (activeTab === 'builds') {
-		if (builds.length === 0) {
-			buildsViewEl.innerHTML = '<div class="quiet">No builds recorded</div>';
-		} else {
-			buildsViewEl.innerHTML = builds
-				.map((b) => {
-					const hitPct = b.reached > 0 ? Math.round((b.found / b.reached) * 100) : 100;
-					const statusTag =
-						b.status === 'failed'
-							? '<span class="eyebrow err">failed</span>'
-							: b.status === 'running' || b.status === 'building'
-								? '<span class="eyebrow fire">live</span>'
-								: '<span class="eyebrow ok">ok</span>';
-					const totalPhaseNs = b.phases.reduce((acc, p) => acc + p.ns, 0);
-					const waterfallHtml =
-						totalPhaseNs > 0
-							? `<div class="wf-bar">${b.phases
-									.map((p, i) => {
-										const pct = Math.max(3, (p.ns / totalPhaseNs) * 100);
-										const color = WF_SERIES[i % WF_SERIES.length];
-										return `<div class="wf-seg" style="width:${pct.toFixed(1)}%;background:${color}" title="${escapeHtml(p.name)}: ${fmtNs(p.ns)}">${pct >= 12 ? escapeHtml(p.name) : ''}</div>`;
-									})
-									.join('')}</div>
-								<div class="wf-legend">${b.phases
-									.map((p, i) => {
-										const color = WF_SERIES[i % WF_SERIES.length];
-										return `<span><span class="wf-dot" style="background:${color}"></span>${escapeHtml(p.name)} <strong>${fmtNs(p.ns)}</strong></span>`;
-									})
-									.join('')}</div>`
-							: '';
-					return `<article class="card">
-						<div class="card-top">
-							<div class="card-title">
-								<span class="eyebrow">${escapeHtml(b.command)}</span>
-								<span>${escapeHtml(b.package)}</span>
-								${statusTag}
-							</div>
-							<div class="card-meta">
-								${b.errors > 0 ? `<span class="eyebrow err">${b.errors} err</span>` : ''}
-								${b.warnings > 0 ? `<span class="eyebrow fire">${b.warnings} warn</span>` : ''}
-								<span>${b.made} built · ${b.found}/${b.reached} cached${totalPhaseNs > 0 ? ` · ${fmtNs(totalPhaseNs)}` : ''}</span>
-							</div>
-						</div>
-						<div class="reason-row">
-							<span>${escapeHtml(b.recompile_reason)}</span>
-							<span class="meter-inline">
-								<span class="meter-track"><span class="meter-fill${hitPct < 70 ? ' warn' : ''}" style="width:${hitPct}%"></span></span>
-								<span class="mono" style="font-size:10.5px;color:var(--ink-3)">${hitPct}%</span>
-							</span>
-						</div>
-						${waterfallHtml}
-					</article>`;
-				})
-				.join('');
-		}
-	}
-
-	// 5. Advisor tab
-	if (activeTab === 'advisor') {
-		if (insights.length === 0) {
-			advisorViewEl.innerHTML = '<div class="quiet">0 issues</div>';
-		} else {
-			advisorViewEl.innerHTML = '<div class="advisor-list" id="advisor-list-inner"></div>';
-			const list = document.getElementById('advisor-list-inner')!;
-			for (const ins of insights) {
-				const tagClass =
-					ins.severity === 'critical'
-						? 'err'
-						: ins.category === 'HOT' || ins.severity === 'warn'
-							? 'fire'
-							: ins.category === 'BUILD'
-								? 'blue'
-								: 'ok';
-				const row = document.createElement('div');
-				row.className = 'advisor-row';
-				row.innerHTML = `
-					<div class="advisor-main">
-						<span class="eyebrow ${tagClass}">${ins.category}</span>
-						<span class="advisor-title">${escapeHtml(ins.title)}</span>
-						<span class="advisor-sep">·</span>
-						<span class="advisor-desc">${escapeHtml(ins.detail)}</span>
-					</div>
-					<div class="advisor-right">
-						<span class="metric-chip">${escapeHtml(ins.metric)}</span>
-						<button class="btn" type="button" data-jump="${ins.targetTab}">→</button>
-					</div>
-				`;
-				row.querySelector<HTMLButtonElement>('button[data-jump]')!.onclick = () => {
-					switchTab(ins.targetTab);
-				};
-				list.appendChild(row);
-			}
-		}
-	}
-
-	// 6. I/O & Locks tab
-	if (activeTab === 'io') {
-		ioBodyEl.innerHTML = '';
-		if (!st || st.ioRows.length === 0) {
-			ioBodyEl.innerHTML = '<tr><td colspan="5" class="quiet">—</td></tr>';
-		} else {
-			for (const ev of [...st.ioRows].reverse().slice(0, 120)) {
-				const opLabel = IO_OP_NAMES[ev.slot_or_op] ?? `#${ev.slot_or_op}`;
-				const tr = document.createElement('tr');
-				tr.innerHTML = `
-					<td class="primary">${escapeHtml(ev.kind)}</td>
-					<td>t#${ev.thread}</td>
-					<td>${escapeHtml(opLabel)}</td>
-					<td>${fmtNs(ev.a)}</td>
-					<td>arg=${ev.b} · res=${ev.c}</td>
-				`;
-				ioBodyEl.appendChild(tr);
-			}
-		}
-	}
-}
-
-document.querySelectorAll<HTMLButtonElement>('.tab').forEach((btn) => {
-	btn.onclick = () => {
-		const tab = btn.dataset.tab as 'flame' | 'spans' | 'heap' | 'builds' | 'advisor' | 'io';
-		switchTab(tab);
+		return null;
 	};
-});
 
-btnPause.onclick = () => {
-	paused = !paused;
-	pauseLabel.textContent = paused ? 'Resume' : 'Pause';
-	btnPause.classList.toggle('active', paused);
-};
-
-btnClear.onclick = () => {
-	timeline.clear();
-	if (!selectedRunId) return;
-	const st = runs.get(selectedRunId);
-	if (!st) return;
-	st.spans.clear();
-	st.spanHistory.length = 0;
-	st.spanSlotById.clear();
-	st.heapSites.clear();
-	st.livePtrs.clear();
-	st.ioRows.length = 0;
-	st.totalEvents = 0;
-	render();
-};
-
-window.addEventListener('resize', () => {
-	timeline.render();
-	if (activeTab === 'flame') flameView.render();
-});
-
-const channel = 'BroadcastChannel' in window ? new BroadcastChannel('blaze-explore') : null;
-channel?.postMessage({ type: 'explore-tab-open', ts: Date.now() });
-
-const origin = resolveViewerOrigin(window.location.search);
-const client = new LiveClient(origin, {
-	onStatus(transport, detail) {
-		connDot.className = `dot ${transport === 'disconnected' ? 'off' : 'live'}`;
-		connLabel.textContent = detail.replace(/^Live · /, '');
-	},
-	onMessage(msg: ServerMessage) {
-		if (msg.type === 'runs') {
-			for (const r of msg.runs) ensureRun(r);
-		} else if (msg.type === 'builds') {
-			builds = [...msg.builds].reverse();
-			for (const b of builds) {
-				if (b.slots) buildSlots.set(b.package, b.slots);
-			}
-		} else if (msg.type === 'run_started') {
-			ensureRun(msg.run);
-			selectedRunId = msg.run.id;
-		} else if (msg.type === 'run_ended') {
-			const st = runs.get(msg.id);
-			if (st) st.summary.alive = false;
-		} else if (msg.type === 'events' && !paused) {
-			for (const ev of msg.events) ingestEvent(ev);
+	void fetchApi('/api/topology').then((txt) => {
+		if (txt) wasm.ingest_topology(writeIoStr(txt));
+	});
+	const pollResources = () => {
+		const pid = wasm.active_pid();
+		if (pid > 0) {
+			void fetchApi(`/api/resources?pid=${pid}`).then((txt) => {
+				if (txt) wasm.ingest_resources(writeIoStr(txt));
+			});
 		}
-		scheduleRender();
-	},
-});
+	};
+	setTimeout(pollResources, 400);
+	setInterval(pollResources, 2500);
 
-client.start();
-render();
+	let ws: WebSocket | null = null;
+	const connectWs = () => {
+		const url = `${viewerOrigin.replace(/^http/, 'ws')}/ws`;
+		ws = new WebSocket(url);
+		ws.binaryType = 'arraybuffer';
+		ws.onopen = () => wasm.set_connection(1, writeIoStr(`${url} (binary)`));
+		ws.onmessage = (ev) => {
+			if (ev.data instanceof ArrayBuffer) {
+				const dv = new DataView(ev.data);
+				if (ev.data.byteLength < 8 || dv.getUint8(0) !== 0x42 || dv.getUint8(1) !== 1) return;
+				const hdrLen = (4 + dv.getUint16(2, true) + 7) & ~7;
+				const raw = new Uint8Array(ev.data, hdrLen);
+				if (raw.byteLength >= 64) wasm.ingest_binary(writeIo(raw), Date.now());
+			} else if (typeof ev.data === 'string') {
+				wasm.ingest_json(writeIoStr(ev.data));
+			}
+		};
+		ws.onclose = () => {
+			wasm.set_connection(0, writeIoStr(`reconnecting ${viewerOrigin}…`));
+			setTimeout(connectWs, 800);
+		};
+		ws.onerror = () => ws?.close();
+	};
+	connectWs();
+
+	// Single-tab smart focus broadcast
+	const ch = 'BroadcastChannel' in window ? new BroadcastChannel('blaze-explore') : null;
+	ch?.postMessage({ type: 'explore-tab-open', ts: Date.now() });
+
+	// 60/120 FPS Zero-DOM WebGPU Frame Loop
+	const vpData = new Float32Array(2);
+	const frame = () => {
+		const dpr = Math.min(window.devicePixelRatio || 1, 2);
+		const cssW = Math.max(1, window.innerWidth);
+		const cssH = Math.max(1, window.innerHeight);
+		const pxW = Math.round(cssW * dpr);
+		const pxH = Math.round(cssH * dpr);
+		if (canvas.width !== pxW || canvas.height !== pxH) {
+			canvas.width = pxW;
+			canvas.height = pxH;
+		}
+
+		wasm.render_frame(Date.now(), cssW, cssH);
+
+		if (webgpuOk) {
+			const rc = Math.min(wasm.rects_count(), MAX_RECTS - 512);
+			const gc = Math.min(wasm.glyphs_count(), MAX_GLYPHS - 2048);
+			const ovRc = Math.min(wasm.ov_rects_count(), MAX_RECTS - rc);
+			const ovGc = Math.min(wasm.ov_glyphs_count(), MAX_GLYPHS - gc);
+			vpData[0] = cssW;
+			vpData[1] = cssH;
+			device.queue.writeBuffer(vpBuf, 0, vpData);
+			if (rc > 0) device.queue.writeBuffer(rectBuf, 0, new Uint8Array(wasm.memory.buffer, wasm.rects_ptr(), rc * 48));
+			if (ovRc > 0) device.queue.writeBuffer(rectBuf, rc * 48, new Uint8Array(wasm.memory.buffer, wasm.ov_rects_ptr(), ovRc * 48));
+			if (gc > 0) device.queue.writeBuffer(glyphBuf, 0, new Uint8Array(wasm.memory.buffer, wasm.glyphs_ptr(), gc * 48));
+			if (ovGc > 0) device.queue.writeBuffer(glyphBuf, gc * 48, new Uint8Array(wasm.memory.buffer, wasm.ov_glyphs_ptr(), ovGc * 48));
+
+			const encGpu = device.createCommandEncoder();
+			const pass = encGpu.beginRenderPass({
+				colorAttachments: [
+					{
+						view: gpuCtx.getCurrentTexture().createView(),
+						clearValue: { r: 0.063, g: 0.063, b: 0.067, a: 1.0 },
+						loadOp: 'clear',
+						storeOp: 'store',
+					},
+				],
+			});
+			// Z-Pass 1: Base UI geometry + text
+			if (rc > 0) {
+				pass.setPipeline(sdfPipe);
+				pass.setBindGroup(0, sdfBG);
+				pass.draw(6, rc, 0, 0);
+			}
+			if (gc > 0) {
+				pass.setPipeline(glyphPipe);
+				pass.setBindGroup(0, glyphBG);
+				pass.draw(6, gc, 0, 0);
+			}
+			// Z-Pass 2: Floating Hover Card geometry + syntax-highlighted Rust source peek (zero bleed-through!)
+			if (ovRc > 0) {
+				pass.setPipeline(sdfPipe);
+				pass.setBindGroup(0, sdfBG);
+				pass.draw(6, ovRc, 0, rc);
+			}
+			if (ovGc > 0) {
+				pass.setPipeline(glyphPipe);
+				pass.setBindGroup(0, glyphBG);
+				pass.draw(6, ovGc, 0, gc);
+			}
+			pass.end();
+			device.queue.submit([encGpu.finish()]);
+		}
+
+		// Drain host commands from Rust WASM (`cursor:`, `source:`, `toggle:`, `open:`)
+		const cmdLen = wasm.take_commands_len();
+		if (cmdLen > 0) {
+			const cmds = dec.decode(new Uint8Array(wasm.memory.buffer, wasm.cmd_buf_ptr(), cmdLen)).split('\n');
+			for (const cmd of cmds) {
+				if (cmd.startsWith('cursor:')) {
+					const cur = cmd.slice(7);
+					if (canvas.style.cursor !== cur) canvas.style.cursor = cur;
+				} else if (cmd.startsWith('source:')) {
+					const [file, line] = cmd.slice(7).split('|');
+					void fetchApi(`/api/source?file=${encodeURIComponent(file)}&line=${line}`).then((txt) => {
+						if (txt) wasm.ingest_source(writeIoStr(txt));
+					});
+				} else if (cmd.startsWith('toggle:')) {
+					const [run, slot, kind] = cmd.slice(7).split('|');
+					if (ws && ws.readyState === WebSocket.OPEN) {
+						ws.send(JSON.stringify({ type: 'toggle', run, slot: Number(slot), kind }));
+					}
+				} else if (cmd.startsWith('open:')) {
+					window.open(cmd.slice(5), '_blank');
+				}
+			}
+		}
+
+		requestAnimationFrame(frame);
+	};
+	requestAnimationFrame(frame);
+}
+
+void boot();

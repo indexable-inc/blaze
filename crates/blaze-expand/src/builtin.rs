@@ -177,21 +177,8 @@ impl Args<'_> {
     /// ends no argument. `None` when the input does not start with an expression, or it is
     /// followed by something other than a `,`.
     fn expr_end(&self, alloc: Alloc<'_>) -> Option<usize> {
-        let words = crate::body::parser_words(self.stream, alloc);
-        let output = parser::PrefixEntryPoint::Expr.parse(parser::Tokens::new(&words.words, true));
-        if output.iter().any(|step| matches!(step, parser::Step::Error { .. })) {
-            return None;
-        }
-        let taken = crate::rules::consumed(&output);
-        let len = self.stream.len();
-        let tokens = self.stream.tokens();
-        let mut end = (0..len).find(|&at| words.word_at[at] as usize >= taken).unwrap_or(len);
-        // An invisible group's delimiters start no word: the close of a `$e:expr` that held
-        // the expression belongs to it.
-        while tokens.get(end).is_some_and(|t| t.kind == TokenKind::Close(Delim::Invisible)) {
-            end += 1;
-        }
-        match tokens.get(end).map(|t| t.kind) {
+        let end = expr_extent(self.stream, alloc)?;
+        match self.stream.tokens().get(end).map(|t| t.kind) {
             None | Some(TokenKind::Punct { char: ',', .. }) => Some(end),
             Some(_) => None,
         }
@@ -721,6 +708,44 @@ fn assert(out: &mut Out<'_, '_>) -> Result<(), ExpandError> {
     out.made(TokenKind::Close(Delim::Brace), "", MADE)
 }
 
+/// Where the expression that starts `stream` ends, by the parser's expression entry point
+/// (rustc's `parse_expr`): the index of the first token past it, whatever follows. `None` when
+/// `stream` does not start with an expression. One reading for every builtin that takes an
+/// expression among other tokens (`assert!`'s condition, a `cfg_select!` arm).
+fn expr_extent(stream: &TokenStream<'_>, alloc: Alloc<'_>) -> Option<usize> {
+    let words = crate::body::parser_words(stream, alloc);
+    let output = parser::PrefixEntryPoint::Expr.parse(parser::Tokens::new(&words.words, true));
+    if output.iter().any(|step| matches!(step, parser::Step::Error { .. })) {
+        return None;
+    }
+    let taken = crate::rules::consumed(&output);
+    let len = stream.len();
+    let tokens = stream.tokens();
+    let mut end = (0..len).find(|&at| words.word_at[at] as usize >= taken).unwrap_or(len);
+    // An invisible group's delimiters start no word: the close of a `$e:expr` that held
+    // the expression belongs to it.
+    while tokens.get(end).is_some_and(|t| t.kind == TokenKind::Close(Delim::Invisible)) {
+        end += 1;
+    }
+    Some(end)
+}
+
+/// Whether the expression `range` of `stream` is one that ends a statement with no `;`
+/// (rustc's `classify::expr_is_complete`: a block-like expression, `if`, `match`, `loop`,
+/// `while`, `for`, `unsafe { .. }`, a labeled block), read by its first token and its last
+/// being a `}`: such an arm of `cfg_select!` may be followed by the next arm with no `,`.
+fn block_like(stream: &TokenStream<'_>, range: &core::ops::Range<usize>) -> bool {
+    let tokens = stream.tokens();
+    let closes = range.end > range.start && matches!(tokens.get(range.end - 1).map(|t| t.kind), Some(TokenKind::Close(Delim::Brace)));
+    let opens = match tokens.get(range.start).map(|t| t.kind) {
+        Some(TokenKind::Ident { raw: Raw::No, .. }) => matches!(stream.text_at(range.start), "if" | "match" | "loop" | "while" | "for" | "unsafe"),
+        // A label: its `'` (a lifetime is a joint `'` and an identifier).
+        Some(TokenKind::Punct { char: '\'', .. }) => true,
+        _ => false,
+    };
+    closes && opens
+}
+
 /// `cfg_select! { pred => { tokens } .. _ => expr }`: the tokens inside the braces of the
 /// first arm whose predicate holds (`_` always does), or its expression up to its `,`. Every
 /// arm is read; the predicates are evaluated in order up to the first that holds, each atom's
@@ -763,8 +788,12 @@ fn cfg_select(
             return refuse(out, "expected a cfg predicate or `_` before `=>`", input_at(arrow));
         }
         let open = arrow + 2;
-        // An arm is `{ tokens }`, or an expression up to the next `,` outside any group
-        // (rustc's arms since `cfg_select!` took expressions).
+        // An arm is `{ tokens }`, or an EXPRESSION, as the parser reads one (rustc_parse
+        // cfg_select.rs `parse_cfg_select_branch_rhs`: `parse_expr_res_after_attrs`, then
+        // `expect(Comma)` unless `classify::expr_is_complete` or the input ends): never "up to
+        // the next `,`", which split core's quicksort.rs `feature = "optimize_for_size" =>
+        // partition_lomuto_branchless_simple::<T, F>,` at the turbofish's comma (t1800: "no cfg
+        // predicate: it stops at token 1", the predicate read was `F> , _`).
         let body = match tokens.get(open).map(|it| it.kind) {
             Some(TokenKind::Open(Delim::Brace)) => match input.close_of(open) {
                 Some(close) => {
@@ -775,16 +804,16 @@ fn cfg_select(
             },
             None => return refuse(out, "expected an arm after `=>` in `cfg_select!`", input_at(arrow)),
             Some(_) => {
-                let mut depth = 0u32;
-                let mut end = open;
-                while let Some(token) = tokens.get(end) {
-                    match token.kind {
-                        TokenKind::Open(_) => depth += 1,
-                        TokenKind::Close(_) => depth = depth.saturating_sub(1),
-                        TokenKind::Punct { char: ',', .. } if depth == 0 => break,
-                        _ => {}
-                    }
-                    end += 1;
+                let rest = input.copy_in(open..tokens.len(), out.alloc)?;
+                let Some(taken) = expr_extent(&rest, out.alloc) else {
+                    return refuse(out, "expected an expression or a `{ .. }` arm after `=>` in `cfg_select!`", input_at(open));
+                };
+                let end = open + taken;
+                let complete = block_like(input, &(open..end));
+                match tokens.get(end).map(|it| it.kind) {
+                    None | Some(TokenKind::Punct { char: ',', .. }) => {}
+                    Some(_) if complete => {}
+                    Some(_) => return refuse(out, "expected `,` after a `cfg_select!` arm's expression", input_at(end)),
                 }
                 at = end;
                 open..end

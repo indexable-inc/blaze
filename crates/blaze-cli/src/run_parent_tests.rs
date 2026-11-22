@@ -619,6 +619,7 @@ fn the_entry_makes_one_instance_and_a_second_run_makes_none() {
     let (record, declares) = match lazy.resolve(&symbol_of(MAIN)).expect("main resolves") {
         Resolved::Record { record, declares, .. } => (record, symbols(declares)),
         Resolved::Unknown => panic!("main is unknown"),
+        Resolved::Waiting => panic!("main waited for its code under `Codes::Serial`"),
     };
     assert_eq!(declares, [symbol_of(A), symbol_of(B)], "main's record declares a and b, in its entry's order");
     assert_eq!(calls.get(), 1, "the maker made more than main: the walk went ahead of what was asked");
@@ -636,6 +637,7 @@ fn the_entry_makes_one_instance_and_a_second_run_makes_none() {
             again.tally()
         }
         Resolved::Unknown => panic!("main is unknown on the second run"),
+        Resolved::Waiting => panic!("main waited for its code under `Codes::Serial`"),
     };
     assert_eq!(second, Tally { reached: 1, found: 1, made: 0, unkeyed: 0 });
     assert_eq!(calls.get(), 1, "the second run made an instance its store holds");
@@ -825,15 +827,18 @@ fn an_unreached_callee_is_walked_to_from_the_roots() {
     match lazy.resolve(&symbol_of(LEAF)).expect("leaf resolves") {
         Resolved::Record { declares, .. } => assert!(declares.is_empty(), "leaf declares nothing"),
         Resolved::Unknown => panic!("an unreached callee was answered Unknown"),
+        Resolved::Waiting => panic!("leaf waited for its code under `Codes::Serial`"),
     }
     assert_eq!(calls.get(), 3, "main and a are stepped to reach leaf, then leaf is made");
     match lazy.resolve(&symbol_of(A)).expect("a, stepped ahead, is served") {
         Resolved::Record { declares, .. } => assert_eq!(symbols(declares), [symbol_of(LEAF)]),
         Resolved::Unknown => panic!("a is unknown"),
+        Resolved::Waiting => panic!("a waited for its code under `Codes::Serial`"),
     }
     match lazy.resolve(&symbol_of(MAIN)).expect("main, stepped ahead, is served") {
         Resolved::Record { declares, .. } => assert_eq!(symbols(declares), [symbol_of(A), symbol_of(B)]),
         Resolved::Unknown => panic!("main is unknown"),
+        Resolved::Waiting => panic!("main waited for its code under `Codes::Serial`"),
     }
     assert_eq!(calls.get(), 3, "a row stepped ahead was made again at its call");
     assert!(matches!(lazy.resolve(&symbol_of(A)), Err(ParentError::ResolvedTwice { .. })), "a served row was served again");
@@ -866,6 +871,7 @@ fn a_records_statics_are_told_once_before_its_publish() {
     let (declares, data) = match lazy.resolve(&symbol_of(SHOUT)).expect("shout resolves") {
         Resolved::Record { declares, data, .. } => (symbols(declares), data.to_vec()),
         Resolved::Unknown => panic!("shout is unknown"),
+        Resolved::Waiting => panic!("shout waited for its code under `Codes::Serial`"),
     };
     assert_eq!(declares, [symbol_of(LEAF)], "a static was declared as a slot");
     let told: std::vec::Vec<Symbol> = data.iter().map(|d| d.symbol).collect();
@@ -876,6 +882,7 @@ fn a_records_statics_are_told_once_before_its_publish() {
     match lazy.resolve(&symbol_of(LEAF)).expect("leaf resolves") {
         Resolved::Record { data, .. } => assert!(data.is_empty(), "a static told already was sent again"),
         Resolved::Unknown => panic!("leaf is unknown"),
+        Resolved::Waiting => panic!("leaf waited for its code under `Codes::Serial`"),
     }
     drop(lazy);
     for d in data.iter() {
@@ -1291,6 +1298,7 @@ fn a_record_that_lands_with_no_routine_is_refused_naming_its_fn() {
     match lazy.resolve(&symbol_of(MAIN)) {
         Ok(Resolved::Record { .. }) => {}
         Ok(Resolved::Unknown) => panic!("`main` lands nowhere and was answered Unknown"),
+        Ok(Resolved::Waiting) => panic!("`main` waited for its code under `Codes::Serial`"),
         Err(why) => panic!("`main` lands nowhere and was refused: {why}"),
     }
     let refused = match lazy.resolve(&symbol_of(A)) {

@@ -19,7 +19,8 @@
 //! data/TLS and then Publish. Keep the parent's declarations, placement, hooks and warm image.
 //! Replace its cold want/pump, per-slot build waiters and failure fanout with this pool
 //! (blaze-run/src/parent.rs:575, :587, :767, :777, :820). A ready reply can leave on the
-//! demand turn as soon as the preceding demands have replies or their children have exited.
+//! demand turn as soon as the preceding demands OF ITS CHILD have replies: the order kept is
+//! each child's own (D194), so one child's long make never holds another child's reply.
 //! Exit withdraws the child's undelivered receipts. A build already given to a worker
 //! returns exactly once. Its completion can settle the key without writing to an exited child.
 //!
@@ -216,6 +217,9 @@ struct Row<'a> {
 struct ChildState<'a> {
     live: bool,
     slots: SMap<'a, CodeKey, Slot>,
+    /// This child's demands not yet answered, in its own order (D194: the delivery order is
+    /// per child; a global queue let one test's 77 s make hold every other test's reply).
+    pending: VecDeque<(RowId, Demand), SharedAlloc<'a>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -232,7 +236,6 @@ pub struct CodePool<'a> {
     children: SVec<'a, ChildState<'a>>,
     workers: SVec<'a, WorkerState>,
     idle: VecDeque<Worker, SharedAlloc<'a>>,
-    pending: VecDeque<(RowId, Demand), SharedAlloc<'a>>,
     // false (demanded) sorts before true. Removal on promotion leaves one queue entry.
     queue: SSet<'a, (bool, RowId)>,
     frontier: SSet<'a, RowId>,
@@ -250,22 +253,22 @@ impl<'a> CodePool<'a> {
         }
         let a = opts.alloc;
         let mut children = SVec::with_capacity_in(opts.children, a);
-        children.resize_with(opts.children, || ChildState { live: true, slots: SMap::new_in(a) });
+        children.resize_with(opts.children, || ChildState { live: true, slots: SMap::new_in(a), pending: VecDeque::new_in(a) });
         Ok(Self {
             opts, index: Table::new_in(a), rows: SVec::new_in(a), children,
             workers: SVec::from_elem_in(WorkerState::Unavailable, opts.workers, a),
             idle: VecDeque::new_in(a),
-            pending: VecDeque::new_in(a), queue: SSet::new_in(a), frontier: SSet::new_in(a),
+            queue: SSet::new_in(a), frontier: SSet::new_in(a),
             background: 0, demands: 0, spec_claims: 0,
             #[cfg(test)]
             plant: Plant::None,
         })
     }
 
-    /// The head demand names the critical wait. With no waiter, outstanding operations still
-    /// need draining, including builds whose last interested child has exited.
+    /// The first child's head demand names the critical wait. With no waiter, outstanding
+    /// operations still need draining, including builds whose last interested child has exited.
     pub fn wait(&self) -> Option<(Wait, Time)> {
-        let waiting = self.pending.front().and_then(|(id, _)| self.row_wait(*id))
+        let waiting = self.children.iter().find_map(|c| c.pending.front().and_then(|(id, _)| self.row_wait(*id)))
             .or_else(|| self.frontier.first().and_then(|&id| self.row_wait(id)))
             .or_else(|| self.children.iter().position(|c| c.live).map(|i| Wait::Child(Child(i))))
             .or_else(|| (0..self.rows.len()).find_map(|id| self.row_wait(id)))?;
@@ -380,10 +383,10 @@ impl<'a> CodePool<'a> {
         }
         self.demands += 1;
         let id = self.find(key).unwrap_or_else(|| self.claim(key, out));
-        let slots = &mut self.children[child.0].slots;
-        let next = Slot(slots.len());
-        let slot = *slots.entry(key).or_insert(next);
-        self.pending.push_back((id, Demand { child, thread, key, slot }));
+        let state = &mut self.children[child.0];
+        let next = Slot(state.slots.len());
+        let slot = *state.slots.entry(key).or_insert(next);
+        state.pending.push_back((id, Demand { child, thread, key, slot }));
         let row = &mut self.rows[id];
         if !row.demanded {
             self.frontier.remove(&id);
@@ -510,23 +513,29 @@ impl<'a> CodePool<'a> {
         }
     }
 
+    /// Each child's ready heads, in child order then that child's demand order.
     fn deliver(&mut self, out: &mut SVec<'_, Action>) {
         #[cfg(test)]
-        if self.plant == Plant::CompletionOrder {
-            self.pending.retain(|&(id, demand)| match self.rows[id].state.outcome() {
-                Some(result) => { Self::reply(demand, result, out); false }
-                None => true,
-            });
-            return;
-        }
-        while let Some(&(id, demand)) = self.pending.front() {
-            let Some(result) = self.rows[id].state.outcome() else { break };
+        let plant = self.plant;
+        let rows = &self.rows;
+        for child in self.children.iter_mut() {
             #[cfg(test)]
-            if self.plant == Plant::LostRefusal && result.is_err() {
-                break;
+            if plant == Plant::CompletionOrder {
+                child.pending.retain(|&(id, demand)| match rows[id].state.outcome() {
+                    Some(result) => { Self::reply(demand, result, out); false }
+                    None => true,
+                });
+                continue;
             }
-            self.pending.pop_front();
-            Self::reply(demand, result, out);
+            while let Some(&(id, demand)) = child.pending.front() {
+                let Some(result) = rows[id].state.outcome() else { break };
+                #[cfg(test)]
+                if plant == Plant::LostRefusal && result.is_err() {
+                    break;
+                }
+                child.pending.pop_front();
+                Self::reply(demand, result, out);
+            }
         }
     }
 
@@ -540,7 +549,7 @@ impl<'a> CodePool<'a> {
     fn exit(&mut self, child: Child, out: &mut SVec<'_, Action>) -> Result<(), Error> {
         self.live(child)?;
         self.children[child.0].live = false;
-        self.pending.retain(|(_, demand)| demand.child != child);
+        self.children[child.0].pending.clear();
         for key in self.children[child.0].slots.keys() {
             let id = self.index.get(&Probe { key: *key, seed: self.opts.hash_seed }).expect("a demanded slot has a claim");
             self.rows[*id].callers.retain(|&c| c != child);
@@ -576,3 +585,7 @@ enum Plant { None, DoubleOwner, CompletionOrder, EnterHint, LostRefusal, KeepOrp
 #[cfg(test)]
 #[path = "code_pool_sim.rs"]
 mod tests;
+
+/// The relay that drives this pool for `blaze test`'s children (D194).
+#[path = "code_pool_relay.rs"]
+pub mod relay;

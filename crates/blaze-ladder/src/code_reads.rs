@@ -858,6 +858,13 @@ impl Adts for Recorded<'_> {
         self.world.caller_site(owner, expr)
     }
 
+    /// Not logged, as `caller_site`: the builder asks it only of the body's own owner (a
+    /// `Fn*` shim's `Fn*` method, blaze-build walk/track_caller.rs `shim_caller_arg`), so the
+    /// site is of the item the record is named by and item-relative (rule 71).
+    fn def_site(&self, item: ItemKey) -> Option<blaze_build::CallerSite<'_>> {
+        self.world.def_site(item)
+    }
+
     fn expr_site(&self, owner: ItemKey, expr: ExprId) -> Option<u32> {
         self.world.expr_site(owner, expr)
     }

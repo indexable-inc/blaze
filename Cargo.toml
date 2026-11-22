@@ -239,6 +239,7 @@ unicode-security = "=0.1.2"
 regex = { version = "1.13.1", default-features = false, features = ["perf", "std", "unicode-perl"] }
 blaze-glob = { path = "crates/blaze-glob" }
 # local crates
+blaze-base-tools = { path = "crates/blaze-base-tools" }
 blaze-body = { path = "crates/blaze-body" }
 blaze-body-drops = { path = "crates/blaze-body-drops" }
 blaze-body-eval = { path = "crates/blaze-body-eval" }

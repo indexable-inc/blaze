@@ -798,8 +798,12 @@ pub fn check_fail_class<'n, S: NamesSource<'n>>(names: S, keys: &Keys, e: &super
         },
         CheckFail::Check { error, .. } => format!("the checker stopped: {}", check_error_class(&path, error)),
         CheckFail::Diags { .. } => String::from("the check found errors"),
+        // The first hole of the last round, its item by path.
         CheckFail::Rounds { last, .. } => match last.first() {
-            Some(q) => format!("still asking after {} rounds ({})", super::check::MOST_ROUNDS, debug_class(&format!("{q:?}"), 1)),
+            Some(q) => match super::body_reads::question_item(q) {
+                Some(k) => format!("still asking after {} rounds ({} of {})", super::check::MOST_ROUNDS, debug_class(&format!("{q:?}"), 1), path(k)),
+                None => format!("still asking after {} rounds ({})", super::check::MOST_ROUNDS, debug_class(&format!("{q:?}"), 1)),
+            },
             None => format!("still asking after {} rounds", super::check::MOST_ROUNDS),
         },
         CheckFail::Const { shown, error, .. } => format!("the constant `{shown}` an array length names has no value ({})", debug_class(&format!("{error:?}"), 2)),

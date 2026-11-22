@@ -12,6 +12,13 @@
 // toolchain's facts and defers a C compiler in `check`; anything it does not answer STOPS the
 // script there, so the call never returns an error a script could swallow and carry on wrong.
 //
+// One answer is an error, because it is the one every machine gives: before a child exists,
+// `Command::spawn` asks the host `blaze_build_script.found` whether the machine has the program
+// (D192: the pinned base tool set and the programs blaze answers). A program it does not have is
+// `io::ErrorKind::NotFound` from `spawn`, `output` and `status`, as from the OS's `execvp` (not
+// exit 127: that is a shell's answer). libc's `Command::new("emcc").output().ok()?` on every
+// target reads it as "no Emscripten" and carries on.
+//
 // The request, every number little-endian u32, a string its length then its bytes:
 //   argc, argv (the program first), env_clear u8, env count, (u8 set, key, value) each,
 //   cwd u8 has + string, stdin string, stdout mode u8, stderr mode u8
@@ -35,6 +42,11 @@ unsafe extern "C" {
     /// the host refuses the spawn: the script stops there.
     #[link_name = "spawn"]
     fn blaze_spawn(request: *const u8, len: usize) -> usize;
+    /// Whether the machine has the program named by the `len` bytes at `program`: 1 it does,
+    /// 0 it does not (the OS's `NotFound`). Never returns when the host cannot say: the script
+    /// stops there.
+    #[link_name = "found"]
+    fn blaze_found(program: *const u8, len: usize) -> u32;
     /// Copies the last reply to `into`.
     #[link_name = "reply"]
     fn blaze_reply(into: *mut u8);
@@ -181,7 +193,12 @@ impl Command {
     }
 
     pub fn spawn(&mut self, default: Stdio, needs_stdin: bool) -> io::Result<(Process, StdioPipes)> {
-        let take = |set: &Option<Stdio>, default: &Stdio| set.as_ref().map_or(default.mode(), Stdio::mode);
+        let program = self.program.as_encoded_bytes();
+        // SAFETY: `program` is live for the call; the host reads `len` bytes of it.
+        if unsafe { blaze_found(program.as_ptr(), program.len()) } == 0 {
+            return Err(io::const_error!(io::ErrorKind::NotFound, "No such file or directory"));
+        }
+        let take =|set: &Option<Stdio>, default: &Stdio| set.as_ref().map_or(default.mode(), Stdio::mode);
         let stdin = take(&self.stdin, if needs_stdin { &default } else { &Stdio::Null });
         let stdout = take(&self.stdout, &default);
         let stderr = take(&self.stderr, &default);

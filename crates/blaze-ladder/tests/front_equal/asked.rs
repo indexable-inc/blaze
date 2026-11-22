@@ -298,6 +298,12 @@ impl<'a, P: FrontEnd> FrontEnd for Asked<'a, P> {
         r
     }
 
+    fn def_site(&self, item: ItemKey) -> Option<CallerSite<'_>> {
+        let r = self.inner.def_site(item);
+        self.note(format_args!("def_site {item:?}"), |o| write!(o, "{r:?}"));
+        r
+    }
+
     fn expr_site(&self, owner: ItemKey, expr: ExprId) -> Option<u32> {
         let r = self.inner.expr_site(owner, expr);
         self.note(format_args!("expr_site {owner:?} {expr:?}"), |o| write!(o, "{r:?}"));

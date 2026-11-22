@@ -639,6 +639,34 @@ pub(crate) fn select_owning<W: World>(
     args: &[PTy],
     ground: &mut PortableTys<'_>,
 ) -> Result<Option<(ItemKey, List)>, ResolveError> {
+    let Some(h) = holding_owning(cx, reads, own, trait_, args, ground)? else { return Ok(None) };
+    let (imp, impl_args) = (h.impls[h.chosen], h.args[h.chosen]);
+    match export_list(&mut cx.exporter(), impl_args, ground, 0)? {
+        Some(l) => Ok(Some((imp, l))),
+        None => Err(ResolveError::NotGround { item: imp }),
+    }
+}
+
+/// Every impl of a trait that holds at a ground goal, in selection order, each with its
+/// arguments in the context that tried it, and the one selected: the one that specializes
+/// every other (specialize.rs `most_specific`). The others are the selected impl's
+/// specialization ancestors (each applies wherever it does, being more general), which an
+/// item the selected impl does not define is inherited from ([`resolve_in`]).
+struct Holding<'x> {
+    impls: Vec<ItemKey, Alloc<'x>>,
+    args: Vec<crate::ty::TyList, Alloc<'x>>,
+    chosen: usize,
+}
+
+/// [`Holding`] at the ground `args` (self first, in `ground`); `None` when no impl holds.
+fn holding_owning<'x, W: World>(
+    cx: &mut InferCtx<'x>,
+    reads: &mut Reads<'_, '_, W>,
+    own: Option<OwnClosures<'_>>,
+    trait_: ItemKey,
+    args: &[PTy],
+    ground: &mut PortableTys<'_>,
+) -> Result<Option<Holding<'x>>, ResolveError> {
     if args.is_empty() {
         return Err(ResolveError::NotGround { item: trait_ });
     }
@@ -674,12 +702,8 @@ pub(crate) fn select_owning<W: World>(
     if holding.is_empty() {
         return Ok(None);
     }
-    let i = crate::specialize::most_specific(cx, reads, trait_, &holding)?;
-    let (imp, impl_args) = (holding[i], holding_args[i]);
-    match export_list(&mut cx.exporter(), impl_args, ground, 0)? {
-        Some(l) => Ok(Some((imp, l))),
-        None => Err(ResolveError::NotGround { item: imp }),
-    }
+    let chosen = crate::specialize::most_specific(cx, reads, trait_, &holding)?;
+    Ok(Some(Holding { impls: holding, args: holding_args, chosen }))
 }
 
 /// The projection `<args[0] as trait_<args[1..]>>::name` at the ground `args` (self first, in
@@ -798,18 +822,51 @@ fn resolve_in<W: World>(
         return Err(ResolveError::NotGround { item });
     }
     let mut cx = InferCtx::post_analysis_in(alloc);
-    let Some((imp, impl_args)) = select_in(&mut cx, reads, trait_, &all[..n], ground)? else {
+    let Some(h) = holding_owning(&mut cx, reads, None, trait_, &all[..n], ground)? else {
         return Err(ResolveError::NoImpl { trait_, item });
     };
-    match reads.assoc_item(imp, parent.name)? {
-        Some(a) => {
-            let mut v: Vec<PTy, Alloc<'_>> = Vec::with_capacity_in(all.len(), alloc);
-            v.extend_from_slice(ground.view().list(impl_args)?);
-            v.extend_from_slice(&all[n..]);
-            Ok(Resolved { item: a.item, args: ground.intern_list(&v)? })
+    // The item's definition: the selected impl's, else the nearest specialization ancestor's
+    // that defines it, else the trait's default (rustc_ty_utils instance.rs
+    // `resolve_associated_item`: `trait_def.ancestors(tcx, impl_def_id)?.leaf_def(tcx,
+    // trait_item_id)`, the walk "starting with that impl itself", then `translate_args` to the
+    // defining impl; RFC 1210: an impl that does not define an item inherits it). The pinned
+    // core's zip.rs: `impl ZipImpl for Zip<A, B> where A: TrustedRandomAccess, ..` defines no
+    // `fold`; it inherits the final `fold` of the `TrustedRandomAccessNoCoerce` impl it
+    // specializes (t1800: `Zip<Map<Iter<u8>, ..>, IterMut<u8>>::fold` ran the trait's bodiless
+    // `ZipImpl::fold`). Every holding impl but the selected one is its ancestor, and ancestors
+    // are a chain, so the nearest that defines the item is the most specific of those; its
+    // arguments are its own match at the goal (the translation, ground).
+    let mut defining: Vec<usize, Alloc<'_>> = Vec::new_in(alloc);
+    let mut members: Vec<ItemKey, Alloc<'_>> = Vec::new_in(alloc);
+    let mut keys: Vec<ItemKey, Alloc<'_>> = Vec::new_in(alloc);
+    for (i, &imp) in h.impls.iter().enumerate() {
+        if let Some(a) = reads.assoc_item(imp, parent.name)? {
+            if i == h.chosen {
+                defining.clear();
+                members.clear();
+                keys.clear();
+                defining.push(i);
+                members.push(a.item);
+                keys.push(imp);
+                break;
+            }
+            defining.push(i);
+            members.push(a.item);
+            keys.push(imp);
         }
-        None => Ok(Resolved { item, args }),
     }
+    let at = match keys.len() {
+        0 => return Ok(Resolved { item, args }),
+        1 => 0,
+        _ => crate::specialize::most_specific(&mut cx, reads, trait_, &keys)?,
+    };
+    let Some(impl_args) = export_list(&mut cx.exporter(), h.args[defining[at]], ground, 0)? else {
+        return Err(ResolveError::NotGround { item: keys[at] });
+    };
+    let mut v: Vec<PTy, Alloc<'_>> = Vec::with_capacity_in(all.len(), alloc);
+    v.extend_from_slice(ground.view().list(impl_args)?);
+    v.extend_from_slice(&all[n..]);
+    Ok(Resolved { item: members[at], args: ground.intern_list(&v)? })
 }
 
 #[cfg(test)]

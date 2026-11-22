@@ -1030,7 +1030,12 @@ pub fn item_attrs<'t, 'a>(cfg: &Cfg<'_, '_>, outline: &Outline<'_>, item: &Item,
     attrs
 }
 
-/// What a file's own inner attributes say under `cfg`.
+/// What a file's own inner attributes say under `cfg`. The attributes after a false `#![cfg]`
+/// are not read (the Reference, "Conditional compilation", cfg.attr.crate-level-attrs: "When a
+/// crate-level cfg has a false predicate, the crate itself still exists. Any crate attributes
+/// preceding the cfg are kept, and any crate attributes following the cfg are removed as well
+/// as removing all of the following crate contents."): a crate root's `#![no_std]` after it is
+/// not the crate's. A module file whose `#![cfg]` is false is not walked at all.
 pub fn file_attrs<'t, 'a>(cfg: &Cfg<'_, '_>, outline: &Outline<'_>, text: &'t str, alloc: Alloc<'a>) -> Attrs<'t, 'a> {
     let mut attrs = Attrs::new_in(alloc);
     let mut stack = AVec::new_in(alloc);
@@ -1039,6 +1044,9 @@ pub fn file_attrs<'t, 'a>(cfg: &Cfg<'_, '_>, outline: &Outline<'_>, text: &'t st
             continue;
         }
         cfg.attr(&mut attrs, strip_attr(attr.range.of(text)), &mut stack);
+        if !attrs.cfg_ok {
+            break;
+        }
     }
     attrs
 }
@@ -1438,6 +1446,14 @@ pub fn walk_rows<'t, 'a: 't>(
     out: &mut AVec<'a, WalkRow<'t>>,
     alloc: Alloc<'a>,
 ) -> Option<(bool, bool)> {
+    // A file whose own `#![cfg]` is false has no `mod` lines to walk ([`walk`]).
+    let own = item.is_none().then(|| {
+        let f = file_attrs(cfg, o, text, alloc);
+        (f.cfg_ok, f.no_implicit_prelude)
+    });
+    if own.is_some_and(|(cfg_ok, _)| !cfg_ok) {
+        return own;
+    }
     for (_, child) in o.children(item) {
         let ItemDetail::Mod { inline, .. } = child.detail else { continue };
         let mut attrs = item_attrs(cfg, o, child, text, alloc);
@@ -1453,10 +1469,7 @@ pub fn walk_rows<'t, 'a: 't>(
         }
         out.push(WalkRow { name, inline, no_implicit_prelude: attrs.no_implicit_prelude, path: attrs.path });
     }
-    item.is_none().then(|| {
-        let f = file_attrs(cfg, o, text, alloc);
-        (f.cfg_ok, f.no_implicit_prelude)
-    })
+    own
 }
 
 /// Where the inline module `name` of module `parent` of the file stands in the file's outline
@@ -1553,7 +1566,11 @@ pub fn walk<'t, 'a: 't, F: Files<'t> + ?Sized>(
         no_implicit_prelude: root_attrs.no_implicit_prelude,
         path: copied(name, alloc),
     });
-    let mut at = 0;
+    // A false crate-level `#![cfg]` removes "all of the following crate contents" (the
+    // Reference, cfg.attr.crate-level-attrs; [`file_attrs`]): the root is the one module,
+    // its `mod` lines not followed (turso's testing/stress/tests/shuttle_mvcc.rs,
+    // `#![cfg(shuttle)]`, was walked and named `shuttle` unresolved, c1814).
+    let mut at = if root_attrs.cfg_ok { 0 } else { tree.modules.len() };
     while at < tree.modules.len() {
         let m = &tree.modules[at];
         let (file, item, key) = (m.file, m.item, m.key);
@@ -2168,6 +2185,16 @@ pub fn lower<'p: 't, 't, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<'_, 'p, W>, fra
     let outline = fragment.outline;
     if let Some(owner) = fragment.members_of {
         low.assoc(None, owner);
+        return low.out;
+    }
+    // A file's own items under a false `#![cfg]` are not there (the Reference,
+    // cfg.attr.crate-level-attrs: "removing all of the following crate contents"). The walk
+    // keeps no module file whose `#![cfg]` is false, so this is the crate root's: the crate
+    // exists and is empty (a proc-macro crate's harness lists nothing).
+    if fragment.items.is_none() && fragment.depth == 0 && matches!(fragment.at, Where::File(_)) && !file_attrs(low.cfg, outline, low.text, alloc).cfg_ok {
+        if low.harness {
+            low.proc_macro_harness();
+        }
         return low.out;
     }
     // A macro crate's module list: the root's fragment declares each macro it names.

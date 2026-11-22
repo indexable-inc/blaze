@@ -209,6 +209,10 @@ pub(crate) trait Zygotes {
     /// Forgets the last wait's batch.
     fn clear(&mut self);
     fn now(&self) -> Nanos;
+    /// How long the run of `row` has been parked waiting for its code (made off the command
+    /// thread, D194): its allowance does not run then, so [`answer_due`] moves by it. Zero for
+    /// a row not running and wherever code is made inside the run's own turn.
+    fn parked(&self, row: u32) -> Nanos;
 }
 
 /// The driver's answers for a run whose report counted.
@@ -258,6 +262,9 @@ impl<C: Fn() -> Nanos> Zygotes for Unbuilt<C> {
     fn clear(&mut self) {}
     fn now(&self) -> Nanos {
         (self.now)()
+    }
+    fn parked(&self, _row: u32) -> Nanos {
+        Nanos(0)
     }
 }
 
@@ -447,9 +454,12 @@ struct Timeout<'b> {
     tail: AVec<'b, u8>,
 }
 
-/// The latest of (the zygote's ready, the run's ask) plus the allowance and [`ANSWER_SLACK`].
-fn answer_due(ready: Nanos, flight: &Flight, budget: Nanos) -> Nanos {
-    ready.max(flight.asked).after(budget).after(ANSWER_SLACK)
+/// The latest of (the zygote's ready, the run's ask) plus the allowance, the time the run was
+/// parked waiting for its code ([`Zygotes::parked`], which its allowance does not count: the
+/// code wait has its own deadline and error, D194) and [`ANSWER_SLACK`], which bounds only the
+/// relay's own lateness.
+fn answer_due(ready: Nanos, flight: &Flight, budget: Nanos, parked: Nanos) -> Nanos {
+    ready.max(flight.asked).after(budget).after(parked).after(ANSWER_SLACK)
 }
 
 fn earliest(wake: Option<Nanos>, at: Nanos) -> Option<Nanos> {
@@ -633,7 +643,7 @@ impl<'b, Z: Zygotes> Runner<'b, Z> {
             Phase::Starting { at } => wake = earliest(wake, at.after(START_DEADLINE)),
             Phase::Ready { at } => {
                 for flight in self.flights.iter().filter(|flight| !flight.expired) {
-                    wake = earliest(wake, answer_due(at, flight, self.budget));
+                    wake = earliest(wake, answer_due(at, flight, self.budget, self.zygotes.parked(flight.row)));
                 }
             }
             Phase::Ending { at } => wake = earliest(wake, at.after(END_DEADLINE)),
@@ -781,7 +791,7 @@ impl<'b, Z: Zygotes> Runner<'b, Z> {
             Phase::Ready { at } => self
                 .flights
                 .iter()
-                .filter(|flight| !flight.expired && now >= answer_due(at, flight, budget))
+                .filter(|flight| !flight.expired && now >= answer_due(at, flight, budget, self.zygotes.parked(flight.row)))
                 .min_by_key(|flight| flight.row)
                 .map(|flight| RunError::ZygoteSilent { suite, row: flight.row, test: flight.test }),
             _ => None,

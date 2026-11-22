@@ -235,6 +235,48 @@ fn section_bounds_are_the_laid_section() {
     assert!(image.fixups.contains(&Fixup { at: start + 8, to: FixTo::Rebase { target: start + 0x20 } }));
 }
 
+/// A pointer to a linker name plus an addend (stop 2 of tempo's `run`, aws-lc's shape): the
+/// header's `___dso_handle + 0x10` and `section$start$__DATA$__data + 8` are image places,
+/// rebased to them. Apple arm64's non-unique RTTI (tempo's rocksdb: a typeinfo's name field,
+/// `.quad __ZTS1H + 0x8000000000000000`) is a tag over an image place: laid as a rebase whose
+/// target keeps the top byte (the writer's `high8`). A target that is no image place below its
+/// top byte is refused naming the member, section, offset, name and the in-place addend (rule
+/// 19), never handed on to fail as a bare value at the chain encoding: `___dso_handle - 8`
+/// (below the image, wrapped) and bit 55 (`+ 0x0080000000000000`, no tag: rule 3).
+#[test]
+fn a_pointer_to_a_linker_name_with_an_addend_is_rebased_or_refused_by_name() {
+    use blaze_native::layout::{Far, REBASE_ADDRESS, Reach};
+    let with = |offset: u32, symbol: u32, addend: i64| Reloc { section: 0, offset, kind: RelocKind::Abs64, to: RelocTo::Symbol(symbol), addend };
+    let names = || [(&b"___dso_handle"[..], Resolution::Linker), (&b"section$start$__DATA$__data"[..], Resolution::Linker)];
+    let symbols = || {
+        [
+            sym(b"___dso_handle", Def::Undefined, Bind::Global),
+            sym(b"section$start$__DATA$__data", Def::Undefined, Bind::Global),
+            sym(b"__ZTS1H", Def::In { section: 0, offset: 0 }, Bind::Local),
+        ]
+    };
+    let p = plan(object([section(b"__DATA", b"__data", SectionKind::Data, 3, zeros(0x18), 0..3)], symbols(), [with(0, 0, 0x10), with(8, 1, 8), with(0x10, 2, i64::MIN)]), names(), [], []);
+    let image = laid(&p);
+    let (data, _) = at(&image, Region::Data);
+    let start = data + 48;
+    assert!(image.fixups.contains(&Fixup { at: start, to: FixTo::Rebase { target: 0x10 } }), "the header plus 0x10");
+    assert!(image.fixups.contains(&Fixup { at: start + 8, to: FixTo::Rebase { target: start + 8 } }), "control: the section's start plus 8, untagged");
+    assert!(image.fixups.contains(&Fixup { at: start + 0x10, to: FixTo::Rebase { target: start | 1 << 63 } }), "the RTTI name pointer keeps bit 63");
+    for (symbol, addend, name) in [(0u32, -8i64, &b"___dso_handle"[..]), (2, 0x0080_0000_0000_0000, &b"__ZTS1H"[..])] {
+        let far = plan(object([section(b"__DATA", b"__data", SectionKind::Data, 3, zeros(8), 0..1)], symbols(), [with(0, symbol, addend)]), names(), [], []);
+        let refused = match lay(&far, &inputs(), Layout::MACOS_ARM64, a()) {
+            Err(refused) => refused,
+            Ok(_) => panic!("a pointer {addend:#x} off `{}` was laid", core::str::from_utf8(name).unwrap_or("?")),
+        };
+        let &LayoutError::OutOfRange(Far { reach: Reach::Rebase { to, addend: said, end }, symbol: named, member, section, offset, .. }) = &refused else {
+            panic!("not refused as a rebase past the image: {refused:?}")
+        };
+        assert_eq!((named, member, section, offset, said), (name, &b"one.o"[..], &b"__data"[..], 0, addend));
+        assert!(to & REBASE_ADDRESS > end, "{to:#x} is past {end:#x} below its top byte");
+        println!("a_pointer_to_a_linker_name_with_an_addend_is_rebased_or_refused_by_name: {refused:?}");
+    }
+}
+
 /// A linker name this image has no address for is refused by its own words (rule 3: lld would
 /// make an empty section; rule 19: the name, the input, why): a boundary of a section that is
 /// not laid, and an executable's header in a dylib image.

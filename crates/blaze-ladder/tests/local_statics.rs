@@ -224,7 +224,7 @@ fn run_whole(text: &str) -> u8 {
 /// and a `main` returning `ret` (an `i32` expression).
 fn program(items: &str, ret: &str) -> String {
     format!(
-        "#![feature(no_core, lang_items, unboxed_closures, rustc_attrs, thread_local)]
+        "#![feature(no_core, lang_items, unboxed_closures, rustc_attrs, thread_local, type_alias_impl_trait)]
 #![no_core]
 #![no_main]
 
@@ -463,4 +463,101 @@ fn a_bodiless_fn_in_a_body_is_refused_by_name() {
     // Its body by path (`holder`, under whatever the crate root's path is shown as).
     assert!(e.contains("declared in the body of") && e.contains("holder"), "the refusal names its body: {e}");
     println!("local static refusal: {e}");
+}
+
+// A TYPE ALIAS'S `impl Trait` HELD BY A TYPE whose defining fn nothing calls, on this file's
+// walk over names records (the lazy program, which checks a fn only when it is needed). These
+// live here for the walk and the run this file already has, not for statics.
+//
+// The stop (t1800, 12 of tempo's tests): eyre 0.6.14's `DefaultHandler::default_with`
+// (src/lib.rs:737) holds an `Option<std::backtrace::Backtrace>`; `Backtrace` holds
+// `LazyLock<Capture, LazyResolve>` with `type LazyResolve = impl (FnOnce() -> Capture) + ..`,
+// defined by `#[define_opaque(LazyResolve)] fn lazy_resolve` (std backtrace.rs:433), which
+// `default_with` never calls. Its layout needs the hidden type, read from `lazy_resolve`'s
+// check record; the lazy program had no row for it: "an `impl Trait` type whose defining fn
+// is not in the program (not reached, or it did not check)". Now the build names the owner
+// (`BuildError::OpaqueOwnerUnchecked`) and the make (run/make_one.rs) checks it and builds
+// again. The Reference, "Type aliases" and RFC 2515: the alias's hidden type is the one its
+// defining uses give, whether or not the program calls them.
+
+/// A type holding the alias whose defining fn `make` nothing calls, laid out by `absent`'s
+/// build: walked with no refusal, and run whole to 3 (`Maybe::None`).
+/// Prints "local static opaque unreached: {counts}; run status 3".
+#[test]
+fn an_alias_opaque_whose_defining_fn_is_not_called_is_laid_out() {
+    runs_to_three(
+        "opaque unreached",
+        "type Hidden = impl Sized;
+
+#[define_opaque(Hidden)]
+fn make() -> Hidden {
+    7u8
+}
+
+enum Maybe {
+    Some(Hidden),
+    None,
+}
+
+#[inline(never)]
+fn absent() -> Maybe {
+    Maybe::None
+}",
+        "match absent() {
+        Maybe::None => 3,
+        Maybe::Some(_) => 4,
+    }",
+    );
+}
+
+/// The twin: the same alias where its defining fn IS called (`some` calls `make`), so the walk
+/// checks `make` by the call: 3 (`Maybe::Some`).
+/// Prints "local static opaque called: {counts}; run status 3".
+#[test]
+fn an_alias_opaque_whose_defining_fn_is_called_is_laid_out() {
+    runs_to_three(
+        "opaque called",
+        "type Hidden = impl Sized;
+
+#[define_opaque(Hidden)]
+fn make() -> Hidden {
+    7u8
+}
+
+enum Maybe {
+    Some(Hidden),
+    None,
+}
+
+#[inline(never)]
+fn some() -> Maybe {
+    Maybe::Some(make())
+}",
+        "match some() {
+        Maybe::Some(_) => 3,
+        Maybe::None => 4,
+    }",
+    );
+}
+
+/// The control: the same holder with a plain `u8` field and no opaque: 3 by the same walk.
+/// Prints "local static opaque control: {counts}; run status 3".
+#[test]
+fn a_holder_with_no_opaque_is_laid_out() {
+    runs_to_three(
+        "opaque control",
+        "enum Maybe {
+    Some(u8),
+    None,
+}
+
+#[inline(never)]
+fn absent() -> Maybe {
+    Maybe::None
+}",
+        "match absent() {
+        Maybe::None => 3,
+        Maybe::Some(_) => 4,
+    }",
+    );
 }

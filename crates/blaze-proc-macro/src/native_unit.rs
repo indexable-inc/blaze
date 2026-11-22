@@ -44,16 +44,18 @@ use crate::{
 pub use blaze_build_script::toolchain::MACOS_MIN;
 
 /// Where `script` (a build-script unit) runs for `mode`: the closure's verdict
-/// ([`native::runner`]) placed by the mode ([`toolchain::placement`], D69 (3)).
+/// ([`native::closure`]: a crate of the toolchain class, and one that does not compile for
+/// wasm) placed by the mode ([`toolchain::placement`], D69 (3)).
 ///
 /// This is THE one place a script is given the native runner; nothing else chooses it.
-/// D112: the five tool-spawning scripts (`toolchain::NATIVE_EVERY_MODE`, and
-/// tikv-jemalloc-sys for build/run) run in the Seatbelt native runner until the deterministic
+/// D112: the scripts whose closure cannot be wasm (`native::NO_WASM_CLASS`: libclang's chain),
+/// those named in `toolchain::NATIVE_EVERY_MODE`, and tikv-jemalloc-sys for build/run run in
+/// the Seatbelt native runner until the deterministic
 /// sandbox runs; records local. A script placed native runs with the command's
 /// [`NativeSetting`] (made once by [`crate::native_setting::command_native_setting`]) or is
 /// refused by name ([`NativeUnitError::NoNativeSetting`]); it is never tried as wasm (rule 3).
 pub fn placed(graph: &UnitGraph<'_>, script: UnitId, mode: Mode, alloc: Alloc<'_>) -> Runner {
-    toolchain::placement(native::runner(graph, script, alloc), mode, graph.units[script.index()].name.as_str())
+    toolchain::placement(native::closure(graph, script, alloc), mode, graph.units[script.index()].name.as_str())
 }
 
 /// What a command gives its native scripts. Every path absolute and canonical (Seatbelt matches
@@ -478,7 +480,7 @@ mod tests {
         units.push(unit("autocfg", UnitKind::Lib, &[], None)); // 3
         units.push(unit("zstd-sys", UnitKind::Lib, &[], Some(0))); // 4
         units.push(unit("pure", UnitKind::Lib, &[], Some(2))); // 5
-        let graph = UnitGraph { units, resolver: Resolver::V3, meta: AVec::new_in(alloc) };
+        let graph = UnitGraph { units, resolver: Resolver::V3, meta: AVec::new_in(alloc), left_out: AVec::new_in(alloc) };
 
         let native = placed(&graph, UnitId(0), Mode::Build, alloc);
         let wasm = placed(&graph, UnitId(2), Mode::Build, alloc);
@@ -513,6 +515,31 @@ mod tests {
         };
         assert_ne!(key_of(native), key_of(wasm));
         println!("placed: zstd-sys build {native:?}, pure build {wasm:?}");
+    }
+
+    /// turso 2026-11-21: turso_sdk_kit's script holds bindgen -> clang-sys -> libloading, which
+    /// do not compile for wasm32-wasip1 (bs-1's log: `cannot find Library in libloading`): native
+    /// in `check` too, though no name list holds it. TWIN: pg_query, whose closure also holds cc.
+    /// CONTROL (rule 23): a script with cc alone (the libloading chain removed) checks as wasm,
+    /// its C requests deferred.
+    #[test]
+    fn a_script_whose_closure_cannot_be_wasm_is_native_in_check() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut units = AVec::new_in(alloc);
+        units.push(unit("turso_sdk_kit", UnitKind::BuildScript, &[1], None)); // 0
+        units.push(unit("bindgen", UnitKind::Lib, &[2], None)); // 1
+        units.push(unit("clang-sys", UnitKind::Lib, &[3], None)); // 2
+        units.push(unit("libloading", UnitKind::Lib, &[], None)); // 3
+        units.push(unit("pg_query", UnitKind::BuildScript, &[1, 5], None)); // 4
+        units.push(unit("cc", UnitKind::Lib, &[], None)); // 5
+        units.push(unit("spawns_only", UnitKind::BuildScript, &[5], None)); // 6
+        let graph = UnitGraph { units, resolver: Resolver::V3, meta: AVec::new_in(alloc), left_out: AVec::new_in(alloc) };
+        for mode in [Mode::Check, Mode::Build, Mode::Run] {
+            assert_eq!(placed(&graph, UnitId(0), mode, alloc), Runner::Native { because: UnitId(1) }, "{mode:?}");
+            assert_eq!(placed(&graph, UnitId(4), mode, alloc), Runner::Native { because: UnitId(1) }, "{mode:?}");
+        }
+        assert_eq!(placed(&graph, UnitId(6), Mode::Check, alloc), Runner::Wasm, "CONTROL: cc alone checks as wasm");
+        assert_eq!(placed(&graph, UnitId(6), Mode::Build, alloc), Runner::Native { because: UnitId(5) });
     }
 
     /// The SDK's version is read with or without spaces around the colon, and refused when

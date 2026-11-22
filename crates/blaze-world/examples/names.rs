@@ -1548,7 +1548,7 @@ fn subset(graph: &UnitGraph<'static>, roots: &[String]) -> &'static UnitGraph<'s
         }
         u.build_script = u.build_script.map(|_| UnitId(u32::MAX));
     }
-    Box::leak(Box::new(UnitGraph { units: kept, resolver: graph.resolver, meta: AVec::new_in(g()) }))
+    Box::leak(Box::new(UnitGraph { units: kept, resolver: graph.resolver, meta: AVec::new_in(g()), left_out: AVec::new_in(g()) }))
 }
 
 /// `--owners`: each owner's heap bytes now and at its own peak; the default zone's are the

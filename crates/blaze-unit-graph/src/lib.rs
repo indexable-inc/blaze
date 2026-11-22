@@ -254,6 +254,60 @@ pub struct UnitGraph<'a> {
     /// meta.rs), sorted by id, each id once. A package with no row is one whose metadata this
     /// graph does not know: a crate of it reads those variables refused by name, never `""`.
     pub meta: AVec<'a, (LockId, PackageMeta<'a>)>,
+    /// The roots' targets the request leaves out by their `required-features`, sorted by
+    /// (package, kind, name), each once: no unit, and a note each (rule 3: never left out
+    /// quietly). In the record, so `run --example x` can say why `x` is not there.
+    pub left_out: AVec<'a, LeftOut<'a>>,
+}
+
+/// What kind of target a [`LeftOut`] is.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum LeftOutKind {
+    Bin,
+    Test,
+    Example,
+    Bench,
+}
+
+impl LeftOutKind {
+    /// As the manifest's table names it (`[[bin]]`, `[[test]]`, `[[example]]`, `[[bench]]`).
+    pub fn table(self) -> &'static str {
+        match self {
+            LeftOutKind::Bin => "bin",
+            LeftOutKind::Test => "test",
+            LeftOutKind::Example => "example",
+            LeftOutKind::Bench => "bench",
+        }
+    }
+}
+
+/// A root's target with no unit because entries of its `required-features` are off (the Cargo
+/// Book, "Cargo Targets", "The `required-features` field": "The `required-features` field
+/// specifies which features the target needs in order to be built. If any of the required
+/// features are not enabled, the target will be skipped.").
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct LeftOut<'a> {
+    pub package: LockId,
+    /// The package's name (a unit's `name`), for the note.
+    pub package_name: Text<'a>,
+    pub kind: LeftOutKind,
+    /// The target's name.
+    pub name: Text<'a>,
+    /// The entries of its `required-features` that are off, sorted, each once, never empty:
+    /// a feature of the package (`bench`) or `dep/feature` as written.
+    pub off: AVec<'a, Text<'a>>,
+}
+
+impl fmt::Display for LeftOut<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "the {} target `{}` of package `{}` is skipped: its required feature", self.kind.table(), self.name, self.package_name)?;
+        f.write_str(if self.off.len() == 1 { " " } else { "s " })?;
+        for (i, feature) in self.off.iter().enumerate() {
+            write!(f, "{}`{feature}`", if i == 0 { "" } else { ", " })?;
+        }
+        f.write_str(if self.off.len() == 1 { " is" } else { " are" })?;
+        f.write_str(" not enabled (the Cargo Book, \"The `required-features` field\": \"If any of the required features are not enabled, the target will be skipped.\")")
+    }
 }
 
 impl<'a> UnitGraph<'a> {

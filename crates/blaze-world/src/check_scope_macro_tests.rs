@@ -97,7 +97,7 @@ fn derive_world(member: bool, macro_side: bool) -> World<'static> {
     units.push(unit(lock, "toks", UnitKind::Lib, true, &[]));
     units.push(unit(lock, "derive", UnitKind::ProcMacro, true, &[("toks", 1)]));
     units.push(unit(lock, "app", UnitKind::Lib, false, &[("toks", 0), ("derive", 2)]));
-    let graph: &'static UnitGraph<'static> = held(UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(a()) });
+    let graph: &'static UnitGraph<'static> = held(UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(a()), left_out: AVec::new_in(a()) });
     let made = crate::fixture::pack(&[("src/lib.rs", "pub struct TokenStream;\npub struct Expr;\n")], a());
     let mut bytes: AVec<'static, u8> = AVec::with_capacity_in(made.len(), a());
     bytes.extend_from_slice(&made);

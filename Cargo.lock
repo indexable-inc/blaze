@@ -1606,6 +1606,7 @@ name = "blaze-proc-macro"
 version = "0.0.0"
 dependencies = [
  "blaze-apple-sdk",
+ "blaze-base-tools",
  "blaze-build-script",
  "blaze-core",
  "blaze-expand",

@@ -129,6 +129,11 @@ pub(crate) fn child_env(script_env: &[(String, String)], d: &Decoded) -> Vec<(St
 /// Which answerer takes a spawn ([`route`]). (No derives: `Fact` is W5's, whose derives this
 /// file does not assume.)
 pub(crate) enum Route<'s> {
+    /// A program by name that no machine with the pinned base tool set has and blaze does not
+    /// answer ([`program_found`] is false, D192). The shim asks first (`found`) and its
+    /// `Command::spawn` gives `io::ErrorKind::NotFound` without spawning, so a spawn that still
+    /// arrives here came from a module built with a shim that does not ask: refused by name.
+    NotFound,
     /// `rustc`: the probe table.
     Rustc,
     /// `cargo -V` (`--version`, `version`): the pinned cargo's line, `blaze_pins::CARGO_V`,
@@ -148,9 +153,15 @@ pub(crate) enum Route<'s> {
 }
 
 /// The route of the spawn of `name` (the program's last path component) with `args`, in this
-/// fixed order: `rustc`; a git question; a derived fact; a deferred tool in `CMode::Deferred`;
-/// then the executor when there is one, else a refusal. Decided from text alone.
-pub(crate) fn route<'s>(name: &'s str, args: &'s [&'s str], c_mode: CMode, has_executor: bool) -> Route<'s> {
+/// fixed order: a program not `found` ([`program_found`] of the program as spawned); `rustc`;
+/// a git question; a derived fact; a deferred tool in `CMode::Deferred`; then the executor when
+/// there is one, else a refusal. Decided from text alone. Not found is first, so a name the
+/// shim was told is missing is never answered here either (`found_covers_every_answered_route`
+/// in the tests holds that every name a later arm answers is found).
+pub(crate) fn route<'s>(name: &'s str, args: &'s [&'s str], c_mode: CMode, found: bool, has_executor: bool) -> Route<'s> {
+    if !found {
+        return Route::NotFound;
+    }
     if name == "rustc" {
         return Route::Rustc;
     }
@@ -168,6 +179,90 @@ pub(crate) fn route<'s>(name: &'s str, args: &'s [&'s str], c_mode: CMode, has_e
         return Route::Deferred;
     }
     if has_executor { Route::Executor } else { Route::Refused }
+}
+
+/// The head of a missing program's read subject, `absent-program\n<host>\n<name>`: a derived
+/// fact (fact_pins.rs `fact_now` answers it again), so a record that saw `NotFound` stands only
+/// while the program is still missing from today's list (rule 21).
+pub const ABSENT_HEAD: &str = "absent-program";
+
+/// Programs blaze answers by name whatever the base tool set holds: each is claimed by an arm
+/// of [`route`] above the executor: `rustc`; `cargo` (its version: any other cargo command is
+/// refused, rule 1); `git`, and the shells that run `git` or a `configure` (`sh`, `bash`); the
+/// derived facts' `pkgconf` and `sw_vers`. With these, the C toolchain's names
+/// ([`probe::C_TOOLS`]: the compilers' facts and probes, the deferred compiles) and the native
+/// tools `check` defers ([`probe::NATIVE_TOOLS`]) are found.
+const ANSWERED: &[&str] = &["bash", "cargo", "git", "pkgconf", "rustc", "sh", "sw_vers"];
+
+/// Why a program could not be looked up: the host has no pinned base tool set to look in.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct NoToolSet {
+    pub program: String,
+    pub host: String,
+    pub why: String,
+}
+
+impl core::fmt::Display for NoToolSet {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let NoToolSet { program, host, why } = self;
+        write!(f, "spawned `{program}`, which blaze looks up in the pinned base tool set of the host `{host}`, and there is none: {why} (D192)")
+    }
+}
+
+/// Whether `program`, as a build script names it to `Command::new`, is a program the script's
+/// machine has: the closed list of D192 ("a tool missing from the set is the error a machine
+/// without that tool gives, never a reach to the OS"): a name blaze answers ([`ANSWERED`], the C
+/// toolchain, the deferred native tools) or a program of the pinned base tool set of `host`
+/// (`pins/base-tools.json`: its names, which are pinned while its archive's digest may still be
+/// `PENDING`). A path (`./configure`, `/usr/bin/cc`) is not looked up on `PATH`: it is found, and
+/// routed by its last component as before. `false` is what the OS says of a missing program:
+/// `Command::spawn` fails with `io::ErrorKind::NotFound` (not exit 127: that is a shell's
+/// answer).
+pub fn program_found(program: &str, host: &str, alloc: Alloc<'_>) -> Result<bool, NoToolSet> {
+    if program.contains('/') {
+        return Ok(true);
+    }
+    if ANSWERED.contains(&program) || probe::C_TOOLS.contains(&program) || probe::NATIVE_TOOLS.contains(&program) {
+        return Ok(true);
+    }
+    let missing = |why: String| NoToolSet { program: program.to_owned(), host: host.to_owned(), why };
+    let Some(platform) = blaze_base_tools::Platform::from_triple(host) else {
+        return Err(missing(format!("{} has no platform of that triple", blaze_base_tools::pins::PATH)));
+    };
+    let file = blaze_base_tools::PinsFile::parse(blaze_pins::BASE_TOOLS_JSON, alloc).map_err(|error| missing(error.to_string()))?;
+    let Some(row) = file.row(platform) else {
+        return Err(missing(format!("{} has no row for it", blaze_base_tools::pins::PATH)));
+    };
+    Ok(row.groups.iter().any(|group| group.programs.iter().any(|have| *have == program)))
+}
+
+/// The read subject of `name` found missing on `host` ([`ABSENT_HEAD`]).
+pub(crate) fn absent_subject(host: &str, name: &str) -> String {
+    format!("{ABSENT_HEAD}\n{host}\n{name}")
+}
+
+/// The answer a missing program's read holds: one value per (host, name), the same on every
+/// machine (rule 25).
+pub(crate) fn absent_digest(host: &str, name: &str) -> ContentId {
+    let mut hash = blaze_ids::Hasher::new("blaze build-script absent program 1");
+    hash.part(host.as_bytes()).part(name.as_bytes());
+    hash.finish()
+}
+
+/// What a missing program's read `subject` is today: `None` when the subject is not one
+/// ([`ABSENT_HEAD`]); `Some(Some(digest))` while the program is still missing; `Some(None)`
+/// when it is found now (added to the set, or answered by blaze) or cannot be looked up, which
+/// differs from every recorded answer, so the script runs again.
+pub fn absent_now(subject: &str, alloc: Alloc<'_>) -> Option<Option<ContentId>> {
+    let mut lines = subject.splitn(3, '\n');
+    if lines.next() != Some(ABSENT_HEAD) {
+        return None;
+    }
+    let (Some(host), Some(name)) = (lines.next(), lines.next()) else { return Some(None) };
+    Some(match program_found(name, host, alloc) {
+        Ok(false) => Some(absent_digest(host, name)),
+        Ok(true) | Err(_) => None,
+    })
 }
 
 /// A pinned program a spawn may name: its bytes' SHA-256 and where the guest sees it (never a

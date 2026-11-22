@@ -34,6 +34,11 @@ use crate::work::{Did, Made, held_str};
 
 const GRAPH_OUT_DOMAIN: &str = "blaze-cli unit graph out 1";
 
+/// The finding number of a root's target the graph leaves out by its `required-features`
+/// (blaze-unit-graph `LeftOut`): a note on the graph's record, counted as nothing (`Told`).
+/// Its one argument is the whole sentence, naming the target and the features that are off.
+pub(crate) const TARGET_SKIPPED: u16 = 46;
+
 /// This build's own target: the one its checks are for.
 pub(crate) const TRIPLE: &str = if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
     "aarch64-apple-darwin"
@@ -362,6 +367,13 @@ pub(crate) fn run<'f, 'b>(cx: &Cx, lockfile: &mut Lockfile<'f>, graph: &mut Grap
             for finding in made.findings.iter() {
                 let words = bstd::mem::format_in!(held, "{finding}");
                 record.find(crate::fetch::SOURCE_REFUSED, (0, 0), &[words.as_str()]);
+            }
+            // A target left out by its `required-features` is said, never quietly dropped
+            // (rule 3): turso's bench `logical_log_serialization` (`bench`), example
+            // `sync_example` (`sync`).
+            for left in made.left_out.iter() {
+                let words = bstd::mem::format_in!(held, "{left}");
+                record.find(TARGET_SKIPPED, (0, 0), &[words.as_str()]);
             }
             Ok(Did::Done(record))
         }

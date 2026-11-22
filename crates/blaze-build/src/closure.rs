@@ -636,9 +636,13 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         self.scope_marks.push(0);
         // `self`: nothing to read for a fn item; the pointer's value for a fn pointer.
         let me = self.take_passed(reprs[0], passes[0], &mut next)?;
+        // A tracked fn item's hidden last argument: a row of this shim's `Fn*` method's
+        // definition site (walk/track_caller.rs `shim_caller_arg`). A fn pointer's target is
+        // never tracked (its reify is refused for a tracked fn).
+        let mut loc = None;
         let callee_ref = match target {
             Some(instance) => {
-                self.refuse_tracked_shim(instance)?;
+                loc = self.shim_caller_arg(instance)?;
                 let place = self.ref_place(instance);
                 Callee::Direct(self.b.reference(RefKind::Func, place))
             }
@@ -661,6 +665,12 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             self.push_val(v, None);
             treprs.push(reprs[i]);
             tpasses.push(self.pass(inputs[i - 1], reprs[i], abi, item)?);
+        }
+        if let Some(loc) = loc {
+            // As `Walk::call_instance` passes it: one pointer, last.
+            self.push_val(V::Scalar(loc), None);
+            treprs.push(Repr::Ptr);
+            tpasses.push(track_caller::PASS);
         }
         let rrepr = self.ret;
         let rpass = self.pass(output, rrepr, abi, item)?;

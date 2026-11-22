@@ -271,6 +271,13 @@ const AUTOCFG: &[&str] = &["--crate-type=lib", "--emit=llvm-ir"];
 /// rustix 1.1.5's `can_compile` arguments (`-o` says where; stdin).
 const RUSTIX: &[&str] = &["--crate-type=rlib", "--emit=metadata"];
 
+/// proc-macro2 1.0.94's `build/probe.rs`, exactly (turso's macro side; its build.rs passes no
+/// `--cfg`).
+const PROC_MACRO2_094_SPAN: &str = "// This code exercises the surface area that we expect of Span's unstable API.\n// If the current toolchain is able to compile it, then proc-macro2 is able to\n// offer these APIs too.\n\n#![feature(proc_macro_span)]\n\nextern crate proc_macro;\n\nuse core::ops::{Range, RangeBounds};\nuse proc_macro::{Literal, Span};\n\npub fn byte_range(this: &Span) -> Range<usize> {\n    this.byte_range()\n}\n\npub fn start(this: &Span) -> Span {\n    this.start()\n}\n\npub fn end(this: &Span) -> Span {\n    this.end()\n}\n\npub fn line(this: &Span) -> usize {\n    this.line()\n}\n\npub fn column(this: &Span) -> usize {\n    this.column()\n}\n\npub fn join(this: &Span, other: Span) -> Option<Span> {\n    this.join(other)\n}\n\npub fn subspan<R: RangeBounds<usize>>(this: &Literal, range: R) -> Option<Span> {\n    this.subspan(range)\n}\n\n// Include in sccache cache key.\nconst _: Option<&str> = option_env!(\"RUSTC_BOOTSTRAP\");\n";
+
+/// proc-macro2 1.0.94's probe arguments (no `--cfg=procmacro2_build_probe`, unlike 1.0.107).
+const PROC_MACRO2_094: &[&str] = &["--edition=2021", "--crate-type=lib", "--cap-lints=allow", DTOLNAY_EMIT];
+
 /// The crates most rows rest on.
 const STD: &[&str] = &["core", "std"];
 const CORE: &[&str] = &["core"];
@@ -378,5 +385,47 @@ pub const TEMPO: &[Known] = &[
         accepted: true,
         why: ERROR_GENERIC_MEMBER_ACCESS,
         needs: CORE,
+    },
+    // turso 2026-11-21 (reports/turso/c1647/check.out:19-26): the probes tempo's versions do
+    // not make. Each read against nightly-2026-10-27's library (rust-src of the pinned
+    // toolchain, `library/`).
+    // Read against library/core/src/ptr/const_ptr.rs:611-615. rustix 0.38.44 build.rs:178 and
+    // 1.0.7 build.rs:183 ask it (one key: same line, snippet and target).
+    Known {
+        probe: "rustix 0.38.44 and 1.0.7: `offset_from` in a const fn (build.rs:178, :183)",
+        args: RUSTIX,
+        snippet: "const unsafe fn foo(p: *const u8) -> isize { p.offset_from(p) }\n",
+        accepted: true,
+        why: "core/src/ptr/const_ptr.rs:611-615 `pub const unsafe fn offset_from`, #[stable(feature = \"ptr_offset_from\", since = \"1.47.0\")] and #[rustc_const_stable(feature = \"const_ptr_offset_from\", since = \"1.65.0\")]",
+        needs: STD,
+    },
+    // Read against the sysroot's crate list: `std` is one (library/std/src/lib.rs); the row is
+    // made only for a target whose sysroot holds it (`needs`). indexmap 1.9.3 build.rs:5.
+    Known {
+        probe: "indexmap 1.9.3 (autocfg): the sysroot crate `std`",
+        args: AUTOCFG,
+        snippet: "extern crate std as probe;",
+        accepted: true,
+        why: "`std` is a crate of the target's sysroot (the row is made only for a target that ships it, `needs`); `extern crate NAME as probe` is autocfg's `probe_sysroot_crate`",
+        needs: STD,
+    },
+    // Read against library/core/src/num/int_macros.rs:2548-2553. bigdecimal 0.4.10 build.rs:28.
+    Known {
+        probe: "bigdecimal 0.4.10 (autocfg): `i64::unsigned_abs`",
+        args: AUTOCFG,
+        snippet: "pub fn probe() { let _ = 0i64.unsigned_abs(); }",
+        accepted: true,
+        why: "core/src/num/int_macros.rs:2548-2553 `pub const fn unsigned_abs`, #[stable(feature = \"unsigned_abs\", since = \"1.51.0\")]",
+        needs: STD,
+    },
+    // Read against library/proc_macro/src/lib.rs:660-661 (byte_range), 666-689 (start, end,
+    // line, column), 715-716 (join), 1583-1584 (Literal::subspan).
+    Known {
+        probe: "proc-macro2 1.0.94: proc_macro_span (build/probe.rs)",
+        args: PROC_MACRO2_094,
+        snippet: PROC_MACRO2_094_SPAN,
+        accepted: true,
+        why: "proc_macro/src/lib.rs: Span::byte_range (661), Span::join (716) and Literal::subspan (1584) under the unstable proc_macro_span, which the probe's #![feature] turns on; start/end/line/column (667-689) stable as proc_macro_span_location since 1.88.0",
+        needs: PROC_MACRO,
     },
 ];

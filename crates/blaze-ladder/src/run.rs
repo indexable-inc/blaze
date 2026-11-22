@@ -1098,6 +1098,11 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
         self.0.caller_site(owner, expr)
     }
 
+    /// From the front end (`FrontEnd::def_site`): item-relative, as `caller_site`.
+    fn def_site(&self, item: ItemKey) -> Option<blaze_build::CallerSite<'_>> {
+        self.0.def_site(item)
+    }
+
     /// From the front end (`FrontEnd::expr_site`): a trap row's site, with no file.
     fn expr_site(&self, owner: ItemKey, expr: ExprId) -> Option<u32> {
         self.0.expr_site(owner, expr)

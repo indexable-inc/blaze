@@ -220,7 +220,7 @@ mod tests {
         units.push(unit(0, "librocksdb-sys", UnitKind::Lib, &[3], Some(0), Some("rocksdb")));
         units.push(unit(1, "lz4-sys", UnitKind::BuildScript, &[], None, None));
         units.push(unit(1, "lz4-sys", UnitKind::Lib, &[], Some(2), Some("lz4")));
-        UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(alloc) }
+        UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(alloc), left_out: AVec::new_in(alloc) }
     }
 
     /// Export-9's librocksdb-sys stop ("DEP_lz4_root: the `links = \"lz4\"` package's run was

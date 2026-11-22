@@ -7,8 +7,9 @@
 //! - "Path patterns": "Path patterns are irrefutable when they refer to structs or an enum
 //!   variant ... They are refutable when they refer to refutable constants or enum variants
 //!   for enums with multiple variants." A constant is compared with its evaluated value, leaf
-//!   by leaf (a structural match: an ADT's, a tuple's, an array's too; `const_test`); one
-//!   holding a reference or a pointer is refused by name.
+//!   by leaf (a structural match: an ADT's, a tuple's, an array's too; `const_test`); a `&str`
+//!   constant by its bytes, as a string literal; any other holding a reference or a pointer is
+//!   refused by name.
 //! - "Or-patterns": "every binding in each pattern [alternative] must have the same type and
 //!   binding mode" and each alternative binds the same set of names. The lowering resolves a
 //!   use of such a name to its first binding in the pattern (blaze-lower machine.rs
@@ -31,6 +32,28 @@ use crate::layout::Variants;
 use super::At;
 use crate::BuildError;
 
+/// The bytes a `&str` constant's record points to, for constant pattern `p`: its root is the
+/// wide pointer (crate::layout's wide-pointer rule: the address word, then the length), the
+/// address word a relocation (crate::data `DataReloc`: "an 8-byte word holding the addend")
+/// to an allocation of the same record, whose bytes `addend..addend + len` are the string. A
+/// `&str` into a static's bytes is refused by name: no record here holds them.
+fn str_const_bytes<B: Allocator>(p: PatId, record: &crate::data::DataRecord<B>) -> Result<&[u8], BuildError> {
+    let root = record.allocs.first().ok_or(malformed("a const's record with no allocation"))?;
+    let word = |off: usize| -> Result<u64, BuildError> {
+        let part = root.bytes.get(off..off + 8).ok_or(malformed("a `&str` constant's record shorter than a wide pointer"))?;
+        Ok(part.iter().enumerate().fold(0u64, |v, (i, &byte)| v | (u64::from(byte) << (8 * i))))
+    };
+    let (addend, len) = (word(0)?, word(8)?);
+    let reloc = root.relocs.iter().find(|r| r.offset == 0).ok_or(malformed("a `&str` constant whose address word holds no relocation"))?;
+    let crate::data::DataTarget::Local(n) = reloc.target else {
+        return Err(BuildError::UnsupportedPat { pat: p, what: "a `&str` constant pointing outside its own record (a static's bytes) as a pattern" });
+    };
+    let to = record.allocs.get(n as usize).ok_or(malformed("a `&str` constant's relocation past its record's allocations"))?;
+    let start = usize::try_from(addend).map_err(|_| malformed("a `&str` constant's addend past a usize"))?;
+    let end = usize::try_from(len).ok().and_then(|len| start.checked_add(len)).ok_or(malformed("a `&str` constant's length past a usize"))?;
+    to.bytes.get(start..end).ok_or(malformed("a `&str` constant's bytes past its allocation"))
+}
+
 impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// The tests that the value at `at` equals the constant path pattern `p` names, from the
     /// current block: to `ok` when it does, else to `fail`. `false` (nothing emitted) when `p`
@@ -41,21 +64,36 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// compares with the constant's bytes there, a float by `==` (`FloatCond::Oeq`), an enum
     /// by its variant first, then that variant's fields, a struct, tuple or array by every
     /// part. The leaves come from the type's walk row, so padding is never compared, and a
-    /// variant's fields are read only once the variant test passed. A constant holding a
-    /// pointer (a `&str` field, a reference) is refused by name: its pointee would be compared,
-    /// which no row here holds.
+    /// variant's fields are read only once the variant test passed. A `&str` constant is
+    /// compared by its bytes, as a string literal pattern is (`bytes_test`). Any other constant
+    /// holding a pointer (a `&str` field, a reference) is refused by name: its pointee would be
+    /// compared, which no row here holds.
     pub(super) fn const_test(&mut self, p: PatId, at: At, ok: Block, fail: Block) -> Result<bool, BuildError> {
         let Some(Def::Const(item)) = self.pat_def(p) else { return Ok(false) };
         let root = self.repr(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
-        let structural = matches!(self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))?, PNode::Adt(..));
+        let node = self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
+        let structural = matches!(node, PNode::Adt(..));
         let refuse = |what| BuildError::UnsupportedPat { pat: p, what };
-        if root == Repr::Ptr {
-            return Err(refuse("a constant of a reference or pointer type as a pattern (compared by its pointee)"));
+        // A `&str` constant: compared as a string literal pattern is (`str_test`), by its
+        // pointee's bytes. rustc_mir_build const_to_pat.rs `recur` makes a `&str` constant
+        // `PatKind::Constant`, tested by `TestKind::Eq` (`<str as PartialEq>::eq`): the same
+        // length, then the same bytes.
+        let str_ref = match node {
+            PNode::Ref(_, inner) => self.ground_node(inner).map_err(|error| Self::pat_ty_err(p, error))? == PNode::Str,
+            _ => false,
+        };
+        if root == Repr::Ptr && !str_ref {
+            return Err(refuse("a constant of a reference or pointer type other than `&str` as a pattern (compared by its pointee)"));
         }
         let args = self.pat_const_args(p)?;
         let adts = self.adts;
         let record = adts.const_value(item, &args[..]).ok_or(BuildError::NoPatConstValue { pat: p, item })?;
         record.check().map_err(|_| malformed("a const's record that breaks the data form"))?;
+        if str_ref {
+            let bytes = str_const_bytes(p, record)?;
+            self.bytes_test(p, at, bytes, (true, true), ok, fail)?;
+            return Ok(true);
+        }
         let bytes = &record.allocs.first().ok_or(malformed("a const's record with no allocation"))?.bytes[..];
         let word = |off: u32, n: u32| -> Result<u128, BuildError> {
             let start = off as usize;
@@ -261,6 +299,15 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         };
         let adts = self.adts;
         let bytes = adts.str_pat(self.body.owner, p).ok_or(BuildError::NoPatValue { pat: p })?;
+        self.bytes_test(p, at, bytes, (behind, wide), ok, fail)
+    }
+
+    /// The tests that the value at `at` holds `bytes`, for pattern `p`: behind the pointer at
+    /// `at` (`behind`) with its length in the word after it (`wide`), or in place: the length
+    /// first when it is a wide pointer's, then the bytes a word at a time; to `ok` when all are
+    /// equal, else to `fail`. No byte is read before the length test passed. The one compare of
+    /// a string literal pattern (`str_test`) and of a `&str` constant (`const_test`).
+    fn bytes_test(&mut self, p: PatId, at: At, bytes: &[u8], (behind, wide): (bool, bool), ok: Block, fail: Block) -> Result<(), BuildError> {
         if wide {
             let len = self.b.load(Ty::I64, Flags::NONE, at.at.0, at.at.1 + 8, MemAttrs::aligned(3));
             let n = self.b.iconst(Ty::I64, bytes.len() as u128);

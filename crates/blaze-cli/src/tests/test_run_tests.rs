@@ -417,6 +417,11 @@ impl Zygotes for SimZygote<'_> {
     fn now(&self) -> Nanos {
         self.now
     }
+
+    /// The simulated zygote makes its code inside its runs: nothing parks.
+    fn parked(&self, _row: u32) -> Nanos {
+        Nanos(0)
+    }
 }
 
 /// Every counted run's address is its test id; nothing is held there.

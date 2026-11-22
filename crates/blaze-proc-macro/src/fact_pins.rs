@@ -163,9 +163,14 @@ pub enum FactNow {
     Answer(Option<ContentId>),
 }
 
-/// `subject` ([`facts::subject`]'s form: the program's word, then one argument per line)
-/// answered now with `pins`.
+/// `subject` ([`facts::subject`]'s form: the program's word, then one argument per line, or a
+/// missing program's `absent-program\n<host>\n<name>`) answered now with `pins`.
 pub fn fact_now(subject: &str, pins: Option<&FactPins>, alloc: Alloc<'_>) -> FactNow {
+    // A program found missing (spawn_route.rs `ABSENT_HEAD`, D192): a fact of the pinned base
+    // tool set's names and blaze's answered list, not of these pins, so answered with none.
+    if let Some(now) = crate::spawn_route::absent_now(subject, alloc) {
+        return FactNow::Answer(now);
+    }
     let mut lines = subject.split('\n');
     let head = lines.next().unwrap_or("");
     if !matches!(head, "pkg-config" | "sw_vers" | "cc-version") {

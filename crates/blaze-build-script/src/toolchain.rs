@@ -354,21 +354,27 @@ pub enum Mode {
     Run,
 }
 
-/// The scripts of the toolchain class that give nothing as wasm (bindgen, or a program they
-/// start is their output): native in every mode. Sorted; from tempo's census (D69).
-/// libusb1-sys is not here (N7): as wasm its build.rs asks no `sw_vers`, pkg-config is answered
-/// from the pins, and its cc compile defers, so check gives its outputs (census 2, 19:29);
-/// build and run place it native for that compile, where the fact shim answers `sw_vers`.
-pub const NATIVE_EVERY_MODE: [&str; 4] = ["libproc", "librocksdb-sys", "reth-mdbx-sys", "sha3-asm"];
+/// The scripts of the toolchain class whose output is a program they start (sha3-asm 0.1.9's
+/// build.rs runs `perl` and `patch`): native in every mode, by name, since their closure does
+/// not say so. Sorted; from tempo's census (D69). libproc, librocksdb-sys and reth-mdbx-sys
+/// were here for bindgen: their closures hold [`crate::native::NO_WASM_CLASS`], which places
+/// them native in every mode. libusb1-sys is not here (N7): as wasm its build.rs asks no
+/// `sw_vers`, pkg-config is answered from the pins, and its cc compile defers, so check gives
+/// its outputs (census 2, 19:29); build and run place it native for that compile, where the
+/// fact shim answers `sw_vers`.
+pub const NATIVE_EVERY_MODE: [&str; 1] = ["sha3-asm"];
 
-/// Where a script runs in `mode` (D69 (3)), and so its key: a script [`crate::native::runner`]
-/// calls native runs native for `build` and `run`; for `check` it runs as wasm with its C
-/// requests deferred, unless it is in [`NATIVE_EVERY_MODE`]. A wasm script is wasm in every
-/// mode. Decided before the run; a failure is never tried again the other way (rule 3).
-pub fn placement(runner: Runner, mode: Mode, package: &str) -> Runner {
-    match (runner, mode) {
+/// Where a script runs in `mode` (D69 (3)), and so its key: a script whose closure
+/// [`crate::native::closure`] calls native runs native for `build` and `run`; for `check` it
+/// runs as wasm with its C requests deferred, unless its closure holds a crate that does not
+/// compile for wasm ([`crate::native::NO_WASM_CLASS`]) or it is in [`NATIVE_EVERY_MODE`]. A
+/// wasm script is wasm in every mode. Decided before the run; a failure is never tried again
+/// the other way (rule 3).
+pub fn placement(closure: crate::native::Closure, mode: Mode, package: &str) -> Runner {
+    match (closure.runner, mode) {
         (Runner::Wasm, _) => Runner::Wasm,
         (native, Mode::Build | Mode::Run) => native,
+        (native, Mode::Check) if closure.no_wasm.is_some() => native,
         (native, Mode::Check) if NATIVE_EVERY_MODE.binary_search(&package).is_ok() => native,
         (Runner::Native { .. }, Mode::Check) => Runner::Wasm,
     }

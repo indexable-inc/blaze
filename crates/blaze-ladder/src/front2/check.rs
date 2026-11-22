@@ -78,8 +78,12 @@ pub enum CheckFail {
     /// `filed`, one per diagnostic: where it is filed (front2 expansion_origin.rs): in expanded
     /// text, at the user's tokens or at the call; elsewhere [`Filed::Own`](super::expansion_origin::Filed::Own).
     Diags { owner: ItemKey, diags: Vec<(tc::DiagCode, tc::Range, Box<str>), Global>, filed: Vec<super::expansion_origin::Filed, Global> },
-    /// Still `Need` after [`MOST_ROUNDS`].
-    Rounds { owner: ItemKey, last: Vec<Question, Global> },
+    /// Still `Need` after [`MOST_ROUNDS`]. `last`: the last round's HOLES (the questions it had
+    /// no answer to, never every question it asked: rt-loop a1750's `tempo_main_with` printed
+    /// 4,200 asked questions and no hole). `shown`: what stopped, by path (rule 19), made by
+    /// [`rounds_fail`]: the loop, the records it made, the holes left and the first of them
+    /// with its item's path.
+    Rounds { owner: ItemKey, last: Vec<Question, Global>, shown: Box<str, Global> },
     /// The constant `key` an array length in a head names has no value: the evaluator's
     /// refusal, or [`ConstFail::Nested`] for one met while another constant is evaluated.
     /// `shown` is what `key` names ([`key_shown`]: rule 19), beside the key tools grep.
@@ -122,12 +126,12 @@ impl core::fmt::Display for CheckFail {
                 }
                 Ok(())
             }
-            CheckFail::Rounds { last, .. } => {
+            CheckFail::Rounds { last, shown, .. } => {
                 let need = last.first().map_or("a record", |question| match question.record_kind() {
                     tc::RecordKind::Body => "the checked body record of a dependency item",
                     tc::RecordKind::Item => "an item record",
                 });
-                write!(f, "checking the body in its source file: still needs {need} after {MOST_ROUNDS} rounds")
+                write!(f, "checking the body in its source file: still needs {need} after {MOST_ROUNDS} rounds: {shown}")
             }
             CheckFail::ReadsDiffer { owner, diff } => write!(f, "checking {owner:?} again read other answers than its first check: two read-list digests under one body (rule 21): {diff}"),
             CheckFail::Resolve { owner, item, error, args } => write!(f, "in {owner:?}, the call of {item:?} at [{args}]: {error}"),
@@ -262,6 +266,8 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
     // The store's allocator: the checked body outlives the round (`Checked<'static>`).
     let alloc = r.store.tys.alloc();
     let mut hints = Needs::new_in(alloc);
+    // The records made between rounds, for a refusal past the last ([`rounds_fail`]).
+    let mut made = 0u64;
     let mut all_gaps: Vec<Gap, Global> = Vec::new_in(Global);
     // The opaques whose hidden types this check reads, grown only by its own gaps
     // (front2/opaque_auto.rs): its answers never depend on what was checked before it.
@@ -444,7 +450,9 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             questions.extend_from_slice(&needs.questions);
             return Err(CheckFail::NothingToFill { owner, questions });
         }
+        let filling = fills.len() as u64;
         let dropped = make_round(r, fills, owner)?;
+        made += filling - dropped;
         if let Some((tally, _)) = &mut count {
             tally.dropped += dropped;
             if round > 0 {
@@ -456,9 +464,37 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
         hints = needs;
     }
     let mut last = Vec::new_in(Global);
-    last.extend_from_slice(&hints.questions);
-    Err(CheckFail::Rounds { owner, last })
+    last.extend_from_slice(&hints.missing);
+    Err(rounds_fail(r, owner, "the body's check", made, last))
 }
+
+/// [`CheckFail::Rounds`] of `owner`: loop `what` ran [`MOST_ROUNDS`] rounds, made `made`
+/// records between them, and its last round still met the holes `last`. Said by path (rule
+/// 19): the owner, the count, and the first [`MOST_HOLES_SHOWN`] holes, each its question's
+/// kind and its item's path ([`key_shown`]). Few records over many rounds is a chain of needs
+/// each found only once the one before it is made (a round per link); many is a body that
+/// needs many records.
+pub(crate) fn rounds_fail<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKey, what: &str, made: u64, last: Vec<Question, Global>) -> CheckFail {
+    use core::fmt::Write as _;
+    let mut shown = String::new();
+    let _ = write!(shown, "{what} of {} made {made} records over {MOST_ROUNDS} rounds, and its last round met {} holes", key_shown(r, owner), last.len());
+    for (i, q) in last.iter().take(MOST_HOLES_SHOWN).enumerate() {
+        let sep = if i == 0 { ": " } else { "; " };
+        let text = format!("{q:?}");
+        let kind = text.split('(').next().unwrap_or("");
+        let _ = match super::body_reads::question_item(q) {
+            Some(k) => write!(shown, "{sep}{kind} of {}", key_shown(r, k)),
+            None => write!(shown, "{sep}{text}"),
+        };
+    }
+    if last.len() > MOST_HOLES_SHOWN {
+        let _ = write!(shown, "; and {} more", last.len() - MOST_HOLES_SHOWN);
+    }
+    CheckFail::Rounds { owner, last, shown: shown.into_boxed_str() }
+}
+
+/// The most holes a [`CheckFail::Rounds`] names.
+const MOST_HOLES_SHOWN: usize = 4;
 
 /// A future-like opaque can make the same auto-trait obligation surface once through its
 /// opaque and once through its coroutine interior. They are one obligation at one place, so
@@ -1500,6 +1536,8 @@ pub fn callee_target<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,scope: &
         true => copy_trait(r, owner)?,
     };
     let alloc = r.store.tys.alloc();
+    // For a refusal past the last round ([`rounds_fail`]).
+    let (mut made, mut hole) = (0u64, None);
     for _ in 0..MOST_ROUNDS {
         // A callee resolved at ground types after its body has checked is post-analysis: it
         // sees every opaque's hidden type, not only the body's leak list.
@@ -1533,12 +1571,18 @@ pub fn callee_target<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,scope: &
         match out {
             Ok(_) if !gaps.is_empty() => return Err(CheckFail::Gap { owner, gaps }),
             Ok(res) => return Ok(Target::Body(res.item)),
-            Err(tc::ResolveError::Missing(_)) if !fills.is_empty() => make_all(r, fills, owner)?,
+            Err(tc::ResolveError::Missing(q)) if !fills.is_empty() => {
+                made += fills.len() as u64;
+                hole = Some(q);
+                make_all(r, fills, owner)?
+            }
             Err(_) if !gaps.is_empty() => return Err(CheckFail::Gap { owner, gaps }),
             Err(error) => return Err(CheckFail::Resolve { owner, item, error, args: shown_args(ground.view(), args) }),
         }
     }
-    Err(CheckFail::Rounds { owner, last: Vec::new_in(Global) })
+    let mut last = Vec::new_in(Global);
+    last.extend(hole);
+    Err(rounds_fail(r, owner, &format!("instance resolution of the call of {}", key_shown(r, item)), made, last))
 }
 
 /// The program's `Copy` trait, its key filed in the key map (no body need name the trait for
@@ -1585,6 +1629,8 @@ pub fn reach_capture_copy<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, sc
     let alloc = r.store.tys.alloc();
     for &t in held.iter() {
         let mut done = false;
+        // For a refusal past the last round ([`rounds_fail`]).
+        let (mut made, mut hole) = (0u64, None);
         for _ in 0..MOST_ROUNDS {
             let world = BodyWorld { reveal: super::opaque_auto::Reveal::All, ..world_at(r, scope) };
             let out = tc::holds(&world, copy, &[t], &mut c.types, alloc);
@@ -1599,14 +1645,20 @@ pub fn reach_capture_copy<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, sc
                     break;
                 }
                 Ok(_) => return Err(CheckFail::Gap { owner, gaps }),
-                Err(tc::ResolveError::Missing(_)) if !fills.is_empty() => make_all(r, fills, owner)?,
+                Err(tc::ResolveError::Missing(q)) if !fills.is_empty() => {
+                    made += fills.len() as u64;
+                    hole = Some(q);
+                    make_all(r, fills, owner)?
+                }
                 Err(_) if !gaps.is_empty() => return Err(CheckFail::Gap { owner, gaps }),
                 // Shown at the closure's arguments: the capture is one of its environment's.
                 Err(error) => return Err(CheckFail::Resolve { owner, item: copy, error, args: shown_args(c.types.view(), args) }),
             }
         }
         if !done {
-            return Err(CheckFail::Rounds { owner, last: Vec::new_in(Global) });
+            let mut last = Vec::new_in(Global);
+            last.extend(hole);
+            return Err(rounds_fail(r, owner, "whether a closure's capture is `Copy`", made, last));
         }
     }
     Ok(())

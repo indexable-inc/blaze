@@ -187,6 +187,8 @@ pub(super) fn select_made<'n, S: NamesSource<'n>>(
     ground: &mut PortableTys<'_>,
     alloc: Alloc<'_>,
 ) -> Result<(ItemKey, List), ConstFail> {
+    // For a refusal past the last round (check.rs `rounds_fail`).
+    let mut made = 0u64;
     for _ in 0..MOST_ROUNDS {
         let step = select_once(r.names, &*r.keys, r.index, &*r.store, r.buckets.as_ref(), constant, trait_, args, ground, alloc);
         match step {
@@ -195,8 +197,11 @@ pub(super) fn select_made<'n, S: NamesSource<'n>>(
             Selection::Asked { fills, gaps } if fills.is_empty() => {
                 return Err(ConstFail::Check { item: constant, error: CheckFail::Gap { owner: constant, gaps } });
             }
-            Selection::Asked { fills, .. } => make_all(r, fills, constant).map_err(|error| ConstFail::Check { item: constant, error })?,
+            Selection::Asked { fills, .. } => {
+                made += fills.len() as u64;
+                make_all(r, fills, constant).map_err(|error| ConstFail::Check { item: constant, error })?
+            }
         }
     }
-    Err(ConstFail::Check { item: constant, error: CheckFail::Rounds { owner: constant, last: Vec::new_in(Global) } })
+    Err(ConstFail::Check { item: constant, error: super::check::rounds_fail(r, constant, "selecting a trait's constant", made, Vec::new_in(Global)) })
 }

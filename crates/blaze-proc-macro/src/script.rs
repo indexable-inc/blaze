@@ -221,6 +221,15 @@ fn errno(answer: Answer<()>) -> Result<i32, Stop> {
 }
 
 fn imports(l: &mut Linker<ScriptHost>) -> wasmtime::Result<()> {
+    // The shim's lookup before a spawn (guest/script_process.rs `Command::spawn`): 1 when the
+    // machine has the program, 0 for the OS's `NotFound` (D192). A module built before the
+    // shim asked does not import it, and the linker's unused definition is nothing to it.
+    l.func_wrap(IMPORTS, "found", |mut c: Caller<'_, ScriptHost>, program: u32, len: u32| {
+        with(&mut c, |mem, host| {
+            let program = blaze_wasi::bytes(mem, u64::from(program), u64::from(len))?.to_vec();
+            Ok(u32::from(host.sandbox.found(&program)?))
+        })
+    })?;
     l.func_wrap(IMPORTS, "spawn", |mut c: Caller<'_, ScriptHost>, request: u32, len: u32| {
         with(&mut c, |mem, host| {
             let request = blaze_wasi::bytes(mem, u64::from(request), u64::from(len))?.to_vec();

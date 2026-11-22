@@ -788,7 +788,6 @@ fn finding_about<'f>(cx: &Cx, l: &Listed<'f>, text: &[u8], file: Option<&str>, s
     let unchecked = kind == Some(words::Kind::Unchecked);
     let borrows_unchecked = kind == Some(words::Kind::BorrowsUnchecked);
     let borrows_note = borrows_unchecked || (kind == Some(words::Kind::Borrows) && !policy.borrows_are_errors);
-    let waited = kind == Some(words::Kind::Waited);
     let root = kind == Some(words::Kind::Failure);
     let severity = match (lint, kind) {
         (Some(blaze_lint::Level::Error), _) => Severity::Error,
@@ -817,8 +816,10 @@ fn finding_about<'f>(cx: &Cx, l: &Listed<'f>, text: &[u8], file: Option<&str>, s
     }
     let message = core::str::from_utf8(l.words).map_err(|_| CliError::Text { what: "a finding's message is not UTF-8" })?;
     let Some(path) = l.path else {
-        // A text-less crate's finding: no source to draw, its name is its place.
-        count(shown, if waited { Severity::Note } else { Severity::Error }, root, false);
+        // A text-less crate's finding: no source to draw, its name is its place. Its severity
+        // is its row's, as a placed one's is (D164): a `Told` note (a target the graph left
+        // out by its `required-features`) was drawn and counted an error here.
+        count(shown, severity, root, false);
         let erased = blaze_own::Erased::new(frame);
         return out.block(cx, || {
             blaze_ids::Hasher::new("blaze-cli fileless drawing 2")
@@ -834,11 +835,10 @@ fn finding_about<'f>(cx: &Cx, l: &Listed<'f>, text: &[u8], file: Option<&str>, s
             let mut line = AString::new_in(erased.handle());
             if shown.view == View::Person {
                 use core::fmt::Write as _;
-                let label = if waited { "note" } else { "error" };
+                let label = severity.label();
                 writeln!(line, "{about}: {label}[{}]: {message}", l.code())
                     .map_err(|_| CliError::Text { what: "could not render a fileless finding" })?;
             } else {
-                let severity = if waited { Severity::Note } else { Severity::Error };
                 let plain = Plain { id: l.id.as_str(), severity, code: l.code(), path: about.as_str(), text: None, start: 0, end: 0, message, fix: None };
                 written(&mut line, &plain, shown.view)?;
             }
@@ -1145,6 +1145,7 @@ mod tests {
             (Area::Cli, crate::units::UNREAD),
             (Area::Cli, crate::units::TOOLCHAIN_NAMED),
             (Area::Cli, crate::units::TARGET_REFUSED),
+            (Area::Cli, crate::graph::TARGET_SKIPPED),
             (Area::Cli, crate::work::MODULE_AT_BOTH),
             (Area::Cli, crate::work::FILE_NOT_TEXT),
             (Area::Cli, crate::names::UNRESOLVED),

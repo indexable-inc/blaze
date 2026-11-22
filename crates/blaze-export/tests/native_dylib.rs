@@ -277,6 +277,31 @@ fn every_command_is_counted_and_the_signature_is_read() {
     assert_eq!(walk(ncmds - 1).1, None, "control: one command fewer does not reach the signature");
 }
 
+/// `dyld_chained_ptr_64_rebase` keeps a target's top byte in `high8` (bits 36..43; dyld:
+/// header + (high8 << 56 | target)): Apple arm64 non-unique RTTI's typeinfo name pointer, bit
+/// 63 over an image place (tempo's rocksdb), is written so, with its 36-bit target. Bits
+/// 36..55 are no image place: refused naming the slot's address (rule 19). Control: the
+/// untagged rebase has high8 0.
+#[test]
+fn a_rebase_keeps_its_top_byte_and_refuses_bits_36_to_55_by_slot() {
+    use blaze_export::native_dylib::DylibError;
+    let mut tagged = image(false);
+    tagged.fixups[1] = Fixup { at: 0xC020, to: FixTo::Rebase { target: (1 << 63) | 0x4000 } };
+    let file = written(&tagged);
+    // The next slot is 0xC028, 8 bytes (two 4-byte strides) on.
+    assert_eq!(u64_at(&file, 0xC020), 0x4000 | (0x80 << 36) | (2 << 51), "high8 0x80, target 0x4000");
+    assert_eq!(u64_at(&file, 0xC038), 0x4004, "control: the untagged rebase has high8 0");
+    for target in [(1u64 << 55) | 0x4000, 1 << 40] {
+        let mut far = image(false);
+        far.fixups[1] = Fixup { at: 0xC020, to: FixTo::Rebase { target } };
+        let mut out: AVec<'static, u8> = Vec::new_in(alloc());
+        match write(&far, IDENT, &mut out, alloc()) {
+            Err(DylibError::Slot { at, value, .. }) => assert_eq!((at, value), (0xC020, target)),
+            other => panic!("the rebase target {target:#x} was not refused by its slot: {other:?}"),
+        }
+    }
+}
+
 /// NATIVE.md 3.10: the bytes are a function of the image and the identifier.
 /// Prints: `native_dylib: two writes, <N> equal bytes`
 #[test]

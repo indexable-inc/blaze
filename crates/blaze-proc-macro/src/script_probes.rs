@@ -88,8 +88,8 @@ impl ProbeStore for DirStore {
     }
 }
 
-/// Answers held in memory, for a run without a store folder and for tests: `writes` counts the
-/// records written.
+/// Answers held in memory, for a run without a store folder and for tests; [`Self::len`] is
+/// how many records were written.
 #[derive(Default)]
 pub struct MemProbeStore {
     rows: Mutex<Vec<(ProbeKey, Vec<u8>)>>,

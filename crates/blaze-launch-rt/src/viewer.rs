@@ -869,8 +869,8 @@ fn read_source_snippet_json(query: &str) -> Option<String> {
         return None;
     }
     let content = std::fs::read_to_string(path).ok()?;
-    let start = line.saturating_sub(3).max(1);
-    let end = line.saturating_add(3);
+    let start = line.saturating_sub(2).max(1);
+    let end = line.saturating_add(13);
     let mut out = format!(r#"{{"file":"{}","line":{line},"lines":["#, escape_json(&path_str));
     let mut first = true;
     for (idx, text) in content.lines().enumerate() {

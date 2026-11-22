@@ -609,6 +609,32 @@ fn cfg_select_takes_the_first_arm_that_holds() {
     assert!(matches!(exp.diagnostics[..], [Diagnostic::Builtin { .. }]));
 }
 
+/// A `cfg_select!` arm's expression is what the parser reads as one (rustc_parse
+/// cfg_select.rs `parse_cfg_select_branch_rhs`), so a comma in a turbofish ends no arm. The
+/// site: core's slice/sort/unstable/quicksort.rs `inst_partition`, `feature =
+/// "optimize_for_size" => partition_lomuto_branchless_simple::<T, F>, _ =>
+/// partition_lomuto_branchless_cyclic::<T, F>,` (t1800, 13 tests NOT RUN: "no cfg predicate:
+/// it stops at token 1", the second arm's predicate read as `F > , _`).
+#[test]
+fn a_cfg_select_arm_s_turbofish_comma_ends_no_arm() {
+    let cx = TestCx::new();
+    let def = builtin(BuiltinFn::CfgSelect);
+    // The site's shape: the first arm does not hold, the wildcard's turbofish is taken whole.
+    let exp = call_fn(&def, "windows => simple::<T, F>, _ => cyclic::<T, F>,", &cx);
+    assert!(exp.diagnostics.is_empty(), "{:?}", exp.diagnostics);
+    assert_eq!(show(&exp.tokens), "cyclic :: < T , F >");
+    // The twin: the first arm holds, its turbofish taken whole and the rest skipped.
+    let exp = call_fn(&def, "unix => simple::<T, F>, _ => cyclic::<T, F>,", &cx);
+    assert!(exp.diagnostics.is_empty(), "{:?}", exp.diagnostics);
+    assert_eq!(show(&exp.tokens), "simple :: < T , F >");
+    // A block-like arm needs no `,` before the next arm (`classify::expr_is_complete`).
+    let exp = call_fn(&def, "windows => if a { b } else { c } _ => d", &cx);
+    assert_eq!(show(&exp.tokens), "d");
+    // The control: the same arms with no comma inside a turbofish read as before.
+    let exp = call_fn(&def, "windows => simple::<T>, _ => cyclic::<T>,", &cx);
+    assert_eq!(show(&exp.tokens), "cyclic :: < T >");
+}
+
 #[test]
 fn line_is_a_hole_or_a_read_in_eager_input() {
     let cx = TestCx::new();

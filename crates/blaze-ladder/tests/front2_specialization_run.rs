@@ -208,3 +208,148 @@ pub extern \"C\" fn main() -> i32 {
     println!("OVERLAP TWIN: {got:?}");
     assert!(got.is_err(), "two impls neither more specific (E0119): never run through one of them, got {got:?}");
 }
+
+// AN ITEM THE SELECTED IMPL DOES NOT DEFINE, INHERITED FROM AN ANCESTOR: the pinned core's
+// zip.rs, three `ZipImpl` impls for `Zip<A, B>` (general; `A, B: TrustedRandomAccessNoCoerce`
+// with a final `fn fold`; `A, B: TrustedRandomAccess`, defining no `fold`). tempo t1800, 27
+// tests NOT RUN: `ZipImpl::fold` at `Zip<Map<Iter<u8>, ..>, IterMut<u8>>` "the record walk
+// reached an instance of a fn the front end holds no checked body for": the call resolved to
+// the TRAIT's bodiless `fold` (blaze-typeck instance.rs `resolve_in` took the trait's item
+// whenever the most specific impl had none). The rule: rustc_ty_utils instance.rs
+// `resolve_associated_item` takes `trait_def.ancestors(tcx, impl_def_id)?.leaf_def(..)`, the
+// walk up the specialization graph "starting with that impl itself" (specialization_graph.rs
+// `ancestors`); RFC 1210: an impl that does not define an item inherits it from the impl it
+// specializes.
+
+/// Three impls of `Pick`, as zip.rs's: the general one (1), the `TrustedLen` one with a FINAL
+/// `pick` (2), and the `Exact` one (`Exact: TrustedLen`) defining only `other` (30). The
+/// repeated `default fn other` is zip.rs's `zip_impl_general_defaults!`: an item an impl does
+/// not mention is final below it (specialization_graph.rs `leaf_def`).
+const CHAIN: &str = "
+#[rustc_specialization_trait]
+unsafe trait Exact: TrustedLen {}
+
+unsafe impl Exact for Counted {}
+
+trait Pick<T, I> {
+    fn pick(&mut self, iter: I) -> u32;
+    fn other(&self) -> u32;
+}
+
+impl<T, I> Pick<T, I> for Bag<T>
+where
+    I: Iter<Item = T>,
+{
+    default fn pick(&mut self, iter: I) -> u32 {
+        let mut it = iter;
+        self.first = it.next();
+        1
+    }
+
+    default fn other(&self) -> u32 {
+        10
+    }
+}
+
+impl<T, I> Pick<T, I> for Bag<T>
+where
+    I: TrustedLen<Item = T>,
+{
+    fn pick(&mut self, iter: I) -> u32 {
+        let mut it = iter;
+        self.first = it.next();
+        2
+    }
+
+    default fn other(&self) -> u32 {
+        20
+    }
+}
+";
+
+/// The leaf impl that defines no `pick` (zip.rs's `TrustedRandomAccess` impl and `fold`).
+const LEAF: &str = "
+impl<T, I> Pick<T, I> for Bag<T>
+where
+    I: Exact<Item = T>,
+{
+    fn other(&self) -> u32 {
+        30
+    }
+}
+";
+
+/// `pick` and `other` at `Counted` (the leaf impl selected) and `pick` at `Plain` (the general
+/// one): `pick` inherited from the `TrustedLen` impl (2), `other` the leaf's own (30), the
+/// plain one's 1: 2 * 100 + 30 + 1 = 231.
+const CALLS: &str = "
+fn via<T, I: Iter<Item = T>>(bag: &mut Bag<T>, iter: I) -> u32 {
+    bag.pick(iter)
+}
+
+fn other_of<T, I: Iter<Item = T>>(bag: &Bag<T>, _iter: &I) -> u32 {
+    <Bag<T> as Pick<T, I>>::other(bag)
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let mut bag: Bag<u32> = Bag { first: None };
+    let counted = Counted { left: 3 };
+    let o = other_of(&bag, &counted);
+    let a = via(&mut bag, counted);
+    let c = via(&mut bag, Plain { left: 3 });
+    (a * 100 + o + c) as i32
+}
+";
+
+/// The site's shape: the leaf impl selected at `Counted` defines no `pick`; it runs the
+/// `TrustedLen` impl's. Before the fix: refused, the trait's bodiless `pick` reached.
+#[test]
+fn an_item_the_selected_impl_omits_is_its_ancestors() {
+    let got = run(&[CHAIN, LEAF, CALLS].concat());
+    println!("INHERITED ITEM: {got:?}");
+    assert_eq!(got, Ok(231), "`pick` from the TrustedLen impl, `other` from the leaf, the plain iterator's general `pick`");
+}
+
+/// The twin: the leaf's own item is still the one called when it defines it (`other`, 30),
+/// and an item no impl below the general one defines is the general's: `other` at `Plain`
+/// (10) beside `pick` at `Counted` (2): 2 * 100 + 30 + 10 = 240.
+#[test]
+fn twin_the_leafs_own_item_and_the_roots() {
+    let got = run(&[
+        CHAIN,
+        LEAF,
+        "
+fn via<T, I: Iter<Item = T>>(bag: &mut Bag<T>, iter: I) -> u32 {
+    bag.pick(iter)
+}
+
+fn other_of<T, I: Iter<Item = T>>(bag: &Bag<T>, _iter: &I) -> u32 {
+    <Bag<T> as Pick<T, I>>::other(bag)
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let mut bag: Bag<u32> = Bag { first: None };
+    let counted = Counted { left: 3 };
+    let plain = Plain { left: 3 };
+    let o = other_of(&bag, &counted);
+    let p = other_of(&bag, &plain);
+    let a = via(&mut bag, counted);
+    (a * 100 + o + p) as i32
+}
+",
+    ]
+    .concat());
+    println!("INHERITED TWIN: {got:?}");
+    assert_eq!(got, Ok(240), "the leaf's `other` at Counted, the general `other` at Plain, the TrustedLen `pick` at Counted");
+}
+
+/// The control: the leaf impl removed (the cause), so the `TrustedLen` impl is the selected
+/// one and defines both: `pick` 2, `other` 20, plain `pick` 1: 2 * 100 + 20 + 1 = 221.
+#[test]
+fn control_with_no_leaf_impl_the_middle_is_selected() {
+    let got = run(&[CHAIN, CALLS].concat());
+    println!("INHERITED CONTROL: {got:?}");
+    assert_eq!(got, Ok(221), "the TrustedLen impl's `pick` and `other` at Counted, the general `pick` at Plain");
+}

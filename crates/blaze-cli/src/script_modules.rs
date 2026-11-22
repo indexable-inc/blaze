@@ -164,13 +164,16 @@ pub(crate) fn run<'b>(cx: &Cx, home: Option<&str>, wanted: Wanted<'_>, task: &Ta
 }
 
 /// The identity lines a lookup asks a record for (what `script_unit::module_where` matches):
-/// name, version, the sorted features and, for a native run, `target <host>`.
+/// name, version, the sorted features and, for a native run, `target <host>`; for a wasm run,
+/// the process shim this binary answers (`script_unit::shim_line`), so a module built with
+/// another is named by its `shim` line.
 pub(crate) fn asked_lines(ran_as: RanAs, package: &str, version: &str, features: &[&str], host: &str) -> std::vec::Vec<std::string::String> {
     let mut sorted = features.to_vec();
     sorted.sort_unstable();
     let mut lines = std::vec![std::format!("name {package}"), std::format!("version {version}"), std::format!("features {}", sorted.join(","))];
-    if ran_as == RanAs::Native {
-        lines.push(std::format!("target {host}"));
+    match ran_as {
+        RanAs::Native => lines.push(std::format!("target {host}")),
+        RanAs::Wasm => lines.push(blaze_proc_macro::script_unit::shim_line()),
     }
     lines
 }
@@ -203,13 +206,21 @@ mod tests {
         let host = "aarch64-apple-darwin";
         let native = asked_lines(RanAs::Native, "libproc", "0.14.11", &[], host);
         assert_eq!(differing(&native, RanAs::Native, libproc).count(), 0);
+        let shim = blaze_proc_macro::script_unit::shim_line();
         let wasm = asked_lines(RanAs::Wasm, "libproc", "0.14.11", &[], host);
         let said: std::vec::Vec<_> = differing(&wasm, RanAs::Wasm, libproc).collect();
-        assert_eq!(said, ["target aarch64-apple-darwin (a native host binary; asked: a wasm module)"]);
-        let nix = "blaze build-script module 3\nname nix\nversion 0.31.3\nfeatures default,ioctl,memoffset,socket\nbuilder bootstrap\n";
+        assert_eq!(said, [std::format!("no `{shim}` line"), "target aarch64-apple-darwin (a native host binary; asked: a wasm module)".to_owned()]);
+        let nix = std::format!("blaze build-script module 3\nname nix\nversion 0.31.3\nfeatures default,ioctl,memoffset,socket\n{shim}\nbuilder bootstrap\n");
         let asked = asked_lines(RanAs::Wasm, "nix", "0.31.3", &["time", "default", "ioctl", "memoffset", "socket"], host);
-        let said: std::vec::Vec<_> = differing(&asked, RanAs::Wasm, nix).collect();
+        let said: std::vec::Vec<_> = differing(&asked, RanAs::Wasm, &nix).collect();
         assert_eq!(said, ["features default,ioctl,memoffset,socket (asked: features default,ioctl,memoffset,socket,time)"]);
+        // A module built with another process shim (before `found`, guest/script_process.rs)
+        // is named by that line: what its rebuild changes.
+        let stale = "blaze build-script module 3\nname nix\nversion 0.31.3\nfeatures default,ioctl,memoffset,socket\nshim c1a4bffa83fc8f619c4daf0a3c0121cc1079b345b415a6d553a910a8e8a6ede6\nbuilder bootstrap\n";
+        let asked = asked_lines(RanAs::Wasm, "nix", "0.31.3", &["default", "ioctl", "memoffset", "socket"], host);
+        let said: std::vec::Vec<_> = differing(&asked, RanAs::Wasm, stale).collect();
+        assert_eq!(said, [std::format!("shim c1a4bffa83fc8f619c4daf0a3c0121cc1079b345b415a6d553a910a8e8a6ede6 (asked: {shim})")]);
+        assert_eq!(differing(&asked, RanAs::Wasm, &nix).count(), 0, "CONTROL: the record with this host's shim answers the ask");
         // A native and a wasm ask of one script are two lookups.
         assert_ne!(subject(RanAs::Native, "libproc", "0.14.11", &[]), subject(RanAs::Wasm, "libproc", "0.14.11", &[]));
     }

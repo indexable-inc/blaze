@@ -21,7 +21,7 @@ doctest = false
 # Running a module: Wasmtime, the bridge server, the host, the hook and build scripts. Without
 # it: a module's identity and key, the module store's lookup and the expansion records' key and
 # lookup (what a command that expands nothing asks).
-runtime = ["dep:wasmtime", "dep:tracing","dep:blaze-build-script", "dep:blaze-unit-graph", "dep:blaze-format", "dep:blaze-id"]
+runtime = ["dep:wasmtime", "dep:tracing","dep:blaze-build-script", "dep:blaze-unit-graph", "dep:blaze-format", "dep:blaze-id", "dep:blaze-base-tools"]
 default = ["runtime"]
 
 [dependencies]
@@ -34,6 +34,10 @@ blaze-core.workspace = true
 blaze-spawn.workspace = true
 # A build script's environment, outputs, key and compiler answers (`script.rs`).
 blaze-build-script = { workspace = true, optional = true }
+# `spawn_route.rs` `program_found`: the pinned base tool set's program names (D192), the closed
+# list a spawned program is looked up in; a name outside it is `NotFound`, as on a machine
+# without it.
+blaze-base-tools = { workspace = true, optional = true }
 # The pinned nightly in a module's key and the clang pin table (pins/, read at compile time).
 blaze-pins.workspace = true
 # The macOS SDK's version from its `SDKSettings.json`: the native runs' key holds it (native_unit.rs).

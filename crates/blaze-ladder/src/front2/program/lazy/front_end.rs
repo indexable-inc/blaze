@@ -326,6 +326,12 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
         super::seam_rules::caller_site(self.front.names, &self.front.keys, &self.store, owner, &live.made, expr)
     }
 
+    /// By program/seam_rules.rs `def_site`, from `item`'s head and the names source: no body
+    /// is read (a `Fn*` method has none).
+    fn def_site(&self, item: ItemKey) -> Option<blaze_build::CallerSite<'_>> {
+        super::seam_rules::def_site(self.front.names, &self.front.keys, &self.store, item)
+    }
+
     /// From `owner`'s live body by program/seam_rules.rs `expr_offset`: no file asked, so a
     /// toolchain crate's trap keeps its site.
     fn expr_site(&self, owner: ItemKey, expr: ExprId) -> Option<u32> {
