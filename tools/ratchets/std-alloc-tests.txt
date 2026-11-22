@@ -6,6 +6,7 @@
 # Written once by scripts/src/bin/ambient.rs (`{"command": "tests-write"}`), then lowered by
 # hand; checked by `{"command": "tests-check"}`.
 # crate	std	is_std	alloc	vec_box	fs	clock	threads	env	random	std_hash
+blaze-algebra	1	0	0	0	0	0	0	0	0	0
 blaze-alloc-count	5	0	0	13	0	0	0	0	0	0
 blaze-answer	10	0	0	11	0	0	0	0	0	0
 blaze-apple-sdk	2	0	0	0	0	0	0	0	0	0
@@ -24,7 +25,7 @@ blaze-body-eval	5	0	0	1	0	0	0	0	0	0
 blaze-body-flow	6	1	0	7	0	0	0	0	0	0
 blaze-body-lower	13	0	0	24	0	0	0	0	0	0
 blaze-borrow	3	0	0	5	0	0	0	0	0	0
-blaze-bstd-convert	13	0	0	7	8	0	0	0	0	0
+blaze-bstd-convert	13	0	0	9	8	0	0	0	0	0
 blaze-build	139	2	2	439	0	0	6	3	0	0
 blaze-build-script	137	0	0	116	3	0	0	0	0	0
 blaze-bytes	9	0	0	20	0	0	1	0	0	0

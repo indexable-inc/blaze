@@ -16,7 +16,7 @@
 
 #![feature(default_field_values)]
 
-use std::path::PathBuf;
+use std::{path::PathBuf, process::exit};
 use std::time::Instant;
 
 use blaze_cad::prelude::*;
@@ -268,8 +268,22 @@ fn main() {
     println!("=== MIRROR ASSEMBLY (HeroAsset + Per-Feature Targets) ===");
     println!("build_time: {build_ms:.1} ms");
     println!("{}", Shown(&asset.report));
+    let proof = match asset.check_publish(PublishCheckOpts { require_non_empty_features: true, .. }) {
+        Ok(proof) => proof,
+        Err(err) => {
+            eprintln!("mirror assembly failed strict publish gate: {}", Shown(&err));
+            exit(1);
+        }
+    };
+    println!(
+        "publish_gate: PASS ({} parts, {}/{} features, {} tris)",
+        proof.parts(),
+        proof.passed_features(),
+        proof.requested_features(),
+        proof.written_triangles()
+    );
 
-    std::fs::write(out_dir.join("mirror.glb"), &asset.glb).expect("write mirror.glb");
+    std::fs::write(out_dir.join("mirror.glb"), asset.publish_glb(proof)).expect("write mirror.glb");
 
     let png_opts = blaze_cad_out::PngOpts {
         level: blaze_deflate::Level::Default,
@@ -342,6 +356,10 @@ fn main() {
     println!("=== STARVED DEMO (Missed Feature Auto-Highlight) ===");
     println!("missed_highlights: {}", starved.missed_highlights.len());
     println!("{}", Shown(&starved.report));
+    let blocked = starved
+        .check_publish(PublishCheckOpts { .. })
+        .expect_err("starved demo must be blocked by publish gate");
+    println!("publish_gate: BLOCKED ({})", Shown(&blocked));
 
     let pic_missed = starved
         .preview(&MATERIALS, front_view, MeshPictureOpts { alloc, scratch: alloc, supersample: 2, .. })

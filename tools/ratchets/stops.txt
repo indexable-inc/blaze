@@ -4,6 +4,7 @@
 # 0 (AGENTS.md panics-fail-one-job). Written by scripts/src/bin/stops.rs (`{"command":
 # "write"}`), checked in CI.
 # crate	stops
+blaze-algebra	113
 blaze-alloc-count	2
 blaze-answer	95
 blaze-apple-sdk	5
@@ -21,7 +22,7 @@ blaze-body-eval	6
 blaze-body-flow	39
 blaze-body-lower	21
 blaze-borrow	2
-blaze-bstd-convert	109
+blaze-bstd-convert	115
 blaze-build	551
 blaze-build-script	247
 blaze-bytes	3
@@ -79,7 +80,7 @@ blaze-inproc	55
 blaze-int	41
 blaze-json	32
 blaze-keyed	590
-blaze-kit	160
+blaze-kit	167
 blaze-ladder	1164
 blaze-launch	83
 blaze-launch-rt	219
