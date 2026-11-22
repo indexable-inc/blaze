@@ -186,6 +186,23 @@ pub enum Decl<'a> {
     },
 }
 
+/// Read-only classification of a stored declaration in [`KernelEnv`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeclKind {
+    Axiom,
+    Def { is_theorem: bool },
+    Inductive { num_params: u32, num_ctors: u32 },
+    Ctor { ind_name: NameId, ctor_idx: u32, num_params: u32, num_fields: u32 },
+    Recursor {
+        ind_name: NameId,
+        num_params: u32,
+        num_indices: u32,
+        num_motives: u32,
+        num_minors: u32,
+    },
+    Quot,
+}
+
 /// Compact `Copy` representation of a checked declaration stored in [`KernelEnv`].
 #[derive(Clone, Copy, Debug)]
 enum StoredDecl {
@@ -360,6 +377,8 @@ pub struct KernelEnv<'a> {
     levels: AVec<'a, Level>,
     level_intern: ABTreeMap<'a, Level, LevelId>,
     level_lists: AVec<'a, LevelId>,
+    level_list_intern_1: ABTreeMap<'a, LevelId, LevelRange>,
+    level_list_intern_2: ABTreeMap<'a, (LevelId, LevelId), LevelRange>,
     name_lists: AVec<'a, NameId>,
     rec_rules: AVec<'a, RecRule>,
     exprs: AVec<'a, Expr>,
@@ -388,6 +407,8 @@ impl<'a> KernelEnv<'a> {
             levels,
             level_intern,
             level_lists: AVec::new_in(alloc),
+            level_list_intern_1: ABTreeMap::new_in(alloc),
+            level_list_intern_2: ABTreeMap::new_in(alloc),
             name_lists: AVec::new_in(alloc),
             rec_rules: AVec::new_in(alloc),
             exprs: AVec::new_in(alloc),
@@ -822,15 +843,43 @@ impl<'a> KernelEnv<'a> {
     }
 
     fn push_level_range(&mut self, lvls: &[LevelId]) -> LevelRange {
-        if lvls.is_empty() {
-            return LevelRange { start: 0, len: 0 };
+        match lvls {
+            [] => LevelRange { start: 0, len: 0 },
+            &[l0] => {
+                if let Some(&r) = self.level_list_intern_1.get(&l0) {
+                    return r;
+                }
+                let start = len32(self.level_lists.len()).unwrap_or_else(|e| e.stop());
+                self.level_lists.push(l0);
+                let r = LevelRange { start, len: 1 };
+                self.level_list_intern_1.insert(l0, r);
+                r
+            }
+            &[l0, l1] => {
+                if let Some(&r) = self.level_list_intern_2.get(&(l0, l1)) {
+                    return r;
+                }
+                let start = len32(self.level_lists.len()).unwrap_or_else(|e| e.stop());
+                self.level_lists.push(l0);
+                self.level_lists.push(l1);
+                let r = LevelRange { start, len: 2 };
+                self.level_list_intern_2.insert((l0, l1), r);
+                r
+            }
+            _ => {
+                if let Some(pos) = self.level_lists.as_slice().windows(lvls.len()).position(|w| w == lvls) {
+                    let start = len32(pos).unwrap_or_else(|e| e.stop());
+                    let len = len32(lvls.len()).unwrap_or_else(|e| e.stop());
+                    return LevelRange { start, len };
+                }
+                let start = len32(self.level_lists.len()).unwrap_or_else(|e| e.stop());
+                for &l in lvls {
+                    self.level_lists.push(l);
+                }
+                let len = len32(lvls.len()).unwrap_or_else(|e| e.stop());
+                LevelRange { start, len }
+            }
         }
-        let start = len32(self.level_lists.len()).unwrap_or_else(|e| e.stop());
-        for &l in lvls {
-            self.level_lists.push(l);
-        }
-        let len = len32(lvls.len()).unwrap_or_else(|e| e.stop());
-        LevelRange { start, len }
     }
 
     fn push_name_range(&mut self, names: &[NameId]) -> NameRange {
@@ -1897,6 +1946,12 @@ impl<'a> KernelEnv<'a> {
         self.infer_type_impl(e, false, 0, &mut budget)
     }
 
+    /// Infer the type of `e` and reduce it to `Sort(u)`, returning normalized `u`.
+    pub fn infer_sort(&mut self, e: ExprId) -> Result<LevelId, KernelError> {
+        let mut budget = self.budget();
+        self.infer_sort_impl(e, false, 0, &mut budget)
+    }
+
     /// Infer the type of `e` and reduce it to a `Sort(u)`, returning `u`.
     fn infer_sort_impl(
         &mut self,
@@ -2297,6 +2352,87 @@ impl<'a> KernelEnv<'a> {
             Some(StoredDecl::Ctor { ctor_idx, .. }) => Some(*ctor_idx),
             _ => None,
         }
+    }
+
+    /// Return the read-only [`DeclKind`] of `name`, if declared.
+    #[inline]
+    pub fn decl_kind(&self, name: NameId) -> Option<DeclKind> {
+        match *self.decls.get(&name)? {
+            StoredDecl::Axiom { .. } => Some(DeclKind::Axiom),
+            StoredDecl::Def { is_theorem, .. } => Some(DeclKind::Def { is_theorem }),
+            StoredDecl::Inductive { num_params, ctors, .. } => {
+                Some(DeclKind::Inductive { num_params, num_ctors: ctors.len })
+            }
+            StoredDecl::Ctor { ind_name, ctor_idx, num_params, num_fields, .. } => {
+                Some(DeclKind::Ctor { ind_name, ctor_idx, num_params, num_fields })
+            }
+            StoredDecl::Recursor {
+                ind_name,
+                num_params,
+                num_indices,
+                num_motives,
+                num_minors,
+                ..
+            } => Some(DeclKind::Recursor {
+                ind_name,
+                num_params,
+                num_indices,
+                num_motives,
+                num_minors,
+            }),
+            StoredDecl::Quot { .. } => Some(DeclKind::Quot),
+        }
+    }
+
+    /// Return the declared type of `name`, if present.
+    #[inline]
+    pub fn decl_ty(&self, name: NameId) -> Option<ExprId> {
+        self.decls.get(&name).map(|d| d.ty())
+    }
+
+    /// Return the universe level parameter names of `name`.
+    #[inline]
+    pub fn decl_level_params(&self, name: NameId) -> &[NameId] {
+        match self.decls.get(&name) {
+            Some(d) => {
+                let r = d.level_params();
+                let start = idx(r.start);
+                let len = idx(r.len);
+                &self.name_lists.as_slice()[start..start + len]
+            }
+            None => &[],
+        }
+    }
+
+    /// Return the constructor names of inductive `name`, if `name` is an inductive declaration.
+    #[inline]
+    pub fn inductive_ctors(&self, name: NameId) -> Option<&[NameId]> {
+        match self.decls.get(&name) {
+            Some(StoredDecl::Inductive { ctors, .. }) => {
+                let start = idx(ctors.start);
+                let len = idx(ctors.len);
+                Some(&self.name_lists.as_slice()[start..start + len])
+            }
+            _ => None,
+        }
+    }
+
+    /// Return the body of a transparent (non-theorem) definition `name`, if present.
+    #[inline]
+    pub fn def_value(&self, name: NameId) -> Option<ExprId> {
+        match self.decls.get(&name) {
+            Some(StoredDecl::Def { value, is_theorem: false, .. }) => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// Return all declaration names in deterministic [`NameId`] order.
+    pub fn decl_names(&self) -> AVec<'a, NameId> {
+        let mut out = AVec::new_in(self.alloc);
+        for (&name, _) in self.decls.iter() {
+            out.push(name);
+        }
+        out
     }
 
     /// Verify a theorem in the environment:
