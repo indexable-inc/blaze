@@ -9,6 +9,7 @@
 # scripts/src/bin/ambient.rs (`{"command": "sansio-write"}`), checked by
 # `{"command": "sansio-check"}`; tools/ratchets/sans-io-done.txt holds its crates at 0 (a lock with its reason aside).
 # crate	std	alloc	global	global_tests	alloc_global	alloc_global_tests	implicit	statics	clock	env	random	io	no_std	unmarked	breaks	bare	locks_constructed	locks_without_reason
+blaze-algebra	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-alloc-count	5	1	0	0	0	0	6	10	0	1	0	1	1	1	0	0	0	0
 blaze-answer	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-arrow-ipc	0	0	0	46	0	0	0	0	0	0	0	0	0	0	0	0	0	0
@@ -26,7 +27,7 @@ blaze-body-eval	0	7	0	0	0	0	0	0	0	0	0	0	0	1	0	0	0	0
 blaze-body-flow	0	0	0	16	0	0	0	0	0	0	0	0	0	1	0	0	0	0
 blaze-body-lower	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	1	0	0
 blaze-borrow	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	1	0	0
-blaze-bstd-convert	6	14	0	0	7	2	695	0	0	1	0	43	0	1	0	0	0	0
+blaze-bstd-convert	6	14	0	0	7	2	796	0	0	1	0	43	0	1	0	0	0	0
 blaze-build	4	0	21	677	0	325	0	0	0	0	0	0	1	1	0	1	0	0
 blaze-build-script	16	0	0	0	0	41	52	0	0	1	0	37	1	1	0	1	0	0
 blaze-bytes	0	3	0	0	0	0	0	0	0	0	0	0	0	1	0	1	0	0
@@ -56,11 +57,11 @@ blaze-dbsp	15	0	16	0	0	0	20	2	0	0	0	0	1	1	0	0	0	0
 blaze-deflate	11	1	0	0	0	0	5	0	1	1	0	11	0	0	13	1	0	0
 blaze-drive	0	0	0	5	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-ed25519	3	0	0	0	0	0	0	0	2	0	0	4	0	0	6	1	0	0
-blaze-emit	16	1	37	194	1	88	0	0	0	0	0	3	1	1	0	1	0	0
+blaze-emit	0	29	37	194	1	88	0	0	0	0	0	3	0	1	0	1	0	0
 blaze-engine	0	0	0	0	0	0	3	0	0	0	0	0	0	0	3	1	0	0
 blaze-expand	33	0	0	0	0	0	24	4	6	3	0	43	0	1	0	1	0	0
 blaze-export	14	0	0	0	0	46	1	0	2	2	0	20	0	0	24	1	0	0
-blaze-fetch	68	0	2	10	0	0	49	9	3	7	0	50	1	1	0	1	0	0
+blaze-fetch	57	8	2	10	0	0	49	9	3	7	0	50	0	1	0	1	0	0
 blaze-file-items	64	4	49	0	2	0	36	2	26	9	0	95	0	1	0	1	0	0
 blaze-flow	0	1	0	104	0	0	0	0	0	0	0	0	0	1	0	1	0	0
 blaze-flow-lower	0	0	0	3	0	17	0	0	0	0	0	0	0	1	0	1	0	0
@@ -75,7 +76,7 @@ blaze-graph	204	3	37	61	0	0	219	53	7	5	0	20	1	1	0	0	17	17
 blaze-h1	0	2	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-h2	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0	0	0
 blaze-hash	4	6	11	139	0	0	6	0	3	1	1	11	0	0	16	1	0	0
-blaze-hashcons	10	2	7	9	0	0	5	0	1	0	0	4	1	1	0	1	2	2
+blaze-hashcons	4	6	7	9	0	0	5	0	1	0	0	4	0	1	0	1	2	2
 blaze-http	87	7	114	39	0	0	274	0	2	1	0	13	1	1	8	0	2	2
 blaze-id	0	1	0	7	0	0	0	0	0	0	0	0	0	1	0	1	0	0
 blaze-ids	22	3	7	9	0	0	12	2	1	1	0	2	1	1	0	1	0	0
@@ -83,7 +84,7 @@ blaze-impls	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	1	0	0
 blaze-inproc	14	6	0	0	0	0	54	0	0	0	0	0	1	1	0	1	0	0
 blaze-inproc-rt	0	0	0	0	0	0	0	0	0	0	0	0	1	1	0	1	0	0
 blaze-json	0	2	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
-blaze-keyed	2	4	14	10	0	0	0	0	0	0	0	0	1	1	0	1	0	0
+blaze-keyed	0	14	14	10	0	0	0	0	0	0	0	0	0	1	0	1	0	0
 blaze-kit	12	13	0	0	0	0	13	0	1	0	0	12	0	1	0	1	0	0
 blaze-ladder	324	2	1455	114	17	716	1010	6	25	10	0	116	1	1	0	1	1	1
 blaze-launch	0	15	2	0	0	0	23	0	0	0	0	0	0	0	0	1	0	0
@@ -91,12 +92,12 @@ blaze-launch-rt	99	1	1	9	1	33	115	50	8	12	0	348	1	1	0	1	0	0
 blaze-launcher	64	0	0	0	1	1	46	1	3	29	0	36	1	1	0	1	0	0
 blaze-lex	16	0	0	0	0	0	14	0	1	2	0	7	0	0	11	1	0	0
 blaze-lint	17	0	0	0	0	9	18	0	5	5	0	23	0	1	0	1	0	0
-blaze-lint-defs	6	0	0	0	0	0	17	2	0	0	0	0	1	1	0	0	0	0
+blaze-lint-defs	0	3	0	0	0	0	17	2	0	0	0	0	0	1	0	0	0	0
 blaze-lir	0	33	11	364	0	5	20	0	0	0	0	0	0	0	0	1	0	0
 blaze-lower	17	0	0	0	7	97	8	2	1	2	0	25	0	1	0	1	0	0
 blaze-malloc	4	3	0	0	0	0	14	10	1	2	0	10	0	1	0	0	0	0
 blaze-manifest	153	0	130	11	0	0	464	0	0	4	0	23	1	1	0	1	0	0
-blaze-math	0	0	0	0	0	0	1	0	0	0	0	5	0	0	5	0	0	0
+blaze-math	0	0	0	0	0	0	1	0	0	0	0	5	0	0	5	1	0	0
 blaze-mem	50	5	0	4	0	0	24	31	2	4	0	28	1	1	0	1	0	0
 blaze-memchr	2	1	7	0	0	0	2	0	1	0	0	2	0	0	3	1	0	0
 blaze-memo	115	9	112	31	0	0	10	18	0	0	0	0	1	0	8	0	4	4

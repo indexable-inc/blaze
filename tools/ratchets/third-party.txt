@@ -10,6 +10,7 @@ ast-merge-langs	4	0	52
 astlog	1	0	58
 astlog-core	1	1	58
 astlog-engine	0	0	16
+blaze-algebra	0	0	1
 blaze-answer	0	0	86
 blaze-arrow-ipc	0	0	1
 blaze-ask	0	0	8

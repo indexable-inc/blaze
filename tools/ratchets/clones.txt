@@ -4,6 +4,7 @@
 # `CloneIn` are crates/blaze-own's).
 # Written by scripts/src/bin/clones.rs (`{"command": "write"}`), checked in CI.
 # crate	calls
+blaze-algebra	20
 blaze-arrow-ipc	51
 blaze-ask	6
 blaze-audit	30
@@ -14,7 +15,7 @@ blaze-body-drops	10
 blaze-body-flow	26
 blaze-body-lower	38
 blaze-borrow	12
-blaze-bstd-convert	102
+blaze-bstd-convert	135
 blaze-build	286
 blaze-build-script	22
 blaze-c	2
