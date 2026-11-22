@@ -125,6 +125,18 @@ pub enum Target {
     /// Collapse every edge whose collapse keeps the two-sided distance bound at most this (the
     /// mesh's positions are metres, so the bound is compared with `as_m()`, one rounding).
     Error(Length),
+    /// Game-asset budget target: collapse freely within `error` (removing flat/coplanar
+    /// redundancy even below `max_triangles`), and if the mesh still exceeds `max_triangles`,
+    /// continue collapsing cheapest-first until `live <= max_triangles` or the two-sided error
+    /// would exceed `max_error` (when `Some`, stopping with [`Stop::ErrorCeiling`]).
+    Budget {
+        /// Geometric accuracy target collapsed freely to eliminate coplanar/redundant triangles.
+        error: Length,
+        /// Per-part triangle budget cap.
+        max_triangles: u32,
+        /// Optional hard two-sided error ceiling that stops decimation before destroying shapes.
+        max_error: Option<Length>,
+    },
 }
 
 /// What is simplified: any shape-checked mesh, or a verified one, whose output is then
@@ -153,6 +165,9 @@ pub enum Stop {
     Reached,
     /// Every collapse left would break a rule above before the triangle target was met.
     NoValidCollapse,
+    /// For [`Target::Budget`], every remaining collapse before `max_triangles` would exceed
+    /// `max_error`.
+    ErrorCeiling,
 }
 
 #[derive(Debug)]
@@ -575,10 +590,21 @@ pub fn decimate_planted<'a>(
     if view.colours().is_some() {
         return Err(DecimateError::NotCarried { column: Column::Colours });
     }
-    if let Target::Error(e) = opts.target
-        && e < Length::ZERO
-    {
-        return Err(DecimateError::BadErrorTarget { error: e });
+    match opts.target {
+        Target::Error(e) if e < Length::ZERO => {
+            return Err(DecimateError::BadErrorTarget { error: e });
+        }
+        Target::Budget { error, max_error, .. } => {
+            if error < Length::ZERO {
+                return Err(DecimateError::BadErrorTarget { error });
+            }
+            if let Some(ce) = max_error
+                && (ce < Length::ZERO || ce < error)
+            {
+                return Err(DecimateError::BadErrorTarget { error: ce });
+            }
+        }
+        _ => {}
     }
     let s = opts.scratch;
     let spots = spots(view.positions(), s)?;
@@ -740,11 +766,16 @@ pub fn decimate_planted<'a>(
     // The largest accepted collapse's error (module documentation, ERROR BOUND), metres.
     let mut error_bound = 0.0f64;
     let mut stats = DecimateStats::default();
-    // The most a map's pieces may err before it stops and the collapse is refused: the target
-    // less the allowance the admission adds back.
-    let limit = match opts.target {
+    let mut over_ceiling: u64 = 0;
+    // For `Target::Budget`, Phase 1 runs strictly under `error` so all flat/coplanar and low-error
+    // collapses happen BEFORE any above-`error` budget collapse is ever considered; only if
+    // `w.live > max_triangles` after Phase 1 empties does Phase 2 re-seed live edges under
+    // `max_error` and collapse cheapest-first down to `max_triangles`.
+    let mut budget_phase2 = false;
+    let mut active_limit = match opts.target {
         Target::Error(e) => e.as_m() - w.allowance,
         Target::Triangles(_) => f64::INFINITY,
+        Target::Budget { error, .. } => error.as_m() - w.allowance,
     };
     let mut queue = Queue { heap: Heap4::new_in(s), pushed: 0, plant };
     if queue.plant.has(DecimatePlant::TieByInsertion) {
@@ -772,13 +803,52 @@ pub fn decimate_planted<'a>(
         }
     }
     let stop = loop {
-        if let Target::Triangles(most) = opts.target
-            && w.live <= most
-        {
-            break Stop::Reached;
+        match opts.target {
+            Target::Triangles(most) if w.live <= most => break Stop::Reached,
+            Target::Budget { max_triangles, .. } if budget_phase2 && w.live <= max_triangles => break Stop::Reached,
+            _ => {}
         }
         let Some(c) = queue.heap.pop() else {
-            break if matches!(opts.target, Target::Error(_)) { Stop::Reached } else { Stop::NoValidCollapse };
+            match opts.target {
+                Target::Error(_) => break Stop::Reached,
+                Target::Triangles(_) => break Stop::NoValidCollapse,
+                Target::Budget { max_triangles, max_error, .. } => {
+                    if w.live <= max_triangles {
+                        break Stop::Reached;
+                    }
+                    if !budget_phase2 {
+                        // Phase 1 finished above `max_triangles`: transition to Phase 2 and re-seed
+                        // every live undirected edge once in deterministic `(lo, hi)` order.
+                        budget_phase2 = true;
+                        active_limit = max_error.map_or(f64::INFINITY, |ce| ce.as_m() - w.allowance);
+                        for v in 0..n {
+                            if w.parent[at(v)] != v || w.head[at(v)] == NONE {
+                                continue;
+                            }
+                            w.star(v, &mut lists.star_a)?;
+                            lists.neighbours.clear();
+                            let mut last = NONE;
+                            for side in lists.star_a.iter() {
+                                if side.0 > v && side.0 != last {
+                                    push(&mut lists.neighbours, side.0)?;
+                                    last = side.0;
+                                }
+                            }
+                            for ni in 0..lists.neighbours.len() {
+                                let x = lists.neighbours[ni];
+                                w.star(x, &mut lists.star_b)?;
+                                queue.offer_from_stars(&w, (v, x), &lists.star_a, &lists.star_b)?;
+                            }
+                        }
+                        continue;
+                    }
+                    break if max_error.is_some() && over_ceiling > 0 {
+                        Stop::ErrorCeiling
+                    } else {
+                        Stop::NoValidCollapse
+                    };
+                }
+            }
         };
         if w.version[at(c.lo)] != c.ver_lo || w.version[at(c.hi)] != c.ver_hi {
             continue;
@@ -791,7 +861,16 @@ pub fn decimate_planted<'a>(
             continue;
         };
         // `evaluate` left both ends' stars in `star_a` and `star_b`, reused directly by `valid`.
-        if !valid(&w, &mut lists, &plan)? {
+        // In error-bounded simplification (and Phase 1 of `Target::Budget`), reject bevel-folding
+        // collapses that twist a surviving triangle's normal by more than 30° (`cos² = 0.75`).
+        // In aggressive triangle-budget reduction (`Target::Triangles` / Phase 2), fall back to
+        // hemisphere non-flip (`dot > 0`) so arbitrary low-poly budgets remain reachable.
+        let min_cos_sq = match opts.target {
+            Target::Error(_) => 0.75,
+            Target::Budget { .. } if !budget_phase2 => 0.75,
+            _ => 0.0,
+        };
+        if !valid(&w, &mut lists, &plan, min_cos_sq)? {
             continue;
         }
         // `valid` left both ends' live corners in `ring_a` (`keep`) and `ring_b` (`gone`).
@@ -800,15 +879,30 @@ pub fn decimate_planted<'a>(
             stats.over_region += 1;
             continue;
         }
-        let Some(step) = remap(&w, &mut lists, &plan, limit, &mut stats, queue.plant)? else {
+        let Some(step) = remap(&w, &mut lists, &plan, active_limit, &mut stats, queue.plant)? else {
             continue;
         };
         let err = step + w.allowance;
-        if let Target::Error(e) = opts.target
-            && !(err <= e.as_m())
-        {
-            stats.over_error += 1;
-            continue;
+        match opts.target {
+            Target::Error(e) if !(err <= e.as_m()) => {
+                stats.over_error += 1;
+                continue;
+            }
+            Target::Budget { error, max_error, .. } => {
+                if !budget_phase2 {
+                    if !(err <= error.as_m()) {
+                        stats.over_error += 1;
+                        continue;
+                    }
+                } else if let Some(ce) = max_error
+                    && !(err <= ce.as_m())
+                {
+                    stats.over_error += 1;
+                    over_ceiling += 1;
+                    continue;
+                }
+            }
+            _ => {}
         }
         collapse(&mut w, &mut lists, &plan)?;
         stats.collapses += 1;
@@ -816,8 +910,15 @@ pub fn decimate_planted<'a>(
         // A merge may err up to the target, or for a triangle target up to the bound so far: it
         // never raises that one.
         let merge_limit = match opts.target {
-            Target::Error(_) => limit,
+            Target::Error(_) => active_limit,
             Target::Triangles(_) => error_bound - w.allowance,
+            Target::Budget { .. } => {
+                if !budget_phase2 {
+                    active_limit
+                } else {
+                    error_bound - w.allowance
+                }
+            }
         };
         let merged = place(&mut w, &mut lists, merge_limit, &mut stats, s)?;
         error_bound = error_bound.max(merged + w.allowance);
@@ -1019,9 +1120,10 @@ fn evaluate_stars(
     Some(Plan { keep, gone, shared: fa.edge_tris, p, q, cost })
 }
 
-/// The link condition, no duplicate triangle after, no normal flipped or made zero.
+/// The link condition, no duplicate triangle after, no normal flipped or folded past
+/// `acos(sqrt(min_cos_sq))` (or 90° when `min_cos_sq == 0.0`), and no zero-area triangle.
 /// Reuses the sorted stars `evaluate` left in `lists.star_a` and `lists.star_b`.
-fn valid(w: &Work<'_, '_>, lists: &mut Lists<'_>, plan: &Plan) -> Result<bool, AllocFailure> {
+fn valid(w: &Work<'_, '_>, lists: &mut Lists<'_>, plan: &Plan, min_cos_sq: f64) -> Result<bool, AllocFailure> {
     let (a, b) = (plan.keep, plan.gone);
     let shared = plan.shared;
     // Distinct neighbours of each, the other end left out, counted in common.
@@ -1073,7 +1175,11 @@ fn valid(w: &Work<'_, '_>, lists: &mut Lists<'_>, plan: &Plan) -> Result<bool, A
                 }
             }
             let after = tri_normal(corners[0], corners[1], corners[2]);
-            if after == [0.0; 3] || !(dot(before, after) > 0.0) {
+            let d = dot(before, after);
+            if after == [0.0; 3] || !(d > 0.0) {
+                return Ok(false);
+            }
+            if min_cos_sq > 0.0 && !(d * d >= min_cos_sq * dot(before, before) * dot(after, after)) {
                 return Ok(false);
             }
             if moved[0] > moved[1] {
@@ -1789,7 +1895,12 @@ fn place<'s>(
             }
             j = k;
         }
-        if count > FREEZE {
+        // Coplanar / near-flat triangles carry negligible error (`<= 0.5%` of the merge limit or
+        // f32 rounding jitter) even after accumulating 16 pieces: freezing them early keeps large
+        // flat walls at O(1) pieces per triangle while curved surfaces (whose 16-piece sagitta
+        // vastly exceeds `0.5%` of `limit`) keep full merging up to `FREEZE`.
+        let flat_freeze = count >= 16 && (most <= w.allowance * 1000.0 || (limit.is_finite() && most <= limit * 0.005));
+        if count > FREEZE || flat_freeze {
             w.pieces.truncate(at(first));
             w.corr.truncate(corr_start);
             let start = len32(w.corr.len());

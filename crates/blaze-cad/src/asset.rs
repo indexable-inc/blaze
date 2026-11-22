@@ -1,0 +1,912 @@
+//! End-to-end game-asset workflow: scale-aware tessellation defaults ([`AssetPreset`]), per-part
+//! and bundle-wide triangle budgets ([`allocate_budgets`], [`PartBudget`], [`TriangleBudget`]),
+//! sharper fidelity checks for lost holes and bevels ([`check_mesh_fidelity`]), a structured and
+//! human/agent-readable per-part report ([`AssetReport`], [`PartReport`]), GPU-optimized GLB
+//! export, and direct preview rendering using the **actual exported meshes** ([`GameAsset::preview`]).
+
+#![blaze::sans_io]
+
+use blaze_cad_field::{CadPlant, Detail, Graph, Name, Placement};
+use blaze_cad_mesh::{
+    COS_32_DEGREES, DecimateOpts, Decimated, DecomposeOpts, GridSizing, HullOpts, LodOpts, MaterialRole, Mesh, MeshLimits,
+    MeshOpts, MeshView, Meshed, PieceCache, Source, Stop, Target, auto_grid, convex_hull, decimate, decompose, lod_chain, mesh,
+    mesh_cached, topology,
+};
+use blaze_cad_out::{Collider, Encoding, GlbOpts, Limits, Lod, MassFacts, Material, Up, glb};
+use blaze_cad_picture::{MeshPictureOpts, MeshScenePart, Picture, View, render_mesh_scene};
+use blaze_math::Aabb3;
+use blaze_own::planted::Planted;
+use blaze_own::{Alloc, Vec};
+use blaze_text::{Put, Show, Writes};
+use blaze_units::{Angle, Density, Length};
+
+use crate::export::{hull_to_mesh, prepare_gpu_mesh};
+use crate::{
+    ColliderMode, ExportLodOpts, FidelityChecked, FidelityOpts, ModelError, Part, PartBudget, PartId, STEEL_ONLY, TriangleBudget,
+    Verdict, check_mesh_fidelity, mass_properties, part_tape, transform_of,
+};
+
+/// Scale-aware tessellation and fidelity preset for [`build_game_asset`].
+///
+/// Instead of hardcoding a fixed millimeter grid (which explodes meter-scale flat walls into
+/// hundreds of thousands of triangles), each preset picks a scale-proportional tolerance and
+/// dyadic octree grid from each part's own bounding box.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum AssetPreset {
+    /// Close-up hero prop or weapon/character piece: tight silhouette (`extent / 600`, clamped to
+    /// `0.25..=2.0 mm`), crisp bevel preservation (`max_normal_error = 14°`).
+    HeroAsset,
+    /// General real-time game prop: balanced silhouette (`extent / 300`, clamped to
+    /// `0.5..=4.0 mm`), solid bevel preservation (`max_normal_error = 18°`).
+    GameProp,
+    /// Large architectural or environment asset (e.g. a cabin, hull, or structure):
+    /// (`extent / 200`, clamped to `1.0..=8.0 mm`), clean walls without over-tessellating flat
+    /// spans (`max_normal_error = 20°`).
+    Environment,
+    /// Explicit caller-chosen tolerance and optional smallest feature width.
+    Custom {
+        tolerance: Length,
+        min_feature: Option<Length>,
+    },
+}
+
+impl AssetPreset {
+    /// Resolve the default geometric tolerance for a part with bounding box `bounds`.
+    pub fn tolerance_for(self, bounds: &Aabb3) -> Length {
+        let extent_mm = if bounds.is_empty() {
+            100.0
+        } else {
+            let d = bounds.hi - bounds.lo;
+            let m = d.x.max(d.y).max(d.z);
+            if m.is_finite() && m > 0.0 { m * 1000.0 } else { 100.0 }
+        };
+        match self {
+            AssetPreset::HeroAsset => Length::mm((extent_mm / 1200.0).clamp(0.20, 1.0)),
+            AssetPreset::GameProp => Length::mm((extent_mm / 800.0).clamp(0.40, 2.0)),
+            AssetPreset::Environment => Length::mm((extent_mm / 1000.0).clamp(0.75, 2.5)),
+            AssetPreset::Custom { tolerance, .. } => tolerance,
+        }
+    }
+
+    /// Default crease angle cosine for shading & bevel splits.
+    pub const fn default_cos_crease(self) -> f32 {
+        match self {
+            AssetPreset::HeroAsset => 0.906_307_8,    // cos(25°)
+            AssetPreset::GameProp => 0.866_025_4,     // cos(30°)
+            AssetPreset::Environment => COS_32_DEGREES, // cos(32°)
+            AssetPreset::Custom { .. } => COS_32_DEGREES,
+        }
+    }
+
+    /// Default normal-error limit for lost-bevel checking.
+    pub fn default_max_normal_error(self) -> Angle {
+        match self {
+            AssetPreset::HeroAsset => Angle::degrees(15.0),
+            AssetPreset::GameProp => Angle::degrees(20.0),
+            AssetPreset::Environment => Angle::degrees(25.0),
+            AssetPreset::Custom { .. } => Angle::degrees(20.0),
+        }
+    }
+
+    /// Optional explicit minimum feature size carried by [`AssetPreset::Custom`].
+    pub const fn min_feature(self) -> Option<Length> {
+        match self {
+            AssetPreset::Custom { min_feature, .. } => min_feature,
+            _ => None,
+        }
+    }
+}
+
+/// Configuration for automatic per-part hole & bevel fidelity checks during [`build_game_asset`].
+#[blaze::args]
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct AssetFidelityPolicy {
+    /// Override for bridged-hole tolerance (`None` uses `max(2 × part_tolerance, 2.0 mm)`).
+    pub hole_tolerance: Option<Length> = None,
+    /// Override for shaved-surface tolerance (`None` uses `max(2 × part_tolerance, 2.0 mm)`).
+    pub surface_tolerance: Option<Length> = None,
+    /// Override for normal deviation limit (`None` uses the preset's limit).
+    pub max_normal_error: Option<Angle> = None,
+    /// Override for minimum resolved hole feature (`None` uses `max(4 × part_tolerance, 4.0 mm)`).
+    pub min_hole_feature: Option<Length> = None,
+    /// Maximum fraction of reference bevel edge length allowed to disappear during decimation.
+    pub max_bevel_loss: f64 = 0.45,
+    /// Bounded subdivision cap per part (rule 18).
+    pub most_subdivisions: u64 = 1 << 18,
+}
+
+impl AssetFidelityPolicy {
+    pub const DEFAULT: AssetFidelityPolicy = AssetFidelityPolicy {
+        hole_tolerance: None,
+        surface_tolerance: None,
+        max_normal_error: None,
+        min_hole_feature: None,
+        max_bevel_loss: 0.45,
+        most_subdivisions: 1 << 18,
+    };
+}
+
+/// Options for [`build_game_asset`].
+#[blaze::args]
+#[derive(Clone, Copy, Debug)]
+pub struct GameAssetOpts<'a, 's, 'm> {
+    /// Allocator for the returned GLB bytes, report, and retained preview meshes.
+    pub alloc: Alloc<'a>,
+    /// Scratch allocator for tapes, intermediate meshes, simplification maps, and fidelity checks.
+    pub scratch: Alloc<'s>,
+    /// Scale-aware tessellation & fidelity preset (defaults to [`AssetPreset::GameProp`]).
+    pub preset: AssetPreset = AssetPreset::GameProp,
+    /// Optional total triangle budget across all parts. Parts with explicit
+    /// [`PartBudget::MaxTriangles`] keep their own cap; remaining triangles are allocated across
+    /// `Auto`/weighted parts proportionally to geometric complexity (`weight × natural^0.75`).
+    pub total_budget: Option<TriangleBudget> = None,
+    /// Minimum triangles reserved for any non-trivial part during automatic budget allocation
+    /// (unless the part naturally simplifies below this count).
+    pub min_part_triangles: u32 = 24,
+    /// Material table indexed by each part's [`MaterialRole`].
+    pub materials: &'m [Material<'m>] = STEEL_ONLY,
+    /// Optional uniform density for mass facts in the GLB.
+    pub density: Option<Density> = None,
+    /// Coordinate convention of the model (`Up::Z` turned to glTF's Y-up).
+    pub up: Up = Up::Z,
+    /// Vertex encoding (`Encoding::Float` or `Encoding::Quantized`).
+    pub encoding: Encoding = Encoding::Float,
+    /// Crease cosine override (`None` uses the preset's default).
+    pub cos_crease: Option<f32> = None,
+    /// Run Tipsify vertex-cache and vertex-fetch optimization on exported meshes and LODs.
+    pub optimize_gpu: bool = true,
+    /// Post-transform FIFO vertex cache size for Tipsify.
+    pub vertex_cache_size: u32 = 32,
+    /// Optional per-part LOD chain settings.
+    pub lods: Option<ExportLodOpts> = None,
+    /// Optional per-part physics collider mode.
+    pub colliders: Option<ColliderMode> = None,
+    /// Automatic hole & bevel fidelity check policy (`Some(AssetFidelityPolicy::DEFAULT)` by default).
+    pub fidelity: Option<AssetFidelityPolicy> = Some(AssetFidelityPolicy::DEFAULT),
+    pub limits: Limits = Limits::SHIPPED,
+}
+
+/// How a part's final triangle count compares to its budget.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BudgetStatus {
+    /// No triangle budget was set on this part or the asset.
+    Unbounded,
+    /// Written triangles are within budget with geometric error inside target tolerance.
+    WithinBudget,
+    /// Decimated down to meet the budget cleanly (`Stop::Reached`).
+    AtBudget,
+    /// Exceeded budget because further collapses would breach `max_error` (`Stop::ErrorCeiling`).
+    OverErrorCeiling,
+    /// Exceeded budget because no valid manifold collapse remained (`Stop::NoValidCollapse`).
+    OverNoValidCollapse,
+}
+
+impl BudgetStatus {
+    /// True unless the part exceeded its triangle budget.
+    #[inline]
+    pub const fn ok(self) -> bool {
+        matches!(self, BudgetStatus::Unbounded | BudgetStatus::WithinBudget | BudgetStatus::AtBudget)
+    }
+
+    const fn tag(self) -> &'static str {
+        match self {
+            BudgetStatus::Unbounded => "auto",
+            BudgetStatus::WithinBudget => "ok",
+            BudgetStatus::AtBudget => "fit",
+            BudgetStatus::OverErrorCeiling => "over(err)",
+            BudgetStatus::OverNoValidCollapse => "over(topo)",
+        }
+    }
+}
+
+/// Per-part telemetry, budget outcome, topology, and fidelity metrics.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct PartReport {
+    pub name: Name,
+    pub material: MaterialRole,
+    pub meshed_triangles: u32,
+    pub written_triangles: u32,
+    pub written_vertices: u32,
+    pub budget: Option<u32>,
+    pub budget_status: BudgetStatus,
+    pub tolerance_used: Length,
+    pub feature_grid: Length,
+    pub simplified_within: Length,
+    pub vertex_bound: Length,
+    pub lod_count: u32,
+    pub collider_hulls: u32,
+    /// Exact topological genus (through-holes) of the exported part mesh.
+    pub holes: Option<u32>,
+    pub fidelity: Option<FidelityChecked>,
+}
+
+/// Bundle-level report across every part in a [`GameAsset`]. Implements [`Show`] to render a
+/// concise, deterministic per-part table + summary footer + any fidelity findings.
+#[derive(Debug)]
+pub struct AssetReport<'a> {
+    pub parts: Vec<PartReport, Alloc<'a>>,
+    pub total_meshed: u64,
+    pub total_written: u64,
+    pub total_vertices: u64,
+    pub total_budget: Option<u32>,
+    pub glb_bytes: u64,
+    pub budget_passed: bool,
+    pub fidelity_passed: bool,
+}
+
+impl Show for AssetReport<'_> {
+    fn show<P: Put + ?Sized>(&self, out: &mut P) {
+        out.put_str("part\trole\tmeshed\twritten\tbudget\tstatus\terr_mm\tnorm_deg\tholes\tbevel%\tlods\tfidelity\n");
+        for p in self.parts.iter() {
+            out.put_str(p.name.as_str());
+            out.put_str("\t#");
+            out.int(p.material.0);
+            out.put_byte(b'\t');
+            out.int(p.meshed_triangles);
+            out.put_byte(b'\t');
+            out.int(p.written_triangles);
+            out.put_byte(b'\t');
+            match p.budget {
+                Some(b) => {
+                    out.int(b);
+                }
+                None => out.put_byte(b'-'),
+            }
+            out.put_byte(b'\t');
+            out.put_str(p.budget_status.tag());
+            out.put_byte(b'\t');
+            put_mm(out, p.simplified_within.as_nm(), 2);
+            out.put_byte(b'\t');
+            match p.fidelity {
+                Some(fc) => put_deg(out, fc.metrics.max_normal_error.as_microarcsec(), 1),
+                None => out.put_byte(b'-'),
+            }
+            out.put_byte(b'\t');
+            match p.holes {
+                Some(h) => {
+                    out.int(h);
+                }
+                None => out.put_byte(b'?'),
+            }
+            out.put_byte(b'\t');
+            match p.fidelity.and_then(|fc| fc.metrics.bevel_retention) {
+                Some(r) => {
+                    let pct = (r.clamp(0.0, 2.0) * 100.0 + 0.5) as u64;
+                    out.int(pct);
+                    out.put_byte(b'%');
+                }
+                None => out.put_byte(b'-'),
+            }
+            out.put_byte(b'\t');
+            out.int(p.lod_count);
+            out.put_byte(b'\t');
+            match p.fidelity {
+                Some(fc) => fc.verdict.show(out),
+                None => out.put_str("-"),
+            }
+            out.put_byte(b'\n');
+        }
+        out.put_str("TOTAL (");
+        out.int(self.parts.len());
+        out.put_str(" parts)\tmeshed=");
+        out.int(self.total_meshed);
+        out.put_str("\twritten=");
+        out.int(self.total_written);
+        out.put_str("\tvertices=");
+        out.int(self.total_vertices);
+        out.put_str("\tbudget=");
+        match self.total_budget {
+            Some(b) => {
+                out.int(b);
+            }
+            None => out.put_byte(b'-'),
+        }
+        out.put_str("\tglb_bytes=");
+        out.int(self.glb_bytes);
+        out.put_str("\tbudget_ok=");
+        out.put_str(if self.budget_passed { "PASS" } else { "FAIL" });
+        out.put_str("\tfidelity=");
+        out.put_str(if self.fidelity_passed { "PASS" } else { "FAIL" });
+        out.put_byte(b'\n');
+    }
+}
+
+fn put_mm<P: Put + ?Sized>(out: &mut P, nm: i64, places: u32) {
+    let places = places.min(6);
+    let unit = 10u128.pow(6 - places);
+    let scale = 10u128.pow(places);
+    let q = (i128::from(nm).unsigned_abs() + unit / 2) / unit;
+    let (whole, mut frac) = (q / scale, q % scale);
+    if nm < 0 && q != 0 {
+        out.put_byte(b'-');
+    }
+    out.int(whole);
+    if frac != 0 {
+        let mut digits = places as usize;
+        while frac % 10 == 0 {
+            frac /= 10;
+            digits -= 1;
+        }
+        out.put_byte(b'.');
+        out.int_zeros(frac, digits);
+    }
+}
+
+fn put_deg<P: Put + ?Sized>(out: &mut P, uas: i64, places: u32) {
+    const UAS_PER_DEGREE: u128 = 3_600_000_000;
+    let places = places.min(6);
+    let scale = 10u128.pow(places);
+    let mag = i128::from(uas).unsigned_abs();
+    let q = (mag * scale + UAS_PER_DEGREE / 2) / UAS_PER_DEGREE;
+    let (whole, mut frac) = (q / scale, q % scale);
+    if uas < 0 && q != 0 {
+        out.put_byte(b'-');
+    }
+    out.int(whole);
+    if frac != 0 {
+        let mut digits = places as usize;
+        while frac % 10 == 0 {
+            frac /= 10;
+            digits -= 1;
+        }
+        out.put_byte(b'.');
+        out.int_zeros(frac, digits);
+    }
+}
+
+/// One exported, GPU-optimized part retained inside [`GameAsset`] for direct mesh previewing.
+#[derive(Debug)]
+pub struct ExportedPart<'a> {
+    pub name: Name,
+    pub parent: Option<PartId>,
+    pub placement: Placement,
+    pub material: MaterialRole,
+    pub mesh: Mesh<'a>,
+}
+
+/// Complete game-asset build output: GLB bytes, structured per-part report, and retained exported
+/// meshes for WYSIWYG preview rendering.
+#[derive(Debug)]
+pub struct GameAsset<'a> {
+    pub glb: Vec<u8, Alloc<'a>>,
+    pub report: AssetReport<'a>,
+    pub parts: Vec<ExportedPart<'a>, Alloc<'a>>,
+}
+
+/// Distinct, colorblind-friendly deterministic palette for [`GameAsset::preview_part_colors`].
+const PART_PALETTE: [[u8; 3]; 10] = [
+    [198, 128, 78],  // warm cedar
+    [94, 134, 174],  // slate blue
+    [122, 168, 108], // pine green
+    [196, 166, 86],  // ochre trim
+    [156, 118, 168], // muted plum
+    [176, 112, 112], // terracotta
+    [104, 168, 164], // sea teal
+    [164, 156, 146], // warm stone
+    [214, 148, 114], // peach timber
+    [126, 138, 184], // steel indigo
+];
+
+impl GameAsset<'_> {
+    /// Total triangles written across every part.
+    pub fn triangles(&self) -> u64 {
+        self.report.total_written
+    }
+
+    /// Render a preview using the **actual exported, decimated, GPU-optimized meshes** at their
+    /// real placements and parent hierarchy, shaded with `materials`.
+    pub fn preview<'p>(
+        &self,
+        materials: &[Material<'_>],
+        view: View,
+        opts: MeshPictureOpts<'p, '_>,
+    ) -> Result<Picture<'p>, ModelError> {
+        let mut scene_parts: Vec<MeshScenePart<'_>, Alloc<'_>> = Vec::new_in(opts.scratch);
+        scene_parts.try_reserve(self.parts.len()).map_err(|_| ModelError::Alloc { what: "asset preview parts" })?;
+        for p in self.parts.iter() {
+            scene_parts
+                .try_push(MeshScenePart {
+                    mesh: p.mesh.view(),
+                    parent: p.parent.map(|id| id.0),
+                    transform: transform_of(&p.placement),
+                    tint_override: None,
+                })
+                .map_err(|_| ModelError::Alloc { what: "asset preview parts" })?;
+        }
+        render_mesh_scene(&scene_parts, materials, view, opts).map_err(ModelError::Picture)
+    }
+
+    /// Render a preview using the **actual exported meshes** tinted with one distinct colour per
+    /// named part (ideal for verifying part boundaries, wireframe density, and budget allocation).
+    pub fn preview_part_colors<'p>(&self, view: View, opts: MeshPictureOpts<'p, '_>) -> Result<Picture<'p>, ModelError> {
+        let mut scene_parts: Vec<MeshScenePart<'_>, Alloc<'_>> = Vec::new_in(opts.scratch);
+        scene_parts.try_reserve(self.parts.len()).map_err(|_| ModelError::Alloc { what: "asset preview parts" })?;
+        for (i, p) in self.parts.iter().enumerate() {
+            scene_parts
+                .try_push(MeshScenePart {
+                    mesh: p.mesh.view(),
+                    parent: p.parent.map(|id| id.0),
+                    transform: transform_of(&p.placement),
+                    tint_override: Some(PART_PALETTE[i % PART_PALETTE.len()]),
+                })
+                .map_err(|_| ModelError::Alloc { what: "asset preview parts" })?;
+        }
+        render_mesh_scene(&scene_parts, &[], view, opts).map_err(ModelError::Picture)
+    }
+}
+
+/// Deterministic budget-allocation input for one part.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct BudgetInput {
+    /// Natural triangle count after Phase-1 error-bounded simplification.
+    pub natural_triangles: u32,
+    /// Optional explicit per-part cap (`PartBudget::MaxTriangles` / `Detailed::max_triangles`).
+    pub explicit_cap: Option<u32>,
+    /// Relative importance weight (`> 0.0`, default `1.0`).
+    pub weight: f32,
+}
+
+/// Deterministically allocate a bundle-level `total_budget` across `inputs`.
+///
+/// - Parts with `explicit_cap` receive `min(natural_triangles, cap)`.
+/// - If the resulting total is already `<= total_budget`, every `Auto` part keeps its natural
+///   triangle count (zero unnecessary quality loss).
+/// - Otherwise, the remaining budget after fixed-cap parts is distributed across `Auto` parts
+///   proportionally to `weight × natural^0.75` (sublinear weighting so detailed curved hero parts
+///   keep crisp silhouettes while oversized parts compress smoothly), reserving at least
+///   `min(natural, min_part_triangles)` per part whenever the remaining budget permits, and never
+///   allocating more triangles to a part than its `natural_triangles`.
+pub fn allocate_budgets<'a>(
+    inputs: &[BudgetInput],
+    total_budget: u32,
+    min_part_triangles: u32,
+    alloc: Alloc<'a>,
+) -> Result<Vec<u32, Alloc<'a>>, ModelError> {
+    let n = inputs.len();
+    let mut out: Vec<u32, Alloc<'a>> = Vec::new_in(alloc);
+    out.try_reserve(n).map_err(|_| ModelError::Alloc { what: "budget allocation" })?;
+
+    let mut fixed_sum = 0u64;
+    let mut auto_natural_sum = 0u64;
+    for inp in inputs {
+        if let Some(cap) = inp.explicit_cap {
+            let take = inp.natural_triangles.min(cap);
+            out.try_push(take).map_err(|_| ModelError::Alloc { what: "budget allocation" })?;
+            fixed_sum += u64::from(take);
+        } else {
+            out.try_push(inp.natural_triangles).map_err(|_| ModelError::Alloc { what: "budget allocation" })?;
+            auto_natural_sum += u64::from(inp.natural_triangles);
+        }
+    }
+
+    if fixed_sum + auto_natural_sum <= u64::from(total_budget) {
+        return Ok(out);
+    }
+
+    let remaining = u64::from(total_budget).saturating_sub(fixed_sum);
+    // Reserve floors for Auto parts (scaled down proportionally if even the floors exceed remaining).
+    let mut floor_sum = 0u64;
+    for inp in inputs {
+        if inp.explicit_cap.is_none() {
+            floor_sum += u64::from(inp.natural_triangles.min(min_part_triangles));
+        }
+    }
+    let floor_scale = if floor_sum > remaining && floor_sum > 0 { (remaining as f64) / (floor_sum as f64) } else { 1.0 };
+
+    let mut assigned = 0u64;
+    for (i, inp) in inputs.iter().enumerate() {
+        if inp.explicit_cap.is_none() {
+            let f = ((f64::from(inp.natural_triangles.min(min_part_triangles)) * floor_scale) as u32).min(inp.natural_triangles);
+            out[i] = f;
+            assigned += u64::from(f);
+        }
+    }
+
+    // Iteratively distribute surplus `remaining - assigned` proportionally to `weight * natural^0.75`,
+    // capping each part at `natural_triangles` so leftover slack redistributes cleanly.
+    for _ in 0..8 {
+        let mut surplus = remaining.saturating_sub(assigned);
+        if surplus == 0 {
+            break;
+        }
+        let mut weight_sum = 0.0f64;
+        for (i, inp) in inputs.iter().enumerate() {
+            if inp.explicit_cap.is_none() && out[i] < inp.natural_triangles {
+                let w = f64::from(if inp.weight.is_finite() && inp.weight > 0.0 { inp.weight } else { 1.0 });
+                let score = w * blaze_math::pow(f64::from(inp.natural_triangles.max(1)), 0.75);
+                weight_sum += score;
+            }
+        }
+        if !(weight_sum > 0.0) {
+            break;
+        }
+        let mut added_any = false;
+        let pool = surplus as f64;
+        for (i, inp) in inputs.iter().enumerate() {
+            if inp.explicit_cap.is_none() && out[i] < inp.natural_triangles {
+                let w = f64::from(if inp.weight.is_finite() && inp.weight > 0.0 { inp.weight } else { 1.0 });
+                let score = w * blaze_math::pow(f64::from(inp.natural_triangles.max(1)), 0.75);
+                let share = ((pool * (score / weight_sum)) as u64).min(surplus);
+                let room = u64::from(inp.natural_triangles - out[i]);
+                let give = share.min(room);
+                if give > 0 {
+                    out[i] += give as u32;
+                    assigned += give;
+                    surplus -= give;
+                    added_any = true;
+                }
+            }
+        }
+        if !added_any {
+            // Distribute remaining fractional triangles deterministically (+1 each in part order).
+            for (i, inp) in inputs.iter().enumerate() {
+                if surplus == 0 {
+                    break;
+                }
+                if inp.explicit_cap.is_none() && out[i] < inp.natural_triangles {
+                    out[i] += 1;
+                    surplus -= 1;
+                }
+            }
+            break;
+        }
+    }
+    Ok(out)
+}
+
+struct ReadyLod<'s> {
+    mesh: Mesh<'s>,
+    error: Length,
+    switch_distance: Length,
+}
+
+/// Build an entire game asset end to end:
+///
+/// 1. Scale-aware tessellation (`auto_grid`) using [`GameAssetOpts::preset`] and per-part overrides.
+/// 2. Phase-1 error-bounded QEM decimation, followed by deterministic [`allocate_budgets`] and
+///    Phase-2 budget-constrained decimation when [`GameAssetOpts::total_budget`] or per-part caps
+///    require further compression.
+/// 3. GPU Tipsify vertex-cache and vertex-fetch optimization, optional LOD chains, and optional
+///    physics collider hulls.
+/// 4. Automatic per-part lost-hole and lost-bevel fidelity checks ([`check_mesh_fidelity`]) and
+///    exact Euler genus calculation.
+/// 5. glTF 2.0 `.glb` export, full per-part [`AssetReport`], and retained previewable meshes.
+pub fn build_game_asset<'a, P: Planted<CadPlant>>(
+    g: &Graph<'_, P>,
+    parts: &[Part],
+    o: GameAssetOpts<'a, '_, '_>,
+    mut cache: Option<&mut PieceCache<'_>>,
+) -> Result<GameAsset<'a>, ModelError> {
+    let s = o.scratch;
+    let cos_crease = o.cos_crease.unwrap_or_else(|| o.preset.default_cos_crease());
+
+    // Stage 1: resolve per-part tessellation settings and mesh each part with scale-aware grid.
+    let mut part_tols: Vec<Length, Alloc<'_>> = Vec::new_in(s);
+    let mut part_grids: Vec<GridSizing, Alloc<'_>> = Vec::new_in(s);
+    let mut part_max_errs: Vec<Option<Length>, Alloc<'_>> = Vec::new_in(s);
+    let mut meshes: Vec<Meshed<'_>, Alloc<'_>> = Vec::new_in(s);
+    part_tols.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset part tolerances" })?;
+    part_grids.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset part grids" })?;
+    part_max_errs.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset part ceilings" })?;
+    meshes.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset meshes" })?;
+
+    for part in parts {
+        let tape = part_tape(g, part, Detail::Full, s)?;
+        let bounds = tape.aabb();
+        let (tol, min_feat, max_err) = match part.budget {
+            PartBudget::Detailed { tolerance, min_feature, max_error, .. } => (
+                tolerance.unwrap_or_else(|| o.preset.tolerance_for(&bounds)),
+                min_feature.or_else(|| o.preset.min_feature()),
+                max_error,
+            ),
+            _ => (o.preset.tolerance_for(&bounds), o.preset.min_feature(), None),
+        };
+        let grid = auto_grid(&bounds, tol, min_feat);
+        let mopts = MeshOpts { alloc: s, scratch: s, tolerance: tol, piece: grid.piece, feature: grid.feature, .. };
+        let meshed = match cache.as_deref_mut() {
+            Some(c) => mesh_cached(&tape, mopts, c),
+            None => mesh(&tape, mopts),
+        }
+        .map_err(ModelError::Mesh)?;
+        part_tols.try_push(tol).map_err(|_| ModelError::Alloc { what: "asset part tolerances" })?;
+        part_grids.try_push(grid).map_err(|_| ModelError::Alloc { what: "asset part grids" })?;
+        part_max_errs.try_push(max_err).map_err(|_| ModelError::Alloc { what: "asset part ceilings" })?;
+        meshes.try_push(meshed).map_err(|_| ModelError::Alloc { what: "asset meshes" })?;
+    }
+
+    // Stage 2: Phase-1 decimation (honor explicit per-part cap and eliminate flat/coplanar faces).
+    let mut decimated: Vec<Decimated<'_>, Alloc<'_>> = Vec::new_in(s);
+    let mut budget_inputs: Vec<BudgetInput, Alloc<'_>> = Vec::new_in(s);
+    decimated.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset phase-1 decimation" })?;
+    budget_inputs.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset budget inputs" })?;
+
+    for (i, (part, m)) in parts.iter().zip(meshes.iter()).enumerate() {
+        let tol = part_tols[i];
+        let cap = part.budget.explicit_cap();
+        let target = match cap {
+            Some(max_t) => Target::Budget { error: tol, max_triangles: max_t, max_error: part_max_errs[i] },
+            None => Target::Error(tol),
+        };
+        let d = decimate(
+            Source::Verified(m.verified()),
+            DecimateOpts { target, cos_crease, limits: MeshLimits::SHIPPED, alloc: s, scratch: s },
+        )?;
+        let nat = d.mesh.view().triangle_count();
+        budget_inputs
+            .try_push(BudgetInput { natural_triangles: nat, explicit_cap: cap, weight: part.budget.weight() })
+            .map_err(|_| ModelError::Alloc { what: "asset budget inputs" })?;
+        decimated.try_push(d).map_err(|_| ModelError::Alloc { what: "asset phase-1 decimation" })?;
+    }
+
+    // Stage 3: Total-budget allocation and Phase-2 re-decimation only for parts over their share.
+    let allocated: Option<Vec<u32, Alloc<'_>>> = match o.total_budget {
+        Some(TriangleBudget(total)) => Some(allocate_budgets(&budget_inputs, total, o.min_part_triangles, s)?),
+        None => None,
+    };
+    if let Some(ref alloc_caps) = allocated {
+        for (i, m) in meshes.iter().enumerate() {
+            let cur = decimated[i].mesh.view().triangle_count();
+            let target_cap = alloc_caps[i];
+            if cur > target_cap {
+                let d2 = decimate(
+                    Source::Verified(m.verified()),
+                    DecimateOpts {
+                        target: Target::Budget { error: part_tols[i], max_triangles: target_cap, max_error: part_max_errs[i] },
+                        cos_crease,
+                        limits: MeshLimits::SHIPPED,
+                        alloc: s,
+                        scratch: s,
+                    },
+                )?;
+                decimated[i] = d2;
+            }
+        }
+    }
+
+    // Stage 4 & 5: GPU optimization, LODs, colliders, topology & sharp fidelity checks.
+    let mut exported_parts: Vec<ExportedPart<'a>, Alloc<'a>> = Vec::new_in(o.alloc);
+    exported_parts.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset exported parts" })?;
+
+    let mut ready_lods: Vec<ReadyLod<'_>, Alloc<'_>> = Vec::new_in(s);
+    let mut lod_ranges: Vec<(usize, usize), Alloc<'_>> = Vec::new_in(s);
+    lod_ranges.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset lod ranges" })?;
+
+    let mut ready_hulls: Vec<Mesh<'_>, Alloc<'_>> = Vec::new_in(s);
+    let mut hull_ranges: Vec<(usize, usize), Alloc<'_>> = Vec::new_in(s);
+    hull_ranges.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset hull ranges" })?;
+
+    let mut part_reports: Vec<PartReport, Alloc<'a>> = Vec::new_in(o.alloc);
+    part_reports.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset part reports" })?;
+
+    let mut total_meshed = 0u64;
+    let mut total_written = 0u64;
+    let mut total_vertices = 0u64;
+    let mut all_budgets_ok = true;
+    let mut all_fidelity_ok = true;
+
+    for (i, (part, m)) in parts.iter().zip(meshes.iter()).enumerate() {
+        let d = &decimated[i];
+        let base_view = d.mesh.view();
+        let verified_base = d.verified().unwrap_or_else(|| m.verified());
+        let written_tris = base_view.triangle_count();
+
+        let opt_mesh = prepare_gpu_mesh(&base_view, part.material, o.optimize_gpu, o.vertex_cache_size, o.alloc, s)?;
+        let written_verts = opt_mesh.view().vertex_count();
+
+        let lod_start = ready_lods.len();
+        if let Some(lo) = o.lods {
+            let chain = lod_chain(
+                &verified_base,
+                LodOpts {
+                    ratio: lo.ratio,
+                    fewest_triangles: lo.fewest_triangles,
+                    projection: lo.projection,
+                    cos_crease,
+                    limits: MeshLimits::SHIPPED,
+                    alloc: s,
+                    scratch: s,
+                },
+            )?;
+            for level in chain.levels.iter().skip(1) {
+                let lv_mesh = prepare_gpu_mesh(&level.mesh.view(), part.material, o.optimize_gpu, o.vertex_cache_size, s, s)?;
+                ready_lods
+                    .try_push(ReadyLod { mesh: lv_mesh, error: level.error, switch_distance: level.switch_distance })
+                    .map_err(|_| ModelError::Alloc { what: "asset lod meshes" })?;
+            }
+        }
+        let lod_end = ready_lods.len();
+        lod_ranges.try_push((lod_start, lod_end)).map_err(|_| ModelError::Alloc { what: "asset lod ranges" })?;
+
+        let hull_start = ready_hulls.len();
+        if let Some(mode) = o.colliders {
+            match mode {
+                ColliderMode::ConvexHull => {
+                    let hull = convex_hull(base_view.positions(), HullOpts { limits: MeshLimits::SHIPPED, alloc: s, scratch: s })?;
+                    let hm = hull_to_mesh(&hull, s)?;
+                    ready_hulls.try_push(hm).map_err(|_| ModelError::Alloc { what: "asset collider hulls" })?;
+                }
+                ColliderMode::Decompose { concavity, rays } => {
+                    let decomp = decompose(
+                        &verified_base,
+                        DecomposeOpts { concavity, rays, limits: MeshLimits::SHIPPED, alloc: s, scratch: s },
+                    )?;
+                    for piece in decomp.pieces.iter() {
+                        let hm = hull_to_mesh(&piece.hull, s)?;
+                        ready_hulls.try_push(hm).map_err(|_| ModelError::Alloc { what: "asset collider hulls" })?;
+                    }
+                }
+            }
+        }
+        let hull_end = ready_hulls.len();
+        hull_ranges.try_push((hull_start, hull_end)).map_err(|_| ModelError::Alloc { what: "asset hull ranges" })?;
+
+        let effective_budget = match (part.budget.explicit_cap(), allocated.as_ref().map(|a| a[i])) {
+            (Some(c), _) => Some(c),
+            (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+        let budget_status = match effective_budget {
+            None => BudgetStatus::Unbounded,
+            Some(cap) => {
+                if written_tris <= cap {
+                    if d.error_bound <= part_tols[i] + Length::nm(1) {
+                        BudgetStatus::WithinBudget
+                    } else {
+                        BudgetStatus::AtBudget
+                    }
+                } else {
+                    match d.stop {
+                        Stop::ErrorCeiling => BudgetStatus::OverErrorCeiling,
+                        Stop::NoValidCollapse | Stop::Reached => BudgetStatus::OverNoValidCollapse,
+                    }
+                }
+            }
+        };
+        if !budget_status.ok() {
+            all_budgets_ok = false;
+        }
+
+        let (fidelity, holes) = if let Some(fp) = o.fidelity {
+            let tol = part_tols[i];
+            let err_budget = d.error_bound + m.vertex_bound;
+            let default_pos_tol = (tol * 2.5).max(err_budget + Length::mm(1.0)).max(Length::mm(2.0));
+            let hole_tolerance = fp.hole_tolerance.unwrap_or(default_pos_tol);
+            let surface_tolerance = fp.surface_tolerance.unwrap_or(default_pos_tol);
+            // Sub-triangle bevel offset probe is at least the mesh's own guaranteed geometric
+            // error bound so legal `tol`-bounded chords on fillets are not flagged as lost bevels.
+            let bevel_probe_tolerance = Some(err_budget.max(tol));
+            let max_normal_error = fp.max_normal_error.unwrap_or_else(|| o.preset.default_max_normal_error());
+            // Scale minimum hole subdivision feature to the part's grid/extent so meter-scale
+            // parts settle cleanly while still resolving every opening/feature.
+            let min_hole_feature = fp.min_hole_feature.unwrap_or_else(|| (part_grids[i].feature * 0.5).max(tol * 6.0).max(Length::mm(4.0)));
+            let tol_m = tol.as_m();
+            let min_bevel_area_m2 = Some((tol_m * 4.0) * (tol_m * 4.0));
+            let fc = check_mesh_fidelity(
+                g,
+                part,
+                &opt_mesh.view(),
+                Some(&m.mesh.view()),
+                FidelityOpts {
+                    hole_tolerance,
+                    surface_tolerance,
+                    bevel_probe_tolerance,
+                    max_normal_error,
+                    min_hole_feature,
+                    min_bevel_area_m2,
+                    max_bevel_loss: fp.max_bevel_loss,
+                    most_subdivisions: fp.most_subdivisions,
+                    scratch: s,
+                    ..
+                },
+            )?;
+            if !matches!(fc.verdict, Verdict::Pass) {
+                all_fidelity_ok = false;
+            }
+            (Some(fc), fc.metrics.holes)
+        } else {
+            let topo = topology(&opt_mesh.view(), s).map_err(|_| ModelError::Alloc { what: "asset part topology" })?;
+            (None, topo.genus)
+        };
+
+        total_meshed += u64::from(m.stats.triangles);
+        total_written += u64::from(written_tris);
+        total_vertices += u64::from(written_verts);
+
+        part_reports
+            .try_push(PartReport {
+                name: part.name,
+                material: part.material,
+                meshed_triangles: m.stats.triangles,
+                written_triangles: written_tris,
+                written_vertices: written_verts,
+                budget: effective_budget,
+                budget_status,
+                tolerance_used: part_tols[i],
+                feature_grid: part_grids[i].feature,
+                simplified_within: d.error_bound,
+                vertex_bound: m.vertex_bound,
+                lod_count: (lod_end - lod_start) as u32,
+                collider_hulls: (hull_end - hull_start) as u32,
+                holes,
+                fidelity,
+            })
+            .map_err(|_| ModelError::Alloc { what: "asset part reports" })?;
+
+        exported_parts
+            .try_push(ExportedPart {
+                name: part.name,
+                parent: part.parent,
+                placement: part.placement,
+                material: part.material,
+                mesh: opt_mesh,
+            })
+            .map_err(|_| ModelError::Alloc { what: "asset exported parts" })?;
+    }
+
+    // Stage 6: Build GLB scene from the exact retained exported meshes.
+    let mut lod_views: Vec<Lod<'_>, Alloc<'_>> = Vec::new_in(s);
+    lod_views.try_reserve(ready_lods.len()).map_err(|_| ModelError::Alloc { what: "asset lod views" })?;
+    for lv in ready_lods.iter() {
+        lod_views
+            .try_push(Lod { mesh: lv.mesh.view(), error: lv.error, switch_distance: lv.switch_distance })
+            .map_err(|_| ModelError::Alloc { what: "asset lod views" })?;
+    }
+
+    let mut hull_views: Vec<MeshView<'_>, Alloc<'_>> = Vec::new_in(s);
+    hull_views.try_reserve(ready_hulls.len()).map_err(|_| ModelError::Alloc { what: "asset hull views" })?;
+    for hm in ready_hulls.iter() {
+        hull_views.try_push(hm.view()).map_err(|_| ModelError::Alloc { what: "asset hull views" })?;
+    }
+
+    let mut nodes: Vec<blaze_cad_out::Part<'_>, Alloc<'_>> = Vec::new_in(s);
+    nodes.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset glb nodes" })?;
+    for (i, (ep, m)) in exported_parts.iter().zip(meshes.iter()).enumerate() {
+        let (ls, le) = lod_ranges[i];
+        let (hs, he) = hull_ranges[i];
+        let mass = o.density.map(|d| {
+            let mp = mass_properties(&m.verified(), d);
+            MassFacts {
+                mass: mp.mass.as_kg(),
+                centre: [mp.centre[0].as_m(), mp.centre[1].as_m(), mp.centre[2].as_m()],
+                inertia: mp.inertia,
+            }
+        });
+        let collider = if hs < he { Some(Collider::Hulls(&hull_views[hs..he])) } else { None };
+        nodes
+            .try_push(blaze_cad_out::Part {
+                name: ep.name.as_str(),
+                parent: ep.parent.map(|p| p.0),
+                transform: transform_of(&ep.placement),
+                mesh: Some(ep.mesh.view()),
+                lods: &lod_views[ls..le],
+                mass,
+                joint: None,
+                collider,
+            })
+            .map_err(|_| ModelError::Alloc { what: "asset glb nodes" })?;
+    }
+
+    let scene = blaze_cad_out::Scene { parts: &nodes, materials: o.materials };
+    let glb_bytes = glb(&scene, GlbOpts { encoding: o.encoding, up: o.up, limits: o.limits, alloc: o.alloc, scratch: s })
+        .map_err(ModelError::Glb)?;
+
+    let total_budget_u32 = o.total_budget.map(|b| b.0);
+    if let Some(tb) = total_budget_u32
+        && total_written > u64::from(tb)
+    {
+        all_budgets_ok = false;
+    }
+
+    let report = AssetReport {
+        parts: part_reports,
+        total_meshed,
+        total_written,
+        total_vertices,
+        total_budget: total_budget_u32,
+        glb_bytes: glb_bytes.len() as u64,
+        budget_passed: all_budgets_ok,
+        fidelity_passed: all_fidelity_ok,
+    };
+
+    Ok(GameAsset { glb: glb_bytes, report, parts: exported_parts })
+}

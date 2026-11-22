@@ -434,6 +434,60 @@ impl<'c> PieceCache<'c> {
     }
 }
 
+/// Scale-aware dyadic octree grid parameters returned by [`auto_grid`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GridSizing {
+    /// Side of a cached octree piece (a power of two of nanometres, at least two leaves).
+    pub piece: Length,
+    /// Largest cell side a surface may stop in (a power of two of nanometres, between leaf and
+    /// piece). Features wider than this on any axis are always hit by the 3×3×3 cell lattice.
+    pub feature: Length,
+}
+
+/// Choose deterministic, dyadic-grid-aligned [`MeshOpts::piece`] and [`MeshOpts::feature`] sizes
+/// from a solid's bounding box `bounds`, target `tolerance`, and optional smallest feature size
+/// `min_feature` (such as a window frame, trim, or hole diameter that must never fall between
+/// stopped-cell lattice samples).
+///
+/// Why this matters: [`MeshOpts`]'s legacy fixed defaults (`piece = 16.8 mm`, `feature = 8.4 mm`)
+/// subdivide a 6 m flat cabin wall into hundreds of thousands of cells before decimation even runs.
+/// Scaling `feature` to the part's extent (while clamping to `min_feature` when specified) keeps
+/// flat faces coarse on meter-scale game assets while still refining curved rounds and thin walls
+/// down to `leaf <= tolerance / 2` via the QEF residual test.
+pub fn auto_grid(bounds: &Aabb3, tolerance: Length, min_feature: Option<Length>) -> GridSizing {
+    let tol_nm = tolerance.as_nm().max(16);
+    let leaf = floor_log2(tol_nm / 2);
+    let leaf_nm = 1i64 << leaf;
+
+    let extent_m = if bounds.is_empty() {
+        0.1
+    } else {
+        let d = bounds.hi - bounds.lo;
+        let max_d = d.x.max(d.y).max(d.z);
+        if max_d.is_finite() && max_d > 0.0 { max_d } else { 0.1 }
+    };
+    let extent_nm = (extent_m * 1e9).clamp(f64::from(16u32), 1e15) as i64;
+
+    // Default feature ceiling: ~1/16 of the part's extent, at least 16× tolerance (so flat faces
+    // stay coarse on meter-scale assets) and at most 1/4 of the extent or ~1.07 m (2^30 nm).
+    let max_feature_cap = (extent_nm / 4).clamp(leaf_nm, 1i64 << 30);
+    let auto_feature_nm = (extent_nm / 16).max(tol_nm.saturating_mul(16)).clamp(leaf_nm, max_feature_cap);
+
+    // When `min_feature` is stated, cap `feature` so the cell's 3×3×3 half-step lattice (`feature / 2`)
+    // samples at least twice across any feature of width `min_feature`.
+    let feature_target = match min_feature {
+        Some(mf) if mf.as_nm() > 0 => auto_feature_nm.min(mf.as_nm().max(leaf_nm)),
+        _ => auto_feature_nm,
+    };
+    let feature_shift = floor_log2(feature_target.max(leaf_nm)).max(leaf);
+    // Piece is one octave above `feature` (or at least 4 leaves so a piece holds a compact subtree
+    // of cells rather than exploding into tens of thousands of tiny pieces on meter-scale assets).
+    let piece_shift = (feature_shift + 1).max(leaf + 2).min(31);
+    let feature_shift = feature_shift.min(piece_shift);
+
+    GridSizing { piece: Length::nm(1i64 << piece_shift), feature: Length::nm(1i64 << feature_shift) }
+}
+
 /// The mesh of `t`'s solid, every piece made here.
 pub fn mesh<'a>(t: &Tape<'_>, o: MeshOpts<'a, '_>) -> Result<Meshed<'a>, MeshError> {
     contour(t, o, None, NoPlant)

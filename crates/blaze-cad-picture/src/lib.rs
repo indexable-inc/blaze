@@ -53,10 +53,16 @@
 #[cfg(test)]
 extern crate std;
 
+mod mesh;
 mod shade;
 
 #[cfg(test)]
 mod tests;
+
+pub use mesh::{
+    MeshNormalSource, MeshPictureOpts, MeshPicturePlant, MeshScenePart, Wireframe, render_mesh, render_mesh_scene,
+    render_mesh_scene_planted,
+};
 
 use blaze_cad_field::{Lanes, Points, Scratch, Tape, eval_box, eval_grad, eval_point, eval_points, simplify};
 use blaze_cad_out::{Image, PngError, PngKind, PngOpts};

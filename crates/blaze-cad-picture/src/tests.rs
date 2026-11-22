@@ -602,3 +602,190 @@ fn studio_and_modes_are_bit_deterministic() {
         }
     }
 }
+
+blaze_sim::plants! {
+    impl MeshPicturePlant breaks PictureBroken {
+        None,
+        IgnoreTransform => PictureBroken::Wrong { .. },
+        FlatOnly => PictureBroken::Wrong { .. },
+    }
+}
+
+fn mesh_preview_case(tape: &Tape, plant: impl Planted<MeshPicturePlant> + Copy) -> Result<(), Broken<PictureBroken>> {
+    use blaze_cad_mesh::{COS_32_DEGREES, MeshOpts, ShadeOpts, mesh, shade};
+    use blaze_cad_out::{Material, Matrix, Transform};
+
+    let radius_mm = tape.int_in(22..=34i64, "radius mm") as f64;
+    let shift_x_mm = tape.int_in(40..=70i64, "shift x mm") as f64;
+    let shift_z_mm = tape.int_in(-12..=12i64, "shift z mm") as f64;
+
+    let mut g = Graph::new(GraphOpts { alloc: heap(), .. });
+    let ball = g.sphere(SphereOpts { radius: Length::mm(radius_mm), .. }).map_err(harness)?;
+    let tape_s = compile(&g, ball.id(), CompileOpts { alloc: heap(), .. }).map_err(harness)?;
+    let meshed = mesh(&tape_s, MeshOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(1.5), .. }).map_err(harness)?;
+    // Re-shade with smooth normals (`cos_crease = 0.0` so sphere normals interpolate smoothly).
+    let smooth = shade(&meshed.mesh.view(), ShadeOpts { cos_crease: 0.0, alloc: heap(), scratch: heap() }).map_err(harness)?;
+    let _ = COS_32_DEGREES;
+
+    // Shift the sphere so IgnoreTransform fails to hit at the shifted target.
+    let shifted = Transform::Matrix(Matrix {
+        linear: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        translation: [shift_x_mm / 1000.0, 0.0, shift_z_mm / 1000.0],
+    });
+    let parts = [MeshScenePart { mesh: smooth.view(), parent: None, transform: shifted, tint_override: None }];
+    const MAT: [Material<'static>; 1] = [Material {
+        name: "wood",
+        base_colour: [0.55, 0.35, 0.18, 1.0],
+        metallic: 0.0,
+        roughness: 0.7,
+        emissive: [0.0; 3],
+        emissive_strength: None,
+        clearcoat: None,
+        double_sided: false,
+    }];
+    let v = View {
+        eye: [Length::mm(shift_x_mm), Length::mm(-140.0), Length::mm(shift_z_mm)],
+        target: [Length::mm(shift_x_mm), Length::ZERO, Length::mm(shift_z_mm)],
+        projection: Projection::Orthographic { height: Length::mm(radius_mm * 2.8) },
+        width: 32,
+        height: 32,
+        ..
+    };
+
+    let shaded = render_mesh_scene_planted(
+        &parts,
+        &MAT,
+        v,
+        MeshPictureOpts {
+            alloc: heap(),
+            scratch: heap(),
+            mode: RenderMode::Normals,
+            normal_source: MeshNormalSource::Shading,
+            ..
+        },
+        plant,
+    )
+    .map_err(harness)?;
+
+    let flat = render_mesh_scene_planted(
+        &parts,
+        &MAT,
+        v,
+        MeshPictureOpts {
+            alloc: heap(),
+            scratch: heap(),
+            mode: RenderMode::Normals,
+            normal_source: MeshNormalSource::Geometric,
+            ..
+        },
+        plant,
+    )
+    .map_err(harness)?;
+
+    let center = (16 * 32 + 16) as usize;
+    if !shaded.depth[center].is_finite() {
+        return Err(Broken::Oracle(PictureBroken::Wrong {
+            why: String::from("center ray missed shifted sphere"),
+        }));
+    }
+    let want_t = (140.0 - radius_mm) / 1000.0;
+    let got_t = shaded.depth[center];
+    if (got_t - want_t).abs() > 0.005 {
+        return Err(Broken::Oracle(PictureBroken::Wrong {
+            why: format!("center hit depth {got_t} far from {want_t} m"),
+        }));
+    }
+    // Smooth shading normals must differ from flat geometric triangle normals on a coarse sphere.
+    if shaded.pixels[..] == flat.pixels[..] {
+        return Err(Broken::Oracle(PictureBroken::Wrong {
+            why: String::from("Shading normals matched Geometric normals on sphere"),
+        }));
+    }
+    Ok(())
+}
+
+#[test]
+fn mesh_preview_plants_are_caught() {
+    controls(Config::cases(4), |tape, plant: MeshPicturePlant| mesh_preview_case(tape, plant));
+}
+
+#[test]
+fn mesh_preview_matches_sdf_silhouette_and_draws_wireframe() {
+    use blaze_cad_mesh::{MeshOpts, mesh};
+    use blaze_cad_out::Material;
+
+    let mut g = Graph::new(GraphOpts { alloc: heap(), .. });
+    let cube = g.cuboid(BoxOpts { size: [Length::mm(50.0); 3], round: Length::mm(4.0), .. }).expect("cube");
+    let tape = compile(&g, cube.id(), CompileOpts { alloc: heap(), .. }).expect("compile");
+    let meshed = mesh(&tape, MeshOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(1.0), .. }).expect("mesh");
+
+    let v = View {
+        eye: [Length::mm(110.0), Length::mm(-110.0), Length::mm(90.0)],
+        target: [Length::ZERO; 3],
+        projection: Projection::Perspective { fov: Angle::degrees(35.0) },
+        width: 48,
+        height: 48,
+        ..
+    };
+
+    const MAT: [Material<'static>; 1] = [Material {
+        name: "steel",
+        base_colour: [0.62, 0.64, 0.68, 1.0],
+        metallic: 0.85,
+        roughness: 0.35,
+        emissive: [0.0; 3],
+        emissive_strength: None,
+        clearcoat: None,
+        double_sided: false,
+    }];
+
+    let sdf_pic = render(&tape, v, PictureOpts { alloc: heap(), scratch: heap(), .. }).expect("sdf render");
+    let mesh_pic1 = render_mesh(
+        meshed.mesh.view(),
+        &MAT,
+        v,
+        MeshPictureOpts { alloc: heap(), scratch: heap(), supersample: 2, .. },
+    )
+    .expect("mesh render 1");
+    let mesh_pic2 = render_mesh(
+        meshed.mesh.view(),
+        &MAT,
+        v,
+        MeshPictureOpts { alloc: heap(), scratch: heap(), supersample: 2, .. },
+    )
+    .expect("mesh render 2");
+    assert_eq!(mesh_pic1.pixels[..], mesh_pic2.pixels[..], "mesh preview must be bit-deterministic");
+
+    // Silhouette hit agreement with the exact SDF render (interior pixels agree within tolerance).
+    let mut both_hit = 0usize;
+    for i in 0..(48 * 48) {
+        if sdf_pic.depth[i].is_finite() && mesh_pic1.depth[i].is_finite() {
+            both_hit += 1;
+            let diff = (sdf_pic.depth[i] - mesh_pic1.depth[i]).abs();
+            assert!(diff < 0.008, "pixel {i} depth diff {diff} too large");
+        }
+    }
+    assert!(both_hit > 300, "expected substantial overlap with SDF render, got {both_hit}");
+
+    // Wireframe overlay must visibly alter pixels relative to solid shading.
+    let wire_pic = render_mesh(
+        meshed.mesh.view(),
+        &MAT,
+        v,
+        MeshPictureOpts {
+            alloc: heap(),
+            scratch: heap(),
+            wireframe: Wireframe::Overlay { width_px: 1.2, colour: [20, 20, 25] },
+            ..
+        },
+    )
+    .expect("wireframe render");
+    let solid_1x = render_mesh(
+        meshed.mesh.view(),
+        &MAT,
+        v,
+        MeshPictureOpts { alloc: heap(), scratch: heap(), .. },
+    )
+    .expect("solid 1x");
+    assert_ne!(wire_pic.pixels[..], solid_1x.pixels[..], "wireframe overlay must draw visible triangle edges");
+}

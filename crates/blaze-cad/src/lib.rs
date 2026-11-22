@@ -58,8 +58,10 @@
 #[cfg(test)]
 extern crate std;
 
+mod asset;
 mod check;
 mod export;
+mod fidelity;
 mod part;
 
 #[cfg(test)]
@@ -67,9 +69,16 @@ mod math_tests;
 #[cfg(test)]
 mod tests;
 
-pub use blaze_cad_mesh::{DecimateStats, Decimated, MaterialRole, MeshLimits, PieceCache, PieceCacheOpts, Stop, Target};
+pub use asset::{
+    AssetFidelityPolicy, AssetPreset, AssetReport, BudgetInput, BudgetStatus, ExportedPart, GameAsset, GameAssetOpts, PartReport,
+    allocate_budgets, build_game_asset,
+};
+pub use blaze_cad_mesh::{
+    CreaseProfile, CreaseProfileOpts, DecimateStats, Decimated, GridSizing, MaterialRole, MeshLimits, PieceCache, PieceCacheOpts,
+    Stop, Target, Topology, auto_grid, crease_profile, topology,
+};
 pub use blaze_cad_out::{Encoding, Material, StlUnit, Up};
-pub use blaze_cad_picture::{RenderMode, Shading, StudioOpts};
+pub use blaze_cad_picture::{MeshNormalSource, MeshPictureOpts, MeshScenePart, RenderMode, Shading, StudioOpts, Wireframe};
 pub use check::{
     AssemblyInterference, CHECK_SCHEMA, CheckKey, CheckKind, Checked, DraftFace, DraftOpts, FitOpts, Interference, InterferenceOpts,
     MinWallOpts, Overhang, OverhangFace, OverhangOpts, ThinWall, Unsettled, Verdict, draft_angle_check, draft_angle_check_planted,
@@ -82,12 +91,17 @@ pub use check::{
 pub use blaze_text::Shown;
 pub use export::{
     ColliderMode, ExportLodOpts, ExportOpts, ExportStlOpts, Exported, ExportedStl, LodProjection, PartCount, STEEL, STEEL_ONLY,
-    SectionSvgOpts, export_glb, export_section_svg, export_stl, picture, picture_studio, transform_of,
+    SectionSvgOpts, export_glb, export_section_svg, export_stl, picture, picture_exported_scene, picture_mesh, picture_studio,
+    transform_of,
+};
+pub use fidelity::{
+    FidelityChecked, FidelityFinding, FidelityMetrics, FidelityOpts, FidelityPlant, check_mesh_fidelity,
+    check_mesh_fidelity_planted,
 };
 pub use part::{
-    DecimatePartOpts, MassProperties, MeshPartOpts, Part, PartOpts, RoundEdgesOpts, assemble, decimate_mesh, gyroid, intersect_all,
-    mass_properties, mass_properties_planted, mesh_part, part_tape, placed, placed_tape, round_edges, round_edges_planted,
-    union_all,
+    DecimatePartOpts, MassProperties, MeshPartOpts, Part, PartBudget, PartOpts, RoundEdgesOpts, TriangleBudget, assemble,
+    decimate_mesh, gyroid, intersect_all, mass_properties, mass_properties_planted, mesh_part, part_tape, placed, placed_tape,
+    round_edges, round_edges_planted, union_all,
 };
 
 use blaze_cad_field::{Bound, CadError, CompileError, EvalError, Ex, Graph, InspectError, Name, Placement, Solid, Weakens};
@@ -405,6 +419,14 @@ impl<'a> Model<'a> {
         Ok(())
     }
 
+    /// Assign a per-part triangle budget or tessellation override to one part.
+    pub fn set_budget(&mut self, id: PartId, budget: PartBudget) -> Result<(), ModelError> {
+        let at = usize::try_from(id.0).map_err(|_| ModelError::NoPart { id: id.0 })?;
+        let p = self.parts.get_mut(at).ok_or(ModelError::NoPart { id: id.0 })?;
+        *p = p.with_budget(budget);
+        Ok(())
+    }
+
     /// Set one part's parent in the exported scene hierarchy (`parent` must have been added before
     /// `id` so the hierarchy is a forest by construction).
     pub fn set_parent(&mut self, id: PartId, parent: Option<PartId>) -> Result<(), ModelError> {
@@ -445,18 +467,24 @@ pub mod prelude {
         OffsetOpts, Outside, Placement, RepeatOpts, RevolveOpts, RoundOpts, ScaleOpts, ShellOpts, Solid, SphereOpts, Station,
         SuperellipsoidOpts, TaperOpts, TorusOpts, TwistOpts,
     };
-    pub use blaze_cad_picture::{PictureOpts, Projection, RenderMode, Shading, StudioOpts, View};
+    pub use blaze_cad_picture::{
+        MeshNormalSource, MeshPictureOpts, MeshScenePart, PictureOpts, Projection, RenderMode, Shading, StudioOpts, View, Wireframe,
+    };
     pub use blaze_units::{Angle, Area, Density, Length, Mass, Volume};
 
     pub use crate::Shown;
     pub use crate::{
-        AssemblyInterference, ColliderMode, DecimatePartOpts, DecimateStats, Decimated, DraftFace, DraftOpts, Encoding,
-        ExportLodOpts, ExportOpts, ExportStlOpts, Exported, ExportedStl, FitOpts, InterferenceOpts, LodProjection, Material,
+        AssemblyInterference, AssetFidelityPolicy, AssetPreset, AssetReport, BudgetInput, BudgetStatus, ColliderMode,
+        CreaseProfile, CreaseProfileOpts, DecimatePartOpts, DecimateStats, Decimated, DraftFace, DraftOpts, Encoding,
+        ExportLodOpts, ExportOpts, ExportStlOpts, Exported, ExportedPart, ExportedStl, FidelityChecked, FidelityFinding,
+        FidelityMetrics, FidelityOpts, FitOpts, GameAsset, GameAssetOpts, GridSizing, InterferenceOpts, LodProjection, Material,
         MaterialRole, MeshLimits, MeshPartOpts, MinWallOpts, Model, ModelError, ModelOpts, OverhangFace, OverhangOpts, Part,
-        PartId, PartOpts, PieceCache, PieceCacheOpts, RoundEdgesOpts, SectionSvgOpts, StlUnit, Stop, Target, Up, Verdict,
-        assemble, decimate_mesh, draft_angle_check, export_glb, export_section_svg, export_stl, fits_within, gyroid, intersect_all,
-        mass_properties, mesh_part, min_wall, mm3, no_interference, no_interference_assembly, overhang_check, part_tape, picture,
-        picture_studio, placed_tape, round_edges, union_all,
+        PartBudget, PartId, PartOpts, PartReport, PieceCache, PieceCacheOpts, RoundEdgesOpts, SectionSvgOpts, StlUnit, Stop,
+        Target, Topology, TriangleBudget, Up, Verdict, allocate_budgets, assemble, auto_grid, build_game_asset,
+        check_mesh_fidelity, crease_profile, decimate_mesh, draft_angle_check, export_glb, export_section_svg, export_stl,
+        fits_within, gyroid, intersect_all, mass_properties, mesh_part, min_wall, mm3, no_interference, no_interference_assembly,
+        overhang_check, part_tape, picture, picture_exported_scene, picture_mesh, picture_studio, placed_tape, round_edges,
+        topology, union_all,
     };
 }
 
