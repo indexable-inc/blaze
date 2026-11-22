@@ -541,12 +541,51 @@ pub fn is_active() -> bool {
     !ACTIVE_HEADER.load(Ordering::Acquire).is_null()
 }
 
-/// Emits `event` into the active global telemetry ring, if one is installed.
+/// Reads the current hardware CPU core ID and NUMA/cluster flags in userspace (zero allocation).
 #[inline]
-pub fn emit(event: Event) -> bool {
+pub fn current_cpu_and_node() -> (u16, u8) {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn pthread_cpu_number_np(cpu_number_out: *mut libc::size_t) -> libc::c_int;
+        }
+        let mut cpu: libc::size_t = 0;
+        // SAFETY: `cpu` is valid writable stack memory; `pthread_cpu_number_np` reads the userspace commpage.
+        if unsafe { pthread_cpu_number_np(&mut cpu) } == 0 {
+            let core = u16::try_from(cpu).unwrap_or(blaze_launch::telemetry::CPU_UNKNOWN);
+            (core, 0)
+        } else {
+            (blaze_launch::telemetry::CPU_UNKNOWN, 0)
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `sched_getcpu` is a vDSO userspace read on Linux.
+        let cpu = unsafe { libc::sched_getcpu() };
+        if cpu >= 0 {
+            (u16::try_from(cpu).unwrap_or(blaze_launch::telemetry::CPU_UNKNOWN), 0)
+        } else {
+            (blaze_launch::telemetry::CPU_UNKNOWN, 0)
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        (blaze_launch::telemetry::CPU_UNKNOWN, 0)
+    }
+}
+
+/// Emits `event` into the active global telemetry ring, stamping its hardware CPU core + NUMA
+/// node automatically when unset.
+#[inline]
+pub fn emit(mut event: Event) -> bool {
     let Some(ring) = active_ring() else {
         return false;
     };
+    if event.cpu == blaze_launch::telemetry::CPU_UNKNOWN {
+        let (cpu, node) = current_cpu_and_node();
+        event.cpu = cpu;
+        event.flags = node;
+    }
     ring.try_push(event)
 }
 

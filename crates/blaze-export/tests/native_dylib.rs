@@ -245,6 +245,38 @@ fn writes_loadable_shape() {
     );
 }
 
+/// dyld reads `ncmds` load commands and no more: the header's count covers every command up to
+/// `sizeofcmds`, and among them is the `LC_CODE_SIGNATURE` whose blob ends the file, a super
+/// blob whose code directory's limit is the blob's offset. The cause it guards: a hand count one
+/// short left LC_CODE_SIGNATURE (the last command) unread, and every image was refused at
+/// `dlopen` as "missing code signature". Control: the count one less no longer reaches it.
+#[test]
+fn every_command_is_counted_and_the_signature_is_read() {
+    let file = written(&image(false));
+    let (ncmds, sizeofcmds) = (u32_at(&file, 16), u32_at(&file, 20) as usize);
+    let walk = |count: u32| {
+        let (mut at, mut signature) = (32usize, None);
+        for _ in 0..count {
+            let (cmd, size) = (u32_at(&file, at), u32_at(&file, at + 4) as usize);
+            if cmd == 0x1d {
+                signature = Some((u32_at(&file, at + 8) as usize, u32_at(&file, at + 12) as usize));
+            }
+            at += size;
+        }
+        (at, signature)
+    };
+    let (end, signature) = walk(ncmds);
+    assert_eq!(end, 32 + sizeofcmds, "ncmds commands end exactly at sizeofcmds");
+    let (off, size) = signature.expect("LC_CODE_SIGNATURE among the counted commands");
+    assert_eq!(off + size, file.len(), "the signature ends the file");
+    let be = |at: usize| u32::from_be_bytes(file[at..at + 4].try_into().expect("four bytes"));
+    assert_eq!(be(off), 0xFADE_0CC0, "CSMAGIC_EMBEDDED_SIGNATURE at the command's offset");
+    let directory = off + be(off + 16) as usize;
+    assert_eq!(be(directory), 0xFADE_0C02, "the code directory the blob's index names");
+    assert_eq!(be(directory + 32) as usize, off, "codeLimit: every byte before the signature");
+    assert_eq!(walk(ncmds - 1).1, None, "control: one command fewer does not reach the signature");
+}
+
 /// NATIVE.md 3.10: the bytes are a function of the image and the identifier.
 /// Prints: `native_dylib: two writes, <N> equal bytes`
 #[test]

@@ -1294,9 +1294,11 @@ What `run` uses, stated (the owner asked): today the `Reference` tier, crates/bl
 forward pass, every value in a stack cell, no optimization. Copy-and-patch stencils are parked
 and their crate is deleted. The decided fast tier (D97 to D100, backend-next.md) is the
 stencil idea with registers: one analysis pass, one emission pass with a greedy allocator,
-composed from a table of templates that are data. It is not built. It becomes urgent only if
-the profile says test time is generated code (two tempo tests die at the 60 s deadline: sampled
-before anything is built for them).
+composed from a table of templates that are data. CORRECTION (17:40, from the writer who read
+the tree): it IS built (crates/blaze-emit `compose/analysis.rs`, `compose/emit.rs`, `table_gen/`,
+`tier_tests.rs`) and is not the default; what was missing is typed scratch registers (now
+`compose/scratch.rs`), far frames and their templates, and the switch. The switch happens when
+the equality tests and every ladder rung pass at both tiers.
 
 Order. In parallel now, disjoint files: (1) piece 0, the proc-macro program's interface crate and
 its oracle against today's expansions; (2) the rustc probe; (3) the base tool set and hvbox's

@@ -50,6 +50,8 @@ pub mod protocol;
 #[cfg(feature = "runtime")]
 pub mod script;
 #[cfg(feature = "runtime")]
+pub mod script_probes;
+#[cfg(feature = "runtime")]
 pub mod script_sandbox;
 #[cfg(feature = "runtime")]
 pub mod script_unit;

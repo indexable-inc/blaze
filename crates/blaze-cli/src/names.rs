@@ -398,12 +398,12 @@ impl core::fmt::Display for Unwritten {
 /// The record of the crate `crate_name` resolved as `done`; `alloc` is the allocator `done` was
 /// made in (its task's frame), which the link table is written into before its copy into the
 /// payload. `kept` holds findings that leave the worker with the crate's record.
-/// `quiet`: the names the crate calls its failed dependencies by (names/scope.rs
-/// `resolve_metered`), whose paths are counted, not found (plan row A8).
-fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name: &str, quiet: &[&str], alloc: Alloc<'a>, kept: blaze_own::SharedAlloc<'static>) -> Result<ScopeRecord, Unwritten> {
+/// `waits`: what in the crate waits on a failed dependency (names/scope.rs `resolve_metered`,
+/// blaze-scope waits_on.rs); such a path is counted, not found (plan row A8).
+fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name: &str, waits: &blaze_scope::waits_on::WaitsOn<'_, 'a>, alloc: Alloc<'a>, kept: blaze_own::SharedAlloc<'static>) -> Result<ScopeRecord, Unwritten> {
     let unwritten = |section: &'static str, why: std::string::String| Unwritten { crate_name: crate_name.into(), section, why };
     let mut findings = PathFindings::new_in(kept);
-    let unresolved = done.names.notes.len() as u32 + unresolved(done.names, quiet, &mut findings);
+    let unresolved = done.names.notes.len() as u32 + unresolved(done.names, waits, &mut findings);
     // The names and items records, filed in the same record (drive.md, "End state", piece
     // 3): a body is checked by reading them, never by solving the crate graph again.
     // Scratch copied into the payload below: in the task's frame, as the link table is.
@@ -550,12 +550,12 @@ fn find_word(text: &str, word: &str, from: usize) -> Option<usize> {
 
 /// Every `use` and macro path of crate `c` that the resolver refused. The project's own (a
 /// checkout file, `/0/`) are findings in `own`, sorted; the number of the others (a fetched or
-/// toolchain crate's: not the project's to fix) is returned, counted in one note. A path into a
-/// failed dependency (its first segment one of `quiet`, the names the crate calls such crates
-/// by, failing past it) is counted too, never a finding: that crate's failure is reported once,
-/// at it (plan row A8, rule 19).
-fn unresolved(c: &blaze_scope::resolve::CrateNames<'_>, quiet: &[&str], own: &mut PathFindings) -> u32 {
-    use blaze_surface::{PathKind, ScopeError};
+/// toolchain crate's: not the project's to fix) is returned, counted in one note. A path that
+/// waits on a failed dependency (`waits`: written into it, or failing in a scope a glob or
+/// import into it left unknown) is counted too, never a finding: that crate's failure is
+/// reported once, at it (plan row A8, rule 19).
+fn unresolved<'a>(c: &blaze_scope::resolve::CrateNames<'a>, waits: &blaze_scope::waits_on::WaitsOn<'_, 'a>, own: &mut PathFindings) -> u32 {
+    use blaze_surface::ScopeError;
     let project = c.files.iter().any(|file| file.path.starts_with("/0/"));
     let mut elsewhere = 0u32;
     for r in c.done.values() {
@@ -568,7 +568,7 @@ fn unresolved(c: &blaze_scope::resolve::CrateNames<'_>, quiet: &[&str], own: &mu
                 ScopeError::Macro { call, path, segment, why } => (c.tables.calls.get(call).map(|src| src.loc), path, *segment as usize, *why),
                 _ => continue,
             };
-            let into_failed = segment > 0 && matches!(path.kind, PathKind::Plain | PathKind::Abs) && path.segments.first().is_some_and(|first| quiet.contains(first));
+            let into_failed = waits.waits_on(r.scope.module, error).is_some();
             if !project || into_failed {
                 elsewhere += 1;
                 continue;

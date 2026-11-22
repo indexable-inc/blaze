@@ -112,20 +112,23 @@ struct Born {
     birth: Birth,
     start: extern "C" fn(*mut c_void) -> *mut c_void,
     arg: *mut c_void,
+    parent_tid: u32,
+    spawn_frames: [u64; 3],
 }
 
 /// The new thread's first function: begins as a mutator, then runs the program's.
 extern "C" fn run(born: *mut c_void) -> *mut c_void {
     // SAFETY: `born` is the `Born` `create` boxed for exactly this thread.
-    let Born { birth, start, arg } = *unsafe { Box::from_raw(born.cast::<Born>()) };
+    let Born { birth, start, arg, parent_tid, spawn_frames } = *unsafe { Box::from_raw(born.cast::<Born>()) };
     let me = birth.begin();
     // Registered with the sampler (its port or CPU timer, its stack bounds) before a byte of the
     // program runs on this thread.
     let sampled = crate::sample::register::enter(me.thread().0);
-    let _ = crate::telemetry::emit(crate::telemetry::Event::thread_lifecycle(
+    let _ = crate::telemetry::emit(crate::telemetry::Event::thread_birth(
         crate::telemetry::current_thread_id(),
-        true,
         crate::telemetry::now_ns(),
+        parent_tid,
+        spawn_frames,
     ));
     // alloc: one `Ending` a thread, freed by the key's destructor as the thread ends.
     let ending = Box::into_raw(Box::new(Ending { me, rounds: 0, sampled }));
@@ -162,7 +165,9 @@ pub unsafe extern "C" fn create(
         Arc::from_raw(shared.cast_const())
     };
     // alloc: what the new thread begins with, freed by it.
-    let born = Box::into_raw(Box::new(Born { birth: shared.birth(), start, arg }));
+    let parent_tid = crate::telemetry::current_thread_id();
+    let spawn_frames = crate::telemetry::capture_caller_frames(1);
+    let born = Box::into_raw(Box::new(Born { birth: shared.birth(), start, arg, parent_tid, spawn_frames }));
     #[cfg(target_os = "macos")]
     // SAFETY: thread is writable and attr is null or initialized, as guaranteed by the caller.
     // The macOS pointers name the same pthread ABI types, and run takes ownership of the box.

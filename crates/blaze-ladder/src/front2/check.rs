@@ -19,7 +19,7 @@ use blaze_scope::resolve::Names;
 use blaze_typeck as tc;
 use blaze_typeck::{BodyView, InferCtx, ItemKey, Name, Needs, Outcome, Question};
 
-use super::buckets::{Ask, Buckets, Seen, TablesReadError, Unfilled, inherent_home, prepare_coherence, trait_home};
+use super::buckets::{AdmitError, Ask, Buckets, ImplQuestionError, Seen, TablesReadError, Unfilled, inherent_home, prepare_coherence, trait_home};
 use super::heads::{HeadError, Store, Want};
 use super::index::Index;
 use super::keys::{Keys, Origin, checker_of};
@@ -63,8 +63,12 @@ pub enum CheckFail {
     /// The store could not make a record.
     Head { owner: ItemKey, error: HeadError },
     Buckets { owner: ItemKey, error: Unfilled },
-    /// The impl tables ([`NamesSource::impl_tables`]) could not file a question's impls.
+    /// The impl tables ([`NamesSource::impl_tables`]) could not file a question's impls: the
+    /// tables' own fault, which every question reading them meets (a run's stop).
     Tables { owner: ItemKey, error: TablesReadError },
+    /// One impl question could not be asked (its trait or self type has no library key, or its
+    /// shape no row shape): this body's refusal; every other question still answers.
+    ImplQuestion { owner: ItemKey, error: ImplQuestionError },
     /// The body is malformed or a bound of the checker passed.
     Check { owner: ItemKey, error: tc::CheckError },
     /// The check finished with diagnostics: the program's errors in the body, each by its
@@ -106,6 +110,7 @@ impl core::fmt::Display for CheckFail {
             CheckFail::Head { owner, error } => write!(f, "checking {owner:?}: {error}"),
             CheckFail::Buckets { owner, error } => write!(f, "checking {owner:?}: {error}"),
             CheckFail::Tables { owner, error } => write!(f, "checking {owner:?}: {error}"),
+            CheckFail::ImplQuestion { owner, error } => write!(f, "checking {owner:?}: {error}"),
             CheckFail::Check { owner, error } => write!(f, "checking {owner:?}: {error:?}"),
             CheckFail::Diags { owner, diags, filed } => {
                 write!(f, "checking {owner:?}: {} diagnostics", diags.len())?;
@@ -1681,7 +1686,17 @@ pub(super) enum MakeFail {
     Head(HeadError),
     Buckets(Unfilled),
     Tables(TablesReadError),
+    Question(ImplQuestionError),
     Const(LibKey, ConstFail),
+}
+
+impl From<AdmitError> for MakeFail {
+    fn from(error: AdmitError) -> MakeFail {
+        match error {
+            AdmitError::Tables(error) => MakeFail::Tables(error),
+            AdmitError::Question(error) => MakeFail::Question(error),
+        }
+    }
 }
 
 impl MakeFail {
@@ -1690,6 +1705,7 @@ impl MakeFail {
             MakeFail::Head(error) => CheckFail::Head { owner, error },
             MakeFail::Buckets(error) => CheckFail::Buckets { owner, error },
             MakeFail::Tables(error) => CheckFail::Tables { owner, error },
+            MakeFail::Question(error) => CheckFail::ImplQuestion { owner, error },
             MakeFail::Const(key, error) => CheckFail::Const { owner, key, shown: lib_shown(r, key), error: Box::new_in(error, Global) },
         }
     }
@@ -2003,7 +2019,7 @@ pub(super) fn trait_question<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S,
     // Only impls written where the orphan rules allow (`trait_home`) are candidates.
     let home = trait_home(names, heads.keys(), heads.store(), trait_, shape).map_err(MakeFail::Head)?;
     // Over a bucket index: this question's buckets of the crates `home` admits.
-    b.admit_shared(names, heads.keys(), home, ask, heads.store().tys.alloc()).map_err(MakeFail::Tables)?;
+    b.admit_shared(names, heads.keys(), home, ask, heads.store().tys.alloc()).map_err(MakeFail::from)?;
     // And only impls of the crates the asking body sees (`Seen`): none of a crate downstream
     // of a checked body's, whose headers are then never made for it either.
     let sight = b.sight(names, seen, heads.store().tys.alloc()).map_err(|why| MakeFail::Buckets(Unfilled::Sight(why)))?;
@@ -2031,7 +2047,7 @@ pub(super) fn inherent_question<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names:
     let _cost = super::tables::cost::Cost::enter(heads.store().cost, super::tables::cost::Part::Impls);
     // Only impls written in the type's own crate (`inherent_home`) are candidates.
     let home = inherent_home(names, heads.keys(), heads.store(), shape).map_err(MakeFail::Head)?;
-    b.admit_shared(names, heads.keys(), home, ask, heads.store().tys.alloc()).map_err(MakeFail::Tables)?;
+    b.admit_shared(names, heads.keys(), home, ask, heads.store().tys.alloc()).map_err(MakeFail::from)?;
     // The name filters first, from the impls' member rows (no header made): an impl
     // that declares no member of the name is never the answer, so its header is not
     // lowered for it. rustc finds an inherent item by name before it unifies self

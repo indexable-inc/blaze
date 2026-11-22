@@ -114,12 +114,15 @@ mod op {
     pub const SET_RAN: [u8; 2] = [0x24, 1];
     pub const GROW: [u8; 2] = [0x40, 0];
     pub const EQ: u8 = 0x46;
+    pub const NE: u8 = 0x47;
 }
 
 /// The imports, in function-index order.
 const OUTPUT: u32 = 0;
 const ENV_VAR: u32 = 1;
 const PATH_OPEN: u32 = 2;
+/// The first of [`wasm_importing`]'s extra imports.
+const FIRST_EXTRA: u32 = 3;
 
 fn section(id: u8, body: &[u8], out: &mut Vec<u8>) {
     out.push(id);
@@ -137,17 +140,25 @@ fn name(text: &str, out: &mut Vec<u8>) {
 /// 1 at address 16. The names to open sit at 32 (`FOO`), 48 (`BAR`), 64 (`package/a.txt`),
 /// 96 (`package/b.txt`) and 128 (`etc/passwd`).
 fn wasm(body: &[u8]) -> Vec<u8> {
+    wasm_importing(body, &[])
+}
+
+/// [`wasm`] with more `wasi_snapshot_preview1` imports after `path_open`, each `(i32 x3) ->
+/// i32` (`path_unlink_file`'s type): the first is function 3 ([`FIRST_EXTRA`]), and the
+/// module's own functions come after them.
+fn wasm_importing(body: &[u8], extra: &[&str]) -> Vec<u8> {
     const I32: u8 = 0x7f;
     const I64: u8 = 0x7e;
     let mut out = b"\0asm\x01\0\0\0".to_vec();
     // Types: 0 output (i32 i32), 1 env_var and expand (i32 x4) -> i32, 2 path_open,
-    // 3 () -> (), 4 (i32) -> i32.
-    let types: [(&[u8], &[u8]); 5] = [
+    // 3 () -> (), 4 (i32) -> i32, 5 (i32 x3) -> i32.
+    let types: [(&[u8], &[u8]); 6] = [
         (&[I32, I32], &[]),
         (&[I32, I32, I32, I32], &[I32]),
         (&[I32, I32, I32, I32, I32, I64, I64, I32, I32], &[I32]),
         (&[], &[]),
         (&[I32], &[I32]),
+        (&[I32, I32, I32], &[I32]),
     ];
     let mut s = vec![types.len() as u8];
     for (params, results) in types {
@@ -158,20 +169,23 @@ fn wasm(body: &[u8]) -> Vec<u8> {
         s.extend_from_slice(results);
     }
     section(1, &s, &mut out);
-    let mut s = vec![3];
-    for (module, field, ty) in [("blaze_proc_macro", "output", 0), ("blaze_proc_macro", "env_var", 1), ("wasi_snapshot_preview1", "path_open", 2)] {
+    let imports = [("blaze_proc_macro", "output", 0), ("blaze_proc_macro", "env_var", 1), ("wasi_snapshot_preview1", "path_open", 2)];
+    let mut s = vec![(imports.len() + extra.len()) as u8];
+    for (module, field, ty) in imports.into_iter().chain(extra.iter().map(|field| ("wasi_snapshot_preview1", *field, 5))) {
         name(module, &mut s);
         name(field, &mut s);
         s.extend_from_slice(&[0x00, ty]);
     }
     section(2, &s, &mut out);
-    // Functions 3 `_initialize`, 4 `blaze_proc_macro_alloc`, 5 `blaze_proc_macro_expand`.
+    // Functions 3 `_initialize`, 4 `blaze_proc_macro_alloc`, 5 `blaze_proc_macro_expand`,
+    // each after the extra imports.
+    let own = FIRST_EXTRA as u8 + extra.len() as u8;
     section(3, &[3, 3, 4, 1], &mut out);
     section(5, &[1, 0x00, 1], &mut out);
     // Globals: 0 `decls` = 0; 1 `ran`, mutable, = 0.
     section(6, &[2, I32, 0, 0x41, 0, op::END, I32, 1, 0x41, 0, op::END], &mut out);
     let mut s = vec![5];
-    for (field, kind, index) in [("memory", 2u8, 0u8), ("decls", 3, 0), ("_initialize", 0, 3), ("blaze_proc_macro_alloc", 0, 4), ("blaze_proc_macro_expand", 0, 5)] {
+    for (field, kind, index) in [("memory", 2u8, 0u8), ("decls", 3, 0), ("_initialize", 0, own), ("blaze_proc_macro_alloc", 0, own + 1), ("blaze_proc_macro_expand", 0, own + 2)] {
         name(field, &mut s);
         s.extend_from_slice(&[kind, index]);
     }
@@ -659,6 +673,74 @@ fn control_a_reused_instance_is_caught() {
     let expand = instance.get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "blaze_proc_macro_expand").expect("the export");
     assert!(expand.call(&mut store, (0, 0, 0, 0)).is_ok(), "a clean instance runs");
     assert!(expand.call(&mut store, (0, 0, 0, 0)).is_err(), "a reused instance must trap, or the fresh-instance test proves nothing");
+}
+
+/// The whole of WASI preview 1 (`wasi_snapshot_preview1.witx`), by name.
+const PREVIEW1: [&str; 46] = [
+    "args_get", "args_sizes_get", "environ_get", "environ_sizes_get", "clock_res_get", "clock_time_get",
+    "fd_advise", "fd_allocate", "fd_close", "fd_datasync", "fd_fdstat_get", "fd_fdstat_set_flags",
+    "fd_fdstat_set_rights", "fd_filestat_get", "fd_filestat_set_size", "fd_filestat_set_times", "fd_pread",
+    "fd_prestat_get", "fd_prestat_dir_name", "fd_pwrite", "fd_read", "fd_readdir", "fd_renumber", "fd_seek",
+    "fd_sync", "fd_tell", "fd_write", "path_create_directory", "path_filestat_get", "path_filestat_set_times",
+    "path_link", "path_open", "path_readlink", "path_remove_directory", "path_rename", "path_symlink",
+    "path_unlink_file", "poll_oneoff", "proc_exit", "proc_raise", "sched_yield", "random_get", "sock_accept",
+    "sock_recv", "sock_send", "sock_shutdown",
+];
+
+/// Every preview 1 call is defined for a proc macro once: served (blaze-wasi), refused or
+/// unserved (host.rs), so no import of preview 1 fails a module's load.
+#[test]
+fn the_proc_macro_host_defines_all_of_wasi_preview1_once() {
+    let served = blaze_wasi::FUNCTIONS;
+    let (refused, unserved) = (crate::host::REFUSED_WASI, crate::host::UNSERVED_WASI);
+    let mut defined: Vec<&str> = served.iter().chain(refused).chain(unserved).copied().collect();
+    defined.sort_unstable();
+    let mut all = PREVIEW1.to_vec();
+    all.sort_unstable();
+    assert_eq!(defined, all, "served {served:?}, refused {refused:?}, unserved {unserved:?}");
+}
+
+/// What a module of one macro gives, made of `body` with the extra WASI imports `extra`, its
+/// wasm in the folder `name`: its load's error, or its call's.
+fn expand_importing(name: &str, body: &[u8], extra: &[&str]) -> Result<(), String> {
+    let runtime = Runtime::new(blaze_own::testing::heap()).expect("the runtime");
+    let module = module_in(&folder(name), wasm_importing(body, extra), 1);
+    let loaded = runtime.load(&module).map_err(|e| format!("load: {e}"))?;
+    let input = lex("struct A;", EDITION, Alloc::global()).expect("the input lexes");
+    let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok(CALL_FILE_SHOWN) };
+    runtime.expand(&loaded, &module.macros[0], &call, EDITION, package(&folder(&format!("{name}-pkg")), &[]), Limits::STANDARD, Alloc::global()).map(drop).map_err(|e| format!("call: {e}"))
+}
+
+/// Calls the first extra import as `path_unlink_file(3, "package/a.txt")` and traps unless it
+/// answered `errno`.
+fn unlink_answers(errno: i64) -> Vec<u8> {
+    let mut body = Vec::new();
+    for arg in [3, 64, 13] {
+        body.extend(op::i32(arg));
+    }
+    body.extend(op::call(FIRST_EXTRA));
+    body.extend(op::i32(errno));
+    body.push(op::NE);
+    body.extend(op::IF);
+    body.push(op::UNREACHABLE);
+    body.push(op::END);
+    body
+}
+
+/// Reduced from napi-derive 3.5.2 (turso, 2026-11-21: "unknown import:
+/// wasi_snapshot_preview1::path_unlink_file has not been defined", 32 errors): a module that
+/// imports `path_unlink_file` loads and expands, and a call of it answers `EPERM` (63), the
+/// sandbox giving a proc macro no writable file system (rule 9). The twin: the call checked
+/// against success (0) traps, so the errno check runs. CONTROL (rule 23): a module importing a
+/// call no host defines still fails its load, naming it, so the load is what was checked.
+#[test]
+fn a_module_importing_path_unlink_file_loads_and_a_call_answers_eperm() {
+    assert_eq!(expand_importing("unlink-linked", &[], &["path_unlink_file"]), Ok(()), "linked, never called");
+    assert_eq!(expand_importing("unlink-called", &unlink_answers(63), &["path_unlink_file"]), Ok(()), "called: EPERM");
+    let twin = expand_importing("unlink-success", &unlink_answers(0), &["path_unlink_file"]);
+    assert!(twin.as_ref().is_err_and(|e| e.starts_with("call: ")), "a call checked against success must trap: {twin:?}");
+    let control = expand_importing("unlink-unknown", &[], &["path_unlink_files"]);
+    assert!(control.as_ref().is_err_and(|e| e.starts_with("load: ") && e.contains("path_unlink_files")), "{control:?}");
 }
 
 /// A module that traps (`unreachable`) is a typed failure naming the crate and the macro, and,

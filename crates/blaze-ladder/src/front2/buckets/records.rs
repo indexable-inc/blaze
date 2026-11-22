@@ -526,14 +526,14 @@ const FLOAT_WIDTHS: [FloatWidth; 4] = [FloatWidth::F16, FloatWidth::F32, FloatWi
 /// name where the shape has no row shape: a nominal type whose library key the key map and the
 /// records do not give, or a shape blaze-surface refuses. Never an empty answer in its place:
 /// a question that reads no bucket answers "no impl", which is not what is known (D193 point 5).
-fn asked_shapes<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> Result<Vec<SelfShape, Global>, TablesReadError> {
+fn asked_shapes<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> Result<Vec<SelfShape, Global>, ImplQuestionError> {
     let mut out: Vec<SelfShape, Global> = Vec::new_in(Global);
     let lib = |k: ItemKey| keys.library_in(names, k);
-    let mut put = |s: Shape| -> Result<(), TablesReadError> {
+    let mut put = |s: Shape| -> Result<(), ImplQuestionError> {
         let written = self_shape(s, &lib).map_err(|why| match why {
-            Unwritten::Lib(key) => TablesReadError::NoLibraryKey { of: "the nominal type an impl question is about", key },
-            Unwritten::Shape => TablesReadError::AskedShape { shape: s },
-            Unwritten::Refused(error) => TablesReadError::AskedShapeRefused { shape: s, error },
+            Unwritten::Lib(key) => ImplQuestionError::NoLibraryKey { of: "the nominal type an impl question is about", key },
+            Unwritten::Shape => ImplQuestionError::AskedShape { shape: s },
+            Unwritten::Refused(error) => ImplQuestionError::AskedShapeRefused { shape: s, error },
         })?;
         out.push(written);
         Ok(())
@@ -571,7 +571,10 @@ impl fmt::Display for NoTables {
     }
 }
 
-/// Why a question could not be filed from the impl tables.
+/// Why a question could not be filed from the impl tables: a fault of the TABLES (or of the
+/// crate list they are asked over), so every question that reads them meets it; a run stops
+/// on it (blaze-cli test_drive.rs `front_stops_suite`). A fault of one question is an
+/// [`ImplQuestionError`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TablesReadError {
     Lookup(ImplLookupError<NoTables>),
@@ -580,15 +583,9 @@ pub enum TablesReadError {
     /// A row of a crate the question did not ask.
     Crate { impl_: LibKey },
     /// A crate the question's home admits has no key in the source, so its tables cannot be
-    /// asked: its impls are unknown, never none (D193 point 5).
+    /// asked: its impls are unknown, never none (D193 point 5). Over the records the key is
+    /// the crate list's, so this is a crate index past the list: the engine's fault.
     NoCrateKey { krate: usize },
-    /// The question names `key` (`of` says what it is), and the key map and the records give
-    /// no library key for it, so no bucket of it can be asked.
-    NoLibraryKey { of: &'static str, key: ItemKey },
-    /// The question's shape has no row shape ([`self_shape`]).
-    AskedShape { shape: Shape },
-    /// blaze-surface refused the question's shape as a row shape.
-    AskedShapeRefused { shape: Shape, error: surface::ShapeError },
 }
 
 impl fmt::Display for TablesReadError {
@@ -598,14 +595,69 @@ impl fmt::Display for TablesReadError {
             TablesReadError::Shape { impl_, shape } => write!(f, "the impl table row of {impl_:x} is at {shape:?}, which no table writer writes"),
             TablesReadError::Crate { impl_ } => write!(f, "the impl table row of {impl_:x} is of no crate the question asked"),
             TablesReadError::NoCrateKey { krate } => write!(f, "crate {krate} may hold impls of the question, and the source names no key for it, so its impl tables cannot be asked"),
-            TablesReadError::NoLibraryKey { of, key } => write!(f, "{of} ({:x}) has no library key in the key map or the records, so no impl table of it can be asked", key.0),
-            TablesReadError::AskedShape { shape } => write!(f, "an impl question at {shape:?}, a shape no impl table row is written at"),
-            TablesReadError::AskedShapeRefused { shape, error } => write!(f, "an impl question at {shape:?}, which is no impl table row shape: {error}"),
         }
     }
 }
 
 impl core::error::Error for TablesReadError {}
+
+/// Why ONE impl question could not be asked, of the impl tables or of the bucket index: a fault
+/// of that question's trait or self type, never of the tables, which answer every other
+/// question. The body that asked it is refused by name (`CheckFail::ImplQuestion`: that test's
+/// NOT RUN), never answered "no impl" (D193 point 5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImplQuestionError {
+    /// The question names `key` (`of` says what it is), and the key map and the records give
+    /// no library key for it, so no bucket of it can be asked.
+    NoLibraryKey { of: &'static str, key: ItemKey },
+    /// The question's shape has no row shape ([`self_shape`]).
+    AskedShape { shape: Shape },
+    /// blaze-surface refused the question's shape as a row shape.
+    AskedShapeRefused { shape: Shape, error: surface::ShapeError },
+}
+
+impl fmt::Display for ImplQuestionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ImplQuestionError::NoLibraryKey { of, key } => write!(f, "{of} ({:x}) has no library key in the key map or the records, so no impl of it can be asked for", key.0),
+            ImplQuestionError::AskedShape { shape } => write!(f, "an impl question at {shape:?}, a shape no impl table row is written at"),
+            ImplQuestionError::AskedShapeRefused { shape, error } => write!(f, "an impl question at {shape:?}, which is no impl table row shape: {error}"),
+        }
+    }
+}
+
+impl core::error::Error for ImplQuestionError {}
+
+/// Why a question's impls could not be filed ([`BucketSource::admit`]): the tables' fault or the
+/// question's, kept apart so a run can tell the suite's stop from one test's NOT RUN.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdmitError {
+    Tables(TablesReadError),
+    Question(ImplQuestionError),
+}
+
+impl From<TablesReadError> for AdmitError {
+    fn from(error: TablesReadError) -> AdmitError {
+        AdmitError::Tables(error)
+    }
+}
+
+impl From<ImplQuestionError> for AdmitError {
+    fn from(error: ImplQuestionError) -> AdmitError {
+        AdmitError::Question(error)
+    }
+}
+
+impl fmt::Display for AdmitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AdmitError::Tables(error) => write!(f, "{error}"),
+            AdmitError::Question(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl core::error::Error for AdmitError {}
 
 /// Every crate's impl tables of one request, made ONCE by the Heads stage's tasks and read in
 /// place by every body on every worker (engine.md, "The design" 1): each record's bytes held in
@@ -1259,7 +1311,7 @@ impl BucketIndex {
     /// `tables` (module docs): the crates `home` admits, as [`Buckets::admit_asked`] chooses
     /// them, each asked through blaze-impls' lookups at every shape `ask`'s stands for. A
     /// question asked before is not asked again. Returns how many rows this call filed.
-    pub fn admit_tables<'n, S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, home: Homes, ask: Ask, tables: &TableSet<'_>, alloc: Alloc<'static>) -> Result<usize, TablesReadError> {
+    pub fn admit_tables<'n, S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, home: Homes, ask: Ask, tables: &TableSet<'_>, alloc: Alloc<'static>) -> Result<usize, AdmitError> {
         let asked = match ask {
             Ask::Trait(t, shape) => self.indexed.trait_reads.contains_key(&(t, shape)),
             Ask::Inherent(shape) => self.indexed.inherent_reads.contains_key(&shape),
@@ -1289,7 +1341,7 @@ impl BucketIndex {
         // a names-log gap and `Ok(0)`, so the body went on to that wrong answer.
         let shapes = asked_shapes(names, keys, shape)?;
         let lib_trait = match trait_ {
-            Some(t) => Some(keys.library_in(names, t).ok_or(TablesReadError::NoLibraryKey { of: "the trait an impl question is about", key: t })?),
+            Some(t) => Some(keys.library_in(names, t).ok_or(ImplQuestionError::NoLibraryKey { of: "the trait an impl question is about", key: t })?),
             None => None,
         };
         // The crates asked, in index order: those `home` admits that the program links.
@@ -1398,7 +1450,7 @@ impl BucketIndex {
 /// tables stand behind (rule 78), each tested equal (tests/front2_buckets_order.rs).
 pub trait BucketSource {
     /// Files what `ask` at `home` can be answered from; how many impls it filed.
-    fn admit<'n, S: NamesSource<'n>>(&self, b: &mut Buckets, names: S, keys: &Keys, home: Homes, ask: Ask, alloc: Alloc<'static>) -> Result<usize, TablesReadError>;
+    fn admit<'n, S: NamesSource<'n>>(&self, b: &mut Buckets, names: S, keys: &Keys, home: Homes, ask: Ask, alloc: Alloc<'static>) -> Result<usize, AdmitError>;
 }
 
 /// Today's index: whole crates by their rows ([`Buckets::admit`]), else the items records'
@@ -1406,14 +1458,14 @@ pub trait BucketSource {
 pub struct ItemsIndex;
 
 impl BucketSource for ItemsIndex {
-    fn admit<'n, S: NamesSource<'n>>(&self, b: &mut Buckets, names: S, keys: &Keys, home: Homes, ask: Ask, _alloc: Alloc<'static>) -> Result<usize, TablesReadError> {
+    fn admit<'n, S: NamesSource<'n>>(&self, b: &mut Buckets, names: S, keys: &Keys, home: Homes, ask: Ask, _alloc: Alloc<'static>) -> Result<usize, AdmitError> {
         let whole = b.admit(names, home);
         Ok(whole + b.admit_asked(names, keys, home, ask)?)
     }
 }
 
 impl BucketSource for TableSet<'_> {
-    fn admit<'n, S: NamesSource<'n>>(&self, b: &mut Buckets, names: S, keys: &Keys, home: Homes, ask: Ask, alloc: Alloc<'static>) -> Result<usize, TablesReadError> {
+    fn admit<'n, S: NamesSource<'n>>(&self, b: &mut Buckets, names: S, keys: &Keys, home: Homes, ask: Ask, alloc: Alloc<'static>) -> Result<usize, AdmitError> {
         b.admit_tables(names, keys, home, ask, self, alloc)
     }
 }

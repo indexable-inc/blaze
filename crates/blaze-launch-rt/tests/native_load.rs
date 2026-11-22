@@ -261,7 +261,12 @@ fn a_dlopen_refusal_names_the_unbound_symbol() {
     assert_eq!(unresolved("/h/r/5c5c: undefined symbol: missing_fn"), linux);
     assert_eq!(
         unresolved("dlopen(/h/r/5c5c, 0x0006): tried: '/h/r/5c5c' (not a mach-o file)"),
-        NativeError::Refused { record: LIBRARY, said: CName::new("tried: '/h/r/5c5c' (not a mach-o file)") }
+        NativeError::Refused { record: LIBRARY, said: native_lib::Said::new("tried: '/h/r/5c5c' (not a mach-o file)") }
     );
+    // dyld's real refusal is longer than a C name's 96 bytes: its cause is printed whole.
+    let path = "/Users/someone/.blaze/v2/run/records/80b46309f3e6d1c2a4b5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b";
+    let long = format!("dlopen({path}, 0x0006): tried: '{path}' (missing code signature in <454250A3-0000-0000-0000-000000000000> '{path}')");
+    let shown = format!("{}", native_lib::open_refused(LIBRARY, &long));
+    assert!(shown.contains("missing code signature"), "the refusal's cause is cut: {shown}");
     println!("native_load: dlopen's words typed: Unresolved `_missing_fn` (dyld, both forms, and ld.so); other words Refused");
 }

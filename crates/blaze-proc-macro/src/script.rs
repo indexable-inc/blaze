@@ -361,7 +361,12 @@ impl ScriptRuntime {
         let inputs = KeyInputs {
             module: loaded.sha256,
             env,
-            answers: Table { rows: &script.table }.id(),
+            // The checker's identity when it answers the probes (script_probes.rs), else the
+            // pinned table's: what the run's probe answers are a function of (rule 21).
+            answers: match &script.probes {
+                Some(probes) => probes.id().0,
+                None => Table { rows: &script.table }.id(),
+            },
             c_mode: script.c_mode,
             limits: script.limits,
             runner: RunnerKey::Wasm,

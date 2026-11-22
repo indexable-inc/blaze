@@ -935,6 +935,10 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
             Side::Target => &shared.table,
             Side::Macro => &shared.macro_table,
         }),
+        // The probe checker (blaze-proc-macro script_probes.rs) is off: the pinned table
+        // answers until the engine's checker has answered the real probes' ladder
+        // (handoff p1-probe-checker.txt).
+        probes: None,
         c_mode: C_MODE,
         mode: MODE,
         native,

@@ -41,6 +41,9 @@ pub struct Setting<'s> {
     pub host: &'s str,
     /// The probe table's rows (`probe::pinned_rows`).
     pub table: Arc<Vec<Row>>,
+    /// The probe checker and its records when the command's setting turns it on
+    /// (script_probes.rs); `None`: the table answers the probes.
+    pub probes: Option<crate::script_probes::ScriptProbes>,
     pub c_mode: CMode,
     /// What the command asked for: with each script's closure, where it runs (D69 (3),
     /// [`crate::native_unit::placed`]).
@@ -339,6 +342,7 @@ pub fn prepare_viewing_on<'a>(
         c_mode: setting.c_mode,
         limits: RunLimits::STANDARD,
         table: Arc::clone(&setting.table),
+        probes: setting.probes.clone(),
         spawner: None,
         step: blaze_ids::ContentId::default(),
         spawn_setting: Arc::clone(&setting.spawn_setting),

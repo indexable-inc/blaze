@@ -89,8 +89,41 @@ pub enum NativeError {
     /// `dlopen` refused `record` because `symbol`, an import of its C, is defined by none of
     /// the libraries it loads (`RTLD_NOW` binds every import at the load; [`open_refused`]).
     Unresolved { record: RecordId, symbol: CName },
-    /// `dlopen` refused `record` for another reason: `said` is dlerror's words after the path.
-    Refused { record: RecordId, said: CName },
+    /// `dlopen` refused `record` for another reason: `said` is dlerror's words after the path,
+    /// whole (rule 19: dyld's "tried: '<path>' (missing code signature in <uuid> '<path>'), ..."
+    /// names the cause only past its first hundred bytes).
+    Refused { record: RecordId, said: Said },
+}
+
+/// The loader's words, kept whole up to [`SAID_MOST`] bytes (a C name's [`CName::MOST`] cut
+/// dyld's refusal to its path): a longer text is cut at a character boundary and printed with
+/// `...`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Said {
+    bytes: [u8; SAID_MOST],
+    len: u16,
+    cut: bool,
+}
+
+impl Said {
+    /// `text`'s first [`SAID_MOST`] bytes, cut back to a character boundary.
+    pub fn new(text: &str) -> Said {
+        let mut len = text.len().min(SAID_MOST);
+        while !text.is_char_boundary(len) {
+            len -= 1;
+        }
+        let mut bytes = [0u8; SAID_MOST];
+        bytes[..len].copy_from_slice(&text.as_bytes()[..len]);
+        Said { bytes, len: len as u16, cut: len < text.len() }
+    }
+}
+
+impl fmt::Display for Said {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The bytes are a prefix of a `&str` cut at a character boundary (`Said::new`).
+        let text = core::str::from_utf8(&self.bytes[..usize::from(self.len)]).map_err(|_| fmt::Error)?;
+        write!(f, "`{text}{}`", if self.cut { "..." } else { "" })
+    }
 }
 
 /// The typed refusal of a `dlopen` of `record` from dyld's (or ld.so's) `said` text: the name
@@ -104,7 +137,7 @@ pub fn open_refused(record: RecordId, said: &str) -> NativeError {
         }
     }
     let words = said.split_once("): ").map_or(said, |(_, words)| words);
-    NativeError::Refused { record, said: CName::new(words) }
+    NativeError::Refused { record, said: Said::new(words) }
 }
 
 impl fmt::Display for NativeError {

@@ -791,6 +791,11 @@ pub fn check_fail_class<'n, S: NamesSource<'n>>(names: S, keys: &Keys, e: &super
             super::buckets::Unfilled::Sight(why) => format!("{why}"),
         },
         CheckFail::Tables { error, .. } => format!("the impl tables could not file a question's impls: {error}"),
+        // By path, never the key (one cause of many bodies is one line).
+        CheckFail::ImplQuestion { error, .. } => match error {
+            super::buckets::ImplQuestionError::NoLibraryKey { of, key } => format!("{of}, {}, has no library key, so no impl of it can be asked for", path(*key)),
+            other => format!("an impl question could not be asked: {other}"),
+        },
         CheckFail::Check { error, .. } => format!("the checker stopped: {}", check_error_class(&path, error)),
         CheckFail::Diags { .. } => String::from("the check found errors"),
         CheckFail::Rounds { last, .. } => match last.first() {

@@ -766,6 +766,11 @@ pub(crate) struct Job<'a> {
     /// Whether the command runs any lint rule (`Facts::lints`): then the file's outline
     /// lists its lint units as parts (lints.rs `parts_in`). In the `FileItems` kind's tool.
     pub(crate) lints: bool,
+    /// Whether the outline plans the `mod NAME;` a macro call's tokens hold ([`macro_module_files`]):
+    /// always, but in the control that removes the cause (engine_check.rs
+    /// `without_macro_mods`, engine_macro_mods_tests.rs).
+    #[cfg(test)]
+    pub(crate) macro_mods: bool,
 }
 
 /// A file's outline as its `FileItems` record, worked in `scratch` and built in `into`: the
@@ -827,8 +832,8 @@ pub(crate) fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, 
                     ItemDetail::Mod { inline: false, path: attr } => {
                         let Some(name) = item.name else { continue };
                         let child = match attr {
-                            None => module_file(path, owns_dir, text, &outline, item, Segment::Slot(item.text(text, name)), scratch),
-                            Some(attr) => module_file(path, owns_dir, text, &outline, item, Segment::Attr(item.text(text, attr)), scratch),
+                            None => module_file(path, owns_dir, text, &outline, item, &[], Segment::Slot(item.text(text, name)), scratch),
+                            Some(attr) => module_file(path, owns_dir, text, &outline, item, &[], Segment::Attr(item.text(text, attr)), scratch),
                         };
                         // A `#[path]` names its file: it alone is opened, with no `x/mod.rs` beside it.
                         (child, attr.is_none())
@@ -855,6 +860,35 @@ pub(crate) fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, 
                 let at = path_bytes.len() as u32;
                 path_bytes.extend_from_slice(&child);
                 paths.push((Name::file(&child), at, path_bytes.len() as u32, slot));
+            }
+            // Each `mod NAME;` written LITERALLY in the tokens of an item-position macro call
+            // (blaze-file-items macro_mods.rs): a module the call's expansion may declare, in the
+            // module the call stands in (rustc_expand module.rs `mod_file_path` from the
+            // expansion's module dir; blaze-scope resolve.rs `make_modules`), so its file is
+            // planned as the `mod` written there would be. turso_core's `core/io/mod.rs`:
+            // `cfg_block! { #[cfg(..unix..)] { mod unix; .. } }` stopped `check` on
+            // `core/io/unix.rs`, read by the names and never outlined (2026-11-21). A superset:
+            // every cfg arm, each slot a probe and a file there one outline (the module docs
+            // say what an unread one costs). A path this text cannot name (a `#[path]` out of
+            // the checkout) or one already a part plans nothing more: the names step, which
+            // alone knows what the expansion wrote, names a read the plan missed (engine_names.rs
+            // `finish`, `UnseenFile`), so nothing is dropped quietly.
+            #[cfg(test)]
+            let planned = job.macro_mods;
+            #[cfg(not(test))]
+            let planned = true;
+            if planned {
+                macro_module_files(path, owns_dir, text, &outline, erased.handle(), scratch, &mut |child, slot, place| {
+                    let name = Name::file(&child);
+                    // One part a file: a `mod` the file also writes plainly, or one in two arms.
+                    if parts.iter().any(|part: &Part| part.name == name) {
+                        return;
+                    }
+                    parts.push(Part { name, locate: Locate::File { edition: job.edition }, place });
+                    let at = path_bytes.len() as u32;
+                    path_bytes.extend_from_slice(&child);
+                    paths.push((name, at, path_bytes.len() as u32, slot));
+                });
             }
             // Each file a literal `include_str!` / `include_bytes!` of this text reads (core's:
             // "located relative to the current file"), and each a literal `include!` in a body
@@ -1153,12 +1187,19 @@ enum Segment<'t> {
 /// enclosing modules make. A slot answers `name.rs`: the drive opens it as a module
 /// (`PathOf { module: true }`), and the sweep probes `name.rs` and `name/mod.rs` (sweep.rs); a
 /// `#[path]` answers the one file it names. The error says what is refused.
+///
+/// `inner`: the inline modules written around the `mod` INSIDE a macro call's tokens, outermost
+/// first (blaze-file-items macro_mods.rs), when `item` is that call: each adds its name or its
+/// `#[path]` after the outline's own enclosing modules, as an expansion's inline module adds its
+/// directory where the call stands (blaze-scope resolve.rs `make_modules`). Empty for a `mod`
+/// the file's own items hold.
 fn module_file<'f, 't>(
     path: &str,
     owns_dir: bool,
     text: &'t str,
     outline: &blaze_file_items::Outline<'_>,
     item: &blaze_surface::Item,
+    inner: &[Segment<'t>],
     segment: Segment<'t>,
     frame: &'f Frame,
 ) -> Result<Vec<u8, &'f Frame>, &'static str> {
@@ -1183,11 +1224,11 @@ fn module_file<'f, 't>(
     }
     let mut out = Vec::new_in(frame);
     out.extend_from_slice(dir.as_bytes());
-    let file_relative = chain.is_empty() && matches!(segment, Segment::Attr(_));
+    let file_relative = chain.is_empty() && inner.is_empty() && matches!(segment, Segment::Attr(_));
     if !owns_dir && !file_relative {
         push_segment(&mut out, stem.strip_suffix(".rs").unwrap_or(stem));
     }
-    for segment in chain.iter().rev() {
+    for segment in chain.iter().rev().chain(inner.iter()) {
         match *segment {
             Segment::Slot(name) => push_segment(&mut out, name),
             Segment::Attr(literal) => join(&mut out, &path_literal(literal, frame)?)?,
@@ -1215,6 +1256,49 @@ fn in_modules(outline: &blaze_file_items::Outline<'_>, item: &blaze_surface::Ite
         parent = entry.parent;
     }
     true
+}
+
+/// Each file a `mod NAME;` written literally in the tokens of an item-position macro call of the
+/// file at `path` names (blaze-file-items macro_mods.rs `token_mods`), handed to `each` with
+/// whether it is a slot (`name.rs` probed with `name/mod.rs`; `false` for a `#[path]`) and the
+/// call's place. The file is [`module_file`]'s for that `mod` with the call as its item: the
+/// call's enclosing inline modules, then those in the tokens. `include!` is not scanned (its
+/// file is [`included_file`]'s); a call inside a body, an impl or a trait is not either (its
+/// `mod` would be in a block, whose files rustc does not take from the directory). A `mod`
+/// whose file this text cannot name (a `#[path]` literal refused by [`path_literal`]) is
+/// planned as nothing: only expansion says whether that `mod` is written, and a read of it the
+/// plan lacks stops the names with the file named (engine_names.rs `finish`, `UnseenFile`).
+/// The scratch it takes is `frame`'s and `alloc`'s, freed with the task.
+fn macro_module_files<'f>(
+    path: &str,
+    owns_dir: bool,
+    text: &str,
+    outline: &blaze_file_items::Outline<'_>,
+    alloc: blaze_own::Alloc<'_>,
+    frame: &'f Frame,
+    each: &mut dyn FnMut(Vec<u8, &'f Frame>, bool, u32),
+) {
+    use blaze_file_items::macro_mods::{TokenSegment, may_hold_mods, token_mods};
+    for item in outline.items() {
+        let ItemDetail::MacroCall { path: Some(call), input: Some(input) } = item.detail else { continue };
+        let input = item.text(text, input);
+        if is_include(item.text(text, call)) || !may_hold_mods(input) || !in_modules(outline, item) {
+            continue;
+        }
+        let found = token_mods(input, alloc);
+        let of = move |range: blaze_surface::Range| &input[range.start as usize..range.end as usize];
+        let segment = |one: &TokenSegment| match one.path {
+            Some(attr) => Segment::Attr(of(attr)),
+            None => Segment::Slot(of(one.name)),
+        };
+        for one in found.mods.iter() {
+            let mut inner: Vec<Segment<'_>, &Frame> = Vec::new_in(frame);
+            inner.extend(found.chain(one).iter().map(segment));
+            if let Ok(child) = module_file(path, owns_dir, text, outline, item, &inner, segment(&one.leaf), frame) {
+                each(child, one.leaf.path.is_none(), item.range.start);
+            }
+        }
+    }
 }
 
 /// Whether a macro call's path as written (`include`, `::core::include`) is core's `include!`,
@@ -1383,7 +1467,7 @@ mod tests {
                 None => Segment::Slot(item.text(text, name)),
                 Some(attr) => Segment::Attr(item.text(text, attr)),
             };
-            let file = module_file(path, owns_dir, text, &outline, item, segment, frame);
+            let file = module_file(path, owns_dir, text, &outline, item, &[], segment, frame);
             out.push(file.map(|file| std::string::String::from_utf8(file.as_slice().to_vec()).expect("UTF-8")));
         }
         out

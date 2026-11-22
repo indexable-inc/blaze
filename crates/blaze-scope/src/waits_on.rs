@@ -52,22 +52,22 @@ pub struct FailedDep<'a> {
 
 /// The crate's modules and names that wait on a failed dependency, found once per crate
 /// ([`WaitsOn::of`]) and asked per error ([`WaitsOn::waits_on`]).
-pub struct WaitsOn<'a> {
-    names: &'a CrateNames<'a>,
-    failed: &'a [FailedDep<'a>],
+pub struct WaitsOn<'c, 'a> {
+    names: &'c CrateNames<'a>,
+    failed: &'c [FailedDep<'c>],
     /// A module every name of which waits (a glob of it failed so), and on which crate.
-    whole: HashMap<ItemKey, &'a str, Alloc<'a>>,
+    whole: HashMap<ItemKey, &'c str, Alloc<'c>>,
     /// One name of a module that waits (a named import of it failed so).
-    named: HashMap<(ItemKey, &'a str), &'a str, Alloc<'a>>,
-    alloc: Alloc<'a>,
+    named: HashMap<(ItemKey, &'a str), &'c str, Alloc<'c>>,
+    alloc: Alloc<'c>,
 }
 
-impl<'a> WaitsOn<'a> {
+impl<'c, 'a: 'c> WaitsOn<'c, 'a> {
     /// What waits in crate `names`, whose failed dependencies are `failed`. Each failed import
     /// whose cause waits marks its module (a glob) or its name (a named import), until no more
     /// is marked: a mark only ever adds, and of two crates a mark could name the lesser name is
     /// kept, so the marks are the same in any map order (rule 25).
-    pub fn of(names: &'a CrateNames<'a>, failed: &'a [FailedDep<'a>], alloc: Alloc<'a>) -> WaitsOn<'a> {
+    pub fn of(names: &'c CrateNames<'a>, failed: &'c [FailedDep<'c>], alloc: Alloc<'c>) -> WaitsOn<'c, 'a> {
         let mut w = WaitsOn { names, failed, whole: HashMap::new_in(alloc), named: HashMap::new_in(alloc), alloc };
         if failed.is_empty() {
             return w;
@@ -106,7 +106,7 @@ impl<'a> WaitsOn<'a> {
 
     /// The failed crate `error`, a scope error of `module`, waits on; `None`: the error stands
     /// as the resolver gave it.
-    pub fn waits_on(&self, module: ItemKey, error: &ScopeError<&'a str, Path<'a, &'a str>>) -> Option<&'a str> {
+    pub fn waits_on(&self, module: ItemKey, error: &ScopeError<&'a str, Path<'a, &'a str>>) -> Option<&'c str> {
         match error {
             ScopeError::Import { path, segment, why, .. } | ScopeError::Macro { path, segment, why, .. } => self.cause(module, path, *segment as usize, *why),
             _ => None,
@@ -115,7 +115,7 @@ impl<'a> WaitsOn<'a> {
 
     /// Why `path`, written in `module`, failing at `segment` for `why`, is unknown: the failed
     /// crate the scope it looked in waits on.
-    fn cause(&self, module: ItemKey, path: &Path<'a, &'a str>, segment: usize, why: Unresolved) -> Option<&'a str> {
+    fn cause(&self, module: ItemKey, path: &Path<'a, &'a str>, segment: usize, why: Unresolved) -> Option<&'c str> {
         if why != Unresolved::NotFound {
             return None;
         }
@@ -159,11 +159,11 @@ impl<'a> WaitsOn<'a> {
 
     /// Whether `name` looked up in `module` waits: the module, or one its globs reach in this
     /// crate, is a failed crate's or is marked. The least crate name of all that are found.
-    fn module_waits(&self, module: ItemKey, name: &'a str) -> Option<&'a str> {
+    fn module_waits(&self, module: ItemKey, name: &'a str) -> Option<&'c str> {
         let mut stack = AVec::new_in(self.alloc);
         let mut seen: AVec<'_, ItemKey> = AVec::new_in(self.alloc);
         stack.push(module);
-        let mut found: Option<&'a str> = None;
+        let mut found: Option<&'c str> = None;
         while let Some(m) = stack.pop() {
             if seen.contains(&m) {
                 continue;
@@ -185,7 +185,7 @@ impl<'a> WaitsOn<'a> {
     }
 
     /// The failed dependency `key` is an item of.
-    fn failed_of(&self, key: ItemKey) -> Option<&FailedDep<'a>> {
+    fn failed_of(&self, key: ItemKey) -> Option<&'c FailedDep<'c>> {
         self.failed.iter().find(|dep| key.0.0[..8] == dep.key.prefix()[..])
     }
 
@@ -212,15 +212,15 @@ fn keep_least<'s, K: Eq + core::hash::Hash>(marks: &mut HashMap<K, &'s str, Allo
 
 /// One crate's finished scopes as a [`World`]: a path walks its own modules; a scope of any
 /// other crate is not held ([`Why::NotRead`]), which [`WaitsOn::cause`] reads.
-struct OneCrate<'a>(&'a CrateNames<'a>);
+struct OneCrate<'c, 'a>(&'c CrateNames<'a>);
 
-impl OneCrate<'_> {
+impl OneCrate<'_, '_> {
     fn own(&self, key: ItemKey) -> bool {
         key.0.0[..8] == self.0.key.prefix()[..]
     }
 }
 
-impl<'a> World<&'a str> for OneCrate<'a> {
+impl<'c, 'a: 'c> World<&'a str> for OneCrate<'c, 'a> {
     type Scope<'w>
         = &'w ScopeBuilder<'w, &'a str>
     where

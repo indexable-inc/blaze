@@ -156,7 +156,7 @@ impl fmt::Display for EngineCheckError {
             }
             EngineCheckError::UnseenFile { task, read, krate, path } => write!(
                 f,
-                "crate `{krate}`'s names read the file `{path}` ({task:?} needs {read:?}), which its plan did not hand it: the file walk did not outline that file (engine_check.rs `plan`, engine_names.rs)"
+                "crate `{krate}`'s names read the file `{path}` ({task:?} needs {read:?}), which its plan did not hand it: the file walk did not outline that file. A module file a macro wrote from a computed name (`mod $name;`, a proc macro's `mod`), or an `include!` of a computed path: not planned yet (the walk plans only the `mod NAME;` a macro call's tokens hold literally: work.rs `macro_module_files`; engine_check.rs `plan`, engine_names.rs `finish`)"
             ),
             EngineCheckError::Twice { task } => write!(f, "{task:?} was admitted or filed more than once in this request"),
             EngineCheckError::Cycle { krate } => write!(f, "the crates' dependencies do not settle to depths: a cycle, seen from {krate:?} (engine_names.rs `plan`)"),
@@ -2838,6 +2838,8 @@ fn ready_setup<'f, 'h, 'a>(
             root: place.unit,
             #[cfg(test)]
             text_only_outline: TEXT_ONLY_OUTLINE.get(),
+            #[cfg(test)]
+            without_macro_mods: WITHOUT_MACRO_MODS.get(),
         };
         // The slot as the sweep found it today, when it was read as this kind of slot ([`Kept::slot`]).
         let Some(probed) = ((leaf.flags & sweep::MODULE != 0) == want.module).then_some((leaf.flags, leaf.stamp, leaf.id)) else {
@@ -3765,6 +3767,10 @@ struct Want<'h> {
     root: Name,
     #[cfg(test)]
     text_only_outline: bool,
+    /// The control's plant: its outline plans no `mod` a macro call's tokens hold
+    /// ([`without_macro_mods`]).
+    #[cfg(test)]
+    without_macro_mods: bool,
 }
 
 struct SkippedTarget {
@@ -3808,6 +3814,26 @@ pub(crate) fn with_text_only_outlines<R>(run: impl FnOnce() -> R) -> R {
         }
     }
     let _restore = Restore(TEXT_ONLY_OUTLINE.replace(true));
+    run()
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static WITHOUT_MACRO_MODS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Plant the walk before it planned the `mod NAME;` a macro call's tokens hold (work.rs
+/// `macro_module_files`), for a request's file wants, those sent to workers too (each [`Want`]
+/// carries it): the control that removes the cause (rule 23, engine_macro_mods_tests.rs).
+#[cfg(test)]
+pub(crate) fn without_macro_mods<R>(run: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WITHOUT_MACRO_MODS.set(self.0);
+        }
+    }
+    let _restore = Restore(WITHOUT_MACRO_MODS.replace(true));
     run()
 }
 
@@ -4159,6 +4185,8 @@ fn wants<'h>(
             name: part.name, slot, module, edition, root: root.unwrap_or(part.name),
             #[cfg(test)]
             text_only_outline: TEXT_ONLY_OUTLINE.get(),
+            #[cfg(test)]
+            without_macro_mods: WITHOUT_MACRO_MODS.get(),
         });
     }
     Ok(())
@@ -4219,7 +4247,16 @@ fn outline_one<'h>(cx: &Cx, root: &Dir<ReadWrite>, stamps: &FromMeta, want: &Wan
     }
     // Every outline lists its lint units (lints.rs `parts`) whatever the step, so what it holds
     // never depends on the rule set, which is in each `Lint` task's source (engine_lints.rs).
-    let job = Job { name: want.name, slot, flags, edition: want.edition, expect: source, lints: true };
+    let job = Job {
+        name: want.name,
+        slot,
+        flags,
+        edition: want.edition,
+        expect: source,
+        lints: true,
+        #[cfg(test)]
+        macro_mods: !want.without_macro_mods,
+    };
     let made = match work::unwinding(|| work::outline_file(cx, root, &job, scratch, alloc)) {
         Ok(Ok(made)) => made,
         Ok(Err(Unread::Changed)) => Err(Why::Changed),

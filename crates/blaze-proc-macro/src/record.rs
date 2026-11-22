@@ -352,6 +352,18 @@ impl DirStore {
         self.put_at(Self::named(b"spawn/", key), bytes)
     }
 
+    /// A build script's `rustc` probe's answer record (blaze-build-script probe_check.rs
+    /// `encode`): `probe/<64 hex of the question's key>`.
+    pub(crate) fn get_probe(&self, key: &ContentId) -> Result<Option<Vec<u8>>, FilesError> {
+        self.get_at(Self::named(b"probe/", key))
+    }
+
+    /// Keeps a probe's answer record, written once: other bytes under the key are refused
+    /// (rule 21), equal bytes are no write.
+    pub(crate) fn put_probe(&self, key: &ContentId, bytes: &[u8]) -> Result<(), FilesError> {
+        self.put_at(Self::named(b"probe/", key), bytes)
+    }
+
     /// The record at `name`, its seal checked: `None` when absent or torn.
     fn get_at(&self, name: RecordName) -> Result<Option<Vec<u8>>, FilesError> {
         let mut bytes = match self.files.read(&name)? {

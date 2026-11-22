@@ -467,12 +467,16 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         Ok(done) => crate::names::module_missing::findings(done.names, job.kept),
         Err(_) => blaze_own::Vec::new_in(job.kept),
     };
-    // The names this crate calls its failed dependencies by (each handed as an error record,
-    // engine_names.rs): a path into one is counted, never a finding (plan row A8, rule 19).
-    let mut quiet: blaze_own::Vec<&str, Global> = blaze_own::Vec::new_in(Global);
-    quiet.extend(job.input.deps.iter().filter(|(_, at)| job.deps.get(*at).is_some_and(|bytes| blaze_scope::crate_scope::is_error_record(bytes))).map(|(name, _)| *name));
+    // The crate's failed dependencies (each handed as an error record, engine_names.rs): a path
+    // that fails behind one (written into it, or through a glob or import that failed into it)
+    // waits on it, counted, never a finding (plan row A8, rule 19; blaze-scope waits_on.rs).
+    let mut failed_deps: blaze_own::AVec<'_, blaze_scope::waits_on::FailedDep<'_>> = blaze_own::AVec::new_in(alloc);
+    failed_deps.extend(job.input.deps.iter().filter_map(|(called, at)| {
+        let (key, name) = blaze_scope::crate_scope::error_record_crate(job.deps.get(*at)?)?;
+        Some(blaze_scope::waits_on::FailedDep { called: Some(*called), name, key })
+    }));
     let (out, payload, findings, failed, ok, unresolved, test_marks, expansions) = match done {
-        Ok(done) => match scope_record(&done, crate_name, &quiet, alloc, job.kept) {
+        Ok(done) => match scope_record(&done, crate_name, &blaze_scope::waits_on::WaitsOn::of(done.names, &failed_deps, alloc), alloc, job.kept) {
             Ok(record) => {
                 // Both records (rule 21): a dependent reads the exports, but the crate's own
                 // bodies read its inner names (front_load.rs), so an out over the exports alone

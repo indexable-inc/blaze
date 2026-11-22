@@ -191,6 +191,9 @@ mod chain;
 mod digest;
 mod flags;
 mod header;
+// The `mod NAME;` items a macro call's tokens hold literally: the file walk's plan of the
+// modules an expansion declares (blaze-cli work.rs `outline_file`).
+pub mod macro_mods;
 mod names_digest;
 pub mod nested;
 mod split;

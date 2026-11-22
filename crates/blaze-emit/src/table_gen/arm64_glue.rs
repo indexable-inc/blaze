@@ -1,7 +1,8 @@
 //! The arm64 recipes of the composer's own instructions (compose/emit.rs, `glue`), and the
 //! single-word forms T1 left out: the frame steps (`stack_pointer` variants 1 to 7), register
 //! moves within and across the classes, cell loads and stores of float registers, `ret`, the
-//! poll, `eor` by a logical immediate, shifted-register operands, and `cbz`.
+//! poll, `eor` by a logical immediate, shifted-register operands, `cbz`, and the far frame (the
+//! stack probe, `stack_pointer` variant 8, and the cell and slot forms past the near reach).
 //!
 //! A child of arm64.rs (its `#[path]` line there), so it shares that file's helpers; its
 //! [`recipes`] is called at the end of arm64.rs's, so the generator, the encoder-agreement test

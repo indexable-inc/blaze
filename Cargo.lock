@@ -1385,6 +1385,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-macro-run"
+version = "0.0.0"
+dependencies = [
+ "blaze-comptime",
+ "blaze-expand",
+ "blaze-id",
+ "blaze-own",
+ "blaze-roots",
+]
+
+[[package]]
 name = "blaze-malloc"
 version = "0.0.0"
 dependencies = [

@@ -281,7 +281,7 @@ fn calls(n: u64, across: bool) -> Func<Alloc<'static>> {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn calls_keep_values_live_in_caller_saved_registers() {
-    let g = trash as extern "C" fn(u64) -> u64 as usize as u64;
+    let g = (trash as extern "C" fn(u64) -> u64) as usize as u64;
     let blr_x16 = 0xd63f_0200u32;
     for (n, across) in [(10u64, false), (22, true)] {
         let want = move |p: u64| {

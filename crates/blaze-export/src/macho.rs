@@ -199,6 +199,8 @@ pub(crate) struct ChainImport<'n> {
 pub(crate) struct ChainTooLarge {
     pub what: &'static str,
     pub len: u64,
+    /// The slot's image offset, when the value is a slot's (a table's field has none).
+    pub at: Option<u64>,
 }
 
 /// The chained fixups blob (`dyld_chained_fixups_header`, the starts, the import rows, the
@@ -224,15 +226,19 @@ pub(crate) fn chained_fixups<'a, 'n, F>(
             _ => 0,
         };
         let value = match to {
+            // `dyld_chained_ptr_64_rebase`: target (36 bits), high8 (8), reserved (7), next (12),
+            // bind (1); dyld makes `header + (high8 << 56 | target)`. A pointer the program tags
+            // in its top byte (C's `(uintptr_t)&x | 1ull << 63` in a static initializer) keeps
+            // the tag in `high8`, as ld64 writes it; only bits 36..55 cannot be held.
             Chain::Rebase { target } => {
-                if target >= 1 << 36 {
-                    return Err(ChainTooLarge { what: "a chained rebase's 36-bit target", len: target });
+                if target & blaze_native::layout::REBASE_MIDDLE != 0 {
+                    return Err(ChainTooLarge { what: "a chained rebase's target: bits 36..55 set (neither the 36-bit offset nor the top byte)", len: target, at: Some(at) });
                 }
-                target | (next << 51)
+                (target & ((1 << 36) - 1)) | ((target >> 56) << 36) | (next << 51)
             }
             Chain::Bind { import } => {
                 if import >= 1 << 24 {
-                    return Err(ChainTooLarge { what: "a chained bind's 24-bit ordinal", len: u64::from(import) });
+                    return Err(ChainTooLarge { what: "a chained bind's 24-bit ordinal", len: u64::from(import), at: Some(at) });
                 }
                 u64::from(import) | (next << 51) | (1 << 63)
             }
@@ -261,7 +267,7 @@ pub(crate) fn chained_fixups<'a, 'n, F>(
         bytes::set32(&mut blob, infos_at + 4 * s, (at - starts_at) as u32);
         let pages = (seg.vm_size / PAGE) as usize;
         if pages > usize::from(u16::MAX) {
-            return Err(ChainTooLarge { what: "a segment's 16-bit page count", len: seg.vm_size });
+            return Err(ChainTooLarge { what: "a segment's 16-bit page count", len: seg.vm_size, at: None });
         }
         bytes::u32(&mut blob, (22 + 2 * pages) as u32);
         bytes::u16(&mut blob, PAGE as u16);
@@ -291,20 +297,20 @@ pub(crate) fn chained_fixups<'a, 'n, F>(
         match rows {
             ImportRows::Plain => {
                 if name_at >= 1 << 23 {
-                    return Err(ChainTooLarge { what: "a chained import's 23-bit name offset", len: name_at });
+                    return Err(ChainTooLarge { what: "a chained import's 23-bit name offset", len: name_at, at: None });
                 }
                 if row.ordinal > 0xFF {
-                    return Err(ChainTooLarge { what: "a DYLD_CHAINED_IMPORT row's 8-bit ordinal", len: u64::from(row.ordinal) });
+                    return Err(ChainTooLarge { what: "a DYLD_CHAINED_IMPORT row's 8-bit ordinal", len: u64::from(row.ordinal), at: None });
                 }
                 if row.addend != 0 {
-                    return Err(ChainTooLarge { what: "an addend in a DYLD_CHAINED_IMPORT row, which holds none", len: row.addend as u64 });
+                    return Err(ChainTooLarge { what: "an addend in a DYLD_CHAINED_IMPORT row, which holds none", len: row.addend as u64, at: None });
                 }
                 // `dyld_chained_import`: lib_ordinal, weak_import, name_offset.
                 bytes::u32(&mut blob, u32::from(row.ordinal) | (u32::from(row.weak) << 8) | ((name_at as u32) << 9));
             }
             ImportRows::Addend64 => {
                 if name_at > u64::from(u32::MAX) {
-                    return Err(ChainTooLarge { what: "a chained import's 32-bit name offset", len: name_at });
+                    return Err(ChainTooLarge { what: "a chained import's 32-bit name offset", len: name_at, at: None });
                 }
                 // `dyld_chained_import_addend64`: lib_ordinal, weak_import, reserved, name_offset; addend.
                 bytes::u64(&mut blob, u64::from(row.ordinal) | (u64::from(row.weak) << 16) | (name_at << 32));
@@ -597,10 +603,8 @@ pub fn write_native<'a>(
     for _ in 0..8 {
         bytes::u32(out, 0);
     }
-    let mut ncmds = 0u32;
     let got_size = 8 * n as u64;
     for seg in segs.iter() {
-        ncmds += 1;
         match seg.name {
             "__TEXT" => {
                 segment(out, seg, 4);
@@ -696,12 +700,16 @@ pub fn write_native<'a>(
     if let Some(m) = native {
         for path in m.libraries.iter() {
             dylib_command(out, LC_LOAD_DYLIB, path.as_str(), 2, DYLIB_VERSION, DYLIB_VERSION);
-            ncmds += 1;
         }
     }
     linkedit_data(out, LC_FUNCTION_STARTS, link_off + starts_at, starts_len);
     linkedit_data(out, LC_CODE_SIGNATURE, code_limit, sig_len);
-    ncmds += 10;
+    // Counted from the commands as written (native_dylib.rs `commands_in`), never by hand; each
+    // command above has a cmdsize that is a positive multiple of 8, so a `None` is this
+    // writer's own bug, said as the header's room outgrown.
+    let Some(ncmds) = crate::native_dylib::commands_in(&out[HEADER as usize..]) else {
+        return Err(ExportError::TooLarge { what: "the load commands as written: one's cmdsize is not a positive multiple of 8 (macho.rs `write_native`)", len: out.len() as u64 });
+    };
     let sizeofcmds = out.len() as u64 - HEADER;
     debug_assert!(sizeofcmds <= MAX_COMMANDS + native.map_or(0, |m| command_room(&m.libraries)), "the load commands outgrew the header's room");
     bytes::set32(out, 0, MH_MAGIC_64);

@@ -42,7 +42,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_impls::{ImplRead, Probe};
-use blaze_ladder::front2::buckets::{Ask, BucketRead, BucketSource, Buckets, Home, Homes, ItemsIndex, TableSet, cell_read, cells_of, inherent_home, prepare_home, trait_cell, trait_home, write_impl_tables};
+use blaze_ladder::front2::buckets::{AdmitError, Ask, BucketRead, BucketSource, Buckets, Home, Homes, ImplQuestionError, ItemsIndex, TableSet, cell_read, cells_of, inherent_home, prepare_home, trait_cell, trait_home, write_impl_tables};
 use blaze_ladder::front2::tables::recorder::{ReadSink, TableRead};
 use blaze_ladder::front2::tables::view::{Tables, TablesOpts};
 use blaze_surface::BucketKey;
@@ -347,6 +347,64 @@ fn ten_thousand_negative_goals_offer_each_dependency_once_and_derive_one_probe_i
         assert_eq!(tables.probe_ids_derived(), 1);
     }
     println!("10,000 repeated goals per body: one named trait read and one unread-impl flag per body, one probe ID derived across two bodies");
+}
+
+/// A question whose trait or self type has no library key is ITS OWN refusal
+/// (`AdmitError::Question`, which check.rs makes `CheckFail::ImplQuestion`: that body's NOT
+/// RUN), never the tables' fault, and the next question over the same index still answers. The
+/// twin: a crate whose tables were not written is the tables' fault (`AdmitError::Tables`,
+/// `CheckFail::Tables`: a run's stop), as before. On both paths: the impl tables and the items
+/// records' bucket index (`ItemsIndex`).
+///
+/// CONTROL (rule 23): before the split the refusal was `TablesReadError::NoLibraryKey`, under
+/// `CheckFail::Tables`, which blaze-cli test_drive.rs `front_stops_suite` takes as the suite's
+/// stop; before D193 point 5's lead it was a names-log gap and `Ok(0)`, an answer of "no
+/// impl". The first assertion fails on either.
+#[test]
+fn a_question_with_no_library_key_is_its_own_refusal_and_the_next_still_answers() {
+    let records = records();
+    let root = NamesSource::root_module(records, CORE_AT).expect("core's root");
+    let tr = checker_of(walk(records, root, "Tr"));
+    let root_a = NamesSource::root_module(records, A_AT).expect("a's root");
+    let type_a = checker_of(walk(records, root_a, "A"));
+    let (a_tr, _) = impl_key(records, A_AT, "A", Some("Tr"));
+    // A checker key no row of the key map holds and no crate's records begin (the fixture's
+    // crate keys are content digests, none all ones).
+    let nowhere = blaze_typeck::ItemKey(u128::MAX);
+    let keys = Keys::new();
+    let no_key = |got: &Result<usize, AdmitError>| matches!(got, Err(AdmitError::Question(ImplQuestionError::NoLibraryKey { key, .. })) if *key == nowhere);
+
+    // The impl tables.
+    let crates = [APP_AT, CORE_AT, A_AT, B_AT];
+    let tables = fixture_tables(records, &crates);
+    let sink = ImplOffers::default();
+    let view = Tables::new(TablesOpts { records, impls: Some(tables), lang_crates: &[CORE_AT], reads: &sink });
+    let buckets = Buckets::lazy(view);
+    let by_type = buckets.admit_shared(view, &keys, Homes::ANY, Ask::Trait(tr, Shape::Adt(nowhere)), a());
+    assert!(no_key(&by_type), "tables: a self type with no library key is the question's refusal: {by_type:?}");
+    let by_trait = buckets.admit_shared(view, &keys, Homes::ANY, Ask::Trait(nowhere, Shape::Adt(type_a)), a());
+    assert!(no_key(&by_trait), "tables: a trait with no library key is the question's refusal: {by_trait:?}");
+    buckets.admit_shared(view, &keys, Homes::ANY, Ask::Trait(tr, Shape::Adt(type_a)), a()).unwrap_or_else(|e| panic!("tables: `A: Tr` after the refused questions: {e}"));
+    let candidates = buckets.trait_candidates(tr, Shape::Adt(type_a), Homes::ANY);
+    assert!(candidates.contains(&a_tr), "tables: `A: Tr` still answers `impl Tr for A`: {candidates:?}");
+
+    // The items records' bucket index.
+    let mut index = Buckets::lazy(records);
+    let by_type = index.admit_asked(records, &keys, Homes::ANY, Ask::Trait(tr, Shape::Adt(nowhere)));
+    assert!(no_key(&by_type), "bucket index: a self type with no library key is the question's refusal: {by_type:?}");
+    index.admit(records, Homes::ANY);
+    index.admit_asked(records, &keys, Homes::ANY, Ask::Trait(tr, Shape::Adt(type_a))).unwrap_or_else(|e| panic!("bucket index: `A: Tr` after the refused question: {e}"));
+    let candidates = index.trait_candidates(tr, Shape::Adt(type_a), Homes::ANY);
+    assert!(candidates.contains(&a_tr), "bucket index: `A: Tr` still answers `impl Tr for A`: {candidates:?}");
+
+    // TWIN: crate `a`'s tables not written. `A: Tr` at any home asks them: the tables' fault.
+    let without_a = fixture_tables(records, &[APP_AT, CORE_AT, B_AT]);
+    let sink = ImplOffers::default();
+    let view = Tables::new(TablesOpts { records, impls: Some(without_a), lang_crates: &[CORE_AT], reads: &sink });
+    let buckets = Buckets::lazy(view);
+    let unwritten = buckets.admit_shared(view, &keys, Homes::ANY, Ask::Trait(tr, Shape::Adt(type_a)), a());
+    assert!(matches!(unwritten, Err(AdmitError::Tables(_))), "a crate whose tables were not written is the tables' fault: {unwritten:?}");
+    println!("no library key: the question's refusal on both paths, the next question answers; tables not written: {}", unwritten.err().map(|e| e.to_string()).unwrap_or_default());
 }
 
 #[test]

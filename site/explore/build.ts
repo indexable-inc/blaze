@@ -5,7 +5,7 @@
  *   explore/explore.js    main.ts bundled
  *   explore/explore.css
  */
-import { copyFileSync, mkdirSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 
 const here = import.meta.dirname;
@@ -24,4 +24,8 @@ export async function buildExplorePage(out: string): Promise<void> {
 	if (!bundled.success) throw new AggregateError(bundled.logs, 'explore page bundle failed (site/explore/main.ts)');
 	copyFileSync(path.join(here, 'explore.css'), path.join(dir, 'explore.css'));
 	copyFileSync(path.join(here, 'explore.html'), path.join(out, 'explore.html'));
+	const wasmSrc = path.join(here, 'wasm/target/wasm32-unknown-unknown/release/blaze_explore_wasm.wasm');
+	if (existsSync(wasmSrc)) {
+		copyFileSync(wasmSrc, path.join(dir, 'explore_core.wasm'));
+	}
 }

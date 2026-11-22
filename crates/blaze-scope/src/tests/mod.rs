@@ -96,6 +96,7 @@ mod rendered_int_dot;
 mod rules;
 mod statement_origins;
 mod tests_record;
+mod waits_on;
 
 pub(crate) type N = &'static str;
 

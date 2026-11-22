@@ -301,7 +301,16 @@ impl<'d, 'a> Dry<'d, 'a> {
         if flags & sweep::ABSENT != 0 {
             return Ok(Err(DryRefused::Absent { slot }));
         }
-        let job = Job { name: file, slot, flags, edition, expect: id, lints: true };
+        let job = Job {
+            name: file,
+            slot,
+            flags,
+            edition,
+            expect: id,
+            lints: true,
+            #[cfg(test)]
+            macro_mods: true,
+        };
         let made = work::outline_file(cx, self.root, &job, frame, alloc)?;
         let source = crate::engine_tasks::edition_source(id, edition);
         let outline_source = crate::engine_tasks::outline_source(source, flags);

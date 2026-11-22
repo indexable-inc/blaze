@@ -154,13 +154,18 @@ impl SpanId {
     pub const NONE: SpanId = SpanId(0);
 }
 
+/// Sentinel value for [`Event::cpu`] when the OS did not report a CPU core.
+pub const CPU_UNKNOWN: u16 = u16::MAX;
+
 /// One fixed 64-byte telemetry record in the shared-memory ring.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(C, align(8))]
 pub struct Event {
     pub kind: u8,
+    /// Low 4 bits: NUMA node / cluster (`0..15`); bit 4: efficiency core (`1 = E-core`).
     pub flags: u8,
-    pub _pad: u16,
+    /// Hardware CPU core index (`0..65534`, or [`CPU_UNKNOWN`]).
+    pub cpu: u16,
     pub thread: u32,
     pub slot_or_op: u32,
     pub _pad2: u32,
@@ -180,7 +185,7 @@ impl Event {
     pub const EMPTY: Event = Event {
         kind: 0,
         flags: 0,
-        _pad: 0,
+        cpu: CPU_UNKNOWN,
         thread: 0,
         slot_or_op: 0,
         _pad2: 0,
@@ -191,6 +196,23 @@ impl Event {
         d: 0,
         e: 0,
     };
+
+    #[inline]
+    pub const fn with_cpu(mut self, cpu: u16, flags: u8) -> Event {
+        self.cpu = cpu;
+        self.flags = flags;
+        self
+    }
+
+    #[inline]
+    pub const fn numa_node(self) -> u8 {
+        self.flags & 0x0f
+    }
+
+    #[inline]
+    pub const fn is_e_core(self) -> bool {
+        (self.flags & 0x10) != 0
+    }
 
     /// Typed kind, or `None` if the tag is invalid/empty.
     pub const fn event_kind(&self) -> Option<EventKind> {
@@ -208,7 +230,7 @@ impl Event {
         Event {
             kind: EventKind::SpanEnter as u8,
             flags: 0,
-            _pad: 0,
+            cpu: CPU_UNKNOWN,
             thread,
             slot_or_op: slot.0,
             _pad2: 0,
@@ -232,7 +254,7 @@ impl Event {
         Event {
             kind: EventKind::SpanExit as u8,
             flags: 0,
-            _pad: 0,
+            cpu: CPU_UNKNOWN,
             thread,
             slot_or_op: slot.0,
             _pad2: 0,
@@ -256,7 +278,7 @@ impl Event {
         Event {
             kind: EventKind::SpanUnwound as u8,
             flags: 0,
-            _pad: 0,
+            cpu: CPU_UNKNOWN,
             thread,
             slot_or_op: slot.0,
             _pad2: 0,
@@ -273,7 +295,7 @@ impl Event {
         Event {
             kind: EventKind::HookHit as u8,
             flags: 0,
-            _pad: 0,
+            cpu: CPU_UNKNOWN,
             thread,
             slot_or_op: slot.0,
             _pad2: 0,
@@ -307,7 +329,7 @@ impl Event {
         Event {
             kind,
             flags: 0,
-            _pad: 0,
+            cpu: CPU_UNKNOWN,
             thread,
             slot_or_op: op as u32,
             _pad2: 0,
@@ -336,7 +358,7 @@ impl Event {
         Event {
             kind,
             flags: 0,
-            _pad: 0,
+            cpu: CPU_UNKNOWN,
             thread,
             slot_or_op: op as u32,
             _pad2: 0,
@@ -353,7 +375,7 @@ impl Event {
         Event {
             kind: if birth { EventKind::ThreadBirth as u8 } else { EventKind::ThreadEnd as u8 },
             flags: 0,
-            _pad: 0,
+            cpu: CPU_UNKNOWN,
             thread,
             slot_or_op: 0,
             _pad2: 0,
@@ -363,6 +385,56 @@ impl Event {
             c: 0,
             d: 0,
             e: 0,
+        }
+    }
+
+    /// Thread creation event attributing the spawning parent thread and 3-frame caller stack.
+    pub const fn thread_birth(
+        thread: u32,
+        ts_ns: u64,
+        parent_thread: u32,
+        spawn_frames: [u64; 3],
+    ) -> Event {
+        Event {
+            kind: EventKind::ThreadBirth as u8,
+            flags: 0,
+            cpu: CPU_UNKNOWN,
+            thread,
+            slot_or_op: 0,
+            _pad2: 0,
+            ts_ns,
+            a: parent_thread as u64,
+            b: 0,
+            c: spawn_frames[0],
+            d: spawn_frames[1],
+            e: spawn_frames[2],
+        }
+    }
+
+    /// Mutex / lock wait event attributing both the blocked waiter (`c`) and the blocking
+    /// lock holder (`d` = holder thread ID, `e` = holder acquire caller PC).
+    pub const fn sync_wait(
+        thread: u32,
+        ts_ns: u64,
+        wait_ns: u64,
+        mutex_ptr: u64,
+        waiter_pc: u64,
+        holder_thread: u32,
+        holder_pc: u64,
+    ) -> Event {
+        Event {
+            kind: EventKind::SyncWait as u8,
+            flags: 0,
+            cpu: CPU_UNKNOWN,
+            thread,
+            slot_or_op: IoOp::MutexLock as u32,
+            _pad2: 0,
+            ts_ns,
+            a: wait_ns,
+            b: mutex_ptr,
+            c: waiter_pc,
+            d: holder_thread as u64,
+            e: holder_pc,
         }
     }
 }

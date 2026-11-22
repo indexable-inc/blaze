@@ -801,6 +801,7 @@ mod tests {
     mod engine_body_memory_tests;
     mod engine_body_reads_memory_tests;
     mod engine_body_coverage_tests;
+    mod engine_macro_mods_tests;
     mod engine_skipped_targets_tests;
     mod engine_script_reads_tests;
     mod engine_script_reads_e2e_tests;

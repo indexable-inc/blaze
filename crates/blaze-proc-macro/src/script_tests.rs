@@ -291,6 +291,7 @@ fn script(name: &str, tree: Tree, env: Vec<(String, String)>) -> Arc<Script> {
         c_mode: CMode::Deferred,
         limits: LIMITS,
         table: Arc::new(Vec::new()),
+        probes: None,
         spawner: None,
         step: blaze_ids::ContentId::default(),
         spawn_setting: Arc::new(crate::spawn_route::SpawnSetting::off()),

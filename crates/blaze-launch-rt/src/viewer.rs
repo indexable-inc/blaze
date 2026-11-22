@@ -341,6 +341,17 @@ fn handle_connection(mut stream: TcpStream, shared: &Arc<SharedState>) {
                 .unwrap_or_else(|_| String::from(r#"{"type":"builds","builds":[]}"#));
             write_http(&mut stream, "200 OK", "application/json", cors_origin, &body);
         }
+        ("GET", "/api/topology") => {
+            let body = host_topology_json();
+            write_http(&mut stream, "200 OK", "application/json", cors_origin, &body);
+        }
+        ("GET", "/api/source") => {
+            let query = raw_path.split_once('?').map(|(_, q)| q).unwrap_or("");
+            match read_source_snippet_json(query) {
+                Some(body) => write_http(&mut stream, "200 OK", "application/json", cors_origin, &body),
+                None => write_http(&mut stream, "404 Not Found", "application/json", cors_origin, r#"{"error":"source unavailable"}"#),
+            }
+        }
         ("POST", "/api/toggle") => {
             write_http(&mut stream, "200 OK", "application/json", cors_origin, r#"{"ok":true}"#);
         }
@@ -731,6 +742,153 @@ fn escape_json(s: &str) -> String {
         }
     }
     out
+}
+
+/// Queries live host CPU, P-core/E-core, cache, memory, and NUMA topology (cached once).
+pub fn host_topology_json() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        fn sysctl_u64(name: &core::ffi::CStr) -> u64 {
+            let mut val: u64 = 0;
+            let mut len = core::mem::size_of::<u64>();
+            // SAFETY: `sysctlbyname` writes up to `len` bytes into `val`.
+            let rc = unsafe {
+                libc::sysctlbyname(
+                    name.as_ptr(),
+                    (&mut val as *mut u64).cast(),
+                    &mut len,
+                    core::ptr::null_mut(),
+                    0,
+                )
+            };
+            if rc == 0 { val } else { 0 }
+        }
+        fn sysctl_str(name: &core::ffi::CStr) -> String {
+            let mut buf = [0u8; 128];
+            let mut len = buf.len();
+            // SAFETY: `sysctlbyname` writes a NUL-terminated string into `buf`.
+            let rc = unsafe {
+                libc::sysctlbyname(
+                    name.as_ptr(),
+                    buf.as_mut_ptr().cast(),
+                    &mut len,
+                    core::ptr::null_mut(),
+                    0,
+                )
+            };
+            if rc == 0 && len > 0 {
+                let end = buf[..len].iter().position(|&b| b == 0).unwrap_or(len);
+                String::from_utf8_lossy(&buf[..end]).into_owned()
+            } else {
+                String::from("Apple Silicon")
+            }
+        }
+        let brand = sysctl_str(c"machdep.cpu.brand_string");
+        let ncpu = sysctl_u64(c"hw.ncpu").max(1);
+        let p_cores = sysctl_u64(c"hw.perflevel0.physicalcpu");
+        let e_cores = sysctl_u64(c"hw.perflevel1.physicalcpu");
+        let l1d = sysctl_u64(c"hw.perflevel0.l1dcachesize").max(sysctl_u64(c"hw.l1dcachesize"));
+        let l2 = sysctl_u64(c"hw.perflevel0.l2cachesize").max(sysctl_u64(c"hw.l2cachesize"));
+        let mem = sysctl_u64(c"hw.memsize");
+        format!(
+            r#"{{"arch":"aarch64","os":"macos","brand":"{}","ncpu":{ncpu},"p_cores":{p_cores},"e_cores":{e_cores},"numa_nodes":1,"l1d_bytes":{l1d},"l2_bytes":{l2},"mem_bytes":{mem}}}"#,
+            escape_json(&brand),
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let ncpu = std::thread::available_parallelism().map(|n| n.get() as u64).unwrap_or(1);
+        let numa_nodes = std::fs::read_dir("/sys/devices/system/node")
+            .ok()
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.file_name().to_str().is_some_and(|s| s.starts_with("node")))
+                    .count()
+                    .max(1)
+            })
+            .unwrap_or(1);
+        format!(
+            r#"{{"arch":"{}","os":"linux","brand":"Linux Host","ncpu":{ncpu},"p_cores":{ncpu},"e_cores":0,"numa_nodes":{numa_nodes},"l1d_bytes":0,"l2_bytes":0,"mem_bytes":0}}"#,
+            std::env::consts::ARCH,
+        )
+    }
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+        } else if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Reads a bounded 7-line source snippet around `line` for hover code peek (`file` must be a
+/// regular `.rs`/`.ts`/`.c`/`.h` source file without `..` traversal, <= 256 KiB).
+fn read_source_snippet_json(query: &str) -> Option<String> {
+    let mut file: Option<String> = None;
+    let mut line: usize = 1;
+    for pair in query.split('&') {
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        if k == "file" {
+            file = Some(percent_decode(v));
+        } else if k == "line" {
+            if let Ok(n) = v.parse::<usize>() {
+                line = n.max(1);
+            }
+        }
+    }
+    let path_str = file?;
+    if path_str.contains("..") {
+        return None;
+    }
+    let path = Path::new(&path_str);
+    let ext = path.extension().and_then(|s| s.to_str())?;
+    if !matches!(ext, "rs" | "ts" | "js" | "c" | "h" | "cpp" | "toml") {
+        return None;
+    }
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > 256 * 1024 {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    let start = line.saturating_sub(3).max(1);
+    let end = line.saturating_add(3);
+    let mut out = format!(r#"{{"file":"{}","line":{line},"lines":["#, escape_json(&path_str));
+    let mut first = true;
+    for (idx, text) in content.lines().enumerate() {
+        let ln = idx + 1;
+        if ln < start {
+            continue;
+        }
+        if ln > end {
+            break;
+        }
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        let _ = write!(out, r#"{{"n":{ln},"text":"{}"}}"#, escape_json(text));
+    }
+    out.push_str("]}");
+    Some(out)
 }
 
 /// Probes `http://127.0.0.1:<port>/api/info` with a tight loopback timeout.

@@ -120,7 +120,7 @@ fn first16(id: ContentId) -> u128 {
 /// fn item, a fn pointer, an opaque type, a closure, a trait object, a pattern type: an impl
 /// on one is unfiled or under "any"). Refused: a nominal type whose library key the key map
 /// and the records do not give.
-fn heads_of<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> Result<Vec<(Head, Shape), Global>, TablesReadError> {
+fn heads_of<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> Result<Vec<(Head, Shape), Global>, ImplQuestionError> {
     let mut out = Vec::new_in(Global);
     match shape {
         Shape::Bool | Shape::Char | Shape::Str | Shape::Int(_) | Shape::Uint(_) | Shape::Float(_) | Shape::AnyInt | Shape::AnyFloat => {
@@ -146,7 +146,7 @@ fn heads_of<'n, S: NamesSource<'n>>(names: S, keys: &Keys, shape: Shape) -> Resu
         Shape::Array => out.push((Head::Array, shape)),
         Shape::Slice => out.push((Head::Slice, shape)),
         Shape::Adt(k) => {
-            let lib = keys.library_in(names, k).ok_or(TablesReadError::NoLibraryKey { of: "the nominal type an impl question is about", key: k })?;
+            let lib = keys.library_in(names, k).ok_or(ImplQuestionError::NoLibraryKey { of: "the nominal type an impl question is about", key: k })?;
             out.push((Head::Named(lib), shape));
         }
         _ => {}
@@ -162,7 +162,7 @@ impl BucketIndex {
     /// impls this call filed; refused by name where a bucket the question reads cannot be
     /// asked (no library key for its trait or self type, a crate with no key), never an empty
     /// filing that would answer "no impl" (D193 point 5).
-    pub fn admit_asked<'n, S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, home: Homes, ask: Ask) -> Result<usize, TablesReadError> {
+    pub fn admit_asked<'n, S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, home: Homes, ask: Ask) -> Result<usize, AdmitError> {
         if !self.is_lazy() || self.no_rows || !names.has_buckets() {
             return Ok(0);
         }
@@ -202,7 +202,7 @@ impl BucketIndex {
         let all_heads = heads.iter().map(|(head, of)| (*head, Some(*of))).chain(core::iter::once((Head::Any, None))).chain(shapeless);
         match trait_ {
             Some(t) => {
-                let lib = keys.library_in(names, t).ok_or(TablesReadError::NoLibraryKey { of: "the trait an impl question is about", key: t })?;
+                let lib = keys.library_in(names, t).ok_or(ImplQuestionError::NoLibraryKey { of: "the trait an impl question is about", key: t })?;
                 trait_krate = names.crate_of(lib);
                 wanted.extend(all_heads.map(|(head, of)| (BucketKey::of_trait(lib, head), Under::Trait(of), head == Head::Any)));
                 wanted.push((BucketKey::negatives(lib), Under::Negative, false));

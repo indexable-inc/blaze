@@ -125,7 +125,16 @@ pub enum Reach {
     /// A thread-local whose definition is outside the image: its GOT entry holds an offset in
     /// this image's template, which has none for it.
     ThreadLocalOutside,
+    /// A 64-bit pointer's target `to` (an image offset plus the addend, wrapped) is no value a
+    /// chained rebase holds: an image offset below 2^36 with, at most, a top byte (bits 56..63,
+    /// `high8`, a tag the program stores in its pointer). Bits 36..55 set mean the addend
+    /// carried the target out of the image (a name less a distance past it, wrapped).
+    Rebase { to: u64 },
 }
+
+/// The bits of a rebase target that are neither the 36-bit image offset nor the top byte: a
+/// target with any of them set is no image place ([`Reach::Rebase`]).
+pub const REBASE_MIDDLE: u64 = ((1 << 56) - 1) & !((1 << 36) - 1);
 
 impl core::fmt::Display for Reach {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -141,6 +150,7 @@ impl core::fmt::Display for Reach {
             Reach::NoCell => f.write_str("the stub, veneer or GOT cell the layout counted for it was not made (blaze-native layout.rs's own bug)"),
             Reach::Abs32 => f.write_str("a 32-bit absolute field cannot hold a position-independent image's address"),
             Reach::ThreadLocalOutside => f.write_str("a thread-local defined outside the image: its GOT entry has no offset in this image's template"),
+            Reach::Rebase { to } => write!(f, "the pointer's target {to:#x} is no image place a chained rebase holds (a 36-bit image offset and at most a top byte): its addend carried it out of the image"),
         }
     }
 }
@@ -1240,6 +1250,11 @@ impl<'p, 'a> Lay<'p, 'a> {
                     // header, rebased to the base dyld mapped the image at.
                     Target::Place { .. } | Target::Common { .. } | Target::Linker { .. } => {
                         let v = self.address(t, o, name)?;
+                        // Refused here, where the relocation's input, section and name are known
+                        // (rule 19), not as a bare value at the writer's chain encoding.
+                        if v & REBASE_MIDDLE != 0 {
+                            return Err(far(self, Reach::Rebase { to: v }));
+                        }
                         self.put64(place, v);
                         push(&mut self.fixups, Fixup { at: place, to: FixTo::Rebase { target: v } })?;
                     }
@@ -1375,11 +1390,17 @@ impl<'p, 'a> Lay<'p, 'a> {
                 Cell::Plain(t) => match t {
                     Target::Place { object, .. } => {
                         let v = self.address(t, object, b"")?;
+                        if v & REBASE_MIDDLE != 0 {
+                            return Err(self.far_own(RelocKind::GotPage21, b"(a GOT entry)", Reach::Rebase { to: v }));
+                        }
                         self.put64(at, v);
                         push(&mut self.fixups, Fixup { at, to: FixTo::Rebase { target: v } })?;
                     }
                     Target::Common { .. } | Target::Linker { .. } => {
                         let v = self.address(t, 0, b"")?;
+                        if v & REBASE_MIDDLE != 0 {
+                            return Err(self.far_own(RelocKind::GotPage21, b"(a GOT entry)", Reach::Rebase { to: v }));
+                        }
                         self.put64(at, v);
                         push(&mut self.fixups, Fixup { at, to: FixTo::Rebase { target: v } })?;
                     }

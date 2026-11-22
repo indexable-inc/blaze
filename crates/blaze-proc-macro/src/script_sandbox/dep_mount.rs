@@ -496,6 +496,7 @@ mod tests {
             c_mode: CMode::Deferred,
             limits: RunLimits::STANDARD,
             table: Arc::new(Vec::new()),
+            probes: None,
             spawner: None,
             step: ContentId::default(),
             spawn_setting: Arc::new(crate::spawn_route::SpawnSetting::off()),

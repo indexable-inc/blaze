@@ -1016,10 +1016,96 @@ impl<'a> Walk<'a> {
         most: usize,
         scratch: &mut Scratch<'a>,
     ) -> Result<One<'w>, WalkError<M::Error>> {
-        let Scratch { name, made, facts, items, declared } = scratch;
-        made.clear();
-        if let How::Done(stepped) = self.how[row] {
-            return Ok(One { stepped, declared: self.declared(row) });
+        scratch.made.clear();
+        // The same three parts the pool drives apart (D194: begin and finish on the relay, the
+        // make on a worker), here in one call: the seam test `split_steps_equal_one` holds the
+        // two equal (rule 78).
+        let pending = match self.start(row, ids, store, builder, producer, form, most, scratch)? {
+            Began::Stepped(stepped) => return Ok(One { stepped, declared: self.declared(row) }),
+            Began::Make(pending) => pending,
+        };
+        let Scratch { name, made, declared, .. } = scratch;
+        if let Err(why) = pending.order.make(make, grant, name.as_slice(), made) {
+            self.how[pending.row()] = How::Waiting;
+            return Err(why);
+        }
+        let stepped = self.end(pending, made.as_slice(), store, form, most, declared)?;
+        Ok(One { stepped, declared: self.declared(row) })
+    }
+
+    /// The first part of [`Walk::one`] for row `row`, on the walk's thread: the instance keyed
+    /// from text and today's facts, looked up in `store`; found, its declared rows are reached
+    /// and the row is done ([`Begun::Stepped`]); not found (or unkeyed), the row is
+    /// [`How::Making`] and its make is handed out ([`Begun::Make`]): the caller makes the entry
+    /// (anywhere: [`Order::make`] with the row's name, [`Walk::name`]) and hands it to
+    /// [`Walk::finish`], or gives the row back by [`Walk::abandon`]. A row done before answers
+    /// what it holds, with no store or seam call; a row being made is refused
+    /// ([`WalkError::Making`]). On an error the row stays [`How::Waiting`]. [`Scratch::made`] is
+    /// not touched.
+    pub fn begin<'w, E>(
+        &'w mut self,
+        row: usize,
+        ids: &dyn BodyIds,
+        store: &mut dyn CodeStore,
+        builder: &Builder,
+        producer: &ProducerId<CodeBuilder>,
+        form: &dyn Form,
+        most: usize,
+        scratch: &mut Scratch<'a>,
+    ) -> Result<Begun<'w>, WalkError<E>> {
+        Ok(match self.start(row, ids, store, builder, producer, form, most, scratch)? {
+            Began::Stepped(stepped) => Begun::Stepped(One { stepped, declared: self.declared(row) }),
+            Began::Make(pending) => Begun::Make(pending),
+        })
+    }
+
+    /// The last part of [`Walk::one`], on the walk's thread: `made` is the entry made for
+    /// `pending`'s row ([`Order::make`]); it is put under the row's key when it has one, and
+    /// the rows it declares are reached, in its order, with nothing done for them. On an error
+    /// the row is [`How::Waiting`] again (a row reached before the error stays reached), as
+    /// `one`'s.
+    pub fn finish<'w, E>(&'w mut self, pending: Pending, made: &[u8], store: &mut dyn CodeStore, form: &dyn Form, most: usize, scratch: &mut Scratch<'a>) -> Result<One<'w>, WalkError<E>> {
+        let row = pending.row();
+        let stepped = self.end(pending, made, store, form, most, &mut scratch.declared)?;
+        Ok(One { stepped, declared: self.declared(row) })
+    }
+
+    /// `pending`'s row given back with nothing made (its make failed, or the run stopped): the
+    /// row is [`How::Waiting`] again, as after a refused `one`.
+    pub fn abandon<E>(&mut self, pending: Pending) -> Result<(), WalkError<E>> {
+        let row = self.begun(&pending)?;
+        self.how[row] = How::Waiting;
+        Ok(())
+    }
+
+    /// `pending`'s row, when this walk began it for that fn and it is being made.
+    fn begun<E>(&self, pending: &Pending) -> Result<usize, WalkError<E>> {
+        let row = pending.row();
+        let tabled = pending.order.tabled;
+        match (self.how.get(row), self.tabled.get(row)) {
+            (Some(How::Making), Some(&at)) if at == tabled => Ok(row),
+            _ => Err(WalkError::NotBegun { tabled }),
+        }
+    }
+
+    /// [`Walk::begin`]'s work, its answer holding no borrow of the walk (so `one` may go on
+    /// to the make after it).
+    fn start<E>(
+        &mut self,
+        row: usize,
+        ids: &dyn BodyIds,
+        store: &mut dyn CodeStore,
+        builder: &Builder,
+        producer: &ProducerId<CodeBuilder>,
+        form: &dyn Form,
+        most: usize,
+        scratch: &mut Scratch<'a>,
+    ) -> Result<Began, WalkError<E>> {
+        let Scratch { name, made: _, facts, items, declared } = scratch;
+        match self.how[row] {
+            How::Done(stepped) => return Ok(Began::Stepped(stepped)),
+            How::Making => return Err(WalkError::Making { tabled: self.tabled[row] }),
+            How::Waiting => {}
         }
         let tabled = self.tabled[row];
         name.clear();
@@ -1034,7 +1120,6 @@ impl<'a> Walk<'a> {
             }
         }
         declared.clear();
-        let mut found = false;
         // The instance's key, or why it has none: one value, so a keyed step always has its key.
         let keyed: Result<CodeKey, Unkeyed> = match unkeyed {
             Some(why) => Err(why),
@@ -1060,26 +1145,49 @@ impl<'a> Walk<'a> {
             && let Some(bytes) = store.get(key).map_err(WalkError::Store)?
         {
             form.declared(bytes, declared).map_err(|why| WalkError::Entry { tabled, found: true, why })?;
-            found = true;
+            let stepped = Stepped::Found(key);
+            self.reach_declared(row, stepped, most, declared)?;
+            return Ok(Began::Stepped(stepped));
         }
-        if !found {
-            match self.kinds[row] {
-                RowKind::Instance => make.make(grant, tabled, name.as_slice(), made),
-                RowKind::Static => make.make_static(grant, tabled, made),
-                RowKind::ThreadLocal => make.make_thread_local(grant, tabled, made),
-            }
-            .map_err(|why| WalkError::Make { tabled, why })?;
-            form.declared(made.as_slice(), declared).map_err(|why| WalkError::Entry { tabled, found: false, why })?;
-            if let Ok(key) = keyed {
-                // The toolchain's when every item of its name is (`items` is the name's, filled
-                // when it was keyed above), else the program's.
-                let toolchain = !items.is_empty() && items.iter().all(|&item| ids.class(item) == CodeClass::Toolchain);
-                let class = if toolchain { CodeClass::Toolchain } else { CodeClass::Program };
-                store.put(class, key, made.as_slice()).map_err(WalkError::Store)?;
-            }
+        // The toolchain's when every item of its name is (`items` is the name's, filled when it
+        // was keyed above), else the program's; an unkeyed entry is never put, so its class is
+        // never read.
+        let toolchain = keyed.is_ok() && !items.is_empty() && items.iter().all(|&item| ids.class(item) == CodeClass::Toolchain);
+        let class = if toolchain { CodeClass::Toolchain } else { CodeClass::Program };
+        self.how[row] = How::Making;
+        Ok(Began::Make(Pending { row: row as u32, order: Order { tabled, kind: self.kinds[row] }, keyed, class }))
+    }
+
+    /// [`Walk::finish`]'s work: `made` read for its declared rows, put when keyed, the rows
+    /// reached; on an error the row is waiting again.
+    fn end<E>(&mut self, pending: Pending, made: &[u8], store: &mut dyn CodeStore, form: &dyn Form, most: usize, declared: &mut DeclaredList<'a>) -> Result<Stepped, WalkError<E>> {
+        let row = self.begun(&pending)?;
+        let Pending { order, keyed, class, .. } = pending;
+        let tabled = order.tabled;
+        declared.clear();
+        let done = form
+            .declared(made, declared)
+            .map_err(|why| WalkError::Entry { tabled, found: false, why })
+            .and_then(|()| match keyed {
+                Ok(key) => store.put(class, key, made).map_err(WalkError::Store),
+                Err(_) => Ok(()),
+            })
+            .and_then(|()| {
+                let stepped = match keyed {
+                    Ok(key) => Stepped::Made(key),
+                    Err(why) => Stepped::Unkeyed(why),
+                };
+                self.reach_declared(row, stepped, most, declared).map(|()| stepped)
+            });
+        if done.is_err() {
+            self.how[row] = How::Waiting;
         }
-        // The declared rows, reached in the entry's order; on a refusal the row's edges so far
-        // are dropped and the row stays waiting.
+        done
+    }
+
+    /// Row `row` done as `stepped`: the rows `declared` names reached, in the entry's order; on
+    /// a refusal the row's edges so far are dropped and its `How` is left as it was.
+    fn reach_declared<E>(&mut self, row: usize, stepped: Stepped, most: usize, declared: &DeclaredList<'_>) -> Result<(), WalkError<E>> {
         let start = self.edges.len();
         let (instances, statics) = (declared.len(), declared.statics().len());
         for i in 0..instances + statics + declared.thread_locals().len() {
@@ -1103,14 +1211,15 @@ impl<'a> Walk<'a> {
             }
         }
         self.declares[row] = (start as u32, (self.edges.len() - start) as u32);
-        let stepped = match keyed {
-            Ok(key) if found => Stepped::Found(key),
-            Ok(key) => Stepped::Made(key),
-            Err(why) => Stepped::Unkeyed(why),
-        };
         self.how[row] = How::Done(stepped);
-        Ok(One { stepped, declared: self.declared(row) })
+        Ok(())
     }
+}
+
+/// [`Walk::start`]'s answer: [`Begun`] with no borrow of the walk.
+enum Began {
+    Stepped(Stepped),
+    Make(Pending),
 }
 
 #[cfg(test)]
@@ -1652,6 +1761,93 @@ mod tests {
         name_of(LEAF, None, &mut leaf);
         assert_eq!(walk.row_of(&fn_symbol_of_name(&leaf)), None, "leaf is not reached: nothing walked ahead");
         assert_eq!(walk.row_of(&fn_symbol_of_name(&twice)), Some(declared[1] as usize));
+    }
+
+    /// D194's seam (rule 78): the walk driven apart, as the code pool drives it (every waiting
+    /// row begun before any is finished, each make run apart from the walk by its own maker,
+    /// the makes handed back last first), equals `Walk::one` in walk order: the same rows,
+    /// each with the same `How` and key, the same declared rows in the entry's order, the same
+    /// entry bytes in the store under each key, and as many makes. Keyed (every body has its
+    /// record) and unkeyed (none has: each make is its own task, nothing put). Controls: a row
+    /// being made is not begun again (`Making`); a pending handed to a walk that did not begin
+    /// it is refused (`NotBegun`), never finished there.
+    /// Prints "split_steps_equal_one: keyed 5 rows 5 makes; unkeyed 5 rows 5 makes".
+    #[test]
+    fn split_steps_equal_one() {
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        let builder = builder();
+        let producer = model_producer();
+        let mut entry: AVec<'_, u8> = Vec::new_in(alloc);
+        name_of(MAIN, None, &mut entry);
+        let mut printed = std::string::String::new();
+        for recorded in [true, false] {
+            let mut ids = Ids::new([0, 0]);
+            ids.recorded = recorded;
+
+            let mut serial_store = MemoryStore::new_in(alloc);
+            let mut serial_model = Model { alloc, calls: 0 };
+            let mut serial = Walk::new_in(alloc);
+            serial.run((ItemKey(MAIN), &entry), &ids, &mut serial_store, &builder, &producer, &mut serial_model, &Toy, 64).expect("the serial walk");
+
+            let mut split_store = MemoryStore::new_in(alloc);
+            let mut split_model = Model { alloc, calls: 0 };
+            let mut split = Walk::new_in(alloc);
+            let mut scratch = Scratch::new_in(alloc);
+            split.root::<NameError>((ItemKey(MAIN), &entry), 64).expect("main is reached");
+            loop {
+                let mut wave: std::vec::Vec<(Pending, AVec<'_, u8>)> = std::vec::Vec::new();
+                for row in 0..split.len() {
+                    if split.how(row) != How::Waiting {
+                        continue;
+                    }
+                    let begun = split.begin::<NameError>(row, &ids, &mut split_store, &builder, &producer, &Toy, 64, &mut scratch).expect("begun");
+                    let pending = match begun {
+                        Begun::Stepped(_) => continue,
+                        Begun::Make(pending) => pending,
+                    };
+                    assert_eq!(split.how(row), How::Making);
+                    let name: std::vec::Vec<u8> = split.name(row).to_vec();
+                    let mut made: AVec<'_, u8> = Vec::new_in(alloc);
+                    pending.order().make(&mut split_model, &GRANT, &name, &mut made).expect("made apart from the walk");
+                    wave.push((pending, made));
+                }
+                let Some((first, _)) = wave.first() else { break };
+                let again = split.begin::<NameError>(first.row(), &ids, &mut split_store, &builder, &producer, &Toy, 64, &mut scratch);
+                assert!(matches!(again, Err(WalkError::Making { .. })), "control: a row being made is begun again: {again:?}");
+                while let Some((pending, made)) = wave.pop() {
+                    split.finish::<NameError>(pending, &made, &mut split_store, &Toy, 64, &mut scratch).expect("finished");
+                }
+            }
+
+            assert_eq!((split.len(), split_model.calls, split_store.puts), (serial.len(), serial_model.calls, serial_store.puts));
+            let declared = |walk: &Walk<'_>, row: usize| -> std::vec::Vec<Symbol> { walk.declared(row).iter().map(|&c| walk.symbol(c as usize)).collect() };
+            for row in 0..serial.len() {
+                let other = split.row_of(&serial.symbol(row)).expect("the split walk reached every row the serial one did");
+                assert_eq!(split.how(other), serial.how(row), "row {row}");
+                assert_eq!(declared(&split, other), declared(&serial, row), "row {row}: the entry's order");
+                match serial.key(row) {
+                    Some(key) => assert_eq!(split_store.get(key).expect("read"), serial_store.get(key).expect("read"), "row {row}: one entry under one key"),
+                    None => assert!(!recorded, "row {row}: a keyed model made an unkeyed row"),
+                }
+            }
+
+            // Control: a pending of another walk's row is refused here, and this walk is
+            // unchanged by it.
+            let mut stranger = Walk::new_in(alloc);
+            stranger.root::<NameError>((ItemKey(MAIN), &entry), 64).expect("main is reached");
+            let mut empty = MemoryStore::new_in(alloc);
+            let Begun::Make(foreign) = stranger.begin::<NameError>(0, &ids, &mut empty, &builder, &producer, &Toy, 64, &mut scratch).expect("begun") else {
+                panic!("an empty store found main");
+            };
+            let before = split.how(0);
+            let refused = split.finish::<NameError>(foreign, &[], &mut split_store, &Toy, 64, &mut scratch).map(|one| one.stepped);
+            assert!(matches!(refused, Err(WalkError::NotBegun { tabled: ItemKey(MAIN) })), "control: {refused:?}");
+            assert_eq!(split.how(0), before);
+            printed.push_str(&std::format!("{} {} rows {} makes; ", if recorded { "keyed" } else { "unkeyed" }, split.len(), split_model.calls));
+        }
+        println!("split_steps_equal_one: {}", printed.trim_end_matches("; "));
     }
 
     /// Asking the rows one at a time in another order, from two roots (`plain` first, then

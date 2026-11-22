@@ -50,7 +50,7 @@ mod records;
 pub use asked::{Ask, BucketRead, INCOHERENT_FACT, UNFILED_LIST};
 pub use records::{
     BucketReadUnion,
-    BucketSource, ImplShelf, ImplShelfOpts, ImplTables, ImplTablesDone, ImplTablesFailed, ItemsIndex, NoTables, ShelfError, ShelfSource, ShelvedTwice, TRAIT_HELD, TableSet, TablesError, TablesReadError, bucket_cell, cell_read, check_framed, cells_of, framed,
+    AdmitError, BucketSource, ImplQuestionError, ImplShelf, ImplShelfOpts, ImplTables, ImplTablesDone, ImplTablesFailed, ItemsIndex, NoTables, ShelfError, ShelfSource, ShelvedTwice, TRAIT_HELD, TableSet, TablesError, TablesReadError, bucket_cell, cell_read, check_framed, cells_of, framed,
     impl_tables_name, impl_tables_task, row_answers, row_digest, rows_key, trait_cell, write_impl_tables,
 };
 
@@ -1427,12 +1427,12 @@ impl Buckets {
     }
 
     /// [`BucketIndex::admit_asked`], through `&mut self`.
-    pub fn admit_asked<'n, S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, home: Homes, ask: Ask) -> Result<usize, TablesReadError> {
+    pub fn admit_asked<'n, S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, home: Homes, ask: Ask) -> Result<usize, AdmitError> {
         self.index_get_mut().admit_asked(names, keys, home, ask)
     }
 
     /// [`BucketIndex::admit_tables`], through `&mut self`.
-    pub fn admit_tables<'n, S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, home: Homes, ask: Ask, tables: &TableSet<'_>, alloc: blaze_own::Alloc<'static>) -> Result<usize, TablesReadError> {
+    pub fn admit_tables<'n, S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, home: Homes, ask: Ask, tables: &TableSet<'_>, alloc: blaze_own::Alloc<'static>) -> Result<usize, AdmitError> {
         self.index_get_mut().admit_tables(names, keys, home, ask, tables, alloc)
     }
 
@@ -1442,7 +1442,7 @@ impl Buckets {
     /// records' bucket section. One borrow of the index ([`Buckets::index_mut`]) over the
     /// admit: inside it only the names source and the tables are called. The bucket cells read
     /// are recorded inside `admit_tables` (`names.impls_read`), on either path.
-    pub fn admit_shared<'n, S: NamesSource<'n>>(&self, names: S, keys: &Keys, home: Homes, ask: Ask, alloc: blaze_own::Alloc<'static>) -> Result<usize, TablesReadError> {
+    pub fn admit_shared<'n, S: NamesSource<'n>>(&self, names: S, keys: &Keys, home: Homes, ask: Ask, alloc: blaze_own::Alloc<'static>) -> Result<usize, AdmitError> {
         let mut ix = self.index_mut();
         match names.impl_tables() {
             Some(tables) => ix.admit_tables(names, keys, home, ask, tables, alloc),

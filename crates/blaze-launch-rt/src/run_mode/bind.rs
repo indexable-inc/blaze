@@ -177,6 +177,7 @@ impl<B: Bind> Bind for ObservedBind<B> {
             "connect" => Some(traced_connect as *const () as u64),
             "getenv" => Some(traced_getenv as *const () as u64),
             "pthread_mutex_lock" => Some(traced_mutex_lock as *const () as u64),
+            "pthread_mutex_unlock" => Some(traced_mutex_unlock as *const () as u64),
             _ => None,
         }
     }
@@ -393,22 +394,91 @@ unsafe extern "C" fn traced_getenv(name: *const c_char) -> *mut c_char {
     ret
 }
 
+/// Bounded lock-free mutex-holder cache (`mutex_ptr -> (holder_tid, holder_pc)`) so blocked
+/// threads report WHO held the lock and WHERE they acquired it (YourKit/Tracy lock attribution).
+struct LockSlot {
+    mutex: core::sync::atomic::AtomicU64,
+    holder_tid: core::sync::atomic::AtomicU32,
+    holder_pc: core::sync::atomic::AtomicU64,
+}
+
+impl LockSlot {
+    const fn empty() -> Self {
+        Self {
+            mutex: core::sync::atomic::AtomicU64::new(0),
+            holder_tid: core::sync::atomic::AtomicU32::new(0),
+            holder_pc: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+const LOCK_SLOTS: usize = 1024;
+static LOCK_HOLDERS: [LockSlot; LOCK_SLOTS] = [const { LockSlot::empty() }; LOCK_SLOTS];
+
+#[inline]
+fn lock_slot_idx(mutex_addr: u64) -> usize {
+    ((mutex_addr.wrapping_mul(0x9e37_79b9_7f4a_7c15)) >> 54) as usize & (LOCK_SLOTS - 1)
+}
+
+#[inline]
+fn read_lock_holder(mutex_addr: u64) -> (u32, u64) {
+    use core::sync::atomic::Ordering;
+    let slot = &LOCK_HOLDERS[lock_slot_idx(mutex_addr)];
+    if slot.mutex.load(Ordering::Acquire) == mutex_addr {
+        (slot.holder_tid.load(Ordering::Acquire), slot.holder_pc.load(Ordering::Relaxed))
+    } else {
+        (0, 0)
+    }
+}
+
+#[inline]
+fn set_lock_holder(mutex_addr: u64, tid: u32, pc: u64) {
+    use core::sync::atomic::Ordering;
+    let slot = &LOCK_HOLDERS[lock_slot_idx(mutex_addr)];
+    slot.holder_pc.store(pc, Ordering::Relaxed);
+    slot.holder_tid.store(tid, Ordering::Release);
+    slot.mutex.store(mutex_addr, Ordering::Release);
+}
+
+#[inline]
+fn clear_lock_holder(mutex_addr: u64, tid: u32) {
+    use core::sync::atomic::Ordering;
+    let slot = &LOCK_HOLDERS[lock_slot_idx(mutex_addr)];
+    if slot.mutex.load(Ordering::Acquire) == mutex_addr && slot.holder_tid.load(Ordering::Acquire) == tid {
+        slot.holder_tid.store(0, Ordering::Release);
+        slot.mutex.store(0, Ordering::Release);
+    }
+}
+
 unsafe extern "C" fn traced_mutex_lock(mutex: *mut libc::pthread_mutex_t) -> c_int {
     let lr = caller_return_addr();
+    let tid = current_thread_id();
+    let addr = mutex as usize as u64;
+    let (prev_holder_tid, prev_holder_pc) = read_lock_holder(addr);
     let start = now_ns();
     // SAFETY: forwarded from caller with POSIX `pthread_mutex_lock` contract.
     let ret = unsafe { libc::pthread_mutex_lock(mutex) };
     let end = now_ns();
-    let _ = emit(Event::io(
-        current_thread_id(),
-        IoOp::MutexLock,
+    if ret == 0 {
+        set_lock_holder(addr, tid, lr);
+    }
+    let _ = emit(Event::sync_wait(
+        tid,
         end,
         end.saturating_sub(start),
-        mutex as usize as u64,
-        ret as i64 as u64,
+        addr,
         lr,
+        if prev_holder_tid != tid { prev_holder_tid } else { 0 },
+        if prev_holder_tid != tid { prev_holder_pc } else { 0 },
     ));
     ret
+}
+
+unsafe extern "C" fn traced_mutex_unlock(mutex: *mut libc::pthread_mutex_t) -> c_int {
+    let addr = mutex as usize as u64;
+    clear_lock_holder(addr, current_thread_id());
+    // SAFETY: forwarded from caller with POSIX `pthread_mutex_unlock` contract.
+    unsafe { libc::pthread_mutex_unlock(mutex) }
 }
 
 /// The most data rows (`How::Data`) one system's table may hold: [`Table::bind`] keeps each

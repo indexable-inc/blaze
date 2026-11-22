@@ -1,11 +1,13 @@
 /**
- * Full-bleed Tracy-style WebGPU trace renderer with paired HiDPI label overlay (`#gpu-canvas` + `#gpu-labels`).
+ * Full-bleed Tracy-style WebGPU trace renderer with paired HiDPI label & dependency overlay (`#gpu-canvas` + `#gpu-labels`).
  *
  * Ergonomics:
- *   - Trackpad pinch/squeeze (`wheel` + `ctrlKey`) or vertical wheel: cursor-anchored zoom (`0.2 ms` .. `60 s`).
- *   - Two-finger horizontal pan (`wheel` `deltaX`) or pointer drag: smooth pan, auto-detaches live follow.
- *   - Direct text inside every bar wide enough to read (`>= 32px` shows name, `>= 115px` shows `name · 4.2ms`).
- *   - Hover: crisp vertical crosshair, brightened bar, floating tooltip.
+ *   - 120 ms playout jitter buffer: continuous rAF loop glides the playhead smoothly at 60/120 FPS with zero burst jumps.
+ *   - Two-finger pinch/squeeze (`wheel` + `ctrlKey`/`metaKey`) ONLY for cursor-anchored zoom (`0.2 ms` .. `60 s`).
+ *   - Two-finger horizontal scroll pans time; two-finger vertical scroll scrolls tracks vertically (NEVER accidentally zooms).
+ *   - `[Pan | Select]` drag mode (or `Shift+drag` anytime) to select a time range `[t0..t1]` and zoom/filter all views.
+ *   - Tracy-style lock dependency arrows connecting the blocking holder thread lane to blocked waiter bars.
+ *   - Thread gutter hover + rich structured `onHover` callback for 2-zone code-peek cards.
  *   - Double-click: reset zoom & snap back to live tail.
  */
 
@@ -18,12 +20,33 @@ export interface TimelineSample {
 	label: string;
 	durationText: string;
 	detail: string;
+	slot?: number;
+	thread?: number;
+	cpu?: number;
+	flags?: number;
+	holderThread?: number;
+	holderPc?: number;
+	waiterPc?: number;
+	mutexAddr?: number;
+	kind?: 'span' | 'heap' | 'io' | 'lock';
 }
+
+export type TimelineDragMode = 'pan' | 'select';
 
 export interface TimelineViewportInfo {
 	spanMs: number;
 	following: boolean;
 	selectionMs: [number, number] | null;
+	mode: TimelineDragMode;
+}
+
+export interface TimelineHoverInfo {
+	x: number;
+	y: number;
+	cssW: number;
+	cssH: number;
+	sample: TimelineSample | null;
+	threadGutter: number | null;
 }
 
 const MAX_INSTANCES = 16384;
@@ -31,7 +54,8 @@ const FLOATS_PER_INST = 8; // [x0, y0, x1, y1, r, g, b, a]
 const MIN_SPAN_MS = 0.2;
 const MAX_SPAN_MS = 60_000;
 const DEFAULT_SPAN_MS = 3_500;
-const GUTTER_W = 88;
+const PLAYOUT_BUFFER_MS = 120;
+const GUTTER_W = 96;
 
 const WGSL_SHADER = /* wgsl */ `
 struct Inst {
@@ -102,6 +126,7 @@ interface GpuCanvasCtxLike {
 
 interface TrackLayout {
 	key: string;
+	tid: number | null;
 	title: string;
 	accent: string;
 	yTop: number;
@@ -117,6 +142,13 @@ interface LabelDraw {
 	h: number;
 	text: string;
 	bright: boolean;
+}
+
+interface LockLinkDraw {
+	x: number;
+	fromY: number;
+	toY: number;
+	highlight: boolean;
 }
 
 function niceStepMs(spanMs: number): number {
@@ -138,6 +170,7 @@ export function fmtSpan(ms: number): string {
 export class GpuTimeline {
 	private samples: TimelineSample[] = [];
 	private threadIds = new Set<string>();
+	private threadCpuHint = new Map<string, { cpu: number; isE: boolean }>();
 	private backend: 'webgpu' | '2d' = '2d';
 	private device: GpuDeviceLike | null = null;
 	private gpuCtx: GpuCanvasCtxLike | null = null;
@@ -149,9 +182,13 @@ export class GpuTimeline {
 	private staging = new Float32Array(MAX_INSTANCES * FLOATS_PER_INST);
 
 	private viewSpanMs = DEFAULT_SPAN_MS;
-	private viewEndMs = Date.now();
+	private viewEndMs = Date.now() - PLAYOUT_BUFFER_MS;
 	private following = true;
+	private paused = false;
 	private latestTsMs = Date.now();
+	private scrollY = 0;
+	private maxScrollY = 0;
+	private mode: TimelineDragMode = 'pan';
 
 	private hoverX: number | null = null;
 	private hoverY: number | null = null;
@@ -160,30 +197,83 @@ export class GpuTimeline {
 	private selAnchorMs = 0;
 	private selectionMs: [number, number] | null = null;
 	private dragStartX = 0;
+	private dragStartY = 0;
 	private dragStartEndMs = 0;
+	private dragStartScrollY = 0;
 	private rafPending = false;
+	private liveLoopRunning = false;
 	private lastHoveredSample: TimelineSample | null = null;
+	private lastRulerSig = '';
 
 	constructor(
 		private readonly canvas: HTMLCanvasElement,
 		private readonly labelCanvas: HTMLCanvasElement,
 		private readonly rulerEl: HTMLElement,
-		private readonly tooltipEl: HTMLElement,
 		private readonly onBackend: (kind: 'webgpu' | '2d') => void,
 		private readonly onViewport: (info: TimelineViewportInfo) => void,
 		private readonly onSelectSample?: (sample: TimelineSample) => void,
+		private readonly onHover?: (info: TimelineHoverInfo | null) => void,
 	) {
 		this.labelCtx = this.labelCanvas.getContext('2d');
 		this.bindEvents();
 		void this.init();
+		this.startPlayoutLoop();
+	}
+
+	private playheadEdge(): number {
+		return Math.max(Date.now(), this.latestTsMs) - PLAYOUT_BUFFER_MS;
+	}
+
+	private startPlayoutLoop(): void {
+		if (this.liveLoopRunning) return;
+		this.liveLoopRunning = true;
+		const tick = () => {
+			if (!this.paused && this.following && this.samples.length > 0) {
+				this.render();
+			}
+			requestAnimationFrame(tick);
+		};
+		requestAnimationFrame(tick);
+	}
+
+	setPaused(p: boolean): void {
+		this.paused = p;
+		if (!p && this.following) this.schedule();
+	}
+
+	setMode(m: TimelineDragMode): void {
+		this.mode = m;
+		this.canvas.style.cursor = m === 'select' ? 'crosshair' : 'grab';
+		this.emitViewport();
+	}
+
+	getMode(): TimelineDragMode {
+		return this.mode;
 	}
 
 	private emitViewport(): void {
-		this.onViewport({ spanMs: this.viewSpanMs, following: this.following, selectionMs: this.selectionMs });
+		this.onViewport({
+			spanMs: this.viewSpanMs,
+			following: this.following,
+			selectionMs: this.selectionMs,
+			mode: this.mode,
+		});
 	}
 
 	clearSelection(): void {
 		this.selectionMs = null;
+		this.emitViewport();
+		this.schedule();
+	}
+
+	zoomToSelection(): void {
+		if (!this.selectionMs) return;
+		const [s0, s1] = this.selectionMs;
+		const span = Math.max(MIN_SPAN_MS, s1 - s0);
+		const pad = span * 0.06;
+		this.viewSpanMs = Math.max(MIN_SPAN_MS, Math.min(MAX_SPAN_MS, span + pad * 2));
+		this.viewEndMs = s1 + pad;
+		this.following = false;
 		this.emitViewport();
 		this.schedule();
 	}
@@ -203,19 +293,19 @@ export class GpuTimeline {
 
 	followLive(): void {
 		this.following = true;
-		this.viewEndMs = Math.max(Date.now(), this.latestTsMs);
+		this.viewEndMs = this.playheadEdge();
 		this.emitViewport();
 		this.schedule();
 	}
 
 	zoomBy(factor: number, anchorNorm = 0.5): void {
-		const liveEdge = Math.max(Date.now(), this.latestTsMs);
+		const liveEdge = this.playheadEdge();
 		const curEnd = this.following ? liveEdge : this.viewEndMs;
 		const prevSpan = this.viewSpanMs;
 		const nextSpan = Math.max(MIN_SPAN_MS, Math.min(MAX_SPAN_MS, prevSpan * factor));
 		const anchorTs = curEnd - (1 - anchorNorm) * prevSpan;
 		this.viewSpanMs = nextSpan;
-		this.viewEndMs = Math.min(liveEdge, anchorTs + (1 - anchorNorm) * nextSpan);
+		this.viewEndMs = Math.min(liveEdge + PLAYOUT_BUFFER_MS, anchorTs + (1 - anchorNorm) * nextSpan);
 		this.following = liveEdge - this.viewEndMs < nextSpan * 0.015;
 		this.emitViewport();
 		this.schedule();
@@ -233,22 +323,34 @@ export class GpuTimeline {
 				const plotX = Math.max(0, Math.min(plotW, e.clientX - rect.left - GUTTER_W));
 				const normX = plotX / plotW;
 
-				const isPinch = e.ctrlKey || e.metaKey;
-				const isHorizPan = !isPinch && Math.abs(e.deltaX) > Math.abs(e.deltaY) * 0.55;
-
-				if (isHorizPan) {
-					const shiftMs = (e.deltaX / plotW) * this.viewSpanMs;
-					const liveEdge = Math.max(Date.now(), this.latestTsMs);
-					const curEnd = this.following ? liveEdge : this.viewEndMs;
-					this.viewEndMs = Math.min(liveEdge, curEnd + shiftMs);
-					this.following = liveEdge - this.viewEndMs < this.viewSpanMs * 0.015;
-					this.emitViewport();
-					this.schedule();
+				// ONLY two-finger pinch (`ctrlKey` on macOS/trackpads) or Ctrl/Cmd + wheel zooms!
+				if (e.ctrlKey || e.metaKey) {
+					const sens = 0.012;
+					this.zoomBy(Math.exp(e.deltaY * sens), normX);
 					return;
 				}
 
-				const sens = isPinch ? 0.014 : 0.003;
-				this.zoomBy(Math.exp(e.deltaY * sens), normX);
+				// Plain two-finger scroll: horizontal pans time, vertical scrolls tracks cleanly.
+				let changed = false;
+				if (Math.abs(e.deltaX) > 0.25) {
+					const shiftMs = (e.deltaX / plotW) * this.viewSpanMs;
+					const liveEdge = this.playheadEdge();
+					const curEnd = this.following ? liveEdge : this.viewEndMs;
+					this.viewEndMs = Math.min(liveEdge + PLAYOUT_BUFFER_MS, curEnd + shiftMs);
+					this.following = liveEdge - this.viewEndMs < this.viewSpanMs * 0.015;
+					changed = true;
+				}
+				if (Math.abs(e.deltaY) > 0.25) {
+					const nextY = Math.max(0, Math.min(this.maxScrollY, this.scrollY + e.deltaY));
+					if (nextY !== this.scrollY) {
+						this.scrollY = nextY;
+						changed = true;
+					}
+				}
+				if (changed) {
+					this.emitViewport();
+					this.schedule();
+				}
 			},
 			{ passive: false },
 		);
@@ -257,18 +359,20 @@ export class GpuTimeline {
 			if (e.button !== 0) return;
 			const rect = el.getBoundingClientRect();
 			const plotW = Math.max(1, rect.width - GUTTER_W);
-			const liveEdge = Math.max(Date.now(), this.latestTsMs);
+			const liveEdge = this.playheadEdge();
 			const curEnd = this.following ? liveEdge : this.viewEndMs;
 			const viewStart = curEnd - this.viewSpanMs;
 
-			// Shift+drag selects a YourKit/Perfetto time range [t0..t1] to filter Flame Graph & Hotspots!
-			if (e.shiftKey) {
+			// Select range mode OR Shift+drag anytime selects [t0..t1]
+			if (e.shiftKey || this.mode === 'select') {
 				this.selecting = true;
 				const norm = Math.max(0, Math.min(1, (e.clientX - rect.left - GUTTER_W) / plotW));
 				this.selAnchorMs = viewStart + norm * this.viewSpanMs;
 				this.selectionMs = [this.selAnchorMs, this.selAnchorMs];
 				this.following = false;
 				this.viewEndMs = curEnd;
+				this.dragStartX = e.clientX;
+				this.dragStartY = e.clientY;
 				el.setPointerCapture(e.pointerId);
 				el.style.cursor = 'col-resize';
 				this.emitViewport();
@@ -278,7 +382,9 @@ export class GpuTimeline {
 
 			this.dragging = true;
 			this.dragStartX = e.clientX;
+			this.dragStartY = e.clientY;
 			this.dragStartEndMs = curEnd;
+			this.dragStartScrollY = this.scrollY;
 			el.setPointerCapture(e.pointerId);
 			el.style.cursor = 'grabbing';
 		});
@@ -296,9 +402,13 @@ export class GpuTimeline {
 				this.emitViewport();
 			} else if (this.dragging) {
 				const dx = e.clientX - this.dragStartX;
-				const liveEdge = Math.max(Date.now(), this.latestTsMs);
-				this.viewEndMs = Math.min(liveEdge, this.dragStartEndMs - (dx / plotW) * this.viewSpanMs);
+				const dy = e.clientY - this.dragStartY;
+				const liveEdge = this.playheadEdge();
+				this.viewEndMs = Math.min(liveEdge + PLAYOUT_BUFFER_MS, this.dragStartEndMs - (dx / plotW) * this.viewSpanMs);
 				this.following = liveEdge - this.viewEndMs < this.viewSpanMs * 0.015;
+				if (this.maxScrollY > 0) {
+					this.scrollY = Math.max(0, Math.min(this.maxScrollY, this.dragStartScrollY - dy));
+				}
 				this.emitViewport();
 			}
 			this.schedule();
@@ -306,19 +416,23 @@ export class GpuTimeline {
 
 		const endDrag = (e: PointerEvent) => {
 			if (this.selecting) {
+				const moved = Math.abs(e.clientX - this.dragStartX);
 				this.selecting = false;
-				el.style.cursor = 'grab';
+				el.style.cursor = this.mode === 'select' ? 'crosshair' : 'grab';
 				if (this.selectionMs && this.selectionMs[1] - this.selectionMs[0] < this.viewSpanMs * 0.005) {
 					this.selectionMs = null;
+					if (moved < 4 && this.lastHoveredSample) {
+						this.onSelectSample?.(this.lastHoveredSample);
+					}
 				}
 				this.emitViewport();
 				this.schedule();
 				return;
 			}
 			if (!this.dragging) return;
-			const moved = Math.abs(e.clientX - this.dragStartX);
+			const moved = Math.hypot(e.clientX - this.dragStartX, e.clientY - this.dragStartY);
 			this.dragging = false;
-			el.style.cursor = 'grab';
+			el.style.cursor = this.mode === 'select' ? 'crosshair' : 'grab';
 			if (moved < 4 && this.lastHoveredSample) {
 				this.onSelectSample?.(this.lastHoveredSample);
 			}
@@ -328,11 +442,12 @@ export class GpuTimeline {
 		el.addEventListener('pointerleave', () => {
 			this.hoverX = null;
 			this.hoverY = null;
-			this.tooltipEl.hidden = true;
+			this.onHover?.(null);
 			this.schedule();
 		});
 		el.addEventListener('dblclick', () => {
 			this.viewSpanMs = DEFAULT_SPAN_MS;
+			this.selectionMs = null;
 			this.followLive();
 		});
 	}
@@ -400,36 +515,49 @@ export class GpuTimeline {
 
 	push(sample: TimelineSample): void {
 		if (sample.endMs > this.latestTsMs) this.latestTsMs = sample.endMs;
-		if (sample.trackKey.startsWith('t:')) this.threadIds.add(sample.trackKey);
+		if (sample.trackKey.startsWith('t:')) {
+			this.threadIds.add(sample.trackKey);
+			if (sample.cpu !== undefined && sample.cpu !== 0xffff) {
+				this.threadCpuHint.set(sample.trackKey, {
+					cpu: sample.cpu,
+					isE: ((sample.flags ?? 0) & 0x10) !== 0,
+				});
+			}
+		}
 		this.samples.push(sample);
-		if (this.samples.length > MAX_INSTANCES - 128) {
-			this.samples.splice(0, this.samples.length - (MAX_INSTANCES - 128));
+		if (this.samples.length > MAX_INSTANCES - 256) {
+			this.samples.splice(0, this.samples.length - (MAX_INSTANCES - 256));
 		}
 	}
 
 	clear(): void {
 		this.samples.length = 0;
 		this.threadIds.clear();
+		this.threadCpuHint.clear();
+		this.scrollY = 0;
+		this.selectionMs = null;
 		this.followLive();
 	}
 
-	private buildTracks(cssH: number): TrackLayout[] {
-		const threads = [...this.threadIds].sort();
+	private buildTracks(cssH: number): { tracks: TrackLayout[]; contentH: number } {
+		const threads = [...this.threadIds].sort((a, b) => Number(a.slice(2)) - Number(b.slice(2)));
 		if (threads.length === 0) threads.push('t:1');
 
 		const heapH = 38;
-		const ioH = 34;
+		const ioH = 38;
 		const avail = Math.max(72, cssH - heapH - ioH);
-		const perThread = Math.max(46, Math.floor(avail / threads.length));
+		// Spacious per-thread lanes (min 58px so 2+ call depths & labels stay crisp; scrolls if many threads)
+		const perThread = Math.max(58, Math.min(96, Math.floor(avail / threads.length)));
 
 		const tracks: TrackLayout[] = [];
 		let y = 0;
 		for (const key of threads) {
-			const tid = key.slice(2);
+			const tid = Number(key.slice(2));
 			const maxDepth = perThread >= 74 ? 3 : 2;
-			const barH = Math.min(22, Math.max(17, Math.floor((perThread - 10) / maxDepth) - 2));
+			const barH = Math.min(22, Math.max(18, Math.floor((perThread - 12) / maxDepth) - 2));
 			tracks.push({
 				key,
+				tid,
 				title: `Thread #${tid}`,
 				accent: '#e0461a',
 				yTop: y,
@@ -439,18 +567,21 @@ export class GpuTimeline {
 			});
 			y += perThread;
 		}
-		tracks.push({ key: 'heap', title: 'Heap', accent: '#3987e5', yTop: y, height: heapH, barH: 22, maxDepth: 1 });
+		tracks.push({ key: 'heap', tid: null, title: 'Heap', accent: '#3987e5', yTop: y, height: heapH, barH: 22, maxDepth: 1 });
 		y += heapH;
+		const ioFinalH = Math.max(ioH, cssH - y);
 		tracks.push({
 			key: 'io',
+			tid: null,
 			title: 'Locks / I/O',
 			accent: '#ff7168',
 			yTop: y,
-			height: Math.max(ioH, cssH - y),
-			barH: 20,
+			height: ioFinalH,
+			barH: 22,
 			maxDepth: 1,
 		});
-		return tracks;
+		y += ioFinalH;
+		return { tracks, contentH: y };
 	}
 
 	render(): void {
@@ -471,11 +602,14 @@ export class GpuTimeline {
 		}
 
 		const plotW = Math.max(1, cssW - GUTTER_W);
-		const liveEdge = Math.max(Date.now(), this.latestTsMs);
-		if (this.following) this.viewEndMs = liveEdge;
+		const liveEdge = this.playheadEdge();
+		if (this.following && !this.paused) this.viewEndMs = liveEdge;
 		const viewStartMs = this.viewEndMs - this.viewSpanMs;
 
-		const tracks = this.buildTracks(cssH);
+		const { tracks, contentH } = this.buildTracks(cssH);
+		this.maxScrollY = Math.max(0, contentH - cssH);
+		this.scrollY = Math.max(0, Math.min(this.maxScrollY, this.scrollY));
+
 		const trackByKey = new Map<string, TrackLayout>();
 		for (const tr of tracks) trackByKey.set(tr.key, tr);
 
@@ -484,6 +618,7 @@ export class GpuTimeline {
 		const toNdcY = (py: number) => 1 - (py / cssH) * 2;
 		const pushPxRect = (x: number, y: number, w: number, h: number, r: number, g: number, b: number, a: number) => {
 			if (count >= MAX_INSTANCES || w <= 0 || h <= 0) return;
+			if (y + h < 0 || y > cssH) return;
 			const o = count * FLOATS_PER_INST;
 			this.staging[o] = toNdcX(x);
 			this.staging[o + 1] = toNdcY(y + h);
@@ -496,18 +631,37 @@ export class GpuTimeline {
 			count += 1;
 		};
 
-		// Track lanes + dividers
+		// Track lanes + dividers (scrolled by scrollY)
+		let hoveredGutterTid: number | null = null;
 		for (let i = 0; i < tracks.length; i++) {
 			const tr = tracks[i];
-			if (i % 2 === 1) pushPxRect(0, tr.yTop, cssW, tr.height, 0.092, 0.092, 0.098, 1.0);
-			if (i > 0) pushPxRect(0, tr.yTop, cssW, 1, 0.16, 0.16, 0.175, 1.0);
+			const sy = tr.yTop - this.scrollY;
+			if (i % 2 === 1) pushPxRect(0, sy, cssW, tr.height, 0.092, 0.092, 0.098, 1.0);
+			if (i > 0) pushPxRect(0, sy, cssW, 1, 0.16, 0.16, 0.175, 1.0);
+
+			if (
+				tr.tid !== null &&
+				this.hoverX !== null &&
+				this.hoverY !== null &&
+				this.hoverX < GUTTER_W &&
+				this.hoverY >= sy &&
+				this.hoverY <= sy + tr.height
+			) {
+				hoveredGutterTid = tr.tid;
+			}
 		}
 
-		// Left gutter
+		// Left gutter background + highlight if hovering a thread header
 		pushPxRect(0, 0, GUTTER_W, cssH, 0.068, 0.068, 0.072, 1.0);
+		if (hoveredGutterTid !== null) {
+			const tr = trackByKey.get(`t:${hoveredGutterTid}`);
+			if (tr) {
+				pushPxRect(0, tr.yTop - this.scrollY, GUTTER_W - 1, tr.height, 0.14, 0.14, 0.16, 0.9);
+			}
+		}
 		pushPxRect(GUTTER_W - 1, 0, 1, cssH, 0.17, 0.17, 0.185, 1.0);
 
-		// Adaptive time ruler ticks (aligned to plotX inside `.gpu-ruler`, which starts at GUTTER_W!)
+		// Adaptive time ruler ticks
 		const stepMs = niceStepMs(this.viewSpanMs);
 		const rulerSpans: string[] = [];
 		for (let offset = 0; offset <= this.viewSpanMs; offset += stepMs) {
@@ -517,13 +671,18 @@ export class GpuTimeline {
 			const plotX = norm * plotW;
 			pushPxRect(GUTTER_W + plotX, 0, 1, cssH, 0.15, 0.15, 0.165, 0.65);
 			const relNow = liveEdge - ts;
-			const lbl = relNow < 40 ? 'now' : `-${fmtSpan(relNow)}`;
+			const lbl = relNow < 60 ? 'now' : `-${fmtSpan(relNow)}`;
 			rulerSpans.push(`<span class="ruler-tick" style="left:${plotX.toFixed(1)}px">${lbl}</span>`);
 		}
-		this.rulerEl.innerHTML = rulerSpans.join('');
+		const rulerHtml = rulerSpans.join('');
+		if (rulerHtml !== this.lastRulerSig) {
+			this.lastRulerSig = rulerHtml;
+			this.rulerEl.innerHTML = rulerHtml;
+		}
 
-		// Span / Heap / Lock bars + direct inside-bar text labels
+		// Span / Heap / Lock bars + direct inside-bar text labels + lock dependency links
 		const labels: LabelDraw[] = [];
+		const lockLinks: LockLinkDraw[] = [];
 		let hoveredSample: TimelineSample | null = null;
 		let hoveredArea = Infinity;
 
@@ -540,13 +699,15 @@ export class GpuTimeline {
 			if (w <= 0) continue;
 
 			const depth = s.depth % tr.maxDepth;
-			const y = tr.yTop + 6 + depth * (tr.barH + 3);
+			const y = tr.yTop - this.scrollY + 6 + depth * (tr.barH + 3);
 			const h = tr.barH;
+			if (y + h < 0 || y > cssH) continue;
 
 			let isHit = false;
 			if (
 				this.hoverX !== null &&
 				this.hoverY !== null &&
+				this.hoverX >= GUTTER_W &&
 				this.hoverX >= x0 - 3 &&
 				this.hoverX <= x1 + 3 &&
 				this.hoverY >= y &&
@@ -573,13 +734,22 @@ export class GpuTimeline {
 				pushPxRect(x1 - 1, y, 1, h, 0.06, 0.06, 0.07, 0.7);
 			}
 
+			// Lock dependency connector from holder thread lane -> blocked waiter bar
+			if (s.kind === 'lock' && s.holderThread && s.holderThread > 0) {
+				const holderTrack = trackByKey.get(`t:${s.holderThread}`);
+				if (holderTrack) {
+					const fromY = holderTrack.yTop - this.scrollY + holderTrack.height * 0.5;
+					lockLinks.push({ x: x0 + Math.min(8, w * 0.5), fromY, toY: y, highlight: isHit });
+				}
+			}
+
 			if (w >= 32) {
-				const full = w >= 115 && s.durationText ? `${s.label} · ${s.durationText}` : s.label;
+				const full = w >= 112 && s.durationText ? `${s.label} · ${s.durationText}` : s.label;
 				labels.push({ x: x0, y, w, h, text: full, bright: isHit });
 			}
 		}
 
-		// Shift+drag range selection highlight
+		// Range selection highlight (`[t0..t1]`)
 		if (this.selectionMs) {
 			const [s0, s1] = this.selectionMs;
 			if (s1 >= viewStartMs && s0 <= this.viewEndMs) {
@@ -597,10 +767,17 @@ export class GpuTimeline {
 			pushPxRect(this.hoverX, 0, 1, cssH, 0.92, 0.91, 0.89, 0.34);
 		}
 
-		// Live right-edge fire cursor
-		if (liveEdge >= viewStartMs && liveEdge <= this.viewEndMs + 1) {
+		// Live right-edge fire playhead cursor
+		if (liveEdge >= viewStartMs && liveEdge <= this.viewEndMs + PLAYOUT_BUFFER_MS) {
 			const lx = GUTTER_W + Math.min(1, (liveEdge - viewStartMs) / this.viewSpanMs) * plotW;
 			pushPxRect(lx - 1.5, 0, 1.5, cssH, 0.88, 0.27, 0.1, 0.95);
+		}
+
+		// Subtle vertical scrollbar thumb if tracks overflow
+		if (this.maxScrollY > 0) {
+			const thumbH = Math.max(24, (cssH / contentH) * cssH);
+			const thumbY = (this.scrollY / this.maxScrollY) * (cssH - thumbH);
+			pushPxRect(cssW - 4, thumbY, 3, thumbH, 0.45, 0.45, 0.48, 0.55);
 		}
 
 		// Submit GPU draw call
@@ -640,24 +817,65 @@ export class GpuTimeline {
 			}
 		}
 
-		// Render crisp HiDPI text overlay directly inside every visible bar + left gutter
+		// Render crisp HiDPI overlay: lock dependency arrows + inside-bar labels + left gutter headers
 		const lctx = this.labelCtx;
 		if (lctx) {
 			lctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 			lctx.clearRect(0, 0, cssW, cssH);
 
-			// Left gutter track headers
-			lctx.font = '500 10.5px "Berkeley Mono", ui-monospace, monospace';
-			lctx.textBaseline = 'middle';
-			for (const tr of tracks) {
-				const cy = tr.yTop + Math.min(18, tr.height * 0.5);
-				lctx.fillStyle = tr.accent;
-				lctx.fillRect(10, cy - 2.5, 5, 5);
-				lctx.fillStyle = '#a4a3a0';
-				lctx.fillText(tr.title, 20, cy);
+			// 1. Lock dependency connectors (holder thread -> blocked waiter bar)
+			if (lockLinks.length > 0) {
+				lctx.save();
+				lctx.setLineDash([3, 3]);
+				for (const lk of lockLinks) {
+					lctx.strokeStyle = lk.highlight ? 'rgba(255, 113, 104, 0.95)' : 'rgba(255, 113, 104, 0.42)';
+					lctx.lineWidth = lk.highlight ? 1.8 : 1.1;
+					lctx.beginPath();
+					lctx.moveTo(lk.x, lk.fromY);
+					lctx.lineTo(lk.x, lk.toY);
+					lctx.stroke();
+
+					// Holder dot
+					lctx.setLineDash([]);
+					lctx.fillStyle = lk.highlight ? '#ff7168' : 'rgba(255, 113, 104, 0.72)';
+					lctx.beginPath();
+					lctx.arc(lk.x, lk.fromY, lk.highlight ? 3.5 : 2.5, 0, Math.PI * 2);
+					lctx.fill();
+
+					// Arrow tip onto blocked bar
+					lctx.beginPath();
+					lctx.moveTo(lk.x, lk.toY);
+					lctx.lineTo(lk.x - 3.5, lk.toY - 5);
+					lctx.lineTo(lk.x + 3.5, lk.toY - 5);
+					lctx.closePath();
+					lctx.fill();
+					lctx.setLineDash([3, 3]);
+				}
+				lctx.restore();
 			}
 
-			// Text directly inside every bar wide enough to read
+			// 2. Left gutter track headers + live CPU badge (`C2`)
+			lctx.textBaseline = 'middle';
+			for (const tr of tracks) {
+				const sy = tr.yTop - this.scrollY;
+				if (sy + tr.height < 0 || sy > cssH) continue;
+				const cy = sy + Math.min(20, tr.height * 0.5);
+				lctx.fillStyle = tr.accent;
+				lctx.fillRect(10, cy - 2.5, 5, 5);
+				lctx.font = '500 10.5px "Berkeley Mono", ui-monospace, monospace';
+				lctx.fillStyle = hoveredGutterTid === tr.tid && tr.tid !== null ? '#ebeae6' : '#a4a3a0';
+				lctx.fillText(tr.title, 20, cy);
+
+				// Compact core chip under Thread #N when CPU ID is known
+				const cpuHint = this.threadCpuHint.get(tr.key);
+				if (cpuHint && tr.height >= 44) {
+					lctx.font = '500 9.5px "Berkeley Mono", ui-monospace, monospace';
+					lctx.fillStyle = cpuHint.isE ? '#3987e5' : '#7d7c7a';
+					lctx.fillText(`C${cpuHint.cpu} · ${cpuHint.isE ? 'E' : 'P'}`, 20, cy + 15);
+				}
+			}
+
+			// 3. Direct text inside every bar wide enough to read
 			lctx.font = '500 10.5px "Berkeley Mono", ui-monospace, monospace';
 			lctx.textBaseline = 'middle';
 			const charW = 6.4;
@@ -675,16 +893,18 @@ export class GpuTimeline {
 			}
 		}
 
-		// Hover tooltip
-		if (hoveredSample && this.hoverX !== null && this.hoverY !== null) {
-			this.tooltipEl.hidden = false;
-			this.tooltipEl.innerHTML = `<strong>${hoveredSample.label}</strong> <span>${hoveredSample.detail}</span>`;
-			const left = Math.min(cssW - 250, Math.max(GUTTER_W + 6, this.hoverX + 12));
-			const top = Math.min(cssH - 28, Math.max(6, this.hoverY - 26));
-			this.tooltipEl.style.left = `${left}px`;
-			this.tooltipEl.style.top = `${top}px`;
+		// Structured hover callback for rich 2-zone hover card
+		if (this.hoverX !== null && this.hoverY !== null && (hoveredSample || hoveredGutterTid !== null)) {
+			this.onHover?.({
+				x: this.hoverX,
+				y: this.hoverY,
+				cssW,
+				cssH,
+				sample: hoveredSample,
+				threadGutter: hoveredGutterTid,
+			});
 		} else {
-			this.tooltipEl.hidden = true;
+			this.onHover?.(null);
 		}
 	}
 }

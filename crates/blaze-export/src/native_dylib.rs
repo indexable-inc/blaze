@@ -12,6 +12,7 @@
 //!     NotMac,                                         // image.platform is not MacosArm64
 //!     Library { name: &'a str },                      // a library resolved for another platform
 //!     TooLarge { what: &'static str, len: u64 },      // a field of the format too narrow
+//!     Slot { what: &'static str, value: u64, at: u64 }, // a chained slot's value its field cannot hold
 //!     Alloc,                                          // the output could not be reserved
 //!     Identifier { len: usize },                      // not 64 lowercase hex digits
 //!     TlsRelocs { count: usize },                     // ELF TLS relocations in a Mach-O image
@@ -77,6 +78,9 @@ pub enum DylibError<'a> {
     /// A value does not fit the format's field `what` (chained fixups' widths, 32-bit offsets,
     /// the header room of `Layout::header_reserve`).
     TooLarge { what: &'static str, len: u64 },
+    /// The chained slot at image address `at` holds `value`, which the slot's field `what`
+    /// cannot (rule 19: the place, which the layout's fixup list names).
+    Slot { what: &'static str, value: u64, at: u64 },
     /// The output's room could not be reserved.
     Alloc,
     /// The identifier is not a record id's 64 lowercase hex digits (NATIVE.md 3.10).
@@ -291,7 +295,10 @@ pub fn write<'a, 'b>(image: &Image<'a>, identifier: &str, out: &mut AVec<'_, u8>
         ChainImport { lead: b"", name: row.name, ordinal: FLAT_LOOKUP, weak: row.weak, addend }
     };
     let (blob, slots) = macho::chained_fixups(&chains, |c: &(u64, Chain)| *c, &chain_segs, ImportRows::Addend64, n_imports + extra.len(), import, alloc)
-        .map_err(|e| DylibError::TooLarge { what: e.what, len: e.len })?;
+        .map_err(|e| match e.at {
+            Some(at) => DylibError::Slot { what: e.what, value: e.len, at },
+            None => DylibError::TooLarge { what: e.what, len: e.len },
+        })?;
 
     // The exports: the trie dyld and dlsym search, and the symbol table tools read.
     let trie = export_trie(image, thread_vars, alloc)?;
@@ -368,21 +375,18 @@ pub fn write<'a, 'b>(image: &Image<'a>, identifier: &str, out: &mut AVec<'_, u8>
     for _ in 0..8 {
         bytes::u32(out, 0);
     }
-    let mut ncmds = 0u32;
     for seg in segs.iter() {
         macho::segment_command(out, seg.name, seg.vm, seg.vm_size, seg.file, seg.file_size, seg.prot, seg.count as u32, seg.flags);
         for s in sects[seg.first..seg.first + seg.count].iter() {
             let offset = if s.zero { 0 } else { s.at };
             macho::section_command(out, s.name, s.seg, s.at, s.len, offset, s.align, s.flags, 0);
         }
-        ncmds += 1;
     }
     dylib_command(out, LC_ID_DYLIB, identifier, 1, DYLIB_VERSION, DYLIB_VERSION);
     for (k, path) in paths.iter().enumerate() {
         let (current, compat) = if k == 0 { (macho::LIB_SYSTEM_CURRENT, macho::LIB_SYSTEM_COMPAT) } else { (DYLIB_VERSION, DYLIB_VERSION) };
         dylib_command(out, macho::LC_LOAD_DYLIB, path.as_str(), 2, current, compat);
     }
-    ncmds += 1 + paths.len() as u32;
     macho::linkedit_data(out, macho::LC_DYLD_CHAINED_FIXUPS, file_end + fixups_at, blob.len() as u64);
     macho::linkedit_data(out, LC_DYLD_EXPORTS_TRIE, file_end + trie_at, trie.len() as u64);
     let n = image.exports.len() as u32;
@@ -413,11 +417,14 @@ pub fn write<'a, 'b>(image: &Image<'a>, identifier: &str, out: &mut AVec<'_, u8>
     bytes::u32(out, 0); // ntools
     macho::linkedit_data(out, macho::LC_FUNCTION_STARTS, file_end + starts_at, starts_len);
     macho::linkedit_data(out, macho::LC_CODE_SIGNATURE, code_limit, sig_len);
-    ncmds += 7;
     let header_end = out.len() as u64;
     if header_end > text.at {
         return Err(DylibError::TooLarge { what: "the header and load commands past the image's header room", len: header_end });
     }
+    // Counted from the commands as written, never by hand: dyld reads only `ncmds` of them, and
+    // a hand count one short (LC_FUNCTION_STARTS added, the sum not moved) left the last,
+    // LC_CODE_SIGNATURE, unread: every image refused at `dlopen` as "missing code signature".
+    let ncmds = commands_in(&out[macho::HEADER as usize..]).ok_or(shape("a load command whose cmdsize is not a positive multiple of 8 or runs past the commands", header_end))?;
     let mut flags = MH_DYLDLINK | MH_TWOLEVEL | MH_NO_REEXPORTED_DYLIBS;
     if thread_vars.len > 0 {
         flags |= MH_HAS_TLV_DESCRIPTORS;
@@ -446,6 +453,24 @@ pub fn write<'a, 'b>(image: &Image<'a>, identifier: &str, out: &mut AVec<'_, u8>
     out[uuid_at..uuid_at + 16].copy_from_slice(&digest[..16]);
     sign::sign(out, identifier, text_size, false);
     Ok(())
+}
+
+/// How many load commands `cmds` holds (each `cmd`, `cmdsize`, then its body, little-endian),
+/// walked by their sizes; `None` when one's size is not a positive multiple of 8 or the last
+/// does not end exactly at the end of `cmds`.
+pub(crate) fn commands_in(cmds: &[u8]) -> Option<u32> {
+    let mut at = 0usize;
+    let mut count = 0u32;
+    while at < cmds.len() {
+        let field: [u8; 4] = cmds.get(at + 4..at + 8)?.try_into().ok()?;
+        let size = u32::from_le_bytes(field) as usize;
+        if size == 0 || !size.is_multiple_of(8) {
+            return None;
+        }
+        at = at.checked_add(size)?;
+        count = count.checked_add(1)?;
+    }
+    (at == cmds.len()).then_some(count)
 }
 
 /// `dylib_command`: the name after the 24-byte command, NUL-padded to 8.

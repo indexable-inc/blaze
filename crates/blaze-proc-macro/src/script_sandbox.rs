@@ -376,6 +376,11 @@ pub struct Script {
     pub limits: RunLimits,
     /// The answers for the pinned nightly, sorted by key.
     pub table: Arc<Vec<Row>>,
+    /// The probe checker and its records, when the command's setting turns it on
+    /// (script_probes.rs): a `rustc` probe is then checked by blaze's front end and the table
+    /// is not read. `None` (the default until the checker answers the real probes' ladder):
+    /// the table answers.
+    pub probes: Option<crate::script_probes::ScriptProbes>,
     /// The deterministic sandbox's executor, chosen once per command by its setting; `None`:
     /// the sandbox is off (D92, D94), and a spawn that needs it is refused by name.
     pub spawner: Option<Arc<dyn blaze_spawn::Executor + Send + Sync>>,
@@ -438,6 +443,15 @@ pub enum SpawnRefusal {
     /// `rustc` with a line blaze's reader of a probe refuses (`probe_ask::classify`): the
     /// argument at `at` (the line's end for a missing input) and why.
     RustcLine { args: Vec<String>, at: usize, why: probe_ask::Why },
+    /// With the probe checker on (script_probes.rs): a `rustc` line blaze's checker does not
+    /// take (`probe_check::read_line`, `probe_check::probe`): the argument at `at` and why.
+    ProbeLine { args: Vec<String>, at: usize, why: blaze_build_script::probe_check::Why },
+    /// With the probe checker on: the checker cannot say (D193 point 5: a body not taken to its
+    /// end, a sysroot it lacks, ...): the question's key and the stop's words. Never an exit.
+    ProbeUnknown { key: ContentId, args: Vec<String>, why: String },
+    /// With the probe checker on: the probe records refused a read or a write, or a record
+    /// under the key is not an answer: the key and the stop's words.
+    ProbeRecords { key: ContentId, args: Vec<String>, why: String },
     /// A program the sandbox does not run (a shell command, a tool in a build, ...).
     Program { program: String, args: Vec<String> },
     /// A `git` question blaze does not answer from the checkout (D53): the command after `git`.
@@ -498,6 +512,12 @@ impl std::fmt::Display for SpawnRefusal {
                 Some(arg) => write!(f, "asked the compiler `rustc {}`: its argument {at}, `{arg}`, is {why}", args.join(" ")),
                 None => write!(f, "asked the compiler `rustc {}`: {why}", args.join(" ")),
             },
+            SpawnRefusal::ProbeLine { args, at, why } => match args.get(*at) {
+                Some(arg) => write!(f, "asked the compiler `rustc {}`: its argument {at}, `{arg}`, is refused: {why}", args.join(" ")),
+                None => write!(f, "asked the compiler `rustc {}`, which is refused: {why}", args.join(" ")),
+            },
+            SpawnRefusal::ProbeUnknown { key, args, why } => write!(f, "asked the compiler `rustc {}` (probe {:02x?}): {why}", args.join(" "), &key.0[..8]),
+            SpawnRefusal::ProbeRecords { key, args, why } => write!(f, "asked the compiler `rustc {}` (probe {:02x?}): {why}", args.join(" "), &key.0[..8]),
             SpawnRefusal::Program { program, args } => write!(f, "spawned `{program} {}`, a program a build script may not run", args.join(" ")),
             SpawnRefusal::Git { command, why } => write!(f, "asked `git {command}`, which blaze does not answer from the checkout: {why}"),
             SpawnRefusal::Malformed(why) => write!(f, "made a spawn request blaze cannot read: {why}"),
@@ -1087,6 +1107,10 @@ impl ScriptSandbox {
         let name = program.rsplit('/').next().unwrap_or(program);
         let routed = crate::spawn_route::route(name, &args_text, self.script.c_mode, self.script.spawner.is_some());
         let (code, stdout, stderr): (i32, Vec<u8>, Vec<u8>) = match routed {
+            crate::spawn_route::Route::Rustc if self.script.probes.is_some() => {
+                let probes = self.script.probes.clone().expect("the arm's guard: the checker is on");
+                self.checked_probe(&probes, &args_text, &spawned, args)?
+            }
             crate::spawn_route::Route::Rustc => match probe_ask::classify(&args_text, Alloc::global()) {
                 Err(refused) => return Err(self.refuse(Refusal::Spawn(SpawnRefusal::RustcLine { args: owned(), at: refused.at, why: refused.why }))),
                 Ok(Ask::Version { verbose }) => (0, probe::version(verbose, &self.script.host, Alloc::global()).as_bytes().to_vec(), Vec::new()),

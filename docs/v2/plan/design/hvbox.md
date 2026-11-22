@@ -93,12 +93,12 @@ memory). Every touch of the kernel through the framework:
 | `hv_vm_map` | host memory freed or reused while the guest still maps it | the `Vm` owns each `GuestMem`; it is released only after its last stage-2 range is unmapped, or after `hv_vm_destroy` |
 | `hv_vm_protect` | stage-2 change of a range the helper did not map | only ranges the core's space holds; the cache, mapped in chunks, may not be reprotected (`Stop::CacheChange`) |
 | `hv_vm_unmap` | unmapping a range no slot backs, freeing the wrong memory | `Vm::unmap` finds the slot backing the host range first, or fails typed |
-| `hv_vm_destroy` | destroying with a vCPU alive | the `Vcpu` is declared after the `Vm` and drops first |
-| `hv_vcpu_create`, `_destroy` | a vCPU without a VM, or on another thread | `Vcpu::new` takes the `Vm`; one vCPU, made and run on the calling thread |
+| `hv_vm_destroy` | destroying with a vCPU alive; freeing memory a VM that failed to go still maps | the `Vm` owns its watchdog and its private `Vcpu`. Its drop runs in a fixed order: the watchdog (joined), then `hv_vcpu_destroy`, then `hv_vm_destroy`. When the destroy fails, the slots are leaked, never freed |
+| `hv_vcpu_create`, `_destroy` | a vCPU without a VM, two vCPUs, or one on another thread | only `Vm::start` makes the vCPU, once, on the calling thread; `Vcpu` is private to vm.rs |
 | `hv_vcpu_run` | guest code reaching the host | none can: the guest runs at EL0 under the stub at EL1 inside the VM; every exception is an exit; the loop is bounded (`MAX_EXITS`), the run under `timeout` |
 | register access (`hv_vcpu_get/set_reg`, `_sys_reg`) | a bad value harming the host | they set only the guest's registers; a wrong one faults the guest into an exit |
 | exits | acting on a guest-chosen host address | the core translates guest addresses through its space; the driver checks every host address the core hands it (memory reads and writes, every pointer of a forwarded call) lies inside a `GuestMem` (`Vm::holds_host`) and stops typed otherwise (`Error::OutsideGuest`) |
-| forwarded calls (`svc`) | the guest acting on the host as the owner | the call table: only listed calls, pointers translated and checked, paths through the grant, network, `kill`, `ptrace`, task ports, `mount`, `reboot`, spawning refused by name |
+| forwarded calls (`svc`) | the guest acting on the host as the owner | `HostCall::SameAbi` carries a `HostNr` (core/src/host_nr.rs), made only from eight path and listing numbers, and a const assert keeps every memory and task call out. On top of that, the call table: only listed calls, pointers translated and checked, paths through the grant, network, `kill`, `ptrace`, task ports, `mount`, `reboot`, spawning refused by name |
 | the commpage | the host's page entered in stage 2 | its bytes are read and copied into a `GuestMem`; the host's page is never mapped |
 
 UNVERIFIED, a residual risk to watch in the first runs: what frame an anonymous page the host
@@ -343,6 +343,70 @@ One guest thread is one vCPU on its own host thread (`hv_vcpu_create` is per thr
 host process, so a guest `posix_spawn` or `fork`+`exec` becomes a new helper process given the
 child's program, arguments, the inherited descriptors and the same grant, its trace merged into
 the parent's. `fork` without `exec` is refused by name until a tool is found that needs it.
+
+## Readiness: pinned clang on one C file, then jemalloc's `sh configure` and `make`
+
+Everything below comes from reading. The one recorded run (port27/hvbox-1116/scratch/hello.err) stopped inside dyld, at a data abort at address 8, before any path call. So every startup path list here is UNVERIFIED, and the first run's trace replaces it.
+
+**clang -c one.c**, listed in the order a run reaches each step:
+
+0. Get hello past dyld (that data abort). Nothing below runs before it.
+1. Paths go through `root.rs` (written, not wired into `paths.rs`). The startup opens, all UNVERIFIED:
+   - dyld with everything in the copied cache opens nothing (`shared_region_check_np` is emulated). `/dev/dtracehelper` may be opened; ENOENT is fine there.
+   - clang lstats `/tools`, `/tools/bin` and `/tools/bin/clang` to find its own path. It reads `/tools/lib/clang/<N>/include` and `/sdk` (via `-isysroot /sdk`) with its `SDKSettings.json`. `/usr/local/include` is a miss.
+   - Its own path comes from `fcntl(F_GETPATH)` (92) or `getattrlist` `ATTR_CMN_FULLPATH`, both answered from `Walk::path`.
+2. The 100 MB image maps through `Backing::Copy`, in chunks (`page_cache.rs`, below).
+3. Calls not in the table yet:
+   - `fcntl` (92), `lseek` (199), `pread` (153);
+   - `getrlimit`/`setrlimit` (194/195);
+   - `sigaction` (46), `sigaltstack` (53) and `__pthread_sigmask` (329): LLVM's crash handlers;
+   - `ioctl` (54) `TIOCGETA`, answered ENOTTY;
+   - `madvise` (75), emulated on guest memory, never forwarded;
+   - the output's temp-then-rename: an exclusive create in `/out`, then `rename` (128), both `Namespace` calls, plus `unlink` (10).
+   Whether `-fintegrated-cc1` starts a thread for stack space (`bsdthread_create` 360) is UNVERIFIED.
+
+**jemalloc `sh configure` and `make`**, after clang's list:
+
+1. `#!/bin/sh` and make's `SHELL` resolve through the `/bin/sh` link mount (done).
+2. `fork` (2) and `vfork` (66) are the first hard blocker: a shell forks for every command, subshell, `$(...)` and pipeline.
+   - Design: an `Effect::Fork`. The driver starts a child helper and streams it the parent's guest memory: registers, every `GuestMem` slot's bytes copied into the child's own private anonymous memory (never shared, so the Host safety rule holds), and the Sentry's state, including `Fds`.
+   - Cost: a copy of the shell's resident memory, a few MB, about 1 ms (UNVERIFIED).
+   - `vfork` is the same, with the parent held until the child's exec or exit.
+3. Pipes and redirections: `pipe` (42), `dup`/`dup2` (41/90), `fcntl` `F_DUPFD`/`F_SETFD`, and `posix_spawn` file actions. The model is written (`fds.rs`).
+   - The pipe itself is a host pipe the helper makes: one more host-call number (42), which maps no memory.
+   - A pipe read's split depends on host timing. Shells read to EOF, so their output is not affected, but a program that reads a pipe byte-count-sensitively is UNDETERMINED: name it if one is met.
+4. One namespace for many helpers. A shell, its `cc` and `sed` write `/out` and `/tmp` concurrently from different helpers, so the scratch model needs one owner: the step's first helper. The others ask it over a socketpair, one round trip per scratch create, rename or stat (about 10 µs, UNVERIFIED). Read-only mounts need no round trip; each helper answers them from the manifests.
+5. Signals:
+   - `sigaction` (46), `sigprocmask` (48), `sigsuspend` (111) and `sigreturn` (184);
+   - `SIGCHLD` delivered only when the guest blocks (`wait4`, `sigsuspend`, a pipe read), so the delivery point is the model's choice, not host timing;
+   - `wait4` `WNOHANG` answered from the same order rule (today it is refused).
+6. make compares times. Scratch entries need their own mtime in the model, set from the virtual clock on each write. Records stay at 0, so every output is newer than every input.
+7. configure runs the programs it built (`conftest`). Exec of a scratch file this step wrote is allowed: its bytes are an output, so the key holds. Any other exec is refused, as today.
+8. Path and process calls for sh, make and the base set:
+   - `chdir`/`fchdir` (12/13) and `getcwd`, from the model's cwd;
+   - `umask` (60), `getppid` (39), `getpgrp`/`setpgid`;
+   - the `*at` forms with a real dirfd: `fstatat64` 470, `unlinkat` 472, `mkdirat` 475, `renameat` 465, `readlinkat` 473;
+   - `readlink`/`symlink` (58/57), `chmod`/`fchmod` (15/124), `utimes`/`futimes` (138/139), `ftruncate` (201);
+   - `gettimeofday` (116), for `date`.
+   `openat` with a dirfd other than `AT_FDCWD` is refused today.
+9. The `uname`, `hostname` and `date` answers come from `Answers` (File view). `kern.version` and `hw.machine` are missing.
+
+**Cost floor for a 100 MB clang under `Backing::Copy`.** All numbers are estimates to replace with the first run's spans.
+
+- **Native floor.** dyld maps the file. Only the touched pages fault, from the page cache, with no copy. Say 40 MB touched for one small file, at roughly 0.2 µs per 16 KiB page: about 0.5 ms.
+- **An eager copy is the wrong design.**
+  - 100 MB at 5 to 10 GB/s of `pread` is 10 to 20 ms a spawn, and 100 MB resident a guest.
+  - Over the roughly 200 compiler runs of a configure, that is 2 to 4 s.
+- **The design: a content-keyed page cache** (`page_cache.rs`, pure, tested).
+  - Chunks are 256 KiB (16 pages), filled on the first stage-2 fault, keyed by `(content digest, chunk)`. Each chunk is copied once per helper into its own anonymous memory.
+  - Read-only and executable chunks are mapped into every later guest of that helper. Writable private pages are copied into per-guest slots.
+  - It needs a helper that serves several guests in turn. The VM is recreated between guests, and the cached slots are kept.
+  - First spawn: 160 faults plus 40 MB copied, about 5 to 9 ms.
+  - Every later spawn: about 160 `hv_vm_map` calls, about 0.3 ms (UNVERIFIED cost per call). That is within about 1.5x of the native floor on mapping, and the copy is paid once.
+  - Parallel jobs each have their own helper and their own copy: memory is jobs × working set.
+  - The guest cannot tell a hit from a miss (the test holds both views equal).
+
+Host-side notes, not written: the serve-many-guests loop in `host/src/lib.rs`, the fork snapshot stream, `HostCall::Pipe` and passing host descriptors to a child helper (`Fds::passed`), and the namespace owner's socket. Each lands with a test from the First run checklist, after the owner's go-ahead.
 
 ## Floor and how the ratio is measured
 

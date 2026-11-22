@@ -798,6 +798,88 @@ fn imports(l: &mut Linker<Host>) -> wasmtime::Result<()> {
             give(mem, into, capacity, dir.as_bytes())
         })
     })?;
+    refused_wasi(l)
+}
+
+/// The WASI module a proc macro imports from (wasm32-wasip1: 32-bit pointers).
+const WASI: &str = <W32 as blaze_wasi::Width>::MODULE;
+
+/// The preview 1 calls a proc macro may import but the sandbox permits none of (rule 9: it has
+/// no writable file system, no socket and no signal): each is defined, so a module that links
+/// one loads, and a call answers `EPERM`, which the macro sees as any refused call. napi-derive
+/// 3.5.2 (turso, 2026-11-21) imports `path_unlink_file` (its type-definition file) and did not
+/// load at all ("unknown import"). With [`blaze_wasi::FUNCTIONS`] and [`UNSERVED_WASI`] these
+/// are the whole of preview 1 (tests.rs checks it), so no import of it fails a load.
+pub(crate) const REFUSED_WASI: &[&str] = &[
+    "fd_allocate",
+    "fd_datasync",
+    "fd_fdstat_set_rights",
+    "fd_filestat_set_size",
+    "fd_filestat_set_times",
+    "fd_pwrite",
+    "fd_sync",
+    "path_create_directory",
+    "path_filestat_set_times",
+    "path_link",
+    "path_remove_directory",
+    "path_rename",
+    "path_symlink",
+    "path_unlink_file",
+    "proc_raise",
+    "sock_accept",
+    "sock_recv",
+    "sock_send",
+    "sock_shutdown",
+];
+
+/// The preview 1 calls the sandbox permits in kind but does not serve: a positioned read
+/// (`fd_pread`: the sandbox's reads are `fd_read`), a renumbered descriptor and an advice. A
+/// call answers `ENOTSUP`, a named errno, never a guess at what the call would have done.
+pub(crate) const UNSERVED_WASI: &[&str] = &["fd_advise", "fd_pread", "fd_renumber"];
+
+/// Defines [`REFUSED_WASI`] and [`UNSERVED_WASI`] with preview 1's signatures (`witx`): a wrong
+/// signature would fail the load as the missing import did.
+fn refused_wasi(l: &mut Linker<Host>) -> wasmtime::Result<()> {
+    let perm = i32::from(blaze_wasi::Errno::PERM.0);
+    let notsup = i32::from(blaze_wasi::Errno::NOTSUP.0);
+    // (fd)
+    for name in ["fd_datasync", "fd_sync", "proc_raise"] {
+        l.func_wrap(WASI, name, move |_: u32| -> i32 { perm })?;
+    }
+    // (fd, to) and (fd, how)
+    for (name, errno) in [("fd_renumber", notsup), ("sock_shutdown", perm)] {
+        l.func_wrap(WASI, name, move |_: u32, _: u32| -> i32 { errno })?;
+    }
+    // (fd, path, path_len) and (fd, flags, fd_out)
+    for name in ["path_create_directory", "path_remove_directory", "path_unlink_file", "sock_accept"] {
+        l.func_wrap(WASI, name, move |_: u32, _: u32, _: u32| -> i32 { perm })?;
+    }
+    // (fd, size)
+    l.func_wrap(WASI, "fd_filestat_set_size", move |_: u32, _: u64| -> i32 { perm })?;
+    // (fd, offset, len) and (fd, base, inheriting)
+    for name in ["fd_allocate", "fd_fdstat_set_rights"] {
+        l.func_wrap(WASI, name, move |_: u32, _: u64, _: u64| -> i32 { perm })?;
+    }
+    // (fd, offset, len, advice) and (fd, atim, mtim, fst_flags)
+    for (name, errno) in [("fd_advise", notsup), ("fd_filestat_set_times", perm)] {
+        l.func_wrap(WASI, name, move |_: u32, _: u64, _: u64, _: u32| -> i32 { errno })?;
+    }
+    // (fd, iovs, iovs_len, offset, out)
+    for (name, errno) in [("fd_pread", notsup), ("fd_pwrite", perm)] {
+        l.func_wrap(WASI, name, move |_: u32, _: u32, _: u32, _: u64, _: u32| -> i32 { errno })?;
+    }
+    // (fd, flags, path, path_len, atim, mtim, fst_flags)
+    l.func_wrap(WASI, "path_filestat_set_times", move |_: u32, _: u32, _: u32, _: u32, _: u64, _: u64, _: u32| -> i32 { perm })?;
+    // (old_fd, old_flags, old_path, old_len, new_fd, new_path, new_len)
+    l.func_wrap(WASI, "path_link", move |_: u32, _: u32, _: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { perm })?;
+    // (fd, old_path, old_len, new_fd, new_path, new_len) and (fd, data, data_len, flags, len_out, flags_out)
+    for name in ["path_rename", "sock_recv"] {
+        l.func_wrap(WASI, name, move |_: u32, _: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { perm })?;
+    }
+    // (old_path, old_len, fd, new_path, new_len) and (fd, data, data_len, flags, len_out)
+    for name in ["path_symlink", "sock_send"] {
+        l.func_wrap(WASI, name, move |_: u32, _: u32, _: u32, _: u32, _: u32| -> i32 { perm })?;
+    }
     Ok(())
 }
 

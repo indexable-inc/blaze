@@ -50,6 +50,8 @@ export interface RunSummary {
 export interface TelemetryEvent {
 	run: string;
 	kind: EventKindName;
+	flags: number;
+	cpu: number;
 	thread: number;
 	slot_or_op: number;
 	ts_ns: number;
@@ -58,6 +60,32 @@ export interface TelemetryEvent {
 	c: number;
 	d: number;
 	e: number;
+}
+
+export interface HostTopology {
+	arch: string;
+	os: string;
+	brand: string;
+	ncpu: number;
+	p_cores: number;
+	e_cores: number;
+	numa_nodes: number;
+	l1d_bytes: number;
+	l2_bytes: number;
+	mem_bytes: number;
+}
+
+export interface SourceSnippet {
+	file: string;
+	line: number;
+	lines: Array<{ n: number; text: string }>;
+}
+
+export interface SlotLocation {
+	name: string;
+	file?: string;
+	line?: number;
+	rebuilt?: boolean;
 }
 
 export interface ViewerInfo {
@@ -89,6 +117,7 @@ export interface BuildSummary {
 	recompile_reason: string;
 	phases: BuildPhase[];
 	slots?: Record<string, string>;
+	locations?: Record<string, SlotLocation>;
 }
 
 export type ServerMessage =
@@ -145,6 +174,7 @@ function base64ToBytes(b64: string): ArrayBuffer {
 export interface LiveHandlers {
 	onStatus(transport: TransportKind, detail: string): void;
 	onMessage(msg: ServerMessage): void;
+	onBinaryEvents?(rawPayload: Uint8Array, runId: string): void;
 }
 
 export class LiveClient {
@@ -174,6 +204,39 @@ export class LiveClient {
 		this.ws = null;
 		this.wt?.close();
 		this.wt = null;
+	}
+
+	async fetchTopology(): Promise<HostTopology | null> {
+		const origins =
+			window.location.origin && window.location.origin !== this.origin
+				? [this.origin, window.location.origin]
+				: [this.origin];
+		for (const base of origins) {
+			try {
+				const res = await fetch(`${base}/api/topology`, { cache: 'no-store' });
+				if (res.ok) return (await res.json()) as HostTopology;
+			} catch {
+				// Try next origin.
+			}
+		}
+		return null;
+	}
+
+	async fetchSource(file: string, line: number): Promise<SourceSnippet | null> {
+		const origins =
+			window.location.origin && window.location.origin !== this.origin
+				? [this.origin, window.location.origin]
+				: [this.origin];
+		const qs = `/api/source?file=${encodeURIComponent(file)}&line=${line}`;
+		for (const base of origins) {
+			try {
+				const res = await fetch(`${base}${qs}`, { cache: 'no-store' });
+				if (res.ok) return (await res.json()) as SourceSnippet;
+			} catch {
+				// Try next origin.
+			}
+		}
+		return null;
 	}
 
 	async toggleHook(runId: string, slot: number, kind: HookKindName): Promise<void> {
@@ -277,8 +340,11 @@ export class LiveClient {
 		});
 		ws.addEventListener('message', (ev) => {
 			if (ev.data instanceof ArrayBuffer) {
-				const msg = decodeBinaryEvents(ev.data);
-				if (msg) this.handlers.onMessage(msg);
+				const decoded = decodeBinaryEventsWithRaw(ev.data);
+				if (decoded) {
+					this.handlers.onBinaryEvents?.(decoded.raw, decoded.run);
+					this.handlers.onMessage(decoded.msg);
+				}
 				return;
 			}
 			if (typeof ev.data !== 'string') return;
@@ -319,6 +385,12 @@ const utf8Decoder = new TextDecoder();
  *   [u8 magic='B', u8 ver=1, u16 run_id_len (LE), run_id bytes..., pad to 8B, N * 64B Event]
  */
 export function decodeBinaryEvents(buf: ArrayBuffer): ServerMessage | null {
+	return decodeBinaryEventsWithRaw(buf)?.msg ?? null;
+}
+
+export function decodeBinaryEventsWithRaw(
+	buf: ArrayBuffer,
+): { run: string; raw: Uint8Array; msg: ServerMessage } | null {
 	if (buf.byteLength < 8) return null;
 	const view = new DataView(buf);
 	if (view.getUint8(0) !== 0x42 || view.getUint8(1) !== 1) return null;
@@ -327,12 +399,15 @@ export function decodeBinaryEvents(buf: ArrayBuffer): ServerMessage | null {
 	if (hdrLen > buf.byteLength) return null;
 	const run = utf8Decoder.decode(new Uint8Array(buf, 4, idLen));
 	const count = Math.floor((buf.byteLength - hdrLen) / 64);
+	const raw = new Uint8Array(buf, hdrLen, count * 64);
 	const events: TelemetryEvent[] = new Array(count);
 	for (let i = 0; i < count; i++) {
 		const off = hdrLen + i * 64;
 		events[i] = {
 			run,
 			kind: EVENT_KIND_TABLE[view.getUint8(off)] ?? 'sample',
+			flags: view.getUint8(off + 1),
+			cpu: view.getUint16(off + 2, true),
 			thread: view.getUint32(off + 4, true),
 			slot_or_op: view.getUint32(off + 8, true),
 			ts_ns: Number(view.getBigUint64(off + 16, true)),
@@ -343,5 +418,5 @@ export function decodeBinaryEvents(buf: ArrayBuffer): ServerMessage | null {
 			e: Number(view.getBigUint64(off + 56, true)),
 		};
 	}
-	return { type: 'events', events };
+	return { run, raw, msg: { type: 'events', events } };
 }
