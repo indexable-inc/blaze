@@ -72,6 +72,7 @@ fn main() -> Result<(), ModelError> {
                 limits: blaze_cad_mesh::MeshLimits::SHIPPED,
                 alloc,
                 scratch: alloc,
+                ..
             },
         )?;
         let t3 = Instant::now();

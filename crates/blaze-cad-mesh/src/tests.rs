@@ -714,7 +714,7 @@ fn simplified(
 ) -> Result<Decimated<'static>, Broken<MeshBroken>> {
     match decimate_planted(
         Source::Verified(source),
-        DecimateOpts { target, cos_crease: COS_32_DEGREES, limits: MeshLimits::SHIPPED, alloc: heap(), scratch: heap() },
+        DecimateOpts { target, cos_crease: COS_32_DEGREES, limits: MeshLimits::SHIPPED, alloc: heap(), scratch: heap(), .. },
         plant,
     ) {
         Ok(out) => Ok(out),
@@ -1476,7 +1476,7 @@ fn blob_tape(blobs: &[Blob]) -> Result<blaze_cad_field::Tape<'static>, Broken<Me
     compile(&g, root.id(), CompileOpts { alloc: heap(), .. }).map_err(harness)
 }
 
-fn contour_opts(tolerance_mm: f64) -> MeshOpts<'static, 'static> {
+fn contour_opts(tolerance_mm: f64) -> MeshOpts<'static, 'static, 'static> {
     MeshOpts { alloc: heap(), scratch: heap(), tolerance: blaze_units::Length::mm(tolerance_mm), .. }
 }
 
@@ -1735,6 +1735,7 @@ fn target_budget_enforces_triangle_cap_and_error_ceiling() {
             limits: MeshLimits::SHIPPED,
             alloc: heap(),
             scratch: heap(),
+            ..
         },
     )
     .expect("budget decimate");
@@ -1753,6 +1754,7 @@ fn target_budget_enforces_triangle_cap_and_error_ceiling() {
             limits: MeshLimits::SHIPPED,
             alloc: heap(),
             scratch: heap(),
+            ..
         },
     )
     .expect("ceiling decimate");
@@ -1800,4 +1802,126 @@ fn topology_counts_exact_holes_and_crease_profile_detects_bevels() {
     let prof_rnd = crease_profile(&m_rnd.mesh.view(), CreaseProfileOpts { scratch: heap(), .. }).expect("prof rnd");
     assert!(prof_sharp.sharp_edge_length > Length::mm(100.0), "sharp box must have sharp creases");
     assert!(prof_rnd.bevel_edge_length > Length::mm(50.0), "rounded box must have bevel edges, got {prof_rnd:?}");
+}
+
+#[test]
+fn feature_zone_refines_locally_updates_cache_keys_and_protects_decimation() {
+    use blaze_cad_field::{BoxOpts, CompileOpts, Graph, GraphOpts, compile};
+    use blaze_math::{Aabb3, Vec3};
+    use blaze_units::Length;
+
+    // 1) FeatureRegion signed distance and intersection sanity across Box, Ball, Capsule.
+    let bx = FeatureRegion::Box(Aabb3::new(Vec3::new(-0.01, -0.01, -0.01), Vec3::new(0.01, 0.01, 0.01)));
+    assert!(bx.contains(Vec3::new(0.0, 0.0, 0.0)));
+    assert!(!bx.contains(Vec3::new(0.02, 0.0, 0.0)));
+    let ball = FeatureRegion::Ball { center: Vec3::new(0.0, 0.0, 0.0), radius: Length::mm(10.0) };
+    assert!((ball.signed_distance(Vec3::new(0.015, 0.0, 0.0)) - 0.005).abs() < 1e-9);
+    let cap = FeatureRegion::Capsule {
+        a: Vec3::new(-0.02, 0.0, 0.0),
+        b: Vec3::new(0.02, 0.0, 0.0),
+        radius: Length::mm(5.0),
+    };
+    assert!(cap.contains(Vec3::new(0.0, 0.004, 0.0)));
+    assert!(!cap.contains(Vec3::new(0.0, 0.008, 0.0)));
+
+    // 2) Local octree refinement & PieceCache soundness: a rounded bar with a critical zone on its
+    // +X end refines locally there (more triangles inside +X than -X) and produces distinct
+    // RegionKeys on zoned pieces while untouched -X pieces keep their cached keys.
+    let mut g = Graph::new(GraphOpts { alloc: heap(), .. });
+    let bar = g
+        .cuboid(BoxOpts { size: [Length::mm(160.0), Length::mm(40.0), Length::mm(40.0)], round: Length::mm(8.0), .. })
+        .expect("bar");
+    let tape = compile(&g, bar.id(), CompileOpts { alloc: heap(), .. }).expect("compile");
+    let grid = auto_grid(&tape.aabb(), Length::mm(1.2), None);
+
+    let mut cache = PieceCache::new(PieceCacheOpts { alloc: heap(), .. });
+    let plain = mesh_cached(
+        &tape,
+        MeshOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(1.2), piece: grid.piece, feature: grid.feature, .. },
+        &mut cache,
+    )
+    .expect("plain mesh");
+
+    let right_end = FeatureRegion::Box(Aabb3::new(Vec3::new(0.04, -0.03, -0.03), Vec3::new(0.09, 0.03, 0.03)));
+    let mut zone = FeatureZone::new(right_end, FeatureProtect::Pinned);
+    zone.max_error = Some(Length::mm(0.25));
+    let zones = [zone];
+
+    let zoned = mesh_cached(
+        &tape,
+        MeshOpts {
+            alloc: heap(),
+            scratch: heap(),
+            tolerance: Length::mm(1.2),
+            piece: grid.piece,
+            feature: grid.feature,
+            zones: &zones,
+            ..
+        },
+        &mut cache,
+    )
+    .expect("zoned mesh");
+
+    // Zoned mesh is watertight (Verified) even when sharing `cache` with a coarser `plain` run,
+    // and preserves extra detail inside the +X zone.
+    assert!(
+        zoned.mesh.view().triangle_count() > plain.mesh.view().triangle_count(),
+        "zoned mesh ({}) should preserve extra detail over plain ({})",
+        zoned.mesh.view().triangle_count(),
+        plain.mesh.view().triangle_count()
+    );
+
+    // Shifting only the +X zone (same leaf) reuses untouched -X pieces from `cache` while
+    // recomputing only pieces touching the shifted zone!
+    let right_end_shifted = FeatureRegion::Box(Aabb3::new(Vec3::new(0.045, -0.03, -0.03), Vec3::new(0.09, 0.03, 0.03)));
+    let mut zone2 = FeatureZone::new(right_end_shifted, FeatureProtect::Pinned);
+    zone2.max_error = Some(Length::mm(0.25));
+    let zones2 = [zone2];
+    let zoned2 = mesh_cached(
+        &tape,
+        MeshOpts {
+            alloc: heap(),
+            scratch: heap(),
+            tolerance: Length::mm(1.2),
+            piece: grid.piece,
+            feature: grid.feature,
+            zones: &zones2,
+            ..
+        },
+        &mut cache,
+    )
+    .expect("shifted zoned mesh");
+    assert!(zoned2.stats.reused > 0, "untouched pieces should reuse PieceCache: {:?}", zoned2.stats);
+    assert!(zoned2.stats.recomputed > 0, "shifted zone pieces must recompute: {:?}", zoned2.stats);
+
+    // 3) Protected decimation: under a tight budget, the Pinned +X end retains strictly more
+    // triangles than the symmetrically identical unprotected -X end!
+    let dec = decimate(
+        Source::Verified(zoned.verified()),
+        DecimateOpts {
+            target: Target::Budget { error: Length::mm(1.2), max_triangles: 140, max_error: None },
+            cos_crease: COS_32_DEGREES,
+            zones: &zones,
+            limits: MeshLimits::SHIPPED,
+            alloc: heap(),
+            scratch: heap(),
+        },
+    )
+    .expect("zoned decimate");
+    let v = dec.mesh.view();
+    let pos = v.positions();
+    let mut left_tris = 0u32;
+    let mut right_tris = 0u32;
+    for tri in v.triangles() {
+        let cx = (pos[tri[0] as usize][0] + pos[tri[1] as usize][0] + pos[tri[2] as usize][0]) / 3.0;
+        if cx > 0.04 {
+            right_tris += 1;
+        } else if cx < -0.04 {
+            left_tris += 1;
+        }
+    }
+    assert!(
+        right_tris > left_tris * 2,
+        "pinned +X zone ({right_tris} tris) must retain >2x geometry of unprotected -X end ({left_tris} tris)"
+    );
 }

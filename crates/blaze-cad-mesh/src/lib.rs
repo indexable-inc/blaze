@@ -71,6 +71,7 @@ pub mod cluster;
 pub mod contour;
 pub mod decompose;
 pub mod digest;
+pub mod feature;
 pub mod geom;
 pub mod hull;
 pub mod ids;
@@ -97,6 +98,7 @@ pub use contour::{
 };
 pub use decompose::{ConvexPiece, DecomposeError, DecomposeOpts, Decomposition, decompose};
 pub use digest::MeshDigest;
+pub use feature::{FeatureProtect, FeatureRegion, FeatureZone};
 pub use geom::Aabb;
 pub use hull::{Flat, Hull, HullError, HullOpts, convex_hull, convex_hull_planted};
 pub use ids::{MaterialRole, PartId, TriId, VertexId, VertexPair};

@@ -11,7 +11,7 @@
 
 #![blaze::sans_io]
 
-use blaze_cad_mesh::MeshView;
+use blaze_cad_mesh::{FeatureRegion, MeshView};
 use blaze_cad_out::{Material, Transform};
 use blaze_math::{Aabb3, Vec3};
 use blaze_own::planted::{NoPlant, Planted, Plants};
@@ -39,6 +39,8 @@ pub enum MeshPicturePlant {
     IgnoreTransform,
     /// Ignores the mesh's shading normals even when [`MeshNormalSource::Shading`] is selected.
     FlatOnly,
+    /// Ignores [`MeshPictureOpts::highlights`] (never draws missed-feature callouts on the preview).
+    IgnoreHighlights,
 }
 
 impl Plants for MeshPicturePlant {}
@@ -86,10 +88,33 @@ pub struct MeshScenePart<'a> {
     pub tint_override: Option<[u8; 3]>,
 }
 
+/// Visual highlight style for a spatial feature region on an exported mesh preview.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HighlightStyle {
+    /// Failed fidelity target: vivid surface tint with screen-consistent diagonal hazard stripes
+    /// and a crisp solid boundary contour so missed keyholes, bevels, or mating surfaces jump out
+    /// immediately on any material colour.
+    Missed { colour: [u8; 3] },
+    /// Passing critical feature: subtle anti-aliased boundary contour showing the protected zone
+    /// without obscuring surface shading.
+    Outline { colour: [u8; 3] },
+}
+
+/// Spatial region on one part of a [`MeshScenePart`] scene to highlight in the export preview.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct MeshHighlight {
+    /// Index into the `parts` slice passed to [`render_mesh_scene`].
+    pub part_index: u32,
+    /// Feature region in that part's local coordinate frame (exact under transforms and parent
+    /// hierarchies).
+    pub region: FeatureRegion,
+    pub style: HighlightStyle,
+}
+
 /// Options for [`render_mesh`] and [`render_mesh_scene`].
 #[blaze::args]
 #[derive(Clone, Copy, Debug)]
-pub struct MeshPictureOpts<'a, 's> {
+pub struct MeshPictureOpts<'a, 's, 'h> {
     /// Where the output picture's pixels and depths live.
     pub alloc: Alloc<'a>,
     /// Where the BVH and transformed triangle table live.
@@ -107,6 +132,9 @@ pub struct MeshPictureOpts<'a, 's> {
     pub normal_source: MeshNormalSource = MeshNormalSource::Shading,
     /// Optional anti-aliased triangle wireframe overlay.
     pub wireframe: Wireframe = Wireframe::Off,
+    /// Optional spatial feature highlights (e.g. missed fidelity targets) rendered directly on
+    /// the exported triangles in part-local coordinates.
+    pub highlights: &'h [MeshHighlight] = &[],
     /// Deterministic supersampling per axis: `1` or `2` (2×2 RGSS).
     pub supersample: u8 = 1,
 }
@@ -116,7 +144,7 @@ pub fn render_mesh<'a>(
     mesh: MeshView<'_>,
     materials: &[Material<'_>],
     view: View,
-    o: MeshPictureOpts<'a, '_>,
+    o: MeshPictureOpts<'a, '_, '_>,
 ) -> Result<Picture<'a>, PictureError> {
     let part = [MeshScenePart { mesh, parent: None, transform: Transform::IDENTITY, tint_override: None }];
     render_mesh_scene(&part, materials, view, o)
@@ -128,7 +156,7 @@ pub fn render_mesh_scene<'a>(
     parts: &[MeshScenePart<'_>],
     materials: &[Material<'_>],
     view: View,
-    o: MeshPictureOpts<'a, '_>,
+    o: MeshPictureOpts<'a, '_, '_>,
 ) -> Result<Picture<'a>, PictureError> {
     render_mesh_scene_planted(parts, materials, view, o, NoPlant)
 }
@@ -138,7 +166,7 @@ pub fn render_mesh_scene_planted<'a>(
     parts: &[MeshScenePart<'_>],
     materials: &[Material<'_>],
     view: View,
-    o: MeshPictureOpts<'a, '_>,
+    o: MeshPictureOpts<'a, '_, '_>,
     plant: impl Planted<MeshPicturePlant>,
 ) -> Result<Picture<'a>, PictureError> {
     if o.supersample != 1 && o.supersample != 2 {
@@ -169,6 +197,7 @@ pub fn render_mesh_scene_planted<'a>(
     let ctx = ShadeContext::new(&cam, bvh.scene_bounds, &dummy_pic_opts);
     let mut stats = PictureStats::default();
     let use_shading_normals = matches!(o.normal_source, MeshNormalSource::Shading) && !plant.has(MeshPicturePlant::FlatOnly);
+    let active_highlights: &[MeshHighlight] = if plant.has(MeshPicturePlant::IgnoreHighlights) { &[] } else { o.highlights };
 
     for y in 0..view.height {
         for x in 0..view.width {
@@ -177,7 +206,20 @@ pub fn render_mesh_scene_planted<'a>(
                 stats.rays += 1;
                 if let Some(hit) = bvh.trace(origin, dir, f64::INFINITY, &mut stats) {
                     stats.hits += 1;
-                    let sample = shade_mesh_hit(&bvh, &cam, &ctx, &o, origin, dir, &hit, use_shading_normals, &mut stats);
+                    let sample = shade_mesh_hit(
+                        &bvh,
+                        &cam,
+                        &ctx,
+                        &o,
+                        active_highlights,
+                        f64::from(x) + 0.5,
+                        f64::from(y) + 0.5,
+                        origin,
+                        dir,
+                        &hit,
+                        use_shading_normals,
+                        &mut stats,
+                    );
                     let rgba = resolve_samples(sample, 1.0, ctx.linear_blend);
                     pixels.try_extend_from_slice(&rgba)?;
                     push(&mut depth, hit.t)?;
@@ -190,13 +232,27 @@ pub fn render_mesh_scene_planted<'a>(
                 let mut best_t = f64::INFINITY;
                 let mut any_hit = false;
                 for &(ox, oy) in &RGSS_2X2 {
-                    let (origin, dir) = cam.ray_at(f64::from(x) + ox, f64::from(y) + oy);
+                    let (sx, sy) = (f64::from(x) + ox, f64::from(y) + oy);
+                    let (origin, dir) = cam.ray_at(sx, sy);
                     stats.rays += 1;
                     if let Some(hit) = bvh.trace(origin, dir, f64::INFINITY, &mut stats) {
                         stats.hits += 1;
                         any_hit = true;
                         best_t = best_t.min(hit.t);
-                        let s = shade_mesh_hit(&bvh, &cam, &ctx, &o, origin, dir, &hit, use_shading_normals, &mut stats);
+                        let s = shade_mesh_hit(
+                            &bvh,
+                            &cam,
+                            &ctx,
+                            &o,
+                            active_highlights,
+                            sx,
+                            sy,
+                            origin,
+                            dir,
+                            &hit,
+                            use_shading_normals,
+                            &mut stats,
+                        );
                         for c in 0..4 {
                             sum[c] += s[c];
                         }
@@ -283,6 +339,48 @@ impl Affine3 {
         )
     }
 
+    #[inline]
+    fn point_v3(&self, p: Vec3) -> Vec3 {
+        Vec3::new(
+            self.m[0][0] * p.x + self.m[0][1] * p.y + self.m[0][2] * p.z + self.t[0],
+            self.m[1][0] * p.x + self.m[1][1] * p.y + self.m[1][2] * p.z + self.t[1],
+            self.m[2][0] * p.x + self.m[2][1] * p.y + self.m[2][2] * p.z + self.t[2],
+        )
+    }
+
+    fn inverse(&self) -> Affine3 {
+        let m = self.m;
+        let det = self.det();
+        if !(det.abs() > 1e-18 && det.is_finite()) {
+            return Affine3::IDENTITY;
+        }
+        let inv_det = 1.0 / det;
+        let inv_m = [
+            [
+                (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv_det,
+                (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * inv_det,
+                (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv_det,
+            ],
+            [
+                (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * inv_det,
+                (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv_det,
+                (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * inv_det,
+            ],
+            [
+                (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv_det,
+                (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv_det,
+                (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv_det,
+            ],
+        ];
+        let t = self.t;
+        let inv_t = [
+            -(inv_m[0][0] * t[0] + inv_m[0][1] * t[1] + inv_m[0][2] * t[2]),
+            -(inv_m[1][0] * t[0] + inv_m[1][1] * t[1] + inv_m[1][2] * t[2]),
+            -(inv_m[2][0] * t[0] + inv_m[2][1] * t[1] + inv_m[2][2] * t[2]),
+        ];
+        Affine3 { m: inv_m, t: inv_t }
+    }
+
     fn det(&self) -> f64 {
         let m = self.m;
         m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
@@ -350,6 +448,7 @@ struct WorldTri {
     metallic: f64,
     roughness: f64,
     emissive: [f64; 3],
+    part_idx: u32,
     bounds: Aabb3,
     centroid: Vec3,
 }
@@ -366,6 +465,7 @@ struct BvhNode {
 struct MeshBvh<'s> {
     nodes: Vec<BvhNode, Alloc<'s>>,
     tris: Vec<WorldTri, Alloc<'s>>,
+    inv_xforms: Vec<Affine3, Alloc<'s>>,
     scene_bounds: Aabb3,
 }
 
@@ -384,6 +484,7 @@ fn build_bvh<'s>(
     plant: impl Planted<MeshPicturePlant>,
 ) -> Result<MeshBvh<'s>, AllocFailure> {
     let mut world_xforms: Vec<Affine3, Alloc<'s>> = Vec::try_with_capacity_in(parts.len(), scratch)?;
+    let mut inv_xforms: Vec<Affine3, Alloc<'s>> = Vec::try_with_capacity_in(parts.len(), scratch)?;
     for part in parts {
         let local = if plant.has(MeshPicturePlant::IgnoreTransform) {
             Affine3::IDENTITY
@@ -395,6 +496,7 @@ fn build_bvh<'s>(
             _ => local,
         };
         push(&mut world_xforms, world)?;
+        push(&mut inv_xforms, world.inverse())?;
     }
 
     let total_tris: usize = parts.iter().map(|p| p.mesh.triangle_count() as usize).sum();
@@ -488,6 +590,7 @@ fn build_bvh<'s>(
                 metallic,
                 roughness,
                 emissive,
+                part_idx: part_idx as u32,
                 bounds: Aabb3::new(lo, hi),
                 centroid,
             })?;
@@ -495,7 +598,7 @@ fn build_bvh<'s>(
     }
 
     if tris.is_empty() {
-        return Ok(MeshBvh { nodes: Vec::new_in(scratch), tris, scene_bounds: Aabb3::EMPTY });
+        return Ok(MeshBvh { nodes: Vec::new_in(scratch), tris, inv_xforms, scene_bounds: Aabb3::EMPTY });
     }
 
     let mut nodes: Vec<BvhNode, Alloc<'s>> = Vec::try_with_capacity_in(tris.len().saturating_mul(2), scratch)?;
@@ -595,7 +698,7 @@ fn build_bvh<'s>(
         push(&mut work, (left_idx, start, mid))?;
     }
 
-    Ok(MeshBvh { nodes, tris, scene_bounds: root_bounds })
+    Ok(MeshBvh { nodes, tris, inv_xforms, scene_bounds: root_bounds })
 }
 
 #[inline]
@@ -825,7 +928,10 @@ fn shade_mesh_hit(
     bvh: &MeshBvh<'_>,
     cam: &Camera,
     ctx: &ShadeContext,
-    o: &MeshPictureOpts<'_, '_>,
+    o: &MeshPictureOpts<'_, '_, '_>,
+    highlights: &[MeshHighlight],
+    sx: f64,
+    sy: f64,
     origin: Vec3,
     dir: Vec3,
     hit: &MeshHit,
@@ -902,7 +1008,7 @@ fn shade_mesh_hit(
 
     // Optional anti-aliased screen-space wireframe overlay.
     match o.wireframe {
-        Wireframe::Off => colour,
+        Wireframe::Off => {}
         Wireframe::Overlay { width_px, colour: wc } | Wireframe::Only { width_px, colour: wc } => {
             let px_size = cam.tolerance_at(hit.t, 1.0);
             let d_world = (w * tri.alt_scale[0]).min(hit.u * tri.alt_scale[1]).min(hit.v * tri.alt_scale[2]);
@@ -919,9 +1025,66 @@ fn shade_mesh_hit(
                     colour[c] = (colour[c] * (1.0 - alpha) + edge_col[c] * alpha).clamp(0.0, 1.0);
                 }
             }
-            colour
         }
     }
+
+    // Optional spatial feature highlights (missed tolerance callouts & critical feature outlines)
+    // evaluated in the hit part's exact local frame.
+    if !highlights.is_empty() {
+        let px_size = cam.tolerance_at(hit.t, 1.0);
+        let p_local = bvh.inv_xforms[tri.part_idx as usize].point_v3(p);
+        for h in highlights {
+            if h.part_index != tri.part_idx {
+                continue;
+            }
+            let sd = h.region.signed_distance(p_local);
+            match h.style {
+                HighlightStyle::Missed { colour: hc } => {
+                    let ring_half = 1.6 * px_size;
+                    let alpha = if sd.abs() <= ring_half + 0.5 * px_size {
+                        let t = ((sd.abs() - ring_half) / px_size).clamp(0.0, 1.0);
+                        0.94 * (1.0 - t) + if sd <= 0.0 { 0.45 * t } else { 0.0 }
+                    } else if sd < 0.0 {
+                        // Subtle 45-degree screen-space diagonal hatch so missed regions remain
+                        // unmistakably readable on any underlying material colour.
+                        let phase = ((sx + sy) * 0.14).rem_euclid(1.0);
+                        if phase < 0.32 { 0.62 } else { 0.36 }
+                    } else {
+                        0.0
+                    };
+                    if alpha > 0.0 {
+                        let hcol = if ctx.linear_blend {
+                            [srgb_to_linear(hc[0]), srgb_to_linear(hc[1]), srgb_to_linear(hc[2])]
+                        } else {
+                            [f64::from(hc[0]) / 255.0, f64::from(hc[1]) / 255.0, f64::from(hc[2]) / 255.0]
+                        };
+                        for c in 0..3 {
+                            colour[c] = (colour[c] * (1.0 - alpha) + hcol[c] * alpha).clamp(0.0, 1.0);
+                        }
+                    }
+                }
+                HighlightStyle::Outline { colour: hc } => {
+                    let ring_half = 1.1 * px_size;
+                    if sd.abs() <= ring_half + 0.5 * px_size {
+                        let t = ((sd.abs() - ring_half) / px_size).clamp(0.0, 1.0);
+                        let alpha = 0.85 * (1.0 - t);
+                        if alpha > 0.0 {
+                            let hcol = if ctx.linear_blend {
+                                [srgb_to_linear(hc[0]), srgb_to_linear(hc[1]), srgb_to_linear(hc[2])]
+                            } else {
+                                [f64::from(hc[0]) / 255.0, f64::from(hc[1]) / 255.0, f64::from(hc[2]) / 255.0]
+                            };
+                            for c in 0..3 {
+                                colour[c] = (colour[c] * (1.0 - alpha) + hcol[c] * alpha).clamp(0.0, 1.0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    colour
 }
 
 #[allow(clippy::too_many_arguments)]

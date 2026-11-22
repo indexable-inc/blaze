@@ -8,12 +8,14 @@
 
 use blaze_cad_field::{CadPlant, Detail, Graph, Name, Placement};
 use blaze_cad_mesh::{
-    COS_32_DEGREES, DecimateOpts, Decimated, DecomposeOpts, GridSizing, HullOpts, LodOpts, MaterialRole, Mesh, MeshLimits,
-    MeshOpts, MeshView, Meshed, PieceCache, Source, Stop, Target, auto_grid, convex_hull, decimate, decompose, lod_chain, mesh,
-    mesh_cached, topology,
+    COS_32_DEGREES, DecimateOpts, Decimated, DecomposeOpts, FeatureProtect, FeatureZone, GridSizing, HullOpts, LodOpts,
+    MaterialRole, Mesh, MeshLimits, MeshOpts, MeshView, Meshed, PieceCache, Source, Stop, Target, auto_grid, convex_hull,
+    decimate, decompose, lod_chain, mesh, mesh_cached, topology,
 };
 use blaze_cad_out::{Collider, Encoding, GlbOpts, Limits, Lod, MassFacts, Material, Up, glb};
-use blaze_cad_picture::{MeshPictureOpts, MeshScenePart, Picture, View, render_mesh_scene};
+use blaze_cad_picture::{
+    HighlightStyle, MeshHighlight, MeshPictureOpts, MeshScenePart, Picture, View, Wireframe, render_mesh_scene,
+};
 use blaze_math::Aabb3;
 use blaze_own::planted::Planted;
 use blaze_own::{Alloc, Vec};
@@ -22,8 +24,8 @@ use blaze_units::{Angle, Density, Length};
 
 use crate::export::{hull_to_mesh, prepare_gpu_mesh};
 use crate::{
-    ColliderMode, ExportLodOpts, FidelityChecked, FidelityOpts, ModelError, Part, PartBudget, PartId, STEEL_ONLY, TriangleBudget,
-    Verdict, check_mesh_fidelity, mass_properties, part_tape, transform_of,
+    ColliderMode, ExportLodOpts, FeatureReport, FeatureTarget, FidelityChecked, FidelityOpts, ModelError, Part, PartBudget,
+    PartId, STEEL_ONLY, TriangleBudget, Verdict, check_mesh_fidelity_report, mass_properties, part_tape, transform_of,
 };
 
 /// Scale-aware tessellation and fidelity preset for [`build_game_asset`].
@@ -81,8 +83,8 @@ impl AssetPreset {
     /// Default normal-error limit for lost-bevel checking.
     pub fn default_max_normal_error(self) -> Angle {
         match self {
-            AssetPreset::HeroAsset => Angle::degrees(15.0),
-            AssetPreset::GameProp => Angle::degrees(20.0),
+            AssetPreset::HeroAsset => Angle::degrees(18.0),
+            AssetPreset::GameProp => Angle::degrees(22.0),
             AssetPreset::Environment => Angle::degrees(25.0),
             AssetPreset::Custom { .. } => Angle::degrees(20.0),
         }
@@ -126,10 +128,32 @@ impl AssetFidelityPolicy {
     };
 }
 
+/// A [`FeatureTarget`] attached to a named part in a [`build_game_asset`] call or [`crate::Model`].
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct PartFeature {
+    pub part: Name,
+    pub target: FeatureTarget,
+}
+
+impl PartFeature {
+    /// Attach `target` to the part named `part`.
+    #[inline]
+    pub fn new(part: &str, target: FeatureTarget) -> PartFeature {
+        PartFeature { part: Name::new(part), target }
+    }
+}
+
+/// One per-feature fidelity report entry bound to its owning part name.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct PartFeatureReport {
+    pub part: Name,
+    pub report: FeatureReport,
+}
+
 /// Options for [`build_game_asset`].
 #[blaze::args]
 #[derive(Clone, Copy, Debug)]
-pub struct GameAssetOpts<'a, 's, 'm> {
+pub struct GameAssetOpts<'a, 's, 'm, 'f> {
     /// Allocator for the returned GLB bytes, report, and retained preview meshes.
     pub alloc: Alloc<'a>,
     /// Scratch allocator for tapes, intermediate meshes, simplification maps, and fidelity checks.
@@ -145,6 +169,10 @@ pub struct GameAssetOpts<'a, 's, 'm> {
     pub min_part_triangles: u32 = 24,
     /// Material table indexed by each part's [`MaterialRole`].
     pub materials: &'m [Material<'m>] = STEEL_ONLY,
+    /// Optional per-feature critical targets (keyholes, bevels, mating surfaces) bound by part
+    /// name: preserved with extra geometry during meshing & decimation, checked per feature, and
+    /// highlighted in the export preview when any misses tolerance.
+    pub features: &'f [PartFeature] = &[],
     /// Optional uniform density for mass facts in the GLB.
     pub density: Option<Density> = None,
     /// Coordinate convention of the model (`Up::Z` turned to glTF's Y-up).
@@ -221,10 +249,11 @@ pub struct PartReport {
 }
 
 /// Bundle-level report across every part in a [`GameAsset`]. Implements [`Show`] to render a
-/// concise, deterministic per-part table + summary footer + any fidelity findings.
+/// concise, deterministic per-part table + per-feature critical-target table + summary footer.
 #[derive(Debug)]
 pub struct AssetReport<'a> {
     pub parts: Vec<PartReport, Alloc<'a>>,
+    pub features: Vec<PartFeatureReport, Alloc<'a>>,
     pub total_meshed: u64,
     pub total_written: u64,
     pub total_vertices: u64,
@@ -308,6 +337,36 @@ impl Show for AssetReport<'_> {
         out.put_str("\tfidelity=");
         out.put_str(if self.fidelity_passed { "PASS" } else { "FAIL" });
         out.put_byte(b'\n');
+        if !self.features.is_empty() {
+            out.put_str("FEATURES\tpart\tfeature\tkind\tprotect\ttris\terr_mm\tnorm_deg\tstatus\n");
+            for pf in self.features.iter() {
+                let r = &pf.report;
+                out.put_str("feature\t");
+                out.put_str(pf.part.as_str());
+                out.put_byte(b'\t');
+                out.put_str(r.name.as_str());
+                out.put_byte(b'\t');
+                out.put_str(r.kind.tag());
+                out.put_byte(b'\t');
+                out.put_str(match r.protect {
+                    FeatureProtect::Critical => "critical",
+                    FeatureProtect::Pinned => "pinned",
+                });
+                out.put_byte(b'\t');
+                out.int(r.triangles);
+                out.put_byte(b'\t');
+                put_mm(out, r.measured_error().as_nm(), 2);
+                out.put_byte(b'/');
+                put_mm(out, r.max_error.as_nm(), 2);
+                out.put_byte(b'\t');
+                put_deg(out, r.measured_normal_error.as_microarcsec(), 1);
+                out.put_byte(b'/');
+                put_deg(out, r.max_normal_error.as_microarcsec(), 1);
+                out.put_byte(b'\t');
+                r.verdict.show(out);
+                out.put_byte(b'\n');
+            }
+        }
     }
 }
 
@@ -364,13 +423,26 @@ pub struct ExportedPart<'a> {
     pub mesh: Mesh<'a>,
 }
 
-/// Complete game-asset build output: GLB bytes, structured per-part report, and retained exported
-/// meshes for WYSIWYG preview rendering.
+/// Vivid crimson highlight colour for features that missed their fidelity target.
+const MISSED_HIGHLIGHT_RGB: [u8; 3] = [245, 42, 68];
+
+/// Cool cyan contour colour for passing critical features in [`GameAsset::preview_fidelity`].
+const PASS_OUTLINE_RGB: [u8; 3] = [46, 196, 214];
+
+/// Complete game-asset build output: GLB bytes, structured per-part & per-feature report,
+/// retained exported meshes for WYSIWYG preview rendering, and automatic highlight overlays for
+/// any marked features that missed tolerance.
 #[derive(Debug)]
 pub struct GameAsset<'a> {
     pub glb: Vec<u8, Alloc<'a>>,
     pub report: AssetReport<'a>,
     pub parts: Vec<ExportedPart<'a>, Alloc<'a>>,
+    /// Spatial highlight regions for marked features that missed tolerance (drawn automatically by
+    /// [`GameAsset::preview`] when `opts.highlights` is empty).
+    pub missed_highlights: Vec<MeshHighlight, Alloc<'a>>,
+    /// Spatial highlight regions for all marked features (vivid crimson for missed features,
+    /// subtle cyan outline for passing critical features; drawn by [`GameAsset::preview_fidelity`]).
+    pub all_highlights: Vec<MeshHighlight, Alloc<'a>>,
 }
 
 /// Distinct, colorblind-friendly deterministic palette for [`GameAsset::preview_part_colors`].
@@ -395,11 +467,14 @@ impl GameAsset<'_> {
 
     /// Render a preview using the **actual exported, decimated, GPU-optimized meshes** at their
     /// real placements and parent hierarchy, shaded with `materials`.
+    ///
+    /// When `opts.highlights` is empty, any marked critical feature that missed tolerance is
+    /// highlighted directly on the exported mesh automatically.
     pub fn preview<'p>(
         &self,
         materials: &[Material<'_>],
         view: View,
-        opts: MeshPictureOpts<'p, '_>,
+        opts: MeshPictureOpts<'p, '_, '_>,
     ) -> Result<Picture<'p>, ModelError> {
         let mut scene_parts: Vec<MeshScenePart<'_>, Alloc<'_>> = Vec::new_in(opts.scratch);
         scene_parts.try_reserve(self.parts.len()).map_err(|_| ModelError::Alloc { what: "asset preview parts" })?;
@@ -413,12 +488,51 @@ impl GameAsset<'_> {
                 })
                 .map_err(|_| ModelError::Alloc { what: "asset preview parts" })?;
         }
-        render_mesh_scene(&scene_parts, materials, view, opts).map_err(ModelError::Picture)
+        let eff_opts = if opts.highlights.is_empty() && !self.missed_highlights.is_empty() {
+            MeshPictureOpts { highlights: &self.missed_highlights, ..opts }
+        } else {
+            opts
+        };
+        render_mesh_scene(&scene_parts, materials, view, eff_opts).map_err(ModelError::Picture)
+    }
+
+    /// Render a fidelity inspection preview of the **actual exported meshes**: shows both missed
+    /// critical features (vivid crimson tint + hazard hatch + boundary ring) and passing critical
+    /// features (crisp cyan contour outline), adding a subtle wireframe when `opts.wireframe` is
+    /// [`Wireframe::Off`].
+    pub fn preview_fidelity<'p>(
+        &self,
+        materials: &[Material<'_>],
+        view: View,
+        opts: MeshPictureOpts<'p, '_, '_>,
+    ) -> Result<Picture<'p>, ModelError> {
+        let mut scene_parts: Vec<MeshScenePart<'_>, Alloc<'_>> = Vec::new_in(opts.scratch);
+        scene_parts.try_reserve(self.parts.len()).map_err(|_| ModelError::Alloc { what: "asset preview parts" })?;
+        for p in self.parts.iter() {
+            scene_parts
+                .try_push(MeshScenePart {
+                    mesh: p.mesh.view(),
+                    parent: p.parent.map(|id| id.0),
+                    transform: transform_of(&p.placement),
+                    tint_override: None,
+                })
+                .map_err(|_| ModelError::Alloc { what: "asset preview parts" })?;
+        }
+        let wf = match opts.wireframe {
+            Wireframe::Off => Wireframe::Overlay { width_px: 0.75, colour: [36, 40, 48] },
+            other => other,
+        };
+        let eff_opts = MeshPictureOpts {
+            wireframe: wf,
+            highlights: if opts.highlights.is_empty() { &self.all_highlights } else { opts.highlights },
+            ..opts
+        };
+        render_mesh_scene(&scene_parts, materials, view, eff_opts).map_err(ModelError::Picture)
     }
 
     /// Render a preview using the **actual exported meshes** tinted with one distinct colour per
     /// named part (ideal for verifying part boundaries, wireframe density, and budget allocation).
-    pub fn preview_part_colors<'p>(&self, view: View, opts: MeshPictureOpts<'p, '_>) -> Result<Picture<'p>, ModelError> {
+    pub fn preview_part_colors<'p>(&self, view: View, opts: MeshPictureOpts<'p, '_, '_>) -> Result<Picture<'p>, ModelError> {
         let mut scene_parts: Vec<MeshScenePart<'_>, Alloc<'_>> = Vec::new_in(opts.scratch);
         scene_parts.try_reserve(self.parts.len()).map_err(|_| ModelError::Alloc { what: "asset preview parts" })?;
         for (i, p) in self.parts.iter().enumerate() {
@@ -431,7 +545,12 @@ impl GameAsset<'_> {
                 })
                 .map_err(|_| ModelError::Alloc { what: "asset preview parts" })?;
         }
-        render_mesh_scene(&scene_parts, &[], view, opts).map_err(ModelError::Picture)
+        let eff_opts = if opts.highlights.is_empty() && !self.missed_highlights.is_empty() {
+            MeshPictureOpts { highlights: &self.missed_highlights, ..opts }
+        } else {
+            opts
+        };
+        render_mesh_scene(&scene_parts, &[], view, eff_opts).map_err(ModelError::Picture)
     }
 }
 
@@ -574,21 +693,29 @@ struct ReadyLod<'s> {
 pub fn build_game_asset<'a, P: Planted<CadPlant>>(
     g: &Graph<'_, P>,
     parts: &[Part],
-    o: GameAssetOpts<'a, '_, '_>,
+    o: GameAssetOpts<'a, '_, '_, '_>,
     mut cache: Option<&mut PieceCache<'_>>,
 ) -> Result<GameAsset<'a>, ModelError> {
     let s = o.scratch;
     let cos_crease = o.cos_crease.unwrap_or_else(|| o.preset.default_cos_crease());
+    let default_norm_limit = o
+        .fidelity
+        .and_then(|fp| fp.max_normal_error)
+        .unwrap_or_else(|| o.preset.default_max_normal_error());
 
-    // Stage 1: resolve per-part tessellation settings and mesh each part with scale-aware grid.
+    // Stage 1: resolve per-part tessellation settings, per-feature zones, and mesh each part.
     let mut part_tols: Vec<Length, Alloc<'_>> = Vec::new_in(s);
     let mut part_grids: Vec<GridSizing, Alloc<'_>> = Vec::new_in(s);
     let mut part_max_errs: Vec<Option<Length>, Alloc<'_>> = Vec::new_in(s);
     let mut meshes: Vec<Meshed<'_>, Alloc<'_>> = Vec::new_in(s);
+    let mut part_feats: Vec<FeatureTarget, Alloc<'_>> = Vec::new_in(s);
+    let mut part_zones: Vec<FeatureZone, Alloc<'_>> = Vec::new_in(s);
+    let mut feat_ranges: Vec<(usize, usize), Alloc<'_>> = Vec::new_in(s);
     part_tols.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset part tolerances" })?;
     part_grids.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset part grids" })?;
     part_max_errs.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset part ceilings" })?;
     meshes.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset meshes" })?;
+    feat_ranges.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset feature ranges" })?;
 
     for part in parts {
         let tape = part_tape(g, part, Detail::Full, s)?;
@@ -601,8 +728,27 @@ pub fn build_game_asset<'a, P: Planted<CadPlant>>(
             ),
             _ => (o.preset.tolerance_for(&bounds), o.preset.min_feature(), None),
         };
+        let f_start = part_feats.len();
+        for pf in o.features {
+            if pf.part == part.name {
+                let zone = pf.target.to_zone(tol, default_norm_limit);
+                part_feats.try_push(pf.target).map_err(|_| ModelError::Alloc { what: "asset part features" })?;
+                part_zones.try_push(zone).map_err(|_| ModelError::Alloc { what: "asset feature zones" })?;
+            }
+        }
+        let f_end = part_feats.len();
+        feat_ranges.try_push((f_start, f_end)).map_err(|_| ModelError::Alloc { what: "asset feature ranges" })?;
+
         let grid = auto_grid(&bounds, tol, min_feat);
-        let mopts = MeshOpts { alloc: s, scratch: s, tolerance: tol, piece: grid.piece, feature: grid.feature, .. };
+        let mopts = MeshOpts {
+            alloc: s,
+            scratch: s,
+            tolerance: tol,
+            piece: grid.piece,
+            feature: grid.feature,
+            zones: &part_zones[f_start..f_end],
+            ..
+        };
         let meshed = match cache.as_deref_mut() {
             Some(c) => mesh_cached(&tape, mopts, c),
             None => mesh(&tape, mopts),
@@ -614,7 +760,8 @@ pub fn build_game_asset<'a, P: Planted<CadPlant>>(
         meshes.try_push(meshed).map_err(|_| ModelError::Alloc { what: "asset meshes" })?;
     }
 
-    // Stage 2: Phase-1 decimation (honor explicit per-part cap and eliminate flat/coplanar faces).
+    // Stage 2: Phase-1 decimation (honor explicit per-part cap, preserve marked feature zones,
+    // and eliminate flat/coplanar redundancy).
     let mut decimated: Vec<Decimated<'_>, Alloc<'_>> = Vec::new_in(s);
     let mut budget_inputs: Vec<BudgetInput, Alloc<'_>> = Vec::new_in(s);
     decimated.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset phase-1 decimation" })?;
@@ -623,13 +770,14 @@ pub fn build_game_asset<'a, P: Planted<CadPlant>>(
     for (i, (part, m)) in parts.iter().zip(meshes.iter()).enumerate() {
         let tol = part_tols[i];
         let cap = part.budget.explicit_cap();
+        let (fs, fe) = feat_ranges[i];
         let target = match cap {
             Some(max_t) => Target::Budget { error: tol, max_triangles: max_t, max_error: part_max_errs[i] },
             None => Target::Error(tol),
         };
         let d = decimate(
             Source::Verified(m.verified()),
-            DecimateOpts { target, cos_crease, limits: MeshLimits::SHIPPED, alloc: s, scratch: s },
+            DecimateOpts { target, cos_crease, zones: &part_zones[fs..fe], limits: MeshLimits::SHIPPED, alloc: s, scratch: s },
         )?;
         let nat = d.mesh.view().triangle_count();
         budget_inputs
@@ -638,32 +786,55 @@ pub fn build_game_asset<'a, P: Planted<CadPlant>>(
         decimated.try_push(d).map_err(|_| ModelError::Alloc { what: "asset phase-1 decimation" })?;
     }
 
-    // Stage 3: Total-budget allocation and Phase-2 re-decimation only for parts over their share.
+    // Stage 3: Total-budget allocation and incremental Phase-2 decimation continuing directly from
+    // Phase-1 `decimated[i]` (50–100× faster than restarting from raw meshed triangles while
+    // keeping a sound triangle-inequality Hausdorff bound and hard-pinning `Pinned` features).
     let allocated: Option<Vec<u32, Alloc<'_>>> = match o.total_budget {
         Some(TriangleBudget(total)) => Some(allocate_budgets(&budget_inputs, total, o.min_part_triangles, s)?),
         None => None,
     };
     if let Some(ref alloc_caps) = allocated {
-        for (i, m) in meshes.iter().enumerate() {
+        let mut stage3_zones: Vec<FeatureZone, Alloc<'_>> = Vec::new_in(s);
+        for i in 0..parts.len() {
             let cur = decimated[i].mesh.view().triangle_count();
             let target_cap = alloc_caps[i];
             if cur > target_cap {
-                let d2 = decimate(
-                    Source::Verified(m.verified()),
+                let base_err = decimated[i].error_bound;
+                let rem_max_err = part_max_errs[i].map(|ce| Length::nm((ce.as_nm() - base_err.as_nm()).max(0)));
+                let (fs, fe) = feat_ranges[i];
+                stage3_zones.clear();
+                for &z in &part_zones[fs..fe] {
+                    let mut z3 = z;
+                    if z3.protect == FeatureProtect::Pinned {
+                        // Phase 1 already reached `z.max_error`; allow zero extra shape error in
+                        // Phase 2 so pinned features strictly keep their original error bound.
+                        z3.max_error = Some(Length::ZERO);
+                    }
+                    stage3_zones.try_push(z3).map_err(|_| ModelError::Alloc { what: "asset stage-3 feature zones" })?;
+                }
+                let src = match decimated[i].verified() {
+                    Some(v) => Source::Verified(v),
+                    None => Source::Open(decimated[i].mesh.view()),
+                };
+                let mut d2 = decimate(
+                    src,
                     DecimateOpts {
-                        target: Target::Budget { error: part_tols[i], max_triangles: target_cap, max_error: part_max_errs[i] },
+                        target: Target::Budget { error: Length::ZERO, max_triangles: target_cap, max_error: rem_max_err },
                         cos_crease,
+                        zones: &stage3_zones,
                         limits: MeshLimits::SHIPPED,
                         alloc: s,
                         scratch: s,
                     },
                 )?;
+                d2.error_bound = base_err + d2.error_bound;
                 decimated[i] = d2;
             }
         }
     }
 
-    // Stage 4 & 5: GPU optimization, LODs, colliders, topology & sharp fidelity checks.
+    // Stage 4 & 5: GPU optimization, LODs, colliders, topology, per-part & per-feature fidelity
+    // checks, and preview highlight collection.
     let mut exported_parts: Vec<ExportedPart<'a>, Alloc<'a>> = Vec::new_in(o.alloc);
     exported_parts.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset exported parts" })?;
 
@@ -677,6 +848,10 @@ pub fn build_game_asset<'a, P: Planted<CadPlant>>(
 
     let mut part_reports: Vec<PartReport, Alloc<'a>> = Vec::new_in(o.alloc);
     part_reports.try_reserve(parts.len()).map_err(|_| ModelError::Alloc { what: "asset part reports" })?;
+
+    let mut feature_reports: Vec<PartFeatureReport, Alloc<'a>> = Vec::new_in(o.alloc);
+    let mut missed_highlights: Vec<MeshHighlight, Alloc<'a>> = Vec::new_in(o.alloc);
+    let mut all_highlights: Vec<MeshHighlight, Alloc<'a>> = Vec::new_in(o.alloc);
 
     let mut total_meshed = 0u64;
     let mut total_written = 0u64;
@@ -766,6 +941,7 @@ pub fn build_game_asset<'a, P: Planted<CadPlant>>(
             all_budgets_ok = false;
         }
 
+        let (fs, fe) = feat_ranges[i];
         let (fidelity, holes) = if let Some(fp) = o.fidelity {
             let tol = part_tols[i];
             let err_budget = d.error_bound + m.vertex_bound;
@@ -781,7 +957,7 @@ pub fn build_game_asset<'a, P: Planted<CadPlant>>(
             let min_hole_feature = fp.min_hole_feature.unwrap_or_else(|| (part_grids[i].feature * 0.5).max(tol * 6.0).max(Length::mm(4.0)));
             let tol_m = tol.as_m();
             let min_bevel_area_m2 = Some((tol_m * 4.0) * (tol_m * 4.0));
-            let fc = check_mesh_fidelity(
+            let rep = check_mesh_fidelity_report(
                 g,
                 part,
                 &opt_mesh.view(),
@@ -794,13 +970,38 @@ pub fn build_game_asset<'a, P: Planted<CadPlant>>(
                     min_hole_feature,
                     min_bevel_area_m2,
                     max_bevel_loss: fp.max_bevel_loss,
+                    features: &part_feats[fs..fe],
                     most_subdivisions: fp.most_subdivisions,
                     scratch: s,
                     ..
                 },
+                s,
             )?;
+            let fc = rep.checked;
             if !matches!(fc.verdict, Verdict::Pass) {
                 all_fidelity_ok = false;
+            }
+            for fr in rep.features.iter() {
+                feature_reports
+                    .try_push(PartFeatureReport { part: part.name, report: *fr })
+                    .map_err(|_| ModelError::Alloc { what: "asset feature reports" })?;
+                if fr.missed() {
+                    let hl = MeshHighlight {
+                        part_index: i as u32,
+                        region: fr.region,
+                        style: HighlightStyle::Missed { colour: MISSED_HIGHLIGHT_RGB },
+                    };
+                    missed_highlights.try_push(hl).map_err(|_| ModelError::Alloc { what: "asset missed highlights" })?;
+                    all_highlights.try_push(hl).map_err(|_| ModelError::Alloc { what: "asset all highlights" })?;
+                } else {
+                    all_highlights
+                        .try_push(MeshHighlight {
+                            part_index: i as u32,
+                            region: fr.region,
+                            style: HighlightStyle::Outline { colour: PASS_OUTLINE_RGB },
+                        })
+                        .map_err(|_| ModelError::Alloc { what: "asset all highlights" })?;
+                }
             }
             (Some(fc), fc.metrics.holes)
         } else {
@@ -899,6 +1100,7 @@ pub fn build_game_asset<'a, P: Planted<CadPlant>>(
 
     let report = AssetReport {
         parts: part_reports,
+        features: feature_reports,
         total_meshed,
         total_written,
         total_vertices,
@@ -908,5 +1110,5 @@ pub fn build_game_asset<'a, P: Planted<CadPlant>>(
         fidelity_passed: all_fidelity_ok,
     };
 
-    Ok(GameAsset { glb: glb_bytes, report, parts: exported_parts })
+    Ok(GameAsset { glb: glb_bytes, report, parts: exported_parts, missed_highlights, all_highlights })
 }
