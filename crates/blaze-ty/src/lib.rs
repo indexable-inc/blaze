@@ -50,6 +50,7 @@ mod relate;
 mod solve;
 pub mod type_set;
 pub mod union_ty;
+pub mod view_ty;
 mod tys;
 
 #[cfg(test)]
