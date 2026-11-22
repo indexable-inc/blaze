@@ -824,7 +824,7 @@ impl Uring {
         let stopping = hot.flags & STOPPING != 0;
         if res >= 0 {
             let tcp = self.listeners.get(Handle::from_bits(hot.of)).is_some_and(|it| !it.is_unix());
-            let socket = match self.admitted(hot, res) {
+            let socket = match self.admit_accepted(hot, res) {
                 Ok(Some(socket)) => socket,
                 // Refused and closed unread: as a connection that went before it was taken
                 // (below), the listen goes on.
@@ -899,7 +899,7 @@ impl Uring {
     /// driver's half of the table and handed to anyone; refused (another user, or a uid that
     /// cannot be read), it is closed here unread: `Ok(None)`, as the other drivers skip a
     /// `ConnectionAborted` accept. `Err`: the table could not take it (`Table::install`).
-    fn admitted(&mut self, hot: Hot, res: i32) -> io::Result<Option<Fixed>> {
+    fn admit_accepted(&mut self, hot: Hot, res: i32) -> io::Result<Option<Fixed>> {
         if hot.flags & UNIX_PEER == 0 {
             return Ok(Some(self.table.accepted(res as u32)));
         }

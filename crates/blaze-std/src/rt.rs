@@ -563,7 +563,7 @@ mod machine {
             return Err(failed("sched_getaffinity", std::io::Error::last_os_error()));
         }
         let allowed = |cpu: u32| (cpu as usize) < linux::SET_BYTES * 8 && mask[cpu as usize / 8] & (1 << (cpu % 8)) != 0;
-        let online = fs::read_to_string("/sys/devices/system/cpu/online").map_err(|error| failed("/sys/devices/system/cpu/online", error))?;
+        let online = std::fs::read_to_string("/sys/devices/system/cpu/online").map_err(|error| failed("/sys/devices/system/cpu/online", error))?;
         let online = cpu_list(&online).map_err(|why| failed("/sys/devices/system/cpu/online", why))?;
         let mut groups: StdVec<StdVec<u32>> = StdVec::new();
         let mut seen: StdVec<u32> = StdVec::new();
@@ -587,11 +587,11 @@ mod machine {
         let mut best: Option<(u32, String)> = None;
         for index in 0..16 {
             let dir = format!("/sys/devices/system/cpu/cpu{cpu}/cache/index{index}");
-            let Ok(level) = fs::read_to_string(format!("{dir}/level")) else {
+            let Ok(level) = std::fs::read_to_string(format!("{dir}/level")) else {
                 break;
             };
             let level: u32 = level.trim().parse().map_err(|error| failed("a cache's level", error))?;
-            let shared = fs::read_to_string(format!("{dir}/shared_cpu_list")).map_err(|error| failed("a cache's shared_cpu_list", error))?;
+            let shared = std::fs::read_to_string(format!("{dir}/shared_cpu_list")).map_err(|error| failed("a cache's shared_cpu_list", error))?;
             if best.as_ref().is_none_or(|(kept, _)| level > *kept) {
                 best = Some((level, shared));
             }
