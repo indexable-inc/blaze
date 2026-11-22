@@ -76,6 +76,8 @@ enum CadBroken {
     DraftWrong { should_fail: bool, verdict: String },
     /// A mesh fidelity check missed a lost hole or lost bevel (or falsely rejected a good mesh).
     FidelityWrong { what: &'static str, verdict: String },
+    /// Strict export validation or the publish gate silently accepted an invalid/failing export.
+    PublishWrong { what: &'static str, got: String },
 }
 
 impl fmt::Display for CadBroken {
@@ -147,6 +149,16 @@ blaze_sim::plants! {
         SkipVoidSubdivision => CadBroken::FidelityWrong { what: "off-center lost hole", .. },
         IgnoreNormalDeviation => CadBroken::FidelityWrong { what: "lost bevel", .. },
         IgnoreFeatureTargets => CadBroken::FidelityWrong { what: "critical feature target", .. },
+    }
+}
+
+blaze_sim::plants! {
+    impl PublishPlant breaks CadBroken {
+        None,
+        IgnoreUnknownFeaturePart => CadBroken::PublishWrong { what: "unknown feature part", .. },
+        AllowPartialFeatures => CadBroken::PublishWrong { what: "partial features", .. },
+        AllowFailedFeature => CadBroken::PublishWrong { what: "failed feature", .. },
+        AllowOverBudget => CadBroken::PublishWrong { what: "over budget", .. },
     }
 }
 
@@ -1503,5 +1515,254 @@ fn per_feature_fidelity_targets_preserve_geometry_report_and_highlight_misses() 
         auto_pic.pixels[..],
         plain_pic.pixels[..],
         "auto-highlighted export preview must visibly highlight the missed feature"
+    );
+}
+
+fn publish_validation_case(tape: &Tape, plant: impl Planted<PublishPlant> + Copy) -> Result<(), Broken<CadBroken>> {
+    use blaze_math::{Aabb3, Vec3};
+
+    let side = tape.int_in(40..=60i64, "box side mm") as f64;
+    let mut model = Model::new(ModelOpts { alloc: heap(), .. });
+    let cube = model
+        .graph()
+        .cuboid(BoxOpts { size: mm3(side, side, side), round: Length::mm(5.0), .. })
+        .map_err(harness)?;
+    model.add(PartOpts { solid: cube, name: "bracket" }).map_err(harness)?;
+
+    let region = FeatureRegion::Box(Aabb3::new(Vec3::new(-0.015, -0.015, -0.015), Vec3::new(0.015, 0.015, 0.015)));
+
+    // 1) Misspelled part name on a pinned feature target MUST be a hard error!
+    let typo_feats = [PartFeature::new(
+        "brackte",
+        FeatureTarget::new(FeatureTargetOpts {
+            name: "mount_pad",
+            kind: FeatureKind::MatingSurface,
+            region,
+            protect: FeatureProtect::Pinned,
+            ..
+        }),
+    )];
+    let typo_res = build_game_asset_planted(
+        model.graph_ref(),
+        model.parts(),
+        GameAssetOpts { alloc: heap(), scratch: heap(), features: &typo_feats, .. },
+        None,
+        plant,
+    );
+    if !matches!(typo_res, Err(ModelError::UnknownFeaturePart { .. })) {
+        return Err(Broken::Oracle(CadBroken::PublishWrong {
+            what: "unknown feature part",
+            got: format!("{:?}", typo_res.map(|a| a.report.checked_features)),
+        }));
+    }
+
+    // 2) Partial feature coverage (`fidelity: None` with a requested feature target) MUST block publish!
+    let valid_feat = [PartFeature::new(
+        "bracket",
+        FeatureTarget::new(FeatureTargetOpts {
+            name: "bevel_edge",
+            kind: FeatureKind::Bevel,
+            region: FeatureRegion::Box(Aabb3::new(
+                Vec3::new(-side / 2000.0, -side / 2000.0, side / 2000.0 - 0.01),
+                Vec3::new(side / 2000.0, side / 2000.0, side / 2000.0 + 0.005),
+            )),
+            protect: FeatureProtect::Critical,
+            ..
+        }),
+    )];
+    let unchecked = build_game_asset(
+        model.graph_ref(),
+        model.parts(),
+        GameAssetOpts { alloc: heap(), scratch: heap(), fidelity: None, features: &valid_feat, .. },
+        None,
+    )
+    .map_err(harness)?;
+    let partial_res = unchecked.report.check_publish_planted(
+        PublishCheckOpts { require_fidelity: false, require_all_features: true, .. },
+        plant,
+    );
+    if !matches!(partial_res, Err(PublishFailure::FeatureTargetMismatch { requested: 1, checked: 0, passed: 0 })) {
+        return Err(Broken::Oracle(CadBroken::PublishWrong {
+            what: "partial features",
+            got: format!("{partial_res:?}"),
+        }));
+    }
+
+    // 3) Failed requested feature target MUST block publish!
+    let impossible = [PartFeature::new(
+        "bracket",
+        FeatureTarget::new(FeatureTargetOpts {
+            name: "impossible_bevel",
+            kind: FeatureKind::Bevel,
+            region: FeatureRegion::Box(Aabb3::new(
+                Vec3::new(-side / 2000.0, -side / 2000.0, side / 2000.0 - 0.01),
+                Vec3::new(side / 2000.0, side / 2000.0, side / 2000.0 + 0.005),
+            )),
+            max_error: Some(Length::mm(0.001)),
+            max_normal_error: Some(Angle::degrees(0.5)),
+            protect: FeatureProtect::Critical,
+            ..
+        }),
+    )];
+    let failed_asset = build_game_asset(
+        model.graph_ref(),
+        model.parts(),
+        GameAssetOpts {
+            alloc: heap(),
+            scratch: heap(),
+            preset: AssetPreset::Environment,
+            total_budget: Some(TriangleBudget(48)),
+            features: &impossible,
+            ..
+        },
+        None,
+    )
+    .map_err(harness)?;
+    let fail_res = failed_asset
+        .report
+        .check_publish_planted(PublishCheckOpts { require_budget: false, require_all_features: true, .. }, plant);
+    if !matches!(fail_res, Err(PublishFailure::FeatureFailed { .. })) {
+        return Err(Broken::Oracle(CadBroken::PublishWrong {
+            what: "failed feature",
+            got: format!("{fail_res:?}"),
+        }));
+    }
+
+    // 4) Over-budget part MUST block publish!
+    let mut over_model = Model::new(ModelOpts { alloc: heap(), .. });
+    let s2 = over_model
+        .graph()
+        .cuboid(BoxOpts { size: mm3(side, side, side), round: Length::mm(5.0), .. })
+        .map_err(harness)?;
+    let (id2, _) = over_model.add(PartOpts { solid: s2, name: "bracket" }).map_err(harness)?;
+    over_model
+        .set_budget(
+            id2,
+            PartBudget::Detailed {
+                max_triangles: Some(TriangleBudget(4)),
+                tolerance: None,
+                min_feature: None,
+                max_error: Some(Length::mm(0.5)),
+                weight: 1.0,
+            },
+        )
+        .map_err(harness)?;
+    let over_asset = build_game_asset(
+        over_model.graph_ref(),
+        over_model.parts(),
+        GameAssetOpts { alloc: heap(), scratch: heap(), .. },
+        None,
+    )
+    .map_err(harness)?;
+    let over_res = over_asset
+        .report
+        .check_publish_planted(PublishCheckOpts { require_fidelity: false, require_all_features: false, .. }, plant);
+    if !matches!(over_res, Err(PublishFailure::BudgetExceeded { .. })) {
+        return Err(Broken::Oracle(CadBroken::PublishWrong {
+            what: "over budget",
+            got: format!("{over_res:?}"),
+        }));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn publish_validation_plants_are_caught() {
+    controls(Config::cases(3), |tape, plant: PublishPlant| publish_validation_case(tape, plant));
+}
+
+#[test]
+fn strict_export_validation_and_publish_gate_enforce_all_requested_targets() {
+    use blaze_math::{Aabb3, Vec3};
+
+    let mut model = Model::new(ModelOpts { alloc: heap(), .. });
+    let body = model.graph().cuboid(BoxOpts { size: mm3(100.0, 60.0, 20.0), .. }).expect("body");
+    let (body_id, _) = model.add(PartOpts { solid: body, name: "plate" }).expect("add plate");
+
+    let valid_box = FeatureRegion::Box(Aabb3::new(Vec3::new(-0.02, -0.02, -0.015), Vec3::new(0.02, 0.02, 0.015)));
+    let valid_target = FeatureTarget::new(FeatureTargetOpts {
+        name: "top_face",
+        kind: FeatureKind::MatingSurface,
+        region: valid_box,
+        max_error: Some(Length::mm(0.5)),
+        max_normal_error: Some(Angle::degrees(10.0)),
+        protect: FeatureProtect::Pinned,
+        ..
+    });
+
+    // 1) Unknown / misspelled part name is a hard error naming both part and feature.
+    let misspelled = [
+        PartFeature::new("plate", valid_target),
+        PartFeature::new(
+            "pltae",
+            FeatureTarget::new(FeatureTargetOpts {
+                name: "pinned_hole",
+                kind: FeatureKind::Keyhole,
+                region: valid_box,
+                protect: FeatureProtect::Pinned,
+                ..
+            }),
+        ),
+    ];
+    let err = build_game_asset(
+        model.graph_ref(),
+        model.parts(),
+        GameAssetOpts { alloc: heap(), scratch: heap(), features: &misspelled, .. },
+        None,
+    )
+    .expect_err("misspelled part name must fail");
+    assert_eq!(err, ModelError::UnknownFeaturePart { part: Name::new("pltae"), feature: Name::new("pinned_hole") });
+
+    // 2) Duplicate feature name on the same part is a hard error (both on Model and build_game_asset).
+    model.mark_feature(body_id, valid_target).expect("first mark");
+    let dup_err = model.mark_feature(body_id, valid_target).expect_err("duplicate feature name must fail");
+    assert_eq!(dup_err, ModelError::DuplicateFeatureName { part: Name::new("plate"), feature: Name::new("top_face") });
+
+    // 3) Invalid region (zero radius / inverted box) is refused upfront.
+    let bad_region = FeatureTarget::new(FeatureTargetOpts {
+        name: "bad_ball",
+        kind: FeatureKind::Keyhole,
+        region: FeatureRegion::Ball { center: Vec3::ZERO, radius: Length::ZERO },
+        ..
+    });
+    assert!(matches!(
+        model.mark_feature(body_id, bad_region),
+        Err(ModelError::InvalidFeatureTarget { .. })
+    ));
+
+    // 4) Passing asset with all requested targets mints a PublishProof and exposes publish_glb.
+    let (asset, proof) = publish_game_asset(
+        model.graph_ref(),
+        model.parts(),
+        GameAssetOpts {
+            alloc: heap(),
+            scratch: heap(),
+            preset: AssetPreset::HeroAsset,
+            features: model.features(),
+            ..
+        },
+        PublishCheckOpts { require_non_empty_features: true, .. },
+        None,
+    )
+    .expect("all targets pass publish gate");
+    assert_eq!(proof.parts(), 1);
+    assert_eq!(proof.requested_features(), 1);
+    assert_eq!(proof.passed_features(), 1);
+    assert_eq!(asset.publish_glb(proof).len(), asset.glb.len());
+    let rep_text = format!("{}", Shown(&asset.report));
+    assert!(rep_text.contains("features=1/1"), "report must show passed/requested features:\n{rep_text}");
+
+    // 5) `require_non_empty_features` blocks publishing when no targets were declared.
+    let bare = build_game_asset(
+        model.graph_ref(),
+        model.parts(),
+        GameAssetOpts { alloc: heap(), scratch: heap(), .. },
+        None,
+    )
+    .expect("bare build");
+    assert_eq!(
+        bare.check_publish(PublishCheckOpts { require_non_empty_features: true, .. }),
+        Err(PublishFailure::NoFeaturesDeclared)
     );
 }
