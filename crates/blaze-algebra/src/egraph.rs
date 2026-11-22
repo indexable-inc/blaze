@@ -36,6 +36,7 @@ pub enum ENode {
     Sqrt(EClassId),
     Tanh(EClassId),
     Abs(EClassId),
+    Select(EClassId, EClassId, EClassId),
 }
 
 impl ENode {
@@ -55,6 +56,7 @@ impl ENode {
             Self::Add(_, _) | Self::Sub(_, _) => 3,
             Self::Mul(_, _) => 4,
             Self::Div(_, _) => 6,
+            Self::Select(_, _, _) => 5,
             Self::Sqrt(_) => 8,
             Self::Pow(_, _) => 10,
             Self::Sin(_) | Self::Cos(_) | Self::Tan(_) | Self::Exp(_) | Self::Ln(_) | Self::Tanh(_) => 12,
@@ -148,6 +150,7 @@ impl<A: Allocator + Copy> EGraph<A> {
             ENode::Sqrt(a) => ENode::Sqrt(self.find(a)),
             ENode::Tanh(a) => ENode::Tanh(self.find(a)),
             ENode::Abs(a) => ENode::Abs(self.find(a)),
+            ENode::Select(c, t, e) => ENode::Select(self.find(c), self.find(t), self.find(e)),
         }
     }
 
@@ -554,6 +557,13 @@ impl<A: Allocator + Copy> EGraph<A> {
                             pending_unions.push((me, c));
                         }
                     }
+                    ENode::Select(c, t, e) => {
+                        if self.find(t) == self.find(e) {
+                            pending_unions.push((me, t));
+                        } else if let Some(cv) = self.const_of(c) {
+                            pending_unions.push((me, if cv > 0.0 { t } else { e }));
+                        }
+                    }
                     ENode::Const(_) | ENode::Var(_) => {}
                 }
             }
@@ -625,6 +635,9 @@ impl<A: Allocator + Copy> EGraph<A> {
                         | ENode::Div(a, b)
                         | ENode::Pow(a, b) => costs[self.find(a).0 as usize]
                             .saturating_add(costs[self.find(b).0 as usize]),
+                        ENode::Select(c, t, e) => costs[self.find(c).0 as usize]
+                            .saturating_add(costs[self.find(t).0 as usize])
+                            .saturating_add(costs[self.find(e).0 as usize]),
                     });
                     if c < costs[cid] {
                         costs[cid] = c;
@@ -727,6 +740,12 @@ impl<A: Allocator + Copy> EGraph<A> {
                 let ea = self.extract_rec(a, best, g, memo, depth + 1);
                 g.abs(ea)
             }
+            ENode::Select(c, t, e) => {
+                let ec = self.extract_rec(c, best, g, memo, depth + 1);
+                let et = self.extract_rec(t, best, g, memo, depth + 1);
+                let ee = self.extract_rec(e, best, g, memo, depth + 1);
+                g.select(ec, et, ee)
+            }
         };
         memo[idx] = Some(eid);
         eid
@@ -775,6 +794,10 @@ fn expr_cost_memo<A: Allocator + Copy>(
         Op::Sin(a) | Op::Cos(a) | Op::Tan(a) | Op::Exp(a) | Op::Ln(a) | Op::Tanh(a) => {
             12u32.saturating_add(expr_cost_memo(g, a, memo)?)
         }
+        Op::Select(c, t, e) => 5u32
+            .saturating_add(expr_cost_memo(g, c, memo)?)
+            .saturating_add(expr_cost_memo(g, t, memo)?)
+            .saturating_add(expr_cost_memo(g, e, memo)?),
     };
     memo[idx] = Some(c);
     Ok(c)
@@ -854,9 +877,246 @@ fn insert_expr<A: Allocator + Copy>(
             let ca = insert_expr(g, a, eg, memo)?;
             eg.add(ENode::Abs(ca))
         }
+        Op::Select(c, t, e) => {
+            let cc = insert_expr(g, c, eg, memo)?;
+            let ct = insert_expr(g, t, eg, memo)?;
+            let ce = insert_expr(g, e, eg, memo)?;
+            eg.add(ENode::Select(cc, ct, ce))
+        }
     };
     memo[idx] = Some(cid);
     Ok(cid)
+}
+
+/// One node in a flat, `const`-constructible declarative e-graph pattern (`PatNode`).
+/// Child indices refer to earlier elements of the pattern slice; the last element is the root.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PatNode {
+    /// Pattern wildcard `?0..=?7` binding any e-class (repeated uses enforce equality!).
+    Var(u8),
+    /// Exact constant bits (`canonical_f64_bits(v)`).
+    Const(u64),
+    Neg(usize),
+    Add(usize, usize),
+    Sub(usize, usize),
+    Mul(usize, usize),
+    Div(usize, usize),
+    Pow(usize, usize),
+    Sin(usize),
+    Cos(usize),
+    Tan(usize),
+    Exp(usize),
+    Ln(usize),
+    Sqrt(usize),
+    Tanh(usize),
+    Abs(usize),
+}
+
+impl PatNode {
+    #[inline]
+    pub const fn lit(v: f64) -> Self {
+        Self::Const(canonical_f64_bits(v))
+    }
+}
+
+/// Declarative, zero-allocation user-extensible e-graph rewrite rule `lhs => rhs`.
+/// Both `lhs` and `rhs` are flat slices of [`PatNode`] whose last element is the pattern root.
+#[derive(Clone, Copy, Debug)]
+pub struct RewriteRule<'r> {
+    pub name: &'r str,
+    pub lhs: &'r [PatNode],
+    pub rhs: &'r [PatNode],
+}
+
+/// Maximum number of pattern wildcards (`?0..=?7`) in one [`RewriteRule`].
+const MAX_PAT_VARS: usize = 8;
+/// Maximum e-matching substitutions collected per rule per e-class (`bounded-progress`).
+const MAX_MATCHES_PER_CLASS: usize = 16;
+
+type Subst = [Option<EClassId>; MAX_PAT_VARS];
+
+impl<A: Allocator + Copy> EGraph<A> {
+    fn ematch_node(
+        &self,
+        pat: &[PatNode],
+        pat_idx: usize,
+        class_id: EClassId,
+        subst: Subst,
+        out: &mut OwnVec<Subst, A>,
+    ) {
+        if out.len() >= MAX_MATCHES_PER_CLASS {
+            return;
+        }
+        let cid = self.find(class_id);
+        match pat[pat_idx] {
+            PatNode::Var(v) => {
+                let vi = v as usize;
+                if vi >= MAX_PAT_VARS {
+                    return;
+                }
+                match subst[vi] {
+                    Some(prev) if self.find(prev) == cid => out.push(subst),
+                    Some(_) => {}
+                    None => {
+                        let mut next = subst;
+                        next[vi] = Some(cid);
+                        out.push(next);
+                    }
+                }
+            }
+            PatNode::Const(bits) => {
+                let want = f64::from_bits(bits);
+                if self.const_of(cid) == Some(want) {
+                    out.push(subst);
+                }
+            }
+            node_pat => {
+                for &enode in self.classes[cid.0 as usize].iter() {
+                    if out.len() >= MAX_MATCHES_PER_CLASS {
+                        break;
+                    }
+                    match (node_pat, enode) {
+                        (PatNode::Neg(pa), ENode::Neg(ea))
+                        | (PatNode::Sin(pa), ENode::Sin(ea))
+                        | (PatNode::Cos(pa), ENode::Cos(ea))
+                        | (PatNode::Tan(pa), ENode::Tan(ea))
+                        | (PatNode::Exp(pa), ENode::Exp(ea))
+                        | (PatNode::Ln(pa), ENode::Ln(ea))
+                        | (PatNode::Sqrt(pa), ENode::Sqrt(ea))
+                        | (PatNode::Tanh(pa), ENode::Tanh(ea))
+                        | (PatNode::Abs(pa), ENode::Abs(ea)) => {
+                            self.ematch_node(pat, pa, ea, subst, out);
+                        }
+                        (PatNode::Add(pa, pb), ENode::Add(ea, eb))
+                        | (PatNode::Sub(pa, pb), ENode::Sub(ea, eb))
+                        | (PatNode::Mul(pa, pb), ENode::Mul(ea, eb))
+                        | (PatNode::Div(pa, pb), ENode::Div(ea, eb))
+                        | (PatNode::Pow(pa, pb), ENode::Pow(ea, eb)) => {
+                            let mut mid: OwnVec<Subst, A> = OwnVec::new_in(self.alloc);
+                            self.ematch_node(pat, pa, ea, subst, &mut mid);
+                            for &s1 in mid.iter() {
+                                self.ematch_node(pat, pb, eb, s1, out);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    fn instantiate_pat(&mut self, pat: &[PatNode], idx: usize, subst: &Subst) -> Option<EClassId> {
+        let cid = match pat[idx] {
+            PatNode::Var(v) => subst.get(v as usize).copied().flatten()?,
+            PatNode::Const(bits) => self.add(ENode::Const(bits)),
+            PatNode::Neg(a) => {
+                let ca = self.instantiate_pat(pat, a, subst)?;
+                self.add(ENode::Neg(ca))
+            }
+            PatNode::Add(a, b) => {
+                let ca = self.instantiate_pat(pat, a, subst)?;
+                let cb = self.instantiate_pat(pat, b, subst)?;
+                self.add(ENode::Add(ca, cb))
+            }
+            PatNode::Sub(a, b) => {
+                let ca = self.instantiate_pat(pat, a, subst)?;
+                let cb = self.instantiate_pat(pat, b, subst)?;
+                self.add(ENode::Sub(ca, cb))
+            }
+            PatNode::Mul(a, b) => {
+                let ca = self.instantiate_pat(pat, a, subst)?;
+                let cb = self.instantiate_pat(pat, b, subst)?;
+                self.add(ENode::Mul(ca, cb))
+            }
+            PatNode::Div(a, b) => {
+                let ca = self.instantiate_pat(pat, a, subst)?;
+                let cb = self.instantiate_pat(pat, b, subst)?;
+                self.add(ENode::Div(ca, cb))
+            }
+            PatNode::Pow(a, b) => {
+                let ca = self.instantiate_pat(pat, a, subst)?;
+                let cb = self.instantiate_pat(pat, b, subst)?;
+                self.add(ENode::Pow(ca, cb))
+            }
+            PatNode::Sin(a) => {
+                let ca = self.instantiate_pat(pat, a, subst)?;
+                self.add(ENode::Sin(ca))
+            }
+            PatNode::Cos(a) => {
+                let ca = self.instantiate_pat(pat, a, subst)?;
+                self.add(ENode::Cos(ca))
+            }
+            PatNode::Tan(a) => {
+                let ca = self.instantiate_pat(pat, a, subst)?;
+                self.add(ENode::Tan(ca))
+            }
+            PatNode::Exp(a) => {
+                let ca = self.instantiate_pat(pat, a, subst)?;
+                self.add(ENode::Exp(ca))
+            }
+            PatNode::Ln(a) => {
+                let ca = self.instantiate_pat(pat, a, subst)?;
+                self.add(ENode::Ln(ca))
+            }
+            PatNode::Sqrt(a) => {
+                let ca = self.instantiate_pat(pat, a, subst)?;
+                self.add(ENode::Sqrt(ca))
+            }
+            PatNode::Tanh(a) => {
+                let ca = self.instantiate_pat(pat, a, subst)?;
+                self.add(ENode::Tanh(ca))
+            }
+            PatNode::Abs(a) => {
+                let ca = self.instantiate_pat(pat, a, subst)?;
+                self.add(ENode::Abs(ca))
+            }
+        };
+        Some(cid)
+    }
+
+    fn apply_custom_rules(&mut self, rules: &[RewriteRule<'_>], max_enodes: usize) -> bool {
+        if rules.is_empty() {
+            return false;
+        }
+        let mut pending: OwnVec<(EClassId, EClassId), A> = OwnVec::new_in(self.alloc);
+        let nclasses = self.classes.len();
+        for rule in rules {
+            if rule.lhs.is_empty() || rule.rhs.is_empty() {
+                continue;
+            }
+            let lhs_root = rule.lhs.len() - 1;
+            let rhs_root = rule.rhs.len() - 1;
+            for cid in 0..nclasses {
+                if self.total_enodes >= max_enodes {
+                    break;
+                }
+                if self.parent[cid] != cid as u32 {
+                    continue;
+                }
+                let me = EClassId(cid as u32);
+                let mut matches: OwnVec<Subst, A> = OwnVec::new_in(self.alloc);
+                self.ematch_node(rule.lhs, lhs_root, me, [None; MAX_PAT_VARS], &mut matches);
+                for subst in matches.iter() {
+                    if self.total_enodes >= max_enodes {
+                        break;
+                    }
+                    if let Some(rhs_cid) = self.instantiate_pat(rule.rhs, rhs_root, subst) {
+                        pending.push((me, rhs_cid));
+                    }
+                }
+            }
+        }
+        let mut any = false;
+        for &(a, b) in pending.iter() {
+            if self.union(a, b) {
+                any = true;
+            }
+        }
+        if any {
+            self.rebuild();
+        }
+        any
+    }
 }
 
 /// Simplify `root` using bounded e-graph equality saturation with default options.
@@ -864,7 +1124,7 @@ pub fn simplify<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     root: ExprId,
 ) -> Result<ExprId, AlgebraError> {
-    let (id, _) = simplify_with(g, root, SimplifyOpts::default())?;
+    let (id, _) = simplify_with_rules(g, root, SimplifyOpts::default(), &[])?;
     Ok(id)
 }
 
@@ -873,6 +1133,16 @@ pub fn simplify_with<A: Allocator + Copy>(
     g: &mut ExprGraph<A>,
     root: ExprId,
     opts: SimplifyOpts,
+) -> Result<(ExprId, SimplifyStats), AlgebraError> {
+    simplify_with_rules(g, root, opts, &[])
+}
+
+/// Simplify `root` with explicit [`SimplifyOpts`] AND declarative user-defined [`RewriteRule`]s!
+pub fn simplify_with_rules<A: Allocator + Copy>(
+    g: &mut ExprGraph<A>,
+    root: ExprId,
+    opts: SimplifyOpts,
+    custom_rules: &[RewriteRule<'_>],
 ) -> Result<(ExprId, SimplifyStats), AlgebraError> {
     let cost_before = expr_cost(g, root)?;
     let n = g.len();
@@ -886,7 +1156,9 @@ pub fn simplify_with<A: Allocator + Copy>(
     let mut iterations = 0usize;
     for _ in 0..opts.max_iters {
         iterations += 1;
-        if !eg.saturate_once(opts.max_enodes) {
+        let builtin_changed = eg.saturate_once(opts.max_enodes);
+        let custom_changed = eg.apply_custom_rules(custom_rules, opts.max_enodes);
+        if !builtin_changed && !custom_changed {
             break;
         }
     }

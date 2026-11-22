@@ -30,9 +30,9 @@ use blaze_algebra::{
     simplify, simplify_poly_expr,
 };
 use blaze_body::{
-    BinOp, Block, BlockKind, Body, BodyBuilder, BuildError, Callee, ConstDecl, ConstKind, Local,
-    LocalDecl, LocalKind, Operand, Place, Role, Span, Stmt, StmtKind, UnOp, Unwind, Value,
-    Verified, VerifyError,
+    AggregateKind, BinOp, Block, BlockKind, Body, BodyBuilder, BuildError, Callee, ConstDecl,
+    ConstKind, Local, LocalDecl, LocalKind, Operand, Place, Role, Span, Stmt, StmtKind, UnOp,
+    Unwind, Value, Verified, VerifyError,
     body::{ExprId as MirExprId, Mutbl, PTy},
     verify,
 };
@@ -388,6 +388,11 @@ fn collect_postorder<A: Allocator + Copy>(
             collect_postorder(g, a, visited, order)?;
             collect_postorder(g, b, visited, order)?;
         }
+        Op::Select(c, t, e) => {
+            collect_postorder(g, c, visited, order)?;
+            collect_postorder(g, t, visited, order)?;
+            collect_postorder(g, e, visited, order)?;
+        }
     }
     order.push(id);
     Ok(())
@@ -395,7 +400,8 @@ fn collect_postorder<A: Allocator + Copy>(
 
 /// Splice any [`ExprId`](AlgExprId) from [`ExprGraph`] back into a fresh, CSE-shared, verified
 /// [`blaze_body::Body`]. Every shared DAG node is computed once into a temporary local; math
-/// operations emit real [`StmtKind::Call`] terminators with continuation blocks.
+/// operations emit real [`StmtKind::Call`] terminators with continuation blocks, and
+/// [`Op::Select`] emits real [`BinOp::Gt`] + [`StmtKind::Switch`] diamond CFGs.
 pub fn splice_body<A: Allocator + Copy, E: MathEmitter>(
     g: &ExprGraph<A>,
     root: AlgExprId,
@@ -404,12 +410,41 @@ pub fn splice_body<A: Allocator + Copy, E: MathEmitter>(
     math: &E,
     alloc: A,
 ) -> Result<Body<A>, BodyAlgebraError> {
+    splice_body_impl(g, &[root], vars, f64_ty, None, math, alloc)
+}
+
+/// Splice multiple [`ExprId`](AlgExprId) roots (e.g. `[f, ∂f/∂x, ∂f/∂y]`) into a **single**
+/// verified [`blaze_body::Body`] returning `[f64; K]` via `Value::Aggregate { kind: Array, .. }`,
+/// sharing every CSE temporary local across all outputs!
+pub fn splice_multi_body<A: Allocator + Copy, E: MathEmitter>(
+    g: &ExprGraph<A>,
+    roots: &[AlgExprId],
+    vars: &[VarId],
+    f64_ty: PTy,
+    array_ty: PTy,
+    math: &E,
+    alloc: A,
+) -> Result<Body<A>, BodyAlgebraError> {
+    splice_body_impl(g, roots, vars, f64_ty, Some(array_ty), math, alloc)
+}
+
+fn splice_body_impl<A: Allocator + Copy, E: MathEmitter>(
+    g: &ExprGraph<A>,
+    roots: &[AlgExprId],
+    vars: &[VarId],
+    f64_ty: PTy,
+    array_ty: Option<PTy>,
+    math: &E,
+    alloc: A,
+) -> Result<Body<A>, BodyAlgebraError> {
     let n = g.len();
-    if (root.0 as usize) >= n {
-        return Err(BodyAlgebraError::Algebra(AlgebraError::InvalidExpr {
-            expr: root,
-            node_count: n,
-        }));
+    for &root in roots {
+        if (root.0 as usize) >= n {
+            return Err(BodyAlgebraError::Algebra(AlgebraError::InvalidExpr {
+                expr: root,
+                node_count: n,
+            }));
+        }
     }
 
     let mut visited: OwnVec<bool, A> = OwnVec::with_capacity_in(n, alloc);
@@ -417,10 +452,13 @@ pub fn splice_body<A: Allocator + Copy, E: MathEmitter>(
         visited.push(false);
     }
     let mut order: OwnVec<AlgExprId, A> = OwnVec::new_in(alloc);
-    collect_postorder(g, root, &mut visited, &mut order)?;
+    for &root in roots {
+        collect_postorder(g, root, &mut visited, &mut order)?;
+    }
 
     let mut b = BodyBuilder::new_in(alloc);
-    let ret_local = b.new_local(LocalDecl { ty: f64_ty, kind: LocalKind::Return, mutbl: Mutbl::Mut });
+    let ret_ty = array_ty.unwrap_or(f64_ty);
+    let ret_local = b.new_local(LocalDecl { ty: ret_ty, kind: LocalKind::Return, mutbl: Mutbl::Mut });
     let ret_place = b.local_place(ret_local);
 
     let mut var_places: OwnVec<Place, A> = OwnVec::with_capacity_in(vars.len(), alloc);
@@ -444,17 +482,17 @@ pub fn splice_body<A: Allocator + Copy, E: MathEmitter>(
     let span = Span { lo: 0, hi: 0 };
 
     let mut next_temp_id = 0u32;
-    let mut alloc_temp = |b: &mut BodyBuilder<A>| -> Place {
+    let mut alloc_temp = |b: &mut BodyBuilder<A>, mutbl: Mutbl| -> Place {
         let l = b.new_local(LocalDecl {
             ty: f64_ty,
             kind: LocalKind::Temp(MirExprId(next_temp_id), Role::Value),
-            mutbl: Mutbl::Not,
+            mutbl,
         });
         next_temp_id += 1;
         b.local_place(l)
     };
 
-    let mut emit_math_call = |b: &mut BodyBuilder<A>,
+    let emit_math_call = |b: &mut BodyBuilder<A>,
                               op: MathOp,
                               call_args: &[Operand],
                               dest: Place,
@@ -479,8 +517,10 @@ pub fn splice_body<A: Allocator + Copy, E: MathEmitter>(
         Ok(())
     };
 
+    let single_root = if array_ty.is_none() { roots.first().copied() } else { None };
+
     for &id in order.iter() {
-        let is_root = id == root;
+        let is_single_root = single_root == Some(id);
         let op = g.node(id)?;
         match op {
             Op::Const(bits) => {
@@ -490,7 +530,7 @@ pub fn splice_body<A: Allocator + Copy, E: MathEmitter>(
                 });
                 let operand = Operand::Const(c);
                 node_ops[id.0 as usize] = Some(operand);
-                if is_root {
+                if is_single_root {
                     b.assign(ret_place, Value::Use(operand), span);
                 }
             }
@@ -504,13 +544,13 @@ pub fn splice_body<A: Allocator + Copy, E: MathEmitter>(
                     }))?;
                 let operand = Operand::Copy(var_places[pos]);
                 node_ops[id.0 as usize] = Some(operand);
-                if is_root {
+                if is_single_root {
                     b.assign(ret_place, Value::Use(operand), span);
                 }
             }
             Op::Neg(a) => {
                 let oa = node_ops[a.0 as usize].expect("postorder visited child");
-                let dest = if is_root { ret_place } else { alloc_temp(&mut b) };
+                let dest = if is_single_root { ret_place } else { alloc_temp(&mut b, Mutbl::Not) };
                 b.assign(dest, Value::Unary { op: UnOp::Neg, operand: oa }, span);
                 node_ops[id.0 as usize] = Some(Operand::Copy(dest));
             }
@@ -524,14 +564,14 @@ pub fn splice_body<A: Allocator + Copy, E: MathEmitter>(
                     Op::Div(_, _) => BinOp::Div,
                     _ => unreachable!(),
                 };
-                let dest = if is_root { ret_place } else { alloc_temp(&mut b) };
+                let dest = if is_single_root { ret_place } else { alloc_temp(&mut b, Mutbl::Not) };
                 b.assign(dest, Value::Binary { op: bin, lhs: oa, rhs: ob }, span);
                 node_ops[id.0 as usize] = Some(Operand::Copy(dest));
             }
             Op::Pow(a, b_id) => {
                 let oa = node_ops[a.0 as usize].expect("postorder visited base");
                 let ob = node_ops[b_id.0 as usize].expect("postorder visited exp");
-                let dest = if is_root { ret_place } else { alloc_temp(&mut b) };
+                let dest = if is_single_root { ret_place } else { alloc_temp(&mut b, Mutbl::Not) };
                 emit_math_call(&mut b, MathOp::Pow, &[oa, ob], dest, &mut cur_block)?;
                 node_ops[id.0 as usize] = Some(Operand::Copy(dest));
             }
@@ -555,11 +595,57 @@ pub fn splice_body<A: Allocator + Copy, E: MathEmitter>(
                     Op::Abs(_) => MathOp::Abs,
                     _ => unreachable!(),
                 };
-                let dest = if is_root { ret_place } else { alloc_temp(&mut b) };
+                let dest = if is_single_root { ret_place } else { alloc_temp(&mut b, Mutbl::Not) };
                 emit_math_call(&mut b, mop, &[oa], dest, &mut cur_block)?;
                 node_ops[id.0 as usize] = Some(Operand::Copy(dest));
             }
+            Op::Select(c_id, t_id, e_id) => {
+                let oc = node_ops[c_id.0 as usize].expect("postorder visited cond");
+                let ot = node_ops[t_id.0 as usize].expect("postorder visited then");
+                let oe = node_ops[e_id.0 as usize].expect("postorder visited else");
+                let zero_c = b.new_const(ConstDecl {
+                    kind: ConstKind::Scalar { bits: u128::from(0.0_f64.to_bits()) },
+                    ty: f64_ty,
+                });
+                let cmp_place = alloc_temp(&mut b, Mutbl::Not);
+                let dest = if is_single_root { ret_place } else { alloc_temp(&mut b, Mutbl::Mut) };
+                b.assign(
+                    cmp_place,
+                    Value::Binary { op: BinOp::Gt, lhs: oc, rhs: Operand::Const(zero_c) },
+                    span,
+                );
+                let bb_then = b.new_block(BlockKind::Normal);
+                let bb_else = b.new_block(BlockKind::Normal);
+                let bb_join = b.new_block(BlockKind::Normal);
+                let cases = b.cases(&[(1u128, bb_then)]);
+                b.terminate(
+                    StmtKind::Switch { on: Operand::Copy(cmp_place), cases, otherwise: bb_else },
+                    span,
+                );
+                b.start(bb_then);
+                b.assign(dest, Value::Use(ot), span);
+                b.terminate(StmtKind::Goto(bb_join), span);
+                b.start(bb_else);
+                b.assign(dest, Value::Use(oe), span);
+                b.terminate(StmtKind::Goto(bb_join), span);
+                b.start(bb_join);
+                cur_block = bb_join;
+                node_ops[id.0 as usize] = Some(Operand::Copy(dest));
+            }
         }
+    }
+
+    if let Some(arr_ty) = array_ty {
+        let mut elem_ops: OwnVec<Operand, A> = OwnVec::with_capacity_in(roots.len(), alloc);
+        for &r in roots {
+            elem_ops.push(node_ops[r.0 as usize].expect("postorder visited root"));
+        }
+        let ops = b.operands(elem_ops.as_slice());
+        b.assign(
+            ret_place,
+            Value::Aggregate { kind: AggregateKind::Array, ty: arr_ty, operands: ops },
+            span,
+        );
     }
 
     b.terminate(StmtKind::Return, span);
@@ -640,14 +726,51 @@ pub fn grad_bodies<A: Allocator + Copy, R: MathResolver, E: MathEmitter>(
     Ok(out)
 }
 
-/// Deterministic sans-IO scalar `f64` evaluator over any verified straight-line pure numeric
-/// [`blaze_body::Body`], using `blaze_math` for transcendental ops.
-pub fn eval_pure_body<A: Allocator + Copy, R: MathResolver>(
+/// End-to-end MIR → MIR fused value-and-gradient pass: compiles a verified scalar function
+/// `f(x_0, ..., x_{N-1}) -> f64` into a **single** verified [`Body`] returning `[f64; 1 + N]`
+/// (`[f, ∂f/∂x_0, ..., ∂f/∂x_{N-1}]`) where the primal value and every reverse-mode partial share
+/// one topological CSE MIR schedule via [`splice_multi_body`].
+pub fn value_and_grad_body<A: Allocator + Copy, R: MathResolver, E: MathEmitter>(
+    body: Verified<'_>,
+    array_ty: PTy,
+    resolve: &R,
+    emit: &E,
+    alloc: A,
+) -> Result<Body<A>, BodyAlgebraError> {
+    let mut lifted = lift_body(body, resolve, alloc)?;
+    let grads = grad_reverse(&mut lifted.graph, lifted.result, &lifted.vars)?;
+    let mut roots = OwnVec::with_capacity_in(1 + grads.len(), alloc);
+    let primal = simplify_poly_expr(&mut lifted.graph, lifted.result)?;
+    let primal = simplify(&mut lifted.graph, primal)?;
+    roots.push(primal);
+    for &d in grads.iter() {
+        let d = simplify_poly_expr(&mut lifted.graph, d)?;
+        let d = simplify(&mut lifted.graph, d)?;
+        roots.push(d);
+    }
+    splice_multi_body(
+        &lifted.graph,
+        roots.as_slice(),
+        &lifted.vars,
+        lifted.f64_ty,
+        array_ty,
+        emit,
+        alloc,
+    )
+}
+
+enum MirVal<A: Allocator + Copy> {
+    Scalar(f64),
+    Bool(bool),
+    Array(OwnVec<f64, A>),
+}
+
+fn eval_pure_impl<A: Allocator + Copy, R: MathResolver>(
     body: Verified<'_>,
     args_in: &[f64],
     math: &R,
     alloc: A,
-) -> Result<f64, BodyAlgebraError> {
+) -> Result<MirVal<A>, BodyAlgebraError> {
     let nlocals = body.locals() as usize;
     if nlocals == 0 {
         return Err(BodyAlgebraError::MissingReturnLocal);
@@ -660,25 +783,51 @@ pub fn eval_pure_body<A: Allocator + Copy, R: MathResolver>(
         });
     }
 
-    let mut env: OwnVec<Option<f64>, A> = OwnVec::with_capacity_in(nlocals, alloc);
+    let mut env: OwnVec<Option<MirVal<A>>, A> = OwnVec::with_capacity_in(nlocals, alloc);
     for _ in 0..nlocals {
         env.push(None);
     }
     for (i, &v) in args_in.iter().take(nargs).enumerate() {
-        env[i + 1] = Some(v);
+        env[i + 1] = Some(MirVal::Scalar(v));
     }
 
-    let read_op = |block: Block, stmt: Stmt, op: Operand, env: &[Option<f64>]| -> Result<f64, BodyAlgebraError> {
+    let read_f64 = |block: Block,
+                    stmt: Stmt,
+                    op: Operand,
+                    env: &[Option<MirVal<A>>]|
+     -> Result<f64, BodyAlgebraError> {
         match op {
             Operand::Copy(p) | Operand::Move(p) => {
                 let local = bare_local(body, block, stmt, p)?;
-                env.get(local.index())
-                    .copied()
-                    .flatten()
-                    .ok_or(BodyAlgebraError::UnassignedLocal { block, stmt, local })
+                match env.get(local.index()).and_then(Option::as_ref) {
+                    Some(MirVal::Scalar(v)) => Ok(*v),
+                    Some(_) => Err(BodyAlgebraError::UnsupportedValue { block, stmt }),
+                    None => Err(BodyAlgebraError::UnassignedLocal { block, stmt, local }),
+                }
             }
             Operand::Const(c) => match body.konst(c).kind {
                 ConstKind::Scalar { bits } => Ok(f64::from_bits(bits as u64)),
+                _ => Err(BodyAlgebraError::UnsupportedConst { block, stmt }),
+            },
+        }
+    };
+
+    let read_switch_val = |block: Block,
+                           stmt: Stmt,
+                           op: Operand,
+                           env: &[Option<MirVal<A>>]|
+     -> Result<u128, BodyAlgebraError> {
+        match op {
+            Operand::Copy(p) | Operand::Move(p) => {
+                let local = bare_local(body, block, stmt, p)?;
+                match env.get(local.index()).and_then(Option::as_ref) {
+                    Some(MirVal::Bool(b)) => Ok(u128::from(*b)),
+                    Some(_) => Err(BodyAlgebraError::UnsupportedValue { block, stmt }),
+                    None => Err(BodyAlgebraError::UnassignedLocal { block, stmt, local }),
+                }
+            }
+            Operand::Const(c) => match body.konst(c).kind {
+                ConstKind::Scalar { bits } => Ok(bits),
                 _ => Err(BodyAlgebraError::UnsupportedConst { block, stmt }),
             },
         }
@@ -707,18 +856,38 @@ pub fn eval_pure_body<A: Allocator + Copy, R: MathResolver>(
                 StmtKind::Assign { dest, value } => {
                     let local = bare_local(body, cur, stmt, dest)?;
                     let val = match value {
-                        Value::Use(op) => read_op(cur, stmt, op, &env)?,
-                        Value::Unary { op: UnOp::Neg, operand } => -read_op(cur, stmt, operand, &env)?,
+                        Value::Use(op) => MirVal::Scalar(read_f64(cur, stmt, op, &env)?),
+                        Value::Unary { op: UnOp::Neg, operand } => {
+                            MirVal::Scalar(-read_f64(cur, stmt, operand, &env)?)
+                        }
                         Value::Binary { op, lhs, rhs } => {
-                            let a = read_op(cur, stmt, lhs, &env)?;
-                            let b = read_op(cur, stmt, rhs, &env)?;
+                            let a = read_f64(cur, stmt, lhs, &env)?;
+                            let b = read_f64(cur, stmt, rhs, &env)?;
                             match op {
-                                BinOp::Add => a + b,
-                                BinOp::Sub => a - b,
-                                BinOp::Mul => a * b,
-                                BinOp::Div => a / b,
-                                _ => return Err(BodyAlgebraError::UnsupportedValue { block: cur, stmt }),
+                                BinOp::Add => MirVal::Scalar(a + b),
+                                BinOp::Sub => MirVal::Scalar(a - b),
+                                BinOp::Mul => MirVal::Scalar(a * b),
+                                BinOp::Div => MirVal::Scalar(a / b),
+                                BinOp::Gt => MirVal::Bool(a > b),
+                                BinOp::Lt => MirVal::Bool(a < b),
+                                BinOp::Ge => MirVal::Bool(a >= b),
+                                BinOp::Le => MirVal::Bool(a <= b),
+                                BinOp::Eq => MirVal::Bool(a == b),
+                                BinOp::Ne => MirVal::Bool(a != b),
+                                _ => {
+                                    return Err(BodyAlgebraError::UnsupportedValue {
+                                        block: cur,
+                                        stmt,
+                                    });
+                                }
                             }
+                        }
+                        Value::Aggregate { kind: AggregateKind::Array, operands, .. } => {
+                            let mut elems = OwnVec::with_capacity_in(operands.len() as usize, alloc);
+                            for op in body.ops(operands) {
+                                elems.push(read_f64(cur, stmt, op, &env)?);
+                            }
+                            MirVal::Array(elems)
                         }
                         _ => return Err(BodyAlgebraError::UnsupportedValue { block: cur, stmt }),
                     };
@@ -726,6 +895,18 @@ pub fn eval_pure_body<A: Allocator + Copy, R: MathResolver>(
                 }
                 StmtKind::Goto(next) => {
                     cur = next;
+                    break;
+                }
+                StmtKind::Switch { on, cases, otherwise } => {
+                    let discr = read_switch_val(cur, stmt, on, &env)?;
+                    let mut target = otherwise;
+                    for (val, blk) in body.cases(cases) {
+                        if val == discr {
+                            target = blk;
+                            break;
+                        }
+                    }
+                    cur = target;
                     break;
                 }
                 StmtKind::Call { callee, args, dest, target, .. } => {
@@ -740,7 +921,7 @@ pub fn eval_pure_body<A: Allocator + Copy, R: MathResolver>(
                     }
                     let mut vals = [0.0_f64; 2];
                     for (k, op) in body.ops(args).enumerate() {
-                        vals[k] = read_op(cur, stmt, op, &env)?;
+                        vals[k] = read_f64(cur, stmt, op, &env)?;
                     }
                     let res = match math_op {
                         MathOp::Sin => blaze_math::sin(vals[0]),
@@ -754,16 +935,50 @@ pub fn eval_pure_body<A: Allocator + Copy, R: MathResolver>(
                         MathOp::Pow => blaze_math::pow(vals[0], vals[1]),
                     };
                     let local = bare_local(body, cur, stmt, dest_place)?;
-                    env[local.index()] = Some(res);
+                    env[local.index()] = Some(MirVal::Scalar(res));
                     cur = next_block;
                     break;
                 }
                 StmtKind::Return => {
-                    return env[0].ok_or(BodyAlgebraError::MissingReturnValue { block: cur });
+                    return env[0].take().ok_or(BodyAlgebraError::MissingReturnValue { block: cur });
                 }
                 _ => return Err(BodyAlgebraError::UnsupportedStmt { block: cur, stmt }),
             }
         }
+    }
+}
+
+/// Deterministic sans-IO scalar `f64` evaluator over any verified acyclic pure numeric
+/// [`blaze_body::Body`] (including `Switch` diamond CFGs from `Op::Select`), using `blaze_math`
+/// for transcendental ops.
+pub fn eval_pure_body<A: Allocator + Copy, R: MathResolver>(
+    body: Verified<'_>,
+    args_in: &[f64],
+    math: &R,
+    alloc: A,
+) -> Result<f64, BodyAlgebraError> {
+    match eval_pure_impl(body, args_in, math, alloc)? {
+        MirVal::Scalar(v) => Ok(v),
+        _ => Err(BodyAlgebraError::MissingReturnValue { block: Block(0) }),
+    }
+}
+
+/// Deterministic sans-IO multi-output evaluator for a verified [`blaze_body::Body`] produced by
+/// [`splice_multi_body`] or [`value_and_grad_body`] returning `[f64; K]`.
+pub fn eval_pure_multi_body<A: Allocator + Copy, R: MathResolver>(
+    body: Verified<'_>,
+    args_in: &[f64],
+    math: &R,
+    alloc: A,
+) -> Result<OwnVec<f64, A>, BodyAlgebraError> {
+    match eval_pure_impl(body, args_in, math, alloc)? {
+        MirVal::Array(vs) => Ok(vs),
+        MirVal::Scalar(v) => {
+            let mut out = OwnVec::with_capacity_in(1, alloc);
+            out.push(v);
+            Ok(out)
+        }
+        MirVal::Bool(_) => Err(BodyAlgebraError::MissingReturnValue { block: Block(0) }),
     }
 }
 

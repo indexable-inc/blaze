@@ -75,6 +75,9 @@ impl<const N: usize> ConstGraph<N> {
             | (Op::Mul(a1, a2), Op::Mul(b1, b2))
             | (Op::Div(a1, a2), Op::Div(b1, b2))
             | (Op::Pow(a1, a2), Op::Pow(b1, b2)) => a1.0 == b1.0 && a2.0 == b2.0,
+            (Op::Select(c1, t1, e1), Op::Select(c2, t2, e2)) => {
+                c1.0 == c2.0 && t1.0 == t2.0 && e1.0 == e2.0
+            }
             _ => false,
         }
     }
@@ -206,6 +209,19 @@ impl<const N: usize> ConstGraph<N> {
                 }
                 Op::Pow(a, b)
             }
+            Op::Select(c, t, e) => {
+                if t.0 == e.0 {
+                    return self.nodes[t.0 as usize];
+                }
+                if let Some(cv) = self.const_of(ConstExpr(c.0)) {
+                    return if cv > 0.0 {
+                        self.nodes[t.0 as usize]
+                    } else {
+                        self.nodes[e.0 as usize]
+                    };
+                }
+                Op::Select(c, t, e)
+            }
             other => other,
         }
     }
@@ -265,6 +281,25 @@ impl<const N: usize> ConstGraph<N> {
 
     pub const fn sqrt(&mut self, a: ConstExpr) -> ConstExpr {
         self.intern(Op::Sqrt(ExprId(a.0)))
+    }
+
+    pub const fn select(&mut self, cond: ConstExpr, then_val: ConstExpr, else_val: ConstExpr) -> ConstExpr {
+        self.intern(Op::Select(ExprId(cond.0), ExprId(then_val.0), ExprId(else_val.0)))
+    }
+
+    pub const fn relu(&mut self, x: ConstExpr) -> ConstExpr {
+        let z = self.lit(0.0);
+        self.select(x, x, z)
+    }
+
+    pub const fn max_expr(&mut self, a: ConstExpr, b: ConstExpr) -> ConstExpr {
+        let c = self.sub(a, b);
+        self.select(c, a, b)
+    }
+
+    pub const fn min_expr(&mut self, a: ConstExpr, b: ConstExpr) -> ConstExpr {
+        let c = self.sub(b, a);
+        self.select(c, a, b)
     }
 
     /// **Compile-time symbolic differentiation** `∂(expr) / ∂(var_id)` inside `const fn`!
@@ -380,6 +415,11 @@ impl<const N: usize> ConstGraph<N> {
                 let sign = self.div(ConstExpr(u.0), expr);
                 self.mul(sign, du)
             }
+            Op::Select(c, t, e) => {
+                let dt = self.diff_memo(ConstExpr(t.0), wrt_var, cache);
+                let de = self.diff_memo(ConstExpr(e.0), wrt_var, cache);
+                self.select(ConstExpr(c.0), dt, de)
+            }
         };
         cache[idx] = out.0;
         out
@@ -399,6 +439,13 @@ impl<const N: usize> ConstGraph<N> {
                 let base = self.eval_const(ConstExpr(a.0), env);
                 let exp = self.eval_const(ConstExpr(b.0), env);
                 const_powi(base, exp as i32)
+            }
+            Op::Select(c, t, e) => {
+                if self.eval_const(ConstExpr(c.0), env) > 0.0 {
+                    self.eval_const(ConstExpr(t.0), env)
+                } else {
+                    self.eval_const(ConstExpr(e.0), env)
+                }
             }
             _ => panic!("transcendental eval_const requires runtime `eval` with `blaze-math`"),
         }
@@ -423,6 +470,13 @@ impl<const N: usize> ConstGraph<N> {
             Op::Sqrt(a) => blaze_math::sqrt(self.eval(ConstExpr(a.0), env)),
             Op::Tanh(a) => crate::det_tanh(self.eval(ConstExpr(a.0), env)),
             Op::Abs(a) => blaze_math::abs(self.eval(ConstExpr(a.0), env)),
+            Op::Select(c, t, e) => {
+                if self.eval(ConstExpr(c.0), env) > 0.0 {
+                    self.eval(ConstExpr(t.0), env)
+                } else {
+                    self.eval(ConstExpr(e.0), env)
+                }
+            }
         }
     }
 }

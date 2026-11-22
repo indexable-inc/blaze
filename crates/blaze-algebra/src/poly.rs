@@ -875,7 +875,8 @@ fn expr_to_poly_memo<A: Allocator + Copy>(
         | Op::Ln(_)
         | Op::Sqrt(_)
         | Op::Tanh(_)
-        | Op::Abs(_) => None,
+        | Op::Abs(_)
+        | Op::Select(_, _, _) => None,
     };
     cache[idx] = Some(res.as_ref().map(|p| p.clone_in(alloc)));
     Ok(res)
