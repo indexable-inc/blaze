@@ -179,6 +179,21 @@ pub struct DistanceOpts {
     pub most_boxes: u32 = 1 << 20,
 }
 
+/// What [`distance_between_stopping`] takes: [`DistanceOpts`] plus optional early-exit
+/// distance thresholds (metres).
+#[blaze::args]
+#[derive(Clone, Copy, Debug)]
+pub struct DistanceStopOpts {
+    /// How wide the answer may be, metres.
+    pub tolerance: f64,
+    /// Boxes it may evaluate.
+    pub most_boxes: u32 = 1 << 20,
+    /// Stop early as soon as the upper bound is strictly below this distance (metres).
+    pub stop_below: Option<f64> = None,
+    /// Stop early as soon as the lower bound is at or above this distance (metres).
+    pub stop_above: Option<f64> = None,
+}
+
 /// A box in the search, keyed by the least gap it can hold.
 #[derive(Clone, Copy)]
 struct Cand {
@@ -227,33 +242,67 @@ fn heap_pop(h: &mut AVec<'_, Cand>) -> Option<Cand> {
 }
 
 /// The distance between the solids of `a` and `b` (zero when they meet), best first over the
-/// boxes of `a`'s box that can hold points of `a`, each keyed by `max(0, lo of b's field)`
-/// there: the least key is a LOWER bound (a field is at most the distance outside its solid).
-/// An UPPER bound needs a field that IS the distance outside its solid: `b`'s when it is at
-/// least `Outside`, evaluated at centres found inside `a`; with weaker fields the answer stays
-/// open above and the budget ends it.
+/// boxes of `a`'s box that can hold points of `a`, each keyed by `max(0, lo of b's field,
+/// AABB gap to b's box)` there: the least key is a LOWER bound (a field is at most the
+/// distance outside its solid, and every point of `b` lies in `b`'s box). An UPPER bound
+/// needs a field that IS the distance outside its solid: `b`'s when it is at least `Outside`,
+/// evaluated at centres found inside `a`; with weaker fields the answer stays open above and
+/// the budget ends it.
 pub fn distance_between(a: &Tape<'_>, b: &Tape<'_>, o: DistanceOpts, s: &mut Scratch<'_>) -> Result<Gap, InspectError> {
+    distance_between_stopping(a, b, DistanceStopOpts { tolerance: o.tolerance, most_boxes: o.most_boxes, .. }, s)
+}
+
+/// [`distance_between`] with optional early-exit bounds (`stop_below` / `stop_above`): returns
+/// `Gap::Settled([lb, ub])` immediately once `lb >= stop_above` or `ub < stop_below`, in
+/// addition to the standard `ub - lb <= tolerance` stopping rule.
+pub fn distance_between_stopping(a: &Tape<'_>, b: &Tape<'_>, o: DistanceStopOpts, s: &mut Scratch<'_>) -> Result<Gap, InspectError> {
     if !(o.tolerance >= 0.0) {
         return Err(InspectError::Argument { arg: "tolerance", value: o.tolerance, accepted: "at least zero" });
     }
+    if let Some(lim) = o.stop_below
+        && !(lim >= 0.0)
+    {
+        return Err(InspectError::Argument { arg: "stop_below", value: lim, accepted: "at least zero" });
+    }
+    if let Some(lim) = o.stop_above
+        && !(lim >= 0.0)
+    {
+        return Err(InspectError::Argument { arg: "stop_above", value: lim, accepted: "at least zero" });
+    }
     let root = a.aabb();
+    if root.is_empty() {
+        return Ok(Gap::Empty);
+    }
     if !finite(&root) {
         return Err(InspectError::Unbounded { what: "the first solid's box" });
     }
+    let b_box = b.aabb();
+    let box_lb = |q: &Aabb3| if b_box.is_empty() { 0.0 } else { q.gap(&b_box) };
+    let root_lb = box_lb(&root);
     let measures = b.level().at_least(Level::Outside);
     let alloc = s.alloc();
     let mut heap: AVec<'_, Cand> = Vec::new_in(alloc);
-    heap_push(&mut heap, Cand { lb: 0.0, b: root });
+    heap_push(&mut heap, Cand { lb: root_lb, b: root });
     let mut ub = f64::INFINITY;
     let mut any = false;
     let mut spent: u64 = 0;
     while let Some(c) = heap_pop(&mut heap) {
         let lb = c.lb;
+        if let Some(lim) = o.stop_above
+            && lb >= lim
+        {
+            return Ok(Gap::Settled(Interval::hull_of(lb, ub)));
+        }
+        if let Some(lim) = o.stop_below
+            && ub < lim
+        {
+            return Ok(Gap::Settled(Interval::hull_of(lb, ub)));
+        }
         if ub - lb <= o.tolerance {
             return Ok(Gap::Settled(Interval::hull_of(lb, ub)));
         }
         if lb >= ub {
-            continue;
+            break;
         }
         spent += 1;
         if spent > u64::from(o.most_boxes) {
@@ -264,6 +313,14 @@ pub fn distance_between(a: &Tape<'_>, b: &Tape<'_>, o: DistanceOpts, s: &mut Scr
             any = true;
             if measures {
                 ub = ub.min(eval_point(b, centre, s).max(0.0));
+                if let Some(lim) = o.stop_below
+                    && ub < lim
+                {
+                    return Ok(Gap::Settled(Interval::hull_of(lb, ub)));
+                }
+                if ub - lb <= o.tolerance {
+                    return Ok(Gap::Settled(Interval::hull_of(lb, ub)));
+                }
             }
         }
         for q in octants(&c.b) {
@@ -272,7 +329,10 @@ pub fn distance_between(a: &Tape<'_>, b: &Tape<'_>, o: DistanceOpts, s: &mut Scr
                 continue;
             }
             let (fb, _) = eval_box(b, &q, s);
-            heap_push(&mut heap, Cand { lb: fb.lo().max(0.0), b: q });
+            let qlb = fb.lo().max(box_lb(&q)).max(0.0);
+            if !ub.is_finite() || qlb < ub {
+                heap_push(&mut heap, Cand { lb: qlb, b: q });
+            }
         }
     }
     if !any && ub == f64::INFINITY {
@@ -327,12 +387,65 @@ pub struct Hit {
     pub normal: Option<Vec3>,
 }
 
-/// The ray's first crossing, by sphere tracing. STOPPING RULE: from `t`, step by the field's
-/// value or `min_step`, whichever is more (the field is at most the distance, so a step of its
-/// value crosses nothing); a step that lands at or below zero brackets a crossing, which is
-/// bisected to the last representable width. A start at or below zero is a hit at `t = 0`.
-/// MISS: no point at or below zero was met before `t` passed `max_t`. A crossing and recrossing
-/// both within one `min_step`, or a tangent graze that never goes below zero, is not seen.
+/// Clips the ray interval `[0, max_t]` against `b` (which may have infinite faces), widening
+/// each finite slab entry/exit outward by two ulps so grazing surface hits are never missed.
+fn clip_ray_aabb(origin: Vec3, dir: Vec3, max_t: f64, b: &Aabb3) -> Option<(f64, f64)> {
+    if b.is_empty() {
+        return None;
+    }
+    let o = origin.to_array();
+    if !o.iter().all(|v| v.is_finite()) {
+        return Some((0.0, max_t));
+    }
+    let d = dir.to_array();
+    let lo = b.lo.to_array();
+    let hi = b.hi.to_array();
+    let (mut t_lo, mut t_hi) = (0.0f64, max_t);
+    for i in 0..3 {
+        if d[i] == 0.0 {
+            if o[i] < lo[i] || o[i] > hi[i] {
+                return None;
+            }
+            continue;
+        }
+        let t0 = if lo[i].is_finite() {
+            (lo[i] - o[i]) / d[i]
+        } else if d[i] > 0.0 {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+        let t1 = if hi[i].is_finite() {
+            (hi[i] - o[i]) / d[i]
+        } else if d[i] > 0.0 {
+            f64::INFINITY
+        } else {
+            f64::NEG_INFINITY
+        };
+        let (mut s_lo, mut s_hi) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
+        if s_lo.is_finite() {
+            s_lo = next_down(next_down(s_lo));
+        }
+        if s_hi.is_finite() {
+            s_hi = next_up(next_up(s_hi));
+        }
+        t_lo = t_lo.max(s_lo);
+        t_hi = t_hi.min(s_hi);
+        if t_lo > t_hi {
+            return None;
+        }
+    }
+    Some((t_lo, t_hi))
+}
+
+/// The ray's first crossing, by sphere tracing. Clips `[0, max_t]` against `t.aabb()` first so
+/// rays missing the bounding box return immediately and rays starting far away jump straight to
+/// entry. STOPPING RULE: from `t`, step by the field's value or `min_step`, whichever is more
+/// (the field is at most the distance, so a step of its value crosses nothing); a step that
+/// lands at or below zero brackets a crossing, which is bisected to the last representable
+/// width. A start at or below zero is a hit at `t = 0`. MISS: no point at or below zero was met
+/// before `t` passed `max_t`. A crossing and recrossing both within one `min_step`, or a tangent
+/// graze that never goes below zero, is not seen.
 pub fn ray(t: &Tape<'_>, o: RayOpts, s: &mut Scratch<'_>) -> Result<Option<Hit>, InspectError> {
     let Some(d) = o.dir.normalized() else {
         return Err(InspectError::ZeroDirection);
@@ -343,22 +456,25 @@ pub fn ray(t: &Tape<'_>, o: RayOpts, s: &mut Scratch<'_>) -> Result<Option<Hit>,
     if !(o.max_t >= 0.0) {
         return Err(InspectError::Argument { arg: "max_t", value: o.max_t, accepted: "at least zero" });
     }
+    let Some((t_enter, t_exit)) = clip_ray_aabb(o.origin, d, o.max_t, &t.aabb()) else {
+        return Ok(None);
+    };
     let at = |k: f64| o.origin + d * k;
     let hit = |k: f64, s: &mut Scratch<'_>| {
         let (_, g) = eval_grad(t, at(k), s);
         Hit { t: k, normal: g.normalized() }
     };
-    let mut k = 0.0;
+    let mut k = t_enter;
     let mut v = eval_point(t, at(k), s);
     if v <= 0.0 {
-        return Ok(Some(hit(0.0, s)));
+        return Ok(Some(hit(k, s)));
     }
     for _ in 0..o.most_steps {
         let next = k + v.max(o.min_step);
-        if next > o.max_t {
-            // The last stretch to `max_t` itself.
-            if k < o.max_t && eval_point(t, at(o.max_t), s) <= 0.0 {
-                return Ok(Some(hit(bisect(t, &at, k, o.max_t, s), s)));
+        if next > t_exit {
+            // The last stretch to `t_exit` itself.
+            if k < t_exit && eval_point(t, at(t_exit), s) <= 0.0 {
+                return Ok(Some(hit(bisect(t, &at, k, t_exit, s), s)));
             }
             return Ok(None);
         }

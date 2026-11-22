@@ -584,6 +584,19 @@ fn the_skipper_refuses_a_text_not_at_a_brace() {
     assert_eq!(skip_body(widest(), ""), Err(SkipError::NotAtBrace));
     assert_eq!(skip_body(widest(), "{ \"}\" '}' /* } */ // }\n }"), Ok(24));
     assert_eq!(tokenize("", FrontmatterAllowed::No, widest()).count(), 0);
+    for edge in [
+        "{ #[inline] fn g<'a, 'static>() { let c = '{'; let b = b'}'; } }",
+        "{ r#r\"\\\"}\" }",
+        "{ k#r\"\\\"}\" }",
+        "{ b'a }",
+        "{ 'a'b\"}\" }",
+        "{ r#{ } }",
+        "{ \"a\"suffix } ",
+    ] {
+        for cpu in cpus() {
+            same_skip("skip edge", edge, cpu, Plant::Clean).expect("matches rustc_lexer");
+        }
+    }
 }
 
 // ---- Planted-bug controls (rule 53).

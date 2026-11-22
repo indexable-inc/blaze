@@ -107,7 +107,7 @@ pub use counts::{Counts, completed, on_each_run, take_counts};
 pub use fetch::{Query, Recovery, fetch};
 pub use flight::{Alone, Flight, FlightKey, Flown, Hold, Kept, Scheduled};
 pub use home::{Home, Homes};
-pub use image::{Image, ImageOf, Imaged, Stable, StableKey};
+pub use image::{Image, ImageOf, Imaged, ImagedBytes, Stable, StableKey};
 pub use input::{Input, input, input_fact, new_input, set_singleton, singleton, try_singleton};
 pub use intern::{Interned, intern, interned};
 pub use keep::{keep, keep_iter, keep_owned, keep_slice, keep_str};

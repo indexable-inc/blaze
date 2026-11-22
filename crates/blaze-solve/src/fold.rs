@@ -13,10 +13,133 @@ use crate::tys::Tys;
 /// The most nodes one walk visits (rule 18).
 pub const MAX_WALK: usize = 1 << 22;
 
+#[derive(Clone, Copy)]
+struct MemoSlot {
+    key: u64,
+    val: Ty,
+    generation: u32,
+}
+
+impl MemoSlot {
+    const EMPTY: MemoSlot = MemoSlot { key: 0, val: Ty::NONE, generation: 0 };
+}
+
+#[inline(always)]
+fn memo_key(t: Ty, depth: u32) -> u64 {
+    (u64::from(depth) << 32) | u64::from(t.0)
+}
+
+#[inline(always)]
+fn hash_u64(mut x: u64) -> usize {
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+    x as usize
+}
+
+/// An O(1)-clear generation-stamped flat open-addressed hash table mapping `(Ty, u32)` to `Ty`.
+/// Each slot is 16 bytes so a probe touches one cache line, and clearing between imports only
+/// bumps `gen_now` without zeroing memory.
+struct ImportMemo<'a> {
+    slots: Vec<MemoSlot, Alloc<'a>>,
+    gen_now: u32,
+    len: usize,
+}
+
+impl<'a> ImportMemo<'a> {
+    fn new_in(alloc: Alloc<'a>) -> ImportMemo<'a> {
+        ImportMemo { slots: Vec::new_in(alloc), gen_now: 1, len: 0 }
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        self.len = 0;
+        self.gen_now = self.gen_now.wrapping_add(1);
+        if self.gen_now == 0 {
+            for s in self.slots.iter_mut() {
+                s.generation = 0;
+            }
+            self.gen_now = 1;
+        }
+    }
+
+    #[inline]
+    fn get(&self, t: Ty, depth: u32) -> Option<Ty> {
+        if self.len == 0 {
+            return None;
+        }
+        let key = memo_key(t, depth);
+        let mask = self.slots.len() - 1;
+        let mut at = hash_u64(key) & mask;
+        loop {
+            let s = self.slots[at];
+            if s.generation != self.gen_now {
+                return None;
+            }
+            if s.key == key {
+                return Some(s.val);
+            }
+            at = (at + 1) & mask;
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, t: Ty, depth: u32, val: Ty) {
+        if (self.len + 1) * 2 > self.slots.len() {
+            self.grow();
+        }
+        let key = memo_key(t, depth);
+        let mask = self.slots.len() - 1;
+        let mut at = hash_u64(key) & mask;
+        loop {
+            let s = &mut self.slots[at];
+            if s.generation != self.gen_now {
+                *s = MemoSlot { key, val, generation: self.gen_now };
+                self.len += 1;
+                return;
+            }
+            if s.key == key {
+                s.val = val;
+                return;
+            }
+            at = (at + 1) & mask;
+        }
+    }
+
+    #[cold]
+    fn grow(&mut self) {
+        let cap = (self.slots.len() * 2).max(64);
+        let alloc = *self.slots.allocator();
+        let mut slots = Vec::new_in(alloc);
+        slots.resize(cap, MemoSlot::EMPTY);
+        let old = core::mem::replace(&mut self.slots, slots);
+        let was = self.gen_now;
+        self.gen_now = 1;
+        self.len = 0;
+        let mask = cap - 1;
+        for s in old.iter() {
+            if s.generation != was {
+                continue;
+            }
+            let mut at = hash_u64(s.key) & mask;
+            while self.slots[at].generation == self.gen_now {
+                at = (at + 1) & mask;
+            }
+            self.slots[at] = MemoSlot { key: s.key, val: s.val, generation: self.gen_now };
+            self.len += 1;
+        }
+    }
+}
+
 /// Scratch the walks reuse: term work and result stacks, plus portable-parameter buffers.
 pub struct Scratch<'a> {
     work: Vec<(Ty, u32, u32), Alloc<'a>>,
     out: Vec<Ty, Alloc<'a>>,
+    /// Reusable children buffer for nodes with more than 8 children (avoids per-walk allocation).
+    kids: Vec<Ty, Alloc<'a>>,
     /// The max-ordered worklist for portable-table reachability walks. It is reused by
     /// `builtin::params_reached`, whose callers may inspect only a few nodes of a large table.
     params_work: Vec<u32, Alloc<'a>>,
@@ -24,7 +147,7 @@ pub struct Scratch<'a> {
     params_roots: Vec<Ty, Alloc<'a>>,
     /// The import's memo: a portable node and binder depth to its arena handle, for the nodes one import
     /// reaches (a record's table may hold many terms; only the root's are walked).
-    memo: Map<(Ty, u32), Ty, FixedState, Alloc<'a>>,
+    memo: ImportMemo<'a>,
     /// Which generics of an impl are const parameters, one bit each, by the impl and its
     /// header's digest (coherence.rs `fresh_for_impl`): found once per solver, not once per
     /// candidate.
@@ -46,9 +169,10 @@ impl<'a> Scratch<'a> {
         Scratch {
             work: Vec::new_in(alloc),
             out: Vec::new_in(alloc),
+            kids: Vec::new_in(alloc),
             params_work: Vec::new_in(alloc),
             params_roots: Vec::new_in(alloc),
-            memo: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
+            memo: ImportMemo::new_in(alloc),
             masks: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             stats: crate::eval::Stats::default(),
             auto: crate::auto_summary::Summaries::new_in(alloc),
@@ -217,16 +341,14 @@ fn fold_walk<T: Tys>(
             }
             let r = if same {
                 t
-            } else {
+            } else if (n as usize) <= 8 {
                 let mut kids: [Ty; 8] = [Ty::NONE; 8];
-                if (n as usize) <= kids.len() {
-                    kids[..n as usize].copy_from_slice(&s.out[start..start + n as usize]);
-                    rebuild(tys, k, &kids[..n as usize])?
-                } else {
-                    let mut big = Vec::with_capacity_in(n as usize, *s.out.allocator());
-                    big.extend_from_slice(&s.out[start..start + n as usize]);
-                    rebuild(tys, k, &big)?
-                }
+                kids[..n as usize].copy_from_slice(&s.out[start..start + n as usize]);
+                rebuild(tys, k, &kids[..n as usize])?
+            } else {
+                s.kids.clear();
+                s.kids.extend_from_slice(&s.out[start..start + n as usize]);
+                rebuild(tys, k, &s.kids)?
             };
             s.out.truncate(start);
             s.out.push(r);
@@ -252,6 +374,63 @@ pub fn import<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, p: Portable<'_>, root: T
     import_at(tys, s, p, root, inst, core::panic::Location::caller())
 }
 
+/// Evaluates a 0-child portable node `k` at binder depth `depth`.
+#[inline]
+fn import_zero_arity<T: Tys>(
+    tys: &mut T,
+    s: &mut Scratch<'_>,
+    k: TyKind,
+    depth: u32,
+    inst: Inst<'_>,
+    at: &'static core::panic::Location<'static>,
+) -> Result<Ty, SolveError> {
+    match k {
+        TyKind::Param(x) | TyKind::ConstParam(x) => match inst.args.get(x as usize) {
+            Some(&a) => land(tys, s, a, depth),
+            None => Err(SolveError::Malformed(Malformed::Param {
+                index: x,
+                args: inst.args.len() as u32,
+                at,
+                goal: None,
+                head: None,
+            })),
+        },
+        TyKind::ReParam(_) => tys.mk(TyKind::ReErased),
+        TyKind::Bound(d, x) if d == depth && !inst.bound.is_empty() => match inst.bound.get(x as usize) {
+            Some(&b) => land(tys, s, b, depth),
+            None => Err(SolveError::Malformed(Malformed::Param {
+                index: x,
+                args: inst.bound.len() as u32,
+                at,
+                goal: None,
+                head: None,
+            })),
+        },
+        // Removing the enclosing binder moves variables bound farther out one level closer.
+        TyKind::Bound(d, x) if d > depth && !inst.bound.is_empty() => tys.mk(TyKind::Bound(d - 1, x)),
+        _ => tys.mk(k),
+    }
+}
+
+/// Fast-path for a 0-child root at binder depth 0: resolves without touching `memo` or `work`.
+#[inline]
+fn import_leaf<T: Tys>(
+    tys: &mut T,
+    s: &mut Scratch<'_>,
+    k: TyKind,
+    inst: Inst<'_>,
+    at: &'static core::panic::Location<'static>,
+) -> Option<Result<Ty, SolveError>> {
+    if arity(children(k)) != 0 {
+        return None;
+    }
+    let r = import_zero_arity(tys, s, k, 0, inst, at);
+    if r.is_ok() {
+        s.stats.terms_imported += 1;
+    }
+    Some(r)
+}
+
 /// [`import`] with the line a `Malformed::Param` names given: for a helper that imports from a
 /// closure (which cannot forward its caller's location) and takes `at` once, `#[track_caller]`.
 pub fn import_at<T: Tys>(
@@ -266,6 +445,9 @@ pub fn import_at<T: Tys>(
     if root.0 >= len {
         return Err(SolveError::Malformed(Malformed::PortableIndex { node: root.0, len }));
     }
+    if let Some(r) = import_leaf(tys, s, p.nodes[root.0 as usize], inst, at) {
+        return r;
+    }
     // A post-order walk of the nodes `root` reaches (a record's table may hold other terms,
     // over other parameters, that this import must not touch). A child's index is below its
     // parent's (children come first in a table), which bounds the walk on a malformed table.
@@ -275,6 +457,98 @@ pub fn import_at<T: Tys>(
     s.work.truncate(wb);
     s.memo.clear();
     r
+}
+
+/// Imports every portable term in `roots` into `out` sharing one `memo` generation across all
+/// elements (and without touching `memo` at all when every element is a 0-child leaf).
+pub fn import_slice<T: Tys>(
+    tys: &mut T,
+    s: &mut Scratch<'_>,
+    p: Portable<'_>,
+    roots: &[Ty],
+    inst: Inst<'_>,
+    out: &mut [Ty],
+    at: &'static core::panic::Location<'static>,
+) -> Result<(), SolveError> {
+    debug_assert_eq!(roots.len(), out.len());
+    let wb = s.work.len();
+    let mut memo_started = false;
+    let r = import_slice_inner(tys, s, p, roots, inst, out, at, &mut memo_started);
+    s.work.truncate(wb);
+    if memo_started {
+        s.memo.clear();
+    }
+    r
+}
+
+fn import_slice_inner<T: Tys>(
+    tys: &mut T,
+    s: &mut Scratch<'_>,
+    p: Portable<'_>,
+    roots: &[Ty],
+    inst: Inst<'_>,
+    out: &mut [Ty],
+    at: &'static core::panic::Location<'static>,
+    memo_started: &mut bool,
+) -> Result<(), SolveError> {
+    let len = p.nodes.len() as u32;
+    for (dst, &root) in out.iter_mut().zip(roots.iter()) {
+        if root.0 >= len {
+            return Err(SolveError::Malformed(Malformed::PortableIndex { node: root.0, len }));
+        }
+        let k = p.nodes[root.0 as usize];
+        if let Some(res) = import_leaf(tys, s, k, inst, at) {
+            *dst = res?;
+            continue;
+        }
+        if !*memo_started {
+            s.memo.clear();
+            *memo_started = true;
+        } else if let Some(cached) = s.memo.get(root, 0) {
+            *dst = cached;
+            continue;
+        }
+        *dst = import_walk(tys, s, p, root, inst, at)?;
+    }
+    Ok(())
+}
+
+/// Imports the portable list `l` of `p` into an arena `List`, sharing one `memo` generation
+/// across its elements and avoiding heap allocation for lists of up to 8 elements.
+pub fn import_list_at<T: Tys>(
+    tys: &mut T,
+    s: &mut Scratch<'_>,
+    p: Portable<'_>,
+    l: List,
+    inst: Inst<'_>,
+    at: &'static core::panic::Location<'static>,
+) -> Result<List, SolveError> {
+    if l.len == 0 {
+        return tys.mk_list(&[]);
+    }
+    let start = l.start as usize;
+    let len = l.len as usize;
+    let end = match start.checked_add(len) {
+        Some(e) if e <= p.lists.len() => e,
+        _ => {
+            let bad = if start < p.lists.len() { p.lists.len() as u32 } else { l.start };
+            return Err(SolveError::Malformed(Malformed::PortableIndex {
+                node: bad,
+                len: p.lists.len() as u32,
+            }));
+        }
+    };
+    let roots = &p.lists[start..end];
+    if len <= 8 {
+        let mut buf = [Ty::NONE; 8];
+        import_slice(tys, s, p, roots, inst, &mut buf[..len], at)?;
+        tys.mk_list(&buf[..len])
+    } else {
+        let mut out: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(len, *s.work.allocator());
+        out.resize(len, Ty::NONE);
+        import_slice(tys, s, p, roots, inst, &mut out, at)?;
+        tys.mk_list(&out)
+    }
 }
 
 fn import_walk<T: Tys>(
@@ -290,7 +564,6 @@ fn import_walk<T: Tys>(
         if at < p.lists.len() { p.lists[at] } else { Ty::NONE }
     };
     let base = s.work.len();
-    let mut kids: Vec<Ty, Alloc<'_>> = Vec::new_in(*s.work.allocator());
     s.work.push((root, 0, 0));
     let mut steps = 0usize;
     while s.work.len() > base {
@@ -300,7 +573,7 @@ fn import_walk<T: Tys>(
             s.work.truncate(base);
             return Err(SolveError::Limit(Limit::Walk));
         }
-        if exit == 0 && s.memo.contains_key(&(t, depth)) {
+        if exit == 0 && s.memo.get(t, depth).is_some() {
             continue;
         }
         let k = p.nodes[t.0 as usize];
@@ -308,6 +581,12 @@ fn import_walk<T: Tys>(
         let n = arity(c);
         let next_depth = child_depth(k, depth);
         if exit == 0 {
+            if n == 0 {
+                let made = import_zero_arity(tys, s, k, depth, inst, at)?;
+                s.stats.terms_imported += 1;
+                s.memo.insert(t, depth, made);
+                continue;
+            }
             s.work.push((t, depth, 1));
             for j in (0..n).rev() {
                 let ch = child(c, j, get);
@@ -315,47 +594,31 @@ fn import_walk<T: Tys>(
                     s.work.truncate(base);
                     return Err(SolveError::Malformed(Malformed::PortableIndex { node: ch.0, len: t.0 }));
                 }
-                if !s.memo.contains_key(&(ch, next_depth)) {
+                if s.memo.get(ch, next_depth).is_none() {
                     s.work.push((ch, next_depth, 0));
                 }
             }
             continue;
         }
-        kids.clear();
-        for j in 0..n {
-            let ch = child(c, j, get);
-            kids.push(s.memo[&(ch, next_depth)]);
-        }
-        let made = match k {
-            TyKind::Param(x) | TyKind::ConstParam(x) => match inst.args.get(x as usize) {
-                Some(&a) => land(tys, s, a, depth)?,
-                None => {
-                    s.work.truncate(base);
-                    return Err(SolveError::Malformed(Malformed::Param { index: x, args: inst.args.len() as u32, at, goal: None, head: None }));
-                }
-            },
-            TyKind::ReParam(_) => tys.mk(TyKind::ReErased)?,
-            TyKind::Bound(d, x) if d == depth && !inst.bound.is_empty() => match inst.bound.get(x as usize) {
-                Some(&b) => land(tys, s, b, depth)?,
-                None => {
-                    s.work.truncate(base);
-                    return Err(SolveError::Malformed(Malformed::Param { index: x, args: inst.bound.len() as u32, at, goal: None, head: None }));
-                }
-            },
-            // Removing the enclosing binder moves variables bound farther out one level closer.
-            TyKind::Bound(d, x) if d > depth && !inst.bound.is_empty() => tys.mk(TyKind::Bound(d - 1, x))?,
-            _ => {
-                if n == 0 {
-                    tys.mk(k)?
-                } else {
-                    rebuild(tys, k, &kids)?
-                }
+        let made = if (n as usize) <= 8 {
+            let mut kids = [Ty::NONE; 8];
+            for j in 0..n {
+                let ch = child(c, j, get);
+                kids[j as usize] = s.memo.get(ch, next_depth).unwrap_or(Ty::NONE);
             }
+            rebuild(tys, k, &kids[..n as usize])?
+        } else {
+            s.kids.clear();
+            for j in 0..n {
+                let ch = child(c, j, get);
+                s.kids.push(s.memo.get(ch, next_depth).unwrap_or(Ty::NONE));
+            }
+            rebuild(tys, k, &s.kids)?
         };
         s.stats.terms_imported += 1;
-        s.memo.insert((t, depth), made);
+        s.memo.insert(t, depth, made);
     }
-    Ok(s.memo[&(root, 0)])
+    Ok(s.memo.get(root, 0).unwrap_or(Ty::NONE))
 }
 
 /// An argument entering a binder must retain references to its own surrounding binders.

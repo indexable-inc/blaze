@@ -12,6 +12,7 @@
 //! recorder can call, so every solved goal carries the read list it is valid by (rule 77).
 
 #![no_std]
+#![forbid(unsafe_code)]
 #![feature(allocator_api, portable_simd, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 

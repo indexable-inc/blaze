@@ -97,15 +97,81 @@ pub(crate) fn skip_body_in(cpu: Cpu, text: &str, plant: Plant) -> Result<usize, 
                 },
                 _ => q + 1,
             },
-            b'"' => match token_start(bytes, pos, q) {
-                Some(start) if !matches!(&bytes[start..q], b"r" | b"br" | b"cr") => {
+            b'"' => {
+                if q == pos || bytes[q - 1] != b'r' {
                     let end = quoted_end(bytes, q + 1, plant).ok_or(SkipError::Unclosed)?;
-                    let mut suffix = Cursor::new(text, end, false, cpu, plant);
-                    suffix.eat_identifier();
-                    suffix.pos()
+                    match bytes.get(end) {
+                        Some(&b) if b.is_ascii_alphabetic() || b == b'_' || b >= 0x80 => {
+                            string_suffix(cpu, text, end, plant)
+                        }
+                        _ => end,
+                    }
+                } else {
+                    match token_start(bytes, pos, q) {
+                        Some(start) if !matches!(&bytes[start..q], b"r" | b"br" | b"cr") => {
+                            let end = quoted_end(bytes, q + 1, plant).ok_or(SkipError::Unclosed)?;
+                            match bytes.get(end) {
+                                Some(&b) if b.is_ascii_alphabetic() || b == b'_' || b >= 0x80 => {
+                                    string_suffix(cpu, text, end, plant)
+                                }
+                                _ => end,
+                            }
+                        }
+                        Some(start) => exact(cpu, text, start, q, plant),
+                        None => exact(cpu, text, resync(bytes, pos, q), q, plant),
+                    }
                 }
-                Some(start) => exact(cpu, text, start, q, plant),
-                None => exact(cpu, text, resync(bytes, pos, q), q, plant),
+            }
+            b'#' => {
+                if !matches!(bytes.get(q + 1), Some(b'"' | b'#'))
+                    && (q == pos || !matches!(bytes[q - 1], b'r' | b'k'))
+                {
+                    q + 1
+                } else {
+                    let start = token_start(bytes, pos, q).unwrap_or_else(|| resync(bytes, pos, q));
+                    exact(cpu, text, start, q, plant)
+                }
+            }
+            b'\'' => match (bytes.get(q + 1).copied(), bytes.get(q + 2).copied()) {
+                // Single-byte ASCII char/byte literal (`'x'` or `b'x'`) without suffix.
+                (Some(b1), Some(b'\''))
+                    if b1 < 0x80
+                        && b1 != b'\\'
+                        && b1 != b'\''
+                        && !matches!(
+                            bytes.get(q + 3),
+                            Some(&b) if b.is_ascii_alphabetic() || b == b'_' || b >= 0x80
+                        ) =>
+                {
+                    q + 3
+                }
+                // Simple ASCII lifetime (`'a`, `'static`, ...) not preceded by `b` (which could be `b'`).
+                (Some(b1), b2)
+                    if plant == Plant::Clean
+                        && (b1.is_ascii_alphabetic() || b1 == b'_')
+                        && (q == pos || bytes[q - 1] != b'b')
+                        && b2 != Some(b'\'') =>
+                {
+                    let mut end = q + 2;
+                    while let Some(&b) = bytes.get(end) {
+                        if is_ident_byte(b) {
+                            end += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    match bytes.get(end) {
+                        Some(&b) if b == b'\'' || b == b'#' || b >= 0x80 => {
+                            let start = token_start(bytes, pos, q).unwrap_or_else(|| resync(bytes, pos, q));
+                            exact(cpu, text, start, q, plant)
+                        }
+                        _ => end,
+                    }
+                }
+                _ => {
+                    let start = token_start(bytes, pos, q).unwrap_or_else(|| resync(bytes, pos, q));
+                    exact(cpu, text, start, q, plant)
+                }
             },
             _ => {
                 let start = token_start(bytes, pos, q).unwrap_or_else(|| resync(bytes, pos, q));
@@ -207,7 +273,18 @@ fn resync(bytes: &[u8], boundary: usize, q: usize) -> usize {
     boundary
 }
 
+/// Eats an identifier suffix after a double-quoted string literal (rare in Rust).
+#[cold]
+#[inline(never)]
+fn string_suffix(cpu: Cpu, text: &str, end: usize, plant: Plant) -> usize {
+    let mut suffix = Cursor::new(text, end, false, cpu, plant);
+    suffix.eat_identifier();
+    suffix.pos()
+}
+
 /// The end of the token that holds `q`, lexing whole tokens from the boundary `start`.
+#[cold]
+#[inline(never)]
 fn exact(cpu: Cpu, text: &str, start: usize, q: usize, plant: Plant) -> usize {
     let mut cursor = Cursor::new(text, start, false, cpu, plant);
     loop {

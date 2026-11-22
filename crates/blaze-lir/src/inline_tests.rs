@@ -388,3 +388,88 @@ fn no_growth_splices_nothing() {
     assert!(inlined.read.is_empty());
     assert_eq!(calls_left(inlined.func.view()), 1);
 }
+
+#[test]
+fn fn_summary_and_guided_pgo_priority_and_external_refs() {
+    use crate::inline::{GuidedInlined, InlinePolicy, NoWeights, SiteWeights, WithImported, inline_guided};
+    use crate::summary::FnSummary;
+
+    // 1. FnSummary deterministic hash & loop detection.
+    let pure = chain(4);
+    let s1 = FnSummary::compute(pure.view(), &Global);
+    let s2 = FnSummary::compute(pure.view(), &Global);
+    assert_eq!(s1, s2);
+    assert!(!s1.has_loops);
+    assert!(s1.is_closed);
+    assert!(s1.has_return);
+
+    let looped = build(false, |b, _, x, y| counted_loop(b, Op::Add, x, y, 3)).expect("looped builds");
+    let sl = FnSummary::compute(looped.view(), &Global);
+    assert!(sl.has_loops);
+    assert_ne!(s1.summary_hash, sl.summary_hash);
+
+    // 2. PGO hot-site priority under tight growth budget: caller calls g (site A) then h (site B).
+    // Both g and h have 12 insts (chain(9)), growth budget = 14 fits only ONE; PGO marks site B hot.
+    let g = chain(9);
+    let h = chain(9);
+    let caller = build(false, |b, sig, x, y| {
+        let rg = b.reference(RefKind::Func, 0);
+        let rh = b.reference(RefKind::Func, 1);
+        let a = b.call(Flags::NONE, rg, sig, &[x, y]);
+        b.call(Flags::NONE, rh, sig, &[a, y])
+    })
+    .expect("caller builds");
+    // Find the two call instruction indices in `caller`.
+    let call_sites: Vec<u32> = (0..caller.view().len())
+        .filter(|&i| caller.view().op(i) == Op::Call)
+        .map(|i| i as u32)
+        .collect();
+    assert_eq!(call_sites.len(), 2);
+
+    struct HotSecond(u32);
+    impl SiteWeights for HotSecond {
+        fn weight(&self, _caller: BodyId, site_inst: u32) -> u64 {
+            if site_inst == self.0 { 1000 } else { 1 }
+        }
+    }
+
+    let bank = Bank {
+        bodies: vec![(id(1), caller), (id(2), g), (id(3), h)],
+        links: vec![(id(1), RefId(0), id(2)), (id(1), RefId(1), id(3))],
+    };
+    let root = bank.bodies[0].1.view();
+    let policy = InlinePolicy { max_growth: 14, ..InlinePolicy::default() };
+    let GuidedInlined { func, read, .. } =
+        inline_guided(root, id(1), &bank, &HotSecond(call_sites[1]), policy, Global).expect("guided inlines");
+    // Hot second call (`id(3)`) was prioritized over cold first call (`id(2)`).
+    assert_eq!(read[..], [id(3)], "expected hot callee id(3) to win tight budget, got {read:?}");
+    let args = [Val::Int(5), Val::Int(3)];
+    let before = run_calls_in(root, id(1), &args, FUEL, &bank, Global).expect("before runs");
+    let after = run_calls_in(func.view(), id(1), &args, FUEL, &bank, Global).expect("after runs");
+    assert_eq!(after, before);
+
+    // 3. Lifting CLOSED barrier: mid calls un-inlinable leaf (missing from bank or too large),
+    // yet mid itself inlines into main and imports the external Func RefRec cleanly.
+    let huge = chain(100);
+    let mid = build(false, |b, sig, x, y| {
+        let rleaf = b.reference(RefKind::Func, 0);
+        let v = b.call(Flags::NONE, rleaf, sig, &[x, y]);
+        b.binary(Op::Add, Flags::NONE, v, y)
+    })
+    .expect("mid builds");
+    let main_fn = calling_place_zero();
+    let bank2 = Bank {
+        bodies: vec![(id(1), main_fn), (id(2), mid), (id(3), huge)],
+        links: vec![(id(1), RefId(0), id(2)), (id(2), RefId(0), id(3))],
+    };
+    let root2 = bank2.bodies[0].1.view();
+    let GuidedInlined { func: out2, read: read2, imported_refs } =
+        inline_guided(root2, id(1), &bank2, &NoWeights, InlinePolicy { max_callee_insts: 32, allow_external_refs: true, ..InlinePolicy::default() }, Global)
+            .expect("open callee inlines");
+    assert_eq!(read2[..], [id(2)], "mid should inline even though it calls un-inlined huge");
+    assert!(!imported_refs.is_empty(), "external ref to huge should be imported");
+    let adapted = WithImported { root: id(1), imported: &imported_refs, inner: &bank2 };
+    let before2 = run_calls_in(root2, id(1), &args, FUEL, &bank2, Global).expect("before2 runs");
+    let after2 = run_calls_in(out2.view(), id(1), &args, FUEL, &adapted, Global).expect("after2 runs");
+    assert_eq!(after2, before2);
+}

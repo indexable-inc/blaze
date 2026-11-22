@@ -41,6 +41,7 @@
 //! kinds; only [`Input::Text`] is built.
 
 #![no_std]
+#![forbid(unsafe_code)]
 #![feature(allocator_api, variant_count)]
 
 #[cfg(test)]
@@ -61,8 +62,9 @@ mod tests;
 
 use blaze_own::{AVec, Alloc};
 
-pub use fix::{FixError, apply, apply_all};
 pub use allowed::{ALLOWED_STATICS, Allowed, AllowedStatic, statics_of_path};
+pub use engine::Scratch;
+pub use fix::{FixError, apply, apply_all};
 pub use marks::{OwnHeads, RootMarks};
 pub use message::show_message;
 pub use units::{ChildHoles, HOLE_MARK, HOLE_MARK_LEN, OwnUnit, UnitLinted, UnitPlan, Units, holes_in, own_place, own_text, real_place, real_range};
@@ -204,6 +206,23 @@ pub enum Rule {
     /// is the named exception, and says which shape it could not be. The lint
     /// `blaze::lock_without_reason`.
     LockWithoutReason = 22,
+    /// `unsafe` code (`unsafe {`, `unsafe fn`, `unsafe impl`, `unsafe trait`, `unsafe extern`,
+    /// `#[unsafe(..)]`) in a crate whose root does not carry `#![blaze::trust(unsafe, reason = "..")]`.
+    /// The lint `blaze::workspace_unsafe`.
+    WorkspaceUnsafe = 23,
+    /// `Ordering::SeqCst` without a `// seqcst: <why>` comment explaining why one total order is
+    /// needed. The lint `blaze::seqcst_unexplained`.
+    SeqCstUnexplained = 24,
+    /// Raw synchronization primitives (`sync::{Mutex, RwLock, Condvar, Barrier}`,
+    /// `parking_lot::{Mutex, RwLock, Condvar}`, `dashmap::DashMap`, `mpsc::{channel, sync_channel}`).
+    /// The lint `blaze::raw_sync`.
+    RawSync = 25,
+    /// Blocking or OS-thread operations on a pool (`thread::{sleep, spawn, scope, yield_now, park,
+    /// available_parallelism}`, `hint::spin_loop`). The lint `blaze::blocking_on_pool`.
+    BlockingOnPool = 26,
+    /// `mem::transmute` or `mem::transmute_copy` (direct call or turbofish). The lint
+    /// `blaze::transmute`.
+    Transmute = 27,
 }
 
 impl Rule {
@@ -234,6 +253,11 @@ impl Rule {
         Rule::ProcessStatic,
         Rule::SansIoCore,
         Rule::LockWithoutReason,
+        Rule::WorkspaceUnsafe,
+        Rule::SeqCstUnexplained,
+        Rule::RawSync,
+        Rule::BlockingOnPool,
+        Rule::Transmute,
     ];
 
     /// The ten rules ported from blaze's scripts: what [`Step::Strict`] runs. The rules after
@@ -280,6 +304,11 @@ impl Rule {
             Rule::ProcessStatic => "process-static",
             Rule::SansIoCore => "sans-io-core",
             Rule::LockWithoutReason => "lock-without-reason",
+            Rule::WorkspaceUnsafe => "workspace-unsafe",
+            Rule::SeqCstUnexplained => "seqcst-unexplained",
+            Rule::RawSync => "raw-sync",
+            Rule::BlockingOnPool => "blocking-on-pool",
+            Rule::Transmute => "transmute",
         }
     }
 
@@ -288,11 +317,21 @@ impl Rule {
     /// lints are blaze-lint-defs' (`lints.rs`); a rule no lint names has none.
     pub const fn lint(self) -> Option<&'static str> {
         match self {
+            Rule::Casts => Some("as_cast"),
+            Rule::Untyped => Some("untyped_error"),
             Rule::Ambient => Some("std_use"),
             Rule::AmbientHeap => Some("implicit_allocator"),
+            Rule::NoAsync => Some("async_fn"),
+            Rule::UnboundedWait => Some("unbounded_wait"),
+            Rule::AmbientHasher => Some("default_hasher"),
             Rule::ProcessStatic => Some("process_static"),
             Rule::SansIoCore => Some("sans_io_core"),
             Rule::LockWithoutReason => Some("lock_without_reason"),
+            Rule::WorkspaceUnsafe => Some("workspace_unsafe"),
+            Rule::SeqCstUnexplained => Some("seqcst_unexplained"),
+            Rule::RawSync => Some("raw_sync"),
+            Rule::BlockingOnPool => Some("blocking_on_pool"),
+            Rule::Transmute => Some("transmute"),
             _ => None,
         }
     }
@@ -318,7 +357,10 @@ impl Rule {
     /// The rule's version: raised whenever what it finds changes, so a record of the old one is
     /// not read as the new one's (the version joins [`RuleSet::id`]).
     pub const fn version(self) -> u16 {
-        1
+        match self {
+            Rule::AmbientHeap | Rule::AmbientHasher => 2,
+            _ => 1,
+        }
     }
 
     #[inline]
@@ -472,6 +514,18 @@ pub enum Template {
     /// `"claimed"`, whose `why` is missing or empty, or which says anything else; the range is
     /// the attribute.
     LockBadReason = 181,
+    /// `unsafe` code in a crate without `#![blaze::trust(unsafe, reason = "..")]`.
+    WorkspaceUnsafe = 190,
+    /// `Ordering::SeqCst` without a `// seqcst: <why>` comment above or beside it.
+    SeqCstUnexplained = 200,
+    /// A raw synchronization primitive (`sync::Mutex`, `parking_lot::RwLock`, `dashmap::DashMap`,
+    /// `mpsc::channel(`, etc.); argument: the row of the sequence table.
+    RawSync = 210,
+    /// A blocking or OS-thread call on a pool (`thread::sleep(`, `thread::spawn(`,
+    /// `hint::spin_loop(`, etc.); argument: the row of the sequence table.
+    BlockingOnPool = 220,
+    /// `mem::transmute` or `mem::transmute_copy`; argument: the row of the sequence table.
+    Transmute = 230,
 }
 
 impl Template {
@@ -493,9 +547,15 @@ impl Template {
             120..=123 => Rule::LeftUndone,
             130..=131 => Rule::UnboundedWait,
             140..=141 => Rule::AmbientHasher,
+            150..=151 => Rule::VariantCount,
             160..=162 => Rule::ProcessStatic,
             170..=173 => Rule::SansIoCore,
             180..=181 => Rule::LockWithoutReason,
+            190 => Rule::WorkspaceUnsafe,
+            200 => Rule::SeqCstUnexplained,
+            210 => Rule::RawSync,
+            220 => Rule::BlockingOnPool,
+            230 => Rule::Transmute,
             _ => Rule::VariantCount,
         }
     }
@@ -562,6 +622,11 @@ impl Template {
             Template::SansIoPrint => "print",
             Template::LockNoReason => "no-reason",
             Template::LockBadReason => "bad-reason",
+            Template::WorkspaceUnsafe => "workspace-unsafe",
+            Template::SeqCstUnexplained => "seqcst-unexplained",
+            Template::RawSync => "raw-sync",
+            Template::BlockingOnPool => "blocking-on-pool",
+            Template::Transmute => "transmute",
         }
     }
 }
@@ -760,6 +825,8 @@ pub enum Mark {
     Unsorted = 4,
     /// A `// SAFETY:` comment.
     Safety = 5,
+    /// A `// seqcst: <why>` comment.
+    SeqCst = 6,
 }
 
 /// What the parent's text around a child item says that the child's rules read: the comments
@@ -775,6 +842,10 @@ pub struct Context {
     pub safety_above: Walk,
     /// A `// SAFETY:` mark after the item on its last line.
     pub safety_after: bool,
+    /// The `// seqcst: <why>` walk from the line above the item's first line.
+    pub seqcst_above: Walk,
+    /// A `// seqcst: <why>` mark after the item on its last line.
+    pub seqcst_after: bool,
     /// How many lines above the item's first line the nearest `// recursion: calls another
     /// impl` mark is, within three; 0 for none.
     pub recursion_above: u8,
@@ -808,6 +879,9 @@ pub struct Scope {
     /// An ancestor item carries `#[blaze::lock_exception(..)]` (D179): the locks the item
     /// constructs have their reason, which `lock-without-reason` reads.
     pub lock_reason: bool,
+    /// The crate root carries a valid `#![blaze::trust(unsafe, reason = "..")]` grant
+    /// ([`RootMarks::trust_unsafe`]): what `workspace-unsafe` reads.
+    pub trust_unsafe: bool,
     pub context: Context,
 }
 
@@ -825,11 +899,14 @@ impl Scope {
             own_heads: OwnHeads::NONE,
             statics: 0,
             lock_reason: false,
+            trust_unsafe: false,
             context: Context {
                 clone_above: Walk::NONE,
                 clone_after: None,
                 safety_above: Walk::NONE,
                 safety_after: false,
+                seqcst_above: Walk::NONE,
+                seqcst_after: false,
                 recursion_above: 0,
             },
         }
@@ -839,6 +916,12 @@ impl Scope {
     /// says `#![blaze::sans_io]` ([`RootMarks::scope`]).
     pub const fn in_core(self) -> Scope {
         Scope { sans_io: true, ..self }
+    }
+
+    /// The same scope with a valid `#![blaze::trust(unsafe, reason = "..")]` grant
+    /// ([`RootMarks::scope`]).
+    pub const fn with_trust_unsafe(self) -> Scope {
+        Scope { trust_unsafe: true, ..self }
     }
 
     /// The same scope in a file with these facts of its own text and crate: the IO module
@@ -861,27 +944,57 @@ impl Scope {
     /// are equal.
     pub const fn key(&self) -> u64 {
         let c = &self.context;
-        let after = match c.clone_after {
-            None => 0,
-            Some(mark) => 1 + mark as u64,
+        let clone_above = if c.clone_above.dist == 0 {
+            0u64
+        } else {
+            let d = if c.clone_above.dist > 8 { 8 } else { c.clone_above.dist } as u64;
+            let m = c.clone_above.mark as u64;
+            let m = if m > 4 { 4 } else { m };
+            1 + (d - 1) * 5 + m
         };
+        let clone_after = match c.clone_after {
+            None => 0u64,
+            Some(mark) => {
+                let m = mark as u64;
+                1 + if m > 4 { 4 } else { m }
+            }
+        };
+        // 41 * 6 = 246 < 256 (fits in 8 bits: bits 9..17).
+        let clone_bits = clone_above * 6 + clone_after;
+        let safety_above = if c.safety_above.dist == 0 {
+            0u64
+        } else {
+            let d = if c.safety_above.dist > 8 { 8 } else { c.safety_above.dist } as u64;
+            let hit = matches!(c.safety_above.mark, Mark::Safety) as u64;
+            1 + (d - 1) * 2 + hit
+        };
+        // 17 * 2 = 34 < 64 (fits in 6 bits: bits 17..23).
+        let safety_bits = safety_above * 2 + (c.safety_after as u64);
+        let seqcst_above = if c.seqcst_above.dist == 0 {
+            0u64
+        } else {
+            let d = if c.seqcst_above.dist > 8 { 8 } else { c.seqcst_above.dist } as u64;
+            let hit = matches!(c.seqcst_above.mark, Mark::SeqCst) as u64;
+            1 + (d - 1) * 2 + hit
+        };
+        // 17 * 2 = 34 < 64 (6 bits: low 4 in bits 23..27, high 2 in bits 62..64).
+        let seqcst_bits = seqcst_above * 2 + (c.seqcst_after as u64);
         (self.test.0 as u64)
             | (self.block as u64) << 2
             | (self.assoc as u64) << 5
             | (self.in_module as u64) << 6
             | (self.bin_root as u64) << 7
             | (self.build_script as u64) << 8
-            | (c.clone_above.dist as u64) << 9
-            | (c.clone_above.mark as u64) << 13
-            | after << 16
-            | (c.safety_above.dist as u64) << 19
-            | (c.safety_above.mark as u64) << 23
-            | (c.safety_after as u64) << 26
+            | clone_bits << 9
+            | safety_bits << 17
+            | (seqcst_bits & 0xF) << 23
             | (c.recursion_above as u64) << 27
             | (self.sans_io as u64) << 35
             | (self.own_heads.0 as u64) << 36
             | (self.statics as u64) << 44
             | (self.lock_reason as u64) << 60
+            | (self.trust_unsafe as u64) << 61
+            | (seqcst_bits >> 4) << 62
     }
 }
 
@@ -1207,6 +1320,47 @@ pub fn lint<'a>(rules: &RuleSet, unit: &Unit<'_>, alloc: Alloc<'a>, out: &mut Fi
     lint_in(rules, unit, &variants, 0, alloc, out)
 }
 
+/// Lints one item of a file using reusable [`Scratch`] buffers, leaving child scopes in
+/// `scratch.children()` without copying them.
+pub(crate) fn lint_in_scratch<'a>(
+    rules: &RuleSet,
+    unit: &Unit<'_>,
+    variants: &Variants<'_>,
+    base: u32,
+    scratch: &mut Scratch<'a>,
+    out: &mut Findings<'a>,
+) -> Result<engine::PassDone, LintError> {
+    let mut done = engine::run_with(rules, unit, scratch, out)?;
+    if rules.runs(Rule::VariantCount) {
+        // One probe of the file's fact a unit.
+        done.cost.add(Rule::VariantCount);
+        variants.find(unit, base, out)?;
+        done.findings.to = count(out.list.len())?;
+    }
+    Ok(done)
+}
+
+fn copy_children<'a>(scratch: &Scratch<'a>) -> AVec<'a, Scope> {
+    let mut children = AVec::with_capacity_in(scratch.children.len(), scratch.alloc);
+    children.extend_from_slice(&scratch.children);
+    children
+}
+
+/// Lints one item of a file reusing `scratch`'s work buffers across calls: every rule of `rules`
+/// in one pass over the tokens of `unit`'s own bytes, findings pushed onto `out`.
+pub fn lint_in_with<'a>(
+    rules: &RuleSet,
+    unit: &Unit<'_>,
+    variants: &Variants<'_>,
+    base: u32,
+    scratch: &mut Scratch<'a>,
+    out: &mut Findings<'a>,
+) -> Result<Linted<'a>, LintError> {
+    let done = lint_in_scratch(rules, unit, variants, base, scratch, out)?;
+    let children = copy_children(scratch);
+    Ok(Linted { findings: done.findings, children, test_at_end: done.test_at_end, cost: done.cost, tokens: done.tokens })
+}
+
 /// Lints one item of a file: every rule of `rules` in one pass over the tokens of `unit`'s own
 /// bytes, findings pushed onto `out`, scratch in `alloc` (freed on return); no recursion, no
 /// allocation per token. `variant-count` reads `variants`, the fact of the file `unit` is the
@@ -1219,14 +1373,31 @@ pub fn lint_in<'a>(
     alloc: Alloc<'a>,
     out: &mut Findings<'a>,
 ) -> Result<Linted<'a>, LintError> {
-    let mut linted = engine::run(rules, unit, alloc, out)?;
+    let mut scratch = Scratch::new_in(alloc);
+    lint_in_with(rules, unit, variants, base, &mut scratch, out)
+}
+
+/// Lints one unit of a file as its OWN text ([`Units::own`]) reusing `scratch`'s work buffers
+/// across calls.
+pub fn lint_own_with<'a>(
+    rules: &RuleSet,
+    own: &OwnUnit<'_>,
+    scope: Scope,
+    at: Geometry<'_>,
+    variants: Option<VariantsView<'_>>,
+    scratch: &mut Scratch<'a>,
+    out: &mut Findings<'a>,
+) -> Result<Linted<'a>, LintError> {
+    let mut done = engine::run_with(rules, &own.unit(scope), scratch, out)?;
     if rules.runs(Rule::VariantCount) {
+        let variants = variants.ok_or(LintError::NoFact { rule: Rule::VariantCount })?;
         // One probe of the file's fact a unit.
-        linted.cost.add(Rule::VariantCount);
-        variants.find(unit, base, out)?;
-        linted.findings.to = count(out.list.len())?;
+        done.cost.add(Rule::VariantCount);
+        variants.find_own(at, out)?;
+        done.findings.to = count(out.list.len())?;
     }
-    Ok(linted)
+    let children = copy_children(scratch);
+    Ok(Linted { findings: done.findings, children, test_at_end: done.test_at_end, cost: done.cost, tokens: done.tokens })
 }
 
 /// Lints one unit of a file as its OWN text ([`Units::own`]: each child one [`HOLE_MARK`]):
@@ -1244,15 +1415,8 @@ pub fn lint_own_in<'a>(
     alloc: Alloc<'a>,
     out: &mut Findings<'a>,
 ) -> Result<Linted<'a>, LintError> {
-    let mut linted = engine::run(rules, &own.unit(scope), alloc, out)?;
-    if rules.runs(Rule::VariantCount) {
-        let variants = variants.ok_or(LintError::NoFact { rule: Rule::VariantCount })?;
-        // One probe of the file's fact a unit.
-        linted.cost.add(Rule::VariantCount);
-        variants.find_own(at, out)?;
-        linted.findings.to = count(out.list.len())?;
-    }
-    Ok(linted)
+    let mut scratch = Scratch::new_in(alloc);
+    lint_own_with(rules, own, scope, at, variants, &mut scratch, out)
 }
 
 /// The tokens of a whole text, counted: what the floor of a lint pass over it is (one lex). The

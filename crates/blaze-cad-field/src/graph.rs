@@ -185,6 +185,8 @@ opts! {
     EllipsoidOpts { radii: [Length; 3] }
     /// `sum |x_i / r_i|^e = 1` (`exponent >= 1`).
     SuperellipsoidOpts { radii: [Length; 3], exponent: f64 }
+    /// A triply periodic minimal surface (TPMS) gyroid sheet of spatial `period` and nominal wall `thickness`.
+    GyroidOpts { period: Length, thickness: Length }
     /// A profile: every form but the superellipse (which is a bound).
     ProfileOpts { profile: Profile<'n> }
     /// Extrude along `z`, centred.
@@ -272,6 +274,7 @@ fn shape_box(s: &Shape) -> Aabb3 {
         Shape::Cone { r0, r1, half_h } => cube(m(r0.max(r1)), m(r0.max(r1)), m(half_h)),
         Shape::Torus { big, small } => cube(m(big + small), m(big + small), m(small)),
         Shape::Ellipsoid { radii } | Shape::Superellipsoid { radii, .. } => cube(m(radii[0]), m(radii[1]), m(radii[2])),
+        Shape::Gyroid { .. } => Aabb3::ALL,
     }
 }
 
@@ -893,6 +896,16 @@ impl<'a, P: Planted<CadPlant>> Graph<'a, P> {
         self.primitive(Shape::Superellipsoid { radii, e_ppm }, Level::Bound, o.name)
     }
 
+    /// A triply periodic minimal surface (TPMS) gyroid sheet: a 1-Lipschitz bound,
+    /// `|sin(kx)cos(ky) + sin(ky)cos(kz) + sin(kz)cos(kx)| / (k sqrt(3)) - thickness / 2`
+    /// where `k = 2 pi / period` (`||grad g|| <= k sqrt(3)` everywhere by Cauchy-Schwarz).
+    pub fn gyroid(&mut self, o: GyroidOpts<'_>) -> Result<Solid<Bound>, CadError> {
+        let k = NodeKind::Gyroid;
+        let period = Self::positive(k, o.name, "period", o.period)?;
+        let thickness = Self::positive(k, o.name, "thickness", o.thickness)?;
+        self.primitive(Shape::Gyroid { period, thickness }, Level::Bound, o.name)
+    }
+
     // ---- profiles and what takes them ---------------------------------------------------
 
     fn add_profile(&mut self, p: &Profile<'_>, name: Option<&str>) -> Result<(ProfileId, Level), CadError> {
@@ -1063,7 +1076,7 @@ impl<'a, P: Planted<CadPlant>> Graph<'a, P> {
         let p = *self.profile_rec(profile.id);
         let reach = p.bounds.iter().fold(0.0f64, |a, v| a.max(v.abs()));
         let at = |i: usize| Vec3::new(pts[i][0].as_m(), pts[i][1].as_m(), pts[i][2].as_m());
-        let mut acc: Option<NodeId> = None;
+        let mut layer: AVec<'a, NodeId> = Vec::with_capacity_in(pts.len() - 1, self.alloc);
         for i in 0..pts.len() - 1 {
             let (a, b) = (at(i), at(i + 1));
             let d = b - a;
@@ -1107,17 +1120,9 @@ impl<'a, P: Planted<CadPlant>> Graph<'a, P> {
                 let h = self.wrap(h, frame, None)?;
                 seg = self.boolean(Boolean::Intersect, Edge::Sharp, seg, h, None)?;
             }
-            acc = Some(match acc {
-                None => seg,
-                Some(u) => self.boolean(Boolean::Union, Edge::Sharp, u, seg, None)?,
-            });
+            layer.push(seg);
         }
-        let id = acc.unwrap_or(self.empty()?.id);
-        if let Some(n) = o.name
-            && self.names.get(&id).is_none()
-        {
-            self.names.insert(id, Name::new(n));
-        }
+        let id = self.balanced_boolean(Boolean::Union, Edge::Sharp, layer, o.name)?;
         Ok(Solid::new(id))
     }
 
@@ -1328,23 +1333,54 @@ impl<'a, P: Planted<CadPlant>> Graph<'a, P> {
             layer.push(self.wrap(s.id, p, None)?);
         }
         // A balanced tree of unions: depth log2(count).
-        while layer.len() > 1 {
-            let mut next: AVec<'a, NodeId> = Vec::with_capacity_in(layer.len().div_ceil(2), self.alloc);
-            for pair in layer.chunks(2) {
-                next.push(if pair.len() == 2 { self.boolean(Boolean::Union, Edge::Sharp, pair[0], pair[1], None)? } else { pair[0] });
-            }
-            layer = next;
-        }
-        let id = layer[0];
-        if let Some(n) = o.name
-            && self.names.get(&id).is_none()
-        {
-            self.names.insert(id, Name::new(n));
-        }
+        let id = self.balanced_boolean(Boolean::Union, Edge::Sharp, layer, o.name)?;
         Ok(Solid::new(id))
     }
 
     // ---- booleans -------------------------------------------------------------------------
+
+    /// Reduces a non-empty `layer` into a balanced binary tree of depth `ceil(log2(len))`,
+    /// reusing two arena buffers across levels.
+    fn balanced_boolean(&mut self, op: Boolean, edge: Edge, mut layer: AVec<'a, NodeId>, name: Option<&str>) -> Result<NodeId, CadError> {
+        let mut next: AVec<'a, NodeId> = Vec::with_capacity_in(layer.len().div_ceil(2), self.alloc);
+        while layer.len() > 1 {
+            next.clear();
+            let final_merge = layer.len() == 2;
+            for pair in layer.chunks(2) {
+                next.push(if pair.len() == 2 {
+                    self.boolean(op, edge, pair[0], pair[1], if final_merge { name } else { None })?
+                } else {
+                    pair[0]
+                });
+            }
+            core::mem::swap(&mut layer, &mut next);
+        }
+        let id = layer[0];
+        if let Some(n) = name
+            && self.names.get(&id).is_none()
+        {
+            self.names.insert(id, Name::new(n));
+        }
+        Ok(id)
+    }
+
+    fn boolean_all<K: Ex>(&mut self, op: Boolean, edge: Edge, kind: NodeKind, solids: &[Solid<K>], name: Option<&str>) -> Result<NodeId, CadError> {
+        if solids.is_empty() {
+            return Err(CadError::Argument {
+                kind,
+                name: name.map(Name::new),
+                arg: "solids",
+                value: Value::Count(0),
+                accepted: "at least 1 solid",
+            });
+        }
+        let mut layer: AVec<'a, NodeId> = Vec::with_capacity_in(solids.len(), self.alloc);
+        for s in solids {
+            self.check(s.id)?;
+            layer.push(s.id);
+        }
+        self.balanced_boolean(op, edge, layer, name)
+    }
 
     fn boolean(&mut self, op: Boolean, edge: Edge, a: NodeId, b: NodeId, name: Option<&str>) -> Result<NodeId, CadError> {
         self.check(a)?;
@@ -1406,6 +1442,45 @@ impl<'a, P: Planted<CadPlant>> Graph<'a, P> {
     /// `a` without `b`.
     pub fn difference<A: Join<B::Complement>, B: Ex>(&mut self, a: Solid<A>, b: Solid<B>) -> Result<Solid<A::Intersect>, CadError> {
         Ok(Solid::new(self.boolean(Boolean::Difference, Edge::Sharp, a.id, b.id, None)?))
+    }
+
+    /// Balanced binary tree union of `solids` (depth `ceil(log2(solids.len()))`, preserving level).
+    /// Returns [`CadError::Argument`] when `solids` is empty.
+    pub fn union_all<K: Join<K>>(&mut self, solids: &[Solid<K>]) -> Result<Solid<K::Union>, CadError> {
+        Ok(Solid::new(self.boolean_all(Boolean::Union, Edge::Sharp, NodeKind::Union, solids, None)?))
+    }
+
+    /// Balanced binary tree intersection of `solids` (depth `ceil(log2(solids.len()))`, preserving level).
+    /// Returns [`CadError::Argument`] when `solids` is empty.
+    pub fn intersect_all<K: Join<K>>(&mut self, solids: &[Solid<K>]) -> Result<Solid<K::Intersect>, CadError> {
+        Ok(Solid::new(self.boolean_all(Boolean::Intersect, Edge::Sharp, NodeKind::Intersect, solids, None)?))
+    }
+
+    fn blend_all<K: Ex>(&mut self, op: Boolean, chamfer: bool, solids: &[Solid<K>], o: BlendOpts<'_>) -> Result<Solid<Bound>, CadError> {
+        let kind = if chamfer { NodeKind::ChamferBoolean } else { NodeKind::SmoothBoolean };
+        let r = Self::positive(kind, o.name, "radius", o.radius)?;
+        let edge = if chamfer { Edge::Chamfer { r } } else { Edge::Round { r } };
+        Ok(Solid::new(self.boolean_all(op, edge, kind, solids, o.name)?))
+    }
+
+    /// Balanced binary tree union with a rounded fillet of `radius` at every join.
+    pub fn round_union_all<K: Ex>(&mut self, solids: &[Solid<K>], o: BlendOpts<'_>) -> Result<Solid<Bound>, CadError> {
+        self.blend_all(Boolean::Union, false, solids, o)
+    }
+
+    /// Balanced binary tree intersection with a rounded edge at every join.
+    pub fn round_intersect_all<K: Ex>(&mut self, solids: &[Solid<K>], o: BlendOpts<'_>) -> Result<Solid<Bound>, CadError> {
+        self.blend_all(Boolean::Intersect, false, solids, o)
+    }
+
+    /// Balanced binary tree union with a chamfer at every join.
+    pub fn chamfer_union_all<K: Ex>(&mut self, solids: &[Solid<K>], o: BlendOpts<'_>) -> Result<Solid<Bound>, CadError> {
+        self.blend_all(Boolean::Union, true, solids, o)
+    }
+
+    /// Balanced binary tree intersection with a chamfer at every join.
+    pub fn chamfer_intersect_all<K: Ex>(&mut self, solids: &[Solid<K>], o: BlendOpts<'_>) -> Result<Solid<Bound>, CadError> {
+        self.blend_all(Boolean::Intersect, true, solids, o)
     }
 
     fn blend<A: Ex, B: Ex>(&mut self, op: Boolean, chamfer: bool, a: Solid<A>, b: Solid<B>, o: BlendOpts<'_>) -> Result<Solid<Bound>, CadError> {

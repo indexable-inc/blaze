@@ -197,3 +197,16 @@ fn shared_cells_record_as_plain_ones() {
     assert_eq!(read.cells(), plain.cells());
     assert_eq!(read.estimate(7), 15);
 }
+
+#[test]
+fn precomputed_inv_ln_gamma_matches_runtime_ln_and_cell_of() {
+    let runtime_ln = GAMMA.ln();
+    assert!((LN_GAMMA - runtime_ln).abs() < 1e-15, "LN_GAMMA={LN_GAMMA} vs runtime={runtime_ln}");
+    let runtime_inv = 1.0 / runtime_ln;
+    assert!((INV_LN_GAMMA - runtime_inv).abs() < 1e-12, "INV_LN_GAMMA={INV_LN_GAMMA} vs {runtime_inv}");
+    for shift in 0..45u32 {
+        let v = 1u64 << shift;
+        let expected = 1 + (((v as f64).ln() / runtime_ln).ceil().max(0.0) as usize).min(BUCKETS - 1);
+        assert_eq!(DdSketch::cell_of(v), expected, "mismatch at 2^{shift}");
+    }
+}

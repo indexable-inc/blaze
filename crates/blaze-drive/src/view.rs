@@ -43,9 +43,11 @@ impl ViewKey {
     /// The view of the member unit whose root is `root` (the crate list's root path, in the
     /// checkout's tree: `/0/a/src/lib.rs`, never a machine path: rule 25), whose crate is named
     /// `name` (the target's name: the library's, a bin's, an integration test's) and which is a
-    /// test build or not. Not the unit's crate key: that key holds every dependency's key, so a
-    /// dependency bumped or an edge added would rename every view row and move every shared
-    /// body's row key (`source_at_views`), entering bodies that read nothing of it (rule 77).
+    /// test build or not. Not the unit's crate key: that key held every dependency's key, so a
+    /// dependency bumped or an edge added renamed every view row and moved every shared body's
+    /// row key (`source_at_views`), entering bodies that read nothing of it (rule 77). Since D158
+    /// the crate key is the identity alone (blaze-world list.rs `unit_crate_key`); the view stays
+    /// by (root, name, test), which a source correction or a member's move does not rename.
     /// Two member units never share (root, name, test): that triple is what tells them apart.
     pub fn of_member(root: &[u8], name: &[u8], test: bool) -> ViewKey {
         let mut h = Hasher::new(MEMBER_VIEW_DOMAIN);

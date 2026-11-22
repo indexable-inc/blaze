@@ -223,7 +223,7 @@ fn step_auto<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result
             reach.push(Reach::Pointee);
         }
         TyKind::Tuple(l) => {
-            tys.extend_from_slice(&cx.list(l));
+            tys.extend_from_slice(&cx.list_small(l));
             for i in 0..l.len {
                 reach.push(Reach::Element(i));
             }
@@ -401,13 +401,13 @@ fn step_wf<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result<S
             for &p in adt.where_clauses {
                 preds.push(cx.import_pred(adt.portable, p, args)?);
             }
-            kids.extend_from_slice(&cx.list(args));
+            kids.extend_from_slice(&cx.list_small(args));
         }
         // wf.rs: "ty::FnDef(did, args) => { .. nominal_obligations(did, args) .. }": the fn's
         // where-clauses are not in `FnSigDef` (module doc); its arguments are checked.
-        TyKind::FnDef(_, args) => kids.extend_from_slice(&cx.list(args)),
+        TyKind::FnDef(_, args) => kids.extend_from_slice(&cx.list_small(args)),
         // wf.rs: "ty::FnPtr(..) => {}", then its inputs and output are visited.
-        TyKind::FnPtr(l, _) => kids.extend_from_slice(&cx.list(l)),
+        TyKind::FnPtr(l, _) => kids.extend_from_slice(&cx.list_small(l)),
         // wf.rs: "ty::Closure(did, args) => { .. Only check the upvar types for WF, not the
         // rest of the types (#93611) .. }".
         TyKind::Closure(_, args) => {
@@ -431,10 +431,10 @@ fn step_wf<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result<S
                 match cx.tys.kind(cx.arg(l, i)) {
                     TyKind::ExTrait(d, a) => {
                         preds.push(Pred::DynCompatible(d));
-                        kids.extend_from_slice(&cx.list(a));
+                        kids.extend_from_slice(&cx.list_small(a));
                     }
                     TyKind::ExProj(_, a, term) => {
-                        kids.extend_from_slice(&cx.list(a));
+                        kids.extend_from_slice(&cx.list_small(a));
                         kids.push(term);
                     }
                     TyKind::ExAuto(_) => {}
@@ -453,7 +453,7 @@ fn step_wf<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result<S
             if a.parent_generics > args.len || a.parent_generics == 0 {
                 return Err(malformed());
             }
-            let all = cx.list(args);
+            let all = cx.list_small(args);
             let trait_args = cx.mk_list(&all[..a.parent_generics as usize])?;
             preds.push(Pred::Trait { trait_: tr, args: trait_args, polarity: Polarity::Positive });
             let td = cx.trait_def(tr)?;
@@ -474,10 +474,10 @@ fn step_wf<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result<S
         // wf.rs: an unevaluated const is `ConstEvaluatable`, then its arguments.
         TyKind::Alias(_, AliasKind::Const, _, args) => {
             preds.push(Pred::ConstEvaluatable(t));
-            kids.extend_from_slice(&cx.list(args));
+            kids.extend_from_slice(&cx.list_small(args));
         }
         // Inherent, free and opaque aliases: their arguments (module doc).
-        TyKind::Alias(_, _, _, args) => kids.extend_from_slice(&cx.list(args)),
+        TyKind::Alias(_, _, _, args) => kids.extend_from_slice(&cx.list_small(args)),
         TyKind::Bound(..) | TyKind::Canonical(_) => return Err(malformed()),
         _ => match children(k) {
             Children::None => {}

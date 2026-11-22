@@ -377,9 +377,23 @@ struct Cand {
 struct Plan {
     keep: u32,
     gone: u32,
+    shared: u32,
     p: P3,
     q: Quadric,
     cost: f64,
+}
+
+/// Precomputed per-fan-triangle geometry for `vertical`, hoisted out of the `piece × fan` loop.
+#[derive(Clone, Copy, Debug)]
+struct FanData {
+    owner: u32,
+    q: [[f64; 2]; 3],
+    bbox: [[f64; 2]; 2],
+    sc: Line,
+    sd: Line,
+    link: Option<Line>,
+    a2: f64,
+    corners: [D3; 3],
 }
 
 /// One side of a vertex's star: a neighbour, the triangle, and whether that side is marked.
@@ -426,6 +440,7 @@ struct Lists<'s> {
     ring_b: V<'s, u32>,
     triples: V<'s, [u32; 3]>,
     fixes: V<'s, (u32, u32, u32, bool)>,
+    neighbours: V<'s, u32>,
     /// The collapse's region: least-first triples with their slots, sorted, once each.
     region: V<'s, ([u32; 3], u32)>,
     /// The fan: `[NONE (the new vertex), c, d]` per region triangle off the edge, with its slot.
@@ -435,10 +450,9 @@ struct Lists<'s> {
     ins: V<'s, u32>,
     /// Unit normals of the region and the fan.
     normals: V<'s, D3>,
-    /// The fan projected, its boxes (least and most corner), and one spoke line per link vertex,
-    /// sorted by it.
+    /// The fan projected, one spoke line per link vertex (sorted by it), and precomputed per-fan data.
     fan2: V<'s, [[f64; 2]; 3]>,
-    fan_box: V<'s, [[f64; 2]; 2]>,
+    fan_data: V<'s, FanData>,
     spokes: V<'s, (u32, Line)>,
     /// A region triangle's pieces projected, corner by corner in piece order, and the fan
     /// triangles whose boxes meet theirs.
@@ -448,15 +462,15 @@ struct Lists<'s> {
     /// `new_corr`, and the hull's.
     pts: V<'s, ([f64; 2], u32)>,
     hull: V<'s, ([f64; 2], u32)>,
-    /// A piece projected, and the two buffers it is cut between.
-    poly_src: V<'s, Vtx>,
+    /// The two buffers a projected piece is cut between.
     poly_a: V<'s, Vtx>,
     poly_b: V<'s, Vtx>,
     vals: V<'s, f64>,
     /// The collapse's new pieces before it is admitted: corners, and per piece its owner slot,
-    /// the piece (its `first` an index into `new_corr`) and its error.
+    /// the piece (its `first` an index into `new_corr`) and its error, plus compact sort order.
     new_corr: V<'s, Corr>,
     new_pieces: V<'s, (u32, Piece, f64)>,
+    piece_order: V<'s, (u64, u32, u32)>,
 }
 
 /// What a vertex's star says about it and about one of its edges.
@@ -703,24 +717,25 @@ pub fn decimate_planted<'a>(
         ring_b: Vec::new_in(s),
         triples: Vec::new_in(s),
         fixes: Vec::new_in(s),
+        neighbours: Vec::new_in(s),
         region: Vec::new_in(s),
         fan: Vec::new_in(s),
         outs: Vec::new_in(s),
         ins: Vec::new_in(s),
         normals: Vec::new_in(s),
         fan2: Vec::new_in(s),
-        fan_box: Vec::new_in(s),
+        fan_data: Vec::new_in(s),
         spokes: Vec::new_in(s),
         proj: Vec::new_in(s),
         near: Vec::new_in(s),
         pts: Vec::new_in(s),
         hull: Vec::new_in(s),
-        poly_src: Vec::new_in(s),
         poly_a: Vec::new_in(s),
         poly_b: Vec::new_in(s),
         vals: Vec::new_in(s),
         new_corr: Vec::new_in(s),
         new_pieces: Vec::new_in(s),
+        piece_order: Vec::new_in(s),
     };
     // The largest accepted collapse's error (module documentation, ERROR BOUND), metres.
     let mut error_bound = 0.0f64;
@@ -732,12 +747,28 @@ pub fn decimate_planted<'a>(
         Target::Triangles(_) => f64::INFINITY,
     };
     let mut queue = Queue { heap: Heap4::new_in(s), pushed: 0, plant };
-    // Seeded in the input's triangle order: the order only a planted tie-break can see.
-    for t in 0..triangles {
-        for k in 0..3u32 {
-            let (a, b) = (w.tri[at(t)][at(k)], w.tri[at(t)][at((k + 1) % 3)]);
-            let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-            queue.offer(&w, &mut lists, (lo, hi))?;
+    if queue.plant.has(DecimatePlant::TieByInsertion) {
+        // Seeded in the input's triangle order: the order only a planted tie-break can see.
+        for t in 0..triangles {
+            for k in 0..3u32 {
+                let (a, b) = (w.tri[at(t)][at(k)], w.tri[at(t)][at((k + 1) % 3)]);
+                let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+                queue.offer(&w, &mut lists, (lo, hi))?;
+            }
+        }
+    } else {
+        // Each distinct undirected edge once, in `(lo, hi)` order, reusing `star_a` across edges
+        // sharing `lo`. With deterministic tie-breaking (`tie = 0`), duplicates in the heap are
+        // strictly redundant (and would re-run refused maps twice).
+        let mut last_lo = NONE;
+        for (start, _) in edge_runs(&feature_halves) {
+            let h = feature_halves[start];
+            if h.lo != last_lo {
+                w.star(h.lo, &mut lists.star_a)?;
+                last_lo = h.lo;
+            }
+            w.star(h.hi, &mut lists.star_b)?;
+            queue.offer_from_stars(&w, (h.lo, h.hi), &lists.star_a, &lists.star_b)?;
         }
     }
     let stop = loop {
@@ -759,10 +790,11 @@ pub fn decimate_planted<'a>(
         let Some(plan) = queue.evaluate(&w, &mut lists, (c.lo, c.hi))? else {
             continue;
         };
+        // `evaluate` left both ends' stars in `star_a` and `star_b`, reused directly by `valid`.
         if !valid(&w, &mut lists, &plan)? {
             continue;
         }
-        // `valid` left both ends' live corners in the rings.
+        // `valid` left both ends' live corners in `ring_a` (`keep`) and `ring_b` (`gone`).
         region(&w, &mut lists)?;
         if lists.region.len() > MAX_REGION {
             stats.over_region += 1;
@@ -790,20 +822,23 @@ pub fn decimate_planted<'a>(
         let merged = place(&mut w, &mut lists, merge_limit, &mut stats, s)?;
         error_bound = error_bound.max(merged + w.allowance);
         w.star(plan.keep, &mut lists.star_a)?;
+        lists.neighbours.clear();
         let mut last = NONE;
-        let neighbours: V<'_, u32> = {
-            let mut v: V<'_, u32> = Vec::try_with_capacity_in(lists.star_a.len(), s)?;
-            for side in lists.star_a.iter() {
-                if side.0 != last {
-                    push(&mut v, side.0)?;
-                    last = side.0;
-                }
+        for side in lists.star_a.iter() {
+            if side.0 != last {
+                push(&mut lists.neighbours, side.0)?;
+                last = side.0;
             }
-            v
-        };
-        for &x in neighbours.iter() {
-            let (lo, hi) = if x < plan.keep { (x, plan.keep) } else { (plan.keep, x) };
-            queue.offer(&w, &mut lists, (lo, hi))?;
+        }
+        // Reuse `star_a` (`plan.keep`'s star) across all incident edges without recomputing it.
+        for ni in 0..lists.neighbours.len() {
+            let x = lists.neighbours[ni];
+            w.star(x, &mut lists.star_b)?;
+            if x < plan.keep {
+                queue.offer_from_stars(&w, (x, plan.keep), &lists.star_b, &lists.star_a)?;
+            } else {
+                queue.offer_from_stars(&w, (plan.keep, x), &lists.star_a, &lists.star_b)?;
+            }
         }
     };
     let shaped = output(&w, view.triangle_count(), s)?;
@@ -868,10 +903,28 @@ impl<P: Planted<DecimatePlant>> Queue<'_, P> {
         let Some(plan) = self.evaluate(w, lists, edge)? else {
             return Ok(());
         };
+        self.push_plan(w, edge, plan.cost)
+    }
+
+    /// `edge`'s collapse queued using precomputed sorted stars `(star_lo, star_hi)`.
+    fn offer_from_stars(
+        &mut self,
+        w: &Work<'_, '_>,
+        edge: (u32, u32),
+        star_lo: &[Side],
+        star_hi: &[Side],
+    ) -> Result<(), AllocFailure> {
+        let Some(plan) = evaluate_stars(w, edge, star_lo, star_hi, self.plant) else {
+            return Ok(());
+        };
+        self.push_plan(w, edge, plan.cost)
+    }
+
+    fn push_plan(&mut self, w: &Work<'_, '_>, edge: (u32, u32), cost: f64) -> Result<(), AllocFailure> {
         let tie = if self.plant.has(DecimatePlant::TieByInsertion) { self.pushed } else { 0 };
         self.pushed += 1;
         let cand = Cand {
-            cost: plan.cost.to_bits(),
+            cost: cost.to_bits(),
             tie,
             lo: edge.0,
             hi: edge.1,
@@ -887,7 +940,7 @@ impl<P: Planted<DecimatePlant>> Queue<'_, P> {
 }
 
 /// Where the collapse of `edge` would put the merged vertex and what it costs, or `None` when
-/// the feature rule forbids it.
+/// the feature rule forbids it. Leaves both ends' sorted stars in `lists.star_a` and `lists.star_b`.
 fn evaluate(
     w: &Work<'_, '_>,
     lists: &mut Lists<'_>,
@@ -897,11 +950,23 @@ fn evaluate(
     let (a, b) = edge;
     w.star(a, &mut lists.star_a)?;
     w.star(b, &mut lists.star_b)?;
-    let fa = w.facts(&lists.star_a, b);
-    let fb = w.facts(&lists.star_b, a);
+    Ok(evaluate_stars(w, edge, &lists.star_a, &lists.star_b, plant))
+}
+
+/// [`evaluate`] on precomputed sorted stars `(star_a, star_b)` of `edge = (a, b)`.
+fn evaluate_stars(
+    w: &Work<'_, '_>,
+    edge: (u32, u32),
+    star_a: &[Side],
+    star_b: &[Side],
+    plant: impl Planted<DecimatePlant>,
+) -> Option<Plan> {
+    let (a, b) = edge;
+    let fa = w.facts(star_a, b);
     if fa.edge_tris == 0 {
-        return Ok(None);
+        return None;
     }
+    let fb = w.facts(star_b, a);
     let (da, db, feature) =
         if plant.has(DecimatePlant::CrossCrease) { (0, 0, false) } else { (fa.degree, fb.degree, fa.edge_feature) };
     enum Place {
@@ -913,11 +978,11 @@ fn evaluate(
         (0, 0) => Place::Optimum,
         (0, _) => Place::AtB,
         (_, 0) => Place::AtA,
-        _ if !feature => return Ok(None),
+        _ if !feature => return None,
         (2, 2) => Place::Optimum,
         (2, _) => Place::AtB,
         (_, 2) => Place::AtA,
-        _ => return Ok(None),
+        _ => return None,
     };
     let q = w.quad[at(a)].add(w.quad[at(b)]);
     let (pa, pb) = (wide(w.pos[at(a)]), wide(w.pos[at(b)]));
@@ -940,27 +1005,27 @@ fn evaluate(
     };
     let p = narrow(p);
     if !p.iter().all(|x| x.is_finite()) {
-        return Ok(None);
+        return None;
     }
     let cost = q.eval(wide(p));
     if cost.is_nan() {
-        return Ok(None);
+        return None;
     }
     let cost = if cost > 0.0 { cost } else { 0.0 };
     let (keep, gone) = match place {
         Place::AtB => (b, a),
         _ => (a, b),
     };
-    Ok(Some(Plan { keep, gone, p, q, cost }))
+    Some(Plan { keep, gone, shared: fa.edge_tris, p, q, cost })
 }
 
 /// The link condition, no duplicate triangle after, no normal flipped or made zero.
+/// Reuses the sorted stars `evaluate` left in `lists.star_a` and `lists.star_b`.
 fn valid(w: &Work<'_, '_>, lists: &mut Lists<'_>, plan: &Plan) -> Result<bool, AllocFailure> {
     let (a, b) = (plan.keep, plan.gone);
-    w.star(a, &mut lists.star_a)?;
-    w.star(b, &mut lists.star_b)?;
-    let shared = w.facts(&lists.star_a, b).edge_tris;
+    let shared = plan.shared;
     // Distinct neighbours of each, the other end left out, counted in common.
+    // Symmetric in `(a, b)`, so `star_a` / `star_b` from `evaluate` work in either order.
     let mut common = 0u32;
     let (mut i, mut j) = (0, 0);
     let (sa, sb) = (&lists.star_a, &lists.star_b);
@@ -989,10 +1054,10 @@ fn valid(w: &Work<'_, '_>, lists: &mut Lists<'_>, plan: &Plan) -> Result<bool, A
     w.live_corners(b, &mut lists.ring_b)?;
     lists.triples.clear();
     let p = wide(plan.p);
-    for ring in [&lists.ring_a, &lists.ring_b] {
+    for (ring, other) in [(&lists.ring_a, b), (&lists.ring_b, a)] {
         for &c in ring.iter() {
             let t = c / 3;
-            if w.contains(t, a) && w.contains(t, b) {
+            if w.contains(t, other) {
                 continue;
             }
             // From the least id, as the quadrics: the signs tested below must not hang on which
@@ -1011,24 +1076,28 @@ fn valid(w: &Work<'_, '_>, lists: &mut Lists<'_>, plan: &Plan) -> Result<bool, A
             if after == [0.0; 3] || !(dot(before, after) > 0.0) {
                 return Ok(false);
             }
-            moved.sort_unstable();
+            if moved[0] > moved[1] {
+                moved.swap(0, 1);
+            }
+            if moved[1] > moved[2] {
+                moved.swap(1, 2);
+            }
+            if moved[0] > moved[1] {
+                moved.swap(0, 1);
+            }
             push(&mut lists.triples, moved)?;
         }
     }
     lists.triples.sort_unstable();
     // A triangle around both ends is in both rings: equal neighbours there are one triangle.
     let mut last: Option<[u32; 3]> = None;
-    let mut seen_twice = false;
     for &t in lists.triples.iter() {
         if last == Some(t) {
-            seen_twice = true;
+            // Only a triangle of `b`'s turned into one of `a`'s repeats a triple, since rings hold
+            // each live triangle once and the shared ones were skipped.
+            return Ok(false);
         }
         last = Some(t);
-    }
-    if seen_twice {
-        // Only a triangle of `b`'s turned into one of `a`'s repeats a triple, since rings hold
-        // each live triangle once and the shared ones were skipped.
-        return Ok(false);
     }
     Ok(true)
 }
@@ -1155,42 +1224,137 @@ fn spoke(spokes: &[(u32, Line)], v: u32) -> Option<Line> {
     spokes.binary_search_by_key(&v, |s| s.0).ok().map(|i| spokes[i].1)
 }
 
-/// `poly` cut to where `value` is at least zero (Sutherland and Hodgman), into `out`; whether
-/// every corner kept lies on the cut (value zero), so the result has no area on its kept side.
-fn cut(
-    poly: &[Vtx],
-    vals: &mut V<'_, f64>,
-    out: &mut V<'_, Vtx>,
-    value: impl Fn([f64; 2]) -> f64,
-) -> Result<bool, AllocFailure> {
-    out.clear();
-    vals.clear();
-    for v in poly {
-        push(vals, value(v.at))?;
+enum CutResult {
+    Empty,
+    AllInside,
+    Clipped { len: usize, on_line: bool },
+}
+
+#[inline(always)]
+fn eval_cut<const SNAP: bool, const NEG: bool>(line: Line, tau: f64, x: [f64; 2]) -> f64 {
+    let raw = line.side(x);
+    let d = if NEG { -raw } else { raw };
+    if !SNAP {
+        d + tau
+    } else if d.abs() <= tau {
+        0.0
+    } else {
+        d
     }
-    let between = |x: Vtx, y: Vtx, s: f64| Vtx {
+}
+
+#[inline(always)]
+fn lerp_vtx(x: Vtx, y: Vtx, s: f64) -> Vtx {
+    Vtx {
         at: [x.at[0] + s * (y.at[0] - x.at[0]), x.at[1] + s * (y.at[1] - x.at[1])],
         orig: add(x.orig, scale(sub(y.orig, x.orig), s)),
-    };
-    let mut on_line = true;
+    }
+}
+
+/// Stack-backed Sutherland-Hodgman clip for convex polygons of up to 20 corners (zero heap writes).
+#[inline(always)]
+fn cut_line_stack<const SNAP: bool, const NEG: bool>(
+    poly: &[Vtx],
+    line: Line,
+    tau: f64,
+    out: &mut [Vtx; 24],
+) -> CutResult {
     let m = poly.len();
+    let mut vals = [0.0f64; 24];
+    let mut any_nonneg = false;
+    let mut all_pos = true;
     for i in 0..m {
-        let j = if i == 0 { m - 1 } else { i - 1 };
+        let val = eval_cut::<SNAP, NEG>(line, tau, poly[i].at);
+        vals[i] = val;
+        if val >= 0.0 {
+            any_nonneg = true;
+        }
+        if !(val > 0.0) {
+            all_pos = false;
+        }
+    }
+    if !any_nonneg {
+        return CutResult::Empty;
+    }
+    if all_pos {
+        return CutResult::AllInside;
+    }
+    let mut n = 0usize;
+    let mut on_line = true;
+    let mut j = m - 1;
+    for i in 0..m {
         let (dc, dp) = (vals[i], vals[j]);
         let (cur, prev) = (poly[i], poly[j]);
         if dc >= 0.0 {
             if dp < 0.0 && dc > 0.0 {
-                push(out, between(prev, cur, dp / (dp - dc)))?;
+                out[n] = lerp_vtx(prev, cur, dp / (dp - dc));
+                n += 1;
+            }
+            out[n] = cur;
+            n += 1;
+            if dc > 0.0 {
+                on_line = false;
+            }
+        } else if dp > 0.0 {
+            out[n] = lerp_vtx(prev, cur, dp / (dp - dc));
+            n += 1;
+        }
+        j = i;
+    }
+    CutResult::Clipped { len: n, on_line }
+}
+
+/// Fallback heap-backed clip for polygons with more than 20 corners.
+fn cut_line_vec<const SNAP: bool, const NEG: bool>(
+    poly: &[Vtx],
+    line: Line,
+    tau: f64,
+    vals: &mut V<'_, f64>,
+    out: &mut V<'_, Vtx>,
+) -> Result<CutResult, AllocFailure> {
+    let m = poly.len();
+    if m == 0 {
+        return Ok(CutResult::Empty);
+    }
+    vals.clear();
+    let mut any_nonneg = false;
+    let mut all_pos = true;
+    for v in poly {
+        let val = eval_cut::<SNAP, NEG>(line, tau, v.at);
+        if val >= 0.0 {
+            any_nonneg = true;
+        }
+        if !(val > 0.0) {
+            all_pos = false;
+        }
+        push(vals, val)?;
+    }
+    if !any_nonneg {
+        return Ok(CutResult::Empty);
+    }
+    if all_pos {
+        return Ok(CutResult::AllInside);
+    }
+    out.clear();
+    let mut on_line = true;
+    let mut j = m - 1;
+    for i in 0..m {
+        let (dc, dp) = (vals[i], vals[j]);
+        let (cur, prev) = (poly[i], poly[j]);
+        if dc >= 0.0 {
+            if dp < 0.0 && dc > 0.0 {
+                push(out, lerp_vtx(prev, cur, dp / (dp - dc)))?;
             }
             push(out, cur)?;
             if dc > 0.0 {
                 on_line = false;
             }
         } else if dp > 0.0 {
-            push(out, between(prev, cur, dp / (dp - dc)))?;
+            push(out, lerp_vtx(prev, cur, dp / (dp - dc)))?;
         }
+        j = i;
     }
-    Ok(on_line)
+    Ok(CutResult::Clipped { len: out.len(), on_line })
 }
 
 /// The barycentric map (module documentation): `None` when an edge triangle's far corner is in
@@ -1312,21 +1476,12 @@ fn vertical(w: &Work<'_, '_>, lists: &mut Lists<'_>, plan: &Plan, limit: f64) ->
         }
     }
     lists.fan2.clear();
-    lists.fan_box.clear();
     for &(f, _) in lists.fan.iter() {
         let q = [proj(point(f[0])), proj(point(f[1])), proj(point(f[2]))];
         if !(area2(q) > 0.0) {
             return Ok(None);
         }
         push(&mut lists.fan2, q)?;
-        let mut b = [q[0], q[0]];
-        for x in &q[1..] {
-            for i in 0..2 {
-                b[0][i] = b[0][i].min(x[i]);
-                b[1][i] = b[1][i].max(x[i]);
-            }
-        }
-        push(&mut lists.fan_box, b)?;
     }
     let pp = proj(p);
     // The fan winds once about `p`: its sectors, half-open, cross the ray along `+u` once.
@@ -1343,10 +1498,34 @@ fn vertical(w: &Work<'_, '_>, lists: &mut Lists<'_>, plan: &Plan, limit: f64) ->
         push(&mut lists.spokes, (lists.fan[i].0[1], line))?;
     }
     lists.spokes.sort_unstable_by_key(|s| s.0);
+    // Precompute all per-fan-triangle lines, boxes, areas and 3D corners once outside the inner loop.
+    lists.fan_data.clear();
+    for fi in 0..lists.fan.len() {
+        let (f, owner) = lists.fan[fi];
+        let q = lists.fan2[fi];
+        let (Some(sc), Some(sd)) = (spoke(&lists.spokes, f[1]), spoke(&lists.spokes, f[2])) else {
+            return Ok(None);
+        };
+        let mut bbox = [q[0], q[0]];
+        for x in &q[1..] {
+            for i in 0..2 {
+                bbox[0][i] = bbox[0][i].min(x[i]);
+                bbox[1][i] = bbox[1][i].max(x[i]);
+            }
+        }
+        let link = Line::through(q[1], q[2]);
+        let a2 = area2(q);
+        let corners = [p, point(f[1]), point(f[2])];
+        push(&mut lists.fan_data, FanData { owner, q, bbox, sc, sd, link, a2, corners })?;
+    }
     let tau = w.tau;
     // Whether the boxes `lo..hi` and `b` are apart by more than `tau` along an axis.
-    let apart = |lo: [f64; 2], hi: [f64; 2], b: [[f64; 2]; 2]| (0..2).any(|i| hi[i] < b[0][i] - tau || lo[i] > b[1][i] + tau);
+    let apart = |lo: [f64; 2], hi: [f64; 2], b: [[f64; 2]; 2]| {
+        hi[0] < b[0][0] - tau || lo[0] > b[1][0] + tau || hi[1] < b[0][1] - tau || lo[1] > b[1][1] + tau
+    };
     let mut err = 0.0f64;
+    let mut stack_a = [Vtx { at: [0.0; 2], orig: [0.0; 3] }; 24];
+    let mut stack_b = [Vtx { at: [0.0; 2], orig: [0.0; 3] }; 24];
     for ri in 0..lists.region.len() {
         let (first, count) = w.own[at(lists.region[ri].1)];
         // The triangle's pieces projected, and the fan triangles near any of them: a piece's
@@ -1358,96 +1537,173 @@ fn vertical(w: &Work<'_, '_>, lists: &mut Lists<'_>, plan: &Plan, limit: f64) ->
             for k in piece.first..piece.first + piece.len {
                 let c = w.corr[at(k)];
                 let x = proj(c.cur);
-                for i in 0..2 {
-                    tlo[i] = tlo[i].min(x[i]);
-                    thi[i] = thi[i].max(x[i]);
-                }
+                tlo[0] = tlo[0].min(x[0]);
+                thi[0] = thi[0].max(x[0]);
+                tlo[1] = tlo[1].min(x[1]);
+                thi[1] = thi[1].max(x[1]);
                 push(&mut lists.proj, Vtx { at: x, orig: c.orig })?;
             }
         }
         lists.near.clear();
-        for fi in 0..lists.fan_box.len() {
-            if !apart(tlo, thi, lists.fan_box[fi]) {
+        for fi in 0..lists.fan_data.len() {
+            if !apart(tlo, thi, lists.fan_data[fi].bbox) {
                 push(&mut lists.near, len32(fi))?;
             }
         }
         let mut next = 0usize;
         for pi in first..first + count {
             let piece = w.pieces[at(pi)];
-            let projected = &lists.proj[next..next + at(piece.len)];
-            next += at(piece.len);
-            lists.poly_src.clear();
+            let p_start = next;
+            let p_end = next + at(piece.len);
+            next = p_end;
             let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
-            for &x in projected {
-                for i in 0..2 {
-                    lo[i] = lo[i].min(x.at[i]);
-                    hi[i] = hi[i].max(x.at[i]);
-                }
-                push(&mut lists.poly_src, x)?;
+            for &x in &lists.proj[p_start..p_end] {
+                lo[0] = lo[0].min(x.at[0]);
+                hi[0] = hi[0].max(x.at[0]);
+                lo[1] = lo[1].min(x.at[1]);
+                hi[1] = hi[1].max(x.at[1]);
             }
             for ni in 0..lists.near.len() {
-                let fi = at(lists.near[ni]);
-                let (f, owner) = lists.fan[fi];
-                let q = lists.fan2[fi];
-                if apart(lo, hi, lists.fan_box[fi]) {
+                let fd = lists.fan_data[at(lists.near[ni])];
+                if apart(lo, hi, fd.bbox) {
                     continue;
                 }
-                let (Some(sc), Some(sd), Some(link)) = (spoke(&lists.spokes, f[1]), spoke(&lists.spokes, f[2]), Line::through(q[1], q[2]))
-                else {
+                let Some(link) = fd.link else {
                     return Ok(None);
                 };
-                lists.poly_a.clear();
-                extend(&mut lists.poly_a, &lists.poly_src)?;
                 // Inside spoke `c` (its left), inside spoke `d` (its right), each snapped to the
                 // line within `tau`; inside the link edge (its left) or within `tau` outside it.
                 let mut flat = false;
-                for (line, sign, snap) in [(sc, 1.0f64, true), (sd, -1.0, true), (link, 1.0, false)] {
-                    let on_line = cut(&lists.poly_a, &mut lists.vals, &mut lists.poly_b, |x| {
-                        let d = sign * line.side(x);
-                        if !snap {
-                            d + tau
-                        } else if d.abs() <= tau {
-                            0.0
-                        } else {
-                            d
+                let mut use_stack = p_end - p_start <= 11;
+                let mut cur_buf: u8 = 0; // 0 = proj, 1 = buf_a, 2 = buf_b
+                let mut cur_len = p_end - p_start;
+                let mut empty = false;
+
+                macro_rules! do_cut {
+                    ($snap:expr, $neg:expr, $line:expr) => {
+                        if !empty {
+                            if use_stack && cur_len <= 11 {
+                                let (res, next_buf) = match cur_buf {
+                                    0 => (cut_line_stack::<$snap, $neg>(&lists.proj[p_start..p_end], $line, tau, &mut stack_a), 1u8),
+                                    1 => (cut_line_stack::<$snap, $neg>(&stack_a[..cur_len], $line, tau, &mut stack_b), 2u8),
+                                    _ => (cut_line_stack::<$snap, $neg>(&stack_b[..cur_len], $line, tau, &mut stack_a), 1u8),
+                                };
+                                match res {
+                                    CutResult::Empty => empty = true,
+                                    CutResult::AllInside => {}
+                                    CutResult::Clipped { len, on_line } => {
+                                        cur_buf = next_buf;
+                                        cur_len = len;
+                                        flat |= on_line;
+                                    }
+                                }
+                            } else {
+                                if use_stack {
+                                    // Spill current stack buffer into `poly_a` / `poly_b` before falling back.
+                                    if cur_buf == 1 {
+                                        lists.poly_a.clear();
+                                        extend(&mut lists.poly_a, &stack_a[..cur_len])?;
+                                    } else if cur_buf == 2 {
+                                        lists.poly_b.clear();
+                                        extend(&mut lists.poly_b, &stack_b[..cur_len])?;
+                                    }
+                                    use_stack = false;
+                                }
+                                let (res, next_buf) = match cur_buf {
+                                    0 => (cut_line_vec::<$snap, $neg>(&lists.proj[p_start..p_end], $line, tau, &mut lists.vals, &mut lists.poly_a)?, 1u8),
+                                    1 => (cut_line_vec::<$snap, $neg>(&lists.poly_a, $line, tau, &mut lists.vals, &mut lists.poly_b)?, 2u8),
+                                    _ => (cut_line_vec::<$snap, $neg>(&lists.poly_b, $line, tau, &mut lists.vals, &mut lists.poly_a)?, 1u8),
+                                };
+                                match res {
+                                    CutResult::Empty => empty = true,
+                                    CutResult::AllInside => {}
+                                    CutResult::Clipped { len, on_line } => {
+                                        cur_buf = next_buf;
+                                        cur_len = len;
+                                        flat |= on_line;
+                                    }
+                                }
+                            }
                         }
-                    })?;
-                    core::mem::swap(&mut lists.poly_a, &mut lists.poly_b);
-                    if lists.poly_a.is_empty() {
-                        break;
-                    }
-                    flat |= on_line;
+                    };
                 }
-                // A cut with no area is the neighbour's (its closure holds it), unless the piece
-                // is squashed: it never had area, and every part of it must stay claimed.
-                if lists.poly_a.is_empty() || (!piece.squashed && (lists.poly_a.len() < 3 || flat)) {
+
+                do_cut!(true, false, fd.sc);
+                do_cut!(true, true, fd.sd);
+                do_cut!(false, false, link);
+
+                if empty {
                     continue;
                 }
-                let a2 = area2(q);
-                let corners = [p, point(f[1]), point(f[2])];
+                let clipped: &[Vtx] = if use_stack {
+                    match cur_buf {
+                        0 => &lists.proj[p_start..p_end],
+                        1 => &stack_a[..cur_len],
+                        _ => &stack_b[..cur_len],
+                    }
+                } else {
+                    match cur_buf {
+                        0 => &lists.proj[p_start..p_end],
+                        1 => &lists.poly_a,
+                        _ => &lists.poly_b,
+                    }
+                };
+                // A cut with no area is the neighbour's (its closure holds it), unless the piece
+                // is squashed: it never had area, and every part of it must stay claimed.
+                if clipped.is_empty() || (!piece.squashed && (clipped.len() < 3 || flat)) {
+                    continue;
+                }
+                let q = fd.q;
+                let a2 = fd.a2;
+                let corners = fd.corners;
                 let start = len32(lists.new_corr.len());
+                lists.new_corr.try_reserve(clipped.len())?;
                 let mut most = 0.0f64;
-                for vi in 0..lists.poly_a.len() {
-                    let x = lists.poly_a[vi];
+                for &x in clipped {
                     let l0 = cross2(minus2(q[1], x.at), minus2(q[2], x.at)) / a2;
                     let l1 = cross2(minus2(q[2], x.at), minus2(q[0], x.at)) / a2;
                     let l2 = 1.0 - l0 - l1;
                     let cur = add(add(scale(corners[0], l0), scale(corners[1], l1)), scale(corners[2], l2));
-                    most = worst(most, distance(cur, x.orig));
-                    push(&mut lists.new_corr, Corr { cur, orig: x.orig })?;
+                    let d = distance(cur, x.orig);
+                    most = worst(most, d);
+                    let e_so_far = piece.base + most;
+                    if !(e_so_far <= limit) {
+                        return Ok(Some(worst(err, e_so_far)));
+                    }
+                    lists.new_corr.push(Corr { cur, orig: x.orig });
                 }
                 let e = piece.base + most;
                 err = worst(err, e);
                 if !(err <= limit) {
                     return Ok(Some(err));
                 }
-                let len = len32(lists.poly_a.len());
+                let len = len32(clipped.len());
                 let cut_piece = Piece { first: start, len, squashed: piece.squashed, base: piece.base, src: piece.src };
-                push(&mut lists.new_pieces, (owner, cut_piece, e))?;
+                push(&mut lists.new_pieces, (fd.owner, cut_piece, e))?;
             }
         }
     }
     Ok(Some(err))
+}
+
+/// Orthonormal frame on an owner triangle, computed once per owner slot in `place`.
+#[derive(Clone, Copy)]
+struct OwnerFrame {
+    o: D3,
+    u: D3,
+    vv: D3,
+}
+
+impl OwnerFrame {
+    fn of(w: &Work<'_, '_>, slot: u32) -> Option<OwnerFrame> {
+        // The owner's plane, from its least vertex (as every per-triangle float).
+        let v = least_first(w.tri[at(slot)]);
+        let (o, b, c) = (wide(w.pos[at(v[0])]), wide(w.pos[at(v[1])]), wide(w.pos[at(v[2])]));
+        let edge = sub(b, o);
+        let (u, n) = (unit(edge)?, unit(tri_normal(o, b, c))?);
+        let vv = unit(cross(n, u))?;
+        Some(OwnerFrame { o, u, vv })
+    }
 }
 
 /// The admitted collapse's new pieces given to their fan triangles (each region slot's old ones
@@ -1471,30 +1727,46 @@ fn place<'s>(
         w.live_pieces -= count;
         w.own[at(slot)] = (0, 0);
     }
-    // A new piece's `first` is its own place in `new_corr`, so the order is total, and a
-    // function of the region's (sorted) order alone.
-    lists.new_pieces.sort_unstable_by_key(|&(owner, piece, _)| (owner, piece.src, piece.first));
+    // Sort compact 16-byte `(owner_src, first, idx)` keys instead of swapping 40-byte entries.
+    // A new piece's `first` is its own place in `new_corr`, so the order is total and identical.
+    lists.piece_order.clear();
+    lists.piece_order.try_reserve(lists.new_pieces.len())?;
+    for (idx, &(owner, piece, _)) in lists.new_pieces.iter().enumerate() {
+        let key = (u64::from(owner) << 32) | u64::from(piece.src);
+        lists.piece_order.push((key, piece.first, len32(idx)));
+    }
+    lists.piece_order.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
     let mut merged_most = 0.0f64;
     let mut i = 0;
-    while i < lists.new_pieces.len() {
+    let total = lists.piece_order.len();
+    while i < total {
         // Every owner is a fan triangle, alive after the collapse.
-        let slot = lists.new_pieces[i].0;
+        let slot = (lists.piece_order[i].0 >> 32) as u32;
         let mut end = i;
-        while end < lists.new_pieces.len() && lists.new_pieces[end].0 == slot {
+        while end < total && (lists.piece_order[end].0 >> 32) as u32 == slot {
             end += 1;
         }
+        let frame = OwnerFrame::of(w, slot);
         let (first, corr_start) = (len32(w.pieces.len()), w.corr.len());
         let (mut count, mut corners, mut most) = (0u32, 0u32, 0.0f64);
         let mut j = i;
         while j < end {
-            let src = lists.new_pieces[j].1.src;
+            let key = lists.piece_order[j].0;
+            let src = key as u32;
             let mut k = j;
-            while k < end && lists.new_pieces[k].1.src == src {
+            while k < end && lists.piece_order[k].0 == key {
                 k += 1;
             }
-            let run = &lists.new_pieces[j..k];
+            let run = &lists.piece_order[j..k];
             let mergeable = run.len() > 1 && src != NONE;
-            let kept = if mergeable { merge(w, slot, run, &lists.new_corr, &mut lists.pts, &mut lists.hull, limit)? } else { None };
+            let kept = if mergeable {
+                match frame {
+                    Some(fr) => merge(w, fr, run, &lists.new_pieces, &lists.new_corr, &mut lists.pts, &mut lists.hull, limit)?,
+                    None => None,
+                }
+            } else {
+                None
+            };
             if let Some((len, e)) = kept {
                 stats.merged += 1;
                 count += 1;
@@ -1505,7 +1777,8 @@ fn place<'s>(
                 if mergeable {
                     stats.not_merged += 1;
                 }
-                for &(_, piece, e) in run {
+                for &(_, _, idx) in run {
+                    let (_, piece, e) = lists.new_pieces[at(idx)];
                     let start = len32(w.corr.len());
                     extend(&mut w.corr, &lists.new_corr[at(piece.first)..at(piece.first + piece.len)])?;
                     push(&mut w.pieces, Piece { first: start, ..piece })?;
@@ -1539,32 +1812,27 @@ fn place<'s>(
     Ok(merged_most)
 }
 
-/// One source's fragments in triangle `slot` (a run of `new_pieces`, corners in `new_corr`)
-/// pushed as one piece (module documentation, MERGING), with its corner count and error; `None`,
-/// nothing pushed, when the hull has no area, the fit fails, or the merge errs more than `limit`.
+/// One source's fragments in an owner triangle (a run of `piece_order` indices into `new_pieces`,
+/// corners in `new_corr`) pushed as one piece (module documentation, MERGING), with its corner
+/// count and error; `None`, nothing pushed, when the hull has no area, the fit fails, or the
+/// merge errs more than `limit`.
+#[allow(clippy::too_many_arguments)]
 fn merge(
     w: &mut Work<'_, '_>,
-    slot: u32,
-    run: &[(u32, Piece, f64)],
+    frame: OwnerFrame,
+    run: &[(u64, u32, u32)],
+    new_pieces: &[(u32, Piece, f64)],
     new_corr: &[Corr],
     pts: &mut V<'_, ([f64; 2], u32)>,
     hull: &mut V<'_, ([f64; 2], u32)>,
     limit: f64,
 ) -> Result<Option<(u32, f64)>, AllocFailure> {
-    // The owner's plane, from its least vertex (as every per-triangle float).
-    let v = least_first(w.tri[at(slot)]);
-    let (o, b, c) = (wide(w.pos[at(v[0])]), wide(w.pos[at(v[1])]), wide(w.pos[at(v[2])]));
-    let edge = sub(b, o);
-    let (Some(u), Some(n)) = (unit(edge), unit(tri_normal(o, b, c))) else {
-        return Ok(None);
-    };
-    let Some(vv) = unit(cross(n, u)) else {
-        return Ok(None);
-    };
+    let OwnerFrame { o, u, vv } = frame;
     // Corners in the plane, about their mean (so the normal equations are centred).
     pts.clear();
     let mut mean = [0.0f64; 2];
-    for &(_, piece, _) in run {
+    for &(_, _, idx) in run {
+        let piece = new_pieces[at(idx)].1;
         for k in piece.first..piece.first + piece.len {
             let d = sub(new_corr[at(k)].cur, o);
             let x = [dot(d, u), dot(d, vv)];
@@ -1582,35 +1850,54 @@ fn merge(
     let mut normal: M3 = [[0.0; 3]; 3];
     let mut rhs = [[0.0f64; 3]; 3];
     for &(x, k) in pts.iter() {
-        let row = [1.0, x[0], x[1]];
+        let (x0, x1) = (x[0], x[1]);
         let d = sub(new_corr[at(k)].orig, o0);
-        for i in 0..3 {
-            for j in 0..3 {
-                normal[i][j] += row[i] * row[j];
-            }
-            for (axis, r) in rhs.iter_mut().enumerate() {
-                r[i] += row[i] * d[axis];
-            }
+        normal[0][0] += 1.0;
+        normal[0][1] += x0;
+        normal[0][2] += x1;
+        normal[1][0] += x0;
+        normal[1][1] += x0 * x0;
+        normal[1][2] += x0 * x1;
+        normal[2][0] += x1;
+        normal[2][1] += x1 * x0;
+        normal[2][2] += x1 * x1;
+        for (axis, r) in rhs.iter_mut().enumerate() {
+            let da = d[axis];
+            r[0] += da;
+            r[1] += x0 * da;
+            r[2] += x1 * da;
         }
     }
+    // Cramer's rule with shared determinant & `cross(c1, c2)`, bit-equal to 3 calls to `solve3`.
+    let det = dot(normal[0], cross(normal[1], normal[2]));
+    if !(det.abs() > 0.0) || !det.is_finite() {
+        return Ok(None);
+    }
+    let c0 = [normal[0][0], normal[1][0], normal[2][0]];
+    let c1 = [normal[0][1], normal[1][1], normal[2][1]];
+    let c2 = [normal[0][2], normal[1][2], normal[2][2]];
+    let c1xc2 = cross(c1, c2);
     let mut coef = [[0.0f64; 3]; 3];
     for axis in 0..3 {
-        let Some(sol) = solve3(normal, rhs[axis], 0.0) else {
+        let b = rhs[axis];
+        let sol = [dot(b, c1xc2) / det, dot(c0, cross(b, c2)) / det, dot(c0, cross(c1, b)) / det];
+        if !sol.iter().all(|v| v.is_finite()) {
             return Ok(None);
-        };
+        }
         coef[axis] = sol;
     }
     let fit = |x: [f64; 2]| -> D3 {
-        let mut out = o0;
-        for axis in 0..3 {
-            out[axis] += coef[axis][0] + coef[axis][1] * x[0] + coef[axis][2] * x[1];
-        }
-        out
+        [
+            o0[0] + (coef[0][0] + coef[0][1] * x[0] + coef[0][2] * x[1]),
+            o0[1] + (coef[1][0] + coef[1][1] * x[0] + coef[1][2] * x[1]),
+            o0[2] + (coef[2][0] + coef[2][1] * x[0] + coef[2][2] * x[1]),
+        ]
     };
     // `base`: the old error before each corner's `orig`, plus how far the fit moved it.
     let mut base = 0.0f64;
     let mut at_corner = 0;
-    for &(_, piece, _) in run {
+    for &(_, _, idx) in run {
+        let piece = new_pieces[at(idx)].1;
         for _ in 0..piece.len {
             let (x, k) = pts[at_corner];
             at_corner += 1;
@@ -1618,7 +1905,26 @@ fn merge(
         }
     }
     // The hull (A. M. Andrew's monotone chain), counter-clockwise, no corner on a side's line.
-    pts.sort_unstable_by(|p, q| p.0[0].total_cmp(&q.0[0]).then(p.0[1].total_cmp(&q.0[1])).then(p.1.cmp(&q.1)));
+    // Fast finite `<`/`>` pre-check before `total_cmp`: bit-identical total order.
+    pts.sort_unstable_by(|p, q| {
+        let c0 = if p.0[0] < q.0[0] {
+            core::cmp::Ordering::Less
+        } else if p.0[0] > q.0[0] {
+            core::cmp::Ordering::Greater
+        } else {
+            p.0[0].total_cmp(&q.0[0])
+        };
+        c0.then_with(|| {
+            if p.0[1] < q.0[1] {
+                core::cmp::Ordering::Less
+            } else if p.0[1] > q.0[1] {
+                core::cmp::Ordering::Greater
+            } else {
+                p.0[1].total_cmp(&q.0[1])
+            }
+        })
+        .then_with(|| p.1.cmp(&q.1))
+    });
     hull.clear();
     for pass in 0..2 {
         let floor = hull.len();
@@ -1639,19 +1945,28 @@ fn merge(
     if hull.len() < 3 {
         return Ok(None);
     }
+    let mut fitted = [[0.0f64; 3]; 16];
+    let use_fitted = hull.len() <= 16;
     let mut err = 0.0f64;
-    for &(x, k) in hull.iter() {
-        err = worst(err, base + distance(new_corr[at(k)].cur, fit(x)));
+    for (hi, &(x, k)) in hull.iter().enumerate() {
+        let fx = fit(x);
+        if use_fitted {
+            fitted[hi] = fx;
+        }
+        err = worst(err, base + distance(new_corr[at(k)].cur, fx));
     }
     if !(err <= limit) {
         return Ok(None);
     }
     let start = len32(w.corr.len());
-    for &(x, k) in hull.iter() {
-        push(&mut w.corr, Corr { cur: new_corr[at(k)].cur, orig: fit(x) })?;
+    w.corr.try_reserve(hull.len())?;
+    for (hi, &(x, k)) in hull.iter().enumerate() {
+        let orig = if use_fitted { fitted[hi] } else { fit(x) };
+        w.corr.push(Corr { cur: new_corr[at(k)].cur, orig });
     }
     let len = len32(hull.len());
-    push(&mut w.pieces, Piece { first: start, len, squashed: false, base, src: run[0].1.src })?;
+    let src = new_pieces[at(run[0].2)].1.src;
+    push(&mut w.pieces, Piece { first: start, len, squashed: false, base, src })?;
     Ok(Some((len, err)))
 }
 
@@ -1675,10 +1990,10 @@ fn compact<'s>(w: &mut Work<'s, '_>, s: Alloc<'s>) -> Result<(), AllocFailure> {
     Ok(())
 }
 
+/// Reuses `lists.ring_a` (`keep`'s live corners) and `lists.ring_b` (`gone`'s live corners)
+/// left intact by `valid`, and relinks surviving corners without re-walking the vertex rings.
 fn collapse(w: &mut Work<'_, '_>, lists: &mut Lists<'_>, plan: &Plan) -> Result<(), AllocFailure> {
     let (keep, gone) = (plan.keep, plan.gone);
-    w.live_corners(gone, &mut lists.ring_b)?;
-    w.live_corners(keep, &mut lists.ring_a)?;
     lists.fixes.clear();
     for &c in lists.ring_b.iter() {
         let t = c / 3;
@@ -1725,13 +2040,13 @@ fn collapse(w: &mut Work<'_, '_>, lists: &mut Lists<'_>, plan: &Plan) -> Result<
             }
         }
     }
-    // One ring of the survivors of both.
-    w.live_corners(keep, &mut lists.ring_a)?;
-    w.live_corners(gone, &mut lists.ring_b)?;
+    // One ring of the survivors of both, in the exact order of `ring_b` then `ring_a`.
     let mut h = NONE;
     for &c in lists.ring_b.iter().rev().chain(lists.ring_a.iter().rev()) {
-        w.next[at(c)] = h;
-        h = c;
+        if w.alive[at(c / 3)] {
+            w.next[at(c)] = h;
+            h = c;
+        }
     }
     w.head[at(keep)] = h;
     w.head[at(gone)] = NONE;

@@ -39,6 +39,17 @@ pub(crate) const WORDS: &[&str] = &[
     // `lock-without-reason` (engine.rs `LOCK_TYPES`): its constructors' words are compared as
     // text after the type and `::`, and `new` and `new_in` are above.
     "Lock", "ReadLock", "RwLock", "RankedLock", "SharedMap",
+    // `workspace-unsafe` and `seqcst-unexplained`.
+    "extern", "Ordering", "SeqCst",
+    // `raw-sync`.
+    "sync", "Mutex", "Condvar", "Barrier", "parking_lot", "dashmap", "DashMap", "mpsc", "channel", "sync_channel",
+    // `blocking-on-pool`.
+    "sleep", "spawn", "scope", "yield_now", "park", "available_parallelism", "hint", "spin_loop",
+    // `transmute`.
+    "mem", "transmute", "transmute_copy",
+    // Strengthened `ambient-hasher` and `ambient-heap`.
+    "rustc_hash", "FxHashMap", "FxHashSet", "ahash", "AHashMap", "AHashSet", "foldhash", "pin", "into_boxed_slice",
+    "into_boxed_str",
 ];
 
 blaze_phf::name_phf_table!(pub(crate) static WORD = WORDS;);
@@ -47,6 +58,32 @@ blaze_phf::name_phf_table!(pub(crate) static WORD = WORDS;);
 pub(crate) const NO_WORD: u8 = u8::MAX;
 
 const _: () = assert!(WORDS.len() < NO_WORD as usize, "word numbers fit a byte below NO_WORD");
+
+/// Minimum and maximum byte lengths of any word in [`WORDS`], computed at compile time so the
+/// lexer can skip the PHF probe for identifiers outside this range (e.g., all 1-byte names).
+pub(crate) const MIN_WORD_LEN: usize = {
+    let mut min = usize::MAX;
+    let mut at = 0;
+    while at < WORDS.len() {
+        if WORDS[at].len() < min {
+            min = WORDS[at].len();
+        }
+        at += 1;
+    }
+    min
+};
+
+pub(crate) const MAX_WORD_LEN: usize = {
+    let mut max = 0;
+    let mut at = 0;
+    while at < WORDS.len() {
+        if WORDS[at].len() > max {
+            max = WORDS[at].len();
+        }
+        at += 1;
+    }
+    max
+};
 
 /// The number of `word` in [`WORDS`]. Panics, a compile error in a `const`, when it is not there.
 pub(crate) const fn word(word: &str) -> u8 {
@@ -61,6 +98,81 @@ pub(crate) const fn word(word: &str) -> u8 {
     panic!("a word the rules compare is missing from WORDS")
 }
 
+/// Bitmask classes for O(1) dispatch in `Pass::on_word` (`WORD_CLASS[t.word as usize]`).
+pub(crate) const WC_DEFINING: u16 = 1 << 0;
+pub(crate) const WC_COLLECTION: u16 = 1 << 1;
+pub(crate) const WC_RENAME: u16 = 1 << 2;
+pub(crate) const WC_STATIC: u16 = 1 << 3;
+pub(crate) const WC_SANS_IO: u16 = 1 << 4;
+pub(crate) const WC_LOCK_TYPE: u16 = 1 << 5;
+pub(crate) const WC_DISPATCHED: u16 = 1 << 6;
+pub(crate) const WC_IO_MODULE: u16 = 1 << 7;
+pub(crate) const WC_IO_TYPE: u16 = 1 << 8;
+pub(crate) const WC_PRINT_MACRO: u16 = 1 << 9;
+
+/// Word indices in [`WORDS`] for O(1) integer dispatch without string comparisons.
+pub(crate) const W_USE: u8 = word("use");
+pub(crate) const W_AS: u8 = word("as");
+pub(crate) const W_CLONE: u8 = word("clone");
+pub(crate) const W_GLOBAL: u8 = word("Global");
+pub(crate) const W_FN: u8 = word("fn");
+pub(crate) const W_TYPE: u8 = word("type");
+pub(crate) const W_IMPL: u8 = word("impl");
+pub(crate) const W_TRAIT: u8 = word("trait");
+pub(crate) const W_MOD: u8 = word("mod");
+pub(crate) const W_FOR: u8 = word("for");
+pub(crate) const W_SELF: u8 = word("self");
+pub(crate) const W_UNWRAP: u8 = word("unwrap");
+pub(crate) const W_EXPECT: u8 = word("expect");
+pub(crate) const W_STD: u8 = word("std");
+pub(crate) const W_ALLOC: u8 = word("alloc");
+pub(crate) const W_UNSAFE: u8 = word("unsafe");
+pub(crate) const W_EXTERN: u8 = word("extern");
+pub(crate) const W_ORDERING: u8 = word("Ordering");
+pub(crate) const W_SEQCST: u8 = word("SeqCst");
+pub(crate) const W_STRING: u8 = word("String");
+pub(crate) const W_THREAD_LOCAL: u8 = word("thread_local");
+pub(crate) const W_FILE: u8 = word("File");
+pub(crate) const W_RECV: u8 = word("recv");
+pub(crate) const W_JOIN: u8 = word("join");
+pub(crate) const W_LOCK: u8 = word("lock");
+pub(crate) const W_WAIT: u8 = word("wait");
+pub(crate) const W_BLOCK_ON: u8 = word("block_on");
+pub(crate) const W_INSTANT: u8 = word("Instant");
+pub(crate) const W_SYSTEM_TIME: u8 = word("SystemTime");
+pub(crate) const W_LIBC: u8 = word("libc");
+pub(crate) const W_RUSTIX: u8 = word("rustix");
+
+const fn mark_all(table: &mut [u16; WORDS.len()], words: &[&str], bit: u16) {
+    let mut at = 0;
+    // Bounded: one turn per word given.
+    while at < words.len() {
+        table[word(words[at]) as usize] |= bit;
+        at += 1;
+    }
+}
+
+/// Compile-time class bitmask for every word in [`WORDS`]. Also verifies that every word in the
+/// engine's dispatch and rule tables is present in [`WORDS`].
+pub(crate) const WORD_CLASS: [u16; WORDS.len()] = {
+    let mut table = [0u16; WORDS.len()];
+    mark_all(&mut table, &crate::engine::DEFINING, WC_DEFINING);
+    mark_all(&mut table, &crate::engine::COLLECTIONS, WC_COLLECTION);
+    mark_all(&mut table, &crate::engine::STATIC_WORDS, WC_STATIC);
+    mark_all(&mut table, &crate::engine::SANS_IO_WORDS, WC_SANS_IO);
+    mark_all(&mut table, &crate::engine::LOCK_TYPES, WC_LOCK_TYPE);
+    mark_all(&mut table, &crate::engine::DISPATCHED, WC_DISPATCHED);
+    mark_all(&mut table, &crate::engine::IO_MODULES, WC_IO_MODULE);
+    mark_all(&mut table, &crate::engine::IO_TYPES, WC_IO_TYPE);
+    mark_all(&mut table, &crate::engine::PRINT_MACROS, WC_PRINT_MACRO);
+    let mut at = 0;
+    while at < RENAMES.len() {
+        table[word(RENAMES[at].old) as usize] |= WC_RENAME;
+        at += 1;
+    }
+    table
+};
+
 /// Every word of `words` is one of [`WORDS`] (a compile error otherwise).
 const fn all_in(words: &[&str]) -> bool {
     let mut at = 0;
@@ -72,20 +184,7 @@ const fn all_in(words: &[&str]) -> bool {
     true
 }
 
-const fn renames_in() -> bool {
-    let mut at = 0;
-    // Bounded: one turn per row of the rename table.
-    while at < RENAMES.len() {
-        word(RENAMES[at].old);
-        at += 1;
-    }
-    true
-}
-
-const _: () = assert!(all_in(&crate::engine::COLLECTIONS) && all_in(&crate::engine::FORMAT_MACROS));
-const _: () = assert!(all_in(&crate::engine::DEFINING) && all_in(&crate::engine::DISPATCHED) && renames_in());
-const _: () = assert!(all_in(&crate::engine::STATIC_WORDS) && all_in(&crate::engine::SANS_IO_WORDS));
-const _: () = assert!(all_in(&crate::engine::LOCK_TYPES));
+const _: () = assert!(all_in(&crate::engine::FORMAT_MACROS));
 
 const W: u8 = WORDS.len() as u8;
 /// `::`.
@@ -102,10 +201,14 @@ pub(crate) const BANG: u8 = W + 5;
 pub(crate) const NE: u8 = W + 6;
 pub(crate) const BRACE: u8 = W + 7;
 pub(crate) const BAR: u8 = W + 8;
+/// `<` (for turbofish `::<` sequences such as `mem::transmute::<`).
+pub(crate) const LT: u8 = W + 9;
 /// Any other token, a word no rule reads, and a hole: no sequence has it, so it ends every match.
-pub(crate) const OTHER: u8 = W + 9;
+pub(crate) const OTHER: u8 = W + 10;
 /// The size of the alphabet.
 pub(crate) const SYMS: usize = OTHER as usize + 1;
+
+const _: () = assert!(SYMS <= u8::MAX as usize, "symbols fit in a u8");
 
 /// One element of a sequence as it is written in the table.
 #[derive(Clone, Copy, Debug)]
@@ -138,6 +241,8 @@ pub(crate) enum Cut {
     DropFirst,
     /// Without the first and the last (a method's `.` and its call's `(`).
     Inner,
+    /// Without a trailing `::<` turbofish opener (three tokens: `:`, `:`, `<`).
+    DropTurbo,
 }
 
 /// The argument a finding of a sequence carries.
@@ -169,7 +274,7 @@ const fn s(elems: &'static [E], template: Template, guard: Guard, cut: Cut, arg:
 }
 
 use ArgOf::{FirstToken, Row};
-use Cut::{DropFirst, DropLast, Inner, Whole};
+use Cut::{DropFirst, DropLast, DropTurbo, Inner, Whole};
 use E::{P, W as Wd};
 use Guard::{NotMethod, Unbounded};
 
@@ -278,6 +383,49 @@ pub(crate) const SEQS: &[Seq] = &[
     s(&[Wd("ByHashSet"), P(SEP), Wd("new_in"), P(OPEN)], Template::HasherDefault, none(), DropLast, Row, "`Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None })`"),
     s(&[Wd("ByHashSet"), P(SEP), Wd("with_capacity_in"), P(OPEN)], Template::HasherDefault, none(), DropLast, Row, "`Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc, capacity: Some(n) })`"),
     s(&[Wd("ByHashSet"), P(SEP), Wd("from_iter_in"), P(OPEN)], Template::HasherDefault, none(), DropLast, Row, "`Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None })`, then `extend`"),
+    // ---- ambient-hasher (strengthened): third-party default-hasher maps/sets and bare constructors.
+    s(&[Wd("rustc_hash"), P(SEP), Wd("FxHashMap")], Template::HasherStd, none(), Whole, Row, "`blaze_hash::Map<K, V, FixedState, A>`, made by `Map::new(MapOpts { hasher: FixedState, alloc, capacity: None })`"),
+    s(&[Wd("rustc_hash"), P(SEP), Wd("FxHashSet")], Template::HasherStd, none(), Whole, Row, "`blaze_hash::Set<T, FixedState, A>`, made by `Set::new(SetOpts { hasher: FixedState, alloc, capacity: None })`"),
+    s(&[Wd("ahash"), P(SEP), Wd("AHashMap")], Template::HasherStd, none(), Whole, Row, "`blaze_hash::Map<K, V, FixedState, A>`, made by `Map::new(MapOpts { hasher: FixedState, alloc, capacity: None })`"),
+    s(&[Wd("ahash"), P(SEP), Wd("AHashSet")], Template::HasherStd, none(), Whole, Row, "`blaze_hash::Set<T, FixedState, A>`, made by `Set::new(SetOpts { hasher: FixedState, alloc, capacity: None })`"),
+    s(&[Wd("foldhash"), P(SEP), Wd("HashMap")], Template::HasherStd, none(), Whole, Row, "`blaze_hash::Map<K, V, FixedState, A>`, made by `Map::new(MapOpts { hasher: FixedState, alloc, capacity: None })`"),
+    s(&[Wd("HashMap"), P(SEP), Wd("new"), P(OPEN)], Template::HasherDefault, none(), DropLast, Row, "`Map::new(MapOpts { hasher: FixedState, alloc, capacity: None })`"),
+    s(&[Wd("HashSet"), P(SEP), Wd("new"), P(OPEN)], Template::HasherDefault, none(), DropLast, Row, "`Set::new(SetOpts { hasher: FixedState, alloc, capacity: None })`"),
+    s(&[Wd("HashMap"), P(SEP), Wd("with_capacity"), P(OPEN)], Template::HasherDefault, none(), DropLast, Row, "`Map::new(MapOpts { hasher: FixedState, alloc, capacity: Some(n) })`"),
+    // ---- ambient-heap (strengthened): additional std constructors and allocating methods.
+    s(&[Wd("BTreeMap"), P(SEP), Wd("new"), P(OPEN)], Template::HeapConstructor, none(), DropLast, Row, "`BTreeMap::new_in(alloc)`"),
+    s(&[Wd("BTreeSet"), P(SEP), Wd("new"), P(OPEN)], Template::HeapConstructor, none(), DropLast, Row, "`BTreeSet::new_in(alloc)`"),
+    s(&[Wd("VecDeque"), P(SEP), Wd("new"), P(OPEN)], Template::HeapConstructor, none(), DropLast, Row, "`VecDeque::new_in(alloc)`"),
+    s(&[Wd("VecDeque"), P(SEP), Wd("with_capacity"), P(OPEN)], Template::HeapConstructor, none(), DropLast, Row, "`VecDeque::with_capacity_in(n, alloc)`"),
+    s(&[Wd("BinaryHeap"), P(SEP), Wd("new"), P(OPEN)], Template::HeapConstructor, none(), DropLast, Row, "`BinaryHeap::new_in(alloc)`"),
+    s(&[Wd("String"), P(SEP), Wd("with_capacity"), P(OPEN)], Template::HeapConstructor, none(), DropLast, Row, "`String::with_capacity_in(n, alloc)`"),
+    s(&[Wd("Box"), P(SEP), Wd("pin"), P(OPEN)], Template::HeapConstructor, none(), DropLast, Row, "`Box::pin_in(value, alloc)`"),
+    s(&[P(DOT), Wd("into_boxed_slice"), P(OPEN)], Template::HeapMethod, none(), Inner, Row, "a slice owned in the caller's allocator"),
+    s(&[P(DOT), Wd("into_boxed_str"), P(OPEN)], Template::HeapMethod, none(), Inner, Row, "a string owned in the caller's allocator"),
+    // ---- raw-sync: std / parking_lot / dashmap / mpsc primitives.
+    s(&[Wd("sync"), P(SEP), Wd("Mutex")], Template::RawSync, none(), Whole, Row, "a named `blaze_core::lock::Lock` (or a lock-free D179 shape)"),
+    s(&[Wd("sync"), P(SEP), Wd("RwLock")], Template::RawSync, none(), Whole, Row, "a named `blaze_core::lock::ReadLock` (or a lock-free D179 shape)"),
+    s(&[Wd("sync"), P(SEP), Wd("Condvar")], Template::RawSync, none(), Whole, Row, "a deadline-bounded wait (`blaze_core::wait`)"),
+    s(&[Wd("sync"), P(SEP), Wd("Barrier")], Template::RawSync, none(), Whole, Row, "structured worker coordination through the scheduler"),
+    s(&[Wd("parking_lot"), P(SEP), Wd("Mutex")], Template::RawSync, none(), Whole, Row, "a named `blaze_core::lock::Lock` (or a lock-free D179 shape)"),
+    s(&[Wd("parking_lot"), P(SEP), Wd("RwLock")], Template::RawSync, none(), Whole, Row, "a named `blaze_core::lock::ReadLock` (or a lock-free D179 shape)"),
+    s(&[Wd("parking_lot"), P(SEP), Wd("Condvar")], Template::RawSync, none(), Whole, Row, "a deadline-bounded wait (`blaze_core::wait`)"),
+    s(&[Wd("dashmap"), P(SEP), Wd("DashMap")], Template::RawSync, none(), Whole, Row, "partitioned ownership or a named `SharedMap` with a D179 reason"),
+    s(&[Wd("mpsc"), P(SEP), Wd("channel"), P(OPEN)], Template::RawSync, none(), DropLast, Row, "a bounded channel (`blaze_core::chan::bounded`)"),
+    s(&[Wd("mpsc"), P(SEP), Wd("sync_channel"), P(OPEN)], Template::RawSync, none(), DropLast, Row, "a bounded channel (`blaze_core::chan::bounded`)"),
+    // ---- blocking-on-pool: OS thread blocking / spawning / spinning on a pool.
+    s(&[Wd("thread"), P(SEP), Wd("sleep"), P(OPEN)], Template::BlockingOnPool, none(), DropLast, Row, "a deadline or timer on the driver rather than blocking a pool thread"),
+    s(&[Wd("thread"), P(SEP), Wd("spawn"), P(OPEN)], Template::BlockingOnPool, none(), DropLast, Row, "work submitted to the scheduler pool rather than spawning an OS thread"),
+    s(&[Wd("thread"), P(SEP), Wd("scope"), P(OPEN)], Template::BlockingOnPool, none(), DropLast, Row, "structured work on the scheduler pool rather than OS-thread scoping"),
+    s(&[Wd("thread"), P(SEP), Wd("yield_now"), P(OPEN)], Template::BlockingOnPool, none(), DropLast, Row, "returning to the scheduler rather than yielding the OS thread"),
+    s(&[Wd("thread"), P(SEP), Wd("park"), P(OPEN)], Template::BlockingOnPool, none(), DropLast, Row, "a bounded wait through the scheduler rather than parking the OS thread"),
+    s(&[Wd("thread"), P(SEP), Wd("available_parallelism"), P(OPEN)], Template::BlockingOnPool, none(), DropLast, Row, "the pool's configured worker count passed in"),
+    s(&[Wd("hint"), P(SEP), Wd("spin_loop"), P(OPEN)], Template::BlockingOnPool, none(), DropLast, Row, "a bounded wait rather than busy-spinning on a pool thread"),
+    // ---- transmute: raw bit reinterpretation.
+    s(&[Wd("mem"), P(SEP), Wd("transmute"), P(OPEN)], Template::Transmute, none(), DropLast, Row, "a safe conversion (`from_ne_bytes`, `to_bits`, or a typed helper)"),
+    s(&[Wd("mem"), P(SEP), Wd("transmute"), P(SEP), P(LT)], Template::Transmute, none(), DropTurbo, Row, "a safe conversion (`from_ne_bytes`, `to_bits`, or a typed helper)"),
+    s(&[Wd("mem"), P(SEP), Wd("transmute_copy"), P(OPEN)], Template::Transmute, none(), DropLast, Row, "a safe conversion (`from_ne_bytes`, `ptr::read_unaligned` with a safety proof, or a typed helper)"),
+    s(&[Wd("mem"), P(SEP), Wd("transmute_copy"), P(SEP), P(LT)], Template::Transmute, none(), DropTurbo, Row, "a safe conversion (`from_ne_bytes`, `ptr::read_unaligned` with a safety proof, or a typed helper)"),
 ];
 
 /// The symbols of `seq`.

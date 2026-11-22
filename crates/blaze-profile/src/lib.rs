@@ -48,6 +48,7 @@ pub mod logs;
 pub mod memory;
 pub mod panics;
 pub mod perf;
+pub mod pgo;
 pub mod reading;
 pub mod sampler;
 pub mod schema;
@@ -67,6 +68,7 @@ pub mod views;
 pub mod watchdog;
 
 pub use flight::{FiberStack, Plot, fiber_stack, moved, plot};
+pub use pgo::{PgoError, PgoProfile, SiteWeight};
 pub use watchdog::{Stall, Watchdog};
 
 /// When this process began, as near as it can tell: the first call, which `main` makes.

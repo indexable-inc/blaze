@@ -339,3 +339,291 @@ fn only_anonymous_private_memory_without_execution_is_mapped() {
     assert_eq!(crate::mmap_allowed(Os::Linux, 3, linux.map_shared | linux.map_anon, -1), Err(Errno::Perm));
     assert_eq!(crate::mprotect_allowed(4), Err(Errno::Perm));
 }
+
+#[test]
+fn emfile_does_not_leak_held_bytes() {
+    let mut host = Host::default();
+    // `most_held = 22` allows the cap check (`11 + 11 <= 22`) to pass so `install` hits EMFILE.
+    let limits = Limits { most_fds: 4, most_file: 64, most_held: 22, page: 16384, .. };
+    let mut sys = Sys::new(SysOpts { os: Os::Mac, limits, alloc: heap(), .. });
+    drive(&mut sys, &mut host).unwrap();
+
+    // fd 3 takes 11 bytes (`/pkg/a.txt`).
+    sys.open(-2, b"a.txt", 0).unwrap();
+    let fd3 = int(drive(&mut sys, &mut host).unwrap()).unwrap();
+    assert_eq!(fd3, 3);
+
+    // Repeated opens hit EMFILE (fds 0..4 are full); if `held` leaked on the first EMFILE,
+    // the second open would fail with EFBIG instead of EMFILE.
+    for _ in 0..3 {
+        sys.open(-2, b"a.txt", 0).unwrap();
+        assert_eq!(int(drive(&mut sys, &mut host).unwrap()), Err(Errno::MFile));
+    }
+
+    // Close fd 3: held bytes must be 0, so reopening fits cleanly.
+    sys.close(Fd(fd3 as i32)).unwrap();
+    sys.open(-2, b"a.txt", 0).unwrap();
+    let reopened = int(drive(&mut sys, &mut host).unwrap()).unwrap();
+    assert_eq!(reopened, 3);
+}
+
+#[test]
+fn out_write_ftruncate_and_pipe_enforce_caps_and_compact() {
+    let mut host = Host::default();
+    let limits = Limits { most_file: 16, most_held: 20, page: 16384, .. };
+    let mut sys = Sys::new(SysOpts { os: Os::Mac, limits, alloc: heap(), .. });
+    drive(&mut sys, &mut host).unwrap();
+
+    // Open an output file via O_CREAT | O_TRUNC | O_RDWR.
+    let c = crate::MAC;
+    sys.open(c.at_fdcwd, b"/out/f", c.o_rdwr | c.o_creat | c.o_trunc).unwrap();
+    let fd = Fd(int(drive(&mut sys, &mut host).unwrap()).unwrap() as i32);
+
+    // Checked overflow on write offset returns EFBIG.
+    sys.write(fd, b"abc", Some(u64::MAX - 1)).unwrap();
+    assert_eq!(int(drive(&mut sys, &mut host).unwrap()), Err(Errno::FBig));
+
+    // Exceeding `most_file` on write and ftruncate returns EFBIG.
+    sys.write(fd, &[1u8; 17], None).unwrap();
+    assert_eq!(int(drive(&mut sys, &mut host).unwrap()), Err(Errno::FBig));
+    sys.ftruncate(fd, 17).unwrap();
+    assert_eq!(int(drive(&mut sys, &mut host).unwrap()), Err(Errno::FBig));
+
+    // Write 12 bytes to file (held = 12).
+    sys.write(fd, &[7u8; 12], None).unwrap();
+    assert_eq!(int(drive(&mut sys, &mut host).unwrap()), Ok(12));
+
+    // Pipe write respects `most_held` (12 + 9 > 20 -> EFBIG; 12 + 8 <= 20 -> Ok).
+    let (pr, pw) = sys.pipe().unwrap();
+    sys.write(pw, &[2u8; 9], None).unwrap();
+    assert_eq!(int(drive(&mut sys, &mut host).unwrap()), Err(Errno::FBig));
+
+    // Repeated write + read of 8 bytes compacts consumed prefix and releases `held` back to 12.
+    let mut buf = [0u8; 8];
+    for i in 0u8..10 {
+        sys.write(pw, &[i; 8], None).unwrap();
+        assert_eq!(int(drive(&mut sys, &mut host).unwrap()), Ok(8));
+        assert_eq!(sys.read(pr, &mut buf, None), Ok(8));
+        assert_eq!(buf, [i; 8]);
+    }
+
+    // Buffer 8 bytes in pipe (held = 20), then close read end -> releases pipe buffer (held = 12).
+    sys.write(pw, &[9u8; 8], None).unwrap();
+    assert_eq!(int(drive(&mut sys, &mut host).unwrap()), Ok(8));
+    sys.close(pr).unwrap();
+    // Now ftruncate(fd, 16) fits within most_held (16 <= 20)!
+    sys.ftruncate(fd, 16).unwrap();
+    assert_eq!(int(drive(&mut sys, &mut host).unwrap()), Ok(0));
+    sys.close(pw).unwrap();
+    sys.close(fd).unwrap();
+}
+
+#[test]
+fn setenv_updates_in_place_respects_overwrite_false_and_invalidates_environ() {
+    struct EnvHost {
+        env_all_calls: usize,
+    }
+    impl EnvHost {
+        fn run(&mut self, sys: &mut Sys<'_>) -> Option<Result<Ret, Errno>> {
+            loop {
+                match sys.state() {
+                    SysState::Done => return Some(sys.result().unwrap()),
+                    SysState::Ready => return None,
+                    SysState::Starting | SysState::Asking => {
+                        let frame = match sys.next_effect().unwrap() {
+                            GuestEffect::Send { frame } => frame.to_vec(),
+                        };
+                        let (body, _) = split_frame(&frame, WireLimits::SHIPPED).unwrap().unwrap();
+                        let call = read_call(body, WireLimits::SHIPPED).unwrap();
+                        let answer = match call {
+                            Call::Hello { protocol } => Answer::Hello { protocol },
+                            Call::Cwd => Answer::Value { value: Some(b"/pkg") },
+                            Call::EnvAll => {
+                                self.env_all_calls += 1;
+                                Answer::Words { words: Words::new(b"HOME=/home\0KEEP=1\0").unwrap() }
+                            }
+                            _ => Answer::Done,
+                        };
+                        let mut out = blaze_own::Vec::new_in(heap());
+                        write_answer(&answer, &mut out, WireLimits::SHIPPED).unwrap();
+                        let (reply, _) = split_frame(&out, WireLimits::SHIPPED).unwrap().unwrap();
+                        sys.step(Nanos(0), GuestEvent::Frame(reply)).unwrap();
+                    }
+                    state => panic!("unexpected state {state:?}"),
+                }
+            }
+        }
+    }
+
+    let mut host = EnvHost { env_all_calls: 0 };
+    let limits = Limits { most_env: 2, page: 16384, .. };
+    let mut sys = Sys::new(SysOpts { os: Os::Mac, limits, alloc: heap(), .. });
+    host.run(&mut sys);
+
+    // Fetch environ first so `env_all` is populated.
+    sys.environ().unwrap();
+    host.run(&mut sys).unwrap().unwrap();
+    assert_eq!(host.env_all_calls, 1);
+    assert!(sys.environ_words().is_some());
+
+    // `overwrite = false` respects a variable already present in `env_all`.
+    sys.setenv(b"HOME", Some(b"/other"), false).unwrap();
+    assert!(sys.environ_words().is_some(), "no-op setenv must not invalidate env_all");
+
+    // Repeated `setenv` on the same key updates in place and never exhausts `most_env = 2`.
+    for i in 0..20 {
+        let val = format!("v{i}");
+        sys.setenv(b"K", Some(val.as_bytes()), true).unwrap();
+    }
+    assert!(sys.environ_words().is_none(), "mutating setenv must invalidate env_all");
+
+    // `overwrite = false` does not overwrite an existing overlay variable.
+    sys.setenv(b"K", Some(b"ignored"), false).unwrap();
+    sys.getenv(b"K").unwrap();
+    let Ret::Env(Some(at)) = host.run(&mut sys).unwrap().unwrap() else { panic!() };
+    assert_eq!(sys.env_value(at), Some(&b"v19\0"[..]));
+
+    // Unset `HOME`, re-fetch `environ()`, and verify merged words contain `KEEP=1`, `K=v19`, not `HOME`.
+    sys.setenv(b"HOME", None, true).unwrap();
+    sys.environ().unwrap();
+    host.run(&mut sys).unwrap().unwrap();
+    assert_eq!(host.env_all_calls, 2);
+    let words: StdVec<&[u8]> = sys.environ_words().unwrap().split_inclusive(|b| *b == 0).collect();
+    assert!(words.contains(&&b"KEEP=1\0"[..]));
+    assert!(words.contains(&&b"K=v19\0"[..]));
+    assert!(!words.iter().any(|w| w.starts_with(b"HOME=")));
+}
+
+#[test]
+fn readdir_is_o1_and_rewinddir_resets_cursor() {
+    let mut listing = StdVec::new();
+    for i in 0..500u32 {
+        listing.extend_from_slice(format!("entry_{i:04}").as_bytes());
+        listing.push(0);
+    }
+
+    let mut sys = Sys::new(SysOpts { os: Os::Mac, limits: Limits { page: 16384, .. }, alloc: heap(), .. });
+    let drive_list = |sys: &mut Sys<'_>| -> Option<Result<Ret, Errno>> {
+        loop {
+            match sys.state() {
+                SysState::Done => return Some(sys.result().unwrap()),
+                SysState::Ready => return None,
+                SysState::Starting | SysState::Asking => {
+                    let frame = match sys.next_effect().unwrap() {
+                        GuestEffect::Send { frame } => frame.to_vec(),
+                    };
+                    let (body, _) = split_frame(&frame, WireLimits::SHIPPED).unwrap().unwrap();
+                    let call = read_call(body, WireLimits::SHIPPED).unwrap();
+                    let answer = match call {
+                        Call::Hello { protocol } => Answer::Hello { protocol },
+                        Call::Cwd => Answer::Value { value: Some(b"/pkg") },
+                        Call::Look { want: Want::List, .. } => Answer::Listing { names: Words::new(&listing).unwrap() },
+                        _ => Answer::Done,
+                    };
+                    let mut out = blaze_own::Vec::new_in(heap());
+                    write_answer(&answer, &mut out, WireLimits::SHIPPED).unwrap();
+                    let (reply, _) = split_frame(&out, WireLimits::SHIPPED).unwrap().unwrap();
+                    sys.step(Nanos(0), GuestEvent::Frame(reply)).unwrap();
+                }
+                state => panic!("unexpected {state:?}"),
+            }
+        }
+    };
+    drive_list(&mut sys);
+
+    sys.opendir(b"/pkg").unwrap();
+    let fd = Fd(int(drive_list(&mut sys)).unwrap() as i32);
+
+    let read_all = |sys: &mut Sys<'_>| -> StdVec<(StdVec<u8>, u64, u64)> {
+        let mut out = StdVec::new();
+        while let Some(ent) = sys.readdir(fd).unwrap() {
+            assert_ne!(ent.ino, 0);
+            out.push((ent.name.to_vec(), ent.ino, ent.at));
+        }
+        out
+    };
+    let first = read_all(&mut sys);
+    assert_eq!(first.len(), 502);
+    assert_eq!(first[0].0, b".\0");
+    assert_eq!(first[1].0, b"..\0");
+    assert_eq!(first[2].0, b"entry_0000\0");
+    assert_eq!(first[501].0, b"entry_0499\0");
+    assert_eq!(first[501].2, 501);
+
+    sys.rewinddir(fd).unwrap();
+    let second = read_all(&mut sys);
+    assert_eq!(first, second);
+    sys.close(fd).unwrap();
+}
+
+#[test]
+fn open_trunc_uses_stat_and_single_rtt_setlen() {
+    let mut seen_calls: StdVec<String> = StdVec::new();
+    let mut sys = Sys::new(SysOpts { os: Os::Mac, limits: Limits { page: 16384, .. }, alloc: heap(), .. });
+    let pump = |sys: &mut Sys<'_>, seen_calls: &mut StdVec<String>| -> Option<Result<Ret, Errno>> {
+        loop {
+            match sys.state() {
+                SysState::Done => return Some(sys.result().unwrap()),
+                SysState::Ready => return None,
+                SysState::Starting | SysState::Asking => {
+                    let frame = match sys.next_effect().unwrap() {
+                        GuestEffect::Send { frame } => frame.to_vec(),
+                    };
+                    let (body, _) = split_frame(&frame, WireLimits::SHIPPED).unwrap().unwrap();
+                    let call = read_call(body, WireLimits::SHIPPED).unwrap();
+                    let answer = match call {
+                        Call::Hello { protocol } => Answer::Hello { protocol },
+                        Call::Cwd => Answer::Value { value: Some(b"/pkg") },
+                        Call::Look { path, want } => {
+                            seen_calls.push(format!("Look({:?}, {want:?})", core::str::from_utf8(path).unwrap()));
+                            Answer::Stat { kind: FileKind::File, len: 1024 }
+                        }
+                        Call::SetLen { path, len } => {
+                            seen_calls.push(format!("SetLen({:?}, {len})", core::str::from_utf8(path).unwrap()));
+                            Answer::Done
+                        }
+                        Call::WriteFile { path, .. } => {
+                            seen_calls.push(format!("WriteFile({:?})", core::str::from_utf8(path).unwrap()));
+                            Answer::Done
+                        }
+                        _ => Answer::Done,
+                    };
+                    let mut out = blaze_own::Vec::new_in(heap());
+                    write_answer(&answer, &mut out, WireLimits::SHIPPED).unwrap();
+                    let (reply, _) = split_frame(&out, WireLimits::SHIPPED).unwrap().unwrap();
+                    sys.step(Nanos(0), GuestEvent::Frame(reply)).unwrap();
+                }
+                state => panic!("unexpected {state:?}"),
+            }
+        }
+    };
+    pump(&mut sys, &mut seen_calls);
+
+    let c = crate::MAC;
+    // O_WRONLY | O_CREAT | O_TRUNC collapses to a single SetLen(0) round trip.
+    seen_calls.clear();
+    sys.open(c.at_fdcwd, b"/out/a", c.o_wronly | c.o_creat | c.o_trunc).unwrap();
+    let fd1 = Fd(int(pump(&mut sys, &mut seen_calls)).unwrap() as i32);
+    assert_eq!(seen_calls, vec!["SetLen(\"/out/a\", 0)"]);
+
+    // O_WRONLY | O_TRUNC (without O_CREAT) uses Want::Stat, never Want::Read, then SetLen(0).
+    seen_calls.clear();
+    sys.open(c.at_fdcwd, b"/out/b", c.o_wronly | c.o_trunc).unwrap();
+    let fd2 = Fd(int(pump(&mut sys, &mut seen_calls)).unwrap() as i32);
+    assert_eq!(seen_calls, vec!["Look(\"/out/b\", Stat)", "SetLen(\"/out/b\", 0)"]);
+
+    sys.close(fd1).unwrap();
+    sys.close(fd2).unwrap();
+}
+
+#[test]
+fn actions_destroy_reclaims_slot() {
+    let mut sys = Sys::new(SysOpts { os: Os::Mac, limits: Limits { page: 16384, .. }, alloc: heap(), .. });
+    let a = sys.actions_new();
+    sys.actions_dup2(a, 1, 2).unwrap();
+    sys.actions_chdir(a, b"/pkg").unwrap();
+    sys.actions_destroy(a).unwrap();
+    assert_eq!(sys.actions_destroy(a), Err(Errno::Inval));
+    assert_eq!(sys.actions_dup2(a, 1, 2), Err(Errno::Inval));
+    assert_eq!(sys.actions_new(), a, "freed actions slot must be reused");
+}

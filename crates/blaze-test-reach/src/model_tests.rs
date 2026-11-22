@@ -33,7 +33,7 @@ use std::vec::Vec as StdVec;
 use blaze_own::Alloc;
 use blaze_sim::{Broke, Config as SimConfig, Tape, check, control};
 
-use crate::{Because, CellKind, Digest, Enter, MAX_READS, Out, Reach, ReachOpts, Read, Reusable, TestRecord, enter_stored};
+use crate::{Because, CellKind, Digest, Enter, ImpactIndex, MAX_READS, Out, Reach, ReachOpts, Read, Reusable, TestRecord, enter_stored};
 
 fn alloc() -> Alloc<'static> {
     blaze_own::testing::heap().alloc()
@@ -283,4 +283,72 @@ fn control_reach_without_statics_is_a_stale_pass() {
 #[test]
 fn control_decision_on_own_body_is_a_stale_pass() {
     control(SimConfig::cases(400), Plant::None, Plant::DecisionOwnBodyOnly, "stale pass", histories);
+}
+
+fn impact_histories(tape: &Tape) -> Result<(), Broke> {
+    let mut p = draw(tape);
+    let tests = p.tests.len();
+    let mut stored = StdVec::new();
+    for t in 0..tests {
+        let ran = run(&p, t);
+        stored.push(record_of(tape, t, &ran, Plant::None)?);
+    }
+    for step in 0..1 + tape.below(3, "edits") {
+        let before = p.clone();
+        match tape.below(3, "edit") {
+            0 => {
+                let f = tape.index(p.funcs.len(), "edited fn");
+                p.funcs[f].version += 1 + tape.below(2, "by");
+            }
+            1 if !p.statics.is_empty() => {
+                let s = tape.index(p.statics.len(), "edited static");
+                p.statics[s] += 1 + tape.below(3, "by");
+            }
+            _ => {}
+        }
+
+        // Build `ImpactIndex` over current stored records and pass ONLY changed cells (plus
+        // occasional false-positive unchanged cells with their current values to exercise early cutoff).
+        let records: StdVec<(Digest, Option<&[u8]>)> = (0..tests)
+            .map(|t| (test_key(t), Some(stored[t].as_slice())))
+            .collect();
+        let index = ImpactIndex::build(&records, alloc());
+
+        let mut changed_cells: StdVec<(CellKind, Digest, Digest)> = StdVec::new();
+        for f in 0..p.funcs.len() {
+            let now_k = code_key(&p, f);
+            if code_key(&before, f) != now_k || tape.one_in(4, "fp_code") {
+                changed_cells.push((CellKind::Code, Digest(fn_symbol(f)), now_k));
+            }
+        }
+        for s in 0..p.statics.len() {
+            let now_k = datum_key(&p, s);
+            if datum_key(&before, s) != now_k || tape.one_in(4, "fp_datum") {
+                changed_cells.push((CellKind::Datum, Digest(static_symbol(s)), now_k));
+            }
+        }
+        tape.shuffle(&mut changed_cells, "changed_order");
+
+        let selection = index.select(&changed_cells, alloc());
+
+        for t in 0..tests {
+            let expected = enter_stored(test_key(t), Some(stored[t].as_slice()), |read| moved_now(&p, read));
+            let got = selection.decision_for(t as u32);
+            if got != expected {
+                return Err(Broke::Oracle(format!(
+                    "step {step} test {t}: ImpactIndex::select gave {got:?}, enter_stored gave {expected:?}"
+                )));
+            }
+            if matches!(got, Enter::Rerun { .. }) {
+                let now = run(&p, t);
+                stored[t] = record_of(tape, t, &now, Plant::None)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn impact_index_matches_model_histories() {
+    check(SimConfig::cases(400), impact_histories);
 }

@@ -197,3 +197,408 @@ fn render_is_deterministic() {
         Ok(())
     });
 }
+
+fn luma(px: &[u8]) -> f64 {
+    0.2126 * f64::from(px[0]) + 0.7152 * f64::from(px[1]) + 0.0722 * f64::from(px[2])
+}
+
+/// Tiled frustum culling and per-tile tape simplification agree with the untiled reference across
+/// random models and perspective/orthographic views, and actively cull & simplify multi-part models.
+#[test]
+fn tiled_matches_untiled_parity() {
+    check(Config::cases(40), |tape| {
+        let (t, _) = model(tape)?;
+        let mut v = view(tape);
+        v.width = 48;
+        v.height = 48;
+        let o = PictureOpts { alloc: heap(), scratch: heap(), .. };
+        let tiled = render(&t, v, o).map_err(harness)?;
+        let untiled = render_untiled(&t, v, o).map_err(harness)?;
+        let cam = Camera::new(&v).map_err(harness)?;
+        if tiled.stats.rays != untiled.stats.rays {
+            return Err(Broken::Oracle(PictureBroken::Wrong {
+                why: format!("ray count mismatch: tiled={} untiled={}", tiled.stats.rays, untiled.stats.rays),
+            }));
+        }
+        let mut sc = Scratch::new(heap());
+        for y in 0..v.height {
+            for x in 0..v.width {
+                let idx = (y * v.width + x) as usize;
+                let (dt, du) = (tiled.depth[idx], untiled.depth[idx]);
+                match (dt.is_finite(), du.is_finite()) {
+                    (true, true) => {
+                        let tol = 2.0 * cam.tolerance_at(dt.max(du), o.pixel_fraction);
+                        if (dt - du).abs() > tol {
+                            return Err(Broken::Oracle(PictureBroken::Wrong {
+                                why: format!("pixel ({x},{y}) depth diff: tiled={dt} untiled={du} tol={tol}"),
+                            }));
+                        }
+                    }
+                    (false, false) => {}
+                    (true, false) | (false, true) => {
+                        // Only possible at a grazing edge within step tolerance; verify the hit
+                        // point is genuinely near zero and never falsely culled inside.
+                        let d = if dt.is_finite() { dt } else { du };
+                        let (origin, dir) = cam.ray(x, y);
+                        let val = eval_point(&t, origin + dir * d, &mut sc);
+                        let tol = 4.0 * cam.tolerance_at(d, o.pixel_fraction);
+                        if !(val.abs() <= tol) {
+                            return Err(Broken::Oracle(PictureBroken::Wrong {
+                                why: format!("pixel ({x},{y}) hit/miss mismatch: tiled={dt} untiled={du} f={val} tol={tol}"),
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    });
+
+    // Multi-part model exercises both tile culling and per-tile tape simplification.
+    let mut g = Graph::new(GraphOpts { alloc: heap(), .. });
+    let mut acc: Option<Solid<Outside>> = None;
+    for i in 0..8 {
+        let s = g.sphere(SphereOpts { radius: Length::mm(14.0), .. }).expect("sphere");
+        let s = g.place(s, Placement::shift(Length::mm(45.0 * i as f64 - 157.5), Length::ZERO, Length::ZERO)).expect("place");
+        acc = Some(match acc {
+            None => s.weaken::<Outside>(),
+            Some(a) => g.union(a, s).expect("union"),
+        });
+    }
+    let tape = compile(&g, acc.expect("solid").id(), CompileOpts { alloc: heap(), .. }).expect("tape");
+    let v = View {
+        eye: [Length::mm(0.0), Length::mm(-500.0), Length::mm(120.0)],
+        target: [Length::ZERO; 3],
+        projection: Projection::Perspective { fov: Angle::degrees(40.0) },
+        width: 96,
+        height: 96,
+        ..
+    };
+    let pic = render(&tape, v, PictureOpts { alloc: heap(), scratch: heap(), .. }).expect("render");
+    assert!(pic.stats.tiles_culled > 0, "expected empty tiles to be culled");
+    assert!(pic.stats.tiles_simplified > 0, "expected non-empty tiles to simplify the tape");
+    assert!(pic.stats.hits > 0);
+}
+
+/// Distance-bound stride acceleration never skips past an ultra-thin (50 µm) wall in front of a
+/// larger solid, from both head-on and oblique perspective/orthographic views.
+#[test]
+fn thin_wall_never_skipped_by_stride_acceleration() {
+    let mut g = Graph::new(GraphOpts { alloc: heap(), .. });
+    let wall = g
+        .cuboid(BoxOpts { size: [Length::mm(0.05), Length::mm(120.0), Length::mm(120.0)], .. })
+        .expect("thin wall");
+    let back = g.cuboid(BoxOpts { size: [Length::mm(40.0), Length::mm(120.0), Length::mm(120.0)], .. }).expect("back");
+    let back = g.place(back, Placement::shift(Length::mm(-40.0), Length::ZERO, Length::ZERO)).expect("place back");
+    let solid = g.union(wall, back).expect("union");
+    let tape = compile(&g, solid.id(), CompileOpts { alloc: heap(), .. }).expect("tape");
+
+    let views = [
+        View {
+            eye: [Length::mm(300.0), Length::ZERO, Length::ZERO],
+            target: [Length::ZERO; 3],
+            projection: Projection::Perspective { fov: Angle::degrees(35.0) },
+            width: 32,
+            height: 32,
+            ..
+        },
+        View {
+            eye: [Length::mm(240.0), Length::mm(180.0), Length::mm(40.0)],
+            target: [Length::ZERO; 3],
+            projection: Projection::Orthographic { height: Length::mm(100.0) },
+            width: 32,
+            height: 32,
+            ..
+        },
+    ];
+
+    for v in views {
+        let pic = render(&tape, v, PictureOpts { alloc: heap(), scratch: heap(), .. }).expect("render");
+        let cam = Camera::new(&v).expect("cam");
+        // Centre pixel must hit the front face of the thin wall at x = +0.025 mm, never the box at x = -20 mm.
+        let (cx, cy) = (v.width / 2, v.height / 2);
+        let d = pic.depth[(cy * v.width + cx) as usize];
+        assert!(d.is_finite(), "centre ray must hit the thin wall");
+        let (o, dir) = cam.ray(cx, cy);
+        let p = o + dir * d;
+        assert!(
+            p.x > -0.0005 && p.x < 0.002,
+            "ray skipped the 50 µm wall at x=0: hit at x={} m (back box is at x=-0.02 m)",
+            p.x
+        );
+    }
+}
+
+/// Studio SDF ambient occlusion darkens concave 90° corners relative to AO-off while leaving
+/// exposed exterior faces unaffected.
+#[test]
+fn studio_ao_darkens_concave_corner() {
+    let mut g = Graph::new(GraphOpts { alloc: heap(), .. });
+    let floor = g.cuboid(BoxOpts { size: [Length::mm(120.0), Length::mm(120.0), Length::mm(10.0)], .. }).expect("floor");
+    let floor = g.place(floor, Placement::shift(Length::mm(50.0), Length::ZERO, Length::mm(-5.0))).expect("place floor");
+    let wall = g.cuboid(BoxOpts { size: [Length::mm(10.0), Length::mm(120.0), Length::mm(120.0)], .. }).expect("wall");
+    let wall = g.place(wall, Placement::shift(Length::mm(-5.0), Length::ZERO, Length::mm(55.0))).expect("place wall");
+    let bracket = g.union(floor, wall).expect("bracket");
+    let tape = compile(&g, bracket.id(), CompileOpts { alloc: heap(), .. }).expect("tape");
+
+    let v = View {
+        eye: [Length::mm(140.0), Length::ZERO, Length::mm(140.0)],
+        target: [Length::mm(35.0), Length::ZERO, Length::ZERO],
+        projection: Projection::Orthographic { height: Length::mm(110.0) },
+        width: 64,
+        height: 64,
+        ..
+    };
+    let no_ao = render(
+        &tape,
+        v,
+        PictureOpts {
+            alloc: heap(),
+            scratch: heap(),
+            shading: Shading::Studio(StudioOpts { ao_strength: 0.0, shadow_strength: 0.0, .. }),
+            ..
+        },
+    )
+    .expect("no_ao");
+    let with_ao = render(
+        &tape,
+        v,
+        PictureOpts {
+            alloc: heap(),
+            scratch: heap(),
+            shading: Shading::Studio(StudioOpts { ao_strength: 0.85, ao_steps: 5, shadow_strength: 0.0, .. }),
+            ..
+        },
+    )
+    .expect("with_ao");
+
+    let cam = Camera::new(&v).expect("cam");
+    let mut corner_delta = 0.0f64;
+    let mut exposed_delta = f64::INFINITY;
+    let mut corner_hits = 0u32;
+    let mut exposed_hits = 0u32;
+    for y in 0..v.height {
+        for x in 0..v.width {
+            let idx = (y * v.width + x) as usize;
+            let d = with_ao.depth[idx];
+            if !d.is_finite() {
+                continue;
+            }
+            let (o, dir) = cam.ray(x, y);
+            let p = o + dir * d;
+            // Floor pixels (`z ≈ 0`): compare near the vertical wall (`x ∈ 1..8 mm`) vs exposed (`x > 55 mm`).
+            if p.z.abs() < 0.001 && p.y.abs() < 0.02 {
+                let l_off = luma(&no_ao.pixels[idx * 4..idx * 4 + 4]);
+                let l_on = luma(&with_ao.pixels[idx * 4..idx * 4 + 4]);
+                let delta = l_off - l_on;
+                if p.x > 0.001 && p.x < 0.008 {
+                    corner_hits += 1;
+                    corner_delta = corner_delta.max(delta);
+                } else if p.x > 0.055 && p.x < 0.095 {
+                    exposed_hits += 1;
+                    exposed_delta = exposed_delta.min(delta.abs());
+                }
+            }
+        }
+    }
+    assert!(corner_hits > 0 && exposed_hits > 0, "expected both corner ({corner_hits}) and exposed ({exposed_hits}) floor hits");
+    assert!(corner_delta > 12.0, "AO should darken concave corner noticeably, got delta={corner_delta}");
+    assert!(exposed_delta < 2.0, "AO should not darken exposed open floor, got delta={exposed_delta}");
+}
+
+/// Studio soft SDF shadows darken the floor region occluded from the key light while leaving
+/// unoccluded floor pixels bright.
+#[test]
+fn studio_soft_shadows_darken_occluded_floor() {
+    let v = View {
+        eye: [Length::mm(0.0), Length::mm(-220.0), Length::mm(180.0)],
+        target: [Length::ZERO; 3],
+        projection: Projection::Perspective { fov: Angle::degrees(40.0) },
+        width: 64,
+        height: 64,
+        ..
+    };
+    let cam = Camera::new(&v).expect("cam");
+    let key_dir = (cam.up * 0.72 - cam.right * 0.45 - cam.forward * 0.52).normalized().expect("key_dir");
+
+    let mut g = Graph::new(GraphOpts { alloc: heap(), .. });
+    let floor = g.cuboid(BoxOpts { size: [Length::mm(240.0), Length::mm(240.0), Length::mm(10.0)], .. }).expect("floor");
+    let floor = g.place(floor, Placement::shift(Length::ZERO, Length::ZERO, Length::mm(-5.0))).expect("place floor");
+    // Place an occluder sphere directly along `key_dir` from the floor centre `(0, 0, 0)`.
+    let occluder = g.sphere(SphereOpts { radius: Length::mm(20.0), .. }).expect("occluder");
+    let occluder = g
+        .place(
+            occluder,
+            Placement::shift(Length::m(key_dir.x * 0.07), Length::m(key_dir.y * 0.07), Length::m(key_dir.z * 0.07)),
+        )
+        .expect("place occluder");
+    let scene = g.union(floor, occluder).expect("scene");
+    let tape = compile(&g, scene.id(), CompileOpts { alloc: heap(), .. }).expect("tape");
+
+    let unshadowed = render(
+        &tape,
+        v,
+        PictureOpts {
+            alloc: heap(),
+            scratch: heap(),
+            shading: Shading::Studio(StudioOpts { ao_strength: 0.0, shadow_strength: 0.0, .. }),
+            ..
+        },
+    )
+    .expect("unshadowed");
+    let shadowed = render(
+        &tape,
+        v,
+        PictureOpts {
+            alloc: heap(),
+            scratch: heap(),
+            shading: Shading::Studio(StudioOpts { ao_strength: 0.0, shadow_strength: 0.80, shadow_softness: 12.0, shadow_steps: 48, .. }),
+            ..
+        },
+    )
+    .expect("shadowed");
+
+    // Centre pixel hits `(0, 0, 0)` on the floor directly beneath the key-light occluder.
+    let centre_idx = ((v.height / 2) * v.width + (v.width / 2)) as usize;
+    let l_unshadowed = luma(&unshadowed.pixels[centre_idx * 4..centre_idx * 4 + 4]);
+    let l_shadowed = luma(&shadowed.pixels[centre_idx * 4..centre_idx * 4 + 4]);
+    assert!(
+        l_unshadowed - l_shadowed > 25.0,
+        "occluded floor pixel should be much darker with shadows enabled: unshadowed={l_unshadowed}, shadowed={l_shadowed}"
+    );
+
+    // An unoccluded floor pixel on the far right should match closely.
+    let lit_idx = ((v.height / 2) * v.width + (v.width - 8)) as usize;
+    assert!(shadowed.depth[lit_idx].is_finite(), "far-right pixel should hit floor");
+    let l_lit_off = luma(&unshadowed.pixels[lit_idx * 4..lit_idx * 4 + 4]);
+    let l_lit_on = luma(&shadowed.pixels[lit_idx * 4..lit_idx * 4 + 4]);
+    assert!(
+        (l_lit_off - l_lit_on).abs() < 2.0,
+        "unoccluded floor pixel should stay bright: off={l_lit_off}, on={l_lit_on}"
+    );
+}
+
+/// 2×2 RGSS supersampling traces 4 rays per pixel and produces smooth intermediate edge colors
+/// along curved silhouettes.
+#[test]
+fn supersample_2x2_smooths_silhouettes() {
+    let mut g = Graph::new(GraphOpts { alloc: heap(), .. });
+    let ball = g.sphere(SphereOpts { radius: Length::mm(40.0), .. }).expect("sphere");
+    let tape = compile(&g, ball.id(), CompileOpts { alloc: heap(), .. }).expect("tape");
+
+    let v = View {
+        eye: [Length::mm(180.0), Length::ZERO, Length::ZERO],
+        target: [Length::ZERO; 3],
+        projection: Projection::Perspective { fov: Angle::degrees(38.0) },
+        width: 48,
+        height: 48,
+        ..
+    };
+    let bg = [255, 255, 255, 255];
+    let col = [20, 40, 80];
+
+    let s1 = render(&tape, v, PictureOpts { alloc: heap(), scratch: heap(), background: bg, colour: col, supersample: 1, .. }).expect("1x");
+    let s2 = render(&tape, v, PictureOpts { alloc: heap(), scratch: heap(), background: bg, colour: col, supersample: 2, .. }).expect("2x");
+
+    assert_eq!(s1.stats.rays, u64::from(v.width * v.height));
+    assert_eq!(s2.stats.rays, 4 * u64::from(v.width * v.height));
+
+    let intermediate = |p: &Picture<'_>| {
+        p.pixels.chunks_exact(4).filter(|px| px[0] >= 60 && px[0] <= 240).count()
+    };
+    assert_eq!(intermediate(&s1), 0, "1x1 classic render of dark solid on white bg has no blended silhouette pixels");
+    assert!(intermediate(&s2) >= 20, "2x2 RGSS should produce smooth intermediate silhouette pixels, got {}", intermediate(&s2));
+
+    // Invalid supersample values return typed errors.
+    assert_eq!(
+        render(&tape, v, PictureOpts { alloc: heap(), scratch: heap(), supersample: 0, .. }).unwrap_err(),
+        PictureError::BadSupersample { supersample: 0 }
+    );
+    assert_eq!(
+        render(&tape, v, PictureOpts { alloc: heap(), scratch: heap(), supersample: 3, .. }).unwrap_err(),
+        PictureError::BadSupersample { supersample: 3 }
+    );
+}
+
+/// Normal, Depth, and Matcap render modes produce accurate visual encodings.
+#[test]
+fn normals_depth_and_matcap_modes() {
+    let mut g = Graph::new(GraphOpts { alloc: heap(), .. });
+    let ball = g.sphere(SphereOpts { radius: Length::mm(40.0), .. }).expect("sphere");
+    let tape = compile(&g, ball.id(), CompileOpts { alloc: heap(), .. }).expect("tape");
+
+    let v = View {
+        eye: [Length::mm(200.0), Length::ZERO, Length::ZERO],
+        target: [Length::ZERO; 3],
+        projection: Projection::Perspective { fov: Angle::degrees(35.0) },
+        width: 48,
+        height: 48,
+        ..
+    };
+    let bg = [10, 20, 30, 255];
+
+    let normals = render(&tape, v, PictureOpts { alloc: heap(), scratch: heap(), background: bg, mode: RenderMode::Normals, .. }).expect("normals");
+    let c = ((v.height / 2) * v.width + (v.width / 2)) as usize;
+    let cpx = &normals.pixels[c * 4..c * 4 + 4];
+    // Front of sphere faces +X -> RGB ≈ [255, 128, 128, 255].
+    assert!(cpx[0] >= 250, "front normal R should be ~255, got {}", cpx[0]);
+    assert!((i32::from(cpx[1]) - 128).abs() <= 8, "front normal G should be ~128, got {}", cpx[1]);
+    assert!((i32::from(cpx[2]) - 128).abs() <= 8, "front normal B should be ~128, got {}", cpx[2]);
+    assert_eq!(&normals.pixels[0..4], &bg, "background pixel must stay background");
+
+    let depth = render(&tape, v, PictureOpts { alloc: heap(), scratch: heap(), background: bg, mode: RenderMode::Depth, .. }).expect("depth");
+    assert_eq!(depth.stats.grads, 0, "depth mode should not evaluate gradients");
+    let near_val = depth.pixels[c * 4];
+    // Find a hit pixel farther from centre (greater depth -> darker).
+    let mut far_val = near_val;
+    for x in 0..v.width / 2 {
+        let idx = ((v.height / 2) * v.width + x) as usize;
+        if depth.depth[idx].is_finite() {
+            far_val = depth.pixels[idx * 4];
+            break;
+        }
+    }
+    assert!(near_val > far_val + 30, "nearer sphere centre ({near_val}) must be brighter than limb ({far_val})");
+
+    let matcap = render(&tape, v, PictureOpts { alloc: heap(), scratch: heap(), background: bg, mode: RenderMode::Matcap, .. }).expect("matcap");
+    assert_eq!(&matcap.pixels[0..4], &bg);
+    assert_ne!(&matcap.pixels[c * 4..c * 4 + 4], &bg);
+}
+
+/// Studio shading with 2×2 RGSS and all render modes are strictly bit-for-bit deterministic.
+#[test]
+fn studio_and_modes_are_bit_deterministic() {
+    let mut g = Graph::new(GraphOpts { alloc: heap(), .. });
+    let box_ = g.cuboid(BoxOpts { size: [Length::mm(60.0), Length::mm(60.0), Length::mm(20.0)], round: Length::mm(3.0), .. }).expect("box");
+    let ball = g.sphere(SphereOpts { radius: Length::mm(22.0), .. }).expect("ball");
+    let ball = g.place(ball, Placement::shift(Length::mm(10.0), Length::mm(-8.0), Length::mm(20.0))).expect("place");
+    let solid = g.union(box_, ball).expect("union");
+    let tape = compile(&g, solid.id(), CompileOpts { alloc: heap(), .. }).expect("tape");
+
+    let v = View {
+        eye: [Length::mm(140.0), Length::mm(-120.0), Length::mm(100.0)],
+        target: [Length::ZERO; 3],
+        projection: Projection::Perspective { fov: Angle::degrees(38.0) },
+        width: 36,
+        height: 36,
+        ..
+    };
+
+    let configs = [
+        (RenderMode::Shaded, Shading::Studio(StudioOpts::DEFAULT), 2u8),
+        (RenderMode::Normals, Shading::Classic, 2u8),
+        (RenderMode::Depth, Shading::Classic, 1u8),
+        (RenderMode::Matcap, Shading::Classic, 2u8),
+    ];
+
+    for (mode, shading, supersample) in configs {
+        let o = PictureOpts { alloc: heap(), scratch: heap(), mode, shading, supersample, .. };
+        let a = render(&tape, v, o).expect("render a");
+        let b = render(&tape, v, o).expect("render b");
+        assert_eq!(a.pixels[..], b.pixels[..], "pixels differ for {mode:?}");
+        assert_eq!(a.stats, b.stats, "stats differ for {mode:?}");
+        for (da, db) in a.depth.iter().zip(b.depth.iter()) {
+            assert_eq!(da.to_bits(), db.to_bits(), "depth bits differ for {mode:?}");
+        }
+    }
+}

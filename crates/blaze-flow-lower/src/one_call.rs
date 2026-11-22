@@ -1151,10 +1151,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
                 return self.refuse(Form::Bound, e);
             }
             if let Some(expr) = self.body_expr(t, e)? {
-                for (i, x) in ck.captures.column::<0>().iter().enumerate() {
-                    if *x != expr {
-                        continue;
-                    }
+                for &row in self.captures_of(expr) {
+                    let i = row as usize;
                     let Some(&pat) = ck.captures.column::<1>().get(i) else { return self.refuse(Form::Malformed, e) };
                     let Some(&c) = ck.local_ty.get(pat.ix()) else { return self.refuse(Form::Malformed, e) };
                     stack.push(c);

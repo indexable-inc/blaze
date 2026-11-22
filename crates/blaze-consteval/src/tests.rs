@@ -1081,3 +1081,92 @@ fn int_binop_names_the_operator() {
     assert_eq!(r, Err(Refusal::Overflow { op: Op::Add }));
     let _: ItemKey = ItemKey(0);
 }
+
+/// Overlapping `Memory::copy` (`to > from && to < from + size`) must preserve the exact `init`
+/// bitmask and relocations without clobbering source bits before reading them, and recycled
+/// regions after `kill` must still report `Uninit` on unwritten bytes (zero-memset safety).
+#[test]
+fn overlapping_memory_copy_preserves_init_and_relocs() {
+    use crate::mem::{Memory, Origin, Pointer, Scalar};
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut mem = Memory::new_in(4096, alloc);
+
+    // 1. Overlapping forward copy (to > from && to < from + size) with init/uninit holes.
+    // Layout of 16 bytes: init at offsets 0, 2, 4; uninit at 1, 3, 5..16.
+    // Copy [0..8] -> [2..10]: expected init at 2, 4, 6; uninit at 3, 5, 7, 8, 9.
+    let id = mem.allocate(16, 3, true, Origin::Local).unwrap();
+    let base = Pointer { alloc: id, offset: 0 };
+    mem.write(base.at(0), 1, Scalar::Int(0x11)).unwrap();
+    mem.write(base.at(2), 1, Scalar::Int(0x22)).unwrap();
+    mem.write(base.at(4), 1, Scalar::Int(0x33)).unwrap();
+    mem.copy(base.at(0), base.at(2), 8).unwrap();
+    assert_eq!(mem.read(base.at(2), 1), Ok(Scalar::Int(0x11)));
+    assert_eq!(mem.read(base.at(3), 1), Err(Refusal::Uninit { offset: 3 }));
+    assert_eq!(mem.read(base.at(4), 1), Ok(Scalar::Int(0x22)));
+    assert_eq!(mem.read(base.at(5), 1), Err(Refusal::Uninit { offset: 5 }));
+    assert_eq!(mem.read(base.at(6), 1), Ok(Scalar::Int(0x33)));
+    assert_eq!(mem.read(base.at(7), 1), Err(Refusal::Uninit { offset: 7 }));
+    assert_eq!(mem.read(base.at(8), 1), Err(Refusal::Uninit { offset: 8 }));
+    assert_eq!(mem.read(base.at(9), 1), Err(Refusal::Uninit { offset: 9 }));
+
+    // 2. Overlapping copy with relocations + sorted reloc lookup.
+    let target = mem.allocate(8, 3, false, Origin::Data).unwrap();
+    let buf = mem.allocate(32, 3, true, Origin::Local).unwrap();
+    let bp = Pointer { alloc: buf, offset: 0 };
+    let ptr_val = Scalar::Ptr(Pointer { alloc: target, offset: 4 });
+    mem.write(bp.at(0), 8, ptr_val).unwrap();
+    mem.write(bp.at(16), 8, Scalar::Ptr(Pointer { alloc: target, offset: 0 })).unwrap();
+    // Forward overlap: [0..16] -> [8..24] (shifts reloc from 0 -> 8, overwrites old reloc at 16).
+    mem.copy(bp.at(0), bp.at(8), 16).unwrap();
+    assert_eq!(mem.read(bp.at(8), 8), Ok(ptr_val));
+    assert_eq!(mem.read(bp.at(16), 8), Err(Refusal::Uninit { offset: 16 }));
+    assert_eq!(mem.relocs(buf).unwrap(), &[(0, target), (8, target)]);
+
+    // 3. Zero-memset recycle: killing `buf` and reallocating reuses heap bytes, but `init`
+    //    guards all reads and `zero_unwritten` clears stale bytes.
+    let dirty = mem.allocate(16, 0, true, Origin::Local).unwrap();
+    let dp = Pointer { alloc: dirty, offset: 0 };
+    mem.write(dp, 8, Scalar::Int(0xDEAD_BEEF_CAFE_BABE)).unwrap();
+    mem.kill(dirty);
+    let fresh = mem.allocate(16, 0, true, Origin::Local).unwrap();
+    let fp = Pointer { alloc: fresh, offset: 0 };
+    assert_eq!(mem.read(fp, 1), Err(Refusal::Uninit { offset: 0 }));
+    assert_eq!(mem.read(fp.at(1), 2), Err(Refusal::Uninit { offset: 1 }));
+    mem.write(fp.at(2), 2, Scalar::Int(0x1234)).unwrap();
+    assert_eq!(mem.read(fp.at(2), 2), Ok(Scalar::Int(0x1234)));
+    let mut out = [0xFFu8; 16];
+    out.copy_from_slice(mem.bytes(fresh).unwrap());
+    mem.zero_unwritten(fresh, &mut out);
+    assert_eq!(&out[0..4], &[0, 0, 0x34, 0x12]);
+}
+
+/// String literals inside a loop must reuse their immutable `Origin::Data` allocation rather
+/// than allocating fresh bytes every iteration and tripping `MemoryLimit`.
+#[test]
+fn str_literal_in_loop_does_not_leak_memory() {
+    let mut w = world();
+    let s_lit = std::format!("\"{}\"", "a".repeat(256));
+    let body = std::format!(
+        "{{ let mut i = 0u32; let mut acc = 0usize; while i < 500 {{ let s: &str = {s_lit}; acc += 1; i += 1; }} acc }}"
+    );
+    w.konst("LOOP_STR", "usize", &body);
+    w.limits.memory = 4096;
+    w.build();
+    assert_eq!(eval_int(&mut w, "LOOP_STR"), Ok(500));
+}
+
+/// `Intrinsic::Offset` must reject overflowing `count * size` and byte offsets exceeding
+/// `isize::MAX` with `Refusal::OutOfBounds` instead of panicking.
+#[test]
+fn offset_intrinsic_overflow_is_refused() {
+    let mut w = world();
+    let p0 = w.fx.param(0);
+    let ptr = w.fx.ty(PNode::Ptr(blaze_typeck::Mutbl::Not, p0));
+    let isize_ = w.ty("isize");
+    w.intrinsic("offset", 1, &[ptr, isize_], ptr, Intrinsic::Offset);
+    w.konst("OVER_MUL", "*const u64", "{ let x = 0u64; offset(&x as *const u64, 9223372036854775807isize) }");
+    w.konst("OVER_MIN", "*const u8", "{ let x = 0u8; offset(&x as *const u8, -9223372036854775807isize - 1isize) }");
+    w.build();
+    assert!(refusal(&mut w, "OVER_MUL").contains("OutOfBounds"));
+    assert!(refusal(&mut w, "OVER_MIN").contains("OutOfBounds"));
+}

@@ -42,17 +42,20 @@ mod tests;
 
 pub use error::{CadError, CompileError, DecodeError, EvalError, InspectError, Name, NodeKind, Value};
 pub use eval::{
-    Choice, Choices, Lanes, Points, Scratch, eval_box, eval_box_with, eval_grad, eval_grad_with, eval_point, eval_points, eval_points_with,
-    simplify, simplify_with,
+    Choice, Choices, Lanes, Points, Scratch, eval_box, eval_box_with, eval_grad, eval_grad_with, eval_grads, eval_grads_with, eval_point,
+    eval_points, eval_points_with, simplify, simplify_with,
 };
-pub use inspect::{Bounds, BoundsOpts, Class, DistanceOpts, Gap, Hit, RayOpts, bounds, classify, distance_between, ray, section};
+pub use inspect::{
+    Bounds, BoundsOpts, Class, DistanceOpts, DistanceStopOpts, Gap, Hit, RayOpts, bounds, classify, distance_between,
+    distance_between_stopping, ray, section,
+};
 pub use lower::{CompileOpts, compile};
 pub use tape::{INSTR_BYTES, Instr, Op, Tape, schema_digest};
 pub use graph::{
-    BendOpts, BlendOpts, BoxOpts, CapsuleOpts, CircularOpts, ConeOpts, CylinderOpts, DetailOpts, EllipsoidOpts, ExtrudeOpts, Graph,
-    GraphOpts, GridOpts, HalfSpaceOpts, LoftOpts, MirrorOpts, OffsetOpts, Prof, ProfileOpts, RepeatOpts, RevolveOpts, RevolvePartOpts,
-    RoundOpts, ScaleOpts, ShellOpts, Solid, SphereOpts, Station, SuperellipsoidOpts, SweepArcOpts, SweepPolylineOpts, TaperOpts,
-    TorusOpts, TwistOpts, AffineOpts,
+    AffineOpts, BendOpts, BlendOpts, BoxOpts, CapsuleOpts, CircularOpts, ConeOpts, CylinderOpts, DetailOpts, EllipsoidOpts, ExtrudeOpts,
+    Graph, GraphOpts, GridOpts, GyroidOpts, HalfSpaceOpts, LoftOpts, MirrorOpts, OffsetOpts, Prof, ProfileOpts, RepeatOpts, RevolveOpts,
+    RevolvePartOpts, RoundOpts, ScaleOpts, ShellOpts, Solid, SphereOpts, Station, SuperellipsoidOpts, SweepArcOpts, SweepPolylineOpts,
+    TaperOpts, TorusOpts, TwistOpts,
 };
 pub use level::{AtLeastInside, AtLeastOutside, Bound, Ex, Exact, Inside, Join, Level, Lipschitz, Outside, Weakens};
 pub use node::{Boolean, Detail, Digest, Edge, Node, NodeId, ProfileId, Shape};

@@ -12,14 +12,10 @@
 //!
 //! **What the table costs.** `nodes x symbols x size_of::<Node>()` bytes, the nodes counted
 //! exactly by [`nodes_for`] (one per distinct prefix, the root's included). The rules' table is
-//! 207 nodes over 126 symbols at one byte, 26,082 bytes (the 5 lock types `lock-without-reason`
-//! dispatches on added symbols, not nodes); at 121 symbols it was 25,047 bytes (the 14 words
-//! `process-static` and `sans-io-core` dispatch on added symbols too); at 107, 22,149 bytes, and
-//! before the `ambient-hasher` rows it was
-//! 147 nodes over 95 symbols, 13,965 bytes. (Counted by hand from `sequences::SEQS`; the build
-//! checks the count, and `rule_trie_equals_a_scan_per_sequence` the table.) `nodes_for` was once
-//! the bound `1 + total symbols` (284 now), used only to size a first build; that bound, not the
-//! table, passed a byte.
+//! 292 nodes at two bytes (`Node = u16`) after adding `raw-sync`, `blocking-on-pool`, `transmute`,
+//! and strengthened `ambient-hasher`/`ambient-heap` patterns (previously 207 nodes over 126
+//! symbols at one byte, 26,082 bytes). (Counted by hand from `sequences::SEQS`; the build
+//! checks the count, and `rule_trie_equals_a_scan_per_sequence` the table.)
 //!
 //! A node number is a byte while the table has at most 254 nodes, and the hot path is fastest so:
 //! a token costs one load of the root's row ([`Trie::starts`]) and one per live state, the same
@@ -32,8 +28,8 @@
 //! Sans-IO and pure: [`Live::step`] is a function of its state, the trie and one symbol.
 
 /// A node's number: wide enough for every node of the rules' table, with [`DEAD`] above them
-/// (`Trie::build` asserts it). A byte up to 254 nodes; `u16` past that, changed here alone.
-pub(crate) type Node = u8;
+/// (`Trie::build` asserts it). `u16` supports up to 65,534 nodes.
+pub(crate) type Node = u16;
 
 /// No transition: the symbol ends every match through this node.
 pub(crate) const DEAD: Node = Node::MAX;
@@ -53,6 +49,7 @@ impl Pattern {
     pub(crate) const EMPTY: Pattern = Pattern { syms: [0; LIVE], len: 0 };
 
     /// The pattern of `syms`. Panics, a compile error in a `const`, past [`LIVE`] symbols.
+    #[cfg(test)]
     pub(crate) const fn of(syms: &[u8]) -> Pattern {
         assert!(!syms.is_empty() && syms.len() <= LIVE, "a sequence of 1 to LIVE symbols");
         let mut out = Pattern::EMPTY;
@@ -157,11 +154,11 @@ impl<const NODES: usize, const SYMS: usize, const SEQS: usize> Trie<NODES, SYMS,
         Trie { next, ends, also }
     }
 
-    /// Whether some sequence starts with `sym`: when none does and no state is live, a token
+    /// The transition from the root on `sym`, or [`DEAD`]: when no state is live, a token
     /// costs this one load.
     #[inline(always)]
-    pub(crate) fn starts(&self, sym: u8) -> bool {
-        self.next[0][sym as usize] != DEAD
+    pub(crate) fn root(&self, sym: u8) -> Node {
+        self.next[0][sym as usize]
     }
 
     /// The first sequence that ends at `node`, or [`NO_SEQ`].
@@ -201,6 +198,19 @@ impl Live {
         self.len as usize
     }
 
+    #[inline(always)]
+    pub(crate) fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// Starts one live state from the root's transition `to` at `token` (when `self.is_empty()`).
+    #[inline(always)]
+    pub(crate) fn start_root(&mut self, to: Node, token: u32) {
+        self.node[0] = to;
+        self.start[0] = token;
+        self.len = 1;
+    }
+
     /// State `at`: its node and the token its match started at.
     #[inline(always)]
     pub(crate) fn state(&self, at: usize) -> (Node, u32) {
@@ -213,35 +223,42 @@ impl Live {
     ///
     /// At most `LIVE` states are kept: two states have different starts, so different depths,
     /// and a depth past the longest pattern (at most `LIVE`, checked by [`Trie::build`]) has no
-    /// node. The writes are therefore in bounds.
-    #[inline]
+    /// node. The writes are therefore in bounds, and `out <= at` holds throughout, so compaction
+    /// runs in place with zero stack-array copies.
+    #[inline(always)]
     pub(crate) fn step<const NODES: usize, const SYMS: usize, const SEQS: usize>(
         &mut self,
         trie: &Trie<NODES, SYMS, SEQS>,
         sym: u8,
         token: u32,
     ) {
-        let mut node: [Node; LIVE] = [0; LIVE];
-        let mut start = [0u32; LIVE];
-        let mut len = 0usize;
         let column = sym as usize;
+        let cur_len = self.len as usize;
+        if cur_len == 0 {
+            let to = trie.next[0][column];
+            if to != DEAD {
+                self.node[0] = to;
+                self.start[0] = token;
+                self.len = 1;
+            }
+            return;
+        }
+        let mut out = 0usize;
         // Bounded: LIVE turns at most.
-        for at in 0..self.len as usize {
+        for at in 0..cur_len {
             let to = trie.next[self.node[at] as usize][column];
             if to != DEAD {
-                node[len] = to;
-                start[len] = self.start[at];
-                len += 1;
+                self.node[out] = to;
+                self.start[out] = self.start[at];
+                out += 1;
             }
         }
         let to = trie.next[0][column];
         if to != DEAD {
-            node[len] = to;
-            start[len] = token;
-            len += 1;
+            self.node[out] = to;
+            self.start[out] = token;
+            out += 1;
         }
-        self.node = node;
-        self.start = start;
-        self.len = len as u8;
+        self.len = out as u8;
     }
 }

@@ -567,4 +567,7 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     // Emitted by the release build, which reads it from the code LLVM made, never by `blaze check`.
     l("blaze::vecreport", Allow, "reports a bounds check, overflow check or panic path the optimizer kept inside a loop, and a loop it left unvectorized with its reason, read from the optimized code; only hot loops when the build has a profile"),
+    // Raw std/third-party synchronization primitives, checked by blaze-lint's `raw-sync` rule.
+    l("blaze::raw_sync", Allow, "detects raw synchronization primitives (`std::sync::{Mutex, RwLock, Condvar, Barrier}`, `parking_lot::{Mutex, RwLock, Condvar}`, `dashmap::DashMap`, `mpsc::{channel, sync_channel}`) where blaze's named locks or bounded channels belong")
+        .externally_loaded(),
 ];

@@ -322,6 +322,25 @@ fn shape(e: &mut Emit<'_>, s: &Shape, l: [u32; 3]) -> R {
             let lip = blaze_math::pow(3.0, 1.0 / ex - 0.5).max(1.0);
             e.mulk(n1, m(radii[0].min(radii[1]).min(radii[2])) / lip)
         }
+        Shape::Gyroid { period, thickness } => {
+            // g(x,y,z) = sin(kx)cos(ky) + sin(ky)cos(kz) + sin(kz)cos(kx), k = 2*pi / period.
+            // ||grad g|| <= k * sqrt(3) everywhere (exact tight bound by Cauchy-Schwarz), so
+            // |g| / (k * sqrt(3)) - thickness / 2 is strictly 1-Lipschitz.
+            let k = 2.0 * core::f64::consts::PI / m(period);
+            let scale = 1.0 / (k * blaze_math::sqrt(3.0));
+            let (kx, ky, kz) = (e.mulk(x, k)?, e.mulk(y, k)?, e.mulk(z, k)?);
+            let (sx, cx) = (e.un(Op::Sin, kx)?, e.un(Op::Cos, kx)?);
+            let (sy, cy) = (e.un(Op::Sin, ky)?, e.un(Op::Cos, ky)?);
+            let (sz, cz) = (e.un(Op::Sin, kz)?, e.un(Op::Cos, kz)?);
+            let t0 = e.bin(Op::Mul, sx, cy)?;
+            let t1 = e.bin(Op::Mul, sy, cz)?;
+            let t2 = e.bin(Op::Mul, sz, cx)?;
+            let s = e.bin(Op::Add, t0, t1)?;
+            let g = e.bin(Op::Add, s, t2)?;
+            let ag = e.un(Op::Abs, g)?;
+            let d = e.mulk(ag, scale)?;
+            e.subk(d, 0.5 * m(thickness))
+        }
     }
 }
 

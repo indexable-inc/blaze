@@ -407,7 +407,8 @@ pub fn value_key(key: Key, reads: &[(Name, ContentId)]) -> Key {
 /// checks open, and a `CrateScope`'s name is its crate's key, so which names it reads follows
 /// from WHICH crates own the file (`owners`, the file's `Owners` name, `owners_out` its out:
 /// root files) and WHAT those crates are (`graph`, the `UnitGraph`'s out: the crate list, whose
-/// rows hold each crate's key, made from its features, cfg, dependencies' keys and side). Both
+/// rows hold each crate's key, made from its features, cfg and side, and each crate's edges).
+/// Both
 /// are folded into `task` as reads, so one key never names two read lists (rule 21). Without the
 /// graph, `blaze run` then `blaze check` of one hello world (two asks, two crate lists, one
 /// `Owners` out) put two shapes of one `Signature` under one key ("held CrateScope(1e39..), put

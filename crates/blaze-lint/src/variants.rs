@@ -89,6 +89,10 @@ pub struct Variants<'a> {
     names: AVec<'a, u8>,
     /// In file order.
     sites: AVec<'a, Site>,
+    /// Bit `c` is set when some enum in `enums` has `count == c` (`c < 64`).
+    count_mask: u64,
+    /// Whether some enum in `enums` has `count >= 64`.
+    has_large: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -204,7 +208,13 @@ fn int_value(lit: &str) -> Option<(u32, bool)> {
 impl<'a> Variants<'a> {
     /// No enum, no site: what a file without the word `enum` has.
     pub fn new_in(alloc: Alloc<'a>) -> Variants<'a> {
-        Variants { enums: AVec::new_in(alloc), names: AVec::new_in(alloc), sites: AVec::new_in(alloc) }
+        Variants {
+            enums: AVec::new_in(alloc),
+            names: AVec::new_in(alloc),
+            sites: AVec::new_in(alloc),
+            count_mask: 0,
+            has_large: false,
+        }
     }
 
     /// The fact of the whole file `text`: one lex of it, its tables and scratch in `alloc`. A
@@ -336,6 +346,11 @@ impl<'a> Variants<'a> {
                                 in_block: e.in_block,
                                 generic: e.generic,
                             });
+                            if total < 64 {
+                                made.count_mask |= 1u64 << total;
+                            } else {
+                                made.has_large = true;
+                            }
                         }
                     }
                 }
@@ -348,7 +363,13 @@ impl<'a> Variants<'a> {
     /// The fact as borrowed columns: `Copy` and `Sync`, so a file's units linted on several
     /// workers read the one fact gathered for the file ([`VariantsView`]).
     pub fn view(&self) -> VariantsView<'_> {
-        VariantsView { enums: &self.enums, names: &self.names, sites: &self.sites }
+        VariantsView {
+            enums: &self.enums,
+            names: &self.names,
+            sites: &self.sites,
+            count_mask: self.count_mask,
+            has_large: self.has_large,
+        }
     }
 
     /// What this rule's findings in the unit at `base` (its `len` bytes, its `holes`) read of the
@@ -383,9 +404,19 @@ pub struct VariantsView<'a> {
     enums: &'a [EnumFact],
     names: &'a [u8],
     sites: &'a [Site],
+    count_mask: u64,
+    has_large: bool,
 }
 
 impl<'a> VariantsView<'a> {
+    #[inline(always)]
+    fn may_match(&self, value: u32) -> bool {
+        if value < 64 {
+            (self.count_mask & (1u64 << value)) != 0
+        } else {
+            self.has_large
+        }
+    }
     /// The digest [`Variants::unit_key`] makes, its sites' places own places ([`crate::own_place`]):
     /// what a unit linted as its own text reads of the rest of the file, with no child's length.
     pub fn unit_key_own(&self, at: Geometry<'_>) -> Option<[u8; 32]> {
@@ -428,8 +459,14 @@ impl<'a> VariantsView<'a> {
 
     /// [`Variants::unit_key`], each site's place made by `place` from its item-relative range.
     fn key_of(&self, base: u32, len: u32, holes: &[Span], place: impl Fn(Span) -> Span) -> Option<[u8; 32]> {
+        if self.enums.is_empty() {
+            return None;
+        }
         let mut hasher: Option<blaze_blake3::Hasher> = None;
         for (range, site) in self.sites_of(base, len, holes) {
+            if !self.may_match(site.value) {
+                continue;
+            }
             let range = place(range);
             for e in self.enums.iter().filter(|e| e.count == site.value) {
                 let h = hasher.get_or_insert_with(|| blaze_blake3::Hasher::new_derive_key("blaze-lint variant-count unit 1"));
@@ -449,7 +486,13 @@ impl<'a> VariantsView<'a> {
     /// The findings of `variant-count` in the unit at `base` of `len` bytes with `holes`, each
     /// placed by `place` from its item-relative range, pushed onto `out`.
     fn find_in(&self, base: u32, len: u32, holes: &[Span], place: impl Fn(Span) -> Span, out: &mut Findings<'_>) -> Result<(), LintError> {
+        if self.enums.is_empty() {
+            return Ok(());
+        }
         for (range, site) in self.sites_of(base, len, holes) {
+            if !self.may_match(site.value) {
+                continue;
+            }
             let range = place(range);
             let mut matching = self.enums.iter().filter(|e| e.count == site.value);
             let Some(first) = matching.next() else { continue };

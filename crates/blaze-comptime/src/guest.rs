@@ -8,7 +8,7 @@
 
 use blaze_own::{AVec, Alloc, Vec};
 
-use crate::call::{Answer, Call, CallKind};
+use crate::call::{Answer, Call, CallKind, SysError};
 use crate::host::Nanos;
 use crate::wire::{WireError, WireLimits, read_answer, write_call};
 
@@ -138,6 +138,7 @@ pub fn fits(on: CallKind, answer: &Answer<'_>) -> bool {
         ),
         Answer::Spawned { .. } => on == K::Spawn,
         Answer::Bridge { .. } => on == K::Bridge,
+        Answer::Error(SysError::TooLarge) => !matches!(on, K::Hello | K::Clock | K::Sleep | K::TrackEnv),
         Answer::Error(_) => !matches!(on, K::Hello | K::EnvAll | K::Args | K::Cwd | K::Clock | K::Random | K::Sleep | K::TrackEnv),
     }
 }

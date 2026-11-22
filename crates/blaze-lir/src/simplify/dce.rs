@@ -259,6 +259,12 @@ pub(super) struct Edit<A: Allocator> {
     /// Per instruction: [`NONE`], or for a `br` or `switch` the target ([`Edge::ordinal`])
     /// it becomes a `jump` to.
     pub(super) jump: Vec<u32, A>,
+    /// Per instruction: [`NONE`], or for a `call_indirect` the `RefId` (of `RefKind::Func`)
+    /// it devirtualizes into a direct `call` of.
+    pub(super) devirt: Vec<u32, A>,
+    /// Per block: [`NONE`], or the sole-predecessor block `B` coalesced into this block across
+    /// its `jump` terminator (dropping this block's `jump` and `B`'s parameters).
+    pub(super) merge_next: Vec<u32, A>,
 }
 
 /// The function `view` with `edit` made, in `alloc`, verified.
@@ -266,6 +272,8 @@ pub(super) fn rebuild<A: Allocator + Clone>(view: View<'_>, edit: &Edit<A>, allo
     if !edit.block_kept[0] {
         return Err(SimplifyError::Refused { inst: 0, what: "a rewrite without the entry block" });
     }
+    let blocks = view.blocks();
+    let len = view.len();
     let mut func = view.to_func_in(alloc.clone());
     func.ops.clear();
     func.flags.clear();
@@ -276,29 +284,134 @@ pub(super) fn rebuild<A: Allocator + Clone>(view: View<'_>, edit: &Edit<A>, allo
     func.locs.clear();
     func.block_starts.clear();
     func.block_kinds.clear();
-    // Kept instructions and blocks keep their order: their new numbers are their ranks.
-    let mut new_inst = filled(view.len(), NONE, &alloc);
-    let mut next = 0u32;
-    for inst in 0..view.len() {
-        if edit.inst_kept[inst] {
-            new_inst[inst] = next;
-            next += 1;
+
+    let has_merges = edit.merge_next.iter().any(|&m| m != NONE);
+    if !has_merges {
+        // Fast path: kept instructions and blocks keep their order: their new numbers are their ranks.
+        let mut new_inst = filled(len, NONE, &alloc);
+        let mut next = 0u32;
+        for inst in 0..len {
+            if edit.inst_kept[inst] {
+                new_inst[inst] = next;
+                next += 1;
+            }
+        }
+        let mut new_block = filled(blocks, NONE, &alloc);
+        let mut next = 0u32;
+        for b in 0..blocks {
+            if edit.block_kept[b] {
+                new_block[b] = next;
+                next += 1;
+            }
+        }
+        let mut out = Out { view, edit, stands: &edit.stands, new_inst, new_block, func };
+        for b in (0..blocks).filter(|&b| edit.block_kept[b]) {
+            out.func.block_starts.push(out.func.ops.len() as u32);
+            out.func.block_kinds.push(view.block_kinds[b]);
+            for inst in view.block(Block(b as u32)).filter(|&inst| edit.inst_kept[inst]) {
+                out.inst(inst)?;
+            }
+        }
+        let func = out.func;
+        verify(func.view()).map_err(SimplifyError::Verify)?;
+        return Ok(func);
+    }
+
+    // Coalescing path: merge `A -> Jump(B, args)` chains into single blocks.
+    let mut merged_into_pred = filled(blocks, false, &alloc);
+    let mut resolved_stands = Vec::with_capacity_in(len, alloc.clone());
+    resolved_stands.extend_from_slice(&edit.stands);
+
+    for a in 0..blocks {
+        if !edit.block_kept[a] {
+            continue;
+        }
+        let b = edit.merge_next[a];
+        if b == NONE {
+            continue;
+        }
+        let b_idx = b as usize;
+        merged_into_pred[b_idx] = true;
+        // Redirect `B`'s parameters to `A`'s `Jump` arguments.
+        let term = view.terminator(Block(a as u32));
+        let jump_at = view.data[term] as usize;
+        let arg_count = view.extra[jump_at + 1] as usize;
+        let params = view.params(Block(b));
+        if params.len() != arg_count {
+            return Err(SimplifyError::Refused {
+                inst: term,
+                what: "a coalesced jump given another number of arguments than its target's parameters",
+            });
+        }
+        for k in 0..arg_count {
+            let arg = view.extra[jump_at + 2 + k];
+            resolved_stands[params.start + k] = edit.stands[arg as usize];
         }
     }
-    let mut new_block = filled(view.blocks(), NONE, &alloc);
-    let mut next = 0u32;
-    for b in 0..view.blocks() {
-        if edit.block_kept[b] {
-            new_block[b] = next;
-            next += 1;
+    // Path-compress `resolved_stands` so transitive chains across arbitrary block order resolve in O(1).
+    for v in 0..len {
+        let mut cur = resolved_stands[v];
+        for _ in 0..=len {
+            let next = resolved_stands[cur as usize];
+            if next == cur {
+                break;
+            }
+            cur = next;
+        }
+        resolved_stands[v] = cur;
+    }
+
+    let mut new_block = filled(blocks, NONE, &alloc);
+    let mut new_inst = filled(len, NONE, &alloc);
+    let mut next_block = 0u32;
+    let mut next_inst = 0u32;
+    for head in 0..blocks {
+        if !edit.block_kept[head] || merged_into_pred[head] {
+            continue;
+        }
+        new_block[head] = next_block;
+        next_block += 1;
+        let mut cur = head;
+        for _ in 0..blocks {
+            let range = view.block(Block(cur as u32));
+            let start = if cur == head { range.start } else { view.params(Block(cur as u32)).end };
+            let next = edit.merge_next[cur];
+            let end = if next != NONE { range.end - 1 } else { range.end };
+            for inst in start..end {
+                if edit.inst_kept[inst] {
+                    new_inst[inst] = next_inst;
+                    next_inst += 1;
+                }
+            }
+            if next == NONE {
+                break;
+            }
+            cur = next as usize;
         }
     }
-    let mut out = Out { view, edit, new_inst, new_block, func };
-    for b in (0..view.blocks()).filter(|&b| edit.block_kept[b]) {
+
+    let mut out = Out { view, edit, stands: &resolved_stands, new_inst, new_block, func };
+    for head in 0..blocks {
+        if !edit.block_kept[head] || merged_into_pred[head] {
+            continue;
+        }
         out.func.block_starts.push(out.func.ops.len() as u32);
-        out.func.block_kinds.push(view.block_kinds[b]);
-        for inst in view.block(Block(b as u32)).filter(|&inst| edit.inst_kept[inst]) {
-            out.inst(inst)?;
+        out.func.block_kinds.push(view.block_kinds[head]);
+        let mut cur = head;
+        for _ in 0..blocks {
+            let range = view.block(Block(cur as u32));
+            let start = if cur == head { range.start } else { view.params(Block(cur as u32)).end };
+            let next = edit.merge_next[cur];
+            let end = if next != NONE { range.end - 1 } else { range.end };
+            for inst in start..end {
+                if edit.inst_kept[inst] {
+                    out.inst(inst)?;
+                }
+            }
+            if next == NONE {
+                break;
+            }
+            cur = next as usize;
         }
     }
     let func = out.func;
@@ -310,6 +423,7 @@ pub(super) fn rebuild<A: Allocator + Clone>(view: View<'_>, edit: &Edit<A>, allo
 struct Out<'v, 'e, A: Allocator + Clone> {
     view: View<'v>,
     edit: &'e Edit<A>,
+    stands: &'e [u32],
     new_inst: Vec<u32, A>,
     new_block: Vec<u32, A>,
     func: Func<A>,
@@ -327,7 +441,7 @@ impl<A: Allocator + Clone> Out<'_, '_, A> {
 
     /// The output's number of the value a use of `value` in `inst` reads.
     fn value(&self, inst: usize, value: u32) -> Result<u32, SimplifyError> {
-        let reads = self.edit.stands[value as usize];
+        let reads = self.stands[value as usize];
         match self.new_inst[reads as usize] {
             NONE => Err(SimplifyError::Refused { inst, what: "a use of a value the rewrite removed" }),
             it => Ok(it),
@@ -475,6 +589,23 @@ impl<A: Allocator + Clone> Out<'_, '_, A> {
         let (flags, ty, attrs, loc) = (view.flags[inst], view.tys[inst], view.attrs[inst], view.locs[inst]);
         if let Some(value) = self.edit.constant[inst] {
             self.constant(Ty(ty), value, loc);
+            return Ok(());
+        }
+        let target_ref = self.edit.devirt[inst];
+        if target_ref != NONE {
+            let words = view.extra;
+            let at = view.data[inst] as usize;
+            let sig = words[at + 1];
+            let n = words[at + 2] as usize;
+            let start = self.func.extra.len() as u32;
+            self.func.extra.push(target_ref);
+            self.func.extra.push(sig);
+            self.func.extra.push(n as u32);
+            for k in 0..n {
+                let value = self.value(inst, words[at + 3 + k])?;
+                self.func.extra.push(value);
+            }
+            self.raw(Op::Call, flags, ty, start, attrs, loc);
             return Ok(());
         }
         let chosen = self.edit.jump[inst];
@@ -640,18 +771,25 @@ pub fn dead<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, S
     }
     let len = view.len();
     let mut jump = filled(len, NONE, &alloc);
+    let mut any_jump = false;
     for b in 0..view.blocks() {
         let end = view.terminator(Block(b as u32));
-        jump[end] = trivial(&view, end);
+        let chosen = trivial(&view, end);
+        if chosen != NONE {
+            jump[end] = chosen;
+            any_jump = true;
+        }
     }
     let reached = reachable(&view, &jump, &alloc);
     let into = incoming(&view, &reached, &jump, &alloc);
     let owner = owners(&view, &alloc);
     let mut live = filled(len, false, &alloc);
+    let mut live_count = 0usize;
     let mut work: Vec<u32, A> = Vec::with_capacity_in(len, alloc.clone());
-    let mark = |live: &mut Vec<bool, A>, work: &mut Vec<u32, A>, value: u32| {
+    let mark = |live: &mut Vec<bool, A>, work: &mut Vec<u32, A>, live_count: &mut usize, value: u32| {
         if !live[value as usize] {
             live[value as usize] = true;
+            *live_count += 1;
             work.push(value);
         }
     };
@@ -664,7 +802,7 @@ pub fn dead<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, S
                 op => !removable(op),
             };
             if root {
-                mark(&mut live, &mut work, inst as u32);
+                mark(&mut live, &mut work, &mut live_count, inst as u32);
             }
         }
     }
@@ -675,7 +813,7 @@ pub fn dead<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, S
             let b = owner[at] as usize;
             let k = at - view.params(Block(b as u32)).start;
             for &args in into.edges_into(b) {
-                mark(&mut live, &mut work, view.extra[args as usize + k]);
+                mark(&mut live, &mut work, &mut live_count, view.extra[args as usize + k]);
             }
             continue;
         }
@@ -685,9 +823,37 @@ pub fn dead<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, S
         }
         each(&view, at, |item| {
             if let Item::Value(used) = item {
-                mark(&mut live, &mut work, used);
+                mark(&mut live, &mut work, &mut live_count, used);
             }
         });
+    }
+    let blocks = view.blocks();
+    let mut merge_next = filled(blocks, NONE, &alloc);
+    let mut any_merge = false;
+    for a in 0..blocks {
+        if !reached[a] {
+            continue;
+        }
+        let term = view.terminator(Block(a as u32));
+        if view.op(term) != Op::Jump {
+            continue;
+        }
+        let b = view.extra[view.data[term] as usize];
+        let b_idx = b as usize;
+        if b != 0
+            && b_idx != a
+            && reached[b_idx]
+            && into.targets_only[b_idx]
+            && into.edges_into(b_idx).len() == 1
+            && !view.block_kind(Block(b)).is_landing()
+        {
+            merge_next[a] = b;
+            any_merge = true;
+        }
+    }
+    if !any_jump && !any_merge && live_count == len && reached.iter().all(|&r| r) {
+        verify(view).map_err(SimplifyError::Verify)?;
+        return Ok(view.to_func_in(alloc));
     }
     let mut stands = Vec::with_capacity_in(len, alloc.clone());
     for value in 0..len as u32 {
@@ -699,6 +865,62 @@ pub fn dead<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, S
         stands,
         constant: filled(len, None, &alloc),
         jump,
+        devirt: filled(len, NONE, &alloc),
+        merge_next,
+    };
+    rebuild(view, &edit, alloc)
+}
+
+/// Coalesces single-predecessor `jump` chains (`A -> Jump(B, args)` when `B` has `A` as its
+/// sole reached predecessor) without altering any live computation, in `alloc`, verified.
+pub fn coalesce_cfg<A: Allocator + Clone>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
+    if view.blocks() == 0 {
+        return Err(SimplifyError::Refused { inst: 0, what: "a function with no blocks" });
+    }
+    let blocks = view.blocks();
+    let len = view.len();
+    let no_jumps = filled(len, NONE, &alloc);
+    let reached = reachable(&view, &no_jumps, &alloc);
+    let into = incoming(&view, &reached, &no_jumps, &alloc);
+    let mut merge_next = filled(blocks, NONE, &alloc);
+    let mut any_merge = false;
+    for a in 0..blocks {
+        if !reached[a] {
+            continue;
+        }
+        let term = view.terminator(Block(a as u32));
+        if view.op(term) != Op::Jump {
+            continue;
+        }
+        let b = view.extra[view.data[term] as usize];
+        let b_idx = b as usize;
+        if b != 0
+            && b_idx != a
+            && reached[b_idx]
+            && into.targets_only[b_idx]
+            && into.edges_into(b_idx).len() == 1
+            && !view.block_kind(Block(b)).is_landing()
+        {
+            merge_next[a] = b;
+            any_merge = true;
+        }
+    }
+    if !any_merge && reached.iter().all(|&r| r) {
+        verify(view).map_err(SimplifyError::Verify)?;
+        return Ok(view.to_func_in(alloc));
+    }
+    let mut stands = Vec::with_capacity_in(len, alloc.clone());
+    for value in 0..len as u32 {
+        stands.push(value);
+    }
+    let edit = Edit {
+        block_kept: reached,
+        inst_kept: filled(len, true, &alloc),
+        stands,
+        constant: filled(len, None, &alloc),
+        jump: no_jumps,
+        devirt: filled(len, NONE, &alloc),
+        merge_next,
     };
     rebuild(view, &edit, alloc)
 }

@@ -56,24 +56,43 @@ impl Hashed for u64 {
     }
 }
 
+/// Control byte marking an unoccupied hash bucket; occupied buckets hold a 7-bit H2 hash tag in
+/// `0x00..=0x7F`, so probes filter mismatches in L1 cache without touching entries.
+const EMPTY: u8 = 0x80;
+
+#[inline]
+fn h2(hash: u64) -> u8 {
+    (hash >> 57) as u8
+}
+
 pub struct Table<K, V, A: Allocator + Clone> {
-    slots: Vec<Option<(K, V)>, A>,
-    len: usize,
+    /// One byte per bucket: `EMPTY` or the 7-bit H2 fingerprint of the occupant's hash.
+    ctrl: Vec<u8, A>,
+    /// Bucket-to-entry index into `entries` (valid where `ctrl[i] != EMPTY`).
+    indices: Vec<u32, A>,
+    /// Densely packed live `(K, V)` entries (zero `Option` discriminant or empty-slot waste).
+    entries: Vec<(K, V), A>,
     alloc: A,
     ops: Cell<u64>,
 }
 
 impl<K: Hashed, V, A: Allocator + Clone> Table<K, V, A> {
     pub fn new_in(alloc: A) -> Table<K, V, A> {
-        Table { slots: Vec::new_in(alloc.clone()), len: 0, alloc, ops: Cell::new(0) }
+        Table {
+            ctrl: Vec::new_in(alloc.clone()),
+            indices: Vec::new_in(alloc.clone()),
+            entries: Vec::new_in(alloc.clone()),
+            alloc,
+            ops: Cell::new(0),
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.len
+        self.entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.entries.is_empty()
     }
 
     /// Probes made so far, growth included.
@@ -86,38 +105,47 @@ impl<K: Hashed, V, A: Allocator + Clone> Table<K, V, A> {
     }
 
     fn mask(&self) -> usize {
-        self.slots.len() - 1
+        self.ctrl.len() - 1
     }
 
-    /// The key's slot, or the empty slot it would go in. The table is never full (load at most
-    /// a half), so the probe ends.
+    /// The key's bucket, or the empty bucket it would go in. The table stays at or below 75% load,
+    /// so every probe terminates.
     fn find(&self, key: &K) -> Result<usize, usize> {
+        let h = key.hash();
+        let tag = h2(h);
         let mask = self.mask();
-        let mut at = key.hash() as usize & mask;
+        let mut at = h as usize & mask;
         loop {
             self.tick();
-            match &self.slots[at] {
-                Some((held, _)) if held == key => return Ok(at),
-                Some(_) => at = (at + 1) & mask,
-                None => return Err(at),
+            let c = self.ctrl[at];
+            if c == EMPTY {
+                return Err(at);
             }
+            if c == tag {
+                let idx = self.indices[at] as usize;
+                if self.entries[idx].0 == *key {
+                    return Ok(at);
+                }
+            }
+            at = (at + 1) & mask;
         }
     }
 
     pub fn get(&self, key: &K) -> Option<&V> {
-        if self.len == 0 {
+        if self.entries.is_empty() {
             return None;
         }
         let at = self.find(key).ok()?;
-        self.slots[at].as_ref().map(|(_, value)| value)
+        Some(&self.entries[self.indices[at] as usize].1)
     }
 
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
-        if self.len == 0 {
+        if self.entries.is_empty() {
             return None;
         }
         let at = self.find(key).ok()?;
-        self.slots[at].as_mut().map(|(_, value)| value)
+        let idx = self.indices[at] as usize;
+        Some(&mut self.entries[idx].1)
     }
 
     pub fn contains_key(&self, key: &K) -> bool {
@@ -125,63 +153,101 @@ impl<K: Hashed, V, A: Allocator + Clone> Table<K, V, A> {
     }
 
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        if (self.len + 1) * 2 > self.slots.len() {
+        // 75% load factor (`(len + 1) / cap > 3 / 4`).
+        if (self.entries.len() + 1) * 4 > self.ctrl.len() * 3 {
             self.grow();
         }
         match self.find(&key) {
-            Ok(at) => self.slots[at].as_mut().map(|(_, held)| core::mem::replace(held, value)),
+            Ok(at) => {
+                let idx = self.indices[at] as usize;
+                Some(core::mem::replace(&mut self.entries[idx].1, value))
+            }
             Err(at) => {
-                self.slots[at] = Some((key, value));
-                self.len += 1;
+                let idx = u32::try_from(self.entries.len()).expect("table exceeds u32::MAX entries");
+                self.ctrl[at] = h2(key.hash());
+                self.indices[at] = idx;
+                self.entries.push((key, value));
                 None
             }
         }
     }
 
     fn grow(&mut self) {
-        let size = (self.slots.len() * 2).max(16);
-        let mut slots = Vec::with_capacity_in(size, self.alloc.clone());
-        for _ in 0..size {
-            slots.push(None);
-        }
-        let old = core::mem::replace(&mut self.slots, slots);
-        for (key, value) in old.into_iter().flatten() {
-            if let Err(at) = self.find(&key) {
-                self.slots[at] = Some((key, value));
+        let size = (self.ctrl.len() * 2).max(16);
+        let mut ctrl = Vec::with_capacity_in(size, self.alloc.clone());
+        ctrl.resize(size, EMPTY);
+        let mut indices = Vec::with_capacity_in(size, self.alloc.clone());
+        indices.resize(size, 0);
+        let mask = size - 1;
+        // Re-index existing entries in place without moving any `(K, V)` values.
+        for (idx, (key, _)) in self.entries.iter().enumerate() {
+            let h = key.hash();
+            let mut at = h as usize & mask;
+            loop {
+                self.tick();
+                if ctrl[at] == EMPTY {
+                    ctrl[at] = h2(h);
+                    indices[at] = idx as u32;
+                    break;
+                }
+                at = (at + 1) & mask;
             }
         }
+        self.ctrl = ctrl;
+        self.indices = indices;
     }
 
     pub fn remove(&mut self, key: &K) -> Option<V> {
-        if self.len == 0 {
+        if self.entries.is_empty() {
             return None;
         }
         let at = self.find(key).ok()?;
-        let (_, value) = self.slots[at].take()?;
-        self.len -= 1;
-        // Backward shift: each later entry of the run moves into the hole unless its home lies
-        // after the hole (cyclically), so every probe chain stays unbroken.
+        let removed_idx = self.indices[at] as usize;
+        // Backward shift over the compact ctrl/index arrays: each later bucket of the run moves
+        // into the hole unless its home lies after the hole (cyclically), keeping probe chains
+        // unbroken with no tombstones and without moving `(K, V)` payloads.
         let mask = self.mask();
         let mut hole = at;
         let mut next = (at + 1) & mask;
         loop {
             self.tick();
-            let home = match &self.slots[next] {
-                Some((held, _)) => held.hash() as usize & mask,
-                None => break,
-            };
+            let c = self.ctrl[next];
+            if c == EMPTY {
+                break;
+            }
+            let idx = self.indices[next] as usize;
+            let home = self.entries[idx].0.hash() as usize & mask;
             if (next.wrapping_sub(home) & mask) >= (next.wrapping_sub(hole) & mask) {
-                self.slots[hole] = self.slots[next].take();
+                self.ctrl[hole] = c;
+                self.indices[hole] = idx as u32;
                 hole = next;
             }
             next = (next + 1) & mask;
+        }
+        self.ctrl[hole] = EMPTY;
+
+        let (_, value) = self.entries.remove_swap(removed_idx);
+        if removed_idx < self.entries.len() {
+            // The former last entry moved into `removed_idx`: patch its bucket index in place.
+            let old_idx = self.entries.len() as u32;
+            let h = self.entries[removed_idx].0.hash();
+            let tag = h2(h);
+            let mut probe = h as usize & mask;
+            loop {
+                self.tick();
+                if self.ctrl[probe] == tag && self.indices[probe] == old_idx {
+                    self.indices[probe] = removed_idx as u32;
+                    break;
+                }
+                probe = (probe + 1) & mask;
+            }
         }
         Some(value)
     }
 
     /// In slot order: callers that print, write or hash sort first.
     pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> + '_ {
-        self.slots.iter().filter_map(|slot| slot.as_ref().map(|(key, value)| (key, value)))
+        self.entries.iter().map(|(key, value)| (key, value))
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &K> + '_ {
@@ -194,9 +260,9 @@ impl<K: Hashed, V, A: Allocator + Clone> Table<K, V, A> {
 
     /// Every entry, the table left empty.
     pub fn take_all(&mut self) -> impl Iterator<Item = (K, V)> + use<K, V, A> {
-        let slots = core::mem::replace(&mut self.slots, Vec::new_in(self.alloc.clone()));
-        self.len = 0;
-        slots.into_iter().flatten()
+        self.ctrl = Vec::new_in(self.alloc.clone());
+        self.indices = Vec::new_in(self.alloc.clone());
+        core::mem::replace(&mut self.entries, Vec::new_in(self.alloc.clone())).into_iter()
     }
 }
 
@@ -280,5 +346,27 @@ mod tests {
                 false => Err(Broke::Oracle(format!("len {} against {}", table.len(), model.len()))),
             }
         });
+    }
+
+    #[test]
+    fn compact_table_respects_75_percent_load_and_take_all() {
+        let mut table: Table<u64, u64, Global> = Table::new_in(Global);
+        // 12 entries fit in a 16-bucket table at 75% load factor without growing to 32.
+        for i in 0..12u64 {
+            assert_eq!(table.insert(i, i * 10), None);
+        }
+        assert_eq!(table.ctrl.len(), 16, "12 entries fit at 75% load factor");
+        assert_eq!(table.len(), 12);
+        // 13th entry grows to 32.
+        assert_eq!(table.insert(12, 120), None);
+        assert_eq!(table.ctrl.len(), 32);
+        for i in 0..13u64 {
+            assert_eq!(table.get(&i), Some(&(i * 10)));
+        }
+        let mut drained: std::vec::Vec<(u64, u64)> = table.take_all().collect();
+        drained.sort_unstable();
+        assert_eq!(drained.len(), 13);
+        assert!(table.is_empty());
+        assert_eq!(table.get(&0), None);
     }
 }

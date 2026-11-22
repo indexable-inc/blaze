@@ -21,6 +21,7 @@ pub enum NodeKind {
     Torus,
     Ellipsoid,
     Superellipsoid,
+    Gyroid,
     Profile,
     Extrude,
     Revolve,
@@ -63,6 +64,7 @@ impl NodeKind {
             NodeKind::Torus => "torus",
             NodeKind::Ellipsoid => "ellipsoid",
             NodeKind::Superellipsoid => "superellipsoid",
+            NodeKind::Gyroid => "gyroid",
             NodeKind::Profile => "profile",
             NodeKind::Extrude => "extrude",
             NodeKind::Revolve => "revolve",
@@ -364,6 +366,8 @@ impl core::error::Error for DecodeError {}
 pub enum EvalError {
     /// The coordinate and output slices differ in length.
     Lengths { x: u64, y: u64, z: u64, out: u64 },
+    /// The coordinate, value, and gradient slices differ in length.
+    GradLengths { x: u64, y: u64, z: u64, vals: u64, grads: u64 },
 }
 
 impl Show for EvalError {
@@ -372,6 +376,11 @@ impl Show for EvalError {
             EvalError::Lengths { x, y, z, out: o } => {
                 out.str("eval_points: x has ").int(*x).str(" values, y ").int(*y).str(", z ").int(*z).str(" and out ").int(*o);
                 out.str("; all four must be equal");
+            }
+            EvalError::GradLengths { x, y, z, vals, grads } => {
+                out.str("eval_grads: x has ").int(*x).str(" values, y ").int(*y).str(", z ").int(*z);
+                out.str(", vals ").int(*vals).str(" and grads ").int(*grads);
+                out.str("; all five must be equal");
             }
         }
     }

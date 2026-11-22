@@ -162,3 +162,45 @@ fn the_oracle_catches_a_stale_entry() {
     refines(&ops, Resident::new(CAP)).unwrap();
     assert!(refines(&ops, KeepsDropped(Resident::new(CAP))).is_err(), "the oracle missed a stale entry");
 }
+
+/// Selective unsealed-first eviction in `Resident::new_selective`: when `cap_bytes` is hit,
+/// evicts the largest/oldest unsealed arena first while preserving sealed arenas, and refuses
+/// oversized single records without wiping warm arenas.
+#[test]
+fn resident_selective_eviction_preserves_sealed_arenas() {
+    let mut resident = Resident::new_selective(1024);
+    proof::scope(|snap| {
+        // Arena 0: sealed warm dependency.
+        keep_as::<Body>(&mut resident, snap, 0, 0, &[1u8; 64]);
+        resident.seal_arena(0);
+        assert!(resident.is_sealed(0));
+
+        // Arena 1: unsealed, largest.
+        keep_as::<Body>(&mut resident, snap, 1, 1, &[2u8; 400]);
+
+        // Arena 2: unsealed, small.
+        keep_as::<Body>(&mut resident, snap, 2, 2, &[3u8; 40]);
+
+        let before_sealed = resident.get::<Body>(0, &key::<Body>(0)).expect("sealed present").to_vec();
+        assert!(resident.get::<Body>(1, &key::<Body>(1)).is_some(), "arena 1 present before eviction");
+
+        // Inserting into arena 2 pushes total past 1024: arena 1 (largest unsealed) is evicted
+        // first, while sealed arena 0 remains intact!
+        keep_as::<Body>(&mut resident, snap, 2, 3, &[4u8; 320]);
+        assert!(resident.resident_bytes() <= 1024, "stayed under cap: {}", resident.resident_bytes());
+        assert_eq!(
+            resident.get::<Body>(0, &key::<Body>(0)),
+            Some(before_sealed.as_slice()),
+            "sealed arena 0 preserved during selective eviction"
+        );
+        assert!(resident.get::<Body>(1, &key::<Body>(1)).is_none(), "largest unsealed arena 1 evicted");
+
+        // Oversized single record (> cap_bytes) must NOT wipe warm arenas.
+        keep_as::<Body>(&mut resident, snap, 2, 4, &[5u8; 1200]);
+        assert_eq!(
+            resident.get::<Body>(0, &key::<Body>(0)),
+            Some(before_sealed.as_slice()),
+            "oversized record left sealed arena 0 untouched"
+        );
+    });
+}

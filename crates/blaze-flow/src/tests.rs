@@ -1017,3 +1017,254 @@ fn signature_control_missing_relation_taken_as_known() {
     assert_eq!(tiers_with(&pick_flow().0, Plant::AllKnown), (TierOne::Accepted, Vec::new()));
     assert_eq!(tiers_with(&implied_bound_flow(true).0, Plant::AllKnown), (TierOne::Accepted, Vec::new()));
 }
+
+// ---------------------------------------------------------------- builder, equivalence & stress
+
+#[test]
+fn flow_builder_interning_and_mentions_sorting() {
+    use crate::flow::PlaceMark;
+
+    let mut b = FlowBuilder::new_in(4, 2, Global);
+    let extra = b.add_local();
+    assert_eq!(extra, Local(4));
+    let p_extra = b.local(4);
+
+    // Wide children + deep nesting + repeated lookups keep first id and mark.
+    let f0 = b.project_in(Place(1), Proj::Field(0), PlaceMark::DropField);
+    let f1 = b.project_in(Place(1), Proj::Field(1), PlaceMark::SliceElement);
+    let f2 = b.project_in(Place(1), Proj::Field(2), PlaceMark::None);
+    let f0_sub = b.project_in(f0, Proj::Field(0), PlaceMark::None);
+    let e0 = b.project_in(p_extra, Proj::Index, PlaceMark::SliceElement);
+
+    assert_eq!(b.project_in(Place(1), Proj::Field(0), PlaceMark::None), f0);
+    assert_eq!(b.project_in(Place(1), Proj::Field(1), PlaceMark::DropField), f1);
+    assert_eq!(b.project_in(Place(1), Proj::Field(2), PlaceMark::None), f2);
+    assert_eq!(b.project_in(f0, Proj::Field(0), PlaceMark::DropField), f0_sub);
+    assert_eq!(b.project_in(p_extra, Proj::Index, PlaceMark::None), e0);
+
+    let o0 = b.origin(false);
+    let o1 = b.origin(false);
+    let o2 = b.origin(true);
+    // Out-of-order + consecutive and non-consecutive duplicates.
+    b.mentions(3, o2);
+    b.mentions(3, o2);
+    b.mentions(1, o1);
+    b.mentions(1, o0);
+    b.mentions(3, o0);
+    b.mentions(1, o1);
+    b.mentions(4, o2);
+
+    let bb = b.block();
+    b.start(bb);
+    b.assign(Place(0), Operand::Const, S);
+    b.ret(S);
+    let flow = finish(b);
+
+    assert!(flow.place(f0).of_drop_type && !flow.place(f0).of_slice);
+    assert!(flow.place(f1).of_slice && !flow.place(f1).of_drop_type);
+    assert!(flow.place(e0).of_slice && !flow.place(e0).of_drop_type);
+    assert_eq!(
+        flow.local_origins.as_slice(),
+        &[(Local(1), o0), (Local(1), o1), (Local(3), o0), (Local(3), o2), (Local(4), o2)]
+    );
+}
+
+#[test]
+fn placeholder_transitive_known_and_unproven_tier_one() {
+    // Three placeholders 'a, 'b, 'c with transitive known 'a: 'b and 'b: 'c (through a chain).
+    let build = |add_unproven: bool| -> (Flow<Global>, Origin, Origin) {
+        let mut b = FlowBuilder::new_in(4, 3, Global);
+        let oa = b.origin(true);
+        let ob = b.origin(true);
+        let oc = b.origin(true);
+        let mid1 = b.origin(false);
+        let mid2 = b.origin(false);
+        b.known(oa, ob);
+        b.known(ob, oc);
+        b.mentions(0, oc);
+        b.mentions(1, oa);
+        b.mentions(2, ob);
+        b.mentions(3, oc);
+        let bb = b.block();
+        b.start(bb);
+        b.assign(Place(0), Operand::Copy(Place(1)), S);
+        // Transitive subset path oa -> mid1 -> mid2 -> oc is proven by oa: ob: oc.
+        b.subset(oa, mid1);
+        b.subset(mid1, mid2);
+        b.subset(mid2, oc);
+        if add_unproven {
+            // Unproven reverse path oc -> mid1 -> oa.
+            b.subset(oc, mid1);
+            b.subset(mid1, oa);
+        }
+        b.ret(S);
+        (finish(b), oc, oa)
+    };
+
+    let (ok_flow, _, _) = build(false);
+    assert_eq!(tiers(&ok_flow), (TierOne::Accepted, Vec::new()));
+    let (ignored_one, ignored_two) = tiers_with(&ok_flow, Plant::KnownIgnored);
+    assert_eq!(ignored_one, TierOne::Refused);
+    assert!(!ignored_two.is_empty());
+
+    let (bad_flow, oc, oa) = build(true);
+    let (bad_one, bad_two) = tiers(&bad_flow);
+    assert_eq!(bad_one, TierOne::Refused);
+    assert!(
+        bad_two.iter().any(|f| matches!(*f, BorrowFinding::UnprovenOutlives { from, into, .. } if from == oc && into == oa)),
+        "expected UnprovenOutlives({oc} -> {oa}), got {bad_two:?}"
+    );
+    assert_eq!(tiers_with(&bad_flow, Plant::AllKnown), (TierOne::Accepted, Vec::new()));
+}
+
+/// Stress & equivalence test: exercises large place trees (`FlowBuilder::project_in`,
+/// `PlaceSubtrees`), out-of-order `mentions`, multi-block diamonds + loops (`moves::inits`,
+/// `loans::facts` liveness & activation), and `loans::tier_one` (CSR `close`, `loans_by_local`,
+/// transposed `contains_t`, and guarded placeholder DFS).
+#[test]
+fn large_flow_stress_and_equivalence() {
+    use std::time::Instant;
+
+    let t0 = Instant::now();
+    // Build a flow with 600 locals, ~2400 places, 600 origins, 400 loans, ~2500 statements across
+    // 200 blocks (diamonds + a loop back-edge + drops + two-phase borrows).
+    let n_groups: u32 = 200;
+    let locals: u32 = 1 + n_groups * 3; // _0 return, plus (val, ref_tmp, scratch) per group
+    let args: u32 = n_groups; // _1..=n_groups are args
+    let mut b = FlowBuilder::new_in(locals, args, Global);
+
+    // Project 3 nested levels on every group's value local (200 * 9 = 1800 extra places),
+    // and re-project every field once to exercise interning hits.
+    let mut f0 = Vec::with_capacity(n_groups as usize);
+    let mut f1 = Vec::with_capacity(n_groups as usize);
+    let mut f0_0 = Vec::with_capacity(n_groups as usize);
+    for g in 0..n_groups {
+        let base = Place(1 + g);
+        let p0 = b.project(base, Proj::Field(0));
+        let p1 = b.project(base, Proj::Field(1));
+        let p2 = b.project(base, Proj::Field(2));
+        let p00 = b.project(p0, Proj::Field(0));
+        let p01 = b.project(p0, Proj::Field(1));
+        let _p10 = b.project(p1, Proj::Field(0));
+        let _p11 = b.project(p1, Proj::Field(1));
+        let _p20 = b.project(p2, Proj::Field(0));
+        let _p000 = b.project(p00, Proj::Field(0));
+        // Re-lookup existing children: must return exact same ids.
+        assert_eq!(b.project(base, Proj::Field(0)), p0);
+        assert_eq!(b.project(base, Proj::Field(1)), p1);
+        assert_eq!(b.project(p0, Proj::Field(0)), p00);
+        assert_eq!(b.project(p0, Proj::Field(1)), p01);
+        f0.push(p0);
+        f1.push(p1);
+        f0_0.push(p00);
+    }
+
+    // Create 600 origins (including 2 placeholders with a known bound and a bridge) and out-of-order mentions.
+    let ph_a = b.origin(true);
+    let ph_b = b.origin(true);
+    let ph_bridge = b.origin(false);
+    b.known(ph_a, ph_b);
+    let mut origins = Vec::with_capacity((n_groups * 3) as usize);
+    for _ in 0..(n_groups * 3) {
+        origins.push(b.origin(false));
+    }
+    for g in (0..n_groups).rev() {
+        let ref_local = 1 + n_groups + g;
+        let scratch_local = 1 + 2 * n_groups + g;
+        b.mentions(ref_local, origins[(g * 3) as usize]);
+        b.mentions(scratch_local, origins[(g * 3 + 1) as usize]);
+        b.mentions(ref_local, origins[(g * 3) as usize]); // duplicate
+    }
+    b.mentions(0, ph_b);
+
+    // Reserve blocks: entry + 200 diamond/chain groups (2 blocks each) + exit.
+    let entry = b.block();
+    let mut left_bbs = Vec::with_capacity(n_groups as usize);
+    let mut join_bbs = Vec::with_capacity(n_groups as usize);
+    for _ in 0..n_groups {
+        left_bbs.push(b.block());
+        join_bbs.push(b.block());
+    }
+    let exit_bb = b.block();
+
+    b.start(entry);
+    b.assign(Place(0), Operand::Const, S);
+    b.subset(ph_a, ph_bridge);
+    b.subset(ph_bridge, ph_b);
+    b.goto(join_bbs[0], S);
+
+    let mut drop_stmts = Vec::with_capacity(n_groups as usize);
+    for g in 0..n_groups as usize {
+        let val = Place(1 + g as u32);
+        let ref_p = Place(1 + n_groups + g as u32);
+        let scr_p = Place(1 + 2 * n_groups + g as u32);
+        let o0 = origins[g * 3];
+        let o1 = origins[g * 3 + 1];
+        let o2 = origins[g * 3 + 2];
+
+        b.start(join_bbs[g]);
+        // Shared borrow -> subset -> call into scr_p -> call consumes scr_p (both dead afterwards).
+        b.borrow(ref_p, BorrowKind::Shared, f0[g], o0, S);
+        b.subset(o0, o1);
+        b.call(&[Operand::Move(ref_p)], scr_p, S);
+        b.call(&[Operand::Move(scr_p)], Place(0), S);
+        // Two-phase borrow -> activate -> call consumes ref_p (dead afterwards).
+        let tp = b.borrow(ref_p, BorrowKind::TwoPhase, f1[g], o2, S);
+        b.stmt(StmtKind::Activate(tp), S);
+        b.call(&[Operand::Move(ref_p)], Place(0), S);
+        // Move f0_0 on all paths, then drop val (DropKind::Open) and branch to left_bbs[g] or next.
+        b.assign(Place(0), Operand::Move(f0_0[g]), S);
+        let drop_s = b.stmt(StmtKind::Drop(val), S);
+        drop_stmts.push((drop_s, val));
+        let next = if g + 1 < n_groups as usize { join_bbs[g + 1] } else { exit_bb };
+        b.switch(Place(0), &[left_bbs[g], next], S);
+
+        b.start(left_bbs[g]);
+        // Re-init val and jump to next (or back-edge on g == 10 to exercise loop convergence).
+        b.assign(val, Operand::Const, S);
+        let target = if g == 10 { join_bbs[10] } else { next };
+        b.goto(target, S);
+    }
+
+    b.start(exit_bb);
+    b.ret(S);
+
+    let flow = finish(b);
+    assert!(flow.places.len() >= 2400);
+    assert!(flow.stmts.len() >= 2000);
+    assert_eq!(flow.loans.len(), (n_groups * 2) as usize);
+
+    let rec = check_body(&flow, Global).expect("large stress flow converges");
+    assert!(rec.moves.is_empty(), "expected no move findings, got {:?}", &rec.moves[..rec.moves.len().min(5)]);
+    assert!(rec.borrows.is_empty(), "expected no borrow findings, got {:?}", &rec.borrows[..rec.borrows.len().min(5)]);
+    assert_eq!(rec.proof.map(|p| p.tier()), Some(1), "clean large flow should be accepted by tier one");
+
+    // Verify drop_kind & drop_may_run match brute-force `is_prefix` check on all 200 drops.
+    let st = inits(&flow, Plant::None, Global).expect("inits converges");
+    for &(s, p) in &drop_stmts {
+        let got_kind = drop_kind(&flow, &st, s, p);
+        let got_may_run = st.drop_may_run(&flow, s, p);
+        let brute_may_run = st.reached[s.index()]
+            && (0..flow.places.len()).any(|q| flow.is_prefix(p, Place(q as u32)) && st.init.get(s.index(), q));
+        let brute_part_moved = (0..flow.places.len()).any(|q| {
+            let q = Place(q as u32);
+            q != p && flow.is_prefix(p, q) && st.uninit.get(s.index(), q.index())
+        });
+        let brute_kind = match (st.init.get(s.index(), p.index()), st.uninit.get(s.index(), p.index())) {
+            (false, _) => DropKind::Nothing,
+            (true, true) => DropKind::Flag,
+            (true, false) if brute_part_moved => DropKind::Open,
+            (true, false) => DropKind::Static,
+        };
+        assert_eq!(got_may_run, brute_may_run);
+        assert_eq!(got_kind, brute_kind);
+    }
+    let elapsed = t0.elapsed();
+    std::println!(
+        "large_flow_stress: places={} stmts={} loans={} origins={} elapsed={elapsed:?}",
+        flow.places.len(),
+        flow.stmts.len(),
+        flow.loans.len(),
+        flow.origins,
+    );
+}

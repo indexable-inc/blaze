@@ -938,10 +938,20 @@ impl<'a> Responses<'a> {
             return Ok(r);
         }
         let row = self.row(r);
-        let (pool_words, start) = if r.is_cached() { (&self.cached.words, row.start) } else { (&self.scratch.words, row.start) };
-        let mut tmp: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(row.len as usize, *pool_words.allocator());
-        tmp.extend_from_slice(&pool_words[start as usize..(start + row.len) as usize]);
-        self.push(false, &tmp, row.certainty, via)
+        let id = crate::error::row(self.scratch.rows.len())?;
+        let start = crate::error::row(self.scratch.words.len())?;
+        let (s, e) = (row.start as usize, (row.start + row.len) as usize);
+        if r.is_cached() {
+            self.scratch.words.extend_from_slice(&self.cached.words[s..e]);
+        } else {
+            self.scratch.words.reserve(row.len as usize);
+            for k in s..e {
+                let w = self.scratch.words[k];
+                self.scratch.words.push(w);
+            }
+        }
+        self.scratch.rows.push(Row { start, len: row.len, certainty: row.certainty, via, identity: row.identity });
+        Ok(RespId(id))
     }
 
     /// Copies `r` into the cached pool (a frame's final answer).
@@ -953,11 +963,7 @@ impl<'a> Responses<'a> {
         let start = crate::error::row(self.cached.words.len())?;
         let id = crate::error::row(self.cached.rows.len())?;
         let (s, e) = (row.start as usize, (row.start + row.len) as usize);
-        // The scratch words are copied word by word: the pools are distinct vectors.
-        for k in s..e {
-            let w = self.scratch.words[k];
-            self.cached.words.push(w);
-        }
+        self.cached.words.extend_from_slice(&self.scratch.words[s..e]);
         self.cached.rows.push(Row { start, ..row });
         Ok(RespId(id | RespId::CACHED))
     }
@@ -1009,9 +1015,7 @@ impl<'a> Responses<'a> {
         if identity {
             return self.push(false, &[IDENTITY, 0], certainty, via);
         }
-        let mut words: Vec<u32, Alloc<'_>> = Vec::with_capacity_in(tmp.len(), *tmp.allocator());
-        words.extend_from_slice(tmp);
-        self.push(false, &words, certainty, via)
+        self.push(false, tmp, certainty, via)
     }
 
     /// Applies `r` in the caller: each original value `orig[i]` is related with the response's

@@ -411,3 +411,24 @@ fn a_slot_offset_by_a_value_or_read_across_types_stays() {
     let after = run_in(out.view(), &args, FUEL, Global).expect("the output runs");
     assert_eq!(before, after, "the same run");
 }
+
+/// A function with no slots takes the early-return fast path and keeps its exact semantics.
+#[test]
+fn a_function_with_no_slots_takes_the_fast_path() {
+    let mut b = Builder::<Global, Full>::new_in(64, Global);
+    signature(&mut b);
+    let entry = b.create_block(BlockKind::Normal);
+    b.begin(entry);
+    let (x, y) = (b.param(Ty::I64), b.param(Ty::I64));
+    let sum = b.binary(Op::Add, Flags::NONE, x, y);
+    b.ret(&[sum]);
+    let func = b.finish_checked().expect("the function builds");
+    let out = scalar_replace(func.view(), Global).expect("the pass takes a verified function");
+    verify(out.view()).expect("the output verifies");
+    assert_eq!(out.slots.len(), 0);
+    let args = [Val::Int(19), Val::Int(23)];
+    assert_eq!(
+        run_in(out.view(), &args, FUEL, Global).expect("the output runs"),
+        Outcome::<Global>::Returned(vec![Val::Int(42)])
+    );
+}

@@ -92,6 +92,9 @@ pub struct Memory<A: Allocator + Clone> {
     /// [`Memory::reset`] with their room, so storing a pointer allocates nothing once warm.
     relocs: Vec<Vec<(u64, AllocId), A>, A>,
     heap: Vec<u8, A>,
+    /// Logical end of the heap (`0..heap_len` is active); `heap.len()` is the high-water mark so
+    /// recycled regions never zero-fill `heap` again (unwritten reads are guarded by `init`).
+    heap_len: usize,
     /// One bit per heap byte: written or not.
     init: Vec<u64, A>,
     /// The allocations with a region, in heap order.
@@ -110,6 +113,7 @@ impl<A: Allocator + Clone> Memory<A> {
             allocs: Vec::new_in(alloc.clone()),
             relocs: Vec::new_in(alloc.clone()),
             heap: Vec::new_in(alloc.clone()),
+            heap_len: 0,
             init: Vec::new_in(alloc.clone()),
             regions: Vec::new_in(alloc.clone()),
             scratch: Vec::new_in(alloc.clone()),
@@ -126,8 +130,7 @@ impl<A: Allocator + Clone> Memory<A> {
             r.clear();
         }
         self.allocs.clear();
-        self.heap.clear();
-        self.init.clear();
+        self.heap_len = 0;
         self.regions.clear();
         self.scratch.clear();
         self.live_bytes = 0;
@@ -139,12 +142,28 @@ impl<A: Allocator + Clone> Memory<A> {
         self.live_bytes
     }
 
+    #[inline]
     fn is_init(&self, i: u64) -> bool {
         self.init.get((i / 64) as usize).is_some_and(|w| w >> (i % 64) & 1 == 1)
     }
 
-    /// Whether every heap byte of `from..to` is written: a word at a time.
+    /// Whether every heap byte of `from..to` is written: single-word fast path, then word by word.
+    #[inline]
     fn all_init(&self, from: u64, to: u64) -> bool {
+        if from == to {
+            return true;
+        }
+        let w0 = (from / 64) as usize;
+        let b0 = from % 64;
+        let n = to - from;
+        if b0 + n <= 64 {
+            let m = if n == 64 { u64::MAX } else { ((1u64 << n) - 1) << b0 };
+            return self.init.get(w0).is_some_and(|&x| x & m == m);
+        }
+        self.all_init_slow(from, to)
+    }
+
+    fn all_init_slow(&self, from: u64, to: u64) -> bool {
         let mut i = from;
         while i < to {
             let (w, b) = ((i / 64) as usize, i % 64);
@@ -184,7 +203,27 @@ impl<A: Allocator + Clone> Memory<A> {
     }
 
     /// Marks heap bytes `from..to` written (`on`) or not.
+    #[inline]
     fn set_init(&mut self, from: u64, to: u64, on: bool) {
+        if from == to {
+            return;
+        }
+        let w0 = (from / 64) as usize;
+        let b0 = from % 64;
+        let n = to - from;
+        if b0 + n <= 64 {
+            let m = if n == 64 { u64::MAX } else { ((1u64 << n) - 1) << b0 };
+            if on {
+                self.init[w0] |= m;
+            } else {
+                self.init[w0] &= !m;
+            }
+            return;
+        }
+        self.set_init_slow(from, to, on);
+    }
+
+    fn set_init_slow(&mut self, from: u64, to: u64, on: bool) {
         let mut i = from;
         while i < to {
             let (w, b) = ((i / 64) as usize, i % 64);
@@ -199,16 +238,19 @@ impl<A: Allocator + Clone> Memory<A> {
         }
     }
 
-    /// A fresh region of `size` bytes at the heap's end, none written.
+    /// A fresh region of `size` bytes at the heap's logical end, none written.
     fn region(&mut self, size: u64) -> Result<u64, Refusal<'static>> {
-        let start = self.heap.len() as u64;
+        let start = self.heap_len as u64;
         let end = start.checked_add(size).and_then(|e| usize::try_from(e).ok()).ok_or(Refusal::MemoryLimit { limit: self.limit })?;
-        self.heap.resize(end, 0u8);
+        if end > self.heap.len() {
+            self.heap.resize(end, 0u8);
+        }
         let words = end.div_ceil(64);
         if self.init.len() < words {
             self.init.resize(words, 0u64);
         }
         self.set_init(start, end as u64, false);
+        self.heap_len = end;
         Ok(start)
     }
 
@@ -218,7 +260,10 @@ impl<A: Allocator + Clone> Memory<A> {
         if live > self.limit {
             return Err(Refusal::MemoryLimit { limit: self.limit });
         }
-        let id = AllocId(u32::try_from(self.allocs.len()).map_err(|_| Refusal::MemoryLimit { limit: self.limit })?);
+        if self.allocs.len() >= u32::MAX as usize {
+            return Err(Refusal::MemoryLimit { limit: self.limit });
+        }
+        let id = AllocId(self.allocs.len() as u32);
         let start = self.region(size)?;
         self.allocs.push(Allocation { start, len: size, align_log2, mutable, live: true, origin, loaded: true });
         if self.relocs.len() < self.allocs.len() {
@@ -230,7 +275,7 @@ impl<A: Allocator + Clone> Memory<A> {
     }
 
     /// Ends an allocation: later uses of a pointer into it are `Dangling`. Dead regions at the
-    /// heap's end go back to it.
+    /// heap's end go back to it without shrinking or zeroing the backing buffer.
     pub fn kill(&mut self, id: AllocId) {
         if let Some(a) = self.allocs.get_mut(id.0 as usize) {
             if a.live {
@@ -244,7 +289,7 @@ impl<A: Allocator + Clone> Memory<A> {
             if a.live {
                 break;
             }
-            self.heap.truncate(a.start as usize);
+            self.heap_len = a.start as usize;
             self.regions.pop();
         }
     }
@@ -297,36 +342,66 @@ impl<A: Allocator + Clone> Memory<A> {
             let first = (p.offset..end).find(|&i| !self.is_init(a.start + i)).unwrap_or(p.offset);
             return Err(Refusal::Uninit { offset: first });
         }
+        let r = &self.relocs[p.alloc.0 as usize];
         let mut ptr = None;
-        for &(at, target) in self.relocs[p.alloc.0 as usize].iter() {
-            if at + PTR <= p.offset || at >= end {
-                continue;
-            }
-            if at == p.offset && size == PTR {
-                ptr = Some(target);
-            } else {
-                return Err(Refusal::PartialPointer { offset: at });
+        if !r.is_empty() {
+            let lo = r.partition_point(|&(at, _)| at.saturating_add(PTR) <= p.offset);
+            if let Some(&(at, target)) = r.get(lo) {
+                if at < end {
+                    if at == p.offset && size == PTR && r.get(lo + 1).is_none_or(|&(at2, _)| at2 >= end) {
+                        ptr = Some(target);
+                    } else {
+                        return Err(Refusal::PartialPointer { offset: at });
+                    }
+                }
             }
         }
         let s = &self.heap[(a.start + p.offset) as usize..(a.start + end) as usize];
         // The scalar sizes as fixed-size loads; any other size byte by byte.
-        let bits = if let Ok(w) = <[u8; 8]>::try_from(s) {
-            u128::from(u64::from_le_bytes(w))
-        } else if let Ok(w) = <[u8; 4]>::try_from(s) {
-            u128::from(u32::from_le_bytes(w))
-        } else if let Ok(w) = <[u8; 16]>::try_from(s) {
-            u128::from_le_bytes(w)
-        } else {
-            let mut bits: u128 = 0;
-            for (k, &b) in s.iter().enumerate() {
-                bits |= u128::from(b) << (8 * k);
+        let bits = match size {
+            1 => u128::from(s[0]),
+            2 => u128::from(u16::from_le_bytes([s[0], s[1]])),
+            4 => u128::from(u32::from_le_bytes([s[0], s[1], s[2], s[3]])),
+            8 => u128::from(u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])),
+            16 => u128::from_le_bytes([
+                s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+                s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15],
+            ]),
+            _ => {
+                let mut bits: u128 = 0;
+                for (k, &b) in s.iter().enumerate() {
+                    bits |= u128::from(b) << (8 * k);
+                }
+                bits
             }
-            bits
         };
         Ok(match ptr {
             Some(alloc) => Scalar::Ptr(Pointer { alloc, offset: bits as u64 }),
             None => Scalar::Int(bits),
         })
+    }
+
+    /// Reads `size` initialized, provenance-free bytes at `p` directly as a slice (zero copy).
+    pub fn read_bytes(&self, p: Pointer, size: u64) -> Result<&[u8], Refusal<'static>> {
+        let a = self.checked(p, size)?;
+        if size == 0 {
+            return Ok(&[]);
+        }
+        let end = p.offset + size;
+        if !self.all_init(a.start + p.offset, a.start + end) {
+            let first = (p.offset..end).find(|&i| !self.is_init(a.start + i)).unwrap_or(p.offset);
+            return Err(Refusal::Uninit { offset: first });
+        }
+        let r = &self.relocs[p.alloc.0 as usize];
+        if !r.is_empty() {
+            let lo = r.partition_point(|&(at, _)| at.saturating_add(PTR) <= p.offset);
+            if let Some(&(at, _)) = r.get(lo) {
+                if at < end {
+                    return Err(Refusal::PartialPointer { offset: at });
+                }
+            }
+        }
+        Ok(&self.heap[(a.start + p.offset) as usize..(a.start + end) as usize])
     }
 
     /// The start of a writable allocation's region, `size` bytes at `p` checked.
@@ -341,22 +416,37 @@ impl<A: Allocator + Clone> Memory<A> {
     /// Writes scalar `v` in `size` bytes at `p`.
     pub fn write(&mut self, p: Pointer, size: u64, v: Scalar) -> Result<(), Refusal<'static>> {
         let start = self.writable(p, size)?;
-        let end = p.offset + size;
-        let r = &mut self.relocs[p.alloc.0 as usize];
-        if !r.is_empty() {
-            r.retain(|&(at, _)| at + PTR <= p.offset || at >= end);
-        }
         let bits = match v {
             Scalar::Int(b) => b,
             Scalar::Ptr(q) => {
                 if size != PTR {
                     return Err(Refusal::PointerAsInt);
                 }
-                let at = r.iter().position(|&(o, _)| o > p.offset).unwrap_or(r.len());
-                r.insert(at, (p.offset, q.alloc));
                 u128::from(q.offset)
             }
         };
+        let end = p.offset + size;
+        let r = &mut self.relocs[p.alloc.0 as usize];
+        match v {
+            Scalar::Int(_) => {
+                if !r.is_empty() {
+                    remove_relocs_in(r, p.offset, end);
+                }
+            }
+            Scalar::Ptr(q) => {
+                if r.is_empty() {
+                    r.push((p.offset, q.alloc));
+                } else {
+                    let lo = r.partition_point(|&(at, _)| at.saturating_add(PTR) <= p.offset);
+                    let hi = lo + r[lo..].partition_point(|&(at, _)| at < end);
+                    if lo + 1 == hi {
+                        r[lo] = (p.offset, q.alloc);
+                    } else {
+                        splice_relocs_shifted(r, lo, hi, &[(0, q.alloc)], p.offset);
+                    }
+                }
+            }
+        }
         let at = (start + p.offset) as usize;
         let b = bits.to_le_bytes();
         // The scalar sizes as fixed-size stores, not a `memcpy` call each.
@@ -380,7 +470,10 @@ impl<A: Allocator + Clone> Memory<A> {
         }
         let start = self.writable(p, size)?;
         let end = p.offset + size;
-        self.relocs[p.alloc.0 as usize].retain(|&(at, _)| at + PTR <= p.offset || at >= end);
+        let r = &mut self.relocs[p.alloc.0 as usize];
+        if !r.is_empty() {
+            remove_relocs_in(r, p.offset, end);
+        }
         self.set_init(start + p.offset, start + end, false);
         Ok(())
     }
@@ -392,32 +485,49 @@ impl<A: Allocator + Clone> Memory<A> {
         }
         let from = self.checked(src, size)?.start + src.offset;
         self.scratch.clear();
-        for &(at, t) in self.relocs[src.alloc.0 as usize].iter() {
-            if at >= src.offset && at + PTR <= src.offset + size {
-                self.scratch.push((at - src.offset, t));
-            } else if at + PTR > src.offset && at < src.offset + size {
-                return Err(Refusal::PartialPointer { offset: at });
+        let src_end = src.offset + size;
+        let src_r = &self.relocs[src.alloc.0 as usize];
+        if !src_r.is_empty() {
+            let lo = src_r.partition_point(|&(at, _)| at.saturating_add(PTR) <= src.offset);
+            for &(at, t) in &src_r[lo..] {
+                if at >= src_end {
+                    break;
+                }
+                if at >= src.offset && at + PTR <= src_end {
+                    self.scratch.push((at - src.offset, t));
+                } else {
+                    return Err(Refusal::PartialPointer { offset: at });
+                }
             }
         }
         let to = self.writable(dst, size)? + dst.offset;
-        self.heap.copy_within(from as usize..(from + size) as usize, to as usize);
-        // The written bits: whole runs when the source is all written, as nearly always.
-        if self.all_init(from, from + size) {
-            self.set_init(to, to + size, true);
-        } else {
-            for k in 0..size {
-                let on = self.is_init(from + k);
-                self.set_init(to + k, to + k + 1, on);
+        if from != to {
+            self.heap.copy_within(from as usize..(from + size) as usize, to as usize);
+            // The written bits: whole runs when the source is all written, as nearly always;
+            // reverse order when destination overlaps the tail of the source.
+            if self.all_init(from, from + size) {
+                self.set_init(to, to + size, true);
+            } else if to > from && to < from + size {
+                for k in (0..size).rev() {
+                    let on = self.is_init(from + k);
+                    self.set_init(to + k, to + k + 1, on);
+                }
+            } else {
+                for k in 0..size {
+                    let on = self.is_init(from + k);
+                    self.set_init(to + k, to + k + 1, on);
+                }
             }
         }
         let d = &mut self.relocs[dst.alloc.0 as usize];
-        if !d.is_empty() {
-            d.retain(|&(at, _)| at + PTR <= dst.offset || at >= dst.offset + size);
-        }
-        for &(at, t) in self.scratch.iter() {
-            let o = dst.offset + at;
-            let pos = d.iter().position(|&(x, _)| x > o).unwrap_or(d.len());
-            d.insert(pos, (o, t));
+        if d.is_empty() {
+            for &(at, t) in self.scratch.iter() {
+                d.push((dst.offset + at, t));
+            }
+        } else {
+            let lo = d.partition_point(|&(at, _)| at.saturating_add(PTR) <= dst.offset);
+            let hi = lo + d[lo..].partition_point(|&(at, _)| at < dst.offset + size);
+            splice_relocs_shifted(d, lo, hi, &self.scratch, dst.offset);
         }
         Ok(())
     }
@@ -436,6 +546,9 @@ impl<A: Allocator + Clone> Memory<A> {
         let r = &mut self.relocs[id.0 as usize];
         r.clear();
         r.extend_from_slice(relocs);
+        if !r.is_sorted_by_key(|&(o, _)| o) {
+            r.sort_unstable_by_key(|&(o, _)| o);
+        }
         self.allocs[id.0 as usize].loaded = true;
         Ok(())
     }
@@ -453,12 +566,50 @@ impl<A: Allocator + Clone> Memory<A> {
         let start = self.region(size)?;
         // Its region is now the heap's last: keep `regions` in heap order.
         if let Some(i) = self.regions.iter().rposition(|&r| r == id) {
-            self.regions.remove(i);
+            self.regions.remove_shift(i);
         }
         self.regions.push(id);
         let a = &mut self.allocs[id.0 as usize];
         a.start = start;
         a.len = size;
         Ok(())
+    }
+}
+
+/// Removes every relocation overlapping `start..end` from sorted slice `r` in one shift.
+fn remove_relocs_in<A: Allocator>(r: &mut Vec<(u64, AllocId), A>, start: u64, end: u64) {
+    let lo = r.partition_point(|&(at, _)| at.saturating_add(PTR) <= start);
+    let hi = lo + r[lo..].partition_point(|&(at, _)| at < end);
+    if lo < hi {
+        let len = r.len();
+        r.copy_within(hi..len, lo);
+        r.truncate(len - (hi - lo));
+    }
+}
+
+/// Replaces `r[lo..hi]` with `src` (each offset shifted by `base`), preserving sorted order in O(N + M).
+fn splice_relocs_shifted<A: Allocator>(
+    r: &mut Vec<(u64, AllocId), A>,
+    lo: usize,
+    hi: usize,
+    src: &[(u64, AllocId)],
+    base: u64,
+) {
+    let old = hi - lo;
+    let new = src.len();
+    if old == 0 && new == 0 {
+        return;
+    }
+    let len = r.len();
+    if new < old {
+        r.copy_within(hi..len, lo + new);
+        r.truncate(len - (old - new));
+    } else if new > old {
+        let grow = new - old;
+        r.resize(len + grow, (0, AllocId(0)));
+        r.copy_within(hi..len, lo + new);
+    }
+    for (k, &(at, target)) in src.iter().enumerate() {
+        r[lo + k] = (base + at, target);
     }
 }

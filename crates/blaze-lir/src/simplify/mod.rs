@@ -19,7 +19,7 @@ mod prop;
 pub mod sroa;
 mod stage;
 
-pub use dce::dead;
+pub use dce::{coalesce_cfg, dead};
 pub use prop::{Plant, propagate, propagate_planted};
 pub use sroa::scalar_replace;
 pub use stage::simplify;

@@ -84,12 +84,67 @@ impl<A: Allocator> Reach<A> {
         Ok(())
     }
 
+    /// Every read in `reads` came, in bulk: counted once however often it comes, settling in
+    /// bounded chunks so the buffer stays within the same cap multiple as [`Reach::add`].
+    pub fn add_batch(&mut self, mut reads: &[Read]) -> Result<(), ReachError> {
+        while !reads.is_empty() {
+            let threshold = self.settled.max(MERGE_FLOOR);
+            let tail = self.rows.len() - self.settled;
+            let room = (threshold + 1).saturating_sub(tail).max(1);
+            let take = reads.len().min(room);
+            self.rows.extend_from_slice(&reads[..take]);
+            reads = &reads[take..];
+            if self.rows.len() - self.settled > self.settled.max(MERGE_FLOOR) {
+                self.settle()?;
+            }
+        }
+        Ok(())
+    }
+
     /// The whole sorted, each cell once, a name with two values refused, the cap checked.
     fn settle(&mut self) -> Result<(), ReachError> {
+        let len = self.rows.len();
+        if self.settled == len {
+            return Ok(());
+        }
+
+        // Fast path 1: the arrival tail is already strictly ascending in `(kind, name)` after the
+        // settled prefix, so the whole buffer is sorted, deduplicated, and single-valued as is.
+        if tail_strictly_after_settled(&self.rows, self.settled) {
+            if len > self.cap {
+                return Err(ReachError::Over { cap: self.cap });
+            }
+            self.settled = len;
+            return Ok(());
+        }
+
+        // Fast path 2: when a settled prefix already exists, sort only the arrival tail first. If
+        // the tail's smallest cell still sorts strictly after the settled prefix's last cell by
+        // `(kind, name)`, we deduplicate and check only the tail without re-sorting the prefix.
+        if self.settled > 0 {
+            self.rows[self.settled..].sort_unstable();
+            let prev = self.rows[self.settled - 1];
+            let first = self.rows[self.settled];
+            if (first.kind, first.name) > (prev.kind, prev.name) {
+                dedup_tail(&mut self.rows, self.settled);
+                check_one_value(&self.rows[self.settled..])?;
+                if self.rows.len() > self.cap {
+                    return Err(ReachError::Over { cap: self.cap });
+                }
+                self.settled = self.rows.len();
+                return Ok(());
+            }
+        }
+
+        // General path: the tail overlaps or precedes the settled prefix.
         self.rows.sort_unstable();
         self.rows.dedup();
-        check_one_value(&self.rows)?;
+        if let Err(err) = check_one_value(&self.rows) {
+            self.settled = 0;
+            return Err(err);
+        }
         if self.rows.len() > self.cap {
+            self.settled = 0;
             return Err(ReachError::Over { cap: self.cap });
         }
         self.settled = self.rows.len();
@@ -124,6 +179,40 @@ impl<A: Allocator> Reached<A> {
     pub fn digest(&self) -> Digest {
         self.digest
     }
+}
+
+/// True when `rows[settled..]` is strictly ascending in `(kind, name)` and, if `settled > 0`,
+/// strictly greater than `rows[settled - 1]` in `(kind, name)`.
+fn tail_strictly_after_settled(rows: &[Read], settled: usize) -> bool {
+    let mut prev = settled.checked_sub(1).map(|i| (rows[i].kind, rows[i].name));
+    for read in &rows[settled..] {
+        let key = (read.kind, read.name);
+        if let Some(p) = prev
+            && key <= p
+        {
+            return false;
+        }
+        prev = Some(key);
+    }
+    true
+}
+
+/// Deduplicates the sorted slice `rows[settled..]` in place without touching `rows[..settled]`.
+fn dedup_tail<A: Allocator>(rows: &mut Vec<Read, A>, settled: usize) {
+    let len = rows.len();
+    if len - settled <= 1 {
+        return;
+    }
+    let mut write = settled + 1;
+    for read_idx in (settled + 1)..len {
+        if rows[read_idx] != rows[write - 1] {
+            if write != read_idx {
+                rows[write] = rows[read_idx];
+            }
+            write += 1;
+        }
+    }
+    rows.truncate(write);
 }
 
 /// Sorted `rows` with one name holding two values is refused, naming the first such.

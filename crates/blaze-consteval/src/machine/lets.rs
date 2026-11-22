@@ -29,12 +29,12 @@ use core::alloc::Allocator;
 
 use blaze_typeck::{BinOp, Expr, ExprId};
 
-use super::super::{Machine, Mode, R, Val, malformed};
+use super::super::{Machine, Mode, R, malformed};
 use super::{C, Cc, Code, Kind, Op};
 use crate::ConstWorld;
 use crate::layout::Layout;
 
-impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine<'w, 'l, 'g, 't, 'a, W, L, K> {
+impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine<'w, 'l, 'g, 't, 'wk, 'a, W, L, K> {
     /// Whether `if` condition `cond` is compiled by links: a `let`, or an `&&` chain.
     pub(super) fn cond_by_links(&self, cc: &Cc<'w, '_>, cond: ExprId) -> R<'a, bool> {
         Ok(matches!(self.expr_c(cc, cond)?, Expr::Let { .. } | Expr::Binary { op: BinOp::And, .. }))
@@ -98,7 +98,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                         cc.tasks.push(C::Eval(x, Mode::Value));
                     }
                     None => {
-                        self.emit(code, cc, Op::Imm { dst, v: Val::Zst });
+                        self.emit(code, cc, Op::ImmZst { dst });
                         self.patch_one(code, end);
                         cc.rs.push(dst);
                     }

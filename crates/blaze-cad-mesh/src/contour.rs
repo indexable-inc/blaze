@@ -148,7 +148,7 @@
 use blaze_blake3::Hasher;
 use blaze_cad_field::{
     CadError, CadPlant, CompileError, CompileOpts, Digest, EvalError, Exact, Graph, GridOpts, Lanes, Node, Points, Scratch, Solid, Tape,
-    compile, eval_box, eval_grad, eval_point, eval_points, simplify,
+    compile, eval_box, eval_grad, eval_grads, eval_point, eval_points, simplify,
 };
 use blaze_math::{Aabb3, Interval, Vec3};
 use blaze_own::planted::{NoPlant, Planted};
@@ -161,7 +161,7 @@ use crate::geom::{D3, M3, P3, add, dot, length_up, narrow, scale, sub, unit};
 use crate::ids::{MaterialRole, PartId};
 use crate::mesh::Mesh;
 use crate::plant::{ContourPlant, RedistancePlant};
-use crate::vecs::{V, copied, extend, filled, push};
+use crate::vecs::{V, extend, filled, push};
 use crate::weld::{Soup, Twins, WeldError, WeldOpts, weld};
 
 /// The version of the rules above, held in every [`RegionKey`]: raised when a rule changes, so a
@@ -460,11 +460,6 @@ fn m(nm: i64) -> f64 {
     nm as f64 / 1e9
 }
 
-/// A grid point, metres.
-fn at_nm(p: [i64; 3]) -> Vec3 {
-    Vec3::new(m(p[0]), m(p[1]), m(p[2]))
-}
-
 /// `⌊log2 x⌋` of a positive `x`.
 fn floor_log2(x: i64) -> u32 {
     63 - (x as u64).leading_zeros()
@@ -574,54 +569,106 @@ fn contour<'a>(
 
     let mut sc = Scratch::new(s);
     let mut stats = MeshStats::default();
-    let instrs = t.len() as u64;
 
-    // The skeleton: roots down to pieces.
-    let mut cells: V<'_, [i64; 3]> = Vec::new_in(s);
+    // The skeleton: roots down to pieces, simplifying the tape hierarchically at intermediate
+    // levels (over each kept cell grown by a leaf) into a shared tape pool so deep branches and
+    // leaf pieces evaluate tiny specialised tapes and skip redundant `simplify` calls when no
+    // choice sites are decided, while keeping every piece's `RegionKey` bit-identical to
+    // simplifying directly from the root tape.
+    const SIMPLIFY_MIN_OPS: usize = 64;
+    struct SkelFrame {
+        cell: [i64; 3],
+        shift: u32,
+        next_child: u8,
+        tape_idx: usize,
+    }
+    let mut root_cells: V<'_, [i64; 3]> = Vec::new_in(s);
     for z in (lo[2] >> root)..=(hi[2] >> root) {
         for y in (lo[1] >> root)..=(hi[1] >> root) {
             for x in (lo[0] >> root)..=(hi[0] >> root) {
-                push(&mut cells, [x, y, z])?;
+                push(&mut root_cells, [x, y, z])?;
             }
         }
     }
-    let mut shift = root;
-    loop {
-        let mut kept: V<'_, [i64; 3]> = Vec::new_in(s);
-        for &c in cells.iter() {
+    // Index 0 is the root tape `t`; index `i >= 1` is `&tapes[i - 1]`.
+    let mut tapes: V<'_, Tape<'_>> = Vec::new_in(s);
+    let mut stack: V<'_, SkelFrame> = Vec::new_in(s);
+    let mut kept_pieces: V<'_, ([i64; 3], usize)> = Vec::new_in(s);
+
+    macro_rules! visit_skel_cell {
+        ($c:expr, $sh:expr, $tidx:expr) => {{
+            let c = $c;
+            let sh = $sh;
+            let tidx: usize = $tidx;
             stats.boxes += 1;
             if stats.boxes > o.most_cells {
                 return Err(MeshError::TooManyCells { most: o.most_cells });
             }
-            stats.work += instrs;
-            let (iv, _) = eval_box(t, &cell_box(c, shift, 0), &mut sc);
+            let cur = if tidx == 0 { t } else { &tapes[tidx - 1] };
+            stats.work += cur.len() as u64;
+            let (iv, ch_e) = eval_box(cur, &cell_box(c, sh, 0), &mut sc);
             if spans_zero(iv) {
-                push(&mut kept, c)?;
+                let sites_total = ch_e.as_slice().len();
+                if sh == piece {
+                    let piece_tidx = if sites_total == 0 {
+                        tidx
+                    } else {
+                        stats.boxes += 1;
+                        stats.work += cur.len() as u64;
+                        let (_, ch_g) = eval_box(cur, &cell_box(c, piece, leaf_nm), &mut sc);
+                        if ch_g.decided() == 0 {
+                            tidx
+                        } else {
+                            let region = simplify(cur, ch_g, s).map_err(MeshError::Compile)?;
+                            push(&mut tapes, region)?;
+                            tapes.len()
+                        }
+                    };
+                    push(&mut kept_pieces, (c, piece_tidx))?;
+                } else {
+                    let next_tidx = if cur.len() >= SIMPLIFY_MIN_OPS && sites_total > 0 && ch_e.decided() * 4 >= sites_total {
+                        stats.work += cur.len() as u64;
+                        let (_, ch_g) = eval_box(cur, &cell_box(c, sh, leaf_nm), &mut sc);
+                        if ch_g.decided() * 4 >= sites_total {
+                            let sub = simplify(cur, ch_g, s).map_err(MeshError::Compile)?;
+                            push(&mut tapes, sub)?;
+                            tapes.len()
+                        } else {
+                            tidx
+                        }
+                    } else {
+                        tidx
+                    };
+                    push(&mut stack, SkelFrame { cell: c, shift: sh, next_child: 0, tape_idx: next_tidx })?;
+                }
             }
-        }
-        if shift == piece {
-            cells = kept;
-            break;
-        }
-        shift -= 1;
-        let mut next: V<'_, [i64; 3]> = Vec::try_with_capacity_in(kept.len() * 8, s)?;
-        for &c in kept.iter() {
-            for d in 0..8 {
-                push(&mut next, child(c, d))?;
-            }
-        }
-        cells = next;
+        }};
     }
-    cells.sort_unstable();
 
-    // Each kept piece's region tape.
-    let mut regions: V<'_, Tape<'_>> = Vec::try_with_capacity_in(cells.len(), s)?;
-    for &p in cells.iter() {
-        stats.boxes += 1;
-        stats.work += instrs;
-        let (_, choices) = eval_box(t, &cell_box(p, piece, leaf_nm), &mut sc);
-        let region = simplify(t, choices, s).map_err(MeshError::Compile)?;
-        push(&mut regions, region)?;
+    for &rc in root_cells.iter() {
+        visit_skel_cell!(rc, root, 0);
+        while let Some(top) = stack.last_mut() {
+            if top.next_child == 8 {
+                stack.pop();
+                continue;
+            }
+            let d = top.next_child;
+            top.next_child += 1;
+            let c = child(top.cell, i64::from(d));
+            let child_shift = top.shift - 1;
+            let tidx = top.tape_idx;
+            visit_skel_cell!(c, child_shift, tidx);
+        }
+    }
+    kept_pieces.sort_unstable_by_key(|&(c, _)| c);
+    let mut cells: V<'_, [i64; 3]> = Vec::try_with_capacity_in(kept_pieces.len(), s)?;
+    let mut region_tidx: V<'_, usize> = Vec::try_with_capacity_in(kept_pieces.len(), s)?;
+    let mut region_digests: V<'_, Digest> = Vec::try_with_capacity_in(kept_pieces.len(), s)?;
+    for &(c, tidx) in kept_pieces.iter() {
+        push(&mut cells, c)?;
+        push(&mut region_tidx, tidx)?;
+        let rt = if tidx == 0 { t } else { &tapes[tidx - 1] };
+        push(&mut region_digests, rt.digest())?;
     }
     let grid = Grid { leaf, piece, feature };
     let key_leaf = if plant.has(ContourPlant::KeyWithoutTolerance) { 0 } else { leaf_nm };
@@ -629,7 +676,7 @@ fn contour<'a>(
     let own = |n: usize| {
         let p = cells[n];
         RegionKey {
-            tape: regions[n].digest(),
+            tape: region_digests[n],
             cell: [p[0] << piece, p[1] << piece, p[2] << piece, (p[0] + 1) << piece, (p[1] + 1) << piece, (p[2] + 1) << piece],
             leaf_nm: key_leaf,
             feature_nm: 1i64 << feature,
@@ -640,6 +687,7 @@ fn contour<'a>(
 
     // Pass one: every piece's tree.
     let mut tree: V<'_, TreeCell> = Vec::new_in(s);
+    let mut tree_stack: V<'_, Cell> = Vec::new_in(s);
     let mut spans: V<'_, (usize, usize)> = Vec::try_with_capacity_in(cells.len(), s)?;
     for (n, &p) in cells.iter().enumerate() {
         let key = own(n);
@@ -650,7 +698,9 @@ fn contour<'a>(
             extend(&mut tree, kept)?;
             stats.trees_reused += 1;
         } else {
-            piece_tree(&regions[n], p, &grid, uniform, &mut tree, &mut sc, &mut stats, s, o.most_cells)?;
+            let tidx = region_tidx[n];
+            let rt = if tidx == 0 { t } else { &tapes[tidx - 1] };
+            piece_tree(rt, p, &grid, uniform, &mut tree, &mut tree_stack, &mut sc, &mut stats, o.most_cells)?;
             if let Some(c) = cache.as_deref_mut()
                 && !c.put_tree(key, &tree[start..])?
             {
@@ -659,21 +709,16 @@ fn contour<'a>(
         }
         push(&mut spans, (start, tree.len()))?;
     }
-    let mut splits: V<'_, Cell> = Vec::new_in(s);
-    for tc in tree.iter() {
-        if tc.split {
-            push(&mut splits, tc.cell)?;
-        }
-    }
-    splits.sort_unstable();
 
     // Pass two: every piece's triangles, in canonical order.
     let mut soup: V<'_, [P3; 3]> = Vec::new_in(s);
     let mut keys: V<'a, (RegionKey, bool)> = Vec::try_with_capacity_in(cells.len(), o.alloc)?;
     let mut stopped: V<'_, Cell> = Vec::new_in(s);
+    let mut ps = PieceScratch::new(s);
     let mut far = 0.0f64;
     for (n, &p) in cells.iter().enumerate() {
-        let key = RegionKey { around: around(&cells, &regions, p), ..own(n) };
+        let (around_digest, nb_indices, nb_count) = around_and_neighbours(&cells, &region_digests, p);
+        let key = RegionKey { around: around_digest, ..own(n) };
         stats.pieces += 1;
         if let Some(c) = cache.as_deref()
             && let Some((tris, piece_far)) = c.piece(&key)
@@ -685,15 +730,29 @@ fn contour<'a>(
             continue;
         }
         stopped.clear();
+        ps.local_splits.clear();
         let (a, z) = spans[n];
         for tc in &tree[a..z] {
-            if !tc.split {
+            if tc.split {
+                push(&mut ps.local_splits, tc.cell)?;
+            } else {
                 push(&mut stopped, tc.cell)?;
             }
         }
+        for &nb in &nb_indices[..nb_count] {
+            let (na, nz) = spans[nb];
+            for tc in &tree[na..nz] {
+                if tc.split {
+                    push(&mut ps.local_splits, tc.cell)?;
+                }
+            }
+        }
+        ps.local_splits.sort_unstable();
         stats.leaves += stopped.len() as u64;
         let start = soup.len();
-        let piece_far = piece_triangles(&regions[n], &stopped, &splits, &grid, &mut soup, &mut sc, &mut stats, s)?;
+        let tidx = region_tidx[n];
+        let rt = if tidx == 0 { t } else { &tapes[tidx - 1] };
+        let piece_far = piece_triangles(rt, &stopped, &grid, &mut soup, &mut ps, &mut sc, &mut stats)?;
         far = far.max(piece_far);
         stats.recomputed += 1;
         push(&mut keys, (key, true))?;
@@ -720,10 +779,12 @@ fn contour<'a>(
     Ok(Meshed { mesh, proof, quantum, vertex_bound, keys, stats })
 }
 
-/// The `around` of piece `p`: BLAKE3 of its 26 neighbours' tape digests, zeros where the walk kept
-/// no piece, in `z`, `y`, `x` order.
-fn around(cells: &[[i64; 3]], regions: &[Tape<'_>], p: [i64; 3]) -> Digest {
+/// The `around` of piece `p` (BLAKE3 of its 26 neighbours' tape digests, zeros where the walk kept
+/// no piece, in `z`, `y`, `x` order) together with the indices of the kept neighbours.
+fn around_and_neighbours(cells: &[[i64; 3]], digests: &[Digest], p: [i64; 3]) -> (Digest, [usize; 26], usize) {
     let mut h = Hasher::new_derive_key("blaze-cad-mesh 2026-11-21 contour piece neighbours");
+    let mut nbs = [0usize; 26];
+    let mut count = 0usize;
     for dz in -1..=1i64 {
         for dy in -1..=1i64 {
             for dx in -1..=1i64 {
@@ -731,14 +792,18 @@ fn around(cells: &[[i64; 3]], regions: &[Tape<'_>], p: [i64; 3]) -> Digest {
                     continue;
                 }
                 let d = match cells.binary_search(&[p[0] + dx, p[1] + dy, p[2] + dz]) {
-                    Ok(i) => regions[i].digest(),
+                    Ok(i) => {
+                        nbs[count] = i;
+                        count += 1;
+                        digests[i]
+                    }
                     Err(_) => [0u8; 32],
                 };
                 h.update(&d);
             }
         }
     }
-    h.finalize()
+    (h.finalize(), nbs, count)
 }
 
 /// The stopped cell holding the point just inside `q` (a point `q` of the grid offset by less
@@ -763,14 +828,14 @@ fn piece_tree(
     g: &Grid,
     uniform: bool,
     out: &mut V<'_, TreeCell>,
+    stack: &mut V<'_, Cell>,
     sc: &mut Scratch<'_>,
     stats: &mut MeshStats,
-    s: Alloc<'_>,
     most_cells: u64,
 ) -> Result<(), MeshError> {
     let instrs = r.len() as u64;
-    let mut stack: V<'_, Cell> = Vec::new_in(s);
-    push(&mut stack, Cell { shift: g.piece, i: p })?;
+    stack.clear();
+    push(stack, Cell { shift: g.piece, i: p })?;
     while let Some(c) = stack.pop() {
         stats.boxes += 1;
         if stats.boxes > most_cells {
@@ -785,7 +850,7 @@ fn piece_tree(
         push(out, TreeCell { cell: c, split })?;
         if split {
             for d in (0..8).rev() {
-                push(&mut stack, Cell { shift: c.shift - 1, i: child(c.i, d) })?;
+                push(stack, Cell { shift: c.shift - 1, i: child(c.i, d) })?;
             }
         }
     }
@@ -817,19 +882,25 @@ fn settles(r: &Tape<'_>, c: Cell, g: &Grid, sc: &mut Scratch<'_>, stats: &mut Me
     let half = side / 2;
     let lo = [c.i[0] << c.shift, c.i[1] << c.shift, c.i[2] << c.shift];
     // Sample `n` is lattice point `(n % 3, n / 3 % 3, n / 9)`; every index below 27.
+    // Padded to 32 lanes so `eval_points(..., Lanes::Eight, sc)` runs 4 full SIMD8 passes with no scalar tail.
     let point = |n: usize| [lo[0] + (n % 3) as i64 * half, lo[1] + (n / 3 % 3) as i64 * half, lo[2] + (n / 9) as i64 * half];
     let lat = |x: usize, y: usize, z: usize| x + 3 * y + 9 * z;
     let corner = |k: usize| lat(2 * (k & 1), 2 * ((k >> 1) & 1), 2 * ((k >> 2) & 1));
-    let mut xs = [0.0f64; 27];
-    let mut ys = [0.0f64; 27];
-    let mut zs = [0.0f64; 27];
+    let mut xs = [0.0f64; 32];
+    let mut ys = [0.0f64; 32];
+    let mut zs = [0.0f64; 32];
     for n in 0..27 {
         let p = point(n);
         xs[n] = m(p[0]);
         ys[n] = m(p[1]);
         zs[n] = m(p[2]);
     }
-    let mut v = [0.0f64; 27];
+    for n in 27..32 {
+        xs[n] = xs[0];
+        ys[n] = ys[0];
+        zs[n] = zs[0];
+    }
+    let mut v = [0.0f64; 32];
     eval_points(r, Points { x: &xs, y: &ys, z: &zs }, &mut v, Lanes::Eight, sc).map_err(MeshError::Eval)?;
     stats.points += 27;
     stats.work += 27 * instrs;
@@ -915,9 +986,8 @@ fn settles(r: &Tape<'_>, c: Cell, g: &Grid, sc: &mut Scratch<'_>, stats: &mut Me
         return Ok(false);
     }
 
-    // The residual.
-    let mut pts = [[0.0f64; 3]; 12];
-    let mut nrm = [None::<D3>; 12];
+    // The residual: lockstep SIMD crossing bisection and batched SIMD gradients.
+    let mut states = [CrossingState::ZERO; 12];
     let mut n = 0;
     for e in 0..12 {
         if !crossing(e) {
@@ -926,15 +996,12 @@ fn settles(r: &Tape<'_>, c: Cell, g: &Grid, sc: &mut Scratch<'_>, stats: &mut Me
         let (la, lb) = (corner(EDGES[e].0), corner(EDGES[e].1));
         let lm = (la + lb) / 2;
         let (from, fa, fb) = if sign(la) != sign(lm) { (la, v[la], v[lm]) } else { (lm, v[lm], v[lb]) };
-        let p = crossing_on(r, point(from), e / 4, half, fa, fb, leaf_nm, sc, stats);
-        let (_, gr) = eval_grad(r, Vec3::new(p[0], p[1], p[2]), sc);
-        stats.grads += 1;
-        stats.work += instrs;
-        // A point with no gradient (a kink exactly at it) gives no plane; the others still must.
-        pts[n] = p;
-        nrm[n] = unit([gr.x, gr.y, gr.z]);
+        states[n] = CrossingState::new(point(from), e / 4, half, fa, fb);
         n += 1;
     }
+    let mut pts = [[0.0f64; 3]; 12];
+    let mut nrm = [None::<D3>; 12];
+    resolve_crossings_stack(r, &mut states[..n], leaf_nm, &mut pts[..n], &mut nrm[..n], sc, stats)?;
     if nrm[..n].iter().all(|u| u.is_none()) {
         return Ok(false);
     }
@@ -955,63 +1022,384 @@ fn settles(r: &Tape<'_>, c: Cell, g: &Grid, sc: &mut Scratch<'_>, stats: &mut Me
     Ok(true)
 }
 
-/// The crossing on the grid segment from `a` along axis `e`, `len` nm long, whose ends' values
-/// are `fa` (at `a`) and `fb`, of opposite insides: regula falsi (kept an eighth of the bracket
-/// from its ends) with a half-leaf squeeze for eight rounds, then bisection, until the bracket is
-/// at most a leaf; then the bracket's linear interpolation, kept an eighth of a leaf from both
-/// ends of the segment. A function of the segment alone, in metres.
-#[allow(clippy::too_many_arguments)]
-fn crossing_on(
+/// Evaluates `r` at `xs/ys/zs` into `out` using 8-wide SIMD, padding any 2..=7 tail into a
+/// 4-wide or 8-wide SIMD call so scalar fallback runs at most once. Bit-equal to `eval_point`.
+fn eval_points_simd(
     r: &Tape<'_>,
-    a: [i64; 3],
+    xs: &[f64],
+    ys: &[f64],
+    zs: &[f64],
+    out: &mut [f64],
+    sc: &mut Scratch<'_>,
+) -> Result<(), MeshError> {
+    let n = out.len();
+    let n8 = n & !7;
+    if n8 > 0 {
+        eval_points(r, Points { x: &xs[..n8], y: &ys[..n8], z: &zs[..n8] }, &mut out[..n8], Lanes::Eight, sc)
+            .map_err(MeshError::Eval)?;
+    }
+    let rem = n - n8;
+    if rem == 1 {
+        out[n8] = eval_point(r, Vec3::new(xs[n8], ys[n8], zs[n8]), sc);
+    } else if rem > 1 && rem <= 4 {
+        let (mut px, mut py, mut pz, mut po) = ([xs[n8]; 4], [ys[n8]; 4], [zs[n8]; 4], [0.0; 4]);
+        px[..rem].copy_from_slice(&xs[n8..n]);
+        py[..rem].copy_from_slice(&ys[n8..n]);
+        pz[..rem].copy_from_slice(&zs[n8..n]);
+        eval_points(r, Points { x: &px, y: &py, z: &pz }, &mut po, Lanes::Four, sc).map_err(MeshError::Eval)?;
+        out[n8..n].copy_from_slice(&po[..rem]);
+    } else if rem > 4 {
+        let (mut px, mut py, mut pz, mut po) = ([xs[n8]; 8], [ys[n8]; 8], [zs[n8]; 8], [0.0; 8]);
+        px[..rem].copy_from_slice(&xs[n8..n]);
+        py[..rem].copy_from_slice(&ys[n8..n]);
+        pz[..rem].copy_from_slice(&zs[n8..n]);
+        eval_points(r, Points { x: &px, y: &py, z: &pz }, &mut po, Lanes::Eight, sc).map_err(MeshError::Eval)?;
+        out[n8..n].copy_from_slice(&po[..rem]);
+    }
+    Ok(())
+}
+
+/// Evaluates `r`'s values and gradients at `xs/ys/zs` using 8-wide SIMD, padding any 2..=7 tail
+/// into a 4-wide or 8-wide SIMD call. Bit-equal to scalar `eval_grad`.
+fn eval_grads_simd(
+    r: &Tape<'_>,
+    xs: &[f64],
+    ys: &[f64],
+    zs: &[f64],
+    vals: &mut [f64],
+    grads: &mut [Vec3],
+    sc: &mut Scratch<'_>,
+) -> Result<(), MeshError> {
+    let n = vals.len();
+    let n8 = n & !7;
+    if n8 > 0 {
+        eval_grads(
+            r,
+            Points { x: &xs[..n8], y: &ys[..n8], z: &zs[..n8] },
+            &mut vals[..n8],
+            &mut grads[..n8],
+            Lanes::Eight,
+            sc,
+        )
+        .map_err(MeshError::Eval)?;
+    }
+    let rem = n - n8;
+    if rem == 1 {
+        let (v, g) = eval_grad(r, Vec3::new(xs[n8], ys[n8], zs[n8]), sc);
+        vals[n8] = v;
+        grads[n8] = g;
+    } else if rem > 1 && rem <= 4 {
+        let (mut px, mut py, mut pz) = ([xs[n8]; 4], [ys[n8]; 4], [zs[n8]; 4]);
+        let (mut pv, mut pg) = ([0.0; 4], [Vec3::ZERO; 4]);
+        px[..rem].copy_from_slice(&xs[n8..n]);
+        py[..rem].copy_from_slice(&ys[n8..n]);
+        pz[..rem].copy_from_slice(&zs[n8..n]);
+        eval_grads(r, Points { x: &px, y: &py, z: &pz }, &mut pv, &mut pg, Lanes::Four, sc).map_err(MeshError::Eval)?;
+        vals[n8..n].copy_from_slice(&pv[..rem]);
+        grads[n8..n].copy_from_slice(&pg[..rem]);
+    } else if rem > 4 {
+        let (mut px, mut py, mut pz) = ([xs[n8]; 8], [ys[n8]; 8], [zs[n8]; 8]);
+        let (mut pv, mut pg) = ([0.0; 8], [Vec3::ZERO; 8]);
+        px[..rem].copy_from_slice(&xs[n8..n]);
+        py[..rem].copy_from_slice(&ys[n8..n]);
+        pz[..rem].copy_from_slice(&zs[n8..n]);
+        eval_grads(r, Points { x: &px, y: &py, z: &pz }, &mut pv, &mut pg, Lanes::Eight, sc).map_err(MeshError::Eval)?;
+        vals[n8..n].copy_from_slice(&pv[..rem]);
+        grads[n8..n].copy_from_slice(&pg[..rem]);
+    }
+    Ok(())
+}
+
+/// Lockstep bisection state for one grid segment crossing (identical rules to scalar regula falsi
+/// with half-leaf squeeze for eight rounds, then bisection, then clamped linear interpolation).
+#[derive(Clone, Copy)]
+struct CrossingState {
+    a_m: D3,
+    base: f64,
     e: usize,
-    len: i64,
-    fa: f64,
-    fb: f64,
+    len: f64,
+    x0: f64,
+    x1: f64,
+    f0: f64,
+    f1: f64,
+    cand: f64,
+    low: bool,
+}
+
+impl CrossingState {
+    const ZERO: CrossingState = CrossingState {
+        a_m: [0.0; 3],
+        base: 0.0,
+        e: 0,
+        len: 0.0,
+        x0: 0.0,
+        x1: 0.0,
+        f0: 0.0,
+        f1: 0.0,
+        cand: 0.0,
+        low: false,
+    };
+
+    #[inline]
+    fn new(a: [i64; 3], e: usize, len: i64, fa: f64, fb: f64) -> CrossingState {
+        CrossingState {
+            a_m: [m(a[0]), m(a[1]), m(a[2])],
+            base: a[e] as f64,
+            e,
+            len: len as f64,
+            x0: 0.0,
+            x1: len as f64,
+            f0: fa,
+            f1: fb,
+            cand: 0.0,
+            low: false,
+        }
+    }
+
+    #[inline]
+    fn at(&self, x: f64) -> D3 {
+        let mut p = self.a_m;
+        p[self.e] = (self.base + x) / 1e9;
+        p
+    }
+
+    #[inline]
+    fn finish(&self, leaf: f64) -> D3 {
+        let f = self.f0 / (self.f0 - self.f1);
+        let f = if f.is_nan() { 0.5 } else { f.max(0.0).min(1.0) };
+        self.at((self.x0 + f * (self.x1 - self.x0)).max(leaf / 8.0).min(self.len - leaf / 8.0))
+    }
+}
+
+/// Resolves up to 12 crossings and their unit normals in lockstep SIMD on the stack (for `settles`).
+#[allow(clippy::too_many_arguments)]
+fn resolve_crossings_stack(
+    r: &Tape<'_>,
+    states: &mut [CrossingState],
     leaf_nm: i64,
+    pts: &mut [D3],
+    nrm: &mut [Option<D3>],
     sc: &mut Scratch<'_>,
     stats: &mut MeshStats,
-) -> D3 {
+) -> Result<(), MeshError> {
+    let n = states.len();
+    if n == 0 {
+        return Ok(());
+    }
     let instrs = r.len() as u64;
-    let base = a[e] as f64;
-    let at = |x: f64| {
-        let mut p = [m(a[0]), m(a[1]), m(a[2])];
-        p[e] = (base + x) / 1e9;
-        p
-    };
     let leaf = leaf_nm as f64;
-    let (mut x0, mut x1, mut f0, mut f1) = (0.0f64, len as f64, fa, fb);
+    let mut xs = [0.0f64; 12];
+    let mut ys = [0.0f64; 12];
+    let mut zs = [0.0f64; 12];
+    let mut out = [0.0f64; 12];
+    let mut active = [0usize; 12];
+    let mut squeeze = [0usize; 12];
     let mut round = 0u32;
-    while x1 - x0 > leaf {
-        let w = x1 - x0;
-        let x = if round < 8 { (x0 + w * (f0 / (f0 - f1))).max(x0 + w / 8.0).min(x1 - w / 8.0) } else { x0 + w / 2.0 };
-        let p = at(x);
-        let fx = eval_point(r, Vec3::new(p[0], p[1], p[2]), sc);
-        stats.points += 1;
-        stats.work += instrs;
-        let low = inside(fx) == inside(f0);
-        if low {
-            (x0, f0) = (x, fx);
-        } else {
-            (x1, f1) = (x, fx);
-        }
-        if round < 8 && x1 - x0 > leaf {
-            let y = if low { x0 + leaf / 2.0 } else { x1 - leaf / 2.0 };
-            let p = at(y);
-            let fy = eval_point(r, Vec3::new(p[0], p[1], p[2]), sc);
-            stats.points += 1;
-            stats.work += instrs;
-            if inside(fy) == inside(f0) {
-                (x0, f0) = (y, fy);
+    loop {
+        let mut na = 0usize;
+        for (i, st) in states.iter_mut().enumerate() {
+            let w = st.x1 - st.x0;
+            if !(w > leaf) {
+                continue;
+            }
+            let x = if round < 8 {
+                (st.x0 + w * (st.f0 / (st.f0 - st.f1))).max(st.x0 + w / 8.0).min(st.x1 - w / 8.0)
             } else {
-                (x1, f1) = (y, fy);
+                st.x0 + w / 2.0
+            };
+            st.cand = x;
+            let p = st.at(x);
+            xs[na] = p[0];
+            ys[na] = p[1];
+            zs[na] = p[2];
+            active[na] = i;
+            na += 1;
+        }
+        if na == 0 {
+            break;
+        }
+        eval_points_simd(r, &xs[..na], &ys[..na], &zs[..na], &mut out[..na], sc)?;
+        stats.points += na as u64;
+        stats.work += na as u64 * instrs;
+        let mut ns = 0usize;
+        for k in 0..na {
+            let i = active[k];
+            let st = &mut states[i];
+            let fx = out[k];
+            let low = inside(fx) == inside(st.f0);
+            if low {
+                (st.x0, st.f0) = (st.cand, fx);
+            } else {
+                (st.x1, st.f1) = (st.cand, fx);
+            }
+            st.low = low;
+            if round < 8 && st.x1 - st.x0 > leaf {
+                let y = if low { st.x0 + leaf / 2.0 } else { st.x1 - leaf / 2.0 };
+                st.cand = y;
+                let p = st.at(y);
+                xs[ns] = p[0];
+                ys[ns] = p[1];
+                zs[ns] = p[2];
+                squeeze[ns] = i;
+                ns += 1;
+            }
+        }
+        if ns > 0 {
+            eval_points_simd(r, &xs[..ns], &ys[..ns], &zs[..ns], &mut out[..ns], sc)?;
+            stats.points += ns as u64;
+            stats.work += ns as u64 * instrs;
+            for k in 0..ns {
+                let st = &mut states[squeeze[k]];
+                let fy = out[k];
+                if inside(fy) == inside(st.f0) {
+                    (st.x0, st.f0) = (st.cand, fy);
+                } else {
+                    (st.x1, st.f1) = (st.cand, fy);
+                }
             }
         }
         round += 1;
     }
-    let f = f0 / (f0 - f1);
-    let f = if f.is_nan() { 0.5 } else { f.max(0.0).min(1.0) };
-    at((x0 + f * (x1 - x0)).max(leaf / 8.0).min(len as f64 - leaf / 8.0))
+    for (i, st) in states.iter().enumerate() {
+        let p = st.finish(leaf);
+        pts[i] = p;
+        xs[i] = p[0];
+        ys[i] = p[1];
+        zs[i] = p[2];
+    }
+    let mut grads = [Vec3::ZERO; 12];
+    eval_grads_simd(r, &xs[..n], &ys[..n], &zs[..n], &mut out[..n], &mut grads[..n], sc)?;
+    stats.grads += n as u64;
+    stats.work += n as u64 * instrs;
+    for i in 0..n {
+        let gr = grads[i];
+        nrm[i] = unit([gr.x, gr.y, gr.z]);
+    }
+    Ok(())
+}
+
+/// Resolves an arbitrary batch of grid segments into crossings and unit normals using 8-wide SIMD
+/// lockstep bisection and a single 8-wide `eval_grads` batch. Bit-equal to scalar `crossing_on` + `eval_grad`.
+#[allow(clippy::too_many_arguments)]
+fn resolve_crossings_batch(
+    r: &Tape<'_>,
+    leaf_nm: i64,
+    ps: &mut PieceScratch<'_>,
+    sc: &mut Scratch<'_>,
+    stats: &mut MeshStats,
+) -> Result<(), MeshError> {
+    let n = ps.segs.len();
+    ps.cross.clear();
+    if n == 0 {
+        return Ok(());
+    }
+    let instrs = r.len() as u64;
+    let leaf = leaf_nm as f64;
+    ps.c_states.clear();
+    ps.c_active.clear();
+    for (i, sg) in ps.segs.iter().enumerate() {
+        let e = (0..3).find(|&k| sg.p[k] != sg.q[k]).unwrap_or(0);
+        let st = CrossingState::new(sg.p, e, sg.q[e] - sg.p[e], sg.vp, sg.vq);
+        if st.x1 - st.x0 > leaf {
+            push(&mut ps.c_active, i)?;
+        }
+        push(&mut ps.c_states, st)?;
+    }
+    let mut round = 0u32;
+    while !ps.c_active.is_empty() {
+        ps.xs.clear();
+        ps.ys.clear();
+        ps.zs.clear();
+        ps.out.clear();
+        for &i in ps.c_active.iter() {
+            let st = &mut ps.c_states[i];
+            let w = st.x1 - st.x0;
+            let x = if round < 8 {
+                (st.x0 + w * (st.f0 / (st.f0 - st.f1))).max(st.x0 + w / 8.0).min(st.x1 - w / 8.0)
+            } else {
+                st.x0 + w / 2.0
+            };
+            st.cand = x;
+            let p = st.at(x);
+            push(&mut ps.xs, p[0])?;
+            push(&mut ps.ys, p[1])?;
+            push(&mut ps.zs, p[2])?;
+            push(&mut ps.out, 0.0)?;
+        }
+        eval_points_simd(r, &ps.xs, &ps.ys, &ps.zs, &mut ps.out, sc)?;
+        stats.points += ps.c_active.len() as u64;
+        stats.work += ps.c_active.len() as u64 * instrs;
+        ps.c_squeeze.clear();
+        ps.xs.clear();
+        ps.ys.clear();
+        ps.zs.clear();
+        for (k, &i) in ps.c_active.iter().enumerate() {
+            let st = &mut ps.c_states[i];
+            let fx = ps.out[k];
+            let low = inside(fx) == inside(st.f0);
+            if low {
+                (st.x0, st.f0) = (st.cand, fx);
+            } else {
+                (st.x1, st.f1) = (st.cand, fx);
+            }
+            st.low = low;
+            if round < 8 && st.x1 - st.x0 > leaf {
+                let y = if low { st.x0 + leaf / 2.0 } else { st.x1 - leaf / 2.0 };
+                st.cand = y;
+                let p = st.at(y);
+                push(&mut ps.xs, p[0])?;
+                push(&mut ps.ys, p[1])?;
+                push(&mut ps.zs, p[2])?;
+                push(&mut ps.c_squeeze, i)?;
+            }
+        }
+        if !ps.c_squeeze.is_empty() {
+            ps.out.truncate(ps.c_squeeze.len());
+            eval_points_simd(r, &ps.xs, &ps.ys, &ps.zs, &mut ps.out, sc)?;
+            stats.points += ps.c_squeeze.len() as u64;
+            stats.work += ps.c_squeeze.len() as u64 * instrs;
+            for (k, &i) in ps.c_squeeze.iter().enumerate() {
+                let st = &mut ps.c_states[i];
+                let fy = ps.out[k];
+                if inside(fy) == inside(st.f0) {
+                    (st.x0, st.f0) = (st.cand, fy);
+                } else {
+                    (st.x1, st.f1) = (st.cand, fy);
+                }
+            }
+        }
+        ps.c_next.clear();
+        for &i in ps.c_active.iter() {
+            if ps.c_states[i].x1 - ps.c_states[i].x0 > leaf {
+                push(&mut ps.c_next, i)?;
+            }
+        }
+        core::mem::swap(&mut ps.c_active, &mut ps.c_next);
+        round += 1;
+    }
+    ps.xs.clear();
+    ps.ys.clear();
+    ps.zs.clear();
+    ps.out.clear();
+    ps.grads.clear();
+    ps.positions.clear();
+    for st in ps.c_states.iter() {
+        let p = st.finish(leaf);
+        push(&mut ps.positions, p)?;
+        push(&mut ps.xs, p[0])?;
+        push(&mut ps.ys, p[1])?;
+        push(&mut ps.zs, p[2])?;
+        push(&mut ps.out, 0.0)?;
+        push(&mut ps.grads, Vec3::ZERO)?;
+    }
+    eval_grads_simd(r, &ps.xs, &ps.ys, &ps.zs, &mut ps.out, &mut ps.grads, sc)?;
+    stats.grads += n as u64;
+    stats.work += n as u64 * instrs;
+    for i in 0..n {
+        let gr = ps.grads[i];
+        push(&mut ps.cross, (ps.positions[i], unit([gr.x, gr.y, gr.z])))?;
+    }
+    Ok(())
 }
 
 /// The mean of `points` (at least one), summed in order.
@@ -1117,6 +1505,9 @@ fn settle(r: &Tape<'_>, x: D3, lo: D3, hi: D3, sc: &mut Scratch<'_>, stats: &mut
 /// between its ends: the ends of the stopped cells in the four quadrants around it, ascending.
 fn cuts_on(splits: &[Cell], g: &Grid, from: [i64; 3], e: usize, len: i64, cuts: &mut V<'_, i64>) -> Result<(), MeshError> {
     cuts.clear();
+    if len <= g.leaf_nm() || splits.is_empty() {
+        return Ok(());
+    }
     let (u, w) = ((e + 1) % 3, (e + 2) % 3);
     let end = from[e] + len;
     for quad in 0..4 {
@@ -1139,8 +1530,10 @@ fn cuts_on(splits: &[Cell], g: &Grid, from: [i64; 3], e: usize, len: i64, cuts: 
             x = next;
         }
     }
-    cuts.sort_unstable();
-    cuts.dedup();
+    if cuts.len() > 1 {
+        cuts.sort_unstable();
+        cuts.dedup();
+    }
     Ok(())
 }
 
@@ -1247,221 +1640,398 @@ fn facet_point(r: &Tape<'_>, f: &Facet, u: (D3, Option<D3>), v: (D3, Option<D3>)
     if fv.abs() <= leaf / 2.0 { Some(p) } else { None }
 }
 
+/// One live cell cycle queued for batched 8-wide SIMD Newton `settle`.
+struct CycleJob {
+    cell_idx: usize,
+    p0: usize,
+    p1: usize,
+    blo: D3,
+    bhi: D3,
+    x: D3,
+    v: f64,
+    gr: Vec3,
+    active: bool,
+}
+
+/// Reusable scratch buffers across all `piece_triangles` calls in a `contour` run (zero per-piece
+/// heap allocations once warmed up).
+struct PieceScratch<'s> {
+    local_splits: V<'s, Cell>,
+    facets: V<'s, Facet>,
+    walk: V<'s, [i64; 3]>,
+    ranges: V<'s, (usize, usize)>,
+    squares: V<'s, (i64, i64, u32)>,
+    cuts: V<'s, i64>,
+    pts: V<'s, [i64; 3]>,
+    vals: V<'s, f64>,
+    wv: V<'s, f64>,
+    segs: V<'s, Seg>,
+    cross: V<'s, (D3, Option<D3>)>,
+    c_states: V<'s, CrossingState>,
+    c_active: V<'s, usize>,
+    c_squeeze: V<'s, usize>,
+    c_next: V<'s, usize>,
+    xs: V<'s, f64>,
+    ys: V<'s, f64>,
+    zs: V<'s, f64>,
+    out: V<'s, f64>,
+    grads: V<'s, Vec3>,
+    positions: V<'s, D3>,
+    links: V<'s, Link>,
+    marks: V<'s, (usize, bool)>,
+    all_poly: V<'s, D3>,
+    poly_n: V<'s, Option<D3>>,
+    cycles: V<'s, (usize, usize)>,
+    seen: V<'s, bool>,
+    jobs: V<'s, CycleJob>,
+    cands: V<'s, D3>,
+    centres: V<'s, P3>,
+}
+
+impl<'s> PieceScratch<'s> {
+    fn new(s: Alloc<'s>) -> PieceScratch<'s> {
+        PieceScratch {
+            local_splits: Vec::new_in(s),
+            facets: Vec::new_in(s),
+            walk: Vec::new_in(s),
+            ranges: Vec::new_in(s),
+            squares: Vec::new_in(s),
+            cuts: Vec::new_in(s),
+            pts: Vec::new_in(s),
+            vals: Vec::new_in(s),
+            wv: Vec::new_in(s),
+            segs: Vec::new_in(s),
+            cross: Vec::new_in(s),
+            c_states: Vec::new_in(s),
+            c_active: Vec::new_in(s),
+            c_squeeze: Vec::new_in(s),
+            c_next: Vec::new_in(s),
+            xs: Vec::new_in(s),
+            ys: Vec::new_in(s),
+            zs: Vec::new_in(s),
+            out: Vec::new_in(s),
+            grads: Vec::new_in(s),
+            positions: Vec::new_in(s),
+            links: Vec::new_in(s),
+            marks: Vec::new_in(s),
+            all_poly: Vec::new_in(s),
+            poly_n: Vec::new_in(s),
+            cycles: Vec::new_in(s),
+            seen: Vec::new_in(s),
+            jobs: Vec::new_in(s),
+            cands: Vec::new_in(s),
+            centres: Vec::new_in(s),
+        }
+    }
+}
+
 /// The triangles of a piece's stopped `cells` (module documentation, "Contouring") appended to
 /// `soup`; the largest `|f|` at their centres.
 #[allow(clippy::too_many_arguments)]
 fn piece_triangles(
     r: &Tape<'_>,
     cells: &[Cell],
-    splits: &[Cell],
     g: &Grid,
     soup: &mut V<'_, [P3; 3]>,
+    ps: &mut PieceScratch<'_>,
     sc: &mut Scratch<'_>,
     stats: &mut MeshStats,
-    s: Alloc<'_>,
 ) -> Result<f64, MeshError> {
     let instrs = r.len() as u64;
     let leaf_nm = g.leaf_nm();
 
-    // Each cell's facets and their borders.
-    let mut facets: V<'_, Facet> = Vec::new_in(s);
-    let mut walk: V<'_, [i64; 3]> = Vec::new_in(s);
-    let mut ranges: V<'_, (usize, usize)> = Vec::try_with_capacity_in(cells.len(), s)?;
-    let mut squares: V<'_, (i64, i64, u32)> = Vec::new_in(s);
-    let mut cuts: V<'_, i64> = Vec::new_in(s);
+    // Each cell's facets and their borders (using only this piece's and its 26 neighbours' splits).
+    ps.facets.clear();
+    ps.walk.clear();
+    ps.ranges.clear();
     for c in cells.iter() {
-        let first = facets.len();
+        let first = ps.facets.len();
         for face in 0..6usize {
             let (k, high) = (face / 2, face % 2 == 1);
             let (a, b) = ((k + 1) % 3, (k + 2) % 3);
             let w = (c.i[k] + i64::from(high)) << c.shift;
-            squares.clear();
-            push(&mut squares, (c.i[a] << c.shift, c.i[b] << c.shift, c.shift))?;
-            while let Some((qa, qb, j)) = squares.pop() {
-                let mut q = [0i64; 3];
-                q[k] = if high { w } else { w - 1 };
-                q[a] = qa;
-                q[b] = qb;
-                if locate(splits, g, q).shift < j {
-                    let h = 1i64 << (j - 1);
-                    for (da, db) in [(1i64, 1i64), (0, 1), (1, 0), (0, 0)] {
-                        push(&mut squares, (qa + da * h, qb + db * h, j - 1))?;
+            ps.squares.clear();
+            push(&mut ps.squares, (c.i[a] << c.shift, c.i[b] << c.shift, c.shift))?;
+            while let Some((qa, qb, j)) = ps.squares.pop() {
+                if j > g.leaf && !ps.local_splits.is_empty() {
+                    let mut q = [0i64; 3];
+                    q[k] = if high { w } else { w - 1 };
+                    q[a] = qa;
+                    q[b] = qb;
+                    if locate(&ps.local_splits, g, q).shift < j {
+                        let h = 1i64 << (j - 1);
+                        for (da, db) in [(1i64, 1i64), (0, 1), (1, 0), (0, 0)] {
+                            push(&mut ps.squares, (qa + da * h, qb + db * h, j - 1))?;
+                        }
+                        continue;
                     }
-                    continue;
                 }
                 let mut lo = [0i64; 3];
                 lo[k] = w;
                 lo[a] = qa;
                 lo[b] = qb;
-                let start = walk.len();
-                border(splits, g, lo, k, j, &mut walk, &mut cuts)?;
-                push(&mut facets, Facet { k, high, lo, shift: j, start, end: walk.len() })?;
+                let start = ps.walk.len();
+                border(&ps.local_splits, g, lo, k, j, &mut ps.walk, &mut ps.cuts)?;
+                push(&mut ps.facets, Facet { k, high, lo, shift: j, start, end: ps.walk.len() })?;
             }
         }
-        push(&mut ranges, (first, facets.len()))?;
+        push(&mut ps.ranges, (first, ps.facets.len()))?;
     }
 
-    // A value at every border point, each point once.
-    let mut pts = copied(&walk, s)?;
-    pts.sort_unstable();
-    pts.dedup();
-    let mut vals = filled(pts.len(), 0.0f64, s)?;
-    for (n, p) in pts.iter().enumerate() {
-        vals[n] = eval_point(r, at_nm(*p), sc);
+    // A value at every border point, each point once, evaluated in 8-wide SIMD chunks.
+    ps.pts.clear();
+    extend(&mut ps.pts, &ps.walk)?;
+    ps.pts.sort_unstable();
+    ps.pts.dedup();
+    let n_pts = ps.pts.len();
+    ps.vals.clear();
+    ps.vals.try_reserve(n_pts)?;
+    for _ in 0..n_pts {
+        push(&mut ps.vals, 0.0f64)?;
     }
-    stats.points += pts.len() as u64;
-    stats.work += pts.len() as u64 * instrs;
-    let mut wv = filled(walk.len(), 0.0f64, s)?;
-    for (n, p) in walk.iter().enumerate() {
-        match pts.binary_search(p) {
-            Ok(i) => wv[n] = vals[i],
+    let mut cxs = [0.0f64; 64];
+    let mut cys = [0.0f64; 64];
+    let mut czs = [0.0f64; 64];
+    let mut off = 0usize;
+    while off < n_pts {
+        let len = (n_pts - off).min(64);
+        for k in 0..len {
+            let p = ps.pts[off + k];
+            cxs[k] = m(p[0]);
+            cys[k] = m(p[1]);
+            czs[k] = m(p[2]);
+        }
+        eval_points_simd(r, &cxs[..len], &cys[..len], &czs[..len], &mut ps.vals[off..off + len], sc)?;
+        off += len;
+    }
+    stats.points += n_pts as u64;
+    stats.work += n_pts as u64 * instrs;
+    ps.wv.clear();
+    ps.wv.try_reserve(ps.walk.len())?;
+    for p in ps.walk.iter() {
+        match ps.pts.binary_search(p) {
+            Ok(i) => push(&mut ps.wv, ps.vals[i])?,
             Err(_) => return Err(MeshError::Unpaired { cell: [p[0], p[1], p[2]], shift: g.leaf }),
         }
     }
 
-    // A crossing on every grid segment of a border whose ends differ, each segment once.
-    let mut segs: V<'_, Seg> = Vec::new_in(s);
-    for f in facets.iter() {
+    // A crossing on every grid segment of a border whose ends differ, each segment once,
+    // resolved in lockstep 8-wide SIMD bisection + a single 8-wide `eval_grads` batch.
+    ps.segs.clear();
+    for f in ps.facets.iter() {
         let len = f.end - f.start;
         for n in 0..len {
             let (i, j) = (f.start + n, f.start + (n + 1) % len);
-            if inside(wv[i]) == inside(wv[j]) {
+            if inside(ps.wv[i]) == inside(ps.wv[j]) {
                 continue;
             }
-            let seg = if walk[i] < walk[j] {
-                Seg { p: walk[i], q: walk[j], vp: wv[i], vq: wv[j] }
+            let seg = if ps.walk[i] < ps.walk[j] {
+                Seg { p: ps.walk[i], q: ps.walk[j], vp: ps.wv[i], vq: ps.wv[j] }
             } else {
-                Seg { p: walk[j], q: walk[i], vp: wv[j], vq: wv[i] }
+                Seg { p: ps.walk[j], q: ps.walk[i], vp: ps.wv[j], vq: ps.wv[i] }
             };
-            push(&mut segs, seg)?;
+            push(&mut ps.segs, seg)?;
         }
     }
-    segs.sort_unstable_by(|x, y| (x.p, x.q).cmp(&(y.p, y.q)));
-    segs.dedup_by(|x, y| x.p == y.p && x.q == y.q);
-    let mut cross: V<'_, (D3, Option<D3>)> = Vec::try_with_capacity_in(segs.len(), s)?;
-    for sg in segs.iter() {
-        let e = (0..3).find(|&k| sg.p[k] != sg.q[k]).unwrap_or(0);
-        let pos = crossing_on(r, sg.p, e, sg.q[e] - sg.p[e], sg.vp, sg.vq, leaf_nm, sc, stats);
-        let (_, gr) = eval_grad(r, Vec3::new(pos[0], pos[1], pos[2]), sc);
-        stats.grads += 1;
-        stats.work += instrs;
-        push(&mut cross, (pos, unit([gr.x, gr.y, gr.z])))?;
-    }
+    ps.segs.sort_unstable_by(|x, y| (x.p, x.q).cmp(&(y.p, y.q)));
+    ps.segs.dedup_by(|x, y| x.p == y.p && x.q == y.q);
+    resolve_crossings_batch(r, leaf_nm, ps, sc, stats)?;
 
-    // Each cell's cycles and their fans.
-    let mut links: V<'_, Link> = Vec::new_in(s);
-    let mut marks: V<'_, (usize, bool)> = Vec::new_in(s);
-    let mut poly: V<'_, D3> = Vec::new_in(s);
-    let mut poly_n: V<'_, Option<D3>> = Vec::new_in(s);
-    let mut cycles: V<'_, (usize, usize)> = Vec::new_in(s);
-    let mut seen: V<'_, bool> = Vec::new_in(s);
-    let mut centres: V<'_, P3> = Vec::new_in(s);
-    let mut far = 0.0f64;
+    // Each cell's cycles, collected first so all centres' Newton `settle` steps run in 8-wide SIMD.
+    ps.all_poly.clear();
+    ps.jobs.clear();
     for (ci, c) in cells.iter().enumerate() {
         let bug = MeshError::Unpaired { cell: c.i, shift: c.shift };
-        links.clear();
-        let (f0, f1) = ranges[ci];
-        for f in &facets[f0..f1] {
-            marks.clear();
+        ps.links.clear();
+        let (f0, f1) = ps.ranges[ci];
+        for fi in f0..f1 {
+            let f = ps.facets[fi];
+            ps.marks.clear();
             let len = f.end - f.start;
             for n in 0..len {
                 let (i, j) = (f.start + n, f.start + (n + 1) % len);
-                if inside(wv[i]) == inside(wv[j]) {
+                if inside(ps.wv[i]) == inside(ps.wv[j]) {
                     continue;
                 }
-                let key = if walk[i] < walk[j] { (walk[i], walk[j]) } else { (walk[j], walk[i]) };
-                let id = segs.binary_search_by(|x| (x.p, x.q).cmp(&key)).map_err(|_| bug)?;
+                let key = if ps.walk[i] < ps.walk[j] { (ps.walk[i], ps.walk[j]) } else { (ps.walk[j], ps.walk[i]) };
+                let id = ps.segs.binary_search_by(|x| (x.p, x.q).cmp(&key)).map_err(|_| bug)?;
                 // An ENTRY when the walk goes into the inside.
-                push(&mut marks, (id, inside(wv[j])))?;
+                push(&mut ps.marks, (id, inside(ps.wv[j])))?;
             }
-            if marks.is_empty() {
+            if ps.marks.is_empty() {
                 continue;
             }
-            let count = marks.len();
-            let Some(first) = marks.iter().position(|&(_, entry)| entry) else { return Err(bug) };
+            let count = ps.marks.len();
+            let Some(first) = ps.marks.iter().position(|&(_, entry)| entry) else { return Err(bug) };
             if count % 2 != 0 {
                 return Err(bug);
             }
             let pairs = count / 2;
             for n in 0..pairs {
-                let (en, is_entry) = marks[(first + 2 * n) % count];
-                let (ex, is_exit_entry) = marks[(first + 2 * n + 1) % count];
+                let (en, is_entry) = ps.marks[(first + 2 * n) % count];
+                let (ex, is_exit_entry) = ps.marks[(first + 2 * n + 1) % count];
                 if !is_entry || is_exit_entry {
                     return Err(bug);
                 }
                 let (from, to) = if f.high { (en, ex) } else { (ex, en) };
                 // The two cells sharing the facet ask with the ends swapped: order them by
                 // position, so both compute the same bits.
-                let (u, v) = if cross[en].0 < cross[ex].0 { (cross[en], cross[ex]) } else { (cross[ex], cross[en]) };
-                let mid = if pairs == 1 { facet_point(r, f, u, v, leaf_nm, sc, stats) } else { None };
-                push(&mut links, Link { from, to, mid })?;
+                let (u, v) = if ps.cross[en].0 < ps.cross[ex].0 { (ps.cross[en], ps.cross[ex]) } else { (ps.cross[ex], ps.cross[en]) };
+                let mid = if pairs == 1 { facet_point(r, &f, u, v, leaf_nm, sc, stats) } else { None };
+                push(&mut ps.links, Link { from, to, mid })?;
             }
         }
-        if links.is_empty() {
+        if ps.links.is_empty() {
             continue;
         }
-        links.sort_unstable_by_key(|l| l.from);
-        if links.windows(2).any(|w| w[0].from == w[1].from) {
+        ps.links.sort_unstable_by_key(|l| l.from);
+        if ps.links.windows(2).any(|w| w[0].from == w[1].from) {
             return Err(bug);
         }
-        seen.clear();
-        for _ in 0..links.len() {
-            push(&mut seen, false)?;
+        ps.seen.clear();
+        for _ in 0..ps.links.len() {
+            push(&mut ps.seen, false)?;
         }
-        poly.clear();
-        poly_n.clear();
-        cycles.clear();
-        for start in 0..links.len() {
-            if seen[start] {
+        let poly_base = ps.all_poly.len();
+        ps.poly_n.clear();
+        ps.cycles.clear();
+        for start in 0..ps.links.len() {
+            if ps.seen[start] {
                 continue;
             }
-            let p0 = poly.len();
+            let p0 = ps.all_poly.len();
             let mut at = start;
             loop {
-                if seen[at] {
+                if ps.seen[at] {
                     return Err(bug);
                 }
-                seen[at] = true;
-                let l = links[at];
-                push(&mut poly, cross[l.from].0)?;
-                push(&mut poly_n, cross[l.from].1)?;
+                ps.seen[at] = true;
+                let l = ps.links[at];
+                push(&mut ps.all_poly, ps.cross[l.from].0)?;
+                push(&mut ps.poly_n, ps.cross[l.from].1)?;
                 if let Some(mp) = l.mid {
-                    push(&mut poly, mp)?;
-                    push(&mut poly_n, None)?;
+                    push(&mut ps.all_poly, mp)?;
+                    push(&mut ps.poly_n, None)?;
                 }
-                at = links.binary_search_by_key(&l.to, |x| x.from).map_err(|_| bug)?;
+                at = ps.links.binary_search_by_key(&l.to, |x| x.from).map_err(|_| bug)?;
                 if at == start {
                     break;
                 }
             }
-            push(&mut cycles, (p0, poly.len()))?;
+            push(&mut ps.cycles, (p0, ps.all_poly.len()))?;
         }
         // A cycle of two points cuts nothing off.
-        let live = cycles.iter().filter(|&&(p0, p1)| p1 - p0 >= 3).count();
+        let live = ps.cycles.iter().filter(|&&(p0, p1)| p1 - p0 >= 3).count();
         if live == 0 {
             continue;
         }
         let side = 1i64 << c.shift;
         let lo = [c.i[0] << c.shift, c.i[1] << c.shift, c.i[2] << c.shift];
         let (blo, bhi) = shrunk(lo, side, leaf_nm);
-        centres.clear();
-        for &(p0, p1) in cycles.iter() {
+        for &(p0, p1) in ps.cycles.iter() {
             if p1 - p0 < 3 {
                 continue;
             }
-            let ring = &poly[p0..p1];
-            let x = if live == 1 { place(ring, &poly_n[p0..p1], mean_of(ring)) } else { mean_of(ring) };
-            let (x, fx) = settle(r, x, blo, bhi, sc, stats);
-            far = far.max(fx);
-            let cx = narrow(x);
-            if centres.iter().any(|q| *q == cx) {
-                return Err(MeshError::CoincidentCentres { cell: c.i, shift: c.shift });
+            let ring = &ps.all_poly[p0..p1];
+            let x0 = if live == 1 {
+                place(ring, &ps.poly_n[p0 - poly_base..p1 - poly_base], mean_of(ring))
+            } else {
+                mean_of(ring)
+            };
+            let x = [0usize, 1, 2].map(|k| x0[k].max(blo[k]).min(bhi[k]));
+            push(&mut ps.jobs, CycleJob { cell_idx: ci, p0, p1, blo, bhi, x, v: 0.0, gr: Vec3::ZERO, active: true })?;
+        }
+    }
+
+    // Batched 3-wave SIMD8 Newton `settle` across all live cycles in this piece (bit-equal to scalar `settle`).
+    if !ps.jobs.is_empty() {
+        let nj = ps.jobs.len();
+        ps.xs.clear();
+        ps.ys.clear();
+        ps.zs.clear();
+        ps.out.clear();
+        ps.grads.clear();
+        for job in ps.jobs.iter() {
+            push(&mut ps.xs, job.x[0])?;
+            push(&mut ps.ys, job.x[1])?;
+            push(&mut ps.zs, job.x[2])?;
+            push(&mut ps.out, 0.0)?;
+            push(&mut ps.grads, Vec3::ZERO)?;
+        }
+        eval_grads_simd(r, &ps.xs, &ps.ys, &ps.zs, &mut ps.out, &mut ps.grads, sc)?;
+        stats.grads += nj as u64;
+        stats.work += nj as u64 * instrs;
+        for (i, job) in ps.jobs.iter_mut().enumerate() {
+            job.v = ps.out[i];
+            job.gr = ps.grads[i];
+        }
+        for _ in 0..2 {
+            ps.c_active.clear();
+            ps.cands.clear();
+            ps.xs.clear();
+            ps.ys.clear();
+            ps.zs.clear();
+            for (i, job) in ps.jobs.iter_mut().enumerate() {
+                if !job.active {
+                    continue;
+                }
+                let gr = job.gr;
+                let gg = gr.x * gr.x + gr.y * gr.y + gr.z * gr.z;
+                if !(gg > 0.0 && gg.is_finite() && job.v.is_finite()) {
+                    job.active = false;
+                    continue;
+                }
+                let y = [
+                    (job.x[0] - job.v * gr.x / gg).max(job.blo[0]).min(job.bhi[0]),
+                    (job.x[1] - job.v * gr.y / gg).max(job.blo[1]).min(job.bhi[1]),
+                    (job.x[2] - job.v * gr.z / gg).max(job.blo[2]).min(job.bhi[2]),
+                ];
+                push(&mut ps.c_active, i)?;
+                push(&mut ps.cands, y)?;
+                push(&mut ps.xs, y[0])?;
+                push(&mut ps.ys, y[1])?;
+                push(&mut ps.zs, y[2])?;
             }
-            push(&mut centres, cx)?;
-            for n in p0..p1 {
-                let next = if n + 1 == p1 { p0 } else { n + 1 };
-                push(soup, [cx, narrow(poly[n]), narrow(poly[next])])?;
+            let na = ps.c_active.len();
+            if na == 0 {
+                break;
             }
+            eval_grads_simd(r, &ps.xs, &ps.ys, &ps.zs, &mut ps.out[..na], &mut ps.grads[..na], sc)?;
+            stats.grads += na as u64;
+            stats.work += na as u64 * instrs;
+            for (k, &ji) in ps.c_active.iter().enumerate() {
+                let job = &mut ps.jobs[ji];
+                let w = ps.out[k];
+                if !(w.abs() < job.v.abs()) {
+                    job.active = false;
+                } else {
+                    job.x = ps.cands[k];
+                    job.v = w;
+                    job.gr = ps.grads[k];
+                }
+            }
+        }
+    }
+
+    // Emit each cycle's fan in canonical cell & cycle order.
+    ps.centres.clear();
+    let mut cur_cell = usize::MAX;
+    let mut far = 0.0f64;
+    for job in ps.jobs.iter() {
+        if job.cell_idx != cur_cell {
+            ps.centres.clear();
+            cur_cell = job.cell_idx;
+        }
+        far = far.max(job.v.abs());
+        let cx = narrow(job.x);
+        if ps.centres.iter().any(|q| *q == cx) {
+            let c = cells[job.cell_idx];
+            return Err(MeshError::CoincidentCentres { cell: c.i, shift: c.shift });
+        }
+        push(&mut ps.centres, cx)?;
+        for n in job.p0..job.p1 {
+            let next = if n + 1 == job.p1 { job.p0 } else { n + 1 };
+            push(soup, [cx, narrow(ps.all_poly[n]), narrow(ps.all_poly[next])])?;
         }
     }
     Ok(far)
@@ -1480,6 +2050,222 @@ pub struct RedistanceOpts<'s> {
     pub band: Length,
     /// The most grid values.
     pub most_values: u64 = 1 << 24,
+}
+
+/// Exact crossing fraction along a sign-changing grid edge `(va, vb)`.
+#[inline]
+fn crossing_frac(va: f64, vb: f64) -> f64 {
+    let f = va / (va - vb);
+    if f.is_nan() { 0.5 } else { f.max(0.0).min(1.0) }
+}
+
+/// Exact 1D squared distance (in grid-step units) to the nearest sub-voxel sign-changing edge
+/// crossing along a grid line of length `len`, in two linear passes (`O(len)`).
+fn scan_line_crossings(len: usize, get_val: impl Fn(usize) -> f64, out: &mut [f64]) {
+    let mut last_c: Option<f64> = None;
+    let mut prev_v = get_val(0);
+    let mut prev_in = inside(prev_v);
+    out[0] = f64::INFINITY;
+    for i in 1..len {
+        let cur_v = get_val(i);
+        let cur_in = inside(cur_v);
+        if prev_in != cur_in {
+            last_c = Some((i - 1) as f64 + crossing_frac(prev_v, cur_v));
+        }
+        out[i] = match last_c {
+            Some(c) => {
+                let d = i as f64 - c;
+                d * d
+            }
+            None => f64::INFINITY,
+        };
+        prev_v = cur_v;
+        prev_in = cur_in;
+    }
+    let mut next_c: Option<f64> = None;
+    let mut next_v = get_val(len - 1);
+    let mut next_in = inside(next_v);
+    for i in (0..len - 1).rev() {
+        let cur_v = get_val(i);
+        let cur_in = inside(cur_v);
+        if cur_in != next_in {
+            next_c = Some(i as f64 + crossing_frac(cur_v, next_v));
+        }
+        if let Some(c) = next_c {
+            let d = c - i as f64;
+            out[i] = out[i].min(d * d);
+        }
+        next_v = cur_v;
+        next_in = cur_in;
+    }
+}
+
+/// Exact 1D Felzenszwalb-Huttenlocher parabolic lower envelope in grid-step units:
+/// `out[p] = min_q (f[q] + (p - q)^2)`, skipping entries `!(f[q] < cut_sq)`.
+fn edt_1d(f: &[f64], out: &mut [f64], cut_sq: f64, v: &mut [usize], z: &mut [f64]) {
+    let len = f.len();
+    let mut k: isize = -1;
+    for q in 0..len {
+        let fq = f[q];
+        if !(fq < cut_sq) {
+            continue;
+        }
+        if k < 0 {
+            k = 0;
+            v[0] = q;
+            z[0] = f64::NEG_INFINITY;
+            z[1] = f64::INFINITY;
+            continue;
+        }
+        let qf = q as f64;
+        loop {
+            let vk = v[k as usize];
+            let vkf = vk as f64;
+            let s = 0.5 * ((fq - f[vk]) / (qf - vkf) + (qf + vkf));
+            if s <= z[k as usize] {
+                k -= 1;
+                if k < 0 {
+                    k = 0;
+                    v[0] = q;
+                    z[0] = f64::NEG_INFINITY;
+                    z[1] = f64::INFINITY;
+                    break;
+                }
+            } else {
+                k += 1;
+                let ku = k as usize;
+                v[ku] = q;
+                z[ku] = s;
+                z[ku + 1] = f64::INFINITY;
+                break;
+            }
+        }
+    }
+    if k < 0 {
+        for o in out.iter_mut() {
+            *o = f64::INFINITY;
+        }
+        return;
+    }
+    let mut idx = 0usize;
+    for p in 0..len {
+        let pf = p as f64;
+        while z[idx + 1] < pf {
+            idx += 1;
+        }
+        let vp = v[idx];
+        let d = pf - vp as f64;
+        out[p] = d * d + f[vp];
+    }
+}
+
+/// Exact `O(N)` 3D sub-voxel squared Euclidean distance (in grid-step squared units) from every
+/// grid point to the nearest sign-changing grid-edge crossing, separated across X, Y, Z crossings:
+/// - `A = FH_Y(F_X)` and `B = FH_X(F_Y)` give exact XY-plane squared distance to X and Y crossings;
+/// - `FH_Z(min(A, B))` gives exact 3D squared distance to X and Y crossings;
+/// - `FH_Y(FH_X(F_Z))` gives exact 3D squared distance to Z crossings;
+/// - `min` of the two gives the exact 3D squared distance to all edge crossings in 5 linear passes.
+pub(crate) fn exact_subvoxel_edt3(
+    vals: &[f64],
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    cut_sq: f64,
+    out: &mut [f64],
+    s: Alloc<'_>,
+) -> Result<(), AllocFailure> {
+    let n_total = nx * ny * nz;
+    let stride_z = nx * ny;
+    let max_dim = nx.max(ny).max(nz);
+    let mut buf2 = filled(n_total, f64::INFINITY, s)?;
+    let mut line_in = filled(max_dim, f64::INFINITY, s)?;
+    let mut line_out = filled(max_dim, f64::INFINITY, s)?;
+    let mut env_v = filled(max_dim, 0usize, s)?;
+    let mut env_z = filled(max_dim + 1, 0.0f64, s)?;
+
+    // 1. X-crossings: 1D scan along X into `out`, then FH along Y in-place on `out`.
+    for iz in 0..nz {
+        let z_off = iz * stride_z;
+        for iy in 0..ny {
+            let row = z_off + iy * nx;
+            scan_line_crossings(nx, |ix| vals[row + ix], &mut out[row..row + nx]);
+        }
+        for ix in 0..nx {
+            let col = z_off + ix;
+            for iy in 0..ny {
+                line_in[iy] = out[col + iy * nx];
+            }
+            edt_1d(&line_in[..ny], &mut line_out[..ny], cut_sq, &mut env_v, &mut env_z);
+            for iy in 0..ny {
+                out[col + iy * nx] = line_out[iy];
+            }
+        }
+    }
+
+    // 2. Y-crossings: 1D scan along Y into `buf2`, then FH along X fused with `min` into `out`.
+    for iz in 0..nz {
+        let z_off = iz * stride_z;
+        for ix in 0..nx {
+            let col = z_off + ix;
+            scan_line_crossings(ny, |iy| vals[col + iy * nx], &mut line_out[..ny]);
+            for iy in 0..ny {
+                buf2[col + iy * nx] = line_out[iy];
+            }
+        }
+        for iy in 0..ny {
+            let row = z_off + iy * nx;
+            edt_1d(&buf2[row..row + nx], &mut line_out[..nx], cut_sq, &mut env_v, &mut env_z);
+            for ix in 0..nx {
+                out[row + ix] = out[row + ix].min(line_out[ix]);
+            }
+        }
+    }
+
+    // 3. FH along Z on `out`: exact 3D squared distance to all X and Y crossings.
+    for iy in 0..ny {
+        let y_off = iy * nx;
+        for ix in 0..nx {
+            let base = y_off + ix;
+            for iz in 0..nz {
+                line_in[iz] = out[base + iz * stride_z];
+            }
+            edt_1d(&line_in[..nz], &mut line_out[..nz], cut_sq, &mut env_v, &mut env_z);
+            for iz in 0..nz {
+                out[base + iz * stride_z] = line_out[iz];
+            }
+        }
+    }
+
+    // 4. Z-crossings: 1D scan along Z into `buf2`, then FH along X, then FH along Y fused with `min` into `out`.
+    for iy in 0..ny {
+        let y_off = iy * nx;
+        for ix in 0..nx {
+            let base = y_off + ix;
+            scan_line_crossings(nz, |iz| vals[base + iz * stride_z], &mut line_out[..nz]);
+            for iz in 0..nz {
+                buf2[base + iz * stride_z] = line_out[iz];
+            }
+        }
+    }
+    for iz in 0..nz {
+        let z_off = iz * stride_z;
+        for iy in 0..ny {
+            let row = z_off + iy * nx;
+            edt_1d(&buf2[row..row + nx], &mut line_out[..nx], cut_sq, &mut env_v, &mut env_z);
+            buf2[row..row + nx].copy_from_slice(&line_out[..nx]);
+        }
+        for ix in 0..nx {
+            let col = z_off + ix;
+            for iy in 0..ny {
+                line_in[iy] = buf2[col + iy * nx];
+            }
+            edt_1d(&line_in[..ny], &mut line_out[..ny], cut_sq, &mut env_v, &mut env_z);
+            for iy in 0..ny {
+                out[col + iy * nx] = out[col + iy * nx].min(line_out[iy]);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Solves the grid of a redistance node (`Graph::redistance` gave `r`) and attaches it, so the
@@ -1537,76 +2323,59 @@ pub fn solve_redistance_planted<P: Planted<CadPlant>>(
         return Err(MeshError::TooManyGridValues { values: n, most });
     }
     let (nx, ny, nz) = (blaze_int::idx(dims[0]), blaze_int::idx(dims[1]), blaze_int::idx(dims[2]));
-    let point = |ix: usize, iy: usize, iz: usize| -> D3 {
-        // Indices below 2^24, products in range: exact.
-        [m(origin[0] + step * ix as i64), m(origin[1] + step * iy as i64), m(origin[2] + step * iz as i64)]
-    };
+    let n_total = nx * ny * nz;
     let mut sc = Scratch::new(s);
-    let mut vals = filled(nx * ny * nz, 0.0f64, s)?;
-    for iz in 0..nz {
-        for iy in 0..ny {
-            for ix in 0..nx {
-                let p = point(ix, iy, iz);
-                vals[ix + nx * (iy + ny * iz)] = eval_point(&t, Vec3::new(p[0], p[1], p[2]), &mut sc);
-            }
-        }
+    let mut vals = filled(n_total, 0.0f64, s)?;
+
+    // Sample the entire 3D grid in 8-wide SIMD batches (64 points per batch).
+    let mut px_table = filled(nx, 0.0f64, s)?;
+    for ix in 0..nx {
+        px_table[ix] = m(origin[0] + step * ix as i64);
     }
-    // The crossings, grouped by their edge's lower grid point (generated in that order).
-    let mut starts = filled(nx * ny * nz + 1, 0u32, s)?;
-    let mut crossings: V<'_, D3> = Vec::new_in(s);
+    let mut cxs = [0.0f64; 64];
+    let mut cys = [0.0f64; 64];
+    let mut czs = [0.0f64; 64];
+    let mut batch_len = 0usize;
+    let mut batch_start = 0usize;
     for iz in 0..nz {
+        let pz = m(origin[2] + step * iz as i64);
         for iy in 0..ny {
+            let py = m(origin[1] + step * iy as i64);
             for ix in 0..nx {
-                let here = ix + nx * (iy + ny * iz);
-                // At most `most_values · 3` crossings, below 2^32 under the shipped caps.
-                starts[here] = crossings.len() as u32;
-                let pa = point(ix, iy, iz);
-                let va = vals[here];
-                for (axis, (ok, there)) in [(ix + 1 < nx, here + 1), (iy + 1 < ny, here + nx), (iz + 1 < nz, here + nx * ny)].into_iter().enumerate() {
-                    if !ok || inside(va) == inside(vals[there]) {
-                        continue;
-                    }
-                    let vb = vals[there];
-                    let f = va / (va - vb);
-                    let f = if f.is_nan() { 0.5 } else { f.max(0.0).min(1.0) };
-                    let mut c = pa;
-                    c[axis] = pa[axis] + f * m(step);
-                    push(&mut crossings, c)?;
+                cxs[batch_len] = px_table[ix];
+                cys[batch_len] = py;
+                czs[batch_len] = pz;
+                batch_len += 1;
+                if batch_len == 64 {
+                    eval_points_simd(&t, &cxs, &cys, &czs, &mut vals[batch_start..batch_start + 64], &mut sc)?;
+                    batch_start += 64;
+                    batch_len = 0;
                 }
             }
         }
     }
-    starts[nx * ny * nz] = crossings.len() as u32;
-    let reach = blaze_int::idx(u32::try_from(band / step + 2).unwrap_or(u32::MAX));
+    if batch_len > 0 {
+        eval_points_simd(
+            &t,
+            &cxs[..batch_len],
+            &cys[..batch_len],
+            &czs[..batch_len],
+            &mut vals[batch_start..batch_start + batch_len],
+            &mut sc,
+        )?;
+    }
+
+    // Exact O(N) 3D sub-voxel squared Euclidean distance transform to all sign-changing edges.
+    let step_m = m(step);
     let band_m = m(band);
-    // Each grid point's least squared distance to a crossing whose edge's lower point is within
-    // `reach` grid steps of it (every crossing within the band is), capped at the band's square.
-    // Scattered from the crossings, not gathered at every point: the work is the crossings (a
-    // surface) times one window, not every grid point (a volume) times one; the minimum over the
-    // same set, so the same bits.
-    let mut out = filled(nx * ny * nz, band_m * band_m, s)?;
-    for qz in 0..nz {
-        for qy in 0..ny {
-            for qx in 0..nx {
-                let q = qx + nx * (qy + ny * qz);
-                let (a, z) = (blaze_int::idx(starts[q]), blaze_int::idx(starts[q + 1]));
-                for c in &crossings[a..z] {
-                    for iz in qz.saturating_sub(reach)..(qz + reach + 1).min(nz) {
-                        for iy in qy.saturating_sub(reach)..(qy + reach + 1).min(ny) {
-                            for ix in qx.saturating_sub(reach)..(qx + reach + 1).min(nx) {
-                                let here = ix + nx * (iy + ny * iz);
-                                let w = sub(*c, point(ix, iy, iz));
-                                out[here] = out[here].min(dot(w, w));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let band_steps = band as f64 / step as f64 + 1.0;
+    let cut_sq = band_steps * band_steps;
+    let mut out = filled(n_total, f64::INFINITY, s)?;
+    exact_subvoxel_edt3(&vals, nx, ny, nz, cut_sq, &mut out, s)?;
+    let unsigned = plant.has(RedistancePlant::Unsigned);
     for (here, o) in out.iter_mut().enumerate() {
-        let d = core::f64::math::sqrt(*o);
-        *o = if inside(vals[here]) && !plant.has(RedistancePlant::Unsigned) { -d } else { d };
+        let d = if o.is_finite() { (core::f64::math::sqrt(*o) * step_m).min(band_m) } else { band_m };
+        *o = if inside(vals[here]) && !unsigned { -d } else { d };
     }
     g.attach_grid(
         r,

@@ -254,10 +254,18 @@ impl<A: Allocator + Clone> BodyBuilder<A> {
         let mut ix = TypeIndex {
             ty_base,
             list_base,
-            nodes: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
-            lists: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            nodes: Map::new(MapOpts {
+                hasher: FixedState,
+                alloc: alloc.clone(),
+                capacity: Some(ty_base as usize),
+            }),
+            lists: Map::new(MapOpts {
+                hasher: FixedState,
+                alloc: alloc.clone(),
+                capacity: Some((list_base as usize).min(ty_base as usize)),
+            }),
             canon: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
-            entries: Vec::new_in(alloc),
+            entries: Vec::with_capacity_in(list_base as usize, alloc),
         };
         for t in record.lists() {
             ix.entries.push(*t);
@@ -276,9 +284,7 @@ impl<A: Allocator + Clone> BodyBuilder<A> {
         }
         for (i, n) in record.nodes().enumerate() {
             let key = map_ty_lists(*n, |l| ix.canonical_list(l));
-            if ix.nodes.get(&key).is_none() {
-                ix.nodes.insert(key, i as u32);
-            }
+            ix.nodes.get_or_insert_with(&key, |&k| (k, i as u32));
         }
         b.types = Some(ix);
         b

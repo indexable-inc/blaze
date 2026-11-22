@@ -114,6 +114,7 @@ covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it
 ### Speed and tracing (skill `perf-and-tracing`)
 - **16. slow-is-p0-traced**: Anything slow or large is a P0 until the profile names it; the fix quotes before and after.
 - **60. incremental-first**: Judge by the edit loop first; trade: incremental and lints, remote, memory, cold, cleanup, disk.
+- **84. per-core-units**: Report throughput and latency in per-core units (`MB/s/core`, `ns/op/core`) and name core count.
 
 ### Evidence and debugging (skill `debugging`)
 - **17. ask-the-profile-first**: Say why a build was slow, reran or grew from its profile, before guessing or measuring.

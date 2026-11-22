@@ -10,25 +10,25 @@ description: "How blaze is built, checked, tested and measured, and how a lane r
 ## blaze-builds-blaze (rule 2)
 
 Interim, by the owner's decision of 2026-11-11: blaze's own tree is built, checked and unit-tested
-in the dev loop with cargo and the pinned nightly (`pins/toolchain`): `cargo +nightly-<date>
-check -p blaze-engine`, `cargo +nightly-<date> build --release -p blaze-engine`, with
-`LLVM_SYS_231_PREFIX` naming the LLVM `pins/llvm.json` pins (blaze's own copy
-under `~/.blaze/native/` serves). On 2026-11-11 that check took under two minutes and a release
-build 292 s on an 18-core Mac, where blaze building blaze took about 80 minutes and 175 GB on 64
-cores. A blaze cargo built is a legal stage 0 and the daily driver. What does not change: blaze must
-keep building blaze (a self-build runs at least daily and before a release, and a release binary is
-one blaze built, stage 2 equal to stage 3); a claim about what blaze does (it builds a project, an
-edit takes so long, a test passes under it) is measured with a blaze, never with cargo standing in
-for it; and a failure of blaze on blaze (a compile error, a panic, too slow, too much memory) is
-ranked work, never dropped because cargo got past it. The tree stays accepted by both compilers
-while this holds: attribute-form extensions (`#[blaze::pure]`, `#![blaze::sans_io]`, tool attributes
-rustc ignores) are used as before, and code only blaze accepts (a borrow rustc refuses, extension
-syntax) waits or sits behind the extension's own crate; where the two disagree on plain Rust,
-rustc's refusal of a program blaze accepted is a blaze bug to file (2026-11-11: a method redeclaring
-its impl's lifetime). The rule returns to blaze-only when the owner says the loop is fast enough;
-the measure to watch is a warm rebuild of blaze by blaze after a one-function change in under a
-minute, and a cold one inside 64 GiB. While cargo builds blaze, a new crate is written on `core` and
-`alloc` and need not be on bstd; it moves to bstd once blaze builds blaze. Never sccache.
+in the dev loop with cargo and the pinned nightly (`pins/toolchain`): `cargo +nightly-<date> check
+-p blaze-engine`, `cargo +nightly-<date> build --release -p blaze-engine`, with
+`LLVM_SYS_231_PREFIX` naming the LLVM `pins/llvm.json` pins (blaze's own copy under
+`~/.blaze/native/` serves). On 2026-11-11 that check took under two minutes and a release build 292
+s on an 18-core Mac, where blaze building blaze took about 80 minutes and 175 GB on 64 cores. A
+blaze cargo built is a legal stage 0 and the daily driver. What does not change: blaze must keep
+building blaze (a self-build runs at least daily and before a release, and a release binary is one
+blaze built, stage 2 equal to stage 3); a claim about what blaze does (it builds a project, an edit
+takes so long, a test passes under it) is measured with a blaze, never with cargo standing in for
+it; and a failure of blaze on blaze (a compile error, a panic, too slow, too much memory) is ranked
+work, never dropped because cargo got past it. The tree stays accepted by both compilers while this
+holds: attribute-form extensions (`#[blaze::pure]`, `#![blaze::sans_io]`, tool attributes rustc
+ignores) are used as before, and code only blaze accepts (a borrow rustc refuses, extension syntax)
+waits or sits behind the extension's own crate; where the two disagree on plain Rust, rustc's
+refusal of a program blaze accepted is a blaze bug to file (2026-11-11: a method redeclaring its
+impl's lifetime). The rule returns to blaze-only when the owner says the loop is fast enough; the
+measure to watch is a warm rebuild of blaze by blaze after a one-function change in under a minute,
+and a cold one inside 64 GiB. While cargo builds blaze, a new crate is written on `core` and `alloc`
+and need not be on bstd; it moves to bstd once blaze builds blaze. Never sccache.
 
 See [docs/contributing.md](../../../docs/contributing.md).
 

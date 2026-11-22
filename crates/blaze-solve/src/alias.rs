@@ -154,7 +154,7 @@ fn args_with_self<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, args: List, self_
     if cx.arg(args, 0) == self_ty {
         return Ok(args);
     }
-    let mut v = cx.list(args);
+    let mut v = cx.list_small(args);
     v[0] = self_ty;
     cx.mk_list(&v)
 }
@@ -167,8 +167,8 @@ fn prefix<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, l: List, n: u32) -> Resul
     if n == l.len {
         return Ok(l);
     }
-    let v = cx.list(l);
-    cx.mk_list(&v[..n as usize])
+    let v = cx.list_range_small(l, 0, n);
+    cx.mk_list(&v)
 }
 
 /// The frame's `NormalizesTo` goal.
@@ -674,7 +674,7 @@ fn normalize_opaque_type<T: Tys, F: Facts>(
         TypingMode::Coherence => {
             let op = cx.opaque(def)?;
             // `add_item_bounds_for_hidden_type`.
-            let argv = cx.list(args);
+            let argv = cx.list_small(args);
             for &b in op.bounds {
                 let p = cx.import_pred(op.portable, b, args)?;
                 let p = cx.map_pred(p, |cx, t| {
@@ -1018,11 +1018,15 @@ fn step_impl<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, stage
         // `fetch_eligible_assoc_item`: a final item; `translate_args` from the same impl: the
         // impl's arguments, then the item's own (the goal's arguments after the trait's).
         Some(ia) if !ia.is_default => {
-            let mut all = cx.list(iargs);
-            for i in tgen..args.len {
-                all.push(cx.arg(args, i));
-            }
-            let all = cx.mk_list(&all)?;
+            let all = if tgen >= args.len {
+                iargs
+            } else {
+                let mut all = cx.list(iargs);
+                for i in tgen..args.len {
+                    all.push(cx.arg(args, i));
+                }
+                cx.mk_list(&all)?
+            };
             cx.import_head(ParamHead::ImplValue { impl_: cand.d, item }, h.portable, ia.value, all)?
         }
         // A `default` item is not eligible: ambiguous in coherence, rigid elsewhere.

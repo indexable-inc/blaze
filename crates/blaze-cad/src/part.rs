@@ -3,15 +3,15 @@
 #![blaze::sans_io]
 
 use blaze_cad_field::{
-    AtLeastInside, Bound, CadPlant, CompileOpts, Detail, Ex, Graph, Name, OffsetOpts, Outside, Placement, Solid, Tape, Weakens,
-    compile,
+    AtLeastInside, Bound, CadPlant, CompileOpts, Detail, Ex, Graph, GyroidOpts, Join, Name, OffsetOpts, Outside, Placement, Solid,
+    Tape, Weakens, compile,
 };
-use blaze_cad_mesh::{MeshOpts, Meshed, PieceCache, RedistanceOpts, Verified, mesh, mesh_cached, solve_redistance};
+use blaze_cad_mesh::{MaterialRole, MeshOpts, Meshed, PieceCache, RedistanceOpts, Verified, mesh, mesh_cached, solve_redistance};
 use blaze_own::Alloc;
 use blaze_own::planted::{NoPlant, Planted};
 use blaze_units::{Density, Length, Mass, Volume};
 
-use crate::{MassPlant, ModelError, PartPlant, RoundPlant};
+use crate::{MassPlant, ModelError, PartId, PartPlant, RoundPlant};
 
 /// A named solid and where it sits. PLACEMENT IS NOT GEOMETRY: `solid` is the unplaced shape
 /// (its digest, and so every mesh piece and check record of it, does not move when the part
@@ -23,6 +23,10 @@ pub struct Part<K: Ex = Bound> {
     pub solid: Solid<K>,
     pub placement: Placement,
     pub name: Name,
+    /// Material role index into `ExportOpts::materials` (defaults to `MaterialRole(0)`).
+    pub material: MaterialRole,
+    /// Optional parent part in a scene/model hierarchy (defaults to `None` for a root node).
+    pub parent: Option<PartId>,
 }
 
 /// What [`Part::new`] takes.
@@ -49,10 +53,16 @@ impl<K: Ex> Part<K> {
         plant: impl Planted<PartPlant>,
     ) -> Result<Part<K>, ModelError> {
         if plant.has(PartPlant::PlacementKept) {
-            return Ok(Part { solid: o.solid, placement: Placement::IDENTITY, name: Name::new(o.name) });
+            return Ok(Part {
+                solid: o.solid,
+                placement: Placement::IDENTITY,
+                name: Name::new(o.name),
+                material: MaterialRole(0),
+                parent: None,
+            });
         }
         let (placement, local) = g.split_placement(o.solid).map_err(ModelError::Cad)?;
-        Ok(Part { solid: local, placement, name: Name::new(o.name) })
+        Ok(Part { solid: local, placement, name: Name::new(o.name), material: MaterialRole(0), parent: None })
     }
 
     /// The same part somewhere else: only the placement changes, so its pieces and records stay.
@@ -60,13 +70,51 @@ impl<K: Ex> Part<K> {
         Part { placement, ..self }
     }
 
+    /// The same part assigned a material role for export (`ExportOpts::materials[role.0]`).
+    pub fn with_material(self, material: MaterialRole) -> Part<K> {
+        Part { material, ..self }
+    }
+
+    /// The same part attached under `parent` in the exported scene hierarchy.
+    pub fn with_parent(self, parent: Option<PartId>) -> Part<K> {
+        Part { parent, ..self }
+    }
+
     /// The same part at a weaker level (an assembly takes `Part<Bound>`).
     pub fn weaken<J: Ex>(self) -> Part<J>
     where
         K: Weakens<J>,
     {
-        Part { solid: self.solid.weaken::<J>(), placement: self.placement, name: self.name }
+        Part {
+            solid: self.solid.weaken::<J>(),
+            placement: self.placement,
+            name: self.name,
+            material: self.material,
+            parent: self.parent,
+        }
     }
+}
+
+/// A triply periodic minimal surface (TPMS) gyroid sheet: intersect with a finite solid to
+/// produce a lattice/infill part.
+pub fn gyroid<P: Planted<CadPlant>>(g: &mut Graph<'_, P>, o: GyroidOpts<'_>) -> Result<Solid<Bound>, ModelError> {
+    g.gyroid(o).map_err(ModelError::Cad)
+}
+
+/// Balanced binary tree union of `solids` (depth `ceil(log2(n))`, preserving exactness level).
+pub fn union_all<K: Join<K>, P: Planted<CadPlant>>(
+    g: &mut Graph<'_, P>,
+    solids: &[Solid<K>],
+) -> Result<Solid<K::Union>, ModelError> {
+    g.union_all(solids).map_err(ModelError::Cad)
+}
+
+/// Balanced binary tree intersection of `solids` (depth `ceil(log2(n))`, preserving exactness level).
+pub fn intersect_all<K: Join<K>, P: Planted<CadPlant>>(
+    g: &mut Graph<'_, P>,
+    solids: &[Solid<K>],
+) -> Result<Solid<K::Intersect>, ModelError> {
+    g.intersect_all(solids).map_err(ModelError::Cad)
 }
 
 /// The union of the parts, each at its placement, as a balanced tree: moving one part re-keys its

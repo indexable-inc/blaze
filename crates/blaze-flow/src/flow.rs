@@ -352,6 +352,25 @@ impl<A: Allocator> Flow<A> {
         }
     }
 
+    /// Returns the `idx`-th successor statement of `s`, or `None`.
+    #[inline]
+    pub(crate) fn nth_succ(&self, s: Stmt, idx: u32) -> Option<Stmt> {
+        match self.stmt(s).kind {
+            StmtKind::Goto(b) => (idx == 0).then(|| Stmt(self.blocks[b.index()].start)),
+            StmtKind::Switch { targets, .. } => {
+                let i = targets.start + idx;
+                (i < targets.end).then(|| Stmt(self.blocks[self.succ[i as usize].index()].start))
+            }
+            StmtKind::Suspend { resume, cancel } => match idx {
+                0 => Some(Stmt(self.blocks[resume.index()].start)),
+                1 => Some(Stmt(self.blocks[cancel.index()].start)),
+                _ => None,
+            },
+            StmtKind::Return | StmtKind::Unreachable => None,
+            _ => (idx == 0).then(|| Stmt(s.0 + 1)),
+        }
+    }
+
     pub fn origin_live_mentions(&self, l: Local) -> impl Iterator<Item = Origin> + '_ {
         self.local_origins.iter().filter(move |(x, _)| *x == l).map(|(_, o)| *o)
     }
@@ -474,10 +493,17 @@ impl<A: Allocator> Flow<A> {
     }
 }
 
+const NO_CHILD: u32 = u32::MAX;
+
 /// Builds a flow by hand: reserve blocks, then fill each in turn, ending it with a terminator.
 pub struct FlowBuilder<A: Allocator + Clone> {
     flow: Flow<A>,
     filled: Vec<bool, A>,
+    /// Intrusive linked list of direct children per place (`NO_CHILD` = end).
+    first_child: Vec<u32, A>,
+    next_sibling: Vec<u32, A>,
+    /// True when `flow.local_origins` has received an out-of-order entry and needs sort+dedup at `finish`.
+    local_origins_dirty: bool,
     open: Option<Block>,
     error: Option<FlowError>,
 }
@@ -485,8 +511,11 @@ pub struct FlowBuilder<A: Allocator + Clone> {
 impl<A: Allocator + Clone> FlowBuilder<A> {
     /// A body of `locals` locals, of which `1..=args` are arguments (`Local(0)` returns).
     pub fn new_in(locals: u32, args: u32, alloc: A) -> FlowBuilder<A> {
-        let mut places = Vec::new_in(alloc.clone());
-        let mut local_places = Vec::new_in(alloc.clone());
+        let cap = locals as usize;
+        let mut places = Vec::with_capacity_in(cap, alloc.clone());
+        let mut local_places = Vec::with_capacity_in(cap, alloc.clone());
+        let mut first_child = Vec::with_capacity_in(cap, alloc.clone());
+        let mut next_sibling = Vec::with_capacity_in(cap, alloc.clone());
         for l in 0..locals {
             local_places.push(Place(l));
             places.push(PlaceRow {
@@ -497,6 +526,8 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
                 of_drop_type: false,
                 of_slice: false,
             });
+            first_child.push(NO_CHILD);
+            next_sibling.push(NO_CHILD);
         }
         FlowBuilder {
             flow: Flow {
@@ -517,6 +548,9 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
                 local_places,
             },
             filled: Vec::new_in(alloc),
+            first_child,
+            next_sibling,
+            local_origins_dirty: false,
             open: None,
             error: None,
         }
@@ -537,6 +571,8 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
         let l = Local(self.flow.locals);
         self.flow.locals += 1;
         self.flow.places.push(PlaceRow { local: l, parent: None, proj: None, depth: 0, of_drop_type: false, of_slice: false });
+        self.first_child.push(NO_CHILD);
+        self.next_sibling.push(NO_CHILD);
         self.flow.local_places.push(Place(self.flow.places.len() as u32 - 1));
         l
     }
@@ -554,12 +590,16 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
     /// As [`Self::project`], the new row marked `mark` (a place is interned by its parent and
     /// projection: the mark is a fact of those, so a second ask finds the first row).
     pub fn project_in(&mut self, parent: Place, proj: Proj, mark: PlaceMark) -> Place {
-        for (i, row) in self.flow.places.iter().enumerate() {
-            if row.parent == Some(parent) && row.proj == Some(proj) {
-                return Place(i as u32);
+        let p_idx = parent.index();
+        let mut cur = self.first_child[p_idx];
+        while cur != NO_CHILD {
+            if self.flow.places[cur as usize].proj == Some(proj) {
+                return Place(cur);
             }
+            cur = self.next_sibling[cur as usize];
         }
         let up = self.flow.place(parent);
+        let id = self.flow.places.len() as u32;
         self.flow.places.push(PlaceRow {
             local: up.local,
             parent: Some(parent),
@@ -568,7 +608,10 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
             of_drop_type: mark == PlaceMark::DropField,
             of_slice: mark == PlaceMark::SliceElement,
         });
-        Place(self.flow.places.len() as u32 - 1)
+        self.first_child.push(NO_CHILD);
+        self.next_sibling.push(self.first_child[p_idx]);
+        self.first_child[p_idx] = id;
+        Place(id)
     }
 
     pub fn origin(&mut self, placeholder: bool) -> Origin {
@@ -580,9 +623,15 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
     /// The type of `local` mentions `origin`.
     pub fn mentions(&mut self, local: u32, origin: Origin) {
         let row = (Local(local), origin);
-        if let Err(at) = self.flow.local_origins.binary_search(&row) {
-            self.flow.local_origins.insert(at, row);
+        if let Some(&last) = self.flow.local_origins.last() {
+            if row == last {
+                return;
+            }
+            if row < last {
+                self.local_origins_dirty = true;
+            }
         }
+        self.flow.local_origins.push(row);
     }
 
     /// The signature says `from: into` between two placeholders.
@@ -698,7 +747,7 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
         self.push(StmtKind::Suspend { resume, cancel }, Span::default());
     }
 
-    pub fn finish(self) -> Result<Flow<A>, FlowError> {
+    pub fn finish(mut self) -> Result<Flow<A>, FlowError> {
         if let Some(e) = self.error {
             return Err(e);
         }
@@ -710,6 +759,10 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
         }
         if let Some(b) = self.filled.iter().position(|f| !f) {
             return Err(FlowError::UnfilledBlock(Block(b as u32)));
+        }
+        if self.local_origins_dirty {
+            self.flow.local_origins.sort_unstable();
+            self.flow.local_origins.dedup();
         }
         Ok(self.flow)
     }

@@ -14,6 +14,7 @@
 //! Every function is sans-IO and takes the allocator it allocates in.
 
 #![no_std]
+#![forbid(unsafe_code)]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 

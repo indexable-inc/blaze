@@ -14,6 +14,7 @@
 //! No recursion: one task stack and one value stack, every loop bounded by the body's size.
 
 #![no_std]
+#![forbid(unsafe_code)]
 #![feature(allocator_api)]
 
 #[cfg(test)]
@@ -1280,6 +1281,118 @@ struct Target {
     temps: u32,
 }
 
+/// Inline work stack for type walks (`npos_positions`, `positions_all_opaque`, `is_copy`,
+/// `needs_drop`): zero heap allocation up to depth 16, spilling to an explicit-allocator `Vec`
+/// only past 16.
+struct TyStack<A: Allocator> {
+    inline: [PTy; 16],
+    len: usize,
+    spill: Vec<PTy, A>,
+}
+
+impl<A: Allocator> TyStack<A> {
+    #[inline]
+    fn new(root: PTy, alloc: A) -> Self {
+        let mut inline = [PTy(0); 16];
+        inline[0] = root;
+        Self { inline, len: 1, spill: Vec::new_in(alloc) }
+    }
+
+    #[inline]
+    fn push(&mut self, t: PTy) {
+        if self.spill.is_empty() && self.len < self.inline.len() {
+            self.inline[self.len] = t;
+            self.len += 1;
+        } else {
+            self.spill.push(t);
+        }
+    }
+
+    #[inline]
+    fn extend_from_slice(&mut self, slice: &[PTy]) {
+        if self.spill.is_empty() && self.len + slice.len() <= self.inline.len() {
+            self.inline[self.len..self.len + slice.len()].copy_from_slice(slice);
+            self.len += slice.len();
+        } else {
+            self.spill.extend_from_slice(slice);
+        }
+    }
+
+    #[inline]
+    fn pop(&mut self) -> Option<PTy> {
+        if let Some(t) = self.spill.pop() {
+            return Some(t);
+        }
+        if self.len > 0 {
+            self.len -= 1;
+            return Some(self.inline[self.len]);
+        }
+        None
+    }
+}
+
+/// Builds a dense O(1) first-match index table (`u32::MAX` sentinel) from a column of `ExprId`s.
+fn index_expr_rows<A: Allocator>(col: &[ExprId], n_exprs: usize, alloc: A) -> Vec<u32, A> {
+    if col.is_empty() {
+        return Vec::new_in(alloc);
+    }
+    let mut table = Vec::from_elem_in(u32::MAX, n_exprs, alloc);
+    for (i, &e) in col.iter().enumerate() {
+        if let Some(slot) = table.get_mut(e.ix())
+            && *slot == u32::MAX
+        {
+            *slot = i as u32;
+        }
+    }
+    table
+}
+
+/// Builds a dense O(1) first-match index table (`u32::MAX` sentinel) from a column of `PatId`s.
+fn index_pat_rows<A: Allocator>(col: &[PatId], n_pats: usize, alloc: A) -> Vec<u32, A> {
+    if col.is_empty() {
+        return Vec::new_in(alloc);
+    }
+    let mut table = Vec::from_elem_in(u32::MAX, n_pats, alloc);
+    for (i, &p) in col.iter().enumerate() {
+        if let Some(slot) = table.get_mut(p.ix())
+            && *slot == u32::MAX
+        {
+            *slot = i as u32;
+        }
+    }
+    table
+}
+
+/// Builds a CSR index over `ck.captures.column::<0>()` keyed by `ExprId`, preserving exact row order.
+fn build_capture_csr<A: Allocator + Clone>(col: &[ExprId], n_exprs: usize, alloc: A) -> (Vec<u32, A>, Vec<u32, A>) {
+    if col.is_empty() || n_exprs == 0 {
+        return (Vec::new_in(alloc.clone()), Vec::new_in(alloc));
+    }
+    let mut offsets = Vec::from_elem_in(0u32, n_exprs + 1, alloc.clone());
+    for &ce in col {
+        let i = ce.ix();
+        if i < n_exprs {
+            offsets[i + 1] += 1;
+        }
+    }
+    for i in 1..=n_exprs {
+        offsets[i] += offsets[i - 1];
+    }
+    let total = offsets[n_exprs] as usize;
+    let mut rows = Vec::from_elem_in(0u32, total, alloc);
+    for (row, &ce) in col.iter().enumerate() {
+        let i = ce.ix();
+        if i < n_exprs {
+            let pos = offsets[i] as usize;
+            offsets[i] = (pos + 1) as u32;
+            rows[pos] = row as u32;
+        }
+    }
+    offsets.copy_within(0..n_exprs, 1);
+    offsets[0] = 0;
+    (offsets, rows)
+}
+
 /// One body's lowering. `R` is the call rule (rule 78, D156: one_call.rs); a lowering named
 /// without it is production's ([`one_call::Production`]).
 struct Lower<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule = one_call::Production> {
@@ -1292,6 +1405,20 @@ struct Lower<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule = one
     b: builder::Builder<A>,
     rule: core::marker::PhantomData<R>,
     alloc: A,
+    /// Dense O(1) first-match lookup tables into `ck` columns (`u32::MAX` = absent).
+    expr_def_row: Vec<u32, A>,
+    pat_def_row: Vec<u32, A>,
+    callee_row: Vec<u32, A>,
+    field_row: Vec<u32, A>,
+    closure_ordinal: Vec<u32, A>,
+    /// CSR index over `ck.captures` keyed by `ExprId`, preserving row order.
+    cap_offsets: Vec<u32, A>,
+    cap_rows: Vec<u32, A>,
+    /// Per-`PTy` memo tables (0 = unknown, 1 = false, 2 = true; `u32::MAX` = unknown for `npos`).
+    copy_memo: Vec<core::cell::Cell<u8>, A>,
+    drop_memo: Vec<core::cell::Cell<u8>, A>,
+    all_opaque_memo: Vec<core::cell::Cell<u8>, A>,
+    npos_memo: Vec<core::cell::Cell<u32>, A>,
     /// Per pattern: the flow local of a binding, `u32::MAX` before it is bound.
     pat_local: Vec<u32, A>,
     local_ty: Vec<TyD, A>,
@@ -1396,14 +1523,35 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
                 *t = true;
             }
         }
+        let tys = ck.types.view();
+        let n_exprs = body.exprs.len();
+        let n_pats = body.pats.len();
+        let n_tys = tys.len();
+        let expr_def_row = index_expr_rows(ck.expr_defs.column::<0>(), n_exprs, alloc.clone());
+        let pat_def_row = index_pat_rows(ck.pat_defs.column::<0>(), n_pats, alloc.clone());
+        let callee_row = index_expr_rows(ck.callees.column::<0>(), n_exprs, alloc.clone());
+        let field_row = index_expr_rows(ck.fields.column::<0>(), n_exprs, alloc.clone());
+        let closure_ordinal = index_expr_rows(ck.closures.column::<0>(), n_exprs, alloc.clone());
+        let (cap_offsets, cap_rows) = build_capture_csr(ck.captures.column::<0>(), n_exprs, alloc.clone());
         let mut l = Lower {
             body,
             ck,
-            tys: ck.types.view(),
+            tys,
             facts,
             b,
             rule: core::marker::PhantomData,
             alloc: alloc.clone(),
+            expr_def_row,
+            pat_def_row,
+            callee_row,
+            field_row,
+            closure_ordinal,
+            cap_offsets,
+            cap_rows,
+            copy_memo: Vec::from_elem_in(core::cell::Cell::new(0u8), n_tys, alloc.clone()),
+            drop_memo: Vec::from_elem_in(core::cell::Cell::new(0u8), n_tys, alloc.clone()),
+            all_opaque_memo: Vec::from_elem_in(core::cell::Cell::new(0u8), n_tys, alloc.clone()),
+            npos_memo: Vec::from_elem_in(core::cell::Cell::new(u32::MAX), n_tys, alloc.clone()),
             pat_local,
             local_ty: Vec::new_in(alloc.clone()),
             local_origs: Vec::new_in(alloc.clone()),
@@ -1518,28 +1666,59 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
         (lo, hi)
     }
 
+    #[inline]
+    fn capture_range(&self, e: ExprId) -> (usize, usize) {
+        let i = e.ix();
+        if i < self.cap_offsets.len().saturating_sub(1) {
+            (self.cap_offsets[i] as usize, self.cap_offsets[i + 1] as usize)
+        } else {
+            (0, 0)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn captures_of(&self, e: ExprId) -> &[u32] {
+        let (lo, hi) = self.capture_range(e);
+        &self.cap_rows[lo..hi]
+    }
+
+    #[inline]
+    fn closure_row(&self, e: ExprId) -> Option<usize> {
+        let row = *self.closure_ordinal.get(e.ix())?;
+        if row == u32::MAX { None } else { Some(row as usize) }
+    }
+
     fn expr_def(&self, e: ExprId) -> Option<Def> {
-        let col = self.ck.expr_defs.column::<0>();
-        let i = col.iter().position(|x| *x == e)?;
-        Some(self.ck.expr_defs.column::<1>()[i])
+        let row = *self.expr_def_row.get(e.ix())?;
+        if row == u32::MAX {
+            return None;
+        }
+        Some(self.ck.expr_defs.column::<1>()[row as usize])
     }
 
     fn pat_def(&self, p: PatId) -> Option<Def> {
-        let col = self.ck.pat_defs.column::<0>();
-        let i = col.iter().position(|x| *x == p)?;
-        Some(self.ck.pat_defs.column::<1>()[i])
+        let row = *self.pat_def_row.get(p.ix())?;
+        if row == u32::MAX {
+            return None;
+        }
+        Some(self.ck.pat_defs.column::<1>()[row as usize])
     }
 
     fn callee_of(&self, e: ExprId) -> Option<(ItemKey, List)> {
-        let col = self.ck.callees.column::<0>();
-        let i = col.iter().position(|x| *x == e)?;
+        let row = *self.callee_row.get(e.ix())?;
+        if row == u32::MAX {
+            return None;
+        }
+        let i = row as usize;
         Some((self.ck.callees.column::<1>()[i], self.ck.callees.column::<2>()[i]))
     }
 
     fn field_of(&self, e: ExprId) -> Option<u32> {
-        let col = self.ck.fields.column::<0>();
-        let i = col.iter().position(|x| *x == e)?;
-        Some(self.ck.fields.column::<2>()[i])
+        let row = *self.field_row.get(e.ix())?;
+        if row == u32::MAX {
+            return None;
+        }
+        Some(self.ck.fields.column::<2>()[row as usize])
     }
 
     fn adt_facts(&self, k: ItemKey, e: ExprId) -> Result<AdtFacts, Refusal> {
@@ -1569,8 +1748,41 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
     }
 
     /// [`Lower::npos`] in the positions' grain (the old paths', unchanged).
-    pub(crate) fn npos_positions(&self, t: PTy, e: ExprId) -> Result<u32, Refusal> {
+    pub(crate) fn npos_positions(&self, root: PTy, e: ExprId) -> Result<u32, Refusal> {
         use blaze_typeck::regions::{Arity, Count, NotKnown, Unknown, region_arity};
+        if let Some(cell) = self.npos_memo.get(root.0 as usize) {
+            let cached = cell.get();
+            if cached != u32::MAX {
+                return Ok(cached);
+            }
+        }
+        let root_node = self.node(root, e)?;
+        let quick = match root_node {
+            PNode::Bool
+            | PNode::Char
+            | PNode::Int(_)
+            | PNode::Uint(_)
+            | PNode::Float(_)
+            | PNode::Str
+            | PNode::Never
+            | PNode::FnDef(..)
+            | PNode::Param(_)
+            | PNode::Infer
+            | PNode::Error
+            | PNode::ConstValue { .. }
+            | PNode::ConstParam(_)
+            | PNode::ExAuto(_)
+            | PNode::Foreign(_) => Some(0),
+            PNode::Tuple(l) if l.len == 0 => Some(0),
+            PNode::Opaque(_, _) | PNode::Alias { .. } | PNode::Dynamic(_) => Some(1),
+            _ => None,
+        };
+        if let Some(ans) = quick {
+            if let Some(cell) = self.npos_memo.get(root.0 as usize) {
+                cell.set(ans);
+            }
+            return Ok(ans);
+        }
         /// The facts `region_arity` reads, from this lowering's `Facts`: an ADT's lifetime
         /// parameters as its head declares them. An opaque and an alias count ONE position as
         /// before; they take their true arity (an opaque's captured lifetimes, an alias's trait
@@ -1595,14 +1807,20 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
             }
         }
         let arity = ByFacts(self.facts);
-        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
-        stack.push(t);
+        let mut stack = TyStack::new(root, self.alloc.clone());
         let mut n = 0u32;
         let mut steps = 0u32;
         while let Some(t) = stack.pop() {
             steps += 1;
             if steps > MOST_POSITIONS {
                 return self.refuse(Form::Bound, e);
+            }
+            if let Some(cell) = self.npos_memo.get(t.0 as usize) {
+                let cached = cell.get();
+                if cached != u32::MAX {
+                    n += cached;
+                    continue;
+                }
             }
             let node = self.node(t, e)?;
             match node {
@@ -1638,10 +1856,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
                     // After the captures', the signature positions its owner binds (D148:
                     // closure.rs `sig_slots`).
                     n += self.owner_sig_count(ordinal as usize, e)?;
-                    for (i, x) in ck.captures.column::<0>().iter().enumerate() {
-                        if *x != ce {
-                            continue;
-                        }
+                    for &row in self.captures_of(ce) {
+                        let i = row as usize;
                         if ck.captures.column::<2>()[i] != blaze_typeck::CaptureKind::ByValue {
                             n += 1;
                         }
@@ -1663,10 +1879,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
                 // reference, then the captured type's own.
                 PNode::Future(fe, _, _) => {
                     let ck: &'c Checked<'c> = self.ck;
-                    for (i, x) in ck.captures.column::<0>().iter().enumerate() {
-                        if *x != fe {
-                            continue;
-                        }
+                    for &row in self.captures_of(fe) {
+                        let i = row as usize;
                         if ck.captures.column::<2>()[i] != blaze_typeck::CaptureKind::ByValue {
                             n += 1;
                         }
@@ -1680,6 +1894,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
                 _ => {}
             }
         }
+        if n != u32::MAX
+            && let Some(cell) = self.npos_memo.get(root.0 as usize)
+        {
+            cell.set(n);
+        }
         Ok(n)
     }
 
@@ -1687,14 +1906,48 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
     /// reference, no ADT lifetime parameter, no projection, trait object, closure or async block
     /// position among them (each of those may stand for an elided lifetime of a written
     /// output). A bounded work list, as `npos`.
-    fn positions_all_opaque(&self, t: PTy, e: ExprId) -> Result<bool, Refusal> {
-        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
-        stack.push(t);
+    fn positions_all_opaque(&self, root: PTy, e: ExprId) -> Result<bool, Refusal> {
+        if let Some(cell) = self.all_opaque_memo.get(root.0 as usize) {
+            let v = cell.get();
+            if v != 0 {
+                return Ok(v == 2);
+            }
+        }
+        let quick = match self.node(root, e)? {
+            PNode::Ptr(..) | PNode::Slice(_) | PNode::Pat(..) | PNode::Array(..) | PNode::FnPtr(..) | PNode::Adt(..) => None,
+            PNode::Tuple(l) if l.len > 0 => None,
+            PNode::Ref(..)
+            | PNode::Alias { .. }
+            | PNode::Dynamic(_)
+            | PNode::Closure { .. }
+            | PNode::Future(..)
+            | PNode::Coroutine { .. } => Some(false),
+            _ => Some(true),
+        };
+        if let Some(ans) = quick {
+            if let Some(cell) = self.all_opaque_memo.get(root.0 as usize) {
+                cell.set(if ans { 2 } else { 1 });
+            }
+            return Ok(ans);
+        }
+        let mut stack = TyStack::new(root, self.alloc.clone());
         let mut steps = 0u32;
         while let Some(t) = stack.pop() {
             steps += 1;
             if steps > MOST_POSITIONS {
                 return self.refuse(Form::Bound, e);
+            }
+            if let Some(cell) = self.all_opaque_memo.get(t.0 as usize) {
+                let v = cell.get();
+                if v == 1 {
+                    if let Some(rc) = self.all_opaque_memo.get(root.0 as usize) {
+                        rc.set(1);
+                    }
+                    return Ok(false);
+                }
+                if v == 2 {
+                    continue;
+                }
             }
             match self.node(t, e)? {
                 PNode::Opaque(_, _) => {}
@@ -1702,13 +1955,24 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
                 PNode::Tuple(l) | PNode::FnPtr(l, _) => stack.extend_from_slice(self.list(l, e)?),
                 PNode::Adt(k, l) => {
                     if self.adt_facts(k, e)?.lifetimes > 0 {
+                        if let Some(rc) = self.all_opaque_memo.get(root.0 as usize) {
+                            rc.set(1);
+                        }
                         return Ok(false);
                     }
                     stack.extend_from_slice(self.list(l, e)?);
                 }
-                PNode::Ref(..) | PNode::Alias { .. } | PNode::Dynamic(_) | PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => return Ok(false),
+                PNode::Ref(..) | PNode::Alias { .. } | PNode::Dynamic(_) | PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => {
+                    if let Some(rc) = self.all_opaque_memo.get(root.0 as usize) {
+                        rc.set(1);
+                    }
+                    return Ok(false);
+                }
                 _ => {}
             }
+        }
+        if let Some(rc) = self.all_opaque_memo.get(root.0 as usize) {
+            rc.set(2);
         }
         Ok(true)
     }
@@ -1862,10 +2126,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
         // start in the closure's, how many, and its type.
         let mut rel: Vec<(Place, u32, u32, TyD), A> = Vec::new_in(self.alloc.clone());
         let mut at = ci.start;
-        for (i, x) in ck.captures.column::<0>().iter().enumerate() {
-            if *x != e {
-                continue;
-            }
+        let (cap_lo, cap_hi) = self.capture_range(e);
+        for idx in cap_lo..cap_hi {
+            let i = self.cap_rows[idx] as usize;
             let p = ck.captures.column::<1>()[i];
             // In an async block's body, a variable the block captures by reference is `*arg`.
             let (pl, lt) = self.binding_place(p, e)?;
@@ -1894,7 +2157,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
         // After the captures', the signature positions the owner binds (closure.rs
         // `sig_slots`): no operand fills them; the calls and the requirements relate them.
         let caps = at - ci.start;
-        let nsig = match ck.closures.column::<0>().iter().position(|&c| c == e) {
+        let nsig = match self.closure_row(e) {
             Some(row) => self.owner_sig_count(row, e)?,
             None => 0,
         };
@@ -1942,13 +2205,60 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
         if let Some(m) = t.wrap {
             return Ok(m == Mutbl::Not);
         }
-        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
-        stack.push(t.ty);
+        self.is_copy_pty(t.ty, e)
+    }
+
+    fn is_copy_pty(&self, root: PTy, e: ExprId) -> Result<bool, Refusal> {
+        if let Some(cell) = self.copy_memo.get(root.0 as usize) {
+            let v = cell.get();
+            if v != 0 {
+                return Ok(v == 2);
+            }
+        }
+        let quick = match self.node(root, e)? {
+            PNode::Bool
+            | PNode::Char
+            | PNode::Int(_)
+            | PNode::Uint(_)
+            | PNode::Float(_)
+            | PNode::Never
+            | PNode::Ptr(..)
+            | PNode::FnDef(..)
+            | PNode::FnPtr(..)
+            | PNode::ConstValue { .. }
+            | PNode::ConstParam(_)
+            | PNode::Ref(Mutbl::Not, _) => Some(true),
+            PNode::Ref(Mutbl::Mut, _) => Some(false),
+            PNode::Param(i) => Some(self.facts.param_copy(i)),
+            PNode::Tuple(l) if l.len == 0 => Some(true),
+            PNode::Tuple(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
+            PNode::Closure { owner, .. } if owner == self.body.owner => None,
+            _ => Some(false),
+        };
+        if let Some(ans) = quick {
+            if let Some(cell) = self.copy_memo.get(root.0 as usize) {
+                cell.set(if ans { 2 } else { 1 });
+            }
+            return Ok(ans);
+        }
+        let mut stack = TyStack::new(root, self.alloc.clone());
         let mut steps = 0u32;
         while let Some(t) = stack.pop() {
             steps += 1;
             if steps > MOST_POSITIONS {
                 return self.refuse(Form::Bound, e);
+            }
+            if let Some(cell) = self.copy_memo.get(t.0 as usize) {
+                let v = cell.get();
+                if v == 1 {
+                    if let Some(rc) = self.copy_memo.get(root.0 as usize) {
+                        rc.set(1);
+                    }
+                    return Ok(false);
+                }
+                if v == 2 {
+                    continue;
+                }
             }
             match self.node(t, e)? {
                 PNode::Bool
@@ -1963,11 +2273,19 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
                 | PNode::ConstValue { .. }
                 | PNode::ConstParam(_)
                 | PNode::Ref(Mutbl::Not, _) => {}
-                PNode::Ref(Mutbl::Mut, _) => return Ok(false),
+                PNode::Ref(Mutbl::Mut, _) => {
+                    if let Some(rc) = self.copy_memo.get(root.0 as usize) {
+                        rc.set(1);
+                    }
+                    return Ok(false);
+                }
                 PNode::Tuple(l) => stack.extend_from_slice(self.list(l, e)?),
                 PNode::Array(i, _) | PNode::Pat(i, _) => stack.push(i),
                 PNode::Adt(k, l) => {
                     if !self.adt_facts(k, e)?.copy {
+                        if let Some(rc) = self.copy_memo.get(root.0 as usize) {
+                            rc.set(1);
+                        }
                         return Ok(false);
                     }
                     // The type is `Copy` when the arguments its `Copy` impl bounds are (the
@@ -1991,6 +2309,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
                 }
                 PNode::Param(i) => {
                     if !self.facts.param_copy(i) {
+                        if let Some(rc) = self.copy_memo.get(root.0 as usize) {
+                            rc.set(1);
+                        }
                         return Ok(false);
                     }
                 }
@@ -2004,13 +2325,16 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
                     let Some(&ce) = ck.closures.column::<0>().get(ordinal as usize) else {
                         return self.refuse(Form::Malformed, e);
                     };
-                    for (i, x) in ck.captures.column::<0>().iter().enumerate() {
-                        if *x != ce {
-                            continue;
-                        }
+                    for &row in self.captures_of(ce) {
+                        let i = row as usize;
                         match ck.captures.column::<2>()[i] {
                             blaze_typeck::CaptureKind::ByRef => {}
-                            blaze_typeck::CaptureKind::ByMutRef => return Ok(false),
+                            blaze_typeck::CaptureKind::ByMutRef => {
+                                if let Some(rc) = self.copy_memo.get(root.0 as usize) {
+                                    rc.set(1);
+                                }
+                                return Ok(false);
+                            }
                             blaze_typeck::CaptureKind::ByValue => match ck.local_ty.get(ck.captures.column::<1>()[i].ix()) {
                                 Some(&t) => stack.push(t),
                                 None => return self.refuse(Form::Malformed, e),
@@ -2018,8 +2342,16 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
                         }
                     }
                 }
-                _ => return Ok(false),
+                _ => {
+                    if let Some(rc) = self.copy_memo.get(root.0 as usize) {
+                        rc.set(1);
+                    }
+                    return Ok(false);
+                }
             }
+        }
+        if let Some(rc) = self.copy_memo.get(root.0 as usize) {
+            rc.set(2);
         }
         Ok(true)
     }
@@ -2027,31 +2359,93 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
     /// Whether dropping a value of `t` may run code (more is safe: a `Drop` of a value that needs
     /// none is a deep write the borrow check may refuse, never a missed one).
     fn needs_drop(&self, t: TyD, e: ExprId) -> Result<bool, Refusal> {
-        if t.wrap.is_some() || self.is_copy(t, e)? {
+        if t.wrap.is_some() {
             return Ok(false);
         }
-        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
-        stack.push(t.ty);
+        self.needs_drop_pty(t.ty, e)
+    }
+
+    fn needs_drop_pty(&self, root: PTy, e: ExprId) -> Result<bool, Refusal> {
+        if let Some(cell) = self.drop_memo.get(root.0 as usize) {
+            let v = cell.get();
+            if v != 0 {
+                return Ok(v == 2);
+            }
+        }
+        if self.is_copy_pty(root, e)? {
+            if let Some(cell) = self.drop_memo.get(root.0 as usize) {
+                cell.set(1);
+            }
+            return Ok(false);
+        }
+        let quick = match self.node(root, e)? {
+            PNode::Tuple(l) if l.len == 0 => Some(false),
+            PNode::Tuple(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
+            PNode::Param(_)
+            | PNode::Alias { .. }
+            | PNode::Opaque(..)
+            | PNode::Dynamic(_)
+            | PNode::Future(..)
+            | PNode::Coroutine { .. } => Some(true),
+            _ => Some(false),
+        };
+        if let Some(ans) = quick {
+            if let Some(cell) = self.drop_memo.get(root.0 as usize) {
+                cell.set(if ans { 2 } else { 1 });
+            }
+            return Ok(ans);
+        }
+        let mut stack = TyStack::new(root, self.alloc.clone());
         let mut steps = 0u32;
         while let Some(t) = stack.pop() {
             steps += 1;
             if steps > MOST_POSITIONS {
                 return self.refuse(Form::Bound, e);
             }
+            if let Some(cell) = self.drop_memo.get(t.0 as usize) {
+                let v = cell.get();
+                if v == 2 {
+                    if let Some(rc) = self.drop_memo.get(root.0 as usize) {
+                        rc.set(2);
+                    }
+                    return Ok(true);
+                }
+                if v == 1
+                    && self.copy_memo.get(t.0 as usize).is_some_and(|c| c.get() == 1)
+                {
+                    continue;
+                }
+            }
             match self.node(t, e)? {
                 PNode::Tuple(l) => stack.extend_from_slice(self.list(l, e)?),
                 PNode::Array(i, _) | PNode::Pat(i, _) => stack.push(i),
                 PNode::Adt(k, l) => {
                     if self.adt_facts(k, e)?.needs_drop {
+                        if let Some(rc) = self.drop_memo.get(root.0 as usize) {
+                            rc.set(2);
+                        }
                         return Ok(true);
                     }
                     stack.extend_from_slice(self.list(l, e)?);
                 }
-                PNode::Param(_) | PNode::Alias { .. } | PNode::Opaque(..) | PNode::Dynamic(_) => return Ok(true),
+                PNode::Param(_) | PNode::Alias { .. } | PNode::Opaque(..) | PNode::Dynamic(_) => {
+                    if let Some(rc) = self.drop_memo.get(root.0 as usize) {
+                        rc.set(2);
+                    }
+                    return Ok(true);
+                }
                 // A future holds its captures and its saved values: dropping it may run code.
-                PNode::Future(..) | PNode::Coroutine { .. } => return Ok(true),
+                PNode::Future(..) | PNode::Coroutine { .. } => {
+                    if let Some(rc) = self.drop_memo.get(root.0 as usize) {
+                        rc.set(2);
+                    }
+                    return Ok(true);
+                }
                 _ => {}
             }
+        }
+        if let Some(rc) = self.drop_memo.get(root.0 as usize) {
+            rc.set(1);
         }
         Ok(false)
     }

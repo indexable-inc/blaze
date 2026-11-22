@@ -171,16 +171,16 @@ impl<A: Allocator + Clone> Codes<A> {
     /// How many times the body of `item` was compiled, over every instance of it in the table:
     /// the tests' counter of recompiles.
     pub(crate) fn compiles(&self, item: ItemKey) -> u32 {
-        self.list.iter().filter(|c| c.item == item).map(|c| c.compiles).sum()
+        self.table.list.iter().filter(|c| c.item == item).map(|c| c.compiles).sum()
     }
 
     /// What the code of `item` (every instance of it) waited for when last compiled.
     pub(crate) fn waits(&self, item: ItemKey) -> usize {
-        self.list.iter().filter(|c| c.item == item).map(|c| waited(&c.lates).count()).sum()
+        self.table.list.iter().filter(|c| c.item == item).map(|c| waited(&c.lates).count()).sum()
     }
 }
 
-impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine<'w, 'l, 'g, 't, 'a, W, L, K> {
+impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine<'w, 'l, 'g, 't, 'wk, 'a, W, L, K> {
     /// Charges a recompile of `item`'s body (`ops` operations) to the evaluation's step bound;
     /// past it, the refusal names the body recompiled.
     pub(super) fn charge_recompile(&mut self, item: ItemKey, ops: usize) -> R<'a, ()> {

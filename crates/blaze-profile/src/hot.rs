@@ -41,9 +41,29 @@ pub const ALPHA: f64 = 0.01;
 pub const BUCKETS: usize = 1536;
 
 /// `(1 + ALPHA) / (1 - ALPHA)`: each bucket's upper bound over its lower.
-fn gamma() -> f64 {
-    (1.0 + ALPHA) / (1.0 - ALPHA)
-}
+const GAMMA: f64 = (1.0 + ALPHA) / (1.0 - ALPHA);
+
+/// `ln(GAMMA) = ln((1 + ALPHA) / (1 - ALPHA)) = 2 * sum_{k>=0} ALPHA^(2k+1) / (2k+1)`,
+/// evaluated at compile time to full IEEE-754 `f64` precision.
+const LN_GAMMA: f64 = {
+    let a2 = ALPHA * ALPHA;
+    let mut term = ALPHA;
+    let mut sum = 0.0;
+    let mut k = 0u32;
+    while k < 12 {
+        sum += term / (2 * k + 1) as f64;
+        term *= a2;
+        k += 1;
+    }
+    2.0 * sum
+};
+
+/// Precomputed reciprocal `1.0 / ln(GAMMA)`: replaces `gamma().ln()` and a floating-point
+/// division with a single multiply in [`DdSketch::cell_of`].
+const INV_LN_GAMMA: f64 = 1.0 / LN_GAMMA;
+
+/// Precomputed `2.0 / (GAMMA + 1.0)` for [`DdSketch::value_of`].
+const VALUE_SCALE: f64 = 2.0 / (GAMMA + 1.0);
 
 /// Counters a sketch is read from, by index: plain for a reader's sum and the tests, atomics
 /// for the recorder, which one thread writes and any reads.
@@ -351,20 +371,22 @@ impl DdSketch {
 
     /// The cell `value` is counted in: 0 for 0, else `1 + ceil(log_gamma(value))`, the last for
     /// a value past the buckets.
+    #[inline]
     pub fn cell_of(value: u64) -> usize {
         if value == 0 {
             return 0;
         }
-        let bucket = ((value as f64).ln() / gamma().ln()).ceil().max(0.0) as usize;
+        let bucket = ((value as f64).ln() * INV_LN_GAMMA).ceil().max(0.0) as usize;
         1 + bucket.min(BUCKETS - 1)
     }
 
     /// The value a bucket's cell stands for: `2 GAMMA^i / (GAMMA + 1)`, within [`ALPHA`] of every
     /// value in the bucket.
+    #[inline]
     pub fn value_of(cell: usize) -> f64 {
         match cell.checked_sub(1) {
             None => 0.0,
-            Some(bucket) => 2.0 * gamma().powi(bucket as i32) / (gamma() + 1.0),
+            Some(bucket) => VALUE_SCALE * GAMMA.powi(bucket as i32),
         }
     }
 

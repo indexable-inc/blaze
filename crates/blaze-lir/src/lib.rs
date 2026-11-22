@@ -44,6 +44,7 @@
 //!
 //! The crate is a sans-IO core: it reads no clock, file or thread.
 
+#![forbid(unsafe_code)]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 #![blaze::sans_io]
@@ -77,6 +78,8 @@ pub mod print;
 /// The linear simplify stage in front of the Fast tier (backend-next.md D100 point 1): scalar
 /// replacement of slots that do not escape, then (S2) propagation and dead code.
 pub mod simplify;
+/// ThinLTO function summaries for cost-model inlining and incremental early cutoff.
+pub mod summary;
 pub mod ty;
 pub mod verify;
 

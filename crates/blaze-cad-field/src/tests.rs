@@ -28,11 +28,13 @@ use blaze_units::{Angle, Length};
 
 use crate::eval::{eval_box_each, eval_point_each};
 use crate::{
-    Axis, BlendOpts, Boolean, BoxOpts, CadPlant, CapsuleOpts, CompileOpts, ConeOpts, CylinderOpts, DetailOpts, Edge, EllipsoidOpts, Graph,
-    GraphOpts, Lanes, Level, Limits, Node, NodeId, OffsetOpts, Placement, Points, ScaleOpts, Scratch, Shape, ShellOpts, Solid, SphereOpts,
-    TaperOpts, Tape, TorusOpts, TwistOpts, compile, eval_box, eval_grad, eval_point, eval_points_with, simplify_with,
+    Axis, BlendOpts, Boolean, BoxOpts, CadError, CadPlant, CapsuleOpts, CompileOpts, ConeOpts, CylinderOpts, DetailOpts, DistanceOpts,
+    DistanceStopOpts, Edge, EllipsoidOpts, EvalError, Gap, Graph, GraphOpts, GridOpts, GyroidOpts, HalfSpaceOpts, Lanes, Level, Limits,
+    Node, NodeId, NodeKind, OffsetOpts, Placement, Points, Profile, ProfileOpts, RayOpts, ScaleOpts, Scratch, Shape, ShellOpts, Solid,
+    SphereOpts, SweepPolylineOpts, TaperOpts, Tape, TorusOpts, TwistOpts, compile, distance_between, distance_between_stopping, eval_box,
+    eval_grad, eval_grads, eval_grads_with, eval_point, eval_points, eval_points_with, ray, simplify_with,
 };
-use crate::level::{Bound, Exact};
+use crate::level::{Bound, Exact, Inside, Outside};
 
 // ---- what a test finds ------------------------------------------------------------------------
 
@@ -71,6 +73,8 @@ enum CadBroken {
     FarKept { kept: u32, far: u32 },
     /// A tape did not survive encode and decode.
     RoundTrip { what: &'static str },
+    /// A SIMD gradient lane differed from scalar `eval_grad`.
+    GradLanesDiffer { lanes: &'static str, component: &'static str, scalar: f64, vector: f64 },
 }
 
 impl fmt::Display for CadBroken {
@@ -700,6 +704,11 @@ fn shape_ref(s: &Shape, p: Vec3) -> f64 {
             (Vec3::new(p.x / r[0], p.y / r[1], p.z / r[2]).length() - 1.0) * r[0].min(r[1]).min(r[2])
         }
         Shape::Superellipsoid { .. } => f64::NAN,
+        Shape::Gyroid { period, thickness } => {
+            let k = 2.0 * core::f64::consts::PI / mm(period);
+            let g = (k * p.x).sin() * (k * p.y).cos() + (k * p.y).sin() * (k * p.z).cos() + (k * p.z).sin() * (k * p.x).cos();
+            g.abs() / (k * 3f64.sqrt()) - 0.5 * mm(thickness)
+        }
     }
 }
 
@@ -1229,6 +1238,7 @@ into_cad! {
     GradPlant { GradAbsSignIgnored }
     RefPlant { PlacementShiftDropped }
     LanePlant { VectorDivReciprocal }
+    GradLanePlant { VectorDivReciprocal }
     DigestPlant { DigestDropsParameter }
     SpellPlant { OperandsUnordered }
     FramePlant { FrameKeptInGeometry }
@@ -1236,4 +1246,523 @@ into_cad! {
     RegionPlant { TapeDigestSkipsConsts }
     FarPlant { SimplifyKeepsBothSides }
     TripPlant { EncodeConstsAsF32 }
+}
+
+// ---- 14. SIMD forward-mode AD lanes == scalar ---------------------------------------------------------
+
+fn grad_lanes(t: &Draw, plant: impl Planted<CadPlant>) -> R {
+    let mut g = graph(NoPlant);
+    let mut model = spec(t, ALL);
+    model.push(Step::Over(Over::Scale(t.int_in(1_100_000i64..=1_900_000, "scale ppm"))));
+    let root = built(t, &mut g, &model);
+    let tape = tape_of(&g, root, alloc())?;
+    let mut s = Scratch::new(alloc());
+    let n = t.int_in(1usize..=21, "points");
+    let (mut xs, mut ys, mut zs) = (Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..n {
+        let p = point(t);
+        xs.push(p.x);
+        ys.push(p.y);
+        zs.push(p.z);
+    }
+    let pts = Points { x: &xs, y: &ys, z: &zs };
+    for (lanes, name) in [(Lanes::Four, "four"), (Lanes::Eight, "eight"), (Lanes::One, "one")] {
+        let mut vals = vec![0.0; n];
+        let mut grads = vec![Vec3::ZERO; n];
+        eval_grads_with(&tape, pts, &mut vals, &mut grads, lanes, &mut s, plant).map_err(harness)?;
+        for i in 0..n {
+            let (sv, sg) = eval_grad(&tape, Vec3::new(xs[i], ys[i], zs[i]), &mut s);
+            if !same_bits(sv, vals[i]) {
+                return broken(CadBroken::GradLanesDiffer { lanes: name, component: "val", scalar: sv, vector: vals[i] });
+            }
+            for (comp, a, b) in [("gx", sg.x, grads[i].x), ("gy", sg.y, grads[i].y), ("gz", sg.z, grads[i].z)] {
+                if !same_bits(a, b) {
+                    return broken(CadBroken::GradLanesDiffer { lanes: name, component: comp, scalar: a, vector: b });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+blaze_sim::plants! {
+    enum GradLanePlant breaks CadBroken {
+        None,
+        VectorDivReciprocal => CadBroken::GradLanesDiffer { .. },
+    }
+}
+
+#[test]
+fn grad_lanes_match_scalar() {
+    check(Config::cases(400), |t| grad_lanes(t, NoPlant));
+}
+
+#[test]
+fn grad_lanes_match_scalar_controls() {
+    controls(Config::cases(400), |t, plant: GradLanePlant| grad_lanes(t, plant));
+}
+
+#[test]
+fn eval_grads_rejects_mismatched_lengths() {
+    let mut g = graph(NoPlant);
+    let sp = g.sphere(SphereOpts { radius: nm(5_000_000), .. }).unwrap();
+    let tape = compile(&g, sp.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+    let mut s = Scratch::new(alloc());
+    let pts = Points { x: &[0.0, 1.0], y: &[0.0, 1.0], z: &[0.0, 1.0] };
+    let mut vals = [0.0; 2];
+    let mut grads = [Vec3::ZERO; 1];
+    let err = eval_grads(&tape, pts, &mut vals, &mut grads, Lanes::Four, &mut s).unwrap_err();
+    assert_eq!(err, EvalError::GradLengths { x: 2, y: 2, z: 2, vals: 2, grads: 1 });
+}
+
+// ---- 15. zero-overhead scratch reuse ------------------------------------------------------------------
+
+#[test]
+fn scratch_reuse_matches_fresh_across_varied_tapes() {
+    let mut g = graph(NoPlant);
+    let small_s = g.sphere(SphereOpts { radius: nm(5_000_000), .. }).unwrap();
+    let mut big_parts = Vec::new();
+    for i in 0..16 {
+        let s = g.cuboid(BoxOpts { size: [nm(4_000_000); 3], round: nm(500_000), .. }).unwrap();
+        let placed = g.place(s, Placement::shift(nm(i * 6_000_000), Length::ZERO, Length::ZERO)).unwrap();
+        big_parts.push(placed);
+    }
+    let big_s = g.union_all(&big_parts).unwrap();
+    let t_small = compile(&g, small_s.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+    let t_big = compile(&g, big_s.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+    assert!(t_big.registers() > t_small.registers());
+
+    let mut reused = Scratch::new(alloc());
+    let xs = [-0.01, 0.0, 0.004, 0.012, 0.025, 0.05, 0.07, 0.09, 0.11];
+    let ys = [0.001, -0.002, 0.003, 0.0, -0.001, 0.002, -0.003, 0.004, 0.0];
+    let zs = [0.0, 0.001, -0.001, 0.002, -0.002, 0.0, 0.001, -0.001, 0.002];
+    let pts = Points { x: &xs, y: &ys, z: &zs };
+    let b = Aabb3::new(Vec3::new(-0.02, -0.02, -0.02), Vec3::new(0.05, 0.02, 0.02));
+
+    for tape in [&t_big, &t_small, &t_big, &t_small] {
+        let mut fresh = Scratch::new(alloc());
+        for i in 0..xs.len() {
+            let p = Vec3::new(xs[i], ys[i], zs[i]);
+            assert!(same_bits(eval_point(tape, p, &mut reused), eval_point(tape, p, &mut fresh)));
+            let (v1, g1) = eval_grad(tape, p, &mut reused);
+            let (v2, g2) = eval_grad(tape, p, &mut fresh);
+            assert!(same_bits(v1, v2) && same_bits(g1.x, g2.x) && same_bits(g1.y, g2.y) && same_bits(g1.z, g2.z));
+        }
+        for lanes in [Lanes::One, Lanes::Four, Lanes::Eight] {
+            let (mut o1, mut o2) = (vec![0.0; xs.len()], vec![0.0; xs.len()]);
+            eval_points(tape, pts, &mut o1, lanes, &mut reused).unwrap();
+            eval_points(tape, pts, &mut o2, lanes, &mut fresh).unwrap();
+            for (a, b) in o1.iter().zip(o2.iter()) {
+                assert!(same_bits(*a, *b));
+            }
+            let (mut v1, mut v2) = (vec![0.0; xs.len()], vec![0.0; xs.len()]);
+            let (mut g1, mut g2) = (vec![Vec3::ZERO; xs.len()], vec![Vec3::ZERO; xs.len()]);
+            eval_grads(tape, pts, &mut v1, &mut g1, lanes, &mut reused).unwrap();
+            eval_grads(tape, pts, &mut v2, &mut g2, lanes, &mut fresh).unwrap();
+            for i in 0..xs.len() {
+                assert!(same_bits(v1[i], v2[i]) && same_bits(g1[i].x, g2[i].x) && same_bits(g1[i].y, g2[i].y) && same_bits(g1[i].z, g2[i].z));
+            }
+        }
+        let (iv1, ch1) = eval_box(tape, &b, &mut reused);
+        let (iv2, ch2) = eval_box(tape, &b, &mut fresh);
+        assert!(same_bits(iv1.lo(), iv2.lo()) && same_bits(iv1.hi(), iv2.hi()));
+        assert_eq!(ch1.as_slice(), ch2.as_slice());
+    }
+}
+
+// ---- 16. balanced CSG combinators ---------------------------------------------------------------------
+
+fn graph_depth<P: Planted<CadPlant>>(g: &Graph<'_, P>, id: NodeId) -> usize {
+    let (kids, n) = g.node(id).children();
+    let mut best = 0;
+    for &k in &kids[..n] {
+        best = best.max(graph_depth(g, k));
+    }
+    1 + best
+}
+
+#[test]
+fn balanced_csg_combinators_and_sweep_polyline() {
+    let mut g = graph(NoPlant);
+    // Empty slice rejected with typed error.
+    let empty_ex: &[Solid<Exact>] = &[];
+    assert!(matches!(
+        g.union_all(empty_ex),
+        Err(CadError::Argument { kind: NodeKind::Union, arg: "solids", value: crate::Value::Count(0), .. })
+    ));
+    assert!(matches!(
+        g.intersect_all(empty_ex),
+        Err(CadError::Argument { kind: NodeKind::Intersect, arg: "solids", value: crate::Value::Count(0), .. })
+    ));
+    assert!(matches!(
+        g.round_union_all(empty_ex, BlendOpts { radius: nm(1_000_000), .. }),
+        Err(CadError::Argument { kind: NodeKind::SmoothBoolean, arg: "solids", .. })
+    ));
+
+    // Level preservation & balanced tree depth.
+    let mut spheres: Vec<Solid<Exact>> = Vec::new();
+    for i in 0..16 {
+        let sp = g.sphere(SphereOpts { radius: nm(4_000_000), .. }).unwrap();
+        spheres.push(g.place(sp, Placement::shift(nm(i * 6_000_000), Length::ZERO, Length::ZERO)).unwrap());
+    }
+    let u_all: Solid<Outside> = g.union_all(&spheres).unwrap();
+    assert_eq!(g.level(u_all.id()), Level::Outside);
+    assert_eq!(graph_depth(&g, u_all.id()), 5); // 16 leaves -> 4 union levels + 1 leaf
+
+    let i_all: Solid<Inside> = g.intersect_all(&spheres).unwrap();
+    assert_eq!(g.level(i_all.id()), Level::Inside);
+    assert_eq!(graph_depth(&g, i_all.id()), 5);
+
+    // Changing one leaf in `union_all` rekeys only `k + 2` nodes.
+    let before = g.len();
+    let changed = g.sphere(SphereOpts { radius: nm(4_500_000), .. }).unwrap();
+    spheres[7] = g.place(changed, Placement::shift(nm(7 * 6_000_000), Length::ZERO, Length::ZERO)).unwrap();
+    let _u_all2 = g.union_all(&spheres).unwrap();
+    assert_eq!(g.len() - before, 4 + 2);
+
+    // Blended / chamfered balanced combinators.
+    let ru: Solid<Bound> = g.round_union_all(&spheres[..4], BlendOpts { radius: nm(1_000_000), .. }).unwrap();
+    let ci: Solid<Bound> = g.chamfer_intersect_all(&spheres[..4], BlendOpts { radius: nm(1_000_000), .. }).unwrap();
+    assert_eq!(g.level(ru.id()), Level::Bound);
+    assert_eq!(g.level(ci.id()), Level::Bound);
+
+    // `sweep_polyline` builds a balanced binary union tree instead of a left-deep chain.
+    let prof = g.profile(ProfileOpts { profile: Profile::Circle { radius: nm(1_000_000) }, .. }).unwrap();
+    let mut pts = Vec::new();
+    for i in 0..=16 {
+        pts.push([nm(i * 10_000_000), nm((i % 2) * 2_000_000), Length::ZERO]);
+    }
+    let swept = g.sweep_polyline(prof, SweepPolylineOpts { points: &pts, .. }).unwrap();
+    // 16 segments -> balanced union depth 4 + per-segment mitre cuts (depth <= 5) => total <= 10 (vs >= 17 for left-deep).
+    let d = graph_depth(&g, swept.id());
+    assert!(d <= 10, "expected balanced polyline sweep depth <= 10, got {d}");
+    let tape = compile(&g, swept.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+    let mut sc = Scratch::new(alloc());
+    // Midpoint of first segment must be inside the swept tube.
+    assert!(eval_point(&tape, Vec3::new(0.005, 0.001, 0.0), &mut sc) < 0.0);
+}
+
+// ---- 17. TPMS gyroid primitive ------------------------------------------------------------------------
+
+fn gyroid_prop(t: &Draw) -> R {
+    let period = um(t, 2_000, 20_000, "period");
+    let thickness = um(t, 200, 3_000, "thickness");
+    let mut g = graph(NoPlant);
+    let gyr = g.gyroid(GyroidOpts { period: nm(period), thickness: nm(thickness), .. }).map_err(harness)?;
+    let tape = tape_of(&g, gyr.id(), alloc())?;
+    let mut sc = Scratch::new(alloc());
+
+    // Reference agreement + 1-Lipschitz + forward-mode AD gradient vs finite differences.
+    let axes = [Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, 1.0)];
+    let (mut xs, mut ys, mut zs) = (Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..10 {
+        let p = point(t);
+        xs.push(p.x);
+        ys.push(p.y);
+        zs.push(p.z);
+        let got = eval_point(&tape, p, &mut sc);
+        let want = reference(&g, gyr.id(), p).expect("gyroid in reference");
+        if (got - want).abs() > 1e-12 {
+            return broken(CadBroken::ReferenceDiffers { tape: got, reference: want });
+        }
+        // 1-Lipschitz check.
+        let step = 10f64.powf(t.f64_in(-5.0..=-2.5, "log10 step"));
+        let dir = Vec3::new(t.f64_in(-1.0..=1.0, "dx"), t.f64_in(-1.0..=1.0, "dy"), t.f64_in(-1.0..=1.0, "dz"));
+        if let Some(d) = dir.normalized() {
+            let q = p + d * step;
+            let fq = eval_point(&tape, q, &mut sc);
+            let dist = (q - p).length();
+            if (got - fq).abs() > dist * (1.0 + 1e-9) + 1e-15 {
+                return broken(CadBroken::NotLipschitz { slope: (got - fq).abs() / dist });
+            }
+        }
+        // Gradient check where smooth (forward and backward differences agree, so symmetric
+        // V-kinks of `|g| = 0` are not mistaken for smooth points with zero slope).
+        let (_, grad) = eval_grad(&tape, p, &mut sc);
+        let h = 1e-6;
+        let fwd = axes.map(|e| (eval_point(&tape, p + e * h, &mut sc) - got) / h);
+        let bwd = axes.map(|e| (got - eval_point(&tape, p - e * h, &mut sc)) / h);
+        if (0..3).all(|i| fwd[i].is_finite() && bwd[i].is_finite() && (fwd[i] - bwd[i]).abs() <= 1e-3) {
+            let numeric = [0.5 * (fwd[0] + bwd[0]), 0.5 * (fwd[1] + bwd[1]), 0.5 * (fwd[2] + bwd[2])];
+            let analytic = grad.to_array();
+            if (0..3).any(|i| (analytic[i] - numeric[i]).abs() > 1e-2) {
+                return broken(CadBroken::GradientOff { analytic, numeric });
+            }
+        }
+    }
+
+    // SIMD 4/8-lane grad bit-equality on gyroid.
+    let pts = Points { x: &xs, y: &ys, z: &zs };
+    for (lanes, name) in [(Lanes::Four, "four"), (Lanes::Eight, "eight")] {
+        let mut vals = vec![0.0; xs.len()];
+        let mut grads = vec![Vec3::ZERO; xs.len()];
+        eval_grads(&tape, pts, &mut vals, &mut grads, lanes, &mut sc).map_err(harness)?;
+        for i in 0..xs.len() {
+            let (sv, sg) = eval_grad(&tape, Vec3::new(xs[i], ys[i], zs[i]), &mut sc);
+            if !same_bits(sv, vals[i]) {
+                return broken(CadBroken::GradLanesDiffer { lanes: name, component: "val", scalar: sv, vector: vals[i] });
+            }
+            if !same_bits(sg.x, grads[i].x) || !same_bits(sg.y, grads[i].y) || !same_bits(sg.z, grads[i].z) {
+                return broken(CadBroken::GradLanesDiffer { lanes: name, component: "g", scalar: sg.x, vector: grads[i].x });
+            }
+        }
+    }
+
+    // Interval containment over random box.
+    let b = cell(t);
+    let (iv, _) = eval_box(&tape, &b, &mut sc);
+    for p in points_in(t, &b) {
+        let v = eval_point(&tape, p, &mut sc);
+        if !iv.contains(v) {
+            return broken(CadBroken::Escapes { instr: 0, op: "gyroid", value: v, lo: iv.lo(), hi: iv.hi() });
+        }
+    }
+
+    // BCFT encode / decode round-trip.
+    let mut bytes = blaze_own::Vec::new_in(alloc());
+    tape.encode(&mut bytes);
+    let Ok(back) = Tape::decode(&bytes, alloc(), Limits::SHIPPED) else {
+        return broken(CadBroken::RoundTrip { what: "gyroid decode" });
+    };
+    if back.digest() != tape.digest() {
+        return broken(CadBroken::RoundTrip { what: "gyroid digest" });
+    }
+    Ok(())
+}
+
+#[test]
+fn gyroid_properties() {
+    check(Config::cases(200), gyroid_prop);
+}
+
+#[test]
+fn gyroid_bounded_intersection_and_validation() {
+    let mut g = graph(NoPlant);
+    assert!(matches!(
+        g.gyroid(GyroidOpts { period: Length::ZERO, thickness: nm(1_000_000), .. }),
+        Err(CadError::Argument { kind: NodeKind::Gyroid, arg: "period", .. })
+    ));
+    assert!(matches!(
+        g.gyroid(GyroidOpts { period: nm(10_000_000), thickness: Length::ZERO, .. }),
+        Err(CadError::Argument { kind: NodeKind::Gyroid, arg: "thickness", .. })
+    ));
+    let gyr = g.gyroid(GyroidOpts { period: nm(10_000_000), thickness: nm(1_000_000), .. }).unwrap();
+    let cube = g.cuboid(BoxOpts { size: [nm(20_000_000); 3], .. }).unwrap();
+    let lattice = g.intersect(gyr, cube.weaken::<Bound>()).unwrap();
+    assert_eq!(g.aabb(lattice.id()), g.aabb(cube.id()));
+    let tape = compile(&g, lattice.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+    let mut sc = Scratch::new(alloc());
+    // Origin lies on g(0,0,0) = 0, so inside the gyroid sheet (f = -thickness/2).
+    let v0 = eval_point(&tape, Vec3::ZERO, &mut sc);
+    assert!((v0 - (-0.0005)).abs() < 1e-12);
+    // Ray from outside hits the bounded gyroid lattice.
+    let hit = ray(&tape, RayOpts { origin: Vec3::new(-0.05, 0.0, 0.0), dir: Vec3::new(1.0, 0.0, 0.0), max_t: 0.2, .. }, &mut sc).unwrap();
+    assert!(hit.is_some());
+}
+
+// ---- 18. fast inspection: ray AABB clip & distance_between early-exit ---------------------------------
+
+#[test]
+fn ray_aabb_clipping_skips_misses_and_jumps_to_entry() {
+    let mut g = graph(NoPlant);
+    let sp = g.sphere(SphereOpts { radius: nm(10_000_000), .. }).unwrap();
+    let t_sp = compile(&g, sp.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+    let mut sc = Scratch::new(alloc());
+
+    // Ray missing AABB returns None with zero steps allowed!
+    let miss = ray(
+        &t_sp,
+        RayOpts { origin: Vec3::new(-1.0, 0.5, 0.0), dir: Vec3::new(1.0, 0.0, 0.0), max_t: 10.0, most_steps: 0, .. },
+        &mut sc,
+    )
+    .unwrap();
+    assert!(miss.is_none());
+
+    // Ray starting 1000 m away hits exact sphere surface in <= 4 steps after jumping to t_enter.
+    let far_hit = ray(
+        &t_sp,
+        RayOpts { origin: Vec3::new(-1000.0, 0.0, 0.0), dir: Vec3::new(1.0, 0.0, 0.0), max_t: 2000.0, most_steps: 4, .. },
+        &mut sc,
+    )
+    .unwrap()
+    .expect("far ray hits sphere");
+    assert!((far_hit.t - 999.99).abs() < 1e-9, "got t = {}", far_hit.t);
+    let n = far_hit.normal.expect("sphere normal");
+    assert!((n.x - (-1.0)).abs() < 1e-9 && n.y.abs() < 1e-9 && n.z.abs() < 1e-9);
+
+    // Ray hitting a box face dead-on (surface coincides with AABB face).
+    let bx = g.cuboid(BoxOpts { size: [nm(20_000_000); 3], .. }).unwrap();
+    let t_bx = compile(&g, bx.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+    let face_hit = ray(
+        &t_bx,
+        RayOpts { origin: Vec3::new(-5.0, 0.0, 0.0), dir: Vec3::new(1.0, 0.0, 0.0), max_t: 20.0, .. },
+        &mut sc,
+    )
+    .unwrap()
+    .expect("ray hits box face");
+    assert!((face_hit.t - 4.99).abs() < 1e-9, "got t = {}", face_hit.t);
+
+    // Ray starting inside returns t = 0.
+    let inside_hit = ray(
+        &t_sp,
+        RayOpts { origin: Vec3::ZERO, dir: Vec3::new(1.0, 0.0, 0.0), max_t: 1.0, most_steps: 0, .. },
+        &mut sc,
+    )
+    .unwrap()
+    .expect("inside hit");
+    assert_eq!(inside_hit.t, 0.0);
+
+    // Empty solid misses immediately.
+    let empty = g.empty().unwrap();
+    let t_empty = compile(&g, empty.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+    assert!(ray(&t_empty, RayOpts { origin: Vec3::ZERO, dir: Vec3::new(1.0, 0.0, 0.0), max_t: 10.0, most_steps: 0, .. }, &mut sc).unwrap().is_none());
+
+    // Partially unbounded HalfSpace (z <= 0).
+    let hs = g.half_space(HalfSpaceOpts { .. }).unwrap();
+    let t_hs = compile(&g, hs.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+    let hs_hit = ray(
+        &t_hs,
+        RayOpts { origin: Vec3::new(0.0, 0.0, 2.0), dir: Vec3::new(0.0, 0.0, -1.0), max_t: 10.0, .. },
+        &mut sc,
+    )
+    .unwrap()
+    .expect("hits half-space");
+    assert!((hs_hit.t - 2.0).abs() < 1e-9);
+    // Ray above z = 0 pointing +z misses immediately.
+    let hs_miss = ray(
+        &t_hs,
+        RayOpts { origin: Vec3::new(0.0, 0.0, 2.0), dir: Vec3::new(0.0, 0.0, 1.0), max_t: 10.0, most_steps: 0, .. },
+        &mut sc,
+    )
+    .unwrap();
+    assert!(hs_miss.is_none());
+}
+
+#[test]
+fn distance_between_aabb_lb_and_early_stops() {
+    let mut g = graph(NoPlant);
+    let s1 = g.sphere(SphereOpts { radius: nm(10_000_000), .. }).unwrap();
+    let s2 = g.place(s1, Placement::shift(nm(100_000_000), Length::ZERO, Length::ZERO)).unwrap();
+    let t1 = compile(&g, s1.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+    let t2 = compile(&g, s2.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+    let mut sc = Scratch::new(alloc());
+
+    // True gap between spheres of r=0.01m at x=0 and x=0.10m is 0.08m.
+    // AABB gap is also 0.08m, so `stop_above: Some(0.05)` settles with ZERO boxes!
+    let early_above = distance_between_stopping(
+        &t1,
+        &t2,
+        DistanceStopOpts { tolerance: 1e-6, most_boxes: 0, stop_above: Some(0.05), .. },
+        &mut sc,
+    )
+    .unwrap();
+    match early_above {
+        Gap::Settled(iv) => assert!(iv.lo() >= 0.05, "expected lb >= 0.05, got {:?}", iv),
+        other => panic!("expected early Settled above, got {other:?}"),
+    }
+
+    // `stop_below: Some(0.12)` settles early once upper bound < 0.12m (at root centre ub = 0.09m).
+    let early_below = distance_between_stopping(
+        &t1,
+        &t2,
+        DistanceStopOpts { tolerance: 1e-9, most_boxes: 1, stop_below: Some(0.12), .. },
+        &mut sc,
+    )
+    .unwrap();
+    match early_below {
+        Gap::Settled(iv) => assert!(iv.hi() < 0.12 && iv.lo() <= 0.08 + 1e-12, "got {:?}", iv),
+        other => panic!("expected early Settled below, got {other:?}"),
+    }
+
+    // Standard `distance_between` settles accurately around 0.08m.
+    let exact_gap = distance_between(&t1, &t2, DistanceOpts { tolerance: 1e-4, .. }, &mut sc).unwrap();
+    match exact_gap {
+        Gap::Settled(iv) => assert!(iv.lo() <= 0.08 + 1e-9 && iv.hi() >= 0.08 - 1e-9 && iv.hi() - iv.lo() <= 1e-4, "got {:?}", iv),
+        other => panic!("expected Settled, got {other:?}"),
+    }
+
+    // Empty solid returns Gap::Empty.
+    let empty = g.empty().unwrap();
+    let t_empty = compile(&g, empty.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+    assert_eq!(distance_between(&t_empty, &t2, DistanceOpts { tolerance: 1e-4, .. }, &mut sc).unwrap(), Gap::Empty);
+}
+
+// ---- 19. Grid3 coarse min-max block summary -----------------------------------------------------------
+
+#[test]
+fn grid3_coarse_summary_sound_and_round_trips() {
+    // Build a non-multiple-of-4 grid (29 x 25 x 33) sampling a sphere SDF so both 4^3 and 16^3
+    // block summaries exercise partial tail blocks and full blocks.
+    let dims = [29u32, 25u32, 33u32];
+    let step_nm = 1_000_000i64; // 1 mm
+    let step = step_nm as f64 / 1e9;
+    let origin_nm = [-14_000_000i64, -12_000_000i64, -16_000_000i64];
+    let origin = origin_nm.map(|v| v as f64 / 1e9);
+    let r = 0.009;
+    let mut values = Vec::with_capacity((dims[0] * dims[1] * dims[2]) as usize);
+    for k in 0..dims[2] {
+        for j in 0..dims[1] {
+            for i in 0..dims[0] {
+                let p = Vec3::new(origin[0] + i as f64 * step, origin[1] + j as f64 * step, origin[2] + k as f64 * step);
+                values.push(p.length() - r);
+            }
+        }
+    }
+    let mut g = graph(NoPlant);
+    let sp = g.sphere(SphereOpts { radius: nm(9_000_000), .. }).unwrap();
+    let rd = g.redistance(sp).unwrap();
+    g.attach_grid(
+        rd,
+        GridOpts {
+            origin: origin_nm.map(nm),
+            step: nm(step_nm),
+            dims,
+            values: &values,
+            band: nm(2_000_000),
+            ..
+        },
+    )
+    .unwrap();
+    let tape = compile(&g, rd.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+
+    // Round-trip through BCFT encode/decode.
+    let mut bytes = blaze_own::Vec::new_in(alloc());
+    tape.encode(&mut bytes);
+    let decoded = Tape::decode(&bytes, alloc(), Limits::SHIPPED).unwrap();
+    assert_eq!(decoded.digest(), tape.digest());
+
+    let mut sc = Scratch::new(alloc());
+    // Query boxes spanning: (a) tiny <= 64 voxels, (b) medium 4^3 block level, (c) full grid 16^3 superblock level, (d) outside grid.
+    let boxes = [
+        Aabb3::new(Vec3::new(-0.0015, -0.0015, -0.0015), Vec3::new(0.0015, 0.0015, 0.0015)),
+        Aabb3::new(Vec3::new(-0.008, -0.007, -0.006), Vec3::new(0.008, 0.007, 0.006)),
+        Aabb3::new(Vec3::new(-0.015, -0.013, -0.017), Vec3::new(0.015, 0.013, 0.017)),
+        Aabb3::new(Vec3::new(0.02, 0.02, 0.02), Vec3::new(0.03, 0.03, 0.03)),
+    ];
+    for b in &boxes {
+        let (iv, _) = eval_box(&tape, b, &mut sc);
+        let (iv_dec, _) = eval_box(&decoded, b, &mut sc);
+        assert!(same_bits(iv.lo(), iv_dec.lo()) && same_bits(iv.hi(), iv_dec.hi()));
+        // Check all 8 corners + centre + intermediate samples lie inside the coarse interval.
+        for c in b.corners().into_iter().chain(core::iter::once(b.center())) {
+            let v = eval_point(&tape, c, &mut sc);
+            assert!(iv.contains(v), "point {c:?} value {v} escaped grid_box interval {iv:?}");
+        }
+    }
+
+    // Verify SIMD 4/8-lane `eval_grads` matches scalar `eval_grad` on `Grid3` bit-for-bit!
+    let xs = [-0.01, -0.003, 0.0, 0.004, 0.009, 0.013, 0.02, -0.02, 0.001];
+    let ys = [0.002, -0.005, 0.0, 0.003, -0.004, 0.011, 0.0, 0.02, -0.002];
+    let zs = [-0.001, 0.004, 0.0, -0.006, 0.002, -0.012, 0.015, -0.018, 0.003];
+    let pts = Points { x: &xs, y: &ys, z: &zs };
+    for lanes in [Lanes::One, Lanes::Four, Lanes::Eight] {
+        let mut vals = vec![0.0; xs.len()];
+        let mut grads = vec![Vec3::ZERO; xs.len()];
+        eval_grads(&tape, pts, &mut vals, &mut grads, lanes, &mut sc).unwrap();
+        for i in 0..xs.len() {
+            let (sv, sg) = eval_grad(&tape, Vec3::new(xs[i], ys[i], zs[i]), &mut sc);
+            assert!(same_bits(sv, vals[i]));
+            assert!(same_bits(sg.x, grads[i].x) && same_bits(sg.y, grads[i].y) && same_bits(sg.z, grads[i].z));
+        }
+    }
 }

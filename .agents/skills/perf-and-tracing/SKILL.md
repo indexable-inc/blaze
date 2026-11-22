@@ -50,4 +50,12 @@ but tuning cold time is not picked ahead of an open incremental item until the o
 priority has changed. Say which of the two a speed change is for, and quote the edit-loop numbers
 with it.
 
+## per-core-units (rule 84)
+
+Every throughput or latency number reported in a benchmark, commit, PR or reply names its
+concurrency explicitly and states per-core units (`MB/s/core`, `GB/s/core`, `ops/s/core`,
+`ns/op/core`, `tris/s/core`, `rays/s/core`, `evals/s/core`). When reporting multi-core aggregate
+throughput, always show both the core count and the per-core rate (e.g. `38.7 GB/s across 18 cores =
+2.15 GB/s/core`), never a bare `MB/s` or `GB/s` that hides whether the run was 1 core or 18 cores.
+
 <!-- End of the generated rules. Hand-written notes follow. -->

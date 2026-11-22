@@ -801,6 +801,13 @@ export const rules = [
 		reason: "The owner, 2026-11-17 02:32, shown named arguments with defaults through an options struct compiling on the pinned nightly (`default_field_values`): \"wait enable #![feature(default_field_values)]\", \"and AGNETS.md say use extensively ... GREAT this is great\", \"and then improve bstd api to use this extensively for creating almsot evyering\", \"like creating hashmap should use that for instance instead of a million differnt function names get what i mean\". At 02:37, on the first sketch (`capacity: usize = 0`): \"i mean capacity can probs stay explciit (no defult) but would be none get what i mean in most cases\". At 02:51: \"can u add a lint for must be made outside of a function or const? like must be inline for struct? say MapOpts\" (the lint `args-inline`). Decision D126; D125 (the hasher is named) is its first use.",
 		alsoIn: ["runtime-code"],
 	},
+	{
+		id: "per-core-units",
+		skill: "perf-and-tracing",
+		line: "Report throughput and latency in per-core units (`MB/s/core`, `ns/op/core`) and name core count.",
+		info: "Every throughput or latency number reported in a benchmark, commit, PR or reply names its concurrency explicitly and states per-core units (`MB/s/core`, `GB/s/core`, `ops/s/core`, `ns/op/core`, `tris/s/core`, `rays/s/core`, `evals/s/core`). When reporting multi-core aggregate throughput, always show both the core count and the per-core rate (e.g. `38.7 GB/s across 18 cores = 2.15 GB/s/core`), never a bare `MB/s` or `GB/s` that hides whether the run was 1 core or 18 cores.",
+		reason: "Andrew, 2026-11-22: \"please give per core units (mentoin in AGENTS.md sa well?) like i htink blaze lint is it 143.1 MB /s core ? (or specify that in AGNETS.md) etc\".",
+	},
 ] as const satisfies readonly Rule[];
 
 /**

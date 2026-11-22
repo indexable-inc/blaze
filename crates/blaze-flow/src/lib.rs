@@ -14,6 +14,7 @@
 //! with [`flow::Bound::TierTwo`] if its budget is exhausted.
 
 #![no_std]
+#![forbid(unsafe_code)]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 

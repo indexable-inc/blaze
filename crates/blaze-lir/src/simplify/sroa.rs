@@ -68,9 +68,27 @@ pub fn scalar_replace_planted<A: Allocator + Clone>(
     plant: Plant,
     alloc: A,
 ) -> Result<Func<A>, SimplifyError> {
+    if view.slots.is_empty() {
+        if cfg!(debug_assertions) {
+            verify(view).map_err(SimplifyError::Verify)?;
+        }
+        return Ok(view.to_func_in(alloc));
+    }
     let cfg = Cfg::of(&view, &alloc)?;
     let mut found = find(&view, &cfg, &alloc)?;
+    if found.kept.iter().all(|&k| k) {
+        if cfg!(debug_assertions) {
+            verify(view).map_err(SimplifyError::Verify)?;
+        }
+        return Ok(view.to_func_in(alloc));
+    }
     let phis = place(&view, &cfg, &mut found, &alloc);
+    if found.kept.iter().all(|&k| k) {
+        if cfg!(debug_assertions) {
+            verify(view).map_err(SimplifyError::Verify)?;
+        }
+        return Ok(view.to_func_in(alloc));
+    }
     // Input values and new parameters share one numbering while the output is written.
     if view.len() + phis.field.len() >= NONE as usize {
         return Err(SimplifyError::Refused { inst: 0, what: "more values than LIR numbers" });

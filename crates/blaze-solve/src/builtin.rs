@@ -175,7 +175,7 @@ pub(crate) fn require_lang<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, l: Lang)
 
 /// `args` with `self_ty` in place of `args[0]`, as a `Tuple` term to keep in a scratch field.
 pub(crate) fn pack_args<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, args: List, self_ty: Ty) -> Result<Ty, Stop> {
-    let mut v = cx.list(args);
+    let mut v = cx.list_small(args);
     let Some(first) = v.first_mut() else { return Err(malformed()) };
     *first = self_ty;
     let l = cx.mk_list(&v)?;
@@ -569,7 +569,7 @@ fn split_sig<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, io: List) -> Result<Ca
     if io.len == 0 {
         return Err(malformed());
     }
-    let inputs = cx.mk_list(&cx.list_range(io, 0, io.len - 1))?;
+    let inputs = cx.mk_list(&cx.list_range_small(io, 0, io.len - 1))?;
     let tupled = cx.mk(TyKind::Tuple(inputs))?;
     Ok(Callable::Sig(tupled, cx.arg(io, io.len - 1)))
 }
@@ -642,7 +642,7 @@ fn assemble_unsize<T: Tys, F: Facts>(
                 elaborate_supertraits(cx, ad, args, &mut supers)?;
                 for &(d, l) in supers.iter().skip(1) {
                     // `ExistentialTraitRef::erase_self_ty`.
-                    let rest = cx.mk_list(&cx.list_range(l, 1, l.len))?;
+                    let rest = cx.mk_list(&cx.list_range_small(l, 1, l.len))?;
                     let b = cx.mk(TyKind::Tuple(rest))?;
                     out.push(Cand { b, d, n: 1, ..row(Rule::UnsizeUpcast, BuiltinSource::TraitUpcasting) });
                 }
@@ -833,7 +833,7 @@ fn step_copy_clone<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> 
         | TyKind::Placeholder(..) => return Ok(Step::No),
         // An async coroutine is immovable: never `Copy` or `Clone`.
         TyKind::Coroutine(..) => return Ok(Step::No),
-        TyKind::Tuple(l) => tys.extend_from_slice(&cx.list(l)),
+        TyKind::Tuple(l) => tys.extend_from_slice(&cx.list_small(l)),
         // A pattern type is `Copy`/`Clone` as its base (core's `niche_types` derives both over
         // one; no impl in core).
         TyKind::Pat(base, _) => tys.push(base),

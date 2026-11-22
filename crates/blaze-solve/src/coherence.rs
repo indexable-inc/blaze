@@ -346,7 +346,7 @@ pub fn step<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, rule: 
             if args.len == 0 {
                 return Err(Stop::Error(SolveError::Malformed(crate::error::bad_pred())));
             }
-            let mut items = cx.list(args);
+            let mut items = cx.list_small(args);
             items[0] = cand.a;
             let args = cx.mk_list(&items)?;
             let mut seen: Vec<Pred, Alloc<'_>> = Vec::new_in(cx.alloc);
@@ -406,9 +406,9 @@ pub(crate) fn fresh_for_impl<'a, T: Tys>(
     impl_: Def,
     h: &ImplHeader<'_>,
     alloc: Alloc<'a>,
-) -> Result<Vec<Ty, Alloc<'a>>, SolveError> {
+) -> Result<crate::assembly::SmallTys<'a>, SolveError> {
     if h.generics > 64 {
-        return fresh_for(tys, s, h, alloc);
+        return Ok(crate::assembly::SmallTys::Heap(fresh_for(tys, s, h, alloc)?));
     }
     let mask = match s.const_mask(impl_, h.digest) {
         Some(m) => m,
@@ -423,9 +423,9 @@ pub(crate) fn fresh_for_impl<'a, T: Tys>(
             m
         }
     };
-    let mut v = Vec::with_capacity_in(h.generics as usize, alloc);
-    for i in 0..h.generics {
-        v.push(tys.fresh(if (mask >> i) & 1 == 1 { VarKind::Const } else { VarKind::Ty })?);
+    let mut v = crate::assembly::SmallTys::new_with_len(h.generics as usize, alloc);
+    for (i, slot) in v.iter_mut().enumerate() {
+        *slot = tys.fresh(if (mask >> i) & 1 == 1 { VarKind::Const } else { VarKind::Ty })?;
     }
     Ok(v)
 }
@@ -474,41 +474,49 @@ fn const_params<'a>(s: &mut Scratch<'_>, h: &ImplHeader<'_>, alloc: Alloc<'a>) -
 /// The portable list `l` of `p`, imported with `args`; a parameter past `args` names the
 /// caller's line.
 #[track_caller]
-fn import_list<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, p: Portable<'_>, l: List, args: &[Ty], alloc: Alloc<'_>) -> Result<List, SolveError> {
+fn import_list<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, p: Portable<'_>, l: List, args: &[Ty], _alloc: Alloc<'_>) -> Result<List, SolveError> {
     let site = core::panic::Location::caller();
-    let mut out: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(l.len as usize, alloc);
-    for i in 0..l.len {
-        let at = l.start + i;
-        let Some(&x) = p.lists.get(at as usize) else {
-            return Err(SolveError::Malformed(Malformed::PortableIndex { node: at, len: p.lists.len() as u32 }));
-        };
-        out.push(fold::import_at(tys, s, p, x, Inst { args, bound: &[] }, site)?);
-    }
-    tys.mk_list(&out)
+    fold::import_list_at(tys, s, p, l, Inst { args, bound: &[] }, site)
 }
 
 /// The portable predicate `pred` of `p`, imported with `args` (`Cx::import_pred` outside a
 /// context).
 #[track_caller]
-fn import_pred<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, p: Portable<'_>, pred: Pred, args: &[Ty], alloc: Alloc<'_>) -> Result<Pred, SolveError> {
+fn import_pred<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, p: Portable<'_>, pred: Pred, args: &[Ty], _alloc: Alloc<'_>) -> Result<Pred, SolveError> {
     let site = core::panic::Location::caller();
     let inst = Inst { args, bound: &[] };
-    let t = |tys: &mut T, s: &mut Scratch<'_>, x: Ty| fold::import_at(tys, s, p, x, inst, site);
     Ok(match pred {
-        Pred::Trait { trait_, args: a, polarity } => Pred::Trait { trait_, args: import_list(tys, s, p, a, args, alloc)?, polarity },
-        Pred::HostEffect { trait_, args: a, constness } => {
-            Pred::HostEffect { trait_, args: import_list(tys, s, p, a, args, alloc)?, constness }
+        Pred::Trait { trait_, args: a, polarity } => {
+            Pred::Trait { trait_, args: fold::import_list_at(tys, s, p, a, inst, site)?, polarity }
         }
-        Pred::ConstHolds { cond, args: a } => Pred::ConstHolds { cond, args: import_list(tys, s, p, a, args, alloc)? },
-        Pred::Projection { alias, term } => Pred::Projection { alias: t(tys, s, alias)?, term: t(tys, s, term)? },
-        Pred::NormalizesTo { alias, term } => Pred::NormalizesTo { alias: t(tys, s, alias)?, term: t(tys, s, term)? },
-        Pred::TypeOutlives { ty, region } => Pred::TypeOutlives { ty: t(tys, s, ty)?, region: t(tys, s, region)? },
-        Pred::RegionOutlives { a, b } => Pred::RegionOutlives { a: t(tys, s, a)?, b: t(tys, s, b)? },
-        Pred::WellFormed(x) => Pred::WellFormed(t(tys, s, x)?),
-        Pred::ConstEvaluatable(x) => Pred::ConstEvaluatable(t(tys, s, x)?),
-        Pred::Subtype { a, b } => Pred::Subtype { a: t(tys, s, a)?, b: t(tys, s, b)? },
-        Pred::Coerce { a, b } => Pred::Coerce { a: t(tys, s, a)?, b: t(tys, s, b)? },
-        Pred::ConstArgHasType { ct, ty } => Pred::ConstArgHasType { ct: t(tys, s, ct)?, ty: t(tys, s, ty)? },
+        Pred::HostEffect { trait_, args: a, constness } => {
+            Pred::HostEffect { trait_, args: fold::import_list_at(tys, s, p, a, inst, site)?, constness }
+        }
+        Pred::ConstHolds { cond, args: a } => {
+            Pred::ConstHolds { cond, args: fold::import_list_at(tys, s, p, a, inst, site)? }
+        }
+        Pred::WellFormed(x) => Pred::WellFormed(fold::import_at(tys, s, p, x, inst, site)?),
+        Pred::ConstEvaluatable(x) => Pred::ConstEvaluatable(fold::import_at(tys, s, p, x, inst, site)?),
+        Pred::Projection { alias: a, term: b }
+        | Pred::NormalizesTo { alias: a, term: b }
+        | Pred::TypeOutlives { ty: a, region: b }
+        | Pred::RegionOutlives { a, b }
+        | Pred::Subtype { a, b }
+        | Pred::Coerce { a, b }
+        | Pred::ConstArgHasType { ct: a, ty: b } => {
+            let mut out = [Ty::NONE; 2];
+            fold::import_slice(tys, s, p, &[a, b], inst, &mut out, site)?;
+            match pred {
+                Pred::Projection { .. } => Pred::Projection { alias: out[0], term: out[1] },
+                Pred::NormalizesTo { .. } => Pred::NormalizesTo { alias: out[0], term: out[1] },
+                Pred::TypeOutlives { .. } => Pred::TypeOutlives { ty: out[0], region: out[1] },
+                Pred::RegionOutlives { .. } => Pred::RegionOutlives { a: out[0], b: out[1] },
+                Pred::Subtype { .. } => Pred::Subtype { a: out[0], b: out[1] },
+                Pred::Coerce { .. } => Pred::Coerce { a: out[0], b: out[1] },
+                Pred::ConstArgHasType { .. } => Pred::ConstArgHasType { ct: out[0], ty: out[1] },
+                _ => unreachable!(),
+            }
+        }
         Pred::DynCompatible(d) => Pred::DynCompatible(d),
         Pred::Eq { .. } => return Err(SolveError::Malformed(crate::error::bad_pred())),
     })

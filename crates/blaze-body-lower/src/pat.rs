@@ -346,7 +346,7 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
                 }
                 let drops = self.needs_drop(lt, At::Pat(p))?;
                 out.push(Binding { local, place: lp, ty: lt, drops });
-                self.binds.push((p, lp));
+                self.bind(p, lp);
                 match sub {
                     Some(s) => self.bind_pat(s, place, ty, out),
                     None => Ok(()),
@@ -379,7 +379,7 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
                 let (local, lp) = self.binding_local(p, lt)?;
                 let drops = self.needs_drop(lt, At::Pat(p))?;
                 out.push(Binding { local, place: lp, ty: lt, drops });
-                self.binds.push((p, lp));
+                self.bind(p, lp);
                 Ok(())
             }
             Pat::Tuple { elems, .. } => {

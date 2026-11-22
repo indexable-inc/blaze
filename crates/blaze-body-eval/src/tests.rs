@@ -10,7 +10,7 @@ use std::vec::Vec as StdVec;
 use blaze_body::{AssertKind, BinOp, Body, Stmt, verify};
 use blaze_consteval::fixture::World;
 use blaze_consteval::{
-    Answer, ConstRecord, ConstWorld, DataRecord, FnKind, Layouts, LayoutFacts, Limits, Missing, Op, RecordKey, Refusal,
+    Answer, ConstRecord, ConstWorld, DataRecord, FnKind, Intrinsic, Layouts, LayoutFacts, Limits, Missing, Op, RecordKey, Refusal,
     ReprAttrs, ValidRange,
 };
 use blaze_ids::ContentId;
@@ -31,29 +31,44 @@ struct Tw {
 
 /// The types the bodies name, as `tN` handles of the world's table.
 struct Tys {
+    unit: u32,
+    u8: u32,
     u32: u32,
+    usize: u32,
     bool: u32,
+    char: u32,
+    str_ref: u32,
     pair: u32,
     p: u32,
     r: u32,
     e: u32,
     isize: u32,
+    arr4: u32,
 }
 
 fn world() -> (Tw, Tys) {
     let mut w = World::new();
+    let b = w.fx.ty(blaze_typeck::PNode::Bool);
+    let unit = w.fx.tuple(&[]);
+    w.intrinsic("assume", 0, &[b], unit, Intrinsic::Assume);
     w.strukt("P", &[("a", "u32"), ("b", "u32")]);
     w.enum_("E", None, &[("A", &[], None), ("B", &["u32"], None)]);
     w.build();
     let mut t = |s: &str| -> u32 { w.ty(s).0 };
     let tys = Tys {
+        unit: unit.0,
+        u8: t("u8"),
         u32: t("u32"),
+        usize: t("usize"),
         bool: t("bool"),
+        char: t("char"),
+        str_ref: t("&str"),
         pair: t("(u32, bool)"),
         p: t("P"),
         r: t("&u32"),
         e: t("E"),
         isize: t("isize"),
+        arr4: t("[u32; 4]"),
     };
     (Tw { w, bodies: StdVec::new() }, tys)
 }
@@ -398,4 +413,156 @@ fn step_limit_stops_a_loop() {
     let tw = tw.with(ROOT, &format!("local _0: t{u} return\nbb0:\n  goto bb0\n", u = t.u32));
     let e = refused(&tw, Limits { steps: 1000, ..Limits::DEFAULT });
     assert!(matches!(e.fault, Fault::Refused(Refusal::StepLimit { limit: 1000 })), "{e:?}");
+}
+
+/// `Intrinsic::Assume(false)` is UB and must be refused with `Refusal::Unreachable`, while
+/// `Intrinsic::Assume(true)` succeeds.
+#[test]
+fn assume_false_is_refused_and_true_passes() {
+    let (tw, t) = world();
+    let assume = tw.w.key("assume").0;
+    let body_false = format!(
+        "\
+local _0: t{u} return
+local _1: t{unit} temp e0 value
+const c0 = scalar 0x0: t{b}
+const c1 = scalar 0x7: t{u}
+bb0:
+  call intrinsic k{assume:x}<0,0>(const c0) -> _1 then bb1 unwind continue
+bb1:
+  _0 = const c1
+  return
+",
+        u = t.u32,
+        unit = t.unit,
+        b = t.bool,
+    );
+    let tw_false = tw.with(ROOT, &body_false);
+    let e = refused(&tw_false, Limits::DEFAULT);
+    assert!(matches!(e.fault, Fault::Refused(Refusal::Unreachable)), "{e:?}");
+
+    let (tw, t) = world();
+    let assume = tw.w.key("assume").0;
+    let body_true = format!(
+        "\
+local _0: t{u} return
+local _1: t{unit} temp e0 value
+const c0 = scalar 0x1: t{b}
+const c1 = scalar 0x7: t{u}
+bb0:
+  call intrinsic k{assume:x}<0,0>(const c0) -> _1 then bb1 unwind continue
+bb1:
+  _0 = const c1
+  return
+",
+        u = t.u32,
+        unit = t.unit,
+        b = t.bool,
+    );
+    let tw_true = tw.with(ROOT, &body_true);
+    assert_eq!(u32_value(&tw_true), 7);
+}
+
+/// `UnOp::PtrMetadata` on a `&str` bytes constant (`ConstKind::Bytes`) must return its length
+/// and not leak `Origin::Data` allocations in a loop.
+#[test]
+fn ptr_metadata_on_bytes_const_and_loop_no_leak() {
+    let (tw, t) = world();
+    // 64 bytes ("aa" * 64 = 128 hex chars), looped 200 times under a 1024-byte memory limit
+    // (would allocate 12.8 KiB and fail with MemoryLimit if ConstKind::Bytes leaked).
+    let hex = "61".repeat(64);
+    let text = format!(
+        "\
+local _0: t{u} return mut
+local _1: t{u} temp e0 value mut
+local _2: t{b} temp e1 value
+local _3: t{us} temp e2 value
+const c0 = scalar 0x0: t{u}
+const c1 = scalar 0x1: t{u}
+const c2 = scalar 0xc8: t{u}
+const c3 = bytes \"{hex}\": t{s}
+bb0:
+  _0 = const c0
+  _1 = const c0
+  goto bb1
+bb1:
+  _2 = lt(copy _1, const c2)
+  switch copy _2 [0 -> bb3] else bb2
+bb2:
+  _3 = meta(const c3)
+  _0 = cast int_to_int(copy _3) as t{u}
+  _1 = add(copy _1, const c1)
+  goto bb1
+bb3:
+  return
+",
+        u = t.u32,
+        b = t.bool,
+        us = t.usize,
+        s = t.str_ref,
+    );
+    let tw = tw.with(ROOT, &text);
+    let r = run(&tw, Limits { memory: 1024, ..Limits::DEFAULT }).unwrap_or_else(|e| panic!("refused: {e}"));
+    let bytes = &r.allocs[0].bytes;
+    assert_eq!(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]), 64);
+}
+
+/// Invalid `bool` (> 1) and invalid `char` (surrogate `0xD800`) values must be refused on
+/// scalar read / transmute.
+#[test]
+fn invalid_bool_and_char_are_refused() {
+    let (tw, t) = world();
+    let bad_bool = format!(
+        "\
+local _0: t{b} return
+const c0 = scalar 0x2: t{u8}
+bb0:
+  _0 = cast transmute(const c0) as t{b}
+  return
+",
+        b = t.bool,
+        u8 = t.u8,
+    );
+    let tw_b = tw.with(ROOT, &bad_bool);
+    let e = refused(&tw_b, Limits::DEFAULT);
+    assert!(matches!(e.fault, Fault::Refused(Refusal::InvalidBool { value: 2 })), "{e:?}");
+
+    let (tw, t) = world();
+    let bad_char = format!(
+        "\
+local _0: t{ch} return
+const c0 = scalar 0xd800: t{u}
+bb0:
+  _0 = cast transmute(const c0) as t{ch}
+  return
+",
+        ch = t.char,
+        u = t.u32,
+    );
+    let tw_c = tw.with(ROOT, &bad_char);
+    let e = refused(&tw_c, Limits::DEFAULT);
+    assert!(matches!(e.fault, Fault::Refused(Refusal::InvalidChar { value: 0xD800 })), "{e:?}");
+}
+
+/// `Value::Repeat` evaluates its operand once and writes all elements.
+#[test]
+fn repeat_hoisted_builds_array() {
+    let (tw, t) = world();
+    let text = format!(
+        "\
+local _0: t{u} return
+local _1: t{arr} temp e0 value
+const c0 = scalar 0x9: t{u}
+const c1 = scalar 0x4: t{us}
+bb0:
+  _1 = repeat(const c0, c1)
+  _0 = add(copy _1[0 of 4], copy _1[3 of 4])
+  return
+",
+        u = t.u32,
+        arr = t.arr4,
+        us = t.usize,
+    );
+    let tw = tw.with(ROOT, &text);
+    assert_eq!(u32_value(&tw), 18);
 }

@@ -505,3 +505,85 @@ fn an_invariant_loop_parameter_is_a_copy() {
     assert_eq!(before, after);
     assert_eq!(after, Outcome::<Global>::Returned(vec![Val::Int(43)]));
 }
+
+/// A value that stands for a block parameter whose arguments fold to a constant propagates that
+/// constant to its own users (tests the CSR worklist's `stands` relay).
+#[test]
+fn a_stands_relay_chain_folds_dependent_instructions() {
+    let mut b = Builder::<Global, Full>::new_in(64, Global);
+    let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I1)], &[Param::of(Ty::I32)]);
+    b.set_signature(sig);
+    let [entry, then, other, join] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+    b.begin(entry);
+    let cond = b.param(Ty::I1);
+    b.br(Flags::NONE, cond, (then, &[]), (other, &[]));
+    b.begin(then);
+    let two = b.iconst(Ty::I32, 2);
+    let five_a = b.binary(Op::Add, Flags::NONE, two, two);
+    b.jump((join, &[five_a]));
+    b.begin(other);
+    let one = b.iconst(Ty::I32, 1);
+    let three = b.iconst(Ty::I32, 3);
+    let five_b = b.binary(Op::Add, Flags::NONE, one, three);
+    b.jump((join, &[five_b]));
+    b.begin(join);
+    // `joined` folds to `Known::Int(4)` only after both arms' `add`s fold; `sel` immediately
+    // stands for `joined` (`a == b`), so `plus_one` must be woken through `sel` once `joined`
+    // becomes known.
+    let joined = b.param(Ty::I32);
+    let sel = b.select(Flags::NONE, cond, joined, joined);
+    let k = b.iconst(Ty::I32, 1);
+    let plus_one = b.binary(Op::Add, Flags::NONE, sel, k);
+    b.ret(&[plus_one]);
+    let func = b.finish_checked().expect("builds");
+    let out = dead(propagate(func.view(), Global).expect("propagates").view(), Global).expect("cleans");
+    assert_eq!(
+        ops(out.view()),
+        [Op::Param, Op::Br, Op::Jump, Op::Jump, Op::Iconst, Op::Return],
+        "{}",
+        print(out.view())
+    );
+    for c in [0u128, 1] {
+        let ran = run_in(out.view(), &[Val::Int(c)], FUEL, Global).expect("runs");
+        assert_eq!(ran, Outcome::<Global>::Returned(vec![Val::Int(5)]));
+    }
+}
+
+/// No-op fast paths for `propagate` and `dead` on a function with nothing to fold or remove.
+#[test]
+fn noop_function_preserves_ir_and_semantics() {
+    let mut b = Builder::<Global, Full>::new_in(64, Global);
+    let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I32), Param::of(Ty::I32)], &[Param::of(Ty::I32)]);
+    b.set_signature(sig);
+    let entry = b.create_block(BlockKind::Normal);
+    b.begin(entry);
+    let (x, y) = (b.param(Ty::I32), b.param(Ty::I32));
+    let sum = b.binary(Op::Add, Flags::NONE, x, y);
+    b.ret(&[sum]);
+    let func = b.finish_checked().expect("builds");
+    let prop = propagate(func.view(), Global).expect("propagates");
+    let cleaned = dead(prop.view(), Global).expect("cleans");
+    assert_eq!(ops(cleaned.view()), ops(func.view()));
+    let args = [Val::Int(17), Val::Int(25)];
+    assert_eq!(
+        run_in(cleaned.view(), &args, FUEL, Global).expect("runs"),
+        Outcome::<Global>::Returned(vec![Val::Int(42)])
+    );
+}
+
+/// A long chain of constant additions folds completely in linear time.
+#[test]
+fn a_long_constant_chain_folds_completely() {
+    let func = one_block(Ty::I32, |b| {
+        let one = b.iconst(Ty::I32, 1);
+        let mut acc = b.iconst(Ty::I32, 0);
+        for _ in 0..512 {
+            acc = b.binary(Op::Add, Flags::NONE, acc, one);
+        }
+        acc
+    });
+    let out = dead(propagate(func.view(), Global).expect("propagates").view(), Global).expect("cleans");
+    assert_eq!(ops(out.view()), [Op::Iconst, Op::Return], "{}", print(out.view()));
+    let ran = run_in(out.view(), &[], FUEL, Global).expect("runs");
+    assert_eq!(ran, Outcome::<Global>::Returned(vec![Val::Int(512)]));
+}

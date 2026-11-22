@@ -54,6 +54,12 @@ pub fn eval_body<'w, 'a, W: BodyWorld, L: Layout>(
         mem: Memory::new_in(limits.memory, alloc),
         frames: Vec::new_in(alloc),
         consts: Vec::new_in(alloc),
+        bytes_consts: Vec::new_in(alloc),
+        proj_scratch: Vec::new_in(alloc),
+        body_live: Vec::new_in(alloc),
+        live_bits: Vec::new_in(alloc),
+        inst_tys: Vec::new_in(alloc),
+        cached_tys: Vec::new_in(alloc),
         limits,
         steps: 0,
         alloc,
@@ -212,8 +218,8 @@ struct Frame<'w, 'a> {
     types: PTys<'w>,
     /// The ground arguments, a copy of the list `ground` holds.
     args: Vec<PTy, Alloc<'a>>,
-    /// Each local's ground type.
-    tys: Vec<PTy, Alloc<'a>>,
+    /// Slice `(start, len)` in `Machine::cached_tys` holding each local's ground type.
+    tys: (u32, u32),
     /// Each local's allocation while it is live.
     locals: Vec<Option<AllocId>, Alloc<'a>>,
     /// The row run next.
@@ -255,6 +261,17 @@ struct Machine<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> {
     /// Constants' records loaded into memory this run, by item and ground arguments: a
     /// constant read in a loop is loaded once (rule 77).
     consts: Vec<(ItemKey, List, AllocId), Alloc<'a>>,
+    /// Byte-string / string literal data allocations cached by `(item, const_id)` so loops
+    /// never leak `Origin::Data` allocations.
+    bytes_consts: Vec<(ItemKey, Const, AllocId), Alloc<'a>>,
+    /// Reused projection scratch stack for `place()` (zero per-call heap allocations).
+    proj_scratch: Vec<Proj, Alloc<'a>>,
+    /// Cached per-body `StorageLive` scan: `(item, start, len)` indexing `live_bits`.
+    body_live: Vec<(ItemKey, u32, u32), Alloc<'a>>,
+    live_bits: Vec<bool, Alloc<'a>>,
+    /// Cached per-instance grounded local types: `(item, args, start, len)` indexing `cached_tys`.
+    inst_tys: Vec<(ItemKey, List, u32, u32), Alloc<'a>>,
+    cached_tys: Vec<PTy, Alloc<'a>>,
     limits: Limits,
     steps: u64,
     alloc: Alloc<'a>,
@@ -418,26 +435,52 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         let mut argv: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
         argv.extend_from_slice(self.ground.view().list(args).map_err(|_| malformed("a call's arguments past the ground table"))?);
         let n = b.body.locals() as usize;
-        let mut made_live: Vec<bool, Alloc<'a>> = Vec::new_in(self.alloc);
-        made_live.resize(n, false);
-        for s in 0..b.body.stmts() {
-            if let StmtKind::StorageLive(l) = b.body.stmt(Stmt(s)).kind {
-                made_live[l.0 as usize] = true;
+        // Scan StorageLive statements once per body (avoids O(stmts) scan on every recursive call).
+        let (live_start, live_len) = match self.body_live.iter().find(|&&(k, _, _)| k == item) {
+            Some(&(_, s, l)) => (s as usize, l as usize),
+            None => {
+                let s = self.live_bits.len();
+                self.live_bits.resize(s + n, false);
+                for st in 0..b.body.stmts() {
+                    if let StmtKind::StorageLive(l) = b.body.stmt(Stmt(st)).kind {
+                        self.live_bits[s + l.0 as usize] = true;
+                    }
+                }
+                self.body_live.push((item, s as u32, n as u32));
+                (s, n)
+            }
+        };
+        // Ground local types once per `(item, args)` instance.
+        let (tys_start, tys_len) = match self.inst_tys.iter().find(|&&(k, a, _, _)| k == item && a == args) {
+            Some(&(_, _, s, l)) => (s, l),
+            None => {
+                let s = self.cached_tys.len() as u32;
+                for l in 0..n {
+                    let decl = b.body.local(Local(l as u32));
+                    let gty = ground_in(b.body, b.types, &argv, decl.ty, &mut *self.ground, self.alloc, self.world)?;
+                    self.cached_tys.push(gty);
+                }
+                self.inst_tys.push((item, args, s, n as u32));
+                (s, n as u32)
+            }
+        };
+        let mut locals: Vec<Option<AllocId>, Alloc<'a>> = Vec::with_capacity_in(n, self.alloc);
+        for l in 0..n {
+            if l < live_len && !self.live_bits[live_start + l] {
+                let ty = self.cached_tys[tys_start as usize + l];
+                locals.push(Some(self.allocate_local(ty)?));
+            } else {
+                locals.push(None);
             }
         }
-        let mut tys: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
-        let mut locals: Vec<Option<AllocId>, Alloc<'a>> = Vec::new_in(self.alloc);
-        for l in 0..n {
-            let decl = b.body.local(Local(l as u32));
-            tys.push(ground_in(b.body, b.types, &argv, decl.ty, &mut *self.ground, self.alloc, self.world)?);
-            locals.push(None);
+        Ok(Frame { item, body: b.body, types: b.types, args: argv, tys: (tys_start, tys_len), locals, at: b.body.entry(), ret })
+    }
+
+    fn local_ty(&self, f: &Frame<'w, 'a>, i: usize) -> R<'a, PTy> {
+        if i >= f.tys.1 as usize {
+            return Err(malformed("a local past the frame").into());
         }
-        for l in 0..n {
-            if !made_live[l] {
-                locals[l] = Some(self.allocate_local(tys[l])?);
-            }
-        }
-        Ok(Frame { item, body: b.body, types: b.types, args: argv, tys, locals, at: b.body.entry(), ret })
+        Ok(self.cached_tys[f.tys.0 as usize + i])
     }
 
     fn allocate_local(&mut self, ty: PTy) -> R<'a, AllocId> {
@@ -446,7 +489,8 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
     }
 
     fn storage_live(&mut self, l: Local) -> R<'a, ()> {
-        let ty = *self.top()?.tys.get(l.0 as usize).ok_or(Stop::from(malformed("a local past the frame")))?;
+        let f = self.top()?;
+        let ty = self.local_ty(f, l.0 as usize)?;
         let id = self.allocate_local(ty)?;
         self.top_mut()?.locals[l.0 as usize] = Some(id);
         Ok(())
@@ -547,7 +591,8 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
             return Ok(Some(self.intern(r0)?));
         }
         if let Some(dst) = f.ret.dest {
-            let size = self.size(f.tys[0])?;
+            let ty0 = self.local_ty(&f, 0)?;
+            let size = self.size(ty0)?;
             if size != 0 {
                 self.mem.copy(Pointer { alloc: r0, offset: 0 }, dst, size)?;
             }
@@ -562,20 +607,28 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
     // ---- Places ----
 
     fn place(&mut self, p: Place) -> R<'a, Pl> {
-        let body = self.top()?.body;
-        let mut chain: Vec<Proj, Alloc<'a>> = Vec::new_in(self.alloc);
-        let mut row = body.place(p);
-        while let (Some(parent), Some(proj)) = (row.parent, row.proj) {
-            chain.push(proj);
-            row = body.place(parent);
+        let f = self.top()?;
+        let row = f.body.place(p);
+        if row.parent.is_none() {
+            let i = row.local.0 as usize;
+            let ty = self.local_ty(f, i)?;
+            // A local read outside its storage is undefined behaviour.
+            let id = f.locals.get(i).copied().flatten().ok_or(Stop::from(Refusal::Dangling))?;
+            return Ok(Pl { ptr: Pointer { alloc: id, offset: 0 }, meta: None, ty, variant: 0 });
+        }
+        let body = f.body;
+        self.proj_scratch.clear();
+        let mut cur = row;
+        while let (Some(parent), Some(proj)) = (cur.parent, cur.proj) {
+            self.proj_scratch.push(proj);
+            cur = body.place(parent);
         }
         let f = self.top()?;
-        let i = row.local.0 as usize;
-        let ty = *f.tys.get(i).ok_or(Stop::from(malformed("a local past the frame")))?;
-        // A local read outside its storage is undefined behaviour.
+        let i = cur.local.0 as usize;
+        let ty = self.local_ty(f, i)?;
         let id = f.locals.get(i).copied().flatten().ok_or(Stop::from(Refusal::Dangling))?;
         let mut pl = Pl { ptr: Pointer { alloc: id, offset: 0 }, meta: None, ty, variant: 0 };
-        while let Some(proj) = chain.pop() {
+        while let Some(proj) = self.proj_scratch.pop() {
             pl = self.project(pl, proj)?;
         }
         Ok(pl)
@@ -693,9 +746,17 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                 }
             }
             ConstKind::Bytes { .. } => {
+                let item = self.top()?.item;
                 let bytes = body.bytes(c).ok_or(Stop::from(malformed("a bytes constant with no bytes")))?;
-                let data = self.mem.allocate(bytes.len() as u64, 0, false, Origin::Data)?;
-                self.mem.fill(data, bytes, &[])?;
+                let data = match self.bytes_consts.iter().find(|&&(it, kc, _)| it == item && kc == c) {
+                    Some(&(_, _, id)) => id,
+                    None => {
+                        let id = self.mem.allocate(bytes.len() as u64, 0, false, Origin::Data)?;
+                        self.mem.fill(id, bytes, &[])?;
+                        self.bytes_consts.push((item, c, id));
+                        id
+                    }
+                };
                 match self.node(ty)? {
                     PNode::Ref(_, t) | PNode::Ptr(_, t) => {
                         let unsized_ = self.is_unsized(t)?;
@@ -708,7 +769,7 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                         Src::Temp(tmp)
                     }
                     // An array by value.
-                    _ => Src::Temp(data),
+                    _ => Src::At(Pointer { alloc: data, offset: 0 }),
                 }
             }
             ConstKind::Item { key, args } => {
@@ -760,13 +821,27 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         }
     }
 
+    fn check_scalar_valid(&self, ty: PTy, s: Scalar) -> R<'a, ()> {
+        match (self.node(ty)?, s) {
+            (PNode::Bool, Scalar::Int(v)) if v > 1 => Err(Refusal::InvalidBool { value: v }.into()),
+            (PNode::Bool, Scalar::Ptr(_)) => Err(Refusal::PointerAsInt.into()),
+            (PNode::Char, Scalar::Int(v)) if u32::try_from(v).ok().and_then(char::from_u32).is_none() => {
+                Err(Refusal::InvalidChar { value: v }.into())
+            }
+            (PNode::Char, Scalar::Ptr(_)) => Err(Refusal::PointerAsInt.into()),
+            _ => Ok(()),
+        }
+    }
+
     fn read(&mut self, o: Opnd) -> R<'a, Scalar> {
         let size = self.size(o.ty)?;
-        Ok(match o.src {
+        let s = match o.src {
             Src::At(p) => self.mem.read(p, size)?,
             Src::Temp(id) => self.mem.read(Pointer { alloc: id, offset: 0 }, size)?,
             Src::Imm(b) => Scalar::Int(b),
-        })
+        };
+        self.check_scalar_valid(o.ty, s)?;
+        Ok(s)
     }
 
     fn copy_out(&mut self, o: Opnd, dst: Pointer, size: u64) -> R<'a, ()> {
@@ -783,10 +858,18 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
 
     fn operand_into(&mut self, op: Operand, dst: Pointer) -> R<'a, ()> {
         let o = self.operand(op)?;
-        let size = self.size(o.ty)?;
-        self.copy_out(o, dst, size)?;
+        let res = (|| -> R<'a, ()> {
+            if matches!(self.node(o.ty)?, PNode::Bool | PNode::Char) {
+                let s = self.read(o)?;
+                let size = self.size(o.ty)?;
+                self.mem.write(dst, size, s)?;
+                return Ok(());
+            }
+            let size = self.size(o.ty)?;
+            self.copy_out(o, dst, size)
+        })();
         self.release(o);
-        Ok(())
+        res
     }
 
     fn uint(&self, s: Scalar) -> R<'a, u128> {
@@ -867,12 +950,30 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                 };
                 let (e, _) = self.elem(d)?;
                 let stride = self.size(e)?;
-                for k in 0..n {
+                let o = self.operand(operand)?;
+                let res = (|| -> R<'a, ()> {
                     // A long repeat is bounded as a loop is.
-                    self.tick()?;
-                    self.operand_into(operand, d.ptr.at(k * stride))?;
-                }
-                Ok(())
+                    self.steps = self.steps.saturating_add(n);
+                    if self.steps > self.limits.steps {
+                        return Err(Refusal::StepLimit { limit: self.limits.steps }.into());
+                    }
+                    if n > 0 && stride != 0 {
+                        let size = self.size(o.ty)?;
+                        if matches!(self.node(o.ty)?, PNode::Bool | PNode::Char) {
+                            let s = self.read(o)?;
+                            for k in 0..n {
+                                self.mem.write(d.ptr.at(k * stride), size, s)?;
+                            }
+                        } else {
+                            for k in 0..n {
+                                self.copy_out(o, d.ptr.at(k * stride), size)?;
+                            }
+                        }
+                    }
+                    Ok(())
+                })();
+                self.release(o);
+                res
             }
             Value::Len(p) => {
                 let pl = self.place(p)?;
@@ -958,14 +1059,24 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
         if op == UnOp::PtrMetadata {
             // A pointer's metadata: its second word if the pointee is unsized, else `()`.
             let (PNode::Ref(_, t) | PNode::Ptr(_, t)) = n else {
+                self.release(o);
                 return Err(malformed("metadata of a value that is no pointer").into());
             };
-            if self.is_unsized(t)? {
-                let Src::At(p) = o.src else { return Err(malformed("metadata of a pointer constant").into()) };
-                self.mem.copy(p.at(PTR), d.ptr, PTR)?;
-            }
+            let res = if self.is_unsized(t)? {
+                let p = match o.src {
+                    Src::At(p) => p,
+                    Src::Temp(id) => Pointer { alloc: id, offset: 0 },
+                    Src::Imm(_) => {
+                        self.release(o);
+                        return Err(malformed("metadata of a pointer constant").into());
+                    }
+                };
+                self.mem.copy(p.at(PTR), d.ptr, PTR).map_err(Stop::from)
+            } else {
+                Ok(())
+            };
             self.release(o);
-            return Ok(());
+            return res;
         }
         let s = self.read(o)?;
         self.release(o);
@@ -1010,9 +1121,17 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
             CastKind::Transmute => {
                 let (fs, ts) = (self.size(o.ty)?, self.size(d.ty)?);
                 if fs != ts {
+                    self.release(o);
                     return Err(Refusal::TransmuteSize { from: fs, to: ts }.into());
                 }
                 self.copy_out(o, d.ptr, ts)?;
+                if matches!(to, PNode::Bool | PNode::Char) {
+                    let s = self.mem.read(d.ptr, ts)?;
+                    if let Err(e) = self.check_scalar_valid(d.ty, s) {
+                        self.release(o);
+                        return Err(e);
+                    }
+                }
             }
             CastKind::Unsize => {
                 let (PNode::Ref(_, s) | PNode::Ptr(_, s), PNode::Ref(_, t) | PNode::Ptr(_, t)) = (from, to) else {
@@ -1122,11 +1241,12 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
     /// `Machine::intrinsic` (see the report).
     fn intrinsic(&mut self, i: Intrinsic, iargs: List, args: Ops, d: Option<Pl>) -> R<'a, ()> {
         let body = self.top()?.body;
-        let mut ops: Vec<Operand, Alloc<'a>> = Vec::new_in(self.alloc);
-        ops.extend(body.ops(args));
+        let mut ops = body.ops(args);
+        let op0 = ops.next();
+        let op1 = ops.next();
         let need_dest = |d: Option<Pl>| d.ok_or(Stop::from(malformed("an intrinsic call with no destination")));
-        let two = |ops: &Vec<Operand, Alloc<'a>>| match (ops.first(), ops.get(1)) {
-            (Some(&a), Some(&b)) => Ok((a, b)),
+        let two = || match (op0, op1) {
+            (Some(a), Some(b)) => Ok((a, b)),
             _ => Err(Stop::from(malformed("a two-operand intrinsic without two operands"))),
         };
         match i {
@@ -1139,14 +1259,21 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
             // `true` in a constant, as the old evaluator answers.
             Intrinsic::UbChecks => self.put(need_dest(d)?, 1),
             Intrinsic::Likely | Intrinsic::Unlikely | Intrinsic::BlackBox => {
-                let a = *ops.first().ok_or(Stop::from(malformed("a one-operand intrinsic with none")))?;
+                let a = op0.ok_or(Stop::from(malformed("a one-operand intrinsic with none")))?;
                 self.operand_into(a, need_dest(d)?.ptr)
             }
-            Intrinsic::Assume | Intrinsic::ColdPath => Ok(()),
+            Intrinsic::Assume => {
+                let a = op0.ok_or(Stop::from(malformed("`assume` with no argument")))?;
+                if self.int(a)? == 0 {
+                    return Err(Refusal::Unreachable.into());
+                }
+                Ok(())
+            }
+            Intrinsic::ColdPath => Ok(()),
             Intrinsic::Unreachable => Err(Refusal::Unreachable.into()),
             Intrinsic::AbortImmediate => Err(Stop::Fault(Fault::Abort)),
             Intrinsic::WrappingAdd | Intrinsic::WrappingSub | Intrinsic::WrappingMul => {
-                let (a, b) = two(&ops)?;
+                let (a, b) = two()?;
                 let op = match i {
                     Intrinsic::WrappingAdd => BinOp::Add,
                     Intrinsic::WrappingSub => BinOp::Sub,
@@ -1159,7 +1286,7 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                 Ok(())
             }
             Intrinsic::AddWithOverflow | Intrinsic::SubWithOverflow | Intrinsic::MulWithOverflow => {
-                let (a, b) = two(&ops)?;
+                let (a, b) = two()?;
                 let op = match i {
                     Intrinsic::AddWithOverflow => BinOp::Add,
                     Intrinsic::SubWithOverflow => BinOp::Sub,

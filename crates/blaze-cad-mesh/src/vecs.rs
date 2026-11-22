@@ -13,43 +13,40 @@ use crate::geom::{P3, plus_zeros, point_order};
 pub(crate) type V<'a, T> = Vec<T, Alloc<'a>>;
 
 /// `x` pushed, or the refusal.
-#[inline]
+#[inline(always)]
 pub(crate) fn push<T>(v: &mut V<'_, T>, x: T) -> Result<(), AllocFailure> {
-    v.try_push(x).map_err(|refused| refused.why)
+    if v.len() == v.capacity() {
+        v.try_reserve(1)?;
+    }
+    v.push(x);
+    Ok(())
 }
 
 /// `len` copies of `value`.
 pub(crate) fn filled<T: Copy>(len: usize, value: T, alloc: Alloc<'_>) -> Result<V<'_, T>, AllocFailure> {
     let mut v = Vec::try_with_capacity_in(len, alloc)?;
-    for _ in 0..len {
-        push(&mut v, value)?;
-    }
+    v.resize(len, value);
     Ok(v)
 }
 
 /// A copy of `src`.
 pub(crate) fn copied<'a, T: Copy>(src: &[T], alloc: Alloc<'a>) -> Result<V<'a, T>, AllocFailure> {
     let mut v = Vec::try_with_capacity_in(src.len(), alloc)?;
-    for &x in src {
-        push(&mut v, x)?;
-    }
+    v.extend_from_slice(src);
     Ok(v)
 }
 
 /// `src` appended.
+#[inline]
 pub(crate) fn extend<T: Copy>(v: &mut V<'_, T>, src: &[T]) -> Result<(), AllocFailure> {
-    v.try_reserve(src.len())?;
-    for &x in src {
-        push(v, x)?;
-    }
-    Ok(())
+    v.try_extend_from_slice(src)
 }
 
 /// `0, 1, .., len - 1`.
 pub(crate) fn counting(len: u32, alloc: Alloc<'_>) -> Result<V<'_, u32>, AllocFailure> {
     let mut v = Vec::try_with_capacity_in(blaze_int::idx(len), alloc)?;
     for i in 0..len {
-        push(&mut v, i)?;
+        v.push(i);
     }
     Ok(v)
 }

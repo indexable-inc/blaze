@@ -25,13 +25,15 @@ pub struct RootMarks {
     pub sans_io: bool,
     /// `#![blaze::driver]`: the code under it is a core's driver, which does the IO.
     pub driver: bool,
+    /// `#![blaze::trust(unsafe, reason = "..")]`: the crate root explains why it uses `unsafe`.
+    pub trust_unsafe: bool,
     /// The rules whose lint the file denies or forbids, as [`Rule::bit`]s.
     denied: u32,
 }
 
 impl RootMarks {
     /// No mark: a file whose top says none of these.
-    pub const NONE: RootMarks = RootMarks { no_std: false, sans_io: false, driver: false, denied: 0 };
+    pub const NONE: RootMarks = RootMarks { no_std: false, sans_io: false, driver: false, trust_unsafe: false, denied: 0 };
 
     /// The marks `text`'s leading inner attributes give. Comments and doc comments between them
     /// are passed over; the first token that does not start an inner attribute ends the read.
@@ -58,6 +60,7 @@ impl RootMarks {
             no_std: self.no_std,
             sans_io: self.sans_io || file.sans_io,
             driver: self.driver || file.driver,
+            trust_unsafe: self.trust_unsafe || file.trust_unsafe,
             denied: self.denied | file.denied,
         }
     }
@@ -66,7 +69,11 @@ impl RootMarks {
     /// equal. The rules they add ([`RootMarks::rules`]) are a function of it, so a key that has
     /// it covers them.
     pub const fn key(&self) -> u64 {
-        (self.denied as u64) | (self.no_std as u64) << 32 | (self.sans_io as u64) << 33 | (self.driver as u64) << 34
+        (self.denied as u64)
+            | (self.no_std as u64) << 32
+            | (self.sans_io as u64) << 33
+            | (self.driver as u64) << 34
+            | (self.trust_unsafe as u64) << 35
     }
 
     /// Whether the file denies or forbids `rule`'s lint.
@@ -74,9 +81,11 @@ impl RootMarks {
         self.denied & rule.bit() != 0
     }
 
-    /// `scope` as the marks make it: in a core where the file is one.
+    /// `scope` as the marks make it: in a core where the file is one, and with `trust_unsafe`
+    /// where the crate root carries a valid `#![blaze::trust(unsafe, reason = "..")]`.
     pub const fn scope(&self, scope: Scope) -> Scope {
-        if self.sans_io { scope.in_core() } else { scope }
+        let scope = if self.sans_io { scope.in_core() } else { scope };
+        if self.trust_unsafe { scope.with_trust_unsafe() } else { scope }
     }
 
     /// `base` and the rules the marks ask for: each rule whose lint is denied, and
@@ -126,6 +135,11 @@ impl RootMarks {
             "blaze" => match blaze_path(sig) {
                 Some("sans_io") if peek_is(sig, TokenKind::CloseBracket) => self.sans_io = true,
                 Some("driver") if peek_is(sig, TokenKind::CloseBracket) => self.driver = true,
+                Some("trust") if peek_is(sig, TokenKind::OpenParen) => {
+                    if trust_unsafe(sig) {
+                        self.trust_unsafe = true;
+                    }
+                }
                 _ => {}
             },
             "deny" | "forbid" if peek_is(sig, TokenKind::OpenParen) => self.denied |= denied_list(sig),
@@ -288,4 +302,55 @@ fn denied_list(sig: &mut Peekable<Sig<'_>>) -> u32 {
         }
     }
     bits
+}
+
+/// `(unsafe, reason = "..")` after `blaze::trust`: consumes from `(` through its matching `)`,
+/// returning `true` iff `unsafe` and a non-empty `reason = "<text>"` are both present at depth 1
+/// and well-formed.
+fn trust_unsafe(sig: &mut Peekable<Sig<'_>>) -> bool {
+    let Some((TokenKind::OpenParen, _)) = sig.next() else { return false };
+    let mut depth = 1usize;
+    let mut has_unsafe = false;
+    let mut has_reason = false;
+    let mut bad = false;
+    // Bounded: each turn consumes one token of the text until the matching `)`.
+    while depth > 0 {
+        let Some((kind, word)) = sig.next() else { return false };
+        if depth == 1 && kind == TokenKind::CloseParen {
+            return !bad && has_unsafe && has_reason;
+        }
+        if depth == 1 && kind == TokenKind::Ident {
+            if word == "unsafe" {
+                if matches!(sig.peek(), Some(&(TokenKind::Comma | TokenKind::CloseParen, _))) {
+                    has_unsafe = true;
+                } else {
+                    bad = true;
+                }
+                continue;
+            }
+            if word == "reason" {
+                if peek_is(sig, TokenKind::Eq) {
+                    sig.next();
+                    if matches!(sig.peek(), Some(&(TokenKind::Literal { .. }, _))) {
+                        if let Some((_, val)) = sig.next() {
+                            if crate::engine::says_something(val)
+                                && matches!(sig.peek(), Some(&(TokenKind::Comma | TokenKind::CloseParen, _)))
+                            {
+                                has_reason = true;
+                            } else {
+                                bad = true;
+                            }
+                        }
+                    } else {
+                        bad = true;
+                    }
+                } else {
+                    bad = true;
+                }
+                continue;
+            }
+        }
+        depth = depth_of(kind, depth);
+    }
+    false
 }

@@ -91,6 +91,7 @@ pub use blaze_inproc_rt::{
 };
 
 pub mod exec;
+pub mod link;
 
 mod alloc;
 
@@ -99,8 +100,10 @@ mod tests;
 
 use std::sync::Arc;
 
+pub use exec::{CodeHandle, Executable, JitPool, TierSlot};
 use fence::{Fences, Grace};
 pub use image::{Layout, Segment};
+pub use link::{LinkUnit, LinkedBatch, Reloc, RelocKind, RelocTarget};
 
 /// A range of a [`CodeMemory`], by offset in its object.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -169,9 +172,11 @@ pub struct CodeMemory {
     arena_len: u64,
     cells_len: u64,
     arena: alloc::CodeHeap,
-    /// Ranges retired behind a fence: with their grace once their entry is in the control
-    /// table, waiting for room in it before.
+    /// Ranges retired behind a fence: partitioned so `limbo[..unposted]` are posted in the
+    /// control table with their grace and `limbo[unposted..]` are waiting for room in it.
     limbo: Vec<(Option<(Grace, u32)>, CodeRange)>,
+    /// Partition cursor into `limbo`: index of the first unposted range.
+    unposted: usize,
     layout: Option<Layout>,
     placed: Option<Placed>,
     /// Nothing changed the image part since [`CodeMemory::lay_out`]: it is still the file the
@@ -239,6 +244,7 @@ impl CodeMemory {
             cells_len: cells,
             arena: alloc::CodeHeap::new(image, arena),
             limbo: Vec::new(),
+            unposted: 0,
             layout: None,
             placed: None,
             pristine: false,
@@ -368,7 +374,9 @@ impl CodeMemory {
                 }
                 self.touch(at);
                 self.view.bytes_mut(at as usize..run as usize)?.fill(0);
-                self.view.publish(at as usize..run as usize);
+                if !self.processes.is_empty() {
+                    self.view.publish(at as usize..run as usize);
+                }
                 filled += run - at;
                 at = run;
             } else {
@@ -511,12 +519,31 @@ impl CodeMemory {
     /// Retires `range` of the arena, unlinked by stores already made: it is reused once every
     /// thread that could be in it has left it ([`CodeMemory::collect`]).
     pub fn retire(&mut self, range: CodeRange) -> Result<(), Error> {
-        self.arena_range(range)?;
-        if self.placed.is_none() || self.processes.is_empty() {
-            self.arena.give(range);
+        self.retire_batch(std::slice::from_ref(&range))
+    }
+
+    /// Retires a batch of arena `ranges`, unlinked by stores already made, sharing ONE fence
+    /// publication (`SeqCst` fence + `W_EPOCH` bump) instead of one per range.
+    ///
+    /// Atomic on validation error: if any range is outside the arena or empty, no range is
+    /// retired.
+    pub fn retire_batch(&mut self, ranges: &[CodeRange]) -> Result<(), Error> {
+        for &range in ranges {
+            self.arena_range(range)?;
+        }
+        if ranges.is_empty() {
             return Ok(());
         }
-        self.limbo.push((None, range));
+        if self.placed.is_none() || self.processes.is_empty() {
+            for &range in ranges {
+                self.arena.give(range);
+            }
+            return Ok(());
+        }
+        self.limbo.reserve(ranges.len());
+        for &range in ranges {
+            self.limbo.push((None, range));
+        }
         self.post();
         Ok(())
     }
@@ -535,18 +562,28 @@ impl CodeMemory {
         for process in &mut self.processes {
             sys::threads(process.pid, &mut process.threads)?;
         }
-        let lists: Vec<(u32, &[u64])> =
-            self.processes.iter().map(|it| (it.pid, it.threads.as_slice())).collect();
-        let oldest = self.fences.oldest(births, &lists);
+        let oldest = if self.processes.len() <= 64 {
+            let mut stack: [(u32, &[u64]); 64] = [(0, &[]); 64];
+            for (slot, process) in stack.iter_mut().zip(&self.processes) {
+                *slot = (process.pid, process.threads.as_slice());
+            }
+            self.fences.oldest(births, &stack[..self.processes.len()])
+        } else {
+            let lists: Vec<(u32, &[u64])> =
+                self.processes.iter().map(|it| (it.pid, it.threads.as_slice())).collect();
+            self.fences.oldest(births, &lists)
+        };
         let Some(oldest) = oldest else { return Ok(0) };
         let mut freed = 0;
         let mut index = 0;
-        while index < self.limbo.len() {
+        while index < self.unposted {
             match self.limbo[index] {
                 (Some((grace, entry)), range) if grace.passed_by(oldest) => {
                     self.fences.clear(entry);
                     self.arena.give(range);
-                    self.limbo.swap_remove(index);
+                    self.unposted -= 1;
+                    self.limbo.swap(index, self.unposted);
+                    self.limbo.swap_remove(self.unposted);
                     freed += 1;
                 }
                 _ => index += 1,
@@ -642,7 +679,8 @@ impl CodeMemory {
         self.processes.retain(|it| it.pid != pid);
         self.fences.forget(pid);
         if self.processes.is_empty() {
-            for (entry, range) in std::mem::take(&mut self.limbo) {
+            self.unposted = 0;
+            for (entry, range) in self.limbo.drain(..) {
                 if let Some((_, entry)) = entry {
                     self.fences.clear(entry);
                 }
@@ -676,25 +714,24 @@ impl CodeMemory {
         &self.control
     }
 
-    /// Posts what waits in limbo to the control table, under one grace.
+    /// Posts what waits in limbo (`limbo[unposted..]`) to the control table, under one grace.
     fn post(&mut self) {
+        if self.unposted >= self.limbo.len() {
+            return;
+        }
         let Some(placed) = self.placed else { return };
-        let mut posted = false;
-        for (entry, range) in &mut self.limbo {
-            if entry.is_some() {
-                continue;
-            }
+        let first_new = self.unposted;
+        while self.unposted < self.limbo.len() {
+            let (entry, range) = &mut self.limbo[self.unposted];
             let start = placed.arena + (range.offset - self.image);
             let Some(slot) = self.fences.post(start, start + range.len) else { break };
             *entry = Some((Grace::NONE, slot));
-            posted = true;
+            self.unposted += 1;
         }
-        if posted {
+        if self.unposted > first_new {
             let grace = self.fences.start();
-            for (entry, _) in &mut self.limbo {
-                if let Some((g, _)) = entry
-                    && *g == Grace::NONE
-                {
+            for (entry, _) in &mut self.limbo[first_new..self.unposted] {
+                if let Some((g, _)) = entry {
                     *g = grace;
                 }
             }
@@ -774,7 +811,7 @@ impl CellView {
 
 /// Whether AArch64 lets one thread change `instruction` while another may run it (Arm ARM
 /// B2.2.5, "concurrent modification and execution of instructions").
-fn is_concurrently_modifiable(instruction: u32) -> bool {
+pub(crate) fn is_concurrently_modifiable(instruction: u32) -> bool {
     let b_or_bl = instruction & 0x7c00_0000 == 0x1400_0000;
     let nop = instruction == 0xd503_201f;
     let isb = instruction == 0xd503_3fdf;

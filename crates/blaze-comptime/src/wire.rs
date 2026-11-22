@@ -119,8 +119,85 @@ fn maybe(out: &mut AVec<'_, u8>, bytes: Option<&[u8]>) {
     }
 }
 
+fn cbor_uint_len(n: u64) -> usize {
+    if n < 24 {
+        1
+    } else if n <= u64::from(u8::MAX) {
+        2
+    } else if n <= u64::from(u16::MAX) {
+        3
+    } else if n <= u64::from(u32::MAX) {
+        5
+    } else {
+        9
+    }
+}
+
+fn cbor_bytes_len(bytes: &[u8]) -> usize {
+    cbor_uint_len(len64(bytes.len())).saturating_add(bytes.len())
+}
+
+fn cbor_maybe_len(bytes: Option<&[u8]>) -> usize {
+    match bytes {
+        None => 1,
+        Some(bytes) => 1usize.saturating_add(cbor_bytes_len(bytes)),
+    }
+}
+
+fn call_body_len(call: &Call<'_>) -> usize {
+    // Array header (1 byte for 1..=5 elements) + tag (1 byte for 0..=23).
+    const HEAD: usize = 2;
+    match *call {
+        Call::Hello { protocol } => HEAD + cbor_uint_len(u64::from(protocol)),
+        Call::Look { path, .. } => HEAD.saturating_add(cbor_bytes_len(path)).saturating_add(1),
+        Call::Env { name } | Call::CreateDir { path: name } | Call::Remove { path: name } | Call::TrackPath { path: name } | Call::Denied { name } => {
+            HEAD.saturating_add(cbor_bytes_len(name))
+        }
+        Call::EnvAll | Call::Args | Call::Cwd | Call::Thread | Call::Socket => HEAD,
+        Call::Clock { .. } => HEAD + 1,
+        Call::Random { len } => HEAD + cbor_uint_len(u64::from(len)),
+        Call::Write { bytes, .. } => HEAD.saturating_add(1).saturating_add(cbor_bytes_len(bytes)),
+        Call::WriteFile { path, at, bytes } => HEAD.saturating_add(cbor_bytes_len(path)).saturating_add(cbor_uint_len(at)).saturating_add(cbor_bytes_len(bytes)),
+        Call::SetLen { path, len } => HEAD.saturating_add(cbor_bytes_len(path)).saturating_add(cbor_uint_len(len)),
+        Call::Rename { from, to } => HEAD.saturating_add(cbor_bytes_len(from)).saturating_add(cbor_bytes_len(to)),
+        Call::Sleep { ns } => HEAD + cbor_uint_len(ns),
+        Call::Spawn { program, args, env, cwd } => HEAD
+            .saturating_add(cbor_bytes_len(program))
+            .saturating_add(cbor_bytes_len(args.as_bytes()))
+            .saturating_add(cbor_bytes_len(env.as_bytes()))
+            .saturating_add(cbor_bytes_len(cwd)),
+        Call::Bridge { method, args } => HEAD.saturating_add(cbor_uint_len(u64::from(method))).saturating_add(cbor_bytes_len(args)),
+        Call::TrackEnv { name, value } => HEAD.saturating_add(cbor_bytes_len(name)).saturating_add(cbor_maybe_len(value)),
+        Call::Return { output } => HEAD.saturating_add(cbor_bytes_len(output)),
+        Call::Exit { code } => HEAD + cbor_uint_len(int_bits(code)),
+    }
+}
+
+fn answer_body_len(answer: &Answer<'_>) -> usize {
+    // Array header (1 byte for 1..=4 elements) + tag (1 byte for 0..=11).
+    const HEAD: usize = 2;
+    match *answer {
+        Answer::Hello { protocol } => HEAD + cbor_uint_len(u64::from(protocol)),
+        Answer::File { bytes } | Answer::Random { bytes } | Answer::Bridge { reply: bytes } => HEAD.saturating_add(cbor_bytes_len(bytes)),
+        Answer::Stat { len, .. } => HEAD + 1 + cbor_uint_len(len),
+        Answer::Listing { names } | Answer::Words { words: names } => HEAD.saturating_add(cbor_bytes_len(names.as_bytes())),
+        Answer::Value { value } => HEAD.saturating_add(cbor_maybe_len(value)),
+        Answer::Clock { ns } => HEAD + cbor_uint_len(ns),
+        Answer::Done => HEAD,
+        Answer::Spawned { status, stdout, stderr } => {
+            HEAD.saturating_add(cbor_uint_len(int_bits(status))).saturating_add(cbor_bytes_len(stdout)).saturating_add(cbor_bytes_len(stderr))
+        }
+        Answer::Error(_) => HEAD + 1,
+    }
+}
+
 /// `call` as one frame at the end of `out`; on an error `out` is as it was.
 pub fn write_call(call: &Call<'_>, out: &mut AVec<'_, u8>, limits: WireLimits) -> Result<(), WireError> {
+    let body_len = call_body_len(call);
+    if len64(body_len) > u64::from(limits.most_frame) {
+        return Err(WireError::Frame { len: len64(body_len), most: limits.most_frame });
+    }
+    out.reserve(body_len.saturating_add(4));
     let start = open(out);
     match *call {
         Call::Hello { protocol } => {
@@ -260,6 +337,10 @@ impl<'f> Fields<'f> {
 
     fn data(&mut self) -> Result<&'f [u8], WireError> {
         Ok(self.r.bytes(wide(self.limits.most_frame), "a frame's bytes")?)
+    }
+
+    fn random(&mut self) -> Result<&'f [u8], WireError> {
+        Ok(self.r.bytes(wide(self.limits.most_random), "random bytes")?)
     }
 
     fn words(&mut self) -> Result<Words<'f>, WireError> {
@@ -438,6 +519,11 @@ const SYS_ERRORS: [SysError; 10] = [
 
 /// `answer` as one frame at the end of `out`; on an error `out` is as it was.
 pub fn write_answer(answer: &Answer<'_>, out: &mut AVec<'_, u8>, limits: WireLimits) -> Result<(), WireError> {
+    let body_len = answer_body_len(answer);
+    if len64(body_len) > u64::from(limits.most_frame) {
+        return Err(WireError::Frame { len: len64(body_len), most: limits.most_frame });
+    }
+    out.reserve(body_len.saturating_add(4));
     let start = open(out);
     match *answer {
         Answer::Hello { protocol } => {
@@ -530,7 +616,7 @@ pub fn read_answer(body: &[u8], limits: WireLimits) -> Result<Answer<'_>, WireEr
         }
         7 => {
             f.expect(1)?;
-            Answer::Random { bytes: f.data()? }
+            Answer::Random { bytes: f.random()? }
         }
         8 => {
             f.expect(0)?;

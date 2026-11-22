@@ -27,13 +27,15 @@
 //!
 //! | piece | what | where |
 //! |---|---|---|
-//! | [`Part`] | a named solid and its placement, kept apart so moving a part re-keys nothing of it | `part` |
+//! | [`Part`] | a named solid, its placement, material role and parent, kept apart from geometry | `part` |
 //! | [`assemble`] | the union of placed parts, a balanced tree | `part` |
+//! | [`gyroid`] [`union_all`] [`intersect_all`] | TPMS gyroid lattice and balanced N-way booleans | `part` |
 //! | [`round_edges`] | erode, solved redistance, grow: rounded edges that compile at once | `part` |
 //! | [`mesh_part`] | a part's mesh in its own frame, pieces from a [`PieceCache`] | `part` |
 //! | [`mass_properties`] | volume, mass, centre and inertia of a verified mesh at a density | `part` |
-//! | [`min_wall`] [`no_interference`] [`fits_within`] | the design checks, three-way verdicts with keys | `check` |
-//! | [`export_glb`] [`picture`] | a glTF binary of the parts, a picture of a solid | `export` |
+//! | [`min_wall`] [`no_interference`] [`no_interference_assembly`] [`fits_within`] | geometric & assembly checks, three-way verdicts with keys | `check` |
+//! | [`overhang_check`] [`draft_angle_check`] | additive (3D printing) & molding/casting DFM checks | `check` |
+//! | [`export_glb`] [`export_stl`] [`export_section_svg`] [`picture`] [`picture_studio`] | GPU-ready glTF, binary STL, 2D SVG engineering sections, and studio pictures | `export` |
 //! | [`Model`] | the graph and its named parts together | here |
 //!
 //! # Records and checkpoints
@@ -65,24 +67,31 @@ mod math_tests;
 #[cfg(test)]
 mod tests;
 
-pub use blaze_cad_mesh::{PieceCache, PieceCacheOpts};
+pub use blaze_cad_mesh::{MaterialRole, PieceCache, PieceCacheOpts};
+pub use blaze_cad_out::{Encoding, Material, StlUnit, Up};
+pub use blaze_cad_picture::{RenderMode, Shading, StudioOpts};
 pub use check::{
-    CHECK_SCHEMA, CheckKey, CheckKind, Checked, FitOpts, Interference, InterferenceOpts, MinWallOpts, Overhang, ThinWall, Unsettled,
-    Verdict, fits_within, fits_within_planted, min_wall, min_wall_planted, no_interference, no_interference_planted,
+    AssemblyInterference, CHECK_SCHEMA, CheckKey, CheckKind, Checked, DraftFace, DraftOpts, FitOpts, Interference, InterferenceOpts,
+    MinWallOpts, Overhang, OverhangFace, OverhangOpts, ThinWall, Unsettled, Verdict, draft_angle_check, draft_angle_check_planted,
+    fits_within, fits_within_planted, min_wall, min_wall_planted, no_interference, no_interference_assembly,
+    no_interference_planted, overhang_check, overhang_check_planted,
 };
 /// A finding, a verdict or any other [`blaze_text::Show`] as a `Display`:
 /// `println!("{}", Shown(&checked.verdict))` prints "thin wall of about 4.2 mm at (295.898,
 /// 290.039, -0.586) mm".
 pub use blaze_text::Shown;
-pub use export::{ExportOpts, Exported, PartCount, STEEL, STEEL_ONLY, export_glb, picture, transform_of};
+pub use export::{
+    ColliderMode, ExportLodOpts, ExportOpts, ExportStlOpts, Exported, ExportedStl, LodProjection, PartCount, STEEL, STEEL_ONLY,
+    SectionSvgOpts, export_glb, export_section_svg, export_stl, picture, picture_studio, transform_of,
+};
 pub use part::{
-    MassProperties, MeshPartOpts, Part, PartOpts, RoundEdgesOpts, assemble, mass_properties, mass_properties_planted, mesh_part,
-    part_tape, placed, placed_tape, round_edges, round_edges_planted,
+    MassProperties, MeshPartOpts, Part, PartOpts, RoundEdgesOpts, assemble, gyroid, intersect_all, mass_properties,
+    mass_properties_planted, mesh_part, part_tape, placed, placed_tape, round_edges, round_edges_planted, union_all,
 };
 
-use blaze_cad_field::{Bound, CadError, CompileError, Ex, Graph, InspectError, Name, Placement, Solid, Weakens};
-use blaze_cad_mesh::{DecimateError, MeshError};
-use blaze_cad_out::{GlbError, PngError};
+use blaze_cad_field::{Bound, CadError, CompileError, EvalError, Ex, Graph, InspectError, Name, Placement, Solid, Weakens};
+use blaze_cad_mesh::{CacheError, DecimateError, DecomposeError, HullError, LodError, MeshError, ShapeError};
+use blaze_cad_out::{GlbError, PngError, StlError, SvgError};
 use blaze_cad_picture::PictureError;
 use blaze_own::planted::{NoPlant, Plants};
 use blaze_own::{Alloc, Vec};
@@ -106,11 +115,19 @@ pub enum ModelError {
     /// The kernel refused a node (it names the node and the argument).
     Cad(CadError),
     Compile(CompileError),
+    Eval(EvalError),
     Inspect(InspectError),
     Mesh(MeshError),
     Decimate(DecimateError),
+    Cache(CacheError),
+    Lod(LodError),
+    Hull(HullError),
+    Decompose(DecomposeError),
+    Shape(ShapeError),
     Picture(PictureError),
     Glb(GlbError),
+    Stl(StlError),
+    Svg(SvgError),
     Png(PngError),
 }
 
@@ -124,6 +141,12 @@ impl From<CadError> for ModelError {
 impl From<CompileError> for ModelError {
     fn from(e: CompileError) -> ModelError {
         ModelError::Compile(e)
+    }
+}
+
+impl From<EvalError> for ModelError {
+    fn from(e: EvalError) -> ModelError {
+        ModelError::Eval(e)
     }
 }
 
@@ -151,9 +174,51 @@ impl From<DecimateError> for ModelError {
     }
 }
 
+impl From<CacheError> for ModelError {
+    fn from(e: CacheError) -> ModelError {
+        ModelError::Cache(e)
+    }
+}
+
+impl From<LodError> for ModelError {
+    fn from(e: LodError) -> ModelError {
+        ModelError::Lod(e)
+    }
+}
+
+impl From<HullError> for ModelError {
+    fn from(e: HullError) -> ModelError {
+        ModelError::Hull(e)
+    }
+}
+
+impl From<DecomposeError> for ModelError {
+    fn from(e: DecomposeError) -> ModelError {
+        ModelError::Decompose(e)
+    }
+}
+
+impl From<ShapeError> for ModelError {
+    fn from(e: ShapeError) -> ModelError {
+        ModelError::Shape(e)
+    }
+}
+
 impl From<GlbError> for ModelError {
     fn from(e: GlbError) -> ModelError {
         ModelError::Glb(e)
+    }
+}
+
+impl From<StlError> for ModelError {
+    fn from(e: StlError) -> ModelError {
+        ModelError::Stl(e)
+    }
+}
+
+impl From<SvgError> for ModelError {
+    fn from(e: SvgError) -> ModelError {
+        ModelError::Svg(e)
     }
 }
 
@@ -229,6 +294,28 @@ pub enum FitPlant {
 }
 
 impl Plants for FitPlant {}
+
+/// [`overhang_check`]'s planted bug.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OverhangPlant {
+    None,
+    /// `build_dir` inverted when evaluating overhang normals: upward-facing roofs are flagged
+    /// as overhangs while downward-facing overhangs are missed.
+    FlippedBuildDir,
+}
+
+impl Plants for OverhangPlant {}
+
+/// [`draft_angle_check`]'s planted bug.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DraftPlant {
+    None,
+    /// Uses `|n · pull_dir|` instead of signed `n · pull_dir`: undercuts (negative draft) are
+    /// misclassified as positive draft and falsely pass.
+    IgnoreUndercutSign,
+}
+
+impl Plants for DraftPlant {}
 
 /// A part's index in its [`Model`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -309,27 +396,65 @@ impl<'a> Model<'a> {
         Ok(())
     }
 
+    /// Assign a material role (`ExportOpts::materials[role.0]`) to one part.
+    pub fn set_material(&mut self, id: PartId, material: MaterialRole) -> Result<(), ModelError> {
+        let at = usize::try_from(id.0).map_err(|_| ModelError::NoPart { id: id.0 })?;
+        let p = self.parts.get_mut(at).ok_or(ModelError::NoPart { id: id.0 })?;
+        *p = p.with_material(material);
+        Ok(())
+    }
+
+    /// Set one part's parent in the exported scene hierarchy (`parent` must have been added before
+    /// `id` so the hierarchy is a forest by construction).
+    pub fn set_parent(&mut self, id: PartId, parent: Option<PartId>) -> Result<(), ModelError> {
+        let at = usize::try_from(id.0).map_err(|_| ModelError::NoPart { id: id.0 })?;
+        if at >= self.parts.len() {
+            return Err(ModelError::NoPart { id: id.0 });
+        }
+        if let Some(par) = parent {
+            if par.0 >= id.0 {
+                return Err(ModelError::Argument {
+                    function: "Model::set_parent",
+                    arg: "parent",
+                    accepted: "a part added earlier than this part",
+                });
+            }
+        }
+        let p = &mut self.parts[at];
+        *p = p.with_parent(parent);
+        Ok(())
+    }
+
     /// Every part where it sits, as one solid.
     pub fn assembly(&mut self) -> Result<Solid<Bound>, ModelError> {
         assemble(&mut self.graph, &self.parts)
+    }
+
+    /// All-pairs interference check across every part in the model, with AABB broad-phase pruning.
+    pub fn no_interference(&mut self, o: InterferenceOpts<'_>) -> Result<Checked<AssemblyInterference>, ModelError> {
+        no_interference_assembly(&mut self.graph, &self.parts, o)
     }
 }
 
 /// Everything a model is written with, in one `use`.
 pub mod prelude {
     pub use blaze_cad_field::{
-        Axis, BlendOpts, Bound, BoxOpts, CapsuleOpts, ConeOpts, CylinderOpts, Detail, EllipsoidOpts, Exact, ExtrudeOpts, Graph,
-        GraphOpts, HalfSpaceOpts, Inside, MirrorOpts, OffsetOpts, Outside, Placement, RepeatOpts, RevolveOpts, ScaleOpts, ShellOpts,
-        Solid, SphereOpts, TorusOpts,
+        AffineOpts, Axis, BendOpts, BlendOpts, Bound, BoxOpts, CapsuleOpts, CircularOpts, ConeOpts, CylinderOpts, Detail,
+        EllipsoidOpts, Exact, ExtrudeOpts, Graph, GraphOpts, GyroidOpts, HalfSpaceOpts, Inside, Join, LoftOpts, MirrorOpts,
+        OffsetOpts, Outside, Placement, RepeatOpts, RevolveOpts, RoundOpts, ScaleOpts, ShellOpts, Solid, SphereOpts, Station,
+        SuperellipsoidOpts, TaperOpts, TorusOpts, TwistOpts,
     };
-    pub use blaze_cad_picture::{PictureOpts, Projection, View};
+    pub use blaze_cad_picture::{PictureOpts, Projection, RenderMode, Shading, StudioOpts, View};
     pub use blaze_units::{Angle, Area, Density, Length, Mass, Volume};
 
     pub use crate::Shown;
     pub use crate::{
-        ExportOpts, FitOpts, InterferenceOpts, MeshPartOpts, MinWallOpts, Model, ModelError, ModelOpts, Part, PartId, PartOpts,
-        PieceCache, PieceCacheOpts, RoundEdgesOpts, Verdict, assemble, export_glb, fits_within, mass_properties, mesh_part, min_wall,
-        mm3, no_interference, part_tape, picture, placed_tape, round_edges,
+        AssemblyInterference, ColliderMode, DraftFace, DraftOpts, Encoding, ExportLodOpts, ExportOpts, ExportStlOpts, Exported,
+        ExportedStl, FitOpts, InterferenceOpts, LodProjection, Material, MaterialRole, MeshPartOpts, MinWallOpts, Model, ModelError,
+        ModelOpts, OverhangFace, OverhangOpts, Part, PartId, PartOpts, PieceCache, PieceCacheOpts, RoundEdgesOpts, SectionSvgOpts,
+        StlUnit, Up, Verdict, assemble, draft_angle_check, export_glb, export_section_svg, export_stl, fits_within, gyroid,
+        intersect_all, mass_properties, mesh_part, min_wall, mm3, no_interference, no_interference_assembly, overhang_check,
+        part_tape, picture, picture_studio, placed_tape, round_edges, union_all,
     };
 }
 

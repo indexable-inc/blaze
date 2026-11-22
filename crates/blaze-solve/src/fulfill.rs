@@ -61,6 +61,7 @@ pub struct Fulfill<'a, S: Strategy> {
     /// stale.
     stamp: Vec<u32, Alloc<'a>>,
     ready: Vec<u32, Alloc<'a>>,
+    batch: Vec<u32, Alloc<'a>>,
     queued: Vec<bool, Alloc<'a>>,
     /// Variable index to the first wake entry; entries chain by `wait_next`.
     wait_head: Map<u32, u32, FixedState, Alloc<'a>>,
@@ -82,6 +83,7 @@ impl<'a, S: Strategy> Fulfill<'a, S> {
             state: Vec::new_in(alloc),
             stamp: Vec::new_in(alloc),
             ready: Vec::new_in(alloc),
+            batch: Vec::new_in(alloc),
             queued: Vec::new_in(alloc),
             wait_head: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             wait_ob: Vec::new_in(alloc),
@@ -223,10 +225,10 @@ impl<'a, S: Strategy> Fulfill<'a, S> {
                 return Ok(());
             }
             let before = tys.bindings_len();
-            let mut batch: Vec<u32, Alloc<'a>> = Vec::new_in(self.alloc);
-            batch.extend_from_slice(&self.ready);
-            self.ready.clear();
-            for &ob in batch.iter() {
+            self.batch.clear();
+            core::mem::swap(&mut self.batch, &mut self.ready);
+            for i in 0..self.batch.len() {
+                let ob = self.batch[i];
                 self.queued[ob as usize] = false;
                 let g = self.goal[ob as usize];
                 self.evaluations += 1;
@@ -245,6 +247,7 @@ impl<'a, S: Strategy> Fulfill<'a, S> {
                     }
                 };
             }
+            self.batch.clear();
             if !S::WAKE && tys.bindings_len() == before {
                 return Ok(());
             }

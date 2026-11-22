@@ -128,7 +128,7 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
             self.lower_into(place, init)?;
             let drops = self.needs_drop(ty, At::Pat(pat))?;
             out.push(Binding { local, place, ty, drops });
-            self.binds.push((pat, place));
+            self.bind(pat, place);
         } else {
             let ty = self.adjusted_ty(init)?;
             let p = self.place(init)?;

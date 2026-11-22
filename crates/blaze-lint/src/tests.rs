@@ -629,7 +629,7 @@ fn variant_count_runs_from_suggest_up() {
 /// The trie's size as the matcher's module doc states it: change both together.
 #[test]
 fn the_rule_trie_has_the_nodes_its_doc_says() {
-    assert_eq!(nodes_for(&PATTERNS), 207);
+    assert_eq!(nodes_for(&PATTERNS), 292);
 }
 
 #[test]
@@ -1665,4 +1665,54 @@ fn control_range_off_by_one() {
 #[test]
 fn control_fix_eats_neighbour() {
     blaze_sim::control(Config::cases(200), Plant::None, Plant::FixEatsNeighbour, "neighbouring token", run_case);
+}
+
+#[test]
+fn sota_new_rules_and_wired_lints() {
+    // 1. Newly wired Rule::lint() names opt in via `#![deny(blaze::..)]`.
+    for (rule, name) in [
+        (Rule::AmbientHasher, "default_hasher"),
+        (Rule::NoAsync, "async_fn"),
+        (Rule::Casts, "as_cast"),
+        (Rule::Untyped, "untyped_error"),
+        (Rule::UnboundedWait, "unbounded_wait"),
+        (Rule::WorkspaceUnsafe, "workspace_unsafe"),
+        (Rule::SeqCstUnexplained, "seqcst_unexplained"),
+        (Rule::RawSync, "raw_sync"),
+        (Rule::BlockingOnPool, "blocking_on_pool"),
+        (Rule::Transmute, "transmute"),
+    ] {
+        assert_eq!(rule.lint(), Some(name), "rule {:?} lint name", rule);
+        let root = format!("#![deny(blaze::{name})]\n");
+        let marks = RootMarks::read(&root);
+        assert!(marks.denies(rule), "RootMarks did not enable {name}");
+    }
+
+    // 2. WorkspaceUnsafe: refused without trust attr, allowed with `#![blaze::trust(unsafe, reason = "...")]`.
+    let wu = RuleSet::only(&[Rule::WorkspaceUnsafe]);
+    assert!(!found(&wu, "fn f() { unsafe { foo() } }", FILE).is_empty());
+    assert!(!found(&wu, "unsafe fn g() {}", FILE).is_empty());
+    let trusted_marks = RootMarks::read("#![blaze::trust(unsafe, reason = \"FFI syscall wrapper\")]\n");
+    let trusted_scope = trusted_marks.scope(FILE);
+    assert!(found(&wu, "fn f() { unsafe { foo() } }", trusted_scope).is_empty());
+    let empty_reason = RootMarks::read("#![blaze::trust(unsafe, reason = \"\")]\n");
+    assert!(!found(&wu, "fn f() { unsafe { foo() } }", empty_reason.scope(FILE)).is_empty());
+
+    // 3. SeqCstUnexplained: refused bare, accepted with `// seqcst: ...`.
+    let sc = RuleSet::only(&[Rule::SeqCstUnexplained]);
+    assert!(!found(&sc, "fn f(a: &AtomicU64) { a.load(Ordering::SeqCst); }", FILE).is_empty());
+    assert!(found(&sc, "fn f(a: &AtomicU64) {\n    // seqcst: total order across producer and consumer\n    a.load(Ordering::SeqCst);\n}", FILE).is_empty());
+
+    // 4. RawSync, BlockingOnPool, Transmute.
+    assert!(!kinds(Rule::RawSync, "fn f() { let _ = sync::Mutex::new(0); }").is_empty());
+    assert!(!kinds(Rule::RawSync, "fn f() { let _ = mpsc::channel(); }").is_empty());
+    assert!(!kinds(Rule::BlockingOnPool, "fn f() { thread::sleep(d); }").is_empty());
+    assert!(!kinds(Rule::BlockingOnPool, "fn f() { hint::spin_loop(); }").is_empty());
+    assert!(!kinds(Rule::Transmute, "fn f(x: u32) -> f32 { unsafe { mem::transmute(x) } }").is_empty());
+
+    // 5. Strengthened AmbientHasher & AmbientHeap.
+    assert!(!kinds(Rule::AmbientHasher, "fn f() { let _ = HashMap::new(); }").is_empty());
+    assert!(!kinds(Rule::AmbientHasher, "fn f() { let _ = rustc_hash::FxHashMap::default(); }").is_empty());
+    assert!(!kinds(Rule::AmbientHeap, "fn f() { let _ = BTreeMap::new(); }").is_empty());
+    assert!(!kinds(Rule::AmbientHeap, "fn f() { let _ = VecDeque::new(); }").is_empty());
 }

@@ -8,6 +8,8 @@
 //! | [`reach`] | [`Reach`]: fed each cell in arrival order, each counted once; [`Reached`]: sorted, with its digest |
 //! | [`record`] | [`TestRecord`]: the result record's bytes, encoded, and opened with every limit checked |
 //! | [`decide`] | [`Reusable`] from a test's grants, [`enter`]: reuse or rerun naming the first moved cell, [`audit`] |
+//! | [`impact`] | [`ImpactIndex`]: CSR inverted change-impact index for `O(|changed| * (log U + fanout))` selection |
+//! | [`plan`] | [`ExecutionPlan`]: failed-last + LPT test scheduler, and [`advise_tier_up`]: JIT tier-up advisor |
 //!
 //! Nothing here touches the system, reads a clock or picks an allocator (rule 75): the driver
 //! feeds cells in, answers "has this cell moved", and writes the bytes it is handed.
@@ -23,6 +25,8 @@
 extern crate std;
 
 pub mod decide;
+pub mod impact;
+pub mod plan;
 pub mod reach;
 pub mod record;
 
@@ -34,6 +38,8 @@ mod tests;
 use core::fmt;
 
 pub use decide::{Audit, Because, Enter, Grants, NotReusable, Reusable, audit, enter, enter_stored};
+pub use impact::{CodeSymbols, ImpactIndex, Posting, SelectedTest, Selection};
+pub use plan::{ExecutionPlan, PlannedTest, TestHistory, TierAdvice, TierOpts, advise_tier_up, advise_tier_up_for_plan};
 pub use reach::{Reach, ReachError, ReachOpts, Reached};
 pub use record::{Out, RecordError, TestRecord};
 

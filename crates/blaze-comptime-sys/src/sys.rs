@@ -272,8 +272,9 @@ enum Desc<'a> {
     File { path: AVec<'a, u8>, bytes: AVec<'a, u8>, at: u64 },
     /// A directory opened by `open`: `read` is `EISDIR`; `fdopendir` lists it.
     DirStub { path: AVec<'a, u8> },
-    /// A directory stream: `.` and `..`, then `names` (NUL-ended words), from `next`.
-    Dir { path: AVec<'a, u8>, names: AVec<'a, u8>, next: u64 },
+    /// A directory stream: `.` and `..`, then `names` (NUL-ended words), from `next`
+    /// (`byte_pos` tracks the next unread byte in `names`; `dir_ino` caches `ino_of(&path)`).
+    Dir { path: AVec<'a, u8>, names: AVec<'a, u8>, next: u64, byte_pos: usize, dir_ino: u64 },
     /// A file in the output root: each write crosses; `shadow` is its bytes as written.
     Out { path: AVec<'a, u8>, shadow: AVec<'a, u8>, at: u64, append: bool, read: bool },
     PipeRead { pipe: u32 },
@@ -325,8 +326,8 @@ enum Pending {
     OpenRead,
     /// `open` for writing, step one: the file's bytes (or its absence).
     OpenWriteLook { flags: i32 },
-    /// `open` for writing: the empty write that makes the file (or keeps it as it is).
-    OpenWriteCreate { flags: i32 },
+    /// `open` for writing: creating/truncating the file (`truncated`: length is already 0).
+    OpenWriteCreate { flags: i32, truncated: bool },
     /// `open` with `O_TRUNC`: the length set to zero; `fd` is already installed.
     OpenWriteTruncate { fd: i32 },
     /// `fdopendir` of a stub, or `open` with `O_DIRECTORY` (`opened`: the descriptor was made
@@ -345,12 +346,12 @@ enum Pending {
     Random,
     Done { ret: i64 },
     /// A write into an output file at `at`, `len` bytes.
-    WriteOut { open: u32, len: u32, at: u64, moves: bool },
+    WriteOut { open: u32, len: usize, at: u64, moves: bool },
     SetLen { open: u32, len: u64 },
     Thread,
     Socket,
     Denied { errno: Errno },
-    Spawn { actions: u32 },
+    Spawn { actions: Option<u32> },
     /// A spawned command's inherited stream written to the run's own.
     SpawnForward { pid: i32, err_left: bool },
 }
@@ -381,7 +382,7 @@ pub struct Sys<'a, P: Planted<SysPlant> = NoPlant> {
     env_all: Option<AVec<'a, u8>>,
     args: Option<AVec<'a, u8>>,
     cwd: AVec<'a, u8>,
-    actions: AVec<'a, Actions<'a>>,
+    actions: AVec<'a, Option<Actions<'a>>>,
     children: AVec<'a, Child>,
     /// The path of the call in flight, absolute and lexically resolved.
     path: AVec<'a, u8>,
@@ -403,6 +404,37 @@ fn ino_of(path: &[u8]) -> u64 {
     let digest = blaze_blake3::derive_key("blaze comptime-sys inode", path);
     // Never 0, which `readdir` callers read as a deleted entry.
     u64::from_le_bytes([digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7]]) | 1
+}
+
+/// Split-borrow helper: sends `call` through `guest` so callers can borrow fields of `Sys`
+/// (like `self.path`, `self.opens`, or `self.spawned`) without cloning into a temporary `AVec`.
+fn ask_guest(
+    guest: &mut Guest<'_>,
+    state: &mut SysState,
+    pending: &mut Pending,
+    call: &Call<'_>,
+    next: Pending,
+) -> Result<(), Fault> {
+    if let Err(error) = guest.call(call) {
+        *state = SysState::Broken;
+        return Err(Fault::Guest(error));
+    }
+    *pending = next;
+    *state = SysState::Asking;
+    Ok(())
+}
+
+/// Whether `words` (NUL-terminated `NAME=value` entries) contains a variable named `name`.
+fn words_has_var(words: &[u8], name: &[u8]) -> bool {
+    for word in words.split_inclusive(|b| *b == 0) {
+        let entry = word.strip_suffix(&[0]).unwrap_or(word);
+        if let Some(eq) = entry.iter().position(|b| *b == b'=')
+            && &entry[..eq] == name
+        {
+            return true;
+        }
+    }
+    false
 }
 
 impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
@@ -534,12 +566,7 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
     // ---- asking -------------------------------------------------------------------------
 
     fn ask(&mut self, call: &Call<'_>, pending: Pending) -> Result<(), Fault> {
-        if let Err(error) = self.guest.call(call) {
-            return Err(self.broke(Fault::Guest(error)));
-        }
-        self.pending = pending;
-        self.state = SysState::Asking;
-        Ok(())
+        ask_guest(&mut self.guest, &mut self.state, &mut self.pending, call, pending)
     }
 
     fn begin(&mut self) -> Result<(), Fault> {
@@ -659,13 +686,13 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
         out
     }
 
-    /// An output file's descriptor, holding `shadow` (empty when `None`); with `O_TRUNC` the
-    /// file's length is then set to zero, one more crossing.
-    fn open_out(&mut self, flags: i32, shadow: Option<AVec<'a, u8>>) -> Result<(), Fault> {
+    /// An output file's descriptor, holding `shadow` (empty when `None`); with `O_TRUNC` and
+    /// `!already_truncated`, the file's length is then set to zero, one more crossing.
+    fn open_out(&mut self, flags: i32, shadow: Option<AVec<'a, u8>>, already_truncated: bool) -> Result<(), Fault> {
         let c = consts(self.os);
         let shadow = shadow.unwrap_or_else(|| Vec::new_in(self.alloc));
         let len = shadow.len() as u64;
-        if len > self.limits.most_file || self.held + len > self.limits.most_held {
+        if len > self.limits.most_file || self.held.checked_add(len).is_none_or(|total| total > self.limits.most_held) {
             return self.finish(Err(Errno::FBig));
         }
         let path = self.path_owned();
@@ -675,11 +702,16 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
             Err(errno) => return self.finish(Err(errno)),
         };
         self.held += len;
-        if flags & c.o_trunc == 0 {
+        if already_truncated || flags & c.o_trunc == 0 {
             return self.finish(Ok(Ret::Int(fd.0 as i64)));
         }
-        let path = self.path_owned();
-        self.ask(&Call::SetLen { path: &path, len: 0 }, Pending::OpenWriteTruncate { fd: fd.0 })
+        ask_guest(
+            &mut self.guest,
+            &mut self.state,
+            &mut self.pending,
+            &Call::SetLen { path: &self.path, len: 0 },
+            Pending::OpenWriteTruncate { fd: fd.0 },
+        )
     }
 
     /// One step of the chain in flight, with the host's answer.
@@ -694,22 +726,25 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
             (Pending::Hello, Got::Hello(host)) => Err(self.broke(Fault::Protocol { host })),
             (Pending::Cwd, Got::Value { set: true }) => {
                 self.cwd.clear();
-                let scratch = self.scratch_owned();
-                self.cwd.extend_from_slice(&scratch);
+                self.cwd.extend_from_slice(&self.scratch);
                 self.pending = Pending::None;
                 self.state = SysState::Ready;
                 Ok(())
             }
             (Pending::OpenRead, Got::Bytes) => {
                 let len = self.scratch.len() as u64;
-                if len > self.limits.most_file || self.held + len > self.limits.most_held {
+                if len > self.limits.most_file || self.held.checked_add(len).is_none_or(|total| total > self.limits.most_held) {
                     return self.finish(Err(Errno::FBig));
                 }
-                self.held += len;
                 let bytes = self.scratch_owned();
                 let path = self.path_owned();
-                let opened = self.install(Desc::File { path, bytes, at: 0 });
-                self.finish(opened.map(|fd| Ret::Int(fd.0 as i64)))
+                match self.install(Desc::File { path, bytes, at: 0 }) {
+                    Ok(fd) => {
+                        self.held += len;
+                        self.finish(Ok(Ret::Int(fd.0 as i64)))
+                    }
+                    Err(errno) => self.finish(Err(errno)),
+                }
             }
             // A directory opened without `O_DIRECTORY` opens, as on the real system; reading it
             // is `EISDIR` and `fdopendir` lists it.
@@ -724,7 +759,8 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
                 let Some(open) = self.open_of_mut(Fd(fd)) else { return self.finish(Err(Errno::BadF)) };
                 let Desc::DirStub { path } = &mut open.desc else { return self.finish(Err(Errno::BadF)) };
                 let path = core::mem::replace(path, Vec::new_in(alloc));
-                open.desc = Desc::Dir { path, names, next: 0 };
+                let dir_ino = ino_of(&path);
+                open.desc = Desc::Dir { path, names, next: 0, byte_pos: 0, dir_ino };
                 self.finish(Ok(Ret::Int(fd as i64)))
             }
             (Pending::List { fd, opened: true }, Got::Error(error)) => {
@@ -737,16 +773,41 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
                     return self.finish(Err(Errno::Exist));
                 }
                 if flags & c.o_trunc != 0 {
-                    return self.open_out(flags, None);
+                    return self.open_out(flags, None, false);
                 }
                 let shadow = self.scratch_owned();
-                self.open_out(flags, Some(shadow))
+                self.open_out(flags, Some(shadow), true)
+            }
+            (Pending::OpenWriteLook { flags }, Got::Stat { kind, .. }) => {
+                let c = consts(self.os);
+                if flags & c.o_excl != 0 && flags & c.o_creat != 0 {
+                    return self.finish(Err(Errno::Exist));
+                }
+                match kind {
+                    FileKind::Dir => self.finish(Err(Errno::IsDir)),
+                    FileKind::File => self.open_out(flags, None, false),
+                }
             }
             (Pending::OpenWriteLook { flags }, Got::Error(SysError::NotFound)) if flags & consts(self.os).o_creat != 0 => {
-                let path = self.path_owned();
-                self.ask(&Call::WriteFile { path: &path, at: 0, bytes: &[] }, Pending::OpenWriteCreate { flags })
+                if flags & consts(self.os).o_trunc != 0 {
+                    ask_guest(
+                        &mut self.guest,
+                        &mut self.state,
+                        &mut self.pending,
+                        &Call::SetLen { path: &self.path, len: 0 },
+                        Pending::OpenWriteCreate { flags, truncated: true },
+                    )
+                } else {
+                    ask_guest(
+                        &mut self.guest,
+                        &mut self.state,
+                        &mut self.pending,
+                        &Call::WriteFile { path: &self.path, at: 0, bytes: &[] },
+                        Pending::OpenWriteCreate { flags, truncated: true },
+                    )
+                }
             }
-            (Pending::OpenWriteCreate { flags }, Got::Done) => self.open_out(flags, None),
+            (Pending::OpenWriteCreate { flags, truncated }, Got::Done) => self.open_out(flags, None, truncated),
             (Pending::OpenWriteTruncate { fd }, Got::Done) => self.finish(Ok(Ret::Int(fd as i64))),
             (Pending::OpenWriteTruncate { fd }, Got::Error(error)) => {
                 let _ = self.close(Fd(fd));
@@ -762,16 +823,14 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
             }
             (Pending::Chdir, Got::Stat { kind: FileKind::Dir, .. }) => {
                 self.cwd.clear();
-                let path = self.path_owned();
-                self.cwd.extend_from_slice(&path);
+                self.cwd.extend_from_slice(&self.path);
                 self.finish(Ok(Ret::Int(0)))
             }
             (Pending::Chdir, Got::Stat { kind: FileKind::File, .. }) => self.finish(Err(Errno::NotDir)),
             (Pending::Readlink, Got::Stat { .. }) => self.finish(Err(Errno::Inval)),
             (Pending::Realpath, Got::Stat { .. }) => {
                 self.scratch.clear();
-                let path = self.path_owned();
-                self.scratch.extend_from_slice(&path);
+                self.scratch.extend_from_slice(&self.path);
                 self.finish(Ok(Ret::Scratch))
             }
             (Pending::Getenv, Got::Value { set }) => {
@@ -780,7 +839,27 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
                 self.finish(Ok(Ret::Env(set.then_some(at))))
             }
             (Pending::Environ, Got::Bytes) => {
-                let words = self.scratch_owned();
+                let words = if self.vars.is_empty() {
+                    self.scratch_owned()
+                } else {
+                    let mut merged = Vec::new_in(self.alloc);
+                    for word in self.scratch.split_inclusive(|b| *b == 0) {
+                        let entry = word.strip_suffix(&[0]).unwrap_or(word);
+                        let key = match entry.iter().position(|b| *b == b'=') {
+                            Some(eq) => &entry[..eq],
+                            None => entry,
+                        };
+                        if self.find_var(key).is_none() {
+                            merged.extend_from_slice(word);
+                        }
+                    }
+                    for var in self.vars.iter() {
+                        if var.set {
+                            merged.extend_from_slice(&var.text);
+                        }
+                    }
+                    merged
+                };
                 self.env_all = Some(words);
                 self.finish(Ok(Ret::State))
             }
@@ -802,12 +881,12 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
                 let Some(Some(Open { desc: Desc::Out { shadow, at: offset, .. }, .. })) = self.opens.get_mut(open as usize) else {
                     return self.finish(Err(Errno::BadF));
                 };
-                let end = data_at + len as usize;
+                let end = data_at + len;
                 if shadow.len() < end {
                     *held += (end - shadow.len()) as u64;
                     shadow.resize(end, 0);
                 }
-                shadow[data_at..end].copy_from_slice(&self.path2[..len as usize]);
+                shadow[data_at..end].copy_from_slice(&self.path2[..len]);
                 if moves {
                     *offset = end as u64;
                 }
@@ -815,7 +894,12 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
             }
             (Pending::SetLen { open, len }, Got::Done) => {
                 if let Some(Some(Open { desc: Desc::Out { shadow, .. }, .. })) = self.opens.get_mut(open as usize) {
-                    self.held = self.held - shadow.len() as u64 + len;
+                    let cur = shadow.len() as u64;
+                    if len >= cur {
+                        self.held += len - cur;
+                    } else {
+                        self.held -= cur - len;
+                    }
                     shadow.resize(len as usize, 0);
                 }
                 self.finish(Ok(Ret::Int(0)))
@@ -830,9 +914,13 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
             (Pending::SpawnForward { pid, err_left: true }, Got::Done) => {
                 let (split, len) = (self.spawned_split, self.spawned.len());
                 if split < len {
-                    let mut bytes = Vec::new_in(self.alloc);
-                    bytes.extend_from_slice(&self.spawned[split..]);
-                    return self.ask(&Call::Write { stream: Stream::Err, bytes: &bytes }, Pending::SpawnForward { pid, err_left: false });
+                    return ask_guest(
+                        &mut self.guest,
+                        &mut self.state,
+                        &mut self.pending,
+                        &Call::Write { stream: Stream::Err, bytes: &self.spawned[split..] },
+                        Pending::SpawnForward { pid, err_left: false },
+                    );
                 }
                 self.finish(Ok(Ret::Int(pid as i64)))
             }
@@ -892,8 +980,24 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
         if open.refs == 0 {
             match self.opens[at].take().map(|open| open.desc) {
                 Some(Desc::File { bytes, .. } | Desc::Out { shadow: bytes, .. }) => self.held -= bytes.len() as u64,
-                Some(Desc::PipeRead { pipe }) => self.pipes[pipe as usize].readers -= 1,
-                Some(Desc::PipeWrite { pipe }) => self.pipes[pipe as usize].writers -= 1,
+                Some(Desc::PipeRead { pipe }) => {
+                    let p = &mut self.pipes[pipe as usize];
+                    p.readers -= 1;
+                    if p.readers == 0 {
+                        self.held -= (p.bytes.len() - p.at) as u64;
+                        p.bytes = Vec::new_in(self.alloc);
+                        p.at = 0;
+                    }
+                }
+                Some(Desc::PipeWrite { pipe }) => {
+                    let p = &mut self.pipes[pipe as usize];
+                    p.writers -= 1;
+                    if p.writers == 0 && p.readers == 0 {
+                        self.held -= (p.bytes.len() - p.at) as u64;
+                        p.bytes = Vec::new_in(self.alloc);
+                        p.at = 0;
+                    }
+                }
                 _ => {}
             }
         }
@@ -955,6 +1059,7 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
     pub fn read(&mut self, fd: Fd, buf: &mut [u8], place: Option<u64>) -> Result<usize, Errno> {
         let past_end = self.plant.has(SysPlant::ReadPastEnd);
         let pipes = &mut self.pipes;
+        let held = &mut self.held;
         let number = usize::try_from(fd.0).map_err(|_| Errno::BadF)?;
         let open = self.fds.get(number).copied().flatten().ok_or(Errno::BadF)?;
         let open = self.opens.get_mut(open as usize).and_then(Option::as_mut).ok_or(Errno::BadF)?;
@@ -969,19 +1074,38 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
                     return Err(Errno::SPipe);
                 }
                 let pipe = &mut pipes[*pipe as usize];
-                let n = buf.len().min(pipe.bytes.len() - pipe.at);
+                let avail = pipe.bytes.len() - pipe.at;
+                let n = buf.len().min(avail);
                 buf[..n].copy_from_slice(&pipe.bytes[pipe.at..pipe.at + n]);
                 pipe.at += n;
+                *held -= n as u64;
+                if pipe.at == pipe.bytes.len() {
+                    pipe.bytes.clear();
+                    pipe.at = 0;
+                } else if pipe.at >= 4096 && pipe.at * 2 >= pipe.bytes.len() {
+                    let rem = pipe.bytes.len() - pipe.at;
+                    pipe.bytes.copy_within(pipe.at.., 0);
+                    pipe.bytes.truncate(rem);
+                    pipe.at = 0;
+                }
                 // An empty pipe with a writer open would block forever: one thread.
                 return if n == 0 && pipe.writers > 0 && !buf.is_empty() { Err(Errno::Again) } else { Ok(n) };
             }
         };
         let from = place.unwrap_or(*offset);
         let start = usize::try_from(from).unwrap_or(usize::MAX).min(bytes.len());
-        let end = if past_end { (start + buf.len()).min(bytes.len() + 1) } else { (start + buf.len()).min(bytes.len()) };
+        let end = if past_end {
+            start.saturating_add(buf.len()).min(bytes.len() + 1)
+        } else {
+            start.saturating_add(buf.len()).min(bytes.len())
+        };
         let n = end - start;
-        for (out, at) in buf[..n].iter_mut().zip(start..end) {
-            *out = bytes.get(at).copied().unwrap_or(0);
+        if !past_end || end <= bytes.len() {
+            buf[..n].copy_from_slice(&bytes[start..end]);
+        } else {
+            let valid = bytes.len() - start;
+            buf[..valid].copy_from_slice(&bytes[start..]);
+            buf[valid..n].fill(0);
         }
         if place.is_none() {
             *offset = end as u64;
@@ -1017,7 +1141,8 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
             Desc::File { path, bytes, .. } | Desc::Out { path, shadow: bytes, .. } => {
                 StatOut { kind: Kind::File, len: bytes.len() as u64, ino: ino_of(path) }
             }
-            Desc::DirStub { path } | Desc::Dir { path, .. } => StatOut { kind: Kind::Dir, len: 0, ino: ino_of(path) },
+            Desc::DirStub { path } => StatOut { kind: Kind::Dir, len: 0, ino: ino_of(path) },
+            Desc::Dir { dir_ino, .. } => StatOut { kind: Kind::Dir, len: 0, ino: *dir_ino },
             Desc::PipeRead { pipe } | Desc::PipeWrite { pipe } => StatOut { kind: Kind::Fifo, len: 0, ino: *pipe as u64 + 1 },
         })
     }
@@ -1047,25 +1172,54 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
             return self.finish(opened.map(|fd| Ret::Int(fd.0 as i64)));
         }
         let writes = flags & c.o_accmode != 0 || flags & (c.o_creat | c.o_trunc | c.o_append) != 0;
-        let path = self.path_owned();
         if !writes {
             if flags & c.o_directory != 0 {
                 // Listed at once: the descriptor is a stream already, as `fdopendir` wants.
                 let stub_path = self.path_owned();
                 let stub = self.install(Desc::DirStub { path: stub_path });
                 return match stub {
-                    Ok(fd) => self.ask(&Call::Look { path: &path, want: Want::List }, Pending::List { fd: fd.0, opened: true }),
+                    Ok(fd) => ask_guest(
+                        &mut self.guest,
+                        &mut self.state,
+                        &mut self.pending,
+                        &Call::Look { path: &self.path, want: Want::List },
+                        Pending::List { fd: fd.0, opened: true },
+                    ),
                     Err(errno) => self.finish(Err(errno)),
                 };
             }
-            return self.ask(&Call::Look { path: &path, want: Want::Read }, Pending::OpenRead);
+            return ask_guest(
+                &mut self.guest,
+                &mut self.state,
+                &mut self.pending,
+                &Call::Look { path: &self.path, want: Want::Read },
+                Pending::OpenRead,
+            );
         }
         if flags & c.o_creat != 0 && flags & c.o_trunc != 0 && flags & c.o_excl == 0 {
-            // Made (or kept) by an empty write, then emptied: a fresh file either way, without
-            // reading bytes that are thrown away.
-            return self.ask(&Call::WriteFile { path: &path, at: 0, bytes: &[] }, Pending::OpenWriteCreate { flags });
+            // `SetLen(0)` creates if absent and truncates if present in one round trip.
+            return ask_guest(
+                &mut self.guest,
+                &mut self.state,
+                &mut self.pending,
+                &Call::SetLen { path: &self.path, len: 0 },
+                Pending::OpenWriteCreate { flags, truncated: true },
+            );
         }
-        self.ask(&Call::Look { path: &path, want: Want::Read }, Pending::OpenWriteLook { flags })
+        // `O_TRUNC` (without `O_CREAT`) and `O_CREAT | O_EXCL` never keep existing file bytes:
+        // stat instead of reading up to 64 MiB over the wire only to discard it.
+        let want = if flags & c.o_trunc != 0 || (flags & c.o_creat != 0 && flags & c.o_excl != 0) {
+            Want::Stat
+        } else {
+            Want::Read
+        };
+        ask_guest(
+            &mut self.guest,
+            &mut self.state,
+            &mut self.pending,
+            &Call::Look { path: &self.path, want },
+            Pending::OpenWriteLook { flags },
+        )
     }
 
     /// `opendir`: a listing.
@@ -1077,44 +1231,53 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
     /// `fdopendir`: a stub is listed; a stream is itself.
     pub fn fdopendir(&mut self, fd: Fd) -> Result<(), Fault> {
         self.begin()?;
-        match self.open_of(fd).map(|open| &open.desc) {
+        let Some(open) = usize::try_from(fd.0).ok().and_then(|n| self.fds.get(n).copied().flatten()) else {
+            return self.finish(Err(Errno::BadF));
+        };
+        match self.opens.get(open as usize).and_then(Option::as_ref).map(|open| &open.desc) {
             Some(Desc::Dir { .. }) => self.finish(Ok(Ret::Int(fd.0 as i64))),
-            Some(Desc::DirStub { path }) => {
-                let mut asked = Vec::new_in(self.alloc);
-                asked.extend_from_slice(path);
-                self.ask(&Call::Look { path: &asked, want: Want::List }, Pending::List { fd: fd.0, opened: false })
-            }
+            Some(Desc::DirStub { path }) => ask_guest(
+                &mut self.guest,
+                &mut self.state,
+                &mut self.pending,
+                &Call::Look { path, want: Want::List },
+                Pending::List { fd: fd.0, opened: false },
+            ),
             Some(_) => self.finish(Err(Errno::NotDir)),
             None => self.finish(Err(Errno::BadF)),
         }
     }
 
-    /// `readdir`: the next entry, or `None` at the end.
+    /// `readdir`: the next entry, or `None` at the end, in O(1) per entry.
     pub fn readdir(&mut self, fd: Fd) -> Result<Option<DirEnt<'_>>, Errno> {
         let open = self.open_of_mut(fd).ok_or(Errno::BadF)?;
-        let Desc::Dir { path, names, next } = &mut open.desc else { return Err(Errno::BadF) };
+        let Desc::Dir { names, next, byte_pos, dir_ino, .. } = &mut open.desc else { return Err(Errno::BadF) };
         let at = *next;
         let name: &[u8] = match at {
             0 => b".\0",
             1 => b"..\0",
             _ => {
-                let mut words = names.split_inclusive(|b| *b == 0);
-                match words.nth((at - 2) as usize) {
-                    Some(word) => word,
-                    None => return Ok(None),
+                if *byte_pos >= names.len() {
+                    return Ok(None);
                 }
+                let rest = &names[*byte_pos..];
+                let len = rest.iter().position(|b| *b == 0).map_or(rest.len(), |p| p + 1);
+                let word = &rest[..len];
+                *byte_pos += len;
+                word
             }
         };
         *next += 1;
-        let ino = ino_of(path) ^ at;
-        Ok(Some(DirEnt { name, ino: ino | 1, at }))
+        let ino = (*dir_ino ^ at) | 1;
+        Ok(Some(DirEnt { name, ino, at }))
     }
 
     /// `rewinddir`.
     pub fn rewinddir(&mut self, fd: Fd) -> Result<(), Errno> {
         match &mut self.open_of_mut(fd).ok_or(Errno::BadF)?.desc {
-            Desc::Dir { next, .. } => {
+            Desc::Dir { next, byte_pos, .. } => {
                 *next = 0;
+                *byte_pos = 0;
                 Ok(())
             }
             _ => Err(Errno::BadF),
@@ -1146,8 +1309,7 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
         if let Err(errno) = self.resolve_into_path(at, path) {
             return self.finish(Err(errno));
         }
-        let asked = self.path_owned();
-        self.ask(&Call::Look { path: &asked, want: Want::Stat }, pending)
+        ask_guest(&mut self.guest, &mut self.state, &mut self.pending, &Call::Look { path: &self.path, want: Want::Stat }, pending)
     }
 
     /// `write`, `pwrite` (`at` given) and `writev` (gathered by the caller).
@@ -1167,7 +1329,28 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
                 if pipe.readers == 0 {
                     return self.finish(Err(Errno::Pipe));
                 }
+                let live = (pipe.bytes.len() - pipe.at) as u64;
+                let Some(next_live) = live.checked_add(len as u64) else {
+                    return self.finish(Err(Errno::FBig));
+                };
+                if next_live > self.limits.most_file
+                    || self.held.checked_add(len as u64).is_none_or(|total| total > self.limits.most_held)
+                {
+                    return self.finish(Err(Errno::FBig));
+                }
+                if pipe.at > 0 {
+                    if pipe.at == pipe.bytes.len() {
+                        pipe.bytes.clear();
+                        pipe.at = 0;
+                    } else if pipe.at >= 4096 && pipe.at * 2 >= pipe.bytes.len() {
+                        let rem = pipe.bytes.len() - pipe.at;
+                        pipe.bytes.copy_within(pipe.at.., 0);
+                        pipe.bytes.truncate(rem);
+                        pipe.at = 0;
+                    }
+                }
                 pipe.bytes.extend_from_slice(bytes);
+                self.held += len as u64;
                 self.finish(Ok(Ret::Int(len as i64)))
             }
             Some(Desc::Out { path, shadow, at: offset, append, .. }) => {
@@ -1176,16 +1359,26 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
                     (None, true) => shadow.len() as u64,
                     (None, false) => *offset,
                 };
-                if place + len as u64 > self.limits.most_file {
+                let Some(end) = place.checked_add(len as u64) else {
+                    return self.finish(Err(Errno::FBig));
+                };
+                let growth = end.saturating_sub(shadow.len() as u64);
+                if end > self.limits.most_file
+                    || self.held.checked_add(growth).is_none_or(|total| total > self.limits.most_held)
+                {
                     return self.finish(Err(Errno::FBig));
                 }
-                let mut asked = Vec::new_in(self.alloc);
-                asked.extend_from_slice(path);
                 // The bytes are kept for the shadow until the host says done.
                 self.path2.clear();
                 self.path2.extend_from_slice(bytes);
-                let pending = Pending::WriteOut { open, len: len as u32, at: place, moves: at.is_none() };
-                self.ask(&Call::WriteFile { path: &asked, at: place, bytes }, pending)
+                let pending = Pending::WriteOut { open, len, at: place, moves: at.is_none() };
+                ask_guest(
+                    &mut self.guest,
+                    &mut self.state,
+                    &mut self.pending,
+                    &Call::WriteFile { path, at: place, bytes },
+                    pending,
+                )
             }
             Some(Desc::DirStub { .. } | Desc::Dir { .. }) => self.finish(Err(Errno::IsDir)),
             Some(_) => self.finish(Err(Errno::BadF)),
@@ -1200,10 +1393,20 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
             return self.finish(Err(Errno::BadF));
         };
         match self.opens[open as usize].as_ref().map(|open| &open.desc) {
-            Some(Desc::Out { path, .. }) => {
-                let mut asked = Vec::new_in(self.alloc);
-                asked.extend_from_slice(path);
-                self.ask(&Call::SetLen { path: &asked, len }, Pending::SetLen { open, len })
+            Some(Desc::Out { path, shadow, .. }) => {
+                let growth = len.saturating_sub(shadow.len() as u64);
+                if len > self.limits.most_file
+                    || self.held.checked_add(growth).is_none_or(|total| total > self.limits.most_held)
+                {
+                    return self.finish(Err(Errno::FBig));
+                }
+                ask_guest(
+                    &mut self.guest,
+                    &mut self.state,
+                    &mut self.pending,
+                    &Call::SetLen { path, len },
+                    Pending::SetLen { open, len },
+                )
             }
             Some(_) => self.finish(Err(Errno::Inval)),
             None => self.finish(Err(Errno::BadF)),
@@ -1224,12 +1427,19 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
         if let Err(errno) = self.resolve_into_path(to_at, to) {
             return self.finish(Err(errno));
         }
-        let target = self.path_owned();
+        // Stash resolved `to` in `self.scratch` (unused while sending) so `resolve_into_path`
+        // can reuse `self.path` and `self.path2` for `from` without any heap allocation.
+        core::mem::swap(&mut self.path, &mut self.scratch);
         if let Err(errno) = self.resolve_into_path(from_at, from) {
             return self.finish(Err(errno));
         }
-        let source = self.path_owned();
-        self.ask(&Call::Rename { from: &source, to: &target }, Pending::Done { ret: 0 })
+        ask_guest(
+            &mut self.guest,
+            &mut self.state,
+            &mut self.pending,
+            &Call::Rename { from: &self.path, to: &self.scratch },
+            Pending::Done { ret: 0 },
+        )
     }
 
     fn path_call(&mut self, at: i32, path: &[u8], call: impl for<'p> Fn(&'p [u8]) -> Call<'p>) -> Result<(), Fault> {
@@ -1237,8 +1447,7 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
         if let Err(errno) = self.resolve_into_path(at, path) {
             return self.finish(Err(errno));
         }
-        let asked = self.path_owned();
-        self.ask(&call(&asked), Pending::Done { ret: 0 })
+        ask_guest(&mut self.guest, &mut self.state, &mut self.pending, &call(&self.path), Pending::Done { ret: 0 })
     }
 
     // ---- the environment ----------------------------------------------------------------
@@ -1247,7 +1456,34 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
         self.vars.iter().rposition(|var| &var.text[..var.name_len as usize] == name)
     }
 
+    #[cfg(feature = "child")]
+    pub(crate) fn env_needs_host_check(&self, name: &[u8]) -> bool {
+        if name.is_empty() || name.contains(&b'=') || name.contains(&0) {
+            return false;
+        }
+        if self.find_var(name).is_some() {
+            return false;
+        }
+        if let Some(words) = &self.env_all
+            && words_has_var(words, name)
+        {
+            return false;
+        }
+        self.vars.len() < self.limits.most_env as usize
+    }
+
     fn remember(&mut self, value: &[u8], set: bool) -> Result<u32, Fault> {
+        if let Some(at) = self.find_var(&self.path2) {
+            let var = &mut self.vars[at];
+            var.text.clear();
+            var.text.extend_from_slice(&self.path2);
+            var.text.push(b'=');
+            var.text.extend_from_slice(value);
+            var.text.push(0);
+            var.name_len = self.path2.len() as u32;
+            var.set = set;
+            return Ok(at as u32);
+        }
         if self.vars.len() >= self.limits.most_env as usize {
             return Err(self.broke(Fault::EnvFull { most: self.limits.most_env }));
         }
@@ -1277,18 +1513,34 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
         }
         self.path2.clear();
         self.path2.extend_from_slice(name);
-        let mut asked = Vec::new_in(self.alloc);
-        asked.extend_from_slice(name);
-        self.ask(&Call::Env { name: &asked }, Pending::Getenv)
+        self.ask(&Call::Env { name }, Pending::Getenv)
     }
 
     /// `setenv` (`value` `Some`) and `unsetenv`: the overlay only; nothing crosses, nothing is
     /// recorded (the run's own value is no fact of the world).
     pub fn setenv(&mut self, name: &[u8], value: Option<&[u8]>, overwrite: bool) -> Result<(), Errno> {
-        if name.is_empty() || name.contains(&b'=') {
+        if name.is_empty() || name.contains(&b'=') || name.contains(&0) {
             return Err(Errno::Inval);
         }
-        if !overwrite && let Some(at) = self.find_var(name) && self.vars[at].set {
+        if let Some(at) = self.find_var(name) {
+            if !overwrite && self.vars[at].set {
+                return Ok(());
+            }
+            let var = &mut self.vars[at];
+            var.text.clear();
+            var.text.extend_from_slice(name);
+            var.text.push(b'=');
+            var.text.extend_from_slice(value.unwrap_or(&[]));
+            var.text.push(0);
+            var.name_len = name.len() as u32;
+            var.set = value.is_some();
+            self.env_all = None;
+            return Ok(());
+        }
+        if !overwrite
+            && let Some(words) = &self.env_all
+            && words_has_var(words, name)
+        {
             return Ok(());
         }
         if self.vars.len() >= self.limits.most_env as usize {
@@ -1300,6 +1552,7 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
         text.extend_from_slice(value.unwrap_or(&[]));
         text.push(0);
         self.vars.push(Var { text, name_len: name.len() as u32, set: value.is_some() });
+        self.env_all = None;
         Ok(())
     }
 
@@ -1352,9 +1605,7 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
     /// `errno`.
     pub fn denied(&mut self, name: &[u8], errno: Errno) -> Result<(), Fault> {
         self.begin()?;
-        let mut asked = Vec::new_in(self.alloc);
-        asked.extend_from_slice(name);
-        self.ask(&Call::Denied { name: &asked }, Pending::Denied { errno })
+        self.ask(&Call::Denied { name }, Pending::Denied { errno })
     }
 
     pub fn thread(&mut self) -> Result<(), Fault> {
@@ -1402,13 +1653,34 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
 
     /// `pipe`: `(read, write)`.
     pub fn pipe(&mut self) -> Result<(Fd, Fd), Errno> {
-        self.pipes.push(Pipe { bytes: Vec::new_in(self.alloc), at: 0, writers: 1, readers: 1 });
-        let pipe = self.pipes.len() as u32 - 1;
-        let read = self.install(Desc::PipeRead { pipe })?;
+        let pipe = match self.pipes.iter().position(|p| p.readers == 0 && p.writers == 0) {
+            Some(at) => {
+                let p = &mut self.pipes[at];
+                p.bytes.clear();
+                p.at = 0;
+                p.writers = 1;
+                p.readers = 1;
+                at as u32
+            }
+            None => {
+                self.pipes.push(Pipe { bytes: Vec::new_in(self.alloc), at: 0, writers: 1, readers: 1 });
+                self.pipes.len() as u32 - 1
+            }
+        };
+        let read = match self.install(Desc::PipeRead { pipe }) {
+            Ok(fd) => fd,
+            Err(errno) => {
+                let p = &mut self.pipes[pipe as usize];
+                p.readers = 0;
+                p.writers = 0;
+                return Err(errno);
+            }
+        };
         match self.install(Desc::PipeWrite { pipe }) {
             Ok(write) => Ok((read, write)),
             Err(errno) => {
                 let _ = self.close(read);
+                self.pipes[pipe as usize].writers = 0;
                 Err(errno)
             }
         }
@@ -1416,19 +1688,38 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
 
     /// `posix_spawn_file_actions_init`: a handle child.rs writes into the caller's object.
     pub fn actions_new(&mut self) -> u32 {
-        self.actions.push(Actions { dup2: Vec::new_in(self.alloc), chdir: None });
-        self.actions.len() as u32 - 1
+        let fresh = Actions { dup2: Vec::new_in(self.alloc), chdir: None };
+        match self.actions.iter().position(Option::is_none) {
+            Some(at) => {
+                self.actions[at] = Some(fresh);
+                at as u32
+            }
+            None => {
+                self.actions.push(Some(fresh));
+                self.actions.len() as u32 - 1
+            }
+        }
+    }
+
+    /// `posix_spawn_file_actions_destroy`: reclaims the recorded action slot and its buffers.
+    pub fn actions_destroy(&mut self, actions: u32) -> Result<(), Errno> {
+        let slot = self.actions.get_mut(actions as usize).ok_or(Errno::Inval)?;
+        if slot.is_none() {
+            return Err(Errno::Inval);
+        }
+        *slot = None;
+        Ok(())
     }
 
     pub fn actions_dup2(&mut self, actions: u32, fd: i32, to: i32) -> Result<(), Errno> {
-        self.actions.get_mut(actions as usize).ok_or(Errno::Inval)?.dup2.push((fd, to));
+        self.actions.get_mut(actions as usize).and_then(Option::as_mut).ok_or(Errno::Inval)?.dup2.push((fd, to));
         Ok(())
     }
 
     pub fn actions_chdir(&mut self, actions: u32, path: &[u8]) -> Result<(), Errno> {
         let mut owned = Vec::new_in(self.alloc);
         owned.extend_from_slice(path);
-        self.actions.get_mut(actions as usize).ok_or(Errno::Inval)?.chdir = Some(owned);
+        self.actions.get_mut(actions as usize).and_then(Option::as_mut).ok_or(Errno::Inval)?.chdir = Some(owned);
         Ok(())
     }
 
@@ -1440,49 +1731,66 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
             return self.finish(Err(Errno::Again));
         }
         let (Some(args), Some(env)) = (Words::new(args), Words::new(env)) else { return self.finish(Err(Errno::Inval)) };
-        let actions = match actions {
-            Some(at) if (at as usize) < self.actions.len() => at,
-            Some(_) => return self.finish(Err(Errno::Inval)),
-            None => self.actions_new(),
+        let act = match actions {
+            Some(at) => match self.actions.get(at as usize).and_then(Option::as_ref) {
+                Some(act) => Some((at, act)),
+                None => return self.finish(Err(Errno::Inval)),
+            },
+            None => None,
         };
         // The command's own stdin: a pipe or a file put on 0 has no wire field, so it is
         // refused by name rather than dropped (rule 3).
-        if self.actions[actions as usize].dup2.iter().any(|(fd, to)| *to == 0 && !matches!(self.open_of(Fd(*fd)).map(|o| &o.desc), Some(Desc::Null))) {
+        if let Some((_, act)) = act
+            && act.dup2.iter().any(|(fd, to)| *to == 0 && !matches!(self.open_of(Fd(*fd)).map(|o| &o.desc), Some(Desc::Null)))
+        {
             return self.finish(Err(Errno::NotSup));
         }
-        let cwd_raw = match &self.actions[actions as usize].chdir {
-            Some(path) => {
-                let mut owned = Vec::new_in(self.alloc);
-                owned.extend_from_slice(path);
-                Some(owned)
-            }
-            None => None,
+        let has_chdir = if let Some((_, act)) = act
+            && let Some(path) = &act.chdir
+        {
+            self.scratch.clear();
+            self.scratch.extend_from_slice(path);
+            true
+        } else {
+            false
         };
-        match cwd_raw {
-            Some(raw) => {
-                if let Err(errno) = self.resolve_into_path(consts(self.os).at_fdcwd, &raw) {
-                    return self.finish(Err(errno));
-                }
+        if has_chdir {
+            let mut raw = Vec::new_in(self.alloc);
+            core::mem::swap(&mut raw, &mut self.scratch);
+            let res = self.resolve_into_path(consts(self.os).at_fdcwd, &raw);
+            core::mem::swap(&mut raw, &mut self.scratch);
+            if let Err(errno) = res {
+                return self.finish(Err(errno));
             }
-            None => {
-                self.path.clear();
-                self.path.extend_from_slice(&self.cwd);
-            }
+            ask_guest(
+                &mut self.guest,
+                &mut self.state,
+                &mut self.pending,
+                &Call::Spawn { program, args, env, cwd: &self.path },
+                Pending::Spawn { actions },
+            )
+        } else {
+            ask_guest(
+                &mut self.guest,
+                &mut self.state,
+                &mut self.pending,
+                &Call::Spawn { program, args, env, cwd: &self.cwd },
+                Pending::Spawn { actions },
+            )
         }
-        let cwd = self.path_owned();
-        self.ask(&Call::Spawn { program, args, env, cwd: &cwd }, Pending::Spawn { actions })
     }
 
     /// The pipe a spawn's actions put on `stream`'s number, if any.
-    fn pipe_on(&self, actions: u32, number: i32) -> Option<Option<u32>> {
-        let (fd, _) = self.actions[actions as usize].dup2.iter().rev().find(|(_, to)| *to == number)?;
+    fn pipe_on(&self, actions: Option<u32>, number: i32) -> Option<Option<u32>> {
+        let act = self.actions.get(actions? as usize)?.as_ref()?;
+        let (fd, _) = act.dup2.iter().rev().find(|(_, to)| *to == number)?;
         Some(match self.open_of(Fd(*fd)).map(|open| &open.desc) {
             Some(Desc::PipeWrite { pipe }) => Some(*pipe),
             _ => None,
         })
     }
 
-    fn spawned_answer(&mut self, actions: u32, status: i32) -> Result<(), Fault> {
+    fn spawned_answer(&mut self, actions: Option<u32>, status: i32) -> Result<(), Fault> {
         let pid = 100 + self.children.len() as i32;
         self.children.push(Child { pid, status, reaped: false });
         let split = self.spawned_split;
@@ -1490,8 +1798,18 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
         for (number, range) in [(1, 0..split), (2, split..self.spawned.len())] {
             match self.pipe_on(actions, number) {
                 Some(Some(pipe)) => {
-                    let (spawned, pipes) = (&self.spawned, &mut self.pipes);
-                    pipes[pipe as usize].bytes.extend_from_slice(&spawned[range]);
+                    let p = &mut self.pipes[pipe as usize];
+                    if p.readers > 0 {
+                        if p.at > 0 {
+                            let rem = p.bytes.len() - p.at;
+                            p.bytes.copy_within(p.at.., 0);
+                            p.bytes.truncate(rem);
+                            p.at = 0;
+                        }
+                        let slice = &self.spawned[range];
+                        p.bytes.extend_from_slice(slice);
+                        self.held = self.held.saturating_add(slice.len() as u64);
+                    }
                 }
                 // Put on `/dev/null` or a closed number: gone, as on the real system.
                 Some(None) => {}
@@ -1502,9 +1820,13 @@ impl<'a, P: Planted<SysPlant>> Sys<'a, P> {
             self.spawned_split = self.spawned.len();
         }
         if inherited[0] && split > 0 {
-            let mut bytes = Vec::new_in(self.alloc);
-            bytes.extend_from_slice(&self.spawned[..split]);
-            return self.ask(&Call::Write { stream: Stream::Out, bytes: &bytes }, Pending::SpawnForward { pid, err_left: true });
+            return ask_guest(
+                &mut self.guest,
+                &mut self.state,
+                &mut self.pending,
+                &Call::Write { stream: Stream::Out, bytes: &self.spawned[..split] },
+                Pending::SpawnForward { pid, err_left: true },
+            );
         }
         self.pending = Pending::SpawnForward { pid, err_left: true };
         self.advance(Got::Done)
@@ -1556,8 +1878,8 @@ fn pending_kind(pending: Pending) -> blaze_comptime::CallKind {
         Pending::Cwd => K::Cwd,
         Pending::OpenRead | Pending::OpenWriteLook { .. } | Pending::List { .. } | Pending::Stat => K::Look,
         Pending::Chdir | Pending::Readlink | Pending::Realpath => K::Look,
-        Pending::OpenWriteCreate { .. } | Pending::WriteOut { .. } => K::WriteFile,
-        Pending::OpenWriteTruncate { .. } | Pending::SetLen { .. } => K::SetLen,
+        Pending::OpenWriteCreate { truncated: true, .. } | Pending::OpenWriteTruncate { .. } | Pending::SetLen { .. } => K::SetLen,
+        Pending::OpenWriteCreate { truncated: false, .. } | Pending::WriteOut { .. } => K::WriteFile,
         Pending::Getenv => K::Env,
         Pending::Environ => K::EnvAll,
         Pending::Args => K::Args,

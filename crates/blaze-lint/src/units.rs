@@ -14,7 +14,7 @@
 use blaze_own::{AString, AVec, Alloc};
 use blaze_surface::Item;
 
-use crate::{Findings, LintError, Rule, Run, RuleSet, Scope, Span, TestBits, Unit, Variants, count, lint_in};
+use crate::{Findings, LintError, Rule, Run, RuleSet, Scope, Scratch, Span, TestBits, Unit, Variants, count, lint_in_scratch};
 
 /// What a child item is in its parent's own text ([`Units::own`]): two bytes that are no token
 /// of Rust's (the lex skips a hole) and end a line's code with `}` as a child's own last line
@@ -279,13 +279,14 @@ impl<'a> Units<'a> {
             true => Variants::gather(text, alloc)?,
             false => Variants::new_in(alloc),
         };
+        let mut pass_scratch = Scratch::new_in(alloc);
         for at in 0..self.list.len() {
             let scope = scratch[at];
-            let linted = lint_in(rules, &self.unit(at, text, scope), &variants, self.list[at].base, alloc, out)?;
-            for (child, given) in self.children_of(at).iter().zip(linted.children.iter()) {
+            let done = lint_in_scratch(rules, &self.unit(at, text, scope), &variants, self.list[at].base, &mut pass_scratch, out)?;
+            for (child, given) in self.children_of(at).iter().zip(pass_scratch.children().iter()) {
                 scratch[*child as usize] = *given;
             }
-            each(UnitLinted { unit: at, scope, findings: linted.findings, test_at_end: linted.test_at_end });
+            each(UnitLinted { unit: at, scope, findings: done.findings, test_at_end: done.test_at_end });
         }
         Ok(())
     }

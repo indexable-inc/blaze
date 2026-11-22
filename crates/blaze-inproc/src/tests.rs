@@ -886,6 +886,104 @@ fn retired_code_waits_for_the_threads_of_a_live_process() {
     memory.reserve(arena, 16).unwrap();
 }
 
+#[test]
+fn retire_batch_shares_one_epoch_and_tracks_unposted_cursor() {
+    if !SUPPORTED {
+        return;
+    }
+    let page = crate::sys::page();
+    let arena_pages = 8u64;
+    let mut exe = elf(&[
+        (R, 0, 0, 0x200, 0x200),
+        (RX, page, page, page, page),
+        (0, 0, 4 * page, 0, arena_pages * page),
+        (0, 0, (4 + arena_pages + 2) * page, 0, page),
+    ]);
+    exe.resize(2 * page as usize, 0);
+    let mut memory = CodeMemory::with_cells("batch", 2 * page, arena_pages * page, page).unwrap();
+    memory.write(0, &exe).unwrap();
+    memory.lay_out(Format::Elf).unwrap();
+
+    // Cold retire_batch (no attached process): immediately frees all ranges without bumping epoch.
+    let epoch0 = memory.fences.epoch();
+    let cold_ranges: Vec<CodeRange> = (0..16).map(|_| memory.reserve(64, 16).unwrap()).collect();
+    memory.retire_batch(&[]).unwrap();
+    memory.retire_batch(&cold_ranges).unwrap();
+    assert_eq!(memory.held(), 0);
+    assert_eq!(memory.fences.epoch(), epoch0);
+    assert_eq!(memory.arena.largest(), arena_pages * page);
+
+    // Attach a non-existent pid (`i32::MAX` -> 0 live threads, so `collect()` passes graces).
+    let ghost_pid = i32::MAX as u32;
+    memory.attach(ghost_pid);
+
+    // Validation atomicity: a batch containing an out-of-arena range retires nothing.
+    let valid_r = memory.reserve(64, 16).unwrap();
+    let bad_r = CodeRange { offset: 0, len: 16 };
+    assert!(memory.retire_batch(&[valid_r, bad_r]).is_err());
+    assert_eq!(memory.held(), 0);
+    assert_eq!(memory.fences.epoch(), epoch0);
+    memory.unreserve(valid_r).unwrap();
+
+    // Retire 32 ranges in ONE batch: must bump W_EPOCH by EXACTLY 1 (one SeqCst fence).
+    let batch32: Vec<CodeRange> = (0..32).map(|_| memory.reserve(64, 16).unwrap()).collect();
+    memory.retire_batch(&batch32).unwrap();
+    assert_eq!(memory.fences.epoch(), epoch0 + 1, "retire_batch must share ONE epoch bump");
+    assert_eq!(memory.unposted, 32);
+    assert_eq!(memory.limbo.len(), 32);
+    assert_eq!(memory.held(), 32 * 64);
+
+    // Overflow fence::ENTRIES (256): retire 300 more ranges in ONE batch.
+    // 256 - 32 = 224 fit in the control table now; 76 remain unposted in `limbo[unposted..]`.
+    let batch300: Vec<CodeRange> = (0..300).map(|_| memory.reserve(64, 16).unwrap()).collect();
+    memory.retire_batch(&batch300).unwrap();
+    assert_eq!(memory.fences.epoch(), epoch0 + 2, "overflow batch still does ONE epoch bump");
+    assert_eq!(memory.unposted, crate::fence::ENTRIES);
+    assert_eq!(memory.limbo.len(), 332);
+    assert!(memory.limbo[..memory.unposted].iter().all(|(entry, _)| entry.is_some()));
+    assert!(memory.limbo[memory.unposted..].iter().all(|(entry, _)| entry.is_none()));
+
+    // First collect(): frees the 256 posted entries AND automatically posts the remaining 76!
+    let freed1 = memory.collect().unwrap();
+    assert_eq!(freed1, crate::fence::ENTRIES);
+    assert_eq!(memory.limbo.len(), 76);
+    assert_eq!(memory.unposted, 76);
+    assert_eq!(memory.fences.epoch(), epoch0 + 3);
+    assert!(memory.limbo.iter().all(|(entry, _)| entry.is_some()));
+
+    // Second collect(): frees the remaining 76 entries.
+    let freed2 = memory.collect().unwrap();
+    assert_eq!(freed2, 76);
+    assert_eq!(memory.limbo.len(), 0);
+    assert_eq!(memory.unposted, 0);
+    assert_eq!(memory.held(), 0);
+    assert_eq!(memory.arena.largest(), arena_pages * page);
+
+    memory.exited(ghost_pid);
+}
+
+#[test]
+fn zero_works_both_cold_and_with_attached_process() {
+    let Some(probe) = memory(1, 1) else { return };
+    let page = probe.page();
+    drop(probe);
+    let Some(mut memory) = memory(4 * page, page) else { return };
+    // Cold path (`processes.is_empty()`): skips icache publish while still zeroing written pages.
+    memory.write(page + 16, &[0xaa; 32]).unwrap();
+    assert_eq!(memory.zero(0, 4 * page).unwrap(), page);
+    assert!(memory.bytes(CodeRange { offset: page + 16, len: 32 }).unwrap().iter().all(|&b| b == 0));
+
+    // Warm path (with an attached process): zeroes and publishes written pages.
+    let pid = std::process::id();
+    memory.attach(pid);
+    memory.write(2 * page + 8, &[0xbb; 16]).unwrap();
+    assert_eq!(memory.zero(2 * page, page).unwrap(), page);
+    assert!(
+        memory.bytes(CodeRange { offset: 2 * page + 8, len: 16 }).unwrap().iter().all(|&b| b == 0)
+    );
+    memory.exited(pid);
+}
+
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod linux {
     use std::path::PathBuf;

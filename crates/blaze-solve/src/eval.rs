@@ -210,6 +210,7 @@ pub struct Solver<'a, E = NoDerivation> {
     frames: Vec<Frame, Alloc<'a>>,
     cands: Vec<Cand, Alloc<'a>>,
     dones: Vec<Done, Alloc<'a>>,
+    merge_dones: Vec<Done, Alloc<'a>>,
     goals: Vec<Pending, Alloc<'a>>,
     origs: Vec<Ty, Alloc<'a>>,
     /// Every frame's read list, a set per frame (readlog.rs).
@@ -519,6 +520,7 @@ impl<'a, E: Emit> Solver<'a, E> {
             frames: Vec::new_in(alloc),
             cands: Vec::new_in(alloc),
             dones: Vec::new_in(alloc),
+            merge_dones: Vec::new_in(alloc),
             goals: Vec::new_in(alloc),
             origs: Vec::new_in(alloc),
             reads: ReadLog::new_in(alloc),
@@ -685,12 +687,9 @@ impl<'a, E: Emit> Solver<'a, E> {
             i += 1;
             let Pred::Trait { trait_, args, polarity: Polarity::Positive } = c.pred else { continue };
             let def = ask.trait_def(reads, trait_)?;
-            let mut v: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(args.len as usize, self.alloc);
-            for k in 0..args.len {
-                v.push(tys.list_get(args, k));
-            }
+            let v = crate::assembly::SmallTys::from_list(tys, args, self.alloc);
             for &sp in def.supertraits {
-                let p = import_pred(tys, &mut self.scratch, def.portable, sp, &v, self.alloc)?;
+                let p = import_pred(tys, &mut self.scratch, def.portable, sp, &v)?;
                 let nc = Clause { pred: p, bound: c.bound };
                 if !all.contains(&nc) {
                     if all.len() >= MAX_ENV {
@@ -1197,7 +1196,7 @@ impl<'a, E: Emit> Solver<'a, E> {
                 self.nested_ids.truncate(0);
                 self.added.clear();
                 self.deferred.clear();
-                self.inputs.prov.clear();
+                self.inputs.clear_provisional();
                 Err(e)
             }
         }
@@ -2216,10 +2215,15 @@ impl<'a, E: Emit> Solver<'a, E> {
         }
         // The provisional cache.
         let mut hit = None;
-        for p in self.inputs.prov.iter() {
-            if p.input == input && (p.highest as usize) < self.frames.len() && self.path_from(p.highest as usize, step) == p.path {
-                hit = Some(*p);
-                break;
+        if !self.inputs.prov.is_empty() {
+            let mut at = self.inputs.prov_head(input);
+            while at != u32::MAX {
+                let p = self.inputs.prov[at as usize];
+                if (p.highest as usize) < self.frames.len() && self.path_from(p.highest as usize, step) == p.path {
+                    hit = Some(p);
+                    break;
+                }
+                at = self.inputs.prov_next(at);
             }
         }
         if let Some(p) = hit {
@@ -2282,22 +2286,23 @@ impl<'a, E: Emit> Solver<'a, E> {
 
     fn merge<F: Facts>(&mut self, facts: &F, top: usize) -> Result<Ans, Stop> {
         let f = self.frames[top];
-        let mut dones: Vec<Done, Alloc<'a>> = Vec::new_in(self.alloc);
-        dones.extend_from_slice(&self.dones[f.dones_lo as usize..]);
+        self.merge_dones.clear();
+        self.merge_dones.extend_from_slice(&self.dones[f.dones_lo as usize..]);
         let mut m = Merger { resps: &mut self.resps, vars: f.vars, bail: None };
         // Specialization between two impl candidates, a fact of the impls read like any other
         // (the frame's read list keeps it).
         let ask = Ask::new(facts);
         self.reads.lo = f.reads_lo;
         let reads = &mut self.reads;
+        let dones = &mut self.merge_dones;
         let mut specializes = |a: Def, b: Def| ask.specializes(reads, a, b);
         let ans = match f.kind {
-            Kind::Trait => match trait_goals::merge(&mut m, f.mode, &f.tstate, &mut dones, &mut specializes)? {
+            Kind::Trait => match trait_goals::merge(&mut m, f.mode, &f.tstate, dones, &mut specializes)? {
                 Some((r, via)) => Some(m.with_via(r, via)?),
                 None => None,
             },
-            Kind::Alias => crate::alias::merge(&mut m, f.mode, f.goal.pred, &mut dones, &mut specializes)?,
-            Kind::WellFormed | Kind::Other => m.merge_responses(&dones)?,
+            Kind::Alias => crate::alias::merge(&mut m, f.mode, f.goal.pred, dones, &mut specializes)?,
+            Kind::WellFormed | Kind::Other => m.merge_responses(dones)?,
         };
         let bail = m.bail;
         if self.maybe_on {
@@ -2305,26 +2310,29 @@ impl<'a, E: Emit> Solver<'a, E> {
         }
         if let Some(t) = &mut self.trace {
             let verdict = ans.map(|r| (self.resps.certainty(r), !self.resps.is_identity(r)));
-            t.merge(f.input, dones.len() as u32, verdict);
+            t.merge(f.input, self.merge_dones.len() as u32, verdict);
         }
         if E::ON
             && let Some(r) = ans
         {
-            self.note_choice(f.input, r, &dones)?;
+            self.note_choice(f.input, r)?;
         }
         Ok(ans)
     }
 
-    /// Records the frame's choice (witness.rs): of the candidates the merge kept (`dones`,
+    /// Records the frame's choice (witness.rs): of the candidates the merge kept (`merge_dones`,
     /// as it filtered them), those answering `Yes` with the merged response's words; the least
     /// by `witness::least`. Nothing is recorded for an answer other than `Yes`.
-    fn note_choice(&mut self, input: u32, r: RespId, dones: &[Done]) -> Result<(), Stop> {
+    fn note_choice(&mut self, input: u32, r: RespId) -> Result<(), Stop> {
         if self.resps.certainty(r) != Certainty::Yes {
             return Ok(());
         }
         let resps = &self.resps;
         let best = crate::witness::least(
-            dones.iter().filter(|d| resps.certainty(d.resp) == Certainty::Yes && resps.equal(d.resp, r)).map(|d| Choice::of(&d.cand)),
+            self.merge_dones
+                .iter()
+                .filter(|d| resps.certainty(d.resp) == Certainty::Yes && resps.equal(d.resp, r))
+                .map(|d| Choice::of(&d.cand)),
         );
         if let Some(c) = best {
             self.emit.record(input, c)?;
@@ -2438,7 +2446,7 @@ impl<'a, E: Emit> Solver<'a, E> {
                 }
                 p
             };
-            self.inputs.prov.push(Prov { input: f.input, heads, highest, path, ans, overflow: f.overflow });
+            self.inputs.push_provisional(Prov { input: f.input, heads, highest, path, ans, overflow: f.overflow });
         }
         if top == 0 {
             // The root's reads stay for `evaluate` to hand out; its nested goals are done with.
@@ -2556,29 +2564,33 @@ fn import_pred<T: Tys>(
     p: crate::facts::Portable<'_>,
     pred: Pred,
     args: &[Ty],
-    alloc: Alloc<'_>,
 ) -> Result<Pred, SolveError> {
     let at = core::panic::Location::caller();
-    let inst = |tys: &mut T, s: &mut Scratch<'_>, t: Ty| fold::import_at(tys, s, p, t, Inst { args, bound: &[] }, at);
-    let list = |tys: &mut T, s: &mut Scratch<'_>, l: crate::term::List| -> Result<crate::term::List, SolveError> {
-        let mut v: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(l.len as usize, alloc);
-        for i in 0..l.len {
-            let Some(&x) = p.lists.get((l.start + i) as usize) else {
-                return Err(SolveError::Malformed(Malformed::PortableIndex { node: l.start + i, len: p.lists.len() as u32 }));
-            };
-            v.push(fold::import_at(tys, s, p, x, Inst { args, bound: &[] }, at)?);
-        }
-        tys.mk_list(&v)
-    };
+    let inst = Inst { args, bound: &[] };
     Ok(match pred {
-        Pred::Trait { trait_, args: a, polarity } => Pred::Trait { trait_, args: list(tys, s, a)?, polarity },
-        Pred::HostEffect { trait_, args: a, constness } => Pred::HostEffect { trait_, args: list(tys, s, a)?, constness },
-        Pred::ConstHolds { cond, args: a } => Pred::ConstHolds { cond, args: list(tys, s, a)? },
-        Pred::Projection { alias, term } => Pred::Projection { alias: inst(tys, s, alias)?, term: inst(tys, s, term)? },
-        Pred::TypeOutlives { ty, region } => Pred::TypeOutlives { ty: inst(tys, s, ty)?, region: inst(tys, s, region)? },
-        Pred::RegionOutlives { a, b } => Pred::RegionOutlives { a: inst(tys, s, a)?, b: inst(tys, s, b)? },
-        Pred::WellFormed(t) => Pred::WellFormed(inst(tys, s, t)?),
-        Pred::ConstEvaluatable(t) => Pred::ConstEvaluatable(inst(tys, s, t)?),
+        Pred::Trait { trait_, args: a, polarity } => {
+            Pred::Trait { trait_, args: fold::import_list_at(tys, s, p, a, inst, at)?, polarity }
+        }
+        Pred::HostEffect { trait_, args: a, constness } => {
+            Pred::HostEffect { trait_, args: fold::import_list_at(tys, s, p, a, inst, at)?, constness }
+        }
+        Pred::ConstHolds { cond, args: a } => {
+            Pred::ConstHolds { cond, args: fold::import_list_at(tys, s, p, a, inst, at)? }
+        }
+        Pred::Projection { alias: a, term: b }
+        | Pred::TypeOutlives { ty: a, region: b }
+        | Pred::RegionOutlives { a, b } => {
+            let mut out = [Ty::NONE; 2];
+            fold::import_slice(tys, s, p, &[a, b], inst, &mut out, at)?;
+            match pred {
+                Pred::Projection { .. } => Pred::Projection { alias: out[0], term: out[1] },
+                Pred::TypeOutlives { .. } => Pred::TypeOutlives { ty: out[0], region: out[1] },
+                Pred::RegionOutlives { .. } => Pred::RegionOutlives { a: out[0], b: out[1] },
+                _ => unreachable!(),
+            }
+        }
+        Pred::WellFormed(t) => Pred::WellFormed(fold::import_at(tys, s, p, t, inst, at)?),
+        Pred::ConstEvaluatable(t) => Pred::ConstEvaluatable(fold::import_at(tys, s, p, t, inst, at)?),
         Pred::DynCompatible(d) => Pred::DynCompatible(d),
         _ => return Err(SolveError::Malformed(crate::error::bad_pred())),
     })
@@ -2644,7 +2656,7 @@ fn const_holds<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cond: Def, args: cra
     if cx.mode == TypingMode::Coherence {
         return Ok(Step::Done(Certainty::Ambiguous));
     }
-    let mut v = cx.list(args);
+    let mut v = cx.list_small(args);
     let mut flags = 0u16;
     for t in v.iter_mut() {
         *t = cx.resolve_deep(*t)?;

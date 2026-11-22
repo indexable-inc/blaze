@@ -644,10 +644,19 @@ fn expect_finding(g: G, is_macro: bool) -> Option<(StdVec<u8>, Grant)> {
             Res::At(..) => None,
         },
         G::Env(name) | G::TrackEnv(name) if !granted(name, is_macro) => named(name, Grant::Env),
-        G::WriteFile(path) | G::CreateDir(path) | G::Remove(path) | G::Rename(path, _) => match model_resolve(path, is_macro) {
+        G::WriteFile(path) | G::CreateDir(path) | G::Remove(path) => match model_resolve(path, is_macro) {
             Res::Escape => named(path, Grant::Unaddressable),
             Res::At(2, _) => None,
             _ => named(path, Grant::Write),
+        },
+        G::Rename(from, to) => match model_resolve(from, is_macro) {
+            Res::Escape => named(from, Grant::Unaddressable),
+            Res::At(2, _) => match model_resolve(to, is_macro) {
+                Res::Escape => named(to, Grant::Unaddressable),
+                Res::At(2, _) => None,
+                _ => named(to, Grant::Write),
+            },
+            _ => named(from, Grant::Write),
         },
         G::Thread => named("pthread_create", Grant::Thread),
         G::Socket => named("socket", Grant::Network),
@@ -887,4 +896,174 @@ fn the_two_constructors_hold_the_two_kinds_of_run() {
     let grants = Grants::build_script(script(with_out)).unwrap();
     assert_eq!((grants.spawns, grants.args), (crate::Spawns::CMode, &[&b"build-script-build"[..]][..]));
     assert_eq!(grants.kind, crate::RunKind::BuildScript);
+}
+
+#[test]
+fn guest_fits_accepts_too_large_on_bulk_calls_and_wire_caps_random() {
+    use crate::CallKind as K;
+    use crate::guest::fits;
+    use crate::wire::{read_answer, write_answer};
+
+    for kind in [K::EnvAll, K::Args, K::Cwd, K::Random] {
+        assert!(fits(kind, &Answer::Error(SysError::TooLarge)), "{kind:?} must accept TooLarge");
+        assert!(!fits(kind, &Answer::Error(SysError::NotFound)), "{kind:?} must still reject NotFound");
+    }
+    assert!(!fits(K::Hello, &Answer::Error(SysError::TooLarge)));
+    assert!(!fits(K::Clock, &Answer::Error(SysError::TooLarge)));
+
+    let big = crate::WireLimits::SHIPPED;
+    let small_rand = crate::WireLimits { most_random: 4, ..big };
+    let mut out = blaze_own::Vec::new_in(heap());
+    write_answer(&Answer::Random { bytes: b"12345" }, &mut out, big).unwrap();
+    let (body, _) = split_frame(&out, big).unwrap().unwrap();
+    assert!(matches!(read_answer(body, small_rand), Err(crate::WireError::Cbor(_))));
+    assert_eq!(read_answer(body, big), Ok(Answer::Random { bytes: b"12345" }));
+}
+
+#[test]
+fn nospace_does_not_leak_ghost_output_file() {
+    let globs = [Glob::new("src/**").unwrap()];
+    let list = [Root { name: "pkg", kind: RootKind::Package { globs: &globs } }, Root { name: "out", kind: RootKind::Output }];
+    let roots = Roots::new(&list).unwrap();
+    let mounts = Mounts::new(&[Mount { spelling: b"/pkg", root: RootId(0) }, Mount { spelling: b"/out", root: RootId(1) }], Some(b"/pkg"), &roots).unwrap();
+    let output = crate::OutputCaps { most_file_bytes: 4, most_files: 4, ..crate::OutputCaps::SCRIPT };
+    let grants = Grants::build_script(BuildScriptOpts { key: CallKey([7; 32]), roots, mounts, env: &[], output, .. }).unwrap();
+
+    let mut host = Host::new(HostOpts { grants, alloc: heap(), .. });
+    let mut guest = Guest::new(GuestOpts { alloc: heap(), .. });
+    assert_eq!(exchange(&mut host, &mut guest, Nanos(0), &Call::Hello { protocol: crate::PROTOCOL }).unwrap(), Some(Ans::Hello));
+
+    // WriteFile exceeding most_file_bytes returns NoSpace and must NOT create a ghost 0-byte file.
+    assert_eq!(
+        exchange(&mut host, &mut guest, Nanos(1), &Call::WriteFile { path: b"/out/big", at: 0, bytes: b"12345" }).unwrap(),
+        Some(Ans::Error(SysError::NoSpace)),
+    );
+    assert_eq!(
+        exchange(&mut host, &mut guest, Nanos(2), &Call::Look { path: b"/out/big", want: Want::Stat }).unwrap(),
+        Some(Ans::Error(SysError::NotFound)),
+    );
+
+    // Same for SetLen on a new file.
+    assert_eq!(
+        exchange(&mut host, &mut guest, Nanos(3), &Call::SetLen { path: b"/out/big2", len: 10 }).unwrap(),
+        Some(Ans::Error(SysError::NoSpace)),
+    );
+    assert_eq!(
+        exchange(&mut host, &mut guest, Nanos(4), &Call::Look { path: b"/out/big2", want: Want::Stat }).unwrap(),
+        Some(Ans::Error(SysError::NotFound)),
+    );
+
+    // Overflowing offset + len returns NoSpace cleanly.
+    assert_eq!(
+        exchange(&mut host, &mut guest, Nanos(5), &Call::WriteFile { path: b"/out/ovf", at: u64::MAX, bytes: b"x" }).unwrap(),
+        Some(Ans::Error(SysError::NoSpace)),
+    );
+
+    assert_eq!(exchange(&mut host, &mut guest, Nanos(6), &Call::Exit { code: 0 }).unwrap(), None);
+    let done = host.finish().unwrap();
+    assert!(done.files.is_empty(), "no ghost files may remain after NoSpace");
+}
+
+#[test]
+fn rename_outside_output_root_records_finding_and_spawn_fact_key_has_no_nul_collision() {
+    let globs = [Glob::new("src/**").unwrap()];
+    let list = [Root { name: "pkg", kind: RootKind::Package { globs: &globs } }, Root { name: "out", kind: RootKind::Output }];
+    let roots = Roots::new(&list).unwrap();
+    let mounts = Mounts::new(&[Mount { spelling: b"/pkg", root: RootId(0) }, Mount { spelling: b"/out", root: RootId(1) }], Some(b"/pkg"), &roots).unwrap();
+    let grants = Grants::build_script(BuildScriptOpts { key: CallKey([8; 32]), roots, mounts, env: &[], .. }).unwrap();
+
+    let mut host = Host::new(HostOpts { grants, alloc: heap(), .. });
+    let mut guest = Guest::new(GuestOpts { alloc: heap(), .. });
+    exchange(&mut host, &mut guest, Nanos(0), &Call::Hello { protocol: crate::PROTOCOL }).unwrap();
+
+    // Create `/out/a`, attempt to rename into `/pkg/x` (outside output root): must record Finding.
+    assert_eq!(exchange(&mut host, &mut guest, Nanos(1), &Call::WriteFile { path: b"/out/a", at: 0, bytes: b"hi" }).unwrap(), Some(Ans::Done));
+    assert_eq!(
+        exchange(&mut host, &mut guest, Nanos(2), &Call::Rename { from: b"/out/a", to: b"/pkg/x" }).unwrap(),
+        Some(Ans::Error(SysError::ReadOnly)),
+    );
+    let findings: StdVec<_> = host.findings().map(|f| (f.call, f.name.to_vec(), f.grant)).collect();
+    assert_eq!(findings, vec![(crate::CallKind::Rename, b"/pkg/x".to_vec(), Grant::Write)]);
+
+    // Two spawns that would collide under NUL-only concatenation must produce distinct FactKind::Spawn entries.
+    let s1 = Call::Spawn { program: b"a", args: Words(b"b\0"), env: Words::EMPTY, cwd: b"/pkg" };
+    let s2 = Call::Spawn { program: b"a", args: Words::EMPTY, env: Words(b"b\0"), cwd: b"/pkg" };
+    exchange(&mut host, &mut guest, Nanos(3), &s1).unwrap();
+    exchange(&mut host, &mut guest, Nanos(4), &s2).unwrap();
+
+    exchange(&mut host, &mut guest, Nanos(5), &Call::Exit { code: 0 }).unwrap();
+    let done = host.finish().unwrap();
+    let spawns: StdVec<_> = done.facts.iter().filter(|f| f.kind == crate::FactKind::Spawn).collect();
+    assert_eq!(spawns.len(), 2, "length-prefixed spawn keys must not collide");
+    assert_ne!(spawns[0].name, spawns[1].name);
+}
+
+#[test]
+fn stderr_cap_and_facts_findings_caps_and_sorted_output_root() {
+    let globs = [Glob::new("src/**").unwrap()];
+    let list = [Root { name: "pkg", kind: RootKind::Package { globs: &globs } }, Root { name: "out", kind: RootKind::Output }];
+    let roots = Roots::new(&list).unwrap();
+    let mounts = Mounts::new(&[Mount { spelling: b"/pkg", root: RootId(0) }, Mount { spelling: b"/out", root: RootId(1) }], Some(b"/pkg"), &roots).unwrap();
+    let output = crate::OutputCaps { most_log: 8, most_file_bytes: 16, most_files: 16, ..crate::OutputCaps::SCRIPT };
+    let limits = blaze_roots::Limits { most_entries: 2, most_path: 64, most_text: 64 };
+    let grants = Grants::build_script(BuildScriptOpts { key: CallKey([9; 32]), roots, mounts, env: &[], output, limits, .. }).unwrap();
+
+    let mut host = Host::new(HostOpts { grants, alloc: heap(), .. });
+    let mut guest = Guest::new(GuestOpts { alloc: heap(), .. });
+    exchange(&mut host, &mut guest, Nanos(0), &Call::Hello { protocol: crate::PROTOCOL }).unwrap();
+
+    // Stream::Err large write slices down to `most_log = 8` without allocating oversized buffer.
+    let big: StdVec<u8> = (0..1024u32).map(|i| b'a' + (i % 26) as u8).collect();
+    assert_eq!(exchange(&mut host, &mut guest, Nanos(1), &Call::Write { stream: Stream::Err, bytes: &big }).unwrap(), Some(Ans::Done));
+    assert_eq!(exchange(&mut host, &mut guest, Nanos(2), &Call::Write { stream: Stream::Err, bytes: b"1234" }).unwrap(), Some(Ans::Done));
+
+    // Repeated Env("X") deduplicates in Facts; Findings caps cleanly at `most_entries = 2`.
+    for i in 0..5u64 {
+        assert_eq!(exchange(&mut host, &mut guest, Nanos(10 + i), &Call::Env { name: b"X" }).unwrap(), Some(Ans::Value(None)));
+    }
+    assert_eq!(host.findings().count(), 2, "findings capped at most_entries without panicking");
+
+    // Sorted output root prefix edge cases: `a-1` and `a.txt` sort between `a` and `a/child`.
+    for call in [
+        Call::CreateDir { path: b"/out/a" },
+        Call::WriteFile { path: b"/out/a-1", at: 0, bytes: b"1234" },
+        Call::WriteFile { path: b"/out/a.txt", at: 0, bytes: b"5678" },
+        Call::WriteFile { path: b"/out/a/child", at: 0, bytes: b"90" },
+        Call::WriteFile { path: b"/out/a0", at: 0, bytes: b"xy" },
+    ] {
+        assert_eq!(exchange(&mut host, &mut guest, Nanos(20), &call).unwrap(), Some(Ans::Done));
+    }
+    assert_eq!(
+        exchange(&mut host, &mut guest, Nanos(21), &Call::Remove { path: b"/out/a" }).unwrap(),
+        Some(Ans::Error(SysError::NotEmpty)),
+    );
+    assert_eq!(
+        exchange(&mut host, &mut guest, Nanos(22), &Call::Look { path: b"/out/a", want: Want::List }).unwrap(),
+        Some(Ans::Listing(vec![b"child".to_vec()])),
+    );
+    assert_eq!(
+        exchange(&mut host, &mut guest, Nanos(23), &Call::Look { path: b"/out", want: Want::List }).unwrap(),
+        Some(Ans::Listing(vec![b"a".to_vec(), b"a-1".to_vec(), b"a.txt".to_vec(), b"a0".to_vec()])),
+    );
+    // Remove `/out/a/child` and `/out/a`, reclaiming bytes for incremental `out_bytes`.
+    assert_eq!(exchange(&mut host, &mut guest, Nanos(24), &Call::Remove { path: b"/out/a/child" }).unwrap(), Some(Ans::Done));
+    assert_eq!(exchange(&mut host, &mut guest, Nanos(25), &Call::Remove { path: b"/out/a" }).unwrap(), Some(Ans::Done));
+    // Currently 4 + 4 + 2 = 10 bytes used out of 16; writing 6 bytes fits, 7 does not.
+    assert_eq!(
+        exchange(&mut host, &mut guest, Nanos(26), &Call::WriteFile { path: b"/out/z", at: 0, bytes: b"1234567" }).unwrap(),
+        Some(Ans::Error(SysError::NoSpace)),
+    );
+    assert_eq!(
+        exchange(&mut host, &mut guest, Nanos(27), &Call::WriteFile { path: b"/out/z", at: 0, bytes: b"123456" }).unwrap(),
+        Some(Ans::Done),
+    );
+
+    exchange(&mut host, &mut guest, Nanos(30), &Call::Exit { code: 0 }).unwrap();
+    let done = host.finish().unwrap();
+    let mut want_log = big[big.len() - 4..].to_vec();
+    want_log.extend_from_slice(b"1234");
+    assert_eq!(done.log.as_slice(), want_log.as_slice());
+    assert_eq!(done.facts.len(), 1, "repeated Env(X) deduplicated to 1 fact");
+    let paths: StdVec<&[u8]> = done.files.iter().map(|f| f.path.as_slice()).collect();
+    assert_eq!(paths, vec![&b"a-1"[..], &b"a.txt"[..], &b"a0"[..], &b"z"[..]]);
 }

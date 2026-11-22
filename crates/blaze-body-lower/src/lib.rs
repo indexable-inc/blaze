@@ -20,6 +20,7 @@
 //! - [`closure`]: closure values and closure bodies with their captures as places.
 
 #![no_std]
+#![forbid(unsafe_code)]
 #![feature(allocator_api)]
 
 #[cfg(test)]
@@ -35,8 +36,9 @@ mod scope;
 mod tests;
 
 use core::alloc::Allocator;
+use core::cell::Cell;
 
-use blaze_body::{Block, BlockKind, Body, BodyBuilder, BuildError, Local, LocalDecl, LocalKind, Loan, Place, Span, StmtKind};
+use blaze_body::{Block, BlockKind, Body, BodyBuilder, BuildError, Local, LocalDecl, LocalKind, Loan, NONE, Place, Span, StmtKind};
 use blaze_flow_lower::Facts;
 use blaze_own::Vec;
 use blaze_typeck::{
@@ -244,6 +246,87 @@ fn pat_range_of(body: &BodyView<'_>, p: PatId) -> Range {
     body.pat_ranges.get(p.ix()).copied().unwrap_or(Range { start: 0, end: 0 })
 }
 
+/// Inline work stack for type walks (`is_copy`, `needs_drop`): zero heap allocation up to depth 16,
+/// spilling to an explicit-allocator `Vec` only past 16.
+struct TyStack<A: Allocator> {
+    inline: [PTy; 16],
+    len: usize,
+    spill: Vec<PTy, A>,
+}
+
+impl<A: Allocator> TyStack<A> {
+    #[inline]
+    fn new(root: PTy, alloc: A) -> Self {
+        let mut inline = [PTy(0); 16];
+        inline[0] = root;
+        Self { inline, len: 1, spill: Vec::new_in(alloc) }
+    }
+
+    #[inline]
+    fn push(&mut self, t: PTy) {
+        if self.spill.is_empty() && self.len < self.inline.len() {
+            self.inline[self.len] = t;
+            self.len += 1;
+        } else {
+            self.spill.push(t);
+        }
+    }
+
+    #[inline]
+    fn extend_from_slice(&mut self, slice: &[PTy]) {
+        if self.spill.is_empty() && self.len + slice.len() <= self.inline.len() {
+            self.inline[self.len..self.len + slice.len()].copy_from_slice(slice);
+            self.len += slice.len();
+        } else {
+            self.spill.extend_from_slice(slice);
+        }
+    }
+
+    #[inline]
+    fn pop(&mut self) -> Option<PTy> {
+        if let Some(t) = self.spill.pop() {
+            return Some(t);
+        }
+        if self.len > 0 {
+            self.len -= 1;
+            return Some(self.inline[self.len]);
+        }
+        None
+    }
+}
+
+/// Builds a dense O(1) first-match index table (`u32::MAX` sentinel) from a column of `ExprId`s.
+fn index_expr_rows<A: Allocator>(col: &[ExprId], n_exprs: usize, alloc: A) -> Vec<u32, A> {
+    if col.is_empty() {
+        return Vec::new_in(alloc);
+    }
+    let mut table = Vec::from_elem_in(u32::MAX, n_exprs, alloc);
+    for (i, &e) in col.iter().enumerate() {
+        if let Some(slot) = table.get_mut(e.ix())
+            && *slot == u32::MAX
+        {
+            *slot = i as u32;
+        }
+    }
+    table
+}
+
+/// Builds a dense O(1) first-match index table (`u32::MAX` sentinel) from a column of `PatId`s.
+fn index_pat_rows<A: Allocator>(col: &[PatId], n_pats: usize, alloc: A) -> Vec<u32, A> {
+    if col.is_empty() {
+        return Vec::new_in(alloc);
+    }
+    let mut table = Vec::from_elem_in(u32::MAX, n_pats, alloc);
+    for (i, &p) in col.iter().enumerate() {
+        if let Some(slot) = table.get_mut(p.ix())
+            && *slot == u32::MAX
+        {
+            *slot = i as u32;
+        }
+    }
+    table
+}
+
 /// The lowering's state over one body.
 pub(crate) struct Lower<'b, 'v, 'c, F, A: Allocator + Clone> {
     pub(crate) body: &'b BodyView<'v>,
@@ -255,8 +338,17 @@ pub(crate) struct Lower<'b, 'v, 'c, F, A: Allocator + Clone> {
     /// The return place `_0` and its type.
     pub(crate) ret: Place,
     pub(crate) ret_ty: PTy,
-    /// Each binding pattern's place: its local's, or a closure's upvar place.
-    pub(crate) binds: Vec<(PatId, Place), A>,
+    /// Each binding pattern's place (indexed by `PatId`, `Place(NONE)` until bound):
+    /// its local's, or a closure's upvar place.
+    pub(crate) pat_place: Vec<Place, A>,
+    /// Dense O(1) first-match lookup tables into `ck` columns (`u32::MAX` = absent).
+    expr_def_row: Vec<u32, A>,
+    pat_def_row: Vec<u32, A>,
+    callee_row: Vec<u32, A>,
+    field_row: Vec<u32, A>,
+    /// Per-`PTy` memo tables for `is_copy` and `needs_drop` (0 = unknown, 1 = false, 2 = true).
+    copy_memo: Vec<Cell<u8>, A>,
+    drop_memo: Vec<Cell<u8>, A>,
     /// The drop schedule: what is live, in declaration order ([`scope`]).
     pub(crate) sched: Vec<Entry, A>,
     /// Where each open scope begins in `sched`.
@@ -289,15 +381,29 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Clone> Lower<'b, 'v, 'c, F, A> {
         }
         break_targets.sort_unstable();
         break_targets.dedup();
+        let tys = ck.types.view();
+        let n_exprs = body.exprs.len();
+        let n_pats = body.pats.len();
+        let n_tys = tys.len();
+        let expr_def_row = index_expr_rows(ck.expr_defs.column::<0>(), n_exprs, alloc.clone());
+        let pat_def_row = index_pat_rows(ck.pat_defs.column::<0>(), n_pats, alloc.clone());
+        let callee_row = index_expr_rows(ck.callees.column::<0>(), n_exprs, alloc.clone());
+        let field_row = index_expr_rows(ck.fields.column::<0>(), n_exprs, alloc.clone());
         Lower {
             body,
             ck,
-            tys: ck.types.view(),
+            tys,
             facts,
-            b: BodyBuilder::new_with_types_in(ck.types.view(), alloc.clone()),
+            b: BodyBuilder::new_with_types_in(tys, alloc.clone()),
             ret: Place(0),
             ret_ty: PTy(0),
-            binds: Vec::new_in(alloc.clone()),
+            pat_place: Vec::from_elem_in(Place(NONE), n_pats, alloc.clone()),
+            expr_def_row,
+            pat_def_row,
+            callee_row,
+            field_row,
+            copy_memo: Vec::from_elem_in(Cell::new(0u8), n_tys, alloc.clone()),
+            drop_memo: Vec::from_elem_in(Cell::new(0u8), n_tys, alloc.clone()),
             sched: Vec::new_in(alloc.clone()),
             marks: Vec::new_in(alloc.clone()),
             targets: Vec::new_in(alloc.clone()),
@@ -335,7 +441,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Clone> Lower<'b, 'v, 'c, F, A> {
             let drops = self.needs_drop(ty, At::Pat(p))?;
             self.sched.push(Entry { local, place, drops, storage: false, cleanup: None });
             if self.simple_bind(p)? {
-                self.binds.push((p, place));
+                self.bind(p, place);
                 continue;
             }
             let mut out = Vec::new_in(self.alloc.clone());
@@ -451,29 +557,38 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Clone> Lower<'b, 'v, 'c, F, A> {
     }
 
     pub(crate) fn expr_def(&self, e: ExprId) -> Option<Def> {
-        let col = self.ck.expr_defs.column::<0>();
-        let i = col.iter().position(|x| *x == e)?;
-        Some(self.ck.expr_defs.column::<1>()[i])
+        let row = *self.expr_def_row.get(e.ix())?;
+        if row == u32::MAX {
+            return None;
+        }
+        Some(self.ck.expr_defs.column::<1>()[row as usize])
     }
 
     pub(crate) fn pat_def(&self, p: PatId) -> Option<Def> {
-        let col = self.ck.pat_defs.column::<0>();
-        let i = col.iter().position(|x| *x == p)?;
-        Some(self.ck.pat_defs.column::<1>()[i])
+        let row = *self.pat_def_row.get(p.ix())?;
+        if row == u32::MAX {
+            return None;
+        }
+        Some(self.ck.pat_defs.column::<1>()[row as usize])
     }
 
     /// The method or operator trait method the check chose for `e`, and its arguments.
     pub(crate) fn callee_of(&self, e: ExprId) -> Option<(ItemKey, List)> {
-        let col = self.ck.callees.column::<0>();
-        let i = col.iter().position(|x| *x == e)?;
+        let row = *self.callee_row.get(e.ix())?;
+        if row == u32::MAX {
+            return None;
+        }
+        let i = row as usize;
         Some((self.ck.callees.column::<1>()[i], self.ck.callees.column::<2>()[i]))
     }
 
     /// The index of the field field expression `e` names.
     pub(crate) fn field_of(&self, e: ExprId) -> Option<u32> {
-        let col = self.ck.fields.column::<0>();
-        let i = col.iter().position(|x| *x == e)?;
-        Some(self.ck.fields.column::<2>()[i])
+        let row = *self.field_row.get(e.ix())?;
+        if row == u32::MAX {
+            return None;
+        }
+        Some(self.ck.fields.column::<2>()[row as usize])
     }
 
     /// Type `t`'s node: the body's own (an overlay type this lowering made) or the record's.
@@ -523,14 +638,56 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Clone> Lower<'b, 'v, 'c, F, A> {
     }
 
     /// Whether a value of `t` is `Copy` (a use copies it rather than moving it).
-    pub(crate) fn is_copy(&self, t: PTy, at: At) -> Result<bool, LowerError> {
-        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
-        stack.push(t);
+    pub(crate) fn is_copy(&self, root: PTy, at: At) -> Result<bool, LowerError> {
+        if let Some(cell) = self.copy_memo.get(root.0 as usize) {
+            let v = cell.get();
+            if v != 0 {
+                return Ok(v == 2);
+            }
+        }
+        let quick = match self.node(root, at)? {
+            PNode::Bool
+            | PNode::Char
+            | PNode::Int(_)
+            | PNode::Uint(_)
+            | PNode::Float(_)
+            | PNode::Never
+            | PNode::Ptr(..)
+            | PNode::FnDef(..)
+            | PNode::FnPtr(..)
+            | PNode::ConstValue { .. }
+            | PNode::ConstParam(_)
+            | PNode::Ref(Mutbl::Not, _) => Some(true),
+            PNode::Ref(Mutbl::Mut, _) => Some(false),
+            PNode::Param(i) => Some(self.facts.param_copy(i)),
+            PNode::Tuple(l) if l.len == 0 => Some(true),
+            PNode::Tuple(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
+            _ => Some(false),
+        };
+        if let Some(ans) = quick {
+            if let Some(cell) = self.copy_memo.get(root.0 as usize) {
+                cell.set(if ans { 2 } else { 1 });
+            }
+            return Ok(ans);
+        }
+        let mut stack = TyStack::new(root, self.alloc.clone());
         let mut steps = 0u32;
         while let Some(t) = stack.pop() {
             steps += 1;
             if steps > MOST_POSITIONS {
                 return self.refuse_at(Construct::Bound, at);
+            }
+            if let Some(cell) = self.copy_memo.get(t.0 as usize) {
+                let v = cell.get();
+                if v == 1 {
+                    if let Some(rc) = self.copy_memo.get(root.0 as usize) {
+                        rc.set(1);
+                    }
+                    return Ok(false);
+                }
+                if v == 2 {
+                    continue;
+                }
             }
             match self.node(t, at)? {
                 PNode::Bool
@@ -545,55 +702,136 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Clone> Lower<'b, 'v, 'c, F, A> {
                 | PNode::ConstValue { .. }
                 | PNode::ConstParam(_)
                 | PNode::Ref(Mutbl::Not, _) => {}
-                PNode::Ref(Mutbl::Mut, _) => return Ok(false),
+                PNode::Ref(Mutbl::Mut, _) => {
+                    if let Some(rc) = self.copy_memo.get(root.0 as usize) {
+                        rc.set(1);
+                    }
+                    return Ok(false);
+                }
                 PNode::Tuple(l) => stack.extend_from_slice(self.list(l, at)?),
                 PNode::Array(i, _) | PNode::Pat(i, _) => stack.push(i),
                 PNode::Adt(k, l) => {
                     if !self.adt_facts(k, at)?.copy {
+                        if let Some(rc) = self.copy_memo.get(root.0 as usize) {
+                            rc.set(1);
+                        }
                         return Ok(false);
                     }
                     stack.extend_from_slice(self.list(l, at)?);
                 }
                 PNode::Param(i) => {
                     if !self.facts.param_copy(i) {
+                        if let Some(rc) = self.copy_memo.get(root.0 as usize) {
+                            rc.set(1);
+                        }
                         return Ok(false);
                     }
                 }
-                _ => return Ok(false),
+                _ => {
+                    if let Some(rc) = self.copy_memo.get(root.0 as usize) {
+                        rc.set(1);
+                    }
+                    return Ok(false);
+                }
             }
+        }
+        if let Some(rc) = self.copy_memo.get(root.0 as usize) {
+            rc.set(2);
         }
         Ok(true)
     }
 
     /// Whether dropping a value of `t` may run code: its `Drop` row is written, and drop
     /// elaboration (D119 P4) removes the ones that do nothing at an instance.
-    pub(crate) fn needs_drop(&self, t: PTy, at: At) -> Result<bool, LowerError> {
-        if self.is_copy(t, at)? {
+    pub(crate) fn needs_drop(&self, root: PTy, at: At) -> Result<bool, LowerError> {
+        if let Some(cell) = self.drop_memo.get(root.0 as usize) {
+            let v = cell.get();
+            if v != 0 {
+                return Ok(v == 2);
+            }
+        }
+        if self.is_copy(root, at)? {
+            if let Some(cell) = self.drop_memo.get(root.0 as usize) {
+                cell.set(1);
+            }
             return Ok(false);
         }
-        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
-        stack.push(t);
+        let quick = match self.node(root, at)? {
+            PNode::Tuple(l) if l.len == 0 => Some(false),
+            PNode::Tuple(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
+            PNode::Param(_)
+            | PNode::Alias { .. }
+            | PNode::Opaque(..)
+            | PNode::Dynamic(_)
+            | PNode::Future(..)
+            | PNode::Coroutine { .. } => Some(true),
+            PNode::Closure { owner, .. } => {
+                if owner != self.body.owner {
+                    Some(true)
+                } else {
+                    None
+                }
+            }
+            _ => Some(false),
+        };
+        if let Some(ans) = quick {
+            if let Some(cell) = self.drop_memo.get(root.0 as usize) {
+                cell.set(if ans { 2 } else { 1 });
+            }
+            return Ok(ans);
+        }
+        let mut stack = TyStack::new(root, self.alloc.clone());
         let mut steps = 0u32;
         while let Some(t) = stack.pop() {
             steps += 1;
             if steps > MOST_POSITIONS {
                 return self.refuse_at(Construct::Bound, at);
             }
+            if let Some(cell) = self.drop_memo.get(t.0 as usize) {
+                let v = cell.get();
+                if v == 2 {
+                    if let Some(rc) = self.drop_memo.get(root.0 as usize) {
+                        rc.set(2);
+                    }
+                    return Ok(true);
+                }
+                if v == 1
+                    && self.copy_memo.get(t.0 as usize).is_some_and(|c| c.get() == 1)
+                {
+                    continue;
+                }
+            }
             match self.node(t, at)? {
                 PNode::Tuple(l) => stack.extend_from_slice(self.list(l, at)?),
                 PNode::Array(i, _) | PNode::Pat(i, _) => stack.push(i),
                 PNode::Adt(k, l) => {
                     if self.adt_facts(k, at)?.needs_drop {
+                        if let Some(rc) = self.drop_memo.get(root.0 as usize) {
+                            rc.set(2);
+                        }
                         return Ok(true);
                     }
                     stack.extend_from_slice(self.list(l, at)?);
                 }
-                PNode::Param(_) | PNode::Alias { .. } | PNode::Opaque(..) | PNode::Dynamic(_) => return Ok(true),
-                PNode::Future(..) | PNode::Coroutine { .. } => return Ok(true),
+                PNode::Param(_) | PNode::Alias { .. } | PNode::Opaque(..) | PNode::Dynamic(_) => {
+                    if let Some(rc) = self.drop_memo.get(root.0 as usize) {
+                        rc.set(2);
+                    }
+                    return Ok(true);
+                }
+                PNode::Future(..) | PNode::Coroutine { .. } => {
+                    if let Some(rc) = self.drop_memo.get(root.0 as usize) {
+                        rc.set(2);
+                    }
+                    return Ok(true);
+                }
                 // A closure of this body holds its by-value captures; one of another body is
                 // not known here, and its `Drop` row stays for elaboration to judge.
                 PNode::Closure { owner, ordinal, .. } => {
                     if owner != self.body.owner {
+                        if let Some(rc) = self.drop_memo.get(root.0 as usize) {
+                            rc.set(2);
+                        }
                         return Ok(true);
                     }
                     let Some(&c) = self.ck.closures.column::<0>().get(ordinal as usize) else {
@@ -614,6 +852,9 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Clone> Lower<'b, 'v, 'c, F, A> {
                 _ => {}
             }
         }
+        if let Some(rc) = self.drop_memo.get(root.0 as usize) {
+            rc.set(1);
+        }
         Ok(false)
     }
 
@@ -625,11 +866,21 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Clone> Lower<'b, 'v, 'c, F, A> {
         })
     }
 
+    /// Records `place` as the binding place for pattern `p` (latest binding wins).
+    #[inline]
+    pub(crate) fn bind(&mut self, p: PatId, place: Place) {
+        let i = p.ix();
+        if i >= self.pat_place.len() {
+            self.pat_place.resize(i + 1, Place(NONE));
+        }
+        self.pat_place[i] = place;
+    }
+
     /// The place binding pattern `p` was given.
     pub(crate) fn bound(&self, p: PatId, e: ExprId) -> Result<Place, LowerError> {
-        match self.binds.iter().rev().find(|(q, _)| *q == p) {
-            Some(&(_, place)) => Ok(place),
-            None => self.refuse(Construct::Malformed, e),
+        match self.pat_place.get(p.ix()) {
+            Some(&place) if place.0 != NONE => Ok(place),
+            _ => self.refuse(Construct::Malformed, e),
         }
     }
 

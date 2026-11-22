@@ -182,6 +182,85 @@ impl Default for Langs {
     }
 }
 
+/// Inline stack capacity for [`SmallTys`]: handles 99%+ of generic argument lists without a heap
+/// allocation, spilling to `Vec::new_in(alloc)` only when `len > 8`.
+const SMALL_TYS: usize = 8;
+
+/// A small buffer of `Ty`s kept inline on the stack up to [`SMALL_TYS`] elements, spilling to
+/// the explicit solver allocator only when larger.
+pub(crate) enum SmallTys<'a> {
+    Inline { buf: [Ty; SMALL_TYS], len: usize },
+    Heap(Vec<Ty, Alloc<'a>>),
+}
+
+impl<'a> SmallTys<'a> {
+    #[inline]
+    pub(crate) fn new_with_len(len: usize, alloc: Alloc<'a>) -> Self {
+        if len <= SMALL_TYS {
+            SmallTys::Inline { buf: [Ty::NONE; SMALL_TYS], len }
+        } else {
+            let mut v = Vec::with_capacity_in(len, alloc);
+            v.resize(len, Ty::NONE);
+            SmallTys::Heap(v)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn from_list_range<T: Tys>(tys: &T, l: List, from: u32, to: u32, alloc: Alloc<'a>) -> Self {
+        let to = to.min(l.len);
+        let len = to.saturating_sub(from) as usize;
+        if len <= SMALL_TYS {
+            let mut buf = [Ty::NONE; SMALL_TYS];
+            for i in 0..len {
+                buf[i] = tys.list_get(l, from + i as u32);
+            }
+            SmallTys::Inline { buf, len }
+        } else {
+            let mut v = Vec::with_capacity_in(len, alloc);
+            for i in from..to {
+                v.push(tys.list_get(l, i));
+            }
+            SmallTys::Heap(v)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn from_list<T: Tys>(tys: &T, l: List, alloc: Alloc<'a>) -> Self {
+        Self::from_list_range(tys, l, 0, l.len, alloc)
+    }
+
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[Ty] {
+        match self {
+            SmallTys::Inline { buf, len } => &buf[..*len],
+            SmallTys::Heap(v) => v.as_slice(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [Ty] {
+        match self {
+            SmallTys::Inline { buf, len } => &mut buf[..*len],
+            SmallTys::Heap(v) => v.as_mut_slice(),
+        }
+    }
+}
+
+impl core::ops::Deref for SmallTys<'_> {
+    type Target = [Ty];
+    #[inline]
+    fn deref(&self) -> &[Ty] {
+        self.as_slice()
+    }
+}
+
+impl core::ops::DerefMut for SmallTys<'_> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [Ty] {
+        self.as_mut_slice()
+    }
+}
+
 /// The context a rule or an assembly stage runs in.
 pub struct Cx<'c, 'a, T: Tys, F: Facts> {
     pub tys: &'c mut T,
@@ -241,6 +320,18 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
         v
     }
 
+    /// The terms of `l`, inline on the stack up to 8 elements.
+    #[inline]
+    pub(crate) fn list_small(&self, l: List) -> SmallTys<'a> {
+        SmallTys::from_list(self.tys, l, self.alloc)
+    }
+
+    /// Elements `from..to` of `l` (clamped to its length), inline on the stack up to 8 elements.
+    #[inline]
+    pub(crate) fn list_range_small(&self, l: List, from: u32, to: u32) -> SmallTys<'a> {
+        SmallTys::from_list_range(self.tys, l, from, to, self.alloc)
+    }
+
     pub fn mk(&mut self, k: TyKind) -> Result<Ty, Stop> {
         Ok(self.tys.mk(k)?)
     }
@@ -259,11 +350,11 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
 
     /// `n` fresh type variables as a list: the arguments of an impl or item being matched.
     pub fn fresh_args(&mut self, n: u32) -> Result<List, Stop> {
-        let mut v: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(n as usize, self.alloc);
-        for _ in 0..n {
-            v.push(self.tys.fresh(VarKind::Ty)?);
+        let mut buf = SmallTys::new_with_len(n as usize, self.alloc);
+        for slot in buf.iter_mut() {
+            *slot = self.tys.fresh(VarKind::Ty)?;
         }
-        self.mk_list(&v)
+        self.mk_list(&buf)
     }
 
     /// Fresh arguments for an impl being matched: a const variable for each const parameter
@@ -287,11 +378,11 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
     pub fn placeholders(&mut self, n: u32) -> Result<List, Stop> {
         *self.universe += 1;
         let u = *self.universe;
-        let mut v: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(n as usize, self.alloc);
-        for i in 0..n {
-            v.push(self.tys.mk(TyKind::Placeholder(u, i))?);
+        let mut buf = SmallTys::new_with_len(n as usize, self.alloc);
+        for (i, slot) in buf.iter_mut().enumerate() {
+            *slot = self.tys.mk(TyKind::Placeholder(u, i as u32))?;
         }
-        self.mk_list(&v)
+        self.mk_list(&buf)
     }
 
     /// Opens the binder immediately outside `t`, leaving nested binders' variables in scope.
@@ -326,14 +417,14 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
 
     /// `l` with every term mapped by `f` (the same list when nothing changed).
     pub fn map_list(&mut self, l: List, f: &mut impl FnMut(&mut Self, Ty) -> Result<Ty, Stop>) -> Result<List, Stop> {
-        let mut v = self.list(l);
+        let mut buf = SmallTys::from_list(self.tys, l, self.alloc);
         let mut same = true;
-        for x in v.iter_mut() {
+        for x in buf.iter_mut() {
             let y = f(self, *x)?;
             same &= y == *x;
             *x = y;
         }
-        if same { Ok(l) } else { self.mk_list(&v) }
+        if same { Ok(l) } else { self.mk_list(&buf) }
     }
 
     /// The portable term `t` of `p` in the arena, `Param(i)` replaced by `args[i]`. A
@@ -341,7 +432,7 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
     #[track_caller]
     pub fn import(&mut self, p: Portable<'_>, t: Ty, args: List) -> Result<Ty, Stop> {
         let at = core::panic::Location::caller();
-        let v = self.list(args);
+        let v = SmallTys::from_list(self.tys, args, self.alloc);
         Ok(fold::import_at(self.tys, self.scratch, p, t, Inst { args: &v, bound: &[] }, at)?)
     }
 
@@ -361,43 +452,63 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
         self.import_pred(p, pred, args).map_err(|e| e.in_head(ParamHead::AliasBound { alias, bound }))
     }
 
-    /// The portable list `l` of `p`, imported as `import` does each element.
+    /// The portable list `l` of `p`, imported as `import` does each element, sharing one memo
+    /// generation across all elements.
     #[track_caller]
     pub fn import_list(&mut self, p: Portable<'_>, l: List, args: List) -> Result<List, Stop> {
         let site = core::panic::Location::caller();
-        let v = self.list(args);
-        let mut out: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(l.len as usize, self.alloc);
-        for i in 0..l.len {
-            let at = (l.start + i) as usize;
-            let Some(&x) = p.lists.get(at) else {
-                return Err(Stop::Error(SolveError::Malformed(crate::error::Malformed::PortableIndex {
-                    node: at as u32,
-                    len: p.lists.len() as u32,
-                })));
-            };
-            out.push(fold::import_at(self.tys, self.scratch, p, x, Inst { args: &v, bound: &[] }, site)?);
-        }
-        self.mk_list(&out)
+        let v = SmallTys::from_list(self.tys, args, self.alloc);
+        Ok(fold::import_list_at(self.tys, self.scratch, p, l, Inst { args: &v, bound: &[] }, site)?)
     }
 
     /// The portable predicate `pred` of `p`, imported.
     #[track_caller]
     pub fn import_pred(&mut self, p: Portable<'_>, pred: Pred, args: List) -> Result<Pred, Stop> {
         let at = core::panic::Location::caller();
-        match pred {
+        if matches!(pred, Pred::Eq { .. }) {
+            return Err(Stop::Error(SolveError::Malformed(crate::error::bad_pred())));
+        }
+        if let Pred::DynCompatible(d) = pred {
+            return Ok(Pred::DynCompatible(d));
+        }
+        let v = SmallTys::from_list(self.tys, args, self.alloc);
+        let inst = Inst { args: &v, bound: &[] };
+        Ok(match pred {
             Pred::Trait { trait_, args: a, polarity } => {
-                Ok(Pred::Trait { trait_, args: self.import_list(p, a, args)?, polarity })
+                Pred::Trait { trait_, args: fold::import_list_at(self.tys, self.scratch, p, a, inst, at)?, polarity }
             }
             Pred::HostEffect { trait_, args: a, constness } => {
-                Ok(Pred::HostEffect { trait_, args: self.import_list(p, a, args)?, constness })
+                Pred::HostEffect { trait_, args: fold::import_list_at(self.tys, self.scratch, p, a, inst, at)?, constness }
             }
-            Pred::ConstHolds { cond, args: a } => Ok(Pred::ConstHolds { cond, args: self.import_list(p, a, args)? }),
-            Pred::Eq { .. } => Err(Stop::Error(SolveError::Malformed(crate::error::bad_pred()))),
-            other => {
-                let v = self.list(args);
-                self.map_pred(other, |cx, t| Ok(fold::import_at(cx.tys, cx.scratch, p, t, Inst { args: &v, bound: &[] }, at)?))
+            Pred::ConstHolds { cond, args: a } => {
+                Pred::ConstHolds { cond, args: fold::import_list_at(self.tys, self.scratch, p, a, inst, at)? }
             }
-        }
+            Pred::WellFormed(t) => Pred::WellFormed(fold::import_at(self.tys, self.scratch, p, t, inst, at)?),
+            Pred::ConstEvaluatable(t) => {
+                Pred::ConstEvaluatable(fold::import_at(self.tys, self.scratch, p, t, inst, at)?)
+            }
+            Pred::Projection { alias: a, term: b }
+            | Pred::NormalizesTo { alias: a, term: b }
+            | Pred::TypeOutlives { ty: a, region: b }
+            | Pred::RegionOutlives { a, b }
+            | Pred::Subtype { a, b }
+            | Pred::Coerce { a, b }
+            | Pred::ConstArgHasType { ct: a, ty: b } => {
+                let mut out = [Ty::NONE; 2];
+                fold::import_slice(self.tys, self.scratch, p, &[a, b], inst, &mut out, at)?;
+                match pred {
+                    Pred::Projection { .. } => Pred::Projection { alias: out[0], term: out[1] },
+                    Pred::NormalizesTo { .. } => Pred::NormalizesTo { alias: out[0], term: out[1] },
+                    Pred::TypeOutlives { .. } => Pred::TypeOutlives { ty: out[0], region: out[1] },
+                    Pred::RegionOutlives { .. } => Pred::RegionOutlives { a: out[0], b: out[1] },
+                    Pred::Subtype { .. } => Pred::Subtype { a: out[0], b: out[1] },
+                    Pred::Coerce { .. } => Pred::Coerce { a: out[0], b: out[1] },
+                    Pred::ConstArgHasType { .. } => Pred::ConstArgHasType { ct: out[0], ty: out[1] },
+                    _ => unreachable!(),
+                }
+            }
+            Pred::DynCompatible(_) | Pred::Eq { .. } => unreachable!(),
+        })
     }
 
     // Relating and adding goals.

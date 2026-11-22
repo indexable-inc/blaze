@@ -275,10 +275,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: CallRule> Lower<'b, 'c, F, A, R>
             Some(r) => self.owner_sig_count(r, e)?,
             None => 0,
         };
-        for (i, x) in ck.captures.column::<0>().iter().enumerate() {
-            if *x != expr {
-                continue;
-            }
+        for &row in self.captures_of(expr) {
+            let i = row as usize;
             let (Some(&pat), Some(&kind)) = (ck.captures.column::<1>().get(i), ck.captures.column::<2>().get(i)) else {
                 return self.refuse(Form::Malformed, e);
             };

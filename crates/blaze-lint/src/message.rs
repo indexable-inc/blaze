@@ -174,6 +174,21 @@ pub fn show_message<P: Put + ?Sized>(rules: &RuleSet, item: &str, findings: &Fin
             out.str("`").str(range).str("`: a lock's reason says `tried = \"published\"`, `\"gathered\"` or `\"claimed\"` ");
             out.str("and a `why` that is not empty, each once, and nothing else (D179)");
         }
+        Template::WorkspaceUnsafe => {
+            out.str("`unsafe` in a crate without `#![blaze::trust(unsafe, reason = \"..\")]` at its root");
+        }
+        Template::SeqCstUnexplained => {
+            out.str("`Ordering::SeqCst` with no `// seqcst: <why>` comment saying why one total order is needed");
+        }
+        Template::RawSync => {
+            out.str("`").str(range).str("` is a raw synchronization primitive: use ").str(instead());
+        }
+        Template::BlockingOnPool => {
+            out.str("`").str(range).str("` blocks or spawns an OS thread on the pool: use ").str(instead());
+        }
+        Template::Transmute => {
+            out.str("`").str(range).str("` reinterprets raw bits with only a size check: use ").str(instead());
+        }
         Template::VariantCount | Template::VariantCountMany => {
             let names = || {
                 args.iter().filter_map(|arg| match arg {

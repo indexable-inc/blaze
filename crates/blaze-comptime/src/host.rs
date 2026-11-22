@@ -114,7 +114,8 @@ pub enum FactKind {
     /// A variable answered: its name, and its value's digest or `None` for unset.
     Env,
     /// A command answered: its request (program, arguments, environment, directory, each
-    /// NUL-ended), and the digest of its status and streams.
+    /// prefixed with its u32 LE byte length so embedded NULs cannot collide), and the digest
+    /// of its status and streams.
     Spawn,
 }
 
@@ -259,21 +260,34 @@ impl<'a> Facts<'a> {
         Facts { text: Vec::new_in(alloc), rows: Vec::new_in(alloc) }
     }
 
-    fn push(&mut self, kind: FactKind, name: &[u8], value: Option<Digest>) {
-        let at = u32::try_from(self.text.len()).unwrap_or(u32::MAX);
+    fn push(&mut self, kind: FactKind, name: &[u8], value: Option<Digest>, limits: blaze_roots::Limits) -> Result<(), Full> {
+        let text = self.text.as_slice();
+        let pos = match self.rows.binary_search_by(|row| {
+            let row_name = &text[wide(row.at)..wide(row.at) + wide(row.len)];
+            (row.kind, row_name, row.value).cmp(&(kind, name, value))
+        }) {
+            Ok(_) => return Ok(()),
+            Err(pos) => pos,
+        };
+        if self.rows.len() >= wide(limits.most_entries) {
+            return Err(Full::Entries { most: limits.most_entries });
+        }
+        let Ok(at) = u32::try_from(self.text.len()) else {
+            return Err(Full::Text { most: limits.most_text });
+        };
+        let Ok(len) = u32::try_from(name.len()) else {
+            return Err(Full::Text { most: limits.most_text });
+        };
+        if at.checked_add(len).is_none_or(|end| end > limits.most_text) {
+            return Err(Full::Text { most: limits.most_text });
+        }
         self.text.extend_from_slice(name);
-        self.rows.push(Row { kind, at, len: u32::try_from(name.len()).unwrap_or(u32::MAX), value });
+        self.rows.insert_shift(pos, Row { kind, at, len, value });
+        Ok(())
     }
 
     fn name(&self, row: &Row<FactKind>) -> &[u8] {
         &self.text[wide(row.at)..wide(row.at) + wide(row.len)]
-    }
-
-    fn settle(&mut self) {
-        let text = self.text.as_slice();
-        let key = |row: &Row<FactKind>| (row.kind, &text[wide(row.at)..wide(row.at) + wide(row.len)], row.value);
-        self.rows.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
-        self.rows.dedup_by(|a, b| key(a) == key(b));
     }
 
     pub fn iter(&self) -> impl Iterator<Item = Fact<'_>> + '_ {
@@ -318,10 +332,21 @@ impl<'a> Findings<'a> {
         Findings { text: Vec::new_in(alloc), rows: Vec::new_in(alloc) }
     }
 
-    fn push(&mut self, call: CallKind, name: &[u8], grant: Grant) {
-        let at = u32::try_from(self.text.len()).unwrap_or(u32::MAX);
+    fn push(&mut self, call: CallKind, name: &[u8], grant: Grant, limits: blaze_roots::Limits) {
+        if self.rows.len() >= wide(limits.most_entries) {
+            return;
+        }
+        let Ok(at) = u32::try_from(self.text.len()) else {
+            return;
+        };
+        let Ok(len) = u32::try_from(name.len()) else {
+            return;
+        };
+        if at.checked_add(len).is_none_or(|end| end > limits.most_text) {
+            return;
+        }
         self.text.extend_from_slice(name);
-        self.rows.push(Row { kind: (call, grant), at, len: u32::try_from(name.len()).unwrap_or(u32::MAX), value: None });
+        self.rows.push(Row { kind: (call, grant), at, len, value: None });
     }
 
     pub fn iter(&self) -> impl Iterator<Item = Finding<'_>> + '_ {
@@ -394,7 +419,10 @@ pub struct Host<'g, 'a, P: Planted<HostPlant> = NoPlant> {
     output: AVec<'a, u8>,
     log: AVec<'a, u8>,
     exit: Option<i32>,
+    /// Output files and directories, kept sorted bytewise by `path`.
     files: AVec<'a, OutFile<'a>>,
+    /// Running sum of `file.data.len() as u64` across `files`.
+    out_bytes: u64,
     random_at: u64,
 }
 
@@ -443,6 +471,7 @@ impl<'g, 'a, P: Planted<HostPlant>> Host<'g, 'a, P> {
             log: Vec::new_in(alloc),
             exit: None,
             files: Vec::new_in(alloc),
+            out_bytes: 0,
             random_at: 0,
         }
     }
@@ -553,11 +582,8 @@ impl<'g, 'a, P: Planted<HostPlant>> Host<'g, 'a, P> {
             state => return Err(Ended::NotEnded { state }),
         }
         let reads = self.reads.under(&self.grants.roots).map_err(Ended::Reads)?;
-        let mut facts = self.facts;
-        facts.settle();
-        let mut files = self.files;
-        files.sort_unstable_by(|a, b| a.path.as_slice().cmp(b.path.as_slice()));
-        Ok(Done { output: self.output, log: self.log, exit: self.exit, files, reads, facts, findings: self.findings })
+        debug_assert!(self.files.windows(2).all(|w| w[0].path.as_slice() < w[1].path.as_slice()));
+        Ok(Done { output: self.output, log: self.log, exit: self.exit, files: self.files, reads, facts: self.facts, findings: self.findings })
     }
 
     fn stop(&mut self, state: HostState) {
@@ -585,7 +611,7 @@ impl<'g, 'a, P: Planted<HostPlant>> Host<'g, 'a, P> {
     }
 
     fn refuse(&mut self, call: CallKind, name: &[u8], grant: Grant, error: SysError) {
-        self.findings.push(call, name, grant);
+        self.findings.push(call, name, grant, self.grants.limits);
         self.reply(Answer::Error(error));
     }
 
@@ -613,14 +639,16 @@ impl<'g, 'a, P: Planted<HostPlant>> Host<'g, 'a, P> {
             Call::Hello { .. } => self.crashed(Crash::Order { got: kind }),
             Call::Look { path, want } => self.look(kind, path, Some(want)),
             Call::TrackPath { path } if is_macro => self.look(kind, path, None),
-            Call::Env { name } => {
-                let value = self.env(kind, name);
-                self.reply(Answer::Value { value });
-            }
+            Call::Env { name } => match self.env(kind, name) {
+                Ok(value) => self.reply(Answer::Value { value }),
+                Err(full) => self.crashed(Crash::Reads(full)),
+            },
             Call::TrackEnv { name, .. } if is_macro => {
                 // The value the run depends on is the grant's, whatever the macro claims.
-                let _ = self.env(kind, name);
-                self.reply(Answer::Done);
+                match self.env(kind, name) {
+                    Ok(_) => self.reply(Answer::Done),
+                    Err(full) => self.crashed(Crash::Reads(full)),
+                }
             }
             Call::EnvAll => {
                 self.spare.clear();
@@ -635,7 +663,9 @@ impl<'g, 'a, P: Planted<HostPlant>> Host<'g, 'a, P> {
                         }
                         EnvValue::Unset => None,
                     };
-                    self.facts.push(FactKind::Env, grant.name, digest);
+                    if let Err(full) = self.facts.push(FactKind::Env, grant.name, digest, grants.limits) {
+                        return self.crashed(Crash::Reads(full));
+                    }
                 }
                 put(&mut self.send, self.wire, &Answer::Words { words: Words(&self.spare) });
                 self.sent();
@@ -730,22 +760,23 @@ impl<'g, 'a, P: Planted<HostPlant>> Host<'g, 'a, P> {
     }
 
     /// The variable `name`'s value as the run sees it, recorded as a fact (or a refusal).
-    fn env(&mut self, call: CallKind, name: &[u8]) -> Option<&'g [u8]> {
+    fn env(&mut self, call: CallKind, name: &[u8]) -> Result<Option<&'g [u8]>, Full> {
+        let limits = self.grants.limits;
         match self.grants.env_of(name) {
             Some(EnvValue::Set(value)) => {
-                self.facts.push(FactKind::Env, name, Some(Digest(blaze_blake3::hash(value))));
-                Some(value)
+                self.facts.push(FactKind::Env, name, Some(Digest(blaze_blake3::hash(value))), limits)?;
+                Ok(Some(value))
             }
             Some(EnvValue::Unset) => {
-                self.facts.push(FactKind::Env, name, None);
-                None
+                self.facts.push(FactKind::Env, name, None, limits)?;
+                Ok(None)
             }
             // Not granted: the real system's answer (unset), the finding printed, and the
             // asked-and-absent fact kept, so granting it later reruns the run (owner, 2026-11-20).
             None => {
-                self.findings.push(call, name, Grant::Env);
-                self.facts.push(FactKind::Env, name, None);
-                None
+                self.findings.push(call, name, Grant::Env, limits);
+                self.facts.push(FactKind::Env, name, None, limits)?;
+                Ok(None)
             }
         }
     }
@@ -777,7 +808,7 @@ impl<'g, 'a, P: Planted<HostPlant>> Host<'g, 'a, P> {
             }
             // The plant: the refusal is recorded, and the path is looked up and answered anyway
             // (kept off the read list, so only the answer shows the bug).
-            self.findings.push(call, path, Grant::Glob { root });
+            self.findings.push(call, path, Grant::Glob { root }, self.grants.limits);
         }
         self.pending = Some(match want {
             Some(want) => Pending::Look { root, want, listed: admitted },
@@ -872,16 +903,19 @@ impl<'g, 'a, P: Planted<HostPlant>> Host<'g, 'a, P> {
         let Some(Pending::Spawn { parts }) = self.pending.take() else {
             return self.crashed(Crash::Order { got: CallKind::Spawn });
         };
-        // The request, each part NUL-ended, is the fact's name; the answer's digest its value.
+        // Each of the four request parts is prefixed with its u32 LE byte length so embedded
+        // NULs in `args`/`env` cannot collide across part boundaries.
         self.spare.clear();
         for (at, len) in parts {
+            self.spare.extend_from_slice(&len.to_le_bytes());
             self.spare.extend_from_slice(&self.scratch[wide(at)..wide(at) + wide(len)]);
-            self.spare.push(0);
         }
         let mut h = blaze_blake3::Hasher::new_derive_key("blaze-comptime 2026-11-20 command answer");
         h.update(&status.to_le_bytes()).update(&len64(stdout.len()).to_le_bytes()).update(stdout).update(stderr);
         let digest = Digest(h.finalize());
-        self.facts.push(FactKind::Spawn, &self.spare, Some(digest));
+        if let Err(full) = self.facts.push(FactKind::Spawn, &self.spare, Some(digest), self.grants.limits) {
+            return self.crashed(Crash::Reads(full));
+        }
         self.reply(Answer::Spawned { status, stdout, stderr });
     }
 
@@ -898,20 +932,27 @@ impl<'g, 'a, P: Planted<HostPlant>> Host<'g, 'a, P> {
                 self.output.extend_from_slice(bytes);
             }
             Stream::Err => {
-                self.log.extend_from_slice(bytes);
                 let most = wide(self.grants.output.most_log);
-                if self.log.len() > most {
-                    let cut = self.log.len() - most;
-                    self.log.drain(..cut);
+                if most == 0 {
+                    self.log.clear();
+                } else if bytes.len() >= most {
+                    self.log.clear();
+                    self.log.extend_from_slice(&bytes[bytes.len() - most..]);
+                } else {
+                    let need = self.log.len().saturating_add(bytes.len());
+                    if need > most {
+                        self.log.drain(..need - most);
+                    }
+                    self.log.extend_from_slice(bytes);
                 }
             }
         }
         self.reply(Answer::Done);
     }
 
-    /// The output root's entry at the relative path in `scratch`.
+    /// The output root's entry at `path`, binary-searched in the sorted `files` table.
     fn find(&self, path: &[u8]) -> Option<usize> {
-        self.files.iter().position(|file| file.path.as_slice() == path)
+        self.files.binary_search_by(|file| file.path.as_slice().cmp(path)).ok()
     }
 
     fn parent_is_dir(&self, path: &[u8]) -> bool {
@@ -934,25 +975,28 @@ impl<'g, 'a, P: Planted<HostPlant>> Host<'g, 'a, P> {
             (Some(_), Want::Read) => Answer::Error(SysError::IsADir),
             (Some(_), Want::Stat) => Answer::Stat { kind: FileKind::Dir, len: 0 },
             (Some(_), Want::List) => {
-                let mut names: AVec<'_, &[u8]> = Vec::new_in(self.alloc);
-                for file in self.files.iter() {
-                    let rest = if path.is_empty() {
-                        Some(file.path.as_slice())
-                    } else {
-                        file.path.strip_prefix(path).and_then(|rest| rest.strip_prefix(b"/"))
-                    };
-                    if let Some(rest) = rest
-                        && !rest.is_empty()
-                        && !rest.contains(&b'/')
-                    {
-                        names.push(rest);
-                    }
-                }
-                names.sort_unstable();
+                // `self.files` is kept sorted bytewise by `path`, so direct children arrive in
+                // sorted order already without allocating or sorting a scratch list.
                 self.spare.clear();
-                for name in names.iter() {
-                    self.spare.extend_from_slice(name);
-                    self.spare.push(0);
+                if path.is_empty() {
+                    for file in self.files.iter() {
+                        let name = file.path.as_slice();
+                        if !name.is_empty() && !name.contains(&b'/') {
+                            self.spare.extend_from_slice(name);
+                            self.spare.push(0);
+                        }
+                    }
+                } else {
+                    let start = self.files.partition_point(|file| cmp_with_slash(file.path.as_slice(), path).is_lt());
+                    for file in &self.files[start..] {
+                        let Some(rest) = file.path.strip_prefix(path).and_then(|rest| rest.strip_prefix(b"/")) else {
+                            break;
+                        };
+                        if !rest.is_empty() && !rest.contains(&b'/') {
+                            self.spare.extend_from_slice(rest);
+                            self.spare.push(0);
+                        }
+                    }
                 }
                 Answer::Listing { names: Words(&self.spare) }
             }
@@ -974,18 +1018,37 @@ impl<'g, 'a, P: Planted<HostPlant>> Host<'g, 'a, P> {
         let at = self.find(&self.scratch);
         let result = match op {
             OutOp::Write { at: offset, bytes } => {
-                let end = offset.saturating_add(len64(bytes.len()));
-                self.sized(at, end, caps).map(|at| {
+                let Some(end) = offset.checked_add(len64(bytes.len())) else {
+                    return self.reply(Answer::Error(SysError::NoSpace));
+                };
+                let Ok(end_usize) = usize::try_from(end) else {
+                    return self.reply(Answer::Error(SysError::NoSpace));
+                };
+                self.prepare_write(at, end, true, caps).map(|at| {
                     let data = &mut self.files[at].data;
-                    if len64(data.len()) < end {
-                        data.resize(usize::try_from(end).unwrap_or(usize::MAX), 0);
+                    if data.len() < end_usize {
+                        let growth = len64(end_usize - data.len());
+                        data.resize(end_usize, 0);
+                        self.out_bytes += growth;
                     }
                     let from = usize::try_from(offset).unwrap_or(usize::MAX);
                     data[from..from + bytes.len()].copy_from_slice(bytes);
                 })
             }
             OutOp::SetLen { len } => {
-                self.sized(at, len, caps).map(|at| self.files[at].data.resize(usize::try_from(len).unwrap_or(usize::MAX), 0))
+                let Ok(len_usize) = usize::try_from(len) else {
+                    return self.reply(Answer::Error(SysError::NoSpace));
+                };
+                self.prepare_write(at, len, false, caps).map(|at| {
+                    let data = &mut self.files[at].data;
+                    let cur = len64(data.len());
+                    data.resize(len_usize, 0);
+                    if len >= cur {
+                        self.out_bytes += len - cur;
+                    } else {
+                        self.out_bytes -= cur - len;
+                    }
+                })
             }
             OutOp::CreateDir => match at {
                 Some(_) => Err(SysError::Exists),
@@ -996,7 +1059,8 @@ impl<'g, 'a, P: Planted<HostPlant>> Host<'g, 'a, P> {
                 None => Err(SysError::NotFound),
                 Some(at) if self.files[at].dir && self.has_children(at) => Err(SysError::NotEmpty),
                 Some(at) => {
-                    self.files.remove_shift(at);
+                    let removed = self.files.remove_shift(at);
+                    self.out_bytes -= len64(removed.data.len());
                     Ok(())
                 }
             },
@@ -1010,23 +1074,38 @@ impl<'g, 'a, P: Planted<HostPlant>> Host<'g, 'a, P> {
 
     fn has_children(&self, at: usize) -> bool {
         let dir = self.files[at].path.as_slice();
-        self.files.iter().any(|file| file.path.strip_prefix(dir).is_some_and(|rest| rest.first() == Some(&b'/')))
+        let start = self.files.partition_point(|file| cmp_with_slash(file.path.as_slice(), dir).is_lt());
+        self.files.get(start).is_some_and(|file| file.path.strip_prefix(dir).is_some_and(|rest| rest.first() == Some(&b'/')))
     }
 
-    /// The file at `at`, made if absent, may grow to `end` bytes within the caps.
-    fn sized(&mut self, at: Option<usize>, end: u64, caps: crate::grant::OutputCaps) -> Result<usize, SysError> {
-        let at = match at {
-            Some(at) if self.files[at].dir => return Err(SysError::IsADir),
-            Some(at) => at,
-            None if self.scratch.is_empty() => return Err(SysError::IsADir),
-            None => self.create(false, caps)?,
-        };
-        let others: u64 = self.files.iter().enumerate().filter(|(i, _)| *i != at).map(|(_, f)| len64(f.data.len())).sum();
-        let mine = end.max(len64(self.files[at].data.len()));
-        if others.saturating_add(mine) > caps.most_file_bytes {
-            return Err(SysError::NoSpace);
+    /// Checks caps and returns the file at `at` (creating it only once every cap passes, so
+    /// `NoSpace` never leaks a ghost 0-byte file).
+    fn prepare_write(&mut self, at: Option<usize>, target_len: u64, grow_only: bool, caps: crate::grant::OutputCaps) -> Result<usize, SysError> {
+        match at {
+            Some(at) if self.files[at].dir => Err(SysError::IsADir),
+            Some(at) => {
+                let cur = len64(self.files[at].data.len());
+                let next = if grow_only { target_len.max(cur) } else { target_len };
+                let growth = next.saturating_sub(cur);
+                if self.out_bytes.checked_add(growth).is_none_or(|total| total > caps.most_file_bytes) {
+                    return Err(SysError::NoSpace);
+                }
+                Ok(at)
+            }
+            None if self.scratch.is_empty() => Err(SysError::IsADir),
+            None => {
+                if !self.parent_is_dir(&self.scratch) {
+                    return Err(SysError::NotFound);
+                }
+                if len64(self.files.len()) >= u64::from(caps.most_files) {
+                    return Err(SysError::NoSpace);
+                }
+                if self.out_bytes.checked_add(target_len).is_none_or(|total| total > caps.most_file_bytes) {
+                    return Err(SysError::NoSpace);
+                }
+                self.insert_sorted(false)
+            }
         }
-        Ok(at)
     }
 
     fn create(&mut self, dir: bool, caps: crate::grant::OutputCaps) -> Result<usize, SysError> {
@@ -1036,21 +1115,36 @@ impl<'g, 'a, P: Planted<HostPlant>> Host<'g, 'a, P> {
         if len64(self.files.len()) >= u64::from(caps.most_files) {
             return Err(SysError::NoSpace);
         }
+        self.insert_sorted(dir)
+    }
+
+    fn insert_sorted(&mut self, dir: bool) -> Result<usize, SysError> {
+        let pos = match self.files.binary_search_by(|file| file.path.as_slice().cmp(&self.scratch)) {
+            Ok(_) => return Err(SysError::Exists),
+            Err(pos) => pos,
+        };
         let mut path = Vec::new_in(self.alloc);
         path.extend_from_slice(&self.scratch);
-        self.files.push(OutFile { path, data: Vec::new_in(self.alloc), dir });
-        Ok(self.files.len() - 1)
+        self.files.insert_shift(pos, OutFile { path, data: Vec::new_in(self.alloc), dir });
+        Ok(pos)
     }
 
     fn rename(&mut self, at: Option<usize>, to: &[u8]) -> Result<(), SysError> {
-        let Some(at) = at else { return Err(SysError::NotFound) };
         let output = self.grants.roots.output();
-        let mut from = Vec::new_in(self.alloc);
-        from.extend_from_slice(&self.scratch);
         match self.grants.mounts.resolve(to, self.grants.limits.most_path, &mut self.spare) {
             Ok(root) if Some(root) == output => {}
-            _ => return Err(SysError::ReadOnly),
+            Ok(_) | Err(blaze_roots::Unmounted::Outside | blaze_roots::Unmounted::NoCwd) => {
+                self.findings.push(CallKind::Rename, to, Grant::Write, self.grants.limits);
+                return Err(SysError::ReadOnly);
+            }
+            Err(blaze_roots::Unmounted::Path(_)) => {
+                self.findings.push(CallKind::Rename, to, Grant::Unaddressable, self.grants.limits);
+                return Err(SysError::NotFound);
+            }
         }
+        let Some(at) = at else { return Err(SysError::NotFound) };
+        let mut from = Vec::new_in(self.alloc);
+        from.extend_from_slice(&self.scratch);
         // Into itself (a directory moved beneath itself) or onto the root: refused, as `rename(2)`.
         if self.spare.is_empty() || (self.spare.starts_with(from.as_slice()) && self.spare.get(from.len()) == Some(&b'/')) {
             return Err(SysError::Invalid);
@@ -1067,7 +1161,8 @@ impl<'g, 'a, P: Planted<HostPlant>> Host<'g, 'a, P> {
             if self.files[existing].dir != self.files[at].dir || (self.files[existing].dir && self.has_children(existing)) {
                 return Err(SysError::Exists);
             }
-            self.files.remove_shift(existing);
+            let removed = self.files.remove_shift(existing);
+            self.out_bytes -= len64(removed.data.len());
         }
         // The entry and, for a directory, everything beneath it, moved to the new prefix.
         for file in self.files.iter_mut() {
@@ -1080,7 +1175,23 @@ impl<'g, 'a, P: Planted<HostPlant>> Host<'g, 'a, P> {
             moved.extend_from_slice(rest);
             file.path = moved;
         }
+        self.files.sort_unstable_by(|a, b| a.path.as_slice().cmp(b.path.as_slice()));
         Ok(())
+    }
+}
+
+/// Compares `entry` against the virtual prefix `dir + "/"` without allocating.
+fn cmp_with_slash(entry: &[u8], dir: &[u8]) -> core::cmp::Ordering {
+    let n = entry.len().min(dir.len());
+    match entry[..n].cmp(&dir[..n]) {
+        core::cmp::Ordering::Equal => {
+            if entry.len() <= dir.len() {
+                core::cmp::Ordering::Less
+            } else {
+                entry[dir.len()].cmp(&b'/')
+            }
+        }
+        ord => ord,
     }
 }
 

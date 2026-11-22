@@ -96,6 +96,9 @@ pub struct Counts {
     pub image_redone: u64,
     /// Records of imaged runs queued for the driver to file.
     pub image_filed: u64,
+    /// Imaged runs recomputed after a read digest moved whose serialized output bytes matched the
+    /// previous record (early-cutoff backdating: redundant re-filing skipped).
+    pub image_backdated: u64,
     /// Runs of imaged queries not filed because their list held an untracked read.
     pub image_untracked: u64,
     /// Values of an `owns` query's fixpoint kept as a round's provisional value: the initial
@@ -122,6 +125,7 @@ impl Counts {
         self.image_served += other.image_served;
         self.image_redone += other.image_redone;
         self.image_filed += other.image_filed;
+        self.image_backdated += other.image_backdated;
         self.image_untracked += other.image_untracked;
         self.owned_rounds += other.owned_rounds;
         self.rows_replayed += other.rows_replayed;
@@ -143,6 +147,7 @@ thread_local! {
             image_served: 0,
             image_redone: 0,
             image_filed: 0,
+            image_backdated: 0,
             image_untracked: 0,
             owned_rounds: 0,
             rows_replayed: 0,
@@ -213,6 +218,10 @@ pub(crate) fn image_redo() {
 
 pub(crate) fn image_filed() {
     bump(|it| it.image_filed += 1);
+}
+
+pub(crate) fn image_backdated() {
+    bump(|it| it.image_backdated += 1);
 }
 
 pub(crate) fn image_untracked() {

@@ -301,6 +301,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::registry_spread",
             "blaze::same_behaviour",
             "blaze::workspace_unsafe",
+            "blaze::raw_sync",
         ],
     ),
     // The cross-configuration reachability lints (docs/v2/plan/design/multiconfig-check.md), also in

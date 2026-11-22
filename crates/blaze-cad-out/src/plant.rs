@@ -40,3 +40,39 @@ pub enum SummaryPlant {
 }
 
 impl Plants for SummaryPlant {}
+
+/// The binary STL writer's planted bugs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StlPlant {
+    None,
+    /// The 80-byte header starts with `"solid "`, breaking ASCII/binary STL auto-detectors.
+    SolidHeader,
+    /// The 4-byte triangle count under-reports the number of facets by one.
+    WrongTriCount,
+    /// The first facet's stored normal is negated (opposing its right-hand winding).
+    FlipNormal,
+    /// The first facet's vertices 1 and 2 are swapped (breaking outward winding).
+    FlipWinding,
+    /// The first zero float emitted is written as `-0.0` instead of canonical `+0.0`.
+    NegativeZero,
+}
+
+impl Plants for StlPlant {}
+
+/// The 2D vector SVG cross-section writer's planted bugs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SvgPlant {
+    None,
+    /// Saddle cases 5 and 10 invert the cell-centre asymptotic decider.
+    WrongSaddle,
+    /// Edge crossings use cell midpoints (`t = 0.5`) instead of linear zero-crossing interpolation.
+    WrongInterp,
+    /// Closed contour subpaths omit the closing `Z` command.
+    DropZClose,
+    /// Contour Y coordinates are not negated from Y-up into SVG Y-down.
+    NoYFlip,
+    /// The filled cross-section silhouette omits `fill-rule="evenodd"`.
+    OmitEvenOdd,
+}
+
+impl Plants for SvgPlant {}

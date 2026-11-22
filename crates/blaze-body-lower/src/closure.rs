@@ -139,7 +139,7 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
                 CaptureKind::ByValue => f,
                 _ => self.b.project(f, Proj::Deref),
             };
-            self.binds.push((p, place));
+            self.bind(p, place);
         }
         let env_drops = kind == ClosureKind::FnOnce && self.needs_drop(cty, at)?;
         self.sched.push(Entry { local: env, place: env_place, drops: env_drops, storage: false, cleanup: None });
@@ -147,7 +147,7 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
             let drops = self.needs_drop(ty, At::Pat(p))?;
             self.sched.push(Entry { local, place, drops, storage: false, cleanup: None });
             if self.simple_bind(p)? {
-                self.binds.push((p, place));
+                self.bind(p, place);
                 continue;
             }
             let mut out = Vec::new_in(self.alloc.clone());

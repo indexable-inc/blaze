@@ -346,7 +346,7 @@ fn build_argv(layer: &mut Layer) {
 }
 
 fn build_environ(layer: &mut Layer) {
-    if !layer.environ_word.is_null() {
+    if !layer.environ_word.is_null() && layer.sys.environ_words().is_some() {
         return;
     }
     let _ = ask(layer, |sys| sys.environ());
@@ -485,7 +485,7 @@ table_fns! {
     "pipe" => c_pipe, "pipe2" => c_pipe2, "poll" => c_poll,
     "posix_spawn" => posix_spawn, "posix_spawnp" => posix_spawn,
     "posix_spawn_file_actions_addchdir_np" => fa_chdir, "posix_spawn_file_actions_adddup2" => fa_dup2,
-    "posix_spawn_file_actions_destroy" => zero1, "posix_spawn_file_actions_init" => fa_init,
+    "posix_spawn_file_actions_destroy" => fa_destroy, "posix_spawn_file_actions_init" => fa_init,
     "posix_spawnattr_destroy" => zero1, "posix_spawnattr_init" => zero1, "posix_spawnattr_setflags" => zero2,
     "posix_spawnattr_setpgroup" => zero2, "posix_spawnattr_setsigdefault" => zero2,
     "prctl" => prctl, "pread" => c_pread, "pread64" => c_pread, "preadv" => c_preadv, "preadv64" => c_preadv,
@@ -837,23 +837,38 @@ unsafe extern "C" fn c_stat(path: *const c_char, st: *mut c_void) -> c_int {
     // SAFETY: as fstatat.
     unsafe { fstatat(c(|layer| consts(os(layer)).at_fdcwd), path, st, 0) }
 }
-unsafe extern "C" fn fstatat(at: c_int, path: *const c_char, st: *mut c_void, _: c_int) -> c_int {
+const LINUX_AT_EMPTY_PATH: c_int = 0x1000;
+
+unsafe extern "C" fn fstatat(at: c_int, path: *const c_char, st: *mut c_void, flags: c_int) -> c_int {
     // SAFETY: a C string.
     let path = unsafe { bytes(path) };
     c(|layer| {
-        // `AT_EMPTY_PATH` (Linux) with an empty path: the descriptor itself.
-        if path.is_empty() && at >= 0 {
-            return match layer.sys.fstat(Fd(at)) {
-                Ok(stat) => {
-                    write_stat(os(layer), st.cast(), stat);
-                    0
-                }
-                Err(errno) => int!(layer,Err(errno)),
-            };
+        let os = os(layer);
+        // `AT_EMPTY_PATH` (Linux) with an empty path: the descriptor itself (or cwd for AT_FDCWD).
+        if path.is_empty() && os == Os::Linux && flags & LINUX_AT_EMPTY_PATH != 0 {
+            if at >= 0 {
+                return match layer.sys.fstat(Fd(at)) {
+                    Ok(stat) => {
+                        write_stat(os, st.cast(), stat);
+                        0
+                    }
+                    Err(errno) => int!(layer, Err(errno)),
+                };
+            }
+            if at == consts(os).at_fdcwd {
+                return match ask(layer, |sys| sys.stat(at, b".")) {
+                    Ok(Ret::Stat(stat)) => {
+                        write_stat(os, st.cast(), stat);
+                        0
+                    }
+                    Ok(_) => int!(layer, Err(Errno::Io)),
+                    Err(errno) => int!(layer, Err(errno)),
+                };
+            }
         }
         match ask(layer, |sys| sys.stat(at, path)) {
             Ok(Ret::Stat(stat)) => {
-                write_stat(os(layer), st.cast(), stat);
+                write_stat(os, st.cast(), stat);
                 0
             }
             Ok(_) => int!(layer,Err(Errno::Io)),
@@ -1137,7 +1152,12 @@ unsafe extern "C" fn c_getenv(name: *const c_char) -> *const c_char {
 unsafe extern "C" fn c_setenv(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int {
     // SAFETY: C strings.
     let (name, value) = unsafe { (bytes(name), bytes(value)) };
-    c(|layer| int!(layer,layer.sys.setenv(name, Some(value), overwrite != 0).map(|()| 0)))
+    c(|layer| {
+        if overwrite == 0 && layer.sys.env_needs_host_check(name) {
+            let _ = ask(layer, |sys| sys.getenv(name));
+        }
+        int!(layer, layer.sys.setenv(name, Some(value), overwrite != 0).map(|()| 0))
+    })
 }
 unsafe extern "C" fn c_unsetenv(name: *const c_char) -> c_int {
     // SAFETY: a C string.
@@ -1373,7 +1393,7 @@ unsafe extern "C" fn c_poll(fds: *mut PollFd, count: u32, timeout: c_int) -> c_i
             // Nothing will ever be ready: one thread, no outside writer.
             layer.transport.fault(ChildFault::Sys(Fault::Deadlock));
         }
-        let _ = ask(layer, |sys| sys.sleep(timeout as u64 * 1_000_000));
+        let _ = ask(layer, |sys| sys.sleep((timeout as u64).saturating_mul(1_000_000)));
         0
     })
 }
@@ -1413,6 +1433,19 @@ unsafe extern "C" fn fa_chdir(actions: *mut u64, path: *const c_char) -> c_int {
             Ok(()) => 0,
             Err(errno) => errno.code(os(layer)),
         },
+        None => Errno::Inval.code(os(layer)),
+    })
+}
+unsafe extern "C" fn fa_destroy(actions: *mut u64) -> c_int {
+    c(|layer| match handle(actions) {
+        Some(h) => {
+            // SAFETY: the caller's `posix_spawn_file_actions_t`, cleared so double-destroy fails.
+            unsafe { actions.write_unaligned(0) };
+            match layer.sys.actions_destroy(h) {
+                Ok(()) => 0,
+                Err(errno) => errno.code(os(layer)),
+            }
+        }
         None => Errno::Inval.code(os(layer)),
     })
 }
@@ -1517,15 +1550,28 @@ unsafe extern "C" fn sigaction(_: c_int, _: *const c_void, old: *mut u8) -> c_in
 unsafe extern "C" fn signal(_: c_int, _: usize) -> usize {
     0
 }
+/// Writes `SS_DISABLE` into a `stack_t` (24 bytes on both macOS arm64 and Linux arm64):
+/// - macOS arm64: `{ ss_sp: 0..8, ss_size: 8..16, ss_flags: 16..20 }` (`SS_DISABLE = 4`)
+/// - Linux arm64: `{ ss_sp: 0..8, ss_flags: 8..12, ss_size: 16..24 }` (`SS_DISABLE = 2`)
+///
+/// SAFETY: `old` points to 24 writable bytes of the caller's `stack_t`.
+unsafe fn write_sigaltstack_old(os: Os, old: *mut u8) {
+    // SAFETY: caller guarantees 24 writable bytes at `old`.
+    unsafe {
+        core::ptr::write_bytes(old, 0, 24);
+        let (offset, disable) = match os {
+            Os::Mac => (16, 4),
+            Os::Linux => (8, 2),
+        };
+        old.add(offset).cast::<c_int>().write_unaligned(disable);
+    }
+}
+
 unsafe extern "C" fn sigaltstack(_: *const c_void, old: *mut u8) -> c_int {
     c(|layer| {
         if !old.is_null() {
-            // SAFETY: the caller's `stack_t` (24 bytes on both): `ss_flags` SS_DISABLE.
-            unsafe {
-                core::ptr::write_bytes(old, 0, 24);
-                let disable = if os(layer) == Os::Mac { 4 } else { 2 };
-                old.add(if os(layer) == Os::Mac { 12 } else { 8 }).cast::<c_int>().write_unaligned(disable);
-            }
+            // SAFETY: the caller's `stack_t` (24 bytes on both).
+            unsafe { write_sigaltstack_old(os(layer), old) };
         }
         0
     })
@@ -1653,7 +1699,7 @@ unsafe extern "C" fn syscall(number: c_long, a1: u64, a2: u64, a3: u64, a4: u64,
                     }
                     // SAFETY: the caller's timespec.
                     let ts = unsafe { (a4 as *const Timespec).read() };
-                    let ns = (ts.sec.max(0) as u64) * 1_000_000_000 + ts.nsec.max(0) as u64;
+                    let ns = futex_timeout_ns(ts);
                     let _ = ask(layer, |sys| sys.sleep(ns));
                     // ETIMEDOUT (110).
                     // SAFETY: `Real::errno`.
@@ -1671,8 +1717,15 @@ unsafe extern "C" fn syscall(number: c_long, a1: u64, a2: u64, a3: u64, a4: u64,
     })
 }
 
+fn futex_timeout_ns(ts: Timespec) -> u64 {
+    (ts.sec.max(0) as u64).saturating_mul(1_000_000_000).saturating_add(ts.nsec.max(0) as u64)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{Timespec, futex_timeout_ns, write_sigaltstack_old};
+    use crate::errno::Os;
+
     /// Every row the table binds to a function here has one, and no function is bound to a
     /// name the table lacks.
     #[test]
@@ -1681,5 +1734,29 @@ mod tests {
             let needs = !matches!(row.how, crate::How::Own | crate::How::Data);
             assert_eq!(needs, super::function(row.c).is_some(), "{}: {:?}", row.c, row.how);
         }
+    }
+
+    #[test]
+    fn sigaltstack_ss_flags_offset_matches_os_abi() {
+        let mut mac = [0xffu8; 24];
+        // SAFETY: `mac` is a 24-byte writable buffer.
+        unsafe { write_sigaltstack_old(Os::Mac, mac.as_mut_ptr()) };
+        assert_eq!(&mac[0..16], &[0u8; 16], "macOS ss_sp and ss_size must be zeroed");
+        assert_eq!(i32::from_ne_bytes(mac[16..20].try_into().unwrap()), 4, "macOS ss_flags at offset 16 must be SS_DISABLE (4)");
+        assert_eq!(&mac[20..24], &[0u8; 4]);
+
+        let mut linux = [0xffu8; 24];
+        // SAFETY: `linux` is a 24-byte writable buffer.
+        unsafe { write_sigaltstack_old(Os::Linux, linux.as_mut_ptr()) };
+        assert_eq!(&linux[0..8], &[0u8; 8], "Linux ss_sp must be zeroed");
+        assert_eq!(i32::from_ne_bytes(linux[8..12].try_into().unwrap()), 2, "Linux ss_flags at offset 8 must be SS_DISABLE (2)");
+        assert_eq!(&linux[12..24], &[0u8; 12]);
+    }
+
+    #[test]
+    fn futex_timeout_saturates_instead_of_overflowing() {
+        assert_eq!(futex_timeout_ns(Timespec { sec: i64::MAX, nsec: 999_999_999 }), u64::MAX);
+        assert_eq!(futex_timeout_ns(Timespec { sec: -5, nsec: -10 }), 0);
+        assert_eq!(futex_timeout_ns(Timespec { sec: 2, nsec: 500 }), 2_000_000_500);
     }
 }

@@ -300,6 +300,9 @@ fn put_condition(page: &mut AVec<'_, u8>, condition: &Condition) {
 /// is the order its writer keeps the list in.
 pub trait Entry: Copy + Ord + 'static {
     const BYTES: usize;
+    /// Whether raw wire-byte lexicographical order equals [`Ord`], allowing [`PageView::open`] to
+    /// validate list sortedness directly on byte slices without per-entry struct decoding.
+    const RAW_ORD: bool = false;
     /// The entry `bytes` hold ([`Entry::BYTES`] of them), which [`PageView::open`] checked.
     fn read(bytes: &[u8]) -> Self;
     fn write(&self, page: &mut AVec<'_, u8>);
@@ -309,6 +312,7 @@ pub trait Entry: Copy + Ord + 'static {
 
 impl Entry for Name {
     const BYTES: usize = NAME_BYTES;
+    const RAW_ORD: bool = true;
     fn read(bytes: &[u8]) -> Name {
         name_at(bytes, 0)
     }
@@ -322,6 +326,7 @@ impl Entry for Name {
 
 impl Entry for (Name, ContentId) {
     const BYTES: usize = NAME_BYTES + 32;
+    const RAW_ORD: bool = true;
     fn read(bytes: &[u8]) -> (Name, ContentId) {
         (name_at(bytes, 0), id_at(bytes, NAME_BYTES))
     }
@@ -336,6 +341,7 @@ impl Entry for (Name, ContentId) {
 
 impl Entry for CellRead {
     const BYTES: usize = CELL_ENTRY;
+    const RAW_ORD: bool = true;
     fn read(bytes: &[u8]) -> CellRead {
         CellRead { name: name_at(bytes, 0), cell: cell_at(bytes, NAME_BYTES), saw: id_at(bytes, NAME_BYTES + CELL_BYTES) }
     }
@@ -351,6 +357,7 @@ impl Entry for CellRead {
 
 impl Entry for CellReader {
     const BYTES: usize = CELL_ENTRY;
+    const RAW_ORD: bool = true;
     fn read(bytes: &[u8]) -> CellReader {
         CellReader { reader: name_at(bytes, 0), cell: cell_at(bytes, NAME_BYTES), saw: id_at(bytes, NAME_BYTES + CELL_BYTES) }
     }
@@ -544,7 +551,7 @@ impl<'p> PageView<'p> {
         }
         let page = PageView { bytes, shape: Shape { rows, tails } };
         let mut claimed = [0usize; LISTS];
-        let mut last: Option<Name> = None;
+        let mut last: Option<&[u8]> = None;
         for row in 0..rows {
             let r = page.row_bytes(row);
             let at_row = row as u32;
@@ -553,8 +560,9 @@ impl<'p> PageView<'p> {
                     return Err(PageError::Kind { row: at_row, byte: r[at] });
                 }
             }
-            let name = name_at(r, 0);
-            if last.is_some_and(|last| last >= name) {
+            // `Name` wire order (`[kind as u8, subject[0..32]]`) equals `Name::Ord`.
+            let name = &r[..NAME_BYTES];
+            if last.is_some_and(|prev| prev >= name) {
                 return Err(PageError::Unsorted { row: at_row });
             }
             last = Some(name);
@@ -619,6 +627,12 @@ impl<'p> PageView<'p> {
         &self.bytes[at..at + ROW_BYTES]
     }
 
+    #[inline]
+    fn row_name_bytes(&self, row: usize) -> &'p [u8] {
+        let at = HEAD + row * ROW_BYTES;
+        &self.bytes[at..at + NAME_BYTES]
+    }
+
     /// The `row`-th row of the table, in name order.
     pub fn row_at(&self, row: usize) -> RowView<'p> {
         assert!(row < self.shape.rows, "row {row} of a page of {}", self.shape.rows);
@@ -631,11 +645,111 @@ impl<'p> PageView<'p> {
         (0..page.shape.rows).map(move |row| RowView { page, row })
     }
 
-    /// `name`'s row: a binary search of the table in place. Names sort by kind first, so this is
-    /// a search within the kind's run of rows.
-    // Port: the interpolation search over the digest bytes another lane is making shared.
+    /// `name`'s row: interpolation search over the uniform BLAKE3 subject prefix within the
+    /// matching kind (O(log log N)), falling back cleanly to binary search when narrow, across
+    /// kind boundaries, or on uneven distributions (O(log N) worst case).
     pub fn row(&self, name: Name) -> Option<RowView<'p>> {
-        search(self.shape.rows, |row| name_at(self.row_bytes(row), 0).cmp(&name)).ok().map(|row| RowView { page: *self, row })
+        let mut target = [0u8; NAME_BYTES];
+        target[0] = name.kind as u8;
+        target[1..].copy_from_slice(&name.subject.0);
+        self.find_row_counted(&target, None).map(|row| RowView { page: *self, row })
+    }
+
+    /// Finds `target` in the sorted row table; if `probes` is `Some`, counts row comparisons.
+    fn find_row_counted(&self, target: &[u8; NAME_BYTES], mut probes: Option<&mut usize>) -> Option<usize> {
+        #[inline]
+        fn prefix64(bytes: &[u8]) -> u64 {
+            u64::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8]])
+        }
+
+        let n = self.shape.rows;
+        if n == 0 {
+            return None;
+        }
+        let mut bump = || {
+            if let Some(p) = probes.as_deref_mut() {
+                *p += 1;
+            }
+        };
+
+        let mut lo = 0usize;
+        let mut hi = n - 1;
+        let mut lo_b = self.row_name_bytes(lo);
+        bump();
+        match lo_b.cmp(target.as_slice()) {
+            core::cmp::Ordering::Equal => return Some(lo),
+            core::cmp::Ordering::Greater => return None,
+            core::cmp::Ordering::Less => {}
+        }
+        if lo == hi {
+            return None;
+        }
+        let mut hi_b = self.row_name_bytes(hi);
+        bump();
+        match hi_b.cmp(target.as_slice()) {
+            core::cmp::Ordering::Equal => return Some(hi),
+            core::cmp::Ordering::Less => return None,
+            core::cmp::Ordering::Greater => {}
+        }
+
+        let target_p = prefix64(target);
+        let mut stall = 0u8;
+        while hi - lo > 1 {
+            let span = hi - lo;
+            if span <= 4 {
+                // Tight binary search on the exclusive interior `(lo + 1)..hi`.
+                let mut left = lo + 1;
+                let mut right = hi;
+                while left < right {
+                    let mid = left + (right - left) / 2;
+                    bump();
+                    match self.row_name_bytes(mid).cmp(target.as_slice()) {
+                        core::cmp::Ordering::Less => left = mid + 1,
+                        core::cmp::Ordering::Greater => right = mid,
+                        core::cmp::Ordering::Equal => return Some(mid),
+                    }
+                }
+                return None;
+            }
+
+            let probe = if stall < 3 && lo_b[0] == hi_b[0] {
+                let lo_p = prefix64(lo_b);
+                let hi_p = prefix64(hi_b);
+                if hi_p > lo_p {
+                    // `lo_b < target < hi_b` with equal kind guarantees `lo_p <= target_p <= hi_p`.
+                    let den = u128::from(hi_p - lo_p);
+                    let offset = ((u128::from(target_p - lo_p) * span as u128 + den / 2) / den) as usize;
+                    (lo + offset).clamp(lo + 1, hi - 1)
+                } else {
+                    lo + span / 2
+                }
+            } else {
+                stall = 0;
+                lo + span / 2
+            };
+
+            let p_b = self.row_name_bytes(probe);
+            bump();
+            match p_b.cmp(target.as_slice()) {
+                core::cmp::Ordering::Equal => return Some(probe),
+                core::cmp::Ordering::Less => {
+                    lo = probe;
+                    lo_b = p_b;
+                }
+                core::cmp::Ordering::Greater => {
+                    hi = probe;
+                    hi_b = p_b;
+                }
+            }
+
+            let new_span = hi - lo;
+            if new_span > span / 2 {
+                stall = stall.saturating_add(1);
+            } else {
+                stall = 0;
+            }
+        }
+        None
     }
 }
 
@@ -647,7 +761,21 @@ enum ListWhy {
 }
 
 /// Each entry of `list` checked ([`Entry::check`]) before it is decoded, and the list in order.
+/// When `E::RAW_ORD` holds, compares raw wire byte slices directly without decoding each entry.
 fn check_list<E: Entry>(list: Entries<'_, E>) -> Result<(), ListWhy> {
+    if E::RAW_ORD {
+        let mut last: Option<&[u8]> = None;
+        for bytes in list.raw.chunks_exact(E::BYTES) {
+            if !E::check(bytes) {
+                return Err(ListWhy::Entry);
+            }
+            if last.is_some_and(|prev| prev > bytes) {
+                return Err(ListWhy::Unsorted);
+            }
+            last = Some(bytes);
+        }
+        return Ok(());
+    }
     let mut last: Option<E> = None;
     for bytes in list.raw.chunks_exact(E::BYTES) {
         if !E::check(bytes) {
@@ -930,32 +1058,6 @@ impl<'r> PageRow<'r, '_> {
         let held = self.base.map_or(List::Held(&[]), |base| base.cell_readers());
         merge_each(held, self.cell_readers.iter().map(|(_, entry, add)| (*entry, *add)), each);
     }
-
-    /// Whether it is written: a watch row no one reads any more, whole or by cell, goes.
-    pub(crate) fn kept(&self) -> bool {
-        if self.base.is_some_and(|base| !base.watching()) {
-            return true;
-        }
-        let mut any = false;
-        self.each_reader(|_| any = true);
-        if !any {
-            self.each_cell_reader(|_| any = true);
-        }
-        any
-    }
-
-    fn counts(&self) -> [usize; LISTS] {
-        let mut counts = [0; LISTS];
-        if let Some(base) = self.base {
-            counts[READS] = base.reads().len();
-            counts[CELLS] = base.cells().len();
-            counts[PARTS] = base.parts().len();
-            counts[CONDS] = usize::from(base.cond().is_some());
-        }
-        self.each_reader(|_| counts[READERS] += 1);
-        self.each_cell_reader(|_| counts[CELL_READERS] += 1);
-        counts
-    }
 }
 
 /// `held` (sorted, no repeats) with each sorted update applied, handed to `each` in order: an add
@@ -985,18 +1087,71 @@ fn merge_each<E: Entry>(held: List<'_, E>, updates: impl Iterator<Item = (E, boo
     }
 }
 
-/// The page of `rows` (sorted by name, one a name), its readers merged with their updates
-/// straight into the page's bytes; `None` when no row is kept (an empty page is stored as the
-/// zero key). Sized exactly before the first byte: one allocation.
-pub(crate) fn write_page<'b>(rows: &[PageRow<'_, '_>], alloc: Alloc<'b>) -> Option<AVec<'b, u8>> {
-    let mut kept = 0usize;
-    let mut totals = [0usize; LISTS];
-    for row in rows.iter().filter(|row| row.kept()) {
-        kept += 1;
-        for (total, count) in totals.iter_mut().zip(row.counts()) {
-            *total += count;
+/// Appends `list`'s wire bytes to `page`: copies the raw slice directly when the list is already
+/// in page format, otherwise encodes each entry.
+fn write_list<E: Entry>(list: List<'_, E>, page: &mut AVec<'_, u8>) {
+    match list {
+        List::Page(entries) => page.extend_from_slice(entries.raw()),
+        List::Held(held) => {
+            for entry in held {
+                entry.write(page);
+            }
         }
     }
+}
+
+/// The page of `rows` (sorted by name, one a name), its readers merged with their updates in a
+/// single pass into scratch buffers in `alloc`; `None` when no row is kept (an empty page is
+/// stored as the zero key). Sized exactly before the first byte of the page is written.
+pub(crate) fn write_page<'b>(rows: &[PageRow<'_, '_>], alloc: Alloc<'b>) -> Option<AVec<'b, u8>> {
+    struct KeptRow {
+        index: usize,
+        counts: [usize; LISTS],
+        readers_start: usize,
+        cell_readers_start: usize,
+    }
+
+    let mut kept_rows: AVec<'b, KeptRow> = Vec::with_capacity_in(rows.len(), alloc.clone());
+    let mut merged_readers: AVec<'b, Name> = Vec::new_in(alloc.clone());
+    let mut merged_cell_readers: AVec<'b, CellReader> = Vec::new_in(alloc.clone());
+    let mut totals = [0usize; LISTS];
+
+    for (index, row) in rows.iter().enumerate() {
+        let mut counts = [0usize; LISTS];
+        if let Some(base) = row.base {
+            counts[READS] = base.reads().len();
+            counts[CELLS] = base.cells().len();
+            counts[PARTS] = base.parts().len();
+            counts[CONDS] = usize::from(base.cond().is_some());
+        }
+
+        let readers_start = merged_readers.len();
+        if row.readers.is_empty() {
+            counts[READERS] = row.base.map_or(0, |base| base.readers().len());
+        } else {
+            row.each_reader(|entry| merged_readers.push(entry));
+            counts[READERS] = merged_readers.len() - readers_start;
+        }
+
+        let cell_readers_start = merged_cell_readers.len();
+        if row.cell_readers.is_empty() {
+            counts[CELL_READERS] = row.base.map_or(0, |base| base.cell_readers().len());
+        } else {
+            row.each_cell_reader(|entry| merged_cell_readers.push(entry));
+            counts[CELL_READERS] = merged_cell_readers.len() - cell_readers_start;
+        }
+
+        let is_kept = row.base.is_some_and(|base| !base.watching()) || counts[READERS] > 0 || counts[CELL_READERS] > 0;
+        if !is_kept {
+            continue;
+        }
+        for (total, count) in totals.iter_mut().zip(counts) {
+            *total += count;
+        }
+        kept_rows.push(KeptRow { index, counts, readers_start, cell_readers_start });
+    }
+
+    let kept = kept_rows.len();
     if kept == 0 {
         return None;
     }
@@ -1007,10 +1162,10 @@ pub(crate) fn write_page<'b>(rows: &[PageRow<'_, '_>], alloc: Alloc<'b>) -> Opti
     for total in totals {
         put32(&mut page, total);
     }
-    let kept_rows = || rows.iter().filter(|row| row.kept());
+
     let mut starts = [0usize; LISTS];
-    for row in kept_rows() {
-        let counts = row.counts();
+    for meta in kept_rows.iter() {
+        let row = &rows[meta.index];
         let (key, at, source, out, home, place, split) = match row.base {
             Some(base) => (base.key(), base.at(), base.source(), base.out(), base.home(), base.place(), base.split()),
             None => (Key::default(), Key::default(), ABSENT, ABSENT, row.name, 0, None),
@@ -1023,36 +1178,62 @@ pub(crate) fn write_page<'b>(rows: &[PageRow<'_, '_>], alloc: Alloc<'b>) -> Opti
         put_name(&mut page, home);
         page.extend_from_slice(&place.to_le_bytes());
         page.extend_from_slice(&split.map_or(NO_SPLIT, u32::from).to_le_bytes());
-        for (start, count) in starts.iter_mut().zip(counts) {
+        for (start, count) in starts.iter_mut().zip(meta.counts) {
             put32(&mut page, *start);
             put32(&mut page, count);
             *start += count;
         }
     }
-    for row in kept_rows() {
-        if let Some(base) = row.base {
-            base.reads().iter().for_each(|entry| entry.write(&mut page));
+    for meta in kept_rows.iter() {
+        if let Some(base) = rows[meta.index].base {
+            write_list(base.reads(), &mut page);
         }
     }
-    for row in kept_rows() {
-        if let Some(base) = row.base {
-            base.cells().iter().for_each(|entry| entry.write(&mut page));
+    for meta in kept_rows.iter() {
+        if let Some(base) = rows[meta.index].base {
+            write_list(base.cells(), &mut page);
         }
     }
-    for row in kept_rows() {
-        if let Some(base) = row.base {
-            base.parts().iter().for_each(|entry| entry.write(&mut page));
+    for meta in kept_rows.iter() {
+        if let Some(base) = rows[meta.index].base {
+            write_list(base.parts(), &mut page);
         }
     }
-    for row in kept_rows() {
-        row.each_reader(|entry| entry.write(&mut page));
+    for meta in kept_rows.iter() {
+        let row = &rows[meta.index];
+        if row.readers.is_empty() {
+            if let Some(base) = row.base {
+                write_list(base.readers(), &mut page);
+            }
+        } else {
+            let end = meta.readers_start + meta.counts[READERS];
+            for entry in &merged_readers[meta.readers_start..end] {
+                entry.write(&mut page);
+            }
+        }
     }
-    for row in kept_rows() {
-        row.each_cell_reader(|entry| entry.write(&mut page));
+    for meta in kept_rows.iter() {
+        let row = &rows[meta.index];
+        if row.cell_readers.is_empty() {
+            if let Some(base) = row.base {
+                write_list(base.cell_readers(), &mut page);
+            }
+        } else {
+            let end = meta.cell_readers_start + meta.counts[CELL_READERS];
+            for entry in &merged_cell_readers[meta.cell_readers_start..end] {
+                entry.write(&mut page);
+            }
+        }
     }
-    for row in kept_rows() {
-        if let Some(cond) = row.base.and_then(|base| base.cond()) {
-            cond.write(&mut page);
+    for meta in kept_rows.iter() {
+        match rows[meta.index].base {
+            Some(RowRef::Old(view)) => page.extend_from_slice(view.list::<(Name, Condition)>(CONDS).raw()),
+            Some(RowRef::Made(row)) => {
+                if let Some(cond) = &row.cond {
+                    cond.write(&mut page);
+                }
+            }
+            None => {}
         }
     }
     debug_assert_eq!(page.len(), size, "the page's size counted before it was written");
@@ -1372,5 +1553,124 @@ mod tests {
         let bytes = super::write_root(&root, g.clone());
         let back = super::read_root(&bytes, g).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!((back.bits, back.rows, back.bytes, back.pages.as_slice()), (1, 7, (5u64 << 32) + 9, root.pages.as_slice()));
+    }
+
+    /// Interpolation search finds every row (and refuses absent names) across uniform BLAKE3
+    /// digests, multiple kinds, and skewed prefixes, while averaging far fewer probes than binary
+    /// search on large uniform pages.
+    #[test]
+    fn interpolation_search_matches_binary_search_and_beats_log_n() {
+        let g = blaze_own::testing::heap().alloc();
+        fn make_row<'a>(i: u32, alloc: Alloc<'a>) -> Row<'a> {
+            Row {
+                key: Key(ContentId::of("interp-key", &i.to_le_bytes())),
+                at: Key(ContentId::of("interp-at", &i.to_le_bytes())),
+                source: ContentId::of("interp-src", &i.to_le_bytes()),
+                out: ContentId::of("interp-out", &i.to_le_bytes()),
+                home: name(Kind::FileItems, 1),
+                place: i,
+                reads: Vec::new_in(alloc.clone()),
+                cells: Vec::new_in(alloc.clone()),
+                parts: Vec::new_in(alloc.clone()),
+                readers: Vec::new_in(alloc.clone()),
+                cell_readers: Vec::new_in(alloc),
+                split: None,
+                cond: None,
+            }
+        }
+
+        // 1. Large homogeneous page of 2048 uniform BLAKE3 subjects.
+        let n = 2048u32;
+        let mut uniform: StdVec<(Name, Row<'_>)> = (0..n)
+            .map(|i| (Name::new(Kind::BodyCheck, ContentId::of("interp-subject", &i.to_le_bytes())), make_row(i, g.clone())))
+            .collect();
+        uniform.sort_by_key(|(name, _)| *name);
+        let bytes = page(&uniform, g.clone());
+        let view = PageView::open(&bytes).unwrap_or_else(|e| panic!("{e}"));
+
+        let mut total_probes = 0usize;
+        for (idx, (nm, _)) in uniform.iter().enumerate() {
+            let mut target = [0u8; NAME_BYTES];
+            target[0] = nm.kind as u8;
+            target[1..].copy_from_slice(&nm.subject.0);
+            let mut probes = 0usize;
+            assert_eq!(view.find_row_counted(&target, Some(&mut probes)), Some(idx));
+            total_probes += probes;
+            assert_eq!(view.row(*nm).expect("found").name(), *nm);
+        }
+        // Binary search on 2048 items averages ~10.0 probes; interpolation should average < 6.5.
+        let avg_probes = total_probes as f64 / f64::from(n);
+        assert!(avg_probes < 6.5, "interpolation search averaged {avg_probes:.2} probes on {n} uniform BLAKE3 rows");
+
+        // Absent probes (below min, above max, and interior misses).
+        assert!(view.row(Name::new(Kind::Units, ContentId([0; 32]))).is_none());
+        assert!(view.row(Name::new(Kind::Lint, ContentId([0xff; 32]))).is_none());
+        for miss in 0..256u32 {
+            let nm = Name::new(Kind::BodyCheck, ContentId::of("interp-miss", &miss.to_le_bytes()));
+            assert!(view.row(nm).is_none(), "absent uniform name {miss} was found");
+        }
+
+        // 2. Multi-kind + adversarial skewed prefixes (same leading 64 bits, differing later bytes,
+        //    plus exponential gaps): must stay exact and bounded by O(log N).
+        let mut skewed: StdVec<(Name, Row<'_>)> = StdVec::new();
+        for i in 0..128u32 {
+            let mut sub = [0u8; 32];
+            if i < 64 {
+                // Clustered identical 64-bit prefix, differing only in byte 31.
+                sub[0..8].copy_from_slice(&0x1000_0000_0000_0000u64.to_be_bytes());
+                sub[31] = i as u8;
+            } else {
+                let shift = (i - 64).min(63);
+                sub[0..8].copy_from_slice(&(1u64 << shift).to_be_bytes());
+                sub[31] = i as u8;
+            }
+            let kind = if i % 5 == 0 { Kind::Signature } else { Kind::BodyCheck };
+            skewed.push((Name::new(kind, ContentId(sub)), make_row(i, g.clone())));
+        }
+        skewed.sort_by_key(|(name, _)| *name);
+        skewed.dedup_by_key(|(name, _)| *name);
+        let bytes = page(&skewed, g.clone());
+        let view = PageView::open(&bytes).unwrap_or_else(|e| panic!("{e}"));
+        for (idx, (nm, _)) in skewed.iter().enumerate() {
+            let mut target = [0u8; NAME_BYTES];
+            target[0] = nm.kind as u8;
+            target[1..].copy_from_slice(&nm.subject.0);
+            let mut probes = 0usize;
+            assert_eq!(view.find_row_counted(&target, Some(&mut probes)), Some(idx));
+            assert!(probes <= 20, "skewed lookup took {probes} probes");
+        }
+    }
+
+    /// Raw wire byte ordering equals Rust `Ord` for every `RAW_ORD = true` entry type.
+    #[test]
+    fn raw_ord_matches_struct_ord_for_all_entries() {
+        use super::Entry;
+        let g = blaze_own::testing::heap().alloc();
+        let encode = |write: &dyn Fn(&mut AVec<'_, u8>)| {
+            let mut buf = Vec::new_in(g.clone());
+            write(&mut buf);
+            buf
+        };
+        let names = [
+            name(Kind::Units, 0),
+            name(Kind::Units, 255),
+            name(Kind::FileItems, 1),
+            name(Kind::BodyCheck, 2),
+            name(Kind::Lint, 3),
+        ];
+        for &a in &names {
+            for &b in &names {
+                assert_eq!(a.cmp(&b), encode(&|p| a.write(p)).as_slice().cmp(encode(&|p| b.write(p)).as_slice()));
+                let pa = (a, id(1));
+                let pb = (b, id(2));
+                assert_eq!(pa.cmp(&pb), encode(&|p| pa.write(p)).as_slice().cmp(encode(&|p| pb.write(p)).as_slice()));
+                let ca = CellRead { name: a, cell: Cell([1; 16]), saw: id(3) };
+                let cb = CellRead { name: b, cell: Cell([2; 16]), saw: id(4) };
+                assert_eq!(ca.cmp(&cb), encode(&|p| ca.write(p)).as_slice().cmp(encode(&|p| cb.write(p)).as_slice()));
+                let ra = CellReader { reader: a, cell: Cell([1; 16]), saw: id(3) };
+                let rb = CellReader { reader: b, cell: Cell([2; 16]), saw: id(4) };
+                assert_eq!(ra.cmp(&rb), encode(&|p| ra.write(p)).as_slice().cmp(encode(&|p| rb.write(p)).as_slice()));
+            }
+        }
     }
 }

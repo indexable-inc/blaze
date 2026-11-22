@@ -41,6 +41,8 @@ pub enum Shape {
     Ellipsoid { radii: [i64; 3] },
     /// `sum |x_i / r_i|^e = 1`, exponent in millionths (`>= 1`).
     Superellipsoid { radii: [i64; 3], e_ppm: i64 },
+    /// Triply periodic minimal surface (TPMS) gyroid sheet: period and wall thickness (nanometres).
+    Gyroid { period: i64, thickness: i64 },
 }
 
 impl Shape {
@@ -56,6 +58,7 @@ impl Shape {
             Shape::Torus { big, small } => (7, [big, small, 0, 0]),
             Shape::Ellipsoid { radii } => (8, [radii[0], radii[1], radii[2], 0]),
             Shape::Superellipsoid { radii, e_ppm } => (9, [radii[0], radii[1], radii[2], e_ppm]),
+            Shape::Gyroid { period, thickness } => (10, [period, thickness, 0, 0]),
         }
     }
 
@@ -64,7 +67,7 @@ impl Shape {
         match self {
             Shape::HalfSpace => 0,
             Shape::Sphere { .. } => 1,
-            Shape::Cylinder { .. } | Shape::Capsule { .. } | Shape::Torus { .. } => 2,
+            Shape::Cylinder { .. } | Shape::Capsule { .. } | Shape::Torus { .. } | Shape::Gyroid { .. } => 2,
             Shape::Cone { .. } | Shape::Ellipsoid { .. } => 3,
             Shape::Box { .. } | Shape::Superellipsoid { .. } => 4,
         }

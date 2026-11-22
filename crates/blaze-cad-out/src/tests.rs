@@ -16,14 +16,25 @@
 //!   CRC-32 checked and `IEND`'s equal to the format's known constant. Planted: `CrcWithoutType`
 //!   (`CrcMismatch`), `PaethTie` (`PixelsDiffer`);
 //! - the summary equals a line per part formatted independently here. Planted: `SkipGroups`
-//!   (`SummaryWrong`).
+//!   (`SummaryWrong`);
+//! - every binary STL exported from a verified solid parses cleanly, avoids the `"solid "`
+//!   header trap, carries canonical `+0.0` floats, unit outward normals matching right-hand
+//!   winding, exact scaled vertices and positive signed volume; and a golden tetrahedron equals
+//!   its expected 284 bytes byte for byte. Planted: `SolidHeader` (`AsciiHeader`),
+//!   `WrongTriCount` (`LengthMismatch`), `FlipNormal` (`NormalDisagrees`), `FlipWinding`
+//!   (`WindingMismatch`), `NegativeZero` (`NegativeZero`);
+//! - every 2D vector SVG cross-section is well-formed XML/SVG 1.1 with `fill-rule="evenodd"`,
+//!   closed `Z` silhouettes, Y-up mapped to SVG Y-down, exact saddle disambiguation (cases 5 &
+//!   10), and circle/annulus perimeter & area matching `2πr` / `πr²` within tolerance. Planted:
+//!   `WrongSaddle` (`WrongLoopCount`), `WrongInterp` (`GeometryError`), `DropZClose`
+//!   (`UnclosedSilhouette`), `NoYFlip` (`WrongYSign`), `OmitEvenOdd` (`MissingEvenOdd`).
 
 use core::fmt;
 use std::string::{String, ToString};
 use std::{format, vec, vec::Vec as StdVec};
 
 use blaze_cad_mesh::geom::P3;
-use blaze_cad_mesh::{Columns, MaterialRole, MeshView, PartId};
+use blaze_cad_mesh::{CheckOpts, Columns, MaterialRole, MeshLimits, MeshView, PartId, TriId, check};
 use blaze_data::Value;
 use blaze_deflate::{Crc32, Level, MAX_RATIO, unzlib};
 use blaze_own::Alloc;
@@ -65,6 +76,31 @@ enum Invalid {
     Extension { name: String, why: &'static str },
 }
 
+/// Why the validating binary STL parser or mesh agreement oracle refused an `.stl`.
+#[derive(Clone, PartialEq, Debug)]
+enum StlInvalid {
+    TooShort { len: usize },
+    AsciiHeader,
+    LengthMismatch { declared: u32, actual_bytes: usize },
+    NonFinite { facet: usize, slot: usize },
+    NegativeZero { facet: usize, slot: usize },
+    NonZeroAttr { facet: usize, attr: u16 },
+    NormalDisagrees { facet: usize, dot: f64 },
+    WindingMismatch { facet: usize },
+    VolumeWrong { volume: f64 },
+}
+
+/// Why the validating SVG parser or geometric oracle refused an `.svg`.
+#[derive(Clone, PartialEq, Debug)]
+enum SvgInvalid {
+    Structure { why: &'static str },
+    MissingEvenOdd,
+    UnclosedSilhouette,
+    WrongLoopCount { got: usize, want: usize },
+    WrongYSign { got_cy: f64, want_cy: f64 },
+    GeometryError { why: &'static str, got: f64, want: f64 },
+}
+
 #[derive(Clone, PartialEq, Debug)]
 enum OutBroken {
     Invalid { why: Invalid },
@@ -76,6 +112,8 @@ enum OutBroken {
     CrcMismatch { chunk: [u8; 4] },
     PixelsDiffer { at: usize, got: u8, want: u8 },
     SummaryWrong { line: usize, got: String, want: String },
+    StlInvalid { why: StlInvalid },
+    SvgInvalid { why: SvgInvalid },
 }
 
 impl fmt::Display for OutBroken {
@@ -105,6 +143,28 @@ blaze_sim::plants! {
     impl SummaryPlant breaks OutBroken {
         None,
         SkipGroups => OutBroken::SummaryWrong { .. },
+    }
+}
+
+blaze_sim::plants! {
+    impl StlPlant breaks OutBroken {
+        None,
+        SolidHeader => OutBroken::StlInvalid { why: StlInvalid::AsciiHeader },
+        WrongTriCount => OutBroken::StlInvalid { why: StlInvalid::LengthMismatch { .. } },
+        FlipNormal => OutBroken::StlInvalid { why: StlInvalid::NormalDisagrees { .. } },
+        FlipWinding => OutBroken::StlInvalid { why: StlInvalid::WindingMismatch { .. } },
+        NegativeZero => OutBroken::StlInvalid { why: StlInvalid::NegativeZero { .. } },
+    }
+}
+
+blaze_sim::plants! {
+    impl SvgPlant breaks OutBroken {
+        None,
+        WrongSaddle => OutBroken::SvgInvalid { why: SvgInvalid::WrongLoopCount { .. } },
+        WrongInterp => OutBroken::SvgInvalid { why: SvgInvalid::GeometryError { .. } },
+        DropZClose => OutBroken::SvgInvalid { why: SvgInvalid::UnclosedSilhouette },
+        NoYFlip => OutBroken::SvgInvalid { why: SvgInvalid::WrongYSign { .. } },
+        OmitEvenOdd => OutBroken::SvgInvalid { why: SvgInvalid::MissingEvenOdd },
     }
 }
 
@@ -1415,4 +1475,834 @@ fn summary_case(tape: &Tape, plant: SummaryPlant) -> Result<(), Broken<OutBroken
 #[test]
 fn summary_has_a_line_per_part() {
     controls(Config::cases(200), |tape, plant: SummaryPlant| summary_case(tape, plant));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Binary STL.
+
+struct StlFacet {
+    verts: [[f32; 3]; 3],
+}
+
+struct ParsedStl {
+    header: [u8; 80],
+    facets: StdVec<StlFacet>,
+}
+
+fn read_f32_le(bytes: &[u8], i: usize) -> f32 {
+    f32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]])
+}
+
+/// Independent validating binary STL parser.
+fn parse_stl(bytes: &[u8]) -> Result<ParsedStl, StlInvalid> {
+    if bytes.len() < 84 {
+        return Err(StlInvalid::TooShort { len: bytes.len() });
+    }
+    let mut header = [0u8; 80];
+    header.copy_from_slice(&bytes[0..80]);
+    if header[0..6].eq_ignore_ascii_case(b"solid ") {
+        return Err(StlInvalid::AsciiHeader);
+    }
+    let count = u32::from_le_bytes([bytes[80], bytes[81], bytes[82], bytes[83]]);
+    let want_len = 84usize + blaze_int::idx(count) * 50;
+    if bytes.len() != want_len {
+        return Err(StlInvalid::LengthMismatch { declared: count, actual_bytes: bytes.len() });
+    }
+    let mut facets = StdVec::with_capacity(blaze_int::idx(count));
+    for f in 0..blaze_int::idx(count) {
+        let base = 84 + f * 50;
+        let mut raw = [0.0f32; 12];
+        for slot in 0..12 {
+            let x = read_f32_le(bytes, base + slot * 4);
+            if !x.is_finite() {
+                return Err(StlInvalid::NonFinite { facet: f, slot });
+            }
+            if x.to_bits() == 0x8000_0000 {
+                return Err(StlInvalid::NegativeZero { facet: f, slot });
+            }
+            raw[slot] = x;
+        }
+        let attr = u16::from_le_bytes([bytes[base + 48], bytes[base + 49]]);
+        if attr != 0 {
+            return Err(StlInvalid::NonZeroAttr { facet: f, attr });
+        }
+        let normal = [raw[0], raw[1], raw[2]];
+        let verts = [[raw[3], raw[4], raw[5]], [raw[6], raw[7], raw[8]], [raw[9], raw[10], raw[11]]];
+        let v0 = [f64::from(verts[0][0]), f64::from(verts[0][1]), f64::from(verts[0][2])];
+        let v1 = [f64::from(verts[1][0]), f64::from(verts[1][1]), f64::from(verts[1][2])];
+        let v2 = [f64::from(verts[2][0]), f64::from(verts[2][1]), f64::from(verts[2][2])];
+        let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+        let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+        let cx = e1[1] * e2[2] - e1[2] * e2[1];
+        let cy = e1[2] * e2[0] - e1[0] * e2[2];
+        let cz = e1[0] * e2[1] - e1[1] * e2[0];
+        let clen = (cx * cx + cy * cy + cz * cz).sqrt();
+        if clen > 0.0 {
+            let nx = f64::from(normal[0]);
+            let ny = f64::from(normal[1]);
+            let nz = f64::from(normal[2]);
+            let nlen = (nx * nx + ny * ny + nz * nz).sqrt();
+            let dot = (nx * cx + ny * cy + nz * cz) / clen;
+            if (nlen - 1.0).abs() > 1e-4 || dot < 0.9999 {
+                return Err(StlInvalid::NormalDisagrees { facet: f, dot });
+            }
+        }
+        facets.push(StlFacet { verts });
+    }
+    Ok(ParsedStl { header, facets })
+}
+
+struct SolidMesh {
+    positions: StdVec<P3>,
+    normals: StdVec<P3>,
+    triangles: StdVec<[u32; 3]>,
+    parts: StdVec<PartId>,
+    roles: StdVec<MaterialRole>,
+}
+
+impl SolidMesh {
+    fn from_verts_tris(positions: StdVec<P3>, triangles: StdVec<[u32; 3]>) -> SolidMesh {
+        let normals = vec![[0.0, 0.0, 1.0]; positions.len()];
+        let parts = vec![PartId(0); triangles.len()];
+        let roles = vec![MaterialRole(0); triangles.len()];
+        SolidMesh { positions, normals, triangles, parts, roles }
+    }
+
+    fn box_solid(lo: P3, hi: P3) -> SolidMesh {
+        let positions = vec![
+            [lo[0], lo[1], lo[2]], // 0
+            [hi[0], lo[1], lo[2]], // 1
+            [hi[0], hi[1], lo[2]], // 2
+            [lo[0], hi[1], lo[2]], // 3
+            [lo[0], lo[1], hi[2]], // 4
+            [hi[0], lo[1], hi[2]], // 5
+            [hi[0], hi[1], hi[2]], // 6
+            [lo[0], hi[1], hi[2]], // 7
+        ];
+        let triangles = vec![
+            [0, 2, 1], [0, 3, 2], // -Z
+            [4, 5, 6], [4, 6, 7], // +Z
+            [0, 1, 5], [0, 5, 4], // -Y
+            [2, 3, 7], [2, 7, 6], // +Y
+            [0, 4, 7], [0, 7, 3], // -X
+            [1, 2, 6], [1, 6, 5], // +X
+        ];
+        Self::from_verts_tris(positions, triangles)
+    }
+
+    fn tet_solid(origin: P3, scale: P3) -> SolidMesh {
+        let positions = vec![
+            [origin[0], origin[1], origin[2]],
+            [origin[0] + scale[0], origin[1], origin[2]],
+            [origin[0], origin[1] + scale[1], origin[2]],
+            [origin[0], origin[1], origin[2] + scale[2]],
+        ];
+        let triangles = vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]];
+        Self::from_verts_tris(positions, triangles)
+    }
+
+    fn octahedron_solid(centre: P3, radii: P3) -> SolidMesh {
+        let [cx, cy, cz] = centre;
+        let [rx, ry, rz] = radii;
+        let positions = vec![
+            [cx + rx, cy, cz], // 0: +X
+            [cx - rx, cy, cz], // 1: -X
+            [cx, cy + ry, cz], // 2: +Y
+            [cx, cy - ry, cz], // 3: -Y
+            [cx, cy, cz + rz], // 4: +Z
+            [cx, cy, cz - rz], // 5: -Z
+        ];
+        let triangles = vec![
+            [0, 2, 4], [2, 1, 4], [1, 3, 4], [3, 0, 4],
+            [2, 0, 5], [1, 2, 5], [3, 1, 5], [0, 3, 5],
+        ];
+        Self::from_verts_tris(positions, triangles)
+    }
+
+    fn view(&self) -> Result<MeshView<'_>, Broken<OutBroken>> {
+        MeshView::new(Columns {
+            positions: &self.positions,
+            normals: &self.normals,
+            tangents: &[],
+            uvs: &[],
+            colours: &[],
+            triangles: &self.triangles,
+            parts: &self.parts,
+            roles: &self.roles,
+            creases: &[],
+        })
+        .map_err(harness)
+    }
+}
+
+fn draw_solid(tape: &Tape) -> SolidMesh {
+    let pick_pos = |t: &Tape, label: &'static str| -> f32 { f32::from(t.int_in(1i16..=64, label)) / 16.0 };
+    let pick_off = |t: &Tape, label: &'static str| -> f32 { f32::from(t.int_in(-32i16..=32, label)) / 16.0 };
+    match tape.below(3, "solid kind") {
+        0 => {
+            let lo = [0.0, pick_off(tape, "lo_y"), pick_off(tape, "lo_z")];
+            let hi = [lo[0] + pick_pos(tape, "dx"), lo[1] + pick_pos(tape, "dy"), lo[2] + pick_pos(tape, "dz")];
+            SolidMesh::box_solid(lo, hi)
+        }
+        1 => {
+            let origin = [0.0, pick_off(tape, "ty"), pick_off(tape, "tz")];
+            let scale = [pick_pos(tape, "sx"), pick_pos(tape, "sy"), pick_pos(tape, "sz")];
+            SolidMesh::tet_solid(origin, scale)
+        }
+        _ => {
+            let centre = [0.0, pick_off(tape, "cy"), pick_off(tape, "cz")];
+            let radii = [pick_pos(tape, "rx"), pick_pos(tape, "ry"), pick_pos(tape, "rz")];
+            SolidMesh::octahedron_solid(centre, radii)
+        }
+    }
+}
+
+fn stl_case(tape: &Tape, plant: StlPlant) -> Result<(), Broken<OutBroken>> {
+    let solid = draw_solid(tape);
+    let view = solid.view()?;
+    let verified = check(view, CheckOpts { limits: MeshLimits::SHIPPED, scratch: heap() }).map_err(harness)?;
+    let unit = if tape.coin("metres") { StlUnit::Metres } else { StlUnit::Millimetres };
+    let title = *tape
+        .pick(
+            &[
+                "",
+                "bracket",
+                "solid decoy title",
+                "a very long title exceeding eighty bytes to verify clean deterministic truncation at the fixed STL header boundary",
+                "bad\tchars\n\x01here",
+            ],
+            "title",
+        )
+        .unwrap_or(&"");
+    let opts = StlOpts { title, unit, limits: Limits::SHIPPED, alloc: heap() };
+    let first = stl_planted(&verified, opts, plant).map_err(harness)?;
+    let second = stl_planted(&verified, opts, plant).map_err(harness)?;
+    if first[..] != second[..] {
+        return Err(Broken::Oracle(OutBroken::NotDeterministic { what: "two STL exports of one mesh" }));
+    }
+    let parsed = parse_stl(&first).map_err(|why| Broken::Oracle(OutBroken::StlInvalid { why }))?;
+    if !parsed.header.starts_with(b"blaze-cad binary stl") {
+        return Err(Broken::Oracle(OutBroken::StlInvalid { why: StlInvalid::AsciiHeader }));
+    }
+    let scale = unit.scale();
+    let mut signed_vol6 = 0.0f64;
+    for (t, facet) in parsed.facets.iter().enumerate() {
+        let want_corners = view.corners(TriId(u32::try_from(t).unwrap_or(0)));
+        for k in 0..3 {
+            let want = [
+                (f64::from(want_corners[k][0]) * scale) as f32,
+                (f64::from(want_corners[k][1]) * scale) as f32,
+                (f64::from(want_corners[k][2]) * scale) as f32,
+            ];
+            let got = facet.verts[k];
+            for a in 0..3 {
+                let w = if want[a] == 0.0 { 0.0 } else { want[a] };
+                if got[a] != w {
+                    return Err(Broken::Oracle(OutBroken::StlInvalid { why: StlInvalid::WindingMismatch { facet: t } }));
+                }
+            }
+        }
+        let v0 = [f64::from(facet.verts[0][0]), f64::from(facet.verts[0][1]), f64::from(facet.verts[0][2])];
+        let v1 = [f64::from(facet.verts[1][0]), f64::from(facet.verts[1][1]), f64::from(facet.verts[1][2])];
+        let v2 = [f64::from(facet.verts[2][0]), f64::from(facet.verts[2][1]), f64::from(facet.verts[2][2])];
+        let cross = [
+            v1[1] * v2[2] - v1[2] * v2[1],
+            v1[2] * v2[0] - v1[0] * v2[2],
+            v1[0] * v2[1] - v1[1] * v2[0],
+        ];
+        signed_vol6 += v0[0] * cross[0] + v0[1] * cross[1] + v0[2] * cross[2];
+    }
+    if !(signed_vol6 > 0.0) {
+        return Err(Broken::Oracle(OutBroken::StlInvalid { why: StlInvalid::VolumeWrong { volume: signed_vol6 / 6.0 } }));
+    }
+    Ok(())
+}
+
+#[test]
+fn stl_exports_validate_and_agree() {
+    controls(Config::cases(200), |tape, plant: StlPlant| stl_case(tape, plant));
+}
+
+#[test]
+fn golden_stl_tetrahedron_and_errors() {
+    let solid = SolidMesh::tet_solid([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    let view = solid.view().expect("tet view");
+    let verified = check(view, CheckOpts { limits: MeshLimits::SHIPPED, scratch: heap() }).expect("verified tet");
+
+    let got = stl(
+        &verified,
+        StlOpts { title: "tet", unit: StlUnit::Metres, limits: Limits::SHIPPED, alloc: heap() },
+    )
+    .expect("golden stl");
+
+    // Expected 284 bytes = 80 header + 4 count + 4 * 50 facets.
+    let mut want = StdVec::with_capacity(284);
+    let mut hdr = [0u8; 80];
+    let prefix = b"blaze-cad binary stl (m): tet";
+    hdr[..prefix.len()].copy_from_slice(prefix);
+    want.extend_from_slice(&hdr);
+    want.extend_from_slice(&4u32.to_le_bytes());
+
+    let push_facet = |buf: &mut StdVec<u8>, n: [f32; 3], v: [[f32; 3]; 3]| {
+        for x in n {
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+        for p in v {
+            for x in p {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        buf.extend_from_slice(&0u16.to_le_bytes());
+    };
+    let inv_sqrt3 = (1.0f64 / 3.0f64.sqrt()) as f32;
+    push_facet(&mut want, [0.0, 0.0, -1.0], [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]);
+    push_facet(&mut want, [0.0, -1.0, 0.0], [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]);
+    push_facet(&mut want, [-1.0, 0.0, 0.0], [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]]);
+    push_facet(&mut want, [inv_sqrt3; 3], [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+
+    assert_eq!(got.len(), 284, "golden binary STL length");
+    assert_eq!(&got[..], &want[..], "golden binary STL bytes differ");
+
+    // Limits::most_stl_bytes refusal.
+    let mut tight = Limits::SHIPPED;
+    tight.most_stl_bytes = 200;
+    assert_eq!(
+        stl(&verified, StlOpts { title: "", unit: StlUnit::Millimetres, limits: tight, alloc: heap() }),
+        Err(StlError::TooLarge { bytes: 284, most: 200 }),
+    );
+
+    // Millimetres overflow refusal on huge f32 coordinate.
+    let huge = SolidMesh::tet_solid([0.0, 0.0, 0.0], [1.0e37, 1.0e37, 1.0e37]);
+    let huge_v = check(huge.view().expect("huge view"), CheckOpts { limits: MeshLimits::SHIPPED, scratch: heap() })
+        .expect("verified huge");
+    assert_eq!(
+        stl(&huge_v, StlOpts { title: "", unit: StlUnit::Millimetres, limits: Limits::SHIPPED, alloc: heap() }),
+        Err(StlError::Overflow { triangle: 0, corner: 1 }),
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// 2D Vector SVG Cross-Section.
+
+struct Subpath {
+    pts: StdVec<[f64; 2]>,
+    closed: bool,
+}
+
+struct ParsedSvg {
+    view_box: [f64; 4],
+    has_grid: bool,
+    has_dimensions: bool,
+    has_scale_bar: bool,
+    silhouette_even_odd: bool,
+    silhouette: StdVec<Subpath>,
+    open_contours: StdVec<Subpath>,
+}
+
+/// Check well-formed balanced XML tags (independent of the SVG writer).
+fn check_xml_balanced(doc: &str) -> Result<(), SvgInvalid> {
+    let bad = |why| SvgInvalid::Structure { why };
+    if !doc.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>") {
+        return Err(bad("missing XML declaration"));
+    }
+    let bytes = doc.as_bytes();
+    let mut i = 0usize;
+    let mut stack: StdVec<String> = StdVec::new();
+    let mut seen_root = false;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let Some(rel_end) = bytes[i..].iter().position(|&b| b == b'>') else {
+            return Err(bad("unterminated tag"));
+        };
+        let tag = &doc[i + 1..i + rel_end];
+        i += rel_end + 1;
+        if tag.starts_with('?') {
+            if !tag.ends_with('?') {
+                return Err(bad("malformed processing instruction"));
+            }
+            continue;
+        }
+        if let Some(rest) = tag.strip_prefix('/') {
+            let name = rest.trim();
+            match stack.pop() {
+                Some(open) if open == name => {}
+                _ => return Err(bad("mismatched closing tag")),
+            }
+        } else {
+            let self_closing = tag.ends_with('/');
+            let body = if self_closing { &tag[..tag.len() - 1] } else { tag };
+            let name = body.split_ascii_whitespace().next().unwrap_or("");
+            if name.is_empty() {
+                return Err(bad("empty tag name"));
+            }
+            // Check balanced quotes inside attribute list.
+            if body.bytes().filter(|&b| b == b'"').count() % 2 != 0 {
+                return Err(bad("unbalanced attribute quotes"));
+            }
+            if stack.is_empty() {
+                if seen_root || name != "svg" {
+                    return Err(bad("root element must be a single <svg>"));
+                }
+                seen_root = true;
+            }
+            if !self_closing {
+                stack.push(name.to_string());
+            }
+        }
+    }
+    if !seen_root || !stack.is_empty() {
+        return Err(bad("unclosed XML tags"));
+    }
+    Ok(())
+}
+
+fn attr_of<'a>(tag: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!(" {key}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let end = tag[start..].find('"')?;
+    Some(&tag[start..start + end])
+}
+
+fn parse_path_d(d: &str) -> Result<StdVec<Subpath>, SvgInvalid> {
+    let bad = |why| SvgInvalid::Structure { why };
+    let tokens: StdVec<&str> = d.split_ascii_whitespace().collect();
+    let mut subpaths = StdVec::new();
+    let mut cur: Option<Subpath> = None;
+    let mut i = 0usize;
+    while i < tokens.len() {
+        match tokens[i] {
+            "M" => {
+                if let Some(sp) = cur.take() {
+                    subpaths.push(sp);
+                }
+                if i + 2 >= tokens.len() {
+                    return Err(bad("truncated M command"));
+                }
+                let x: f64 = tokens[i + 1].parse().map_err(|_| bad("bad M x"))?;
+                let y: f64 = tokens[i + 2].parse().map_err(|_| bad("bad M y"))?;
+                cur = Some(Subpath { pts: vec![[x, y]], closed: false });
+                i += 3;
+            }
+            "L" => {
+                if i + 2 >= tokens.len() {
+                    return Err(bad("truncated L command"));
+                }
+                let x: f64 = tokens[i + 1].parse().map_err(|_| bad("bad L x"))?;
+                let y: f64 = tokens[i + 2].parse().map_err(|_| bad("bad L y"))?;
+                let sp = cur.as_mut().ok_or(bad("L without M"))?;
+                sp.pts.push([x, y]);
+                i += 3;
+            }
+            "Z" => {
+                let sp = cur.as_mut().ok_or(bad("Z without M"))?;
+                sp.closed = true;
+                subpaths.push(cur.take().unwrap());
+                i += 1;
+            }
+            _ => return Err(bad("unexpected path command")),
+        }
+    }
+    if let Some(sp) = cur {
+        subpaths.push(sp);
+    }
+    Ok(subpaths)
+}
+
+fn parse_svg(bytes: &[u8]) -> Result<ParsedSvg, SvgInvalid> {
+    let bad = |why| SvgInvalid::Structure { why };
+    let doc = core::str::from_utf8(bytes).map_err(|_| bad("not UTF-8"))?;
+    check_xml_balanced(doc)?;
+
+    let mut view_box = None;
+    let mut has_grid = false;
+    let mut has_dimensions = false;
+    let mut has_scale_bar = false;
+    let mut silhouette_even_odd = true;
+    let mut silhouette = StdVec::new();
+    let mut open_contours = StdVec::new();
+
+    for part in doc.split('<').skip(1) {
+        let Some(end) = part.find('>') else { continue };
+        let tag = &part[..end];
+        if tag.starts_with("svg ") {
+            if attr_of(tag, "xmlns") != Some("http://www.w3.org/2000/svg") || attr_of(tag, "version") != Some("1.1") {
+                return Err(bad("missing SVG 1.1 xmlns or version"));
+            }
+            let vb_str = attr_of(tag, "viewBox").ok_or(bad("missing viewBox"))?;
+            let nums: StdVec<f64> = vb_str
+                .split_ascii_whitespace()
+                .map(|s| s.parse::<f64>())
+                .collect::<Result<_, _>>()
+                .map_err(|_| bad("bad viewBox numbers"))?;
+            if nums.len() != 4 || !nums.iter().all(|x| x.is_finite()) || !(nums[2] > 0.0 && nums[3] > 0.0) {
+                return Err(bad("invalid viewBox"));
+            }
+            view_box = Some([nums[0], nums[1], nums[2], nums[3]]);
+        } else if tag.starts_with("g ") {
+            match attr_of(tag, "id") {
+                Some("grid") => has_grid = true,
+                Some("dimensions") => has_dimensions = true,
+                Some("scale-bar") => has_scale_bar = true,
+                _ => {}
+            }
+        } else if tag.starts_with("path ") {
+            match attr_of(tag, "id") {
+                Some("silhouette") => {
+                    silhouette_even_odd = attr_of(tag, "fill-rule") == Some("evenodd");
+                    let d = attr_of(tag, "d").ok_or(bad("silhouette missing d"))?;
+                    silhouette = parse_path_d(d)?;
+                }
+                Some("open-contours") => {
+                    let d = attr_of(tag, "d").ok_or(bad("open-contours missing d"))?;
+                    open_contours = parse_path_d(d)?;
+                }
+                _ => {}
+            }
+        }
+    }
+    let view_box = view_box.ok_or(bad("missing <svg>"))?;
+    Ok(ParsedSvg { view_box, has_grid, has_dimensions, has_scale_bar, silhouette_even_odd, silhouette, open_contours })
+}
+
+/// Convert SVG Y-down subpath points back to math Y-up (mm) and compute perimeter & signed area.
+fn loop_metrics_math_mm(sp: &Subpath) -> (f64, f64, [f64; 2]) {
+    let n = sp.pts.len();
+    let mut perim = 0.0f64;
+    let mut area2 = 0.0f64;
+    let mut sx = 0.0f64;
+    let mut sy = 0.0f64;
+    for i in 0..n {
+        let a = [sp.pts[i][0], -sp.pts[i][1]];
+        let b = [sp.pts[(i + 1) % n][0], -sp.pts[(i + 1) % n][1]];
+        let dx = b[0] - a[0];
+        let dy = b[1] - a[1];
+        perim += (dx * dx + dy * dy).sqrt();
+        area2 += a[0] * b[1] - b[0] * a[1];
+        sx += a[0];
+        sy += a[1];
+    }
+    (perim, 0.5 * area2, [sx / (n as f64), sy / (n as f64)])
+}
+
+fn sample_grid(nx: u32, ny: u32, origin: [f64; 2], step: f64, f: impl Fn(f64, f64) -> f64) -> StdVec<f64> {
+    let mut values = StdVec::with_capacity(blaze_int::idx(nx) * blaze_int::idx(ny));
+    for iy in 0..ny {
+        let y = origin[1] + f64::from(iy) * step;
+        for ix in 0..nx {
+            let x = origin[0] + f64::from(ix) * step;
+            values.push(f(x, y));
+        }
+    }
+    values
+}
+
+enum SvgScenario {
+    Circle { cx: f64, cy: f64, r: f64, step: f64 },
+    Annulus { cx: f64, cy: f64, r_in: f64, r_out: f64, step: f64 },
+    Saddle { connected: bool, cy_m: f64 },
+}
+
+fn svg_case(tape: &Tape, plant: SvgPlant) -> Result<(), Broken<OutBroken>> {
+    let kind = tape.below(3, "svg scenario");
+    let show_grid = tape.coin("show_grid");
+    let show_dimensions = tape.coin("show_dimensions");
+
+    let (nx, ny, origin, step, values, scenario) = match kind {
+        0 => {
+            // Circle centred strictly above Y=0 so NoYFlip is unambiguously detected.
+            let r = f64::from(tape.int_in(14i32..=28, "radius_mm")) * 0.001;
+            let cx = f64::from(tape.int_in(-10i32..=10, "cx_mm")) * 0.001;
+            let cy = f64::from(tape.int_in(20i32..=40, "cy_mm")) * 0.001;
+            let step = 0.0015;
+            let half = r + 4.0 * step;
+            let nx = ((2.0 * half / step) as u32).max(28) + 2;
+            let ny = nx;
+            let origin = [cx - half, cy - half];
+            let values = sample_grid(nx, ny, origin, step, |x, y| ((x - cx).powi(2) + (y - cy).powi(2)).sqrt() - r);
+            (nx, ny, origin, step, values, SvgScenario::Circle { cx, cy, r, step })
+        }
+        1 => {
+            // Annulus with interior hole: 2 closed loops (CCW outer + CW hole).
+            let r_in = f64::from(tape.int_in(10i32..=14, "r_in_mm")) * 0.001;
+            let r_out = r_in + f64::from(tape.int_in(10i32..=16, "wall_mm")) * 0.001;
+            let cx = f64::from(tape.int_in(-8i32..=8, "cx_mm")) * 0.001;
+            let cy = f64::from(tape.int_in(22i32..=38, "cy_mm")) * 0.001;
+            let step = 0.0015;
+            let half = r_out + 4.0 * step;
+            let nx = ((2.0 * half / step) as u32).max(36) + 2;
+            let ny = nx;
+            let origin = [cx - half, cy - half];
+            let values = sample_grid(nx, ny, origin, step, |x, y| {
+                let d = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
+                (r_in - d).max(d - r_out)
+            });
+            (nx, ny, origin, step, values, SvgScenario::Annulus { cx, cy, r_in, r_out, step })
+        }
+        _ => {
+            // Explicit 4x4 grid with central saddle cell (1,1)-(2,2) surrounded by +5 outside.
+            let case10 = tape.coin("saddle_case_10");
+            let connected = tape.coin("saddle_connected");
+            let (in_val, out_val) = if connected { (-2.0, 0.5) } else { (-0.5, 2.0) };
+            let nx = 4u32;
+            let ny = 4u32;
+            let step = 0.005;
+            let origin = [0.0, 0.02]; // strictly positive Y (20..35 mm)
+            let mut values = vec![5.0f64; 16];
+            let set = |vals: &mut [f64], x: usize, y: usize, v: f64| vals[y * 4 + x] = v;
+            if case10 {
+                // BR (2,1) & TL (1,2) inside; BL (1,1) & TR (2,2) outside.
+                set(&mut values, 1, 1, out_val);
+                set(&mut values, 2, 1, in_val);
+                set(&mut values, 2, 2, out_val);
+                set(&mut values, 1, 2, in_val);
+            } else {
+                // Case 5: BL (1,1) & TR (2,2) inside; BR (2,1) & TL (1,2) outside.
+                set(&mut values, 1, 1, in_val);
+                set(&mut values, 2, 1, out_val);
+                set(&mut values, 2, 2, in_val);
+                set(&mut values, 1, 2, out_val);
+            }
+            let cy_m = origin[1] + 1.5 * step;
+            (nx, ny, origin, step, values, SvgScenario::Saddle { connected, cy_m })
+        }
+    };
+
+    let grid = SectionGrid { nx, ny, origin, step, values: &values };
+    let opts = SvgOpts {
+        title: "Section <A&B>",
+        fill: DEFAULT_FILL,
+        stroke: DEFAULT_STROKE,
+        stroke_width: 0.0,
+        show_dimensions,
+        show_grid,
+        limits: Limits::SHIPPED,
+        alloc: heap(),
+        scratch: heap(),
+    };
+    let first = svg_planted(&grid, opts, plant).map_err(harness)?;
+    let second = svg_planted(&grid, opts, plant).map_err(harness)?;
+    if first[..] != second[..] {
+        return Err(Broken::Oracle(OutBroken::NotDeterministic { what: "two SVG exports of one grid" }));
+    }
+    let parsed = parse_svg(&first).map_err(|why| Broken::Oracle(OutBroken::SvgInvalid { why }))?;
+    if !parsed.has_scale_bar || parsed.has_grid != show_grid || parsed.has_dimensions != show_dimensions {
+        return Err(Broken::Oracle(OutBroken::SvgInvalid {
+            why: SvgInvalid::Structure { why: "missing expected drawing layer" },
+        }));
+    }
+    if !parsed.silhouette_even_odd {
+        return Err(Broken::Oracle(OutBroken::SvgInvalid { why: SvgInvalid::MissingEvenOdd }));
+    }
+    if parsed.silhouette.iter().any(|sp| !sp.closed) {
+        return Err(Broken::Oracle(OutBroken::SvgInvalid { why: SvgInvalid::UnclosedSilhouette }));
+    }
+    if !parsed.open_contours.is_empty() {
+        return Err(Broken::Oracle(OutBroken::SvgInvalid {
+            why: SvgInvalid::Structure { why: "unexpected open contours on closed shape" },
+        }));
+    }
+
+    match scenario {
+        SvgScenario::Circle { cx, cy, r, step } => {
+            if parsed.silhouette.len() != 1 {
+                return Err(Broken::Oracle(OutBroken::SvgInvalid {
+                    why: SvgInvalid::WrongLoopCount { got: parsed.silhouette.len(), want: 1 },
+                }));
+            }
+            let sp = &parsed.silhouette[0];
+            let (perim, area, centroid) = loop_metrics_math_mm(sp);
+            let want_cy = cy * 1000.0;
+            if (centroid[1] - want_cy).abs() > 0.5 * want_cy.abs() {
+                return Err(Broken::Oracle(OutBroken::SvgInvalid {
+                    why: SvgInvalid::WrongYSign { got_cy: centroid[1], want_cy },
+                }));
+            }
+            let r_mm = r * 1000.0;
+            let cx_mm = cx * 1000.0;
+            let step_mm = step * 1000.0;
+            // Every contour vertex must sit tightly on the zero level set (midpoint staircase fails badly).
+            for &[x, y_svg] in &sp.pts {
+                let d = ((x - cx_mm).powi(2) + (-y_svg - want_cy).powi(2)).sqrt();
+                if (d - r_mm).abs() > 0.2 * step_mm {
+                    return Err(Broken::Oracle(OutBroken::SvgInvalid {
+                        why: SvgInvalid::GeometryError { why: "vertex off circle zero-crossing", got: d, want: r_mm },
+                    }));
+                }
+            }
+            let want_perim = 2.0 * core::f64::consts::PI * r_mm;
+            let want_area = core::f64::consts::PI * r_mm * r_mm;
+            if (perim - want_perim).abs() / want_perim > 0.02 {
+                return Err(Broken::Oracle(OutBroken::SvgInvalid {
+                    why: SvgInvalid::GeometryError { why: "circle perimeter", got: perim, want: want_perim },
+                }));
+            }
+            if !(area > 0.0) || (area - want_area).abs() / want_area > 0.02 {
+                return Err(Broken::Oracle(OutBroken::SvgInvalid {
+                    why: SvgInvalid::GeometryError { why: "circle signed area", got: area, want: want_area },
+                }));
+            }
+        }
+        SvgScenario::Annulus { cx, cy, r_in, r_out, step } => {
+            if parsed.silhouette.len() != 2 {
+                return Err(Broken::Oracle(OutBroken::SvgInvalid {
+                    why: SvgInvalid::WrongLoopCount { got: parsed.silhouette.len(), want: 2 },
+                }));
+            }
+            let want_cy = cy * 1000.0;
+            let mut pos_area = 0.0;
+            let mut neg_area = 0.0;
+            let cx_mm = cx * 1000.0;
+            let r_in_mm = r_in * 1000.0;
+            let r_out_mm = r_out * 1000.0;
+            let step_mm = step * 1000.0;
+            for sp in &parsed.silhouette {
+                let (_perim, area, centroid) = loop_metrics_math_mm(sp);
+                if (centroid[1] - want_cy).abs() > 0.5 * want_cy.abs() {
+                    return Err(Broken::Oracle(OutBroken::SvgInvalid {
+                        why: SvgInvalid::WrongYSign { got_cy: centroid[1], want_cy },
+                    }));
+                }
+                let target_r = if area > 0.0 {
+                    pos_area += area;
+                    r_out_mm
+                } else {
+                    neg_area += -area;
+                    r_in_mm
+                };
+                for &[x, y_svg] in &sp.pts {
+                    let d = ((x - cx_mm).powi(2) + (-y_svg - want_cy).powi(2)).sqrt();
+                    if (d - target_r).abs() > 0.25 * step_mm {
+                        return Err(Broken::Oracle(OutBroken::SvgInvalid {
+                            why: SvgInvalid::GeometryError { why: "annulus vertex off level set", got: d, want: target_r },
+                        }));
+                    }
+                }
+            }
+            let want_out = core::f64::consts::PI * r_out_mm * r_out_mm;
+            let want_in = core::f64::consts::PI * r_in_mm * r_in_mm;
+            if (pos_area - want_out).abs() / want_out > 0.025 {
+                return Err(Broken::Oracle(OutBroken::SvgInvalid {
+                    why: SvgInvalid::GeometryError { why: "annulus outer area", got: pos_area, want: want_out },
+                }));
+            }
+            if (neg_area - want_in).abs() / want_in > 0.035 {
+                return Err(Broken::Oracle(OutBroken::SvgInvalid {
+                    why: SvgInvalid::GeometryError { why: "annulus hole area", got: neg_area, want: want_in },
+                }));
+            }
+        }
+        SvgScenario::Saddle { connected, cy_m } => {
+            let want_loops = if connected { 1 } else { 2 };
+            if parsed.silhouette.len() != want_loops {
+                return Err(Broken::Oracle(OutBroken::SvgInvalid {
+                    why: SvgInvalid::WrongLoopCount { got: parsed.silhouette.len(), want: want_loops },
+                }));
+            }
+            let want_cy = cy_m * 1000.0;
+            for sp in &parsed.silhouette {
+                let (_perim, area, centroid) = loop_metrics_math_mm(sp);
+                if (centroid[1] - want_cy).abs() > 0.5 * want_cy.abs() {
+                    return Err(Broken::Oracle(OutBroken::SvgInvalid {
+                        why: SvgInvalid::WrongYSign { got_cy: centroid[1], want_cy },
+                    }));
+                }
+                if !(area > 0.0) {
+                    return Err(Broken::Oracle(OutBroken::SvgInvalid {
+                        why: SvgInvalid::GeometryError { why: "saddle loop orientation", got: area, want: 1.0 },
+                    }));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn svg_sections_validate_and_agree() {
+    controls(Config::cases(200), |tape, plant: SvgPlant| svg_case(tape, plant));
+}
+
+#[test]
+fn svg_edge_cases_open_empty_zero_and_errors() {
+    let base_opts = |limits: Limits| SvgOpts {
+        title: "Cut <1> & \"2\"",
+        fill: DEFAULT_FILL,
+        stroke: DEFAULT_STROKE,
+        stroke_width: 0.25,
+        show_dimensions: true,
+        show_grid: true,
+        limits,
+        alloc: heap(),
+        scratch: heap(),
+    };
+
+    // 1. Open contour: half-plane x <= 0.005 slicing through the grid boundary.
+    let vals_open = sample_grid(10, 10, [0.0, 0.0], 0.002, |x, _y| x - 0.005);
+    let open_svg = svg(&SectionGrid { nx: 10, ny: 10, origin: [0.0, 0.0], step: 0.002, values: &vals_open }, base_opts(Limits::SHIPPED))
+        .expect("open svg");
+    let parsed_open = parse_svg(&open_svg).expect("parse open svg");
+    assert!(parsed_open.silhouette.is_empty(), "open half-plane has no closed loops");
+    assert_eq!(parsed_open.open_contours.len(), 1, "expected one open contour polyline");
+    assert!(!parsed_open.open_contours[0].closed, "open contour must not close with Z");
+    let open_str = core::str::from_utf8(&open_svg).expect("utf8");
+    assert!(open_str.contains("<title>Cut &lt;1&gt; &amp; &quot;2&quot;</title>"), "XML title escaping");
+
+    // 2. Empty contour (all positive samples) still produces valid standalone SVG with viewBox.
+    let vals_empty = vec![1.0f64; 16];
+    let empty_svg = svg(&SectionGrid { nx: 4, ny: 4, origin: [0.0, 0.0], step: 0.01, values: &vals_empty }, base_opts(Limits::SHIPPED))
+        .expect("empty svg");
+    let parsed_empty = parse_svg(&empty_svg).expect("parse empty svg");
+    assert!(parsed_empty.silhouette.is_empty());
+    assert!(parsed_empty.open_contours.is_empty());
+    assert!(parsed_empty.view_box[2] > 0.0 && parsed_empty.view_box[3] > 0.0);
+
+    // 3. Exact zeros on grid vertices: power-of-two step (1/128 m = 7.8125 mm) so every boundary
+    //    sample evaluates to bit-exact 0.0 without FP drift.
+    let h = 1.0 / 128.0;
+    let vals_zero = sample_grid(9, 9, [-4.0 * h, -4.0 * h], h, |x, y| x.abs().max(y.abs()) - 2.0 * h);
+    assert!(vals_zero.contains(&0.0), "grid must hit bit-exact 0.0 on boundary nodes");
+    let zero_svg = svg(&SectionGrid { nx: 9, ny: 9, origin: [-4.0 * h, -4.0 * h], step: h, values: &vals_zero }, base_opts(Limits::SHIPPED))
+        .expect("exact zero svg");
+    let parsed_zero = parse_svg(&zero_svg).expect("parse exact zero svg");
+    assert_eq!(parsed_zero.silhouette.len(), 1);
+    let (_p, area, _c) = loop_metrics_math_mm(&parsed_zero.silhouette[0]);
+    // 4h × 4h square minus four corner right triangles of legs h (area 0.5 h^2 each) = 14 h^2.
+    let h_mm = h * 1000.0;
+    let want_area = 14.0 * h_mm * h_mm;
+    assert!((area - want_area).abs() < 1e-6, "exact-zero square contour area should be {want_area}, got {area}");
+
+    // 4. Error refusals.
+    assert_eq!(
+        svg(&SectionGrid { nx: 1, ny: 4, origin: [0.0, 0.0], step: 0.01, values: &[0.0; 4] }, base_opts(Limits::SHIPPED)),
+        Err(SvgError::EmptyGrid { nx: 1, ny: 4 }),
+    );
+    let mut tiny = Limits::SHIPPED;
+    tiny.most_svg_cells = 4;
+    assert_eq!(
+        svg(&SectionGrid { nx: 4, ny: 4, origin: [0.0, 0.0], step: 0.01, values: &vals_empty }, base_opts(tiny)),
+        Err(SvgError::TooManyCells { cells: 9, most: 4 }),
+    );
+    assert_eq!(
+        svg(&SectionGrid { nx: 4, ny: 4, origin: [0.0, 0.0], step: 0.01, values: &[0.0; 10] }, base_opts(Limits::SHIPPED)),
+        Err(SvgError::Length { want: 16, got: 10 }),
+    );
+    assert_eq!(
+        svg(&SectionGrid { nx: 4, ny: 4, origin: [0.0, 0.0], step: 0.0, values: &vals_empty }, base_opts(Limits::SHIPPED)),
+        Err(SvgError::BadGrid),
+    );
+    let mut nan_vals = vec![1.0f64; 16];
+    nan_vals[7] = f64::NAN;
+    assert_eq!(
+        svg(&SectionGrid { nx: 4, ny: 4, origin: [0.0, 0.0], step: 0.01, values: &nan_vals }, base_opts(Limits::SHIPPED)),
+        Err(SvgError::NonFinite { index: 7 }),
+    );
+    let mut bad_style = base_opts(Limits::SHIPPED);
+    bad_style.stroke_width = -1.0;
+    assert_eq!(
+        svg(&SectionGrid { nx: 4, ny: 4, origin: [0.0, 0.0], step: 0.01, values: &vals_empty }, bad_style),
+        Err(SvgError::BadStyle),
+    );
 }

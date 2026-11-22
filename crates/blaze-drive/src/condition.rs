@@ -159,14 +159,119 @@ impl Space<'_> {
     /// implications are closed: setting each unfixed boolean to 1 only where an implication from
     /// a fixed 1 forces it satisfies every other implication.
     pub fn allows(&self, condition: &Condition) -> bool {
-        condition.atoms().iter().all(|(var, value)| self.values.get(*var as usize).is_some_and(|n| value < n))
-            && !self.implications.iter().any(|(a, b)| condition.get(*a) == Some(1) && condition.get(*b) == Some(0))
+        let atoms = condition.atoms();
+        let mut ones = [0 as Var; MOST_ATOMS];
+        let mut zeros = [0 as Var; MOST_ATOMS];
+        let mut n_ones = 0usize;
+        let mut n_zeros = 0usize;
+        let mut max_var = 0 as Var;
+        for &(var, value) in atoms {
+            if !self.values.get(var as usize).is_some_and(|n| value < *n) {
+                return false;
+            }
+            if value == 1 {
+                ones[n_ones] = var;
+                n_ones += 1;
+                max_var = max_var.max(var);
+            } else if value == 0 {
+                zeros[n_zeros] = var;
+                n_zeros += 1;
+                max_var = max_var.max(var);
+            }
+        }
+        if n_ones == 0 || n_zeros == 0 || self.implications.is_empty() {
+            return true;
+        }
+        // Exact O(1) stack bitset when every fixed 0/1 variable fits under 256.
+        if max_var < 256 {
+            let mut one_bits = [0u64; 4];
+            let mut zero_bits = [0u64; 4];
+            for &v in &ones[..n_ones] {
+                let u = usize::from(v);
+                one_bits[u >> 6] |= 1u64 << (u & 63);
+            }
+            for &v in &zeros[..n_zeros] {
+                let u = usize::from(v);
+                zero_bits[u >> 6] |= 1u64 << (u & 63);
+            }
+            for &(a, b) in self.implications {
+                if a < 256 && b < 256 {
+                    let au = usize::from(a);
+                    let bu = usize::from(b);
+                    if (one_bits[au >> 6] & (1u64 << (au & 63))) != 0
+                        && (zero_bits[bu >> 6] & (1u64 << (bu & 63))) != 0
+                    {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+        // Fallback for large variable indices: 64-bit bloom mask + binary search on sorted slices.
+        let mut one_mask = 0u64;
+        let mut zero_mask = 0u64;
+        for &v in &ones[..n_ones] {
+            one_mask |= 1u64 << (v & 63);
+        }
+        for &v in &zeros[..n_zeros] {
+            zero_mask |= 1u64 << (v & 63);
+        }
+        let ones = &ones[..n_ones];
+        let zeros = &zeros[..n_zeros];
+        for &(a, b) in self.implications {
+            if ((one_mask >> (a & 63)) & (zero_mask >> (b & 63)) & 1) != 0
+                && ones.binary_search(&a).is_ok()
+                && zeros.binary_search(&b).is_ok()
+            {
+                return false;
+            }
+        }
+        true
     }
 
     /// Whether the implications are closed: `a -> b` and `b -> c` give `a -> c`.
     pub fn closed(&self) -> bool {
-        self.implications.iter().all(|(a, b)| {
-            self.implications.iter().filter(|(b2, _)| b2 == b).all(|(_, c)| a == c || self.implications.contains(&(*a, *c)))
+        let imps = self.implications;
+        if imps.len() <= 1 {
+            return true;
+        }
+        // Fast path when `implications` is sorted (the standard canonical order): group by `a`,
+        // binary-search `b`'s outgoing slice, and merge-check that every `c != a` in `b`'s slice
+        // is present in `a`'s slice.
+        if imps.windows(2).all(|w| w[0] <= w[1]) {
+            let mut a_start = 0usize;
+            while a_start < imps.len() {
+                let a = imps[a_start].0;
+                let mut a_end = a_start + 1;
+                while a_end < imps.len() && imps[a_end].0 == a {
+                    a_end += 1;
+                }
+                let a_edges = &imps[a_start..a_end];
+                for &(_, b) in a_edges {
+                    let b_start = imps.partition_point(|&(x, _)| x < b);
+                    let mut b_idx = b_start;
+                    let mut a_idx = 0usize;
+                    while b_idx < imps.len() && imps[b_idx].0 == b {
+                        let c = imps[b_idx].1;
+                        b_idx += 1;
+                        if c == a {
+                            continue;
+                        }
+                        while a_idx < a_edges.len() && a_edges[a_idx].1 < c {
+                            a_idx += 1;
+                        }
+                        if a_idx == a_edges.len() || a_edges[a_idx].1 != c {
+                            return false;
+                        }
+                    }
+                }
+                a_start = a_end;
+            }
+            return true;
+        }
+        // Unsorted fallback: preserve exact semantics for arbitrary caller slices.
+        imps.iter().all(|(a, b)| {
+            imps.iter().filter(|(b2, _)| b2 == b).all(|(_, c)| a == c || imps.contains(&(*a, *c)))
         })
     }
 
@@ -442,5 +547,31 @@ mod model {
         assert!(a.implies(&Condition::ANY.with(3, 1).unwrap().unwrap()));
         assert!(!Condition::ANY.implies(&a));
         assert_eq!(a.with(1, 1).unwrap(), None);
+    }
+
+    #[test]
+    fn fast_closed_and_allows_match_naive_for_small_and_large_vars() {
+        // Chain 0 -> 1 -> 2, closed vs unclosed, sorted and unsorted.
+        let values = [2u16; 320];
+        let closed_sorted = [(0, 1), (0, 2), (1, 2), (260, 270), (260, 280), (270, 280)];
+        let s = Space { values: &values, implications: &closed_sorted };
+        assert!(s.closed());
+        let ok = Condition::ANY.with(0, 1).unwrap().unwrap().with(2, 1).unwrap().unwrap();
+        assert!(s.allows(&ok));
+        let bad_small = Condition::ANY.with(0, 1).unwrap().unwrap().with(2, 0).unwrap().unwrap();
+        assert!(!s.allows(&bad_small));
+        let bad_large = Condition::ANY.with(260, 1).unwrap().unwrap().with(280, 0).unwrap().unwrap();
+        assert!(!s.allows(&bad_large));
+        let ok_large = Condition::ANY.with(260, 1).unwrap().unwrap().with(280, 1).unwrap().unwrap();
+        assert!(s.allows(&ok_large));
+
+        let unclosed_sorted = [(0, 1), (1, 2)];
+        assert!(!Space { values: &values, implications: &unclosed_sorted }.closed());
+
+        let unclosed_unsorted = [(1, 2), (0, 1)];
+        assert!(!Space { values: &values, implications: &unclosed_unsorted }.closed());
+
+        let closed_unsorted = [(1, 2), (0, 2), (0, 1)];
+        assert!(Space { values: &values, implications: &closed_unsorted }.closed());
     }
 }

@@ -227,6 +227,20 @@ pub(crate) struct Table {
     pub len: u32,
 }
 
+/// Coarse min-max block edge length (`4 x 4 x 4` voxels per level-1 block,
+/// `16 x 16 x 16` voxels per level-2 superblock).
+pub(crate) const GRID_BLOCK: usize = 4;
+pub(crate) const GRID_SUPER: usize = GRID_BLOCK * GRID_BLOCK;
+
+/// Coarse min-max summary metadata for one [`Table`] (zeros for `Path2`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GridSummary {
+    pub b1_start: u32,
+    pub b1_dims: [u32; 3],
+    pub b2_start: u32,
+    pub b2_dims: [u32; 3],
+}
+
 /// One register instruction (16 bytes): the SSA instruction with registers for indices.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RInstr {
@@ -242,6 +256,8 @@ pub struct Tape<'a> {
     pub(crate) pool: AVec<'a, f64>,
     pub(crate) tables: AVec<'a, Table>,
     pub(crate) data: AVec<'a, f64>,
+    pub(crate) grid_blocks: AVec<'a, [f64; 2]>,
+    pub(crate) grid_summaries: AVec<'a, GridSummary>,
     pub(crate) root: u32,
     pub(crate) level: Level,
     pub(crate) aabb: Aabb3,
@@ -621,11 +637,72 @@ pub(crate) fn finish<'a>(
         }
     }
     let out = reg[root as usize];
+    // Deterministic 2-level coarse min-max block summaries (4^3 and 16^3) for `Grid3` tables.
+    let mut grid_blocks: AVec<'a, [f64; 2]> = Vec::new_in(alloc);
+    let mut grid_summaries: AVec<'a, GridSummary> = Vec::with_capacity_in(tables.len(), alloc);
+    for tb in tables.iter() {
+        if tb.kind != TableKind::Grid3 {
+            grid_summaries.push(GridSummary { b1_start: 0, b1_dims: [0; 3], b2_start: 0, b2_dims: [0; 3] });
+            continue;
+        }
+        let gn = [tb.head[5] as usize, tb.head[6] as usize, tb.head[7] as usize];
+        let vals = &data[tb.start as usize..(tb.start + tb.len) as usize];
+        let b1 = [gn[0].div_ceil(GRID_BLOCK), gn[1].div_ceil(GRID_BLOCK), gn[2].div_ceil(GRID_BLOCK)];
+        let b1_start = grid_blocks.len() as u32;
+        let b1_len = b1[0] * b1[1] * b1[2];
+        grid_blocks.reserve(b1_len);
+        for _ in 0..b1_len {
+            grid_blocks.push([f64::INFINITY, f64::NEG_INFINITY]);
+        }
+        for k in 0..gn[2] {
+            let bk = k / GRID_BLOCK;
+            for j in 0..gn[1] {
+                let bj = j / GRID_BLOCK;
+                let row_ofs = gn[0] * (j + gn[1] * k);
+                let b_row = b1_start as usize + b1[0] * (bj + b1[1] * bk);
+                for i in 0..gn[0] {
+                    let v = vals[row_ofs + i];
+                    let slot = &mut grid_blocks[b_row + (i / GRID_BLOCK)];
+                    slot[0] = slot[0].min(v);
+                    slot[1] = slot[1].max(v);
+                }
+            }
+        }
+        let b2 = [b1[0].div_ceil(GRID_BLOCK), b1[1].div_ceil(GRID_BLOCK), b1[2].div_ceil(GRID_BLOCK)];
+        let b2_start = grid_blocks.len() as u32;
+        let b2_len = b2[0] * b2[1] * b2[2];
+        grid_blocks.reserve(b2_len);
+        for _ in 0..b2_len {
+            grid_blocks.push([f64::INFINITY, f64::NEG_INFINITY]);
+        }
+        for bk in 0..b1[2] {
+            let sk = bk / GRID_BLOCK;
+            for bj in 0..b1[1] {
+                let sj = bj / GRID_BLOCK;
+                let b1_row = b1_start as usize + b1[0] * (bj + b1[1] * bk);
+                let b2_row = b2_start as usize + b2[0] * (sj + b2[1] * sk);
+                for bi in 0..b1[0] {
+                    let pair = grid_blocks[b1_row + bi];
+                    let slot = &mut grid_blocks[b2_row + (bi / GRID_BLOCK)];
+                    slot[0] = slot[0].min(pair[0]);
+                    slot[1] = slot[1].max(pair[1]);
+                }
+            }
+        }
+        grid_summaries.push(GridSummary {
+            b1_start,
+            b1_dims: [b1[0] as u32, b1[1] as u32, b1[2] as u32],
+            b2_start,
+            b2_dims: [b2[0] as u32, b2[1] as u32, b2[2] as u32],
+        });
+    }
     let mut tape = Tape {
         instrs,
         pool,
         tables,
         data,
+        grid_blocks,
+        grid_summaries,
         root,
         level,
         aabb,

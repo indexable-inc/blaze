@@ -28,7 +28,6 @@ use super::{Machine, Mode, Need, NeedKind, R, Repr, Stop, Val, Work, int_info, m
 use crate::error::Refusal;
 use crate::layout::{self, Layout};
 use crate::lit;
-use crate::mem::Scalar;
 use crate::record::{ConstFn, RecordKey};
 use crate::soft::Format;
 use crate::{ConstWorld, FnKind, FnTraitMethod, Intrinsic, Typed};
@@ -60,14 +59,58 @@ pub(super) struct TyInfo {
     pub(super) valid: Valid,
 }
 
-/// An operand type of arithmetic.
+/// An operand type of arithmetic, packed into one byte so `Op::Binary` and `Op::StoreOp` fit in 16 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Num {
-    Int { bits: u32, signed: bool },
+    I8,
+    I16,
+    I32,
+    I64,
+    I128,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
     Bool,
-    Float(FloatTy),
+    F16,
+    F32,
+    F64,
+    F128,
     /// Not a number: refused once the values are seen to be no pointers.
     Other,
+}
+
+const _: () = assert!(core::mem::size_of::<Num>() == 1);
+
+impl Num {
+    #[inline(always)]
+    pub(super) fn int(self) -> Option<(u32, bool)> {
+        Some(match self {
+            Num::I8 => (8, true),
+            Num::I16 => (16, true),
+            Num::I32 => (32, true),
+            Num::I64 => (64, true),
+            Num::I128 => (128, true),
+            Num::U8 => (8, false),
+            Num::U16 => (16, false),
+            Num::U32 => (32, false),
+            Num::U64 => (64, false),
+            Num::U128 => (128, false),
+            _ => return None,
+        })
+    }
+
+    #[inline(always)]
+    pub(super) fn float(self) -> Option<FloatTy> {
+        Some(match self {
+            Num::F16 => FloatTy::F16,
+            Num::F32 => FloatTy::F32,
+            Num::F64 => FloatTy::F64,
+            Num::F128 => FloatTy::F128,
+            _ => return None,
+        })
+    }
 }
 
 /// How a borrow treats a place's length.
@@ -81,19 +124,25 @@ pub(super) enum Meta {
     Need,
 }
 
-/// One operation. Registers are the frame's; a jump's target is an index in the code.
+/// One operation, packed to 16 bytes for L1 cache density. Wide immediates and rarely-used
+/// multi-word operands live in side tables on `Code`.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Op {
-    /// A value known when compiled: a literal, `()`, a fn item.
-    Imm { dst: Reg, v: Val },
-    /// A string or byte-string literal: its bytes (`Code::bytes`) as fresh immutable data.
-    Str { dst: Reg, at: u32, len: u32, wide: bool },
+    /// Zero-sized immediate (`()`, fn item, empty tuple/array).
+    ImmZst { dst: Reg },
+    /// Scalar integer immediate up to 64 bits (covers `bool`, `char`, `usize`, `u8..u64`, `i8..i64`, `f16..f64`).
+    ImmU64 { dst: Reg, v: u64 },
+    /// Wide immediate in `Code::imms[k]` (128-bit integers/floats).
+    Imm { dst: Reg, k: u32 },
+    /// A string or byte-string literal (`Code::strs[k]`), cached once per evaluation.
+    Str { dst: Reg, k: u32 },
     Move { dst: Reg, src: Reg },
     /// The place of a local held in memory, allocated when first used.
     Local { dst: Reg, slot: u32, ty: u32 },
     /// The place of a constant's value, by its record (`Code::consts`).
     Const { dst: Reg, k: u32 },
-    Static { dst: Reg, item: ItemKey },
+    /// The place of a static (`Code::statics[k]`).
+    Static { dst: Reg, k: u32 },
     /// A place's value (a value stays as it is).
     Load { dst: Reg, src: Reg, ty: u32 },
     /// A value's place: a temporary holding it (a place stays as it is).
@@ -102,23 +151,25 @@ pub(super) enum Op {
     Deref { dst: Reg, src: Reg },
     /// A pointer to a place.
     Borrow { dst: Reg, src: Reg, meta: Meta },
-    /// A pointer to an array made a slice's pointer and length.
-    Unsize { dst: Reg, src: Reg, n: u64 },
+    /// A pointer to an array made a slice's pointer and length (`n` fits in `u32`).
+    Unsize { dst: Reg, src: Reg, n: u32 },
+    /// A pointer to an array made a slice's pointer and length (`Code::u64s[k]`).
+    UnsizeWide { dst: Reg, src: Reg, k: u32 },
     /// A fn pointer to `Code::fns[k]`.
     FnPtr { dst: Reg, k: u32 },
     Unary { dst: Reg, src: Reg, op: UnOp, num: Num },
     Binary { dst: Reg, l: Reg, r: Reg, op: BinOp, num: Num, rnum: Num },
-    Cast { dst: Reg, src: Reg, from: PTy, to: PTy },
-    /// The discriminant of the enum (a place or a value of code type `ty`) whose facts are
-    /// `Code::enums[e]`, masked to `bits`: `as` on a fieldless enum and `discriminant_value`.
-    Discr { dst: Reg, src: Reg, e: u32, ty: u32, bits: u32 },
+    /// Scalar/pointer cast (`Code::casts[k]` holds `(from, to)`).
+    Cast { dst: Reg, src: Reg, k: u32 },
+    /// The discriminant of the enum (`Code::discr_ops[k]`).
+    Discr { dst: Reg, src: Reg, k: u32 },
     /// A field's place: the base place moved by `off`. `tail`: the field is the unsized tail
-    /// of a dynamically sized struct (crypto-bigint's `UintRef(pub [Limb])`), whose place keeps
-    /// the base place's length (the Reference, "Dynamically sized types": the struct's
-    /// metadata is its last field's); every other field's place has none.
-    Field { dst: Reg, src: Reg, off: u64, tail: bool },
-    /// An element's place; `len` the array's, or `None`: the slice place's own.
-    Index { dst: Reg, base: Reg, index: Reg, size: u64, len: Option<u64> },
+    /// of a dynamically sized struct, whose place keeps the base place's length.
+    Field { dst: Reg, src: Reg, off: u32, tail: bool },
+    /// A field's place with offset `Code::u64s[k]`.
+    FieldWide { dst: Reg, src: Reg, k: u32, tail: bool },
+    /// An element's place (`Code::indexes[k]`).
+    Index { dst: Reg, k: u32 },
     /// A struct, variant, tuple or array value made of parts (`Code::builds[k]`).
     Build { dst: Reg, k: u32 },
     /// A struct expression with a base: the base's value with some fields set.
@@ -143,23 +194,61 @@ pub(super) enum Op {
     Kill { mark: Reg },
     /// Nothing (a `Mark` whose statement made no temporary).
     Nop,
-    /// Jump unless the enum value at `place` (facts `Code::enums[e]`) is variant `variant`.
-    IfVariant { place: Reg, e: u32, variant: u32, fail: u32 },
-    /// Jump unless two values of type `ty` are equal; `konst`: the left is a constant's.
-    IfSame { a: Reg, b: Reg, ty: PTy, konst: bool, fail: u32 },
-    /// Jump unless the slice at `place` has `len` elements (`at_least`: `len` or more, a slice
-    /// pattern with `..`).
-    IfLen { place: Reg, len: u64, at_least: bool, fail: u32 },
-    /// The place of the element `back` from the end (`back` at least 1) of the slice at `src`,
-    /// its elements `size` bytes apart: a slice pattern's element after its `..`.
-    FromEnd { dst: Reg, src: Reg, size: u64, back: u64 },
-    /// The subslice of the slice at `src` without its first `from` and last `back` elements: a
-    /// slice pattern's `..`, which a length test before it has made at least `from + back` long.
-    Subslice { dst: Reg, src: Reg, size: u64, from: u64, back: u64 },
+    /// Jump unless the enum value at `place` (`Code::if_variants[k]` = `(e, variant)`) matches.
+    IfVariant { place: Reg, k: u32, fail: u32 },
+    /// Jump unless two values (`Code::if_sames[k]`) are equal.
+    IfSame { k: u32, fail: u32 },
+    /// Jump unless the slice at `place` matches length (`Code::if_lens[k]` = `(len, at_least)`).
+    IfLen { place: Reg, k: u32, fail: u32 },
+    /// The place of the element `back` from the end (`Code::slice_ops[k]`).
+    FromEnd { dst: Reg, src: Reg, k: u32 },
+    /// The subslice without its first `from` and last `back` elements (`Code::slice_ops[k]`).
+    Subslice { dst: Reg, src: Reg, k: u32 },
     /// A binding by value into memory: `size` bytes from place `src` to place `dst`.
-    Copy { dst: Reg, src: Reg, size: u64 },
+    Copy { dst: Reg, src: Reg, size: u32 },
+    /// A binding by value into memory: `Code::u64s[k]` bytes from `src` to `dst`.
+    CopyWide { dst: Reg, src: Reg, k: u32 },
     /// Stop: `Code::lates[k]`.
     Late { k: u32 },
+}
+
+const _: () = assert!(core::mem::size_of::<Op>() <= 16);
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct StrLit {
+    pub(super) at: u32,
+    pub(super) len: u32,
+    pub(super) wide: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DiscrOp {
+    pub(super) e: u32,
+    pub(super) ty: u32,
+    pub(super) bits: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct IndexOp {
+    pub(super) base: Reg,
+    pub(super) index: Reg,
+    pub(super) size: u64,
+    pub(super) len: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct IfSameOp {
+    pub(super) a: Reg,
+    pub(super) b: Reg,
+    pub(super) ty: PTy,
+    pub(super) konst: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SliceOp {
+    pub(super) size: u64,
+    pub(super) from: u64,
+    pub(super) back: u64,
 }
 
 /// A made value's parts: each a register stored at an offset.
@@ -219,6 +308,18 @@ pub(super) struct Code<A: Allocator + Clone> {
     pub(super) ret: PTy,
     pub(super) tys: Vec<TyInfo, A>,
     pub(super) bytes: Vec<u8, A>,
+    /// Side tables for compact 16-byte `Op`.
+    pub(super) imms: Vec<Val, A>,
+    pub(super) strs: Vec<StrLit, A>,
+    pub(super) casts: Vec<(PTy, PTy), A>,
+    pub(super) discr_ops: Vec<DiscrOp, A>,
+    pub(super) indexes: Vec<IndexOp, A>,
+    pub(super) if_variants: Vec<(u32, u32), A>,
+    pub(super) if_sames: Vec<IfSameOp, A>,
+    pub(super) if_lens: Vec<(u64, bool), A>,
+    pub(super) slice_ops: Vec<SliceOp, A>,
+    pub(super) u64s: Vec<u64, A>,
+    pub(super) statics: Vec<ItemKey, A>,
     /// The constants it reads: item, arguments, record key.
     pub(super) consts: Vec<(ItemKey, List, RecordKey), A>,
     /// The fn pointers it makes: each one's key and the instance it was made from.
@@ -285,44 +386,46 @@ impl EnumFacts {
     }
 }
 
+/// The compiled bodies of a unit, separated from `Work` so `Machine` can borrow `&mut Work`
+/// and `&mut CodeTable` simultaneously with zero moves.
+pub(super) struct CodeTable<A: Allocator + Clone> {
+    pub(super) list: Vec<Code<A>, A>,
+    pub(super) by: HashMap<(ItemKey, List), u32, A>,
+    pub(super) alloc: A,
+    /// The evaluations begun on this table.
+    pub(super) evaluation: u64,
+}
+
 /// The code of a unit's bodies, by item and ground arguments: compiled once, run by every
 /// evaluation in the unit. It lives as long as the unit's ground table and layouts, whose ids
 /// it holds.
 pub struct Codes<A: Allocator + Clone> {
-    pub(super) list: Vec<Code<A>, A>,
-    by: HashMap<(ItemKey, List), u32, A>,
-    /// The machine's working vectors, kept for the next evaluation of the unit (empty, with
-    /// no room, while an evaluation holds them).
-    work: Work<A>,
-    alloc: A,
-    /// The evaluations begun on this table: each takes the work once ([`Self::take_work`]).
-    pub(super) evaluation: u64,
+    pub(super) table: CodeTable<A>,
+    /// The machine's working vectors, kept for the next evaluation of the unit and borrowed
+    /// in place (`&mut Work`) with zero struct moves.
+    pub(super) work: Work<A>,
 }
 
 impl<A: Allocator + Clone> Codes<A> {
     pub fn new_in(alloc: A) -> Codes<A> {
-        Codes { list: Vec::new_in(alloc.clone()), by: HashMap::new_in(alloc.clone()), work: Work::new_in(alloc.clone()), alloc, evaluation: 0 }
-    }
-
-    /// The working vectors, for one evaluation, which gives them back ([`Self::put_work`]).
-    /// Taking them begins an evaluation: incomplete code compiled before it is compiled again
-    /// when asked for.
-    pub(super) fn take_work(&mut self) -> Work<A> {
-        self.evaluation += 1;
-        core::mem::replace(&mut self.work, Work::new_in(self.alloc.clone()))
-    }
-
-    pub(super) fn put_work(&mut self, work: Work<A>) {
-        self.work = work;
+        Codes {
+            table: CodeTable {
+                list: Vec::new_in(alloc.clone()),
+                by: HashMap::new_in(alloc.clone()),
+                alloc: alloc.clone(),
+                evaluation: 0,
+            },
+            work: Work::new_in(alloc),
+        }
     }
 
     /// Bodies compiled.
     pub fn len(&self) -> usize {
-        self.list.len()
+        self.table.list.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.list.is_empty()
+        self.table.list.is_empty()
     }
 }
 
@@ -487,10 +590,22 @@ fn rows<K: Ord + Copy>(col: &[K], key: K) -> core::ops::Range<usize> {
 pub(super) fn num(n: PNode) -> Num {
     match n {
         PNode::Bool => Num::Bool,
-        PNode::Float(f) => Num::Float(f),
+        PNode::Float(FloatTy::F16) => Num::F16,
+        PNode::Float(FloatTy::F32) => Num::F32,
+        PNode::Float(FloatTy::F64) => Num::F64,
+        PNode::Float(FloatTy::F128) => Num::F128,
         _ => match int_info(n) {
-            Some((bits, signed)) => Num::Int { bits, signed },
-            None => Num::Other,
+            Some((8, true)) => Num::I8,
+            Some((16, true)) => Num::I16,
+            Some((32, true)) => Num::I32,
+            Some((64, true)) => Num::I64,
+            Some((128, true)) => Num::I128,
+            Some((8, false)) => Num::U8,
+            Some((16, false)) => Num::U16,
+            Some((32, false)) => Num::U32,
+            Some((64, false)) => Num::U64,
+            Some((128, false)) => Num::U128,
+            _ => Num::Other,
         },
     }
 }
@@ -563,9 +678,9 @@ impl Refusal<'_> {
     }
 }
 
-impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine<'w, 'l, 'g, 't, 'a, W, L, K> {
+impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine<'w, 'l, 'g, 't, 'wk, 'a, W, L, K> {
     /// The code of `item` at ground arguments `args`: the unit's, or compiled now.
-    pub(super) fn code<A: Allocator + Clone>(&mut self, codes: &mut Codes<A>, item: ItemKey, args: List) -> R<'a, u32> {
+    pub(super) fn code<A: Allocator + Clone>(&mut self, codes: &mut CodeTable<A>, item: ItemKey, args: List) -> R<'a, u32> {
         let old = codes.by.get(&(item, args)).copied();
         if let Some(i) = old {
             let c = &codes.list[i as usize];
@@ -594,6 +709,17 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 ret: PTy(0),
                 tys: Vec::new_in(codes.alloc.clone()),
                 bytes: Vec::new_in(codes.alloc.clone()),
+                imms: Vec::new_in(codes.alloc.clone()),
+                strs: Vec::new_in(codes.alloc.clone()),
+                casts: Vec::new_in(codes.alloc.clone()),
+                discr_ops: Vec::new_in(codes.alloc.clone()),
+                indexes: Vec::new_in(codes.alloc.clone()),
+                if_variants: Vec::new_in(codes.alloc.clone()),
+                if_sames: Vec::new_in(codes.alloc.clone()),
+                if_lens: Vec::new_in(codes.alloc.clone()),
+                slice_ops: Vec::new_in(codes.alloc.clone()),
+                u64s: Vec::new_in(codes.alloc.clone()),
+                statics: Vec::new_in(codes.alloc.clone()),
                 consts: Vec::new_in(codes.alloc.clone()),
                 fns: Vec::new_in(codes.alloc.clone()),
                 calls: Vec::new_in(codes.alloc.clone()),
@@ -756,6 +882,55 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
         (code.ops.len() - 1) as u32
     }
 
+    fn emit_imm<A: Allocator + Clone>(&self, code: &mut Code<A>, cc: &mut Cc<'w, '_>, dst: Reg, v: Val) -> u32 {
+        let op = match v {
+            Val::Zst => Op::ImmZst { dst },
+            Val::Int(n) => Op::ImmU64 { dst, v: n },
+            other => {
+                let k = code.imms.len() as u32;
+                code.imms.push(other);
+                Op::Imm { dst, k }
+            }
+        };
+        self.emit(code, cc, op)
+    }
+
+    fn emit_field<A: Allocator + Clone>(&self, code: &mut Code<A>, cc: &mut Cc<'w, '_>, dst: Reg, src: Reg, off: u64, tail: bool) -> u32 {
+        let op = match u32::try_from(off) {
+            Ok(off) => Op::Field { dst, src, off, tail },
+            Err(_) => {
+                let k = code.u64s.len() as u32;
+                code.u64s.push(off);
+                Op::FieldWide { dst, src, k, tail }
+            }
+        };
+        self.emit(code, cc, op)
+    }
+
+    fn emit_copy<A: Allocator + Clone>(&self, code: &mut Code<A>, cc: &mut Cc<'w, '_>, dst: Reg, src: Reg, size: u64) -> u32 {
+        let op = match u32::try_from(size) {
+            Ok(size) => Op::Copy { dst, src, size },
+            Err(_) => {
+                let k = code.u64s.len() as u32;
+                code.u64s.push(size);
+                Op::CopyWide { dst, src, k }
+            }
+        };
+        self.emit(code, cc, op)
+    }
+
+    fn emit_unsize<A: Allocator + Clone>(&self, code: &mut Code<A>, cc: &mut Cc<'w, '_>, dst: Reg, src: Reg, n: u64) -> u32 {
+        let op = match u32::try_from(n) {
+            Ok(n) => Op::Unsize { dst, src, n },
+            Err(_) => {
+                let k = code.u64s.len() as u32;
+                code.u64s.push(n);
+                Op::UnsizeWide { dst, src, k }
+            }
+        };
+        self.emit(code, cc, op)
+    }
+
     /// Fn item type `ty`'s value as a fn pointer: the one reification, for the checker's
     /// `ReifyFnPointer` adjustment and for an `as` cast of a fn item (`id::<T> as fn(T) -> T`)
     /// alike. The record names the instance ([`ConstFn`]).
@@ -806,7 +981,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
             if cc.fix[i].0 == list {
                 let op = cc.fix[i].1;
                 set_target(&mut code.ops[op as usize], here);
-                cc.fix.swap_remove(i);
+                cc.fix.remove_swap(i);
             } else {
                 i += 1;
             }
@@ -932,10 +1107,10 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
         };
         let node = self.node(ty)?;
         Ok(match node {
-            PNode::Bool | PNode::Char => Val::S(Scalar::Int(bits)),
+            PNode::Bool | PNode::Char => Val::int(bits),
             PNode::Int(_) | PNode::Uint(_) => {
                 let (width, _) = int_info(node).ok_or(malformed("a const parameter's integer type with no size"))?;
-                Val::S(Scalar::Int(mask(bits, width)))
+                Val::int(mask(bits, width))
             }
             // Under `adt_const_params` the bits are a fieldless enum's variant index, not its
             // stored tag: building that value is not written yet.
@@ -1087,15 +1262,15 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
         let dst = self.reg(cc, Kind::V);
         let node = self.node(t)?;
         let v = match l {
-            Lit::Bool(b) => Val::S(Scalar::Int(u128::from(b))),
+            Lit::Bool(b) => Val::Int(u64::from(b)),
             Lit::Int(_) => {
                 let v = lit::int(src).map_err(Refusal::Literal)?;
                 match node {
                     // Rounded once from the integer, at every float width.
-                    PNode::Float(f) => Val::S(Scalar::Int(Format::of(f).from_int(neg, v))),
+                    PNode::Float(f) => Val::int(Format::of(f).from_int(neg, v)),
                     _ => {
                         let (bits, _) = int_info(node).ok_or(malformed("an integer literal of a type that is not an integer"))?;
-                        Val::S(Scalar::Int(mask(if neg { v.wrapping_neg() } else { v }, bits)))
+                        Val::int(mask(if neg { v.wrapping_neg() } else { v }, bits))
                     }
                 }
             }
@@ -1109,14 +1284,16 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                     FloatTy::F16 | FloatTy::F128 => fm.parse(src, self.alloc).map_err(Refusal::Literal)?,
                 };
                 let sign = if neg { fm.sign() } else { 0 };
-                Val::S(Scalar::Int(bits ^ sign))
+                Val::int(bits ^ sign)
             }
-            Lit::Char => Val::S(Scalar::Int(u128::from(lit::char(src).map_err(Refusal::Literal)?))),
+            Lit::Char => Val::Int(u64::from(lit::char(src).map_err(Refusal::Literal)?)),
             Lit::Str | Lit::ByteStr(_) => {
                 let bytes = lit::bytes(src, self.alloc).map_err(Refusal::Literal)?;
                 let at = code.bytes.len() as u32;
                 code.bytes.extend_from_slice(&bytes);
-                self.emit(code, cc, Op::Str { dst, at, len: bytes.len() as u32, wide: matches!(l, Lit::Str) });
+                let k = code.strs.len() as u32;
+                code.strs.push(StrLit { at, len: bytes.len() as u32, wide: matches!(l, Lit::Str) });
+                self.emit(code, cc, Op::Str { dst, k });
                 return Ok(dst);
             }
             // `&CStr`: a wide pointer whose metadata is the length of its `[c_char]`, the
@@ -1125,11 +1302,13 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 let bytes = lit::c_bytes(src, self.alloc).map_err(Refusal::Literal)?;
                 let at = code.bytes.len() as u32;
                 code.bytes.extend_from_slice(&bytes);
-                self.emit(code, cc, Op::Str { dst, at, len: bytes.len() as u32, wide: true });
+                let k = code.strs.len() as u32;
+                code.strs.push(StrLit { at, len: bytes.len() as u32, wide: true });
+                self.emit(code, cc, Op::Str { dst, k });
                 return Ok(dst);
             }
         };
-        self.emit(code, cc, Op::Imm { dst, v });
+        self.emit_imm(code, cc, dst, v);
         Ok(dst)
     }
 
@@ -1138,7 +1317,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
         let ty = self.ty(code, t)?;
         let dst = self.reg(cc, Kind::V);
         if code.tys[ty as usize].repr == Repr::Zst {
-            self.emit(code, cc, Op::Imm { dst, v: Val::Zst });
+            self.emit(code, cc, Op::ImmZst { dst });
             return Ok(dst);
         }
         if !matches!(code.tys[ty as usize].repr, Repr::Mem(_)) {
@@ -1249,9 +1428,13 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                     let (bits, _) = int_info(self.node(to)?).ok_or(malformed("an enum cast to a type that is not an integer"))?;
                     let e = self.enum_facts(code, from)?;
                     let ty = self.ty(code, from)?;
-                    self.emit(code, cc, Op::Discr { dst, src, e, ty, bits });
+                    let k = code.discr_ops.len() as u32;
+                    code.discr_ops.push(DiscrOp { e, ty, bits });
+                    self.emit(code, cc, Op::Discr { dst, src, k });
                 } else {
-                    self.emit(code, cc, Op::Cast { dst, src, from, to });
+                    let k = code.casts.len() as u32;
+                    code.casts.push((from, to));
+                    self.emit(code, cc, Op::Cast { dst, src, k });
                 }
                 cc.rs.push(dst);
             }
@@ -1287,7 +1470,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 let ft = self.field_ty(bt, variant, field)?;
                 let tail = layout::is_unsized(self.world, self.ground, ft, self.alloc)?;
                 let dst = self.reg(cc, Kind::P);
-                self.emit(code, cc, Op::Field { dst, src, off, tail });
+                self.emit_field(code, cc, dst, src, off, tail);
                 cc.rs.push(dst);
             }
             C::Index(e) => {
@@ -1303,7 +1486,9 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 let _ = ie;
                 let (size, _) = self.size_align(elem)?;
                 let dst = self.reg(cc, Kind::P);
-                self.emit(code, cc, Op::Index { dst, base: b, index, size, len });
+                let k = code.indexes.len() as u32;
+                code.indexes.push(IndexOp { base: b, index, size, len });
+                self.emit(code, cc, Op::Index { dst, k });
                 cc.rs.push(dst);
             }
             C::Aggregate(e) => {
@@ -1332,7 +1517,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 let elem = self.ty(code, el)?;
                 let dst = self.reg(cc, Kind::V);
                 if code.tys[ty as usize].repr == Repr::Zst {
-                    self.emit(code, cc, Op::Imm { dst, v: Val::Zst });
+                    self.emit(code, cc, Op::ImmZst { dst });
                 } else {
                     code.repeats.push(Repeat { ty, elem, n });
                     let k = code.repeats.len() as u32 - 1;
@@ -1428,7 +1613,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                         cc.tasks.push(C::Eval(x, Mode::Value));
                     }
                     None => {
-                        self.emit(code, cc, Op::Imm { dst, v: Val::Zst });
+                        self.emit(code, cc, Op::ImmZst { dst });
                         self.patch_one(code, end);
                         cc.rs.push(dst);
                     }
@@ -1472,7 +1657,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                         Some(t) => cc.tasks.push(C::Eval(t, Mode::Value)),
                         None => {
                             let d = self.reg(cc, Kind::V);
-                            self.emit(code, cc, Op::Imm { dst: d, v: Val::Zst });
+                            self.emit(code, cc, Op::ImmZst { dst: d });
                             cc.rs.push(d);
                         }
                     },
@@ -1635,7 +1820,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                     }
                 }
                 let d = self.reg(cc, Kind::V);
-                self.emit(code, cc, Op::Imm { dst: d, v: Val::Zst });
+                self.emit(code, cc, Op::ImmZst { dst: d });
                 cc.rs.push(d);
             }
             C::AssignOp(e) => {
@@ -1657,7 +1842,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                     }
                 }
                 let d = self.reg(cc, Kind::V);
-                self.emit(code, cc, Op::Imm { dst: d, v: Val::Zst });
+                self.emit(code, cc, Op::ImmZst { dst: d });
                 cc.rs.push(d);
             }
         }
@@ -1712,8 +1897,10 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                         if m == Mutbl::Mut {
                             return Err(Stop::Refused(Refusal::MutableStatic { item: k }));
                         }
+                        let sk = code.statics.len() as u32;
+                        code.statics.push(k);
                         let dst = self.reg(cc, Kind::P);
-                        self.emit(code, cc, Op::Static { dst, item: k });
+                        self.emit(code, cc, Op::Static { dst, k: sk });
                         cc.rs.push(dst);
                     }
                     Some(Def::Ctor { variant, kind: blaze_typeck::CtorKind::Unit, .. }) => {
@@ -1729,13 +1916,13 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                     Some(Def::TyParam(i)) => {
                         let v = self.const_param_value(cc, i)?;
                         let dst = self.reg(cc, Kind::V);
-                        self.emit(code, cc, Op::Imm { dst, v });
+                        self.emit_imm(code, cc, dst, v);
                         cc.rs.push(dst);
                     }
                     _ => match self.node(t)? {
                         PNode::FnDef(..) => {
                             let dst = self.reg(cc, Kind::V);
-                            self.emit(code, cc, Op::Imm { dst, v: Val::Zst });
+                            self.emit(code, cc, Op::ImmZst { dst });
                             cc.rs.push(dst);
                         }
                         _ => return Err(malformed("a path with no definition")),
@@ -1786,7 +1973,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                     Some(v) => cc.tasks.push(C::Eval(v, Mode::Value)),
                     None => {
                         let d = self.reg(cc, Kind::V);
-                        self.emit(code, cc, Op::Imm { dst: d, v: Val::Zst });
+                        self.emit(code, cc, Op::ImmZst { dst: d });
                         cc.rs.push(d);
                     }
                 }
@@ -1803,7 +1990,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                     Some(v) => cc.tasks.push(C::Eval(v, Mode::Value)),
                     None => {
                         let d = self.reg(cc, Kind::V);
-                        self.emit(code, cc, Op::Imm { dst: d, v: Val::Zst });
+                        self.emit(code, cc, Op::ImmZst { dst: d });
                         cc.rs.push(d);
                     }
                 }
@@ -1920,7 +2107,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                     }
                 }
                 let dst = self.reg(cc, Kind::V);
-                self.emit(code, cc, Op::Imm { dst, v: Val::Zst });
+                self.emit(code, cc, Op::ImmZst { dst });
                 cc.rs.push(dst);
             }
             // An `if` condition's `let` links are compiled by machine/lets.rs; a `let` reached
@@ -1938,7 +2125,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
             Expr::OffsetOf { ty, fields } => {
                 let off = self.offset_of(cc, ty, fields)?;
                 let dst = self.reg(cc, Kind::V);
-                self.emit(code, cc, Op::Imm { dst, v: Val::S(Scalar::Int(u128::from(off))) });
+                self.emit(code, cc, Op::ImmU64 { dst, v: off });
                 cc.rs.push(dst);
             }
         }
@@ -2095,7 +2282,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                         _ => return Err(unsupported("an unsizing coercion of a value that is not a pointer")),
                     };
                     let dst = self.reg(cc, Kind::V);
-                    self.emit(code, cc, Op::Unsize { dst, src, n });
+                    self.emit_unsize(code, cc, dst, src, n);
                     dst
                 }
             };
@@ -2192,7 +2379,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                     let off = self.field_offset(tt, 0, k)?;
                     let tail = layout::is_unsized(self.world, self.ground, ft, self.alloc)?;
                     let fp = self.reg(cc, Kind::P);
-                    self.emit(code, cc, Op::Field { dst: fp, src: place, off, tail });
+                    self.emit_field(code, cc, fp, place, off, tail);
                     inner.push((fp, ft));
                 }
                 let (k, l) = self.resolve(k, l)?;
@@ -2213,7 +2400,9 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 let place = self.reg(cc, Kind::P);
                 self.emit(code, cc, Op::Deref { dst: place, src: v });
                 let dst = self.reg(cc, Kind::V);
-                self.emit(code, cc, Op::Discr { dst, src: place, e, ty, bits });
+                let k = code.discr_ops.len() as u32;
+                code.discr_ops.push(DiscrOp { e, ty, bits });
+                self.emit(code, cc, Op::Discr { dst, src: place, k });
                 dst
             }
             FnKind::Intrinsic(i) => {
@@ -2308,7 +2497,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                                 self.emit(code, cc, Op::Store { place: local, src: b, ty });
                             } else {
                                 let (size, _) = self.size_align(lt)?;
-                                self.emit(code, cc, Op::Copy { dst: local, src: pl, size });
+                                self.emit_copy(code, cc, local, pl, size);
                             }
                         }
                         Home::None => return Err(malformed("a binding with no home")),
@@ -2327,7 +2516,9 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 Pat::Lit(_) | Pat::NegLit(_) => {
                     let want = self.pat_value(cc, code, p, t)?;
                     let have = self.as_value(cc, code, pl, t)?;
-                    let j = self.emit(code, cc, Op::IfSame { a: want, b: have, ty: t, konst: false, fail: u32::MAX });
+                    let k = code.if_sames.len() as u32;
+                    code.if_sames.push(IfSameOp { a: want, b: have, ty: t, konst: false });
+                    let j = self.emit(code, cc, Op::IfSame { k, fail: u32::MAX });
                     self.to_list(cc, fail, j);
                 }
                 Pat::Path(_) => match self.pat_def_c(cc, p) {
@@ -2335,7 +2526,9 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                     Some(Def::Const(_)) => {
                         let want = self.pat_value(cc, code, p, t)?;
                         let have = self.as_value(cc, code, pl, t)?;
-                        let j = self.emit(code, cc, Op::IfSame { a: want, b: have, ty: t, konst: true, fail: u32::MAX });
+                        let k = code.if_sames.len() as u32;
+                        code.if_sames.push(IfSameOp { a: want, b: have, ty: t, konst: true });
+                        let j = self.emit(code, cc, Op::IfSame { k, fail: u32::MAX });
                         self.to_list(cc, fail, j);
                     }
                     _ => return Err(malformed("a path pattern with no definition")),
@@ -2384,7 +2577,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                         let off = self.field_offset(t, variant, idx)?;
                         let tail = layout::is_unsized(self.world, self.ground, ft, self.alloc)?;
                         let fpl = self.reg(cc, Kind::P);
-                        self.emit(code, cc, Op::Field { dst: fpl, src: pl, off, tail });
+                        self.emit_field(code, cc, fpl, pl, off, tail);
                         work.push(P::Pat { p: fp.pat, place: fpl, ty: ft, fail });
                     }
                 }
@@ -2413,7 +2606,9 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                         }
                         Some(_) => {}
                         None => {
-                            let j = self.emit(code, cc, Op::IfLen { place: pl, len: fixed, at_least: rest.is_some(), fail: u32::MAX });
+                            let k = code.if_lens.len() as u32;
+                            code.if_lens.push((fixed, rest.is_some()));
+                            let j = self.emit(code, cc, Op::IfLen { place: pl, k, fail: u32::MAX });
                             self.to_list(cc, fail, j);
                         }
                     }
@@ -2426,21 +2621,29 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                             Some(r) if k == r => {
                                 let back = count - 1 - r;
                                 match len {
-                                    Some(_) => self.emit(code, cc, Op::Field { dst: q, src: pl, off: size * k, tail: false }),
-                                    None => self.emit(code, cc, Op::Subslice { dst: q, src: pl, size, from: k, back }),
+                                    Some(_) => { self.emit_field(code, cc, q, pl, size * k, false); }
+                                    None => {
+                                        let sk = code.slice_ops.len() as u32;
+                                        code.slice_ops.push(SliceOp { size, from: k, back });
+                                        self.emit(code, cc, Op::Subslice { dst: q, src: pl, k: sk });
+                                    }
                                 };
                                 self.cg(cc, *typed.pat_ty.get(sp.ix()).ok_or(malformed("a pattern with no type"))?)?
                             }
                             Some(r) if k > r => {
                                 let back = count - k;
                                 match len {
-                                    Some(n) => self.emit(code, cc, Op::Field { dst: q, src: pl, off: size * (n - back), tail: false }),
-                                    None => self.emit(code, cc, Op::FromEnd { dst: q, src: pl, size, back }),
+                                    Some(n) => { self.emit_field(code, cc, q, pl, size * (n - back), false); }
+                                    None => {
+                                        let sk = code.slice_ops.len() as u32;
+                                        code.slice_ops.push(SliceOp { size, from: 0, back });
+                                        self.emit(code, cc, Op::FromEnd { dst: q, src: pl, k: sk });
+                                    }
                                 };
                                 el
                             }
                             _ => {
-                                self.emit(code, cc, Op::Field { dst: q, src: pl, off: size * k, tail: false });
+                                self.emit_field(code, cc, q, pl, size * k, false);
                                 el
                             }
                         };
@@ -2489,7 +2692,11 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
         let e = self.enum_facts(code, ty)?;
         let facts = code.enums[e as usize];
         let j = match facts.tag_at() {
-            Some(_) => self.emit(code, cc, Op::IfVariant { place, e, variant, fail: u32::MAX }),
+            Some(_) => {
+                let k = code.if_variants.len() as u32;
+                code.if_variants.push((e, variant));
+                self.emit(code, cc, Op::IfVariant { place, k, fail: u32::MAX })
+            }
             // No tag: the one variant the layout names, known now.
             None if facts.variant(0, &code.discrs)? == variant => return Ok(()),
             None => self.jump(code, cc),
@@ -2555,7 +2762,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
             let off = self.field_offset(t, variant, field)?;
             let tail = layout::is_unsized(self.world, self.ground, ft, self.alloc)?;
             let q = self.reg(cc, Kind::P);
-            self.emit(code, cc, Op::Field { dst: q, src: pl, off, tail });
+            self.emit_field(code, cc, q, pl, off, tail);
             work.push(P::Pat { p: sp, place: q, ty: ft, fail });
         }
         Ok(())

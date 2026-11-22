@@ -97,3 +97,64 @@ fn substitution_respects_nested_binders() -> Result<(), SolveError> {
     assert_eq!(super::instantiate_bound(&mut tys, &mut scratch, quantified, outer_args)?, expected);
     Ok(())
 }
+
+/// `import_list_at` shares one memo generation across all elements of a list (a repeated compound
+/// subterm is imported once, not once per list slot), handles lists longer than the 8-element
+/// stack buffer, and leaves `memo` clean for subsequent imports with different arguments.
+#[test]
+fn import_list_shares_memo_and_spills_past_eight() -> Result<(), SolveError> {
+    use crate::term::List;
+
+    let mut tys = TestTys::new();
+    let mut scratch = Scratch::new_in(blaze_own::testing::heap().alloc());
+    let nodes = [
+        TyKind::Param(0),                                   // 0: T
+        TyKind::Slice(Ty(0)),                               // 1: [T]
+        TyKind::RawPtr(Ty(1), crate::term::Mutbl::Not),     // 2: *const [T]
+    ];
+    // 10-element list (> 8 inline buffer) repeating the same compound node `Ty(2)` and leaf `Ty(0)`.
+    let lists = [Ty(2), Ty(0), Ty(2), Ty(1), Ty(2), Ty(0), Ty(2), Ty(1), Ty(2), Ty(0)];
+    let p = Portable { nodes: &nodes, lists: &lists };
+    let t1 = tys.mk(TyKind::Bool)?;
+    let t2 = tys.mk(TyKind::Char)?;
+
+    let at = core::panic::Location::caller();
+    let before = scratch.stats.terms_imported;
+    let l1 = super::import_list_at(
+        &mut tys,
+        &mut scratch,
+        p,
+        List { start: 0, len: lists.len() as u32 },
+        Inst { args: &[t1], bound: &[] },
+        at,
+    )?;
+    let imported = scratch.stats.terms_imported - before;
+    // Compound nodes (0, 1, 2) imported once (3) + 3 direct leaf slots of Ty(0) = 6,
+    // far fewer than 5*3 + 2*2 + 3*1 = 22 without shared memo.
+    assert_eq!(imported, 6, "shared memo should import compound subterms once across the list");
+
+    let slice_1 = tys.mk(TyKind::Slice(t1))?;
+    let ptr_1 = tys.mk(TyKind::RawPtr(slice_1, crate::term::Mutbl::Not))?;
+    assert_eq!(l1.len, 10);
+    assert_eq!(tys.list_get(l1, 0), ptr_1);
+    assert_eq!(tys.list_get(l1, 1), t1);
+    assert_eq!(tys.list_get(l1, 3), slice_1);
+    assert_eq!(tys.list_get(l1, 8), ptr_1);
+    assert_eq!(tys.list_get(l1, 9), t1);
+
+    // Next import with a different argument must not see stale memo entries from the previous generation.
+    let l2 = super::import_list_at(
+        &mut tys,
+        &mut scratch,
+        p,
+        List { start: 0, len: lists.len() as u32 },
+        Inst { args: &[t2], bound: &[] },
+        at,
+    )?;
+    let slice_2 = tys.mk(TyKind::Slice(t2))?;
+    let ptr_2 = tys.mk(TyKind::RawPtr(slice_2, crate::term::Mutbl::Not))?;
+    assert_eq!(tys.list_get(l2, 0), ptr_2);
+    assert_eq!(tys.list_get(l2, 3), slice_2);
+    assert_eq!(tys.list_get(l2, 9), t2);
+    Ok(())
+}

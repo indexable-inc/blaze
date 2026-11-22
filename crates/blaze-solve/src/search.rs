@@ -153,6 +153,13 @@ pub struct Inputs<'a> {
     /// The entries' read lists, as the solver's read ids (`readlog::ReadLog`).
     pub reads_pool: Vec<u32, Alloc<'a>>,
     pub prov: Vec<Prov, Alloc<'a>>,
+    /// Per input: head index into `prov` (or `NONE`), chained via `prov_next` in FIFO order so
+    /// provisional lookup only inspects entries belonging to `input`.
+    prov_head: Vec<u32, Alloc<'a>>,
+    prov_next: Vec<u32, Alloc<'a>>,
+    /// Maximum `p.highest` across all entries currently in `prov` (0 when `prov` is empty),
+    /// enabling O(1) skip in `drop_provisional` when no entry depends on `>= head`.
+    prov_max_highest: u32,
 }
 
 const NONE: u32 = u32::MAX;
@@ -181,6 +188,9 @@ impl<'a> Inputs<'a> {
             nested_pool: Vec::new_in(alloc),
             reads_pool: Vec::new_in(alloc),
             prov: Vec::new_in(alloc),
+            prov_head: Vec::new_in(alloc),
+            prov_next: Vec::new_in(alloc),
+            prov_max_highest: 0,
         }
     }
 
@@ -215,6 +225,7 @@ impl<'a> Inputs<'a> {
         self.next.push(head);
         self.success.push(None);
         self.on_stack.push(NONE);
+        self.prov_head.push(NONE);
         Ok(id)
     }
 
@@ -234,7 +245,14 @@ impl<'a> Inputs<'a> {
         {
             return Some(e);
         }
-        self.overflow.iter().find(|o| o.input == input && o.depth == depth && applicable(&o.entry)).map(|o| o.entry)
+        if !self.overflow.is_empty() {
+            return self
+                .overflow
+                .iter()
+                .find(|o| o.input == input && o.depth == depth && applicable(&o.entry))
+                .map(|o| o.entry);
+        }
+        None
     }
 
     /// Stores a finished goal's answer: `nested` its nested goals and `reads` its read ids,
@@ -279,9 +297,137 @@ impl<'a> Inputs<'a> {
         Some(&self.nested_pool[e.nested.0 as usize..(e.nested.0 + e.nested.1) as usize])
     }
 
+    /// First provisional entry index for `input`, or `u32::MAX` when none exist.
+    #[inline]
+    pub fn prov_head(&self, input: u32) -> u32 {
+        self.prov_head[input as usize]
+    }
+
+    /// Next provisional entry index in the same input's chain, or `u32::MAX`.
+    #[inline]
+    pub fn prov_next(&self, idx: u32) -> u32 {
+        self.prov_next[idx as usize]
+    }
+
+    /// Appends a provisional entry and links it at the tail of `p.input`'s chain (preserving
+    /// exact FIFO lookup order).
+    pub fn push_provisional(&mut self, p: Prov) {
+        let idx = self.prov.len() as u32;
+        if self.prov.is_empty() || p.highest > self.prov_max_highest {
+            self.prov_max_highest = p.highest;
+        }
+        self.prov.push(p);
+        self.prov_next.push(NONE);
+        let inp = p.input as usize;
+        let head = self.prov_head[inp];
+        if head == NONE {
+            self.prov_head[inp] = idx;
+        } else {
+            let mut cur = head;
+            while self.prov_next[cur as usize] != NONE {
+                cur = self.prov_next[cur as usize];
+            }
+            self.prov_next[cur as usize] = idx;
+        }
+    }
+
+    /// Clears all provisional entries and unlinks their per-input heads.
+    pub fn clear_provisional(&mut self) {
+        for p in self.prov.iter() {
+            self.prov_head[p.input as usize] = NONE;
+        }
+        self.prov.clear();
+        self.prov_next.clear();
+        self.prov_max_highest = 0;
+    }
+
     /// Drops the provisional entries that depend on the stack entry `head` (the reference
     /// rebases them when a head finishes; solve.md, "Not ported").
     pub fn drop_provisional(&mut self, head: u32) {
-        self.prov.retain(|p| p.highest < head);
+        if self.prov.is_empty() || self.prov_max_highest < head {
+            return;
+        }
+        for p in self.prov.iter() {
+            self.prov_head[p.input as usize] = NONE;
+        }
+        let mut write = 0usize;
+        let mut max_h = 0u32;
+        for read in 0..self.prov.len() {
+            let p = self.prov[read];
+            if p.highest < head {
+                self.prov[write] = p;
+                if write == 0 || p.highest > max_h {
+                    max_h = p.highest;
+                }
+                write += 1;
+            }
+        }
+        self.prov.truncate(write);
+        self.prov_next.truncate(write);
+        self.prov_max_highest = max_h;
+        // Relink in reverse so each input's chain stays in exact FIFO order (`0..write`).
+        for idx in (0..write).rev() {
+            let inp = self.prov[idx].input as usize;
+            self.prov_next[idx] = self.prov_head[inp];
+            self.prov_head[inp] = idx as u32;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provisional_chain_fifo_drop_and_clear() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut inputs = Inputs::new_in(alloc);
+        let a = inputs.intern(&[1]).unwrap();
+        let b = inputs.intern(&[2]).unwrap();
+        let c = inputs.intern(&[3]).unwrap();
+
+        let mk = |input: u32, highest: u32, path: PathKind| Prov {
+            input,
+            heads: Heads::default(),
+            highest,
+            path,
+            ans: None,
+            overflow: false,
+        };
+        inputs.push_provisional(mk(a, 1, PathKind::Coinductive));
+        inputs.push_provisional(mk(b, 3, PathKind::Unknown));
+        inputs.push_provisional(mk(a, 2, PathKind::ForcedAmbiguity));
+        inputs.push_provisional(mk(a, 3, PathKind::Inductive));
+
+        let chain = |inp: &Inputs<'_>, id: u32| -> std::vec::Vec<(u32, PathKind)> {
+            let mut out = std::vec::Vec::new();
+            let mut at = inp.prov_head(id);
+            while at != NONE {
+                let p = inp.prov[at as usize];
+                assert_eq!(p.input, id);
+                out.push((p.highest, p.path));
+                at = inp.prov_next(at);
+            }
+            out
+        };
+
+        assert_eq!(chain(&inputs, a), [(1, PathKind::Coinductive), (2, PathKind::ForcedAmbiguity), (3, PathKind::Inductive)]);
+        assert_eq!(chain(&inputs, b), [(3, PathKind::Unknown)]);
+        assert_eq!(chain(&inputs, c), []);
+
+        // No-op drop above max highest.
+        inputs.drop_provisional(4);
+        assert_eq!(inputs.prov.len(), 4);
+
+        // Drop highest >= 3: b disappears, a keeps (1, 2) in FIFO order.
+        inputs.drop_provisional(3);
+        assert_eq!(chain(&inputs, a), [(1, PathKind::Coinductive), (2, PathKind::ForcedAmbiguity)]);
+        assert_eq!(chain(&inputs, b), []);
+
+        // Clear unlinks everything cleanly.
+        inputs.clear_provisional();
+        assert!(inputs.prov.is_empty());
+        assert_eq!(inputs.prov_head(a), NONE);
+        assert_eq!(inputs.prov_head(b), NONE);
     }
 }

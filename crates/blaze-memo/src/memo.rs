@@ -628,16 +628,53 @@ impl Memo {
                 }
             }
         }
-        let carried: usize = self
+        let mut carried: u64 = self
             .slots
             .iter()
             .flatten()
             .filter(|slot| !is(&dropped, slot.id.index()))
-            .map(|slot| slot.held())
+            .map(|slot| slot.held() as u64)
             .sum();
-        if carried as u64 > self.config.cap_bytes {
-            for slot in self.slots.iter().flatten() {
-                mark(&mut dropped, slot.id.index());
+        // Selective unsealed-first eviction: when carried memory exceeds `cap_bytes`, evict
+        // unsealed arenas first (largest first, oldest generation, downstream-most index) while
+        // maintaining the borrow closure, preserving warm sealed dependency arenas unless still
+        // over cap after all unsealed arenas are dropped.
+        while carried > self.config.cap_bytes {
+            let victim = self
+                .slots
+                .iter()
+                .flatten()
+                .filter(|slot| !is(&dropped, slot.id.index()))
+                .min_by_key(|slot| {
+                    let index = slot.id.index();
+                    (
+                        index == ArenaId::SESSION_INDEX,
+                        slot.is_sealed(),
+                        std::cmp::Reverse(slot.held()),
+                        slot.id.generation(),
+                        std::cmp::Reverse(index),
+                    )
+                });
+            let Some(victim) = victim else {
+                break;
+            };
+            mark(&mut dropped, victim.id.index());
+            carried = carried.saturating_sub(victim.held() as u64);
+            if self.config.plant != Plant::IgnoreBorrows {
+                loop {
+                    let mut grew = false;
+                    for slot in self.slots.iter().flatten() {
+                        let index = slot.id.index();
+                        if !is(&dropped, index) && borrowed(&**slot, &dropped[..]) {
+                            mark(&mut dropped, index);
+                            carried = carried.saturating_sub(slot.held() as u64);
+                            grew = true;
+                        }
+                    }
+                    if !grew {
+                        break;
+                    }
+                }
             }
         }
         // A dropped arena is made again at its index's next generation in the id space: none

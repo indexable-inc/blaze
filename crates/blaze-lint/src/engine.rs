@@ -10,18 +10,23 @@ use blaze_lex::{Cpu, FrontmatterAllowed, LiteralKind, TokenKind, tokenize};
 use blaze_memchr::{memchr, memrchr};
 use blaze_own::{AVec, Alloc};
 
-use crate::matcher::{Live, NO_SEQ};
+use crate::matcher::{DEAD, Live, NO_SEQ};
 use crate::sequences::{
-    ArgOf, BANG, BAR, BRACE, CLOSE, Cut, DOT, DOTDOT, Guard, NE, NO_WORD, OPEN, OTHER, SEP, SEQS, TRIE, WORD,
+    ArgOf, BANG, BAR, BRACE, CLOSE, Cut, DOT, DOTDOT, Guard, LT, MAX_WORD_LEN, MIN_WORD_LEN, NE, NO_WORD, OPEN, OTHER,
+    SEP, SEQS, TRIE, W_ALLOC, W_AS, W_BLOCK_ON, W_CLONE, W_EXPECT, W_EXTERN, W_FILE, W_FN, W_FOR, W_GLOBAL, W_IMPL,
+    W_INSTANT, W_JOIN, W_LIBC, W_LOCK, W_MOD, W_ORDERING, W_RECV, W_RUSTIX, W_SELF, W_SEQCST, W_STD, W_STRING,
+    W_SYSTEM_TIME, W_THREAD_LOCAL, W_TRAIT, W_TYPE, W_UNSAFE, W_UNWRAP, W_USE, W_WAIT, WC_COLLECTION, WC_DEFINING,
+    WC_DISPATCHED, WC_IO_MODULE, WC_IO_TYPE, WC_LOCK_TYPE, WC_PRINT_MACRO, WC_RENAME, WC_SANS_IO, WC_STATIC, WORD,
+    WORD_CLASS,
 };
 use crate::{
-    Arg, Block, Cost, Finding, Findings, Fix, LintError, Linted, Mark, ONLY_OWN, Owner, Rule, RuleSet, Run, Scope, Span,
+    Arg, Block, Cost, Finding, Findings, Fix, LintError, Mark, ONLY_OWN, Owner, Rule, RuleSet, Run, Scope, Span,
     Template, TestBits, Unit, Walk, count,
 };
 
 /// The rules that have sequences in `sequences::SEQS`: when none of them runs, the matcher's
 /// pass is not made.
-const SEQUENCE_RULES: [Rule; 8] = [
+const SEQUENCE_RULES: [Rule; 11] = [
     Rule::Stops,
     Rule::FormatMacro,
     Rule::AmbientHeap,
@@ -30,6 +35,9 @@ const SEQUENCE_RULES: [Rule; 8] = [
     Rule::LeftUndone,
     Rule::UnboundedWait,
     Rule::AmbientHasher,
+    Rule::RawSync,
+    Rule::BlockingOnPool,
+    Rule::Transmute,
 ];
 
 /// A token's kind, as the rules tell kinds apart.
@@ -147,8 +155,10 @@ pub(crate) const FORMAT_MACROS: [&str; 8] =
     ["format", "format_args", "write", "writeln", "print", "println", "eprint", "eprintln"];
 /// Every word [`Pass::on_word`] matches on by name: each must be in `sequences::WORDS`, which a
 /// compile-time check there holds, since a word not in the table is never dispatched.
-pub(crate) const DISPATCHED: [&str; 16] =
-    ["use", "as", "clone", "Global", "fn", "type", "impl", "trait", "mod", "for", "self", "unwrap", "expect", "std", "alloc", "unsafe"];
+pub(crate) const DISPATCHED: [&str; 17] = [
+    "use", "as", "clone", "Global", "fn", "type", "impl", "trait", "mod", "for", "self", "unwrap", "expect", "std",
+    "alloc", "unsafe", "Ordering",
+];
 /// The words `process-static` starts at ([`Pass::process_static`]).
 pub(crate) const STATIC_WORDS: [&str; 2] = ["static", "thread_local"];
 /// The words `sans-io-core` starts at in a core ([`Pass::sans_io_word`]): the IO modules, the
@@ -161,39 +171,121 @@ pub(crate) const SANS_IO_WORDS: [&str; 25] = [
 /// Their order is [`crate::OwnHeads`]'s bits.
 pub(crate) const IO_MODULES: [&str; 7] = ["fs", "net", "process", "io", "os", "thread", "env"];
 /// The IO types a core never names, and the system-call crates.
-const IO_TYPES: [&str; 5] = ["TcpStream", "TcpListener", "UdpSocket", "libc", "rustix"];
+pub(crate) const IO_TYPES: [&str; 5] = ["TcpStream", "TcpListener", "UdpSocket", "libc", "rustix"];
 /// What a `File::` call does that is IO.
 const FILE_CALLS: [&str; 4] = ["open", "create", "create_new", "options"];
-const PRINT_MACROS: [&str; 5] = ["print", "println", "eprint", "eprintln", "dbg"];
+pub(crate) const PRINT_MACROS: [&str; 5] = ["print", "println", "eprint", "eprintln", "dbg"];
 /// The lock types `lock-without-reason` starts at ([`Pass::lock_ctor`]): blaze-core's lock.rs
 /// (`Lock`, `ReadLock`), bstd's (`Lock`, `RwLock`, `RankedLock`) and `SharedMap`.
 pub(crate) const LOCK_TYPES: [&str; 5] = ["Lock", "ReadLock", "RwLock", "RankedLock", "SharedMap"];
 /// The values of a `lock_exception`'s `tried`: D179's three shapes, as written.
 const LOCK_SHAPES: [&str; 3] = ["\"published\"", "\"gathered\"", "\"claimed\""];
 
-pub(crate) fn run<'a>(rules: &RuleSet, unit: &Unit<'_>, alloc: Alloc<'a>, out: &mut Findings<'a>) -> Result<Linted<'a>, LintError> {
+/// One test-code region, augmented with prefix-max `max_end` so [`Pass::test_at`] binary-searches
+/// and stops as soon as no earlier region can reach `pos`.
+#[derive(Clone, Copy)]
+pub(crate) struct TestRegion {
+    span: Span,
+    flavor: TestBits,
+    max_end: u32,
+}
+
+/// Reusable per-pass work buffers, kept across units by [`crate::Units::lint_all`] and
+/// [`crate::lint_in_with`] / [`crate::lint_own_with`] to eliminate per-unit heap allocations.
+pub struct Scratch<'a> {
+    pub(crate) alloc: Alloc<'a>,
+    toks: AVec<'a, Tok>,
+    cands: AVec<'a, Cand>,
+    regions: AVec<'a, TestRegion>,
+    reasons: AVec<'a, Span>,
+    frames: AVec<'a, Frame>,
+    bodies: AVec<'a, u32>,
+    fns: AVec<'a, FnRec>,
+    pub(crate) children: AVec<'a, Scope>,
+}
+
+impl<'a> Scratch<'a> {
+    /// Allocates an empty scratch workspace backed by `alloc`.
+    pub fn new_in(alloc: Alloc<'a>) -> Scratch<'a> {
+        Scratch {
+            alloc,
+            toks: AVec::new_in(alloc),
+            cands: AVec::new_in(alloc),
+            regions: AVec::new_in(alloc),
+            reasons: AVec::new_in(alloc),
+            frames: AVec::new_in(alloc),
+            bodies: AVec::new_in(alloc),
+            fns: AVec::new_in(alloc),
+            children: AVec::new_in(alloc),
+        }
+    }
+
+    /// Empties every work buffer while retaining allocated capacities for the next unit.
+    pub fn clear(&mut self) {
+        self.toks.clear();
+        self.cands.clear();
+        self.regions.clear();
+        self.reasons.clear();
+        self.frames.clear();
+        self.bodies.clear();
+        self.fns.clear();
+        self.children.clear();
+    }
+
+    /// The child scopes produced by the most recent pass run with this scratch.
+    #[inline]
+    pub fn children(&self) -> &[Scope] {
+        &self.children
+    }
+}
+
+/// Non-allocating summary returned by [`run_with`]; child scopes live in `scratch.children()`.
+#[derive(Clone, Copy)]
+pub(crate) struct PassDone {
+    pub(crate) findings: Run,
+    pub(crate) test_at_end: TestBits,
+    pub(crate) cost: Cost,
+    pub(crate) tokens: u32,
+}
+
+pub(crate) fn run_with<'a>(
+    rules: &RuleSet,
+    unit: &Unit<'_>,
+    scratch: &mut Scratch<'a>,
+    out: &mut Findings<'a>,
+) -> Result<PassDone, LintError> {
     if u32::try_from(unit.text.len()).is_err() {
         return Err(LintError::TooLong { len: unit.text.len() });
+    }
+    scratch.clear();
+    // Sized by the unit's own bytes (about one token per five), not its children's; only grows
+    // when a unit exceeds the high-water mark already held by `scratch`.
+    let need_toks = own_bytes(unit) / 5 + 8;
+    if scratch.toks.capacity() < need_toks {
+        scratch.toks.reserve(need_toks);
+    }
+    if scratch.children.capacity() < unit.holes.len() {
+        scratch.children.reserve(unit.holes.len());
     }
     let mut pass = Pass {
         rules,
         text: unit.text,
         bytes: unit.text.as_bytes(),
         scope: unit.scope,
-        // Sized by the unit's own bytes (about one token per five), not its children's.
-        toks: AVec::with_capacity_in(own_bytes(unit) / 5 + 8, alloc),
-        cands: AVec::new_in(alloc),
-        regions: AVec::new_in(alloc),
-        reasons: AVec::new_in(alloc),
-        frames: AVec::new_in(alloc),
-        bodies: AVec::new_in(alloc),
-        fns: AVec::new_in(alloc),
-        children: AVec::with_capacity_in(unit.holes.len(), alloc),
+        toks: &mut scratch.toks,
+        cands: &mut scratch.cands,
+        regions: &mut scratch.regions,
+        reasons: &mut scratch.reasons,
+        frames: &mut scratch.frames,
+        bodies: &mut scratch.bodies,
+        fns: &mut scratch.fns,
+        children: &mut scratch.children,
         header: None,
         sig: None,
         in_use: false,
         defining: false,
         last_fn: None,
+        cur_fn_len: 0,
         cost: Cost::NONE,
     };
     pass.lex(unit.holes)?;
@@ -207,7 +299,7 @@ pub(crate) fn run<'a>(rules: &RuleSet, unit: &Unit<'_>, alloc: Alloc<'a>, out: &
     let to = count(out.list.len())?;
     // Holes are tokens of the walk too, but not of the lex: the item's own tokens alone.
     let tokens = count(pass.toks.len().saturating_sub(unit.holes.len()))?;
-    Ok(Linted { findings: Run { from, to }, children: pass.children, test_at_end, cost: pass.cost, tokens })
+    Ok(PassDone { findings: Run { from, to }, test_at_end, cost: pass.cost, tokens })
 }
 
 /// The bytes of `unit` outside its holes (holes not yet checked: a bad one only mis-sizes).
@@ -216,23 +308,23 @@ fn own_bytes(unit: &Unit<'_>) -> usize {
     unit.text.len().saturating_sub(holes)
 }
 
-struct Pass<'u, 'a> {
+struct Pass<'u, 's, 'a> {
     rules: &'u RuleSet,
     text: &'u str,
     bytes: &'u [u8],
     scope: Scope,
-    toks: AVec<'a, Tok>,
-    cands: AVec<'a, Cand>,
-    /// Test code: each region's range and which test code it is.
-    regions: AVec<'a, (Span, TestBits)>,
+    toks: &'s mut AVec<'a, Tok>,
+    cands: &'s mut AVec<'a, Cand>,
+    /// Test code: each region's range, flavor, and prefix-max end.
+    regions: &'s mut AVec<'a, TestRegion>,
     /// What each `#[blaze::lock_exception(..)]` covers (D179): the statement, field, `static`,
     /// `const` or item after it ([`Pass::reason_end`]).
-    reasons: AVec<'a, Span>,
-    frames: AVec<'a, Frame>,
+    reasons: &'s mut AVec<'a, Span>,
+    frames: &'s mut AVec<'a, Frame>,
     /// The functions whose bodies are open, innermost last (indices of `fns`).
-    bodies: AVec<'a, u32>,
-    fns: AVec<'a, FnRec>,
-    children: AVec<'a, Scope>,
+    bodies: &'s mut AVec<'a, u32>,
+    fns: &'s mut AVec<'a, FnRec>,
+    children: &'s mut AVec<'a, Scope>,
     /// From `impl`, `trait` or `mod` to the `{` or `;` after it: the block it opens.
     header: Option<Block>,
     sig: Option<Sig>,
@@ -242,11 +334,13 @@ struct Pass<'u, 'a> {
     defining: bool,
     /// The last `fn` read: where a local's declaration is looked for from.
     last_fn: Option<usize>,
+    /// Byte length of the innermost open non-recursive function's name when `sig.is_none()`, or 0.
+    cur_fn_len: u32,
     /// The sites each rule tried ([`Cost`]): one count at each dispatch into a rule.
     cost: Cost,
 }
 
-impl<'u, 'a> Pass<'u, 'a> {
+impl<'u, 's, 'a> Pass<'u, 's, 'a> {
     // ---- the lex ------------------------------------------------------------------------
 
     fn lex(&mut self, holes: &[Span]) -> Result<(), LintError> {
@@ -271,6 +365,16 @@ impl<'u, 'a> Pass<'u, 'a> {
     }
 
     fn lex_run(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let slice = &self.bytes[from..to];
+        if is_ignorable_gap(slice, true) {
+            if self.rules.runs(Rule::Allocs) && memchr(b'/', slice).is_some() {
+                self.scan_gap_alloc_comments(from, to);
+            }
+            return;
+        }
         let mut pos = from as u32;
         for token in tokenize(&self.text[from..to], FrontmatterAllowed::No, Cpu::BASELINE) {
             let start = pos;
@@ -323,13 +427,39 @@ impl<'u, 'a> Pass<'u, 'a> {
             };
             // The one probe per identifier: its number in the rules' word table, or none.
             let word = match k {
-                K::Ident => match WORD.index(&self.bytes[start as usize..end as usize]) {
-                    Some(at) => at as u8,
-                    None => NO_WORD,
-                },
+                K::Ident => {
+                    let len = (end - start) as usize;
+                    if len >= MIN_WORD_LEN && len <= MAX_WORD_LEN {
+                        match WORD.index(&self.bytes[start as usize..end as usize]) {
+                            Some(at) => at as u8,
+                            None => NO_WORD,
+                        }
+                    } else {
+                        NO_WORD
+                    }
+                }
                 _ => NO_WORD,
             };
             self.toks.push(Tok { start, end, k, word });
+        }
+    }
+
+    /// Runs `alloc_comment` on each `//` line comment inside a gap already verified by
+    /// `is_ignorable_gap` to contain only ASCII whitespace and `//` line comments.
+    fn scan_gap_alloc_comments(&mut self, from: usize, to: usize) {
+        let mut i = from;
+        // Bounded: each turn advances `i` past whitespace or one line comment.
+        while i < to {
+            match self.bytes[i] {
+                b' ' | b'\n' | b'\r' | b'\t' => i += 1,
+                b'/' => {
+                    let end = memchr(b'\n', &self.bytes[i + 2..to]).map_or(to, |nl| i + 2 + nl);
+                    self.cost.add(Rule::Allocs);
+                    self.alloc_comment(i as u32, end as u32);
+                    i = if end < to { end + 1 } else { to };
+                }
+                _ => break,
+            }
         }
     }
 
@@ -522,11 +652,31 @@ impl<'u, 'a> Pass<'u, 'a> {
             .map_or(self.scope.assoc, |f| f.block.container())
     }
 
+    #[inline]
+    fn push_region(&mut self, span: Span, flavor: TestBits) {
+        let max_end = self.regions.last().map_or(0, |r| r.max_end).max(span.end);
+        self.regions.push(TestRegion { span, flavor, max_end });
+    }
+
+    #[inline]
     fn test_at(&self, pos: u32) -> TestBits {
         let mut bits = self.scope.test;
-        for (span, flavor) in self.regions.iter() {
-            if span.start <= pos && pos < span.end {
-                bits = bits.union(*flavor);
+        if self.regions.is_empty() || bits == TestBits::ANY {
+            return bits;
+        }
+        let mut j = self.regions.partition_point(|r| r.span.start <= pos);
+        // Bounded: walks backwards at most `j` entries, stopping as soon as `max_end <= pos`.
+        while j > 0 {
+            j -= 1;
+            let r = self.regions[j];
+            if r.max_end <= pos {
+                break;
+            }
+            if pos < r.span.end {
+                bits = bits.union(r.flavor);
+                if bits == TestBits::ANY {
+                    break;
+                }
             }
         }
         bits
@@ -616,6 +766,8 @@ impl<'u, 'a> Pass<'u, 'a> {
             clone_after: clone_mark(rest).or(if at_end { parent.clone_after } else { None }),
             safety_above: self.walk_up(line, LOOK_UP, safety_mark, parent.safety_above),
             safety_after: safety_mark(rest).is_some() || (at_end && parent.safety_after),
+            seqcst_above: self.walk_up(line, LOOK_UP, seqcst_mark, parent.seqcst_above),
+            seqcst_after: seqcst_mark(rest).is_some() || (at_end && parent.seqcst_after),
             recursion_above: self.recursion_mark_above(line, parent.recursion_above),
         };
         let scope = Scope {
@@ -629,105 +781,129 @@ impl<'u, 'a> Pass<'u, 'a> {
             own_heads: self.scope.own_heads,
             statics: self.scope.statics,
             lock_reason: self.scope.lock_reason || self.reasoned(t.start),
+            trust_unsafe: self.scope.trust_unsafe,
             context,
         };
         self.children.push(scope);
     }
 
     fn on_word(&mut self, i: usize, t: Tok) {
-        let w = self.str_of(t);
-        if t.word == NO_WORD {
+        let word_id = t.word;
+        if word_id == NO_WORD {
             // No rule reads this word (every word below is in the table, a compile-time check
             // in sequences.rs): only a recursive call can be its use.
             self.defining = false;
             if self.rules.runs(Rule::Recursion) {
                 self.cost.add(Rule::Recursion);
-                self.recursion_name(i, t, w);
+                if self.sig.is_none() && !self.bodies.is_empty() {
+                    self.recursion_name(i, t);
+                }
             }
             return;
         }
-        let was_defining = core::mem::replace(&mut self.defining, DEFINING.contains(&w));
+        let class = WORD_CLASS[word_id as usize];
+        let was_defining = core::mem::replace(&mut self.defining, class & WC_DEFINING != 0);
         let rules = self.rules;
-        match w {
-            "use" => self.in_use = true,
-            "as" if rules.runs(Rule::Casts) => {
-                self.cost.add(Rule::Casts);
-                self.cast(i, t);
-            }
-            "clone" if rules.runs(Rule::Clones) => {
-                self.cost.add(Rule::Clones);
-                self.clone_call(i, t);
-            }
-            "Global" if rules.runs(Rule::Allocs) && !self.in_use => {
-                self.cost.add(Rule::Allocs);
-                self.push(Template::AllocGlobal, t.start, t.end, None);
-            }
-            "fn" => self.fn_word(i, t),
-            "type" => self.type_word(i, t),
-            "impl" | "trait" | "mod" if self.sig.is_none() => {
-                self.header = Some(match w {
-                    "impl" => Block::Impl,
-                    "trait" => Block::Trait,
-                    _ => Block::Module,
-                });
-            }
-            "for" if self.header == Some(Block::Impl) && !matches!(self.tok(i + 1), Some(n) if n.k == K::P(b'<')) => {
-                self.header = Some(Block::TraitImpl);
-            }
-            "self" => {
-                if let Some(sig) = self.sig
-                    && sig.depth == 1
-                {
-                    self.fns[sig.item as usize].has_self = true;
+        if class & WC_DISPATCHED != 0 {
+            match word_id {
+                W_USE => self.in_use = true,
+                W_AS if rules.runs(Rule::Casts) => {
+                    self.cost.add(Rule::Casts);
+                    self.cast(i, t);
                 }
+                W_CLONE if rules.runs(Rule::Clones) => {
+                    self.cost.add(Rule::Clones);
+                    self.clone_call(i, t);
+                }
+                W_GLOBAL if rules.runs(Rule::Allocs) && !self.in_use => {
+                    self.cost.add(Rule::Allocs);
+                    self.push(Template::AllocGlobal, t.start, t.end, None);
+                }
+                W_FN => {
+                    self.fn_word(i, t);
+                    // `fn_word` reads the signature for each of these rules that runs.
+                    for rule in [Rule::Allocs, Rule::Untyped, Rule::Recursion] {
+                        if rules.runs(rule) {
+                            self.cost.add(rule);
+                        }
+                    }
+                }
+                W_TYPE => {
+                    self.type_word(i, t);
+                    if rules.runs(Rule::Untyped) {
+                        self.cost.add(Rule::Untyped);
+                    }
+                }
+                W_IMPL | W_TRAIT | W_MOD if self.sig.is_none() => {
+                    self.header = Some(match word_id {
+                        W_IMPL => Block::Impl,
+                        W_TRAIT => Block::Trait,
+                        _ => Block::Module,
+                    });
+                }
+                W_FOR if self.header == Some(Block::Impl) && !matches!(self.tok(i + 1), Some(n) if n.k == K::P(b'<')) => {
+                    self.header = Some(Block::TraitImpl);
+                }
+                W_SELF => {
+                    if let Some(sig) = self.sig
+                        && sig.depth == 1
+                    {
+                        self.fns[sig.item as usize].has_self = true;
+                    }
+                }
+                W_UNWRAP | W_EXPECT if rules.runs(Rule::Stops) => {
+                    self.cost.add(Rule::Stops);
+                    self.stop(i, t, word_id);
+                }
+                W_STD | W_ALLOC if rules.runs(Rule::Ambient) => {
+                    self.cost.add(Rule::Ambient);
+                    self.ambient_head(i, t, word_id);
+                }
+                W_UNSAFE => {
+                    if rules.runs(Rule::UnsafeComment) {
+                        self.cost.add(Rule::UnsafeComment);
+                        self.unsafe_word(i, t);
+                    }
+                    if !self.scope.trust_unsafe && rules.runs(Rule::WorkspaceUnsafe) {
+                        self.cost.add(Rule::WorkspaceUnsafe);
+                        self.workspace_unsafe_word(i, t);
+                    }
+                }
+                W_ORDERING if rules.runs(Rule::SeqCstUnexplained) => {
+                    self.cost.add(Rule::SeqCstUnexplained);
+                    self.seqcst_word(i, t);
+                }
+                _ => {}
             }
-            "unwrap" | "expect" if rules.runs(Rule::Stops) => {
-                self.cost.add(Rule::Stops);
-                self.stop(i, t, w);
-            }
-            "std" | "alloc" if rules.runs(Rule::Ambient) => {
+        }
+        const EXTRA: u16 = WC_COLLECTION | WC_RENAME | WC_STATIC | WC_SANS_IO | WC_LOCK_TYPE;
+        if class & EXTRA != 0 {
+            if class & WC_COLLECTION != 0 && rules.runs(Rule::Ambient) && !self.in_use && !was_defining {
                 self.cost.add(Rule::Ambient);
-                self.ambient_head(i, t, w);
+                self.collection(i, t, word_id);
             }
-            "unsafe" if rules.runs(Rule::UnsafeComment) => {
-                self.cost.add(Rule::UnsafeComment);
-                self.unsafe_word(i, t);
+            if class & WC_RENAME != 0 && rules.runs(Rule::Renamed) {
+                self.cost.add(Rule::Renamed);
+                self.renamed(i, t, self.str_of(t));
             }
-            _ => {}
-        }
-        if w == "fn" {
-            // `fn_word` reads the signature for each of these rules that runs.
-            for rule in [Rule::Allocs, Rule::Untyped, Rule::Recursion] {
-                if rules.runs(rule) {
-                    self.cost.add(rule);
-                }
+            if class & WC_STATIC != 0 && rules.runs(Rule::ProcessStatic) {
+                self.cost.add(Rule::ProcessStatic);
+                self.process_static(i, t, word_id);
             }
-        } else if w == "type" && rules.runs(Rule::Untyped) {
-            self.cost.add(Rule::Untyped);
-        }
-        if rules.runs(Rule::Ambient) && COLLECTIONS.contains(&w) && !self.in_use && !was_defining {
-            self.cost.add(Rule::Ambient);
-            self.collection(i, t, w);
-        }
-        if rules.runs(Rule::Renamed) && rules.renames().iter().any(|r| r.old == w) {
-            self.cost.add(Rule::Renamed);
-            self.renamed(i, t, w);
-        }
-        if rules.runs(Rule::ProcessStatic) && STATIC_WORDS.contains(&w) {
-            self.cost.add(Rule::ProcessStatic);
-            self.process_static(i, t, w);
-        }
-        if self.scope.sans_io && rules.runs(Rule::SansIoCore) && SANS_IO_WORDS.contains(&w) {
-            self.cost.add(Rule::SansIoCore);
-            self.sans_io_word(i, t, w);
-        }
-        if rules.runs(Rule::LockWithoutReason) && LOCK_TYPES.contains(&w) {
-            self.cost.add(Rule::LockWithoutReason);
-            self.lock_ctor(i, t, w);
+            if class & WC_SANS_IO != 0 && self.scope.sans_io && rules.runs(Rule::SansIoCore) {
+                self.cost.add(Rule::SansIoCore);
+                self.sans_io_word(i, t, word_id, class);
+            }
+            if class & WC_LOCK_TYPE != 0 && rules.runs(Rule::LockWithoutReason) {
+                self.cost.add(Rule::LockWithoutReason);
+                self.lock_ctor(i, t, self.str_of(t));
+            }
         }
         if rules.runs(Rule::Recursion) {
             self.cost.add(Rule::Recursion);
-            self.recursion_name(i, t, w);
+            if self.sig.is_none() && !self.bodies.is_empty() {
+                self.recursion_name(i, t);
+            }
         }
     }
 
@@ -756,7 +932,7 @@ impl<'u, 'a> Pass<'u, 'a> {
         }
         if cfg_test_end(rest, true).is_some() {
             // `#![cfg(test)]`: the rest of the item (the file, for the root) is test code.
-            self.regions.push((Span::new(t.start, self.text.len() as u32), TestBits::CFG));
+            self.push_region(Span::new(t.start, self.text.len() as u32), TestBits::CFG);
             return;
         }
         let (end, flavor) = match cfg_test_end(rest, false) {
@@ -774,7 +950,7 @@ impl<'u, 'a> Pass<'u, 'a> {
             ItemEnd::Under(bracket) => (self.line_end(pos) as u32).min(bracket),
             ItemEnd::Open => self.line_end(pos) as u32,
         };
-        self.regions.push((Span::new(t.start, region_end), flavor));
+        self.push_region(Span::new(t.start, region_end), flavor);
     }
 
     /// The ratchet's `item_end` from byte `from`: the end of the first `;` outside brackets, or
@@ -1256,13 +1432,10 @@ impl<'u, 'a> Pass<'u, 'a> {
 
     /// recursion.rs: in the innermost open body, its function's name called as the function
     /// is (bare or `self::` for a free one, `Self::` or `self.` for an associated one).
-    fn recursion_name(&mut self, i: usize, t: Tok, w: &str) {
-        if self.sig.is_some() {
-            return;
-        }
+    fn recursion_name(&mut self, i: usize, t: Tok) {
         let Some(&inner) = self.bodies.last() else { return };
         let f = self.fns[inner as usize];
-        if f.recursive || f.name.of(self.text) != w {
+        if f.recursive || f.name.len() != t.end - t.start || f.name.of(self.text) != self.str_of(t) {
             return;
         }
         let recursive = match self.call_of(i) {
@@ -1332,18 +1505,18 @@ impl<'u, 'a> Pass<'u, 'a> {
 
     /// stops.rs: `.unwrap()` and `.expect(`. Its macros (`panic!`, `unreachable!`, `todo!`,
     /// `unimplemented!`, not after `.`, not `!=`) are sequences (`sequences::SEQS`).
-    fn stop(&mut self, i: usize, t: Tok, w: &str) {
+    fn stop(&mut self, i: usize, t: Tok, word_id: u8) {
         let next = self.tok(i + 1);
         let method = self.method(i);
-        match w {
-            "unwrap" if method && matches!(next, Some(n) if n.k == K::P(b'(')) => {
+        match word_id {
+            W_UNWRAP if method && matches!(next, Some(n) if n.k == K::P(b'(')) => {
                 if let Some(close) = self.tok(i + 2)
                     && close.k == K::P(b')')
                 {
                     self.push(Template::StopUnwrap, t.start, close.end, None);
                 }
             }
-            "expect" if method && matches!(next, Some(n) if n.k == K::P(b'(')) => {
+            W_EXPECT if method && matches!(next, Some(n) if n.k == K::P(b'(')) => {
                 self.push(Template::StopExpect, t.start, t.end, None);
             }
             _ => {}
@@ -1397,7 +1570,7 @@ impl<'u, 'a> Pass<'u, 'a> {
 
     /// ambient.rs: `std` or `alloc` as a path's first segment, followed by `::` or after the
     /// word `use` or `crate`.
-    fn ambient_head(&mut self, i: usize, t: Tok, w: &str) {
+    fn ambient_head(&mut self, i: usize, t: Tok, word_id: u8) {
         let field = self.method(i);
         let segment_before = self.colons_before(i) && self.word(self.back(i, 3)).is_some();
         if field || segment_before {
@@ -1408,7 +1581,7 @@ impl<'u, 'a> Pass<'u, 'a> {
         if !path && !after_word {
             return;
         }
-        let template = if w == "std" { Template::AmbientStd } else { Template::AmbientAlloc };
+        let template = if word_id == W_STD { Template::AmbientStd } else { Template::AmbientAlloc };
         let arg = if path {
             self.tok(i + 3).filter(|s| s.k == K::Ident).map(|s| Arg::Span(Span::new(s.start, s.end)))
         } else {
@@ -1419,9 +1592,9 @@ impl<'u, 'a> Pass<'u, 'a> {
 
     /// ambient.rs's `vec_box` for a collection named through `std::` or `alloc::` (the bare
     /// names wait for the file's imports: a rule of the second kind, not built).
-    fn collection(&mut self, i: usize, t: Tok, w: &str) {
+    fn collection(&mut self, i: usize, t: Tok, word_id: u8) {
         let shaped =
-            w == "String" || matches!(self.tok(i + 1), Some(n) if n.k == K::P(b'<')) || self.colons_at(i + 1);
+            word_id == W_STRING || matches!(self.tok(i + 1), Some(n) if n.k == K::P(b'<')) || self.colons_at(i + 1);
         if !shaped || self.method(i) {
             return;
         }
@@ -1434,7 +1607,7 @@ impl<'u, 'a> Pass<'u, 'a> {
             return;
         }
         let first = self.toks[head];
-        if matches!(self.str_of(first), "std" | "alloc") {
+        if first.word == W_STD || first.word == W_ALLOC {
             self.push(Template::AmbientCollection, first.start, t.end, Some(Arg::Span(Span::new(first.start, first.end))));
         }
     }
@@ -1447,9 +1620,9 @@ impl<'u, 'a> Pass<'u, 'a> {
     /// C3's three and not reported; a `thread_local!` is not when every `static` it declares is
     /// such a row. Text cannot see a stateful type behind a name of the crate's own
     /// (`static X: Table`), so the rule says less, never more.
-    fn process_static(&mut self, i: usize, t: Tok, w: &str) {
+    fn process_static(&mut self, i: usize, t: Tok, word_id: u8) {
         let next = self.tok(i + 1);
-        if w == "thread_local" {
+        if word_id == W_THREAD_LOCAL {
             if let Some(bang) = next
                 && bang.k == K::P(b'!')
                 && !self.method(i)
@@ -1516,14 +1689,15 @@ impl<'u, 'a> Pass<'u, 'a> {
     /// `block_on(`), the wall clock (`Instant::now`, `SystemTime::now`), a print macro. A bare head
     /// `io::` is not reported in a file that declares or imports `io` as its own module
     /// ([`crate::OwnHeads`], in the scope): there the name cannot be std's.
-    fn sans_io_word(&mut self, i: usize, t: Tok, w: &str) {
+    fn sans_io_word(&mut self, i: usize, t: Tok, word_id: u8, class: u16) {
         let next = self.tok(i + 1);
         let open_next = matches!(next, Some(n) if n.k == K::P(b'('));
-        let (template, end) = if IO_MODULES.contains(&w) {
+        let (template, end) = if class & WC_IO_MODULE != 0 {
             if self.method(i) {
                 return;
             }
-            let after_std = self.colons_before(i) && self.is_word(self.back(i, 3), "std");
+            let w = self.str_of(t);
+            let after_std = self.colons_before(i) && matches!(self.back(i, 3), Some(p) if p.word == W_STD);
             // A bare head is std's only when the file does not make that name its own
             // (`mod io;`, `use crate::io;`: the scope's `own_heads`, read by `OwnHeads::read`).
             let own = IO_MODULES.iter().position(|m| *m == w).is_some_and(|at| self.scope.own_heads.0 & (1 << at) != 0);
@@ -1532,41 +1706,41 @@ impl<'u, 'a> Pass<'u, 'a> {
                 return;
             }
             (Template::SansIoPath, t.end)
-        } else if IO_TYPES.contains(&w) {
-            let crate_path = matches!(w, "libc" | "rustix");
+        } else if class & WC_IO_TYPE != 0 {
+            let crate_path = word_id == W_LIBC || word_id == W_RUSTIX;
             if self.method(i) || (crate_path && !self.colons_at(i + 1)) {
                 return;
             }
             (Template::SansIoPath, t.end)
-        } else if w == "File" {
+        } else if word_id == W_FILE {
             let call = self.tok(i + 3).filter(|c| self.colons_at(i + 1) && FILE_CALLS.contains(&self.str_of(*c)));
             match call {
                 Some(call) => (Template::SansIoPath, call.end),
                 None => return,
             }
-        } else if matches!(w, "recv" | "join" | "lock") {
+        } else if matches!(word_id, W_RECV | W_JOIN | W_LOCK) {
             let no_arg = matches!(self.tok(i + 2), Some(c) if c.k == K::P(b')'));
             if !self.method(i) || !open_next || !no_arg {
                 return;
             }
             (Template::SansIoBlocking, t.end)
-        } else if w == "wait" {
+        } else if word_id == W_WAIT {
             if !self.method(i) || !open_next {
                 return;
             }
             (Template::SansIoBlocking, t.end)
-        } else if w == "block_on" {
-            if !open_next || self.is_word(self.back(i, 1), "fn") {
+        } else if word_id == W_BLOCK_ON {
+            if !open_next || matches!(self.back(i, 1), Some(p) if p.word == W_FN) {
                 return;
             }
             (Template::SansIoBlocking, t.end)
-        } else if matches!(w, "Instant" | "SystemTime") {
+        } else if matches!(word_id, W_INSTANT | W_SYSTEM_TIME) {
             let now = self.tok(i + 3).filter(|n| self.colons_at(i + 1) && self.str_of(*n) == "now");
             match now {
                 Some(now) => (Template::SansIoClock, now.end),
                 None => return,
             }
-        } else if PRINT_MACROS.contains(&w) {
+        } else if class & WC_PRINT_MACRO != 0 {
             match next {
                 Some(bang) if bang.k == K::P(b'!') && !self.method(i) => (Template::SansIoPrint, bang.end),
                 _ => return,
@@ -1739,7 +1913,7 @@ impl<'u, 'a> Pass<'u, 'a> {
     /// clones walk: comment lines and a statement's unended lines are passed over).
     fn unsafe_word(&mut self, i: usize, t: Tok) {
         let next = self.tok(i + 1);
-        let opens = matches!(next, Some(n) if n.k == K::P(b'{')) || self.is_word(next, "impl");
+        let opens = matches!(next, Some(n) if n.k == K::P(b'{') || n.word == W_IMPL);
         if !opens {
             return;
         }
@@ -1750,15 +1924,57 @@ impl<'u, 'a> Pass<'u, 'a> {
         }
     }
 
+    /// `unsafe {`, `unsafe fn`, `unsafe impl`, `unsafe trait`, `unsafe extern`, and
+    /// `#[unsafe(..)]` / `#![unsafe(..)]` when the crate does not carry a valid
+    /// `#![blaze::trust(unsafe, reason = "..")]` grant.
+    fn workspace_unsafe_word(&mut self, i: usize, t: Tok) {
+        let next = self.tok(i + 1);
+        let is_item_or_block = match next {
+            Some(n) if n.k == K::P(b'{') => true,
+            Some(n) if n.k == K::Ident => matches!(n.word, W_FN | W_IMPL | W_TRAIT | W_EXTERN),
+            _ => false,
+        };
+        let is_attr = matches!(next, Some(n) if n.k == K::P(b'('))
+            && matches!(self.back(i, 1), Some(b) if b.k == K::P(b'['))
+            && (matches!(self.back(i, 2), Some(p) if p.k == K::P(b'#'))
+                || (matches!(self.back(i, 2), Some(b) if b.k == K::P(b'!'))
+                    && matches!(self.back(i, 3), Some(p) if p.k == K::P(b'#'))));
+        if is_item_or_block || is_attr {
+            self.push(Template::WorkspaceUnsafe, t.start, t.end, None);
+        }
+    }
+
+    /// `Ordering::SeqCst` without a `// seqcst: <why>` comment on its line or above it.
+    fn seqcst_word(&mut self, i: usize, t: Tok) {
+        if self.in_use || self.method(i) || !self.colons_at(i + 1) {
+            return;
+        }
+        let Some(variant) = self.tok(i + 3) else { return };
+        if variant.k != K::Ident || variant.word != W_SEQCST {
+            return;
+        }
+        let context = self.scope.context;
+        let after = context.seqcst_after.then_some(Mark::SeqCst);
+        if self.look(t.start as usize, seqcst_mark, context.seqcst_above, after).is_none() {
+            self.push(Template::SeqCstUnexplained, t.start, variant.end, None);
+        }
+    }
+
     // ---- the sequences ------------------------------------------------------------------
 
     /// The symbol of token `i` for the matcher, and how many tokens it takes: `::`, `..` and
     /// `!=` are one symbol of two adjacent tokens.
-    #[inline]
+    #[inline(always)]
     fn symbol(&self, i: usize, t: Tok) -> (u8, usize) {
         let joined = |c: u8| matches!(self.tok(i + 1), Some(n) if n.k == K::P(c) && n.start == t.end);
         match t.k {
-            K::Ident if t.word != NO_WORD => (t.word, 1),
+            K::Ident => {
+                if t.word != NO_WORD {
+                    (t.word, 1)
+                } else {
+                    (OTHER, 1)
+                }
+            }
             K::P(b':') if joined(b':') => (SEP, 2),
             K::P(b'.') if joined(b'.') => (DOTDOT, 2),
             K::P(b'!') if joined(b'=') => (NE, 2),
@@ -1768,6 +1984,7 @@ impl<'u, 'a> Pass<'u, 'a> {
             K::P(b'!') => (BANG, 1),
             K::P(b'{') => (BRACE, 1),
             K::P(b'|') => (BAR, 1),
+            K::P(b'<') => (LT, 1),
             // A hole is here too: no sequence matches across a child item.
             _ => (OTHER, 1),
         }
@@ -1793,12 +2010,23 @@ impl<'u, 'a> Pass<'u, 'a> {
         while i < n {
             let t = self.toks[i];
             let (sym, width) = self.symbol(i, t);
+            let tok_start = i as u32;
             let last = i + width - 1;
             i += width;
-            if live.is_empty() && !TRIE.starts(sym) {
+            // `OTHER` has no transition from any node: clear live states without touching `TRIE`.
+            if sym == OTHER {
+                live.clear();
                 continue;
             }
-            live.step(&TRIE, sym, (i - width) as u32);
+            if live.is_empty() {
+                let to = TRIE.root(sym);
+                if to == DEAD {
+                    continue;
+                }
+                live.start_root(to, tok_start);
+            } else {
+                live.step(&TRIE, sym, tok_start);
+            }
             // Bounded: one turn per live state (the longest sequence's length at most), and
             // within it one per sequence that ends at its node.
             for at in 0..live.len() {
@@ -1838,6 +2066,7 @@ impl<'u, 'a> Pass<'u, 'a> {
             Cut::DropLast => (first, last - 1),
             Cut::DropFirst => (first + 1, last),
             Cut::Inner => (first + 1, last - 1),
+            Cut::DropTurbo => (first, last - 3),
         };
         let (a, b) = (self.toks[from], self.toks[to]);
         let arg = match seq.arg {
@@ -2127,6 +2356,9 @@ impl<'u, 'a> Pass<'u, 'a> {
 
     /// The candidates outside the test code their rule exempts, written out.
     fn emit(&mut self, out: &mut Findings<'_>) -> Result<(), LintError> {
+        if self.cands.is_empty() {
+            return Ok(());
+        }
         let renames = self.rules.renames();
         for c in self.cands.iter() {
             let rule = c.template.rule();
@@ -2192,9 +2424,32 @@ fn stateful(word: &str) -> bool {
         || matches!(word, "Mutex" | "Condvar" | "Lazy" | "Once" | "Barrier")
 }
 
+/// True when `bytes` (an inter-hole run) contains only ASCII whitespace — and, when
+/// `skip_line_comments` is true (`!rules.runs(Rule::Allocs)`), `//` line comments — so
+/// `blaze_lex::tokenize` would emit zero kept tokens and zero `AllocComment` callbacks.
+#[inline]
+fn is_ignorable_gap(bytes: &[u8], skip_line_comments: bool) -> bool {
+    let mut i = 0;
+    // Bounded: each turn advances `i` by at least one byte.
+    while i < bytes.len() {
+        match bytes[i] {
+            b' ' | b'\n' | b'\r' | b'\t' => i += 1,
+            b'/' if skip_line_comments && bytes.get(i + 1) == Some(&b'/') => {
+                match memchr(b'\n', &bytes[i + 2..]) {
+                    Some(nl) => i += 2 + nl + 1,
+                    None => return true,
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// A string literal's text (`"x"`, `r"x"`, `r#"x"#`) has something in it but whitespace: a
-/// `lock_exception`'s `why`. A byte or C string, or a char, is not one.
-fn says_something(literal: &str) -> bool {
+/// `lock_exception`'s `why` or a `blaze::trust`'s `reason`. A byte or C string, or a char, is
+/// not one.
+pub(crate) fn says_something(literal: &str) -> bool {
     let body = match literal.strip_prefix('r') {
         Some(raw) => raw.trim_matches('#'),
         None => literal,
@@ -2237,6 +2492,24 @@ fn safety_mark(line: &str) -> Option<Mark> {
         let said = rest.trim_start_matches(['/', '!']).trim_start();
         if said.len() >= 6 && said.as_bytes()[..6].eq_ignore_ascii_case(b"safety") {
             return Some(Mark::Safety);
+        }
+    }
+    None
+}
+
+/// A `// seqcst: <why>` comment on `line` (any case, non-empty reason after `:`).
+fn seqcst_mark(line: &str) -> Option<Mark> {
+    let mut rest = line;
+    // Bounded: each turn moves past one `//`.
+    while let Some(at) = rest.find("//") {
+        rest = &rest[at + 2..];
+        let said = rest.trim_start_matches(['/', '!']).trim_start();
+        if said.len() >= 7
+            && said.as_bytes()[..6].eq_ignore_ascii_case(b"seqcst")
+            && let Some(why) = said[6..].strip_prefix(':').map(str::trim)
+            && !why.is_empty()
+        {
+            return Some(Mark::SeqCst);
         }
     }
     None
