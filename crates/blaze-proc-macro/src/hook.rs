@@ -25,7 +25,7 @@
 
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use blaze_expand::{
@@ -167,6 +167,12 @@ pub struct ProcMacros<'r> {
     /// Warm pool of native `rust-analyzer-proc-macro-srv` workers for zero-Wasm `.dylib`/`.so`
     /// proc-macro modules (D175 fast path; spawned lazily only when a native module runs).
     native_pool: Arc<crate::native_bridge::NativeServerPool>,
+    /// Whether the built-in comptime patch library (`crate::comptime_patch`: `serde_derive`,
+    /// `bytemuck_derive`, `thiserror-impl`, `derive_more`, `strum_macros`, `paste`) is enabled.
+    /// Enabled by default; disable with `BLAZE_NO_COMPTIME_PATCH=1` or [`Self::set_comptime_patch`].
+    comptime_patch_enabled: bool,
+    patch_hits: AtomicU64,
+    patch_fallbacks: AtomicU64,
     /// Each package a call was expanded in, with its crate name's results and its own
     /// verdicts on them: sorted by the package's address, which a slot keeps alive, so a
     /// package is found by identity with no hash of it a call.
@@ -200,6 +206,7 @@ pub struct KeptAll {
 
 impl<'r> ProcMacros<'r> {
     pub fn new(runtime: &'r Runtime, store: &'r DirStore, limits: Limits) -> ProcMacros<'r> {
+        let comptime_patch_enabled = std::env::var_os("BLAZE_NO_COMPTIME_PATCH").is_none();
         ProcMacros {
             runtime,
             store,
@@ -207,8 +214,30 @@ impl<'r> ProcMacros<'r> {
             crates: Vec::new(),
             findings: Mutex::new(Vec::new()),
             native_pool: Arc::new(crate::native_bridge::NativeServerPool::new()),
+            comptime_patch_enabled,
+            patch_hits: AtomicU64::new(0),
+            patch_fallbacks: AtomicU64::new(0),
             slots: Mutex::new(Vec::new()),
             tables: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Enable or disable Blaze's default built-in comptime patch library (`serde_derive`,
+    /// `bytemuck_derive`, `thiserror-impl`, `derive_more`, `strum_macros`, `paste`).
+    pub fn set_comptime_patch(&mut self, enabled: bool) {
+        self.comptime_patch_enabled = enabled;
+    }
+
+    /// Whether the built-in comptime patch library is enabled on this hook.
+    pub fn comptime_patch_enabled(&self) -> bool {
+        self.comptime_patch_enabled
+    }
+
+    /// Telemetry counters for comptime-patch hits and lossless fallbacks.
+    pub fn comptime_patch_stats(&self) -> crate::comptime_patch::ComptimePatchStats {
+        crate::comptime_patch::ComptimePatchStats {
+            hits: self.patch_hits.load(Ordering::Relaxed),
+            fallbacks: self.patch_fallbacks.load(Ordering::Relaxed),
         }
     }
 
@@ -389,15 +418,21 @@ impl<'r> ProcMacros<'r> {
     pub fn refusal_of(&self, def: &MacroDefinition<'_>) -> Option<Finding> {
         let MacroKind::ProcMacro { krate, kind } = def.kind() else { return None };
         let Some(macro_crate) = self.crates.iter().find(|it| it.key == krate) else { return Some(Finding::UnknownCrate { krate }) };
+        let name = def.proc_name().unwrap_or("");
         let module = match &macro_crate.module {
             Ok(module) => module,
             Err(error) => {
+                if self.comptime_patch_enabled && crate::comptime_patch::has_patch(&macro_crate.label, kind, name) {
+                    return None;
+                }
                 let (name, version) = macro_crate.label.split_once(' ').unwrap_or((&macro_crate.label, ""));
                 return Some(Finding::MissingModule { name: name.to_owned(), version: version.to_owned(), why: error.to_string() });
             }
         };
-        let name = def.proc_name().unwrap_or("");
         if module.find(kind, name).is_none() {
+            if self.comptime_patch_enabled && crate::comptime_patch::has_patch(&macro_crate.label, kind, name) {
+                return None;
+            }
             return Some(Finding::NoSuchMacro { krate: macro_crate.label.clone(), name: name.to_owned(), kind });
         }
         if module.native_dylib.is_some() {
@@ -426,9 +461,24 @@ impl<'r> ProcMacros<'r> {
             self.report(Finding::UnknownCrate { krate });
             return Err(refused);
         };
+        let name = def.proc_name().unwrap_or("");
         let module = match &macro_crate.module {
             Ok(module) => module,
             Err(error) => {
+                // Default built-in comptime patch fast path: expand patched crates (`serde_derive`,
+                // `bytemuck_derive`, `thiserror-impl`, `derive_more`, `strum_macros`, `paste`) in-process
+                // even when no `.dylib`/`.wasm` proc-macro module has been compiled!
+                if self.comptime_patch_enabled && crate::comptime_patch::has_patch(&macro_crate.label, kind, name) {
+                    match crate::comptime_patch::try_expand(&macro_crate.label, kind, name, call, edition, alloc) {
+                        crate::comptime_patch::PatchResult::Expanded(produced) => {
+                            self.patch_hits.fetch_add(1, Ordering::Relaxed);
+                            return Ok(produced);
+                        }
+                        crate::comptime_patch::PatchResult::Fallback => {
+                            self.patch_fallbacks.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
                 if !macro_crate.reported.swap(true, Ordering::Relaxed) {
                     let (name, version) = macro_crate.label.split_once(' ').unwrap_or((&macro_crate.label, ""));
                     self.report(Finding::MissingModule { name: name.to_owned(), version: version.to_owned(), why: error.to_string() });
@@ -436,7 +486,6 @@ impl<'r> ProcMacros<'r> {
                 return Err(refused);
             }
         };
-        let name = def.proc_name().unwrap_or("");
         let Some(export) = module.find(kind, name) else {
             self.report(Finding::NoSuchMacro { krate: macro_crate.label.clone(), name: name.to_owned(), kind });
             return Err(refused);
@@ -455,6 +504,26 @@ impl<'r> ProcMacros<'r> {
                 return Err(failed);
             }
         };
+        // Default built-in comptime patch fast path: expand in-process in microseconds before
+        // spawning a native `.dylib` server or Wasmtime sandbox, falling back losslessly on
+        // exotic attributes.
+        if self.comptime_patch_enabled && crate::comptime_patch::has_patch(&macro_crate.label, kind, &export.name) {
+            match crate::comptime_patch::try_expand(&macro_crate.label, kind, &export.name, call, edition, alloc) {
+                crate::comptime_patch::PatchResult::Expanded(produced) => {
+                    self.patch_hits.fetch_add(1, Ordering::Relaxed);
+                    let mut mark = parts.start();
+                    let kept = slot.results.insert(self.store, base, &produced);
+                    mark.lap(Part::Keep);
+                    if let Err(error) = kept {
+                        self.report(Finding::Record { base, error });
+                    }
+                    return Ok(produced);
+                }
+                crate::comptime_patch::PatchResult::Fallback => {
+                    self.patch_fallbacks.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
         // Native zero-Wasm fast path (D175): expand directly via `NativeServerPool` on host `.dylib`/`.so`.
         if let Some(ref dylib) = module.native_dylib {
             let real_dir: Option<String> = match &package.files {

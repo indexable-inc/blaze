@@ -18,6 +18,7 @@
 // Without `runtime`: a module's identity and key, the module store's lookup, the expansion
 // record's key and lookup. A command that only asks whether a module or an answer is kept
 // links no Wasmtime.
+pub mod comptime_patch;
 pub mod module;
 pub mod package_env;
 pub mod parts;
