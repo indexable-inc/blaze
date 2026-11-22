@@ -45,6 +45,10 @@ pub struct Selection<A: Allocator> {
 }
 
 impl<A: Allocator> Selection<A> {
+    pub(crate) fn from_parts(total_tests: usize, rerun: Vec<SelectedTest, A>) -> Selection<A> {
+        Selection { total_tests, rerun }
+    }
+
     /// Affected tests that must rerun, sorted strictly ascending by `test_idx`.
     pub fn rerun(&self) -> &[SelectedTest] {
         &self.rerun
@@ -376,6 +380,32 @@ pub struct CodeSymbols<'a> {
     offsets: &'a [usize],
     postings: &'a [Posting],
     pos: usize,
+}
+
+impl<A: Allocator> ImpactIndex<A> {
+    pub(crate) fn tests_slice(&self) -> &[Digest] {
+        &self.tests
+    }
+
+    pub(crate) fn keys_slice(&self) -> &[(CellKind, Digest)] {
+        &self.keys
+    }
+
+    pub(crate) fn offsets_slice(&self) -> &[usize] {
+        &self.offsets
+    }
+
+    pub(crate) fn postings_slice(&self) -> &[Posting] {
+        &self.postings
+    }
+
+    pub(crate) fn code_keys_end(&self) -> usize {
+        self.code_keys_end
+    }
+
+    pub(crate) fn always_rerun_slice(&self) -> &[(u32, Because)] {
+        &self.always_rerun
+    }
 }
 
 impl<'a> Iterator for CodeSymbols<'a> {

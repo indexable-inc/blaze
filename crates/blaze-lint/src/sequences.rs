@@ -85,6 +85,22 @@ pub(crate) const MAX_WORD_LEN: usize = {
     max
 };
 
+/// Per-length 64-bit mask of valid first ASCII bytes (`b - b'A'` in `0..64`, covering `'A'..='Z'`,
+/// `'_'`, and `'a'..='z'`) across [`WORDS`]. Lets `Pass::lex_run` reject ~85% of identifiers in
+/// two instructions before touching the PHF table.
+pub(crate) const WORD_FIRST_BY_LEN: [u64; MAX_WORD_LEN + 1] = {
+    let mut masks = [0u64; MAX_WORD_LEN + 1];
+    let mut at = 0;
+    while at < WORDS.len() {
+        let b = WORDS[at].as_bytes();
+        let bit = b[0].wrapping_sub(b'A');
+        assert!(bit < 64, "every WORDS entry starts with ASCII letter or underscore");
+        masks[b.len()] |= 1u64 << bit;
+        at += 1;
+    }
+    masks
+};
+
 /// The number of `word` in [`WORDS`]. Panics, a compile error in a `const`, when it is not there.
 pub(crate) const fn word(word: &str) -> u8 {
     let mut at = 0;

@@ -242,14 +242,17 @@ impl<'a> Variants<'a> {
                     if let F::Enum(at) = top.f {
                         open[at as usize].named = true;
                     }
-                    let next = toks.get(i + 1).copied();
-                    match (word(t), next) {
-                        ("mod", Some(n)) if n.g == G::Ident => pending = Pending::Mod(Span::new(n.start, n.end)),
-                        ("enum", Some(n)) if n.g == G::Ident => {
-                            pending = Pending::Enum(Span::new(n.start, n.end), is(i + 2, G::P(b'<')));
+                    let wlen = t.end - t.start;
+                    if wlen == 3 || wlen == 4 || wlen == 11 {
+                        let next = toks.get(i + 1).copied();
+                        match (word(t), next) {
+                            ("mod", Some(n)) if n.g == G::Ident => pending = Pending::Mod(Span::new(n.start, n.end)),
+                            ("enum", Some(n)) if n.g == G::Ident => {
+                                pending = Pending::Enum(Span::new(n.start, n.end), is(i + 2, G::P(b'<')));
+                            }
+                            ("macro_rules", Some(n)) if n.g == G::P(b'!') => pending = Pending::Macro,
+                            _ => {}
                         }
-                        ("macro_rules", Some(n)) if n.g == G::P(b'!') => pending = Pending::Macro,
-                        _ => {}
                     }
                 }
                 G::Int if !top.quiet => {
@@ -582,16 +585,20 @@ fn lex<'a>(text: &str, alloc: Alloc<'a>) -> AVec<'a, T> {
 /// The site the integer literal at token `i` is, if it is one: its value at least
 /// [`MIN_COUNT`], in one of the three positions, alone there.
 fn site_at(text: &str, toks: &[T], i: usize, top: Frame) -> Option<Site> {
+    let at = |j: usize| toks.get(j).copied();
+    let back = |n: usize| i.checked_sub(n).and_then(at);
+    let prev = back(1);
+    let p = |tok: Option<T>, c: u8| tok.is_some_and(|t| t.g == G::P(c));
+    // Fast pre-check before parsing the integer literal: every site is preceded by `;`, `.`, or `=`.
+    if !matches!(prev, Some(T { g: G::P(b';' | b'.' | b'='), .. })) {
+        return None;
+    }
     let t = toks[i];
     let (value, suffix_usize) = int_value(&text[t.start as usize..t.end as usize])?;
     if value < MIN_COUNT {
         return None;
     }
-    let at = |j: usize| toks.get(j).copied();
-    let back = |n: usize| i.checked_sub(n).and_then(at);
-    let p = |tok: Option<T>, c: u8| tok.is_some_and(|t| t.g == G::P(c));
     let joined = |a: Option<T>, b: Option<T>| matches!((a, b), (Some(a), Some(b)) if a.end == b.start);
-    let prev = back(1);
     let next = at(i + 1);
     let site = |usize_typed: bool| Site { start: t.start, end: t.end, value, module: top.module, usize_typed };
     // (b) `[T; 21]`, `[x; 21]`: always a `usize`.

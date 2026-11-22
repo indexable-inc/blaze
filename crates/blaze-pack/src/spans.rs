@@ -33,6 +33,18 @@ pub const FRAME_SLACK: u64 = 64 << 10;
 pub const INDEX_MOST: u64 = 4 << 20;
 const WHAT: &str = "the pack's span index";
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CoalescedRange {
+    /// Start offset in the compressed frames file.
+    pub byte_start: u64,
+    /// Total compressed bytes to request in one HTTP Range GET.
+    pub byte_len: u64,
+    /// First span index covered by this range.
+    pub first_span: u64,
+    /// One past the last span index covered by this range.
+    pub end_span: u64,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Spans {
     span: u64,
@@ -96,6 +108,60 @@ impl Spans {
         let at = self.starts[index as usize];
         let plain = (self.body_len - index * self.span).min(self.span);
         (at, self.starts[index as usize + 1] - at, plain)
+    }
+
+    /// Coalesces a batch of requested body byte ranges `(at, len)` into minimal contiguous HTTP
+    /// Range requests over the compressed frames file (for R2/S3 and peer-to-peer fetches).
+    ///
+    /// Deduplicates overlapping spans, merges adjacent/nearby frames whose gap is `<= max_gap`
+    /// while keeping each combined transfer `<= max_range`, and returns ranges sorted ascending.
+    pub fn coalesce_ranges(&self, ranges: &[(u64, u64)], max_gap: u64, max_range: u64) -> Vec<CoalescedRange> {
+        let mut spans: Vec<u64> = Vec::new();
+        for &(at, len) in ranges {
+            let (first, end) = self.covering(at, len);
+            for s in first..end {
+                spans.push(s);
+            }
+        }
+        spans.sort_unstable();
+        spans.dedup();
+        if spans.is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<CoalescedRange> = Vec::new();
+        let mut cur_first_span = spans[0];
+        let mut cur_end_span = spans[0] + 1;
+        let (mut cur_byte_start, first_len, _) = self.frame(spans[0]);
+        let mut cur_byte_end = cur_byte_start + first_len;
+
+        for &s in &spans[1..] {
+            let (f_start, f_len, _) = self.frame(s);
+            let f_end = f_start + f_len;
+            let gap = f_start.saturating_sub(cur_byte_end);
+            let merged_len = f_end.saturating_sub(cur_byte_start);
+            if gap <= max_gap && (max_range == 0 || merged_len <= max_range) {
+                cur_end_span = s + 1;
+                cur_byte_end = f_end;
+            } else {
+                out.push(CoalescedRange {
+                    byte_start: cur_byte_start,
+                    byte_len: cur_byte_end - cur_byte_start,
+                    first_span: cur_first_span,
+                    end_span: cur_end_span,
+                });
+                cur_first_span = s;
+                cur_end_span = s + 1;
+                cur_byte_start = f_start;
+                cur_byte_end = f_end;
+            }
+        }
+        out.push(CoalescedRange {
+            byte_start: cur_byte_start,
+            byte_len: cur_byte_end - cur_byte_start,
+            first_span: cur_first_span,
+            end_span: cur_end_span,
+        });
+        out
     }
 
     pub fn encode(&self) -> Vec<u8> {

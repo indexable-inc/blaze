@@ -60,17 +60,12 @@ use super::{
 };
 use crate::cx::{Canceller, Here};
 
-/// The target's cache line: what two values written by different cores are kept apart by.
-/// Apple silicon's line is 128 bytes; Graviton's, EPYC's and the rest are 64 (an x86 core's
-/// adjacent-line prefetch pairs lines, which the deque's two ends are far enough apart for).
-#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+/// Cache-line isolation stride: 128 bytes unconditionally across Apple Silicon, EPYC, and Graviton 5
+/// so adjacent-line spatial prefetchers never false-share hot atomics or per-group queues at 128 cores.
 pub(crate) const LINE: usize = 128;
-#[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
-pub(crate) const LINE: usize = 64;
 
-/// A value alone on its cache line ([`LINE`]).
-#[cfg_attr(all(target_arch = "aarch64", target_vendor = "apple"), repr(align(128)))]
-#[cfg_attr(not(all(target_arch = "aarch64", target_vendor = "apple")), repr(align(64)))]
+/// A value alone on its 128-byte cache-line pair ([`LINE`]).
+#[repr(align(128))]
 pub(crate) struct Padded<T>(pub(crate) T);
 
 const _: () = assert!(align_of::<Padded<u8>>() == LINE, "Padded's alignment is the target's line");
@@ -558,11 +553,16 @@ struct Worker {
     stole_far: AtomicU64,
 }
 
-/// One group's shared state.
+/// One group's shared state, padded to 128 bytes so adjacent CCX/L3 groups never false-share.
+#[repr(align(128))]
 struct GroupState {
     first: u32,
     len: u32,
     class: Class,
+    /// Lock-free mirrored queue lengths (updated under each queue's lock) so `take` fast-paths
+    /// empty queues and `Pool::visible` checks all groups with zero mutex acquisitions at 128 cores.
+    fg_len: Padded<AtomicUsize>,
+    bg_len: Padded<AtomicUsize>,
     foreground: Lock<VecDeque<JobPtr, Global>>,
     background: Lock<VecDeque<JobPtr, Global>>,
 }
@@ -790,6 +790,8 @@ impl Pool {
                 first,
                 len,
                 class: group.class,
+                fg_len: Padded(AtomicUsize::new(0)),
+                bg_len: Padded(AtomicUsize::new(0)),
                 foreground: Lock::new("bstd.task.inject", VecDeque::with_capacity_in(INJECT, Global)),
                 background: Lock::new("bstd.task.inject.background", VecDeque::with_capacity_in(INJECT, Global)),
             });
@@ -950,11 +952,16 @@ impl Pool {
 
     fn inject(&self, group: u32, class: Class, job: JobPtr) -> Result<(), Full> {
         let group = &self.shared().groups[group as usize];
-        let queue = match class {
-            Class::Foreground => &group.foreground,
-            Class::Background => &group.background,
+        let (queue, count) = match class {
+            Class::Foreground => (&group.foreground, &group.fg_len.0),
+            Class::Background => (&group.background, &group.bg_len.0),
         };
-        bounded_push(&mut queue.lock(), INJECT, job)
+        let mut guard = queue.lock();
+        let res = bounded_push(&mut guard, INJECT, job);
+        if res.is_ok() {
+            count.store(guard.len(), Ordering::Release);
+        }
+        res
     }
 
     /// Runs a task a full queue gave back, on the spawner's thread `here`, now.
@@ -1339,13 +1346,15 @@ impl Pool {
         None
     }
 
-    /// Whether any task is visible to worker `at`: the idle protocol's re-check.
+    /// Whether any task is visible to worker `at`: the idle protocol's re-check (100% lock-free).
     fn visible(&self, at: u32) -> bool {
         let shared = self.shared();
         let worker = &shared.workers[at as usize].0;
         worker.pinned_count.load(Ordering::Acquire) != 0
             || shared.workers.iter().any(|it| !it.0.deque.looks_empty())
-            || shared.groups.iter().any(|group| !group.foreground.lock().is_empty() || !group.background.lock().is_empty())
+            || shared.groups.iter().any(|group| {
+                group.fg_len.0.load(Ordering::Acquire) != 0 || group.bg_len.0.load(Ordering::Acquire) != 0
+            })
     }
 
     /// Asks every worker to stop once it finds nothing more to run, and wakes them.
@@ -1433,13 +1442,21 @@ fn bounded_push(queue: &mut VecDeque<JobPtr, Global>, most: usize, job: JobPtr) 
     Ok(())
 }
 
-/// One task off `group`'s queue of `class`.
+/// One task off `group`'s queue of `class` (lock-free fast path when empty).
 fn take(group: &GroupState, class: Class) -> Option<JobPtr> {
-    let queue = match class {
-        Class::Foreground => &group.foreground,
-        Class::Background => &group.background,
+    let (queue, count) = match class {
+        Class::Foreground => (&group.foreground, &group.fg_len.0),
+        Class::Background => (&group.background, &group.bg_len.0),
     };
-    queue.lock().pop_front()
+    if count.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let mut guard = queue.lock();
+    let job = guard.pop_front();
+    if job.is_some() {
+        count.store(guard.len(), Ordering::Release);
+    }
+    job
 }
 
 impl Drop for Shared {

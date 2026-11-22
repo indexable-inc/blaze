@@ -895,3 +895,95 @@ fn advise_tier_up_prop(tape: &Tape) -> Result<(), Broke> {
 fn advise_tier_up_matches_bruteforce_property() {
     check(SimConfig::cases(300), advise_tier_up_prop);
 }
+
+#[test]
+fn persist_impact_view_matches_index_and_rejects_corruption() {
+    use crate::persist::{ImpactView, PersistError, encode_impact};
+
+    // 1. Property test: zero-copy BTI1 ImpactView::select matches ImpactIndex::select bit-for-bit.
+    check(SimConfig::cases(300), |tape| {
+        let n_tests = tape.index(18, "tests");
+        let n_syms = 1 + tape.index(14, "syms");
+        let syms: StdVec<Digest> = (0..n_syms).map(|i| Digest::of("p-sym", &(i as u32).to_le_bytes())).collect();
+        let mut raw_records: StdVec<(Digest, Option<StdVec<u8>>)> = StdVec::new();
+
+        for t in 0..n_tests {
+            let test = Digest::of("p-test", &(t as u32).to_le_bytes());
+            match tape.index(6, "rec kind") {
+                0 => raw_records.push((test, None)),
+                1 => raw_records.push((test, Some(StdVec::from([1, 2, 3])))),
+                2 => {
+                    let other = Digest::of("p-other", &(t as u32).to_le_bytes());
+                    let r = Reach::new(ReachOpts { cap: 16, alloc: alloc() }).expect("reach").finish().expect("finish");
+                    raw_records.push((test, Some(encoded(other, Out::Passed, Reusable::Yes, &r).as_slice().to_vec())));
+                }
+                3 => {
+                    let r = Reach::new(ReachOpts { cap: 16, alloc: alloc() }).expect("reach").finish().expect("finish");
+                    raw_records.push((
+                        test,
+                        Some(encoded(test, Out::Passed, Reusable::No(NotReusable::Clock), &r).as_slice().to_vec()),
+                    ));
+                }
+                _ => {
+                    let mut r = Reach::new(ReachOpts { cap: 32, alloc: alloc() }).expect("reach");
+                    let reads = tape.index(8, "reads");
+                    for _ in 0..reads {
+                        let kind = match tape.index(4, "kind") {
+                            0 => CellKind::Code,
+                            1 => CellKind::Datum,
+                            2 => CellKind::File,
+                            _ => CellKind::Env,
+                        };
+                        let name = syms[tape.index(n_syms, "sym")];
+                        let val = Digest::of("p-val", &[tape.index(3, "v") as u8]);
+                        let _ = r.add(Read { kind, name, value: val });
+                    }
+                    if let Ok(fin) = r.finish() {
+                        raw_records.push((test, Some(encoded(test, Out::Passed, Reusable::Yes, &fin).as_slice().to_vec())));
+                    } else {
+                        raw_records.push((test, None));
+                    }
+                }
+            }
+        }
+        let borrowed: StdVec<(Digest, Option<&[u8]>)> =
+            raw_records.iter().map(|(d, b)| (*d, b.as_deref())).collect();
+        let index = ImpactIndex::build(&borrowed, alloc());
+        let bytes = encode_impact(&index, alloc());
+        let view = ImpactView::open(&bytes).map_err(|e| Broke::Oracle(format!("open failed: {e}")))?;
+        view.verify_digest().map_err(|e| Broke::Oracle(format!("digest failed: {e}")))?;
+
+        let n_changes = tape.index(6, "changes");
+        let mut changed = StdVec::new();
+        for _ in 0..n_changes {
+            let kind = match tape.index(4, "ck") {
+                0 => CellKind::Code,
+                1 => CellKind::Datum,
+                2 => CellKind::File,
+                _ => CellKind::Env,
+            };
+            let name = syms[tape.index(n_syms, "csym")];
+            let val = Digest::of("p-val", &[tape.index(4, "cv") as u8]);
+            changed.push((kind, name, val));
+        }
+
+        let got = view.select(&changed, alloc()).map_err(|e| Broke::Oracle(format!("select failed: {e}")))?;
+        let want = index.select(&changed, alloc());
+        oracle(
+            got.total_tests() == want.total_tests() && got.rerun() == want.rerun(),
+            || format!("persisted ImpactView mismatch:\ngot:  {:?}\nwant: {:?}", got.rerun(), want.rerun()),
+        )
+    });
+
+    // 2. Corruption refusal checks.
+    assert_eq!(ImpactView::open(&[0u8; 10]).unwrap_err(), PersistError::TooShort);
+    let idx = ImpactIndex::build(&[(Digest::of("t", b"1"), None)], alloc());
+    let mut bytes = encode_impact(&idx, alloc());
+    let mut bad_magic = bytes.as_slice().to_vec();
+    bad_magic[0] = b'X';
+    assert_eq!(ImpactView::open(&bad_magic).unwrap_err(), PersistError::BadMagic);
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    let view = ImpactView::open(&bytes).expect("header still valid");
+    assert_eq!(view.verify_digest().unwrap_err(), PersistError::BadDigest);
+}

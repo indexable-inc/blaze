@@ -17,7 +17,7 @@ use crate::sequences::{
     W_INSTANT, W_JOIN, W_LIBC, W_LOCK, W_MOD, W_ORDERING, W_RECV, W_RUSTIX, W_SELF, W_SEQCST, W_STD, W_STRING,
     W_SYSTEM_TIME, W_THREAD_LOCAL, W_TRAIT, W_TYPE, W_UNSAFE, W_UNWRAP, W_USE, W_WAIT, WC_COLLECTION, WC_DEFINING,
     WC_DISPATCHED, WC_IO_MODULE, WC_IO_TYPE, WC_LOCK_TYPE, WC_PRINT_MACRO, WC_RENAME, WC_SANS_IO, WC_STATIC, WORD,
-    WORD_CLASS,
+    WORD_CLASS, WORD_FIRST_BY_LEN,
 };
 use crate::{
     Arg, Block, Cost, Finding, Findings, Fix, LintError, Mark, ONLY_OWN, Owner, Rule, RuleSet, Run, Scope, Span,
@@ -430,9 +430,14 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                 K::Ident => {
                     let len = (end - start) as usize;
                     if len >= MIN_WORD_LEN && len <= MAX_WORD_LEN {
-                        match WORD.index(&self.bytes[start as usize..end as usize]) {
-                            Some(at) => at as u8,
-                            None => NO_WORD,
+                        let first = self.bytes[start as usize].wrapping_sub(b'A');
+                        if first < 64 && (WORD_FIRST_BY_LEN[len] & (1u64 << first)) != 0 {
+                            match WORD.index(&self.bytes[start as usize..end as usize]) {
+                                Some(at) => at as u8,
+                                None => NO_WORD,
+                            }
+                        } else {
+                            NO_WORD
                         }
                     } else {
                         NO_WORD
@@ -2009,6 +2014,44 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
         // Bounded: each turn moves `i` forward by one or two tokens.
         while i < n {
             let t = self.toks[i];
+            // Fast path when no sequence match is live: skip tokens that can never start one
+            // without running `symbol()` or touching `TRIE`.
+            if live.is_empty() {
+                match t.k {
+                    K::Ident => {
+                        if t.word == NO_WORD {
+                            i += 1;
+                            continue;
+                        }
+                        let to = TRIE.root(t.word);
+                        if to == DEAD {
+                            i += 1;
+                            continue;
+                        }
+                        live.start_root(to, i as u32);
+                        let last = i;
+                        i += 1;
+                        let mut seq = TRIE.first_end(to);
+                        while seq != NO_SEQ {
+                            let template = SEQS[seq as usize].template;
+                            let covered = last == std_table_at
+                                && matches!(template, Template::ReadHashSeed | Template::HasherDefault);
+                            if !covered && self.on_sequence(seq as usize, last, last) && template == Template::HasherStd {
+                                std_table_at = last;
+                            }
+                            seq = TRIE.next_end(seq);
+                        }
+                        continue;
+                    }
+                    // Only `.` (for `.await`, `.to_string()`, `.recv()`, etc.) and `:`/`!`/`(`/`{`/`|`/`<`
+                    // can ever map to non-OTHER punctuation; skip everything else in 1 branch.
+                    K::P(b'.' | b':' | b'!' | b'(' | b')' | b'{' | b'|' | b'<') => {}
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
             let (sym, width) = self.symbol(i, t);
             let tok_start = i as u32;
             let last = i + width - 1;

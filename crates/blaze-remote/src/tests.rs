@@ -1319,3 +1319,21 @@ fn batches_and_outcomes_round_trip() {
         assert_eq!(Outcome::decode(&outcome.encode(), made).expect("decodes"), outcome);
     });
 }
+
+#[test]
+fn find_cache_trim_evicts_lru_and_preserves_hot_blocks() {
+    use crate::find::{BLOCKS_CACHED, Cache};
+    let mut cache = Cache::default();
+    let shard = ContentId([7u8; 32]);
+    // Insert BLOCKS_CACHED + 4 blocks (0..BLOCKS_CACHED+4).
+    for i in 0..(BLOCKS_CACHED + 4) {
+        cache.keep_block(shard, i, Vec::new());
+    }
+    // Re-touch block 0 so it becomes the most recently used and survives LRU eviction.
+    cache.keep_block(shard, 0, Vec::new());
+    cache.trim_blocks();
+    assert!(cache.block(&shard, 0).is_some(), "re-touched hot block 0 must stay cached");
+    assert!(cache.block(&shard, 1).is_none(), "oldest cold block 1 must be evicted");
+    assert!(cache.block(&shard, 4).is_none(), "cold block 4 must be evicted");
+    assert!(cache.block(&shard, BLOCKS_CACHED + 3).is_some(), "newest block must stay cached");
+}

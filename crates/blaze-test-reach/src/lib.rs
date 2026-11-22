@@ -26,6 +26,7 @@ extern crate std;
 
 pub mod decide;
 pub mod impact;
+pub mod persist;
 pub mod plan;
 pub mod reach;
 pub mod record;
@@ -39,6 +40,7 @@ use core::fmt;
 
 pub use decide::{Audit, Because, Enter, Grants, NotReusable, Reusable, audit, enter, enter_stored};
 pub use impact::{CodeSymbols, ImpactIndex, Posting, SelectedTest, Selection};
+pub use persist::{ImpactView, PersistError, encode_impact};
 pub use plan::{ExecutionPlan, PlannedTest, TestHistory, TierAdvice, TierOpts, advise_tier_up, advise_tier_up_for_plan};
 pub use reach::{Reach, ReachError, ReachOpts, Reached};
 pub use record::{Out, RecordError, TestRecord};

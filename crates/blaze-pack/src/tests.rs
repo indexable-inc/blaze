@@ -723,3 +723,28 @@ fn a_verified_record_carries_the_manifests_key_and_kind() {
     cut.read(0, 4, &mut into).unwrap();
     assert_eq!(into, records[0].1[..4]);
 }
+
+#[test]
+fn spans_coalesce_ranges_merges_nearby_frames_and_respects_max_range() {
+    use crate::spans::{CoalescedRange, Spans};
+    // 6 spans of 1000 bytes each; compressed frame sizes = [100, 120, 80, 500, 90, 110].
+    let spans = Spans::new(1000, 6000, &[100, 120, 80, 500, 90, 110]).unwrap();
+    // Ask for bytes in spans 0, 2 (gap = frame 1 = 120 bytes <= 150), and span 5 (gap = frames 3+4 = 590 > 150).
+    let got = spans.coalesce_ranges(&[(10, 50), (2050, 20), (5010, 30), (15, 25)], 150, 1000);
+    assert_eq!(
+        got,
+        vec![
+            CoalescedRange { byte_start: 0, byte_len: 300, first_span: 0, end_span: 3 },
+            CoalescedRange { byte_start: 890, byte_len: 110, first_span: 5, end_span: 6 },
+        ]
+    );
+    // Respect max_range cap: cap = 250 splits span 2 from span 0 even though gap <= 150.
+    let split = spans.coalesce_ranges(&[(10, 50), (2050, 20)], 150, 250);
+    assert_eq!(
+        split,
+        vec![
+            CoalescedRange { byte_start: 0, byte_len: 100, first_span: 0, end_span: 1 },
+            CoalescedRange { byte_start: 220, byte_len: 80, first_span: 2, end_span: 3 },
+        ]
+    );
+}
