@@ -440,10 +440,10 @@ pub(crate) const SEQS: &[Seq] = &[
     s(&[Wd("thread"), P(SEP), Wd("available_parallelism"), P(OPEN)], Template::BlockingOnPool, none(), DropLast, Row, "the pool's configured worker count passed in"),
     s(&[Wd("hint"), P(SEP), Wd("spin_loop"), P(OPEN)], Template::BlockingOnPool, none(), DropLast, Row, "a bounded wait rather than busy-spinning on a pool thread"),
     // ---- transmute: raw bit reinterpretation.
-    s(&[Wd("mem"), P(SEP), Wd("transmute"), P(OPEN)], Template::Transmute, none(), DropLast, Row, "a safe conversion (`from_ne_bytes`, `to_bits`, or a typed helper)"),
-    s(&[Wd("mem"), P(SEP), Wd("transmute"), P(SEP), P(LT)], Template::Transmute, none(), DropTurbo, Row, "a safe conversion (`from_ne_bytes`, `to_bits`, or a typed helper)"),
-    s(&[Wd("mem"), P(SEP), Wd("transmute_copy"), P(OPEN)], Template::Transmute, none(), DropLast, Row, "a safe conversion (`from_ne_bytes`, `ptr::read_unaligned` with a safety proof, or a typed helper)"),
-    s(&[Wd("mem"), P(SEP), Wd("transmute_copy"), P(SEP), P(LT)], Template::Transmute, none(), DropTurbo, Row, "a safe conversion (`from_ne_bytes`, `ptr::read_unaligned` with a safety proof, or a typed helper)"),
+    s(&[Wd("mem"), P(SEP), Wd("transmute"), P(OPEN)], Template::Transmute, none(), DropLast, Row, "a safe `bstd::pod` / `blaze_own::pod` conversion (`pod::cast`, `pod::cast_slice`, `pod::bytes_of`, `pod::from_bytes`, `CheckedBitPattern`) or `from_ne_bytes`/`to_bits`"),
+    s(&[Wd("mem"), P(SEP), Wd("transmute"), P(SEP), P(LT)], Template::Transmute, none(), DropTurbo, Row, "a safe `bstd::pod` / `blaze_own::pod` conversion (`pod::cast`, `pod::cast_slice`, `pod::bytes_of`, `pod::from_bytes`, `CheckedBitPattern`) or `from_ne_bytes`/`to_bits`"),
+    s(&[Wd("mem"), P(SEP), Wd("transmute_copy"), P(OPEN)], Template::Transmute, none(), DropLast, Row, "a safe `bstd::pod` / `blaze_own::pod` conversion (`pod::pod_read_unaligned`, `pod::cast`, `CheckedBitPattern`) or `from_ne_bytes`"),
+    s(&[Wd("mem"), P(SEP), Wd("transmute_copy"), P(SEP), P(LT)], Template::Transmute, none(), DropTurbo, Row, "a safe `bstd::pod` / `blaze_own::pod` conversion (`pod::pod_read_unaligned`, `pod::cast`, `CheckedBitPattern`) or `from_ne_bytes`"),
 ];
 
 /// The symbols of `seq`.

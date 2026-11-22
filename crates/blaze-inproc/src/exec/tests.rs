@@ -22,7 +22,12 @@ const FORTY_TWO: &[u8] = &[0x40, 0x05, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6];
 fn call(at: u64) -> u32 {
     // SAFETY: every caller passes the address of a function of this signature in the C
     // convention, mapped executable and live for the call.
-    let f: extern "C" fn() -> u32 = unsafe { std::mem::transmute(at as usize) };
+    let ptr = at as usize as *const ();
+    const {
+        assert!(size_of::<*const ()>() == size_of::<extern "C" fn() -> u32>());
+        assert!(align_of::<*const ()>() == align_of::<extern "C" fn() -> u32>());
+    }
+    let f: extern "C" fn() -> u32 = unsafe { core::ptr::read((&raw const ptr).cast()) };
     f()
 }
 
@@ -278,7 +283,11 @@ fn emit_ret_u32(value: u16) -> Vec<u8> {
 fn call_u32_to_u32(ptr: *const u8, arg: u32) -> u32 {
     // SAFETY: every caller passes an RX pointer to published machine code matching the
     // `extern "C" fn(u32) -> u32` ABI, live in `JitPool` for the duration of the call.
-    let f: extern "C" fn(u32) -> u32 = unsafe { std::mem::transmute(ptr) };
+    const {
+        assert!(size_of::<*const u8>() == size_of::<extern "C" fn(u32) -> u32>());
+        assert!(align_of::<*const u8>() == align_of::<extern "C" fn(u32) -> u32>());
+    }
+    let f: extern "C" fn(u32) -> u32 = unsafe { core::ptr::read((&raw const ptr).cast()) };
     f(arg)
 }
 

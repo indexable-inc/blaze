@@ -52,6 +52,23 @@ impl Executable {
         self.memory.data_address()
     }
 
+    /// Reinterprets the executable entry point at `code_address()` as a typed function pointer `F`.
+    ///
+    /// # Safety
+    /// - `F` must be a function pointer type (`extern "C" fn(...) -> ...`) with pointer size & alignment.
+    /// - The sealed code inside this `Executable` must match `F`'s ABI and remain live while called.
+    #[inline]
+    pub unsafe fn as_fn<F: Copy>(&self) -> F {
+        const {
+            assert!(core::mem::size_of::<F>() == core::mem::size_of::<*const u8>(), "as_fn target must have pointer size");
+            assert!(core::mem::align_of::<F>() == core::mem::align_of::<*const u8>(), "as_fn target must have pointer alignment");
+        }
+        let ptr = self.memory.code_address() as usize as *const u8;
+        // SAFETY: `F` has pointer size & alignment (asserted at compile time) and caller guarantees
+        // the sealed RX code matches `F`'s ABI.
+        unsafe { core::ptr::read((&raw const ptr).cast::<F>()) }
+    }
+
     pub fn data(&mut self) -> &mut [u8] {
         self.memory.data()
     }
@@ -365,20 +382,20 @@ impl JitPool {
     ///   [`JitPool::publish`] (or [`JitPool::link_batch`] / [`JitPool::alloc_tier_slot`]), and
     ///   must remain live in this pool for as long as the returned pointer is called.
     pub unsafe fn typed_fn<F: Copy>(&self, handle: CodeHandle) -> F {
-        assert_eq!(
-            std::mem::size_of::<F>(),
-            std::mem::size_of::<*const u8>(),
-            "typed_fn target must have pointer size"
-        );
-        assert_eq!(
-            std::mem::align_of::<F>(),
-            std::mem::align_of::<*const u8>(),
-            "typed_fn target must have pointer alignment"
-        );
+        const {
+            assert!(
+                core::mem::size_of::<F>() == core::mem::size_of::<*const u8>(),
+                "typed_fn target must have pointer size"
+            );
+            assert!(
+                core::mem::align_of::<F>() == core::mem::align_of::<*const u8>(),
+                "typed_fn target must have pointer alignment"
+            );
+        }
         let ptr = self.fn_ptr(handle);
         // SAFETY: the caller guarantees `F` is a function pointer matching the published code at
-        // `ptr`, and pointer size/alignment were asserted above.
-        unsafe { std::mem::transmute_copy(&ptr) }
+        // `ptr`, and pointer size/alignment were proved at compile time above.
+        unsafe { core::ptr::read((&raw const ptr).cast::<F>()) }
     }
 
     /// Reads the current bytes of `handle` through the RW view.

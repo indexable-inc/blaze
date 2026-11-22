@@ -24,11 +24,9 @@
 //! [`Buffers`] is what the kernel says after every option is set, read back with
 //! `getsockopt`: a datagram socket's arrives in [`crate::Done::Bound`].
 //!
-//! Why unsafe: `setsockopt` and `getsockopt` read and write the bytes of a value of the size
-//! given, a `c_int`, a `struct linger` or a name's bytes, each on this function's stack for the
-//! one call; `bind`, `listen` and `connect` read a `sockaddr_storage` of the length
-//! [`crate::net::sockaddr`] wrote. Every descriptor is one this module made and owns, or one
-//! the caller owns for the length of the call.
+//! Production `setsockopt`/`getsockopt` paths are 100% safe via [`crate::pod::bytes_of`] and
+//! [`crate::pod::bytes_of_mut`]. The remaining `unsafe` blocks are strictly in socket bind/connect
+//! helpers that pass a `sockaddr_storage` written by [`crate::net::sockaddr`].
 
 use std::{alloc::Global, fmt};
 
@@ -725,7 +723,7 @@ pub(crate) mod native {
 
     use blaze_sys::{
         Fd,
-        posix::{net, types::{c_int, c_void, socklen_t}},
+        posix::{net, types::{c_int, socklen_t}},
     };
 
     use super::{
@@ -850,12 +848,10 @@ pub(crate) mod native {
         })
     }
 
-    /// `value` written as `knob` of `fd`.
-    fn set_raw(fd: RawFd, knob: Knob, value: *const c_void, len: usize) -> io::Result<()> {
-        // SAFETY: the callers supply an initialized int, two consecutive ints (linger), or a
-        // byte slice, all live for this call. Casting to socklen_t can only shorten the slice.
-        let bytes = unsafe { core::slice::from_raw_parts(value.cast(), len as socklen_t as usize) };
-        net::setsockopt_bytes(Fd::new(fd), knob.level, knob.name, bytes).map_err(|errno| {
+    /// `bytes` written as `knob` of `fd`.
+    fn set_bytes(fd: RawFd, knob: Knob, value: &[u8]) -> io::Result<()> {
+        let len = (value.len() as socklen_t as usize).min(value.len());
+        net::setsockopt_bytes(Fd::new(fd), knob.level, knob.name, &value[..len]).map_err(|errno| {
             let error = io::Error::from_raw_os_error(i32::from(errno.raw()));
             // alloc: an error path.
             io::Error::new(error.kind(), format!("setting socket option {}: {error}", knob.text))
@@ -863,23 +859,22 @@ pub(crate) mod native {
     }
 
     pub(crate) fn set_int(fd: RawFd, knob: Knob, value: c_int) -> io::Result<()> {
-        set_raw(fd, knob, (&raw const value).cast(), size_of::<c_int>())
+        set_bytes(fd, knob, crate::pod::bytes_of(&value))
     }
 
     fn set_linger(fd: RawFd, knob: Knob, value: net::linger) -> io::Result<()> {
-        set_raw(fd, knob, (&raw const value).cast(), size_of::<net::linger>())
-    }
-
-    fn set_bytes(fd: RawFd, knob: Knob, value: &[u8]) -> io::Result<()> {
-        set_raw(fd, knob, value.as_ptr().cast(), value.len())
+        const {
+            assert!(size_of::<net::linger>() == size_of::<[c_int; 2]>());
+            assert!(align_of::<net::linger>() == align_of::<[c_int; 2]>());
+        }
+        let pair = [value.l_onoff, value.l_linger];
+        set_bytes(fd, knob, crate::pod::bytes_of(&pair))
     }
 
     /// `knob` of `fd` read back into `into`: how many bytes the kernel wrote.
-    fn get_raw(fd: RawFd, knob: Knob, into: *mut c_void, len: usize) -> io::Result<usize> {
-        // SAFETY: the callers lend an initialized int, two consecutive ints (linger), or a
-        // byte array exclusively for this call. Every bit pattern is valid in each.
-        let bytes = unsafe { core::slice::from_raw_parts_mut(into.cast(), len as socklen_t as usize) };
-        net::getsockopt_bytes(Fd::new(fd), knob.level, knob.name, bytes).map_err(|errno| {
+    fn get_bytes(fd: RawFd, knob: Knob, into: &mut [u8]) -> io::Result<usize> {
+        let len = (into.len() as socklen_t as usize).min(into.len());
+        net::getsockopt_bytes(Fd::new(fd), knob.level, knob.name, &mut into[..len]).map_err(|errno| {
             let error = io::Error::from_raw_os_error(i32::from(errno.raw()));
             // alloc: an error path.
             io::Error::new(error.kind(), format!("reading socket option {}: {error}", knob.text))
@@ -888,21 +883,25 @@ pub(crate) mod native {
 
     pub(crate) fn get_int(fd: RawFd, knob: Knob) -> io::Result<c_int> {
         let mut value: c_int = 0;
-        get_raw(fd, knob, (&raw mut value).cast(), size_of::<c_int>())?;
+        get_bytes(fd, knob, crate::pod::bytes_of_mut(&mut value))?;
         Ok(value)
     }
 
     #[cfg(test)]
     pub(crate) fn get_linger(fd: RawFd, knob: Knob) -> io::Result<net::linger> {
-        let mut value = net::linger { l_onoff: 0, l_linger: 0 };
-        get_raw(fd, knob, (&raw mut value).cast(), size_of::<net::linger>())?;
-        Ok(value)
+        const {
+            assert!(size_of::<net::linger>() == size_of::<[c_int; 2]>());
+            assert!(align_of::<net::linger>() == align_of::<[c_int; 2]>());
+        }
+        let mut pair = [0 as c_int; 2];
+        get_bytes(fd, knob, crate::pod::bytes_of_mut(&mut pair))?;
+        Ok(net::linger { l_onoff: pair[0], l_linger: pair[1] })
     }
 
     /// A name option's bytes, up to its first NUL.
     #[cfg(test)]
     pub(crate) fn get_name(fd: RawFd, knob: Knob, into: &mut [u8; 16]) -> io::Result<usize> {
-        let got = get_raw(fd, knob, into.as_mut_ptr().cast(), into.len())?;
+        let got = get_bytes(fd, knob, into)?;
         Ok(into[..got].iter().position(|it| *it == 0).unwrap_or(got))
     }
 

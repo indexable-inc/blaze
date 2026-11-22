@@ -282,15 +282,17 @@ unsafe fn symbol<F: Copy>(
     framework: &'static CStr,
     name: &'static CStr,
 ) -> Result<F, Missing> {
-    const { assert!(size_of::<F>() == size_of::<*mut c_void>(), "a symbol is one address") };
+    const {
+        assert!(size_of::<F>() == size_of::<*mut c_void>(), "a symbol is one address");
+        assert!(align_of::<F>() == align_of::<*mut c_void>(), "a symbol has pointer alignment");
+    }
     // SAFETY: a handle `open` returned, never closed, and a NUL-terminated name.
     let found = unsafe { thread::dlsym(handle, name.as_ptr()) };
     if found.is_null() {
         return Err(Missing { framework, symbol: Some(name) });
     }
-    // SAFETY: an address the size of `F` (asserted above), of the symbol whose type `F` is
-    // (the caller's contract).
-    Ok(unsafe { std::mem::transmute_copy::<*mut c_void, F>(&found) })
+    // SAFETY: `F` has pointer size & alignment (asserted above) and names the loaded symbol's ABI.
+    Ok(unsafe { core::ptr::read((&raw const found).cast::<F>()) })
 }
 
 // libdispatch, in libSystem: through blaze-sys's table of calls found at first use, so a

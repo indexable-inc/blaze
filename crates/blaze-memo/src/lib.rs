@@ -581,7 +581,7 @@ pub mod plumbing {
         // `mark_borrows` checks), and the memo hands a stored value out only under a borrow of
         // the snapshot no longer than the arena's life. `ManuallyDrop` keeps the value from
         // being dropped twice.
-        unsafe { std::mem::transmute_copy::<A, B>(&value) }
+        unsafe { core::ptr::read(core::ptr::from_ref::<A>(&*value).cast::<B>()) }
     }
 
     /// [`relifetime_by_macro`] for a reference: the stored value read back as its database form,

@@ -145,7 +145,7 @@ mod run {
         // SAFETY: `exec` holds a composed function of the C convention taking one `i64` and
         // returning one, mapped executable while `exec` lives; its only relocations were
         // patched to a static readable page.
-        let f = unsafe { core::mem::transmute::<usize, extern "C" fn(u64) -> u64>(exec.code_address() as usize) };
+        let f: extern "C" fn(u64) -> u64 = unsafe { exec.as_fn() };
         f(n)
     }
 }

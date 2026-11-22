@@ -167,7 +167,7 @@ fn f128_arithmetic_runs_through_the_routines() {
         }
         // SAFETY: an emitted C function of two quads (q0, q1) returning one (q0), its literal
         // words this binary's routines; mapped while `exec` lives.
-        let f = unsafe { std::mem::transmute::<usize, extern "C" fn(f128, f128) -> f128>(exec.code_address() as usize) };
+        let f: extern "C" fn(f128, f128) -> f128 = unsafe { exec.as_fn() };
         let got = f(q(a), q(b)).to_bits();
         assert_eq!(got, want, "{op:?} {a:#034x} {b:#034x}: {got:#034x}");
     }
@@ -197,7 +197,7 @@ fn f128_comparisons_with_nan_and_negative_zero() {
         let (exec, _) = placed(&func);
         // SAFETY: an emitted C function of two quads (q0, q1) returning an `i1` in x0,
         // zero-extended (lib.rs, "Values").
-        let f = unsafe { std::mem::transmute::<usize, extern "C" fn(f128, f128) -> u64>(exec.code_address() as usize) };
+        let f: extern "C" fn(f128, f128) -> u64 = unsafe { exec.as_fn() };
         assert_eq!(f(q(a), q(b)), want, "{cond:?} {a:#034x} {b:#034x}");
     }
 }
@@ -212,7 +212,7 @@ fn f128_conversions_round_trip_exact_values() {
     let from_i128 = one(&[Ty::I128], Ty::F128, |bd, v| bd.convert(Op::SitoFp, Flags::NONE, Ty::F128, v[0]));
     let (exec, _) = placed(&from_i128);
     // SAFETY: an emitted C function of an `i128` (x0:x1) returning a quad (q0).
-    let f = unsafe { std::mem::transmute::<usize, extern "C" fn(i128) -> f128>(exec.code_address() as usize) };
+    let f: extern "C" fn(i128) -> f128 = unsafe { exec.as_fn() };
     assert_eq!(f(1 << 70).to_bits(), P70, "2^70 as f128");
     assert_eq!(f(i128::MAX).to_bits(), P127, "i128::MAX as f128 rounds to 2^127");
     assert_eq!(f(-1).to_bits(), SIGN | ONE, "-1i128 as f128");
@@ -220,13 +220,13 @@ fn f128_conversions_round_trip_exact_values() {
     let from_i64 = one(&[Ty::I64], Ty::F128, |bd, v| bd.convert(Op::SitoFp, Flags::NONE, Ty::F128, v[0]));
     let (exec, _) = placed(&from_i64);
     // SAFETY: an emitted C function of an `i64` (x0) returning a quad (q0).
-    let f = unsafe { std::mem::transmute::<usize, extern "C" fn(i64) -> f128>(exec.code_address() as usize) };
+    let f: extern "C" fn(i64) -> f128 = unsafe { exec.as_fn() };
     assert_eq!(f(-1).to_bits(), SIGN | ONE, "-1i64 as f128");
 
     let to_i128 = one(&[Ty::F128], Ty::I128, |bd, v| bd.convert(Op::FptoSi, Flags::NONE, Ty::I128, v[0]));
     let (exec, _) = placed(&to_i128);
     // SAFETY: an emitted C function of a quad (q0) returning an `i128` (x0:x1).
-    let f = unsafe { std::mem::transmute::<usize, extern "C" fn(f128) -> i128>(exec.code_address() as usize) };
+    let f: extern "C" fn(f128) -> i128 = unsafe { exec.as_fn() };
     assert_eq!(f(q(P70)), 1 << 70, "2^70 as i128");
     assert_eq!(f(q(P127)), i128::MAX, "2^127 as i128 saturates");
     assert_eq!(f(q(SIGN | P127)), i128::MIN, "-2^127 as i128 is MIN exactly");
@@ -235,27 +235,27 @@ fn f128_conversions_round_trip_exact_values() {
     let to_i64 = one(&[Ty::F128], Ty::I64, |bd, v| bd.convert(Op::FptoSi, Flags::NONE, Ty::I64, v[0]));
     let (exec, _) = placed(&to_i64);
     // SAFETY: an emitted C function of a quad (q0) returning an `i64` (x0).
-    let f = unsafe { std::mem::transmute::<usize, extern "C" fn(f128) -> i64>(exec.code_address() as usize) };
+    let f: extern "C" fn(f128) -> i64 = unsafe { exec.as_fn() };
     assert_eq!(f(q(SIGN | ONE)), -1, "-1.0 as i64");
     assert_eq!(f(q(P70)), i64::MAX, "2^70 as i64 saturates");
 
     let to_u64 = one(&[Ty::F128], Ty::I64, |bd, v| bd.convert(Op::FptoUi, Flags::NONE, Ty::I64, v[0]));
     let (exec, _) = placed(&to_u64);
     // SAFETY: as above.
-    let f = unsafe { std::mem::transmute::<usize, extern "C" fn(f128) -> u64>(exec.code_address() as usize) };
+    let f: extern "C" fn(f128) -> u64 = unsafe { exec.as_fn() };
     assert_eq!(f(q(SIGN | ONE)), 0, "-1.0 as u64 saturates to 0");
     assert_eq!(f(q(THREE)), 3, "3.0 as u64");
 
     let widen = one(&[Ty::F64], Ty::F128, |bd, v| bd.convert(Op::Fpext, Flags::NONE, Ty::F128, v[0]));
     let (exec, _) = placed(&widen);
     // SAFETY: an emitted C function of an `f64` (d0) returning a quad (q0).
-    let f = unsafe { std::mem::transmute::<usize, extern "C" fn(f64) -> f128>(exec.code_address() as usize) };
+    let f: extern "C" fn(f64) -> f128 = unsafe { exec.as_fn() };
     assert_eq!(f(1.5).to_bits(), ONE_HALF, "1.5f64 as f128");
 
     let narrow = one(&[Ty::F128], Ty::F64, |bd, v| bd.convert(Op::Fptrunc, Flags::NONE, Ty::F64, v[0]));
     let (exec, _) = placed(&narrow);
     // SAFETY: an emitted C function of a quad (q0) returning an `f64` (d0).
-    let f = unsafe { std::mem::transmute::<usize, extern "C" fn(f128) -> f64>(exec.code_address() as usize) };
+    let f: extern "C" fn(f128) -> f64 = unsafe { exec.as_fn() };
     assert_eq!(f(q(THREE)).to_bits(), 3.0f64.to_bits(), "3.0 as f64");
 }
 
@@ -269,12 +269,12 @@ fn a_quad_third_argument_is_passed_and_returned() {
     let (exec, _) = placed(&same);
     // SAFETY: an emitted C function of a quad, an `f64` and a quad (v0, v1, v2) returning a
     // quad (q0).
-    let f = unsafe { std::mem::transmute::<usize, extern "C" fn(f128, f64, f128) -> f128>(exec.code_address() as usize) };
+    let f: extern "C" fn(f128, f64, f128) -> f128 = unsafe { exec.as_fn() };
     assert_eq!(f(q(ONE), 9.0, q(SEVEN)).to_bits(), SEVEN, "the third argument returned");
     let sum = one(&[Ty::F128, Ty::F64, Ty::F128], Ty::F128, |bd, v| bd.binary(Op::Fadd, Flags::NONE, v[0], v[2]));
     let (exec, _) = placed(&sum);
     // SAFETY: as above.
-    let f = unsafe { std::mem::transmute::<usize, extern "C" fn(f128, f64, f128) -> f128>(exec.code_address() as usize) };
+    let f: extern "C" fn(f128, f64, f128) -> f128 = unsafe { exec.as_fn() };
     assert_eq!(f(q(ONE), 9.0, q(TWO)).to_bits(), THREE, "first + third");
 }
 

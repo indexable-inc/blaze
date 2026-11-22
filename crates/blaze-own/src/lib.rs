@@ -124,6 +124,10 @@ pub mod packed;
 pub mod paths;
 // The plant seam shipped code takes a planted bug through (D165): `Planted`, `NoPlant`.
 pub mod planted;
+/// Safe plain-old-data (`Pod`), `Zeroable`, `CheckedBitPattern`, and `TransparentWrapper`
+/// conversions — `#![no_std]`, zero dependencies, zero `transmute`.
+#[macro_use]
+pub mod pod;
 pub mod raw;
 pub mod rc;
 pub mod segs;
@@ -163,6 +167,7 @@ pub use fixed::{FixedString, FixedVec, Full, Inline, Overflow};
 pub use heap4::{Heap4, Heap4Plant};
 pub use make::{CloneIn, DefaultIn, FromIn, FromStrIn, IntoIn, ParseIn, Share};
 pub use packed::{Pack, Packed};
+pub use pod::{AnyBitPattern, CastError, CheckedBitPattern, NoUninit, Pod, TransparentWrapper, Zeroable};
 pub use raw::RawBuf;
 pub use rc::Rc;
 pub use soa::Soa;

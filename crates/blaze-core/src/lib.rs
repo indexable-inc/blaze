@@ -39,6 +39,9 @@ pub mod atomic;
 pub mod boot;
 pub mod busy;
 pub mod chan;
+/// Safe plain-old-data (`Pod`), `Zeroable`, `CheckedBitPattern`, and `TransparentWrapper`
+/// conversions (`blaze_own::pod`): Blaze's safe replacement for `core::mem::transmute`.
+pub use blaze_own::pod;
 // The records in flight: a per-key claim, its waiters, the cycle walk (parallel.md, end state).
 pub mod claim_table;
 pub mod claim_watch;

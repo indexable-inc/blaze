@@ -138,7 +138,7 @@ fn sota_fused_madd_msub_shifted_alu_and_csel_match_evaluator_on_hardware() {
     // Frameless fused sequence should be tiny (<= 40 bytes = <= 10 AArch64 instructions)!
     assert!(code_len <= 44, "expected tiny frameless fused A64 code, got {code_len} bytes");
 
-    let f_ptr: extern "C" fn(u64, u64, u64) -> u64 = unsafe { core::mem::transmute(exec.code_address()) };
+    let f_ptr: extern "C" fn(u64, u64, u64) -> u64 = unsafe { exec.as_fn() };
     for &(av, bval, cv) in &[(3u64, 7u64, 11u64), (20, 5, 13), (0, 0, 99), (u64::MAX, 2, 7)] {
         let got = f_ptr(av, bval, cv);
         let expected = match eval::run_in(
@@ -194,7 +194,7 @@ fn sota_fibonacci_parallel_copy_cycle_matches_evaluator_on_hardware() {
     let v = verify(func.view()).unwrap();
     let emitted = Sota::standalone().emit(v, &NoNames, MAC_ARM64, Alloc::global()).unwrap();
     let (exec, _len) = load_exec(emitted);
-    let fib: extern "C" fn(u64) -> u64 = unsafe { core::mem::transmute(exec.code_address()) };
+    let fib: extern "C" fn(u64) -> u64 = unsafe { exec.as_fn() };
 
     for &nv in &[0u64, 1, 2, 5, 10, 20, 40] {
         let got = fib(nv);
@@ -281,9 +281,9 @@ fn sota_beats_reference_and_fast_on_hot_loop_hardware_benchmark() {
     let (fast_exec, fast_bytes) = load_exec(fast_em);
     let (sota_exec, sota_bytes) = load_exec(sota_em);
 
-    let f_ref: extern "C" fn(u64, u64, u64) -> u64 = unsafe { core::mem::transmute(ref_exec.code_address()) };
-    let f_fast: extern "C" fn(u64, u64, u64) -> u64 = unsafe { core::mem::transmute(fast_exec.code_address()) };
-    let f_sota: extern "C" fn(u64, u64, u64) -> u64 = unsafe { core::mem::transmute(sota_exec.code_address()) };
+    let f_ref: extern "C" fn(u64, u64, u64) -> u64 = unsafe { ref_exec.as_fn() };
+    let f_fast: extern "C" fn(u64, u64, u64) -> u64 = unsafe { fast_exec.as_fn() };
+    let f_sota: extern "C" fn(u64, u64, u64) -> u64 = unsafe { sota_exec.as_fn() };
 
     // Correctness check across all 3 tiers + LIR evaluator!
     let eval_out = match eval::run_in(func.view(), &[Val::Int(50), Val::Int(7), Val::Int(3)], 200_000, Global).unwrap() {
@@ -483,7 +483,7 @@ fn sota_stack_slots_struct_load_store_and_address_folding_match_evaluator_on_har
     assert!(blaze_code::unwind::Frame::of_word(emitted.frame).unwrap().is_some());
 
     let (exec, _) = load_exec(emitted);
-    let f_ptr: extern "C" fn(u64, u64, u64) -> u64 = unsafe { core::mem::transmute(exec.code_address()) };
+    let f_ptr: extern "C" fn(u64, u64, u64) -> u64 = unsafe { exec.as_fn() };
 
     for &(av, bval, iv) in &[
         (0x1234_5678u64, 0x00ab_cdefu64, 0u64),
@@ -533,7 +533,7 @@ fn sota_stack_slots_struct_load_store_and_address_folding_match_evaluator_on_har
     let v2_ver = verify(func2.view()).unwrap();
     let emitted2 = Sota::standalone().emit(v2_ver, &NoNames, MAC_ARM64, Alloc::global()).unwrap();
     let (exec2, _) = load_exec(emitted2);
-    let f2: extern "C" fn(*mut u64) -> u64 = unsafe { core::mem::transmute(exec2.code_address()) };
+    let f2: extern "C" fn(*mut u64) -> u64 = unsafe { exec2.as_fn() };
     let mut buf = [10u64, 25u64, 7u64];
     let res = f2(buf.as_mut_ptr());
     assert_eq!(res, 42);
@@ -583,7 +583,7 @@ fn sota_high_register_pressure_spilling_over_30_live_values_matches_evaluator_on
     let emitted = Sota::standalone().emit(v, &NoNames, MAC_ARM64, Alloc::global()).unwrap();
     assert!(emitted.frame != 0, "spilling function must allocate a stack frame");
     let (exec, _) = load_exec(emitted);
-    let f_ptr: extern "C" fn(u64, u64) -> u64 = unsafe { core::mem::transmute(exec.code_address()) };
+    let f_ptr: extern "C" fn(u64, u64) -> u64 = unsafe { exec.as_fn() };
 
     for &(xv, yv) in &[(1u64, 2u64), (17, 99), (0, 0), (0xdead_beef, 0x1234_5678)] {
         let got = f_ptr(xv, yv);
@@ -661,7 +661,7 @@ fn sota_high_register_pressure_spilling_over_30_live_values_matches_evaluator_on
     let v2 = verify(func2.view()).unwrap();
     let emitted2 = Sota::standalone().emit(v2, &NoNames, MAC_ARM64, Alloc::global()).unwrap();
     let (exec2, _) = load_exec(emitted2);
-    let f2: extern "C" fn(u64, u64) -> u64 = unsafe { core::mem::transmute(exec2.code_address()) };
+    let f2: extern "C" fn(u64, u64) -> u64 = unsafe { exec2.as_fn() };
 
     for &(nv, sv) in &[(0u64, 5u64), (1, 10), (7, 42), (35, 13)] {
         let got = f2(nv, sv);
@@ -738,7 +738,7 @@ fn sota_scalar_fp_f32_f64_fmadd_fmsub_conversions_and_fcmp_match_evaluator_on_ha
     assert!(saw_fmsub, "expected hardware fmsub instruction in Sota FP code");
 
     let (exec, _) = load_exec(emitted);
-    let f64_fn: extern "C" fn(f64, f64, f64) -> f64 = unsafe { core::mem::transmute(exec.code_address()) };
+    let f64_fn: extern "C" fn(f64, f64, f64) -> f64 = unsafe { exec.as_fn() };
 
     for &(xv, yv, zv) in &[
         (1.5f64, 2.25f64, 4.0f64),
@@ -807,7 +807,7 @@ fn sota_scalar_fp_f32_f64_fmadd_fmsub_conversions_and_fcmp_match_evaluator_on_ha
     let v2 = verify(func2.view()).unwrap();
     let emitted2 = Sota::standalone().emit(v2, &NoNames, MAC_ARM64, Alloc::global()).unwrap();
     let (exec2, _) = load_exec(emitted2);
-    let f32_fn: extern "C" fn(f32, i32, u64) -> u64 = unsafe { core::mem::transmute(exec2.code_address()) };
+    let f32_fn: extern "C" fn(f32, i32, u64) -> u64 = unsafe { exec2.as_fn() };
 
     for &(fv, sv, uv) in &[
         (1.25f32, -10i32, 5u64),
@@ -962,7 +962,7 @@ fn sota_data_addr_func_addr_call_indirect_and_code_record_seal_on_hardware() {
     done.expect("place must succeed");
 
     let run_fn: extern "C" fn(u64, extern "C" fn(u64, u64) -> u64) -> u64 =
-        unsafe { core::mem::transmute(exec.code_address()) };
+        unsafe { exec.as_fn() };
     let fn_addr = add_triple as *const () as u64;
     for &xv in &[0u64, 7, 42, 9999] {
         let d = add_triple(xv, 100);
@@ -1017,7 +1017,7 @@ fn sota_data_addr_func_addr_call_indirect_and_code_record_seal_on_hardware() {
     .expect("W^X exec mapping must succeed");
     done_c.expect("bzcode08 place must succeed");
     let run_fn_c: extern "C" fn(u64, extern "C" fn(u64, u64) -> u64) -> u64 =
-        unsafe { core::mem::transmute(exec_c.code_address()) };
+        unsafe { exec_c.as_fn() };
     let want_c = add_triple(add_triple(123, 100), 100) ^ TEST_STATIC_VAL ^ fn_addr;
     assert_eq!(run_fn_c(123, add_triple), want_c);
     drop(emitted);

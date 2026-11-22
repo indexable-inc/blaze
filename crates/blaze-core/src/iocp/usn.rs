@@ -999,11 +999,7 @@ impl Journal {
             Ok(got) => got as usize,
             Err(error) => return self.failed(error),
         };
-        // SAFETY: the read's completion was taken, so the kernel holds the buffer no more; it
-        // wrote `got` bytes of it, read here as bytes while nothing writes it.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(self.buffer.as_ptr().cast::<u8>(), got.min(BUFFER))
-        };
+        let bytes = &crate::pod::bytes_of_slice(&self.buffer)[..got.min(BUFFER)];
         let mut records = std::mem::take(&mut self.records);
         records.clear();
         let parsed = parse(bytes, &mut records);
