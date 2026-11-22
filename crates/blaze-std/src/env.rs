@@ -178,7 +178,7 @@ impl Vars {
     /// The first value of `name`, as the C library's `getenv` finds it.
     #[blaze::noalloc]
     #[blaze::nonblocking]
-    fn get(&self, name: &str) -> Option<&str> {
+    pub(crate) fn get(&self, name: &str) -> Option<&str> {
         self.each().find(|(it, _)| *it == name).map(|(_, value)| value)
     }
 

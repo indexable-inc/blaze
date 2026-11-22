@@ -872,9 +872,29 @@ impl Pool {
         &self.0.clock
     }
 
+    /// How many L3-cache / core-class worker groups this pool has (at least 1).
+    pub(crate) fn groups(&self) -> u32 {
+        u32::try_from(self.shared().groups.len()).unwrap_or(1).max(1)
+    }
+
     /// The class of worker `at`.
     pub(crate) fn class_of(&self, at: u32) -> Class {
         self.shared().workers[at as usize].0.class
+    }
+
+    /// Spawns `job` onto a specific L3-cache `group` (modulo `self.groups()`), waking a worker
+    /// inside that exact group first so all sub-tasks spawned by `job` stay L3-cache-warm on the
+    /// same CCX / cluster.
+    pub(crate) fn spawn_in_group(&self, group: u32, class: Class, job: JobPtr) -> Result<(), Full> {
+        let count = self.groups();
+        let target = group % count;
+        let target = match class {
+            Class::Foreground => target,
+            Class::Background => self.background_group(target),
+        };
+        self.inject(target, class, job)?;
+        self.notify(target);
+        Ok(())
     }
 
     /// A task spawned from `here` in `class`: onto the spawner's own LIFO slot and deque when it

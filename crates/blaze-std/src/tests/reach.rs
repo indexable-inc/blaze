@@ -66,6 +66,9 @@ fn allowed(file: &str, reach: &str) -> bool {
         // pure ring, slot and walk, which live in blaze-sys because every `unsafe` of the
         // sampler is kept there (its line 85): a type path, not a call into the system.
         || (matches!(file, "telemetry/sampler/mac.rs" | "telemetry/sampler/linux.rs" | "telemetry/sampler.rs") && reach == "blaze_sys::")
+        // `local.rs`: compile-time `const _` assertion checking `SOCKET_PATH_MOST == sockaddr_un::ZERO.sun_path.len()`;
+        // a pure layout check, not a runtime syscall.
+        || (file == "local.rs" && reach == "blaze_sys::")
 }
 
 /// Files that are tests, which run on the host's std and are not the program: `tests.rs`,

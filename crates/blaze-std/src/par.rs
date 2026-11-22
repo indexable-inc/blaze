@@ -355,6 +355,59 @@ fn spawn_workers(
     rest
 }
 
+/// Runs `work` over logical locality `groups`, steering `groups[i]` onto L3-cache cluster
+/// `i % scope.groups()` ([`Scope::may_overlap_in_group`]) so nested parallel work inside each
+/// group (e.g. compiling one crate's files or bodies) stays hot inside a single CCX / L3
+/// cluster on 64–128-core EPYC / Graviton machines instead of thrashing cross-NUMA caches.
+pub fn by_group<G: Send>(
+    cx: &Cx,
+    scope: &Scope<'_>,
+    groups: &mut [G],
+    scratch: usize,
+    work: impl Fn(&Cx, usize, &mut G) + Sync,
+) -> Result<(), ParError> {
+    if groups.is_empty() {
+        cx.check().map_err(ParError::Stopped)?;
+        return Ok(());
+    }
+    let cluster_count = scope.groups().max(1);
+    dispatch_groups(cx, scope, groups, 0, cluster_count, scratch, &work)
+}
+
+fn dispatch_groups<G: Send>(
+    cx: &Cx,
+    scope: &Scope<'_>,
+    groups: &mut [G],
+    base: usize,
+    cluster_count: u32,
+    scratch: usize,
+    work: &(impl Fn(&Cx, usize, &mut G) + Sync),
+) -> Result<(), ParError> {
+    match groups {
+        [] => Ok(()),
+        [only] => {
+            cx.check().map_err(ParError::Stopped)?;
+            work(cx, base, only);
+            Ok(())
+        }
+        [first, rest @ ..] => {
+            let target_cluster = (base as u32) % cluster_count;
+            let task = scope.may_overlap_in_group(target_cluster, "bstd.par.by_group", scratch, move |wcx| {
+                wcx.check().map_err(ParError::Stopped)?;
+                work(wcx, base, first);
+                Ok::<_, ParError>(())
+            });
+            let rest_res = dispatch_groups(cx, scope, rest, base + 1, cluster_count, scratch, work);
+            let first_res = match task.join(cx) {
+                Ok(()) => Ok(()),
+                Err(failed) => Err(ParError::Task(failed)),
+            };
+            first_res?;
+            rest_res
+        }
+    }
+}
+
 /// What every chunk is done with.
 struct Ops<'f, I, F, J> {
     grain: Grain,

@@ -413,3 +413,257 @@ fn par_weighted_and_dynamic_visit_every_item_exactly_once() {
     assert!(njoined.is_ok());
     assert!(nseen.iter().all(|c| c.load(Ordering::Relaxed) == 1));
 }
+
+#[test]
+fn pending_select2_wait_both_and_try_wait_multiplex_linear_ops() {
+    use crate::pending::{Either, select2, wait_both};
+
+    let io = world(9, Plant::None);
+    let cx = root(&io);
+    let dir = io.need_fs().expect("fs").open_dir(&cx, &path("data")).expect("dir");
+    dir.publish_synced(&cx, &path("a"), Content::bytes(b"alpha-data")).expect("seed a");
+    dir.publish_synced(&cx, &path("b"), Content::bytes(b"beta-data!")).expect("seed b");
+
+    let ro = dir.read_only();
+    let fa = ro.open(&cx, &path("a")).expect("open a");
+    let fb = ro.open(&cx, &path("b")).expect("open b");
+
+    // 1. `select2` completes whichever finishes first and hands back the other linear `Pending`.
+    let mut buf_a = [0u8; 16];
+    let mut buf_b = [0u8; 16];
+    let pa = fa.read_into(&mut buf_a, 0);
+    let pb = fb.read_into(&mut buf_b, 0);
+    let (na, nb) = match select2(&cx, pa, pb) {
+        Ok(Either::First((ra, pending_b))) => (ra.expect("read a"), pending_b.wait(&cx).expect("read b")),
+        Ok(Either::Second((pending_a, rb))) => (pending_a.wait(&cx).expect("read a"), rb.expect("read b")),
+        Err((stopped, pending_a, pending_b)) => {
+            let _ = pending_a.wait(&cx);
+            let _ = pending_b.wait(&cx);
+            panic!("select2 stopped unexpectedly: {stopped:?}");
+        }
+    };
+    assert_eq!(&buf_a[..na], b"alpha-data");
+    assert_eq!(&buf_b[..nb], b"beta-data!");
+
+    // 2. `wait_both` drives two concurrent reads to completion without spawning a task.
+    let mut buf_a2 = [0u8; 16];
+    let mut buf_b2 = [0u8; 16];
+    let (ra2, rb2) = wait_both(&cx, fa.read_into(&mut buf_a2, 0), fb.read_into(&mut buf_b2, 0));
+    assert_eq!(&buf_a2[..ra2.expect("ra2")], b"alpha-data");
+    assert_eq!(&buf_b2[..rb2.expect("rb2")], b"beta-data!");
+
+    // 3. `try_wait` returns `Err(self)` when not yet polled, then completes cleanly on `wait`.
+    let mut buf_c = [0u8; 16];
+    let pc = fa.read_into(&mut buf_c, 0);
+    let nc = match pc.try_wait() {
+        Ok(res) => res.expect("ready immediately"),
+        Err(still_pending) => still_pending.wait(&cx).expect("wait after try_wait"),
+    };
+    assert_eq!(&buf_c[..nc], b"alpha-data");
+}
+
+#[test]
+fn net_connect_with_and_open_native_quiet_limits() {
+    use crate::net::{Ask, Linger, Tcp, TcpOptions};
+
+    let io = world(10, Plant::None);
+    let cx = root(&io);
+    let net = io.need_net().expect("net");
+    let addr = Addr::Tcp(HostPort::new("127.0.0.1", 9092).expect("valid host:port"));
+    let opts = Tcp::new(TcpOptions { linger: Ask::WhereAvailable(Linger::Reset), ..TcpOptions::DEFAULT });
+
+    let mut listener = match net.listen_with(&cx, &addr, opts.clone()) {
+        Ok(l) => l,
+        Err(e) => panic!("listen_with: {e}"),
+    };
+    let client = match net.connect_with(&cx, &addr, opts) {
+        Ok(c) => c,
+        Err(e) => panic!("connect_with: {e}"),
+    };
+    let server = match listener.accept(&cx) {
+        Ok(s) => s,
+        Err(e) => panic!("accept: {e}"),
+    };
+    let _ = client.finish(&cx);
+    let _ = server.finish(&cx);
+    let _ = listener.close(&cx);
+
+    // `open_native` uses `Limits::QUIET` by default and `Limits::USUAL` when `BLAZE_TRACE=1`.
+    let dir = std::env::temp_dir().join(format!("bstd-upgrades-limits-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let quiet = crate::rt::open_native(
+        blaze_core::testing::os(),
+        crate::args::ArgList::given(Vec::new()),
+        crate::env::Vars::given(Vec::new()),
+        &dir,
+        0,
+    )
+    .expect("quiet native world");
+    assert_eq!(quiet.limits().trace_most, 0);
+
+    let traced = crate::rt::open_native(
+        blaze_core::testing::os(),
+        crate::args::ArgList::given(Vec::new()),
+        crate::env::Vars::given(vec![("BLAZE_TRACE".to_owned(), "1".to_owned())]),
+        &dir,
+        0,
+    )
+    .expect("traced native world");
+    assert_eq!(traced.limits().trace_most, Limits::USUAL.trace_most);
+
+    drop((quiet, traced));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn par_by_group_steers_shards_across_l3_clusters_and_inline() {
+    use crate::task::threads::{Class, Plants, Topology};
+
+    // 1. Inline world: `groups() == 1`, every shard runs once in order.
+    let io = world(11, Plant::None);
+    let cx = root(&io);
+    let scope = cx.scope();
+    assert_eq!(scope.groups(), 1);
+    let mut shards = vec![0usize; 6];
+    let res = par::by_group(&cx, &scope, &mut shards, 64 * 1024, |_wcx, idx, slot| {
+        *slot = idx + 100;
+    });
+    let joined = scope.join(&cx);
+    assert!(res.is_ok(), "inline by_group failed: {res:?}");
+    assert!(joined.is_ok());
+    assert_eq!(shards, vec![100, 101, 102, 103, 104, 105]);
+
+    // 2. Multi-cluster pool (2 L3 groups x 2 workers = 4 workers): `scope.groups() == 2`.
+    let topo = Topology::groups(&[(Class::Foreground, 2), (Class::Foreground, 2)]);
+    let running = crate::rt::pool::start(&topo, Plants::NONE).expect("start 2-cluster pool");
+    let frame = blaze_mem::Frame::with_reserve(TASK_FRAME, blaze_mem::Tag::Frames).expect("root frame");
+    let deadline = blaze_core::wait::Deadline::after(io.now(), Duration::from_secs(10));
+    let pcx = crate::Cx::root_on(deadline, frame, io.clone(), running.pool().clone());
+
+    let pscope = pcx.scope();
+    assert_eq!(pscope.groups(), 2);
+    let mut pshards = vec![0usize; 16];
+    let pres = par::by_group(&pcx, &pscope, &mut pshards, 64 * 1024, |wcx, idx, slot| {
+        // Also exercise zero-atomic `Cx::span` / `Cx::until` from every cluster worker.
+        let s = wcx.span("cluster.shard");
+        let _u = s.until(deadline);
+        *slot = idx * 3 + 1;
+    });
+    let pjoined = pscope.join(&pcx);
+    drop(pcx);
+    running.stop(Duration::from_secs(5)).expect("stop 2-cluster pool");
+
+    assert!(pres.is_ok(), "multi-cluster by_group failed: {pres:?}");
+    assert!(pjoined.is_ok());
+    let expected: Vec<usize> = (0..16).map(|i| i * 3 + 1).collect();
+    assert_eq!(pshards, expected);
+}
+
+#[test]
+fn fs_read_all_many_and_vectored_writes_round_trip() {
+    let io = world(12, Plant::None);
+    let cx = root(&io);
+    let dir = io.need_fs().expect("fs").open_dir(&cx, &path("data")).expect("dir");
+
+    // 1. Seed 80 files (> WINDOW=64) via one txn, then read all 80 concurrently via `read_all_many`.
+    let mut txn = dir.txn();
+    let mut owned_paths = Vec::with_capacity(80);
+    for i in 0..80usize {
+        let p = path(&format!("f{i:03}"));
+        let body = format!("payload-{i:03}");
+        txn.publish(&cx, &p, Content::bytes(body.as_bytes())).expect("stage");
+        owned_paths.push(p);
+    }
+    let committed = txn.commit_unsynced(&cx, Unsynced::No).expect("commit 80 files");
+    assert_eq!(committed.published, 80);
+
+    let refs: Vec<&crate::path::Path> = owned_paths.iter().collect();
+    let mut bufs: Vec<Bytes<'_>> = (0..80).map(|_| cx.bytes()).collect();
+    let total = dir.read_all_many(&cx, &refs, &mut bufs).expect("read_all_many 80 files");
+    let mut expected_total = 0usize;
+    for (i, buf) in bufs.iter().enumerate() {
+        let want = format!("payload-{i:03}");
+        assert_eq!(buf.as_slice(), want.as_bytes(), "mismatch at file {i}");
+        expected_total += want.len();
+    }
+    assert_eq!(total, expected_total);
+
+    // Missing file returns `FsKind::NotFound`.
+    let missing = path("does_not_exist");
+    let mut one_buf = [cx.bytes()];
+    let err = dir.read_all_many(&cx, &[&missing], &mut one_buf).expect_err("missing file");
+    assert_eq!(err.kind, FsKind::NotFound);
+
+    // 2. `write_vectored_unsynced` and `append_vectored_unsynced` (0, 1, and multi-slice).
+    let f = match dir.create(&cx, &path("vec.bin")) {
+        Ok(f) => f,
+        Err(e) => panic!("create: {e}"),
+    };
+    let r1 = f.write_vectored_unsynced(&cx, 0, &[b"", b""], Unsynced::No);
+    let r2 = f.write_vectored_unsynced(&cx, 0, &[b"head-"], Unsynced::No);
+    let r3 = f.write_vectored_unsynced(&cx, 5, &[b"mid-", b"", b"body-"], Unsynced::No);
+    let r4 = f.append_vectored_unsynced(&cx, &[b"tail-", b"end"], Unsynced::No);
+    let r5 = f.close_unsynced(Unsynced::No);
+    r1.expect("empty vectored write");
+    r2.expect("single vectored write");
+    r3.expect("multi vectored write");
+    r4.expect("multi vectored append");
+    r5.expect("close");
+
+    let mut got = cx.bytes();
+    dir.read_all(&cx, &path("vec.bin"), &mut got).expect("read vec.bin");
+    assert_eq!(got.as_slice(), b"head-mid-body-tail-end");
+}
+
+#[test]
+fn native_readonly_inline_calls_and_quiet_spans_take_zero_world_locks() {
+    let dir = std::env::temp_dir().join(format!("bstd-upgrades-lockfree-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::fs::write(dir.join("hello.txt"), b"lock-free-read").expect("seed file");
+
+    let io = crate::rt::open_native(
+        blaze_core::testing::os(),
+        crate::args::ArgList::given(Vec::new()),
+        crate::env::Vars::given(Vec::new()),
+        &dir,
+        0,
+    )
+    .expect("quiet native io");
+    let cx = io.cx(Duration::from_secs(10), TASK_FRAME).expect("root cx");
+    let root_dir = io.need_fs().expect("fs").root();
+    let seen = io.seen().expect("native world has seen counts");
+
+    // Snapshot global `world` lock acquisitions BEFORE hot-path read-only ops + spans.
+    let before = seen.locks.load(Ordering::Relaxed);
+    let inline_before = seen.inline.load(Ordering::Relaxed);
+
+    let p = path("hello.txt");
+    for _ in 0..8 {
+        let s = cx.span("hot.read");
+        s.event("step");
+        let meta = root_dir.stat(&s, &p).expect("stat").expect("exists");
+        assert_eq!(meta.len, 14);
+        let looks = root_dir.looks(&s, [&p]).expect("looks");
+        assert_eq!(looks.len(), 1);
+        let entries = root_dir.own_entries(&s).expect("entries");
+        assert!(entries.find("hello.txt").is_some());
+        let mut buf = s.bytes();
+        root_dir.read_all(&s, &p, &mut buf).expect("read_all");
+        assert_eq!(buf.as_slice(), b"lock-free-read");
+        let f = root_dir.read_only().open(&s, &p).expect("open ro");
+        let mut part = s.bytes();
+        f.read_at(&s, 5, 4, &mut part).expect("read_at");
+        assert_eq!(part.as_slice(), b"free");
+    }
+
+    let locks_taken = seen.locks.load(Ordering::Relaxed) - before;
+    let inline_done = seen.inline.load(Ordering::Relaxed) - inline_before;
+    drop((root_dir, cx, io));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(locks_taken, 0, "native read-only inline calls + quiet spans must take 0 global world locks (took {locks_taken})");
+    assert!(inline_done >= 40, "expected >= 40 inline read ops, got {inline_done}");
+}
+
+
+

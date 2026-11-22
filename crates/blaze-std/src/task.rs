@@ -608,6 +608,60 @@ impl<'p> Scope<'p> {
         Scope::handle(name, Held::Ended(outcome))
     }
 
+    /// How many L3-cache / core-class worker groups this scope's pool has (1 under `Inline` or
+    /// when narrowed to a single worker). Used by [`crate::par::by_group`] to keep related work
+    /// (e.g. a crate or module shard) hot inside one L3 cache cluster.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn groups(&self) -> u32 {
+        if self.workers() <= 1 {
+            return 1;
+        }
+        self.live.cx.pool().map_or(1, Pool::groups)
+    }
+
+    /// Like [`Scope::may_overlap`], steering the task onto L3-cache `group` (modulo
+    /// [`Scope::groups`]) so the task and any sub-tasks it spawns stay warm inside one L3/CCX
+    /// cluster on multi-cluster CPUs (EPYC, Graviton, Apple Silicon).
+    #[track_caller]
+    pub fn may_overlap_in_group<T: Send, E: fmt::Display>(
+        &self,
+        group: u32,
+        name: &'static str,
+        scratch: usize,
+        task: impl FnOnce(&Cx) -> Result<T, E> + Send,
+    ) -> Task<'_, T> {
+        let live = &self.live;
+        let (index, frame) = match self.prepare(name, scratch) {
+            Ok(prepared) => prepared,
+            Err(failed) => return failed,
+        };
+        if let (Some(pool), Some(tally)) = (live.cx.pool(), &live.shared)
+            && self.workers() > 1
+        {
+            let (queued, job) = self.pool_job(tally, name, index, frame, Start::Open, task);
+            let here = live.cx.here();
+            if let Err(Full(job)) = pool.spawn_in_group(group, live.class.get(), job) {
+                pool.run_now(here, job);
+            }
+            return Scope::handle(name, Held::Queued(self.pending(pool, queued)));
+        }
+        let cx = live.cx.task(name, frame, live.cx.worker().wrapping_add(index)).with_class(live.class.get());
+        live.running.set(live.running.get() + 1);
+        let begun = cx.task_began(name);
+        let ran = catch_unwind(AssertUnwindSafe(|| task(&cx)));
+        cx.task_ended(begun, !matches!(ran, Ok(Ok(_))));
+        live.running.set(live.running.get() - 1);
+        drop(cx);
+        let outcome = match ended(ran) {
+            Ok(made) => Ok(made),
+            Err(Ending::Exit(exit)) => resume_unwind(exit),
+            Err(Ending::Why(why)) => Err(live.fail(index, name, why)),
+        };
+        Scope::handle(name, Held::Ended(outcome))
+    }
+
     /// A queued task's handle state.
     fn pending<T>(&self, pool: &Pool, queued: Queued<T>) -> Pending<T> {
         let cx = &self.live.cx;

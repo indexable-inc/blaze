@@ -760,6 +760,13 @@ pub(crate) fn process_start() -> Result<&'static block::Block, String> {
 /// read `above` folders above `root` (`u8::MAX`: up to the filesystem's root). Made with the
 /// root of real-OS authority `os`, handed down from the entry.
 pub(crate) fn open_native(os: &blaze_core::Os, args: ArgList, env: Vars, root: &RootPath, above: u8) -> Result<Io, String> {
+    // Global `Trace` recording is off by default (`Limits::QUIET`, lock-free fast-path) so
+    // `Cx::span` / `Cx::event` never contend on the global world lock in production runs; set
+    // `BLAZE_TRACE=1` (any non-empty value other than `0`) to capture global trace records.
+    let limits = match env.get("BLAZE_TRACE") {
+        Some(v) if !v.is_empty() && v != "0" => Limits::USUAL,
+        _ => Limits::QUIET,
+    };
     let world = NativeWorld {
         root,
         above,
@@ -770,7 +777,7 @@ pub(crate) fn open_native(os: &blaze_core::Os, args: ArgList, env: Vars, root: &
         host_name: Arc::from(""),
         // Drawn at the first `Io::rng`, not here: the start draws no randomness.
         seed: None,
-        limits: Limits::USUAL,
+        limits,
     };
     // alloc: an error's message.
     Io::native_in(os, world).map_err(|error| error.to_string())

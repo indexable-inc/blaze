@@ -317,8 +317,47 @@ pub(crate) mod folder {
     /// The plan's objects written into `dir` in `order`, each whole by a rename with its bytes
     /// flushed and the folder's names synced, at most `most` of them (a test stops it there, as
     /// a crash would): how many were written.
+    ///
+    /// Full `Order::HeadLast` publishes batch all rank-0/1 objects into one linear `Dir::txn()`
+    /// (`commit_barrier`, syncing the directory once) before publishing the rank-2 head synced,
+    /// preserving the `HeadLast` crash invariant while cutting `O(N)` directory syncs to 2.
     pub(crate) fn write(cx: &Cx, dir: &Dir<ReadWrite>, plan: &Plan<'_>, order: Order, most: usize) -> Result<usize, PublishedError> {
         const WHAT: [&str; 3] = ["an object named by its digest", "the prefix", "the head"];
+        if order == Order::HeadLast && most >= plan.objects.len() {
+            let mut txn = dir.txn();
+            let mut written = 0;
+            for rank in [0u8, 1u8] {
+                for sealed in plan.objects.iter().filter(|sealed| write_rank(&sealed.object) == rank) {
+                    let name = sealed.object.name();
+                    assert!(is_object_name(name.as_str()), "an object's name is made from a digest's hex alone");
+                    let path = match Path::new(name.as_str()) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let _ = txn.abort(cx);
+                            return Err(PublishedError::Path(e));
+                        }
+                    };
+                    if let Err(error) = txn.publish(cx, &path, Content::bytes(&sealed.bytes)) {
+                        let _ = txn.abort(cx);
+                        return Err(PublishedError::Folder { what: WHAT[usize::from(rank)], error });
+                    }
+                    written += 1;
+                }
+            }
+            if txn.is_empty() {
+                txn.abort(cx).map_err(|error| PublishedError::Folder { what: WHAT[0], error })?;
+            } else {
+                txn.commit_barrier(cx).map_err(|error| PublishedError::Folder { what: WHAT[0], error })?;
+            }
+            for sealed in plan.objects.iter().filter(|sealed| write_rank(&sealed.object) == 2) {
+                let name = sealed.object.name();
+                assert!(is_object_name(name.as_str()), "an object's name is made from a digest's hex alone");
+                let path = Path::new(name.as_str()).map_err(PublishedError::Path)?;
+                dir.publish_synced(cx, &path, Content::bytes(&sealed.bytes)).map_err(|error| PublishedError::Folder { what: WHAT[2], error })?;
+                written += 1;
+            }
+            return Ok(written);
+        }
         let ranks: [u8; 3] = match order {
             Order::HeadLast => [0, 1, 2],
             Order::HeadFirst => [2, 1, 0],

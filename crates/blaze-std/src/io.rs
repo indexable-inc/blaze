@@ -1682,6 +1682,9 @@ impl Io {
     /// Start recording the files effects name ([`Io::touched`]).
     #[cfg(test)]
     pub(crate) fn record(&self) {
+        if let Reach::Shared { beside, .. } = &self.reach {
+            beside.recording.store(true, core::sync::atomic::Ordering::Release);
+        }
         self.world().lock().record = true;
     }
 
@@ -1772,6 +1775,9 @@ impl Io {
 
     /// A caller waited for the device (a flush it did not return before): counted.
     pub(crate) fn waited_for_device(&self) {
+        if !self.has_disk() {
+            return;
+        }
         if let Some(disk) = self.world().lock().disk.as_deref_mut() {
             disk.waited();
         }
@@ -1781,6 +1787,9 @@ impl Io {
     /// ([`Effect::SyncDir`]): the simulated disk's ledger counts the sync and the wait; a
     /// real world has no ledger.
     pub(crate) fn names_synced(&self) {
+        if !self.has_disk() {
+            return;
+        }
         if let Some(disk) = self.world().lock().disk.as_deref_mut() {
             disk.names_synced();
             disk.waited();
@@ -1856,6 +1865,18 @@ impl Io {
         let mut world = self.world().lock();
         let at = world.got.iter().position(|it| it.tag == tag)?;
         Some(world.got.remove(at).done)
+    }
+
+    /// The first already-polled completion matching any tag in `tags`, returning `(index, done)`.
+    pub(crate) fn take_any(&self, tags: &[Tag]) -> Option<(usize, Done)> {
+        let mut world = self.world().lock();
+        for (pos, item) in world.got.iter().enumerate() {
+            if let Some(idx) = tags.iter().position(|&t| t == item.tag) {
+                let done = world.got.remove(pos).done;
+                return Some((idx, done));
+            }
+        }
+        None
     }
 
     /// One poll of the driver, waiting at most until `until`: what it brought kept for each

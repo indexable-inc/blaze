@@ -1365,6 +1365,108 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
     pub fn read_all(&self, cx: &Cx, path: &Path, into: &mut Bytes<'_>) -> Result<usize, FsError> {
         self.open_read(cx, path)?.read_all(cx, into)
     }
+
+    /// Reads all of `paths` beneath this directory concurrently into the matching `out` buffers,
+    /// returning the total bytes appended.
+    ///
+    /// Uses one batched [`Dir::looks`] (`Effect::Stamp`) to verify existence and pre-reserve exact
+    /// lengths, then overlaps up to 64 `Effect::ReadAll` ops in flight at once via `Cx::wait_any`
+    /// so `io_uring` and multi-lane thread drivers saturate disk concurrency instead of serializing
+    /// file reads one by one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `paths.len() != out.len()`.
+    pub fn read_all_many(&self, cx: &Cx, paths: &[&Path], out: &mut [Bytes<'_>]) -> Result<usize, FsError> {
+        assert_eq!(paths.len(), out.len(), "bstd::fs::Dir::read_all_many: paths and out length mismatch");
+        if paths.is_empty() {
+            cx.check().map_err(|stopped| FsError::new(FsOp::Read, &self.base, FsKind::Stopped(stopped)))?;
+            return Ok(0);
+        }
+        // 1. One batched Stamp verifies every path exists and is a regular file, and tells us its size.
+        let looks = self.looks(cx, paths.iter().copied())?;
+        let mut names: Vec<FileName, &blaze_mem::Frame> = Vec::new_in(cx.frame());
+        names
+            .try_reserve(paths.len())
+            .map_err(|_| FsError::new(FsOp::Read, &self.base, FsKind::Stopped(Stopped::OutOfMemory { arena: "bstd::fs::read_all_many", asked: paths.len() * size_of::<FileName>() })))?;
+        for (i, path) in paths.iter().enumerate() {
+            let name = self.beneath(path);
+            match looks.get(i) {
+                Some(look) if look.kind == EntryKind::File => {
+                    if let Ok(len) = usize::try_from(look.len) {
+                        out[i]
+                            .try_reserve(len)
+                            .map_err(|stopped| FsError::new(FsOp::Read, &name, FsKind::Stopped(stopped)))?;
+                    }
+                    names.push(name);
+                }
+                Some(look) if look.kind == EntryKind::Gone => {
+                    return Err(FsError::new(FsOp::Read, &name, FsKind::NotFound));
+                }
+                Some(look) if look.kind == EntryKind::Dir => {
+                    return Err(FsError::new(FsOp::Read, &name, FsKind::IsADirectory));
+                }
+                _ => {
+                    return Err(FsError::new(FsOp::Read, &name, FsKind::NotFound));
+                }
+            }
+        }
+        // 2. Overlap up to WINDOW concurrent ReadAll ops and drain completions as they land.
+        const WINDOW: usize = 64;
+        let cap = paths.len().min(WINDOW);
+        let mut tags: Vec<Tag, &blaze_mem::Frame> = Vec::new_in(cx.frame());
+        let mut indices: Vec<usize, &blaze_mem::Frame> = Vec::new_in(cx.frame());
+        let _ = tags.try_reserve(cap);
+        let _ = indices.try_reserve(cap);
+        let mut next = 0usize;
+        let mut total = 0usize;
+        let submit_one = |io: &Io, name: &FileName| {
+            let file = name.clone();
+            io.submit(|tag| Effect::ReadAll { file, tag })
+        };
+        while next < names.len() && tags.len() < cap {
+            tags.push(submit_one(&self.io, &names[next]));
+            indices.push(next);
+            next += 1;
+        }
+        while !tags.is_empty() {
+            let waited = cx.wait_any(&self.io, &tags);
+            let (slot, done) = match waited {
+                Ok(pair) => pair,
+                Err(stopped) => {
+                    for &t in &tags {
+                        self.io.forget(t, crate::io::Ends::Once);
+                    }
+                    return Err(FsError::new(FsOp::Read, &self.base, FsKind::Stopped(stopped)));
+                }
+            };
+            tags.swap_remove(slot);
+            let idx = indices.swap_remove(slot);
+            match done {
+                Done::Read(bytes) => {
+                    if let Err(stopped) = out[idx].try_extend(&bytes) {
+                        for &t in &tags {
+                            self.io.forget(t, crate::io::Ends::Once);
+                        }
+                        return Err(FsError::new(FsOp::Read, &names[idx], FsKind::Stopped(stopped)));
+                    }
+                    total += bytes.len();
+                }
+                other => {
+                    for &t in &tags {
+                        self.io.forget(t, crate::io::Ends::Once);
+                    }
+                    return Err(unexpected(FsOp::Read, &names[idx], other));
+                }
+            }
+            if next < names.len() {
+                tags.push(submit_one(&self.io, &names[next]));
+                indices.push(next);
+                next += 1;
+            }
+        }
+        Ok(total)
+    }
 }
 
 impl Dir<ReadOnly> {
@@ -2036,6 +2138,41 @@ impl File<ReadWrite> {
         Ok(())
     }
 
+    /// Appends every slice in `parts` in order in a single write call (coalescing multiple
+    /// non-empty slices in an ephemeral [`Cx::scratch`] buffer so nothing escapes to the task
+    /// frame or global heap).
+    pub fn append_vectored_unsynced(&self, cx: &Cx, parts: &[&[u8]], unsynced: Unsynced) -> Result<(), FsError> {
+        let mut non_empty = 0usize;
+        let mut single: &[u8] = &[];
+        let mut total = 0usize;
+        for &p in parts {
+            if !p.is_empty() {
+                non_empty += 1;
+                single = p;
+                total = total.saturating_add(p.len());
+            }
+        }
+        if non_empty == 0 {
+            return cx.check().map_err(|s| FsError::new(FsOp::Append, &self.name, FsKind::Stopped(s)));
+        }
+        if non_empty == 1 {
+            return self.append_unsynced(cx, single, unsynced);
+        }
+        let reserve = total.saturating_add(4096);
+        cx.scratch(reserve, |scx| {
+            let mut buf = Bytes::with_capacity_in(scx.frame(), "bstd::fs::append_vectored", total)
+                .map_err(|s| FsError::new(FsOp::Append, &self.name, FsKind::Stopped(s)))?;
+            for &p in parts {
+                if !p.is_empty() {
+                    buf.try_extend(p)
+                        .map_err(|s| FsError::new(FsOp::Append, &self.name, FsKind::Stopped(s)))?;
+                }
+            }
+            self.append_unsynced(scx, buf.as_slice(), unsynced)
+        })
+        .map_err(|s| FsError::new(FsOp::Append, &self.name, FsKind::Stopped(s)))?
+    }
+
     /// `bytes` added at the end, then the file flushed: once this returns a crash keeps
     /// them, and everything written to the file before them.
     pub fn append_synced(&self, cx: &Cx, bytes: &[u8]) -> Result<(), FsError> {
@@ -2098,6 +2235,40 @@ impl File<ReadWrite> {
     pub fn write_at_synced(&self, cx: &Cx, at: u64, bytes: &[u8]) -> Result<(), FsError> {
         self.write_at_unsynced(cx, at, bytes, Unsynced::No)?;
         self.flush(cx)
+    }
+
+    /// Writes every slice in `parts` contiguously starting at `at` in a single write call
+    /// (coalescing multiple non-empty slices in an ephemeral [`Cx::scratch`] buffer).
+    pub fn write_vectored_unsynced(&self, cx: &Cx, at: u64, parts: &[&[u8]], unsynced: Unsynced) -> Result<(), FsError> {
+        let mut non_empty = 0usize;
+        let mut single: &[u8] = &[];
+        let mut total = 0usize;
+        for &p in parts {
+            if !p.is_empty() {
+                non_empty += 1;
+                single = p;
+                total = total.saturating_add(p.len());
+            }
+        }
+        if non_empty == 0 {
+            return cx.check().map_err(|s| FsError::new(FsOp::WriteAt, &self.name, FsKind::Stopped(s)));
+        }
+        if non_empty == 1 {
+            return self.write_at_unsynced(cx, at, single, unsynced);
+        }
+        let reserve = total.saturating_add(4096);
+        cx.scratch(reserve, |scx| {
+            let mut buf = Bytes::with_capacity_in(scx.frame(), "bstd::fs::write_vectored", total)
+                .map_err(|s| FsError::new(FsOp::WriteAt, &self.name, FsKind::Stopped(s)))?;
+            for &p in parts {
+                if !p.is_empty() {
+                    buf.try_extend(p)
+                        .map_err(|s| FsError::new(FsOp::WriteAt, &self.name, FsKind::Stopped(s)))?;
+                }
+            }
+            self.write_at_unsynced(scx, at, buf.as_slice(), unsynced)
+        })
+        .map_err(|s| FsError::new(FsOp::WriteAt, &self.name, FsKind::Stopped(s)))?
     }
 
     /// The file cut or grown to `len`, as durably as `durable` says: [`File::set_len_unsynced`]

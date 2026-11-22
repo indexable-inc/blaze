@@ -67,20 +67,17 @@ fn ns_of(at: core::time::Duration) -> u64 {
 /// and the worker cell, that opened it.
 struct SpanEnd {
     slot: OpenSlot,
-    world: Io,
     placed: Placement,
     span: &'static str,
 }
 
 impl Drop for SpanEnd {
     fn drop(&mut self) {
-        let workers = self.world.workers();
-        let placed = match &self.placed {
-            Placement::Task(placed) => &**placed,
-            Placement::HostedRoot => crate::guest::Run::current().placed(),
-        };
+        let io = self.placed.io();
+        let workers = io.workers();
+        let placed = self.placed.get();
         let id = placed.cell(workers, self.span);
-        let wall = ns_of(self.world.now());
+        let wall = ns_of(io.now());
         let slot = self.slot;
         // A close the cell refuses (its world's workers were replaced while the span was
         // open: `Io::on_workers`) is counted by the cell in `unrecorded`, which the report
@@ -91,6 +88,29 @@ impl Drop for SpanEnd {
                 cell.span_close(slot, wall, now);
             }
         });
+    }
+}
+
+/// Thread-local non-atomic handle to a scope's [`Cancel`] `Arc`: every child context on the
+/// same thread (`Cx::span`, `Cx::until`) clones this via a local L1 `Rc::clone` instead of
+/// bouncing the shared `Arc<Cancel>` cache line across cores.
+#[derive(Clone)]
+struct LocalCancel(Rc<Arc<Cancel>>);
+
+impl LocalCancel {
+    fn new(cancel: Arc<Cancel>) -> LocalCancel {
+        // alloc: once per task/scope thread, avoids atomic refcount churn on every span/until.
+        LocalCancel(Rc::new(cancel))
+    }
+
+    #[inline]
+    fn arc(&self) -> &Arc<Cancel> {
+        &self.0
+    }
+
+    #[inline]
+    fn is_set(&self) -> bool {
+        self.0.is_set()
     }
 }
 
@@ -106,17 +126,15 @@ pub struct Cx {
     /// `None`: never; no wait or check under it reads the clock for it.
     deadline: Option<Deadline>,
     /// `None`: never cancelled (a root); a scope's is `Some`, its outer chain the scopes it
-    /// is in.
-    cancel: Option<Arc<Cancel>>,
+    /// is in. Wrapped in a local `Rc` so `Cx::span`/`Cx::until` execute zero atomic RMWs.
+    cancel: Option<LocalCancel>,
     span: &'static str,
-    /// The world the root context came from: where its spans and events are recorded.
-    world: Io,
     plant: Plant,
     /// The class of the scope the context is in: a background scope's tasks run on the
     /// pool's background queues (std.md, "`Threads`", point 5), and so do its scopes'.
     class: Class,
-    /// Where its task runs, its task's lock-order token and its frame: one per task, shared
-    /// by the task's contexts.
+    /// Where its task runs, its task's lock-order token, its world handle (`Io`), and its
+    /// frame: one per task, shared by the task's contexts with zero atomic refcount ops.
     placed: Placement,
     /// The span path it is in for the telemetry (from `Spans`; the root below): copied by
     /// every child and handed to the tasks it spawns, so their use is charged under it.
@@ -126,16 +144,34 @@ pub struct Cx {
     end: Option<SpanEnd>,
 }
 
-/// Where a context's task placement is held.
+/// Where a context's task placement and world handle are held.
 #[derive(Clone)]
 enum Placement {
-    /// Shared by the task's contexts: one allocation per task.
+    /// Shared by the task's contexts: one allocation per task; holds `world: Some(Io)` so
+    /// child contexts never atomically clone `Io`'s `Arc`.
     Task(Rc<Placed>),
     /// The root task of a hosted run: held by the run itself ([`crate::guest::Run`], in
     /// `bstd_hosted_start`'s frame), reached through the calling thread's run as every hosted
-    /// reach is, so it needs no allocation and no count. A context of it used outside its run
-    /// stops with the run's panic.
-    HostedRoot,
+    /// reach is, so it needs no allocation and no atomic (`Io` is `Reach::Hosted`).
+    HostedRoot(Io),
+}
+
+impl Placement {
+    #[inline]
+    fn get(&self) -> &Placed {
+        match self {
+            Placement::Task(placed) => placed,
+            Placement::HostedRoot(_) => crate::guest::Run::current().placed(),
+        }
+    }
+
+    #[inline]
+    fn io(&self) -> &Io {
+        match self {
+            Placement::Task(placed) => placed.world.as_ref().expect("bstd::cx: task placement holds its world"),
+            Placement::HostedRoot(io) => io,
+        }
+    }
 }
 
 /// Where the code holding a context runs: worker `n` of its pool, or a thread outside the pool
@@ -175,6 +211,9 @@ pub(crate) struct Placed {
     /// Which worker cell its `on_worker` holds (D171, crate::workers): read at each
     /// `on_worker`, never kept across a wait.
     seat: Seat,
+    /// The world handle for `Placement::Task` (`None` only for `Placed::hosted_root`, whose
+    /// `Placement::HostedRoot` carries the zero-atomic hosted `Io`).
+    world: Option<Io>,
 }
 
 /// Which cell of the world's [`Workers`] a task's `on_worker` holds.
@@ -193,15 +232,15 @@ enum Seat {
 }
 
 impl Placed {
-    fn on(worker: u32, pool: Option<Pool>, here: Here, seat: Seat, frame: Option<Frame>, scratch: usize) -> Placement {
-        // alloc: once per task, where it runs and its frame.
-        Placement::Task(Rc::new(Placed::new(worker, pool, here, seat, frame, scratch)))
+    fn on(worker: u32, pool: Option<Pool>, here: Here, seat: Seat, frame: Option<Frame>, scratch: usize, world: Io) -> Placement {
+        // alloc: once per task, where it runs, its world handle, and its frame.
+        Placement::Task(Rc::new(Placed::new(worker, pool, here, seat, frame, scratch, Some(world))))
     }
 
     /// A hosted run's root task's placement, held by the run: on no pool, outside, its frame
     /// of `scratch` bytes made at its first use.
     pub(crate) fn hosted_root(scratch: usize) -> Placed {
-        Placed::new(0, None, Here::Outside, Seat::Root(OnceCell::new()), None, scratch)
+        Placed::new(0, None, Here::Outside, Seat::Root(OnceCell::new()), None, scratch, None)
     }
 
     /// The cell of `workers` (the world's) this task holds in `on_worker` now. `span` names the
@@ -233,7 +272,7 @@ impl Placed {
         }
     }
 
-    fn new(worker: u32, pool: Option<Pool>, here: Here, seat: Seat, frame: Option<Frame>, scratch: usize) -> Placed {
+    fn new(worker: u32, pool: Option<Pool>, here: Here, seat: Seat, frame: Option<Frame>, scratch: usize, world: Option<Io>) -> Placed {
         let made = OnceCell::new();
         if let Some(frame) = frame {
             // A fresh cell takes its value: `set` cannot find one there.
@@ -249,6 +288,7 @@ impl Placed {
             frame: made,
             scratch,
             seat,
+            world,
         }
     }
 
@@ -311,7 +351,16 @@ impl Seed {
             Here::Worker(at) => (at, Seat::Pool(at)),
             Here::Outside => (worker, Seat::Root(OnceCell::new())),
         };
-        Cx { deadline, cancel, span, world, plant, class, placed: Placed::on(worker, pool, here, seat, Some(frame), 0), path, end: None }
+        Cx {
+            deadline,
+            cancel: cancel.map(LocalCancel::new),
+            span,
+            plant,
+            class,
+            placed: Placed::on(worker, pool, here, seat, Some(frame), 0, world),
+            path,
+            end: None,
+        }
     }
 }
 
@@ -361,10 +410,9 @@ impl Cx {
             deadline,
             cancel: None,
             span: "main",
-            world,
             plant,
             class: Class::Foreground,
-            placed: Placed::on(0, None, Here::Outside, Seat::Root(OnceCell::new()), None, scratch),
+            placed: Placed::on(0, None, Here::Outside, Seat::Root(OnceCell::new()), None, scratch, world),
             path: SpanPath::ROOT,
             end: None,
         }
@@ -376,15 +424,12 @@ impl Cx {
     pub(crate) fn hosted_root(deadline: Option<Deadline>, world: Io) -> Cx {
         let plant = world.plant();
         world.record_trace("main", RecordKind::Opened { parent: "main" });
-        Cx { deadline, cancel: None, span: "main", world, plant, class: Class::Foreground, placed: Placement::HostedRoot, path: SpanPath::ROOT, end: None }
+        Cx { deadline, cancel: None, span: "main", plant, class: Class::Foreground, placed: Placement::HostedRoot(world), path: SpanPath::ROOT, end: None }
     }
 
     /// Where its task runs: shared by the task's contexts, or the hosted run's root's.
     fn placed(&self) -> &Placed {
-        match &self.placed {
-            Placement::Task(placed) => placed,
-            Placement::HostedRoot => crate::guest::Run::current().placed(),
-        }
+        self.placed.get()
     }
 
     /// The root context of `world` on `pool` (std.md, "`Threads`"): as [`Cx::root`], its tasks
@@ -395,12 +440,11 @@ impl Cx {
         Cx {
             deadline: Some(deadline),
             // A pool's fold may cancel its root (`PerWorker`'s tally): it has one from the start.
-            cancel: Some(Cancel::new(None)),
+            cancel: Some(LocalCancel::new(Cancel::new(None))),
             span: "main",
-            world,
             plant,
             class: Class::Foreground,
-            placed: Placed::on(0, Some(pool), Here::Outside, Seat::Root(OnceCell::new()), Some(frame), 0),
+            placed: Placed::on(0, Some(pool), Here::Outside, Seat::Root(OnceCell::new()), Some(frame), 0, world),
             path: SpanPath::ROOT,
             end: None,
         }
@@ -423,13 +467,14 @@ impl Cx {
     /// its children and the tasks it spawns are charged under its path. At `Totals`, or on a
     /// world with no cells, nothing more than the trace's record is done.
     pub fn span(&self, name: &'static str) -> Cx {
-        self.world.record_trace(name, RecordKind::Opened { parent: self.span });
+        let io = self.io();
+        io.record_trace(name, RecordKind::Opened { parent: self.span });
         let child = Cx { span: name, ..self.child() };
-        let workers = self.world.workers();
+        let workers = io.workers();
         if !workers.telemetry_level().is_some_and(|level| level.keeps(crate::telemetry::Level::Spans)) {
             return child;
         }
-        let wall = ns_of(self.world.now());
+        let wall = ns_of(io.now());
         let parent = self.path;
         let opened = self.on_worker(|w| {
             let (tally, cell) = w.telemetry()?;
@@ -439,7 +484,7 @@ impl Cx {
         match opened {
             Some((slot, path)) => Cx {
                 path,
-                end: Some(SpanEnd { slot, world: self.world.clone(), placed: self.placed.clone(), span: self.span }),
+                end: Some(SpanEnd { slot, placed: self.placed.clone(), span: self.span }),
                 ..child
             },
             None => child,
@@ -448,7 +493,7 @@ impl Cx {
 
     /// `what` happened, in this span: recorded on the driver's clock.
     pub fn event(&self, what: &'static str) {
-        self.world.record_trace(self.span, RecordKind::Event(what));
+        self.io().record_trace(self.span, RecordKind::Event(what));
     }
 
     /// The deadline every wait under it ends by.
@@ -525,17 +570,16 @@ impl Cx {
         let frame = Frame::with_reserve(scratch, blaze_mem::Tag::Frames)
             .map_err(|_| Stopped::OutOfMemory { arena: self.span, asked: scratch })?;
         let placed = self.placed();
-        let seat = placed.child_seat(self.world.workers(), self.span);
+        let io = self.io();
+        let seat = placed.child_seat(io.workers(), self.span);
         let child = Cx {
             deadline: self.deadline,
-            // clone: the scope's cancellation, a refcount if any.
+            // clone: local non-atomic Rc clone.
             cancel: self.cancel.clone(),
             span: self.span,
-            // clone: the world handle, a refcount (no-op for hosted).
-            world: self.world.clone(),
             plant: self.plant,
             class: self.class,
-            placed: Placed::on(placed.worker.get(), placed.pool.clone(), placed.here, seat, Some(frame), scratch),
+            placed: Placed::on(placed.worker.get(), placed.pool.clone(), placed.here, seat, Some(frame), scratch, io.clone()),
             path: self.path,
             end: None,
         };
@@ -554,7 +598,7 @@ impl Cx {
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub(crate) fn io(&self) -> &Io {
-        &self.world
+        self.placed.io()
     }
 
     /// A scope of tasks inside this one: spawn its tasks with [`Scope::spawn`], then
@@ -593,6 +637,41 @@ impl Cx {
         self.charged(io, self.span, None, || self.wait_now(io, tag, ends))
     }
 
+    /// Waits for any tag in `tags` to complete, returning `(index, done)` for the first ready
+    /// op, or `Err(stopped)` without abandoning any tag (so linear callers can finish or cancel
+    /// every still-in-flight `Pending` explicitly).
+    pub(crate) fn wait_any(&self, io: &Io, tags: &[Tag]) -> Result<(usize, Done), Stopped> {
+        self.charged(io, self.span, None, || self.wait_any_now(io, tags))
+    }
+
+    fn wait_any_now(&self, io: &Io, tags: &[Tag]) -> Result<(usize, Done), Stopped> {
+        let deadline = match self.plant {
+            Plant::WaitIgnoresDeadline => Deadline::NEVER,
+            _ => self.deadline(),
+        };
+        self.waits();
+        let mut idle = 0;
+        loop {
+            if let Some(found) = io.take_any(tags) {
+                return Ok(found);
+            }
+            if self.plant != Plant::WaitIgnoresCancel && self.cancelled() {
+                return Err(Stopped::Cancelled { span: self.span });
+            }
+            if deadline.passed(io.now()) {
+                return Err(Stopped::Deadline { span: self.span, at: deadline.get() });
+            }
+            if idle == io.limits().poll_fuel {
+                return Err(Stopped::Stalled { span: self.span, polls: idle });
+            }
+            match io.poll(deadline) {
+                0 => idle += 1,
+                _ => idle = 0,
+            }
+            self.resumed();
+        }
+    }
+
     /// `f` with the cell of the worker this task is on now held, `&mut` (D171,
     /// [`crate::workers`]): its registered slots ([`Worker::slot`]), its scratch frame, its
     /// meter, its trace rows and its random stream. The closure cannot wait: it is `Send`, so
@@ -606,7 +685,7 @@ impl Cx {
     /// same cell), a slot's make panicked, or a thread outside the pool finds every caller
     /// cell leased: the task fails naming it (rule 20).
     pub fn on_worker<R>(&self, f: impl FnOnce(&mut Worker<'_>) -> R + Send) -> R {
-        let workers = self.world.workers();
+        let workers = self.io().workers();
         let id = self.placed().cell(workers, self.span);
         workers.enter(id, f)
     }
@@ -791,16 +870,18 @@ impl Cx {
 
     /// The context of a scope inside this task: its own cancellation, under this one's.
     pub(crate) fn scoped(&self) -> Cx {
-        Cx { cancel: Some(Cancel::new(self.cancel.clone())), ..self.child() }
+        let outer = self.cancel.as_ref().map(|c| Arc::clone(c.arc()));
+        Cx { cancel: Some(LocalCancel::new(Cancel::new(outer))), ..self.child() }
     }
 
     /// The context of a task of the scope `self` is: the scope's deadline and cancellation,
     /// its own name and frame.
     /// It is placed on `worker` and stays there (std.md, "Layouts").
     pub(crate) fn task(&self, name: &'static str, frame: Frame, worker: u32) -> Cx {
-        self.world.record_trace(name, RecordKind::Opened { parent: self.span });
-        let seat = self.placed().child_seat(self.world.workers(), self.span);
-        let placed = Placed::on(worker, self.placed().pool.clone(), self.placed().here, seat, Some(frame), 0);
+        let io = self.io();
+        io.record_trace(name, RecordKind::Opened { parent: self.span });
+        let seat = self.placed().child_seat(io.workers(), self.span);
+        let placed = Placed::on(worker, self.placed().pool.clone(), self.placed().here, seat, Some(frame), 0, io.clone());
         Cx { span: name, placed, ..self.child() }
     }
 
@@ -809,13 +890,14 @@ impl Cx {
     /// placement model's, used if the task is grown outside the pool. The task's opening is
     /// recorded here, on the spawner, so the trace's order of openings is the spawner's.
     pub(crate) fn seed(&self, name: &'static str, frame: Frame, class: Class, worker: u32) -> Seed {
-        self.world.record_trace(name, RecordKind::Opened { parent: self.span });
+        let io = self.io();
+        io.record_trace(name, RecordKind::Opened { parent: self.span });
         Seed {
             deadline: self.deadline,
-            cancel: self.cancel.clone(),
+            cancel: self.cancel.as_ref().map(|c| Arc::clone(c.arc())),
             span: name,
             frame,
-            world: self.world.clone(),
+            world: io.clone(),
             plant: self.plant,
             pool: self.placed().pool.clone(),
             class,
@@ -880,7 +962,7 @@ impl Cx {
 
     fn cancellation(&self) -> &Arc<Cancel> {
         match &self.cancel {
-            Some(cancel) => cancel,
+            Some(cancel) => cancel.arc(),
             None => panic!("bstd::cx {}: cancelled outside a scope (a root is never cancelled; std.md, \"Cancellation\")", self.span),
         }
     }
@@ -902,8 +984,9 @@ impl Cx {
     /// counts it and, from `Spans`, makes it the worker's current task (what its waits' records
     /// name) and takes its snapshot. `None` on a world with no cells.
     pub(crate) fn task_began(&self, name: &'static str) -> Option<Begun> {
-        self.world.workers().telemetry_level()?;
-        let wall = ns_of(self.world.now());
+        let io = self.io();
+        io.workers().telemetry_level()?;
+        let wall = ns_of(io.now());
         let path = self.path;
         self.on_worker(|w| {
             let (tally, cell) = w.telemetry()?;
@@ -917,7 +1000,7 @@ impl Cx {
     /// charged under its path and its record kept for the chain.
     pub(crate) fn task_ended(&self, begun: Option<Begun>, failed: bool) {
         let Some(begun) = begun else { return };
-        let wall = ns_of(self.world.now());
+        let wall = ns_of(self.io().now());
         self.on_worker(|w| {
             if let Some((tally, cell)) = w.telemetry() {
                 let now = cell.snapshot(tally);
@@ -931,9 +1014,9 @@ impl Cx {
     fn child(&self) -> Cx {
         Cx {
             deadline: self.deadline,
+            // Zero atomic RMWs: both `LocalCancel` and `Placement` are local `Rc` clones.
             cancel: self.cancel.clone(),
             span: self.span,
-            world: self.world.clone(),
             plant: self.plant,
             class: self.class,
             placed: self.placed.clone(),

@@ -92,8 +92,15 @@ pub(super) struct Beside {
     pub(super) time: Time,
     /// The native driver's inline file calls; `None` where every effect keeps its queue.
     files: Option<Inline>,
+    /// Whether this world has a simulated disk ledger (`false` on native worlds so
+    /// `waited_for_device` / `names_synced` take no lock).
+    pub(super) has_disk: bool,
     /// Lock-free gate for trace recording so full or disabled traces never lock the world.
     pub(super) trace: Arc<TraceGate>,
+    /// Whether a test called `Io::record()` (always `false` outside tests, letting read-only
+    /// inline file calls bypass the global `world` lock completely).
+    #[cfg(test)]
+    pub(super) recording: Arc<AtomicBool>,
     /// The tests' view of this world (counts and the switch), shared by its clones.
     #[cfg(test)]
     pub(super) seen: Arc<Seen>,
@@ -102,13 +109,13 @@ pub(super) struct Beside {
 /// What the tests count of one world, and their switch between the two native routes.
 #[cfg(test)]
 #[derive(Default)]
-pub(super) struct Seen {
+pub(crate) struct Seen {
     /// Every reach of the world's lock through `Io::world`.
-    pub(super) locks: AtomicU64,
+    pub(crate) locks: AtomicU64,
     /// Every lent write's bytes copied into an effect the queue carries.
     pub(super) copies: AtomicU64,
     /// Every effect made inline.
-    pub(super) inline: AtomicU64,
+    pub(crate) inline: AtomicU64,
     /// Every effect handed to the driver's queue (`Io::hand_over`), both routes.
     pub(super) handoffs: AtomicU64,
     /// The test-only switch: every effect of a native world through its queue, as before
@@ -119,16 +126,21 @@ pub(super) struct Seen {
 impl Beside {
     /// What `driver` lets a world read and do without its lock.
     pub(super) fn of(driver: &Backend, trace_most: usize) -> Beside {
-        let (time, files) = match driver {
+        let (time, files, has_disk) = match driver {
             #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
-            Backend::Native(native) => (Time::Native(native.clock()), native.inline_files()),
-            Backend::Sim(_) | Backend::Guest(_) => (Time::Locked, None),
+            Backend::Native(native) => (Time::Native(native.clock()), native.inline_files(), false),
+            Backend::Sim(_) => (Time::Locked, None, true),
+            Backend::Guest(_) => (Time::Locked, None, false),
         };
         Beside {
             time,
             files,
+            has_disk,
             // alloc: once per world, the lock-free trace gate.
             trace: Arc::new(TraceGate::new(trace_most)),
+            #[cfg(test)]
+            // alloc: once per world, test recording flag.
+            recording: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             // alloc: once per world, a test's counts.
             seen: Arc::new(Seen::default()),
@@ -162,7 +174,42 @@ pub(super) fn stamp(world: &mut World, effect: impl FnOnce(Tag) -> Effect) -> Ef
     effect
 }
 
+/// Pure read-only inline effects that neither mutate `world.changed` nor require a driver tag
+/// when test recording is off: executed completely lock-free on the calling thread.
+#[inline]
+fn is_readonly_inline(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::Stat { .. }
+            | Effect::Lstat { .. }
+            | Effect::Stamp { .. }
+            | Effect::Entries { .. }
+            | Effect::ReadLink { .. }
+            | Effect::Read { .. }
+            | Effect::ReadAll { .. }
+    )
+}
+
 impl Io {
+    /// Whether a test enabled effect recording (`Io::record()`); always `false` in production.
+    #[inline]
+    pub(super) fn is_recording(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.kept_beside().is_some_and(|b| b.recording.load(Ordering::Relaxed))
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    /// Whether this world maintains a simulated disk ledger (`false` on native worlds).
+    #[inline]
+    pub(super) fn has_disk(&self) -> bool {
+        self.kept_beside().is_some_and(|b| b.has_disk)
+    }
+
     /// What this world keeps beside its lock; `None` for a hosted run, which keeps none.
     fn kept_beside(&self) -> Option<&Beside> {
         match &self.reach {
@@ -184,15 +231,59 @@ impl Io {
 
     /// The tests' view of this world; `None` for a hosted run.
     #[cfg(test)]
-    pub(super) fn seen(&self) -> Option<&Seen> {
+    pub(crate) fn seen(&self) -> Option<&Seen> {
         self.kept_beside().map(|beside| &*beside.seen)
     }
 
-    /// [`Io::call`] on a native world with inline calls: the effect stamped under one short
-    /// hold of the lock, then made on this thread if blaze-core's table says so, its `Done`
-    /// the queue's; otherwise handed to the driver under that same hold and waited for as
-    /// before. The context's deadline was looked at by the caller.
+    /// [`Io::call`] on a native world with inline calls: read-only inline effects bypass the
+    /// global `world` lock completely when not recording; mutating or non-inline effects stamp
+    /// under one short lock hold as before.
     pub(super) fn call_inline(&self, cx: &Cx, files: &Inline, effect: impl FnOnce(Tag) -> Effect) -> Result<Done, Stopped> {
+        if !self.is_recording() {
+            let built = effect(Tag(0));
+            if is_readonly_inline(&built) {
+                blaze_meter::call(built.metered());
+                return match files.perform_now(built) {
+                    Now::Done(done) => {
+                        #[cfg(test)]
+                        self.counted(|seen| &seen.inline);
+                        Ok(done)
+                    }
+                    Now::Queue(mut queued) => {
+                        let mut world = self.world().lock();
+                        let tag = Tag(world.next);
+                        world.next += 1;
+                        *queued.tag_mut() = tag;
+                        self.hand_over(world, queued);
+                        cx.wait(self, tag, Ends::Once)
+                    }
+                };
+            }
+            let mut world = self.world().lock();
+            let stamped = stamp(&mut world, |tag| {
+                let mut e = built;
+                *e.tag_mut() = tag;
+                e
+            });
+            if inline_op(&stamped).is_none() {
+                let tag = stamped.tag();
+                self.hand_over(world, stamped);
+                return cx.wait(self, tag, Ends::Once);
+            }
+            drop(world);
+            return match files.perform_now(stamped) {
+                Now::Done(done) => {
+                    #[cfg(test)]
+                    self.counted(|seen| &seen.inline);
+                    Ok(done)
+                }
+                Now::Queue(queued) => {
+                    let tag = queued.tag();
+                    self.hand_over(self.world().lock(), queued);
+                    cx.wait(self, tag, Ends::Once)
+                }
+            };
+        }
         let mut world = self.world().lock();
         let effect = stamp(&mut world, effect);
         if inline_op(&effect).is_none() {
@@ -207,8 +298,6 @@ impl Io {
                 self.counted(|seen| &seen.inline);
                 Ok(done)
             }
-            // The table and `perform_now` are one function's two answers; an effect handed
-            // back is queued as the table says, never dropped.
             Now::Queue(effect) => {
                 let tag = effect.tag();
                 self.hand_over(self.world().lock(), effect);
@@ -298,11 +387,14 @@ impl Io {
         if let Err(stopped) = cx.stopped_by(began) {
             return Some(Err(stopped));
         }
-        let kind = {
+        let kind = if self.is_recording() {
             let mut world = self.world().lock();
             // clone: the effect's name, a refcount.
             let named = file.clone();
             stamp(&mut world, |tag| Effect::ReadAll { file: named, tag }).metered()
+        } else {
+            blaze_meter::call(blaze_meter::Call::Read);
+            blaze_meter::Call::Read
         };
         let start = into.len();
         let mut refused: Option<Stopped> = None;

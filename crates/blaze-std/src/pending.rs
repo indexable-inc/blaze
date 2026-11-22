@@ -155,6 +155,83 @@ impl<'buf, C: Complete<'buf>> Pending<'buf, C> {
         let done = settle.io.settle(tag, give_up, cx.name());
         finish.complete(into, done)
     }
+
+    /// Non-blocking completion check: if the driver already has this op's completion ready,
+    /// consumes `self` and returns `Ok(output)`; otherwise returns `Err(self)` still armed.
+    #[blaze::consumes]
+    pub fn try_wait(self) -> Result<C::Output, Self> {
+        let Pending { into, from, finish, mut settle, unfinished } = self;
+        match settle.tag {
+            None => {
+                unfinished.finished();
+                settle.armed = false;
+                Ok(finish.complete(into, Err(Stopped::Cancelled { span: settle.span })))
+            }
+            Some(tag) => match settle.io.take(tag) {
+                Some(done) => {
+                    unfinished.finished();
+                    settle.armed = false;
+                    Ok(finish.complete(into, Ok(done)))
+                }
+                None => Err(Pending { into, from, finish, settle, unfinished }),
+            },
+        }
+    }
+
+    fn finish_with(self, done: Result<Done, Stopped>) -> C::Output {
+        let Pending { into, from: _, finish, mut settle, unfinished } = self;
+        unfinished.finished();
+        settle.armed = false;
+        finish.complete(into, done)
+    }
+}
+
+/// Which of two concurrent [`Pending`] operations finished first in [`select2`].
+#[derive(Debug)]
+pub enum Either<A, B> {
+    First(A),
+    Second(B),
+}
+
+/// Linear 2-way I/O multiplex: waits in a single driver poll loop until either `first` or
+/// `second` completes, completing the winner inline and returning the other still-in-flight
+/// linear [`Pending`] intact so the caller can wait or cancel it.
+///
+/// If `cx` stops (deadline, cancellation, stall) before either completes, returns
+/// `Err((stopped, first, second))` with BOTH linear ops intact (neither abandoned).
+pub fn select2<'a, 'b, A: Complete<'a>, B: Complete<'b>>(
+    cx: &Cx,
+    first: Pending<'a, A>,
+    second: Pending<'b, B>,
+) -> Result<Either<(A::Output, Pending<'b, B>), (Pending<'a, A>, B::Output)>, (Stopped, Pending<'a, A>, Pending<'b, B>)> {
+    let Some(tag_a) = first.settle.tag else {
+        let span = first.settle.span;
+        return Ok(Either::First((first.finish_with(Err(Stopped::Cancelled { span })), second)));
+    };
+    let Some(tag_b) = second.settle.tag else {
+        let span = second.settle.span;
+        return Ok(Either::Second((first, second.finish_with(Err(Stopped::Cancelled { span })))));
+    };
+    let io = first.settle.io.clone();
+    match cx.wait_any(&io, &[tag_a, tag_b]) {
+        Ok((0, done)) => Ok(Either::First((first.finish_with(Ok(done)), second))),
+        Ok((_, done)) => Ok(Either::Second((first, second.finish_with(Ok(done))))),
+        Err(stopped) => Err((stopped, first, second)),
+    }
+}
+
+/// Drives two concurrent [`Pending`] operations to completion in whichever order they land,
+/// with zero heap allocation and without spawning a task.
+pub fn wait_both<'a, 'b, A: Complete<'a>, B: Complete<'b>>(
+    cx: &Cx,
+    first: Pending<'a, A>,
+    second: Pending<'b, B>,
+) -> (A::Output, B::Output) {
+    match select2(cx, first, second) {
+        Ok(Either::First((a, second))) => (a, second.wait(cx)),
+        Ok(Either::Second((first, b))) => (first.wait(cx), b),
+        Err((_stopped, first, second)) => (first.wait(cx), second.wait(cx)),
+    }
 }
 
 impl<'buf, C: Complete<'buf>> fmt::Debug for Pending<'buf, C> {

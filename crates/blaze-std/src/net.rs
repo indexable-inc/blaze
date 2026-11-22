@@ -24,6 +24,7 @@ use blaze_core::{
     Address, Done, Effect, Tag,
     trust::{Roots, TrustError},
 };
+pub use blaze_core::sockopt::{Ask, Linger, Tcp, TcpOptions};
 
 use crate::{
     Plant, Stopped,
@@ -276,16 +277,23 @@ impl Net {
         self.budget.as_deref().map(Budget::left)
     }
 
-    /// A connection to `at`: finished with [`Conn::finish`].
+    /// A connection to `at` with default TCP options: finished with [`Conn::finish`].
     #[track_caller]
     pub fn connect(&self, cx: &Cx, at: &Addr) -> Result<Conn, NetError> {
+        self.connect_with(cx, at, blaze_core::sockopt::Tcp::DEFAULT)
+    }
+
+    /// A connection to `at` with explicit socket `options` (e.g. `nodelay`, `linger: Linger::Reset`,
+    /// keepalive, buffers): finished with [`Conn::finish`].
+    #[track_caller]
+    pub fn connect_with(&self, cx: &Cx, at: &Addr, options: blaze_core::sockopt::Tcp) -> Result<Conn, NetError> {
         if !self.connect.allows(at) {
             return Err(error(NetOp::Connect, at, NetKind::NotAllowed));
         }
         let address = at.reach(NetOp::Connect)?;
         let done = self
             .io
-            .call(cx, |tag| Effect::Connect { at: address, options: blaze_core::sockopt::Tcp::DEFAULT, tag })
+            .call(cx, |tag| Effect::Connect { at: address, options, tag })
             .map_err(|stopped| error(NetOp::Connect, at, NetKind::Stopped(stopped)))?;
         match done {
             // clone: the connection's peer, for its errors.
@@ -294,16 +302,22 @@ impl Net {
         }
     }
 
-    /// Listens on `at`: each connection made to it is [`Listener::accept`]ed. Finished with
-    /// [`Listener::close`].
+    /// Listens on `at` with default TCP options: each connection made to it is
+    /// [`Listener::accept`]ed. Finished with [`Listener::close`].
     #[track_caller]
     pub fn listen(&self, cx: &Cx, at: &Addr) -> Result<Listener, NetError> {
+        self.listen_with(cx, at, blaze_core::sockopt::Tcp::DEFAULT)
+    }
+
+    /// Listens on `at` with explicit socket `options`: finished with [`Listener::close`].
+    #[track_caller]
+    pub fn listen_with(&self, cx: &Cx, at: &Addr, options: blaze_core::sockopt::Tcp) -> Result<Listener, NetError> {
         if !self.listen.allows(at) {
             return Err(error(NetOp::Listen, at, NetKind::NotAllowed));
         }
         cx.check().map_err(|stopped| error(NetOp::Listen, at, NetKind::Stopped(stopped)))?;
         let address = at.reach(NetOp::Listen)?;
-        let tag = self.io.submit(|tag| Effect::Listen { at: address, options: blaze_core::sockopt::Tcp::DEFAULT, tag });
+        let tag = self.io.submit(|tag| Effect::Listen { at: address, options, tag });
         let listening = Listening { io: self.io.clone(), tag, open: true };
         // clone: the listener's address, for its errors; the budget shared, a refcount.
         Ok(Listener {
