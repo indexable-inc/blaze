@@ -16,7 +16,8 @@
 //! Pure data and pure functions: the front end names the levels (the attribute), the code
 //! generator the unit's features, std's detection the CPU's.
 
-use std::fmt;
+use alloc::{borrow::ToOwned, boxed::Box, string::String, string::ToString, vec::Vec};
+use core::fmt;
 
 use blaze_ids::{ContentId, Hasher};
 

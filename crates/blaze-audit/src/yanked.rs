@@ -6,7 +6,8 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::alloc::Global;
+use alloc::{format, string::String};
+use alloc::alloc::Global;
 
 /// The largest index file read: 32 MiB. The largest crates.io packages (thousands of
 /// versions) are a few MiB.
@@ -32,8 +33,8 @@ struct Line<'a> {
 /// `line` read as an index entry, its strings borrowed from the value. Its other keys (`deps`,
 /// `cksum`, `features`, `v`, ...) are let be on purpose: the line is the registry's format,
 /// which gains keys a reader must tolerate, so this reads the three it needs and no others.
-fn line_of(value: &blaze_data::Value<std::alloc::Global>) -> Result<Line<'_>, blaze_data::ShapeError<std::alloc::Global>> {
-    let c = blaze_data::Cursor::root(value, std::alloc::Global);
+fn line_of(value: &blaze_data::Value<alloc::alloc::Global>) -> Result<Line<'_>, blaze_data::ShapeError<alloc::alloc::Global>> {
+    let c = blaze_data::Cursor::root(value, alloc::alloc::Global);
     Ok(Line {
         name: c.field("name")?.text()?,
         vers: c.field("vers")?.text()?,
@@ -54,7 +55,7 @@ pub fn yanked(package: &str, version: &blaze_semver::Version<Global>, bytes: &[u
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let value = match blaze_json::read_in(line, blaze_json::Limits::DEFAULT, std::alloc::Global) {
+        let value = match blaze_json::read_in(line, blaze_json::Limits::DEFAULT, alloc::alloc::Global) {
             Ok(it) => it,
             Err(why) => return Yanked::NotChecked(format!("line {} of its index file is not an index entry: {why}", at + 1)),
         };

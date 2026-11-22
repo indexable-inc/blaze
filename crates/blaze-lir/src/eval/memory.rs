@@ -37,6 +37,7 @@
 //! Storage: the crate's present form, std `Vec` in the run's allocator `A` (blaze-lir does not
 //! depend on blaze-own); this file replaces eval.rs's `Memory` and its four `Vec` fields.
 
+use alloc::vec::Vec;
 use core::{alloc::Allocator, ops::Range};
 
 use super::{

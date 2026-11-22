@@ -11,11 +11,8 @@
 //! otherwise (`attrs`, `locs`, a parameter's facts, a range); one that is a parent or an
 //! optional place is [`NONE`] for none.
 
-use std::{
-    alloc::{Allocator, Global},
-    fmt,
-    ops::Range,
-};
+use core::{fmt, ops::Range};
+use alloc::{alloc::Allocator, alloc::Global, vec::Vec};
 
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;

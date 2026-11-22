@@ -21,7 +21,8 @@
 //! head, and so the dominance rule above, unchanged, is what refuses in its output any value
 //! that would cross a poll outside the state.
 
-use std::fmt;
+use alloc::{vec, vec::Vec};
+use core::fmt;
 
 use crate::{
     flags::Ordering,
@@ -64,9 +65,9 @@ impl fmt::Display for VerifyError {
     }
 }
 
-impl std::error::Error for VerifyError {}
+impl core::error::Error for VerifyError {}
 
-type Result<T = ()> = std::result::Result<T, VerifyError>;
+type Result<T = ()> = core::result::Result<T, VerifyError>;
 
 fn func(rule: &'static str) -> VerifyError {
     VerifyError { at: At::Func, rule }
@@ -269,7 +270,7 @@ pub fn structure(view: View<'_>) -> Result {
 }
 
 /// Whether `ty` is a type of the encoding whose compound row exists.
-fn check_ty(view: &View<'_>, ty: Ty) -> std::result::Result<(), &'static str> {
+fn check_ty(view: &View<'_>, ty: Ty) -> core::result::Result<(), &'static str> {
     if !ty.is_valid() {
         return Err("a type of no known encoding");
     }
@@ -280,7 +281,7 @@ fn check_ty(view: &View<'_>, ty: Ty) -> std::result::Result<(), &'static str> {
 }
 
 /// Whether one word of an operand names something that exists.
-fn index(view: &View<'_>, word: Word) -> std::result::Result<(), &'static str> {
+fn index(view: &View<'_>, word: Word) -> core::result::Result<(), &'static str> {
     let ok = match word {
         Word::Value(value) => (value as usize) < view.ops.len(),
         Word::Block(block) => (block as usize) < view.block_starts.len(),
@@ -448,7 +449,7 @@ fn structure_tables(view: &View<'_>) -> Result {
         if !within(rec.name_first, rec.name_len, view.names.len()) || rec.sig as usize >= view.sigs.len() {
             return Err(row("intrinsics", r, "a name past `names` or a signature past `sigs`"));
         }
-        if std::str::from_utf8(&view.names[rec.name_first as usize..][..rec.name_len as usize]).is_err() {
+        if core::str::from_utf8(&view.names[rec.name_first as usize..][..rec.name_len as usize]).is_err() {
             return Err(row("intrinsics", r, "a name that is not UTF-8"));
         }
     }
@@ -468,7 +469,7 @@ fn structure_tables(view: &View<'_>) -> Result {
         if rec.options & !options != 0 {
             return Err(row("asms", r, "an option of no known meaning"));
         }
-        if std::str::from_utf8(view.asm_str(rec.clobbers_first, rec.clobbers_len)).is_err() {
+        if core::str::from_utf8(view.asm_str(rec.clobbers_first, rec.clobbers_len)).is_err() {
             return Err(row("asms", r, "clobbers that are not UTF-8"));
         }
         let pieces = &view.asm_pieces[rec.pieces_first as usize..][..rec.pieces_len as usize];
@@ -477,7 +478,7 @@ fn structure_tables(view: &View<'_>) -> Result {
             match piece.kind {
                 AsmPieceRec::TEXT => {
                     if !within(piece.a, piece.b, view.asm_text.len())
-                        || std::str::from_utf8(view.asm_str(piece.a, piece.b)).is_err()
+                        || core::str::from_utf8(view.asm_str(piece.a, piece.b)).is_err()
                     {
                         return Err(row("asms", r, "template text past `asm_text` or not UTF-8"));
                     }
@@ -502,7 +503,7 @@ fn structure_tables(view: &View<'_>) -> Result {
                 return Err(row("asms", r, "an operand of no known kind"));
             };
             if !within(operand.reg_first, operand.reg_len, view.asm_text.len())
-                || std::str::from_utf8(view.asm_str(operand.reg_first, operand.reg_len)).is_err()
+                || core::str::from_utf8(view.asm_str(operand.reg_first, operand.reg_len)).is_err()
                 || operand.class > 1
                 || operand.pad != [0; 2]
             {
@@ -513,7 +514,7 @@ fn structure_tables(view: &View<'_>) -> Result {
             }
         }
     }
-    if std::str::from_utf8(view.features).is_err() {
+    if core::str::from_utf8(view.features).is_err() {
         return Err(func("target features that are not UTF-8"));
     }
     canonical(view)
@@ -560,7 +561,7 @@ fn canonical(view: &View<'_>) -> Result {
                 let regs = view.asm_operands[rec.operands_first as usize..][..rec.operands_len as usize]
                     .iter()
                     .map(|it| (it.reg_first, it.reg_len));
-                pieces.chain(regs).chain(std::iter::once((rec.clobbers_first, rec.clobbers_len)))
+                pieces.chain(regs).chain(core::iter::once((rec.clobbers_first, rec.clobbers_len)))
             });
             tiles(text, view.asm_text.len())
         }),
@@ -931,7 +932,7 @@ fn semantics(view: &View<'_>) -> Result {
             continue;
         }
         let mut bad = None;
-        let mut visit = |word: Word| -> std::result::Result<(), ()> {
+        let mut visit = |word: Word| -> core::result::Result<(), ()> {
             if let Word::Value(value) = word {
                 if let Some(rule) = dominance(view, &cfg, &of, value as usize, at) {
                     bad = Some(rule);
@@ -1009,7 +1010,7 @@ fn types(
     ty: Ty,
     ptr_int: Ty,
     own: &crate::func::Sig<'_>,
-) -> std::result::Result<(), &'static str> {
+) -> core::result::Result<(), &'static str> {
     let mut o = view.operands(at);
     let t = |v: Value| view.ty(v);
     let need = |ok: bool, rule: &'static str| if ok { Ok(()) } else { Err(rule) };
@@ -1343,7 +1344,7 @@ fn types(
 }
 
 /// Whether `args` are what `sig` takes: its parameters, and past them for a variadic one.
-fn arguments(view: &View<'_>, sig: SigId, args: Values<'_>) -> std::result::Result<(), &'static str> {
+fn arguments(view: &View<'_>, sig: SigId, args: Values<'_>) -> core::result::Result<(), &'static str> {
     let sig = view.sig(sig);
     let variadic = sig.bits & SigRec::VARIADIC != 0;
     let count_ok = match variadic {

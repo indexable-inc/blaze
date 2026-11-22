@@ -18,6 +18,7 @@
 //! "this operation"); a `call` whose callee `bodies` does not give (an outside function), or
 //! that names no function.
 
+use alloc::vec::Vec;
 use core::alloc::Allocator;
 
 use super::{EvalError, Memory, Outcome, Run, Val};

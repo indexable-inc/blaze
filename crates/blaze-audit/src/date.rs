@@ -5,7 +5,8 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::fmt;
+use alloc::{borrow::ToOwned, string::String};
+use core::fmt;
 
 /// One day of the proleptic Gregorian calendar, years 1 to 9999.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -49,7 +50,7 @@ impl Date {
         if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
             return Err(refused());
         }
-        let digits = |range: std::ops::Range<usize>| -> Option<u16> {
+        let digits = |range: core::ops::Range<usize>| -> Option<u16> {
             let part = text.get(range)?;
             part.bytes().all(|it| it.is_ascii_digit()).then(|| part.parse().ok()).flatten()
         };

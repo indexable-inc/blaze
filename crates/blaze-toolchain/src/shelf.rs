@@ -5,6 +5,7 @@
 //! anything absent or other is a [`ToolchainError`] naming the digest and the folder. Never a
 //! fallback to another version, a path or rustup (rules 3, 8).
 
+use alloc::{string::String, string::ToString};
 use core::fmt;
 
 use blaze_fetch::{Blake3, PackView};

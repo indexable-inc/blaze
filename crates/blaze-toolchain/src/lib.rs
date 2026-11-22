@@ -11,9 +11,12 @@
 //!
 //! The tool that cuts a toolchain from the tree is the script `scripts/src/bin/toolchain_cut.rs`.
 
+#![cfg_attr(not(test), no_std)]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 
+
+extern crate alloc;
 pub mod implied;
 pub mod record;
 pub mod shelf;

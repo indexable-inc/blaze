@@ -24,8 +24,9 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::alloc::Global;
-use std::fmt;
+use alloc::{borrow::ToOwned, format, string::String, string::ToString, vec::Vec};
+use alloc::alloc::Global;
+use core::fmt;
 
 use blaze_data::{Map, Value};
 use blaze_semver::VersionReq;
@@ -281,7 +282,7 @@ impl Advisory {
         if bytes.len() > MOST_ADVISORY_BYTES {
             return Err(AdvisoryRefused::TooBig { file: file.to_owned(), bytes: bytes.len() });
         }
-        let text = std::str::from_utf8(bytes).map_err(|_| bad("is not UTF-8".to_owned()))?;
+        let text = core::str::from_utf8(bytes).map_err(|_| bad("is not UTF-8".to_owned()))?;
         let text = text.replace("\r\n", "\n");
         let rest = text.strip_prefix(FENCE).ok_or_else(|| bad("does not open with a ```toml fence".to_owned()))?;
         let end = rest.find(FENCE_END).ok_or_else(|| bad("has no end to its ```toml fence".to_owned()))?;

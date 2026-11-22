@@ -400,6 +400,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-bstd-convert"
+version = "0.0.0"
+dependencies = [
+ "blaze-data",
+ "blaze-json",
+ "blaze-own",
+ "blaze-toml",
+ "syntax",
+]
+
+[[package]]
 name = "blaze-build"
 version = "0.0.0"
 dependencies = [

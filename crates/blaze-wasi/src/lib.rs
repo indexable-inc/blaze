@@ -36,15 +36,19 @@
 //! but handles and straight-line calls: `calls` (each call defined in a `Linker`, its arguments
 //! handed to the core) and [`seed`] (the seed's calls and its fibers on Wasmtime's).
 
+#![cfg_attr(not(test), no_std)]
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 #![deny(blaze::sans_io_core)]
 
+
+extern crate alloc;
+use alloc::{string::String, string::ToString, vec::Vec};
 mod calls;
 mod layout;
 pub mod seed;
 
-use std::fmt;
+use core::fmt;
 
 pub use calls::{bytes, link, put};
 pub use layout::{Fault, Halt, Pointers, bytes_at, put_at};

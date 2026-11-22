@@ -27,7 +27,9 @@
 //! [`Builder::finish`] returns it, naming the operation and block. In debug builds `finish`
 //! also runs the verifier.
 
-use std::{alloc::Allocator, hash::BuildHasher, marker::PhantomData};
+use alloc::vec::Vec;
+use core::{hash::BuildHasher, marker::PhantomData};
+use alloc::alloc::Allocator;
 
 use blaze_format::SpanRef;
 use blaze_hash::{FixedState, Map, MapOpts};
@@ -106,8 +108,8 @@ pub enum BuildError {
     Verify(VerifyError),
 }
 
-impl std::fmt::Display for BuildError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             BuildError::NoBlock { op } => write!(f, "a `{}` made with no block begun", op.name()),
             BuildError::AfterEnd { op, block } => {
@@ -130,7 +132,7 @@ impl std::fmt::Display for BuildError {
     }
 }
 
-impl std::error::Error for BuildError {}
+impl core::error::Error for BuildError {}
 
 /// Whether a signature is C's `...`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

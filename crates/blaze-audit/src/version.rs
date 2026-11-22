@@ -11,7 +11,7 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::alloc::Global;
+use alloc::alloc::Global;
 
 use blaze_semver::{Comparator, Op, Prerelease, Version, VersionReq};
 

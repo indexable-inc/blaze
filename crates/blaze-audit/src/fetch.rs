@@ -14,7 +14,8 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::fmt;
+use alloc::{borrow::ToOwned, format, string::String};
+use core::fmt;
 
 use blaze_fetch::Digest;
 
@@ -119,7 +120,7 @@ impl Fetch {
 
     /// What to do after `event`.
     pub fn step(&mut self, event: Event) -> Result<Effect, Refused> {
-        let step = std::mem::replace(&mut self.step, Step::Done);
+        let step = core::mem::replace(&mut self.step, Step::Done);
         let name = match &step {
             Step::Start => "start",
             Step::Fetching => "fetch",

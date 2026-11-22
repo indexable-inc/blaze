@@ -15,6 +15,7 @@
 //!
 //! Pure sans-IO, `#![forbid(unsafe_code)]`, explicit allocator only.
 
+use alloc::vec::Vec;
 use core::alloc::Allocator;
 
 use blaze_hash::{FixedState, Map, MapOpts};

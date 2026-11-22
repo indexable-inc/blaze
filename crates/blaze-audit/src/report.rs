@@ -19,8 +19,9 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::alloc::Global;
-use std::fmt::Write as _;
+use alloc::{borrow::ToOwned, format, string::String, string::ToString, vec::Vec};
+use alloc::alloc::Global;
+use core::fmt::Write as _;
 
 use blaze_data::{Map, ToValue, Value};
 

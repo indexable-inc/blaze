@@ -23,8 +23,9 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::alloc::{Allocator, Global};
-use std::fmt::Write as _;
+use alloc::{borrow::ToOwned, format, string::{String, ToString}, vec::Vec};
+use alloc::{alloc::Allocator, alloc::Global};
+use core::fmt::Write as _;
 
 use blaze_data::Value;
 use blaze_fetch::Digest;

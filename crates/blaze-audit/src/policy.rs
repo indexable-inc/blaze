@@ -19,8 +19,9 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::alloc::{Allocator, Global};
-use std::fmt;
+use alloc::{borrow::ToOwned, format, string::String, vec::Vec};
+use alloc::{alloc::Allocator, alloc::Global};
+use core::fmt;
 
 use blaze_data::Value;
 

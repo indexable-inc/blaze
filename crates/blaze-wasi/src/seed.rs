@@ -30,7 +30,9 @@
 //! has). The macro host does not, and its import check refuses the module.
 
 #[cfg(feature = "seed")]
-use std::marker::PhantomData;
+use alloc::{format, vec::Vec};
+#[cfg(feature = "seed")]
+use core::marker::PhantomData;
 
 #[cfg(feature = "seed")]
 use wasmtime::{
@@ -188,7 +190,7 @@ impl Fibers {
     /// Takes `fiber` out to run it.
     fn take(&mut self, fiber: u64) -> wasmtime::Result<Fiber> {
         let slot = self.slot("fiber_resume", fiber)?;
-        match std::mem::replace(slot, Slot::Running) {
+        match core::mem::replace(slot, Slot::Running) {
             Slot::Idle(it) => Ok(it),
             was => {
                 let why = if matches!(was, Slot::Running) {
@@ -222,7 +224,7 @@ impl Fibers {
     /// seed's entry returned, before its store is dropped. A fiber still suspended then is one
     /// the seed leaked (as blaze-graph leaks a fiber suspended mid-body).
     pub fn dispose_all<T: EmbedSeed>(store: &mut Store<T>) {
-        let slots = std::mem::take(&mut store.data_mut().fibers().slots);
+        let slots = core::mem::take(&mut store.data_mut().fibers().slots);
         for slot in slots {
             if let Slot::Idle(it) = slot {
                 store.guest_fiber_dispose(it.fiber);
@@ -337,7 +339,7 @@ fn fiber_resume<T: EmbedSeed>(c: &mut Caller<'_, T>, fiber: u64) -> wasmtime::Re
 #[cfg(feature = "seed")]
 fn fiber_drop<T: EmbedSeed>(c: &mut Caller<'_, T>, fiber: u64) -> wasmtime::Result<()> {
     let slot = c.data_mut().fibers().slot("fiber_drop", fiber)?;
-    match std::mem::replace(slot, Slot::Free) {
+    match core::mem::replace(slot, Slot::Free) {
         Slot::Running => {
             *slot = Slot::Running;
             // alloc: error path

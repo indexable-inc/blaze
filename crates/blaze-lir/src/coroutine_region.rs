@@ -27,6 +27,7 @@
 //! it may be read back from memory or a callee after the resume), is never read after a
 //! suspension, so its bytes need not outlive the poll that wrote them.
 
+use alloc::vec::Vec;
 use core::alloc::Allocator;
 
 use super::{Body, CoroutineError, Panics, Plant, Shape, Split, View, each_value, filled, successors};

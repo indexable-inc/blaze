@@ -30,8 +30,12 @@
 //! writes the result and jumps on, its unwind edge to a fresh landing block that takes the
 //! exception and jumps to the body's cleanup block with it and the values. Under
 //! [`blaze_build::Panic::Abort`] every call is plain and no cleanup block is built (D119 point 2).
+#![cfg_attr(not(test), no_std)]
 #![feature(allocator_api)]
 
+
+extern crate alloc;
+use alloc::vec::Vec;
 mod frame;
 mod term;
 mod value;

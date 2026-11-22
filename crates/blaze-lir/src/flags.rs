@@ -15,7 +15,7 @@
 //!
 //! [`Op::info`]: crate::Op::info
 
-use std::{fmt, ops::BitOr};
+use core::{fmt, ops::BitOr};
 
 /// An instruction's flag byte. Which bits mean what depends on the operation's [`FlagClass`]:
 /// the constants below are named for their meaning, and two of different classes may share a

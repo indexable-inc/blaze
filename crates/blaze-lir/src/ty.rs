@@ -17,7 +17,7 @@
 //!
 //! [`Op::Project`]: crate::Op::Project
 
-use std::fmt;
+use core::fmt;
 
 /// A LIR type. See the module for its encoding.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default)]

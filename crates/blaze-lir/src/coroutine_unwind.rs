@@ -29,7 +29,8 @@
 //! builder refuses too: a caught unwind goes on in ordinary code, which nothing here has
 //! been shown to split right).
 
-use std::alloc::Allocator;
+use alloc::vec::Vec;
+use alloc::alloc::Allocator;
 
 use super::{CoroutineError, DIRECT, Emit, PANICKED, Plant, REMADE, Shape, Split, filled, split_planted_with};
 use crate::{Block, Op, Ty, View, func::BlockKind, func::NONE};

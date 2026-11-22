@@ -3,6 +3,7 @@
 //! replacement ([`scalar_replace`]), copy and constant propagation ([`propagate`]) and dead
 //! code and trivial branch removal ([`dead`]), in that order, each once.
 
+use alloc::vec::Vec;
 use core::alloc::Allocator;
 
 use super::{SimplifyError, dead, propagate, scalar_replace};

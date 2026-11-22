@@ -22,7 +22,8 @@
 //! `(values)`, `[blocks]` or `[lanes]`, an immediate in decimal, a constant as hex words
 //! from the most significant, and rows of the tables as `refN`, `sN`, `ssN`, `iN`, `aN`.
 
-use std::fmt;
+use alloc::string::String;
+use core::fmt;
 
 use crate::{
     flags::{AtomicRmw, FloatCond, IntCond, Shown},
@@ -74,7 +75,7 @@ pub(crate) fn quoted(text: &str, out: &mut impl fmt::Write) -> fmt::Result {
 }
 
 fn text<'a>(view: &View<'a>, first: u32, len: u32) -> &'a str {
-    std::str::from_utf8(view.asm_str(first, len)).unwrap_or("?")
+    core::str::from_utf8(view.asm_str(first, len)).unwrap_or("?")
 }
 
 fn hex(bytes: &[u8], out: &mut impl fmt::Write) -> fmt::Result {
@@ -116,7 +117,7 @@ fn header(view: &View<'_>, out: &mut impl fmt::Write) -> fmt::Result {
         out.write_str(inline.name())?;
     }
     out.write_str("] features ")?;
-    quoted(std::str::from_utf8(view.features).unwrap_or("?"), out)?;
+    quoted(core::str::from_utf8(view.features).unwrap_or("?"), out)?;
     out.write_char('\n')
 }
 
@@ -241,7 +242,7 @@ fn tables(view: &View<'_>, out: &mut impl fmt::Write) -> fmt::Result {
     }
     for (r, rec) in view.intrinsics.iter().enumerate() {
         write!(out, "intrinsic i{r} = ")?;
-        quoted(std::str::from_utf8(view.intrinsic_name(crate::func::IntrinsicId(r as u32))).unwrap_or("?"), out)?;
+        quoted(core::str::from_utf8(view.intrinsic_name(crate::func::IntrinsicId(r as u32))).unwrap_or("?"), out)?;
         writeln!(out, " s{}", rec.sig)?;
     }
     for (r, rec) in view.slots.iter().enumerate() {

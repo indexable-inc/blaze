@@ -8,9 +8,12 @@
 //! AArch64 and `sse2` on x86). Nothing is interned, hashed or allocated to ask whether a
 //! feature is enabled.
 
+#![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
-use std::fmt;
+
+extern crate alloc;
+use core::fmt;
 
 use blaze_ids::bits::{BitArray, BitIndex};
 

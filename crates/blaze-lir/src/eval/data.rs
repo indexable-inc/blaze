@@ -38,6 +38,7 @@
 //! depends on a number (different allocations are unordered: memory.rs `ptr_compare`).
 //! Storage: the crate's present form, std `Vec` in the run's allocator.
 
+use alloc::vec::Vec;
 use core::alloc::Allocator;
 
 use super::{
