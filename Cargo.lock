@@ -1367,6 +1367,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-live"
+version = "0.0.0"
+dependencies = [
+ "blaze-cbor",
+ "blaze-own",
+ "blaze-sim",
+ "blaze-text",
+ "blaze-unicode",
+]
+
+[[package]]
 name = "blaze-lower"
 version = "0.0.0"
 dependencies = [

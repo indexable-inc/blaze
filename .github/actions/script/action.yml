@@ -32,19 +32,17 @@ runs:
     - if: steps.restore.outputs.cache-hit == 'true'
       shell: bash
       run: '"$GITHUB_ACTION_PATH/check.sh" "${{ steps.key.outputs.dir }}" "${{ steps.key.outputs.key }}"'
-    # A miss: the whole tree (blaze loads the workspace), then the release unless a step before
-    # installed it.
+    # A miss: the whole tree (cargo loads the workspace), then the pinned Rust toolchain unless
+    # a step before installed it.
     - id: need
       if: steps.restore.outputs.cache-hit != 'true'
       shell: bash
       run: |
         if [ "$(git config --bool core.sparseCheckout || echo false)" = true ]; then git sparse-checkout disable; fi
-        have=$(blaze-engine --version 2>/dev/null | awk '$1 == "blaze" { print $2 }' || true)
-        echo "install=$([ "$have" = "$(cat .github/blaze-version)" ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
+        tc=$(cat pins/toolchain)
+        echo "install=$(cargo +"$tc" --version >/dev/null 2>&1 && echo false || echo true)" >> "$GITHUB_OUTPUT"
     - if: steps.need.outputs.install == 'true'
-      uses: ./.github/actions/blaze
-      with:
-        job: ${{ inputs.job }}
+      uses: ./.github/actions/toolchain
     - if: steps.restore.outputs.cache-hit != 'true'
       shell: bash
       run: '"$GITHUB_ACTION_PATH/build.sh" "${{ steps.key.outputs.dir }}" "${{ steps.key.outputs.key }}"'

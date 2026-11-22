@@ -6,7 +6,8 @@
 # Written by scripts/src/bin/ambient.rs (`{"command": "heap-write"}`), checked by
 # `{"command": "heap-check"}`.
 # crate	global	shared_global	test_heap	process	leak
-blaze-cad	0	0	2	0	0
+blaze-bstd-convert	7	0	0	0	0
+blaze-cad	0	0	3	0	0
 blaze-cad-field	0	0	1	0	0
 blaze-cad-mesh	0	0	1	0	0
 blaze-cad-out	0	0	1	0	0

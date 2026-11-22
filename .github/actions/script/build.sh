@@ -22,10 +22,8 @@ die() { echo "::error::$*" >&2; echo "build.sh: $*" >&2; exit 1; }
 [ $# = 2 ] || die "takes DIR and KEY, not: $*"
 dir=$1 key=$2
 
-want=$(cat .github/blaze-version)
-said=$(blaze-engine --version 2>&1) || die "no blaze on PATH (blaze-engine --version: $said)"
-[ "$(echo "$said" | awk '$1 == "blaze" { print $2 }')" = "$want" ] ||
-  die "the blaze on PATH says '$said', and .github/blaze-version names $want: the key names that release"
+tc=$(cat pins/toolchain)
+cargo +"$tc" --version >/dev/null 2>&1 || die "no cargo +$tc on PATH (pins/toolchain names $tc)"
 
 # What cargo or blaze reads from the caller's environment (harness/v2/engine.py, SCRUBBED), so
 # the key, which names none of it, covers the build.
@@ -36,13 +34,10 @@ for name in $(env | sed -nE 's/^(CARGO_PROFILE_[A-Z0-9_]*|CARGO_TARGET_[A-Z0-9_]
 unset CARGO_TARGET_DIR
 said="$dir.build.json"
 mkdir -p "$(dirname "$dir")"
-lock_backup="$dir.Cargo.lock.orig"
-cp Cargo.lock "$lock_backup"
-restore_lock() { [ -f "$lock_backup" ] && mv "$lock_backup" Cargo.lock || true; }
-trap restore_lock EXIT
-blaze build --no-locked -p scripts --bins --message-format=json > "$said" || die "blaze build --no-locked -p scripts --bins --message-format=json failed (its JSON lines: $said)"
-restore_lock
-trap - EXIT
+if ! cargo +"$tc" build --locked -p scripts --bins --message-format=json > "$said"; then
+  grep '"level":"error"' "$said" | sed -n 's/.*"rendered":"\([^"]*\)".*/\1/p' | sed 's/\\n/\n/g' >&2 || true
+  die "cargo +$tc build --locked -p scripts --bins --message-format=json failed (its JSON lines: $said)"
+fi
 
 fresh="$dir.new"
 rm -rf "$fresh"
