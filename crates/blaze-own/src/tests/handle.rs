@@ -27,6 +27,7 @@ fn through(case: impl FnOnce(&Counting, Alloc<'_>) -> Result<(), Broke>) -> Resu
     counted.check()
 }
 
+/// The refinement: blaze-own collections through an `Alloc` handle match std collections and grow in place when the underlying allocator supports it.
 #[test]
 fn vec_matches_std_through_a_handle() {
     blaze_sim::check(cases(300), |tape: &Tape| through(|_, alloc| vec_case_in(tape, alloc)));

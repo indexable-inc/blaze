@@ -1568,98 +1568,287 @@ fn edition_runs<I: Ord + Copy>(marks: &[(I, Edition)], body: Edition, after: imp
 /// A record's type, printed as Rust writes it (items by their declared names; a parameter of
 /// the owner as `P<i>`).
 pub fn show(fx: &Fx, t: PTys<'_>, p: PTy) -> String {
-    let list = |l: List| -> String {
-        let parts: Vec<String> = t.list(l).expect("a shown list in its table").iter().map(|&x| show(fx, t, x)).collect();
-        parts.join(", ")
-    };
+    use core::fmt::Write as _;
     match *t.get(p).expect("a shown type in its table") {
-        PNode::Bool => String::from("bool"),
-        PNode::Char => String::from("char"),
-        PNode::Int(i) => String::from(match i {
-            IntTy::Isize => "isize",
-            IntTy::I8 => "i8",
-            IntTy::I16 => "i16",
-            IntTy::I32 => "i32",
-            IntTy::I64 => "i64",
-            IntTy::I128 => "i128",
-        }),
-        PNode::Uint(u) => String::from(match u {
-            UintTy::Usize => "usize",
-            UintTy::U8 => "u8",
-            UintTy::U16 => "u16",
-            UintTy::U32 => "u32",
-            UintTy::U64 => "u64",
-            UintTy::U128 => "u128",
-        }),
-        PNode::Float(f) => String::from(match f {
-            FloatTy::F16 => "f16",
-            FloatTy::F32 => "f32",
-            FloatTy::F64 => "f64",
-            FloatTy::F128 => "f128",
-        }),
-        PNode::Str => String::from("str"),
-        PNode::Never => String::from("!"),
-        PNode::Tuple(l) if l.len == 1 => format!("({},)", list(l)),
-        PNode::Tuple(l) => format!("({})", list(l)),
-        PNode::Ref(Mutbl::Not, x) => format!("&{}", show(fx, t, x)),
-        PNode::Ref(Mutbl::Mut, x) => format!("&mut {}", show(fx, t, x)),
-        PNode::Ptr(Mutbl::Not, x) => format!("*const {}", show(fx, t, x)),
-        PNode::Ptr(Mutbl::Mut, x) => format!("*mut {}", show(fx, t, x)),
-        PNode::Array(x, n) => format!("[{}; {}]", show(fx, t, x), show(fx, t, n)),
-        PNode::Slice(x) => format!("[{}]", show(fx, t, x)),
-        PNode::Pat(x, l) => format!("({} is {})", show(fx, t, x), list(l)),
-        PNode::Adt(k, l) if l.len == 0 => String::from(fx.name_of(k)),
-        PNode::Adt(k, l) => format!("{}<{}>", fx.name_of(k), list(l)),
-        PNode::FnDef(k, l) if l.len == 0 => format!("fn {}", fx.name_of(k)),
-        PNode::FnDef(k, l) => format!("fn {}<{}>", fx.name_of(k), list(l)),
-        PNode::FnPtr(l, h) => {
-            let unsafe_ = if h.safety == crate::ids::Safety::Unsafe { "unsafe " } else { "" };
-            let abi_owned = format!("extern \"{}\" ", h.abi.name());
-            let abi = if h.abi == crate::ids::Abi::Rust { "" } else { abi_owned.as_str() };
-            // The list is the inputs, then the output.
-            let all = t.list(l).expect("a shown list in its table");
-            let (ins, out) = all.split_at(all.len().saturating_sub(1));
-            let ins: Vec<String> = ins.iter().map(|&x| show(fx, t, x)).collect();
-            let out = match out.first() {
-                Some(&o) => format!(" -> {}", show(fx, t, o)),
-                None => String::new(),
-            };
-            format!("{unsafe_}{abi}fn({}){out}", ins.join(", "))
+        PNode::Bool => return String::from("bool"),
+        PNode::Char => return String::from("char"),
+        PNode::Int(i) => {
+            return String::from(match i {
+                IntTy::Isize => "isize",
+                IntTy::I8 => "i8",
+                IntTy::I16 => "i16",
+                IntTy::I32 => "i32",
+                IntTy::I64 => "i64",
+                IntTy::I128 => "i128",
+            });
         }
-        PNode::Closure { owner, ordinal, args } => format!("closure#{ordinal} of {}<{}>", fx.name_of(owner), list(args)),
-        PNode::Future(e, o, i) => format!("future#{}<{}; {}>", e.0, show(fx, t, o), show(fx, t, i)),
-        PNode::Coroutine { owner, ordinal, args } => format!("coroutine#{ordinal} of {}<{}>", fx.name_of(owner), list(args)),
-        PNode::Param(i) => format!("P{i}"),
-        PNode::Alias { trait_, name, args } => format!("<{} as {}>::{:x}", list(args), fx.name_of(trait_), name.0),
-        PNode::Opaque(k, _) => format!("impl {}", fx.name_of(k)),
-        PNode::Infer => String::from("_"),
-        PNode::Error => String::from("{error}"),
-        PNode::ConstParam(i) => format!("C{i}"),
-        PNode::ConstValue { ty, bits } => match t.get(ty) {
-            Some(PNode::Bool) => format!("{}", bits != 0),
-            Some(PNode::Char) => match u32::try_from(bits).ok().and_then(char::from_u32) {
-                Some(c) => format!("{c:?}"),
-                None => format!("{{char {bits:#x}}}"),
-            },
-            Some(PNode::Uint(crate::ids::UintTy::Usize)) => format!("{bits}"),
-            _ => format!("{bits}{}", show(fx, t, ty)),
-        },
-        PNode::Dynamic(l) => {
-            let rows: Vec<String> = t.list(l).expect("a shown list in its table").iter().map(|&x| show(fx, t, x)).collect();
-            format!("dyn {}", rows.join(" + "))
+        PNode::Uint(u) => {
+            return String::from(match u {
+                UintTy::Usize => "usize",
+                UintTy::U8 => "u8",
+                UintTy::U16 => "u16",
+                UintTy::U32 => "u32",
+                UintTy::U64 => "u64",
+                UintTy::U128 => "u128",
+            });
         }
-        PNode::ExTrait(k, l) if l.len == 0 => String::from(fx.name_of(k)),
-        PNode::ExTrait(k, l) => format!("{}<{}>", fx.name_of(k), list(l)),
-        // An object's binding: its args follow the erased `Self`, so it prints as the trait.
-        PNode::ExProj { trait_, name, args, term } if args.len == 0 => {
-            format!("{}::{:x} = {}", fx.name_of(trait_), name.0, show(fx, t, term))
+        PNode::Float(f) => {
+            return String::from(match f {
+                FloatTy::F16 => "f16",
+                FloatTy::F32 => "f32",
+                FloatTy::F64 => "f64",
+                FloatTy::F128 => "f128",
+            });
         }
-        PNode::ExProj { trait_, name, args, term } => {
-            format!("{}<{}>::{:x} = {}", fx.name_of(trait_), list(args), name.0, show(fx, t, term))
+        PNode::Str => return String::from("str"),
+        PNode::Never => return String::from("!"),
+        PNode::Adt(k, l) if l.len == 0 => return String::from(fx.name_of(k)),
+        PNode::FnDef(k, l) if l.len == 0 => {
+            let mut s = String::from("fn ");
+            s.push_str(fx.name_of(k));
+            return s;
         }
-        PNode::ExAuto(k) => String::from(fx.name_of(k)),
-        PNode::Foreign(k) => String::from(fx.name_of(k)),
+        PNode::Opaque(k, _) => {
+            let mut s = String::from("impl ");
+            s.push_str(fx.name_of(k));
+            return s;
+        }
+        PNode::Infer => return String::from("_"),
+        PNode::Error => return String::from("{error}"),
+        PNode::ExTrait(k, l) if l.len == 0 => return String::from(fx.name_of(k)),
+        PNode::ExAuto(k) => return String::from(fx.name_of(k)),
+        PNode::Foreign(k) => return String::from(fx.name_of(k)),
+        _ => {}
     }
+    enum Task<'a> {
+        Ty(PTy),
+        List { list: List, next: usize, end: Option<usize>, sep: &'static str },
+        Str(&'a str),
+        Hex(u64),
+    }
+    fn push_list(stack: &mut Vec<Task<'_>>, list: List, sep: &'static str) {
+        stack.push(Task::List { list, next: 0, end: None, sep });
+    }
+    let mut out = String::new();
+    let mut stack: Vec<Task<'_>> = Vec::new();
+    stack.push(Task::Ty(p));
+    while let Some(task) = stack.pop() {
+        match task {
+            Task::Str(s) => out.push_str(s),
+            Task::Hex(n) => {
+                let _ = write!(out, "{n:x}");
+            }
+            Task::List { list, next, end, sep } => {
+                let all = t.list(list).expect("a shown list in its table");
+                let limit = end.unwrap_or(all.len());
+                if let Some(&x) = all.get(next)
+                    && next < limit
+                {
+                    if next + 1 < limit {
+                        stack.push(Task::List { list, next: next + 1, end, sep });
+                    }
+                    stack.push(Task::Ty(x));
+                    if next > 0 {
+                        stack.push(Task::Str(sep));
+                    }
+                }
+            }
+            Task::Ty(cur) => match *t.get(cur).expect("a shown type in its table") {
+                PNode::Bool => out.push_str("bool"),
+                PNode::Char => out.push_str("char"),
+                PNode::Int(i) => out.push_str(match i {
+                    IntTy::Isize => "isize",
+                    IntTy::I8 => "i8",
+                    IntTy::I16 => "i16",
+                    IntTy::I32 => "i32",
+                    IntTy::I64 => "i64",
+                    IntTy::I128 => "i128",
+                }),
+                PNode::Uint(u) => out.push_str(match u {
+                    UintTy::Usize => "usize",
+                    UintTy::U8 => "u8",
+                    UintTy::U16 => "u16",
+                    UintTy::U32 => "u32",
+                    UintTy::U64 => "u64",
+                    UintTy::U128 => "u128",
+                }),
+                PNode::Float(f) => out.push_str(match f {
+                    FloatTy::F16 => "f16",
+                    FloatTy::F32 => "f32",
+                    FloatTy::F64 => "f64",
+                    FloatTy::F128 => "f128",
+                }),
+                PNode::Str => out.push_str("str"),
+                PNode::Never => out.push_str("!"),
+                PNode::Tuple(l) if l.len == 1 => {
+                    out.push_str("(");
+                    stack.push(Task::Str(",)"));
+                    push_list(&mut stack, l, ", ");
+                }
+                PNode::Tuple(l) => {
+                    out.push_str("(");
+                    stack.push(Task::Str(")"));
+                    push_list(&mut stack, l, ", ");
+                }
+                PNode::Ref(Mutbl::Not, x) => {
+                    out.push_str("&");
+                    stack.push(Task::Ty(x));
+                }
+                PNode::Ref(Mutbl::Mut, x) => {
+                    out.push_str("&mut ");
+                    stack.push(Task::Ty(x));
+                }
+                PNode::Ptr(Mutbl::Not, x) => {
+                    out.push_str("*const ");
+                    stack.push(Task::Ty(x));
+                }
+                PNode::Ptr(Mutbl::Mut, x) => {
+                    out.push_str("*mut ");
+                    stack.push(Task::Ty(x));
+                }
+                PNode::Array(x, n) => {
+                    out.push_str("[");
+                    stack.push(Task::Str("]"));
+                    stack.push(Task::Ty(n));
+                    stack.push(Task::Str("; "));
+                    stack.push(Task::Ty(x));
+                }
+                PNode::Slice(x) => {
+                    out.push_str("[");
+                    stack.push(Task::Str("]"));
+                    stack.push(Task::Ty(x));
+                }
+                PNode::Pat(x, l) => {
+                    out.push_str("(");
+                    stack.push(Task::Str(")"));
+                    push_list(&mut stack, l, ", ");
+                    stack.push(Task::Str(" is "));
+                    stack.push(Task::Ty(x));
+                }
+                PNode::Adt(k, l) if l.len == 0 => out.push_str(fx.name_of(k)),
+                PNode::Adt(k, l) => {
+                    out.push_str(fx.name_of(k));
+                    out.push_str("<");
+                    stack.push(Task::Str(">"));
+                    push_list(&mut stack, l, ", ");
+                }
+                PNode::FnDef(k, l) if l.len == 0 => {
+                    out.push_str("fn ");
+                    out.push_str(fx.name_of(k));
+                }
+                PNode::FnDef(k, l) => {
+                    out.push_str("fn ");
+                    out.push_str(fx.name_of(k));
+                    out.push_str("<");
+                    stack.push(Task::Str(">"));
+                    push_list(&mut stack, l, ", ");
+                }
+                PNode::FnPtr(l, h) => {
+                    if h.safety == crate::ids::Safety::Unsafe {
+                        out.push_str("unsafe ");
+                    }
+                    if h.abi != crate::ids::Abi::Rust {
+                        let _ = write!(out, "extern \"{}\" ", h.abi.name());
+                    }
+                    out.push_str("fn(");
+                    // The list is the inputs, then the output.
+                    let all = t.list(l).expect("a shown list in its table");
+                    let ins_len = all.len().saturating_sub(1);
+                    if let Some(&o) = all.get(ins_len) {
+                        stack.push(Task::Ty(o));
+                        stack.push(Task::Str(" -> "));
+                    }
+                    stack.push(Task::Str(")"));
+                    stack.push(Task::List { list: l, next: 0, end: Some(ins_len), sep: ", " });
+                }
+                PNode::Closure { owner, ordinal, args } => {
+                    let _ = write!(out, "closure#{ordinal} of {}<", fx.name_of(owner));
+                    stack.push(Task::Str(">"));
+                    push_list(&mut stack, args, ", ");
+                }
+                PNode::Future(e, o, i) => {
+                    let _ = write!(out, "future#{}<", e.0);
+                    stack.push(Task::Str(">"));
+                    stack.push(Task::Ty(i));
+                    stack.push(Task::Str("; "));
+                    stack.push(Task::Ty(o));
+                }
+                PNode::Coroutine { owner, ordinal, args } => {
+                    let _ = write!(out, "coroutine#{ordinal} of {}<", fx.name_of(owner));
+                    stack.push(Task::Str(">"));
+                    push_list(&mut stack, args, ", ");
+                }
+                PNode::Param(i) => {
+                    let _ = write!(out, "P{i}");
+                }
+                PNode::Alias { trait_, name, args } => {
+                    out.push_str("<");
+                    stack.push(Task::Hex(name.0));
+                    stack.push(Task::Str(">::"));
+                    stack.push(Task::Str(fx.name_of(trait_)));
+                    stack.push(Task::Str(" as "));
+                    push_list(&mut stack, args, ", ");
+                }
+                PNode::Opaque(k, _) => {
+                    out.push_str("impl ");
+                    out.push_str(fx.name_of(k));
+                }
+                PNode::Infer => out.push_str("_"),
+                PNode::Error => out.push_str("{error}"),
+                PNode::ConstParam(i) => {
+                    let _ = write!(out, "C{i}");
+                }
+                PNode::ConstValue { ty, bits } => match t.get(ty) {
+                    Some(PNode::Bool) => {
+                        let _ = write!(out, "{}", bits != 0);
+                    }
+                    Some(PNode::Char) => match u32::try_from(bits).ok().and_then(char::from_u32) {
+                        Some(c) => {
+                            let _ = write!(out, "{c:?}");
+                        }
+                        None => {
+                            let _ = write!(out, "{{char {bits:#x}}}");
+                        }
+                    },
+                    Some(PNode::Uint(crate::ids::UintTy::Usize)) => {
+                        let _ = write!(out, "{bits}");
+                    }
+                    _ => {
+                        let _ = write!(out, "{bits}");
+                        stack.push(Task::Ty(ty));
+                    }
+                },
+                PNode::Dynamic(l) => {
+                    out.push_str("dyn ");
+                    push_list(&mut stack, l, " + ");
+                }
+                PNode::ExTrait(k, l) if l.len == 0 => out.push_str(fx.name_of(k)),
+                PNode::ExTrait(k, l) => {
+                    out.push_str(fx.name_of(k));
+                    out.push_str("<");
+                    stack.push(Task::Str(">"));
+                    push_list(&mut stack, l, ", ");
+                }
+                // An object's binding: its args follow the erased `Self`, so it prints as the trait.
+                PNode::ExProj { trait_, name, args, term } if args.len == 0 => {
+                    let _ = write!(out, "{}::{:x} = ", fx.name_of(trait_), name.0);
+                    stack.push(Task::Ty(term));
+                }
+                PNode::ExProj { trait_, name, args, term } => {
+                    out.push_str(fx.name_of(trait_));
+                    out.push_str("<");
+                    stack.push(Task::Ty(term));
+                    stack.push(Task::Str(" = "));
+                    stack.push(Task::Hex(name.0));
+                    stack.push(Task::Str(">::"));
+                    push_list(&mut stack, args, ", ");
+                }
+                PNode::ExAuto(k) => out.push_str(fx.name_of(k)),
+                PNode::Foreign(k) => out.push_str(fx.name_of(k)),
+            },
+        }
+    }
+    out
 }
 
 /// The items of [`loops`] the cases name.

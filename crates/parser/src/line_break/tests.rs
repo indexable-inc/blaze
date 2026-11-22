@@ -206,6 +206,7 @@ fn same(tape: &Tape, rule: Rule) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The refinement: any source with CRLF line breaks (including line continuations and block doc comments) lexes to the exact same tokens, errors, and values as its LF form with mapped offsets.
 #[test]
 fn crlf_lexes_as_its_lf_form() {
     blaze_sim::check(Config::cases(2000), |tape| same(tape, Rule::Clean));

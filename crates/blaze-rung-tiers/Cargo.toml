@@ -15,7 +15,7 @@ doctest = false
 
 [dev-dependencies]
 # The programs.
-blaze-rungs = { path = "../blaze-rungs" }
+blaze-rungs.workspace = true
 # `blaze run`'s record walk as a census (code_records.rs `RecordRun::census`, run.rs
 # `build_records_new`), and its builder's settings.
 blaze-ladder.workspace = true

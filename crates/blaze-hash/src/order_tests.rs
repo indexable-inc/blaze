@@ -127,7 +127,7 @@ fn agrees(tape: &Tape) -> Result<(), String> {
     Ok(())
 }
 
-/// The invariant: after any operations an insertion-ordered map iterates the pairs a `Vec`
+/// Invariant: after any operations an insertion-ordered map iterates the pairs a `Vec`
 /// under the same operations holds, in its order, and finds each key at its index.
 #[test]
 fn an_ordered_map_is_a_vec_of_pairs_under_any_operations() {
@@ -224,7 +224,7 @@ fn inserts() -> impl Iterator<Item = (u64, u64)> {
 
 const CHILD: &str = "BLAZE_HASH_ORDER_CHILD";
 
-/// The invariant: an ordered map iterates in insertion order, whatever hashes its keys (the
+/// Invariant: an ordered map iterates in insertion order, whatever hashes its keys (the
 /// fixed seed, a key drawn at random), whatever its capacity, and in another process. The
 /// control is the cause: a hash map of the same inserts under two random keys iterates in two
 /// orders, so the order this test compares is one a table can get wrong.

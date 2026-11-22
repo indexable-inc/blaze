@@ -151,6 +151,7 @@ fn heated(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The invariant: a hot function is queued for optimization exactly once when its heat reaches the threshold, and an optimized record is used only when its inlined callees still match.
 #[test]
 fn a_hot_function_is_tiered_exactly_once() {
     check(Config::cases(500), |tape| heated(tape, Plant::None));

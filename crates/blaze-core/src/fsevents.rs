@@ -2076,6 +2076,7 @@ mod tests {
         Ok(())
     }
 
+    /// The invariant: an FSEvents journal resume from a saved place tells nothing from before the command's flush and every change under the watched directory after it.
     /// A case the tape draws, beside the three the real side runs too: writes of the judged
     /// names, the first `seen` of them before the place; told, those under `src` written
     /// after it. Run on the model alone (each real run waits on fseventsd's store, seconds),

@@ -10,9 +10,7 @@
 (with tests)	274
 blaze-cas	libc
 blaze-check	libc
-blaze-check	windows-sys
 blaze-core	libc
-blaze-core	windows-sys
 blaze-http	bytes
 blaze-http	quinn-proto
 blaze-http	rustls
@@ -24,7 +22,6 @@ blaze-manifest	serde
 blaze-manifest	serde_json
 blaze-manifest	url
 blaze-mem	libc
-blaze-mem	windows-sys
 blaze-proc-macro	libc
 blaze-proc-macro	tracing
 blaze-proc-macro	wasmtime

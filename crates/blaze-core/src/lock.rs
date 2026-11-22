@@ -553,6 +553,12 @@ impl<T: ?Sized> Lock<T> {
         self.meta.name
     }
 
+    /// Allocate the contention slot up front so the first contended acquire on a hot path makes
+    /// no heap allocation.
+    pub(crate) fn prewarm_contention(&self) {
+        let _ = self.meta.slot_or_make();
+    }
+
     /// The lock, waiting for it if another holds it; a wait is recorded.
     #[inline]
     #[track_caller]

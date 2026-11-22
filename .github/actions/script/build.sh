@@ -36,7 +36,13 @@ for name in $(env | sed -nE 's/^(CARGO_PROFILE_[A-Z0-9_]*|CARGO_TARGET_[A-Z0-9_]
 unset CARGO_TARGET_DIR
 said="$dir.build.json"
 mkdir -p "$(dirname "$dir")"
-blaze build -p scripts --bins --message-format=json > "$said" || die "blaze build -p scripts --bins --message-format=json failed (its JSON lines: $said)"
+lock_backup="$dir.Cargo.lock.orig"
+cp Cargo.lock "$lock_backup"
+restore_lock() { [ -f "$lock_backup" ] && mv "$lock_backup" Cargo.lock || true; }
+trap restore_lock EXIT
+blaze build --no-locked -p scripts --bins --message-format=json > "$said" || die "blaze build --no-locked -p scripts --bins --message-format=json failed (its JSON lines: $said)"
+restore_lock
+trap - EXIT
 
 fresh="$dir.new"
 rm -rf "$fresh"

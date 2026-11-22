@@ -158,6 +158,7 @@ fn broke(why: std::fmt::Arguments<'_>) -> Broke {
     Broke::Oracle(std::fmt::format(why))
 }
 
+/// The invariant: with edge-first enabled, every `blaze-sim` generator respects its size, range, UTF-8, and alphabet bounds without leaking characters outside `text_from`'s alphabet.
 /// (b) Over drawn sizes, alphabets and ranges, the draws keep their promises with the edges on:
 /// `bytes`, `text`, `name` and `text_from` give a size in `sizes` (counted in characters for
 /// text); `text_from` only its alphabet's characters; `char` no surrogate; `f64_finite` and

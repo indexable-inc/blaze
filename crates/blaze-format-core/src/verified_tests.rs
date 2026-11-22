@@ -565,6 +565,7 @@ fn fuzz(tape: &Tape) -> Result<bool, Broke> {
     }
 }
 
+/// The refinement: `Verified::open` refuses every buffer the byte-by-byte reference reader refuses (including out-of-bounds references and invalid UTF-8), and every unchecked read agrees with the reference.
 #[test]
 fn open_refuses_every_buffer_an_unchecked_read_would_misread() {
     // A fuzz whose changes `open` always refused would read nothing unchecked: the cases it

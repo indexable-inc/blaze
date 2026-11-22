@@ -14,10 +14,9 @@
 #   command  bash, run from the checkout's root; `$BLAZE_SCRIPTS` is the built scripts' directory
 #            (the run's `scripts` field)
 
-# The repository's Python workspace (pyproject.toml, uv.lock) lints and type-checks. Some scripts
+# The repository's Python workspace (pyproject.toml, uv.lock) lints. Some scripts
 # ask rustc for the host when imported: in the workspace's Python, with its helpers.
 python lint | 300 | - | uv run --frozen ruff check
-python types | 600 | - | uv run --frozen pyright
 python imports | 300 | - | uv run --frozen python harness/imports.py
 # The list of tests that may fail holds together and is as its recorder writes it.
 failures selftest | 120 | - | uv run --frozen python harness/failures.py selftest

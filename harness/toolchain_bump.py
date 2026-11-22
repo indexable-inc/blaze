@@ -231,9 +231,7 @@ def replace_tree(src, dst):
     shutil.copytree(src, dst, symlinks=True)
 
 
-async def vendor(new):
-    """crates/rustc_abi/src and crates/rustc_lexer/src as rust-lang/rust has them at `new`."""
-    repo = await checkout(new, [ABI[1], LEXER[1]])
+def _patch_abi_root(repo: str) -> None:
     root, marker, count = ABI_ROOT
     root = os.path.join(ROOT, root)
     with open(root, encoding="utf-8") as f:
@@ -246,6 +244,12 @@ async def vendor(new):
         upstream = f.read()
     with open(root, "w", encoding="utf-8") as f:
         f.write("".join(kept) + upstream)
+
+
+async def vendor(new):
+    """crates/rustc_abi/src and crates/rustc_lexer/src as rust-lang/rust has them at `new`."""
+    repo = await checkout(new, [ABI[1], LEXER[1]])
+    _patch_abi_root(repo)
 
 
 async def lints(new):

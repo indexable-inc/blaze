@@ -72,7 +72,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// [`Walk::emit_call`] with `declared`: `Some(n)` for a C-variadic callee whose first `n`
     /// of `passes` are its declared parameters (the rest the `...` ones), `None` for any other
     /// call. One home for building a call: `emit_call` is this with `None`.
-    pub(super) fn emit_call_from(&mut self, callee: Callee, reprs: &[Repr], passes: &[Pass], declared: Option<usize>, rrepr: Repr, rpass: Pass) -> Result<(), BuildError> {
+    pub(super) fn emit_call_from(&mut self, callee: Callee, reprs: &[Repr], passes: &[Pass], declared: Option<usize>, callee_nounwind: bool, rrepr: Repr, rpass: Pass) -> Result<(), BuildError> {
         let named = match declared {
             Some(n) if n <= passes.len() => &passes[..n],
             Some(_) => return Err(malformed("a C-variadic call with fewer arguments than declared parameters (the checker's E0061)")),
@@ -97,6 +97,15 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         }
         self.truncate_vals(base);
         let r = match declared {
+            None if callee_nounwind => {
+                // A non-unwinding callee (`extern "C"`, `#[rustc_nounwind]`) cannot unwind: a plain
+                // call, no landing pad or terminate block.
+                let sig = self.b.sig(Conv::C, Variadic::No, &params, &rets);
+                match callee {
+                    Callee::Direct(reference) => self.b.call(Flags::NONE, reference, sig, &values),
+                    Callee::Pointer(p) => self.b.call_indirect(Flags::NONE, p, sig, &values),
+                }
+            }
             None => {
                 let sig = self.b.sig(Conv::C, Variadic::No, &params, &rets);
                 self.call_unwinding(callee, sig, &values)?

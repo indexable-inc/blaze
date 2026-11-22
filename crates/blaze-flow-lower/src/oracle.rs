@@ -546,6 +546,7 @@ mod checks {
         findings
     }
 
+    /// The refinement: lowering under the one-rule call lowering agrees call-site by call-site (including inside closure bodies) with the reference lowering, catching any dropped constraint.
     /// A CLOSURE'S BODY IS COMPARED: the planted control (one subset dropped per call) is caught
     /// at the call inside the closure under (b); the real one rule there has no finding.
     #[test]

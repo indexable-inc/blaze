@@ -435,6 +435,7 @@ fn case_inner(tape: &Tape) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The invariant: the sparse-index machine reads each crate index once cold, sends cached validators when warm, and downloads nothing when unchanged.
 /// A clean machine passes 300 cases; a failure prints the oracle's words and the tape, e.g.
 /// "asked again: se/rd/serde asked 2 times, not 1".
 #[test]

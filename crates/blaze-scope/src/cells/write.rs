@@ -371,6 +371,99 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         }
         Some((out, unknown))
     }
+
+    /// Which kind of unresolved item caused `unknown > 0` for `module` (rule 19: name the cause).
+    pub(crate) fn first_unknown(&self, ix: &WriteIndex<'_, N>, module: ItemKey) -> &'static str {
+        let Some(&m) = self.by_key.get(&module) else { return "no_module" };
+        let Some(md) = usize::try_from(m).ok().and_then(|i| self.modules.get(i)) else { return "no_module" };
+        for (&(ns, name), &(_, vis, origin, frag)) in md.explicit.iter() {
+            if !self.published_later(origin, frag) && self.entry_vis_final(m, ns, name, vis).is_none() {
+                return "entry_vis_final";
+            }
+        }
+        for imports in md.named.values() {
+            for &j in imports.iter() {
+                if let Some(it) = usize::try_from(j).ok().and_then(|i| self.items.get(i)) {
+                    match it.outcome {
+                        Some(Outcome::Outside) => return "named_outside",
+                        None => return "named_none",
+                        _ => {}
+                    }
+                }
+            }
+        }
+        for &j in md.glob_items.iter() {
+            if let Some(it) = usize::try_from(j).ok().and_then(|i| self.items.get(i))
+                && !md.edges.contains_key(&it.index)
+                && !matches!(it.outcome, Some(Outcome::Failed(_)))
+            {
+                return match it.outcome {
+                    Some(Outcome::Outside) => "glob_outside",
+                    None => "glob_none",
+                    _ => "glob_other",
+                };
+            }
+        }
+        let mut stack: AVec<'_, (FragId, usize, usize, bool)> = AVec::new_in(self.alloc);
+        stack.push((md.text, 0, 0, true));
+        while let Some(&(f, si, ui, own)) = stack.last() {
+            let Some(fi) = usize::try_from(f).ok() else { stack.pop(); continue };
+            let Some(frag) = self.frags.get(fi) else { stack.pop(); continue };
+            let next_slot = frag.slots.get(si).copied();
+            let next_use = if own { ix.uses.get(fi).and_then(|u| u.get(ui).copied()) } else { None };
+            let take_use = match (next_slot, next_use) {
+                (None, None) => { stack.pop(); continue }
+                (Some((pos, _)), Some(i)) => usize::try_from(i).ok().and_then(|k| self.items.get(k)).is_some_and(|it| it.pos < pos),
+                (None, Some(_)) => true,
+                (Some(_), None) => false,
+            };
+            let top = stack.len().saturating_sub(1);
+            if take_use {
+                if let Some(slot) = stack.get_mut(top) { slot.2 += 1; }
+                if let Some(i) = next_use
+                    && let Some(it) = usize::try_from(i).ok().and_then(|k| self.items.get(k))
+                    && it.binds.is_none()
+                    && !it.glob
+                {
+                    match it.outcome {
+                        Some(Outcome::Outside) => return "anon_outside",
+                        None => return "anon_none",
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+            if let Some(slot) = stack.get_mut(top) { slot.1 += 1; }
+            let Some((_, slot)) = next_slot else { continue };
+            match slot {
+                Slot::Rules(..) => {}
+                Slot::Mod(child, macro_use) => {
+                    if let Some(c) = usize::try_from(child).ok().and_then(|k| self.modules.get(k)) {
+                        if macro_use && !c.foreign && !c.unread && c.text != FragId::MAX {
+                            stack.push((c.text, 0, 0, false));
+                        } else if macro_use && !c.foreign && !c.unread && !self.recorded_textual.contains_key(&child) {
+                            return "macro_use_textual";
+                        }
+                    }
+                }
+                Slot::Call(c) => {
+                    if let Some(it) = usize::try_from(c).ok().and_then(|k| self.items.get(k)) {
+                        if own && !it.deep {
+                            match it.outcome {
+                                Some(Outcome::Outside) => return "call_outside",
+                                None => return "call_none",
+                                _ => {}
+                            }
+                        }
+                        if let Some(e) = it.expansion {
+                            stack.push((e, 0, 0, own));
+                        }
+                    }
+                }
+            }
+        }
+        "other"
+    }
 }
 
 /// The namespaces in the record's order are the order [`NAMESPACES`] lists them in.

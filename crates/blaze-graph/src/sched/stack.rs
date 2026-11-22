@@ -95,7 +95,7 @@ mod tests {
         held.iter().filter(|it| **it & 1 != 0).count()
     }
 
-    /// The invariant: a worker that parks after an idle daemon's ask gives back its own
+    /// Invariant: a worker that parks after an idle daemon's ask gives back its own
     /// stack's pages below its frame: 4 MiB a deep call left committed under the calling frame
     /// are out of the resident set once `give_back_below_here` returns, and it says it advised
     /// at least them. Linux reads residency with `mincore`; macOS, whose `MADV_FREE_REUSABLE`

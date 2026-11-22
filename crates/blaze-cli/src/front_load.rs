@@ -512,7 +512,7 @@ impl<'n> Load<'n> for StoreLoad<'n> {
         }
         let record = one.made.as_ref().map_err(|_| ItemsRecordError::FileItemsUnavailable { file: index, what: "the outline task failed" })?;
         let physical = crate::signature::SignatureFile::new(real.as_bytes());
-        let expected = blaze_ids::Hasher::new("blaze-cli file surface with physical path 1").id(&physical.subject()).id(&surface).finish();
+        let expected = blaze_ids::Hasher::new(crate::work::FILE_SURFACE_PHYSICAL_DOMAIN).id(&physical.subject()).id(&surface).finish();
         let found = crate::engine_tasks::surface_of(record).ok_or(ItemsRecordError::FileItemsUnavailable { file: index, what: "the planned outline has no surface" })?;
         let Some(key) = self.crates.key(krate) else { return Ok(None) };
         let stale = |saw, found| ItemsRecordError::Stale { krate: key, file: Some(index), call: None, saw, found };

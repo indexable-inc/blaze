@@ -628,6 +628,7 @@ fn move_back(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     compare(&store.open(plant).map_err(refused("reopen after retiring the sole reader"))?, &model, "sole reader retired")
 }
 
+/// The refinement: after every simulated request, compaction, or crash between segments and root, the views over the stored bytes equal the in-memory model for rows, cells, readers, plans, findings, owed tasks, and owed cells.
 #[test]
 fn histories_match_the_model() {
     check(SimConfig::cases(300), |tape| histories(tape, Plant::None));

@@ -204,17 +204,32 @@ pub fn each(mut each: impl FnMut(&[u64; WORDS])) {
 mod tests {
     use super::*;
 
+    struct TableGuard;
+    impl Drop for TableGuard {
+        fn drop(&mut self) {
+            TEST_BUSY.store(false, Ordering::Release);
+        }
+    }
+    static TEST_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    fn exclusive_table() -> TableGuard {
+        while TEST_BUSY.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
+        TableGuard
+    }
+
     fn held(first: u64) -> usize {
         let mut found = 0;
         each(|words| found += usize::from(words[0] == first));
         found
     }
 
-    /// The invariant: a sample is in the table from its put to its block's free, follows the
+    /// Invariant: a sample is in the table from its put to its block's free, follows the
     /// block through a move, and stays through a realloc that failed or moved nothing. One
     /// test, since the table is the process's: each case uses addresses of its own.
     #[test]
     fn a_sample_is_held_until_its_block_is_freed_and_follows_a_move() {
+        let _guard = exclusive_table();
         keep();
         let block = |n: usize| (0x7000_0000usize + n * 64) as *mut u8;
         put(block(1).addr(), [11, 2, 3].into_iter());
@@ -248,6 +263,7 @@ mod tests {
     /// A bucket holds [`WAYS`] samples: one more is lost and counted, never put over another.
     #[test]
     fn a_full_bucket_loses_the_sample_and_counts_it() {
+        let _guard = exclusive_table();
         keep();
         // Addresses of one bucket: found by search, as the hash is not invertible by eye.
         let home = bucket(0x9000_0000);
@@ -277,6 +293,7 @@ mod tests {
     /// drive.
     #[test]
     fn threads_end_with_exactly_their_held_blocks() {
+        let _guard = exclusive_table();
         keep();
         const THREADS: u64 = 8;
         const STEPS: u64 = 20_000;

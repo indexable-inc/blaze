@@ -12,7 +12,7 @@ src/ast/visit.rs 9 a77ff4d13526762d
 src/ast_pretty.rs 14 2219abc61f682f8c
 src/attr/doc_comment.rs 5 cbd6cbead4647221
 src/attr.rs 32 fe726516a13b7210
-src/cargo_fmt.rs 48 7c67b235f42df578
+src/cargo_fmt.rs 48 97e48df2a9840bfa
 src/chains.rs 42 4a064e33854f218d
 src/cli.rs 41 6a7bc579701bbd57
 src/closures.rs 29 38c6edcf066c95c8

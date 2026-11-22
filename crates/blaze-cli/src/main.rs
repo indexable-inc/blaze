@@ -83,6 +83,7 @@ mod seal;
 mod start_list;
 /// A head as a drive task (D114): its name, source and out.
 mod signature;
+mod single_file;
 mod store;
 mod sweep;
 // The sweep's change detection from the system's journal of changes (plan row S1).

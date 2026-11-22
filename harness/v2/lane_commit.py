@@ -6,7 +6,7 @@ of `base`, so no branch moves, nothing is staged in the checkout and no other la
 taken. Input: one JSON value
 
     {"repo": "/Volumes/Projects/blaze-int-1112", "base": "origin/int-1112", "message": "...",
-     "whole": ["crates/x/src/mine.rs", "docs/mine.md"],
+     "whole": ["crates/x/src/mine.rs", "docs/README.md"],
      "hunks": {"crates/x/src/shared.rs": "ahead|Ahead"},
      "push": "onsave-1112"}
 

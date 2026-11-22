@@ -249,6 +249,7 @@ fn run(plan: &Plan) -> Result<(), String> {
     }
 }
 
+/// The invariant: a ranged HTTP GET validates `Content-Range` and length, returning only the exact byte range requested or a typed refusal without forwarding unverified bytes.
 /// Every server: the honest one's bytes are exactly the range asked; each other one is refused
 /// by the name of what it did, its bytes not handed on.
 #[test]

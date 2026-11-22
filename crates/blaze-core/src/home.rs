@@ -310,7 +310,7 @@ mod tests {
         Ok(PathBuf::from("/recorded"))
     }
 
-    /// The invariant: the home is `HOME` when it is set and not empty, else the system's
+    /// Invariant: the home is `HOME` when it is set and not empty, else the system's
     /// record, else an error that names what was tried; the record is asked only when no
     /// variable answers.
     #[test]

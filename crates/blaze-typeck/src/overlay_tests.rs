@@ -161,6 +161,7 @@ fn overlay_property(tape: &Tape, read: Read) -> Result<(), Broke> {
     same(again, fork.view(), "the kept body read over a grown base")
 }
 
+/// The refinement: a body type table overlay answers every read identically to a full copy of the base table and never reads IDs added to the base after the overlay was created.
 #[test]
 fn an_overlay_reads_as_the_copy() {
     blaze_sim::check(Config::cases(400), |tape: &Tape| overlay_property(tape, Read::Truncated));

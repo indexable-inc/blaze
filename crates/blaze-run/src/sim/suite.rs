@@ -61,6 +61,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The refinement: `Tests::affected` equals a naive scan of each test's latest entered-body record without keeping stale postings from earlier records.
 #[test]
 fn affected_is_exactly_the_tests_that_entered_a_changed_body() {
     check(Config::cases(500), |tape| run(tape, Plant::None));

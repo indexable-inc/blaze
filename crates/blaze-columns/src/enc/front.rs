@@ -520,7 +520,7 @@ mod tests {
         strings
     }
 
-    /// The invariant: a sorted set of any bytes (empty strings, 0xFF, more strings than a
+    /// Invariant: a sorted set of any bytes (empty strings, 0xFF, more strings than a
     /// bucket, one string, none) reads back string for string through `get` and `walk`;
     /// `find` of each is its index, and of any other key what `binary_search` says; the same
     /// set writes the same bytes. Prints nothing; a failure prints its tape.

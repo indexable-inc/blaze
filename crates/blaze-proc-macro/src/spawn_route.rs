@@ -400,7 +400,7 @@ pub fn fact_reply_matches(subject: &str, observed: Option<ContentId>, pins: Opti
 
 /// A file's digest in a spawn request (`present`).
 pub(crate) fn file_digest(bytes: &[u8]) -> ContentId {
-    ContentId::of("blaze v2 spawn file 1", bytes)
+    blaze_spawn::digest::file_digest(bytes)
 }
 
 /// The served tree's digest, the coarse proof covering every file under `/workspace`: each
@@ -412,7 +412,7 @@ pub(crate) fn tree_digest(files: &[(String, Vec<u8>)]) -> ContentId {
         bytes.extend_from_slice(path.as_bytes());
         bytes.extend_from_slice(&file_digest(file).0);
     }
-    ContentId::of("blaze v2 spawn tree 1", &bytes)
+    ContentId::of(blaze_spawn::digest::TREE_DOMAIN, &bytes)
 }
 
 /// 64 lowercase hex digits.

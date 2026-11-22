@@ -120,6 +120,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     })
 }
 
+/// The invariant: a resumed event feed delivers every pushed item in order at most once without repeating items across reconnects, announcing a gap whenever items were evicted.
 #[test]
 fn a_resumed_feed_delivers_each_item_once_or_a_gap() {
     let lap = Lap::new("resume: each item once or a gap");

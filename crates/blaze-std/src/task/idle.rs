@@ -675,6 +675,7 @@ mod model {
             .expect("the model's report is text")
     }
 
+    /// The invariant: the lazy pool idle protocol starts each worker thread at most once, counts starts before threads exit, loses no wake-up including for unstarted workers, and runs every spawned task.
     #[test]
     fn model_lazy_pool_runs_every_task_and_stops_after_every_start() {
         blaze_check::model(|| lazy_pool(PoolPlant::None));

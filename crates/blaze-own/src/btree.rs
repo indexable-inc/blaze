@@ -263,13 +263,26 @@ unsafe fn count_below<K: Borrow<Q>, V, Q: Ord + ?Sized>(node: Node<K, V>, key: &
 unsafe fn count_entries<K, V>(node: Node<K, V>, height: usize) -> usize {
     // SAFETY: the node is live, of this height, its edges written.
     unsafe {
-        let n = len(node);
         if height == 0 {
-            return n;
+            return len(node);
         }
-        let mut total = n;
-        for i in 0..=n {
-            total += count_entries(edge_at(node, i), height - 1);
+        let mut stack: FixedVec<(Node<K, V>, usize, usize), MOST_NODES> = FixedVec::new();
+        let mut total = len(node);
+        let _ = stack.push((node, height, 0));
+        while let Some((cur, h, edge)) = stack.last_mut() {
+            let cur_node = *cur;
+            let cur_h = *h;
+            let idx = *edge;
+            if idx > len(cur_node) {
+                stack.pop();
+                continue;
+            }
+            *edge = idx + 1;
+            let child = edge_at(cur_node, idx);
+            total += len(child);
+            if cur_h > 1 {
+                let _ = stack.push((child, cur_h - 1, 0));
+            }
         }
         total
     }
@@ -644,56 +657,107 @@ unsafe fn clone_tree<K, V, K2, V2, B: Allocator>(
     alloc: &B,
     copy: &mut impl FnMut(&K, &V) -> Result<(K2, V2), AllocFailure>,
 ) -> Result<(Node<K2, V2>, usize), AllocFailure> {
-    // SAFETY: the source is live.
-    let n = unsafe { len(src) };
-    if height == 0 {
+    enum FrameState<K2, V2> {
+        First,
+        Child { dst: Node<K2, V2>, made: usize, next_i: usize, pending: (K2, V2) },
+    }
+    struct Frame<K, V, K2, V2> {
+        src: Node<K, V>,
+        height: usize,
+        state: FrameState<K2, V2>,
+    }
+    let mut stack = DropGuard::new(
+        FixedVec::<Frame<K, V, K2, V2>, MOST_NODES>::new(),
+        |mut stack| {
+            while let Some(frame) = stack.pop() {
+                if let FrameState::Child { dst, made, .. } = frame.state {
+                    // SAFETY: the node is `alloc`'s, a root, holding `made` entries below it.
+                    drop(unsafe { IntoIter::from_root(Some(dst), frame.height, made, alloc) });
+                }
+            }
+        },
+    );
+    let mut cur_src = src;
+    let mut cur_h = height;
+    loop {
+        while cur_h > 0 {
+            let _ = stack.push(Frame { src: cur_src, height: cur_h, state: FrameState::First });
+            // SAFETY: an internal source has edge 0.
+            cur_src = unsafe { edge_at(cur_src, 0) };
+            cur_h -= 1;
+        }
+        // SAFETY: the source leaf is live.
+        let leaf_n = unsafe { len(cur_src) };
         let leaf = new_node::<K2, V2, B>(0, alloc)?;
-        let mut made = DropGuard::new(0usize, |made| {
+        let mut leaf_made = DropGuard::new(0usize, |made| {
             // SAFETY: the leaf is `alloc`'s, a root, holding `made` entries.
             drop(unsafe { IntoIter::from_root(Some(leaf), 0, made, alloc) })
         });
-        for i in 0..n {
+        for i in 0..leaf_n {
             // SAFETY: entry `i < len` of the source is written.
-            let (key, value) = unsafe { copy(&*key_at(src, i), &*val_at(src, i))? };
+            let (key, value) = unsafe { copy(&*key_at(cur_src, i), &*val_at(cur_src, i))? };
             // SAFETY: slot `i` of the new leaf is free and within it.
             unsafe {
                 key_at(leaf, i).write(key);
                 val_at(leaf, i).write(value);
                 set_len(leaf, i + 1);
             }
-            *made += 1;
+            *leaf_made += 1;
         }
-        return Ok((leaf, DropGuard::dismiss(made)));
-    }
-    // SAFETY: an internal source has edge 0.
-    let (first, first_len) = unsafe { clone_tree(edge_at(src, 0), height - 1, alloc, copy)? };
-    let first_made = DropGuard::new((), |()| {
-        // SAFETY: the copied child is `alloc`'s, a root, holding `first_len` entries.
-        drop(unsafe { IntoIter::from_root(Some(first), height - 1, first_len, alloc) })
-    });
-    let node = new_node::<K2, V2, B>(height, alloc)?;
-    DropGuard::dismiss(first_made);
-    // SAFETY: the node is internal and empty.
-    unsafe { set_edge(node, 0, first) };
-    let mut made = DropGuard::new(first_len, |made| {
-        // SAFETY: the node is `alloc`'s, a root, holding `made` entries below it.
-        drop(unsafe { IntoIter::from_root(Some(node), height, made, alloc) })
-    });
-    for i in 0..n {
-        // SAFETY: entry `i` and edge `i + 1` of the source are written.
-        let (key, value) = unsafe { copy(&*key_at(src, i), &*val_at(src, i))? };
-        // SAFETY: as above.
-        let (child, child_len) = unsafe { clone_tree(edge_at(src, i + 1), height - 1, alloc, copy)? };
-        // SAFETY: slot `i` and edge `i + 1` of the node are free and within it.
-        unsafe {
-            key_at(node, i).write(key);
-            val_at(node, i).write(value);
-            set_len(node, i + 1);
-            set_edge(node, i + 1, child);
+        let mut child = leaf;
+        let mut child_len = DropGuard::dismiss(leaf_made);
+        loop {
+            let Some(frame) = stack.pop() else {
+                DropGuard::dismiss(stack);
+                return Ok((child, child_len));
+            };
+            let (dst, made, next_i) = match frame.state {
+                FrameState::First => {
+                    let first_made = DropGuard::new((), |()| {
+                        // SAFETY: the copied child is `alloc`'s, a root, holding `child_len` entries.
+                        drop(unsafe { IntoIter::from_root(Some(child), frame.height - 1, child_len, alloc) })
+                    });
+                    let node = new_node::<K2, V2, B>(frame.height, alloc)?;
+                    DropGuard::dismiss(first_made);
+                    // SAFETY: the node is internal and empty.
+                    unsafe { set_edge(node, 0, child) };
+                    (node, child_len, 0)
+                }
+                FrameState::Child { dst, made, next_i, pending: (key, value) } => {
+                    // SAFETY: slot `next_i` and edge `next_i + 1` of the node are free and within it.
+                    unsafe {
+                        key_at(dst, next_i).write(key);
+                        val_at(dst, next_i).write(value);
+                        set_len(dst, next_i + 1);
+                        set_edge(dst, next_i + 1, child);
+                    }
+                    (dst, made + 1 + child_len, next_i + 1)
+                }
+            };
+            // SAFETY: the source is live.
+            let n = unsafe { len(frame.src) };
+            if next_i < n {
+                let node_guard = DropGuard::new((), |()| {
+                    // SAFETY: the node is `alloc`'s, a root, holding `made` entries below it.
+                    drop(unsafe { IntoIter::from_root(Some(dst), frame.height, made, alloc) })
+                });
+                // SAFETY: entry `next_i` and edge `next_i + 1` of the source are written.
+                let pending = unsafe { copy(&*key_at(frame.src, next_i), &*val_at(frame.src, next_i))? };
+                DropGuard::dismiss(node_guard);
+                let _ = stack.push(Frame {
+                    src: frame.src,
+                    height: frame.height,
+                    state: FrameState::Child { dst, made, next_i, pending },
+                });
+                // SAFETY: edge `next_i + 1` of the source is written.
+                cur_src = unsafe { edge_at(frame.src, next_i + 1) };
+                cur_h = frame.height - 1;
+                break;
+            }
+            child = dst;
+            child_len = made;
         }
-        *made += 1 + child_len;
     }
-    Ok((node, DropGuard::dismiss(made)))
 }
 
 // ---------------------------------------------------------------------------------------------

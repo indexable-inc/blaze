@@ -402,7 +402,7 @@ impl fmt::Write for Held<'_> {
     }
 }
 
-/// The invariant: a chain through `line_with` and `write_with` puts on the stream exactly what
+/// Invariant: a chain through `line_with` and `write_with` puts on the stream exactly what
 /// `line` and `write` put for the same values through `format_args!`, for lines shorter and
 /// longer than [`HELD`].
 #[cfg(test)]

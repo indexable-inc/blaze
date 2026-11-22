@@ -432,7 +432,9 @@ impl<A: Allocator> Extend<char> for String<A> {
 
 impl<'a, A: Allocator> Extend<&'a char> for String<A> {
     fn extend<I: IntoIterator<Item = &'a char>>(&mut self, iter: I) {
-        self.extend(iter.into_iter().copied());
+        let iter = iter.into_iter();
+        self.reserve(iter.size_hint().0);
+        iter.for_each(|&ch| self.push(ch));
     }
 }
 

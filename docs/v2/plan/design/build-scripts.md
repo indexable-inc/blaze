@@ -829,3 +829,5 @@ by default; bindgen's text holds no paths. Proven by a two-run byte compare once
   record as `<name>@<version>@<side>.outputs`; `blaze-world` `names <ws> <fetch store>
   --scripts <dir>` reads them. `outline <package>` lowers the served crate's root through
   `ScriptCx` with a control.
+- **Fact shim:** `BLAZE_FACT_SHIM_RUN` names the run's facts folder passed into a build script's environment (inherited by children) by `crates/blaze-build-script/src/fact_shim.rs`.
+

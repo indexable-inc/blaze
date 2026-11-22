@@ -11,12 +11,12 @@ LLVM) over the code generator that exists.
 
 ## The unit is one function instance
 
-A build ([`driver`](../../../../crates/blaze-codegen/src/driver.rs)) starts from its roots (a `main`,
+A build (`driver`) starts from its roots (a `main`,
 the tests, a library's exported functions) and walks what each instance refers to. Nothing is
 grouped by crate: every instance is one task on all cores, and a crate's size never makes a
 tail.
 
-For each instance the front end ([`Frontend::describe`](../../../../crates/blaze-codegen/src/backend.rs))
+For each instance the front end (`Frontend::describe`)
 says, without compiling it: its item, its code hash, the content ID of its type arguments'
 facts, whose code it is (`plan::Origin`), and everything it refers to in the order of its MIR
 (`Described::refs`). The build's policy (`plan::Policy::choose`) gives it a backend and its
@@ -30,7 +30,7 @@ code hash. The caller's key takes the callee by its interface hash. So a callee'
 changes the callee's key and not the caller's: anything kept under the caller's key that named
 the callee would be stale.
 
-So the store and the memo hold a [`Template`](../../../../crates/blaze-codegen/src/template.rs): the
+So the store and the memo hold a `Template`: the
 function with each function, static and outside symbol it refers to by its place in
 `Described::refs`, and each of its own data objects by its place among its data. A build
 instantiates the template with the keys this build gives the places. A callee edit renames
@@ -112,7 +112,7 @@ folded count, rounds and bytes saved. See
 On Cranelift units, when `Spec::fold`: shapes with their constants masked are grouped; a group
 whose members differ in at most 16 constants and saves more than the thunks cost becomes one
 body that takes the differing constants as parameters, and each member a thunk that calls it.
-Off by default for LLVM's levels. See [`fold`](../../../../crates/blaze-codegen/src/fold.rs).
+Off by default for LLVM's levels. See `fold`.
 
 ## Settings and the plan (#635, #807, #1404)
 
@@ -478,5 +478,5 @@ The design (2026-11-16, built in blaze-build src/closure.rs, a child module of w
 
 ## Queries
 
-The codegen query kinds are in [`query`](../../../../crates/blaze-codegen/src/query.rs), in
+The codegen query kinds are in `query`, in
 `blaze_query::kinds::BACK`.

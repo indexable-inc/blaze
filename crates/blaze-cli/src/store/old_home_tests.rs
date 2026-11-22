@@ -57,7 +57,7 @@ fn the_old_home_is_reported_by_name_once_and_never_touched() {
     write(&io, "one/Cargo.toml");
     assert_eq!(command(&io, 1), 3, "the first command's look");
     let said = stderr(&io);
-    for name in ["the home's .blaze/v2/own", "the checkout's .blaze/v2/packs", "the checkout's .blaze/v2/at"] {
+    for name in ["~/.blaze/v2/own", ".blaze/v2/packs", ".blaze/v2/at"] {
         assert!(said.contains(name), "{name} not said by name: {said}");
     }
     assert!(!said.contains("v2/shared"), "a folder not there was said: {said}");

@@ -1,4 +1,7 @@
 {
- "crates/blaze-build-script/src/elide/tests.rs": 1,
- "crates/blaze-cargo/src/answers/own.rs": 2
+ "crates/blaze-proc-macro/src/comptime_patch.rs": 1,
+ "crates/blaze-proc-macro/src/native_bridge.rs": 2,
+ "crates/blaze-proc-macro/src/native_script.rs": 1,
+ "crates/blaze-std/build.rs": 1,
+ "crates/blaze-std/tests/refusals.rs": 1
 }

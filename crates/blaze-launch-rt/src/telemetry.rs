@@ -874,6 +874,7 @@ mod tests {
         Ok((rec, stats.dropped))
     }
 
+    /// The invariant: the lock-free MPSC telemetry ring delivers whole events without tearing or out-of-turn reads and accounts for every dropped event exactly.
     #[test]
     fn mpsc_ring_delivers_whole_events_with_exact_drop_accounting() {
         let (received, dropped) = run_mpsc(RingPlant::None).expect("clean ring must pass");

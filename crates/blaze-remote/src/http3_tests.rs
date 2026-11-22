@@ -394,7 +394,7 @@ fn a_signed_request_is_never_sent_over_http3() {
     assert!(bucket.wire().served.is_empty(), "nothing reached the server");
 }
 
-/// The invariant: a tickets file decodes to the tickets encoded, at most [`TICKETS_KEPT`] of
+/// Invariant: a tickets file decodes to the tickets encoded, at most [`TICKETS_KEPT`] of
 /// them, without those past their age; a file of another layout, cut short, or with bytes
 /// past its last ticket is refused, naming the file.
 #[test]

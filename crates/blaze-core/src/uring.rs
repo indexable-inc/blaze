@@ -4808,7 +4808,7 @@ mod tests {
     /// sync kept read-only (`Kept::read_only`) is let go by the append after it, which writes
     /// through a descriptor of its own.
     #[test]
-    fn a_sync_of_a_sealed_file_succeeds_on_each_driver() {
+    fn a_sync_of_a_sealed_file_succeeds_on_uring_driver() {
         let root = dir("uring-sync-sealed");
         std::fs::create_dir_all(&root).unwrap();
         let mut driver = Uring::new(&root).unwrap();

@@ -356,3 +356,9 @@ Where the rebuilt pipeline stands, each line from a run on tempo in this session
   proc-macro/modules/<key>/`, the home the passed value main.rs reads at the edge: a module is
   keyed by its crate's identity alone, the same for every project. The bootstrap tool's `store`
   input names that folder (`<home>/.blaze/v2`).
+
+### Environment variables
+
+- `BLAZE_NO_COMPTIME_PATCH`: when set, disables the built-in comptime patch library (`serde_derive`, `bytemuck_derive`, `thiserror-impl`, `derive_more`, `strum_macros`, `paste`) in `crates/blaze-proc-macro/src/hook.rs`.
+- `BLAZE_PROC_MACRO_SRV`: explicit path to `rust-analyzer-proc-macro-srv` used by `crates/blaze-proc-macro/src/native_bridge.rs` before falling back to `rustc --print sysroot`.
+

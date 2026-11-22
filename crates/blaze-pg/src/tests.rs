@@ -496,7 +496,7 @@ fn base64_is_the_crate_s() {
 // ---------------------------------------------------------------------------------------------
 // The codecs.
 
-/// The refinement: decoding what `encode` wrote gives the value back, for every storage.
+/// Refinement: decoding what `encode` wrote gives the value back, for every storage.
 #[test]
 fn a_value_round_trips() {
     blaze_sim::check(blaze_sim::Config::cases(100), |tape| {
@@ -511,7 +511,7 @@ fn a_value_round_trips() {
     });
 }
 
-/// The refinement: decoding what `encode_array` wrote gives the elements back, nulls included.
+/// Refinement: decoding what `encode_array` wrote gives the elements back, nulls included.
 #[test]
 fn an_array_round_trips() {
     blaze_sim::check(blaze_sim::Config::cases(100), |tape| {

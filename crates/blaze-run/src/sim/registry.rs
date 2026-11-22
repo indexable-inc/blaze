@@ -102,6 +102,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The invariant: reading the run registry never lists a dead process's run even under PID reuse.
 #[test]
 fn a_read_never_lists_a_dead_run() {
     check(Config::cases(500), |tape| run(tape, Plant::None));

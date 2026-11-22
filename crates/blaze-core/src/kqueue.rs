@@ -3418,7 +3418,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// The invariant: a sync and a barrier of a file sealed read-only succeed through this
+    /// Invariant: a sync and a barrier of a file sealed read-only succeed through this
     /// driver and the threads driver, and of a missing file make it
     /// ([`crate::fs::assert_syncs_a_sealed_file`], with its control).
     #[test]

@@ -251,17 +251,34 @@ fn fit_path(out: &mut dyn fmt::Write, path: &str, cut: bool, room: usize, ellips
 /// when fewer than 8 columns are left for it), then the counts, then the time, then the word's
 /// end.
 fn status_text(line: &StatusLine<'_>, terminal: &Terminal, out: &mut dyn fmt::Write) -> fmt::Result {
+    const SPINNER: [&str; 10] = ["⠋ ", "⠙ ", "⠹ ", "⠸ ", "⠼ ", "⠴ ", "⠦ ", "⠧ ", "⠇ ", "⠏ "];
     let budget = usize::from(line.cols).saturating_sub(1);
-    let (glyph, sep, ellipsis) = match line.unicode {
-        true => ("▶ ", " · ", "…"),
-        false => ("> ", " - ", "..."),
+    let (glyph, sep, ellipsis) = match (line.unicode, line.progress.is_some()) {
+        (true, true) => {
+            let idx = usize::try_from((line.elapsed_ms / 80) % 10).unwrap_or(0);
+            (*SPINNER.get(idx).unwrap_or(&"▶ "), " · ", "…")
+        }
+        (true, false) => ("▶ ", " · ", "…"),
+        (false, _) => ("> ", " - ", "..."),
     };
     let mut counts = LineBuf::<48>::new();
-    match (line.made, line.found) {
-        (0, 0) => {}
-        (made, 0) => write!(counts, "{made} made")?,
-        (0, found) => write!(counts, "{found} found")?,
-        (made, found) => write!(counts, "{made} made, {found} found")?,
+    match line.progress {
+        Some((done, total)) if total > 0 => {
+            let clamped = done.min(total);
+            let filled = usize::try_from(u64::from(clamped).saturating_mul(12) / u64::from(total)).unwrap_or(0).min(12);
+            let (full, empty) = if line.unicode { ('█', '░') } else { ('#', '.') };
+            counts.write_char('[')?;
+            for i in 0..12 {
+                counts.write_char(if i < filled { full } else { empty })?;
+            }
+            write!(counts, "] {clamped}/{total}")?;
+        }
+        _ => match (line.made, line.found) {
+            (0, 0) => {}
+            (made, 0) => write!(counts, "{made} made")?,
+            (0, found) => write!(counts, "{found} found")?,
+            (made, found) => write!(counts, "{made} made, {found} found")?,
+        },
     }
     let mut time = LineBuf::<24>::new();
     let ms = line.elapsed_ms;
@@ -278,7 +295,7 @@ fn status_text(line: &StatusLine<'_>, terminal: &Terminal, out: &mut dyn fmt::Wr
     let time_w = sep_w + time.as_str().len();
     let counts_w = match counts.as_str() {
         "" => 0,
-        text => sep_w + text.len(),
+        text => sep_w + columns(text),
     };
     let show_time = head + time_w <= budget;
     let show_counts = counts_w > 0 && head + counts_w + if show_time { time_w } else { 0 } <= budget;

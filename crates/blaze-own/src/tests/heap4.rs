@@ -82,6 +82,7 @@ fn heap_case(tape: &Tape, plant: impl Planted<Heap4Plant>) -> Result<(), Broken<
     counted.check().map_err(|_| Broken::Oracle(HeapBroken::Leaked))
 }
 
+/// The refinement: `Heap4` matches a sorted `Vec` under random operations and frees every allocation through the counting allocator.
 #[test]
 fn heap4_matches_a_sorted_vec() {
     blaze_sim::check(cases(300), |tape: &Tape| {

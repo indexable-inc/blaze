@@ -382,8 +382,9 @@ pub(crate) fn transcribe<'f, B: Copying>(
                             }
                         }
                     }
+                    let frame = *scratch.stack.allocator();
                     if !ended
-                        && let Err(error) = integer(scratch, out, count(bindings, binding, 0, depth))
+                        && let Err(error) = integer(scratch, out, count(bindings, binding, 0, depth, frame))
                     {
                         return Ok(Err(error));
                     }
@@ -554,15 +555,36 @@ fn integer(scratch: &mut Scratch<'_>, out: &mut Out<'_, '_>, value: u32) -> Resu
 }
 
 /// `${count(..)}` of a binding at `depth`.
-fn count<B: Values>(bindings: &B, binding: B::Node, depth: u32, max: u32) -> u32 {
+fn count<B: Values>(bindings: &B, binding: B::Node, depth: u32, max: u32, frame: &Frame) -> u32 {
+    let mut stack: Vec<(B::Node, u32, u32, u32), &Frame> = Vec::new_in(frame);
+    let mut total = 0u32;
     match bindings.kind(binding) {
         NodeKind::Nested(len) => match depth == max {
-            true => len,
-            false => (0..len).map(|idx| count(bindings, bindings.child(binding, idx), depth + 1, max)).sum(),
+            true => return len,
+            false => stack.push((binding, depth, 0, len)),
         },
-        NodeKind::Empty => 0,
-        NodeKind::Fragment(_) | NodeKind::Missing(_) => 1,
+        NodeKind::Empty => return 0,
+        NodeKind::Fragment(_) | NodeKind::Missing(_) => return 1,
     }
+    while let Some((node, d, idx, len)) = stack.last_mut() {
+        if *idx >= *len {
+            stack.pop();
+            continue;
+        }
+        let cur = *idx;
+        *idx = cur + 1;
+        let child = bindings.child(*node, cur);
+        let next_d = *d + 1;
+        match bindings.kind(child) {
+            NodeKind::Nested(n) => match next_d == max {
+                true => total += n,
+                false => stack.push((child, next_d, 0, n)),
+            },
+            NodeKind::Empty => {}
+            NodeKind::Fragment(_) | NodeKind::Missing(_) => total += 1,
+        }
+    }
+    total
 }
 
 /// A metavariable's value at the repetitions' current iterations.

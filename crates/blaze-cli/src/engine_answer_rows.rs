@@ -900,6 +900,7 @@ mod dictionary_tests {
         Ok(())
     }
 
+    /// The invariant: rows-answer bytes are independent of worker completion arrival order.
     #[test]
     fn worker_order_preserves_answer_bytes() {
         blaze_sim::check(Config::cases(24), |tape| same_writes(tape, false));

@@ -61,6 +61,7 @@ fn table_case(tape: &Tape) -> Result<(), Broke> {
     no_leaks(&alloc)
 }
 
+/// The refinement: `Table`, `TableSet`, and `TableMap` match `Vec`, `BTreeSet`, and `BTreeMap` under any sequence of operations and reject out-of-bounds indices.
 #[test]
 fn table_matches_a_vec() {
     blaze_sim::check(Config::cases(300), table_case);

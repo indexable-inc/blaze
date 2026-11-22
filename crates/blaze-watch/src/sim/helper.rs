@@ -618,6 +618,7 @@ fn drive(tape: &Tape, sim: &mut Sim<'_>) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The invariant: every command learns every change since its saved place (via the helper or journal replay) respecting flush cookies, event-id barriers, binary changes, queue caps, and deadlines.
 #[test]
 fn every_command_is_told_every_change_since_its_place_by_the_helper_or_its_own_replay() {
     let lap = Lap::new("helper: every command told every change");

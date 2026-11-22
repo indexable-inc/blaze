@@ -177,5 +177,5 @@ diagnostic does not carry its item yet; when the front end says it, the id chang
 
 The formats each agent's hooks read and write, with the documentation they rest on, are in
 `plugins/claude/FORMAT-NOTES.md` and `plugins/codex/FORMAT-NOTES.md`. The hook's decisions are
-sans-IO (`crates/blaze-cargo/src/cli/agents/decide.rs`) and tested on fixtures of both agents'
+sans-IO and tested on fixtures of both agents'
 inputs.

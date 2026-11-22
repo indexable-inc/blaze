@@ -229,7 +229,7 @@ pub(crate) fn solve_body_in<'a, F: ScopeFacts<Name = &'a str>>(
     for &k in keys.iter() {
         let Some((scope, unknown)) = c.scope(&ix, k, alloc) else { continue };
         if unknown > 0 {
-            return Err(Unwritten::Unknown { module: k, count: unknown });
+            return Err(Unwritten::Unknown { module: k, count: unknown, why: c.first_unknown(&ix, k) });
         }
         out.push((k, scope));
     }

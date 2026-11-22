@@ -458,38 +458,63 @@ impl<'p, 'd, 'a> Walk<'p, 'd, 'a> {
     }
 
     fn atoms_into(&self, from: u32, to: u32, depth: usize, out: &mut MacroWrites<'d, 'a>, atoms: &mut AVec<'a, Atom>) {
-        if depth > MOST_WALK_DEPTH {
-            out.set_any(AnyWhy::Depth);
-            return;
-        }
-        let mut at = from as usize;
-        while at < to as usize {
-            match self.p.ops[at] {
-                Op::Tok(tok) => atoms.push(match self.d.kind(tok) {
-                    TokenKind::Ident { raw, .. } => Atom::Word { tok, raw: raw == Raw::Yes },
-                    _ => Atom::Lit,
-                }),
-                Op::Crate(_) => atoms.push(Atom::Crate),
-                Op::Puncts { at: tok, len } => atoms.push(Atom::Punct { ch: self.d.char(tok), len }),
-                Op::Var { binder, .. } => atoms.push(Atom::Var { binder }),
+        let mut stack: AVec<'a, (usize, usize, usize)> = AVec::new_in(self.alloc);
+        stack.push((from as usize, to as usize, depth));
+        while let Some((at, to, d)) = stack.last_mut() {
+            if *d > MOST_WALK_DEPTH {
+                out.set_any(AnyWhy::Depth);
+                stack.pop();
+                continue;
+            }
+            if *at >= *to {
+                stack.pop();
+                continue;
+            }
+            let cur = *at;
+            match self.p.ops[cur] {
+                Op::Tok(tok) => {
+                    atoms.push(match self.d.kind(tok) {
+                        TokenKind::Ident { raw, .. } => Atom::Word { tok, raw: raw == Raw::Yes },
+                        _ => Atom::Lit,
+                    });
+                    *at = cur + 1;
+                }
+                Op::Crate(_) => {
+                    atoms.push(Atom::Crate);
+                    *at = cur + 1;
+                }
+                Op::Puncts { at: tok, len } => {
+                    atoms.push(Atom::Punct { ch: self.d.char(tok), len });
+                    *at = cur + 1;
+                }
+                Op::Var { binder, .. } => {
+                    atoms.push(Atom::Var { binder });
+                    *at = cur + 1;
+                }
                 Op::Group { delim, end, .. } => {
-                    atoms.push(Atom::Group { delim, from: (at + 1) as u32, to: end });
-                    at = end as usize;
-                    continue;
+                    atoms.push(Atom::Group { delim, from: (cur + 1) as u32, to: end });
+                    *at = end as usize;
                 }
                 Op::Repeat { end, sep, .. } => {
                     if sep != NONE && matches!(self.p.seps.get(sep as usize), Some(Sep::Ident(_) | Sep::Literal(_))) {
                         out.set_any(AnyWhy::Separator);
                     }
-                    self.atoms_into((at + 1) as u32, end, depth + 1, out, atoms);
-                    at = end as usize;
-                    continue;
+                    let next_d = *d + 1;
+                    *at = end as usize;
+                    stack.push((cur + 1, end as usize, next_d));
                 }
-                Op::Ignore { .. } => {}
-                Op::Index { .. } | Op::Len { .. } | Op::Count { .. } => atoms.push(Atom::Lit),
-                Op::Concat { .. } => atoms.push(Atom::Made),
+                Op::Ignore { .. } => {
+                    *at = cur + 1;
+                }
+                Op::Index { .. } | Op::Len { .. } | Op::Count { .. } => {
+                    atoms.push(Atom::Lit);
+                    *at = cur + 1;
+                }
+                Op::Concat { .. } => {
+                    atoms.push(Atom::Made);
+                    *at = cur + 1;
+                }
             }
-            at += 1;
         }
     }
 
@@ -783,57 +808,88 @@ impl<'p, 'd, 'a> Walk<'p, 'd, 'a> {
 
     /// One attribute's inside.
     fn attr(&self, atoms: &[Atom], depth: usize, flags: &mut AttrFlags, out: &mut MacroWrites<'d, 'a>) {
-        let first = match atoms.first() {
-            Some(Atom::Var { .. } | Atom::Made) => return out.set_any(AnyWhy::AttrFromInput),
-            Some(Atom::Word { tok, .. }) => self.d.text(*tok),
-            _ => return,
-        };
-        if matches!(atoms.get(1), Some(Atom::Punct { ch: ':', len: 2 })) {
-            if !TOOLS.contains(&first) {
-                out.set_any(AnyWhy::AttrMacro);
+        let mut groups: AVec<'a, AVec<'a, Atom>> = AVec::new_in(self.alloc);
+        let mut stack: AVec<'a, (Option<usize>, usize, usize, usize)> = AVec::new_in(self.alloc);
+        stack.push((None, 0, atoms.len(), depth));
+        while let Some((src, start, end, depth)) = stack.pop() {
+            let cur = match src {
+                None => atoms.get(start..end).unwrap_or(&[]),
+                Some(idx) => groups.get(idx).and_then(|g| g.get(start..end)).unwrap_or(&[]),
+            };
+            let first = match cur.first() {
+                Some(Atom::Var { .. } | Atom::Made) => {
+                    out.set_any(AnyWhy::AttrFromInput);
+                    continue;
+                }
+                Some(Atom::Word { tok, .. }) => self.d.text(*tok),
+                _ => continue,
+            };
+            if matches!(cur.get(1), Some(Atom::Punct { ch: ':', len: 2 })) {
+                if !TOOLS.contains(&first) {
+                    out.set_any(AnyWhy::AttrMacro);
+                }
+                continue;
             }
-            return;
-        }
-        let group = match atoms.get(1) {
-            Some(Atom::Group { from, to, .. }) => Some(self.atoms(*from, *to, depth + 1, out)),
-            _ => None,
-        };
-        match first {
-            "macro_export" => flags.exported = true,
-            "macro_use" => flags.macro_use = true,
-            "derive" | "derive_const" => {
-                // astlog-ignore: expand-hand-extent (a derive's paths in a transcriber's atoms; a derive path holds no `,`)
-                for part in group.as_deref().unwrap_or(&[]).split(|a| matches!(a, Atom::Punct { ch: ',', .. })) {
-                    if part.iter().any(|a| matches!(a, Atom::Var { .. } | Atom::Made)) {
-                        out.set_any(AnyWhy::AttrFromInput);
-                    } else if let Some(last) = part.iter().rev().find_map(|a| self.word(Some(a)))
-                        && !BuiltinDerive::ALL.iter().any(|d| d.name() == last)
-                    {
-                        out.set_any(AnyWhy::Derive);
+            let group = match cur.get(1) {
+                Some(Atom::Group { from, to, .. }) => Some(self.atoms(*from, *to, depth + 1, out)),
+                _ => None,
+            };
+            match first {
+                "macro_export" => flags.exported = true,
+                "macro_use" => flags.macro_use = true,
+                "derive" | "derive_const" => {
+                    // astlog-ignore: expand-hand-extent (a derive's paths in a transcriber's atoms; a derive path holds no `,`)
+                    for part in group.as_deref().unwrap_or(&[]).split(|a| matches!(a, Atom::Punct { ch: ',', .. })) {
+                        if part.iter().any(|a| matches!(a, Atom::Var { .. } | Atom::Made)) {
+                            out.set_any(AnyWhy::AttrFromInput);
+                        } else if let Some(last) = part.iter().rev().find_map(|a| self.word(Some(a)))
+                            && !BuiltinDerive::ALL.iter().any(|d| d.name() == last)
+                        {
+                            out.set_any(AnyWhy::Derive);
+                        }
                     }
                 }
-            }
-            "cfg_attr" => {
-                let inner = group.as_deref().unwrap_or(&[]);
-                // astlog-ignore: expand-hand-extent (LEFT: cfg_attr's metas in a transcriber's atoms, `$x` among them, by commas; over-approximates names demand, D158)
-                for part in inner.split(|a| matches!(a, Atom::Punct { ch: ',', .. })).skip(1) {
-                    if !part.is_empty() {
-                        self.attr(part, depth + 1, flags, out);
+                "cfg_attr" => {
+                    if let Some(g) = group {
+                        let idx = groups.len();
+                        let mut ranges: AVec<'a, (usize, usize)> = AVec::new_in(self.alloc);
+                        let mut part_start = 0usize;
+                        let mut skipped_first = false;
+                        // astlog-ignore: expand-hand-extent (LEFT: cfg_attr's metas in a transcriber's atoms, `$x` among them, by commas; over-approximates names demand, D158)
+                        for (i, a) in g.iter().enumerate() {
+                            if matches!(a, Atom::Punct { ch: ',', .. }) {
+                                if skipped_first && part_start < i {
+                                    ranges.push((part_start, i));
+                                }
+                                skipped_first = true;
+                                part_start = i + 1;
+                            }
+                        }
+                        if skipped_first && part_start < g.len() {
+                            ranges.push((part_start, g.len()));
+                        }
+                        groups.push(g);
+                        for &(s, e) in ranges.iter().rev() {
+                            stack.push((Some(idx), s, e, depth + 1));
+                        }
                     }
                 }
-            }
-            "unsafe" => {
-                if let Some(inner) = group.as_deref() {
-                    self.attr(inner, depth + 1, flags, out);
+                "unsafe" => {
+                    if let Some(g) = group {
+                        let idx = groups.len();
+                        let len = g.len();
+                        groups.push(g);
+                        stack.push((Some(idx), 0, len, depth + 1));
+                    }
                 }
-            }
-            "global_allocator" => {
-                for name in ALLOCATOR_SYMBOLS {
-                    out.names.push(Written { name, ns: WrittenNs::VALUE, by: By::Builtin, exported: false });
+                "global_allocator" => {
+                    for name in ALLOCATOR_SYMBOLS {
+                        out.names.push(Written { name, ns: WrittenNs::VALUE, by: By::Builtin, exported: false });
+                    }
                 }
+                name if INERT.contains(&name) || name.starts_with("rustc_") => {}
+                _ => out.set_any(AnyWhy::AttrMacro),
             }
-            name if INERT.contains(&name) || name.starts_with("rustc_") => {}
-            _ => out.set_any(AnyWhy::AttrMacro),
         }
     }
 
@@ -884,18 +940,35 @@ impl<'p, 'd, 'a> Walk<'p, 'd, 'a> {
 
     /// A `use` tree (no `use`, no `;`); `parent`: the segment before its braces.
     fn use_tree(&self, atoms: &[Atom], parent: Option<Seg<'d>>, depth: usize, out: &mut MacroWrites<'d, 'a>) {
-        if depth > MOST_WALK_DEPTH {
-            return out.set_any(AnyWhy::Depth);
+        struct Frame<'d, 'a> {
+            owned: Option<AVec<'a, Atom>>,
+            at: usize,
+            last: Option<Seg<'d>>,
+            parent: Option<Seg<'d>>,
+            depth: usize,
         }
-        let mut last: Option<Seg<'d>> = None;
-        let mut at = 0;
-        while let Some(atom) = atoms.get(at) {
-            match *atom {
+        let mut stack: AVec<'a, Frame<'d, 'a>> = AVec::new_in(self.alloc);
+        stack.push(Frame { owned: None, at: 0, last: None, parent, depth });
+        while let Some(top) = stack.last_mut() {
+            if top.depth > MOST_WALK_DEPTH {
+                out.set_any(AnyWhy::Depth);
+                stack.pop();
+                continue;
+            }
+            let slice = top.owned.as_deref().unwrap_or(atoms);
+            let Some(&atom) = slice.get(top.at) else {
+                let last = top.last;
+                let parent = top.parent;
+                stack.pop();
+                self.bind(last, parent, out);
+                continue;
+            };
+            top.at += 1;
+            match atom {
                 Atom::Word { tok, raw } => {
                     let text = self.d.text(tok);
                     if !raw && text == "as" {
-                        at += 1;
-                        match atoms.get(at) {
+                        match slice.get(top.at) {
                             Some(Atom::Word { tok, .. }) if self.d.text(*tok) != "_" => {
                                 out.names.push(Written { name: self.d.text(*tok), ns: WrittenNs::ALL, by: By::Use, exported: false });
                             }
@@ -903,18 +976,19 @@ impl<'p, 'd, 'a> Walk<'p, 'd, 'a> {
                             Some(Atom::Made) => out.set_any(AnyWhy::Concat),
                             _ => {}
                         }
-                        last = None;
+                        top.at += 1;
+                        top.last = None;
                     } else {
-                        last = Some(match text {
+                        top.last = Some(match text {
                             "self" if !raw => Seg::SelfKw,
                             "crate" | "super" if !raw => Seg::Kw,
                             _ => Seg::Lit(text),
                         });
                     }
                 }
-                Atom::Crate => last = Some(Seg::Kw),
+                Atom::Crate => top.last = Some(Seg::Kw),
                 Atom::Var { binder } => match self.frag(binder) {
-                    Ok(Some(Frag::Ident | Frag::Path)) => last = Some(Seg::Input),
+                    Ok(Some(Frag::Ident | Frag::Path)) => top.last = Some(Seg::Input),
                     Ok(_) => out.set_any(AnyWhy::UseFromInput),
                     Err(()) => out.set_any(AnyWhy::UnknownVar),
                 },
@@ -922,17 +996,17 @@ impl<'p, 'd, 'a> Walk<'p, 'd, 'a> {
                 Atom::Punct { ch: '*', .. } => out.set_any(AnyWhy::Glob),
                 // astlog-ignore: expand-hand-extent (a `use` tree's separator in a transcriber's atoms; a use path holds no generics)
                 Atom::Punct { ch: ',', .. } => {
-                    self.bind(last.take(), parent, out);
+                    self.bind(top.last.take(), top.parent, out);
                 }
                 Atom::Group { delim: Delim::Brace, from, to } => {
-                    let inner = self.atoms(from, to, depth + 1, out);
-                    self.use_tree(&inner, last.take(), depth + 1, out);
+                    let child_depth = top.depth + 1;
+                    let child_parent = top.last.take();
+                    let inner = self.atoms(from, to, child_depth, out);
+                    stack.push(Frame { owned: Some(inner), at: 0, last: None, parent: child_parent, depth: child_depth });
                 }
                 _ => {}
             }
-            at += 1;
         }
-        self.bind(last, parent, out);
     }
 
     fn bind(&self, seg: Option<Seg<'d>>, parent: Option<Seg<'d>>, out: &mut MacroWrites<'d, 'a>) {

@@ -198,7 +198,7 @@ fn oracle(what: &str) -> Broke {
     Broke::Oracle(what.into())
 }
 
-/// The refinement: every value of a drawn file reads back as written, and each entry's
+/// Refinement: every value of a drawn file reads back as written, and each entry's
 /// children are exactly the entries whose parent it is.
 #[test]
 fn file_items_read_back_every_value() {

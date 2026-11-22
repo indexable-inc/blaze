@@ -95,6 +95,9 @@ pub enum Step<'a> {
     Waits,
     /// The answer is about to be sent: the program may write again once it reads it.
     Answers,
+    /// A check/build stage making live progress (`done` of `total` tasks), with an optional
+    /// active item label (`detail`, e.g. crate or file path).
+    Progress { stage: &'static str, done: u32, total: u32, detail: Option<&'a str> },
     /// The command is about to write a line of its own: nothing live until the next event.
     Says,
 }
@@ -136,6 +139,8 @@ pub struct StatusLine<'a> {
     /// Functions found in the store and made (built now, keyed or not), so far.
     pub found: u32,
     pub made: u32,
+    /// Stage progress `(done, total)` when reporting check/build stage progress.
+    pub progress: Option<(u32, u32)>,
     /// The time since the command began, by the injected clock.
     pub elapsed_ms: u64,
     pub cols: u16,
@@ -166,6 +171,8 @@ pub struct RunStatus {
     caps: Caps,
     now: u64,
     stage: Option<Stage>,
+    /// Live stage progress verb and `(done, total)` counts when inside a checking/building phase.
+    progress: Option<(&'static str, u32, u32)>,
     /// A function is being answered (since the last stage began).
     item: bool,
     path: [u8; PATH_BYTES],
@@ -196,6 +203,7 @@ impl RunStatus {
             caps: opts.caps,
             now: 0,
             stage: None,
+            progress: None,
             item: false,
             path: [0; PATH_BYTES],
             path_len: 0,
@@ -234,22 +242,30 @@ impl RunStatus {
         match step {
             Step::Began(stage) => {
                 self.stage = Some(stage);
+                self.progress = None;
                 self.item = false;
                 self.path_len = 0;
             }
             Step::Placed { rows } => self.found = self.found.saturating_add(rows),
             Step::Resolving { path } => {
+                self.progress = None;
                 self.item = true;
                 self.keep_path(path.unwrap_or(""));
             }
             Step::Answered(Answered::Found) => self.found = self.found.saturating_add(1),
             Step::Answered(Answered::Made | Answered::Unkeyed) => self.made = self.made.saturating_add(1),
             Step::Started => {
+                self.progress = None;
                 self.started = true;
                 self.waiting_since = None;
             }
             Step::Waits => self.waiting_since = Some(self.now),
             Step::Answers => self.waiting_since = None,
+            Step::Progress { stage, done, total, detail } => {
+                self.progress = Some((stage, done, total));
+                self.item = false;
+                self.keep_path(detail.unwrap_or(""));
+            }
             Step::Says => self.held = true,
         }
     }
@@ -303,13 +319,15 @@ impl RunStatus {
 
     /// The line as it would be drawn now.
     pub fn line(&self) -> StatusLine<'_> {
-        let path = core::str::from_utf8(&self.path[..self.path_len]).ok().filter(|path| self.item && !path.is_empty());
-        let word = match (self.item, self.stage) {
-            (true, _) => "compiling",
-            (false, Some(stage)) => stage.word(),
-            (false, None) => "starting",
+        let has_path = self.item || self.progress.is_some();
+        let path = core::str::from_utf8(&self.path[..self.path_len]).ok().filter(|path| has_path && !path.is_empty());
+        let (word, progress) = match (self.item, self.progress, self.stage) {
+            (true, _, _) => ("compiling", None),
+            (false, Some((stage, done, total)), _) => (stage, Some((done, total))),
+            (false, None, Some(stage)) => (stage.word(), None),
+            (false, None, None) => ("starting", None),
         };
-        StatusLine { word, path, cut: self.path_cut, found: self.found, made: self.made, elapsed_ms: self.now, cols: self.caps.cols, unicode: self.caps.unicode }
+        StatusLine { word, path, cut: self.path_cut, found: self.found, made: self.made, progress, elapsed_ms: self.now, cols: self.caps.cols, unicode: self.caps.unicode }
     }
 
     /// When [`RunStatus::frame`] may next have something with no event in between: `None`

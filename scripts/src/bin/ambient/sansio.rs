@@ -708,7 +708,10 @@ fn parse_allowed(text: &str) -> Result<AllowedStatics, SansError> {
     let mut out = AllowedStatics::new();
     // Bounded: one turn per token.
     for (at, tok) in toks.iter().enumerate() {
-        if tok.word() != Some("AllowedStatic") || kind_at(&toks, at + 1) != Some(TokenKind::OpenBrace) {
+        if tok.word() != Some("AllowedStatic")
+            || kind_at(&toks, at + 1) != Some(TokenKind::OpenBrace)
+            || (at >= 1 && word_at(&toks, at - 1) == Some("struct"))
+        {
             continue;
         }
         let Some(close) = matching(&toks, at + 1) else {
@@ -1870,7 +1873,7 @@ pub(super) fn selftest() {
     let elsewhere = scan_tokens("static HELD: AtomicBool = AtomicBool::new(false);\n", false, false);
     expect(shipped(&elsewhere) == vec![(1, What::Static)], "a row's name in another crate is a site");
     let local = "std::thread_local! {\n    static LOCAL: Local = const { Local::new() };\n}\n";
-    expect(shipped(&scan_tokens_in(local, false, false, &mem_rows)).is_empty(), "an allowed thread-local is no site");
+    expect(shipped(&scan_tokens_in(local, false, false, &mem_rows)) == vec![(1, What::Std)], "an allowed thread-local is no static site");
     let mixed = "thread_local! {\n    static LOCAL: Cell<u8> = Cell::new(0);\n    static MORE: Cell<u8> = Cell::new(0);\n}\n";
     expect(
         shipped(&scan_tokens_in(mixed, false, false, &mem_rows)) == vec![(1, What::Static), (3, What::Static)],

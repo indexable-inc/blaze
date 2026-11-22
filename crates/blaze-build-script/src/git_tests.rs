@@ -26,7 +26,17 @@ impl Mem {
         self.files.insert(path.to_string(), (bytes.to_vec(), mtime));
     }
     fn ino(&self, rel: &str) -> u64 {
-        self.files.keys().position(|k| k == rel).map_or(0, |at| at as u64 + 1)
+        if !self.files.contains_key(rel) {
+            return 0;
+        }
+        // Stable per-path inode (a real filesystem does not renumber unrelated files when another
+        // file is created or deleted).
+        let mut h: u32 = 2166136261;
+        for &b in rel.as_bytes() {
+            h ^= u32::from(b);
+            h = h.wrapping_mul(16777619);
+        }
+        u64::from(h.max(1))
     }
 }
 

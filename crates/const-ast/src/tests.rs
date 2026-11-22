@@ -810,7 +810,7 @@ fn same_tree(built: &Rebuilt, arrays: &Arrays, at: usize) -> Result<(), String> 
 /// from, for every item of every file of the corpus `the_views_are_syntax_asts` walks: the
 /// builder can write every tree the parser makes, and sizes are relative, so an item rebuilt
 /// alone is the same run of elements it is inside its file. The control is
-/// `the_rebuild_check_catches_a_size_off_by_one`.
+/// `the_oracle_catches_a_size_off_by_one`.
 #[test]
 fn every_item_rebuilt_is_the_parsers() {
     let mut items = 0usize;
@@ -844,7 +844,7 @@ fn every_item_rebuilt_is_the_parsers() {
 /// The planted bug for `every_item_rebuilt_is_the_parsers`: a rebuilt tree with one size one
 /// too big is not the parser's, and the compare names that element.
 #[test]
-fn the_rebuild_check_catches_a_size_off_by_one() {
+fn the_oracle_catches_a_size_off_by_one() {
     let text = "pub struct A<T> { x: T, y: [u8; 4] }";
     let arrays = Arrays::of(AstFile::parse(text, Edition::CURRENT).root().shared_file());
     let at = 1;

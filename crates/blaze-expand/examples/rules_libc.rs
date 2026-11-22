@@ -86,12 +86,14 @@ fn site() -> CallSite {
 }
 
 fn files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(read) = std::fs::read_dir(dir) else { return };
-    let mut entries: Vec<PathBuf> = read.filter_map(|it| it.ok().map(|it| it.path())).collect();
-    entries.sort();
-    for path in entries {
+    let (mut stack, mut entries) = (Vec::from([dir.to_path_buf()]), Vec::new());
+    while let Some(path) = stack.pop() {
         if path.is_dir() {
-            files(&path, out);
+            let Ok(read) = std::fs::read_dir(&path) else { continue };
+            entries.clear();
+            entries.extend(read.filter_map(|it| it.ok().map(|it| it.path())));
+            entries.sort();
+            stack.extend(entries.drain(..).rev());
         } else if path.extension().is_some_and(|it| it == "rs") {
             out.push(path);
         }

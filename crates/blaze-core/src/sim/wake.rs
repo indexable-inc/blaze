@@ -386,7 +386,7 @@ mod tests {
         Ok(())
     }
 
-    /// The invariant (the rule on [`crate::Driver::waker`], as the simulation keeps it): a
+    /// The invariant: by the rule on [`crate::Driver::waker`], as the simulation keeps it, a
     /// message another thread posts and wakes the driver for is read by the loop at the virtual
     /// time it was posted, wherever the wake lands (before the poll looks, between its look and
     /// its park, or while it is parked), with timers completing beside it; and with nothing in

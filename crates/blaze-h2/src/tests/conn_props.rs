@@ -282,6 +282,7 @@ fn exchange(tape: &Tape) -> Result<(), Broke> {
     Err(Broke::Oracle(String::from("exchange broke: not done in 20000 rounds")))
 }
 
+/// The invariant: back-to-back HTTP/2 connections deliver every request and response body byte exactly once and in order under arbitrary framing and chunk splits while keeping all flow-control windows valid.
 #[test]
 fn back_to_back_delivers_every_byte_once() {
     check(Config::cases(32), exchange);

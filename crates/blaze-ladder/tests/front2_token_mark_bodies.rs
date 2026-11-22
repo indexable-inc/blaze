@@ -280,6 +280,7 @@ fn marks_crates<'a>(cfg: &'a [(&'a str, Option<&'a str>)]) -> [CrateInput<'a>; 2
     ]
 }
 
+/// The invariant: macro-written item bodies resolve paths by their tokens' hygiene marks identically over solved names and over stored records.
 /// (i) and (ii) over the solved names, then over the records of the same solve.
 ///
 /// Prints `front2_token_mark_bodies names: in_body: clean; by_item: clean; by_item_stmt: clean`,

@@ -4,7 +4,7 @@
 use super::{RESERVED_FROM, ReservedTag, TagReach, reach_of};
 use crate::kind::{TAGS, Tag};
 
-/// The invariant: every reserved tag has its own value, in the reserved block, and maps back
+/// Invariant: every reserved tag has its own value, in the reserved block, and maps back
 /// to itself; no kind's tag is a reservation. (Also a compile-time assertion in reserved.rs:
 /// this is its run-time statement, over the same table.)
 #[test]

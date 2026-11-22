@@ -165,7 +165,7 @@ pub(super) fn encoded(message: &Message<'_>, id: u64) -> Vec<u8> {
     out
 }
 
-/// The invariant: every run-wire message is one frame whose item is deterministic CBOR, reads
+/// Invariant: every run-wire message is one frame whose item is deterministic CBOR, reads
 /// back with its id as the message it was (and not as the other direction's), and EVERY cut of
 /// the item is refused, never read as a shorter message. Expected: passes with no output.
 #[test]

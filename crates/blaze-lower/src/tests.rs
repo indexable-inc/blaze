@@ -216,6 +216,7 @@ fn a_block_item_whose_cfg_is_false_is_no_row() {
 // ---------------------------------------------------------------------------------------------
 // The desugarings, against rustc's (rustc_ast_lowering, as `-Zunpretty=hir` prints them)
 
+/// The refinement: lowering desugars `for` loops (including breaking on `None`) and other Rust syntax forms identically to rustc.
 /// rustc: `match IntoIterator::into_iter(xs) { mut iter => loop { match Iterator::next(&mut
 /// iter) { None => break, Some(x) => { .. } } } }`, the `None` arm first.
 #[test]

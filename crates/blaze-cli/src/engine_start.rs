@@ -214,13 +214,13 @@ pub(crate) fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phase
     let launch = program::Launch { io, select, grants: &flags.grants, args: &flags.program };
     let words = crate::words(command, out, err);
     // `blaze run`'s live line on a terminal's stderr (run_line.rs), as the old path had it.
-    let env = io.env();
-    let var = |name: &str| -> Option<&str> { env.as_ref()?.get(&bstd::env::VarName::new(name).ok()?).ok().flatten() };
-    let line = crate::run_line::LineOpts::new(&|name| var(name).map(std::string::String::from), err, flags.color);
-    let line = crate::run_line::LineOpts { live: line.live && command == Command::Run, ..line };
-    let clock = phases.clock().clone();
-    let lined = crate::run_line::watched(cx, io, err, &clock, line, |watch| {
-        check_for_start(cx, io, words, phases, heap, &flags, |standing, phases| {
+    let line = crate::run_line::LineOpts::from_io(io, err, flags.color);
+    let line = crate::run_line::LineOpts { live: line.live && matches!(command, Command::Run | Command::Test), ..line };
+    let clock = io.need_clock()?;
+    let lined = crate::run_line::watched(cx, io, err, &clock, line, |watch, bg| {
+        watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Checking));
+        let bg_live = if line.live { Some(bg) } else { None };
+        check_for_start(cx, io, words, phases, heap, &flags, command == Command::Run, bg_live, |standing, phases| {
             let (root, frame) = (standing.checkout, standing.frame);
             // The member's folder the command was given selects when no `-p` does (R3).
             let select = run_package::Select { member: standing.member, ..launch.select };

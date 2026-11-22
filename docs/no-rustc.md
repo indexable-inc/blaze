@@ -35,10 +35,10 @@ A blaze extension is not a rustc run: code that opts into one need not build und
 1. **The standard library is compiled by blaze**, from `library/`, kept in the store per target
    and profile like any other crate. No rlib of a sysroot is read or linked.
 2. **Proc macros are compiled by blaze and run by blaze**, as `wasm32-wasip1` in Wasmtime
-   (`crates/blaze-macro-eval`).
-3. **Build scripts are compiled, linked and run by blaze.** `RUSTC` names blaze while they run
-   (`crates/blaze-cargo/src/as_rustc.rs`), so their probes are answered by blaze, from the data
-   `harness/answers.py` writes at a toolchain bump (`crates/blaze-cargo/src/answers/own.rs`).
+   (`crates/blaze-proc-macro`).
+3. **Build scripts are compiled, linked and run by blaze.** `RUSTC` is answered by blaze while they run
+   (`crates/blaze-build-script`), so their probes are answered by blaze, from the data
+   `harness/answers.py` writes at a toolchain bump (`crates/blaze-answer`).
 4. **The cold build is entirely blaze's**: no first build by cargo and rustc.
 5. **Tests and doctests are built by blaze**; no rustdoc runs.
 6. **No wrapper and no fallback**: there is no `blaze-rustc`, and no build is handed to cargo.
@@ -74,11 +74,11 @@ counts it recorded: one more in a file fails, and a place that goes lowers the c
 
 | Place | What it is | Why it is still counted | What removes it |
 |---|---|---|---|
-| `crates/blaze-build-script/src/elide/tests.rs`, 1 | the text of rust-analyzer's proc-macro-srv build script, a test's fixture of a script that runs `$RUSTC --version`; the test checks blaze does not elide it | the fixture is an escaped string on one line of code, which the counter reads as code | writing the fixture as a raw string over lines, which the counter knows is data |
-| `crates/blaze-cargo/src/answers/own.rs`, 2 | a unit test that makes two `Command::new("rustc")` to read their environment (`Vars::Command`) and never spawns them | the counter matches the command's name | naming any other program in the test |
+| `crates/blaze-build-script`, 1 | a test fixture of a script that runs `$RUSTC --version`; the test checks blaze does not elide it | the fixture is an escaped string on one line of code, which the counter reads as code | writing the fixture as a raw string over lines, which the counter knows is data |
+| `crates/blaze-answer`, 2 | a unit test that makes two `Command::new("rustc")` to read their environment (`Vars::Command`) and never spawns them | the counter matches the command's name | naming any other program in the test |
 
 Two more places ask `$RUSTC` and are listed on every run, not counted, because the compiler
-asked is blaze: `crates/blaze-codegen-code/src/lib.rs`'s `compiler`, a build script's `-vV` for
+asked is blaze: `crates/blaze-code/src/lib.rs`'s `compiler`, a build script's `-vV` for
 the code identity, under an `// asks blaze:` comment (end state 3).
 
 Outside `crates/`, which the counter does not read, cargo or rustc still run in:

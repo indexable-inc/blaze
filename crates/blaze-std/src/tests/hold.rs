@@ -269,6 +269,7 @@ fn run(plan: &(Vec<Step>, usize), plant: Plant) -> Result<(), String> {
     }
 }
 
+/// The invariant: recording captures every hosted call and answer bytes intact, and replay returns identical answers without touching the host while stopping at the first diverging call.
 #[test]
 fn a_recorded_plan_replays_equal_and_a_changed_one_stops_where_it_changed() {
     blaze_sim::check(Config::cases(200), |tape| check(plan(tape), run));

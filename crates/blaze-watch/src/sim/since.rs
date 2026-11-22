@@ -502,6 +502,7 @@ fn run_journal(tape: &Tape) -> Result<(), Broke> {
     run_with(tape, &mut source)
 }
 
+/// The invariant: the change watcher names every change since a valid saved place after a flush barrier or refuses to vouch on overflow, dead instance, or forgotten place.
 #[test]
 fn the_helper_names_every_change_since_a_place_or_cannot_vouch() {
     let lap = Lap::new("since: the helper names every change");

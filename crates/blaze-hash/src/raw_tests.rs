@@ -150,7 +150,7 @@ fn agrees(tape: &Tape) -> Result<(), String> {
     }
 }
 
-/// The invariant: after any operations the table holds what a `BTreeMap` under the same
+/// Invariant: after any operations the table holds what a `BTreeMap` under the same
 /// operations holds, finds each key, and walks each pair once; under a hash that fills groups,
 /// so that removals leave DEAD slots and growth rehashes them.
 #[test]

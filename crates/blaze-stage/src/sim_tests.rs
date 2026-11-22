@@ -593,6 +593,7 @@ fn ratio(part: u32, whole: u32) -> f64 {
     f64::from(part) / f64::from(whole.max(1))
 }
 
+/// The invariant: the stage driver resets task frames, merges in plan order, reports transitive waits accurately, starts nothing after stop, and exposes no result before commit.
 #[test]
 fn the_driver_holds_every_law() {
     let mut tally = Tally::default();

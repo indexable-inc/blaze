@@ -164,6 +164,7 @@ mod tests {
         whole(&torn, "with words torn")
     }
 
+    /// The invariant: a sealed pointer record interrupted or torn at any point reads back whole old, whole new, or absent, and never accepts bytes whose header check fails.
     #[test]
     fn a_crash_at_any_point_reads_whole_old_whole_new_or_absent() {
         sim_check(Config::cases(500), |tape| crashes(tape, Plant::None));

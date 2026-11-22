@@ -200,6 +200,7 @@ fn offers_agree(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     oracle(same_order, || "the graph's edges listed reversed gave another offer".to_string())
 }
 
+/// The refinement: `offer` matches the plain O(n^2) greedy reference on random call graphs while respecting per-member, total-size, and depth bounds.
 #[test]
 fn offers_match_the_plain_greedy() {
     check(Config::cases(512), |tape| offers_agree(tape, Plant::None));

@@ -735,8 +735,10 @@ const EDGES: [(&str, &str, Option<&str>); 7] = [
 
 fn metadata(edges: &[(&str, &str, Option<&str>)]) -> String {
     let id = |name: &str| format!("{name}@1.0.0");
+    let used = |name: &str, member: bool| member || edges.iter().any(|(from, to, _)| *from == name || *to == name);
     let packages: Vec<Value> = PKGS
         .iter()
+        .filter(|(name, _, _, member, _)| used(name, *member))
         .map(|(name, source, dir, _, bin)| {
             let targets = if *bin { serde_json::json!([{"kind": ["bin"], "name": BINARY}]) } else { serde_json::json!([{"kind": ["lib"], "name": name}]) };
             serde_json::json!({"id": id(name), "name": name, "version": "1.0.0", "source": source, "manifest_path": format!("{dir}/Cargo.toml"), "targets": targets})
@@ -745,6 +747,7 @@ fn metadata(edges: &[(&str, &str, Option<&str>)]) -> String {
     let members: Vec<String> = PKGS.iter().filter(|it| it.3).map(|it| id(it.0)).collect();
     let nodes: Vec<Value> = PKGS
         .iter()
+        .filter(|(name, _, _, member, _)| used(name, *member))
         .map(|(name, ..)| {
             let deps: Vec<Value> = edges
                 .iter()

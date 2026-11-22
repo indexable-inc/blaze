@@ -26,6 +26,7 @@ pub const SYNTAX: u16 = 1;
 pub const MODULE_AT_BOTH: u16 = 4;
 
 const OUT_DOMAIN: &str = "blaze-cli parts out 1";
+pub(crate) const FILE_SURFACE_PHYSICAL_DOMAIN: &str = "blaze-cli file surface with physical path 1";
 
 /// The finding number of a task's typed failure, filed as its answer: its one argument is the
 /// failure's words.
@@ -891,7 +892,7 @@ pub(crate) fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, 
             // Name resolution records physical file paths. Its read of this slot's surface
             // must move when the same text is found at the other module path.
             let file = crate::signature::SignatureFile::new(path.as_bytes());
-            let surface = blaze_ids::Hasher::new("blaze-cli file surface with physical path 1").id(&file.subject()).id(&outline.surface()).finish();
+            let surface = blaze_ids::Hasher::new(FILE_SURFACE_PHYSICAL_DOMAIN).id(&file.subject()).id(&outline.surface()).finish();
             parts.push(Part { name: Name::new(Kind::Surface, job.name.subject), locate: Locate::Source(surface), place: 0 });
             // Each body its own part, keyed by its item's text alone (body_types.rs
             // `body_source`): an edit of one body re-parses and re-checks that one.

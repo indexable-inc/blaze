@@ -1688,7 +1688,7 @@ fn clone_file(_: &Path, _: &Path) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "no call that shares blocks on this system"))
 }
 
-/// The invariant: a sync and a barrier of a file sealed read-only (mode 0444, as the store
+/// Invariant: a sync and a barrier of a file sealed read-only (mode 0444, as the store
 /// seals a placed output) succeed on the real file system through `driver`, which runs at
 /// `root`, a directory of the test's own; a sync or a barrier of a missing file makes it, as
 /// before; and a file a sync kept (`uring.rs`'s `Kept::read_only`) is appended to after it.

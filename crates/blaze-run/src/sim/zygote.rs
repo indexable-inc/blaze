@@ -324,6 +324,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     run_with(tape, plant, width_now)
 }
 
+/// The invariant: every test row finishes once with its child's verified report digest or typed non-pass outcome, never counting a killed or corrupt child as passed.
 #[test]
 fn each_row_ends_once_with_the_result_its_child_gives() {
     check(Config::cases(500), |tape| run(tape, Plant::None));

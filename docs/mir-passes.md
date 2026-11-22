@@ -4,12 +4,12 @@ summary: The MIR passes from built MIR to runtime MIR, ported from rustc, that c
 ---
 # MIR passes: from built MIR to runtime MIR
 
-blaze's front end gives its MIR the pre-codegen passes rustc runs, so that the code generator
-(`crates/hir-ty-codegen`) and the interpreter (`crates/hir-ty-mir/src/mir/eval.rs`) execute a
+blaze's front end gives its body IR the pre-codegen passes rustc runs, so that the code generator
+(`crates/blaze-emit` / `crates/blaze-build`) and the interpreter (`crates/blaze-body-eval/src/eval.rs`) execute a
 body as rustc's post-pass MIR says, instead of each re-deriving drop flags, moves and unwinding
 on its own.
 
-The code is `crates/hir-ty-mir/src/mir/transform.rs` and `transform/`.
+The code is `crates/blaze-body-drops` and `crates/blaze-body`.
 
 ## Phases and queries
 
@@ -198,7 +198,7 @@ changes which unwind paths there are.
 
 ## What the consumers do with it
 
-**blaze codegen** (`crates/hir-ty-codegen/mod.rs`) generates a Runtime body directly, and
+**blaze codegen** (`crates/blaze-build`) generates a Runtime body directly, and
 generates nothing else:
 - no drop flags of its own, in `async` bodies too;
 - `Drop` is `drop_in_place` and a jump;
@@ -226,18 +226,18 @@ with the words its own checks used (`Overflow in Add`, `index out of bounds: ..`
 
 ## Optimizations
 
-The code is `crates/hir-ty-mir/src/mir/optimize.rs` and `optimize/`: rustc's
+The code is in `crates/blaze-body` and `crates/blaze-lir`: rustc's
 `run_optimization_passes`, ported pass by pass in its order, on top of the runtime
 body: `optimized_mir_body(def, level)`, `optimized_mir_body_for_closure` and their
 `monomorphized_optimized_*` variants, again separate salsa queries so nothing else computes
 them. `MirOptLevel` is rustc's `-Zmir-opt-level`: `Off` is the runtime body unchanged,
 `Debug` is level 1 (what `-Copt-level=0` gets), `Release` level 2 (above `-Copt-level=0`).
 The code generator takes rustc's level for each crate from the unit it compiles
-(`Build::options` in `crates/hir-ty-codegen/v2/build.rs`: `Debug` at `-Copt-level=0`,
+(`crates/blaze-code` and `crates/blaze-emit`: `Debug` at `-Copt-level=0`,
 `Release` above it and for the library's crates, inlined where the unit inlines), with UB
 checks (`CheckAlignment`, `CheckNull`, `CheckEnums`) where rustc's `sess.ub_checks()` has them.
-`BLAZE_MIR_OPT` is not an override in v2: set, it stops a unit's build, since a unit's key has
-no part of it (`CHANGES_CODE` in `crates/hir-ty-codegen/v2/backend.rs`). The interpreter takes
+There is no environment-variable override for MIR optimization level in v2, since a unit's key
+determines its optimization level. The interpreter takes
 the level from `set_interpreter_mir_opt_level`.
 
 - Level 1: `CleanupPostBorrowck` (fake reads, false edges, `CopyForDeref`; also the storage

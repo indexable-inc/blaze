@@ -290,6 +290,7 @@ fn a_full_row_frame_fails_one_body_and_reenters_it() {
     check_isolation(crate::engine_bodies::BodyFault::RowFrame, "FrameUsedUp");
 }
 
+/// The invariant: a body that fails or panics is not left standing and is re-entered on the next request.
 #[test]
 fn a_widening_panic_fails_one_body_and_reenters_it() {
     check_isolation(crate::engine_bodies::BodyFault::WidenPanic, "Panicked");
@@ -394,6 +395,7 @@ fn assert_fresh_refusal(io: &Io, fresh: &Io, target: blaze_drive::Name, printed:
     assert_eq!(&*row, &fresh.answer.rows[&target], "restored dependency proof differs from fresh");
 }
 
+/// The invariant: a failed fact read keeps its refusal read list and replays until its input changes.
 #[test]
 fn a_failed_fact_read_replays_until_its_input_changes() {
     use crate::engine_bodies::BodyFault::MissingFact;
@@ -486,6 +488,7 @@ fn given_of(text: &str) -> (blaze_engine::CellId, blaze_ids::ContentId) {
     (blaze_engine::CellId { of: given, cell: crate::engine_tasks::WHOLE }, answer)
 }
 
+/// The invariant: a computed data read is recorded and followed as a checkout read so edits invalidate it.
 #[test]
 fn a_computed_data_read_is_followed_as_a_checkout_read() {
     let io = fact_world(FACT_FIRST);

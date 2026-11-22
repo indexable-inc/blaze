@@ -672,89 +672,168 @@ impl<'q, 'r, 'a, C: ExpandCx> Driver<'q, 'r, 'a, C> {
     /// namespace, its definition built, its input's calls answered first when it asks
     /// (`concat!`), its result sealed by its call's key.
     fn expand_one(&mut self, stream: &TokenStream<'a>, at: CallAt, depth: usize) -> Result<TokenStream<'a>, ValueRefused<'a>> {
-        let alloc = self.alloc();
-        self.reached(stream);
-        let (segments, abs, first) = self.segments(stream, at);
-        let mac: &'a str = segments.last().copied().unwrap_or("");
-        if depth >= EAGER_DEPTH {
-            return Err(self.refused(ValueWhy::TooDeep { mac }));
+        struct Frame<'a> {
+            mac: &'a str,
+            definition: blaze_expand::MacroDefinition<'a>,
+            args: TokenStream<'a>,
+            site: CallSite,
+            depth: usize,
+            nested: AVec<'a, blaze_expand::NestedCall>,
+            next_idx: usize,
+            answers: AVec<'a, TokenStream<'a>>,
+            reduce_depth: usize,
         }
-        let own = self.world.own;
-        let (kind, skip) = to_path_head(abs, &segments, first, own.key);
-        let written = Written { kind, segments: &segments[skip..] };
-        let module = self.world.module;
-        let resolved = crate::names::path(&self.world, module, Namespace::Macros, written, alloc).map_err(|why| self.refused(ValueWhy::NotFound { mac, why }))?;
-        let Some(def) = resolved.whole(written.segments.len()) else {
-            let why = PathError { module, at: resolved.consumed, why: Why::NotAModule };
-            return Err(self.refused(ValueWhy::NotFound { mac, why }));
-        };
-        // The source, from the crate's tables or the dependency that defines it (asked).
-        let (src, krate, runner, edition) = match own.tables.macros.get(&def.key) {
-            Some(src) => (Some(*src), own.key, own.proc_key, own.edition),
-            None => match self.world.built.of(def.key) {
-                Some(dep) => {
-                    let src = dep.macro_of(def.key);
-                    self.world.built.ask(|| Question::macro_src(def.key, src, alloc));
-                    (src, dep.key(), dep.proc_key(), dep.edition())
-                }
-                None => (None, own.key, None, own.edition),
-            },
-        };
-        let Some(src) = src else { return Err(self.refused(ValueWhy::NoSource { mac })) };
-        self.read(ValueRead::Macro { def: def.key, digest: crate::asked::macro_digest(Some(src)) });
-        let definition = match definition_of(src, krate, runner, edition, CallShape::FnLike, alloc) {
-            Ok(definition) => definition,
-            Err(note) => {
-                let mut text = AString::new_in(alloc);
-                let _ = write!(text, "{note:?}");
-                let note: &'a str = Box::leak(text.into_boxed_str());
-                return Err(self.refused(ValueWhy::Definition { mac, note }));
+        let alloc = self.alloc();
+        let mut stack: AVec<'a, Frame<'a>> = AVec::new_in(alloc);
+        let mut cur_owned: Option<TokenStream<'a>> = None;
+        let mut cur_at = at;
+        let mut cur_depth = depth;
+        loop {
+            let cur_stream = cur_owned.as_ref().unwrap_or(stream);
+            self.reached(cur_stream);
+            let (segments, abs, first) = self.segments(cur_stream, cur_at);
+            let mac: &'a str = segments.last().copied().unwrap_or("");
+            if cur_depth >= EAGER_DEPTH {
+                return Err(self.refused(ValueWhy::TooDeep { mac }));
             }
-        };
-        let args = stream.copy_in(at.open + 1..at.close, alloc).map_err(|error| self.refused(ValueWhy::Stream { mac, error }))?;
-        let site = CallSite { edition: self.edition, panic_edition: self.edition, ctx: Ctx::root(self.edition) };
-        let call = Call { kind: CallKind::FnLike { args: &args }, site, eager: Eager { inside: Inside::EagerInput, answers: &[] } };
-        let failed = |error| ValueWhy::Expand { mac, error };
-        let (expansion, key) = match expand(&definition, &call, self.cx, alloc).map_err(|error| self.refused(failed(error)))? {
-            Expanded::Expansion(expansion) => (expansion, call_key(&definition, &call).0),
-            Expanded::NeedsExpanded(nested) => {
-                // Each call in the input, expanded at the site in written order (and its
-                // result while it is one call), then the builtin entered again with them.
-                let mut answers: AVec<'a, TokenStream<'a>> = AVec::with_capacity_in(nested.len(), alloc);
-                for inner in nested.iter() {
+            let own = self.world.own;
+            let (kind, skip) = to_path_head(abs, &segments, first, own.key);
+            let written = Written { kind, segments: &segments[skip..] };
+            let module = self.world.module;
+            let resolved = crate::names::path(&self.world, module, Namespace::Macros, written, alloc).map_err(|why| self.refused(ValueWhy::NotFound { mac, why }))?;
+            let Some(def) = resolved.whole(written.segments.len()) else {
+                let why = PathError { module, at: resolved.consumed, why: Why::NotAModule };
+                return Err(self.refused(ValueWhy::NotFound { mac, why }));
+            };
+            // The source, from the crate's tables or the dependency that defines it (asked).
+            let (src, krate, runner, edition) = match own.tables.macros.get(&def.key) {
+                Some(src) => (Some(*src), own.key, own.proc_key, own.edition),
+                None => match self.world.built.of(def.key) {
+                    Some(dep) => {
+                        let src = dep.macro_of(def.key);
+                        self.world.built.ask(|| Question::macro_src(def.key, src, alloc));
+                        (src, dep.key(), dep.proc_key(), dep.edition())
+                    }
+                    None => (None, own.key, None, own.edition),
+                },
+            };
+            let Some(src) = src else { return Err(self.refused(ValueWhy::NoSource { mac })) };
+            self.read(ValueRead::Macro { def: def.key, digest: crate::asked::macro_digest(Some(src)) });
+            let definition = match definition_of(src, krate, runner, edition, CallShape::FnLike, alloc) {
+                Ok(definition) => definition,
+                Err(note) => {
+                    let mut text = AString::new_in(alloc);
+                    let _ = write!(text, "{note:?}");
+                    let note: &'a str = Box::leak(text.into_boxed_str());
+                    return Err(self.refused(ValueWhy::Definition { mac, note }));
+                }
+            };
+            let args = cur_stream.copy_in(cur_at.open + 1..cur_at.close, alloc).map_err(|error| self.refused(ValueWhy::Stream { mac, error }))?;
+            let site = CallSite { edition: self.edition, panic_edition: self.edition, ctx: Ctx::root(self.edition) };
+            let call = Call { kind: CallKind::FnLike { args: &args }, site, eager: Eager { inside: Inside::EagerInput, answers: &[] } };
+            let failed = |error| ValueWhy::Expand { mac, error };
+            let (mut expansion, mut key, mut finished_mac) = match expand(&definition, &call, self.cx, alloc).map_err(|error| self.refused(failed(error)))? {
+                Expanded::Expansion(expansion) => (expansion, call_key(&definition, &call).0, mac),
+                Expanded::NeedsExpanded(nested) => {
+                    // Each call in the input, expanded at the site in written order (and its
+                    // result while it is one call), then the builtin entered again with them.
+                    if let Some(first_inner) = nested.first() {
+                        if first_inner.kind != NestedKind::FnLike {
+                            return Err(self.refused(ValueWhy::NotACall { mac }));
+                        }
+                        let (start, end) = (first_inner.path.start as usize, first_inner.args.end as usize);
+                        let one = args.copy_in(start..end, alloc).map_err(|error| self.refused(ValueWhy::Stream { mac, error }))?;
+                        let next_at = CallAt {
+                            path: (0, first_inner.path.end as usize - start),
+                            open: first_inner.args.start as usize - start,
+                            close: end - 1 - start,
+                            def_crate: first_inner.scope == PathScope::DefCrate,
+                        };
+                        let answers = AVec::with_capacity_in(nested.len(), alloc);
+                        stack.push(Frame {
+                            mac,
+                            definition,
+                            args,
+                            site,
+                            depth: cur_depth,
+                            nested,
+                            next_idx: 0,
+                            answers,
+                            reduce_depth: cur_depth + 2,
+                        });
+                        cur_owned = Some(one);
+                        cur_at = next_at;
+                        cur_depth += 1;
+                        continue;
+                    }
+                    let again = Call { kind: CallKind::FnLike { args: &args }, site, eager: Eager { inside: Inside::EagerInput, answers: &[] } };
+                    match expand(&definition, &again, self.cx, alloc).map_err(|error| self.refused(failed(error)))? {
+                        Expanded::Expansion(expansion) => (expansion, call_key(&definition, &again).0, mac),
+                        Expanded::NeedsExpanded(_) => return Err(self.refused(ValueWhy::AskedAgain { mac })),
+                    }
+                }
+            };
+            loop {
+                if let Some(failed) = Failed::of(&expansion, alloc) {
+                    return Err(self.refused(ValueWhy::Failed { mac: finished_mac, failed }));
+                }
+                for read in expansion.reads.list() {
+                    let subject = keep(expansion.reads.subject(read), alloc);
+                    self.read(ValueRead::Host { kind: read.kind, subject, answer: read.answer });
+                }
+                let mut tokens = expansion.tokens;
+                tokens.seal(key);
+                let Some(top) = stack.last_mut() else {
+                    return Ok(tokens);
+                };
+                if let Some(next_at) = one_call(&tokens) {
+                    cur_owned = Some(tokens);
+                    cur_at = next_at;
+                    cur_depth = top.reduce_depth;
+                    top.reduce_depth += 1;
+                    break;
+                }
+                top.answers.push(tokens);
+                top.next_idx += 1;
+                if let Some(inner) = top.nested.get(top.next_idx) {
                     if inner.kind != NestedKind::FnLike {
+                        let mac = top.mac;
                         return Err(self.refused(ValueWhy::NotACall { mac }));
                     }
-                    let (start, end) = (inner.path.start as usize, inner.args.end as usize);
-                    let one = args.copy_in(start..end, alloc).map_err(|error| self.refused(ValueWhy::Stream { mac, error }))?;
-                    let at = CallAt {
-                        path: (0, inner.path.end as usize - start),
-                        open: inner.args.start as usize - start,
+                    let start = usize::try_from(inner.path.start).unwrap_or(0);
+                    let end = usize::try_from(inner.args.end).unwrap_or(0);
+                    let path_end = usize::try_from(inner.path.end).unwrap_or(0);
+                    let args_start = usize::try_from(inner.args.start).unwrap_or(0);
+                    let mac = top.mac;
+                    let one = top.args.copy_in(start..end, alloc).map_err(|error| self.refused(ValueWhy::Stream { mac, error }))?;
+                    cur_owned = Some(one);
+                    cur_at = CallAt {
+                        path: (0, path_end - start),
+                        open: args_start - start,
                         close: end - 1 - start,
                         def_crate: inner.scope == PathScope::DefCrate,
                     };
-                    let made = self.expand_one(&one, at, depth + 1)?;
-                    answers.push(self.reduce(made, depth + 2)?);
+                    cur_depth = top.depth + 1;
+                    top.reduce_depth = top.depth + 2;
+                    break;
                 }
-                let mut refs: AVec<'_, &TokenStream<'_>> = AVec::with_capacity_in(answers.len(), alloc);
-                refs.extend(answers.iter());
-                let again = Call { kind: CallKind::FnLike { args: &args }, site, eager: Eager { inside: Inside::EagerInput, answers: &refs } };
-                match expand(&definition, &again, self.cx, alloc).map_err(|error| self.refused(failed(error)))? {
-                    Expanded::Expansion(expansion) => (expansion, call_key(&definition, &again).0),
+                let Some(frame) = stack.pop() else {
+                    return Err(self.refused(ValueWhy::AskedAgain { mac: finished_mac }));
+                };
+                let mut refs: AVec<'_, &TokenStream<'_>> = AVec::with_capacity_in(frame.answers.len(), alloc);
+                refs.extend(frame.answers.iter());
+                let again = Call { kind: CallKind::FnLike { args: &frame.args }, site: frame.site, eager: Eager { inside: Inside::EagerInput, answers: &refs } };
+                let mac = frame.mac;
+                let failed = |error| ValueWhy::Expand { mac, error };
+                let (exp, k) = match expand(&frame.definition, &again, self.cx, alloc).map_err(|error| self.refused(failed(error)))? {
+                    Expanded::Expansion(expansion) => (expansion, call_key(&frame.definition, &again).0),
                     Expanded::NeedsExpanded(_) => return Err(self.refused(ValueWhy::AskedAgain { mac })),
-                }
+                };
+                expansion = exp;
+                key = k;
+                finished_mac = mac;
             }
-        };
-        if let Some(failed) = Failed::of(&expansion, alloc) {
-            return Err(self.refused(ValueWhy::Failed { mac, failed }));
         }
-        for read in expansion.reads.list() {
-            let subject = keep(expansion.reads.subject(read), alloc);
-            self.read(ValueRead::Host { kind: read.kind, subject, answer: read.answer });
-        }
-        let mut tokens = expansion.tokens;
-        tokens.seal(key);
-        Ok(tokens)
     }
 
     /// `read` noted once, in the order first read.

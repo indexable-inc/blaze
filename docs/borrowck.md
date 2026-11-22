@@ -4,9 +4,7 @@ summary: blaze's own borrow checker (hir-ty-borrowck): how it matches rustc's ve
 ---
 # The borrow checker
 
-blaze has its own borrow checker, the crate `hir-ty-borrowck` in the front end
-(`crates/hir-ty-borrowck`, next to `hir-ty`). It checks the MIR `hir-ty-mir`
-lowers (from rust-analyzer's lowering), the same MIR the code generator compiles, and it is meant to give exactly rustc's
+blaze has its own borrow checker (`crates/blaze-borrow` and `crates/blaze-flow`). It checks the body flow IR and is meant to give exactly rustc's
 verdict: the same errors, on the same lines, and none where rustc gives none. At its last
 scoring it gave rustc's verdict on 99.8% of the rustc borrow-check tests in scope, and on
 every one rustc accepts; how they were scored and what is left is below.
@@ -37,7 +35,7 @@ such an error still builds.
 - `polonius-flow`: an opt-in extension that only ever accepts more than `polonius`. A body
   `polonius` accepts gets exactly that result, at no extra cost. A body it rejects is checked
   again, and this time each loan's scope is narrowed to where datalog (legacy) Polonius's
-  naive rules (`crates/hir-ty-borrowck/src/flow.rs`) also find it live. Those rules kill a
+  naive rules (`crates/blaze-flow/src/loans.rs`) also find it live. Those rules kill a
   loan when its path is overwritten and propagate subsets along the control flow. A universal
   region error is dropped only when those rules find no failing pair. This accepts the cases
   in section 2.5 of the research that the alpha rejects and legacy
@@ -825,6 +823,4 @@ is 0.3 ms now. Nothing else moves.
 
 ## Debugging
 
-- `BLAZE_BORROWCK_DEBUG=1` prints each body's locals, universal regions, constraints and
-  loans; `BLAZE_BORROWCK_DEBUG=<function>` only those of that function and its closures,
-  which a project needs.
+Inspect borrow-check flow and loan diagnostics via `crates/blaze-borrow` and `crates/blaze-flow` unit tests (`blaze test -p blaze-borrow -p blaze-flow`).

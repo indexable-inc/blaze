@@ -844,20 +844,39 @@ impl<'w, 't, 'a, 'c, 'd, T: SourceTexts<'t> + ?Sized, J: Jump> Walk<'w, 't, 'a, 
 
     /// Fields or variants up to the list's closer, each with its own attributes.
     fn list(&mut self, lex: &mut Lex<'t, J>, d: &Dirs<'a>, on: bool, depth: usize) -> R<'a, ()> {
-        loop {
+        let mut stack = [(false, false); MOST_DEPTH + 1];
+        let mut sp = 0usize;
+        let mut cur_on = on;
+        let mut cur_depth = depth;
+        'elem: loop {
             let mark = self.out.pending.len();
             let mut st = Attrs { on: true, path: None };
             self.attributes(lex, d, false, &mut st)?;
-            let element_on = on && st.on;
+            let mut element_on = cur_on && st.on;
             self.settle(mark, element_on);
             loop {
                 let (open, tok) = self.want(lex, d)?;
                 match tok {
-                    Tok::Close(_) => return Ok(()),
-                    Tok::Punct(b',') => break,
+                    Tok::Close(_) => {
+                        if sp == 0 {
+                            return Ok(());
+                        }
+                        sp -= 1;
+                        let &(prev_on, prev_elem) = stack.get(sp).unwrap_or(&(false, false));
+                        cur_on = prev_on;
+                        element_on = prev_elem;
+                        cur_depth -= 1;
+                    }
+                    Tok::Punct(b',') => continue 'elem,
                     Tok::Open(b'{' | b'(') => {
-                        let depth = self.deeper(d, open, depth)?;
-                        self.list(lex, d, element_on, depth)?;
+                        let next_depth = self.deeper(d, open, cur_depth)?;
+                        if let Some(slot) = stack.get_mut(sp) {
+                            *slot = (cur_on, element_on);
+                        }
+                        sp += 1;
+                        cur_on = element_on;
+                        cur_depth = next_depth;
+                        continue 'elem;
                     }
                     Tok::Open(_) => {
                         self.group(lex, d, element_on)?;

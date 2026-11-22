@@ -129,6 +129,7 @@ fn runs(count: u32, plant: RecordPlant, cuts: bool) -> Result<bstd::test::Passed
     seeded("blaze-proc-macro", module_path!(), "tables_crash", seeds, Given::NOTHING, move |_: &Cx, io: Io| program(&io, plant, cuts))
 }
 
+/// The invariant: under power cuts, failures, and concurrent writers, every opened proc-macro results table is sealed and whole or absent, and never published before its bytes are whole.
 #[test]
 fn a_crash_or_failure_anywhere_keeps_each_table_whole_or_absent() {
     match runs(1000, RecordPlant::None, true) {

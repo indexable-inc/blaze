@@ -120,6 +120,7 @@ fn refines<M: Memo>(ops: &[Op], mut mine: M) -> Result<(), String> {
     Ok(())
 }
 
+/// The refinement: `Resident` answers every get identically to blaze-keyed's reference `Resident` and tracks the exact same `resident_bytes` across keeps, arena drops, and request ends.
 #[test]
 fn resident_refines_the_reference() {
     blaze_sim::check(blaze_sim::Config::cases(300), |tape| {

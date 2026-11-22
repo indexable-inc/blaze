@@ -343,6 +343,7 @@ mod tests {
         assert_ne!(at, two_owners(WatchPlant::None)[1]);
     }
 
+    /// The invariant: on every drawn schedule, hung claims reported by `ClaimWatch` match the reference model (held at least the deadline, unpublished, and named once).
     /// Drawn schedules on the virtual clock: up to 6 owners of two kinds, each claiming at a
     /// drawn millisecond and publishing later or never, ticks at drawn milliseconds; a model
     /// says which claims each tick must name (held at least the deadline, unpublished, not

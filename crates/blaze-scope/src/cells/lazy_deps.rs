@@ -444,19 +444,32 @@ impl<'a, S: SourceTexts<'a>> Ctx<'_, 'a, S> {
     /// Answers `want` in its crate: its walk, then its modules' groups on demand; what those
     /// solves want of other crates first, `depth` crates down.
     fn satisfy(&self, demanded: &mut [Demanded<'a>], want: &Want<'a>, depth: usize) -> Result<(), OnDemandError<'a>> {
-        let k = want.krate;
-        let name = self.crates[k].name;
-        if depth > self.crates.len() {
-            return Err(OnDemandError::Depth { krate: name, most: self.crates.len() });
+        struct Frame<'a> {
+            want: Option<Want<'a>>,
+            depth: usize,
+            round: usize,
         }
-        for _ in 0..MOST_ROUNDS {
+        let mut stack: AVec<'a, Frame<'a>> = AVec::new_in(self.alloc);
+        stack.push(Frame { want: None, depth, round: 0 });
+        while let Some(top) = stack.last_mut() {
+            let cur_want = top.want.as_ref().unwrap_or(want);
+            let k = cur_want.krate;
+            let name = self.crates[k].name;
+            if top.depth > self.crates.len() {
+                return Err(OnDemandError::Depth { krate: name, most: self.crates.len() });
+            }
+            if top.round >= MOST_ROUNDS {
+                return Err(OnDemandError::Rounds { krate: name, most: MOST_ROUNDS });
+            }
             if !self.held[k].borrow().walked() {
                 // The crate's one walk: its tree, tables and tree record, no members.
-                let (r, wants, _) = self.solve(k, Some(Members { members: &[], records: &demanded[k], tree: None }));
+                let (r, mut wants, _) = self.solve(k, Some(Members { members: &[], records: &demanded[k], tree: None }));
                 self.counts.borrow_mut().walks[k] += 1;
                 if !wants.is_empty() {
-                    for w in wants.iter() {
-                        self.satisfy(demanded, w, depth + 1)?;
+                    let next_depth = top.depth + 1;
+                    top.round += 1;
+                    while let Some(w) = wants.pop() {
+                        stack.push(Frame { want: Some(w), depth: next_depth, round: 0 });
                     }
                     continue;
                 }
@@ -465,9 +478,10 @@ impl<'a, S: SourceTexts<'a>> Ctx<'_, 'a, S> {
                 self.take_tree(k, &mut h, c.tree_record).map_err(OnDemandError::Names)?;
                 h.solves.push(c);
             }
-            let modules = self.held[k].borrow().unsolved(&want.modules, self.alloc);
+            let modules = self.held[k].borrow().unsolved(&cur_want.modules, self.alloc);
             if modules.is_empty() {
-                return Ok(());
+                stack.pop();
+                continue;
             }
             let r = {
                 let solve_crate = |m: Members<'_>| -> Result<Solved<'a>, Refused<'a>> {
@@ -494,10 +508,14 @@ impl<'a, S: SourceTexts<'a>> Ctx<'_, 'a, S> {
             };
             self.held[k].borrow_mut().hold(&demanded[k], self.alloc)?;
             match r {
-                Ok(()) => return Ok(()),
-                Err(DemandError::Solver(OneGroupRefusal::Crate(Refused::Wanted(wants)))) => {
-                    for w in wants.iter() {
-                        self.satisfy(demanded, w, depth + 1)?;
+                Ok(()) => {
+                    stack.pop();
+                }
+                Err(DemandError::Solver(OneGroupRefusal::Crate(Refused::Wanted(mut wants)))) => {
+                    let next_depth = top.depth + 1;
+                    top.round += 1;
+                    while let Some(w) = wants.pop() {
+                        stack.push(Frame { want: Some(w), depth: next_depth, round: 0 });
                     }
                 }
                 Err(error) => {
@@ -509,7 +527,7 @@ impl<'a, S: SourceTexts<'a>> Ctx<'_, 'a, S> {
                 }
             }
         }
-        Err(OnDemandError::Rounds { krate: name, most: MOST_ROUNDS })
+        Ok(())
     }
 }
 

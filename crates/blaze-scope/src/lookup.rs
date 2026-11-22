@@ -972,15 +972,24 @@ impl<'a, N: Name> Resolver<'a, N> {
     }
 
     fn textual_back(&self, name: N, frag: u32, end: usize, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) -> Tex {
-        let f = &self.frags[frag as usize];
-        for s in (0..end).rev() {
+        let mut stack: blaze_own::AVec<'a, (u32, usize)> = blaze_own::AVec::new_in(self.alloc);
+        stack.push((frag, end));
+        while let Some((cur_frag, rem)) = stack.last_mut() {
+            if *rem == 0 {
+                stack.pop();
+                continue;
+            }
+            let cur_frag = *cur_frag;
+            let s = *rem - 1;
+            *rem = s;
+            let f = &self.frags[cur_frag as usize];
             match f.slots[s] {
                 Slot::Rules { name: n, def, export, shapes } if n == name => {
                     let hit = self.textual_hit(&TextualDef { name: n, def, expansion: f.expansion, shapes });
                     // rustc's `define_macro`: a `#[macro_export]` macro's textual binding is
                     // public, so `pub use m;` beside it re-exports it (core's `ub_checks`).
                     let vis = if export { Visibility::Public } else { hit.vis };
-                    return Tex::Hit(Hit { frag: Some(frag), vis, ..hit });
+                    return Tex::Hit(Hit { frag: Some(cur_frag), vis, ..hit });
                 }
                 Slot::Call(i) => {
                     let call = &self.calls[i as usize];
@@ -994,11 +1003,7 @@ impl<'a, N: Name> Resolver<'a, N> {
                             if !fr.textual && fr.open == 0 {
                                 continue;
                             }
-                            let len = fr.slots.len();
-                            match self.textual_back(name, inner, len, env, sink) {
-                                Tex::Start => {}
-                                other => return other,
-                            }
+                            stack.push((inner, fr.slots.len()));
                         }
                         CallState::Pending => {
                             sink.blame(Blame::Call(self.module, i));

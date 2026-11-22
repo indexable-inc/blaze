@@ -307,7 +307,7 @@ pub fn use_bindings<'t>(item: &'t str, kind: NestedKind, alloc: Alloc<'_>, each:
                 return false;
             }
             let mut i = at + 1;
-            tree(&t, &mut i, WrittenPath::empty(PathKind::Plain), 0, each).is_some() && kind_is(t.get(i), TokenKind::Semi)
+            tree(&t, &mut i, WrittenPath::empty(PathKind::Plain), each).is_some() && kind_is(t.get(i), TokenKind::Semi)
         }
         NestedKind::ExternCrate => {
             if !word_is(t.get(at), "extern") || !word_is(t.get(at + 1), "crate") {
@@ -339,78 +339,98 @@ pub fn use_bindings<'t>(item: &'t str, kind: NestedKind, alloc: Alloc<'_>, each:
 }
 
 /// How many use-tree groups deep [`tree`] reads (rule 18).
-const MAX_TREE_DEPTH: u32 = 16;
+const MAX_TREE_DEPTH: usize = 16;
 
 /// One use tree at `*at` under `prefix`.
-fn tree<'t>(t: &[Tok<'t>], at: &mut usize, prefix: WrittenPath<'t>, depth: u32, each: &mut dyn FnMut(UseBinding<'t>)) -> Option<()> {
-    if depth > MAX_TREE_DEPTH {
-        return None;
-    }
+fn tree<'t>(t: &[Tok<'t>], at: &mut usize, prefix: WrittenPath<'t>, each: &mut dyn FnMut(UseBinding<'t>)) -> Option<()> {
+    let mut stack = [WrittenPath::empty(PathKind::Plain); MAX_TREE_DEPTH];
+    let mut depth: usize = 0;
     let mut path = prefix;
-    if path.len == 0 && path.kind == PathKind::Plain && sep_at(t, *at) {
-        path.kind = PathKind::Abs;
-        *at += 2;
-    }
-    loop {
-        let tok = t.get(*at)?;
-        match tok.kind {
-            TokenKind::Star => {
-                *at += 1;
-                each(UseBinding { path, binds: None });
-                return Some(());
-            }
-            TokenKind::OpenBrace => {
-                *at += 1;
-                loop {
+    'child: loop {
+        if path.len == 0 && path.kind == PathKind::Plain && sep_at(t, *at) {
+            path.kind = PathKind::Abs;
+            *at += 2;
+        }
+        loop {
+            let tok = t.get(*at)?;
+            match tok.kind {
+                TokenKind::Star => {
+                    *at += 1;
+                    each(UseBinding { path, binds: None });
+                    break;
+                }
+                TokenKind::OpenBrace => {
+                    *at += 1;
                     if kind_is(t.get(*at), TokenKind::CloseBrace) {
                         *at += 1;
-                        return Some(());
+                        break;
                     }
-                    tree(t, at, path, depth + 1, each)?;
-                    if kind_is(t.get(*at), TokenKind::Comma) {
-                        *at += 1;
-                    } else if !kind_is(t.get(*at), TokenKind::CloseBrace) {
+                    let Some(slot) = stack.get_mut(depth) else {
                         return None;
-                    }
+                    };
+                    *slot = path;
+                    depth += 1;
+                    continue 'child;
                 }
-            }
-            TokenKind::Ident | TokenKind::RawIdent => {
-                *at += 1;
-                let head = path.len == 0;
-                let mut last = None;
-                match (tok.text, path.kind) {
-                    ("crate", PathKind::Plain) if head => path.kind = PathKind::Crate,
-                    ("self", PathKind::Plain) if head && sep_at(t, *at) => path.kind = PathKind::SelfMod,
-                    ("super", PathKind::Plain) if head => path.kind = PathKind::Super(1),
-                    ("super", PathKind::Super(n)) if head => path.kind = PathKind::Super(n.checked_add(1)?),
-                    // `a::{self}`: binds the prefix's own last name.
-                    ("self", _) if !head => last = Some(*path.segments().last()?),
-                    ("self" | "crate" | "super", _) => return None,
-                    (w, _) => {
-                        if !path.push(w) {
+                TokenKind::Ident | TokenKind::RawIdent => {
+                    *at += 1;
+                    let head = path.len == 0;
+                    let mut last = None;
+                    match (tok.text, path.kind) {
+                        ("crate", PathKind::Plain) if head => path.kind = PathKind::Crate,
+                        ("self", PathKind::Plain) if head && sep_at(t, *at) => path.kind = PathKind::SelfMod,
+                        ("super", PathKind::Plain) if head => path.kind = PathKind::Super(1),
+                        ("super", PathKind::Super(n)) if head => path.kind = PathKind::Super(n.checked_add(1)?),
+                        // `a::{self}`: binds the prefix's own last name.
+                        ("self", _) if !head => last = Some(*path.segments().last()?),
+                        ("self" | "crate" | "super", _) => return None,
+                        (w, _) => {
+                            if !path.push(w) {
+                                return None;
+                            }
+                            last = Some(w);
+                        }
+                    }
+                    if last.is_none() || sep_at(t, *at) {
+                        if !sep_at(t, *at) {
                             return None;
                         }
-                        last = Some(w);
+                        *at += 2;
+                        continue;
                     }
+                    let binds = if word_is(t.get(*at), "as") {
+                        let alias = word(t.get(*at + 1))?;
+                        *at += 2;
+                        alias.text
+                    } else {
+                        last?
+                    };
+                    each(UseBinding { path, binds: Some(binds) });
+                    break;
                 }
-                if last.is_none() || sep_at(t, *at) {
-                    if !sep_at(t, *at) {
-                        return None;
-                    }
-                    *at += 2;
-                    continue;
-                }
-                let binds = if word_is(t.get(*at), "as") {
-                    let alias = word(t.get(*at + 1))?;
-                    *at += 2;
-                    alias.text
-                } else {
-                    last?
-                };
-                each(UseBinding { path, binds: Some(binds) });
+                _ => return None,
+            }
+        }
+        loop {
+            if depth == 0 {
                 return Some(());
             }
-            _ => return None,
+            if kind_is(t.get(*at), TokenKind::Comma) {
+                *at += 1;
+                if kind_is(t.get(*at), TokenKind::CloseBrace) {
+                    *at += 1;
+                    depth -= 1;
+                    continue;
+                }
+                path = *stack.get(depth - 1)?;
+                continue 'child;
+            }
+            if kind_is(t.get(*at), TokenKind::CloseBrace) {
+                *at += 1;
+                depth -= 1;
+                continue;
+            }
+            return None;
         }
     }
 }

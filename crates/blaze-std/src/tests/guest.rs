@@ -317,6 +317,7 @@ fn run(calls: &Vec<Call>, plant: Plant) -> Result<(), String> {
     Ok(())
 }
 
+/// The invariant: the hosted world refuses every hostile guest call (including unknown streams, out-of-bounds ranges, and invalid escapes) with a typed error without corrupting host state.
 #[test]
 fn a_hostile_programs_calls_are_each_refused_with_a_typed_answer() {
     blaze_sim::check(Config::cases(300), |tape| check(plan(tape), run));

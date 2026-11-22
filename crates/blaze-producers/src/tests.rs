@@ -69,7 +69,7 @@ const TREE: &[(&str, &str)] = &[
     ("Cargo.lock", LOCK),
     ("pins/toolchain", "nightly-2026-11-01\n"),
     ("pins/answers/rustc.json", "{}\n"),
-    ("docs/readme.md", "words\n"),
+    ("docs/README.md", "words\n"),
     ("crates/parked/src/lib.rs", "// parked\n"),
     ("crates/blaze-own/Cargo.toml", "[package]\nname = \"blaze-own\"\n"),
     ("crates/blaze-own/src/lib.rs", "pub struct Vec;\n"),
@@ -229,7 +229,7 @@ fn one_producers_source_moves_its_rows_alone() {
         ("crates/blaze-expand/tests/expand.rs", "#[test] fn u() {}\n", &[]),
         ("crates/blaze-expand/.DS_Store", "finder moved\n", &[]),
         ("tools/lone/src/main.rs", "fn main() { 5; }\n", &[]),
-        ("docs/readme.md", "other words\n", &[]),
+        ("docs/README.md", "other words\n", &[]),
         ("crates/blaze-expand/src/new.rs", "// a new file\n", &["expander", "lowering"]),
         // A `[patch]` path crate the lock reaches through `outside`: its files are the names
         // row's (with rows of a source alone, this moved nothing: the stale-answer hole).

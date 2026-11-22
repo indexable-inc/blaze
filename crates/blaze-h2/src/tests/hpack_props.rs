@@ -100,6 +100,7 @@ fn round_trip(tape: &Tape) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The invariant: HPACK encode followed by decode is the identity across arbitrary header lists and dynamic table resizes, and encoder and decoder dynamic tables stay identical after every block.
 #[test]
 fn round_trip_is_the_identity() {
     check(Config::cases(200), round_trip);

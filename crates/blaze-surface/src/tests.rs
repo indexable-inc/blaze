@@ -92,7 +92,7 @@ mod tool_attrs {
     }
 }
 
-/// The refinement: a key index page answers each key with its entry, in any order given.
+/// Refinement: a key index page answers each key with its entry, in any order given.
 #[test]
 fn a_key_index_answers_each_key_in_one_probe() {
     blaze_sim::check(Config::cases(300), |tape| {
@@ -158,7 +158,7 @@ fn surface(rows: &[ScopeEntry<&str>]) -> MemSurface<'static> {
     surface
 }
 
-/// The refinement: through `Items`, `lookup` finds exactly what `scope` lists.
+/// Refinement: through `Items`, `lookup` finds exactly what `scope` lists.
 #[test]
 fn lookup_finds_what_scope_lists() {
     blaze_sim::check(Config::cases(200), |tape| {

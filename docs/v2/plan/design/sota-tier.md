@@ -1,5 +1,5 @@
 ---
-status: proposal
+status: plan
 summary: Experimental non-LLVM SOTA optimization tier (`TierName::Sota`) over Blaze LIR: Acyclic E-Graphs (`aegraph`) + ISLE-style bottom-up DAG ISEL + Chordal-SSA Register Coloring + Dynamic PGO/Devirt, targeting LLVM -O2/-O3 runtime speed at 10-30x faster per-core compile speed and per-function incremental caching.
 date: 2026-11-22
 ---

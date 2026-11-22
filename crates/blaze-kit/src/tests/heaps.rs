@@ -37,6 +37,7 @@ fn heap_case(tape: &Tape) -> Result<(), Broke> {
     no_leaks(&alloc)
 }
 
+/// The refinement: `Heap4` matches a sorted `Vec` and `TimerWheel` matches a list of deadlines under any sequence of operations.
 #[test]
 fn heap4_matches_a_sorted_vec() {
     blaze_sim::check(Config::cases(300), heap_case);

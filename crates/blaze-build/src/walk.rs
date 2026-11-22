@@ -3315,7 +3315,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// stack, of `reprs` passed as `passes`, for a result of `rrepr` passed as `rpass`; pushes
     /// the result.
     fn emit_call(&mut self, callee: Callee, reprs: &[Repr], passes: &[Pass], rrepr: Repr, rpass: Pass) -> Result<(), BuildError> {
-        self.emit_call_from(callee, reprs, passes, None, rrepr, rpass)
+        self.emit_call_from(callee, reprs, passes, None, false, rrepr, rpass)
     }
 
     /// Returns `v` from the function: as the one result, through the result pointer, or as

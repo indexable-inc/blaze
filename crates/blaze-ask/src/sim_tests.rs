@@ -332,6 +332,7 @@ fn case(tape: &Tape, p: P) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The invariant: late needs are made once under any interleaving of askers, no running fact is read without waiting, every cycle is named, and no parked body restarts from the top.
 #[test]
 fn late_needs_are_made_once_and_nothing_starts_over() {
     blaze_sim::check(Config::cases(600), |tape| case(tape, P::Clean));

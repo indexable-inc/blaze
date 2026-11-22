@@ -211,6 +211,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     })
 }
 
+/// The invariant: under any interleaving of control-thread writes and running threads, no call reaches unplaced or freed code and no publish overwrites an active stub.
 #[test]
 fn no_schedule_reaches_unplaced_or_freed_code_or_loses_a_store() {
     check(Config::cases(500), |tape| run(tape, Plant::None));

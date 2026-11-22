@@ -5,5 +5,10 @@
 # Written by scripts/src/bin/ambient.rs (`{"command": "producers-write"}`), checked by
 # `{"command": "producers-check"}`.
 # crate	count
+blaze-build-script	1
+blaze-cad-field	2
+blaze-cad-mesh	1
+blaze-comptime	3
 blaze-cond	1
+blaze-roots	3
 blaze-run	1

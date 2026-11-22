@@ -274,7 +274,7 @@ fn first_failure(bounds: Bounds, bug: Bug, always_file: bool) -> Option<(u64, Fa
     (0..SEEDS).find_map(|seed| drive(seed, bounds, bug, always_file).err().map(|why| (seed, why)))
 }
 
-/// The refinement: a lookup's hit equals what running the work now gives (the model runs it
+/// Refinement: a lookup's hit equals what running the work now gives (the model runs it
 /// every time), under random changes to what is read, read-lists that change between runs and
 /// absent reads turning present; and a result filed short of the bound is found by the next
 /// lookup.
@@ -312,7 +312,7 @@ fn a_negative_read_dropped_is_caught() {
     );
 }
 
-/// The invariant: the same sequence writes the same bytes under the same keys in the same
+/// Invariant: the same sequence writes the same bytes under the same keys in the same
 /// order (rule deterministic-output).
 #[test]
 fn the_same_sequence_writes_identical_bytes() {
@@ -328,7 +328,7 @@ fn the_same_sequence_writes_identical_bytes() {
     assert_ne!(*one.log.borrow(), *two.log.borrow(), "two seeds wrote alike: the log shows nothing");
 }
 
-/// The invariant: no put offers other bytes under a key the store holds, when every result is
+/// Invariant: no put offers other bytes under a key the store holds, when every result is
 /// filed whether or not the store had it (two writers of one result).
 #[test]
 fn no_put_offers_other_bytes_under_a_held_key() {
@@ -350,7 +350,7 @@ fn an_answer_keyed_without_a_read_is_caught() {
     assert!(matches!(caught, Some((_, (_, Failure::TwoValues, _)))), "{caught:?}");
 }
 
-/// The invariant: at the bound the filing says so, the lookup says so, and every hit is still
+/// Invariant: at the bound the filing says so, the lookup says so, and every hit is still
 /// what the work would answer.
 #[test]
 fn a_full_chain_is_counted_and_stays_correct() {
@@ -411,7 +411,7 @@ fn a_list_past_the_first_generation_is_stored_and_found() {
     assert_eq!(nothing, Found::Miss { lists: 8, full: true });
 }
 
-/// The invariant: a walk shows its visitor the lists a lookup searches, in the lookup's
+/// Invariant: a walk shows its visitor the lists a lookup searches, in the lookup's
 /// order, each with its slot and its own bytes; a list the visitor passes over is followed by
 /// the next, the visitor's `Some` ends the walk at that list's slot, and its error ends the
 /// walk as that error.
@@ -505,7 +505,7 @@ impl Store for Buffered {
     }
 }
 
-/// The invariant: a store's tally counts each lookup through it once, with the read-lists it
+/// Invariant: a store's tally counts each lookup through it once, with the read-lists it
 /// read, every read it asked the value of (the one that had none too) and whether it hit; a
 /// walk counts the same but the reads, which are its caller's to say; a placing and a keeping
 /// count nothing; and a take leaves zero. The control: the walk whose caller says no reads
@@ -579,7 +579,7 @@ fn a_tally_counts_lookups_hits_lists_and_reads_valued() {
     assert_eq!(store.tally.take(), Counts { lookups: 1, hits: 0, lists: 1, reads: 0 });
 }
 
-/// The invariant: two lists of one base placed by one filing take two slots, though the store
+/// Invariant: two lists of one base placed by one filing take two slots, though the store
 /// shows neither put. The control: a filing that forgets what it placed puts both under one
 /// key.
 #[test]
@@ -609,7 +609,7 @@ fn one_filing_places_two_lists_in_two_slots() {
     assert_eq!(puts[0], puts[1]);
 }
 
-/// The invariant: a read-list reads back as written; bytes of another layout, another base or
+/// Invariant: a read-list reads back as written; bytes of another layout, another base or
 /// cut anywhere are refused by name and never read as a shorter list.
 #[test]
 fn a_read_list_round_trips_and_refuses_what_is_not_one() {
@@ -658,7 +658,7 @@ fn a_read_list_round_trips_and_refuses_what_is_not_one() {
     assert_eq!(LAYOUT.to_le_bytes(), *b"bzrecl01");
 }
 
-/// The invariant: the open generation is the first not full, found in a number of reads
+/// Invariant: the open generation is the first not full, found in a number of reads
 /// logarithmic in the bound.
 #[test]
 fn the_open_generation_is_found_in_logarithmic_reads() {

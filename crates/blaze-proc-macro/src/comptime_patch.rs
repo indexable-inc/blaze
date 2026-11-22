@@ -30,7 +30,7 @@ use blaze_expand::{
 use blaze_own::{AVec, Alloc};
 
 /// Versioned digest domain used when caching pure comptime-patch expansions.
-pub const COMPTIME_PATCH_VERSION: &[u8] = b"blaze-comptime-patch-v1";
+pub const COMPTIME_PATCH_VERSION: &[u8] = b"blaze-comptime-patch-v2";
 
 /// Cumulative telemetry counters for the built-in comptime patch library.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -108,6 +108,36 @@ pub fn has_patch(crate_name: &str, kind: ProcKind, macro_name: &str) -> bool {
     }
 }
 
+/// Returns `true` if `stream` contains macro-rules hygiene markers (`Delim::Invisible`, `$crate`,
+/// or `crate::` paths that may carry macro-expansion hygiene), in which case re-lexing a generated
+/// string would drop hygiene and we must fall back to the real proc macro.
+fn has_hygiene_sensitive_tokens(stream: &TokenStream<'_>) -> bool {
+    let tokens = stream.tokens();
+    for i in 0..tokens.len() {
+        match tokens[i].kind {
+            TokenKind::Open(Delim::Invisible) | TokenKind::Close(Delim::Invisible) => return true,
+            TokenKind::Ident { .. } if stream.text_at(i) == "$crate" => return true,
+            TokenKind::Ident { .. }
+                if stream.text_at(i) == "crate"
+                    && i + 2 < tokens.len()
+                    && is_punct(stream, i + 1, ':')
+                    && is_punct(stream, i + 2, ':') =>
+            {
+                return true;
+            }
+            TokenKind::Punct { char: '$', .. }
+                if i + 1 < tokens.len()
+                    && matches!(tokens[i + 1].kind, TokenKind::Ident { .. })
+                    && stream.text_at(i + 1) == "crate" =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Try to expand `(crate_name, kind, macro_name)` in-process using the default comptime patch library.
 ///
 /// Returns [`PatchResult::Fallback`] whenever the crate/macro is not covered OR the item uses an
@@ -120,6 +150,9 @@ pub fn try_expand<'a>(
     edition: Edition,
     alloc: Alloc<'a>,
 ) -> PatchResult<'a> {
+    if has_hygiene_sensitive_tokens(call.input) {
+        return PatchResult::Fallback;
+    }
     let norm = normalize_crate_name(crate_name);
     let generated: Option<String> = match (norm.as_str(), kind, macro_name) {
         ("serde_derive", ProcKind::Derive, "Serialize") => expand_serde(call.input, false),
@@ -1457,11 +1490,11 @@ fn gen_serde_deserialize(
                             .filter(|&i| !fs[i].skip_deserializing)
                             .collect();
                         if active.len() == 1 && v.fields.len() == 1 && !fs[0].default && !cattrs.default {
-                            let _ = writeln!(
-                                out,
-                                "        struct __Visitor{ty_g}({});",
-                                if marker_ty.is_empty() { "" } else { &marker_ty }
-                            );
+                            if marker_ty.is_empty() {
+                                let _ = writeln!(out, "        struct __Visitor;");
+                            } else {
+                                let _ = writeln!(out, "        struct __Visitor{ty_g}({marker_ty});");
+                            }
                             let _ = writeln!(
                                 out,
                                 "        impl{impl_g} {sp}::de::Visitor<'de> for __Visitor{ty_g}{where_c} {{"
@@ -1494,11 +1527,11 @@ fn gen_serde_deserialize(
                                 quote_str(container_wire)
                             );
                         } else {
-                            let _ = writeln!(
-                                out,
-                                "        struct __Visitor{ty_g}({});",
-                                if marker_ty.is_empty() { "" } else { &marker_ty }
-                            );
+                            if marker_ty.is_empty() {
+                                let _ = writeln!(out, "        struct __Visitor;");
+                            } else {
+                                let _ = writeln!(out, "        struct __Visitor{ty_g}({marker_ty});");
+                            }
                             let _ = writeln!(
                                 out,
                                 "        impl{impl_g} {sp}::de::Visitor<'de> for __Visitor{ty_g}{where_c} {{"
@@ -1684,11 +1717,11 @@ fn gen_serde_struct_visitor(
     let _ = writeln!(out, "        }} }}");
 
     // Struct Visitor
-    let _ = writeln!(
-        out,
-        "        struct __Visitor{ty_g}({});",
-        if marker_ty.is_empty() { "" } else { marker_ty }
-    );
+    if marker_ty.is_empty() {
+        let _ = writeln!(out, "        struct __Visitor;");
+    } else {
+        let _ = writeln!(out, "        struct __Visitor{ty_g}({marker_ty});");
+    }
     let _ = writeln!(
         out,
         "        impl{impl_g} {sp}::de::Visitor<'de> for __Visitor{ty_g}{where_c} {{"
@@ -1915,11 +1948,11 @@ fn gen_serde_enum_deserialize(
     );
     let _ = writeln!(out, "        }} }}");
 
-    let _ = writeln!(
-        out,
-        "        struct __Visitor{ty_g}({});",
-        if marker_ty.is_empty() { "" } else { marker_ty }
-    );
+    if marker_ty.is_empty() {
+        let _ = writeln!(out, "        struct __Visitor;");
+    } else {
+        let _ = writeln!(out, "        struct __Visitor{ty_g}({marker_ty});");
+    }
     let _ = writeln!(
         out,
         "        impl{impl_g} {sp}::de::Visitor<'de> for __Visitor{ty_g}{where_c} {{"
@@ -2075,6 +2108,25 @@ fn expand_thiserror(stream: &TokenStream<'_>) -> Option<String> {
     let adt = parse_adt(stream)?;
     if adt.has_cfg_on_members() {
         return None;
+    }
+    // Generic error ADTs (e.g. `UnbuiltTransactionError<N: Network>`) do not necessarily bound all
+    // type parameters with `Debug + Display`; fall back to real `thiserror-impl` for exact bounds.
+    if adt.generics.iter().any(|g| matches!(g.kind, GenericParamKind::Type)) {
+        return None;
+    }
+    // `thiserror` v2 auto-calls `.display()` on `Path`/`PathBuf` fields and uses `AsDynError`
+    // autoref specialization for non-`Error` report/boxed-dyn wrappers (`eyre::Report`,
+    // `anyhow::Error`, `Box<dyn Error>`); fall back to real `thiserror-impl` on those.
+    for v in &adt.variants {
+        if v.fields.iter().any(|f| {
+            f.ty.contains("Path")
+                || f.ty.contains("Report")
+                || f.ty.contains("eyre")
+                || f.ty.contains("anyhow")
+                || f.ty.contains("dyn")
+        }) {
+            return None;
+        }
     }
     let name = &adt.name;
     let impl_g = adt.impl_generics(None);
@@ -2676,6 +2728,22 @@ fn expand_strum(stream: &TokenStream<'_>, macro_name: &str) -> Option<String> {
 
 fn expand_paste(stream: &TokenStream<'_>) -> Option<String> {
     let tokens = stream.tokens();
+    // Bail to the real `paste` proc macro if the input contains `$crate` or invisible
+    // macro_rules! fragment delimiters, where preserving macro hygiene spans is required.
+    for i in 0..tokens.len() {
+        match tokens[i].kind {
+            TokenKind::Open(Delim::Invisible) | TokenKind::Close(Delim::Invisible) => return None,
+            TokenKind::Ident { .. } if stream.text_at(i) == "$crate" => return None,
+            TokenKind::Punct { char: '$', .. }
+                if i + 1 < tokens.len()
+                    && matches!(tokens[i + 1].kind, TokenKind::Ident { .. })
+                    && stream.text_at(i + 1) == "crate" =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+    }
     let mut out = String::new();
     expand_paste_range(stream, 0, tokens.len(), &mut out)?;
     Some(out)
@@ -2684,6 +2752,7 @@ fn expand_paste(stream: &TokenStream<'_>) -> Option<String> {
 fn expand_paste_range(stream: &TokenStream<'_>, start: usize, end: usize, out: &mut String) -> Option<()> {
     let tokens = stream.tokens();
     let mut i = start;
+    let mut prev_joint = false;
     while i < end {
         match tokens[i].kind {
             TokenKind::Open(Delim::Bracket) => {
@@ -2691,16 +2760,21 @@ fn expand_paste_range(stream: &TokenStream<'_>, start: usize, end: usize, out: &
                 // Check for paste group `[< ... >]`.
                 if i + 2 < close && is_punct(stream, i + 1, '<') && is_punct(stream, close - 1, '>') {
                     let pasted = eval_paste_group(stream, i + 2, close - 1)?;
-                    if !out.is_empty() && !out.ends_with(['(', '[', '{', '<', ':', '\'', '.', '&', '#']) {
+                    if !out.is_empty()
+                        && !prev_joint
+                        && !out.ends_with(['(', '[', '{', '<', ':', '\'', '.', '&', '#', ' '])
+                    {
                         out.push(' ');
                     }
                     out.push_str(&pasted);
+                    prev_joint = false;
                     i = close + 1;
                     continue;
                 }
                 out.push('[');
                 expand_paste_range(stream, i + 1, close, out)?;
                 out.push(']');
+                prev_joint = false;
                 i = close + 1;
             }
             TokenKind::Open(d) => {
@@ -2709,18 +2783,21 @@ fn expand_paste_range(stream: &TokenStream<'_>, start: usize, end: usize, out: &
                     Delim::Paren => ('(', ')'),
                     Delim::Brace => ('{', '}'),
                     Delim::Bracket => ('[', ']'),
-                    Delim::Invisible => (' ', ' '),
+                    Delim::Invisible => return None,
                 };
                 out.push(o);
                 expand_paste_range(stream, i + 1, close, out)?;
                 out.push(c);
+                prev_joint = false;
                 i = close + 1;
             }
             TokenKind::Close(_) => {
+                prev_joint = false;
                 i += 1;
             }
             TokenKind::Punct { char: ch, spacing } => {
                 if !out.is_empty()
+                    && !prev_joint
                     && !matches!(ch, ',' | ';' | ':' | '.' | '>' | '!' | '?')
                     && !out.ends_with(['(', '[', '{', ':', '\'', '<', '&', '#', ' '])
                 {
@@ -2730,20 +2807,29 @@ fn expand_paste_range(stream: &TokenStream<'_>, start: usize, end: usize, out: &
                 if spacing == Spacing::Alone && matches!(ch, ',' | ';') {
                     out.push(' ');
                 }
+                prev_joint = spacing == Spacing::Joint || matches!(ch, '\'' | '#');
                 i += 1;
             }
             TokenKind::Ident { .. } => {
-                if !out.is_empty() && !out.ends_with(['(', '[', '{', '<', ':', '\'', '.', '&', '#', ' ']) {
+                if !out.is_empty()
+                    && !prev_joint
+                    && !out.ends_with(['(', '[', '{', '<', ':', '\'', '.', '&', '#', ' '])
+                {
                     out.push(' ');
                 }
                 out.push_str(stream.text_at(i));
+                prev_joint = false;
                 i += 1;
             }
             TokenKind::Literal { kind, suffix_len, .. } => {
-                if !out.is_empty() && !out.ends_with(['(', '[', '{', '<', ':', '\'', '.', '&', '#', ' ']) {
+                if !out.is_empty()
+                    && !prev_joint
+                    && !out.ends_with(['(', '[', '{', '<', ':', '\'', '.', '&', '#', ' '])
+                {
                     out.push(' ');
                 }
                 write_literal(out, kind, stream.text_at(i), suffix_len);
+                prev_joint = false;
                 i += 1;
             }
         }

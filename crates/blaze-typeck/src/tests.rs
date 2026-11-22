@@ -276,6 +276,7 @@ fn read_list_property(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The invariant: type checking is deterministic and changing any world answer not recorded in the read list changes nothing in the resulting record.
 #[test]
 fn an_answer_not_read_changes_nothing() {
     blaze_sim::check(Config::cases(300), |tape: &Tape| read_list_property(tape, Plant::None));

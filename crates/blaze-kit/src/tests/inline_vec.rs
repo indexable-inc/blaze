@@ -81,6 +81,7 @@ fn case(tape: &Tape) -> Result<(), Broke> {
     no_leaks(&alloc)
 }
 
+/// The refinement: `InlineVec` matches `Vec` under any sequence of operations including spilling from inline to heap storage.
 #[test]
 fn inline_vec_matches_a_vec() {
     blaze_sim::check(Config::cases(400), case);
