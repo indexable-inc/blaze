@@ -44,7 +44,7 @@ const CALL_FILE_SHOWN: &str = "src/lib.rs";
 /// The expansion records under the folder `store`, through a world over that folder.
 fn records_at(store: &Path) -> DirStore {
     let (io, root) = crate::record::native_world(store).unwrap_or_else(|error| panic!("the records at {}: {error}", store.display()));
-    DirStore::expansions(&io, &root)
+    DirStore::expansions(io.spawner(), io.boot().ok(), &root)
 }
 
 /// A fresh folder under the system's temporary one, by this process and a count.

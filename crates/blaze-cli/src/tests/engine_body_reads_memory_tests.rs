@@ -346,7 +346,10 @@ fn with_dependency_rows<R>(io: &Io, inspect: impl FnOnce(&blaze_engine::pages::K
     let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("checkout path")).expect("checkout");
     let mut phases = Phases::new(io.need_clock().expect("clock"));
     let err = io.need_err().expect("err");
-    crate::engine_why::with_kept(&cx, io, &root, &opts(io, 2, false), &mut phases, &err, inspect).expect("open answer").expect("persisted answer")
+    let fs = io.need_fs().expect("files");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    crate::engine_why::with_kept(&cx, &fs, &host, &mut rng, &root, &opts(io, 2, false), &mut phases, &err, inspect).expect("open answer").expect("persisted answer")
 }
 
 /// Check the fetch, the graph it fed, and the proof the caller actually persisted: every cell of

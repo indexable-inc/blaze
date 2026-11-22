@@ -69,7 +69,10 @@ pub(super) fn why(io: &Io, target: &str) -> std::string::String {
     let err = io.need_err().expect("err");
     let mut phases = boxed(|| Phases::new(io.need_clock().expect("a clock")));
     let before = stdout(io).len();
-    if let Err(error) = crate::engine_why::explain(&cx, io, &root, &opts(io, 2, false), target, &mut phases, &out, &err) {
+    let fs = io.need_fs().expect("files");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    if let Err(error) = crate::engine_why::explain(&cx, &fs, &host, &mut rng, &root, &opts(io, 2, false), target, &mut phases, &out, &err) {
         panic!("why {target} answers: {error:?}");
     }
     stdout(io).split_off(before)
@@ -107,7 +110,12 @@ pub(super) fn engine_view(cx: &bstd::Cx, io: &Io, opts: engine_check::Opts<'stat
     let mut phases = boxed(|| Phases::new(io.need_clock().expect("a clock")));
     let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, view, "/ws", frame);
     let err = io.need_err().expect("err");
-    let checked = match engine_check::check(cx, io, &root, opts, &mut shown, &mut phases, &out, &err) {
+    let fs = io.need_fs().expect("files");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    let args = io.args();
+    let net = io.net();
+    let checked = match engine_check::check(cx, &fs, &host, &mut rng, args.as_ref(), net.as_ref(), &root, opts, &mut shown, &mut phases, &out, &err) {
         Ok(checked) => checked,
         Err(error) => panic!("engine-check (fresh {fresh}) answers: {error:?}"),
     };
@@ -469,7 +477,10 @@ pub(super) fn head_reads_of_bodies(io: &Io) -> (std::vec::Vec<std::string::Strin
     let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
     let err = io.need_err().expect("err");
     let mut phases = boxed(|| Phases::new(io.need_clock().expect("a clock")));
-    let judged = crate::engine_why::with_kept(&cx, io, &root, &opts(io, 2, false), &mut phases, &err, |kept| {
+    let fs = io.need_fs().expect("files");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    let judged = crate::engine_why::with_kept(&cx, &fs, &host, &mut rng, &root, &opts(io, 2, false), &mut phases, &err, |kept| {
         let rows = &kept.answer.rows;
         let (mut bad, mut good) = (std::vec::Vec::new(), 0u32);
         for (name, row) in rows.iter().filter(|(name, _)| name.kind == blaze_drive::Kind::BodyCheck) {
@@ -1778,7 +1789,10 @@ fn names_reads_of_bodies(io: &Io) -> (std::vec::Vec<std::string::String>, [u32; 
     let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
     let err = io.need_err().expect("err");
     let mut phases = boxed(|| Phases::new(io.need_clock().expect("a clock")));
-    let judged = crate::engine_why::with_kept(&cx, io, &root, &opts(io, 2, false), &mut phases, &err, |kept| {
+    let fs = io.need_fs().expect("files");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    let judged = crate::engine_why::with_kept(&cx, &fs, &host, &mut rng, &root, &opts(io, 2, false), &mut phases, &err, |kept| {
         let rows = &kept.answer.rows;
         let (mut bad, mut counts) = (std::vec::Vec::new(), [0u32; 4]);
         for (name, row) in rows.iter() {
@@ -2288,7 +2302,10 @@ fn stored_graph_out(io: &Io) -> blaze_ids::ContentId {
     let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
     let err = io.need_err().expect("err");
     let mut phases = boxed(|| Phases::new(io.need_clock().expect("a clock")));
-    let got = crate::engine_why::with_kept(&cx, io, &root, &opts(io, 2, false), &mut phases, &err, |kept| kept.answer.rows.get(&blaze_drive::Name::unit_graph()).map(|row| row.out));
+    let fs = io.need_fs().expect("files");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    let got = crate::engine_why::with_kept(&cx, &fs, &host, &mut rng, &root, &opts(io, 2, false), &mut phases, &err, |kept| kept.answer.rows.get(&blaze_drive::Name::unit_graph()).map(|row| row.out));
     got.expect("the stored answer opens").expect("an answer opens").expect("the answer has a unit graph row")
 }
 

@@ -55,7 +55,6 @@ use blaze_remote::read::{Head, HeadCheck, Namespace, Object, Origin, Refused, Si
 use blaze_toolchain::ToolchainId;
 use bstd::clock::Clock;
 use bstd::cx::Cx;
-use bstd::io::Io;
 use bstd::out::Out;
 
 use super::plain_place::{PlaceError, PlainPlace, StoreAlloc};
@@ -234,21 +233,30 @@ impl From<TakeError> for CliError {
 /// set of this blaze's toolchain and target taken into `opened`'s store as the module says, its
 /// line on `err` when records were taken and in the profile (`phases`) always. With no
 /// `--origin`, nothing.
-pub(crate) fn before_first_phase(cx: &Cx, io: &Io, opened: &Opened, toolchain: ToolchainId, phases: &mut crate::phases::Phases, err: &Out) -> Result<(), CliError> {
+#[expect(clippy::too_many_arguments, reason = "the take's edge: each argument one specific capability or handle")]
+pub(crate) fn before_first_phase(
+    cx: &Cx,
+    args: Option<&bstd::args::Args>,
+    fs: &bstd::fs::Fs,
+    net: Option<&bstd::net::Net>,
+    opened: &Opened,
+    toolchain: ToolchainId,
+    phases: &mut crate::phases::Phases,
+    err: &Out,
+) -> Result<(), CliError> {
     // A command given no argument list (a test's check called directly) names no origin.
-    let Some(args) = io.args() else { return Ok(()) };
-    let flags = crate::flags(&args)?;
+    let Some(args) = args else { return Ok(()) };
+    let flags = crate::flags(args)?;
     let Some(origin) = flags.origin else {
         if flags.origin_key.is_some() {
             return Err(CliError::Usage("--origin-key names the key of an --origin: name the origin too"));
         }
         return Ok(());
     };
-    let fs = io.need_fs()?;
     let hex = toolchain.hex();
     let set = SetName::new(hex.as_str(), crate::graph::TRIPLE).map_err(TakeError::Set)?;
     let id = set.id();
-    let named = NamedOrigin::published(cx, &fs, io.net().as_ref(), origin, flags.origin_key, set, &opened.lent)?;
+    let named = NamedOrigin::published(cx, fs, net, origin, flags.origin_key, set, &opened.lent)?;
     let clock = phases.clock().clone();
     let taken = take(cx, &named, id, &opened.lent, toolchain, &clock, TakePlant::NONE)?;
     if taken.how == How::Took {

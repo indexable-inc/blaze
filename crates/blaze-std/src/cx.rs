@@ -601,6 +601,20 @@ impl Cx {
         self.placed.io()
     }
 
+    /// A narrow `Send + Sync + Clone` handle for spawning root [`Cx`] values on background
+    /// threads (e.g. tickers, status watchers, shared stores) without handing down the whole `Io`.
+    pub fn spawner(&self) -> CxSpawn {
+        CxSpawn::new(self.io().clone())
+    }
+
+    /// Whether this context's world is simulated (no real host OS/filesystem).
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn is_simulated(&self) -> bool {
+        self.io().with_sim(|_| ()).is_some()
+    }
+
     /// A scope of tasks inside this one: spawn its tasks with [`Scope::spawn`], then
     /// [`Scope::join`] it, which returns once each has ended, with the first that failed. A
     /// task may borrow from the frame that holds the scope. The scope is linear: leaving it
@@ -1034,5 +1048,38 @@ impl core::fmt::Debug for Cx {
             .field("deadline", &self.deadline)
             .field("cancelled", &self.cancelled())
             .finish()
+    }
+}
+
+/// Narrow `Send + Sync + Clone` capability that only spawns root [`Cx`] values on another thread
+/// (no `Fs`, `Env`, `Net`, `Clock`, `Out`, `Args`, `Host`, or `Rng`). Obtained from [`Cx::spawner`]
+/// or [`Io::spawner`].
+#[derive(Clone)]
+pub struct CxSpawn {
+    world: Io,
+}
+
+impl CxSpawn {
+    pub(crate) fn new(world: Io) -> CxSpawn {
+        CxSpawn { world }
+    }
+
+    /// Creates a root [`Cx`] on the calling thread with `budget` and `scratch` frame bytes.
+    pub fn cx(&self, budget: core::time::Duration, scratch: usize) -> Result<Cx, Stopped> {
+        self.world.cx(budget, scratch)
+    }
+
+    /// Whether the underlying world is simulated.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn is_simulated(&self) -> bool {
+        self.world.with_sim(|_| ()).is_some()
+    }
+}
+
+impl core::fmt::Debug for CxSpawn {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CxSpawn").finish_non_exhaustive()
     }
 }

@@ -26,7 +26,7 @@
 
 use bstd::entry::Status;
 use bstd::out::Out;
-use bstd::{Cx, Io};
+use bstd::Cx;
 
 use crate::CliError;
 use crate::phases::Phases;
@@ -39,11 +39,24 @@ pub(crate) const NOT_TAKEN: [(&str, &str, fn(&crate::Flags<'_>) -> bool); 0] = [
 /// The command: `check`'s arguments refused where the engine does not honour them, then the
 /// engine's check (engine_check.rs `run`), which prints its findings, notes and closing line
 /// through print.rs and returns the status main.rs `STATUSES` explains.
-pub(crate) fn run(cx: &Cx, io: &Io, out: &Out, phases: &mut Phases, heap: &'static blaze_own::Heap) -> Result<Status, CliError> {
-    let args = io.need_args()?;
-    let flags = crate::flags(&args)?;
+#[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one specific capability")]
+pub(crate) fn run(
+    cx: &Cx,
+    args: &bstd::args::Args,
+    fs: &bstd::fs::Fs,
+    env: Option<&bstd::env::Env>,
+    net: Option<&bstd::net::Net>,
+    host: &bstd::host::Host,
+    clock: &bstd::clock::Clock,
+    rng: &mut bstd::rng::Rng,
+    out: &Out,
+    err: &Out,
+    phases: &mut Phases,
+    heap: &'static blaze_own::Heap,
+) -> Result<Status, CliError> {
+    let flags = crate::flags(args)?;
     refuse_not_taken(&flags)?;
-    crate::engine_check::run(cx, io, out, phases, heap)
+    crate::engine_check::run(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap)
 }
 
 /// The first flag given that the engine's check does not take, refused by name (rule 3: never

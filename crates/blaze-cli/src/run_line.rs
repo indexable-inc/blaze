@@ -23,8 +23,10 @@ use blaze_report::frame::Choice;
 use blaze_report::terminal::{self, Color, Config, Terminal};
 use blaze_screen::{Caps, LineBuf, RunStatus, RunStatusOpts, StatusFrame, Step, Unwatched, Watch, encode_status};
 use bstd::clock::{Clock, Instant};
+use bstd::cx::CxSpawn;
+use bstd::env::Env;
 use bstd::out::{Out, OutError};
-use bstd::{Cx, Io, Stopped};
+use bstd::{Cx, Stopped};
 
 /// The longest the ticker sleeps with nothing due; it reads the terminal's width when it wakes.
 const IDLE: Duration = Duration::from_secs(1);
@@ -71,14 +73,13 @@ pub(crate) struct LineOpts {
 }
 
 impl LineOpts {
-    /// From `io`'s environment variables, whether `err` is a terminal and how wide, and `--color`.
-    pub(crate) fn from_io(io: &Io, err: &Out, color: Choice) -> LineOpts {
-        let env = io.env();
-        let var = |name: &str| -> Option<&str> { env.as_ref()?.get(&bstd::env::VarName::new(name).ok()?).ok().flatten() };
+    /// From `env`'s environment variables, whether `err` is a terminal and how wide, and `--color`.
+    pub(crate) fn from_env(env: Option<&Env>, err: &Out, color: Choice) -> LineOpts {
+        let var = |name: &str| -> Option<&str> { env?.get(&bstd::env::VarName::new(name).ok()?).ok().flatten() };
         Self::new(&|name| var(name).map(String::from), err, color)
     }
 
-    /// From the command's variables (`var`, read through `io.env()` by the caller), whether
+    /// From the command's variables (`var`, read through `Env` by the caller), whether
     /// `err` is a terminal and how wide, and `--color`.
     pub(crate) fn new(var: &dyn Fn(&str) -> Option<String>, err: &Out, color: Choice) -> LineOpts {
         let on_terminal = err.is_terminal();
@@ -147,8 +148,8 @@ impl Line<'_> {
     }
 
     /// The ticker's loop: what time makes due written, until the line is over.
-    fn tick(&self, io: &Io) {
-        let cx = match io.cx(Duration::MAX, TICKER_SCRATCH) {
+    fn tick(&self, spawner: &CxSpawn) {
+        let cx = match spawner.cx(Duration::MAX, TICKER_SCRATCH) {
             Ok(cx) => cx,
             Err(why) => {
                 let mut shared = self.shared.lock();
@@ -253,7 +254,6 @@ impl Watch for ProgressSink<'_, '_> {
 /// command ends with that error, rule 3).
 pub(crate) fn watched<R>(
     cx: &Cx,
-    io: &Io,
     err: &Out,
     clock: &Clock,
     opts: LineOpts,
@@ -262,12 +262,13 @@ pub(crate) fn watched<R>(
     if !opts.live {
         return Ok(work(&Unwatched, &ProgressSink::NONE));
     }
+    let spawner = cx.spawner();
     let core = RunStatus::new(RunStatusOpts { caps: opts.caps });
     let line = Line { shared: Lock::new("run.line", Shared { core, err, terminal: opts.terminal, failed: None }), woken: Signal::new("run.line.due"), clock, began: clock.now() };
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .name(std::string::String::from("blaze run line"))
-            .spawn_scoped(scope, || line.tick(io))
+            .spawn_scoped(scope, || line.tick(&spawner))
             .map_err(|why| RunLineError::Ticker { kind: why.kind() })?;
         let over = Over { line: &line, cx };
         let bg = ProgressSink { line: Some(&line) };

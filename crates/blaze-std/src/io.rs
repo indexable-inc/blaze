@@ -942,6 +942,12 @@ impl Io {
         Ok(Cx::root(deadline, scratch, self.clone()))
     }
 
+    /// Narrow `Send + Sync + Clone` capability that only spawns root [`Cx`] values (no `Fs`,
+    /// `Env`, `Net`, `Clock`, `Out`, `Args`, `Host`, or `Rng`).
+    pub fn spawner(&self) -> crate::cx::CxSpawn {
+        crate::cx::CxSpawn::new(self.clone())
+    }
+
     /// What the host offers: fixed when this `Io` was made.
     #[blaze::nopanic]
     #[blaze::noalloc]

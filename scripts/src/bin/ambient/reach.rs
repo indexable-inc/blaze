@@ -227,13 +227,17 @@ pub(super) enum ReachUse {
     MainOs,
     /// `Io` as a parameter's type in a `fn main` signature (D104: a whole world asked for).
     MainIo,
+    /// `&Io` / `&'a Io` / `&bstd::Io` / `&bstd::io::Io` as a parameter or field type outside
+    /// `blaze-std` (D104: take specific capabilities like `&Out`, `&Fs`, `&Clock`, `&Env`, `&Host`,
+    /// `CxSpawn` instead of borrowing the whole world).
+    IoRef,
 }
 
 impl ReachUse {
     const fn column(self) -> Column {
         match self {
             ReachUse::Call(it) => it.column,
-            ReachUse::MainOs | ReachUse::MainIo => Column::World,
+            ReachUse::MainOs | ReachUse::MainIo | ReachUse::IoRef => Column::World,
         }
     }
 
@@ -244,6 +248,7 @@ impl ReachUse {
             ReachUse::Call(Call { prev: None, word, .. }) => format!("`{word}()`"),
             ReachUse::MainOs => "`Os::process()`".to_owned(),
             ReachUse::MainIo => "`Io` in a `fn main` signature".to_owned(),
+            ReachUse::IoRef => "`&Io` parameter or field (pass specific capabilities like `&Out`, `&Fs`, `&Clock`, `CxSpawn`)".to_owned(),
         }
     }
 }
@@ -317,6 +322,49 @@ fn typed_here(text: &str, at: usize, end: usize) -> bool {
     before.ends_with(':') && !before.ends_with("::")
 }
 
+/// Whether the word at bytes `at..end` of `text` stands as a borrowed `&Io` / `&'a Io` /
+/// `&mut Io` / `&bstd::io::Io` parameter or struct field type: after `:` and `&` (optionally
+/// `'lifetime`, `mut`, and path segments), before `,`, `)`, or `}`. Local `struct Io` / `trait Io`
+/// types defined in the same file are ignored unless qualified with `bstd::`.
+fn borrowed_io_here(text: &str, at: usize, end: usize, has_local_io: bool) -> bool {
+    if !text[end..].trim_start().starts_with([',', ')', '}']) {
+        return false;
+    }
+    let mut before = text[..at].trim_end();
+    let mut qualified_bstd = false;
+    let mut qualified = false;
+    // Bounded: each turn takes one `segment::` off the end.
+    while let Some(rest) = before.strip_suffix("::") {
+        qualified = true;
+        let rest = rest.trim_end();
+        let word = trailing_word(rest);
+        if word == "bstd" {
+            qualified_bstd = true;
+        }
+        if word.is_empty() {
+            break;
+        }
+        before = rest[..rest.len() - word.len()].trim_end();
+    }
+    if has_local_io && !qualified_bstd {
+        return false;
+    }
+    if qualified && !qualified_bstd {
+        return false;
+    }
+    if trailing_word(before) == "mut" {
+        before = before[..before.len() - 3].trim_end();
+    }
+    let word = trailing_word(before);
+    if !word.is_empty() && before[..before.len() - word.len()].ends_with('\'') {
+        before = before[..before.len() - word.len() - 1].trim_end();
+    }
+    let Some(before) = before.strip_suffix('&').map(str::trim_end) else {
+        return false;
+    };
+    before.ends_with(':') && !before.ends_with("::")
+}
+
 /// Each reach in `text`, test code included ([`scan_file`] splits it): its line (from 1) and
 /// what it is, in order. Comments, strings and characters are skipped as [`item_end`] skips
 /// them.
@@ -331,6 +379,8 @@ pub(super) fn reach_uses(text: &str) -> Vec<(usize, ReachUse)> {
     let mut main: Option<(usize, usize)> = None;
     // The parameter list of the last `fn main` read, at any depth.
     let mut params: Option<(usize, usize)> = None;
+    // Local private `struct Io` / `trait Io` / `enum Io` / `type Io` definitions (not `bstd::Io`).
+    let has_local_io = text.contains("struct Io") || text.contains("trait Io") || text.contains("enum Io") || text.contains("type Io");
     // Bounded: every turn moves `at` forward, to the end of the text at most.
     while at < bytes.len() {
         let next = bytes.get(at + 1).copied();
@@ -354,6 +404,8 @@ pub(super) fn reach_uses(text: &str) -> Vec<(usize, ReachUse)> {
                 }
                 let found = if word == "Io" && params.is_some_and(|(from, to)| from < at && at < to) {
                     typed_here(text, at, end).then_some(ReachUse::MainIo)
+                } else if word == "Io" && borrowed_io_here(text, at, end, has_local_io) {
+                    Some(ReachUse::IoRef)
                 } else {
                     reach_use_of(text, at, end).map(|it| {
                         let in_main = main.is_some_and(|(from, to)| from < at && at < to);
@@ -398,12 +450,14 @@ fn count_reach(root: &Path) -> Result<ReachCounts, TreeError> {
         let path = parts.join("/");
         let whole_test = skipped.contains(&path);
         let krate = crate_of(root, &parts, &mut manifests);
+        let is_bstd = krate == "blaze-std";
         let (outside, inside) = out.entry(krate).or_default();
         // An entry file's `fn main` takes the OS root freely: that is where it is taken.
         let entry = super::heap::entry_file(&path);
         let kept = |what: ReachUse| match what {
             ReachUse::MainOs if entry => None,
             ReachUse::MainOs => Some(ReachUse::Call(&OS_PROCESS)),
+            ReachUse::IoRef if is_bstd => None,
             other => Some(other),
         };
         for (line, what) in &found.reach {
@@ -665,6 +719,14 @@ pub(super) fn selftest() {
                  const T: &str = \"fn main(cx: &Cx, io: Io)\";\nfn main(_: &mut Io, n: IoKind) {}\n";
     let found = reach_uses(mains);
     expect(found == vec![(1, ReachUse::MainIo), (7, ReachUse::MainIo)], &format!("`Io` in a `main` signature: {found:?}"));
+
+    // D104: `&Io` parameters and fields are denied outside `blaze-std`; specific capabilities pass.
+    let io_refs = "fn bad(io: &Io) {}\nfn bad_path(io: &'a bstd::io::Io) {}\nstruct Bad<'a> { io: &'a Io }\nfn good(out: &Out, fs: &Fs) {}\n";
+    let found = reach_uses(io_refs);
+    expect(
+        found == vec![(1, ReachUse::IoRef), (2, ReachUse::IoRef), (3, ReachUse::IoRef)],
+        &format!("`&Io` parameters and fields are caught: {found:?}"),
+    );
 
     // The list: over is refused naming the added line; under is a note; it reads back.
     let site = |line| ReachSite { path: "crates/a/src/lib.rs".to_owned(), line, what: instant };

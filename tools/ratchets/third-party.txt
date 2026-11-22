@@ -89,7 +89,6 @@ blaze-launcher	1	0	109
 blaze-lint	0	0	8
 blaze-lint-defs	0	0	8
 blaze-lir	0	0	8
-blaze-live	0	0	1
 blaze-lower	0	0	86
 blaze-macro-run	0	0	41
 blaze-malloc	0	0	1

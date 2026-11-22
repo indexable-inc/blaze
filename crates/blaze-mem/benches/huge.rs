@@ -151,10 +151,8 @@ mod walks {
             // SAFETY: as above; the ioctl takes no argument memory.
             unsafe { libc::ioctl(self.fd, IOC_DISABLE as _, none) };
             // SAFETY: `count` is a live eight-byte integer and the kernel writes exactly those bytes.
-            let _ = blaze_sys::posix::io::read(
-                blaze_sys::Fd::new(self.fd),
-                core::slice::from_raw_parts_mut((&raw mut count).cast::<u8>(), 8),
-            );
+            let buf = unsafe { core::slice::from_raw_parts_mut((&raw mut count).cast::<u8>(), 8) };
+            let _ = blaze_sys::posix::io::read(blaze_sys::Fd::new(self.fd), buf);
             count
         }
     }

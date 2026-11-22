@@ -699,7 +699,7 @@ fn read_whole(store: &DirStore, krate: &ContentId) -> Result<Option<Whole>, File
         return Ok(None);
     };
     // A host with no boot fact vouches for nothing: the body is hashed at every open.
-    let boot = store.files.io.boot().ok();
+    let boot = store.files.boot;
     let mut vouched = false;
     if let Some(boot) = &boot
         && let Held::Whole(said) = store.files.read(&whole_file(krate))?
@@ -737,7 +737,7 @@ fn write_whole(store: &DirStore, krate: &ContentId, file: &[u8]) -> Result<(), F
         RecordPlant::FramedPublish => store.files.publish_framed(&table_file(krate), file)?,
         RecordPlant::None | RecordPlant::SealSkipped => store.files.publish(&table_file(krate), file)?,
     }
-    if let Ok(boot) = store.files.io.boot() {
+    if let Some(boot) = store.files.boot {
         store.files.publish(&whole_file(krate), &voucher(&boot.0, &file[file.len() - SEAL_LEN..]))?;
     }
     Ok(())

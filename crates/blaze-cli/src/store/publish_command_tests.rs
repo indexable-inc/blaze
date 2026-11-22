@@ -75,7 +75,8 @@ fn publish(io: &Io, cx: &Cx, signer: &'static str) -> (Result<Status, CliError>,
     let (_home, lent) = plant(io, cx, "/a", &records, false);
     let out = io.need_out().expect("out");
     let words = Words { folder: "o", signer };
-    let result = trusted::publish(cx, io, &out, &words, &lent, TOOLCHAIN);
+    let fs = io.need_fs().expect("fs");
+    let result = trusted::publish(cx, &fs, &out, &words, &lent, TOOLCHAIN);
     let (said, warned) = io.script(|host| (host.out.clone(), host.err.clone())).expect("a simulated host");
     (result, String::from_utf8_lossy(&said).into_owned(), String::from_utf8_lossy(&warned).into_owned())
 }

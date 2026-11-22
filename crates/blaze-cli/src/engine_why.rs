@@ -18,7 +18,7 @@ use bstd::fs::{Dir, ReadWrite};
 use bstd::mem::{Bytes, Frame};
 use bstd::out::Out;
 use bstd::path::Path;
-use bstd::{Cx, Io};
+use bstd::Cx;
 
 use crate::engine_check::Opts;
 use crate::phases::Phases;
@@ -27,11 +27,22 @@ use crate::{CliError, work};
 
 /// The explanation of `target` from the checkout's stored answer, printed to `out`.
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
-pub(crate) fn explain(cx: &Cx, io: &Io, root: &Dir<ReadWrite>, opts: &Opts<'_>, target: &str, phases: &mut Phases, out: &Out, err: &Out) -> Result<Status, CliError> {
+pub(crate) fn explain(
+    cx: &Cx,
+    fs: &bstd::fs::Fs,
+    host: &bstd::host::Host,
+    rng: &mut bstd::rng::Rng,
+    root: &Dir<ReadWrite>,
+    opts: &Opts<'_>,
+    target: &str,
+    phases: &mut Phases,
+    out: &Out,
+    err: &Out,
+) -> Result<Status, CliError> {
     let frame = cx.frame();
     let erased = blaze_own::Erased::new(frame);
     let place = &opts.place;
-    let opened = crate::store::open_for_command(cx, io, place.home, root, place.checkout, phases.clock(), err, opts.heap)?;
+    let opened = crate::store::open_for_command(cx, fs, host, rng, place.home, root, place.checkout, phases.clock(), err, opts.heap)?;
     let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), err, erased.handle())?;
     let answer_root = crate::engine_answer::root_name(place.checkout, frame);
     let mut text = blaze_own::String::new_in(frame);
@@ -283,11 +294,22 @@ fn walk<'m, 'a>(
 /// stored, or one that does not read): what a command-level test asks of the rows' read lists
 /// and definitions (engine_check_tests.rs `names_reads_of_bodies`). Nothing is written.
 #[cfg(test)]
-pub(crate) fn with_kept<R>(cx: &Cx, io: &Io, root: &Dir<ReadWrite>, opts: &Opts<'_>, phases: &mut Phases, err: &Out, with: impl FnOnce(&Kept<'_>) -> R) -> Result<Option<R>, CliError> {
+#[expect(clippy::too_many_arguments, reason = "the test's edge: each argument one specific capability or handle")]
+pub(crate) fn with_kept<R>(
+    cx: &Cx,
+    fs: &bstd::fs::Fs,
+    host: &bstd::host::Host,
+    rng: &mut bstd::rng::Rng,
+    root: &Dir<ReadWrite>,
+    opts: &Opts<'_>,
+    phases: &mut Phases,
+    err: &Out,
+    with: impl FnOnce(&Kept<'_>) -> R,
+) -> Result<Option<R>, CliError> {
     let frame = cx.frame();
     let erased = blaze_own::Erased::new(frame);
     let place = &opts.place;
-    let opened = crate::store::open_for_command(cx, io, place.home, root, place.checkout, phases.clock(), err, opts.heap)?;
+    let opened = crate::store::open_for_command(cx, fs, host, rng, place.home, root, place.checkout, phases.clock(), err, opts.heap)?;
     let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), err, erased.handle())?;
     let answer_root = crate::engine_answer::root_name(place.checkout, frame);
     let got = match crate::engine_answer::load_pointer(cx, &mut store, &answer_root)? {

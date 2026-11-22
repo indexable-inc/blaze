@@ -23,11 +23,11 @@ blaze-bstd-convert	9
 blaze-build	762
 blaze-build-script	109
 blaze-c	4
-blaze-cad	44
+blaze-cad	47
 blaze-cad-field	177
 blaze-cad-mesh	61
 blaze-cad-out	9
-blaze-cad-picture	54
+blaze-cad-picture	56
 blaze-cas	307
 blaze-cast	40
 blaze-cc	17
@@ -78,7 +78,6 @@ blaze-launcher	6
 blaze-lint	187
 blaze-lint-defs	21
 blaze-lir	1466
-blaze-live	41
 blaze-lower	307
 blaze-malloc	48
 blaze-manifest	6

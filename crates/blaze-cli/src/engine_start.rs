@@ -25,7 +25,7 @@ use blaze_ids::ContentId;
 use blaze_own::Alloc;
 use bstd::entry::Status;
 use bstd::out::Out;
-use bstd::{Cx, Io};
+use bstd::Cx;
 use core::fmt;
 
 use crate::body_types::TreesSeen;
@@ -199,11 +199,25 @@ fn end_procs<'n, F: Fn() -> crate::job_texts::MadeProcs<'n>>(cx: &Cx, maker: &cr
 
 /// main.rs's `run` and `test` arms: the arguments, the engine's check, then the start. `run`'s
 /// words go to stderr (its stdout is its program's), `test`'s to stdout (main.rs `words`).
-pub(crate) fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'static blaze_own::Heap, command: Command) -> Result<Status, CliError> {
-    let args = io.need_args()?;
+#[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one specific capability")]
+pub(crate) fn command(
+    cx: &Cx,
+    args: &bstd::args::Args,
+    fs: &bstd::fs::Fs,
+    env: Option<&bstd::env::Env>,
+    net: Option<&bstd::net::Net>,
+    host: &bstd::host::Host,
+    clock: &bstd::clock::Clock,
+    rng: &mut bstd::rng::Rng,
+    out: &Out,
+    err: &Out,
+    phases: &mut Phases,
+    heap: &'static blaze_own::Heap,
+    command: Command,
+) -> Result<Status, CliError> {
     let mut packages = blaze_own::Vec::new_in(cx.frame());
     // `-p` picks from the engine's unit graph for `run` and `test` alike (R3).
-    let flags = crate::parse_flags(&args, |name| packages.push(name))?;
+    let flags = crate::parse_flags(args, |name| packages.push(name))?;
     if flags.fix.is_some() {
         return Err(CliError::Usage("--fix is `blaze check`'s"));
     }
@@ -211,22 +225,21 @@ pub(crate) fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phase
         Command::Test => run_package::Select { test_packages: packages.as_slice(), bin: flags.select.bin, ..run_package::Select::NONE },
         Command::Run | Command::Check => run_package::Select { test_packages: packages.as_slice(), ..flags.select },
     };
-    let launch = program::Launch { io, select, grants: &flags.grants, args: &flags.program };
+    let launch = program::Launch { fs, env, host, out, err, select, grants: &flags.grants, args: &flags.program };
     let words = crate::words(command, out, err);
     // `blaze run`'s live line on a terminal's stderr (run_line.rs), as the old path had it.
-    let line = crate::run_line::LineOpts::from_io(io, err, flags.color);
+    let line = crate::run_line::LineOpts::from_env(env, err, flags.color);
     let line = crate::run_line::LineOpts { live: line.live && matches!(command, Command::Run | Command::Test), ..line };
-    let clock = io.need_clock()?;
-    let lined = crate::run_line::watched(cx, io, err, &clock, line, |watch, bg| {
+    let lined = crate::run_line::watched(cx, err, clock, line, |watch, bg| {
         watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Checking));
         let bg_live = if line.live { Some(bg) } else { None };
-        check_for_start(cx, io, words, phases, heap, &flags, command == Command::Run, bg_live, |standing, phases| {
+        check_for_start(cx, Some(args), fs, env, net, host, rng, words, err, phases, heap, &flags, command == Command::Run, bg_live, |standing, phases, rng| {
             let (root, frame) = (standing.checkout, standing.frame);
             // The member's folder the command was given selects when no `-p` does (R3).
             let select = run_package::Select { member: standing.member, ..launch.select };
             let started = match command {
                 Command::Run => run_package::pick(cx, root, select, frame).and_then(|picked| run_program(cx, standing, &picked, &launch, phases, watch)),
-                Command::Test => run_package::test_packages(cx, root, select, frame).and_then(|packages| run_tests(cx, standing, &packages, select.bin, &launch, phases, watch)),
+                Command::Test => run_package::test_packages(cx, root, select, frame).and_then(|packages| run_tests(cx, standing, &packages, select.bin, &launch, clock, rng, phases, watch)),
                 Command::Check => Err(CliError::Usage("`check` is engine_check.rs's; engine_start.rs starts `run` and `test`")),
             };
             write_start_profile(cx, root, phases, frame)?;
@@ -287,7 +300,7 @@ pub(crate) fn run_program(
         laid: None,
         plant: crate::work::Sizes::USUAL.plant,
         workers: standing.workers.get(),
-        fetch_env: standing.place.fetch_env(phases.clock().clone(), standing.toolchain, launch.io.need_fs()?, heap),
+        fetch_env: standing.place.fetch_env(phases.clock().clone(), standing.toolchain, launch.fs.clone(), heap),
         macros: None,
         names: None,
         bodies: crate::body_types::Kept::default(),
@@ -380,14 +393,22 @@ fn suite_closure<'a>(list: &blaze_world::crate_list::CrateList<'_>, test: usize,
 /// `blaze test` over the check's answer: the selected packages' suites from the answer's rows,
 /// the body ids, then each suite under the lazy parent (test_drive.rs `run_suites`). A test
 /// that calls a body whose check does not run (D151) is NOT RUN naming that body; the others run.
+#[expect(clippy::too_many_arguments, reason = "the test runner's edge: each argument one specific capability or record")]
 pub(crate) fn run_tests(
-    cx: &Cx, mut standing: Standing<'_, '_>, packages: &[&str], bin: Option<&str>, launch: &program::Launch<'_>, phases: &mut Phases, watch: &dyn blaze_screen::Watch,
+    cx: &Cx,
+    mut standing: Standing<'_, '_>,
+    packages: &[&str],
+    bin: Option<&str>,
+    launch: &program::Launch<'_>,
+    clock: &bstd::clock::Clock,
+    rng: &mut bstd::rng::Rng,
+    phases: &mut Phases,
+    watch: &dyn blaze_screen::Watch,
 ) -> Result<Status, CliError> {
     let (frame, heap) = (standing.frame, standing.heap);
     let erased = blaze_own::Erased::new(frame);
     let alloc = erased.handle();
-    let io = launch.io;
-    let out = io.need_out()?;
+    let out = launch.out;
     let err = standing.err;
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Crates));
     let mut read = EngineRecords::new();
@@ -403,7 +424,7 @@ pub(crate) fn run_tests(
         laid: None,
         plant: crate::work::Sizes::USUAL.plant,
         workers,
-        fetch_env: standing.place.fetch_env(phases.clock().clone(), standing.toolchain, io.need_fs()?, heap),
+        fetch_env: standing.place.fetch_env(phases.clock().clone(), standing.toolchain, launch.fs.clone(), heap),
         macros: None,
         names: None,
         bodies: crate::body_types::Kept::default(),
@@ -511,7 +532,7 @@ pub(crate) fn run_tests(
             let builder = crate::run_parent::builder_for(unit.edition.name(), overflow, panic, producer, isa).map_err(parent)?;
             runnable.push(crate::test_drive::Suite { names, crates, builder, unit: *unit, place, native: images[at] });
         }
-        let ran = crate::test_drive::run_suites(cx, io, &runnable, &ids, config, launch.args, standing.lent, root, procs, heap, watch, frame);
+        let ran = crate::test_drive::run_suites(cx, launch.fs, launch.env, launch.host, clock, rng, launch.out, launch.err, &runnable, &ids, config, launch.args, standing.lent, root, procs, heap, watch, frame);
         end_procs(cx, &maker, err, "test")?;
         ids_line = Some(ids.line(&asked, ids_ns));
         ran.map_err(|error| CliError::Test(blaze_own::Box::new_in(error, heap.alloc())))?

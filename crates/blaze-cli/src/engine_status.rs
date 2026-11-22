@@ -29,10 +29,11 @@ use blaze_engine::{STAGES, Stage};
 use blaze_own::FixedString;
 use bstd::clock::Clock;
 use bstd::fs::{Dir, ReadWrite};
+use bstd::host::Host;
 use bstd::out::Out;
 use bstd::path::Path;
 use bstd::procs::{By, Requests};
-use bstd::{Cx, Io};
+use bstd::Cx;
 
 use crate::engine_memory::AtEnd;
 
@@ -589,8 +590,10 @@ fn report_live(board: &Board<'_>, live: &(dyn blaze_screen::Watch + Sync)) {
 /// do not reach in [`STOP_BOUND`] is written from here and ends the process (`Exit::StopStalled`).
 /// A plant starts no watcher: its requests are the driver's at its scheduling points, so a planted
 /// run stays one deterministic thread on one worker.
+#[expect(clippy::too_many_arguments, reason = "the watcher's edge: each argument one specific capability or sink")]
 pub(crate) fn watched<R>(
-    io: &Io,
+    cx: &Cx,
+    host: Option<&Host>,
     root: &Dir<ReadWrite>,
     err: &Out,
     clock: &Clock,
@@ -602,6 +605,7 @@ pub(crate) fn watched<R>(
     if board.asked.is_none() && every.is_none() && live.is_none() {
         return Ok(work());
     }
+    let spawner = cx.spawner();
     struct Over<'b, 'r>(&'b Board<'r>, &'b Signal);
     impl Drop for Over<'_, '_> {
         fn drop(&mut self) {
@@ -617,7 +621,7 @@ pub(crate) fn watched<R>(
     let got = std::thread::scope(|scope| {
         std::thread::Builder::new()
             .spawn_scoped(scope, || {
-                let cx = match io.cx(Duration::MAX, WATCH_SCRATCH) {
+                let cx = match spawner.cx(Duration::MAX, WATCH_SCRATCH) {
                     Ok(cx) => cx,
                     Err(why) => {
                         *failed.lock() = Some(why);
@@ -632,7 +636,7 @@ pub(crate) fn watched<R>(
                         report_live(board, sink);
                     }
                     let act = watch.look(now, board.stopping(), board.take_status(), board.claimed.load(Ordering::Acquire) != 0);
-                    act_on(&cx, io, root, err, board, act, now);
+                    act_on(&cx, host, root, err, board, act, now);
                     // A bounded wait (rule 15, 18): the next look in a tick, or at the work's end.
                     let _span = cx.span("engine status: the next look");
                     woken.wait_for(&mut guard, TICK);
@@ -652,7 +656,7 @@ pub(crate) fn watched<R>(
 
 /// One act's writes. A write that fails is said on stderr once and the check goes on (the
 /// status is a report; the check's own result is the command's).
-fn act_on(cx: &Cx, io: &Io, root: &Dir<ReadWrite>, err: &Out, board: &Board<'_>, act: Act, now: u64) {
+fn act_on(cx: &Cx, host: Option<&Host>, root: &Dir<ReadWrite>, err: &Out, board: &Board<'_>, act: Act, now: u64) {
     let mut text = FixedString::<TEXT>::new();
     let heading = match act {
         Act::Nothing => return,
@@ -679,11 +683,11 @@ fn act_on(cx: &Cx, io: &Io, root: &Dir<ReadWrite>, err: &Out, board: &Board<'_>,
         let _ = err.write_all(cx, said.as_str().as_bytes());
     }
     if let Heading::Stopped { .. } = heading {
-        match io.need_host() {
-            Ok(host) => host.exit(blaze_core::exit::Exit::StopStalled.code()),
-            Err(missing) => {
+        match host {
+            Some(host) => host.exit(blaze_core::exit::Exit::StopStalled.code()),
+            None => {
                 let mut said = FixedString::<512>::new();
-                let _ = writeln!(said, "engine-check: stopped, and the process could not be ended: {missing}");
+                let _ = writeln!(said, "engine-check: stopped, and the process could not be ended: missing host capability");
                 let _ = err.write_all(cx, said.as_str().as_bytes());
             }
         }

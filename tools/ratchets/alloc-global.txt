@@ -7,7 +7,7 @@
 # `{"command": "heap-check"}`.
 # crate	global	shared_global	test_heap	process	leak
 blaze-bstd-convert	7	0	0	0	0
-blaze-cad	0	0	3	0	0
+blaze-cad	0	0	4	0	0
 blaze-cad-field	0	0	1	0	0
 blaze-cad-mesh	0	0	1	0	0
 blaze-cad-out	0	0	1	0	0

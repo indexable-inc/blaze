@@ -52,7 +52,12 @@ pub(super) fn refused(seed: u64, files: &[(&str, &str)]) -> std::string::String 
     let (out, err) = (io.need_out().expect("out"), io.need_err().expect("err"));
     let mut phases = boxed(|| Phases::new(io.need_clock().expect("a clock")));
     let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, View::Person, "/ws", frame);
-    match engine_check::check(&cx, &io, &root, opts(&io, 2, true), &mut shown, &mut phases, &out, &err) {
+    let fs = io.need_fs().expect("files");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    let args = io.args();
+    let net = io.net();
+    match engine_check::check(&cx, &fs, &host, &mut rng, args.as_ref(), net.as_ref(), &root, opts(&io, 2, true), &mut shown, &mut phases, &out, &err) {
         Ok(checked) => panic!("the check answered (status {}) where it must stop:\n{}", checked.status.0, stdout(&io)),
         Err(error) => std::format!("{error}"),
     }

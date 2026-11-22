@@ -348,7 +348,6 @@ blaze-ladder = { path = "crates/blaze-ladder" } # The `blaze run` walking skelet
 blaze-world = { path = "crates/blaze-world" } # One world for run and check: the unit graph made into the names library's inputs.
 blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }
 blaze-lint = { path = "crates/blaze-lint" }
-blaze-live = { path = "crates/blaze-live" }
 blaze-macro-run = { path = "crates/blaze-macro-run" }
 blaze-real ={ path = "crates/blaze-real" } # blaze's stages on a real checkout (tempo): the harness behind docs/v2/plan/design/tempo.md.
 blaze-radix = { path = "crates/blaze-radix" }

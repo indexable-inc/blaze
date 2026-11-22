@@ -65,7 +65,7 @@ use blaze_typeck::ItemKey;
 use bstd::Cx;
 use bstd::Deadline;
 use bstd::fs::{Dir, Durable, FsError, FsKind, ReadWrite};
-use bstd::io::{Io, Missing};
+use bstd::io::Missing;
 use bstd::mem::Frame;
 use bstd::path::{Path, PathError};
 use bstd::procs::{ChannelError, Exit, GRACE, Held, Message, OutPipe, ParentDeath, ParentSignals, Read as Piped, Relay, RelayAct, RunChild, RunError as ProcError, RunFault, RunSpec, SignalError, Spawner, Started, Streams, Waited};
@@ -2740,9 +2740,17 @@ impl RunOne for Selected<'_, Launched<'_, '_>> {
 /// to every test's run. `root` is the checkout's (each worker's names records read its trees
 /// through it); `procs` is the command's proc-macro runner (by need: a worker asks for it,
 /// [`CodePool`]); `heap` is the command's, the relay's and the workers' tables in it.
-#[expect(clippy::too_many_arguments, reason = "the command supplies the selected records and runtime capabilities")]
+#[expect(clippy::too_many_arguments, reason = "the command supplies the selected records and specific runtime capabilities")]
 pub(crate) fn run_suites<'h>(
-    cx: &Cx, io: &Io, suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, config: LoopConfig<'_>,
+    cx: &Cx,
+    fs: &bstd::fs::Fs,
+    env: Option<&bstd::env::Env>,
+    host: &bstd::host::Host,
+    clock: &bstd::clock::Clock,
+    rng: &mut bstd::rng::Rng,
+    out: &bstd::out::Out,
+    err: &bstd::out::Out,
+    suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, config: LoopConfig<'_>,
     args: &[&str], lent: &CommandLent, root: &Dir<ReadWrite>, procs: crate::job_texts::Procs<'_>, heap: &'static blaze_own::Heap, watch: &dyn Watch, frame: &Frame,
 ) -> Result<Status, DriveError> {
     let tables = heap.alloc();
@@ -2750,8 +2758,8 @@ pub(crate) fn run_suites<'h>(
     // every maker, the serial turns' and each code worker's (rule 16: a large or slow make's line).
     let make_watch = crate::run_parent::command_make_watch();
     match CODES {
-        Codes::Serial => run_selected(cx, io, suites, ids, config, args, lent, tables, watch, make_watch, frame, None),
-        Codes::Pooled => pooled(cx, io, suites, root, procs, heap, make_watch, |relay| run_selected(cx, io, suites, ids, config, args, lent, tables, watch, make_watch, frame, Some(relay))),
+        Codes::Serial => run_selected(cx, fs, env, host, clock, out, err, suites, ids, config, args, lent, tables, watch, make_watch, frame, None),
+        Codes::Pooled => pooled(cx, clock, rng, suites, root, procs, heap, make_watch, |relay| run_selected(cx, fs, env, host, clock, out, err, suites, ids, config, args, lent, tables, watch, make_watch, frame, Some(relay))),
     }
 }
 
@@ -2766,13 +2774,12 @@ pub(crate) fn run_suites<'h>(
 /// proc-macro runner, made by need on this thread, is relayed ([`CodePool::finished`]).
 #[expect(clippy::too_many_arguments, reason = "the command supplies the suites, the workers' inputs and the run")]
 fn pooled<'h>(
-    cx: &Cx, io: &Io, suites: &[Suite<'_, 'h>], root: &Dir<ReadWrite>, procs: crate::job_texts::Procs<'_>, heap: &'static blaze_own::Heap,
+    cx: &Cx, clock: &bstd::clock::Clock, rng: &mut bstd::rng::Rng, suites: &[Suite<'_, 'h>], root: &Dir<ReadWrite>, procs: crate::job_texts::Procs<'_>, heap: &'static blaze_own::Heap,
     make_watch: blaze_ladder::run::make_one::MakeWatch<'static>,
     run: impl FnOnce(&CodeRelay<'_>) -> Result<Status, DriveError>,
 ) -> Result<Status, DriveError> {
     let cx = cx.span("blaze test: the command's code workers");
-    let clock = io.need_clock().map_err(DriveError::Missing)?;
-    let hash_seed = io.need_rng().map_err(DriveError::Missing)?.next_u64();
+    let hash_seed = rng.next_u64();
     let have = cx.workers();
     let Some(most) = core::num::NonZeroUsize::new(usize::try_from(have.saturating_sub(1)).unwrap_or(0)) else {
         return Err(DriveError::NoCodeWorkers { have });
@@ -2799,7 +2806,7 @@ fn pooled<'h>(
     let ran = match core::num::NonZeroUsize::new(tasks.len()) {
         None => Err(DriveError::NoCodeWorkers { have }),
         Some(count) => {
-            let pool = CodePool { lanes: &lanes, count: count.get(), cx: &cx, clock: &clock, procs };
+            let pool = CodePool { lanes: &lanes, count: count.get(), cx: &cx, clock, procs };
             match CodeRelay::new(children, &pool, &now, heap.shared(), hash_seed) {
                 Ok(relay) => run(&relay),
                 Err(error) => Err(DriveError::Relay(error)),
@@ -2826,19 +2833,21 @@ fn pooled<'h>(
     Ok(status)
 }
 
-#[expect(clippy::too_many_arguments, reason = "the command supplies the selected records and runtime capabilities")]
+#[expect(clippy::too_many_arguments, reason = "the command supplies the selected records and specific runtime capabilities")]
 fn run_selected<'h>(
-    cx: &Cx, io: &Io, suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, config: LoopConfig<'_>,
+    cx: &Cx,
+    fs: &bstd::fs::Fs,
+    env: Option<&bstd::env::Env>,
+    host: &bstd::host::Host,
+    clock: &bstd::clock::Clock,
+    out: &bstd::out::Out,
+    err: &bstd::out::Out,
+    suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, config: LoopConfig<'_>,
     args: &[&str], lent: &CommandLent, tables: Alloc<'static>, watch: &dyn Watch, make_watch: blaze_ladder::run::make_one::MakeWatch<'static>, frame: &Frame,
     relay: Option<&CodeRelay<'_>>,
 ) -> Result<Status, DriveError> {
     let cx = cx.span("blaze test: selected suites");
-    let env = io.need_env().map_err(DriveError::Missing)?;
-    let fs = io.need_fs().map_err(DriveError::Missing)?;
-    let host = io.need_host().map_err(DriveError::Missing)?;
-    let out = io.need_out().map_err(DriveError::Missing)?;
-    let err = io.need_err().map_err(DriveError::Missing)?;
-    let clock = io.need_clock().map_err(DriveError::Missing)?;
+    let env = env.ok_or(DriveError::Missing(bstd::io::Missing { capability: "env" }))?;
     let erased = blaze_own::Erased::new(frame);
     let alloc = erased.handle();
     let one = DriveError::One;

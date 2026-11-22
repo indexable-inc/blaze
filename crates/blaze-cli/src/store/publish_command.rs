@@ -20,7 +20,6 @@
 
 use bstd::cx::Cx;
 use bstd::entry::Status;
-use bstd::io::Io;
 use bstd::out::Out;
 
 use super::published::PublishedError;
@@ -46,24 +45,32 @@ pub(crate) const THIS_BUILDER: Builder = Builder::Developer;
 const USAGE: &str = "blaze store publish <folder> --signer <key file>: the folder origin to write, and a file holding the signer's Ed25519 seed as 64 hex digits";
 
 /// `blaze store …`: its one subcommand, `publish`, as this blaze's builder may run it.
-pub(crate) fn run(cx: &Cx, io: &Io, out: &Out, err: &Out, heap: &'static blaze_own::Heap) -> Result<Status, CliError> {
-    let args = io.need_args()?;
+#[expect(clippy::too_many_arguments, reason = "the publish command's edge: each argument one specific capability")]
+pub(crate) fn run(
+    cx: &Cx,
+    args: &bstd::args::Args,
+    fs: &bstd::fs::Fs,
+    env: Option<&bstd::env::Env>,
+    clock: &bstd::clock::Clock,
+    host: &bstd::host::Host,
+    rng: &mut bstd::rng::Rng,
+    out: &Out,
+    err: &Out,
+    heap: &'static blaze_own::Heap,
+) -> Result<Status, CliError> {
     let words = words(args.each().skip(2))?;
     admit(THIS_BUILDER, &words)?;
     match THIS_BUILDER {
         Builder::Developer => {
-            let _ = (cx, out, err, heap);
+            let _ = (cx, fs, env, clock, host, rng, out, err, heap);
             Err(PublishedError::NotPublisher.into())
         }
         #[cfg(any(test, feature = "publish"))]
         Builder::Trusted => {
             // The home, read here at the edge (rule 75).
-            let env = io.env();
-            let home = env.as_ref().and_then(|env| env.get(&bstd::env::VarName::new("HOME").ok()?).ok().flatten());
-            let fs = io.need_fs()?;
-            let clock = io.need_clock()?;
-            let opened = super::open_for_command(cx, io, home, &fs.root(), "", &clock, err, heap)?;
-            trusted::publish(cx, io, out, &words, &opened.lent, blaze_toolchain::PINNED)
+            let home = env.and_then(|env| env.get(&bstd::env::VarName::new("HOME").ok()?).ok().flatten());
+            let opened = super::open_for_command(cx, fs, host, rng, home, &fs.root(), "", clock, err, heap)?;
+            trusted::publish(cx, fs, out, &words, &opened.lent, blaze_toolchain::PINNED)
         }
     }
 }
@@ -113,7 +120,7 @@ pub(crate) fn admit(builder: Builder, words: &Words<'_>) -> Result<(), Published
 pub(crate) mod trusted {
     use bstd::cx::Cx;
     use bstd::entry::Status;
-    use bstd::io::Io;
+    use bstd::fs::Fs;
     use bstd::out::Out;
     use bstd::path::Path;
 
@@ -124,9 +131,8 @@ pub(crate) mod trusted {
 
     /// The publish of `toolchain`'s set from the home's store `lent`: the seed read, the
     /// toolchain's root walked, the set laid out and written head last; one line on `out`.
-    pub(crate) fn publish(cx: &Cx, io: &Io, out: &Out, words: &Words<'_>, lent: &CommandLent, toolchain: blaze_toolchain::ToolchainId) -> Result<Status, CliError> {
+    pub(crate) fn publish(cx: &Cx, fs: &Fs, out: &Out, words: &Words<'_>, lent: &CommandLent, toolchain: blaze_toolchain::ToolchainId) -> Result<Status, CliError> {
         let origin = published::folder_only(words.folder)?;
-        let fs = io.need_fs()?;
         let signer = folder::signer_from_file(cx, &fs.root(), &Path::new(words.signer)?)?;
         let hex = toolchain.hex();
         let set = blaze_remote::published::set::SetName::new(hex.as_str(), crate::graph::TRIPLE).map_err(published::PublishedError::Set)?;

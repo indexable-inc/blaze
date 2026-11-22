@@ -777,16 +777,27 @@ pub struct Opened {
 /// the open maps nothing; the store lives in `heap`, the process's heap `main` was handed. Then
 /// the old forms are reported once ([`old_home`]).
 #[expect(clippy::too_many_arguments, reason = "the store's edge: each argument one handle or fact of it")]
-pub fn open_for_command(cx: &Cx, io: &bstd::io::Io, home: Option<&str>, checkout_root: &Dir<ReadWrite>, checkout: &str, clock: &Clock, err: &Out, heap: &'static blaze_own::Heap) -> Result<Opened, CliError> {
-    let home = Home::of(cx, &io.need_fs()?, home)?;
-    let boot = match io.boot() {
+pub fn open_for_command(
+    cx: &Cx,
+    fs: &bstd::fs::Fs,
+    host: &bstd::host::Host,
+    rng: &mut bstd::rng::Rng,
+    home: Option<&str>,
+    checkout_root: &Dir<ReadWrite>,
+    checkout: &str,
+    clock: &Clock,
+    err: &Out,
+    heap: &'static blaze_own::Heap,
+) -> Result<Opened, CliError> {
+    let home = Home::of(cx, fs, home)?;
+    let boot = match host.boot() {
         Ok(boot) => Some(boot_fact(&boot)),
         Err(why) => {
             err.line(cx, format_args!("blaze: no boot fact ({why}): each segment an earlier command wrote is checked once"))?;
             None
         }
     };
-    let nonce = nonce(&mut io.need_rng()?);
+    let nonce = nonce(rng);
     let ns = |clock: &Clock| u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX);
     let began = ns(clock);
     // A trusted builder's store may name the public namespace ([`TRUSTED_BUILDER`]); a

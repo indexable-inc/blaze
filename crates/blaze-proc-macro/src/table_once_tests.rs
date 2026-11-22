@@ -57,7 +57,7 @@ fn table_once_a_row_is_two_blocks_of_their_own_length() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("a temporary folder");
     let (io, root) = native_world(&dir).unwrap_or_else(|error| panic!("the world over {}: {error}", dir.display()));
-    let store = DirStore::expansions(&io, &root);
+    let store = DirStore::expansions(io.spawner(), io.boot().ok(), &root);
     let counting = counting();
     let krate = ContentId::of("table once test crate", b"one");
     let base = ContentId::of("table once test base", b"one");

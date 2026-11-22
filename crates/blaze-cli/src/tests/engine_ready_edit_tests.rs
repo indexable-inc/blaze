@@ -170,7 +170,12 @@ fn standing_control(crates: usize, phases: &StoredKeys) {
     let err = io.need_err().expect("err");
     let mut phases_meter = super::engine_check_tests::boxed(|| Phases::new(io.need_clock().expect("a clock")));
     let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, View::Person, "/ws", frame);
-    match engine_check::check(&cx, &io, &root, options, &mut shown, &mut phases_meter, &out, &err) {
+    let fs = io.need_fs().expect("files");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    let args = io.args();
+    let net = io.net();
+    match engine_check::check(&cx, &fs, &host, &mut rng, args.as_ref(), net.as_ref(), &root, options, &mut shown, &mut phases_meter, &out, &err) {
         Ok(checked) => {
             assert!(checked.members_stood.0 > 0, "{crates} crates: CONTROL: the planted setup stood no member, so it plants nothing");
             let stored = checked.stored.expect("the planted edit stored an answer");
@@ -242,7 +247,12 @@ fn a_signature_edit_under_ready_is_refused_by_kind() {
     let err = io.need_err().expect("err");
     let mut phases = super::engine_check_tests::boxed(|| Phases::new(io.need_clock().expect("a clock")));
     let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, View::Person, "/ws", frame);
-    match engine_check::check(&cx, &io, &root, options, &mut shown, &mut phases, &out, &err) {
+    let fs = io.need_fs().expect("files");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    let args = io.args();
+    let net = io.net();
+    match engine_check::check(&cx, &fs, &host, &mut rng, args.as_ref(), net.as_ref(), &root, options, &mut shown, &mut phases, &out, &err) {
         Err(CliError::EngineCheck(engine_check::EngineCheckError::ReadyRefused(crate::engine_ready_edit::ReadyRefused::Kind { name }))) => {
             assert!(!crate::engine_ready_edit::READY_KINDS.contains(&name.kind), "the refusal names a kind the ready path does not run: {name:?}");
         }
@@ -297,7 +307,12 @@ fn checked_on(io: &Io, driver: Driver) -> Result<engine_check::Checked, CliError
     let err = io.need_err().expect("err");
     let mut phases = super::engine_check_tests::boxed(|| Phases::new(io.need_clock().expect("a clock")));
     let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, View::Person, "/ws", frame);
-    engine_check::check(&cx, io, &root, options, &mut shown, &mut phases, &out, &err)
+    let fs = io.need_fs().expect("files");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    let args = io.args();
+    let net = io.net();
+    engine_check::check(&cx, &fs, &host, &mut rng, args.as_ref(), net.as_ref(), &root, options, &mut shown, &mut phases, &out, &err)
 }
 
 /// THE WORLD BY NEED (names.rs `Names::made_or_make`; the crate list v6, blaze-world
@@ -495,7 +510,12 @@ fn moduled_on(io: &Io, n: u32, driver: Driver, plant: CommitPlant) -> (Result<en
     let mut phases = super::engine_check_tests::boxed(|| Phases::new(io.need_clock().expect("a clock")));
     let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, View::Person, "/ws", frame);
     let before = stdout(io).len();
-    let checked = engine_check::check(&cx, io, &root, options, &mut shown, &mut phases, &out, &err);
+    let fs = io.need_fs().expect("files");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    let args = io.args();
+    let net = io.net();
+    let checked = engine_check::check(&cx, &fs, &host, &mut rng, args.as_ref(), net.as_ref(), &root, options, &mut shown, &mut phases, &out, &err);
     let text = stdout(io).split_off(before);
     let mut lines: std::vec::Vec<std::string::String> = text.lines().map(str::to_owned).collect();
     lines.pop();
@@ -586,7 +606,12 @@ fn written_on(io: &Io, text: &str, driver: Driver, plant: CommitPlant) -> (Resul
     let mut phases = super::engine_check_tests::boxed(|| Phases::new(io.need_clock().expect("a clock")));
     let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, View::Person, "/ws", frame);
     let before = stdout(io).len();
-    let checked = engine_check::check(&cx, io, &root, options, &mut shown, &mut phases, &out, &err);
+    let fs = io.need_fs().expect("files");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    let args = io.args();
+    let net = io.net();
+    let checked = engine_check::check(&cx, &fs, &host, &mut rng, args.as_ref(), net.as_ref(), &root, options, &mut shown, &mut phases, &out, &err);
     let text = stdout(io).split_off(before);
     let mut lines: std::vec::Vec<std::string::String> = text.lines().map(str::to_owned).collect();
     lines.pop();

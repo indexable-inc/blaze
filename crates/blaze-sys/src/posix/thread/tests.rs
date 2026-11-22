@@ -372,9 +372,12 @@ fn the_affinity_is_libcs() {
         theirs
     };
     for cpu in 0..CPU_SETSIZE {
-        assert_eq!(ours.contains(cpu), libc::CPU_ISSET(cpu, &theirs), "cpu {cpu}");
+        // SAFETY: `theirs` is an initialized `cpu_set_t` and `cpu < CPU_SETSIZE`.
+        let libc_has = unsafe { libc::CPU_ISSET(cpu, &theirs) };
+        assert_eq!(ours.contains(cpu), libc_has, "cpu {cpu}");
     }
-    assert_eq!(ours.count(), libc::CPU_COUNT(&theirs) as u32);
+    // SAFETY: `theirs` is an initialized `cpu_set_t`.
+    assert_eq!(ours.count(), unsafe { libc::CPU_COUNT(&theirs) } as u32);
     // Setting the set it has changes nothing.
     set_affinity(&ours).unwrap();
     assert_eq!(affinity().unwrap(), ours);
