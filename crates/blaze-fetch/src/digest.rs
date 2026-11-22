@@ -10,7 +10,8 @@
 //! blaze-audit pins sources by these; the fetch of a lock's crates checks its SHA-256 directly
 //! ([`crate::fetch`]).
 
-use std::fmt;
+use alloc::{borrow::ToOwned, string::String, vec::Vec};
+use core::fmt;
 
 /// An algorithm a pin may be in.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -100,7 +101,7 @@ impl fmt::Display for DigestRefused {
     }
 }
 
-impl std::error::Error for DigestRefused {}
+impl core::error::Error for DigestRefused {}
 
 impl Digest {
     /// The digest `bytes` in `algo`; `None` when `bytes` is not as long as one.
@@ -171,7 +172,7 @@ impl fmt::Debug for Digest {
     }
 }
 
-impl std::str::FromStr for Digest {
+impl core::str::FromStr for Digest {
     type Err = DigestRefused;
 
     fn from_str(text: &str) -> Result<Digest, DigestRefused> {

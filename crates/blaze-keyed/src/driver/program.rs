@@ -103,6 +103,7 @@
 //! when a plan of a body its unit kept must be probed or run); a body its unit kept costs its
 //! unit's manifest root and its file's chunk, once a request.
 
+use alloc::vec::Vec;
 use core::alloc::Allocator;
 
 use blaze_format::Aligned;

@@ -32,6 +32,7 @@
 
 #![blaze::sans_io]
 
+use alloc::string::String;
 use core::{alloc::Allocator, fmt, ops::{Deref, Range}};
 
 use blaze_ids::ContentId;

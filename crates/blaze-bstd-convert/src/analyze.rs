@@ -256,6 +256,45 @@ impl CInteropInfo {
     }
 }
 
+/// Category of bare primitive that should become an explicit `bstd::newtype` (rules 76 & 85).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NewtypeKind {
+    /// Affine `Offset` + `Len` pair (`Offset + Len -> Offset`, `Offset - Offset -> Len`, `Offset + Offset` forbidden).
+    AffineOffsetLen,
+    /// Opaque typed id (`*_id: u32/u64/usize` -> `bstd::id::id!` or `bstd::newtype! { opaque ... }`).
+    TypedId,
+    /// Network port (`port: u16` -> `bstd::newtype::Port`).
+    OpaquePort,
+    /// Bare time duration (`*_ms` / `*_ns` / `*_us` / `*_secs` -> `bstd::clock::Duration`).
+    DurationUnit,
+    /// Bare alignment (`align` / `alignment` -> `bstd::newtype::Alignment`, validated power of two).
+    AlignmentPow2,
+}
+
+impl NewtypeKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AffineOffsetLen => "affine-offset-len",
+            Self::TypedId => "typed-id",
+            Self::OpaquePort => "opaque-port",
+            Self::DurationUnit => "duration-unit",
+            Self::AlignmentPow2 => "alignment-pow2",
+        }
+    }
+}
+
+/// One primitive-obsession parameter or struct field that should be promoted to a `bstd::newtype`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewtypeCandidate {
+    pub file: String,
+    pub line: usize,
+    pub owner: String,
+    pub name: String,
+    pub raw_type: String,
+    pub kind: NewtypeKind,
+    pub suggestion: String,
+}
+
 /// Complete analysis for one workspace crate.
 #[derive(Debug, Clone)]
 pub struct CrateAnalysis {
@@ -276,6 +315,7 @@ pub struct CrateAnalysis {
     pub struct_sm_candidates: Vec<StructSmCandidate>,
     pub proc_macro_entries: Vec<ProcMacroEntry>,
     pub c_interop: Option<CInteropInfo>,
+    pub newtype_candidates: Vec<NewtypeCandidate>,
     pub builtin_derives_used: BTreeMap<String, usize>,
     pub walls: Vec<Wall>,
 }
@@ -332,6 +372,8 @@ pub struct WorkspaceAnalysis {
     pub total_proc_macro_crates: usize,
     /// Total crates using C/C++ build scripts or binding generators (`bindgen`/`cc`/`cmake`/`cxx`/`pkg-config`).
     pub total_c_interop_crates: usize,
+    /// Total primitive-obsession sites recommended for `bstd::newtype!` / `bstd::id::id!`.
+    pub total_newtype_candidates: usize,
 }
 
 /// Analyze an entire workspace snapshot without performing any IO.
@@ -382,6 +424,7 @@ pub fn analyze_workspace(snapshot: &WorkspaceSnapshot) -> WorkspaceAnalysis {
     let mut total_sm_struct_candidates = 0usize;
     let mut total_proc_macro_crates = 0usize;
     let mut total_c_interop_crates = 0usize;
+    let mut total_newtype_candidates = 0usize;
 
     for (idx, (name, dir, manifest_path, is_proc_macro, raw_deps)) in crate_manifests.into_iter().enumerate() {
         let mut deps = Vec::with_capacity(raw_deps.len());
@@ -422,6 +465,7 @@ pub fn analyze_workspace(snapshot: &WorkspaceSnapshot) -> WorkspaceAnalysis {
         let mut functions = Vec::new();
         let mut struct_sm_candidates = Vec::new();
         let mut proc_macro_entries = Vec::new();
+        let mut newtype_candidates = Vec::new();
         let mut builtin_derives_used: BTreeMap<String, usize> = BTreeMap::new();
         let mut walls = Vec::new();
 
@@ -432,6 +476,11 @@ pub fn analyze_workspace(snapshot: &WorkspaceSnapshot) -> WorkspaceAnalysis {
                     analyze_build_rs_c_interop(src, &mut c_interop);
                 }
                 analyze_c_interop_src_markers(rs_path, src, &mut c_interop);
+                if !rs_path.ends_with("/build.rs") && rs_path != "build.rs" {
+                    analyze_newtype_candidates_in_file(rs_path, src, &mut |c| {
+                        newtype_candidates.push(c);
+                    });
+                }
                 analyze_rs_file(
                     rs_path,
                     src,
@@ -469,6 +518,7 @@ pub fn analyze_workspace(snapshot: &WorkspaceSnapshot) -> WorkspaceAnalysis {
             }
         }
         total_sm_struct_candidates += struct_sm_candidates.len();
+        total_newtype_candidates += newtype_candidates.len();
 
         crates.push(CrateAnalysis {
             name,
@@ -488,6 +538,7 @@ pub fn analyze_workspace(snapshot: &WorkspaceSnapshot) -> WorkspaceAnalysis {
             struct_sm_candidates,
             proc_macro_entries,
             c_interop,
+            newtype_candidates,
             builtin_derives_used,
             walls,
         });
@@ -505,6 +556,7 @@ pub fn analyze_workspace(snapshot: &WorkspaceSnapshot) -> WorkspaceAnalysis {
         total_sm_struct_candidates,
         total_proc_macro_crates,
         total_c_interop_crates,
+        total_newtype_candidates,
     }
 }
 
@@ -1231,6 +1283,173 @@ fn analyze_c_interop_src_markers(file_path: &str, src: &str, info: &mut CInterop
                 }
             }
             _ => {}
+        }
+    }
+}
+
+fn is_bare_int_type(ty: &str) -> bool {
+    matches!(ty.trim(), "u16" | "u32" | "u64" | "usize" | "i32" | "i64" | "isize")
+}
+
+/// Detect primitive-obsession parameters and struct fields (`offset`+`len` pairs, `*_id`, `port`,
+/// `*_ms`/`*_ns`, `align`) that should become explicit `bstd::newtype!` / `bstd::id::id!` types.
+fn analyze_newtype_candidates_in_file(
+    file_path: &str,
+    src: &str,
+    emit: &mut impl FnMut(NewtypeCandidate),
+) {
+    let parse = SourceFile::parse(src, Edition::CURRENT);
+    let root = parse.tree();
+
+    for node in root.syntax().descendants() {
+        match node.kind() {
+            SyntaxKind::FN => {
+                let Some(func) = ast::Fn::cast(node.clone()) else { continue };
+                let Some(fname) = func.name() else { continue };
+                let owner = format!("fn {}", fname.text());
+                let line = line_of_offset(src, node.text_range().start().into());
+                let Some(plist) = func.param_list() else { continue };
+                let mut owned_pairs: Vec<(String, String)> = Vec::new();
+                for p in plist.params() {
+                    let Some(pat) = p.pat() else { continue };
+                    let Some(ty) = p.ty() else { continue };
+                    let pname = pat.syntax().text().to_string();
+                    let pname = pname.trim().trim_start_matches("mut ").trim().to_owned();
+                    let ty_txt = ty.syntax().text().to_string().trim().to_owned();
+                    if is_bare_int_type(&ty_txt) {
+                        owned_pairs.push((pname, ty_txt));
+                    }
+                }
+                let borrowed: Vec<(&str, &str)> =
+                    owned_pairs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+                classify_primitive_pairs(file_path, line, &owner, &borrowed, emit);
+            }
+            SyntaxKind::STRUCT => {
+                let Some(st) = ast::Struct::cast(node.clone()) else { continue };
+                let Some(sname) = st.name() else { continue };
+                let owner = format!("struct {}", sname.text());
+                let line = line_of_offset(src, node.text_range().start().into());
+                let Some(ast::FieldList::RecordFieldList(rfl)) = st.field_list() else { continue };
+                let mut owned_pairs: Vec<(String, String)> = Vec::new();
+                for f in rfl.fields() {
+                    let Some(fname) = f.name() else { continue };
+                    let Some(ty) = f.ty() else { continue };
+                    let ty_txt = ty.syntax().text().to_string().trim().to_owned();
+                    if is_bare_int_type(&ty_txt) {
+                        owned_pairs.push((fname.text().to_string(), ty_txt));
+                    }
+                }
+                let borrowed: Vec<(&str, &str)> =
+                    owned_pairs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+                classify_primitive_pairs(file_path, line, &owner, &borrowed, emit);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn classify_primitive_pairs(
+    file_path: &str,
+    line: usize,
+    owner: &str,
+    pairs: &[(&str, &str)],
+    emit: &mut impl FnMut(NewtypeCandidate),
+) {
+    let has_offset = pairs
+        .iter()
+        .any(|&(n, _)| matches!(n, "offset" | "byte_offset" | "start" | "pos") || n.ends_with("_offset"));
+    let has_len = pairs
+        .iter()
+        .any(|&(n, _)| matches!(n, "len" | "length" | "byte_len" | "size" | "end") || n.ends_with("_len"));
+    if has_offset && has_len {
+        let raw_ty = pairs
+            .iter()
+            .find(|&&(n, _)| matches!(n, "offset" | "byte_offset" | "start" | "pos") || n.ends_with("_offset"))
+            .map(|&(_, t)| t)
+            .unwrap_or("usize");
+        let suggestion = if raw_ty == "u32" {
+            "bstd::newtype::{TextOffset, TextLen, TextSpan}".to_owned()
+        } else {
+            "bstd::newtype::{ByteOffset, ByteLen, ByteSpan}".to_owned()
+        };
+        emit(NewtypeCandidate {
+            file: file_path.to_owned(),
+            line,
+            owner: owner.to_owned(),
+            name: "offset/len".to_owned(),
+            raw_type: raw_ty.to_owned(),
+            kind: NewtypeKind::AffineOffsetLen,
+            suggestion,
+        });
+    }
+
+    for &(name, ty) in pairs {
+        if name.ends_with("_id") && name.len() > 3 {
+            let mut pascal = String::with_capacity(name.len());
+            write_pascal_id(name, &mut pascal);
+            let suggestion = if ty == "u32" {
+                format!("bstd::id::id! {{ pub struct {pascal}; }}")
+            } else {
+                format!("bstd::newtype! {{ opaque pub struct {pascal}({ty}); }}")
+            };
+            emit(NewtypeCandidate {
+                file: file_path.to_owned(),
+                line,
+                owner: owner.to_owned(),
+                name: name.to_owned(),
+                raw_type: ty.to_owned(),
+                kind: NewtypeKind::TypedId,
+                suggestion,
+            });
+        } else if (name == "port" || name.ends_with("_port")) && ty == "u16" {
+            emit(NewtypeCandidate {
+                file: file_path.to_owned(),
+                line,
+                owner: owner.to_owned(),
+                name: name.to_owned(),
+                raw_type: ty.to_owned(),
+                kind: NewtypeKind::OpaquePort,
+                suggestion: "bstd::newtype::Port".to_owned(),
+            });
+        } else if name.ends_with("_ms")
+            || name.ends_with("_ns")
+            || name.ends_with("_us")
+            || name.ends_with("_secs")
+            || name == "timeout_ms"
+        {
+            emit(NewtypeCandidate {
+                file: file_path.to_owned(),
+                line,
+                owner: owner.to_owned(),
+                name: name.to_owned(),
+                raw_type: ty.to_owned(),
+                kind: NewtypeKind::DurationUnit,
+                suggestion: "core::time::Duration".to_owned(),
+            });
+        } else if matches!(name, "align" | "alignment") && matches!(ty, "usize" | "u64") {
+            emit(NewtypeCandidate {
+                file: file_path.to_owned(),
+                line,
+                owner: owner.to_owned(),
+                name: name.to_owned(),
+                raw_type: ty.to_owned(),
+                kind: NewtypeKind::AlignmentPow2,
+                suggestion: "bstd::newtype::Alignment".to_owned(),
+            });
+        }
+    }
+}
+
+fn write_pascal_id(snake: &str, out: &mut impl core::fmt::Write) {
+    let mut cap = true;
+    for c in snake.chars() {
+        if c == '_' {
+            cap = true;
+        } else if cap {
+            let _ = out.write_char(c.to_ascii_uppercase());
+            cap = false;
+        } else {
+            let _ = out.write_char(c);
         }
     }
 }

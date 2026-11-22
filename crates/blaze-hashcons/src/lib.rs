@@ -20,10 +20,13 @@
 
 // No unsafe code of its own; `blaze_format::record!` writes the `unsafe impl Record` of the
 // pack's records, allowed on that module alone.
+#![cfg_attr(not(test), no_std)]
 #![deny(unsafe_code)]
 // `ContentMap` names its allocator.
 #![feature(allocator_ext)]
 
+
+extern crate alloc;
 mod content_map;
 mod persist;
 mod std_hash;

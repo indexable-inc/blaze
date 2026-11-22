@@ -21,6 +21,7 @@
 
 #![blaze::sans_io]
 
+use alloc::vec::Vec;
 use core::fmt;
 
 use blaze_ids::{ContentId, Hasher};

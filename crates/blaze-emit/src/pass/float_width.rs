@@ -34,7 +34,7 @@
 //! This emitter is arm64's only (`Isa` names no other architecture): an x86-64 placement of
 //! `f128` (SysV's SSE class, `xmm`) belongs to the tier that emits x86-64.
 
-use std::alloc::Allocator;
+use alloc::alloc::Allocator;
 
 use blaze_lir::{Op, Scalar, Ty, Value, View};
 

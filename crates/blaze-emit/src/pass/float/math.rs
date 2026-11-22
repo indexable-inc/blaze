@@ -21,7 +21,7 @@
 //!   of `b` inserted into `a`'s bits by LSR and BFI (the cell holds an `f32`'s bits
 //!   zero-extended, so bit 31 is its sign; an `f64`'s is bit 63).
 
-use std::alloc::Allocator;
+use alloc::alloc::Allocator;
 
 use blaze_lir::Op;
 

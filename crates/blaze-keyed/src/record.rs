@@ -29,6 +29,7 @@
 // unsafe.
 #![allow(unsafe_code)]
 
+use alloc::vec::Vec;
 use core::{alloc::Allocator, fmt, mem::offset_of};
 
 use blaze_format::{FormatError, Record, Slice, Writer, WriterOpts};

@@ -31,6 +31,7 @@ pub enum QuestionCategory {
     Dependency,
     ProcMacroToComptime,
     CInterop,
+    Newtype,
     StateMachineLift,
     ImplicitStateStruct,
     Allocator,
@@ -44,6 +45,7 @@ impl QuestionCategory {
             Self::Dependency => "dependency",
             Self::ProcMacroToComptime => "proc-macro-comptime",
             Self::CInterop => "c-interop",
+            Self::Newtype => "newtype",
             Self::StateMachineLift => "state-machine-lift",
             Self::ImplicitStateStruct => "implicit-state-struct",
             Self::Allocator => "allocator",
@@ -141,6 +143,14 @@ impl Decisions {
             Some("keep_alloc_for_now") => AllocStrategy::KeepAllocForNow,
             _ => AllocStrategy::ExplicitAllocHandle,
         }
+    }
+
+    pub fn parameterize_struct_fields(&self) -> bool {
+        self.get("alloc:struct_fields") != Some("keep_struct_fields")
+    }
+
+    pub fn emit_newtypes_module(&self) -> bool {
+        self.get("newtype:promote_primitives") != Some("report_only")
     }
 
     pub fn comptime_proc_macro_choice(&self, crate_name: &str) -> ComptimeChoice {
@@ -297,6 +307,26 @@ pub fn build_questions(analysis: &WorkspaceAnalysis) -> Vec<Question> {
                     key: "keep_alloc_for_now".to_owned(),
                     label: "Keep `alloc::*` temporarily and convert IO/deps first".to_owned(),
                     impact: "Fastest first step to 0 third-party deps + sans-IO state machines; migrate allocators in pass 2.".to_owned(),
+                    recommended: false,
+                },
+            ],
+        });
+        questions.push(Question {
+            id: "alloc:struct_fields".to_owned(),
+            category: QuestionCategory::Allocator,
+            prompt: "Parameterize plain owned-heap structs (`Vec<T>`, `String`, `Box<T>`, `HashMap`, `BTreeMap` fields) with `<'a>` and explicit `bstd::mem::Alloc<'a>` fields + `impl<'a>` blocks?".to_owned(),
+            affected: vec![format!("non-serde, non-repr(C) domain structs across {} crates", analysis.crates.len())],
+            options: vec![
+                QuestionOption {
+                    key: "parameterize_struct_fields".to_owned(),
+                    label: "Parameterize heap structs with `<'a>` and `bstd::mem::Alloc<'a>` (Recommended)".to_owned(),
+                    impact: "Rewrites `struct Foo { items: Vec<String> }` -> `struct Foo<'a> { items: bstd::vec::Vec<bstd::mem::String<bstd::mem::Alloc<'a>>, bstd::mem::Alloc<'a>> }` and updates matching `impl<'a> Foo<'a>` blocks.".to_owned(),
+                    recommended: true,
+                },
+                QuestionOption {
+                    key: "keep_struct_fields".to_owned(),
+                    label: "Keep struct field types untouched (only thread function params & return types)".to_owned(),
+                    impact: "Leaves struct definitions unchanged for incremental migration.".to_owned(),
                     recommended: false,
                 },
             ],
@@ -466,6 +496,46 @@ pub fn build_questions(analysis: &WorkspaceAnalysis) -> Vec<Question> {
                     key: "keep_build_script".to_owned(),
                     label: "Keep existing `build.rs` (routed through blaze's C mode & bindgen stand-in)".to_owned(),
                     impact: "Keeps current build-dependencies and opaque build script until manually migrated.".to_owned(),
+                    recommended: false,
+                },
+            ],
+        });
+    }
+
+    // 4c. Primitive obsession -> explicit `bstd::newtype!` (affine Offset/Len, typed IDs, Port, Alignment, Duration).
+    if analysis.total_newtype_candidates > 0 {
+        let sample: Vec<String> = analysis
+            .crates
+            .iter()
+            .flat_map(|c| {
+                c.newtype_candidates.iter().map(move |n| {
+                    format!(
+                        "{}::{} ({}:{}) `{}: {}` -> `{}`",
+                        c.name, n.owner, n.file, n.line, n.name, n.raw_type, n.suggestion
+                    )
+                })
+            })
+            .take(10)
+            .collect();
+        questions.push(Question {
+            id: "newtype:promote_primitives".to_owned(),
+            category: QuestionCategory::Newtype,
+            prompt: format!(
+                "Found {} bare-primitive domain parameters/fields (`offset`/`len`, `*_id`, `port`, `*_ms`, `align`). Generate `src/newtypes.rs` with explicit `bstd::newtype!` (affine `Offset`/`Len`, `bstd::id::id!`, Kotlin-style `delegate`, zero blanket `Deref`)?",
+                analysis.total_newtype_candidates
+            ),
+            affected: sample,
+            options: vec![
+                QuestionOption {
+                    key: "emit_newtypes_module".to_owned(),
+                    label: "Generate `src/newtypes.rs` using `bstd::newtype!` & `bstd::id::id!` (Recommended)".to_owned(),
+                    impact: "Prevents `Offset + Offset` and `Offset`/`Len` mixups at compile time; composes cleanly with `bstd::TypeSet!` for order-independent typed bundles.".to_owned(),
+                    recommended: true,
+                },
+                QuestionOption {
+                    key: "report_only".to_owned(),
+                    label: "Report only (do not emit `src/newtypes.rs`)".to_owned(),
+                    impact: "Lists bare primitive candidates in the analysis report.".to_owned(),
                     recommended: false,
                 },
             ],

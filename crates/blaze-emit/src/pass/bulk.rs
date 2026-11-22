@@ -1,7 +1,8 @@
 //! `memcpy`, `memmove` and `memset` (lib.rs, "Bulk memory"): inline for a constant length up
 //! to the bound, else a call of the system routine; and the copies of `byval` arguments.
 
-use std::alloc::{Allocator, Global};
+use alloc::vec::Vec;
+use alloc::{alloc::Allocator, alloc::Global};
 
 use blaze_lir::{Op, Value};
 

@@ -23,7 +23,8 @@
 
 #![blaze::sans_io]
 
-use std::alloc::Global;
+use alloc::vec::Vec;
+use alloc::alloc::Global;
 
 use blaze_format::Aligned;
 use blaze_ids::ContentId;

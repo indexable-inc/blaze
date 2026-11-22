@@ -23,7 +23,7 @@
 //! reversals work word by word (`wide_bits`). Refused by name: rotations, min and max, the high
 //! multiplies (no reached function asks: the census of 2026-11-17).
 
-use std::alloc::Allocator;
+use alloc::alloc::Allocator;
 
 use blaze_lir::{IntCond, Op, Scalar, Ty, Value, View, func::NONE};
 

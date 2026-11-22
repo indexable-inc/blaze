@@ -1,6 +1,7 @@
 //! The lint options of rustc's command line: `rustc_session`'s `lint_opts` and `lint_cap`, as
 //! `get_cmd_lint_options` reads them.
 
+use alloc::{borrow::ToOwned, format, string::String, vec::Vec};
 use crate::Level;
 
 /// The lint flags a crate is checked with. base-db holds one per crate.
@@ -74,7 +75,7 @@ impl LintOptions {
 /// rustc's arguments, read one at a time; a flag's value is given as `-Xv`, `-X v`,
 /// `--flag v` or `--flag=v`.
 pub struct Args<'a> {
-    rest: std::slice::Iter<'a, String>,
+    rest: core::slice::Iter<'a, String>,
 }
 
 impl<'a> Args<'a> {

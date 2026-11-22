@@ -32,7 +32,7 @@
 //! fast path (macOS), no extra branch. Every value lives in its cell, so the getter's call may
 //! take every caller-saved register (as pass/tls.rs's call does).
 
-use std::alloc::Allocator;
+use alloc::alloc::Allocator;
 
 use blaze_lir::{Op, func::RefKind};
 

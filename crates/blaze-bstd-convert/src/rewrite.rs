@@ -28,7 +28,7 @@ use blaze_own::Alloc;
 use blaze_toml::{Document, Edit, Limits};
 use syntax::{
     AstNode, Edition, SourceFile, SyntaxKind,
-    ast::{self, HasArgList, HasGenericParams, HasName},
+    ast::{self, HasArgList, HasGenericArgs, HasGenericParams, HasName, HasVisibility},
 };
 
 use crate::{
@@ -37,7 +37,7 @@ use crate::{
     questions::{AllocStrategy, CInteropChoice, ComptimeChoice, Decisions, DepChoice, SmLiftMode},
     sm_compiler::{
         SmAllocMode, compile_file_functions_opts, compile_struct_sm, generate_blaze_c_toml_section,
-        generate_c_interop_scaffold, generate_comptime_scaffold,
+        generate_c_interop_scaffold, generate_comptime_scaffold, write_newtypes_scaffold,
     },
 };
 
@@ -89,6 +89,7 @@ pub struct CrateConversionSummary {
     pub refactored_structs: Vec<String>,
     pub comptime_scaffold_generated: bool,
     pub c_interop_scaffold_generated: bool,
+    pub newtype_scaffold_generated: bool,
     pub graduated_no_std: bool,
 }
 
@@ -103,8 +104,11 @@ pub struct ConversionResult {
     pub total_external_edges_after: usize,
     pub total_lifted_machines: usize,
     pub total_refactored_structs: usize,
+    pub total_parameterized_structs: usize,
+    pub total_cross_crate_call_rewrites: usize,
     pub total_comptime_scaffolds: usize,
     pub total_c_interop_scaffolds: usize,
+    pub total_newtype_scaffolds: usize,
 }
 
 /// Convert the whole workspace (or only crates matching `only_crates`) using `decisions`.
@@ -124,14 +128,28 @@ pub fn convert_workspace(
     let mut total_refactored_structs = 0usize;
     let mut total_comptime_scaffolds = 0usize;
     let mut total_c_interop_scaffolds = 0usize;
+    let mut total_newtype_scaffolds = 0usize;
 
+    let mut ws_files: Vec<WorkspaceFile> = Vec::new();
     for krate in &analysis.crates {
         if let Some(filter) = only_crates {
             if !filter.contains(&krate.name) {
                 continue;
             }
         }
+        let summary_idx = crate_summaries.len();
         let summary = convert_one_crate(krate, decisions, &mut out_files);
+        let crate_ident = krate.name.replace('-', "_");
+        for rs_path in &krate.rs_files {
+            if let Some(src) = out_files.get(rs_path).cloned() {
+                ws_files.push(WorkspaceFile {
+                    summary_idx,
+                    crate_ident: crate_ident.clone(),
+                    path: rs_path.clone(),
+                    src,
+                });
+            }
+        }
         if summary.external_deps_before == 0 {
             crates_at_zero_before += 1;
         }
@@ -148,7 +166,43 @@ pub fn convert_workspace(
         if summary.c_interop_scaffold_generated {
             total_c_interop_scaffolds += 1;
         }
+        if summary.newtype_scaffold_generated {
+            total_newtype_scaffolds += 1;
+        }
         crate_summaries.push(summary);
+    }
+
+    // SOTA 2: parameterize plain owned-heap structs with `<'a>` and explicit `bstd::mem::Alloc<'a>`
+    // fields + update matching `impl<'a>` blocks when enabled.
+    let alloc_strategy = decisions.alloc_strategy();
+    let mut total_parameterized_structs = 0usize;
+    if alloc_strategy == AllocStrategy::ExplicitAllocHandle && decisions.parameterize_struct_fields() {
+        for wf in &mut ws_files {
+            if wf.path == "build.rs" || wf.path.ends_with("/build.rs") {
+                continue;
+            }
+            let mut updated = String::new();
+            let stats = rewrite_struct_alloc_fields_into(&wf.src, &mut updated);
+            if stats.structs_changed > 0 {
+                wf.src = updated;
+                total_parameterized_structs += stats.structs_changed;
+                crate_summaries[wf.summary_idx].ast_edits_applied += stats.edits_applied;
+            }
+        }
+    }
+
+    // SOTA 1 (Pass B): whole-workspace cross-crate call-graph fixpoint threading `alloc` / `cx` /
+    // `clock` / `env` / `rng`, explicit allocator lifetimes & return types, and intra- + cross-crate
+    // call-site argument forwarding.
+    let total_cross_crate_call_rewrites = propagate_and_rewrite_workspace_capabilities(
+        &mut ws_files,
+        alloc_strategy,
+        &mut |summary_idx, edits| {
+            crate_summaries[summary_idx].ast_edits_applied += edits;
+        },
+    );
+    for wf in ws_files {
+        out_files.insert(wf.path, wf.src);
     }
 
     ConversionResult {
@@ -160,8 +214,11 @@ pub fn convert_workspace(
         total_external_edges_after,
         total_lifted_machines,
         total_refactored_structs,
+        total_parameterized_structs,
+        total_cross_crate_call_rewrites,
         total_comptime_scaffolds,
         total_c_interop_scaffolds,
+        total_newtype_scaffolds,
     }
 }
 
@@ -229,7 +286,7 @@ fn convert_one_crate(
     }
 
     // Pass A: per-file path, grouped-use, direct implicit-alloc, and direct capability rewrites.
-    let mut crate_file_buffers: Vec<(String, String)> = Vec::new();
+    // (Pass B whole-workspace capability/allocator propagation runs in `convert_workspace`.)
     for (file_idx, rs_path) in krate.rs_files.iter().enumerate() {
         let Some(src) = out_files.get(rs_path).cloned() else {
             continue;
@@ -240,7 +297,7 @@ fn convert_one_crate(
         if has_remaining_std {
             still_uses_std = true;
         }
-        crate_file_buffers.push((rs_path.clone(), rewritten));
+        out_files.insert(rs_path.clone(), rewritten);
 
         if lift_mode == SmLiftMode::LiftAllCandidates {
             let file_stem = file_disambiguator(rs_path, file_idx);
@@ -277,13 +334,6 @@ fn convert_one_crate(
                 lifted_machines_code.push('\n');
             }
         }
-    }
-
-    // Pass B: whole-crate call-graph fixpoint threading explicit `alloc` / `cx` / `clock` / `env` /
-    // `rng` parameters, lifetimes, explicit-allocator return types, and intra-crate call sites.
-    ast_edits_applied += propagate_and_rewrite_capabilities(&mut crate_file_buffers, alloc_strategy);
-    for (rs_path, rewritten) in crate_file_buffers {
-        out_files.insert(rs_path, rewritten);
     }
 
     if split_structs {
@@ -351,6 +401,21 @@ fn convert_one_crate(
         }
     }
 
+    let mut newtype_scaffold_generated = false;
+    if !krate.newtype_candidates.is_empty() && decisions.emit_newtypes_module() {
+        let mut scaffold = String::new();
+        write_newtypes_scaffold(&krate.name, &krate.newtype_candidates, &mut scaffold);
+        let path = if krate.dir.is_empty() {
+            "src/newtypes.rs".to_owned()
+        } else {
+            format!("{}/src/newtypes.rs", krate.dir)
+        };
+        if !out_files.contains_key(&path) {
+            out_files.insert(path, scaffold);
+            newtype_scaffold_generated = true;
+        }
+    }
+
     let needs_bstd = !removed_deps.is_empty()
         || krate.bstd_std_sites > 0
         || !lifted_machines.is_empty()
@@ -405,6 +470,7 @@ fn convert_one_crate(
         refactored_structs,
         comptime_scaffold_generated,
         c_interop_scaffold_generated,
+        newtype_scaffold_generated,
         graduated_no_std,
     }
 }
@@ -729,7 +795,17 @@ fn after_header_insert_pos(src: &str) -> usize {
 }
 
 fn is_cfg_test_item(node: &syntax::SyntaxNode) -> bool {
-    if !matches!(node.kind(), SyntaxKind::MODULE | SyntaxKind::FN | SyntaxKind::IMPL) {
+    if !matches!(
+        node.kind(),
+        SyntaxKind::MODULE
+            | SyntaxKind::FN
+            | SyntaxKind::IMPL
+            | SyntaxKind::MACRO_CALL
+            | SyntaxKind::STRUCT
+            | SyntaxKind::ENUM
+            | SyntaxKind::STATIC
+            | SyntaxKind::CONST
+    ) {
         return false;
     }
     for child in node.children() {
@@ -887,9 +963,19 @@ pub fn rewrite_rust_source(
 ) -> (String, usize, bool) {
     let (pass_a, count_a, has_remaining_std) =
         rewrite_rust_source_expressions(src, crate_rewrites, alloc_strategy);
-    let mut bufs = vec![("src/lib.rs".to_owned(), pass_a)];
-    let count_b = propagate_and_rewrite_capabilities(&mut bufs, alloc_strategy);
-    (bufs.into_iter().next().map(|(_, s)| s).unwrap_or_default(), count_a + count_b, has_remaining_std)
+    let mut bufs = vec![WorkspaceFile {
+        summary_idx: 0,
+        crate_ident: "local".to_owned(),
+        path: "src/lib.rs".to_owned(),
+        src: pass_a,
+    }];
+    let mut count_b = 0usize;
+    let _ = propagate_and_rewrite_workspace_capabilities(
+        &mut bufs,
+        alloc_strategy,
+        &mut |_, edits| count_b += edits,
+    );
+    (bufs.into_iter().next().map(|wf| wf.src).unwrap_or_default(), count_a + count_b, has_remaining_std)
 }
 
 /// Pass A: rewrite paths, grouped `use`, direct implicit-alloc expressions, and direct capability
@@ -907,6 +993,7 @@ fn rewrite_rust_source_expressions(
     // Pre-collect `use` statements with grouped `std::{...}` trees so we rewrite the whole `use`
     // statement cleanly without inner `PATH` edits conflicting.
     let mut grouped_use_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut needs_collect_in_import = false;
 
     for node in root.syntax().descendants() {
         match node.kind() {
@@ -1189,6 +1276,27 @@ fn rewrite_rust_source_expressions(
                     AllocStrategy::CxFrameScratch => "cx.frame().alloc()",
                     AllocStrategy::KeepAllocForNow => unreachable!(),
                 };
+                // SOTA 3: `.collect::<Vec<_>>()` / `.collect::<Vec<T>>()` -> `.collect_in(alloc)`.
+                if mname == "collect" {
+                    if let Some(gal) = mc.generic_arg_list() {
+                        let gtxt: String = gal.syntax().text().to_string().chars().filter(|c| !c.is_whitespace()).collect();
+                        let is_std_vec = (gtxt.starts_with("::<Vec<")
+                            || gtxt.starts_with("::<std::vec::Vec<")
+                            || gtxt.starts_with("::<alloc::vec::Vec<"))
+                            && !gtxt.contains(',');
+                        if is_std_vec {
+                            let start: usize = mname_ref.syntax().text_range().start().into();
+                            let end: usize = mc.syntax().text_range().end().into();
+                            edits.push(SpanEdit {
+                                start,
+                                end,
+                                replacement: format!("collect_in({alloc_arg})"),
+                            });
+                            needs_collect_in_import = true;
+                            continue;
+                        }
+                    }
+                }
                 let replacement = match mname.as_str() {
                     "to_string" | "to_owned"
                         if recv_trim.starts_with('"') && recv_trim.ends_with('"') && recv_trim.len() >= 2 =>
@@ -1252,6 +1360,15 @@ fn rewrite_rust_source_expressions(
         }
     }
 
+    if needs_collect_in_import && !src.contains("bstd::vec::CollectIn") {
+        let pos = after_header_insert_pos(src);
+        edits.push(SpanEdit {
+            start: pos,
+            end: pos,
+            replacement: "use bstd::vec::CollectIn as _;\n".to_owned(),
+        });
+    }
+
     let count = edits.len();
     let rewritten = apply_span_edits(src, edits);
     (rewritten, count, has_remaining_std)
@@ -1298,38 +1415,119 @@ const MAX_CAP_PROP_ITERS: usize = 32;
 #[derive(Debug, Clone)]
 struct FnCapInfo {
     file_idx: usize,
+    summary_idx: usize,
+    crate_ident: String,
     fn_start: usize,
     name: String,
+    is_pub: bool,
     is_method: bool,
     already_has: BTreeSet<CapParam>,
     needed: BTreeSet<CapParam>,
+    /// Intra-crate free-fn calls (`foo(...)` or `mod::foo(...)`).
     free_callees: BTreeSet<String>,
+    /// Cross-crate qualified or imported calls `(target_crate_ident, fn_name)`.
+    cross_crate_callees: BTreeSet<(String, String)>,
     method_callees: BTreeSet<String>,
 }
 
-/// Pass B: whole-crate call-graph fixpoint that:
-/// 1. Detects direct capability/allocator uses introduced by Pass A in every threadable function,
-/// 2. Propagates those parameters upward through unambiguous intra-crate free-fn and inherent-method
-///    callers to a fixpoint,
+/// One workspace Rust source file buffered for whole-workspace Pass B propagation.
+struct WorkspaceFile {
+    summary_idx: usize,
+    crate_ident: String,
+    path: String,
+    src: String,
+}
+
+/// Named result of [`rewrite_struct_alloc_fields_into`] (`newtypes-and-named-returns`, rule 85).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StructAllocStats {
+    pub structs_changed: usize,
+    pub edits_applied: usize,
+}
+
+/// Extract `use other_crate::...::item [as alias];` imports in a file for cross-crate call resolution.
+fn collect_cross_crate_imports(
+    root: &ast::SourceFile,
+    known_crates: &[&str],
+    own_crate: &str,
+    emit: &mut impl FnMut(&str, &str, &str),
+) {
+    for node in root.syntax().descendants() {
+        if node.kind() != SyntaxKind::USE {
+            continue;
+        }
+        let Some(use_item) = ast::Use::cast(node) else { continue };
+        let Some(tree) = use_item.use_tree() else { continue };
+        let mut leaves = Vec::new();
+        flatten_use_tree("", &tree, &mut leaves);
+        for leaf in leaves {
+            let (path_part, alias_part) = match leaf.split_once(" as ") {
+                Some((p, a)) => (p.trim(), Some(a.trim())),
+                None => (leaf.trim(), None),
+            };
+            let cleaned = path_part.strip_prefix("::").unwrap_or(path_part);
+            let mut segs = cleaned.split("::");
+            let Some(first) = segs.next() else { continue };
+            if first == own_crate || !known_crates.contains(&first) {
+                continue;
+            }
+            let Some(last) = cleaned.rsplit("::").next() else { continue };
+            if last == "*" || !last.starts_with(|c: char| c.is_ascii_lowercase()) {
+                continue;
+            }
+            let local_name = alias_part.unwrap_or(last);
+            emit(local_name, first, last);
+        }
+    }
+}
+
+/// Pass B (SOTA 1): whole-workspace cross-crate call-graph fixpoint that:
+/// 1. Detects direct capability/allocator uses introduced by Pass A in every threadable function
+///    (including `.collect_in(alloc)`),
+/// 2. Propagates those parameters upward through both intra-crate AND cross-crate workspace-internal
+///    callers (`other_crate::foo(...)` and `use other_crate::foo; foo(...)`) to a fixpoint,
 /// 3. Rewrites every affected function's `ParamList`, generic lifetime (`'a` / `'alloc`), and
 ///    owned-heap return types (`String` / `Vec<T>` / `Box<T>` / `HashMap` / `BTreeMap` / etc.),
-/// 4. Forwards the added arguments at every intra-crate call site (passing `bstd::mem::Alloc::global()`
-///    at `main` / `#[test]` root boundaries).
-fn propagate_and_rewrite_capabilities(
-    files: &mut [(String, String)],
+/// 4. Forwards the added arguments at every intra-crate and cross-crate call site (passing
+///    `bstd::mem::Alloc::global()` at `main` / `#[test]` root boundaries).
+///
+/// Invokes `on_crate_edit(summary_idx, edits)` for each modified file and returns the total
+/// cross-crate call-site rewrites applied.
+fn propagate_and_rewrite_workspace_capabilities(
+    files: &mut [WorkspaceFile],
     alloc_strategy: AllocStrategy,
+    on_crate_edit: &mut impl FnMut(usize, usize),
 ) -> usize {
-    // 1. Collect all threadable functions across the crate.
-    let mut fns: Vec<FnCapInfo> = Vec::new();
-    let mut free_fn_counts: BTreeMap<String, usize> = BTreeMap::new();
-    let mut method_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let known_crates: BTreeSet<String> = files.iter().map(|wf| wf.crate_ident.clone()).collect();
+    let known_crates_slice: Vec<&str> = known_crates.iter().map(String::as_str).collect();
 
-    for (file_idx, (path, src)) in files.iter().enumerate() {
+    // 1. Collect all threadable functions & per-file cross-crate imports across the workspace.
+    let mut fns: Vec<FnCapInfo> = Vec::new();
+    let mut file_imports: Vec<BTreeMap<String, (String, String)>> = Vec::with_capacity(files.len());
+    let mut free_fn_counts: BTreeMap<(usize, String), usize> = BTreeMap::new();
+    let mut method_counts: BTreeMap<(usize, String), usize> = BTreeMap::new();
+    let mut pub_fn_counts: BTreeMap<(String, String), usize> = BTreeMap::new();
+
+    for (file_idx, wf) in files.iter().enumerate() {
+        let summary_idx = &wf.summary_idx;
+        let crate_ident = &wf.crate_ident;
+        let path = &wf.path;
+        let src = &wf.src;
         if path == "build.rs" || path.ends_with("/build.rs") {
+            file_imports.push(BTreeMap::new());
             continue;
         }
         let parse = SourceFile::parse(src, Edition::CURRENT);
         let root = parse.tree();
+        let mut imports: BTreeMap<String, (String, String)> = BTreeMap::new();
+        collect_cross_crate_imports(
+            &root,
+            &known_crates_slice,
+            crate_ident,
+            &mut |local, krate, item| {
+                imports.insert(local.to_owned(), (krate.to_owned(), item.to_owned()));
+            },
+        );
         for node in root.syntax().descendants() {
             let Some(func) = ast::Fn::cast(node) else { continue };
             if !is_threadable_fn(&func) {
@@ -1340,10 +1538,17 @@ fn propagate_and_rewrite_capabilities(
             let is_method = func
                 .param_list()
                 .is_some_and(|pl| pl.self_param().is_some());
+            let is_pub = !is_method
+                && func
+                    .visibility()
+                    .is_some_and(|v| v.syntax().text().to_string().trim() == "pub");
             if is_method {
-                *method_counts.entry(name.clone()).or_default() += 1;
+                *method_counts.entry((*summary_idx, name.clone())).or_default() += 1;
             } else {
-                *free_fn_counts.entry(name.clone()).or_default() += 1;
+                *free_fn_counts.entry((*summary_idx, name.clone())).or_default() += 1;
+                if is_pub {
+                    *pub_fn_counts.entry((crate_ident.clone(), name.clone())).or_default() += 1;
+                }
             }
 
             let mut already_has = BTreeSet::new();
@@ -1363,56 +1568,77 @@ fn propagate_and_rewrite_capabilities(
 
             let mut needed = BTreeSet::new();
             let mut free_callees = BTreeSet::new();
+            let mut cross_crate_callees = BTreeSet::new();
             let mut method_callees = BTreeSet::new();
             if let Some(body) = func.body() {
                 scan_body_caps_and_callees(
                     body.syntax(),
                     alloc_strategy,
+                    crate_ident,
+                    &known_crates,
+                    &imports,
                     &mut needed,
                     &mut free_callees,
+                    &mut cross_crate_callees,
                     &mut method_callees,
                 );
             }
 
             fns.push(FnCapInfo {
                 file_idx,
+                summary_idx: *summary_idx,
+                crate_ident: crate_ident.clone(),
                 fn_start: func.syntax().text_range().start().into(),
                 name,
+                is_pub,
                 is_method,
                 already_has,
                 needed,
                 free_callees,
+                cross_crate_callees,
                 method_callees,
             });
         }
+        file_imports.push(imports);
     }
 
-    // Build unambiguous lookup tables (free fns with 1 definition in crate; non-std-colliding methods with 1 def).
-    let mut free_fn_idx: BTreeMap<String, usize> = BTreeMap::new();
-    let mut method_idx: BTreeMap<String, usize> = BTreeMap::new();
+    // Build unambiguous lookup tables (per-crate free fns, per-crate methods, workspace pub fns).
+    let mut free_fn_idx: BTreeMap<(usize, String), usize> = BTreeMap::new();
+    let mut method_idx: BTreeMap<(usize, String), usize> = BTreeMap::new();
+    let mut ws_pub_fn_idx: BTreeMap<(String, String), usize> = BTreeMap::new();
     for (idx, f) in fns.iter().enumerate() {
         if !f.is_method {
-            if free_fn_counts.get(&f.name).copied() == Some(1) {
-                free_fn_idx.insert(f.name.clone(), idx);
+            if free_fn_counts.get(&(f.summary_idx, f.name.clone())).copied() == Some(1) {
+                free_fn_idx.insert((f.summary_idx, f.name.clone()), idx);
             }
-        } else if method_counts.get(&f.name).copied() == Some(1) && !is_common_std_method(&f.name) {
-            method_idx.insert(f.name.clone(), idx);
+            if f.is_pub && pub_fn_counts.get(&(f.crate_ident.clone(), f.name.clone())).copied() == Some(1) {
+                ws_pub_fn_idx.insert((f.crate_ident.clone(), f.name.clone()), idx);
+            }
+        } else if method_counts.get(&(f.summary_idx, f.name.clone())).copied() == Some(1)
+            && !is_common_std_method(&f.name)
+        {
+            method_idx.insert((f.summary_idx, f.name.clone()), idx);
         }
     }
 
-    // 2. Bounded call-graph fixpoint: propagate callee capabilities to callers.
+    // 2. Bounded workspace-wide call-graph fixpoint: propagate callee capabilities to callers.
     for _ in 0..MAX_CAP_PROP_ITERS {
         let mut changed = false;
         let snapshot: Vec<BTreeSet<CapParam>> = fns.iter().map(|f| f.needed.clone()).collect();
         for f in &mut fns {
             let before = f.needed.len();
             for callee in &f.free_callees {
-                if let Some(&cidx) = free_fn_idx.get(callee) {
+                if let Some(&cidx) = free_fn_idx.get(&(f.summary_idx, callee.clone())) {
+                    f.needed.extend(snapshot[cidx].iter().copied());
+                }
+            }
+            for (target_crate, callee) in &f.cross_crate_callees {
+                if let Some(&cidx) = ws_pub_fn_idx.get(&(target_crate.clone(), callee.clone())) {
                     f.needed.extend(snapshot[cidx].iter().copied());
                 }
             }
             for callee in &f.method_callees {
-                if let Some(&cidx) = method_idx.get(callee) {
+                if let Some(&cidx) = method_idx.get(&(f.summary_idx, callee.clone())) {
                     f.needed.extend(snapshot[cidx].iter().copied());
                 }
             }
@@ -1427,18 +1653,24 @@ fn propagate_and_rewrite_capabilities(
 
     // Map `(file_idx, fn_start)` -> newly added `CapParam`s (excluding already_has).
     let mut added_by_fn: BTreeMap<(usize, usize), BTreeSet<CapParam>> = BTreeMap::new();
-    let mut added_by_free_name: BTreeMap<String, BTreeSet<CapParam>> = BTreeMap::new();
-    let mut added_by_method_name: BTreeMap<String, BTreeSet<CapParam>> = BTreeMap::new();
+    let mut added_by_free_name: BTreeMap<(usize, String), BTreeSet<CapParam>> = BTreeMap::new();
+    let mut added_by_method_name: BTreeMap<(usize, String), BTreeSet<CapParam>> = BTreeMap::new();
+    let mut added_by_ws_pub_fn: BTreeMap<(String, String), BTreeSet<CapParam>> = BTreeMap::new();
     for f in &fns {
         let added: BTreeSet<CapParam> = f.needed.difference(&f.already_has).copied().collect();
         if added.is_empty() {
             continue;
         }
         added_by_fn.insert((f.file_idx, f.fn_start), added.clone());
-        if !f.is_method && free_fn_idx.contains_key(&f.name) {
-            added_by_free_name.insert(f.name.clone(), added);
-        } else if f.is_method && method_idx.contains_key(&f.name) {
-            added_by_method_name.insert(f.name.clone(), added);
+        if !f.is_method {
+            if free_fn_idx.contains_key(&(f.summary_idx, f.name.clone())) {
+                added_by_free_name.insert((f.summary_idx, f.name.clone()), added.clone());
+            }
+            if f.is_pub && ws_pub_fn_idx.contains_key(&(f.crate_ident.clone(), f.name.clone())) {
+                added_by_ws_pub_fn.insert((f.crate_ident.clone(), f.name.clone()), added);
+            }
+        } else if method_idx.contains_key(&(f.summary_idx, f.name.clone())) {
+            added_by_method_name.insert((f.summary_idx, f.name.clone()), added);
         }
     }
 
@@ -1446,12 +1678,18 @@ fn propagate_and_rewrite_capabilities(
         return 0;
     }
 
-    // 3. Emit signature edits + intra-crate call-site argument forwarding in every file.
-    let mut total_edits = 0usize;
-    for (file_idx, (path, src)) in files.iter_mut().enumerate() {
+    // 3. Emit signature edits + intra-crate & cross-crate call-site argument forwarding.
+    let mut cross_crate_rewrites = 0usize;
+
+    for (file_idx, wf) in files.iter_mut().enumerate() {
+        let summary_idx = &wf.summary_idx;
+        let crate_ident = &wf.crate_ident;
+        let path = &wf.path;
+        let src = &mut wf.src;
         if path == "build.rs" || path.ends_with("/build.rs") {
             continue;
         }
+        let imports = &file_imports[file_idx];
         let parse = SourceFile::parse(src, Edition::CURRENT);
         let root = parse.tree();
         let mut edits: Vec<SpanEdit> = Vec::new();
@@ -1465,8 +1703,6 @@ fn propagate_and_rewrite_capabilities(
                     let Some(plist) = func.param_list() else { continue };
                     let Some(rparen) = plist.r_paren_token() else { continue };
 
-                    // Check if we should add an explicit allocator lifetime `'a` / `'alloc` and rewrite
-                    // an owned-heap return type (`String`, `Vec<T>`, `Box<T>`, `Result<Vec<T>, E>`, ...).
                     let mut alloc_lt: Option<&'static str> = None;
                     if added.contains(&CapParam::Alloc) {
                         if let Some(ret_ty) = func.ret_type().and_then(|r| r.ty()) {
@@ -1474,7 +1710,6 @@ fn propagate_and_rewrite_capabilities(
                             let chosen_lt = pick_fresh_alloc_lifetime(&func);
                             if let Some(rewritten_ret) = rewrite_return_type_with_alloc(&raw_ret, chosen_lt) {
                                 alloc_lt = Some(chosen_lt);
-                                // 3a. Insert lifetime into generic param list (if not already present).
                                 if !fn_declares_lifetime(&func, chosen_lt) {
                                     if let Some(gpl) = func.generic_param_list() {
                                         if let Some(langle) = gpl.l_angle_token() {
@@ -1496,7 +1731,6 @@ fn propagate_and_rewrite_capabilities(
                                         });
                                     }
                                 }
-                                // 3b. Rewrite return type.
                                 let rrange = ret_ty.syntax().text_range();
                                 edits.push(SpanEdit {
                                     start: rrange.start().into(),
@@ -1507,7 +1741,6 @@ fn propagate_and_rewrite_capabilities(
                         }
                     }
 
-                    // 3c. Insert added capability/allocator parameters into `ParamList`.
                     let ins_pos: usize = rparen.text_range().start().into();
                     let has_existing = plist.self_param().is_some() || plist.params().next().is_some();
                     let decls: Vec<String> = added.iter().map(|c| c.param_decl(alloc_lt)).collect();
@@ -1527,15 +1760,40 @@ fn propagate_and_rewrite_capabilities(
                     let Some(expr) = call.expr() else { continue };
                     let raw_callee = expr.syntax().text().to_string();
                     let compact: String = raw_callee.chars().filter(|c| !c.is_whitespace()).collect();
-                    // Only forward for bare or module-qualified free-fn calls (skip Type::method calls with uppercase qualifier).
-                    let leaf = compact.rsplit("::").next().unwrap_or(&compact);
-                    if let Some((prefix, _)) = compact.rsplit_once("::") {
+                    let cleaned = compact.strip_prefix("::").unwrap_or(&compact);
+                    let leaf = cleaned.rsplit("::").next().unwrap_or(cleaned);
+                    if let Some((prefix, _)) = cleaned.rsplit_once("::") {
                         let parent_seg = prefix.rsplit("::").next().unwrap_or(prefix);
                         if parent_seg.starts_with(|c: char| c.is_ascii_uppercase()) {
                             continue;
                         }
                     }
-                    let Some(callee_added) = added_by_free_name.get(leaf) else { continue };
+
+                    // Resolve either cross-crate (`other_crate::...::fn` or imported `use other_crate::fn`)
+                    // or intra-crate (`fn` / `mod::fn`).
+                    let first_seg = cleaned.split("::").next().unwrap_or("");
+                    let (callee_added, is_cross_crate) = if cleaned.contains("::")
+                        && first_seg != crate_ident.as_str()
+                        && known_crates.contains(first_seg)
+                    {
+                        match added_by_ws_pub_fn.get(&(first_seg.to_owned(), leaf.to_owned())) {
+                            Some(a) => (Some(a), true),
+                            None => (None, false),
+                        }
+                    } else if !cleaned.contains("::") {
+                        if let Some((target_crate, orig_fn)) = imports.get(leaf) {
+                            match added_by_ws_pub_fn.get(&(target_crate.clone(), orig_fn.clone())) {
+                                Some(a) => (Some(a), true),
+                                None => (added_by_free_name.get(&(*summary_idx, leaf.to_owned())), false),
+                            }
+                        } else {
+                            (added_by_free_name.get(&(*summary_idx, leaf.to_owned())), false)
+                        }
+                    } else {
+                        (added_by_free_name.get(&(*summary_idx, leaf.to_owned())), false)
+                    };
+
+                    let Some(callee_added) = callee_added else { continue };
                     let Some(arg_list) = call.arg_list() else { continue };
                     let Some(rparen) = arg_list.r_paren_token() else { continue };
                     if let Some(args_str) = format_forwarded_args(&node, callee_added, file_idx, &added_by_fn) {
@@ -1551,13 +1809,16 @@ fn propagate_and_rewrite_capabilities(
                             format!(", {args_str}")
                         };
                         edits.push(SpanEdit { start: ins_pos, end: ins_pos, replacement: text });
+                        if is_cross_crate {
+                            cross_crate_rewrites += 1;
+                        }
                     }
                 }
                 SyntaxKind::METHOD_CALL_EXPR => {
                     let Some(mc) = ast::MethodCallExpr::cast(node.clone()) else { continue };
                     let Some(mname_ref) = mc.name_ref() else { continue };
                     let mname = mname_ref.text().to_string();
-                    let Some(callee_added) = added_by_method_name.get(&mname) else { continue };
+                    let Some(callee_added) = added_by_method_name.get(&(*summary_idx, mname)) else { continue };
                     let Some(arg_list) = mc.arg_list() else { continue };
                     let Some(rparen) = arg_list.r_paren_token() else { continue };
                     if let Some(args_str) = format_forwarded_args(&node, callee_added, file_idx, &added_by_fn) {
@@ -1580,12 +1841,159 @@ fn propagate_and_rewrite_capabilities(
         }
 
         if !edits.is_empty() {
-            total_edits += edits.len();
+            on_crate_edit(*summary_idx, edits.len());
             *src = apply_span_edits(src, edits);
         }
     }
 
-    total_edits
+    cross_crate_rewrites
+}
+
+/// SOTA 2: Parameterize plain owned-heap structs (`struct Foo { items: Vec<String>, ... }`) with
+/// an explicit allocator lifetime `struct Foo<'a>` and `bstd::mem::Alloc<'a>` field types, and
+/// update matching inherent `impl<'a> Foo<'a>` blocks in the same file.
+///
+/// Skips `#[repr(C)]`, `#[repr(transparent)]`, `Serialize`/`Deserialize`/`Copy` derives, structs
+/// already carrying `'a` or an `Allocator` parameter, and `#[cfg(test)]` items.
+/// Writes the rewritten source into `out` and returns [`StructAllocStats`].
+pub fn rewrite_struct_alloc_fields_into(
+    src: &str,
+    out: &mut impl core::fmt::Write,
+) -> StructAllocStats {
+    let parse = SourceFile::parse(src, Edition::CURRENT);
+    let root = parse.tree();
+    let mut edits: Vec<SpanEdit> = Vec::new();
+    let mut parameterized_structs: BTreeSet<String> = BTreeSet::new();
+
+    // 1. Inspect structs and rewrite owned-heap fields + add `'a` lifetime param.
+    for node in root.syntax().descendants() {
+        let Some(st) = ast::Struct::cast(node.clone()) else { continue };
+        if node.ancestors().any(|a| is_cfg_test_item(&a)) || is_cfg_test_item(&node) {
+            continue;
+        }
+        // Skip structs nested inside function bodies.
+        if node.ancestors().skip(1).any(|a| a.kind() == SyntaxKind::FN) {
+            continue;
+        }
+        let Some(name_tok) = st.name() else { continue };
+        let sname = name_tok.text().to_string();
+
+        let attr_txt: String = st
+            .syntax()
+            .children()
+            .filter(|c| c.kind() == SyntaxKind::ATTR)
+            .map(|c| c.text().to_string())
+            .collect();
+        if attr_txt.contains("repr(C")
+            || attr_txt.contains("repr(transparent")
+            || attr_txt.contains("Serialize")
+            || attr_txt.contains("Deserialize")
+            || attr_txt.contains("Copy")
+        {
+            continue;
+        }
+
+        if let Some(gpl) = st.generic_param_list() {
+            let gtxt = gpl.syntax().text().to_string();
+            if gtxt.contains("'a") || gtxt.contains("Allocator") || gtxt.contains("Alloc") {
+                continue;
+            }
+        }
+
+        let Some(ast::FieldList::RecordFieldList(rfl)) = st.field_list() else {
+            continue;
+        };
+
+        let mut field_edits: Vec<SpanEdit> = Vec::new();
+        for field in rfl.fields() {
+            if let Some(ty) = field.ty() {
+                let raw = ty.syntax().text().to_string();
+                if let Some(rewritten) = rewrite_return_type_with_alloc(&raw, "'a") {
+                    let r = ty.syntax().text_range();
+                    field_edits.push(SpanEdit {
+                        start: r.start().into(),
+                        end: r.end().into(),
+                        replacement: rewritten,
+                    });
+                }
+            }
+        }
+        if field_edits.is_empty() {
+            continue;
+        }
+
+        // Insert `'a` into struct's generic param list.
+        if let Some(gpl) = st.generic_param_list() {
+            if let Some(langle) = gpl.l_angle_token() {
+                let pos: usize = langle.text_range().end().into();
+                let has_any = gpl.generic_params().next().is_some();
+                let rep = if has_any { "'a, ".to_owned() } else { "'a".to_owned() };
+                edits.push(SpanEdit { start: pos, end: pos, replacement: rep });
+            }
+        } else {
+            let pos: usize = name_tok.syntax().text_range().end().into();
+            edits.push(SpanEdit { start: pos, end: pos, replacement: "<'a>".to_owned() });
+        }
+        edits.extend(field_edits);
+        parameterized_structs.insert(sname);
+    }
+
+    if parameterized_structs.is_empty() {
+        let _ = out.write_str(src);
+        return StructAllocStats::default();
+    }
+
+    // 2. Update matching inherent `impl` blocks in the same file (`impl Foo` -> `impl<'a> Foo<'a>`).
+    for node in root.syntax().descendants() {
+        let Some(imp) = ast::Impl::cast(node.clone()) else { continue };
+        if imp.trait_().is_some() || node.ancestors().any(|a| is_cfg_test_item(&a)) {
+            continue;
+        }
+        let Some(self_ty) = imp.self_ty() else { continue };
+        let stxt = self_ty.syntax().text().to_string();
+        let st_trim = stxt.trim();
+        let head = st_trim.split('<').next().unwrap_or(st_trim).trim();
+        if !parameterized_structs.contains(head) {
+            continue;
+        }
+        if st_trim.contains("'a") {
+            continue;
+        }
+
+        // Insert `'a` on `impl` generics.
+        if let Some(gpl) = imp.generic_param_list() {
+            if !gpl.syntax().text().to_string().contains("'a") {
+                if let Some(langle) = gpl.l_angle_token() {
+                    let pos: usize = langle.text_range().end().into();
+                    let has_any = gpl.generic_params().next().is_some();
+                    let rep = if has_any { "'a, ".to_owned() } else { "'a".to_owned() };
+                    edits.push(SpanEdit { start: pos, end: pos, replacement: rep });
+                }
+            }
+        } else if let Some(impl_tok) = imp.impl_token() {
+            let pos: usize = impl_tok.text_range().end().into();
+            edits.push(SpanEdit { start: pos, end: pos, replacement: "<'a>".to_owned() });
+        }
+
+        // Insert `'a` on `SelfTy` (`Foo` -> `Foo<'a>`, `Foo<T>` -> `Foo<'a, T>`).
+        let srange = self_ty.syntax().text_range();
+        let new_self_ty = if let Some(open) = st_trim.find('<') {
+            format!("{}<'a, {}", &st_trim[..open], &st_trim[open + 1..])
+        } else {
+            format!("{st_trim}<'a>")
+        };
+        edits.push(SpanEdit {
+            start: srange.start().into(),
+            end: srange.end().into(),
+            replacement: new_self_ty,
+        });
+    }
+
+    let edits_applied = edits.len();
+    let structs_changed = parameterized_structs.len();
+    let rewritten = apply_span_edits(src, edits);
+    let _ = out.write_str(&rewritten);
+    StructAllocStats { structs_changed, edits_applied }
 }
 
 fn format_forwarded_args(
@@ -1626,11 +2034,19 @@ fn format_forwarded_args(
     Some(args.join(", "))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "single-pass body scanner recording direct capability uses and intra/cross-crate callees"
+)]
 fn scan_body_caps_and_callees(
     body: &syntax::SyntaxNode,
     alloc_strategy: AllocStrategy,
+    own_crate: &str,
+    known_crates: &BTreeSet<String>,
+    imports: &BTreeMap<String, (String, String)>,
     needed: &mut BTreeSet<CapParam>,
     free_callees: &mut BTreeSet<String>,
+    cross_crate_callees: &mut BTreeSet<(String, String)>,
     method_callees: &mut BTreeSet<String>,
 ) {
     for node in body.descendants() {
@@ -1647,15 +2063,16 @@ fn scan_body_caps_and_callees(
                 let Some(expr) = call.expr() else { continue };
                 let raw = expr.syntax().text().to_string();
                 let compact: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
-                if compact.starts_with("bstd::vec::Vec::")
-                    || compact.starts_with("bstd::mem::String::")
-                    || compact.starts_with("bstd::boxed::Box::new_in")
-                    || compact.starts_with("bstd::boxed::Arc::new_in")
-                    || compact.starts_with("bstd::boxed::Rc::new_in")
-                    || compact.starts_with("bstd::map::BTreeMap::new_in")
-                    || compact.starts_with("bstd::set::BTreeSet::new_in")
-                    || compact.starts_with("bstd::map::Map::new")
-                    || compact.starts_with("bstd::set::Set::new")
+                let cleaned = compact.strip_prefix("::").unwrap_or(&compact);
+                if cleaned.starts_with("bstd::vec::Vec::")
+                    || cleaned.starts_with("bstd::mem::String::")
+                    || cleaned.starts_with("bstd::boxed::Box::new_in")
+                    || cleaned.starts_with("bstd::boxed::Arc::new_in")
+                    || cleaned.starts_with("bstd::boxed::Rc::new_in")
+                    || cleaned.starts_with("bstd::map::BTreeMap::new_in")
+                    || cleaned.starts_with("bstd::set::BTreeSet::new_in")
+                    || cleaned.starts_with("bstd::map::Map::new")
+                    || cleaned.starts_with("bstd::set::Set::new")
                 {
                     let body_txt = call.syntax().text().to_string();
                     if body_txt.contains("cx.frame().alloc()") {
@@ -1665,18 +2082,38 @@ fn scan_body_caps_and_callees(
                     }
                     continue;
                 }
-                let leaf = compact.rsplit("::").next().unwrap_or(&compact);
-                let is_type_assoc = compact
+                let leaf = cleaned.rsplit("::").next().unwrap_or(cleaned);
+                let is_type_assoc = cleaned
                     .rsplit_once("::")
                     .is_some_and(|(pfx, _)| pfx.rsplit("::").next().unwrap_or(pfx).starts_with(|c: char| c.is_ascii_uppercase()));
                 if !is_type_assoc && !leaf.is_empty() && leaf.starts_with(|c: char| c.is_ascii_lowercase()) {
-                    free_callees.insert(leaf.to_owned());
+                    let first_seg = cleaned.split("::").next().unwrap_or("");
+                    if cleaned.contains("::") && first_seg != own_crate && known_crates.contains(first_seg) {
+                        cross_crate_callees.insert((first_seg.to_owned(), leaf.to_owned()));
+                    } else if !cleaned.contains("::") {
+                        if let Some((target_crate, orig_fn)) = imports.get(leaf) {
+                            cross_crate_callees.insert((target_crate.clone(), orig_fn.clone()));
+                        } else {
+                            free_callees.insert(leaf.to_owned());
+                        }
+                    } else {
+                        free_callees.insert(leaf.to_owned());
+                    }
                 }
             }
             SyntaxKind::METHOD_CALL_EXPR => {
                 let Some(mc) = ast::MethodCallExpr::cast(node) else { continue };
                 let Some(mname_ref) = mc.name_ref() else { continue };
                 let mname = mname_ref.text().to_string();
+                if mname == "collect_in" {
+                    let mtxt = mc.syntax().text().to_string();
+                    if mtxt.contains("cx.frame().alloc()") {
+                        needed.insert(CapParam::Cx);
+                    } else if alloc_strategy != AllocStrategy::KeepAllocForNow {
+                        needed.insert(CapParam::Alloc);
+                    }
+                    continue;
+                }
                 if let Some(recv) = mc.receiver() {
                     let rtxt = recv.syntax().text().to_string();
                     let rtrim = rtxt.trim();

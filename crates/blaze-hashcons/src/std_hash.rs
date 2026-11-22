@@ -7,7 +7,7 @@
 //! (an `Interned` of `crates/intern`, a raw pointer) is not deterministic and must not be fed
 //! this way; feed such parts by content ID.
 
-use std::hash::{self, Hash};
+use core::{hash, hash::Hash};
 
 use blaze_ids::Hasher;
 

@@ -24,6 +24,7 @@
 //! [`Assembler::finish`] resolves local branches within this template. Only labels and
 //! their uses need scratch space. Each statement fits in [`STATEMENT_MOST`] bytes.
 
+use alloc::vec::Vec;
 mod table;
 
 use core::{alloc::Allocator, ops::Range};

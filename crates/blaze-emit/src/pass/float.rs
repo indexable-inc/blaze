@@ -25,7 +25,7 @@
 //! operation on one that reaches here is refused by name, as are the two conditions that need
 //! two flags (`one`, `ueq`).
 
-use std::alloc::Allocator;
+use alloc::alloc::Allocator;
 
 mod math;
 

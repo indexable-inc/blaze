@@ -27,11 +27,14 @@
 //! Nothing here does IO, and nothing here depends on the daemon, the query engine or the old
 //! store.
 
+#![cfg_attr(not(test), no_std)]
 #![deny(unsafe_code)]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
 // `#![blaze::sans_io]` in each module; inert under rustc.
 #![register_tool(blaze)]
 
+
+extern crate alloc;
 pub mod driver;
 pub mod exec;
 pub mod front;

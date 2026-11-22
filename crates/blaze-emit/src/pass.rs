@@ -2,7 +2,8 @@
 //! as it comes, branch and PC-relative fields patched once everything is placed from the list
 //! of patches the pass kept (no second walk of the input).
 
-use std::alloc::{Allocator, Global};
+use alloc::vec::Vec;
+use alloc::{alloc::Allocator, alloc::Global};
 
 use blaze_lir::{
     Block, Flags, IntCond, Op, Scalar, Ty, Value, View,
