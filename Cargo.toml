@@ -245,6 +245,7 @@ blaze-body-drops = { path = "crates/blaze-body-drops" }
 blaze-body-eval = { path = "crates/blaze-body-eval" }
 blaze-body-flow = { path = "crates/blaze-body-flow" }
 blaze-body-lower = { path = "crates/blaze-body-lower" }
+blaze-bstd-convert = { path = "crates/blaze-bstd-convert" }
 blaze-build-script = { path = "crates/blaze-build-script" }
 blaze-cad = { path = "crates/blaze-cad" }
 blaze-cad-field = { path = "crates/blaze-cad-field" }

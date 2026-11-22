@@ -24,6 +24,7 @@ blaze-body-eval	0	0	86
 blaze-body-flow	0	0	8
 blaze-body-lower	0	0	8
 blaze-borrow	0	0	8
+blaze-bstd-convert	0	0	41
 blaze-build	0	0	8
 blaze-build-script	0	0	86
 blaze-bytes	0	0	1

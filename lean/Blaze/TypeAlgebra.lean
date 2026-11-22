@@ -52,7 +52,7 @@ def StrictlySorted : List TypeKey → Prop
 private theorem allGt_mono {x y : TypeKey} (hxy : x < y) :
     ∀ {xs : List TypeKey}, AllGt y xs → AllGt x xs
   | [], _ => trivial
-  | _ :: _, ⟨hyz, hrest⟩ => ⟨by omega, allGt_mono hxy hrest⟩
+  | _ :: _, ⟨hyz, hrest⟩ => ⟨Nat.lt_trans hxy hyz, allGt_mono hxy hrest⟩
 
 private theorem allGt_insertKey {x k : TypeKey} (hxk : x < k) :
     ∀ {xs : List TypeKey}, AllGt x xs → AllGt x (insertKey k xs)
@@ -60,13 +60,13 @@ private theorem allGt_insertKey {x k : TypeKey} (hxk : x < k) :
   | y :: ys, ⟨hxy, hys⟩ => by
     simp only [insertKey]
     by_cases hky : k < y
-    · rw [if_pos hky]
+    · simp only [hky, ↓reduceIte]
       exact ⟨hxk, hxy, hys⟩
-    · rw [if_neg hky]
+    · simp only [hky, ↓reduceIte]
       by_cases hkeq : k = y
-      · rw [if_pos hkeq]
+      · simp only [hkeq, ↓reduceIte]
         exact ⟨hxy, hys⟩
-      · rw [if_neg hkeq]
+      · simp only [hkeq, ↓reduceIte]
         exact ⟨hxy, allGt_insertKey hxk hys⟩
 
 private theorem strictlySorted_insertKey (k : TypeKey) :
@@ -75,14 +75,14 @@ private theorem strictlySorted_insertKey (k : TypeKey) :
   | y :: ys, ⟨hy, hys⟩ => by
     simp only [insertKey]
     by_cases hky : k < y
-    · rw [if_pos hky]
+    · simp only [hky, ↓reduceIte]
       exact ⟨⟨hky, allGt_mono hky hy⟩, hy, hys⟩
-    · rw [if_neg hky]
+    · simp only [hky, ↓reduceIte]
       by_cases hkeq : k = y
-      · rw [if_pos hkeq]
+      · simp only [hkeq, ↓reduceIte]
         exact ⟨hy, hys⟩
-      · rw [if_neg hkeq]
-        have hyk : y < k := by omega
+      · simp only [hkeq, ↓reduceIte]
+        have hyk : y < k := Nat.lt_of_le_of_ne (Nat.le_of_not_lt hky) (Ne.symm hkeq)
         exact ⟨allGt_insertKey hyk hy, strictlySorted_insertKey k hys⟩
 
 private theorem allGt_removeKey {x m : TypeKey} :
@@ -91,9 +91,9 @@ private theorem allGt_removeKey {x m : TypeKey} :
   | y :: ys, ⟨hxy, hys⟩ => by
     simp only [removeKey]
     by_cases hym : y = m
-    · rw [if_pos hym]
+    · simp only [hym, ↓reduceIte]
       exact allGt_removeKey hys
-    · rw [if_neg hym]
+    · simp only [hym, ↓reduceIte]
       exact ⟨hxy, allGt_removeKey hys⟩
 
 private theorem strictlySorted_removeKey (m : TypeKey) :
@@ -102,58 +102,62 @@ private theorem strictlySorted_removeKey (m : TypeKey) :
   | y :: ys, ⟨hy, hys⟩ => by
     simp only [removeKey]
     by_cases hym : y = m
-    · rw [if_pos hym]
+    · simp only [hym, ↓reduceIte]
       exact strictlySorted_removeKey m hys
-    · rw [if_neg hym]
+    · simp only [hym, ↓reduceIte]
       exact ⟨allGt_removeKey hy, strictlySorted_removeKey m hys⟩
 
 private theorem insertKey_comm (a b : TypeKey) :
     ∀ (xs : List TypeKey), insertKey a (insertKey b xs) = insertKey b (insertKey a xs)
   | [] => by
     by_cases hlt : a < b
-    · have h1 : ¬(b < a) := by omega
-      have h2 : ¬(b = a) := by omega
+    · have h1 : ¬(b < a) := Nat.lt_asymm hlt
+      have h2 : ¬(b = a) := Nat.ne_of_gt hlt
       simp [insertKey, hlt, h1, h2]
     · by_cases heq : a = b
       · subst heq; rfl
-      · have hgt : b < a := by omega
-        have h1 : ¬(a < b) := by omega
+      · have hgt : b < a := Nat.lt_of_le_of_ne (Nat.le_of_not_lt hlt) (Ne.symm heq)
+        have h1 : ¬(a < b) := hlt
         simp [insertKey, hgt, h1, heq]
   | x :: rest => by
     have ih := insertKey_comm a b rest
     by_cases ha1 : a < x
     · by_cases hb1 : b < x
       · by_cases hab1 : a < b
-        · have hba : ¬(b < a) := by omega
-          have hne : ¬(b = a) := by omega
+        · have hba : ¬(b < a) := Nat.lt_asymm hab1
+          have hne : ¬(b = a) := Nat.ne_of_gt hab1
           simp [insertKey, ha1, hb1, hab1, hba, hne]
         · by_cases hab2 : a = b
           · subst hab2; rfl
-          · have hba : b < a := by omega
+          · have hba : b < a := Nat.lt_of_le_of_ne (Nat.le_of_not_lt hab1) (Ne.symm hab2)
             simp [insertKey, ha1, hb1, hab1, hab2, hba]
       · by_cases hb2 : b = x
         · subst hb2
-          have h1 : ¬(b < b) := by omega
-          have h2 : ¬(b < a) := by omega
-          have h3 : ¬(b = a) := by omega
+          have h1 : ¬(b < b) := Nat.lt_irrefl b
+          have h2 : ¬(b < a) := Nat.lt_asymm ha1
+          have h3 : ¬(b = a) := Nat.ne_of_gt ha1
           simp [insertKey, ha1, h1, h2, h3]
-        · have h1 : ¬(b < a) := by omega
-          have h2 : ¬(b = a) := by omega
+        · have hxb : x < b := Nat.lt_of_le_of_ne (Nat.le_of_not_lt hb1) (Ne.symm hb2)
+          have hab : a < b := Nat.lt_trans ha1 hxb
+          have h1 : ¬(b < a) := Nat.lt_asymm hab
+          have h2 : ¬(b = a) := Nat.ne_of_gt hab
           simp [insertKey, ha1, hb1, hb2, h1, h2]
     · by_cases ha2 : a = x
       · subst ha2
         by_cases hb1 : b < a
-        · have h1 : ¬(a < a) := by omega
-          have h2 : ¬(a < b) := by omega
-          have h3 : ¬(a = b) := by omega
+        · have h1 : ¬(a < a) := Nat.lt_irrefl a
+          have h2 : ¬(a < b) := Nat.lt_asymm hb1
+          have h3 : ¬(a = b) := Nat.ne_of_gt hb1
           simp [insertKey, hb1, h1, h2, h3]
         · by_cases hb2 : b = a
           · subst hb2; rfl
-          · have h1 : ¬(a < a) := by omega
+          · have h1 : ¬(a < a) := Nat.lt_irrefl a
             simp [insertKey, hb1, hb2, h1]
       · by_cases hb1 : b < x
-        · have h1 : ¬(a < b) := by omega
-          have h2 : ¬(a = b) := fun h => ha1 (h ▸ hb1)
+        · have hxa : x < a := Nat.lt_of_le_of_ne (Nat.le_of_not_lt ha1) (Ne.symm ha2)
+          have hba : b < a := Nat.lt_trans hb1 hxa
+          have h1 : ¬(a < b) := Nat.lt_asymm hba
+          have h2 : ¬(a = b) := Nat.ne_of_gt hba
           simp [insertKey, ha1, ha2, hb1, h1, h2]
         · by_cases hb2 : b = x
           · subst hb2
@@ -243,18 +247,17 @@ private theorem mem_iff_indexOfKey_isSome (k : TypeKey) :
     constructor
     · intro hmem
       by_cases hkx : k = x
-      · exact ⟨0, by simp only [indexOfKey]; rw [if_pos hkx]⟩
+      · exact ⟨0, by simp only [indexOfKey, hkx, ↓reduceIte]⟩
       · cases hmem with
         | head => exact (hkx rfl).elim
         | tail _ hrest =>
           obtain ⟨i, hi⟩ := ih.mp hrest
-          exact ⟨i + 1, by simp only [indexOfKey]; rw [if_neg hkx, hi]; rfl⟩
+          exact ⟨i + 1, by simp only [indexOfKey, hkx, ↓reduceIte, hi]; rfl⟩
     · intro ⟨i, hi⟩
       by_cases hkx : k = x
       · subst hkx
         exact List.Mem.head rest
-      · simp only [indexOfKey] at hi
-        rw [if_neg hkx] at hi
+      · simp only [indexOfKey, hkx, ↓reduceIte] at hi
         cases hrest : indexOfKey k rest with
         | none =>
           rw [hrest] at hi
@@ -271,8 +274,7 @@ private theorem mem_or_removeKey (k m : TypeKey) :
       by_cases hkm : k = m
       · exact Or.inl hkm
       · right
-        simp only [removeKey]
-        rw [if_neg hkm]
+        simp only [removeKey, hkm, ↓reduceIte]
         exact List.Mem.head _
     | tail _ hrest =>
       cases mem_or_removeKey k m rest hrest with
@@ -281,9 +283,9 @@ private theorem mem_or_removeKey (k m : TypeKey) :
         right
         simp only [removeKey]
         by_cases hxm : x = m
-        · rw [if_pos hxm]
+        · simp only [hxm, ↓reduceIte]
           exact hrem
-        · rw [if_neg hxm]
+        · simp only [hxm, ↓reduceIte]
           exact List.Mem.tail x hrem
 
 private theorem not_mem_removeKey (m : TypeKey) :
@@ -292,9 +294,9 @@ private theorem not_mem_removeKey (m : TypeKey) :
   | x :: rest, h => by
     simp only [removeKey] at h
     by_cases hxm : x = m
-    · rw [if_pos hxm] at h
+    · simp only [hxm, ↓reduceIte] at h
       exact not_mem_removeKey m rest h
-    · rw [if_neg hxm] at h
+    · simp only [hxm, ↓reduceIte] at h
       cases h with
       | head => exact hxm rfl
       | tail _ hrest => exact not_mem_removeKey m rest hrest

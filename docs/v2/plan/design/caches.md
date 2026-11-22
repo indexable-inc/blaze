@@ -120,6 +120,7 @@ a file under `crates/` that names SipHash, `DefaultHasher`, `RandomState`, `FxHa
 | `crates/blaze-hash/` | foldhash under one fixed seed; SipHash-1-3 under a drawn key for keys an attacker picks; the key's own first word for keys that are hashes | probe | in memory only; the map compares the key |
 | `crates/blaze-std/src/lib.rs` | the above, re-exported | names | |
 | `crates/blaze-arrow-ipc/src/write.rs` | FNV-1a, 64 bits | probe | in-memory string dictionary slot hash (`Dict::place`); full string compared after |
+| `crates/blaze-bstd-convert/src/catalog.rs` | `FxHasher` | names | rewrite catalog naming `rustc_hash::FxHasher` for migration to `bstd::hash::FixedHasher` |
 | `crates/blaze-expand/examples/rules_compare/compare.rs` | FNV-1a, 64 bits | unaudited | example comparison tool, not the compiler |
 | `crates/blaze-ladder/src/symbols.rs` | FNV-1a, 64 bits | probe | in-memory DAG interning table slot hash (`bytes_hash`); full node bytes compared after |
 | `crates/blaze-lint/src/dup.rs` | FNV-1a, 64 bits | probe | duplicate-code lint rolling token hash (`token_kind_code`); token windows compared after |
