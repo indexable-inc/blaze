@@ -92,6 +92,27 @@ pub struct In {
     io: Io,
 }
 
+/// Completion state for [`In::read_into`], stored inline inside [`Pending`] (zero heap alloc).
+pub struct ReadInto {
+    most: usize,
+}
+
+impl<'buf> pending::Complete<'buf> for ReadInto {
+    type Output = Result<usize, InError>;
+
+    fn complete(self, into: &'buf mut [u8], done: Result<Done, Stopped>) -> Self::Output {
+        match done {
+            Ok(Done::Read(bytes)) if bytes.len() <= self.most => {
+                into[..bytes.len()].copy_from_slice(&bytes);
+                Ok(bytes.len())
+            }
+            Ok(Done::Broken { error, .. }) => Err(InError { why: InWhy::Host(error) }),
+            Ok(done) => Err(InError { why: InWhy::Answered(done) }),
+            Err(stopped) => Err(InError::from(stopped)),
+        }
+    }
+}
+
 impl In {
     pub(crate) fn new(io: Io) -> In {
         In { io }
@@ -101,20 +122,12 @@ impl In {
     /// most blaze-core's [`RECV_MOST`]), in flight: its outcome is how many, `0` once the input
     /// has ended (or for an empty `into`).
     #[track_caller]
-    pub fn read_into<'buf>(&'buf self, into: &'buf mut [u8]) -> Pending<'buf, Result<usize, InError>> {
+    pub fn read_into<'buf>(&'buf self, into: &'buf mut [u8]) -> Pending<'buf, ReadInto> {
         let most = into.len().min(RECV_MOST);
         // alloc: none here, an empty buffer; the driver grows it to what it reads (one global
         // allocation a read, as `Done::Read`'s every reader pays until the page pool).
         let effect = move |tag| Effect::ReadStdin { most, into: Default::default(), tag };
-        pending::start(&self.io, "bstd::in read_into", into, effect, move |into: &mut [u8], done| match done {
-            Ok(Done::Read(bytes)) if bytes.len() <= most => {
-                into[..bytes.len()].copy_from_slice(&bytes);
-                Ok(bytes.len())
-            }
-            Ok(Done::Broken { error, .. }) => Err(InError { why: InWhy::Host(error) }),
-            Ok(done) => Err(InError { why: InWhy::Answered(done) }),
-            Err(stopped) => Err(InError::from(stopped)),
-        })
+        pending::start(&self.io, "bstd::in read_into", into, effect, ReadInto { most })
     }
 
     /// What standard input holds next, at most `most` bytes (and at most [`RECV_MOST`]), added

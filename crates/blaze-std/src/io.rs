@@ -132,6 +132,16 @@ impl Limits {
         close_most: 1024,
         trace_most: 1 << 16,
     };
+
+    /// As [`Limits::USUAL`], with global trace recording off (`trace_most: 0`): `Cx::span` and
+    /// `Cx::event` take no world lock on high-core workloads where worker telemetry is used
+    /// instead.
+    pub const QUIET: Limits = Limits {
+        abandon_wait: Duration::from_secs(1),
+        poll_fuel: 1 << 16,
+        close_most: 1024,
+        trace_most: 0,
+    };
 }
 
 /// What the simulation's generator of [`Io::rng`] starts from, besides the seed: so it draws
@@ -789,7 +799,7 @@ impl Io {
         // clone: the world's environment and command line, `Arc`s.
         let (env, args) = (start.env.clone(), start.args.clone());
         // Chosen once, from the driver, before it moves under the lock.
-        let beside = fast::Beside::of(&start.driver);
+        let beside = fast::Beside::of(&start.driver, limits.trace_most);
         Io {
             // alloc: once per world.
             reach: Reach::Shared { world: Arc::new(Lock::new("bstd.io.world", World::new(start))), env, args, beside, workers },
@@ -1502,7 +1512,14 @@ impl Io {
     /// `f` on what the world's tasks recorded through their contexts ([`Cx::span`],
     /// [`Cx::event`]).
     pub fn trace<R>(&self, f: impl FnOnce(&Trace) -> R) -> R {
-        f(&self.world().lock().trace)
+        let mut world = self.world().lock();
+        if let Reach::Shared { beside, .. } = &self.reach {
+            let dropped = beside.trace.take_dropped();
+            if dropped > 0 {
+                world.trace.add_dropped(dropped);
+            }
+        }
+        f(&world.trace)
     }
 
     /// The status the simulated process exited with, if it did ([`Host::exit`]).
@@ -1512,13 +1529,24 @@ impl Io {
 
     /// A record of `span`, now on the driver's clock.
     /// A hosted run keeps none: its spans are its host's to see (run.md, "The hosted world").
+    /// Once `trace_most` is 0 or full, takes no world lock: `trace_most == 0` returns at once,
+    /// and a full trace counts its drops atomically beside the lock.
     pub(crate) fn record_trace(&self, span: &'static str, kind: RecordKind) {
-        if let Reach::Hosted = self.reach {
+        let Reach::Shared { beside, .. } = &self.reach else {
+            return;
+        };
+        if self.limits.trace_most == 0 {
+            return;
+        }
+        if !beside.trace.is_open() {
+            beside.trace.drop_one();
             return;
         }
         let mut world = self.world().lock();
         let at = world.driver.now();
-        world.trace.push(Record { at, span, kind });
+        if !world.trace.push(Record { at, span, kind }) {
+            beside.trace.close();
+        }
     }
 
     pub(crate) fn host_facts<R>(&self, f: impl FnOnce(&HostFacts) -> R) -> R {

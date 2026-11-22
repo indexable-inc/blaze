@@ -801,6 +801,34 @@ impl<T: ?Sized> ReadLock<T> {
         })
     }
 
+    #[inline]
+    #[track_caller]
+    pub fn try_read_for(&self, timeout: Duration) -> Option<ReadGuard<'_, T>> {
+        let site = Location::caller();
+        if let Some(inner) = self.raw.try_read() {
+            return Some(ReadGuard { meta: &self.meta, site, acquired_ns: 0, inner });
+        }
+        let waiting = Waiting::begin(&self.meta, site, Mode::Read, type_name::<T>());
+        let inner = self.raw.try_read_for(timeout)?;
+        let acquired_ns = waiting.taken();
+        Some(ReadGuard { meta: &self.meta, site, acquired_ns, inner })
+    }
+
+    #[inline]
+    #[track_caller]
+    pub fn try_write_for(&self, timeout: Duration) -> Option<WriteGuard<'_, T>> {
+        let site = Location::caller();
+        if let Some(inner) = self.raw.try_write() {
+            self.meta.stamp();
+            return Some(WriteGuard { meta: &self.meta, site, acquired_ns: 0, inner });
+        }
+        let waiting = Waiting::begin(&self.meta, site, Mode::Write, type_name::<T>());
+        let inner = self.raw.try_write_for(timeout)?;
+        self.meta.stamp();
+        let acquired_ns = waiting.taken();
+        Some(WriteGuard { meta: &self.meta, site, acquired_ns, inner })
+    }
+
     pub fn get_mut(&mut self) -> &mut T {
         self.raw.get_mut()
     }

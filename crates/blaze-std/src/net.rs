@@ -482,6 +482,67 @@ impl Drop for Link {
     }
 }
 
+/// Completion state for [`Conn::write_from`], stored inline inside [`Pending`] (zero heap alloc).
+pub enum WriteFrom<'buf> {
+    InFlight { peer: &'buf Addr, budget: Option<&'buf Budget>, asked: u64, after: bool },
+    Refused(NetError),
+}
+
+impl<'buf> pending::Complete<'buf> for WriteFrom<'buf> {
+    type Output = Result<(), NetError>;
+
+    fn complete(self, _: &'buf mut [u8], done: Result<Done, Stopped>) -> Self::Output {
+        match self {
+            WriteFrom::Refused(err) => Err(err),
+            WriteFrom::InFlight { peer, budget, asked, after } => match done {
+                Ok(Done::Sent(_)) => match budget {
+                    Some(budget) if after => budget.take(asked).map_err(|over| error(NetOp::Send, peer, NetKind::OverLimit(over))),
+                    _ => Ok(()),
+                },
+                Ok(done) => Err(unexpected(NetOp::Send, peer, done)),
+                Err(stopped) => Err(error(NetOp::Send, peer, NetKind::Stopped(stopped))),
+            },
+        }
+    }
+}
+
+/// Completion state for [`Conn::read_into`], stored inline inside [`Pending`] (zero heap alloc).
+pub enum ReadInto<'buf> {
+    InFlight { peer: &'buf Addr, budget: Option<&'buf Budget>, most: usize },
+    Refused(NetError),
+}
+
+impl<'buf> pending::Complete<'buf> for ReadInto<'buf> {
+    type Output = Result<usize, NetError>;
+
+    fn complete(self, into: &'buf mut [u8], done: Result<Done, Stopped>) -> Self::Output {
+        match self {
+            ReadInto::Refused(err) => Err(err),
+            ReadInto::InFlight { peer, budget, most } => match done {
+                Ok(Done::Read(bytes)) if bytes.len() <= most => {
+                    into[..bytes.len()].copy_from_slice(&bytes);
+                    if let Some(budget) = budget {
+                        budget.give_back((most - bytes.len()) as u64);
+                    }
+                    Ok(bytes.len())
+                }
+                Ok(done) => {
+                    if let Some(budget) = budget {
+                        budget.give_back(most as u64);
+                    }
+                    Err(unexpected(NetOp::Recv, peer, done))
+                }
+                Err(stopped) => {
+                    if let Some(budget) = budget {
+                        budget.give_back(most as u64);
+                    }
+                    Err(error(NetOp::Recv, peer, NetKind::Stopped(stopped)))
+                }
+            },
+        }
+    }
+}
+
 impl Conn {
     #[track_caller]
     fn new(io: &Io, conn: blaze_core::Conn, peer: Addr, budget: Option<Arc<Budget>>) -> Conn {
@@ -505,11 +566,10 @@ impl Conn {
     /// the bytes are taken from it before anything is sent; with no room for them the send
     /// never starts, and its outcome is [`NetKind::OverLimit`].
     #[track_caller]
-    pub fn write_from<'buf>(&'buf self, from: &'buf [u8]) -> Pending<'buf, Result<(), NetError>> {
+    pub fn write_from<'buf>(&'buf self, from: &'buf [u8]) -> Pending<'buf, WriteFrom<'buf>> {
         let conn = self.link.conn;
         let peer = &self.peer;
         let asked = from.len() as u64;
-        let over = move |over| error(NetOp::Send, peer, NetKind::OverLimit(over));
         // The planted bug of the budget tests: the limit is looked at once the bytes are gone.
         let after = self.link.io.plant() == Plant::BudgetCheckedAfter;
         let budget = self.budget.as_deref();
@@ -518,21 +578,12 @@ impl Conn {
             _ => None,
         };
         if let Some(short) = short {
-            return pending::refused(&self.link.io, "bstd::net write_from", Err(over(short)));
+            return pending::refused(&self.link.io, "bstd::net write_from", WriteFrom::Refused(error(NetOp::Send, peer, NetKind::OverLimit(short))));
         }
         // alloc: the effect's bytes, which blaze-core's `Effect` owns.
         let bytes = from.to_vec();
         let effect = |tag| Effect::Send { conn, bytes, tag };
-        pending::start(&self.link.io, "bstd::net write_from", &mut [], effect, move |_: &mut [u8], done| {
-            match done {
-                Ok(Done::Sent(_)) => match budget {
-                    Some(budget) if after => budget.take(asked).map_err(over),
-                    _ => Ok(()),
-                },
-                Ok(done) => Err(unexpected(NetOp::Send, peer, done)),
-                Err(stopped) => Err(error(NetOp::Send, peer, NetKind::Stopped(stopped))),
-            }
-        })
+        pending::start(&self.link.io, "bstd::net write_from", &mut [], effect, WriteFrom::InFlight { peer, budget, asked, after })
     }
 
     /// All of `bytes` sent, or an error: never a part said sent. Its [`Conn::write_from`],
@@ -544,13 +595,44 @@ impl Conn {
         self.write_from(bytes).wait(cx)
     }
 
+    /// Sends all `parts` in order as one send, joining once directly into the effect's buffer
+    /// (avoiding a separate caller allocation for header + payload framing).
+    pub fn send_vectored(&self, cx: &Cx, parts: &[&[u8]]) -> Result<(), NetError> {
+        cx.stopped_by(self.link.io.now())
+            .map_err(|stopped| error(NetOp::Send, &self.peer, NetKind::Stopped(stopped)))?;
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        let asked = total as u64;
+        let after = self.link.io.plant() == Plant::BudgetCheckedAfter;
+        let budget = self.budget.as_deref();
+        if let Some(budget) = budget
+            && !after
+            && let Err(short) = budget.take(asked)
+        {
+            return Err(error(NetOp::Send, &self.peer, NetKind::OverLimit(short)));
+        }
+        // alloc: the effect's bytes, filled once directly from `parts`.
+        let mut bytes = Vec::with_capacity(total);
+        for part in parts {
+            bytes.extend_from_slice(part);
+        }
+        let conn = self.link.conn;
+        pending::start(
+            &self.link.io,
+            "bstd::net send_vectored",
+            &mut [],
+            |tag| Effect::Send { conn, bytes, tag },
+            WriteFrom::InFlight { peer: &self.peer, budget, asked, after },
+        )
+        .wait(cx)
+    }
+
     /// A receive into `into` of the bytes the peer sent since the last receive, at most
     /// `into.len()`, in flight: its outcome is how many, 0 once the peer has hung up. Under a
     /// byte limit ([`Net::limit`]) it asks for no more than the limit has left, takes that
     /// much from it as it starts and gives back what did not come; with nothing left the
     /// receive never starts, and its outcome is [`NetKind::OverLimit`].
     #[track_caller]
-    pub fn read_into<'buf>(&'buf self, into: &'buf mut [u8]) -> Pending<'buf, Result<usize, NetError>> {
+    pub fn read_into<'buf>(&'buf self, into: &'buf mut [u8]) -> Pending<'buf, ReadInto<'buf>> {
         let conn = self.link.conn;
         let peer = &self.peer;
         let budget = self.budget.as_deref();
@@ -563,34 +645,12 @@ impl Conn {
             };
             if let Some(short) = short {
                 let over = error(NetOp::Recv, peer, NetKind::OverLimit(short));
-                return pending::refused(&self.link.io, "bstd::net read_into", Err(over));
+                return pending::refused(&self.link.io, "bstd::net read_into", ReadInto::Refused(over));
             }
         }
-        // What was taken from the limit and did not come is given back.
-        let unused = move |came: usize| {
-            if let Some(budget) = budget {
-                budget.give_back((most - came) as u64);
-            }
-        };
         // alloc: the effect's buffer, which blaze-core's `Effect` owns.
         let effect = |tag| Effect::Recv { conn, most, into: Vec::new(), tag };
-        pending::start(&self.link.io, "bstd::net read_into", into, effect, move |into: &mut [u8], done| {
-            match done {
-                Ok(Done::Read(bytes)) if bytes.len() <= most => {
-                    into[..bytes.len()].copy_from_slice(&bytes);
-                    unused(bytes.len());
-                    Ok(bytes.len())
-                }
-                Ok(done) => {
-                    unused(0);
-                    Err(unexpected(NetOp::Recv, peer, done))
-                }
-                Err(stopped) => {
-                    unused(0);
-                    Err(error(NetOp::Recv, peer, NetKind::Stopped(stopped)))
-                }
-            }
-        })
+        pending::start(&self.link.io, "bstd::net read_into", into, effect, ReadInto::InFlight { peer, budget, most })
     }
 
     /// The bytes the peer sent since the last receive, at most `most`, added to `into`; how

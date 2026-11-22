@@ -186,6 +186,32 @@ impl<'a> Bytes<'a> {
         Bytes { bytes: Vec::new_in(frame), arena }
     }
 
+    /// Empty bytes in `frame` with room for at least `capacity` bytes reserved upfront, or
+    /// [`Stopped::OutOfMemory`] if `frame` cannot fit it.
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn with_capacity_in(frame: &'a Frame, arena: &'static str, capacity: usize) -> Result<Bytes<'a>, Stopped> {
+        let mut out = Bytes::new_in(frame, arena);
+        out.try_reserve(capacity)?;
+        Ok(out)
+    }
+
+    /// Bytes this buffer can hold without growing.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn capacity(&self) -> usize {
+        self.bytes.capacity()
+    }
+
+    /// Mutable view of the bytes currently held.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+
     /// `more` added at the end, or [`Stopped::OutOfMemory`] with the bytes as they were.
     #[blaze::noalloc]
     #[blaze::nonblocking]

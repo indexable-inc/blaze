@@ -144,6 +144,10 @@ pub use journal::{CHANGES_MOST, Changes, HeldChanges, JournalError, ReplayTimes}
 // A folder made the user's alone (`Dir::make_private`): the journal helper's socket folder.
 mod private;
 pub use private::PrivateError;
+
+// Linear group-commit file transactions (`Dir::txn`): N publishes/renames/removals, 1 dir sync.
+mod txn;
+pub use txn::{Committed, Txn};
 pub use blaze_core::{Cursor, Lost};
 #[cfg(test)]
 pub(crate) use dirs::DirsPlant;
@@ -1897,22 +1901,12 @@ impl<#[blaze::linear] P: Rights> File<P> {
     /// A read of up to `into.len()` bytes at `at` into `into`, in flight: its outcome, once
     /// waited for, is how many bytes it read, fewer at the end of the file.
     #[track_caller]
-    pub fn read_into<'buf>(&'buf self, into: &'buf mut [u8], at: u64) -> Pending<'buf, Result<usize, FsError>> {
+    pub fn read_into<'buf>(&'buf self, into: &'buf mut [u8], at: u64) -> Pending<'buf, ReadInto<'buf>> {
         // clone: the effect's name, a refcount.
         let file = self.name.clone();
         let len = into.len();
-        let name = &self.name;
         let effect = |tag| Effect::Read { file, at, len, tag };
-        pending::start(&self.io, "bstd::fs read_into", into, effect, move |into: &mut [u8], done| {
-            match done {
-                Ok(Done::Read(bytes)) if bytes.len() <= into.len() => {
-                    into[..bytes.len()].copy_from_slice(&bytes);
-                    Ok(bytes.len())
-                }
-                Ok(done) => Err(unexpected(FsOp::Read, name, done)),
-                Err(stopped) => Err(FsError::new(FsOp::Read, name, FsKind::Stopped(stopped))),
-            }
-        })
+        pending::start(&self.io, "bstd::fs read_into", into, effect, ReadInto { name: &self.name })
     }
 
     /// Up to `len` bytes at `at` added to `into`, fewer at the end of the file; how many.
@@ -1967,6 +1961,50 @@ impl<#[blaze::linear] P: Rights> File<P> {
     }
 }
 
+/// Completion state for [`File::read_into`], stored inline inside [`Pending`] (zero heap alloc).
+pub struct ReadInto<'buf> {
+    name: &'buf FileName,
+}
+
+impl<'buf> pending::Complete<'buf> for ReadInto<'buf> {
+    type Output = Result<usize, FsError>;
+
+    fn complete(self, into: &'buf mut [u8], done: Result<Done, Stopped>) -> Self::Output {
+        match done {
+            Ok(Done::Read(bytes)) if bytes.len() <= into.len() => {
+                into[..bytes.len()].copy_from_slice(&bytes);
+                Ok(bytes.len())
+            }
+            Ok(done) => Err(unexpected(FsOp::Read, self.name, done)),
+            Err(stopped) => Err(FsError::new(FsOp::Read, self.name, FsKind::Stopped(stopped))),
+        }
+    }
+}
+
+/// Completion state for [`File::write_from`], stored inline inside [`Pending`] (zero heap alloc).
+pub enum WriteFrom<'buf> {
+    InFlight { name: &'buf FileName, quota: Option<&'buf Budget>, asked: u64, after: bool },
+    Refused(FsError),
+}
+
+impl<'buf> pending::Complete<'buf> for WriteFrom<'buf> {
+    type Output = Result<(), FsError>;
+
+    fn complete(self, _: &'buf mut [u8], done: Result<Done, Stopped>) -> Self::Output {
+        match self {
+            WriteFrom::Refused(err) => Err(err),
+            WriteFrom::InFlight { name, quota, asked, after } => match done {
+                Ok(Done::Written) => match quota {
+                    Some(quota) if after => quota.take(asked).map_err(|over| FsError::new(FsOp::WriteAt, name, FsKind::OverQuota(over))),
+                    _ => Ok(()),
+                },
+                Ok(done) => Err(unexpected(FsOp::WriteAt, name, done)),
+                Err(stopped) => Err(FsError::new(FsOp::WriteAt, name, FsKind::Stopped(stopped))),
+            },
+        }
+    }
+}
+
 impl File<ReadWrite> {
     /// The bytes handed to the driver at the file's end, within the quota: lent for the call
     /// ([`Io::write_lent`]), so a native world writes them with no copy and the simulation
@@ -2008,10 +2046,9 @@ impl File<ReadWrite> {
     /// A write of `from` at `at`, past the end making it longer, in flight; not flushed. The
     /// bytes are copied as it starts (see [`crate::pending`]), and stay lent until it ends.
     #[track_caller]
-    pub fn write_from<'buf>(&'buf self, from: &'buf [u8], at: u64) -> Pending<'buf, Result<(), FsError>> {
+    pub fn write_from<'buf>(&'buf self, from: &'buf [u8], at: u64) -> Pending<'buf, WriteFrom<'buf>> {
         let name = &self.name;
         let asked = from.len() as u64;
-        let over = move |over| FsError::new(FsOp::WriteAt, name, FsKind::OverQuota(over));
         // The planted bug of the budget tests: the quota is looked at once the bytes are written.
         let after = self.io.plant() == Plant::BudgetCheckedAfter;
         let quota = self.quota.as_deref();
@@ -2020,23 +2057,14 @@ impl File<ReadWrite> {
             _ => None,
         };
         if let Some(short) = short {
-            return pending::refused(&self.io, "bstd::fs write_from", Err(over(short)));
+            return pending::refused(&self.io, "bstd::fs write_from", WriteFrom::Refused(FsError::new(FsOp::WriteAt, name, FsKind::OverQuota(short))));
         }
         // clone: the effect's name, a refcount.
         let file = self.name.clone();
         // alloc: the effect's bytes, which blaze-core's `Effect` owns.
         let bytes = from.to_vec();
         let effect = |tag| Effect::WriteAt { file, at, bytes, tag };
-        pending::start(&self.io, "bstd::fs write_from", &mut [], effect, move |_: &mut [u8], done| {
-            match done {
-                Ok(Done::Written) => match quota {
-                    Some(quota) if after => quota.take(asked).map_err(over),
-                    _ => Ok(()),
-                },
-                Ok(done) => Err(unexpected(FsOp::WriteAt, name, done)),
-                Err(stopped) => Err(FsError::new(FsOp::WriteAt, name, FsKind::Stopped(stopped))),
-            }
-        })
+        pending::start(&self.io, "bstd::fs write_from", &mut [], effect, WriteFrom::InFlight { name, quota, asked, after })
     }
 
     /// `bytes` written at `at`, past the end making it longer, as durably as `durable`

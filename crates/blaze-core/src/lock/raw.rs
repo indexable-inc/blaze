@@ -509,13 +509,29 @@ impl RawRwLock {
                 .compare_exchange_weak(state, state + READ_LOCKED, Ordering::Acquire, Ordering::Relaxed)
                 .is_err()
         {
-            self.read_contended();
+            let _ = self.read_contended(None);
         }
+    }
+
+    #[inline]
+    pub(crate) fn read_within(&self, within: Duration) -> bool {
+        let state = self.state.value.load(Ordering::Relaxed);
+        if is_read_lockable(state)
+            && self
+                .state
+                .value
+                .compare_exchange_weak(state, state + READ_LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        {
+            return true;
+        }
+        self.read_contended(Some(within))
     }
 
     #[cold]
     #[inline(never)]
-    fn read_contended(&self) {
+    fn read_contended(&self, within: Option<Duration>) -> bool {
+        let start = within.map(|_| std::time::Instant::now());
         let mut state = self.spin_read();
         loop {
             if is_read_lockable(state) {
@@ -525,12 +541,16 @@ impl RawRwLock {
                     Ordering::Acquire,
                     Ordering::Relaxed,
                 ) {
-                    Ok(_) => return,
+                    Ok(_) => return true,
                     Err(now) => {
                         state = now;
                         continue;
                     }
                 }
+            }
+            let remaining = left(within, start.map_or(Duration::ZERO, |s| s.elapsed()));
+            if remaining == Some(Duration::ZERO) {
+                return false;
             }
             assert!(state & MASK != MAX_READERS, "a read lock with {MAX_READERS} readers");
             // Say a reader waits before sleeping, so a writer's release wakes it.
@@ -546,7 +566,7 @@ impl RawRwLock {
                 continue;
             }
             // wakes: `wake_writer_or_readers`, which wakes every reader once no writer waits
-            self.state.wait(state | READERS_WAITING, None);
+            self.state.wait(state | READERS_WAITING, remaining);
             state = self.spin_read();
         }
     }
@@ -591,13 +611,27 @@ impl RawRwLock {
             .compare_exchange_weak(0, WRITE_LOCKED, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            self.write_contended();
+            let _ = self.write_contended(None);
         }
+    }
+
+    #[inline]
+    pub(crate) fn write_within(&self, within: Duration) -> bool {
+        if self
+            .state
+            .value
+            .compare_exchange_weak(0, WRITE_LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return true;
+        }
+        self.write_contended(Some(within))
     }
 
     #[cold]
     #[inline(never)]
-    fn write_contended(&self) {
+    fn write_contended(&self, within: Option<Duration>) -> bool {
+        let start = within.map(|_| std::time::Instant::now());
         let mut state = self.spin_write();
         // Once this writer has waited, others may wait too: it keeps the bit when it takes it.
         let mut other_writers_waiting = 0;
@@ -609,12 +643,16 @@ impl RawRwLock {
                     Ordering::Acquire,
                     Ordering::Relaxed,
                 ) {
-                    Ok(_) => return,
+                    Ok(_) => return true,
                     Err(now) => {
                         state = now;
                         continue;
                     }
                 }
+            }
+            let remaining = left(within, start.map_or(Duration::ZERO, |s| s.elapsed()));
+            if remaining == Some(Duration::ZERO) {
+                return false;
             }
             if !has_writers_waiting(state)
                 && let Err(now) = self.state.value.compare_exchange(
@@ -636,7 +674,7 @@ impl RawRwLock {
                 continue;
             }
             // wakes: `wake_writer`, from the release that saw the writers' bit
-            self.writer_notify.wait(seq, None);
+            self.writer_notify.wait(seq, remaining);
             state = self.spin_write();
         }
     }
@@ -803,6 +841,16 @@ impl<T: ?Sized> RwLock<T> {
     #[inline]
     pub(crate) fn try_write(&self) -> Option<RwLockWriteGuard<'_, T>> {
         self.raw.try_write().then(|| self.writing())
+    }
+
+    #[inline]
+    pub(crate) fn try_read_for(&self, within: Duration) -> Option<RwLockReadGuard<'_, T>> {
+        self.raw.read_within(within).then(|| self.reading())
+    }
+
+    #[inline]
+    pub(crate) fn try_write_for(&self, within: Duration) -> Option<RwLockWriteGuard<'_, T>> {
+        self.raw.write_within(within).then(|| self.writing())
     }
 
     pub(crate) fn is_locked(&self) -> bool {

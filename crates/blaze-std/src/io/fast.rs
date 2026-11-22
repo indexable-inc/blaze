@@ -18,10 +18,7 @@
 //! process or an event (blaze-core's table says each, and its one unbounded case, a FIFO), its
 //! span opened by `blaze_core::lock::io_wait`.
 
-// Test-only: the tests' counts, shared by a world's clones.
-#[cfg(test)]
 use alloc::sync::Arc;
-#[cfg(test)]
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 
@@ -56,12 +53,47 @@ pub(super) enum Time {
     Locked,
 }
 
+/// Lock-free gate beside the world's lock for [`crate::trace::Trace`]: once `most` is reached
+/// (or 0), `Cx::span` and `Cx::event` never contend on the world's lock.
+pub(super) struct TraceGate {
+    open: AtomicBool,
+    dropped: AtomicU64,
+}
+
+impl TraceGate {
+    fn new(most: usize) -> TraceGate {
+        TraceGate { open: AtomicBool::new(most > 0), dropped: AtomicU64::new(0) }
+    }
+
+    #[inline]
+    pub(super) fn is_open(&self) -> bool {
+        self.open.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(super) fn close(&self) {
+        self.open.store(false, Ordering::Release);
+    }
+
+    #[inline]
+    pub(super) fn drop_one(&self) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(super) fn take_dropped(&self) -> u64 {
+        self.dropped.swap(0, Ordering::AcqRel)
+    }
+}
+
 /// What a shared world keeps beside its lock: what is read or done with none.
 #[derive(Clone)]
 pub(super) struct Beside {
     pub(super) time: Time,
     /// The native driver's inline file calls; `None` where every effect keeps its queue.
     files: Option<Inline>,
+    /// Lock-free gate for trace recording so full or disabled traces never lock the world.
+    pub(super) trace: Arc<TraceGate>,
     /// The tests' view of this world (counts and the switch), shared by its clones.
     #[cfg(test)]
     pub(super) seen: Arc<Seen>,
@@ -86,7 +118,7 @@ pub(super) struct Seen {
 
 impl Beside {
     /// What `driver` lets a world read and do without its lock.
-    pub(super) fn of(driver: &Backend) -> Beside {
+    pub(super) fn of(driver: &Backend, trace_most: usize) -> Beside {
         let (time, files) = match driver {
             #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
             Backend::Native(native) => (Time::Native(native.clock()), native.inline_files()),
@@ -95,6 +127,8 @@ impl Beside {
         Beside {
             time,
             files,
+            // alloc: once per world, the lock-free trace gate.
+            trace: Arc::new(TraceGate::new(trace_most)),
             #[cfg(test)]
             // alloc: once per world, a test's counts.
             seen: Arc::new(Seen::default()),

@@ -38,7 +38,13 @@
 //!   the chunks run on the pool's workers. Each left half is a task that cuts its own half in
 //!   a scope of its own (a scope is its thread's), so the tree of halves is a tree of scopes.
 
-use core::{convert::Infallible, fmt, num::NonZeroUsize};
+use alloc::vec::Vec;
+use core::{
+    convert::Infallible,
+    fmt,
+    num::NonZeroUsize,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use crate::{
     Plant, Stopped,
@@ -197,6 +203,156 @@ pub fn reduce<D: Split + Send, R: Send>(
     let len = data.lengths().map_err(|(first, other)| ParError::Ragged { first, other })?;
     let ops = Ops { grain, identity: &identity, fold: &fold, join: &join };
     cut(cx, scope, data, len, &ops)
+}
+
+/// Runs `work` over contiguous chunks of `data` packed by predicted item `weights` up to
+/// `budget` (always at least one item per chunk) and dispatched **heaviest chunk first (LPT)**
+/// so skewed workloads (e.g. a few giant files or generic bodies beside thousands of tiny ones)
+/// never end on a late straggler.
+///
+/// Fails with [`ParError::Ragged`] if `weights.len()` differs from `data`'s length.
+pub fn for_each_weighted<D: Split + Send>(
+    cx: &Cx,
+    scope: &Scope<'_>,
+    data: D,
+    weights: &[u64],
+    budget: u64,
+    scratch: usize,
+    work: impl Fn(D) + Sync,
+) -> Result<(), ParError> {
+    let len = data.lengths().map_err(|(first, other)| ParError::Ragged { first, other })?;
+    if weights.len() != len {
+        return Err(ParError::Ragged { first: len, other: weights.len() });
+    }
+    if len == 0 {
+        cx.check().map_err(ParError::Stopped)?;
+        return Ok(());
+    }
+    // Partition `data` into contiguous weighted slices, then sort heaviest-first (LPT) so long
+    // runs start immediately. Uses `cx.frame()` so scratch dies with the task.
+    let mut chunks: Vec<(u64, Option<D>), &blaze_mem::Frame> = Vec::new_in(cx.frame());
+    let mut rest = data;
+    let mut i = 0usize;
+    while i < len {
+        let mut take = 1usize;
+        let mut sum = weights[i];
+        while i + take < len {
+            let next = sum.saturating_add(weights[i + take]);
+            if next > budget {
+                break;
+            }
+            sum = next;
+            take += 1;
+        }
+        let (head, tail) = rest.split(take);
+        rest = tail;
+        chunks.push((sum, Some(head)));
+        i += take;
+    }
+    // Longest processing time first; ties keep original order (deterministic).
+    chunks.sort_by(|a, b| b.0.cmp(&a.0));
+    run_chunks(cx, scope, chunks.as_mut_slice(), scratch, &work)
+}
+
+/// Runs weighted chunks in LPT order: spawns each leading (heaviest) chunk onto `scope` while
+/// splitting the remainder recursively so tasks stay linear on the call stack (never in a `Vec`).
+fn run_chunks<D: Send>(
+    cx: &Cx,
+    scope: &Scope<'_>,
+    chunks: &mut [(u64, Option<D>)],
+    scratch: usize,
+    work: &(impl Fn(D) + Sync),
+) -> Result<(), ParError> {
+    match chunks {
+        [] => Ok(()),
+        [(_, only)] => {
+            cx.check().map_err(ParError::Stopped)?;
+            if let Some(chunk) = only.take() {
+                work(chunk);
+            }
+            Ok(())
+        }
+        _ => {
+            // Spawn the heavier left half first so the highest-weight chunks enter the pool first.
+            let mid = chunks.len() / 2;
+            let (left, right) = chunks.split_at_mut(mid);
+            let task = scope.may_overlap("bstd.par.weighted", scratch, move |wcx| {
+                let res = match wcx.scope_with(|inner| run_chunks(wcx, inner, left, scratch, work)) {
+                    Ok(res) => res,
+                    Err(failed) => Err(ParError::Task(failed)),
+                };
+                Ok::<_, Infallible>(res)
+            });
+            let right_res = run_chunks(cx, scope, right, scratch, work);
+            let left_res = match task.join(cx) {
+                Ok(res) => res,
+                Err(failed) => Err(ParError::Task(failed)),
+            };
+            left_res?;
+            right_res
+        }
+    }
+}
+
+/// Runs `work` over `items` using **guided self-scheduling** (shared `AtomicUsize` cursor
+/// claiming chunks of `remaining / (2 * workers)` down to `min_grain`), eliminating tail
+/// stragglers on uneven slices without allocating per-item tasks.
+pub fn for_each_dynamic<T: Sync>(
+    cx: &Cx,
+    scope: &Scope<'_>,
+    items: &[T],
+    min_grain: NonZeroUsize,
+    scratch: usize,
+    work: impl Fn(&Cx, usize, &[T]) + Sync,
+) -> Result<(), ParError> {
+    let len = items.len();
+    if len == 0 {
+        cx.check().map_err(ParError::Stopped)?;
+        return Ok(());
+    }
+    let workers = (scope.workers() as usize).max(1).min(len.div_ceil(min_grain.get()));
+    let next = AtomicUsize::new(0);
+    let min_g = min_grain.get();
+    let run_worker = |wcx: &Cx| -> Result<(), ParError> {
+        loop {
+            wcx.check().map_err(ParError::Stopped)?;
+            let cur = next.load(Ordering::Relaxed);
+            if cur >= len {
+                return Ok(());
+            }
+            let remaining = len - cur;
+            let take = (remaining / (workers * 2)).max(min_g).min(remaining);
+            let start = next.fetch_add(take, Ordering::AcqRel);
+            if start >= len {
+                return Ok(());
+            }
+            let end = (start + take).min(len);
+            work(wcx, start, &items[start..end]);
+        }
+    };
+    spawn_workers(cx, scope, workers, scratch, &run_worker)
+}
+
+/// Spawns `n` worker tasks recursively on the stack (linear-safe: every `Task` is joined on
+/// unwind of the call stack, never stored in a `Vec`), running the last worker on this thread.
+fn spawn_workers(
+    cx: &Cx,
+    scope: &Scope<'_>,
+    n: usize,
+    scratch: usize,
+    run: &(impl Fn(&Cx) -> Result<(), ParError> + Sync),
+) -> Result<(), ParError> {
+    if n <= 1 {
+        return run(cx);
+    }
+    let task = scope.may_overlap("bstd.par.dynamic", scratch, move |wcx| Ok::<_, Infallible>(run(wcx)));
+    let rest = spawn_workers(cx, scope, n - 1, scratch, run);
+    let mine = match task.join(cx) {
+        Ok(res) => res,
+        Err(failed) => Err(ParError::Task(failed)),
+    };
+    mine?;
+    rest
 }
 
 /// What every chunk is done with.

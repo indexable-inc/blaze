@@ -3,15 +3,19 @@
 //! reaching further than it: it resolves only the hosts that `Net` may connect to, and it has
 //! no connect. Narrowed to one host by [`Resolver::only`], which never widens.
 //!
-//! **Provider.** A host that is an IP address resolves to itself everywhere. A DNS name
-//! resolves in the simulation, from its name table ([`crate::hosted::SimHost::names`]); in a
-//! real world it is refused ([`NetKind::NoLookup`]), since blaze-core has no effect that looks
-//! a name up, and Rust std's resolver is not reached for in its place.
+//! **Provider.** A host that is an IP address resolves to itself everywhere. In a simulated
+//! world, [`crate::hosted::SimHost::names`] answers first; otherwise [`blaze_core::Effect::Resolve`]
+//! asks the driver (native `getaddrinfo` on the driver's host thread, or `Sim::name` in a
+//! simulation).
 //!
 //! [`Net`]: crate::net::Net
 //! [`Net::resolver`]: crate::net::Net::resolver
 
+use alloc::{format, string::ToString, vec::Vec};
 use core::{fmt, net::SocketAddr};
+
+use blaze_core::{Done, Effect};
+use blaze_mem::Frame;
 
 use crate::{
     cx::Cx,
@@ -43,8 +47,16 @@ impl Resolver {
         Resolver { io: self.io.clone(), reach: self.reach.clone(), allowed: self.allowed.one(name, self.io.plant()) }
     }
 
-    /// The address `name` resolves to, with its port.
+    /// The first address `name` resolves to, with its port.
     pub fn lookup(&self, cx: &Cx, name: &HostPort) -> Result<SocketAddr, NetError> {
+        let mut out = Vec::new_in(cx.frame());
+        self.lookup_into(cx, name, &mut out)?;
+        out.first().copied().ok_or_else(|| net::error(NetOp::Lookup, &Addr::Tcp(name.clone()), NetKind::NoSuchName))
+    }
+
+    /// Every address `name` resolves to, with its port, appended into `into` (in the caller's
+    /// frame).
+    pub fn lookup_into(&self, cx: &Cx, name: &HostPort, into: &mut Vec<SocketAddr, &Frame>) -> Result<usize, NetError> {
         // clone: the name as an address, a refcount.
         let addr = Addr::Tcp(name.clone());
         let refuse = |kind| net::error(NetOp::Lookup, &addr, kind);
@@ -53,13 +65,41 @@ impl Resolver {
         }
         cx.stopped_by(self.io.now()).map_err(|stopped| refuse(NetKind::Stopped(stopped)))?;
         if let Some(found) = name.socket_addr() {
-            return Ok(found);
+            into.try_reserve(1)
+                .map_err(|_| refuse(NetKind::Stopped(crate::Stopped::OutOfMemory { arena: "bstd::resolver", asked: size_of::<SocketAddr>() })))?;
+            into.push(found);
+            return Ok(1);
         }
-        let named = self.io.script(|host| host.names.iter().find(|(it, _)| it == name.host()).map(|(_, ip)| *ip));
-        match named {
-            Some(Some(ip)) => Ok(SocketAddr::new(ip, name.port())),
-            Some(None) => Err(refuse(NetKind::NoSuchName)),
-            None => Err(refuse(NetKind::NoLookup)),
+        // In a simulated world, `SimHost::names` overrides DNS when an entry is scripted.
+        if let Some(Some(ip)) = self.io.script(|host| host.names.iter().find(|(it, _)| it == name.host()).map(|(_, ip)| *ip)) {
+            into.try_reserve(1)
+                .map_err(|_| refuse(NetKind::Stopped(crate::Stopped::OutOfMemory { arena: "bstd::resolver", asked: size_of::<SocketAddr>() })))?;
+            into.push(SocketAddr::new(ip, name.port()));
+            return Ok(1);
+        }
+        // Native (and simulations without a `SimHost` override): resolve through `Effect::Resolve`.
+        // alloc: the effect owns the host name string.
+        let host_name = name.host().to_string();
+        let port = name.port();
+        let done = self
+            .io
+            .call(cx, |tag| Effect::Resolve { name: host_name, port, tag })
+            .map_err(|stopped| refuse(NetKind::Stopped(stopped)))?;
+        match done {
+            Done::Resolved(addrs) => {
+                if addrs.is_empty() {
+                    return Err(refuse(NetKind::NoSuchName));
+                }
+                into.try_reserve(addrs.len())
+                    .map_err(|_| refuse(NetKind::Stopped(crate::Stopped::OutOfMemory { arena: "bstd::resolver", asked: addrs.len() * size_of::<SocketAddr>() })))?;
+                let count = addrs.len();
+                into.extend(addrs);
+                Ok(count)
+            }
+            Done::Unresolved { .. } => Err(refuse(NetKind::NoSuchName)),
+            Done::Failed(error) => Err(refuse(NetKind::Driver(error.0))),
+            // alloc: an error's message.
+            other => Err(refuse(NetKind::Answered(format!("{other:?}")))),
         }
     }
 }

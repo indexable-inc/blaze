@@ -22,7 +22,6 @@
 //! cannot ask the driver to stop the op: it waits for it to end, which is why it never
 //! returns before the op is done.
 
-use alloc::boxed::Box;
 use core::{fmt, marker::PhantomData};
 
 use blaze_core::{Done, Effect, Tag, wait::Deadline};
@@ -35,21 +34,24 @@ use crate::{
     unfinished::Unfinished,
 };
 
-/// What a `Pending` makes of its op's end: its outcome, given the lent buffer and the
-/// completion or why the wait stopped.
-type Finish<'buf, T> = Box<dyn FnOnce(&mut [u8], Result<Done, Stopped>) -> T + 'buf>;
+/// How a [`Pending`] turns its driver completion into its caller's outcome, inline with zero
+/// heap allocation (no `Box<dyn FnOnce>` per op in flight).
+pub trait Complete<'buf> {
+    type Output;
+    fn complete(self, into: &'buf mut [u8], done: Result<Done, Stopped>) -> Self::Output;
+}
 
 /// An op in flight, borrowing its buffer for as long as it runs: finished by
 /// [`Pending::wait`] or [`Pending::cancel`] (see the module's doc for why it is linear and
 /// what a panic that drops it does).
 #[blaze::linear]
 #[must_use = "an op in flight is finished with wait(cx) or cancel(cx)"]
-pub struct Pending<'buf, T> {
+pub struct Pending<'buf, C: Complete<'buf>> {
     /// Where a read's bytes go; empty for a write.
     into: &'buf mut [u8],
     /// A write's bytes stay lent until it ends, so the caller cannot change them meanwhile.
     from: PhantomData<&'buf [u8]>,
-    finish: Finish<'buf, T>,
+    finish: C,
     settle: Settle,
     unfinished: Unfinished,
 }
@@ -80,46 +82,46 @@ impl Drop for Settle {
     }
 }
 
-/// `effect` handed to the driver now, its outcome made by `finish` once it ends.
+/// `effect` handed to the driver now, its outcome made inline by `finish` once it ends
+/// (zero heap allocation).
 #[track_caller]
-pub(crate) fn start<'buf, T>(
+pub(crate) fn start<'buf, C: Complete<'buf>>(
     io: &Io,
     span: &'static str,
     into: &'buf mut [u8],
     effect: impl FnOnce(Tag) -> Effect,
-    finish: impl FnOnce(&mut [u8], Result<Done, Stopped>) -> T + 'buf,
-) -> Pending<'buf, T> {
+    finish: C,
+) -> Pending<'buf, C> {
     let tag = io.submit(effect);
     Pending {
         into,
         from: PhantomData,
-        // alloc: once per op, its outcome's maker (bounded: freed when the op is finished).
-        finish: Box::new(finish),
+        finish,
         settle: Settle { io: io.clone(), tag: Some(tag), span, armed: true },
         unfinished: Unfinished::new("Pending", "wait(cx) or cancel(cx, give_up)"),
     }
 }
 
 /// An op refused before it started (a write past its capability's budget): nothing is handed
-/// to the driver, and waiting for it or cancelling it gives `outcome` at once.
+/// to the driver, and waiting for it or cancelling it gives `finish`'s outcome at once
+/// (zero heap allocation).
 #[track_caller]
-pub(crate) fn refused<'buf, T: 'buf>(io: &Io, span: &'static str, outcome: T) -> Pending<'buf, T> {
+pub(crate) fn refused<'buf, C: Complete<'buf>>(io: &Io, span: &'static str, finish: C) -> Pending<'buf, C> {
     Pending {
         into: &mut [],
         from: PhantomData,
-        // alloc: once per op, its outcome's holder (freed when the op is finished).
-        finish: Box::new(move |_: &mut [u8], _| outcome),
+        finish,
         settle: Settle { io: io.clone(), tag: None, span, armed: true },
         unfinished: Unfinished::new("Pending", "wait(cx) or cancel(cx, give_up)"),
     }
 }
 
-impl<T> Pending<'_, T> {
+impl<'buf, C: Complete<'buf>> Pending<'buf, C> {
     /// The op's outcome, waited for under `cx`: until its deadline, ending early on its
     /// cancellation (after which the op's end is still waited for, as [`Pending::cancel`]
     /// does, so nothing it does lands later).
     #[blaze::consumes]
-    pub fn wait(self, cx: &Cx) -> T {
+    pub fn wait(self, cx: &Cx) -> C::Output {
         let Pending { into, from: _, finish, mut settle, unfinished } = self;
         unfinished.finished();
         settle.armed = false;
@@ -128,7 +130,7 @@ impl<T> Pending<'_, T> {
             // Refused before it started: its outcome is made already and reads no completion.
             None => Err(Stopped::Cancelled { span: settle.span }),
         };
-        finish(into, done)
+        finish.complete(into, done)
     }
 
     /// The op given up: blaze-core cannot cancel an effect in flight, so this waits, heeding
@@ -138,24 +140,24 @@ impl<T> Pending<'_, T> {
     /// done, or why the wait stopped (then the op may still be in flight, and the stop says
     /// so). `cx` names the span the wait is recorded in.
     #[blaze::consumes]
-    pub fn cancel(self, cx: &Cx, give_up: Deadline) -> T {
+    pub fn cancel(self, cx: &Cx, give_up: Deadline) -> C::Output {
         let Pending { into, from: _, finish, mut settle, unfinished } = self;
         unfinished.finished();
         settle.armed = false;
         let Some(tag) = settle.tag else {
             // Refused before it started: nothing is in flight to wait for.
-            return finish(into, Err(Stopped::Cancelled { span: cx.name() }));
+            return finish.complete(into, Err(Stopped::Cancelled { span: cx.name() }));
         };
         if cx.plant() == Plant::CancelSkipsWait {
             settle.io.forget(tag, Ends::Once);
-            return finish(into, Err(Stopped::Cancelled { span: cx.name() }));
+            return finish.complete(into, Err(Stopped::Cancelled { span: cx.name() }));
         }
         let done = settle.io.settle(tag, give_up, cx.name());
-        finish(into, done)
+        finish.complete(into, done)
     }
 }
 
-impl<T> fmt::Debug for Pending<'_, T> {
+impl<'buf, C: Complete<'buf>> fmt::Debug for Pending<'buf, C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Pending({:?} in {}, {} bytes lent)", self.settle.tag, self.settle.span, self.into.len())
     }

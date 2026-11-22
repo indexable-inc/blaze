@@ -97,14 +97,17 @@ pub mod raw {
     pub use core::sync::atomic::{Atomic, Ordering};
 }
 
+/// Maximum slice a contended lock or signal wait sleeps before re-checking `cx.cancelled()`,
+/// so a cancelled scope with a long or infinite deadline wakes promptly instead of hanging.
+const CANCEL_SLICE: core::time::Duration = core::time::Duration::from_millis(2);
+
 /// The one lock, named. Taking it is a wait like any other (docs/v2/plan/design/std.md, "One
 /// wait"): [`Lock::lock`] takes the task's `Cx`, so the wait has a deadline and a span, and
 /// [`Lock::try_lock`] never waits. There is no `lock()` that waits for ever.
 ///
 /// Over `blaze_core::lock::Lock`, which names the lock and records who waited behind whom.
-/// The wait is that lock's bounded one (`try_lock_for`), on the wall clock: under the
-/// `Inline` layout a lock is contended only by another thread, never by another task of the
-/// same simulated world, so the simulation's virtual clock has no lock wait to model yet.
+/// The wait is that lock's bounded one (`try_lock_for`), sliced by [`CANCEL_SLICE`] so scope
+/// cancellation wakes contended waiters promptly even under long or unbounded deadlines.
 ///
 /// Holding two: [`RankedLock`], whose ranks make the order a type.
 pub struct Lock<T>(blaze_core::lock::Lock<T>);
@@ -132,22 +135,54 @@ impl<T> Lock<T> {
         self.0.try_lock()
     }
 
-    /// The lock, waited for until `cx`'s deadline in a span named for the lock: the guard, or
-    /// why the wait stopped ([`Stopped::Cancelled`] when `cx` was cancelled before the wait,
-    /// [`Stopped::Deadline`] when the deadline passed with the lock still held). A context
-    /// with no deadline ([`blaze_core::wait::Deadline::NEVER`]) said its waits have none.
+    /// The lock, waited for until `cx`'s deadline or cancellation in a span named for the lock:
+    /// the guard, or why the wait stopped ([`Stopped::Cancelled`] when `cx` is cancelled before
+    /// or during the wait, [`Stopped::Deadline`] when the deadline passes with the lock still
+    /// held).
     pub fn lock(&self, cx: &Cx) -> Result<LockGuard<'_, T>, Stopped> {
         cx.check()?;
         if let Some(guard) = self.0.try_lock() {
             return Ok(guard);
         }
         let cx = cx.span(self.0.name());
-        let Some(deadline) = cx.deadline().finite() else {
-            return Ok(self.0.lock());
-        };
-        match self.0.try_lock_for(deadline.left(cx.io().now())) {
-            Some(guard) => Ok(guard),
-            None => Err(Stopped::Deadline { span: cx.name(), at: deadline.get() }),
+        let deadline = cx.deadline().finite();
+        if !cx.cancellable() {
+            return match deadline {
+                None => Ok(self.0.lock()),
+                Some(deadline) => match self.0.try_lock_for(deadline.left(cx.io().now())) {
+                    Some(guard) => Ok(guard),
+                    None => Err(Stopped::Deadline { span: cx.name(), at: deadline.get() }),
+                },
+            };
+        }
+        let simulated = cx.io().with_sim(|_| ()).is_some();
+        let mut sim_left = deadline.map(|d| d.left(cx.io().now()));
+        loop {
+            cx.check()?;
+            let wait = match deadline {
+                Some(deadline) => {
+                    let left = if simulated {
+                        sim_left.unwrap_or(core::time::Duration::ZERO)
+                    } else {
+                        let now = cx.io().now();
+                        if deadline.passed(now) {
+                            return Err(Stopped::Deadline { span: cx.name(), at: deadline.get() });
+                        }
+                        deadline.left(now)
+                    };
+                    if left.is_zero() {
+                        return Err(Stopped::Deadline { span: cx.name(), at: deadline.get() });
+                    }
+                    left.min(CANCEL_SLICE)
+                }
+                None => CANCEL_SLICE,
+            };
+            if let Some(guard) = self.0.try_lock_for(wait) {
+                return Ok(guard);
+            }
+            if let Some(left) = sim_left.as_mut() {
+                *left = left.saturating_sub(wait);
+            }
         }
     }
 
@@ -170,6 +205,102 @@ impl<T> Lock<T> {
     #[blaze::nonblocking]
     pub fn into_inner(self) -> T {
         self.0.into_inner()
+    }
+}
+
+/// Acquires a shared read guard on `rwlock` respecting `cx`'s deadline and cancellation.
+pub fn read_lock<'a, T>(rwlock: &'a RwLock<T>, cx: &Cx) -> Result<ReadGuard<'a, T>, Stopped> {
+    cx.check()?;
+    if let Some(guard) = rwlock.try_read() {
+        return Ok(guard);
+    }
+    let cx = cx.span(rwlock.name());
+    let deadline = cx.deadline().finite();
+    if !cx.cancellable() {
+        return match deadline {
+            None => Ok(rwlock.read()),
+            Some(deadline) => match rwlock.try_read_for(deadline.left(cx.io().now())) {
+                Some(guard) => Ok(guard),
+                None => Err(Stopped::Deadline { span: cx.name(), at: deadline.get() }),
+            },
+        };
+    }
+    let simulated = cx.io().with_sim(|_| ()).is_some();
+    let mut sim_left = deadline.map(|d| d.left(cx.io().now()));
+    loop {
+        cx.check()?;
+        let wait = match deadline {
+            Some(deadline) => {
+                let left = if simulated {
+                    sim_left.unwrap_or(core::time::Duration::ZERO)
+                } else {
+                    let now = cx.io().now();
+                    if deadline.passed(now) {
+                        return Err(Stopped::Deadline { span: cx.name(), at: deadline.get() });
+                    }
+                    deadline.left(now)
+                };
+                if left.is_zero() {
+                    return Err(Stopped::Deadline { span: cx.name(), at: deadline.get() });
+                }
+                left.min(CANCEL_SLICE)
+            }
+            None => CANCEL_SLICE,
+        };
+        if let Some(guard) = rwlock.try_read_for(wait) {
+            return Ok(guard);
+        }
+        if let Some(left) = sim_left.as_mut() {
+            *left = left.saturating_sub(wait);
+        }
+    }
+}
+
+/// Acquires an exclusive write guard on `rwlock` respecting `cx`'s deadline and cancellation.
+pub fn write_lock<'a, T>(rwlock: &'a RwLock<T>, cx: &Cx) -> Result<WriteGuard<'a, T>, Stopped> {
+    cx.check()?;
+    if let Some(guard) = rwlock.try_write() {
+        return Ok(guard);
+    }
+    let cx = cx.span(rwlock.name());
+    let deadline = cx.deadline().finite();
+    if !cx.cancellable() {
+        return match deadline {
+            None => Ok(rwlock.write()),
+            Some(deadline) => match rwlock.try_write_for(deadline.left(cx.io().now())) {
+                Some(guard) => Ok(guard),
+                None => Err(Stopped::Deadline { span: cx.name(), at: deadline.get() }),
+            },
+        };
+    }
+    let simulated = cx.io().with_sim(|_| ()).is_some();
+    let mut sim_left = deadline.map(|d| d.left(cx.io().now()));
+    loop {
+        cx.check()?;
+        let wait = match deadline {
+            Some(deadline) => {
+                let left = if simulated {
+                    sim_left.unwrap_or(core::time::Duration::ZERO)
+                } else {
+                    let now = cx.io().now();
+                    if deadline.passed(now) {
+                        return Err(Stopped::Deadline { span: cx.name(), at: deadline.get() });
+                    }
+                    deadline.left(now)
+                };
+                if left.is_zero() {
+                    return Err(Stopped::Deadline { span: cx.name(), at: deadline.get() });
+                }
+                left.min(CANCEL_SLICE)
+            }
+            None => CANCEL_SLICE,
+        };
+        if let Some(guard) = rwlock.try_write_for(wait) {
+            return Ok(guard);
+        }
+        if let Some(left) = sim_left.as_mut() {
+            *left = left.saturating_sub(wait);
+        }
     }
 }
 
@@ -203,26 +334,27 @@ pub(crate) fn wait_ready<T, R>(
     // (D171), as the simulated branch's `wait_for` is; a ready look above charges nothing.
     let cx = cx.span(signal.name());
     cx.charged(io, signal.name(), None, || {
+        let deadline = cx.deadline().finite();
         loop {
             cx.check()?;
-            let Some(deadline) = cx.deadline().finite() else {
-                signal.wait(&mut held);
-                if let Some(got) = ready(&mut held) {
-                    return Ok(got);
+            let wait = match deadline {
+                Some(deadline) => {
+                    let now = io.now();
+                    if deadline.passed(now) {
+                        return Err(Stopped::Deadline { span: cx.name(), at: deadline.get() });
+                    }
+                    deadline.left(now).min(CANCEL_SLICE)
                 }
-                continue;
+                None => CANCEL_SLICE,
             };
-            let now = io.now();
-            let stopped = Stopped::Deadline { span: cx.name(), at: deadline.get() };
-            if deadline.passed(now) {
-                return Err(stopped);
-            }
-            if signal.wait_for(&mut held, deadline.left(now)) {
-                // The deadline passed: one last look, then the stop.
-                return ready(&mut held).ok_or(stopped);
-            }
+            let _ = signal.wait_for(&mut held, wait);
             if let Some(got) = ready(&mut held) {
                 return Ok(got);
+            }
+            if let Some(deadline) = deadline
+                && deadline.passed(io.now())
+            {
+                return Err(Stopped::Deadline { span: cx.name(), at: deadline.get() });
             }
         }
     })

@@ -46,12 +46,23 @@ impl Trace {
 
     #[blaze::pure]
     #[blaze::nonblocking]
-    pub(crate) fn push(&mut self, record: Record) {
+    pub(crate) fn push(&mut self, record: Record) -> bool {
         if self.records.len() < self.most {
             self.records.push(record);
+            self.records.len() < self.most
         } else {
             self.dropped += 1;
+            false
         }
+    }
+
+    /// Folds records dropped outside the lock (once the recorder filled) into the count.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn add_dropped(&mut self, more: u64) {
+        self.dropped = self.dropped.saturating_add(more);
     }
 
     /// The records kept, in the order they were made.

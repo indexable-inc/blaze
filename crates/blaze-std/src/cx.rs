@@ -480,6 +480,14 @@ impl Cx {
         }
     }
 
+    /// Whether this context belongs to a cancellable scope (a root context has none).
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn cancellable(&self) -> bool {
+        self.cancel.is_some()
+    }
+
     /// [`Stopped::Cancelled`] once its scope was cancelled: the line a long computation calls.
     #[blaze::noalloc]
     #[blaze::nonblocking]
@@ -503,6 +511,35 @@ impl Cx {
     #[blaze::nonblocking]
     pub fn bytes(&self) -> Bytes<'_> {
         Bytes::new_in(self.placed().frame(), self.span)
+    }
+
+    /// Runs `f` with a child context backed by a fresh scratch frame of at most `scratch` bytes
+    /// (taken from the calling thread's warm chunk shelf, ~2 ns once warm) that is released when
+    /// `f` returns or unwinds. What `f` allocates in `scratch_cx.frame()` never accumulates across
+    /// iterations of a loop or batch, while still inheriting this context's deadline,
+    /// cancellation, span, worker seat and telemetry path.
+    ///
+    /// Returns [`Stopped::OutOfMemory`] if the scratch frame cannot be reserved.
+    pub fn scratch<R>(&self, scratch: usize, f: impl FnOnce(&Cx) -> R) -> Result<R, Stopped> {
+        self.check()?;
+        let frame = Frame::with_reserve(scratch, blaze_mem::Tag::Frames)
+            .map_err(|_| Stopped::OutOfMemory { arena: self.span, asked: scratch })?;
+        let placed = self.placed();
+        let seat = placed.child_seat(self.world.workers(), self.span);
+        let child = Cx {
+            deadline: self.deadline,
+            // clone: the scope's cancellation, a refcount if any.
+            cancel: self.cancel.clone(),
+            span: self.span,
+            // clone: the world handle, a refcount (no-op for hosted).
+            world: self.world.clone(),
+            plant: self.plant,
+            class: self.class,
+            placed: Placed::on(placed.worker.get(), placed.pool.clone(), placed.here, seat, Some(frame), scratch),
+            path: self.path,
+            end: None,
+        };
+        Ok(f(&child))
     }
 
     #[blaze::nopanic]
