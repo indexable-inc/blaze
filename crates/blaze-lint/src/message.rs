@@ -29,13 +29,13 @@ pub fn show_message<P: Put + ?Sized>(rules: &RuleSet, item: &str, findings: &Fin
             out.str("` can truncate or wrap; convert with `from`, `try_from` or a named truncation");
         }
         Template::CloneHandle => {
-            out.str("clone of a refcounted handle: say so with `.share()` where the type has it");
+            out.str("clone of a refcounted handle: say so with `.local_share()` (for `Rc`) or `.share()` (for `Arc`)");
         }
         Template::CloneErrorPath => {
             out.str("clone on the error path");
         }
         Template::CloneDeep => {
-            out.str("clone that copies an allocation: borrow, move or keep one copy");
+            out.str("clone that copies an allocation: borrow, move, or name the allocator with `.clone_in(alloc)`");
         }
         Template::CloneUnknown => {
             out.str("clone of unknown kind: say what it copies with `// clone: <why>` above it");

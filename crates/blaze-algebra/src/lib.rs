@@ -29,6 +29,7 @@ pub mod comptime;
 pub mod diff;
 pub mod egraph;
 pub mod emit;
+pub mod interval;
 pub mod poly;
 pub mod solve;
 
@@ -45,14 +46,15 @@ use blaze_own::{String as OwnString, Vec as OwnVec};
 
 pub use comptime::{ConstExpr, ConstGraph};
 pub use diff::{
-    AlgebraPlant, Dual, diff, eval_dual, grad, grad_reverse, grad_reverse_with_plant, hessian,
-    jacobian, nth_diff, taylor,
+    AlgebraPlant, Dual, active_vars, diff, eval_dual, grad, grad_reverse, grad_reverse_with_plant,
+    hessian, hvp, jacobian, jvp, nth_diff, taylor,
 };
 pub use egraph::{
-    EGraph, PatNode, RewriteRule, SimplifyOpts, SimplifyStats, expr_cost, simplify, simplify_with,
-    simplify_with_rules,
+    CostModel, EGraph, PatNode, RewriteMode, RewriteRule, SimplifyOpts, SimplifyStats, expr_cost,
+    expr_cost_with, simplify, simplify_with, simplify_with_rules,
 };
 pub use emit::{emit_rust_fn, emit_rust_multi_fn, format_expr};
+pub use interval::{Interval, eval_interval, eval_intervals, prune_branches};
 pub use poly::{
     Monomial, Poly, PolyError, PolyPlant, Rat, expr_to_poly, poly_to_expr, simplify_poly_expr,
 };
@@ -146,6 +148,8 @@ pub enum Op {
     /// Piecewise branch: `if cond > 0.0 { then_val } else { else_val }`.
     /// Enables differentiable `relu`, `max`, `min`, `clamp`, and piecewise CAD/physics fields.
     Select(ExprId, ExprId, ExprId),
+    /// Fused multiply-add: `a.mul_add(b, c)` (`a * b + c` in one IEEE-754 rounding step).
+    Fma(ExprId, ExprId, ExprId),
 }
 
 impl Op {
@@ -345,6 +349,12 @@ impl<A: Allocator + Copy> ExprGraph<A> {
         self.intern(Op::Select(cond, then_val, else_val))
     }
 
+    /// Fused multiply-add: `a.mul_add(b, c)` (`a * b + c`).
+    #[inline]
+    pub fn fma(&mut self, a: ExprId, b: ExprId, c: ExprId) -> ExprId {
+        self.intern(Op::Fma(a, b, c))
+    }
+
     /// Rectified linear unit `max(0, x) = select(x, x, 0)`.
     #[inline]
     pub fn relu(&mut self, x: ExprId) -> ExprId {
@@ -456,9 +466,6 @@ impl<A: Allocator + Copy> ExprGraph<A> {
                         return aop;
                     }
                 }
-                if a == b {
-                    return Op::const_f64(1.0);
-                }
                 Op::Div(a, b)
             }
             Op::Pow(a, b) => {
@@ -541,6 +548,14 @@ impl<A: Allocator + Copy> ExprGraph<A> {
                 }
                 Op::Select(c, t, e)
             }
+            Op::Fma(a, b, c) => {
+                if let (Some(av), Some(bv), Some(cv)) =
+                    (self.const_of(a), self.const_of(b), self.const_of(c))
+                {
+                    return Op::const_f64(blaze_math::mul_add(av, bv, cv));
+                }
+                Op::Fma(a, b, c)
+            }
             other => other,
         }
     }
@@ -595,6 +610,11 @@ impl<A: Allocator + Copy> ExprGraph<A> {
                     self.eval_memo(e, env, cache)?
                 }
             }
+            Op::Fma(a, b, c) => blaze_math::mul_add(
+                self.eval_memo(a, env, cache)?,
+                self.eval_memo(b, env, cache)?,
+                self.eval_memo(c, env, cache)?,
+            ),
         };
         if let Some(slot) = cache.get_mut(idx) {
             *slot = Some(val);
@@ -697,6 +717,12 @@ impl<A: Allocator + Copy> ExprGraph<A> {
                 let se = self.sub_memo(e, var, replacement, cache)?;
                 self.select(sc, st, se)
             }
+            Op::Fma(a, b, c) => {
+                let sa = self.sub_memo(a, var, replacement, cache)?;
+                let sb = self.sub_memo(b, var, replacement, cache)?;
+                let sc = self.sub_memo(c, var, replacement, cache)?;
+                self.fma(sa, sb, sc)
+            }
         };
         if let Some(slot) = cache.get_mut(idx) {
             *slot = Some(out);
@@ -741,7 +767,7 @@ impl<A: Allocator + Copy> ExprGraph<A> {
                     stack.push(a);
                     stack.push(b);
                 }
-                Op::Select(c, t, e) => {
+                Op::Select(c, t, e) | Op::Fma(c, t, e) => {
                     stack.push(c);
                     stack.push(t);
                     stack.push(e);
@@ -878,6 +904,11 @@ impl<'g, A: Allocator + Copy> Sym<'g, A> {
 
     pub fn clamp(self, lo: Self, hi: Self) -> Self {
         let id = self.scope.graph.borrow_mut().clamp_expr(self.id, lo.id, hi.id);
+        Self { scope: self.scope, id }
+    }
+
+    pub fn mul_add(self, b: Self, c: Self) -> Self {
+        let id = self.scope.graph.borrow_mut().fma(self.id, b.id, c.id);
         Self { scope: self.scope, id }
     }
 }

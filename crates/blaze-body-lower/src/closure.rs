@@ -19,7 +19,7 @@ use crate::scope::Entry;
 use crate::{At, BodyFacts, Construct, Lower, LowerError};
 
 /// Lowers the body of closure expression `closure` of `body` (checked as `ck`) to a [`Body`].
-pub fn lower_closure<A: Allocator + Clone, F: BodyFacts>(
+pub fn lower_closure<A: Allocator + Copy, F: BodyFacts>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     facts: &F,
@@ -37,13 +37,13 @@ pub fn lower_closure<A: Allocator + Clone, F: BodyFacts>(
     l.finish(cb)
 }
 
-impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
+impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
     /// The captures of closure `c`, in its environment's field order (blaze-typeck
     /// env_fields.rs, the active strategy): each captured binding and how. A field holding a
     /// place below its binding is refused by name (`Construct::CapturedPlace`): its field is the
     /// place's value, which this lowering does not build yet.
     fn captures_of(&self, c: ExprId) -> Result<Vec<(PatId, CaptureKind), A>, LowerError> {
-        let mut out = Vec::new_in(self.alloc.clone());
+        let mut out = Vec::new_in(self.alloc);
         for f in self.ck.env_fields(c) {
             if !f.is_whole() {
                 return self.refuse(Construct::CapturedPlace, c);
@@ -69,7 +69,7 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
         let at = At::Expr(e);
         let ty = self.expr_ty(e)?;
         let caps = self.captures_of(e)?;
-        let mut ops: Vec<Operand, A> = Vec::new_in(self.alloc.clone());
+        let mut ops: Vec<Operand, A> = Vec::new_in(self.alloc);
         for &(p, kind) in caps.iter() {
             let place = self.bound(p, e)?;
             let vt = self.local_ty(p)?;
@@ -119,7 +119,7 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
         let env = self.b.new_local(LocalDecl { ty: env_ty, kind: LocalKind::Arg(0), mutbl: Mutbl::Not });
         let env_place = self.b.local_place(env);
         let pats = self.exprs_param_pats(params, closure)?;
-        let mut args: Vec<(PatId, blaze_body::Local, Place, PTy), A> = Vec::new_in(self.alloc.clone());
+        let mut args: Vec<(PatId, blaze_body::Local, Place, PTy), A> = Vec::new_in(self.alloc);
         for (i, &p) in pats.iter().enumerate() {
             let ty = self.pat_ty(p)?;
             let local = self.b.new_local(LocalDecl { ty, kind: LocalKind::Arg(1 + i as u32), mutbl: Mutbl::Not });
@@ -150,7 +150,7 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
                 self.bind(p, place);
                 continue;
             }
-            let mut out = Vec::new_in(self.alloc.clone());
+            let mut out = Vec::new_in(self.alloc);
             self.bind_irrefutable(p, place, ty, &mut out)?;
             self.schedule(&out);
         }
@@ -159,7 +159,7 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
 
     /// A closure's parameter patterns (its `params` list, of `BodyView::pat_lists`).
     fn exprs_param_pats(&self, params: List, closure: ExprId) -> Result<Vec<PatId, A>, LowerError> {
-        let mut out = Vec::new_in(self.alloc.clone());
+        let mut out = Vec::new_in(self.alloc);
         match self.body.pat_lists.get(params.range()) {
             Some(s) => out.extend_from_slice(s),
             None => return self.refuse(Construct::Malformed, closure),

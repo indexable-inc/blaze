@@ -21,7 +21,7 @@ use blaze_typeck::{Edition, Expr, ExprId, List, PNode, PatId, Stmt, StmtId};
 use crate::scope::{Binding, Target};
 use crate::{At, BodyFacts, Construct, Lower, LowerError, MOST_POSITIONS};
 
-impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
+impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
     fn edition_2024(&self) -> bool {
         matches!(self.body.edition, Edition::E2024)
     }
@@ -111,14 +111,14 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
     /// schedules its bindings uninitialized.
     fn let_stmt(&mut self, pat: PatId, init: Option<ExprId>) -> Result<(), LowerError> {
         let span = self.pat_span(pat);
-        let mut out: Vec<Binding, A> = Vec::new_in(self.alloc.clone());
+        let mut out: Vec<Binding, A> = Vec::new_in(self.alloc);
         let Some(init) = init else {
             self.declare_uninit(pat, &mut out)?;
             self.schedule(&out);
             return Ok(());
         };
         self.open();
-        let prev = core::mem::replace(&mut self.extended, Vec::new_in(self.alloc.clone()));
+        let prev = core::mem::replace(&mut self.extended, Vec::new_in(self.alloc));
         let prev_mark = self.ext_mark.take();
         self.mark_extending(init)?;
         self.ext_mark = Some(self.marks.len() - 1);
@@ -147,7 +147,7 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
     /// arguments of an extending tuple struct or variant constructor call, and the tail of an
     /// extending block.
     fn mark_extending(&mut self, init: ExprId) -> Result<(), LowerError> {
-        let mut work: Vec<ExprId, A> = Vec::new_in(self.alloc.clone());
+        let mut work: Vec<ExprId, A> = Vec::new_in(self.alloc);
         work.push(init);
         let mut steps = 0u32;
         while let Some(x) = work.pop() {
@@ -240,7 +240,7 @@ impl<F: BodyFacts, A: Allocator + Clone> Lower<'_, '_, '_, F, A> {
         let join = self.b.new_block(BlockKind::Normal);
         self.test_pat(pat, p, ty, eb, e)?;
         self.open();
-        let mut out: Vec<Binding, A> = Vec::new_in(self.alloc.clone());
+        let mut out: Vec<Binding, A> = Vec::new_in(self.alloc);
         self.bind_pat(pat, p, ty, &mut out)?;
         self.schedule(&out);
         self.lower_into(dest, then)?;

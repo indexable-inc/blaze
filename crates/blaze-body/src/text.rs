@@ -668,7 +668,7 @@ enum Row {
     Borrow { dest: Place, kind: BorrowKind, place: Place, loan: Loan, origin: Origin },
 }
 
-struct Parser<A: Allocator + Clone> {
+struct Parser<A: Allocator + Copy> {
     b: BodyBuilder<A>,
     ops: Vec<Operand, A>,
     cases: Vec<(u128, Block), A>,
@@ -676,12 +676,12 @@ struct Parser<A: Allocator + Clone> {
 }
 
 /// Reads a body in the text form, its tables in `alloc`.
-pub fn parse<A: Allocator + Clone>(text: &str, alloc: A) -> Result<Body<A>, ParseError> {
+pub fn parse<A: Allocator + Copy>(text: &str, alloc: A) -> Result<Body<A>, ParseError> {
     let mut p = Parser {
-        b: BodyBuilder::new_in(alloc.clone()),
-        ops: Vec::new_in(alloc.clone()),
-        cases: Vec::new_in(alloc.clone()),
-        bytes: Vec::new_in(alloc.clone()),
+        b: BodyBuilder::new_in(alloc),
+        ops: Vec::new_in(alloc),
+        cases: Vec::new_in(alloc),
+        bytes: Vec::new_in(alloc),
     };
     // Blocks first, by id, so a row may name a block written after it.
     let n = text.lines().filter(|l| is_header(l)).count();
@@ -730,7 +730,7 @@ pub fn parse<A: Allocator + Clone>(text: &str, alloc: A) -> Result<Body<A>, Pars
     p.b.finish().map_err(|e| ParseError { line: last as u32 + 1, col: 1, what: ParseWhat::Build(e) })
 }
 
-impl<A: Allocator + Clone> Parser<A> {
+impl<A: Allocator + Copy> Parser<A> {
     fn next_id(c: &Cur<'_>, table: Table, want: u32, found: u32) -> Result<(), ParseError> {
         match want == found {
             true => Ok(()),

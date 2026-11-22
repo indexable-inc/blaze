@@ -1,11 +1,13 @@
 use blaze_own::Alloc;
 
 use crate::{
-    AlgebraPlant, ConstExpr, ConstGraph, ExprGraph, ExprId, NewtonOpts, PatNode, Poly, PolyPlant,
-    Rat, RewriteRule, SimplifyOpts, Solution, SymScope, diff, diff::diff_with_plant, emit_rust_fn,
-    emit_rust_multi_fn, eval_dual, eval_newton, expr_cost, expr_to_poly, format_expr, grad,
-    grad_reverse, grad_reverse_with_plant, hessian, jacobian, newton_step, poly_to_expr, simplify,
-    simplify_poly_expr, simplify_with_rules, solve_for, solve_linear_system, taylor,
+    AlgebraPlant, ConstExpr, ConstGraph, CostModel, ExprGraph, ExprId, Interval, NewtonOpts, Op,
+    PatNode, Poly, PolyPlant, Rat, RewriteMode, RewriteRule, SimplifyOpts, Solution, SymScope,
+    active_vars, diff, diff::diff_with_plant, emit_rust_fn, emit_rust_multi_fn, eval_dual,
+    eval_interval, eval_newton, expr_cost, expr_cost_with, expr_to_poly, format_expr, grad,
+    grad_reverse, grad_reverse_with_plant, hessian, hvp, jacobian, jvp, newton_step, poly_to_expr,
+    prune_branches, simplify, simplify_poly_expr, simplify_with, simplify_with_rules, solve_for,
+    solve_linear_system, taylor,
 };
 
 fn heap() -> Alloc<'static> {
@@ -664,4 +666,107 @@ fn symbolic_linear_system_and_exact_newton_raphson_solver() {
     let dottie = eval_newton(&mut g2, f_dottie, vx, &[0.0], 0.5, NewtonOpts::default()).unwrap();
     assert!(dottie.converged);
     assert!(close(blaze_math::cos(dottie.root), dottie.root, 1e-12), "dottie={}", dottie.root);
+}
+
+#[test]
+fn interval_dead_branch_pruning_ieee_exact_mode_and_cpu_fma_fusion() {
+    // 1. Sound interval enclosure + dead-branch elimination on `Op::Select` and `abs`:
+    let s = SymScope::new_in(heap());
+    let (_, x) = s.var("x");
+    let (_, y) = s.var("y");
+    let expr = (x.relu() + y.relu() + x.abs() + (x / x)).id();
+    let mut g = s.into_graph();
+
+    // x in [2, 5] (> 0), y in [-4, -1] (< 0):
+    //   relu(x) -> x, relu(y) -> 0, abs(x) -> x, x / x -> 1  =>  2*x + 1
+    let bounds = [Interval::new(2.0, 5.0).unwrap(), Interval::new(-4.0, -1.0).unwrap()];
+    let iv = eval_interval(&g, expr, &bounds).unwrap();
+    for env in [[2.0, -4.0], [3.5, -2.5], [5.0, -1.0]] {
+        let v = g.eval(expr, &env).unwrap();
+        assert!(iv.contains(v), "interval {iv:?} failed to enclose {v}");
+    }
+    let pruned = prune_branches(&mut g, expr, &bounds).unwrap();
+    let simp = simplify(&mut g, pruned).unwrap();
+    let txt = format_expr(&g, simp).unwrap();
+    assert!(!txt.as_str().contains("select"), "dead select remained: {}", txt.as_str());
+    assert!(!txt.as_str().contains("abs"), "signed abs remained: {}", txt.as_str());
+    for env in [[2.0, -4.0], [3.5, -2.5], [5.0, -1.0]] {
+        assert!(close(g.eval(expr, &env).unwrap(), g.eval(simp, &env).unwrap(), 1e-12));
+    }
+
+    // 2. RewriteMode::IeeeExact must NOT apply `x / x -> 1`, while still simplifying `x * 1 -> x`:
+    let mut g2 = ExprGraph::new_in(heap());
+    let (_, ex) = g2.var("x");
+    let x_div_x = g2.div(ex, ex);
+    let ieee_opts = SimplifyOpts { mode: RewriteMode::IeeeExact, ..SimplifyOpts::default() };
+    let (ieee_out, _) = simplify_with(&mut g2, x_div_x, ieee_opts).unwrap();
+    assert!(matches!(g2.node(ieee_out).unwrap(), Op::Div(_, _)), "IeeeExact must preserve x / x");
+
+    let (fast_out, _) = simplify_with(&mut g2, x_div_x, SimplifyOpts::default()).unwrap();
+    assert_eq!(g2.node(fast_out).unwrap().as_const(), Some(1.0));
+
+    // 3. CostModel::CpuFma fuses `a * b + c` into `Op::Fma(a, b, c)`!
+    let mut g3 = ExprGraph::new_in(heap());
+    let (va, ea) = g3.var("a");
+    let (_, eb) = g3.var("b");
+    let (_, ec) = g3.var("c");
+    let ab = g3.mul(ea, eb);
+    let ab_c = g3.add(ab, ec);
+    let fma_opts = SimplifyOpts { cost_model: CostModel::CpuFma, ..SimplifyOpts::default() };
+    let (fused, _) = simplify_with(&mut g3, ab_c, fma_opts).unwrap();
+    assert!(matches!(g3.node(fused).unwrap(), Op::Fma(_, _, _)), "expected Fma fusion");
+    assert!(
+        expr_cost_with(&g3, fused, CostModel::CpuFma).unwrap()
+            < expr_cost_with(&g3, ab_c, CostModel::CpuFma).unwrap()
+    );
+    let code = emit_rust_fn(&g3, "fused_mac", fused).unwrap();
+    assert!(code.as_str().contains("blaze_math::mul_add"), "expected mul_add in:\n{}", code.as_str());
+    // Differentiate Fma and check against Dual oracle:
+    let df_da = diff(&mut g3, fused, va).unwrap();
+    let dual = eval_dual(&g3, fused, &[2.0, 3.5, -1.2], va).unwrap();
+    assert!(close(g3.eval(df_da, &[2.0, 3.5, -1.2]).unwrap(), dual.deriv, 1e-12));
+}
+
+#[test]
+fn jvp_hvp_and_active_vars_sparsity_match_full_hessian_oracle() {
+    // f(x, y, z) = sin(x * y) + exp(x) * y^2  (z is inactive!)
+    let s = SymScope::new_in(heap());
+    let (vx, x) = s.var("x");
+    let (vy, y) = s.var("y");
+    let (vz, _z) = s.var("z");
+    let (_, dx) = s.var("vx");
+    let (_, dy) = s.var("vy");
+    let (_, dz) = s.var("vz");
+    let f = ((x * y).sin() + x.exp() * y * y).id();
+    let dir = [dx.id(), dy.id(), dz.id()];
+    let mut g = s.into_graph();
+
+    let active = active_vars(&g, f, 3).unwrap();
+    assert_eq!(active.as_slice(), &[true, true, false]);
+
+    let directional = jvp(&mut g, f, &[vx, vy, vz], &dir).unwrap();
+    let hv = hvp(&mut g, f, &[vx, vy, vz], &dir).unwrap();
+    let h = hessian(&mut g, f, &[vx, vy, vz]).unwrap();
+    let grad_f = grad_reverse(&mut g, f, &[vx, vy, vz]).unwrap();
+
+    let env = [0.7, -1.3, 42.0, 0.4, -0.9, 1.5];
+    let v = [env[3], env[4], env[5]];
+
+    // Verify jvp == grad(f) · v
+    let mut expected_jvp = 0.0;
+    for i in 0..3 {
+        expected_jvp += g.eval(grad_f[i], &env).unwrap() * v[i];
+    }
+    assert!(close(g.eval(directional, &env).unwrap(), expected_jvp, 1e-11));
+
+    // Verify hvp[i] == sum_j H[i, j] * v[j]
+    for i in 0..3 {
+        let mut expected_hi = 0.0;
+        for j in 0..3 {
+            expected_hi += g.eval(h[i * 3 + j], &env).unwrap() * v[j];
+        }
+        let got_hi = g.eval(hv[i], &env).unwrap();
+        assert!(close(got_hi, expected_hi, 1e-11), "hvp[{i}]: {got_hi} vs {expected_hi}");
+    }
+    assert_eq!(g.eval(hv[2], &env).unwrap(), 0.0);
 }

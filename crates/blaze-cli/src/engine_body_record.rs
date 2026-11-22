@@ -86,7 +86,7 @@ pub(crate) fn put(cx: &Cx, store: &mut dyn Store<'_>, body: Name, owner: Key, by
 
 /// Body `body`'s kept record at `key`, read in place and opened: its table decoded into
 /// `alloc`, its body verified once ([`Kept::verified`]).
-pub(crate) fn read<'m, A: Allocator + Clone>(cx: &Cx, store: &mut dyn Store<'m>, body: Name, key: Key, alloc: A) -> Result<Kept<'m, A>, BodyRecordError> {
+pub(crate) fn read<'m, A: Allocator + Copy>(cx: &Cx, store: &mut dyn Store<'m>, body: Name, key: Key, alloc: A) -> Result<Kept<'m, A>, BodyRecordError> {
     let cx = cx.span("engine: a body's kept code read");
     let held = store.get(&cx, key).map_err(|why| BodyRecordError::Store { body, key, why })?;
     let Some(held) = held else { return Err(BodyRecordError::Missing { body, key }) };
@@ -96,7 +96,7 @@ pub(crate) fn read<'m, A: Allocator + Clone>(cx: &Cx, store: &mut dyn Store<'m>,
 
 /// The kept body in `bytes`, found at `key`: refused when the bytes are not `key`'s, then
 /// opened by blaze-body's one reader.
-pub(crate) fn open<'b, A: Allocator + Clone>(body: Name, key: Key, bytes: &'b [u8], alloc: A) -> Result<Kept<'b, A>, BodyRecordError> {
+pub(crate) fn open<'b, A: Allocator + Copy>(body: Name, key: Key, bytes: &'b [u8], alloc: A) -> Result<Kept<'b, A>, BodyRecordError> {
     let found = key_of(bytes);
     if found != key {
         return Err(BodyRecordError::WrongBytes { body, key, found });

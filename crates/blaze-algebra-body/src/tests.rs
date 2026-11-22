@@ -1,4 +1,4 @@
-use blaze_algebra::{ExprGraph, eval_dual};
+use blaze_algebra::{CostModel, ExprGraph, Interval, SimplifyOpts, eval_dual, hessian};
 use blaze_body::{
     BinOp, Block, BlockKind, Body, BodyBuilder, Callee, ConstDecl, ConstKind, LocalDecl, LocalKind,
     Operand, Role, Span, StmtKind,
@@ -9,8 +9,8 @@ use blaze_own::Alloc;
 
 use crate::{
     BodyAlgebraError, BodyPlant, MathEmitter, MathOp, MathResolver, NoMathCalls, diff_body,
-    diff_body_with_plant, eval_pure_body, eval_pure_multi_body, grad_bodies, lift_body,
-    simplify_body, splice_body, splice_multi_body, value_and_grad_body,
+    diff_body_with_plant, eval_pure_body, eval_pure_multi_body, grad_bodies, hvp_body, lift_body,
+    simplify_body, simplify_body_with, splice_body, splice_multi_body, value_and_grad_body,
 };
 
 fn heap() -> Alloc<'static> {
@@ -38,6 +38,7 @@ impl TestMath {
             MathOp::Tanh => 106,
             MathOp::Abs => 107,
             MathOp::Pow => 108,
+            MathOp::Fma => 109,
         })
     }
 }
@@ -55,6 +56,7 @@ impl MathResolver for TestMath {
             106 => Some(MathOp::Tanh),
             107 => Some(MathOp::Abs),
             108 => Some(MathOp::Pow),
+            109 => Some(MathOp::Fma),
             _ => None,
         }
     }
@@ -364,4 +366,93 @@ fn select_relu_and_max_splice_into_verified_switch_diamond_mir() {
         assert!(close(got_f, dual.val, 1e-12), "f({env:?}): {got_f} vs {}", dual.val);
         assert!(close(got_dx, dual.deriv, 1e-12), "df/dx({env:?}): {got_dx} vs {}", dual.deriv);
     }
+
+    // Round-trip: lift the branching Switch-diamond MIR directly back through `diff_body` and
+    // `value_and_grad_body`!
+    let round_dx = diff_body(v_f, 0, &TestMath, &TestMath, heap()).unwrap();
+    let v_round_dx = verify(&round_dx).unwrap();
+    let round_vg = value_and_grad_body(v_f, PTy(1), &TestMath, &TestMath, heap()).unwrap();
+    let v_round_vg = verify(&round_vg).unwrap();
+    for env in [[1.5, 2.0], [-1.5, 2.0], [2.5, -0.5], [-2.0, -3.0]] {
+        let dual_x = eval_dual(&g, root, &env, vx).unwrap();
+        let dual_y = eval_dual(&g, root, &env, vy).unwrap();
+        assert!(close(eval_pure_body(v_round_dx, &env, &TestMath, heap()).unwrap(), dual_x.deriv, 1e-12));
+        let vg = eval_pure_multi_body(v_round_vg, &env, &TestMath, heap()).unwrap();
+        assert_eq!(vg.len(), 3);
+        assert!(close(vg[0], dual_x.val, 1e-12));
+        assert!(close(vg[1], dual_x.deriv, 1e-12));
+        assert!(close(vg[2], dual_y.deriv, 1e-12));
+    }
+
+    // Sound interval dead-branch pruning on MIR: when x in [3, 5] and y in [1, 2],
+    // both `x * y > 0` and `x - y > 0` are provably positive, collapsing 7+ blocks into 1 block!
+    let bounds = [Interval::new(3.0, 5.0).unwrap(), Interval::new(1.0, 2.0).unwrap()];
+    let branchless = simplify_body_with(
+        v_f,
+        SimplifyOpts::default(),
+        Some(&bounds),
+        &TestMath,
+        &TestMath,
+        heap(),
+    )
+    .unwrap();
+    let v_branchless = verify(&branchless).unwrap();
+    assert_eq!(v_branchless.blocks(), 1, "dead Switch diamonds should collapse to 1 block");
+    assert!(close(
+        eval_pure_body(v_branchless, &[4.0, 1.5], &TestMath, heap()).unwrap(),
+        eval_pure_body(v_f, &[4.0, 1.5], &TestMath, heap()).unwrap(),
+        1e-12
+    ));
+}
+
+#[test]
+fn hvp_body_and_cpu_fma_simplify_verify_and_match_hessian_oracle() {
+    // 1. O(|V|) Hessian-Vector Product MIR pass on f(x, y) = x^3 * y + sin(x * y)
+    let mut g = ExprGraph::new_in(heap());
+    let (vx, ex) = g.var("x");
+    let (vy, ey) = g.var("y");
+    let x2 = g.mul(ex, ex);
+    let x3 = g.mul(x2, ex);
+    let x3y = g.mul(x3, ey);
+    let xy = g.mul(ex, ey);
+    let sxy = g.sin(xy);
+    let root = g.add(x3y, sxy);
+
+    let orig = splice_body(&g, root, &[vx, vy], PTy(0), &TestMath, heap()).unwrap();
+    let v_orig = verify(&orig).unwrap();
+
+    let hvp_mir = hvp_body(v_orig, PTy(1), &TestMath, &TestMath, heap()).unwrap();
+    let v_hvp = verify(&hvp_mir).expect("hvp_body MIR must verify");
+    assert_eq!(v_hvp.args(), 4);
+
+    let h = hessian(&mut g, root, &[vx, vy]).unwrap();
+    let env_xy = [1.2, -0.7];
+    let dir = [0.6, -1.1];
+    let got = eval_pure_multi_body(v_hvp, &[env_xy[0], env_xy[1], dir[0], dir[1]], &TestMath, heap()).unwrap();
+    assert_eq!(got.len(), 2);
+    for i in 0..2 {
+        let expected = g.eval(h[i * 2], &env_xy).unwrap() * dir[0]
+            + g.eval(h[i * 2 + 1], &env_xy).unwrap() * dir[1];
+        assert!(close(got[i], expected, 1e-10), "hvp[{i}]: {} vs {expected}", got[i]);
+    }
+
+    // 2. CpuFma cost model simplifies `x * y + z` MIR into a verified 3-arg `MathOp::Fma` MIR call!
+    let mut g2 = ExprGraph::new_in(heap());
+    let (va, ea) = g2.var("x");
+    let (vb, eb) = g2.var("y");
+    let (vc, ec) = g2.var("z");
+    let ab = g2.mul(ea, eb);
+    let mac = g2.add(ab, ec);
+    let mac_mir = splice_body(&g2, mac, &[va, vb, vc], PTy(0), &TestMath, heap()).unwrap();
+    let v_mac = verify(&mac_mir).unwrap();
+    let fma_opts = SimplifyOpts { cost_model: CostModel::CpuFma, ..SimplifyOpts::default() };
+    let fused_mir = simplify_body_with(v_mac, fma_opts, None, &TestMath, &TestMath, heap()).unwrap();
+    let v_fused = verify(&fused_mir).unwrap();
+    // Fma is emitted as a Call terminator => 2 blocks (call + continuation) and evaluates cleanly!
+    assert_eq!(v_fused.blocks(), 2);
+    assert!(close(
+        eval_pure_body(v_fused, &[2.5, 4.0, -3.0], &TestMath, heap()).unwrap(),
+        7.0,
+        1e-12
+    ));
 }

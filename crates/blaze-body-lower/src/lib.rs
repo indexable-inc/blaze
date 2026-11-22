@@ -197,7 +197,7 @@ pub trait BodyFacts: Facts {
 /// Locals are the return place `_0`, then one argument per parameter, then bindings and
 /// temporaries. A parameter whose pattern is a plain by-value binding is that binding; any
 /// other parameter pattern binds from its argument at entry.
-pub fn lower<A: Allocator + Clone, F: BodyFacts>(
+pub fn lower<A: Allocator + Copy, F: BodyFacts>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     facts: &F,
@@ -228,13 +228,13 @@ pub enum KeepError {
 ///
 /// Two bodies whose verdicts agree but whose code differs (`return 1`, `return 2`) keep two
 /// records: the record is the code, not the verdict.
-pub fn keep<A: Allocator + Clone, F: BodyFacts>(
+pub fn keep<A: Allocator + Copy, F: BodyFacts>(
     body: &BodyView<'_>,
     ck: &Checked<'_>,
     facts: &F,
     alloc: A,
 ) -> Result<Vec<u8, A>, KeepError> {
-    let lowered = lower(body, ck, facts, alloc.clone()).map_err(KeepError::Lower)?;
+    let lowered = lower(body, ck, facts, alloc).map_err(KeepError::Lower)?;
     blaze_body::kept::encode(&lowered, ck.types.view(), alloc).map_err(KeepError::Kept)
 }
 
@@ -328,7 +328,7 @@ fn index_pat_rows<A: Allocator>(col: &[PatId], n_pats: usize, alloc: A) -> Vec<u
 }
 
 /// The lowering's state over one body.
-pub(crate) struct Lower<'b, 'v, 'c, F, A: Allocator + Clone> {
+pub(crate) struct Lower<'b, 'v, 'c, F, A: Allocator + Copy> {
     pub(crate) body: &'b BodyView<'v>,
     pub(crate) ck: &'b Checked<'c>,
     pub(crate) tys: PTys<'b>,
@@ -370,9 +370,9 @@ pub(crate) struct Lower<'b, 'v, 'c, F, A: Allocator + Clone> {
     pub(crate) depth: u32,
 }
 
-impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Clone> Lower<'b, 'v, 'c, F, A> {
+impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
     pub(crate) fn new(body: &'b BodyView<'v>, ck: &'b Checked<'c>, facts: &'b F, alloc: A) -> Self {
-        let mut break_targets = Vec::new_in(alloc.clone());
+        let mut break_targets = Vec::new_in(alloc);
         for x in body.exprs.iter() {
             match *x {
                 Expr::Break { target, .. } | Expr::Continue { target } => break_targets.push(target),
@@ -385,34 +385,34 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Clone> Lower<'b, 'v, 'c, F, A> {
         let n_exprs = body.exprs.len();
         let n_pats = body.pats.len();
         let n_tys = tys.len();
-        let expr_def_row = index_expr_rows(ck.expr_defs.column::<0>(), n_exprs, alloc.clone());
-        let pat_def_row = index_pat_rows(ck.pat_defs.column::<0>(), n_pats, alloc.clone());
-        let callee_row = index_expr_rows(ck.callees.column::<0>(), n_exprs, alloc.clone());
-        let field_row = index_expr_rows(ck.fields.column::<0>(), n_exprs, alloc.clone());
+        let expr_def_row = index_expr_rows(ck.expr_defs.column::<0>(), n_exprs, alloc);
+        let pat_def_row = index_pat_rows(ck.pat_defs.column::<0>(), n_pats, alloc);
+        let callee_row = index_expr_rows(ck.callees.column::<0>(), n_exprs, alloc);
+        let field_row = index_expr_rows(ck.fields.column::<0>(), n_exprs, alloc);
         Lower {
             body,
             ck,
             tys,
             facts,
-            b: BodyBuilder::new_with_types_in(tys, alloc.clone()),
+            b: BodyBuilder::new_with_types_in(tys, alloc),
             ret: Place(0),
             ret_ty: PTy(0),
-            pat_place: Vec::from_elem_in(Place(NONE), n_pats, alloc.clone()),
+            pat_place: Vec::from_elem_in(Place(NONE), n_pats, alloc),
             expr_def_row,
             pat_def_row,
             callee_row,
             field_row,
-            copy_memo: Vec::from_elem_in(Cell::new(0u8), n_tys, alloc.clone()),
-            drop_memo: Vec::from_elem_in(Cell::new(0u8), n_tys, alloc.clone()),
-            sched: Vec::new_in(alloc.clone()),
-            marks: Vec::new_in(alloc.clone()),
-            targets: Vec::new_in(alloc.clone()),
+            copy_memo: Vec::from_elem_in(Cell::new(0u8), n_tys, alloc),
+            drop_memo: Vec::from_elem_in(Cell::new(0u8), n_tys, alloc),
+            sched: Vec::new_in(alloc),
+            marks: Vec::new_in(alloc),
+            targets: Vec::new_in(alloc),
             break_targets,
-            pending: Vec::new_in(alloc.clone()),
+            pending: Vec::new_in(alloc),
             resume: None,
-            extended: Vec::new_in(alloc.clone()),
+            extended: Vec::new_in(alloc),
             ext_mark: None,
-            activate: Vec::new_in(alloc.clone()),
+            activate: Vec::new_in(alloc),
             depth: 0,
             alloc,
         }
@@ -424,7 +424,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Clone> Lower<'b, 'v, 'c, F, A> {
         let ret_ty = self.adjusted_ty(root)?;
         self.return_place(ret_ty);
         let params = self.body.params;
-        let mut args: Vec<(PatId, Local, Place, PTy), A> = Vec::new_in(self.alloc.clone());
+        let mut args: Vec<(PatId, Local, Place, PTy), A> = Vec::new_in(self.alloc);
         for (i, &p) in params.iter().enumerate() {
             let ty = self.pat_ty(p)?;
             let mutbl = match self.pat(p)? {
@@ -444,7 +444,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Clone> Lower<'b, 'v, 'c, F, A> {
                 self.bind(p, place);
                 continue;
             }
-            let mut out = Vec::new_in(self.alloc.clone());
+            let mut out = Vec::new_in(self.alloc);
             self.bind_irrefutable(p, place, ty, &mut out)?;
             self.schedule(&out);
         }
@@ -670,7 +670,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Clone> Lower<'b, 'v, 'c, F, A> {
             }
             return Ok(ans);
         }
-        let mut stack = TyStack::new(root, self.alloc.clone());
+        let mut stack = TyStack::new(root, self.alloc);
         let mut steps = 0u32;
         while let Some(t) = stack.pop() {
             steps += 1;
@@ -780,7 +780,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Clone> Lower<'b, 'v, 'c, F, A> {
             }
             return Ok(ans);
         }
-        let mut stack = TyStack::new(root, self.alloc.clone());
+        let mut stack = TyStack::new(root, self.alloc);
         let mut steps = 0u32;
         while let Some(t) = stack.pop() {
             steps += 1;

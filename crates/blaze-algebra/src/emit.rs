@@ -31,7 +31,8 @@ fn op_prec(op: Op) -> u8 {
         | Op::Sqrt(_)
         | Op::Tanh(_)
         | Op::Abs(_)
-        | Op::Select(_, _, _) => 5,
+        | Op::Select(_, _, _)
+        | Op::Fma(_, _, _) => 5,
         Op::Pow(_, _) => 4,
         Op::Neg(_) => 3,
         Op::Mul(_, _) | Op::Div(_, _) => 2,
@@ -107,6 +108,15 @@ fn fmt_rec<A: Allocator + Copy>(
             fmt_rec(g, t, 0, out)?;
             out.push_str(", ");
             fmt_rec(g, e, 0, out)?;
+            out.push(')');
+        }
+        Op::Fma(a, b, c) => {
+            out.push_str("fma(");
+            fmt_rec(g, a, 0, out)?;
+            out.push_str(", ");
+            fmt_rec(g, b, 0, out)?;
+            out.push_str(", ");
+            fmt_rec(g, c, 0, out)?;
             out.push(')');
         }
     }
@@ -245,6 +255,9 @@ fn emit_ssa_body<A: Allocator + Copy>(
             Op::Select(c, t, e) => {
                 let _ = write!(out, "if t{} > 0.0_f64 {{ t{} }} else {{ t{} }}", c.0, t.0, e.0);
             }
+            Op::Fma(a, b, c) => {
+                let _ = write!(out, "blaze_math::mul_add(t{}, t{}, t{})", a.0, b.0, c.0);
+            }
         }
         out.push_str(";\n");
     }
@@ -290,7 +303,7 @@ fn collect_postorder<A: Allocator + Copy>(
             collect_postorder(g, a, visited, order)?;
             collect_postorder(g, b, visited, order)?;
         }
-        Op::Select(c, t, e) => {
+        Op::Select(c, t, e) | Op::Fma(c, t, e) => {
             collect_postorder(g, c, visited, order)?;
             collect_postorder(g, t, visited, order)?;
             collect_postorder(g, e, visited, order)?;
