@@ -6,8 +6,9 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::alloc::Global;
-use std::collections::VecDeque;
+use alloc::{borrow::ToOwned, format, string::String, string::ToString, vec::Vec};
+use alloc::alloc::Global;
+use alloc::collections::VecDeque;
 
 use blaze_fetch::Digest;
 use blaze_manifest::lock::{Lock, LockPackage as Package, LockSource as Source};

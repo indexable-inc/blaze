@@ -27,8 +27,9 @@
 //! one field each, past the slots (a value is stored once where it is made and loaded at each
 //! use; its own life is not tracked by markers).
 
-use std::alloc::Allocator;
-use std::cmp::Reverse;
+use alloc::vec::Vec;
+use alloc::alloc::Allocator;
+use core::cmp::Reverse;
 
 use super::{Body, CoroutineError, Plant, align_up, filled, successors};
 use crate::{Block, Op, func::NONE};

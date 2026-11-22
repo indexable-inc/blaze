@@ -2,7 +2,7 @@
 //! as Wasmtime passes them and handed in a straight line to the core (`layout`), which
 //! reads and writes the guest's memory and asks the [`System`](crate::System).
 
-use std::marker::PhantomData;
+use core::marker::PhantomData;
 
 use wasmtime::{Caller, Linker};
 

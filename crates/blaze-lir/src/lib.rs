@@ -44,6 +44,7 @@
 //!
 //! The crate is a sans-IO core: it reads no clock, file or thread.
 
+#![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
@@ -51,6 +52,8 @@
 #![deny(blaze::sans_io_core)]
 
 /// LIR's integer arithmetic, one home: what the evaluator runs and the simplify stage folds by.
+
+extern crate alloc;
 mod arith;
 /// Bodies by identity and what a direct call reaches: the evaluator's and the inliner's seam.
 pub mod body;

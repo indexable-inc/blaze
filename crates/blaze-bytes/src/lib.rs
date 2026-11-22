@@ -17,6 +17,7 @@
 //! its deref is the slice, one load of a pointer and a length. The check is std's, after the
 //! ASCII the bytes start with is skipped 64 bytes at a time.
 
+#![cfg_attr(not(test), no_std)]
 #![feature(allocator_ext)]
 // `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
@@ -26,7 +27,11 @@
     reason = "bytes held without a copy: an owner's bytes lent as `&'static [u8]` beside the owner that keeps them (`Bytes::held`), checked UTF-8 viewed as `&str`, and a heap `Arc<[u8]>` of checked UTF-8 cast to `Arc<str>`"
 )]
 
-use std::{borrow::Borrow, fmt, hash, ops::Deref, str::Utf8Error, sync::Arc};
+
+extern crate alloc;
+use alloc::string::String;
+use core::{borrow::Borrow, fmt, hash, ops::Deref, str::Utf8Error};
+use alloc::sync::Arc;
 
 use blaze_mem::{Kept, Tag};
 
@@ -96,7 +101,7 @@ impl Bytes {
         let place = Arc::get_mut(&mut made).expect("a new `Arc` is its only count");
         // SAFETY: the slice was made zeroed, and zero is a `u8`; no other count can read it
         // while it is lent here (`get_mut`).
-        write(unsafe { &mut *(place as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]) })?;
+        write(unsafe { &mut *(place as *mut [core::mem::MaybeUninit<u8>] as *mut [u8]) })?;
         // SAFETY: as above, every byte is initialized: zeroed, then written by `write`.
         let shared = unsafe { made.assume_init() };
         let bytes: *const [u8] = &*shared;
@@ -110,7 +115,7 @@ impl Bytes {
     pub fn copy_kept(tag: Tag, bytes: &[u8]) -> Bytes {
         match Bytes::kept(tag, bytes.len(), |place| {
             place.copy_from_slice(bytes);
-            Ok::<(), std::convert::Infallible>(())
+            Ok::<(), core::convert::Infallible>(())
         }) {
             Ok(made) => made,
         }
@@ -293,7 +298,7 @@ impl Deref for Text {
         // SAFETY: a `Text`'s bytes are UTF-8: checked by `text_of` or made from a `str`, the
         // only ways to make one. `Bytes` lends the same immutable bytes on every deref, kept
         // alive by the count `self` holds.
-        unsafe { std::str::from_utf8_unchecked(&self.bytes) }
+        unsafe { core::str::from_utf8_unchecked(&self.bytes) }
     }
 }
 
@@ -353,9 +358,9 @@ impl fmt::Display for Text {
 /// where a char starts, so the rest is UTF-8 exactly when the whole is; a refusal is asked of
 /// the whole again, for where it stops.
 fn check(bytes: &[u8]) -> Result<(), Utf8Error> {
-    match std::str::from_utf8(&bytes[ascii_prefix(bytes)..]) {
+    match core::str::from_utf8(&bytes[ascii_prefix(bytes)..]) {
         Ok(_) => Ok(()),
-        Err(_) => std::str::from_utf8(bytes).map(drop),
+        Err(_) => core::str::from_utf8(bytes).map(drop),
     }
 }
 

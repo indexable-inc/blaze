@@ -559,7 +559,7 @@ impl<'a> Operands<'a> {
     pub(crate) fn of(view: View<'a>, inst: usize) -> Operands<'a> {
         let words: &'a [u32] = match view.op(inst).info().layout {
             Layout::None => &[],
-            Layout::Data(_) => std::slice::from_ref(&view.data[inst]),
+            Layout::Data(_) => core::slice::from_ref(&view.data[inst]),
             Layout::Extra(_) => &view.extra[view.data[inst] as usize..],
         };
         Operands { words, at: 0, tys: view.tys, ty: Ty(view.tys[inst]) }

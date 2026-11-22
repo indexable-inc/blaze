@@ -2,6 +2,7 @@
 //! instance's reference, or through a fn pointer), asserts, drops, resume and unreachable
 //! (lib.rs, "Unwinding").
 
+use alloc::vec::Vec;
 use core::alloc::Allocator;
 
 use blaze_body::{AssertKind, BinOp, Block as BodyBlock, Callee, CalleeId, Operand, Ops, Place, StmtKind, Unwind};

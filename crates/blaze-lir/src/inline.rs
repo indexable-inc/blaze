@@ -11,11 +11,12 @@
 //!   `allow_external_refs` is enabled) lifts the CLOSED barrier by importing external `RefRec`s
 //!   and remapping `DataRec` relocations and source positions.
 
-use std::alloc::Allocator;
-use std::cmp::Ordering;
-use std::convert::Infallible;
-use std::fmt;
-use std::hash::{BuildHasher, Hash, Hasher};
+use alloc::vec::Vec;
+use alloc::alloc::Allocator;
+use core::cmp::Ordering;
+use core::convert::Infallible;
+use core::fmt;
+use core::{hash::BuildHasher, hash::Hash, hash::Hasher};
 
 use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_own::Vec as OwnVec;
@@ -205,7 +206,7 @@ impl fmt::Display for InlineError {
     }
 }
 
-impl std::error::Error for InlineError {}
+impl core::error::Error for InlineError {}
 
 /// `view` (the body `root`) with its trivial sites spliced, the callees found through
 /// `bodies`, within `bound`, in `alloc`.

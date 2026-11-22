@@ -2,8 +2,8 @@
 //! computed over a LIR [`View`] to drive cost-model inlining, specialization scoring, and
 //! incremental ThinLTO early cutoff.
 
-use std::alloc::Allocator;
-use std::convert::Infallible;
+use alloc::alloc::Allocator;
+use core::convert::Infallible;
 
 use blaze_own::Vec;
 

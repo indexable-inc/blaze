@@ -2,7 +2,9 @@
 //! parsed is the same bytes; text written by hand is any function the grammar spells, which
 //! the verifier then judges (`parse` checks the text, not what it means).
 
-use std::{alloc::Global, fmt};
+use alloc::{borrow::ToOwned, string::String, string::ToString, vec::Vec};
+use core::fmt;
+use alloc::alloc::Global;
 
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
@@ -36,9 +38,9 @@ impl fmt::Display for ParseError {
     }
 }
 
-impl std::error::Error for ParseError {}
+impl core::error::Error for ParseError {}
 
-type Result<T> = std::result::Result<T, ParseError>;
+type Result<T> = core::result::Result<T, ParseError>;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Tok<'a> {
@@ -181,7 +183,7 @@ impl<'t, 'a> Line<'t, 'a> {
         Err(self.err("a quoted string"))
     }
 
-    fn number<T: std::str::FromStr>(&mut self, what: &'static str) -> Result<T> {
+    fn number<T: core::str::FromStr>(&mut self, what: &'static str) -> Result<T> {
         let at = self.at;
         let word = self.word(what)?;
         word.parse().map_err(|_| {

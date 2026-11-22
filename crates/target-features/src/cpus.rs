@@ -8,9 +8,10 @@
 //! `tools/cpus.py` writes from harness/answers.py's record of the pinned nightly and
 //! `llvm_cpus.json`.
 
+use alloc::{borrow::ToOwned, string::String};
 mod table;
 
-use std::fmt;
+use core::fmt;
 
 /// One target's CPUs.
 pub struct Cpus {

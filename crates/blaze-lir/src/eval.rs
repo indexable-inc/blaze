@@ -24,7 +24,8 @@
 //! an outcome ([`Outcome::Undefined`]): a comparison of two backends says nothing of a case
 //! with one. Fuel bounds every run.
 
-use std::alloc::Allocator;
+use alloc::vec::Vec;
+use alloc::alloc::Allocator;
 
 pub use crate::arith::Trap;
 use crate::{
@@ -115,8 +116,8 @@ pub enum EvalError {
     Depth { inst: usize },
 }
 
-impl std::fmt::Display for EvalError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for EvalError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match *self {
             EvalError::Unsupported { inst, op, what } => {
                 write!(f, "instruction {inst} (`{}`): the evaluator does not model {what}", op.name())
@@ -134,7 +135,7 @@ impl std::fmt::Display for EvalError {
     }
 }
 
-impl std::error::Error for EvalError {}
+impl core::error::Error for EvalError {}
 
 /// One run of a function and the functions it calls: the running body's view and values,
 /// every frame's slots, and the callers waiting on a call.

@@ -12,7 +12,9 @@
 //! once measured (docs/v2/plan/design/lir.md, open question 3): this is the record that is kept
 //! then, and what the round-trip tests hold to its bytes now.
 
-use std::{alloc::Global, mem::offset_of};
+use alloc::vec::Vec;
+use core::mem::offset_of;
+use alloc::alloc::Global;
 
 use blaze_format::{
     FormatError, Part, Persist, Placed, Record, SchemaHash, Slice, Writer, WriterIn, open_as, schema_of,
@@ -89,8 +91,8 @@ pub enum ReadError {
     Structure(VerifyError),
 }
 
-impl std::fmt::Display for ReadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ReadError::Format(error) => write!(f, "not a kept LIR: {error}"),
             ReadError::Structure(error) => write!(f, "a kept LIR that is not a function: {error}"),
@@ -98,7 +100,7 @@ impl std::fmt::Display for ReadError {
     }
 }
 
-impl std::error::Error for ReadError {}
+impl core::error::Error for ReadError {}
 
 /// `view` written into `out`, a writer of [`SCHEMA`]: where its root is.
 pub fn write<P: WriterIn>(view: &View<'_>, out: &mut Writer<P>) -> u64 {

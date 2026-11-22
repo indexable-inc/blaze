@@ -1,6 +1,7 @@
 //! The frame: which locals are values and which are memory, the function's signature, its entry
 //! block and the parameters of every body block (lib.rs, "The frame" and "Block parameters").
 
+use alloc::vec::Vec;
 use core::alloc::Allocator;
 
 use blaze_body::{Block as BodyBlock, BlockKind as BodyKind, Local, LocalKind, Place, Proj, StmtKind, Value as BodyValue};

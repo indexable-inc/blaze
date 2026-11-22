@@ -1,0 +1,32 @@
+[package]
+name = "blaze-bstd-convert"
+description = "Sans-IO Rust-to-bstd converter and explicit state-machine compiler: replaces std and third-party crates with bstd/blaze-* toward zero external deps, compiles imperative/async IO into sans-IO state machines with exact live-variable analysis, and drives structured user decisions"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[[bin]]
+name = "blaze-bstd-convert"
+path = "src/bin/blaze-bstd-convert.rs"
+
+[dependencies]
+# Full lossless Rust 2024 CST/AST parser (zero third-party deps).
+syntax.workspace = true
+# Strict TOML 1.0 parser and lossless manifest editor (zero third-party deps).
+blaze-toml.workspace = true
+# Strict RFC 8259 JSON parser/writer and format-neutral Value (zero third-party deps).
+blaze-data.workspace = true
+blaze-json.workspace = true
+# Explicit-allocator containers used by blaze-toml / blaze-json / blaze-data.
+blaze-own = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

@@ -12,7 +12,8 @@
 //! accumulator slot, which the last block returns, so a wrong value anywhere shows. Division
 //! by zero traps and every tier must trap alike.
 
-use std::alloc::Global;
+use alloc::{format, string::String, string::ToString, vec, vec::Vec};
+use alloc::alloc::Global;
 
 use blaze_format::Aligned;
 use blaze_sim::{Broke, Config, Tape};
@@ -297,7 +298,7 @@ impl Gen {
         let attrs = MemAttrs::aligned(3);
         let mut acc = self.b.load(Ty::I64, Flags::NONE, self.acc, 0, attrs);
         let mix = self.b.iconst(Ty::I64, MIX);
-        for value in std::mem::take(&mut self.made) {
+        for value in core::mem::take(&mut self.made) {
             let bits = self.b.ty(value).bits(64);
             let wide = match bits {
                 64 => value,

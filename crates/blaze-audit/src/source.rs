@@ -19,8 +19,9 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::alloc::Global;
-use std::fmt;
+use alloc::{borrow::ToOwned, string::String, string::ToString, vec::Vec};
+use alloc::alloc::Global;
+use core::fmt;
 
 use blaze_fetch::{Algo, Digest};
 

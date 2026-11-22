@@ -68,8 +68,9 @@
 //! Owed: debug rows of kept slots (a `VarRec` names a slot; a kept local needs "the state
 //! plus an offset"), so the outputs drop them.
 
-use std::alloc::Allocator;
-use std::fmt;
+use alloc::vec::Vec;
+use alloc::alloc::Allocator;
+use core::fmt;
 
 use crate::{
     Block, Func, Op, Ty, Value, View,
@@ -309,7 +310,7 @@ impl fmt::Display for CoroutineError {
     }
 }
 
-impl std::error::Error for CoroutineError {}
+impl core::error::Error for CoroutineError {}
 
 /// Splits the coroutine body `view` into its `poll`, its state's `drop` and the state's
 /// layout, every buffer in `alloc`.

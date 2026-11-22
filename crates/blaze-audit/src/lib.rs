@@ -17,10 +17,13 @@
 //! [`audit`] puts them together into one [`report::Report`]: one finding per (package
 //! version, reason), in a fixed order, as text or as JSON under [`report::VERSION`].
 
+#![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 
+
+extern crate alloc;
 pub mod advisory;
 pub mod audit;
 pub mod date;
