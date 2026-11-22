@@ -37,7 +37,7 @@ use crate::{
     questions::{AllocStrategy, CInteropChoice, ComptimeChoice, Decisions, DepChoice, SmLiftMode},
     sm_compiler::{
         SmAllocMode, compile_file_functions_opts, compile_struct_sm, generate_blaze_c_toml_section,
-        generate_c_interop_scaffold, generate_comptime_scaffold, generate_newtypes_scaffold,
+        generate_c_interop_scaffold, generate_comptime_scaffold, write_newtypes_scaffold,
     },
 };
 
@@ -130,7 +130,7 @@ pub fn convert_workspace(
     let mut total_c_interop_scaffolds = 0usize;
     let mut total_newtype_scaffolds = 0usize;
 
-    let mut ws_files: Vec<(usize, String, String, String)> = Vec::new();
+    let mut ws_files: Vec<WorkspaceFile> = Vec::new();
     for krate in &analysis.crates {
         if let Some(filter) = only_crates {
             if !filter.contains(&krate.name) {
@@ -142,7 +142,12 @@ pub fn convert_workspace(
         let crate_ident = krate.name.replace('-', "_");
         for rs_path in &krate.rs_files {
             if let Some(src) = out_files.get(rs_path).cloned() {
-                ws_files.push((summary_idx, crate_ident.clone(), rs_path.clone(), src));
+                ws_files.push(WorkspaceFile {
+                    summary_idx,
+                    crate_ident: crate_ident.clone(),
+                    path: rs_path.clone(),
+                    src,
+                });
             }
         }
         if summary.external_deps_before == 0 {
@@ -172,15 +177,16 @@ pub fn convert_workspace(
     let alloc_strategy = decisions.alloc_strategy();
     let mut total_parameterized_structs = 0usize;
     if alloc_strategy == AllocStrategy::ExplicitAllocHandle && decisions.parameterize_struct_fields() {
-        for (summary_idx, _, rs_path, src) in &mut ws_files {
-            if rs_path == "build.rs" || rs_path.ends_with("/build.rs") {
+        for wf in &mut ws_files {
+            if wf.path == "build.rs" || wf.path.ends_with("/build.rs") {
                 continue;
             }
-            let (updated, structs_changed, edit_count) = rewrite_struct_alloc_fields(src);
-            if structs_changed > 0 {
-                *src = updated;
-                total_parameterized_structs += structs_changed;
-                crate_summaries[*summary_idx].ast_edits_applied += edit_count;
+            let mut updated = String::new();
+            let stats = rewrite_struct_alloc_fields_into(&wf.src, &mut updated);
+            if stats.structs_changed > 0 {
+                wf.src = updated;
+                total_parameterized_structs += stats.structs_changed;
+                crate_summaries[wf.summary_idx].ast_edits_applied += stats.edits_applied;
             }
         }
     }
@@ -188,13 +194,15 @@ pub fn convert_workspace(
     // SOTA 1 (Pass B): whole-workspace cross-crate call-graph fixpoint threading `alloc` / `cx` /
     // `clock` / `env` / `rng`, explicit allocator lifetimes & return types, and intra- + cross-crate
     // call-site argument forwarding.
-    let (per_crate_edits, total_cross_crate_call_rewrites) =
-        propagate_and_rewrite_workspace_capabilities(&mut ws_files, alloc_strategy);
-    for (summary_idx, edits) in per_crate_edits {
-        crate_summaries[summary_idx].ast_edits_applied += edits;
-    }
-    for (_, _, rs_path, src) in ws_files {
-        out_files.insert(rs_path, src);
+    let total_cross_crate_call_rewrites = propagate_and_rewrite_workspace_capabilities(
+        &mut ws_files,
+        alloc_strategy,
+        &mut |summary_idx, edits| {
+            crate_summaries[summary_idx].ast_edits_applied += edits;
+        },
+    );
+    for wf in ws_files {
+        out_files.insert(wf.path, wf.src);
     }
 
     ConversionResult {
@@ -395,7 +403,8 @@ fn convert_one_crate(
 
     let mut newtype_scaffold_generated = false;
     if !krate.newtype_candidates.is_empty() && decisions.emit_newtypes_module() {
-        let scaffold = generate_newtypes_scaffold(&krate.name, &krate.newtype_candidates);
+        let mut scaffold = String::new();
+        write_newtypes_scaffold(&krate.name, &krate.newtype_candidates, &mut scaffold);
         let path = if krate.dir.is_empty() {
             "src/newtypes.rs".to_owned()
         } else {
@@ -954,10 +963,19 @@ pub fn rewrite_rust_source(
 ) -> (String, usize, bool) {
     let (pass_a, count_a, has_remaining_std) =
         rewrite_rust_source_expressions(src, crate_rewrites, alloc_strategy);
-    let mut bufs = vec![(0usize, "local".to_owned(), "src/lib.rs".to_owned(), pass_a)];
-    let (per_crate, _) = propagate_and_rewrite_workspace_capabilities(&mut bufs, alloc_strategy);
-    let count_b = per_crate.get(&0).copied().unwrap_or(0);
-    (bufs.into_iter().next().map(|(_, _, _, s)| s).unwrap_or_default(), count_a + count_b, has_remaining_std)
+    let mut bufs = vec![WorkspaceFile {
+        summary_idx: 0,
+        crate_ident: "local".to_owned(),
+        path: "src/lib.rs".to_owned(),
+        src: pass_a,
+    }];
+    let mut count_b = 0usize;
+    let _ = propagate_and_rewrite_workspace_capabilities(
+        &mut bufs,
+        alloc_strategy,
+        &mut |_, edits| count_b += edits,
+    );
+    (bufs.into_iter().next().map(|wf| wf.src).unwrap_or_default(), count_a + count_b, has_remaining_std)
 }
 
 /// Pass A: rewrite paths, grouped `use`, direct implicit-alloc expressions, and direct capability
@@ -1412,13 +1430,28 @@ struct FnCapInfo {
     method_callees: BTreeSet<String>,
 }
 
+/// One workspace Rust source file buffered for whole-workspace Pass B propagation.
+struct WorkspaceFile {
+    summary_idx: usize,
+    crate_ident: String,
+    path: String,
+    src: String,
+}
+
+/// Named result of [`rewrite_struct_alloc_fields_into`] (`newtypes-and-named-returns`, rule 85).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StructAllocStats {
+    pub structs_changed: usize,
+    pub edits_applied: usize,
+}
+
 /// Extract `use other_crate::...::item [as alias];` imports in a file for cross-crate call resolution.
 fn collect_cross_crate_imports(
     root: &ast::SourceFile,
-    known_crates: &BTreeSet<String>,
+    known_crates: &[&str],
     own_crate: &str,
-) -> BTreeMap<String, (String, String)> {
-    let mut map = BTreeMap::new();
+    emit: &mut impl FnMut(&str, &str, &str),
+) {
     for node in root.syntax().descendants() {
         if node.kind() != SyntaxKind::USE {
             continue;
@@ -1435,7 +1468,7 @@ fn collect_cross_crate_imports(
             let cleaned = path_part.strip_prefix("::").unwrap_or(path_part);
             let mut segs = cleaned.split("::");
             let Some(first) = segs.next() else { continue };
-            if first == own_crate || !known_crates.contains(first) {
+            if first == own_crate || !known_crates.contains(&first) {
                 continue;
             }
             let Some(last) = cleaned.rsplit("::").next() else { continue };
@@ -1443,10 +1476,9 @@ fn collect_cross_crate_imports(
                 continue;
             }
             let local_name = alias_part.unwrap_or(last);
-            map.insert(local_name.to_owned(), (first.to_owned(), last.to_owned()));
+            emit(local_name, first, last);
         }
     }
-    map
 }
 
 /// Pass B (SOTA 1): whole-workspace cross-crate call-graph fixpoint that:
@@ -1459,12 +1491,15 @@ fn collect_cross_crate_imports(
 /// 4. Forwards the added arguments at every intra-crate and cross-crate call site (passing
 ///    `bstd::mem::Alloc::global()` at `main` / `#[test]` root boundaries).
 ///
-/// Returns `(per_summary_edit_counts, cross_crate_call_rewrites)`.
+/// Invokes `on_crate_edit(summary_idx, edits)` for each modified file and returns the total
+/// cross-crate call-site rewrites applied.
 fn propagate_and_rewrite_workspace_capabilities(
-    files: &mut [(usize, String, String, String)],
+    files: &mut [WorkspaceFile],
     alloc_strategy: AllocStrategy,
-) -> (BTreeMap<usize, usize>, usize) {
-    let known_crates: BTreeSet<String> = files.iter().map(|(_, c, _, _)| c.clone()).collect();
+    on_crate_edit: &mut impl FnMut(usize, usize),
+) -> usize {
+    let known_crates: BTreeSet<String> = files.iter().map(|wf| wf.crate_ident.clone()).collect();
+    let known_crates_slice: Vec<&str> = known_crates.iter().map(String::as_str).collect();
 
     // 1. Collect all threadable functions & per-file cross-crate imports across the workspace.
     let mut fns: Vec<FnCapInfo> = Vec::new();
@@ -1473,14 +1508,26 @@ fn propagate_and_rewrite_workspace_capabilities(
     let mut method_counts: BTreeMap<(usize, String), usize> = BTreeMap::new();
     let mut pub_fn_counts: BTreeMap<(String, String), usize> = BTreeMap::new();
 
-    for (file_idx, (summary_idx, crate_ident, path, src)) in files.iter().enumerate() {
+    for (file_idx, wf) in files.iter().enumerate() {
+        let summary_idx = &wf.summary_idx;
+        let crate_ident = &wf.crate_ident;
+        let path = &wf.path;
+        let src = &wf.src;
         if path == "build.rs" || path.ends_with("/build.rs") {
             file_imports.push(BTreeMap::new());
             continue;
         }
         let parse = SourceFile::parse(src, Edition::CURRENT);
         let root = parse.tree();
-        let imports = collect_cross_crate_imports(&root, &known_crates, crate_ident);
+        let mut imports: BTreeMap<String, (String, String)> = BTreeMap::new();
+        collect_cross_crate_imports(
+            &root,
+            &known_crates_slice,
+            crate_ident,
+            &mut |local, krate, item| {
+                imports.insert(local.to_owned(), (krate.to_owned(), item.to_owned()));
+            },
+        );
         for node in root.syntax().descendants() {
             let Some(func) = ast::Fn::cast(node) else { continue };
             if !is_threadable_fn(&func) {
@@ -1628,14 +1675,17 @@ fn propagate_and_rewrite_workspace_capabilities(
     }
 
     if added_by_fn.is_empty() {
-        return (BTreeMap::new(), 0);
+        return 0;
     }
 
     // 3. Emit signature edits + intra-crate & cross-crate call-site argument forwarding.
-    let mut per_crate_edits: BTreeMap<usize, usize> = BTreeMap::new();
     let mut cross_crate_rewrites = 0usize;
 
-    for (file_idx, (summary_idx, crate_ident, path, src)) in files.iter_mut().enumerate() {
+    for (file_idx, wf) in files.iter_mut().enumerate() {
+        let summary_idx = &wf.summary_idx;
+        let crate_ident = &wf.crate_ident;
+        let path = &wf.path;
+        let src = &mut wf.src;
         if path == "build.rs" || path.ends_with("/build.rs") {
             continue;
         }
@@ -1791,12 +1841,12 @@ fn propagate_and_rewrite_workspace_capabilities(
         }
 
         if !edits.is_empty() {
-            *per_crate_edits.entry(*summary_idx).or_default() += edits.len();
+            on_crate_edit(*summary_idx, edits.len());
             *src = apply_span_edits(src, edits);
         }
     }
 
-    (per_crate_edits, cross_crate_rewrites)
+    cross_crate_rewrites
 }
 
 /// SOTA 2: Parameterize plain owned-heap structs (`struct Foo { items: Vec<String>, ... }`) with
@@ -1805,8 +1855,11 @@ fn propagate_and_rewrite_workspace_capabilities(
 ///
 /// Skips `#[repr(C)]`, `#[repr(transparent)]`, `Serialize`/`Deserialize`/`Copy` derives, structs
 /// already carrying `'a` or an `Allocator` parameter, and `#[cfg(test)]` items.
-/// Returns `(rewritten_source, structs_parameterized, ast_edits_applied)`.
-pub fn rewrite_struct_alloc_fields(src: &str) -> (String, usize, usize) {
+/// Writes the rewritten source into `out` and returns [`StructAllocStats`].
+pub fn rewrite_struct_alloc_fields_into(
+    src: &str,
+    out: &mut impl core::fmt::Write,
+) -> StructAllocStats {
     let parse = SourceFile::parse(src, Edition::CURRENT);
     let root = parse.tree();
     let mut edits: Vec<SpanEdit> = Vec::new();
@@ -1886,7 +1939,8 @@ pub fn rewrite_struct_alloc_fields(src: &str) -> (String, usize, usize) {
     }
 
     if parameterized_structs.is_empty() {
-        return (src.to_owned(), 0, 0);
+        let _ = out.write_str(src);
+        return StructAllocStats::default();
     }
 
     // 2. Update matching inherent `impl` blocks in the same file (`impl Foo` -> `impl<'a> Foo<'a>`).
@@ -1935,9 +1989,11 @@ pub fn rewrite_struct_alloc_fields(src: &str) -> (String, usize, usize) {
         });
     }
 
-    let edit_count = edits.len();
-    let count_structs = parameterized_structs.len();
-    (apply_span_edits(src, edits), count_structs, edit_count)
+    let edits_applied = edits.len();
+    let structs_changed = parameterized_structs.len();
+    let rewritten = apply_span_edits(src, edits);
+    let _ = out.write_str(&rewritten);
+    StructAllocStats { structs_changed, edits_applied }
 }
 
 fn format_forwarded_args(

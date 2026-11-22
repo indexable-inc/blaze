@@ -477,7 +477,9 @@ pub fn analyze_workspace(snapshot: &WorkspaceSnapshot) -> WorkspaceAnalysis {
                 }
                 analyze_c_interop_src_markers(rs_path, src, &mut c_interop);
                 if !rs_path.ends_with("/build.rs") && rs_path != "build.rs" {
-                    analyze_newtype_candidates_in_file(rs_path, src, &mut newtype_candidates);
+                    analyze_newtype_candidates_in_file(rs_path, src, &mut |c| {
+                        newtype_candidates.push(c);
+                    });
                 }
                 analyze_rs_file(
                     rs_path,
@@ -1294,7 +1296,7 @@ fn is_bare_int_type(ty: &str) -> bool {
 fn analyze_newtype_candidates_in_file(
     file_path: &str,
     src: &str,
-    out: &mut Vec<NewtypeCandidate>,
+    emit: &mut impl FnMut(NewtypeCandidate),
 ) {
     let parse = SourceFile::parse(src, Edition::CURRENT);
     let root = parse.tree();
@@ -1307,7 +1309,7 @@ fn analyze_newtype_candidates_in_file(
                 let owner = format!("fn {}", fname.text());
                 let line = line_of_offset(src, node.text_range().start().into());
                 let Some(plist) = func.param_list() else { continue };
-                let mut pairs: Vec<(String, String)> = Vec::new();
+                let mut owned_pairs: Vec<(String, String)> = Vec::new();
                 for p in plist.params() {
                     let Some(pat) = p.pat() else { continue };
                     let Some(ty) = p.ty() else { continue };
@@ -1315,10 +1317,12 @@ fn analyze_newtype_candidates_in_file(
                     let pname = pname.trim().trim_start_matches("mut ").trim().to_owned();
                     let ty_txt = ty.syntax().text().to_string().trim().to_owned();
                     if is_bare_int_type(&ty_txt) {
-                        pairs.push((pname, ty_txt));
+                        owned_pairs.push((pname, ty_txt));
                     }
                 }
-                classify_primitive_pairs(file_path, line, &owner, &pairs, out);
+                let borrowed: Vec<(&str, &str)> =
+                    owned_pairs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+                classify_primitive_pairs(file_path, line, &owner, &borrowed, emit);
             }
             SyntaxKind::STRUCT => {
                 let Some(st) = ast::Struct::cast(node.clone()) else { continue };
@@ -1326,16 +1330,18 @@ fn analyze_newtype_candidates_in_file(
                 let owner = format!("struct {}", sname.text());
                 let line = line_of_offset(src, node.text_range().start().into());
                 let Some(ast::FieldList::RecordFieldList(rfl)) = st.field_list() else { continue };
-                let mut pairs: Vec<(String, String)> = Vec::new();
+                let mut owned_pairs: Vec<(String, String)> = Vec::new();
                 for f in rfl.fields() {
                     let Some(fname) = f.name() else { continue };
                     let Some(ty) = f.ty() else { continue };
                     let ty_txt = ty.syntax().text().to_string().trim().to_owned();
                     if is_bare_int_type(&ty_txt) {
-                        pairs.push((fname.text().to_string(), ty_txt));
+                        owned_pairs.push((fname.text().to_string(), ty_txt));
                     }
                 }
-                classify_primitive_pairs(file_path, line, &owner, &pairs, out);
+                let borrowed: Vec<(&str, &str)> =
+                    owned_pairs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+                classify_primitive_pairs(file_path, line, &owner, &borrowed, emit);
             }
             _ => {}
         }
@@ -1346,60 +1352,62 @@ fn classify_primitive_pairs(
     file_path: &str,
     line: usize,
     owner: &str,
-    pairs: &[(String, String)],
-    out: &mut Vec<NewtypeCandidate>,
+    pairs: &[(&str, &str)],
+    emit: &mut impl FnMut(NewtypeCandidate),
 ) {
     let has_offset = pairs
         .iter()
-        .any(|(n, _)| matches!(n.as_str(), "offset" | "byte_offset" | "start" | "pos") || n.ends_with("_offset"));
+        .any(|&(n, _)| matches!(n, "offset" | "byte_offset" | "start" | "pos") || n.ends_with("_offset"));
     let has_len = pairs
         .iter()
-        .any(|(n, _)| matches!(n.as_str(), "len" | "length" | "byte_len" | "size" | "end") || n.ends_with("_len"));
+        .any(|&(n, _)| matches!(n, "len" | "length" | "byte_len" | "size" | "end") || n.ends_with("_len"));
     if has_offset && has_len {
         let raw_ty = pairs
             .iter()
-            .find(|(n, _)| matches!(n.as_str(), "offset" | "byte_offset" | "start" | "pos") || n.ends_with("_offset"))
-            .map(|(_, t)| t.clone())
-            .unwrap_or_else(|| "usize".to_owned());
+            .find(|&&(n, _)| matches!(n, "offset" | "byte_offset" | "start" | "pos") || n.ends_with("_offset"))
+            .map(|&(_, t)| t)
+            .unwrap_or("usize");
         let suggestion = if raw_ty == "u32" {
             "bstd::newtype::{TextOffset, TextLen, TextSpan}".to_owned()
         } else {
             "bstd::newtype::{ByteOffset, ByteLen, ByteSpan}".to_owned()
         };
-        out.push(NewtypeCandidate {
+        emit(NewtypeCandidate {
             file: file_path.to_owned(),
             line,
             owner: owner.to_owned(),
             name: "offset/len".to_owned(),
-            raw_type: raw_ty,
+            raw_type: raw_ty.to_owned(),
             kind: NewtypeKind::AffineOffsetLen,
             suggestion,
         });
     }
 
-    for (name, ty) in pairs {
+    for &(name, ty) in pairs {
         if name.ends_with("_id") && name.len() > 3 {
+            let mut pascal = String::with_capacity(name.len());
+            write_pascal_id(name, &mut pascal);
             let suggestion = if ty == "u32" {
-                format!("bstd::id::id! {{ pub struct {}; }}", to_pascal_id(name))
+                format!("bstd::id::id! {{ pub struct {pascal}; }}")
             } else {
-                format!("bstd::newtype! {{ opaque pub struct {}({ty}); }}", to_pascal_id(name))
+                format!("bstd::newtype! {{ opaque pub struct {pascal}({ty}); }}")
             };
-            out.push(NewtypeCandidate {
+            emit(NewtypeCandidate {
                 file: file_path.to_owned(),
                 line,
                 owner: owner.to_owned(),
-                name: name.clone(),
-                raw_type: ty.clone(),
+                name: name.to_owned(),
+                raw_type: ty.to_owned(),
                 kind: NewtypeKind::TypedId,
                 suggestion,
             });
         } else if (name == "port" || name.ends_with("_port")) && ty == "u16" {
-            out.push(NewtypeCandidate {
+            emit(NewtypeCandidate {
                 file: file_path.to_owned(),
                 line,
                 owner: owner.to_owned(),
-                name: name.clone(),
-                raw_type: ty.clone(),
+                name: name.to_owned(),
+                raw_type: ty.to_owned(),
                 kind: NewtypeKind::OpaquePort,
                 suggestion: "bstd::newtype::Port".to_owned(),
             });
@@ -1409,22 +1417,22 @@ fn classify_primitive_pairs(
             || name.ends_with("_secs")
             || name == "timeout_ms"
         {
-            out.push(NewtypeCandidate {
+            emit(NewtypeCandidate {
                 file: file_path.to_owned(),
                 line,
                 owner: owner.to_owned(),
-                name: name.clone(),
-                raw_type: ty.clone(),
+                name: name.to_owned(),
+                raw_type: ty.to_owned(),
                 kind: NewtypeKind::DurationUnit,
                 suggestion: "core::time::Duration".to_owned(),
             });
-        } else if matches!(name.as_str(), "align" | "alignment") && matches!(ty.as_str(), "usize" | "u64") {
-            out.push(NewtypeCandidate {
+        } else if matches!(name, "align" | "alignment") && matches!(ty, "usize" | "u64") {
+            emit(NewtypeCandidate {
                 file: file_path.to_owned(),
                 line,
                 owner: owner.to_owned(),
-                name: name.clone(),
-                raw_type: ty.clone(),
+                name: name.to_owned(),
+                raw_type: ty.to_owned(),
                 kind: NewtypeKind::AlignmentPow2,
                 suggestion: "bstd::newtype::Alignment".to_owned(),
             });
@@ -1432,18 +1440,16 @@ fn classify_primitive_pairs(
     }
 }
 
-fn to_pascal_id(snake: &str) -> String {
-    let mut out = String::with_capacity(snake.len());
+fn write_pascal_id(snake: &str, out: &mut impl core::fmt::Write) {
     let mut cap = true;
     for c in snake.chars() {
         if c == '_' {
             cap = true;
         } else if cap {
-            out.push(c.to_ascii_uppercase());
+            let _ = out.write_char(c.to_ascii_uppercase());
             cap = false;
         } else {
-            out.push(c);
+            let _ = out.write_char(c);
         }
     }
-    out
 }

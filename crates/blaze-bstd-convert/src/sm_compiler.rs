@@ -2834,11 +2834,14 @@ pub fn generate_c_interop_scaffold(crate_name: &str, info: &CInteropInfo) -> Str
     out
 }
 
-/// Generate a `#![no_std]` `src/newtypes.rs` module promoting bare domain primitives (`offset`/`len`,
+/// Write a `#![no_std]` `src/newtypes.rs` module promoting bare domain primitives (`offset`/`len`,
 /// `*_id`, `port`, `*_ms`, `align`) into explicit `bstd::newtype!` / `bstd::id::id!` types
 /// (affine `Offset`/`Len` algebra, zero blanket `Deref`, composable with `bstd::TypeSet!`).
-pub fn generate_newtypes_scaffold(crate_name: &str, candidates: &[NewtypeCandidate]) -> String {
-    let mut out = String::new();
+pub fn write_newtypes_scaffold(
+    crate_name: &str,
+    candidates: &[NewtypeCandidate],
+    out: &mut impl core::fmt::Write,
+) {
     let _ = writeln!(
         out,
         "//! Explicit zero-cost domain newtypes for `{crate_name}` (`bstd::newtype!`, rules 76 & 85)."
@@ -2917,8 +2920,6 @@ pub fn generate_newtypes_scaffold(crate_name: &str, candidates: &[NewtypeCandida
             c.file, c.line, c.owner, c.name, c.raw_type, c.suggestion
         );
     }
-
-    out
 }
 
 pub fn to_pascal_case(s: &str) -> String {

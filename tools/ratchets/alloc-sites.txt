@@ -10,7 +10,7 @@ blaze-alloc-count	0	0	0	2
 blaze-audit	0	0	137	27
 blaze-bench	0	0	0	12
 blaze-blake3	0	0	0	8
-blaze-bstd-convert	0	0	0	70
+blaze-bstd-convert	0	0	0	69
 blaze-build	0	0	14	1
 blaze-build-script	0	0	0	11
 blaze-bytes	0	0	0	3
