@@ -2,7 +2,7 @@
 //! and stores, the LSE atomics when the core has them ([`crate::Isa::lse`]), else (and for
 //! `nand`) an exclusive load and store retried until the store keeps its reservation.
 
-use std::alloc::Allocator;
+use alloc::alloc::Allocator;
 
 use blaze_lir::{AtomicRmw, Op, Ordering, Value, func::NONE};
 

@@ -412,8 +412,8 @@ impl<A: Allocator + Clone> Table<A> {
     /// line): the lock's `pin`, then ` corrected <row digest>` when a row applies, so the
     /// module key changes when the row does. The one home of that line: the interim builder and
     /// blaze-proc-macro's `LockedPackages::closure` both call it.
-    pub fn pin(&self, name: &str, version: &str, pin: &str) -> std::string::String {
-        let mut out = std::string::String::from(pin);
+    pub fn pin(&self, name: &str, version: &str, pin: &str) -> alloc::string::String {
+        let mut out = alloc::string::String::from(pin);
         if let Some(row) = self.find_text(name, version) {
             out.push_str(" corrected ");
             for byte in row.digest() {

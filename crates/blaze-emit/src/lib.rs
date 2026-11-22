@@ -177,10 +177,14 @@
 //! Anything outside the subset is [`EmitError::Unsupported`], naming the instruction: never a
 //! guess.
 
+#![cfg_attr(not(test), no_std)]
 #![feature(allocator_api)]
 // quad_run_tests.rs calls emitted `f128` functions and names the routines' `f128` signatures.
 #![cfg_attr(test, feature(f128))]
 
+
+extern crate alloc;
+use alloc::vec::Vec;
 use core::alloc::Allocator;
 use core::fmt;
 
@@ -631,7 +635,7 @@ pub(crate) fn emit_reaching<A: Allocator>(
     // scalar on a copy first, in `Global` (the scratch the pass names for its own rows). Each
     // bound routine's reference row names a place the caller gave (`bound`), so `via` (one
     // entry per reference place) still covers every reference of the copy.
-    let heap = blaze_own::Erased::new(std::alloc::Global);
+    let heap = blaze_own::Erased::new(alloc::alloc::Global);
     let (legal, called) = routines::legalized(func, bound, heap.handle()).map_err(EmitError::Legalize)?;
     let func = match &legal {
         None => func,

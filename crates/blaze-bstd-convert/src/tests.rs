@@ -731,3 +731,175 @@ fn smoke_root_boundary() {
         assert!(p.errors().is_empty(), "{name} parse errors: {:?}\n{text}", p.errors());
     }
 }
+
+#[test]
+fn cross_crate_propagation_struct_alloc_parameterization_and_collect_in() {
+    let mut files = BTreeMap::new();
+    // Crate 1: `core-fmt` exports `pub fn make_id(n: u32) -> String`
+    files.insert(
+        "crates/core-fmt/Cargo.toml".to_owned(),
+        r#"[package]
+name = "core-fmt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+"#
+        .to_owned(),
+    );
+    files.insert(
+        "crates/core-fmt/src/lib.rs".to_owned(),
+        r#"pub fn make_id(n: u32) -> String {
+    format!("id-{n}")
+}
+"#
+        .to_owned(),
+    );
+
+    // Crate 2: `app` depends on `core-fmt`, calls both `core_fmt::make_id` and imported `make_id`,
+    // uses `.collect::<Vec<_>>()`, and defines both a plain heap struct and a `#[repr(C)]` struct.
+    files.insert(
+        "crates/app/Cargo.toml".to_owned(),
+        r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+core-fmt = { path = "../core-fmt" }
+"#
+        .to_owned(),
+    );
+    files.insert(
+        "crates/app/src/lib.rs".to_owned(),
+        r#"use std::collections::HashMap;
+use core_fmt::make_id;
+
+pub struct Cache {
+    pub items: Vec<String>,
+    pub counts: HashMap<String, u32>,
+}
+
+impl Cache {
+    pub fn total(&self) -> usize {
+        self.items.len()
+    }
+}
+
+#[repr(C)]
+pub struct FfiHeader {
+    pub raw: Vec<u8>,
+}
+
+pub fn collect_ids(n: u32) -> Vec<String> {
+    (0..n).map(|i| make_id(i)).collect::<Vec<_>>()
+}
+
+pub fn make_qualified(n: u32) -> String {
+    core_fmt::make_id(n)
+}
+"#
+        .to_owned(),
+    );
+
+    let snap = WorkspaceSnapshot { files };
+    let analysis = analyze_workspace(&snap);
+    let questions = build_questions(&analysis);
+    let decisions = Decisions::from_recommended(&questions);
+    let converted = convert_workspace(&snap, &analysis, &decisions, None);
+
+    assert_eq!(converted.total_parameterized_structs, 1, "only Cache (not #[repr(C)] FfiHeader) parameterized");
+    assert_eq!(converted.total_cross_crate_call_rewrites, 2, "both imported and qualified cross-crate calls forwarded");
+
+    let core_rs = converted.files.get("crates/core-fmt/src/lib.rs").expect("core-fmt/src/lib.rs");
+    let app_rs = converted.files.get("crates/app/src/lib.rs").expect("app/src/lib.rs");
+
+    assert!(
+        core_rs.contains("pub fn make_id<'a>(n: u32, alloc: bstd::mem::Alloc<'a>) -> bstd::mem::String<bstd::mem::Alloc<'a>>"),
+        "core-fmt::make_id rewritten:\n{core_rs}"
+    );
+    assert!(app_rs.contains("use bstd::vec::CollectIn as _;"), "CollectIn trait imported:\n{app_rs}");
+    assert!(app_rs.contains("pub struct Cache<'a>"), "Cache parameterized:\n{app_rs}");
+    assert!(
+        app_rs.contains("pub items: bstd::vec::Vec<bstd::mem::String<bstd::mem::Alloc<'a>>, bstd::mem::Alloc<'a>>"),
+        "Cache.items field rewritten:\n{app_rs}"
+    );
+    assert!(
+        app_rs.contains("pub counts: bstd::map::Map<bstd::mem::String<bstd::mem::Alloc<'a>>, u32, bstd::hash::FixedState, bstd::mem::Alloc<'a>>"),
+        "Cache.counts field rewritten:\n{app_rs}"
+    );
+    assert!(app_rs.contains("impl<'a> Cache<'a>"), "impl<'a> Cache<'a> updated:\n{app_rs}");
+    assert!(app_rs.contains("pub struct FfiHeader {"), "#[repr(C)] FfiHeader untouched:\n{app_rs}");
+    assert!(app_rs.contains("make_id(i, alloc)"), "imported cross-crate call forwarded:\n{app_rs}");
+    assert!(app_rs.contains(".collect_in(alloc)"), ".collect::<Vec<_>>() rewritten to .collect_in(alloc):\n{app_rs}");
+    assert!(
+        app_rs.contains("pub fn make_qualified<'a>(n: u32, alloc: bstd::mem::Alloc<'a>) -> bstd::mem::String<bstd::mem::Alloc<'a>>"),
+        "cross-crate caller signature propagated:\n{app_rs}"
+    );
+    assert!(app_rs.contains("core_fmt::make_id(n, alloc)"), "qualified cross-crate call forwarded:\n{app_rs}");
+
+    for (name, text) in [("core-fmt/src/lib.rs", core_rs), ("app/src/lib.rs", app_rs)] {
+        let p = SourceFile::parse(text, Edition::CURRENT);
+        assert!(p.errors().is_empty(), "{name} parse errors: {:?}\n{text}", p.errors());
+    }
+}
+
+#[test]
+fn detects_primitive_obsession_and_emits_explicit_newtypes_module() {
+    let mut files = BTreeMap::new();
+    files.insert(
+        "crates/netbuf/Cargo.toml".to_owned(),
+        r#"[package]
+name = "netbuf"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+"#
+        .to_owned(),
+    );
+    files.insert(
+        "crates/netbuf/src/lib.rs".to_owned(),
+        r#"pub struct FrameHeader {
+    pub offset: u64,
+    pub len: u64,
+    pub peer_id: u32,
+    pub session_id: u64,
+    pub port: u16,
+    pub timeout_ms: u64,
+    pub align: usize,
+}
+"#
+        .to_owned(),
+    );
+
+    let snap = WorkspaceSnapshot { files };
+    let analysis = analyze_workspace(&snap);
+    assert!(
+        analysis.total_newtype_candidates >= 5,
+        "expected offset/len, peer_id, session_id, port, timeout_ms, align; got {}",
+        analysis.total_newtype_candidates
+    );
+
+    let questions = build_questions(&analysis);
+    let q = questions
+        .iter()
+        .find(|q| q.id == "newtype:promote_primitives")
+        .expect("newtype promotion question");
+    assert_eq!(q.default_key(), "emit_newtypes_module");
+
+    let decisions = Decisions::from_recommended(&questions);
+    let converted = convert_workspace(&snap, &analysis, &decisions, None);
+    assert_eq!(converted.total_newtype_scaffolds, 1);
+
+    let nt_rs = converted.files.get("crates/netbuf/src/newtypes.rs").expect("src/newtypes.rs");
+    assert!(nt_rs.contains("ByteOffset"), "ByteOffset re-exported:\n{nt_rs}");
+    assert!(nt_rs.contains("ByteLen"), "ByteLen re-exported:\n{nt_rs}");
+    assert!(nt_rs.contains("Alignment"), "Alignment re-exported:\n{nt_rs}");
+    assert!(nt_rs.contains("Port"), "Port re-exported:\n{nt_rs}");
+    assert!(nt_rs.contains("bstd::id::id!"), "u32 peer_id -> bstd::id::id!:\n{nt_rs}");
+    assert!(nt_rs.contains("pub struct PeerId;"), "PeerId declared:\n{nt_rs}");
+    assert!(nt_rs.contains("opaque pub struct SessionId(u64);"), "u64 session_id -> opaque newtype:\n{nt_rs}");
+    let p = SourceFile::parse(nt_rs, Edition::CURRENT);
+    assert!(p.errors().is_empty(), "newtypes.rs parse errors: {:?}\n{nt_rs}", p.errors());
+}

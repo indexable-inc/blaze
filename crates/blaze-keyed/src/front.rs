@@ -34,6 +34,7 @@
 
 #![blaze::sans_io]
 
+use alloc::vec::Vec;
 use core::alloc::Allocator;
 
 use blaze_format::Aligned;

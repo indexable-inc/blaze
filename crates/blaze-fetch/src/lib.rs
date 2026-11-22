@@ -27,9 +27,12 @@
 //! crate's folder, no link out, no two names one on a caseless disk); only then is a record
 //! made, and only a made record is put.
 
+#![cfg_attr(not(test), no_std)]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 
+
+extern crate alloc;
 mod casefold;
 pub mod correct;
 pub mod digest;

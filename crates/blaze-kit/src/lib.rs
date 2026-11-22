@@ -72,6 +72,8 @@ extern crate std;
 // found.
 #[macro_use]
 mod id;
+#[macro_use]
+pub mod newtype;
 mod error;
 
 pub mod chunked;

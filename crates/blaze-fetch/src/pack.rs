@@ -80,7 +80,7 @@ pub enum PackRefused {
     /// The listing's rules ([`crate::tree`]).
     Tree(TreeRefused),
     /// A link whose target leaves the folder.
-    LinkOut { path: std::string::String },
+    LinkOut { path: alloc::string::String },
     Alloc(AllocFailure),
     /// Bytes that are not a record: the part that is wrong.
     Form { why: &'static str },
@@ -325,7 +325,7 @@ impl<'a, S: Sink> Builder<'a, S> {
     pub fn finish(mut self) -> Result<S, PackRefused> {
         let data = &self.out.bytes()[HEADER..];
         // The listing's rules and its digest, over the files as the tree module knows them.
-        let mut entries: std::vec::Vec<tree::Entry> = std::vec::Vec::with_capacity(self.rows.len()); // alloc: the listing's own form, once a record
+        let mut entries: alloc::vec::Vec<tree::Entry> = alloc::vec::Vec::with_capacity(self.rows.len()); // alloc: the listing's own form, once a record
         for row in self.rows.iter_mut() {
             let path = path_of(&self.paths, row);
             let bytes = data_of(data, row);

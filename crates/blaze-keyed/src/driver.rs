@@ -125,10 +125,12 @@
 
 #![blaze::sans_io]
 
+use alloc::vec::Vec;
 mod program;
 
 use core::alloc::Allocator;
-use std::{alloc::Global, collections::VecDeque, marker::PhantomData};
+use core::marker::PhantomData;
+use alloc::{alloc::Global, collections::VecDeque};
 
 use blaze_format::Aligned;
 use blaze_ids::ContentId;

@@ -3,7 +3,7 @@
 //! bit operations. Each loads its operands (zero-extended, the cell invariant), computes in
 //! whole 64-bit registers and stores a result zero-extended to its width.
 
-use std::alloc::Allocator;
+use alloc::alloc::Allocator;
 
 use blaze_lir::{Op, Value};
 

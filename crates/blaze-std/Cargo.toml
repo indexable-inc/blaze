@@ -25,6 +25,7 @@ blaze-rng.workspace = true
 # on blaze-own and blaze-blake3 alone, neither of which depends on bstd.
 blaze-roots.workspace = true
 # The facade (lib.rs, "Batteries"): each re-exported under bstd's names, none depending on bstd.
+blaze-algebra.workspace = true
 blaze-alloc-count.workspace = true
 blaze-bytes.workspace = true
 blaze-check.workspace = true

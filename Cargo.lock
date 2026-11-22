@@ -226,6 +226,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-algebra"
+version = "0.0.0"
+dependencies = [
+ "blaze-hash",
+ "blaze-math",
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-alloc-count"
 version = "0.0.0"
 
@@ -1097,6 +1107,7 @@ dependencies = [
  "blaze-mem",
  "blaze-own",
  "blaze-sim",
+ "blaze-swiss",
 ]
 
 [[package]]
@@ -1352,6 +1363,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-ids",
  "blaze-phf",
+ "blaze-swiss",
  "edition",
 ]
 
@@ -2053,6 +2065,7 @@ dependencies = [
 name = "blaze-std"
 version = "0.0.0"
 dependencies = [
+ "blaze-algebra",
  "blaze-alloc-count",
  "blaze-bytes",
  "blaze-cbor",

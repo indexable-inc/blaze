@@ -1,0 +1,26 @@
+[package]
+name = "blaze-algebra"
+description = "Zero-dependency, no_std, sans-IO symbolic algebra, memoized DAG symbolic differentiation, bounded e-graph equality saturation, symbolic equation solving, and const-fn comptime expression graphs (bstd::algebra)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-hash.workspace = true
+blaze-math.workspace = true
+blaze-own.workspace = true
+
+[dev-dependencies]
+blaze-own = { workspace = true, features = ["testing"] }
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

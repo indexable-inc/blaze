@@ -13,20 +13,13 @@
 //! - An [`Idx`] is the node's place in its shard's arena shifted past the shard bits, ored with
 //!   the shard: an index to a node is arithmetic and two acquire loads.
 
-use std::{
-    alloc::Global,
-    any::type_name,
-    fmt, hash,
-    ops::Deref,
-    ptr,
-    sync::{
-        OnceLock,
-        atomic::{AtomicU32, Ordering},
-    },
-};
+use alloc::{boxed::Box, vec::Vec};
+use core::{any::type_name, fmt, hash, ops::Deref, ptr, sync::atomic::AtomicU32, sync::atomic::Ordering};
+use alloc::alloc::Global;
 
 use blaze_ids::{ContentId, Fingerprint, Hasher, Idx, Interner};
 use blaze_mem::swiss::Index;
+use blaze_swiss::sync::Once as OnceLock;
 
 use crate::{Consed, content_of};
 
@@ -105,7 +98,7 @@ impl<T> Shard<T> {
             lock: ShardLock::new(),
             len: AtomicU32::new(0),
             index: Index::new_in(Global),
-            nodes: std::array::from_fn(|_| OnceLock::new()),
+            nodes: core::array::from_fn(|_| OnceLock::new()),
         }
     }
 

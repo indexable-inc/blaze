@@ -12,7 +12,7 @@
 //! The immediate must be a constant (an `iconst`): it is a field of the instruction. A name
 //! outside the four, a non-constant immediate or one past its field is refused by name.
 
-use std::alloc::Allocator;
+use alloc::alloc::Allocator;
 
 use blaze_lir::Op;
 

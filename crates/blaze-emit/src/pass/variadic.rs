@@ -44,7 +44,7 @@
 //! `f32`, a `bool` and an integer narrower than `c_int` passed to `...` (E0617), so a variable
 //! argument narrower than 32 bits is refused by name as a broken invariant of the input.
 
-use std::alloc::Allocator;
+use alloc::alloc::Allocator;
 
 use blaze_lir::op::Values;
 use blaze_lir::{Op, Scalar, Ty};

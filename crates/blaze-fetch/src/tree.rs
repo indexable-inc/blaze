@@ -23,7 +23,8 @@
 //! another file or a symlink. [`parse`] refuses all of it as [`listing`] does. A change to any
 //! of this is `blaze tree 3`.
 
-use std::fmt::{self, Write as _};
+use alloc::{borrow::ToOwned, string::String, vec::Vec};
+use core::{fmt, fmt::Write as _};
 
 use crate::digest::Blake3;
 
@@ -111,7 +112,7 @@ impl fmt::Display for TreeRefused {
     }
 }
 
-impl std::error::Error for TreeRefused {}
+impl core::error::Error for TreeRefused {}
 
 /// Why `path` can't be listed, if it can't.
 fn bad_path(path: &str) -> Option<&'static str> {
@@ -218,7 +219,7 @@ pub fn listing(entries: &mut [Entry]) -> Result<Vec<u8>, TreeRefused> {
 
 /// The entries of a listing [`listing`] wrote, in its order; anything else is refused.
 pub fn parse(bytes: &[u8]) -> Result<Vec<Entry>, TreeRefused> {
-    let text = std::str::from_utf8(bytes)
+    let text = core::str::from_utf8(bytes)
         .map_err(|_| TreeRefused::Line { line: 0, why: "is not UTF-8" })?;
     let body = text.strip_prefix(HEADER).ok_or(TreeRefused::NoHeader)?;
     let mut entries: Vec<Entry> = Vec::new(); // alloc: once a tree read

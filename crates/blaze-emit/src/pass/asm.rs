@@ -33,7 +33,7 @@
 //! and the prologue saved the incoming link register. A literal `bl name` still needs the
 //! function reference place to which the call site will be bound.
 
-use std::alloc::Allocator;
+use alloc::alloc::Allocator;
 
 use blaze_lir::{
     Op, Ty, Value,

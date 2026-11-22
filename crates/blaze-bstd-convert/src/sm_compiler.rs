@@ -21,7 +21,10 @@ use syntax::{
 };
 
 use crate::{
-    analyze::{CInteropInfo, ProcMacroEntry, ProcMacroPattern, StructSmCandidate, line_of_offset},
+    analyze::{
+        CInteropInfo, NewtypeCandidate, NewtypeKind, ProcMacroEntry, ProcMacroPattern,
+        StructSmCandidate, line_of_offset,
+    },
     catalog::{EffectKind, classify_call_effect, classify_macro_effect},
 };
 
@@ -2827,6 +2830,93 @@ pub fn generate_c_interop_scaffold(crate_name: &str, info: &CInteropInfo) -> Str
         let _ = writeln!(out, "    std \"c++20\";");
     }
     let _ = writeln!(out, "}}");
+
+    out
+}
+
+/// Generate a `#![no_std]` `src/newtypes.rs` module promoting bare domain primitives (`offset`/`len`,
+/// `*_id`, `port`, `*_ms`, `align`) into explicit `bstd::newtype!` / `bstd::id::id!` types
+/// (affine `Offset`/`Len` algebra, zero blanket `Deref`, composable with `bstd::TypeSet!`).
+pub fn generate_newtypes_scaffold(crate_name: &str, candidates: &[NewtypeCandidate]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "//! Explicit zero-cost domain newtypes for `{crate_name}` (`bstd::newtype!`, rules 76 & 85)."
+    );
+    let _ = writeln!(
+        out,
+        "//! - Affine `Offset` + `Len` → `Offset`, `Offset - Offset` → `Len` (`Offset + Offset` is a compile error)."
+    );
+    let _ = writeln!(
+        out,
+        "//! - No blanket `Deref` on numeric types; compose bundles order-independently with `bstd::TypeSet!`."
+    );
+    let _ = writeln!(out, "#![no_std]");
+    let _ = writeln!(out, "#![forbid(unsafe_code)]\n");
+
+    let mut reexports: BTreeSet<&'static str> = BTreeSet::new();
+    let mut emitted_ids: BTreeSet<String> = BTreeSet::new();
+    let mut id_u32_decls: Vec<String> = Vec::new();
+    let mut id_opaque_decls: Vec<(String, String)> = Vec::new();
+
+    for c in candidates {
+        match c.kind {
+            NewtypeKind::AffineOffsetLen => {
+                if c.raw_type == "u32" {
+                    reexports.insert("TextOffset");
+                    reexports.insert("TextLen");
+                    reexports.insert("TextSpan");
+                } else {
+                    reexports.insert("ByteOffset");
+                    reexports.insert("ByteLen");
+                    reexports.insert("ByteSpan");
+                }
+            }
+            NewtypeKind::OpaquePort => {
+                reexports.insert("Port");
+            }
+            NewtypeKind::AlignmentPow2 => {
+                reexports.insert("Alignment");
+            }
+            NewtypeKind::DurationUnit => {}
+            NewtypeKind::TypedId => {
+                let pascal = to_pascal_case(&c.name);
+                if emitted_ids.insert(pascal.clone()) {
+                    if c.raw_type == "u32" {
+                        id_u32_decls.push(pascal);
+                    } else {
+                        id_opaque_decls.push((pascal, c.raw_type.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    if !reexports.is_empty() {
+        let list: Vec<&str> = reexports.into_iter().collect();
+        let _ = writeln!(out, "pub use bstd::newtype::{{{}}};\n", list.join(", "));
+    }
+
+    for id_name in &id_u32_decls {
+        let _ = writeln!(out, "bstd::id::id! {{");
+        let _ = writeln!(out, "    pub struct {id_name};");
+        let _ = writeln!(out, "}}\n");
+    }
+
+    for (id_name, raw_ty) in &id_opaque_decls {
+        let _ = writeln!(out, "bstd::newtype! {{");
+        let _ = writeln!(out, "    opaque pub struct {id_name}({raw_ty});");
+        let _ = writeln!(out, "}}\n");
+    }
+
+    let _ = writeln!(out, "// Detected bare-primitive sites to migrate (sample up to 20):");
+    for c in candidates.iter().take(20) {
+        let _ = writeln!(
+            out,
+            "// - {}:{} ({}) `{}: {}` -> `{}`",
+            c.file, c.line, c.owner, c.name, c.raw_type, c.suggestion
+        );
+    }
 
     out
 }

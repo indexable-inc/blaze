@@ -20,6 +20,7 @@ blaze-format.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
+blaze-swiss.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true

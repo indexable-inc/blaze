@@ -542,6 +542,21 @@ pub mod id {
     pub use blaze_kit::{Id, NonMax, Table, TableMap, TableSet, id};
 }
 
+/// Explicit zero-cost newtypes, affine spaces (`ByteOffset` vs `ByteLen` + `ByteSpan`,
+/// `TextOffset` vs `TextLen` + `TextSpan`), power-of-two [`newtype::Alignment`], quantities
+/// (`Count`, `Capacity`, `Stride`), opaque wrappers (`Port`, `LineNo`, `ColNo`), Kotlin-style
+/// selective `delegate { ... }` forwarding (`newtype!`), and `TypeSet!`-powered unit/invariant
+/// sets (`Tagged`, `Dim`, `slice_from`).
+pub mod newtype;
+
+/// Symbolic algebra, DAG differentiation (`diff`, `grad`, `hessian`, `taylor`), bounded e-graph
+/// equality saturation (`simplify`), symbolic equation solving (`solve_for`), `const fn`
+/// compile-time expression graphs (`comptime::ConstGraph`), and CSE Rust SSA emission
+/// (`blaze-algebra`; `docs/v2/plan/design/symbolic-algebra.md`).
+pub mod algebra {
+    pub use blaze_algebra::*;
+}
+
 /// The stable radix sort (blaze-radix), on workers named at the call ([`sort::on`], with
 /// [`sort::Serial`] for the calling thread alone). The free functions that sort on the
 /// thread's ambient workers are left out.

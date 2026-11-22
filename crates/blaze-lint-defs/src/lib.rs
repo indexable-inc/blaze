@@ -22,8 +22,12 @@
 //! `declare_lint!`s, `register_builtins` and `register_internals`; `tests` holds their counts
 //! and hashes to rustc's.
 
+#![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+
+extern crate alloc;
+use alloc::{borrow::ToOwned, format, string::String, vec::Vec};
 mod index;
 mod lints;
 mod names;
@@ -32,7 +36,7 @@ pub mod ready;
 mod rustc;
 mod set;
 
-use std::sync::OnceLock;
+use blaze_swiss::sync::Once as OnceLock;
 
 use edition::Edition;
 
@@ -451,7 +455,7 @@ impl LintId {
 
     /// `&'static [&'static Lint]` of it alone.
     fn alone(self) -> &'static [&'static Lint] {
-        std::slice::from_ref(&REFS[usize::from(self.0)])
+        core::slice::from_ref(&REFS[usize::from(self.0)])
     }
 }
 

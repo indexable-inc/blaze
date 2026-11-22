@@ -26,7 +26,7 @@
 //!   undefined. So the code decides every out-of-range input itself and calls the routine
 //!   only with a value whose truncation fits, where every implementation agrees.
 
-use std::alloc::Allocator;
+use alloc::alloc::Allocator;
 
 use blaze_lir::{Op, Value};
 

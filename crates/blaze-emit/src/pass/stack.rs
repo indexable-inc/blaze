@@ -37,7 +37,7 @@
 //! first puts `sp` back where the prologue left it ([`Pass::restore_sp`]), from `x29` and the
 //! frame's size, patched once the frame is known.
 
-use std::alloc::Allocator;
+use alloc::alloc::Allocator;
 
 use blaze_lir::{Scalar, Ty, Value};
 

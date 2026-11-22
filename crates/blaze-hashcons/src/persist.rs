@@ -7,7 +7,8 @@
 //! same bytes in every run. Loading one checks each value's content ID against its entry before
 //! interning it.
 
-use std::mem::{offset_of, size_of};
+use alloc::vec::Vec;
+use core::{mem::offset_of, mem::size_of};
 
 use blaze_format::{
     ALIGN, FormatError, Part, Persist, Record, SchemaHash, Slice, Writer, WriterIn, open_as,

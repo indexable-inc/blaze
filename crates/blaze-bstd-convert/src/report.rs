@@ -45,8 +45,13 @@ pub fn render_analysis_markdown(analysis: &WorkspaceAnalysis) -> String {
     let _ = writeln!(out, "- **Custom proc-macro crates (recommended for `comptime`/`const` reflection)**: {}", analysis.total_proc_macro_crates);
     let _ = writeln!(
         out,
-        "- **C/C++ interop crates (`bindgen`/`cc`/`cmake`/`cxx`/`pkg-config`, recommended for `blaze::c::import!` / `blaze::cpp::import!`)**: {}\n",
+        "- **C/C++ interop crates (`bindgen`/`cc`/`cmake`/`cxx`/`pkg-config`, recommended for `blaze::c::import!` / `blaze::cpp::import!`)**: {}",
         analysis.total_c_interop_crates
+    );
+    let _ = writeln!(
+        out,
+        "- **Bare-primitive domain sites (recommended for `bstd::newtype!` / `bstd::id::id!`)**: {}\n",
+        analysis.total_newtype_candidates
     );
 
     // External dependency table sorted by usage count.
@@ -233,11 +238,26 @@ pub fn render_conversion_markdown(res: &ConversionResult) -> String {
     );
     let _ = writeln!(out, "- **Explicit sans-IO state machines compiled**: {}", res.total_lifted_machines);
     let _ = writeln!(out, "- **Mixed-IO / implicit-state structs split**: {}", res.total_refactored_structs);
+    let _ = writeln!(
+        out,
+        "- **Owned-heap structs parameterized with `bstd::mem::Alloc<'a>`**: {}",
+        res.total_parameterized_structs
+    );
+    let _ = writeln!(
+        out,
+        "- **Cross-crate capability/allocator call sites forwarded**: {}",
+        res.total_cross_crate_call_rewrites
+    );
     let _ = writeln!(out, "- **Custom proc-macro `comptime` scaffolds emitted**: {}", res.total_comptime_scaffolds);
     let _ = writeln!(
         out,
-        "- **C/C++ `blaze::c::import!` / `blaze::cpp::import!` scaffolds emitted**: {}\n",
+        "- **C/C++ `blaze::c::import!` / `blaze::cpp::import!` scaffolds emitted**: {}",
         res.total_c_interop_scaffolds
+    );
+    let _ = writeln!(
+        out,
+        "- **Explicit `bstd::newtype!` modules emitted**: {}\n",
+        res.total_newtype_scaffolds
     );
 
     let changed: Vec<_> = res

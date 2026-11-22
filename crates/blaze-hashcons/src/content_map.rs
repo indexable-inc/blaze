@@ -20,7 +20,9 @@
 //! which hashes the value and refuses the pair when the id is not its own; nothing is stored
 //! under an id nobody checked.
 
-use std::{alloc::Allocator, any::type_name, fmt};
+use alloc::vec::Vec;
+use core::{any::type_name, fmt};
+use alloc::alloc::Allocator;
 
 use blaze_hash::{BuildKeyHasher, Map, MapOpts, hash_map::Entry};
 use blaze_ids::ContentId;
@@ -51,7 +53,7 @@ impl fmt::Display for Mismatch {
     }
 }
 
-impl std::error::Error for Mismatch {}
+impl core::error::Error for Mismatch {}
 
 impl<V, A: Allocator> ContentMap<V, A> {
     /// An empty map in `alloc`: no allocation until the first insert.

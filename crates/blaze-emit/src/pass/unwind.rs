@@ -29,7 +29,8 @@
 //!
 //! The literal-word form refuses all of it by name: it places no unwind entry.
 
-use std::alloc::{Allocator, Global};
+use alloc::vec::Vec;
+use alloc::{alloc::Allocator, alloc::Global};
 
 use blaze_code::record::CodeRecord;
 use blaze_code::unwind::{self, Action, Frame, Row};
