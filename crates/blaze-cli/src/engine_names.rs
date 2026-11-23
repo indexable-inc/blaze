@@ -1245,6 +1245,19 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         self.answered.contains_key(&name)
     }
 
+    pub(crate) fn set_width(&mut self, scope: &bstd::task::Scope<'_>, handles: &Handles<'_, '_>, scripts_pending: bool) -> core::num::NonZeroU32 {
+        let width = handles.workers.get().min(scope.workers());
+        #[cfg(test)]
+        let width = if crate::engine_scripts::runner_clock().is_some() { handles.workers.get() } else { width };
+        let workers = if scripts_pending {
+            core::num::NonZeroU32::new(width.saturating_sub(width.div_ceil(4))).unwrap_or(core::num::NonZeroU32::MIN)
+        } else {
+            core::num::NonZeroU32::new(width).unwrap_or(core::num::NonZeroU32::MIN)
+        };
+        self.width = workers.get() as usize;
+        workers
+    }
+
     /// Snapshot the inputs the selected task can read before admitting it. The worker
     /// then needs neither a producer wait nor access to a changing input table.
     #[expect(clippy::too_many_arguments, reason = "one worker scope and the request's store, names, and timing handles")]
@@ -1252,6 +1265,7 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         &mut self, scope: &'j bstd::task::Scope<'j>, cx: &Cx, stage: &mut NamesStage<'f>,
         store: &mut dyn crate::store::Store<'r>, read: &mut EngineRecords<'r>, handles: &Handles<'j, 'f>,
         task: EngineTask, alloc: SharedAlloc<'a>, frame: &'f Frame, waiter: &'j blaze_core::wait::Parker,
+        scripts_pending: bool,
     ) -> Result<(), CliError> {
         let name = task.planned.name;
         stage.admissions.admit(name)?;
@@ -1348,11 +1362,7 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
                 }
             }
         } else { None };
-        let width = handles.workers.get().min(scope.workers());
-        #[cfg(test)]
-        let width = if crate::engine_scripts::runner_clock().is_some() { handles.workers.get() } else { width };
-        let workers = core::num::NonZeroU32::new(width.saturating_sub(width.div_ceil(4))).unwrap_or(core::num::NonZeroU32::MIN);
-        self.width = workers.get() as usize;
+        let workers = self.set_width(scope, handles, scripts_pending);
         let job = Job { at, crates: columns.crates, all, deps, script: script_bytes, home: handles.env.home, env, packs: columns.packs,
             corrected: columns.corrected, procs: gate.as_ref().ok().copied().flatten(), kept: handles.env.heap.shared(), workers, oracle: handles.oracle, clock: &handles.env.clock, serve: handles.serve() };
         self.order.insert((!feeds_names, task.planned.phase.wave, name), task);

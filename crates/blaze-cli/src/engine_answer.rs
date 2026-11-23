@@ -1336,9 +1336,9 @@ fn save<'m, D: Driver, S: Sharing>(
             records.push(record);
             if name.kind == blaze_drive::Kind::CrateScope {
                 scopes.push((name, record));
-                if sink.store.is_toolchain(name) {
-                    toolchain_records.push(record);
-                }
+            }
+            if sink.store.is_toolchain(name) {
+                toolchain_records.push(record);
             }
         }
         sink.index_rows(page, &records, &scopes, alloc.into()).map_err(reach_error)?;
@@ -1373,6 +1373,10 @@ fn save<'m, D: Driver, S: Sharing>(
     // This root accumulates indexes across commands. Unchanged pages' toolchain
     // payloads were admitted with the page and this renewal extends their lifetime.
     store.keep_toolchain(toolchain, &toolchain_records)?;
+    // Refresh the toolchain-only fallback base (`tool-base.<PINNED>.<TRIPLE>.<tools>`) whenever
+    // this build holds non-failed closed toolchain rows, so any fresh project or git worktree
+    // automatically reuses pre-warmed `core`/`alloc`/`std`/`bstd`.
+    keep_toolchain_base(cx, store, lent, toolchain, tools, kept, alloc, frame)?;
     store.pin(name, &[key])?;
     // This answer as its workspace's newest base: a checkout of it with none of its own starts
     // from it ([`BASES_ROOT`]). The control keeps the one home-wide pointer instead.
@@ -1470,6 +1474,223 @@ pub(crate) fn load_base<'m, D: Driver, S: Sharing>(
         Some(base) => pointer_at(cx, store, base.pointer).map(Some),
         None => Ok(None),
     }
+}
+
+/// The home-wide toolchain-only answer root: `tool-base.<PINNED>.<TRIPLE>.<tools>`.
+/// Holds only closed toolchain crate rows (`CrateScope` and `ImplBucket`) with empty checkout
+/// leaves so any fresh project or git worktree on the same `(toolchain, target, tools)` starts
+/// with `core`/`alloc`/`std`/`bstd` already standing via [`StoredBase::OtherCheckout`].
+pub(crate) fn toolchain_base_root<'f>(
+    toolchain: blaze_toolchain::ToolchainId,
+    tools: &Tools,
+    frame: &'f Frame,
+) -> blaze_own::String<&'f Frame> {
+    let tc_hex = toolchain.hex();
+    let tools_id = tools_digest(tools);
+    let mut name = blaze_own::String::new_in(frame);
+    name.push_str("tool-base.");
+    name.push_str(&tc_hex.as_str()[..16]);
+    name.push('.');
+    name.push_str(crate::graph::TRIPLE);
+    name.push('.');
+    for byte in &tools_id.0[..8] {
+        let _ = write!(name, "{byte:02x}");
+    }
+    name
+}
+
+/// Fallback lookup for a fresh checkout that has neither its own answer nor a matching workspace
+/// base: loads the pre-warmed toolchain-only `Answer` pointer under
+/// `tool-base.<PINNED>.<TRIPLE>.<tools>`.
+pub(crate) fn load_toolchain_base<'m, D: Driver, S: Sharing>(
+    cx: &Cx,
+    store: &mut CommandStore<'m, '_, D, S>,
+    toolchain: blaze_toolchain::ToolchainId,
+    tools: &Tools,
+    frame: &Frame,
+) -> Result<Option<Result<Pointer<'m>, Unreadable>>, CliError> {
+    let name = toolchain_base_root(toolchain, tools, frame);
+    load_pointer(cx, store, name.as_str())
+}
+
+/// Copies a single engine [`blaze_engine::Row`] into `alloc` without cloning via `Clone`.
+fn copy_row<'a>(row: &blaze_engine::Row<'_>, alloc: SharedAlloc<'a>) -> blaze_engine::Row<'a> {
+    blaze_engine::Row {
+        key: row.key,
+        phase: row.phase,
+        file: row.file,
+        source: row.source,
+        out: row.out,
+        serial: row.serial,
+        defines: blaze_engine::SVec::from_slice_in(&row.defines, alloc),
+        reads: blaze_engine::SVec::from_slice_in(&row.reads, alloc),
+        by_cell: blaze_engine::SVec::from_slice_in(&row.by_cell, alloc),
+        findings: row.findings,
+        inline: row.inline,
+        failed: row.failed,
+    }
+}
+
+/// Writes or merges the toolchain-only fallback base (`tool-base.<PINNED>.<TRIPLE>.<tools>`)
+/// whenever `kept` contains non-failed toolchain rows (`store.is_toolchain`). Unchanged bases
+/// perform no writes; new toolchain sets (e.g. `bstd` added after `std`) are merged cleanly.
+#[expect(clippy::too_many_arguments, reason = "toolchain base save edge: each argument one handle")]
+fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
+    cx: &Cx,
+    store: &mut CommandStore<'m, '_, D, S>,
+    lent: &'m blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    toolchain: blaze_toolchain::ToolchainId,
+    tools: &Tools,
+    kept: &Kept<'_>,
+    alloc: SharedAlloc<'_>,
+    frame: &Frame,
+) -> Result<(), CliError> {
+    let mut fresh_names: blaze_own::Vec<Name, &Frame> = blaze_own::Vec::new_in(frame);
+    for (&name, row) in kept.answer.rows.iter() {
+        if !row.failed && store.is_toolchain(name) && kept.records.contains_key(&name) {
+            fresh_names.push(name);
+        }
+    }
+    if fresh_names.is_empty() {
+        return Ok(());
+    }
+    let tc_root = toolchain_base_root(toolchain, tools, frame);
+    let prev = match load_pointer(cx, store, tc_root.as_str())? {
+        Some(Ok(ptr)) => {
+            let mut store_err: Option<CliError> = None;
+            let decoded = pages::decode(
+                ptr.root,
+                |k| {
+                    if store_err.is_some() {
+                        return None;
+                    }
+                    match store.get(cx, k) {
+                        Ok(Some(held)) => Some(Ok(Sealed::by_store(k, held.bytes, held.proof))),
+                        Ok(None) => None,
+                        Err(error) => {
+                            store_err = Some(error);
+                            None
+                        }
+                    }
+                },
+                alloc,
+            );
+            if let Some(error) = store_err {
+                return Err(error);
+            }
+            decoded.ok()
+        }
+        _ => None,
+    };
+    // Skip rewriting when every fresh toolchain row already stands identically in `tool-base`.
+    if let Some(existing) = &prev {
+        let unchanged = fresh_names.iter().all(|name| {
+            let Some(new_row) = kept.answer.rows.get(name) else { return false };
+            let Some(old_row) = existing.answer.rows.get(name) else { return false };
+            !old_row.failed
+                && old_row.key == new_row.key
+                && old_row.out == new_row.out
+                && existing.records.get(name) == kept.records.get(name)
+        });
+        if unchanged {
+            return Ok(());
+        }
+    }
+    let mut tc_kept = match prev {
+        Some(mut existing) => {
+            existing.places.clear();
+            existing
+        }
+        None => Kept::new_in(alloc),
+    };
+    if tc_kept.answer.serial.0 < kept.answer.serial.0 {
+        tc_kept.answer.serial = kept.answer.serial;
+    }
+    for &name in fresh_names.iter() {
+        if let Some(row) = kept.answer.rows.get(&name) {
+            tc_kept.answer.rows.insert(name, copy_row(row, alloc));
+        }
+        if let Some(&record) = kept.records.get(&name) {
+            tc_kept.records.insert(name, record);
+        }
+        if let Some(&cause) = kept.causes.get(&name) {
+            tc_kept.causes.insert(name, cause);
+        }
+    }
+    let encoded = pages::encode(&tc_kept, None, alloc);
+    for (key, bytes) in encoded.puts.iter() {
+        store.put(cx, *key, bytes)?;
+    }
+    let (headers, writes) = Headers::after(None, &tc_kept, Writer::Phases, tc_kept.answer.serial, HeadersPlant::None, |_| Ok(None), alloc).map_err(page_error)?;
+    for (key, bytes) in &writes {
+        store.put(cx, *key, bytes)?;
+    }
+    let (empty_lines_key, empty_lines_bytes) = crate::engine_lines::Lines::new_in(alloc).record();
+    store.put(cx, empty_lines_key, &empty_lines_bytes)?;
+    let empty_rows = Rows::new_in(frame);
+    let leaves = Leaves::bytes_in(&empty_rows, frame)?;
+    let mut pointer: blaze_own::Vec<u8, &Frame> = blaze_own::Vec::with_capacity_in(POINTER_BYTES, frame);
+    pointer.extend_from_slice(POINTER_MAGIC);
+    pointer.extend_from_slice(&encoded.root.0.0);
+    pointer.extend_from_slice(&empty_lines_key.0.0);
+    let printed = Printed { names: true, bodies_whole: false, replayable: false };
+    let facts = Facts { files: encoded.files, printed, findings: encoded.findings, owed: encoded.owed };
+    pointer.extend_from_slice(&facts.files.to_le_bytes());
+    pointer.push(facts.printed.byte());
+    pointer.extend_from_slice(&facts.findings.to_le_bytes());
+    pointer.extend_from_slice(&facts.owed.to_le_bytes());
+    pointer.extend_from_slice(&tools_digest(tools).0);
+    match &headers {
+        Headers::Current(keys) => {
+            pointer.push(HEADERS_CURRENT);
+            pointer.extend_from_slice(&0u64.to_le_bytes());
+            for key in &keys.keys {
+                pointer.extend_from_slice(&key.0.0);
+            }
+        }
+        Headers::Absent { since } => {
+            pointer.push(HEADERS_ABSENT);
+            pointer.extend_from_slice(&since.0.to_le_bytes());
+            pointer.extend_from_slice(&[0u8; 32 * HeaderPages::COUNT]);
+        }
+    }
+    crate::journal_sweep::Stored::encode_units(core::iter::empty(), None, &mut pointer);
+    let sealed = seal::seal(&pointer, &leaves, frame)?;
+    let ptr_key = Key(ContentId::of(POINTER_DOMAIN, &sealed));
+    store.put(cx, ptr_key, &sealed)?;
+    use crate::engine_answer_rows::{AnswerSink as _, StoreSink};
+    let mut sink = StoreSink { cx, store, lent, toolchain };
+    let mut records = blaze_own::Vec::new_in(alloc);
+    let mut scopes = blaze_own::Vec::new_in(alloc);
+    for (page, page_rows) in encoded.page_records() {
+        records.clear();
+        scopes.clear();
+        records.push(page);
+        for &(name, record) in page_rows {
+            records.push(record);
+            if name.kind == blaze_drive::Kind::CrateScope {
+                scopes.push((name, record));
+            }
+        }
+        sink.index_rows(page, &records, &scopes, alloc.into()).map_err(reach_error)?;
+    }
+    let mut page_idx = blaze_own::Vec::new_in(alloc);
+    page_idx.extend(encoded.pages.iter().filter(|p| **p != Key::default()).map(|p| blaze_cas::plain::beside_key(blaze_cas::Key(p.0))));
+    page_idx.sort_unstable();
+    let mut direct = blaze_own::Vec::new_in(alloc);
+    direct.push(blaze_cas::Key(encoded.root.0));
+    direct.push(blaze_cas::Key(empty_lines_key.0));
+    if let Some(keys) = headers.current() {
+        direct.extend(keys.keys.iter().filter(|k| **k != Key::default()).map(|k| blaze_cas::Key(k.0)));
+    }
+    let answer_index = lent.index(&direct).map_err(crate::store::PlaceError::from)?;
+    let reach_name = bstd::mem::format_in!(frame, "{}.{REACH_ROOT}", tc_root.as_str());
+    let answer_name = bstd::mem::format_in!(frame, "{}.{ANSWER_ROOT}", tc_root.as_str());
+    let life = crate::store::roots::TOOLCHAIN_LIFE_NS;
+    lent.root_through(reach_name.as_str(), &page_idx, life).map_err(crate::store::PlaceError::from)?;
+    lent.root_through(answer_name.as_str(), &[answer_index], life).map_err(crate::store::PlaceError::from)?;
+    lent.root_for(tc_root.as_str(), &[blaze_cas::Key(ptr_key.0)], life).map_err(crate::store::PlaceError::from)?;
+    Ok(())
 }
 
 /// The reach root's page indexes for the pages `now` (one a page with anything on it, its

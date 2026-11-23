@@ -227,3 +227,20 @@ fn the_merge_oracle_catches_arrival_order() {
     let heap = heap();
     control(Config::cases(500), MergePlant::Rule, MergePlant::Arrival, "a split's result out of split order", |tape, plant| merge(tape, plant, heap));
 }
+
+#[test]
+fn large_single_file_splits_across_workers_for_128_cores() {
+    let runs: std::vec::Vec<_> = file_splits(&[256], 256, 16).collect();
+    assert_eq!(runs.len(), 8, "a 256-task mega-file splits into 8 balanced chunks of 32: {runs:?}");
+    assert_eq!(runs.iter().map(|r| r.len()).sum::<usize>(), 256);
+    assert_eq!(runs[0], 0..32);
+    assert_eq!(runs[7], 224..256);
+
+    let wide: std::vec::Vec<_> = file_splits(&[4096], 4096, 512).collect();
+    assert_eq!(wide.len(), 128, "a 4096-task mega-file splits across 128 cores: {}", wide.len());
+    assert_eq!(wide.iter().map(|r| r.len()).sum::<usize>(), 4096);
+
+    // Single-job request keeps the file whole.
+    let single: std::vec::Vec<_> = file_splits(&[256], 256, 1).collect();
+    assert_eq!(single, [0..256]);
+}

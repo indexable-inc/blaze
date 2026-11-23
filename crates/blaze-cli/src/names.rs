@@ -886,9 +886,14 @@ impl<'f> Names<'f> {
             script_placed.push(module.ran_as);
         }
         // The public crates, in the list's order, then their runs placed on the wasm path (as
-        // [`world`] tells them: ruling D115 sharing (i)).
+        // [`world`] tells them: ruling D115 sharing (i)). Both `CrateScope` and `ImplBucket`
+        // subjects are added so closed public crates' impl tables are shareable and publishable.
         let mut public = blaze_own::Vec::new_in(heap);
-        public.extend((0..n).filter(|r| list.public(*r)).map(|r| blaze_drive::key::crate_scope_name(&list.key(r)).subject));
+        for r in (0..n).filter(|r| list.public(*r)) {
+            let key = list.key(r);
+            public.push(blaze_drive::key::crate_scope_name(&key).subject);
+            public.push(blaze_ladder::front2::buckets::impl_tables_name(key).subject);
+        }
         for ((at, name), ran_as) in scripts.iter().zip(script_placed.iter()) {
             if crate::scripts::run_is_public(list.public(*at), *ran_as) {
                 public.push(name.subject);
@@ -1432,11 +1437,15 @@ pub(crate) fn script_units<'a>(
 /// a world is made.
 pub(crate) fn tell_public(store: &mut dyn Store<'_>, names: &Names<'_>) {
     store.public_crates(&names.public);
-    // The toolchain's of them: their records are kept under the toolchain's root (the list's
-    // `TOOLCHAIN` flag).
+    // The toolchain's of them: their records (`CrateScope` and `ImplBucket`) are kept under the
+    // toolchain's root (the list's `TOOLCHAIN` flag).
     let list = &names.list;
-    let mut toolchain = std::vec::Vec::with_capacity_in(list.len(), Global);
-    toolchain.extend((0..list.len()).filter(|r| CrateGraph::toolchain(list, *r)).map(|r| blaze_drive::key::crate_scope_name(&list.key(r)).subject));
+    let mut toolchain = std::vec::Vec::with_capacity_in(list.len().saturating_mul(2), Global);
+    for r in (0..list.len()).filter(|r| CrateGraph::toolchain(list, *r)) {
+        let key = list.key(r);
+        toolchain.push(blaze_drive::key::crate_scope_name(&key).subject);
+        toolchain.push(blaze_ladder::front2::buckets::impl_tables_name(key).subject);
+    }
     store.toolchain_crates(&toolchain);
 }
 
