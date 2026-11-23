@@ -62,9 +62,8 @@ const MANIFEST: &str = "[package]\nname = \"two\"\nversion = \"0.1.0\"\nedition 
 const PASS: &str = "#[test]\nfn passes() {}\n";
 const FAIL: &str = "#[test]\nfn fails() {\n    assert_eq!(1, 2);\n}\n";
 
-const BOTH_SUMMARY: &str = "test result: FAILED. ran 2: 1 passed, 1 failed; 0 reused from kept results; 1 not kept (1 was not traced); 0 ignored; 0 benches not run; 0 filtered out; 0 flaky";
-const PASS_SUMMARY: &str = "test result: ok. ran 1: 1 passed, 0 failed; 0 reused from kept results; 1 not kept (1 was not traced); 0 ignored; 0 benches not run; 0 filtered out; 0 flaky";
-const NOT_KEPT: &str = "not kept passes: was not traced";
+const BOTH_SUMMARY: &str = "test result: FAILED. ran 2: 1 passed, 1 failed; 0 reused from kept results; 0 not kept; 0 ignored; 0 benches not run; 0 filtered out; 0 flaky";
+const PASS_SUMMARY: &str = "test result: ok. ran 1: 1 passed, 0 failed; 0 reused from kept results; 0 not kept; 0 ignored; 0 benches not run; 0 filtered out; 0 flaky";
 
 /// What `blaze test` prints before anything of its tests: its check's own lines, exactly. D147:
 /// "`run` and `test` read the engine's answer: one check (`check_for_start`), then the start";
@@ -88,6 +87,10 @@ fn blaze_test(name: &str, lib: &str) -> Said {
     })
 }
 
+fn write_source(path: &Path, text: &str, what: &str) {
+    std::fs::write(path, text).unwrap_or_else(|error| panic!("writing {what}: {error}"));
+}
+
 fn fixture<T>(name: &str, files: &[(&str, &str)], check: impl FnOnce(&Path, &Path) -> T) -> T {
     let base = fresh_home(name, true);
     // The test profile names the test's folder by its canonical path (blaze-run child.rs
@@ -99,7 +102,7 @@ fn fixture<T>(name: &str, files: &[(&str, &str)], check: impl FnOnce(&Path, &Pat
         let path = dir.join(name);
         std::fs::create_dir_all(path.parent().expect("a file in the fixture"))
             .unwrap_or_else(|error| panic!("making the folder for {name}: {error}"));
-        std::fs::write(&path, source).unwrap_or_else(|error| panic!("writing {name}: {error}"));
+        write_source(&path, source, name);
     }
     let result = check(&dir, &home);
     std::fs::remove_dir_all(&base).expect("remove the scratch command fixture");
@@ -185,7 +188,7 @@ fn byte_evidence(why: &str, code: Option<i32>, stderr: &[u8], stdout: &[u8]) -> 
 /// the package (with `fails` when `failing`), else what differs.
 fn judge(said: &Said, failing: bool) -> Result<(), String> {
     let lines: Vec<&str> = said.stdout.lines().collect();
-    let tail = if failing { [ "FAILED fails: ended by signal 6", NOT_KEPT, BOTH_SUMMARY ].as_slice() } else { [NOT_KEPT, PASS_SUMMARY].as_slice() };
+    let tail = if failing { ["FAILED fails: ended by signal 6", BOTH_SUMMARY].as_slice() } else { [PASS_SUMMARY].as_slice() };
     if lines.len() < tail.len() || lines[lines.len() - tail.len()..] != *tail {
         return Err(format!("the summary is not\n{}\n", tail.join("\n")));
     }
@@ -415,7 +418,6 @@ fn only_dependent_test_refused(stdout: &str, code: Option<i32>) -> bool {
     let Some(instance_and_cause) = refusal.strip_prefix("NOT RUN a_needs_callee: ") else { return false };
     instance_and_cause.contains("refused_callee")
         && instance_and_cause.contains(REFUSED)
-        && lines.next() == Some("not kept b_returns: was not traced")
         && lines.next().is_some_and(|summary| summary.starts_with(REFUSED_SUMMARY))
         && lines.next().is_none()
         && code.is_some_and(|status| status != 0)
@@ -440,12 +442,11 @@ fn refused_first_call_does_not_hide_the_next_test() {
 #[test]
 fn the_refusal_oracle_catches_one_stopped_and_not_run_as_pass() {
     let refusal = format!("NOT RUN a_needs_callee: refused_callee: {REFUSED}");
-    let passed = "not kept b_returns: was not traced";
-    let correct = format!("{refusal}\n{passed}\n{REFUSED_SUMMARY}\n");
+    let correct = format!("{refusal}\n{REFUSED_SUMMARY}\n");
     assert!(only_dependent_test_refused(&correct, Some(1)));
     let one_stopped = format!("{refusal}\n");
     assert!(!only_dependent_test_refused(&one_stopped, Some(1)));
-    let not_run_as_pass = format!("{refusal}\n{passed}\ntest result: ok. ran 2: 2 passed, 0 failed\n");
+    let not_run_as_pass = format!("{refusal}\ntest result: ok. ran 2: 2 passed, 0 failed\n");
     assert!(!only_dependent_test_refused(&not_run_as_pass, Some(0)));
 }
 
@@ -469,9 +470,7 @@ fn runs_both_workspace_packages() {
         run(dir, home, &["--", "--test-threads", "2", "--deadline", "20s"])
     });
     let expected = [
-        "not kept alpha/lib/shared::same: was not traced",
-        "not kept beta/lib/shared::same: was not traced",
-        "test result: ok. ran 2: 2 passed, 0 failed; 0 reused from kept results; 2 not kept (2 was not traced); 0 ignored; 0 benches not run; 0 filtered out; 0 flaky",
+        "test result: ok. ran 2: 2 passed, 0 failed; 0 reused from kept results; 0 not kept; 0 ignored; 0 benches not run; 0 filtered out; 0 flaky",
     ];
     assert_eq!(said.code, Some(0), "{}", evidence("two passing packages", &said));
     assert!(said.stdout.lines().eq(expected), "{}", evidence(&expected.join("\n"), &said));
@@ -531,7 +530,7 @@ fn every_test_passes_is_caught() {
     let rule = "-".repeat(80);
     let quiet = Said {
         stdout: format!(
-            "FAILED fails after 0.012 s: ended by signal 6\n---- fails output: 79 bytes ----\nthread 'main' (1) panicked at src/lib.rs:6:5:\nassertion `left == right` failed\n{rule}\nFAILED fails: ended by signal 6\n{NOT_KEPT}\n{BOTH_SUMMARY}\n"
+            "FAILED fails after 0.012 s: ended by signal 6\n---- fails output: 79 bytes ----\nthread 'main' (1) panicked at src/lib.rs:6:5:\nassertion `left == right` failed\n{rule}\nFAILED fails: ended by signal 6\n{BOTH_SUMMARY}\n"
         ),
         stderr: String::new(),
         code: Some(0),
@@ -542,4 +541,98 @@ fn every_test_passes_is_caught() {
     assert_eq!(judge(&right, true), Ok(()));
     let shifted = Said { stdout: right.stdout.replace("src/lib.rs:6:5", "src/lib.rs:5:5"), ..right };
     assert!(judge(&shifted, true).is_err(), "the check passed a panic at the enclosing fn instead of its assertion");
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn incremental_reruns_only_changed_test_and_reuses_unchanged() {
+    let make_lib = |a_expr: &str, b_expr: &str| {
+        format!(
+            "fn helper_a() -> u32 {{ {a_expr} }}\n\
+             fn helper_b() -> u32 {{ {b_expr} }}\n\
+             #[test]\nfn test_a() {{ assert_eq!(helper_a(), 42); }}\n\
+             #[test]\nfn test_b() {{ assert_eq!(helper_b(), 100); }}\n"
+        )
+    };
+    let initial = make_lib("40 + 2", "100");
+    fixture("test_command_incremental_selective", &[("Cargo.toml", MANIFEST), ("src/lib.rs", &initial)], |dir, home| {
+        let lib_path = dir.join("src/lib.rs");
+
+        // 1. Cold run: both tests run and both results are kept.
+        let cold = run(dir, home, &["--", "--deadline", "20s"]);
+        let expect_cold = "test result: ok. ran 2: 2 passed, 0 failed; 0 reused from kept results; 0 not kept; 0 ignored; 0 benches not run; 0 filtered out; 0 flaky\n";
+        assert_eq!(cold.code, Some(0), "{}", evidence("cold run passes", &cold));
+        assert_eq!(cold.stdout, expect_cold, "{}", evidence(expect_cold, &cold));
+
+        // 2. No-op rerun: both tests reused from kept results (ran 0).
+        let warm = run(dir, home, &["--", "--deadline", "20s"]);
+        let expect_warm = "test result: ok. ran 0: 0 passed, 0 failed; 2 reused from kept results; 0 not kept; 0 ignored; 0 benches not run; 0 filtered out; 0 flaky\n";
+        assert_eq!(warm.code, Some(0), "{}", evidence("warm rerun passes", &warm));
+        assert_eq!(warm.stdout, expect_warm, "{}", evidence(expect_warm, &warm));
+
+        // 3. Edit helper_a only: only test_a reruns; test_b is reused from kept results.
+        let edit_1 = make_lib("21 * 2", "100");
+        write_source(&lib_path, &edit_1, "edit helper_a");
+        let edited = run(dir, home, &["--", "--deadline", "20s"]);
+        let expect_edited = "test result: ok. ran 1: 1 passed, 0 failed; 1 reused from kept results; 0 not kept; 0 ignored; 0 benches not run; 0 filtered out; 0 flaky\n";
+        assert_eq!(edited.code, Some(0), "{}", evidence("only test_a reruns after helper_a edit", &edited));
+        assert_eq!(edited.stdout, expect_edited, "{}", evidence(expect_edited, &edited));
+
+        // 4. Edit helper_a to a second value, then revert back to edit_1: Effect::Look finds the
+        //    previously kept pass at edit_1's address without re-running test_a (ran 0).
+        write_source(&lib_path, &make_lib("41 + 1", "100"), "edit helper_a again");
+        let edited2 = run(dir, home, &["--", "--deadline", "20s"]);
+        assert_eq!(edited2.code, Some(0), "{}", evidence("second helper_a edit reruns only test_a", &edited2));
+        assert_eq!(edited2.stdout, expect_edited, "{}", evidence(expect_edited, &edited2));
+
+        write_source(&lib_path, &edit_1, "revert helper_a to edit_1");
+        let reverted = run(dir, home, &["--", "--deadline", "20s"]);
+        assert_eq!(reverted.code, Some(0), "{}", evidence("reverted edit reuses kept result", &reverted));
+        assert_eq!(reverted.stdout, expect_warm, "{}", evidence(expect_warm, &reverted));
+
+        // 5. --run-all bypasses kept results and runs both tests.
+        let forced = run(dir, home, &["--", "--run-all", "--deadline", "20s"]);
+        assert_eq!(forced.code, Some(0), "{}", evidence("--run-all passes", &forced));
+        assert_eq!(forced.stdout, expect_cold, "{}", evidence(expect_cold, &forced));
+
+        // 6. Soundness control: break helper_a -> only test_a runs and FAILS, test_b stays reused.
+        write_source(&lib_path, &make_lib("99", "100"), "break helper_a");
+        let broken = run(dir, home, &["--", "--deadline", "20s"]);
+        let expect_broken_summary = "test result: FAILED. ran 1: 0 passed, 1 failed; 1 reused from kept results; 0 not kept; 0 ignored; 0 benches not run; 0 filtered out; 0 flaky";
+        assert_eq!(broken.code, Some(1), "{}", evidence("broken helper_a must fail", &broken));
+        assert!(
+            broken.stdout.contains("FAILED test_a")
+                && !broken.stdout.contains("test_b")
+                && broken.stdout.lines().last() == Some(expect_broken_summary),
+            "{}",
+            evidence(expect_broken_summary, &broken),
+        );
+    });
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn impure_test_is_not_kept_and_reruns() {
+    let source = "#[test]\nfn reads_clock() {\n    let _ = std::time::SystemTime::now();\n}\n";
+    fixture("test_command_impure_clock", &[("Cargo.toml", MANIFEST), ("src/lib.rs", source)], |dir, home| {
+        let check = |label: &str, said: &Said| {
+            assert_eq!(said.code, Some(0), "{}", evidence(label, said));
+            let mut lines = said.stdout.lines();
+            let first = lines.next().unwrap_or("");
+            let second = lines.next().unwrap_or("");
+            assert!(
+                first.starts_with("not kept reads_clock: ")
+                    && second.starts_with("test result: ok. ran 1: 1 passed, 0 failed; 0 reused from kept results; 1 not kept (")
+                    && lines.next().is_none(),
+                "{}",
+                evidence(label, said),
+            );
+        };
+        let first = run(dir, home, &["--", "--deadline", "20s"]);
+        check("first impure run is not kept", &first);
+
+        // Second invocation must NOT reuse the clock-reading test.
+        let second = run(dir, home, &["--", "--deadline", "20s"]);
+        check("second impure run reruns instead of reusing", &second);
+    });
 }

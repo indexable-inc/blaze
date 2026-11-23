@@ -37,7 +37,8 @@ use super::reads::{Fact, FactKind, Read, ReadsError};
 /// field region of its own (`FieldRegion::Bound`, tag 3); its variances read the pointer.
 /// v6 (D148, piece L6): the fields' regions are the head record's field columns; no written
 /// type is read, so the asked ADT counts and path answers are no longer in the row.
-const ADT_DOMAIN: &str = "blaze-ladder front2 borrow adt read v6";
+/// v7: structural `needs_drop` and `drop_args` (borrow_fields.rs `drop_facts_of`).
+const ADT_DOMAIN: &str = "blaze-ladder front2 borrow adt read v7";
 /// The domain of a [`FactKind::BorrowHead`] answer.
 /// v2 (piece RB8): a head's verdict now also reads its trait bounds' lifetime arguments
 /// (borrows_ties.rs), so a list filed under v1 never answers for one checked since.
@@ -74,6 +75,8 @@ pub enum AdtAnswer<'f> {
         region_list: &'f [FieldRegion],
         /// Which arguments its one `Copy` impl needs `Copy` (`None`: not read).
         copy_args: Option<&'f [bool]>,
+        /// Which arguments its drop glue drops (`None`: not read; borrow_fields.rs `drop_facts_of`).
+        drop_args: Option<&'f [bool]>,
         /// Its lifetime parameters' variances, in head order (`None`: not read; borrows.rs
         /// `adt_variances_of`).
         variances: Option<&'f [Variance]>,
@@ -153,7 +156,7 @@ pub fn adt_read(adt: u128, answer: AdtAnswer<'_>) -> Read {
     let mut h = StableHasher::new(ADT_DOMAIN);
     match answer {
         AdtAnswer::NotMade => h.tag(0),
-        AdtAnswer::Made { copy, drop_impl, facts, variant_lens, fields, field_params, field_leads, field_regions, region_list, copy_args, variances } => {
+        AdtAnswer::Made { copy, drop_impl, facts, variant_lens, fields, field_params, field_leads, field_regions, region_list, copy_args, drop_args, variances } => {
             h.tag(1);
             option_bool(&mut h, copy);
             option_bool(&mut h, drop_impl);
@@ -217,7 +220,17 @@ pub fn adt_read(adt: u128, answer: AdtAnswer<'_>) -> Read {
                 None => h.tag(0),
                 Some(need) => {
                     h.tag(1);
-                    h.u32(need.len() as u32);
+                    h.u32(u32::try_from(need.len()).unwrap_or(u32::MAX));
+                    for &n in need {
+                        flag(&mut h, n);
+                    }
+                }
+            }
+            match drop_args {
+                None => h.tag(0),
+                Some(need) => {
+                    h.tag(1);
+                    h.u32(u32::try_from(need.len()).unwrap_or(u32::MAX));
                     for &n in need {
                         flag(&mut h, n);
                     }
@@ -368,6 +381,45 @@ pub fn impl_read(imp: u128, names: &[tc::Name], regions: &dyn blaze_flow_lower::
         }
     }
     Read { fact: Fact { kind: FactKind::BorrowHead, key: imp, detail: IMPL_DETAIL }, answer: Some(h.finish()) }
+}
+
+/// The `detail` of a trait's `Self` supertraits read for transitive `Copy` bounds (borrows.rs).
+pub const COPY_SUPERTRAIT_DETAIL: u64 = 9;
+const COPY_SUPERTRAIT_DOMAIN: &str = "blaze-ladder front2 borrow copy supertrait v1";
+
+/// The `detail` of a nested ADT's drop summary read (borrow_fields.rs `drop_facts_of`).
+pub const DROP_ADT_DETAIL: u64 = 10;
+const DROP_ADT_DOMAIN: &str = "blaze-ladder front2 borrow drop adt v1";
+
+/// The row of what the borrow check took about trait `trait_key`'s direct `Self` supertraits.
+/// `supers` is `None` when the trait head was not made, else the sorted direct supertrait keys.
+pub fn copy_supertrait_read(trait_key: u128, supers: Option<&[u128]>) -> Read {
+    let mut h = StableHasher::new(COPY_SUPERTRAIT_DOMAIN);
+    match supers {
+        None => h.tag(0),
+        Some(list) => {
+            h.tag(1);
+            h.u32(u32::try_from(list.len()).unwrap_or(u32::MAX));
+            for &sup in list {
+                h.u128(sup);
+            }
+        }
+    }
+    Read { fact: Fact { kind: FactKind::BorrowHead, key: trait_key, detail: COPY_SUPERTRAIT_DETAIL }, answer: Some(h.finish()) }
+}
+
+/// The row of what the structural `needs_drop` walk took about ADT `adt`: whether it was made,
+/// its kind, whether it is `ManuallyDrop`/`PhantomData`, its `Drop` impl answer, its generic
+/// count, and the structural digest of its fields' types (`fields_digest`).
+pub fn drop_adt_read(adt: u128, made: bool, union: bool, inert: bool, drop_impl: Option<bool>, generics: u32, fields_digest: u64) -> Read {
+    let mut h = StableHasher::new(DROP_ADT_DOMAIN);
+    flag(&mut h, made);
+    flag(&mut h, union);
+    flag(&mut h, inert);
+    option_bool(&mut h, drop_impl);
+    h.u32(generics);
+    h.u64(fields_digest);
+    Read { fact: Fact { kind: FactKind::BorrowAdt, key: adt, detail: DROP_ADT_DETAIL }, answer: Some(h.finish()) }
 }
 
 /// Files the borrow check's `rows` into the body's read list in `verdict` (sorted by fact, one

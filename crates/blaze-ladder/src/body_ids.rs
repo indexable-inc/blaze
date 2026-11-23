@@ -148,6 +148,41 @@ pub fn record_key(symbol: Symbol, body: &BodyId<'_>, facts: &[Read], builder: &B
     CodeKey(h.finish())
 }
 
+/// Computes the content-addressed [`CodeKey`] of a previously walked instance `(symbol, tabled, name)`
+/// against today's [`BodyIds`], [`Builder`], and [`ProducerId<CodeBuilder>`], without compiling it.
+/// Returns `None` if `tabled` has no valid body record today, any read moved, or any item in `name`
+/// lacks a crate fact. Uses the exact same inputs as `Walk::start` (rule 30).
+pub fn instance_key(
+    symbol: Symbol,
+    tabled: ItemKey,
+    name: &[u8],
+    ids: &dyn BodyIds,
+    builder: &Builder,
+    producer: &ProducerId<CodeBuilder>,
+    alloc: Alloc<'_>,
+) -> Option<CodeKey> {
+    let body = ids.body_check(tabled)?;
+    if body.reads.is_empty() {
+        return None;
+    }
+    for read in body.reads {
+        if ids.today(&read.fact) != Some(read.digest) {
+            return None;
+        }
+    }
+    let mut items: AVec<'_, ItemKey> = Vec::new_in(alloc);
+    each_item(name, |item| items.push(item)).ok()?;
+    items.sort_unstable();
+    items.dedup();
+    let mut facts: AVec<'_, Read> = Vec::with_capacity_in(items.len(), alloc);
+    for &item in items.iter() {
+        facts.push(ids.crate_fact(item)?);
+    }
+    facts.sort_unstable();
+    facts.dedup();
+    Some(record_key(symbol, &body, facts.as_slice(), builder, producer))
+}
+
 /// Why an instance name's items cannot be listed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NameError {

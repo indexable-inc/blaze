@@ -31,6 +31,7 @@ mod data_include;
 mod fetch;
 mod fix;
 mod front_load;
+mod gc;
 mod home;
 mod job_texts;
 mod lints;
@@ -96,6 +97,7 @@ mod journal_helper;
 mod graph;
 mod graph_payload;
 mod test_args;
+mod test_cache;
 mod test_drive;
 mod test_loop;
 mod test_run;
@@ -219,6 +221,8 @@ pub enum CliError {
     ProcAnswers(proc_runner::KeepError),
     /// `blaze clean` refused (clean.rs): the path that is not blaze's, named.
     Clean(clean::CleanError),
+    /// `blaze gc` or store budget configuration refused (gc.rs).
+    Gc(gc::GcError),
     JournalHelper(journal_helper::HelperError),
     /// A settled input a task needed could not be read (work.rs, `payload`).
     Input { name: blaze_drive::Name, why: work::InputWhy },
@@ -291,7 +295,7 @@ impl fmt::Display for CliError {
         match self {
             CliError::Usage(what) => write!(
                 f,
-                "usage: blaze check [dir] [--color=auto|always|never] [--view person|agent|json] [--each] [--workers N] [--status-every S], blaze <run|test> [dir] [--stats] [--workers N], blaze clean [dir] [--store], blaze explain [status]: {what}"
+                "usage: blaze check [dir] [--color=auto|always|never] [--view person|agent|json] [--each] [--workers N] [--status-every S], blaze <run|test> [dir] [--stats] [--workers N], blaze clean [dir] [--store], blaze gc [--max-gb N] [--dry-run] [--all-formats], blaze explain [status]: {what}"
             ),
             CliError::NotOnEngine { flag, why } => write!(f, "`blaze check {flag}`: the engine's check does not take {flag} yet ({why}; check_command.rs)"),
             CliError::NotBuilt { command } => write!(f, "`blaze {command}` is not built on the new item layer yet (drive.md)"),
@@ -316,6 +320,7 @@ impl fmt::Display for CliError {
             CliError::EngineCheck(error) => write!(f, "check: {error}"),
             CliError::ProcAnswers(error) => write!(f, "{error}"),
             CliError::Clean(error) => write!(f, "{error}"),
+            CliError::Gc(error) => write!(f, "{error}"),
             CliError::JournalHelper(error) => write!(f, "{error}"),
             CliError::Input { name, why } => write!(f, "the input {name} a task needed could not be read: {why}"),
             CliError::Shelf(error) => write!(f, "{error}"),
@@ -639,6 +644,8 @@ fn command(
         Some("explain") => explain(cx, args.get(2), out),
         // The checkout's state, and with `--store` the home's store, removed (clean.rs).
         Some("clean") => clean::run(cx, fs, env, args, out),
+        // Bounded store compaction, root-LRU budget eviction, and stale old-format cleanup (gc.rs).
+        Some("gc") => gc::run(cx, args, fs, env, host, clock, rng, out, err, heap),
         // Hidden: the checkout's journal helper, run by hand until a command starts one
         // (journal_ask.rs `HelperStart`): one stream held open, asks answered on its socket.
         Some("journal-helper") => journal_helper::run(cx, fs, clock, host, rng, env, args, out),
@@ -655,7 +662,7 @@ fn command(
         }
         Some("warm-toolchain") => engine_check::warm_toolchain(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap),
         Some("store") => store::publish_command::run(cx, args, fs, env, clock, host, rng, out, err, heap),
-        Some(_) | None => Err(CliError::Usage("the command is check, run, test, clean, warm-toolchain or explain")),
+        Some(_) | None => Err(CliError::Usage("the command is check, run, test, clean, gc, warm-toolchain or explain")),
     }
 }
 

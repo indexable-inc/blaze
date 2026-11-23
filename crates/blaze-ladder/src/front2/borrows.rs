@@ -26,7 +26,7 @@ use blaze_typeck as tc;
 use core::alloc::Allocator;
 
 use super::body::Body;
-use super::borrow_reads::{AdtAnswer, HeadAnswer, adt_read, file_borrow_reads, head_read, impl_read};
+use super::borrow_reads::{AdtAnswer, HeadAnswer, adt_read, copy_supertrait_read, file_borrow_reads, head_read, impl_read};
 use super::check::{Records, answer_impls, eval_len};
 use super::reads::Read;
 use super::borrows_nested::{FlowOf, NestedFacts, Requirements, closure_flow_of, flow_of, nested_inner_first, nested_range, next_nested};
@@ -434,6 +434,8 @@ pub struct BorrowLangs {
     pub copy: Option<tc::ItemKey>,
     pub drop: Option<tc::ItemKey>,
     pub owned_box: Option<tc::ItemKey>,
+    pub manually_drop: Option<tc::ItemKey>,
+    pub phantom_data: Option<tc::ItemKey>,
     /// `Clone`: a `Copy` impl's `T: Clone` bound beside `T: Copy` asks nothing more of `T`
     /// (`Copy: Clone`), read by [`Facts::copy_args`]'s provider (borrow_fields.rs).
     pub clone: Option<tc::ItemKey>,
@@ -453,6 +455,8 @@ impl BorrowLangs {
             copy: lang("copy"),
             drop: lang("drop"),
             owned_box: lang("owned_box"),
+            manually_drop: lang("manually_drop"),
+            phantom_data: lang("phantom_data"),
             clone: lang("clone"),
             relates_nothing: [lang("sized"), lang("meta_sized"), lang("pointee_sized"), lang("destruct")],
         }
@@ -478,6 +482,10 @@ pub struct BorrowFacts<'a> {
     /// needs are in `copy_need` (borrow_fields.rs `copy_args_of`; `Facts::copy_args`).
     copy_args: AVec<'a, (u128, u32, u32)>,
     copy_need: AVec<'a, bool>,
+    /// Per ADT whose structural drop summary was read, sorted by checker key: where its
+    /// arguments' drop flags are in `drop_need` (borrow_fields.rs `drop_facts_of`; `Facts::drop_args`).
+    drop_args: AVec<'a, (u128, u32, u32)>,
+    drop_need: AVec<'a, bool>,
     /// The body owner's type parameters bounded by `Copy` in its clauses (own and inherited:
     /// `Preds::clauses`), sorted, each once (`Facts::param_copy`).
     param_copy: AVec<'a, u32>,
@@ -592,6 +600,8 @@ impl<'a> BorrowFacts<'a> {
             field_regions: blaze_hash::HashMap::new_in(alloc),
             copy_args: AVec::new_in(alloc),
             copy_need: AVec::new_in(alloc),
+            drop_args: AVec::new_in(alloc),
+            drop_need: AVec::new_in(alloc),
             param_copy: AVec::new_in(alloc),
             callees: AVec::new_in(alloc),
             calls: super::call_generics::CallBoundsTable::new_in(alloc),
@@ -710,7 +720,16 @@ impl Facts for ReadBy<'_, '_> {
     fn copy_args(&self, adt: tc::ItemKey) -> Option<&[bool]> {
         let at = self.facts.copy_args.binary_search_by_key(&adt.0, |&(k, _, _)| k).ok()?;
         let &(_, start, len) = self.facts.copy_args.get(at)?;
-        self.facts.copy_need.get(start as usize..(start + len) as usize)
+        let start = usize::try_from(start).ok()?;
+        let end = start.checked_add(usize::try_from(len).ok()?)?;
+        self.facts.copy_need.get(start..end)
+    }
+    fn drop_args(&self, adt: tc::ItemKey) -> Option<&[bool]> {
+        let at = self.facts.drop_args.binary_search_by_key(&adt.0, |&(k, _, _)| k).ok()?;
+        let &(_, start, len) = self.facts.drop_args.get(at)?;
+        let start = usize::try_from(start).ok()?;
+        let end = start.checked_add(usize::try_from(len).ok()?)?;
+        self.facts.drop_need.get(start..end)
     }
     fn param_copy(&self, index: u32) -> bool {
         self.facts.param_copy.binary_search(&index).is_ok()
@@ -1019,22 +1038,84 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     g.constant_initializer = r.keys.library_in(r.names, owner).is_some_and(|lib| {
         matches!(r.names.detail_of(lib), Some(blaze_surface::ItemDetail::Const { .. } | blaze_surface::ItemDetail::Static { .. }))
     });
-    // The owner's `T: Copy` clauses (own and inherited, as the call bounds read them below):
-    // a value of such a parameter is copied, never moved (the Reference, "Copy types"). Its
-    // read is the owner's head row, filed with the heads' (rule 21). A bound only implied by
-    // a supertrait (`T: Tr` with `trait Tr: Copy`) is not read: the parameter stays moved,
-    // the stricter answer for a move (it can only add a finding).
-    if let Some(copy) = langs.copy
-        && let Some(p) = r.store.preds.get(&owner)
-    {
-        let tys = r.store.tys.view();
-        for c in p.clauses.iter() {
-            if let tc::PClause::Trait { trait_, args } = *c
-                && trait_ == copy
-                && let Ok(&[t]) = tys.list(args)
-                && let Ok(tc::PNode::Param(i)) = tys.node(t)
-            {
-                g.param_copy.push(i);
+    // The owner's `T: Copy` clauses (own and inherited), including transitive supertraits
+    // (`T: Tr` where `trait Tr: Copy`, e.g. `Planted<P>: Copy`, `ArbitraryInt: Copy`): a value
+    // of such a parameter is copied, never moved (the Reference, "Copy types"). Each inspected
+    // trait's direct `Self` supertraits are filed as a `BorrowHead` read row (rule 21).
+    if let Some(copy) = langs.copy {
+        let mut param_traits: AVec<'a, (u32, tc::ItemKey)> = AVec::new_in(alloc);
+        if let Some(p) = r.store.preds.get(&owner) {
+            let tys = r.store.tys.view();
+            for c in p.clauses.iter() {
+                if let tc::PClause::Trait { trait_, args } = *c
+                    && let Ok(list) = tys.list(args)
+                    && let Some(&first) = list.first()
+                    && let Ok(tc::PNode::Param(i)) = tys.node(first)
+                {
+                    if trait_ == copy {
+                        g.param_copy.push(i);
+                    } else {
+                        param_traits.push((i, trait_));
+                    }
+                }
+            }
+        }
+        if !param_traits.is_empty() {
+            let mut visited: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+            let mut stack: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+            let mut direct: AVec<'a, u128> = AVec::new_in(alloc);
+            let mut recorded: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+            for &(param, start_trait) in param_traits.iter() {
+                if g.param_copy.scan_for(&param).is_some() {
+                    continue;
+                }
+                visited.clear();
+                stack.clear();
+                stack.push(start_trait);
+                let mut found_copy = false;
+                while let Some(t) = stack.pop() {
+                    if t == copy {
+                        found_copy = true;
+                        break;
+                    }
+                    if visited.scan_for(&t).is_some() || visited.len() >= 64 {
+                        continue;
+                    }
+                    visited.push(t);
+                    if !r.store.trait_defs.contains_key(&t)
+                        && let Some(lib) = r.keys.library_in(r.names, t)
+                    {
+                        ensure_one(r, Want::Members(lib));
+                    }
+                    direct.clear();
+                    if let Some(def) = r.store.trait_defs.get(&t) {
+                        let tys = r.store.tys.view();
+                        for sc in def.supertraits.iter() {
+                            if let tc::PClause::Trait { trait_: sup, args } = *sc
+                                && let Ok(list) = tys.list(args)
+                                && let Some(&first) = list.first()
+                                && matches!(tys.node(first), Ok(tc::PNode::Param(0)))
+                            {
+                                direct.push(sup.0);
+                            }
+                        }
+                        direct.sort_unstable();
+                        direct.dedup();
+                        if recorded.scan_for(&t).is_none() {
+                            recorded.push(t);
+                            g.reads.push(copy_supertrait_read(t.0, Some(&direct)));
+                        }
+                        for &sup in direct.iter() {
+                            stack.push(tc::ItemKey(sup));
+                        }
+                    } else if recorded.scan_for(&t).is_none() {
+                        recorded.push(t);
+                        g.reads.push(copy_supertrait_read(t.0, None));
+                    }
+                }
+                if found_copy {
+                    g.param_copy.push(param);
+                }
             }
         }
         g.param_copy.sort_unstable();
@@ -1158,10 +1239,14 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             g.variance_at.push((k, lo, hi));
         }
         let copy_taken = copy.unwrap_or(false);
+        let (needs_drop, drop_need) = fields::drop_facts_of(r, langs, key, drop_impl, &mut g.drop_need, &mut g.reads, alloc);
+        if let Some((start, len)) = drop_need {
+            g.drop_args.push((k, start, len));
+        }
         let facts = AdtFacts {
             copy: copy_taken,
             drop_impl: drop_impl.unwrap_or(false),
-            needs_drop: !copy_taken,
+            needs_drop,
             lifetimes,
             union: kind == tc::AdtKind::Union,
             is_enum: kind == tc::AdtKind::Enum,
@@ -1173,8 +1258,21 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         for &(_, _, _, count) in g.variants[variants_from..].iter() {
             variant_lens.push(count);
         }
-        let copy_args = copy_need.and_then(|(start, len)| g.copy_need.get(start as usize..(start + len) as usize));
-        let variances = variances.and_then(|(lo, hi)| g.variance_list.get(lo as usize..hi as usize));
+        let copy_args = copy_need.and_then(|(start, len)| {
+            let s = usize::try_from(start).ok()?;
+            let e = s.checked_add(usize::try_from(len).ok()?)?;
+            g.copy_need.get(s..e)
+        });
+        let drop_args = drop_need.and_then(|(start, len)| {
+            let s = usize::try_from(start).ok()?;
+            let e = s.checked_add(usize::try_from(len).ok()?)?;
+            g.drop_need.get(s..e)
+        });
+        let variances = variances.and_then(|(lo, hi)| {
+            let s = usize::try_from(lo).ok()?;
+            let e = usize::try_from(hi).ok()?;
+            g.variance_list.get(s..e)
+        });
         let mut absent = AVec::new_in(alloc);
         let spans = if plant == FactsPlant::NoFieldRegions {
             absent.resize(field_count, NO_ROW);
@@ -1195,6 +1293,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 field_regions: spans,
                 region_list: &regions.list,
                 copy_args,
+                drop_args,
                 variances,
             },
         );

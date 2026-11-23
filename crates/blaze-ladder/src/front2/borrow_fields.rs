@@ -30,10 +30,13 @@ use blaze_typeck as tc;
 use blaze_typeck::region_facts::RegionFacts;
 use blaze_typeck::regions::{Arity, Region, RegionError, Unknown, region_arity, slots};
 
+use crate::front2::borrow_reads::drop_adt_read;
 use crate::front2::check::{Records, answer_impls};
 use crate::front2::heads::{Store, Want};
 use crate::front2::keys::{Keys, checker_of};
+use crate::front2::reads::Read;
 use crate::front2::source::NamesSource;
+use crate::front2::tables::view::BodyHeadFacts;
 use crate::front2::types::{HeadsArity, Why};
 
 /// A field with no row in `at` (its regions not known).
@@ -310,8 +313,9 @@ fn read_copy_impl<'a>(store: &Store<'_>, langs: super::BorrowLangs, adt: tc::Ite
         return None;
     }
     let args = tys.list(l).ok()?;
-    // Per argument: the impl's parameter it is (distinct), or a const (asks nothing of `Copy`).
+    // Per argument: the impl's type or const parameter it is (distinct).
     let mut param_of: AVec<'a, Option<u32>> = AVec::new_in(alloc);
+    let mut const_of: AVec<'a, Option<u32>> = AVec::new_in(alloc);
     for &a in args {
         match tys.node(a).ok()? {
             tc::PNode::Param(p) => {
@@ -319,8 +323,16 @@ fn read_copy_impl<'a>(store: &Store<'_>, langs: super::BorrowLangs, adt: tc::Ite
                     return None;
                 }
                 param_of.push(Some(p));
+                const_of.push(None);
             }
-            tc::PNode::ConstParam(_) | tc::PNode::ConstValue { .. } => param_of.push(None),
+            tc::PNode::ConstParam(cp) => {
+                param_of.push(None);
+                const_of.push(Some(cp));
+            }
+            tc::PNode::ConstValue { .. } => {
+                param_of.push(None);
+                const_of.push(None);
+            }
             _ => return None,
         }
     }
@@ -329,25 +341,28 @@ fn read_copy_impl<'a>(store: &Store<'_>, langs: super::BorrowLangs, adt: tc::Ite
         need.push(false);
     }
     let mut cloned: AVec<'a, usize> = AVec::new_in(alloc);
-    let sized = store.sized.map(checker_of);
+    let [sized, meta_sized, pointee_sized, destruct] = langs.relates_nothing;
+    let sized = sized.or_else(|| store.sized.map(checker_of));
     let adt_preds = store.preds.get(&adt)?;
     for c in store.preds.get(&imp)?.clauses.iter() {
         let tc::PClause::Trait { trait_, args: cargs } = *c else { return None };
+        // `PointeeSized` and `Destruct` hold for every type and ask nothing of the arguments.
+        if Some(trait_) == pointee_sized || Some(trait_) == destruct {
+            continue;
+        }
+        // Any trait clause already required by the ADT's own predicates (with impl params mapped
+        // to the ADT's) is implied by well-formedness of any value of the ADT.
+        if trait_clause_in_preds(tys, trait_, cargs, &param_of, &const_of, &adt_preds.clauses) {
+            continue;
+        }
         let &[self_ty] = tys.list(cargs).ok()? else { return None };
         let tc::PNode::Param(p) = tys.node(self_ty).ok()? else { return None };
         let j = param_of.iter().position(|&q| q == Some(p))?;
         if trait_ == copy {
             need[start + j] = true;
-        } else if Some(trait_) == sized {
-            // Implied by the ADT's own well-formedness only when the ADT bounds its own
-            // parameter `j` (`Param(j)` in its record) by `Sized` too.
-            let bounded = adt_preds.clauses.iter().any(|ac| match *ac {
-                tc::PClause::Trait { trait_: at, args: aargs } if at == trait_ => match tys.list(aargs) {
-                    Ok(&[t]) => matches!(tys.node(t), Ok(tc::PNode::Param(q)) if q as usize == j),
-                    _ => false,
-                },
-                _ => false,
-            });
+        } else if Some(trait_) == meta_sized {
+            // `Sized: MetaSized`: if the ADT bounds param `j` by `Sized`, `MetaSized` holds.
+            let bounded = sized.is_some_and(|s| adt_param_has_trait(tys, &adt_preds.clauses, s, j));
             if !bounded {
                 return None;
             }
@@ -362,6 +377,465 @@ fn read_copy_impl<'a>(store: &Store<'_>, langs: super::BorrowLangs, adt: tc::Ite
         return None;
     }
     Some(())
+}
+
+fn adt_param_has_trait(tys: tc::PTys<'_>, clauses: &[tc::PClause], want_trait: tc::ItemKey, j: usize) -> bool {
+    let Ok(j_u32) = u32::try_from(j) else { return false };
+    clauses.iter().any(|ac| match *ac {
+        tc::PClause::Trait { trait_, args } if trait_ == want_trait => match tys.list(args) {
+            Ok(&[t]) => matches!(tys.node(t), Ok(tc::PNode::Param(q)) if q == j_u32),
+            _ => false,
+        },
+        _ => false,
+    })
+}
+
+fn trait_clause_in_preds(
+    tys: tc::PTys<'_>,
+    want_trait: tc::ItemKey,
+    want_args: tc::List,
+    param_of: &[Option<u32>],
+    const_of: &[Option<u32>],
+    adt_clauses: &[tc::PClause],
+) -> bool {
+    let Ok(w_list) = tys.list(want_args) else { return false };
+    for ac in adt_clauses {
+        let tc::PClause::Trait { trait_, args } = *ac else { continue };
+        if trait_ != want_trait {
+            continue;
+        }
+        let Ok(a_list) = tys.list(args) else { continue };
+        if w_list.len() != a_list.len() {
+            continue;
+        }
+        let mut budget = 64u32;
+        if w_list.iter().zip(a_list.iter()).all(|(&w, &a)| mapped_pty_eq(tys, w, a, param_of, const_of, &mut budget)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn mapped_pty_eq(
+    tys: tc::PTys<'_>,
+    imp_ty: tc::PTy,
+    adt_ty: tc::PTy,
+    param_of: &[Option<u32>],
+    const_of: &[Option<u32>],
+    budget: &mut u32,
+) -> bool {
+    let mut stack = [(tc::PTy(0), tc::PTy(0)); 64];
+    let mut top = 1usize;
+    if let Some(first) = stack.first_mut() {
+        *first = (imp_ty, adt_ty);
+    }
+    let push = |stack: &mut [(tc::PTy, tc::PTy); 64], top: &mut usize, pair: (tc::PTy, tc::PTy)| -> bool {
+        let Some(slot) = stack.get_mut(*top) else { return false };
+        *slot = pair;
+        *top += 1;
+        true
+    };
+    while top > 0 {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        top -= 1;
+        let Some(&(it, at)) = stack.get(top) else { return false };
+        let (Ok(in_), Ok(an)) = (tys.node(it), tys.node(at)) else { return false };
+        match (in_, an) {
+            (tc::PNode::Param(p), tc::PNode::Param(q)) => {
+                if usize::try_from(q).ok().and_then(|qi| param_of.get(qi)).copied() != Some(Some(p)) {
+                    return false;
+                }
+            }
+            (tc::PNode::ConstParam(p), tc::PNode::ConstParam(q)) => {
+                if usize::try_from(q).ok().and_then(|qi| const_of.get(qi)).copied() != Some(Some(p)) {
+                    return false;
+                }
+            }
+            (tc::PNode::Adt(k1, l1), tc::PNode::Adt(k2, l2)) if k1 == k2 => {
+                let (Ok(a), Ok(b)) = (tys.list(l1), tys.list(l2)) else { return false };
+                if a.len() != b.len() {
+                    return false;
+                }
+                for (&x, &y) in a.iter().zip(b.iter()) {
+                    if !push(&mut stack, &mut top, (x, y)) {
+                        return false;
+                    }
+                }
+            }
+            (tc::PNode::Tuple(l1), tc::PNode::Tuple(l2)) => {
+                let (Ok(a), Ok(b)) = (tys.list(l1), tys.list(l2)) else { return false };
+                if a.len() != b.len() {
+                    return false;
+                }
+                for (&x, &y) in a.iter().zip(b.iter()) {
+                    if !push(&mut stack, &mut top, (x, y)) {
+                        return false;
+                    }
+                }
+            }
+            (tc::PNode::Ref(m1, i1), tc::PNode::Ref(m2, i2)) if m1 == m2 => {
+                if !push(&mut stack, &mut top, (i1, i2)) {
+                    return false;
+                }
+            }
+            (tc::PNode::Ptr(m1, i1), tc::PNode::Ptr(m2, i2)) if m1 == m2 => {
+                if !push(&mut stack, &mut top, (i1, i2)) {
+                    return false;
+                }
+            }
+            (tc::PNode::Slice(i1), tc::PNode::Slice(i2)) => {
+                if !push(&mut stack, &mut top, (i1, i2)) {
+                    return false;
+                }
+            }
+            (tc::PNode::Array(i1, c1), tc::PNode::Array(i2, c2)) => {
+                if !push(&mut stack, &mut top, (c1, c2)) || !push(&mut stack, &mut top, (i1, i2)) {
+                    return false;
+                }
+            }
+            (a, b)
+                if a == b
+                    && !matches!(
+                        a,
+                        tc::PNode::Param(_)
+                            | tc::PNode::ConstParam(_)
+                            | tc::PNode::Adt(..)
+                            | tc::PNode::Tuple(_)
+                            | tc::PNode::Ref(..)
+                            | tc::PNode::Ptr(..)
+                            | tc::PNode::Slice(_)
+                            | tc::PNode::Array(..)
+                    ) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// The most ADTs one structural `needs_drop` walk visits (rule 18): past it, the root is taken
+/// as unconditionally needing drop (conservative, never unsound).
+const MOST_DROP_ADTS: usize = 256;
+const MOST_DROP_NODES: u32 = 4096;
+
+/// Structural drop summary for `adt`: `(needs_drop_unconditionally, drop_args_span)`.
+/// Computes a bounded fixed point over ADTs reachable from `adt`'s fields in dropping positions
+/// and files a `BorrowAdt` (`DROP_ADT_DETAIL`) read row for each nested ADT inspected (rule 21).
+#[expect(clippy::too_many_arguments, reason = "the ADT's already-queried Copy/Drop facts and output buffers")]
+pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    langs: super::BorrowLangs,
+    adt: tc::ItemKey,
+    adt_drop_impl: Option<bool>,
+    need: &mut AVec<'a, bool>,
+    reads: &mut AVec<'a, Read>,
+    alloc: Alloc<'a>,
+) -> (bool, Option<(u32, u32)>) {
+    let is_inert = |k: tc::ItemKey| langs.manually_drop == Some(k) || langs.phantom_data == Some(k);
+    if is_inert(adt) {
+        let generics = BodyHeadFacts::new(&*r.store, r.names).adt(adt).map_or(0, |row| row.generics);
+        return push_drop_mask(generics, 0, need);
+    }
+    if adt_drop_impl != Some(false) {
+        return (true, None);
+    }
+    let Some(root_row) = BodyHeadFacts::new(&*r.store, r.names).adt(adt) else {
+        return (true, None);
+    };
+    let root_generics = root_row.generics;
+    if root_row.kind == tc::AdtKind::Union {
+        return push_drop_mask(root_generics, 0, need);
+    }
+    if root_generics > 64 {
+        return (true, None);
+    }
+
+    // Discover reachable ADTs in dropping positions (BFS, bounded by MOST_DROP_ADTS).
+    struct DropNode {
+        key: tc::ItemKey,
+        fixed: Option<(bool, u64)>,
+        generics: u32,
+        uncond: bool,
+        params: u64,
+    }
+    let mut nodes: AVec<'a, DropNode> = AVec::new_in(alloc);
+    nodes.push(DropNode { key: adt, fixed: None, generics: root_generics, uncond: false, params: 0 });
+    let mut cursor = 0usize;
+    let mut capped = false;
+    let mut field_tys: AVec<'a, tc::PTy> = AVec::new_in(alloc);
+    let mut field_spans: AVec<'a, (usize, usize)> = AVec::new_in(alloc);
+    let mut ty_stack: AVec<'a, tc::PTy> = AVec::new_in(alloc);
+
+    while let Some(key) = nodes.get(cursor).map(|n| n.key) {
+        let is_root = cursor == 0;
+        let inert = is_inert(key);
+        if !is_root && !r.store.adts.contains_key(&key) {
+            if let Some(lib) = r.keys.library_in(r.names, key) {
+                super::ensure_one(r, Want::Adt(lib));
+            }
+        }
+        let drop_impl = if is_root {
+            adt_drop_impl
+        } else if inert {
+            Some(false)
+        } else {
+            super::has_impl(r, langs.drop, key).ok()
+        };
+        let row_opt = BodyHeadFacts::new(&*r.store, r.names).adt(key);
+        let (made, union, generics) = match row_opt {
+            Some(row) => (true, row.kind == tc::AdtKind::Union, row.generics),
+            None => (false, false, 0),
+        };
+        let fields_start = field_tys.len();
+        let mut fhash = tc::StableHasher::new("blaze-ladder front2 borrow drop fields v1");
+        if let Some(row) = row_opt {
+            let tys = r.store.tys.view();
+            fhash.u32(u32::try_from(row.fields.len()).unwrap_or(u32::MAX));
+            for f in row.fields.iter() {
+                field_tys.push(f.ty);
+                let mut hb = MOST_DROP_NODES;
+                hash_pty_for_drop(tys, f.ty, &mut fhash, &mut hb, &mut ty_stack);
+            }
+        }
+        let fields_end = field_tys.len();
+        field_spans.push((fields_start, fields_end));
+        if !is_root {
+            reads.push(drop_adt_read(key.0, made, union, inert, drop_impl, generics, fhash.finish()));
+        }
+
+        let fixed = if inert {
+            Some((false, 0))
+        } else if !made || generics > 64 || drop_impl != Some(false) {
+            Some((true, 0))
+        } else if union {
+            Some((false, 0))
+        } else {
+            None
+        };
+        if let Some(node) = nodes.get_mut(cursor) {
+            node.generics = generics;
+            node.fixed = fixed;
+            if let Some((u, p)) = fixed {
+                node.uncond = u;
+                node.params = p;
+            }
+        }
+        if fixed.is_none() {
+            // Enqueue ADTs mentioned in this node's fields (stopping at Ref / Ptr).
+            let tys = r.store.tys.view();
+            ty_stack.clear();
+            if let Some(slice) = field_tys.get(fields_start..fields_end) {
+                ty_stack.extend_from_slice(slice);
+            }
+            let mut steps = 0u32;
+            while let Some(t) = ty_stack.pop() {
+                steps += 1;
+                if steps > MOST_DROP_NODES {
+                    capped = true;
+                    break;
+                }
+                match tys.node(t) {
+                    Ok(tc::PNode::Tuple(l)) => {
+                        if let Ok(es) = tys.list(l) {
+                            ty_stack.extend_from_slice(es);
+                        }
+                    }
+                    Ok(tc::PNode::Array(elem, _) | tc::PNode::Pat(elem, _)) => ty_stack.push(elem),
+                    Ok(tc::PNode::Adt(nested, args)) => {
+                        if !nodes.iter().any(|n| n.key == nested) {
+                            if nodes.len() >= MOST_DROP_ADTS {
+                                capped = true;
+                                break;
+                            }
+                            nodes.push(DropNode { key: nested, fixed: None, generics: 0, uncond: false, params: 0 });
+                        }
+                        if let Ok(es) = tys.list(args) {
+                            ty_stack.extend_from_slice(es);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        cursor += 1;
+    }
+
+    if capped {
+        return (true, None);
+    }
+
+    // Monotone fixed point over `nodes`: each pass only sets `uncond = true` or sets bits in `params`.
+    let tys = r.store.tys.view();
+    let max_iters = nodes.len().saturating_add(2);
+    for _ in 0..max_iters {
+        let mut changed = false;
+        for idx in 0..nodes.len() {
+            let Some((fixed, generics, old_uncond, old_params)) = nodes.get(idx).map(|n| (n.fixed, n.generics, n.uncond, n.params)) else {
+                continue;
+            };
+            if fixed.is_some() || old_uncond {
+                continue;
+            }
+            let Some(&(fs, fe)) = field_spans.get(idx) else { continue };
+            let mut uncond = old_uncond;
+            let mut params = old_params;
+            ty_stack.clear();
+            if let Some(slice) = field_tys.get(fs..fe) {
+                ty_stack.extend_from_slice(slice);
+            }
+            let mut steps = 0u32;
+            while let Some(t) = ty_stack.pop() {
+                steps += 1;
+                if steps > MOST_DROP_NODES {
+                    uncond = true;
+                    break;
+                }
+                match tys.node(t) {
+                    Ok(
+                        tc::PNode::Bool
+                        | tc::PNode::Char
+                        | tc::PNode::Int(_)
+                        | tc::PNode::Uint(_)
+                        | tc::PNode::Float(_)
+                        | tc::PNode::Never
+                        | tc::PNode::Ptr(..)
+                        | tc::PNode::Ref(..)
+                        | tc::PNode::FnDef(..)
+                        | tc::PNode::FnPtr(..)
+                        | tc::PNode::ConstValue { .. }
+                        | tc::PNode::ConstParam(_),
+                    ) => {}
+                    Ok(tc::PNode::Param(p)) => {
+                        if p < generics && p < 64 {
+                            params |= 1u64 << p;
+                        } else {
+                            uncond = true;
+                            break;
+                        }
+                    }
+                    Ok(tc::PNode::Tuple(l)) => match tys.list(l) {
+                        Ok(es) => ty_stack.extend_from_slice(es),
+                        Err(_) => {
+                            uncond = true;
+                            break;
+                        }
+                    },
+                    Ok(tc::PNode::Array(elem, _) | tc::PNode::Pat(elem, _)) => ty_stack.push(elem),
+                    Ok(tc::PNode::Adt(nested, args)) => {
+                        let Some(target) = nodes.iter().find(|n| n.key == nested) else {
+                            uncond = true;
+                            break;
+                        };
+                        if target.uncond {
+                            uncond = true;
+                            break;
+                        }
+                        let mask = target.params;
+                        let Ok(es) = tys.list(args) else {
+                            uncond = true;
+                            break;
+                        };
+                        for (j, &arg) in es.iter().enumerate() {
+                            if j >= 64 || (mask & (1u64 << j)) != 0 {
+                                ty_stack.push(arg);
+                            }
+                        }
+                    }
+                    _ => {
+                        uncond = true;
+                        break;
+                    }
+                }
+            }
+            if (uncond != old_uncond || params != old_params)
+                && let Some(node) = nodes.get_mut(idx)
+            {
+                node.uncond = uncond;
+                node.params = params;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    match nodes.first() {
+        Some(root) if !root.uncond => push_drop_mask(root_generics, root.params, need),
+        _ => (true, None),
+    }
+}
+
+fn push_drop_mask(generics: u32, mask: u64, need: &mut AVec<'_, bool>) -> (bool, Option<(u32, u32)>) {
+    let Ok(start) = u32::try_from(need.len()) else { return (true, None) };
+    for j in 0..generics {
+        need.push(j < 64 && (mask & (1u64 << j)) != 0);
+    }
+    (false, Some((start, generics)))
+}
+
+fn hash_pty_for_drop(tys: tc::PTys<'_>, root: tc::PTy, h: &mut tc::StableHasher, budget: &mut u32, stack: &mut AVec<'_, tc::PTy>) {
+    stack.clear();
+    stack.push(root);
+    while let Some(ty) = stack.pop() {
+        if *budget == 0 {
+            h.tag(0xff);
+            stack.clear();
+            return;
+        }
+        *budget -= 1;
+        match tys.node(ty) {
+            Ok(tc::PNode::Bool) => h.tag(1),
+            Ok(tc::PNode::Char) => h.tag(2),
+            Ok(tc::PNode::Int(_)) => h.tag(3),
+            Ok(tc::PNode::Uint(_)) => h.tag(4),
+            Ok(tc::PNode::Float(_)) => h.tag(5),
+            Ok(tc::PNode::Never) => h.tag(6),
+            Ok(tc::PNode::Ptr(..)) => h.tag(7),
+            Ok(tc::PNode::Ref(..)) => h.tag(8),
+            Ok(tc::PNode::FnDef(..)) => h.tag(9),
+            Ok(tc::PNode::FnPtr(..)) => h.tag(10),
+            Ok(tc::PNode::ConstValue { .. }) => h.tag(11),
+            Ok(tc::PNode::ConstParam(cp)) => {
+                h.tag(12);
+                h.u32(cp);
+            }
+            Ok(tc::PNode::Param(p)) => {
+                h.tag(13);
+                h.u32(p);
+            }
+            Ok(tc::PNode::Tuple(l)) => {
+                h.tag(14);
+                if let Ok(es) = tys.list(l) {
+                    h.u32(u32::try_from(es.len()).unwrap_or(u32::MAX));
+                    for &e in es.iter().rev() {
+                        stack.push(e);
+                    }
+                }
+            }
+            Ok(tc::PNode::Array(elem, _)) => {
+                h.tag(15);
+                stack.push(elem);
+            }
+            Ok(tc::PNode::Pat(elem, _)) => {
+                h.tag(16);
+                stack.push(elem);
+            }
+            Ok(tc::PNode::Adt(k, args)) => {
+                h.tag(17);
+                h.u128(k.0);
+                if let Ok(es) = tys.list(args) {
+                    h.u32(u32::try_from(es.len()).unwrap_or(u32::MAX));
+                    for &e in es.iter().rev() {
+                        stack.push(e);
+                    }
+                }
+            }
+            _ => h.tag(18),
+        }
+    }
 }
 
 #[cfg(test)]

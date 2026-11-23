@@ -363,7 +363,7 @@ fn a_new_view_is_pinned_and_read_after_reopening_the_store() {
         let fs = io.need_fs().unwrap();
         let host = io.need_host().unwrap();
         let mut rng = io.need_rng().unwrap();
-        let opened = crate::store::open_for_command(&cx, &fs, &host, &mut rng, Some("/h"), &root, "ws", &clock, &err, heap).unwrap();
+        let opened = crate::store::open_for_command(&cx, &fs, &host, &mut rng, Some("/h"), None, &root, "ws", &clock, &err, heap).unwrap();
         let erased = blaze_own::Erased::new(frame);
         let mut store = crate::store::CommandStore::new(&cx, &opened.lent, false, opened.open_ns, None, clock.clone(), &err, erased.handle()).unwrap();
         let mut request = shown(view, frame);

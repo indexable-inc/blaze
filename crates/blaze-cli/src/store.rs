@@ -27,9 +27,9 @@ use core::fmt;
 use core::time::Duration;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use blaze_cas::plain::{Lent, Settings, Snapshot};
+use blaze_cas::plain::{Lent, Liveness, Settings, Snapshot};
 use blaze_core::Driver;
-use blaze_own::{Alloc, Arc};
+use blaze_own::{Alloc, Arc, Share};
 use blaze_remote::PublicKey;
 use blaze_remote::published::set::SetCheck;
 use blaze_remote::read::{Answer, BatchError, Ed25519Keys, HeadCheck, Limits, Namespace, Object, Origin, OriginError, Reader, SignatureWhy, Unfetched, fetch};
@@ -570,6 +570,7 @@ impl From<PlaceError> for CliError {
 /// through the effect layer as a second tree ([`Fs::home`]), wherever it is.
 pub struct Home {
     dir: Dir<ReadWrite>,
+    bg_gc: crate::gc::BgGc,
 }
 
 impl Home {
@@ -578,7 +579,7 @@ impl Home {
     pub fn of(cx: &Cx, fs: &Fs, home: Option<&str>) -> Result<Home, CliError> {
         let Some(home) = home else { return Err(CliError::Store(StoreFailure::NoHome)) };
         match fs.home(cx, home, &Path::new(HOME_FOLDER)?) {
-            Ok(dir) => Ok(Home { dir }),
+            Ok(dir) => Ok(Home { dir, bg_gc: crate::gc::BgGc::None }),
             Err(error) => Err(CliError::Store(StoreFailure::Home(error))),
         }
     }
@@ -593,6 +594,16 @@ impl Home {
         let driver = self.dir.lend(&Path::new(plain_place::STORE_DIR)?);
         let dir = driver.dir().clone();
         Ok(plain_place::open(driver, plain_place::config(dir, settings, facts, alloc), alloc)?)
+    }
+
+    /// Opens the store with an explicit [`Liveness`] policy (used by `blaze gc` to sweep
+    /// unreachable records with [`Liveness::Reached`]).
+    pub(crate) fn open_store_with_liveness(&self, settings: &Settings, facts: Facts, liveness: Liveness, alloc: StoreAlloc) -> Result<Lent<bstd::io::LentDriver, StoreAlloc>, CliError> {
+        let driver = self.dir.lend(&Path::new(plain_place::STORE_DIR)?);
+        let dir = driver.dir().share();
+        let mut cfg = plain_place::config(dir, settings, facts, alloc);
+        cfg.liveness = liveness;
+        Ok(plain_place::open(driver, cfg, alloc)?)
     }
 }
 
@@ -782,14 +793,16 @@ pub fn open_for_command(
     fs: &bstd::fs::Fs,
     host: &bstd::host::Host,
     rng: &mut bstd::rng::Rng,
-    home: Option<&str>,
+    home_str: Option<&str>,
+    max_store_bytes: Option<u64>,
     checkout_root: &Dir<ReadWrite>,
     checkout: &str,
     clock: &Clock,
     err: &Out,
     heap: &'static blaze_own::Heap,
 ) -> Result<Opened, CliError> {
-    let home = Home::of(cx, fs, home)?;
+    let mut home = Home::of(cx, fs, home_str)?;
+    home.bg_gc = crate::gc::BgGc::detached(cx, host, home_str, max_store_bytes, heap.alloc());
     let boot = match host.boot() {
         Ok(boot) => Some(boot_fact(&boot)),
         Err(why) => {
@@ -801,8 +814,8 @@ pub fn open_for_command(
     let ns = |clock: &Clock| u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX);
     let began = ns(clock);
     // A trusted builder's store may name the public namespace ([`TRUSTED_BUILDER`]); a
-    // developer's only its own.
-    let settings = Settings { trusted_writer: TRUSTED_BUILDER, ..Settings::default() };
+    // developer's only its own. Budget defaults to 32 GiB unless overridden via env.
+    let settings = Settings { max_store_bytes, trusted_writer: TRUSTED_BUILDER, ..Settings::default() };
     let lent = home.open_store(&settings, Facts { boot, nonce }, heap.alloc())?;
     let open_ns = ns(clock).saturating_sub(began);
     old_home(cx, &home, checkout_root, checkout, &lent, err)?;
@@ -843,11 +856,22 @@ pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool
         ),
         plain_place::AfterAnswerQos::AsCalled => None,
     };
-    let slices = if lent.needs_housekeeping(lent.wall_ns()) { AFTER_ANSWER_SLICES } else { 0 };
+    let needs_hk = lent.needs_housekeeping(lent.wall_ns());
+    let bg_detached = home.bg_gc.is_detached();
+    // Warm no-op fast path: when needs_housekeeping is false, 0 slices and 0 spawns.
+    // On a native host when housekeeping is needed (over budget, tiers over K, expired roots,
+    // or retired files ready), commit + seal immediately with 0 foreground slices and spawn
+    // detached `blaze gc --background` (QOS_CLASS_BACKGROUND + non-blocking gc.lock) so CLI
+    // exit is never delayed. In simulated worlds without a spawner, run inline slices.
+    let slices = if needs_hk && !bg_detached { AFTER_ANSWER_SLICES } else { 0 };
     let after = plain_place::after_answer(cx, &lent, slices)?;
     let commit_ns = ns(clock).saturating_sub(answered);
+    let spawn_bg = bg_detached && (needs_hk || lent.needs_housekeeping(lent.wall_ns()));
     drop(lent);
-    {
+    if spawn_bg {
+        let cx = cx.span("store after answer: spawn detached background gc");
+        home.bg_gc.spawn(&cx, err);
+    } else if !bg_detached {
         let cx = cx.span("store after answer: sweep of other forms' stores (a listing of the store root)");
         crate::clean::sweep_other_forms(&cx, &home.dir, clock.wall().as_ns(), err, crate::clean::SweepPlant::None)?;
     }
