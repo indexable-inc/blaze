@@ -1,0 +1,29 @@
+[package]
+name = "blaze-tab"
+description = "Blaze Tabular Data (TAB), an LLM-first tabular structured data format over blaze-data's `Value` inspired by Nushell's NUON: lossless across all `Value` variants (exact i64/u64, NaN/Inf/-0.0 floats, native 0x[...] hex bytes, bare and escaped text), automatic homogeneous and sparse-schema union tables with `_` absent-field sentinel, `#` line comments, optional commas, zero recursion, zero third-party dependencies; `no_std`, sans-IO"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The format-neutral value read into and written from.
+blaze-data.workspace = true
+# Explicit-allocator collections (`Vec`, `String`, `BTreeSet`, `Alloc`).
+blaze-own.workspace = true
+
+[dev-dependencies]
+# Compact JSON comparison in the 50-item CI diagnostic token/byte-size benchmark test.
+blaze-json.workspace = true
+# `blaze_own::testing::heap()`: a test's root allocator (D102), in place of `Global`.
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true
