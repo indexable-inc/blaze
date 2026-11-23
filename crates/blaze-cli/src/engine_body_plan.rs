@@ -437,7 +437,7 @@ pub(crate) fn reached(outlined: &[Outlined<'_>], root: Name, g: blaze_own::Alloc
         let at = outlined.binary_search_by(|one| one.name.cmp(&name)).map_err(|_| Unoutlined { file: name, root })?;
         seen.insert_shift(slot, name);
         if let Ok(record) = &outlined[at].made {
-            next.extend(record.parts.iter().filter(|part| matches!(part.locate, Locate::File { .. })).map(|part| part.name));
+            next.extend(record.parts.iter().filter(|part| matches!(part.locate, Locate::File { edition } if !crate::data_include::is_data(edition))).map(|part| part.name));
         }
     }
     Ok(seen)
@@ -468,7 +468,7 @@ pub(crate) fn reached_under(outlined: &[Outlined<'_>], cuts: &PlanCuts<'_, '_, '
         }
         seen.insert_shift(slot, name);
         if let Ok(record) = &outlined[at].made {
-            next.extend(record.parts.iter().filter(|part| matches!(part.locate, Locate::File { .. }) && !crate::engine_plan_cfg::part_cut(file, part).cuts(test)).map(|part| part.name));
+            next.extend(record.parts.iter().filter(|part| matches!(part.locate, Locate::File { edition } if !crate::data_include::is_data(edition)) && !crate::engine_plan_cfg::part_cut(file, part).cuts(test)).map(|part| part.name));
         }
     }
     Ok(seen)
@@ -1072,7 +1072,10 @@ impl fmt::Display for FileWords<'_, '_> {
         let outlined = self.outlined;
         let names_it = |one: &Outlined<'_>| {
             one.made.as_ref().is_ok_and(|record| {
-                record.parts.iter().any(|part| matches!(part.locate, Locate::File { .. }) && outlined.binary_search_by(|o| o.name.cmp(&part.name)).is_ok_and(|at| outlined[at].path.as_slice() == path))
+                record.parts.iter().any(|part| {
+                    matches!(part.locate, Locate::File { edition } if !crate::data_include::is_data(edition))
+                        && outlined.binary_search_by(|o| o.name.cmp(&part.name)).ok().and_then(|at| outlined.get(at)).is_some_and(|o| o.path.as_slice() == path)
+                })
             })
         };
         let text = core::str::from_utf8(path).unwrap_or("?");

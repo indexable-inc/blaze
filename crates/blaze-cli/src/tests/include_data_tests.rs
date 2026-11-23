@@ -278,3 +278,142 @@ fn a_created_include_file_enters_its_reader_again() {
     assert!(same.stood(), "the created file is unchanged: the certificate\n{}", same.profile);
     println!("created include: Bodies entered {bodies} after the file was written");
 }
+
+/// (8) A Rust source file read BOTH as a `mod` (in `lib.rs` / `sub/mod.rs`) AND as data via
+/// `include_str!` (in another target or deeper module), in BOTH walk orders:
+/// - Wave-earlier data include (the `blaze-ladder` repro: `tests/a_reader.rs` at wave 0 does
+///   `include_str!("../src/sub/body.rs")` and `include_str!("../src/sub/mod.rs")`, while
+///   `src/lib.rs` -> `src/sub/mod.rs` -> `pub mod body;` only reaches `body.rs` at wave 2).
+/// - Wave-later data include (`src/lib.rs` reaches `src/foo.rs` at wave 1 via `pub mod foo;`,
+///   while `src/deep/reader.rs` reaches `src/foo.rs` at wave 2 via `include_str!("../foo.rs")`).
+///
+/// Neither walk order stops with `UnseenFile`; `src/sub/body.rs` is checked as Rust (not shadowed
+/// by `DATA_FILE`); a comment-only edit in `src/sub/body.rs` moves its `DATA` cell and re-enters
+/// the `include_str!` body without re-entering unrelated bodies or `Names`; and replay stands.
+#[test]
+fn a_rust_module_also_read_by_include_str_checks_in_both_walk_orders_and_invalidates_on_comment_edit() {
+    let manifest = "\
+[package]
+name = \"dual\"
+version = \"0.1.0\"
+edition = \"2024\"
+";
+    let lib = "\
+#![no_core]
+#[rustc_builtin_macro]
+macro_rules! include_str { () => {} }
+pub mod sub;
+pub mod foo;
+pub mod deep;
+pub fn call_both() -> u32 { sub::body::val() + foo::val() }
+";
+    let sub_mod = "pub mod body;\n";
+    let body_v1 = "// version 1\npub fn val() -> u32 { 1 }\n";
+    let body_v2_comment = "// version 2 (comment-only edit)\npub fn val() -> u32 { 1 }\n";
+    let foo_v1 = "// foo 1\npub fn val() -> u32 { 2 }\n";
+    let deep_mod = "pub mod reader;\n";
+    let deep_reader = "\
+pub fn read_foo() {
+    include_str!(\"../foo.rs\");
+}
+";
+    // Integration test root (wave 0): names `../src/sub/body.rs` and `../src/sub/mod.rs` BEFORE
+    // `src/sub/mod.rs` reaches `pub mod body;` at wave 2.
+    let test_reader = "\
+#![no_core]
+#[rustc_builtin_macro]
+macro_rules! include_str { () => {} }
+pub fn reads_dual() {
+    include_str!(\"../src/sub/body.rs\");
+    include_str!(\"../src/sub/mod.rs\");
+}
+pub fn unrelated_test() {}
+";
+
+    let io = Io::simulated(SimWorld::new(48, Limits::USUAL));
+    write(&io, "Cargo.toml", manifest);
+    write(&io, "src/lib.rs", lib);
+    write(&io, "src/sub/mod.rs", sub_mod);
+    write(&io, "src/sub/body.rs", body_v1);
+    write(&io, "src/foo.rs", foo_v1);
+    write(&io, "src/deep/mod.rs", deep_mod);
+    write(&io, "src/deep/reader.rs", deep_reader);
+    write(&io, "tests/a_reader.rs", test_reader);
+
+    let first = check(&io);
+    let out = stdout(&io);
+    assert!(!out.contains("which its plan did not hand it"), "dual-included module must not fail with UnseenFile:\n{out}\n{}", first.profile);
+    assert_includes_checked(&io, &first);
+    assert_eq!(first.errors, 0, "clean dual-include workspace must report 0 errors:\n{out}\n{}", first.profile);
+
+    // A comment-only edit in `src/sub/body.rs` leaves its Rust `Surface` and `BodyCheck` intact
+    // while moving its `DATA` cell: ONLY `tests/a_reader.rs::reads_dual` re-enters (not
+    // `unrelated_test`, not `body::val`, not `Names`).
+    write(&io, "src/sub/body.rs", body_v2_comment);
+    let edited = check(&io);
+    assert_includes_checked(&io, &edited);
+    assert_eq!(edited.entered(blaze_engine::Stage::Names), 0, "comment edit must not re-enter Names:\n{}", edited.profile);
+    assert_eq!(edited.entered(blaze_engine::Stage::Bodies), 1, "only the integration test body reading body.rs via include_str! must re-enter:\n{}", edited.profile);
+
+    // Unchanged replay stands on its certificate.
+    let same = check(&io);
+    assert_includes_checked(&io, &same);
+    assert!(same.stood(), "unchanged dual-include workspace must stand:\n{}", same.profile);
+
+    // Same-wave reverse order: `tests/a_reader.rs` includes `../src/foo.rs` (wave 1) alongside
+    // `src/lib.rs`'s `pub mod foo;` (wave 1). Both are in wave 0; `a_reader.rs` sorts before
+    // `lib.rs` in the target list, so `DATA_FILE` is encountered before `pub mod foo;`.
+    write(
+        &io,
+        "tests/a_reader.rs",
+        "#![no_core]\n#[rustc_builtin_macro]\nmacro_rules! include_str { () => {} }\npub fn reads_dual() {\n    include_str!(\"../src/sub/body.rs\");\n    include_str!(\"../src/foo.rs\");\n}\n",
+    );
+    let same_wave = check(&io);
+    assert!(!stdout(&io).contains("which its plan did not hand it"), "same-wave dual-include must not fail with UnseenFile:\n{}", stdout(&io));
+    assert_includes_checked(&io, &same_wave);
+    assert_eq!(same_wave.errors, 0, "same-wave dual-include must check clean:\n{}", stdout(&io));
+    println!("dual include (both walk orders + comment edit): ok");
+}
+
+/// (9) A file first walked as `DATA_FILE` (`include_str!("../src/gen_mod.rs")` in a test target)
+/// and then discovered as a Rust module during `Names` via a macro-written `mod $n;`: `unoutlined`
+/// upgrades it to Rust, `serve_found` replaces the `DATA_FILE` plan cleanly, and replay stands.
+#[test]
+fn a_data_included_file_also_declared_by_macro_mod_upgrades_cleanly() {
+    let manifest = "\
+[package]
+name = \"dual_found\"
+version = \"0.1.0\"
+edition = \"2024\"
+";
+    let lib = "\
+#![no_core]
+macro_rules! decl { ($n:ident) => { pub mod $n; }; }
+decl!(gen_mod);
+pub fn top() -> u32 { gen_mod::v() }
+";
+    let gen_mod = "pub fn v() -> u32 { 7 }\n";
+    let test_reader = "\
+#![no_core]
+#[rustc_builtin_macro]
+macro_rules! include_str { () => {} }
+pub fn read_gen() { include_str!(\"../src/gen_mod.rs\"); }
+";
+
+    let io = Io::simulated(SimWorld::new(49, Limits::USUAL));
+    write(&io, "Cargo.toml", manifest);
+    write(&io, "src/lib.rs", lib);
+    write(&io, "src/gen_mod.rs", gen_mod);
+    write(&io, "tests/reader.rs", test_reader);
+
+    let first = check(&io);
+    let out = stdout(&io);
+    assert!(!out.contains("which its plan did not hand it"), "macro-found dual-include must upgrade from DATA_FILE:\n{out}\n{}", first.profile);
+    assert_includes_checked(&io, &first);
+    assert_eq!(first.errors, 0, "macro-found dual-include must check clean:\n{out}\n{}", first.profile);
+
+    let again = check(&io);
+    assert_includes_checked(&io, &again);
+    assert!(again.stood(), "replay after macro-found dual-include upgrade must stand:\n{}", again.profile);
+    println!("dual include macro-found upgrade: ok");
+}

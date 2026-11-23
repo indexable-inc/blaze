@@ -248,10 +248,12 @@ jobs:
         run: |
           pinned="$(tr -d '[:space:]' < crates/blaze-toolchain/PINNED)"
           shelf="$HOME/.blaze/v2/toolchain"
-          if [ ! -f "$shelf/$pinned" ]; then
-            tc="$(cat pins/toolchain)"
-            cargo +"$tc" fetch --locked --quiet
-            reg="$(ls -d "${CARGO_HOME:-$HOME/.cargo}"/registry/cache/index.crates.io-* | head -n 1)"
+          tc="$(cat pins/toolchain)"
+          cargo +"$tc" fetch --locked --quiet
+          reg="$(ls -d "${CARGO_HOME:-$HOME/.cargo}"/registry/cache/index.crates.io-* | head -n 1)"
+          if [ -f "$shelf/$pinned" ]; then
+            "$BLAZE_SCRIPTS/toolchain_cut" "{\"tree\": \".\", \"targets\": [\"aarch64-apple-darwin\", \"aarch64-unknown-linux-gnu\"], \"registry\": \"$reg\", \"shelf\": \"$shelf\", \"write_pin\": false, \"check\": true, \"macro_side\": true}"
+          else
             "$BLAZE_SCRIPTS/toolchain_cut" "{\"tree\": \".\", \"targets\": [\"aarch64-apple-darwin\", \"aarch64-unknown-linux-gnu\"], \"registry\": \"$reg\", \"shelf\": \"$shelf\", \"write_pin\": false, \"check\": false, \"macro_side\": true}"
             if [ ! -f "$shelf/$pinned" ]; then
               echo "::error::crates/blaze-toolchain/PINNED ($pinned) does not match toolchain_cut output; run toolchain_cut with write_pin: true" >&2
@@ -273,13 +275,13 @@ jobs:
           sysroot="$(rustc +"$tc" --print sysroot)"
           nm="$sysroot/lib/rustlib/aarch64-unknown-linux-gnu/bin/llvm-nm"
           for triple in aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu aarch64-apple-darwin; do
-            timeout 600 cargo +"$tc" build --locked -p blaze-sys --lib --target "$triple" --target-dir target/sys-imports
+            timeout -k 30 600 cargo +"$tc" build --locked -p blaze-sys --lib --target "$triple" --target-dir target/sys-imports
             builtins=$(echo "$sysroot/lib/rustlib/$triple/lib/"libcompiler_builtins-*.rlib)
             case "$triple" in
               *-linux-*) extra='' ; os=linux ;;
               *) extra=', "ratchet": "tools/ratchets/blaze-sys-libsystem.txt"' ; os=macos ;;
             esac
-            timeout 120 "$BLAZE_SCRIPTS/sys_imports" "{\"command\": \"check\", \"target\": \"$os\", \"objects\": [\"target/sys-imports/$triple/debug/libblaze_sys.rlib\"], \"builtins\": \"$builtins\", \"nm\": \"$nm\"$extra}"
+            timeout -k 30 120 "$BLAZE_SCRIPTS/sys_imports" "{\"command\": \"check\", \"target\": \"$os\", \"objects\": [\"target/sys-imports/$triple/debug/libblaze_sys.rlib\"], \"builtins\": \"$builtins\", \"nm\": \"$nm\"$extra}"
           done
 
   ci:

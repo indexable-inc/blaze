@@ -3677,33 +3677,77 @@ fn serve_found<'d, 'f, 'r, 's, 'w, 'm>(
     let mut probes: SVec<'r, (SVec<'r, u8>, sweep::Probed)> = SVec::new_in(alloc);
     // Each file outlined here, its place but for the found flags, sorted below.
     let mut new_places: SVec<'_, (Name, FilePlace)> = SVec::new_in(alloc);
-    let mut seen: SSet<'r, Name> = SSet::new_in(alloc);
-    seen.extend(merged.iter().map(|one| one.name));
-    seen.extend(news.iter().map(|(outline, ..)| outline.name));
+    // Track Rust and `DATA_FILE` names separately so a macro-found Rust module (or one of its
+    // children) upgrades an existing `DATA_FILE` outline instead of being dropped.
+    let mut seen_rust: SSet<'r, Name> = SSet::new_in(alloc);
+    let mut seen_data: SSet<'r, Name> = SSet::new_in(alloc);
+    for one in merged.iter() {
+        if crate::data_include::is_data(one.edition) {
+            seen_data.insert(one.name);
+        } else {
+            seen_rust.insert(one.name);
+        }
+    }
+    for (outline, ..) in news.iter() {
+        if crate::data_include::is_data(outline.edition) {
+            seen_data.insert(outline.name);
+        } else {
+            seen_rust.insert(outline.name);
+        }
+    }
+    let mut upgraded: SSet<'_, Name> = SSet::new_in(alloc);
     let mut wave: SVec<'r, Want<'r>> = SVec::new_in(alloc);
+    let mut pending_data: SVec<'r, Want<'r>> = SVec::new_in(alloc);
     for (outline, probe, root, external) in news.iter().copied() {
         let copy = outline_copy(outline, alloc)?;
         if let Ok(record) = &copy.made {
-            wants(&record.parts, &record.paths, &record.path_bytes, Some(root), external, &mut seen, &mut wave, alloc)?;
+            wants(&record.parts, &record.paths, &record.path_bytes, Some(root), external, &mut seen_rust, &mut seen_data, &mut wave, &mut pending_data, alloc)?;
         }
         let flags = (if probe.2 { PLACE_MODULE } else { 0 }) | (if external { PLACE_EXTERNAL } else { 0 });
         new_places.push((copy.name, FilePlace { unit: root, edition: copy.edition, flags }));
         probes.push((SVec::from_slice_in(&probe.0, alloc), probe.1));
-        merged.push(copy);
+        if let Some(existing) = merged.iter_mut().find(|one| one.name == copy.name) {
+            upgraded.insert(copy.name);
+            *existing = copy;
+        } else {
+            merged.push(copy);
+        }
+    }
+    let mut data_walked = false;
+    if wave.is_empty() && !pending_data.is_empty() {
+        data_walked = true;
+        for want in core::mem::replace(&mut pending_data, SVec::new_in(alloc)) {
+            if !seen_rust.contains(&want.name) {
+                wave.push(want);
+            }
+        }
     }
     while !wave.is_empty() {
         let mut next: SVec<'r, Want<'r>> = SVec::new_in(alloc);
         for want in wave.iter() {
             let (one, probed) = outline_one(cx, rq.root, &rq.handles.stamps, want, None, rq.handles.plants.lints, alloc).map_err(|stopped| stopped.of(want))?;
             if let Ok(record) = &one.made {
-                wants(&record.parts, &record.paths, &record.path_bytes, Some(want.root), want.external, &mut seen, &mut next, alloc)?;
+                wants(&record.parts, &record.paths, &record.path_bytes, Some(want.root), want.external, &mut seen_rust, &mut seen_data, &mut next, &mut pending_data, alloc)?;
             }
             let flags = (if want.module { PLACE_MODULE } else { 0 }) | (if want.external { PLACE_EXTERNAL } else { 0 });
             new_places.push((want.name, FilePlace { unit: want.root, edition: want.edition, flags }));
             probes.push((SVec::from_slice_in(&want.slot, alloc), probed));
-            merged.push(one);
+            if let Some(existing) = merged.iter_mut().find(|entry| entry.name == one.name) {
+                upgraded.insert(one.name);
+                *existing = one;
+            } else {
+                merged.push(one);
+            }
         }
         wave = next;
+        if wave.is_empty() && !data_walked {
+            data_walked = true;
+            for want in core::mem::replace(&mut pending_data, SVec::new_in(alloc)) {
+                if !seen_rust.contains(&want.name) {
+                    wave.push(want);
+                }
+            }
+        }
     }
     merged.sort_unstable_by_key(|one| one.name);
     new_places.sort_unstable_by_key(|(file, _)| *file);
@@ -3806,7 +3850,11 @@ fn serve_found<'d, 'f, 'r, 's, 'w, 'm>(
             continue;
         }
         let now = file_group(&served.planned, file);
-        if rq.outlined.binary_search_by_key(&file, |one| one.name).is_err() {
+        let upgraded_file = upgraded.contains(&file);
+        if rq.outlined.binary_search_by_key(&file, |one| one.name).is_err() || upgraded_file {
+            if upgraded_file {
+                engine.drop_file(file)?;
+            }
             let own = now.iter().find(|one| one.name == file).copied().ok_or(EngineCheckError::MissingEntry { task: file, table: Table::FoundServed, key: file })?;
             let task = Task { planned: own, key: rq.tools.key(file, &own.source) };
             let merged_before = engine.merged().len();
@@ -5858,8 +5906,15 @@ fn plan<'h, 'm>(
     // Each file's slot and what its probe found: its row in the leaf table the next request's
     // sweep follows (engine_answer.rs).
     let mut probes: SVec<'h, (SVec<'h, u8>, sweep::Probed)> = SVec::new_in(alloc);
-    let mut seen: SSet<'h, Name> = SSet::new_in(alloc);
+    // Rust module files (`seen_rust`) and `DATA_FILE` includes (`seen_data`, deferred into
+    // `pending_data`) are tracked separately: all Rust waves (plus `found_last`) run first so a
+    // file reached BOTH via `include_str!` / `include_bytes!` AND via `mod x;` is always outlined
+    // once as a Rust module (with `Surface`, bodies, heads, and raw-bytes `DATA` cell), never
+    // shadowed by an earlier `DATA_FILE` wave regardless of walk order.
+    let mut seen_rust: SSet<'h, Name> = SSet::new_in(alloc);
+    let mut seen_data: SSet<'h, Name> = SSet::new_in(alloc);
     let mut wave: SVec<'h, Want<'h>> = SVec::new_in(alloc);
+    let mut pending_data: SVec<'h, Want<'h>> = SVec::new_in(alloc);
     let mut selected_roots: SSet<'h, Name> = SSet::new_in(alloc);
     let mut skipped_roots: SSet<'h, Name> = SSet::new_in(alloc);
     if let Some(names) = names {
@@ -5886,7 +5941,7 @@ fn plan<'h, 'm>(
         }
     }
     for (_, made) in laid.members.iter() {
-        wants(&made.parts, &made.paths, &made.path_bytes, None, false, &mut seen, &mut wave, alloc)?;
+        wants(&made.parts, &made.paths, &made.path_bytes, None, false, &mut seen_rust, &mut seen_data, &mut wave, &mut pending_data, alloc)?;
     }
     // Reached non-member checkout path packages (`[patch.*]` and excluded/transitive path deps):
     // walk their source trees as `PLACE_EXTERNAL` leaves so `CrateScope` reads their `Surface`
@@ -5898,7 +5953,7 @@ fn plan<'h, 'm>(
                 && let Some(root_path) = list.root(r).strip_prefix("/0/")
             {
                 let file = Name::file(root_path.as_bytes());
-                if !seen.insert(file) {
+                if !seen_rust.insert(file) {
                     continue;
                 }
                 let edition = laid
@@ -5924,10 +5979,20 @@ fn plan<'h, 'm>(
     }
     let mut outlined: SVec<'h, Outlined<'h>> = SVec::new_in(alloc);
     // The found files' wants once the roots' walk is done (above): a file it reached is not one.
+    // Pure data includes (`pending_data`) flush only after all Rust files (roots + found) finish.
     let mut found_walked = false;
+    let mut data_walked = false;
     if wave.is_empty() {
         found_walked = true;
-        found_wants(kept, found_last, &mut seen, &mut wave, alloc)?;
+        found_wants(kept, found_last, &mut seen_rust, &mut seen_data, &mut wave, &mut pending_data, alloc)?;
+    }
+    if wave.is_empty() && !data_walked {
+        data_walked = true;
+        for want in core::mem::replace(&mut pending_data, SVec::new_in(alloc)) {
+            if !seen_rust.contains(&want.name) {
+                wave.push(want);
+            }
+        }
     }
     while !wave.is_empty() {
         let scope = cx.scope();
@@ -6112,7 +6177,7 @@ fn plan<'h, 'm>(
             match joined {
                 Ok(Ok((one, probed))) => {
                     if let Ok(record) = &one.made {
-                        wants(&record.parts, &record.paths, &record.path_bytes, Some(want.root), want.external, &mut seen, &mut next, alloc)?;
+                        wants(&record.parts, &record.paths, &record.path_bytes, Some(want.root), want.external, &mut seen_rust, &mut seen_data, &mut next, &mut pending_data, alloc)?;
                     }
                     let flags = (if want.module { PLACE_MODULE } else { 0 }) | want.found | (if want.external { PLACE_EXTERNAL } else { 0 });
                     places.push((want.name, blaze_engine::pages::FilePlace { unit: want.root, edition: want.edition, flags }));
@@ -6136,7 +6201,15 @@ fn plan<'h, 'm>(
         wave = next;
         if wave.is_empty() && !found_walked {
             found_walked = true;
-            found_wants(kept, found_last, &mut seen, &mut wave, alloc)?;
+            found_wants(kept, found_last, &mut seen_rust, &mut seen_data, &mut wave, &mut pending_data, alloc)?;
+        }
+        if wave.is_empty() && !data_walked {
+            data_walked = true;
+            for want in core::mem::replace(&mut pending_data, SVec::new_in(alloc)) {
+                if !seen_rust.contains(&want.name) {
+                    wave.push(want);
+                }
+            }
         }
     }
     outlined.sort_unstable_by(|a, b| a.name.cmp(&b.name));
@@ -6150,9 +6223,9 @@ fn plan<'h, 'm>(
         let Ok(at) = outlined.binary_search_by(|one| one.name.cmp(&name)) else { continue };
         let Ok(record) = &outlined[at].made else { continue };
         selected_next.extend(record.parts.iter().filter_map(|part| match part.locate {
-            Locate::File { .. } => Some(part.name),
-            // A source digest or a keyed record of a crate with no text here: no file to follow.
-            Locate::Source(_) | Locate::Key(_) => None,
+            Locate::File { edition } if !crate::data_include::is_data(edition) => Some(part.name),
+            // A data include, source digest or keyed record: no Rust module of this target to follow.
+            Locate::File { .. } | Locate::Source(_) | Locate::Key(_) => None,
         }));
     }
     let mut skipped_files: SSet<'h, Name> = SSet::new_in(alloc);
@@ -6171,8 +6244,8 @@ fn plan<'h, 'm>(
             let Ok(at) = outlined.binary_search_by(|one| one.name.cmp(&name)) else { continue };
             let Ok(record) = &outlined[at].made else { continue };
             next.extend(record.parts.iter().filter_map(|part| match part.locate {
-                Locate::File { .. } => Some(part.name),
-                Locate::Source(_) | Locate::Key(_) => None,
+                Locate::File { edition } if !crate::data_include::is_data(edition) => Some(part.name),
+                Locate::File { .. } | Locate::Source(_) | Locate::Key(_) => None,
             }));
         }
         skipped_targets.push(SkippedTarget { root: root_name, files: u32::try_from(skipped_files.len().saturating_sub(before)).unwrap_or(u32::MAX) });
@@ -6397,7 +6470,10 @@ pub(crate) struct Files {
     pub(crate) probed: u32,
 }
 
-/// Each file part of a record not seen yet, as a [`Want`] of `into`.
+/// Each file part of a record not seen yet: Rust module/root files go into `rust_into` (deduped
+/// by `seen_rust`), while `DATA_FILE` includes go into `data_into` (deduped by `seen_rust` and
+/// `seen_data`, flushed only after all Rust waves finish so Rust always wins over `DATA_FILE`).
+#[expect(clippy::too_many_arguments, reason = "file-walk accumulator separates Rust and deferred data wants")]
 fn wants<'h>(
     parts: &[blaze_drive::Part],
     paths: &[(Name, u32, u32, bool)],
@@ -6406,13 +6482,20 @@ fn wants<'h>(
     // whose every file part is a target's root.
     root: Option<Name>,
     external: bool,
-    seen: &mut SSet<'h, Name>,
-    into: &mut SVec<'h, Want<'h>>,
+    seen_rust: &mut SSet<'h, Name>,
+    seen_data: &mut SSet<'h, Name>,
+    rust_into: &mut SVec<'h, Want<'h>>,
+    data_into: &mut SVec<'h, Want<'h>>,
     alloc: SharedAlloc<'h>,
 ) -> Result<(), CliError> {
     for part in parts {
         let Locate::File { edition } = part.locate else { continue };
-        if !seen.insert(part.name) {
+        let is_data = crate::data_include::is_data(edition);
+        if is_data {
+            if seen_rust.contains(&part.name) || !seen_data.insert(part.name) {
+                continue;
+            }
+        } else if !seen_rust.insert(part.name) {
             continue;
         }
         let Some(&(_, start, end, module)) = paths.iter().find(|(name, ..)| *name == part.name) else {
@@ -6420,32 +6503,51 @@ fn wants<'h>(
         };
         let mut slot = SVec::new_in(alloc);
         slot.extend_from_slice(&path_bytes[start as usize..end as usize]);
-        into.push(Want {
+        let want = Want {
             name: part.name, slot, module, edition, root: root.unwrap_or(part.name), found: 0, external,
             #[cfg(test)]
             text_only_outline: TEXT_ONLY_OUTLINE.get(),
-        });
+        };
+        if is_data {
+            data_into.push(want);
+        } else {
+            rust_into.push(want);
+        }
     }
     Ok(())
 }
 
 /// Each found file of `found_last` (sorted by name) the walk has not reached, as a [`Want`] of
-/// `into` at the slot the sweep followed it at ([`Kept::slots`]), its place's crate root, edition,
-/// module form and found flags ([`plan`]). One the sweep did not follow is left: no slot today.
-fn found_wants<'h>(kept: &Kept<'_, '_, '_>, found_last: &[(Name, blaze_engine::pages::FilePlace)], seen: &mut SSet<'h, Name>, into: &mut SVec<'h, Want<'h>>, alloc: SharedAlloc<'h>) -> Result<(), CliError> {
+/// `rust_into` (or `data_into` for `DATA_FILE`) at the slot the sweep followed it at
+/// ([`Kept::slots`]), its place's crate root, edition, module form and found flags ([`plan`]).
+/// One the sweep did not follow is left: no slot today.
+fn found_wants<'h>(
+    kept: &Kept<'_, '_, '_>,
+    found_last: &[(Name, blaze_engine::pages::FilePlace)],
+    seen_rust: &mut SSet<'h, Name>,
+    seen_data: &mut SSet<'h, Name>,
+    rust_into: &mut SVec<'h, Want<'h>>,
+    data_into: &mut SVec<'h, Want<'h>>,
+    alloc: SharedAlloc<'h>,
+) -> Result<(), CliError> {
     if found_last.is_empty() {
         return Ok(());
     }
     for (path, _) in kept.slots.iter() {
         let file = Name::file(path.as_bytes());
         let Ok(at) = found_last.binary_search_by(|(name, _)| name.cmp(&file)) else { continue };
-        if !seen.insert(file) {
+        let Some(&(_, place)) = found_last.get(at) else { continue };
+        let is_data = crate::data_include::is_data(place.edition);
+        if is_data {
+            if seen_rust.contains(&file) || !seen_data.insert(file) {
+                continue;
+            }
+        } else if !seen_rust.insert(file) {
             continue;
         }
-        let place = found_last[at].1;
         let mut slot = SVec::new_in(alloc);
         slot.extend_from_slice(path.as_bytes());
-        into.push(Want {
+        let want = Want {
             name: file,
             slot,
             module: place.flags & PLACE_MODULE != 0,
@@ -6455,7 +6557,12 @@ fn found_wants<'h>(kept: &Kept<'_, '_, '_>, found_last: &[(Name, blaze_engine::p
             external: place.flags & PLACE_EXTERNAL != 0,
             #[cfg(test)]
             text_only_outline: TEXT_ONLY_OUTLINE.get(),
-        });
+        };
+        if is_data {
+            data_into.push(want);
+        } else {
+            rust_into.push(want);
+        }
     }
     Ok(())
 }
