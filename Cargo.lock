@@ -4134,6 +4134,7 @@ dependencies = [
  "blaze-mem",
  "blaze-own",
  "blaze-pins",
+ "blaze-roots",
  "blaze-script",
  "blaze-sha256",
  "blaze-text",

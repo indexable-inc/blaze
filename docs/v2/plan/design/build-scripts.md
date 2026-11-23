@@ -530,9 +530,9 @@ by default; bindgen's text holds no paths. Proven by a two-run byte compare once
     SHA-256), hashed only when a tool is granted (old native keys stand). Mark: the read list
     is filed under the note `build-script run host-tool` (`host_tools::RUN_KIND_HOST_TOOL`,
     `host_tools::marked`); the origin's refusal is the store writer's (below).
-  - The builder: `proc_macro_modules`' native mode runs cargo under `native::seatbelt_with`
-    (the deny-by-default profile, one home; `exec_under` adds the toolchain's and the shelf's
-    `bin` and the target folder): reads the vendored sources, the script's own source folder,
+  - The builder: `proc_macro_modules`' native mode runs cargo under `bstd::procs::hermetic::confinement`
+    (the deny-by-default profile, one home; its helpers add the toolchain's and the shelf's
+    `bin` programs and `helper_folders` the target folder): reads the vendored sources, the script's own source folder,
     the pinned toolchain, the shelf, the SDK; writes its workspace, target, `CARGO_HOME`,
     `TMPDIR`. The wasm mode keeps `seatbelt(work)`.
   - Which path was refused (design, not built). (a) The unified log: Seatbelt reports every
