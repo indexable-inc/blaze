@@ -204,15 +204,22 @@ fn bind<'a>(asked: &[Asked<'a>], installs: &[Linked<'a>], alloc: Alloc<'a>) -> R
     Ok(linked)
 }
 
-/// The record's bytes: plan, lay, write; appended to `out`. The caller stores them under
-/// [`native_key`] (a store write as run.rs does for code records) and never calls this when the
-/// store has the key. The word names are the record's own ([`word_names`]).
-pub(crate) fn native_library<'a>(
+/// The program's native image laid out at image-relative addresses (base 0), ready for either
+/// the dylib writer ([`native_library`]) or `blaze-export`'s native merge (`native_merge.rs`).
+pub(crate) fn native_layout<'a>(
     inputs: &NativeInputs<'_, 'a>,
     seed: FixedState,
-    out: &mut AVec<'_, u8>,
     bump: Bump<'a>,
-) -> Result<NativeSummary, NativeError<'a>> {
+) -> Result<blaze_native::image::Image<'a>, NativeError<'a>> {
+    let (image, _, _, _) = native_layout_parts(inputs, seed, bump)?;
+    Ok(image)
+}
+
+fn native_layout_parts<'a>(
+    inputs: &NativeInputs<'_, 'a>,
+    seed: FixedState,
+    bump: Bump<'a>,
+) -> Result<(blaze_native::image::Image<'a>, ContentId, usize, usize), NativeError<'a>> {
     let alloc = bump.alloc();
     let platform = inputs.platform;
     let line = link_line(inputs, alloc)?;
@@ -232,15 +239,29 @@ pub(crate) fn native_library<'a>(
 
     let plan = resolve::plan(platform, &objects, Wanted { roots, rust, libraries }, seed, alloc).map_err(NativeError::Resolve)?;
     let image = layout::lay(&plan, &objects, layout_of(platform), alloc).map_err(NativeError::Layout)?;
+    Ok((image, key, objects.len(), plan.objects.len()))
+}
+
+/// The record's bytes: plan, lay, write; appended to `out`. The caller stores them under
+/// [`native_key`] (a store write as run.rs does for code records) and never calls this when the
+/// store has the key. The word names are the record's own ([`word_names`]).
+pub(crate) fn native_library<'a>(
+    inputs: &NativeInputs<'_, 'a>,
+    seed: FixedState,
+    out: &mut AVec<'_, u8>,
+    bump: Bump<'a>,
+) -> Result<NativeSummary, NativeError<'a>> {
+    let alloc = bump.alloc();
+    let (image, key, inputs_len, members_len) = native_layout_parts(inputs, seed, bump)?;
     let mut hex = [0u8; 64];
     let identifier = hex_of(&key, &mut hex)?;
-    match platform {
+    match inputs.platform {
         Platform::MacosArm64 => native_dylib::write(&image, identifier, out, alloc).map_err(NativeError::Write)?,
         Platform::LinuxArm64 => native_so::write(&image, identifier, out, alloc).map_err(NativeError::WriteSo)?,
     }
     Ok(NativeSummary {
-        inputs: narrow("inputs", objects.len())?,
-        members: narrow("members", plan.objects.len())?,
+        inputs: narrow("inputs", inputs_len)?,
+        members: narrow("members", members_len)?,
         words: narrow("words", image.words.len())?,
         inits: image.inits,
         imports: narrow("imports", image.imports.len())?,

@@ -81,7 +81,10 @@ pub(crate) fn refuse_not_taken(flags: &crate::Flags<'_>) -> Result<(), CliError>
         return Err(CliError::Usage("--grant and the words after -- are `blaze run`'s program's"));
     }
     if flags.select != crate::run_package::Select::NONE {
-        return Err(CliError::Usage("-p and --bin choose `blaze run`'s program"));
+        return Err(CliError::Usage("-p and --bin choose `blaze run`'s or `blaze export`'s program"));
+    }
+    if flags.output.is_some() {
+        return Err(CliError::Usage("-o / --output is `blaze export`'s"));
     }
     if flags.open == blaze_run::viewer::OpenExplore::Open {
         return Err(CliError::Usage("--open is `blaze run`'s"));

@@ -91,12 +91,13 @@ pub(crate) struct Located<'f> {
     pub(crate) member: &'f str,
 }
 
-/// The program chosen: its package, the package's manifest, the binary's crate root (each
-/// checkout-relative) and the package's edition as a manifest writes it (`2024`,
+/// The program chosen: its package, binary target name, the package's manifest, the binary's crate
+/// root (each checkout-relative) and the package's edition as a manifest writes it (`2024`,
 /// `blaze-2026.11`), what the runner's front end is given.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Program<'f> {
     pub package: &'f str,
+    pub bin: &'f str,
     pub manifest: &'f str,
     pub root: &'f str,
     pub edition: &'f str,
@@ -643,7 +644,13 @@ pub(crate) fn pick<'f>(cx: &Cx, root: &Dir<ReadWrite>, select: Select<'_>, frame
             Some(blaze) => blaze.manifest(),
             None => kept(bstd::mem::format_in!(frame, "{}", member.edition.syntax).as_str(), frame)?,
         };
-        Ok(Program { package: kept(member.name.as_str(), frame)?, manifest: kept(manifest.as_str(), frame)?, root: kept(bin.root.as_str(), frame)?, edition })
+        Ok(Program {
+            package: kept(member.name.as_str(), frame)?,
+            bin: kept(bin.name.as_str(), frame)?,
+            manifest: kept(manifest.as_str(), frame)?,
+            root: kept(bin.root.as_str(), frame)?,
+            edition,
+        })
     })
 }
 
@@ -910,7 +917,7 @@ mod tests {
     /// The program's own files are under its crate root's folder.
     #[test]
     fn the_programs_sources_are_its_roots_folder() {
-        let program = Program { package: "tempo", manifest: "bin/tempo/Cargo.toml", root: "bin/tempo/src/main.rs", edition: "2024" };
+        let program = Program { package: "tempo", bin: "tempo", manifest: "bin/tempo/Cargo.toml", root: "bin/tempo/src/main.rs", edition: "2024" };
         assert_eq!((program.sources(), program.units()), ("bin/tempo/src/", Name::manifest(b"bin/tempo/Cargo.toml")));
     }
 

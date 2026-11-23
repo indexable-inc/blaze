@@ -117,6 +117,7 @@ mod engine_answer;
 mod engine_answer_rows;
 mod engine_check;
 mod engine_dry;
+mod engine_export;
 mod engine_ready_edit;
 mod engine_ready_check;
 mod engine_bodies;
@@ -174,8 +175,6 @@ use crate::phases::Phases;
 #[derive(Debug)]
 pub enum CliError {
     Usage(&'static str),
-    /// A command this binary does not do yet.
-    NotBuilt { command: &'static str },
     /// A word that is no command of blaze and never will be: the commands that do its work.
     NoSuchCommand { command: &'static str, instead: &'static str },
     /// A flag of `check` that the engine's check (check_command.rs) does not honour yet: refused
@@ -267,6 +266,9 @@ pub enum CliError {
     Start(engine_start::StartError),
     /// `blaze inspect` failed (inspect_command.rs). Boxed in the process heap (`CliError`'s size).
     Inspect(blaze_own::Box<blaze_ladder::front2::inspect::InspectError, blaze_own::Alloc<'static>>),
+    /// `blaze export` failed to build or write the standalone executable (engine_export.rs).
+    /// Boxed in the process heap (`CliError`'s size cap).
+    Export(blaze_own::Box<engine_export::ExportCliError, blaze_own::Alloc<'static>>),
 }
 
 // THE ERROR IS SMALL: a debug build reserves a `Result<_, CliError>` and its `?` residual for
@@ -307,10 +309,9 @@ impl fmt::Display for CliError {
         match self {
             CliError::Usage(what) => write!(
                 f,
-                "usage: blaze check [dir] [--color=auto|always|never] [--view person|agent|json] [--each] [--workers N] [--status-every S], blaze ci [dir] [--workers N] [--format auto|plain|github] [--todo <path>] [--todo-format nuon|json] [--no-todo] [--no-test] [--fix] [--allow-incomplete], blaze inspect <file.rs[::fn]> [--json] [--all-exprs] [--no-coercions] [--no-defaults], blaze run [dir] [--open] [--stats] [--workers N], blaze test [dir] [--stats] [--workers N], blaze clean [dir] [--store], blaze gc [--max-gb N] [--dry-run] [--all-formats], blaze explain [status]: {what}"
+                "usage: blaze check [dir] [--color ...] [--view ...] [--each] [--workers N] [--status-every S], blaze ci [dir] [--format ...] [--todo ...], blaze inspect <file.rs[::fn]> [--json] [--all-exprs], blaze run [dir] [--open] [--stats] [--workers N], blaze test [dir] [--stats] [--workers N], blaze export [dir] [-p pkg] [--bin name] [-o path] [--workers N] [--stats], blaze clean|gc|explain: {what}"
             ),
             CliError::NotOnEngine { flag, why } => write!(f, "`blaze check {flag}`: the engine's check does not take {flag} yet ({why}; check_command.rs)"),
-            CliError::NotBuilt { command } => write!(f, "`blaze {command}` is not built on the new item layer yet (drive.md)"),
             CliError::NoSuchCommand { command, instead } => write!(f, "blaze has no `{command}` command: {instead}"),
             CliError::Missing(missing) => write!(f, "{missing}"),
             CliError::Path(error) => write!(f, "{error}"),
@@ -346,6 +347,7 @@ impl fmt::Display for CliError {
             CliError::TestPool(error) => write!(f, "`blaze test`'s pool: {error}"),
             CliError::Start(error) => write!(f, "{error}"),
             CliError::Inspect(error) => write!(f, "{error}"),
+            CliError::Export(error) => write!(f, "{error}"),
             CliError::RunLine(error) => write!(f, "{error}"),
             CliError::Peer(error) => write!(f, "{error}"),
         }
@@ -409,10 +411,12 @@ struct Flags<'a> {
     view: Option<View>,
     /// `--fix <selector>...`: the arguments that are its selectors, `start..end` of the list.
     fix: Option<(usize, usize)>,
-    /// `-p <package>` and `--bin <name>`: which program `blaze run` runs (run_package.rs).
+    /// `-p <package>` and `--bin <name>`: which program `blaze run` or `blaze export` picks (run_package.rs).
     select: run_package::Select<'a>,
     /// `--open`: opt-in to opening the Explore web page in the browser on `blaze run` (default: off).
     open: blaze_run::viewer::OpenExplore,
+    /// `-o <path>` / `--output <path>`: where `blaze export` writes the standalone executable.
+    output: Option<&'a str>,
     /// `--names-oracle`: `check` decides every crate's names twice and compares them (D158 step
     /// 1, engine_names.rs `NamesOracle`).
     names_oracle: engine_names::NamesOracle,
@@ -443,6 +447,7 @@ impl<'a> Flags<'a> {
             status_every: None,
             select: run_package::Select::NONE,
             open: blaze_run::viewer::OpenExplore::No,
+            output: None,
             names_oracle: engine_names::NamesOracle::Off,
             driver: engine_ready_edit::Driver::Auto,
             block_scopes: blaze_scope::surface::BlockScopes::Modules,
@@ -468,7 +473,7 @@ fn parse_flags<'a>(args: &'a Args, mut package: impl FnMut(&'a str)) -> Result<F
         }
         let mut value = || {
             at += 1;
-            args.get(at - 1).ok_or(CliError::Usage("--color, --origin, --origin-key, --grant, --workers, -p and --bin each take a value"))
+            args.get(at - 1).ok_or(CliError::Usage("--color, --origin, --origin-key, --grant, --workers, -p, --bin and -o each take a value"))
         };
         let selected = match arg {
             "-p" | "--package" => Some(value()?),
@@ -506,6 +511,8 @@ fn parse_flags<'a>(args: &'a Args, mut package: impl FnMut(&'a str)) -> Result<F
             }
             "--bin" => flags.select.bin = Some(value()?),
             _ if arg.starts_with("--bin=") => flags.select.bin = Some(&arg["--bin=".len()..]),
+            "-o" | "--output" => flags.output = Some(value()?),
+            _ if let Some(path) = arg.strip_prefix("--output=") => flags.output = Some(path),
             "--workers" => {
                 let n = value()?.parse::<core::num::NonZeroU32>().map_err(|_| CliError::Usage("--workers takes a count of at least 1"))?;
                 flags.workers = Some(n);
@@ -632,7 +639,7 @@ fn words<'o>(command: Command, out: &'o Out, err: &'o Out) -> &'o Out {
 }
 
 /// What `blaze build` is told: the two commands that do what it would.
-const NO_BUILD: &str = "`blaze run` compiles what the program reaches and runs it; `blaze export` (not built yet) writes the program as a file";
+const NO_BUILD: &str = "`blaze run` compiles what the program reaches and runs it; `blaze export` writes the program as a standalone executable";
 
 #[expect(clippy::too_many_arguments, reason = "top-level command dispatcher: each argument one specific capability extracted at main")]
 fn command(
@@ -666,9 +673,9 @@ fn command(
         // check, then the program or the tests over what it stored.
         Some("run") => engine_start::command(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap, Command::Run),
         Some("test") => engine_start::command(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap, Command::Test),
-        // The commands are `check`, `run`, `test` and, later, `export`: there is no `build`.
+        // The commands are `check`, `run`, `test` and `export`: there is no `build`.
         Some("build") => Err(CliError::NoSuchCommand { command: "build", instead: NO_BUILD }),
-        Some("export") => Err(CliError::NotBuilt { command: "export" }),
+        Some("export") => engine_export::command(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap),
         Some("explain") => explain(cx, args.get(2), out),
         // The checkout's state, and with `--store` the home's store, removed (clean.rs).
         Some("clean") => clean::run(cx, fs, env, args, out),
@@ -693,7 +700,7 @@ fn command(
         Some("warm-toolchain") => engine_check::warm_toolchain(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap),
         Some("store") => store::publish_command::run(cx, args, fs, env, clock, host, rng, out, err, heap),
         Some("peer") => peer::run(cx, args, fs, env, net, clock, rng, out),
-        Some(_) | None => Err(CliError::Usage("the command is check, ci, inspect, run, test, peer, clean, gc, warm-toolchain or explain")),
+        Some(_) | None => Err(CliError::Usage("the command is check, ci, inspect, run, test, export, peer, clean, gc, warm-toolchain or explain")),
     }
 }
 

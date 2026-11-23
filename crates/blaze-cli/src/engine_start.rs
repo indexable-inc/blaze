@@ -135,19 +135,19 @@ pub(crate) fn abort_dependency<'b>(
 /// read only through the committed snapshot). COST: none until the first call; then one
 /// units layout, one names world and one runner, once a command.
 pub(crate) struct RunProcs<'n, 'e> {
-    cx: &'n Cx,
-    root: &'n bstd::fs::Dir<bstd::fs::ReadWrite>,
-    snapshot: &'n crate::store::StoreSnapshot,
+    pub(crate) cx: &'n Cx,
+    pub(crate) root: &'n bstd::fs::Dir<bstd::fs::ReadWrite>,
+    pub(crate) snapshot: &'n crate::store::StoreSnapshot,
     /// The answer's `UnitGraph` row (`Standing::graph`).
-    graph: blaze_drive::Input,
-    env: &'n crate::fetch::FetchEnv<'e>,
-    frame: &'n bstd::mem::Frame,
+    pub(crate) graph: blaze_drive::Input,
+    pub(crate) env: &'n crate::fetch::FetchEnv<'e>,
+    pub(crate) frame: &'n bstd::mem::Frame,
 }
 
 impl<'n> RunProcs<'n, '_> {
     /// The runner, as engine_check.rs makes it on a Names miss (its `MacroSide`, engine_check.rs
     /// `checking`), or why it could not be made, in the frame (rule 19).
-    fn make(&self) -> crate::job_texts::MadeProcs<'n> {
+    pub(crate) fn make(&self) -> crate::job_texts::MadeProcs<'n> {
         let (cx, frame, env) = (self.cx, self.frame, self.env);
         let _cx = cx.span("run: the proc-macro runner, made at the first proc-macro call");
         let said = |what: fmt::Arguments<'_>| -> &'n str { crate::work::held_str(bstd::mem::format_in!(frame, "{}", what).as_str(), frame) };
@@ -184,7 +184,7 @@ impl<'n> RunProcs<'n, '_> {
 /// reads each by its key; or, when a call asked for a runner and none could be made, why, said
 /// once on `err` (each call's refusal is its body's, with C8 that test's NOT RUN). Nothing when
 /// no call asked.
-fn end_procs<'n, F: Fn() -> crate::job_texts::MadeProcs<'n>>(cx: &Cx, maker: &crate::job_texts::MadeOnce<'n, F>, err: &Out, command: &str) -> Result<(), CliError> {
+pub(crate) fn end_procs<'n, F: Fn() -> crate::job_texts::MadeProcs<'n>>(cx: &Cx, maker: &crate::job_texts::MadeOnce<'n, F>, err: &Out, command: &str) -> Result<(), CliError> {
     match maker.made() {
         None => {}
         Some(Ok(procs)) => {
@@ -223,6 +223,9 @@ pub(crate) fn command(
     }
     if command != Command::Run && flags.open == blaze_run::viewer::OpenExplore::Open {
         return Err(CliError::Usage("--open is `blaze run`'s"));
+    }
+    if flags.output.is_some() {
+        return Err(CliError::Usage("-o / --output is `blaze export`'s"));
     }
     let select = match command {
         Command::Test => run_package::Select { test_packages: packages.as_slice(), bin: flags.select.bin, ..run_package::Select::NONE },
@@ -263,7 +266,7 @@ pub(crate) fn command(
 /// Either way they read each workspace body's reads BY NEED from the stored rows in place
 /// (`Standing::rows`, run_ids.rs `BodyReads`), counted in `asked` for the profile's line.
 /// COST: a hit, one get; a miss, O(workspace bodies) row reads and one put; no read list.
-fn body_ids<'a, 'r: 'a, 'm: 'a>(
+pub(crate) fn body_ids<'a, 'r: 'a, 'm: 'a>(
     cx: &Cx, standing: &mut Standing<'r, 'm>, list: &blaze_world::crate_list::CrateList<'_>, asked: &'a crate::run_ids::Asked, bump: blaze_own::Bump<'a>,
 ) -> Result<RunIds<'a>, CliError> {
     let alloc = bump.alloc();
@@ -287,6 +290,32 @@ fn body_ids<'a, 'r: 'a, 'm: 'a>(
     reading(ids)
 }
 
+/// Builds `work::Facts` for `run`, `test`, and `export` from `standing` (the one home for
+/// `Facts` on the start path, rule 30).
+pub(crate) fn start_facts<'f>(
+    standing: &Standing<'f, '_>,
+    fs: &bstd::fs::Fs,
+    phases: &Phases,
+    lints: crate::lints::Lints,
+) -> crate::work::Facts<'f, crate::sweep::FromMeta> {
+    let (frame, heap) = (standing.frame, standing.heap);
+    crate::work::Facts {
+        stamps: crate::sweep::FromMeta::now(phases.clock()),
+        rows: crate::sweep::Rows::new_in(frame),
+        found: crate::sweep::Found::new_in(frame),
+        laid: None,
+        plant: crate::work::Sizes::USUAL.plant,
+        workers: standing.workers.get(),
+        fetch_env: standing.place.fetch_env(phases.clock().clone(), standing.toolchain, fs.clone(), heap),
+        macros: None,
+        names: None,
+        bodies: crate::body_types::Kept::default(),
+        scripts: None,
+        producer: standing.producers.get::<blaze_ids::producer::Whole>(),
+        lints: lints.rules,
+    }
+}
+
 /// `blaze run` over the check's answer: the program's crates from the answer's rows, its native
 /// image by key, its body ids, then the program under the lazy parent (program.rs `run`), which
 /// builds what it calls and refuses a called body whose check does not run (D151).
@@ -304,21 +333,7 @@ pub(crate) fn run_program(
     let lints = crate::lints::of_root(cx, root, frame)?;
     // The names world's facts, made only on the unit map's miss (run_names.rs `unit_map`):
     // the program's crate is its `Bin` unit's, found through that map (`program_row`).
-    let mut facts = crate::work::Facts {
-        stamps: crate::sweep::FromMeta::now(phases.clock()),
-        rows: crate::sweep::Rows::new_in(frame),
-        found: crate::sweep::Found::new_in(frame),
-        laid: None,
-        plant: crate::work::Sizes::USUAL.plant,
-        workers: standing.workers.get(),
-        fetch_env: standing.place.fetch_env(phases.clock().clone(), standing.toolchain, launch.fs.clone(), heap),
-        macros: None,
-        names: None,
-        bodies: crate::body_types::Kept::default(),
-        scripts: None,
-        producer: standing.producers.get::<blaze_ids::producer::Whole>(),
-        lints: lints.rules,
-    };
+    let mut facts = start_facts(&standing, launch.fs, phases, lints);
     let answered = run_names::FromEngine { graph: standing.graph, names: standing.names };
     let at = run_names::program_row(cx, root, &answered, &mut *standing.store, &mut facts, picked.root, heap, frame).map_err(CliError::RunNames)?;
     let owner = run_names::Owner::At(at);
@@ -447,21 +462,7 @@ pub(crate) fn run_tests_status(
     let lints = crate::lints::of_root(cx, root, frame)?;
     let workers = standing.workers.get();
     // The names world's facts, made only on a test map's miss (run_names.rs `tests_of`).
-    let mut facts = crate::work::Facts {
-        stamps: crate::sweep::FromMeta::now(phases.clock()),
-        rows: crate::sweep::Rows::new_in(frame),
-        found: crate::sweep::Found::new_in(frame),
-        laid: None,
-        plant: crate::work::Sizes::USUAL.plant,
-        workers,
-        fetch_env: standing.place.fetch_env(phases.clock().clone(), standing.toolchain, launch.fs.clone(), heap),
-        macros: None,
-        names: None,
-        bodies: crate::body_types::Kept::default(),
-        scripts: None,
-        producer: standing.producers.get::<blaze_ids::producer::Whole>(),
-        lints: lints.rules,
-    };
+    let mut facts = start_facts(&standing, launch.fs, phases, lints);
     let answered = run_names::FromEngine { graph: standing.graph, names: standing.names };
     let inventory = run_names::found_tests_answered(cx, root, &answered, &mut *standing.store, &mut facts, &mut read, packages, bin, heap, frame).map_err(CliError::RunNames)?;
     // A custom harness owns its arguments. Listing is a command operation, even for a selection

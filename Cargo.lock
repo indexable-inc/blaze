@@ -654,6 +654,7 @@ dependencies = [
  "blaze-emit",
  "blaze-engine",
  "blaze-expand",
+ "blaze-export",
  "blaze-fetch",
  "blaze-file-items",
  "blaze-h1",
