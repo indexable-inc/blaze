@@ -234,7 +234,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             }
             match self.expr(ExprId(up))? {
                 Expr::Ref { .. } | Expr::Paren(_) | Expr::Cast { .. } | Expr::Tuple { .. } | Expr::Array { .. } => {}
-                Expr::Struct { base, .. } if base.expr().map(|b| b.0) != Some(c) => {}
+                Expr::Struct { base, .. } | Expr::Record { base, .. } if base.expr().map(|b| b.0) != Some(c) => {}
                 Expr::Call { callee, .. }
                     if callee.0 != c && matches!(self.expr_def(callee), Some(Def::Ctor { kind: CtorKind::Tuple, .. })) => {}
                 Expr::Block { stmts, tail, .. } => {
@@ -290,7 +290,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     let l = body.expr_lists.get(elems.range()).ok_or(malformed("a list past `expr_lists`"))?;
                     todo.extend(l.iter().map(|&c| (c, under)));
                 }
-                Expr::Struct { fields, .. } => {
+                Expr::Struct { fields, .. } | Expr::Record { fields, .. } => {
                     let inits = body.field_inits.get(fields.range()).ok_or(malformed("a struct literal's fields past `field_inits`"))?;
                     todo.extend(inits.iter().map(|f| (f.expr, under)));
                 }

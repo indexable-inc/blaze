@@ -1185,6 +1185,15 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 let fields = adt.fields.get(v.fields.range()).ok_or(malformed("an ADT's fields past their column"))?;
                 fields.get(j as usize).ok_or(malformed("a field past its ADT's fields"))?.name
             }
+            PNode::Record(schema, _) => {
+                let idx = usize::try_from(j).ok();
+                self.ground
+                    .view()
+                    .record_names(schema)
+                    .or_else(|| self.checked.types.view().record_names(schema))
+                    .and_then(|ns| idx.and_then(|i| ns.get(i).copied()))
+                    .unwrap_or(Name(u64::from(j)))
+            }
             _ => Name(u64::from(j)),
         };
         if found != declared {
@@ -1312,10 +1321,25 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     parts.push((Name(0), ptr));
                     parts.push((Name(1), len));
                 }
-                PNode::Tuple(l) | PNode::Record(_, l) => {
+                PNode::Tuple(l) => {
                     let elems = self.ground.view().list(l).map_err(|_| TyErr::Malformed("a list past the ground table"))?;
                     for (i, &et) in elems.iter().enumerate() {
                         parts.push((Name(u64::try_from(i).map_err(|_| TyErr::Malformed("too many fields"))?), et));
+                    }
+                }
+                PNode::Record(schema, l) => {
+                    let elems = self.ground.view().list(l).map_err(|_| TyErr::Malformed("a list past the ground table"))?;
+                    let names = self
+                        .ground
+                        .view()
+                        .record_names(schema)
+                        .or_else(|| self.checked.types.view().record_names(schema));
+                    for (i, &et) in elems.iter().enumerate() {
+                        let nm = match names.and_then(|ns| ns.get(i).copied()) {
+                            Some(nm) => nm,
+                            None => Name(u64::try_from(i).map_err(|_| TyErr::Malformed("too many fields"))?),
+                        };
+                        parts.push((nm, et));
                     }
                 }
                 PNode::Union(l) => {
@@ -2082,7 +2106,12 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 Pat::Slice { elems, rest: None } => (elems, None),
                 // An array with `..`, a struct or only-variant pattern, `&p`: the irrefutable
                 // binder, by the match builder's projection.
-                Pat::Slice { rest: Some(_), .. } | Pat::Struct { .. } | Pat::TupleStruct { .. } | Pat::Ref { .. } | Pat::Path(_) => {
+                Pat::Slice { rest: Some(_), .. }
+                | Pat::Struct { .. }
+                | Pat::Record { .. }
+                | Pat::TupleStruct { .. }
+                | Pat::Ref { .. }
+                | Pat::Path(_) => {
                     self.bind_irrefutable(p, v)?;
                     continue;
                 }
@@ -4139,12 +4168,197 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 AdjustKind::Deref { .. } | AdjustKind::Borrow { .. } => {
                     return Err(malformed("a dereference or a borrow among the value adjustments"));
                 }
-                AdjustKind::UnionInject { .. } | AdjustKind::UnionWiden => {
-                    return Err(unsupported(e, "a structural union coercion"));
-                }
+                AdjustKind::UnionInject { variant } => self.union_inject(e, t, variant)?,
+                AdjustKind::UnionWiden => self.union_widen(e, n, t)?,
             }
         }
         Ok(())
+    }
+
+    /// Injects the value on top into structural union type `dst_t` at member `variant`.
+    fn union_inject(&mut self, e: ExprId, dst_t: PTy, variant: u32) -> Result<(), BuildError> {
+        let v = self.pop()?;
+        let dst_g = self.ground_ty(dst_t).map_err(|error| Self::ty_err(e, error))?;
+        if let PNode::Union(ul) = self.ground_node(dst_g).map_err(|error| Self::ty_err(e, error))?
+            && ul.len == 1
+        {
+            if variant != 0 {
+                return Err(malformed("a single-member union injection at a non-zero variant"));
+            }
+            let owns = self.needs_drop(dst_g).map_err(|error| Self::ty_err(e, error))?.then_some(dst_g);
+            self.push_val(v, owns);
+            return Ok(());
+        }
+        let dst_repr = self.repr(dst_g).map_err(|error| Self::ty_err(e, error))?;
+        match dst_repr {
+            Repr::None => {
+                self.push_val(V::None, None);
+                Ok(())
+            }
+            Repr::Agg(dst_l) => {
+                let (first, len, tag) = self.variant_rows(dst_l, variant)?;
+                if len != 1 {
+                    return Err(malformed("a union variant without exactly one payload field"));
+                }
+                let first_idx = usize::try_from(first).map_err(|_| malformed("a union field index past `usize`"))?;
+                let &(_, field_off, field_repr) = self
+                    .layout_fields
+                    .get(first_idx)
+                    .ok_or(malformed("a union variant's field past `layout_fields`"))?;
+                let field_off_i32 = i32::try_from(field_off).map_err(|_| malformed("a union field offset past `i32`"))?;
+                let dst_at = self.temp(dst_repr);
+                self.write_tag(tag, variant, dst_at);
+                self.store(v, field_repr, (dst_at.0, dst_at.1 + field_off_i32))?;
+                let owns = self.repr_needs_drop(dst_repr).then_some(dst_g);
+                self.push_val(V::Place(dst_at.0, dst_at.1), owns);
+                Ok(())
+            }
+            _ => Err(malformed("a multi-member union not held as an aggregate")),
+        }
+    }
+
+    /// Widens the structural union value on top (`A | B -> A | B | C`).
+    fn union_widen(&mut self, e: ExprId, n: usize, dst_t: PTy) -> Result<(), BuildError> {
+        let src_t = self.ty_before(e, n)?;
+        let src_g = self.ground_ty(src_t).map_err(|error| Self::ty_err(e, error))?;
+        let dst_g = self.ground_ty(dst_t).map_err(|error| Self::ty_err(e, error))?;
+        if src_g == dst_g {
+            return Ok(());
+        }
+        let PNode::Union(src_l_list) = self.ground_node(src_g).map_err(|error| Self::ty_err(e, error))? else {
+            return Err(malformed("a union widening from other than a structural union"));
+        };
+        let PNode::Union(dst_l_list) = self.ground_node(dst_g).map_err(|error| Self::ty_err(e, error))? else {
+            return Err(malformed("a union widening to other than a structural union"));
+        };
+        let mut src_members: Vec<PTy, A> = Vec::new_in(self.alloc);
+        src_members.extend_from_slice(
+            self.ground
+                .view()
+                .list(src_l_list)
+                .map_err(|_| malformed("a source union's members past the ground table"))?,
+        );
+        let mut dst_members: Vec<PTy, A> = Vec::new_in(self.alloc);
+        dst_members.extend_from_slice(
+            self.ground
+                .view()
+                .list(dst_l_list)
+                .map_err(|_| malformed("a target union's members past the ground table"))?,
+        );
+        if let [only] = src_members.as_slice() {
+            let j = dst_members
+                .iter()
+                .position(|dm| dm == only)
+                .ok_or(malformed("a widened union missing a source member"))?;
+            let j = u32::try_from(j).map_err(|_| malformed("a union variant index past `u32`"))?;
+            return self.union_inject(e, dst_t, j);
+        }
+        let v = self.pop()?;
+        let src_repr = self.repr(src_g).map_err(|error| Self::ty_err(e, error))?;
+        let dst_repr = self.repr(dst_g).map_err(|error| Self::ty_err(e, error))?;
+        if dst_repr == Repr::None {
+            self.push_val(V::None, None);
+            return Ok(());
+        }
+        let Repr::Agg(dst_l) = dst_repr else {
+            return Err(malformed("a widened union not held as an aggregate"));
+        };
+        let dst_at = self.temp(dst_repr);
+        if !self.live {
+            self.push_val(V::Place(dst_at.0, dst_at.1), None);
+            return Ok(());
+        }
+        let Repr::Agg(src_l) = src_repr else {
+            return Err(malformed("a multi-member source union not held as an aggregate"));
+        };
+        let src_at = self.place(v, src_repr)?;
+        self.remap_union(Some(e), src_l, src_at, &src_members, dst_l, dst_at, &dst_members)?;
+        let owns = self.repr_needs_drop(dst_repr).then_some(dst_g);
+        self.push_val(V::Place(dst_at.0, dst_at.1), owns);
+        Ok(())
+    }
+
+    /// Copies the active member of source union `src_l` at `src_at` into target union `dst_l` at
+    /// `dst_at`, switching on the source discriminant across every source member that appears in
+    /// `dst_members` (shared by `AdjustKind::UnionWiden` and `UnionPat::Residual`).
+    pub(super) fn remap_union(
+        &mut self,
+        at_expr: Option<ExprId>,
+        src_l: u32,
+        src_at: (Value, i32),
+        src_members: &[PTy],
+        dst_l: u32,
+        dst_at: (Value, i32),
+        dst_members: &[PTy],
+    ) -> Result<(), BuildError> {
+        let src_l_idx = usize::try_from(src_l).map_err(|_| malformed("a layout index past `usize`"))?;
+        let Some(&Shape::Enum { id: src_id, len: src_len, .. }) = self.layouts.get(src_l_idx).map(|row| &row.shape) else {
+            return Err(malformed("a multi-member union not laid out as an enum"));
+        };
+        let copy_one = |w: &mut Self, i: u32, j: u32| -> Result<(), BuildError> {
+            let (sfirst, slen, _) = w.variant_rows(src_l, i)?;
+            let (dfirst, dlen, dtag) = w.variant_rows(dst_l, j)?;
+            if slen != 1 || dlen != 1 {
+                return Err(malformed("a union variant without exactly one payload field"));
+            }
+            let sfirst_idx = usize::try_from(sfirst).map_err(|_| malformed("a union field index past `usize`"))?;
+            let dfirst_idx = usize::try_from(dfirst).map_err(|_| malformed("a union field index past `usize`"))?;
+            let &(_, soff, srepr) = w
+                .layout_fields
+                .get(sfirst_idx)
+                .ok_or(malformed("a source union variant's field past `layout_fields`"))?;
+            let &(_, doff, drepr) = w
+                .layout_fields
+                .get(dfirst_idx)
+                .ok_or(malformed("a target union variant's field past `layout_fields`"))?;
+            let soff_i32 = i32::try_from(soff).map_err(|_| malformed("a union field offset past `i32`"))?;
+            let doff_i32 = i32::try_from(doff).map_err(|_| malformed("a union field offset past `i32`"))?;
+            w.write_tag(dtag, j, dst_at);
+            let pv = w.load(srepr, (src_at.0, src_at.1 + soff_i32));
+            w.store(pv, drepr, (dst_at.0, dst_at.1 + doff_i32))
+        };
+        match self.ls.get(src_id).variants {
+            Variants::Single { index } if index < src_len => {
+                let idx = usize::try_from(index).map_err(|_| malformed("a union variant past `usize`"))?;
+                let sm = *src_members.get(idx).ok_or(malformed("a union variant past its members"))?;
+                let j = dst_members
+                    .iter()
+                    .position(|&dm| dm == sm)
+                    .ok_or(malformed("a remapped union missing the single present source member"))?;
+                let j = u32::try_from(j).map_err(|_| malformed("a union variant index past `u32`"))?;
+                copy_one(self, index, j)?;
+                Ok(())
+            }
+            Variants::Single { .. } => Ok(()),
+            Variants::Multiple { .. } => {
+                let d = self.read_discriminant(src_id, src_at)?;
+                let join = self.create();
+                let none = self.create();
+                let mut cases: Vec<(u128, Block), A> = Vec::new_in(self.alloc);
+                let mut arms: Vec<(Block, u32, u32), A> = Vec::new_in(self.alloc);
+                for (i_idx, &sm) in src_members.iter().enumerate() {
+                    let Some(j_idx) = dst_members.iter().position(|&dm| dm == sm) else {
+                        continue;
+                    };
+                    let i = u32::try_from(i_idx).map_err(|_| malformed("a union variant index past `u32`"))?;
+                    let j = u32::try_from(j_idx).map_err(|_| malformed("a union variant index past `u32`"))?;
+                    let case = self.discriminant_case(src_id, i)?;
+                    let block = self.create();
+                    cases.push((case, block));
+                    arms.push((block, i, j));
+                }
+                self.switch(d, none, &cases);
+                for &(block, i, j) in arms.iter() {
+                    self.begin(block);
+                    copy_one(self, i, j)?;
+                    self.jump(join, &[]);
+                }
+                self.begin(none);
+                self.unreachable_of_enum(src_id, src_len, at_expr)?;
+                self.begin(join);
+                Ok(())
+            }
+        }
     }
 
     /// Adjustment `n` of `e`, an unsizing of the value on top (lib.rs, "Wide pointers";
@@ -5329,13 +5543,16 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 self.work.push(Task::Cast(e));
                 self.work.push(Task::Eval(operand));
             }
-            Expr::Struct { base: blaze_typeck::StructBase::Expr(_), .. } => self.struct_update(e)?,
+            Expr::Struct { base: blaze_typeck::StructBase::Expr(_), .. }
+            | Expr::Record { base: blaze_typeck::StructBase::Expr(_), .. } => self.struct_update(e)?,
             // `S { a: 1, .. }` (RFC 3681) is built as `S { a: 1, b: B_DEFAULT }` would be: the
             // written fields in written order, then each unwritten field from its default's
             // value at this instance (`Task::InitDefaults`: `Checked::default_fields`, each a
             // constant pulled before the walk by front2 const_at.rs `needs_of`).
-            Expr::Struct { fields, base: base @ (blaze_typeck::StructBase::None | blaze_typeck::StructBase::Defaults), .. } => {
+            Expr::Struct { fields, base: base @ (blaze_typeck::StructBase::None | blaze_typeck::StructBase::Defaults), .. }
+            | Expr::Record { fields, base: base @ (blaze_typeck::StructBase::None | blaze_typeck::StructBase::Defaults) } => {
                 let defaults = base == blaze_typeck::StructBase::Defaults;
+                let is_record = matches!(self.expr(e)?, Expr::Record { .. });
                 let repr = self.expr_repr(e)?;
                 let inits = self.body.field_inits.get(fields.range()).ok_or(malformed("a struct literal's fields past `field_inits`"))?;
                 match repr {
@@ -5348,8 +5565,12 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                         }
                     }
                     Repr::Agg(l) => {
-                        let variant = Self::def_variant(self.expr_def(e))
-                            .ok_or(malformed("a struct literal the check did not resolve to a struct or variant"))?;
+                        let variant = if is_record {
+                            0
+                        } else {
+                            Self::def_variant(self.expr_def(e))
+                                .ok_or(malformed("a struct literal the check did not resolve to a struct or variant"))?
+                        };
                         let (first, len, tag) = self.variant_rows(l, variant)?;
                         // A union literal names exactly one field (the reference, "Unions").
                         let named = if self.layouts[l as usize].is_union { 1 } else { len as usize };
@@ -5381,7 +5602,6 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     _ => return Err(unsupported(e, "a struct literal of other than a struct")),
                 }
             }
-            Expr::Record { .. } => return Err(unsupported(e, "a structural record literal")),
             Expr::Tuple { elems } | Expr::Array { elems } => {
                 let list = self.body.expr_lists.get(elems.range()).ok_or(malformed("a literal's elements past `expr_lists`"))?;
                 let repr = self.expr_repr(e)?;

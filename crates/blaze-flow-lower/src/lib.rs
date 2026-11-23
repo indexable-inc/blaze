@@ -2753,7 +2753,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         let len = self.npos_d(child, e)?;
                         info = PInfo { start: pi.start, len, exact: true, ..info };
                     }
-                    (Proj::Field(i), PNode::Tuple(l) | PNode::Record(_, l)) => {
+                    (Proj::Field(i), PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l)) => {
                         let elems = self.list(l, e)?;
                         let mut off = 0;
                         for &t in elems.iter().take(i as usize) {
@@ -5289,6 +5289,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     let t = self.temp(out, e)?;
                     let tp = self.place_of(t);
                     self.b.aggregate(tp, &[op], self.span(e));
+                    if let At::Place(p) = v.at {
+                        self.relate(p, tp, out, e)?;
+                    }
                     Val { at: At::Place(tp), ty: out }
                 }
             };
@@ -5574,6 +5577,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 }
                 f.drop_impl
             }
+            PNode::Record(..) => false,
             _ => return self.refuse(Form::Malformed, e),
         };
         let ck = self.ck;
@@ -6707,7 +6711,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 Some(x) => *x,
                 None => return self.refuse_pat(Form::Malformed, p),
             };
-            let peel = matches!(pat, Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Record { .. } | Pat::Slice { .. } | Pat::Path(_) | Pat::Range { .. });
+            let union_pat = self.ck.union_pat_of(p);
+            let peel = union_pat.is_some()
+                || matches!(pat, Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Record { .. } | Pat::Slice { .. } | Pat::Path(_) | Pat::Range { .. });
             if peel {
                 for _ in 0..MOST_POSITIONS {
                     let (m, inner) = match (ty.wrap, self.node(ty.ty, root)?) {
@@ -6732,6 +6738,22 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         Some(&t) => TyD::of(t),
                         None => return self.refuse_pat(Form::Malformed, p),
                     };
+                    if let Some(blaze_typeck::UnionPat::Variant(v)) = union_pat
+                        && ty.wrap.is_none()
+                        && let PNode::Union(ul) = self.node(ty.ty, root)?
+                    {
+                        let members = self.list(ul, root)?;
+                        let Some(v_idx) = usize::try_from(v).ok() else {
+                            return self.refuse_pat(Form::Malformed, p);
+                        };
+                        let Some(&mt) = members.get(v_idx) else {
+                            return self.refuse_pat(Form::Malformed, p);
+                        };
+                        let mty = TyD::of(mt);
+                        place = self.project(place, ty, Proj::Field(v), mty, false, root)?;
+                        ty = mty;
+                    }
+                    let is_residual = matches!(union_pat, Some(blaze_typeck::UnionPat::Residual));
                     let by_ref = match ann.by_ref {
                         Some(m) => Some(m),
                         None if ann.mutable => None,
@@ -6767,7 +6789,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     self.b.stmt(StmtKind::StorageLive(l), self.pat_span(p));
                     match by_ref {
                         None => {
-                            if ty.wrap.is_some() || ty.ty != lt.ty {
+                            if !is_residual && (ty.wrap.is_some() || ty.ty != lt.ty) {
                                 return self.refuse_pat(Form::BindingMode, p);
                             }
                             let op = self.operand(Val { at: At::Place(place), ty }, root)?;
@@ -6779,9 +6801,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                             self.relate(place, lp, lt, root)?;
                         }
                         Some(m) => {
-                            match self.node(lt.ty, root)? {
-                                PNode::Ref(rm, inner) if rm == m && ty.wrap.is_none() && inner == ty.ty => {}
-                                _ => return self.refuse_pat(Form::BindingMode, p),
+                            if !is_residual {
+                                match self.node(lt.ty, root)? {
+                                    PNode::Ref(rm, inner) if rm == m && ty.wrap.is_none() && inner == ty.ty => {}
+                                    _ => return self.refuse_pat(Form::BindingMode, p),
+                                }
                             }
                             let kind = if m == Mutbl::Mut { BorrowKind::Mut } else { BorrowKind::Shared };
                             self.borrow(place, ty, kind, l, root)?;

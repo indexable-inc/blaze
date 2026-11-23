@@ -57,7 +57,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     todo.extend(sub);
                 }
                 Pat::Ref { inner, .. } => todo.push(inner),
-                Pat::Struct { fields, .. } => {
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                     let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
                     todo.extend(fps.iter().map(|fp| fp.pat));
                 }
@@ -92,7 +92,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     todo.extend(sub);
                 }
                 Pat::Ref { inner, .. } => todo.push(inner),
-                Pat::Struct { fields, .. } => {
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                     let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
                     todo.extend(fps.iter().map(|fp| fp.pat));
                 }

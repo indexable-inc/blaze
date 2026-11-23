@@ -69,7 +69,7 @@ impl RootStart {
     /// `cfg_atoms`, or the crate input's), `alloc` holds the outline and is dropped by the
     /// caller.
     pub fn of_root(std: StdIs, root_text: &str, edition: Edition, atoms: &[(&str, Option<&str>)], alloc: Alloc<'_>) -> RootStart {
-        let outline = blaze_file_items::outline(root_text, edition, alloc);
+        let outline = blaze_file_items::outline_auto_extensions(root_text, edition, blaze_file_items::Bodies::Skipped, alloc);
         let cfg = blaze_scope::task::Cfg::from_atoms(atoms, alloc);
         let attrs = blaze_scope::task::file_attrs(&cfg, &outline, root_text, alloc);
         RootStart::of(std, attrs.no_core, attrs.no_std)

@@ -38,8 +38,10 @@ impl<'x, A: Allocator + Copy> Walk<'x, '_, '_, A> {
     /// its base.
     fn update_parts(&self, e: ExprId) -> Result<(&'x [FieldInit], ExprId), BuildError> {
         let body: &'x blaze_typeck::BodyView<'x> = self.body;
-        let Expr::Struct { fields, base: blaze_typeck::StructBase::Expr(base), .. } = self.expr(e)? else {
-            return Err(malformed("a struct update that is not a struct expression with a base"));
+        let (fields, base) = match self.expr(e)? {
+            Expr::Struct { fields, base: blaze_typeck::StructBase::Expr(base), .. }
+            | Expr::Record { fields, base: blaze_typeck::StructBase::Expr(base) } => (fields, base),
+            _ => return Err(malformed("a struct update that is not a struct expression with a base")),
         };
         let inits = body.field_inits.get(fields.range()).ok_or(malformed("a struct update's fields past `field_inits`"))?;
         Ok((inits, base))
@@ -71,7 +73,11 @@ impl<'x, A: Allocator + Copy> Walk<'x, '_, '_, A> {
                 if self.layouts[l as usize].is_union {
                     return Err(malformed("a struct update of a union (only a struct takes a base)"));
                 }
-                let variant = Self::def_variant(self.expr_def(e)).ok_or(malformed("a struct update the check did not resolve to a struct"))?;
+                let variant = if matches!(self.expr(e)?, Expr::Record { .. }) {
+                    0
+                } else {
+                    Self::def_variant(self.expr_def(e)).ok_or(malformed("a struct update the check did not resolve to a struct"))?
+                };
                 let (first, len, tag) = self.variant_rows(l, variant)?;
                 let at = self.temp(repr);
                 self.write_tag(tag, variant, at);
@@ -107,7 +113,11 @@ impl<'x, A: Allocator + Copy> Walk<'x, '_, '_, A> {
         let Repr::Agg(l) = self.expr_repr(e)? else {
             return Err(malformed("a struct update built as other than an aggregate"));
         };
-        let variant = Self::def_variant(self.expr_def(e)).ok_or(malformed("a struct update the check did not resolve to a struct"))?;
+        let variant = if matches!(self.expr(e)?, Expr::Record { .. }) {
+            0
+        } else {
+            Self::def_variant(self.expr_def(e)).ok_or(malformed("a struct update the check did not resolve to a struct"))?
+        };
         let (first, len, _) = self.variant_rows(l, variant)?;
         let Repr::Agg(bl) = self.adjusted_repr(base)? else {
             return Err(malformed("a struct update's base held as other than an aggregate"));
@@ -211,7 +221,11 @@ impl<'x, A: Allocator + Copy> Walk<'x, '_, '_, A> {
     pub(in crate::walk) fn scan_update_moves(&mut self) -> Result<(), BuildError> {
         for i in 0..self.body.exprs.len() {
             let e = ExprId(i as u32);
-            let Expr::Struct { base: blaze_typeck::StructBase::Expr(base), .. } = self.expr(e)? else { continue };
+            let base = match self.expr(e)? {
+                Expr::Struct { base: blaze_typeck::StructBase::Expr(base), .. }
+                | Expr::Record { base: blaze_typeck::StructBase::Expr(base), .. } => base,
+                _ => continue,
+            };
             if !self.adjust_rows(base).is_empty() {
                 continue;
             }

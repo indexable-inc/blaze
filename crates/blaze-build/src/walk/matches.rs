@@ -37,7 +37,7 @@ use blaze_lir::builder::MemAttrs;
 use blaze_lir::func::SlotKind;
 use blaze_lir::{Block, Flags, IntCond, Op, Ty, Value};
 use blaze_own::Vec;
-use blaze_typeck::{Def, ExprId, List, Lit, Mutbl, Name, PNode, PTy, Pat, PatId};
+use blaze_typeck::{Def, ExprId, List, Lit, Mutbl, Name, PNode, PTy, Pat, PatId, UnionPat};
 
 mod alts;
 mod forms;
@@ -46,6 +46,14 @@ mod ref_bind;
 
 use super::{Home, MatchState, Owner, PTR_BITS, Repr, Shape, Task, V, Walk, malformed, mask, unsupported};
 use crate::BuildError;
+use crate::layout::Variants;
+
+/// Outcome of testing whether a union value matches a residual sub-union pattern.
+enum ResidualTest {
+    Never,
+    Always,
+    Cond(Value),
+}
 
 /// A place a pattern is matched against.
 #[derive(Clone, Copy)]
@@ -122,7 +130,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let plain = |w: &Self, q: PatId| -> Result<bool, BuildError> {
             Ok(match w.pat(q)? {
                 Pat::Wild => true,
-                Pat::Bind { ann, sub: None, .. } => ann.by_ref.is_none(),
+                Pat::Bind { ann, sub: None, .. } => ann.by_ref.is_none() && w.checked.union_pat_of(q).is_none(),
                 _ => false,
             })
         };
@@ -133,7 +141,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         Ok(match self.pat(p)? {
             Pat::Wild => true,
             Pat::Path(_) => variant(self, p),
-            Pat::Bind { ann, sub: None, .. } => ann.by_ref.is_none(),
+            Pat::Bind { ann, sub: None, .. } => ann.by_ref.is_none() && self.checked.union_pat_of(p).is_none(),
             Pat::Lit(l) | Pat::NegLit(l) => lit(l),
             Pat::Or { alts } => {
                 let list = self.body.pat_lists.get(alts.range()).ok_or(malformed("an or-pattern past `pat_lists`"))?;
@@ -352,7 +360,56 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 at = self.peel(p, at)?;
             }
             match pat {
-                Pat::Wild | Pat::Bind { .. } => self.jump(ok, &[]),
+                Pat::Wild => self.jump(ok, &[]),
+                Pat::Bind { ann, sub, .. } => match self.checked.union_pat_of(p) {
+                    None => self.jump(ok, &[]),
+                    Some(UnionPat::Variant(v)) => {
+                        let peeled = self.peel(p, at)?;
+                        let test = self.union_variant_test(p, peeled, v)?;
+                        match (test, sub) {
+                            (None, None) => self.jump(ok, &[]),
+                            (Some(c), None) => self.br(c, (ok, &[]), (fail, &[])),
+                            (None, Some(s)) => {
+                                let payload = self.union_variant_at(p, peeled, v)?;
+                                let mid = self.create();
+                                self.jump(mid, &[]);
+                                todo.push((s, payload, mid, ok, fail));
+                            }
+                            (Some(c), Some(s)) => {
+                                let payload = self.union_variant_at(p, peeled, v)?;
+                                let mid = self.create();
+                                self.br(c, (mid, &[]), (fail, &[]));
+                                todo.push((s, payload, mid, ok, fail));
+                            }
+                        }
+                    }
+                    Some(UnionPat::Residual) => {
+                        let peeled = self.peel(p, at)?;
+                        let by_ref = ann.by_ref.is_some() || (!ann.mutable && peeled.by_ref);
+                        let dst_g = self.union_residual_ty(p, by_ref)?;
+                        match (self.union_residual_test(p, peeled, dst_g)?, sub) {
+                            (ResidualTest::Never, _) => self.jump(fail, &[]),
+                            (ResidualTest::Always, None) => self.jump(ok, &[]),
+                            (ResidualTest::Cond(c), None) => self.br(c, (ok, &[]), (fail, &[])),
+                            (ResidualTest::Always, Some(s)) => {
+                                let dst_at = self.union_residual_narrow(p, peeled, dst_g)?;
+                                let mid = self.create();
+                                self.jump(mid, &[]);
+                                todo.push((s, dst_at, mid, ok, fail));
+                            }
+                            (ResidualTest::Cond(c), Some(s)) => {
+                                let mid = self.create();
+                                self.br(c, (mid, &[]), (fail, &[]));
+                                self.begin(mid);
+                                self.live = live;
+                                let dst_at = self.union_residual_narrow(p, peeled, dst_g)?;
+                                let next_b = self.create();
+                                self.jump(next_b, &[]);
+                                todo.push((s, dst_at, next_b, ok, fail));
+                            }
+                        }
+                    }
+                },
                 // matches/forms.rs: a float by `==`, a string by length and bytes.
                 Pat::Lit(Lit::Float(_)) | Pat::NegLit(Lit::Float(_)) => {
                     let c = self.float_test(p, at)?;
@@ -402,7 +459,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                         }
                     }
                 }
-                Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Tuple { .. } | Pat::Slice { .. } => {
+                Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Record { .. } | Pat::Tuple { .. } | Pat::Slice { .. } => {
                     let c = match pat {
                         Pat::TupleStruct { .. } | Pat::Struct { .. } => self.variant_test(p, at)?,
                         Pat::Slice { elems, rest } => self.length_test(p, at, elems.len, rest.is_some())?,
@@ -503,6 +560,19 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             let pat = self.pat(p)?;
             match pat {
                 Pat::Bind { ann, name, sub, .. } => {
+                    let at = match self.checked.union_pat_of(p) {
+                        None => at,
+                        Some(UnionPat::Variant(v)) => {
+                            let peeled = self.peel(p, at)?;
+                            self.union_variant_at(p, peeled, v)?
+                        }
+                        Some(UnionPat::Residual) => {
+                            let peeled = self.peel(p, at)?;
+                            let by_ref = ann.by_ref.is_some() || (!ann.mutable && peeled.by_ref);
+                            let dst_g = self.union_residual_ty(p, by_ref)?;
+                            self.union_residual_narrow(p, peeled, dst_g)?
+                        }
+                    };
                     if at.copy && ann.by_ref == Some(Mutbl::Mut) {
                         return Err(BuildError::UnsupportedPat { pat: p, what: "a `ref mut` binding of a scrutinee held as a value (a copy)" });
                     }
@@ -571,7 +641,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     }
                 }
                 Pat::Or { .. } => {}
-                Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Slice { .. } => {
+                Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Record { .. } | Pat::Slice { .. } => {
                     let a = self.peel(p, at)?;
                     parts.clear();
                     self.parts(p, a, &mut parts)?;
@@ -611,7 +681,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     fn through(&mut self, mut p: PatId, mut at: At) -> Result<(PatId, At), BuildError> {
         loop {
             match self.pat(p)? {
-                Pat::Bind { sub: Some(s), .. } => p = s,
+                Pat::Bind { sub: Some(s), .. } if self.checked.union_pat_of(p).is_none() => p = s,
                 Pat::Ref { inner, .. } => {
                     let PNode::Ref(_, to) = self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))? else {
                         return Err(malformed("a `&` pattern over other than a reference"));
@@ -628,7 +698,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// The patterns that follow references (rules/pat.rs `step_pat`'s `peel`).
     fn peels(pat: Pat) -> bool {
         match pat {
-            Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Slice { .. } | Pat::Path(_) | Pat::Range { .. } => true,
+            Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Record { .. } | Pat::Slice { .. } | Pat::Path(_) | Pat::Range { .. } => true,
             Pat::Lit(l) | Pat::NegLit(l) => !matches!(l, Lit::Str | Lit::ByteStr(_) | Lit::CStr),
             _ => false,
         }
@@ -768,13 +838,17 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     out.push((sub, part(at, i64::from(off), g)?));
                 }
             }
-            Pat::Struct { fields, .. } => {
+            Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                 let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
                 if fps.is_empty() {
                     return Ok(());
                 }
                 let l = self.layout(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
-                let variant = Self::def_variant(self.pat_def(p)).ok_or(malformed("a variant pattern the check did not resolve"))?;
+                let variant = if matches!(self.pat(p)?, Pat::Record { .. }) {
+                    0
+                } else {
+                    Self::def_variant(self.pat_def(p)).ok_or(malformed("a variant pattern the check did not resolve"))?
+                };
                 let (first, len, _) = self.variant_rows(l, variant)?;
                 for fp in fps {
                     let row = (first..first + len)
@@ -870,7 +944,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                         todo.push(s);
                     }
                 }
-                Pat::Struct { fields, .. } => {
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                     let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
                     for fp in fps {
                         todo.push(fp.pat);
@@ -880,5 +954,192 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             }
         }
         Ok(false)
+    }
+
+    /// The test that a union value at `at` (references peeled) holds variant `v`: `None` when it
+    /// always holds `v` (single-arm transparent union or single-present-variant layout).
+    fn union_variant_test(&mut self, p: PatId, at: At, v: u32) -> Result<Option<Value>, BuildError> {
+        let PNode::Union(ul) = self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))? else {
+            return Err(malformed("a union variant pattern over other than a structural union"));
+        };
+        if ul.len == 1 {
+            if v != 0 {
+                return Err(malformed("a single-member union pattern at a non-zero variant"));
+            }
+            return Ok(None);
+        }
+        let l = self.layout(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
+        let l_idx = usize::try_from(l).map_err(|_| malformed("a layout index past `usize`"))?;
+        let Some(&Shape::Enum { id, .. }) = self.layouts.get(l_idx).map(|row| &row.shape) else {
+            return Err(malformed("a multi-member union not laid out as an enum"));
+        };
+        match self.ls.get(id).variants {
+            Variants::Single { index } if index == v => Ok(None),
+            Variants::Single { .. } => {
+                let z = self.b.iconst(Ty::I8, 0);
+                let o = self.b.iconst(Ty::I8, 1);
+                Ok(Some(self.b.icmp(IntCond::Eq, z, o)))
+            }
+            Variants::Multiple { .. } => {
+                let d = self.read_discriminant(id, at.at)?;
+                let case = self.discriminant_case(id, v)?;
+                let k = self.b.iconst(Ty::I64, case);
+                Ok(Some(self.b.icmp(IntCond::Eq, d, k)))
+            }
+        }
+    }
+
+    /// Projects union place `at` (references peeled) to the payload of member `v`.
+    fn union_variant_at(&mut self, p: PatId, at: At, v: u32) -> Result<At, BuildError> {
+        let PNode::Union(ul) = self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))? else {
+            return Err(malformed("a union variant pattern over other than a structural union"));
+        };
+        if ul.len == 1 {
+            if v != 0 {
+                return Err(malformed("a single-member union pattern at a non-zero variant"));
+            }
+            let only = self
+                .ground
+                .view()
+                .list(ul)
+                .ok()
+                .and_then(|xs| xs.first().copied())
+                .ok_or(malformed("a union list past the ground table"))?;
+            return Ok(At { at: at.at, g: only, by_ref: at.by_ref, copy: at.copy });
+        }
+        let l = self.layout(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
+        let (first, len, _) = self.variant_rows(l, v)?;
+        if len != 1 {
+            return Err(malformed("a union variant without exactly one payload field"));
+        }
+        let first_idx = usize::try_from(first).map_err(|_| malformed("a union field index past `usize`"))?;
+        let off = self
+            .layout_fields
+            .get(first_idx)
+            .ok_or(malformed("a union variant's field past `layout_fields`"))?
+            .1;
+        let off_i32 = i32::try_from(i64::from(at.at.1) + i64::from(off))
+            .map_err(|_| BuildError::UnsupportedPat { pat: p, what: "a part past an `i32` offset" })?;
+        let member_g = *self
+            .layout_field_tys
+            .get(first_idx)
+            .ok_or(malformed("a union variant's field type past `layout_field_tys`"))?;
+        Ok(At { at: (at.at.0, off_i32), g: member_g, by_ref: at.by_ref, copy: at.copy })
+    }
+
+    /// The narrowed sub-union ground type of a `UnionPat::Residual` binding pattern `p`.
+    fn union_residual_ty(&mut self, p: PatId, by_ref: bool) -> Result<PTy, BuildError> {
+        let lt = *self.checked.local_ty.get(p.ix()).ok_or(malformed("a binding without a type in the record"))?;
+        let lg = self.ground_ty(lt).map_err(|error| Self::pat_ty_err(p, error))?;
+        if by_ref
+            && let PNode::Ref(_, inner) = self.ground_node(lg).map_err(|error| Self::pat_ty_err(p, error))?
+        {
+            return Ok(inner);
+        }
+        Ok(lg)
+    }
+
+    /// Tests whether union value `at` holds any variant whose ground type appears in `dst_g`.
+    fn union_residual_test(&mut self, p: PatId, at: At, dst_g: PTy) -> Result<ResidualTest, BuildError> {
+        let PNode::Union(src_l) = self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))? else {
+            return Err(malformed("a union residual pattern over other than a structural union"));
+        };
+        let PNode::Union(dst_l) = self.ground_node(dst_g).map_err(|error| Self::pat_ty_err(p, error))? else {
+            return Err(malformed("a union residual binding whose type is not a structural union"));
+        };
+        let mut src_members: Vec<PTy, A> = Vec::new_in(self.alloc);
+        src_members.extend_from_slice(
+            self.ground
+                .view()
+                .list(src_l)
+                .map_err(|_| malformed("a source union's members past the ground table"))?,
+        );
+        let mut dst_members: Vec<PTy, A> = Vec::new_in(self.alloc);
+        dst_members.extend_from_slice(
+            self.ground
+                .view()
+                .list(dst_l)
+                .map_err(|_| malformed("a target union's members past the ground table"))?,
+        );
+        if let [only] = src_members.as_slice() {
+            return Ok(if dst_members.contains(only) {
+                ResidualTest::Always
+            } else {
+                ResidualTest::Never
+            });
+        }
+        let l = self.layout(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
+        let l_idx = usize::try_from(l).map_err(|_| malformed("a layout index past `usize`"))?;
+        let Some(&Shape::Enum { id, .. }) = self.layouts.get(l_idx).map(|row| &row.shape) else {
+            return Err(malformed("a multi-member union not laid out as an enum"));
+        };
+        match self.ls.get(id).variants {
+            Variants::Single { index } => {
+                let idx = usize::try_from(index).ok();
+                Ok(if idx.and_then(|i| src_members.get(i)).is_some_and(|sm| dst_members.contains(sm)) {
+                    ResidualTest::Always
+                } else {
+                    ResidualTest::Never
+                })
+            }
+            Variants::Multiple { .. } => {
+                let d = self.read_discriminant(id, at.at)?;
+                let mut cond: Option<Value> = None;
+                for (i_idx, &sm) in src_members.iter().enumerate() {
+                    if !dst_members.contains(&sm) {
+                        continue;
+                    }
+                    let i = u32::try_from(i_idx).map_err(|_| malformed("a union variant index past `u32`"))?;
+                    let case = self.discriminant_case(id, i)?;
+                    let k = self.b.iconst(Ty::I64, case);
+                    let eq = self.b.icmp(IntCond::Eq, d, k);
+                    cond = Some(match cond {
+                        Some(prev) => self.b.binary(Op::Or, Flags::NONE, prev, eq),
+                        None => eq,
+                    });
+                }
+                Ok(match cond {
+                    Some(c) => ResidualTest::Cond(c),
+                    None => ResidualTest::Never,
+                })
+            }
+        }
+    }
+
+    /// Materializes the narrowed sub-union `dst_g` from source union `at` into a temp slot.
+    fn union_residual_narrow(&mut self, p: PatId, at: At, dst_g: PTy) -> Result<At, BuildError> {
+        let PNode::Union(src_l) = self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))? else {
+            return Err(malformed("a union residual pattern over other than a structural union"));
+        };
+        let PNode::Union(dst_l) = self.ground_node(dst_g).map_err(|error| Self::pat_ty_err(p, error))? else {
+            return Err(malformed("a union residual binding whose type is not a structural union"));
+        };
+        let mut src_members: Vec<PTy, A> = Vec::new_in(self.alloc);
+        src_members.extend_from_slice(
+            self.ground
+                .view()
+                .list(src_l)
+                .map_err(|_| malformed("a source union's members past the ground table"))?,
+        );
+        let mut dst_members: Vec<PTy, A> = Vec::new_in(self.alloc);
+        dst_members.extend_from_slice(
+            self.ground
+                .view()
+                .list(dst_l)
+                .map_err(|_| malformed("a target union's members past the ground table"))?,
+        );
+        let dst_repr = self.repr(dst_g).map_err(|error| Self::pat_ty_err(p, error))?;
+        if dst_repr == Repr::None {
+            return Ok(At { at: (self.b.uninit(Ty::PTR), 0), g: dst_g, by_ref: at.by_ref, copy: true });
+        }
+        let Repr::Agg(dst_layout) = dst_repr else {
+            return Err(malformed("a narrowed sub-union not held as an aggregate"));
+        };
+        let dst_at = self.temp(dst_repr);
+        if self.live {
+            let src_layout = self.layout(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
+            self.remap_union(None, src_layout, at.at, &src_members, dst_layout, dst_at, &dst_members)?;
+        }
+        Ok(At { at: dst_at, g: dst_g, by_ref: at.by_ref, copy: true })
     }
 }

@@ -472,7 +472,8 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             Expr::Let { init, .. } => init.0 == c,
             // A struct update's base is a place: its taken fields move by
             // walk/moves/struct_update.rs, not the whole.
-            Expr::Struct { base: blaze_typeck::StructBase::Expr(b), .. } => b.0 == c,
+            Expr::Struct { base: blaze_typeck::StructBase::Expr(b), .. }
+            | Expr::Record { base: blaze_typeck::StructBase::Expr(b), .. } => b.0 == c,
             _ => false,
         })
     }

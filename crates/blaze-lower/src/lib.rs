@@ -958,6 +958,67 @@ pub fn lower_body_expanding_marked<'a, 't>(
     m.finish()
 }
 
+/// As [`lower_body_expanding`], with explicit Blaze syntax [`parser::Extensions`] enabled.
+pub fn lower_body_expanding_with_extensions<'a, 't>(
+    text: &'t str,
+    edition: Edition,
+    extensions: parser::Extensions,
+    cfg: &mut dyn Cfg,
+    values: &mut dyn ValueNames,
+    expand: &mut dyn Expand,
+    alloc: Alloc<'a>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
+    if extensions.is_none() {
+        return lower_body_expanding(text, edition, cfg, values, expand, alloc);
+    }
+    if let Some(w) = spelled_words(text, edition, alloc) {
+        return lower_body_words_expanding(text, w.item_words(), edition, cfg, values, expand, alloc);
+    }
+    let pe = parser_edition(edition);
+    let lexed = parser::LexedStr::new(pe, text);
+    let mut input = lexed.to_input(pe);
+    input.mark_extensions(0, extensions);
+    let output = parser::Reparser::top_level_item().parse(input.tokens());
+    let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, Some(values), alloc);
+    expand.begin_body();
+    feed::feed_expanding(&mut m, &lexed, &output, 0, expand);
+    m.finish()
+}
+
+/// As [`lower_body_expanding_marked`], with explicit Blaze syntax [`parser::Extensions`] enabled.
+pub fn lower_body_expanding_marked_with_extensions<'a, 't>(
+    marks: mark_site::ItemMarks<'t>,
+    edition: Edition,
+    extensions: parser::Extensions,
+    cfg: &mut dyn Cfg,
+    values: &mut dyn ValueNames,
+    expand: &mut dyn Expand,
+    alloc: Alloc<'a>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
+    if extensions.is_none() {
+        return lower_body_expanding_marked(marks, edition, cfg, values, expand, alloc);
+    }
+    let text = marks.text();
+    if let Some(w) = spelled_words(text, edition, alloc) {
+        let output = parser::Reparser::top_level_item().parse(parser::Tokens::new(&w.words, false));
+        let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, Some(values), alloc);
+        m.mark_item(marks);
+        expand.begin_body();
+        feed::feed_words(&mut m, &output, &w.ranges, Some(expand));
+        return m.finish();
+    }
+    let pe = parser_edition(edition);
+    let lexed = parser::LexedStr::new(pe, text);
+    let mut input = lexed.to_input(pe);
+    input.mark_extensions(0, extensions);
+    let output = parser::Reparser::top_level_item().parse(input.tokens());
+    let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, Some(values), alloc);
+    m.mark_item(marks);
+    expand.begin_body();
+    feed::feed_expanding(&mut m, &lexed, &output, 0, expand);
+    m.finish()
+}
+
 /// An item written by an item macro (a `macro_rules!` call at item position, a derive), as
 /// the expander wrote it: the parser's `words` (ending in [`parser::Tokens::PAD`] `EOF`
 /// words) and each word's range in `text`, the item's text. `$crate` is one word here, a path
