@@ -212,13 +212,13 @@ impl fmt::Display for EffectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             EffectError::UndeclaredEffects { missing } => {
-                write!(f, "undeclared effects: add `{missing}` to `expect(..)` or handle them")
+                write!(f, "undeclared effects: add '{missing}' to `expect(..)` or handle them")
             }
             EffectError::UnfulfilledEffects { extra } => {
-                write!(f, "unfulfilled effects `{extra}`: remove them from `expect(..)`")
+                write!(f, "unfulfilled effects '{extra}': remove them from `expect(..)`")
             }
             EffectError::FnPtrEffectMismatch { expected, found } => {
-                write!(f, "function type effect mismatch: expected subset of `{expected}`, found `{found}`")
+                write!(f, "function type effect mismatch: expected subset of '{expected}', found '{found}'")
             }
             EffectError::FnHeaderIncompatible => {
                 write!(f, "incompatible function pointer header (ABI, safety, or variadics)")

@@ -59,6 +59,7 @@
 use blaze_build_script::instr::{LinkTo, SearchKind};
 use blaze_build_script::outputs::OutputsRef;
 use blaze_export::native_dylib::{self, DylibError};
+use blaze_export::native_so::{self, SoError};
 use blaze_hash::FixedState;
 use blaze_ids::producer::{ProducerId, Whole};
 use blaze_ids::{ContentId, Hasher};
@@ -145,6 +146,7 @@ pub enum NativeError<'a> {
     Resolve(ResolveError<'a>),
     Layout(LayoutError<'a>),
     Write(DylibError<'a>),
+    WriteSo(SoError<'a>),
     Alloc,
     /// The record's bytes give no BNL2 descriptor (blaze-native descriptor.rs).
     Descriptor(DescriptorError),
@@ -232,7 +234,10 @@ pub(crate) fn native_library<'a>(
     let image = layout::lay(&plan, &objects, layout_of(platform), alloc).map_err(NativeError::Layout)?;
     let mut hex = [0u8; 64];
     let identifier = hex_of(&key, &mut hex)?;
-    native_dylib::write(&image, identifier, out, alloc).map_err(NativeError::Write)?;
+    match platform {
+        Platform::MacosArm64 => native_dylib::write(&image, identifier, out, alloc).map_err(NativeError::Write)?,
+        Platform::LinuxArm64 => native_so::write(&image, identifier, out, alloc).map_err(NativeError::WriteSo)?,
+    }
     Ok(NativeSummary {
         inputs: narrow("inputs", objects.len())?,
         members: narrow("members", plan.objects.len())?,

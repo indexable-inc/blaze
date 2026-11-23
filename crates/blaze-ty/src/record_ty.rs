@@ -129,37 +129,37 @@ impl fmt::Display for RecordError<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             RecordError::InvalidFieldName { name } => {
-                write!(f, "invalid record field name `{name}`: must be non-empty and contain no `,`")
+                write!(f, "invalid record field name '{name}': must be non-empty and contain no `,`")
             }
             RecordError::DuplicateField { name } => {
-                write!(f, "duplicate record field `{name}`")
+                write!(f, "duplicate record field '{name}'")
             }
             RecordError::DefaultOutsideParam { field } => {
-                write!(f, "record field `{field}` has a default outside a function parameter")
+                write!(f, "record field '{field}' has a default outside a function parameter")
             }
             RecordError::ImplDeclaresDefault { field } => {
-                write!(f, "trait impl repeats default on record field `{field}`; defaults belong on the trait declaration")
+                write!(f, "trait impl repeats default on record field '{field}'; defaults belong on the trait declaration")
             }
             RecordError::UnknownField { field } => {
-                write!(f, "unknown record field `{field}`")
+                write!(f, "unknown record field '{field}'")
             }
             RecordError::MissingRequiredField { field } => {
-                write!(f, "missing required record field `{field}` (no default declared)")
+                write!(f, "missing required record field '{field}' (no default declared)")
             }
             RecordError::OmittedFieldWithoutDots { field } => {
-                write!(f, "record field `{field}` omitted without `..`; add `..` to use its default")
+                write!(f, "record field '{field}' omitted without `..`; add `..` to use its default")
             }
             RecordError::IndirectCallDefaults => {
                 write!(f, "`..` record defaults cannot be used through a function pointer, closure, or `Fn` value")
             }
             RecordError::UpdateBaseMismatch { expected_field } => {
-                write!(f, "functional update base record is missing field `{expected_field}`")
+                write!(f, "functional update base record is missing field '{expected_field}'")
             }
             RecordError::FieldTypeMismatch { field, expected, found } => {
-                write!(f, "record field `{field}` type mismatch: expected {expected:?}, found {found:?}")
+                write!(f, "record field '{field}' type mismatch: expected {expected:?}, found {found:?}")
             }
             RecordError::PatternMissingField { field } => {
-                write!(f, "record pattern omits field `{field}` without `..`")
+                write!(f, "record pattern omits field '{field}' without `..`")
             }
             RecordError::InherentImplForbidden => {
                 write!(f, "cannot define inherent impl on anonymous record type (name it with a `struct`)")

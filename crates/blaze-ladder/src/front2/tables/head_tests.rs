@@ -1060,18 +1060,18 @@ pub fn unmade(x: &u8) -> &u8 { x }
         let (w, k) = (Want::Fn(lib), checker_of(lib));
         let mut made = Store::new(sized, frame, a());
         let mut keys = Keys::new();
-        made.ensure(names, &mut keys, w).unwrap_or_else(|e| panic!("ensure `{name}`: {e}"));
+        made.ensure(names, &mut keys, w).unwrap_or_else(|e| panic!("ensure '{name}': {e}"));
         if plant {
             made.regions.file_unlaid(k, head_record::Unlaid::NoContainer, head_record::Unlaid::NoContainer.name());
         } else {
             made.regions.file_refused(k);
         }
         let want_kind = if plant { head_record::Unlaid::NoContainer } else { head_record::Unlaid::NotMade };
-        let bytes = export(names, &keys, &mut made, w, Plant::None, a()).unwrap_or_else(|e| panic!("export `{name}`: {e}"));
-        let frozen = FrozenHead::read(&bytes).unwrap_or_else(|e| panic!("read `{name}`: {e}"));
+        let bytes = export(names, &keys, &mut made, w, Plant::None, a()).unwrap_or_else(|e| panic!("export '{name}': {e}"));
+        let frozen = FrozenHead::read(&bytes).unwrap_or_else(|e| panic!("read '{name}': {e}"));
         let other = Store::new(sized, frame, a());
-        file_frozen(names, w, frozen, &other, &Keys::new(), a()).unwrap_or_else(|e| panic!("file `{name}`: {e}"));
-        assert!(other.fns.contains_key(&k), "ORACLE: `{name}`'s head was not filed");
+        file_frozen(names, w, frozen, &other, &Keys::new(), a()).unwrap_or_else(|e| panic!("file '{name}': {e}"));
+        assert!(other.fns.contains_key(&k), "ORACLE: '{name}'s head was not filed");
         assert_eq!(other.regions.unread(k).why, UnreadWhy::Refused { what: want_kind.name() }, "ORACLE: `{name}` reached the other store without its refusal's name");
         // CONTROL: the old filer, the heads alone.
         let old = Store::new(sized, frame, a());

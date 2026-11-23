@@ -280,7 +280,7 @@ fn without_plan_file_the_found_file_is_missing() {
             assert!(!skipped.contains_key(&B) && !skipped.contains_key(&BB), "no row of the file nobody planned");
             assert_ne!(skipped, literal, "the control differs from the literal plan");
         }
-        Err(error) => println!("the control was refused: {error}"),
+        Err(_error) => {}
     }
 }
 

@@ -3877,6 +3877,10 @@ impl<'f> BodiesStage<'f> {
                 let shared = &shared;
                 let clock = prepared.clock.clone();
                 running.push(scope.may_overlap("engine bodies run", BODIES_FRAME, move |cx: &Cx| {
+                    if shared.board.stopping().is_some() {
+                        shared.board.refused(Stage::Bodies, u64::try_from(run.len()).unwrap_or(u64::MAX));
+                        return Ok::<(), Infallible>(());
+                    }
                     let began = crate::engine_times::ns(clock.now().since_start());
                     run_bodies(cx, shared, run, &clock, out, ran, run_out, tally, alloc);
                     *span = (began, crate::engine_times::ns(clock.now().since_start()));
@@ -3893,6 +3897,13 @@ impl<'f> BodiesStage<'f> {
             if let Some(error) = failed {
                 return Err(CliError::Pool(error));
             }
+        }
+        // Stopped while the phase ran: `one_phase` calls `stop_point` right after `run_stage`
+        // and drops the phase arena without merging, so skip joining tens of thousands of
+        // unbegun bodies to stay well within `STOP_BOUND` (rule 18).
+        if handles.board.stopping().is_some() {
+            self.wall_ns = self.wall_ns.saturating_add(handles.clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)));
+            return Ok(MadeFacts { bytes: SVec::new_in(at_phase), index: SVec::new_in(at_phase) });
         }
         self.expansion_demands = prepared.snapshot.expansion_demands();
         self.expansion_keys = prepared.expansion_keys.len() as u64;

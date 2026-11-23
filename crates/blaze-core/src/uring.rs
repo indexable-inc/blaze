@@ -3886,10 +3886,12 @@ mod tests {
             Effect::Read { file: name("a"), at: 0, len: 3, tag: Tag(3) },
             Effect::Remove { file: name("b"), tag: Tag(4) },
         ];
+        // Independent SQEs (Read on "a", Remove on "b") may complete in either order on io_uring.
         let mut seen = Vec::new();
-        run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done))
-        .expect("the effects end");
-        assert_eq!(seen, [Done::Read(b"one".to_vec()), Done::Removed]);
+        run_until_idle(&mut driver, &mut effects, |done, _| seen.push((done.tag, done.done)))
+            .expect("the effects end");
+        seen.sort_by_key(|(tag, _)| *tag);
+        assert_eq!(seen, [(Tag(3), Done::Read(b"one".to_vec())), (Tag(4), Done::Removed)]);
         // The slot is emptied through the ring, a close no effect waits for.
         let deadline = Instant::now() + Duration::from_secs(5);
         while driver.table.free.borrow().len() < free + 1 && Instant::now() < deadline {

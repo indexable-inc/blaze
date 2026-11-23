@@ -261,12 +261,6 @@ impl Names for Nameless {
     }
 }
 
-/// A readable page standing for the runtime's poll page.
-#[repr(C, align(4096))]
-struct Page([u8; 4096]);
-
-static POLL: Page = Page([0; 4096]);
-
 /// The run's answers for a placed record: the poll page by its C name, nothing else (generated
 /// programs name nothing: any other target is unbound, by name).
 struct PollOnly {
@@ -286,6 +280,19 @@ impl Words for PollOnly {
     }
 }
 
+/// Carves a zeroed, 4096-byte-aligned poll page out of the front of `Executable::written`'s
+/// adjacent data mapping (guaranteed within `adrp`'s ±4 GiB `Page21` reach on every host ASLR
+/// layout, including Linux ARM64 PIE) and returns `(poll_addr, rest)`.
+const POLL_PAGE_ROOM: usize = 8192;
+
+fn carve_poll_page(data: &mut [u8]) -> (u64, &mut [u8]) {
+    let skip = (4096 - data.as_ptr() as usize % 4096) % 4096;
+    let (poll_and_pad, rest) = data.split_at_mut(skip + 4096);
+    let poll = &mut poll_and_pad[skip..];
+    poll.fill(0);
+    (poll.as_ptr() as u64, rest)
+}
+
 /// `e` sealed, encoded, read back and placed by the one new placer into executable memory: its
 /// code where it runs (a mapping's start, page-aligned), its relro part at its record's
 /// alignment in the data after it.
@@ -299,11 +306,12 @@ fn placed(e: Emitted<'static>, tier: TierName) -> Result<Executable, Broke> {
     let align = 1usize << view.relro_align();
     let symbol = Symbol::of_name("blaze-emit tier_tests: the function under test");
     let mut done: Result<(), PlaceError> = Ok(());
-    let exec = Executable::written(view.code().len(), relro_len + align, |code, data| {
-        let skip = (align - data.as_ptr() as usize % align) % align;
-        let relro = &mut data[skip..skip + relro_len];
+    let exec = Executable::written(view.code().len(), POLL_PAGE_ROOM + relro_len + align, |code, data| {
+        let (page, rest) = carve_poll_page(data);
+        let skip = (align - rest.as_ptr() as usize % align) % align;
+        let relro = &mut rest[skip..skip + relro_len];
         let at = At { code: code.as_ptr() as u64, relro: relro.as_ptr() as u64 };
-        let mut words = PollOnly { page: core::ptr::addr_of!(POLL) as u64 };
+        let mut words = PollOnly { page };
         done = place(&view, symbol, at, &mut words, code, relro);
     })
     .expect("the code maps");
