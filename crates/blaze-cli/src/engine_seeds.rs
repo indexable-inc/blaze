@@ -646,8 +646,11 @@ pub(crate) struct RequestTable<'p> {
     /// Where a crate's names record key is read: [`CrateNames`] (rule 78's seam).
     names: CrateNames<'p>,
     tool: Tool,
-    /// The keys the root listed when the request began, sorted.
-    listed: std::vec::Vec<Key, Global>,
+    /// Whether the dependency heads root existed when the request began, and how many keys it held.
+    had_root: bool,
+    listed_from_root: usize,
+    /// Additional dependency head keys from the Heads stage (`list_too`), empty on warm edits.
+    added_listed: std::vec::Vec<Key, Global>,
     /// What was read of the head tasks' records, by member cell.
     members: blaze_core::SharedMapBy<CellId, MemberRead, blaze_hash::DigestState, Global>,
     /// The member cells taken from them.
@@ -757,26 +760,24 @@ impl<'p> RequestTable<'p> {
         tool: Tool,
         heap: &'static blaze_own::Heap,
     ) -> Result<RequestTable<'p>, CliError> {
-        let mut listed: std::vec::Vec<Key, Global> = std::vec::Vec::new_in(Global);
-        if let Some(keys) = store.named(root)? {
-            if keys.len() % 32 != 0 {
-                return Err(CliError::Text { what: "the dependency heads' root lists bytes that are no whole keys (engine_seeds.rs `root_name`)" });
+        let (had_root, listed_from_root) = match store.named(root)? {
+            Some(keys) => {
+                if keys.len() % 32 != 0 {
+                    return Err(CliError::Text { what: "the dependency heads' root lists bytes that are no whole keys (engine_seeds.rs `root_name`)" });
+                }
+                (true, keys.len() / 32)
             }
-            for chunk in keys.chunks_exact(32) {
-                let mut key = [0u8; 32];
-                key.copy_from_slice(chunk);
-                listed.push(Key(ContentId(key)));
-            }
-        }
-        listed.sort_unstable();
-        listed.dedup();
+            None => (false, 0),
+        };
         Ok(RequestTable {
             snapshot: store.snapshot_in(Global)?,
             heads,
             crates,
             names,
             tool,
-            listed,
+            had_root,
+            listed_from_root,
+            added_listed: std::vec::Vec::new_in(Global),
             members: blaze_core::SharedMapBy::new_in("engine.member heads read from their head tasks' records", Global),
             taken: blaze_core::SharedSetBy::new_in("engine.member heads taken", Global),
             dependencies: blaze_core::SharedMapBy::new_in("engine.dependency head records read", Global),
@@ -898,9 +899,10 @@ impl<'p> RequestTable<'p> {
     /// `HeadsOnce::put_keys`): listed by the root with the rest at the merge, so the records
     /// that stage put live as long as those this stage puts (lane H9).
     pub(crate) fn list_too(&mut self, keys: &[Key]) {
-        self.listed.extend_from_slice(keys);
-        self.listed.sort_unstable();
-        self.listed.dedup();
+        if keys.is_empty() {
+            return;
+        }
+        self.added_listed.extend_from_slice(keys);
     }
 
     /// Cell `cell`'s first failed freeze this request, by any worker's stretch (front2
@@ -1015,13 +1017,36 @@ impl<'p> RequestTable<'p> {
                 store.keep_with_toolchain(*key)?;
             }
         }
+        const RENEW_SENTINEL: blaze_toolchain::ToolchainId = blaze_toolchain::ToolchainId(*b"blaze-renew-no-toolchain-root\0\0\0");
         let mut unlisted = 0u32;
+        let listed_count;
         // Set again by every request that lists heads, not only one that puts some: a root a
         // command reaches is renewed (store/roots.rs), so heads every checkout reads never expire
-        // while one reads them (equal keys within a day write nothing: blaze-cas `set_root`).
-        if !puts.is_empty() || !self.listed.is_empty() {
-            let mut keys: std::vec::Vec<Key, Global> = std::vec::Vec::with_capacity_in(self.listed.len() + puts.len(), Global);
-            keys.extend_from_slice(&self.listed);
+        // while one reads them. When nothing new was added to a live root (the common warm-edit
+        // case), renew the root in O(1) without probing, sorting, or hashing all listed keys.
+        if puts.is_empty() && self.added_listed.is_empty() && self.had_root && self.listed_from_root <= MOST_CELLS {
+            listed_count = self.listed_from_root;
+            if self.listed_from_root > 0 {
+                store.renew(&[root], RENEW_SENTINEL)?;
+            }
+        } else if !puts.is_empty() || !self.added_listed.is_empty() || self.listed_from_root > 0 {
+            let mut keys: std::vec::Vec<Key, Global> = std::vec::Vec::with_capacity_in(self.listed_from_root + self.added_listed.len() + puts.len(), Global);
+            if let Some(existing) = store.named(root)? {
+                if existing.len() % 32 != 0 {
+                    return Err(CliError::Text { what: "the dependency heads' root lists bytes that are no whole keys (engine_seeds.rs `root_name`)" });
+                }
+                for chunk in existing.chunks_exact(32) {
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(chunk);
+                    keys.push(Key(ContentId(key)));
+                }
+            }
+            if !self.added_listed.is_empty() {
+                keys.extend_from_slice(&self.added_listed);
+                keys.sort_unstable();
+                keys.dedup();
+            }
+            listed_count = keys.len();
             keys.extend(puts.iter().map(|(key, _, _)| *key));
             keys.sort_unstable();
             keys.dedup();
@@ -1031,6 +1056,8 @@ impl<'p> RequestTable<'p> {
                 keys.truncate(MOST_CELLS);
             }
             store.pin(root, &keys)?;
+        } else {
+            listed_count = 0;
         }
         Ok(SeedCounts {
             table: self.heads.count(),
@@ -1039,7 +1066,7 @@ impl<'p> RequestTable<'p> {
             found,
             frozen: u32::try_from(fresh.len()).unwrap_or(u32::MAX),
             twice: self.twice.load(Ordering::Relaxed),
-            listed: u32::try_from(self.listed.len()).unwrap_or(u32::MAX),
+            listed: u32::try_from(listed_count).unwrap_or(u32::MAX),
             looked,
             put: u32::try_from(puts.len()).unwrap_or(u32::MAX),
             unlisted,
@@ -1457,5 +1484,78 @@ impl RequestTable<'_> {
             Ok(_) => Ok(()),
             Err(occupied) => self.again(cell, occupied.current.bytes, bytes),
         }
+    }
+}
+
+#[cfg(test)]
+mod renew_tests {
+    use super::*;
+    use blaze_cas::plain::Settings;
+    use bstd::io::{Io, Limits, SimWorld};
+    use bstd::mem::TASK_FRAME;
+    use bstd::test::BUDGET;
+
+    /// When a warm edit freezes 0 new dependency heads, `RequestTable::merge` renews the existing
+    /// dependency-heads root in O(1) with 0 CAS root probes instead of probing every listed key.
+    #[test]
+    fn merge_with_no_new_heads_renews_root_with_zero_probes() {
+        let io = Io::simulated(SimWorld::new(47, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
+        let home = crate::store::Home::of(&cx, &io.need_fs().expect("filesystem"), Some("/h")).expect("home");
+        let heap = blaze_own::testing::heap();
+        let frame = cx.frame();
+        let erased = blaze_own::Erased::new(frame);
+        let clock = io.need_clock().expect("clock");
+        let err = io.need_err().expect("stderr");
+        let lent = home.open_store(&Settings::default(), crate::store::Facts { boot: Some(1), nonce: 47 }, heap.alloc()).expect("store");
+        let mut store = CommandStore::new(&cx, &lent, false, 0, None, clock.clone(), &err, erased.handle()).expect("command store");
+        let root = "engine-dependency-heads.test";
+
+        // Seed 500 committed dependency head records under `root`.
+        let mut initial_keys = std::vec::Vec::new();
+        for i in 0..500u32 {
+            let bytes = i.to_le_bytes();
+            let key = Key(ContentId::of(DEPENDENCY_DOMAIN, &bytes));
+            store.put(&cx, key, &bytes).expect("put head");
+            initial_keys.push(key);
+        }
+        store.pin(root, &initial_keys).expect("pin initial root");
+        lent.commit().expect("commit initial heads");
+
+        // Warm edit: 0 new heads frozen, empty `list_too` -> 0 root probes!
+        let mut table = RequestTable::of(
+            &mut store,
+            HeadEntries::Built { entries: std::vec::Vec::new(), failed: std::vec::Vec::new() },
+            (std::vec::Vec::new(), CrateNames::Listed),
+            root,
+            Tool(ContentId([1; 32])),
+            heap,
+        ).expect("open request table");
+        table.list_too(&[]);
+        let probes_before = lent.put_tally().disk.root_probes;
+        let mut ledger = crate::engine_store::Ledger::new();
+        let counts = table.merge(&cx, &mut store, root, &mut ledger, SeedTally::default()).expect("merge warm");
+        let probes_after = lent.put_tally().disk.root_probes;
+        assert_eq!(counts.listed, 500, "reports all 500 listed heads");
+        assert_eq!(counts.put, 0);
+        assert_eq!(probes_after - probes_before, 0, "warm merge with 0 new heads probes 0 root keys");
+
+        // Adding 1 new key via `list_too` pins the updated 501-key root.
+        let extra = Key(ContentId::of(DEPENDENCY_DOMAIN, b"extra-head"));
+        store.put(&cx, extra, b"extra-head").expect("put extra head");
+        let mut table2 = RequestTable::of(
+            &mut store,
+            HeadEntries::Built { entries: std::vec::Vec::new(), failed: std::vec::Vec::new() },
+            (std::vec::Vec::new(), CrateNames::Listed),
+            root,
+            Tool(ContentId([1; 32])),
+            heap,
+        ).expect("open request table 2");
+        table2.list_too(&[extra]);
+        let counts2 = table2.merge(&cx, &mut store, root, &mut ledger, SeedTally::default()).expect("merge with extra");
+        lent.commit().expect("commit updated root");
+        assert_eq!(counts2.listed, 501);
+        let stored = store.named(root).expect("read updated root").expect("root live");
+        assert_eq!(stored.len(), 501 * 32, "updated root keeps all 501 keys");
     }
 }
