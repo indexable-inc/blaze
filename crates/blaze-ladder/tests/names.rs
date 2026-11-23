@@ -34,7 +34,7 @@ fn his_main_names_bstds_and_cores_items() {
     // (path, namespace, the crate its definition is in, its name, its kind when not `Other`).
     let expected: [(&str, Namespace, &str, Option<&str>, Option<DefKind>); 5] = [
         ("Cx", Namespace::Types, "bstd", Some("Cx"), None),
-        ("Io", Namespace::Types, "bstd", Some("Io"), None),
+        ("Out", Namespace::Types, "bstd", Some("Out"), None),
         ("Error", Namespace::Types, "bstd", Some("Error"), None),
         ("Result", Namespace::Types, "core", Some("Result"), Some(DefKind::Enum)),
         // A variant has no item text of its own: its crate is what is checked.

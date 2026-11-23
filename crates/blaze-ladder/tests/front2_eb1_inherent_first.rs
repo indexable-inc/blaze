@@ -66,11 +66,11 @@ impl<T> Option<T> {
     fn unwrap(self) -> T { match self { Some(t) => t, None => loop {} } }
 }
 struct CountInspector;
-fn through(value: Option<&(dyn Inspector<u8> + 'static)>) -> Option<&CountInspector> {
+fn through<'a>(value: Option<&'a (dyn Inspector<u8> + 'static)>) -> Option<&'a CountInspector> {
     value.unwrap().downcast_ref::<CountInspector>()
 }
 trait OtherInspector: NonStaticAny {}
-fn without_deref(value: &(dyn OtherInspector + 'static)) -> Option<&CountInspector> {
+fn without_deref<'a>(value: &'a (dyn OtherInspector + 'static)) -> Option<&'a CountInspector> {
     value.downcast_ref::<CountInspector>()
 }
 "#;

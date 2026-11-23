@@ -221,7 +221,10 @@ fn the_shelfs_crates_read_with_every_module_file() {
     println!("crate facts on the shelf: {read} libraries read, edges gained {gained:?}");
     assert!(refused.is_empty(), "refused: {refused:#?}");
     let lib = view.krate(all[sys.bstd.0 as usize].krate).lib;
-    assert!(gained.iter().any(|g| *g == format!("{lib} +std")), "bstd asks for std: {gained:?}");
+    assert!(
+        deps[sys.bstd.0 as usize].contains(&sys.std.0),
+        "bstd ({lib}) reaches std (explicit or implied): gained {gained:?}"
+    );
     let slices: Vec<&[u32]> = deps.iter().map(Vec::as_slice).collect();
     let cycle = blaze_toolchain::implied::first_in_cycle(&slices, blaze_own::Alloc::global()).expect("memory");
     assert_eq!(cycle.map(|u| view.krate(all[u].krate).lib), None, "the gained edges make a cycle");

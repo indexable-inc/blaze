@@ -136,7 +136,9 @@ fn closure_signature_regions_from_the_expecting_clause() {
         ("hr_store", Want::NotClean),
         ("iter_projection", Want::Clean),
         ("user_projection", Want::Clean),
-        ("projection_bad", Want::Finding("outlives")),
+        // `apply` ties two owner positions (`T` and `U`), so the soundness guard turns the
+        // `outlives` finding into `Stricter(ClosureSigTies)` (never accepted).
+        ("projection_bad", Want::NotClean),
     ] {
         let (body, text) = find(name);
         let (types, verdict) = world.check_borrows(body, alloc);

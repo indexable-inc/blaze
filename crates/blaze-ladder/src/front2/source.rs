@@ -689,6 +689,12 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
     }
 
     fn member_owner(self, member: ItemKey) -> Option<(ItemKey, &'n str)> {
+        if matches!(
+            self.kind_of_item(member),
+            Some(k) if !matches!(k, ItemKind::Function | ItemKind::Const | ItemKind::TypeAlias)
+        ) {
+            return None;
+        }
         let c = Names::crate_of(self, member)?;
         self.krate(c).tables.members.iter().find_map(|(owner, ms)| ms.iter().find(|m| m.key == member).and_then(|m| m.name.map(|n| (*owner, n))))
     }

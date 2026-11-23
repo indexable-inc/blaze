@@ -31,7 +31,7 @@ use blaze_drive::key::{ABSENT, Key, Kind, Name};
 use blaze_engine::{CellId, Made, Phase, Planned, SVec, Stage, Task};
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
-use blaze_ladder::front2::project_records::{Listing, list_with};
+use blaze_ladder::front2::project_records::{Listed, Listing, list_with};
 use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
 use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts};
 use blaze_ladder::front2::tables::task::{BodyFrame, BodyOut, Facts, Make, MakeRefused, SaidWhat, check_body, verdict_bytes};
@@ -361,8 +361,13 @@ fn a_path_in_a_block_an_expansion_wrote_reads_that_blocks_extern_crate() {
     let mut lines = Vec::new();
     let mut refused: Vec<String> = Vec::new();
     for (key, body) in list.iter() {
-        let (verdict, borrows) = today.check_borrows(*body, a());
-        let want = verdict_bytes(&verdict, &borrows, Facts::Digest, a()).expect("today's bytes");
+        let root = Listed { body: *body, at: None, entry: None };
+        let reached = today.each_from(&[root], a(), |w, b| w.check_borrows(b, a()));
+        let mut want = blaze_own::Vec::new_in(a());
+        for one in reached.iter() {
+            let (verdict, borrows) = &one.got;
+            want.extend_from_slice(&verdict_bytes(verdict, borrows, Facts::Digest, a()).expect("today's bytes"));
+        }
         let got = run(records, *key);
         for said in got.said.iter() {
             match &said.what {
@@ -411,8 +416,13 @@ fn a_const_an_expansion_declares_in_its_block_names_a_const_argument() {
     // `SPEC_ID` (a refusal or a resolution error, whichever the checker gives).
     let mut saying: Vec<Vec<String>> = Vec::new();
     for (key, body) in list.iter() {
-        let (verdict, borrows) = today.check_borrows(*body, a());
-        let want = verdict_bytes(&verdict, &borrows, Facts::Digest, a()).expect("today's bytes");
+        let root = Listed { body: *body, at: None, entry: None };
+        let reached = today.each_from(&[root], a(), |w, b| w.check_borrows(b, a()));
+        let mut want = blaze_own::Vec::new_in(a());
+        for one in reached.iter() {
+            let (verdict, borrows) = &one.got;
+            want.extend_from_slice(&verdict_bytes(verdict, borrows, Facts::Digest, a()).expect("today's bytes"));
+        }
         let got = run(records, *key);
         let said: Vec<String> = got
             .said

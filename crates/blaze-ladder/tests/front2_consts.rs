@@ -77,6 +77,7 @@ fn constants_evaluate_through_front2() {
     let got = consts.value(&mut records, prepared, c).map(|r| int_of(r));
     note(&format!("C: {got:?}"));
     match &got {
+        Err(ConstFail::Cycle { shown, .. }) => note(&format!("cycle: {shown}")),
         Err(ConstFail::Eval(e)) => note(&format!("cycle: {e}")),
         other => panic!("C and D are a cycle, got {other:?}"),
     }

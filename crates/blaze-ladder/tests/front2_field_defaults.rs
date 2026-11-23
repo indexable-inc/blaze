@@ -143,9 +143,9 @@ pub fn main() {}
     let got = check_fns(BLAZE, TEXT, &["one", "two"]);
     let lines = shown("missing", &got);
     assert!(of(&got, "one").starts_with("diags "), "{lines}");
-    assert_eq!(of(&got, "one").matches("MissingFields").count(), 1, "{lines}");
+    assert_eq!(of(&got, "one").matches("(MissingFields,").count(), 1, "{lines}");
     assert!(of(&got, "two").starts_with("diags "), "{lines}");
-    assert_eq!(of(&got, "two").matches("MissingFields").count(), 2, "{lines}");
+    assert_eq!(of(&got, "two").matches("(MissingFields,").count(), 2, "{lines}");
     // Each names its field as the ADT's head spells it (the body never wrote it).
     assert!(of(&got, "one").contains("about `a`"), "{lines}");
     assert!(of(&got, "two").contains("about `a`") && of(&got, "two").contains("about `c`"), "{lines}");

@@ -66,7 +66,8 @@ fn check_fns(text: &str, fns: &[&str]) -> Vec<(String, String, String)> {
         // Today's path, over a store with nothing made: the face this test is about.
         let mut bare = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
         let plain = match lower_fn(&names, prepared, &mut front.keys, &mut bare, k) {
-            Err(BodyError::Generics { why: Why::Need(_), .. }) => "generics need".to_string(),
+            Err(BodyError::Generics { why: Why::Need(_) | Why::NeedConst(..), .. })
+            | Err(BodyError::Head { error: blaze_ladder::front2::heads::HeadError::Item(_, Why::NeedConst(..)), .. }) => "generics need".to_string(),
             Err(e) => format!("not lowered: {e}"),
             Ok(_) => "lowered".to_string(),
         };
@@ -108,14 +109,15 @@ fn lines(what: &str, got: &[(String, String, String)]) -> String {
 /// Expected line: "unmade trait head: f: plain lower_fn: generics need; lower_made: clean".
 #[test]
 fn a_bound_on_an_unmade_trait_is_made_then_lowered() {
-    const TEXT: &str = "trait T { type A; }
-fn f<X: T<A = u8>>() {}
+    const TEXT: &str = "const N: usize = 4;
+trait T<const K: usize> { type A; }
+fn f<X: T<N, A = u8>>() {}
 fn main() {}
 ";
     let got = check_fns(TEXT, &["f"]);
     let shown = lines("unmade trait head", &got);
     assert_eq!(got.len(), 1, "{shown}");
-    assert_eq!(got[0].1, "generics need", "the control: plain `lower_fn` must stop on the generics' need of `T`\n{shown}");
+    assert_eq!(got[0].1, "generics need", "the control: plain `lower_fn` must stop on the generics' need of `N`\n{shown}");
     assert_eq!(got[0].2, "clean", "`f` must lower through `lower_made` and check clean\n{shown}");
 }
 

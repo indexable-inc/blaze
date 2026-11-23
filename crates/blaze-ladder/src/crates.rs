@@ -10,14 +10,16 @@
 //! A crate's cfg is the target's atoms as the toolchain record states them
 //! (`ToolchainView::cfg`), the profile's, and a `feature` atom per feature on.
 
+use core::cell::RefCell;
 use core::fmt;
 
 use blaze_fetch::PackView;
 use blaze_id::{ContentId, CrateItemKey};
-use blaze_own::{Alloc, Bump};
+use blaze_mem::{Frame, Tag};
+use blaze_own::{AVec, Alloc, Bump, Erased};
 use blaze_scope::graph::{CrateId, Sysroot};
 use blaze_scope::resolve::{CrateInput, Names, NamesError, SourceTexts, resolve_crates};
-use blaze_scope::task::Serial;
+use blaze_scope::task::{Par, Scratch, Serial};
 use blaze_surface::Edition;
 use blaze_toolchain::{Role, Shelf, ToolchainError, ToolchainId, ToolchainView, UnitKind};
 use blaze_unit_graph::implicit;
@@ -410,9 +412,10 @@ impl<'t> Inputs<'t> {
     }
 
     /// Every crate's names, resolved together, held in `bump` (the caller's arena, alive as long as
-    /// the names).
+    /// the names), with per-call macro scratch rolled back after each expansion.
     pub fn resolve(&'t self, crates: &[CrateInput<'t>], bump: Bump<'t>) -> Result<Names<'t>, NamesError<'t>> {
-        self.resolve_with(crates, &Serial, bump)
+        let par = ScratchSerial::new();
+        self.resolve_with(crates, &par, bump)
     }
 
     /// [`Inputs::resolve`] under the caller's `par` (one that asks for each crate's names
@@ -425,5 +428,37 @@ impl<'t> Inputs<'t> {
     /// demand (E13, blaze-scope cells/lazy_deps.rs).
     pub fn names_on_demand(&'t self, crates: &[CrateInput<'t>], roots: &[usize], bump: Bump<'t>) -> Result<blaze_scope::NamesOnDemand<'t>, blaze_scope::NamesOnDemandError<'t>> {
         blaze_scope::names_on_demand(crates, self.sysroot, &self.texts, roots, bump)
+    }
+}
+
+/// Serial `Par` whose macro-expansion work runs in a reusable scratch `Frame` reset after each
+/// call (`Par::call_scratch`), preventing bump-arena exhaustion when resolving the toolchain.
+pub(crate) struct ScratchSerial {
+    frame: RefCell<Option<Frame>>,
+}
+
+impl ScratchSerial {
+    pub(crate) fn new() -> Self {
+        Self { frame: RefCell::new(Frame::new(Tag::Expand).ok()) }
+    }
+}
+
+impl Par for ScratchSerial {
+    fn map<T, F: Fn(usize) -> T>(&self, n: usize, f: F, out: &mut AVec<'_, T>) {
+        Serial.map(n, f, out);
+    }
+
+    fn call_scratch(&self, work: &mut dyn FnMut(Alloc<'_>)) -> Scratch {
+        let Ok(mut slot) = self.frame.try_borrow_mut() else {
+            return Scratch::Kept;
+        };
+        let Some(frame) = slot.as_mut() else {
+            return Scratch::Kept;
+        };
+        frame.scope(|f| {
+            let erased = Erased::new(f);
+            work(erased.handle());
+        });
+        Scratch::Reset
     }
 }

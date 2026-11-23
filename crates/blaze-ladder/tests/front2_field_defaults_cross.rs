@@ -133,7 +133,7 @@ fn an_options_struct_from_another_crate() {
     let lines = lines.join("\n");
     assert_eq!(got[0].1, "clean", "`made` must check clean\n{lines}");
     assert_eq!(got[1].1, "clean", "`sum` must check clean\n{lines}");
-    assert!(got[2].1.starts_with("diags ") && got[2].1.matches("MissingFields").count() == 1, "`missing` leaves `name` (no default) unwritten: one E0063\n{lines}");
+    assert!(got[2].1.starts_with("diags ") && got[2].1.matches("(MissingFields,").count() == 1, "`missing` leaves `name` (no default) unwritten: one E0063\n{lines}");
     // Named as the library's head spells it (front2/check.rs `name_about`).
     assert!(got[2].1.contains("about `name`"), "`missing`'s E0063 names the field `name`\n{lines}");
 

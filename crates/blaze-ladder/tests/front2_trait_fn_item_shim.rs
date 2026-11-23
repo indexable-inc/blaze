@@ -28,6 +28,7 @@ const NEW: NewFront<'static> = NewFront { package: "ladder", edition: "2024", sh
 /// The declarations, as core's (clone.rs, marker.rs, ops/function.rs), `no_core`.
 const PRELUDE: &str = "#![feature(no_core, lang_items, unboxed_closures, fn_traits, rustc_attrs)]
 #![no_core]
+#![no_main]
 
 #[lang = \"pointee_sized\"]
 pub trait PointeeSized {}
@@ -94,9 +95,9 @@ fn run(main: &str) -> String {
 #[test]
 fn trait_fn_items_run_as_the_impls_fn() {
     let cases = [
-        ("trait_item", "fn main() -> i32 { let five: u8 = 5; apply(Clone::clone, &five) as i32 }"),
-        ("qualified", "fn main() -> i32 { let five: u8 = 5; apply(<u8 as Clone>::clone, &five) as i32 }"),
-        ("control", "fn main() -> i32 { let five: u8 = 5; apply(own, &five) as i32 }"),
+        ("trait_item", "#[unsafe(no_mangle)] pub extern \"C\" fn main() -> i32 { let five: u8 = 5; apply(Clone::clone, &five) as i32 }"),
+        ("qualified", "#[unsafe(no_mangle)] pub extern \"C\" fn main() -> i32 { let five: u8 = 5; apply(<u8 as Clone>::clone, &five) as i32 }"),
+        ("control", "#[unsafe(no_mangle)] pub extern \"C\" fn main() -> i32 { let five: u8 = 5; apply(own, &five) as i32 }"),
     ];
     for (name, main) in cases {
         let said = run(main);

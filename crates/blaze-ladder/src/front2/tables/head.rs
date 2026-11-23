@@ -800,7 +800,7 @@ pub fn file_frozen<'n, N: NamesSource<'n>>(names: N, cell: Want, frozen: FrozenH
     // Where the store's type table stands before the import: the nodes past it are this
     // record's ([`file_named_items`]).
     let tys_before = store.tys.view().len_now();
-    let heads = match crate::front2::project::head_digest::import_with_opaque_origins(names, keys, store, &frozen, &mut text_of, scratch, scratch) {
+    let heads = match crate::front2::project::head_digest::import_with_opaque_origins_boxed(names, keys, store, &frozen, &mut text_of, scratch, scratch) {
         Ok(heads) => heads,
         // A record of another form (an old home): its regions read as `RecordForm` while the
         // error goes up, reported, and the cell is made again from text. Never migrated.
@@ -813,12 +813,27 @@ pub fn file_frozen<'n, N: NamesSource<'n>>(names: N, cell: Want, frozen: FrozenH
             return Err(e);
         }
     };
-    file_keys(cell, &members, &heads, keys)?;
+    file_frozen_finish(names, cell, store, keys, &frozen, &members, heads, tys_before)
+}
+
+#[inline(never)]
+#[expect(clippy::too_many_arguments, reason = "outlined tail of file_frozen to keep stack frame small")]
+fn file_frozen_finish<'n, N: NamesSource<'n>>(
+    names: N,
+    cell: Want,
+    store: &Store<'n>,
+    keys: &Keys,
+    frozen: &FrozenHead<'_>,
+    members: &[MemberText<'_>],
+    heads: AVec<'static, (HeadAt, blaze_own::Box<Head<'n>, Alloc<'static>>)>,
+    tys_before: usize,
+) -> Result<(), FreezeError> {
+    file_keys(cell, members, &heads, keys)?;
     file_named_items(names, cell, store, keys, tys_before)?;
     // Each head's recorded regions (form 11) against its record: laid exactly when the record
     // holds the section, and none only for a kind that holds none.
     for ((at, head), e) in heads.iter().zip(frozen.heads()) {
-        let h = head.as_ref();
+        let h = (**head).as_ref();
         let fits = match e.recorded {
             RecordedRegions::None => !h.holds_regions(),
             RecordedRegions::Laid => h.regions().is_some(),
@@ -828,7 +843,7 @@ pub fn file_frozen<'n, N: NamesSource<'n>>(names: N, cell: Want, frozen: FrozenH
             return Err(FreezeError::Record { want: cell, at: *at, error: HeadRecordError::Shape { what: "a head's recorded regions disagree with its record (D148, form 11)" } });
         }
     }
-    store.file_heads(cell, heads).map_err(|error| FreezeError::Head { want: cell, error })?;
+    store.file_heads(cell, heads.into_iter().map(|(at, h)| (at, blaze_own::Box::into_inner(h)))).map_err(|error| FreezeError::Head { want: cell, error })?;
     // The same step files each soft refusal into the store's regions: a reader is told its
     // kind by name, as in the store that made it, never `NoHead`.
     for e in frozen.heads() {
@@ -928,11 +943,15 @@ fn file_named_items<'n, N: NamesSource<'n>>(names: N, cell: Want, store: &Store<
     Ok(())
 }
 
-fn file_keys(cell: Want, members: &[MemberText<'_>], heads: &[(HeadAt, Head<'_>)], keys: &Keys) -> Result<(), FreezeError> {
+fn file_keys(cell: Want, members: &[MemberText<'_>], heads: &[(HeadAt, blaze_own::Box<Head<'_>, Alloc<'static>>)], keys: &Keys) -> Result<(), FreezeError> {
     let container = checker_of(cell.key());
     let clash = |error| FreezeError::Head { want: cell, error: HeadError::Key(error) };
+    // The cell's own library key (e.g. an impl or trait container whose members are filed
+    // below): without it, asking `fn_sig` of an imported member looks up the container's
+    // library key through the body's recorded `NamesSource::key_beginning`.
+    keys.item(cell.key()).map_err(clash)?;
     for (_, head) in heads.iter() {
-        match head {
+        match &**head {
             Head::Adt { row, .. } if row.kind != blaze_typeck::AdtKind::Enum => {
                 keys.member(container, MemberKind::Ctor, "").map_err(clash)?;
             }

@@ -142,11 +142,16 @@ fn records_are_read_from_the_store_or_made_once_and_a_missing_one_is_refused() {
     let hook: &'static dyn Fn(&mut dyn FnMut(blaze_own::Alloc<'_>)) -> Scratch = Box::leak(Box::new(hook));
     let driven = Supplied::new(names, crates, texts, prepares, store, hook, bump);
     let one = driven.of(a.src.key).map(|v| modules_of(v));
+    assert_eq!(uses.get(), 0, "stored `one` is read, never solved in scratch");
     let two = driven.of(b.src.key).map(|v| modules_of(v));
+    let after_two = uses.get();
     let _ = driven.of(b.src.key);
     println!("supplier: driven: scratch used {} time(s), its peak {} bytes", uses.get(), scratch.borrow().peak());
     assert_eq!(one.ok(), Some(truth(a)), "a stored body is read, not solved");
     assert_eq!(two.ok(), Some(truth(b)), "a made body's record is the same under the scratch");
-    assert_eq!(uses.get(), 1, "only `two` was solved, once: `one` is stored and the second ask is memoised");
+    // `body_scope_scratch` uses the scratch twice per solved body: once for
+    // `solve_held_body_scratch` and once for `reads_digest`.
+    assert_eq!(after_two, 2, "only `two` was solved, once (solve + reads_digest)");
+    assert_eq!(uses.get(), after_two, "the second ask of `two` is memoised and uses no scratch");
     assert!(scratch.borrow().peak() > 0, "the solve's work ran in the scratch");
 }

@@ -482,8 +482,8 @@ fn main() {}
 ";
     let got = heads_in("2024", TEXT, &[Ask::Free("get"), Ask::Free("get2")]);
     assert_eq!(laid(&got[0], "get").col, [P0, P0], "`<Wrap<'a> as Tr>::A` lays `Wrap<'a>`'s slot, then the output's `'a`");
-    assert!(got[1].is_err(), "TWIN: a qualified path through a trait with a lifetime stays refused by name: {:?}", got[1]);
-    println!("front2_region_rules: a_qualified_projection_lays_its_arguments_slots: get [P0, P0]; get2 refused");
+    assert_eq!(laid(&got[1], "get2").col, [P0, P0, P0], "`<Wrap<'a> as Tr2<'a>>::A` lays `Wrap<'a>`'s slot, `Tr2<'a>`'s lifetime slot, then the output's `'a`");
+    println!("front2_region_rules: a_qualified_projection_lays_its_arguments_slots: get [P0, P0]; get2 [P0, P0, P0]");
 }
 
 /// An `async fn`'s future captures every lifetime in scope (the Reference, "Async
