@@ -113,7 +113,7 @@ fn tests_record() -> &'static [u8] {
         }
     }
     out.extend_from_slice(&strings);
-    blaze_scope::resolve::aligned(&out, g)
+    blaze_scope::resolve::aligned(&out, blaze_own::testing::bump())
 }
 
 /// An answer the runner owes the loop.

@@ -1166,7 +1166,7 @@ fn print_with<'f, 'b, O: print::RenderOutput, F: Files<'f, O>, VF: ViewFold>(
                 // file as it is now (print.rs `Place::Own`), so a child that grew moves no key.
                 Entry::PlacedOwn { rule, start, end, path, chain, edition, words } => (rule, start, end, words, Some(work::held_str(path, frame)), print::Place::Own(chain, edition), words),
             };
-            let kept: &'f [u8] = Vec::from_slice_in(words, frame).leak();
+            let kept: &'f [u8] = frame.alloc_slice_copy(words);
             let at = prints.len();
             let at_item = match place {
                 print::Place::Chain(chain, _) => (1, chain),
@@ -1928,7 +1928,7 @@ fn texts_of<'f>(rows: &crate::sweep::Rows<'_>, frame: &'f Frame) -> Result<Texts
             continue;
         }
         let physical = crate::sweep::real_path(slot, row.flags, frame);
-        let path = core::str::from_utf8(physical.leak()).map_err(|_| CliError::Text { what: "a sweep row's path is not UTF-8" })?;
+        let path = core::str::from_utf8(physical.into_bump_slice()).map_err(|_| CliError::Text { what: "a sweep row's path is not UTF-8" })?;
         match texts.get(path).copied() {
             None => {
                 texts.insert(path, Some(row.id));

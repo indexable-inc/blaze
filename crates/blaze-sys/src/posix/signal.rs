@@ -1778,8 +1778,18 @@ mod tests {
         assert_eq!(unsafe { libc::sigaction(signal, &theirs, &mut before) }, 0);
         let read = get_action(signal).expect("glibc's action read");
         assert_eq!(read.sa_sigaction, theirs.sa_sigaction);
-        assert_eq!(read.sa_flags & crate::linux::signal::SA_RESTORER, crate::linux::signal::SA_RESTORER);
-        assert!(read.sa_restorer.is_some_and(|it| it as usize != ours), "glibc's own restorer");
+        // On x86_64 glibc always installs its own `__restore_rt` trampoline (`SA_RESTORER`);
+        // on aarch64 glibc relies on the kernel vDSO `__kernel_rt_sigreturn` and leaves
+        // `SA_RESTORER` clear.
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(read.sa_flags & crate::linux::signal::SA_RESTORER, crate::linux::signal::SA_RESTORER);
+            assert!(read.sa_restorer.is_some_and(|it| it as usize != ours), "glibc's own restorer");
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_ne!(read.sa_restorer.map(|it| it as usize), Some(ours));
+        }
         // SAFETY: glibc's action, its handler as above.
         unsafe { set_action(signal, &read) }.expect("glibc's action put back here");
         assert_eq!(get_action(signal).expect("read again").sa_restorer.map(|it| it as usize), Some(ours));

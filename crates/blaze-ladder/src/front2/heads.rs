@@ -4823,9 +4823,9 @@ impl<'n> Store<'n> {
                         continue;
                     }
                     let values_at = super::links::values_key(names, self, lib);
-                    let symbol = super::links::symbol_of(v.text_at(attr.args)?, Some(values_at), |item| names.attr_value(item, "link_name"), edition, alloc)
+                    let renamed = super::links::with_symbol_of(v.text_at(attr.args)?, Some(values_at), |item| names.attr_value(item, "link_name"), edition, |res| res.map(|symbol| symbol != name).map_err(|_| ()))
                         .map_err(|_| Why::Unsupported("a `#[link_name]` whose value names no symbol (front2 links.rs `symbol_of`)", whole))?;
-                    if symbol != name {
+                    if renamed {
                         qualifiers.0 |= FnQualifiers::RENAMED_INTERNAL;
                         break;
                     }

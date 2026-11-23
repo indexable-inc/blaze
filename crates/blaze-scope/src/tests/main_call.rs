@@ -58,7 +58,6 @@ static TEXTS: Texts = Texts(&[
 const DEPS: &[(&str, usize)] = &[("std", 1)];
 
 fn names() -> Names<'static> {
-    let alloc: Alloc<'static> = blaze_own::testing::heap().alloc();
     let entry = |mut c: CrateInput<'static>| {
         c.implicit = Implicit { entry: true, ..c.implicit };
         c
@@ -69,7 +68,7 @@ fn names() -> Names<'static> {
         entry(input("unresolved", "/unresolved/main.rs", DEPS)),
         entry(input("nomain", "/nomain/main.rs", DEPS)),
     ];
-    resolve_crates(&crates, Sysroot::default(), &TEXTS, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"))
+    resolve_crates(&crates, Sysroot::default(), &TEXTS, &Serial, super::SyncFrame::leaked()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))
 }
 
 fn main_misses(names: &Names<'static>, krate: usize) {

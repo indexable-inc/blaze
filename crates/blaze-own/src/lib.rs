@@ -149,7 +149,8 @@ mod plant;
 
 pub use alloc_ref::{
     AArc, ABTreeMap, ABTreeSet, ABox, ADeque, ALists, APaths, ARc, ASoa, ASortedMap, ASortedSet, AString, ATexts,
-    AThinArc, AThinArcSlice, AThinStr, AThinVec, AVec, Alloc, Erased, Headed, Header, SharedAlloc,
+    AThinArc, AThinArcSlice, AThinStr, AThinVec, AVec, Alloc, BBox, BString, BVec, Bump, BumpAlloc, Erased, Headed,
+    Header, SharedAlloc,
 };
 #[cfg(any(test, feature = "std"))]
 pub use alloc_ref::Heap;

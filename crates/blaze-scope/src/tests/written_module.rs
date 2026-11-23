@@ -52,7 +52,7 @@ fn self_and_super_heads_from_a_block_pass_over_it() {
     let crates = [input("user", "/user/lib.rs", &[])];
     let fresh: Names<'static> = resolved(&crates, &TEXTS);
     let c = fresh.krate(0);
-    let record: &'static [u8] = aligned(&encode(c, g).unwrap_or_else(|e| panic!("encode: {e:?}")), g);
+    let record: &'static [u8] = aligned(&encode(c, g).unwrap_or_else(|e| panic!("encode: {e:?}")), super::SyncFrame::leaked());
     let keys: Vec<CrateItemKey> = std::vec![c.key];
     let read = RecordNames::new(&keys, Loaded(std::vec![record]), g);
 

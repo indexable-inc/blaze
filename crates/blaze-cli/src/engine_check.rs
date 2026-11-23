@@ -515,8 +515,12 @@ fn serve(
                 // written as one transaction, then a second check printing what is left; the
                 // listed findings are in the request's frame, which outlives both.
                 Some((start, end)) => {
-                    let mut selectors: blaze_own::Vec<&str, &Frame> = blaze_own::Vec::with_capacity_in(end - start, frame);
+                    let cap = (end - start).max(1);
+                    let mut selectors: blaze_own::Vec<&str, &Frame> = blaze_own::Vec::with_capacity_in(cap, frame);
                     selectors.extend((start..end).filter_map(|at| args.get(at)));
+                    if selectors.is_empty() {
+                        selectors.push("all");
+                    }
                     let mut ask = |mut shown| check(cx, fs, host, rng, Some(args), net, root, opts(), &mut shown, phases, out, err).map(|checked| (checked, shown));
                     match crate::fix_then_check::<crate::fix::Atomic, Checked>(cx, root, &selectors, (caps, view, shown_root), frame, out, &mut ask)? {
                         crate::Fixed::Refused => None,
@@ -3679,7 +3683,7 @@ fn ready_setup<'f, 'h, 'a>(
         let _cx = cx.span("names: the crate list read back");
         let mut held = Vec::with_capacity_in(sections.list.len(), env.heap.alloc());
         held.extend_from_slice(sections.list);
-        let held: &'static [u8] = held.leak();
+        let held: &'static [u8] = held.leak_static();
         match crate::names::Names::of_list(held, None, env.heap.alloc()) {
             Ok(names) => names,
             Err(crate::names::NamesError::List(why)) => return Ok(Err(ReadyRefused::Graph(crate::engine_units::BackRefused::List { key, why }))),

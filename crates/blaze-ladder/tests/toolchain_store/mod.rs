@@ -483,16 +483,17 @@ fn write_toolchain(
     sysroot: Sysroot,
     alloc: Alloc<'static>,
 ) -> Result<usize, TestStoreError> {
-    let (scopes, _needs) = resolve_by_records(toolchain, sysroot, texts, &Serial, &Ready::serial(SOLVE_WAIT), alloc)
+    let bump = blaze_own::testing::bump();
+    let (scopes, _needs) = resolve_by_records(toolchain, sysroot, texts, &Serial, &Ready::serial(SOLVE_WAIT), bump)
         .map_err(|(krate, why)| TestStoreError::Solve { krate: toolchain[krate].name, why })?;
-    let all: Vec<&'static CrateNames<'static>> = scopes.iter().map(|s| s.names).collect();
-    let names: &'static Names<'static> = Box::leak(Box::new(Names::of_crates(toolchain, sysroot, &all, alloc).map_err(TestStoreError::Names)?));
+    let all: Vec<&CrateNames<'_>> = scopes.iter().map(|s| s.names).collect();
+    let names = Names::of_crates(toolchain, sysroot, &all, alloc).map_err(TestStoreError::Names)?;
     for (scope, c) in scopes.iter().zip(toolchain.iter()) {
         let krate = c.name;
         store.put(section_key(world, c.key, "exports"), &scope.record)?;
         let n = names_record::encode(scope.names, alloc).map_err(|why| TestStoreError::NamesRecord { krate, why })?;
         store.put(section_key(world, c.key, "names"), &n)?;
-        let i = items_record::encode_with(scope.names, names, alloc).map_err(|why| TestStoreError::ItemsRecord { krate, why })?;
+        let i = items_record::encode_with(scope.names, &names, alloc).map_err(|why| TestStoreError::ItemsRecord { krate, why })?;
         store.put(section_key(world, c.key, "items"), &i)?;
         for (call, e) in scope.names.expansions.iter() {
             let Some(m) = e.made else { continue };
@@ -649,16 +650,18 @@ pub fn front_over_records(shelf_dir: &str, user: &'static UserCrate<'static>, al
     for c in toolchain {
         deps.push(store.section(c.name, section_key(world, c.key, "exports"), "exports")?);
     }
-    let prepares = Prepares::new_in(alloc);
+    let frame: &'static Frame = Box::leak(Box::new(Frame::new(blaze_mem::tag::Tag::Infer).map_err(TestStoreError::Frame)?));
+    let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
+    let prepares = Prepares::new_in(bump);
     let own_texts = Counted { texts: &inputs.texts, shift: 0, reads };
     let program_start = Instant::now();
     // Crate 0 reads the program's files (crates.rs `Texts::read`); a toolchain file it read
     // would be counted.
-    let scope = resolve_crate(&crates[0], &deps, sysroot, &own_texts, 0, &Serial, prepares, alloc).map_err(|why| TestStoreError::Program { why })?;
+    let scope = resolve_crate(&crates[0], &deps, sysroot, &own_texts, 0, &Serial, prepares, bump).map_err(|why| TestStoreError::Program { why })?;
     let own: &'static CrateNames<'static> = scope.names;
     let krate = own.name;
-    let names = aligned(&names_record::encode(own, alloc).map_err(|why| TestStoreError::NamesRecord { krate, why })?, alloc);
-    let items = aligned(&items_record::encode(own, alloc).map_err(|why| TestStoreError::ItemsRecord { krate, why })?, alloc);
+    let names = aligned(&names_record::encode(own, alloc).map_err(|why| TestStoreError::NamesRecord { krate, why })?, bump);
+    let items = aligned(&items_record::encode(own, alloc).map_err(|why| TestStoreError::ItemsRecord { krate, why })?, bump);
     let program_took = program_start.elapsed();
     let files = own.files.iter().map(|f| (leak(f.package.as_str()), f.text)).collect();
     let mut expansions = Vec::new();
@@ -686,7 +689,6 @@ pub fn front_over_records(shelf_dir: &str, user: &'static UserCrate<'static>, al
         expansions,
         question_reads: AtomicUsize::new(0),
     }));
-    let frame: &'static Frame = Box::leak(Box::new(Frame::new(blaze_mem::tag::Tag::Infer).map_err(TestStoreError::Frame)?));
     let log: &'static Log<'static> = Box::leak(Box::new(Log::new(crate_names, alloc)));
     let records: &'static Records<'static> = Box::leak(Box::new(Records::new(keys, load, log, frame, alloc)));
     let front = Front2::from_records(records, frame, lang_crates).map_err(TestStoreError::Front)?;

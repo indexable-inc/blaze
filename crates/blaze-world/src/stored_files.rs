@@ -80,7 +80,7 @@ mod tests {
         outputs.add_stored("gone.rs", 3, FileMode::Plain, [7; 32], FileLimits::DEFAULT, alloc).expect("a stored file");
         let mut record: AVec<'static, u8> = AVec::new_in(alloc);
         outputs.encode(&mut record);
-        let record: &'static [u8] = record.leak();
+        let record: &'static [u8] = record.leak_static();
 
         let read = |folder: Option<std::path::PathBuf>| {
             let records = ScriptRecords::new([(UnitId(3), record)], alloc).expect("a record");

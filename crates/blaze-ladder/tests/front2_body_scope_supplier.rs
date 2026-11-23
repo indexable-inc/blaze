@@ -63,6 +63,7 @@ impl StoredBodyScopes<'static> for Store {
 #[test]
 fn records_are_read_from_the_store_or_made_once_and_a_missing_one_is_refused() {
     let alloc = blaze_own::testing::heap().alloc();
+    let bump = blaze_own::testing::bump();
     let home = std::env::var("HOME").expect("HOME is set");
     let shelf = format!("{home}/.blaze/v2/toolchain");
     let tc: &'static Toolchain = Box::leak(Box::new(Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"))));
@@ -74,15 +75,15 @@ fn records_are_read_from_the_store_or_made_once_and_a_missing_one_is_refused() {
     let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(u32::try_from(i).expect("few crates")));
     let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd") };
     let texts = &inputs.texts;
-    let names: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Bodies, alloc).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"))));
+    let names: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Bodies, bump).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"))));
     let c = names.crates()[0];
-    let prepares = Prepares::new_in(alloc);
+    let prepares = Prepares::new_in(bump);
     let deps = BodyDeps::of_names(names, 0, alloc);
 
     // Each held body's own record, by `body_scope`, as the truth.
     let by_text = |word: &str| c.bodies.iter().find(|h| h.src.text.contains(word)).copied().unwrap_or_else(|| panic!("a held body writing `{word}`"));
     let (a, b, d) = (by_text("struct A;"), by_text("struct B;"), by_text("struct D;"));
-    let own = |h: HeldBody<'static>| body_scope(c, &deps, &crates[0], 0, h, texts, prepares, alloc).unwrap_or_else(|e| panic!("body_scope: {e}"));
+    let own = |h: HeldBody<'static>| body_scope(c, &deps, &crates[0], 0, h, texts, prepares, bump).unwrap_or_else(|e| panic!("body_scope: {e}"));
     let modules_of = |v: &blaze_scope::body_scope::BodyScopeView<'_>| v.modules().collect::<Vec<_>>();
     let truth = |h: HeldBody<'static>| {
         let scope = own(h);
@@ -90,11 +91,11 @@ fn records_are_read_from_the_store_or_made_once_and_a_missing_one_is_refused() {
         m.sort_unstable();
         m
     };
-    let record_of = |h: HeldBody<'static>| -> &'static [u8] { aligned(&own(h).write(alloc).unwrap_or_else(|e| panic!("write: {e:?}")), alloc) };
+    let record_of = |h: HeldBody<'static>| -> &'static [u8] { aligned(&own(h).write(alloc).unwrap_or_else(|e| panic!("write: {e:?}")), bump) };
 
     // No surface body: every record made here, once.
     let none: &'static NoSurface = &NoSurface;
-    let made = Supplied::new(names, crates, texts, prepares, none, &Scratch::kept, alloc);
+    let made = Supplied::new(names, crates, texts, prepares, none, &Scratch::kept, bump);
     let first = made.of(a.src.key).unwrap_or_else(|e| panic!("body `one` made: {e:?}"));
     let again = made.of(a.src.key).unwrap_or_else(|e| panic!("body `one` again: {e:?}"));
     println!("supplier: made: `one` blocks {:?}; asked {}; same record twice {}", modules_of(first).len(), made.asked(), core::ptr::eq(first, again));
@@ -107,7 +108,7 @@ fn records_are_read_from_the_store_or_made_once_and_a_missing_one_is_refused() {
 
     // Surface bodies: `one` stored, `three` stored by no record.
     let store: &'static Store = Box::leak(Box::new(Store { surface: vec![(a.src.key, Some(record_of(a))), (d.src.key, None)] }));
-    let read = Supplied::new(names, crates, texts, prepares, store, &Scratch::kept, alloc);
+    let read = Supplied::new(names, crates, texts, prepares, store, &Scratch::kept, bump);
     let stored = read.of(a.src.key).map(|v| modules_of(v));
     let missing = read.of(d.src.key).err();
     println!("supplier: stored: `one` {:?}; `three` (no record) {missing:?}", stored.as_ref().map(Vec::len));
@@ -117,7 +118,7 @@ fn records_are_read_from_the_store_or_made_once_and_a_missing_one_is_refused() {
 
     // Control: the store hands `one` the record of `two`.
     let swapped: &'static Store = Box::leak(Box::new(Store { surface: vec![(a.src.key, Some(record_of(b)))] }));
-    let wrong = Supplied::new(names, crates, texts, prepares, swapped, &Scratch::kept, alloc);
+    let wrong = Supplied::new(names, crates, texts, prepares, swapped, &Scratch::kept, bump);
     let answered = wrong.of(a.src.key).map(|v| modules_of(v)).unwrap_or_else(|e| panic!("the swapped record reads: {e:?}"));
     println!("supplier: control: `one` answered by `two`'s record: {} block(s), its own {}", answered.len(), truth(a).len());
     assert_eq!(answered, truth(b), "control: the stored record is what is read");
@@ -139,7 +140,7 @@ fn records_are_read_from_the_store_or_made_once_and_a_missing_one_is_refused() {
         Scratch::Reset
     };
     let hook: &'static dyn Fn(&mut dyn FnMut(blaze_own::Alloc<'_>)) -> Scratch = Box::leak(Box::new(hook));
-    let driven = Supplied::new(names, crates, texts, prepares, store, hook, alloc);
+    let driven = Supplied::new(names, crates, texts, prepares, store, hook, bump);
     let one = driven.of(a.src.key).map(|v| modules_of(v));
     let two = driven.of(b.src.key).map(|v| modules_of(v));
     let _ = driven.of(b.src.key);

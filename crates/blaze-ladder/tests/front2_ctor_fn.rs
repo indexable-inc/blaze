@@ -290,7 +290,7 @@ fn a_ctor_with_a_drop_field_builds_in_the_census_survey() {
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let segments: &[&str] = &["main"];
     let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments }, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("`main` by path: {e:?}"));
     let main = found.whole(1).unwrap_or_else(|| panic!("`main` resolves whole")).key;
@@ -384,10 +384,10 @@ fn a_ctor_with_a_drop_field_is_made_over_records() {
     let crate_names: &'static [&'static str] = Vec::leak(crates.iter().map(|c| leak(c.name)).collect());
     let mut kept = Kept::default();
     let main = {
-        let names = inputs.resolve(&crates, a).unwrap_or_else(|e| panic!("the one solve: {e}"));
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("the one solve: {e}"));
         for c in names.crates().iter() {
-            kept.names.push(blaze_scope::resolve::aligned(&blaze_scope::names_record::encode(c, a).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), a));
-            kept.items.push(blaze_scope::resolve::aligned(&blaze_scope::items_record::encode_with(c, &names, a).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), a));
+            kept.names.push(blaze_scope::resolve::aligned(&blaze_scope::names_record::encode(c, a).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
+            kept.items.push(blaze_scope::resolve::aligned(&blaze_scope::items_record::encode_with(c, &names, a).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
             kept.files.push(c.files.iter().map(|f| (f.package.as_str().to_string(), leak(f.text))).collect());
         }
         let segments: &[&str] = &["main"];

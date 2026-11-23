@@ -426,7 +426,14 @@ pub(crate) fn parts_with<K: UnitKey, A: core::alloc::Allocator + Copy>(
         for (child, given) in units.children_of(at).iter().zip(linted.children.iter()) {
             scopes[*child as usize] = *given;
         }
-        let source = K::source(&units, at, text, &own, scope, marks, variants.as_ref());
+        let mut source = K::source(&units, at, text, &own, scope, marks, variants.as_ref());
+        // Top-level `use` items under `Rule::UnusedImport` read identifier uses from sibling
+        // items in the file, so mix the whole-file digest into their unit key (rule 65).
+        if at > 0 && marks.rules(*rules).runs(Rule::UnusedImport) && own.text.contains("use") {
+            let mut h = Hasher::new(UNIT_SOURCE_DOMAIN);
+            h.update(&source.0).update(&file.0);
+            source = h.finish();
+        }
         parts.push(Part { name: unit_name(file, outline, at, text), locate: Locate::Source(source), place: units.list[at].base });
     }
     Ok(())
@@ -685,7 +692,10 @@ fn lint_batch(shared: Shared<'_>, lone: &[Lone], alloc: Alloc<'_>) -> Result<(Ve
         let own = blaze_lint::own_text(one.plan, holes, shared.text, alloc).map_err(|_| UNLINTED)?;
         findings.clear();
         let at = Geometry { base: one.plan.base, len: one.plan.end - one.plan.base, holes };
-        let linted = blaze_lint::lint_own_in(shared.rules, &own, one.scope, at, shared.variants, alloc, &mut findings).map_err(|_| UNLINTED)?;
+        let mut linted = blaze_lint::lint_own_in(shared.rules, &own, one.scope, at, shared.variants, alloc, &mut findings).map_err(|_| UNLINTED)?;
+        if shared.rules.runs(Rule::UnusedImport) && holes.is_empty() && own.text.contains("use") {
+            blaze_lint::unused_imports_for_range(shared.text, one.scope, one.plan.base, one.plan.end, alloc, &mut findings, &mut linted).map_err(|_| UNLINTED)?;
+        }
         bytes += own.text.len() as u64;
         records.push(record(one.name, shared.rules, own.text.as_str(), &findings, &linted));
     }
@@ -762,6 +772,49 @@ pub(crate) fn cost_of(payload: &[u8]) -> Option<(u32, blaze_lint::Cost)> {
 /// payload shorter than a cost.
 pub(crate) fn fixes_of(payload: &[u8]) -> Option<&[u8]> {
     payload.len().checked_sub(COST_BYTES).map(|at| &payload[..at])
+}
+
+/// Mechanical single-edit fix for a lint finding at file-relative `start..end`, copied into
+/// `frame`. Runs only on files that actually produced an auto-fixable lint finding, keeping
+/// clean checks at zero cost.
+pub(crate) fn fix_at<'f>(
+    rule: Rule,
+    text: &str,
+    start: u32,
+    end: u32,
+    frame: &'f bstd::mem::Frame,
+    scratch: &bstd::mem::Frame,
+) -> Option<crate::fix::Change<'f>> {
+    if !matches!(rule, Rule::UnusedImport | Rule::UnusedMut | Rule::Renamed | Rule::VariantCount) {
+        return None;
+    }
+    let erased = blaze_own::Erased::new(scratch);
+    let alloc = erased.handle();
+    let mut findings = Findings::new_in(alloc);
+    let scope = Scope::file(TestBits::NONE, false, false);
+    if rule == Rule::UnusedImport {
+        let _ = blaze_lint::lint_file_imports(text, scope, alloc, &mut findings);
+    }
+    let only = RuleSet::only(&[rule]);
+    let _ = blaze_lint::lint(&only, &blaze_lint::Unit { text, holes: &[], scope }, alloc, &mut findings);
+    let want = Span::new(start, end);
+    let finding = findings.list.iter().find(|f| f.range == want)?;
+    let fix = findings.fixes_of(finding).first()?;
+    let edits = findings.edits_of(fix);
+    let [edit] = edits else { return None };
+    let insert = if edit.text.is_empty() {
+        ""
+    } else {
+        frame.alloc_str(findings.text_of(edit))
+    };
+    Some(crate::fix::Change {
+        start: edit.range.start,
+        end: edit.range.end,
+        insert,
+        reason: blaze_report::frame::words::HelpKind::LintFix,
+        args: [rule.name(), ""],
+        given: 1,
+    })
 }
 
 /// The engine's findings `list` as bytes (each little-endian): their count; then each finding's

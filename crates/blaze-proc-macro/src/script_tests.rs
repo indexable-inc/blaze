@@ -640,9 +640,13 @@ fn a_git_fact_reruns_its_script_only_when_its_answer_changes() {
     // fact does not: no rerun.
     std::fs::write(root.join(".git/HEAD"), format!("{COMMIT_A}\n")).expect("detach");
     assert_eq!(answer_now(&tree, subject), Ok(first));
-    // The answer flips: rerun. And a question refused now is an answer that differs.
+    // The answer flips: rerun. And removing HEAD yields git's own failure answer (exit 128),
+    // a distinct digest from both commits (`no_repository_is_gits_own_answer`).
     std::fs::write(root.join(".git/HEAD"), format!("{COMMIT_B}\n")).expect("move");
-    assert_ne!(answer_now(&tree, subject), Ok(first));
+    let moved = answer_now(&tree, subject).expect("moved git subject");
+    assert_ne!(moved, first);
     std::fs::remove_file(root.join(".git/HEAD")).expect("break");
-    assert_eq!(answer_now(&tree, subject), Ok(None));
+    let broken = answer_now(&tree, subject).expect("broken git subject");
+    assert_ne!(broken, first);
+    assert_ne!(broken, moved);
 }

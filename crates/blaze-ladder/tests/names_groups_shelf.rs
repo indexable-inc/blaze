@@ -16,7 +16,7 @@
 use std::time::Instant;
 
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
-use blaze_own::{AVec, Alloc};
+use blaze_own::AVec;
 use blaze_scope::task::{Par, Serial};
 
 /// The serial solve, with every crate's groups asked for.
@@ -51,16 +51,15 @@ fn the_shelf_s_crates_are_written_per_group() {
     let user = UserCrate { name: "hello", dir: "/hello/", root: "/hello/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let g = Alloc::global();
 
     let t0 = Instant::now();
-    let plain = inputs.resolve(&crates, g).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let plain = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let plain_s = t0.elapsed().as_secs_f64();
     drop(plain);
     let t1 = Instant::now();
-    let first = inputs.resolve_with(&crates, &Grouped, g).unwrap_or_else(|e| panic!("resolve_crates with groups: {e}"));
+    let first = inputs.resolve_with(&crates, &Grouped, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates with groups: {e}"));
     let grouped_s = t1.elapsed().as_secs_f64();
-    let second = inputs.resolve_with(&crates, &Grouped, g).unwrap_or_else(|e| panic!("resolve_crates with groups, again: {e}"));
+    let second = inputs.resolve_with(&crates, &Grouped, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates with groups, again: {e}"));
 
     // Each line printed is kept too, and written to `names_groups_shelf.out` in the temp
     // directory: the build queue shows a passing test's output to no one.

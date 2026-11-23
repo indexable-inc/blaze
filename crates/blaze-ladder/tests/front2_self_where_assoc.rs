@@ -56,7 +56,7 @@ fn self_assoc_through_where_clauses_on_self() {
     let user = UserCrate { name: "swa", dir: "/swa/", root: "/swa/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
     let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
@@ -96,7 +96,7 @@ fn self_assoc_through_where_clauses_on_self() {
     line.push(format!("two: refused: {gap}"));
 
     // A caller: the method's signature is what its call is checked against.
-    let prepared = Prepares::new_in(alloc);
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut buckets = None;
     let f = item(Namespace::Values, "use_try");
     store.ensure(&names, &mut front.keys, Want::Fn(f)).unwrap_or_else(|e| panic!("use_try: no head: {e:?}"));

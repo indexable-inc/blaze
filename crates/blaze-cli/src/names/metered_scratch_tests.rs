@@ -69,7 +69,8 @@ struct Ran<'o> {
 fn run<'o>(mode: CallScratch, text: &str, out: Alloc<'o>) -> Ran<'o> {
     let home = Frame::new(Tag::Nameres).unwrap_or_else(|e| panic!("the crate's frame: {e:?}"));
     let erased = Erased::new(&home);
-    let g = erased.handle();
+    let bump = erased.bump();
+    let g = bump.alloc();
     let scratch = Frame::new(Tag::Expand).unwrap_or_else(|e| panic!("the call scratch: {e:?}"));
     let metered = Metered::new(&home, scratch, mode);
     let crates = [CrateInput {
@@ -84,7 +85,7 @@ fn run<'o>(mode: CallScratch, text: &str, out: Alloc<'o>) -> Ran<'o> {
         cfg: &[],
         script: None,
     }];
-    let names = resolve_crates(&crates, Sysroot::default(), &Fixture(text), &metered, g).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &Fixture(text), &metered, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let peak = home.peak();
     let bytes = metered.finish(Label::of(format_args!("fixture")));
     let krate = names.krate(0);

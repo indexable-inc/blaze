@@ -8,13 +8,13 @@
 //! (`debug_assertions`), and a `feature` atom per feature on.
 
 use blaze_id::{ContentId, CrateItemKey};
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, BVec, Bump};
 use blaze_surface::Edition;
 use blaze_toolchain::{Role, Shelf, ToolchainId, ToolchainView, UnitKind};
 use blaze_unit_graph::{Implicit, implicit};
 use edition::PackageEdition;
 
-use crate::{WorldError, join, keep, keep_slice};
+use crate::{WorldError, join};
 
 /// The profile's atoms beside the target's: `dev`.
 const PROFILE: &[(&str, Option<&str>)] = &[("debug_assertions", None)];
@@ -106,7 +106,9 @@ fn edition_of(written: &str) -> Option<Edition> {
 impl<'w, B: AsRef<[u8]>> Toolchain<'w, B> {
     /// Opens toolchain `id`'s manifest on `shelf` and reads the pack of every unit `needs`
     /// reaches for `triple`.
-    pub fn open<S: Shelf<Bytes = B>>(shelf: &mut S, id: ToolchainId, triple: &'w str, needs: Needs, alloc: Alloc<'w>) -> Result<Toolchain<'w, B>, WorldError<'w>> {
+    pub fn open<S: Shelf<Bytes = B>>(shelf: &mut S, id: ToolchainId, triple: &'w str, needs: Needs, alloc: Bump<'w>) -> Result<Toolchain<'w, B>, WorldError<'w>> {
+        let bump = alloc;
+        let alloc = bump.alloc();
         let manifest = blaze_toolchain::shelf::open_manifest(shelf, id).map_err(WorldError::Toolchain)?;
         let view = ToolchainView::open(manifest.as_ref(), id).expect("open_manifest checked it");
         let sys = blaze_toolchain::sysroot(&view, triple, false).ok_or(WorldError::NoTarget { triple })?;
@@ -147,24 +149,24 @@ impl<'w, B: AsRef<[u8]>> Toolchain<'w, B> {
         let cfg_target: AVec<'w, (&'w str, Option<&'w str>)> = {
             let mut v = AVec::new_in(alloc);
             for (name, value) in view.cfg(triple).ok_or(WorldError::NoTarget { triple })? {
-                v.push((keep(name, alloc), value.map(|v| keep(v, alloc))));
+                v.push((&*bump.alloc_str(name), value.map(|v| &*bump.alloc_str(v))));
             }
             v
         };
         // First the rows, then their dependencies by index among the kept.
-        let mut raw_deps: AVec<'w, AVec<'w, (&'w str, usize)>> = AVec::new_in(alloc);
+        let mut raw_deps: AVec<'w, BVec<'w, (&'w str, usize)>> = AVec::new_in(alloc);
         for (u, row) in all.iter().enumerate() {
             let proc_macro = row.kind == UnitKind::ProcMacro;
             if !keep_unit[u] || !(proc_macro || (row.kind == UnitKind::Lib && !row.for_host)) {
                 continue;
             }
             let krate = view.krate(row.krate);
-            let name = keep(krate.lib, alloc);
-            let edition = edition_of(krate.edition).ok_or(WorldError::ToolchainEdition { krate: name, written: keep(krate.edition, alloc) })?;
+            let name = bump.alloc_str(krate.lib);
+            let edition = edition_of(krate.edition).ok_or(WorldError::ToolchainEdition { krate: name, written: bump.alloc_str(krate.edition) })?;
             // Its implicit is its own, from its row: its crate's edition (the prelude's
             // `rust_20xx`), never one uniform Rust 2024; what it is given from the sysroot is
             // its row's value and edges (`row.sysroot`, `row.deps()`).
-            let own = PackageEdition::of_manifest(krate.edition).map_err(|_| WorldError::ToolchainEdition { krate: name, written: keep(krate.edition, alloc) })?;
+            let own = PackageEdition::of_manifest(krate.edition).map_err(|_| WorldError::ToolchainEdition { krate: name, written: bump.alloc_str(krate.edition) })?;
             let own_implicit = implicit(own, if proc_macro { &blaze_unit_graph::UnitKind::ProcMacro } else { &blaze_unit_graph::UnitKind::Lib });
             let pack = blaze_toolchain::shelf::open_pack(shelf, id, &krate).map_err(WorldError::Toolchain)?;
             let index = crates.len();
@@ -177,9 +179,9 @@ impl<'w, B: AsRef<[u8]>> Toolchain<'w, B> {
             } else {
                 join(&join(&base, krate.dir, alloc), row.root, alloc)
             };
-            let mut features: AVec<'w, &'w str> = AVec::new_in(alloc);
-            features.extend(row.features().map(|f| keep(f, alloc)));
-            let mut cfg: AVec<'w, (&'w str, Option<&'w str>)> = AVec::with_capacity_in(cfg_target.len() + features.len() + 1, alloc);
+            let mut features: BVec<'w, &'w str> = BVec::new_in(bump);
+            features.extend(row.features().map(|f| &*bump.alloc_str(f)));
+            let mut cfg: BVec<'w, (&'w str, Option<&'w str>)> = BVec::with_capacity_in(cfg_target.len() + features.len() + 1, bump);
             cfg.extend_from_slice(&cfg_target);
             cfg.extend_from_slice(PROFILE);
             cfg.extend(features.iter().map(|f| ("feature", Some(*f))));
@@ -196,32 +198,32 @@ impl<'w, B: AsRef<[u8]>> Toolchain<'w, B> {
                 key_bytes.extend_from_slice(atom.as_bytes());
                 key_bytes.push(0);
             }
-            let mut deps: AVec<'w, (&'w str, usize)> = AVec::new_in(alloc);
+            let mut deps: BVec<'w, (&'w str, usize)> = BVec::new_in(bump);
             if !proc_macro {
-                deps.extend(row.deps().map(|(n, d)| (keep(n, alloc), d as usize)));
+                deps.extend(row.deps().map(|(n, d)| (&*bump.alloc_str(n), d as usize)));
             }
             raw_deps.push(deps);
             at[u] = index;
             crates.push(ToolchainCrate {
                 name,
-                version: keep(krate.version, alloc),
+                version: bump.alloc_str(krate.version),
                 unit: u as u32,
                 key: CrateItemKey(ContentId::of("blaze toolchain unit", &key_bytes)),
                 edition,
                 implicit: own_implicit,
                 sysroot: row.sysroot,
-                root: keep(&root, alloc),
-                shown_from: keep(&base, alloc),
-                features: features.leak(),
+                root: bump.alloc_str(&root),
+                shown_from: bump.alloc_str(&base),
+                features: features.into_bump_slice(),
                 deps: &[],
-                cfg: cfg.leak(),
+                cfg: cfg.into_bump_slice(),
                 proc_macro,
                 role: krate.role,
                 pack: packs.len(),
             });
             packs.push(pack);
         }
-        for (c, deps) in crates.iter_mut().zip(raw_deps.iter_mut()) {
+        for (c, mut deps) in crates.iter_mut().zip(raw_deps.into_iter()) {
             for dep in deps.iter_mut() {
                 let kept = at[dep.1];
                 if kept == usize::MAX {
@@ -229,7 +231,7 @@ impl<'w, B: AsRef<[u8]>> Toolchain<'w, B> {
                 }
                 dep.1 = kept;
             }
-            c.deps = keep_slice(deps, alloc);
+            c.deps = deps.into_bump_slice();
         }
         // A crate's key is its identity: its pack's digest and features (set above), the
         // target's cfg (the same pack is another crate on another target), and its dependencies'

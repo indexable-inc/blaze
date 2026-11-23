@@ -261,7 +261,7 @@ fn renamed<'n, S: NamesSource<'n>>(names: S, krate: usize, lib: LibKey, text: &s
         // The value cooked as the native image reads it (links.rs `symbol_of`: a value written
         // as a macro call is the names' row of the item, as the link table's).
         if v.text_at(a.path).map_err(|_| ())?.trim() == "link_name"
-            && super::links::symbol_of(v.text_at(a.args).map_err(|_| ())?, Some(lib), |item| names.attr_value(item, "link_name"), edition, alloc).map_err(|_| ())? != name
+            && super::links::with_symbol_of(v.text_at(a.args).map_err(|_| ())?, Some(lib), |item| names.attr_value(item, "link_name"), edition, |res| res.map(|sym| sym != name).map_err(|_| ()))?
         {
             return Ok(true);
         }

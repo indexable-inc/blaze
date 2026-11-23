@@ -125,7 +125,7 @@ fn with_unit<R>(tc: &Toolchain, text: &str, test: bool, f: impl FnOnce(&Names<'_
     if test {
         crates[0].key = CrateItemKey(ContentId::of("blaze program crate test", SOURCE_NAME));
     }
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/lib.rs", text }];
     f(&names, &cfg, &sources)
 }
@@ -171,7 +171,7 @@ fn with_suite<R>(tc: &Toolchain, text: &str, f: impl FnOnce(&Names<'_>, &Suite<'
     with_unit(tc, text, true, |names, _cfg, sources| {
         let g = Alloc::global();
         let bytes = encode(names.krate(0), g).unwrap_or_else(|e| panic!("the tests record: {e}")).bytes;
-        let record = TestsRecord::open(aligned(&bytes, g)).unwrap_or_else(|e| panic!("the tests record does not open: {e}"));
+        let record = TestsRecord::open(aligned(&bytes, blaze_own::testing::bump())).unwrap_or_else(|e| panic!("the tests record does not open: {e}"));
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
         let mut left: Vec<(Box<str>, blaze_ladder::front2::program::LeftOut)> = Vec::new();
         let suite = Front2Program::suite(names, &frame, sources, &record, Some(&mut left), g).unwrap_or_else(|e| panic!("the suite: {e}"));

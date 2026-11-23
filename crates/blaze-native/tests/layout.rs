@@ -20,13 +20,13 @@ fn le(words: &[u32]) -> &'static [u8] {
     for w in words {
         b.extend_from_slice(&w.to_le_bytes());
     }
-    b.leak()
+    b.leak_static()
 }
 
 fn zeros(n: usize) -> &'static [u8] {
     let mut b: AVec<'static, u8> = Vec::new_in(a());
     b.resize(n, 0);
-    b.leak()
+    b.leak_static()
 }
 
 fn section(segment: &'static [u8], name: &'static [u8], kind: SectionKind, align_log2: u8, bytes: &'static [u8], relocs: core::ops::Range<u32>) -> Section<'static> {

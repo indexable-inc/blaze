@@ -101,7 +101,7 @@ pub fn members_lock<'f>(units: &layout::Units<'_>, frame: &'f Frame) -> &'f [u8]
             text.extend_from_slice(b"]\n");
         }
     }
-    text.leak()
+    text.into_bump_slice()
 }
 
 /// The members as the layout read them, before the lock is matched: each one's facts, its

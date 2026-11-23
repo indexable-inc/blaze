@@ -2231,10 +2231,13 @@ fn lower_heads<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S, heads: &mut H
         // words, never "no impl". Only an unread candidate can be one (its row's trait is
         // unread), and the names say which calls were refused.
         if b.is_unread(k)
-            && let Some(row) = names.failed_call(k, heads.store().tys.alloc())
+            && let Ok(frame) = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer)
         {
-            b.fail(k, refused_derive_words(&row));
-            continue;
+            let erased = blaze_own::Erased::new(&frame);
+            if let Some(row) = names.failed_call(k, erased.bump()) {
+                b.fail(k, refused_derive_words(&row));
+                continue;
+            }
         }
         let made = heads.make(Want::Impl(k));
         if !matches!(made, Ok(Made::Later(_))) {

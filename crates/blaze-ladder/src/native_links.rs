@@ -26,7 +26,7 @@ use blaze_hash::FixedState;
 use blaze_ids::producer::{ProducerId, Whole};
 use blaze_ids::{ContentId, Hasher};
 pub use blaze_native::Platform;
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, Bump};
 use blaze_scope::resolve::CrateNames;
 use blaze_surface::ItemIndex;
 
@@ -51,11 +51,11 @@ pub fn table_digest(table: &[u8]) -> ContentId {
 
 /// The table of the crate `c` resolved by its `CrateScope` job, as bytes appended to `out`. A
 /// refused table is written as its refusal's words (state 1), never as an empty table.
-pub fn scope_table<'a>(c: &CrateNames<'a>, out: &mut AVec<'_, u8>, alloc: Alloc<'a>) -> Result<(), TableError> {
-    match scope_links(c, alloc) {
+pub fn scope_table<'a>(c: &CrateNames<'a>, out: &mut AVec<'_, u8>, bump: Bump<'a>) -> Result<(), TableError> {
+    match scope_links(c, bump) {
         Ok(links) => write_table(&links, out),
         Err(refused) => {
-            let mut words = AVec::new_in(alloc);
+            let mut words = AVec::new_in(bump.alloc());
             write_words(&mut words, refused).map_err(|_| TableError::Alloc)?;
             head(out, 1)?;
             put_str(out, core::str::from_utf8(&words).map_err(|_| TableError::Alloc)?)
@@ -184,7 +184,7 @@ pub fn program_key<'a>(
     alloc: Alloc<'a>,
 ) -> Result<ContentId, NativeError<'a>> {
     let natives = as_natives(crates, alloc)?;
-    native_key(&NativeInputs { platform, producer, crates: natives, installs }, alloc)
+    native_key(&NativeInputs { platform, producer, crates: &natives, installs }, alloc)
 }
 
 /// The libraries the program's link line asks for, each once, in link order, by where its
@@ -193,7 +193,7 @@ pub fn program_key<'a>(
 /// [`program_key`]'s and [`program_image`]'s `installs`.
 pub fn program_libraries<'a>(crates: &'a [ProgramCrate<'a>], platform: Platform, producer: &'a ProducerId<Whole>, alloc: Alloc<'a>) -> Result<AVec<'a, Asked<'a>>, NativeError<'a>> {
     let natives = as_natives(crates, alloc)?;
-    asked(&NativeInputs { platform, producer, crates: natives, installs: &[] }, alloc)
+    asked(&NativeInputs { platform, producer, crates: &natives, installs: &[] }, alloc)
 }
 
 /// The image's bytes appended to `out` (natives.rs `native_library`): a program with no C
@@ -205,18 +205,18 @@ pub fn program_image<'a>(
     producer: &'a ProducerId<Whole>,
     seed: FixedState,
     out: &mut AVec<'_, u8>,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Result<NativeSummary, NativeError<'a>> {
-    let natives = as_natives(crates, alloc)?;
-    native_library(&NativeInputs { platform, producer, crates: natives, installs }, seed, out, alloc)
+    let natives = as_natives(crates, bump.alloc())?;
+    native_library(&NativeInputs { platform, producer, crates: &natives, installs }, seed, out, bump)
 }
 
-fn as_natives<'a>(crates: &'a [ProgramCrate<'a>], alloc: Alloc<'a>) -> Result<&'a [CrateNative<'a>], NativeError<'a>> {
+fn as_natives<'a>(crates: &'a [ProgramCrate<'a>], alloc: Alloc<'a>) -> Result<AVec<'a, CrateNative<'a>>, NativeError<'a>> {
     let mut natives: AVec<'a, CrateNative<'a>> = AVec::try_with_capacity_in(crates.len(), alloc).map_err(|_| NativeError::Alloc)?;
     for c in crates.iter() {
         natives.try_push(CrateNative { package: c.package, outputs: c.outputs, links: c.links }).map_err(|_| NativeError::Alloc)?;
     }
-    Ok(natives.leak())
+    Ok(natives)
 }
 
 fn head(out: &mut AVec<'_, u8>, state: u8) -> Result<(), TableError> {

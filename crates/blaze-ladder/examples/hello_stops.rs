@@ -60,10 +60,11 @@ fn main() {
     let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind).unwrap_or_else(|e| panic!("the program's texts: {e}"));
     let user = texts.user();
     let appended = user.files.iter().any(|(_, text)| text.contains("mod __blaze_entry"));
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the frame");
+    let erased = blaze_own::Erased::new(&frame);
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
-    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the frame");
+    let names = inputs.resolve(&crates, erased.bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     {
         let mut left_out = Vec::new_in(Global);
         match Front2Program::survey(&names, &frame, &files, &mut left_out, alloc) {

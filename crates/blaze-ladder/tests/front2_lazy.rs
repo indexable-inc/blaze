@@ -157,7 +157,7 @@ fn with_program(each: impl FnOnce(&blaze_scope::resolve::Names<'_>, &[SourceFile
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     each(&names, &files);
 }
 

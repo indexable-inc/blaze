@@ -652,6 +652,10 @@ fn new_rules_are_off_until_named() {
         Rule::ManualSliceIdioms,
         Rule::TestAmbientLeak,
         Rule::MutForUniqBorrow,
+        Rule::IoRef,
+        Rule::UnusedImport,
+        Rule::UnusedMut,
+        Rule::HeapLeak,
     ] {
         assert!(!Step::Strict.rules().runs(rule), "{} runs in strict", rule.name());
         assert!(Step::Strict.rules().with(rule).runs(rule));
@@ -1510,22 +1514,66 @@ fn check_fixes(text: &str, scope: Scope, plant: Plant) -> Result<(), Broke> {
     let (old_tokens, _) = significant(text);
     let mut expected: StdVec<StdString> = StdVec::new();
     let mut used = vec![false; edits.len()];
-    for (start, end) in &old_tokens {
-        match edits.iter().position(|(r, _)| !r.is_empty() && (r.start, r.end) == (*start, *end)) {
-            Some(at) => {
-                used[at] = true;
-                let (put, _) = significant(edits[at].1);
-                expected.extend(put.iter().map(|(a, b)| edits[at].1[*a as usize..*b as usize].to_string()));
+    // Every non-empty edit must cover one or more whole significant tokens without splitting
+    // any neighbouring token (trailing/leading whitespace inside the edit is allowed so fixes
+    // like removing `mut ` or a whole `use` line leave clean formatting).
+    for (at, (r, _)) in edits.iter().enumerate() {
+        if r.is_empty() {
+            continue;
+        }
+        for &(ts, te) in &old_tokens {
+            let splits_start = r.start > ts && r.start < te;
+            let splits_end = r.end > ts && r.end < te;
+            if splits_start || splits_end {
+                return Err(Broke::Oracle(format!(
+                    "a fix changes a neighbouring token: edit {:?} splits token {ts}..{te} in\n{text}",
+                    edits[at].0
+                )));
             }
-            None => expected.push(text[*start as usize..*end as usize].to_string()),
+        }
+        // Also ensure the edit covers at least one token and ends no further than the start of
+        // the next token (so eating into a 1-byte neighbour like `(` is rejected).
+        if let Some(first_covered) = old_tokens.iter().position(|&(ts, te)| ts >= r.start && te <= r.end) {
+            let last_covered = old_tokens
+                .iter()
+                .rposition(|&(ts, te)| ts >= r.start && te <= r.end)
+                .unwrap_or(first_covered);
+            let covered = last_covered - first_covered + 1;
+            // Single-token rename/strip edits must cover exactly 1 token; multi-token fixes
+            // (unused-import line/brace rewrites) start on `use`, `::`, or `{`.
+            let multi_ok = matches!(
+                text.get(old_tokens[first_covered].0 as usize..old_tokens[first_covered].1 as usize),
+                Some("use" | "{" | ":")
+            );
+            if covered > 1 && !multi_ok {
+                return Err(Broke::Oracle(format!(
+                    "a fix changes a neighbouring token: edit {:?} covers {covered} tokens in\n{text}",
+                    edits[at].0
+                )));
+            }
+        }
+    }
+    let mut tok_idx = 0usize;
+    while tok_idx < old_tokens.len() {
+        let (start, end) = old_tokens[tok_idx];
+        match edits.iter().position(|(r, _)| !r.is_empty() && r.start <= start && end <= r.end) {
+            Some(at) => {
+                if !used[at] {
+                    used[at] = true;
+                    let (put, _) = significant(edits[at].1);
+                    expected.extend(put.iter().map(|(a, b)| edits[at].1[*a as usize..*b as usize].to_string()));
+                }
+            }
+            None => expected.push(text[start as usize..end as usize].to_string()),
         }
         for (at, (r, put)) in edits.iter().enumerate() {
-            if r.is_empty() && r.start == *end {
+            if r.is_empty() && r.start == end {
                 used[at] = true;
                 let (tokens, _) = significant(put);
                 expected.extend(tokens.iter().map(|(a, b)| put[*a as usize..*b as usize].to_string()));
             }
         }
+        tok_idx += 1;
     }
     if let Some(at) = used.iter().position(|u| !u) {
         return Err(Broke::Oracle(format!(
@@ -2402,5 +2450,166 @@ fn mut_for_uniq_borrow_autofixes_non_rebound_let_mut_and_keeps_rebindings() {
         "fn rebound() -> i32 { let mut n = 0; bump(&uniq n); n = 5; n }",
         "fn compound() -> i32 { let mut n = 0; bump(&uniq n); n += 1; n }",
         "fn no_borrow() -> i32 { let mut n = 0; n }",
+    ]);
+}
+
+#[test]
+fn io_ref_denies_general_io_bundle() {
+    let rule = Rule::IoRef;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(rule.name(), "io-ref");
+    assert_eq!(Rule::from_name("io-ref"), Some(rule));
+    assert_eq!(rule.lint(), Some("io_ref"));
+    assert_eq!(Rule::from_lint("io_ref"), Some(rule));
+    assert_eq!(Template::IoRef.rule(), rule);
+
+    assert_eq!(found(&only, "fn f(io: &Io) {}", FILE), [("io-ref", "&Io")]);
+    assert_eq!(found(&only, "struct S<'a> { io: &'a Io }", FILE), [("io-ref", "&'a Io")]);
+    assert_eq!(found(&only, "fn f(io: &mut Io) {}", FILE), [("io-ref", "&mut Io")]);
+    assert_eq!(found(&only, "fn f(io: &bstd::io::Io) {}", FILE), [("io-ref", "&bstd::io::Io")]);
+    assert_eq!(found(&only, "fn f(io: &bstd::Io) {}", FILE), [("io-ref", "&bstd::Io")]);
+
+    // Local private `struct Io` exempts unqualified `&Io`, but still flags `&bstd::io::Io`.
+    assert!(found(&only, "struct Io;\nfn f(io: &Io) {}", FILE).is_empty());
+    assert_eq!(
+        found(&only, "struct Io;\nfn f(io: &bstd::io::Io) {}", FILE),
+        [("io-ref", "&bstd::io::Io")]
+    );
+
+    // Narrow capabilities, owned `Io`, and tests are clean.
+    none(rule, &[
+        "fn f(out: &Out, fs: &Fs) {}",
+        "fn main(io: Io) { drop(io); }",
+        "fn f() { let _ = mask & Io; }",
+        "#[test]\nfn t(io: &Io) {}",
+        "#[cfg(test)]\nmod t { fn f(io: &Io) {} }",
+    ]);
+}
+
+#[test]
+fn unused_import_minimizes_and_autofixes() {
+    let rule = Rule::UnusedImport;
+    let only = RuleSet::only(&[rule]);
+    let alloc = blaze_own::testing::heap().alloc();
+
+    let fix = |src: &str| {
+        let mut out = Findings::new_in(alloc);
+        crate::lint_file_imports(src, FILE, alloc, &mut out).unwrap();
+        lint(&only, &Unit { text: src, holes: &[], scope: FILE }, alloc, &mut out).unwrap();
+        apply_all(src, &out, alloc).unwrap()
+    };
+
+    // Collapse braced import down to minimal single import (`{Io, Missing}` -> `Missing`).
+    assert_eq!(
+        fix("use bstd::io::{Io, Missing};\nfn f() -> Missing { todo!() }\n").as_str(),
+        "use bstd::io::Missing;\nfn f() -> Missing { todo!() }\n"
+    );
+
+    // Collapse `{self, Io}` down to bare module import `use bstd::io;`.
+    assert_eq!(
+        fix("use bstd::io::{self, Io};\nfn f() { io::init(); }\n").as_str(),
+        "use bstd::io;\nfn f() { io::init(); }\n"
+    );
+
+    // Prune middle entry from 3-item braced group.
+    assert_eq!(
+        fix("use bstd::io::{Fs, Io, Out};\nfn f(fs: &Fs, out: &Out) {}\n").as_str(),
+        "use bstd::io::{Fs, Out};\nfn f(fs: &Fs, out: &Out) {}\n"
+    );
+
+    // Remove redundant braces on single-item braced import.
+    assert_eq!(
+        fix("use bstd::io::{Missing};\nfn f() -> Missing { todo!() }\n").as_str(),
+        "use bstd::io::Missing;\nfn f() -> Missing { todo!() }\n"
+    );
+
+    // Delete completely unused single or braced `use` lines cleanly.
+    assert_eq!(
+        fix("use bstd::io::Io;\nuse bstd::io::Missing;\nfn f() -> Missing { todo!() }\n").as_str(),
+        "use bstd::io::Missing;\nfn f() -> Missing { todo!() }\n"
+    );
+    assert_eq!(
+        fix("use bstd::io::{Io, Foo};\nfn f() {}\n").as_str(),
+        "fn f() {}\n"
+    );
+
+    // Renamed import checks alias; `as _`, `pub use`, globs, and `#[cfg]`/`#[allow]` are untouched.
+    assert_eq!(
+        fix("use bstd::io::{Io as Unused, Missing as M};\nfn f() -> M { todo!() }\n").as_str(),
+        "use bstd::io::Missing as M;\nfn f() -> M { todo!() }\n"
+    );
+    for clean in [
+        "pub use bstd::io::Io;\nfn f() {}\n",
+        "pub(crate) use bstd::io::Io;\nfn f() {}\n",
+        "use core::fmt::Write as _;\nfn f() {}\n",
+        "use bstd::io::*;\nfn f() {}\n",
+        "#[cfg(unix)]\nuse bstd::io::Io;\nfn f() {}\n",
+        "#[allow(unused_imports)]\nuse bstd::io::Io;\nfn f() {}\n",
+    ] {
+        assert_eq!(fix(clean).as_str(), clean, "should leave untouched: {clean}");
+    }
+}
+
+#[test]
+fn unused_mut_autofixes_and_preserves_mutations() {
+    let rule = Rule::UnusedMut;
+    let only = RuleSet::only(&[rule]);
+    let alloc = blaze_own::testing::heap().alloc();
+
+    let fix = |src: &str| {
+        let mut out = Findings::new_in(alloc);
+        lint(&only, &Unit { text: src, holes: &[], scope: FILE }, alloc, &mut out).unwrap();
+        apply_all(src, &out, alloc).unwrap()
+    };
+
+    // Unnecessary `mut` on `let mut` and `fn` parameter is removed cleanly.
+    assert_eq!(
+        fix("fn f(mut n: u32) -> u32 {\n    let mut x = n + 1;\n    let mut y: u32 = x + 2;\n    y\n}\n").as_str(),
+        "fn f(n: u32) -> u32 {\n    let x = n + 1;\n    let y: u32 = x + 2;\n    y\n}\n"
+    );
+
+    // Format string read (`"{x}"`) does not mutate `x`.
+    assert_eq!(
+        fix("fn f() {\n    let mut x = 42;\n    println!(\"{x}\");\n}\n").as_str(),
+        "fn f() {\n    let x = 42;\n    println!(\"{x}\");\n}\n"
+    );
+
+    // Every genuinely mutating pattern is preserved untouched.
+    for mutated in [
+        "fn f() { let mut x = 0; x = 1; }",
+        "fn f() { let mut x = 0; x += 1; }",
+        "fn f() { let mut x = 0; take(&mut x); }",
+        "fn f() { let mut v = Vec::new(); v.push(1); }",
+        "fn f() { let mut a = [0; 4]; a[0] = 1; }",
+        "fn f() { let mut b = Box::new(0); *b = 1; }",
+        "fn f() { let mut x = 0; inc!(x); }",
+        "fn f(mut x: u32) -> u32 { x += 1; x }",
+        "fn f() { let mut _x = 0; }",
+        "fn f() { #[allow(unused_mut)] let mut x = 0; let _ = x; }",
+        "fn f() { let mut x = 0; let x = bump(&mut x); let _ = x; }",
+    ] {
+        assert_eq!(fix(mutated).as_str(), mutated, "should keep mut: {mutated}");
+    }
+}
+
+#[test]
+fn heap_leak_flags_leak_and_allows_root_and_bump() {
+    let rule = Rule::HeapLeak;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(rule.name(), "heap-leak");
+    assert_eq!(Rule::from_name("heap-leak"), Some(rule));
+    assert_eq!(rule.lint(), Some("heap_leak"));
+    assert_eq!(Rule::from_lint("heap_leak"), Some(rule));
+    assert_eq!(Template::HeapLeak.rule(), rule);
+
+    assert_eq!(found(&only, "fn f() { let _ = v.leak(); }", FILE), [("heap-leak", ".leak")]);
+    assert_eq!(found(&only, "fn f() { let _ = Box::leak(b); }", FILE), [("heap-leak", "Box::leak")]);
+    assert_eq!(found(&only, "fn f() { let _ = Vec::leak(v); }", FILE), [("heap-leak", "Vec::leak")]);
+
+    none(rule, &[
+        "fn f(frame: &Frame) { let _ = v.into_bump_slice(); }",
+        "fn f(frame: &Frame) { let _ = s.into_bump_str(); }",
+        "fn f(root: Root) { let _ = Root::leak(root); }",
+        "#[test]\nfn t() { let _ = v.leak(); }",
     ]);
 }

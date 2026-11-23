@@ -1295,7 +1295,7 @@ impl<'t, 's, 'n> StretchHeads<'t, 's, 'n> {
             "a member crate's head ({}); its head task could not freeze it: {why} (said at its head task; a body never freezes a member's head: engine_seeds.rs `StretchHeads::known`)",
             kind_words(cell)
         );
-        core::str::from_utf8(words.into_bytes().leak()).unwrap_or("a member's head its head task could not freeze (its words are not text)")
+        blaze_own::Box::leak_static(words.into_boxed_str())
     }
 
     /// Resolve the listing's logical file slot in the defining unit. For a macro-written
@@ -1339,7 +1339,7 @@ impl<'t, 's, 'n> StretchHeads<'t, 's, 'n> {
             let _ = write!(words, " and {more} more");
         }
         let _ = write!(words, " and not under this body's unit for the referenced crate (requested defining unit {}): a head is frozen once a unit that holds its item (engine_heads.rs `head_cell`, `run_items`)", UnitWords(unit_of(cell)));
-        core::str::from_utf8(words.into_bytes().leak()).unwrap_or("a member's head frozen under other units only (its words are not text)")
+        blaze_own::Box::leak_static(words.into_boxed_str())
     }
 }
 
@@ -1452,7 +1452,7 @@ impl RequestTable<'_> {
         // retired by a replace never frees them: they are not its).
         let mut copy = blaze_own::Vec::with_capacity_in(bytes.len(), self.heap.alloc());
         copy.extend_from_slice(bytes);
-        let lent: &'static [u8] = copy.leak();
+        let lent: &'static [u8] = copy.leak_static();
         match fresh.try_insert(id, Fresh { cell, krate, bytes: lent }) {
             Ok(_) => Ok(()),
             Err(occupied) => self.again(cell, occupied.current.bytes, bytes),

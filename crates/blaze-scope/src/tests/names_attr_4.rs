@@ -86,13 +86,16 @@ static TEXTS: Texts = Texts(&[&[("/user/lib.rs", USER)], &[("/dep/lib.rs", DEP)]
 /// `BuiltinDerive`) the `#[default]` of `Right` fails NotFound too (two `default` errors).
 #[test]
 fn a_built_in_derive_s_helper_is_inert_on_its_item_alone_through_the_records() {
-    let alloc = blaze_own::testing::heap().alloc();
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let bump = erased.bump();
+    let alloc = bump.alloc();
     let crates = [input("user", "/user/lib.rs", &[("dep", 1)]), input("dep", "/dep/lib.rs", &[])];
-    let (all, _) = resolve_by_records(&crates, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), alloc)
+    let (all, _) = resolve_by_records(&crates, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), bump)
         .unwrap_or_else(|e| panic!("by records: {e:?}"));
 
     // The record keeps the library's helper list.
-    let dep = read_record(aligned(&all[1].record, alloc), alloc).unwrap_or_else(|e| panic!("dep's record reads: {e:?}"));
+    let dep = read_record(aligned(&all[1].record, bump), alloc).unwrap_or_else(|e| panic!("dep's record reads: {e:?}"));
     let bodies: Vec<(&str, MacroBody<'_>)> = dep.macros.values().map(|m| (m.name, m.body)).collect();
     assert!(
         bodies.iter().any(|(name, body)| *name == "Default" && matches!(body, MacroBody::BuiltinDerive { helpers: "default" })),

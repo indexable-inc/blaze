@@ -370,7 +370,7 @@ fn an_answer_round_trips_and_its_digest_ignores_order() {
         assert_eq!(decoded, ordered, "the decoded answer is the answer");
         assert_eq!(encoded_answer(&decoded), bytes, "the decoded answer encodes to the same bytes");
 
-        let scripted = Scripted { answer: bytes.clone().leak() };
+        let scripted = Scripted { answer: bytes.clone().leak_static() };
         let replayed = scripted.answer(&base(None), &NoFiles, g()).expect("blaze-spawn: the scripted executor answers");
         assert_eq!(replayed.digest(g()), ordered.digest(g()), "the scripted executor gives the recorded answer");
     });

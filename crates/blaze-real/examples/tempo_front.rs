@@ -556,7 +556,8 @@ fn heads<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, krate: usize, cname: 
     let listed = ordered.len();
     ordered.truncate(cap);
 
-    let prepared = Prepares::new_in(Alloc::global());
+    let bump = front.frame.alloc(blaze_own::Erased::new(front.frame)).bump();
+    let prepared = Prepares::new_in(bump);
     let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
     store.pointers = Pointers::find(&front.index, front.resolver);
     let mut buckets = None;
@@ -883,7 +884,8 @@ fn bodies<'n>(
     let listed = entries.len();
     out.push_str(&format!("BODIES {cname}: {listed} fns with a body listed ({declarations} bodiless free declarations skipped); records shared by every body; cap {cap}\n"));
 
-    let prepared = Prepares::new_in(Alloc::global());
+    let bump = front.frame.alloc(blaze_own::Erased::new(front.frame)).bump();
+    let prepared = Prepares::new_in(bump);
     let sized = front.index.lang("sized");
     let pointers = Pointers::find(&front.index, front.resolver);
     let mut shared = Recs::new(sized, pointers, front.frame);

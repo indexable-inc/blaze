@@ -49,6 +49,10 @@ fn a() -> Alloc<'static> {
     blaze_own::testing::heap().alloc()
 }
 
+fn b() -> blaze_own::Bump<'static> {
+    blaze_own::testing::bump()
+}
+
 struct Memory(StdMap<StdString, StdVec<u8>>);
 
 impl Shelf for Memory {
@@ -110,9 +114,9 @@ fn hello(std: &str) -> World<'static> {
     let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(a()), left_out: AVec::new_in(a()) }));
     let (id, files) = crate::fixture::shelf(TRIPLE, std, TARGET_CFG, a());
     let mut shelf = Memory(files.into_iter().collect());
-    let listed = open_list(&mut shelf, id, TRIPLE, graph, lock, &mut Member, a()).unwrap_or_else(|e| panic!("{e}"));
+    let listed = open_list(&mut shelf, id, TRIPLE, graph, lock, &mut Member, b()).unwrap_or_else(|e| panic!("{e}"));
     let listed = StdBox::leak(StdBox::new(listed));
-    world(graph, lock, listed, &mut Member, &NoFiles, a()).unwrap_or_else(|e| panic!("{e}"))
+    world(graph, lock, listed, &mut Member, &NoFiles, b()).unwrap_or_else(|e| panic!("{e}"))
 }
 
 fn answered<'t>(args: &[&'t str], snippet: &str, rows: &[Row]) -> Answered<'t> {

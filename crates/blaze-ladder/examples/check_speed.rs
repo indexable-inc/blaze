@@ -457,7 +457,7 @@ fn main() {
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names: Names<'_> = inputs.resolve(&crates, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names: Names<'_> = inputs.resolve(&crates, held_erased.bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     out.push_str(&format!("phase names: toolchain opened and names resolved in {} (not the subject)\n", ms(ns(t0))));
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let t0 = Instant::now();
@@ -558,7 +558,7 @@ fn main() {
     out.clear();
 
     // Phase 1: every head of the crate, one shared store.
-    let prepared = Prepares::new_in(alloc);
+    let prepared = Prepares::new_in(held_erased.bump());
     let sized = front.index.lang("sized");
     let mut st = St::new(sized, front.frame, tables);
     let kinds_order = ["struct/enum/union", "trait", "trait alias", "impl", "fn", "const", "static", "type alias"];
@@ -776,12 +776,12 @@ fn main() {
                             let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
                             let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
                             let crates = inputs.crates();
-                            let names: Names<'_> = inputs.resolve(&crates, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+                            let names: Names<'_> = inputs.resolve(&crates, held_erased.bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
                             let srcs = [SourceFile { path: "src/main.rs", text: MAIN }];
                             let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
                                 let mut fr = Front2::new(&names, &frame, &srcs, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
                             let front_ns = ns(f0);
-                            let prep = Prepares::new_in(alloc);
+                            let prep = Prepares::new_in(held_erased.bump());
                             // The handle is not `Send`: each thread names its own, as main does.
                             let mut st = St::new(fr.index.lang("sized"), fr.frame, blaze_own::Alloc::global());
                             let (mut low, mut chk, mut done) = (0u64, 0u64, 0usize);

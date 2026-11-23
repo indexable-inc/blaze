@@ -314,7 +314,7 @@ fn compare_one(w: &World, program: &str, files: &[SourceFile<'_>], edition: &str
         }
     };
     let crates = inputs.crates();
-    let names = match inputs.resolve(&crates, a) {
+    let names = match inputs.resolve(&crates, blaze_own::testing::bump()) {
         Ok(names) => names,
         Err(e) => {
             println!("{program}: SKIPPED: its names over no toolchain: {}", first_line(a, &e).as_str());
@@ -567,7 +567,7 @@ fn check_record_status(files: &[SourceFile<'_>], expected: i32) {
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap();
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, w.a).unwrap();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap();
     let whole = Front2Program::new(&names, w.frame, files, w.a).unwrap();
     let entry = whole.function(whole.entry().expect("exported main")).key;
     let mut lazy = LazyProgram::new(&names, w.frame, files, Some(entry), w.a).unwrap();

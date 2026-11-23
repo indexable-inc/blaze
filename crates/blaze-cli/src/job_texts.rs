@@ -250,12 +250,12 @@ impl<'n> JobTexts<'n> {
             return match error.kind {
                 FsKind::NotFound | FsKind::IsADirectory | FsKind::NotADirectory => Found::Absent,
                 _ => {
-                    let why: &'n bstd::fs::FsError = blaze_own::Box::leak(blaze_own::Box::new_in(error, self.frame));
+                    let why: &'n bstd::fs::FsError = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(error, self.frame));
                     Found::Unknown(Unread { path: held_str(inner, self.frame), why })
                 }
             };
         }
-        let held: &'n Bytes<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(bytes, self.frame));
+        let held: &'n Bytes<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(bytes, self.frame));
         Found::Known(held.as_slice())
     }
 
@@ -266,7 +266,7 @@ impl<'n> JobTexts<'n> {
         let at = Path::new(inner).ok()?;
         let mut bytes = Bytes::new_in(self.frame, "a pool job's checkout files");
         self.root.read_all(self.cx, &at, &mut bytes).ok()?;
-        let held: &'n Bytes<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(bytes, self.frame));
+        let held: &'n Bytes<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(bytes, self.frame));
         Some(held.as_slice())
     }
 }
@@ -316,7 +316,7 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
             Found::Known(bytes) => match core::str::from_utf8(bytes) {
                 Ok(text) => Some(text),
                 Err(error) => {
-                    let why: &'n core::str::Utf8Error = blaze_own::Box::leak(blaze_own::Box::new_in(error, self.frame));
+                    let why: &'n core::str::Utf8Error = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(error, self.frame));
                     return unknown(Unread { path: held_str(inner, self.frame), why });
                 }
             },

@@ -112,7 +112,7 @@ fn written_self_and_super_in_a_block_name_the_module_around_the_body() {
         }
     }
 
-    let record: &'static [u8] = aligned(&encode(c, g).unwrap_or_else(|e| panic!("encode: {e:?}")), g);
+    let record: &'static [u8] = aligned(&encode(c, g).unwrap_or_else(|e| panic!("encode: {e:?}")), super::SyncFrame::leaked());
     let keys: Vec<CrateItemKey> = std::vec![c.key];
     let read = RecordNames::new(&keys, Loaded(std::vec![record]), g);
 

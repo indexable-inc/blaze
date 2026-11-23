@@ -168,7 +168,7 @@ fn verdicts() -> Vec<(&'static str, Option<usize>)> {
         });
     }
     let texts = WithLibs { base: &inputs.texts, first, files: &lib_files };
-    let names = resolve_crates(&crates, sysroot, &texts, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates (three crates): {e}"));
+    let names = resolve_crates(&crates, sysroot, &texts, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates (three crates): {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: USER }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
     let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).unwrap_or_else(|e| panic!("the body checker: {e}"));

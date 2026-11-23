@@ -602,16 +602,12 @@ pub struct TreeTools<'t> {
 /// `read_apple_userland`, the one place it is read). Held in `alloc` for the command. A program
 /// whose path is not its real path is refused: the grant names real paths (Seatbelt matches
 /// them), and a link's target could change under an equal key.
-pub fn tree_tools<'a>(package: &str, host: &'static str, shelf: &str, alloc: Alloc<'a>) -> Result<TreeTools<'a>, AString<'a>> {
+pub fn tree_tools<'a>(package: &str, host: &'static str, shelf: &str, bump: blaze_own::Bump<'a>) -> Result<TreeTools<'a>, AString<'a>> {
+    let alloc = bump.alloc();
     let words = |text: std::string::String| String::from_str_in(&text, alloc);
-    let leak = |text: &str| -> &'a str {
-        let bytes: &'a mut [u8] = Vec::from_slice_in(text.as_bytes(), alloc).leak();
-        // A copy of a `str`'s bytes is UTF-8.
-        core::str::from_utf8(bytes).unwrap_or_default()
-    };
     let table = host_tools::host_tools(blaze_pins::CLANG_JSON, host, alloc).map_err(|e| words(format!("the host tools' table: {e}")))?;
     let tools: AVec<'a, HostTool<'static>> = host_tools::granted(&table, package, alloc);
-    let mut keys: AVec<'a, HostToolKey<'a>> = Vec::new_in(alloc);
+    let mut keys: blaze_own::BVec<'a, HostToolKey<'a>> = Vec::new_in(bump);
     for tool in tools.iter() {
         for (at, program) in tool.programs_in(shelf, alloc).into_iter().enumerate() {
             let program = program.as_str();
@@ -621,16 +617,17 @@ pub fn tree_tools<'a>(package: &str, host: &'static str, shelf: &str, alloc: All
             }
             let bytes = std::fs::read(program).map_err(|e| words(format!("{program}: {e}")))?;
             let name = match at {
-                0 => leak(tool.name),
-                _ => leak(&format!("{}+{program}", tool.name)),
+                0 => bump.alloc_str(tool.name),
+                _ => bump.alloc_str(&format!("{}+{program}", tool.name)),
             };
             keys.push(HostToolKey::of(tool, name, blaze_sha256::digest(&bytes)));
         }
     }
     let text = crate::fact_pins::read_apple_userland(alloc).map_err(|e| words(format!("the OS build: {e}")))?;
     let userland = blaze_build_script::fact_pins::apple_userland(text.plist.as_str(), text.darwin_release.as_str()).map_err(|e| words(format!("the OS build: {e}")))?;
-    let os_build = leak(userland.build_version);
-    Ok(TreeTools { tools: tools.leak(), keys: keys.leak(), os_build })
+    let os_build = bump.alloc_str(userland.build_version);
+    let tools_slice = bump.alloc_slice_copy(&tools);
+    Ok(TreeTools { tools: tools_slice, keys: keys.into_bump_slice(), os_build })
 }
 
 /// The digest of what a crate's tree is run with beyond its record (its tools, the OS build,

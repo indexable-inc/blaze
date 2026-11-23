@@ -171,7 +171,7 @@ fn compare(label: &str, files: &[(String, String)]) -> Compared {
     // Over the solved names: every verdict, the bodies by chain, the planted index, and the
     // records written from the solve. Nothing else of the solved names leaves this block.
     let (kept, solved_bodies, solved_verdicts, solved_rows, unplaced, unplaced_bodies, planted) = {
-        let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("{label}: resolve_crates: {e}"));
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("{label}: resolve_crates: {e}"));
         let sources: Vec<SourceFile<'_>> = files.iter().map(|(path, text)| SourceFile { path, text }).collect();
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
         let mut world = ProjectWorld::new(&names, &frame, &sources, g).unwrap_or_else(|e| panic!("{label}: front2: {e}"));
@@ -211,8 +211,8 @@ fn compare(label: &str, files: &[(String, String)]) -> Compared {
         };
         let mut kept = Kept { names: Vec::new(), items: Vec::new(), files: Vec::new(), expansions: Vec::new() };
         for c in names.crates().iter() {
-            kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), g));
-            kept.items.push(aligned(&items_record::encode(c, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), g));
+            kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
+            kept.items.push(aligned(&items_record::encode(c, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
             // By each file's path in its package: what the items record asks for (D96).
             kept.files.push(c.files.iter().map(|f| (f.package.as_str().to_string(), leak(f.text))).collect());
             kept.expansions.push(c.expansions.iter().filter_map(|(call, e)| e.made.map(|m| (*call, leak(m.text)))).collect());

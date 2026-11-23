@@ -79,15 +79,18 @@ fn holding<'g, 'a>(groups: &'g [NameGroup<'a>], module: ItemKey) -> Option<&'g N
 
 #[test]
 fn a_macro_rules_walk_out_of_a_group_reads_the_parents_record_or_demands_it() {
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let bump = erased.bump();
     let inputs = inputs();
-    let whole = resolve_crates(&inputs, Sysroot::default(), &BOTH, &Grouped, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the whole solve: {e}"));
+    let whole = resolve_crates(&inputs, Sysroot::default(), &BOTH, &Grouped, bump).unwrap_or_else(|e| panic!("the whole solve: {e}"));
     let (dep, app) = (whole.krate(0), whole.krate(1));
     let path = |k: &ItemKey| dep.path_of(*k).map_or_else(|| std::format!("{k:?}"), String::from);
     let key = |p: &str| dep.tree.modules.iter().find(|m| m.path.as_str() == p).unwrap_or_else(|| panic!("no module `{p}`")).key;
     let (root, a, b, mac) = (dep.root, key("dep::a"), key("dep::b"), key("dep::mac"));
     let want: BTreeSet<ItemKey> = [root, a, b, mac].iter().map(|&m| holding(&dep.groups, m).expect("a whole-solve group").members[0]).collect();
 
-    let lazy = names_on_demand(&inputs, Sysroot::default(), &BOTH, &[1], blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("names on demand: {e:?}"));
+    let lazy = names_on_demand(&inputs, Sysroot::default(), &BOTH, &[1], bump).unwrap_or_else(|e| panic!("names on demand: {e:?}"));
     let got = &lazy.demanded[0];
     let solved: BTreeSet<ItemKey> = got.groups.iter().map(|g| g.members[0]).collect();
     let paths: Vec<String> = got.groups.iter().flat_map(|g| g.members.iter().map(path)).collect();
@@ -126,7 +129,7 @@ fn a_macro_rules_walk_out_of_a_group_reads_the_parents_record_or_demands_it() {
     // the on-demand records: a group is entered when a member's own text moved or a cell it
     // read is defined now with another digest (or no longer).
     let edited_in = [input("dep", "/dep/lib.rs", &[])];
-    let edited = resolve_crates(&edited_in, Sysroot::default(), &EDITED, &Grouped, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the edited solve: {e}"));
+    let edited = resolve_crates(&edited_in, Sysroot::default(), &EDITED, &Grouped, bump).unwrap_or_else(|e| panic!("the edited solve: {e}"));
     let after = edited.krate(0);
     let entered = |g: &NameGroup<'_>, keep: &dyn Fn(&(ItemKey, [u8; 16], ContentId)) -> bool| -> bool {
         let own_moved = g.members.iter().zip(g.own.iter()).any(|(&m, own)| {

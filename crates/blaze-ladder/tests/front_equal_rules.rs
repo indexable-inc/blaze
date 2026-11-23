@@ -159,8 +159,8 @@ fn keep<'a>(names: &Names<'_>, frame: &'a Frame, alloc: blaze_own::Alloc<'a>) ->
         let file = &c.files[0];
         KeptCrate {
             key: c.key,
-            names: aligned(&names_record::encode(c, alloc).expect("names record"), alloc),
-            items: aligned(&items_record::encode_with(c, names, alloc).expect("items record"), alloc),
+            names: aligned(&names_record::encode(c, alloc).expect("names record"), blaze_own::testing::bump()),
+            items: aligned(&items_record::encode_with(c, names, alloc).expect("items record"), blaze_own::testing::bump()),
             path: frame.alloc_str(file.package.as_str()),
             text: frame.alloc_str(file.text),
             expansions: c.expansions.iter().filter_map(|(call, e)| {
@@ -238,7 +238,7 @@ fn with_programs<R: Send + 'static>(text: &'static str, inspect: impl for<'n> Fn
         let user = texts.user();
         let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("fixture inputs: {e}"));
         let crates = inputs.crates();
-        let names = inputs.resolve(&crates, a).unwrap_or_else(|e| panic!("fixture names: {e}"));
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("fixture names: {e}"));
         let whole = Front2Program::new(&names, frame, &files, a).unwrap_or_else(|e| panic!("whole program: {e}"));
         let entry = whole.function(whole.entry().expect("the fixture exports main")).key;
 
@@ -387,7 +387,7 @@ fn compare_binding(provider: &'static str, plant: bool) {
         ];
         let solve = |provider| {
             let roots = [(app.root, CALLER), (crates[1].root, provider)];
-            resolve_crates(&crates, Sysroot::default(), &FixtureFiles(&roots), &Serial, a).expect("fixture names")
+            resolve_crates(&crates, Sysroot::default(), &FixtureFiles(&roots), &Serial, blaze_own::testing::bump()).expect("fixture names")
         };
         let names = solve(provider);
         let lib = |krate, name| names.items(krate).map(|(k, _, _)| k).find(|&k| names.name_of(k) == Some(name)).expect("named fixture item");
@@ -533,7 +533,7 @@ pub extern "C" fn main() -> i32 {
                 runtime("panic_abort", "/panic_abort/src/lib.rs"),
             ];
             let roots = [(app.root, MAIN), (crates[1].root, RUNTIME), (crates[2].root, RUNTIME)];
-            let names = resolve_crates(&crates, Sysroot::default(), &FixtureFiles(&roots), &Serial, a).expect("fixture names");
+            let names = resolve_crates(&crates, Sysroot::default(), &FixtureFiles(&roots), &Serial, blaze_own::testing::bump()).expect("fixture names");
             let key = |krate, name: &str| {
                 let (lib, _, _) = names.items(krate).find(|(lib, _, _)| names.name_of(*lib) == Some(name)).expect("named fixture item");
                 checker_of(lib)

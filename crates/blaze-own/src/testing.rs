@@ -98,6 +98,41 @@ unsafe impl Allocator for TestHeap {
 // SAFETY: every `TestHeap` is the one process heap (above), so a copy frees what another made.
 unsafe impl core::alloc::AllocatorClone for TestHeap {}
 
+/// A process-lifetime bump allocator for `'static` test fixtures in crates that cannot depend
+/// on `blaze-mem` or write `unsafe` (`#![forbid(unsafe_code)]`). Allocations live for the life
+/// of the test process (`deallocate` is a no-op), satisfying [`BumpAlloc`](crate::BumpAlloc)
+/// for `'static`. Available under the `testing` feature only; production code takes a
+/// [`Bump`](crate::Bump) backed by a [`Frame`](../../blaze_mem) or arena.
+struct TestBump;
+
+// SAFETY: forwards allocations to the process test heap; `deallocate` is a no-op so blocks
+// remain valid for `'static`.
+unsafe impl Allocator for TestBump {
+    #[inline]
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        heap().shared().allocate(layout)
+    }
+
+    #[inline]
+    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        heap().shared().allocate_zeroed(layout)
+    }
+
+    #[inline]
+    unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {}
+}
+
+// SAFETY: `deallocate` is a no-op and `TEST_BUMP` lives for `'static`, so dropping a
+// container allocated from `TestBump` without running `deallocate` leaves its bytes valid for
+// `'static`.
+unsafe impl crate::BumpAlloc for TestBump {}
+
+/// A `'static` [`Bump`](crate::Bump) handle for test fixtures (under the `testing` feature).
+pub fn bump() -> crate::Bump<'static> {
+    static BUMP: crate::Erased<TestBump> = crate::Erased::new(TestBump);
+    BUMP.bump()
+}
+
 /// The byte a fresh block is filled with.
 pub const POISON: u8 = 0xA5;
 

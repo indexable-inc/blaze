@@ -86,7 +86,7 @@ fn stored() -> std::vec::Vec<Stored> {
     let g = blaze_own::testing::heap().alloc();
     let inputs = [input("app", "/0/app/lib.rs", &[("lib", 1)]), input("lib", "/1/lib/lib.rs", &[("base", 2)]), input("base", "/2/base/lib.rs", &[])];
     let sysroot = Sysroot { core: None, alloc: None, std: None, bstd: None };
-    let names: Names<'static> = blaze_scope::resolve::resolve_crates(&inputs, sysroot, &Files, &blaze_scope::task::Serial, g).unwrap_or_else(|e| panic!("the three crates' names: {e:?}"));
+    let names: Names<'static> = blaze_scope::resolve::resolve_crates(&inputs, sysroot, &Files, &blaze_scope::task::Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("the three crates' names: {e:?}"));
     let mut out = std::vec::Vec::new();
     for c in names.crates().iter() {
         let n = blaze_scope::names_record::encode(c, g).unwrap_or_else(|e| panic!("names record of `{}`: {e:?}", c.name));
@@ -258,7 +258,7 @@ fn a_record_still_in_the_arena_is_refused_by_name() {
 #[test]
 fn a_misaligned_section_is_refused_by_name() {
     let g: Alloc<'static> = blaze_own::testing::heap().alloc();
-    let base: &'static [u8] = blaze_scope::resolve::aligned(&[7u8; 64], g);
+    let base: &'static [u8] = blaze_scope::resolve::aligned(&[7u8; 64], blaze_own::testing::bump());
     let name: Name = blaze_drive::key::crate_scope_name(&CrateItemKey(ContentId::of("blaze-cli run records in place test crate", b"bent")));
     let mut counts = crate::engine_records::ReadCounts::default();
     let whole = <InPlace as Route>::section(name, "names section", &base[..32], &mut counts, g).unwrap_or_else(|e| panic!("CONTROL: an aligned section was refused: {e}"));

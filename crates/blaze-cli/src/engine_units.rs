@@ -242,7 +242,7 @@ fn sealed<'b>(list: &'b [u8], frame: &'b Frame) -> &'b [u8] {
     let row = (0..CrateGraph::len(&opened)).find(|r| opened.member(*r)).expect("SealsFlipped: the world has a member row to plant in");
     let mut planted = Vec::from_slice_in(list, frame);
     planted[HEADER_LEN + row * ROW + FLAGS_AT] ^= flag;
-    planted.leak()
+    planted.into_bump_slice()
 }
 
 /// The plan's reads of the stored answer, the profile's `plan:` line: the units stage's rows read
@@ -716,7 +716,7 @@ fn read_back<'f>(
         let _cx = cx.span("names: the crate list read back");
         let mut held = Vec::with_capacity_in(sections.list.len(), env.heap.alloc());
         held.extend_from_slice(sections.list);
-        let held: &'static [u8] = held.leak();
+        let held: &'static [u8] = held.leak_static();
         let maker = crate::names::Maker::new(key, view.out, lockfile.lock, graph.member_dirs(), frame);
         crate::names::Names::of_list(held, Some(maker), env.heap.alloc())
     };

@@ -105,15 +105,16 @@ fn family() -> Vec<(PathKind, Vec<&'static str>)> {
 
 #[test]
 fn a_names_record_answers_in_place_with_no_allocation() {
-    let g = blaze_own::testing::heap().alloc();
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
     let inputs = [input("k0", "/k0/lib.rs", &[]), input("k1", "/k1/lib.rs", &[("k0", 0)])];
-    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("solve: {e:?}"));
+    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("solve: {e:?}"));
     let all: Vec<&'static CrateNames<'static>> = solved.iter().map(|s| s.names).collect();
     for (i, c) in all.iter().enumerate() {
         assert!(c.notes.is_empty(), "crate {i}: notes {:?}", c.notes);
     }
     let fresh = Names::of_crates(&inputs, Sysroot::default(), &all, g).unwrap_or_else(|e| panic!("names: {e:?}"));
-    let records: Vec<&'static [u8]> = all.iter().map(|n| aligned(&encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")), g)).collect();
+    let records: Vec<&'static [u8]> = all.iter().map(|n| aligned(&encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")), bump)).collect();
     let keys: Vec<CrateItemKey> = all.iter().map(|n| n.key).collect();
     let roots: Vec<ItemKey> = (0..all.len()).map(|i| fresh.root(i)).collect();
 

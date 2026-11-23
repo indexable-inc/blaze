@@ -31,7 +31,7 @@ eval = []
 [dev-dependencies]
 blaze-sim.workspace = true
 # `Alloc::global()`, which legalize's tests name (blaze-own's `std` feature).
-blaze-own = { workspace = true, features = ["std"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
 
 [lints]
 workspace = true

@@ -23,7 +23,7 @@
 //! No recursion: nested calls are a work list, each entry with its depth, bounded by
 //! [`MOST_ATTR_VALUE_DEPTH`] and refused past it.
 
-use blaze_own::{AVec, Alloc, Vec};
+use blaze_own::{AVec, Bump, Vec};
 
 use crate::builtin::stringified;
 use crate::extent::{Prefix, Words};
@@ -83,8 +83,9 @@ struct Piece {
 }
 
 /// The string `expr` (an attribute's value as written: `stringify!(x)`,
-/// `concat!("a", stringify!(b))`, `"plain"`) expands to, lexed in `edition`, in `alloc`.
-pub fn attr_literal<'a>(expr: &str, edition: Edition, alloc: Alloc<'a>) -> Result<&'a str, AttrLiteralError<'a>> {
+/// `concat!("a", stringify!(b))`, `"plain"`) expands to, lexed in `edition`, in `bump`.
+pub fn attr_literal<'a>(expr: &str, edition: Edition, bump: Bump<'a>) -> Result<&'a str, AttrLiteralError<'a>> {
+    let alloc = bump.alloc();
     let stream = lex(expr, edition, alloc).map_err(|_| AttrLiteralError::Lex)?;
     let mut value = Buf::new_in(alloc);
     let mut work: AVec<'_, Piece> = Vec::new_in(alloc);
@@ -93,10 +94,10 @@ pub fn attr_literal<'a>(expr: &str, edition: Edition, alloc: Alloc<'a>) -> Resul
         if piece.depth > MOST_ATTR_VALUE_DEPTH {
             return Err(AttrLiteralError::TooDeep);
         }
-        read_piece(&stream, piece, &mut value, &mut work, alloc)?;
+        read_piece(&stream, piece, &mut value, &mut work, bump)?;
     }
-    let bytes: &'a [u8] = value.0.leak();
-    Ok(core::str::from_utf8(bytes).expect("a `Buf` is pushed only whole `str`s and `char`s"))
+    let text = core::str::from_utf8(&value.0).expect("a `Buf` is pushed only whole `str`s and `char`s");
+    Ok(bump.alloc_str(text))
 }
 
 /// Reads one piece: a literal or `true`/`false` is appended to `value`; a `stringify!` call's
@@ -107,8 +108,9 @@ fn read_piece<'a>(
     piece: Piece,
     value: &mut Buf<'_>,
     work: &mut AVec<'_, Piece>,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Result<(), AttrLiteralError<'a>> {
+    let alloc = bump.alloc();
     let tokens = stream.tokens();
     let Piece { start, end, depth, top } = piece;
     let at = |i: usize| u32::try_from(i).unwrap_or(u32::MAX);
@@ -157,7 +159,7 @@ fn read_piece<'a>(
     }
     let inner = open + 1..end - 1;
     match name {
-        _ if !built_in => Err(AttrLiteralError::NeedsContext { mac: leak_name(name, alloc) }),
+        _ if !built_in => Err(AttrLiteralError::NeedsContext { mac: bump.alloc_str(name) }),
         "stringify" => {
             let input = stream.copy_in(inner, alloc).map_err(|_| AttrLiteralError::Malformed { index: at(open) })?;
             stringified(&input, alloc, value).map_err(|_| AttrLiteralError::Malformed { index: at(open) })
@@ -176,7 +178,7 @@ fn read_piece<'a>(
             work[first..].reverse();
             Ok(())
         }
-        other => Err(AttrLiteralError::NeedsContext { mac: leak_name(other, alloc) }),
+        other => Err(AttrLiteralError::NeedsContext { mac: bump.alloc_str(other) }),
     }
 }
 
@@ -222,13 +224,4 @@ fn call_path<'s>(stream: &'s TokenStream<'_>, start: usize, end: usize) -> Optio
     // (`$crate::concat!`, `my::stringify!`) names a macro only resolution can tell.
     let built_in = (segments == 1 && !rooted) || (segments == 2 && matches!(first, "core" | "std"));
     Some((last, i, built_in))
-}
-
-/// `name` copied into `alloc` for as long as it lives (an error's macro name outlives the
-/// lexed stream it was read from).
-fn leak_name<'a>(name: &str, alloc: Alloc<'a>) -> &'a str {
-    let mut bytes: AVec<'a, u8> = Vec::new_in(alloc);
-    bytes.extend_from_slice(name.as_bytes());
-    let bytes: &'a [u8] = bytes.leak();
-    core::str::from_utf8(bytes).expect("copied from a `str`")
 }

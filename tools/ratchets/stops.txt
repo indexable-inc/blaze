@@ -53,7 +53,7 @@ blaze-drive	157
 blaze-ed25519	58
 blaze-emit	1003
 blaze-engine	268
-blaze-expand	470
+blaze-expand	469
 blaze-export	273
 blaze-facts	2
 blaze-fetch	175
@@ -113,7 +113,7 @@ blaze-profile	737
 blaze-protocol	134
 blaze-queue	9
 blaze-radix	49
-blaze-real	154
+blaze-real	153
 blaze-reclaim	2
 blaze-record	7
 blaze-remote	217
@@ -123,7 +123,7 @@ blaze-rng	3
 blaze-roots	24
 blaze-run	273
 blaze-rungs	2
-blaze-scope	1710
+blaze-scope	1705
 blaze-screen	30
 blaze-script	91
 blaze-semver	9

@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 use blaze_hash::HashMap;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_ids::{Domain, Hasher};
-use blaze_own::{AVec, Alloc, Box};
+use blaze_own::{AVec, Alloc, Bump};
 use blaze_surface::{Binding, BindingState, Def, DefKind, Edition, Namespace, Visibility};
 
 use crate::crate_scope::Dep;
@@ -160,7 +160,7 @@ struct AskedNode<'a> {
 /// ([`encode`]) sorts and dedups it, so the bytes are a function of the questions alone.
 pub(crate) struct Asked<'a> {
     head: AtomicPtr<AskedNode<'a>>,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 }
 
 // SAFETY: a node is reached only through `head`; it is written once by the pushing worker before
@@ -172,12 +172,12 @@ unsafe impl Sync for Asked<'_> {}
 unsafe impl Send for Asked<'_> {}
 
 impl<'a> Asked<'a> {
-    pub(crate) fn new_in(alloc: Alloc<'a>) -> Asked<'a> {
+    pub(crate) fn new_in(alloc: Bump<'a>) -> Asked<'a> {
         Asked { head: AtomicPtr::new(ptr::null_mut()), alloc }
     }
 
     pub(crate) fn push(&self, question: Question<'a>) {
-        let node: *mut AskedNode<'a> = Box::leak(Box::new_in(AskedNode { question, next: ptr::null_mut() }, self.alloc));
+        let node: *mut AskedNode<'a> = self.alloc.alloc_val(AskedNode { question, next: ptr::null_mut() });
         let mut head = self.head.load(Ordering::Acquire);
         loop {
             // SAFETY: `node` is this worker's alone until the exchange below publishes it.
@@ -191,7 +191,7 @@ impl<'a> Asked<'a> {
 
     /// Every question pushed, in no particular order ([`encode`] sorts them).
     pub(crate) fn take(self) -> AVec<'a, Question<'a>> {
-        let mut out = AVec::new_in(self.alloc);
+        let mut out = AVec::new_in(self.alloc.alloc());
         let mut at = self.head.into_inner();
         while !at.is_null() {
             // SAFETY: every non-null pointer in the list is a published node of the arena `'a`,

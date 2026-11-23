@@ -163,7 +163,7 @@ fn inferred_outlives_and_implied_bounds() {
     let user = UserCrate { name: "ib", dir: "/ib/", root: "/ib/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, root.alloc()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
 
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");

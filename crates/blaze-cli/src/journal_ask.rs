@@ -476,7 +476,7 @@ fn converse<'f>(cx: &Cx, conn: &Conn, asking: &mut Asking, clock: &Clock, born: 
                     let mut told = Vec::new_in(frame);
                     match helper::decode_answer(body, &mut told) {
                         Ok(answer) => {
-                            names = told.leak();
+                            names = told.into_bump_slice();
                             asking.answered(answer)
                         }
                         Err(error) => {

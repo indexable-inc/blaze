@@ -30,7 +30,7 @@
 use core::fmt;
 
 use blaze_expand::{AttrLiteralError, attr_literal};
-use blaze_own::Alloc;
+use blaze_own::Bump;
 use blaze_surface::Edition;
 
 use super::lower::{head, string_value};
@@ -83,6 +83,6 @@ pub fn attr_string<'t>(content: &'t str) -> (Option<&'t str>, Option<AttrCall<'t
 /// The string `call`'s value expands to, lexed in the crate's `edition` and built in `alloc`
 /// (a `stringify!` of one name is a copy; a `concat!` is new text, so the answer lives in
 /// `alloc`, which outlives the text it is read beside).
-pub fn read_call<'t, 'a: 't>(call: AttrCall<'t>, edition: Edition, alloc: Alloc<'a>) -> Result<&'t str, AttrValueRefusal<'t>> {
+pub fn read_call<'t, 'a: 't>(call: AttrCall<'t>, edition: Edition, alloc: Bump<'a>) -> Result<&'t str, AttrValueRefusal<'t>> {
     attr_literal(call.expr, edition, alloc).map_err(|why| AttrValueRefusal { attr: call.attr, expr: call.expr, why })
 }

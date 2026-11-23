@@ -91,13 +91,13 @@ fn bisect_statics() {
         let user = UserCrate { name: "bisect", dir: "/bisect/", root: "/bisect/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
         let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
         let crates = inputs.crates();
-        let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
         let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
         let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
         let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
         let mut buckets = None;
-        let prepared = Prepares::new_in(blaze_own::testing::heap().alloc());
+        let prepared = Prepares::new_in(blaze_own::testing::bump());
         let lib = path_key(&names, Namespace::Values, &[name]).unwrap_or_else(|| panic!("`{name}` from the crate root"));
         let k = front.keys.item(lib).unwrap_or_else(|e| panic!("{name}'s key: {e:?}"));
         let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: None };
@@ -126,13 +126,13 @@ fn manifest_body_questions() {
     let user = UserCrate { name: "bisect", dir: "/bisect/", root: "/bisect/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
     let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
     let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let mut buckets = None;
-    let prepared = Prepares::new_in(blaze_own::testing::heap().alloc());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let lib = path_key(&names, Namespace::Values, &["MANIFEST"]).expect("`MANIFEST` from the crate root");
     // The keys a gap's key is compared with (KEY PROBE).
     let probes: Vec<(&str, Option<blaze_typeck::ItemKey>)> = [

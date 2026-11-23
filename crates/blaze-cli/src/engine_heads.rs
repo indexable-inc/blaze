@@ -1441,8 +1441,8 @@ fn listing_of(joined: crate::engine_listing_record::Joined<'static, 'static>, g:
         label: HeadLabel { want: Some(one.want), name: one.name, member: one.member, entry_name: one.entry_name, by: one.by },
     }));
     let mut one: Vec<Listing, Alloc<'static>> = Vec::with_capacity_in(1, g);
-    one.push(Listing { heads: heads.leak(), by_sig: by_sig.leak(), unlisted: rows.unlisted.leak(), calls: rows.calls.leak(), digest });
-    let one: &'static [Listing] = one.leak();
+    one.push(Listing { heads: heads.leak_static(), by_sig: by_sig.leak_static(), unlisted: rows.unlisted.leak_static(), calls: rows.calls.leak_static(), digest });
+    let one: &'static [Listing] = one.leak_static();
     &one[0]
 }
 
@@ -1663,7 +1663,7 @@ impl Listings {
             Ok(Some(bytes)) => {
                 let mut copy: Vec<u8, Alloc<'static>> = Vec::with_capacity_in(bytes.len(), self.heap.alloc());
                 copy.extend_from_slice(bytes);
-                Found::Bytes(copy.leak())
+                Found::Bytes(copy.leak_static())
             }
             Ok(None) => Found::Absent,
             Err(_) => Found::Fault,
@@ -1828,7 +1828,7 @@ impl Listings {
         let joined = listing_record::join(all, g);
         let mut bytes: Vec<u8, Alloc<'static>> = Vec::new_in(g);
         listing_record::encode_join(&joined, &mut bytes);
-        let bytes: &'static [u8] = bytes.leak();
+        let bytes: &'static [u8] = bytes.leak_static();
         let joined = listing_record::open_join(bytes, g).map_err(|_| LISTING_NOT_OPENED)?;
         self.made.fetch_add(1, Ordering::Relaxed);
         if Self::filed(records) > before {
@@ -1876,7 +1876,7 @@ impl Listings {
         });
         let mut bytes: Vec<u8, Alloc<'static>> = Vec::new_in(g);
         listing_record::encode_part(&rows, &mut bytes);
-        let bytes: &'static [u8] = bytes.leak();
+        let bytes: &'static [u8] = bytes.leak_static();
         let opened = listing_record::open_part(bytes, g).map_err(|_| LISTING_NOT_OPENED)?;
         self.parts_made.fetch_add(1, Ordering::Relaxed);
         match key {
@@ -3272,7 +3272,7 @@ fn crate_setup(
     let records = open_scope(cx, root, outlined, &job.crates, packs, corrected, procs, frame, g, snapshot)?;
     let mut lang: Vec<usize, Alloc<'static>> = Vec::with_capacity_in(job.lang.len(), g);
     lang.extend_from_slice(&job.lang);
-    let lang: &'static [usize] = lang.leak();
+    let lang: &'static [usize] = lang.leak_static();
     let mut sized = None;
     for at in lang.iter() {
         NamesSource::each_lang(records, *at, &mut |name, key| {
@@ -3293,7 +3293,7 @@ fn crate_setup(
     members.extend(job.crates.iter().filter(|one| subjects.binary_search_by(|row| row.prefix.cmp(&one.records.key.prefix())).is_ok()).map(|one| blaze_drive::key::crate_scope_name(&one.records.key)));
     members.sort_unstable();
     members.dedup();
-    let members: &'static [Name] = members.leak();
+    let members: &'static [Name] = members.leak_static();
     let setup_cell = |read: blaze_ladder::front2::tables::recorder::TableRead| -> Result<Option<CellId>, &'static str> {
         let id = if read.is_source() {
             crate::engine_head_consts::source_read(records, subjects, read).map_err(|unplaced| {
@@ -3334,7 +3334,7 @@ fn crate_setup(
     }
     let over = job.crates.first().filter(|one| one.records.key == crate_key).map(|one| &one.records).ok_or("its crate is not the first of the crates its records were opened over (run_names.rs `names_records`)")?;
     let listing = listings.listing(records, over, 0, crate_key, subjects)?;
-    Ok(CrateSetup { lang, sized, pointers, lang_reads: lang_reads.leak(), pointer_reads: pointer_reads.leak(), members, listing })
+    Ok(CrateSetup { lang, sized, pointers, lang_reads: lang_reads.leak_static(), pointer_reads: pointer_reads.leak_static(), members, listing })
 }
 
 /// One run of a member crate's head tasks (`tasks`, a split of `job`'s: [`split_count`]) on a
@@ -3385,7 +3385,8 @@ fn heads_of(
     let (freeze_names, eval_names) = (owned(), owned());
     let both = blaze_ladder::front2::tables::owned_reads::BothOwners { names: &freeze_names, evals: &eval_names };
     let shared = base.reading_into(&freeze_names);
-    let mut once_consts = crate::engine_heads_once::OnceConsts::new(base.reading_into(&eval_names), &index, g, once, job.prefix);
+    let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
+    let mut once_consts = crate::engine_heads_once::OnceConsts::new(base.reading_into(&eval_names), &index, bump, once, job.prefix);
     let mut source = SeededHeads::new(SeededHeadsOpts { names: shared, sized, pointers, frame, scratch: g, alloc: g, consts: Some(&mut once_consts as &mut dyn ConstValues<'_>), known: Some(once), owners: Some(&both) });
     let job_cx = crate::engine_heads_once::JobCx {
         base,

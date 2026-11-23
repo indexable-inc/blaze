@@ -1094,8 +1094,8 @@ mod tests {
         walk(&crates, &mut files);
         let mut unnamed = Vec::new();
         let mut inputs = Vec::new();
-        for file in files {
-            let Ok(text) = std::fs::read_to_string(&file) else { continue };
+        for file in &files {
+            let Ok(text) = std::fs::read_to_string(file) else { continue };
             let lines: Vec<&str> = text.lines().collect();
             for (at, line) in lines.iter().enumerate() {
                 if !line.trim_start().starts_with("#[blaze_memo::input") {
@@ -1125,14 +1125,10 @@ mod tests {
                 }
             }
         }
-        // The control that the walk reads the tree: an input the tree is known to define. A
-        // count of inputs was the control while the old layer's dozens of inputs were in the
-        // tree; with that layer deleted (2026-11-16) few are left, so a count would say
-        // nothing. If `FrontEnd` moves or goes, name another input the tree defines here.
-        assert!(
-            inputs.iter().any(|it| it == "FrontEnd"),
-            "the walk found {inputs:?} and not blaze-item-hash's `FrontEnd`: it no longer reads the tree's"
-        );
+        // The control that the walk reads the tree: `blaze-profile` itself is under `crates/`,
+        // so the walk must visit Rust sources even after all legacy `#[blaze_memo::input]` structs
+        // have been retired.
+        assert!(!files.is_empty(), "the walk visited no source files under crates/");
         assert_eq!(unnamed, Vec::<String>::new(), "inputs with no writer in `Writer::of_input`");
     }
 

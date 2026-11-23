@@ -35,8 +35,8 @@ use bstd::procs::By;
 
 const MB: u64 = 1 << 20;
 
-/// The planted leak's bytes: 10 MB.
-const LEAK: usize = 10 << 20;
+/// The planted leak's bytes: 32 MB (large enough to stay well above concurrent test heap noise).
+const LEAK: usize = 32 << 20;
 
 /// The number after `label` in `line`.
 fn number_after(line: &str, label: &str) -> i64 {

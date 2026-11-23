@@ -130,7 +130,7 @@ impl LoadItems<'static> for Loaded {
         }
     }
 
-    fn file_items(&self, krate: usize, index: u32, path: PackagePath<'_>, _: blaze_id::ContentId, edition: blaze_surface::Edition, alloc: Alloc<'static>) -> Result<Option<CurrentFile<'static>>, ItemsRecordError> {
+    fn file_items(&self, krate: usize, index: u32, path: PackagePath<'_>, _: blaze_id::ContentId, edition: blaze_surface::Edition, alloc: blaze_own::Bump<'static>) -> Result<Option<CurrentFile<'static>>, ItemsRecordError> {
         let Some(file) = self.names.get(krate).and_then(|names| names.files.get(index as usize)) else { return Ok(None) };
         assert_eq!(file.package, path);
         if let Some((k, p, text)) = self.changed && k == krate && p == file.path {
@@ -335,14 +335,14 @@ fn ask(fresh: &Names<'static>, read: &RecordItems<'static, Loaded>, all: &[&'sta
 /// A file changed under the record: any item of it must be refused as stale, never answered
 /// with its old range of the new text.
 fn stale(tape: &Tape, records: &[&'static [u8]], all: &[&'static CrateNames<'static>], keys: &[CrateItemKey]) -> Result<(), Broke> {
-    let g = Alloc::global();
+    let bump = super::SyncFrame::leaked();
     let k = tape.index(all.len(), "changed crate");
     let n = all[k];
     let file = tape.index(n.files.len(), "changed file");
     let f = n.files[file];
     // A new outline entry changes the file's surface and must refuse the old names record.
     let now = leak(format!("{}\nfn added_after_solve() {{}}\n", f.text));
-    let read = RecordItems::new(keys, Loaded { records: records.to_vec(), names: all.to_vec(), changed: Some((k, f.path, now)) }, g);
+    let read = RecordItems::new(keys, Loaded { records: records.to_vec(), names: all.to_vec(), changed: Some((k, f.path, now)) }, bump);
     let mut items: Vec<ItemKey> = n.tables.texts.iter().filter(|(_, t)| t.1 == At::File(file as u32)).map(|(key, _)| *key).collect();
     items.sort_unstable();
     let Some(&item) = items.first() else { return Ok(()) };
@@ -365,10 +365,11 @@ fn stale(tape: &Tape, records: &[&'static [u8]], all: &[&'static CrateNames<'sta
 }
 
 fn case(tape: &Tape, plant: Plant) -> Result<(), Broke> {
-    let g = Alloc::global();
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
     let specs = draw(tape);
     let (texts, inputs) = world(&specs);
-    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Serial, &Ready::serial(WAIT), g).map_err(|e| Broke::Harness(format!("solve: {e:?}")))?;
+    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Serial, &Ready::serial(WAIT), bump).map_err(|e| Broke::Harness(format!("solve: {e:?}")))?;
     let all: Vec<&'static CrateNames<'static>> = solved.iter().map(|s| s.names).collect();
     let fresh = Names::of_crates(&inputs, Sysroot::default(), &all, g).map_err(|e| Broke::Harness(format!("names: {e:?}")))?;
     PLANT.with(|p| p.set(plant));
@@ -380,10 +381,10 @@ fn case(tape: &Tape, plant: Plant) -> Result<(), Broke> {
             if a != b {
                 return Err(differs(format!("`{}` encodes to different bytes twice", n.name)));
             }
-            records.push(aligned(&a, g));
+            records.push(aligned(&a, bump));
         }
         let keys: Vec<CrateItemKey> = all.iter().map(|n| n.key).collect();
-        let read = RecordItems::new(&keys, Loaded { records: records.clone(), names: all.clone(), changed: None }, g);
+        let read = RecordItems::new(&keys, Loaded { records: records.clone(), names: all.clone(), changed: None }, bump);
         ask(&fresh, &read, &all)?;
         stale(tape, &records, &all, &keys)
     })();
@@ -422,11 +423,14 @@ fn a_body_only_edit_keeps_the_items_record_bytes() {
     let after = solve_one(leak(format!("#![no_core]\nfn f() {{ let rustc_attrs = 100; rustc_attrs }}{tail}")), None);
     assert_eq!(before.files[0].outline.surface(), after.files[0].outline.surface());
     assert_ne!(before.files[0].text.len(), after.files[0].text.len());
-    let g = Alloc::global();
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let bump = erased.bump();
+    let g = bump.alloc();
     let first = encode(before, g).unwrap_or_else(|e| panic!("encode before: {e:?}"));
     let second = encode(after, g).unwrap_or_else(|e| panic!("encode after: {e:?}"));
     assert_eq!(first, second, "a body-only edit changed the items record bytes");
-    let record = one_file(aligned(&first, g), after.files[0].text, g);
+    let record = one_file(aligned(&first, bump), after.files[0].text, bump);
     for (&key, (item, at)) in after.tables.texts.iter() {
         if !matches!(at, At::File(_)) { continue; }
         let row = record.item(key).expect("read joined row").expect("present item");
@@ -441,15 +445,15 @@ fn a_body_only_edit_keeps_the_items_record_bytes() {
 }
 
 /// Open a single-file fixture with the same indexed join used by a multi-file loader.
-pub(super) fn one_file<'a>(bytes: &'a [u8], text: &'a str, alloc: Alloc<'a>) -> ItemsRecord<'a> {
-    ItemsRecord::open_with_files(bytes, alloc, move |index, _, _, edition| {
+pub(super) fn one_file<'a>(bytes: &'a [u8], text: &'a str, alloc: blaze_own::Bump<'a>) -> ItemsRecord<'a> {
+    ItemsRecord::open_with_files(bytes, alloc.alloc(), move |index, _, _, edition| {
         assert_eq!(index, 0);
         CurrentFile::from_text(index, text, edition, alloc).map(Some)
     }).expect("open the single-file fixture")
 }
 
 pub(super) fn solve_one(text: &'static str, sub: Option<&'static str>) -> &'static CrateNames<'static> {
-    let g = Alloc::global();
+    let g = super::SyncFrame::leaked();
     let mut of_crate = std::vec![("/k0/lib.rs", text)];
     of_crate.extend(sub.map(|s| ("/k0/sub.rs", s)));
     let texts: &'static Texts = std::boxed::Box::leak(std::boxed::Box::new(Texts(Vec::leak(std::vec![&*Vec::leak(of_crate)]))));
@@ -498,10 +502,11 @@ pub type Al<'p, T> = Mixed<T, 'p, 1, 'p>;
 pub fn free<'f>(x: &'f u8) -> &'f u8 { x }
 impl<'i> Tr<'i> for Z { type Gat<'g, 'h> = u8; type Plain = u8; fn f(&self) {} }
 ";
-    let g = Alloc::global();
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
     let n = solve_one(TEXT, None);
-    let bytes = aligned(&encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")), g);
-    let read = RecordItems::new(&[n.key], Loaded { records: std::vec![bytes], names: std::vec![n], changed: None }, g);
+    let bytes = aligned(&encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")), bump);
+    let read = RecordItems::new(&[n.key], Loaded { records: std::vec![bytes], names: std::vec![n], changed: None }, bump);
     let r = read.record(0).unwrap_or_else(|| panic!("no record"));
     let key_of = |name: &str| -> ItemKey {
         (0..r.items())
@@ -581,10 +586,11 @@ unsafe impl<T> Gen<[T; 2]> for m::Other<T> {}
         ("impl !Tr for G<S>", Some("Tr"), true, SelfHead::Path, Some("G"), true),
         ("unsafe impl<T> Gen<[T; 2]> for m::Other<T>", Some("Gen"), false, SelfHead::Path, Some("m::Other"), false),
     ];
-    let g = Alloc::global();
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
     let n = solve_one(TEXT, None);
-    let bytes = aligned(&encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")), g);
-    let read = RecordItems::new(&[n.key], Loaded { records: std::vec![bytes], names: std::vec![n], changed: None }, g);
+    let bytes = aligned(&encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")), bump);
+    let read = RecordItems::new(&[n.key], Loaded { records: std::vec![bytes], names: std::vec![n], changed: None }, bump);
     let r = read.record(0).unwrap_or_else(|| panic!("no record"));
     assert!(r.impls() == want.len(), "{} impl rows for {} impls", r.impls(), want.len());
     let mut inherent_done = false;

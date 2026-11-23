@@ -15,7 +15,7 @@
 use core::fmt;
 
 use blaze_expand::{Delim, TokenKind, TokenStream};
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, BVec, Bump};
 
 use crate::expansion_origins::offset_in;
 
@@ -170,8 +170,8 @@ impl<'t> ExpansionTokens<'t> {
     /// "no `assert` in `crate`" in every tempo member asserting (2026-11-17 g105938, 27 names).
     /// The Reference, "Macros By Example", "Hygiene": `$crate` names the crate of the macro that
     /// wrote it wherever its tokens end up.
-    pub fn moved(&self, text: &'t str, copies: &[crate::crate_roots::Copied], alloc: Alloc<'t>) -> ExpansionTokens<'t> {
-        let mut places: AVec<'t, (u32, u32, u32)> = AVec::new_in(alloc);
+    pub fn moved(&self, text: &'t str, copies: &[crate::crate_roots::Copied], alloc: Bump<'t>) -> ExpansionTokens<'t> {
+        let mut places: BVec<'t, (u32, u32, u32)> = BVec::new_in(alloc);
         for copy in copies {
             let end = copy.from.saturating_add(copy.len);
             let first = self.places.partition_point(|p| p.0 < copy.from);
@@ -181,7 +181,7 @@ impl<'t> ExpansionTokens<'t> {
                 }
             }
         }
-        ExpansionTokens { stream: self.stream, text, places: places.leak(), words: self.words }
+        ExpansionTokens { stream: self.stream, text, places: places.into_bump_slice(), words: self.words }
     }
 }
 

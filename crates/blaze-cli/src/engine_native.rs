@@ -264,7 +264,7 @@ fn send_of<'w>(cx: &Cx, key: Key, payload: &[u8], crates: &[CrateIn<'_>], platfo
     let erased = blaze_own::Erased::new(scratch);
     let alloc = erased.handle();
     // Every crate's exports, each by its platform spelling (the names table's), read once.
-    let mut exports: Vec<(&[u8], blaze_id::ItemKey), &Frame> = Vec::new_in(scratch);
+    let mut exports: Vec<(AVec<'_, u8>, blaze_id::ItemKey), &Frame> = Vec::new_in(scratch);
     for c in crates.iter() {
         let links = match native_links::open_table(c.table, alloc) {
             Ok(Table::Links(links)) => links,
@@ -273,14 +273,14 @@ fn send_of<'w>(cx: &Cx, key: Key, payload: &[u8], crates: &[CrateIn<'_>], platfo
         };
         for export in links.exports.iter() {
             let mangled = blaze_native::resolve::mangle(platform, export.name, alloc).map_err(|why| refused(bstd::mem::format_in!(scratch, "the export `{}`: {why:?}", export.name).as_str()))?;
-            exports.push((mangled.leak(), export.item));
+            exports.push((mangled, export.item));
         }
     }
     let mut words: Vec<blaze_launch::wire::run::Symbol, &'w Frame> = Vec::with_capacity_in(names.len(), ask.words);
     let mut items: Vec<blaze_id::ItemKey, &'w Frame> = Vec::with_capacity_in(names.len(), ask.words);
     for i in 0..names.len() {
         let Some(name) = names.get(i) else { return Err(refused("a word's name is past its table")) };
-        let found = exports.iter().find(|(spelled, _)| *spelled == name).map(|(_, item)| *item);
+        let found = exports.iter().find(|(spelled, _)| spelled.as_slice() == name).map(|(_, item)| *item);
         let Some(item) = found else {
             return Err(refused(bstd::mem::format_in!(scratch, "word {i} `{}` is no crate's export", core::str::from_utf8(name).unwrap_or("(not UTF-8)")).as_str()));
         };
@@ -299,7 +299,7 @@ fn send_of<'w>(cx: &Cx, key: Key, payload: &[u8], crates: &[CrateIn<'_>], platfo
     if dir.stat(cx, &name).map_err(|why| refused(bstd::mem::format_in!(scratch, "{why}").as_str()))?.is_none() {
         dir.publish(cx, &name, bstd::fs::Content::bytes(payload), bstd::fs::Durable::No).map_err(|why| refused(bstd::mem::format_in!(scratch, "the library's file: {why}").as_str()))?;
     }
-    Ok(Some(NativeSend { library: blaze_launch::wire::RecordId(key.0.0), hex: held(hex.as_str(), ask), words: words.leak(), items: items.leak() }))
+    Ok(Some(NativeSend { library: blaze_launch::wire::RecordId(key.0.0), hex: held(hex.as_str(), ask), words: words.into_bump_slice(), items: items.into_bump_slice() }))
 }
 
 /// 32 bytes as 64 lowercase hex digits.
@@ -713,7 +713,7 @@ pub(crate) fn image_in<'w>(
             Some(script) => match native_image::script_outputs(script.payload, ask.home) {
                 Ok((opened, area)) => {
                     // Held in the scratch frame for as long as the link reads the outputs.
-                    let area: &blaze_world::StoredFiles = blaze_own::Box::leak(blaze_own::Box::new_in(area, scratch));
+                    let area: &blaze_world::StoredFiles = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(area, scratch));
                     outputs.push(Some((script.out, opened.with_area(area))));
                 }
                 Err(why) => return Err(NativeError::Script { package: held(c.package, ask), script: script.name, why }),
@@ -733,7 +733,7 @@ pub(crate) fn image_in<'w>(
         Err(error) => return Err(NativeError::Link { what: "the program's native key", words: held(bstd::mem::format_in!(scratch, "{error:?}").as_str(), ask) }),
     };
     let mut image = AVec::new_in(alloc);
-    if let Err(error) = native_links::program_image(&linked, &installs, platform, &ask.producer, blaze_hash::FixedState, &mut image, alloc) {
+    if let Err(error) = native_links::program_image(&linked, &installs, platform, &ask.producer, blaze_hash::FixedState, &mut image, erased.bump()) {
         return Err(NativeError::Link { what: "the program's native image", words: held(bstd::mem::format_in!(scratch, "{error:?}").as_str(), ask) });
     }
     // What it read, in link order: each crate's table (by its digest) and its script's run.
@@ -777,7 +777,7 @@ fn stubs_read<'s, 'w>(cx: &Cx, asked: &[Asked<'s>], sdk: Option<blaze_apple_sdk:
             Err(error) => return Err(unread(bstd::mem::format_in!(scratch, "{error}").as_str())),
         }
         // Held in the scratch frame for as long as the link reads the install name.
-        let bytes: &'s bstd::mem::Bytes<'s> = blaze_own::Box::leak(blaze_own::Box::new_in(bytes, scratch));
+        let bytes: &'s bstd::mem::Bytes<'s> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(bytes, scratch));
         installs.push(at.linked(bytes.as_slice()).map_err(|why| refused(StubWhy::Form(why)))?);
     }
     Ok(installs)

@@ -245,7 +245,7 @@ impl Reader {
         self.root.read_all(self.cx, &at, &mut bytes).ok()?;
         // Held to the end of the command, in the names frame: the bytes and their header both
         // (the header was a box of the global heap until 2026-11-21).
-        let held: &'static Bytes<'static> = blaze_own::Box::leak(blaze_own::Box::new_in(bytes, self.frame));
+        let held: &'static Bytes<'static> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(bytes, self.frame));
         Some(held.as_slice())
     }
 }
@@ -309,7 +309,7 @@ impl<'b> Records<'b> for Folder {
         // package and key: no world is made, and the units stage says why (engine_units.rs).
         let mapping = self.store.map_read(self.cx, &path).ok()?;
         // Held to the end of the command: the world and every reader of its packs borrow it.
-        let mapping: &'static blaze_core::Mapping = blaze_own::Box::leak(blaze_own::Box::new_in(mapping, self.heap));
+        let mapping: &'static blaze_core::Mapping = blaze_own::Box::leak_static(blaze_own::Box::new_in(mapping, self.heap));
         let bytes: &'static [u8] = mapping.bytes();
         self.opened.records_mapped.set(self.opened.records_mapped.get().saturating_add(1));
         self.opened.mapped_bytes.set(self.opened.mapped_bytes.get().saturating_add(bytes.len() as u64));
@@ -401,7 +401,8 @@ impl core::fmt::Display for Unwritten {
 /// payload. `kept` holds findings that leave the worker with the crate's record.
 /// `waits`: what in the crate waits on a failed dependency (names/scope.rs `resolve_metered`,
 /// blaze-scope waits_on.rs); such a path is counted, not found (plan row A8).
-fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name: &str, waits: &blaze_scope::waits_on::WaitsOn<'_, 'a>, alloc: Alloc<'a>, kept: blaze_own::SharedAlloc<'static>) -> Result<ScopeRecord, Unwritten> {
+fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name: &str, waits: &blaze_scope::waits_on::WaitsOn<'_, 'a>, bump: blaze_own::Bump<'a>, kept: blaze_own::SharedAlloc<'static>) -> Result<ScopeRecord, Unwritten> {
+    let alloc = bump.alloc();
     let unwritten = |section: &'static str, why: std::string::String| Unwritten { crate_name: crate_name.into(), section, why };
     let mut findings = PathFindings::new_in(kept);
     let unresolved = done.names.notes.len() as u32 + unresolved(done.names, waits, &mut findings);
@@ -452,7 +453,7 @@ fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name:
     // task"): a refused table is written as its refusal (state 1), so only a program that links
     // the crate fails; an error here is a table that could not be written at all.
     let mut links = blaze_own::AVec::new_in(alloc);
-    blaze_ladder::native_links::scope_table(done.names, &mut links, alloc).map_err(|error| unwritten("link table", std::format!("{error:?}")))?;
+    blaze_ladder::native_links::scope_table(done.names, &mut links, bump).map_err(|error| unwritten("link table", std::format!("{error:?}")))?;
     // The cell table (drive.md, "Names at module grain" point 3): what a reader by cell is
     // checked against, over the two records above and, whole, the names, the items and the
     // expansions. Each section a reader can read whole (`NameCell::Whole`) is a row: a body's
@@ -463,7 +464,7 @@ fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name:
         (blaze_scope::names_cells::Section::Items, &items_record[..]),
         (blaze_scope::names_cells::Section::Expansions, expansions),
     ];
-    let cells = blaze_scope::names_cells::crate_table(done.names, &names_record, &items_record, &wholes, alloc).map_err(|error| unwritten("cell table", std::format!("{error:?}")))?;
+    let cells = blaze_scope::names_cells::crate_table(done.names, &names_record, &items_record, &wholes, bump).map_err(|error| unwritten("cell table", std::format!("{error:?}")))?;
     let payload = sections::write(unresolved, [&done.record[..], &done.inner[..], &names_record[..], &items_record[..], tests, expansions, &links[..], &cells[..]]);
     #[cfg(test)]
     sections::watch_tests(crate_name, &payload, tests);
@@ -750,7 +751,7 @@ impl<'f> Maker<'f> {
         for (id, dir) in members.iter() {
             held.push((*id, crate::work::held_str(dir.as_str(), frame)));
         }
-        Maker { record, out, lock, members: held.leak() }
+        Maker { record, out, lock, members: held.into_bump_slice() }
     }
 }
 
@@ -1239,7 +1240,7 @@ pub(crate) fn world<'f>(
     let made = make_world(cx, root, graph_record, lock, &dirs, env)?;
     let list: &'static [u8] = {
         let _cx = cx.span("names: the crate list written");
-        blaze_world::crate_list::encode_with(&made.world, &made, heap).map_err(NamesError::List)?.leak()
+        blaze_world::crate_list::encode_with(&made.world, &made, heap).map_err(NamesError::List)?.leak_static()
     };
     let names = Names::of_list(list, None, heap)?;
     // THE ORACLE, under test (names.rs `differences_from`): every answer the planners take from
@@ -1277,7 +1278,7 @@ fn make_world<'f>(
     let Some(home) = env.home else { return Err(NamesError::NoHome) };
     // Each step of the making under its own span (engine.md item 2: the read back's 180 ms on
     // tempo had no span below "names: make the world"), its counts in `opened`.
-    let opened: &'static Opened = blaze_own::Box::leak(blaze_own::Box::new_in(Opened::default(), heap));
+    let opened: &'static Opened = blaze_own::Box::leak_static(blaze_own::Box::new_in(Opened::default(), heap));
     let decoded = {
         let _cx = cx.span("names: the unit graph decoded");
         opened.graph_decodes.set(opened.graph_decodes.get().saturating_add(1));
@@ -1330,29 +1331,30 @@ fn make_world<'f>(
             return Err(NamesError::PathNotMember { package: String::from(package.name.as_str()), dependent });
         };
         // Held to the end of the command, in the names frame, as the files read under it are.
-        let held: &'static blaze_own::String<&'static Frame> = blaze_own::Box::leak(blaze_own::Box::new_in(blaze_own::String::from_str_in(dir, frame), frame));
-        paths.push((id, held.as_str()));
+        let held: &'static str = frame.alloc_str(dir);
+        paths.push((id, held));
     }
     let paths: &'f [(LockId, &'static str)] = std::vec::Vec::leak(paths);
     let checkout: &'f ReadTree = std::boxed::Box::leak(std::boxed::Box::new(ReadTree(reader)));
-    let mut fetched = Fetched { store: sources, paths, lock: lock_whole, alloc: heap };
+    let bump: blaze_own::Bump<'static> = frame.alloc(blaze_own::Erased::new(frame)).bump();
+    let mut fetched = Fetched { store: sources, paths, lock: lock_whole, alloc: bump };
     // Every place the world is told, kept for the proc-macro runner (proc_callers.rs).
     let mut packages = crate::proc_callers::Placing::new(&mut fetched, alloc);
     // The crate list (blaze-scope's units list, the one home) and the toolchain crates it needs.
     // Placing a member asks only its directory; the fetched packages are placed by the world.
     let listed = {
         let _cx = cx.span("names: the crate list and the toolchain's packs opened");
-        blaze_world::open_list(&mut shelf, env.toolchain, crate::graph::TRIPLE, graph, lock, &mut packages, heap).map_err(|e| match e {
+        blaze_world::open_list(&mut shelf, env.toolchain, crate::graph::TRIPLE, graph, lock, &mut packages, bump).map_err(|e| match e {
             WorldError::Toolchain(_) => NamesError::Toolchain(std::format!("{e}")),
             other => NamesError::World(std::format!("{other}")),
         })?
     };
-    let listed: &'f Listed<'f, crate::toolchain::Held<'static>> = blaze_own::Box::leak(blaze_own::Box::new_in(listed, heap));
+    let listed: &'f Listed<'f, crate::toolchain::Held<'static>> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(listed, frame));
     // Every fetched package placed: its record mapped ([`Folder`]), its rows checked, its manifest
     // laid out (blaze-unit-graph sources.rs `locate`), its crates keyed in order.
     let world = {
         let _cx = cx.span("names: the packages placed and the world made");
-        blaze_world::world(graph, lock, listed, &mut packages, checkout, heap).map_err(|e| NamesError::World(std::format!("{e}")))?
+        blaze_world::world(graph, lock, listed, &mut packages, checkout, bump).map_err(|e| NamesError::World(std::format!("{e}")))?
     };
     let placed = packages.finish();
     let _cx = cx.span("names: the world's public crates and scripts");

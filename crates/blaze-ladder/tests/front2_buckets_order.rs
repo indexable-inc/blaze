@@ -167,7 +167,7 @@ fn names() -> &'static Names<'static> {
         input("b", "/b/lib.rs", &[("core", CORE_AT)]),
     ];
     let sysroot = Sysroot { core: Some(CrateId(CORE_AT as u32)), alloc: None, std: None, bstd: None };
-    let names = resolve_crates(&crates, sysroot, &Texts, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, sysroot, &Texts, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     Box::leak(Box::new(names))
 }
 
@@ -203,8 +203,8 @@ fn records() -> &'static Records<'static> {
     let mut crate_names: Vec<&'static str> = Vec::new();
     let mut keys: Vec<CrateItemKey> = Vec::new();
     for c in names.crates().iter() {
-        kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), g));
-        kept.items.push(aligned(&items_record::encode(c, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), g));
+        kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
+        kept.items.push(aligned(&items_record::encode(c, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
         kept.files.push(c.files.iter().map(|f| (f.package.as_str().to_string(), f.text)).collect());
         crate_names.push(c.name);
         keys.push(c.key);

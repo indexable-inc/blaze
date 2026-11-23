@@ -665,10 +665,10 @@ fn fixture(frame: &'static Frame, a: Alloc<'static>, text: &str) -> Fixture {
     let keys: &'static [CrateItemKey] = frame.alloc_slice_copy(&[krate.key]);
     let name: &'static str = frame.alloc_str(krate.name);
     let crate_names: &'static [&'static str] = frame.alloc_slice_copy(&[name]);
-    let names = inputs.resolve(&crates, a).unwrap_or_else(|e| panic!("the fixture's one solve: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("the fixture's one solve: {e}"));
     let [c] = names.crates() else { panic!("{} solved crates (one wanted)", names.crates().len()) };
-    let names_bytes = aligned(&names_record::encode(c, a).unwrap_or_else(|e| panic!("the names record: {e:?}")), a);
-    let items_bytes = aligned(&items_record::encode_with(c, &names, a).unwrap_or_else(|e| panic!("the items record: {e:?}")), a);
+    let names_bytes = aligned(&names_record::encode(c, a).unwrap_or_else(|e| panic!("the names record: {e:?}")), blaze_own::testing::bump());
+    let items_bytes = aligned(&items_record::encode_with(c, &names, a).unwrap_or_else(|e| panic!("the items record: {e:?}")), blaze_own::testing::bump());
     let [file] = c.files.as_slice() else { panic!("{} files (one wanted)", c.files.len()) };
     // Each call's made text and origins (tests/const_fn_pointers.rs `made_origins`: a text the
     // solve rewrote or could not place keeps no origins).

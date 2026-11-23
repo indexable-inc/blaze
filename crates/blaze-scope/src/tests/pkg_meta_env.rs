@@ -87,8 +87,10 @@ fn the_metadata_round_trips_through_facts_and_a_script_pair_shadows_it() {
     let env = CrateEnv::of(EnvFacts { build_script: true, script: Some(record), ..facts(SeenRoot::Package, Some(META)) }, alloc).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(env.get("CARGO_PKG_AUTHORS"), Ok(Some("from-script")), "the script's pair is given after cargo's");
     assert_eq!(env.facts().meta, Some(META), "the facts keep the manifest's value, not the script's");
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
     let again = CrateEnv::of(env.facts(), alloc).unwrap_or_else(|e| panic!("{e}"));
-    let copy = env.clone_in(alloc).unwrap_or_else(|e| panic!("{e:?}"));
+    let copy = env.clone_in(erased.bump()).unwrap_or_else(|e| panic!("{e:?}"));
     for (name, _) in META.pairs() {
         assert_eq!(again.get(name), env.get(name), "{name}");
         assert_eq!(copy.get(name), env.get(name), "{name}");

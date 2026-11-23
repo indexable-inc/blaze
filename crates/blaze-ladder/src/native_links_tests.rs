@@ -10,14 +10,14 @@
 use blaze_hash::FixedState;
 use blaze_ids::producer::{Producers, Whole};
 use blaze_native::Platform;
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, Bump};
 
 use super::{ProgramCrate, Source, Table, open_table, program_image, program_key, program_libraries, table_digest, write_table};
 use crate::front2::links::{CrateLinks, LinkKind, text_links};
 
-fn table_of<'a>(text: &'a str, alloc: Alloc<'a>) -> AVec<'a, u8> {
-    let links = text_links("app", text, &[], alloc).unwrap_or_else(|e| panic!("the text's links: {e:?}"));
-    let mut out = AVec::new_in(alloc);
+fn table_of<'a>(text: &'a str, bump: Bump<'a>) -> AVec<'a, u8> {
+    let links = text_links("app", text, &[], bump).unwrap_or_else(|e| panic!("the text's links: {e:?}"));
+    let mut out = AVec::new_in(bump.alloc());
     write_table(&links, &mut out).unwrap_or_else(|e| panic!("the table writes: {e:?}"));
     out
 }
@@ -42,8 +42,9 @@ fn a_links_table_holds_link_z_and_a_no_mangle_export() {
     // The test's one allocator, made at its top: a frame, its memory from the OS.
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
     let erased = blaze_own::Erased::new(&frame);
-    let alloc = erased.handle();
-    let table = table_of(ONE_LINK, alloc);
+    let bump = erased.bump();
+    let alloc = bump.alloc();
+    let table = table_of(ONE_LINK, bump);
     let links = links_of(&table, alloc);
     assert_eq!(links.decls.len(), 1, "one #[link]");
     assert_eq!((links.decls[0].name, links.decls[0].kind), ("z", LinkKind::Dylib));
@@ -70,7 +71,8 @@ fn a_private_no_mangle_fn_moves_the_table_a_body_edit_does_not() {
     // The test's one allocator, made at its top: a frame, its memory from the OS.
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
     let erased = blaze_own::Erased::new(&frame);
-    let alloc = erased.handle();
+    let bump = erased.bump();
+    let alloc = bump.alloc();
     let body = "#[link(name = \"z\")]\nextern \"C\" { fn deflate(); }\n\
                 #[unsafe(no_mangle)] pub extern \"C\" fn rust_cb() -> i32 { let two = 2; two - 1 }\n";
     let private_fn = "#[link(name = \"z\")]\nextern \"C\" { fn deflate(); }\n\
@@ -78,10 +80,10 @@ fn a_private_no_mangle_fn_moves_the_table_a_body_edit_does_not() {
     let private_export = "#[link(name = \"z\")]\nextern \"C\" { fn deflate(); }\n\
                           #[unsafe(no_mangle)] pub extern \"C\" fn rust_cb() -> i32 { 1 }\n\
                           #[unsafe(no_mangle)] extern \"C\" fn hidden() {}\n";
-    let base = table_digest(&table_of(ONE_LINK, alloc));
-    assert_eq!(base, table_digest(&table_of(body, alloc)), "a body edit moved the table");
-    assert_eq!(base, table_digest(&table_of(private_fn, alloc)), "a private fn without an export moved the table");
-    let moved = table_of(private_export, alloc);
+    let base = table_digest(&table_of(ONE_LINK, bump));
+    assert_eq!(base, table_digest(&table_of(body, bump)), "a body edit moved the table");
+    assert_eq!(base, table_digest(&table_of(private_fn, bump)), "a private fn without an export moved the table");
+    let moved = table_of(private_export, bump);
     let links = links_of(&moved, alloc);
     let exports: std::vec::Vec<&str> = links.exports.iter().map(|e| e.name).collect();
     assert!(exports.contains(&"hidden"), "the private export is in the table: {exports:?}");
@@ -98,15 +100,15 @@ fn a_program_with_no_c_input_gets_a_system_only_image() {
     // The test's one allocator, made at its top: a frame, its memory from the OS.
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
     let erased = blaze_own::Erased::new(&frame);
-    let alloc = erased.handle();
+    let bump = erased.bump();
+    let alloc = bump.alloc();
     let producers = Producers::for_tests(b"native_links");
     let producer = producers.get::<Whole>();
     let plain = "pub fn main() { let _ = 1 + 1; }\n";
-    let table = table_of(plain, alloc);
+    let table = table_of(plain, bump);
     let links = links_of(&table, alloc);
     assert!(links.decls.is_empty() && links.foreign.is_empty() && links.exports.is_empty());
-    let links: &CrateLinks<'_> = blaze_own::Box::leak(blaze_own::Box::new_in(links, alloc));
-    let crates = [ProgramCrate { package: "app", outputs: None, links }];
+    let crates = [ProgramCrate { package: "app", outputs: None, links: &links }];
     // The one library asked, `c`, resolved as the SDK's `usr/lib/libc.tbd` (libSystem's) states it.
     let asked = program_libraries(&crates, Platform::MacosArm64, &producer, alloc).unwrap_or_else(|e| panic!("the libraries: {e:?}"));
     let [one] = asked.as_slice() else { panic!("a program with no C input asks for `c` alone: {asked:?}") };
@@ -115,7 +117,7 @@ fn a_program_with_no_c_input_gets_a_system_only_image() {
     let installs = [at.linked(stub).unwrap_or_else(|e| panic!("the stub: {e}"))];
     let key = program_key(&crates, &installs, Platform::MacosArm64, &producer, alloc).unwrap_or_else(|e| panic!("the key: {e:?}"));
     let mut bytes = AVec::new_in(alloc);
-    let summary = program_image(&crates, &installs, Platform::MacosArm64, &producer, FixedState, &mut bytes, alloc)
+    let summary = program_image(&crates, &installs, Platform::MacosArm64, &producer, FixedState, &mut bytes, bump)
         .unwrap_or_else(|e| panic!("a program with no C input is refused: {e:?}"));
     assert_eq!(summary.inputs, 0, "no archive or object on the link line");
     assert!(!bytes.is_empty(), "no empty case: the image is written");

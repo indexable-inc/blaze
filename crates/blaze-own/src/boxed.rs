@@ -180,14 +180,33 @@ impl<T: ?Sized, A: Allocator> Box<T, A> {
     }
 
     /// Gives up the value for as long as the allocator lives; nothing is dropped or freed.
-    pub fn leak<'a>(b: Box<T, A>) -> &'a mut T
+    /// Freezes a bump-allocated box into a mutable reference tied to the arena's lifetime `'a`.
+    ///
+    /// Only compiles for bulk-reclaimed [`BumpAlloc`](crate::BumpAlloc) arenas (`&Frame`,
+    /// `ArenaLocal`, `&Inline`, `Bump<'a>`) — never `Global` or `Heap`.
+    #[inline]
+    pub fn into_bump_ref<'a>(b: Box<T, A>) -> &'a mut T
     where
-        A: 'a,
+        A: crate::BumpAlloc + 'a,
     {
         let (mut ptr, alloc) = Box::into_non_null_with_allocator(b);
-        // The allocator is forgotten with the block, so nothing it does on drop can free it.
         core::mem::forget(alloc);
-        // SAFETY: the value is live and never freed; nothing else refers to it.
+        // SAFETY: `A: BumpAlloc + 'a` guarantees the value lives for `'a` and its backing block is
+        // reclaimed in bulk when the arena drops; nothing else aliases `ptr`.
+        unsafe { ptr.as_mut() }
+    }
+
+    /// Permanently leaks a `'static`-backed box for the remainder of the process.
+    ///
+    /// Only valid for intentional process-lifetime OS hooks (such as an installed unwind
+    /// registry). For scoped arenas, use [`Box::into_bump_ref`] instead.
+    pub fn leak_static(b: Box<T, A>) -> &'static mut T
+    where
+        A: 'static,
+    {
+        let (mut ptr, alloc) = Box::into_non_null_with_allocator(b);
+        core::mem::forget(alloc);
+        // SAFETY: the box and its allocator are forgotten, so the value lives for `'static`.
         unsafe { ptr.as_mut() }
     }
 }

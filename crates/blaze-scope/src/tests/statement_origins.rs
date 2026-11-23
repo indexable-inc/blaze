@@ -47,9 +47,10 @@ impl<'a> SourceTexts<'a> for One {
 fn a_statement_calls_items_have_the_calls_origins() {
     let frame = Frame::new(Tag::Nameres).unwrap_or_else(|e| panic!("the test's frame: {e:?}"));
     let erased = Erased::new(&frame);
-    let g = erased.handle();
+    let bump = erased.bump();
+    let g = bump.alloc();
     let crates = [input("stmt", ROOT, &[])];
-    let names = resolve_crates(&crates, Sysroot::default(), &One, &Serial, g).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &One, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let krate = names.krate(0);
     let mut made = AVec::new_in(g);
     made.extend(krate.expansions.values().filter_map(|e| e.made));

@@ -65,7 +65,7 @@ checksum = "0000000000000000000000000000000000000000000000000000000000000000"
 fn held<T: 'static>(value: T) -> &'static T {
     let mut one: AVec<'static, T> = AVec::with_capacity_in(1, a());
     one.push(value);
-    let kept: &'static [T] = one.leak();
+    let kept: &'static [T] = one.leak_static();
     &kept[0]
 }
 
@@ -101,13 +101,13 @@ fn derive_world(member: bool, macro_side: bool) -> World<'static> {
     let made = crate::fixture::pack(&[("src/lib.rs", "pub struct TokenStream;\npub struct Expr;\n")], a());
     let mut bytes: AVec<'static, u8> = AVec::with_capacity_in(made.len(), a());
     bytes.extend_from_slice(&made);
-    let pack: &'static [u8] = bytes.leak();
+    let pack: &'static [u8] = bytes.leak_static();
     let members: &'static [&'static str] = if member { &["app", "derive"] } else { &["app"] };
     let mut places = Placed { lock, members, pack };
     let (id, mut shelf) = shelf(macro_side);
-    let listed = open_list(&mut shelf, id, TRIPLE, graph, lock, &mut places, a()).unwrap_or_else(|e| panic!("{e}"));
+    let listed = open_list(&mut shelf, id, TRIPLE, graph, lock, &mut places, b()).unwrap_or_else(|e| panic!("{e}"));
     let listed = held(listed);
-    world(graph, lock, listed, &mut places, &NoFiles, a()).unwrap_or_else(|e| panic!("{e}"))
+    world(graph, lock, listed, &mut places, &NoFiles, b()).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// The crate named `name` on `side`, if the world holds one.
@@ -121,7 +121,7 @@ fn named(w: &World<'static>, name: &str, side: Side) -> Option<usize> {
 /// [`has_check_scope`] gave. The owners scoped, and those without a scope, by name.
 fn every_scope(w: &World<'static>, what: &str) -> (usize, AVec<'static, &'static str>) {
     let bytes = encode(w, &|_| None, a()).unwrap_or_else(|e| panic!("{what}: {e}"));
-    let bytes: &'static [u8] = bytes.leak();
+    let bytes: &'static [u8] = bytes.leak_static();
     let list = CrateList::open(bytes).unwrap_or_else(|e| panic!("{what}: {e}"));
     let mut scoped = 0;
     let mut without: AVec<'static, &'static str> = AVec::new_in(a());
@@ -247,7 +247,7 @@ fn a_member_proc_macro_given_the_target_proc_macro_is_refused() {
     let old = w.crates[derive].input.deps;
     let mut deps: AVec<'static, (&'static str, usize)> = AVec::with_capacity_in(old.len(), a());
     deps.extend(old.iter().map(|&(n, d)| if n == "proc_macro" { (n, target_pm) } else { (n, d) }));
-    w.crates[derive].input.deps = deps.leak();
+    w.crates[derive].input.deps = deps.leak_static();
     let refused = check_scope_in(&w, derive, false, a()).err().expect("an edge to the other side's proc_macro is refused");
     assert_eq!(refused, ScopeError::OtherSide { owner: "derive", from: "derive", krate: "proc_macro", side: Side::Macro });
     let mut words = AString::new_in(a());

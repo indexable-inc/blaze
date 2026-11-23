@@ -37,7 +37,7 @@ use core::cell::{Cell, RefCell};
 use blaze_format::FormatError;
 use blaze_hash::HashMap;
 use blaze_id::{CrateItemKey, ItemKey};
-use blaze_own::{AVec, Alloc, Box};
+use blaze_own::{AVec, Alloc, BVec, Bump};
 use blaze_surface::{Edition, ScopeBuilder, ScopeView};
 
 use super::edit::{MemberRefusal, Members, OneGroup, OneGroupRefusal, Solved};
@@ -155,24 +155,25 @@ impl<'a> Held<'a> {
     }
 
     /// `tree` (a solve's `tree_record`) kept as the crate's record, its module keys read.
-    fn take_tree(&mut self, tree: &'a [u8], alloc: Alloc<'a>) -> Result<(), NamesError<'a>> {
-        let record = TreeRecord::read(tree, alloc).map_err(|error| NamesError::TreeRecord { krate: self.name, error })?;
-        let mut modules: AVec<'a, ItemKey> = AVec::with_capacity_in(record.modules.len(), alloc);
+    fn take_tree(&mut self, tree: &'a [u8], bump: Bump<'a>) -> Result<(), NamesError<'a>> {
+        let record = TreeRecord::read(tree, bump.alloc()).map_err(|error| NamesError::TreeRecord { krate: self.name, error })?;
+        let mut modules: BVec<'a, ItemKey> = BVec::with_capacity_in(record.modules.len(), bump);
         modules.extend(record.modules.iter().map(|m| m.key));
         modules.sort_unstable();
-        self.modules = modules.leak();
+        self.modules = modules.into_bump_slice();
         self.tree = Some(tree);
         Ok(())
     }
 
     /// The scopes of the groups `demanded` kept since the last call, from their records.
-    fn hold(&mut self, demanded: &Demanded<'a>, alloc: Alloc<'a>) -> Result<(), OnDemandError<'a>> {
+    fn hold(&mut self, demanded: &Demanded<'a>, bump: Bump<'a>) -> Result<(), OnDemandError<'a>> {
+        let alloc = bump.alloc();
         for g in demanded.groups[self.groups_held..].iter() {
             for &m in g.members.iter() {
                 let bytes = g.scope_of(m).map_err(|error| OnDemandError::Record { krate: self.name, module: m, error })?;
-                let bytes = crate::resolve::aligned(bytes, alloc);
+                let bytes = crate::resolve::aligned(bytes, bump);
                 let view = ScopeView::read(bytes).map_err(|error| OnDemandError::Scope { krate: self.name, module: m, error })?;
-                let scope: &'a ScopeBuilder<'a, &'a str> = Box::leak(Box::new_in(ScopeBuilder::from(&view, alloc), alloc));
+                let scope: &'a ScopeBuilder<'a, &'a str> = bump.alloc_val(ScopeBuilder::from(&view, alloc));
                 self.scopes.insert(m, scope);
             }
         }
@@ -365,6 +366,7 @@ struct Ctx<'c, 'a, S> {
     prepares: &'a Prepares<'a>,
     counts: RefCell<OnDemandCounts<'a>>,
     alloc: Alloc<'a>,
+    bump: Bump<'a>,
 }
 
 impl<'a, S: SourceTexts<'a>> Ctx<'_, 'a, S> {
@@ -376,7 +378,8 @@ impl<'a, S: SourceTexts<'a>> Ctx<'_, 'a, S> {
         let par = OnDemandPar { members, again: &again, tree_reads: &tree_reads };
         let par = &par;
         let alloc = self.alloc;
-        let sink: &'a Sink<'a> = Box::leak(Box::new_in(Sink { wants: RefCell::new(HashMap::new_in(alloc)), alloc }, alloc));
+        let bump = self.bump;
+        let sink: &'a Sink<'a> = bump.alloc_val(Sink { wants: RefCell::new(HashMap::new_in(alloc)), alloc });
         let roots = self.roots.borrow();
         let mut slots: AVec<'a, Option<Dep<'a>>> = AVec::with_capacity_in(self.crates.len(), alloc);
         for i in 0..self.crates.len() {
@@ -387,21 +390,23 @@ impl<'a, S: SourceTexts<'a>> Ctx<'_, 'a, S> {
             } else {
                 // This solve's frozen view of crate `i`.
                 let h = self.held[i].borrow();
-                let solves: &'a AVec<'a, &'a CrateNames<'a>> = Box::leak(Box::new_in(AVec::from_slice_in(&h.solves[..], alloc), alloc));
-                let solves: &'a [&'a CrateNames<'a>] = solves.as_slice();
+                let solves: &'a [&'a CrateNames<'a>] = bump.alloc_slice_copy(&h.solves[..]);
                 let mut scopes = HashMap::new_in(alloc);
                 scopes.extend(h.scopes.iter().map(|(&m, &s)| (m, s)));
-                let scopes: &'a HashMap<ItemKey, &'a ScopeBuilder<'a, &'a str>, Alloc<'a>> = Box::leak(Box::new_in(scopes, alloc));
+                let scopes: &'a HashMap<ItemKey, &'a ScopeBuilder<'a, &'a str>, Alloc<'a>> = bump.alloc_val(scopes);
                 let root = crate::task::root_key(h.key);
                 let l = LazyDep { name: h.name, key: h.key, root, edition: h.edition, proc_key: h.proc_key, krate: i as u32, solves, modules: h.modules, scopes, wants: sink };
-                Some(Dep::Lazy(Box::leak(Box::new_in(l, alloc))))
+                Some(Dep::Lazy(bump.alloc_val(l)))
             });
         }
         drop(roots);
         let built = Built { crates: &slots, by_prefix: &self.by_prefix, asked: None };
         let kept = crate::expansions::KeptExpansions::none(alloc);
         let id = CrateId(k as u32);
-        let r = resolve_one::<S, OnDemandPar<'_>>(&self.graph, &self.crates[k], id, k, &built, self.sources, par, First::Prefetch, self.prepares, &kept, alloc);
+        let r = match self.crates.get(k) {
+            Some(input) => resolve_one::<S, OnDemandPar<'_>>(&self.graph, input, id, k, &built, self.sources, par, First::Prefetch, self.prepares, &kept, bump),
+            None => Err(NamesError::NotResolved { krate: "" }),
+        };
         let mut wants: AVec<'a, Want<'a>> = AVec::new_in(alloc);
         let taken = core::mem::replace(&mut *sink.wants.borrow_mut(), HashMap::new_in(alloc));
         for (_, mut w) in taken {
@@ -431,7 +436,7 @@ impl<'a, S: SourceTexts<'a>> Ctx<'_, 'a, S> {
         counts.tree_reads[k] += 1;
         counts.tree_read_bytes[k] += tree.len();
         drop(counts);
-        h.take_tree(tree, self.alloc)
+        h.take_tree(tree, self.bump)
     }
 
     /// The counts so far, taken (the driver stops after: a refusal carries them).
@@ -473,7 +478,7 @@ impl<'a, S: SourceTexts<'a>> Ctx<'_, 'a, S> {
                     }
                     continue;
                 }
-                let c: &'a CrateNames<'a> = Box::leak(Box::new_in(r.map_err(OnDemandError::Names)?, self.alloc));
+                let c: &'a CrateNames<'a> = self.bump.alloc_val(r.map_err(OnDemandError::Names)?);
                 let mut h = self.held[k].borrow_mut();
                 self.take_tree(k, &mut h, c.tree_record).map_err(OnDemandError::Names)?;
                 h.solves.push(c);
@@ -490,7 +495,7 @@ impl<'a, S: SourceTexts<'a>> Ctx<'_, 'a, S> {
                     if !wants.is_empty() {
                         return Err(Refused::Wanted(wants));
                     }
-                    let c: &'a CrateNames<'a> = Box::leak(Box::new_in(r.map_err(Refused::Names)?, self.alloc));
+                    let c: &'a CrateNames<'a> = self.bump.alloc_val(r.map_err(Refused::Names)?);
                     let mut h = self.held[k].borrow_mut();
                     if walked_again {
                         // The record's inputs moved under it: the new record is the crate's.
@@ -506,7 +511,9 @@ impl<'a, S: SourceTexts<'a>> Ctx<'_, 'a, S> {
                 let mut solver = OneGroup { solve_crate, alloc: self.alloc, tree };
                 demand(&modules, &mut solver, &mut demanded[k], self.alloc)
             };
-            self.held[k].borrow_mut().hold(&demanded[k], self.alloc)?;
+            if let (Some(held), Some(dem)) = (self.held.get(k), demanded.get(k)) {
+                held.borrow_mut().hold(dem, self.bump)?;
+            }
             match r {
                 Ok(()) => {
                     stack.pop();
@@ -551,7 +558,8 @@ fn demand_source(e: &DemandError<OneGroupRefusal<Refused<'_>>>) -> Option<ItemKe
 /// The names of `crates` with `roots` (crate indices) solved whole, in graph order, and every
 /// other crate solved on demand from what the roots' solves read. Scratch and results in
 /// `alloc`.
-pub fn names_on_demand<'a, S: SourceTexts<'a>>(crates: &[CrateInput<'a>], sysroot: Sysroot, sources: &S, roots: &[usize], alloc: Alloc<'a>) -> Result<OnDemand<'a>, OnDemandError<'a>> {
+pub fn names_on_demand<'a, S: SourceTexts<'a>>(crates: &[CrateInput<'a>], sysroot: Sysroot, sources: &S, roots: &[usize], bump: Bump<'a>) -> Result<OnDemand<'a>, OnDemandError<'a>> {
+    let alloc = bump.alloc();
     let graph = graph_of(crates, sysroot, alloc).map_err(OnDemandError::Graph)?;
     let mut held = AVec::with_capacity_in(crates.len(), alloc);
     let mut by_prefix = HashMap::new_in(alloc);
@@ -580,7 +588,7 @@ pub fn names_on_demand<'a, S: SourceTexts<'a>>(crates: &[CrateInput<'a>], sysroo
     for wave in graph.waves() {
         order.extend(wave.iter().map(|id| id.index()).filter(|i| roots.contains(i)));
     }
-    let cx = Ctx { crates, graph, sources, held, roots: RefCell::new(none), by_prefix, prepares: Prepares::new_in(alloc), counts: RefCell::new(OnDemandCounts::new_in(names, alloc)), alloc };
+    let cx = Ctx { crates, graph, sources, held, roots: RefCell::new(none), by_prefix, prepares: Prepares::new_in(bump), counts: RefCell::new(OnDemandCounts::new_in(names, alloc)), alloc, bump };
     let mut root_solves = 0usize;
     for &r in order.iter() {
         let mut rounds = 0usize;
@@ -592,7 +600,7 @@ pub fn names_on_demand<'a, S: SourceTexts<'a>>(crates: &[CrateInput<'a>], sysroo
             root_solves += 1;
             let (res, wants, _) = cx.solve(r, None);
             if wants.is_empty() {
-                let c: &'a CrateNames<'a> = Box::leak(Box::new_in(res.map_err(OnDemandError::Names)?, alloc));
+                let c: &'a CrateNames<'a> = bump.alloc_val(res.map_err(OnDemandError::Names)?);
                 cx.roots.borrow_mut()[r] = Some(c);
                 break;
             }

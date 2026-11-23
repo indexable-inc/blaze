@@ -100,12 +100,12 @@ fn expand_census() {
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names: Names<'_> = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names: Names<'_> = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let crate_names: Vec<&str> = crates.iter().map(|c| c.name).collect();
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
     let front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut out = format!("expand census: names resolved in {:?}\n", start.elapsed());
 
     // (path, cause) -> row; and per path alone.

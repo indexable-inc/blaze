@@ -94,7 +94,7 @@ fn tests_record(n: usize) -> &'static [u8] {
         }
     }
     out.extend_from_slice(&strings);
-    blaze_scope::resolve::aligned(&out, g)
+    blaze_scope::resolve::aligned(&out, blaze_own::testing::bump())
 }
 
 /// What the zygote's channel and its reap carry.
@@ -480,7 +480,7 @@ fn drive<Z: Zygotes>(runner: &mut Runner<'static, Z>, width: u32, n: usize) -> R
     for i in 0..n {
         ids.push(id(i));
     }
-    let ids: &'static [TestId] = ids.leak();
+    let ids: &'static [TestId] = ids.leak_static();
     let mut machine = TestLoop::new(config(width), g).map_err(harness)?;
     let mut out: AVec<'_, Effect<'_>> = Vec::new_in(g);
     machine.begin(&mut out).map_err(harness)?;

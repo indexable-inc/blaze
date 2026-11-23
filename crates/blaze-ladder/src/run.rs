@@ -1585,6 +1585,10 @@ pub fn build(files: &[SourceFile<'_>], root: &str, overflow: OverflowChecks, all
     build_noting(files, root, &mut BlazeAttrs::default(), overflow, alloc)
 }
 
+fn infer_frame() -> Result<blaze_mem::Frame, RunError> {
+    blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).map_err(|e| RunError::Names { shown: std::format!("the command's frame: {e}").into_boxed_str() })
+}
+
 /// [`build`] through the new front end: the program's names resolved by the names library over
 /// the toolchain `new` names, then front2's answers to the back half.
 pub fn build_new(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>, alloc: Alloc<'static>) -> Result<Built, RunError> {
@@ -1594,9 +1598,11 @@ pub fn build_new(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>, alloc:
     let tc = crate::library_set::toolchain_for(files, root, new, panic, alloc)?;
     let texts = ProgramTexts::new(files, root, new, &tc, panic)?;
     let user = texts.user();
+    let names_frame = infer_frame()?;
+    let names_erased = blaze_own::Erased::new(&names_frame);
     let inputs = Inputs::new(&user, &tc).map_err(RunError::Crates)?;
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, alloc).map_err(|e| RunError::Names { shown: std::format!("{e}").into_boxed_str() })?;
+    let names = inputs.resolve(&crates, names_erased.bump()).map_err(|e| RunError::Names { shown: std::format!("{e}").into_boxed_str() })?;
     build_over(&names, files, &texts, alloc)
 }
 
@@ -1604,7 +1610,7 @@ pub fn build_new(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>, alloc:
 /// (the program's crate at index 0, resolved from `texts`). For a caller that resolved the
 /// names itself (examples/front2_rungs.rs: the toolchain library once, `crates::library`).
 pub fn build_over(names: &blaze_scope::resolve::Names<'_>, files: &[SourceFile<'_>], texts: &ProgramTexts, alloc: Alloc<'static>) -> Result<Built, RunError> {
-    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).map_err(|e| RunError::Names { shown: std::format!("the command's frame: {e}").into_boxed_str() })?;
+    let frame = infer_frame()?;
     let mut program = Front2Program::new(names, &frame, files, alloc).map_err(RunError::Front2)?;
     build_with(&mut program, texts.overflow, alloc)
 }
@@ -1643,10 +1649,11 @@ pub fn entry_start(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>, pani
     let tc = crate::library_set::toolchain_for(files, root, new, panic, alloc)?;
     let texts = ProgramTexts::new(files, root, new, &tc, panic)?;
     let user = texts.user();
+    let frame = infer_frame()?;
+    let erased = blaze_own::Erased::new(&frame);
     let inputs = Inputs::new(&user, &tc).map_err(RunError::Crates)?;
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, alloc).map_err(|e| RunError::Names { shown: std::format!("{e}").into_boxed_str() })?;
-    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).map_err(|e| RunError::Names { shown: std::format!("the command's frame: {e}").into_boxed_str() })?;
+    let names = inputs.resolve(&crates, erased.bump()).map_err(|e| RunError::Names { shown: std::format!("{e}").into_boxed_str() })?;
     Ok(entry_start_of(&names, &frame, alloc, alloc)?.form)
 }
 
@@ -1669,9 +1676,11 @@ pub fn run_program_given(files: &[SourceFile<'_>], root: &str, given: Given, new
     let tc = crate::library_set::toolchain_for(files, root, new, panic, alloc.local())?;
     let texts = ProgramTexts::new(files, root, new, &tc, panic)?;
     let user = texts.user();
+    let names_frame = infer_frame()?;
+    let names_erased = blaze_own::Erased::new(&names_frame);
     let inputs = Inputs::new(&user, &tc).map_err(RunError::Crates)?;
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, alloc.local()).map_err(|e| RunError::Names { shown: std::format!("{e}").into_boxed_str() })?;
+    let names = inputs.resolve(&crates, names_erased.bump()).map_err(|e| RunError::Names { shown: std::format!("{e}").into_boxed_str() })?;
     let built = build_stubbed(&names, files, &texts, alloc.local())?;
     ran_built_given(built, given, alloc)
 }
@@ -1691,7 +1700,7 @@ pub fn run_program_given(files: &[SourceFile<'_>], root: &str, given: Given, new
 /// out ([`Front2Program::own_left_out`]). Only a library's function blaze cannot check or
 /// build is left behind a stub.
 pub fn build_stubbed(names: &blaze_scope::resolve::Names<'_>, files: &[SourceFile<'_>], texts: &ProgramTexts, alloc: Alloc<'static>) -> Result<Built, RunError> {
-    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).map_err(|e| RunError::Names { shown: std::format!("the command's frame: {e}").into_boxed_str() })?;
+    let frame = infer_frame()?;
     // The survey front leaves a fn it refuses out of the program (each caller's build then
     // names it: [`RunError::LeftOut`]); its list of them is the seam's `left_out`, read there.
     let mut left_out = Vec::new_in(Global);
@@ -1770,10 +1779,11 @@ pub fn build_records_new(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>
     let tc = crate::library_set::toolchain_for(files, root, new, panic, alloc)?;
     let texts = ProgramTexts::new(files, root, new, &tc, panic)?;
     let user = texts.user();
+    let frame = infer_frame()?;
+    let erased = blaze_own::Erased::new(&frame);
     let inputs = Inputs::new(&user, &tc).map_err(RunError::Crates)?;
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, alloc).map_err(|e| RunError::Names { shown: std::format!("{e}").into_boxed_str() })?;
-    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).map_err(|e| RunError::Names { shown: std::format!("the command's frame: {e}").into_boxed_str() })?;
+    let names = inputs.resolve(&crates, erased.bump()).map_err(|e| RunError::Names { shown: std::format!("{e}").into_boxed_str() })?;
     let mut program = Front2Program::new(&names, &frame, files, alloc).map_err(RunError::Front2)?;
     build_records(&mut program, records, alloc)
 }

@@ -10,8 +10,6 @@
 //!
 //! Prints `macro writes sound: N cases, S summarised Only, B names bound, every one allowed`.
 
-#![feature(allocator_api)]
-
 use std::cell::Cell;
 
 use blaze_expand::{
@@ -25,7 +23,7 @@ use blaze_mem::Frame;
 use blaze_mem::tag::Tag;
 use blaze_names_demand::types::Writes;
 use blaze_names_source::call_writes_keeping;
-use blaze_own::{AVec, Alloc, Erased, Vec};
+use blaze_own::{AVec, Alloc, BVec, Bump, Erased, Vec};
 use blaze_sim::{Broke, Config, Tape};
 use blaze_tokens::Tokens;
 
@@ -155,21 +153,22 @@ fn bound<'t>(tokens: Tokens<'t>, alloc: Alloc<'_>, out: &mut AVec<'_, Bound<'t>>
 }
 
 /// The record `bytes` at a 16-byte aligned address, as `Tokens::open` reads it.
-fn aligned<'a>(bytes: &[u8], alloc: Alloc<'a>) -> &'a [u8] {
-    let mut words: AVec<'a, u128> = Vec::new_in(alloc);
+fn aligned<'a>(bytes: &[u8], bump: Bump<'a>) -> &'a [u8] {
+    let mut words: BVec<'a, u128> = Vec::new_in(bump);
     for chunk in bytes.chunks(16) {
         let mut word = [0u8; 16];
         word[..chunk.len()].copy_from_slice(chunk);
         words.push(u128::from_le_bytes(word));
     }
-    let words: &'a [u128] = words.leak();
+    let words: &'a [u128] = words.into_bump_slice();
     &blaze_format::bytes_of_slice(words)[..bytes.len()]
 }
 
 fn case(tape: &Tape, plant: Plant, tally: &Tally) -> Result<(), Broke> {
     let frame = Frame::new(Tag::Expand).map_err(|why| harness("the case's frame", why))?;
     let erased = Erased::new(&frame);
-    let alloc = erased.handle();
+    let bump = erased.bump();
+    let alloc = bump.alloc();
     // The definition: `($n:ident) => { pieces };` and maybe an arm the call does not take.
     let mut body: AVec<'_, u8> = Vec::new_in(alloc);
     body.extend_from_slice(EXTRA_ARMS[tape.index(EXTRA_ARMS.len(), "extra arm")].as_bytes());
@@ -190,7 +189,7 @@ fn case(tape: &Tape, plant: Plant, tally: &Tally) -> Result<(), Broke> {
         Plant::Clean => true,
         Plant::ForgetsUse => written.by != By::Use,
     };
-    let summary = call_writes_keeping(&writes, Some(&input), &keep, alloc);
+    let summary = call_writes_keeping(&writes, Some(&input), &keep, bump);
     // The expansion, for real.
     let site = CallSite { edition: Edition::E2021, panic_edition: Edition::E2021, ctx: Ctx::root(Edition::E2021) };
     let call = Call::fn_like(&input, site);
@@ -200,7 +199,7 @@ fn case(tape: &Tape, plant: Plant, tally: &Tally) -> Result<(), Broke> {
     };
     let sources = SourceIndexes::of(&def, &call, alloc);
     let record = expansion.token_record(&sources.maps(), alloc).map_err(|why| harness("the token record", why))?;
-    let tokens = Tokens::open(aligned(&record, alloc)).map_err(|why| harness("the record opens", why))?;
+    let tokens = Tokens::open(aligned(&record, bump)).map_err(|why| harness("the record opens", why))?;
     let mut names: AVec<'_, Bound<'_>> = Vec::new_in(alloc);
     bound(tokens, alloc, &mut names)?;
     tally.cases.set(tally.cases.get() + 1);
@@ -210,7 +209,7 @@ fn case(tape: &Tape, plant: Plant, tally: &Tally) -> Result<(), Broke> {
         tally.bound.set(tally.bound.get() + 1);
         if !allowed.contains(&name.name) {
             return Err(Broke::Oracle(std::format!(
-                "the expansion binds `{}`, which its summary {allowed:?} does not allow",
+                "the expansion binds `{}`, which its writes summary {allowed:?} does not allow",
                 name.name
             )));
         }

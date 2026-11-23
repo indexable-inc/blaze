@@ -63,9 +63,12 @@ fn inputs() -> [CrateInput<'static>; 2] {
 
 #[test]
 fn names_on_demand_across_crates_solve_the_closure_of_what_the_root_reads() {
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let bump = erased.bump();
     let texts = texts();
     let inputs = inputs();
-    let whole = resolve_crates(&inputs, Sysroot::default(), texts, &Grouped, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the whole solve: {e}"));
+    let whole = resolve_crates(&inputs, Sysroot::default(), texts, &Grouped, bump).unwrap_or_else(|e| panic!("the whole solve: {e}"));
     let (dep, app) = (whole.krate(0), whole.krate(1));
     // The prediction: `app`'s groups' reads into `dep`, then `dep`'s groups' reads, transitively.
     let mut of: BTreeMap<ItemKey, usize> = BTreeMap::new();
@@ -107,7 +110,7 @@ fn names_on_demand_across_crates_solve_the_closure_of_what_the_root_reads() {
     let path = |k: &ItemKey| dep.path_of(*k).map_or_else(|| std::format!("{k:?}"), String::from);
     let paths: Vec<String> = want.iter().map(path).collect();
 
-    let lazy = names_on_demand(&inputs, Sysroot::default(), texts, &[1], blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("names on demand: {e:?}"));
+    let lazy = names_on_demand(&inputs, Sysroot::default(), texts, &[1], bump).unwrap_or_else(|e| panic!("names on demand: {e:?}"));
     let got = &lazy.demanded[0];
     let solved: BTreeSet<ItemKey> = got.groups.iter().map(|g| g.members[0]).collect();
     std::println!(
@@ -176,8 +179,11 @@ static ENUM_GLOB: Texts = Texts(&[&[("/dep/lib.rs", ENUM_GLOB_DEP)], &[("/app/li
 /// a glob's answer is recorded by), so the prediction is not met by accident.
 #[test]
 fn names_on_demand_a_glob_of_an_enum_outside_the_members_reads_the_tree_record() {
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let bump = erased.bump();
     let inputs = inputs();
-    let whole = resolve_crates(&inputs, Sysroot::default(), &ENUM_GLOB, &Grouped, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the whole solve: {e}"));
+    let whole = resolve_crates(&inputs, Sysroot::default(), &ENUM_GLOB, &Grouped, bump).unwrap_or_else(|e| panic!("the whole solve: {e}"));
     let dep = whole.krate(0);
     let key = |p: &str| dep.tree.modules.iter().find(|m| m.path.as_str() == p).unwrap_or_else(|| panic!("{p}: no such module")).key;
     let (b, c, m0, m1) = (key("dep::b"), key("dep::c"), key("dep::m0"), key("dep::m1"));
@@ -188,7 +194,7 @@ fn names_on_demand_a_glob_of_an_enum_outside_the_members_reads_the_tree_record()
         "the control: c's group does not read b's globs cell, so its read of `A` through the glob is not recorded"
     );
 
-    let lazy = names_on_demand(&inputs, Sysroot::default(), &ENUM_GLOB, &[1], blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("names on demand: {e:?}"));
+    let lazy = names_on_demand(&inputs, Sysroot::default(), &ENUM_GLOB, &[1], bump).unwrap_or_else(|e| panic!("names on demand: {e:?}"));
     let got = &lazy.demanded[0];
     std::println!("NAMES ON DEMAND enum glob: {} groups solved of {}; counts: {}", got.groups.len(), dep.groups.len(), lazy.counts);
     assert!(got.holds(b) && got.holds(c), "b's and c's groups were not both solved");
