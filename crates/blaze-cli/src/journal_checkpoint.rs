@@ -434,9 +434,16 @@ pub(crate) fn read<'f, D: Driver, S: Sharing>(cx: &Cx, store: &mut CommandStore<
             let mut id = [0; 32];
             id.copy_from_slice(keys);
             let key = Key(ContentId(id));
-            match store.get(cx, key)? {
-                None => Some(Err(Ignored::Missing { key })),
-                Some(held) => Some(decode(held.bytes, answer, Plant::None)),
+            // `engine_answer::save` resets `<answer_root>.journal` to `[pointer.key]` (reusing
+            // the same 32-byte root record as `answer_root` in the newest segment): no checkpoint
+            // has been written past this answer yet, so do not probe older segments.
+            if key == answer {
+                None
+            } else {
+                match store.get(cx, key)? {
+                    None => Some(Err(Ignored::Missing { key })),
+                    Some(held) => Some(decode(held.bytes, answer, Plant::None)),
+                }
             }
         }
     };
@@ -448,7 +455,15 @@ pub(crate) fn read<'f, D: Driver, S: Sharing>(cx: &Cx, store: &mut CommandStore<
 /// riding the commit after the answer. Called only on the certificate's path.
 #[expect(clippy::too_many_arguments, reason = "the write's inputs, each one handle")]
 pub(crate) fn after_certificate<D: Driver, S: Sharing>(cx: &Cx, store: &mut CommandStore<'_, '_, D, S>, answer_root: &str, answer: Key, chosen: &Chosen<'_>, now: Stored<'_>, every: u64, frame: &Frame) -> Result<Option<Due>, CliError> {
-    let Some(why) = due(chosen.places(), now, every) else { return Ok(None) };
+    let Some(why) = due(chosen.places(), now, every) else {
+        // If `<answer_root>.journal` still points to a stale/ignored checkpoint from an older
+        // answer or a concurrent certifier, reset it to `[answer]` so later warm runs do not
+        // probe ancient segments only to ignore the same record again.
+        if matches!(chosen.status, Status::Ignored(_)) {
+            store.pin(name(answer_root, frame).as_str(), &[answer])?;
+        }
+        return Ok(None);
+    };
     let places = Places::merged(chosen.places(), now, frame);
     let (key, bytes) = encode(answer, places.stored(), frame);
     store.put(cx, key, &bytes)?;

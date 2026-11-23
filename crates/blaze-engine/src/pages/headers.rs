@@ -28,6 +28,149 @@ fn full(name: Name) -> bool {
     matches!(name.kind, Kind::Units | Kind::UnitGraph | Kind::Fetch | Kind::Script)
 }
 
+fn shard_full(index: usize) -> bool {
+    index < 8 || (16..24).contains(&index)
+}
+
+enum HeaderChange<'k> {
+    Set { name: Name, row: &'k Row<'k>, record: Option<Key> },
+    Remove(Name),
+    RecordOnly { name: Name, record: Option<Key> },
+}
+
+impl HeaderChange<'_> {
+    fn name(&self) -> Name {
+        match *self {
+            HeaderChange::Set { name, .. } | HeaderChange::Remove(name) | HeaderChange::RecordOnly { name, .. } => name,
+        }
+    }
+}
+
+/// One changed producer header shard ready to be merged and content-hashed independently of
+/// every other shard ([`HeaderPages::encode_with`], [`Headers::after_with`]).
+pub struct HeaderShardJob<'k, 'b, 'a> {
+    index: usize,
+    old_key: Key,
+    base: Option<&'b IndexedHeaders<'b>>,
+    changes: SVec<'a, HeaderChange<'k>>,
+}
+
+/// The merged and hashed result of one [`HeaderShardJob`].
+pub struct HeaderShardBuilt<'a> {
+    index: usize,
+    key: Key,
+    bytes: SVec<'a, u8>,
+    changed: bool,
+}
+
+impl HeaderShardJob<'_, '_, '_> {
+    /// Linearly merge `base` with `changes` into one header shard and compute its content key.
+    pub fn run<'a>(&self, alloc: SharedAlloc<'a>) -> Result<HeaderShardBuilt<'a>, PagesError> {
+        let index = self.index;
+        let page = u32::try_from(index).unwrap_or(ROOT_PAGE);
+        let has_payload = shard_full(index);
+        let base_table = self.base.map_or(&[][..], |b| b.table);
+        let base_payload = self.base.map_or(&[][..], |b| b.payload);
+        let base_count = base_table.len() / ENTRY;
+        let max_entries = base_count + self.changes.len();
+        let mut table = SVec::with_capacity_in(9 + max_entries * ENTRY, alloc);
+        table.extend_from_slice(MAGIC);
+        table.push(u8::try_from(index).unwrap_or(0));
+        table.extend_from_slice(&0u32.to_le_bytes());
+        let mut payload = if has_payload {
+            SVec::with_capacity_in(base_payload.len(), alloc)
+        } else {
+            SVec::new_in(alloc)
+        };
+        let mut bi = 0usize;
+        let emit_base_run = |table: &mut SVec<'a, u8>, payload: &mut SVec<'a, u8>, from: usize, to: usize| -> Result<(), PagesError> {
+            if from >= to {
+                return Ok(());
+            }
+            let run = base_table.get(from * ENTRY..to * ENTRY).unwrap_or_default();
+            if !has_payload {
+                table.extend_from_slice(run);
+                return Ok(());
+            }
+            for raw in run.chunks_exact(ENTRY) {
+                let old_start = usize::try_from(view::word(raw.get(ENTRY - 8..).unwrap_or_default())).unwrap_or(usize::MAX);
+                let old_len = usize::try_from(view::word(raw.get(ENTRY - 4..).unwrap_or_default())).unwrap_or(usize::MAX);
+                let new_start = payload.len();
+                payload.extend_from_slice(base_payload.get(old_start..old_start.saturating_add(old_len)).unwrap_or_default());
+                table.extend_from_slice(raw.get(..ENTRY - 8).unwrap_or_default());
+                for field in [new_start, old_len] {
+                    let offset = u32::try_from(field).map_err(|_| PagesError::Count { page, count: u32::MAX })?;
+                    table.extend_from_slice(&offset.to_le_bytes());
+                }
+            }
+            Ok(())
+        };
+        for change in self.changes.iter() {
+            let target = change.name();
+            let run_start = bi;
+            while let Some(raw) = base_table.get(bi * ENTRY..(bi + 1) * ENTRY) && view::name(raw) < target {
+                bi += 1;
+            }
+            emit_base_run(&mut table, &mut payload, run_start, bi)?;
+            let matched = base_table.get(bi * ENTRY..(bi + 1) * ENTRY).filter(|raw| view::name(raw) == target);
+            match *change {
+                HeaderChange::Set { name, row, record } => {
+                    if matched.is_some() { bi += 1; }
+                    let start = payload.len();
+                    debug_assert_eq!(full(name), has_payload);
+                    if has_payload { put_row(&mut payload, name, row); }
+                    let count = |n| u32::try_from(n).map_err(|_| PagesError::Count { page, count: u32::MAX });
+                    let header = Header {
+                        facts: RowFacts::of(row),
+                        reads: count(row.reads.len())?,
+                        defines: count(row.defines.len())?,
+                        record,
+                    };
+                    put_header(&mut table, name, header, start, payload.len() - start, page)?;
+                }
+                HeaderChange::Remove(_) => {
+                    if matched.is_some() { bi += 1; }
+                }
+                HeaderChange::RecordOnly { record, .. } => {
+                    let Some(raw) = matched else {
+                        // An entered task can leave only debt and no row.
+                        continue;
+                    };
+                    bi += 1;
+                    let old_start = usize::try_from(view::word(raw.get(ENTRY - 8..).unwrap_or_default())).unwrap_or(usize::MAX);
+                    let old_len = usize::try_from(view::word(raw.get(ENTRY - 4..).unwrap_or_default())).unwrap_or(usize::MAX);
+                    let new_start = payload.len();
+                    if old_len > 0 {
+                        payload.extend_from_slice(base_payload.get(old_start..old_start.saturating_add(old_len)).unwrap_or_default());
+                    }
+                    table.extend_from_slice(raw.get(..ROW_FIXED).unwrap_or_default());
+                    table.push(u8::from(record.is_some()));
+                    put_id(&mut table, &record.unwrap_or_default().0);
+                    for field in [new_start, old_len] {
+                        let offset = u32::try_from(field).map_err(|_| PagesError::Count { page, count: u32::MAX })?;
+                        table.extend_from_slice(&offset.to_le_bytes());
+                    }
+                }
+            }
+        }
+        emit_base_run(&mut table, &mut payload, bi, base_count)?;
+        let count = u32::try_from((table.len() - 9) / ENTRY).map_err(|_| PagesError::Count { page, count: u32::MAX })?;
+        if count == 0 {
+            return Ok(HeaderShardBuilt { index, key: Key::default(), bytes: SVec::new_in(alloc), changed: false });
+        }
+        if let Some(count_slot) = table.get_mut(5..9) {
+            count_slot.copy_from_slice(&count.to_le_bytes());
+        }
+        if !payload.is_empty() {
+            table.extend_from_slice(&payload);
+        }
+        let key = content_key(&table);
+        let changed = key != self.old_key;
+        let bytes = if changed { table } else { SVec::new_in(alloc) };
+        Ok(HeaderShardBuilt { index, key, bytes, changed })
+    }
+}
+
 struct EntryAt {
     name: Name,
     header: Header,
@@ -177,9 +320,30 @@ impl HeaderPages {
     /// replaces only the record field of the previous header.
     pub fn encode<'b, 'a>(
         kept: &Kept<'_>, last: Option<&HeaderPages>,
-        mut get: impl FnMut(usize) -> Result<Option<&'b IndexedHeaders<'b>>, PagesError>,
+        get: impl FnMut(usize) -> Result<Option<&'b IndexedHeaders<'b>>, PagesError>,
         alloc: SharedAlloc<'a>,
     ) -> Result<(Self, SVec<'a, (Key, SVec<'a, u8>)>), PagesError> {
+        Self::encode_with(kept, last, get, alloc, |jobs| {
+            let mut out = SVec::with_capacity_in(jobs.len(), alloc);
+            for job in jobs {
+                out.push(job.run(alloc));
+            }
+            out
+        })
+    }
+
+    /// [`HeaderPages::encode`] with a caller-supplied executor for independent
+    /// [`HeaderShardJob`]s so a multi-threaded driver can merge and BLAKE3-hash changed shards in
+    /// parallel while keeping this crate sans-IO and deterministic.
+    pub fn encode_with<'b, 'a, F>(
+        kept: &Kept<'_>, last: Option<&HeaderPages>,
+        mut get: impl FnMut(usize) -> Result<Option<&'b IndexedHeaders<'b>>, PagesError>,
+        alloc: SharedAlloc<'a>,
+        run_shards: F,
+    ) -> Result<(Self, SVec<'a, (Key, SVec<'a, u8>)>), PagesError>
+    where
+        F: FnOnce(&[HeaderShardJob<'_, '_, '_>]) -> SVec<'a, Result<HeaderShardBuilt<'a>, PagesError>>,
+    {
         let work = kept.answer.work();
         if work.is_some() && last.is_none() { return Err(PagesError::Base { serial: kept.answer.serial }); }
         let mut names: [SVec<'a, Name>; Self::COUNT] = core::array::from_fn(|_| Vec::new_in(alloc));
@@ -196,70 +360,46 @@ impl HeaderPages {
             (Some(_), Some(last)) => last.clone(),
             _ => Self::default(),
         };
-        let mut puts = Vec::new_in(alloc);
-        for (index, mut names) in names.into_iter().enumerate() {
-            if names.is_empty() { continue; }
-            let old_key = last.map_or(Key::default(), |last| last.keys[index]);
+        let mut jobs: SVec<'_, HeaderShardJob<'_, '_, '_>> = SVec::with_capacity_in(Self::COUNT, alloc);
+        for (index, mut shard_names) in names.into_iter().enumerate() {
+            if shard_names.is_empty() { continue; }
+            let old_key = last.map_or(Key::default(), |last| last.keys.get(index).copied().unwrap_or_default());
             let base = if work.is_some() && old_key != Key::default() {
-                let page = index as u32;
+                let page = u32::try_from(index).unwrap_or(ROOT_PAGE);
                 let base = get(index)?.ok_or(PagesError::Missing { page, key: old_key })?;
                 if base.key != old_key { return Err(PagesError::Digest { page, want: old_key, got: base.key }); }
                 if base.index != index { return Err(PagesError::Magic { page }); }
-                for field in base.table.chunks_exact(ENTRY) {
-                    names.push(view::name(field));
-                }
                 Some(base)
             } else {
                 None
             };
-            names.sort_unstable();
-            names.dedup();
-            let mut table = Vec::new_in(alloc);
-            table.extend_from_slice(MAGIC);
-            table.push(index as u8);
-            table.extend_from_slice(&0u32.to_le_bytes());
-            let mut payload = Vec::new_in(alloc);
-            for name in names {
-                let start = payload.len();
-                // Some(None) is a retirement; None is a standing row on this shard.
-                let changed = match work {
-                    Some(work) => work.rows.get(&name).map(|slot| slot.as_ref()),
-                    None => kept.answer.rows.get(&name).map(Some),
-                };
-                let header = match changed {
-                    Some(Some(row)) => {
-                        if full(name) { put_row(&mut payload, name, row); }
-                        let count = |n| u32::try_from(n).map_err(|_| PagesError::Count { page: index as u32, count: u32::MAX });
-                        Header {
-                            facts: RowFacts::of(row), reads: count(row.reads.len())?, defines: count(row.defines.len())?,
-                            record: kept.records.get(&name).copied(),
-                        }
-                    }
-                    Some(None) => continue,
-                    None => {
-                        let Some((previous, e)) = base.and_then(|base| Some((base, base.lookup(name)?))) else {
-                            // An entered task can leave only debt and no row.
-                            continue;
-                        };
-                        payload.extend_from_slice(&previous.payload[e.start..e.start + e.len]);
-                        let mut header = e.header;
-                        if kept.causes.contains_key(&name) { header.record = kept.records.get(&name).copied(); }
-                        header
-                    }
-                };
-                put_header(&mut table, name, header, start, payload.len() - start, index as u32)?;
+            shard_names.sort_unstable();
+            shard_names.dedup();
+            let mut changes = SVec::with_capacity_in(shard_names.len(), alloc);
+            for name in shard_names {
+                match work {
+                    Some(work) => match work.rows.get(&name) {
+                        Some(Some(row)) => changes.push(HeaderChange::Set { name, row, record: kept.records.get(&name).copied() }),
+                        Some(None) => changes.push(HeaderChange::Remove(name)),
+                        None => changes.push(HeaderChange::RecordOnly { name, record: kept.records.get(&name).copied() }),
+                    },
+                    None => if let Some(row) = kept.answer.rows.get(&name) {
+                        changes.push(HeaderChange::Set { name, row, record: kept.records.get(&name).copied() });
+                    },
+                }
             }
-            let count = u32::try_from((table.len() - 9) / ENTRY).map_err(|_| PagesError::Count { page: index as u32, count: u32::MAX })?;
-            let key = if count == 0 {
-                Key::default()
-            } else {
-                table[5..9].copy_from_slice(&count.to_le_bytes());
-                table.extend_from_slice(&payload);
-                let key = content_key(&table);
-                if key != old_key { puts.push((key, table)); }
-                key
-            };
-            next.keys[index] = key;
+            jobs.push(HeaderShardJob { index, old_key, base, changes });
+        }
+        let built = run_shards(&jobs);
+        let mut puts = SVec::with_capacity_in(built.len(), alloc);
+        for one in built {
+            let one = one?;
+            if let Some(slot) = next.keys.get_mut(one.index) {
+                *slot = one.key;
+            }
+            if one.changed {
+                puts.push((one.key, one.bytes));
+            }
         }
         Ok((next, puts))
     }
@@ -323,14 +463,37 @@ impl Headers {
         get: impl FnMut(usize) -> Result<Option<&'b IndexedHeaders<'b>>, PagesError>,
         alloc: SharedAlloc<'a>,
     ) -> Result<(Headers, SVec<'a, (Key, SVec<'a, u8>)>), PagesError> {
+        Self::after_with(last, kept, writer, serial, plant, get, alloc, |jobs| {
+            let mut out = SVec::with_capacity_in(jobs.len(), alloc);
+            for job in jobs {
+                out.push(job.run(alloc));
+            }
+            out
+        })
+    }
+
+    /// [`Headers::after`] with a caller-supplied executor for independent [`HeaderShardJob`]s.
+    pub fn after_with<'b, 'a, F>(
+        last: Option<&Headers>,
+        kept: &Kept<'_>,
+        writer: Writer,
+        serial: Gen,
+        plant: HeadersPlant,
+        get: impl FnMut(usize) -> Result<Option<&'b IndexedHeaders<'b>>, PagesError>,
+        alloc: SharedAlloc<'a>,
+        run_shards: F,
+    ) -> Result<(Headers, SVec<'a, (Key, SVec<'a, u8>)>), PagesError>
+    where
+        F: FnOnce(&[HeaderShardJob<'_, '_, '_>]) -> SVec<'a, Result<HeaderShardBuilt<'a>, PagesError>>,
+    {
         let none = || Vec::new_in(alloc);
         match (last, writer) {
             (None, _) => {
-                let (keys, puts) = HeaderPages::encode(kept, None, get, alloc)?;
+                let (keys, puts) = HeaderPages::encode_with(kept, None, get, alloc, run_shards)?;
                 Ok((Headers::Current(keys), puts))
             }
             (Some(Headers::Current(keys)), Writer::Phases) => {
-                let (keys, puts) = HeaderPages::encode(kept, Some(keys), get, alloc)?;
+                let (keys, puts) = HeaderPages::encode_with(kept, Some(keys), get, alloc, run_shards)?;
                 Ok((Headers::Current(keys), puts))
             }
             (Some(Headers::Current(keys)), Writer::Ready) => match plant {

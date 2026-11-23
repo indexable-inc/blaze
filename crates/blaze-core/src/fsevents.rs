@@ -1452,9 +1452,10 @@ fn tell_flushes<S: Tell>(shared: &Shared<S>, heard: &mut Heard) {
         !heard
     });
     for &tag in told.iter() {
-        // Its removal is heard too, of a flush told already: nothing.
-        _ = with_cookie(path, tag, |it| std::fs::remove_file(it));
         shared.send(Completion { tag, done: Done::Flushed });
+        // Its removal is heard too, of a flush told already: nothing. Done after `send` so the
+        // unlink syscall stays off the waiter's critical path.
+        _ = with_cookie(path, tag, |it| std::fs::remove_file(it));
     }
 }
 

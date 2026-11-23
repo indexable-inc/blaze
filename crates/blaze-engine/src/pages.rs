@@ -82,8 +82,8 @@ use crate::engine::{Answer, Cause, CellId, Entered, Gen, Phase, Planned, Row, SM
 mod view;
 mod changes;
 mod headers;
-pub use headers::{Header, HeaderPages, Headers, HeadersPlant, IndexedHeaders, Writer};
-pub use changes::{encode_changes, plan_digest};
+pub use headers::{Header, HeaderPages, HeaderShardBuilt, HeaderShardJob, Headers, HeadersPlant, IndexedHeaders, Writer};
+pub use changes::{PageBuilt, PageJob, encode_changes, encode_changes_with, plan_digest};
 pub use view::{StoredDefines, StoredNames, StoredReads, StoredRow, VerifiedPage};
 
 /// A page's form. A page of another form is never read: it is a [`PagesError::Magic`]. `BEP3`

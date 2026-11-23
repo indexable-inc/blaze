@@ -466,6 +466,21 @@ pub fn real_path<'f>(slot: &str, flags: u8, frame: &'f Frame) -> Vec<u8, &'f Fra
     }
 }
 
+/// [`real_path`] allocated directly in `alloc`, with exact capacity and no frame copy.
+pub fn real_path_in<A: core::alloc::Allocator>(slot: &str, flags: u8, alloc: A) -> Vec<u8, A> {
+    if flags & AT_MOD_RS != 0 {
+        let stem = slot.strip_suffix(".rs").unwrap_or(slot);
+        let mut out = Vec::with_capacity_in(stem.len() + 7, alloc);
+        out.extend_from_slice(stem.as_bytes());
+        out.extend_from_slice(b"/mod.rs");
+        out
+    } else {
+        let mut out = Vec::with_capacity_in(slot.len(), alloc);
+        out.extend_from_slice(slot.as_bytes());
+        out
+    }
+}
+
 /// Where a slot is today: its flags and stamp and id, or absent. `old` is its last row.
 fn slot_now(
     cx: &Cx,

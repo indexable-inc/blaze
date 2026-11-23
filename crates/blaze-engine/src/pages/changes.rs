@@ -714,30 +714,146 @@ fn key_of_entry(bytes: &[u8], section: usize) -> CellId {
     }
 }
 
-/// Merge the old page's entries with sorted replacements and deletions in each column.
-/// Unchanged variable lists are copied as byte ranges and never decoded into rows.
-fn merge_page<'a>(base: Option<&VerifiedPage<'_>>, change: &ChangedPage<'_>, bits: u8, index: u32, alloc: SharedAlloc<'a>) -> (SVec<'a, u8>, SVec<'a, (Name, Key)>) {
-    let mut buf = PageBuf::new_in(alloc);
-    for section in 0..SECTIONS {
-        let mut changes = change.sections[section].iter().peekable();
-        let mut append = |bytes: &[u8]| buf.entry(section).extend_from_slice(bytes);
-        for bytes in base.into_iter().flat_map(|p| p.entries(section)) {
-            let key = key_of_entry(bytes, section);
-            while changes.peek().is_some_and(|item| *item.0 < key) {
-                if let Some((_, Some(replacement))) = changes.next() { append(replacement); }
-            }
-            if changes.peek().is_some_and(|item| *item.0 == key) {
-                if let Some((_, Some(replacement))) = changes.next() { append(replacement); }
-            } else {
-                append(bytes);
+fn merge_section<'b, 'c>(
+    base: Option<&'b VerifiedPage<'b>>,
+    changes: &'c Writes<'c>,
+    section: usize,
+    mut emit: impl FnMut(&[u8]),
+) {
+    let mut edits = changes.iter().peekable();
+    for bytes in base.into_iter().flat_map(|p| p.entries(section)) {
+        let key = key_of_entry(bytes, section);
+        while edits.peek().is_some_and(|item| *item.0 < key) {
+            if let Some((_, Some(replacement))) = edits.next() {
+                emit(replacement);
             }
         }
-        for (_, value) in changes { if let Some(replacement) = value { append(replacement); } }
+        if edits.peek().is_some_and(|item| *item.0 == key) {
+            if let Some((_, Some(replacement))) = edits.next() {
+                emit(replacement);
+            }
+        } else {
+            emit(bytes);
+        }
     }
-    let records = view::page_records(&buf.parts[RECORDS], alloc);
-    // A page left with nothing on it is named by no key (`bytes.is_empty()` below).
-    let page = buf.finish(bits, index, alloc).unwrap_or_else(|| Vec::new_in(alloc));
+    for (_, value) in edits {
+        if let Some(replacement) = value {
+            emit(replacement);
+        }
+    }
+}
+
+/// Merge the old page's entries with sorted replacements and deletions in each column.
+/// Unchanged sections are copied in one contiguous slice; changed sections are merged directly
+/// into one exact-sized output buffer without intermediate `PageBuf` reallocations.
+fn merge_page<'a>(base: Option<&VerifiedPage<'_>>, change: &ChangedPage<'_>, bits: u8, index: u32, alloc: SharedAlloc<'a>) -> (SVec<'a, u8>, SVec<'a, (Name, Key)>) {
+    let mut counts = [0usize; SECTIONS];
+    let mut body_len = 0usize;
+    for (section, (section_changes, count_slot)) in change.sections.iter().zip(counts.iter_mut()).enumerate() {
+        if section_changes.is_empty() {
+            if let Some(base) = base {
+                *count_slot = base.section_count(section);
+                body_len += base.section_bytes(section).len();
+            }
+        } else {
+            merge_section(base, section_changes, section, |bytes| {
+                *count_slot += 1;
+                body_len += bytes.len();
+            });
+        }
+    }
+    let entries: usize = counts.iter().sum();
+    if entries == 0 {
+        return (SVec::new_in(alloc), SVec::new_in(alloc));
+    }
+    let body_at = starts_end(entries);
+    let total_len = body_at + body_len;
+    let mut page: SVec<'a, u8> = SVec::with_capacity_in(total_len, alloc);
+    page.extend_from_slice(PAGE_MAGIC);
+    page.push(bits);
+    page.extend_from_slice(&index.to_le_bytes());
+    for count in counts {
+        put_u32(&mut page, count);
+    }
+    let mut at = body_at;
+    for (section, section_changes) in change.sections.iter().enumerate() {
+        if section_changes.is_empty() {
+            if let Some(base) = base {
+                let count = base.section_count(section);
+                if count > 0 {
+                    let base_start = base.section_start(section);
+                    for j in 0..count {
+                        put_u32(&mut page, at + (base.section_entry_start(section, j) - base_start));
+                    }
+                    at += base.section_bytes(section).len();
+                }
+            }
+        } else {
+            merge_section(base, section_changes, section, |bytes| {
+                put_u32(&mut page, at);
+                at += bytes.len();
+            });
+        }
+    }
+    put_u32(&mut page, total_len);
+    let mut records: SVec<'a, (Name, Key)> = SVec::with_capacity_in(counts.get(RECORDS).copied().unwrap_or(0), alloc);
+    for (section, section_changes) in change.sections.iter().enumerate() {
+        if section_changes.is_empty() {
+            if let Some(base) = base {
+                page.extend_from_slice(base.section_bytes(section));
+                if section == RECORDS {
+                    records.extend(base.records());
+                }
+            }
+        } else {
+            merge_section(base, section_changes, section, |bytes| {
+                page.extend_from_slice(bytes);
+                if section == RECORDS && let Some(rest) = bytes.get(NAME..) {
+                    records.push((view::name(bytes), Key(view::id(rest))));
+                }
+            });
+        }
+    }
+    debug_assert_eq!(page.len(), total_len, "a merged page's start table ends at its length");
     (page, records)
+}
+
+/// One changed page ready to be merged and content-hashed independently of every other page
+/// ([`encode_changes_with`]).
+pub struct PageJob<'b, 'c> {
+    index: u32,
+    base: Option<&'b VerifiedPage<'b>>,
+    change: &'c ChangedPage<'c>,
+    bits: u8,
+    last_key: Key,
+}
+
+/// The merged and hashed result of one [`PageJob`].
+pub struct PageBuilt<'a> {
+    index: u32,
+    base_len: u64,
+    new_len: u64,
+    key: Key,
+    bytes: SVec<'a, u8>,
+    records: SVec<'a, (Name, Key)>,
+    changed: bool,
+}
+
+impl PageJob<'_, '_> {
+    /// Merge this page's base with its delta and compute its content key.
+    pub fn run<'a>(&self, alloc: SharedAlloc<'a>) -> PageBuilt<'a> {
+        let base_len = self.base.map_or(0, |p| u64::try_from(p.len()).unwrap_or(u64::MAX));
+        let (bytes, records) = merge_page(self.base, self.change, self.bits, self.index, alloc);
+        let new_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let key = if bytes.is_empty() { Key::default() } else { content_key(&bytes) };
+        let changed = key != Key::default() && key != self.last_key;
+        let (bytes, records) = if changed {
+            (bytes, records)
+        } else {
+            (SVec::new_in(alloc), SVec::new_in(alloc))
+        };
+        PageBuilt { index: self.index, base_len, new_len, key, bytes, records, changed }
+    }
 }
 
 fn previous(source: &dyn StoredPages, name: Name) -> Result<Option<RowFacts>, PagesError> {
@@ -828,9 +944,11 @@ fn file_changes<'a>(root: &mut Root<'a>, last: &Root<'_>, work: &Work<'_>, sourc
 fn reader_changes<'a>(work: &Work<'_>, source: &dyn StoredPages, delta: &mut Changed<'a>) -> Result<(), PagesError> {
     for (&id, changes) in work.readers.iter() {
         let old_page = source.page_for(readers_slot(&id), Ask::Readers)?;
+        let old_raw = old_page.and_then(|p| p.readers_raw(&id));
         let adds = changes.iter().filter(|&(_, &add)| add).count();
         let mut changes = changes.iter().peekable();
-        let mut readers = SVec::with_capacity_in(CELL_ID + 4 + NAME * adds, delta.alloc);
+        let cap = old_raw.map_or(CELL_ID + 4, |raw| raw.len()).saturating_add(NAME * adds);
+        let mut readers = SVec::with_capacity_in(cap, delta.alloc);
         put_cell_id(&mut readers, &id);
         put_u32(&mut readers, 0);
         for reader in old_page.into_iter().flat_map(|p| p.readers(&id)) {
@@ -847,7 +965,15 @@ fn reader_changes<'a>(work: &Work<'_>, source: &dyn StoredPages, delta: &mut Cha
         let count = (readers.len() - CELL_ID - 4) / NAME;
         let count = u32::try_from(count).expect("a cell's readers fit the section count");
         readers[CELL_ID..CELL_ID + 4].copy_from_slice(&count.to_le_bytes());
-        delta.set(READERS, id, (count > 0).then_some(readers));
+        // Skip dirtying the page if the merged readers entry is byte-identical to the old one.
+        let unchanged = match (count == 0, old_raw) {
+            (true, None) => true,
+            (false, Some(raw)) => raw == readers.as_slice(),
+            _ => false,
+        };
+        if !unchanged {
+            delta.set(READERS, id, (count > 0).then_some(readers));
+        }
     }
     Ok(())
 }
@@ -857,6 +983,22 @@ fn reader_changes<'a>(work: &Work<'_>, source: &dyn StoredPages, delta: &mut Cha
 /// outgrows `last.bits` (e.g. a cold workspace starting from a small `tool-base`), re-pages
 /// directly into `bits_kept(total, Some(last.bits))`.
 pub fn encode_changes<'a>(kept: &Kept<'_>, last: &Root<'_>, alloc: SharedAlloc<'a>) -> Result<Encoded<'a>, PagesError> {
+    encode_changes_with(kept, last, alloc, |jobs| {
+        let mut out = SVec::with_capacity_in(jobs.len(), alloc);
+        for job in jobs {
+            out.push(job.run(alloc));
+        }
+        out
+    })
+}
+
+/// [`encode_changes`] with a caller-supplied executor for independent [`PageJob`]s, letting a
+/// multi-threaded driver merge and BLAKE3-hash changed pages in parallel while keeping this crate
+/// sans-IO and deterministic.
+pub fn encode_changes_with<'a, F>(kept: &Kept<'_>, last: &Root<'_>, alloc: SharedAlloc<'a>, run_pages: F) -> Result<Encoded<'a>, PagesError>
+where
+    F: FnOnce(&[PageJob<'_, '_>]) -> SVec<'a, PageBuilt<'a>>,
+{
     let answer = &kept.answer;
     let source = answer.stored().ok_or(PagesError::Base { serial: answer.serial })?;
     let work = answer.work().ok_or(PagesError::Base { serial: answer.serial })?;
@@ -931,23 +1073,28 @@ pub fn encode_changes<'a>(kept: &Kept<'_>, last: &Root<'_>, alloc: SharedAlloc<'
     root.places.extend(kept.places.iter().map(|(&name, &place)| (name, place)));
     let planned = &root.files;
     root.places.retain(|file, _| planned.contains_key(file));
-    let mut puts = Vec::new_in(alloc);
-    let mut records = Vec::new_in(alloc);
     let changed_pages = u32::try_from(delta.pages.len()).unwrap_or(u32::MAX);
     let changed_entries = delta.pages.values().map(|page| page.sections.iter().map(BTreeMap::len).sum::<usize>()).sum::<usize>();
     let changed_entries = u32::try_from(changed_entries).unwrap_or(u32::MAX);
+    let mut jobs: SVec<'_, PageJob<'_, '_>> = SVec::with_capacity_in(delta.pages.len(), alloc);
     for (&index, change) in delta.pages.iter() {
         let base = source.page_for(change.witness, Ask::Witness)?;
-        let last_key = last.pages[index as usize];
+        let last_key = last.pages.get(usize::try_from(index).unwrap_or(usize::MAX)).copied().unwrap_or_default();
         if base.is_none() && last_key != Key::default() { return Err(PagesError::Missing { page: index, key: last_key }); }
-        let (bytes, keys) = merge_page(base, change, last.bits, index, alloc);
-        root.bytes = root.bytes.checked_sub(base.map_or(0, |p| p.len() as u64))
-            .and_then(|n| n.checked_add(bytes.len() as u64)).ok_or(PagesError::Total { page: index, field: "page byte count" })?;
-        let key = if bytes.is_empty() { Key::default() } else { content_key(&bytes) };
-        root.pages[index as usize] = key;
-        if key != Key::default() && key != last_key {
-            puts.push((key, bytes));
-            records.push((key, keys));
+        jobs.push(PageJob { index, base, change, bits: last.bits, last_key });
+    }
+    let built = run_pages(&jobs);
+    let mut puts = SVec::with_capacity_in(built.len(), alloc);
+    let mut records = SVec::with_capacity_in(built.len(), alloc);
+    for one in built {
+        root.bytes = root.bytes.checked_sub(one.base_len)
+            .and_then(|n| n.checked_add(one.new_len)).ok_or(PagesError::Total { page: one.index, field: "page byte count" })?;
+        if let Some(slot) = root.pages.get_mut(usize::try_from(one.index).unwrap_or(usize::MAX)) {
+            *slot = one.key;
+        }
+        if one.changed {
+            puts.push((one.key, one.bytes));
+            records.push((one.key, one.records));
         }
     }
     let mut encoded = root.finish(puts, records, PagesPlant::None, alloc);

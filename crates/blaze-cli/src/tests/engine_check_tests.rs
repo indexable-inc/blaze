@@ -2107,7 +2107,7 @@ fn engine_check_counts_the_records_it_holds() {
     let names = checked.records.lines[blaze_engine::Stage::Names.index()];
     assert!(names.puts >= 3, "a names record a member at least: {names}");
     assert_eq!(names.copies, names.puts, "each names record copied once, into the arena, and joined nowhere: {names}");
-    assert_eq!(names.held, 0, "nothing of a names record is held after its merge: {names}");
+    assert_eq!(names.results_held, 0, "nothing of a names record is held in the stage's results after its merge: {names}");
 }
 
 /// The digest of the answers of [`engine_check_reads_records_in_place`]: the bodies' notes,

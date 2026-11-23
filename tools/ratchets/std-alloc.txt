@@ -31,13 +31,13 @@ blaze-columns	29	0	1	23
 blaze-comptime/rungs/derive-hello	0	1	0	0
 blaze-cond	1	0	0	11
 blaze-consteval	30	0	4	64
-blaze-core	891	1	19	1199
+blaze-core	890	1	19	1199
 blaze-data	3	0	4	0
 blaze-dbsp	14	1	0	36
 blaze-deflate	11	0	1	6
 blaze-ed25519	3	0	0	1
 blaze-emit	0	0	23	50
-blaze-engine	0	0	0	24
+blaze-engine	0	0	0	18
 blaze-expand	32	0	0	38
 blaze-export	12	0	0	0
 blaze-fetch	52	0	7	40
