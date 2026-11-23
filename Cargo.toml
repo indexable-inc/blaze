@@ -322,6 +322,7 @@ blaze-queue = { path = "crates/blaze-queue" }
 blaze-trace = { path = "crates/blaze-trace" }
 blaze-sys = { path = "crates/blaze-sys" }
 blaze-dbsp = { path = "crates/blaze-dbsp" }
+blaze-ecs = { path = "crates/blaze-ecs" }
 # `blaze audit`: sources pinned by strong digests, advisories, yanked versions (sans-IO).
 blaze-audit = { path = "crates/blaze-audit" }
 blaze-fetch = { path = "crates/blaze-fetch" }

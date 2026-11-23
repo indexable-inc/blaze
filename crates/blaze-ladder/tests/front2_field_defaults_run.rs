@@ -34,6 +34,11 @@ const HEAD: &str = "#![feature(no_core, lang_items)]
 #[lang = \"sized\"]
 trait Sized {}
 
+#[lang = \"panic_bounds_check\"]
+fn panic_bounds_check(_index: usize, _len: usize) -> ! {
+    loop {}
+}
+
 #[lang = \"copy\"]
 trait Copy {}
 
@@ -133,6 +138,11 @@ const RECORDS_HEAD: &str = "#![blaze::records]
 #[lang = \"sized\"]
 trait Sized {}
 
+#[lang = \"panic_bounds_check\"]
+fn panic_bounds_check(_index: usize, _len: usize) -> ! {
+    loop {}
+}
+
 #[lang = \"copy\"]
 trait Copy {}
 
@@ -149,6 +159,11 @@ const UNIONS_HEAD: &str = "#![blaze::error_unions]
 
 #[lang = \"sized\"]
 trait Sized {}
+
+#[lang = \"panic_bounds_check\"]
+fn panic_bounds_check(_index: usize, _len: usize) -> ! {
+    loop {}
+}
 
 #[lang = \"copy\"]
 trait Copy {}
@@ -794,4 +809,274 @@ pub extern \"C\" fn main() -> i32 {
 }
 ");
     assert_eq!(got_uni, Ok(42));
+}
+
+/// Full native Flecs-without-Flecs-Script Proof of Concept combining:
+/// - Composable prefab types via record type spread (`{ ..Transform, ..Velocity, ..Combat }`)
+/// - Inherited & overridden type-level defaults + elided literals (`{ hp: 30u32, vx: 2i32 }`)
+/// - Const-evaluated prefabs + partial overrides (`{ x: 3i32, ..GOBLIN }`)
+/// - Compile-time reflection intrinsics (`blaze_field_count`, `blaze_records_disjoint`,
+///   `blaze_record_schema_id`) proving canonical archetype identity and disjoint system queries
+/// - Width-subtyping systems (`RecordProject`) over both `UnitPrefab` and `BossPrefab`
+/// - SoA world + `ChildOf` cascade + `Result<u32, _>` inferred error unions (`MissingEntity | DeadEntity`)
+/// - Live `front2::inspect` LLM inlay-hint rendering over the PoC itself.
+#[test]
+fn flecs_without_flecs_script_native_poc_and_inspect() {
+    let poc_source = "#![blaze::records]
+#![blaze::error_unions]
+#![feature(no_core, lang_items, intrinsics)]
+#![no_core]
+#![no_main]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"panic_bounds_check\"]
+fn panic_bounds_check(_index: usize, _len: usize) -> ! {
+    loop {}
+}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+impl Copy for u8 {}
+impl Copy for u32 {}
+impl Copy for u64 {}
+impl Copy for i32 {}
+impl Copy for usize {}
+impl Copy for bool {}
+
+#[rustc_intrinsic]
+const fn blaze_field_count<T>() -> usize;
+
+#[rustc_intrinsic]
+const fn blaze_records_disjoint<A, B>() -> bool;
+
+#[rustc_intrinsic]
+const fn blaze_record_schema_id<T>() -> u64;
+
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+enum ControlFlow<B, C> {
+    #[lang = \"Continue\"]
+    Continue(C),
+    #[lang = \"Break\"]
+    Break(B),
+}
+
+#[lang = \"from\"]
+trait From<T> {
+    fn from(value: T) -> Self;
+}
+
+impl<T> From<T> for T {
+    fn from(value: T) -> Self {
+        value
+    }
+}
+
+#[lang = \"Try\"]
+trait Try {
+    type Output;
+    type Residual;
+    #[lang = \"from_output\"]
+    fn from_output(output: Self::Output) -> Self;
+    #[lang = \"branch\"]
+    fn branch(self) -> ControlFlow<Self::Residual, Self::Output>;
+}
+
+#[lang = \"FromResidual\"]
+trait FromResidual<R = <Self as Try>::Residual> {
+    #[lang = \"from_residual\"]
+    fn from_residual(residual: R) -> Self;
+}
+
+impl<T, E> Try for Result<T, E> {
+    type Output = T;
+    type Residual = Result<!, E>;
+    fn from_output(output: T) -> Self {
+        Result::Ok(output)
+    }
+    fn branch(self) -> ControlFlow<Result<!, E>, T> {
+        match self {
+            Result::Ok(v) => ControlFlow::Continue(v),
+            Result::Err(e) => ControlFlow::Break(Result::Err(e)),
+        }
+    }
+}
+
+impl<T, E, F: From<E>> FromResidual<Result<!, E>> for Result<T, F> {
+    fn from_residual(residual: Result<!, E>) -> Self {
+        match residual {
+            Result::Err(e) => Result::Err(F::from(e)),
+            Result::Ok(never) => match never {},
+        }
+    }
+}
+
+// 1. Declarative Flecs-style prefabs using composable record spread & inherited defaults.
+type Transform = { x: i32 = 0, y: i32 = 0, scale: i32 = 1 };
+type Velocity = { vx: i32 = 0, vy: i32 = 0 };
+type Combat = { hp: u32 = 100, armor: u32 = 0 };
+type UnitPrefab = { ..Transform, ..Velocity, ..Combat, team: u32 = 0 };
+type BossPrefab = { ..UnitPrefab, hp: u32 = 500, shield: u32 = 50, phase: u32 = 1 };
+type FlatUnit = { armor: u32, hp: u32, scale: i32, team: u32, vx: i32, vy: i32, x: i32, y: i32 };
+
+// 2. Compile-time reflection proofs (zero macros, zero runtime cost).
+const BOSS_FIELDS: usize = blaze_field_count::<BossPrefab>();
+const DISJOINT_MOVE: bool = blaze_records_disjoint::<{ x: i32, y: i32 }, { vx: i32, vy: i32 }>();
+const OVERLAP_COMBAT: bool = blaze_records_disjoint::<UnitPrefab, BossPrefab>();
+const SCHEMA_MATCH: bool = blaze_record_schema_id::<UnitPrefab>() == blaze_record_schema_id::<FlatUnit>();
+
+// 3. Const-evaluated prefabs with elided inherited defaults.
+const GOBLIN: UnitPrefab = { hp: 30u32, vx: 2i32 };
+const DRAGON: BossPrefab = { x: 10i32, shield: 80u32, vx: 5i32 };
+
+// 4. Width-subtyping physics system: accepts ANY record containing x, y, vx, vy.
+fn step_physics(e: { x: i32, y: i32, vx: i32, vy: i32 }) -> { x: i32, y: i32 } {
+    { x: e.x + e.vx, y: e.y + e.vy }
+}
+
+// 5. Minimal SoA World with ChildOf hierarchy + fallible inferred-error-set queries.
+struct MissingEntity(u32);
+struct DeadEntity(u32);
+
+struct World {
+    alive: [bool; 4],
+    parent: [usize; 4], // 4 = root (no parent)
+    local_x: [i32; 4],
+    world_x: [i32; 4],
+    hp: [u32; 4],
+    shield: [u32; 4],
+}
+
+fn spawn_unit(w: &mut World, id: usize, parent: usize, u: UnitPrefab) {
+    let moved = step_physics(u);
+    w.alive[id] = true;
+    w.parent[id] = parent;
+    w.local_x[id] = moved.x;
+    w.world_x[id] = moved.x;
+    w.hp[id] = u.hp;
+    w.shield[id] = 0;
+}
+
+fn spawn_boss(w: &mut World, id: usize, parent: usize, b: BossPrefab) {
+    let moved = step_physics(b);
+    w.alive[id] = true;
+    w.parent[id] = parent;
+    w.local_x[id] = moved.x;
+    w.world_x[id] = moved.x;
+    w.hp[id] = b.hp;
+    w.shield[id] = b.shield;
+}
+
+fn cascade_transforms(w: &mut World) {
+    let mut i: usize = 0;
+    while i < 4 {
+        if w.alive[i] {
+            let p = w.parent[i];
+            if p < 4 {
+                w.world_x[i] = w.world_x[p] + w.local_x[i];
+            } else {
+                w.world_x[i] = w.local_x[i];
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn require_alive(w: &World, id: usize) -> Result<u32, MissingEntity> {
+    if id >= 4 || !w.alive[id] {
+        Result::Err(MissingEntity(id as u32))
+    } else {
+        Result::Ok(w.hp[id])
+    }
+}
+
+pub fn query_effective_hp(w: &World, id: usize) -> Result<u32, _> {
+    let hp = require_alive(w, id)?;
+    if hp == 0 {
+        return Result::Err(DeadEntity(id as u32));
+    }
+    Result::Ok(hp + w.shield[id])
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    if BOSS_FIELDS != 10 || !DISJOINT_MOVE || OVERLAP_COMBAT || !SCHEMA_MATCH {
+        return 1;
+    }
+    let mut world = World {
+        alive: [false; 4],
+        parent: [4; 4],
+        local_x: [0; 4],
+        world_x: [0; 4],
+        hp: [0; 4],
+        shield: [0; 4],
+    };
+    // Entity 0: Dragon boss at root (x=10 + vx=5 = 15, hp=500, shield=80)
+    spawn_boss(&mut world, 0, 4, DRAGON);
+    // Entity 1: Goblin minion ChildOf(0), partial override x=3 + vx=2 = 5 => world_x = 15 + 5 = 20, hp = 30
+    let minion: UnitPrefab = { x: 3i32, ..GOBLIN };
+    spawn_unit(&mut world, 1, 0, minion);
+    // Entity 2: Fallen goblin (hp = 0)
+    let fallen: UnitPrefab = { hp: 0u32 };
+    spawn_unit(&mut world, 2, 0, fallen);
+
+    cascade_transforms(&mut world);
+
+    // Effective HP of Dragon (580) + Minion (30) -> check world_x(1) == 20, dead(2) -> DeadEntity(2), missing(3) -> MissingEntity(3).
+    let boss_hp = match query_effective_hp(&world, 0) {
+        Result::Ok(v) => v,
+        Result::Err(_) => 0,
+    };
+    let minion_hp = match query_effective_hp(&world, 1) {
+        Result::Ok(v) => v,
+        Result::Err(_) => 0,
+    };
+    let dead_code = match query_effective_hp(&world, 2) {
+        Result::Ok(_) => 0,
+        Result::Err(e) => match e {
+            d: DeadEntity => d.0 + 10,
+            m => m.0 + 100,
+        },
+    };
+    let miss_code = match query_effective_hp(&world, 3) {
+        Result::Ok(_) => 0,
+        Result::Err(e) => match e {
+            m: MissingEntity => m.0 + 7,
+            d => d.0 + 200,
+        },
+    };
+    // 580 + 30 == 610, world_x[1] == 20, dead_code == 12, miss_code == 10 => 20 + 12 + 10 = 42!
+    if boss_hp != 580 || minion_hp != 30 {
+        return 2;
+    }
+    (world.world_x[1] as u32 + dead_code + miss_code) as i32
+}
+";
+    // 1. Compile to native machine code and execute in-process!
+    let got = run_head("", poc_source);
+    assert_eq!(got, Ok(42));
+
+    // 2. Verify `blaze inspect` surfaces LLM inlay hints across the PoC!
+    let alloc = blaze_own::testing::heap().alloc();
+    let inspected = blaze_ladder::front2::inspect::inspect_source(
+        poc_source,
+        blaze_ladder::front2::inspect::BLAZE_EDITION,
+        None,
+        blaze_ladder::front2::inspect::InspectOpts::default(),
+        alloc,
+        alloc,
+    )
+    .expect("inspect PoC");
+    let annotated = blaze_ladder::front2::inspect::render_annotated(&inspected, alloc);
+    assert!(annotated.contains("DeadEntity") && annotated.contains("MissingEntity"), "inferred error union hint missing:\n{annotated}");
+    assert!(annotated.contains("project ->"), "RecordProject width-subtyping hint missing:\n{annotated}");
+    assert!(annotated.contains("..defaults:"), "elided inherited default hint missing:\n{annotated}");
+    assert!(annotated.contains("? MissingEntity"), "try propagation hint missing:\n{annotated}");
+    println!("=== FLECS-WITHOUT-FLECS-SCRIPT POC (BLAZE INSPECT) ===\n{annotated}");
 }

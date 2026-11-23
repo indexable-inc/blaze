@@ -1273,7 +1273,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
                 None => return self.refuse(Construct::UnknownField, fi.expr),
             }
         }
-        if base == blaze_typeck::StructBase::Defaults {
+        if matches!(base, blaze_typeck::StructBase::Defaults | blaze_typeck::StructBase::None) {
             let ck: &'b blaze_typeck::Checked<'c> = self.ck;
             let (idx, keys) = ck.default_fields_of(e);
             let (_, tys) = ck.fru_fields_of(e);

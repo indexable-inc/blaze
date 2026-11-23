@@ -128,12 +128,13 @@ fn type_with_bounds_cond_here<S: Sink>(p: &mut Parser<'_, S>, allow_bounds: bool
 }
 
 /// blaze, under `#![blaze::records]`: `fn open(opts: { create: bool = false, mode: u32 }) {}`
+/// and structural spread `type Actor = { ..Transform, hp: u32 = 100 };`.
 ///
 /// A record type: a field list where a type is expected, which is nowhere a type of Rust's
 /// (the arm after this one is its error). The list and its fields are a struct's nodes, but a
-/// record's field is a name, a `:`, a type and then a default (`= expr`, as
-/// `default_field_values` writes it) and nothing else: a visibility, an attribute or `unsafe`
-/// is an error here. hir-ty refuses a default outside a function parameter.
+/// record's field is either a spread (`..Type`, a `RECORD_FIELD` with no `NAME`) or a name, a
+/// `:`, a type and then an optional default (`= expr`, as `default_field_values` writes it) and
+/// nothing else: a visibility, an attribute or `unsafe` is an error here.
 fn record_type<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T!['{']));
     let m = p.start();
@@ -144,20 +145,26 @@ fn record_type<S: Sink>(p: &mut Parser<'_, S>) {
             error_block(p, "expected a record field: a name, `:` and a type");
             continue;
         }
-        if !p.at(IDENT) {
+        if p.at(T![..]) && !p.at(T![..=]) {
+            let field = p.start();
+            p.bump(T![..]);
+            type_(p);
+            field.complete(p, RECORD_FIELD);
+        } else if p.at(IDENT) {
+            let field = p.start();
+            name(p);
+            p.expect(T![:]);
+            type_(p);
+            if p.eat(T![=]) {
+                let default = p.start();
+                expressions::expr(p);
+                default.complete(p, CONST_ARG);
+            }
+            field.complete(p, RECORD_FIELD);
+        } else {
             p.err_and_bump("expected a record field: a name, `:` and a type");
             continue;
         }
-        let field = p.start();
-        name(p);
-        p.expect(T![:]);
-        type_(p);
-        if p.eat(T![=]) {
-            let default = p.start();
-            expressions::expr(p);
-            default.complete(p, CONST_ARG);
-        }
-        field.complete(p, RECORD_FIELD);
         if !p.at(T!['}']) {
             p.expect(T![,]);
         }
@@ -174,16 +181,16 @@ pub(super) fn at_record_type<S: Sink>(p: &Parser<'_, S>) -> bool {
 }
 
 /// Whether the parser is at a record type that is a generic argument (`Vec<{ a: u8 }>`,
-/// `#![blaze::records]`): a `{`, an identifier, a `:` and a token that is not a second `:`.
-/// Any other `{` in a generic argument list is Rust's const block (`Foo<{ N + 1 }>`, `Foo<{}>`),
-/// which never starts so; the empty record there is written `({})`. Four tokens, jointness
-/// unread, the bound of [`super::expressions::at_record_value`].
+/// `Vec<{ ..Base, a: u8 }>`, `#![blaze::records]`): a `{`, then either an identifier, a `:` and
+/// a token that is not a second `:`, or a `..` spread (not `..=`). Any other `{` in a generic
+/// argument list is Rust's const block (`Foo<{ N + 1 }>`, `Foo<{}>`), which never starts so;
+/// the empty record there is written `({})`. Four tokens, jointness unread, the bound of
+/// [`super::expressions::at_record_value`].
 pub(super) fn at_record_type_arg<S: Sink>(p: &Parser<'_, S>) -> bool {
     p.at(T!['{'])
         && p.records_gate()
-        && p.nth(1) == IDENT
-        && p.nth(2) == T![:]
-        && p.nth(3) != T![:]
+        && ((p.nth(1) == IDENT && p.nth(2) == T![:] && p.nth(3) != T![:])
+            || (p.nth_at(1, T![..]) && !p.nth_at(1, T![..=])))
 }
 
 pub(crate) fn is_dyn_weak<S: Sink>(p: &Parser<'_, S>) -> bool {

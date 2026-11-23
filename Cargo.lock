@@ -845,6 +845,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-ecs"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-ed25519"
 version = "0.0.0"
 dependencies = [
