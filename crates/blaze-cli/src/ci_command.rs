@@ -5,8 +5,8 @@
 //! (unless `--no-test`) over the exact same engine check answer (no double-checking), fails on
 //! any issue (errors, warnings, unused dependencies, test failures, or unchecked items unless
 //! `--allow-incomplete`), and always writes a deterministic machine/LLM-readable todo file
-//! (default `.blaze/ci/todo.nuon`, compact NUON table syntax, or JSON via `--todo-format=json` /
-//! `--todo path.json`).
+//! (default `.blaze/ci/todo.btab`, Blaze Tabular Data via `bstd::tab`, or JSON via
+//! `--todo-format=json` / `--todo path.json`).
 //!
 //! When `GITHUB_ACTIONS=true` or `--format=github`:
 //! - Wraps phases in collapsible `::group::...` / `::endgroup::` blocks
@@ -33,7 +33,7 @@ use crate::CliError;
 use crate::fix::Listed;
 use crate::phases::Phases;
 
-const DEFAULT_TODO_NUON: &str = ".blaze/ci/todo.nuon";
+const DEFAULT_TODO_BTAB: &str = ".blaze/ci/todo.btab";
 const DEFAULT_TODO_JSON: &str = ".blaze/ci/todo.json";
 const DEFAULT_REVIEW_JSON: &str = ".blaze/ci/github-review.json";
 const CI_FILE_FRAME: usize = 32 << 20;
@@ -49,7 +49,7 @@ pub(crate) enum OutputStyle {
 /// Serialization format for the CI todo artifact.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TodoKindFormat {
-    Nuon,
+    Btab,
     Json,
 }
 
@@ -84,7 +84,7 @@ impl<'a> CiArgs<'a> {
     }
 
     /// Resolve effective todo format: explicit `--todo-format`, else inferred from `--todo`
-    /// extension (`.json` -> Json), else NUON (LLM-first default).
+    /// extension (`.json` -> Json), else Blaze Tabular Data (`btab`, LLM-first default).
     pub(crate) fn resolved_todo_format(&self) -> TodoKindFormat {
         if let Some(fmt) = self.todo_format {
             return fmt;
@@ -94,7 +94,7 @@ impl<'a> CiArgs<'a> {
         {
             return TodoKindFormat::Json;
         }
-        TodoKindFormat::Nuon
+        TodoKindFormat::Btab
     }
 
     /// Resolve effective todo file path, or `None` when `--no-todo`.
@@ -106,7 +106,7 @@ impl<'a> CiArgs<'a> {
             return Some(path);
         }
         match self.resolved_todo_format() {
-            TodoKindFormat::Nuon => Some(DEFAULT_TODO_NUON),
+            TodoKindFormat::Btab => Some(DEFAULT_TODO_BTAB),
             TodoKindFormat::Json => Some(DEFAULT_TODO_JSON),
         }
     }
@@ -123,9 +123,9 @@ fn parse_style(word: &str) -> Result<OutputStyle, CliError> {
 
 fn parse_todo_format(word: &str) -> Result<TodoKindFormat, CliError> {
     match word {
-        "nuon" => Ok(TodoKindFormat::Nuon),
+        "btab" | "tab" => Ok(TodoKindFormat::Btab),
         "json" => Ok(TodoKindFormat::Json),
-        _ => Err(CliError::Usage("--todo-format is nuon or json")),
+        _ => Err(CliError::Usage("--todo-format is btab, tab or json")),
     }
 }
 
@@ -165,7 +165,7 @@ pub(crate) fn parse_ci_args(args: &bstd::args::Args) -> Result<CiArgs<'_>, CliEr
             _ if let Some(raw) = arg.strip_prefix("--format=") => parsed.style = parse_style(raw)?,
             "--todo" => parsed.todo_path = Some(next_val("--todo takes a file path")?),
             _ if let Some(raw) = arg.strip_prefix("--todo=") => parsed.todo_path = Some(raw),
-            "--todo-format" => parsed.todo_format = Some(parse_todo_format(next_val("--todo-format is nuon or json")?)?),
+            "--todo-format" => parsed.todo_format = Some(parse_todo_format(next_val("--todo-format is btab, tab or json")?)?),
             _ if let Some(raw) = arg.strip_prefix("--todo-format=") => parsed.todo_format = Some(parse_todo_format(raw)?),
             "--color" => parsed.color = parse_color(next_val("--color is auto, always or never")?)?,
             _ if let Some(raw) = arg.strip_prefix("--color=") => parsed.color = parse_color(raw)?,
@@ -514,65 +514,100 @@ fn write_json_str(out: &mut String<&Frame>, s: &str) {
     out.push('"');
 }
 
-/// Escape a string for NUON double-quoted string literal.
-fn write_nuon_str(out: &mut String<&Frame>, s: &str) {
-    write_json_str(out, s);
+/// Build the structured [`bstd::data::Value`] for a `blaze ci` report.
+///
+/// Absent optional fields (`file` when empty, `line`/`col` when 0, `suggestion` and `command`
+/// when `None`) are omitted from each row map so [`bstd::tab`] emits compact sparse union-schema
+/// tables using `_` instead of repeating `null`.
+fn build_report_value<'a>(
+    items: &[TodoItem<'_>],
+    summary: &Summary,
+    allow_incomplete: bool,
+    alloc: blaze_own::Alloc<'a>,
+) -> bstd::data::Value<blaze_own::Alloc<'a>> {
+    use bstd::data::{Int, Map, Value};
+
+    let status = if summary.passed(allow_incomplete) { "passed" } else { "failed" };
+
+    let mut sum_map = Map::new_in(alloc);
+    sum_map.insert(String::from_str_in("errors", alloc), Value::Int(Int::from_u64(u64::from(summary.errors))));
+    sum_map.insert(String::from_str_in("warnings", alloc), Value::Int(Int::from_u64(u64::from(summary.warnings))));
+    sum_map.insert(
+        String::from_str_in("unused_deps", alloc),
+        Value::Int(Int::from_u64(u64::from(summary.unused_deps))),
+    );
+    sum_map.insert(String::from_str_in("format", alloc), Value::Int(Int::from_u64(u64::from(summary.format))));
+    sum_map.insert(
+        String::from_str_in("test_failures", alloc),
+        Value::Int(Int::from_u64(u64::from(summary.test_failures))),
+    );
+    sum_map.insert(
+        String::from_str_in("incomplete", alloc),
+        Value::Int(Int::from_u64(u64::from(summary.incomplete))),
+    );
+
+    let mut todo = Vec::with_capacity_in(items.len(), alloc);
+    for item in items.iter() {
+        let mut row = Map::new_in(alloc);
+        row.insert(String::from_str_in("kind", alloc), Value::Text(String::from_str_in(item.kind.name(), alloc)));
+        if !item.file.is_empty() {
+            row.insert(String::from_str_in("file", alloc), Value::Text(String::from_str_in(item.file, alloc)));
+        }
+        if item.line > 0 {
+            row.insert(String::from_str_in("line", alloc), Value::Int(Int::from_u64(u64::from(item.line))));
+        }
+        if item.col > 0 {
+            row.insert(String::from_str_in("col", alloc), Value::Int(Int::from_u64(u64::from(item.col))));
+        }
+        row.insert(String::from_str_in("code", alloc), Value::Text(String::from_str_in(item.code, alloc)));
+        row.insert(String::from_str_in("message", alloc), Value::Text(String::from_str_in(item.message, alloc)));
+        if let Some(s) = item.suggestion {
+            let mut sug = Map::new_in(alloc);
+            sug.insert(
+                String::from_str_in("start_line", alloc),
+                Value::Int(Int::from_u64(u64::from(s.start_line))),
+            );
+            sug.insert(String::from_str_in("end_line", alloc), Value::Int(Int::from_u64(u64::from(s.end_line))));
+            sug.insert(
+                String::from_str_in("replacement", alloc),
+                Value::Text(String::from_str_in(s.replacement, alloc)),
+            );
+            row.insert(String::from_str_in("suggestion", alloc), Value::Map(sug));
+        }
+        if let Some(cmd) = item.command {
+            row.insert(String::from_str_in("command", alloc), Value::Text(String::from_str_in(cmd, alloc)));
+        }
+        todo.push(Value::Map(row));
+    }
+
+    let mut root = Map::new_in(alloc);
+    root.insert(String::from_str_in("schema", alloc), Value::Int(Int::from_u64(1)));
+    root.insert(String::from_str_in("status", alloc), Value::Text(String::from_str_in(status, alloc)));
+    root.insert(String::from_str_in("summary", alloc), Value::Map(sum_map));
+    root.insert(String::from_str_in("todo", alloc), Value::List(todo));
+    Value::Map(root)
 }
 
-/// Serialize the CI report as compact, token-efficient NUON.
+/// Serialize the CI report as compact, token-efficient Blaze Tabular Data (`bstd::tab`).
 ///
-/// Uses NUON's table syntax (`[[cols...]; [row...]]`) when `items` is non-empty so column names
-/// are declared once instead of repeated per item.
-pub(crate) fn render_nuon<'f>(
+/// Uses [`bstd::tab::write_pretty`] over [`build_report_value`] so non-empty `todo` lists compress
+/// into homogeneous or sparse union-schema tables (`[[cols...]; [row...]]`) with `_` for omitted
+/// optional fields and unquoted bare paths.
+pub(crate) fn render_btab<'f>(
     items: &[TodoItem<'_>],
     summary: &Summary,
     allow_incomplete: bool,
     frame: &'f Frame,
-) -> String<&'f Frame> {
-    let status = if summary.passed(allow_incomplete) { "passed" } else { "failed" };
-    let mut out = String::new_in(frame);
-    let _ = writeln!(out, "{{");
-    let _ = writeln!(out, "  schema: 1");
-    let _ = writeln!(out, "  status: {status}");
-    let _ = writeln!(
-        out,
-        "  summary: {{ errors: {} warnings: {} unused_deps: {} format: {} test_failures: {} incomplete: {} }}",
-        summary.errors, summary.warnings, summary.unused_deps, summary.format, summary.test_failures, summary.incomplete
-    );
-    if items.is_empty() {
-        let _ = writeln!(out, "  todo: []");
-    } else {
-        let _ = writeln!(out, "  todo: [");
-        let _ = writeln!(out, "    [kind file line col code message suggestion command];");
-        for item in items.iter() {
-            out.push_str("    [");
-            out.push_str(item.kind.name());
-            out.push(' ');
-            write_nuon_str(&mut out, item.file);
-            let _ = write!(out, " {} {} ", item.line, item.col);
-            write_nuon_str(&mut out, item.code);
-            out.push(' ');
-            write_nuon_str(&mut out, item.message);
-            out.push(' ');
-            match item.suggestion {
-                Some(s) => {
-                    let _ = write!(out, "{{ start_line: {} end_line: {} replacement: ", s.start_line, s.end_line);
-                    write_nuon_str(&mut out, s.replacement);
-                    out.push_str(" }");
-                }
-                None => out.push_str("null"),
-            }
-            out.push(' ');
-            match item.command {
-                Some(cmd) => write_nuon_str(&mut out, cmd),
-                None => out.push_str("null"),
-            }
-            out.push_str("]\n");
-        }
-        let _ = writeln!(out, "  ]");
-    }
-    let _ = writeln!(out, "}}");
-    out
+) -> Result<String<&'f Frame>, CliError> {
+    let erased = blaze_own::Erased::new(frame);
+    let alloc = erased.handle();
+    let value = build_report_value(items, summary, allow_incomplete, alloc);
+    let written = bstd::tab::write_pretty(&value, alloc)
+        .map_err(|_| CliError::Text { what: "blaze ci: failed to serialize todo.btab" })?;
+    let mut out = String::with_capacity_in(written.len().saturating_add(1), frame);
+    out.push_str(written.as_str());
+    out.push('\n');
+    Ok(out)
 }
 
 /// Serialize the CI report as standard deterministic JSON.
@@ -1054,10 +1089,10 @@ pub(crate) fn run(
                 .since(started)
                 .map_or(0u64, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
 
-            // Write todo artifact (NUON default, or JSON).
+            // Write todo artifact (btab default, or JSON).
             if let Some(path) = todo_path {
                 let text = match todo_format {
-                    TodoKindFormat::Nuon => render_nuon(&items, &summary, ci_args.allow_incomplete, frame),
+                    TodoKindFormat::Btab => render_btab(&items, &summary, ci_args.allow_incomplete, frame)?,
                     TodoKindFormat::Json => render_json(&items, &summary, ci_args.allow_incomplete, frame),
                 };
                 write_output_file(cx, fs, ci.checkout, path, text.as_bytes(), false)?;
@@ -1119,18 +1154,18 @@ mod tests {
     }
 
     #[test]
-    fn nuon_and_json_serializers_emit_valid_compact_output() {
+    fn btab_and_json_serializers_emit_valid_compact_output() {
         let frame = test_frame();
         let summary = Summary {
             errors: 1,
             warnings: 0,
             unused_deps: 1,
             format: 0,
-            test_failures: 0,
+            test_failures: 1,
             incomplete: 0,
             tests_passed: 0,
             tests_ignored: 0,
-            tests_ran: false,
+            tests_ran: true,
             fixes_applied: 0,
             files_fixed: 0,
         };
@@ -1155,15 +1190,36 @@ mod tests {
                 suggestion: Some(Suggestion { start_line: 7, end_line: 7, replacement: "" }),
                 command: Some("blaze check --fix 23456"),
             },
+            TodoItem {
+                kind: ItemKind::TestFailure,
+                file: "",
+                line: 0,
+                col: 0,
+                code: "test-failed",
+                message: "1 test(s) failed",
+                suggestion: None,
+                command: Some("blaze test"),
+            },
         ];
 
-        let nuon = render_nuon(&items, &summary, false, &frame);
-        let nuon_s = nuon.as_str();
-        assert!(nuon_s.contains("schema: 1"));
-        assert!(nuon_s.contains("status: failed"));
-        assert!(nuon_s.contains("[kind file line col code message suggestion command];"));
-        assert!(nuon_s.contains("[unused_dependency \"app/Cargo.toml\" 7 1 \"unused-dependency\""));
-        assert!(nuon_s.contains("{ start_line: 7 end_line: 7 replacement: \"\" }"));
+        let btab = render_btab(&items, &summary, false, &frame).expect("render_btab failed");
+        let btab_s = btab.as_str();
+        assert!(btab_s.contains("schema: 1"), "missing schema:\n{btab_s}");
+        assert!(btab_s.contains("status: failed"), "missing status:\n{btab_s}");
+        assert!(btab_s.contains("todo: [["), "expected compact table syntax:\n{btab_s}");
+        assert!(btab_s.contains("];"), "expected table header terminator:\n{btab_s}");
+        assert!(btab_s.contains("app/Cargo.toml"), "expected bare path:\n{btab_s}");
+        assert!(btab_s.contains("app/src/lib.rs"), "expected bare path:\n{btab_s}");
+        assert!(!btab_s.contains("\"app/Cargo.toml\""), "path should be bare, not quoted:\n{btab_s}");
+        assert!(btab_s.contains(" _ "), "expected absent-field sentinel `_` in sparse rows:\n{btab_s}");
+        assert!(!btab_s.contains("null"), "omitted optional fields must not emit null:\n{btab_s}");
+
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        let expected = build_report_value(&items, &summary, false, alloc);
+        let parsed = bstd::tab::read(btab_s.as_bytes(), bstd::tab::Limits::SHIPPED, alloc)
+            .expect("todo.btab must round-trip via bstd::tab::read");
+        assert_eq!(parsed, expected);
 
         let json = render_json(&items, &summary, false, &frame);
         let json_s = json.as_str();
@@ -1173,11 +1229,37 @@ mod tests {
         assert!(json_s.contains("\"kind\":\"unused_dependency\""));
         assert!(json_s.contains("\"replacement\":\"\""));
 
-        // Empty passed report
+        // Empty passed report round-trips cleanly too.
         let clean = Summary::default();
-        let nuon_clean = render_nuon(&[], &clean, false, &frame);
-        assert!(nuon_clean.as_str().contains("status: passed"));
-        assert!(nuon_clean.as_str().contains("todo: []"));
+        let btab_clean = render_btab(&[], &clean, false, &frame).expect("clean render_btab failed");
+        assert!(btab_clean.as_str().contains("status: passed"));
+        assert!(btab_clean.as_str().contains("todo: []"));
+        let expected_clean = build_report_value(&[], &clean, false, alloc);
+        let parsed_clean = bstd::tab::read(btab_clean.as_bytes(), bstd::tab::Limits::SHIPPED, alloc)
+            .expect("clean todo.btab must round-trip via bstd::tab::read");
+        assert_eq!(parsed_clean, expected_clean);
+    }
+
+    #[test]
+    fn todo_format_defaults_to_btab_and_infers_json_from_extension() {
+        assert_eq!(parse_todo_format("btab").ok(), Some(TodoKindFormat::Btab));
+        assert_eq!(parse_todo_format("tab").ok(), Some(TodoKindFormat::Btab));
+        assert_eq!(parse_todo_format("json").ok(), Some(TodoKindFormat::Json));
+        assert!(parse_todo_format("nuon").is_err());
+
+        let default_args = CiArgs::empty();
+        assert_eq!(default_args.resolved_todo_format(), TodoKindFormat::Btab);
+        assert_eq!(default_args.resolved_todo_path(), Some(".blaze/ci/todo.btab"));
+
+        let mut json_ext = CiArgs::empty();
+        json_ext.todo_path = Some("out/report.json");
+        assert_eq!(json_ext.resolved_todo_format(), TodoKindFormat::Json);
+        assert_eq!(json_ext.resolved_todo_path(), Some("out/report.json"));
+
+        let mut custom_btab = CiArgs::empty();
+        custom_btab.todo_path = Some("out/report.btab");
+        assert_eq!(custom_btab.resolved_todo_format(), TodoKindFormat::Btab);
+        assert_eq!(custom_btab.resolved_todo_path(), Some("out/report.btab"));
     }
 
     #[test]
@@ -1229,7 +1311,7 @@ mod tests {
             suggestion: None,
             command: None,
         };
-        let md = render_step_summary(&[item], &summary, false, 42, Some(".blaze/ci/todo.nuon"), &frame);
+        let md = render_step_summary(&[item], &summary, false, 42, Some(".blaze/ci/todo.btab"), &frame);
         assert!(md.as_str().contains("## blaze ci: FAILED (42 ms)"));
         assert!(md.as_str().contains("| `unused-deps` | fail | 1 unused dependency(ies) |"));
         assert!(md.as_str().contains("| `test` | pass | 3 passed, 0 failed/unrun, 0 ignored |"));

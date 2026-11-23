@@ -638,6 +638,43 @@ pub mod toml {
 /// LLM-first tabular structured data format (TAB) over [`data::Value`] (`blaze-tab`).
 pub mod tab {
     pub use blaze_tab::*;
+
+    #[cfg(test)]
+    mod tests {
+        use crate::data::{Int, Map, Value};
+        use crate::tab::{Limits, read, write_pretty};
+        use blaze_own::{String, Vec};
+
+        #[test]
+        fn sparse_table_round_trip_via_bstd_tab() {
+            let alloc = blaze_own::testing::heap().alloc();
+
+            let mut row1 = Map::new_in(alloc);
+            row1.insert(String::from_str_in("kind", alloc), Value::Text(String::from_str_in("error", alloc)));
+            row1.insert(String::from_str_in("file", alloc), Value::Text(String::from_str_in("src/main.rs", alloc)));
+            row1.insert(String::from_str_in("line", alloc), Value::Int(Int::from_u64(12)));
+
+            let mut row2 = Map::new_in(alloc);
+            row2.insert(String::from_str_in("kind", alloc), Value::Text(String::from_str_in("warning", alloc)));
+            row2.insert(String::from_str_in("file", alloc), Value::Text(String::from_str_in("Cargo.toml", alloc)));
+            row2.insert(String::from_str_in("line", alloc), Value::Int(Int::from_u64(8)));
+            row2.insert(String::from_str_in("fix", alloc), Value::Text(String::from_str_in("remove dep", alloc)));
+
+            let mut rows = Vec::new_in(alloc);
+            rows.push(Value::Map(row1));
+            rows.push(Value::Map(row2));
+            let doc = Value::List(rows);
+
+            let rendered = write_pretty(&doc, alloc).expect("bstd::tab::write_pretty failed");
+            let text = rendered.as_str();
+            assert!(text.starts_with("[["), "expected tabular header:\n{text}");
+            assert!(text.contains("src/main.rs"), "expected bare path:\n{text}");
+            assert!(text.contains('_'), "expected sparse absent sentinel `_`:\n{text}");
+
+            let parsed = read(text.as_bytes(), Limits::SHIPPED, alloc).expect("bstd::tab::read failed");
+            assert_eq!(parsed, doc);
+        }
+    }
 }
 
 /// Canonical RFC 4648 Base64 encoding and decoding (`STANDARD`, `URL_SAFE`, padded and unpadded; `blaze-base64`).
