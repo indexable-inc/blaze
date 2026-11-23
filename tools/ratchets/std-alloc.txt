@@ -94,14 +94,14 @@ blaze-reclaim	1	1	0	8
 blaze-record	0	0	3	5
 blaze-remote	76	1	4	404
 blaze-report	11	1	0	99
-blaze-resolve	103	1	0	328
+blaze-resolve	103	1	0	326
 blaze-run	2	0	0	1
 blaze-scope	126	0	0	381
 blaze-screen	0	0	11	132
 blaze-script	127	1	0	330
 blaze-semver	0	0	4	0
 blaze-sim	31	1	0	132
-blaze-solve	26	0	0	220
+blaze-solve	25	0	0	219
 blaze-sort	5	0	0	5
 blaze-source	22	1	0	26
 blaze-spin	2	1	0	0

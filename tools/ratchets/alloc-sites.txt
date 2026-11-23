@@ -73,7 +73,7 @@ blaze-reclaim	3	0	0	0
 blaze-record	4	0	0	2
 blaze-remote	1	0	57	117
 blaze-report	42	0	1	45
-blaze-resolve	5	0	113	66
+blaze-resolve	5	0	103	64
 blaze-scope	0	0	0	47
 blaze-screen	254	0	0	37
 blaze-script	0	0	6	117
@@ -126,7 +126,7 @@ harness/vendor/hyperion-ecs	0	0	0	13
 harness/vendor/hyperion-manifest-types	0	0	0	3
 intern	8	0	0	0
 ix-prof	46	0	73	170
-parser	33	0	0	23
+parser	32	0	0	23
 paths	0	0	0	1
 rustc_abi	0	0	0	5
 stdx	23	0	0	21
