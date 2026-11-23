@@ -676,57 +676,12 @@ impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
     }
 }
 
-/// `core::any::type_name`'s item paths over the names source ([`type_name_path`]).
+/// `core::any::type_name`'s item paths over the names source and store
+/// (`super::type_name::item_path`, shared with the build seam).
 impl<'n, S: NamesSource<'n>> blaze_build::type_name::TypeNames for ConstsWorld<'_, 'n, S> {
     fn item_path(&self, item: ItemKey, out: &mut dyn FnMut(&str)) -> bool {
-        type_name_path(self.names, self.keys, item, out)
+        super::type_name::item_path(self.names, self.keys, self.store, item, out)
     }
-}
-
-/// The path `type_name` prints checker key `item` by, as rustc prints a def path: the
-/// declaring module's path from its crate's name (`core::option`, never a re-export's
-/// `std::option`) and the item's name; a trait's member as its trait's path and its name
-/// (`core::iter::Iterator::next`). `false`, with `out` not called (the printer then refuses
-/// naming the item: never a path made up): a member of an impl (rustc prints
-/// `<Self as Trait>::name`, which needs the impl's self type printed, not done here), an item
-/// in a block's module (rustc prints the enclosing fn's path and `{{closure}}`-like parts), or
-/// an item the source names no module or name for.
-fn type_name_path<'n, S: NamesSource<'n>>(names: S, keys: &Keys, item: ItemKey, out: &mut dyn FnMut(&str)) -> bool {
-    if let Some(super::keys::Origin::Member { container, name, .. }) = keys.origin(item) {
-        return match keys.library_in(names, *container) {
-            Some(owner) => type_name_member(names, owner, name, out),
-            None => false,
-        };
-    }
-    let Some(lib) = keys.library_in(names, item) else { return false };
-    match names.member_owner(lib) {
-        Some((owner, name)) => type_name_member(names, owner, name, out),
-        None => type_name_item(names, lib, out),
-    }
-}
-
-/// Member `name` of library item `owner`: printed only when `owner` is a trait (an impl has no
-/// name of its own: [`type_name_path`]).
-fn type_name_member<'n, S: NamesSource<'n>>(names: S, owner: LibKey, name: &str, out: &mut dyn FnMut(&str)) -> bool {
-    if names.name_of(owner).is_none() || !type_name_item(names, owner, out) {
-        return false;
-    }
-    out("::");
-    out(name);
-    true
-}
-
-/// A module-level library item: its module's path, `::`, its name; `out` is called only once
-/// all three are known.
-fn type_name_item<'n, S: NamesSource<'n>>(names: S, lib: LibKey, out: &mut dyn FnMut(&str)) -> bool {
-    let (Some(home), Some(name)) = (names.home_of(lib), names.name_of(lib)) else { return false };
-    let Some(path) = names.module_path(home) else { return false };
-    if !path.is_empty() {
-        out(path);
-        out("::");
-    }
-    out(name);
-    true
 }
 
 /// Where an evaluation starts ([`Consts::value_at`]): `item` at no arguments; a trait's
