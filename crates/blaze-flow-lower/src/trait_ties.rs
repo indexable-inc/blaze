@@ -151,12 +151,12 @@ pub(crate) enum TieEnd {
 /// What the impls answering a call's bounds put on it (the module's rule (d)): each `(a, b)`
 /// is `a: b`. Filled by [`Lower::tie_bounds_open`] before the call's positions have origins,
 /// related by [`Lower::tie_impl_relations`] once they may be made.
-pub(crate) struct ImplTies<A: Allocator + Clone> {
+pub(crate) struct ImplTies<A: Allocator + Copy> {
     pub(crate) rel: Vec<(TieEnd, TieEnd), A>,
     pub(crate) free: u32,
 }
 
-impl<A: Allocator + Clone> ImplTies<A> {
+impl<A: Allocator + Copy> ImplTies<A> {
     pub(crate) fn new_in(alloc: A) -> ImplTies<A> {
         ImplTies { rel: Vec::new_in(alloc), free: 0 }
     }
@@ -166,7 +166,7 @@ impl<A: Allocator + Clone> ImplTies<A> {
 /// (`Form::Bound`).
 const MOST_IMPL_TIES: usize = 1 << 14;
 
-impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
+impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
     /// Seeds `inst` (the call's instantiation of `callee`'s regions, before any is made) with
     /// the caller's placeholder for each trait lifetime the call's bounds fix (the module's
     /// rule), `args` the call's type arguments; what an impl's header answers goes to
@@ -293,7 +293,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
         // (a trait object, an alias, an opaque type, a closure: `unplaced`), and no impl type
         // parameter covering a position of `a` (then the column is shorter). `a`'s own type
         // parameters (the caller's) hold no position.
-        let mut held: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let mut held: Vec<u32, A> = Vec::new_in(self.alloc);
         let positions = self.npos(a, e)?;
         if self.unplaced(a, e, &mut held)? || self_col.len() != positions {
             return self.refuse(miss(TieMiss::ImplHeader), e);
@@ -338,8 +338,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
             }
             true
         };
-        let mut xs: Vec<TieEnd, A> = Vec::new_in(self.alloc.clone());
-        let mut ys: Vec<TieEnd, A> = Vec::new_in(self.alloc.clone());
+        let mut xs: Vec<TieEnd, A> = Vec::new_in(self.alloc);
+        let mut ys: Vec<TieEnd, A> = Vec::new_in(self.alloc);
         // Each trait lifetime IS the impl's argument there: both ways (a trait's parameters
         // are invariant, the module's rule (a)).
         for (&x, &r) in theirs.iter().zip(own.iter()) {
@@ -409,7 +409,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
         if ties.rel.is_empty() {
             return Ok(());
         }
-        let mut free: Vec<Origin, A> = Vec::new_in(self.alloc.clone());
+        let mut free: Vec<Origin, A> = Vec::new_in(self.alloc);
         for _ in 0..ties.free {
             let o = self.b.origin(false);
             free.push(o);

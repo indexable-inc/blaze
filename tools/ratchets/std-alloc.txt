@@ -11,7 +11,7 @@ blaze-audit	0	0	24	153
 blaze-base64	0	0	1	0
 blaze-bench	13	1	0	34
 blaze-blake3	23	0	0	20
-blaze-body-build	0	0	5	51
+blaze-body-build	0	0	2	0
 blaze-body-eval	0	0	4	3
 blaze-bstd-convert	6	0	13	436
 blaze-build	4	1	0	297

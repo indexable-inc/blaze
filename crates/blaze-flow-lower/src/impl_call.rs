@@ -67,7 +67,7 @@ use core::alloc::Allocator;
 use crate::hidden_call::{HiddenCall, HiddenWhy, LaidSig};
 use crate::{At, Facts, Form, Laid, Lower, Refusal, Region, SigLife, TyD, Val};
 
-impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
+impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
     /// A call of `item` (its column `life`, laid as `laid`, holding a hidden position) whose
     /// type arguments carry origins and name none of the caller's generics: each hidden input
     /// whose argument carries origins is read through the selected impl (the module doc).
@@ -90,13 +90,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower
         // whose counts differ (an opaque type among them) is refused at its hidden input below.
         let numbered = rows.len() == laid.hidden();
         let facts: &'b F = self.facts;
-        let mut inst: Vec<(Region, Origin), A> = Vec::new_in(self.alloc.clone());
+        let mut inst: Vec<(Region, Origin), A> = Vec::new_in(self.alloc);
         // The CLOSED call's column (the module doc): each input's laid regions, a hidden
         // position replaced by its impl value's column, each impl lifetime renumbered past
         // every region the callee's column and bounds name (`next`), one block per row.
         let mut closed = facts.ties(item).is_none_or(|t| t.rows.is_empty());
-        let mut wide: Vec<Region, A> = Vec::new_in(self.alloc.clone());
-        let mut ends: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let mut wide: Vec<Region, A> = Vec::new_in(self.alloc);
+        let mut ends: Vec<u32, A> = Vec::new_in(self.alloc);
         let named = life.slots().iter().chain(life.bounds().iter().flat_map(|(a, b)| [a, b]));
         let mut next = named.filter_map(|r| match *r {
             Region::Param(i) => i.checked_add(1),

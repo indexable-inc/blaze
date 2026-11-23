@@ -64,19 +64,19 @@ pub(crate) struct PlaceSubtrees<A: Allocator> {
     order: Vec<u32, A>,
 }
 
-impl<A: Allocator + Clone> PlaceSubtrees<A> {
+impl<A: Allocator + Copy> PlaceSubtrees<A> {
     pub(crate) fn new_in<B: Allocator>(flow: &Flow<B>, alloc: A) -> Self {
         let m = flow.places.len();
-        let mut enter = Vec::with_capacity_in(m, alloc.clone());
+        let mut enter = Vec::with_capacity_in(m, alloc);
         enter.resize(m, 0u32);
-        let mut exit = Vec::with_capacity_in(m, alloc.clone());
+        let mut exit = Vec::with_capacity_in(m, alloc);
         exit.resize(m, 0u32);
-        let mut order = Vec::with_capacity_in(m, alloc.clone());
+        let mut order = Vec::with_capacity_in(m, alloc);
         if m == 0 {
             return Self { enter, exit, order };
         }
         // Build CSR of direct children for each place.
-        let mut child_off = Vec::with_capacity_in(m + 1, alloc.clone());
+        let mut child_off = Vec::with_capacity_in(m + 1, alloc);
         child_off.resize(m + 1, 0u32);
         for row in flow.places.iter() {
             if let Some(par) = row.parent {
@@ -89,7 +89,7 @@ impl<A: Allocator + Clone> PlaceSubtrees<A> {
             *c = end;
         }
         child_off[m] = end;
-        let mut children = Vec::with_capacity_in(end as usize, alloc.clone());
+        let mut children = Vec::with_capacity_in(end as usize, alloc);
         children.resize(end as usize, 0u32);
         for q in (0..m).rev() {
             if let Some(par) = flow.places[q].parent {
@@ -270,12 +270,12 @@ fn transfer_with<A: Allocator, B: Allocator>(
 /// The two forward dataflows, join = union, solved with an RPO worklist over reachable statements.
 /// Bound: every pop corresponds to initial reach or at least one monotone bit change, so pops
 /// are at most `2 * stmts * places + stmts + 1`.
-pub fn inits<A: Allocator + Clone>(flow: &Flow<A>, plant: Plant, alloc: A) -> Result<Inits<A>, Bound> {
+pub fn inits<A: Allocator + Copy>(flow: &Flow<A>, plant: Plant, alloc: A) -> Result<Inits<A>, Bound> {
     let (n, m) = (flow.stmts.len(), flow.places.len());
-    let subtrees = PlaceSubtrees::new_in(flow, alloc.clone());
-    let mut init = Bits::new_in(n, m, alloc.clone());
-    let mut uninit = Bits::new_in(n, m, alloc.clone());
-    let mut reached = Vec::with_capacity_in(n, alloc.clone());
+    let subtrees = PlaceSubtrees::new_in(flow, alloc);
+    let mut init = Bits::new_in(n, m, alloc);
+    let mut uninit = Bits::new_in(n, m, alloc);
+    let mut reached = Vec::with_capacity_in(n, alloc);
     reached.resize(n, false);
     if n == 0 {
         return Ok(Inits { init, uninit, reached, subtrees });
@@ -291,10 +291,10 @@ pub fn inits<A: Allocator + Clone>(flow: &Flow<A>, plant: Plant, alloc: A) -> Re
         }
     }
     // Compute RPO of statements reachable from `entry` via iterative DFS.
-    let mut seen = Vec::with_capacity_in(n, alloc.clone());
+    let mut seen = Vec::with_capacity_in(n, alloc);
     seen.resize(n, false);
-    let mut rpo = Vec::with_capacity_in(n, alloc.clone());
-    let mut dfs = Vec::with_capacity_in(n, alloc.clone());
+    let mut rpo = Vec::with_capacity_in(n, alloc);
+    let mut dfs = Vec::with_capacity_in(n, alloc);
     seen[e] = true;
     dfs.push((e as u32, 0u32));
     while let Some((node, next)) = dfs.last_mut() {
@@ -315,16 +315,16 @@ pub fn inits<A: Allocator + Clone>(flow: &Flow<A>, plant: Plant, alloc: A) -> Re
     drop(seen);
     rpo.reverse();
     let k = rpo.len();
-    let mut rank = Vec::with_capacity_in(n, alloc.clone());
+    let mut rank = Vec::with_capacity_in(n, alloc);
     rank.resize(n, u32::MAX);
     for (r, &s) in rpo.iter().enumerate() {
         rank[s as usize] = r as u32;
     }
 
     let w = init.words();
-    let mut si = Vec::with_capacity_in(w, alloc.clone());
+    let mut si = Vec::with_capacity_in(w, alloc);
     si.resize(w, 0u64);
-    let mut su = Vec::with_capacity_in(w, alloc.clone());
+    let mut su = Vec::with_capacity_in(w, alloc);
     su.resize(w, 0u64);
     let mut worklist = BitWorklist::new_in(k, alloc);
     worklist.push(rank[e] as usize);
@@ -407,17 +407,17 @@ pub fn move_out<A: Allocator>(flow: &Flow<A>, mut p: Place) -> Option<MoveOut> {
 }
 
 /// The move check's findings, in statement order, then operand order, then the destination.
-pub fn check_moves<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Result<Vec<MoveFinding, A>, Bound> {
+pub fn check_moves<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<Vec<MoveFinding, A>, Bound> {
     check_moves_planted(flow, Plant::None, alloc)
 }
 
 #[doc(hidden)]
-pub fn check_moves_planted<A: Allocator + Clone>(
+pub fn check_moves_planted<A: Allocator + Copy>(
     flow: &Flow<A>,
     plant: Plant,
     alloc: A,
 ) -> Result<Vec<MoveFinding, A>, Bound> {
-    let st = inits(flow, plant, alloc.clone())?;
+    let st = inits(flow, plant, alloc)?;
     // A statement's operands are read in order, each after the moves of those before it (the
     // Reference, "Evaluation order of operands": left to right; MIR borrowck checks `(move p,
     // move p)` operand by operand, E0382). Checked all against the statement's entry state,
@@ -425,9 +425,9 @@ pub fn check_moves_planted<A: Allocator + Clone>(
     // the entry state with the earlier operands' moves applied; `scratch` takes `deinit`'s
     // init half, unused.
     let w = st.uninit.words();
-    let mut seen: Vec<u64, A> = Vec::with_capacity_in(w, alloc.clone());
+    let mut seen: Vec<u64, A> = Vec::with_capacity_in(w, alloc);
     seen.resize(w, 0u64);
-    let mut scratch: Vec<u64, A> = Vec::with_capacity_in(w, alloc.clone());
+    let mut scratch: Vec<u64, A> = Vec::with_capacity_in(w, alloc);
     scratch.resize(w, 0u64);
     let mut out = Vec::new_in(alloc);
     for s in 0..flow.stmts.len() {

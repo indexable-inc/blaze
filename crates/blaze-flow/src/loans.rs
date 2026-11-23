@@ -226,13 +226,13 @@ struct Csr<T, A: Allocator> {
     entries: Vec<T, A>,
 }
 
-impl<T: Copy, A: Allocator + Clone> Csr<T, A> {
+impl<T: Copy, A: Allocator + Copy> Csr<T, A> {
     fn from_iter(
         rows: usize,
         iter: impl ExactSizeIterator<Item = (usize, T)> + Clone,
         alloc: A,
     ) -> Self {
-        let mut offsets = Vec::with_capacity_in(rows + 1, alloc.clone());
+        let mut offsets = Vec::with_capacity_in(rows + 1, alloc);
         offsets.resize(rows + 1, 0u32);
         let mut entries = Vec::with_capacity_in(iter.len(), alloc);
         for (k, v) in iter.clone() {
@@ -264,25 +264,25 @@ impl<T, A: Allocator> Csr<T, A> {
 /// origin liveness from it (RFC 2094: "a lifetime L is live at a point P if there is some
 /// variable `p` which is live at P, and L appears in the type of `p`"), and activation
 /// (forward, RPO worklist; bound `stmts * loans + stmts + 1`).
-pub fn facts<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>, Bound> {
+pub fn facts<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>, Bound> {
     let (n, nl, o) = (flow.stmts.len(), flow.loans.len(), flow.origins as usize);
     let locals = flow.locals as usize;
     // Where each drop may run: the move check's dataflow, unplanted (a planted move bug is
     // the move check's control, not liveness's).
-    let init = crate::moves::inits(flow, Plant::None, alloc.clone())?;
-    let mut live_in = Bits::new_in(n, locals, alloc.clone());
-    let mut live_out = Bits::new_in(n, locals, alloc.clone());
+    let init = crate::moves::inits(flow, Plant::None, alloc)?;
+    let mut live_in = Bits::new_in(n, locals, alloc);
+    let mut live_out = Bits::new_in(n, locals, alloc);
 
     if n == 0 {
-        let live = Bits::new_in(0, o, alloc.clone());
+        let live = Bits::new_in(0, o, alloc);
         let active = Bits::new_in(0, nl, alloc);
         return Ok(Facts { live, active, init });
     }
 
     // Precompute per-statement `(def, uses)` and whether any `Activate` exists once.
-    let mut defs = Vec::with_capacity_in(n, alloc.clone());
-    let mut uses_off = Vec::with_capacity_in(n + 1, alloc.clone());
-    let mut uses_data = Vec::with_capacity_in(n, alloc.clone());
+    let mut defs = Vec::with_capacity_in(n, alloc);
+    let mut uses_off = Vec::with_capacity_in(n + 1, alloc);
+    let mut uses_data = Vec::with_capacity_in(n, alloc);
     let mut has_activate = false;
     uses_off.push(0u32);
     for s in 0..n {
@@ -296,7 +296,7 @@ pub fn facts<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>,
     }
 
     // Build statement predecessor CSR in two linear passes.
-    let mut pred_off = Vec::with_capacity_in(n + 1, alloc.clone());
+    let mut pred_off = Vec::with_capacity_in(n + 1, alloc);
     pred_off.resize(n + 1, 0u32);
     for s in 0..n {
         flow.for_each_succ(Stmt(s as u32), |t| {
@@ -309,7 +309,7 @@ pub fn facts<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>,
         *c = total_edges;
     }
     pred_off[n] = total_edges;
-    let mut pred_entries = Vec::with_capacity_in(total_edges as usize, alloc.clone());
+    let mut pred_entries = Vec::with_capacity_in(total_edges as usize, alloc);
     pred_entries.resize(total_edges as usize, 0u32);
     for s in 0..n {
         flow.for_each_succ(Stmt(s as u32), |t| {
@@ -322,10 +322,10 @@ pub fn facts<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>,
 
     // Full-CFG DFS forest postorder (entry first, then any disconnected blocks).
     // Smallest `post_rank` is backward topological order; `(n - 1) - post_rank` is forward RPO.
-    let mut visited = Vec::with_capacity_in(n, alloc.clone());
+    let mut visited = Vec::with_capacity_in(n, alloc);
     visited.resize(n, false);
-    let mut postorder = Vec::with_capacity_in(n, alloc.clone());
-    let mut dfs = Vec::with_capacity_in(n, alloc.clone());
+    let mut postorder = Vec::with_capacity_in(n, alloc);
+    let mut dfs = Vec::with_capacity_in(n, alloc);
     let entry = flow.entry().index();
     let visit_root = |root: usize,
                       visited: &mut Vec<bool, A>,
@@ -357,7 +357,7 @@ pub fn facts<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>,
     }
     drop(dfs);
     drop(visited);
-    let mut post_rank = Vec::with_capacity_in(n, alloc.clone());
+    let mut post_rank = Vec::with_capacity_in(n, alloc);
     post_rank.resize(n, 0u32);
     for (r, &s) in postorder.iter().enumerate() {
         post_rank[s as usize] = r as u32;
@@ -365,7 +365,7 @@ pub fn facts<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>,
 
     // Backward liveness worklist:
     // `live_in(s) = use(s) | (live_out(s) - def(s))`, `live_out(s) = union_{t in succ(s)} live_in(t)`.
-    let mut worklist = BitWorklist::new_in(n, alloc.clone());
+    let mut worklist = BitWorklist::new_in(n, alloc);
     for s in 0..n {
         let lo = uses_off[s] as usize;
         let hi = uses_off[s + 1] as usize;
@@ -384,7 +384,7 @@ pub fn facts<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>,
     drop(uses_data);
     drop(uses_off);
 
-    let mut scratch_l = Vec::with_capacity_in(live_in.words(), alloc.clone());
+    let mut scratch_l = Vec::with_capacity_in(live_in.words(), alloc);
     scratch_l.resize(live_in.words(), 0u64);
     let limit = (2 * n * locals + 1) as u64;
     let mut pops = 0u64;
@@ -412,10 +412,10 @@ pub fn facts<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>,
     drop(defs);
 
     // Build `facts.live` via CSR `origins_by_local`, `trailing_zeros()`, and precomputed `ph_mask`.
-    let mut live = Bits::new_in(2 * n, o, alloc.clone());
+    let mut live = Bits::new_in(2 * n, o, alloc);
     if o > 0 {
         let ow = live.words();
-        let mut ph_mask = Vec::with_capacity_in(ow, alloc.clone());
+        let mut ph_mask = Vec::with_capacity_in(ow, alloc);
         ph_mask.resize(ow, 0u64);
         let mut has_ph = false;
         for origin in 0..o {
@@ -427,10 +427,10 @@ pub fn facts<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>,
         let origins_by_local = Csr::from_iter(
             locals,
             flow.local_origins.iter().map(|&(l, origin)| (l.index(), origin)),
-            alloc.clone(),
+            alloc,
         );
         let lw = live_in.words();
-        let mut local_has_origin = Vec::with_capacity_in(lw, alloc.clone());
+        let mut local_has_origin = Vec::with_capacity_in(lw, alloc);
         local_has_origin.resize(lw, 0u64);
         for l in 0..locals {
             if !origins_by_local.row(l).is_empty() {
@@ -479,9 +479,9 @@ pub fn facts<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Result<Facts<A>,
     drop(live_in);
     drop(live_out);
 
-    let mut active = Bits::new_in(n, nl, alloc.clone());
+    let mut active = Bits::new_in(n, nl, alloc);
     if has_activate && nl > 0 {
-        let mut reached = Vec::with_capacity_in(n, alloc.clone());
+        let mut reached = Vec::with_capacity_in(n, alloc);
         reached.resize(n, false);
         reached[entry] = true;
         let mut scratch = Vec::with_capacity_in(active.words(), alloc);
@@ -590,27 +590,27 @@ pub enum Kept {
 /// nearer use of a second holder; it never misses the true one, which is among them. Work: per
 /// finding, one sort of the subset edges' endpoints and one forward walk of the statements per
 /// holding local: findings are few, and nothing is computed for a body without one.
-pub fn loan_parts<A: Allocator + Clone>(
+pub fn loan_parts<A: Allocator + Copy>(
     flow: &Flow<A>,
     facts: &Facts<A>,
     borrows: &[BorrowFinding],
     alloc: A,
 ) -> Vec<LoanParts, A> {
-    let mut out = Vec::new_in(alloc.clone());
+    let mut out = Vec::new_in(alloc);
     if !borrows.iter().any(|f| matches!(f, BorrowFinding::Invalidated { .. })) {
         return out;
     }
     let o = flow.origins as usize;
     let n = flow.stmts.len();
     // The subset relation as rows by `from`, points dropped.
-    let mut edges = Vec::with_capacity_in(flow.subsets.len(), alloc.clone());
+    let mut edges = Vec::with_capacity_in(flow.subsets.len(), alloc);
     edges.extend(flow.subsets.iter().map(|&(_, a, b)| (a, b)));
     edges.sort_unstable();
     edges.dedup();
-    let mut holds = Vec::with_capacity_in(o, alloc.clone());
-    let mut stack = Vec::new_in(alloc.clone());
-    let mut seen = Vec::with_capacity_in(flow.locals as usize, alloc.clone());
-    let mut dist = Vec::with_capacity_in(n, alloc.clone());
+    let mut holds = Vec::with_capacity_in(o, alloc);
+    let mut stack = Vec::new_in(alloc);
+    let mut seen = Vec::with_capacity_in(flow.locals as usize, alloc);
+    let mut dist = Vec::with_capacity_in(n, alloc);
     let mut queue = Vec::new_in(alloc);
     for f in borrows {
         let BorrowFinding::Invalidated { at, loan, .. } = *f else { continue };
@@ -697,7 +697,7 @@ pub enum TierOne {
 
 /// Closes `rows` over CSR outgoing edges (`from -> into`: row `into` |= row `from`) with a
 /// bounded FIFO ring buffer. Bound: pops are at most `origins + origins * columns`.
-fn close_csr<A: Allocator + Clone>(
+fn close_csr<A: Allocator + Copy>(
     outgoing: &Csr<Origin, A>,
     rows: &mut Bits<A>,
     origins: usize,
@@ -707,7 +707,7 @@ fn close_csr<A: Allocator + Clone>(
     if origins == 0 || cols == 0 || outgoing.entries.is_empty() {
         return Ok(());
     }
-    let mut queue = Vec::with_capacity_in(origins, alloc.clone());
+    let mut queue = Vec::with_capacity_in(origins, alloc);
     queue.resize(origins, Origin(0));
     let mut queued = Vec::with_capacity_in(origins, alloc);
     queued.resize(origins, false);
@@ -753,7 +753,7 @@ fn close_csr<A: Allocator + Clone>(
 }
 
 #[cfg(test)]
-fn close<A: Allocator + Clone>(
+fn close<A: Allocator + Copy>(
     edges: &[(Origin, Origin)],
     rows: &mut Bits<A>,
     origins: usize,
@@ -763,11 +763,11 @@ fn close<A: Allocator + Clone>(
     if origins == 0 || cols == 0 || edges.is_empty() {
         return Ok(());
     }
-    let outgoing = Csr::from_iter(origins, edges.iter().map(|&(a, b)| (a.index(), b)), alloc.clone());
+    let outgoing = Csr::from_iter(origins, edges.iter().map(|&(a, b)| (a.index(), b)), alloc);
     close_csr(&outgoing, rows, origins, cols, alloc)
 }
 
-fn subset_edges<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Vec<(Origin, Origin), A> {
+fn subset_edges<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Vec<(Origin, Origin), A> {
     let mut edges = Vec::with_capacity_in(flow.subsets.len(), alloc);
     edges.extend(flow.subsets.iter().map(|&(_, from, into)| (from, into)));
     edges.sort_unstable();
@@ -781,9 +781,9 @@ fn subset_edges<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Vec<(Origin, 
 /// body may assume among its placeholders, so a `subset` between two of them that this closure
 /// does not hold is `UnprovenOutlives`. The two planted controls bend exactly this table.
 #[cfg(test)]
-fn known_closure<A: Allocator + Clone>(flow: &Flow<A>, plant: Plant, alloc: A) -> Result<Bits<A>, Bound> {
+fn known_closure<A: Allocator + Copy>(flow: &Flow<A>, plant: Plant, alloc: A) -> Result<Bits<A>, Bound> {
     let o = flow.origins as usize;
-    let mut known = Bits::new_in(o, o, alloc.clone());
+    let mut known = Bits::new_in(o, o, alloc);
     for x in 0..o {
         known.set(x, x);
     }
@@ -803,7 +803,7 @@ fn known_closure<A: Allocator + Clone>(flow: &Flow<A>, plant: Plant, alloc: A) -
 /// Tier one: one global subset graph, contained loans per origin closed over it, kills ignored,
 /// liveness kept. Accepts only when no invalidated loan may be in an origin live there and no
 /// two placeholders are related beyond the signature.
-pub fn tier_one<A: Allocator + Clone>(
+pub fn tier_one<A: Allocator + Copy>(
     flow: &Flow<A>,
     facts: &Facts<A>,
     plant: Plant,
@@ -819,7 +819,7 @@ pub fn tier_one<A: Allocator + Clone>(
         let loans_by_local = Csr::from_iter(
             flow.locals as usize,
             flow.loans.iter().enumerate().map(|(i, row)| (flow.place(row.place).local.index(), Loan(i as u32))),
-            alloc.clone(),
+            alloc,
         );
         // The planted control keeps each loan in the origin it was issued into only (as does an
         // empty subset table).
@@ -848,16 +848,16 @@ pub fn tier_one<A: Allocator + Clone>(
                 }
             }
         } else {
-            let edges = subset_edges(flow, alloc.clone());
-            let out = Csr::from_iter(o, edges.iter().map(|&(a, b)| (a.index(), b)), alloc.clone());
+            let edges = subset_edges(flow, alloc);
+            let out = Csr::from_iter(o, edges.iter().map(|&(a, b)| (a.index(), b)), alloc);
             drop(edges);
-            let mut contains = Bits::new_in(o, nl, alloc.clone());
+            let mut contains = Bits::new_in(o, nl, alloc);
             for (l, row) in flow.loans.iter().enumerate() {
                 contains.set(row.origin.index(), l);
             }
-            close_csr(&out, &mut contains, o, nl, alloc.clone())?;
+            close_csr(&out, &mut contains, o, nl, alloc)?;
             // Transpose `contains[origin][loan]` into `contains_t[loan][origin]` for word-wise live checks.
-            let mut contains_t = Bits::new_in(nl, o, alloc.clone());
+            let mut contains_t = Bits::new_in(nl, o, alloc);
             let lw = contains.words();
             for x in 0..o {
                 let row = contains.row(x);
@@ -903,7 +903,7 @@ pub fn tier_one<A: Allocator + Clone>(
     // `AllKnown` is not planted, and there is at least one subset edge. Runs `O(P * (O + E + K))`
     // DFS from the `P` placeholder origins without allocating `O × O` matrices.
     if plant != Plant::AllKnown && !flow.subsets.is_empty() {
-        let mut placeholders = Vec::new_in(alloc.clone());
+        let mut placeholders = Vec::new_in(alloc);
         for (i, &is_ph) in flow.placeholder.iter().enumerate() {
             if is_ph {
                 placeholders.push(Origin(i as u32));
@@ -913,20 +913,20 @@ pub fn tier_one<A: Allocator + Clone>(
             let out = match outgoing {
                 Some(out) => out,
                 None => {
-                    let edges = subset_edges(flow, alloc.clone());
-                    Csr::from_iter(o, edges.iter().map(|&(a, b)| (a.index(), b)), alloc.clone())
+                    let edges = subset_edges(flow, alloc);
+                    Csr::from_iter(o, edges.iter().map(|&(a, b)| (a.index(), b)), alloc)
                 }
             };
             let known_out = (plant != Plant::KnownIgnored && !flow.known.is_empty()).then(|| {
-                Csr::from_iter(o, flow.known.iter().map(|&(a, b)| (a.index(), b)), alloc.clone())
+                Csr::from_iter(o, flow.known.iter().map(|&(a, b)| (a.index(), b)), alloc)
             });
-            let mut seen_reach = Vec::with_capacity_in(o, alloc.clone());
+            let mut seen_reach = Vec::with_capacity_in(o, alloc);
             seen_reach.resize(o, u32::MAX);
-            let mut seen_known = Vec::with_capacity_in(o, alloc.clone());
+            let mut seen_known = Vec::with_capacity_in(o, alloc);
             if known_out.is_some() {
                 seen_known.resize(o, u32::MAX);
             }
-            let mut stack = Vec::with_capacity_in(o, alloc.clone());
+            let mut stack = Vec::with_capacity_in(o, alloc);
             let mut reached_ph = Vec::with_capacity_in(placeholders.len(), alloc);
             for (epoch, &from) in placeholders.iter().enumerate() {
                 let epoch = epoch as u32;
@@ -974,13 +974,13 @@ pub fn tier_one<A: Allocator + Clone>(
 }
 
 /// Location-sensitive loan and placeholder findings, in diagnostic order.
-pub fn tier_two<A: Allocator + Clone>(
+pub fn tier_two<A: Allocator + Copy>(
     flow: &Flow<A>,
     facts: &Facts<A>,
     plant: Plant,
     alloc: A,
 ) -> Result<Vec<BorrowFinding, A>, Bound> {
-    let result = solver::solve((), flow, facts, plant, alloc.clone(), &mut solver::Meter::new(solver::LIMIT));
+    let result = solver::solve((), flow, facts, plant, alloc, &mut solver::Meter::new(solver::LIMIT));
     #[cfg(test)]
     if let Ok(found) = &result {
         let expected = tier_two_oracle(flow, facts, plant, alloc)?;
@@ -990,17 +990,17 @@ pub fn tier_two<A: Allocator + Clone>(
 }
 
 #[cfg(test)]
-fn tier_two_oracle<A: Allocator + Clone>(
+fn tier_two_oracle<A: Allocator + Copy>(
     flow: &Flow<A>, facts: &Facts<A>, plant: Plant, alloc: A,
 ) -> Result<Vec<BorrowFinding, A>, Bound> {
     tier_two_oracle_counted(flow, facts, plant, alloc, &mut 0)
 }
 
 #[cfg(test)]
-pub(crate) fn assert_tiers_equal_for_fixture<A: Allocator + Clone>(flow: &Flow<A>) {
-    let alloc = flow.stmts.allocator();
-    let facts = facts(flow, alloc.clone()).expect("fixture liveness converges");
-    tier_two(flow, &facts, Plant::None, alloc.clone()).expect("fixture loan analysis converges");
+pub(crate) fn assert_tiers_equal_for_fixture<A: Allocator + Copy>(flow: &Flow<A>) {
+    let alloc = *flow.stmts.allocator();
+    let facts = facts(flow, alloc).expect("fixture liveness converges");
+    tier_two(flow, &facts, Plant::None, alloc).expect("fixture loan analysis converges");
 }
 
 /// The original pointwise rules, kept as a test oracle.
@@ -1008,7 +1008,7 @@ pub(crate) fn assert_tiers_equal_for_fixture<A: Allocator + Clone>(flow: &Flow<A
 /// Bound: passes in point order, each but the last adding a fact, so at most
 /// `points * (origins^2 + origins * loans) + 1`.
 #[cfg(test)]
-fn tier_two_oracle_counted<A: Allocator + Clone>(
+fn tier_two_oracle_counted<A: Allocator + Copy>(
     flow: &Flow<A>,
     facts: &Facts<A>,
     plant: Plant,
@@ -1017,8 +1017,8 @@ fn tier_two_oracle_counted<A: Allocator + Clone>(
 ) -> Result<Vec<BorrowFinding, A>, Bound> {
     let (n, o, nl) = (flow.stmts.len(), flow.origins as usize, flow.loans.len());
     let points = 2 * n;
-    let mut subset = Bits::new_in(points, o * o, alloc.clone());
-    let mut contains = Bits::new_in(points, o * nl, alloc.clone());
+    let mut subset = Bits::new_in(points, o * o, alloc);
+    let mut contains = Bits::new_in(points, o * nl, alloc);
     let live = |p: usize, x: usize| facts.live.get(p, x);
     // subset(O1, O2, P) :- subset_base(O1, O2, P).
     for &(s, from, into) in flow.subsets.iter() {
@@ -1111,7 +1111,7 @@ fn tier_two_oracle_counted<A: Allocator + Clone>(
             break;
         }
     }
-    let mut out = Vec::new_in(alloc.clone());
+    let mut out = Vec::new_in(alloc);
     for s in 0..n {
         let stmt = Stmt(s as u32);
         let p = Point::start(stmt);
@@ -1139,7 +1139,7 @@ fn tier_two_oracle_counted<A: Allocator + Clone>(
     }
     // subset_errors(O1, O2, P) :- subset(O1, O2, P), placeholder(O1), placeholder(O2),
     //   !known_placeholder_subset(O1, O2). Reported once per pair, at its first point.
-    let known = known_closure(flow, plant, alloc.clone())?;
+    let known = known_closure(flow, plant, alloc)?;
     let mut reported = Bits::new_in(o, o, alloc);
     for p in 0..points {
         for a in 0..o {

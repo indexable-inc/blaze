@@ -23,7 +23,7 @@ use blaze_typeck::{Expr, ExprId, StmtId};
 
 use crate::{Facts, Form, Lower, Refusal};
 
-impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_, F, A, R> {
+impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, F, A, R> {
     /// `mark_extended` met block `e` as an extending expression of the `let` being lowered:
     /// the drop scope its `super let` bindings join is the one opened after the `let`'s block
     /// (`scope_marks[d]` with `d` the count open now, while that block is the innermost).

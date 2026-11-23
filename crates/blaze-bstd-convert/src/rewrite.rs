@@ -2481,12 +2481,14 @@ pub fn rewrite_manifest(
         if bstd_features.is_empty() {
             let _ = writeln!(additions, "bstd = {{ {base_spec} }}");
         } else {
-            let feats: Vec<String> = bstd_features.iter().map(|f| format!("\"{f}\"")).collect();
-            let _ = writeln!(
-                additions,
-                "bstd = {{ {base_spec}, features = [{}] }}",
-                feats.join(", ")
-            );
+            let _ = write!(additions, "bstd = {{ {base_spec}, features = [");
+            for (i, f) in bstd_features.iter().enumerate() {
+                if i > 0 {
+                    additions.push_str(", ");
+                }
+                let _ = write!(additions, "\"{f}\"");
+            }
+            additions.push_str("] }\n");
         }
     }
     for extra in extra_blaze_crates {

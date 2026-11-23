@@ -53,29 +53,29 @@ pub struct Record<A: Allocator> {
 }
 
 /// The move check, then tier one, then tier two only if tier one cannot accept.
-pub fn check<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Result<Record<A>, Bound> {
+pub fn check<A: Allocator + Copy>(flow: &Flow<A>, alloc: A) -> Result<Record<A>, Bound> {
     check_planted(flow, Plant::None, alloc)
 }
 
 /// Carry the caller's function identity in a refusal. This can be the complete
 /// borrowed spelling, or the item key a driver resolves when printing its diagnostic.
-pub fn check_named<N, A: Allocator + Clone>(
+pub fn check_named<N, A: Allocator + Copy>(
     function: N, flow: &Flow<A>, alloc: A,
 ) -> Result<Record<A>, Bound<N>> {
     check(flow, alloc).map_err(|bound| bound.in_function(function))
 }
 
 #[doc(hidden)]
-pub fn check_planted<A: Allocator + Clone>(
+pub fn check_planted<A: Allocator + Copy>(
     flow: &Flow<A>,
     plant: Plant,
     alloc: A,
 ) -> Result<Record<A>, Bound> {
-    let moves = check_moves_planted(flow, plant, alloc.clone())?;
-    let facts = facts(flow, alloc.clone())?;
-    let (borrows, tier) = match tier_one(flow, &facts, plant, alloc.clone())? {
-        TierOne::Accepted => (Vec::new_in(alloc.clone()), 1),
-        TierOne::Refused => (tier_two(flow, &facts, plant, alloc.clone())?, 2),
+    let moves = check_moves_planted(flow, plant, alloc)?;
+    let facts = facts(flow, alloc)?;
+    let (borrows, tier) = match tier_one(flow, &facts, plant, alloc)? {
+        TierOne::Accepted => (Vec::new_in(alloc), 1),
+        TierOne::Refused => (tier_two(flow, &facts, plant, alloc)?, 2),
     };
     let loan_parts = loan_parts(flow, &facts, &borrows, alloc);
     let proof = (moves.is_empty() && borrows.is_empty()).then_some(Checked { tier });

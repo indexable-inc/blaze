@@ -26,7 +26,7 @@ pub(super) struct Rows<T, A: Allocator> {
     entries: Vec<T, A>,
 }
 
-impl<T: Copy, A: Allocator + Clone> Rows<T, A> {
+impl<T: Copy, A: Allocator + Copy> Rows<T, A> {
     fn new(
         rows: usize,
         relation: impl ExactSizeIterator<Item = (usize, T)> + Clone,
@@ -35,7 +35,7 @@ impl<T: Copy, A: Allocator + Clone> Rows<T, A> {
     ) -> Result<Self, Exhausted> {
         meter.charge(rows)?;
         meter.charge(relation.len().saturating_mul(2))?;
-        let mut offsets = Vec::with_capacity_in(rows + 1, alloc.clone());
+        let mut offsets = Vec::with_capacity_in(rows + 1, alloc);
         offsets.resize(rows + 1, 0usize);
         let mut entries = Vec::with_capacity_in(relation.len(), alloc);
         for (key, value) in relation.clone() {
@@ -65,7 +65,7 @@ struct Walk<A: Allocator> {
     stack: Vec<Origin, A>,
 }
 
-impl<A: Allocator + Clone> Walk<A> {
+impl<A: Allocator + Copy> Walk<A> {
     fn seed(&mut self, origin: Origin, generation: usize) {
         if self.seen[origin.index()] != generation {
             self.seen[origin.index()] = generation;
@@ -95,7 +95,7 @@ impl<A: Allocator + Clone> Walk<A> {
 
 /// Tier one declines a whole flow and hands on no candidate list. Here the reverse
 /// location-insensitive subset walk is shared by every conflicting loan at a Start.
-pub(super) fn candidates<A: Allocator + Clone>(
+pub(super) fn candidates<A: Allocator + Copy>(
     flow: &Flow<A>,
     facts: &Facts<A>,
     plant: Plant,
@@ -105,15 +105,15 @@ pub(super) fn candidates<A: Allocator + Clone>(
     let count = flow.origins as usize;
     meter.charge(count)?;
     meter.charge(flow.loans.len())?;
-    let mut origins = Vec::with_capacity_in(count, alloc.clone());
+    let mut origins = Vec::with_capacity_in(count, alloc);
     origins.resize(count, false);
-    let mut loans = Vec::with_capacity_in(flow.loans.len(), alloc.clone());
+    let mut loans = Vec::with_capacity_in(flow.loans.len(), alloc);
     loans.resize(flow.loans.len(), false);
     let places = Rows::new(
         flow.locals as usize,
         flow.loans.iter().enumerate().map(|(i, row)| (flow.place(row.place).local.index(), Loan(i as u32))),
         meter,
-        alloc.clone(),
+        alloc,
     )?;
     let check_placeholders = plant != Plant::AllKnown
         && flow.placeholder.iter().filter(|p| **p).take(2).count() == 2;
@@ -121,16 +121,16 @@ pub(super) fn candidates<A: Allocator + Clone>(
         return Ok(Candidates { origins, loans, places });
     }
 
-    let forward = Rows::new(count, flow.subsets.iter().map(|&(_, a, b)| (a.index(), b)), meter, alloc.clone())?;
-    let backward = Rows::new(count, flow.subsets.iter().map(|&(_, a, b)| (b.index(), a)), meter, alloc.clone())?;
+    let forward = Rows::new(count, flow.subsets.iter().map(|&(_, a, b)| (a.index(), b)), meter, alloc)?;
+    let backward = Rows::new(count, flow.subsets.iter().map(|&(_, a, b)| (b.index(), a)), meter, alloc)?;
     let (outgoing, incoming) = if plant == Plant::TierTwoReversed {
         (&backward, &forward)
     } else {
         (&forward, &backward)
     };
-    let mut seen = Vec::with_capacity_in(count, alloc.clone());
+    let mut seen = Vec::with_capacity_in(count, alloc);
     seen.resize(count, usize::MAX);
-    let mut walk = Walk { seen, stack: Vec::with_capacity_in(count, alloc.clone()) };
+    let mut walk = Walk { seen, stack: Vec::with_capacity_in(count, alloc) };
 
     if !loans.is_empty() {
         // A loan issued at Mid cannot reach its own Start or an earlier Start in an

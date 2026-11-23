@@ -25,7 +25,7 @@ use core::alloc::Allocator;
 
 use crate::{Facts, Form, Lower, Refusal, TyD};
 
-impl<F: Facts, A: Allocator + Clone, R: crate::one_call::CallRule> Lower<'_, '_, F, A, R> {
+impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, F, A, R> {
     /// How a closure of `kind` reaches field `how` (closure.rs `run_closure`'s table): owned
     /// (`None`), or through a reference of this mutability, the environment's own when the bool
     /// is set.

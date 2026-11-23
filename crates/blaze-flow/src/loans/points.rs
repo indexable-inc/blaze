@@ -27,13 +27,13 @@ struct Ready<A: Allocator> {
     bits: Vec<u64, A>,
 }
 
-impl<A: Allocator + Clone> Ready<A> {
+impl<A: Allocator + Copy> Ready<A> {
     fn new(postorder: &[usize], offsets: &[usize], edges: &[usize], alloc: A) -> Self {
-        let mut rank = Vec::from_elem_in(0, postorder.len(), alloc.clone());
+        let mut rank = Vec::from_elem_in(0, postorder.len(), alloc);
         for (i, &point) in postorder.iter().rev().enumerate() {
             rank[point] = i;
         }
-        let mut back_until = Vec::from_elem_in(0, postorder.len(), alloc.clone());
+        let mut back_until = Vec::from_elem_in(0, postorder.len(), alloc);
         for (p, &from) in rank.iter().enumerate() {
             for &q in &edges[offsets[p]..offsets[p + 1]] {
                 let to = rank[q];
@@ -45,7 +45,7 @@ impl<A: Allocator + Clone> Ready<A> {
             end = end.max(*interval);
             *interval = end;
         }
-        let mut levels = Vec::new_in(alloc.clone());
+        let mut levels = Vec::new_in(alloc);
         let mut bits = Vec::new_in(alloc);
         let mut count = postorder.len();
         loop {
@@ -92,13 +92,13 @@ impl<A: Allocator + Clone> Ready<A> {
     }
 }
 
-impl<A: Allocator + Clone> Points<A> {
+impl<A: Allocator + Copy> Points<A> {
     pub(super) fn new(flow: &Flow<A>, meter: &mut Meter, alloc: A) -> Result<Self, Exhausted> {
         let points = 2 * flow.stmts.len();
         // Count and fill the CSR rows, initialise marks, and enter and finish each
         // point once. The edges are charged for counting, filling and DFS separately.
         meter.charge(points.saturating_mul(6))?;
-        let mut offsets = Vec::with_capacity_in(points + 1, alloc.clone());
+        let mut offsets = Vec::with_capacity_in(points + 1, alloc);
         offsets.push(0usize);
         let mut edge_count = 0;
         for s in 0..flow.stmts.len() {
@@ -110,7 +110,7 @@ impl<A: Allocator + Clone> Points<A> {
             meter.charge((edge_count - before).saturating_mul(3))?;
             offsets.push(edge_count);
         }
-        let mut edges = Vec::with_capacity_in(edge_count, alloc.clone());
+        let mut edges = Vec::with_capacity_in(edge_count, alloc);
         for s in 0..flow.stmts.len() {
             let stmt = Stmt(s as u32);
             edges.push(Point::mid(stmt).index());
@@ -121,10 +121,10 @@ impl<A: Allocator + Clone> Points<A> {
         // still on the stack is exactly a cycle, including in disconnected code.
         #[derive(Clone, Copy, PartialEq)]
         enum Mark { New, Visiting, Done }
-        let mut marks = Vec::with_capacity_in(points, alloc.clone());
+        let mut marks = Vec::with_capacity_in(points, alloc);
         marks.resize(points, Mark::New);
-        let mut stack = Vec::with_capacity_in(points, alloc.clone());
-        let mut pending = Vec::with_capacity_in(points, alloc.clone());
+        let mut stack = Vec::with_capacity_in(points, alloc);
+        let mut pending = Vec::with_capacity_in(points, alloc);
         let mut acyclic = true;
         for root in 0..points {
             if marks[root] != Mark::New {

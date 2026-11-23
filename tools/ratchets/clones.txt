@@ -8,14 +8,11 @@ blaze-arrow-ipc	51
 blaze-ask	6
 blaze-audit	30
 blaze-blake3	1
-blaze-body-flow	26
-blaze-borrow	12
 blaze-bstd-convert	102
 blaze-build	286
 blaze-build-script	22
 blaze-c	2
 blaze-cas	233
-blaze-cbor	7
 blaze-check	7
 blaze-cli	76
 blaze-columns	29
@@ -31,8 +28,8 @@ blaze-engine	3
 blaze-expand	29
 blaze-fetch	12
 blaze-file-items	6
-blaze-flow	154
-blaze-flow-lower	212
+blaze-flow	12
+blaze-flow-lower	2
 blaze-fmt	124
 blaze-format-tiers	1
 blaze-fuzz	1

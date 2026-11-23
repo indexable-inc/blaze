@@ -13,19 +13,19 @@ use blaze_flow::{FlowBuilder, Origin};
 use crate::relate::{Constraints, Kind};
 
 /// [`Constraints`] into a [`FlowBuilder`].
-pub struct FlowConstraints<'b, A: Allocator + Clone> {
+pub struct FlowConstraints<'b, A: Allocator + Copy> {
     b: &'b mut FlowBuilder<A>,
     static_: Origin,
 }
 
-impl<'b, A: Allocator + Clone> FlowConstraints<'b, A> {
+impl<'b, A: Allocator + Copy> FlowConstraints<'b, A> {
     /// Emit into `b`; `static_` the body's `'static` origin.
     pub fn new(b: &'b mut FlowBuilder<A>, static_: Origin) -> FlowConstraints<'b, A> {
         FlowConstraints { b, static_ }
     }
 }
 
-impl<A: Allocator + Clone> Constraints for FlowConstraints<'_, A> {
+impl<A: Allocator + Copy> Constraints for FlowConstraints<'_, A> {
     fn subset(&mut self, a: Origin, b: Origin) {
         self.b.subset(a, b);
     }

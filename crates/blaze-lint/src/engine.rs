@@ -136,7 +136,21 @@ const ALLOCATING: [(&str, usize); 9] = [
     ("BinaryHeap", 2),
     ("LinkedList", 2),
 ];
-const HANDLES: [&str; 2] = ["Arc", "Rc"];
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HandleKind {
+    /// Thread-local non-atomic handle (`Rc`, `ARc`): autofix to `.local_share()`.
+    Local,
+    /// Cross-thread atomic handle (`Arc`, `AArc`, `ThinArc`, `AThinArc`, `ThinStr`, `AThinStr`): autofix to `.share()`.
+    Shared,
+}
+
+fn classify_handle(word: &str) -> Option<HandleKind> {
+    match word {
+        "Rc" | "ARc" => Some(HandleKind::Local),
+        "Arc" | "AArc" | "ThinArc" | "AThinArc" | "ThinStr" | "AThinStr" => Some(HandleKind::Shared),
+        _ => None,
+    }
+}
 const HANDLE_WORDS: [&str; 11] =
     ["refcount", "refcounts", "count", "counts", "handle", "handles", "arc", "rc", "interned", "cursor", "cursors"];
 const HANDLE_PHRASES: [&str; 2] = ["allocates nothing", "no allocation"];
@@ -1062,24 +1076,38 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
         } else {
             return;
         };
+        let handle_kind = match receiver {
+            // A field's declaration is the file's, which an item does not see: its own
+            // text is read (clones.rs reads the whole file).
+            Some(Receiver { name, is_field: true }) => self.declared_handle(0, self.toks.len(), name, false),
+            Some(Receiver { name, is_field: false }) => self.declared_handle(self.last_fn.unwrap_or(0), i, name, true),
+            None => None,
+        };
         let context = self.scope.context;
         let template = match self.look(t.start as usize, clone_mark, context.clone_above, context.clone_after) {
             Some(Mark::Handle) => Template::CloneHandle,
             Some(Mark::ErrorPath) => Template::CloneErrorPath,
             Some(Mark::Deep) => Template::CloneDeep,
             _ => {
-                let handle = match receiver {
-                    // A field's declaration is the file's, which an item does not see: its own
-                    // text is read (clones.rs reads the whole file).
-                    Some(Receiver { name, is_field: true }) => self.declared_handle(0, self.toks.len(), name, false),
-                    Some(Receiver { name, is_field: false }) => self.declared_handle(self.last_fn.unwrap_or(0), i, name, true),
-                    None => false,
-                };
-                if handle { Template::CloneHandle } else { Template::CloneUnknown }
+                if handle_kind.is_some() {
+                    Template::CloneHandle
+                } else {
+                    Template::CloneUnknown
+                }
             }
         };
-        let end = if self.method(i) { self.tok(i + 2).map_or(t.end, |c| c.end) } else { t.end };
-        self.push(template, t.start, end, None);
+        let is_method = self.method(i);
+        let end = if is_method { self.tok(i + 2).map_or(t.end, |c| c.end) } else { t.end };
+        let plan = if is_method && template == Template::CloneHandle {
+            match handle_kind {
+                Some(HandleKind::Local) => Plan::Replace { range: Span::new(t.start, t.end), text: "local_share" },
+                Some(HandleKind::Shared) => Plan::Replace { range: Span::new(t.start, t.end), text: "share" },
+                None => Plan::None,
+            }
+        } else {
+            Plan::None
+        };
+        self.cands.push(Cand { template, range: Span::new(t.start, end), arg: None, plan });
     }
 
     /// clones.rs's `receiver_of`: the last name of the run of names and dots before the `.`
@@ -1110,31 +1138,31 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
 
     /// clones.rs's `declared_handle` over tokens `from..to`: `name: [&][mut] path::Arc<` or
     /// `Rc<`, and with `assigned`, `name = path::Arc::..` or `Rc::..`.
-    fn declared_handle(&self, from: usize, to: usize, name: &str, assigned: bool) -> bool {
+    fn declared_handle(&self, from: usize, to: usize, name: &str, assigned: bool) -> Option<HandleKind> {
         let mut k = from;
         // Bounded: one turn per token of the range.
         while k < to {
             if self.is_word(self.tok(k), name) {
                 let next = self.tok(k + 1);
                 if matches!(next, Some(n) if n.k == K::P(b':')) && !self.colons_at(k + 1) {
-                    if self.handle_type(k + 2) {
-                        return true;
+                    if let Some(kind) = self.handle_type(k + 2) {
+                        return Some(kind);
                     }
                 } else if assigned
                     && let Some(eq) = next
                     && eq.k == K::P(b'=')
                     && !matches!(self.tok(k + 2), Some(n) if matches!(n.k, K::P(b'=' | b'>')) && n.start == eq.end)
-                    && self.handle_value(k + 2)
+                    && let Some(kind) = self.handle_value(k + 2)
                 {
-                    return true;
+                    return Some(kind);
                 }
             }
             k += 1;
         }
-        false
+        None
     }
 
-    fn handle_type(&self, mut k: usize) -> bool {
+    fn handle_type(&self, mut k: usize) -> Option<HandleKind> {
         // Bounded: each turn moves `k` forward past one `&`.
         while matches!(self.tok(k), Some(t) if t.k == K::P(b'&')) {
             k += 1;
@@ -1142,18 +1170,26 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
         if self.is_word(self.tok(k), "mut") {
             k += 1;
         }
-        let Some(last) = self.path_end(k) else { return false };
-        HANDLES.contains(&self.word(self.tok(last)).unwrap_or("")) && matches!(self.tok(last + 1), Some(t) if t.k == K::P(b'<'))
+        let last = self.path_end(k)?;
+        if matches!(self.tok(last + 1), Some(t) if t.k == K::P(b'<')) {
+            classify_handle(self.word(self.tok(last)).unwrap_or(""))
+        } else {
+            None
+        }
     }
 
-    fn handle_value(&self, k: usize) -> bool {
-        let Some(last) = self.path_end(k) else { return false };
+    fn handle_value(&self, k: usize) -> Option<HandleKind> {
+        let last = self.path_end(k)?;
         // `Arc::<T>::default()`: the path stops at a turbofish, its last word the type (as
         // clones.rs's `path_run` stops at the `<`).
         if self.colons_at(last + 1) {
-            return HANDLES.contains(&self.word(self.tok(last)).unwrap_or(""));
+            return classify_handle(self.word(self.tok(last)).unwrap_or(""));
         }
-        last >= k + 3 && HANDLES.contains(&self.word(self.tok(last - 3)).unwrap_or(""))
+        if last >= k + 3 {
+            classify_handle(self.word(self.tok(last - 3)).unwrap_or(""))
+        } else {
+            None
+        }
     }
 
     /// The last token of the path `name (:: name)*` starting at `k`.
