@@ -221,14 +221,7 @@ pub fn start_in<C: Clock + Send + 'static>(
     // Hold a shared advisory lock (`LOCK_SH`) on `<runs_dir>/viewer.lock` for the viewer's exact
     // lifetime so `blaze run` and `blaze gc` can probe non-blocking `LOCK_EX` to detect a live
     // viewer without racing a fast-exiting child's `.telem`/`.meta` cleanup.
-    let viewer_lock_path = config.runs_dir.join(blaze_launch::telemetry::VIEWER_LOCK_LEAF);
-    let viewer_lock = fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(&viewer_lock_path)
-        .ok()
-        .and_then(|file| file.try_lock_shared().ok().map(|()| file));
+    let viewer_lock = acquire_viewer_lock(&config.runs_dir, alloc.local());
     let bind_addr = SocketAddr::from(([127, 0, 0, 1], config.port));
     let listener = TcpListener::bind(bind_addr).map_err(|io| ViewerError::Bind { addr: bind_addr, io })?;
     let addr = listener.local_addr().map_err(|io| ViewerError::Bind { addr: bind_addr, io })?;
@@ -346,6 +339,22 @@ struct Conn<'a> {
     gone: bool,
 }
 
+/// Advisory shared flock on `<runs_dir>/viewer.lock`, released automatically when `OwnedFd` drops.
+fn acquire_viewer_lock(runs_dir: &Path, alloc: Alloc<'_>) -> Option<blaze_sys::posix::io::OwnedFd> {
+    use blaze_sys::posix::io::fd::{FlockOp, OpenFlags, flock, open};
+    let dir_bytes = runs_dir.as_os_str().as_bytes();
+    let leaf = blaze_launch::telemetry::VIEWER_LOCK_LEAF.as_bytes();
+    let mut path = AVec::with_capacity_in(dir_bytes.len() + 1 + leaf.len() + 1, alloc);
+    path.extend_from_slice(dir_bytes);
+    path.push(b'/');
+    path.extend_from_slice(leaf);
+    path.push(0);
+    let sys_path = blaze_sys::posix::Path::from_bytes_with_nul(&path).ok()?;
+    let owned = open(sys_path, OpenFlags::RDWR | OpenFlags::CREAT | OpenFlags::CLOEXEC, 0o600).ok()?;
+    flock(owned.fd(), FlockOp::SharedNonBlock).ok()?;
+    Some(owned)
+}
+
 /// The viewer's thread: the core, and what it waits on.
 struct Loop<'a> {
     alloc: Alloc<'a>,
@@ -355,7 +364,7 @@ struct Loop<'a> {
     listener: TcpListener,
     watch: Watch,
     /// Shared advisory flock on `<runs_dir>/viewer.lock` held for the viewer's lifetime.
-    _viewer_lock: Option<fs::File>,
+    _viewer_lock: Option<blaze_sys::posix::io::OwnedFd>,
     pump: Pump<'a, Mapped>,
     conns: AVec<'a, Conn<'a>>,
     next_conn: u64,
@@ -364,7 +373,7 @@ struct Loop<'a> {
 }
 
 impl<'a> Loop<'a> {
-    fn new(config: &ViewerConfig, listener: TcpListener, watch: Watch, viewer_lock: Option<fs::File>, alloc: Alloc<'a>, now: Duration) -> Loop<'a> {
+    fn new(config: &ViewerConfig, listener: TcpListener, watch: Watch, viewer_lock: Option<blaze_sys::posix::io::OwnedFd>, alloc: Alloc<'a>, now: Duration) -> Loop<'a> {
         Loop {
             alloc,
             idle_expiry: config.idle_expiry,
