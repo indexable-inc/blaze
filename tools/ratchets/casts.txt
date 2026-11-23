@@ -49,9 +49,9 @@ blaze-deflate	152
 blaze-drive	64
 blaze-ed25519	5
 blaze-emit	890
-blaze-engine	120
+blaze-engine	119
 blaze-expand	284
-blaze-export	486
+blaze-export	426
 blaze-facts	12
 blaze-fetch	213
 blaze-file-items	94
@@ -76,7 +76,7 @@ blaze-keyed	677
 blaze-kit	2
 blaze-ladder	1228
 blaze-launch	174
-blaze-launch-rt	467
+blaze-launch-rt	461
 blaze-launcher	6
 blaze-lint	187
 blaze-lint-defs	21

@@ -137,6 +137,10 @@ pub struct Package<'a> {
     pub deps: AVec<'a, Dep<'a>>,
     /// Its `[package]` metadata (`CARGO_PKG_*`): carried into [`crate::UnitGraph::meta`].
     pub meta: PackageMeta<'a>,
+    /// The `[patch.<source>]` source table name(s) that directly named this path package in the
+    /// workspace root manifest; used to disambiguate same-name Git dependencies patched to
+    /// different local paths.
+    pub patched_from: AVec<'a, Text<'a>>,
 }
 
 impl<'a> Package<'a> {
@@ -200,6 +204,10 @@ impl<'a> Package<'a> {
                 source,
             });
         }
+        let mut patched_from = Vec::with_capacity_in(member.patched_from.len(), alloc);
+        for src in member.patched_from.iter() {
+            patched_from.push(own(src));
+        }
         Package {
             name: own(&member.name),
             edition: member.edition,
@@ -211,6 +219,7 @@ impl<'a> Package<'a> {
             features,
             deps,
             meta: member.meta.clone_in(alloc),
+            patched_from,
         }
     }
 

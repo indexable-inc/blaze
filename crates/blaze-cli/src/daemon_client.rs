@@ -93,8 +93,12 @@ pub(crate) fn try_run() -> ClientOutcome {
         },
     };
 
+    let Ok(frame) = bstd::mem::Frame::with_reserve(8 << 20, bstd::mem::Tag::Other) else {
+        return ClientOutcome::Fallthrough { spawn_daemon: false };
+    };
+
     let mut ws_buf = [0u8; 4096];
-    let Some(ws_root) = locate_workspace_root(target_abs, cwd_abs, &mut ws_buf) else {
+    let Some(ws_root) = locate_workspace_root(target_abs, cwd_abs, &frame, &mut ws_buf) else {
         return ClientOutcome::Fallthrough { spawn_daemon: false };
     };
 
@@ -116,10 +120,6 @@ pub(crate) fn try_run() -> ClientOutcome {
         }
         let _ = setsockopt_int(conn.fd(), SOL_SOCKET, SO_SNDBUF, 64 << 10);
     }
-
-    let Ok(frame) = bstd::mem::Frame::with_reserve(8 << 20, bstd::mem::Tag::Other) else {
-        return ClientOutcome::Fallthrough { spawn_daemon: false };
-    };
 
     // 1. Read Hello frame.
     let mut recv_buf: Vec<u8, &bstd::mem::Frame> = Vec::new_in(&frame);
@@ -167,13 +167,22 @@ pub(crate) fn try_run() -> ClientOutcome {
     }
 
     // 3. Stream ServerFrames directly to stdout (fd 1) / stderr (fd 2) until Done or Refused.
+    // Once `CheckReq` has been submitted, hold stop/status signals so Ctrl-C/SIGTERM/SIGINFO
+    // forward to the active daemon request, and NEVER fall through to standalone on disconnect
+    // or decode error (the daemon may already be executing side effects such as `--fix`).
+    let asked = bstd::procs::Asked::hold().ok();
+    let requests = asked.as_ref().map(bstd::procs::Asked::requests);
+    let mut sent_stop = false;
     let mut wrote_any = false;
     loop {
-        let body = match read_frame_fd(conn.fd(), &mut recv_buf) {
+        let body = match read_frame_fd_with_signals(conn.fd(), &mut recv_buf, requests, &mut sent_stop, &frame) {
             Ok(b) => b,
             Err(()) => {
-                if !wrote_any {
-                    return ClientOutcome::Fallthrough { spawn_daemon: true };
+                if !sent_stop {
+                    let _ = write_all_fd(
+                        blaze_sys::Fd::new(2),
+                        b"error: blaze daemon connection closed before completing request\n",
+                    );
                 }
                 return ClientOutcome::Exit(Status::FAILED);
             }
@@ -181,9 +190,10 @@ pub(crate) fn try_run() -> ClientOutcome {
         let server_frame = match ServerFrame::decode(body) {
             Ok(f) => f,
             Err(_) => {
-                if !wrote_any {
-                    return ClientOutcome::Fallthrough { spawn_daemon: true };
-                }
+                let _ = write_all_fd(
+                    blaze_sys::Fd::new(2),
+                    b"error: blaze daemon returned malformed response frame\n",
+                );
                 return ClientOutcome::Exit(Status::FAILED);
             }
         };
@@ -231,6 +241,12 @@ pub(crate) fn send_shutdown(home: &str, checkout_root_abs: &str) {
     let Some(sock_path) = format_socket_path(home, &key, &mut sock_buf) else {
         return;
     };
+    send_shutdown_socket(sock_path);
+}
+
+/// Sends a best-effort `ClientFrame::Shutdown` to the resident daemon listening at `sock_path`.
+#[cfg(unix)]
+pub(crate) fn send_shutdown_socket(sock_path: &[u8]) {
     let Ok(conn) = blaze_sys::posix::net::connect_unix(sock_path) else {
         return;
     };
@@ -388,22 +404,38 @@ fn realpath_str<'a>(path: &str, out: &'a mut [u8; 4096]) -> Option<&'a str> {
 }
 
 /// Resolves the workspace root for `target_abs` (beneath `cwd_abs`), matching `run_package::locate`:
-/// walks up from `target_abs` to `cwd_abs` for `[workspace]`, refusing if an ancestor above
-/// `cwd_abs` holds `[workspace]` (returning `None` so standalone prints `RootAboveStart`).
+/// walks up from `target_abs` to `cwd_abs` for `[workspace]`, respecting `package.workspace` and
+/// `workspace.exclude`, and refusing if an ancestor above `cwd_abs` holds a non-excluding
+/// `[workspace]` (returning `None` so standalone prints `RootAboveStart`).
 #[cfg(unix)]
-fn locate_workspace_root<'a>(target_abs: &str, cwd_abs: &str, out: &'a mut [u8; 4096]) -> Option<&'a str> {
-    let mut nearest_len: Option<usize> = None;
+pub(crate) fn locate_workspace_root<'a>(
+    target_abs: &str,
+    cwd_abs: &str,
+    frame: &bstd::mem::Frame,
+    out: &'a mut [u8; 4096],
+) -> Option<&'a str> {
+    let mut nearest_dir: Option<&str> = None;
     let mut cur = target_abs;
     let cwd_trimmed = cwd_abs.trim_end_matches('/');
 
     // Walk up from `target_abs` up to and including `cwd_abs`.
     for _ in 0..64 {
-        if let Some(has_ws) = inspect_cargo_toml(cur) {
-            if nearest_len.is_none() {
-                nearest_len = Some(cur.len());
+        match inspect_cargo_toml(cur, nearest_dir, frame) {
+            CargoTomlState::Absent => {}
+            CargoTomlState::Ambiguous => return None,
+            CargoTomlState::PackageWithWorkspaceKey => return None,
+            CargoTomlState::PackageOnly => {
+                if nearest_dir.is_none() {
+                    nearest_dir = Some(cur);
+                }
             }
-            if has_ws {
-                return copy_str_into(cur, out);
+            CargoTomlState::Workspace { excludes_package } => {
+                if nearest_dir.is_none() {
+                    return copy_str_into(cur, out);
+                }
+                if !excludes_package {
+                    return copy_str_into(cur, out);
+                }
             }
         }
         let cur_trimmed = cur.trim_end_matches('/');
@@ -416,8 +448,10 @@ fn locate_workspace_root<'a>(target_abs: &str, cwd_abs: &str, out: &'a mut [u8; 
         }
     }
 
-    // Check ancestors strictly above `cwd_abs`: if one has `[workspace]`, return `None` so
-    // standalone `run_package::locate` emits its `RootAboveStart` error faithfully.
+    let pkg_dir = nearest_dir?;
+
+    // Check ancestors strictly above `cwd_abs`: if one has `[workspace]` that does not exclude
+    // `pkg_dir`, return `None` so standalone `run_package::locate` emits `RootAboveStart`.
     let mut above = cwd_trimmed;
     for _ in 0..64 {
         let Some((parent, _)) = above.rsplit_once('/') else {
@@ -426,15 +460,15 @@ fn locate_workspace_root<'a>(target_abs: &str, cwd_abs: &str, out: &'a mut [u8; 
         if parent.is_empty() {
             break;
         }
-        if inspect_cargo_toml(parent) == Some(true) {
-            return None;
+        match inspect_cargo_toml(parent, Some(pkg_dir), frame) {
+            CargoTomlState::Absent | CargoTomlState::PackageOnly | CargoTomlState::PackageWithWorkspaceKey => {}
+            CargoTomlState::Workspace { excludes_package: true } => {}
+            CargoTomlState::Workspace { excludes_package: false } | CargoTomlState::Ambiguous => return None,
         }
         above = parent;
     }
 
-    let len = nearest_len?;
-    let found = target_abs.get(..len)?;
-    copy_str_into(found, out)
+    copy_str_into(pkg_dir, out)
 }
 
 #[cfg(unix)]
@@ -444,25 +478,66 @@ fn copy_str_into<'a>(src: &str, out: &'a mut [u8; 4096]) -> Option<&'a str> {
     core::str::from_utf8(out.get(..bytes.len())?).ok()
 }
 
-/// Checks if `<dir>/Cargo.toml` exists; returns `Some(true)` if it contains a `[workspace]` table,
-/// `Some(false)` if it exists without `[workspace]`, or `None` if absent/unreadable.
 #[cfg(unix)]
-fn inspect_cargo_toml(dir: &str) -> Option<bool> {
+enum CargoTomlState {
+    Absent,
+    Ambiguous,
+    PackageOnly,
+    PackageWithWorkspaceKey,
+    Workspace { excludes_package: bool },
+}
+
+#[cfg(unix)]
+fn path_beneath(path: &str, entry: &str) -> bool {
+    let mut parts = path.split('/').filter(|part| !part.is_empty() && *part != ".");
+    for want in entry.split('/').filter(|part| !part.is_empty() && *part != ".") {
+        if want == ".." || parts.next() != Some(want) {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(unix)]
+fn has_glob_meta(entry: &str) -> bool {
+    entry.as_bytes().iter().any(|&b| matches!(b, b'*' | b'?' | b'['))
+}
+
+/// Inspects `<dir>/Cargo.toml` with `blaze_toml` to classify workspace membership and exclusion
+/// identically to `run_package::locate` (Cargo's `find_root`).
+#[cfg(unix)]
+fn inspect_cargo_toml(dir: &str, pkg_dir: Option<&str>, frame: &bstd::mem::Frame) -> CargoTomlState {
     use blaze_sys::posix::io::{CWD, OpenFlags, openat, read};
     let mut path_buf = [0u8; 4096];
     let dir_b = dir.trim_end_matches('/').as_bytes();
     let suffix = b"/Cargo.toml";
-    let total = dir_b.len().checked_add(suffix.len())?;
+    let Some(total) = dir_b.len().checked_add(suffix.len()) else {
+        return CargoTomlState::Ambiguous;
+    };
     if total >= path_buf.len() {
-        return None;
+        return CargoTomlState::Ambiguous;
     }
-    path_buf.get_mut(..dir_b.len())?.copy_from_slice(dir_b);
-    path_buf.get_mut(dir_b.len()..total)?.copy_from_slice(suffix);
-    *path_buf.get_mut(total)? = 0;
-    let cstr = core::ffi::CStr::from_bytes_with_nul(path_buf.get(..=total)?).ok()?;
-    let fd = openat(CWD, blaze_sys::Path::new(cstr), OpenFlags::READ.with(OpenFlags::CLOSE_ON_EXEC), 0).ok()?;
+    let Some(prefix_slot) = path_buf.get_mut(..dir_b.len()) else {
+        return CargoTomlState::Ambiguous;
+    };
+    prefix_slot.copy_from_slice(dir_b);
+    let Some(suffix_slot) = path_buf.get_mut(dir_b.len()..total) else {
+        return CargoTomlState::Ambiguous;
+    };
+    suffix_slot.copy_from_slice(suffix);
+    let Some(nul_slot) = path_buf.get_mut(total) else {
+        return CargoTomlState::Ambiguous;
+    };
+    *nul_slot = 0;
+    let Ok(cstr) = core::ffi::CStr::from_bytes_with_nul(path_buf.get(..=total).unwrap_or(&[])) else {
+        return CargoTomlState::Ambiguous;
+    };
+    let fd = match openat(CWD, blaze_sys::Path::new(cstr), OpenFlags::READ.with(OpenFlags::CLOSE_ON_EXEC), 0) {
+        Ok(fd) => fd,
+        Err(blaze_sys::Errno::NoEnt | blaze_sys::Errno::NotDir) => return CargoTomlState::Absent,
+        Err(_) => return CargoTomlState::Ambiguous,
+    };
 
-    // Read up to 64 KiB of Cargo.toml to detect `[workspace]`.
     let mut buf = [0u8; 64 << 10];
     let mut filled = 0usize;
     while filled < buf.len() {
@@ -473,15 +548,53 @@ fn inspect_cargo_toml(dir: &str) -> Option<bool> {
             Ok(0) => break,
             Ok(n) => filled += n,
             Err(blaze_sys::Errno::Intr) => continue,
-            Err(_) => return None,
+            Err(_) => return CargoTomlState::Ambiguous,
         }
     }
-    let content = buf.get(..filled).unwrap_or(&[]);
-    let has_ws = content.split(|&b| b == b'\n').any(|line| {
-        let trimmed = line.trim_ascii();
-        trimmed == b"[workspace]" || trimmed.starts_with(b"[workspace.")
-    });
-    Some(has_ws)
+    if filled == buf.len() {
+        // Manifest exceeds fast-path 64 KiB cap -> let standalone parse it cleanly.
+        return CargoTomlState::Ambiguous;
+    }
+    let Ok(text) = core::str::from_utf8(buf.get(..filled).unwrap_or(&[])) else {
+        return CargoTomlState::Ambiguous;
+    };
+    let Ok(doc) = blaze_toml::Document::parse_in(text, blaze_toml::Limits::CARGO, frame) else {
+        return CargoTomlState::Ambiguous;
+    };
+    if let Some(ws) = doc.root().get("workspace") {
+        let Some(pkg) = pkg_dir else {
+            return CargoTomlState::Workspace { excludes_package: false };
+        };
+        let dir_trimmed = dir.trim_end_matches('/');
+        let Some(rel) = pkg.trim_end_matches('/').strip_prefix(dir_trimmed) else {
+            return CargoTomlState::Ambiguous;
+        };
+        let rel = rel.trim_start_matches('/');
+        if rel.is_empty() {
+            return CargoTomlState::Workspace { excludes_package: false };
+        }
+        // If `exclude` or `members` uses glob patterns, fall through to standalone `Layout`
+        // rather than guessing glob expansion in the thin pre-runtime client.
+        for key in ["exclude", "members"] {
+            if let Some(list) = ws.get(key)
+                && list.children().any(|entry| entry.as_str().is_some_and(has_glob_meta))
+            {
+                return CargoTomlState::Ambiguous;
+            }
+        }
+        let under = |key: &str| {
+            ws.get(key)
+                .is_some_and(|list| list.children().any(|entry| entry.as_str().is_some_and(|e| path_beneath(rel, e))))
+        };
+        let excludes_package = under("exclude") && !under("members");
+        return CargoTomlState::Workspace { excludes_package };
+    }
+    if pkg_dir.is_none()
+        && doc.root().get("package").and_then(|p| p.get("workspace")).is_some()
+    {
+        return CargoTomlState::PackageWithWorkspaceKey;
+    }
+    CargoTomlState::PackageOnly
 }
 
 #[cfg(unix)]
@@ -560,6 +673,83 @@ fn read_exact_fd(fd: blaze_sys::Fd, mut dst: &mut [u8]) -> Result<(), ()> {
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn forward_pending_signals(
+    fd: blaze_sys::Fd,
+    requests: Option<&bstd::procs::Requests>,
+    sent_stop: &mut bool,
+    frame: &bstd::mem::Frame,
+) {
+    let Some(requests) = requests else {
+        return;
+    };
+    if !*sent_stop
+        && let Some(by) = requests.stop()
+    {
+        let mut sig_buf: Vec<u8, &bstd::mem::Frame> = Vec::new_in(frame);
+        daemon::encode_signal(by.number(), &mut sig_buf);
+        let _ = write_all_fd(fd, sig_buf.as_slice());
+        *sent_stop = true;
+    }
+    if let Some(by) = requests.take_status() {
+        let mut sig_buf: Vec<u8, &bstd::mem::Frame> = Vec::new_in(frame);
+        daemon::encode_signal(by.number(), &mut sig_buf);
+        let _ = write_all_fd(fd, sig_buf.as_slice());
+    }
+}
+
+#[cfg(unix)]
+fn read_exact_fd_with_signals(
+    fd: blaze_sys::Fd,
+    mut dst: &mut [u8],
+    requests: Option<&bstd::procs::Requests>,
+    sent_stop: &mut bool,
+    frame: &bstd::mem::Frame,
+) -> Result<(), ()> {
+    use blaze_sys::Timespec;
+    use blaze_sys::posix::io::{PollEvents, PollFd, poll};
+    let slice_timeout = Some(Timespec { sec: 0, nsec: 50_000_000 });
+    while !dst.is_empty() {
+        forward_pending_signals(fd, requests, sent_stop, frame);
+        let mut pfd = [PollFd::new(fd, PollEvents::IN)];
+        match poll(&mut pfd, slice_timeout) {
+            Ok(0) | Err(blaze_sys::Errno::Intr) => continue,
+            Ok(_) => {}
+            Err(_) => return Err(()),
+        }
+        forward_pending_signals(fd, requests, sent_stop, frame);
+        match blaze_sys::posix::io::read(fd, dst) {
+            Ok(0) => return Err(()),
+            Ok(n) => {
+                let Some(rest) = dst.get_mut(n..) else {
+                    return Err(());
+                };
+                dst = rest;
+            }
+            Err(blaze_sys::Errno::Intr) => continue,
+            Err(_) => return Err(()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_frame_fd_with_signals<'b>(
+    fd: blaze_sys::Fd,
+    buf: &'b mut Vec<u8, &bstd::mem::Frame>,
+    requests: Option<&bstd::procs::Requests>,
+    sent_stop: &mut bool,
+    frame: &bstd::mem::Frame,
+) -> Result<&'b [u8], ()> {
+    let mut head = [0u8; 4];
+    read_exact_fd_with_signals(fd, &mut head, requests, sent_stop, frame)?;
+    let len = daemon::frame_len(&head).ok_or(())?.map_err(|_| ())?;
+    buf.clear();
+    buf.resize(len, 0);
+    read_exact_fd_with_signals(fd, buf.as_mut_slice(), requests, sent_stop, frame)?;
+    Ok(buf.as_slice())
 }
 
 #[cfg(unix)]

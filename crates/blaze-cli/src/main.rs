@@ -615,7 +615,7 @@ fn run(cx: &Cx, io: Io, heap: bstd::mem::Heap, spawn_daemon: bool) -> Result<Sta
     // (A `Ran` holding `RunError::Trapped` was matched here: no constructor ever made one, as
     // `Ran` is made only from `Program`, whose every constructor is a manifest refusal; a trap
     // in the program's own process is the run loop's words, run_loop.rs `LoopError`.)
-    match command(cx, &args, &fs, env.as_ref(), net.as_ref(), &host, &clock, &mut rng, &out, &err, &mut phases, heap, spawn_daemon) {
+    match command(cx, &args, &fs, env.as_ref(), net.as_ref(), &host, clock, &mut rng, &out, &err, &mut phases, heap, spawn_daemon) {
         // D86 and the ladder's L6: any failure of `run` or `test` before the program starts
         // (manifest, check, build, start, or a stub that stopped it) exits `program::NOT_RUN`,
         // never 1, which a program's `main` returning `Err` also exits with (std's
@@ -649,7 +649,7 @@ fn command(
     env: Option<&bstd::env::Env>,
     net: Option<&bstd::net::Net>,
     host: &bstd::host::Host,
-    clock: &bstd::clock::Clock,
+    clock: bstd::clock::Clock,
     rng: &mut bstd::rng::Rng,
     out: &Out,
     err: &Out,
@@ -661,29 +661,29 @@ fn command(
         // `check` IS the execution engine (check_command.rs over engine_check.rs): one checker
         // (rule 30). `engine-check` is its old name, an alias until the scripts that type it
         // are moved.
-        Some("check" | "engine-check") => check_command::run(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap, spawn_daemon),
-        Some("ci") => ci_command::run(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap),
+        Some("check" | "engine-check") => check_command::run(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap, spawn_daemon),
+        Some("ci") => ci_command::run(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
         Some("inspect") => inspect_command::run(cx, args, fs, out, err, heap),
-        Some("why") => engine_check::why(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap),
+        Some("why") => engine_check::why(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
         // Hidden: the edit path's forward wake over the stored answer, dry (D187; engine_dry.rs).
         Some("engine-dry") => engine_dry::run(cx, args, fs, env, host, rng, out, err, phases, heap, engine_dry::Mode::Dry),
         // Hidden: the stored answer's root and page keys, to compare two drivers' answers.
         Some("engine-keys") => engine_dry::run(cx, args, fs, env, host, rng, out, err, phases, heap, engine_dry::Mode::Keys),
         // `run` and `test` start from the engine's answer (engine_start.rs, D147): the engine's
         // check, then the program or the tests over what it stored.
-        Some("run") => engine_start::command(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap, Command::Run),
-        Some("test") => engine_start::command(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap, Command::Test),
+        Some("run") => engine_start::command(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap, Command::Run),
+        Some("test") => engine_start::command(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap, Command::Test),
         // The commands are `check`, `run`, `test` and `export`: there is no `build`.
         Some("build") => Err(CliError::NoSuchCommand { command: "build", instead: NO_BUILD }),
-        Some("export") => engine_export::command(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap),
+        Some("export") => engine_export::command(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
         Some("explain") => explain(cx, args.get(2), out),
         // The checkout's state, and with `--store` the home's store, removed (clean.rs).
         Some("clean") => clean::run(cx, fs, env, args, out),
         // Bounded store compaction, root-LRU budget eviction, and stale old-format cleanup (gc.rs).
-        Some("gc") => gc::run(cx, args, fs, env, host, clock, rng, out, err, heap),
+        Some("gc") => gc::run(cx, args, fs, env, host, &clock, rng, out, err, heap),
         // Hidden: the checkout's journal helper, run by hand until a command starts one
         // (journal_ask.rs `HelperStart`): one stream held open, asks answered on its socket.
-        Some("journal-helper") => journal_helper::run(cx, fs, clock, host, rng, env, args, out),
+        Some("journal-helper") => journal_helper::run(cx, fs, &clock, host, rng, env, args, out),
         // Hidden: resident per-checkout daemon (Wave 7, daemon_server.rs).
         Some("daemon") => daemon_server::run(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap),
         Some("--version" | "-V" | "version") => {
@@ -697,9 +697,9 @@ fn command(
             out.line(cx, format_args!("Rust {tc}"))?;
             Ok(Status::OK)
         }
-        Some("warm-toolchain") => engine_check::warm_toolchain(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap),
-        Some("store") => store::publish_command::run(cx, args, fs, env, clock, host, rng, out, err, heap),
-        Some("peer") => peer::run(cx, args, fs, env, net, clock, rng, out),
+        Some("warm-toolchain") => engine_check::warm_toolchain(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
+        Some("store") => store::publish_command::run(cx, args, fs, env, &clock, host, rng, out, err, heap),
+        Some("peer") => peer::run(cx, args, fs, env, net, &clock, rng, out),
         Some(_) | None => Err(CliError::Usage("the command is check, ci, inspect, run, test, export, peer, clean, gc, warm-toolchain or explain")),
     }
 }

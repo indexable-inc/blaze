@@ -508,33 +508,50 @@ fn check_detects_unused_dependency_with_zero_false_positives_and_fixes_it() {
 }
 
 #[test]
-fn blaze_ci_passes_on_clean_fails_on_errors_and_unused_deps_and_emits_github_and_nuon() {
+fn blaze_ci_passes_on_clean_fails_on_errors_and_unused_deps_and_emits_github_and_btab() {
     let base = fresh_home("ci_command_e2e", true);
     let home = base.join("home");
+    let alloc = blaze_own::testing::heap().alloc();
 
-    // 1. Clean workspace -> exit 0, NUON todo with `status: passed` and `todo: []`.
+    // 1. Clean workspace -> exit 0, btab todo with `status: passed` and `todo: []`.
     let clean_ws = base.join("clean");
     build_udeps_workspace(&clean_ws, false);
     let clean = blaze_env(&clean_ws, &home, &["ci", "--no-test"], &[("BLAZE_NO_DAEMON", "1")], "ci_clean");
     assert_eq!(clean.status, Some(0), "clean ci should exit 0:\n{}", clean.all());
     assert!(clean.out.contains("blaze ci: PASSED"), "expected PASSED verdict:\n{}", clean.all());
-    let todo_nuon = read_text(&clean_ws.join(".blaze/ci/todo.nuon"));
-    assert!(todo_nuon.contains("schema: 1") && todo_nuon.contains("status: passed") && todo_nuon.contains("todo: []"), "unexpected todo.nuon:\n{todo_nuon}");
+    let todo_btab = read_text(&clean_ws.join(".blaze/ci/todo.btab"));
+    assert!(
+        todo_btab.contains("schema: 1") && todo_btab.contains("status: passed") && todo_btab.contains("todo: []"),
+        "unexpected todo.btab:\n{todo_btab}"
+    );
+    let parsed_clean = bstd::tab::read(todo_btab.as_bytes(), bstd::tab::Limits::SHIPPED, alloc)
+        .expect("clean todo.btab must parse via bstd::tab::read");
+    assert_eq!(parsed_clean.as_map().and_then(|m| m.get("status")).and_then(|v| v.as_str()), Some("passed"));
 
-    // 2. Unused dependency -> exit 1, NUON + JSON todo with suggestion, `--fix` repairs and passes.
+    // 2. Unused dependency -> exit 1, btab + JSON todo with suggestion, `--fix` repairs and passes.
     let udep_ws = base.join("udep");
     build_udeps_workspace(&udep_ws, true);
     let udep = blaze_env(&udep_ws, &home, &["ci", "--no-test"], &[("BLAZE_NO_DAEMON", "1")], "ci_udep");
     assert_eq!(udep.status, Some(1), "ci with unused dep must fail (exit 1):\n{}", udep.all());
     assert!(udep.out.contains("blaze ci: FAILED") && udep.out.contains("1 unused dep(s)"), "expected FAILED naming unused dep:\n{}", udep.all());
-    let udep_nuon = read_text(&udep_ws.join(".blaze/ci/todo.nuon"));
+    let udep_btab = read_text(&udep_ws.join(".blaze/ci/todo.btab"));
     assert!(
-        udep_nuon.contains("status: failed")
-            && udep_nuon.contains("unused_deps: 1")
-            && udep_nuon.contains("[kind file line col code message suggestion command];")
-            && udep_nuon.contains("unused_dependency \"app/Cargo.toml\"")
-            && udep_nuon.contains("replacement: \"\""),
-        "unexpected udep todo.nuon:\n{udep_nuon}"
+        udep_btab.contains("status: failed")
+            && udep_btab.contains("unused_deps: 1")
+            && udep_btab.contains("todo: [[")
+            && udep_btab.contains("];")
+            && udep_btab.contains("app/Cargo.toml")
+            && !udep_btab.contains("\"app/Cargo.toml\"")
+            && udep_btab.contains("unused_dependency")
+            && udep_btab.contains("replacement: \"\""),
+        "unexpected udep todo.btab:\n{udep_btab}"
+    );
+    let parsed_udep = bstd::tab::read(udep_btab.as_bytes(), bstd::tab::Limits::SHIPPED, alloc)
+        .expect("udep todo.btab must parse via bstd::tab::read");
+    assert_eq!(parsed_udep.as_map().and_then(|m| m.get("status")).and_then(|v| v.as_str()), Some("failed"));
+    assert_eq!(
+        parsed_udep.as_map().and_then(|m| m.get("todo")).and_then(|v| v.as_list()).map(|l| l.len()),
+        Some(1)
     );
 
     let udep_json_run = blaze_env(&udep_ws, &home, &["ci", "--no-test", "--todo-format=json"], &[("BLAZE_NO_DAEMON", "1")], "ci_udep_json");
@@ -576,6 +593,21 @@ fn blaze_ci_passes_on_clean_fails_on_errors_and_unused_deps_and_emits_github_and
         gh.out.contains("::warning file=app/Cargo.toml,line=") && gh.out.contains("title=unused-dependency::"),
         "missing ::warning annotation for unused-dependency:\n{}",
         gh.all()
+    );
+    let gh_btab = read_text(&gh_ws.join(".blaze/ci/todo.btab"));
+    assert!(
+        gh_btab.contains("todo: [[")
+            && gh_btab.contains("app/src/lib.rs")
+            && gh_btab.contains("app/Cargo.toml")
+            && !gh_btab.contains("\"app/src/lib.rs\"")
+            && gh_btab.contains(" _ "),
+        "expected sparse btab table with bare paths and `_` sentinel:\n{gh_btab}"
+    );
+    let parsed_gh = bstd::tab::read(gh_btab.as_bytes(), bstd::tab::Limits::SHIPPED, alloc)
+        .expect("gh todo.btab must parse via bstd::tab::read");
+    assert_eq!(
+        parsed_gh.as_map().and_then(|m| m.get("todo")).and_then(|v| v.as_list()).map(|l| l.len()),
+        Some(2)
     );
     let review_json = read_text(&gh_ws.join(".blaze/ci/github-review.json"));
     assert!(

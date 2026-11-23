@@ -40,7 +40,9 @@ pub const VAR: &str = "BLAZE_LAUNCH_TELEMETRY";
 pub const MAGIC: [u8; 8] = *b"bztelem1";
 
 /// Header format version for the live shared-memory telemetry ring.
-pub const VERSION: u32 = 1;
+/// Version 2 stores lap-relative turn counters (`seq - slot_index`), so zero-filled OS pages
+/// are valid lap-0 slots without faulting the ring on `MappedRing::create`.
+pub const VERSION: u32 = 2;
 
 /// Maximum nested hooked spans per thread before overflowing to passthrough (rule 18).
 pub const SHADOW_DEPTH: usize = 256;

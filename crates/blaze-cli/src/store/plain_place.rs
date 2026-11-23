@@ -183,19 +183,12 @@ pub(crate) fn config(dir: FileName, settings: &Settings, facts: Facts, alloc: St
         machine: Vec::new_in(alloc),
         writes: settings.writes(alloc),
         reads: settings.reads(alloc),
-        // Everything, until the switch to the engine path (plan row D5) turns the sweep on:
-        // `Reached`, which keeps what the roots reach and what a running command's lease keeps.
-        // On the engine path every record a later command reads by key is reached now
-        // (store/roots.rs, the census): the program root (code entries, pointers, the start list,
-        // the `run_ids` and `run_names` tables of its certificate), the toolchain root (std's
-        // code, std's names records and their expansion records), the answer's `.pages` root
-        // (every standing row's record, and each names record's expansion records through the
-        // index beside it), the dependency-heads root and the rows-form answer's roots. The old
-        // drive answer graph under the sealed last answer (`set_last` roots only the sealed
-        // record, not its `cert`, page table, pages or rows' records) is old-path work, not
-        // rooted by decision: it goes with the old path, and a sweep before the switch would
-        // drop it after each command.
-        liveness: Liveness::Everything,
+        // Reachability GC (`Liveness::Reached`, runtime.md C5): keeps what unexpired roots reach
+        // (store/roots.rs: program root, toolchain root, answer `.pages` root and expansion
+        // indexes, dependency-heads root, rows-form roots) and what any running command's lease
+        // keeps, sweeping superseded/expired records in post-answer compaction slices. The old
+        // drive path is deleted.
+        liveness: Liveness::Reached,
         // The jittered doubling, its jitter the nonce (drawn from the granted `Rng`: the
         // simulation's draw under it); `Fixed` is a test's control only.
         lock_step: blaze_cas::plain::LockStep::Backoff,

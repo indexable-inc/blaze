@@ -193,62 +193,13 @@ pub fn visible_width(input: &str) -> usize {
     width
 }
 
-/// Terminal column width of a single Unicode scalar (`0`, `1`, or `2`).
+/// Terminal column width of a single Unicode scalar (`0`, `1`, `2`, or `3`), delegating to
+/// [`blaze_unicode::char_width`] (official UCD tables — one home, rule 30). Control characters
+/// return `0`.
 #[inline]
 #[must_use]
 pub fn char_width(ch: char) -> usize {
-    let cp = u32::from(ch);
-    if (0x20..=0x7e).contains(&cp) {
-        return 1;
-    }
-    if cp < 0x20
-        || (0x7f..=0x9f).contains(&cp)
-        || cp == 0x00ad
-        || (0x200b..=0x200f).contains(&cp)
-        || (0x202a..=0x202e).contains(&cp)
-        || (0x2060..=0x206f).contains(&cp)
-        || cp == 0xfeff
-    {
-        return 0;
-    }
-    if (0x0300..=0x036f).contains(&cp)
-        || (0x1ab0..=0x1aff).contains(&cp)
-        || (0x1dc0..=0x1dff).contains(&cp)
-        || (0x20d0..=0x20ff).contains(&cp)
-        || (0xfe00..=0xfe0f).contains(&cp)
-        || (0xfe20..=0xfe2f).contains(&cp)
-        || (0xe0100..=0xe01ef).contains(&cp)
-    {
-        return 0;
-    }
-    if is_wide(cp) {
-        return 2;
-    }
-    1
-}
-
-const fn is_wide(cp: u32) -> bool {
-    (cp >= 0x1100 && cp <= 0x115f)
-        || cp == 0x2329
-        || cp == 0x232a
-        || (cp >= 0x231a && cp <= 0x231b)
-        || (cp >= 0x23e9 && cp <= 0x23ec)
-        || cp == 0x23f0
-        || cp == 0x23f3
-        || (cp >= 0x2600 && cp <= 0x27bf)
-        || (cp >= 0x2e80 && cp <= 0x303e)
-        || (cp >= 0x3041 && cp <= 0x33ff)
-        || (cp >= 0x3400 && cp <= 0x4dbf)
-        || (cp >= 0x4e00 && cp <= 0xa4cf)
-        || (cp >= 0xa960 && cp <= 0xa97c)
-        || (cp >= 0xac00 && cp <= 0xd7a3)
-        || (cp >= 0xf900 && cp <= 0xfaff)
-        || (cp >= 0xfe10 && cp <= 0xfe19)
-        || (cp >= 0xfe30 && cp <= 0xfe6b)
-        || (cp >= 0xff01 && cp <= 0xff60)
-        || (cp >= 0xffe0 && cp <= 0xffe6)
-        || (cp >= 0x1f300 && cp <= 0x1faff)
-        || (cp >= 0x20000 && cp <= 0x3fffd)
+    blaze_unicode::char_width(ch).unwrap_or(0)
 }
 
 /// Terminal ANSI color (4-bit standard, 8-bit 256-palette, or 24-bit RGB truecolor).

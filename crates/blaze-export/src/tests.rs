@@ -230,8 +230,8 @@ fn statics_and_vtables_are_placed_and_fixed() {
     let table = [0u8; 8];
     let words = [DataWord { at: 0, target: Some(func("main")), addend: 0 }];
     let data = [
-        Data { target: st, bytes: &answer, align: 8, words: &[], place: DataPlace::ReadOnly },
-        Data { target: vt, bytes: &table, align: 8, words: &words, place: DataPlace::ReadOnly },
+        Data { target: st, bytes: &answer, align: 8, words: &[], outside: &[], place: DataPlace::ReadOnly },
+        Data { target: vt, bytes: &table, align: 8, words: &words, outside: &[], place: DataPlace::ReadOnly },
     ];
     let members = [Member { symbol: sym("main"), record: CodeView::read(&main).unwrap(), tier: Some(Tier::Fast) }];
     let laid = lay_out(&members, &data, sym("main"), None, macho::plan(), 0, Alloc::global()).unwrap();
@@ -348,10 +348,10 @@ fn rust_tls_macho_and_elf_layout_and_determinism() {
     let ptr_bytes = [0u8; 8];
     let ptr_words = [DataWord { at: 0, target: Some(st_target), addend: 0 }];
     let data = [
-        Data { target: st_target, bytes: &shared_bytes, align: 8, words: &[], place: DataPlace::ReadOnly },
-        Data { target: tls_init, bytes: &init_bytes, align: 8, words: &[], place: DataPlace::ReadOnly },
-        Data { target: tls_zero, bytes: &[], align: 16, words: &[], place: DataPlace::Zeroed { len: 16 } },
-        Data { target: tls_ptr, bytes: &ptr_bytes, align: 8, words: &ptr_words, place: DataPlace::ReadOnly },
+        Data { target: st_target, bytes: &shared_bytes, align: 8, words: &[], outside: &[], place: DataPlace::ReadOnly },
+        Data { target: tls_init, bytes: &init_bytes, align: 8, words: &[], outside: &[], place: DataPlace::ReadOnly },
+        Data { target: tls_zero, bytes: &[], align: 16, words: &[], outside: &[], place: DataPlace::Zeroed { len: 16 } },
+        Data { target: tls_ptr, bytes: &ptr_bytes, align: 8, words: &ptr_words, outside: &[], place: DataPlace::ReadOnly },
     ];
     let data_rev = [data[3], data[2], data[1], data[0]];
     let fs = [
@@ -453,7 +453,7 @@ fn rust_tls_refusals_are_named() {
     let main_tls = rec(&[ADRP_X0, LDR_X0, MOV_W0_42, RET], &[(0, SiteKind::Load, tls_a)], &[]);
     let main_plain = rec(&[MOV_W0_42, RET], &[], &[]);
     let ender = rec(&[RET], &[], &[]);
-    let tls_datum = [Data { target: tls_a, bytes: &val, align: 8, words: &[], place: DataPlace::ReadOnly }];
+    let tls_datum = [Data { target: tls_a, bytes: &val, align: 8, words: &[], outside: &[], place: DataPlace::ReadOnly }];
     let mut out = Vec::new_in(alloc);
 
     // 1. Space::Tls datum without TlsRuntime -> NoTlsRuntime.
@@ -494,8 +494,8 @@ fn rust_tls_refusals_are_named() {
     let bad_words = [DataWord { at: 0, target: Some(tls_a), addend: 0 }];
     let bad_st = Target { space: Space::Static, symbol: sym("BAD_ST") };
     let data_bad_word = [
-        Data { target: tls_a, bytes: &val, align: 8, words: &[], place: DataPlace::ReadOnly },
-        Data { target: bad_st, bytes: &val, align: 8, words: &bad_words, place: DataPlace::ReadOnly },
+        Data { target: tls_a, bytes: &val, align: 8, words: &[], outside: &[], place: DataPlace::ReadOnly },
+        Data { target: bad_st, bytes: &val, align: 8, words: &bad_words, outside: &[], place: DataPlace::ReadOnly },
     ];
     let p = ProgramIn { functions: &fs_both, data: &data_bad_word, tls: rt, ..p };
     assert_eq!(export(&p, Platform::MacosArm64, &mut out, alloc), Err(ExportError::DataTlsTarget { from: bad_st, target: tls_a }));
@@ -511,13 +511,30 @@ fn rust_tls_refusals_are_named() {
 
     // 7. User static colliding with TlsRuntime::descriptor -> TwoData.
     let desc_target = Target { space: Space::Static, symbol: desc_sym };
-    let collide_data = [Data { target: desc_target, bytes: &val, align: 8, words: &[], place: DataPlace::ReadOnly }];
+    let collide_data = [Data { target: desc_target, bytes: &val, align: 8, words: &[], outside: &[], place: DataPlace::ReadOnly }];
     let fs_plain_ender = [
         Function { symbol: sym("main"), record: CodeView::read(&main_plain).unwrap(), tier: Tier::Fast },
         Function { symbol: ender_sym, record: CodeView::read(&ender).unwrap(), tier: Tier::Fast },
     ];
     let p = ProgramIn { functions: &fs_plain_ender, data: &collide_data, tls: rt, ..p };
     assert_eq!(export(&p, Platform::MacosArm64, &mut out, alloc), Err(ExportError::TwoData { target: desc_target }));
+
+    // 8. Self-relative DataWord (`target: None`) in Space::Tls -> DataTlsTarget.
+    let self_words = [DataWord { at: 0, target: None, addend: 0 }];
+    let self_tls_data = [Data { target: tls_a, bytes: &val, align: 8, words: &self_words, outside: &[], place: DataPlace::ReadOnly }];
+    let p = ProgramIn { functions: &fs_both, data: &self_tls_data, tls: rt, ..p };
+    assert_eq!(export(&p, Platform::MacosArm64, &mut out, alloc), Err(ExportError::DataTlsTarget { from: tls_a, target: tls_a }));
+
+    // 9. Space::Outside import referenced only by a Space::Tls template is gathered and bound.
+    let ext_sym = sym("puts");
+    let ext_target = Target { space: Space::Outside, symbol: ext_sym };
+    let ext_words = [DataWord { at: 0, target: Some(ext_target), addend: 0 }];
+    let ext_outside = [(ext_sym, "puts")];
+    let ext_tls_data = [Data { target: tls_a, bytes: &val, align: 8, words: &ext_words, outside: &ext_outside, place: DataPlace::ReadOnly }];
+    let p = ProgramIn { functions: &fs_both, data: &ext_tls_data, tls: rt, ..p };
+    let exported = export(&p, Platform::MacosArm64, &mut out, alloc).expect("TLS template outside import");
+    assert_eq!(exported.imports, 2, "pthread_key_create + puts");
+    check::macho(&out).expect("Mach-O valid with TLS outside import and 16B-aligned __const");
 }
 
 /// Regression: when `eh_room` reserves more pages after `__text` than `eh_sections` actually
@@ -530,7 +547,7 @@ fn macho_const_segment_lands_at_const_at_when_eh_leaves_page_gap() {
     let ro = Target { space: Space::Static, symbol: sym("RO_MAGIC") };
     let main = rec(&[ADRP_X0, LDR_X0, MOV_W0_42, RET], &[(0, SiteKind::Load, ro)], &[]);
     let members = [Member { symbol: sym("main"), record: CodeView::read(&main).unwrap(), tier: Some(Tier::Fast) }];
-    let data = [Data { target: ro, bytes: &magic, align: 8, words: &[], place: DataPlace::ReadOnly }];
+    let data = [Data { target: ro, bytes: &magic, align: 8, words: &[], outside: &[], place: DataPlace::ReadOnly }];
     let tail = 0x8000u64;
     let laid = lay_out(&members, &data, sym("main"), None, macho::plan_for(None), tail, alloc).unwrap();
     let eh = crate::eh_out::eh_sections(&laid, &members, None, Platform::MacosArm64, alloc).unwrap();
@@ -554,4 +571,500 @@ fn macho_const_segment_lands_at_const_at_when_eh_leaves_page_gap() {
         out[const_at..const_at + laid.konst.len()].windows(magic.len()).any(|w| w == magic),
         "RO_MAGIC payload must be present inside __DATA_CONST at laid.const_at"
     );
+}
+
+/// Builds a synthetic `NativePlatform::LinuxArm64` `Image` matching `blaze_native::layout::lay`'s
+/// `Layout::LINUX_ARM64` shape:
+/// - `Text` (`0x1_0000`, 8 bytes): `c_entry` (`0x1_0000`), `c_init` (`0x1_0004`).
+/// - `EhFrame` (`0x1_0008`, 32 bytes): 1 CIE + 1 FDE at `0x1_0010` covering `c_init` (`0x1_0004`).
+/// - `Got` (`0x2_0000`, 0x20 bytes): `puts` (`GLOB_DAT`), optional `TlsReloc::TpRel` (offset 0) & `Desc` (offset 8).
+/// - `Data` (`0x3_0000`, 0x68 bytes): BNL2 descriptor, names (`rust_cb`), pointer row, rebase (`0x3_0050 -> c_entry`),
+///   weak import (`0x3_0058 -> weak_hook + 8`), `FixTo::Word { index: 0 }` (`0x3_0060`).
+/// - `Words` (`0x3_0068`, 8 bytes): word 0 (`rust_cb`).
+/// - `Inits` (`0x3_0070`, 8 bytes): init 0 (`c_init`).
+/// - Optional `ThreadData` (`0x3_0080` or `0x3_0088`, 8 bytes, value `0x1122_3344_5566_7788`) + `ThreadZero` (8 bytes).
+/// - `Zero` (16 bytes).
+/// - Libraries: `c`, `pthread` (both `libc.so.6`, deduplicated), `m` (`libm.so.6`), `gcc_s` (`libgcc_s.so.1`).
+fn linux_native_image(
+    alloc: Alloc<'static>,
+    with_tls: bool,
+    tdata_at: u64,
+    tls_align_log2: u8,
+) -> blaze_native::image::Image<'static> {
+    use blaze_native::Platform as NativePlatform;
+    use blaze_native::image::{EhPointer, FixTo as NativeFix, Fixup as NativeFixup, Frame as NativeFrame, Image, Import as NativeImport, Placed as NativePlaced, Region, TlsReloc};
+    use blaze_native::libraries::{Library, LibraryKind, Linked, Source, source};
+
+    const START: u64 = 0x1_0000;
+    let put32 = |bytes: &mut [u8], at: u64, value: u32| {
+        let i = (at - START) as usize;
+        bytes[i..i + 4].copy_from_slice(&value.to_le_bytes());
+    };
+    let put64 = |bytes: &mut [u8], at: u64, value: u64| {
+        let i = (at - START) as usize;
+        bytes[i..i + 8].copy_from_slice(&value.to_le_bytes());
+    };
+
+    let (tdata_len, tbss_at, tbss_len, init_end, zero_at) = if with_tls {
+        (8u64, tdata_at + 8, 8u64, tdata_at + 8, tdata_at + 16)
+    } else {
+        (0u64, 0x3_0078u64, 0u64, 0x3_0078u64, 0x3_0078u64)
+    };
+
+    let mut regions: AVec<'static, NativePlaced> = Vec::new_in(alloc);
+    let rows: [(Region, u64, u64, u8); 12] = [
+        (Region::Text, 0x1_0000, 8, 2),
+        (Region::Const, 0x1_0008, 0, 0),
+        (Region::EhFrame, 0x1_0008, 32, 3),
+        (Region::UnwindInfo, 0x1_0028, 0, 2),
+        (Region::Got, 0x2_0000, 0x20, 4),
+        (Region::Data, 0x3_0000, 0x68, 3),
+        (Region::Words, 0x3_0068, 8, 3),
+        (Region::Inits, 0x3_0070, 8, 3),
+        (Region::ThreadVars, 0x3_0078, 0, 3),
+        (Region::ThreadData, if with_tls { tdata_at } else { 0x3_0078 }, tdata_len, tls_align_log2),
+        (Region::ThreadZero, tbss_at, tbss_len, tls_align_log2),
+        (Region::Zero, zero_at, 16, 3),
+    ];
+    for (region, at, len, align_log2) in rows {
+        regions.push(NativePlaced { region, at, len, align_log2 });
+    }
+    let mut bytes: AVec<'static, u8> = Vec::new_in(alloc);
+    bytes.resize((init_end - START) as usize, 0);
+    put32(&mut bytes, 0x1_0000, RET);
+    put32(&mut bytes, 0x1_0004, RET);
+    // Minimal 8-byte CIE at 0x1_0008 (len=4, id=0) + 24-byte FDE at 0x1_0010 (len=20, cie_ptr=12, pc_begin at 0x1_0018, range=4).
+    put32(&mut bytes, 0x1_0008, 4);
+    put32(&mut bytes, 0x1_000C, 0);
+    put32(&mut bytes, 0x1_0010, 20);
+    put32(&mut bytes, 0x1_0014, 12);
+    put32(&mut bytes, 0x1_0018, (0x1_0004i64 - 0x1_0018) as i32 as u32);
+    put32(&mut bytes, 0x1_001C, 4);
+    // BNL2 descriptor header at 0x3_0000.
+    put32(&mut bytes, 0x3_0000, 0x424e_4c32);
+    put32(&mut bytes, 0x3_0004, 1);
+    put32(&mut bytes, 0x3_0008, 1);
+    put32(&mut bytes, 0x3_000C, 1);
+    put64(&mut bytes, 0x3_0010, 0x3_0068);
+    put64(&mut bytes, 0x3_0018, 0x3_0070);
+    put64(&mut bytes, 0x3_0020, 0x3_0040);
+    put64(&mut bytes, 0x3_0028, 0x3_0030);
+    // Plant non-zero values in relocated slots to verify RELA zeroing.
+    put64(&mut bytes, 0x2_0000, 0x1111_2222_3333_4444);
+    put64(&mut bytes, 0x2_0008, 0x5555_6666_7777_8888);
+    put64(&mut bytes, 0x2_0010, 0x9999_AAAA_BBBB_CCCC);
+    put64(&mut bytes, 0x2_0018, 0xDDDD_EEEE_FFFF_0001);
+    put64(&mut bytes, 0x3_0050, 0xDEAD);
+    put64(&mut bytes, 0x3_0058, 0xCAFE);
+    put64(&mut bytes, 0x3_0060, 0xBEEF);
+    put64(&mut bytes, 0x3_0068, 0xF00D);
+    put64(&mut bytes, 0x3_0070, 0x1234);
+    if with_tls {
+        put64(&mut bytes, tdata_at, 0x1122_3344_5566_7788);
+    }
+
+    let mut fixups: AVec<'static, NativeFixup> = Vec::new_in(alloc);
+    fixups.push(NativeFixup { at: 0x2_0000, to: NativeFix::Import { index: 0, addend: 0 } });
+    fixups.push(NativeFixup { at: 0x3_0050, to: NativeFix::rebase(0x1_0000) });
+    fixups.push(NativeFixup { at: 0x3_0058, to: NativeFix::Import { index: 1, addend: 8 } });
+    fixups.push(NativeFixup { at: 0x3_0060, to: NativeFix::Word { index: 0 } });
+    fixups.push(NativeFixup { at: 0x3_0070, to: NativeFix::rebase(0x1_0004) });
+
+    let mut tls: AVec<'static, TlsReloc> = Vec::new_in(alloc);
+    if with_tls {
+        tls.push(TlsReloc::TpRel { got_at: 0x2_0008, offset: 0 });
+        tls.push(TlsReloc::Desc { got_at: 0x2_0010, offset: 8 });
+    }
+
+    let mut imports: AVec<'static, NativeImport<'static>> = Vec::new_in(alloc);
+    imports.push(NativeImport { name: b"puts", weak: false });
+    imports.push(NativeImport { name: b"weak_hook", weak: true });
+
+    let mut exports: AVec<'static, (&'static [u8], u64)> = Vec::new_in(alloc);
+    exports.push((b"__blaze_native_v1", 0x3_0000));
+    exports.push((b"c_entry", 0x1_0000));
+    exports.push((b"c_init", 0x1_0004));
+
+    let mut words: AVec<'static, &'static [u8]> = Vec::new_in(alloc);
+    words.push(b"rust_cb");
+
+    let mut libraries: AVec<'static, Linked<'static>> = Vec::new_in(alloc);
+    for name in ["c", "pthread", "m", "gcc_s"] {
+        match source(NativePlatform::LinuxArm64, Library { kind: LibraryKind::Dylib, name }) {
+            Ok(Source::Linked(linked)) => libraries.push(linked),
+            other => panic!("unexpected library resolution for `{name}`: {other:?}"),
+        }
+    }
+
+    let mut frames: AVec<'static, NativeFrame> = Vec::new_in(alloc);
+    frames.push(NativeFrame { at: 0x1_0010, len: 24, start: 0x1_0004, range: 4 });
+    let mut eh_pointers: AVec<'static, EhPointer> = Vec::new_in(alloc);
+    eh_pointers.push(EhPointer { at: 0x1_0018, width: 4, to: 0x1_0004, minus: 0x1_0018 });
+
+    Image {
+        platform: NativePlatform::LinuxArm64,
+        regions,
+        bytes,
+        file_start: START,
+        end: zero_at + 16,
+        fixups,
+        tls,
+        imports,
+        exports,
+        words,
+        inits: 1,
+        descriptor_at: 0x3_0000,
+        libraries,
+        unwind: Vec::new_in(alloc),
+        frames,
+        eh_pointers,
+    }
+}
+
+/// Full ELF arm64 native C image merge: Rust->C direct calls (`c_entry` dropped from `.dynsym`
+/// into `R_AARCH64_RELATIVE`), C->Rust `Word` callbacks (`rust_cb` direct `R_AARCH64_RELATIVE` in
+/// both `Words` and `FixTo::Word`), `DT_INIT_ARRAY`, deduplicated `DT_NEEDED`, `GLOB_DAT` /
+/// `ABS64` (including `STB_WEAK` + addend), `R_AARCH64_TLS_TPREL64` + `R_AARCH64_TLSDESC` +
+/// `PT_TLS`, `.eh_frame_hdr` native FDE integration, RELA cell zeroing, and determinism.
+#[test]
+fn elf_native_merge_full_end_to_end() {
+    use crate::input::CExport;
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let img = linux_native_image(alloc, true, 0x3_0080, 3);
+    // `main` calls `c_entry` (defined by native image -> direct RELATIVE!) and `exit` (external).
+    let main_rec = rec(
+        &[STP, MOV_FP, ADRP_X16, LDR_X16, BLR_X16, ADRP_X16, LDR_X16, BLR_X16, LDP, RET],
+        &[],
+        &[(8, "c_entry"), (20, "exit")],
+    );
+    let rust_cb_rec = rec(&[MOV_W0_42, RET], &[], &[]);
+    let fs = [
+        Function { symbol: sym("main"), record: CodeView::read(&main_rec).unwrap(), tier: Tier::Fast },
+        Function { symbol: sym("rust_cb"), record: CodeView::read(&rust_cb_rec).unwrap(), tier: Tier::Fast },
+    ];
+    let fs_rev = [fs[1], fs[0]];
+    let c_exports = [CExport { name: b"rust_cb", symbol: sym("rust_cb") }];
+    let prog = ProgramIn {
+        name: "elf-native",
+        functions: &fs,
+        data: &[],
+        entry: Entry::CMain { main: sym("main") },
+        panic: Panic::Unwind,
+        personality: None,
+        tls: None,
+        profile: None,
+        natives: Some(&img),
+        exports: &c_exports,
+    };
+    let prog_rev = ProgramIn { functions: &fs_rev, ..prog };
+
+    let mut out1 = Vec::new_in(alloc);
+    let mut out2 = Vec::new_in(alloc);
+    let summary = export(&prog, Platform::LinuxArm64, &mut out1, alloc).unwrap();
+    export(&prog_rev, Platform::LinuxArm64, &mut out2, alloc).unwrap();
+    assert_eq!(&out1[..], &out2[..], "ELF native merge export must be deterministic across input orders");
+
+    // 1. Validate with `check::elf`.
+    let facts = check::elf(&out1).unwrap();
+    assert_eq!(facts.needed, 3, "DT_NEEDED: libc.so.6, libm.so.6, libgcc_s.so.1");
+    assert_eq!(facts.relative, 5, "1 direct program import (c_entry) + 4 native relatives (rebase, Word ptr, Words[0], Inits[0])");
+    assert_eq!(facts.binds, 4, "__libc_start_main, exit, puts, weak_hook");
+    assert_eq!(facts.tls_relocs, 2, "TlsTpRel + TlsDesc");
+    assert_eq!(facts.tls, Some((8, 16, 8)), "PT_TLS: 8B .tdata + 8B .tbss, align 8");
+    assert_eq!(summary.imports, 4, "Exported::imports drops direct c_entry and counts the 4 remaining binds");
+
+    // 2. Independently parse program headers, `.dynamic`, `.dynsym`, `.rela.dyn`, `PT_TLS`, `PT_GNU_EH_FRAME`.
+    let u16_at = |at: usize| u16::from_le_bytes(out1[at..at + 2].try_into().unwrap());
+    let u32_at = |at: usize| u32::from_le_bytes(out1[at..at + 4].try_into().unwrap());
+    let u64_at = |at: usize| u64::from_le_bytes(out1[at..at + 8].try_into().unwrap());
+    let cstr = |at: usize| -> &[u8] {
+        let len = out1[at..].iter().position(|&b| b == 0).unwrap();
+        &out1[at..at + len]
+    };
+
+    let phoff = u64_at(32) as usize;
+    let phnum = u16_at(56) as usize;
+    let mut loads: AVec<'_, (u32, u64, u64, u64, u64)> = Vec::new_in(alloc);
+    let mut dynamic_ph = None;
+    let mut tls_ph = None;
+    let mut eh_ph = None;
+    for k in 0..phnum {
+        let p = phoff + 56 * k;
+        let kind = u32_at(p);
+        let flags = u32_at(p + 4);
+        let off = u64_at(p + 8);
+        let va = u64_at(p + 16);
+        let filesz = u64_at(p + 32);
+        let memsz = u64_at(p + 40);
+        match kind {
+            1 => loads.push((flags, off, va, filesz, memsz)),
+            2 => dynamic_ph = Some((off, filesz)),
+            7 => tls_ph = Some((off, va, filesz, memsz)),
+            0x6474_E550 => eh_ph = Some((off, va, filesz)),
+            _ => {}
+        }
+    }
+    // Program text (r-x), const (rw-), native text (r-x), native data (rw-), meta (r--) = 5 loads.
+    assert_eq!(loads.len(), 5, "expected 5 PT_LOAD segments (no program data segment)");
+    assert_eq!(loads[0].0, 5); // program text r-x
+    assert_eq!(loads[1].0, 6); // program const rw-
+    assert_eq!(loads[2].0, 5); // native text r-x
+    assert_eq!(loads[3].0, 6); // native data rw-
+    assert_eq!(loads[4].0, 4); // meta r--
+    let shift = loads[2].2 - 0x1_0000;
+    assert_eq!(shift % elf::PAGE, 0);
+    assert_eq!(loads[3].2, 0x2_0000 + shift, "native data PT_LOAD starts at shifted Got");
+    assert!(loads[3].4 > loads[3].3, "native data memsz covers ThreadZero + Zero past filesz");
+
+    let vaddr_to_off = |va: u64| -> usize {
+        let l = loads.iter().find(|l| va >= l.2 && va < l.2 + l.3).unwrap_or_else(|| panic!("vaddr {va:#x} not in any PT_LOAD"));
+        (l.1 + (va - l.2)) as usize
+    };
+
+    // Check PT_TLS `.tdata` contents.
+    let (tls_off, tls_va, _, _) = tls_ph.expect("PT_TLS present");
+    assert_eq!(tls_va, 0x3_0080 + shift);
+    assert_eq!(u64_at(tls_off as usize), 0x1122_3344_5566_7788, "PT_TLS preserves .tdata bytes");
+
+    // Check `.dynamic` tags.
+    let (dyn_off, dyn_len) = dynamic_ph.expect("PT_DYNAMIC present");
+    let mut dyn_tags: AVec<'_, (u64, u64)> = Vec::new_in(alloc);
+    let mut off = dyn_off as usize;
+    while off < (dyn_off + dyn_len) as usize {
+        let (t, v) = (u64_at(off), u64_at(off + 8));
+        if t == 0 {
+            break;
+        }
+        dyn_tags.push((t, v));
+        off += 16;
+    }
+    let find_tag = |tag: u64| dyn_tags.iter().find(|&&(t, _)| t == tag).map(|&(_, v)| v);
+    let strtab = vaddr_to_off(find_tag(5).unwrap());
+    let symtab = vaddr_to_off(find_tag(6).unwrap());
+    let rela_off = vaddr_to_off(find_tag(7).unwrap());
+    let relasz = find_tag(8).unwrap() as usize;
+    assert_eq!(find_tag(25), Some(0x3_0070 + shift), "DT_INIT_ARRAY points to shifted Inits");
+    assert_eq!(find_tag(27), Some(8), "DT_INIT_ARRAYSZ == 8");
+    assert_eq!(facts.init_array, Some((0x3_0070 + shift, 8)));
+    assert_eq!(find_tag(0x6FFF_FFF9), Some(5), "DT_RELACOUNT == 5");
+    assert_eq!(find_tag(30), Some(0x8 | 0x10), "DT_FLAGS sets DF_BIND_NOW | DF_STATIC_TLS");
+
+    let mut needed_names: AVec<'_, &[u8]> = Vec::new_in(alloc);
+    for &(t, v) in dyn_tags.iter() {
+        if t == 1 {
+            needed_names.push(cstr(strtab + v as usize));
+        }
+    }
+    assert_eq!(&needed_names[..], &[&b"libc.so.6"[..], &b"libm.so.6"[..], &b"libgcc_s.so.1"[..]]);
+
+    // Check `.dynsym` entries (index 0 is null, then kept program imports, then native imports).
+    let hash_off = vaddr_to_off(find_tag(4).unwrap());
+    let nsyms = u32_at(hash_off + 4) as usize;
+    assert_eq!(nsyms, 5, "null + 2 kept program imports + 2 native imports");
+    let mut sym_names: AVec<'_, (&[u8], u8)> = Vec::new_in(alloc);
+    for s in 1..nsyms {
+        let base = symtab + 24 * s;
+        let name = cstr(strtab + u32_at(base) as usize);
+        let bind = out1[base + 4] >> 4;
+        sym_names.push((name, bind));
+    }
+    assert!(sym_names.iter().all(|&(n, _)| n != b"c_entry"), "c_entry defined by native image must be dropped from .dynsym");
+    assert!(sym_names.iter().any(|&(n, b)| n == b"__libc_start_main" && b == 1));
+    assert!(sym_names.iter().any(|&(n, b)| n == b"exit" && b == 1));
+    assert!(sym_names.iter().any(|&(n, b)| n == b"puts" && b == 1));
+    assert!(sym_names.iter().any(|&(n, b)| n == b"weak_hook" && b == 2), "weak_hook keeps STB_WEAK");
+
+    // Check every RELA entry and confirm every native relocated cell is zero in the file.
+    let mut relas: AVec<'_, (u64, u64, u64, i64)> = Vec::new_in(alloc);
+    for r in 0..relasz / 24 {
+        let base = rela_off + 24 * r;
+        let r_off = u64_at(base);
+        let info = u64_at(base + 8);
+        let addend = u64_at(base + 16) as i64;
+        relas.push((r_off, info >> 32, info & 0xFFFF_FFFF, addend));
+    }
+    assert_eq!(relas.len(), 11);
+    // First 5 are R_AARCH64_RELATIVE (1027).
+    for r in &relas[..5] {
+        assert_eq!((r.1, r.2), (0, 1027), "first DT_RELACOUNT entries must be R_AARCH64_RELATIVE");
+    }
+    // Direct program import for `c_entry` rebases to `0x1_0000 + shift`.
+    assert!(relas[..5].iter().any(|r| r.0 < loads[2].2 && r.3 as u64 == 0x1_0000 + shift), "program c_entry GOT cell rebases to native c_entry");
+    // Native rebase cell 0x3_0050 + shift -> 0x1_0000 + shift.
+    assert!(relas[..5].iter().any(|r| r.0 == 0x3_0050 + shift && r.3 as u64 == 0x1_0000 + shift));
+    // Native Word pointer cell 0x3_0060 + shift and Words[0] 0x3_0068 + shift both rebase to the same Rust `rust_cb` address.
+    let word_ptr_target = relas[..5].iter().find(|r| r.0 == 0x3_0060 + shift).unwrap().3 as u64;
+    let words0_target = relas[..5].iter().find(|r| r.0 == 0x3_0068 + shift).unwrap().3 as u64;
+    assert_eq!(word_ptr_target, words0_target, "FixTo::Word and Words[0] target the same Rust function");
+    assert!(word_ptr_target >= elf::TEXT_AT && word_ptr_target < loads[1].2, "rust_cb sits in program text");
+    // Native Inits[0] 0x3_0070 + shift -> 0x1_0004 + shift (`c_init`).
+    assert!(relas[..5].iter().any(|r| r.0 == 0x3_0070 + shift && r.3 as u64 == 0x1_0004 + shift));
+    // Native GLOB_DAT for puts (0x2_0000 + shift, sym 3, addend 0), TPREL64 (0x2_0008 + shift, sym 0, addend 0),
+    // TLSDESC (0x2_0010 + shift, sym 0, addend 8), ABS64 for weak_hook (0x3_0058 + shift, sym 4, addend 8).
+    assert!(relas[5..].iter().any(|r| r.0 == 0x2_0000 + shift && r.1 == 3 && r.2 == 1025 && r.3 == 0));
+    assert!(relas[5..].iter().any(|r| r.0 == 0x2_0008 + shift && r.1 == 0 && r.2 == 1030 && r.3 == 0));
+    assert!(relas[5..].iter().any(|r| r.0 == 0x2_0010 + shift && r.1 == 0 && r.2 == 1031 && r.3 == 8));
+    assert!(relas[5..].iter().any(|r| r.0 == 0x3_0058 + shift && r.1 == 4 && r.2 == 257 && r.3 == 8));
+    // Every relocated native cell holds 0 in the file (including both words of TLSDESC pair).
+    for &va in &[0x2_0000, 0x2_0008, 0x2_0010, 0x2_0018, 0x3_0050, 0x3_0058, 0x3_0060, 0x3_0068, 0x3_0070] {
+        assert_eq!(u64_at(vaddr_to_off(va + shift)), 0, "RELA slot at {va:#x} must be 0 in file");
+    }
+
+    // Check `.eh_frame_hdr` includes the native FDE for `c_init` (0x1_0004 + shift) with re-encoded pc_begin.
+    let (eh_off, eh_va, eh_len) = eh_ph.expect("PT_GNU_EH_FRAME present");
+    assert!(eh_len >= 20, "eh_frame_hdr has header + at least the native FDE entry");
+    let fde_count = u32_at(eh_off as usize + 8) as usize;
+    assert_eq!(fde_count, 1, "one FDE (the native c_init FDE)");
+    let init_loc = (eh_va as i64 + i64::from(u32_at(eh_off as usize + 12) as i32)) as u64;
+    let fde_va = (eh_va as i64 + i64::from(u32_at(eh_off as usize + 16) as i32)) as u64;
+    assert_eq!(init_loc, 0x1_0004 + shift, "eh_frame_hdr entry points to shifted c_init");
+    let fde_off = vaddr_to_off(fde_va);
+    assert_eq!(u32_at(fde_off), 20, "copied native FDE length");
+    let pc_begin = (fde_va + 8).wrapping_add(i64::from(u32_at(fde_off + 8) as i32) as u64);
+    assert_eq!(pc_begin, 0x1_0004 + shift, "re-encoded FDE pc_begin reaches shifted c_init");
+}
+
+/// ELF `PT_TLS` coexistence: native C TLS (`.tdata` + `.tbss`) and Rust `Space::Tls` share the
+/// executable's single `PT_TLS`, including when `.tdata` is 8-aligned (upgraded to 16-byte align
+/// via read-only `meta` copy) and when C TLS requires 32-byte alignment (shifting `DESC.root`).
+#[test]
+fn elf_native_merge_coexists_with_rust_tls() {
+    use crate::input::CExport;
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let desc_sym = sym("TLS_DESC");
+    let ender_sym = sym("tls_ender");
+    let desc_target = Target { space: Space::Static, symbol: desc_sym };
+    let tls_a = Target { space: Space::Tls, symbol: sym("RUST_TLS_A") };
+    let val = 123u64.to_le_bytes();
+    let main_rec = rec(
+        &[ADRP_X0, LDR_X0, ADRP_X0, LDR_X0, MOV_W0_42, RET],
+        &[(0, SiteKind::Load, desc_target), (8, SiteKind::Load, tls_a)],
+        &[],
+    );
+    let ender_rec = rec(&[RET], &[], &[]);
+    let rust_cb_rec = rec(&[MOV_W0_42, RET], &[], &[]);
+    let fs = [
+        Function { symbol: sym("main"), record: CodeView::read(&main_rec).unwrap(), tier: Tier::Fast },
+        Function { symbol: ender_sym, record: CodeView::read(&ender_rec).unwrap(), tier: Tier::Fast },
+        Function { symbol: sym("rust_cb"), record: CodeView::read(&rust_cb_rec).unwrap(), tier: Tier::Fast },
+    ];
+    let data = [Data { target: tls_a, bytes: &val, align: 8, words: &[], outside: &[], place: DataPlace::ReadOnly }];
+    let c_exports = [CExport { name: b"rust_cb", symbol: sym("rust_cb") }];
+    let tls_rt = Some(TlsRuntime { descriptor: desc_sym, ender: ender_sym });
+
+    let inspect_root = |file: &[u8]| -> (u64, u64, u64, u64, u64) {
+        let u16_at = |at: usize| u16::from_le_bytes(file[at..at + 2].try_into().unwrap());
+        let u32_at = |at: usize| u32::from_le_bytes(file[at..at + 4].try_into().unwrap());
+        let u64_at = |at: usize| u64::from_le_bytes(file[at..at + 8].try_into().unwrap());
+        let phoff = u64_at(32) as usize;
+        let phnum = u16_at(56) as usize;
+        let mut prog_data_off = None;
+        let mut tls_ph = None;
+        let mut load_idx = 0usize;
+        for k in 0..phnum {
+            let p = phoff + 56 * k;
+            match u32_at(p) {
+                1 => {
+                    if load_idx == 2 {
+                        prog_data_off = Some(u64_at(p + 8) as usize);
+                    }
+                    load_idx += 1;
+                }
+                7 => tls_ph = Some((u64_at(p + 8), u64_at(p + 16), u64_at(p + 32), u64_at(p + 40), u64_at(p + 48))),
+                _ => {}
+            }
+        }
+        let (tls_off, tls_va, filesz, memsz, align) = tls_ph.expect("single PT_TLS");
+        assert_eq!(tls_off % align, 0, "PT_TLS p_offset must be p_align-aligned");
+        assert_eq!(tls_va % align, 0, "PT_TLS p_vaddr must be p_align-aligned");
+        if filesz == 8 {
+            assert_eq!(u64_at(tls_off as usize), 0x1122_3344_5566_7788, ".tdata bytes preserved");
+        }
+        // `DESC` is the only writable datum in program data; `DESC.root` is at offset +8.
+        let desc_root = u64_at(prog_data_off.expect("program data load") + 8);
+        (filesz, memsz, align, tls_va, desc_root)
+    };
+
+    // Case 1: 8B .tdata + 8B .tbss with 8-byte aligned tdata at 0x3_0088 (not 16-aligned -> copied into meta).
+    let img_unaligned = linux_native_image(alloc, true, 0x3_0088, 3);
+    let prog1 = ProgramIn {
+        name: "tls-coexist-16",
+        functions: &fs,
+        data: &data,
+        entry: Entry::CMain { main: sym("main") },
+        panic: Panic::Unwind,
+        personality: None,
+        tls: tls_rt,
+        profile: None,
+        natives: Some(&img_unaligned),
+        exports: &c_exports,
+    };
+    let mut elf1 = Vec::new_in(alloc);
+    export(&prog1, Platform::LinuxArm64, &mut elf1, alloc).unwrap();
+    let facts1 = check::elf(&elf1).unwrap();
+    assert_eq!(facts1.tls, Some((8, 24, 16)), "PT_TLS: 8B .tdata, 16B C TLS + 8B Rust ROOT = 24B, align 16");
+    let (_, _, _, _, root1) = inspect_root(&elf1);
+    assert_eq!(root1, (16 + 16) | blaze_code::tls::ROOT_OWN, "DESC.root = (p_align 16 + c_memsz 16) | ROOT_OWN");
+
+    // Case 2: 8B .tdata + 8B .tbss with 32-byte alignment (log2 = 5 -> p_align = 32, DESC.root = 32 + 16 = 48).
+    let img_align32 = linux_native_image(alloc, true, 0x3_0080, 5);
+    let prog2 = ProgramIn { natives: Some(&img_align32), ..prog1 };
+    let mut elf2 = Vec::new_in(alloc);
+    export(&prog2, Platform::LinuxArm64, &mut elf2, alloc).unwrap();
+    let facts2 = check::elf(&elf2).unwrap();
+    assert_eq!(facts2.tls, Some((8, 24, 32)), "PT_TLS honors C's 32-byte alignment");
+    let (_, _, _, _, root2) = inspect_root(&elf2);
+    assert_eq!(root2, (32 + 16) | blaze_code::tls::ROOT_OWN, "DESC.root = (p_align 32 + c_memsz 16) | ROOT_OWN");
+
+    // Control: native image with NO C TLS + Rust Space::Tls stays (0, 8, 16) with DESC.root = 16 | ROOT_OWN.
+    let img_no_tls = linux_native_image(alloc, false, 0x3_0078, 0);
+    let prog3 = ProgramIn { natives: Some(&img_no_tls), ..prog1 };
+    let mut elf3 = Vec::new_in(alloc);
+    export(&prog3, Platform::LinuxArm64, &mut elf3, alloc).unwrap();
+    let facts3 = check::elf(&elf3).unwrap();
+    assert_eq!(facts3.tls, Some((0, 8, 16)));
+    let (_, _, _, _, root3) = inspect_root(&elf3);
+    assert_eq!(root3, 16 | blaze_code::tls::ROOT_OWN);
+}
+
+/// ELF native merge refusals name the exact cause: platform mismatch, missing Rust word, and
+/// Mach-O `__thread_vars` in a Linux image.
+#[test]
+fn elf_native_merge_refusals_are_named() {
+    use crate::native_merge::MergeError;
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let (main_rec, second_rec) = tiny();
+    let fs = functions(&main_rec, &second_rec);
+    let mut out = Vec::new_in(alloc);
+
+    // 1. Missing Rust word export (`rust_cb` not in `exports`).
+    let img = linux_native_image(alloc, false, 0x3_0078, 0);
+    let prog = ProgramIn { natives: Some(&img), ..program(&fs, &[], None) };
+    assert_eq!(
+        export(&prog, Platform::LinuxArm64, &mut out, alloc),
+        Err(ExportError::Native(MergeError::RustWordMissing { word: 0 }))
+    );
+
+    // 2. Wrong platform: Linux image passed to macOS export -> Platform.
+    assert_eq!(
+        export(&prog, Platform::MacosArm64, &mut out, alloc),
+        Err(ExportError::Native(MergeError::Platform))
+    );
+
+    // 3. Mach-O ThreadVars non-empty in Linux image -> Shape.
+    let mut bad_tlv = linux_native_image(alloc, false, 0x3_0078, 0);
+    for r in bad_tlv.regions.iter_mut() {
+        if r.region == blaze_native::image::Region::ThreadVars {
+            r.len = 24;
+        }
+    }
+    let c_exports = [crate::input::CExport { name: b"rust_cb", symbol: sym("second") }];
+    let prog_bad = ProgramIn { natives: Some(&bad_tlv), exports: &c_exports, ..program(&fs, &[], None) };
+    assert!(matches!(
+        export(&prog_bad, Platform::LinuxArm64, &mut out, alloc),
+        Err(ExportError::Native(MergeError::Shape { .. }))
+    ));
 }

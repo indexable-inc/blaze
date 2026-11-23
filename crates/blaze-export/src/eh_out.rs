@@ -269,9 +269,6 @@ fn tables<'a>(
     outside: Option<&Outside<'_, '_>>,
     alloc: Alloc<'a>,
 ) -> Result<EhSections<'a>, ExportError> {
-    if outside.is_some() && platform == Platform::LinuxArm64 {
-        return Err(ExportError::Native(MergeError::ElfNotBuilt));
-    }
     // The LSDAs first: their bytes do not depend on where anything is.
     let mut except: AVec<'a, u8> = Vec::new_in(alloc);
     let mut given: AVec<'_, Given> = Vec::with_capacity_in(covered.len(), alloc);
@@ -380,7 +377,7 @@ fn tables<'a>(
     let mut eh_frame_hdr: AVec<'a, u8> = Vec::new_in(alloc);
     match platform {
         Platform::MacosArm64 => write_unwind_info(covered, &given, outside, native_at, alloc, &mut unwind_info)?,
-        Platform::LinuxArm64 => write_eh_frame_hdr(covered, &given, eh_frame_at, index_at, functions, &mut eh_frame_hdr)?,
+        Platform::LinuxArm64 => write_eh_frame_hdr(covered, &given, outside, native_at, eh_frame_at, index_at, functions, &mut eh_frame_hdr)?,
         Platform::Wasm64 => return Err(ExportError::Wasm64RequiresWasmProgram),
     }
     Ok(EhSections {
@@ -463,20 +460,53 @@ fn write_unwind_info(
 }
 
 /// ELF's `.eh_frame_hdr` at image offset `hdr_at`, for the `functions` FDEs of `eh_frame` at
-/// `eh_frame_at`.
-fn write_eh_frame_hdr(covered: &[Covered<'_>], given: &[Given], eh_frame_at: u64, hdr_at: u64, functions: u32, out: &mut AVec<'_, u8>) -> Result<(), ExportError> {
+/// `eh_frame_at` (both the program's FDEs and any merged native image's FDEs, sorted by initial
+/// location as LSB 5.0 requires for binary search).
+#[allow(clippy::too_many_arguments)]
+fn write_eh_frame_hdr(
+    covered: &[Covered<'_>],
+    given: &[Given],
+    outside: Option<&Outside<'_, '_>>,
+    native_at: usize,
+    eh_frame_at: u64,
+    hdr_at: u64,
+    functions: u32,
+    out: &mut AVec<'_, u8>,
+) -> Result<(), ExportError> {
     out.push(1);
     out.push(PCREL_SDATA4);
     out.push(UDATA4);
     out.push(DATAREL_SDATA4);
     out.extend_from_slice(&rel32(eh_frame_at, hdr_at + 4, "eh_frame_hdr's eh_frame_ptr")?);
     out.extend_from_slice(&functions.to_le_bytes());
+    let table_start = out.len();
     for (k, c) in covered.iter().enumerate() {
         let Some(fde) = given[k].fde else {
             continue;
         };
         out.extend_from_slice(&rel32(c.at, hdr_at, "an initial location in eh_frame_hdr")?);
         out.extend_from_slice(&rel32(eh_frame_at + u64::from(fde), hdr_at, "an FDE address in eh_frame_hdr")?);
+    }
+    if let Some(o) = outside {
+        let (was, _) = o.eh_frame()?;
+        let native_off = u64::try_from(native_at).map_err(|_| ExportError::TooLarge { what: "native eh_frame offset", len: u64::MAX })?;
+        let native_base = eh_frame_at + native_off;
+        for frame in o.image.frames.iter() {
+            let fde_off = frame.at.checked_sub(was).ok_or(ExportError::Native(MergeError::NoRegion { region: NativeRegion::EhFrame }))?;
+            let fde_at = native_base + fde_off;
+            let initial = frame.start + o.shift;
+            out.extend_from_slice(&rel32(initial, hdr_at, "a native initial location in eh_frame_hdr")?);
+            out.extend_from_slice(&rel32(fde_at, hdr_at, "a native FDE address in eh_frame_hdr")?);
+        }
+        if let Some(slice) = out.get_mut(table_start..) {
+            let (table, _) = slice.as_chunks_mut::<8>();
+            table.sort_unstable_by_key(|pair| {
+                (
+                    i32::from_le_bytes([pair[0], pair[1], pair[2], pair[3]]),
+                    i32::from_le_bytes([pair[4], pair[5], pair[6], pair[7]]),
+                )
+            });
+        }
     }
     Ok(())
 }
@@ -512,7 +542,11 @@ pub fn eh_room_with<'a>(functions: &[Member<'_>], personality: Option<Symbol>, p
     }
     let base = up(at, TABLES_ALIGN);
     let personality_at = personality.map(|_| 0);
-    let standin = natives.map(|image| Outside { image, shift: up(base, NATIVE_PAGE) + NATIVE_PAGE });
+    let page = match platform {
+        Platform::MacosArm64 | Platform::Wasm64 => NATIVE_PAGE,
+        Platform::LinuxArm64 => crate::elf::PAGE,
+    };
+    let standin = natives.map(|image| Outside { image, shift: up(base, page) + page });
     let measured = tables(&covered, personality_at, base, platform, standin.as_ref(), alloc)?;
     Ok(measured.end() - base + ROOM_SLACK)
 }

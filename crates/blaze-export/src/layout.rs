@@ -326,6 +326,12 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
         }
         None => None,
     };
+    // Keep `__const` (everything after `__got` and optional `__mod_init_func`) 16-byte aligned
+    // when non-empty so Mach-O's `__const` section header (`align = 4`) matches its start address.
+    let post_tables = konst.len();
+    if !tls_targets.is_empty() {
+        pad_to(&mut konst, const_at, 16);
+    }
     let tls_indices_at = const_at + u64::try_from(konst.len()).unwrap_or(u64::MAX);
     for k in 0..tls_count {
         konst.extend_from_slice(&k.to_le_bytes());
@@ -351,13 +357,18 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
     }
     let mut data_home: AVec<'a, u64> = Vec::from_elem_in(0, data.len(), alloc);
     for &d in by_target.iter() {
-        let datum = &data[d as usize];
+        let Some(datum) = data.get(usize::try_from(d).unwrap_or(usize::MAX)) else {
+            continue;
+        };
         let in_const = match datum.target.space {
             Space::Tls => !matches!(datum.place, DataPlace::Zeroed { .. }) && !datum.bytes.is_empty(),
             Space::Static | Space::Vtable => datum.place == DataPlace::ReadOnly,
             Space::Func | Space::Outside => false,
         };
         if in_const {
+            if konst.len() == post_tables {
+                pad_to(&mut konst, const_at, 16);
+            }
             pad_to(&mut konst, const_at, u64::from(datum.align));
             data_home[d as usize] = const_at + konst.len() as u64;
             konst.extend_from_slice(datum.bytes);
@@ -387,7 +398,9 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
     let data_at = up(const_at + konst.len() as u64, page);
     let mut bytes: AVec<'a, u8> = Vec::new_in(alloc);
     for &d in by_target.iter() {
-        let datum = &data[d as usize];
+        let Some(datum) = data.get(usize::try_from(d).unwrap_or(usize::MAX)) else {
+            continue;
+        };
         if datum.target.space != Space::Tls && datum.place == DataPlace::Writable {
             pad_to(&mut bytes, data_at, u64::from(datum.align));
             data_home[d as usize] = data_at + bytes.len() as u64;
@@ -406,7 +419,9 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
     let zero_at = up(data_at + bytes.len() as u64, 16);
     let mut zero_end = zero_at;
     for &d in by_target.iter() {
-        let datum = &data[d as usize];
+        let Some(datum) = data.get(usize::try_from(d).unwrap_or(usize::MAX)) else {
+            continue;
+        };
         if datum.target.space != Space::Tls
             && let DataPlace::Zeroed { len } = datum.place
         {
@@ -564,6 +579,7 @@ impl<'a> ConstAndData<'a> {
             for w in datum.words {
                 let at = base + u64::from(w.at);
                 let to = match w.target {
+                    None if datum.target.space == Space::Tls => return Err(ExportError::DataTlsTarget { from: datum.target, target: datum.target }),
                     None => rebase_target(datum.target.symbol, at, base as i64 + w.addend, end)?,
                     Some(t) => match (t.space, import_of(t.symbol)) {
                         (Space::Tls, _) => return Err(ExportError::DataTlsTarget { from: datum.target, target: t }),
@@ -835,6 +851,19 @@ pub(crate) fn lay_out_with_tls<'a, 'r>(
                     imports.push(Import { symbol: t.symbol, name });
                 }
                 Space::Func | Space::Static | Space::Vtable => {}
+            }
+        }
+    }
+    for &d in by_target.iter() {
+        let Some(datum) = data.get(usize::try_from(d).unwrap_or(usize::MAX)) else {
+            continue;
+        };
+        for w in datum.words {
+            if let Some(t) = w.target
+                && t.space == Space::Outside
+                && let Some(&(_, name)) = datum.outside.iter().find(|&&(sym, _)| sym == t.symbol)
+            {
+                imports.push(Import { symbol: t.symbol, name });
             }
         }
     }

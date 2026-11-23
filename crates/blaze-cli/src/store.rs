@@ -1072,6 +1072,11 @@ impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
         Ok(())
     }
 
+    /// Renews a single named root for `ROOT_LIFE_NS`, returning `true` if the root was live.
+    pub fn renew_one(&mut self, name: &str) -> Result<bool, CliError> {
+        Ok(self.place.renew(name, blaze_cas::plain::ROOT_LIFE_NS)?)
+    }
+
     /// Whether `name` is a toolchain crate's record ([`Store::toolchain_crates`]): a
     /// `CrateScope`, `ImplBucket`, or closed `Signature` name of one of its subjects.
     pub fn is_toolchain(&self, name: Name) -> bool {
@@ -1643,10 +1648,10 @@ mod after_answer_commit_tests {
 
         // 2. `gc_lock_is_free` returns true when unlocked, false while `gc.lock` is held, and true
         //    again after release — ensuring `BgGc::spawn` never spawns duplicate GC processes.
-        assert!(crate::gc::gc_lock_is_free(&cx, home.dir()), "gc.lock starts free");
+        assert!(crate::gc::gc_lock_is_free(&cx, home.dir()).expect("probe free gc.lock"), "gc.lock starts free");
         let held_lock = crate::gc::try_acquire_gc_lock(&cx, home.dir()).expect("acquire").expect("lock acquired");
-        assert!(!crate::gc::gc_lock_is_free(&cx, home.dir()), "gc_lock_is_free returns false while GC holds gc.lock");
+        assert!(!crate::gc::gc_lock_is_free(&cx, home.dir()).expect("probe contended gc.lock"), "gc_lock_is_free returns false while GC holds gc.lock");
         drop(held_lock);
-        assert!(crate::gc::gc_lock_is_free(&cx, home.dir()), "gc.lock free again after drop");
+        assert!(crate::gc::gc_lock_is_free(&cx, home.dir()).expect("probe released gc.lock"), "gc.lock free again after drop");
     }
 }
