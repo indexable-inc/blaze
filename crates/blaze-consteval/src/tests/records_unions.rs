@@ -170,7 +170,7 @@ fn record_literal_field_update_and_destructure() {
     let alloc = heap();
     let mut fx = Fx::new();
     let u32_t = fx.u32();
-    let owner = fx.func("C", 0, &[], u32_t, std::vec::Vec::new());
+    let owner = fx.func("C", 0, &[], u32_t, Default::default());
     fx.finish();
 
     let mut body_tys = PortableTys::new_in(alloc);
@@ -252,7 +252,7 @@ fn record_width_subtyping_projection() {
     let alloc = heap();
     let mut fx = Fx::new();
     let u32_t = fx.u32();
-    let owner = fx.func("C", 0, &[], u32_t, std::vec::Vec::new());
+    let owner = fx.func("C", 0, &[], u32_t, Default::default());
     fx.finish();
 
     let mut body_tys = PortableTys::new_in(alloc);
@@ -327,7 +327,7 @@ fn union_inject_widen_and_match_direct_tagged() {
         let alloc = heap();
         let mut fx = Fx::new();
         let u32_t = fx.u32();
-        let owner = fx.func("C", 0, &[], u32_t, std::vec::Vec::new());
+        let owner = fx.func("C", 0, &[], u32_t, Default::default());
         fx.finish();
 
         let mut body_tys = PortableTys::new_in(alloc);
@@ -410,7 +410,7 @@ fn union_niche_ref_unit_and_single_member() {
         let alloc = heap();
         let mut fx = Fx::new();
         let u32_t = fx.u32();
-        let owner = fx.func("C", 0, &[], u32_t, std::vec::Vec::new());
+        let owner = fx.func("C", 0, &[], u32_t, Default::default());
         fx.finish();
 
         let mut body_tys = PortableTys::new_in(alloc);
@@ -507,7 +507,7 @@ fn union_niche_ref_unit_and_single_member() {
     let alloc = heap();
     let mut fx = Fx::new();
     let u32_t = fx.u32();
-    let owner = fx.func("SINGLE", 0, &[], u32_t, std::vec::Vec::new());
+    let owner = fx.func("SINGLE", 0, &[], u32_t, Default::default());
     fx.finish();
     let mut body_tys = PortableTys::new_in(alloc);
     let b_u32 = body_tys.intern(PNode::Uint(UintTy::U32)).expect("u32");

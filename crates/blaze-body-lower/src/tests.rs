@@ -468,7 +468,7 @@ fn empty_body_view<'b>(owner: ItemKey, types: blaze_typeck::PTys<'b>, root: Expr
     }
 }
 
-fn lowered_view(fx: &Fx, bv: &blaze_typeck::BodyView<'_>) -> String {
+fn lowered_view(fx: &Fx, bv: &blaze_typeck::BodyView<'_>) -> blaze_own::String<Alloc<'static>> {
     let mut cx = InferCtx::new_in(heap());
     let c = match blaze_typeck::check(bv, fx, &mut cx, &Needs::new_in(heap()), heap()) {
         Ok(Outcome::Done(c)) => {
@@ -482,12 +482,15 @@ fn lowered_view(fx: &Fx, bv: &blaze_typeck::BodyView<'_>) -> String {
         Ok(x) => x,
         Err(r) => panic!("refused: {r:?}"),
     };
-    let mut text = String::new();
+    let mut text = blaze_own::String::new_in(heap());
     blaze_body::print(&body.view(), &mut text).expect("a lowered body prints");
     if let Err(e) = blaze_body::verify(&body) {
         panic!("verify refused {e:?}:\n{text}");
     }
-    normalize(&text)
+    let norm = normalize(&text);
+    let mut out = blaze_own::String::new_in(heap());
+    out.push_str(&norm);
+    out
 }
 
 /// Lowers structural records: `Expr::Record` literal (non-canonical field order -> canonical
@@ -503,7 +506,7 @@ fn structural_record_literal_update_project_and_pattern() {
 
     let mut fx = Fx::new();
     let u32_t = fx.u32();
-    let owner = fx.func("rec_fn", 0, &[], u32_t, Vec::new());
+    let owner = fx.func("rec_fn", 0, &[], u32_t, Default::default());
     fx.finish();
 
     let mut body_tys = PortableTys::new_in(heap());
@@ -605,7 +608,7 @@ fn structural_union_inject_widen_and_match_patterns() {
 
     let mut fx = Fx::new();
     let u32_t = fx.u32();
-    let owner = fx.func("union_fn", 0, &[], u32_t, Vec::new());
+    let owner = fx.func("union_fn", 0, &[], u32_t, Default::default());
     fx.finish();
 
     let mut body_tys = PortableTys::new_in(heap());

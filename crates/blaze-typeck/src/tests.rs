@@ -1429,10 +1429,10 @@ fn inferred_return_type_holes_and_result_error_union() {
         let bool_t = fx.ty(PNode::Bool);
         let hole_t = fx.ty(PNode::Infer);
         let res_infer = fx.adt(result, &[u32_t, hole_t]);
-        let f_key = fx.func("f", 0, &[bool_t], res_infer, std::vec::Vec::new());
+        let f_key = fx.func("f", 0, &[bool_t], res_infer, Default::default());
         let ab_list = fx.list(&[err_a_t, err_b_t]);
         let ab_union = fx.ty(PNode::Union(ab_list));
-        let f_flat = fx.func("f_flat", 0, &[bool_t, ab_union], res_infer, std::vec::Vec::new());
+        let f_flat = fx.func("f_flat", 0, &[bool_t, ab_union], res_infer, Default::default());
         fx.finish();
 
         let mut b = Bb::new();
