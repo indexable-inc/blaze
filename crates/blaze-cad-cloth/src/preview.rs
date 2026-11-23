@@ -200,6 +200,7 @@ pub fn render_studio_preview_png<'a>(
         shadow_softness: 10.0,
         shadow_steps: 24,
         srgb: true,
+        ..
     };
     let pic = render_mesh_scene(
         &scene_parts,

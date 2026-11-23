@@ -29,10 +29,12 @@ use blaze_units::{Angle, Length};
 use crate::eval::{eval_box_each, eval_point_each};
 use crate::{
     Axis, BlendOpts, Boolean, BoxOpts, CadError, CadPlant, CapsuleOpts, CompileOpts, ConeOpts, CylinderOpts, DetailOpts, DistanceOpts,
-    DistanceStopOpts, Edge, EllipsoidOpts, EvalError, Gap, Graph, GraphOpts, GridOpts, GyroidOpts, HalfSpaceOpts, Lanes, Level, Limits,
-    Node, NodeId, NodeKind, OffsetOpts, Placement, Points, Profile, ProfileOpts, RayOpts, ScaleOpts, Scratch, Shape, ShellOpts, Solid,
-    SphereOpts, SweepPolylineOpts, TaperOpts, Tape, TorusOpts, TwistOpts, compile, distance_between, distance_between_stopping, eval_box,
-    eval_grad, eval_grads, eval_grads_with, eval_point, eval_points, eval_points_with, ray, simplify_with,
+    DistanceStopOpts, Edge, EdgeSelect, EllipsoidOpts, EvalError, Gap, Graph, GraphOpts, GridOpts, GuideRail, GuidedLoftOpts,
+    GuidedStation, GyroidOpts, HalfSpaceOpts, Lanes, Level, Limits, LoftContinuity, Node, NodeId, NodeKind, OffsetOpts, Placement, Points,
+    Profile, ProfileOpts, RadiusProfile, RadiusStop, RailPoint, RayOpts, ScaleOpts, Scratch, Shape, ShellOpts, Solid, SphereOpts,
+    SweepCrossSection, SweepFrame, SweepFramesOpts, SweepPolylineOpts, TaperOpts, Tape, TorusOpts, TwistOpts, VariableBlendOpts,
+    VariableOffsetOpts, compile, distance_between, distance_between_stopping, eval_box, eval_grad, eval_grads, eval_grads_with, eval_point,
+    eval_points, eval_points_with, ray, simplify_with,
 };
 use crate::level::{Bound, Exact, Inside, Outside};
 
@@ -1765,4 +1767,519 @@ fn grid3_coarse_summary_sound_and_round_trips() {
             assert!(same_bits(sg.x, grads[i].x) && same_bits(sg.y, grads[i].y) && same_bits(sg.z, grads[i].z));
         }
     }
+}
+
+// ---- 20. rail-guided lofts, variable blends/offsets, and frame sweeps ---------------------------------
+
+fn check_box_contains_samples(tape: &Tape<'_>, b: &Aabb3, sc: &mut Scratch<'_>) {
+    let (iv, _) = eval_box(tape, b, sc);
+    let c = b.center();
+    for p in b.corners().into_iter().chain(core::iter::once(c)) {
+        let v = eval_point(tape, p, sc);
+        assert!(iv.contains(v), "point {p:?} value {v} escaped box interval {iv:?} for {b:?}");
+    }
+    // Also probe quarter-points along diagonals.
+    for corner in b.corners() {
+        let q = c + (corner - c) * 0.5;
+        let v = eval_point(tape, q, sc);
+        assert!(iv.contains(v), "interior point {q:?} value {v} escaped box interval {iv:?} for {b:?}");
+    }
+}
+
+fn check_grad_matches_fd(tape: &Tape<'_>, p: Vec3, sc: &mut Scratch<'_>) {
+    let (v, grad) = eval_grad(tape, p, sc);
+    assert!(v.is_finite(), "non-finite value at {p:?}");
+    let axes = [Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, 1.0)];
+    let h = 1e-6;
+    let fwd = axes.map(|e| (eval_point(tape, p + e * h, sc) - v) / h);
+    let bwd = axes.map(|e| (v - eval_point(tape, p - e * h, sc)) / h);
+    if (0..3).all(|i| fwd[i].is_finite() && bwd[i].is_finite() && (fwd[i] - bwd[i]).abs() <= 1e-3) {
+        let num = [0.5 * (fwd[0] + bwd[0]), 0.5 * (fwd[1] + bwd[1]), 0.5 * (fwd[2] + bwd[2])];
+        let ana = grad.to_array();
+        for i in 0..3 {
+            assert!(
+                (ana[i] - num[i]).abs() < 1e-2,
+                "gradient mismatch at {p:?} axis {i}: analytic={} numeric={}",
+                ana[i],
+                num[i]
+            );
+        }
+    }
+}
+
+#[test]
+fn guided_loft_rails_continuity_and_invariants() {
+    let mut g = graph(NoPlant);
+    let p_circ = g.profile(ProfileOpts { profile: Profile::Circle { radius: Length::mm(10.0) }, .. }).unwrap();
+    let p_rrect = g
+        .profile(ProfileOpts {
+            profile: Profile::RoundedRect { width: Length::mm(20.0), height: Length::mm(20.0), radius: Length::mm(5.0) },
+            ..
+        })
+        .unwrap();
+
+    // Natural C2 side rail: exact mid-span value at z = 25 mm is 19.0625 mm (0.0190625 m).
+    let side_pts = [
+        RailPoint { z: Length::mm(0.0), value: Length::mm(12.0), tangent: None },
+        RailPoint { z: Length::mm(50.0), value: Length::mm(22.0), tangent: None },
+        RailPoint { z: Length::mm(100.0), value: Length::mm(10.0), tangent: None },
+    ];
+    // Clamped-end C2 ridge rail (zero slope at z = 0 and z = 100 mm).
+    let ridge_pts = [
+        RailPoint { z: Length::mm(0.0), value: Length::mm(8.0), tangent: Some(0.0) },
+        RailPoint { z: Length::mm(50.0), value: Length::mm(14.0), tangent: None },
+        RailPoint { z: Length::mm(100.0), value: Length::mm(6.0), tangent: Some(0.0) },
+    ];
+    let stations = [
+        GuidedStation { z: Length::mm(0.0), profile: p_circ, .. },
+        GuidedStation { z: Length::mm(50.0), profile: p_rrect, .. },
+        GuidedStation { z: Length::mm(100.0), profile: p_circ, .. },
+    ];
+    let loft = g
+        .guided_loft(GuidedLoftOpts {
+            stations: &stations,
+            side_rail: Some(GuideRail { points: &side_pts }),
+            ridge_rail: Some(GuideRail { points: &ridge_pts }),
+            continuity: LoftContinuity::CurvatureC2,
+            ..
+        })
+        .unwrap();
+    assert_eq!(g.level(loft.id()), Level::Bound);
+
+    let tape = compile(&g, loft.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+    let mut sc = Scratch::new(alloc());
+
+    // Exact widths at stations & mid-span z = 25 mm.
+    for &(z, x_half) in &[(0.0, 0.012), (0.025, 0.0190625), (0.050, 0.022), (0.100, 0.010)] {
+        let on = eval_point(&tape, Vec3::new(x_half, 0.0, z), &mut sc);
+        assert!(on.abs() < 1e-9, "expected surface at x={x_half}, z={z}, got {on}");
+        let z_in = z.clamp(0.002, 0.098);
+        if (z - z_in).abs() < 1e-9 {
+            assert!(eval_point(&tape, Vec3::new(x_half - 1e-4, 0.0, z), &mut sc) < 0.0);
+            assert!(eval_point(&tape, Vec3::new(x_half + 1e-4, 0.0, z), &mut sc) > 0.0);
+        }
+    }
+    // Exact ridge half-heights at stations.
+    for &(z, y_half) in &[(0.0, 0.008), (0.050, 0.014), (0.100, 0.006)] {
+        let on = eval_point(&tape, Vec3::new(0.0, y_half, z), &mut sc);
+        assert!(on.abs() < 1e-9, "expected ridge surface at y={y_half}, z={z}, got {on}");
+    }
+
+    // Smooth C1/C2 normal continuity across interior station boundary z = 50 mm.
+    let eps = 1e-6;
+    for &(x, y) in &[(0.022, 0.0), (0.0, 0.014), (0.015, 0.010)] {
+        let (_, g_lo) = eval_grad(&tape, Vec3::new(x, y, 0.050 - eps), &mut sc);
+        let (_, g_hi) = eval_grad(&tape, Vec3::new(x, y, 0.050 + eps), &mut sc);
+        let n_lo = g_lo.normalized().expect("non-zero gradient below station");
+        let n_hi = g_hi.normalized().expect("non-zero gradient above station");
+        let jump = (n_hi - n_lo).length();
+        assert!(jump < 1e-4, "normal discontinuity at ({x}, {y}, 0.05): jump={jump}");
+    }
+
+    // Interval soundness across surface, station boundary, cap, and guard boundary.
+    let test_boxes = [
+        Aabb3::new(Vec3::new(0.015, -0.005, 0.020), Vec3::new(0.025, 0.005, 0.030)),
+        Aabb3::new(Vec3::new(-0.025, -0.016, 0.045), Vec3::new(0.025, 0.016, 0.055)),
+        Aabb3::new(Vec3::new(-0.015, -0.010, -0.005), Vec3::new(0.015, 0.010, 0.005)),
+        Aabb3::new(Vec3::new(0.018, -0.004, 0.040), Vec3::new(0.030, 0.004, 0.060)),
+        Aabb3::new(Vec3::new(0.040, 0.040, 0.040), Vec3::new(0.060, 0.060, 0.060)),
+    ];
+    for b in &test_boxes {
+        check_box_contains_samples(&tape, b, &mut sc);
+    }
+
+    // SIMD lane parity (`eval_points` and `eval_grads` match scalar bit-for-bit).
+    let sample_pts = [
+        Vec3::new(0.0, 0.0, 0.025),
+        Vec3::new(0.019, 0.002, 0.025),
+        Vec3::new(0.022, 0.0, 0.050),
+        Vec3::new(-0.010, 0.011, 0.065),
+        Vec3::new(0.005, -0.007, 0.085),
+        Vec3::new(0.015, 0.008, 0.015),
+        Vec3::new(0.035, 0.0, 0.050),
+        Vec3::new(0.0, 0.0, 0.105),
+        Vec3::new(-0.014, -0.005, 0.035),
+    ];
+    let xs: Vec<f64> = sample_pts.iter().map(|p| p.x).collect();
+    let ys: Vec<f64> = sample_pts.iter().map(|p| p.y).collect();
+    let zs: Vec<f64> = sample_pts.iter().map(|p| p.z).collect();
+    let pts = Points { x: &xs, y: &ys, z: &zs };
+    for lanes in [Lanes::One, Lanes::Four, Lanes::Eight] {
+        let mut out = vec![0.0; sample_pts.len()];
+        eval_points(&tape, pts, &mut out, lanes, &mut sc).unwrap();
+        let mut vals = vec![0.0; sample_pts.len()];
+        let mut grads = vec![Vec3::ZERO; sample_pts.len()];
+        eval_grads(&tape, pts, &mut vals, &mut grads, lanes, &mut sc).unwrap();
+        for (i, &p) in sample_pts.iter().enumerate() {
+            let sv = eval_point(&tape, p, &mut sc);
+            assert!(same_bits(sv, out[i]));
+            let (gv, sg) = eval_grad(&tape, p, &mut sc);
+            assert!(same_bits(gv, vals[i]));
+            assert!(same_bits(sg.x, grads[i].x) && same_bits(sg.y, grads[i].y) && same_bits(sg.z, grads[i].z));
+        }
+    }
+
+    // Gradient parity vs finite differences & 1-Lipschitz check inside guard.
+    for &p in &sample_pts[..6] {
+        check_grad_matches_fd(&tape, p, &mut sc);
+        let q = p + Vec3::new(2e-4, -1.5e-4, 2.5e-4);
+        let (fp, fq) = (eval_point(&tape, p, &mut sc), eval_point(&tape, q, &mut sc));
+        assert!((fq - fp).abs() <= (q - p).length() * (1.0 + 1e-6) + 1e-12);
+    }
+
+    // Digest sensitivity & deduplication: changing one rail control point changes digest;
+    // rebuilding identical loft reuses the exact same NodeId.
+    let loft_dup = g
+        .guided_loft(GuidedLoftOpts {
+            stations: &stations,
+            side_rail: Some(GuideRail { points: &side_pts }),
+            ridge_rail: Some(GuideRail { points: &ridge_pts }),
+            continuity: LoftContinuity::CurvatureC2,
+            ..
+        })
+        .unwrap();
+    assert_eq!(loft_dup.id(), loft.id());
+
+    let mut side_bumped = side_pts;
+    side_bumped[1].value = Length::mm(22.5);
+    let loft_changed = g
+        .guided_loft(GuidedLoftOpts {
+            stations: &stations,
+            side_rail: Some(GuideRail { points: &side_bumped }),
+            ridge_rail: Some(GuideRail { points: &ridge_pts }),
+            continuity: LoftContinuity::CurvatureC2,
+            ..
+        })
+        .unwrap();
+    assert_ne!(g.digest(loft_changed.id()), g.digest(loft.id()));
+
+    // Center rails, twist, and cap_round compile and stay interval-sound.
+    let cx_pts = [
+        RailPoint { z: Length::mm(0.0), value: Length::mm(0.0), tangent: None },
+        RailPoint { z: Length::mm(100.0), value: Length::mm(8.0), tangent: None },
+    ];
+    let twisted_stations = [
+        GuidedStation { z: Length::mm(0.0), profile: p_rrect, scale: [1.0, 0.8], twist: Angle::ZERO, .. },
+        GuidedStation { z: Length::mm(100.0), profile: p_rrect, scale: [1.3, 1.1], twist: Angle::degrees(30.0), .. },
+    ];
+    let twisted = g
+        .guided_loft(GuidedLoftOpts {
+            stations: &twisted_stations,
+            center_x_rail: Some(GuideRail { points: &cx_pts }),
+            continuity: LoftContinuity::SmoothC1,
+            cap_round: Length::mm(3.0),
+            ..
+        })
+        .unwrap();
+    let t_tw = compile(&g, twisted.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+    // Centerline at z = 50 mm is shifted to x = 4 mm (inside the solid).
+    assert!(eval_point(&t_tw, Vec3::new(0.004, 0.0, 0.050), &mut sc) < 0.0);
+    check_box_contains_samples(&t_tw, &Aabb3::new(Vec3::new(-0.015, -0.015, -0.002), Vec3::new(0.025, 0.015, 0.020)), &mut sc);
+
+    // Validation errors.
+    assert!(matches!(
+        g.guided_loft(GuidedLoftOpts { stations: &stations[..1], .. }),
+        Err(CadError::Argument { kind: NodeKind::GuidedLoft, arg: "stations", .. })
+    ));
+    let bad_rail = [
+        RailPoint { z: Length::mm(0.0), value: Length::mm(0.0), tangent: None },
+        RailPoint { z: Length::mm(100.0), value: Length::mm(10.0), tangent: None },
+    ];
+    assert!(matches!(
+        g.guided_loft(GuidedLoftOpts { stations: &stations, side_rail: Some(GuideRail { points: &bad_rail }), .. }),
+        Err(CadError::Argument { kind: NodeKind::GuidedLoft, arg: "side_rail", .. })
+    ));
+}
+
+#[test]
+fn variable_blends_and_offsets_selective_and_sound() {
+    let mut g = graph(NoPlant);
+    let box_a = g.cuboid(BoxOpts { size: [Length::mm(40.0), Length::mm(10.0), Length::mm(40.0)], .. }).unwrap();
+    let box_b = g.cuboid(BoxOpts { size: [Length::mm(10.0), Length::mm(40.0), Length::mm(40.0)], .. }).unwrap();
+    let sharp = g.union(box_a, box_b).unwrap();
+
+    // 1. Variable round union with Linear profile along (+5, +5, z) selected by Capsule.
+    let v_round = g
+        .variable_round_union(
+            box_a,
+            box_b,
+            VariableBlendOpts {
+                profile: RadiusProfile::Linear {
+                    from: [Length::mm(5.0), Length::mm(5.0), Length::mm(-20.0)],
+                    to: [Length::mm(5.0), Length::mm(5.0), Length::mm(20.0)],
+                    r0: Length::mm(2.0),
+                    r1: Length::mm(6.0),
+                },
+                select: EdgeSelect::Capsule {
+                    a: [Length::mm(5.0), Length::mm(5.0), Length::mm(-20.0)],
+                    b: [Length::mm(5.0), Length::mm(5.0), Length::mm(20.0)],
+                    radius: Length::mm(4.0),
+                    fade: Length::mm(3.0),
+                },
+                ..
+            },
+        )
+        .unwrap();
+
+    let t_sharp = compile(&g, sharp.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+    let t_round = compile(&g, v_round.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+    let mut sc = Scratch::new(alloc());
+
+    // Selected edge (+5, +5, z) is filleted with tapered radius: r(-15mm)=2.5mm, r(+15mm)=5.5mm.
+    let f_sel_lo = eval_point(&t_round, Vec3::new(0.005, 0.005, -0.015), &mut sc);
+    let f_sel_hi = eval_point(&t_round, Vec3::new(0.005, 0.005, 0.015), &mut sc);
+    assert!(f_sel_lo < 0.0 && f_sel_hi < 0.0, "selected edge must be filleted: lo={f_sel_lo}, hi={f_sel_hi}");
+    let ratio = f_sel_hi / f_sel_lo;
+    assert!((ratio - (5.5 / 2.5)).abs() < 1e-6, "expected tapered fillet ratio 2.2, got {ratio}");
+
+    // Unselected opposite edge (-5, -5, z) stays sharp (zero fillet, exact sharp zero-set).
+    let f_unsel_edge = eval_point(&t_round, Vec3::new(-0.005, -0.005, 0.0), &mut sc);
+    assert!(f_unsel_edge.abs() < 1e-12, "unselected edge must stay sharp (0.0), got {f_unsel_edge}");
+    let p_unsel_out = Vec3::new(-0.0055, -0.0055, 0.0);
+    let f_unsel_out = eval_point(&t_round, p_unsel_out, &mut sc);
+    let f_sharp_out = eval_point(&t_sharp, p_unsel_out, &mut sc);
+    assert!(f_unsel_out > 0.0 && f_sharp_out > 0.0);
+    // Right outside the selected edge at the same diagonal offset (0.5mm), the fillet pulls it inside (< 0).
+    assert!(eval_point(&t_round, Vec3::new(0.0055, 0.0055, 0.015), &mut sc) < 0.0);
+
+    // 2. Variable round difference with Curve profile and EdgeSelect::Box.
+    let block = g.cuboid(BoxOpts { size: [Length::mm(30.0), Length::mm(30.0), Length::mm(30.0)], .. }).unwrap();
+    let slot = g.cuboid(BoxOpts { size: [Length::mm(12.0), Length::mm(12.0), Length::mm(40.0)], .. }).unwrap();
+    let slot = g.place(slot, Placement::shift(Length::mm(0.0), Length::mm(12.0), Length::mm(0.0))).unwrap();
+    let stops = [
+        RadiusStop { at: Length::mm(-15.0), radius: Length::mm(1.0) },
+        RadiusStop { at: Length::mm(0.0), radius: Length::mm(4.0) },
+        RadiusStop { at: Length::mm(15.0), radius: Length::mm(1.0) },
+    ];
+    let v_diff = g
+        .variable_round_difference(
+            block,
+            slot,
+            VariableBlendOpts {
+                profile: RadiusProfile::Curve { origin: [Length::ZERO; 3], axis: [0.0, 0.0, 1.0], stops: &stops },
+                select: EdgeSelect::Box {
+                    lo: [Length::mm(-10.0), Length::mm(4.0), Length::mm(-16.0)],
+                    hi: [Length::mm(10.0), Length::mm(16.0), Length::mm(16.0)],
+                    fade: Length::mm(2.0),
+                },
+                ..
+            },
+        )
+        .unwrap();
+    let t_diff = compile(&g, v_diff.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+    // Pocket lip edge where block (+Y=15mm) meets slot (+X=6mm): more rounded at z = 0 (r = 4mm) than z = 14mm (r ≈ 1mm).
+    let d_mid = eval_point(&t_diff, Vec3::new(0.006, 0.015, 0.0), &mut sc);
+    let d_end = eval_point(&t_diff, Vec3::new(0.006, 0.015, 0.014), &mut sc);
+    assert!(d_mid > d_end && d_end > 0.0, "expected larger difference round at z=0: mid={d_mid} end={d_end}");
+
+    // 3. Variable chamfer union with EdgeSelect::Ball.
+    let v_chamf = g
+        .variable_chamfer_union(
+            box_a,
+            box_b,
+            VariableBlendOpts {
+                profile: RadiusProfile::Constant(Length::mm(4.0)),
+                select: EdgeSelect::Ball {
+                    center: [Length::mm(5.0), Length::mm(5.0), Length::ZERO],
+                    radius: Length::mm(4.0),
+                    fade: Length::mm(2.0),
+                },
+                ..
+            },
+        )
+        .unwrap();
+    let t_chamf = compile(&g, v_chamf.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+    assert!(eval_point(&t_chamf, Vec3::new(0.005, 0.005, 0.0), &mut sc) < 0.0);
+    assert!(eval_point(&t_chamf, Vec3::new(-0.005, -0.005, 0.0), &mut sc).abs() < 1e-12);
+
+    // 4. Variable grow & variable erode with EdgeSelect::Box.
+    let cube = g.cuboid(BoxOpts { size: [Length::mm(20.0); 3], .. }).unwrap();
+    let sel_pos_x = EdgeSelect::Box {
+        lo: [Length::mm(6.0), Length::mm(-12.0), Length::mm(-12.0)],
+        hi: [Length::mm(14.0), Length::mm(12.0), Length::mm(12.0)],
+        fade: Length::mm(2.0),
+    };
+    let lin_z = RadiusProfile::Linear {
+        from: [Length::ZERO, Length::ZERO, Length::mm(-10.0)],
+        to: [Length::ZERO, Length::ZERO, Length::mm(10.0)],
+        r0: Length::mm(1.0),
+        r1: Length::mm(3.0),
+    };
+    let v_grow = g.variable_grow(cube, VariableOffsetOpts { profile: lin_z, select: sel_pos_x, .. }).unwrap();
+    let v_erode = g.variable_erode(cube, VariableOffsetOpts { profile: lin_z, select: sel_pos_x, .. }).unwrap();
+    let t_grow = compile(&g, v_grow.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+    let t_erode = compile(&g, v_erode.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+
+    // Selected +X face moves outward for grow and inward for erode; unselected -X face stays at x = -10 mm.
+    assert!(eval_point(&t_grow, Vec3::new(0.010, 0.0, 0.0), &mut sc) < 0.0);
+    assert!(eval_point(&t_grow, Vec3::new(0.012, 0.0, 0.0), &mut sc).abs() < 1e-9);
+    assert!(eval_point(&t_grow, Vec3::new(-0.010, 0.0, 0.0), &mut sc).abs() < 1e-12);
+
+    assert!(eval_point(&t_erode, Vec3::new(0.010, 0.0, 0.0), &mut sc) > 0.0);
+    assert!(eval_point(&t_erode, Vec3::new(0.008, 0.0, 0.0), &mut sc).abs() < 1e-9);
+    assert!(eval_point(&t_erode, Vec3::new(-0.010, 0.0, 0.0), &mut sc).abs() < 1e-12);
+
+    // Interval soundness, 1-Lipschitz, and gradient parity across all variable tapes.
+    let probe_boxes = [
+        Aabb3::new(Vec3::new(0.002, 0.002, -0.012), Vec3::new(0.012, 0.012, 0.012)),
+        Aabb3::new(Vec3::new(-0.012, -0.012, -0.008), Vec3::new(-0.002, -0.002, 0.008)),
+        Aabb3::new(Vec3::new(0.003, -0.005, -0.005), Vec3::new(0.014, 0.005, 0.005)),
+    ];
+    let probe_pts = [
+        Vec3::new(0.006, 0.006, 0.005),
+        Vec3::new(0.009, 0.007, -0.008),
+        Vec3::new(-0.007, -0.008, 0.002),
+        Vec3::new(0.009, 0.002, 0.004),
+    ];
+    for tape in [&t_round, &t_diff, &t_chamf, &t_grow, &t_erode] {
+        for b in &probe_boxes {
+            check_box_contains_samples(tape, b, &mut sc);
+        }
+        for &p in &probe_pts {
+            check_grad_matches_fd(tape, p, &mut sc);
+            let q = p + Vec3::new(3e-4, -2e-4, 2.5e-4);
+            let (fp, fq) = (eval_point(tape, p, &mut sc), eval_point(tape, q, &mut sc));
+            assert!((fq - fp).abs() <= (q - p).length() * (1.0 + 1e-6) + 1e-12);
+        }
+    }
+
+    // Validation rejects fade below 1 micrometre.
+    assert!(matches!(
+        g.variable_round_union(
+            box_a,
+            box_b,
+            VariableBlendOpts {
+                profile: RadiusProfile::Constant(Length::mm(2.0)),
+                select: EdgeSelect::Ball { center: [Length::ZERO; 3], radius: Length::mm(5.0), fade: Length::nm(500) },
+                ..
+            },
+        ),
+        Err(CadError::Argument { kind: NodeKind::VariableSmoothBoolean, arg: "fade", .. })
+    ));
+}
+
+#[test]
+fn sweep_frames_tapered_channel_and_circular_bead() {
+    let mut g = graph(NoPlant);
+    let r = 0.050; // 50 mm radius quarter-circle helical arc
+    let n = 9usize;
+    let mut frames = Vec::with_capacity(n);
+    for k in 0..n {
+        let u = (k as f64) / ((n - 1) as f64);
+        let th = core::f64::consts::FRAC_PI_2 * u;
+        let (s, c) = blaze_math::sin_cos(th);
+        let z = 0.010 * u;
+        frames.push(SweepFrame {
+            point: [Length::mm(r * c * 1e3), Length::mm(r * s * 1e3), Length::mm(z * 1e3)],
+            tangent: [-r * s * core::f64::consts::FRAC_PI_2, r * c * core::f64::consts::FRAC_PI_2, 0.010],
+            normal: [c, s, 0.0],
+            width: Length::mm(4.0 + 6.0 * u), // 4 mm -> 10 mm
+            depth: Length::mm(2.0 + 4.0 * u), // 2 mm -> 6 mm
+        });
+    }
+
+    let channel = g
+        .sweep_frames(SweepFramesOpts { frames: &frames, section: SweepCrossSection::Channel, closed: false, .. })
+        .unwrap();
+    let t_chan = compile(&g, channel.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+    let mut sc = Scratch::new(alloc());
+
+    // Endpoints of an open sweep sit on the end caps (`f ≈ 0`); every interior frame and segment
+    // midpoint is strictly inside the swept channel.
+    for i in 0..n {
+        let p = Vec3::new(frames[i].point[0].as_m(), frames[i].point[1].as_m(), frames[i].point[2].as_m());
+        let fp = eval_point(&t_chan, p, &mut sc);
+        if i == 0 || i + 1 == n {
+            assert!(fp.abs() < 1e-6, "frame {i} endpoint should sit on end cap: fp={fp}");
+        } else {
+            assert!(fp < 0.0, "frame {i} point not inside swept channel: fp={fp}");
+        }
+        if i + 1 < n {
+            let q = Vec3::new(frames[i + 1].point[0].as_m(), frames[i + 1].point[1].as_m(), frames[i + 1].point[2].as_m());
+            let mid = (p + q) * 0.5;
+            assert!(eval_point(&t_chan, mid, &mut sc) < 0.0, "segment {i} midpoint not inside swept channel");
+        }
+    }
+
+    // Verify tapered depth (along normal) and width (along binormal) near start vs near end.
+    let mut seg_check = |idx: usize, depth_in: f64, depth_out: f64, width_in: f64, width_out: f64| {
+        let a = Vec3::new(frames[idx].point[0].as_m(), frames[idx].point[1].as_m(), frames[idx].point[2].as_m());
+        let b = Vec3::new(frames[idx + 1].point[0].as_m(), frames[idx + 1].point[1].as_m(), frames[idx + 1].point[2].as_m());
+        let mid = (a + b) * 0.5;
+        let z_ax = (b - a).normalized().unwrap();
+        let n_avg = (Vec3::from_array(frames[idx].normal) + Vec3::from_array(frames[idx + 1].normal)).normalized().unwrap();
+        let y_ax = (n_avg - z_ax * n_avg.dot(z_ax)).normalized().unwrap();
+        let x_ax = y_ax.cross(z_ax).normalized().unwrap();
+        assert!(eval_point(&t_chan, mid + y_ax * depth_in, &mut sc) < 0.0);
+        assert!(eval_point(&t_chan, mid + y_ax * depth_out, &mut sc) > 0.0);
+        assert!(eval_point(&t_chan, mid + x_ax * width_in, &mut sc) < 0.0);
+        assert!(eval_point(&t_chan, mid + x_ax * width_out, &mut sc) > 0.0);
+    };
+    // Segment 0: width ≈ 4.375mm (half ≈ 2.19mm), depth ≈ 2.25mm (half ≈ 1.125mm).
+    seg_check(0, 0.0005, 0.0020, 0.0015, 0.0035);
+    // Segment 7: width ≈ 9.625mm (half ≈ 4.81mm), depth ≈ 5.75mm (half ≈ 2.875mm).
+    seg_check(7, 0.0020, 0.0040, 0.0035, 0.0060);
+
+    // Interval soundness over boxes along the swept channel.
+    check_box_contains_samples(&t_chan, &Aabb3::new(Vec3::new(0.044, -0.005, -0.004), Vec3::new(0.056, 0.015, 0.006)), &mut sc);
+    check_box_contains_samples(&t_chan, &Aabb3::new(Vec3::new(-0.005, 0.044, 0.004), Vec3::new(0.015, 0.056, 0.016)), &mut sc);
+
+    // Closed circular bead with smooth joins around a 6-frame ring.
+    let mut ring = Vec::with_capacity(6);
+    for k in 0..6 {
+        let th = 2.0 * core::f64::consts::PI * (k as f64) / 6.0;
+        let (s, c) = blaze_math::sin_cos(th);
+        let d = if k % 2 == 0 { 4.0 } else { 6.0 };
+        ring.push(SweepFrame {
+            point: [Length::mm(30.0 * c), Length::mm(30.0 * s), Length::ZERO],
+            tangent: [-s, c, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            width: Length::mm(d),
+            depth: Length::mm(d),
+        });
+    }
+    let bead = g
+        .sweep_frames(SweepFramesOpts {
+            frames: &ring,
+            section: SweepCrossSection::Circular,
+            closed: true,
+            smooth_join: Length::mm(0.5),
+            ..
+        })
+        .unwrap();
+    let t_bead = compile(&g, bead.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+    for i in 0..6 {
+        let j = (i + 1) % 6;
+        let a = Vec3::new(ring[i].point[0].as_m(), ring[i].point[1].as_m(), 0.0);
+        let b = Vec3::new(ring[j].point[0].as_m(), ring[j].point[1].as_m(), 0.0);
+        assert!(eval_point(&t_bead, a, &mut sc) < 0.0);
+        assert!(eval_point(&t_bead, (a + b) * 0.5, &mut sc) < 0.0);
+    }
+    check_box_contains_samples(&t_bead, &Aabb3::new(Vec3::new(0.020, -0.010, -0.006), Vec3::new(0.036, 0.010, 0.006)), &mut sc);
+
+    // Exercise HalfRound, VGroove, and Rectangular cross sections.
+    for sec in [
+        SweepCrossSection::HalfRound,
+        SweepCrossSection::VGroove,
+        SweepCrossSection::Rectangular { round: Length::mm(0.4) },
+    ] {
+        let s = g.sweep_frames(SweepFramesOpts { frames: &frames[..3], section: sec, .. }).unwrap();
+        let tp = compile(&g, s.id(), CompileOpts { alloc: alloc(), .. }).unwrap();
+        let mid = Vec3::new(
+            0.5 * (frames[0].point[0].as_m() + frames[1].point[0].as_m()),
+            0.5 * (frames[0].point[1].as_m() + frames[1].point[1].as_m()),
+            0.5 * (frames[0].point[2].as_m() + frames[1].point[2].as_m()),
+        );
+        assert!(eval_point(&tp, mid, &mut sc) < 0.0);
+    }
+
+    // Validation checks.
+    assert!(matches!(
+        g.sweep_frames(SweepFramesOpts { frames: &frames[..1], .. }),
+        Err(CadError::Argument { kind: NodeKind::SweepFrames, arg: "frames", .. })
+    ));
+    assert!(matches!(
+        g.sweep_frames(SweepFramesOpts { frames: &frames[..2], closed: true, .. }),
+        Err(CadError::Argument { kind: NodeKind::SweepFrames, arg: "frames", .. })
+    ));
 }

@@ -18,7 +18,7 @@ use blaze_math::Vec3;
 use blaze_own::{Alloc, AllocFailure, Vec};
 use blaze_text::{Put, Writes};
 
-use crate::detail::GarmentMesh;
+use crate::detail::{GarmentMesh, PanelKind};
 use crate::fabric::Fabric;
 
 /// Errors returned by [`read_glb_skeleton_mesh`] or [`write_skinned_glb`].
@@ -62,6 +62,43 @@ pub struct LoadedGlb<'a> {
     pub weights_0: Vec<[f32; 4], Alloc<'a>>,
     /// Skeleton joints in `skins[0].joints` order.
     pub joints: Vec<JointDef<'a>, Alloc<'a>>,
+}
+
+/// One named garment panel metadata entry decoded from a `.glb` file's `extras.blaze_panels`.
+pub struct LoadedPanelEntry<'a> {
+    pub id: u16,
+    pub name: Vec<u8, Alloc<'a>>,
+    pub kind: PanelKind,
+    pub layer: u8,
+    pub fabric_idx: u16,
+    pub host_panel: Option<Vec<u8, Alloc<'a>>>,
+}
+
+impl LoadedPanelEntry<'_> {
+    #[inline]
+    pub fn name_str(&self) -> &str {
+        core::str::from_utf8(&self.name).unwrap_or("")
+    }
+
+    #[inline]
+    pub fn host_panel_str(&self) -> Option<&str> {
+        self.host_panel.as_ref().and_then(|v| core::str::from_utf8(v).ok())
+    }
+}
+
+/// Named panel table + per-triangle panel IDs decoded from an exported `.glb` file.
+pub struct LoadedPanelMap<'a> {
+    pub panels: Vec<LoadedPanelEntry<'a>, Alloc<'a>>,
+    /// Per-triangle panel ID in primitive-emitted triangle order.
+    pub tri_panel: Vec<u16, Alloc<'a>>,
+}
+
+impl LoadedPanelMap<'_> {
+    /// Look up the [`LoadedPanelEntry`] owning exported triangle `tri_idx`.
+    pub fn panel_for_triangle(&self, tri_idx: usize) -> Option<&LoadedPanelEntry<'_>> {
+        let pid = *self.tri_panel.get(tri_idx)?;
+        self.panels.iter().find(|p| p.id == pid)
+    }
 }
 
 #[inline]
@@ -199,14 +236,7 @@ fn resolve_accessor<'a, A: core::alloc::Allocator>(
     Ok(AccessorSlice { data, count, stride, component_type, components })
 }
 
-/// Parse a binary `.glb` file in memory, extracting mesh `mesh_index` (or all meshes if
-/// `mesh_index == None`) along with `skins[0]` skeleton hierarchy & weights if present.
-pub fn read_glb_skeleton_mesh<'a>(
-    glb_bytes: &[u8],
-    mesh_index: Option<usize>,
-    alloc: Alloc<'a>,
-    scratch: Alloc<'_>,
-) -> Result<LoadedGlb<'a>, GltfIoError> {
+fn parse_glb_chunks(glb_bytes: &[u8]) -> Result<(&[u8], &[u8]), GltfIoError> {
     if glb_bytes.len() < 12 || !glb_bytes.starts_with(b"glTF") || read_u32_le(glb_bytes, 4)? != 2
         || usize::try_from(read_u32_le(glb_bytes, 8)?).ok() != Some(glb_bytes.len()) {
         return Err(GltfIoError::BadHeader);
@@ -229,6 +259,18 @@ pub fn read_glb_skeleton_mesh<'a>(
     }
     let json_bytes = json_chunk.ok_or(GltfIoError::MissingJsonChunk)?;
     let bin = bin_chunk.ok_or(GltfIoError::MissingBinChunk)?;
+    Ok((json_bytes, bin))
+}
+
+/// Parse a binary `.glb` file in memory, extracting mesh `mesh_index` (or all meshes if
+/// `mesh_index == None`) along with `skins[0]` skeleton hierarchy & weights if present.
+pub fn read_glb_skeleton_mesh<'a>(
+    glb_bytes: &[u8],
+    mesh_index: Option<usize>,
+    alloc: Alloc<'a>,
+    scratch: Alloc<'_>,
+) -> Result<LoadedGlb<'a>, GltfIoError> {
+    let (json_bytes, bin) = parse_glb_chunks(glb_bytes)?;
     let json_str = core::str::from_utf8(json_bytes).map_err(|_| GltfIoError::JsonParse)?;
     let root = blaze_json::read_in(json_str.as_bytes(), blaze_json::Limits::SHIPPED, scratch).map_err(|_| GltfIoError::JsonParse)?;
 
@@ -466,6 +508,73 @@ pub fn read_glb_skeleton_mesh<'a>(
     Ok(LoadedGlb { positions, triangles, joints_0, weights_0, joints })
 }
 
+/// Read the embedded named panel table (`meshes[0].extras.blaze_panels`) and packed per-triangle
+/// panel IDs (`tri_panel_accessor`) from an exported `.glb` binary buffer so in-game inspectors
+/// can map `clicked_triangle -> panel_id -> CAD pattern piece name` with 100% fidelity.
+pub fn read_glb_panel_metadata<'a>(
+    glb_bytes: &[u8],
+    alloc: Alloc<'a>,
+    scratch: Alloc<'_>,
+) -> Result<LoadedPanelMap<'a>, GltfIoError> {
+    let (json_bytes, bin) = parse_glb_chunks(glb_bytes)?;
+    let json_str = core::str::from_utf8(json_bytes).map_err(|_| GltfIoError::JsonParse)?;
+    let root = blaze_json::read_in(json_str.as_bytes(), blaze_json::Limits::SHIPPED, scratch)
+        .map_err(|_| GltfIoError::JsonParse)?;
+
+    let mut panels = Vec::new_in(alloc);
+    let mut tri_panel = Vec::new_in(alloc);
+
+    let meshes = val_map_get(&root, "meshes").and_then(val_array).ok_or(GltfIoError::MissingMesh { index: 0 })?;
+    let mesh0 = meshes.first().ok_or(GltfIoError::MissingMesh { index: 0 })?;
+    let Some(extras) = val_map_get(mesh0, "extras") else {
+        return Ok(LoadedPanelMap { panels, tri_panel });
+    };
+    let Some(bp) = val_map_get(extras, "blaze_panels") else {
+        return Ok(LoadedPanelMap { panels, tri_panel });
+    };
+
+    if let Some(panel_list) = val_map_get(bp, "panels").and_then(val_array) {
+        for entry in panel_list {
+            let id = val_map_get(entry, "id").and_then(val_u64).ok_or(GltfIoError::UnsupportedAccessor)? as u16;
+            let name_str = val_map_get(entry, "name").and_then(val_str).ok_or(GltfIoError::UnsupportedAccessor)?;
+            let kind_str = val_map_get(entry, "kind").and_then(val_str).ok_or(GltfIoError::UnsupportedAccessor)?;
+            let kind = PanelKind::from_str(kind_str).ok_or(GltfIoError::UnsupportedAccessor)?;
+            let layer = val_map_get(entry, "layer").and_then(val_u64).ok_or(GltfIoError::UnsupportedAccessor)? as u8;
+            let fabric_idx = val_map_get(entry, "material").and_then(val_u64).ok_or(GltfIoError::UnsupportedAccessor)? as u16;
+
+            let mut name = Vec::new_in(alloc);
+            for &b in name_str.as_bytes() {
+                push(&mut name, b)?;
+            }
+            let host_panel = match val_map_get(entry, "host_panel").and_then(val_str) {
+                Some(hs) => {
+                    let mut hv = Vec::new_in(alloc);
+                    for &b in hs.as_bytes() {
+                        push(&mut hv, b)?;
+                    }
+                    Some(hv)
+                }
+                None => None,
+            };
+            push(&mut panels, LoadedPanelEntry { id, name, kind, layer, fabric_idx, host_panel })?;
+        }
+    }
+
+    if let Some(acc_idx) = val_map_get(bp, "tri_panel_accessor").and_then(val_u64) {
+        let acc = resolve_accessor(&root, bin, acc_idx as usize)?;
+        if acc.components != 1 || acc.component_type != 5123 {
+            return Err(GltfIoError::UnsupportedAccessor);
+        }
+        for i in 0..acc.count {
+            let o = i * acc.stride;
+            let pid = read_u16_le(acc.data, o)?;
+            push(&mut tri_panel, pid)?;
+        }
+    }
+
+    Ok(LoadedPanelMap { panels, tri_panel })
+}
+
 // ================================================================================================
 // Deterministic Skinned Binary glTF 2.0 Writer
 // ================================================================================================
@@ -580,6 +689,8 @@ pub fn write_skinned_glb_with_morphs<'a>(
     let n_verts = mesh.positions.len();
     let has_skin = !joints.is_empty() && skin_joints.len() == n_verts && skin_weights.len() == n_verts;
     let has_color = mesh.colors.len() == n_verts && n_verts > 0;
+    let has_rest_pos = mesh.rest_pos_m.len() == n_verts && n_verts > 0;
+    let has_panels = !mesh.panels.is_empty() && mesh.tri_panel.len() == mesh.triangles.len();
 
     let mut bin = Vec::new_in(scratch);
     struct BvMeta {
@@ -651,6 +762,22 @@ pub fn write_skinned_glb_with_morphs<'a>(
     push(&mut bvs, BvMeta { offset: uv_off, length: uv_len, target: Some(34962) })?;
     let uv_acc = accs.len();
     push(&mut accs, AccMeta { bv: uv_bv, component_type: 5126, count: n_verts, typ: "VEC2", normalized: false, min: None, max: None })?;
+
+    // Optional _REST_POS_M (f32 VEC2: physical metric grain-aligned (weft_m, warp_m) independent of TEXCOORD_0!)
+    let mut rest_pos_acc = None;
+    if has_rest_pos {
+        let rp_off = bin.len();
+        for &rp in mesh.rest_pos_m.iter() {
+            push_bytes(&mut bin, &(rp.x as f32).to_le_bytes())?;
+            push_bytes(&mut bin, &(rp.y as f32).to_le_bytes())?;
+        }
+        let rp_len = bin.len() - rp_off;
+        pad4(&mut bin, 0)?;
+        let rp_bv = bvs.len();
+        push(&mut bvs, BvMeta { offset: rp_off, length: rp_len, target: Some(34962) })?;
+        rest_pos_acc = Some(accs.len());
+        push(&mut accs, AccMeta { bv: rp_bv, component_type: 5126, count: n_verts, typ: "VEC2", normalized: false, min: None, max: None })?;
+    }
 
     // Optional COLOR_0 (UNSIGNED_BYTE VEC4 normalized: [wear, micro_ao, topstitch, mobility])
     let mut color_acc = None;
@@ -746,6 +873,7 @@ pub fn write_skinned_glb_with_morphs<'a>(
     }
     let mut prims = Vec::new_in(scratch);
     let mut active_fabrics = Vec::new_in(scratch);
+    let mut emitted_tri_panels = Vec::new_in(scratch);
     for (fi, _) in fabrics.iter().enumerate() {
         let mut count = 0usize;
         for &tf in mesh.tri_fabric.iter() {
@@ -771,6 +899,9 @@ pub fn write_skinned_glb_with_morphs<'a>(
                     push_bytes(&mut bin, &(b as u16).to_le_bytes())?;
                     push_bytes(&mut bin, &(c as u16).to_le_bytes())?;
                 }
+                if has_panels {
+                    push(&mut emitted_tri_panels, mesh.tri_panel[ti])?;
+                }
             }
         }
         let idx_len = bin.len() - idx_off;
@@ -791,6 +922,32 @@ pub fn write_skinned_glb_with_morphs<'a>(
             },
         )?;
         push(&mut prims, PrimMeta { indices_acc: acc_i, material_idx: mat_idx })?;
+    }
+
+    // Optional per-triangle panel ID scalar accessor (UNSIGNED_SHORT SCALAR in primitive-emitted order).
+    let mut tri_panel_acc = None;
+    if has_panels && !emitted_tri_panels.is_empty() {
+        let tp_off = bin.len();
+        for &pid in emitted_tri_panels.iter() {
+            push_bytes(&mut bin, &pid.to_le_bytes())?;
+        }
+        let tp_len = bin.len() - tp_off;
+        pad4(&mut bin, 0)?;
+        let tp_bv = bvs.len();
+        push(&mut bvs, BvMeta { offset: tp_off, length: tp_len, target: None })?;
+        tri_panel_acc = Some(accs.len());
+        push(
+            &mut accs,
+            AccMeta {
+                bv: tp_bv,
+                component_type: 5123,
+                count: emitted_tri_panels.len(),
+                typ: "SCALAR",
+                normalized: false,
+                min: None,
+                max: None,
+            },
+        )?;
     }
 
     // Build deterministic JSON chunk.
@@ -871,7 +1028,7 @@ pub fn write_skinned_glb_with_morphs<'a>(
     }
     j.s("]");
 
-    // Meshes (with optional morph targets + targetNames extras!)
+    // Meshes (with optional morph targets + targetNames + blaze_panels extras!)
     j.s(",\"meshes\":[{\"name\":\"BlazeGarmentMesh\"");
     if !morph_accs.is_empty() {
         j.s(",\"weights\":[");
@@ -879,12 +1036,51 @@ pub fn write_skinned_glb_with_morphs<'a>(
             if k > 0 { j.s(","); }
             j.s("0");
         }
-        j.s("],\"extras\":{\"targetNames\":[");
-        for (k, &(nm, _)) in morph_accs.iter().enumerate() {
-            if k > 0 { j.s(","); }
-            j.q(nm);
+        j.s("]");
+    }
+    if !morph_accs.is_empty() || has_panels {
+        j.s(",\"extras\":{");
+        let mut need_comma = false;
+        if !morph_accs.is_empty() {
+            j.s("\"targetNames\":[");
+            for (k, &(nm, _)) in morph_accs.iter().enumerate() {
+                if k > 0 { j.s(","); }
+                j.q(nm);
+            }
+            j.s("]");
+            need_comma = true;
         }
-        j.s("]}");
+        if has_panels {
+            if need_comma {
+                j.s(",");
+            }
+            j.s("\"blaze_panels\":{\"panels\":[");
+            for (idx, pm) in mesh.panels.iter().enumerate() {
+                if idx > 0 { j.s(","); }
+                j.s("{\"id\":");
+                j.u(pm.id as u64);
+                j.s(",\"name\":");
+                j.q(pm.name);
+                j.s(",\"kind\":");
+                j.q(pm.kind.as_str());
+                j.s(",\"layer\":");
+                j.u(pm.layer as u64);
+                j.s(",\"material\":");
+                j.u(pm.fabric_idx as u64);
+                if let Some(host) = pm.host_panel {
+                    j.s(",\"host_panel\":");
+                    j.q(host);
+                }
+                j.s("}");
+            }
+            j.s("]");
+            if let Some(tpa) = tri_panel_acc {
+                j.s(",\"tri_panel_accessor\":");
+                j.u(tpa as u64);
+            }
+            j.s("}");
+        }
+        j.s("}");
     }
     j.s(",\"primitives\":[");
     for (pi, p) in prims.iter().enumerate() {
@@ -895,6 +1091,10 @@ pub fn write_skinned_glb_with_morphs<'a>(
         j.u(nrm_acc as u64);
         j.s(",\"TEXCOORD_0\":");
         j.u(uv_acc as u64);
+        if let Some(rpa) = rest_pos_acc {
+            j.s(",\"_REST_POS_M\":");
+            j.u(rpa as u64);
+        }
         if let Some(ca) = color_acc {
             j.s(",\"COLOR_0\":");
             j.u(ca as u64);

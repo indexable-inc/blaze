@@ -142,10 +142,11 @@ pub fn transform_of(p: &Placement) -> Transform {
 }
 
 /// Prepare a mesh for GPU export: optionally run Tipsify vertex-cache optimization followed by
-/// vertex-fetch reordering, and stamp `role` onto all triangles when non-zero.
+/// vertex-fetch reordering, and stamp `stamp_role` onto all triangles when `Some(r)` with `r != 0`.
+/// Pass `None` to preserve per-triangle multi-material roles already assigned on `view`.
 pub(crate) fn prepare_gpu_mesh<'s>(
     view: &MeshView<'_>,
-    role: MaterialRole,
+    stamp_role: Option<MaterialRole>,
     optimize_gpu: bool,
     cache_size: u32,
     alloc: Alloc<'s>,
@@ -156,6 +157,9 @@ pub(crate) fn prepare_gpu_mesh<'s>(
         optimize_vertex_fetch(&cached.view(), FetchOpts { alloc, scratch })?
     } else {
         copy_view(view, alloc)?
+    };
+    let Some(role) = stamp_role else {
+        return Ok(mesh);
     };
     if role == MaterialRole(0) {
         return Ok(mesh);
@@ -346,7 +350,7 @@ pub fn export_glb<'a, P: Planted<CadPlant>>(
         let count = PartCount { meshed: m.stats.triangles, written, simplified_within: within, vertex_bound: m.vertex_bound };
         counts.try_push(count).map_err(|_| ModelError::Alloc { what: "the export's counts" })?;
 
-        let opt_mesh = prepare_gpu_mesh(&base_view, part.material, o.optimize_gpu, o.vertex_cache_size, s, s)?;
+        let opt_mesh = prepare_gpu_mesh(&base_view, Some(part.material), o.optimize_gpu, o.vertex_cache_size, s, s)?;
         ready_meshes.try_push(opt_mesh).map_err(|_| ModelError::Alloc { what: "the export's optimized meshes" })?;
 
         let lod_start = ready_lods.len();
@@ -364,7 +368,7 @@ pub fn export_glb<'a, P: Planted<CadPlant>>(
                 },
             )?;
             for level in chain.levels.iter().skip(1) {
-                let lv_mesh = prepare_gpu_mesh(&level.mesh.view(), part.material, o.optimize_gpu, o.vertex_cache_size, s, s)?;
+                let lv_mesh = prepare_gpu_mesh(&level.mesh.view(), Some(part.material), o.optimize_gpu, o.vertex_cache_size, s, s)?;
                 ready_lods
                     .try_push(ReadyLod { mesh: lv_mesh, error: level.error, switch_distance: level.switch_distance })
                     .map_err(|_| ModelError::Alloc { what: "the export's lod meshes" })?;

@@ -59,10 +59,13 @@
 extern crate std;
 
 mod asset;
+mod camera_fidelity;
 mod check;
 mod export;
 mod fidelity;
 mod part;
+mod region;
+mod surface;
 
 #[cfg(test)]
 mod math_tests;
@@ -70,17 +73,28 @@ mod math_tests;
 mod tests;
 
 pub use asset::{
-    AssetFidelityPolicy, AssetPreset, AssetReport, BudgetInput, BudgetStatus, ExportedPart, GameAsset, GameAssetOpts,
-    PartFeature, PartFeatureReport, PartReport, PublishCheckOpts, PublishFailure, PublishPlant, PublishProof, allocate_budgets,
-    build_game_asset, build_game_asset_planted, publish_game_asset,
+    AssetBakeOpts, AssetFidelityPolicy, AssetPreset, AssetReport, BudgetInput, BudgetStatus, ExportedPart, GameAsset,
+    GameAssetOpts, PartDecal, PartFeature, PartFeatureReport, PartMaterialRegion, PartReport, PublishCheckOpts, PublishFailure,
+    PublishPlant, PublishProof, allocate_budgets, build_game_asset, build_game_asset_planted, publish_game_asset,
 };
 pub use blaze_cad_mesh::{
     CreaseProfile, CreaseProfileOpts, DecimateStats, Decimated, FeatureProtect, FeatureRegion, FeatureZone, GridSizing,
-    MaterialRole, MeshLimits, PieceCache, PieceCacheOpts, Stop, Target, Topology, auto_grid, crease_profile, topology,
+    MaterialRole, MeshLimits, PieceCache, PieceCacheOpts, Stop, Target, Topology, UvError, UvMapped, UvOpts, UvPlant, auto_grid,
+    compute_tangents, crease_profile, topology, unwrap_uvs,
 };
-pub use blaze_cad_out::{Encoding, Material, StlUnit, Up};
+pub use blaze_cad_out::{
+    Encoding, GlbReadError, GlbReadOpts, LoadedGlb, Material, MaterialTextures, StlUnit, TexturePack, Up, decode_png,
+    glb_textured, read_glb,
+};
 pub use blaze_cad_picture::{
-    HighlightStyle, MeshHighlight, MeshNormalSource, MeshPictureOpts, MeshScenePart, RenderMode, Shading, StudioOpts, Wireframe,
+    HighlightStyle, MaterialMaps, MeshHighlight, MeshNormalSource, MeshPictureOpts, MeshScenePart, PictureDiff, RenderMode,
+    Shading, StripLight, StudioOpts, TextureMap, Wireframe, ZebraOpts, compose_grid, compose_side_by_side, diff_pictures,
+};
+pub use camera_fidelity::{
+    CameraFidelityOpts, CameraFidelityPlant, CameraFidelityReport, CameraLodReport, DecalLegibility, DecalSpec,
+    GameCameraPreset, GameCameraRig, GlbPreviewOpts, GlbRenderSet, GlbRevisionComparison, GlbRevisionView, GlbViewRender,
+    NamedCamera, SeamSpec, SeamVisibility, SilhouetteShift, check_camera_fidelity, check_camera_fidelity_planted,
+    compare_glb_revisions, render_glb_views,
 };
 pub use check::{
     AssemblyInterference, CHECK_SCHEMA, CheckKey, CheckKind, Checked, DraftFace, DraftOpts, FitOpts, Interference, InterferenceOpts,
@@ -98,7 +112,7 @@ pub use export::{
     transform_of,
 };
 pub use fidelity::{
-    FeatureKind, FeatureReport, FeatureTarget, FeatureTargetOpts, FidelityChecked, FidelityFinding, FidelityMetrics,
+    FeatureKind, FeatureReport, FeatureSpec, FeatureTarget, FeatureTargetOpts, FidelityChecked, FidelityFinding, FidelityMetrics,
     FidelityOpts, FidelityPlant, FidelityReport, check_mesh_fidelity, check_mesh_fidelity_planted, check_mesh_fidelity_report,
     check_mesh_fidelity_report_planted,
 };
@@ -106,6 +120,18 @@ pub use part::{
     DecimatePartOpts, MassProperties, MeshPartOpts, Part, PartBudget, PartOpts, RoundEdgesOpts, TriangleBudget, assemble,
     decimate_mesh, gyroid, intersect_all, mass_properties, mass_properties_planted, mesh_part, part_tape, placed, placed_tape,
     round_edges, round_edges_planted, union_all,
+};
+pub use region::{
+    AttachmentFrame, Curve2dPoint, DerivedPanel, FilletKind, PanelOpts, PatternOpts, PatternResult, ProjectCurveOpts,
+    RegionSelector, SelectedRoundOpts, SurfaceCurve, SurfaceCurvePoint, SurfacePattern, SurfaceRegion, SurfaceRegionOpts,
+    SurfaceSweepOpts, SweptSurfaceFeature, TrimMode, derive_panel, fill_region_pattern, project_curve_to_surface, resolve_region,
+    round_selected_edges, snap_to_surface, sweep_on_surface,
+};
+pub use surface::{
+    BakeOpts, BakedMaps, BakedTexture, Decal, DecalMaterial, DecalOpts, DecalProjection, DecalSample, DecalShape, EdgeWearMask,
+    FinishAssignment, FinishSample, MAX_SVG_SEGMENTS, MaterialRegion, MaterialRule, SeamClip, SurfaceFinish, SvgPath2D,
+    SvgSegment, assign_material_regions, bake_surface_maps, baked_material, decal_feature_target, decal_stroke_width,
+    evaluate_decal, evaluate_decal_with_footprint, evaluate_finish, parse_svg_path, svg_path_sd,
 };
 
 use blaze_cad_field::{Bound, CadError, CompileError, EvalError, Ex, Graph, InspectError, Name, Placement, Solid, Weakens};
@@ -151,6 +177,7 @@ pub enum ModelError {
     Hull(HullError),
     Decompose(DecomposeError),
     Shape(ShapeError),
+    Uv(UvError),
     Picture(PictureError),
     Glb(GlbError),
     Stl(StlError),
@@ -228,6 +255,12 @@ impl From<DecomposeError> for ModelError {
 impl From<ShapeError> for ModelError {
     fn from(e: ShapeError) -> ModelError {
         ModelError::Shape(e)
+    }
+}
+
+impl From<UvError> for ModelError {
+    fn from(e: UvError) -> ModelError {
+        ModelError::Uv(e)
     }
 }
 
@@ -505,31 +538,45 @@ impl<'a> Model<'a> {
 pub mod prelude {
     pub use blaze_cad_field::{
         AffineOpts, Axis, BendOpts, BlendOpts, Bound, BoxOpts, CapsuleOpts, CircularOpts, ConeOpts, CylinderOpts, Detail,
-        EllipsoidOpts, Exact, ExtrudeOpts, Graph, GraphOpts, GyroidOpts, HalfSpaceOpts, Inside, Join, LoftOpts, MirrorOpts,
-        OffsetOpts, Outside, Placement, RepeatOpts, RevolveOpts, RoundOpts, ScaleOpts, ShellOpts, Solid, SphereOpts, Station,
-        SuperellipsoidOpts, TaperOpts, TorusOpts, TwistOpts,
+        EdgeSelect, EllipsoidOpts, Exact, ExtrudeOpts, Graph, GraphOpts, GuideRail, GuidedLoftOpts, GuidedStation, GyroidOpts,
+        HalfSpaceOpts, Inside, Join, LoftContinuity, LoftOpts, MirrorOpts, OffsetOpts, Outside, Placement, Profile, ProfileOpts,
+        RadiusProfile, RadiusStop, RailPoint, RepeatOpts, RevolveOpts, RoundOpts, ScaleOpts, ShellOpts, Solid, SphereOpts,
+        Station, SuperellipsoidOpts, SweepCrossSection, SweepFrame, SweepFramesOpts, TaperOpts, TorusOpts, TwistOpts,
+        VariableBlendOpts, VariableOffsetOpts,
     };
     pub use blaze_cad_picture::{
-        HighlightStyle, MeshHighlight, MeshNormalSource, MeshPictureOpts, MeshScenePart, PictureOpts, Projection, RenderMode,
-        Shading, StudioOpts, View, Wireframe,
+        HighlightStyle, MaterialMaps, MeshHighlight, MeshNormalSource, MeshPictureOpts, MeshScenePart, PictureDiff, PictureOpts,
+        Projection, RenderMode, Shading, StripLight, StudioOpts, TextureMap, View, Wireframe, ZebraOpts, compose_grid,
+        compose_side_by_side, diff_pictures,
     };
     pub use blaze_units::{Angle, Area, Density, Length, Mass, Volume};
 
     pub use crate::Shown;
     pub use crate::{
-        AssemblyInterference, AssetFidelityPolicy, AssetPreset, AssetReport, BudgetInput, BudgetStatus, ColliderMode,
-        CreaseProfile, CreaseProfileOpts, DecimatePartOpts, DecimateStats, Decimated, DraftFace, DraftOpts, Encoding,
-        ExportLodOpts, ExportOpts, ExportStlOpts, Exported, ExportedPart, ExportedStl, FeatureKind, FeatureProtect,
-        FeatureRegion, FeatureReport, FeatureTarget, FeatureTargetOpts, FeatureZone, FidelityChecked, FidelityFinding,
-        FidelityMetrics, FidelityOpts, FidelityReport, FitOpts, GameAsset, GameAssetOpts, GridSizing, InterferenceOpts,
-        LodProjection, Material, MaterialRole, MeshLimits, MeshPartOpts, MinWallOpts, Model, ModelError, ModelOpts,
-        OverhangFace, OverhangOpts, Part, PartBudget, PartFeature, PartFeatureReport, PartId, PartOpts, PartReport, PieceCache,
-        PieceCacheOpts, PublishCheckOpts, PublishFailure, PublishProof, RoundEdgesOpts, SectionSvgOpts, StlUnit, Stop, Target,
-        Topology, TriangleBudget, Up, Verdict, allocate_budgets, assemble, auto_grid, build_game_asset, check_mesh_fidelity,
-        check_mesh_fidelity_report, crease_profile, decimate_mesh, draft_angle_check, export_glb, export_section_svg, export_stl,
-        fits_within, gyroid, intersect_all, mass_properties, mesh_part, min_wall, mm3, no_interference, no_interference_assembly,
-        overhang_check, part_tape, picture, picture_exported_scene, picture_mesh, picture_studio, placed_tape,
-        publish_game_asset, round_edges, topology, union_all,
+        AssemblyInterference, AssetBakeOpts, AssetFidelityPolicy, AssetPreset, AssetReport, AttachmentFrame, BakeOpts,
+        BakedMaps, BakedTexture, BudgetInput, BudgetStatus, CameraFidelityOpts, CameraFidelityPlant, CameraFidelityReport,
+        CameraLodReport, ColliderMode, CreaseProfile, CreaseProfileOpts, Curve2dPoint, Decal, DecalLegibility, DecalMaterial,
+        DecalOpts, DecalProjection, DecalSample, DecalShape, DecalSpec, DecimatePartOpts, DecimateStats, Decimated, DerivedPanel,
+        DraftFace, DraftOpts, EdgeWearMask, Encoding, ExportLodOpts, ExportOpts, ExportStlOpts, Exported, ExportedPart,
+        ExportedStl, FeatureKind, FeatureProtect, FeatureRegion, FeatureReport, FeatureSpec, FeatureTarget, FeatureTargetOpts,
+        FeatureZone, FidelityChecked, FidelityFinding, FidelityMetrics, FidelityOpts, FidelityReport, FilletKind,
+        FinishAssignment, FinishSample, FitOpts, GameAsset, GameAssetOpts, GameCameraPreset, GameCameraRig, GlbPreviewOpts,
+        GlbRenderSet, GlbRevisionComparison, GlbRevisionView, GlbViewRender, GridSizing, InterferenceOpts, LodProjection,
+        Material, MaterialRegion, MaterialRole, MaterialRule, MaterialTextures, MeshLimits, MeshPartOpts, MinWallOpts, Model,
+        ModelError, ModelOpts, NamedCamera, OverhangFace, OverhangOpts, PanelOpts, Part, PartBudget, PartDecal, PartFeature,
+        PartFeatureReport, PartId, PartMaterialRegion, PartOpts, PartReport, PatternOpts, PatternResult, PieceCache,
+        PieceCacheOpts, ProjectCurveOpts, PublishCheckOpts, PublishFailure, PublishProof, RegionSelector, RoundEdgesOpts,
+        SeamClip, SeamSpec, SeamVisibility, SectionSvgOpts, SelectedRoundOpts, SilhouetteShift, StlUnit, Stop, SurfaceCurve,
+        SurfaceCurvePoint, SurfaceFinish, SurfacePattern, SurfaceRegion, SurfaceRegionOpts, SurfaceSweepOpts,
+        SweptSurfaceFeature, Target, TexturePack, Topology, TriangleBudget, TrimMode, Up, UvError, UvMapped, UvOpts, Verdict,
+        allocate_budgets, assemble, assign_material_regions, auto_grid, bake_surface_maps, baked_material, build_game_asset,
+        check_camera_fidelity, check_mesh_fidelity, check_mesh_fidelity_report, compare_glb_revisions, compute_tangents,
+        crease_profile, decal_feature_target, decal_stroke_width, decimate_mesh, derive_panel, draft_angle_check, evaluate_decal,
+        evaluate_finish, export_glb, export_section_svg, export_stl, fill_region_pattern, fits_within, glb_textured, gyroid,
+        intersect_all, mass_properties, mesh_part, min_wall, mm3, no_interference, no_interference_assembly, overhang_check,
+        parse_svg_path, part_tape, picture, picture_exported_scene, picture_mesh, picture_studio, placed_tape,
+        project_curve_to_surface, publish_game_asset, read_glb, render_glb_views, resolve_region, round_edges,
+        round_selected_edges, snap_to_surface, sweep_on_surface, topology, union_all, unwrap_uvs,
     };
 }
 

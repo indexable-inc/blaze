@@ -1766,3 +1766,491 @@ fn strict_export_validation_and_publish_gate_enforce_all_requested_targets() {
         Err(PublishFailure::NoFeaturesDeclared)
     );
 }
+
+#[test]
+fn feature_spec_derives_physical_mesh_budgets() {
+    use blaze_math::{Aabb3, Vec3};
+
+    let region = FeatureRegion::Box(Aabb3::new(Vec3::new(-0.02, -0.01, -0.01), Vec3::new(0.02, 0.01, 0.01)));
+    let groove = FeatureTarget::from_spec("g", region, FeatureSpec::Groove { width: Length::mm(1.8), depth: Length::mm(1.2) });
+    let bevel = FeatureTarget::from_spec("b", region, FeatureSpec::Bevel { radius: Length::mm(3.0) });
+    let seam = FeatureTarget::from_spec("s", region, FeatureSpec::PanelSeam { gap: Length::mm(1.0), depth: Length::mm(2.5) });
+    let stencil = FeatureTarget::from_spec("st", region, FeatureSpec::Stencil { stroke_width: Length::mm(2.0) });
+    let slot = FeatureTarget::from_spec("sl", region, FeatureSpec::Slot { width: Length::mm(2.4) });
+
+    assert!(groove.min_feature.unwrap() <= Length::mm(0.65));
+    assert!(bevel.max_error.unwrap() <= Length::mm(0.12));
+    assert_eq!(seam.protect, FeatureProtect::Pinned);
+    assert!(seam.min_feature.unwrap() <= Length::mm(0.45));
+    assert!(stencil.min_feature.unwrap() <= Length::mm(1.05));
+    assert_eq!(slot.kind, FeatureKind::Keyhole);
+}
+
+#[test]
+fn camera_fidelity_checks_silhouette_seams_decals_and_catches_plants() {
+    use blaze_cad_field::compile;
+    use blaze_cad_mesh::{MeshOpts, mesh};
+    use blaze_cad_picture::{Projection, View};
+    use blaze_math::{Aabb3, Vec3};
+
+    let mut model = Model::new(ModelOpts { alloc: heap(), .. });
+    let cyl = model
+        .graph()
+        .cylinder(CylinderOpts { radius: Length::mm(40.0), height: Length::mm(80.0), .. })
+        .expect("cyl");
+    let (_, part) = model.add(PartOpts { solid: cyl, name: "cell" }).expect("add");
+    let tape = compile(model.graph_ref(), part.solid.id(), blaze_cad_field::CompileOpts { alloc: heap(), .. }).expect("tape");
+
+    // Deliberately coarse mesh so silhouette visibly shifts at close range.
+    let coarse = mesh(&tape, MeshOpts { alloc: heap(), scratch: heap(), tolerance: Length::mm(3.5), .. }).expect("coarse");
+    let view = View {
+        eye: [Length::ZERO, Length::mm(-220.0), Length::ZERO],
+        target: [Length::ZERO; 3],
+        projection: Projection::Perspective { fov: Angle::degrees(38.0) },
+        width: 480,
+        height: 480,
+        ..
+    };
+    let cams = [NamedCamera::new("inspect", view)];
+    let tiny_seam = [SeamSpec::new(
+        "micro_seam",
+        FeatureRegion::Box(Aabb3::new(Vec3::new(-0.002, -0.042, -0.002), Vec3::new(0.002, -0.038, 0.002))),
+        Length::mm(0.05),
+        Length::mm(0.2),
+    )];
+    let tiny_decal = [DecalSpec::new(
+        "micro_07",
+        Vec3::new(0.0, -0.040, 0.0),
+        Vec3::new(0.0, -1.0, 0.0),
+        Length::mm(0.10),
+        Some(100.0),
+    )];
+    let opts = CameraFidelityOpts {
+        cameras: &cams,
+        seams: &tiny_seam,
+        decals: &tiny_decal,
+        max_silhouette_shift_px: 0.5,
+        min_seam_px: 1.0,
+        min_decal_stroke_px: 1.5,
+        min_decal_texel_ratio: 0.75,
+        alloc: heap(),
+        scratch: heap(),
+    };
+
+    let clean = check_camera_fidelity(&tape, &part.placement, &[coarse.mesh.view()], opts).expect("clean check");
+    assert!(!clean.passed, "coarse mesh with sub-pixel seam/decal must fail camera fidelity");
+    assert!(!clean.silhouette_issues.is_empty(), "must flag silhouette shift");
+    assert!(clean.seam_checks.iter().any(|s| !s.visible), "must flag disappearing seam");
+    assert!(clean.decal_checks.iter().any(|d| !d.legible), "must flag illegible decal");
+    let shown = format!("{}", Shown(&clean));
+    assert!(shown.contains("inspect"), "Shown report must name camera:\n{shown}");
+
+    // Planted bug controls: each plant hides its own defect class.
+    let p_sil = check_camera_fidelity_planted(
+        &tape,
+        &part.placement,
+        &[coarse.mesh.view()],
+        opts,
+        CameraFidelityPlant::IgnoreSilhouetteShift,
+    )
+    .expect("plant sil");
+    assert!(p_sil.silhouette_issues.is_empty(), "IgnoreSilhouetteShift must drop silhouette issues");
+
+    let p_seam = check_camera_fidelity_planted(
+        &tape,
+        &part.placement,
+        &[coarse.mesh.view()],
+        opts,
+        CameraFidelityPlant::IgnoreSeamLoss,
+    )
+    .expect("plant seam");
+    assert!(p_seam.seam_checks.iter().all(|s| s.visible), "IgnoreSeamLoss must falsely mark seams visible");
+
+    let p_decal = check_camera_fidelity_planted(
+        &tape,
+        &part.placement,
+        &[coarse.mesh.view()],
+        opts,
+        CameraFidelityPlant::IgnoreDecalBreakup,
+    )
+    .expect("plant decal");
+    assert!(p_decal.decal_checks.iter().all(|d| d.legible), "IgnoreDecalBreakup must falsely mark decals legible");
+}
+
+#[test]
+fn power_cell_milestone_curvature_edit_keeps_cover_decal_and_highlights_aligned() {
+    use blaze_cad_field::{
+        EdgeSelect, GuideRail, GuidedLoftOpts, GuidedStation, LoftContinuity, Profile, ProfileOpts, RadiusProfile, RailPoint,
+        Scratch, SweepCrossSection, VariableBlendOpts, compile, eval_point,
+    };
+    use blaze_cad_out::{GlbReadOpts, Material, Up, read_glb};
+    use blaze_cad_picture::StripLight;
+    use blaze_math::Vec3;
+
+    const MATS: [Material<'static>; 3] = [
+        Material {
+            name: "ceramic",
+            base_colour: [0.76, 0.75, 0.71, 1.0],
+            metallic: 0.0,
+            roughness: 0.45,
+            emissive: [0.0; 3],
+            emissive_strength: None,
+            clearcoat: None,
+            double_sided: false,
+        },
+        Material {
+            name: "graphite",
+            base_colour: [0.16, 0.17, 0.19, 1.0],
+            metallic: 0.15,
+            roughness: 0.68,
+            emissive: [0.0; 3],
+            emissive_strength: None,
+            clearcoat: None,
+            double_sided: false,
+        },
+        Material {
+            name: "titanium",
+            base_colour: [0.64, 0.67, 0.71, 1.0],
+            metallic: 0.90,
+            roughness: 0.25,
+            emissive: [0.0; 3],
+            emissive_strength: None,
+            clearcoat: None,
+            double_sided: false,
+        },
+    ];
+
+    let build_rev = |flare_mm: f64| {
+        let mut model = Model::new(ModelOpts { alloc: heap(), .. });
+        let prof = model
+            .graph()
+            .profile(ProfileOpts {
+                profile: Profile::RoundedRect { width: Length::mm(64.0), height: Length::mm(40.0), radius: Length::mm(10.0) },
+                name: None,
+            })
+            .expect("prof");
+        let stations = [
+            GuidedStation { z: Length::mm(-60.0), profile: prof, .. },
+            GuidedStation { z: Length::mm(0.0), profile: prof, .. },
+            GuidedStation { z: Length::mm(60.0), profile: prof, .. },
+        ];
+        let side_pts = [
+            RailPoint { z: Length::mm(-60.0), value: Length::mm(29.0), tangent: Some(0.05) },
+            RailPoint { z: Length::mm(15.0), value: Length::mm(32.0 + flare_mm * 0.6), tangent: None },
+            RailPoint { z: Length::mm(60.0), value: Length::mm(26.0), tangent: Some(-0.18) },
+        ];
+        let ridge_pts = [
+            RailPoint { z: Length::mm(-60.0), value: Length::mm(18.0), tangent: Some(0.05) },
+            RailPoint { z: Length::mm(15.0), value: Length::mm(20.0 + flare_mm), tangent: None },
+            RailPoint { z: Length::mm(60.0), value: Length::mm(16.0), tangent: Some(-0.16) },
+        ];
+        let shell = model
+            .graph()
+            .guided_loft(GuidedLoftOpts {
+                stations: &stations,
+                side_rail: Some(GuideRail { points: &side_pts }),
+                ridge_rail: Some(GuideRail { points: &ridge_pts }),
+                continuity: LoftContinuity::CurvatureC2,
+                cap_round: Length::mm(4.0),
+                ..
+            })
+            .expect("loft");
+
+        // Selective variable-radius notch on upper +X edge.
+        let notch = model.graph().cuboid(BoxOpts { size: mm3(16.0, 22.0, 28.0), .. }).expect("notch");
+        let notch = model
+            .graph()
+            .place(notch, Placement::shift(Length::mm(34.0 + flare_mm * 0.4), Length::ZERO, Length::mm(16.0)))
+            .expect("place notch");
+        let shell = model
+            .graph()
+            .variable_round_difference(
+                shell,
+                notch,
+                VariableBlendOpts {
+                    profile: RadiusProfile::Linear {
+                        from: mm3(24.0, 0.0, 2.0),
+                        to: mm3(24.0, 0.0, 30.0),
+                        r0: Length::mm(1.5),
+                        r1: Length::mm(4.5),
+                    },
+                    select: EdgeSelect::Box { lo: mm3(14.0, -24.0, -4.0), hi: mm3(52.0, 24.0, 42.0), fade: Length::mm(3.0) },
+                    ..
+                },
+            )
+            .expect("var round diff");
+
+        let shell_tape = compile(model.graph_ref(), shell.id(), blaze_cad_field::CompileOpts { alloc: heap(), .. }).expect("tape");
+        let mut sc = Scratch::new(heap());
+
+        let outer_reg = SurfaceRegion::new(SurfaceRegionOpts {
+            name: "cell.outer_face",
+            selector: RegionSelector::Extremal { dir: [0.0, -1.0, 0.0], at_frac: [0.5, 0.0, 0.38] },
+            ..
+        });
+        let shoulder_reg = SurfaceRegion::new(SurfaceRegionOpts {
+            name: "cell.shoulder",
+            selector: RegionSelector::Extremal { dir: [0.0, -1.0, 0.0], at_frac: [0.5, 0.0, 0.72] },
+            ..
+        });
+        let outer_frame = resolve_region(&shell_tape, &outer_reg, heap()).expect("outer frame");
+        let shoulder_frame = resolve_region(&shell_tape, &shoulder_reg, heap()).expect("shoulder frame");
+        assert!(eval_point(&shell_tape, outer_frame.origin, &mut sc).abs() < 1e-4);
+        assert!(eval_point(&shell_tape, shoulder_frame.origin, &mut sc).abs() < 1e-4);
+
+        let derived = derive_panel(
+            model.graph(),
+            shell,
+            &outer_frame,
+            PanelOpts {
+                outline: Profile::RoundedRect { width: Length::mm(34.0), height: Length::mm(28.0), radius: Length::mm(4.0) },
+                gap: Length::mm(1.5),
+                cover_thickness: Length::mm(3.0),
+                pocket_depth: Length::mm(5.0),
+                lip_width: Length::mm(2.0),
+                lip_thickness: Length::mm(2.0),
+                name: "bay",
+                ..
+            },
+        )
+        .expect("derive panel");
+
+        // Compound surface curve + tapered groove.
+        let cpts = [
+            Curve2dPoint { u: Length::mm(-18.0), v: Length::mm(20.0), width: Length::mm(2.4), depth: Length::mm(1.5) },
+            Curve2dPoint { u: Length::ZERO, v: Length::mm(23.0), width: Length::mm(2.8), depth: Length::mm(1.8) },
+            Curve2dPoint { u: Length::mm(18.0), v: Length::mm(20.0), width: Length::mm(2.4), depth: Length::mm(1.5) },
+        ];
+        let curve = project_curve_to_surface(&shell_tape, &outer_frame, &cpts, ProjectCurveOpts {
+            samples_per_segment: 3,
+            alloc: heap(),
+            scratch: heap(),
+            ..
+        })
+        .expect("curve");
+        let groove = sweep_on_surface(
+            model.graph(),
+            &curve,
+            SurfaceSweepOpts {
+                section: SweepCrossSection::Channel,
+                taper_start: Length::mm(5.0),
+                taper_end: Length::mm(5.0),
+                name: "groove",
+                scratch: heap(),
+                ..
+            },
+        )
+        .expect("sweep");
+        let host = model.graph().difference(derived.host_with_pocket, groove.solid).expect("cut groove");
+
+        // Bounded grip pattern on the -X face.
+        let grip_reg = SurfaceRegion::new(SurfaceRegionOpts {
+            name: "cell.grip",
+            selector: RegionSelector::Extremal { dir: [-1.0, 0.0, 0.0], at_frac: [0.0, 0.5, 0.45] },
+            ..
+        });
+        let grip_frame = resolve_region(&shell_tape, &grip_reg, heap()).expect("grip frame");
+        let poly = [
+            [Length::mm(-8.0), Length::mm(-16.0)],
+            [Length::mm(8.0), Length::mm(-16.0)],
+            [Length::mm(6.0), Length::mm(16.0)],
+            [Length::mm(-6.0), Length::mm(16.0)],
+        ];
+        let pat = fill_region_pattern(
+            model.graph(),
+            shell,
+            &shell_tape,
+            &grip_frame,
+            PatternOpts {
+                boundary: Profile::Polygon { points: &poly },
+                border: Length::mm(1.5),
+                pattern: SurfacePattern::Ribs {
+                    pitch: Length::mm(6.0),
+                    width: Length::mm(2.0),
+                    depth: Length::mm(1.2),
+                    angle: Angle::ZERO,
+                },
+                trim: TrimMode::Clip,
+                raised: true,
+                name: "grip",
+                scratch: heap(),
+                ..
+            },
+        )
+        .expect("pattern");
+        assert!(pat.element_count >= 2);
+        let host = model.graph().union(host, pat.solid).expect("add grip");
+
+        let (hid, _) = model.add(PartOpts { solid: host, name: "housing" }).expect("add host");
+        model.set_material(hid, MaterialRole(0)).expect("hmat");
+        let (cid, _) = model.add(PartOpts { solid: derived.flush_cover, name: "cover" }).expect("add cover");
+        model.set_material(cid, MaterialRole(2)).expect("cmat");
+
+        // Cover must fit cleanly inside derived pocket with zero interference!
+        let clear = model
+            .no_interference(InterferenceOpts { clearance: Length::mm(0.2), scratch: heap(), .. })
+            .expect("clearance");
+        assert!(clear.verdict.passed(), "derived cover interfered at flare={flare_mm}mm: {}", Shown(&clear.verdict));
+
+        // Multi-material regions + physical finishes + surface-conforming "07" + SVG chevron decal.
+        let mregs = [PartMaterialRegion::new(
+            "housing",
+            MaterialRegion {
+                role: MaterialRole(1),
+                rule: MaterialRule::RecessDepth { outer_shell: shell, min_depth: Length::mm(1.8) },
+            },
+        )];
+        let finishes = [
+            FinishAssignment {
+                role: MaterialRole(0),
+                finish: Some(SurfaceFinish::MoldedGrain {
+                    grain_size: Length::mm(0.8),
+                    depth: Length::mm(0.03),
+                    roughness_variation: 0.08,
+                }),
+                wear: Some(EdgeWearMask {
+                    substrate_colour: [0.64, 0.67, 0.71],
+                    substrate_metallic: 0.85,
+                    substrate_roughness: 0.30,
+                    curvature_threshold: 20.0,
+                    intensity: 0.5,
+                    noise_scale: Length::mm(3.0),
+                }),
+            },
+            FinishAssignment {
+                role: MaterialRole(2),
+                finish: Some(SurfaceFinish::BrushedMetal {
+                    direction: [1.0, 0.0, 0.0],
+                    pitch: Length::mm(0.5),
+                    depth: Length::mm(0.025),
+                    roughness_variation: 0.12,
+                }),
+                wear: None,
+            },
+        ];
+        let stencil = Decal::new(DecalOpts {
+            name: "stencil_07",
+            frame: shoulder_frame,
+            shape: DecalShape::Text {
+                text: "07",
+                height: Length::mm(16.0),
+                stroke_width: Length::mm(2.4),
+                tracking: 0.18,
+            },
+            material: DecalMaterial {
+                base_colour: [0.88, 0.28, 0.08, 1.0],
+                roughness: 0.35,
+                metallic: 0.05,
+                relief: Some(Length::mm(0.08)),
+            },
+            projection: DecalProjection::ConformalArcLength,
+            clip_role: Some(MaterialRole(0)),
+            ..
+        });
+        let svg_mark = Decal::new(DecalOpts {
+            name: "svg_arrow",
+            frame: outer_frame,
+            shape: DecalShape::SvgPath {
+                d: "M -6 -2 L 0 4 L 6 -2 Z",
+                scale: Length::mm(1.0),
+                filled: true,
+                stroke_width: Length::mm(1.0),
+            },
+            material: DecalMaterial { base_colour: [0.12, 0.12, 0.14, 1.0], roughness: 0.4, metallic: 0.1, relief: None },
+            ..
+        });
+        let decals = [PartDecal::new("housing", stencil), PartDecal::new("cover", svg_mark)];
+
+        let asset = build_game_asset(
+            model.graph_ref(),
+            model.parts(),
+            GameAssetOpts {
+                alloc: heap(),
+                scratch: heap(),
+                preset: AssetPreset::GameProp,
+                total_budget: Some(TriangleBudget(4_500)),
+                materials: &MATS,
+                material_regions: &mregs,
+                decals: &decals,
+                finishes: &finishes,
+                bake: Some(AssetBakeOpts { size: 128, gutter_px: 2, bake_cad_normals: true, normal_strength: 1.0 }),
+                fidelity: None,
+                ..
+            },
+            None,
+        )
+        .expect("build asset");
+
+        // Verify textured GLB contains embedded PNG textures and UVs/tangents via actual read_glb!
+        let loaded = read_glb(&asset.glb, GlbReadOpts { up: Up::Z, limits: blaze_cad_out::Limits::SHIPPED, alloc: heap(), scratch: heap() })
+            .expect("read_glb");
+        assert_eq!(loaded.parts.len(), 2);
+        assert!(loaded.images.len() >= 6, "both baked parts should embed 3 PNG maps each, got {}", loaded.images.len());
+        let h_mesh = loaded.parts[0].mesh.as_ref().expect("housing mesh");
+        assert!(h_mesh.view().uvs().is_some(), "housing GLB must carry TEXCOORD_0");
+        assert!(h_mesh.view().tangents().is_some(), "housing GLB must carry TANGENT");
+        let h_baked = asset.parts[0].baked.as_ref().expect("housing baked");
+        assert!(h_baked.decal_texels > 0, "07 decal must bake onto curved housing shoulder");
+        assert!(h_baked.covered_texels > 0);
+
+        (asset, outer_frame, shoulder_frame, shell_tape.aabb())
+    };
+
+    let (rev1, outer1, sh1, b1) = build_rev(3.0);
+    let (rev2, outer2, sh2, b2) = build_rev(10.0);
+
+    // Changing the shell curvature moves the live surface frames outward cleanly!
+    assert!(
+        (sh2.origin.y - sh1.origin.y).abs() > 0.002,
+        "shoulder frame must move with shell curvature: y1={} y2={}",
+        sh1.origin.y,
+        sh2.origin.y
+    );
+    assert!(
+        (outer2.origin - outer1.origin).length() > 0.001,
+        "outer_face frame must follow updated shell curvature"
+    );
+
+    // Render BOTH actual exported GLBs side-by-side from saved game cameras (Inspect + Zebra)!
+    let rig = GameCameraRig::standard_views(&b1.union(&b2), 96, 96, heap()).expect("rig");
+    let views = [(Some(rig[2].0), rig[2].1), (Some(rig[5].0), rig[5].1)];
+    let cmp = compare_glb_revisions(
+        &rev1.glb,
+        &rev2.glb,
+        &views,
+        GlbPreviewOpts {
+            supersample: 1,
+            strip_lights: [Some(StripLight::OVERHEAD_HORIZONTAL), None, None, None],
+            alloc: heap(),
+            scratch: heap(),
+            ..
+        },
+    )
+    .expect("compare glb revisions");
+    assert_eq!(cmp.views.len(), 2);
+    assert!(cmp.views[0].rms_error > 0.0, "Inspect view must detect curvature change between Rev 1 and Rev 2");
+    assert!(cmp.views[1].rms_error > 0.0, "Zebra view must detect curvature change between Rev 1 and Rev 2");
+    assert!(!cmp.sheet_png.is_empty());
+
+    // Also test selective variable-radius rounding (`round_selected_edges`) on a sharp block.
+    let mut m3 = Model::new(ModelOpts { alloc: heap(), .. });
+    let blk = m3.graph().cuboid(BoxOpts { size: mm3(40.0, 40.0, 40.0), .. }).expect("blk");
+    let sel_rounded = round_selected_edges(
+        m3.graph(),
+        blk,
+        SelectedRoundOpts {
+            profile: RadiusProfile::Constant(Length::mm(5.0)),
+            select: EdgeSelect::Box { lo: mm3(10.0, 10.0, -25.0), hi: mm3(25.0, 25.0, 25.0), fade: Length::mm(3.0) },
+            step: Length::mm(2.0),
+            scratch: heap(),
+            ..
+        },
+    )
+    .expect("round_selected_edges");
+    let t_sel = compile(m3.graph_ref(), sel_rounded.id(), blaze_cad_field::CompileOpts { alloc: heap(), .. }).expect("t_sel");
+    let mut sc = Scratch::new(heap());
+    // Selected corner (+20, +20, 0) is rounded inward (outside solid, f > 0).
+    assert!(eval_point(&t_sel, Vec3::new(0.020, 0.020, 0.0), &mut sc) > 0.0005);
+    // Unselected opposite corner (-20, -20, 0) stays sharp (f ≈ 0)!
+    assert!(eval_point(&t_sel, Vec3::new(-0.020, -0.020, 0.0), &mut sc).abs() < 1e-4);
+}

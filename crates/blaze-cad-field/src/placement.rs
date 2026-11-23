@@ -101,6 +101,13 @@ impl Placement {
         Some(Placement::from_linear(&m, [snap_nm(origin.x), snap_nm(origin.y), snap_nm(origin.z)]))
     }
 
+    /// The frame whose local axes are the orthonormal triple `(x, y, z)` and whose origin is
+    /// `origin` (metres), snapped to the grid.
+    pub(crate) fn from_axes(x: Vec3, y: Vec3, z: Vec3, origin: Vec3) -> Placement {
+        let m = Mat3::new([[x.x, y.x, z.x], [x.y, y.y, z.y], [x.z, y.z, z.z]]);
+        Placement::from_linear(&m, [snap_nm(origin.x), snap_nm(origin.y), snap_nm(origin.z)])
+    }
+
     /// This placement with its shift multiplied by `factor` and rounded to the nanometre: what
     /// a placement becomes when hoisted above a uniform scale by `factor` (the only rounding a
     /// hoist does, at most half a nanometre per axis).

@@ -32,9 +32,12 @@ pub mod collider;
 pub mod detail;
 pub mod fabric;
 pub mod gltf_io;
+pub mod grain;
+pub mod inspect;
 pub mod ipc;
 pub mod mesh2d;
 pub mod pattern;
+pub mod pose_sweep;
 pub mod preview;
 pub mod psd;
 pub mod remesh;
@@ -53,12 +56,17 @@ pub use cad_gear::{
     build_collar_clasp_dual_tapes, build_collar_clasp_tape, build_collar_clasp_tape_at,
 };
 pub use collider::{ContactQuery, MeshCollider, UnifiedCollider};
-pub use detail::GarmentMesh;
+pub use detail::{GarmentMesh, PanelKind, PanelMeta};
 pub use fabric::Fabric;
 pub use gltf_io::{
-    GltfIoError, JointDef, LoadedGlb, MorphTarget, read_glb_skeleton_mesh, write_skinned_glb,
-    write_skinned_glb_with_morphs,
+    GltfIoError, JointDef, LoadedGlb, LoadedPanelEntry, LoadedPanelMap, MorphTarget, read_glb_panel_metadata,
+    read_glb_skeleton_mesh, write_skinned_glb, write_skinned_glb_with_morphs,
 };
+pub use grain::{
+    FabricGrain, GrainPlant, KneeGatherOpts, PanelStrainSummary, StrainReport, TriangleStrain, measure_cloth_strain,
+    measure_cloth_strain_planted, relax_compression_zones, set_garment_texture_uv_transform,
+};
+pub use inspect::{PanelClickReport, PanelHit, inspect_garment_ray};
 pub use ipc::{IpcOpts, IpcStats, barrier_energy, barrier_grad, barrier_hess, project_ipc_barriers};
 pub use mesh2d::{
     ClothMesh, InternalStitch, Mesh2DError, PanelSlice, build_cloth_mesh, recompute_normals, sample_panel_frame,
@@ -66,6 +74,10 @@ pub use mesh2d::{
 pub use pattern::{
     Curve2D, ElasticSpec, HardwareKind, HardwareMount, InternalSeamSpec, PanelSpec, PatternSet, PinSpec,
     SeamEaseFinding, SeamSpec, Side, SubEdge, SurfacePatchSpec, Wrap3D, export_pattern_svg, seam_ease_check,
+};
+pub use pose_sweep::{
+    DEFAULT_SWEEP_MOTIONS, JointRot, MotionSweepSummary, PoseSweepHit, PoseSweepOpts, PoseSweepPlant, PoseSweepReport,
+    SweepFailureKind, SweepMotion, pose_body_at, pose_body_with_rots, pose_sweep_check, pose_sweep_check_planted,
 };
 pub use preview::{PreviewError, StudioAngle, render_studio_preview_png};
 pub use psd::{
