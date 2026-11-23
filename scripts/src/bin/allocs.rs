@@ -109,9 +109,12 @@ use blaze_script::{
     finding::{self, Finding},
     git,
     input::{self, Fields, Input, InputError},
-    read_text,
+    ratchet::{
+        Hit, added_lines, comment_end, crate_of, ident_len, item_end, module_files, quote_end, rust_files, string_end, test_path,
+        word_end,
+    },
+    read_text, read_text_lossy,
     regex::Regex,
-    universal_newlines,
 };
 
 const SCRIPT: &str = "allocs";
@@ -121,10 +124,6 @@ const LIST: &str = "tools/ratchets/alloc-sites.txt";
 const TAG: &str = "alloc";
 /// The global heap's name where it is used (`Vec::new_in(Global)`).
 const GLOBAL: &str = "Global";
-const TEST_DIRS: [&str; 2] = ["tests", "benches"];
-const TEST_FILES: [&str; 2] = ["tests.rs", "test.rs"];
-/// The files whose out-of-line modules are beside them, not in a directory named for them.
-const ROOT_FILES: [&str; 4] = ["lib.rs", "main.rs", "mod.rs", "build.rs"];
 /// What every message about a crate over its row ends with.
 const RULE: &str = "AGENTS.md bump-allocate: don't allocate where a borrow, a fixed buffer or the caller's buffer does; \
                     where an allocation is needed, allocate by lifetime and name the allocator (`Vec::new_in(frame)`, or \
@@ -233,19 +232,11 @@ impl Kind {
 /// A crate's counts, by [`Kind::column`].
 type Row = [usize; 4];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Site {
-    /// Relative to the root.
-    path: String,
-    line: usize,
-    kind: Kind,
-}
-
 /// The counts of `sites`, by kind.
-fn tally(sites: &[Site]) -> Row {
+fn tally(sites: &[Hit<Kind>]) -> Row {
     let mut row = [0; 4];
     for it in sites {
-        row[it.kind.column()] += 1;
+        row[it.what.column()] += 1;
     }
     row
 }
@@ -349,42 +340,6 @@ fn scan_file(p: &Patterns, text: &str) -> Scanned {
     out
 }
 
-/// The byte after the `}` or `;` that ends the item starting at byte `from` of `text`: the
-/// first `;` outside brackets, or the `}` that closes its first brace; `None` when a closing
-/// bracket comes first (the item is part of a larger one) or the text ends. Comments, strings
-/// (raw and byte strings too) and character literals are skipped, so a brace in them counts not.
-fn item_end(text: &str, from: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut depth: usize = 0;
-    let mut at = from;
-    // Bounded: every turn moves `at` forward, to the end of the text at most.
-    while at < bytes.len() {
-        let byte = bytes[at];
-        let next = bytes.get(at + 1).copied();
-        at = match byte {
-            b'/' if next == Some(b'/') => text[at..].find('\n').map_or(bytes.len(), |n| at + n),
-            b'/' if next == Some(b'*') => comment_end(bytes, at),
-            b'"' => string_end(bytes, at + 1),
-            b'\'' => quote_end(text, at),
-            b'{' | b'(' | b'[' => {
-                depth += 1;
-                at + 1
-            }
-            b'}' | b')' | b']' => {
-                depth = depth.checked_sub(1)?;
-                if byte == b'}' && depth == 0 {
-                    return Some(at + 1);
-                }
-                at + 1
-            }
-            b';' if depth == 0 => return Some(at + 1),
-            b'_' | b'a'..=b'z' | b'A'..=b'Z' => word_end(text, at),
-            _ => at + 1,
-        };
-    }
-    None
-}
-
 /// The lines (from 1, ascending, each once) whose code has the word `Global`: comments, strings
 /// (raw and byte strings too) and character literals are skipped as [`item_end`] skips them, a
 /// word is a whole identifier (`MyGlobal` and `Global2` are not it), and a `use` item, from the
@@ -426,7 +381,7 @@ fn global_lines(text: &str) -> Vec<usize> {
                 end
             }
             // A number's digits and suffix (`1u8`, `0x1F`): never the start of a word.
-            b'0'..=b'9' => at + bytes[at..].iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count(),
+            b'0'..=b'9' => at + ident_len(&bytes[at..]),
             _ => at + 1,
         };
     }
@@ -478,7 +433,7 @@ fn signature_lines<A: Allocator>(text: &str, out: &mut Vec<usize, A>) {
                     "fn" if blocks.last() != Some(&true) => {
                         let rest = text[end..].trim_start();
                         let rest = rest.strip_prefix("r#").unwrap_or(rest);
-                        let len = rest.bytes().take_while(|b| b.is_ascii_alphanumeric() || *b == b'_').count();
+                        let len = ident_len(rest.as_bytes());
                         let name = &rest[..len];
                         let named = name.bytes().next().is_some_and(|b| !b.is_ascii_digit());
                         if named
@@ -496,7 +451,7 @@ fn signature_lines<A: Allocator>(text: &str, out: &mut Vec<usize, A>) {
                 end
             }
             // A number's digits and suffix (`1u8`, `0x1F`): never the start of a word.
-            b'0'..=b'9' => at + bytes[at..].iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count(),
+            b'0'..=b'9' => at + ident_len(&bytes[at..]),
             _ => at + 1,
         };
     }
@@ -567,7 +522,7 @@ fn fixes_allocator(signature: &str) -> bool {
                 }
                 end
             }
-            b'0'..=b'9' => at + bytes[at..].iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count(),
+            b'0'..=b'9' => at + ident_len(&bytes[at..]),
             _ => at + 1,
         };
     }
@@ -603,149 +558,8 @@ fn type_args(text: &str) -> Option<(usize, &str)> {
     None
 }
 
-/// The byte after the block comment that opens at `from`, comments nested in it included.
-fn comment_end(bytes: &[u8], from: usize) -> usize {
-    let mut depth: usize = 0;
-    let mut at = from;
-    while at + 1 < bytes.len() {
-        match (bytes[at], bytes[at + 1]) {
-            (b'/', b'*') => {
-                depth += 1;
-                at += 2;
-            }
-            (b'*', b'/') => {
-                depth = depth.saturating_sub(1);
-                at += 2;
-                if depth == 0 {
-                    return at;
-                }
-            }
-            _ => at += 1,
-        }
-    }
-    bytes.len()
-}
-
-/// The byte after the `"` that closes a string whose text starts at `from`.
-fn string_end(bytes: &[u8], from: usize) -> usize {
-    let mut at = from;
-    while at < bytes.len() {
-        match bytes[at] {
-            b'\\' => at += 2,
-            b'"' => return at + 1,
-            _ => at += 1,
-        }
-    }
-    bytes.len()
-}
-
-/// The byte after the character literal at the `'` at `at`, or after the `'` alone when it opens
-/// a lifetime or a label.
-fn quote_end(text: &str, at: usize) -> usize {
-    let rest = &text[at + 1..];
-    if rest.starts_with('\\') {
-        // An escape (`'\n'`, `'\''`, `'\u{7f}'`): closed by the next quote after the escaped one.
-        return rest.get(2..).and_then(|it| it.find('\'')).map_or(text.len(), |n| at + 3 + n + 1);
-    }
-    match rest.chars().next() {
-        Some(c) if rest[c.len_utf8()..].starts_with('\'') => at + 1 + c.len_utf8() + 1,
-        _ => at + 1,
-    }
-}
-
-/// The byte after the word at `at`, or after the literal it prefixes (`r#"..."#`, `b"..."`,
-/// `br"..."`, `c"..."`, `b'x'`).
-fn word_end(text: &str, at: usize) -> usize {
-    let bytes = text.as_bytes();
-    let end = at + bytes[at..].iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count();
-    match (&text[at..end], bytes.get(end).copied()) {
-        ("r" | "br" | "cr", Some(b'#' | b'"')) => raw_end(bytes, end),
-        ("b" | "c", Some(b'"')) => string_end(bytes, end + 1),
-        ("b", Some(b'\'')) => quote_end(text, end),
-        _ => end,
-    }
-}
-
-/// The byte after the raw string whose `#`s or `"` start at `from`; for a raw identifier
-/// (`r#type`), the byte after its `#`s.
-fn raw_end(bytes: &[u8], from: usize) -> usize {
-    let hashes = bytes[from..].iter().take_while(|b| **b == b'#').count();
-    let open = from + hashes;
-    if bytes.get(open) != Some(&b'"') {
-        return open;
-    }
-    let mut at = open + 1;
-    while at < bytes.len() {
-        if bytes[at] == b'"' && bytes[at + 1..].iter().take(hashes).filter(|b| **b == b'#').count() == hashes {
-            return at + 1 + hashes;
-        }
-        at += 1;
-    }
-    bytes.len()
-}
-
-fn test_path(parts: &[String]) -> bool {
-    let (name, dirs) = parts.split_last().map_or(("", &[][..]), |(name, dirs)| (name.as_str(), dirs));
-    dirs.iter().any(|part| TEST_DIRS.contains(&part.as_str())) || TEST_FILES.contains(&name)
-}
-
-/// The two files the module `name`, declared out of line in the file `parts`, can be.
-fn module_files(parts: &[String], name: &str) -> [String; 2] {
-    let Some((file, dirs)) = parts.split_last() else { return [String::new(), String::new()] };
-    let mut base: Vec<&str> = dirs.iter().map(String::as_str).collect();
-    let root = ROOT_FILES.contains(&file.as_str()) || dirs.last().is_some_and(|it| it == "bin");
-    if !root {
-        base.push(file.strip_suffix(".rs").unwrap_or(file));
-    }
-    let base = base.join("/");
-    [format!("{base}/{name}.rs"), format!("{base}/{name}/mod.rs")]
-}
-
-/// `(root / "crates").rglob("*.rs")`, sorted part by part, each as its parts from the root, none
-/// under a directory named `target`. Directories that are links are not entered.
-fn rust_files(root: &Path) -> Vec<Vec<String>> {
-    let mut out = Vec::new();
-    let mut todo = vec![vec!["crates".to_owned()]];
-    // Bounded: each directory is listed once, and links to directories are not followed.
-    while let Some(dir) = todo.pop() {
-        let full: PathBuf = dir.iter().fold(root.to_path_buf(), |path, part| path.join(part));
-        let Ok(listed) = std::fs::read_dir(&full) else { continue };
-        for entry in listed.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let mut parts = dir.clone();
-            parts.push(name.clone());
-            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-            if is_dir && name != "target" {
-                todo.push(parts);
-            } else if !is_dir && name.ends_with(".rs") {
-                out.push(parts);
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
-/// The crate of the file `parts`: the nearest directory above it, under crates/, with a
-/// Cargo.toml, by its path under crates/; the first directory under crates/ when none has one.
-fn crate_of(root: &Path, parts: &[String], manifests: &mut BTreeMap<Vec<String>, bool>) -> String {
-    for end in (2..parts.len()).rev() {
-        let dir = &parts[..end];
-        let has = *manifests.entry(dir.to_vec()).or_insert_with(|| {
-            dir.iter().fold(root.to_path_buf(), |path, part| path.join(part)).join("Cargo.toml").is_file()
-        });
-        if has {
-            return parts[1..end].join("/");
-        }
-    }
-    match parts {
-        [_, first, _, ..] => first.clone(),
-        _ => "crates".to_owned(),
-    }
-}
-
 /// Each crate's sites outside test code, in file and line order; a crate with none is absent.
-fn count(p: &Patterns, root: &Path) -> BTreeMap<String, Vec<Site>> {
+fn count(p: &Patterns, root: &Path) -> BTreeMap<String, Vec<Hit<Kind>>> {
     let files = rust_files(root);
     let known: BTreeSet<String> = files.iter().map(|it| it.join("/")).collect();
     let mut scanned: Vec<(Vec<String>, Scanned)> = Vec::new();
@@ -754,9 +568,7 @@ fn count(p: &Patterns, root: &Path) -> BTreeMap<String, Vec<Site>> {
     for parts in files {
         let path = parts.join("/");
         let full = parts.iter().fold(root.to_path_buf(), |path, part| path.join(part));
-        // `read_text(errors="replace")`: what is not UTF-8 becomes U+FFFD.
-        let Ok(bytes) = std::fs::read(&full) else { fail(SCRIPT, &format!("{} could not be read", full.display())) };
-        let text = universal_newlines(String::from_utf8_lossy(&bytes).into_owned());
+        let Ok(text) = read_text_lossy(&full) else { fail(SCRIPT, &format!("{} could not be read", full.display())) };
         let found = scan_file(p, &text);
         if test_path(&parts) || found.test {
             test.insert(path.clone());
@@ -785,7 +597,7 @@ fn count(p: &Patterns, root: &Path) -> BTreeMap<String, Vec<Site>> {
         }
     }
     let mut manifests: BTreeMap<Vec<String>, bool> = BTreeMap::new();
-    let mut out: BTreeMap<String, Vec<Site>> = BTreeMap::new();
+    let mut out: BTreeMap<String, Vec<Hit<Kind>>> = BTreeMap::new();
     for (parts, found) in scanned {
         let path = parts.join("/");
         if found.sites.is_empty() || test.contains(&path) {
@@ -794,14 +606,14 @@ fn count(p: &Patterns, root: &Path) -> BTreeMap<String, Vec<Site>> {
         let krate = crate_of(root, &parts, &mut manifests);
         out.entry(krate)
             .or_default()
-            .extend(found.sites.iter().map(|(line, kind)| Site { path: path.clone(), line: *line, kind: *kind }));
+            .extend(found.sites.iter().map(|(line, what)| Hit { path: path.clone(), line: *line, what: *what }));
     }
     out
 }
 
 /// The list as `write` writes it: the header, then `<crate><TAB><comments><TAB><expects><TAB>
 /// <global><TAB><signatures>` for each crate with a site, sorted.
-fn render(counts: &BTreeMap<String, Vec<Site>>) -> String {
+fn render(counts: &BTreeMap<String, Vec<Hit<Kind>>>) -> String {
     let mut out = HEADER.to_owned();
     for (krate, sites) in counts.iter().filter(|(_, sites)| !sites.is_empty()) {
         let [comments, expects, global, signatures] = tally(sites);
@@ -865,42 +677,6 @@ fn previous_layout(text: &str) -> bool {
     first.is_some_and(|line| matches!(line.split('\t').count(), 2 | 4))
 }
 
-/// The lines each file has that `base` did not, from `git diff --unified=0`'s hunks: by path
-/// from the root, the line numbers in the tree.
-fn added_lines(diff: &str) -> Result<BTreeMap<String, BTreeSet<usize>>, String> {
-    let mut out: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
-    let mut file: Option<String> = None;
-    // The lines of the hunk being read, which are text, never a header (`+++ x` is a line `++ x`).
-    let mut skip: usize = 0;
-    for line in diff.split('\n') {
-        if skip > 0 {
-            skip -= 1;
-            continue;
-        }
-        if let Some(path) = line.strip_prefix("+++ ") {
-            // `/dev/null` for a file deleted: no line of it is in the tree.
-            file = path.strip_prefix("b/").map(str::to_owned);
-            continue;
-        }
-        let Some(hunk) = line.strip_prefix("@@ ") else { continue };
-        // `@@ -a,b +c,d @@`: `b` lines from `a` were the base's, `d` from `c` are the tree's
-        // (one when `,b` or `,d` is left out).
-        let range = |sign: char| -> Option<(usize, usize)> {
-            let it = hunk.split(' ').find_map(|it| it.strip_prefix(sign))?;
-            let (from, len) = it.split_once(',').unwrap_or((it, "1"));
-            Some((from.parse().ok()?, len.parse().ok()?))
-        };
-        let (Some((_, removed)), Some((from, len))) = (range('-'), range('+')) else {
-            return Err(format!("git diff's hunk {line:?} is not `@@ -<line>[,<n>] +<line>[,<n>] @@`"));
-        };
-        skip = removed + len;
-        if let Some(path) = &file {
-            out.entry(path.clone()).or_default().extend(from..from + len);
-        }
-    }
-    Ok(out)
-}
-
 /// What `base` says: its rows (none when it has no list, before the ratchet began), and the lines
 /// added since it under crates/.
 fn at_base(root: &Path, base: &str) -> Result<(Option<BTreeMap<String, Row>>, BTreeMap<String, BTreeSet<usize>>), String> {
@@ -920,13 +696,13 @@ fn at_base(root: &Path, base: &str) -> Result<(Option<BTreeMap<String, Row>>, BT
         if previous_layout(&text) { None } else { Some(parse_rows(&text).map_err(|e| format!("at {base}: {e}"))?) }
     };
     let diff = git(root, &["-C", dir, "diff", "--no-color", "--no-ext-diff", "--no-renames", "--unified=0", base, "--", "crates"])?;
-    Ok((rows, added_lines(&diff)?))
+    Ok((rows, added_lines(&diff).map_err(|e| e.to_string())?))
 }
 
 /// What is wrong: `counts` the tree's sites by crate, `rows` the list's, `base_rows` the base's
 /// list (when it had one), `added` the lines added since the base (when one was given).
 fn problems(
-    counts: &BTreeMap<String, Vec<Site>>,
+    counts: &BTreeMap<String, Vec<Hit<Kind>>>,
     rows: &BTreeMap<String, Row>,
     base_rows: Option<&BTreeMap<String, Row>>,
     added: Option<&BTreeMap<String, BTreeSet<usize>>>,
@@ -956,7 +732,7 @@ fn problems(
                     Some(added) => {
                         let new: Vec<String> = sites
                             .iter()
-                            .filter(|it| it.kind == kind && added.get(&it.path).is_some_and(|lines| lines.contains(&it.line)))
+                            .filter(|it| it.what == kind && added.get(&it.path).is_some_and(|lines| lines.contains(&it.line)))
                             .map(|it| format!("{}:{}", it.path, it.line))
                             .collect();
                         if new.is_empty() {
@@ -1009,7 +785,7 @@ fn problems(
 }
 
 /// The tree's counts, by kind.
-fn total(counts: &BTreeMap<String, Vec<Site>>) -> Row {
+fn total(counts: &BTreeMap<String, Vec<Hit<Kind>>>) -> Row {
     let mut row = [0; 4];
     for sites in counts.values() {
         for (sum, n) in row.iter_mut().zip(tally(sites)) {
@@ -1020,7 +796,7 @@ fn total(counts: &BTreeMap<String, Vec<Site>>) -> Row {
 }
 
 /// `counts`' totals, for a line of output.
-fn summary(counts: &BTreeMap<String, Vec<Site>>) -> String {
+fn summary(counts: &BTreeMap<String, Vec<Hit<Kind>>>) -> String {
     let [comments, expects, global, signatures] = total(counts);
     format!(
         "{comments} `// alloc:` lines left to convert, {expects} `allow`/`expect`s of the lint, {global} lines naming `Global` \
@@ -1039,7 +815,7 @@ fn main_with(p: &Patterns, it: &Args) {
     let counts = count(p, &root);
     if it.command == "findings" {
         let found = counts.iter().flat_map(|(krate, sites)| {
-            sites.iter().map(|it| Finding { krate: krate.clone(), file: it.path.clone(), line: it.line, kind: it.kind.name(), detail: None })
+            sites.iter().map(|it| Finding { krate: krate.clone(), file: it.path.clone(), line: it.line, kind: it.what.name(), detail: None })
         });
         finding::print(SCRIPT, &KINDS.map(Kind::finding), found.collect());
         return;
@@ -1087,7 +863,7 @@ fn expect(holds: bool, what: &str) {
 }
 
 /// The sites of the counted crates, as `crate: path:line, ...`, for a selftest's message.
-fn shown(counts: &BTreeMap<String, Vec<Site>>) -> String {
+fn shown(counts: &BTreeMap<String, Vec<Hit<Kind>>>) -> String {
     let crates: Vec<String> = counts
         .iter()
         .map(|(krate, sites)| {
@@ -1099,8 +875,8 @@ fn shown(counts: &BTreeMap<String, Vec<Site>>) -> String {
 }
 
 /// One crate's sites, for a selftest's expectation.
-fn sites_of(path_lines: &[(&str, usize, Kind)]) -> Vec<Site> {
-    path_lines.iter().map(|(path, line, kind)| Site { path: (*path).to_owned(), line: *line, kind: *kind }).collect()
+fn sites_of(path_lines: &[(&str, usize, Kind)]) -> Vec<Hit<Kind>> {
+    path_lines.iter().map(|(path, line, what)| Hit { path: (*path).to_owned(), line: *line, what: *what }).collect()
 }
 
 fn selftest(p: &Patterns) {
@@ -1302,7 +1078,7 @@ fn selftest(p: &Patterns) {
     let diff = "diff --git a/crates/a/src/lib.rs b/crates/a/src/lib.rs\n--- a/crates/a/src/lib.rs\n+++ b/crates/a/src/lib.rs\n\
         @@ -2,0 +3 @@ fn f() {\n+++ b/not/a/file\n@@ -9 +10,2 @@\n-old\n+y\n+z\n@@ -20 +21,0 @@\n-w\n\
         diff --git a/crates/a/src/gone.rs b/crates/a/src/gone.rs\n--- a/crates/a/src/gone.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-v\n";
-    let lines = added_lines(diff).unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &e));
+    let lines = added_lines(diff).unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &e.to_string()));
     expect(
         lines == BTreeMap::from([("crates/a/src/lib.rs".to_owned(), BTreeSet::from([3, 10, 11]))]),
         &format!("the lines added: {lines:?}"),
@@ -1429,8 +1205,8 @@ fn signatures_selftest(p: &Patterns) {
     // The ratchet: a rise over the row is refused, with the new site named from the base's diff.
     let path = "crates/s/src/lib.rs";
     let found = scan_file(p, SIGNATURES);
-    let sites: Vec<Site> =
-        found.sites.iter().map(|(line, kind)| Site { path: path.to_owned(), line: *line, kind: *kind }).collect();
+    let sites: Vec<Hit<Kind>> =
+        found.sites.iter().map(|(line, what)| Hit { path: path.to_owned(), line: *line, what: *what }).collect();
     let counts = BTreeMap::from([("s".to_owned(), sites)]);
     let row = tally(&counts["s"]);
     expect(row == [0, 0, 1, 5], &format!("crate `s`'s row: {row:?}"));
@@ -1521,8 +1297,8 @@ mod tests {
     #[test]
     fn a_rise_in_signatures_is_refused_with_its_site() {
         let sites = [
-            Site { path: "crates/s/src/lib.rs".to_owned(), line: 3, kind: Kind::Signature },
-            Site { path: "crates/s/src/lib.rs".to_owned(), line: 9, kind: Kind::Signature },
+            Hit { path: "crates/s/src/lib.rs".to_owned(), line: 3, what: Kind::Signature },
+            Hit { path: "crates/s/src/lib.rs".to_owned(), line: 9, what: Kind::Signature },
         ];
         let counts = BTreeMap::from([("s".to_owned(), sites.to_vec())]);
         let at_row = BTreeMap::from([("s".to_owned(), [0, 0, 0, 2])]);

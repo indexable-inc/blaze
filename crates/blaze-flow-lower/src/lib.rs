@@ -1284,7 +1284,7 @@ struct Target {
 /// Inline work stack for type walks (`npos_positions`, `positions_all_opaque`, `is_copy`,
 /// `needs_drop`): zero heap allocation up to depth 16, spilling to an explicit-allocator `Vec`
 /// only past 16.
-struct TyStack<A: Allocator> {
+pub struct TyStack<A: Allocator> {
     inline: [PTy; 16],
     len: usize,
     spill: Vec<PTy, A>,
@@ -1292,14 +1292,14 @@ struct TyStack<A: Allocator> {
 
 impl<A: Allocator> TyStack<A> {
     #[inline]
-    fn new(root: PTy, alloc: A) -> Self {
+    pub fn new(root: PTy, alloc: A) -> Self {
         let mut inline = [PTy(0); 16];
         inline[0] = root;
         Self { inline, len: 1, spill: Vec::new_in(alloc) }
     }
 
     #[inline]
-    fn push(&mut self, t: PTy) {
+    pub fn push(&mut self, t: PTy) {
         if self.spill.is_empty() && self.len < self.inline.len() {
             self.inline[self.len] = t;
             self.len += 1;
@@ -1309,7 +1309,7 @@ impl<A: Allocator> TyStack<A> {
     }
 
     #[inline]
-    fn extend_from_slice(&mut self, slice: &[PTy]) {
+    pub fn extend_from_slice(&mut self, slice: &[PTy]) {
         if self.spill.is_empty() && self.len + slice.len() <= self.inline.len() {
             self.inline[self.len..self.len + slice.len()].copy_from_slice(slice);
             self.len += slice.len();
@@ -1319,7 +1319,7 @@ impl<A: Allocator> TyStack<A> {
     }
 
     #[inline]
-    fn pop(&mut self) -> Option<PTy> {
+    pub fn pop(&mut self) -> Option<PTy> {
         if let Some(t) = self.spill.pop() {
             return Some(t);
         }
@@ -1331,14 +1331,14 @@ impl<A: Allocator> TyStack<A> {
     }
 }
 
-/// Builds a dense O(1) first-match index table (`u32::MAX` sentinel) from a column of `ExprId`s.
-fn index_expr_rows<A: Allocator>(col: &[ExprId], n_exprs: usize, alloc: A) -> Vec<u32, A> {
+/// Builds a dense O(1) first-match index table (`u32::MAX` sentinel) from a column of row ids.
+pub fn index_rows<T: Copy, A: Allocator>(col: &[T], len: usize, ix: impl Fn(T) -> usize, alloc: A) -> Vec<u32, A> {
     if col.is_empty() {
         return Vec::new_in(alloc);
     }
-    let mut table = Vec::from_elem_in(u32::MAX, n_exprs, alloc);
-    for (i, &e) in col.iter().enumerate() {
-        if let Some(slot) = table.get_mut(e.ix())
+    let mut table = Vec::from_elem_in(u32::MAX, len, alloc);
+    for (i, &k) in col.iter().enumerate() {
+        if let Some(slot) = table.get_mut(ix(k))
             && *slot == u32::MAX
         {
             *slot = i as u32;
@@ -1347,20 +1347,169 @@ fn index_expr_rows<A: Allocator>(col: &[ExprId], n_exprs: usize, alloc: A) -> Ve
     table
 }
 
-/// Builds a dense O(1) first-match index table (`u32::MAX` sentinel) from a column of `PatId`s.
-fn index_pat_rows<A: Allocator>(col: &[PatId], n_pats: usize, alloc: A) -> Vec<u32, A> {
-    if col.is_empty() {
-        return Vec::new_in(alloc);
-    }
-    let mut table = Vec::from_elem_in(u32::MAX, n_pats, alloc);
-    for (i, &p) in col.iter().enumerate() {
-        if let Some(slot) = table.get_mut(p.ix())
-            && *slot == u32::MAX
-        {
-            *slot = i as u32;
+/// Why a type walk in [`pty_needs_drop`] stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropWalkError {
+    /// A type id, list id, or closure capture record was out of range.
+    Malformed,
+    /// An ADT's [`AdtFacts`] were missing from [`Facts::adt`].
+    UnknownAdt,
+    /// The type walk passed `MOST_POSITIONS`.
+    Bound,
+}
+
+/// How [`pty_needs_drop`] treats `PNode::Closure` nodes.
+#[derive(Clone, Copy)]
+pub enum ClosureDrop<'a, 'c> {
+    /// Closures do not need drop (flow lowering).
+    Ignore,
+    /// A closure of `owner` needs drop if any of its by-value captures in `ck` does; a
+    /// closure of another body conservatively needs drop (body lowering).
+    ByValueCaptures { owner: ItemKey, ck: &'a Checked<'c> },
+}
+
+/// Memo tables, facts, and allocator for [`pty_needs_drop`].
+pub struct DropWalk<'a, 'c, F: Facts, A: Allocator + Clone> {
+    pub facts: &'a F,
+    pub copy_memo: &'a [core::cell::Cell<u8>],
+    pub drop_memo: &'a [core::cell::Cell<u8>],
+    pub closures: ClosureDrop<'a, 'c>,
+    pub alloc: &'a A,
+}
+
+/// Whether dropping a value of `root` may run code, memoized in `walk.drop_memo`
+/// (`0` = unknown, `1` = false, `2` = true).
+pub fn pty_needs_drop<'a, 'c, F: Facts, A: Allocator + Clone, E>(
+    walk: DropWalk<'a, 'c, F, A>,
+    root: PTy,
+    is_copy: impl FnOnce() -> Result<bool, E>,
+    node: impl Fn(PTy) -> Option<PNode>,
+    list: impl Fn(List) -> Option<&'a [PTy]>,
+    on_err: impl Fn(DropWalkError) -> E,
+) -> Result<bool, E> {
+    let root_ix = root.0 as usize;
+    if let Some(cell) = walk.drop_memo.get(root_ix) {
+        let v = cell.get();
+        if v != 0 {
+            return Ok(v == 2);
         }
     }
-    table
+    if is_copy()? {
+        if let Some(cell) = walk.drop_memo.get(root_ix) {
+            cell.set(1);
+        }
+        return Ok(false);
+    }
+    let quick = match node(root).ok_or_else(|| on_err(DropWalkError::Malformed))? {
+        PNode::Tuple(l) if l.len == 0 => Some(false),
+        PNode::Tuple(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
+        PNode::Param(_)
+        | PNode::Alias { .. }
+        | PNode::Opaque(..)
+        | PNode::Dynamic(_)
+        | PNode::Future(..)
+        | PNode::Coroutine { .. } => Some(true),
+        PNode::Closure { owner, .. } => match walk.closures {
+            ClosureDrop::Ignore => Some(false),
+            ClosureDrop::ByValueCaptures { owner: body_owner, .. } => {
+                if owner != body_owner {
+                    Some(true)
+                } else {
+                    None
+                }
+            }
+        },
+        _ => Some(false),
+    };
+    if let Some(ans) = quick {
+        if let Some(cell) = walk.drop_memo.get(root_ix) {
+            cell.set(if ans { 2 } else { 1 });
+        }
+        return Ok(ans);
+    }
+    let mut stack = TyStack::new(root, walk.alloc.clone());
+    let mut steps = 0u32;
+    while let Some(t) = stack.pop() {
+        steps += 1;
+        if steps > MOST_POSITIONS {
+            return Err(on_err(DropWalkError::Bound));
+        }
+        let t_ix = t.0 as usize;
+        if let Some(cell) = walk.drop_memo.get(t_ix) {
+            let v = cell.get();
+            if v == 2 {
+                if let Some(rc) = walk.drop_memo.get(root_ix) {
+                    rc.set(2);
+                }
+                return Ok(true);
+            }
+            if v == 1
+                && walk.copy_memo.get(t_ix).is_some_and(|c| c.get() == 1)
+            {
+                continue;
+            }
+        }
+        match node(t).ok_or_else(|| on_err(DropWalkError::Malformed))? {
+            PNode::Tuple(l) => {
+                let s = list(l).ok_or_else(|| on_err(DropWalkError::Malformed))?;
+                stack.extend_from_slice(s);
+            }
+            PNode::Array(i, _) | PNode::Pat(i, _) => stack.push(i),
+            PNode::Adt(k, l) => {
+                let f = walk.facts.adt(k).ok_or_else(|| on_err(DropWalkError::UnknownAdt))?;
+                if f.needs_drop {
+                    if let Some(rc) = walk.drop_memo.get(root_ix) {
+                        rc.set(2);
+                    }
+                    return Ok(true);
+                }
+                let s = list(l).ok_or_else(|| on_err(DropWalkError::Malformed))?;
+                stack.extend_from_slice(s);
+            }
+            // A future holds its captures and its saved values: dropping it may run code.
+            PNode::Param(_)
+            | PNode::Alias { .. }
+            | PNode::Opaque(..)
+            | PNode::Dynamic(_)
+            | PNode::Future(..)
+            | PNode::Coroutine { .. } => {
+                if let Some(rc) = walk.drop_memo.get(root_ix) {
+                    rc.set(2);
+                }
+                return Ok(true);
+            }
+            // A closure of this body holds its by-value captures; one of another body is
+            // not known here, and its `Drop` row stays for elaboration to judge.
+            PNode::Closure { owner, ordinal, .. } => {
+                if let ClosureDrop::ByValueCaptures { owner: body_owner, ck } = walk.closures {
+                    if owner != body_owner {
+                        if let Some(rc) = walk.drop_memo.get(root_ix) {
+                            rc.set(2);
+                        }
+                        return Ok(true);
+                    }
+                    let Some(&c) = ck.closures.column::<0>().get(ordinal as usize) else {
+                        return Err(on_err(DropWalkError::Malformed));
+                    };
+                    // Its by-value environment fields (blaze-typeck env_fields.rs): a whole
+                    // binding's type, or a captured place's (`x.a` by value holds `x.a` only).
+                    for f in ck.env_fields(c) {
+                        if f.how == blaze_typeck::CaptureKind::ByValue {
+                            match f.place_ty(ck) {
+                                Some(ct) => stack.push(ct),
+                                None => return Err(on_err(DropWalkError::Malformed)),
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(rc) = walk.drop_memo.get(root_ix) {
+        rc.set(1);
+    }
+    Ok(false)
 }
 
 /// Builds a CSR index over `ck.captures.column::<0>()` keyed by `ExprId`, preserving exact row order.
@@ -1527,11 +1676,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
         let n_exprs = body.exprs.len();
         let n_pats = body.pats.len();
         let n_tys = tys.len();
-        let expr_def_row = index_expr_rows(ck.expr_defs.column::<0>(), n_exprs, alloc.clone());
-        let pat_def_row = index_pat_rows(ck.pat_defs.column::<0>(), n_pats, alloc.clone());
-        let callee_row = index_expr_rows(ck.callees.column::<0>(), n_exprs, alloc.clone());
-        let field_row = index_expr_rows(ck.fields.column::<0>(), n_exprs, alloc.clone());
-        let closure_ordinal = index_expr_rows(ck.closures.column::<0>(), n_exprs, alloc.clone());
+        let expr_def_row = index_rows(ck.expr_defs.column::<0>(), n_exprs, ExprId::ix, alloc.clone());
+        let pat_def_row = index_rows(ck.pat_defs.column::<0>(), n_pats, PatId::ix, alloc.clone());
+        let callee_row = index_rows(ck.callees.column::<0>(), n_exprs, ExprId::ix, alloc.clone());
+        let field_row = index_rows(ck.fields.column::<0>(), n_exprs, ExprId::ix, alloc.clone());
+        let closure_ordinal = index_rows(ck.closures.column::<0>(), n_exprs, ExprId::ix, alloc.clone());
         let (cap_offsets, cap_rows) = build_capture_csr(ck.captures.column::<0>(), n_exprs, alloc.clone());
         let mut l = Lower {
             body,
@@ -2366,88 +2515,24 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone, R: one_call::CallRule> Lower<'b, 'c
     }
 
     fn needs_drop_pty(&self, root: PTy, e: ExprId) -> Result<bool, Refusal> {
-        if let Some(cell) = self.drop_memo.get(root.0 as usize) {
-            let v = cell.get();
-            if v != 0 {
-                return Ok(v == 2);
-            }
-        }
-        if self.is_copy_pty(root, e)? {
-            if let Some(cell) = self.drop_memo.get(root.0 as usize) {
-                cell.set(1);
-            }
-            return Ok(false);
-        }
-        let quick = match self.node(root, e)? {
-            PNode::Tuple(l) if l.len == 0 => Some(false),
-            PNode::Tuple(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
-            PNode::Param(_)
-            | PNode::Alias { .. }
-            | PNode::Opaque(..)
-            | PNode::Dynamic(_)
-            | PNode::Future(..)
-            | PNode::Coroutine { .. } => Some(true),
-            _ => Some(false),
-        };
-        if let Some(ans) = quick {
-            if let Some(cell) = self.drop_memo.get(root.0 as usize) {
-                cell.set(if ans { 2 } else { 1 });
-            }
-            return Ok(ans);
-        }
-        let mut stack = TyStack::new(root, self.alloc.clone());
-        let mut steps = 0u32;
-        while let Some(t) = stack.pop() {
-            steps += 1;
-            if steps > MOST_POSITIONS {
-                return self.refuse(Form::Bound, e);
-            }
-            if let Some(cell) = self.drop_memo.get(t.0 as usize) {
-                let v = cell.get();
-                if v == 2 {
-                    if let Some(rc) = self.drop_memo.get(root.0 as usize) {
-                        rc.set(2);
-                    }
-                    return Ok(true);
-                }
-                if v == 1
-                    && self.copy_memo.get(t.0 as usize).is_some_and(|c| c.get() == 1)
-                {
-                    continue;
-                }
-            }
-            match self.node(t, e)? {
-                PNode::Tuple(l) => stack.extend_from_slice(self.list(l, e)?),
-                PNode::Array(i, _) | PNode::Pat(i, _) => stack.push(i),
-                PNode::Adt(k, l) => {
-                    if self.adt_facts(k, e)?.needs_drop {
-                        if let Some(rc) = self.drop_memo.get(root.0 as usize) {
-                            rc.set(2);
-                        }
-                        return Ok(true);
-                    }
-                    stack.extend_from_slice(self.list(l, e)?);
-                }
-                PNode::Param(_) | PNode::Alias { .. } | PNode::Opaque(..) | PNode::Dynamic(_) => {
-                    if let Some(rc) = self.drop_memo.get(root.0 as usize) {
-                        rc.set(2);
-                    }
-                    return Ok(true);
-                }
-                // A future holds its captures and its saved values: dropping it may run code.
-                PNode::Future(..) | PNode::Coroutine { .. } => {
-                    if let Some(rc) = self.drop_memo.get(root.0 as usize) {
-                        rc.set(2);
-                    }
-                    return Ok(true);
-                }
-                _ => {}
-            }
-        }
-        if let Some(rc) = self.drop_memo.get(root.0 as usize) {
-            rc.set(1);
-        }
-        Ok(false)
+        pty_needs_drop(
+            DropWalk {
+                facts: self.facts,
+                copy_memo: &self.copy_memo,
+                drop_memo: &self.drop_memo,
+                closures: ClosureDrop::Ignore,
+                alloc: &self.alloc,
+            },
+            root,
+            || self.is_copy_pty(root, e),
+            |t| self.tys.node(t).ok(),
+            |l| self.tys.list(l).ok(),
+            |err| match err {
+                DropWalkError::Malformed => Refusal { form: Form::Malformed, range: range_of(self.body, e) },
+                DropWalkError::UnknownAdt => Refusal { form: Form::UnknownAdt, range: range_of(self.body, e) },
+                DropWalkError::Bound => Refusal { form: Form::Bound, range: range_of(self.body, e) },
+            },
+        )
     }
 
     fn is_unit_or_never(&self, t: PTy, e: ExprId) -> Result<bool, Refusal> {

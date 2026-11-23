@@ -39,7 +39,7 @@ use core::alloc::Allocator;
 use core::cell::Cell;
 
 use blaze_body::{Block, BlockKind, Body, BodyBuilder, BuildError, Local, LocalDecl, LocalKind, Loan, NONE, Place, Span, StmtKind};
-use blaze_flow_lower::Facts;
+use blaze_flow_lower::{ClosureDrop, DropWalk, DropWalkError, Facts, TyStack, index_rows, pty_needs_drop};
 use blaze_own::Vec;
 use blaze_typeck::{
     AdjustKind, BodyView, Checked, Def, Expr, ExprId, IntTy, ItemKey, List, Mutbl, PNode, PTy, PTys, Pat, PatId, Range,
@@ -246,87 +246,6 @@ fn pat_range_of(body: &BodyView<'_>, p: PatId) -> Range {
     body.pat_ranges.get(p.ix()).copied().unwrap_or(Range { start: 0, end: 0 })
 }
 
-/// Inline work stack for type walks (`is_copy`, `needs_drop`): zero heap allocation up to depth 16,
-/// spilling to an explicit-allocator `Vec` only past 16.
-struct TyStack<A: Allocator> {
-    inline: [PTy; 16],
-    len: usize,
-    spill: Vec<PTy, A>,
-}
-
-impl<A: Allocator> TyStack<A> {
-    #[inline]
-    fn new(root: PTy, alloc: A) -> Self {
-        let mut inline = [PTy(0); 16];
-        inline[0] = root;
-        Self { inline, len: 1, spill: Vec::new_in(alloc) }
-    }
-
-    #[inline]
-    fn push(&mut self, t: PTy) {
-        if self.spill.is_empty() && self.len < self.inline.len() {
-            self.inline[self.len] = t;
-            self.len += 1;
-        } else {
-            self.spill.push(t);
-        }
-    }
-
-    #[inline]
-    fn extend_from_slice(&mut self, slice: &[PTy]) {
-        if self.spill.is_empty() && self.len + slice.len() <= self.inline.len() {
-            self.inline[self.len..self.len + slice.len()].copy_from_slice(slice);
-            self.len += slice.len();
-        } else {
-            self.spill.extend_from_slice(slice);
-        }
-    }
-
-    #[inline]
-    fn pop(&mut self) -> Option<PTy> {
-        if let Some(t) = self.spill.pop() {
-            return Some(t);
-        }
-        if self.len > 0 {
-            self.len -= 1;
-            return Some(self.inline[self.len]);
-        }
-        None
-    }
-}
-
-/// Builds a dense O(1) first-match index table (`u32::MAX` sentinel) from a column of `ExprId`s.
-fn index_expr_rows<A: Allocator>(col: &[ExprId], n_exprs: usize, alloc: A) -> Vec<u32, A> {
-    if col.is_empty() {
-        return Vec::new_in(alloc);
-    }
-    let mut table = Vec::from_elem_in(u32::MAX, n_exprs, alloc);
-    for (i, &e) in col.iter().enumerate() {
-        if let Some(slot) = table.get_mut(e.ix())
-            && *slot == u32::MAX
-        {
-            *slot = i as u32;
-        }
-    }
-    table
-}
-
-/// Builds a dense O(1) first-match index table (`u32::MAX` sentinel) from a column of `PatId`s.
-fn index_pat_rows<A: Allocator>(col: &[PatId], n_pats: usize, alloc: A) -> Vec<u32, A> {
-    if col.is_empty() {
-        return Vec::new_in(alloc);
-    }
-    let mut table = Vec::from_elem_in(u32::MAX, n_pats, alloc);
-    for (i, &p) in col.iter().enumerate() {
-        if let Some(slot) = table.get_mut(p.ix())
-            && *slot == u32::MAX
-        {
-            *slot = i as u32;
-        }
-    }
-    table
-}
-
 /// The lowering's state over one body.
 pub(crate) struct Lower<'b, 'v, 'c, F, A: Allocator + Clone> {
     pub(crate) body: &'b BodyView<'v>,
@@ -385,10 +304,10 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Clone> Lower<'b, 'v, 'c, F, A> {
         let n_exprs = body.exprs.len();
         let n_pats = body.pats.len();
         let n_tys = tys.len();
-        let expr_def_row = index_expr_rows(ck.expr_defs.column::<0>(), n_exprs, alloc.clone());
-        let pat_def_row = index_pat_rows(ck.pat_defs.column::<0>(), n_pats, alloc.clone());
-        let callee_row = index_expr_rows(ck.callees.column::<0>(), n_exprs, alloc.clone());
-        let field_row = index_expr_rows(ck.fields.column::<0>(), n_exprs, alloc.clone());
+        let expr_def_row = index_rows(ck.expr_defs.column::<0>(), n_exprs, ExprId::ix, alloc.clone());
+        let pat_def_row = index_rows(ck.pat_defs.column::<0>(), n_pats, PatId::ix, alloc.clone());
+        let callee_row = index_rows(ck.callees.column::<0>(), n_exprs, ExprId::ix, alloc.clone());
+        let field_row = index_rows(ck.fields.column::<0>(), n_exprs, ExprId::ix, alloc.clone());
         Lower {
             body,
             ck,
@@ -480,12 +399,17 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Clone> Lower<'b, 'v, 'c, F, A> {
         Err(LowerError { construct, at: At::Pat(p), range: pat_range_of(self.body, p) })
     }
 
+    pub(crate) fn error_at(&self, construct: Construct, at: At) -> LowerError {
+        let range = match at {
+            At::Expr(e) => range_of(self.body, e),
+            At::Pat(p) => pat_range_of(self.body, p),
+            At::Body => range_of(self.body, self.body.root),
+        };
+        LowerError { construct, at, range }
+    }
+
     pub(crate) fn refuse_at<T>(&self, construct: Construct, at: At) -> Result<T, LowerError> {
-        match at {
-            At::Expr(e) => self.refuse(construct, e),
-            At::Pat(p) => self.refuse_pat(construct, p),
-            At::Body => Err(LowerError { construct, at, range: range_of(self.body, self.body.root) }),
-        }
+        Err(self.error_at(construct, at))
     }
 
     pub(crate) fn span(&self, e: ExprId) -> Span {
@@ -744,118 +668,23 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Clone> Lower<'b, 'v, 'c, F, A> {
     /// Whether dropping a value of `t` may run code: its `Drop` row is written, and drop
     /// elaboration (D119 P4) removes the ones that do nothing at an instance.
     pub(crate) fn needs_drop(&self, root: PTy, at: At) -> Result<bool, LowerError> {
-        if let Some(cell) = self.drop_memo.get(root.0 as usize) {
-            let v = cell.get();
-            if v != 0 {
-                return Ok(v == 2);
-            }
-        }
-        if self.is_copy(root, at)? {
-            if let Some(cell) = self.drop_memo.get(root.0 as usize) {
-                cell.set(1);
-            }
-            return Ok(false);
-        }
-        let quick = match self.node(root, at)? {
-            PNode::Tuple(l) if l.len == 0 => Some(false),
-            PNode::Tuple(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
-            PNode::Param(_)
-            | PNode::Alias { .. }
-            | PNode::Opaque(..)
-            | PNode::Dynamic(_)
-            | PNode::Future(..)
-            | PNode::Coroutine { .. } => Some(true),
-            PNode::Closure { owner, .. } => {
-                if owner != self.body.owner {
-                    Some(true)
-                } else {
-                    None
-                }
-            }
-            _ => Some(false),
-        };
-        if let Some(ans) = quick {
-            if let Some(cell) = self.drop_memo.get(root.0 as usize) {
-                cell.set(if ans { 2 } else { 1 });
-            }
-            return Ok(ans);
-        }
-        let mut stack = TyStack::new(root, self.alloc.clone());
-        let mut steps = 0u32;
-        while let Some(t) = stack.pop() {
-            steps += 1;
-            if steps > MOST_POSITIONS {
-                return self.refuse_at(Construct::Bound, at);
-            }
-            if let Some(cell) = self.drop_memo.get(t.0 as usize) {
-                let v = cell.get();
-                if v == 2 {
-                    if let Some(rc) = self.drop_memo.get(root.0 as usize) {
-                        rc.set(2);
-                    }
-                    return Ok(true);
-                }
-                if v == 1
-                    && self.copy_memo.get(t.0 as usize).is_some_and(|c| c.get() == 1)
-                {
-                    continue;
-                }
-            }
-            match self.node(t, at)? {
-                PNode::Tuple(l) => stack.extend_from_slice(self.list(l, at)?),
-                PNode::Array(i, _) | PNode::Pat(i, _) => stack.push(i),
-                PNode::Adt(k, l) => {
-                    if self.adt_facts(k, at)?.needs_drop {
-                        if let Some(rc) = self.drop_memo.get(root.0 as usize) {
-                            rc.set(2);
-                        }
-                        return Ok(true);
-                    }
-                    stack.extend_from_slice(self.list(l, at)?);
-                }
-                PNode::Param(_) | PNode::Alias { .. } | PNode::Opaque(..) | PNode::Dynamic(_) => {
-                    if let Some(rc) = self.drop_memo.get(root.0 as usize) {
-                        rc.set(2);
-                    }
-                    return Ok(true);
-                }
-                PNode::Future(..) | PNode::Coroutine { .. } => {
-                    if let Some(rc) = self.drop_memo.get(root.0 as usize) {
-                        rc.set(2);
-                    }
-                    return Ok(true);
-                }
-                // A closure of this body holds its by-value captures; one of another body is
-                // not known here, and its `Drop` row stays for elaboration to judge.
-                PNode::Closure { owner, ordinal, .. } => {
-                    if owner != self.body.owner {
-                        if let Some(rc) = self.drop_memo.get(root.0 as usize) {
-                            rc.set(2);
-                        }
-                        return Ok(true);
-                    }
-                    let Some(&c) = self.ck.closures.column::<0>().get(ordinal as usize) else {
-                        return self.refuse_at(Construct::Malformed, at);
-                    };
-                    // Its by-value environment fields (blaze-typeck env_fields.rs): a whole
-                    // binding's type, or a captured place's (`x.a` by value holds `x.a` only).
-                    let ck = self.ck;
-                    for f in ck.env_fields(c) {
-                        if f.how == blaze_typeck::CaptureKind::ByValue {
-                            match f.place_ty(ck) {
-                                Some(t) => stack.push(t),
-                                None => return self.refuse_at(Construct::Malformed, at),
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        if let Some(rc) = self.drop_memo.get(root.0 as usize) {
-            rc.set(1);
-        }
-        Ok(false)
+        pty_needs_drop(
+            DropWalk {
+                facts: self.facts,
+                copy_memo: &self.copy_memo,
+                drop_memo: &self.drop_memo,
+                closures: ClosureDrop::ByValueCaptures { owner: self.body.owner, ck: self.ck },
+                alloc: &self.alloc,
+            },
+            root,
+            || self.is_copy(root, at),
+            |t| self.node(t, at).ok(),
+            |l| self.b.list_entries(l),
+            |err| match err {
+                DropWalkError::Malformed | DropWalkError::UnknownAdt => self.error_at(Construct::Malformed, at),
+                DropWalkError::Bound => self.error_at(Construct::Bound, at),
+            },
+        )
     }
 
     /// Whether parameter or binding pattern `p` is a plain by-value binding of the place's type.

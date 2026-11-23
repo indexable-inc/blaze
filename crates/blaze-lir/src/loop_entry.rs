@@ -64,7 +64,7 @@ use blaze_own::Vec;
 use crate::{
     Block, Func, Op, Ty, View,
     func::{BlockKind, Ext, NONE, ParamKind, ParamRec, SigRec, SlotKind, SlotRec},
-    op::{Field, Layout, Word, walk},
+    op::{Field, Layout, RewriteSink, Word, rewrite_fields, walk},
     verify::{VerifyError, verify},
 };
 
@@ -624,122 +624,13 @@ impl<A: Allocator + Clone> Emit<'_, A> {
         self.fetched_in[at] = self.current;
     }
 
-    fn put_value(&mut self, value: u32) {
-        if self.fetched_in[value as usize] == self.current {
-            self.func.extra.push(self.fetched[value as usize]);
-        } else {
-            self.fixups.push((self.func.extra.len() as u32, false));
-            self.func.extra.push(value);
-        }
-    }
-
-    fn put_block(&mut self, block: u32) {
-        // Every block a copied block names is reached from the header, so it is copied.
-        self.func.extra.push(self.block_map[block as usize]);
-    }
-
-    fn put_slot(&mut self, slot: u32, inst: usize) -> Result<(), LoopEntryError> {
-        let row = self.slot_row[slot as usize];
-        if row == NONE {
-            return Err(LoopEntryError::RowSlotOperand { inst: inst as u32 });
-        }
-        self.func.extra.push(row);
-        Ok(())
-    }
-
-    /// Appends the target at `words[at..]` (a block, a count, the arguments); where its words
-    /// end.
-    fn put_target(&mut self, words: &[u32], mut at: usize) -> usize {
-        self.put_block(words[at]);
-        let n = words[at + 1] as usize;
-        self.func.extra.push(n as u32);
-        at += 2;
-        for _ in 0..n {
-            self.put_value(words[at]);
-            at += 1;
-        }
-        at
-    }
-
     /// Appends the operands `fields` of instruction `inst` to `extra`, each value, block and
-    /// slot as the variant names it. The mirror of [`walk`] (which hands no list's count), on a
-    /// verified function, as coroutine.rs `Emit::rewrite` is.
+    /// slot as the variant names it.
     fn rewrite(&mut self, inst: usize, fields: &'static [Field]) -> Result<(), LoopEntryError> {
         let view = self.view;
-        let words: &[u32] = &view.extra[view.data[inst] as usize..];
+        let words = &view.extra[view.data[inst] as usize..];
         let ty = Ty(view.tys[inst]);
-        let mut at = 0;
-        let mut scrutinee = None;
-        for &field in fields {
-            match field {
-                Field::Value => {
-                    scrutinee = Some(words[at]);
-                    self.put_value(words[at]);
-                    at += 1;
-                }
-                Field::Block => {
-                    self.put_block(words[at]);
-                    at += 1;
-                }
-                Field::Slot => {
-                    self.put_slot(words[at], inst)?;
-                    at += 1;
-                }
-                Field::Imm
-                | Field::Offset
-                | Field::IntCond
-                | Field::FloatCond
-                | Field::Rmw
-                | Field::Ref
-                | Field::Sig
-                | Field::Intrinsic
-                | Field::Asm => {
-                    self.func.extra.push(words[at]);
-                    at += 1;
-                }
-                Field::Target => at = self.put_target(words, at),
-                Field::Values => {
-                    let n = words[at] as usize;
-                    self.func.extra.push(n as u32);
-                    at += 1;
-                    for _ in 0..n {
-                        self.put_value(words[at]);
-                        at += 1;
-                    }
-                }
-                Field::Blocks => {
-                    let n = words[at] as usize;
-                    self.func.extra.push(n as u32);
-                    at += 1;
-                    for _ in 0..n {
-                        self.put_block(words[at]);
-                        at += 1;
-                    }
-                }
-                Field::Mask => {
-                    let n = words[at] as usize;
-                    self.func.extra.extend_from_slice(&words[at..at + 1 + n]);
-                    at += 1 + n;
-                }
-                Field::Const => {
-                    let n = ty.const_words() as usize;
-                    self.func.extra.extend_from_slice(&words[at..at + n]);
-                    at += n;
-                }
-                Field::Cases => {
-                    let width = scrutinee.map_or(0, |it: u32| Ty(view.tys[it as usize]).const_words()) as usize;
-                    let n = words[at] as usize;
-                    self.func.extra.push(n as u32);
-                    at += 1;
-                    for _ in 0..n {
-                        self.func.extra.extend_from_slice(&words[at..at + width]);
-                        at += width;
-                        at = self.put_target(words, at);
-                    }
-                }
-            }
-        }
-        Ok(())
+        rewrite_fields(words, fields, ty, view.tys, &mut LoopRewrite { emit: self, inst })
     }
 
     /// Copies instruction `at`, its operands as the variant names them.
@@ -799,6 +690,47 @@ impl<A: Allocator + Clone> Emit<'_, A> {
             self.spill(at);
         }
         Ok(())
+    }
+}
+
+struct LoopRewrite<'e, 'v, A: Allocator + Clone> {
+    emit: &'e mut Emit<'v, A>,
+    inst: usize,
+}
+
+impl<A: Allocator + Clone> RewriteSink for LoopRewrite<'_, '_, A> {
+    type Error = LoopEntryError;
+
+    fn put_value(&mut self, value: u32) {
+        let e = &mut *self.emit;
+        if e.fetched_in[value as usize] == e.current {
+            e.func.extra.push(e.fetched[value as usize]);
+        } else {
+            e.fixups.push((e.func.extra.len() as u32, false));
+            e.func.extra.push(value);
+        }
+    }
+
+    fn put_block(&mut self, block: u32) {
+        // Every block a copied block names is reached from the header, so it is copied.
+        self.emit.func.extra.push(self.emit.block_map[block as usize]);
+    }
+
+    fn put_slot(&mut self, slot: u32) -> Result<(), LoopEntryError> {
+        let row = self.emit.slot_row[slot as usize];
+        if row == NONE {
+            return Err(LoopEntryError::RowSlotOperand { inst: self.inst as u32 });
+        }
+        self.emit.func.extra.push(row);
+        Ok(())
+    }
+
+    fn push_word(&mut self, word: u32) {
+        self.emit.func.extra.push(word);
+    }
+
+    fn push_words(&mut self, words: &[u32]) {
+        self.emit.func.extra.extend_from_slice(words);
     }
 }
 

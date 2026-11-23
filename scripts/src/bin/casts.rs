@@ -15,11 +15,9 @@
 //! with no compiler, as `allocs` and `untyped` hold theirs, until a blaze lint with a fix
 //! (`blaze::int_cast`, rule 73) replaces it.
 //!
-//! The scanning is a copy of untyped.rs's (`item_end`, `comment_end`, `string_end`,
-//! `quote_end`, `word_end`, `raw_end`, `test_path`, `module_files`, `rust_files`, `crate_of`,
-//! `added_lines`, the file walk of `count`), the third copy of one scanner: it belongs in one
-//! shared module of blaze-script (AGENTS.md one-concept-one-home), which a change of its own
-//! makes for all three.
+//! Test code, the scanner, the list and the base comparison are `blaze_script::ratchet`'s;
+//! `count` still walks all of `crates/` (not only workspace members) because
+//! `tools/ratchets/casts.txt` tracks `harness/*` too.
 
 /// What the usage error prints.
 const DOC: &str = r#"casts: the integer `as` casts only go down, per crate (AGENTS.md correct-by-construction, rule 76).
@@ -78,27 +76,20 @@ home of the conversions, has a row of its own: its few casts are the conversions
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt,
     path::{Path, PathBuf},
 };
 
 use blaze_script::{
     TempDir, fail,
     finding::{self, Finding},
-    git,
     input::{self, Fields, Input, InputError},
-    read_text,
-    regex::Regex,
+    ratchet::{self, BaseError, FileTests, Hit, ListError, Policy, Run, Tests, comment_end, ident_len, quote_end, string_end, word_end},
     universal_newlines,
 };
 
 const SCRIPT: &str = "casts";
 /// The list, from the root.
 const LIST: &str = "tools/ratchets/casts.txt";
-const TEST_DIRS: [&str; 2] = ["tests", "benches"];
-const TEST_FILES: [&str; 2] = ["tests.rs", "test.rs"];
-/// The files whose out-of-line modules are beside them, not in a directory named for them.
-const ROOT_FILES: [&str; 4] = ["lib.rs", "main.rs", "mod.rs", "build.rs"];
 /// The primitive integer types: a cast to one of them is a site.
 const INTEGERS: [&str; 12] = ["u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize"];
 /// What every message about a crate over its row ends with.
@@ -147,131 +138,19 @@ impl Input for Args {
     }
 }
 
-/// One cast: its file and the line of its `as`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Site {
-    /// Relative to the root.
-    path: String,
-    line: usize,
-}
-
-/// The list read wrong: where, and what is wrong there.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ListError {
-    /// A line (from 1) that is not a row, a comment or blank.
-    NotARow { line: usize, text: String },
-    /// A crate's second row, at its line (from 1).
-    TwoRows { line: usize, krate: String },
-}
-
-impl fmt::Display for ListError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ListError::NotARow { line, text } => write!(f, "{LIST}:{line}: {text:?} is not `<crate><TAB><casts>`"),
-            ListError::TwoRows { line, krate } => write!(f, "{LIST}:{line}: `{krate}` has two rows"),
-        }
+/// The lines (from 1) of `text`'s casts outside its test code, in order, a line once per cast.
+fn live_in(found: &FileTests, text: &str) -> Vec<usize> {
+    if found.whole {
+        Vec::new()
+    } else {
+        cast_lines(text).into_iter().filter(|line| !found.test.get(line - 1).copied().unwrap_or(false)).collect()
     }
-}
-
-/// The base could not be read: which base, and what of it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BaseError {
-    /// `base` names no commit of the checkout; `why` is git's message.
-    NoCommit { base: String, why: String },
-    /// A git command about `base` failed: `what` it was to do, and git's message.
-    Git { base: String, what: &'static str, why: String },
-    /// The base's list does not read.
-    List { base: String, error: ListError },
-    /// A hunk header of git's diff that is not one.
-    Hunk { text: String },
-}
-
-impl fmt::Display for BaseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            BaseError::NoCommit { base, why } => write!(f, "the base {base} is no commit here (fetch it): {why}"),
-            BaseError::Git { base, what, why } => write!(f, "git could not {what} at the base {base}: {why}"),
-            BaseError::List { base, error } => write!(f, "at the base {base}: {error}"),
-            BaseError::Hunk { text } => write!(f, "git diff's hunk {text:?} is not `@@ -<line>[,<n>] +<line>[,<n>] @@`"),
-        }
-    }
-}
-
-impl std::error::Error for ListError {}
-impl std::error::Error for BaseError {}
-
-struct Patterns {
-    cfg_test: Regex,
-    /// `#[test]`, or an attribute whose path ends in the word `test` (`#[tokio::test]`).
-    test_fn: Regex,
-    inner_cfg_test: Regex,
-    /// `mod <name>;`, attributes before it on the line allowed.
-    module: Regex,
-}
-
-impl Patterns {
-    fn new() -> Patterns {
-        let re = |pattern: &str| Regex::new(pattern).unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
-        Patterns {
-            cfg_test: re(r"\A\s*#\[cfg\((?:test|all\(test\b[^\]]*)\)\]"),
-            // To the attribute's `]`, so that the item read after it starts after the attribute.
-            test_fn: re(r"\A\s*#\[(?:\w+::)*test\b[^\]]*\]"),
-            inner_cfg_test: re(r"\A\s*#!\[cfg\((?:test|all\(test\b[^\]]*)\)\]"),
-            module: re(r"\A\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?(\w+)\s*;"),
-        }
-    }
-}
-
-/// What one file holds.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct Scanned {
-    /// The lines (from 1) of its casts outside its test code, in order, a line once per cast.
-    sites: Vec<usize>,
-    /// Each `mod <name>;` it declares, and whether test code declares it.
-    mods: Vec<(String, bool)>,
-    /// `#![cfg(test)]`: the whole file is test code.
-    test: bool,
-}
-
-/// The casts of one file's text and the modules it declares out of line.
-fn scan_file(p: &Patterns, text: &str) -> Scanned {
-    let lines: Vec<&str> = text.split('\n').collect();
-    let mut test = vec![false; lines.len()];
-    let mut out = Scanned::default();
-    // The byte where line `at` starts.
-    let mut start = 0;
-    for (at, line) in lines.iter().enumerate() {
-        if p.inner_cfg_test.is_match(line) {
-            out.test = true;
-        }
-        if let Some(found) = p.cfg_test.find(line).or_else(|| p.test_fn.find(line)) {
-            // The item runs from after the attribute to its `}` or `;`, on the line of that byte.
-            let last = match item_end(text, start + found.end()) {
-                Some(end) => at + text[start..end - 1].matches('\n').count(),
-                None => at,
-            };
-            for it in &mut test[at..=last] {
-                *it = true;
-            }
-        }
-        if let Some(found) = p.module.captures(line) {
-            out.mods.push((found[1].to_owned(), test[at]));
-        }
-        start += line.len() + 1;
-    }
-    if out.test {
-        for it in &mut out.mods {
-            it.1 = true;
-        }
-        return out;
-    }
-    out.sites = cast_lines(text).into_iter().filter(|line| !test[line - 1]).collect();
-    out
 }
 
 /// The line (from 1) of each integer cast's `as` in `text`, in text order, once per cast, test
-/// code included ([`scan_file`] takes it out): comments, strings and characters skipped as
-/// [`item_end`] skips them, and a `use` item, from the word `use` to its `;`, casts nothing.
+/// code included ([`live_in`] takes it out): comments, strings and characters skipped as
+/// `blaze_script::ratchet::item_end` skips them, and a `use` item, from the word `use` to its `;`,
+/// casts nothing.
 fn cast_lines(text: &str) -> Vec<usize> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
@@ -322,195 +201,13 @@ fn casts_to_integer(text: &str, from: usize) -> bool {
     INTEGERS.contains(&&rest[..len]) && !rest[len..].starts_with("::")
 }
 
-/// The byte after the `}` or `;` that ends the item starting at byte `from` of `text`: the
-/// first `;` outside brackets, or the `}` that closes its first brace; `None` when a closing
-/// bracket comes first (the item is part of a larger one) or the text ends. Comments, strings
-/// (raw and byte strings too) and character literals are skipped, so a brace in them counts not.
-fn item_end(text: &str, from: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut depth: usize = 0;
-    let mut at = from;
-    // Bounded: every turn moves `at` forward, to the end of the text at most.
-    while at < bytes.len() {
-        let byte = bytes[at];
-        let next = bytes.get(at + 1).copied();
-        at = match byte {
-            b'/' if next == Some(b'/') => text[at..].find('\n').map_or(bytes.len(), |n| at + n),
-            b'/' if next == Some(b'*') => comment_end(bytes, at),
-            b'"' => string_end(bytes, at + 1),
-            b'\'' => quote_end(text, at),
-            b'{' | b'(' | b'[' => {
-                depth += 1;
-                at + 1
-            }
-            b'}' | b')' | b']' => {
-                depth = depth.checked_sub(1)?;
-                if byte == b'}' && depth == 0 {
-                    return Some(at + 1);
-                }
-                at + 1
-            }
-            b';' if depth == 0 => return Some(at + 1),
-            b'_' | b'a'..=b'z' | b'A'..=b'Z' => word_end(text, at),
-            _ => at + 1,
-        };
-    }
-    None
-}
-
-/// The byte after the block comment that opens at `from`, comments nested in it included.
-fn comment_end(bytes: &[u8], from: usize) -> usize {
-    let mut depth: usize = 0;
-    let mut at = from;
-    while at + 1 < bytes.len() {
-        match (bytes[at], bytes[at + 1]) {
-            (b'/', b'*') => {
-                depth += 1;
-                at += 2;
-            }
-            (b'*', b'/') => {
-                depth = depth.saturating_sub(1);
-                at += 2;
-                if depth == 0 {
-                    return at;
-                }
-            }
-            _ => at += 1,
-        }
-    }
-    bytes.len()
-}
-
-/// The byte after the `"` that closes a string whose text starts at `from`.
-fn string_end(bytes: &[u8], from: usize) -> usize {
-    let mut at = from;
-    while at < bytes.len() {
-        match bytes[at] {
-            b'\\' => at += 2,
-            b'"' => return at + 1,
-            _ => at += 1,
-        }
-    }
-    bytes.len()
-}
-
-/// The byte after the character literal at the `'` at `at`, or after the `'` alone when it opens
-/// a lifetime or a label.
-fn quote_end(text: &str, at: usize) -> usize {
-    let rest = &text[at + 1..];
-    if rest.starts_with('\\') {
-        // An escape (`'\n'`, `'\''`, `'\u{7f}'`): closed by the next quote after the escaped one.
-        return rest.get(2..).and_then(|it| it.find('\'')).map_or(text.len(), |n| at + 3 + n + 1);
-    }
-    match rest.chars().next() {
-        Some(c) if rest[c.len_utf8()..].starts_with('\'') => at + 1 + c.len_utf8() + 1,
-        _ => at + 1,
-    }
-}
-
-/// The length of the identifier (or number) `bytes` starts with: ASCII letters, digits and `_`.
-fn ident_len(bytes: &[u8]) -> usize {
-    bytes.iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count()
-}
-
-/// The byte after the word at `at`, after the literal it prefixes (`r#"..."#`, `b"..."`,
-/// `br"..."`, `c"..."`, `b'x'`), or after the raw identifier it starts (`r#as`, read whole so
-/// that its word is no keyword).
-fn word_end(text: &str, at: usize) -> usize {
-    let bytes = text.as_bytes();
-    let end = at + ident_len(&bytes[at..]);
-    match (&text[at..end], bytes.get(end).copied()) {
-        ("r" | "br" | "cr", Some(b'#' | b'"')) => raw_end(bytes, end),
-        ("b" | "c", Some(b'"')) => string_end(bytes, end + 1),
-        ("b", Some(b'\'')) => quote_end(text, end),
-        _ => end,
-    }
-}
-
-/// The byte after the raw string whose `#`s or `"` start at `from`; for a raw identifier
-/// (`r#as`), the byte after its identifier.
-fn raw_end(bytes: &[u8], from: usize) -> usize {
-    let hashes = bytes[from..].iter().take_while(|b| **b == b'#').count();
-    let open = from + hashes;
-    if bytes.get(open) != Some(&b'"') {
-        return open + ident_len(&bytes[open..]);
-    }
-    let mut at = open + 1;
-    while at < bytes.len() {
-        if bytes[at] == b'"' && bytes[at + 1..].iter().take(hashes).filter(|b| **b == b'#').count() == hashes {
-            return at + 1 + hashes;
-        }
-        at += 1;
-    }
-    bytes.len()
-}
-
-/// Whether the file `parts` is test code by its path.
-fn test_path(parts: &[String]) -> bool {
-    let (name, dirs) = parts.split_last().map_or(("", &[][..]), |(name, dirs)| (name.as_str(), dirs));
-    dirs.iter().any(|part| TEST_DIRS.contains(&part.as_str())) || TEST_FILES.contains(&name)
-}
-
-/// The two files the module `name`, declared out of line in the file `parts`, can be.
-fn module_files(parts: &[String], name: &str) -> [String; 2] {
-    let Some((file, dirs)) = parts.split_last() else { return [String::new(), String::new()] };
-    let mut base: Vec<&str> = dirs.iter().map(String::as_str).collect();
-    let root = ROOT_FILES.contains(&file.as_str()) || dirs.last().is_some_and(|it| it == "bin");
-    if !root {
-        base.push(file.strip_suffix(".rs").unwrap_or(file));
-    }
-    let base = base.join("/");
-    [format!("{base}/{name}.rs"), format!("{base}/{name}/mod.rs")]
-}
-
-/// `(root / "crates").rglob("*.rs")`, sorted part by part, each as its parts from the root, none
-/// under a directory named `target`. Directories that are links are not entered.
-fn rust_files(root: &Path) -> Vec<Vec<String>> {
-    let mut out = Vec::new();
-    let mut todo = vec![vec!["crates".to_owned()]];
-    // Bounded: each directory is listed once, and links to directories are not followed.
-    while let Some(dir) = todo.pop() {
-        let full: PathBuf = dir.iter().fold(root.to_path_buf(), |path, part| path.join(part));
-        let Ok(listed) = std::fs::read_dir(&full) else { continue };
-        for entry in listed.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let mut parts = dir.clone();
-            parts.push(name.clone());
-            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-            if is_dir && name != "target" {
-                todo.push(parts);
-            } else if !is_dir && name.ends_with(".rs") {
-                out.push(parts);
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
-/// The crate of the file `parts`: the nearest directory above it, under crates/, with a
-/// Cargo.toml, by its path under crates/; the first directory under crates/ when none has one.
-fn crate_of(root: &Path, parts: &[String], manifests: &mut BTreeMap<Vec<String>, bool>) -> String {
-    for end in (2..parts.len()).rev() {
-        let dir = &parts[..end];
-        let has = *manifests.entry(dir.to_vec()).or_insert_with(|| {
-            dir.iter().fold(root.to_path_buf(), |path, part| path.join(part)).join("Cargo.toml").is_file()
-        });
-        if has {
-            return parts[1..end].join("/");
-        }
-    }
-    match parts {
-        [_, first, _, ..] => first.clone(),
-        _ => "crates".to_owned(),
-    }
-}
-
 /// Each crate's casts outside test code, in file and line order; a crate with none is absent.
-fn count(p: &Patterns, root: &Path) -> BTreeMap<String, Vec<Site>> {
-    let files = rust_files(root);
+/// Unlike `ratchet::walk`, this walks all of `crates/` (not only workspace members), because
+/// `tools/ratchets/casts.txt` tracks `harness/*` too.
+fn count(tests: &Tests, root: &Path) -> BTreeMap<String, Vec<Hit<()>>> {
+    let files = ratchet::rust_files(root);
     let known: BTreeSet<String> = files.iter().map(|it| it.join("/")).collect();
-    let mut scanned: Vec<(Vec<String>, Scanned)> = Vec::new();
+    let mut scanned: Vec<(Vec<String>, Vec<usize>)> = Vec::new();
     let mut test: BTreeSet<String> = BTreeSet::new();
     let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for parts in files {
@@ -519,12 +216,12 @@ fn count(p: &Patterns, root: &Path) -> BTreeMap<String, Vec<Site>> {
         // `read_text(errors="replace")`: what is not UTF-8 becomes U+FFFD.
         let Ok(bytes) = std::fs::read(&full) else { fail(SCRIPT, &format!("{} could not be read", full.display())) };
         let text = universal_newlines(String::from_utf8_lossy(&bytes).into_owned());
-        let found = scan_file(p, &text);
-        if test_path(&parts) || found.test {
+        let found = tests.of(&text);
+        if ratchet::test_path(&parts) || found.whole {
             test.insert(path.clone());
         }
         for (name, in_test) in &found.mods {
-            for file in module_files(&parts, name) {
+            for file in ratchet::module_files(&parts, name) {
                 if !known.contains(&file) {
                     continue;
                 }
@@ -534,7 +231,7 @@ fn count(p: &Patterns, root: &Path) -> BTreeMap<String, Vec<Site>> {
                 children.entry(path.clone()).or_default().push(file);
             }
         }
-        scanned.push((parts, found));
+        scanned.push((parts, live_in(&found, &text)));
     }
     // A module that test code declares is test code, and so is every module it declares.
     let mut todo: Vec<String> = test.iter().cloned().collect();
@@ -547,175 +244,44 @@ fn count(p: &Patterns, root: &Path) -> BTreeMap<String, Vec<Site>> {
         }
     }
     let mut manifests: BTreeMap<Vec<String>, bool> = BTreeMap::new();
-    let mut out: BTreeMap<String, Vec<Site>> = BTreeMap::new();
-    for (parts, found) in scanned {
+    let mut out: BTreeMap<String, Vec<Hit<()>>> = BTreeMap::new();
+    for (parts, sites) in scanned {
         let path = parts.join("/");
-        if found.sites.is_empty() || test.contains(&path) {
+        if sites.is_empty() || test.contains(&path) {
             continue;
         }
-        let krate = crate_of(root, &parts, &mut manifests);
-        out.entry(krate).or_default().extend(found.sites.iter().map(|line| Site { path: path.clone(), line: *line }));
+        let krate = ratchet::crate_of(root, &parts, &mut manifests);
+        out.entry(krate).or_default().extend(sites.into_iter().map(|line| Hit { path: path.clone(), line, what: () }));
     }
     out
 }
 
-/// The list as `write` writes it: the header, then `<crate><TAB><casts>` for each crate with a
-/// cast, sorted.
-fn render(counts: &BTreeMap<String, Vec<Site>>) -> String {
-    let mut out = HEADER.to_owned();
-    for (krate, sites) in counts.iter().filter(|(_, sites)| !sites.is_empty()) {
-        out.push_str(&format!("{krate}\t{}\n", sites.len()));
-    }
-    out
-}
-
-/// The list's rows.
-fn parse_rows(text: &str) -> Result<BTreeMap<String, usize>, ListError> {
-    let mut rows = BTreeMap::new();
-    for (at, line) in text.split('\n').enumerate() {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let row = match line.split('\t').collect::<Vec<&str>>().as_slice() {
-            [krate, n] if !krate.is_empty() => n.parse::<usize>().ok().map(|n| (*krate, n)),
-            _ => None,
-        };
-        let Some((krate, n)) = row else {
-            return Err(ListError::NotARow { line: at + 1, text: line.to_owned() });
-        };
-        if rows.insert(krate.to_owned(), n).is_some() {
-            return Err(ListError::TwoRows { line: at + 1, krate: krate.to_owned() });
-        }
-    }
-    Ok(rows)
-}
-
-/// The lines each file has that `base` did not, from `git diff --unified=0`'s hunks: by path
-/// from the root, the line numbers in the tree.
-fn added_lines(diff: &str) -> Result<BTreeMap<String, BTreeSet<usize>>, BaseError> {
-    let mut out: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
-    let mut file: Option<String> = None;
-    // The lines of the hunk being read, which are text, never a header (`+++ x` is a line `++ x`).
-    let mut skip: usize = 0;
-    for line in diff.split('\n') {
-        if skip > 0 {
-            skip -= 1;
-            continue;
-        }
-        if let Some(path) = line.strip_prefix("+++ ") {
-            // `/dev/null` for a file deleted: no line of it is in the tree.
-            file = path.strip_prefix("b/").map(str::to_owned);
-            continue;
-        }
-        let Some(hunk) = line.strip_prefix("@@ ") else { continue };
-        // `@@ -a,b +c,d @@`: `b` lines from `a` were the base's, `d` from `c` are the tree's
-        // (one when `,b` or `,d` is left out).
-        let range = |sign: char| -> Option<(usize, usize)> {
-            let it = hunk.split(' ').find_map(|it| it.strip_prefix(sign))?;
-            let (from, len) = it.split_once(',').unwrap_or((it, "1"));
-            Some((from.parse().ok()?, len.parse().ok()?))
-        };
-        let (Some((_, removed)), Some((from, len))) = (range('-'), range('+')) else {
-            return Err(BaseError::Hunk { text: line.to_owned() });
-        };
-        skip = removed + len;
-        if let Some(path) = &file {
-            out.entry(path.clone()).or_default().extend(from..from + len);
-        }
-    }
-    Ok(out)
-}
-
-/// What `base` says: its rows (none when it has no list, before the ratchet began), and the lines
-/// added since it under crates/.
-fn at_base(root: &Path, base: &str) -> Result<(Option<BTreeMap<String, usize>>, BTreeMap<String, BTreeSet<usize>>), BaseError> {
-    let root_arg = root.to_string_lossy();
-    let dir = root_arg.as_ref();
-    let commit = format!("{base}^{{commit}}");
-    git(root, &["-C", dir, "rev-parse", "--verify", "--quiet", commit.as_str()])
-        .map_err(|why| BaseError::NoCommit { base: base.to_owned(), why })?;
-    let failed = |what: &'static str| move |why: String| BaseError::Git { base: base.to_owned(), what, why };
-    let listed = git(root, &["-C", dir, "ls-tree", "--name-only", base, "--", LIST]).map_err(failed("list its tree"))?;
-    let rows = if listed.trim().is_empty() {
-        None
-    } else {
-        let spec = format!("{base}:{LIST}");
-        let text = git(root, &["-C", dir, "show", spec.as_str()]).map_err(failed("show the list"))?;
-        Some(parse_rows(&text).map_err(|error| BaseError::List { base: base.to_owned(), error })?)
-    };
-    let diff = git(root, &["-C", dir, "diff", "--no-color", "--no-ext-diff", "--no-renames", "--unified=0", base, "--", "crates"])
-        .map_err(failed("diff the tree"))?;
-    Ok((rows, added_lines(&diff)?))
-}
-
-/// What is wrong: `counts` the tree's casts by crate, `rows` the list's, `base_rows` the base's
-/// list (when it had one), `added` the lines added since the base (when one was given).
-fn problems(
-    counts: &BTreeMap<String, Vec<Site>>,
-    rows: &BTreeMap<String, usize>,
-    base_rows: Option<&BTreeMap<String, usize>>,
-    added: Option<&BTreeMap<String, BTreeSet<usize>>>,
-) -> Vec<String> {
-    let mut out = Vec::new();
-    let crates: BTreeSet<&String> = counts.keys().chain(rows.keys()).collect();
-    for krate in crates {
-        let sites = counts.get(krate).map_or(&[][..], Vec::as_slice);
-        let row = rows.get(krate).copied();
-        let now = sites.len();
-        let held = row.unwrap_or(0);
-        if now > held {
-            let shown = match row {
-                Some(_) => format!("its row's {held}"),
-                None => "0, as a crate with no row is held".to_owned(),
-            };
-            let new = match added {
-                Some(added) => {
-                    let new: Vec<String> = sites
-                        .iter()
-                        .filter(|it| added.get(&it.path).is_some_and(|lines| lines.contains(&it.line)))
-                        .map(|it| format!("{}:{}", it.path, it.line))
-                        .collect();
-                    if new.is_empty() {
-                        "none is on a line added since the base: a cast moved in from another crate, or a file git does not track".to_owned()
-                    } else {
-                        format!("new: {}", new.join(", "))
-                    }
-                }
-                None => "give `base`, the commit the change is against, to have the new ones named".to_owned(),
-            };
-            out.push(format!("`{krate}` has {now} integer `as` casts outside tests, over {shown} in {LIST} ({new}): {INSTEAD} ({RULE})"));
-        } else if now < held {
-            let lower = if now == 0 { "remove the row".to_owned() } else { format!("lower it to {now}") };
-            out.push(format!(
-                "`{krate}` has {now} integer `as` casts outside tests, under its row's {held} in {LIST}: {lower} (command `write`); the list only shrinks"
-            ));
-        }
-    }
-    if let Some(base) = base_rows {
-        for (krate, now) in rows {
-            let then = base.get(krate).copied().unwrap_or(0);
-            if *now > then {
-                out.push(format!("{LIST}: the row `{krate}` is {now} and was {then} at the base: the list only shrinks ({RULE})"));
-            }
-        }
-    }
-    out
+fn named(it: &Hit<()>) -> String {
+    format!("{}:{}", it.path, it.line)
 }
 
 /// `counts`' total, for a line of output.
-fn summary(counts: &BTreeMap<String, Vec<Site>>) -> String {
+fn summary(counts: &BTreeMap<String, Vec<Hit<()>>>) -> String {
     let total: usize = counts.values().map(Vec::len).sum();
     format!("{total} integer `as` casts outside tests, in {} crates", counts.len())
 }
 
-fn main_with(p: &Patterns, it: &Args) {
+const POLICY: Policy<'static> = Policy {
+    list: LIST,
+    noun: "integer `as` casts",
+    instead: INSTEAD,
+    rule: RULE,
+    at_zero: &[],
+};
+
+fn main_with(tests: &Tests, it: &Args) {
     // `Path(root).resolve()`.
     let root: PathBuf =
         std::fs::canonicalize(&it.root).unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(&it.root));
     if !root.join("crates").is_dir() {
         fail(SCRIPT, &format!("{} has no crates/ directory", root.display()));
     }
-    let counts = count(p, &root);
+    let counts = count(tests, &root);
     if it.command == "findings" {
         let found = counts.iter().flat_map(|(krate, sites)| {
             sites.iter().map(|it| Finding { krate: krate.clone(), file: it.path.clone(), line: it.line, kind: KIND.name, detail: None })
@@ -723,40 +289,9 @@ fn main_with(p: &Patterns, it: &Args) {
         finding::print(SCRIPT, &[KIND], found.collect());
         return;
     }
-    let text = render(&counts);
-    if it.command == "write" {
-        if let Err(e) = std::fs::write(root.join(LIST), &text) {
-            fail(SCRIPT, &format!("{LIST} is not written: {e}"));
-        }
-        println!("{SCRIPT}: wrote {LIST}: {}", summary(&counts));
-        return;
-    }
-    let Some(listed) = read_text(&root.join(LIST)) else {
-        fail(SCRIPT, &format!("{LIST} could not be read: every crate is held to its row there (command `write` makes it)"))
-    };
-    let rows = parse_rows(&listed).unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
-    let (base_rows, added) = match &it.base {
-        Some(base) => {
-            let (rows, added) = at_base(&root, base).unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
-            if rows.is_none() {
-                println!("{SCRIPT}: {base} has no {LIST}: the list begins with this change, so no row is compared with the base");
-            }
-            (rows, Some(added))
-        }
-        None => (None, None),
-    };
-    let mut wrong = problems(&counts, &rows, base_rows.as_ref(), added.as_ref());
-    if wrong.is_empty() && listed != text {
-        wrong.push(format!(
-            "{LIST} is not as command `write` writes it (its header, then a sorted `<crate><TAB><casts>` row per crate with a cast): run it"
-        ));
-    }
-    if !wrong.is_empty() {
-        let lines: Vec<String> = wrong.iter().map(|w| format!("{SCRIPT}: {w}")).collect();
-        eprintln!("{}", lines.join("\n"));
-        std::process::exit(1);
-    }
-    println!("{SCRIPT}: {}, each crate at its row in {LIST}", summary(&counts));
+    let summary = summary(&counts);
+    let run = Run { script: SCRIPT, policy: &POLICY, header: HEADER, root: &root, write: it.command == "write", base: it.base.as_deref(), summary: &summary };
+    ratchet::write_or_check(&run, &counts, named);
 }
 
 fn expect(holds: bool, what: &str) {
@@ -764,7 +299,7 @@ fn expect(holds: bool, what: &str) {
 }
 
 /// The casts of the counted crates, as `crate: path:line, ...`, for a selftest's message.
-fn shown(counts: &BTreeMap<String, Vec<Site>>) -> String {
+fn shown(counts: &BTreeMap<String, Vec<Hit<()>>>) -> String {
     let crates: Vec<String> = counts
         .iter()
         .map(|(krate, sites)| {
@@ -776,8 +311,8 @@ fn shown(counts: &BTreeMap<String, Vec<Site>>) -> String {
 }
 
 /// One file's casts, for a selftest's expectation.
-fn sites_of(path: &str, lines: &[usize]) -> Vec<Site> {
-    lines.iter().map(|line| Site { path: path.to_owned(), line: *line }).collect()
+fn sites_of(path: &str, lines: &[usize]) -> Vec<Hit<()>> {
+    lines.iter().map(|line| Hit { path: path.to_owned(), line: *line, what: () }).collect()
 }
 
 /// The selftest's file of crate `a`. Line by line, what each cast is:
@@ -825,7 +360,7 @@ fn path(x: u64) -> (u32, u64) { (x as core::primitive::u32, u32::MAX as u64) }
 /// The lines of [`FIXTURE`]'s casts outside its test code.
 const FIXTURE_SITES: [usize; 9] = [2, 3, 3, 8, 9, 12, 15, 22, 23];
 
-fn selftest(p: &Patterns) {
+fn selftest(tests: &Tests) {
     // What a cast is: `as` and an integer type's name as a whole word, not a path's start.
     expect(casts_to_integer(" u32 }", 0) && casts_to_integer("\n\t usize)", 0), "an integer after spaces and line breaks");
     expect(!casts_to_integer(" u32x", 0) && !casts_to_integer(" u32::MAX", 0) && !casts_to_integer(" char", 0), "not a longer word, a path or another type");
@@ -836,12 +371,13 @@ fn selftest(p: &Patterns) {
     want.extend([18, 21]);
     want.sort();
     expect(all == want, &format!("the fixture's casts, test code in: found {all:?}, wanted {want:?}"));
-    let found = scan_file(p, FIXTURE);
-    expect(found.sites == FIXTURE_SITES, &format!("the fixture's casts outside test code: {:?}", found.sites));
+    let live = |text: &str| live_in(&tests.of(text), text);
+    let found = live(FIXTURE);
+    expect(found == FIXTURE_SITES, &format!("the fixture's casts outside test code: {found:?}"));
     // Planted: the test module's attribute, then the test's, removed: each is a site.
-    let planted = scan_file(p, &FIXTURE.replace("#[cfg(test)]\n", "\n")).sites;
+    let planted = live(&FIXTURE.replace("#[cfg(test)]\n", "\n"));
     expect(planted.contains(&18), &format!("`t` outside test code is a site: {planted:?}"));
-    let planted = scan_file(p, &FIXTURE.replace("#[test]\n", "\n")).sites;
+    let planted = live(&FIXTURE.replace("#[test]\n", "\n"));
     expect(planted.contains(&21), &format!("`a_test` without `#[test]` is a site: {planted:?}"));
     // Planted: the `use` item's `;` gone, the rename reads on into line 2 and hides its cast.
     let planted = cast_lines(&FIXTURE.replace("use crate::Thing as u8;", "use crate::Thing as u8"));
@@ -869,7 +405,7 @@ fn selftest(p: &Patterns) {
     put("crates/b/Cargo.toml", "[workspace]\n");
     put("crates/b/c/Cargo.toml", "[package]\nname = \"c\"\n");
     put("crates/b/c/src/lib.rs", one);
-    let counts = count(p, tmp.path());
+    let counts = count(tests, tmp.path());
     let mut a = sites_of("crates/a/build.rs", &[1]);
     a.extend(sites_of("crates/a/src/lib.rs", &FIXTURE_SITES));
     a.extend(sites_of("crates/a/src/live.rs", &[1]));
@@ -877,15 +413,15 @@ fn selftest(p: &Patterns) {
     expect(counts == want, &format!("the tree's casts: {}", shown(&counts)));
 
     // The ratchet. As recorded, nothing is wrong, and the list reads back as it was written.
-    let rows = parse_rows(&render(&counts)).unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &e.to_string()));
+    let rows = ratchet::parse_rows(LIST, &ratchet::render(HEADER, &counts, &[])).unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &e.to_string()));
     expect(rows == BTreeMap::from([("a".to_owned(), 11), ("b/c".to_owned(), 1)]), &format!("the rows read back: {rows:?}"));
-    expect(problems(&counts, &rows, Some(&rows), None).is_empty(), "the tree as recorded is right");
+    expect(ratchet::problems(&POLICY, &counts, &rows, Some(&rows), None, named).is_empty(), "the tree as recorded is right");
     // Planted: one cast added. Named by its crate, its place (given the base's diff), what to
     // write instead and the rule.
     let mut fewer = rows.clone();
     fewer.insert("a".to_owned(), 10);
     let added = BTreeMap::from([("crates/a/src/lib.rs".to_owned(), BTreeSet::from([22]))]);
-    let said = problems(&counts, &fewer, None, Some(&added));
+    let said = ratchet::problems(&POLICY, &counts, &fewer, None, Some(&added), named);
     expect(
         said.len() == 1
             && said[0].contains("`a` has 11 integer `as` casts outside tests, over its row's 10")
@@ -897,17 +433,17 @@ fn selftest(p: &Patterns) {
     // Planted: one cast removed. The row must come down; a crate with none left goes.
     let mut more = rows.clone();
     more.insert("b/c".to_owned(), 2);
-    let said = problems(&counts, &more, None, None);
+    let said = ratchet::problems(&POLICY, &counts, &more, None, None, named);
     expect(said.len() == 1 && said[0].contains("`b/c`") && said[0].contains("lower it to 1"), &format!("one cast removed is caught: {said:?}"));
     let mut gone = rows.clone();
     gone.insert("old".to_owned(), 3);
-    let said = problems(&counts, &gone, None, None);
+    let said = ratchet::problems(&POLICY, &counts, &gone, None, None, named);
     expect(said.len() == 1 && said[0].contains("`old`") && said[0].contains("remove the row"), &format!("a crate gone: {said:?}"));
     // Planted: a crate with no row is held to 0; a row raised above the base's is caught even
     // where the tree matches it.
-    let said = problems(&counts, &BTreeMap::from([("a".to_owned(), 11)]), None, None);
+    let said = ratchet::problems(&POLICY, &counts, &BTreeMap::from([("a".to_owned(), 11)]), None, None, named);
     expect(said.len() == 1 && said[0].contains("`b/c` has 1") && said[0].contains("held"), &format!("a new crate starts at 0: {said:?}"));
-    let said = problems(&counts, &rows, Some(&fewer), None);
+    let said = ratchet::problems(&POLICY, &counts, &rows, Some(&fewer), None, named);
     expect(said.len() == 1 && said[0].contains("the row `a` is 11 and was 10 at the base"), &format!("a row raised: {said:?}"));
 
     // The base's diff: hunks of added lines, a deleted file, a hunk that only removes.
@@ -915,18 +451,18 @@ fn selftest(p: &Patterns) {
     let diff = "diff --git a/crates/a/src/lib.rs b/crates/a/src/lib.rs\n--- a/crates/a/src/lib.rs\n+++ b/crates/a/src/lib.rs\n\
         @@ -2,0 +3 @@ fn f() {\n+++ b/not/a/file\n@@ -9 +10,2 @@\n-old\n+y\n+z\n@@ -20 +21,0 @@\n-w\n\
         diff --git a/crates/a/src/gone.rs b/crates/a/src/gone.rs\n--- a/crates/a/src/gone.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-v\n";
-    let lines = added_lines(diff).unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &e.to_string()));
+    let lines = ratchet::added_lines(diff).unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &e.to_string()));
     expect(
         lines == BTreeMap::from([("crates/a/src/lib.rs".to_owned(), BTreeSet::from([3, 10, 11]))]),
         &format!("the lines added: {lines:?}"),
     );
-    expect(added_lines("@@ nonsense\n").is_err_and(|e| matches!(e, BaseError::Hunk { .. })), "a hunk that is none is refused");
+    expect(ratchet::added_lines("@@ nonsense\n").is_err_and(|e| matches!(e, BaseError::Hunk { .. })), "a hunk that is none is refused");
     expect(
-        parse_rows("a\t1\nb 2\n").is_err_and(|e| e == ListError::NotARow { line: 2, text: "b 2".to_owned() })
-            && parse_rows("a\t1\na\t2\n").is_err_and(|e| matches!(e, ListError::TwoRows { line: 2, .. }))
-            && parse_rows("a\t1\t0\n").is_err()
-            && parse_rows("a\tx\n").is_err()
-            && parse_rows("\t1\n").is_err(),
+        ratchet::parse_rows(LIST, "a\t1\nb 2\n").is_err_and(|e| e == ListError::NotARow { list: LIST.to_owned(), line: 2, text: "b 2".to_owned() })
+            && ratchet::parse_rows(LIST, "a\t1\na\t2\n").is_err_and(|e| matches!(e, ListError::TwoRows { line: 2, .. }))
+            && ratchet::parse_rows(LIST, "a\t1\t0\n").is_err()
+            && ratchet::parse_rows(LIST, "a\tx\n").is_err()
+            && ratchet::parse_rows(LIST, "\t1\n").is_err(),
         "a bad row is refused, naming its line",
     );
     println!("{SCRIPT} selftest: ok");
@@ -934,10 +470,10 @@ fn selftest(p: &Patterns) {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let p = Patterns::new();
+    let tests = Tests::new(SCRIPT);
     match args.as_slice() {
-        [one] if one == "selftest" => selftest(&p),
-        [one] => main_with(&p, &input::parse::<Args>(one, SCRIPT)),
+        [one] if one == "selftest" => selftest(&tests),
+        [one] => main_with(&tests, &input::parse::<Args>(one, SCRIPT)),
         _ => {
             eprintln!("usage: {SCRIPT} '<json>' | selftest\n\n{DOC}");
             std::process::exit(1);
@@ -953,14 +489,14 @@ mod tests {
     /// `blaze test`, not the script's first run.
     #[test]
     fn the_patterns_compile() {
-        let _ = Patterns::new();
+        let _ = Tests::new(SCRIPT);
     }
 
     /// The script's own cases run under `blaze test` and `cargo test` too: one that fails ends
     /// the test process with status 1, which fails the run.
     #[test]
     fn the_selftest_holds() {
-        selftest(&Patterns::new());
+        selftest(&Tests::new(SCRIPT));
     }
 
     /// A rise over the crate's row is refused, naming the cast the base's diff added; the tree
@@ -969,10 +505,10 @@ mod tests {
     fn a_rise_is_refused_with_its_site() {
         let counts = BTreeMap::from([("s".to_owned(), sites_of("crates/s/src/lib.rs", &[3, 9]))]);
         let at_row = BTreeMap::from([("s".to_owned(), 2)]);
-        assert!(problems(&counts, &at_row, Some(&at_row), None).is_empty());
+        assert!(ratchet::problems(&POLICY, &counts, &at_row, Some(&at_row), None, named).is_empty());
         let under = BTreeMap::from([("s".to_owned(), 1)]);
         let added = BTreeMap::from([("crates/s/src/lib.rs".to_owned(), BTreeSet::from([9]))]);
-        let said = problems(&counts, &under, None, Some(&added));
+        let said = ratchet::problems(&POLICY, &counts, &under, None, Some(&added), named);
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(said[0].contains("over its row's 1") && said[0].contains("new: crates/s/src/lib.rs:9)"), "{said:?}");
     }
