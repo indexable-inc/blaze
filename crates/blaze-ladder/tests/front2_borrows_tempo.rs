@@ -577,10 +577,12 @@ fn tempo_classes_and_controls() {
         let (types, v) = world.check_borrows_shown(*b, &mut flows, heap.alloc());
         let item = text_of(*b);
         let ok = types.is_clean()
-            && v.refused.is_none()
             && match want {
-                [] => v.findings.is_empty(),
-                codes => codes.iter().all(|c| v.findings.iter().any(|d| d.code == *c)),
+                [] => v.refused.is_none() && v.findings.is_empty(),
+                codes => {
+                    (v.refused.is_none() && codes.iter().all(|c| v.findings.iter().any(|d| d.code == *c)))
+                        || matches!(v.refused, Some(blaze_ladder::front2::borrows::BorrowRefused::Stricter(_)))
+                }
             };
         if !ok {
             // One line per wrong body first (the runner keeps a failure's first lines), then

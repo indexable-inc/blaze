@@ -1676,8 +1676,10 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     }
     let Some((typeck, tys, type_misses)) = typeck else { return Err(BodyError::Rounds { item, last }) };
     defaults_gate(names, krate, &typeck).map_err(|why| BodyError::Record { item, owner, why })?;
-    let body_env = Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts, body: None };
-    store.register_record_defaults(names, keys, item, &body_env, None, &view).map_err(|why| BodyError::Record { item, owner, why })?;
+    if Store::view_has_record_type(&view) {
+        let body_env = Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts, body: None };
+        store.register_record_defaults(names, keys, item, &body_env, None, &view).map_err(|why| BodyError::Record { item, owner, why })?;
+    }
 
     let in_scope = names.traits_in_scope(module, alloc).map_err(|error| BodyError::Traits { item, error })?;
     let mut traits = Vec::with_capacity_in(in_scope.len(), Global);

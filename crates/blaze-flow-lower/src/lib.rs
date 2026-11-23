@@ -1857,6 +1857,10 @@ struct Lower<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule = one_
     nargs: u32,
     /// The async block whose body is lowered (`lower_async`); `None` for a fn body.
     async_root: Option<ExprId>,
+    /// True when the outer body is an `async fn` whose return place `Local(0)` holds the single
+    /// opaque future region (`future_region`), so the root async block's capture origins flow one
+    /// way into it without equating independent captures (`relate`).
+    async_body: bool,
     /// Per capture by reference of the async block: the pattern, the place `*arg` an
     /// `Expr::Local` of it reads, and its type.
     upvar_places: Vec<(PatId, Place, TyD), A>,
@@ -1961,6 +1965,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             held: None,
             nargs: n,
             async_root: None,
+            async_body: false,
             upvar_places: Vec::new_in(alloc),
             points: Vec::new_in(alloc),
             identity: Vec::new_in(alloc),
@@ -2961,6 +2966,19 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             self.relate_by(s.start, d.start, &vs);
             return Ok(());
         }
+        // An `async fn`'s outer body returns its root async block into `Local(0)`'s single
+        // `future_region`: each captured lifetime outlives that future region (one way), without
+        // equating independent captures or tripping `Unified::ValueInexact`.
+        if self.async_body && dst == self.place_of(Local(0)) && s.exact && d.exact && d.len == 1 {
+            if let (Ok(d_start), Ok(s_start), Ok(s_end)) = (usize::try_from(d.start), usize::try_from(s.start), usize::try_from(s.start + s.len))
+                && let (Some(&o), Some(srcs)) = (self.origs.get(d_start), self.origs.get(s_start..s_end))
+            {
+                for &src_o in srcs {
+                    self.b.subset(src_o, o);
+                }
+                return Ok(());
+            }
+        }
         if s.len + d.len > 2 {
             self.coarse_step(Form::Unified { why: Unified::ValueInexact }, e);
         }
@@ -3463,6 +3481,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             };
             let declared = self.sig_declared(sig, i, root)?;
             let async_body = is_out && sig.body() != BodyOut::Output;
+            if async_body {
+                self.async_body = true;
+            }
             let rpit_future = is_out && !async_body && matches!(self.node(t.ty, root)?, PNode::Future(..));
             // An `async fn`'s body returns its future, the root async block's value (the
             // Reference, "Async functions"; `BodyOut`): ONE region. What the future yields is
@@ -5831,6 +5852,19 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             self.push_place(tp, ty);
             return Ok(());
         }
+        // An explicit cast `&T as &dyn Trait` (e.g. tracing's `&display(&x) as &dyn Value`):
+        // unsizing to a trait object whose trait writes no lifetimes relates one way into the
+        // object reference and its lifetime bound (`unsize_to_object`), never via `AggregateHub`.
+        if !fmt
+            && elems.is_none()
+            && parts.len() == 1
+            && matches!(self.expr(e)?, Expr::Cast { .. })
+            && let At::Place(p) = parts[0].at
+            && self.unsize_to_object(p, parts[0].ty, tp, ty, e)?
+        {
+            self.push_place(tp, ty);
+            return Ok(());
+        }
         match elems {
             Some(tys) if !fmt && d.exact && tys.len() == vs.len() && self.plant != Plant::TupleUnified => {
                 let mut off = d.start;
@@ -6374,9 +6408,102 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         let (Some(slots), Ok(declared)) = (own_sig.input(param as u32), self.sig_declared(own_sig, param as u32, e)) else {
             return self.refuse(Form::CalleeValueUnknown, e);
         };
-        // Only a fn pointer's signature is its type's (`fn(&u8) -> &u8`). A `dyn Fn(..)` or a
-        // type parameter bounded by `Fn(..)` has it in a clause's column (pieces L4, L5): not
-        // read here, refused by name.
+        // A fn pointer's signature is its type's (`fn(&u8) -> &u8`); a type parameter bounded by
+        // `Fn`/`FnMut`/`FnOnce` (`f: impl Fn(&u8) -> bool`) has its signature in the enclosing
+        // fn's own clause columns (D148 L4/L5). A `dyn Fn(..)` is still refused by name.
+        if let PNode::Param(tp) = self.head_node(declared, e)? {
+            if dest_ty.wrap.is_some() || args.iter().any(|v| v.ty.wrap.is_some()) {
+                return self.refuse(Form::CalleeValueUnknown, e);
+            }
+            let clauses = match facts.regions().clauses(self.body.owner) {
+                Ok(c) => c,
+                Err(RegionsUnread { item, why }) => return self.refuse(Form::RegionsUnread { item, why }, e),
+            };
+            let mut fn_args: Option<(PTy, &'b [Region])> = None;
+            let mut fn_out: Option<(PTy, &'b [Region])> = None;
+            let mut multi = false;
+            for cv in clauses.iter() {
+                match self.head_node(cv.col.ty(), e)? {
+                    PNode::ExTrait(_, list) => {
+                        let [me, tuple] = self.head_list(list, e)? else { continue };
+                        if !matches!(self.head_node(*me, e)?, PNode::Param(q) if q == tp) {
+                            continue;
+                        }
+                        let PNode::Tuple(in_list) = self.head_node(*tuple, e)? else { continue };
+                        if self.head_list(in_list, e)?.len() != args.len() {
+                            continue;
+                        }
+                        let Some(in_slots) = cv.col.child(1) else { continue };
+                        if fn_args.is_some() {
+                            multi = true;
+                        } else {
+                            fn_args = Some((*tuple, in_slots));
+                        }
+                    }
+                    PNode::ExProj { name, args: list, term, .. } if name == Name::of("Output") => {
+                        let [me, tuple] = self.head_list(list, e)? else { continue };
+                        if !matches!(self.head_node(*me, e)?, PNode::Param(q) if q == tp) {
+                            continue;
+                        }
+                        let PNode::Tuple(in_list) = self.head_node(*tuple, e)? else { continue };
+                        if self.head_list(in_list, e)?.len() != args.len() {
+                            continue;
+                        }
+                        let Some(out_slots) = cv.col.child(2) else { continue };
+                        if fn_out.is_some() {
+                            multi = true;
+                        } else {
+                            fn_out = Some((term, out_slots));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let (Some((tuple_ty, in_slots)), false) = (fn_args, multi) else {
+                return self.refuse(Form::CalleeValueUnknown, e);
+            };
+            let mut held: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
+            let mut regions: Vec<Region, A> = Vec::new_in(self.alloc);
+            if !self.lay_positions(tuple_ty, in_slots, &mut held, e)? || held.iter().any(Option::is_none) {
+                return self.refuse(Form::CalleeValueUnknown, e);
+            }
+            for r in held.iter().flatten() {
+                if matches!(r, Region::Param(_)) {
+                    return self.refuse(Form::CalleeValueUnknown, e);
+                }
+                regions.push(*r);
+            }
+            match fn_out {
+                Some((out_ty, out_slots)) => {
+                    if !self.lay_positions(out_ty, out_slots, &mut held, e)? || held.iter().any(Option::is_none) {
+                        return self.refuse(Form::CalleeValueUnknown, e);
+                    }
+                    for r in held.iter().flatten() {
+                        if matches!(r, Region::Param(_)) {
+                            return self.refuse(Form::CalleeValueUnknown, e);
+                        }
+                        regions.push(*r);
+                    }
+                }
+                None if self.npos_d(dest_ty, e)? != 0 => return self.refuse(Form::CalleeValueUnknown, e),
+                None => {}
+            }
+            let mut ends: Vec<u32, A> = Vec::new_in(self.alloc);
+            let mut at = 0u32;
+            for v in args.iter() {
+                at += self.npos_d(v.ty, e)?;
+                ends.push(at);
+            }
+            if usize::try_from(at + self.npos_d(dest_ty, e)?).ok() != Some(regions.len()) {
+                return self.refuse(Form::CalleeValueUnknown, e);
+            }
+            let laid = Laid { regions: &regions, ends: &ends, bounds: &[] };
+            if !self.call_laid(laid, None, &[], args, dest, dest_ty, e)? {
+                return self.refuse(Form::CalleeValueUnknown, e);
+            }
+            self.stats.calls_by_signature += 1;
+            return Ok(());
+        }
         let PNode::FnPtr(list, _) = self.head_node(declared, e)? else {
             return self.refuse(Form::CalleeValueUnknown, e);
         };

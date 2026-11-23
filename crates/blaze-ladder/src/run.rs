@@ -2694,6 +2694,10 @@ fn build_from<P: FrontEnd>(
                 Err(error) => {
                     let at = crate::callee_shown::self_shown(program, ground.view(), called.args);
                     let refusal = RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), at, error };
+                    if may_ask && asks_again(&refusal) {
+                        ask_again = true;
+                        break;
+                    }
                     match unresolved(&mut survey, &mut reached, called, i, refusal)? {
                         Some(slot) => {
                             via.push(Via::Slot);
@@ -2721,6 +2725,10 @@ fn build_from<P: FrontEnd>(
                         }
                         crate::clone_shim::NoteError::Build(error) => RunError::Build { function: name(), error, range: None },
                     };
+                    if may_ask && asks_again(&refusal) {
+                        ask_again = true;
+                        break;
+                    }
                     match unresolved(&mut survey, &mut reached, called, i, refusal)? {
                         Some(slot) => {
                             via.push(Via::Slot);

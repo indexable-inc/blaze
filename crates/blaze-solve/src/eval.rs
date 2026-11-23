@@ -1593,7 +1593,7 @@ impl<'a, E: Emit> Solver<'a, E> {
                 self.nested(tys, snaps, probes, top)?;
             }
             Phase::Merge => {
-                let ans = self.pull(tys, src, top, |s, _, facts| s.merge(facts, top))?;
+                let ans = self.merge(tys, src, top)?;
                 return self.finish(tys, snaps, probes, top, ans);
             }
         }
@@ -2284,26 +2284,46 @@ impl<'a, E: Emit> Solver<'a, E> {
         Ok(Got::Pushed)
     }
 
-    fn merge<F: Facts>(&mut self, facts: &F, top: usize) -> Result<Ans, Stop> {
+    fn merge<T: Tys, S: FactSource<T>>(&mut self, tys: &mut T, src: &mut S, top: usize) -> Result<Ans, Stop> {
         let f = self.frames[top];
         self.merge_dones.clear();
         self.merge_dones.extend_from_slice(&self.dones[f.dones_lo as usize..]);
         let mut m = Merger { resps: &mut self.resps, vars: f.vars, bail: None };
         // Specialization between two impl candidates, a fact of the impls read like any other
-        // (the frame's read list keeps it).
-        let ask = Ask::new(facts);
+        // (the frame's read list keeps it). Pull missing pairs in place so `filter_specialized_impls`
+        // does not restart from `(0, 0)` on every miss (avoiding O(N^4) rescans).
         self.reads.lo = f.reads_lo;
         let reads = &mut self.reads;
         let dones = &mut self.merge_dones;
-        let mut specializes = |a: Def, b: Def| ask.specializes(reads, a, b);
-        let ans = match f.kind {
-            Kind::Trait => match trait_goals::merge(&mut m, f.mode, &f.tstate, dones, &mut specializes)? {
-                Some((r, via)) => Some(m.with_via(r, via)?),
-                None => None,
-            },
-            Kind::Alias => crate::alias::merge(&mut m, f.mode, f.goal.pred, dones, &mut specializes)?,
-            Kind::WellFormed | Kind::Other => m.merge_responses(dones)?,
+        let mut pulls = 0u32;
+        let mut specializes = |a: Def, b: Def| -> Result<bool, Stop> {
+            loop {
+                match Ask::new(src.facts()).specializes(reads, a, b) {
+                    Ok(v) => return Ok(v),
+                    Err(Stop::Need(q)) if S::PULLS => {
+                        if pulls >= MAX_PULLS {
+                            return Err(Stop::Error(SolveError::Limit(Limit::Pulls)));
+                        }
+                        if !src.fill(tys, q) {
+                            return Err(Stop::Need(q));
+                        }
+                        pulls += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
         };
+        let merged = match f.kind {
+            Kind::Trait => match trait_goals::merge(&mut m, f.mode, &f.tstate, dones, &mut specializes) {
+                Ok(Some((r, via))) => Ok(Some(m.with_via(r, via)?)),
+                Ok(None) => Ok(None),
+                Err(e) => Err(e),
+            },
+            Kind::Alias => crate::alias::merge(&mut m, f.mode, f.goal.pred, dones, &mut specializes),
+            Kind::WellFormed | Kind::Other => m.merge_responses(dones).map_err(Stop::Error),
+        };
+        self.scratch.stats.pulls += u64::from(pulls);
+        let ans = merged?;
         let bail = m.bail;
         if self.maybe_on {
             self.maybe_merged(top, ans, bail);

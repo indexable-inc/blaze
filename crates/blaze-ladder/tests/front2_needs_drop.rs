@@ -45,7 +45,9 @@ use blaze_own::Alloc;
 use blaze_scope::names::{self, Written};
 use blaze_surface::{Namespace, PathKind};
 
-const MAIN: &str = "use core::mem::{ManuallyDrop, needs_drop};
+const MAIN: &str = "extern crate alloc;
+use alloc::{string::String, vec::Vec};
+use core::mem::{ManuallyDrop, needs_drop};
 
 fn main() {}
 

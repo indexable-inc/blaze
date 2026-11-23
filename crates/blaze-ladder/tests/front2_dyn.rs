@@ -166,6 +166,7 @@ fn dyn_types_through_front2() {
 }
 
 const RECEIVERS: &str = "extern crate alloc;
+use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::sync::Arc;
 use core::pin::Pin;

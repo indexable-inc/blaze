@@ -23,6 +23,7 @@ use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::Front2;
 use blaze_ladder::front2::body::lower_fn;
 use blaze_ladder::front2::check::{BuildOrder, CheckFail, Records, check_body};
+use blaze_ladder::front2::consts::Consts;
 use blaze_ladder::front2::heads::{Store, Want};
 use blaze_ladder::front2::spell::Spelling;
 use blaze_ladder::refusal::SourceFile;
@@ -32,10 +33,13 @@ use blaze_scope::names::{self, Written};
 use blaze_surface::{Namespace, PathKind};
 
 const MAIN: &str = "extern crate alloc;
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::rc::Rc;
+use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
-fn main(cx: &Cx, io: Io) -> Result<(), Error> {
+fn main(cx: &Cx, out: Out) -> Result<(), Error> {
+    let _ = (cx, out);
     Ok(())
 }
 fn vec_len(v: Vec<u8>) -> usize { v.len() }
@@ -177,6 +181,7 @@ fn deref_and_try_through_front2() {
     };
     let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut buckets = None;
+    let mut consts = Consts::default();
     let mut failed = Vec::new();
     let mut report: Vec<String> = Vec::new();
     let cases = CLEAN.iter().map(|&(n, p)| (n, p, None)).chain(REFUSED.iter().map(|&(n, w)| (n, "must be refused", Some(w))));
@@ -197,7 +202,7 @@ fn deref_and_try_through_front2() {
         let view = body.lowered.view();
         let spell = Spelling::of(&view).expect("spelling");
         let scope = body.scope(&spell);
-        let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: None };
+        let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, prepared)) };
         match (check_body(&mut records, &body, &scope), want) {
             (Ok(_), None) => report.push(format!("{name}: clean")),
             (Err(CheckFail::Diags { diags, .. }), Some(w)) if format!("{diags:?}").starts_with(&format!("[({w},")) => {

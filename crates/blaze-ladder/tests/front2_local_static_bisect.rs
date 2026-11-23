@@ -85,51 +85,78 @@ fn keys_in(text: &str) -> Vec<u128> {
 
 #[test]
 fn local_static_bisect() {
-    let home = std::env::var("HOME").expect("HOME is set");
+    use core::fmt::Write as _;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::{env, sync::Mutex, thread};
+    let home = env::var("HOME").expect("HOME is set");
     let shelf = format!("{home}/.blaze/v2/toolchain");
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
-    for (case, decl, name, local) in CASES {
-        let text = match local {
-            true => format!("fn main() {{\n    {decl}\n    let _kept = &{name};\n}}\n"),
-            false => format!("{decl}\n\nfn main() {{\n    let _kept = &{name};\n}}\n"),
-        };
-        let files = [SourceFile { path: "src/main.rs", text: &text }];
-        let new = NewFront { package: "bisect", edition: "blaze-2026.11", shelf: Some(&shelf), overflow: blaze_build::OverflowChecks::On };
-        let texts = match ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind) {
-            Ok(t) => t,
-            Err(e) => {
-                note(&format!("case {case}: the program's texts: {e}"));
-                continue;
+    let next = AtomicUsize::new(0);
+    let results = Mutex::new([const { None }; CASES.len()]);
+    let workers = thread::available_parallelism().map_or(2, |n| n.get().min(6));
+    thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                let idx = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&(case, decl, name, local)) = CASES.get(idx) else { break };
+                let mut lines = format!("");
+                let text = match local {
+                    true => format!("fn main() {{\n    {decl}\n    let _kept = &{name};\n}}\n"),
+                    false => format!("{decl}\n\nfn main() {{\n    let _kept = &{name};\n}}\n"),
+                };
+                let files = [SourceFile { path: "src/main.rs", text: &text }];
+                let new = NewFront { package: "bisect", edition: "blaze-2026.11", shelf: Some(&shelf), overflow: blaze_build::OverflowChecks::On };
+                let texts = match ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = writeln!(lines, "case {case}: the program's texts: {e}");
+                        results.lock().unwrap()[idx] = Some(lines);
+                        continue;
+                    }
+                };
+                let user = texts.user();
+                let inputs = match Inputs::new(&user, &tc) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        let _ = writeln!(lines, "case {case}: the crates: {e}");
+                        results.lock().unwrap()[idx] = Some(lines);
+                        continue;
+                    }
+                };
+                let crates = inputs.crates();
+                let names_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("names frame");
+                let names_erased = blaze_own::Erased::new(&names_frame);
+                let names = match inputs.resolve(&crates, names_erased.bump()) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ = writeln!(lines, "case {case}: resolve_crates: {e}");
+                        results.lock().unwrap()[idx] = Some(lines);
+                        continue;
+                    }
+                };
+                let said = match build_stubbed(&names, &files, &texts, blaze_own::Alloc::global()) {
+                    Ok(_) => {
+                        let _ = writeln!(lines, "case {case}: ok");
+                        results.lock().unwrap()[idx] = Some(lines);
+                        continue;
+                    }
+                    Err(e) => format!("{e}").replace('\n', " "),
+                };
+                let _ = writeln!(lines, "case {case}: {said}");
+                for k in keys_in(&said) {
+                    let prefix = k.to_be_bytes();
+                    let owner = names.crates().iter().find(|c| c.key.prefix()[..] == prefix[..8]).map_or("no crate of this program", |c| c.name);
+                    let _ = writeln!(lines, "  key {k:#034x}: crate {owner}");
+                }
+                results.lock().unwrap()[idx] = Some(lines);
+            });
+        }
+    });
+    for slot in results.into_inner().unwrap() {
+        if let Some(block) = slot {
+            for line in block.lines() {
+                note(line);
             }
-        };
-        let user = texts.user();
-        let inputs = match Inputs::new(&user, &tc) {
-            Ok(i) => i,
-            Err(e) => {
-                note(&format!("case {case}: the crates: {e}"));
-                continue;
-            }
-        };
-        let crates = inputs.crates();
-        let names = match inputs.resolve(&crates, blaze_own::testing::bump()) {
-            Ok(n) => n,
-            Err(e) => {
-                note(&format!("case {case}: resolve_crates: {e}"));
-                continue;
-            }
-        };
-        let said = match build_stubbed(&names, &files, &texts, blaze_own::Alloc::global()) {
-            Ok(_) => {
-                note(&format!("case {case}: ok"));
-                continue;
-            }
-            Err(e) => format!("{e}").replace('\n', " "),
-        };
-        note(&format!("case {case}: {said}"));
-        for k in keys_in(&said) {
-            let prefix = k.to_be_bytes();
-            let owner = names.crates().iter().find(|c| c.key.prefix()[..] == prefix[..8]).map_or("no crate of this program", |c| c.name);
-            note(&format!("  key {k:#034x}: crate {owner}"));
         }
     }
 }

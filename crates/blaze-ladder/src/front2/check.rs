@@ -345,34 +345,11 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
                 if trace_ask.is_some() {
                     r.store.traced = cx.take_trace();
                 }
-                match super::opaque_auto::after_auto_gap(r, owner, &error, &mut leaks) {
-                    Ok(true) => continue,
-                    Ok(false) => {}
-                    Err(why) => {
-                        // The round stopped before a finished list could be filed.
-                        // Its reader still needs to hear when the defining body is repaired.
-                        if let (Some(asked), tc::CheckError::OpaqueHiddenUnknown { opaque, .. }) = (asked.as_deref_mut(), &error) {
-                            asked.questions.push(tc::Question::Opaque(*opaque));
-                        }
-                        return Err(why);
-                    }
-                }
-                // A body with no diagnostic of the checker's that recorded the error type, where
-                // the front end gave it that type for a written type that named nothing (its own,
-                // or its signature's: front2 type_miss.rs): no clean body, and no invariant
-                // broken. Its findings are its signature's misses (said here, by the fn's own
-                // body alone: its callers' checks never say them) and its own; the checker said
-                // nothing else.
-                if matches!(error, tc::CheckError::UnknownInCleanBody { .. }) && (!body.type_misses.is_empty() || r.store.type_misses.contains_key(&owner)) {
-                    let mut diags = Vec::with_capacity_in(body.type_misses.len(), Global);
-                    diags.extend(signature_misses(r, owner));
-                    diags.extend(body.type_misses.iter().map(|m| (tc::DiagCode::UnresolvedType, m.range(), m.words.clone())));
-                    return Err(said(r, owner, diags, alloc));
-                }
-                return Err(CheckFail::Check { owner, error });
+                handle_check_error(r, body, owner, error, &mut leaks, asked.as_deref_mut(), alloc)?;
+                continue;
             }
         };
-        if let Some((tally, _)) = &mut count {
+        if let Some((tally, _)) = count.as_mut() {
             cx.add_solver_counts(&mut tally.solve);
         }
         if let Some(cost) = meter {
@@ -380,7 +357,6 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             cx.add_solver_counts(&mut solve);
             cost.round(&solve);
         }
-        // The last round's keys: an earlier round's goals are asked again in the next.
         if let Some(keys) = root_keys.as_deref_mut() {
             keys.clear();
             keys.extend_from_slice(cx.root_keys());
@@ -389,26 +365,14 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
         if r.order == BuildOrder::Reversed {
             fills.reverse();
         }
-        // A failed candidate is a gap only of a question it is a candidate of (the world's
-        // `impls_of`/`inherent`), never of every body checked after it failed.
         let mut gaps = world.gaps.into_inner();
         if trace_ask.is_some() {
             r.store.traced = cx.take_trace();
         }
-        // A const term the body's conversion left a hole (`[0u8; N * 2]`, `f::<{ N + 1 }>()`)
-        // was checked as a const variable, which takes any value: a gap of every round, so
-        // the finished check is no answer and none of its diagnostics is the program's.
         gaps.extend(body.typeck.const_gaps.iter().map(|&gap| Gap::BodyConst { owner, gap }));
         let round_gaps = !gaps.is_empty();
-        for gap in gaps {
-            // `Gap` holds checker questions and library errors with no `Eq`: one gap is one
-            // `Debug` text, so the list names each once.
-            // Kept sorted by that text: the round a gap is met in depends on what earlier rounds
-            // made, so the list's order must not.
-            let shown = format!("{gap:?}");
-            if let Err(at) = all_gaps.binary_search_by(|g| format!("{g:?}").cmp(&shown)) {
-                all_gaps.insert(at, gap);
-            }
+        if round_gaps {
+            merge_gaps(&mut all_gaps, gaps);
         }
         let needs = match out {
             // A finished check with a diagnostic is not a checked body: each is a finding.
@@ -417,26 +381,9 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             // one of the fn's own signature (its head's, `Store::type_misses`): a body whose
             // head holds the error type is never a clean check, even where the walk read none.
             Outcome::Done(done) if !round_gaps && !allow_diags && (!done.diags.is_empty() || !body.type_misses.is_empty() || r.store.type_misses.contains_key(&owner)) => {
-                let mut diags = Vec::with_capacity_in(body.type_misses.len() + done.diags.len(), Global);
-                diags.extend(signature_misses(r, owner));
-                diags.extend(body.type_misses.iter().map(|m| (tc::DiagCode::UnresolvedType, m.range(), m.words.clone())));
-                let tys = done.types.view();
-                let mut future_goals = Vec::with_capacity_in(done.diags.len(), Global);
-                for d in done.diags.iter() {
-                    if let Some(trait_) = future_goal_trait(tys, d)
-                        && future_goals.iter().any(|&(at, seen)| at == d.at && seen == trait_)
-                    {
-                        continue;
-                    }
-                    if let Some(trait_) = future_goal_trait(tys, d) {
-                        future_goals.push((d.at, trait_));
-                    }
-                    diags.push((d.code, d.at, diag_about(r, scope.spell, tys, &view, d, &done.why)));
-                }
-                if let Some(asked) = asked.as_deref_mut() {
-                    asked.finished = Some(done.reads.clone());
-                }
-                return Err(said(r, owner, diags, alloc));
+                let tys = body.tys.view(&r.store.tys).map_err(|error| CheckFail::Check { owner, error })?;
+                let view: BodyView<'_> = body.typeck.view(tys);
+                return Err(collect_done_diags(r, body, scope, &view, owner, done, asked.as_deref_mut(), alloc));
             }
             Outcome::Done(done) if !round_gaps => {
                 if !allow_diags
@@ -451,7 +398,6 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
                 r.store.goal_hits = hits;
                 return Ok(done);
             }
-            // A gap answered `Missing`, so a finished check past one is no answer.
             Outcome::Done(done) => {
                 if !r.store.inferring_output_stack.is_empty() {
                     for g in all_gaps.iter() {
@@ -461,7 +407,7 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
                         }
                     }
                 }
-                if let Some(asked) = asked.as_deref_mut() {
+                if let Some(asked) = asked {
                     asked.finished = Some(done.reads.clone());
                 }
                 return Err(CheckFail::Gap { owner, gaps: all_gaps });
@@ -487,8 +433,6 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             }
             return Err(CheckFail::Gap { owner, gaps: all_gaps });
         }
-        // A question that met more than `MOST_IMPORTS_A_QUESTION` heads stands `Missing` with
-        // its heads imported: the next round finds them made (the cost test counts the round).
         if fills.is_empty() && r.store.imports() != imported_at {
             hints = needs;
             continue;
@@ -535,23 +479,113 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             };
         }
         made += filling - dropped;
-        if let Some((tally, _)) = &mut count {
+        if let Some((tally, _)) = count.as_mut() {
             tally.dropped += dropped;
             if round > 0 {
                 for &q in needs.missing.iter() {
-                    tally.late_holes[tc::question_kind(q)] += 1;
+                    if let Some(slot) = tally.late_holes.get_mut(tc::question_kind(q)) {
+                        *slot += 1;
+                    }
                 }
             }
         }
         hints = needs;
     }
+    Err(rounds_exhausted(r, owner, made, &hints, &holes))
+}
+
+#[cold]
+#[inline(never)]
+fn merge_gaps<A: core::alloc::Allocator>(all_gaps: &mut Vec<Gap, A>, gaps: Vec<Gap, A>) {
+    for gap in gaps {
+        let shown = format!("{gap:?}");
+        if let Err(at) = all_gaps.binary_search_by(|g| format!("{g:?}").cmp(&shown)) {
+            all_gaps.insert(at, gap);
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn rounds_exhausted<'n, S: NamesSource<'n>>(
+    r: &Records<'_, 'n, S>,
+    owner: ItemKey,
+    made: u64,
+    hints: &Needs<'static>,
+    holes: &RoundHoles,
+) -> CheckFail {
     let mut last = Vec::new_in(Global);
     last.extend_from_slice(&hints.missing);
     let mut fail = rounds_fail(r, owner, "the body's check", made, last);
     if let CheckFail::Rounds { last, shown, .. } = &mut fail {
         *shown = format!("{shown}; {}", holes.said(last)).into_boxed_str();
     }
-    Err(fail)
+    fail
+}
+
+#[cold]
+#[inline(never)]
+fn handle_check_error<'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    body: &Body<'_>,
+    owner: ItemKey,
+    error: tc::CheckError,
+    leaks: &mut blaze_own::Vec<ItemKey, blaze_own::Alloc<'static>>,
+    asked: Option<&mut super::reads::Asked<'_>>,
+    alloc: blaze_own::Alloc<'static>,
+) -> Result<(), CheckFail> {
+    match super::opaque_auto::after_auto_gap(r, owner, &error, leaks) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(why) => {
+            if let (Some(asked), tc::CheckError::OpaqueHiddenUnknown { opaque, .. }) = (asked, &error) {
+                asked.questions.push(tc::Question::Opaque(*opaque));
+            }
+            return Err(why);
+        }
+    }
+    if matches!(error, tc::CheckError::UnknownInCleanBody { .. }) && (!body.type_misses.is_empty() || r.store.type_misses.contains_key(&owner)) {
+        let mut diags = Vec::with_capacity_in(body.type_misses.len(), Global);
+        diags.extend(signature_misses(r, owner));
+        diags.extend(body.type_misses.iter().map(|m| (tc::DiagCode::UnresolvedType, m.range(), m.words.clone())));
+        return Err(said(r, owner, diags, alloc));
+    }
+    Err(CheckFail::Check { owner, error })
+}
+
+#[cold]
+#[inline(never)]
+#[expect(clippy::too_many_arguments, reason = "outlined diagnostic formatting of check_rounds_as")]
+fn collect_done_diags<'n, S: NamesSource<'n>>(
+    r: &Records<'_, 'n, S>,
+    body: &Body<'_>,
+    scope: &BodyScope<'_>,
+    view: &BodyView<'_>,
+    owner: ItemKey,
+    done: tc::Checked<'static>,
+    asked: Option<&mut super::reads::Asked<'_>>,
+    alloc: blaze_own::Alloc<'static>,
+) -> CheckFail {
+    let mut diags = Vec::with_capacity_in(body.type_misses.len() + done.diags.len(), Global);
+    diags.extend(signature_misses(r, owner));
+    diags.extend(body.type_misses.iter().map(|m| (tc::DiagCode::UnresolvedType, m.range(), m.words.clone())));
+    let tys = done.types.view();
+    let mut future_goals = blaze_own::Vec::with_capacity_in(done.diags.len(), alloc);
+    for d in done.diags.iter() {
+        if let Some(trait_) = future_goal_trait(tys, d)
+            && future_goals.iter().any(|&(at, seen)| at == d.at && seen == trait_)
+        {
+            continue;
+        }
+        if let Some(trait_) = future_goal_trait(tys, d) {
+            future_goals.push((d.at, trait_));
+        }
+        diags.push((d.code, d.at, diag_about(r, scope.spell, tys, view, d, &done.why)));
+    }
+    if let Some(asked) = asked {
+        asked.finished = Some(done.reads.clone());
+    }
+    said(r, owner, diags, alloc)
 }
 
 /// The holes each round of a body's check met (item 9's measure, rt-loop a1850: `tempo_main_with`

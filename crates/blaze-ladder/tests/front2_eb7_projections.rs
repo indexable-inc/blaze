@@ -117,12 +117,12 @@ fn inherited_projection_bounds_use_the_concrete_impl() {
         assert!(v.reads.is_some() && v.gaps.is_empty() && v.refused.is_none() && v.undecided.is_empty(), "{name}: {v:?}");
         if matches!(name, "wrong_receipt" | "unspecified") {
             let [d] = v.diagnostics.as_slice() else { panic!("{name}: expected one diagnostic, got {v:?}") };
-            assert_eq!(d.code, "E0277", "{name}: {d:?}");
+            assert_eq!(d.code, "E0271", "{name}: {d:?}");
             assert!(d.text.contains("as RpcTypes>::Receipt == Request"), "{name}: {d:?}");
             if name == "wrong_receipt" {
                 assert!(d.text.contains("<Marker as RpcTypes>"), "{name}: {d:?}");
             }
-            println!("{name}: E0277 on RpcTypes::Receipt == Request");
+            println!("{name}: E0271 on RpcTypes::Receipt == Request");
         } else {
             assert!(v.diagnostics.is_empty(), "{name}: {v:?}");
             println!("{name}: clean");
