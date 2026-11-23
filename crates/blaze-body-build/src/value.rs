@@ -37,71 +37,151 @@ const REPEAT_CAP: u64 = 4096;
 impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     /// `ty` of the body's table at this instance, in the ground table.
     /// Grounding also handles types interned into the body's own overlay (`BodyBuilder::intern_ty`)
-    /// recursively up to a fixed depth bound.
+    /// iteratively up to a fixed depth bound.
     pub(crate) fn ground(&mut self, ty: PTy) -> Result<PTy, BuildError> {
-        self.ground_depth(ty, 0)
-    }
-
-    fn ground_depth(&mut self, ty: PTy, depth: u32) -> Result<PTy, BuildError> {
         const MAX_OVERLAY_DEPTH: u32 = 32;
-        if let Ok(Some(node)) = self.v.own_ty(ty) {
-            if depth >= MAX_OVERLAY_DEPTH {
-                return Err(self.unsupported("a deeply nested type of the body's own overlay"));
-            }
-            let grounded = match node {
-                PNode::Bool
-                | PNode::Char
-                | PNode::Str
-                | PNode::Never
-                | PNode::Int(_)
-                | PNode::Uint(_)
-                | PNode::Float(_) => node,
-                PNode::ConstValue { ty: cty, bits } => {
-                    let cty = self.ground_depth(cty, depth + 1)?;
-                    PNode::ConstValue { ty: cty, bits }
+        if !matches!(self.v.own_ty(ty), Ok(Some(_))) {
+            return ground(self.from, ty, self.subst.args, self.subst.ground, self.subst.scratch, self.adts.facts()).map_err(|e| self.facts(e));
+        }
+        enum Frame<A: Allocator> {
+            ConstValue(u128),
+            Ref(blaze_typeck::Mutbl),
+            Ptr(blaze_typeck::Mutbl),
+            Slice,
+            Array { len: PTy, elem: Option<PTy> },
+            List { kind: ListKind, pending: Vec<PTy, A>, done: Vec<PTy, A> },
+        }
+        enum ListKind {
+            Tuple,
+            Adt(blaze_typeck::ItemKey),
+            FnDef(blaze_typeck::ItemKey),
+        }
+        let mut stack: Vec<(u32, Frame<A>), A> = Vec::new_in(self.alloc);
+        let mut cur_ty = ty;
+        let mut cur_depth: u32 = 0;
+        loop {
+            let mut resolved = if let Ok(Some(node)) = self.v.own_ty(cur_ty) {
+                if cur_depth >= MAX_OVERLAY_DEPTH {
+                    return Err(self.unsupported("a deeply nested type of the body's own overlay"));
                 }
-                PNode::Ref(m, inner) => PNode::Ref(m, self.ground_depth(inner, depth + 1)?),
-                PNode::Ptr(m, inner) => PNode::Ptr(m, self.ground_depth(inner, depth + 1)?),
-                PNode::Slice(inner) => PNode::Slice(self.ground_depth(inner, depth + 1)?),
-                PNode::Array(elem, len) => {
-                    let elem = self.ground_depth(elem, depth + 1)?;
-                    let len = self.ground_depth(len, depth + 1)?;
-                    PNode::Array(elem, len)
+                match node {
+                    PNode::Bool
+                    | PNode::Char
+                    | PNode::Str
+                    | PNode::Never
+                    | PNode::Int(_)
+                    | PNode::Uint(_)
+                    | PNode::Float(_) => self.subst.ground.intern(node).map_err(|_| self.malformed("the ground table is full"))?,
+                    PNode::ConstValue { ty: cty, bits } => {
+                        stack.push((cur_depth, Frame::ConstValue(bits)));
+                        cur_ty = cty;
+                        cur_depth += 1;
+                        continue;
+                    }
+                    PNode::Ref(m, inner) => {
+                        stack.push((cur_depth, Frame::Ref(m)));
+                        cur_ty = inner;
+                        cur_depth += 1;
+                        continue;
+                    }
+                    PNode::Ptr(m, inner) => {
+                        stack.push((cur_depth, Frame::Ptr(m)));
+                        cur_ty = inner;
+                        cur_depth += 1;
+                        continue;
+                    }
+                    PNode::Slice(inner) => {
+                        stack.push((cur_depth, Frame::Slice));
+                        cur_ty = inner;
+                        cur_depth += 1;
+                        continue;
+                    }
+                    PNode::Array(elem, len) => {
+                        stack.push((cur_depth, Frame::Array { len, elem: None }));
+                        cur_ty = elem;
+                        cur_depth += 1;
+                        continue;
+                    }
+                    PNode::Tuple(list) | PNode::Adt(_, list) | PNode::FnDef(_, list) => {
+                        let kind = match node {
+                            PNode::Tuple(_) => ListKind::Tuple,
+                            PNode::Adt(k, _) => ListKind::Adt(k),
+                            PNode::FnDef(k, _) => ListKind::FnDef(k),
+                            _ => return Err(self.unsupported("a type of the body's own overlay (not in its record's table)")),
+                        };
+                        let cap = usize::try_from(list.len).unwrap_or(0);
+                        let mut pending: Vec<PTy, A> = Vec::with_capacity_in(cap, self.alloc);
+                        let entries = self.v.ty_list(&self.from, list).map_err(|_| self.malformed("an overlay type list past its table"))?;
+                        for t in entries.iter() {
+                            pending.push(t);
+                        }
+                        pending.reverse();
+                        if let Some(first) = pending.pop() {
+                            let done = Vec::with_capacity_in(cap, self.alloc);
+                            stack.push((cur_depth, Frame::List { kind, pending, done }));
+                            cur_ty = first;
+                            cur_depth += 1;
+                            continue;
+                        }
+                        let empty = self.subst.ground.intern_list(&[]).map_err(|_| self.malformed("the ground table is full"))?;
+                        let out = match kind {
+                            ListKind::Tuple => PNode::Tuple(empty),
+                            ListKind::Adt(k) => PNode::Adt(k, empty),
+                            ListKind::FnDef(k) => PNode::FnDef(k, empty),
+                        };
+                        self.subst.ground.intern(out).map_err(|_| self.malformed("the ground table is full"))?
+                    }
+                    _ => return Err(self.unsupported("a type of the body's own overlay (not in its record's table)")),
                 }
-                PNode::Tuple(list) => {
-                    let list = self.ground_overlay_list(list, depth + 1)?;
-                    PNode::Tuple(list)
-                }
-                PNode::Adt(k, list) => {
-                    let list = self.ground_overlay_list(list, depth + 1)?;
-                    PNode::Adt(k, list)
-                }
-                PNode::FnDef(k, list) => {
-                    let list = self.ground_overlay_list(list, depth + 1)?;
-                    PNode::FnDef(k, list)
-                }
-                _ => return Err(self.unsupported("a type of the body's own overlay (not in its record's table)")),
+            } else {
+                ground(self.from, cur_ty, self.subst.args, self.subst.ground, self.subst.scratch, self.adts.facts()).map_err(|e| self.facts(e))?
             };
-            return self.subst.ground.intern(grounded).map_err(|_| self.malformed("the ground table is full"));
-        }
-        ground(self.from, ty, self.subst.args, self.subst.ground, self.subst.scratch, self.adts.facts()).map_err(|e| self.facts(e))
-    }
 
-    fn ground_overlay_list(&mut self, list: blaze_typeck::List, depth: u32) -> Result<blaze_typeck::List, BuildError> {
-        let items: Vec<PTy, A> = {
-            let cap = usize::try_from(list.len).unwrap_or(0);
-            let mut out = Vec::with_capacity_in(cap, self.alloc);
-            let entries = self.v.ty_list(&self.from, list).map_err(|_| self.malformed("an overlay type list past its table"))?;
-            for t in entries.iter() {
-                out.push(t);
+            loop {
+                let Some((frame_depth, frame)) = stack.pop() else {
+                    return Ok(resolved);
+                };
+                match frame {
+                    Frame::ConstValue(bits) => {
+                        resolved = self.subst.ground.intern(PNode::ConstValue { ty: resolved, bits }).map_err(|_| self.malformed("the ground table is full"))?;
+                    }
+                    Frame::Ref(m) => {
+                        resolved = self.subst.ground.intern(PNode::Ref(m, resolved)).map_err(|_| self.malformed("the ground table is full"))?;
+                    }
+                    Frame::Ptr(m) => {
+                        resolved = self.subst.ground.intern(PNode::Ptr(m, resolved)).map_err(|_| self.malformed("the ground table is full"))?;
+                    }
+                    Frame::Slice => {
+                        resolved = self.subst.ground.intern(PNode::Slice(resolved)).map_err(|_| self.malformed("the ground table is full"))?;
+                    }
+                    Frame::Array { len, elem: None } => {
+                        stack.push((frame_depth, Frame::Array { len, elem: Some(resolved) }));
+                        cur_ty = len;
+                        cur_depth = frame_depth + 1;
+                        break;
+                    }
+                    Frame::Array { elem: Some(elem), .. } => {
+                        resolved = self.subst.ground.intern(PNode::Array(elem, resolved)).map_err(|_| self.malformed("the ground table is full"))?;
+                    }
+                    Frame::List { kind, mut pending, mut done } => {
+                        done.push(resolved);
+                        if let Some(next) = pending.pop() {
+                            stack.push((frame_depth, Frame::List { kind, pending, done }));
+                            cur_ty = next;
+                            cur_depth = frame_depth + 1;
+                            break;
+                        }
+                        let interned = self.subst.ground.intern_list(&done).map_err(|_| self.malformed("the ground table is full"))?;
+                        let out = match kind {
+                            ListKind::Tuple => PNode::Tuple(interned),
+                            ListKind::Adt(k) => PNode::Adt(k, interned),
+                            ListKind::FnDef(k) => PNode::FnDef(k, interned),
+                        };
+                        resolved = self.subst.ground.intern(out).map_err(|_| self.malformed("the ground table is full"))?;
+                    }
+                }
             }
-            out
-        };
-        let mut grounded: Vec<PTy, A> = Vec::with_capacity_in(items.len(), self.alloc);
-        for &t in items.iter() {
-            grounded.push(self.ground_depth(t, depth)?);
         }
-        self.subst.ground.intern_list(&grounded).map_err(|_| self.malformed("the ground table is full"))
     }
 
     /// The layout of ground type `g`.

@@ -190,9 +190,9 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
     let toolchain = &listed.toolchain;
     let units = &graph.units;
     // The source corrections (D58): checked-in data; a package a row names is read corrected.
-    let corrections = blaze_fetch::correct::Table::checked_in(alloc.clone());
-    let mut corrected: AVec<'w, (u32, &'w str, &'w str)> = AVec::new_in(alloc.clone());
-    let mut used: AVec<'w, Corrected<'w>> = AVec::new_in(alloc.clone());
+    let corrections = blaze_fetch::correct::Table::checked_in(alloc);
+    let mut corrected: AVec<'w, (u32, &'w str, &'w str)> = AVec::new_in(alloc);
+    let mut used: AVec<'w, Corrected<'w>> = AVec::new_in(alloc);
     let tc = toolchain.crates();
     let t = tc.len() as u32;
     let proc_macro_crate = toolchain.proc_macro().map(|i| i as u32);
@@ -203,7 +203,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
     // two sets are chosen alike (core, alloc and Rust's std always; bstd for a blaze edition;
     // proc_macro as reached), and this match is the check that they agree: a crate of the list
     // not opened is refused by name, never left out.
-    let mut opened: AVec<'w, u32> = AVec::with_capacity_in(first, alloc.clone());
+    let mut opened: AVec<'w, u32> = AVec::with_capacity_in(first, alloc);
     for c in list.crates[..first].iter() {
         let not_opened = WorldError::ToolchainCrateNotOpened { krate: c.name };
         let ListOrigin::Toolchain { unit, .. } = c.origin else { return Err(not_opened) };
@@ -213,10 +213,10 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
 
     // Keys: dependencies first, by a work list (Kahn's) over the list past its target-side
     // toolchain crates (those are keyed by the toolchain).
-    let mut waiting: AVec<'w, u32> = AVec::with_capacity_in(n, alloc.clone());
-    let mut dependents: AVec<'w, AVec<'w, u32>> = AVec::with_capacity_in(n, alloc.clone());
+    let mut waiting: AVec<'w, u32> = AVec::with_capacity_in(n, alloc);
+    let mut dependents: AVec<'w, AVec<'w, u32>> = AVec::with_capacity_in(n, alloc);
     for _ in 0..n {
-        dependents.push(AVec::new_in(alloc.clone()));
+        dependents.push(AVec::new_in(alloc));
     }
     for (at, c) in list.crates.iter().enumerate() {
         let mut count = 0;
@@ -230,27 +230,27 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
         }
         waiting.push(count);
     }
-    let mut ready: AVec<'w, u32> = AVec::new_in(alloc.clone());
+    let mut ready: AVec<'w, u32> = AVec::new_in(alloc);
     ready.extend((first as u32..n as u32).filter(|at| waiting[*at as usize] == 0));
     // Ready crates in the list's order, so the first crate of a key is the lowest index.
     ready.reverse();
 
-    let mut key_of: AVec<'w, Option<CrateItemKey>> = AVec::with_capacity_in(n, alloc.clone());
+    let mut key_of: AVec<'w, Option<CrateItemKey>> = AVec::with_capacity_in(n, alloc);
     key_of.extend((0..n).map(|at| if at < first { Some(tc[opened[at] as usize].key) } else { None }));
     // Each crate's pending crate (an index into `pending`), one per key.
-    let mut crate_of: AVec<'w, Option<u32>> = AVec::with_capacity_in(n, alloc.clone());
+    let mut crate_of: AVec<'w, Option<u32>> = AVec::with_capacity_in(n, alloc);
     crate_of.extend((0..n).map(|_| None));
-    let mut pending: AVec<'w, Pending<'w>> = AVec::new_in(alloc.clone());
-    let mut by_key: BTreeMap<[u8; 32], u32, Alloc<'w>> = BTreeMap::new_in(alloc.clone());
+    let mut pending: AVec<'w, Pending<'w>> = AVec::new_in(alloc);
+    let mut by_key: BTreeMap<[u8; 32], u32, Alloc<'w>> = BTreeMap::new_in(alloc);
     // Path packages placed while keying (by lock index), each asked of `packages` once.
-    let mut early: BTreeMap<u32, Place<'w>, Alloc<'w>> = BTreeMap::new_in(alloc.clone());
+    let mut early: BTreeMap<u32, Place<'w>, Alloc<'w>> = BTreeMap::new_in(alloc);
     let mut keyed = 0usize;
     while let Some(at) = ready.pop() {
         let at = at as usize;
         let c = &list.crates[at];
         // The list's one answer (a member's proc macro and its harness are the macro side's too).
         let side = if list.macro_side(at) { Side::Macro } else { Side::Target };
-        let mut deps: AVec<'w, (&'w str, CrateItemKey)> = AVec::with_capacity_in(c.deps.len(), alloc.clone());
+        let mut deps: AVec<'w, (&'w str, CrateItemKey)> = AVec::with_capacity_in(c.deps.len(), alloc);
         for &(name, d) in c.deps.iter() {
             deps.push((name, key_of[d].ok_or(WorldError::Cycle { krate: c.name })?));
         }
@@ -262,7 +262,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                 // run for wasm32-wasip1, never the target side's facts (rule 21). One subject
                 // function, from the parts of the crate's list key ([`crate::script_subject`]).
                 let script = match unit.build_script {
-                    Some(_) => Script::Read { subject: crate::script_subject(unit.name.as_str(), unit.version.as_str(), side, &c.features, alloc.clone()) },
+                    Some(_) => Script::Read { subject: crate::script_subject(unit.name.as_str(), unit.version.as_str(), side, &c.features, alloc) },
                     None => Script::None,
                 };
                 // A path package is placed now: a member's directory is what it sees as its
@@ -293,7 +293,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                 let cfg: &'w [(&'w str, Option<&'w str>)] = cfg.into_bump_slice();
                 (key, cfg, script)
             }
-            ListOrigin::Toolchain { .. } => (side_toolchain_key(c, &deps, alloc.clone()), &c.cfg[..], Script::None),
+            ListOrigin::Toolchain { .. } => (side_toolchain_key(c, &deps, alloc), &c.cfg[..], Script::None),
         };
         key_of[at] = Some(key);
         keyed += 1;
@@ -327,10 +327,10 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
     }
 
     // The order: by key. `rank[p]` is pending crate p's place among the graph's crates.
-    let mut order: AVec<'w, u32> = AVec::with_capacity_in(pending.len(), alloc.clone());
+    let mut order: AVec<'w, u32> = AVec::with_capacity_in(pending.len(), alloc);
     order.extend(0..pending.len() as u32);
     order.sort_unstable_by(|a, b| pending[*a as usize].key.0.0.cmp(&pending[*b as usize].key.0.0));
-    let mut rank: AVec<'w, u32> = AVec::with_capacity_in(pending.len(), alloc.clone());
+    let mut rank: AVec<'w, u32> = AVec::with_capacity_in(pending.len(), alloc);
     rank.extend((0..pending.len()).map(|_| 0));
     for (at, p) in order.iter().enumerate() {
         rank[*p as usize] = at as u32;
@@ -341,8 +341,8 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
     // The trees: the toolchain's packs (1..=t), then each fetched package's record and each
     // macro-side toolchain pack in the order its first crate is placed.
     // Beside each pack, where it is kept (the crate list's tree table, crate_list.rs).
-    let mut packs: AVec<'w, PackView<'w>> = AVec::with_capacity_in(tc.len(), alloc.clone());
-    let mut origins: AVec<'w, PackOrigin> = AVec::with_capacity_in(tc.len(), alloc.clone());
+    let mut packs: AVec<'w, PackView<'w>> = AVec::with_capacity_in(tc.len(), alloc);
+    let mut origins: AVec<'w, PackOrigin> = AVec::with_capacity_in(tc.len(), alloc);
     for c in tc {
         let bytes = toolchain.pack(c);
         packs.push(PackView::open_verified(bytes).map_err(|_| WorldError::Pack { krate: c.name })?);
@@ -350,10 +350,10 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
     }
     // The lock's fetch plan, made at the first fetched package placed: which record holds it.
     let mut fetch_plan: Option<blaze_fetch::Plan<'w, 'w>> = None;
-    let mut placed: BTreeMap<u32, (u32, &'w str), Alloc<'w>> = BTreeMap::new_in(alloc.clone());
+    let mut placed: BTreeMap<u32, (u32, &'w str), Alloc<'w>> = BTreeMap::new_in(alloc);
 
-    let mut crates: AVec<'w, Crate<'w>> = AVec::with_capacity_in(tc.len() + pending.len(), alloc.clone());
-    let mut envs: AVec<'w, CrateEnv<'w>> = AVec::with_capacity_in(tc.len() + pending.len(), alloc.clone());
+    let mut crates: AVec<'w, Crate<'w>> = AVec::with_capacity_in(tc.len() + pending.len(), alloc);
+    let mut envs: AVec<'w, CrateEnv<'w>> = AVec::with_capacity_in(tc.len() + pending.len(), alloc);
     for c in tc.iter() {
         // A toolchain crate is a dependency: it sees `/package` (D96); it has no lock entry.
         let facts = EnvFacts {
@@ -368,7 +368,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
             bin_exes: blaze_scope::crate_env::BinNames::NONE,
             meta: None,
         };
-        envs.push(CrateEnv::of(facts, alloc.clone()).map_err(WorldError::Env)?);
+        envs.push(CrateEnv::of(facts, alloc).map_err(WorldError::Env)?);
         crates.push(Crate {
             input: CrateInput {
                 name: c.name,
@@ -407,7 +407,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                         let it = match place {
                             Place::Checkout { dir } => (0, dir),
                             Place::Pack { view, dir } => {
-                                let key = source_key(&mut fetch_plan, view, lock, unit.package, &unit.name, alloc.clone())?;
+                                let key = source_key(&mut fetch_plan, view, lock, unit.package, &unit.name, alloc)?;
                                 packs.push(view);
                                 origins.push(PackOrigin::Source { key });
                                 let tree = packs.len() as u32;
@@ -521,7 +521,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
         });
     }
     // Per unit of the graph, its target-side crate (a macro-side copy is not this map's).
-    let mut crate_of_unit: AVec<'w, Option<u32>> = AVec::with_capacity_in(units.len(), alloc.clone());
+    let mut crate_of_unit: AVec<'w, Option<u32>> = AVec::with_capacity_in(units.len(), alloc);
     crate_of_unit.extend((0..units.len()).map(|_| None));
     for at in first..list.macro_from {
         if let ListOrigin::Unit(id) = list.crates[at].origin {
@@ -529,7 +529,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
         }
     }
     // Each crate the list refused, at its index in the world, with its typed refusal.
-    let mut refused: AVec<'w, RefusedCrate<'w>> = AVec::with_capacity_in(list.refused.len(), alloc.clone());
+    let mut refused: AVec<'w, RefusedCrate<'w>> = AVec::with_capacity_in(list.refused.len(), alloc);
     for r in list.refused.iter() {
         let krate = world_at(r.krate).ok_or(WorldError::Cycle { krate: list.crates[r.krate].name })?;
         refused.push(RefusedCrate { krate: krate as usize, why: r.why.clone() });

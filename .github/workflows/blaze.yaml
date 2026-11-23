@@ -272,6 +272,8 @@ jobs:
           [ "$jobs" -gt 16 ] && jobs=16
           export FAIL_DIR="$tmp_dir"
           export RUST_TEST_THREADS=4
+          sysroot_lib="$(rustc +"$tc" --print sysroot)/lib"
+          export LD_LIBRARY_PATH="$sysroot_lib:${LD_LIBRARY_PATH:-}"
           tr '\n' '\0' < "$bins" | xargs -0 -r -n 1 -P "$jobs" bash -c '
             dir="${1%%|*}"
             bin="${1#*|}"

@@ -2292,11 +2292,11 @@ mod tests {
 
     #[test]
     fn aegraph_float_identities_gvn_and_contract_fma_fusion() {
-        let alloc = Global;
+        let alloc = blaze_own::testing::heap().alloc();
 
         // 1. IEEE-754 bit-exact identities + GVN (`fneg(fneg(x)) == x`, `fabs(fabs(x)) == fabs(x)`,
         //    `fabs(fneg(x))` GVN with `fabs(x)`, duplicate `fconst` & `fadd` GVN).
-        let mut b = Builder::<Global, Full>::new_in(64, alloc);
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
         let sig1 = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::F64)], &[Param::of(Ty::F64)]);
         b.set_signature(sig1);
         let entry = b.create_block(BlockKind::Normal);
@@ -2333,7 +2333,7 @@ mod tests {
         // 2. `Flags::CONTRACT` fuses `fadd(fmul(a, b), c)` into native hardware `Op::Fma(a, b, c)`
         //    and sweeps dead `fmul`, while `Flags::NONE` leaves it strictly unfused!
         let build_mac = |flags: Flags| {
-            let mut b = Builder::<Global, Full>::new_in(64, alloc);
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
             let sig3 = b.sig(
                 Conv::C,
                 Variadic::No,
