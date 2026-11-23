@@ -1144,10 +1144,40 @@ const FOOTER_PIECE: u32 = u32::MAX;
 /// The index the planted [`Plant::UnlinkEarly`]'s unlinks start at, apart from a flip's own.
 const EARLY_REMOVE: u32 = 1 << 30;
 
+/// Outcome of [`Plain::renew_root`]: O(1) lease check or refresh on an already-live root.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Renewed {
+    /// The root is not live (absent, expired, or pending unset).
+    Missing,
+    /// The root is already live with enough remaining life (within [`TOUCH_NS`] of `life_ns`):
+    /// nothing queued and no flip owed.
+    Fresh(Key),
+    /// The root is live and queued to extend its lease at the next commit without rewriting its
+    /// record.
+    Extended(Key),
+}
+
+impl Renewed {
+    /// The root's record key when live (`Fresh` or `Extended`).
+    pub const fn key(self) -> Option<Key> {
+        match self {
+            Renewed::Missing => None,
+            Renewed::Fresh(key) | Renewed::Extended(key) => Some(key),
+        }
+    }
+
+    /// Whether the root was live (already fresh or queued for renewal).
+    pub const fn is_live(self) -> bool {
+        self.key().is_some()
+    }
+}
+
 /// What a commit changes of what keeps records: roots, and this process's lease.
 enum RootEdit {
-    /// `name` names `key`, for `life_ns` from the flip ([`NEVER`]: until unset).
-    Set { name: String, key: Key, life_ns: u64 },
+    /// `name` names `key`, for `life_ns` from the flip ([`NEVER`]: until unset). When
+    /// `renew_only` is true, extends an already-live root still naming `key` at the flip without
+    /// rewriting its record or scanning its held keys.
+    Set { name: String, key: Key, life_ns: u64, renew_only: bool },
     Unset(String),
     /// This process's lease set or renewed: segments of generation `since` on are kept whole
     /// until [`LEASE_NS`] from the flip.
@@ -2582,6 +2612,11 @@ impl<A: Allocator + Clone> Plain<A> {
         Ok(key)
     }
 
+    /// Queues a root set or lease-only renewal for the next commit.
+    fn push_root_set(&mut self, name: &str, key: Key, life_ns: u64, renew_only: bool) {
+        self.roots_pending.push(RootEdit::Set { name: name.to_owned(), key, life_ns, renew_only });
+    }
+
     /// The root `name` set to the record `bytes` (sorted keys) under `tag`, its key derived
     /// under `domain`: the one body of [`Plain::root_for`] and [`Plain::root_through`].
     fn set_root(&mut self, name: &str, bytes: &[u8], life_ns: u64, tag: Tag, domain: &'static str) -> Result<Key, StoreError> {
@@ -2595,8 +2630,88 @@ impl<A: Allocator + Clone> Plain<A> {
             return Ok(key);
         }
         self.put(key, Namespace::LOCAL, tag, bytes).map_err(|it| it.into_store(tag))?;
-        self.roots_pending.push(RootEdit::Set { name: name.to_owned(), key, life_ns });
+        self.push_root_set(name, key, life_ns, false);
         Ok(key)
+    }
+
+    /// O(1) lease renewal for an already-live root `name` at `now_ns`: checks the manifest's root
+    /// entry without reading, probing, sorting, or hashing the keys it holds. Returns
+    /// [`Renewed::Fresh`] when the root still has at least `life_ns - TOUCH_NS` remaining (no flip
+    /// owed), [`Renewed::Extended`] when a metadata-only lease extension is queued for the next
+    /// commit, and [`Renewed::Missing`] when `name` is absent, expired, or pending unset.
+    pub fn renew_root(&mut self, name: &str, life_ns: u64, now_ns: u64) -> Renewed {
+        for edit in self.roots_pending.iter_mut().rev() {
+            match edit {
+                RootEdit::Unset(n) if n == name => return Renewed::Missing,
+                RootEdit::Set { name: n, key, life_ns: existing, .. } if n == name => {
+                    let key = *key;
+                    self.named.roots += 1;
+                    let needs_longer = (life_ns == NEVER && *existing != NEVER)
+                        || (life_ns != NEVER && *existing != NEVER && life_ns > *existing);
+                    if needs_longer {
+                        *existing = life_ns;
+                        return Renewed::Extended(key);
+                    }
+                    return Renewed::Fresh(key);
+                }
+                _ => {}
+            }
+        }
+        let Some(root) = self.manifest.roots.iter().find(|it| it.name == name && it.expires_ns > now_ns) else {
+            return Renewed::Missing;
+        };
+        let key = Key(root.key);
+        self.named.roots += 1;
+        let fresh = (life_ns == NEVER && root.expires_ns == NEVER)
+            || (life_ns != NEVER && root.expires_ns != NEVER && root.expires_ns >= now_ns.saturating_add(life_ns.saturating_sub(TOUCH_NS)));
+        if fresh {
+            return Renewed::Fresh(key);
+        }
+        self.push_root_set(name, key, life_ns, true);
+        Renewed::Extended(key)
+    }
+
+    /// O(segments + roots + retired) check of whether real compaction or GC housekeeping is due
+    /// at `now_ns`, using only the in-memory manifest (no `map_all`, no index probes):
+    /// - total committed bytes exceed `cap_bytes`;
+    /// - any tier of any namespace exceeds `K` open mergeable segments;
+    /// - any root has expired (`expires_ns <= now_ns`);
+    /// - any retired file is past `GRACE_NS` and ready to unlink.
+    pub fn needs_housekeeping(&self, now_ns: u64) -> bool {
+        if self.manifest.bytes() > self.cfg.cap_bytes {
+            return true;
+        }
+        if self.manifest.roots.iter().any(|it| it.expires_ns != NEVER && it.expires_ns <= now_ns) {
+            return true;
+        }
+        if self.manifest.retired.iter().any(|it| it.lost.is_none() && it.since_ns.saturating_add(GRACE_NS) <= now_ns) {
+            return true;
+        }
+        let tiers = self.tiers();
+        let segs = &self.manifest.segments;
+        let blind = tiers.plant == TierPlant::PastCap;
+        let mergeable = |seg: &Segment| {
+            seg.local
+                && !seg.published
+                && (blind || !tiers.closed(seg.file_len()))
+                && (self.cfg.liveness == Liveness::Everything || !self.leased(seg, now_ns))
+        };
+        for (idx, first) in segs.iter().enumerate() {
+            if segs.iter().take(idx).any(|prev| prev.namespace == first.namespace) {
+                continue;
+            }
+            let mut count = [0usize; TIERS_MOST];
+            for seg in segs.iter().skip(idx).filter(|it| it.namespace == first.namespace && mergeable(it)) {
+                let tier = tiers.tier(seg.file_len());
+                if let Some(slot) = count.get_mut(tier) {
+                    *slot += 1;
+                    if *slot > tiers.most() {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Lets go of the root `name` at the next commit.
@@ -3395,7 +3510,7 @@ impl<A: Allocator + Clone> Plain<A> {
         let sets: Vec<Key, A> = {
             let mut it = Vec::new_in(self.alloc.clone());
             it.extend(edits.iter().filter_map(|it| match it {
-                RootEdit::Set { key, .. } => Some(*key),
+                RootEdit::Set { key, renew_only: false, .. } => Some(*key),
                 _ => None,
             }));
             it
@@ -3403,22 +3518,34 @@ impl<A: Allocator + Clone> Plain<A> {
         if sets.is_empty() {
             return Ok(out);
         }
-        let live = self.live_roots(now_ns)?;
-        let look = |key: &ContentId, out: &mut Vec<(u64, ContentId), A>| {
-            if reached(&live, key) {
-                return;
-            }
-            if let Some((at, _)) = self.find_in(&[Namespace::LOCAL], &Key(*key)) {
-                out.push((self.maps[at].seg().id, *key));
-            }
-        };
+        let mut live = None;
+        macro_rules! look_key {
+            ($key:expr) => {{
+                let key: &ContentId = $key;
+                let skip = live.as_deref().is_some_and(|loaded| reached(loaded, key));
+                if !skip && let Some((at, _)) = self.find_in(&[Namespace::LOCAL], &Key(*key)) {
+                    let already = if live.is_none() {
+                        let loaded = self.live_roots(now_ns)?;
+                        let hit = reached(&loaded, key);
+                        live = Some(loaded);
+                        hit
+                    } else {
+                        false
+                    };
+                    if !already && let Some(map) = self.maps.get(at) {
+                        out.push((map.seg().id, *key));
+                    }
+                }
+            }};
+        }
         for root in &sets {
-            look(&root.0, &mut out);
+            look_key!(&root.0);
             let Some(got) = self.get_in(&[Namespace::LOCAL], root) else {
                 return Err(StoreError::RootGone { generation: self.manifest.generation, key: root.0 });
             };
             for key in got.bytes.chunks_exact(32) {
-                look(&ContentId(key.try_into().expect("32 bytes")), &mut out);
+                let Ok(bytes) = key.try_into() else { continue };
+                look_key!(&ContentId(bytes));
             }
             if reach_of(got.tag) != TagReach::Indexes || self.plant() == Plant::IndexNotFollowed {
                 continue;
@@ -3428,8 +3555,9 @@ impl<A: Allocator + Clone> Plain<A> {
             // what it holds here; only another's keys are looked at. (A plain root naming an
             // index keeps its record, not what it holds: not followed, so looked at.)
             for index in got.bytes.chunks_exact(32) {
-                let index = ContentId(index.try_into().expect("32 bytes"));
-                if live.iter().any(|(followed, _)| *followed == index) {
+                let Ok(bytes) = index.try_into() else { continue };
+                let index = ContentId(bytes);
+                if live.as_deref().is_some_and(|loaded| loaded.iter().any(|(followed, _)| *followed == index)) {
                     continue;
                 }
                 let Some(held) = self.get_in(&[Namespace::LOCAL], &Key(index)) else {
@@ -3439,7 +3567,8 @@ impl<A: Allocator + Clone> Plain<A> {
                     return Err(StoreError::NotAnIndex { root: root.0, key: index, tag: held.tag });
                 }
                 for key in held.bytes.chunks_exact(32) {
-                    look(&ContentId(key.try_into().expect("32 bytes")), &mut out);
+                    let Ok(bytes) = key.try_into() else { continue };
+                    look_key!(&ContentId(bytes));
                 }
             }
         }
@@ -3794,10 +3923,17 @@ impl<A: Allocator + Clone> Plain<A> {
                     }
                     for edit in roots.iter() {
                         match edit {
-                            RootEdit::Set { name, key, life_ns } => {
+                            RootEdit::Set { name, key, life_ns, renew_only: false } => {
                                 m.roots.retain(|it| it.name != *name);
                                 let expires_ns = if *life_ns == NEVER { NEVER } else { now_ns.saturating_add(*life_ns).min(NEVER - 1) };
                                 m.roots.push(Root { name: name.clone(), key: key.0, generation, expires_ns });
+                            }
+                            RootEdit::Set { name, key, life_ns, renew_only: true } => {
+                                if let Some(root) = m.roots.iter_mut().find(|it| it.name == *name && it.key == key.0 && it.expires_ns > now_ns) {
+                                    let expires_ns = if *life_ns == NEVER { NEVER } else { now_ns.saturating_add(*life_ns).min(NEVER - 1) };
+                                    root.expires_ns = root.expires_ns.max(expires_ns);
+                                    root.generation = generation;
+                                }
                             }
                             RootEdit::Unset(name) => m.roots.retain(|it| it.name != *name),
                             RootEdit::Lease { since, opened_ns } => {

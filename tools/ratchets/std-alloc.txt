@@ -22,11 +22,11 @@ blaze-cad-field	1	0	0	3
 blaze-cad-mesh	1	0	0	0
 blaze-cad-out	1	0	0	2
 blaze-cad-picture	1	0	0	0
-blaze-cas	93	1	4	415
+blaze-cas	93	1	4	414
 blaze-cbor	0	0	1	0
 blaze-cc	0	0	4	3
 blaze-check	72	1	0	107
-blaze-cli	536	1	0	443
+blaze-cli	536	1	0	442
 blaze-columns	29	0	1	23
 blaze-comptime/rungs/derive-hello	0	1	0	0
 blaze-cond	1	0	0	11

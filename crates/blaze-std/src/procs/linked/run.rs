@@ -68,6 +68,17 @@ pub struct RunSpec<'a> {
     pub parent_death: ParentDeath,
 }
 
+/// What to start detached in a new session ([`Spawner::start_detached`]): the program, its
+/// arguments, its whole environment (nothing of this process's is inherited), and its directory.
+/// Standard streams are `/dev/null` and every other descriptor is closed on exec, so the parent
+/// never blocks on it and the child outlives the parent.
+pub struct DetachedSpec<'a> {
+    pub program: &'a str,
+    pub args: &'a [&'a str],
+    pub env: &'a [(&'a str, &'a str)],
+    pub dir: &'a str,
+}
+
 /// What a step on a run child was.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RunStep {
@@ -216,12 +227,40 @@ pub struct Started<C> {
     pub pipes: Pipes,
 }
 
+fn make_command(program: &str, args: &[&str], env: &[(&str, &str)], dir: &str) -> Command {
+    // blaze-core's `Command` holds std's path and string types, made here from text through
+    // `From<String>`: the allocator is the global one its fields name.
+    Command {
+        program: String::from(program).into(),
+        args: args.iter().map(|it| String::from(*it).into()).collect(),
+        env: env.iter().map(|(name, value)| (String::from(*name).into(), String::from(*value).into())).collect(),
+        dir: String::from(dir).into(),
+        stdin: Vec::new(),
+        sandbox: Sandbox::Off,
+        memory: None,
+    }
+}
+
 impl Spawner {
     /// `spec` started with no channel: its streams as named, its group its own where asked.
     /// Refused before it starts when the task's deadline has passed; what blaze-core refuses by
     /// name ([`blaze_core::linked::LinkOp`]) is [`RunFault::Host`].
     pub fn start(&self, cx: &Cx, spec: &RunSpec<'_>) -> Result<Started<Run>, RunError> {
         self.start_with(cx, spec, &[], None)
+    }
+
+    /// `spec` started detached in a new session (`setsid` on Linux, `POSIX_SPAWN_SETSID` on macOS)
+    /// with `/dev/null` stdio and every other descriptor closed on exec. Returns the started
+    /// process's [`ProcId`]; the child is not linked to this process and outlives it.
+    pub fn start_detached(&self, cx: &Cx, spec: &DetachedSpec<'_>) -> Result<ProcId, RunError> {
+        let refuse = |fault| RunError { step: RunStep::Start, proc: None, fault };
+        let task = cx.deadline();
+        if task.passed(self.io.now()) {
+            return Err(refuse(RunFault::Stopped(Stopped::Deadline { span: RUN_SPAN, at: task.get() })));
+        }
+        let command = make_command(spec.program, spec.args, spec.env, spec.dir);
+        let pid = blaze_core::linked::run::start_detached(&command).map_err(|error: LinkError| refuse(RunFault::Host(error.op.what())))?;
+        Ok(ProcId(pid))
     }
 
     /// `spec` started confined: the child enters `confine` last before its program runs (D177;
@@ -262,17 +301,7 @@ impl Spawner {
         if task.passed(self.io.now()) {
             return Err(refuse(RunFault::Stopped(Stopped::Deadline { span: RUN_SPAN, at: task.get() })));
         }
-        // blaze-core's `Command` holds std's path and string types, made here from text through
-        // `From<String>`: the allocator is the global one its fields name.
-        let command = Command {
-            program: String::from(spec.program).into(),
-            args: spec.args.iter().map(|it| String::from(*it).into()).collect(),
-            env: spec.env.iter().map(|(name, value)| (String::from(*name).into(), String::from(*value).into())).collect(),
-            dir: String::from(spec.dir).into(),
-            stdin: Vec::new(),
-            sandbox: Sandbox::Off,
-            memory: None,
-        };
+        let command = make_command(spec.program, spec.args, spec.env, spec.dir);
         let link = RunLink {
             inherit,
             own_group: spec.own_group,

@@ -450,3 +450,34 @@ fn the_later_place_is_replayed_and_a_new_place_is_due() {
     assert_eq!((counts.replayed, counts.whole, counts.unplaced, counts.at, counts.status), (15, 24, 0, Some(20), Status::Used), "{counts}");
     assert!(counts.to_string().starts_with("journal: replayed 15 of 24 event ids (checkpoint at 20; floor: the ids appended since the last command)"), "{counts}");
 }
+
+/// Acquiring a helper place for the first time, or getting one from a new helper instance after a
+/// restart/reboot, marks a checkpoint due (`Due::NewPlace`) even when zero journal events fired,
+/// while a same-instance vouch with zero events writes no unnecessary checkpoint.
+#[test]
+fn a_new_helper_place_or_instance_is_due_even_with_zero_events() {
+    let frame = Frame::with_reserve(crate::engine_check::REQUEST_FRAME, bstd::mem::Tag::Other).expect("a test frame");
+    let sim = |journal, next| Cursor::Sim { journal, next };
+    let helper = |instance: u64, seq: u64| blaze_watch::since::Place { instance, seq }.encode();
+    let encoded = |cursor: Cursor, place: Option<[u8; crate::journal_sweep::HELPER_PLACE]>| {
+        let mut bytes = Vec::new_in(&frame);
+        Stored::encode_units([(CHECKOUT, "", cursor)].into_iter(), Some(7), &mut bytes);
+        if let Some(place) = place {
+            Stored::encode_helper(place, &mut bytes);
+        }
+        std::vec::Vec::from(&bytes[..])
+    };
+    let no_helper = encoded(sim(1, 10), None);
+    let no_helper_moved = encoded(sim(1, 11), None);
+    let first_helper = encoded(sim(1, 10), Some(helper(0xAA, 1)));
+    let same_instance = encoded(sim(1, 10), Some(helper(0xAA, 2)));
+    let same_instance_small_tick = encoded(sim(1, 10 + 5_000), Some(helper(0xAA, 3)));
+    let same_instance_large_tick = encoded(sim(1, 10 + HELPER_DUE_EVENTS), Some(helper(0xAA, 4)));
+    let restarted_helper = encoded(sim(1, 10), Some(helper(0xBB, 1)));
+    assert_eq!(due(whole(&no_helper), whole(&first_helper), DUE_EVENTS), Some(Due::NewPlace { units: 1 }), "first helper place triggers checkpoint");
+    assert_eq!(due(whole(&no_helper), whole(&no_helper_moved), DUE_EVENTS), Some(Due::Replayed { ids: 1 }), "without helper, 1 event still triggers checkpoint");
+    assert_eq!(due(whole(&first_helper), whole(&same_instance), DUE_EVENTS), None, "same helper instance with 0 events writes no checkpoint");
+    assert_eq!(due(whole(&first_helper), whole(&same_instance_small_tick), DUE_EVENTS), None, "same helper instance under HELPER_DUE_EVENTS writes no checkpoint");
+    assert_eq!(due(whole(&first_helper), whole(&same_instance_large_tick), DUE_EVENTS), Some(Due::Replayed { ids: HELPER_DUE_EVENTS }), "same helper instance at HELPER_DUE_EVENTS checkpoints");
+    assert_eq!(due(whole(&same_instance), whole(&restarted_helper), DUE_EVENTS), Some(Due::NewPlace { units: 1 }), "restarted helper instance triggers checkpoint");
+}

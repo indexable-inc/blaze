@@ -843,7 +843,8 @@ pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool
         ),
         plain_place::AfterAnswerQos::AsCalled => None,
     };
-    let after = plain_place::after_answer(cx, &lent, AFTER_ANSWER_SLICES)?;
+    let slices = if lent.needs_housekeeping(lent.wall_ns()) { AFTER_ANSWER_SLICES } else { 0 };
+    let after = plain_place::after_answer(cx, &lent, slices)?;
     let commit_ns = ns(clock).saturating_sub(answered);
     drop(lent);
     {
