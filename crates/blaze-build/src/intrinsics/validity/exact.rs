@@ -202,6 +202,8 @@ const NO: u8 = 3;
 enum Form<'w> {
     /// Every type it holds by value.
     All,
+    /// At least one member of a tagged union (`PNode::Union`).
+    Any,
     /// Some variant with every field.
     AnyVariant(Adt<'w>),
     /// Always (a union, an empty array).
@@ -243,7 +245,7 @@ fn inhabited<A: Allocator + Clone>(ty: PTy, layouts: &mut Layouts<A>, cx: &mut L
                 _ => Form::All,
             },
             PNode::Tuple(_) | PNode::Record(..) | PNode::Closure { .. } | PNode::Coroutine { .. } | PNode::Pat(..) => Form::All,
-            PNode::Union(_) => Form::Record,
+            PNode::Union(_) => Form::Any,
             PNode::Bool
             | PNode::Char
             | PNode::Int(_)
@@ -260,7 +262,7 @@ fn inhabited<A: Allocator + Clone>(ty: PTy, layouts: &mut Layouts<A>, cx: &mut L
             _ => return Err(LayoutError { ty: t, why: Refusal::Malformed("a validity assertion's type the layout lays out but no rule names") }),
         };
         parts.clear();
-        if matches!(form, Form::All | Form::AnyVariant(_)) {
+        if matches!(form, Form::All | Form::Any | Form::AnyVariant(_)) {
             layouts.field_types(t, cx, &mut parts)?;
         }
         if state[at] == UNSEEN {
@@ -284,6 +286,7 @@ fn inhabited<A: Allocator + Clone>(ty: PTy, layouts: &mut Layouts<A>, cx: &mut L
         let all_yes = |fs: &[PTy]| fs.iter().all(|p| state[p.0 as usize] == YES);
         let yes = match form {
             Form::All => all_yes(&parts),
+            Form::Any => parts.iter().any(|p| usize::try_from(p.0).ok().and_then(|i| state.get(i)) == Some(&YES)),
             Form::Yes => true,
             Form::Record => !l.uninhabited,
             Form::AnyVariant(adt) => {

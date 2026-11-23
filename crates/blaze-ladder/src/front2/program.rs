@@ -1877,21 +1877,25 @@ impl FrontEnd for Front2Program<'_> {
     fn item_named(&self, key: ItemKey) -> Option<Box<str>> {
         // A member (a trait's fn: what a resolve refusal names) by its container's path.
         let mut cur = key;
-        let mut members: Vec<&str> = Vec::new();
+        let mut members = [""; 64];
+        let mut count = 0usize;
         while let Some(super::keys::Origin::Member { container, name, .. }) = self.front.keys.origin(cur) {
-            if members.len() >= 64 {
+            let Some(slot) = members.get_mut(count) else {
                 return None;
-            }
-            members.push(name);
+            };
+            *slot = name;
+            count += 1;
             cur = *container;
         }
         let (names, lib) = (self.front.names, self.front.keys.library_in(self.front.names, cur)?);
         let name = names.item_text(lib)?.name?;
         let module = names.krate(names.crate_of(lib)?).path_of(names.module_of(lib)?)?;
         let mut out = format!("{module}::{name}");
-        for member in members.into_iter().rev() {
-            out.push_str("::");
-            out.push_str(member);
+        if let Some(slice) = members.get(..count) {
+            for &member in slice.iter().rev() {
+                out.push_str("::");
+                out.push_str(member);
+            }
         }
         Some(out.into_boxed_str())
     }

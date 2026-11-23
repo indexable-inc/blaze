@@ -6147,8 +6147,11 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     _ => {}
                 }
             }
-            let is_enum = matches!(self.ground_node(g).map_err(|error| Self::ty_err(scrutinee, error))?, PNode::Adt(..))
-                && self.is_agg(g).map_err(|error| Self::ty_err(scrutinee, error))?;
+            let is_enum = match self.ground_node(g).map_err(|error| Self::ty_err(scrutinee, error))? {
+                PNode::Adt(..) => true,
+                PNode::Union(l) => l.len != 1,
+                _ => false,
+            } && self.is_agg(g).map_err(|error| Self::ty_err(scrutinee, error))?;
             if variant_pats && depth > 0 && is_enum {
                 let mut p = self.scalar(s, Ty::PTR)?;
                 for _ in 1..depth {
@@ -6174,6 +6177,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 };
                 match self.ground_node(g).map_err(|error| Self::ty_err(scrutinee, error))? {
                     PNode::Adt(..) => Some(self.layout(g).map_err(|error| Self::ty_err(scrutinee, error))?),
+                    PNode::Union(l) if l.len != 1 => Some(self.layout(g).map_err(|error| Self::ty_err(scrutinee, error))?),
                     _ => None,
                 }
             }

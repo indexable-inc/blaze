@@ -226,8 +226,7 @@ pub trait RegionTypes {
 
     /// How many slots the whole of `ty` has: its own, then its children's, bounded.
     fn count(&self, ty: PTy) -> Result<SlotCount, Unknown> {
-        let mut budget = MOST_COUNT_STEPS;
-        count_in(self, ty, &mut budget, 0)
+        count_in(self, ty)
     }
 
     /// The variance of `ty`'s own slot or child at `at`, within `ty`: [`rule_variance`].
@@ -236,21 +235,67 @@ pub trait RegionTypes {
     }
 }
 
-fn count_in<T: RegionTypes + ?Sized>(types: &T, ty: PTy, budget: &mut u32, depth: u32) -> Result<SlotCount, Unknown> {
-    if *budget == 0 || depth > MOST_DEPTH {
-        return Err(Unknown { node: ty, why: Why::Bound });
-    }
-    *budget -= 1;
-    let mut n = types.own(ty)?;
-    let kids = types.kids(ty)?;
-    for k in 0..kids.len() {
-        let Some(c) = kids.get(k) else {
-            return Err(Unknown { node: ty, why: Why::Table });
+#[derive(Clone, Copy)]
+struct CountFrame<'t> {
+    ty: PTy,
+    kids: Kids<'t>,
+    next_k: u32,
+    acc: SlotCount,
+}
+
+fn count_in<T: RegionTypes + ?Sized>(types: &T, root: PTy) -> Result<SlotCount, Unknown> {
+    const MAX_FRAMES: usize = 257; // MOST_DEPTH (256) + 1
+    let mut budget = MOST_COUNT_STEPS;
+    let mut stack: [Option<CountFrame<'_>>; MAX_FRAMES] = [None; MAX_FRAMES];
+    let mut sp: usize = 0;
+
+    let mut enter = Some(root);
+    let mut finished: Option<SlotCount> = None;
+
+    loop {
+        if let Some(ty) = enter.take() {
+            if budget == 0 || sp >= MAX_FRAMES {
+                return Err(Unknown { node: ty, why: Why::Bound });
+            }
+            budget -= 1;
+            let acc = types.own(ty)?;
+            let kids = types.kids(ty)?;
+            if kids.len() == 0 {
+                finished = Some(acc);
+            } else {
+                let Some(slot) = stack.get_mut(sp) else {
+                    return Err(Unknown { node: ty, why: Why::Bound });
+                };
+                *slot = Some(CountFrame { ty, kids, next_k: 0, acc });
+                sp += 1;
+            }
+            continue;
+        }
+
+        let Some(top_idx) = sp.checked_sub(1) else {
+            return finished.ok_or(Unknown { node: root, why: Why::Bound });
         };
-        let m = count_in(types, c, budget, depth + 1)?;
-        n = n.checked_add(m).ok_or(Unknown { node: ty, why: Why::Overflow })?;
+        let Some(Some(top)) = stack.get_mut(top_idx) else {
+            return Err(Unknown { node: root, why: Why::Bound });
+        };
+
+        if let Some(child_count) = finished.take() {
+            top.acc = top.acc.checked_add(child_count).ok_or(Unknown { node: top.ty, why: Why::Overflow })?;
+        }
+
+        if top.next_k < top.kids.len() {
+            let k = top.next_k;
+            top.next_k += 1;
+            let Some(c) = top.kids.get(k) else {
+                return Err(Unknown { node: top.ty, why: Why::Table });
+            };
+            enter = Some(c);
+        } else {
+            let acc = top.acc;
+            sp = top_idx;
+            finished = Some(acc);
+        }
     }
-    Ok(n)
 }
 
 /// THE VARIANCE RULE (the Reference, "Subtyping and Variance", its table): `&'a T` covariant in

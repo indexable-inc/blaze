@@ -1138,7 +1138,8 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             }
             lf::TypeRef::Record(fields) => {
                 let rows = v.rows(fields)?;
-                let mut named: Vec<(&str, usize, Name), Global> = Vec::with_capacity_in(rows.len(), Global);
+                let alloc = tys.alloc();
+                let mut named = blaze_own::Vec::with_capacity_in(rows.len(), alloc);
                 for (i, &n) in rows.iter().enumerate() {
                     let f = lf::Field::decode(n)?;
                     let text = match f.name {
@@ -1148,25 +1149,27 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     named.push((text, i, Name::of(text)));
                 }
                 named.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-                let mut sorted_names: Vec<Name, Global> = Vec::with_capacity_in(named.len(), Global);
-                for &(_, _, nm) in &named {
+                let mut sorted_names = blaze_own::Vec::with_capacity_in(named.len(), alloc);
+                let mut sorted_tys = blaze_own::Vec::with_capacity_in(kids.len(), alloc);
+                for &(_, i, nm) in named.iter() {
                     sorted_names.push(nm);
+                    if let Some(&k) = kids.get(i) {
+                        sorted_tys.push(k);
+                    }
                 }
                 let schema = tc::RecordSchema::of_sorted_names(&sorted_names);
-                let l = intern_list(tys, kids)?;
+                let l = intern_list(tys, &sorted_tys)?;
                 intern(tys, PNode::Record(schema, l))
             }
             lf::TypeRef::Union(_) => {
-                let mut flat: Vec<PTy, Global> = Vec::with_capacity_in(kids.len(), Global);
+                let mut flat = blaze_own::Vec::with_capacity_in(kids.len(), tys.alloc());
                 for &kid in kids {
                     if let Some(PNode::Union(inner)) = tys.view().get(kid).copied() {
-                        let mut inner_members: Vec<PTy, Global> = Vec::new_in(Global);
                         if let Ok(slice) = tys.view().list(inner) {
-                            inner_members.extend_from_slice(slice);
-                        }
-                        for member in inner_members {
-                            if !flat.iter().any(|&seen| seen == member) {
-                                flat.push(member);
+                            for &member in slice {
+                                if !flat.iter().any(|&seen| seen == member) {
+                                    flat.push(member);
+                                }
                             }
                         }
                     } else if !flat.iter().any(|&seen| seen == kid) {

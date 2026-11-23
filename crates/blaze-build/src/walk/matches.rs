@@ -103,9 +103,14 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         })
     }
 
-    /// `g` is an enum laid out as one.
+    /// `g` is an enum (or multi-member tagged union) laid out as one.
     fn is_enum(&mut self, scrutinee: ExprId, g: PTy) -> Result<bool, BuildError> {
-        if !matches!(self.ground_node(g).map_err(|error| Self::ty_err(scrutinee, error))?, PNode::Adt(..)) {
+        let is_enum_node = match self.ground_node(g).map_err(|error| Self::ty_err(scrutinee, error))? {
+            PNode::Adt(..) => true,
+            PNode::Union(l) => l.len != 1,
+            _ => false,
+        };
+        if !is_enum_node {
             return Ok(false);
         }
         let l = self.layout(g).map_err(|error| Self::ty_err(scrutinee, error))?;

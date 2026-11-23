@@ -141,58 +141,155 @@ fn ground_in(
 }
 
 fn ground_own(cx: &mut GroundCx<'_, '_, '_>, ty: PTy, depth: u32) -> Result<PTy, Refusal<'static>> {
-    let node = match cx.body.own_ty(ty) {
-        Ok(None) => return ground(cx.from, ty, cx.args, cx.g, cx.scratch, cx.facts).map_err(build_refusal),
-        Ok(Some(n)) => n,
-        Err(_) => return Err(malformed("a type handle past the body's overlay")),
-    };
-    if depth >= OWN_TY_DEPTH {
-        return Err(unsupported("a body's own type nested past the evaluator's depth bound"));
+    enum Step {
+        Visit(PTy, u32),
+        Finish { node: PNode, list_len: usize },
     }
-    let d = depth + 1;
-    let arg = |cx: &GroundCx<'_, '_, '_>, i: u32| {
-        cx.args.get(i as usize).copied().ok_or(malformed("a parameter past the frame's arguments"))
-    };
-    let n = match node {
-        PNode::Bool
-        | PNode::Char
-        | PNode::Int(_)
-        | PNode::Uint(_)
-        | PNode::Float(_)
-        | PNode::Str
-        | PNode::Never
-        | PNode::ExAuto(_)
-        | PNode::Foreign(_) => node,
-        PNode::Param(i) | PNode::ConstParam(i) => return arg(cx, i),
-        PNode::Tuple(l) => PNode::Tuple(ground_own_list(cx, l, d)?),
-        PNode::Record(s, l) => PNode::Record(s, ground_own_list(cx, l, d)?),
-        PNode::Union(l) => PNode::Union(ground_own_list(cx, l, d)?),
-        PNode::Ref(m, t) => PNode::Ref(m, ground_own(cx, t, d)?),
-        PNode::Ptr(m, t) => PNode::Ptr(m, ground_own(cx, t, d)?),
-        PNode::Array(e, n) => PNode::Array(ground_own(cx, e, d)?, ground_own(cx, n, d)?),
-        PNode::Slice(t) => PNode::Slice(ground_own(cx, t, d)?),
-        PNode::Pat(t, l) => PNode::Pat(ground_own(cx, t, d)?, ground_own_list(cx, l, d)?),
-        PNode::Adt(k, l) => PNode::Adt(k, ground_own_list(cx, l, d)?),
-        PNode::FnDef(k, l) => PNode::FnDef(k, ground_own_list(cx, l, d)?),
-        PNode::FnPtr(l, h) => PNode::FnPtr(ground_own_list(cx, l, d)?, h),
-        PNode::Closure { owner, ordinal, args } => PNode::Closure { owner, ordinal, args: ground_own_list(cx, args, d)? },
-        PNode::Coroutine { owner, ordinal, args } => {
-            PNode::Coroutine { owner, ordinal, args: ground_own_list(cx, args, d)? }
+    let mut work: Vec<Step, Alloc<'_>> = Vec::new_in(cx.scratch);
+    let mut vals: Vec<PTy, Alloc<'_>> = Vec::new_in(cx.scratch);
+    work.push(Step::Visit(ty, depth));
+    while let Some(step) = work.pop() {
+        match step {
+            Step::Visit(cur, cur_depth) => {
+                let node = match cx.body.own_ty(cur) {
+                    Ok(None) => {
+                        let g = ground(cx.from, cur, cx.args, cx.g, cx.scratch, cx.facts).map_err(build_refusal)?;
+                        vals.push(g);
+                        continue;
+                    }
+                    Ok(Some(n)) => n,
+                    Err(_) => return Err(malformed("a type handle past the body's overlay")),
+                };
+                if cur_depth >= OWN_TY_DEPTH {
+                    return Err(unsupported("a body's own type nested past the evaluator's depth bound"));
+                }
+                let d = cur_depth + 1;
+                match node {
+                    PNode::Bool
+                    | PNode::Char
+                    | PNode::Int(_)
+                    | PNode::Uint(_)
+                    | PNode::Float(_)
+                    | PNode::Str
+                    | PNode::Never
+                    | PNode::ExAuto(_)
+                    | PNode::Foreign(_) => {
+                        let interned = cx.g.intern(node).map_err(|_| malformed("a ground type the table cannot hold"))?;
+                        vals.push(interned);
+                    }
+                    PNode::Param(i) | PNode::ConstParam(i) => {
+                        let idx = usize::try_from(i).map_err(|_| malformed("a parameter past the frame's arguments"))?;
+                        let a = cx.args.get(idx).copied().ok_or(malformed("a parameter past the frame's arguments"))?;
+                        vals.push(a);
+                    }
+                    PNode::Ref(_, t) | PNode::Ptr(_, t) | PNode::Slice(t) | PNode::ConstValue { ty: t, .. } => {
+                        work.push(Step::Finish { node, list_len: 0 });
+                        work.push(Step::Visit(t, d));
+                    }
+                    PNode::Array(e, n) | PNode::Future(_, e, n) => {
+                        work.push(Step::Finish { node, list_len: 0 });
+                        work.push(Step::Visit(n, d));
+                        work.push(Step::Visit(e, d));
+                    }
+                    PNode::Tuple(l)
+                    | PNode::Record(_, l)
+                    | PNode::Union(l)
+                    | PNode::Adt(_, l)
+                    | PNode::FnDef(_, l)
+                    | PNode::FnPtr(l, _)
+                    | PNode::Closure { args: l, .. }
+                    | PNode::Coroutine { args: l, .. }
+                    | PNode::Dynamic(l)
+                    | PNode::ExTrait(_, l) => {
+                        let src = cx.body.ty_list(&cx.from, l).map_err(|_| malformed("a list past the body's type table"))?;
+                        let len = src.len();
+                        work.push(Step::Finish { node, list_len: len });
+                        for i in (0..len).rev() {
+                            let t = src.get(i).ok_or(malformed("a list entry past its list"))?;
+                            work.push(Step::Visit(t, d));
+                        }
+                    }
+                    PNode::Pat(t, l) => {
+                        let src = cx.body.ty_list(&cx.from, l).map_err(|_| malformed("a list past the body's type table"))?;
+                        let len = src.len();
+                        work.push(Step::Finish { node, list_len: len });
+                        for i in (0..len).rev() {
+                            let item = src.get(i).ok_or(malformed("a list entry past its list"))?;
+                            work.push(Step::Visit(item, d));
+                        }
+                        work.push(Step::Visit(t, d));
+                    }
+                    PNode::ExProj { args, term, .. } => {
+                        let src = cx.body.ty_list(&cx.from, args).map_err(|_| malformed("a list past the body's type table"))?;
+                        let len = src.len();
+                        work.push(Step::Finish { node, list_len: len });
+                        work.push(Step::Visit(term, d));
+                        for i in (0..len).rev() {
+                            let item = src.get(i).ok_or(malformed("a list entry past its list"))?;
+                            work.push(Step::Visit(item, d));
+                        }
+                    }
+                    // A projection or an opaque type the body made has no record table `ground` could
+                    // normalize it in: refused by name (rule 3).
+                    PNode::Alias { trait_, name, .. } => return Err(Refusal::Projection { trait_, name }),
+                    PNode::Opaque(..) => return Err(unsupported("an opaque type made in the body, grounded")),
+                    PNode::Infer | PNode::Error => return Err(malformed("a hole or an error type in a verified body")),
+                }
+            }
+            Step::Finish { node, list_len } => {
+                let pop_list = |vals: &mut Vec<PTy, Alloc<'_>>, g: &mut PortableTys<'_>| -> Result<List, Refusal<'static>> {
+                    let start = vals.len().checked_sub(list_len).ok_or(malformed("grounding stack underflow"))?;
+                    let slice = vals.get(start..).ok_or(malformed("grounding stack underflow"))?;
+                    let list = g.intern_list(slice).map_err(|_| malformed("a ground list the table cannot hold"))?;
+                    vals.truncate(start);
+                    Ok(list)
+                };
+                let n = match node {
+                    PNode::Tuple(_) => PNode::Tuple(pop_list(&mut vals, cx.g)?),
+                    PNode::Record(s, _) => PNode::Record(s, pop_list(&mut vals, cx.g)?),
+                    PNode::Union(_) => PNode::Union(pop_list(&mut vals, cx.g)?),
+                    PNode::Ref(m, _) => PNode::Ref(m, vals.pop().ok_or(malformed("grounding stack underflow"))?),
+                    PNode::Ptr(m, _) => PNode::Ptr(m, vals.pop().ok_or(malformed("grounding stack underflow"))?),
+                    PNode::Array(_, _) => {
+                        let n = vals.pop().ok_or(malformed("grounding stack underflow"))?;
+                        let e = vals.pop().ok_or(malformed("grounding stack underflow"))?;
+                        PNode::Array(e, n)
+                    }
+                    PNode::Slice(_) => PNode::Slice(vals.pop().ok_or(malformed("grounding stack underflow"))?),
+                    PNode::Pat(_, _) => {
+                        let l = pop_list(&mut vals, cx.g)?;
+                        let t = vals.pop().ok_or(malformed("grounding stack underflow"))?;
+                        PNode::Pat(t, l)
+                    }
+                    PNode::Adt(k, _) => PNode::Adt(k, pop_list(&mut vals, cx.g)?),
+                    PNode::FnDef(k, _) => PNode::FnDef(k, pop_list(&mut vals, cx.g)?),
+                    PNode::FnPtr(_, h) => PNode::FnPtr(pop_list(&mut vals, cx.g)?, h),
+                    PNode::Closure { owner, ordinal, .. } => PNode::Closure { owner, ordinal, args: pop_list(&mut vals, cx.g)? },
+                    PNode::Coroutine { owner, ordinal, .. } => PNode::Coroutine { owner, ordinal, args: pop_list(&mut vals, cx.g)? },
+                    PNode::Future(e, _, _) => {
+                        let interior = vals.pop().ok_or(malformed("grounding stack underflow"))?;
+                        let out = vals.pop().ok_or(malformed("grounding stack underflow"))?;
+                        PNode::Future(e, out, interior)
+                    }
+                    PNode::ConstValue { bits, .. } => {
+                        let ty = vals.pop().ok_or(malformed("grounding stack underflow"))?;
+                        PNode::ConstValue { ty, bits }
+                    }
+                    PNode::Dynamic(_) => PNode::Dynamic(pop_list(&mut vals, cx.g)?),
+                    PNode::ExTrait(k, _) => PNode::ExTrait(k, pop_list(&mut vals, cx.g)?),
+                    PNode::ExProj { trait_, name, .. } => {
+                        let term = vals.pop().ok_or(malformed("grounding stack underflow"))?;
+                        let args = pop_list(&mut vals, cx.g)?;
+                        PNode::ExProj { trait_, name, args, term }
+                    }
+                    _ => return Err(malformed("unexpected node on grounding stack")),
+                };
+                let interned = cx.g.intern(n).map_err(|_| malformed("a ground type the table cannot hold"))?;
+                vals.push(interned);
+            }
         }
-        PNode::Future(e, out, interior) => PNode::Future(e, ground_own(cx, out, d)?, ground_own(cx, interior, d)?),
-        PNode::ConstValue { ty, bits } => PNode::ConstValue { ty: ground_own(cx, ty, d)?, bits },
-        PNode::Dynamic(l) => PNode::Dynamic(ground_own_list(cx, l, d)?),
-        PNode::ExTrait(k, l) => PNode::ExTrait(k, ground_own_list(cx, l, d)?),
-        PNode::ExProj { trait_, name, args, term } => {
-            PNode::ExProj { trait_, name, args: ground_own_list(cx, args, d)?, term: ground_own(cx, term, d)? }
-        }
-        // A projection or an opaque type the body made has no record table `ground` could
-        // normalize it in: refused by name (rule 3).
-        PNode::Alias { trait_, name, .. } => return Err(Refusal::Projection { trait_, name }),
-        PNode::Opaque(..) => return Err(unsupported("an opaque type made in the body, grounded")),
-        PNode::Infer | PNode::Error => return Err(malformed("a hole or an error type in a verified body")),
-    };
-    cx.g.intern(n).map_err(|_| malformed("a ground type the table cannot hold"))
+    }
+    vals.pop().ok_or(malformed("grounding stack underflow"))
 }
 
 /// The list `l` the body names, each entry grounded, interned in `g`.
@@ -823,7 +920,8 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                 };
                 relocs.push((r.offset as u64, to));
             }
-            self.mem.fill(ids[k], &a.bytes, &relocs)?;
+            let id = *ids.get(k).ok_or(Stop::from(malformed("a record's allocation past its ids")))?;
+            self.mem.fill(id, &a.bytes, &relocs)?;
         }
         let id = *ids.first().ok_or(Stop::from(malformed("a record with no allocation")))?;
         self.consts.push((key, args, id));
