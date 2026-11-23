@@ -710,7 +710,9 @@ impl Reach {
         for (rank, (at, one)) in ranked.iter().enumerate() {
             let rank = u32::try_from(rank).unwrap_or(u32::MAX);
             let kept = u32::try_from(*at).ok().and_then(|at| members.member(at)).filter(|kept| kept.unit.name == one.unit).ok_or(ReachUnknown { unit: one.unit })?;
-            files.extend(kept.held.iter().map(|held| (held.slot, rank)));
+            if let crate::engine_members_record::MemberState::Held(held) = &kept.state {
+                files.extend(held.held.iter().map(|held| (held.slot, rank)));
+            }
             files.extend(kept.not_held.iter().map(|file| (*file, rank)));
         }
         Ok(Reach::of(&ranked, files, names, found, g))

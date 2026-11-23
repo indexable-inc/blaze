@@ -1348,14 +1348,29 @@ fn stands<'v, 'r>(view: &'v crate::engine_members_record::View<'r>, place: u32, 
 }
 
 /// Whether the member `kept` of a members record is today's `unit` with today's names input
-/// (the half of [`stands`] past the record's own read list; [`stands_below`] shares it).
+/// (or refusal state for a standing refused member; the half of [`stands`] past the record's own
+/// read list; [`stands_below`] shares it).
 fn stands_as(kept: &crate::engine_members_record::Member<'_>, unit: &crate::engine_body_plan::Unit, names: NamesInputs<'_, '_>) -> bool {
-    let today = match names.entry(unit.name) {
-        Some(entered) => entered.map(|own| (own.name, own.out)),
-        None => names.stood_on().map(|_| (unit.name, kept.names_out)),
-    };
-    let Some((own_name, own_out)) = today else { return false };
-    kept.unit == *unit && kept.names == own_name && kept.names_out == own_out && own_out != work::failed_out()
+    if kept.unit != *unit {
+        return false;
+    }
+    match &kept.state {
+        crate::engine_members_record::MemberState::Held(held) => {
+            let today = match names.entry(unit.name) {
+                Some(entered) => entered.map(|own| (own.name, own.out)),
+                None => names.stood_on().map(|_| (unit.name, held.names_out)),
+            };
+            let Some((own_name, own_out)) = today else { return false };
+            held.names == own_name && held.names_out == own_out && own_out != work::failed_out()
+        }
+        crate::engine_members_record::MemberState::Refused(crate::engine_members_record::RefusedWhy::ScopeFailed) => match names.entry(unit.name) {
+            Some(None) => true,
+            Some(Some(_)) => false,
+            None => names.stood_on().is_some(),
+        },
+        crate::engine_members_record::MemberState::Refused(crate::engine_members_record::RefusedWhy::NoNamesTask) => names.entry(unit.name).is_none(),
+        crate::engine_members_record::MemberState::Refused(crate::engine_members_record::RefusedWhy::Unstood) => false,
+    }
 }
 
 /// PIECE A, THE STAND BELOW THE HEADS: member `place` stands from the members record though a
@@ -1422,7 +1437,10 @@ pub(crate) enum ReachFrom {
 /// reach and the difference named (`groups`).
 fn own_row_entered(kept: &crate::engine_members_record::Member<'_>, rows: &[TaskRow], rank: Option<u32>) -> bool {
     let Some(rank) = rank else { return true };
-    rows.iter().any(|row| row.rank == rank && kept.held.iter().any(|held| held.slot == row.file))
+    match &kept.state {
+        crate::engine_members_record::MemberState::Held(held) => rows.iter().any(|row| row.rank == rank && held.held.iter().any(|h| h.slot == row.file)),
+        crate::engine_members_record::MemberState::Refused(_) => true,
+    }
 }
 
 /// The two names a held file's path in a member's items record may be outlined under: its own,
@@ -3287,7 +3305,9 @@ impl<'f> BodiesStage<'f> {
             }
             seeds.push(root_of(member));
             if let Some(kept) = view.as_ref().and_then(|view| view.member(place)) {
-                seeds.extend(kept.held.iter().map(|held| held.slot));
+                if let rec::MemberState::Held(held) = &kept.state {
+                    seeds.extend(held.held.iter().map(|held| held.slot));
+                }
                 seeds.extend(kept.not_held.iter().copied());
             }
         }
@@ -4265,12 +4285,13 @@ impl<'f> BodiesStage<'f> {
             // This member's laps ([`SetupParts`]): stood, or each part of its visit.
             let mut member_mark = handles.clock.now();
             let own_name = blaze_drive::key::crate_scope_name(&list.key(member));
+            let unit_val = crate::engine_body_plan::Unit { name: own_name, prefix: list.key(member).prefix(), test: is_test(own_name) };
             let unit = match again {
                 Some(unit) => unit,
                 None => {
                     tally.members = tally.members.saturating_add(1);
                     let unit = u32::try_from(units.len()).unwrap_or(u32::MAX);
-                    units.push(crate::engine_body_plan::Unit { name: own_name, prefix: list.key(member).prefix(), test: is_test(own_name) });
+                    units.push(unit_val);
                     member_cells.push(CellId { of: own_name, cell: WHOLE });
                     unit
                 }
@@ -4288,34 +4309,47 @@ impl<'f> BodiesStage<'f> {
             let place = u32::try_from(member).unwrap_or(u32::MAX);
             // Stood whole, or below its heads (piece A: kept in `below`, counted at its turn).
             let standing = match (again, stood_view.as_ref()) {
-                (None, Some(view)) => match stands(view, place, &today, &moved, &units[unit as usize], names) {
+                (None, Some(view)) => match stands(view, place, &today, &moved, &unit_val, names) {
                     Some(kept) => Some((kept, false)),
-                    None => stands_below(view, place, &today, &moved, &units[unit as usize], names, &entries_now).map(|kept| (kept, true)),
+                    None => stands_below(view, place, &today, &moved, &unit_val, names, &entries_now).map(|kept| (kept, true)),
                 },
                 _ => None,
             };
             if let Some((kept, below_heads)) = standing {
-                if below_heads {
-                    below.push((member, unit));
-                } else {
-                    tally.members_stood = tally.members_stood.saturating_add(1);
-                }
-                members.push(kept.names);
-                if !drop_standing_heads {
-                    heads.extend(kept.held.iter().map(|held| held.subject(kept.unit.prefix)));
-                }
-                member_files.extend(kept.not_held.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::NotHeld, reads: own_cells }));
-                tally.files = tally.files.saturating_add(u32::try_from(kept.held.len()).unwrap_or(u32::MAX));
-                self.member_rows.get_or_insert_with(|| Vec::new_in(g)).push(kept.row);
-                uncovered = uncovered.saturating_add(kept.uncovered);
-                for label in kept.named.iter() {
-                    if uncovered_named.len() < MOST_UNCOVERED_NAMED {
-                        uncovered_named.push(crate::engine_head_notes::leak(g, format_args!("{label}")));
+                match &kept.state {
+                    rec::MemberState::Held(held) => {
+                        if below_heads {
+                            below.push((member, unit));
+                        } else {
+                            tally.members_stood = tally.members_stood.saturating_add(1);
+                        }
+                        members.push(held.names);
+                        if !drop_standing_heads {
+                            heads.extend(held.held.iter().map(|h| h.subject(kept.unit.prefix)));
+                        }
+                        member_files.extend(kept.not_held.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::NotHeld, reads: own_cells }));
+                        tally.files = tally.files.saturating_add(u32::try_from(held.held.len()).unwrap_or(u32::MAX));
+                        self.member_rows.get_or_insert_with(|| Vec::new_in(g)).push(held.row);
+                        uncovered = uncovered.saturating_add(held.uncovered);
+                        for label in held.named.iter() {
+                            if uncovered_named.len() < MOST_UNCOVERED_NAMED {
+                                uncovered_named.push(crate::engine_head_notes::leak(g, format_args!("{label}")));
+                            }
+                        }
+                        members_out.member(kept);
+                        tally.parts.stood_ns = tally.parts.stood_ns.saturating_add(lap(handles.clock, &mut member_mark));
+                        continue;
+                    }
+                    rec::MemberState::Refused(why) => {
+                        if let Some(words) = why.words() {
+                            tally.members_stood = tally.members_stood.saturating_add(1);
+                            member_files.extend(kept.not_held.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::Refused(words), reads: own_cells }));
+                            members_out.member(kept);
+                            tally.parts.stood_ns = tally.parts.stood_ns.saturating_add(lap(handles.clock, &mut member_mark));
+                            continue;
+                        }
                     }
                 }
-                members_out.member(kept);
-                tally.parts.stood_ns = tally.parts.stood_ns.saturating_add(lap(handles.clock, &mut member_mark));
-                continue;
             }
             // The member's files: what its module tree reaches from its root under what plan
             // time knows of its `test` (engine_body_plan.rs `reached_under`), the walk the
@@ -4342,20 +4376,17 @@ impl<'f> BodiesStage<'f> {
             // reached file it does not hold, in the order the claims are made.
             let mut held_kept: Vec<rec::Held<'_>, blaze_own::Alloc<'static>> = Vec::new_in(g);
             let mut not_held_kept: Vec<Name, blaze_own::Alloc<'static>> = Vec::new_in(g);
-            let mut refuse_all = |why: &'static str, reads: &'f [CellId]| member_files.extend(reach.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::Refused(why), reads }));
+            let mut refuse_all = |files: &[Name], why: &'static str, reads: &'f [CellId]| member_files.extend(files.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::Refused(why), reads }));
             let Some(own) = input_at(member) else {
                 // Its crate's own names failed (a build script, its resolution): that failure
                 // is the crate's `CrateScope` row, reported there once; its bodies say so. Read
                 // as it is today: no task defines the crate's names cell (ABSENT), or its task
                 // failed and defines none; the task that comes, or its fix, moves it.
-                refuse_all(
-                    if names.failed(own_name) {
-                        "its crate has no names record this command: its `CrateScope` task failed, and that failure is reported at it"
-                    } else {
-                        "its crate has no `Names` task this command (engine_names.rs `plan`)"
-                    },
-                    own_cells,
-                );
+                let why = if names.failed(own_name) { rec::RefusedWhy::ScopeFailed } else { rec::RefusedWhy::NoNamesTask };
+                refuse_all(&reach, why.words().unwrap_or("its crate has no `Names` task this command (engine_names.rs `plan`)"), own_cells);
+                if again.is_none() {
+                    members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(why), not_held: reach });
+                }
                 continue;
             };
             // A member visited at need was pushed at its first turn (piece A).
@@ -4377,7 +4408,10 @@ impl<'f> BodiesStage<'f> {
                     Ok(records) => records,
                     Err(error) => {
                         let cause = ScopeRefusal::Records { krate, at: member, error };
-                        refuse_all(crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        refuse_all(&reach, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        if again.is_none() {
+                            members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(rec::RefusedWhy::Unstood), not_held: reach });
+                        }
                         continue;
                     }
                 }
@@ -4389,7 +4423,10 @@ impl<'f> BodiesStage<'f> {
                         own_records
                     }
                     Err(cause) => {
-                        refuse_all(crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        refuse_all(&reach, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        if again.is_none() {
+                            members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(rec::RefusedWhy::Unstood), not_held: reach });
+                        }
                         continue;
                     }
                 }
@@ -4409,7 +4446,10 @@ impl<'f> BodiesStage<'f> {
             // The member's files: its items record's file rows, matched to the planner's outlines.
             let Ok(items) = ItemsRecord::open(own_records.items, g) else {
                 // The items record is the crate's names task's: a function of its cell.
-                refuse_all("its crate's items record does not open (blaze-scope items_record.rs `ItemsRecord::open`)", own_cells);
+                refuse_all(&reach, "its crate's items record does not open (blaze-scope items_record.rs `ItemsRecord::open`)", own_cells);
+                if again.is_none() {
+                    members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(rec::RefusedWhy::Unstood), not_held: reach });
+                }
                 continue;
             };
             // Each member's text length of the impls and traits a macro wrote, made the first
@@ -4473,7 +4513,7 @@ impl<'f> BodiesStage<'f> {
             // upfront `front_load::present` CAS lookups to `LazyScopeRecords::open` on first ask
             // while still checking `names.input_of` (in-memory on `phases`) so failed `CrateScope`
             // dependencies still cut the scope immediately.
-            let stood_in_record = again.is_some() || stood_view.as_ref().and_then(|view| view.member(place)).is_some();
+            let stood_in_record = again.is_some() || stood_view.as_ref().and_then(|view| view.member(place)).is_some_and(|m| matches!(m.state, rec::MemberState::Held(_)));
             let defer_scope_inputs = stood_in_record
                 && names.stood_on().is_some()
                 && names.stage().results.is_empty()
@@ -4497,7 +4537,10 @@ impl<'f> BodiesStage<'f> {
                     Err(cause) => {
                         // As the oracle arm refuses it: before any claim or head subject of it.
                         heads.truncate(heads_at);
-                        refuse_all(crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        refuse_all(&reach, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        if again.is_none() {
+                            members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(rec::RefusedWhy::Unstood), not_held: reach });
+                        }
                         continue;
                     }
                 }
@@ -4688,14 +4731,23 @@ impl<'f> BodiesStage<'f> {
                 named.extend(row.named.iter().copied());
                 members_out.member(&rec::Member {
                     at: place,
-                    unit: units[unit as usize],
-                    names: own.name,
-                    names_out: own.out,
-                    row: row_key,
-                    uncovered: row.uncovered,
-                    named,
-                    held: held_kept,
+                    unit: unit_val,
+                    state: rec::MemberState::Held(rec::HeldMember {
+                        names: own.name,
+                        names_out: own.out,
+                        row: row_key,
+                        uncovered: row.uncovered,
+                        named,
+                        held: held_kept,
+                    }),
                     not_held: not_held_kept,
+                });
+            } else if again.is_none() {
+                members_out.member(&rec::Member {
+                    at: place,
+                    unit: unit_val,
+                    state: rec::MemberState::Refused(rec::RefusedWhy::Unstood),
+                    not_held: reach,
                 });
             }
             // The bodies a macro wrote that no entry covers: neither at a file entry nor in a

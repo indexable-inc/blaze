@@ -1059,6 +1059,12 @@ impl<'n> Front2Program<'n> {
                     }
                 }
             }
+            if let Some(lib) = records.index.lang("panic_location") {
+                let k = super::keys::asked_key(names, lib);
+                if !records.store.adts.contains_key(&k) && !given_up.contains_key(&k) {
+                    missing.push(k);
+                }
+            }
             missing.sort_unstable();
             missing.dedup();
             let Some(&first) = missing.first() else { break };
@@ -1873,9 +1879,19 @@ impl FrontEnd for Front2Program<'_> {
         Some(blaze_build::vtable::ObjectTrait { supers: &o.supers, super_args: &o.super_args, methods: &o.methods, shape: o.shape })
     }
 
-    /// The fn `name` of the lang trait `trait_` (`Deref::deref`), filed with its trait's head.
+    /// The fn `name` of the lang trait `trait_` (`Deref::deref`), filed with its trait's head,
+    /// falling back to the library's member row when the trait's head has not been made yet
+    /// (matching `LazyProgram::lang_trait_fn`).
     fn lang_trait_fn(&self, trait_: LangItem, name: &str) -> Option<ItemKey> {
-        self.front.keys.filed_member(self.made_lang(trait_)?, MemberKind::Fn, name)
+        let tr = self.made_lang(trait_)?;
+        if let Some(filed) = self.front.keys.filed_member(tr, MemberKind::Fn, name) {
+            return Some(filed);
+        }
+        let names = self.front.names;
+        let lib = self.front.keys.library_in(names, tr)?;
+        let mut declared = false;
+        super::source::NamesSource::each_member(names, lib, &mut |m| declared |= m.kind == blaze_surface::ItemKind::Function && m.name == Some(name));
+        declared.then(|| super::keys::member_key_of(tr, MemberKind::Fn, name))
     }
 
     fn adt(&self, key: ItemKey) -> Option<Adt<'_>> {

@@ -872,19 +872,26 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
     // configure's test programs) links those programs: the pinned linker too (the shelf's
     // clang.cfg says `-fuse-ld=lld`; clang starts `ld64.lld`, a link to `lld`), and it may start
     // what is under OUT_DIR. Every other script is granted neither.
-    let linker: &[&str] = if runs_out_dir { &["bin/ld64.lld", "bin/lld"] } else { &[] };
+    let linker: &[&str] = if runs_out_dir { &["bin/ld64.lld", "bin/ld.lld", "bin/lld"] } else { &[] };
     let mut exec: AVec<'a, AString<'a>> = Vec::new_in(alloc);
     for name in ["bin/clang-23", "bin/clang", "bin/clang++", "bin/llvm-ar"].iter().chain(linker) {
         let mut path: AString<'a> = String::from_str_in(c.shelf.dir, alloc);
         path.push('/');
         path.push_str(name);
-        exec.push(path);
+        // Linux Landlock opens every plan path (`O_PATH`) when building the ruleset; skip shelf
+        // binaries absent on disk (e.g. empty test shelves or platform-specific linkers) without
+        // weakening confinement.
+        if Path::new(path.as_str()).exists() {
+            exec.push(path);
+        }
     }
     // Each tool and the programs it starts itself (perl's piped `open`: /bin/sh, /bin/bash), at
     // their real paths: a shelf row's (nm-row: nm, the shelf's llvm-nm) under the shelf.
     for tool in script.host_tools {
         for program in tool.programs_in(c.shelf.dir, alloc) {
-            exec.push(program);
+            if Path::new(program.as_str()).exists() {
+                exec.push(program);
+            }
         }
     }
     let exec: AVec<'a, &str> = {
@@ -950,7 +957,7 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
     for folder in reads.iter() {
         // One mount a spelling: a folder named twice (a tool's and the shelf's) is one root.
         // The fact shim's folder is a channel, not a root (below).
-        if !spellings.contains(folder) && Some(*folder) != facts_folder {
+        if spellings.scan_for(folder).is_none() && Some(*folder) != facts_folder {
             roots.push(Root { name: "a folder a native build script reads", kind: tree });
             spellings.push(folder);
         }

@@ -1566,8 +1566,8 @@ fn checking<'f, 'd>(
                 crate::daemon_watch::PollOutcome::FullRescan { crash_cursor, .. } => {
                     taken.full_rescan_daemon(crash_cursor);
                 }
-                crate::daemon_watch::PollOutcome::FsEvents { changes, cursor } => {
-                    taken.in_process_fsevents(chosen.places(), changes, cursor);
+                crate::daemon_watch::PollOutcome::FsEvents { changes, cursor, valid_since } => {
+                    taken.in_process_fsevents(chosen.places(), valid_since, changes, cursor);
                 }
             }
             taken

@@ -37,11 +37,13 @@
 //! the version: an old form is refused as `Magic`, by name, and made again, D160); the graph's
 //! out (32); the tool (32); made at (u64); the member count (u32); then each member sorted by
 //! its place in the crate list: place (u32), its unit's name (kind u8, subject 32), its crate
-//! prefix (8), test (u8), its names input's name (33) and out (32), its row's key (32), its
-//! row's uncovered count (u32), its row's named labels (u32 count, each a u32 length and UTF-8),
-//! its held files (u32 count, each: file index u32, outline name 33, outline path as a u32
-//! length and bytes, entries digest 32), its reached files it does not hold, in the order its
-//! claims were made (u32 count, each an outline name 33).
+//! prefix (8), test (u8), its state tag (u8: 0 held, 1 refused because its `CrateScope` failed,
+//! 2 refused because it had no `Names` task, 3 refused/unstood — never stands); for held (tag 0):
+//! its names input's name (33) and out (32), its row's key (32), its row's uncovered count (u32),
+//! its row's named labels (u32 count, each a u32 length and UTF-8), its held files (u32 count,
+//! each: file index u32, outline name 33, outline path as a u32 length and bytes, entries digest
+//! 32); then for all tags: its reached files it does not hold (for refused/unstood, its entire
+//! reached module tree), in the order its claims were made (u32 count, each an outline name 33).
 
 use core::fmt;
 
@@ -53,7 +55,7 @@ use crate::engine_body_plan::Unit;
 use crate::engine_heads::Subject;
 
 /// The form's first bytes; the last is its version.
-const MAGIC: [u8; 8] = *b"BLZMEMB\x01";
+const MAGIC: [u8; 8] = *b"BLZMEMB\x02";
 
 /// The setup's strategy (rule 78: a type parameter at one seam, engine_bodies.rs `groups`).
 pub(crate) trait SetupInputs {
@@ -75,11 +77,32 @@ impl SetupInputs for StandingMembers {
     const STANDING: bool = true;
 }
 
-/// One member as a request read it whole and kept its row.
+/// One member in the members record, in the crate list's order.
 pub(crate) struct Member<'r> {
     /// Its place in the crate list (`CrateGraph` index).
     pub(crate) at: u32,
     pub(crate) unit: Unit,
+    /// Its held row and files ([`MemberState::Held`]), or why it was refused or unstood
+    /// ([`MemberState::Refused`]).
+    pub(crate) state: MemberState<'r>,
+    /// Each file its module tree reaches that it does not hold (for [`MemberState::Held`], its
+    /// `NotHeld` claims in order; for [`MemberState::Refused`], its entire reached module tree).
+    pub(crate) not_held: AVec<'r, Name>,
+}
+
+/// Whether a recorded member was read whole and kept a row, or refused/unstood.
+pub(crate) enum MemberState<'r> {
+    /// Read whole, its listing row kept by the store, and every file row in its items record
+    /// matched an outline: eligible to stand whole or below its heads.
+    Held(HeldMember<'r>),
+    /// Refused or otherwise not eligible to stand as a held member: still recorded so
+    /// `Reach::of_members` knows its module tree (`not_held`), and — when [`RefusedWhy::words`]
+    /// is `Some` — eligible to stand as refused when none of its reached files moved.
+    Refused(RefusedWhy),
+}
+
+/// One member as a request read it whole and kept its row.
+pub(crate) struct HeldMember<'r> {
     /// Its crate's names input (`groups`' `members`): its name and the digest of its record.
     pub(crate) names: Name,
     pub(crate) names_out: ContentId,
@@ -91,9 +114,30 @@ pub(crate) struct Member<'r> {
     pub(crate) named: AVec<'r, &'r str>,
     /// Each file it holds: its index in the items record and the outline it matched.
     pub(crate) held: AVec<'r, Held<'r>>,
-    /// Each file its module tree reaches that it does not hold (its claim: not held), in the
-    /// order the claims were made.
-    pub(crate) not_held: AVec<'r, Name>,
+}
+
+/// Why a member was recorded as [`MemberState::Refused`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RefusedWhy {
+    /// Its `CrateScope` task failed (`input_at(member)` was `None` and `names.failed(own_name)`).
+    ScopeFailed,
+    /// It had no `Names` task (`input_at(member)` was `None` and `!names.failed(own_name)`).
+    NoNamesTask,
+    /// Refused for another reason (scope records / check scope / items record / env / damaged row)
+    /// or had a `FileHead::NotOutlined` file row: never stands, always visited by `groups`.
+    Unstood,
+}
+
+impl RefusedWhy {
+    /// The refusal message for standing refused members (`None` for [`RefusedWhy::Unstood`], which
+    /// never stands).
+    pub(crate) const fn words(self) -> Option<&'static str> {
+        match self {
+            RefusedWhy::ScopeFailed => Some("its crate has no names record this command: its `CrateScope` task failed, and that failure is reported at it"),
+            RefusedWhy::NoNamesTask => Some("its crate has no `Names` task this command (engine_names.rs `plan`)"),
+            RefusedWhy::Unstood => None,
+        }
+    }
 }
 
 /// A held file: what [`Subject::new`] reads of its outline, kept.
@@ -135,6 +179,8 @@ pub(crate) enum MembersRefused {
     Utf8 { at: usize },
     /// A name's kind byte at `at` that no kind has.
     Kind { at: usize, byte: u8 },
+    /// A member's state tag byte at `at` that no state has.
+    State { at: usize, byte: u8 },
     /// The members out of the crate list's order at `at`.
     Order { at: usize },
     /// Bytes after the last member.
@@ -149,6 +195,7 @@ impl fmt::Display for MembersRefused {
             MembersRefused::Count { at, what, count } => write!(f, "the members record's count of {what} at byte {at} is {count}, more than its bytes hold (engine_members_record.rs)"),
             MembersRefused::Utf8 { at } => write!(f, "the members record's label at byte {at} is not UTF-8 (engine_members_record.rs)"),
             MembersRefused::Kind { at, byte } => write!(f, "the members record's name at byte {at} has the kind byte {byte}, which no kind has (engine_members_record.rs)"),
+            MembersRefused::State { at, byte } => write!(f, "the members record's member at byte {at} has the state tag {byte}, which no state has (engine_members_record.rs)"),
             MembersRefused::Order { at } => write!(f, "the members record's member at byte {at} is out of the crate list's order (engine_members_record.rs)"),
             MembersRefused::Trailing { at } => write!(f, "the members record has bytes after its last member, from byte {at} (engine_members_record.rs)"),
         }
@@ -201,20 +248,28 @@ impl<'w> Writer<'w> {
         name(into, m.unit.name);
         into.extend_from_slice(&m.unit.prefix);
         into.push(u8::from(m.unit.test));
-        name(into, m.names);
-        into.extend_from_slice(&m.names_out.0);
-        into.extend_from_slice(&m.row.0.0);
-        into.extend_from_slice(&m.uncovered.to_le_bytes());
-        count(into, m.named.len());
-        for label in m.named.iter() {
-            bytes(into, label.as_bytes());
-        }
-        count(into, m.held.len());
-        for h in m.held.iter() {
-            into.extend_from_slice(&h.file.to_le_bytes());
-            name(into, h.slot);
-            bytes(into, h.path);
-            into.extend_from_slice(&h.entries.0);
+        match &m.state {
+            MemberState::Held(held) => {
+                into.push(0u8);
+                name(into, held.names);
+                into.extend_from_slice(&held.names_out.0);
+                into.extend_from_slice(&held.row.0.0);
+                into.extend_from_slice(&held.uncovered.to_le_bytes());
+                count(into, held.named.len());
+                for label in held.named.iter() {
+                    bytes(into, label.as_bytes());
+                }
+                count(into, held.held.len());
+                for h in held.held.iter() {
+                    into.extend_from_slice(&h.file.to_le_bytes());
+                    name(into, h.slot);
+                    bytes(into, h.path);
+                    into.extend_from_slice(&h.entries.0);
+                }
+            }
+            MemberState::Refused(RefusedWhy::ScopeFailed) => into.push(1u8),
+            MemberState::Refused(RefusedWhy::NoNamesTask) => into.push(2u8),
+            MemberState::Refused(RefusedWhy::Unstood) => into.push(3u8),
         }
         count(into, m.not_held.len());
         for n in m.not_held.iter() {
@@ -291,8 +346,9 @@ impl<'r> Cursor<'r> {
     }
 }
 
-/// The least bytes of one member, one held file and one name: what a count is checked against.
-const MEMBER_LEAST: usize = 4 + 33 + 8 + 1 + 33 + 32 + 32 + 4 + 4 + 4 + 4;
+/// The least bytes of one member (refused with 0 reached files), one held file and one name:
+/// what a count is checked against.
+const MEMBER_LEAST: usize = 4 + 33 + 8 + 1 + 1 + 4;
 const HELD_LEAST: usize = 4 + 33 + 4 + 32;
 const NAME_LEN: usize = 33;
 
@@ -328,32 +384,42 @@ impl<'r> View<'r> {
             let mut prefix = [0u8; 8];
             prefix.copy_from_slice(c.take(8, "a member's crate prefix")?);
             let test = c.u8("a member's test mark")? != 0;
-            let names = c.name("a member's names input")?;
-            let names_out = c.id("a member's names record digest")?;
-            let row = Key(c.id("a member's row key")?);
-            let uncovered = c.u32("a member's uncovered count")?;
-            let labels = c.count(4, "a member's named labels")?;
-            let mut named = AVec::with_capacity_in(labels, alloc);
-            for _ in 0..labels {
-                let starts = c.at;
-                let b = c.bytes("a label")?;
-                named.push(core::str::from_utf8(b).map_err(|_| MembersRefused::Utf8 { at: starts })?);
-            }
-            let held_n = c.count(HELD_LEAST, "a member's held files")?;
-            let mut held = AVec::with_capacity_in(held_n, alloc);
-            for _ in 0..held_n {
-                let file = c.u32("a held file's index")?;
-                let slot = c.name("a held file's outline")?;
-                let path = c.bytes("a held file's path")?;
-                let entries = c.id("a held file's entries")?;
-                held.push(Held { file, slot, path, entries });
-            }
+            let state_at = c.at;
+            let state = match c.u8("a member's state tag")? {
+                0 => {
+                    let names = c.name("a member's names input")?;
+                    let names_out = c.id("a member's names record digest")?;
+                    let row = Key(c.id("a member's row key")?);
+                    let uncovered = c.u32("a member's uncovered count")?;
+                    let labels = c.count(4, "a member's named labels")?;
+                    let mut named = AVec::with_capacity_in(labels, alloc);
+                    for _ in 0..labels {
+                        let starts = c.at;
+                        let b = c.bytes("a label")?;
+                        named.push(core::str::from_utf8(b).map_err(|_| MembersRefused::Utf8 { at: starts })?);
+                    }
+                    let held_n = c.count(HELD_LEAST, "a member's held files")?;
+                    let mut held = AVec::with_capacity_in(held_n, alloc);
+                    for _ in 0..held_n {
+                        let file = c.u32("a held file's index")?;
+                        let slot = c.name("a held file's outline")?;
+                        let path = c.bytes("a held file's path")?;
+                        let entries = c.id("a held file's entries")?;
+                        held.push(Held { file, slot, path, entries });
+                    }
+                    MemberState::Held(HeldMember { names, names_out, row, uncovered, named, held })
+                }
+                1 => MemberState::Refused(RefusedWhy::ScopeFailed),
+                2 => MemberState::Refused(RefusedWhy::NoNamesTask),
+                3 => MemberState::Refused(RefusedWhy::Unstood),
+                byte => return Err(MembersRefused::State { at: state_at, byte }),
+            };
             let not_n = c.count(NAME_LEN, "a member's reached files it does not hold")?;
             let mut not_held = AVec::with_capacity_in(not_n, alloc);
             for _ in 0..not_n {
                 not_held.push(c.name("a reached file it does not hold")?);
             }
-            members.push(Member { at, unit: Unit { name: unit_name, prefix, test }, names, names_out, row, uncovered, named, held, not_held });
+            members.push(Member { at, unit: Unit { name: unit_name, prefix, test }, state, not_held });
         }
         if c.at != bytes.len() {
             return Err(MembersRefused::Trailing { at: c.at });
@@ -363,8 +429,9 @@ impl<'r> View<'r> {
 
     /// The member at crate list place `at` as the last request left it, when the record was
     /// made over `today` (graph, tool, and the answer this request starts from) and no outline
-    /// in `moved` (sorted) is a file it holds or reaches. `None`: visit it. The caller still
-    /// compares the unit and the names input with today's.
+    /// in `moved` (sorted) is a file it holds or reaches. `None`: visit it. A member recorded
+    /// as [`RefusedWhy::Unstood`] never stands. The caller still compares the unit and the names
+    /// input (or refusal state) with today's.
     pub(crate) fn standing(&self, at: u32, today: &Header, moved: &[Name]) -> Option<&Member<'r>> {
         if self.header != *today {
             return None;
@@ -372,8 +439,18 @@ impl<'r> View<'r> {
         let place = self.members.binary_search_by_key(&at, |m| m.at).ok()?;
         let member = &self.members[place];
         let hit = |name: &Name| moved.binary_search(name).is_ok();
-        if member.held.iter().any(|h| hit(&h.slot)) || member.not_held.iter().any(hit) {
-            return None;
+        match &member.state {
+            MemberState::Held(held) => {
+                if held.held.iter().any(|h| hit(&h.slot)) || member.not_held.iter().any(hit) {
+                    return None;
+                }
+            }
+            MemberState::Refused(RefusedWhy::ScopeFailed | RefusedWhy::NoNamesTask) => {
+                if member.not_held.iter().any(hit) {
+                    return None;
+                }
+            }
+            MemberState::Refused(RefusedWhy::Unstood) => return None,
         }
         Some(member)
     }
@@ -392,12 +469,15 @@ impl<'r> View<'r> {
             return None;
         }
         let member = self.member(at)?;
+        let MemberState::Held(held_member) = &member.state else {
+            return None;
+        };
         let hit = |name: &Name| moved.binary_search(name).is_ok();
         if member.not_held.iter().any(hit) {
             return None;
         }
         let mut below = false;
-        for held in member.held.iter().filter(|held| hit(&held.slot)) {
+        for held in held_member.held.iter().filter(|held| hit(&held.slot)) {
             if entries_now(held.slot) != Some(held.entries) {
                 return None;
             }
@@ -446,7 +526,10 @@ mod tests {
         let mut not_held = AVec::new_in(alloc);
         not_held.push(reached);
         let unit = Unit { name: name(blaze_drive::Kind::CrateScope, 5), prefix: [6; 8], test: false };
-        let member = Member { at: 3, unit, names: name(blaze_drive::Kind::CrateScope, 7), names_out: ContentId([9; 32]), row: Key(ContentId([8; 32])), uncovered: 1, named, held, not_held };
+        let names = name(blaze_drive::Kind::CrateScope, 7);
+        let names_out = ContentId([9; 32]);
+        let row = Key(ContentId([8; 32]));
+        let member = Member { at: 3, unit, state: MemberState::Held(HeldMember { names, names_out, row, uncovered: 1, named, held }), not_held };
         let mut writer = Writer::new(&header(9), alloc);
         writer.member(&member);
         let bytes = writer.finish();
@@ -454,9 +537,10 @@ mod tests {
         assert_eq!(view.header, header(9));
         assert_eq!(view.len(), 1);
         let got = view.standing(3, &header(9), &[other]).expect("a member none of whose files moved stands");
-        assert_eq!((got.unit, got.names, got.names_out, got.row, got.uncovered), (unit, member.names, member.names_out, member.row, 1));
-        assert_eq!(&got.named[..], &["a body a macro wrote"]);
-        assert_eq!(got.held[0].path, b"c5/src/lib.rs");
+        let MemberState::Held(got_held) = &got.state else { panic!("expected a held member") };
+        assert_eq!((got.unit, got_held.names, got_held.names_out, got_held.row, got_held.uncovered), (unit, names, names_out, row, 1));
+        assert_eq!(&got_held.named[..], &["a body a macro wrote"]);
+        assert_eq!(got_held.held[0].path, b"c5/src/lib.rs");
         assert_eq!(&got.not_held[..], &[reached]);
         // Written again from what was read: the same bytes (a standing member is copied whole).
         let mut again = Writer::new(&header(9), alloc);
@@ -473,8 +557,61 @@ mod tests {
         assert!(matches!(View::open(&bytes[..COUNT_AT + 2], alloc), Err(MembersRefused::Short { what: "members", need: 2, .. })), "CONTROL: a cut header");
         let mut old = AVec::new_in(alloc);
         old.extend_from_slice(&bytes);
-        old[7] = 0;
-        assert!(matches!(View::open(&old, alloc), Err(MembersRefused::Magic)), "CONTROL: another version");
+        old[7] = 1;
+        assert!(matches!(View::open(&old, alloc), Err(MembersRefused::Magic)), "CONTROL: v1 version refused");
+    }
+
+    /// REFUSED MEMBERS ROUND-TRIP AND STANDING RULES: `ScopeFailed` and `NoNamesTask` round-trip,
+    /// expose their full `not_held` reach, and stand when no reached file moved; `Unstood`
+    /// round-trips and exposes its reach via `member()` but NEVER stands (`standing` and
+    /// `standing_below_heads` both return `None`).
+    #[test]
+    fn refused_members_round_trip_and_respect_standing_rules() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let kind = blaze_drive::Kind::FileItems;
+        let (f0, f1, f2, other) = (name(kind, 20), name(kind, 21), name(kind, 22), name(kind, 23));
+        let unit = |b: u8| Unit { name: name(blaze_drive::Kind::CrateScope, b), prefix: [b; 8], test: false };
+        let mut r0 = AVec::new_in(alloc);
+        r0.push(f0);
+        let mut r1 = AVec::new_in(alloc);
+        r1.push(f1);
+        let mut r2 = AVec::new_in(alloc);
+        r2.push(f2);
+        let m0 = Member { at: 0, unit: unit(1), state: MemberState::Refused(RefusedWhy::ScopeFailed), not_held: r0 };
+        let m1 = Member { at: 1, unit: unit(2), state: MemberState::Refused(RefusedWhy::NoNamesTask), not_held: r1 };
+        let m2 = Member { at: 2, unit: unit(3), state: MemberState::Refused(RefusedWhy::Unstood), not_held: r2 };
+        let mut writer = Writer::new(&header(4), alloc);
+        writer.member(&m0);
+        writer.member(&m1);
+        writer.member(&m2);
+        let bytes = writer.finish();
+        let view = View::open(&bytes, alloc).expect("the record opens");
+        assert_eq!(view.len(), 3);
+        let g0 = view.standing(0, &header(4), &[other]).expect("ScopeFailed stands when no file moved");
+        assert!(matches!(g0.state, MemberState::Refused(RefusedWhy::ScopeFailed)));
+        assert_eq!(&g0.not_held[..], &[f0]);
+        assert!(view.standing(0, &header(4), &[f0]).is_none(), "CONTROL: moved reached file breaks ScopeFailed stand");
+        let g1 = view.standing(1, &header(4), &[other]).expect("NoNamesTask stands when no file moved");
+        assert!(matches!(g1.state, MemberState::Refused(RefusedWhy::NoNamesTask)));
+        assert_eq!(&g1.not_held[..], &[f1]);
+        assert!(view.standing(1, &header(4), &[f1]).is_none(), "CONTROL: moved reached file breaks NoNamesTask stand");
+        assert!(view.standing(2, &header(4), &[]).is_none(), "Unstood never stands");
+        assert!(view.standing_below_heads(0, &header(4), &[f0], |_| Some(ContentId([1; 32]))).is_none(), "Refused never stands below heads");
+        let g2 = view.member(2).expect("Unstood is still present for Reach::of_members");
+        assert!(matches!(g2.state, MemberState::Refused(RefusedWhy::Unstood)));
+        assert_eq!(&g2.not_held[..], &[f2]);
+        // Re-written byte-identical.
+        let mut again = Writer::new(&header(4), alloc);
+        again.member(g0);
+        again.member(g1);
+        again.member(g2);
+        assert_eq!(&again.finish()[..], &bytes[..], "refused members round-trip byte-for-byte");
+        // Corrupt state tag byte is refused with `MembersRefused::State`.
+        let mut bad = AVec::new_in(alloc);
+        bad.extend_from_slice(&bytes);
+        let first_state_tag = COUNT_AT + 4 + 4 + 33 + 8 + 1;
+        bad[first_state_tag] = 99;
+        assert!(matches!(View::open(&bad, alloc), Err(MembersRefused::State { byte: 99, .. })));
     }
 
     /// THE STAND BELOW THE HEADS (`View::standing_below_heads`): a member whose moved held file
@@ -492,7 +629,19 @@ mod tests {
         let mut not_held = AVec::new_in(alloc);
         not_held.push(reached);
         let unit = Unit { name: name(blaze_drive::Kind::CrateScope, 5), prefix: [6; 8], test: true };
-        let member = Member { at: 3, unit, names: name(blaze_drive::Kind::CrateScope, 7), names_out: ContentId([9; 32]), row: Key(ContentId([8; 32])), uncovered: 0, named: AVec::new_in(alloc), held, not_held };
+        let member = Member {
+            at: 3,
+            unit,
+            state: MemberState::Held(HeldMember {
+                names: name(blaze_drive::Kind::CrateScope, 7),
+                names_out: ContentId([9; 32]),
+                row: Key(ContentId([8; 32])),
+                uncovered: 0,
+                named: AVec::new_in(alloc),
+                held,
+            }),
+            not_held,
+        };
         let mut writer = Writer::new(&header(9), alloc);
         writer.member(&member);
         let bytes = writer.finish();

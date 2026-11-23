@@ -399,7 +399,25 @@ fn expansion_fn<'n, S: NamesSource<'n>>(names: S, own: LibKey, shim: Shim, alloc
     match (found, second) {
         (Some(first), Some(second)) => Err(Refused::ExpandedTwice { shim, first: path_of(names, first), second: path_of(names, second) }),
         (Some(first), None) => Ok(first),
-        (None, _) => Err(Refused::NotExpanded { shim, static_path: path_of(names, own) }),
+        (None, _) => {
+            let shown = super::item_shown::ItemShown::of_lib(names, own);
+            let static_path = if shown.path().is_some() {
+                shown.boxed()
+            } else if let Some(solved) = names.solved()
+                && let Some(c) = solved.crates().get(krate)
+                && let Some(lang) = c.tables.langs.iter().find(|l| l.key == own)
+                && let Some(offset) = usize::try_from(lang.loc.offset).ok()
+                && let Some(text) = names.file_text(krate, lang.loc.file)
+                && let Some(tail) = text.get(offset..)
+                && let Some(name) = super::static_shown::static_name(tail)
+            {
+                let full = blaze_own::format_in!(alloc, "{}::{name}", c.name);
+                full.as_str().into()
+            } else {
+                shown.boxed()
+            };
+            Err(Refused::NotExpanded { shim, static_path })
+        }
     }
 }
 

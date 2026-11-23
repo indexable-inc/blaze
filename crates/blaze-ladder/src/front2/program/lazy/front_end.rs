@@ -313,10 +313,11 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
 
     /// From the fn's row (fill.rs `row`): its written ABI's unwind category (program/head_abi.rs
     /// `BuildAbi`: "C"/"system" nounwind, "Rust"/"rust-call"/"-unwind" not) or
-    /// `#[rustc_nounwind]`, as `Front2Program`'s. `None`: no row made for `key` yet.
+    /// `#[rustc_nounwind]`, as `Front2Program`'s, falling back to the signature when no row is
+    /// made yet.
     fn nounwind(&self, key: ItemKey) -> Option<bool> {
-        let &i = self.rows.by_key.get(&key)?;
-        self.rows.nounwind.get(i as usize).copied()
+        let tabled = self.rows.by_key.get(&key).and_then(|&i| self.rows.nounwind.get(i as usize).copied());
+        super::seam_rules::nounwind_from(tabled, self.front.names, &self.front.keys, &self.store, key)
     }
 
     /// A row's ABI, else the head's (program/seam_rules.rs `fn_abi`, `Front2Program`'s rule): a
