@@ -277,6 +277,10 @@ pub enum Rule {
     /// that trip Blaze's `alloc_global_tests` and `std-alloc-tests` ratchets.
     /// The lint `blaze::test_ambient_leak`.
     TestAmbientLeak = 40,
+    /// `let mut x = ..;` where `x` is never rebound (`x = ..`) and only borrowed uniquely
+    /// (`&uniq x` / `&mut x`); under Blaze's edition `let x` permits `&uniq x` directly and
+    /// `mut` is reserved for local rebinding. The lint `blaze::mut_for_uniq_borrow`.
+    MutForUniqBorrow = 41,
 }
 
 impl Rule {
@@ -325,6 +329,7 @@ impl Rule {
         Rule::BoolAsInt,
         Rule::ManualSliceIdioms,
         Rule::TestAmbientLeak,
+        Rule::MutForUniqBorrow,
     ];
 
     /// The ten rules ported from blaze's scripts: what [`Step::Strict`] runs. The rules after
@@ -389,6 +394,7 @@ impl Rule {
             Rule::BoolAsInt => "bool-as-int",
             Rule::ManualSliceIdioms => "manual-slice-idioms",
             Rule::TestAmbientLeak => "test-ambient-leak",
+            Rule::MutForUniqBorrow => "mut-for-uniq-borrow",
         }
     }
 
@@ -425,6 +431,7 @@ impl Rule {
             Rule::BoolAsInt => Some("bool_as_int"),
             Rule::ManualSliceIdioms => Some("manual_slice_idioms"),
             Rule::TestAmbientLeak => Some("test_ambient_leak"),
+            Rule::MutForUniqBorrow => Some("mut_for_uniq_borrow"),
             _ => None,
         }
     }
@@ -469,7 +476,7 @@ impl Rule {
     pub const fn exempt(self) -> TestBits {
         match self {
             Rule::Allocs => TestBits::CFG,
-            Rule::UnsafeComment | Rule::VariantCount | Rule::MutRef | Rule::TestAmbientLeak => TestBits::NONE,
+            Rule::UnsafeComment | Rule::VariantCount | Rule::MutRef | Rule::TestAmbientLeak | Rule::MutForUniqBorrow => TestBits::NONE,
             _ => TestBits::ANY,
         }
     }
@@ -669,6 +676,9 @@ pub enum Template {
     TestGlobalAlloc = 360,
     /// `#[cfg(test)] extern crate std;` (trips `std-alloc-tests`).
     TestExternStd = 361,
+    /// `let mut x = ..;` when `x` is never rebound and only uniquely borrowed (`&uniq x`/`&mut x`);
+    /// fixed mechanically by removing `mut`.
+    MutForUniqBorrow = 370,
 }
 
 impl Template {
@@ -712,6 +722,7 @@ impl Template {
             340 => Rule::BoolAsInt,
             350..=352 => Rule::ManualSliceIdioms,
             360..=361 => Rule::TestAmbientLeak,
+            370 => Rule::MutForUniqBorrow,
             _ => Rule::VariantCount,
         }
     }
@@ -804,6 +815,7 @@ impl Template {
             Template::ManualFindSplit => "manual-find-split",
             Template::TestGlobalAlloc => "test-global-alloc",
             Template::TestExternStd => "test-extern-std",
+            Template::MutForUniqBorrow => "mut-for-uniq-borrow",
         }
     }
 }
@@ -1366,7 +1378,7 @@ impl Step {
     /// toolchain has.
     pub const SUGGEST: [Rule; 4] = [Rule::UnsafeComment, Rule::Untyped, Rule::Recursion, Rule::VariantCount];
     /// The rules of [`Step::Edition`].
-    pub const EDITION: [Rule; 12] = [
+    pub const EDITION: [Rule; 13] = [
         Rule::UnsafeComment,
         Rule::Untyped,
         Rule::Recursion,
@@ -1379,6 +1391,7 @@ impl Step {
         Rule::BoolAsInt,
         Rule::ManualSliceIdioms,
         Rule::TestAmbientLeak,
+        Rule::MutForUniqBorrow,
     ];
 
     /// The step as configuration writes it (`rust`, `suggest`, `edition`, `strict`).

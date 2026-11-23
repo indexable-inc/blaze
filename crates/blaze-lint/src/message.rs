@@ -277,6 +277,9 @@ pub fn show_message<P: Put + ?Sized>(rules: &RuleSet, item: &str, findings: &Fin
         Template::TestExternStd => {
             out.str("`extern crate std;` in test code trips `std-alloc-tests`: keep tests `#![no_std]` with `blaze_own::testing::heap().alloc()` and `core::fmt`");
         }
+        Template::MutForUniqBorrow => {
+            out.str("`").str(range).str("` is never rebound and only uniquely borrowed: under Blaze's edition `let` allows `&uniq` directly and `mut` is only for local rebinding");
+        }
         Template::VariantCount | Template::VariantCountMany => {
             let names = || {
                 args.iter().filter_map(|arg| match arg {

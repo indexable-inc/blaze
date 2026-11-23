@@ -1482,7 +1482,7 @@ fn named_in_bounds((v, scope, alloc): (&View<'_>, &Scope, Mem), bounds: lf::List
                         todo.push(Work::Ty(read(lf::Field::decode(n), "a record's field")?.ty, in_fn));
                     }
                 }
-                lf::TypeRef::Tuple(l) => {
+                lf::TypeRef::Tuple(l) | lf::TypeRef::Union(l) => {
                     for &id in read(v.ids(l), "a tuple's elements")? {
                         todo.push(Work::Ty(lf::TypeId(id), in_fn));
                     }

@@ -15,8 +15,8 @@ use crate::sequences::{
     ArgOf, BANG, BAR, BRACE, CLOSE, Cut, DOT, DOTDOT, Guard, LT, MAX_WORD_LEN, MIN_WORD_LEN, NE, NO_WORD, OPEN, OTHER,
     SEP, SEQS, TRIE, W_ALLOC, W_ALLOC_TYPE, W_ARC, W_AS, W_BLOCK_ON, W_CLONE, W_CRATE, W_EXPECT, W_EXTERN, W_FALSE,
     W_FILE, W_FIND, W_FN, W_FOR, W_GET, W_GLOBAL, W_GLOBAL_FN, W_IMPL, W_IN, W_INSTANT, W_IS_SOME_AND, W_JOIN, W_LEN,
-    W_LIBC, W_LOCK, W_MOD, W_MUT, W_ORDERING, W_RECV, W_REF, W_RUSTIX, W_SELF, W_SEQCST, W_SOME, W_STARTS_WITH, W_STD,
-    W_STRING, W_SYSTEM_TIME, W_THREAD_LOCAL, W_TRAIT, W_TRUE, W_TRY_INTO, W_TYPE, W_UNSAFE, W_UNWRAP, W_USE, W_VEC,
+    W_LET, W_LIBC, W_LOCK, W_MOD, W_MUT, W_ORDERING, W_RECV, W_REF, W_RUSTIX, W_SELF, W_SEQCST, W_SOME, W_STARTS_WITH, W_STD,
+    W_STRING, W_SYSTEM_TIME, W_THREAD_LOCAL, W_TRAIT, W_TRUE, W_TRY_INTO, W_TYPE, W_UNIQ, W_UNSAFE, W_UNWRAP, W_USE, W_VEC,
     W_WAIT, WC_COLLECTION, WC_DEFINING, WC_DISPATCHED, WC_IO_MODULE, WC_IO_TYPE, WC_LOCK_TYPE, WC_PRINT_MACRO,
     WC_RENAME, WC_SANS_IO, WC_STATIC, WORD, WORD_CLASS, WORD_FIRST_BY_LEN,
 };
@@ -180,9 +180,9 @@ pub(crate) const FORMAT_MACROS: [&str; 8] =
     ["format", "format_args", "write", "writeln", "print", "println", "eprint", "eprintln"];
 /// Every word [`Pass::on_word`] matches on by name: each must be in `sequences::WORDS`, which a
 /// compile-time check there holds, since a word not in the table is never dispatched.
-pub(crate) const DISPATCHED: [&str; 24] = [
+pub(crate) const DISPATCHED: [&str; 25] = [
     "use", "as", "clone", "Global", "fn", "type", "impl", "trait", "mod", "for", "self", "unwrap", "expect", "std",
-    "alloc", "unsafe", "Ordering", "ref", "get", "starts_with", "len", "find", "Alloc", "extern",
+    "alloc", "unsafe", "Ordering", "ref", "let", "get", "starts_with", "len", "find", "Alloc", "extern",
 ];
 /// The words `process-static` starts at ([`Pass::process_static`]).
 pub(crate) const STATIC_WORDS: [&str; 2] = ["static", "thread_local"];
@@ -943,6 +943,10 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                 W_REF if rules.runs(Rule::MutRef) => {
                     self.cost.add(Rule::MutRef);
                     self.ref_mut_word(i, t);
+                }
+                W_LET if rules.runs(Rule::MutForUniqBorrow) => {
+                    self.cost.add(Rule::MutForUniqBorrow);
+                    self.let_mut_word(i, t);
                 }
                 W_GET if rules.runs(Rule::MagicSliceLen) => {
                     self.cost.add(Rule::MagicSliceLen);
@@ -3052,6 +3056,121 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                 range: Span::new(ref_tok.start, next.end),
                 arg: None,
                 plan: Plan::Replace { range: Span::new(next.start, next.end), text: "uniq" },
+            });
+        }
+    }
+
+    /// Flags `let mut x = ..;` when `x` is never rebound (`x = ..`, `x += ..`, ...) in its
+    /// enclosing block and is only borrowed uniquely (`&uniq x` / `&mut x`), attaching a
+    /// mechanical fix that removes the redundant `mut ` keyword.
+    fn let_mut_word(&mut self, i: usize, let_tok: Tok) {
+        let Some(mut_tok) = self.tok(i + 1) else { return };
+        if mut_tok.k != K::Ident || mut_tok.word != W_MUT {
+            return;
+        }
+        let Some(name_tok) = self.tok(i + 2) else { return };
+        if name_tok.k != K::Ident {
+            return;
+        }
+        // Only simple `let mut x = ...;` or `let mut x: T = ...;` bindings (not destructuring).
+        let Some(after_name) = self.tok(i + 3) else { return };
+        if !matches!(after_name.k, K::P(b'=') | K::P(b':')) {
+            return;
+        }
+        let name = self.str_of(name_tok);
+        if name.is_empty() || name.starts_with('_') {
+            return;
+        }
+
+        // Advance past the initializer statement's `;` at delimiter depth 0.
+        let mut depth = 0i32;
+        let mut j = i + 3;
+        while let Some(tok) = self.tok(j) {
+            match tok.k {
+                K::P(b'{' | b'(' | b'[') => depth += 1,
+                K::P(b'}' | b')' | b']') => {
+                    if depth == 0 {
+                        return;
+                    }
+                    depth -= 1;
+                }
+                K::P(b';') if depth == 0 => {
+                    j += 1;
+                    break;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+
+        // Scan the rest of the enclosing block (`block_depth >= 0`) until it closes or `name` is shadowed.
+        let mut uniq_borrowed = false;
+        let mut rebound = false;
+        let mut block_depth = 0i32;
+        while let Some(tok) = self.tok(j) {
+            match tok.k {
+                K::P(b'{') => block_depth += 1,
+                K::P(b'}') => {
+                    if block_depth == 0 {
+                        break;
+                    }
+                    block_depth -= 1;
+                }
+                K::Ident if tok.word == W_LET && block_depth == 0 => {
+                    let next1 = self.tok(j + 1);
+                    let shadow = if next1.is_some_and(|t| t.k == K::Ident && t.word == W_MUT) {
+                        self.tok(j + 2)
+                    } else {
+                        next1
+                    };
+                    if shadow.is_some_and(|t| t.k == K::Ident && self.str_of(t) == name) {
+                        break;
+                    }
+                }
+                K::Ident if self.str_of(tok) == name => {
+                    let prev = if j > 0 { self.tok(j - 1) } else { None };
+                    let prev2 = if j > 1 { self.tok(j - 2) } else { None };
+                    // Check `&uniq name` or `&mut name`.
+                    let is_uniq_borrow = prev.is_some_and(|p| {
+                        p.k == K::Ident && (p.word == W_UNIQ || p.word == W_MUT)
+                    }) && prev2.is_some_and(|p2| p2.k == K::P(b'&'));
+                    if is_uniq_borrow {
+                        uniq_borrowed = true;
+                    } else {
+                        // Skip field/path access `.name` / `::name`.
+                        let is_member = prev.is_some_and(|p| matches!(p.k, K::P(b'.' | b':')));
+                        if !is_member {
+                            if let Some(next) = self.tok(j + 1) {
+                                let next2 = self.tok(j + 2);
+                                // Bare rebinding: `name = expr` (not `==` / `=>`) or compound assign.
+                                let is_eq = next.k == K::P(b'=')
+                                    && !next2.is_some_and(|n2| matches!(n2.k, K::P(b'=' | b'>')));
+                                let is_compound = matches!(
+                                    next.k,
+                                    K::P(b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^')
+                                ) && next2.is_some_and(|n2| n2.k == K::P(b'='));
+                                let is_shift_assign = matches!(next.k, K::P(b'<' | b'>'))
+                                    && next2.is_some_and(|n2| n2.k == next.k)
+                                    && self.tok(j + 3).is_some_and(|n3| n3.k == K::P(b'='));
+                                if is_eq || is_compound || is_shift_assign {
+                                    rebound = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+
+        if uniq_borrowed && !rebound {
+            self.cands.push(Cand {
+                template: Template::MutForUniqBorrow,
+                range: Span::new(let_tok.start, name_tok.end),
+                arg: None,
+                plan: Plan::Replace { range: Span::new(mut_tok.start, name_tok.start), text: "" },
             });
         }
     }

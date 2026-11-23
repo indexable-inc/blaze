@@ -1030,4 +1030,48 @@ fn uniq_and_record_named_args_with_defaults_lower_cleanly() {
     let has_rec_pat = (0..bv.pats.len() as u32)
         .any(|i| matches!(bv.pat(PatId(i)), Ok(Pat::Record { rest: true, .. })));
     assert!(has_rec_pat, "expected Pat::Record with rest:\n{}", dump_of(&lowered));
+
+    // Also verify all-defaults `{ .. }` literal lowers cleanly as `Expr::Record { fields: empty, base: Defaults }`.
+    let all_def_body = "fn call_defaults() { open(\"p\", { .. }); }";
+    let lowered_def = crate::lower_body_with_extensions(all_def_body, Edition::E2024, exts, &mut Unix, &mut crate::NoModule, alloc)
+        .expect("all-defaults `{ .. }` lowers");
+    let dv = lowered_def.view();
+    assert!(dv.unhandled.is_empty(), "unhandled:\n{}", dump_of(&lowered_def));
+    assert!(dv.diags.is_empty(), "diags:\n{}", dump_of(&lowered_def));
+    assert!(
+        (0..dv.exprs.len() as u32)
+            .any(|i| matches!(dv.expr(ExprId(i)), Ok(Expr::Record { fields, base: StructBase::Defaults }) if fields.len == 0)),
+        "expected empty Expr::Record with Defaults:\n{}",
+        dump_of(&lowered_def)
+    );
+}
+
+#[test]
+fn error_unions_and_typed_binding_patterns_lower_cleanly() {
+    let h = blaze_own::testing::heap();
+    let alloc = h.alloc();
+    let exts = parser::Extensions::ERROR_UNIONS;
+
+    // 1. Signature with union type `OutError | FsError | Stopped` lowers to `TypeRef::Union` with 3 members.
+    let sig_text = "fn load() -> Result<(), OutError | FsError | Stopped>;";
+    let sig = crate::lower_signature_with_extensions(sig_text, Edition::E2024, exts, &mut Unix, alloc)
+        .expect("union signature lowers");
+    let sv = sig.view();
+    assert!(sv.unhandled.is_empty(), "unhandled:\n{}", dump_of(&sig));
+    assert!(sv.diags.is_empty(), "diags:\n{}", dump_of(&sig));
+    let union_members = (0..sv.types.len() as u32)
+        .find_map(|i| match sv.ty(TypeId(i)) {
+            Ok(TypeRef::Union(l)) => Some(l),
+            _ => None,
+        })
+        .expect("expected TypeRef::Union");
+    assert_eq!(union_members.len, 3);
+
+    // 2. Typed binding patterns `Err(e: FsError)` and `Err(_: Stopped)` parse and lower cleanly with 0 errors.
+    let body_text = "fn handle(res: Result<(), FsError | Stopped>) { let x: u32 = 1; match res { Ok(()) => {} Err(e: FsError) => { let _ = e; } Err(_: Stopped) => {} } }";
+    let lowered = crate::lower_body_with_extensions(body_text, Edition::E2024, exts, &mut Unix, &mut crate::NoModule, alloc)
+        .expect("typed binding pattern lowers");
+    let bv = lowered.view();
+    assert!(bv.unhandled.is_empty(), "unhandled:\n{}", dump_of(&lowered));
+    assert!(bv.diags.is_empty(), "diags:\n{}", dump_of(&lowered));
 }

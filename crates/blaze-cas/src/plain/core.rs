@@ -5141,9 +5141,13 @@ fn sorted_keys<A: Allocator>(keys: &[Key], alloc: A) -> Vec<u8, A> {
     chunks.sort_unstable();
     let mut kept = 0usize;
     for i in 0..chunks.len() {
-        if kept == 0 || chunks[i] != chunks[kept - 1] {
-            chunks[kept] = chunks[i];
-            kept += 1;
+        let Some(&cur) = chunks.get(i) else { break };
+        let dup = kept > 0 && chunks.get(kept - 1).is_some_and(|prev| *prev == cur);
+        if !dup {
+            if let Some(dst) = chunks.get_mut(kept) {
+                *dst = cur;
+                kept += 1;
+            }
         }
     }
     bytes.truncate(kept * 32);
