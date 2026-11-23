@@ -392,3 +392,128 @@ fn an_item_added_enters_no_body_that_reads_no_file() {
     }
     println!("an item added: 0 bodies entered (including body: 0 of {rows_seen} rows)");
 }
+
+/// Adding an unused private `fn` to a module containing `#[cfg(...)]`-disabled (`Decision::Absent`)
+/// bodies (top-level `#[cfg(feature = "off")]`, undecided `#[cfg(all(test, feature = "off"))]`,
+/// and nested inside `#[cfg(feature = "off")] mod` and `#[cfg(feature = "off")] impl`) wakes ONLY
+/// the new private `fn`'s own rows (0 absent bodies woken, 0 unrelated bodies woken). Removing an
+/// enclosing `#[cfg(feature = "off")]` on the `mod` moves its inner body's key directly via
+/// `source_with_cfg` and reports its type error identically to a fresh check.
+#[test]
+fn a_private_fn_added_wakes_no_cfg_absent_bodies_and_enclosing_cfg_edit_wakes_them() {
+    const CFG_MANIFEST: &str = "[package]\nname = \"cfgspec\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[features]\noff = []\n";
+    const CFG_LIB: &str = "pub mod spec;\n\npub fn root_ok() -> u32 {\n    spec::live()\n}\n";
+    const CFG_SPEC: &str = r#"pub fn live() -> u32 {
+    42
+}
+
+#[cfg(feature = "off")]
+pub fn gated_top() -> u32 {
+    1
+}
+
+#[cfg(all(test, feature = "off"))]
+fn gated_test_off() -> u32 {
+    2
+}
+
+#[cfg(feature = "off")]
+pub mod gated_mod {
+    pub fn inside_gated_mod() -> u32 {
+        true
+    }
+}
+
+#[cfg(feature = "off")]
+pub struct Gated;
+
+#[cfg(feature = "off")]
+impl Gated {
+    pub fn method(&self) -> u32 {
+        4
+    }
+}
+"#;
+    let sides = sides(47);
+    for side in sides.iter() {
+        write(&side.io, "Cargo.toml", CFG_MANIFEST);
+        write(&side.io, "src/lib.rs", CFG_LIB);
+        write(&side.io, "src/spec.rs", CFG_SPEC);
+    }
+    let first = request(&sides, "cfg absent cold", &[]);
+    checks_clean(&first, "cfg absent cold");
+
+    let with_priv = format!("{CFG_SPEC}\nfn __blaze_wave3_bench_tmp() -> u32 {{\n    1 + 2\n}}\n");
+    let after_priv = request(&sides, "private fn added beside cfg-absent bodies", &[("src/spec.rs", &with_priv)]);
+    let cells = &after_priv[0];
+    let because = because_lines(&cells.profile).join("\n");
+    assert_eq!(
+        bodies(&cells.checked),
+        2,
+        "only the new private fn's 2 rows (lib + test) enter; 0 cfg-absent bodies wake: {}\n{because}",
+        entries(&cells.checked),
+    );
+    assert_eq!(bodies_for(&cells.checked, "new"), 2, "all entered bodies are the new fn: {}\n{because}", entries(&cells.checked));
+    assert_eq!(bodies_for(&cells.checked, "read moved"), 0, "0 bodies wake on read moved: {}\n{because}", entries(&cells.checked));
+
+    // Soundness control: removing the enclosing `#[cfg(feature = "off")]` on `gated_mod` MUST wake
+    // `inside_gated_mod` (which has an E0308 `true` as `u32`) and match the fresh oracle.
+    let un_gated = with_priv.replace("#[cfg(feature = \"off\")]\npub mod gated_mod {", "pub mod gated_mod {");
+    assert_ne!(un_gated, with_priv, "the enclosing cfg edit applies");
+    let after_ungate = request(&sides, "enclosing cfg removed on gated_mod", &[("src/spec.rs", &un_gated)]);
+    assert!(
+        after_ungate[0].failed && !after_ungate[0].placed.is_empty(),
+        "removing enclosing cfg on gated_mod must wake inside_gated_mod and report its type error",
+    );
+}
+
+/// On `Driver::Ready`, a one-line body edit in a member with unused dependency crates:
+/// 1) executes each entered body ONCE (not twice via Tick-1 `Ran::Need` discard), and
+/// 2) defers unused dependency `CrateScope` header lookups in `scope_by_need` so unused dep
+///    crates' task pages are never touched.
+#[test]
+fn ready_body_edit_runs_each_body_once_and_skips_unused_dep_headers() {
+    use crate::engine_ready_edit::Driver;
+    let io = Io::simulated(SimWorld::new(49, Limits::USUAL));
+    let mut members = std::string::String::from("\"app\"");
+    let mut deps = std::string::String::new();
+    for i in 0..6 {
+        members.push_str(&format!(", \"dep{i}\""));
+        deps.push_str(&format!("dep{i} = {{ path = \"../dep{i}\" }}\n"));
+        write(&io, &format!("dep{i}/Cargo.toml"), &format!("[package]\nname = \"dep{i}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"));
+        write(&io, &format!("dep{i}/src/lib.rs"), &format!("pub fn val() -> u32 {{ {i} }}\n"));
+    }
+    write(&io, "Cargo.toml", &format!("[workspace]\nmembers = [{members}]\nresolver = \"2\"\n"));
+    write(&io, "app/Cargo.toml", &format!("[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n{deps}"));
+    write(&io, "app/src/lib.rs", "pub fn f() -> u32 {\n    dep0::val()\n}\n");
+
+    // Cold run (phase path builds the stored answer and members record).
+    let cold_opts = opts(&io, 2, false);
+    let (_, cold) = engine_opts(&io, cold_opts);
+    assert_ne!(cold.status.0, Status::FAILED.0, "cold run checks clean");
+
+    // 1-line body edit inside `app/src/lib.rs`: only `dep0` is actually used; `dep1..dep5` are unused.
+    write(&io, "app/src/lib.rs", "pub fn f() -> u32 {\n    dep0::val() + 1\n}\n");
+    let mut edit_opts = opts(&io, 2, false);
+    edit_opts.driver = Driver::Ready;
+    let (_, edit) = engine_opts(&io, edit_opts);
+    assert_ne!(edit.status.0, Status::FAILED.0, "ready edit checks clean");
+    let prof = profile(&io);
+    assert!(prof.contains("driver: ready"), "edit ran on the ready driver:\n{prof}");
+    // 2 body rows entered (lib + test), and `bodies memory: 2 bodies` (NOT 4 from Tick-1 discard!).
+    assert!(
+        prof.contains("bodies memory: 2 bodies"),
+        "each entered body must execute once (Tick-1 finality peek prevents duplicate run):\n{prof}",
+    );
+    // `dep1..dep5` (5 crates) are in `app`'s check scope but unused by `f()`. With lazy scope
+    // inputs, distinct `CrateScope` rows asked must exclude those 5 unused deps.
+    let rows_line = prof.lines().find(|l| l.starts_with("stored answer rows asked ")).expect("stored answer rows asked line");
+    let cs_after = rows_line.split("CrateScope ").nth(1).expect("CrateScope in rows line");
+    let distinct_cs: u64 = cs_after.split('/').nth(1).and_then(|s| s.split(' ').next()).and_then(|s| s.parse().ok()).expect("distinct CrateScope count");
+    // `app` (lib + test = 2) + `dep0` (1) + toolchain (core/alloc/std <= 3) <= 6 distinct CrateScope rows;
+    // without lazy scope_by_need, all 5 unused deps (dep1..dep5) would also be queried (>= 11).
+    assert!(
+        distinct_cs <= 7,
+        "lazy scope_by_need must not query unused dep CrateScope headers (got {distinct_cs} distinct): {rows_line}",
+    );
+}

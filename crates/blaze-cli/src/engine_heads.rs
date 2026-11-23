@@ -1213,7 +1213,7 @@ pub(crate) fn in_split_order<'a, T>(arrived: SVec<'a, (u32, T)>, splits: usize, 
 /// items. A block that supplies other heads is tracked through the names and expansion cells the
 /// entry reads.
 pub(crate) fn outline_head_source(outline: &blaze_file_items::Outline<'_>, at: ItemIndex, text: &str) -> ContentId {
-    use blaze_surface::{ItemDetail, ItemKind};
+    use blaze_surface::{AttrKind, ItemDetail, ItemKind};
 
     let item = outline.item(at);
     let mut h = blaze_ids::Hasher::new(HEAD_SOURCE_DOMAIN);
@@ -1229,6 +1229,26 @@ pub(crate) fn outline_head_source(outline: &blaze_file_items::Outline<'_>, at: I
             if let ItemDetail::Fn { body_holds_items } = member.detail {
                 h.update(&[u8::from(member.body.is_some()), u8::from(body_holds_items)]);
             }
+        }
+    }
+    // Enclosing `#[cfg]` / `#[cfg_attr]` attributes (ancestors and file `#![cfg]`): adding,
+    // removing, or editing an enclosing cfg moves this entry's head key directly without
+    // waking unrelated sibling heads.
+    let mut parent = item.parent;
+    while let Some(idx) = parent {
+        let anc = outline.item(idx);
+        for attr in outline.attrs(anc) {
+            if matches!(attr.kind, AttrKind::Cfg | AttrKind::CfgAttr) {
+                h.update(&[1, u8::from(attr.kind == AttrKind::CfgAttr)]).part(anc.text(text, attr.range).as_bytes());
+            }
+        }
+        parent = anc.parent;
+    }
+    for attr in outline.file_attrs() {
+        if matches!(attr.kind, AttrKind::Cfg | AttrKind::CfgAttr)
+            && let Some(written) = text.get(attr.range.to_usize())
+        {
+            h.update(&[2, u8::from(attr.kind == AttrKind::CfgAttr)]).part(written.as_bytes());
         }
     }
     h.finish()
@@ -3593,6 +3613,15 @@ fn heads_of(
             ctors: SVec::new_in(heap.shared()),
             adt_failed: false,
         };
+        // When this file is held by this unit yet this entry produced no head (e.g., cut by
+        // `#[cfg]` on itself or an enclosing inline item), read the unit's `CfgAtoms` cell so a
+        // crate-level cfg/feature change wakes the entry without waking it on unrelated edits.
+        if mine.is_empty() {
+            worked.reads.push(names_read(
+                view,
+                CellId { of: scope_name, cell: Cell(blaze_scope::names_cells::NameCell::CfgAtoms { krate: job.prefix }.key()) },
+            ));
+        }
         // A head task whose entry body holds items owns any block impls first written there.
         // Its signature source intentionally ignores body tokens, so read each body's deterministic
         // block-module expansion cell (`NameCell::Expansion { call: block_key(crate_key, body) }`):

@@ -399,6 +399,18 @@ impl<'a> TaskKind<'a, Cx> for BodyKind<'_, '_, '_, 'a> {
         let Some(runner) = self.runner.as_ref() else {
             return self.sink.fail(name, KindError::Host { task: name, what: "a body to check, but its setup stopped before any crate was read and decided every row (engine_bodies.rs `groups`)" });
         };
+        // Check whether the body's own `FileItems` (`task.planned.file`) and member `CrateScope`
+        // are final before opening scope crates or typechecking: when an edited file's `FileItems`
+        // is still running in the same tick, every `BodyCheck` would otherwise open its scope
+        // crates, typecheck, and discard all work with `Ran::Need` at `ran_of`. Peeking finality
+        // up front fails in O(1) and parks the body until `FileItems` merges so each body runs once.
+        let _ = src.row(task.planned.file);
+        if let Some(own) = runner.own_scope_cell(name) {
+            let _ = src.peek(&own);
+        }
+        if let Some(needs) = src.need() {
+            return Ran::Need(needs);
+        }
         let cells = HostCells { src };
         let mut run = match runner.run_body(cx, &cells, task, out.alloc()) {
             Ok(run) => run,

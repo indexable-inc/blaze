@@ -151,6 +151,16 @@ pub trait NamesSource<'n>: Copy {
     /// the crate root record's sorted `features` (blaze-surface `CrateRootView::has_feature`).
     fn has_feature(self, krate: usize, name: &str) -> Option<bool>;
 
+    /// The crate root's `#![blaze::...]` syntax extension flags
+    /// (`blaze_file_items::detect_blaze_extensions` on the root file): answered via
+    /// `NameCell::Extensions` on `Tables` so adding or editing items in any file never records
+    /// `NameCell::Whole { section: Items }`.
+    fn blaze_extensions(self, krate: usize) -> parser::Extensions {
+        self.file_text(krate, 0)
+            .map(blaze_file_items::detect_blaze_extensions)
+            .unwrap_or(parser::Extensions::NONE)
+    }
+
     /// The crates the programs of `roots` link (front2 linked.rs, the one reading of the link
     /// rule): each crate's extern prelude and each `extern crate` it writes, transitively, a
     /// proc-macro unit reached never linked. `None`: a fact of a crate's links not answered

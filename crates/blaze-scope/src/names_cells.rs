@@ -131,6 +131,16 @@ pub enum NameCell {
     /// `FileIs::NotHeld`, and `Heads` no-member / not-held checks read. Absent when the crate
     /// holds no files, so adding an item to an existing file never wakes readers of file paths.
     Files { krate: [u8; 8] },
+    /// The crate's leading `#![blaze::...]` syntax extension flags
+    /// (`blaze_file_items::detect_blaze_extensions` over the crate root file): what
+    /// `NamesSource::blaze_extensions` reads in body/head/symbol lowering. Absent when no
+    /// extension is enabled (normal Rust crates), so adding or editing items in any file never
+    /// wakes unrelated bodies or heads.
+    Extensions { krate: [u8; 8] },
+    /// The crate's cfg atoms, in record order ([`ItemsRecord::cfg_atoms`]): what `Decision::Absent`
+    /// and `NamesSource::cfg_atoms` depend on besides the item's own cfg predicates. Absent when
+    /// the crate has no cfg atoms, so adding or editing items in any file never moves it.
+    CfgAtoms { krate: [u8; 8] },
     /// A module's `macro_rules!` sequence and its `mod` lines' marks in it: what a textual
     /// macro lookup reads of the module, and no other walk; absent for a module the record does
     /// not hold a scope of.
@@ -172,6 +182,8 @@ impl NameCell {
             NameCell::Links { krate } => h.update(&[16]).update(&krate),
             NameCell::ImplRows { krate } => h.update(&[17]).update(&krate),
             NameCell::Files { krate } => h.update(&[18]).update(&krate),
+            NameCell::Extensions { krate } => h.update(&[19]).update(&krate),
+            NameCell::CfgAtoms { krate } => h.update(&[20]).update(&krate),
         };
         let mut key = [0; 16];
         key.copy_from_slice(&h.finish().0[..16]);
@@ -189,7 +201,9 @@ impl NameCell {
             | NameCell::InternalSymbols { krate }
             | NameCell::Links { krate }
             | NameCell::ImplRows { krate }
-            | NameCell::Files { krate } => krate,
+            | NameCell::Files { krate }
+            | NameCell::Extensions { krate }
+            | NameCell::CfgAtoms { krate } => krate,
             NameCell::Variants { owner } | NameCell::Members { owner } => owner.crate_prefix(),
             NameCell::Item { key } => key.crate_prefix(),
             NameCell::Expansion { call } => call.crate_prefix(),
@@ -539,6 +553,41 @@ fn files_digest(items: &ItemsRecord<'_>) -> Result<Option<ContentId>, ItemsRecor
             .file_surface(u32::try_from(i).unwrap_or(u32::MAX))?
             .ok_or(ItemsRecordError::Short { what: "the file rows", at: i })?;
         h.part(row.path.as_str().as_bytes()).part(row.shown.as_bytes());
+    }
+    Ok(Some(h.finish()))
+}
+
+/// What `Extensions(krate)` holds: the bitmask of `#![blaze::...]` syntax extensions enabled at
+/// the top of the crate's root file (`blaze_file_items::detect_blaze_extensions`); `None` (absent)
+/// when none are enabled.
+fn extensions_digest<'a>(items: &ItemsRecord<'a>, read: ReadText<'_, 'a>) -> Result<Option<ContentId>, ItemsRecordError> {
+    let bits = match items.file_surface(0)? {
+        Some(file) => read(TextOf::File { index: 0, path: file.path })
+            .map(blaze_file_items::detect_blaze_extensions)
+            .map_or(0, |ext| ext.bits()),
+        None => 0,
+    };
+    if bits == 0 {
+        return Ok(None);
+    }
+    Ok(Some(Hasher::of(&DIGESTS).update(&[19, bits]).finish()))
+}
+
+/// What `CfgAtoms(krate)` holds: every `(name, value)` cfg atom of the crate in record order
+/// ([`ItemsRecord::cfg_atoms`]); `None` (absent) when empty.
+fn cfg_atoms_digest(items: &ItemsRecord<'_>) -> Result<Option<ContentId>, ItemsRecordError> {
+    let atoms = items.cfg_atoms()?;
+    if atoms.is_empty() {
+        return Ok(None);
+    }
+    let mut h = Hasher::of(&DIGESTS);
+    h.update(&[20]).update(&u64::try_from(atoms.len()).unwrap_or(u64::MAX).to_le_bytes());
+    for &(name, value) in atoms {
+        h.part(name.as_bytes());
+        match value {
+            Some(v) => h.update(&[1]).part(v.as_bytes()),
+            None => h.update(&[0]),
+        };
     }
     Ok(Some(h.finish()))
 }
@@ -915,6 +964,12 @@ pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, 
         if let Some(digest) = files_digest(items).map_err(CellsError::Items)? {
             rows.push((NameCell::Files { krate }.key(), digest));
         }
+        if let Some(digest) = extensions_digest(items, read).map_err(CellsError::Items)? {
+            rows.push((NameCell::Extensions { krate }.key(), digest));
+        }
+        if let Some(digest) = cfg_atoms_digest(items).map_err(CellsError::Items)? {
+            rows.push((NameCell::CfgAtoms { krate }.key(), digest));
+        }
     }
     for module in record.modules() {
         if let Some(digest) = module_digest(record, module) {
@@ -1219,6 +1274,10 @@ pub fn seen_by_record<'a>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<
         NameCell::ImplRows { .. } => None,
         NameCell::Files { krate } if krate == record.key().prefix() => files_digest(items_of()?).map_err(CellsError::Items)?,
         NameCell::Files { .. } => None,
+        NameCell::Extensions { krate } if krate == record.key().prefix() => extensions_digest(items_of()?, read_of()?).map_err(CellsError::Items)?,
+        NameCell::Extensions { .. } => None,
+        NameCell::CfgAtoms { krate } if krate == record.key().prefix() => cfg_atoms_digest(items_of()?).map_err(CellsError::Items)?,
+        NameCell::CfgAtoms { .. } => None,
     })
 }
 
