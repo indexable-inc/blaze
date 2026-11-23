@@ -306,7 +306,7 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
             c_variadic: false,
             legacy_const_generics: &[],
             inputs: &f.inputs,
-            output: f.output,
+            output: self.store.fn_output(key).unwrap_or(f.output),
             types,
         }
     }

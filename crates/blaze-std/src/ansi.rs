@@ -433,6 +433,7 @@ mod tests {
         assert_eq!(visible_width("\x1b[31m🚀\x1b[0m hi"), 5);
     }
 
+    /// The invariant: stripping ANSI styling recovers the original text and preserves visible width.
     #[test]
     fn property_strip_inverts_styled_and_preserves_width() {
         let h = heap();

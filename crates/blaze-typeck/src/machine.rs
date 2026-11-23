@@ -255,6 +255,8 @@ pub(crate) struct MachineSnapshot<S> {
     default_fields: usize,
     union_fields: usize,
     union_pats: usize,
+    inferred_err_coercions: usize,
+    deferred_try_obs: usize,
 }
 
 /// Per-match narrowing state for a structural union scrutinee (`rules/control.rs`).
@@ -492,6 +494,20 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     /// the projection goals [`Machine::unify`] defers, so one that fails later is a finding at
     /// the expression, pattern or statement that related the types (rule 19).
     pub place: Cause,
+    /// When the owner's return signature contains any `_` placeholder (`-> _`, `-> Option<_>`,
+    /// `-> Result<T, _>`), the lowered output type whose finalized concrete type is exported as
+    /// `Checked::inferred_output`.
+    pub inferred_output_ty: Option<Ty>,
+    /// When the owner's return signature is `Result<T, _>` (or `T ! _`), the inference variable
+    /// representing the error slot while collecting error members from `Err(...)` and `?`.
+    pub inferred_err_var: Option<Ty>,
+    /// Coercions into `inferred_err_var` deferred until `finish_body` so multiple distinct error
+    /// types unify into a single canonical error union instead of forcing the first error type.
+    pub inferred_err_coercions: Vec<(Option<ExprId>, Ty), Alloc<'a>>,
+    /// `FromResidual::from_residual` predicate registrations deferred until `inferred_err_var` is
+    /// finalized in `finish_body`, preventing `impl<T> From<T> for T` from binding `inferred_err_var`
+    /// prematurely to the first `?` error type.
+    pub deferred_try_obs: Vec<(ItemKey, TyList, Cause), Alloc<'a>>,
 }
 
 impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
@@ -624,6 +640,10 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             pending_witnesses: Vec::new_in(alloc),
             stalled: Vec::new_in(alloc),
             place: Cause::Body,
+            inferred_output_ty: None,
+            inferred_err_var: None,
+            inferred_err_coercions: Vec::new_in(alloc),
+            deferred_try_obs: Vec::new_in(alloc),
             alloc,
         })
     }
@@ -1867,6 +1887,8 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             default_fields: self.default_fields.len(),
             union_fields: self.union_fields.len(),
             union_pats: self.union_pats.len(),
+            inferred_err_coercions: self.inferred_err_coercions.len(),
+            deferred_try_obs: self.deferred_try_obs.len(),
         }
     }
 
@@ -1897,6 +1919,8 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         self.default_fields.truncate(s.default_fields);
         self.union_fields.truncate(s.union_fields);
         self.union_pats.truncate(s.union_pats);
+        self.inferred_err_coercions.truncate(s.inferred_err_coercions);
+        self.deferred_try_obs.truncate(s.deferred_try_obs);
     }
 
     /// Runs `f` in a snapshot that is always rolled back (`probe`).
@@ -2355,9 +2379,22 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         self.mk_list(&v)
     }
 
+    /// The active unresolved root of `self.inferred_err_var`, if still an inference variable.
+    pub(crate) fn active_inferred_err_var(&mut self) -> Option<Ty> {
+        let ev = self.inferred_err_var?;
+        let r = self.ty.shallow_resolve(ev);
+        self.is_ty_var(r).then_some(r)
+    }
+
     /// Registers `item`'s where-clauses, instantiated with `args`
     /// (`add_required_obligations_for_hir`).
     pub(crate) fn register_predicates(&mut self, item: ItemKey, args: TyList, cause: Cause) -> Result<(), Stop> {
+        if self.inferred_err_var.is_some()
+            && self.reads.lang_path(LangItem::TryTraitFromResidual)? == Some(Def::Fn(item))
+        {
+            self.deferred_try_obs.push((item, args, cause));
+            return Ok(());
+        }
         let preds = self.reads.predicates(item)?;
         for (nth, clause) in preds.clauses.iter().enumerate() {
             let Some(goal) = self.clause_goal(preds.types, *clause, args, cause)? else { continue };

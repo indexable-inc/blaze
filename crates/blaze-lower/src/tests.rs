@@ -1075,35 +1075,28 @@ fn error_unions_and_typed_binding_patterns_lower_cleanly() {
     assert!(bv.unhandled.is_empty(), "unhandled:\n{}", dump_of(&lowered));
     assert!(bv.diags.is_empty(), "diags:\n{}", dump_of(&lowered));
 
-    // 3. Fallible return sugar `Row ! FsError | Stopped` and inferred private set `Row ! _`
-    // lower cleanly to `TypeRef::Fallible { ok, err }` with 0 unhandled nodes!
-    let fallible_sig = "fn load(p: &Path) -> Row ! FsError | Stopped;";
-    let fsig = crate::lower_signature_with_extensions(fallible_sig, Edition::E2024, exts, &mut Unix, alloc)
-        .expect("T ! E signature lowers");
-    let fsv = fsig.view();
-    assert!(fsv.unhandled.is_empty(), "unhandled:\n{}", dump_of(&fsig));
-    assert!(fsv.diags.is_empty(), "diags:\n{}", dump_of(&fsig));
-    let (ok_id, err_id) = (0..fsv.types.len() as u32)
-        .find_map(|i| match fsv.ty(TypeId(i)) {
-            Ok(TypeRef::Fallible { ok, err }) => Some((ok, err)),
-            _ => None,
-        })
-        .expect("expected TypeRef::Fallible");
-    assert!(matches!(fsv.ty(ok_id), Ok(TypeRef::Path(_))));
-    assert!(matches!(fsv.ty(err_id), Ok(TypeRef::Union(l)) if l.len == 2));
+    // 3. `Result<Row, FsError | Stopped>` and `Result<Row, _>` lower cleanly with 0 unhandled nodes.
+    let result_sig = "fn load(p: &Path) -> Result<Row, FsError | Stopped>;";
+    let rsig = crate::lower_signature_with_extensions(result_sig, Edition::E2024, exts, &mut Unix, alloc)
+        .expect("Result<T, E1 | E2> signature lowers");
+    let rsv = rsig.view();
+    assert!(rsv.unhandled.is_empty(), "unhandled:\n{}", dump_of(&rsig));
+    assert!(rsv.diags.is_empty(), "diags:\n{}", dump_of(&rsig));
+    assert!(
+        (0..rsv.types.len() as u32).any(|i| matches!(rsv.ty(TypeId(i)), Ok(TypeRef::Union(l)) if l.len == 2)),
+        "expected TypeRef::Union(2) in Result<Row, FsError | Stopped>:\n{}",
+        dump_of(&rsig)
+    );
 
-    let infer_sig = "fn helper() -> Row ! _;";
+    let infer_sig = "fn helper() -> Result<Row, _>;";
     let isig = crate::lower_signature_with_extensions(infer_sig, Edition::E2024, exts, &mut Unix, alloc)
-        .expect("T ! _ signature lowers");
+        .expect("Result<T, _> signature lowers");
     let isv = isig.view();
     assert!(isv.unhandled.is_empty(), "unhandled:\n{}", dump_of(&isig));
     assert!(isv.diags.is_empty(), "diags:\n{}", dump_of(&isig));
     assert!(
-        (0..isv.types.len() as u32).any(|i| matches!(
-            isv.ty(TypeId(i)),
-            Ok(TypeRef::Fallible { err, .. }) if matches!(isv.ty(err), Ok(TypeRef::Infer))
-        )),
-        "expected TypeRef::Fallible with Infer error:\n{}",
+        (0..isv.types.len() as u32).any(|i| matches!(isv.ty(TypeId(i)), Ok(TypeRef::Infer))),
+        "expected TypeRef::Infer in Result<Row, _>:\n{}",
         dump_of(&isig)
     );
 }

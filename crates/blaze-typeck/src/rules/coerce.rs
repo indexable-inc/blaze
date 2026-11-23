@@ -45,9 +45,13 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             if let Some(e) = e {
                 self.adjust.push((e, AdjustKind::NeverToAny, b));
             }
-            if self.is_ty_var(b) {
+            if self.is_ty_var(b) && self.active_inferred_err_var() != Some(b) {
                 self.diverging.push(b);
             }
+            return Ok(true);
+        }
+        if self.active_inferred_err_var() == Some(b) {
+            self.inferred_err_coercions.push((e, a));
             return Ok(true);
         }
         if self.is_ty_var(a) {

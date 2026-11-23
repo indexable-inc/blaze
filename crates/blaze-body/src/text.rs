@@ -243,11 +243,7 @@ fn list<W: Write>(w: &mut W, l: List) -> fmt::Result {
 /// The text name of `x`. Every form of the three primitive enums is in its table (one row per
 /// variant, `code`'s encode reads the same tables), so the search always finds it.
 fn named<T: PartialEq + Copy>(table: &[(T, &'static str)], x: T) -> &'static str {
-    let mut i = 0;
-    while table[i].0 != x {
-        i += 1;
-    }
-    table[i].1
+    table.iter().find_map(|&(t, name)| (t == x).then_some(name)).unwrap_or("")
 }
 
 /// One overlay node in the text form (the module's `node`).
@@ -624,7 +620,7 @@ impl<'s> Cur<'s> {
     }
 
     fn rest(&self) -> &'s str {
-        &self.line[self.at..]
+        self.line.get(self.at..).unwrap_or("")
     }
 
     fn err(&self, what: ParseWhat) -> ParseError {
@@ -652,7 +648,7 @@ impl<'s> Cur<'s> {
         self.tight(t)
     }
 
-    fn expect(&mut self, t: &'static str) -> Result<(), ParseError> {
+    fn need(&mut self, t: &'static str) -> Result<(), ParseError> {
         match self.eat(t) {
             true => Ok(()),
             false => Err(self.err(ParseWhat::Expected(t))),
@@ -664,7 +660,7 @@ impl<'s> Cur<'s> {
         let rest = self.rest();
         let n = rest.bytes().take_while(|c| c.is_ascii_alphanumeric() || *c == b'_').count();
         self.at += n;
-        &rest[..n]
+        rest.get(..n).unwrap_or("")
     }
 
     /// The word `k`, consumed only when it is the next whole word.
@@ -682,7 +678,7 @@ impl<'s> Cur<'s> {
         let n = rest.bytes().take_while(|c| (*c as char).is_digit(radix)).count();
         let v = match n {
             0 => None,
-            _ => u128::from_str_radix(&rest[..n], radix).ok(),
+            _ => rest.get(..n).and_then(|s| u128::from_str_radix(s, radix).ok()),
         };
         let v = v.ok_or_else(|| self.err(ParseWhat::Number))?;
         self.at += n;
@@ -703,7 +699,7 @@ impl<'s> Cur<'s> {
 
     /// `p` then a decimal `u32` (`t5`, `bb2`, `'o1`).
     fn prefixed(&mut self, p: &'static str) -> Result<u32, ParseError> {
-        self.expect(p)?;
+        self.need(p)?;
         self.u32()
     }
 
@@ -726,7 +722,7 @@ fn header(c: &mut Cur<'_>) -> Result<(u32, BlockKind), ParseError> {
         true => BlockKind::Cleanup,
         false => BlockKind::Normal,
     };
-    c.expect(":")?;
+    c.need(":")?;
     c.done()?;
     Ok((id, kind))
 }
@@ -824,27 +820,27 @@ impl<A: Allocator + Copy> Parser<A> {
     }
 
     fn item(c: &mut Cur<'_>) -> Result<(ItemKey, List), ParseError> {
-        c.expect("k")?;
+        c.need("k")?;
         let key = ItemKey(c.digits(16)?);
-        c.expect("<")?;
+        c.need("<")?;
         let start = c.num()?;
-        c.expect(",")?;
+        c.need(",")?;
         let len = c.num()?;
-        c.expect(">")?;
+        c.need(">")?;
         Ok((key, List { start, len }))
     }
 
     fn list(c: &mut Cur<'_>) -> Result<List, ParseError> {
-        c.expect("<")?;
+        c.need("<")?;
         let start = c.num()?;
-        c.expect(",")?;
+        c.need(",")?;
         let len = c.num()?;
-        c.expect(">")?;
+        c.need(">")?;
         Ok(List { start, len })
     }
 
     fn hex(c: &mut Cur<'_>, prefix: &'static str) -> Result<u128, ParseError> {
-        c.expect(prefix)?;
+        c.need(prefix)?;
         c.digits(16)
     }
 
@@ -944,7 +940,7 @@ impl<A: Allocator + Copy> Parser<A> {
             "local" => {
                 let l = Self::local(c)?;
                 Self::next_id(c, Table::Locals, locals, l.0)?;
-                c.expect(":")?;
+                c.need(":")?;
                 let ty = Self::ty(c)?;
                 let kind = match c.word() {
                     "return" => LocalKind::Return,
@@ -972,14 +968,14 @@ impl<A: Allocator + Copy> Parser<A> {
             "const" => {
                 let k = c.prefixed("c")?;
                 Self::next_id(c, Table::Consts, consts, k)?;
-                c.expect("=")?;
+                c.need("=")?;
                 let kind = match c.word() {
                     "scalar" => {
-                        c.expect("0x")?;
+                        c.need("0x")?;
                         Some(ConstKind::Scalar { bits: c.digits(16)? })
                     }
                     "bytes" => {
-                        c.expect("\"")?;
+                        c.need("\"")?;
                         self.bytes.clear();
                         while !c.tight("\"") {
                             let start = c.at;
@@ -1000,14 +996,14 @@ impl<A: Allocator + Copy> Parser<A> {
                         Some(ConstKind::FnItem { key, args })
                     }
                     "static" => {
-                        c.expect("k")?;
+                        c.need("k")?;
                         Some(ConstKind::StaticAddr(ItemKey(c.digits(16)?)))
                     }
                     "anon" => Some(ConstKind::Anon(ExprId(c.prefixed("e")?))),
                     "param" => Some(ConstKind::Param(c.num()?)),
                     _ => return Err(c.err(ParseWhat::Expected("a constant's kind"))),
                 };
-                c.expect(":")?;
+                c.need(":")?;
                 let ty = Self::ty(c)?;
                 c.done()?;
                 // Appended as written: a text may repeat a constant, and each keeps its number.
@@ -1042,7 +1038,7 @@ impl<A: Allocator + Copy> Parser<A> {
                 };
                 let t = Self::ty(c)?;
                 Self::next_id(c, Table::Types, ty_base.saturating_add(view.own_tys()), t.0)?;
-                c.expect("=")?;
+                c.need("=")?;
                 let node = Self::ty_node(c)?;
                 c.done()?;
                 self.b.push_ty_row(encode_ty(node));
@@ -1056,7 +1052,7 @@ impl<A: Allocator + Copy> Parser<A> {
             }
             "known" => {
                 let from = Self::origin(c)?;
-                c.expect(":")?;
+                c.need(":")?;
                 let into = Self::origin(c)?;
                 c.done()?;
                 self.b.known(from, into);
@@ -1099,7 +1095,7 @@ impl<A: Allocator + Copy> Parser<A> {
                         let from_end = c.tight("-");
                         Proj::Subslice { from: a, to: c.u32()?, from_end }
                     } else {
-                        c.expect("of")?;
+                        c.need("of")?;
                         Proj::ConstIndex { offset: a, min_length: c.num()?, from_end: back }
                     }
                 };
@@ -1127,7 +1123,7 @@ impl<A: Allocator + Copy> Parser<A> {
     }
 
     fn ops(&mut self, c: &mut Cur<'_>) -> Result<Ops, ParseError> {
-        c.expect("(")?;
+        c.need("(")?;
         self.ops.clear();
         if !c.eat(")") {
             loop {
@@ -1136,18 +1132,18 @@ impl<A: Allocator + Copy> Parser<A> {
                 if c.eat(")") {
                     break;
                 }
-                c.expect(",")?;
+                c.need(",")?;
             }
         }
         Ok(self.b.operands(&self.ops))
     }
 
     fn two(&mut self, c: &mut Cur<'_>) -> Result<(Operand, Operand), ParseError> {
-        c.expect("(")?;
+        c.need("(")?;
         let lhs = self.operand(c)?;
-        c.expect(",")?;
+        c.need(",")?;
         let rhs = self.operand(c)?;
-        c.expect(")")?;
+        c.need(")")?;
         Ok((lhs, rhs))
     }
 
@@ -1207,9 +1203,9 @@ impl<A: Allocator + Copy> Parser<A> {
             }
             "cast" => {
                 let kind = CastKind::from_name(c.word()).ok_or_else(|| c.err(ParseWhat::Expected("a cast kind")))?;
-                c.expect("(")?;
+                c.need("(")?;
                 let operand = self.operand(c)?;
-                c.expect(")")?;
+                c.need(")")?;
                 if !c.keyword("as") {
                     return Err(c.err(ParseWhat::Expected("as")));
                 }
@@ -1227,11 +1223,11 @@ impl<A: Allocator + Copy> Parser<A> {
                 Value::Aggregate { kind, ty, operands: self.ops(c)? }
             }
             "repeat" => {
-                c.expect("(")?;
+                c.need("(")?;
                 let operand = self.operand(c)?;
-                c.expect(",")?;
+                c.need(",")?;
                 let count = Const(c.prefixed("c")?);
-                c.expect(")")?;
+                c.need(")")?;
                 Value::Repeat { operand, count }
             }
             "len" => Value::Len(self.place(c)?),
@@ -1244,9 +1240,9 @@ impl<A: Allocator + Copy> Parser<A> {
                     let (lhs, rhs) = self.two(c)?;
                     Value::Binary { op, lhs, rhs }
                 } else if let Some(op) = UnOp::from_name(w) {
-                    c.expect("(")?;
+                    c.need("(")?;
                     let operand = self.operand(c)?;
-                    c.expect(")")?;
+                    c.need(")")?;
                     Value::Unary { op, operand }
                 } else {
                     *c = start;
@@ -1276,7 +1272,7 @@ impl<A: Allocator + Copy> Parser<A> {
         c.ws();
         if c.rest().starts_with('_') {
             let dest = self.place(c)?;
-            c.expect("=")?;
+            c.need("=")?;
             return self.value(c, dest);
         }
         let k = match c.word() {
@@ -1295,19 +1291,19 @@ impl<A: Allocator + Copy> Parser<A> {
             "goto" => StmtKind::Goto(Self::block(c)?),
             "switch" => {
                 let on = self.operand(c)?;
-                c.expect("[")?;
+                c.need("[")?;
                 self.cases.clear();
                 if !c.eat("]") {
                     loop {
                         c.ws();
                         let v = c.digits(10)?;
-                        c.expect("->")?;
+                        c.need("->")?;
                         let t = Self::block(c)?;
                         self.cases.push((v, t));
                         if c.eat("]") {
                             break;
                         }
-                        c.expect(",")?;
+                        c.need(",")?;
                     }
                 }
                 let cases = self.b.cases(&self.cases);
@@ -1340,13 +1336,13 @@ impl<A: Allocator + Copy> Parser<A> {
             }
             "assert" => {
                 let cond = self.operand(c)?;
-                c.expect("==")?;
+                c.need("==")?;
                 let expected = match c.word() {
                     "true" => true,
                     "false" => false,
                     _ => return Err(c.err(ParseWhat::Expected("true or false"))),
                 };
-                c.expect(",")?;
+                c.need(",")?;
                 let kind = Self::assert_kind(c)?;
                 let msg = self.ops(c)?;
                 let target = Self::need_then(c)?;
@@ -1405,7 +1401,7 @@ impl<A: Allocator + Copy> Parser<A> {
         if c.eat(";") {
             loop {
                 let from = Self::origin(c)?;
-                c.expect(":")?;
+                c.need(":")?;
                 let into = Self::origin(c)?;
                 self.b.subset(from, into);
                 if !c.eat(",") {

@@ -356,6 +356,7 @@ fn check_patch_round_trip(
     Ok(())
 }
 
+/// The invariant: unified diff patches and text diffs reconstruct the exact original and target texts.
 #[test]
 fn property_patch_and_text_diffs_round_trip() {
     let h = heap();

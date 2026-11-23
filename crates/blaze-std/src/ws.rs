@@ -1091,6 +1091,7 @@ mod tests {
         Ok(())
     }
 
+    /// The invariant: chunked WebSocket frame encode/decode round-trips masked and unmasked frames accurately.
     #[test]
     fn property_ws_chunked_round_trip() {
         let h = heap();

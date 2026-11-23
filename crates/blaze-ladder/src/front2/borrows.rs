@@ -1429,7 +1429,8 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             // `RegionReader::opaque_captures`), never the in-process maps ([`ShapeArity`]).
             let arity = ShapeArity { declared: super::types::HeadsArity { heads: &r.store.maps, opaques: &[], names: r.names }, regions: &regions };
             let mut shape = blaze_flow_lower::ShapeBuf::new_in(alloc);
-            match blaze_flow_lower::read_shape(r.store.tys.view(), &f.inputs[..], f.output, &arity, &mut shape, alloc) {
+            let out = r.store.fn_output(key).unwrap_or(f.output);
+            match blaze_flow_lower::read_shape(r.store.tys.view(), &f.inputs[..], out, &arity, &mut shape, alloc) {
                 Ok(()) => g.shapes.push((k, shape)),
                 Err(why) => g.shape_refused.push((k, why)),
             }

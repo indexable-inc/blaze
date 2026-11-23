@@ -36,6 +36,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         for &t in sig.inputs {
             inputs.push(self.lower(sig.types, t, Lower::Args(args), cause)?);
         }
+        if k == self.body.owner && self.inferred_output_ty.is_some() {
+            self.diag(DiagCode::InferredErrorSetCycle, At::of(cause), About::found(self.common.err));
+            let inputs = self.mk_list(&inputs)?;
+            return Ok(Some((inputs, self.common.err)));
+        }
         // A trait fn's `impl Trait` at a concrete `Self` is the impl's type (rules/rpitit_use.rs).
         self.rpitit = self.rpitit_rows(k, sig.types, sig.output, args)?;
         let output = self.lower(sig.types, sig.output, Lower::Args(args), cause);

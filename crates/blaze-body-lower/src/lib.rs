@@ -618,7 +618,9 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
     /// Whether parameter or binding pattern `p` is a plain by-value binding of the place's type.
     pub(crate) fn simple_bind(&self, p: PatId) -> Result<bool, LowerError> {
         Ok(match self.pat(p)? {
-            Pat::Bind { ann, sub: None, .. } => ann.by_ref.is_none() && self.local_ty(p)? == self.pat_ty(p)?,
+            Pat::Bind { ann, sub: None, .. } => {
+                ann.by_ref.is_none() && self.ck.union_pat_of(p).is_none() && self.local_ty(p)? == self.pat_ty(p)?
+            }
             _ => false,
         })
     }

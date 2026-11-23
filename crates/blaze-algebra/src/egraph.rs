@@ -809,119 +809,172 @@ impl<A: Allocator + Copy> EGraph<A> {
     }
 
     fn extract_into(&self, root: EClassId, best: &[Option<ENode>], g: &mut ExprGraph<A>) -> ExprId {
+        enum Frame {
+            Enter(EClassId, usize),
+            Build { idx: usize, node: ENode },
+        }
+
         let n = self.classes.len();
         let mut memo: OwnVec<Option<ExprId>, A> = OwnVec::with_capacity_in(n, self.alloc);
         for _ in 0..n {
             memo.push(None);
         }
-        self.extract_rec(root, best, g, &mut memo, 0)
-    }
+        let mut frames: OwnVec<Frame, A> = OwnVec::new_in(self.alloc);
+        let mut vals: OwnVec<ExprId, A> = OwnVec::new_in(self.alloc);
+        frames.push(Frame::Enter(root, 0));
 
-    fn extract_rec(
-        &self,
-        id: EClassId,
-        best: &[Option<ENode>],
-        g: &mut ExprGraph<A>,
-        memo: &mut OwnVec<Option<ExprId>, A>,
-        depth: usize,
-    ) -> ExprId {
-        let r = self.find(id);
-        let idx = u32_to_usize(r.0);
-        if let Some(hit) = memo.get(idx).copied().flatten() {
-            return hit;
+        while let Some(frame) = frames.pop() {
+            match frame {
+                Frame::Enter(id, depth) => {
+                    let r = self.find(id);
+                    let idx = u32_to_usize(r.0);
+                    if let Some(hit) = memo.get(idx).copied().flatten() {
+                        vals.push(hit);
+                        continue;
+                    }
+                    if depth > 128 {
+                        vals.push(g.lit(0.0));
+                        continue;
+                    }
+                    let Some(node) = best
+                        .get(idx)
+                        .copied()
+                        .flatten()
+                        .or_else(|| self.class_node(r, 0))
+                    else {
+                        vals.push(g.lit(0.0));
+                        continue;
+                    };
+                    match node {
+                        ENode::Const(b) => {
+                            let eid = g.intern(Op::Const(b));
+                            if let Some(slot) = memo.get_mut(idx) {
+                                *slot = Some(eid);
+                            }
+                            vals.push(eid);
+                        }
+                        ENode::Var(v) => {
+                            let eid = g.intern(Op::Var(v));
+                            if let Some(slot) = memo.get_mut(idx) {
+                                *slot = Some(eid);
+                            }
+                            vals.push(eid);
+                        }
+                        ENode::Neg(a)
+                        | ENode::Sin(a)
+                        | ENode::Cos(a)
+                        | ENode::Tan(a)
+                        | ENode::Exp(a)
+                        | ENode::Ln(a)
+                        | ENode::Sqrt(a)
+                        | ENode::Tanh(a)
+                        | ENode::Abs(a) => {
+                            frames.push(Frame::Build { idx, node });
+                            frames.push(Frame::Enter(a, depth + 1));
+                        }
+                        ENode::Add(a, b)
+                        | ENode::Sub(a, b)
+                        | ENode::Mul(a, b)
+                        | ENode::Div(a, b)
+                        | ENode::Pow(a, b) => {
+                            frames.push(Frame::Build { idx, node });
+                            frames.push(Frame::Enter(b, depth + 1));
+                            frames.push(Frame::Enter(a, depth + 1));
+                        }
+                        ENode::Select(a, b, c) | ENode::Fma(a, b, c) => {
+                            frames.push(Frame::Build { idx, node });
+                            frames.push(Frame::Enter(c, depth + 1));
+                            frames.push(Frame::Enter(b, depth + 1));
+                            frames.push(Frame::Enter(a, depth + 1));
+                        }
+                    }
+                }
+                Frame::Build { idx, node } => {
+                    let eid = match node {
+                        ENode::Const(b) => g.intern(Op::Const(b)),
+                        ENode::Var(v) => g.intern(Op::Var(v)),
+                        ENode::Neg(_) => {
+                            let ea = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            g.neg(ea)
+                        }
+                        ENode::Add(_, _) => {
+                            let eb = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            let ea = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            g.add(ea, eb)
+                        }
+                        ENode::Sub(_, _) => {
+                            let eb = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            let ea = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            g.sub(ea, eb)
+                        }
+                        ENode::Mul(_, _) => {
+                            let eb = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            let ea = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            g.mul(ea, eb)
+                        }
+                        ENode::Div(_, _) => {
+                            let eb = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            let ea = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            g.div(ea, eb)
+                        }
+                        ENode::Pow(_, _) => {
+                            let eb = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            let ea = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            g.pow(ea, eb)
+                        }
+                        ENode::Sin(_) => {
+                            let ea = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            g.sin(ea)
+                        }
+                        ENode::Cos(_) => {
+                            let ea = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            g.cos(ea)
+                        }
+                        ENode::Tan(_) => {
+                            let ea = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            g.tan(ea)
+                        }
+                        ENode::Exp(_) => {
+                            let ea = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            g.exp(ea)
+                        }
+                        ENode::Ln(_) => {
+                            let ea = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            g.ln(ea)
+                        }
+                        ENode::Sqrt(_) => {
+                            let ea = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            g.sqrt(ea)
+                        }
+                        ENode::Tanh(_) => {
+                            let ea = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            g.tanh(ea)
+                        }
+                        ENode::Abs(_) => {
+                            let ea = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            g.abs(ea)
+                        }
+                        ENode::Select(_, _, _) => {
+                            let ee = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            let et = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            let ec = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            g.select(ec, et, ee)
+                        }
+                        ENode::Fma(_, _, _) => {
+                            let ec = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            let eb = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            let ea = vals.pop().unwrap_or_else(|| g.lit(0.0));
+                            g.fma(ea, eb, ec)
+                        }
+                    };
+                    if let Some(slot) = memo.get_mut(idx) {
+                        *slot = Some(eid);
+                    }
+                    vals.push(eid);
+                }
+            }
         }
-        if depth > 128 {
-            return g.lit(0.0);
-        }
-        let Some(node) = best
-            .get(idx)
-            .copied()
-            .flatten()
-            .or_else(|| self.class_node(r, 0))
-        else {
-            return g.lit(0.0);
-        };
-        let eid = match node {
-            ENode::Const(b) => g.intern(Op::Const(b)),
-            ENode::Var(v) => g.intern(Op::Var(v)),
-            ENode::Neg(a) => {
-                let ea = self.extract_rec(a, best, g, memo, depth + 1);
-                g.neg(ea)
-            }
-            ENode::Add(a, b) => {
-                let ea = self.extract_rec(a, best, g, memo, depth + 1);
-                let eb = self.extract_rec(b, best, g, memo, depth + 1);
-                g.add(ea, eb)
-            }
-            ENode::Sub(a, b) => {
-                let ea = self.extract_rec(a, best, g, memo, depth + 1);
-                let eb = self.extract_rec(b, best, g, memo, depth + 1);
-                g.sub(ea, eb)
-            }
-            ENode::Mul(a, b) => {
-                let ea = self.extract_rec(a, best, g, memo, depth + 1);
-                let eb = self.extract_rec(b, best, g, memo, depth + 1);
-                g.mul(ea, eb)
-            }
-            ENode::Div(a, b) => {
-                let ea = self.extract_rec(a, best, g, memo, depth + 1);
-                let eb = self.extract_rec(b, best, g, memo, depth + 1);
-                g.div(ea, eb)
-            }
-            ENode::Pow(a, b) => {
-                let ea = self.extract_rec(a, best, g, memo, depth + 1);
-                let eb = self.extract_rec(b, best, g, memo, depth + 1);
-                g.pow(ea, eb)
-            }
-            ENode::Sin(a) => {
-                let ea = self.extract_rec(a, best, g, memo, depth + 1);
-                g.sin(ea)
-            }
-            ENode::Cos(a) => {
-                let ea = self.extract_rec(a, best, g, memo, depth + 1);
-                g.cos(ea)
-            }
-            ENode::Tan(a) => {
-                let ea = self.extract_rec(a, best, g, memo, depth + 1);
-                g.tan(ea)
-            }
-            ENode::Exp(a) => {
-                let ea = self.extract_rec(a, best, g, memo, depth + 1);
-                g.exp(ea)
-            }
-            ENode::Ln(a) => {
-                let ea = self.extract_rec(a, best, g, memo, depth + 1);
-                g.ln(ea)
-            }
-            ENode::Sqrt(a) => {
-                let ea = self.extract_rec(a, best, g, memo, depth + 1);
-                g.sqrt(ea)
-            }
-            ENode::Tanh(a) => {
-                let ea = self.extract_rec(a, best, g, memo, depth + 1);
-                g.tanh(ea)
-            }
-            ENode::Abs(a) => {
-                let ea = self.extract_rec(a, best, g, memo, depth + 1);
-                g.abs(ea)
-            }
-            ENode::Select(c, t, e) => {
-                let ec = self.extract_rec(c, best, g, memo, depth + 1);
-                let et = self.extract_rec(t, best, g, memo, depth + 1);
-                let ee = self.extract_rec(e, best, g, memo, depth + 1);
-                g.select(ec, et, ee)
-            }
-            ENode::Fma(a, b, c) => {
-                let ea = self.extract_rec(a, best, g, memo, depth + 1);
-                let eb = self.extract_rec(b, best, g, memo, depth + 1);
-                let ec = self.extract_rec(c, best, g, memo, depth + 1);
-                g.fma(ea, eb, ec)
-            }
-        };
-        if let Some(slot) = memo.get_mut(idx) {
-            *slot = Some(eid);
-        }
-        eid
+        vals.pop().unwrap_or_else(|| g.lit(0.0))
     }
 }
 
@@ -1200,77 +1253,109 @@ impl<A: Allocator + Copy> EGraph<A> {
         subst: Subst,
         out: &mut OwnVec<Subst, A>,
     ) {
-        if out.len() >= MAX_MATCHES_PER_CLASS {
-            return;
-        }
-        let cid = self.find(class_id);
-        let Some(&pnode) = pat.get(pat_idx) else {
-            return;
-        };
-        match pnode {
-            PatNode::Var(v) => {
-                let vi = usize::from(v);
-                let Some(&bound) = subst.get(vi) else {
-                    return;
-                };
-                match bound {
-                    Some(prev) if self.find(prev) == cid => out.push(subst),
-                    Some(_) => {}
-                    None => {
-                        let mut next = subst;
-                        if let Some(slot) = next.get_mut(vi) {
-                            *slot = Some(cid);
-                        }
-                        out.push(next);
-                    }
-                }
+        let mut goal_pool: OwnVec<(usize, EClassId), A> = OwnVec::new_in(self.alloc);
+        let mut work: OwnVec<(Subst, usize), A> = OwnVec::new_in(self.alloc);
+        let mut scratch: OwnVec<(usize, EClassId), A> = OwnVec::new_in(self.alloc);
+        goal_pool.push((pat_idx, class_id));
+        work.push((subst, 1));
+
+        while let Some((cur_subst, n_goals)) = work.pop() {
+            if out.len() >= MAX_MATCHES_PER_CLASS {
+                break;
             }
-            PatNode::Const(bits) => {
-                let want = f64::from_bits(bits);
-                if self.const_of(cid) == Some(want) {
-                    out.push(subst);
-                }
+            if n_goals == 0 {
+                out.push(cur_subst);
+                continue;
             }
-            node_pat => {
-                for &enode in self.class_nodes(cid).iter() {
-                    if out.len() >= MAX_MATCHES_PER_CLASS {
-                        break;
-                    }
-                    match (node_pat, enode) {
-                        (PatNode::Neg(pa), ENode::Neg(ea))
-                        | (PatNode::Sin(pa), ENode::Sin(ea))
-                        | (PatNode::Cos(pa), ENode::Cos(ea))
-                        | (PatNode::Tan(pa), ENode::Tan(ea))
-                        | (PatNode::Exp(pa), ENode::Exp(ea))
-                        | (PatNode::Ln(pa), ENode::Ln(ea))
-                        | (PatNode::Sqrt(pa), ENode::Sqrt(ea))
-                        | (PatNode::Tanh(pa), ENode::Tanh(ea))
-                        | (PatNode::Abs(pa), ENode::Abs(ea)) => {
-                            self.ematch_node(pat, pa, ea, subst, out);
+            let Some((p_idx, c_id)) = goal_pool.pop() else {
+                continue;
+            };
+            let rem = n_goals - 1;
+            let base = goal_pool.len().saturating_sub(rem);
+            let cid = self.find(c_id);
+            let Some(&pnode) = pat.get(p_idx) else {
+                goal_pool.truncate(base);
+                continue;
+            };
+            match pnode {
+                PatNode::Var(v) => {
+                    let vi = usize::from(v);
+                    let Some(&bound) = cur_subst.get(vi) else {
+                        goal_pool.truncate(base);
+                        continue;
+                    };
+                    match bound {
+                        Some(prev) if self.find(prev) == cid => {
+                            work.push((cur_subst, rem));
                         }
-                        (PatNode::Add(pa, pb), ENode::Add(ea, eb))
-                        | (PatNode::Sub(pa, pb), ENode::Sub(ea, eb))
-                        | (PatNode::Mul(pa, pb), ENode::Mul(ea, eb))
-                        | (PatNode::Div(pa, pb), ENode::Div(ea, eb))
-                        | (PatNode::Pow(pa, pb), ENode::Pow(ea, eb)) => {
-                            let mut mid: OwnVec<Subst, A> = OwnVec::new_in(self.alloc);
-                            self.ematch_node(pat, pa, ea, subst, &mut mid);
-                            for &s1 in mid.iter() {
-                                self.ematch_node(pat, pb, eb, s1, out);
+                        Some(_) => {
+                            goal_pool.truncate(base);
+                        }
+                        None => {
+                            let mut next = cur_subst;
+                            if let Some(slot) = next.get_mut(vi) {
+                                *slot = Some(cid);
                             }
+                            work.push((next, rem));
                         }
-                        (PatNode::Fma(pa, pb, pc), ENode::Fma(ea, eb, ec)) => {
-                            let mut mid1: OwnVec<Subst, A> = OwnVec::new_in(self.alloc);
-                            self.ematch_node(pat, pa, ea, subst, &mut mid1);
-                            for &s1 in mid1.iter() {
-                                let mut mid2: OwnVec<Subst, A> = OwnVec::new_in(self.alloc);
-                                self.ematch_node(pat, pb, eb, s1, &mut mid2);
-                                for &s2 in mid2.iter() {
-                                    self.ematch_node(pat, pc, ec, s2, out);
+                    }
+                }
+                PatNode::Const(bits) => {
+                    let want = f64::from_bits(bits);
+                    if self.const_of(cid) == Some(want) {
+                        work.push((cur_subst, rem));
+                    } else {
+                        goal_pool.truncate(base);
+                    }
+                }
+                node_pat => {
+                    scratch.clear();
+                    for j in 0..rem {
+                        if let Some(&g) = goal_pool.get(base + j) {
+                            scratch.push(g);
+                        }
+                    }
+                    goal_pool.truncate(base);
+                    for &enode in self.class_nodes(cid).iter().rev() {
+                        match (node_pat, enode) {
+                            (PatNode::Neg(pa), ENode::Neg(ea))
+                            | (PatNode::Sin(pa), ENode::Sin(ea))
+                            | (PatNode::Cos(pa), ENode::Cos(ea))
+                            | (PatNode::Tan(pa), ENode::Tan(ea))
+                            | (PatNode::Exp(pa), ENode::Exp(ea))
+                            | (PatNode::Ln(pa), ENode::Ln(ea))
+                            | (PatNode::Sqrt(pa), ENode::Sqrt(ea))
+                            | (PatNode::Tanh(pa), ENode::Tanh(ea))
+                            | (PatNode::Abs(pa), ENode::Abs(ea)) => {
+                                for &g in scratch.iter() {
+                                    goal_pool.push(g);
                                 }
+                                goal_pool.push((pa, ea));
+                                work.push((cur_subst, rem + 1));
                             }
+                            (PatNode::Add(pa, pb), ENode::Add(ea, eb))
+                            | (PatNode::Sub(pa, pb), ENode::Sub(ea, eb))
+                            | (PatNode::Mul(pa, pb), ENode::Mul(ea, eb))
+                            | (PatNode::Div(pa, pb), ENode::Div(ea, eb))
+                            | (PatNode::Pow(pa, pb), ENode::Pow(ea, eb)) => {
+                                for &g in scratch.iter() {
+                                    goal_pool.push(g);
+                                }
+                                goal_pool.push((pb, eb));
+                                goal_pool.push((pa, ea));
+                                work.push((cur_subst, rem + 2));
+                            }
+                            (PatNode::Fma(pa, pb, pc), ENode::Fma(ea, eb, ec)) => {
+                                for &g in scratch.iter() {
+                                    goal_pool.push(g);
+                                }
+                                goal_pool.push((pc, ec));
+                                goal_pool.push((pb, eb));
+                                goal_pool.push((pa, ea));
+                                work.push((cur_subst, rem + 3));
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }

@@ -76,7 +76,7 @@ const BORROWS_COUNT: &str = "type-checked whole had the move and borrow check re
 /// prints it now.
 const OLD_FIRST: &str = "note: check-old: the OLD checker";
 /// The usage line of a word that is no command (main.rs `command`'s last arm).
-const NO_COMMAND: &str = "the command is check, ci, run, test, peer, clean, gc, warm-toolchain or explain";
+const NO_COMMAND: &str = "the command is check, ci, inspect, run, test, export, peer, clean, gc, warm-toolchain or explain";
 
 fn write(path: &Path, text: &str) {
     if let Some(dir) = path.parent() {
@@ -258,6 +258,176 @@ fn check_is_the_engine_and_names_exactly_the_stage_not_checked() {
         "CHECK COMMAND: clean {:?}, type error {:?} at {finding}, borrows-only {:?}, check-old refused {first:?}, --stats {:?}",
         clean.status, typed.status, counted.status, stats.status
     );
+}
+
+const INSPECT_SAMPLE: &str = "#![blaze::records]
+#![blaze::error_unions]
+#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+impl Copy for u8 {}
+impl Copy for u32 {}
+impl Copy for i32 {}
+impl Copy for bool {}
+
+enum Infallible {}
+
+enum ControlFlow<B, C> {
+    #[lang = \"Continue\"]
+    Continue(C),
+    #[lang = \"Break\"]
+    Break(B),
+}
+
+#[lang = \"from\"]
+trait From<T> {
+    fn from(value: T) -> Self;
+}
+
+impl<T> From<T> for T {
+    fn from(value: T) -> Self {
+        value
+    }
+}
+
+trait FromResidual<R = <Self as Try>::Residual> {
+    #[lang = \"from_residual\"]
+    fn from_residual(residual: R) -> Self;
+}
+
+trait Try: FromResidual {
+    type Output;
+    type Residual;
+    #[lang = \"branch\"]
+    fn branch(self) -> ControlFlow<Self::Residual, Self::Output>;
+}
+
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+impl<T, E> Try for Result<T, E> {
+    type Output = T;
+    type Residual = Result<Infallible, E>;
+    fn branch(self) -> ControlFlow<Self::Residual, Self::Output> {
+        match self {
+            Result::Ok(v) => ControlFlow::Continue(v),
+            Result::Err(e) => ControlFlow::Break(Result::Err(e)),
+        }
+    }
+}
+
+impl<T, E, F: From<E>> FromResidual<Result<Infallible, E>> for Result<T, F> {
+    fn from_residual(residual: Result<Infallible, E>) -> Self {
+        match residual {
+            Result::Err(e) => Result::Err(From::from(e)),
+            Result::Ok(x) => match x {},
+        }
+    }
+}
+
+struct ErrA(u32);
+struct ErrB(u32);
+struct ErrC(u32);
+
+fn read(mode: u32) -> Result<u32, _> {
+    if mode == 1 {
+        Result::Err(ErrA(10))
+    } else {
+        Result::Ok(mode)
+    }
+}
+
+fn parse(x: u32) -> Result<u32, _> {
+    if x == 2 {
+        Result::Err(ErrB(20))
+    } else {
+        Result::Ok(x + 1)
+    }
+}
+
+pub fn load(mode: u32) -> Result<u32, _> {
+    if mode == 3 {
+        return Result::Err(ErrC(30));
+    }
+    let a = read(mode)?;
+    let b = parse(a)?;
+    Result::Ok(b)
+}
+
+fn sum_def(r: { a: u32, b: u32 = 32 }) -> u32 {
+    r.a + r.b
+}
+
+fn read_host(r: { host: u32 }) -> u32 {
+    r.host
+}
+
+pub fn demo(mode: u32) -> u32 {
+    let x = sum_def({ a: 10u32 });
+    let wide = { host: 20u32, port: 8080u32, tls: true };
+    let y = read_host(wide);
+    let z = match load(mode) {
+        Result::Ok(v) => v,
+        Result::Err(e) => match e {
+            a: ErrA => a.0 + 1,
+            rest => match rest {
+                b: ErrB => b.0 + 2,
+                c => c.0 + 3,
+            },
+        },
+    };
+    x + y + z
+}
+";
+
+#[test]
+fn inspect_command_emits_annotated_hints_and_json() {
+    let base = fresh_home("inspect_command", false);
+    let home = base.join("home");
+    let ws = base.join("ws");
+    write(&ws.join("sample.rs"), INSPECT_SAMPLE);
+
+    // 1. Default annotated output on the full file.
+    let ann = blaze(&ws, &home, &["inspect", "sample.rs"], "inspect_ann");
+    assert_eq!(ann.status, Some(0), "inspect annotated failed:\n{}", ann.all());
+    assert!(ann.out.contains("// pub fn load(mode: u32) -> Result<u32, "), "missing load sig:\n{}", ann.out);
+    assert!(ann.out.contains("/* = "), "missing inferred return hint:\n{}", ann.out);
+    assert!(ann.out.contains("/* ? ErrA */"), "missing ? ErrA hint:\n{}", ann.out);
+    assert!(ann.out.contains("/*: u32*/"), "missing binding hint:\n{}", ann.out);
+    assert!(ann.out.contains("/* ..defaults: b: u32 */"), "missing record default hint:\n{}", ann.out);
+    assert!(ann.out.contains("/* project -> { host: u32 } */"), "missing record projection coercion hint:\n{}", ann.out);
+    assert!(ann.out.contains("rest/*: ") && ann.out.contains("c/*: ErrC*/"), "missing union residual narrowing hints:\n{}", ann.out);
+
+    // 2. Filtered JSON output (`sample.rs::load --json`).
+    let json = blaze(&ws, &home, &["inspect", "sample.rs::load", "--json"], "inspect_json");
+    assert_eq!(json.status, Some(0), "inspect --json failed:\n{}", json.all());
+    assert!(json.out.contains("\"items\": ["), "missing items array:\n{}", json.out);
+    assert!(json.out.contains("\"name\": \"load\""), "missing load item:\n{}", json.out);
+    assert!(!json.out.contains("\"name\": \"demo\""), "filter should exclude demo:\n{}", json.out);
+    assert!(json.out.contains("\"inferred_output\": \"Result<u32, "), "missing inferred_output:\n{}", json.out);
+    assert!(json.out.contains("\"inferred_error_set\": \""), "missing inferred_error_set:\n{}", json.out);
+    assert!(json.out.contains("\"kind\": \"inferred_return\""), "missing inferred_return hint:\n{}", json.out);
+    assert!(json.out.contains("\"kind\": \"try_propagate\""), "missing try_propagate hint:\n{}", json.out);
+    assert!(json.out.contains("\"kind\": \"binding\""), "missing binding hint:\n{}", json.out);
+
+    // 3. Opt-out flags (`--no-coercions --no-defaults`).
+    let stripped = blaze(&ws, &home, &["inspect", "sample.rs::demo", "--no-coercions", "--no-defaults"], "inspect_stripped");
+    assert_eq!(stripped.status, Some(0), "inspect stripped failed:\n{}", stripped.all());
+    assert!(!stripped.out.contains("project ->"), "--no-coercions must omit coercions:\n{}", stripped.out);
+    assert!(!stripped.out.contains("..defaults:"), "--no-defaults must omit defaults:\n{}", stripped.out);
+    assert!(stripped.out.contains("/*: u32*/"), "bindings should remain enabled:\n{}", stripped.out);
+
+    println!("=== ANNOTATED SAMPLE (demo + load) ===\n{}", ann.out);
+    println!("=== JSON SAMPLE (load) ===\n{}", json.out);
 }
 
 /// Multi-crate fixture exercising unused-dependency soundness rules:
