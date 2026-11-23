@@ -675,7 +675,7 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
             None => LowerTarget::Member(k),
         };
         let lowered = lower_made(r, prepared, target);
-        let body = match lowered {
+        let mut body = match lowered {
             Ok(b) => b,
             Err(BodyError::NoBody(_)) => {
                 census.fns.push((k, Reached::NoBody));
@@ -686,6 +686,12 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
                 census.fns.push((k, with_refusal(out, super::program::Front2Refusal::Lower(e))));
                 continue;
             }
+        };
+        let alloc = r.store.tys.alloc();
+        let expand_res = if body.typeck.inline_fors.is_empty() {
+            Ok(())
+        } else {
+            super::inline_for::expand_concrete_body(r, prepared, &mut body)
         };
         let view = body.lowered.view();
         let spell = match Spelling::of(&view) {
@@ -698,8 +704,7 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
         };
         let scope = body.scope(&spell);
         // Each async block's state recipe is made with the check (coroutine_recipes.rs).
-        let alloc = r.store.tys.alloc();
-        let done = check_body(r, &body, &scope).and_then(|c| {
+        let done = expand_res.and_then(|()| check_body(r, &body, &scope)).and_then(|c| {
             super::coroutine_recipes::recipes_of(r, &body, &c, &mut census.recipes, alloc)
                 .map_err(|error| CheckFail::Check { owner: body.owner, error })?;
             Ok(c)

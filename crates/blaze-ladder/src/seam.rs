@@ -177,6 +177,11 @@ pub trait FrontEnd {
     }
     fn sig(&self, i: usize) -> FnSig<'_>;
     fn fn_index(&self, key: ItemKey) -> Option<usize>;
+    /// For a generic `inline for` function at row `i` instantiated at concrete ground `args`
+    /// (in `ground`), returns the tabled monomorphized specialization row if one was built.
+    fn specialized_row(&self, _i: usize, _args: &[PTy], _ground: PTys<'_>) -> Option<usize> {
+        None
+    }
     /// Each soft-float routine's fn in the program's compiler_builtins, found by its exported
     /// name (front2/builtins_shim.rs `find`, INTRINSICS.md 3.5): asked once a run by the record
     /// walk's maker; `alloc` holds the scratch. Default: not looked up, so an `f128` operation

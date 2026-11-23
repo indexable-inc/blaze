@@ -342,6 +342,8 @@ pub struct Front2Program<'n> {
     recipes: Vec<super::coroutine_recipes::RecipeRow, Global>,
     /// The walk's fns by crate (crate index, fns tabled), most first ([`super::reach::by_crate`]).
     reached_by_crate: Vec<(usize, usize), Global>,
+    /// Monomorphized specializations of generic `inline for` functions (`FrontEnd::specialized_row`).
+    inline_for_specs: blaze_own::Vec<super::inline_for::SpecRow, Alloc<'static>>,
 }
 
 /// Where a program's walk starts.
@@ -881,25 +883,21 @@ impl<'n> Front2Program<'n> {
         }
         // The roots that lowered, in the order given: what `mains` is the bodies of.
         roots = kept;
-        let mut lowered = Vec::with_capacity_in(mains.len(), Global);
-        for m in mains.iter() {
-            lowered.push(m.lowered.view());
-        }
-        let mut spells = Vec::with_capacity_in(mains.len(), Global);
-        for v in lowered.iter() {
-            spells.push(Spelling::of(v).map_err(Front2Refusal::Spell)?);
-        }
-        let mut scopes = Vec::with_capacity_in(mains.len(), Global);
-        for (m, s) in mains.iter().zip(spells.iter()) {
-            scopes.push(m.scope(s));
-        }
         // In a survey a root that does not check is filed and left out, and the walk goes on
         // from what it calls by name: what is reachable is surveyed whatever the root is.
         let mut checked: Vec<Option<Checked<'static>>, Global> = Vec::with_capacity_in(mains.len(), Global);
         // Each checked body's async blocks' state recipes, made with its check (coroutine_recipes.rs).
         let mut recipes: Vec<super::coroutine_recipes::RecipeRow, Global> = Vec::new_in(Global);
-        for (m, scope) in mains.iter().zip(scopes.iter()) {
-            let done = check_body(&mut records, m, scope).and_then(|c| {
+        for m in mains.iter_mut() {
+            let checked_res = if m.typeck.inline_fors.is_empty() {
+                let v = m.lowered.view();
+                let s = Spelling::of(&v).map_err(Front2Refusal::Spell)?;
+                let scope = m.scope(&s);
+                check_body(&mut records, m, &scope)
+            } else {
+                super::inline_for::unroll_concrete_body(&mut records, prepared, m)
+            };
+            let done = checked_res.and_then(|c| {
                 super::coroutine_recipes::recipes_of(&mut records, m, &c, &mut recipes, alloc)
                     .map_err(|error| CheckFail::Check { owner: m.owner, error })?;
                 Ok(c)
@@ -918,6 +916,18 @@ impl<'n> Front2Program<'n> {
                     None => return Err(Front2Refusal::Check(e)),
                 },
             });
+        }
+        let mut lowered = Vec::with_capacity_in(mains.len(), Global);
+        for m in mains.iter() {
+            lowered.push(m.lowered.view());
+        }
+        let mut spells = Vec::with_capacity_in(mains.len(), Global);
+        for v in lowered.iter() {
+            spells.push(Spelling::of(v).map_err(Front2Refusal::Spell)?);
+        }
+        let mut scopes = Vec::with_capacity_in(mains.len(), Global);
+        for (m, s) in mains.iter().zip(spells.iter()) {
+            scopes.push(m.scope(s));
         }
         // A test's entry, from its head alone (test_entry.rs): a refusal is that test's own (the
         // runner fails it by name; the rest of the suite goes on). A `Report` entry's `report`
@@ -977,6 +987,10 @@ impl<'n> Front2Program<'n> {
             let report = super::reach::capped_report(&records, &census).into_boxed_str();
             return Err(Front2Refusal::Capped { entry: entry.into_boxed_str(), queued: census.queued, cap: census.cap, items: census.items, forced: census.forced, report });
         }
+        // Specialize any reached generic `inline for` functions at every concrete call site and
+        // merge newly discovered callees into `census`.
+        let inline_specs = super::inline_for::specialize_generic_inline_fors(&mut records, prepared, &mains, &checked, &mut census)
+            .map_err(Front2Refusal::Check)?;
         let reached_by_crate = super::reach::by_crate(&records, &census.fns);
         // Every fn the walk met is checked clean, or the program is refused by its first one
         // that is not: a fn with any diagnostic or gap is never built.
@@ -1032,7 +1046,7 @@ impl<'n> Front2Program<'n> {
         for m in mains.iter() {
             met.insert(m.owner, ());
         }
-        for c in checked.iter().flatten().chain(census.bodies.iter().map(|(_, c)| c)) {
+        for c in checked.iter().flatten().chain(census.bodies.iter().map(|(_, c)| c)).chain(inline_specs.iter().map(|s| &s.checked)) {
             for &item in c.callees.column::<1>() {
                 let of_trait = matches!(records.keys.origin(item), Some(super::keys::Origin::Member { container, kind: MemberKind::Fn, .. }) if !records.store.impls.contains_key(container));
                 if of_trait && met.insert(item, ()).is_none() {
@@ -1048,7 +1062,10 @@ impl<'n> Front2Program<'n> {
         let mut given_up: HashMap<ItemKey, (), Global> = HashMap::new_in(Global);
         for round in 0.. {
             let mut missing: Vec<ItemKey, Global> = Vec::new_in(Global);
-            let views = core::iter::once(records.store.tys.view()).chain(checked.iter().flatten().map(|c| c.types.view())).chain(census.bodies.iter().map(|(_, c)| c.types.view()));
+            let views = core::iter::once(records.store.tys.view())
+                .chain(checked.iter().flatten().map(|c| c.types.view()))
+                .chain(census.bodies.iter().map(|(_, c)| c.types.view()))
+                .chain(inline_specs.iter().map(|s| s.checked.types.view()));
             for v in views {
                 for n in v.nodes() {
                     if let tc::PNode::Adt(k, _) = n
@@ -1112,7 +1129,10 @@ impl<'n> Front2Program<'n> {
         // Every constant a checked body reads by value, evaluated once now (the builder's
         // `const_value` reads the record); one the evaluator refuses is named: in a survey filed
         // and left out (each reader's build then names it), in a run the program's refusal.
-        let (values, refused) = const_values(&mut records, checked.iter().flatten().chain(census.bodies.iter().map(|(_, c)| c)));
+        let (values, refused) = const_values(
+            &mut records,
+            checked.iter().flatten().chain(census.bodies.iter().map(|(_, c)| c)).chain(inline_specs.iter().map(|s| &s.checked)),
+        );
         for (k, why) in refused {
             let constant = fn_shown(&records, k).into_boxed_str();
             match left_out.as_deref_mut() {
@@ -1124,8 +1144,16 @@ impl<'n> Front2Program<'n> {
                 None => return Err(Front2Refusal::Const { constant: super::item_shown::refused(&records, k), why }),
             }
         }
-        let statics = made_statics(&mut records, checked.iter().flatten().chain(census.bodies.iter().map(|(_, c)| c)), left_out.as_deref_mut(), &mut left)?;
-        let views = core::iter::once(records.store.tys.view()).chain(checked.iter().flatten().map(|c| c.types.view())).chain(census.bodies.iter().map(|(_, c)| c.types.view()));
+        let statics = made_statics(
+            &mut records,
+            checked.iter().flatten().chain(census.bodies.iter().map(|(_, c)| c)).chain(inline_specs.iter().map(|s| &s.checked)),
+            left_out.as_deref_mut(),
+            &mut left,
+        )?;
+        let views = core::iter::once(records.store.tys.view())
+            .chain(checked.iter().flatten().map(|c| c.types.view()))
+            .chain(census.bodies.iter().map(|(_, c)| c.types.view()))
+            .chain(inline_specs.iter().map(|s| s.checked.types.view()));
         let asked = dyn_principals(views);
         let mut objects: HashMap<ItemKey, ObjectTable, Global> = HashMap::new_in(Global);
         object_tables(&mut records, asked, &mut objects, left_out.as_deref_mut())?;
@@ -1138,6 +1166,10 @@ impl<'n> Front2Program<'n> {
         let mut body_paths: Vec<Result<super::row_path::RowPath, super::row_path::NoRowPath>, Global> = Vec::with_capacity_in(census.bodies.len(), Global);
         for (b, _) in census.bodies.iter() {
             body_paths.push(super::row_path::row_path_of(&records, b.owner));
+        }
+        let mut spec_paths: blaze_own::Vec<Result<super::row_path::RowPath, super::row_path::NoRowPath>, Alloc<'static>> = blaze_own::Vec::with_capacity_in(inline_specs.len(), alloc);
+        for s in inline_specs.iter() {
+            spec_paths.push(super::row_path::row_path_of(&records, s.orig));
         }
         drop(scopes);
         drop(spells);
@@ -1171,6 +1203,13 @@ impl<'n> Front2Program<'n> {
             match tabled::lowered_row(names, prepared, &mut front.keys, &mut store, &b, &mut tys, path) {
                 Ok((body, path)) => bodies.push((body, c, path)),
                 Err((shown, refusal)) => tabled::left_out_or_stop(b.owner, shown, refusal, &mut left, left_out.as_deref_mut())?,
+            }
+        }
+        let mut spec_lowered: blaze_own::Vec<(ItemKey, blaze_own::Vec<PTy, Alloc<'static>>, Body<'n>, Checked<'static>, super::row_path::RowPath), Alloc<'static>> = blaze_own::Vec::with_capacity_in(inline_specs.len(), alloc);
+        for (s, path) in inline_specs.into_iter().zip(spec_paths) {
+            match tabled::lowered_row(names, prepared, &mut front.keys, &mut store, &s.body, &mut tys, path) {
+                Ok((body, path)) => spec_lowered.push((s.orig, s.args, body, s.checked, path)),
+                Err((shown, refusal)) => tabled::left_out_or_stop(s.spec_key, shown, refusal, &mut left, left_out.as_deref_mut())?,
             }
         }
         // The walk's steps, sorted and once each: what a test's reach is read from.
@@ -1215,6 +1254,21 @@ impl<'n> Front2Program<'n> {
                 }
             }
         }
+        let mut inline_for_specs: blaze_own::Vec<super::inline_for::SpecRow, Alloc<'static>> = blaze_own::Vec::with_capacity_in(spec_lowered.len(), alloc);
+        for (orig, args, body, checked, path) in spec_lowered {
+            let key = body.owner;
+            match tabled::table_one(names, &store, key, Some((body, checked)), path, false) {
+                tabled::Verdict::Tabled(row) => {
+                    let row_idx = fns.len();
+                    by_key.insert(key, row_idx);
+                    fns.push(row);
+                    inline_for_specs.push(super::inline_for::SpecRow { orig, args, row: row_idx });
+                }
+                tabled::Verdict::LeftOut { path, refusal } => {
+                    tabled::left_out_or_stop(key, path, refusal, &mut left, left_out.as_deref_mut())?;
+                }
+            }
+        }
         for (key, path) in ctors {
             let path = match path {
                 Ok(path) => path,
@@ -1244,7 +1298,7 @@ impl<'n> Front2Program<'n> {
         rows.extend(mains.iter().map(|m| (m.owner, by_key.get(&m.owner).copied())));
         // The evaluator is kept, not dropped: the build pulls constants at instances' ground
         // arguments from it (`FrontEnd::const_at`, const_at.rs).
-        let program = Front2Program { front, store, tys, buckets, fns, by_key, entry, objects, langs, left, const_values: values, statics, projection_why: core::cell::RefCell::new(None), asked: RefCell::new(Vec::new_in(Global)), asked_gaps: RefCell::new(Vec::new_in(Global)), definers: super::tait::Definers::new_in(alloc), edges, consts, prepared, start: start2, recipes, reached_by_crate };
+        let program = Front2Program { front, store, tys, buckets, fns, by_key, entry, objects, langs, left, const_values: values, statics, projection_why: core::cell::RefCell::new(None), asked: RefCell::new(Vec::new_in(Global)), asked_gaps: RefCell::new(Vec::new_in(Global)), definers: super::tait::Definers::new_in(alloc), edges, consts, prepared, start: start2, recipes, reached_by_crate, inline_for_specs };
         Ok(Made { program, roots: rows, shapes })
     }
 
@@ -1798,6 +1852,20 @@ impl FrontEnd for Front2Program<'_> {
 
     fn fn_index(&self, key: ItemKey) -> Option<usize> {
         self.by_key.get(&key).copied()
+    }
+
+    fn specialized_row(&self, i: usize, args: &[PTy], ground: PTys<'_>) -> Option<usize> {
+        if self.inline_for_specs.is_empty() {
+            return None;
+        }
+        let orig = self.fns.get(i)?.key;
+        let alloc = self.tys.alloc();
+        for s in self.inline_for_specs.iter() {
+            if s.orig == orig && super::inline_for::args_equal(ground, args, self.tys.view(), &s.args, alloc) {
+                return Some(s.row);
+            }
+        }
+        None
     }
 
     /// The digest filed in the store when fn `i`'s body was checked: its `Checked` holds no

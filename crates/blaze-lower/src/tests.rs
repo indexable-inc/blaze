@@ -1047,6 +1047,24 @@ fn uniq_and_record_named_args_with_defaults_lower_cleanly() {
 }
 
 #[test]
+fn inline_for_lowers_without_into_iter_desugaring() {
+    let h = blaze_own::testing::heap();
+    let alloc = h.alloc();
+    let exts = parser::Extensions::RECORDS;
+    let src = "fn demo(r: { a: u32, b: i32 }) { inline for f in r { use_field(f); } inline for (k, v) in &r { inspect(k, v); } }";
+    let lowered = crate::lower_body_with_extensions(src, Edition::E2024, exts, &mut Unix, &mut crate::NoModule, alloc)
+        .expect("inline for lowers");
+    let v = lowered.view();
+    assert!(v.unhandled.is_empty(), "unhandled:\n{}", dump_of(&lowered));
+    assert!(v.diags.is_empty(), "diags:\n{}", dump_of(&lowered));
+    assert_eq!(v.langs().count(), 0, "inline for must not desugar to IntoIterator lang items");
+    let inline_count = (0..v.exprs.len() as u32)
+        .filter(|&i| matches!(v.expr(ExprId(i)), Ok(Expr::InlineFor { .. })))
+        .count();
+    assert_eq!(inline_count, 2, "expected 2 Expr::InlineFor nodes:\n{}", dump_of(&lowered));
+}
+
+#[test]
 fn error_unions_and_typed_binding_patterns_lower_cleanly() {
     let h = blaze_own::testing::heap();
     let alloc = h.alloc();

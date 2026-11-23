@@ -80,6 +80,9 @@ pub(super) fn atom_expr<S: Sink>(
     if p.at_contextual_kw(T![builtin]) && p.nth_at(1, T![#]) {
         return Some((builtin_expr(p)?, BlockLike::NotBlock));
     }
+    if p.at_contextual_kw(T![inline]) && p.nth_at(1, T![for]) {
+        return Some((inline_for_expr(p, None), BlockLike::Block));
+    }
     if paths::is_path_start(p) {
         return Some(path_expr(p, r));
     }
@@ -734,6 +737,9 @@ fn labeled_expr<S: Sink>(p: &mut Parser<'_, S>) -> Option<CompletedMarker> {
     Some(match p.current() {
         T![loop] => loop_expr(p, Some(m)),
         T![for] => for_expr(p, Some(m)),
+        IDENT if p.at_contextual_kw(T![inline]) && p.nth_at(1, T![for]) => {
+            inline_for_expr(p, Some(m))
+        }
         T![while] => while_expr(p, Some(m)),
         // test labeled_block
         // fn f() { 'label: {}; }
@@ -780,6 +786,12 @@ fn while_expr<S: Sink>(p: &mut Parser<'_, S>, m: Option<Marker>) -> CompletedMar
     verify::loop_clauses(p);
     block_expr(p);
     m.complete(p, WHILE_EXPR)
+}
+
+fn inline_for_expr<S: Sink>(p: &mut Parser<'_, S>, m: Option<Marker>) -> CompletedMarker {
+    let m = m.unwrap_or_else(|| p.start());
+    p.bump_remap(T![inline]);
+    for_expr(p, Some(m))
 }
 
 // test for_expr

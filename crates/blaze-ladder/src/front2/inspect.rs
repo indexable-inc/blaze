@@ -1915,7 +1915,7 @@ pub fn inspect_source<A: Allocator + Copy>(
             }
         };
 
-        let body = match lowered_res {
+        let mut body = match lowered_res {
             Ok(b) => b,
             Err(LowerStepError::Body(BodyError::NoBody(_))) => continue,
             Err(e) => {
@@ -1928,9 +1928,6 @@ pub fn inspect_source<A: Allocator + Copy>(
             }
         };
 
-        let view = body.lowered.view();
-        let Ok(spell) = Spelling::of(&view) else { continue };
-        let scope = body.scope(&spell);
         let checked = {
             let mut records = Records {
                 names: &names,
@@ -1941,7 +1938,15 @@ pub fn inspect_source<A: Allocator + Copy>(
                 order: BuildOrder::AsAsked,
                 consts: Some((&mut consts, prepared)),
             };
-            match check_body(&mut records, &body, &scope) {
+            let res = if body.typeck.inline_fors.is_empty() {
+                let view = body.lowered.view();
+                let Ok(spell) = Spelling::of(&view) else { continue };
+                let scope = body.scope(&spell);
+                check_body(&mut records, &body, &scope)
+            } else {
+                super::inline_for::unroll_concrete_body(&mut records, prepared, &mut body)
+            };
+            match res {
                 Ok(done) => done,
                 Err(err) => {
                     if first_failure.is_none() {
@@ -1953,6 +1958,8 @@ pub fn inspect_source<A: Allocator + Copy>(
                 }
             }
         };
+        let view = body.lowered.view();
+        let Ok(spell) = Spelling::of(&view) else { continue };
 
         let Ok(body_tys) = body.tys.view(&store.tys) else { continue };
         let body_view = body.typeck.view(body_tys);
