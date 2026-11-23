@@ -603,6 +603,7 @@ fn ty(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, t: TypeId) -> fmt::Re
         TypeRef::Pat { base, pat: TyPat::NotNull } => node(p, work, "pattern_type", &[W::Ty(base), W::S("!null")]),
         TypeRef::Pat { base, pat: TyPat::Of(pat) } => node(p, work, "pattern_type", &[W::Ty(base), W::Pat(pat)]),
         TypeRef::Record(fields) => node(p, work, "record_type", &[W::Rows(fields)]),
+        TypeRef::Union(members) => node(p, work, "union_type", &[W::Types(members)]),
         TypeRef::Error => p.atom("(error)"),
     }
 }

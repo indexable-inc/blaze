@@ -68,8 +68,9 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     // and `blaze::default_refuses`, `blaze::one_at_a_time` and `blaze::unwritten_allocator`,
     // and `blaze::lock_without_reason` (D179), `blaze::raw_sync`, and `blaze::anon_tuple_return`.
     // (The refinement gate, `blaze::refinement`, is the one more; plus `blaze::magic_slice_len`,
-    // `blaze::bool_as_int`, `blaze::manual_slice_idioms`, and `blaze::test_ambient_leak`.)
-    assert_eq!(blaze_lints().len(), 262);
+    // `blaze::bool_as_int`, `blaze::manual_slice_idioms`, `blaze::test_ambient_leak`,
+    // and `blaze::mut_for_uniq_borrow`.)
+    assert_eq!(blaze_lints().len(), 263);
     assert!(!lint.is_externally_loaded);
     // The compiler's own and the release build's; blaze-lints loads every other.
     let built: Vec<&str> =
@@ -107,6 +108,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         ("blaze::bool_as_int", true),
         ("blaze::manual_slice_idioms", true),
         ("blaze::test_ambient_leak", true),
+        ("blaze::mut_for_uniq_borrow", false),
         // `program_lifetime` is `deny` where it fires (below); the two that say where it would
         // pay are `blaze::suggest`'s.
         ("blaze::program_lifetime", false),

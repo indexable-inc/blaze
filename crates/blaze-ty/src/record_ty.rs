@@ -25,6 +25,7 @@
 //! 4. **Deterministic layout**: computes exact field byte offsets, total size, and alignment in
 //!    either sorted-tuple order or alignment-descending minimal-padding order.
 
+use core::cmp::Ordering;
 use core::fmt;
 
 use blaze_own::{AString, AVec, Alloc};
@@ -64,7 +65,11 @@ pub enum ParamContext {
     TraitDeclParam,
     /// Parameter of a trait method `impl` (must repeat types with NO defaults).
     TraitImplParam,
-    /// Any non-parameter position (return type, local annotation, struct field, type alias).
+    /// Type alias defining a reusable options/record schema (`type OpenOpts = { create: bool = false }`).
+    TypeAlias,
+    /// Struct field holding a record with defaults (`default_field_values`).
+    StructField,
+    /// Any other non-parameter position (return type, local annotation, generic arg).
     NonParam,
 }
 
@@ -368,6 +373,68 @@ impl<'a, 's> RecordTy<'a, 's> {
         RecordTy::canonicalize(out)
     }
 
+    /// Returns `true` iff `self` structurally covers every field of `target` with matching
+    /// lifetime-erased types (`self` is a width-subrecord of `target`: `{ a, b, c } <: { a, c }`),
+    /// in O(N + M) sorted merge.
+    pub fn is_subrecord_of(&self, target: &RecordTy<'_, '_>) -> bool {
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < self.fields.len() && j < target.fields.len() {
+            let (Some(sf), Some(tf)) = (self.fields.get(i), target.fields.get(j)) else {
+                break;
+            };
+            match sf.name.as_bytes().cmp(tf.name.as_bytes()) {
+                Ordering::Less => i += 1,
+                Ordering::Equal => {
+                    if sf.key != tf.key {
+                        return false;
+                    }
+                    i += 1;
+                    j += 1;
+                }
+                Ordering::Greater => return false,
+            }
+        }
+        j == target.fields.len()
+    }
+
+    /// Computes the canonical source-field indices mapping `self` down to narrower `target`
+    /// (`out[target_idx] = self_idx`), or returns the missing/mismatched field error.
+    pub fn project_indices<'b>(
+        &self,
+        target: &RecordTy<'_, 's>,
+        alloc: Alloc<'b>,
+    ) -> Result<AVec<'b, usize>, RecordError<'s>> {
+        let mut out = AVec::with_capacity_in(target.fields.len(), alloc);
+        let (mut i, mut j) = (0usize, 0usize);
+        while j < target.fields.len() {
+            let Some(tf) = target.fields.get(j) else {
+                break;
+            };
+            let Some(sf) = self.fields.get(i) else {
+                return Err(RecordError::MissingRequiredField { field: tf.name });
+            };
+            match sf.name.as_bytes().cmp(tf.name.as_bytes()) {
+                Ordering::Less => i += 1,
+                Ordering::Equal => {
+                    if sf.key != tf.key {
+                        return Err(RecordError::FieldTypeMismatch {
+                            field: tf.name,
+                            expected: tf.key,
+                            found: sf.key,
+                        });
+                    }
+                    out.push(i);
+                    i += 1;
+                    j += 1;
+                }
+                Ordering::Greater => {
+                    return Err(RecordError::MissingRequiredField { field: tf.name });
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Validates a functional update `{ field: val, ..base }` against `self`.
     ///
     /// Per `records.md`, `base` must have the exact same structural field set as `self`, and
@@ -603,7 +670,10 @@ impl<'a, 's> RecordParamSig<'a, 's> {
             validate_field_name(f.name)?;
             if f.default.is_some() {
                 match ctx {
-                    ParamContext::FnParam | ParamContext::TraitDeclParam => {}
+                    ParamContext::FnParam
+                    | ParamContext::TraitDeclParam
+                    | ParamContext::TypeAlias
+                    | ParamContext::StructField => {}
                     ParamContext::TraitImplParam => {
                         return Err(RecordError::ImplDeclaresDefault { field: f.name });
                     }
@@ -663,7 +733,28 @@ impl<'a, 's> RecordParamSig<'a, 's> {
         self.decl_order.get(decl)?.default
     }
 
-    /// Resolves a call-site record argument list `{ a: x, b: y, .. }` against this parameter.
+    /// Returns `true` iff every field in this record parameter declares a default value
+    /// (allowing `open(p, { .. })` or omitting the trailing record argument entirely).
+    pub fn all_have_defaults(&self) -> bool {
+        self.decl_order.iter().all(|e| e.default.is_some())
+    }
+
+    /// Resolves an all-defaults call (`open(p, { .. })` or omitted trailing all-default arg).
+    pub fn resolve_all_defaults<'b>(
+        &self,
+        target: CallTargetKind,
+        alloc: Alloc<'b>,
+    ) -> Result<ResolvedCall<'b, 's>, RecordError<'s>> {
+        self.resolve_call(&[], true, target, alloc)
+    }
+
+    /// Resolves a call-site record argument list (`{ a: x, b: y }`, `{ a: x, .. }`, or `{ .. }`)
+    /// against this parameter.
+    ///
+    /// Defaulted fields are filled automatically when omitted without requiring trailing `, ..`
+    /// (`has_rest_dots` remains accepted as optional explicit syntax). Omitting a required field
+    /// with no default is always rejected, and omitting any defaulted field through an indirect
+    /// call (`fn(...)` / closure / `Fn`) is rejected with [`RecordError::IndirectCallDefaults`].
     pub fn resolve_call<'b>(
         &self,
         args: &[CallArg<'s>],
@@ -717,8 +808,8 @@ impl<'a, 's> RecordParamSig<'a, 's> {
                     *dest = SlotSource::ExplicitArg(arg_index);
                 }
             } else if let Some(constant) = entry.default {
-                if !has_rest_dots {
-                    return Err(RecordError::OmittedFieldWithoutDots { field: entry.name });
+                if target == CallTargetKind::Indirect {
+                    return Err(RecordError::IndirectCallDefaults);
                 }
                 if let Some(dest) = slots.get_mut(entry.canon_index) {
                     *dest = SlotSource::CalleeDefault(constant);
@@ -853,17 +944,29 @@ mod tests {
         // Only `depth` default was actually used -> incremental invalidation tracks only `depth`.
         assert_eq!(resolved.used_defaults.as_slice(), &["depth"]);
 
-        // Omitting `depth` without `..` is rejected.
+        // Omitting `depth` WITHOUT `, ..` now auto-fills the default seamlessly!
+        let resolved_no_dots = param
+            .resolve_call(
+                &[CallArg { name: "name", ty: Ty::STR }, CallArg { name: "open", ty: Ty::BOOL }],
+                false,
+                CallTargetKind::DirectOrTrait,
+                a,
+            )
+            .expect("call without .. auto-fills defaulted fields");
+        assert_eq!(resolved_no_dots.slots.as_slice(), resolved.slots.as_slice());
+        assert_eq!(resolved_no_dots.used_defaults.as_slice(), &["depth"]);
+
+        // Indirect call omitting a defaulted field (even without `..`) is still rejected.
         assert_eq!(
             param
                 .resolve_call(
-                    &[CallArg { name: "name", ty: Ty::STR }, CallArg { name: "open", ty: Ty::BOOL }],
+                    &[CallArg { name: "name", ty: Ty::STR }],
                     false,
-                    CallTargetKind::DirectOrTrait,
+                    CallTargetKind::Indirect,
                     a,
                 )
                 .unwrap_err(),
-            RecordError::OmittedFieldWithoutDots { field: "depth" }
+            RecordError::IndirectCallDefaults
         );
 
         // Omitting required `name` even with `..` is rejected.
@@ -926,6 +1029,16 @@ mod tests {
             RecordError::ImplDeclaresDefault { field: "open" }
         );
         assert!(RecordParamSig::new(&mut cx, &fields, ParamContext::TraitDeclParam, a).is_ok());
+        // Type-level defaults on reusable aliases and struct fields are permitted!
+        let alias_sig =
+            RecordParamSig::new(&mut cx, &fields, ParamContext::TypeAlias, a).expect("type alias defaults");
+        assert!(alias_sig.all_have_defaults());
+        let all_def = alias_sig
+            .resolve_all_defaults(CallTargetKind::DirectOrTrait, a)
+            .expect("all-defaults call");
+        assert_eq!(all_def.slots.as_slice(), &[SlotSource::CalleeDefault(c0)]);
+        assert_eq!(all_def.used_defaults.as_slice(), &["open"]);
+        assert!(RecordParamSig::new(&mut cx, &fields, ParamContext::StructField, a).is_ok());
 
         assert_eq!(
             RecordTy::check_impl(RecordImplKind::Inherent),
@@ -996,5 +1109,41 @@ mod tests {
         assert_eq!(layout.offsets.as_slice(), &[0, 8, 12]);
         assert_eq!(layout.size, 16);
         assert_eq!(layout.align, 8);
+    }
+
+    #[test]
+    fn subrecord_projection_and_arbitrary_arity_beyond_12_fields() {
+        let h = heap();
+        let a = h.alloc();
+        let mut cx = TyCx::new_in(a);
+        let u32_ty = Ty::uint(UintTy::U32);
+        let c0 = make_const(&mut cx, u32_ty, 0);
+
+        // 16 fields (past Rust's 12-tuple ceiling!) with defaults.
+        let names = [
+            "f15", "f02", "f11", "f00", "f08", "f14", "f03", "f07",
+            "f12", "f01", "f09", "f05", "f13", "f04", "f10", "f06",
+        ];
+        let mut param_fields = AVec::with_capacity_in(names.len(), a);
+        for &n in &names {
+            param_fields.push(RecordParamField { name: n, ty: u32_ty, default: Some(c0) });
+        }
+        let sig = RecordParamSig::new(&mut cx, &param_fields, ParamContext::TypeAlias, a)
+            .expect("16-field record");
+        assert_eq!(sig.record_ty().len(), 16);
+        assert!(sig.all_have_defaults());
+
+        let resolved = sig
+            .resolve_call(&[CallArg { name: "f07", ty: u32_ty }], false, CallTargetKind::DirectOrTrait, a)
+            .expect("16-field auto-filled defaults");
+        assert_eq!(resolved.used_defaults.len(), 15);
+        assert_eq!(resolved.slots[7], SlotSource::ExplicitArg(0));
+
+        // Width subrecord projection: 16-field record -> 2-field subrecord { f02, f13 }
+        let narrow = RecordTy::from_fields(&mut cx, &[("f13", u32_ty), ("f02", u32_ty)], a).expect("narrow");
+        assert!(sig.record_ty().is_subrecord_of(&narrow));
+        assert!(!narrow.is_subrecord_of(sig.record_ty()));
+        let idx = sig.record_ty().project_indices(&narrow, a).expect("project");
+        assert_eq!(idx.as_slice(), &[2, 13]);
     }
 }

@@ -50,8 +50,8 @@ pub(crate) const WORDS: &[&str] = &[
     // Strengthened `ambient-hasher` and `ambient-heap`.
     "rustc_hash", "FxHashMap", "FxHashSet", "ahash", "AHashMap", "AHashSet", "foldhash", "pin", "into_boxed_slice",
     "into_boxed_str",
-    // `mut-ref` (`&mut` / `ref mut` -> `&uniq` / `ref uniq`).
-    "mut", "ref",
+    // `mut-ref` (`&mut` / `ref mut` -> `&uniq` / `ref uniq`) and `mut-for-uniq-borrow` (`let mut`).
+    "mut", "ref", "let", "uniq",
     // `magic-slice-len` (`.get(0..3) == Some(..)`, `.get(at..at + 2)`, `.starts_with(..)` + advance).
     "get", "starts_with", "Some", "is_some_and", "try_into",
     // `manual-slice-idioms` (`.len() == 0`, `for i in 0..xs.len()`, `.find(..)` + slice) and `test-ambient-leak`.
@@ -168,6 +168,8 @@ pub(crate) const W_LIBC: u8 = word("libc");
 pub(crate) const W_RUSTIX: u8 = word("rustix");
 pub(crate) const W_MUT: u8 = word("mut");
 pub(crate) const W_REF: u8 = word("ref");
+pub(crate) const W_LET: u8 = word("let");
+pub(crate) const W_UNIQ: u8 = word("uniq");
 pub(crate) const W_GET: u8 = word("get");
 pub(crate) const W_STARTS_WITH: u8 = word("starts_with");
 pub(crate) const W_SOME: u8 = word("Some");

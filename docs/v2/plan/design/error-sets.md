@@ -94,11 +94,22 @@ covered, a member left out is the witness, written `FsError { .. }` or `Stopped:
 covered twice is unreachable), MIR lowering (a discriminant test, then the variant's field),
 the match tree and closure capture analysis.
 
-Not built: the typed binding of the edition page, `Err(e: FsError)` and `_: Stopped`, which
-binds or tests a member whole without naming its fields or variants (today `e @ FsError { .. }`
-for a struct; an enum member whole has no pattern). It is sugar for the same adjustment and
-needs a pattern form in the parser and `hir-def`. Narrowing the rest of a set after an arm
-(`E is not FsError`) waits for pattern types.
+**v2 compiler representation (`blaze-ty::union_ty`, `blaze-lower`, `parser`):**
+- `UNION_TYPE` lowers directly to `TypeRef::Union(List)` in `blaze-lower` and `blaze-ladder`.
+- `blaze-ty::union_ty::UnionTy` supports arbitrary arity (>12 members, `u8` tag up to 256 members,
+  `u16` beyond) with niche-reuse layout computation.
+- **Generic unions (`ParametricUnionTy`):** `fn with_timeout<T, E>(...) -> Result<T, E | Timeout>`
+  normalizes, flattens nested unions, strips `!`, and deduplicates identical members at
+  monomorphization time.
+- **Typed binding patterns:** `Err(e: FsError)` and `Err(_: Stopped)` parse natively under
+  `#![blaze::error_unions]` in `match` arms and nested pattern delimiters (`tuple`, `tuple_struct`,
+  `slice`, `paren`) without affecting `let x: T`, `fn(x: T)`, or closure parameter ascriptions.
+- **Multi-member residual narrowing (`narrow_remove_many`):** matching `FsError` and `ParseError`
+  out of `FsError | ParseError | Timeout | Stopped` narrows the fallback arm `Err(other)` to
+  `Timeout | Stopped`, detecting redundant arms and allowing direct `?` / `return Err(other)`
+  widening.
+- **Inferred private error sets (`ErrorSetInfer`):** accumulates `?` / `Err(..)` / nested unions
+  for `Result<T, _>` in private functions ("infer inside, declare at the border").
 
 ## Representation and cost
 

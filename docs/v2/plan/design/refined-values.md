@@ -23,23 +23,20 @@ fits by interval arithmetic over the type, and the unused bits are a niche. Ever
 whose range is a power-of-two span suggests the narrow type in its note: "`x` must be in
 `0..=1073741823`: take a `u30`". This is `advice` in `reach/obligations.rs`, over `narrow_type`.
 
-## 2. `Int<LO, HI>`: a library, not a feature
+## 2. Pattern types (`T is PAT`) replace `Int<LO, HI>`
 
-A range that is not a power of two is a const-generic library over `where const`
-([comptime.md](comptime.md)), with no language change (rule 32, library-over-language):
+A range that is not a power of two needs no wrapper struct: **pattern types (`T is PAT`,
+`blaze-ty::pat_ty`)** are the single unified surface for single-value refinements:
 
-```rust
-struct Int<const LO: i128, const HI: i128>(i128);
-fn new<const LO: i128, const HI: i128, const V: i128>() -> Int<LO, HI> where const { LO <= V && V <= HI }
-fn add<..>(a: Int<A, B>, b: Int<C, D>) -> Int<{ A + C }, { B + D }>
-```
-
-The type checker already evaluates the condition per instance, unifies `{ A + C }` by value or by
-normal form, and makes an overflowing bound an error rather than a wrapped value. The fixture is
-`ranged_integers_are_checked_in_the_types` in `crates/hir-ty-mir/src/tests/where_const.rs`. That
-covers type-level ranges. For a value known only at run time, the type is still `Int`, and its
-constructor is the `#[blaze::invariant]` form of §3. `blaze_std` ships it once the two have run
-together on real code.
+- **Integer ranges (`i32 is 0..=100`, `usize is 1..`)** have the exact same layout as their base
+  type, free widening (`T is 10..=20 <: T is 0..=100 <: T`), exact niche counts for
+  `Option<T is PAT>`, overflow-checked interval addition (`(i32 is 0..=10) + (i32 is 0..=20)` →
+  `i32 is 0..=30`), and exact bridging (`exact_arbitrary_int`) to packed `uN`/`iN` storage widths.
+- **Enum variants (`Conn is Conn::Open { .. } | Conn::Draining { .. }`)** narrow flow-sensitively
+  through `match`/`let else`, unlock direct field access when reduced to a single variant, and
+  forbid whole-value overwrites through `&uniq (T is PAT)`.
+- **`#[blaze::invariant]` and `requires`/`ensures`** focus purely on **relational** properties
+  across multiple fields or parameters (`self.len <= self.cap`, `i < v.len()`).
 
 ## 3. `#[blaze::invariant(PRED)]`
 
