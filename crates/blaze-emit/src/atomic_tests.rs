@@ -21,7 +21,7 @@ use crate::{
 const SIZES: [Ty; 4] = [Ty::I8, Ty::I16, Ty::I32, Ty::I64];
 
 fn isa(lse: bool) -> Isa {
-    Isa { lse, os: Os::MacOs }
+    Isa { lse, os: crate::tests::HOST_OS }
 }
 
 /// `f(params) = body(params)`, returning the values `body` gives, of types `rets`.

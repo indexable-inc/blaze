@@ -104,26 +104,27 @@ mod run {
     use blaze_inproc::exec::Executable;
     use blaze_tier::{Emitted, RelocKind};
 
-    /// A readable page standing for the runtime's poll page.
-    #[repr(C, align(4096))]
-    struct Page([u8; 4096]);
-
-    static POLL: Page = Page([0; 4096]);
-
-    /// `e`'s code placed with its poll relocations patched to [`POLL`]: `adrp`'s page delta
+    /// `e`'s code placed with its poll relocations patched to a zeroed readable page inside the
+    /// same `Executable` mapping (guaranteed within 1 GiB of every code byte, so `adrp`'s ±4 GiB
+    /// `Page21` reach holds on every host ASLR layout, including Linux PIE): `adrp`'s page delta
     /// into `immlo` (bits 29..31) and `immhi` (bits 5..24), the page offset in units of 8 into
     /// the `ldr`'s `imm12` (bits 10..22). Any other relocation fails the test.
     pub(super) fn place(e: &Emitted<'_>) -> Executable {
-        let page = core::ptr::addr_of!(POLL) as u64;
-        Executable::written(e.code.len(), 0, |out, _| {
+        Executable::written(e.code.len(), 4096, |out, data| {
             let base = out.as_ptr() as u64;
+            let page = data.as_ptr() as u64;
             out.copy_from_slice(&e.code);
             for r in e.relocs.iter() {
                 let at = r.at as usize;
                 let mut word = u32::from_le_bytes([out[at], out[at + 1], out[at + 2], out[at + 3]]);
                 match r.kind {
                     RelocKind::Page21 => {
-                        let delta = ((page >> 12) as i64 - ((base + u64::from(r.at)) >> 12) as i64) as u64;
+                        let signed_delta = (page >> 12) as i64 - ((base + u64::from(r.at)) >> 12) as i64;
+                        assert!(
+                            (-(1i64 << 20)..(1i64 << 20)).contains(&signed_delta),
+                            "Page21 delta {signed_delta} out of ±4 GiB range (base={base:#x}, page={page:#x})"
+                        );
+                        let delta = signed_delta as u64;
                         word &= !((0b11 << 29) | (0x7ffff << 5));
                         // Truncation on purpose: the delta's low 21 bits are the field.
                         word |= ((delta as u32 & 0b11) << 29) | (((delta >> 2) as u32 & 0x7ffff) << 5);

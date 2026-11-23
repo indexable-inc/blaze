@@ -81,8 +81,9 @@ fn float_comparisons_follow_nan() {
 #[test]
 fn float_casts_saturate_and_round() {
     macro_rules! to_int {
-        ($t:ty, $ty:expr, $op:expr) => {{
-            let f = place(&one(&[Ty::F64], $ty, |b, v| b.convert($op, Flags::NONE, $ty, v[0])));
+        ($t:ty, $ty:expr, $op:expr, $ext:expr) => {{
+            let ret = blaze_lir::builder::Param { ext: $ext, ..blaze_lir::builder::Param::of($ty) };
+            let f = place(&one(&[Ty::F64], ret, |b, v| b.convert($op, Flags::NONE, $ty, v[0])));
             // SAFETY: an emitted C function of this signature, mapped while `f` lives.
             let g = unsafe { std::mem::transmute::<usize, extern "C" fn(f64) -> $t>(f.code_address() as usize) };
             for a in SAMPLES {
@@ -90,14 +91,14 @@ fn float_casts_saturate_and_round() {
             }
         }};
     }
-    to_int!(i8, Ty::I8, Op::FptoSi);
-    to_int!(u8, Ty::I8, Op::FptoUi);
-    to_int!(i16, Ty::I16, Op::FptoSi);
-    to_int!(u16, Ty::I16, Op::FptoUi);
-    to_int!(i32, Ty::I32, Op::FptoSi);
-    to_int!(u32, Ty::I32, Op::FptoUi);
-    to_int!(i64, Ty::I64, Op::FptoSi);
-    to_int!(u64, Ty::I64, Op::FptoUi);
+    to_int!(i8, Ty::I8, Op::FptoSi, blaze_lir::func::Ext::Sext);
+    to_int!(u8, Ty::I8, Op::FptoUi, blaze_lir::func::Ext::Zext);
+    to_int!(i16, Ty::I16, Op::FptoSi, blaze_lir::func::Ext::Sext);
+    to_int!(u16, Ty::I16, Op::FptoUi, blaze_lir::func::Ext::Zext);
+    to_int!(i32, Ty::I32, Op::FptoSi, blaze_lir::func::Ext::None);
+    to_int!(u32, Ty::I32, Op::FptoUi, blaze_lir::func::Ext::None);
+    to_int!(i64, Ty::I64, Op::FptoSi, blaze_lir::func::Ext::None);
+    to_int!(u64, Ty::I64, Op::FptoUi, blaze_lir::func::Ext::None);
     let from = place(&one(&[Ty::I64], Ty::F64, |b, v| b.convert(Op::SitoFp, Flags::NONE, Ty::F64, v[0])));
     let ufrom = place(&one(&[Ty::I32], Ty::F32, |b, v| b.convert(Op::UitoFp, Flags::NONE, Ty::F32, v[0])));
     let narrow = place(&one(&[Ty::F64], Ty::F32, |b, v| b.convert(Op::Fptrunc, Flags::NONE, Ty::F32, v[0])));

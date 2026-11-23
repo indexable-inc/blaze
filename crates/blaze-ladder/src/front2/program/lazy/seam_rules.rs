@@ -140,6 +140,62 @@ pub(in crate::front2::program) fn track_caller(keys: &Keys, store: &Store<'_>, k
     own(declared)
 }
 
+/// The `(lib, text)` of function `k`'s signature for reading its attributes (`#[track_caller]`,
+/// `#[rustc_nounwind]`) when `k` has no tabled row yet.
+fn fn_sig_text<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, k: ItemKey) -> Option<(LibKey, &'n str)> {
+    if let Some(head) = store.fns.get(&k) {
+        Some((head.lib, head.text))
+    } else if let Some(crate::front2::keys::Origin::Member { container, kind: MemberKind::Fn, name }) = keys.origin(k) {
+        let lib = keys.library_in(names, *container)?;
+        let mut text = None;
+        let listed = names.each_member(lib, &mut |member| {
+            if member.kind == blaze_surface::ItemKind::Function && member.name == Some(name.as_ref()) {
+                names.read_member_signature(member.key, member.written_by);
+                text = Some(member.text);
+            }
+        });
+        if !listed {
+            return None;
+        }
+        Some((lib, text?))
+    } else if let Some(local) = store.locals.head(k) {
+        if local.kind != crate::front2::locals::LocalKind::Fn {
+            return None;
+        }
+        Some((local.lib, local.text))
+    } else {
+        let lib = keys.library_in(names, k)?;
+        if names.kind_of_item(lib)? != blaze_surface::ItemKind::Function {
+            return None;
+        }
+        Some((lib, names.text_of(lib)?.text))
+    }
+}
+
+/// Whether `key` is nounwind: from its tabled row when present, else from its head ABI and
+/// `#[rustc_nounwind]` signature attribute (matching `tabled.rs` and `fill.rs`).
+pub(in crate::front2::program) fn nounwind_from<'n, S: NamesSource<'n>>(
+    tabled: Option<bool>,
+    names: S,
+    keys: &Keys,
+    store: &Store<'n>,
+    key: ItemKey,
+) -> Option<bool> {
+    if let Some(nw) = tabled {
+        return Some(nw);
+    }
+    if store.ctors.contains_key(&key) {
+        return Some(false);
+    }
+    let own = crate::front2::program::head_abi::head_abi(names, store, key, Default::default).ok()?;
+    if own.nounwind {
+        return Some(true);
+    }
+    let (lib, text) = fn_sig_text(names, keys, store, key)?;
+    let symbols = symbols_of(names, lib, crate::front2::links::values_key(names, store, lib), text, "").ok()?;
+    Some(symbols.nounwind)
+}
+
 /// A function row already holds its own attribute. Without that row, use the function's
 /// signature text. In particular an impl head files its members' identities before making
 /// their signatures, and a trait declaration can supply the attribute without a body.
@@ -153,33 +209,7 @@ pub(in crate::front2::program) fn track_caller_from<'n, S: NamesSource<'n>>(
         if store.ctors.contains_key(&k) {
             return Some(false);
         }
-        let (lib, text) = if let Some(head) = store.fns.get(&k) {
-            (head.lib, head.text)
-        } else if let Some(crate::front2::keys::Origin::Member { container, kind: MemberKind::Fn, name }) = keys.origin(k) {
-            let lib = keys.library_in(names, *container)?;
-            let mut text = None;
-            let listed = names.each_member(lib, &mut |member| {
-                if member.kind == blaze_surface::ItemKind::Function && member.name == Some(name.as_ref()) {
-                        names.read_member_signature(member.key, member.written_by);
-                    text = Some(member.text);
-                }
-            });
-            if !listed {
-                return None;
-            }
-            (lib, text?)
-        } else if let Some(local) = store.locals.head(k) {
-            if local.kind != crate::front2::locals::LocalKind::Fn {
-                return None;
-            }
-            (local.lib, local.text)
-        } else {
-            let lib = keys.library_in(names, k)?;
-            if names.kind_of_item(lib)? != blaze_surface::ItemKind::Function {
-                return None;
-            }
-            (lib, names.text_of(lib)?.text)
-        };
+        let (lib, text) = fn_sig_text(names, keys, store, k)?;
         symbols_of(names, lib, crate::front2::links::values_key(names, store, lib), text, "").ok().map(|symbols| symbols.track_caller)
     })
 }

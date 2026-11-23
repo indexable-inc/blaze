@@ -16,8 +16,11 @@ use crate::{
     enc::{self, Cond, Size},
 };
 
-/// What the tests emit for: this Mac (every Apple M-series core has FEAT_LSE).
-pub(crate) const ISA: Isa = Isa { lse: true, os: Os::MacOs };
+/// The host OS the tests emit and run on (`Os::MacOs` on macOS, `Os::Linux` on Linux).
+pub(crate) const HOST_OS: Os = if cfg!(target_os = "macos") { Os::MacOs } else { Os::Linux };
+
+/// What the tests emit for: this host (Armv8.1+ with FEAT_LSE).
+pub(crate) const ISA: Isa = Isa { lse: true, os: HOST_OS };
 
 /// The forms, each against the word `clang -c -arch arm64` assembles for it (the text in the
 /// comment), and the patched fields against the assembler's PC-relative words.
@@ -182,14 +185,30 @@ pub(crate) fn emitted_for(view: View<'_>, via: &[Via], isa: Isa) -> Result<Code<
 }
 
 /// `f(params) = body(params)`, returning the one value `body` gives, of type `ret`.
+pub(crate) trait IntoRet {
+    fn into_ret(self) -> Param;
+}
+
+impl IntoRet for Ty {
+    fn into_ret(self) -> Param {
+        Param::of(self)
+    }
+}
+
+impl IntoRet for Param {
+    fn into_ret(self) -> Param {
+        self
+    }
+}
+
 pub(crate) fn one(
     params: &[Ty],
-    ret: Ty,
+    ret: impl IntoRet,
     body: impl FnOnce(&mut Builder<Global, Full>, &[Value]) -> Value,
 ) -> Func<Global> {
     let mut b = Builder::<Global, Full>::new_in(64, Global);
     let sig_params: Vec<Param> = params.iter().map(|&ty| Param::of(ty)).collect();
-    let sig = b.sig(Conv::C, Variadic::No, &sig_params, &[Param::of(ret)]);
+    let sig = b.sig(Conv::C, Variadic::No, &sig_params, &[ret.into_ret()]);
     b.set_signature(sig);
     let entry = b.create_block(BlockKind::Normal);
     b.begin(entry);
