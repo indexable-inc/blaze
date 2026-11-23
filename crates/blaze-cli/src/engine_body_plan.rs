@@ -84,6 +84,20 @@ const NOTE_DOMAIN: &str = "blaze-cli engine body plan file note 1";
 /// The domain of a shared body's row source ([`source_at_views`]).
 const VIEWS_DOMAIN: &str = "blaze-cli engine body rows at views 1";
 
+/// The domain of a body's row source folded with its cumulative cfg-attribute chain
+/// ([`source_with_cfg`]).
+const CFG_SOURCE_DOMAIN: &str = "blaze-cli engine body row cfg 1";
+
+/// Folds the cumulative cfg-attribute chain hash (file `#![cfg]`s + enclosing ancestors' `#[cfg]`s
+/// + entry's own `#[cfg]`s) into a body's `source` so editing any enclosing `#[cfg]` moves the
+/// body's task key directly without needing `Decision::Absent` to read `Section::Items` (rule 21).
+pub(crate) fn source_with_cfg(source: ContentId, cfg: ContentId) -> ContentId {
+    let mut h = blaze_ids::Hasher::new(CFG_SOURCE_DOMAIN);
+    h.update(&source.0);
+    h.update(&cfg.0);
+    h.finish()
+}
+
 /// The source of each row of a body two units or more reach (D191): its text's source and every
 /// such unit's view, in rank. A row's block names the units its body's rows are at
 /// (engine_lines.rs `VIEW`, how a finding only some rows hold is printed), so they are inputs of
@@ -189,12 +203,14 @@ pub(crate) struct Holders<'f> {
 }
 
 /// The two not-held proof cells for one unit: `files` (`NameCell::Files`, moving only when the
-/// unit's file list changes: `Decision::NotHeld`) and `items` (`Section::Items`, moving when an
-/// item in a held file appears or disappears: `Decision::Absent`).
+/// unit's held file list changes: `Decision::NotHeld`) and `cfg_atoms` (`NameCell::CfgAtoms`,
+/// moving only when the unit's cfg atoms change: `Decision::Absent`, alongside `files` and the
+/// body's own task key which folds the entry's enclosing cfg chain). Neither moves when an
+/// unrelated private item is added to any file in the crate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct UnitCells {
     pub(crate) files: CellId,
-    pub(crate) items: CellId,
+    pub(crate) cfg_atoms: CellId,
 }
 
 impl<'f> Holders<'f> {
@@ -313,21 +329,27 @@ impl<'f> Holders<'f> {
         let mut ids = Vec::with_capacity_in(self.units.len(), g);
         ids.extend(self.units.iter().map(|one| UnitCells {
             files: grains.place(files_cell(one.name, one.prefix), false),
-            items: grains.place(items_cell(one.name, one.prefix), false),
+            cfg_atoms: grains.place(cfg_atoms_cell(one.name, one.prefix), false),
         }));
         ids
     }
 
-    /// What a row is a function of: its `passed` unit's not-held cell (`NameCell::Files` when the
-    /// file itself is not held, `Section::Items` when the file is held but the entry is absent) and
+    /// What a row is a function of: its `passed` unit's not-held cells (`NameCell::Files` when the
+    /// file itself is not held; `NameCell::Files` + `NameCell::CfgAtoms` when the file is held but
+    /// the entry is cfg'd out, as its enclosing cfg chain is already folded into its task key) and
     /// its refusal's `reads`, in the phase frame. A checked body canonicalizes these with its other IDs.
     pub(crate) fn cells<'a>(unit_cells: &[UnitCells], decided: Decision, passed: &[u32], reads: &[CellId], frame: &'a Frame) -> Vec<CellId, &'a Frame> {
-        let mut ids = Vec::with_capacity_in(passed.len() + reads.len(), frame);
         let file_only = matches!(decided, Decision::NotHeld);
-        ids.extend(passed.iter().map(|unit| {
-            let pair = unit_cells[*unit as usize];
-            if file_only { pair.files } else { pair.items }
-        }));
+        let extra = if file_only { passed.len() } else { passed.len().saturating_mul(2) };
+        let mut ids = Vec::with_capacity_in(extra + reads.len(), frame);
+        for &unit in passed.iter() {
+            if let Some(&pair) = usize::try_from(unit).ok().and_then(|i| unit_cells.get(i)) {
+                ids.push(pair.files);
+                if !file_only && pair.cfg_atoms != pair.files {
+                    ids.push(pair.cfg_atoms);
+                }
+            }
+        }
         ids.extend_from_slice(reads);
         ids
     }
@@ -352,6 +374,10 @@ pub(crate) fn not_held_cell(view: View<'_, '_>, name: Name, prefix: [u8; 8]) -> 
 
 fn files_cell(of: Name, prefix: [u8; 8]) -> CellId {
     CellId { of, cell: Cell(NameCell::Files { krate: prefix }.key()) }
+}
+
+fn cfg_atoms_cell(of: Name, prefix: [u8; 8]) -> CellId {
+    CellId { of, cell: Cell(NameCell::CfgAtoms { krate: prefix }.key()) }
 }
 
 fn items_cell(of: Name, prefix: [u8; 8]) -> CellId {
@@ -428,7 +454,7 @@ pub(crate) fn reached(outlined: &[Outlined<'_>], root: Name, g: blaze_own::Alloc
 /// [`reached`] walks it. `found`: the unit's found files ([`FoundEdge`], [`Reach::found_of`]),
 /// walked from as the root is (each its own `#![cfg]` read, then its file parts): the files its
 /// names read that no `mod` the walk follows names. In `g`.
-pub(crate) fn reached_under(outlined: &[Outlined<'_>], cuts: &PlanCuts<'_>, root: Name, test: Tri, found: &[FoundEdge], g: blaze_own::Alloc<'static>) -> Result<Vec<Name, blaze_own::Alloc<'static>>, Unoutlined> {
+pub(crate) fn reached_under(outlined: &[Outlined<'_>], cuts: &PlanCuts<'_, '_, '_>, root: Name, test: Tri, found: &[FoundEdge], g: blaze_own::Alloc<'static>) -> Result<Vec<Name, blaze_own::Alloc<'static>>, Unoutlined> {
     let mut seen: Vec<Name, blaze_own::Alloc<'static>> = Vec::new_in(g);
     let mut next: Vec<Name, blaze_own::Alloc<'static>> = Vec::new_in(g);
     next.push(root);

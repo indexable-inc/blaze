@@ -231,6 +231,13 @@ pub(crate) fn plan_views<'h, P: ViewPlan>(outlined: &[Outlined<'_>], skipped: &[
                     None => views.clear(),
                 }
                 let source = crate::engine_tasks::edition_source(source, one.edition);
+                // Fold any enclosing/file/own `#[cfg]` / `#[cfg_attr]` attributes into the row's
+                // key so editing an enclosing `#[cfg]` enters the row directly without needing
+                // `Decision::Absent` to read `Section::Items` (rule 21).
+                let source = match crate::engine_plan_cfg::part_cfg(cuts.as_ref(), part) {
+                    Some(cfg) => crate::engine_body_plan::source_with_cfg(source, cfg),
+                    None => source,
+                };
                 // A body two units or more hold: its units are in each row's key (rule 21).
                 let source = match views.len() {
                     0 | 1 => source,
@@ -710,7 +717,7 @@ const MEM_PARTS: usize = 23;
 
 /// The first representative of each retained recorder cell, before row placement.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct KeptKinds([u32; 22]);
+struct KeptKinds([u32; 24]);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TopKept {
@@ -719,9 +726,9 @@ pub(crate) struct TopKept {
 }
 
 impl KeptKinds {
-    const NAMES: [&'static str; 22] = [
+    const NAMES: [&'static str; 24] = [
         "Binding", "Module", "Root", "Variants", "Item", "Members", "Expansion", "MemberOf",
-        "VariantOf", "Beginning", "Lang", "Incoherent", "InternalSymbols", "Links", "ImplRows", "Files", "Textual", "Whole", "Signature", "Text", "Head", "Impls",
+        "VariantOf", "Beginning", "Lang", "Incoherent", "InternalSymbols", "Links", "ImplRows", "Files", "Extensions", "CfgAtoms", "Textual", "Whole", "Signature", "Text", "Head", "Impls",
     ];
 
     fn add(&mut self, key: TableRead) {
@@ -731,12 +738,13 @@ impl KeptKinds {
                 Binding { .. } => 0, Module { .. } => 1, Root { .. } => 2, Variants { .. } => 3,
                 Item { .. } => 4, Members { .. } => 5, Expansion { .. } => 6, MemberOf { .. } => 7,
                 VariantOf { .. } => 8, Beginning { .. } => 9, Lang { .. } => 10, Incoherent { .. } => 11,
-                InternalSymbols { .. } => 12, Links { .. } => 13, ImplRows { .. } => 14, Files { .. } => 15, Textual { .. } => 16, Whole { .. } => 17,
+                InternalSymbols { .. } => 12, Links { .. } => 13, ImplRows { .. } => 14, Files { .. } => 15,
+                Extensions { .. } => 16, CfgAtoms { .. } => 17, Textual { .. } => 18, Whole { .. } => 19,
             },
-            TableRead::Signature { .. } => 18,
-            TableRead::Text { .. } => 19,
-            TableRead::Head { .. } => 20,
-            TableRead::Impls { .. } => 21,
+            TableRead::Signature { .. } => 20,
+            TableRead::Text { .. } => 21,
+            TableRead::Head { .. } => 22,
+            TableRead::Impls { .. } => 23,
         };
         self.0[at] += 1;
     }
@@ -1767,14 +1775,18 @@ pub(crate) fn scope_of<'r>(read: &mut EngineRecords<'r>, cx: &Cx, store: &mut dy
 /// holds it alone); each crate past it found by its names input and checked present in the
 /// committed `snapshot`, never opened ([`crate::front_load::present`]: one lookup, no byte of the
 /// record read), returned unopened in reader order for the request's
-/// [`crate::front_load::ScopeRecords`]. Cut where [`scope_of`] cuts, by the same causes: a crate
+/// [`LazyScopeRecords`]. When `defer_inputs` is true (a standing member visited below its heads
+/// on the ready driver with no `CrateScope` entered this request and no planted unreadable crate),
+/// its scope already stood whole in the members record, so each dependency crate's `names.input_of`
+/// and snapshot lookup are deferred to its first actual question in [`LazyScopeRecords`], avoiding
+/// reading ~900 unused `CrateScope` task pages upfront.
+/// Cut where [`scope_of`] cuts, by the same causes: a crate
 /// with no names input, a record not in the store or not in place, or the crate the tests plant
 /// unreadable (`planted`, engine_records.rs `plant_unreadable`), read as [`scope_of`] reads it.
 /// A record that is present and does not open is found at its first question and refuses the
 /// bodies of the job that asked it (front_load.rs `StoreLoad::refused`). `Err`: the store's
 /// snapshot refused a lookup, named with the member (rule 3).
-/// COST: per scope crate one names-input lookup and one snapshot lookup; before, each scope
-/// crate's record was opened and its names section checked whole (tempo: 773 records, 823 MB).
+#[expect(clippy::too_many_arguments, reason = "the scope builder's handles, each named")]
 fn scope_by_need<'r>(
     names: NamesInputs<'_, '_>,
     list: &blaze_world::crate_list::CrateList<'static>,
@@ -1782,12 +1794,13 @@ fn scope_by_need<'r>(
     own_records: crate::front_load::CrateRecords<'r>,
     snapshot: &StoreSnapshot,
     planted: Option<&'static str>,
+    defer_inputs: bool,
     heap: &'static blaze_own::Heap,
 ) -> Result<Result<MadeScope<'r>, ScopeRefusal>, CliError> {
     let g = heap.alloc();
     let name_at = |at: usize| blaze_drive::key::crate_scope_name(&list.key(at));
     let krate = CrateGraph::name(list, at);
-    if names.input_of(name_at(at)).is_none() {
+    if !defer_inputs && names.input_of(name_at(at)).is_none() {
         return Ok(Err(ScopeRefusal::NoNamesRecord { krate, at, failed: names.failed(name_at(at)) }));
     }
     let no_core = blaze_scope::names_record::NamesRecord::open(own_records.names_proof).crate_root().head().no_core;
@@ -1797,34 +1810,50 @@ fn scope_by_need<'r>(
     };
     let mut scope = Scope { own_records, crates: Vec::new_in(Global), lang: Vec::new_in(Global), scope: Vec::new_in(Global), cut: None };
     scope.lang.extend(checked.lang_places());
-    let mut rest: Vec<crate::front_load::Unopened, Global> = Vec::new_in(Global);
+    let mut rest: Vec<crate::front_load::Unopened, Global> = Vec::with_capacity_in(checked.readers().len().saturating_sub(1), Global);
     let mut whole = true;
     for one in checked.crates() {
-        let Some(input) = names.input_of(name_at(one)) else {
-            whole = false;
-            scope.cut = Some((one, CutWhy::NoNamesRecord { failed: names.failed(name_at(one)) }));
-            break;
-        };
+        let scope_name = name_at(one);
         let name = CrateGraph::name(list, one);
         if one == at {
             // The owner, first of `check_scope_in`'s crates: reader crate 0, opened.
             scope.crates.push(Crate { records: own_records, name, package: list.shown_from(one), world_at: one });
-        } else {
-            let unopened = crate::front_load::Unopened { input, key: list.key(one), world_at: one, name, package: list.shown_from(one) };
-            let present: Result<(), crate::engine_records::ReadError> = if planted == Some(name) {
-                Err(crate::front_load::LoadError::NotInStore { name: input.name, at: input.at }.into())
-            } else {
-                crate::front_load::present(snapshot, &unopened).map_err(|error| CliError::Text {
-                    what: crate::engine_head_notes::leak(g, format_args!("`{}`: its check scope's crate `{name}` does not read from the store's snapshot: {error:?} (front_load.rs `present`)", list.root(at))),
-                })?
-            };
-            if let Err(error) = present {
-                whole = false;
-                scope.cut = Some((one, CutWhy::Unreadable(error)));
-                break;
-            }
-            rest.push(unopened);
+            scope.scope.push(scope_name);
+            continue;
         }
+        if defer_inputs {
+            // Standing member below its heads on the ready driver: its scope stood whole at
+            // `today.made_at` and no `CrateScope` ran this request. Defer `names.input_of` and
+            // `snapshot.get` to the first actual question of `one` (`LazyScopeRecords`).
+            rest.push(crate::front_load::Unopened {
+                input: Input { name: scope_name, at: Key::default(), out: ABSENT },
+                key: list.key(one),
+                world_at: one,
+                name,
+                package: list.shown_from(one),
+            });
+            scope.scope.push(scope_name);
+            continue;
+        }
+        let Some(input) = names.input_of(scope_name) else {
+            whole = false;
+            scope.cut = Some((one, CutWhy::NoNamesRecord { failed: names.failed(scope_name) }));
+            break;
+        };
+        let unopened = crate::front_load::Unopened { input, key: list.key(one), world_at: one, name, package: list.shown_from(one) };
+        let present: Result<(), crate::engine_records::ReadError> = if planted == Some(name) {
+            Err(crate::front_load::LoadError::NotInStore { name: input.name, at: input.at }.into())
+        } else {
+            crate::front_load::present(snapshot, &unopened).map_err(|error| CliError::Text {
+                what: crate::engine_head_notes::leak(g, format_args!("`{}`: its check scope's crate `{name}` does not read from the store's snapshot: {error:?} (front_load.rs `present`)", list.root(at))),
+            })?
+        };
+        if let Err(error) = present {
+            whole = false;
+            scope.cut = Some((one, CutWhy::Unreadable(error)));
+            break;
+        }
+        rest.push(unopened);
         scope.scope.push(input.name);
     }
     scope.scope.sort_unstable();
@@ -2389,10 +2418,58 @@ pub(crate) struct Prepared<'s, 'f, 'r> {
     clock: &'s Clock,
     listings: &'s crate::engine_heads::Listings,
     seeds: Option<&'s crate::engine_seeds::RequestTable<'s>>,
+    names_keys: Option<crate::engine_names::NamesKeys<'s>>,
     procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
     heap: &'static blaze_own::Heap,
     keep_scratch: bool,
     plants: RowPlants,
+}
+
+/// Scope records opened by need, resolving each crate's `CrateScope` input lazily on its first
+/// actual question when [`scope_by_need`] deferred upfront lookups for a standing member.
+pub(crate) struct LazyScopeRecords<'r> {
+    inner: crate::front_load::ScopeRecords<'r>,
+    names: Option<crate::engine_names::NamesKeys<'r>>,
+    resolved: blaze_own::Vec<bstd::sync::PublishOnce<Result<Input, &'static str>>, SharedAlloc<'static>>,
+    heap: &'static blaze_own::Heap,
+}
+
+impl<'r> LazyScopeRecords<'r> {
+    fn new(snapshot: &'r StoreSnapshot, crates: usize, names: Option<crate::engine_names::NamesKeys<'r>>, heap: &'static blaze_own::Heap) -> LazyScopeRecords<'r> {
+        let resolved = blaze_own::Vec::from_iter_in((0..crates).map(|_| bstd::sync::PublishOnce::new()), heap.shared());
+        LazyScopeRecords { inner: crate::front_load::ScopeRecords::new(snapshot, crates, heap), names, resolved, heap }
+    }
+
+    pub(crate) fn counts(&self) -> crate::front_load::ByNeedCounts {
+        self.inner.counts()
+    }
+}
+
+impl crate::front_load::OpenByNeed for LazyScopeRecords<'_> {
+    fn open<'s>(&'s self, one: &crate::front_load::Unopened) -> Result<crate::front_load::CrateRecords<'s>, &'static str> {
+        if one.input.at != Key::default() {
+            return self.inner.open(one);
+        }
+        let Some(slot) = self.resolved.get(one.world_at) else {
+            return Err("its place is past the request's crate list (engine_bodies.rs `LazyScopeRecords`)");
+        };
+        let got = match slot.get() {
+            Some(got) => *got,
+            None => {
+                let resolved_input = match self.names {
+                    None => Err("its crate's names inputs were not given to resolve a lazy scope crate (engine_bodies.rs `LazyScopeRecords`)"),
+                    Some(keys) => keys.input_of(one.input.name).ok_or_else(|| {
+                        crate::engine_head_notes::leak(self.heap.alloc(), format_args!("crate `{}` has no names record this command (engine_bodies.rs `LazyScopeRecords`)", one.name))
+                    }),
+                };
+                let _ = slot.set(resolved_input);
+                slot.get().copied().unwrap_or(resolved_input)
+            }
+        };
+        let input = got?;
+        let resolved = crate::front_load::Unopened { input, ..*one };
+        self.inner.open(&resolved)
+    }
 }
 
 /// One entry's check by [`BodyRunner::run_body`]: its row in `out` (made or failed, by
@@ -2509,6 +2586,15 @@ impl<'v, 'f, 'r> BodyRunner<'v, 'f, 'r> {
         }
     }
 
+    /// The member's own `CrateScope` cell (`Stage::Names`) for `body`: what `BodyKind::run`
+    /// peeks before opening scope crates or typechecking so a body scheduled in the same tick as
+    /// `FileItems` (`Stage::Outlines`) parks in O(1) instead of running twice.
+    pub(crate) fn own_scope_cell(&self, body: Name) -> Option<CellId> {
+        let one = self.ones.iter().find(|one| one.task.planned.name == body)?;
+        let group = self.groups.get(usize::try_from(one.group).ok()?)?;
+        Some(CellId { of: group.own, cell: WHOLE })
+    }
+
     /// One entered body's check (its whole entry, never sliced) over today's digests `reads`,
     /// on the calling thread, from any worker (the `Ready` driver, D187). A task this setup
     /// did not leave to check is refused, naming it.
@@ -2571,9 +2657,9 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
     /// it (its records are borrowed from the snapshot this setup holds), its counts read after
     /// they end ([`BodiesStage::add_by_need`]). One a request: a crate is opened once whichever
     /// job asks it first (the floor: the crates the checks ask, each once).
-    pub(crate) fn scope_records(&self) -> crate::front_load::ScopeRecords<'_> {
+    pub(crate) fn scope_records(&self) -> LazyScopeRecords<'_> {
         let crates = self.found.as_ref().and_then(|found| found.groups.first()).map_or(0, |group| CrateGraph::len(&group.list));
-        crate::front_load::ScopeRecords::new(self.snapshot.as_ref(), crates, self.heap)
+        LazyScopeRecords::new(self.snapshot.as_ref(), crates, self.names_keys, self.heap)
     }
 
     /// The `Ready` driver's bodies joined into `stage` (D187): the runs its `BodyCheck` kind
@@ -3250,6 +3336,7 @@ impl<'f> BodiesStage<'f> {
         // entry's path and label, so the entries cover the slices `run_phase` cuts.
         handles.board.bodies_mem.prepare(ones, handles.outlined, heap.shared())?;
         let procs = handles.names.and_then(|inputs| inputs.stage().names.as_ref()).and_then(|names| names.procs());
+        let names_keys = handles.names.map(|inputs| inputs.keys());
         Ok(Prepared {
             snapshot: snapshot_owner,
             expansion_keys,
@@ -3262,6 +3349,7 @@ impl<'f> BodiesStage<'f> {
             clock: handles.clock,
             listings,
             seeds: request_heads,
+            names_keys,
             procs,
             heap,
             keep_scratch: planted_keep_scratch(),
@@ -3654,7 +3742,7 @@ impl<'f> BodiesStage<'f> {
         // The setup's reader of scope crates made by need (`scope_by_need`): a member's row and
         // listing ask its own crate, opened already; one past it is opened here only if asked.
         // The runs read through the request's memo instead (`Prepared::scope_records`).
-        let setup_records = crate::front_load::ScopeRecords::new(snapshot, CrateGraph::len(&list), heap);
+        let setup_records = LazyScopeRecords::new(snapshot, CrateGraph::len(&list), Some(names.keys()), heap);
         let planted_unreadable = self.unreadable;
         // The trees are packs mapped from the shelf and the sources store (body_types.rs
         // `open_trees`): a refusal there is of the machine's files, not of a cell (a pack missing
@@ -3788,9 +3876,9 @@ impl<'f> BodiesStage<'f> {
         entered.sort_unstable();
         // The holders' views of the body at hand, scratch for `Reach::view_in`.
         let mut views: Vec<blaze_drive::view::ViewKey, blaze_own::Alloc<'static>> = Vec::new_in(g);
-        // Each outline's cfg cuts (engine_plan_cfg.rs `PlanCuts`), made at the first member
-        // visited and read by every walk and entry after it.
-        let mut plan_cuts: Option<crate::engine_plan_cfg::PlanCuts<'static>> = None;
+        // Each outline's cfg cuts (engine_plan_cfg.rs `PlanCuts`), computed lazily per file on
+        // first ask so unvisited files' outlines are never parsed or lexed.
+        let mut plan_cuts: Option<crate::engine_plan_cfg::PlanCuts<'_, '_, 'static>> = None;
         let mut below: Vec<(usize, u32), blaze_own::Alloc<'static>> = Vec::new_in(g);
         let mut below_at = 0usize;
         // The units visited at need, to check their claims once every member is done.
@@ -4030,16 +4118,27 @@ impl<'f> BodiesStage<'f> {
             };
             let probed = snapshot.get(row_key).map(|got| got.map(|bytes| crate::engine_member_rows::open(bytes, g)));
             tally.parts.files_ns = tally.parts.files_ns.saturating_add(lap(handles.clock, &mut member_mark));
+            // Standing member below its heads on the ready driver with no `CrateScope` entered
+            // this request and no planted unreadable crate: its scope stood whole in the members
+            // record, so defer dependency `names.input_of` and `present` checks to first ask.
+            let defer_scope_inputs = again.is_some()
+                && names.stood_on().is_some()
+                && names.stage().results.is_empty()
+                && self.grains_entered.as_deref().unwrap_or(&[]).iter().all(|name| name.kind != Kind::CrateScope)
+                && planted_unreadable.is_none();
             // D168 (2) (c): the member's check scope, at need ([`OpenWorld`]): its bodies are
             // owed, or its row must be made (not stored, or its bytes do not open), or a crate of
             // its scope has no names input (the refusal `scope_of` words). Else nothing of its
             // scope is opened: no body of it runs, and its row is the stored one.
-            let needs_scope = !O::BY_NEED || !owed_files.is_empty() || !matches!(probed, Ok(Some(Ok(_)))) || !scope_inputs_whole(names, &list, member, &own_records, g);
+            let needs_scope = !O::BY_NEED
+                || !owed_files.is_empty()
+                || !matches!(probed, Ok(Some(Ok(_))))
+                || (!defer_scope_inputs && !scope_inputs_whole(names, &list, member, &own_records, g));
             tally.scopes_needed = tally.scopes_needed.saturating_add(u32::from(needs_scope));
             if needs_scope && whole_scope.is_none() {
                 // Piece C (a): made by need, the member's own record the one opened; every other
-                // scope crate's opened at a body's first question of it (`ScopeRecords`).
-                match scope_by_need(names, &list, member, own_records, snapshot, planted_unreadable, heap)? {
+                // scope crate's opened at a body's first question of it (`LazyScopeRecords`).
+                match scope_by_need(names, &list, member, own_records, snapshot, planted_unreadable, defer_scope_inputs, heap)? {
                     Ok(made) => whole_scope = Some(made),
                     Err(cause) => {
                         // As the oracle arm refuses it: before any claim or head subject of it.
@@ -5604,6 +5703,38 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
         Err(error) => return refuse(run, leak(g, format_args!("its member's environment did not copy into the run: {error:?} (blaze-scope crate_env.rs `EnvLent::copy_in`)")), scope, out, ran, run_out, alloc),
     };
     let files = ((shared.packs, shared.fs), Some(shared.outlined));
+    // Pre-open the scope's lang crates (`core`, `alloc`, `std`, `bstd`) concurrently before
+    // `lang_index` asks them serially on one thread. `run_stretch` unconditionally reads every
+    // crate in `group.lang` below (`each_lang`), so this opens zero crates beyond the floor.
+    if let GroupCrates::ByNeed { rest, .. } = &group.crates {
+        let mut to_open: [Option<&crate::front_load::Unopened>; 8] = [None; 8];
+        let mut count = 0usize;
+        for &place in group.lang.iter() {
+            if place > 0
+                && let Some(unopened) = rest.get(place - 1)
+                && let Some(slot) = to_open.get_mut(count)
+            {
+                *slot = Some(unopened);
+                count += 1;
+            }
+        }
+        if count >= 2 {
+            let pre_cx = cx.span("engine: pre-open lang crates");
+            let scope = pre_cx.scope();
+            let by_need = shared.by_need;
+            let mut handles = blaze_own::Vec::with_capacity_in(count, pre_cx.frame());
+            for unopened in to_open.iter().take(count).flatten().copied() {
+                handles.push(scope.may_overlap("engine: open lang crate", 1 << 20, move |_cx: &Cx| {
+                    let _ = by_need.open(unopened);
+                    Ok::<_, Infallible>(())
+                }));
+            }
+            for handle in handles.into_iter() {
+                let _ = handle.join(&pre_cx);
+            }
+            let _ = scope.join(&pre_cx);
+        }
+    }
     // Its scope crates past the member opened by need, at their first question, through the
     // request's memo (`shared.by_need`, piece C (a)); the oracle arm's all opened at the setup.
     let Ok(opened) = crate::run_names::names_records_over(cx, shared.root, group.crates.scope(shared.by_need), files, shared.corrected, shared.procs, std::vec::Vec::new_in(Global), env, Some(shared.snapshot), Some(shared.expansion_keys), frame, g) else {

@@ -2392,10 +2392,7 @@ pub(super) fn lower<'n, S: super::source::NamesSource<'n>>(names: S, key: LibKey
     // why (`source::SourceError::NoRecord`), and the item has no text to lower.
     let mut cfg = CrateCfg(names.cfg_atoms(krate).ok_or(HeadError::NoText(key))?);
     let edition = names.edition_of(krate).ok_or(HeadError::NoText(key))?;
-    let extensions = names
-        .file_text(krate, 0)
-        .map(blaze_file_items::detect_blaze_extensions)
-        .unwrap_or(parser::Extensions::NONE);
+    let extensions = names.blaze_extensions(krate);
     HeadLowerings::starting(names);
     blaze_lower::lower_signature_with_extensions(text, edition, extensions, &mut cfg, Alloc::global()).map_err(|_| HeadError::Cfg(key))
 }

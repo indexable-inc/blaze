@@ -32,11 +32,16 @@
 
 use blaze_drive::{Kind, Locate};
 use blaze_expand::{Delim, Edition, TokenKind, Tri, cfg_predicate_tri, lex};
+use blaze_ids::{ContentId, Hasher};
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_surface::{AttrKind, FileItemsView, Item};
 use blaze_world::crate_list::CrateList;
 
 use crate::engine_tasks::Outlined;
+
+/// The domain of an entry's cumulative `#[cfg]` / `#[cfg_attr]` attribute chain hash
+/// (file `#![cfg]`s -> enclosing ancestors' `#[cfg]`s -> entry's own `#[cfg]`s).
+const CFG_CHAIN_DOMAIN: &str = "blaze-cli engine body cfg chain 1";
 
 /// What plan time knows of the `test` atom of crate list row `at`'s cfg set (the module doc).
 pub(crate) fn test_atom(list: &CrateList<'_>, at: usize) -> Tri {
@@ -119,11 +124,37 @@ fn own_cut(view: &FileItemsView<'_>, item: Option<&Item>, edition: Edition, g: A
     view.cfgs(item).fold(Cut::HOLDS, |cut, (kind, written)| cut.and(attr_cut(kind, written, edition, g)))
 }
 
-/// One outline's cuts: its file's own, and each entry's whose chain cuts anything, by the
-/// entry's first byte (what a part's `place` is: blaze-cli work.rs), sorted.
+/// Folds the `#[cfg]` / `#[cfg_attr]` attributes of `item` (or the file's `#![cfg]`s when `None`)
+/// onto `above`. Returns `None` when neither `above` nor `item` has any cfg attribute.
+fn fold_cfgs(above: Option<ContentId>, view: &FileItemsView<'_>, item: Option<&Item>) -> Option<ContentId> {
+    let mut iter = view.cfgs(item);
+    let first = iter.next();
+    match (above, first) {
+        (None, None) => None,
+        (Some(prev), None) => Some(prev),
+        (prev, Some((kind, written))) => {
+            let mut h = Hasher::new(CFG_CHAIN_DOMAIN);
+            match prev {
+                Some(id) => h.update(&[1]).update(&id.0),
+                None => h.update(&[0]),
+            };
+            let tag = |kind: AttrKind| u8::from(kind == AttrKind::CfgAttr);
+            h.update(&[tag(kind)]).part(written.as_bytes());
+            for (kind, written) in iter {
+                h.update(&[tag(kind)]).part(written.as_bytes());
+            }
+            Some(h.finish())
+        }
+    }
+}
+
+/// One outline's cuts: its file's own, each entry's whose chain cuts anything, and each entry's
+/// cumulative cfg-attribute chain digest (file + enclosing ancestors + entry), by the entry's
+/// first byte (what a part's `place` is: blaze-cli work.rs), sorted.
 pub(crate) struct FileCuts<'g> {
     pub(crate) own: Cut,
     at: AVec<'g, (u32, Cut)>,
+    cfgs: AVec<'g, (u32, ContentId)>,
 }
 
 impl FileCuts<'_> {
@@ -135,6 +166,16 @@ impl FileCuts<'_> {
         match past.checked_sub(1).and_then(|at| self.at.get(at)) {
             Some((start, cut)) if *start == place => *cut,
             _ => Cut::HOLDS,
+        }
+    }
+
+    /// The cumulative cfg-attribute digest of the deepest entry starting at `place`, or `None`
+    /// when neither the file, any enclosing ancestor, nor the entry carries a `#[cfg]` / `#[cfg_attr]`.
+    pub(crate) fn cfg_of(&self, place: u32) -> Option<ContentId> {
+        let past = self.cfgs.partition_point(|one| one.0 <= place);
+        match past.checked_sub(1).and_then(|at| self.cfgs.get(at)) {
+            Some((start, digest)) if *start == place => Some(*digest),
+            _ => None,
         }
     }
 }
@@ -154,15 +195,21 @@ pub(crate) fn file_cuts<'g>(one: &Outlined<'_>, g: Alloc<'g>) -> Option<FileCuts
     let view = FileItemsView::read(payload).unwrap_or_else(|why| panic!("outline {:?} lists parts and its payload is no FileItems record: {why:?} (engine_plan_cfg.rs `file_cuts`)", one.name));
     let edition = Edition::from_byte(one.edition).unwrap_or_else(|| panic!("outline {:?} has an edition byte that is no edition (engine_plan_cfg.rs `file_cuts`)", one.name));
     let own = own_cut(&view, None, edition, g);
+    let own_cfg = fold_cfgs(None, &view, None);
     // Each entry's chain, in the file's order: a parent comes before its entries.
-    let mut chain: AVec<'_, Cut> = Vec::with_capacity_in(view.len(), g);
+    let mut chain: AVec<'_, (Cut, Option<ContentId>)> = Vec::with_capacity_in(view.len(), g);
     let mut at: AVec<'g, (u32, Cut)> = Vec::new_in(g);
+    let mut cfgs: AVec<'g, (u32, ContentId)> = Vec::new_in(g);
     for entry in view.items() {
-        let above = entry.parent.and_then(|parent| chain.get(parent.at()).copied()).unwrap_or(own);
+        let (above, above_cfg) = entry.parent.and_then(|parent| chain.get(parent.at()).copied()).unwrap_or((own, own_cfg));
         let cut = above.and(own_cut(&view, Some(&entry.item), edition, g));
-        chain.push(cut);
+        let cfg = fold_cfgs(above_cfg, &view, Some(&entry.item));
+        chain.push((cut, cfg));
         if cut != Cut::HOLDS {
             at.push((entry.range.start, cut));
+        }
+        if let Some(digest) = cfg {
+            cfgs.push((entry.range.start, digest));
         }
     }
     // Entries are in the file's order, each before those inside it (which start at or after
@@ -170,7 +217,8 @@ pub(crate) fn file_cuts<'g>(one: &Outlined<'_>, g: Alloc<'g>) -> Option<FileCuts
     // and of one start the deepest is last, as [`FileCuts::of`] reads them. A view that breaks
     // it is the outline's fault, named (rule 20), never a cut read at the wrong entry.
     assert!(at.is_sorted_by_key(|one| one.0), "outline {:?} lists an entry that starts before the one above it (engine_plan_cfg.rs `file_cuts`)", one.name);
-    Some(FileCuts { own, at })
+    assert!(cfgs.is_sorted_by_key(|one| one.0), "outline {:?} lists a cfg entry that starts before the one above it (engine_plan_cfg.rs `file_cuts`)", one.name);
+    Some(FileCuts { own, at, cfgs })
 }
 
 /// The cut of the body `part` of the outline whose cuts are `cuts` ([`file_cuts`]):
@@ -179,24 +227,34 @@ pub(crate) fn part_cut(cuts: Option<&FileCuts<'_>>, part: &blaze_drive::record::
     cuts.map_or(Cut::HOLDS, |cuts| cuts.of(part.place))
 }
 
-/// Each outline's cuts ([`file_cuts`]), by its index in the slice they were made from: made
-/// once for a walk of many module trees over one slice (engine_body_plan.rs `Reach::walk`,
-/// engine_bodies.rs `groups`), so no file's record is read once a tree (rule 77).
-pub(crate) struct PlanCuts<'g> {
-    files: AVec<'g, Option<FileCuts<'g>>>,
+/// The cumulative cfg-attribute digest of the body `part` of the outline whose cuts are `cuts`
+/// ([`file_cuts`]): `None` when neither the file, any enclosing ancestor, nor the entry has a
+/// `#[cfg]` / `#[cfg_attr]`.
+pub(crate) fn part_cfg(cuts: Option<&FileCuts<'_>>, part: &blaze_drive::record::Part) -> Option<ContentId> {
+    cuts.and_then(|cuts| cuts.cfg_of(part.place))
 }
 
-impl<'g> PlanCuts<'g> {
-    /// The cuts of every one of `outlined`, in `g`.
-    pub(crate) fn of(outlined: &[Outlined<'_>], g: Alloc<'g>) -> PlanCuts<'g> {
-        let mut files: AVec<'g, Option<FileCuts<'g>>> = Vec::with_capacity_in(outlined.len(), g);
-        files.extend(outlined.iter().map(|one| file_cuts(one, g)));
-        PlanCuts { files }
+/// Each outline's cuts ([`file_cuts`]), computed lazily by index on first ask: made once for a
+/// walk of many module trees over one slice (engine_body_plan.rs `Reach::walk`, engine_bodies.rs
+/// `groups`), so no unvisited file's outline payload is read or lexed (rule 77).
+pub(crate) struct PlanCuts<'o, 'h, 'g> {
+    outlined: &'o [Outlined<'h>],
+    files: AVec<'g, core::cell::OnceCell<Option<FileCuts<'g>>>>,
+    alloc: Alloc<'g>,
+}
+
+impl<'o, 'h, 'g> PlanCuts<'o, 'h, 'g> {
+    /// A lazy cut table over `outlined`, in `g`: allocates only empty slots until a file is asked.
+    pub(crate) fn of(outlined: &'o [Outlined<'h>], g: Alloc<'g>) -> PlanCuts<'o, 'h, 'g> {
+        let mut files: AVec<'g, core::cell::OnceCell<Option<FileCuts<'g>>>> = Vec::with_capacity_in(outlined.len(), g);
+        files.extend((0..outlined.len()).map(|_| core::cell::OnceCell::new()));
+        PlanCuts { outlined, files, alloc: g }
     }
 
     /// The cuts of the outline at `at` in the slice they were made from; `None` for one with
     /// none ([`file_cuts`]).
     pub(crate) fn file(&self, at: usize) -> Option<&FileCuts<'g>> {
-        self.files.get(at).and_then(Option::as_ref)
+        let slot = self.files.get(at)?;
+        slot.get_or_init(|| self.outlined.get(at).and_then(|one| file_cuts(one, self.alloc))).as_ref()
     }
 }

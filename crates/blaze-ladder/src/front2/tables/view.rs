@@ -230,6 +230,9 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
 
     fn cfg_atoms(self, krate: usize) -> Option<&'n [(&'n str, Option<&'n str>)]> {
         self.root(krate);
+        if let Some(prefix) = self.prefix(krate) {
+            self.cell(NameCell::CfgAtoms { krate: prefix });
+        }
         self.records.cfg_atoms(krate)
     }
 
@@ -251,6 +254,13 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
     fn has_feature(self, krate: usize, name: &str) -> Option<bool> {
         self.root(krate);
         self.records.has_feature(krate, name)
+    }
+
+    fn blaze_extensions(self, krate: usize) -> parser::Extensions {
+        if let Some(prefix) = self.prefix(krate) {
+            self.cell(NameCell::Extensions { krate: prefix });
+        }
+        self.records.blaze_extensions(krate)
     }
 
     /// Each crate whose link facts (`proc_macro`, extern prelude, `Origin::ExternCrate` bindings)

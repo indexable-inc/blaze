@@ -592,3 +592,45 @@ fn impl_rows_and_files_cells_stand_on_private_fn_and_move_on_own_change() {
     assert_eq!(lookup(&with_file, impl_cell), base_impl, "adding an empty module file must not move ImplRows");
     assert_ne!(lookup(&with_file, files_cell), base_files, "adding a module file must move Files");
 }
+
+#[test]
+fn extensions_and_cfg_atoms_cells_stand_on_private_fn_and_move_on_own_change() {
+    const BASE: &str = "#![no_core]\npub fn a() {}\n";
+    const WITH_PRIV_FN: &str = "#![no_core]\npub fn a() {}\nfn __priv() {}\n";
+    const WITH_UNIQ: &str = "#![no_core]\n#![blaze::uniq]\npub fn a() {}\n";
+    const WITH_UNIQ_RECORDS: &str = "#![no_core]\n#![blaze::uniq]\n#![blaze::records]\npub fn a() {}\n";
+
+    let lookup = |src: &'static str, cell_of: &dyn Fn([u8; 8]) -> NameCell| -> Option<ContentId> {
+        let solved = super::items_record::solve_one(src, None);
+        let bump = super::SyncFrame::leaked();
+        let g = bump.alloc();
+        let names_bytes = aligned(&encode(solved, g).expect("encode names"), bump);
+        let items_bytes = aligned(&items_encode(solved, g).expect("encode items"), bump);
+        let wholes = [(Section::Items, items_bytes)];
+        let tbl = crate::names_cells::crate_table(solved, names_bytes, items_bytes, &wholes, bump).expect("crate_table");
+        let cell = cell_of(solved.key.prefix());
+        let table_val = seen_in(&tbl, cell.key()).expect("seen_in");
+        let record = NamesRecord::open(Verified::check(names_bytes).expect("verify names"));
+        let mut items = crate::items_record::ItemsRecord::open(items_bytes, g).expect("open items");
+        items.use_solved_texts(solved, bump);
+        let read = |of: TextOf<'_>| -> Option<&str> {
+            match of {
+                TextOf::File { index: 0, .. } => Some(src),
+                _ => None,
+            }
+        };
+        let rec_val = seen_by_record(&record, Some((&items, &read)), &wholes, cell).expect("seen_by_record");
+        assert_eq!(table_val, rec_val, "crate_table and seen_by_record disagree on {cell:?}");
+        table_val
+    };
+
+    assert_eq!(lookup(BASE, &|krate| NameCell::Extensions { krate }), None, "plain crate has absent Extensions cell");
+    assert_eq!(lookup(WITH_PRIV_FN, &|krate| NameCell::Extensions { krate }), None, "adding private fn keeps Extensions absent");
+    let base_cfg = lookup(BASE, &|krate| NameCell::CfgAtoms { krate });
+    assert_eq!(lookup(WITH_PRIV_FN, &|krate| NameCell::CfgAtoms { krate }), base_cfg, "adding private fn must not move CfgAtoms");
+
+    let uniq_ext = lookup(WITH_UNIQ, &|krate| NameCell::Extensions { krate });
+    assert!(uniq_ext.is_some(), "#![blaze::uniq] defines Extensions cell");
+    let both_ext = lookup(WITH_UNIQ_RECORDS, &|krate| NameCell::Extensions { krate });
+    assert!(both_ext.is_some() && both_ext != uniq_ext, "adding #![blaze::records] moves Extensions cell");
+}
