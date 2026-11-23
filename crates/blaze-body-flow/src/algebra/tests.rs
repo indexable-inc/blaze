@@ -1362,3 +1362,220 @@ fn real_typeck_body_lower_algebra_fma_body_build_native_lir_pipeline() {
     // sqrt(|-7.0| + 3.0^2) = sqrt(7 + 9) = 4.0
     assert!(close(eval_lir(vsa, -7.0, 3.0), 4.0, 1e-12));
 }
+
+#[test]
+fn struct_vec3_ad_aegraph_and_native_aarch64_x86_64_machine_code_emission() {
+    use blaze_body::{AggregateKind, Value};
+    use blaze_build::intrinsics::target::{
+        Target as IntrTarget,
+        float::{FloatCall, FloatFn, Shape},
+    };
+    use blaze_build::layout::{LayoutFacts, Missing, ReprAttrs, ValidRange};
+    use blaze_build::{Abi, Adts, Intrinsic, OverflowChecks, Panic, Subst};
+    use blaze_emit::{Code, Isa, Os, emit};
+    use blaze_lir::eval::{Outcome, Val, run_in};
+    use blaze_lir::simplify::aegraph_optimize;
+    use blaze_typeck::{Adt, FloatTy, PNode, PortableTys};
+
+    // 1. Build a MIR body operating on a plain Rust struct `Vec3 { x: f64, y: f64, z: f64 }`:
+    //    fn energy(v: Vec3) -> f64 {
+    //        let w = Vec3 { x: v.x + 1.0, y: v.y, z: v.z };
+    //        0.5 * (w.x * w.x + w.y * w.y + w.z * w.z) + w.x * w.y
+    //    }
+    //    At v = (2.0, 3.0, 4.0) => w = (3.0, 3.0, 4.0):
+    //      energy = 0.5 * (9 + 9 + 16) + 9 = 17 + 9 = 26.0
+    //      ∂/∂x   = w.x + w.y = 6.0
+    //      ∂/∂y   = w.y + w.x = 6.0
+    //      ∂/∂z   = w.z       = 4.0
+    let mut from = PortableTys::new_in(heap());
+    let f64_ty = from.intern(PNode::Float(FloatTy::F64)).unwrap();
+    let vec3_ty = PTy(10); // opaque struct handle in MIR lifting test
+    let arr4_ty = PTy(11);
+
+    let mir = {
+        let mut b = BodyBuilder::new_in(heap());
+        let ret = b.new_local(LocalDecl { ty: f64_ty, kind: LocalKind::Return, mutbl: Mutbl::Mut });
+        let lv = b.new_local(LocalDecl { ty: vec3_ty, kind: LocalKind::Arg(0), mutbl: Mutbl::Not });
+        let lw = b.new_local(LocalDecl { ty: vec3_ty, kind: LocalKind::Temp(MirExprId(0), Role::Value), mutbl: Mutbl::Not });
+        let lx1 = b.new_local(LocalDecl { ty: f64_ty, kind: LocalKind::Temp(MirExprId(1), Role::Value), mutbl: Mutbl::Not });
+        let lwx2 = b.new_local(LocalDecl { ty: f64_ty, kind: LocalKind::Temp(MirExprId(2), Role::Value), mutbl: Mutbl::Not });
+        let lwy2 = b.new_local(LocalDecl { ty: f64_ty, kind: LocalKind::Temp(MirExprId(3), Role::Value), mutbl: Mutbl::Not });
+        let lwz2 = b.new_local(LocalDecl { ty: f64_ty, kind: LocalKind::Temp(MirExprId(4), Role::Value), mutbl: Mutbl::Not });
+        let ls1 = b.new_local(LocalDecl { ty: f64_ty, kind: LocalKind::Temp(MirExprId(5), Role::Value), mutbl: Mutbl::Not });
+        let ls2 = b.new_local(LocalDecl { ty: f64_ty, kind: LocalKind::Temp(MirExprId(6), Role::Value), mutbl: Mutbl::Not });
+        let lhalf = b.new_local(LocalDecl { ty: f64_ty, kind: LocalKind::Temp(MirExprId(7), Role::Value), mutbl: Mutbl::Not });
+        let lxy = b.new_local(LocalDecl { ty: f64_ty, kind: LocalKind::Temp(MirExprId(8), Role::Value), mutbl: Mutbl::Not });
+        let bb0 = b.new_block(BlockKind::Normal);
+        let span = Span { lo: 0, hi: 0 };
+        b.start(bb0);
+
+        let pv = b.local_place(lv);
+        let pv_x = b.project(pv, Proj::Field { index: 0, ty: f64_ty });
+        let pv_y = b.project(pv, Proj::Field { index: 1, ty: f64_ty });
+        let pv_z = b.project(pv, Proj::Field { index: 2, ty: f64_ty });
+        let c1 = b.new_const(ConstDecl { kind: ConstKind::Scalar { bits: u128::from(1.0_f64.to_bits()) }, ty: f64_ty });
+        let px1 = b.local_place(lx1);
+        b.assign(px1, Value::Binary { op: BinOp::Add, lhs: Operand::Copy(pv_x), rhs: Operand::Const(c1) }, span);
+
+        // Construct `w = Vec3 { x: v.x + 1.0, y: v.y, z: v.z }` via `AggregateKind::Adt(0)`.
+        let pw = b.local_place(lw);
+        let w_ops = b.operands(&[Operand::Copy(px1), Operand::Copy(pv_y), Operand::Copy(pv_z)]);
+        b.assign(pw, Value::Aggregate { kind: AggregateKind::Adt(0), ty: vec3_ty, operands: w_ops }, span);
+
+        let pw_x = b.project(pw, Proj::Field { index: 0, ty: f64_ty });
+        let pw_y = b.project(pw, Proj::Field { index: 1, ty: f64_ty });
+        let pw_z = b.project(pw, Proj::Field { index: 2, ty: f64_ty });
+        let pwx2 = b.local_place(lwx2);
+        let pwy2 = b.local_place(lwy2);
+        let pwz2 = b.local_place(lwz2);
+        let ps1 = b.local_place(ls1);
+        let ps2 = b.local_place(ls2);
+        let phalf = b.local_place(lhalf);
+        let pxy = b.local_place(lxy);
+        let pret = b.local_place(ret);
+
+        b.assign(pwx2, Value::Binary { op: BinOp::Mul, lhs: Operand::Copy(pw_x), rhs: Operand::Copy(pw_x) }, span);
+        b.assign(pwy2, Value::Binary { op: BinOp::Mul, lhs: Operand::Copy(pw_y), rhs: Operand::Copy(pw_y) }, span);
+        b.assign(pwz2, Value::Binary { op: BinOp::Mul, lhs: Operand::Copy(pw_z), rhs: Operand::Copy(pw_z) }, span);
+        b.assign(ps1, Value::Binary { op: BinOp::Add, lhs: Operand::Copy(pwx2), rhs: Operand::Copy(pwy2) }, span);
+        b.assign(ps2, Value::Binary { op: BinOp::Add, lhs: Operand::Copy(ps1), rhs: Operand::Copy(pwz2) }, span);
+        let chalf = b.new_const(ConstDecl { kind: ConstKind::Scalar { bits: u128::from(0.5_f64.to_bits()) }, ty: f64_ty });
+        b.assign(phalf, Value::Binary { op: BinOp::Mul, lhs: Operand::Const(chalf), rhs: Operand::Copy(ps2) }, span);
+        b.assign(pxy, Value::Binary { op: BinOp::Mul, lhs: Operand::Copy(pw_x), rhs: Operand::Copy(pw_y) }, span);
+        b.assign(pret, Value::Binary { op: BinOp::Add, lhs: Operand::Copy(phalf), rhs: Operand::Copy(pxy) }, span);
+        b.terminate(StmtKind::Return, span);
+        b.finish().unwrap()
+    };
+    let v_mir = verify(&mir).unwrap();
+
+    // 2. Differentiate `Vec3` struct body via `BodyTransform::ValueAndGrad`!
+    let vg = run_body_transform(
+        v_mir,
+        BodyTransform::ValueAndGrad { array_ty: arr4_ty },
+        None,
+        &NoMathCalls,
+        &NoMathCalls,
+        heap(),
+    )
+    .expect("struct Vec3 ValueAndGrad succeeds");
+    let v_vg = verify(&vg).unwrap();
+    let out = eval_pure_multi_body(v_vg, &[2.0, 3.0, 4.0], &NoMathCalls, heap()).unwrap();
+    assert_eq!(out.len(), 4);
+    assert!(close(out[0], 26.0, 1e-12), "energy={}", out[0]);
+    assert!(close(out[1], 6.0, 1e-12), "d/dx={}", out[1]);
+    assert!(close(out[2], 6.0, 1e-12), "d/dy={}", out[2]);
+    assert!(close(out[3], 4.0, 1e-12), "d/dz={}", out[3]);
+
+    // 3. Compile ∂energy/∂x (which is `(x + 1) + y`) through:
+    //    `blaze_body_build` -> `blaze_lir::simplify::aegraph_optimize` -> `blaze_lir::eval`
+    //    -> `blaze_emit::emit` for BOTH AArch64 AND x86-64 native machine code!
+    const FMA_KEY: ItemKey = ItemKey(950);
+    struct FmaMath;
+    impl MathResolver for FmaMath {
+        fn classify(&self, _: Callee) -> Option<MathOp> { None }
+    }
+    impl MathEmitter for FmaMath {
+        fn callee_for(&self, op: MathOp) -> Option<Callee> {
+            (op == MathOp::Fma).then_some(Callee::Intrinsic { key: FMA_KEY, args: List::EMPTY })
+        }
+    }
+    struct EmitWorld;
+    impl LayoutFacts for EmitWorld {
+        fn adt(&self, _: ItemKey) -> Option<Adt<'_>> { None }
+        fn repr(&self, _: ItemKey) -> Result<ReprAttrs, Missing> { Ok(ReprAttrs::RUST) }
+        fn discriminant(&self, _: ItemKey, _: u32) -> Result<Option<i128>, Missing> { Ok(None) }
+        fn valid_range(&self, _: ItemKey) -> Result<ValidRange, Missing> { Ok(ValidRange::default()) }
+    }
+    impl Adts for EmitWorld {
+        fn adt(&self, _: ItemKey) -> Option<Adt<'_>> { None }
+        fn facts(&self) -> &dyn LayoutFacts { self }
+        fn panic(&self) -> Panic { Panic::Abort }
+        fn overflow_checks(&self) -> OverflowChecks { OverflowChecks::Off }
+        fn ub_checks(&self) -> blaze_build::UbChecks { blaze_build::UbChecks::Off }
+        fn drop_impl(&self, _: PTy, _: &mut PortableTys<'_>) -> Result<Option<ItemKey>, blaze_build::BuildError> { Ok(None) }
+        fn abi(&self, _: ItemKey) -> Option<Abi> { Some(Abi::Rust) }
+        fn lang_fn(&self, _: &str) -> Option<ItemKey> { None }
+        fn intrinsic(&self, item: ItemKey) -> Option<Intrinsic> {
+            (item == FMA_KEY).then_some(Intrinsic::Target(IntrTarget::Float(FloatCall {
+                func: FloatFn::Fma,
+                shape: Shape::F64,
+            })))
+        }
+    }
+
+    let dx_mir = run_body_transform(
+        v_mir,
+        BodyTransform::DiffWith {
+            arg: 0,
+            opts: SimplifyOpts { cost_model: CostModel::CpuFma, ..SimplifyOpts::default() },
+        },
+        None,
+        &FmaMath,
+        &FmaMath,
+        heap(),
+    )
+    .expect("struct Vec3 DiffWith CpuFma succeeds");
+    let v_dx = verify(&dx_mir).unwrap();
+
+    let mut ground = PortableTys::new_in(heap());
+    let mut subst = Subst { args: &[], ground: &mut ground, scratch: heap() };
+    let built = blaze_body_build::build(v_dx, from.view(), ItemKey(40), &mut subst, &EmitWorld, heap())
+        .expect("differentiated Vec3 MIR compiles to verified LIR");
+    let opt = aegraph_optimize(built.func.view(), heap()).expect("LIR aegraph optimizes cleanly");
+    let verified = blaze_lir::verify(opt.func.view()).expect("optimized LIR verifies");
+
+    // Verify LIR evaluation: ∂energy/∂x(2, 3, 4) = (2 + 1) + 3 = 6.0
+    let args = [
+        Val::Int(u128::from(2.0_f64.to_bits())),
+        Val::Int(u128::from(3.0_f64.to_bits())),
+        Val::Int(u128::from(4.0_f64.to_bits())),
+    ];
+    match run_in(opt.func.view(), &args, 10_000, heap()).expect("eval succeeds") {
+        Outcome::Returned(vals) => {
+            let Val::Int(bits) = vals[0] else { panic!("expected f64 bits") };
+            assert!(close(f64::from_bits(bits as u64), 6.0, 1e-12));
+        }
+        other => panic!("expected Returned([6.0]), got {other:?}"),
+    }
+
+    // 4. Emit REAL native AArch64 machine code for BOTH macOS (Apple Silicon) AND Linux ARM64!
+    let mut arm64_mac = Code::new_in(heap());
+    emit(verified, &[], Isa { lse: true, os: Os::MacOs }, &mut arm64_mac)
+        .expect("AArch64 macOS machine code emission succeeds");
+    assert!(!arm64_mac.bytes.is_empty(), "AArch64 macOS machine code must be non-empty");
+    assert_eq!(arm64_mac.bytes.len() % 4, 0, "AArch64 instructions are 4-byte aligned");
+
+    let mut arm64_linux = Code::new_in(heap());
+    emit(verified, &[], Isa { lse: true, os: Os::Linux }, &mut arm64_linux)
+        .expect("AArch64 Linux machine code emission succeeds");
+    assert!(!arm64_linux.bytes.is_empty(), "AArch64 Linux machine code must be non-empty");
+    assert_eq!(arm64_linux.bytes.len() % 4, 0, "AArch64 instructions are 4-byte aligned");
+
+    // 5. Prove `blaze-body-build` grounds types interned into a body's own overlay table!
+    let empty_table = blaze_typeck::PTys::flat(&[], &[]);
+    let mut ob = BodyBuilder::new_with_types_in(empty_table, heap());
+    let ov_f64 = ob.intern_ty(PNode::Float(FloatTy::F64)).expect("intern f64 in overlay");
+    let o_ret = ob.new_local(LocalDecl { ty: ov_f64, kind: LocalKind::Return, mutbl: Mutbl::Mut });
+    let o_x = ob.new_local(LocalDecl { ty: ov_f64, kind: LocalKind::Arg(0), mutbl: Mutbl::Not });
+    let o_bb = ob.new_block(BlockKind::Normal);
+    ob.start(o_bb);
+    let po_x = ob.local_place(o_x);
+    let po_ret = ob.local_place(o_ret);
+    ob.assign(po_ret, Value::Binary { op: BinOp::Add, lhs: Operand::Copy(po_x), rhs: Operand::Copy(po_x) }, Span { lo: 0, hi: 0 });
+    ob.terminate(StmtKind::Return, Span { lo: 0, hi: 0 });
+    let ob_body = ob.finish().expect("overlay body builds");
+    let v_ob = verify(&ob_body).expect("overlay body verifies");
+
+    let mut ground_ov = PortableTys::new_in(heap());
+    let mut subst_ov = Subst { args: &[], ground: &mut ground_ov, scratch: heap() };
+    let built_ov = blaze_body_build::build(v_ob, empty_table, ItemKey(41), &mut subst_ov, &EmitWorld, heap())
+        .expect("blaze-body-build grounds overlay-interned f64 cleanly");
+    let ov_eval = run_in(built_ov.func.view(), &[Val::Int(u128::from(4.5_f64.to_bits()))], 10_000, heap()).unwrap();
+    match ov_eval {
+        Outcome::Returned(vals) => {
+            let Val::Int(bits) = vals[0] else { panic!("expected f64 bits") };
+            assert!(close(f64::from_bits(bits as u64), 9.0, 1e-12));
+        }
+        other => panic!("expected Returned([9.0]), got {other:?}"),
+    }
+}

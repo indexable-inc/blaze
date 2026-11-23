@@ -36,14 +36,72 @@ const REPEAT_CAP: u64 = 4096;
 
 impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     /// `ty` of the body's table at this instance, in the ground table.
+    /// Grounding also handles types interned into the body's own overlay (`BodyBuilder::intern_ty`)
+    /// recursively up to a fixed depth bound.
     pub(crate) fn ground(&mut self, ty: PTy) -> Result<PTy, BuildError> {
-        // A type of the body's own overlay (blaze-body's `intern_ty`) is past `from`: grounding
-        // it needs one table over both, which blaze-typeck does not let a reader build yet
-        // (`PTys::overlay` is crate-private).
-        if let Ok(Some(_)) = self.v.own_ty(ty) {
-            return Err(self.unsupported("a type of the body's own overlay (not in its record's table)"));
+        self.ground_depth(ty, 0)
+    }
+
+    fn ground_depth(&mut self, ty: PTy, depth: u32) -> Result<PTy, BuildError> {
+        const MAX_OVERLAY_DEPTH: u32 = 32;
+        if let Ok(Some(node)) = self.v.own_ty(ty) {
+            if depth >= MAX_OVERLAY_DEPTH {
+                return Err(self.unsupported("a deeply nested type of the body's own overlay"));
+            }
+            let grounded = match node {
+                PNode::Bool
+                | PNode::Char
+                | PNode::Str
+                | PNode::Never
+                | PNode::Int(_)
+                | PNode::Uint(_)
+                | PNode::Float(_) => node,
+                PNode::ConstValue { ty: cty, bits } => {
+                    let cty = self.ground_depth(cty, depth + 1)?;
+                    PNode::ConstValue { ty: cty, bits }
+                }
+                PNode::Ref(m, inner) => PNode::Ref(m, self.ground_depth(inner, depth + 1)?),
+                PNode::Ptr(m, inner) => PNode::Ptr(m, self.ground_depth(inner, depth + 1)?),
+                PNode::Slice(inner) => PNode::Slice(self.ground_depth(inner, depth + 1)?),
+                PNode::Array(elem, len) => {
+                    let elem = self.ground_depth(elem, depth + 1)?;
+                    let len = self.ground_depth(len, depth + 1)?;
+                    PNode::Array(elem, len)
+                }
+                PNode::Tuple(list) => {
+                    let list = self.ground_overlay_list(list, depth + 1)?;
+                    PNode::Tuple(list)
+                }
+                PNode::Adt(k, list) => {
+                    let list = self.ground_overlay_list(list, depth + 1)?;
+                    PNode::Adt(k, list)
+                }
+                PNode::FnDef(k, list) => {
+                    let list = self.ground_overlay_list(list, depth + 1)?;
+                    PNode::FnDef(k, list)
+                }
+                _ => return Err(self.unsupported("a type of the body's own overlay (not in its record's table)")),
+            };
+            return self.subst.ground.intern(grounded).map_err(|_| self.malformed("the ground table is full"));
         }
         ground(self.from, ty, self.subst.args, self.subst.ground, self.subst.scratch, self.adts.facts()).map_err(|e| self.facts(e))
+    }
+
+    fn ground_overlay_list(&mut self, list: blaze_typeck::List, depth: u32) -> Result<blaze_typeck::List, BuildError> {
+        let items: Vec<PTy, A> = {
+            let cap = usize::try_from(list.len).unwrap_or(0);
+            let mut out = Vec::with_capacity_in(cap, self.alloc);
+            let entries = self.v.ty_list(&self.from, list).map_err(|_| self.malformed("an overlay type list past its table"))?;
+            for t in entries.iter() {
+                out.push(t);
+            }
+            out
+        };
+        let mut grounded: Vec<PTy, A> = Vec::with_capacity_in(items.len(), self.alloc);
+        for &t in items.iter() {
+            grounded.push(self.ground_depth(t, depth)?);
+        }
+        self.subst.ground.intern_list(&grounded).map_err(|_| self.malformed("the ground table is full"))
     }
 
     /// The layout of ground type `g`.

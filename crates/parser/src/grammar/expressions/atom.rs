@@ -887,7 +887,7 @@ fn match_arm<S: Sink>(p: &mut Parser<'_, S>) {
     // }
     attributes::outer_attrs(p);
 
-    patterns::pattern_top_r(p, TokenSet::new(&[T![=], T![if]]));
+    p.with_typed_pats(true, |p| patterns::pattern_top_r(p, TokenSet::new(&[T![=], T![if]])));
     if p.at(T![if]) {
         match_guard(p);
     }

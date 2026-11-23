@@ -120,17 +120,24 @@ is reconsidered only if threading turns out to be the main complaint once blaze'
 on bstd. `main` names each capability it uses (D104): `fn main(cx: &Cx, out: Out)`, each grant
 by its type and name; a whole `Io` cannot be asked for.
 
-**10. `&uniq`.**
+**10. `&uniq` and `let` vs `let mut`.**
 - `&uniq T`, `&uniq self`, `&uniq expr` and `ref uniq` in patterns are exactly `&mut T`,
   `&mut self`, `&mut expr` and `ref mut`: the same type, so code in the two spellings mixes
   freely, across crates too. `uniq` is a keyword only in those positions.
 - What `&` and `&uniq` promise is aliasing: shared, or unique. Whether the target can change
   follows from that (unique: yes; shared: only through a cell or a lock), which is why
   `&Atomic<u32>` can be written to and the old names mislead.
-- `let mut x` stays: it says the binding may be reassigned or borrowed uniquely, which is a
-  different thing. `*mut T` and `*const T` stay.
+- **`let` vs `let mut`:** Under the Blaze edition, `let x = ...;` permits taking `&uniq x`
+  directly (borrow checking enforces uniqueness), while `let mut x` is reserved strictly for
+  rebinding the local (`x = ...`, `x += ...`). The `blaze::mut_for_uniq_borrow` lint flags and
+  mechanically auto-fixes `let mut x` bindings that are never rebound and only uniquely borrowed.
+  `*mut T` and `*const T` stay.
 - Diagnostics and docs say "shared" and "unique" in every crate; under the gate they print
   `&uniq`.
+- **Function-type effects (`blaze-ty::effect_ty`):** `FnHeader` packs an explicit 4-bit
+  `EffectSet` (`panic | alloc | block | diverge`) into bits `10..15` (`fn(u32) -> u32 expect()`),
+  with effect subtyping (`fn() expect() <: fn() expect(alloc) <: fn()`) and polymorphic
+  `EffectRow` (`expect(base | e)`) for higher-order callbacks and `dyn Fn` trait objects.
 
 **8. Pattern types cover enum variants.** (The rest of change 8 is in [contracts](contracts.md).)
 - `T is PAT` is `T` restricted to the values that match `PAT`. A range is one case
