@@ -167,6 +167,12 @@ pub(crate) struct Cx<'a, 'g, 't, A: Allocator + Copy> {
     /// By function reference place: the instance, and the reference made for it.
     pub(crate) refs: AllocVec<Instance, A>,
     pub(crate) ref_ids: Vec<RefId, A>,
+    /// By static reference place: the static item, and the reference made for it.
+    pub(crate) statics: AllocVec<ItemKey, A>,
+    pub(crate) static_ids: Vec<RefId, A>,
+    /// By thread-local reference place: the static item, and the reference made for it.
+    pub(crate) thread_locals: AllocVec<ItemKey, A>,
+    pub(crate) tls_ids: Vec<RefId, A>,
     /// The row being built, which every error names.
     pub(crate) stmt: Option<Stmt>,
 }
@@ -209,6 +215,10 @@ pub fn build<A: Allocator + Copy>(
         ret: Pass::Ignore,
         refs: AllocVec::new_in(alloc),
         ref_ids: Vec::new_in(alloc),
+        statics: AllocVec::new_in(alloc),
+        static_ids: Vec::new_in(alloc),
+        thread_locals: AllocVec::new_in(alloc),
+        tls_ids: Vec::new_in(alloc),
         stmt: None,
     };
     cx.frame()?;
@@ -217,8 +227,8 @@ pub fn build<A: Allocator + Copy>(
     Ok(Built {
         func,
         refs: cx.refs,
-        statics: AllocVec::new_in(alloc),
-        thread_locals: AllocVec::new_in(alloc),
+        statics: cx.statics,
+        thread_locals: cx.thread_locals,
         // This builder marks no `unreachable` with its construct yet: its records carry no trap
         // rows (blaze-code record.rs `TrapSource`), so a fault in them is said by its code alone.
         traps: AllocVec::new_in(alloc),
