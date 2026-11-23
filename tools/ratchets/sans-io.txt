@@ -12,7 +12,7 @@
 blaze-algebra	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-alloc-count	5	1	0	0	0	0	6	10	0	1	0	1	1	1	0	0	0	0
 blaze-answer	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
-blaze-arrow-ipc	0	0	0	46	0	0	0	0	0	0	0	0	0	0	0	0	0	0
+blaze-arrow-ipc	0	0	0	46	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-ask	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	1	0	0
 blaze-audit	0	29	182	15	0	0	168	0	0	0	0	0	0	1	0	0	0	0
 blaze-base-tools	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
@@ -45,7 +45,7 @@ blaze-cert	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0	0	0
 blaze-check	73	0	0	0	0	0	61	12	4	4	0	1	1	1	0	0	6	6
 blaze-cli	633	0	419	61	0	33	148	1	1	5	0	54	1	1	0	1	22	22
 blaze-code	0	0	0	0	0	4	0	0	0	0	0	0	0	0	0	1	0	0
-blaze-columns	39	1	0	27	0	0	24	0	9	1	0	20	0	0	30	0	0	0
+blaze-columns	39	1	0	27	0	0	24	0	9	1	0	20	0	0	30	1	0	0
 blaze-comptime	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-comptime-sys	0	0	0	0	0	0	0	1	0	0	0	0	0	0	0	1	0	0
 blaze-comptime/rungs/derive-hello	0	0	0	0	0	0	3	0	0	0	0	0	1	1	0	0	0	0
@@ -75,7 +75,7 @@ blaze-git-fetch	0	2	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-glob	6	0	13	5	0	0	0	0	0	0	0	2	1	1	0	1	0	0
 blaze-graph	204	3	37	61	0	0	219	53	7	5	0	20	1	1	0	0	17	17
 blaze-h1	0	2	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
-blaze-h2	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0	0	0
+blaze-h2	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	1	0	0
 blaze-hash	4	6	11	139	0	0	6	0	3	1	1	11	0	0	16	1	0	0
 blaze-hashcons	4	6	7	9	0	0	5	0	1	0	0	4	0	1	0	1	2	2
 blaze-http	87	7	114	39	0	0	274	0	2	1	0	13	1	1	8	0	2	2
@@ -137,7 +137,7 @@ blaze-script	139	0	7	0	0	0	439	2	13	7	0	99	1	1	0	0	0	0
 blaze-semver	0	4	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-sim	31	0	48	16	0	1	71	6	0	2	0	6	1	1	0	1	0	0
 blaze-solve	26	0	0	0	0	0	163	0	3	0	0	6	0	1	0	1	0	0
-blaze-sort	5	0	0	0	0	0	1	0	3	1	0	4	0	1	0	0	0	0
+blaze-sort	5	0	0	0	0	0	1	0	3	1	0	4	0	1	0	1	0	0
 blaze-source	27	0	7	3	0	0	28	5	0	0	0	0	1	1	0	1	0	0
 blaze-spawn	0	0	0	0	0	2	0	0	0	0	0	0	0	1	0	1	0	0
 blaze-spin	2	0	0	0	0	0	0	0	2	0	0	0	1	1	0	1	0	0
@@ -163,6 +163,8 @@ blaze-ty	2	0	0	0	0	0	2	0	9	0	0	9	0	1	0	1	0	0
 blaze-typeck	27	0	0	71	4	123	166	0	4	0	0	6	0	1	0	1	0	0
 blaze-unicode	0	2	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-unit-graph	18	0	0	0	0	0	14	0	10	2	0	39	0	1	0	1	0	0
+# blaze-units is 0 in every sans-IO column (`#![no_std]`, `#![blaze::sans_io]`, 0 third-party deps); `bare = 1` is inherited transitively from `blaze-own` once reached via `blaze-std`.
+blaze-units	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-url	0	3	0	0	0	0	5	0	0	0	0	0	0	0	0	1	0	0
 blaze-v2-proof	12	0	0	0	0	0	27	3	0	1	0	6	1	1	0	0	0	0
 blaze-wasi	0	3	5	0	0	0	12	0	0	0	0	0	0	1	0	0	0	0

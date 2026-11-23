@@ -832,6 +832,7 @@ pub fn check_fail_class<'n, S: NamesSource<'n>>(names: S, keys: &Keys, e: &super
             format!("instance resolution of the call of {} failed: {why}", path(*item))
         }
         CheckFail::ReadsDiffer { .. } => String::from("checked again, the body read other answers than its first check (rule 21)"),
+        CheckFail::InlineFor { why, .. } => (*why).into(),
     }
 }
 

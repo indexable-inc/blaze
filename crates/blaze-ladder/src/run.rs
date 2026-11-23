@@ -2315,7 +2315,16 @@ fn build_from<P: FrontEnd>(
             }
         }
         // Each instance is pushed with its fn's index (`tabled`), so none is looked up again.
-        let i = reached.tabled[at - 1];
+        // If this is a generic `inline for` fn instantiated at concrete args, switch to its
+        // monomorphized unrolled specialization row (with 0 generic args of its own).
+        let orig_i = reached.tabled[at - 1];
+        let spec_i = if instance.args.len > 0 && instance.item == program.function(orig_i).key {
+            ground.view().list(instance.args).ok().and_then(|a| program.specialized_row(orig_i, a, ground.view()))
+        } else {
+            None
+        };
+        let i = spec_i.unwrap_or(orig_i);
+        let is_own_instance = spec_i.is_some() || instance.item == program.function(i).key;
         // This step's refusal `e`, filed, and the loop goes on; but an instance question's
         // `Missing` (an answer no check made: a bucket at a shape only this instance's
         // arguments hold) has the front end make what its worlds asked
@@ -2402,12 +2411,14 @@ fn build_from<P: FrontEnd>(
         // built at its owner's arguments, and the owner's instance, built first (it is what
         // reaches them), pulled them. A need the evaluator refuses is this instance's refusal.
         const_needs.clear();
-        if instance.item == function.key
+        if is_own_instance
             && program.evaluates_at_args()
             && let (Some(body), Some(done)) = (body, done)
         {
             args.clear();
-            args.extend_from_slice(ground.view().list(instance.args).map_err(|_| RunError::Build { function: name(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None })?);
+            if spec_i.is_none() {
+                args.extend_from_slice(ground.view().list(instance.args).map_err(|_| RunError::Build { function: name(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None })?);
+            }
             let view = body.view(program.body_types(i));
             let facts = FrontAdts(program, i, &consts, &langs, &checked_bodies);
             if let Err(error) = crate::front2::const_at::needs_of(&view, done, &args, &mut ground, &facts, alloc, &mut const_needs) {
@@ -2490,17 +2501,17 @@ fn build_from<P: FrontEnd>(
         // One of a coroutine's three functions (`Future::poll`, the resume fn, `drop_in_place`,
         // each at `[coroutine]`; tabled as the block's owner): taken from the one build of that
         // coroutine instance (front2/coroutines.rs, `build_coroutines`).
-        let coroutine = if instance.item == function.key {
+        let coroutine = if is_own_instance {
             None
         } else {
             crate::front2::coroutines::part_of(&FrontAdts(program, i, &consts, &langs, &checked_bodies), instance, &ground)
         };
-        let shim = if instance.item == function.key || coroutine.is_some() {
+        let shim = if is_own_instance || coroutine.is_some() {
             None
         } else {
             crate::fn_shim::fn_shim_of(&FrontAdts(program, i, &consts, &langs, &checked_bodies), instance, &ground)
         };
-        let closure = if instance.item == function.key || shim.is_some() || coroutine.is_some() {
+        let closure = if is_own_instance || shim.is_some() || coroutine.is_some() {
             None
         } else {
             let first = ground.view().list(instance.args).map_err(malformed)?.first().copied();
@@ -2513,12 +2524,16 @@ fn build_from<P: FrontEnd>(
                 _ => return Err(callee_refusal(&*program, name(), instance.args, instance, crate::callee_shown::CalleeGap::NotOwnInstance, ground.view())),
             }
         };
-        let owner_args = match shim {
-            Some(s) => s.item.map_or(List::EMPTY, |(_, fn_args)| fn_args),
-            None => match coroutine {
-                Some((of, _)) => of.owner_args,
-                None => closure.map_or(instance.args, |(of, _)| of.owner_args),
-            },
+        let owner_args = if spec_i.is_some() {
+            List::EMPTY
+        } else {
+            match shim {
+                Some(s) => s.item.map_or(List::EMPTY, |(_, fn_args)| fn_args),
+                None => match coroutine {
+                    Some((of, _)) => of.owner_args,
+                    None => closure.map_or(instance.args, |(of, _)| of.owner_args),
+                },
+            }
         };
         args.extend_from_slice(ground.view().list(owner_args).map_err(malformed)?);
         // A coroutine's function: its instance is built once for all three (here, when no

@@ -71,6 +71,19 @@ impl<T: 'static, A: Allocator + Copy> TypedColumn<T, A> {
         Self { data: OwnVec::new_in(alloc), duplicator }
     }
 
+    /// Enable value duplication for a `Copy` component column (used when upgrading a lazily
+    /// registered component to copyable for prefab instantiation).
+    #[inline]
+    pub(crate) fn enable_copy(&mut self)
+    where
+        T: Copy,
+    {
+        fn copy_val<T: Copy>(v: &T) -> T {
+            *v
+        }
+        self.duplicator = Some(copy_val::<T>);
+    }
+
     /// Push a new value onto the back of the column.
     #[inline]
     pub fn push(&mut self, value: T) -> Result<(), EcsError> {
