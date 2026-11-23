@@ -40,12 +40,14 @@ use std::{
 use blaze_core::{Completion, Done, Effect, Extent, FileName, LockMode, Tag as EffectTag};
 use blaze_hash::{BuildKeyHasher, Map, MapOpts};
 use blaze_ids::{ContentId, crc32c};
+use blaze_mem::Kept;
 use blaze_own::Share;
 use blaze_keyed::{
     kind::{Namespace, ReservedTag, Tag, TagReach, reach_of},
     store::{ALIGN, ENTRY, FOOTER, HEADER, Holder, Put, RowRefused, SEGMENT_MOST, SegmentId, StoreError, StoreFile, TwoValues},
 };
 
+use super::bloom::{BLOOM_ALLOC, BloomBuilder, BloomIndex, BloomRef};
 use super::format::{
     self, Entry, FORMAT, HEAD_LEN, HeadRead, Lease, LostKind, LostMark, Manifest, NEVER, OFFSET_MOST, Retired,
     Root, SLOT_AT, Segment, Slot, aligned, record_crc,
@@ -618,6 +620,8 @@ pub fn beside_key(owner: Key) -> Key {
 
 const HEAD: &str = "head";
 const FLIP: &str = "flip";
+/// Optional rebuildable per-segment Bloom filter sidecar beside `head` and `flip`.
+const BLOOM: &str = "bloom";
 /// The cache directory tag's file in the store's directory: also how `blaze clean --store`
 /// tells a directory is blaze's store (blaze-cli clean.rs).
 pub const CACHEDIR_TAG: &str = "CACHEDIR.TAG";
@@ -1055,6 +1059,9 @@ pub(crate) enum Plant {
     /// Root-LRU eviction treats the active toolchain root as a regular root instead of
     /// preserving it last (DST control).
     LruEvictsToolchainFirst,
+    /// Skips CRC verification on mapped `bloom` records so corrupt/torn filters can cause
+    /// false negatives (bloom_tests DST control).
+    TrustsCorruptBloom,
 }
 
 /// What one slice of the background pass did ([`Plain::scrub_next`]).
@@ -1192,6 +1199,10 @@ const DIR_SYNC: u8 = 21;
 const SEG_RENAME: u8 = 22;
 /// A streamed copy's temporary file removed: its bytes are a segment named already.
 const SEG_UNWRITE: u8 = 23;
+/// Optional map of the `bloom` sidecar file at open.
+const BLOOM_MAP: u8 = 24;
+/// Optional append or compact rewrite of the `bloom` sidecar under the flip lock.
+const BLOOM_WRITE: u8 = 25;
 /// A streamed copy's writes, by their [`SEG_PIECE`] index: 0 its header, then a payload chunk
 /// each from 1, an index chunk each from this, and its footer at [`FOOTER_PIECE`].
 const INDEX_PIECE: u32 = 1 << 30;
@@ -1553,6 +1564,8 @@ struct Stream<A: Allocator + Clone> {
     /// completed: one chunk of index alive).
     index_asked: u32,
     index_flying: bool,
+    /// Per-segment Bloom filter populated while streaming the index leg.
+    bloom: Option<BloomBuilder>,
     /// What its footer says, once sealed.
     sealed: Option<format::Described>,
 }
@@ -1607,6 +1620,9 @@ impl<A: Allocator + Clone> Stream<A> {
         let mut bytes = Vec::with_capacity_in(fit as usize * ENTRY, Global);
         for _ in 0..fit {
             let (_, entry) = self.merge.next(store).expect("a copy's third walk meets the records its first counted: the store does nothing else while it streams");
+            if let Some(bloom) = &mut self.bloom {
+                bloom.insert(&entry.key.0);
+            }
             Entry { at: self.placed, ..entry }.encode_into(&mut bytes);
             self.placed = aligned(self.placed + u64::from(entry.len));
         }
@@ -1726,6 +1742,15 @@ struct Flip<A: Allocator + Clone> {
     /// [`Plant::UnlinkEarly`]: unlinks in flight before the log's write, which waits here.
     early: u32,
     deferred: Option<Effect>,
+    /// Optional sidecar Bloom append or compact rewrite performed under the flip lock before
+    /// `SLOT_WRITE`. Its failure never aborts the flip.
+    bloom_effect: Option<Effect>,
+}
+
+/// Parked `Ctx::Open` resolution waiting for the parallel `BLOOM_MAP` effect to settle.
+struct OpenParked {
+    base: Base,
+    fell_back: bool,
 }
 
 enum Phase<A: Allocator + Clone> {
@@ -1800,6 +1825,16 @@ pub struct Plain<A: Allocator + Clone> {
     merge_held_most: u64,
     head: FileName,
     flip: FileName,
+    bloom_file: FileName,
+    bloom: BloomIndex,
+    bloom_loading: bool,
+    open_parked: Option<OpenParked>,
+    /// Framed Bloom records built for segments written by this process, awaiting flip.
+    pending_bloom: blaze_own::Vec<(ContentId, blaze_own::Vec<u8, Kept>), Kept>,
+    /// Most recently hit segment row index in `manifest.segments` (for zero-mmap locality).
+    pub(super) last_hit: Option<usize>,
+    /// Optional creation-generation locality hint for the current `Plain::find` call.
+    pub(super) hint_gen: Option<u64>,
     phase: Phase<A>,
     /// The newest generation this process saw, and its manifest.
     slot: Option<Slot>,
@@ -2066,7 +2101,7 @@ fn io(doing: &'static str, file: &FileName, done: &Done) -> Option<StoreError> {
 /// forms, and the legacy layout of format 4 and before, whose files lay directly in the
 /// store's root).
 pub fn store_leaf(leaf: &str) -> bool {
-    leaf == HEAD || leaf == FLIP || parse_leaf(leaf).is_some()
+    leaf == HEAD || leaf == FLIP || leaf == BLOOM || parse_leaf(leaf).is_some()
 }
 
 /// The id of a file named `seg-<16 hex>` or `manifests-<16 hex>`, and whether it is a log.
@@ -2221,6 +2256,13 @@ impl<A: Allocator + Clone> Plain<A> {
         Plain {
             head: name(HEAD),
             flip: name(FLIP),
+            bloom_file: name(BLOOM),
+            bloom: BloomIndex::new(),
+            bloom_loading: false,
+            open_parked: None,
+            pending_bloom: blaze_own::Vec::new_in(BLOOM_ALLOC),
+            last_hit: None,
+            hint_gen: None,
             boot: Boot(cfg.boot),
             checks: std::cell::Cell::new(Checks::default()),
             checked_ids: Vec::new_in(alloc.clone()),
@@ -2479,6 +2521,118 @@ impl<A: Allocator + Clone> Plain<A> {
         out
     }
 
+    /// Zero-allocation lookup of root `name` in the current manifest: returns its record key and
+    /// the generation that wrote/updated it (used as a segment-locality probe hint).
+    pub fn root_target(&self, name: &str) -> Option<(Key, u64)> {
+        self.manifest.roots.iter().find(|it| it.name == name).map(|it| (Key(it.key), it.generation))
+    }
+
+    /// Number of active leases named by the current manifest, without allocating.
+    pub fn leases_len(&self) -> usize {
+        self.manifest.leases.len()
+    }
+
+    /// Sets an optional segment-generation locality hint consulted by [`Plain::find`].
+    pub fn set_probe_hint(&mut self, generation: Option<u64>) {
+        self.hint_gen = generation;
+    }
+
+    /// Whether [`Plain::commit`] / [`Plain::commit_records`] with empty inputs has any pending
+    /// work (held records, root edits, open stamps, or a folded compaction slice).
+    pub fn needs_commit(&self) -> bool {
+        self.holds_uncommitted() || !self.roots_pending.is_empty() || self.pending_stamps() || self.folding.is_some()
+    }
+
+    /// Whether [`Plain::seal`] has any unsealed local segments of this boot or pending stamps.
+    pub fn needs_seal(&self) -> bool {
+        self.pending_stamps() || self.manifest.segments.iter().any(|it| it.local && !it.sealed && it.boot == self.cfg.boot)
+    }
+
+    /// Whether row `row` of `self.manifest.segments` may contain `key` according to its
+    /// verified per-segment Bloom filter (never returns `false` for earlier-boot unsealed
+    /// crash-tail segments or segments without a valid filter).
+    #[inline]
+    pub(super) fn may_contain_row(&self, row: usize, key: &Key) -> bool {
+        let Some(seg) = self.manifest.segments.get(row) else {
+            return true;
+        };
+        if seg.count == 0 {
+            return false;
+        }
+        if seg.boot != self.cfg.boot && !seg.sealed {
+            return true;
+        }
+        self.bloom.may_contain(seg, &key.0.0, self.plant() == Plant::TrustsCorruptBloom)
+    }
+
+    /// Verified, `Send + Sync` Bloom handle for `seg` (for [`super::snapshot::Snapshot`]).
+    pub(crate) fn bloom_ref_for(&self, seg: &Segment) -> Option<BloomRef> {
+        if seg.boot != self.cfg.boot && !seg.sealed {
+            return None;
+        }
+        self.bloom.verified_ref(seg, self.plant() == Plant::TrustsCorruptBloom)
+    }
+
+    /// Records a newly built framed Bloom record for `digest`, awaiting the next flip.
+    fn record_pending_bloom(&mut self, digest: ContentId, record: blaze_own::Vec<u8, Kept>) {
+        if let Some((_, existing)) = self.pending_bloom.iter_mut().find(|(d, _)| *d == digest) {
+            *existing = record;
+        } else {
+            self.pending_bloom.push((digest, record));
+        }
+    }
+
+    /// Plans the optional `bloom` sidecar write for a flip whose resulting manifest is `m`.
+    /// When the store is whole (`self.eager`) and any live local segment lacks a filter (e.g.
+    /// upgrading an existing store) or dead bytes exceed 2x live + 64 KiB, writes a compact
+    /// replacement via atomic `WriteUnsynced`; otherwise appends only newly built records.
+    fn plan_bloom_effect(&mut self, m: &Manifest) -> Option<Effect> {
+        let has_pending = |pending: &[(ContentId, blaze_own::Vec<u8, Kept>)], digest: &ContentId| pending.iter().any(|(d, _)| d == digest);
+        let needs_backfill = self.eager
+            && m.segments
+                .iter()
+                .any(|seg| seg.local && !self.bloom.has(seg) && !has_pending(&self.pending_bloom, &seg.digest) && self.by_id.contains_key(&seg.id));
+        let needs_compact = self.eager && self.bloom.needs_compact(&m.segments);
+        if needs_backfill || needs_compact {
+            let mut bytes: blaze_own::Vec<u8, Kept> = blaze_own::Vec::new_in(BLOOM_ALLOC);
+            let mut backfilled: blaze_own::Vec<(ContentId, blaze_own::Vec<u8, Kept>), Kept> = blaze_own::Vec::new_in(BLOOM_ALLOC);
+            for seg in m.segments.iter().filter(|it| it.local) {
+                if let Some((_, rec)) = self.pending_bloom.iter().find(|(d, _)| *d == seg.digest) {
+                    bytes.extend_from_slice(rec);
+                } else if let Some(raw) = self.bloom.raw_record(seg) {
+                    bytes.extend_from_slice(raw);
+                } else if let Some(&at) = self.by_id.get(&seg.id)
+                    && let Some(mapped) = self.maps.get(at)
+                    && mapped.seg().digest == seg.digest
+                {
+                    let rec = BloomBuilder::from_run(mapped.run(), &seg.digest);
+                    bytes.extend_from_slice(&rec);
+                    backfilled.push((seg.digest, rec));
+                }
+            }
+            for (digest, rec) in backfilled {
+                self.record_pending_bloom(digest, rec);
+            }
+            if bytes.is_empty() {
+                return None;
+            }
+            return Some(Effect::WriteUnsynced { file: self.bloom_file.share(), bytes: bytes.into_iter().collect(), tag: self.tag(BLOOM_WRITE, 0) });
+        }
+        if self.pending_bloom.is_empty() {
+            return None;
+        }
+        let mut bytes: blaze_own::Vec<u8, Kept> = blaze_own::Vec::new_in(BLOOM_ALLOC);
+        for (digest, rec) in self.pending_bloom.iter() {
+            if m.segments.iter().any(|seg| seg.local && seg.digest == *digest) {
+                bytes.extend_from_slice(rec);
+            }
+        }
+        if bytes.is_empty() {
+            return None;
+        }
+        Some(Effect::Append { file: self.bloom_file.share(), bytes: bytes.into_iter().collect(), tag: self.tag(BLOOM_WRITE, 0) })
+    }
+
     /// The leases this generation names: `(holder's nonce, expires ns)`.
     pub fn leases(&self) -> Vec<(u64, u64), A> {
         let mut out = Vec::with_capacity_in(self.manifest.leases.len(), self.alloc.clone());
@@ -2520,10 +2674,19 @@ impl<A: Allocator + Clone> Plain<A> {
     /// mapped, and the commit, which needs a whole store, refuses two values under one key.)
     fn find_in(&self, spaces: &[Namespace], key: &Key) -> Option<(usize, Entry)> {
         if self.plant() == Plant::IgnoresNamespace {
-            return self.view.iter().filter_map(|&row| self.mapped_row(row)).find_map(|at| self.probe(at, key));
+            return self
+                .view
+                .iter()
+                .filter(|&&row| self.may_contain_row(row, key))
+                .filter_map(|&row| self.mapped_row(row))
+                .find_map(|at| self.probe(at, key));
         }
         spaces.iter().find_map(|space| {
-            self.view.iter().filter(|&&row| self.manifest.segments[row].namespace == *space).filter_map(|&row| self.mapped_row(row)).find_map(|at| self.probe(at, key))
+            self.view
+                .iter()
+                .filter(|&&row| self.manifest.segments[row].namespace == *space && self.may_contain_row(row, key))
+                .filter_map(|&row| self.mapped_row(row))
+                .find_map(|at| self.probe(at, key))
         })
     }
 
@@ -2931,6 +3094,10 @@ impl<A: Allocator + Clone> Plain<A> {
     /// shared arena, lent.rs `Visibility::InArena`): each laid out by its entry, copied once
     /// into the segment's piece, its CRC the one made at its put. The same segments as the
     /// same records put into a batch (arena_tests.rs, the seam's equality).
+    fn empty_committed(&self) -> Committed<A> {
+        Committed { generation: self.manifest.generation, segments: Vec::new_in(self.alloc.clone()) }
+    }
+
     pub fn commit_records(&mut self, batches: &[&Batch], records: &[LentRecord<'_>], now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
         if !self.ready() {
             return Err(StoreError::Busy { phase: self.what() });
@@ -2946,6 +3113,12 @@ impl<A: Allocator + Clone> Plain<A> {
         }
         if let Some(record) = records.iter().find(|it| !self.cfg.writes.contains(&it.namespace)) {
             return Err(StoreError::NotWritable { namespace: record.namespace });
+        }
+        // Fast path: nothing to lay out, no pending roots/stamps/folded slice — skip batch
+        // replacement and layout allocations completely.
+        if batches.iter().all(|it| it.is_empty()) && records.is_empty() && !self.needs_commit() {
+            self.committed = Some(Ok(self.empty_committed()));
+            return Ok(());
         }
         // A worker's batch for a shared namespace is scanned as a put is (rule 25), before
         // anything of the commit is laid out.
@@ -3015,7 +3188,7 @@ impl<A: Allocator + Clone> Plain<A> {
         let mut rest = laid.into_iter();
         match rest.next() {
             None if roots.is_empty() && !self.pending_stamps() && self.folding.is_none() => {
-                self.committed = Some(Ok(Committed { generation: self.manifest.generation, segments: Vec::new_in(self.alloc.clone()) }));
+                self.committed = Some(Ok(self.empty_committed()));
                 self.sealed.clear();
             }
             None => self.start_flip(Change::Commit { segs: Vec::new_in(self.alloc.clone()), started_ns: now_ns, roots }, effects),
@@ -3279,6 +3452,7 @@ impl<A: Allocator + Clone> Plain<A> {
             flying: 0,
             index_asked: 0,
             index_flying: false,
+            bloom: Some(BloomBuilder::new(count)),
             sealed: None,
         };
         // Its row until the stream seals it: no digest yet, so no id.
@@ -3300,9 +3474,14 @@ impl<A: Allocator + Clone> Plain<A> {
     /// ([`Plain::segment_done`]).
     fn named_copy(&mut self, writing: Writing<A>, why: Why<A>, effects: &mut Vec<Effect>) {
         let Writing { seg: unnamed, file: temp, stream, .. } = writing;
-        let described = stream.and_then(|it| it.sealed).expect("a copy's writes all completed only once its footer, which seals it, did");
+        let (described, bloom) = stream
+            .and_then(|it| it.sealed.map(|described| (described, it.bloom)))
+            .expect("a copy's writes all completed only once its footer, which seals it, did");
         let mut seg = Segment::of(&described, unnamed.file_len());
         seg.boot = self.cfg.boot;
+        if let Some(builder) = bloom {
+            self.record_pending_bloom(seg.digest, builder.finish(&seg.digest));
+        }
         let file = self.segment_file(seg.id);
         let back = matches!(&why, Why::Compact { candidates, .. } if candidates.contains(&seg.id));
         let named = Writing { seg, file: file.share(), pieces: Vec::new_in(self.alloc.clone()), left: 0, stream: None };
@@ -3361,6 +3540,8 @@ impl<A: Allocator + Clone> Plain<A> {
             self.phase = Phase::Ready;
             return;
         }
+        let bloom_record = BloomBuilder::from_run(&run, &sealed.described.digest);
+        self.record_pending_bloom(sealed.described.digest, bloom_record);
         if self.by_id.contains_key(&seg.id) {
             // These bytes are here already, under this name: flip without writing them. They
             // are a named segment's, proved as its row is (synced before the flip that named
@@ -4210,6 +4391,7 @@ impl<A: Allocator + Clone> Plain<A> {
             carry: false,
             early: 0,
             deferred: None,
+            bloom_effect: None,
         }));
         effects.push(Effect::Lock { file: self.flip.share(), mode: LockMode::Exclusive, tag: self.tag(LOCK, 0) });
     }
@@ -4591,6 +4773,7 @@ impl<A: Allocator + Clone> Plain<A> {
         flip.log = self.log_file(log);
         flip.fresh = fresh;
         flip.removals = removals;
+        flip.bloom_effect = self.plan_bloom_effect(&m);
         flip.next = Some((slot, m));
         let first = if flip.new_log {
             flip.manifest_bytes = bytes;
@@ -4622,8 +4805,12 @@ impl<A: Allocator + Clone> Plain<A> {
     /// outcome) dies with the process (seed 875559 of the property tests' former engine: an open's fresh flip retired the
     /// orphans a power cut left, its slot landed beside a failed cache tag write, it stopped,
     /// and the next open found them retired and reported none).
-    fn write_slot(&self, effects: &mut Vec<Effect>) {
-        let Phase::Flipping(flip) = &self.phase else { unreachable!("a slot is a flip's") };
+    fn write_slot(&mut self, effects: &mut Vec<Effect>) {
+        let Phase::Flipping(flip) = &mut self.phase else { unreachable!("a slot is a flip's") };
+        if let Some(bloom_effect) = flip.bloom_effect.take() {
+            effects.push(bloom_effect);
+            return;
+        }
         if flip.fresh {
             let tag_file = self.name(CACHEDIR_TAG);
             effects.push(Effect::WriteUnsynced { file: tag_file, bytes: CACHEDIR_SIGNATURE.to_vec(), tag: self.tag(SLOT_WRITE, 1) });
@@ -4665,6 +4852,7 @@ impl<A: Allocator + Clone> Plain<A> {
         let Phase::Flipping(flip) = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!("an unlock is a flip's") };
         let flip = *flip;
         if let Some(why) = flip.refused {
+            self.pending_bloom.clear();
             let roots = match flip.change {
                 Change::Commit { roots, .. } => roots,
                 _ => Vec::new_in(self.alloc.clone()),
@@ -4684,6 +4872,7 @@ impl<A: Allocator + Clone> Plain<A> {
             return;
         }
         if flip.aborted {
+            self.pending_bloom.clear();
             let Change::Compact { seg, mut stats, .. } = flip.change else { unreachable!("only a compaction aborts") };
             stats.aborted = true;
             self.sliced = Some(stats);
@@ -4720,6 +4909,12 @@ impl<A: Allocator + Clone> Plain<A> {
         self.torn_stamp = false;
         self.slot = Some(slot);
         self.manifest = manifest;
+        let pending_bloom = core::mem::replace(&mut self.pending_bloom, blaze_own::Vec::new_in(BLOOM_ALLOC));
+        for (digest, rec) in pending_bloom {
+            if self.manifest.segments.iter().any(|seg| seg.local && seg.digest == digest) {
+                self.bloom.insert_owned(rec);
+            }
+        }
         self.leased = self.manifest.leases.iter().any(|it| it.holder == self.cfg.nonce);
         // The slot names the log this flip wrote its manifest to.
         self.log_lost = false;
@@ -5183,6 +5378,16 @@ impl<A: Allocator + Clone> Plain<A> {
         let fail = |doing: &'static str, file: &FileName, done: &Done| io(doing, file, done);
         let unlink_early = self.plant() == Plant::UnlinkEarly;
         match (op, &mut self.phase) {
+            (BLOOM_MAP, _) if self.bloom_loading => {
+                self.bloom_loading = false;
+                if let Done::Mapped(map) = done {
+                    self.bloom.set_mapping(map);
+                }
+                if let Some(parked) = self.open_parked.take() {
+                    return self.resolved(Ctx::Open, parked.base, false, parked.fell_back, now_ns, effects);
+                }
+                Ok(())
+            }
             (REMOVE, Phase::Flipping(flip)) if unlink_early && index >= EARLY_REMOVE && flip.early > 0 => {
                 flip.early -= 1;
                 if flip.early == 0
@@ -5263,6 +5468,10 @@ impl<A: Allocator + Clone> Plain<A> {
                         }
                         // A torn slot beside it: a newer flip was cut, and the segments it
                         // named are found and reported by the directory's look.
+                        if ctx == Ctx::Open && !self.bloom_loading {
+                            self.bloom_loading = true;
+                            effects.push(Effect::Map { file: self.bloom_file.share(), extent: Extent::Whole, tag: self.tag(BLOOM_MAP, 0) });
+                        }
                         self.read_manifest(ctx, [Some(newest), older], 0, ctx == Ctx::Open && torn.is_some(), effects);
                         Ok(())
                     }
@@ -5621,6 +5830,13 @@ impl<A: Allocator + Clone> Plain<A> {
                 self.write_slot(effects);
                 Ok(())
             }
+            (BLOOM_WRITE, Phase::Flipping(_)) => {
+                // `bloom` is a rebuildable acceleration sidecar: an I/O error writing or
+                // appending to it never aborts the generation flip.
+                let _ = done;
+                self.write_slot(effects);
+                Ok(())
+            }
             (SLOT_WRITE, Phase::Flipping(_)) => {
                 // One write at a time, the slot last ([`Plain::write_slot`]): a failure here
                 // stops the store with nothing of this flip in flight under the lock, and
@@ -5716,10 +5932,15 @@ impl<A: Allocator + Clone> Plain<A> {
     fn resolved(&mut self, ctx: Ctx, base: Base, fresh: bool, fell_back: bool, now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
         match ctx {
             Ctx::Open => {
+                if self.bloom_loading {
+                    self.open_parked = Some(OpenParked { base, fell_back });
+                    return Ok(());
+                }
                 self.slot = base.slot;
                 self.manifest = base.manifest;
                 self.opened_ns = now_ns;
                 self.opened_generation = self.manifest.generation;
+                self.bloom.index_manifest(&self.manifest.segments);
                 // Rows retired as lost and not yet reported to a caller who got the report
                 // (whoever wrote them: this open's process before a crash, or another): this
                 // open reports them, and clears them only after its own report is handed.

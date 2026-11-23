@@ -74,6 +74,7 @@ use blaze_keyed::kind::{Namespace, ReservedTag};
 use blaze_keyed::store::{ENTRY, Generation};
 
 use super::arena::ArenaView;
+use super::bloom::BloomRef;
 use super::core::Plain;
 use super::format::{self, Entry, Segment};
 use super::lent::{Lent, LentError};
@@ -152,12 +153,14 @@ pub(crate) enum SnapshotPlant {
     ShortWatermark,
 }
 
-/// One listed segment: its manifest row (where its index lies), its mapping, shared, and the
-/// proof its [`super::verified::Verified`] gave when the snapshot was taken.
+/// One listed segment: its manifest row (where its index lies), its mapping, shared, the
+/// proof its [`super::verified::Verified`] gave when the snapshot was taken, and its optional
+/// verified per-segment Bloom filter for O(1) negative rejection.
 struct Listed {
     seg: Segment,
     map: Mapping,
     proof: Proof,
+    bloom: Option<BloomRef>,
 }
 
 /// A record read through a snapshot with the store's proof beside its bytes: the bytes lie in a
@@ -222,8 +225,10 @@ impl<A: Allocator> Snapshot<A> {
         for space in plain.reads() {
             for at in in_space(plain, *space) {
                 let verified = plain.mapped_at(at);
+                let seg = *verified.seg();
+                let bloom = plain.bloom_ref_for(&seg);
                 // Within the reserve: no reallocation.
-                listed.push(Listed { seg: *verified.seg(), map: verified.mapping().share(), proof: verified.proof(branded) });
+                listed.push(Listed { seg, map: verified.mapping().share(), proof: verified.proof(branded), bloom });
             }
         }
         Ok(Snapshot { listed, generation, plant, arena: None })
@@ -274,6 +279,14 @@ impl<A: Allocator> Snapshot<A> {
             }
         }
         for listed in self.listed.iter() {
+            if listed.seg.count == 0 {
+                continue;
+            }
+            if let Some(bloom) = &listed.bloom
+                && !bloom.may_contain(&key.0.0)
+            {
+                continue;
+            }
             let file = listed.map.bytes();
             let run = listed.seg.run(file);
             let Some(i) = self.find(run, &key.0) else { continue };

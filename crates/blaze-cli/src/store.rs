@@ -611,18 +611,16 @@ impl Home {
 /// or deleted. Looked for once in the home's life and once in each checkout's: the look is
 /// recorded as a root, committed with this command's records after the answer.
 pub fn old_home<D: Driver>(cx: &Cx, home: &Home, root: &Dir<ReadWrite>, checkout: &str, lent: &Lent<D, StoreAlloc>, err: &Out) -> Result<u32, CliError> {
-    let roots = lent.roots();
     let mut checkout_root = std::string::String::with_capacity(OLD_CHECKOUT_LOOKED.len() + 16);
     checkout_root.push_str(OLD_CHECKOUT_LOOKED);
     for byte in &ContentId::of("blaze-cli old packs look", checkout.as_bytes()).0[..8] {
         const HEX: &[u8; 16] = b"0123456789abcdef";
-        checkout_root.push(char::from(HEX[usize::from(byte >> 4)]));
-        checkout_root.push(char::from(HEX[usize::from(byte & 15)]));
+        checkout_root.push(HEX[usize::from(byte >> 4)] as char);
+        checkout_root.push(HEX[usize::from(byte & 15)] as char);
     }
-    let looked = |name: &str| roots.iter().any(|(it, _)| it == name);
     let mut found = 0u32;
     let mut items: std::vec::Vec<std::string::String, Global> = std::vec::Vec::new_in(Global);
-    if !looked(OLD_HOME_LOOKED) {
+    if !lent.has_root(OLD_HOME_LOOKED) {
         for folder in OLD_HOME {
             if home.dir.stat(cx, &Path::new(folder)?).map_err(|error| CliError::Store(StoreFailure::Look { folder, error }))?.is_some() {
                 items.push(std::format!("~/.blaze/{folder}"));
@@ -631,7 +629,7 @@ pub fn old_home<D: Driver>(cx: &Cx, home: &Home, root: &Dir<ReadWrite>, checkout
         }
         lent.root(OLD_HOME_LOOKED, &[]).map_err(|error| CliError::Store(StoreFailure::Place(PlaceError::Lent(error))))?;
     }
-    if !looked(&checkout_root) {
+    if !lent.has_root(&checkout_root) {
         for old in OLD_CHECKOUT {
             if root.stat(cx, &Path::new(old)?).map_err(|error| CliError::Store(StoreFailure::Look { folder: old, error }))?.is_some() {
                 items.push(std::string::String::from(old));
@@ -846,16 +844,8 @@ pub(crate) fn boot_fact(boot: &blaze_core::Boot) -> u64 {
 pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool, clock: &Clock, err: &Out) -> Result<roots::CleanupLine, CliError> {
     let ns = |clock: &Clock| u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX);
     let answered = ns(clock);
-    // The whole stretch after the answer at the after-answer class (plain_place
-    // `AFTER_ANSWER_QOS`): the commit and the sweep below, given back at the return. The
-    // commit's own scope then finds the thread there already and changes nothing.
-    #[cfg(target_os = "macos")]
-    let _held = match plain_place::AFTER_ANSWER_QOS {
-        plain_place::AfterAnswerQos::Scoped => Some(
-            blaze_core::threads::qos::Lowered::at_most(blaze_core::threads::qos::AFTER_ANSWER).map_err(PlaceError::Qos)?,
-        ),
-        plain_place::AfterAnswerQos::AsCalled => None,
-    };
+    // Queue lease release (if this process held one) before testing whether a commit is owed.
+    lent.release_lease();
     let needs_hk = lent.needs_housekeeping(lent.wall_ns());
     let bg_detached = home.bg_gc.is_detached();
     // Warm no-op fast path: when needs_housekeeping is false, 0 slices and 0 spawns.
@@ -864,10 +854,43 @@ pub fn after_answer_printed(cx: &Cx, lent: CommandLent, home: &Home, stats: bool
     // detached `blaze gc --background` (QOS_CLASS_BACKGROUND + non-blocking gc.lock) so CLI
     // exit is never delayed. In simulated worlds without a spawner, run inline slices.
     let slices = if needs_hk && !bg_detached { AFTER_ANSWER_SLICES } else { 0 };
-    let after = plain_place::after_answer(cx, &lent, slices)?;
-    let commit_ns = ns(clock).saturating_sub(answered);
-    let spawn_bg = bg_detached && (needs_hk || lent.needs_housekeeping(lent.wall_ns()));
-    drop(lent);
+    let has_work = slices > 0 || lent.needs_commit() || lent.needs_seal();
+    let (after, commit_ns, spawn_bg) = if !has_work {
+        let named = lent.named();
+        let before = lent.put_tally();
+        let cleanup = roots::CleanupLine {
+            roots: named.roots,
+            keys: named.keys,
+            indexed: named.indexed,
+            swept_bytes: 0,
+            slices: 0,
+            carried: lent.carried(),
+            leases: u32::try_from(lent.leases_len()).unwrap_or(u32::MAX),
+            put: roots::PutLine { before_answer: before, after_answer: blaze_cas::plain::PutTally::default() },
+        };
+        let after = plain_place::AfterAnswer { cleanup, ..plain_place::AfterAnswer::default() };
+        let commit_ns = ns(clock).saturating_sub(answered);
+        let spawn_bg = bg_detached && needs_hk;
+        drop(lent);
+        (after, commit_ns, spawn_bg)
+    } else {
+        // The whole stretch after the answer at the after-answer class (plain_place
+        // `AFTER_ANSWER_QOS`): the commit and the sweep below, given back at the return. The
+        // commit's own scope then finds the thread there already and changes nothing.
+        #[cfg(target_os = "macos")]
+        let _held = match plain_place::AFTER_ANSWER_QOS {
+            plain_place::AfterAnswerQos::Scoped => Some(
+                blaze_core::threads::qos::Lowered::at_most(blaze_core::threads::qos::AFTER_ANSWER).map_err(PlaceError::Qos)?,
+            ),
+            plain_place::AfterAnswerQos::AsCalled => None,
+        };
+        let after = plain_place::after_answer(cx, &lent, slices)?;
+        let commit_ns = ns(clock).saturating_sub(answered);
+        let manifest_changed = after.segments_written > 0 || after.sealed || after.compaction_slices > 0;
+        let spawn_bg = bg_detached && (needs_hk || (manifest_changed && lent.needs_housekeeping(lent.wall_ns())));
+        drop(lent);
+        (after, commit_ns, spawn_bg)
+    };
     if spawn_bg {
         let cx = cx.span("store after answer: spawn detached background gc");
         home.bg_gc.spawn(&cx, err);

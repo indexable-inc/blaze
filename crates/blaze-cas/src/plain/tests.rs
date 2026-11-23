@@ -1899,7 +1899,7 @@ fn every_store_format_names_the_place() {
     for not in ["", "f5", "s2f5", "f05s2", "f5s2x", "f5s", "fs2", "seg-0000000000000001", "head", "f99999999999s2"] {
         assert_eq!(format::PlaceName::parse(not), None, "{not:?} read as a store's folder");
     }
-    for leaf in ["head", "flip", "seg-0000000000000001", "manifests-00000000000000ff"] {
+    for leaf in ["head", "flip", "bloom", "seg-0000000000000001", "manifests-00000000000000ff"] {
         assert!(super::store_leaf(leaf), "{leaf}");
     }
     for leaf in ["CACHEDIR.TAG", "f5s2", "seg-1", "notes"] {

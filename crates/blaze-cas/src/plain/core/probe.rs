@@ -160,6 +160,7 @@ impl<A: Allocator + Clone> Plain<A> {
         self.view.clear();
         self.view.extend((0..segs.len()).filter(|&row| segs[row].local && !dropped.contains(&segs[row].id)));
         self.view.sort_unstable_by(|&a, &b| segs[b].count.cmp(&segs[a].count).then(b.cmp(&a)));
+        self.last_hit = None;
     }
 
     /// The mapped segment of `row`, when it is mapped, proved and not lost.
@@ -182,8 +183,9 @@ impl<A: Allocator + Clone> Plain<A> {
     }
 
     /// The record under `key` in `spaces` (asked in their order: in each, what this process
-    /// holds uncommitted, then its rows in probe order), mapping at most ONE segment a call:
-    /// see the module's docs. The store must be ready (not mid-commit).
+    /// holds uncommitted, then already-mapped rows, then an optional creation-generation hint,
+    /// then remaining unmapped rows in probe order with verified Bloom filtering), mapping at
+    /// most ONE segment a call: see the module's docs. The store must be ready (not mid-commit).
     pub fn find(&mut self, spaces: &[Namespace], key: &Key, now_ns: u64, effects: &mut Vec<Effect>) -> Result<Probe, StoreError> {
         if let Some(why) = &self.broken {
             return Err(why.clone());
@@ -191,20 +193,94 @@ impl<A: Allocator + Clone> Plain<A> {
         if !self.ready() {
             return Err(StoreError::Busy { phase: self.what() });
         }
+        let hint_gen = self.hint_gen;
         let every = self.plant() == Plant::IgnoresNamespace;
         for space in spaces {
             if let Some((_, entry)) = self.held_in(*space, key) {
                 return Ok(Probe::Hit(Found { key: *key, tag: entry.tag, namespace: *space, at: At::Held }));
             }
-            let mut next = 0;
-            while next < self.view.len() {
-                let row = self.view[next];
-                next += 1;
+            // Pass 1: probe already-mapped segments first (zero syscalls / zero mmaps), starting
+            // with the most recently hit segment for intra-commit locality (root -> pointer -> lines).
+            let mut tried_last: Option<usize> = None;
+            if let Some(last_row) = self.last_hit
+                && let Some(seg) = self.manifest.segments.get(last_row).copied()
+                && seg.local
+                && (every || seg.namespace == *space)
+                && !self.dropped.contains(&seg.id)
+                && let Some(&map) = self.by_id.get(&seg.id)
+            {
+                tried_last = Some(last_row);
+                if self.may_contain_row(last_row, key) {
+                    self.probes.probes += 1;
+                    if let Some((map, entry)) = self.probe(map, key) {
+                        return Ok(Probe::Hit(Found { key: *key, tag: entry.tag, namespace: seg.namespace, at: At::Mapped { map, entry } }));
+                    }
+                }
+            }
+            for i in 0..self.view.len() {
+                let Some(&row) = self.view.get(i) else {
+                    break;
+                };
+                if tried_last == Some(row) {
+                    continue;
+                }
+                let Some(&seg) = self.manifest.segments.get(row) else {
+                    continue;
+                };
+                if (!every && seg.namespace != *space) || self.dropped.contains(&seg.id) {
+                    continue;
+                }
+                let Some(&map) = self.by_id.get(&seg.id) else {
+                    continue;
+                };
+                if !self.may_contain_row(row, key) {
+                    continue;
+                }
+                self.probes.probes += 1;
+                if let Some((map, entry)) = self.probe(map, key) {
+                    self.last_hit = Some(row);
+                    return Ok(Probe::Hit(Found { key: *key, tag: entry.tag, namespace: seg.namespace, at: At::Mapped { map, entry } }));
+                }
+            }
+            // Pass 2: if a creation generation hint was supplied (e.g. from a manifest root),
+            // probe unmapped segments of that generation before walking older/larger segments.
+            if let Some(target_gen) = hint_gen {
+                for i in 0..self.view.len() {
+                    let Some(&row) = self.view.get(i) else {
+                        break;
+                    };
+                    let Some(&seg) = self.manifest.segments.get(row) else {
+                        continue;
+                    };
+                    if seg.generation != target_gen || (!every && seg.namespace != *space) || self.dropped.contains(&seg.id) {
+                        continue;
+                    }
+                    if self.by_id.contains_key(&seg.id) || !self.may_contain_row(row, key) {
+                        continue;
+                    }
+                    if let Some(probe) = self.probe_row(row, key, now_ns, effects)? {
+                        if matches!(probe, Probe::Hit(_)) {
+                            self.last_hit = Some(row);
+                        }
+                        return Ok(probe);
+                    }
+                }
+            }
+            // Pass 3: remaining unmapped / parked segments in probe order, skipping segments whose
+            // verified Bloom filter proves `key` is absent.
+            for i in 0..self.view.len() {
+                let row = self.view[i];
                 let seg = self.manifest.segments[row];
                 if (!every && seg.namespace != *space) || self.dropped.contains(&seg.id) {
                     continue;
                 }
+                if self.by_id.contains_key(&seg.id) || !self.may_contain_row(row, key) {
+                    continue;
+                }
                 if let Some(probe) = self.probe_row(row, key, now_ns, effects)? {
+                    if matches!(probe, Probe::Hit(_)) {
+                        self.last_hit = Some(row);
+                    }
                     return Ok(probe);
                 }
             }
@@ -278,6 +354,9 @@ impl<A: Allocator + Clone> Plain<A> {
         let mut rows: Vec<usize, A> = Vec::new_in(self.alloc.clone());
         rows.extend(self.newest_rows(space));
         for row in rows {
+            if !self.may_contain_row(row, key) {
+                continue;
+            }
             if let Some(probe) = self.probe_row(row, key, now_ns, effects)? {
                 return Ok(probe);
             }
@@ -288,7 +367,10 @@ impl<A: Allocator + Clone> Plain<A> {
     /// [`Plain::find_newest`] over the mapped rows alone, committed records only: the map index
     /// and the entry. The commit's layout and compaction ask it, over a whole store.
     pub(crate) fn newest_mapped(&self, space: Namespace, key: &Key) -> Option<(usize, Entry)> {
-        self.newest_rows(space).filter_map(|row| self.mapped_row(row)).find_map(|at| self.probe(at, key))
+        self.newest_rows(space)
+            .filter(|&row| self.may_contain_row(row, key))
+            .filter_map(|row| self.mapped_row(row))
+            .find_map(|at| self.probe(at, key))
     }
 
     /// The bytes of what [`Plain::find`] found, in place: no check (a mapped segment is

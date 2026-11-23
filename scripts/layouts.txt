@@ -29,6 +29,8 @@ crates/blaze-cad-field/src/tape.rs	MAGIC	none
 crates/blaze-cad-field/src/tape.rs	SCHEMA	none
 crates/blaze-cad-mesh/src/contour.rs	CONTOUR_SCHEMA	none
 crates/blaze-cad/src/check.rs	CHECK_SCHEMA	none
+crates/blaze-cas/src/plain/bloom.rs	MAGIC	test previous_bloom_version_is_ignored
+crates/blaze-cas/src/plain/bloom.rs	VERSION	test previous_bloom_version_is_ignored
 crates/blaze-cas/src/plain/bottom.rs	MAGIC	none
 crates/blaze-cas/src/plain/format.rs	FOOTER_MAGIC	none
 crates/blaze-cas/src/plain/format.rs	FORMAT	none
