@@ -24,7 +24,7 @@ blaze-body-lower	21
 blaze-borrow	2
 blaze-bstd-convert	109
 blaze-build	551
-blaze-build-script	247
+blaze-build-script	246
 blaze-bytes	3
 blaze-c	325
 blaze-cad	172
@@ -137,7 +137,7 @@ blaze-spawn	9
 blaze-sqlite	1
 blaze-squeeze	112
 blaze-stage	39
-blaze-std	630
+blaze-std	626
 blaze-store-check	9
 blaze-surface	205
 blaze-swiss	38

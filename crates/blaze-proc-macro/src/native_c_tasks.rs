@@ -53,7 +53,6 @@ use blaze_build_script::c_tasks_built::Report;
 use blaze_build_script::c_tasks_tree::{self, FIXED_ENV, TREE_LINES, TreeError, TreeExit, TreeJob, TreeRan, TreeRunner};
 use blaze_build_script::host_tools::{self, HostTool};
 use blaze_build_script::key::HostToolKey;
-use blaze_build_script::native::Grant;
 use blaze_build_script::outputs::{FileLimits, Outputs, OutputsRef, StoredFile};
 use blaze_core::wait::Deadline;
 use blaze_ids::ContentId;
@@ -868,11 +867,8 @@ impl TreeRunner for ShelfTree<'_> {
         let mut exec: AVec<'a, &str> = Vec::with_capacity_in(held.len(), alloc);
         exec.extend(held.iter().map(|program| program.as_str()));
         let read_roots = self.read_roots(alloc);
-        let mut reads: AVec<'a, &str> = Vec::with_capacity_in(read_roots.len(), alloc);
-        reads.extend(read_roots.iter().map(|(folder, _)| *folder));
         let out_only = [out.as_str()];
         let exec_under: &[&str] = if runs_out_dir { &out_only } else { &[] };
-        let writes = [folder.as_str()];
 
         // 4. The roots: each read folder a tree root by its digest, the tree's folder the
         // output root (`out` and `tmp` under it).
@@ -995,9 +991,6 @@ impl TreeRunner for ShelfTree<'_> {
                 }
             }
 
-            // The grant said as the Seatbelt profile would say it, before anything runs.
-            blaze_build_script::native::seatbelt_with(&Grant { program: program.as_str(), exec: &exec, read: &reads, write: &writes }, exec_under, alloc)
-                .map_err(|why| fail(&["the Seatbelt grant of a process tree: ", &why.to_string()]))?;
             let roots = Roots::new(&root_list).map_err(|_| fail(&["the roots of a process tree were refused"]))?;
             let now = clock.now().since_start();
             let left = ends.saturating_sub(now);

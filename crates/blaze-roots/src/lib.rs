@@ -63,6 +63,7 @@ mod mounts;
 mod path;
 mod plant;
 mod roots;
+pub mod seatbelt;
 
 #[cfg(test)]
 mod tests;

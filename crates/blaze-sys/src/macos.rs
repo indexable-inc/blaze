@@ -383,6 +383,9 @@ pub mod cold {
         fn mkdir(path: *const c_char, mode: u16) -> c_int;
         /// unistd.h.
         fn pread(fd: c_int, into: *mut c_void, len: usize, at: i64) -> isize;
+        /// libproc.h; `buffer` is an array of `pid_t` (`i32`), `buffersize` in bytes; returns
+        /// the count of PIDs written or -1 on error.
+        fn proc_listpgrppids(pgrpid: i32, buffer: *mut c_void, buffersize: c_int) -> c_int;
         /// libproc.h; `info` is a `rusage_info_*`.
         fn proc_pid_rusage(pid: c_int, flavor: c_int, info: *mut c_void) -> c_int;
         /// pthread.h; `attr` is a `pthread_attr_t`.
@@ -595,11 +598,50 @@ impl RusageInfoV4 {
     pub const PAGEINS: usize = 4;
     /// `ri_phys_footprint`, bytes.
     pub const FOOTPRINT: usize = 7;
+    /// `ri_child_user_time` and `ri_child_system_time`, in Mach absolute time units (reaped
+    /// children of this process).
+    pub const CHILD_USER: usize = 10;
+    pub const CHILD_SYSTEM: usize = 11;
     /// `ri_lifetime_max_phys_footprint`, bytes.
     pub const MOST_FOOTPRINT: usize = 28;
     /// `ri_instructions` and `ri_cycles`: the whole process's, every thread that ran.
     pub const INSTRUCTIONS: usize = 29;
     pub const CYCLES: usize = 30;
+
+    /// This process's own user + system CPU time, in Mach absolute time units.
+    #[inline]
+    #[blaze::noalloc]
+    #[blaze::nopanic]
+    pub const fn self_cpu_ticks(&self) -> u64 {
+        let [user, system, ..] = self.words;
+        user.saturating_add(system)
+    }
+
+    /// Reaped children's user + system CPU time, in Mach absolute time units.
+    #[inline]
+    #[blaze::noalloc]
+    #[blaze::nopanic]
+    pub const fn child_cpu_ticks(&self) -> u64 {
+        let [_, _, _, _, _, _, _, _, _, _, child_user, child_system, ..] = self.words;
+        child_user.saturating_add(child_system)
+    }
+
+    /// Combined user + system CPU time (self + reaped children), in Mach absolute time units.
+    #[inline]
+    #[blaze::noalloc]
+    #[blaze::nopanic]
+    pub const fn total_cpu_ticks(&self) -> u64 {
+        self.self_cpu_ticks().saturating_add(self.child_cpu_ticks())
+    }
+
+    /// Physical footprint (`ri_phys_footprint`), in bytes.
+    #[inline]
+    #[blaze::noalloc]
+    #[blaze::nopanic]
+    pub const fn footprint(&self) -> u64 {
+        let [_, _, _, _, _, _, _, footprint, ..] = self.words;
+        footprint
+    }
 }
 
 /// `getrusage(RUSAGE_SELF)` and `proc_pid_rusage(getpid(), RUSAGE_INFO_V4)`: what the whole
