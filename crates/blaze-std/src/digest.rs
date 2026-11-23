@@ -9,6 +9,7 @@
 //! - **Checksums**: [`Crc32`] (IEEE / ISO 3309) and [`Adler32`] (from `blaze-deflate`).
 
 pub use blaze_deflate::{Adler32, Crc32};
+pub use blaze_ed25519::sha512;
 pub use blaze_ids::b3::{Hasher as Blake3, OUT_LEN as BLAKE3_LEN, hash as blake3};
 pub use blaze_sha256::{Sha256, digest as sha256};
 

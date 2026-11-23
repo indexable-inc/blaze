@@ -45,7 +45,7 @@ crates/blaze-flow-lower	0	crates/blaze-borrow,crates/blaze-flow,crates/blaze-own
 crates/blaze-format	0	crates/blaze-format-core,crates/blaze-ids,crates/blaze-own
 crates/blaze-format-core	0	crates/blaze-ids,crates/blaze-own
 crates/blaze-git-fetch	0	crates/blaze-deflate,crates/blaze-own
-crates/blaze-glob	0	-
+crates/blaze-glob	0	crates/blaze-own
 crates/blaze-h1	0	crates/blaze-own
 crates/blaze-hash	0	crates/blaze-check,crates/blaze-own,crates/blaze-reclaim,crates/blaze-swiss
 crates/blaze-hashcons	0	crates/blaze-core,crates/blaze-format,crates/blaze-hash,crates/blaze-ids,crates/blaze-mem,crates/blaze-swiss
@@ -97,10 +97,11 @@ crates/blaze-solve	0	crates/blaze-hash,crates/blaze-own
 crates/blaze-source	3	crates/blaze-hash,crates/blaze-ids,crates/blaze-own,crates/blaze-semver
 crates/blaze-spawn	0	crates/blaze-ids,crates/blaze-own
 crates/blaze-spin	0	crates/blaze-check
-crates/blaze-std	4	crates/blaze-algebra,crates/blaze-alloc-count,crates/blaze-base64,crates/blaze-bitflags,crates/blaze-bytes,crates/blaze-cbor,crates/blaze-check,crates/blaze-core,crates/blaze-data,crates/blaze-deflate,crates/blaze-format,crates/blaze-h1,crates/blaze-hash,crates/blaze-hashcons,crates/blaze-http,crates/blaze-ids,crates/blaze-json,crates/blaze-kit,crates/blaze-mem,crates/blaze-memchr,crates/blaze-meter,crates/blaze-own,crates/blaze-phf,crates/blaze-radix,crates/blaze-reclaim,crates/blaze-report,crates/blaze-rng,crates/blaze-roots,crates/blaze-semver,crates/blaze-sha256,crates/blaze-sim,crates/blaze-spin,crates/blaze-sys,crates/blaze-tar,crates/blaze-text,crates/blaze-toml,crates/blaze-url
+crates/blaze-std	4	crates/blaze-algebra,crates/blaze-alloc-count,crates/blaze-base64,crates/blaze-bitflags,crates/blaze-bytes,crates/blaze-cbor,crates/blaze-check,crates/blaze-core,crates/blaze-data,crates/blaze-deflate,crates/blaze-ed25519,crates/blaze-format,crates/blaze-glob,crates/blaze-h1,crates/blaze-hash,crates/blaze-hashcons,crates/blaze-http,crates/blaze-ids,crates/blaze-json,crates/blaze-kit,crates/blaze-mem,crates/blaze-memchr,crates/blaze-meter,crates/blaze-own,crates/blaze-phf,crates/blaze-radix,crates/blaze-reclaim,crates/blaze-report,crates/blaze-rng,crates/blaze-roots,crates/blaze-semver,crates/blaze-sha256,crates/blaze-sim,crates/blaze-spin,crates/blaze-sys,crates/blaze-tab,crates/blaze-tar,crates/blaze-text,crates/blaze-toml,crates/blaze-url
 crates/blaze-surface	0	crates/blaze-format,crates/blaze-hash,crates/blaze-id,crates/blaze-own
 crates/blaze-swiss	0	crates/blaze-check,crates/blaze-int,crates/blaze-own
 crates/blaze-sys	0	-
+crates/blaze-tab	0	crates/blaze-data,crates/blaze-own
 crates/blaze-tar	0	crates/blaze-own
 crates/blaze-text	0	crates/blaze-int,crates/blaze-own
 crates/blaze-tier	0	crates/blaze-code,crates/blaze-ids,crates/blaze-lir,crates/blaze-own,crates/blaze-run

@@ -63,12 +63,16 @@ blaze-sha256.workspace = true
 blaze-spin.workspace = true
 # Pure `#![no_std]` leaf battery crates re-exported under `bstd::*` (zero third-party deps):
 # `bstd::base64`, `bstd::toml`, `bstd::semver`, `bstd::tar`, `bstd::search`, `bstd::bitflags`,
+# `bstd::tab`, `bstd::crypto::ed25519`, `bstd::digest::sha512`, `bstd::glob`,
 # and `bstd::compress` / `bstd::digest::{Crc32, Adler32}` (also used by `bstd::image`).
 blaze-base64.workspace = true
 blaze-bitflags.workspace = true
 blaze-deflate.workspace = true
+blaze-ed25519.workspace = true
+blaze-glob = { workspace = true, default-features = false }
 blaze-memchr.workspace = true
 blaze-semver.workspace = true
+blaze-tab.workspace = true
 blaze-tar.workspace = true
 blaze-toml.workspace = true
 

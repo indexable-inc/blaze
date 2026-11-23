@@ -12,15 +12,24 @@
 //! yet: they speak `std::path` and `std::io::Error` and return a vector on the global heap
 //! (wave-1124-sansio, W1 group a's report says what replaces them).
 
-#![feature(allocator_api)]
+#![cfg_attr(not(feature = "std"), no_std)]
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests;
 
 use core::alloc::Allocator;
 use core::fmt;
+#[cfg(feature = "std")]
 use std::alloc::Global;
-use std::path::{Component, Path, PathBuf, is_separator};
+#[cfg(feature = "std")]
+use std::path::{Component, Path, PathBuf};
+
+use blaze_own::Vec as OwnVec;
+
+#[inline]
+fn is_separator(c: char) -> bool {
+    c == '/' || c == '\\'
+}
 
 /// Why a pattern does not parse, as glob says it: `Pattern syntax error near position {pos}:
 /// {msg}`, `pos` a character index.
@@ -67,8 +76,8 @@ enum Token<A: Allocator> {
     AnySequence,
     /// `**`, with the separator after it when one followed.
     AnyRecursiveSequence,
-    AnyWithin(Vec<Class, A>),
-    AnyExcept(Vec<Class, A>),
+    AnyWithin(OwnVec<Class, A>),
+    AnyExcept(OwnVec<Class, A>),
 }
 
 /// By value, wherever either is allocated (a derive would ask `A: PartialEq`, which no
@@ -105,8 +114,8 @@ impl Class {
     }
 
     /// `[ab-z]`'s inside: a `-` between two characters makes a range, anywhere else it is one.
-    fn parse<A: Allocator>(inside: &[char], alloc: A) -> Vec<Class, A> {
-        let mut out = Vec::new_in(alloc);
+    fn parse<A: Allocator>(inside: &[char], alloc: A) -> OwnVec<Class, A> {
+        let mut out = OwnVec::new_in(alloc);
         let mut at = 0;
         while at < inside.len() {
             if at + 3 <= inside.len() && inside[at + 1] == '-' {
@@ -124,7 +133,7 @@ impl Class {
 /// A parsed pattern: the text it was parsed from, borrowed, and its tokens in `A`.
 #[derive(Clone, Debug)]
 pub struct Pattern<'a, A: Allocator> {
-    tokens: Vec<Token<A>, A>,
+    tokens: OwnVec<Token<A>, A>,
     original: &'a str,
     /// A `*`, `?` or `[` (glob's `has_metachars`): matching it needs a directory listed.
     meta: bool,
@@ -139,6 +148,7 @@ impl<A: Allocator, B: Allocator> PartialEq<Pattern<'_, B>> for Pattern<'_, A> {
 
 impl<A: Allocator> Eq for Pattern<'_, A> {}
 
+#[cfg(feature = "std")]
 impl<'a> Pattern<'a, Global> {
     /// `pattern` parsed on the global heap, or glob's error for it.
     ///
@@ -154,12 +164,12 @@ impl<'a, A: Allocator + Clone> Pattern<'a, A> {
     /// `pattern` parsed, its tokens in `alloc` (with the characters it is read through, freed
     /// on return), or glob's error for it.
     pub fn new_in(pattern: &'a str, alloc: A) -> Result<Pattern<'a, A>, PatternError> {
-        let chars: Vec<char, A> = {
-            let mut it = Vec::new_in(alloc.clone());
+        let chars: OwnVec<char, A> = {
+            let mut it = OwnVec::new_in(alloc.clone());
             it.extend(pattern.chars());
             it
         };
-        let mut tokens = Vec::new_in(alloc.clone());
+        let mut tokens = OwnVec::new_in(alloc.clone());
         let mut meta = false;
         let mut at = 0;
         while at < chars.len() {
@@ -236,18 +246,19 @@ impl<'a, A: Allocator + Clone> Pattern<'a, A> {
     /// flags are in the pattern's allocator, freed on return.
     pub fn matches(&self, text: &str) -> bool {
         let alloc = self.tokens.allocator();
-        let chars: Vec<char, A> = {
-            let mut it = Vec::new_in(alloc.clone());
+        let chars: OwnVec<char, A> = {
+            let mut it = OwnVec::new_in(alloc.clone());
             it.extend(text.chars());
             it
         };
         let n = chars.len();
         // `rest[p]`: the tokens from the one at hand on match `chars[p..]`; filled from the last
         // token back, starting from the empty pattern, which matches only the empty rest.
-        let mut rest = Vec::new_in(alloc.clone());
+        let mut rest = OwnVec::new_in(alloc.clone());
         rest.resize(n + 1, false);
         rest[n] = true;
-        let mut next = rest.clone();
+        let mut next = OwnVec::new_in(alloc.clone());
+        next.resize(n + 1, false);
         for token in self.tokens.iter().rev() {
             core::mem::swap(&mut rest, &mut next);
             // `next` is the tokens after this one; `rest` becomes this one's.
@@ -292,10 +303,12 @@ impl<'a, A: Allocator + Clone> Pattern<'a, A> {
     }
 
     /// Whether its first token is a literal `.`, so that it may match `.` and `..`.
+    #[cfg(feature = "std")]
     fn leading_dot(&self) -> bool {
         self.tokens.first() == Some(&Token::Char('.'))
     }
 
+    #[cfg(feature = "std")]
     fn recursive(&self) -> bool {
         self.tokens.len() == 1 && self.tokens[0] == Token::AnyRecursiveSequence
     }
@@ -306,6 +319,10 @@ impl<A: Allocator> fmt::Display for Pattern<'_, A> {
         f.write_str(self.original)
     }
 }
+
+#[cfg(feature = "std")]
+mod walk_std {
+    use super::*;
 
 /// What [`glob`] walks: a tree of directories, read through this.
 pub trait Tree {
@@ -359,7 +376,7 @@ pub fn glob<T: Tree>(tree: &T, pattern: &str) -> Result<Vec<Result<PathBuf, Glob
     let root_len = normalized.as_os_str().len() - rest.as_os_str().len();
     let scope = if root_len > 0 { PathBuf::from(&pattern[..root_len]) } else { PathBuf::from(".") };
 
-    let mut parts = Vec::new_in(Global);
+    let mut parts = OwnVec::new_in(Global);
     for component in pattern[root_len.min(pattern.len())..].split_terminator(is_separator) {
         parts.push(Pattern::new(component)?);
     }
@@ -369,7 +386,7 @@ pub fn glob<T: Tree>(tree: &T, pattern: &str) -> Result<Vec<Result<PathBuf, Glob
     let require_dir = pattern.chars().next_back().is_some_and(is_separator);
 
     let mut out = Vec::new_in(Global);
-    let mut todo: Vec<Result<Todo, GlobError>, Global> = Vec::new_in(Global);
+    let mut todo: OwnVec<Result<Todo, GlobError>, Global> = OwnVec::new_in(Global);
     let scope_dir = tree.is_dir(&scope);
     fill(tree, &mut todo, &parts, 0, &scope, scope_dir);
     while let Some(next) = todo.pop() {
@@ -418,8 +435,8 @@ pub fn glob<T: Tree>(tree: &T, pattern: &str) -> Result<Vec<Result<PathBuf, Glob
     Ok(out)
 }
 
-fn fill<T: Tree>(tree: &T, todo: &mut Vec<Result<Todo, GlobError>, Global>, parts: &[Pattern<'_, Global>], at: usize, path: &Path, dir: bool) {
-    let add = |todo: &mut Vec<Result<Todo, GlobError>, Global>, next: PathBuf| {
+fn fill<T: Tree>(tree: &T, todo: &mut OwnVec<Result<Todo, GlobError>, Global>, parts: &[Pattern<'_, Global>], at: usize, path: &Path, dir: bool) {
+    let add = |todo: &mut OwnVec<Result<Todo, GlobError>, Global>, next: PathBuf| {
         let next_dir = tree.is_dir(&next);
         if at + 1 == parts.len() {
             todo.push(Ok(Todo { path: next, dir: next_dir, at: usize::MAX }));
@@ -457,3 +474,7 @@ fn fill<T: Tree>(tree: &T, todo: &mut Vec<Result<Todo, GlobError>, Global>, part
         }
     }
 }
+}
+
+#[cfg(feature = "std")]
+pub use walk_std::{GlobError, Tree, glob};

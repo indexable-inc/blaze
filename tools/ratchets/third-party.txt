@@ -70,6 +70,7 @@ blaze-format-core	0	0	8
 blaze-format-tiers	1	0	40
 blaze-fuzz	0	0	8
 blaze-git-fetch	0	0	1
+blaze-glob	0	0	1
 blaze-graph	5	0	64
 blaze-h1	0	0	1
 blaze-h2	0	0	1
