@@ -318,4 +318,82 @@ fn batteries_are_exposed_and_work_in_a_frame() {
     let mut writer = crate::tar::Writer::new();
     writer.finish(&mut tar_buf).expect("finish tar");
     assert!(!tar_buf.is_empty());
+
+    // Batch 2 batteries: diff v2, glob, regex, time, crypto, table, markdown, yaml, dotenv, ws, sse, tab
+    let merged = crate::diff::merge3(
+        "a\nb\nc\n",
+        "A\nb\nc\n",
+        "a\nb\nC\n",
+        crate::diff::MergeOpts {
+            algorithm: crate::diff::Algorithm::Myers,
+            style: crate::diff::ConflictStyle::Standard,
+            base_label: "base",
+            ours_label: "ours",
+            theirs_label: "theirs",
+            budget: crate::diff::DEFAULT_BUDGET,
+            alloc,
+        },
+    )
+    .expect("merge3");
+    assert!(merged.is_clean());
+    let mut merged_text = blaze_own::String::new_in(alloc);
+    merged
+        .render_into(crate::diff::ConflictStyle::Standard, "base", "ours", "theirs", &mut merged_text)
+        .expect("render merge");
+    assert_eq!(merged_text.as_str(), "A\nb\nC\n");
+
+    let globs = crate::glob::GlobSet::new(&["**/*.rs", "!**/target/**"], alloc).expect("globset");
+    assert!(globs.is_match("src/lib.rs"));
+    assert!(!globs.is_match("target/lib.rs"));
+
+    let re = crate::regex::Regex::compile(r"([a-z]+)-(\d+)", crate::regex::RegexLimits::USUAL, alloc)
+        .expect("regex");
+    assert!(re.is_match("blaze-42", crate::regex::RegexLimits::USUAL.most_steps, alloc).expect("match"));
+
+    let dt = crate::time::DateTime::parse_rfc3339("2026-11-23T12:34:56Z").expect("rfc3339");
+    assert_eq!(dt.date.year(), 2026);
+
+    let aead = crate::crypto::ChaCha20Poly1305::new([7u8; 32]);
+    let mut buf = [b'h', b'i'];
+    let tag = aead.seal_in_place([1u8; 12], b"ad", &mut buf);
+    aead.open_in_place([1u8; 12], b"ad", &mut buf, &tag).expect("open");
+    assert_eq!(&buf, b"hi");
+
+    let rendered = crate::table::render_table_in(
+        &["k", "v"],
+        &[&["a", "1"]],
+        &[crate::table::Align::Left, crate::table::Align::Right],
+        crate::table::TableOpts {
+            style: crate::table::BoxStyle::Rounded,
+            padding: 1,
+            max_col_width: None,
+        },
+        alloc,
+    )
+    .expect("table");
+    assert!(rendered.as_str().contains('╭'));
+
+    let html = crate::markdown::to_html_in("# Hi\n", crate::markdown::MarkdownLimits::USUAL, alloc)
+        .expect("md");
+    assert!(html.as_str().contains("<h1>Hi</h1>"));
+
+    let y = crate::yaml::read_in("ok: true\n", crate::yaml::YamlLimits::USUAL, alloc).expect("yaml");
+    assert!(matches!(y, crate::data::Value::Map(_)));
+
+    let envs = crate::dotenv::parse_in("FOO=bar\n", crate::dotenv::DotenvLimits::USUAL, alloc)
+        .expect("dotenv");
+    assert_eq!(envs.len(), 1);
+    assert_eq!(envs[0].value.as_str(), "bar");
+
+    let accept = crate::ws::accept_key("dGhlIHNhbXBsZSBub25jZQ==");
+    assert_eq!(&accept, b"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+
+    let mut sse = crate::sse::SseParser::new_in(crate::sse::SseLimits::USUAL, alloc);
+    let mut evs = crate::vec::Vec::new_in(alloc);
+    sse.feed(b"data: hi\n\n", &mut evs).expect("sse");
+    assert_eq!(evs.len(), 1);
+
+    let tab_heap = blaze_own::testing::heap();
+    let tab_doc = crate::tab::read(b"[[a b]; [1 2]]", crate::tab::Limits::SHIPPED, tab_heap.alloc()).expect("tab");
+    assert!(matches!(tab_doc, crate::data::Value::List(_)));
 }

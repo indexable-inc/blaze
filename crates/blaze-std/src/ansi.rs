@@ -17,6 +17,8 @@ use core::fmt::{self, Write as _};
 
 use blaze_own::{AllocFailure, String};
 
+pub use crate::table::{wrap_ansi_in, wrap_ansi_into};
+
 /// One piece yielded by [`segments`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Segment<'a> {

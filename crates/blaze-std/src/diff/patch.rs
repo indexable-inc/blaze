@@ -388,6 +388,178 @@ pub(crate) fn format_patch_ansi_into<W: fmt::Write>(patch_text: &str, out: &mut 
     Ok(())
 }
 
+/// Format a unified diff string with ANSI colors AND inline word-level emphasis on paired `-`/`+`
+/// line blocks (highlighting the exact changed words in bold red/green, like `delta` / GitHub).
+pub(crate) fn format_patch_ansi_inline_into<A: Allocator + Copy, W: fmt::Write>(
+    patch_text: &str,
+    alloc: A,
+    out: &mut W,
+) -> fmt::Result {
+    use crate::ansi::{Color, Style};
+
+    const HEADER: Style = Style::new().bold();
+    const HUNK: Style = Style::new().fg(Color::Cyan);
+    const DEL: Style = Style::new().fg(Color::Red);
+    const DEL_EMPH: Style = Style::new().fg(Color::BrightRed).bold().underline();
+    const ADD: Style = Style::new().fg(Color::Green);
+    const ADD_EMPH: Style = Style::new().fg(Color::BrightGreen).bold().underline();
+    const META: Style = Style::new().dim();
+
+    let Ok(raw_lines) = split_lines(patch_text, alloc) else {
+        return format_patch_ansi_into(patch_text, out);
+    };
+
+    let mut i = 0usize;
+    while let Some(&raw) = raw_lines.get(i) {
+        let (line, has_nl) = strip_lf(raw);
+        if line.starts_with("--- ") || line.starts_with("+++ ") || line.starts_with("diff ") {
+            write!(out, "{}", HEADER.paint(line))?;
+            if has_nl {
+                out.write_char('\n')?;
+            }
+            i += 1;
+            continue;
+        }
+        if line.starts_with("@@ ") {
+            write!(out, "{}", HUNK.paint(line))?;
+            if has_nl {
+                out.write_char('\n')?;
+            }
+            i += 1;
+            continue;
+        }
+        if line.starts_with('\\') {
+            write!(out, "{}", META.paint(line))?;
+            if has_nl {
+                out.write_char('\n')?;
+            }
+            i += 1;
+            continue;
+        }
+        if line.starts_with('-') {
+            // Collect consecutive `-` lines followed immediately by consecutive `+` lines.
+            let del_start = i;
+            while let Some(&r) = raw_lines.get(i) {
+                let (l, _) = strip_lf(r);
+                if l.starts_with('-') && !l.starts_with("--- ") {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            let del_end = i;
+            let add_start = i;
+            while let Some(&r) = raw_lines.get(i) {
+                let (l, _) = strip_lf(r);
+                if l.starts_with('+') && !l.starts_with("+++ ") {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            let add_end = i;
+            let del_count = del_end - del_start;
+            let add_count = add_end - add_start;
+            let paired = del_count.min(add_count);
+
+            // Render deleted lines, word-diffing paired indices against their corresponding `+` line.
+            for idx in 0..del_count {
+                let Some(&dr) = raw_lines.get(del_start + idx) else { continue };
+                let (dl, d_nl) = strip_lf(dr);
+                let d_body = dl.strip_prefix('-').unwrap_or(dl);
+                write!(out, "{}", DEL.paint('-'))?;
+                if idx < paired
+                    && let Some(&ar) = raw_lines.get(add_start + idx)
+                {
+                    let (al, _) = strip_lf(ar);
+                    let a_body = al.strip_prefix('+').unwrap_or(al);
+                    if let Ok(word_changes) = super::words(
+                        d_body,
+                        a_body,
+                        super::DiffOpts {
+                            algorithm: super::Algorithm::Myers,
+                            budget: super::DEFAULT_BUDGET,
+                            alloc,
+                        },
+                    ) {
+                        for ch in word_changes.as_slice() {
+                            match *ch {
+                                super::TextChange::Equal(s) => write!(out, "{}", DEL.paint(s))?,
+                                super::TextChange::Delete(s) => {
+                                    write!(out, "{}", DEL_EMPH.paint(s))?
+                                }
+                                super::TextChange::Insert(_) => {}
+                            }
+                        }
+                    } else {
+                        write!(out, "{}", DEL.paint(d_body))?;
+                    }
+                } else {
+                    write!(out, "{}", DEL.paint(d_body))?;
+                }
+                if d_nl {
+                    out.write_char('\n')?;
+                }
+            }
+
+            // Render added lines, word-diffing paired indices against their corresponding `-` line.
+            for idx in 0..add_count {
+                let Some(&ar) = raw_lines.get(add_start + idx) else { continue };
+                let (al, a_nl) = strip_lf(ar);
+                let a_body = al.strip_prefix('+').unwrap_or(al);
+                write!(out, "{}", ADD.paint('+'))?;
+                if idx < paired
+                    && let Some(&dr) = raw_lines.get(del_start + idx)
+                {
+                    let (dl, _) = strip_lf(dr);
+                    let d_body = dl.strip_prefix('-').unwrap_or(dl);
+                    if let Ok(word_changes) = super::words(
+                        d_body,
+                        a_body,
+                        super::DiffOpts {
+                            algorithm: super::Algorithm::Myers,
+                            budget: super::DEFAULT_BUDGET,
+                            alloc,
+                        },
+                    ) {
+                        for ch in word_changes.as_slice() {
+                            match *ch {
+                                super::TextChange::Equal(s) => write!(out, "{}", ADD.paint(s))?,
+                                super::TextChange::Insert(s) => {
+                                    write!(out, "{}", ADD_EMPH.paint(s))?
+                                }
+                                super::TextChange::Delete(_) => {}
+                            }
+                        }
+                    } else {
+                        write!(out, "{}", ADD.paint(a_body))?;
+                    }
+                } else {
+                    write!(out, "{}", ADD.paint(a_body))?;
+                }
+                if a_nl {
+                    out.write_char('\n')?;
+                }
+            }
+            continue;
+        }
+        if line.starts_with('+') {
+            write!(out, "{}", ADD.paint(line))?;
+            if has_nl {
+                out.write_char('\n')?;
+            }
+            i += 1;
+            continue;
+        }
+        out.write_str(line)?;
+        if has_nl {
+            out.write_char('\n')?;
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 /// Parse one unified diff patch from `text`.
 pub(crate) fn parse_single_patch<'a, A: Allocator + Copy>(
     text: &'a str,

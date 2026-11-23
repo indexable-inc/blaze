@@ -969,6 +969,7 @@ pub(crate) fn run(
                     out,
                     err,
                     select,
+                    open: blaze_run::viewer::OpenExplore::No,
                     grants: &[],
                     args: &[],
                 };

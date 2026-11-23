@@ -27,16 +27,20 @@ use core::hash::Hash;
 
 use blaze_own::{AllocFailure, String, Vec};
 
+mod merge;
 mod myers;
 mod patch;
 mod patience;
 #[cfg(test)]
 mod tests;
 mod tokenize;
+mod value;
 
+pub use merge::{ConflictStyle, MergeOpts, MergeRegion, MergeResult, merge3};
 pub use myers::DEFAULT_BUDGET;
 pub use patch::{DiffStats, Hunk, HunkLine, Patch};
 use tokenize::Token;
+pub use value::{ValuePatchError, ValuePatchOp, apply_value_patch, diff_values};
 
 /// Which diff algorithm to run.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -473,6 +477,32 @@ pub fn format_patch_ansi<A: Allocator>(patch_text: &str, alloc: A) -> Result<Str
 /// Write ANSI-colored unified diff text into `out`.
 pub fn format_patch_ansi_into<W: fmt::Write>(patch_text: &str, out: &mut W) -> fmt::Result {
     patch::format_patch_ansi_into(patch_text, out)
+}
+
+/// Highlight unified diff text with ANSI colors AND inline word-level emphasis on paired `-`/`+`
+/// lines (like `delta` / GitHub's inline diff view).
+pub fn format_patch_ansi_inline<A: Allocator + Copy>(
+    patch_text: &str,
+    alloc: A,
+) -> Result<String<A>, AllocFailure> {
+    let mut out = String::try_with_capacity_in(patch_text.len(), alloc)?;
+    format_patch_ansi_inline_into(patch_text, alloc, &mut out).map_err(|_| {
+        AllocFailure::CapacityOverflow {
+            what: "bstd::diff::format_patch_ansi_inline",
+            len: out.len(),
+            additional: 1,
+        }
+    })?;
+    Ok(out)
+}
+
+/// Write inline word-highlighted ANSI unified diff text into `out`.
+pub fn format_patch_ansi_inline_into<A: Allocator + Copy, W: fmt::Write>(
+    patch_text: &str,
+    alloc: A,
+    out: &mut W,
+) -> fmt::Result {
+    patch::format_patch_ansi_inline_into(patch_text, alloc, out)
 }
 
 /// Parse a single-file unified diff patch under explicit [`ParsePatchLimits`].

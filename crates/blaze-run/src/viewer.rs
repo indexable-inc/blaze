@@ -200,21 +200,30 @@ pub fn read(bytes: &[u8], most_slots: usize, slots: &mut AVec<'_, SlotId>) -> Re
 /// Default loopback port for `blaze-launcher --viewer` (matches `site/explore/protocol.ts`).
 pub const DEFAULT_VIEWER_PORT: u16 = 41937;
 
-/// Hosted Explore UI URL opened by default when no viewer tab is connected.
+/// Hosted Explore UI URL opened by `blaze run --open` when no viewer tab is connected.
 pub const EXPLORE_URL: &str = "https://ix.dev/blaze/explore";
 
 /// Default idle expiry for the local viewer helper (rule 70: no immortal daemon without runs or tabs).
 pub const DEFAULT_IDLE_EXPIRY_NS: u64 = 120 * 1_000_000_000;
 
+/// Whether `blaze run` was asked to open the Explore web page (`--open`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum OpenExplore {
+    /// Default: do not open a browser tab.
+    #[default]
+    No,
+    /// Explicitly requested (`blaze run --open`): ensure the local viewer daemon is running and
+    /// open Explore unless a tab is already connected.
+    Open,
+}
+
 /// Inputs to the sans-IO "should `blaze run` open a browser tab?" decision.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct OpenInput {
+    /// Whether the user opted in via `blaze run --open`.
+    pub requested: OpenExplore,
     /// Number of Explore tabs currently connected to the local viewer (`/api/info`).
     pub active_viewers: u32,
-    /// True when stdin/stderr is an interactive terminal (never pop tabs in CI/piped scripts).
-    pub interactive_tty: bool,
-    /// True when `BLAZE_NO_OPEN=1` (or equivalent opt-out) is set.
-    pub suppressed_by_env: bool,
     /// True when the local viewer daemon is reachable on loopback.
     pub viewer_reachable: bool,
 }
@@ -222,31 +231,30 @@ pub struct OpenInput {
 /// The pure decision of whether to launch the browser for `ix.dev/blaze/explore`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OpenDecision {
-    /// Open the Explore URL: zero tabs are currently connected.
+    /// Open the Explore URL: `--open` was passed and zero tabs are currently connected.
     OpenBrowser,
+    /// Default: `--open` was not passed.
+    NotRequested,
     /// Do NOT open a duplicate tab: at least one Explore tab is already connected live.
     AlreadyOpen { active_viewers: u32 },
-    /// Suppressed because the user opted out (`BLAZE_NO_OPEN`).
-    SuppressedByEnv,
-    /// Suppressed because the invocation is non-interactive (CI, tests, pipes).
-    SuppressedNonInteractive,
     /// Suppressed because the local viewer did not come up on loopback.
     SuppressedViewerUnavailable,
 }
 
-/// Pure decision function: opens a browser tab if and only if interactive, not opted out,
+/// Pure decision function: opens a browser tab if and only if `--open` was passed,
 /// the local viewer is reachable, and `active_viewers == 0`.
 pub const fn decide_open(input: OpenInput) -> OpenDecision {
-    if input.suppressed_by_env {
-        OpenDecision::SuppressedByEnv
-    } else if !input.interactive_tty {
-        OpenDecision::SuppressedNonInteractive
-    } else if !input.viewer_reachable {
-        OpenDecision::SuppressedViewerUnavailable
-    } else if input.active_viewers > 0 {
-        OpenDecision::AlreadyOpen { active_viewers: input.active_viewers }
-    } else {
-        OpenDecision::OpenBrowser
+    match input.requested {
+        OpenExplore::No => OpenDecision::NotRequested,
+        OpenExplore::Open => {
+            if !input.viewer_reachable {
+                OpenDecision::SuppressedViewerUnavailable
+            } else if input.active_viewers > 0 {
+                OpenDecision::AlreadyOpen { active_viewers: input.active_viewers }
+            } else {
+                OpenDecision::OpenBrowser
+            }
+        }
     }
 }
 
@@ -290,25 +298,21 @@ mod presence_tests {
     use super::*;
 
     #[test]
-    fn open_decision_opens_only_when_zero_viewers_and_interactive() {
+    fn open_decision_opens_only_when_requested_and_zero_viewers() {
         assert_eq!(
-            decide_open(OpenInput { active_viewers: 0, interactive_tty: true, suppressed_by_env: false, viewer_reachable: true }),
+            decide_open(OpenInput { requested: OpenExplore::No, active_viewers: 0, viewer_reachable: true }),
+            OpenDecision::NotRequested
+        );
+        assert_eq!(
+            decide_open(OpenInput { requested: OpenExplore::Open, active_viewers: 0, viewer_reachable: true }),
             OpenDecision::OpenBrowser
         );
         assert_eq!(
-            decide_open(OpenInput { active_viewers: 1, interactive_tty: true, suppressed_by_env: false, viewer_reachable: true }),
+            decide_open(OpenInput { requested: OpenExplore::Open, active_viewers: 1, viewer_reachable: true }),
             OpenDecision::AlreadyOpen { active_viewers: 1 }
         );
         assert_eq!(
-            decide_open(OpenInput { active_viewers: 0, interactive_tty: false, suppressed_by_env: false, viewer_reachable: true }),
-            OpenDecision::SuppressedNonInteractive
-        );
-        assert_eq!(
-            decide_open(OpenInput { active_viewers: 0, interactive_tty: true, suppressed_by_env: true, viewer_reachable: true }),
-            OpenDecision::SuppressedByEnv
-        );
-        assert_eq!(
-            decide_open(OpenInput { active_viewers: 0, interactive_tty: true, suppressed_by_env: false, viewer_reachable: false }),
+            decide_open(OpenInput { requested: OpenExplore::Open, active_viewers: 0, viewer_reachable: false }),
             OpenDecision::SuppressedViewerUnavailable
         );
     }

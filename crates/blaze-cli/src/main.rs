@@ -307,7 +307,7 @@ impl fmt::Display for CliError {
         match self {
             CliError::Usage(what) => write!(
                 f,
-                "usage: blaze check [dir] [--color=auto|always|never] [--view person|agent|json] [--each] [--workers N] [--status-every S], blaze ci [dir] [--workers N] [--format auto|plain|github] [--todo <path>] [--todo-format nuon|json] [--no-todo] [--no-test] [--fix] [--allow-incomplete], blaze inspect <file.rs[::fn]> [--json] [--all-exprs] [--no-coercions] [--no-defaults], blaze <run|test> [dir] [--stats] [--workers N], blaze clean [dir] [--store], blaze gc [--max-gb N] [--dry-run] [--all-formats], blaze explain [status]: {what}"
+                "usage: blaze check [dir] [--color=auto|always|never] [--view person|agent|json] [--each] [--workers N] [--status-every S], blaze ci [dir] [--workers N] [--format auto|plain|github] [--todo <path>] [--todo-format nuon|json] [--no-todo] [--no-test] [--fix] [--allow-incomplete], blaze inspect <file.rs[::fn]> [--json] [--all-exprs] [--no-coercions] [--no-defaults], blaze run [dir] [--open] [--stats] [--workers N], blaze test [dir] [--stats] [--workers N], blaze clean [dir] [--store], blaze gc [--max-gb N] [--dry-run] [--all-formats], blaze explain [status]: {what}"
             ),
             CliError::NotOnEngine { flag, why } => write!(f, "`blaze check {flag}`: the engine's check does not take {flag} yet ({why}; check_command.rs)"),
             CliError::NotBuilt { command } => write!(f, "`blaze {command}` is not built on the new item layer yet (drive.md)"),
@@ -411,6 +411,8 @@ struct Flags<'a> {
     fix: Option<(usize, usize)>,
     /// `-p <package>` and `--bin <name>`: which program `blaze run` runs (run_package.rs).
     select: run_package::Select<'a>,
+    /// `--open`: opt-in to opening the Explore web page in the browser on `blaze run` (default: off).
+    open: blaze_run::viewer::OpenExplore,
     /// `--names-oracle`: `check` decides every crate's names twice and compares them (D158 step
     /// 1, engine_names.rs `NamesOracle`).
     names_oracle: engine_names::NamesOracle,
@@ -440,6 +442,7 @@ impl<'a> Flags<'a> {
             workers: None,
             status_every: None,
             select: run_package::Select::NONE,
+            open: blaze_run::viewer::OpenExplore::No,
             names_oracle: engine_names::NamesOracle::Off,
             driver: engine_ready_edit::Driver::Auto,
             block_scopes: blaze_scope::surface::BlockScopes::Modules,
@@ -495,6 +498,7 @@ fn parse_flags<'a>(args: &'a Args, mut package: impl FnMut(&'a str)) -> Result<F
             }
             "--stats" => flags.stats = true,
             "--each" => flags.each = true,
+            "--open" => flags.open = blaze_run::viewer::OpenExplore::Open,
             "--names-oracle" => flags.names_oracle = engine_names::NamesOracle::On,
             _ if let Some(word) = arg.strip_prefix("--driver=") => flags.driver = engine_ready_edit::Driver::parse(word).ok_or(CliError::Usage("--driver is auto, ready or phases"))?,
             _ if arg.starts_with("--block-scopes=") => {
@@ -1718,5 +1722,28 @@ mod tests {
             stdout(&io),
             whole.profile
         );
+    }
+
+    /// `--open` is opt-in on `blaze run`: default is `OpenExplore::No`, `--open` sets
+    /// `OpenExplore::Open`, and `blaze check --open` is refused by name.
+    #[test]
+    fn open_flag_is_opt_in_for_run_and_refused_on_check() {
+        use blaze_run::viewer::OpenExplore;
+        let args_of = |words: &[&str]| {
+            let mut world = SimWorld::new(1, Limits::USUAL);
+            world.args = words.iter().map(|s| std::string::String::from(*s)).collect();
+            Io::simulated(world).need_args().expect("args")
+        };
+        let default_run = args_of(&["blaze", "run"]);
+        assert_eq!(flags(&default_run).expect("default run flags").open, OpenExplore::No);
+
+        let open_run = args_of(&["blaze", "run", "--open", "--", "--open"]);
+        let parsed = flags(&open_run).expect("--open run flags");
+        assert_eq!(parsed.open, OpenExplore::Open);
+        assert_eq!(parsed.program, ["--open"]);
+
+        let open_check = args_of(&["blaze", "check", "--open"]);
+        let parsed_check = flags(&open_check).expect("check flags parse before command check");
+        assert!(matches!(check_command::refuse_not_taken(&parsed_check), Err(CliError::Usage(_))));
     }
 }
