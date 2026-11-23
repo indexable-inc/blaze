@@ -561,11 +561,28 @@ fn word(bytes: &[u8], at: usize) -> u32 {
 }
 
 /// Only the directory the pointer names. The certificate does not need even this read.
+/// For 2-level radix roots (`bits > RADIX_FLAT_MAX_BITS`), reads only the top root and its
+/// directory sub-records — ZERO page leaf shards are read upfront.
 pub(crate) fn open_root<'a, D: Driver, S: Sharing>(
     cx: &Cx, store: &mut CommandStore<'_, '_, D, S>, key: Key, alloc: SharedAlloc<'a>,
 ) -> Result<Result<Root<'a>, Unreadable>, CliError> {
     let Some(held) = store.get(cx, key)? else { return Ok(Err(Unreadable::Missing { key })) };
-    Ok(pages::decode_root(Sealed::by_store(key, held.bytes, held.proof), alloc).map_err(Unreadable::Pages))
+    let mut store_err: Option<CliError> = None;
+    let decoded = pages::decode_root_with(
+        Sealed::by_store(key, held.bytes, held.proof),
+        |sub_key| match store.get(cx, sub_key) {
+            Ok(found) => found.map(|h| Ok(Sealed::by_store(sub_key, h.bytes, h.proof))),
+            Err(err) => {
+                store_err.get_or_insert(err);
+                None
+            }
+        },
+        alloc,
+    );
+    if let Some(err) = store_err {
+        return Err(err);
+    }
+    Ok(decoded.map_err(Unreadable::Pages))
 }
 
 pub(crate) fn page_error(why: PagesError) -> CliError {
@@ -593,6 +610,9 @@ pub(crate) struct Stored<'a> {
     header_pages: HeaderSlots<'a>,
     alloc: SharedAlloc<'a>,
     blocks: blaze_own::Vec<OnceLock<PageBlock<'a>>, SharedAlloc<'a>>,
+    /// Lazy cache of decoded 256-page radix leaf shards (`bits > RADIX_FLAT_MAX_BITS`); empty
+    /// for flat roots. Kept off-stack in a `Vec` so `Stored` stays `<= 1 KiB` by value.
+    radix_shards: blaze_own::Vec<OnceLock<Option<pages::RadixShard<'a>>>, SharedAlloc<'a>>,
     refused: OnceLock<PagesError>,
     /// How a page's bytes are known to be its key's: the store's proof handed through
     /// ([`pages::Check::Store`], the command's path: no byte hashed, a page's head alone checked)
@@ -718,9 +738,11 @@ impl<'a> Stored<'a> {
     /// verify (every byte hashed, every entry walked: `VerifiedPage::open_whole`).
     pub(crate) fn new(root: &'a Root<'a>, snapshot: &'a Snapshot<SharedAlloc<'a>>, headers: &'a Headers, check: pages::Check, alloc: SharedAlloc<'a>) -> Self {
         use core::sync::atomic::{AtomicU64, AtomicUsize};
-        let blocks = blaze_own::Vec::from_iter_in((0..root.pages.len().div_ceil(BLOCK)).map(|_| OnceLock::new()), alloc);
+        let total_pages = root.page_count();
+        let blocks = blaze_own::Vec::from_iter_in((0..total_pages.div_ceil(BLOCK)).map(|_| OnceLock::new()), alloc);
+        let radix_shards = blaze_own::Vec::from_iter_in((0..root.page_shards.len()).map(|_| OnceLock::new()), alloc);
         Self {
-            root, snapshot, headers, header_pages: blaze_own::Box::new_in(core::array::from_fn(|_| OnceLock::new()), alloc), alloc, blocks, refused: OnceLock::new(), check,
+            root, snapshot, headers, header_pages: blaze_own::Box::new_in(core::array::from_fn(|_| OnceLock::new()), alloc), alloc, blocks, radix_shards, refused: OnceLock::new(), check,
             task_reads: AtomicUsize::new(0),
             header_reads: AtomicUsize::new(0),
             task_bytes: AtomicU64::new(0),
@@ -879,11 +901,60 @@ impl<'a> Stored<'a> {
         tasks + headers
     }
 
-    pub(crate) fn page_at(&self, index: usize) -> Result<Option<&VerifiedPage<'a>>, PagesError> {
+    /// Resolves page `index`'s key: O(1) slice index for flat roots, or lazy 8 KiB leaf-shard
+    /// fetch-and-cache for 2-level radix roots (`bits > RADIX_FLAT_MAX_BITS`).
+    fn page_key(&self, index: usize) -> Result<Key, PagesError> {
         let page = u32::try_from(index).unwrap_or(u32::MAX);
-        let Some(&key) = self.root.pages.get(index) else {
+        if !self.root.is_radix() {
+            return self
+                .root
+                .pages
+                .get(index)
+                .copied()
+                .ok_or_else(|| *self.refused.get_or_init(|| PagesError::Count { page: pages::ROOT_PAGE, count: page }));
+        }
+        let (shard_idx, slot_idx) = Root::shard_of(index);
+        let Some(&shard_key) = self.root.page_shards.get(shard_idx) else {
             return Err(*self.refused.get_or_init(|| PagesError::Count { page: pages::ROOT_PAGE, count: page }));
         };
+        if shard_key == Key::default() {
+            return Ok(Key::default());
+        }
+        let Some(shard_cell) = self.radix_shards.get(shard_idx) else {
+            return Err(*self.refused.get_or_init(|| PagesError::Count { page: pages::ROOT_PAGE, count: page }));
+        };
+        let cached = shard_cell.get_or_init(|| {
+            let shard_u32 = u32::try_from(shard_idx).unwrap_or(u32::MAX);
+            let opened = self
+                .sealed(shard_key, pages::ROOT_PAGE, &self.task_bytes)
+                .and_then(|sealed| pages::decode_radix_shard(sealed, shard_u32, self.root.bits, self.alloc));
+            match opened {
+                Ok(shard) => Some(shard),
+                Err(why) => {
+                    self.refused.get_or_init(|| why);
+                    None
+                }
+            }
+        });
+        match cached {
+            Some(shard) => Ok(shard.keys.get(slot_idx).copied().unwrap_or_default()),
+            None => Err(self.refused.get().copied().unwrap_or(PagesError::Count { page: pages::ROOT_PAGE, count: page })),
+        }
+    }
+
+    /// Reads an auxiliary radix record from this answer's snapshot, sealed by `self.check`
+    /// (for `pages::encode_changes_radix` to read ONLY the touched leaf shards).
+    fn get_radix_record(&self, key: Key) -> pages::Got<'a> {
+        let held = crate::store::plain_place::snapshot_get(self.snapshot, key).ok()??;
+        match self.check {
+            pages::Check::Store => Some(Ok(Sealed::by_store(key, held.bytes, held.proof))),
+            pages::Check::Hashed => Some(Sealed::hashed(key, held.bytes)),
+        }
+    }
+
+    pub(crate) fn page_at(&self, index: usize) -> Result<Option<&VerifiedPage<'a>>, PagesError> {
+        let page = u32::try_from(index).unwrap_or(u32::MAX);
+        let key = self.page_key(index)?;
         if key == Key::default() {
             return Ok(None);
         }
@@ -932,10 +1003,26 @@ impl StoredPages for Stored<'_> {
     }
 
     fn visit_rows(&self, visit: &mut dyn FnMut(Name) -> Result<(), blaze_engine::LastError>) -> Result<(), blaze_engine::LastError> {
-        for index in 0..self.root.pages.len() {
-            if let Some(page) = self.page_at(index).map_err(blaze_engine::LastError::Pages)? {
-                for name in page.row_names() {
-                    visit(name)?;
+        if !self.root.is_radix() {
+            for index in 0..self.root.pages.len() {
+                if let Some(page) = self.page_at(index).map_err(blaze_engine::LastError::Pages)? {
+                    for name in page.row_names() {
+                        visit(name)?;
+                    }
+                }
+            }
+        } else {
+            for (shard_idx, &shard_key) in self.root.page_shards.iter().enumerate() {
+                if shard_key == Key::default() {
+                    continue;
+                }
+                let base = shard_idx << pages::RADIX_LEAF_BITS;
+                for slot in 0..pages::RADIX_LEAF_PAGES {
+                    if let Some(page) = self.page_at(base + slot).map_err(blaze_engine::LastError::Pages)? {
+                        for name in page.row_names() {
+                            visit(name)?;
+                        }
+                    }
                 }
             }
         }
@@ -1277,7 +1364,7 @@ fn save<'m, D: Driver, S: Sharing>(
     let encoded = match last {
         Some(stored) => {
             let mut pool_err: Option<CliError> = None;
-            let encoded = pages::encode_changes_with(kept, stored.root, alloc, |jobs| {
+            let encoded = pages::encode_changes_radix(kept, stored.root, alloc, |key| stored.get_radix_record(key), |jobs| {
                 let mut out = blaze_own::Vec::with_capacity_in(jobs.len(), alloc);
                 if jobs.len() <= 4 || workers.get() <= 1 {
                     for job in jobs {
@@ -1321,29 +1408,29 @@ fn save<'m, D: Driver, S: Sharing>(
         }
         None => pages::encode(kept, None, alloc),
     };
-    // The encoder's puts are the new pages and the root (pages.rs `encode`).
-    let new_pages = u32::try_from(encoded.puts.len().saturating_sub(1)).unwrap_or(u32::MAX);
-    #[cfg(test)]
-    let pages_digest = {
-        let mut page_keys: blaze_own::Vec<u8, &Frame> = blaze_own::Vec::with_capacity_in(encoded.pages.len() * 32, frame);
-        for page in encoded.pages.iter() {
-            page_keys.extend_from_slice(&page.0.0);
-        }
-        Some(ContentId::of(PAGES_DOMAIN, &page_keys))
+    // The encoder's puts are task pages first (`..task_puts`), then radix/directory sub-records,
+    // then the top root last (durable order: children before parent).
+    let task_puts = usize::try_from(encoded.task_puts).unwrap_or(0);
+    let mut saved = Saved {
+        bytes: encoded.bytes,
+        new_pages: encoded.task_puts,
+        root: encoded.root,
+        pages_digest: None,
+        changed: (encoded.changed_entries, encoded.changed_pages),
+        ..Saved::default()
     };
-    #[cfg(not(test))]
-    let pages_digest = None;
-    let mut saved = Saved { bytes: encoded.bytes, new_pages, root: encoded.root, pages_digest, changed: (encoded.changed_entries, encoded.changed_pages), ..Saved::default() };
-    for (key, bytes) in encoded.puts.iter() {
+    for (at, (key, bytes)) in encoded.puts.iter().enumerate() {
         store.put(cx, *key, bytes)?;
         saved.puts += 1;
-        // The root is among the puts (`new_pages` above leaves it out); a page is keyed by
-        // its bytes and the root is not a page's key.
-        if *key != encoded.root {
+        if at < task_puts {
             let len = bytes.len() as u64;
             saved.new_page_bytes += len;
             saved.largest_new_page = saved.largest_new_page.max(len);
         }
+    }
+    #[cfg(test)]
+    {
+        saved.pages_digest = Some(test_pages_digest(lent, &encoded, alloc, frame)?);
     }
     let mut header_pool_err: Option<CliError> = None;
     let (headers, writes) = Headers::after_with(last.map(|base| base.headers), kept, writer, kept.answer.serial, HeadersPlant::None, |index| match last {
@@ -1458,22 +1545,37 @@ fn save<'m, D: Driver, S: Sharing>(
     }
     let reach_name = bstd::mem::format_in!(frame, "{name}.{REACH_ROOT}");
     let answer_name = bstd::mem::format_in!(frame, "{name}.{ANSWER_ROOT}");
-    let last_pages = match (last, last_root) {
-        (Some(base), Some(key)) => Some((&base.root.pages[..], key)),
-        _ => None,
-    };
-    let (pages_live, rekeyed) = if encoded.pages.len() <= REACH_SHARD_PAGES {
+    let (pages_live, rekeyed) = if !encoded.is_radix() {
+        let last_pages = match (last, last_root) {
+            (Some(base), Some(key)) if !base.root.is_radix() => Some((&base.root.pages[..], key)),
+            _ => None,
+        };
         let (indexes, rekeyed) = page_indexes(lent, (reach_name.as_str(), answer_name.as_str()), last_pages, &encoded.pages, rekey, alloc)?;
         let count = u32::try_from(indexes.len()).unwrap_or(u32::MAX);
         lent.root_through(reach_name.as_str(), &indexes, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
         (count, rekeyed)
     } else {
-        publish_reach_shards(lent, name, answer_name.as_str(), last_pages, &encoded.pages, rekey, alloc, frame)?
+        let last_info = match (last, last_root) {
+            (Some(base), Some(key)) => Some((base.root.page_count(), key)),
+            _ => None,
+        };
+        publish_reach_shards_from(
+            lent,
+            name,
+            answer_name.as_str(),
+            ReachSource::Radix { last: last_info, encoded: &encoded },
+            rekey,
+            alloc,
+            frame,
+        )?
     };
     saved.pages = pages_live;
     saved.rekeyed = rekeyed;
     let mut direct = blaze_own::Vec::new_in(alloc);
     direct.push(blaze_cas::Key(encoded.root.0));
+    // Pin every live radix leaf shard (`<= 256`), file shard (`<= 16`), places, and summary
+    // sub-record directly under `{name}.answer` so `blaze gc` always retains the whole root tree.
+    direct.extend(encoded.tree_keys().iter().map(|key| blaze_cas::Key(key.0)));
     direct.push(blaze_cas::Key(lines.0.0));
     if let Some(keys) = headers.current() {
         direct.extend(keys.keys.iter().filter(|key| **key != Key::default()).map(|key| blaze_cas::Key(key.0)));
@@ -1846,10 +1948,21 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
         sink.index_rows(page, &records, &scopes, alloc.into()).map_err(reach_error)?;
     }
     let mut page_idx = blaze_own::Vec::new_in(alloc);
-    page_idx.extend(encoded.pages.iter().filter(|p| **p != Key::default()).map(|p| blaze_cas::plain::beside_key(blaze_cas::Key(p.0))));
+    if !encoded.is_radix() {
+        page_idx.extend(encoded.pages.iter().filter(|p| **p != Key::default()).map(|p| blaze_cas::plain::beside_key(blaze_cas::Key(p.0))));
+    } else {
+        for (shard_idx, &shard_key) in encoded.page_shards.iter().enumerate() {
+            if shard_key == Key::default() {
+                continue;
+            }
+            let shard = decode_lent_radix_shard(lent, shard_key, shard_idx, encoded.bits, alloc)?;
+            page_idx.extend(shard.keys.iter().filter(|p| **p != Key::default()).map(|p| blaze_cas::plain::beside_key(blaze_cas::Key(p.0))));
+        }
+    }
     page_idx.sort_unstable();
     let mut direct = blaze_own::Vec::new_in(alloc);
     direct.push(blaze_cas::Key(encoded.root.0));
+    direct.extend(encoded.tree_keys().iter().map(|k| blaze_cas::Key(k.0)));
     direct.push(blaze_cas::Key(empty_lines_key.0));
     if let Some(keys) = headers.current() {
         direct.extend(keys.keys.iter().filter(|k| **k != Key::default()).map(|k| blaze_cas::Key(k.0)));
@@ -1880,24 +1993,72 @@ fn cas_key_at(bytes: &[u8], at: usize) -> blaze_cas::Key {
     blaze_cas::Key(ContentId(bytes[at * 32..at * 32 + 32].try_into().expect("a whole key")))
 }
 
+/// Decodes one radix leaf shard already stored (in arena or committed segment) in `lent`.
+fn decode_lent_radix_shard<'a, D: Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    shard_key: Key,
+    shard_idx: usize,
+    bits: u8,
+    alloc: SharedAlloc<'a>,
+) -> Result<pages::RadixShard<'a>, CliError> {
+    let held = lent
+        .get(&blaze_cas::Key(shard_key.0))
+        .map_err(crate::store::PlaceError::from)?
+        .ok_or_else(|| page_error(PagesError::Missing { page: pages::ROOT_PAGE, key: shard_key }))?;
+    let shard_u32 = u32::try_from(shard_idx).unwrap_or(u32::MAX);
+    let sealed = Sealed::hashed(shard_key, held.bytes).map_err(|torn| page_error(torn.at(pages::ROOT_PAGE)))?;
+    pages::decode_radix_shard(sealed, shard_u32, bits, alloc).map_err(page_error)
+}
+
+#[cfg(test)]
+fn test_pages_digest<D: Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    encoded: &pages::Encoded<'_>,
+    alloc: SharedAlloc<'_>,
+    frame: &Frame,
+) -> Result<ContentId, CliError> {
+    if !encoded.is_radix() {
+        let mut page_keys: blaze_own::Vec<u8, &Frame> = blaze_own::Vec::with_capacity_in(encoded.pages.len() * 32, frame);
+        for page in encoded.pages.iter() {
+            page_keys.extend_from_slice(&page.0.0);
+        }
+        return Ok(ContentId::of(PAGES_DOMAIN, &page_keys));
+    }
+    let mut h = blaze_ids::Hasher::new(PAGES_DOMAIN);
+    let zeros = [0u8; 32];
+    for (shard_idx, &shard_key) in encoded.page_shards.iter().enumerate() {
+        if shard_key == Key::default() {
+            for _ in 0..pages::RADIX_LEAF_PAGES {
+                h.update(&zeros);
+            }
+        } else {
+            let shard = decode_lent_radix_shard(lent, shard_key, shard_idx, encoded.bits, alloc)?;
+            for key in shard.keys.iter() {
+                h.update(&key.0.0);
+            }
+        }
+    }
+    Ok(h.finish())
+}
+
 /// Proves that the previous commit's `{name}.answer` root names `last_root` and its paging matches
-/// `now_len`, returning either `Ok((old_pages, last_root))` or the exact [`WhyWhole`] reason to
-/// build the reach roots whole.
-fn prove_last_reach<'a, D: Driver>(
+/// `now_len`, returning `Ok(last_root)` or the exact [`WhyWhole`] reason to build the reach roots
+/// whole.
+fn prove_last_reach_root<D: Driver>(
     lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
     answer_name: &str,
-    last: Option<(&'a [Key], Key)>,
+    last: Option<(usize, Key)>,
     now_len: usize,
     rekey: Rekey,
-) -> Result<Result<(&'a [Key], Key), WhyWhole>, CliError> {
+) -> Result<Result<Key, WhyWhole>, CliError> {
     #[cfg(test)]
     if rekey == Rekey::All {
         return Ok(Err(WhyWhole::Planted));
     }
     #[cfg(not(test))]
     let Rekey::Changed = rekey;
-    let Some((old, last_root)) = last else { return Ok(Err(WhyWhole::NoLast)) };
-    if old.len() != now_len {
+    let Some((old_len, last_root)) = last else { return Ok(Err(WhyWhole::NoLast)) };
+    if old_len != now_len {
         return Ok(Err(WhyWhole::Paging));
     }
     let Some(answer) = held_root_bytes(lent, answer_name)? else { return Ok(Err(WhyWhole::NoRoot)) };
@@ -1925,7 +2086,27 @@ fn prove_last_reach<'a, D: Driver>(
     if !names_last {
         return Ok(Err(WhyWhole::NotLast));
     }
-    Ok(Ok((old, last_root)))
+    Ok(Ok(last_root))
+}
+
+/// Proves that the previous commit's `{name}.answer` root names `last_root` and its paging matches
+/// `now_len`, returning either `Ok((old_pages, last_root))` or the exact [`WhyWhole`] reason to
+/// build the reach roots whole.
+fn prove_last_reach<'a, D: Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    answer_name: &str,
+    last: Option<(&'a [Key], Key)>,
+    now_len: usize,
+    rekey: Rekey,
+) -> Result<Result<(&'a [Key], Key), WhyWhole>, CliError> {
+    let info = last.map(|(old, key)| (old.len(), key));
+    match prove_last_reach_root(lent, answer_name, info, now_len, rekey)? {
+        Ok(last_root) => {
+            let Some((old, _)) = last else { return Ok(Err(WhyWhole::NoLast)) };
+            Ok(Ok((old, last_root)))
+        }
+        Err(why) => Ok(Err(why)),
+    }
 }
 
 /// Merges the changed pages between `old` and `now` into `carried` (the previous sorted root
@@ -2048,6 +2229,15 @@ fn merge_sorted_keys<'h>(carried: &[u8], added: &[blaze_cas::Key], alloc: Shared
     out
 }
 
+/// Source of page keys for [`publish_reach_shards_from`]: either a flat slice (unit tests) or a
+/// 2-level radix [`pages::Encoded`] whose leaf shards live in `lent` and whose incremental deltas
+/// avoid scanning all `1 << bits` slots.
+enum ReachSource<'a> {
+    #[cfg(test)]
+    Flat { last: Option<(&'a [Key], Key)>, now: &'a [Key] },
+    Radix { last: Option<(usize, Key)>, encoded: &'a pages::Encoded<'a> },
+}
+
 /// Sharded reach roots (`{name}.reach.00`..`{name}.reach.7f`, [`REACH_SHARD_PAGES`] page slots per
 /// shard) plus a bounded delta root (`{name}.reach.delta`, capped at [`REACH_DELTA_CAP`]) for
 /// answers spanning more than [`REACH_SHARD_PAGES`] pages.
@@ -2059,61 +2249,90 @@ fn merge_sorted_keys<'h>(carried: &[u8], added: &[blaze_cas::Key], alloc: Shared
 /// fold in place (unchanged shards still renew with 0 probes) and `{name}.reach.delta` resets to
 /// empty, reclaiming superseded pages.
 #[expect(clippy::too_many_arguments, reason = "reach shard publisher: each argument one handle")]
-fn publish_reach_shards<D: Driver>(
+fn publish_reach_shards_from<D: Driver>(
     lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
     name: &str,
     answer_name: &str,
-    last: Option<(&[Key], Key)>,
-    now: &[Key],
+    source: ReachSource<'_>,
     rekey: Rekey,
     alloc: SharedAlloc<'_>,
     frame: &Frame,
 ) -> Result<(u32, Rekeyed), CliError> {
     let index_of = |page: Key| blaze_cas::plain::beside_key(blaze_cas::Key(page.0));
-    let proof = prove_last_reach(lent, answer_name, last, now.len(), rekey)?;
-    let total_live = u32::try_from(now.iter().filter(|page| **page != Key::default()).count()).unwrap_or(u32::MAX);
-    let num_shards = now.len().div_ceil(REACH_SHARD_PAGES);
+    let (last_info, now_len, total_live) = match source {
+        #[cfg(test)]
+        ReachSource::Flat { last, now } => (
+            last.map(|(old, key)| (old.len(), key)),
+            now.len(),
+            u32::try_from(now.iter().filter(|page| **page != Key::default()).count()).unwrap_or(u32::MAX),
+        ),
+        ReachSource::Radix { last, encoded } => (last, encoded.page_count(), encoded.live_pages),
+    };
+    let proof = prove_last_reach_root(lent, answer_name, last_info, now_len, rekey)?;
+    let num_shards = now_len.div_ceil(REACH_SHARD_PAGES);
     let mut shard_name = blaze_own::String::new_in(frame);
     let delta_name = bstd::mem::format_in!(frame, "{name}.{REACH_ROOT}.{REACH_DELTA_SUFFIX}");
     let mut missing_root = false;
 
     // Incremental delta fast path: renew all base shards in O(1) and publish only changed page
     // indexes in `{name}.reach.delta` while the accumulated delta fits within REACH_DELTA_CAP.
-    if let Ok((old, _last_root)) = proof {
-        if let Some(carried_delta) = held_root_bytes(lent, delta_name.as_str())? {
-            let mut added: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> = blaze_own::Vec::new_in(alloc);
-            let mut moved = 0u32;
-            for (_was, is) in old.iter().zip(now.iter()).filter(|(was, is)| was != is) {
-                moved = moved.saturating_add(1);
-                if *is != Key::default() {
-                    added.push(index_of(*is));
-                }
-            }
-            added.sort_unstable();
-            added.dedup();
-            let next_delta = merge_sorted_keys(carried_delta, &added, alloc);
-            if next_delta.len() <= REACH_DELTA_CAP {
-                let mut all_shards_live = true;
-                for shard in 0..num_shards {
-                    shard_name.clear();
-                    let _ = write!(shard_name, "{name}.{REACH_ROOT}.{shard:02x}");
-                    if !lent.renew_root(shard_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live() {
-                        all_shards_live = false;
-                        missing_root = true;
-                        break;
+    if proof.is_ok() {
+        let mut added: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> = blaze_own::Vec::new_in(alloc);
+        let mut moved = 0u32;
+        let has_deltas = match source {
+            #[cfg(test)]
+            ReachSource::Flat { last: Some((old, _)), now } => {
+                for (_was, is) in old.iter().zip(now.iter()).filter(|(was, is)| was != is) {
+                    moved = moved.saturating_add(1);
+                    if *is != Key::default() {
+                        added.push(index_of(*is));
                     }
                 }
-                if all_shards_live {
-                    let delta_unchanged = keys_equal_bytes(&next_delta, carried_delta);
-                    if delta_unchanged && lent.renew_root(delta_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live() {
+                true
+            }
+            #[cfg(test)]
+            ReachSource::Flat { last: None, .. } => false,
+            ReachSource::Radix { encoded, .. } => match &encoded.page_deltas {
+                Some(deltas) => {
+                    for delta in deltas.iter() {
+                        moved = moved.saturating_add(1);
+                        if delta.new != Key::default() {
+                            added.push(index_of(delta.new));
+                        }
+                    }
+                    true
+                }
+                None => false,
+            },
+        };
+        if has_deltas {
+            if let Some(carried_delta) = held_root_bytes(lent, delta_name.as_str())? {
+                added.sort_unstable();
+                added.dedup();
+                let next_delta = merge_sorted_keys(carried_delta, &added, alloc);
+                if next_delta.len() <= REACH_DELTA_CAP {
+                    let mut all_shards_live = true;
+                    for shard in 0..num_shards {
+                        shard_name.clear();
+                        let _ = write!(shard_name, "{name}.{REACH_ROOT}.{shard:02x}");
+                        if !lent.renew_root(shard_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live() {
+                            all_shards_live = false;
+                            missing_root = true;
+                            break;
+                        }
+                    }
+                    if all_shards_live {
+                        let delta_unchanged = keys_equal_bytes(&next_delta, carried_delta);
+                        if delta_unchanged && lent.renew_root(delta_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live() {
+                            return Ok((total_live, Rekeyed { pages: moved, whole: None }));
+                        }
+                        lent.root_through(delta_name.as_str(), &next_delta, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
                         return Ok((total_live, Rekeyed { pages: moved, whole: None }));
                     }
-                    lent.root_through(delta_name.as_str(), &next_delta, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
-                    return Ok((total_live, Rekeyed { pages: moved, whole: None }));
                 }
+            } else {
+                missing_root = true;
             }
-        } else {
-            missing_root = true;
         }
     }
 
@@ -2121,11 +2340,33 @@ fn publish_reach_shards<D: Driver>(
     // shards in O(1) with 0 probes when `proof` holds) and reset `{name}.reach.delta` to empty.
     let mut scratch: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> = blaze_own::Vec::with_capacity_in(REACH_SHARD_PAGES, alloc);
     let mut rekeyed_pages = 0u32;
-    for (shard, now_slice) in now.chunks(REACH_SHARD_PAGES).enumerate() {
+    let leaves_per_reach = REACH_SHARD_PAGES / pages::RADIX_LEAF_PAGES;
+    for shard in 0..num_shards {
         shard_name.clear();
         let _ = write!(shard_name, "{name}.{REACH_ROOT}.{shard:02x}");
         scratch.clear();
-        scratch.extend(now_slice.iter().filter(|page| **page != Key::default()).map(|page| index_of(*page)));
+        match source {
+            #[cfg(test)]
+            ReachSource::Flat { now, .. } => {
+                let from = shard * REACH_SHARD_PAGES;
+                let to = (from + REACH_SHARD_PAGES).min(now.len());
+                if let Some(slice) = now.get(from..to) {
+                    scratch.extend(slice.iter().filter(|page| **page != Key::default()).map(|page| index_of(*page)));
+                }
+            }
+            ReachSource::Radix { encoded, .. } => {
+                let from_leaf = shard * leaves_per_reach;
+                let to_leaf = (from_leaf + leaves_per_reach).min(encoded.page_shards.len());
+                for leaf_idx in from_leaf..to_leaf {
+                    let shard_key = encoded.page_shards.get(leaf_idx).copied().unwrap_or_default();
+                    if shard_key == Key::default() {
+                        continue;
+                    }
+                    let leaf = decode_lent_radix_shard(lent, shard_key, leaf_idx, encoded.bits, alloc)?;
+                    scratch.extend(leaf.keys.iter().filter(|page| **page != Key::default()).map(|page| index_of(*page)));
+                }
+            }
+        }
         scratch.sort_unstable();
         if proof.is_ok() {
             if let Some(existing) = held_root_bytes(lent, shard_name.as_str())? {
@@ -2148,6 +2389,21 @@ fn publish_reach_shards<D: Driver>(
         Ok(_) => None,
     };
     Ok((total_live, Rekeyed { pages: rekeyed_pages, whole }))
+}
+
+#[cfg(test)]
+#[expect(clippy::too_many_arguments, reason = "test helper for flat reach shard publishing")]
+fn publish_reach_shards<D: Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    name: &str,
+    answer_name: &str,
+    last: Option<(&[Key], Key)>,
+    now: &[Key],
+    rekey: Rekey,
+    alloc: SharedAlloc<'_>,
+    frame: &Frame,
+) -> Result<(u32, Rekeyed), CliError> {
+    publish_reach_shards_from(lent, name, answer_name, ReachSource::Flat { last, now }, rekey, alloc, frame)
 }
 
 /// Appends any live sharded reach root names (`{name}.reach.00`..`{name}.reach.7f` and
@@ -2407,5 +2663,230 @@ mod reach_shard_tests {
                 assert!(set.contains(&beside), "folded shard {shard} contains every live page");
             }
         }
+    }
+
+    /// End-to-end 65,536-page (`bits = 16`) radix answer in `engine_answer`:
+    /// - lazy `Stored` reads 0 leaf shards / 0 task pages at open, and only 1 leaf shard on lookup
+    /// - 4-page incremental edit writes `<= 45 KiB` of root+leaf+dir metadata and probes only 4 delta keys
+    /// - full `blaze gc` (`Liveness::Reached`) sweeps unpinned garbage while preserving 100% of
+    ///   radix leaf shards, directory sub-records, top root, and task pages reachable via `{name}.answer`!
+    #[test]
+    fn radix_65536_page_answer_lazy_read_four_page_edit_and_gc_reachability() {
+        use blaze_drive::{Kind, Tool};
+        use blaze_engine::{Cause, Gen, Phase, Row, Stage};
+
+        let io = Io::simulated(SimWorld::new(47, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
+        let fs = io.need_fs().expect("fs");
+        let host = io.need_host().expect("host");
+        let clock = io.need_clock().expect("clock");
+        let mut rng = io.need_rng().expect("rng");
+        let out = io.need_out().expect("out");
+        let err = io.need_err().expect("err");
+        let home = crate::store::Home::of(&cx, &fs, Some("/h")).expect("home");
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.shared();
+        let frame = cx.frame();
+        let erased = blaze_own::Erased::new(frame);
+
+        let lent = home.open_store(&Settings::default(), crate::store::Facts { boot: Some(1), nonce: 47 }, heap.alloc()).expect("store");
+        let mut store = CommandStore::new(&cx, &lent, false, 0, None, clock.clone(), &err, erased.handle()).expect("command store");
+        let tools = Tools([Tool(ContentId([9; 32])); blaze_drive::key::KINDS]);
+        let phase = Phase::new(Stage::Bodies, 0);
+
+        let payload_v1 = blaze_drive::key::content_key(b"radix-v1-payload");
+        store.put(&cx, payload_v1, b"radix-v1-payload").expect("put payload v1");
+        let mut cold = Kept::new_in(alloc);
+        cold.answer.serial = Gen(1);
+        let mut task_names: std::vec::Vec<Name> = std::vec::Vec::new();
+        for i in 0..200u32 {
+            let file = Name::new(Kind::FileItems, ContentId::of("radix e2e file", &(i % 12).to_le_bytes()));
+            let name = Name::new(Kind::BodyCheck, ContentId::of("radix e2e task", &i.to_le_bytes()));
+            let source = ContentId::of("radix e2e src", &i.to_le_bytes());
+            cold.answer.by_file.entry(file).or_insert_with(|| blaze_own::Vec::new_in(alloc)).push(name);
+            cold.places.insert(file, pages::FilePlace { unit: file, edition: 3, flags: 1 });
+            cold.answer.rows.insert(name, Row {
+                key: tools.key(name, &source), phase, file, source, out: payload_v1.0, serial: Gen(1),
+                defines: blaze_own::Vec::new_in(alloc), reads: blaze_own::Vec::new_in(alloc), by_cell: blaze_own::Vec::new_in(alloc),
+                findings: 0, inline: false, failed: false,
+            });
+            cold.causes.insert(name, (Gen(1), Cause::New));
+            cold.records.insert(name, payload_v1);
+            task_names.push(name);
+        }
+        for names in cold.answer.by_file.values_mut() {
+            names.sort_unstable();
+        }
+
+        // Encode at `bits = 16` (65,536 pages -> 256 leaf shards) and publish with reach shards + `big.answer` pinning `tree_keys`.
+        let enc_v1 = pages::encode_at_bits(&cold, 16, alloc);
+        assert!(enc_v1.is_radix());
+        for (k, b) in enc_v1.puts.iter() {
+            store.put(&cx, *k, b).expect("put v1");
+        }
+        for (page, rows) in enc_v1.page_records() {
+            let mut recs = blaze_own::Vec::new_in(alloc);
+            recs.push(blaze_cas::Key(page.0));
+            for &(_, rec) in rows {
+                recs.push(blaze_cas::Key(rec.0));
+            }
+            lent.index_beside(blaze_cas::Key(page.0), &recs).expect("index beside v1");
+        }
+        let (live1, rekey1) = publish_reach_shards_from(
+            &lent, "big", "big.answer",
+            ReachSource::Radix { last: None, encoded: &enc_v1 },
+            Rekey::Changed, alloc, frame,
+        ).expect("publish cold radix reach shards");
+        assert_eq!(live1, enc_v1.live_pages);
+        assert_eq!(rekey1.whole, Some(WhyWhole::NoLast));
+        let mut direct1 = blaze_own::Vec::new_in(alloc);
+        direct1.push(blaze_cas::Key(enc_v1.root.0));
+        direct1.extend(enc_v1.tree_keys().iter().map(|k| blaze_cas::Key(k.0)));
+        let idx1 = lent.index(&direct1).expect("direct1");
+        lent.root_through("big.answer", &[idx1], blaze_cas::plain::ROOT_LIFE_NS).expect("pin big.answer v1");
+        // Also put an unpinned garbage record so we prove GC actually sweeps.
+        let garbage_key = Key(ContentId::of("radix e2e garbage", b"dead"));
+        store.put(&cx, garbage_key, &[0xAB; 8192]).expect("put garbage");
+        lent.release_lease();
+        lent.commit().expect("commit v1");
+
+        // Open root lazily: 0 task pages read, 0 radix leaf shards loaded at open.
+        let dir_v1 = open_root(&cx, &mut store, enc_v1.root, alloc).expect("store").expect("valid radix root");
+        assert!(dir_v1.is_radix());
+        let snap_v1 = store.snapshot_in(alloc).expect("snapshot v1");
+        let headers = Headers::Absent { since: Gen(1) };
+        let stored_v1 = Stored::new(&dir_v1, &snap_v1, &headers, pages::Check::Store, alloc);
+        assert_eq!(stored_v1.pages_read(), 0, "open_root + Stored::new reads 0 task pages");
+
+        // Pick 3 tasks in file 0 across 3 distinct leaf shards (distinct from file 0's own page)
+        // so editing those 3 tasks touches EXACTLY 4 task pages (3 task pages + 1 file page) across
+        // 4 distinct leaf shards!
+        let edited_file = Name::new(Kind::FileItems, ContentId::of("radix e2e file", &0u32.to_le_bytes()));
+        let file_page = blaze_drive::answers::page_of(edited_file, 16) as usize;
+        let mut picked: std::vec::Vec<Name> = std::vec::Vec::new();
+        let mut used_shards = std::collections::BTreeSet::new();
+        used_shards.insert(Root::shard_of(file_page).0);
+        for &n in cold.answer.by_file[&edited_file].iter() {
+            let p = blaze_drive::answers::page_of(n, 16) as usize;
+            let (s, _) = Root::shard_of(p);
+            if used_shards.insert(s) {
+                picked.push(n);
+                if picked.len() == 3 { break; }
+            }
+        }
+        assert_eq!(picked.len(), 3);
+        // Reading one task lazily resolves its leaf shard and task page.
+        let first_page = stored_v1.page(picked[0]).expect("read page").expect("page exists");
+        assert!(first_page.row(picked[0]).is_some());
+        assert_eq!(stored_v1.pages_read(), 1);
+
+        let payload_v2 = blaze_drive::key::content_key(b"radix-v2-payload");
+        store.put(&cx, payload_v2, b"radix-v2-payload").expect("put payload v2");
+        let new_src = ContentId::of("radix e2e edited src", b"v2");
+        let mut members: std::vec::Vec<blaze_engine::Planned> = std::vec::Vec::new();
+        for &n in cold.answer.by_file[&edited_file].iter() {
+            let src = if picked.contains(&n) { new_src } else { cold.answer.rows[&n].source };
+            members.push(blaze_engine::Planned { name: n, phase, file: edited_file, source: src });
+        }
+        members.sort_unstable_by_key(|p| p.name);
+        let edit = blaze_engine::Edit { files: &[(edited_file, &members)] };
+        let mut eng = blaze_engine::Engine::new_in(tools, stored_v1.answer(), &edit, blaze_engine::Everything, blaze_engine::Plant::None, alloc).expect("engine");
+        assert_eq!(eng.next_phase().expect("phase"), Some(phase));
+        assert_eq!(eng.tasks().len(), 3);
+        let mut batch = blaze_engine::Buffer::new_in(alloc);
+        let mut records = blaze_own::BTreeMap::new_in(alloc);
+        for task in eng.tasks() {
+            batch.done.push(blaze_engine::Done {
+                name: task.planned.name, key: task.key, out: payload_v2.0,
+                defines: blaze_own::Vec::new_in(alloc), reads: blaze_own::Vec::new_in(alloc),
+                findings: 0, failed: false,
+            });
+            records.insert(task.planned.name, payload_v2);
+        }
+        eng.merge(core::slice::from_mut(&mut batch)).expect("merge");
+        assert_eq!(eng.next_phase().expect("settled"), None);
+        let blaze_engine::Finished { answer: edit_answer, causes: edit_causes, .. } = eng.finish().expect("finish");
+        let edit_kept = Kept::after(blaze_own::BTreeMap::new_in(alloc), edit_answer, &edit_causes, records);
+
+        let enc_v2 = pages::encode_changes_radix(
+            &edit_kept,
+            stored_v1.root,
+            alloc,
+            |k| stored_v1.get_radix_record(k),
+            |jobs| {
+                let mut out = blaze_own::Vec::with_capacity_in(jobs.len(), alloc);
+                for job in jobs { out.push(job.run(alloc)); }
+                out
+            },
+        ).expect("encode_changes_radix v2");
+        let task_puts = enc_v2.task_puts as usize;
+        assert_eq!(task_puts, 4);
+        let meta_bytes: usize = enc_v2.puts[task_puts..].iter().map(|(_, b)| b.len()).sum();
+        assert!(meta_bytes <= 45 * 1024, "4-page radix edit metadata must be <= 45 KiB (got {meta_bytes} bytes)");
+
+        for (k, b) in enc_v2.puts.iter() {
+            store.put(&cx, *k, b).expect("put v2");
+        }
+        for (page, rows) in enc_v2.page_records() {
+            let mut recs = blaze_own::Vec::new_in(alloc);
+            recs.push(blaze_cas::Key(page.0));
+            for &(_, rec) in rows { recs.push(blaze_cas::Key(rec.0)); }
+            lent.index_beside(blaze_cas::Key(page.0), &recs).expect("index beside v2");
+        }
+        let probes_before = lent.put_tally().disk.root_probes;
+        let (live2, rekey2) = publish_reach_shards_from(
+            &lent, "big", "big.answer",
+            ReachSource::Radix { last: Some((dir_v1.page_count(), enc_v1.root)), encoded: &enc_v2 },
+            Rekey::Changed, alloc, frame,
+        ).expect("publish incremental radix reach shards");
+        let probes_delta = lent.put_tally().disk.root_probes - probes_before;
+        assert_eq!(live2, enc_v2.live_pages);
+        assert_eq!(rekey2, Rekeyed { pages: 4, whole: None });
+        assert_eq!(probes_delta, 4, "4-page radix edit probes only 4 delta keys (got {probes_delta})");
+
+        let mut direct2 = blaze_own::Vec::new_in(alloc);
+        direct2.push(blaze_cas::Key(enc_v2.root.0));
+        direct2.extend(enc_v2.tree_keys().iter().map(|k| blaze_cas::Key(k.0)));
+        let idx2 = lent.index(&direct2).expect("direct2");
+        lent.root_through("big.answer", &[idx2], blaze_cas::plain::ROOT_LIFE_NS).expect("pin big.answer v2");
+        lent.release_lease();
+        lent.commit().expect("commit v2");
+        drop(edit_kept);
+        drop(edit_causes);
+        drop(stored_v1);
+        drop(snap_v1);
+        drop(store);
+        drop(lent);
+
+        // Run full `blaze gc` under `Liveness::Reached` (budget 16 MiB > live store size, so live
+        // roots are NOT LRU-evicted while unpinned records are swept), and verify ALL radix shards,
+        // directory sub-records, top root, and task pages survive!
+        let gc = crate::gc::run_with(
+            &cx, &fs, &host, &clock, &mut rng, Some("/h"),
+            crate::gc::GcOpts { max_store_bytes: Some(16 << 20), dry_run: false, all_formats: false, background: false },
+            &out, &err, heap,
+        ).expect("run gc");
+        assert!(!gc.skipped_locked);
+
+        // Reopen store after GC and verify every single row & radix shard of v2 decodes cleanly!
+        let lent2 = home.open_store(&Settings::default(), crate::store::Facts { boot: Some(1), nonce: 48 }, heap.alloc()).expect("reopen after gc");
+        let mut store2 = CommandStore::new(&cx, &lent2, false, 0, None, clock, &err, erased.handle()).expect("store2");
+        let (decoded_v2, root_v2) = load_answer(&cx, &mut store2, enc_v2.root, alloc).expect("store read").expect("radix answer survives gc");
+        assert!(root_v2.is_radix());
+        assert_eq!(decoded_v2.answer.rows.len(), 200, "all 200 rows survived GC");
+        for &n in &picked {
+            assert_eq!(decoded_v2.answer.rows[&n].out, payload_v2.0, "edited row {n:?} has v2 payload after GC");
+        }
+        // Verify every single tree key (leaf shard, file shard, places, summary) is explicitly
+        // listed in `big.answer`'s direct index so GC can never sweep any of them.
+        let ans_root = store2.named("big.answer").expect("big.answer").expect("big.answer live");
+        let ans_idx = lent2.get(&cas_key_at(ans_root, 0)).expect("get idx").expect("direct index live");
+        for key in enc_v2.tree_keys() {
+            assert!(
+                ans_idx.bytes.chunks_exact(32).any(|chunk| chunk == key.0.0),
+                "tree key {key:?} must be pinned in big.answer direct index for GC reachability"
+            );
+        }
+        let _ = garbage_key;
     }
 }

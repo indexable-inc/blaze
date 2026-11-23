@@ -84,8 +84,12 @@ crates/blaze-drive/src/answers.rs	PAGE_MAGIC	none
 crates/blaze-drive/src/answers.rs	ROOT_MAGIC	none
 crates/blaze-drive/src/lib.rs	FORMATS	none
 crates/blaze-drive/src/record.rs	MAGIC	none
+crates/blaze-engine/src/pages.rs	FILE_SHARD_MAGIC	none
 crates/blaze-engine/src/pages.rs	PAGE_MAGIC	none
-crates/blaze-engine/src/pages.rs	ROOT_MAGIC	none
+crates/blaze-engine/src/pages.rs	PLACES_MAGIC	none
+crates/blaze-engine/src/pages.rs	RADIX_SHARD_MAGIC	none
+crates/blaze-engine/src/pages.rs	ROOT_MAGIC	test previous_root_magic_ber3_is_rejected
+crates/blaze-engine/src/pages.rs	SUMMARY_MAGIC	none
 crates/blaze-engine/src/pages/headers.rs	MAGIC	none
 crates/blaze-expand/src/kept_set.rs	MAGIC	none
 crates/blaze-expand/src/kept_set.rs	MAGIC_V1	none

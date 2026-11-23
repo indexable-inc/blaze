@@ -218,13 +218,19 @@ impl BgGc {
         !matches!(self, BgGc::None)
     }
 
-    /// Spawns detached `blaze gc --background` in a new session with `/dev/null` stdio.
-    /// Returns immediately without waiting for the child.
-    pub(crate) fn spawn(&self, cx: &Cx, err: &Out) {
+    /// Spawns detached `blaze gc --background` in a new session with `/dev/null` stdio when no
+    /// other GC process currently holds `v2/store/gc.lock`. Returns `true` if a child was spawned,
+    /// `false` if skipped (non-detached handle or GC already active). Never waits for the child.
+    pub(crate) fn spawn(&self, cx: &Cx, blaze_dir: &Dir<ReadWrite>, err: &Out) -> bool {
         match self {
-            BgGc::None => {}
+            BgGc::None => false,
             #[cfg(unix)]
             BgGc::Detached { spawner, exe, home, max_store_bytes } => {
+                // Fast non-blocking probe of `gc.lock`: skip spawning a duplicate `blaze gc`
+                // process on every rapid edit while an existing background GC is already running.
+                if !gc_lock_is_free(cx, blaze_dir) {
+                    return false;
+                }
                 let frame = cx.frame();
                 let budget_text = max_store_bytes.map(|b| bstd::mem::format_in!(frame, "{b}"));
                 let two_vars = budget_text.as_ref().map(|val| [("HOME", home.as_str()), (ENV_MAX_BYTES, val.as_str())]);
@@ -236,10 +242,19 @@ impl BgGc {
                 let spec = bstd::procs::DetachedSpec { program: exe.as_str(), args: &BG_GC_ARGS, env, dir: home.as_str() };
                 if let Err(error) = spawner.start_detached(cx, &spec) {
                     let _ = err.line(cx, format_args!("blaze: warning: failed to start detached background gc: {error}"));
+                    return false;
                 }
+                true
             }
         }
     }
+}
+
+/// Non-blocking check of whether `v2/store/gc.lock` is currently unheld by another GC process.
+/// Immediately releases the probe lock if free so a newly spawned `blaze gc --background` can
+/// acquire it; returns `false` when contended (another GC is already running).
+pub(crate) fn gc_lock_is_free(cx: &Cx, blaze_dir: &Dir<ReadWrite>) -> bool {
+    matches!(try_acquire_gc_lock(cx, blaze_dir), Ok(Some(_)))
 }
 
 /// Acquires the non-blocking exclusive GC lock at `<HOME>/.blaze/v2/store/gc.lock`.
