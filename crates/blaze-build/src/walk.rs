@@ -458,7 +458,7 @@ enum Task {
     AsmJoin(Block),
 }
 
-struct Walk<'x, 'c, 't, A: Allocator + Clone> {
+struct Walk<'x, 'c, 't, A: Allocator + Copy> {
     body: &'x BodyView<'x>,
     checked: &'x Checked<'c>,
     /// The record's types: generic, read only to be grounded (and for the shape of a node,
@@ -662,7 +662,7 @@ pub(crate) enum Kind {
     Closure(ExprId, crate::FnTrait),
 }
 
-pub(crate) fn build<A: Allocator + Clone>(
+pub(crate) fn build<A: Allocator + Copy>(
     body: &BodyView<'_>,
     checked: &Checked<'_>,
     sig: &FnSig<'_>,
@@ -690,7 +690,7 @@ pub(crate) fn build<A: Allocator + Clone>(
 /// (the enum an enum copy's switch read the discriminant of).
 type TrapMark = (u32, TrapKind, Option<(u128, u32)>, Option<Subject>);
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// An `unreachable` ending the construct of `kind` at expression `at`, and its row of the
     /// trap table: its site is `at`'s first byte from its item's (`Adts::caller_site`, for one
     /// in a macro's expansion its outermost call's; rule 71), `None` when the world does not
@@ -754,7 +754,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 
 /// The walk's marks as the trap table: each `unreachable`'s ordinal among the function's
 /// `unreachable` instructions in layout order (what the emitter counts them by).
-fn trap_sources<A: Allocator + Clone>(func: &blaze_lir::Func<A>, marks: &[TrapMark], alloc: A) -> Result<Vec<TrapSource, A>, BuildError> {
+fn trap_sources<A: Allocator + Copy>(func: &blaze_lir::Func<A>, marks: &[TrapMark], alloc: A) -> Result<Vec<TrapSource, A>, BuildError> {
     let unreachable = Op::Unreachable as u8;
     let mut out = Vec::with_capacity_in(marks.len(), alloc);
     let (mut ordinal, mut next) = (0u32, 0usize);
@@ -781,24 +781,24 @@ struct UnsizeEnds {
 /// What the instance `subst` names of `body` reads of trait shapes, in expression order: the
 /// part of its record's key the world's trait facts give ([`crate::vtable::record_key`]). Walks
 /// the checked body's calls and unsizings without building code.
-pub(crate) fn object_reads<A: Allocator + Clone>(
+pub(crate) fn object_reads<A: Allocator + Copy>(
     body: &BodyView<'_>,
     checked: &Checked<'_>,
     subst: &mut Subst<'_, '_>,
     adts: &dyn Adts,
     alloc: A,
 ) -> Result<Vec<ObjectRead, A>, BuildError> {
-    let mut out = Vec::new_in(alloc.clone());
+    let mut out = Vec::new_in(alloc);
     let mut w = Walk::new(body, checked, subst, adts, alloc);
     w.object_reads(&mut out)?;
     Ok(out)
 }
 
-impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
+impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     fn new(body: &'x BodyView<'x>, checked: &'x Checked<'c>, subst: &'x mut Subst<'_, 't>, adts: &'x dyn Adts, alloc: A) -> Self {
-    let mut grounded = Vec::with_capacity_in(checked.types.len(), alloc.clone());
+    let mut grounded = Vec::with_capacity_in(checked.types.len(), alloc);
     grounded.resize(checked.types.len(), UNGROUNDED);
-    let mut break_target = Vec::with_capacity_in(body.exprs.len(), alloc.clone());
+    let mut break_target = Vec::with_capacity_in(body.exprs.len(), alloc);
     break_target.resize(body.exprs.len(), false);
     for e in body.exprs {
         if let Expr::Break { target, .. } = *e
@@ -807,15 +807,15 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             break_target[target.ix()] = true;
         }
     }
-    let mut slots = Vec::with_capacity_in(body.pats.len(), alloc.clone());
+    let mut slots = Vec::with_capacity_in(body.pats.len(), alloc);
     slots.resize(body.pats.len(), None);
-    let mut needs_flag = Vec::with_capacity_in(body.pats.len(), alloc.clone());
+    let mut needs_flag = Vec::with_capacity_in(body.pats.len(), alloc);
     needs_flag.resize(body.pats.len(), false);
-    let mut partial = Vec::with_capacity_in(body.pats.len(), alloc.clone());
+    let mut partial = Vec::with_capacity_in(body.pats.len(), alloc);
     partial.resize(body.pats.len(), false);
-    let mut owned = Vec::with_capacity_in(body.pats.len(), alloc.clone());
+    let mut owned = Vec::with_capacity_in(body.pats.len(), alloc);
     owned.resize(body.pats.len(), None);
-    let mut init = Vec::with_capacity_in(body.pats.len(), alloc.clone());
+    let mut init = Vec::with_capacity_in(body.pats.len(), alloc);
     init.resize(body.pats.len(), false);
     Walk {
         body,
@@ -826,61 +826,61 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         scratch: subst.scratch,
         grounded,
         adts,
-        alloc: alloc.clone(),
-        b: Builder::new_in(PTR_BITS, alloc.clone()),
-        refs: Vec::new_in(alloc.clone()),
-        statics: Vec::new_in(alloc.clone()),
-        thread_locals: Vec::new_in(alloc.clone()),
-        vtables: Vec::new_in(alloc.clone()),
-        trap_marks: Vec::new_in(alloc.clone()),
+        alloc,
+        b: Builder::new_in(PTR_BITS, alloc),
+        refs: Vec::new_in(alloc),
+        statics: Vec::new_in(alloc),
+        thread_locals: Vec::new_in(alloc),
+        vtables: Vec::new_in(alloc),
+        trap_marks: Vec::new_in(alloc),
         copy_insts: 0,
         task_at: None,
-        ls: Layouts::new_in(alloc.clone()),
-        layouts: Vec::new_in(alloc.clone()),
-        layout_fields: Vec::new_in(alloc.clone()),
-        layout_field_tys: Vec::new_in(alloc.clone()),
-        layout_variants: Vec::new_in(alloc.clone()),
-        unsized_tails: Vec::new_in(alloc.clone()),
+        ls: Layouts::new_in(alloc),
+        layouts: Vec::new_in(alloc),
+        layout_fields: Vec::new_in(alloc),
+        layout_field_tys: Vec::new_in(alloc),
+        layout_variants: Vec::new_in(alloc),
+        unsized_tails: Vec::new_in(alloc),
         slots,
-        reached: Vec::new_in(alloc.clone()),
+        reached: Vec::new_in(alloc),
         live: true,
         break_target,
-        work: Vec::new_in(alloc.clone()),
-        vals: Vec::new_in(alloc.clone()),
-        val_tys: Vec::new_in(alloc.clone()),
-        lit_parts: Vec::new_in(alloc.clone()),
-        targets: Vec::new_in(alloc.clone()),
-        matches: Vec::new_in(alloc.clone()),
-        arm_blocks: Vec::new_in(alloc.clone()),
+        work: Vec::new_in(alloc),
+        vals: Vec::new_in(alloc),
+        val_tys: Vec::new_in(alloc),
+        lit_parts: Vec::new_in(alloc),
+        targets: Vec::new_in(alloc),
+        matches: Vec::new_in(alloc),
+        arm_blocks: Vec::new_in(alloc),
         ret: Repr::None,
         ret_pass: Pass::Ignore,
         sret: None,
         needs_flag,
         partial,
-        expr_parent: Vec::new_in(alloc.clone()),
-        temp_marks: Vec::new_in(alloc.clone()),
-        let_else_held: Vec::new_in(alloc.clone()),
+        expr_parent: Vec::new_in(alloc),
+        temp_marks: Vec::new_in(alloc),
+        let_else_held: Vec::new_in(alloc),
         temp_here: {
-            let mut here = Vec::with_capacity_in(body.exprs.len(), alloc.clone());
+            let mut here = Vec::with_capacity_in(body.exprs.len(), alloc);
             here.resize(body.exprs.len(), temps::NOT_SCOPE);
             here
         },
-        temp_scopes: Vec::new_in(alloc.clone()),
-        ext_flags: Vec::new_in(alloc.clone()),
-        super_temps: Vec::new_in(alloc.clone()),
+        temp_scopes: Vec::new_in(alloc),
+        ext_flags: Vec::new_in(alloc),
+        super_temps: Vec::new_in(alloc),
         owned,
         init,
-        scope_pats: Vec::new_in(alloc.clone()),
-        scope_marks: Vec::new_in(alloc.clone()),
-        moves: moves::Moves::new_in(alloc.clone()),
-        env_places: moves::env_places::EnvPlaces::new_in(alloc.clone()),
-        captured: Vec::new_in(alloc.clone()),
+        scope_pats: Vec::new_in(alloc),
+        scope_marks: Vec::new_in(alloc),
+        moves: moves::Moves::new_in(alloc),
+        env_places: moves::env_places::EnvPlaces::new_in(alloc),
+        captured: Vec::new_in(alloc),
         co: None,
         names: None,
         cleanup: false,
         nounwind: false,
         terminate: None,
-        owed: Vec::new_in(alloc.clone()),
+        owed: Vec::new_in(alloc),
         rung: unwind_ladder::Rung::Off,
         track: track_caller::Track::No,
     }
@@ -924,7 +924,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 if a == b {
                     continue;
                 }
-                let shape = crate::vtable::Shape::of(a, |t| self.adts.object_trait(t), self.alloc.clone())
+                let shape = crate::vtable::Shape::of(a, |t| self.adts.object_trait(t), self.alloc)
                     .map_err(|error| BuildError::Vtable { at: Some(e), error })?;
                 let slot = match shape.upcast(b) {
                     Some(crate::vtable::Upcast::Prefix) => None,
@@ -938,7 +938,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     }
 }
 
-impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
+impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     // Types.
 
     /// `t` of table `from` (a signature's, a struct's), grounded at the instance's arguments.
@@ -1233,12 +1233,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             return Ok(found);
         }
         let too_big = || TyErr::Unsupported("an aggregate of 2 GiB or more");
-        let mut todo = Vec::new_in(self.alloc.clone());
-        let mut args: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut todo = Vec::new_in(self.alloc);
+        let mut args: Vec<PTy, A> = Vec::new_in(self.alloc);
         // The parts: a struct's or tuple's fields, or an array's element.
-        let mut parts: Vec<(Name, PTy), A> = Vec::new_in(self.alloc.clone());
+        let mut parts: Vec<(Name, PTy), A> = Vec::new_in(self.alloc);
         // An enum's variants: where each one's fields end in `parts`.
-        let mut variant_ends: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let mut variant_ends: Vec<u32, A> = Vec::new_in(self.alloc);
         todo.push(g);
         while let Some(&t) = todo.last() {
             if self.find_layout(t).is_some() {
@@ -1790,7 +1790,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
 
     /// [`Walk::copy`]'s work, counted by it.
     fn copy_leaves(&mut self, repr: Repr, from: (Value, i32), to: (Value, i32)) -> Result<(), BuildError> {
-        let mut stack = Vec::new_in(self.alloc.clone());
+        let mut stack = Vec::new_in(self.alloc);
         stack.push(CopyStep::Copy { repr, from, to });
         while let Some(step) = stack.pop() {
             let (repr, from, to) = match step {
@@ -1881,7 +1881,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                             let join = self.create();
                             let none = self.create();
                             stack.push(CopyStep::Begin(join));
-                            let mut cases = Vec::new_in(self.alloc.clone());
+                            let mut cases = Vec::new_in(self.alloc);
                             for v in (0..len).rev() {
                                 let case = self.discriminant_case(id, v)?;
                                 let block = self.create();
@@ -1905,7 +1905,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
 
     /// Ends the block with a switch on `x`: to each case's block on its value, else `default`.
     fn switch(&mut self, x: Value, default: Block, cases: &[(u128, Block)]) {
-        let mut tos = Vec::with_capacity_in(cases.len(), self.alloc.clone());
+        let mut tos = Vec::with_capacity_in(cases.len(), self.alloc);
         for &(v, block) in cases {
             self.reach(block);
             tos.push((v, (block, &[] as &[Value])));
@@ -2059,8 +2059,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// by a work list; every other irrefutable pattern (a struct or only-variant pattern, `&p`,
     /// an array with `..`, a tuple over a reference) by walk/matches/irrefutable.rs.
     fn bind_value(&mut self, p: PatId, v: V) -> Result<(), BuildError> {
-        let mut todo = Vec::new_in(self.alloc.clone());
-        let mut parts = Vec::new_in(self.alloc.clone());
+        let mut todo = Vec::new_in(self.alloc);
+        let mut parts = Vec::new_in(self.alloc);
         todo.push((p, v));
         while let Some((p, v)) = todo.pop() {
             let (elems, rest) = match self.pat(p)? {
@@ -2311,8 +2311,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let fa = self.b.slot_addr(slot);
         let mask = self.b.load(Ty::I64, Flags::NONE, fa, 0, MemAttrs::aligned(3));
         let exit = self.create();
-        let mut cases = Vec::with_capacity_in(len as usize, self.alloc.clone());
-        let mut bodies = Vec::with_capacity_in(len as usize, self.alloc.clone());
+        let mut cases = Vec::with_capacity_in(len as usize, self.alloc);
+        let mut bodies = Vec::with_capacity_in(len as usize, self.alloc);
         for v in 0..len {
             let (ff, fl) = self.layout_variants[(first + v) as usize];
             if !self.fields_need_drop(ff, fl) {
@@ -2390,7 +2390,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
 
     /// Every binding of pattern `p`, just bound, joins the innermost drop scope, in order.
     fn own_pat(&mut self, p: PatId) -> Result<(), BuildError> {
-        let mut todo = Vec::new_in(self.alloc.clone());
+        let mut todo = Vec::new_in(self.alloc);
         todo.push(p);
         while let Some(p) = todo.pop() {
             let subs = match self.pat(p)? {
@@ -2551,12 +2551,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let body = self.body;
         let n = body.exprs.len();
         // Per expression: its parent and whether the edge to it is conditional.
-        let mut parent: Vec<(u32, bool), A> = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut parent: Vec<(u32, bool), A> = Vec::with_capacity_in(n, self.alloc);
         parent.resize(n, (NO_EXPR, false));
-        let mut decl: Vec<u32, A> = Vec::with_capacity_in(body.pats.len(), self.alloc.clone());
+        let mut decl: Vec<u32, A> = Vec::with_capacity_in(body.pats.len(), self.alloc);
         decl.resize(body.pats.len(), NO_EXPR);
-        let mut kids: Vec<(ExprId, bool), A> = Vec::new_in(self.alloc.clone());
-        let mut pats: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let mut kids: Vec<(ExprId, bool), A> = Vec::new_in(self.alloc);
+        let mut pats: Vec<PatId, A> = Vec::new_in(self.alloc);
         let list = |l: List| body.expr_lists.get(l.range()).ok_or(malformed("a list past `expr_lists`"));
         for (i, x) in body.exprs.iter().enumerate() {
             kids.clear();
@@ -2777,7 +2777,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
 
     /// Every binding of pattern `p` is declared by expression `by`.
     fn mark_decl(&self, p: PatId, by: u32, decl: &mut Vec<u32, A>) -> Result<(), BuildError> {
-        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
         todo.push(p);
         while let Some(p) = todo.pop() {
             *decl.get_mut(p.ix()).ok_or(malformed("a pattern past `pats`"))? = by;
@@ -2920,10 +2920,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Kind::Body => self.adts.abi(owner).ok_or(BuildError::NoAbi { item: owner })?,
             Kind::Closure(..) => return Err(malformed("a closure's body built as a fn's (closure.rs builds it)")),
         };
-        let mut reprs = Vec::with_capacity_in(sig.inputs.len(), self.alloc.clone());
-        let mut passes = Vec::with_capacity_in(sig.inputs.len(), self.alloc.clone());
+        let mut reprs = Vec::with_capacity_in(sig.inputs.len(), self.alloc);
+        let mut passes = Vec::with_capacity_in(sig.inputs.len(), self.alloc);
         // "rust-call": the last parameter, a tuple, arrives as its fields (lib.rs `Abi`).
-        let mut spread = Vec::new_in(self.alloc.clone());
+        let mut spread = Vec::new_in(self.alloc);
         for (i, &t) in sig.inputs.iter().enumerate() {
             let g = self.ground_in(sig.types, t).map_err(sig_err)?;
             let repr = self.repr(g).map_err(sig_err)?;
@@ -2957,7 +2957,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let entry = self.create();
         self.reached[entry.index()] = true;
         self.begin(entry);
-        let mut values = Vec::with_capacity_in(params.len(), self.alloc.clone());
+        let mut values = Vec::with_capacity_in(params.len(), self.alloc);
         for p in params.iter() {
             values.push(self.b.param(p.ty));
         }
@@ -3106,7 +3106,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// offsets and reprs (codegen.md, "Closures and the Fn traits"). A zero-sized tuple has
     /// none: it crosses the call as nothing.
     fn rust_call_fields(&self, repr: Repr) -> Result<Vec<(u32, Repr), A>, BuildError> {
-        let mut out = Vec::new_in(self.alloc.clone());
+        let mut out = Vec::new_in(self.alloc);
         let l = match repr {
             Repr::None => return Ok(out),
             Repr::Agg(l) => l,
@@ -3167,7 +3167,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             let mut cx = LayoutCx { ground: &mut *self.ground, facts: adts.facts(), scratch: self.scratch };
             self.ls.of(g, &mut cx).map_err(CAbiError::Layout).and_then(|id| {
                 let base = self.ls.get(id).call_ty;
-                cabi::class_of(&mut self.ls, base, &mut cx, self.alloc.clone())
+                cabi::class_of(&mut self.ls, base, &mut cx, self.alloc)
             })
         };
         let class = class.map_err(|error| match error {
@@ -3238,7 +3238,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// The lowered signature of passes `inputs` and `ret`: a result pointer first (Rust's plain
     /// pointer, C's `sret`), then each input's registers.
     fn sig_of(&self, inputs: &[Pass], ret: Pass) -> (Vec<Param, A>, Vec<Param, A>) {
-        crate::abi::sig_of_in(inputs, ret, self.alloc.clone())
+        crate::abi::sig_of_in(inputs, ret, self.alloc)
     }
 
     /// The `size` (1 to 8) bytes at `at`, `start` bytes into a value aligned to `align`, as a
@@ -3371,7 +3371,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             return self.coroutine_return(v);
         }
         let ret = self.ret;
-        let mut xs = Vec::with_capacity_in(2, self.alloc.clone());
+        let mut xs = Vec::with_capacity_in(2, self.alloc);
         match self.ret_pass {
             Pass::Ref | Pass::Memory { .. } => {
                 let to = self.sret.ok_or(malformed("an aggregate result without its pointer"))?;
@@ -3387,7 +3387,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// Whether building place `e` runs no code that could write memory: locals, fields,
     /// dereferences and indexes by a local or a literal.
     fn effect_free_place(&self, e: ExprId) -> Result<bool, BuildError> {
-        let mut todo = Vec::new_in(self.alloc.clone());
+        let mut todo = Vec::new_in(self.alloc);
         todo.push(e);
         while let Some(e) = todo.pop() {
             match self.expr(e)? {
@@ -4030,7 +4030,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// an unsized tail, an index (`push_index_base`) and a pattern (walk/matches.rs).
     fn deref_call(&mut self, e: ExprId, n: usize) -> Result<(), BuildError> {
         let rows = self.adjust_rows(e);
-        let kinds = &self.checked.adjusts.column::<1>()[rows.clone()];
+        let kinds = &self.checked.adjusts.column::<1>()[rows.start..rows.end];
         let AdjustKind::Deref { overloaded: Some(m) } = kinds[n] else {
             return Err(malformed("a deref call on an adjustment that is not an overloaded dereference"));
         };
@@ -4377,8 +4377,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         };
         let fields = self.ground.view().list(fl).map_err(|_| malformed("a list past the ground table"))?.len();
         let abi = self.adts.abi(item).ok_or(BuildError::NoAbi { item })?;
-        let mut reprs = Vec::with_capacity_in(fields, self.alloc.clone());
-        let mut passes = Vec::with_capacity_in(fields, self.alloc.clone());
+        let mut reprs = Vec::with_capacity_in(fields, self.alloc);
+        let mut passes = Vec::with_capacity_in(fields, self.alloc);
         for i in 0..fields {
             let ft = self.ground.view().list(fl).map_err(|_| malformed("a list past the ground table"))?[i];
             let repr = self.repr(ft).map_err(|error| Self::ty_err(e, error))?;
@@ -4431,7 +4431,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         if let Some(check) = intrinsics::validity::Check::of(which) {
             return self.validity_check(e, which, check, gl, list.len());
         }
-        let mut generics = Vec::new_in(self.alloc.clone());
+        let mut generics = Vec::new_in(self.alloc);
         let n_generics = self.ground.view().list(gl).map_err(|_| malformed("a list past the ground table"))?.len();
         for i in 0..n_generics {
             let g = *self.ground.view().list(gl).map_err(|_| malformed("a list past the ground table"))?.get(i).ok_or(malformed("a list past the ground table"))?;
@@ -4469,7 +4469,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         // scalar (a newtype's too), any other aggregate its address.
         let n = list.len();
         let base = self.vals.len().checked_sub(n).ok_or(malformed("an intrinsic's arguments missing from the value stack (a build bug)"))?;
-        let mut cargs = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut cargs = Vec::with_capacity_in(n, self.alloc);
         for (i, &a) in list.iter().enumerate() {
             let v = self.vals[base + i];
             let at = self.adjusted_ty(a)?;
@@ -4635,10 +4635,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// with no row (a constant with no generics).
     fn const_path_args(&mut self, e: ExprId) -> Result<Vec<PTy, A>, BuildError> {
         let Some(list) = self.checked.const_args_of(e) else {
-            return Ok(Vec::new_in(self.alloc.clone()));
+            return Ok(Vec::new_in(self.alloc));
         };
         let tys = self.types.list(list).map_err(|_| malformed("a constant path's arguments past the record's types"))?;
-        let mut grounded = Vec::with_capacity_in(tys.len(), self.alloc.clone());
+        let mut grounded = Vec::with_capacity_in(tys.len(), self.alloc);
         for &t in tys {
             grounded.push(self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?);
         }
@@ -4732,7 +4732,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let PNode::Adt(_, list) = self.ground_node(g).map_err(|error| Self::ty_err(e, error))? else {
             return Err(malformed("a struct expression with defaults of a type that is not an ADT"));
         };
-        let mut args: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut args: Vec<PTy, A> = Vec::new_in(self.alloc);
         args.extend_from_slice(self.ground.view().list(list).map_err(|_| malformed("an ADT's arguments past the ground table"))?);
         let checked: &'x Checked<'c> = self.checked;
         let adts = self.adts;
@@ -4849,7 +4849,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// Pushes the tasks that evaluate `e` as a place.
     fn place_of(&mut self, e: ExprId) -> Result<(), BuildError> {
         let rows = self.adjust_rows(e);
-        let kinds = &self.checked.adjusts.column::<1>()[rows.clone()];
+        let kinds = &self.checked.adjusts.column::<1>()[rows.start..rows.end];
         // An autoderef of builtin steps only: `*`, once per step.
         if kinds.iter().all(|k| *k == AdjustKind::Deref { overloaded: None }) {
             let n = kinds.len() as u32;
@@ -5669,7 +5669,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     fn call(&mut self, e: ExprId) -> Result<(), BuildError> {
         // The arguments in order (a method's receiver first) and the callee instance: its item
         // and its call's arguments, grounded at this instance's.
-        let mut list = Vec::new_in(self.alloc.clone());
+        let mut list = Vec::new_in(self.alloc);
         // An overloaded call (`f(x)` through `Fn*`): its arguments are written apart already,
         // the fields of the trait method's tuple, so none is spread.
         let mut overloaded = false;
@@ -5719,8 +5719,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let item = instance.item;
         let abi = self.adts.abi(item).ok_or(BuildError::NoAbi { item })?;
         let n = list.len();
-        let mut reprs = Vec::with_capacity_in(n, self.alloc.clone());
-        let mut passes = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut reprs = Vec::with_capacity_in(n, self.alloc);
+        let mut passes = Vec::with_capacity_in(n, self.alloc);
         // A C-variadic callee: its declared count splits the arguments (walk/c_variadic.rs).
         let declared = self.adts.c_variadic(item).map(|d| d as usize);
         if declared.is_some() {
@@ -5769,7 +5769,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             return Ok(None);
         };
         let adts = self.adts;
-        let shape = crate::vtable::Shape::of(principal, |t| adts.object_trait(t), self.alloc.clone())
+        let shape = crate::vtable::Shape::of(principal, |t| adts.object_trait(t), self.alloc)
             .map_err(|error| BuildError::Vtable { at: Some(e), error })?;
         if let Some(slot) = shape.slot(instance.item) {
             return Ok(Some((principal, slot)));
@@ -5804,8 +5804,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let item = instance.item;
         let abi = self.adts.abi(item).ok_or(BuildError::NoAbi { item })?;
         let n = list.len();
-        let mut reprs = Vec::with_capacity_in(n, self.alloc.clone());
-        let mut passes = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut reprs = Vec::with_capacity_in(n, self.alloc);
+        let mut passes = Vec::with_capacity_in(n, self.alloc);
         let mut wide = Repr::None;
         for (i, &a) in list.iter().enumerate() {
             let t = self.adjusted_ty(a)?;
@@ -5869,7 +5869,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             PNode::Ptr(m, _) => PNode::Ptr(m, unit),
             PNode::Adt(k, l) if self.adts.lang_adt(LangItem::OwnedBox) == Some(k) => {
                 let view = self.ground.view();
-                let mut args = Vec::new_in(self.alloc.clone());
+                let mut args = Vec::new_in(self.alloc);
                 for &t in view.list(l).map_err(|_| malformed("a type's arguments past the ground table"))? {
                     args.push(match view.node(t) {
                         Ok(PNode::Dynamic(_)) => unit,
@@ -5906,8 +5906,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     fn call_pointer(&mut self, e: ExprId, list: &[ExprId], abi: blaze_typeck::Abi) -> Result<(), BuildError> {
         let abi = pointer_abi(abi).ok_or_else(|| unsupported(e, "a fn pointer outside the Rust, rust-call and C-family calling conventions"))?;
         let n = list.len();
-        let mut reprs = Vec::with_capacity_in(n, self.alloc.clone());
-        let mut passes = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut reprs = Vec::with_capacity_in(n, self.alloc);
+        let mut passes = Vec::with_capacity_in(n, self.alloc);
         for &a in list.iter() {
             let t = self.adjusted_ty(a)?;
             let g = self.ground_ty(t).map_err(|error| Self::ty_err(a, error))?;
@@ -5943,7 +5943,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let item = self.checked.callees.column::<1>()[at];
         let generic = self.checked.callees.column::<2>()[at];
         let tys = self.types.list(generic).map_err(|_| malformed("a callee's arguments past the record's types"))?;
-        let mut grounded = Vec::with_capacity_in(tys.len(), self.alloc.clone());
+        let mut grounded = Vec::with_capacity_in(tys.len(), self.alloc);
         for &t in tys {
             grounded.push(self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?);
         }
@@ -6018,7 +6018,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let (first, len, _) = self.variant_rows(l, variant)?;
         let n = len as usize;
         // (field row, subpattern) pairs.
-        let mut binds = Vec::new_in(self.alloc.clone());
+        let mut binds = Vec::new_in(self.alloc);
         let mut moved = 0u64;
         match self.pat(p)? {
             Pat::TupleStruct { elems, rest, .. } => {
@@ -6229,8 +6229,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             let to = self.arm_blocks[first as usize];
             self.jump(to, &[]);
         } else {
-            let mut values = Vec::new_in(self.alloc.clone());
-            let mut cases: Vec<(u128, Block), A> = Vec::new_in(self.alloc.clone());
+            let mut values = Vec::new_in(self.alloc);
+            let mut cases: Vec<(u128, Block), A> = Vec::new_in(self.alloc);
             let mut default = self.arm_blocks[(first + n) as usize];
             for (i, arm) in list.iter().enumerate() {
                 values.clear();
@@ -6268,7 +6268,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         }
         self.begin(block);
         if st.guarded {
-            let mut values = Vec::new_in(self.alloc.clone());
+            let mut values = Vec::new_in(self.alloc);
             let always = self.pat_values(arm.pat, st.width, st.of_enum.map(|o| o.2), &mut values)?;
             if !always {
                 let ty = Ty::int(st.width).ok_or(malformed("a scrutinee of no integer width"))?;

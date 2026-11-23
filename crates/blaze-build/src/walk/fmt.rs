@@ -312,7 +312,7 @@ const fn counts_of(o: Options) -> usize {
     matches!(o.width, Some(Count::Arg)) as usize + matches!(o.precision, Some(Count::Arg)) as usize
 }
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// `format_args!` expression `e`: checks its template against its uses, then evaluates the
     /// arguments left to right; `Task::FormatArgs` builds the value from them.
     pub(super) fn format_args(&mut self, e: ExprId, args: List, uses: List) -> Result<(), BuildError> {
@@ -372,7 +372,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let has_placeholders = self.fmt_template_checked(e, uses_of)?;
         let n = list.len();
         let base = self.vals.len().checked_sub(n).ok_or(malformed("a `format_args!`'s arguments missing from the value stack (a build bug)"))?;
-        let mut refs = blaze_own::Vec::with_capacity_in(n, self.alloc.clone());
+        let mut refs = blaze_own::Vec::with_capacity_in(n, self.alloc);
         refs.extend_from_slice(&self.vals[base..]);
         self.truncate_vals(base);
 
@@ -387,7 +387,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 
         // The template's bytes as read-only data.
         let pieces = self.adts.format_template(self.body.owner, e).ok_or(malformed("a `format_args!` template that went away"))?;
-        let mut bytes = blaze_own::Vec::new_in(self.alloc.clone());
+        let mut bytes = blaze_own::Vec::new_in(self.alloc);
         // The `args` array: the values' `rt::Argument`s in placeholder order, so each
         // placeholder formats "the next argument" and none writes an `arg_index`; then the
         // counts' `from_usize`s, in template order, each named by its index (`fmt_template_checked`

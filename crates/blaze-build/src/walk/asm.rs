@@ -164,7 +164,7 @@ pub(super) fn asm_kids<A: Allocator>(body: &BodyView<'_>, operands: List, kids: 
     Ok(())
 }
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// `asm!` `e`: its operands' values and places, in operand order, then `Task::Asm`.
     pub(super) fn asm_operands(&mut self, e: ExprId) -> Result<(), BuildError> {
         let Expr::Asm { operands, arch, .. } = self.expr(e)? else { return Err(malformed("an `asm!`'s walk on another expression")) };
@@ -232,14 +232,14 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 
         // Per operand of the source, its index among the LIR block's operands (`const`s are
         // formatted into the text and have none).
-        let mut lir_index: Vec<u32, A> = Vec::with_capacity_in(ops.len(), self.alloc.clone());
-        let mut lir_ops: Vec<AsmOperand<'_>, A> = Vec::with_capacity_in(ops.len(), self.alloc.clone());
-        let mut inputs: Vec<Value, A> = Vec::new_in(self.alloc.clone());
-        let mut members: Vec<Ty, A> = Vec::new_in(self.alloc.clone());
-        let mut stores: Vec<Store, A> = Vec::new_in(self.alloc.clone());
-        let mut labels: Vec<(Block, ExprId), A> = Vec::new_in(self.alloc.clone());
+        let mut lir_index: Vec<u32, A> = Vec::with_capacity_in(ops.len(), self.alloc);
+        let mut lir_ops: Vec<AsmOperand<'_>, A> = Vec::with_capacity_in(ops.len(), self.alloc);
+        let mut inputs: Vec<Value, A> = Vec::new_in(self.alloc);
+        let mut members: Vec<Ty, A> = Vec::new_in(self.alloc);
+        let mut stores: Vec<Store, A> = Vec::new_in(self.alloc);
+        let mut labels: Vec<(Block, ExprId), A> = Vec::new_in(self.alloc);
         // Per operand of the source, its value when it is a `const`.
-        let mut consts: Vec<Option<ConstText>, A> = Vec::with_capacity_in(ops.len(), self.alloc.clone());
+        let mut consts: Vec<Option<ConstText>, A> = Vec::with_capacity_in(ops.len(), self.alloc);
         let mut next = base;
         for op in ops {
             lir_index.push(lir_ops.len() as u32);
@@ -344,8 +344,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 
         // The template: text pieces from `asm_text`, `const` values in decimal, register
         // operands by their LIR index; adjacent text merged.
-        let mut text: Vec<u8, A> = Vec::new_in(self.alloc.clone());
-        let mut raws: Vec<Raw, A> = Vec::with_capacity_in(tpl.len(), self.alloc.clone());
+        let mut text: Vec<u8, A> = Vec::new_in(self.alloc);
+        let mut raws: Vec<Raw, A> = Vec::with_capacity_in(tpl.len(), self.alloc);
         for piece in tpl {
             let start = text.len();
             match *piece {
@@ -372,7 +372,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 _ => raws.push(Raw::Text(start, text.len())),
             }
         }
-        let mut clobbers: Vec<u8, A> = Vec::new_in(self.alloc.clone());
+        let mut clobbers: Vec<u8, A> = Vec::new_in(self.alloc);
         for (i, &(first, len)) in abis.iter().enumerate() {
             if i > 0 {
                 clobbers.push(b',');
@@ -381,7 +381,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         }
         let text = core::str::from_utf8(&text).map_err(|_| malformed("an `asm!` template that is not UTF-8"))?;
         let clobbers = core::str::from_utf8(&clobbers).map_err(|_| malformed("a `clobber_abi` name that is not UTF-8"))?;
-        let mut lir_pieces: Vec<AsmPiece<'_>, A> = Vec::with_capacity_in(raws.len(), self.alloc.clone());
+        let mut lir_pieces: Vec<AsmPiece<'_>, A> = Vec::with_capacity_in(raws.len(), self.alloc);
         for raw in raws.iter() {
             lir_pieces.push(match *raw {
                 Raw::Text(s, end) => AsmPiece::Text(text.get(s..end).ok_or(malformed("an `asm!` text piece off a character boundary"))?),
@@ -410,7 +410,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         }
         let fall = self.create();
         let join = self.create();
-        let mut blocks: Vec<Block, A> = Vec::with_capacity_in(labels.len(), self.alloc.clone());
+        let mut blocks: Vec<Block, A> = Vec::with_capacity_in(labels.len(), self.alloc);
         blocks.extend(labels.iter().map(|&(b, _)| b));
         self.reach(fall);
         for &b in blocks.iter() {

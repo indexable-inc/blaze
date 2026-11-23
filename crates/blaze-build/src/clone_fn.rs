@@ -21,7 +21,7 @@
 
 use super::*;
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// The builtin `clone` of `Self` (`self.args[0]`), `clone` the trait's method its fields'
     /// clones call: one parameter, `&self`, the Rust ABI's; its result `Self`.
     fn run_builtin_clone(&mut self, clone: ItemKey, copy: bool) -> Result<(), BuildError> {
@@ -36,7 +36,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         };
         // The fields to clone, in order, and where `Self`'s layout holds each: a tuple's own,
         // a closure's its environment's inside its one field (closure.rs `capture_offsets`).
-        let mut fields: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut fields: Vec<PTy, A> = Vec::new_in(self.alloc);
         let mut base = 0u32;
         let held = match self.ground_node(me).map_err(sig_err)? {
             PNode::FnDef(..) | PNode::FnPtr(..) => None,
@@ -70,7 +70,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let entry = self.create();
         self.reached[entry.index()] = true;
         self.begin(entry);
-        let mut values = Vec::with_capacity_in(params.len(), self.alloc.clone());
+        let mut values = Vec::with_capacity_in(params.len(), self.alloc);
         for p in params.iter() {
             values.push(self.b.param(p.ty));
         }
@@ -108,7 +108,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         };
         let full = |_| malformed("the ground table is full");
         let lh = if fields.is_empty() { None } else { Some(self.layout(held).map_err(sig_err)?) };
-        let mut offs: Vec<(u32, Repr), A> = Vec::with_capacity_in(fields.len(), self.alloc.clone());
+        let mut offs: Vec<(u32, Repr), A> = Vec::with_capacity_in(fields.len(), self.alloc);
         let mark = self.vals.len();
         let ptr_pass = self.rust_pass(Repr::Ptr)?;
         for (j, &ft) in fields.iter().enumerate() {
@@ -147,7 +147,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 /// or a fn pointer) at the trait method `clone` (lib.rs `build_builtin_clone`); `copy` is the
 /// checker's answer to `Self: Copy`. Its walk is given an empty body named by `clone` and an
 /// empty check record: neither is read.
-pub(crate) fn build_builtin_clone<A: Allocator + Clone>(
+pub(crate) fn build_builtin_clone<A: Allocator + Copy>(
     clone: ItemKey,
     copy: bool,
     subst: &mut Subst<'_, '_>,

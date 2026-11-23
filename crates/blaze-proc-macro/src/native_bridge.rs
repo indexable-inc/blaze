@@ -1093,6 +1093,14 @@ pub fn run_native_build_script(
         }
     }
 
+    let clock_spec = match dedup_env.iter().find(|(name, _)| *name == "SOURCE_DATE_EPOCH") {
+        // A value that is no decimal leaves the spec's own check to refuse it by name.
+        Some((_, value)) => value
+            .parse::<u64>()
+            .map_or(ClockSpec::NeverAsks, |unix_secs| ClockSpec::Fixed { unix_secs }),
+        None => ClockSpec::NeverAsks,
+    };
+
     let spec = HermeticSpec::new(HermeticOpts {
         program: Program::Stored { name: bin_str, digest: bin_digest, path: bin_str },
         args: &[],
@@ -1103,7 +1111,7 @@ pub fn run_native_build_script(
         helpers: &[],
         helper_folders: &[],
         channels: &[],
-        clock: ClockSpec::Fixed { unix_secs: 0 },
+        clock: clock_spec,
         seed: 0,
         budget: Budget { cpu: deadline_dur.saturating_mul(16), memory: 16 << 30, steps: None },
         deadline,
@@ -1275,9 +1283,11 @@ mod tests {
             r#"
 fn main() {
     let out = std::env::var("OUT_DIR").expect("OUT_DIR");
+    let epoch = std::env::var("SOURCE_DATE_EPOCH").expect("SOURCE_DATE_EPOCH");
     std::fs::write(std::path::Path::new(&out).join("generated.rs"), "pub const MAGIC: u64 = 42;\n").unwrap();
     println!("cargo::rustc-cfg=blaze_native_hermetic");
     println!("cargo::rustc-env=BLAZE_ZERO_WASM=1");
+    println!("cargo::rustc-env=SEEN_EPOCH={epoch}");
 }
 "#,
         )
@@ -1303,11 +1313,36 @@ fn main() {
 
         assert_eq!(res.exit_code, 0, "stderr: {}", res.stderr);
         assert_eq!(res.cfgs, vec!["blaze_native_hermetic".to_owned()]);
-        assert_eq!(res.rustc_envs, vec![("BLAZE_ZERO_WASM".to_owned(), "1".to_owned())]);
+        assert_eq!(
+            res.rustc_envs,
+            vec![
+                ("BLAZE_ZERO_WASM".to_owned(), "1".to_owned()),
+                ("SEEN_EPOCH".to_owned(), "0".to_owned()),
+            ]
+        );
         assert!(
             res.output_files.iter().any(|f| f == "generated.rs"),
             "expected generated.rs in output_files, got {:?}",
             res.output_files
+        );
+
+        // Overriding SOURCE_DATE_EPOCH must keep ClockSpec in sync with dedup_env.
+        let custom = run_native_build_script(
+            &bin,
+            &manifest_dir,
+            &out_dir,
+            &[],
+            &[("SOURCE_DATE_EPOCH", "1700000000")],
+            Duration::from_secs(10),
+        )
+        .expect("SOURCE_DATE_EPOCH override must be accepted consistently");
+        assert_eq!(custom.exit_code, 0, "stderr: {}", custom.stderr);
+        assert_eq!(
+            custom.rustc_envs,
+            vec![
+                ("BLAZE_ZERO_WASM".to_owned(), "1".to_owned()),
+                ("SEEN_EPOCH".to_owned(), "1700000000".to_owned()),
+            ]
         );
         let _ = std::fs::remove_dir_all(&base);
     }

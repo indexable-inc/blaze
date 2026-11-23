@@ -38,7 +38,7 @@ use super::{Repr, V, Walk, malformed, unsupported};
 use crate::layout::Tail;
 use crate::{BuildError, Instance};
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// A cast whose source `v` (of `from`) is not a plain scalar, to `to`.
     pub(super) fn cast_other(&mut self, e: ExprId, operand: ExprId, v: V, from: Repr, to: Repr) -> Result<V, BuildError> {
         let t = self.adjusted_ty(operand)?;

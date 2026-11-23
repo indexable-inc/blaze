@@ -193,7 +193,7 @@ fn the_runs_reader_reads_each_crates_sections_in_place() {
         }
     }
     store.place.commit().unwrap_or_else(|e| panic!("the commit: {e:?}"));
-    let mut read = EngineRecords::new();
+    let mut read = EngineRecords::new(g);
     let mut sections_read = 0u64;
     for one in crates.iter() {
         let records = read.records(&cx, &mut store, &one.input, one.key, g).unwrap_or_else(|e| panic!("in place: {e}"));
@@ -237,7 +237,7 @@ fn a_record_still_in_the_arena_is_refused_by_name() {
     let mut store = Placed { place: PlainPlace::new(&lent, false), gets: 0 };
     let one = &crates[2];
     store.put(&cx, one.input.at, &one.whole).unwrap_or_else(|e| panic!("the put: {e}"));
-    let mut read = EngineRecords::new();
+    let mut read = EngineRecords::new(g);
     match read.records(&cx, &mut store, &one.input, one.key, g) {
         Err(error @ ReadError::NotInPlace { why: NotInPlace::Arena { .. }, .. }) => {
             let ReadError::NotInPlace { name, .. } = &error else { unreachable!() };
@@ -328,4 +328,28 @@ fn a_tree_opens_at_the_first_read_of_a_text_from_it() {
     let views = [pack(1), pack(2)];
     let open: Packs<'_> = Packs::from(&views[..]);
     assert_eq!(open.tree(1).and_then(|view| view.find("src/lib.rs")).map(|file| file.bytes), text, "the two schedules serve other texts");
+}
+
+#[test]
+fn exports_cache_serves_repeat_reads_without_store_gets() {
+    let (_io, cx) = root_cx(47);
+    let g: Alloc<'static> = blaze_own::testing::heap().alloc();
+    let crates = stored();
+    let lent = process(Sim::new(47, Faults::default()), 1);
+    let mut store = Placed { place: PlainPlace::new(&lent, false), gets: 0 };
+    for one in crates.iter() {
+        store.put(&cx, one.input.at, &one.whole).unwrap_or_else(|e| panic!("put: {e}"));
+    }
+    store.place.commit().unwrap_or_else(|e| panic!("commit: {e:?}"));
+    let mut read = EngineRecords::new(g);
+    let first = read.exports::<crate::engine_records::InPlace>(&cx, &mut store, &crates[0].input, g).expect("first exports read");
+    assert_eq!(store.gets, 1, "first read hits the store once");
+    for _ in 0..10 {
+        let again = read.exports::<crate::engine_records::InPlace>(&cx, &mut store, &crates[0].input, g).expect("cached exports read");
+        assert_eq!(again.exports.as_ptr(), first.exports.as_ptr(), "cached borrow points to same mapping");
+    }
+    assert_eq!(store.gets, 1, "repeat exports reads never hit the store again");
+    assert_eq!(read.counts().records, 1);
+    assert_eq!(read.counts().hits, 10);
+    assert_eq!(read.counts().copied, 0);
 }

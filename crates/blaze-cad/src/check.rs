@@ -58,7 +58,7 @@ use blaze_cad_field::{
     Level, Name, Points, Scratch, Solid, Tape, compile, distance_between_stopping, eval_box, eval_grad, eval_point, eval_points,
     simplify,
 };
-use blaze_math::{Aabb3, Vec3};
+use blaze_math::{Aabb3, Mat3, Vec3};
 use blaze_own::planted::{NoPlant, Planted};
 use blaze_own::{Alloc, Vec};
 use blaze_text::{Put, Show, Writes};
@@ -1350,6 +1350,174 @@ fn normalize_dir(dir: [f64; 3], function: &'static str, arg: &'static str) -> Re
     v.normalized().ok_or(ModelError::Argument { function, arg, accepted: "a finite non-zero direction" })
 }
 
+/// Shared configuration for the verified surface-normal DFM traversal used by
+/// [`overhang_check_planted`] and [`draft_angle_check_planted`].
+struct SurfaceWalk<'a, 's> {
+    s_tape: &'a Tape<'s>,
+    key: CheckKey,
+    lin: Mat3,
+    shift: Vec3,
+    local_dir: Vec3,
+    eval_dir: Vec3,
+    sample_size: Length,
+    base_tolerance: Length,
+    tolerance: Length,
+    most_boxes: u64,
+    most_steps_per_point: u32,
+    scratch: Alloc<'s>,
+}
+
+/// Verified octree, hierarchical tape simplification, surface projection, and outward normal walk
+/// shared by [`overhang_check_planted`] and [`draft_angle_check_planted`]. Excludes cells and
+/// samples within `base_tolerance` above `z_min` along `local_dir`, invoking `check` on every
+/// remaining `(sample, n_local, eval_dir)` to return the first violating witness face.
+fn check_surface_normals<W, F>(w: SurfaceWalk<'_, '_>, mut check: F) -> Result<Checked<W>, ModelError>
+where
+    F: FnMut(&OnSurface, Vec3, Vec3) -> Option<W>,
+{
+    let root = w.s_tape.aabb();
+    if root.is_empty() {
+        return Ok(Checked { verdict: Verdict::Pass, key: w.key, boxes: 0, samples: 0, points: 0 });
+    }
+    if !finite(&root) {
+        return Err(ModelError::Inspect(InspectError::Unbounded { what: "the part's box" }));
+    }
+
+    let leaf = w.sample_size.as_m();
+    let floor = leaf / f64::from(1u32 << SPLIT_LEVELS);
+    let tol = w.tolerance.as_m().max(1e-9);
+    let base_tol = w.base_tolerance.as_m();
+    let z_tol = (base_tol * 0.25).max(tol);
+
+    let mut sc = Scratch::new(w.scratch);
+    let mut boxes: u64 = 0;
+    let mut samples: u64 = 0;
+    let mut points: u64 = 0;
+
+    let z_min = match min_along(w.s_tape, root, w.local_dir, z_tol, w.most_boxes, &mut boxes, &mut points, &mut sc, w.scratch)? {
+        MinExtent::Found(z) => z,
+        MinExtent::Empty => return Ok(Checked { verdict: Verdict::Pass, key: w.key, boxes, samples, points }),
+        MinExtent::Budget => {
+            return Ok(Checked { verdict: Verdict::Unknown(Unsettled::Budget { boxes }), key: w.key, boxes, samples, points });
+        }
+    };
+    let base_cut = z_min + base_tol;
+
+    let mut frames: Vec<TapeFrame<'_>, Alloc<'_>> = Vec::new_in(w.scratch);
+    let mut stack: Vec<(Aabb3, bool), Alloc<'_>> = Vec::new_in(w.scratch);
+    stack.try_push((root, false)).map_err(|_| ModelError::Alloc { what: "a check's box stack" })?;
+    let mut open: u64 = 0;
+    let mut near: Option<Vec3> = None;
+    let mut vals = [0.0f64; 8];
+
+    loop {
+        while frames.last().is_some_and(|f| stack.len() <= f.stack_base) {
+            frames.pop();
+        }
+        let Some((c, center_tested)) = stack.pop() else { break };
+        boxes += 1;
+        if boxes > w.most_boxes {
+            return Ok(Checked { verdict: Verdict::Unknown(Unsettled::Budget { boxes }), key: w.key, boxes, samples, points });
+        }
+        let side = c.longest_side();
+        let sampling = side <= leaf;
+        if sampling {
+            samples += 1;
+        }
+        let reach = (c.hi - c.lo).length();
+        // Prune cells wholly inside the base contact band along `local_dir` (even when a planted
+        // bug flips `eval_dir`, base exclusion stays along `local_dir` so the bottom remains
+        // excluded).
+        if box_max_dot(&c, w.local_dir) + reach <= base_cut {
+            continue;
+        }
+        let cur_tape = active_tape(w.s_tape, &frames);
+        if !center_tested {
+            points += 1;
+            if eval_point(cur_tape, c.center(), &mut sc).abs() > reach / 2.0 {
+                continue;
+            }
+        }
+        if !sampling || side <= leaf / 2.0 {
+            let (iv, choices) = eval_box(cur_tape, &c, &mut sc);
+            if iv.lo() > 0.0 || iv.hi() < 0.0 {
+                continue;
+            }
+            if !sampling {
+                let sub = if side > leaf * 2.0 { try_simplify(cur_tape, choices, w.scratch)? } else { None };
+                if let Some(tape) = sub {
+                    frames
+                        .try_push(TapeFrame { tape, region: c, stack_base: stack.len() })
+                        .map_err(|_| ModelError::Alloc { what: "a check's tape stack" })?;
+                }
+                let child_tape = active_tape(w.s_tape, &frames);
+                let (kids, n) = split(&c);
+                if boxes + (n as u64) <= w.most_boxes {
+                    batch_eval_centers(child_tape, &kids[..n], &mut vals, &mut sc)?;
+                    points += n as u64;
+                    for i in 0..n {
+                        let k = kids[i];
+                        let k_sampling = k.longest_side() <= leaf;
+                        if vals[i].abs() > (k.hi - k.lo).length() / 2.0 {
+                            boxes += 1;
+                            if k_sampling {
+                                samples += 1;
+                            }
+                        } else {
+                            stack.try_push((k, true)).map_err(|_| ModelError::Alloc { what: "a check's box stack" })?;
+                        }
+                    }
+                } else {
+                    for k in &kids[..n] {
+                        stack.try_push((*k, false)).map_err(|_| ModelError::Alloc { what: "a check's box stack" })?;
+                    }
+                }
+                continue;
+            }
+        }
+        let eps = (4.0 * tol).min(leaf * 0.05);
+        let proj_tape = tape_for_box(w.s_tape, &frames, &Aabb3::around(c.center(), Vec3::splat(reach + eps)));
+        let mut pr = Probe { t: proj_tape, sc: &mut sc, points, used: 0, most: w.most_steps_per_point };
+        let res = project(&mut pr, &c, tol, false);
+        match res {
+            Projected::At(s) => {
+                if s.p.dot(w.local_dir) <= base_cut {
+                    points = pr.points;
+                    continue;
+                }
+                let Some(n_local) = surface_normal(&mut pr, &s, eps) else {
+                    points = pr.points;
+                    open += 1;
+                    near.get_or_insert(w.lin.apply(c.center()) + w.shift);
+                    continue;
+                };
+                points = pr.points;
+                if let Some(found) = check(&s, n_local, w.eval_dir) {
+                    return Ok(Checked { verdict: Verdict::Found(found), key: w.key, boxes, samples, points });
+                }
+            }
+            Projected::NoBracket if side > floor => {
+                points = pr.points;
+                let (kids, n) = split(&c);
+                for k in &kids[..n] {
+                    stack.try_push((*k, false)).map_err(|_| ModelError::Alloc { what: "a check's box stack" })?;
+                }
+            }
+            Projected::NoBracket | Projected::Spent => {
+                points = pr.points;
+                open += 1;
+                near.get_or_insert(w.lin.apply(c.center()) + w.shift);
+            }
+        }
+    }
+
+    let verdict = match near {
+        Some(p) => Verdict::Unknown(Unsettled::Open { cells: open, near: lengths(p) }),
+        None => Verdict::Pass,
+    };
+    Ok(Checked { verdict, key: w.key, boxes, samples, points })
+}
+
 /// What [`overhang_check`] takes.
 #[blaze::args]
 #[derive(Clone, Copy, Debug)]
@@ -1433,159 +1601,41 @@ pub fn overhang_check_planted<K: Ex, P: Planted<CadPlant>>(
         args: [o.max_angle.as_microarcsec(), o.sample_size.as_nm(), dir_tol_key(local_dir, o.plate_tolerance.as_nm())],
         schema: CHECK_SCHEMA,
     };
-    let root = s_tape.aabb();
-    if root.is_empty() {
-        return Ok(Checked { verdict: Verdict::Pass, key, boxes: 0, samples: 0, points: 0 });
-    }
-    if !finite(&root) {
-        return Err(ModelError::Inspect(InspectError::Unbounded { what: "the part's box" }));
-    }
-
-    let leaf = o.sample_size.as_m();
-    let floor = leaf / f64::from(1u32 << SPLIT_LEVELS);
-    let tol = o.tolerance.as_m().max(1e-9);
-    let plate_tol = o.plate_tolerance.as_m();
-    let z_tol = (plate_tol * 0.25).max(tol);
     let sin_max = blaze_math::sin(o.max_angle.as_radians());
     let eval_dir = if plant.has(OverhangPlant::FlippedBuildDir) { -local_dir } else { local_dir };
 
-    let mut sc = Scratch::new(o.scratch);
-    let mut boxes: u64 = 0;
-    let mut samples: u64 = 0;
-    let mut points: u64 = 0;
-
-    let z_min = match min_along(&s_tape, root, local_dir, z_tol, o.most_boxes, &mut boxes, &mut points, &mut sc, o.scratch)? {
-        MinExtent::Found(z) => z,
-        MinExtent::Empty => return Ok(Checked { verdict: Verdict::Pass, key, boxes, samples, points }),
-        MinExtent::Budget => {
-            return Ok(Checked { verdict: Verdict::Unknown(Unsettled::Budget { boxes }), key, boxes, samples, points });
-        }
-    };
-    let plate_cut = z_min + plate_tol;
-
-    let mut frames: Vec<TapeFrame<'_>, Alloc<'_>> = Vec::new_in(o.scratch);
-    let mut stack: Vec<(Aabb3, bool), Alloc<'_>> = Vec::new_in(o.scratch);
-    stack.try_push((root, false)).map_err(|_| ModelError::Alloc { what: "a check's box stack" })?;
-    let mut open: u64 = 0;
-    let mut near: Option<Vec3> = None;
-    let mut vals = [0.0f64; 8];
-
-    loop {
-        while frames.last().is_some_and(|f| stack.len() <= f.stack_base) {
-            frames.pop();
-        }
-        let Some((c, center_tested)) = stack.pop() else { break };
-        boxes += 1;
-        if boxes > o.most_boxes {
-            return Ok(Checked { verdict: Verdict::Unknown(Unsettled::Budget { boxes }), key, boxes, samples, points });
-        }
-        let side = c.longest_side();
-        let sampling = side <= leaf;
-        if sampling {
-            samples += 1;
-        }
-        let reach = (c.hi - c.lo).length();
-        // Prune cells wholly inside the build-plate contact band (not when flipped plant is on,
-        // wait: even with FlippedBuildDir, build-plate exclusion is along `local_dir` so bottom
-        // stays excluded while top is flagged!).
-        if box_max_dot(&c, local_dir) + reach <= plate_cut {
-            continue;
-        }
-        let cur_tape = active_tape(&s_tape, &frames);
-        if !center_tested {
-            points += 1;
-            if eval_point(cur_tape, c.center(), &mut sc).abs() > reach / 2.0 {
-                continue;
+    check_surface_normals(
+        SurfaceWalk {
+            s_tape: &s_tape,
+            key,
+            lin,
+            shift,
+            local_dir,
+            eval_dir,
+            sample_size: o.sample_size,
+            base_tolerance: o.plate_tolerance,
+            tolerance: o.tolerance,
+            most_boxes: o.most_boxes,
+            most_steps_per_point: o.most_steps_per_point,
+            scratch: o.scratch,
+        },
+        |s, n_local, dir| {
+            let d = n_local.dot(dir);
+            if d < -sin_max - 1e-9 {
+                let angle = Angle::radians(blaze_math::asin((-d).clamp(0.0, 1.0)));
+                let at_world = lin.apply(s.p) + shift;
+                let n_world = lin.apply(n_local).normalized().unwrap_or(n_local);
+                Some(OverhangFace {
+                    at: lengths(at_world),
+                    normal: n_world.to_array(),
+                    angle,
+                    max_angle: o.max_angle,
+                })
+            } else {
+                None
             }
-        }
-        if !sampling || side <= leaf / 2.0 {
-            let (iv, choices) = eval_box(cur_tape, &c, &mut sc);
-            if iv.lo() > 0.0 || iv.hi() < 0.0 {
-                continue;
-            }
-            if !sampling {
-                let sub = if side > leaf * 2.0 { try_simplify(cur_tape, choices, o.scratch)? } else { None };
-                if let Some(tape) = sub {
-                    frames
-                        .try_push(TapeFrame { tape, region: c, stack_base: stack.len() })
-                        .map_err(|_| ModelError::Alloc { what: "a check's tape stack" })?;
-                }
-                let child_tape = active_tape(&s_tape, &frames);
-                let (kids, n) = split(&c);
-                if boxes + (n as u64) <= o.most_boxes {
-                    batch_eval_centers(child_tape, &kids[..n], &mut vals, &mut sc)?;
-                    points += n as u64;
-                    for i in 0..n {
-                        let k = kids[i];
-                        let k_sampling = k.longest_side() <= leaf;
-                        if vals[i].abs() > (k.hi - k.lo).length() / 2.0 {
-                            boxes += 1;
-                            if k_sampling {
-                                samples += 1;
-                            }
-                        } else {
-                            stack.try_push((k, true)).map_err(|_| ModelError::Alloc { what: "a check's box stack" })?;
-                        }
-                    }
-                } else {
-                    for k in &kids[..n] {
-                        stack.try_push((*k, false)).map_err(|_| ModelError::Alloc { what: "a check's box stack" })?;
-                    }
-                }
-                continue;
-            }
-        }
-        let eps = (4.0 * tol).min(leaf * 0.05);
-        let proj_tape = tape_for_box(&s_tape, &frames, &Aabb3::around(c.center(), Vec3::splat(reach + eps)));
-        let mut pr = Probe { t: proj_tape, sc: &mut sc, points, used: 0, most: o.most_steps_per_point };
-        let res = project(&mut pr, &c, tol, false);
-        match res {
-            Projected::At(s) => {
-                if s.p.dot(local_dir) <= plate_cut {
-                    points = pr.points;
-                    continue;
-                }
-                let Some(n_local) = surface_normal(&mut pr, &s, eps) else {
-                    points = pr.points;
-                    open += 1;
-                    near.get_or_insert(lin.apply(c.center()) + shift);
-                    continue;
-                };
-                points = pr.points;
-                let d = n_local.dot(eval_dir);
-                if d < -sin_max - 1e-9 {
-                    let angle = Angle::radians(blaze_math::asin((-d).clamp(0.0, 1.0)));
-                    let at_world = lin.apply(s.p) + shift;
-                    let n_world = lin.apply(n_local).normalized().unwrap_or(n_local);
-                    let found = OverhangFace {
-                        at: lengths(at_world),
-                        normal: n_world.to_array(),
-                        angle,
-                        max_angle: o.max_angle,
-                    };
-                    return Ok(Checked { verdict: Verdict::Found(found), key, boxes, samples, points });
-                }
-            }
-            Projected::NoBracket if side > floor => {
-                points = pr.points;
-                let (kids, n) = split(&c);
-                for k in &kids[..n] {
-                    stack.try_push((*k, false)).map_err(|_| ModelError::Alloc { what: "a check's box stack" })?;
-                }
-            }
-            Projected::NoBracket | Projected::Spent => {
-                points = pr.points;
-                open += 1;
-                near.get_or_insert(lin.apply(c.center()) + shift);
-            }
-        }
-    }
-
-    let verdict = match near {
-        Some(p) => Verdict::Unknown(Unsettled::Open { cells: open, near: lengths(p) }),
-        None => Verdict::Pass,
-    };
-    Ok(Checked { verdict, key, boxes, samples, points })
+        },
+    )
 }
 
 /// What [`draft_angle_check`] takes.
@@ -1672,158 +1722,43 @@ pub fn draft_angle_check_planted<K: Ex, P: Planted<CadPlant>>(
         args: [o.min_draft.as_microarcsec(), o.sample_size.as_nm(), dir_tol_key(local_dir, o.parting_tolerance.as_nm())],
         schema: CHECK_SCHEMA,
     };
-    let root = s_tape.aabb();
-    if root.is_empty() {
-        return Ok(Checked { verdict: Verdict::Pass, key, boxes: 0, samples: 0, points: 0 });
-    }
-    if !finite(&root) {
-        return Err(ModelError::Inspect(InspectError::Unbounded { what: "the part's box" }));
-    }
-
-    let leaf = o.sample_size.as_m();
-    let floor = leaf / f64::from(1u32 << SPLIT_LEVELS);
-    let tol = o.tolerance.as_m().max(1e-9);
-    let parting_tol = o.parting_tolerance.as_m();
-    let z_tol = (parting_tol * 0.25).max(tol);
     let sin_min = blaze_math::sin(o.min_draft.as_radians());
     let ignore_sign = plant.has(DraftPlant::IgnoreUndercutSign);
 
-    let mut sc = Scratch::new(o.scratch);
-    let mut boxes: u64 = 0;
-    let mut samples: u64 = 0;
-    let mut points: u64 = 0;
-
-    let z_min = match min_along(&s_tape, root, local_dir, z_tol, o.most_boxes, &mut boxes, &mut points, &mut sc, o.scratch)? {
-        MinExtent::Found(z) => z,
-        MinExtent::Empty => return Ok(Checked { verdict: Verdict::Pass, key, boxes, samples, points }),
-        MinExtent::Budget => {
-            return Ok(Checked { verdict: Verdict::Unknown(Unsettled::Budget { boxes }), key, boxes, samples, points });
-        }
-    };
-    let parting_cut = z_min + parting_tol;
-
-    let mut frames: Vec<TapeFrame<'_>, Alloc<'_>> = Vec::new_in(o.scratch);
-    let mut stack: Vec<(Aabb3, bool), Alloc<'_>> = Vec::new_in(o.scratch);
-    stack.try_push((root, false)).map_err(|_| ModelError::Alloc { what: "a check's box stack" })?;
-    let mut open: u64 = 0;
-    let mut near: Option<Vec3> = None;
-    let mut vals = [0.0f64; 8];
-
-    loop {
-        while frames.last().is_some_and(|f| stack.len() <= f.stack_base) {
-            frames.pop();
-        }
-        let Some((c, center_tested)) = stack.pop() else { break };
-        boxes += 1;
-        if boxes > o.most_boxes {
-            return Ok(Checked { verdict: Verdict::Unknown(Unsettled::Budget { boxes }), key, boxes, samples, points });
-        }
-        let side = c.longest_side();
-        let sampling = side <= leaf;
-        if sampling {
-            samples += 1;
-        }
-        let reach = (c.hi - c.lo).length();
-        if box_max_dot(&c, local_dir) + reach <= parting_cut {
-            continue;
-        }
-        let cur_tape = active_tape(&s_tape, &frames);
-        if !center_tested {
-            points += 1;
-            if eval_point(cur_tape, c.center(), &mut sc).abs() > reach / 2.0 {
-                continue;
+    check_surface_normals(
+        SurfaceWalk {
+            s_tape: &s_tape,
+            key,
+            lin,
+            shift,
+            local_dir,
+            eval_dir: local_dir,
+            sample_size: o.sample_size,
+            base_tolerance: o.parting_tolerance,
+            tolerance: o.tolerance,
+            most_boxes: o.most_boxes,
+            most_steps_per_point: o.most_steps_per_point,
+            scratch: o.scratch,
+        },
+        |s, n_local, dir| {
+            let d_raw = n_local.dot(dir);
+            let d = if ignore_sign { d_raw.abs() } else { d_raw };
+            if d < sin_min - 1e-9 {
+                let angle = Angle::radians(blaze_math::asin(d_raw.clamp(-1.0, 1.0)));
+                let at_world = lin.apply(s.p) + shift;
+                let n_world = lin.apply(n_local).normalized().unwrap_or(n_local);
+                Some(DraftFace {
+                    at: lengths(at_world),
+                    normal: n_world.to_array(),
+                    angle,
+                    min_draft: o.min_draft,
+                    undercut: d_raw < -1e-9,
+                })
+            } else {
+                None
             }
-        }
-        if !sampling || side <= leaf / 2.0 {
-            let (iv, choices) = eval_box(cur_tape, &c, &mut sc);
-            if iv.lo() > 0.0 || iv.hi() < 0.0 {
-                continue;
-            }
-            if !sampling {
-                let sub = if side > leaf * 2.0 { try_simplify(cur_tape, choices, o.scratch)? } else { None };
-                if let Some(tape) = sub {
-                    frames
-                        .try_push(TapeFrame { tape, region: c, stack_base: stack.len() })
-                        .map_err(|_| ModelError::Alloc { what: "a check's tape stack" })?;
-                }
-                let child_tape = active_tape(&s_tape, &frames);
-                let (kids, n) = split(&c);
-                if boxes + (n as u64) <= o.most_boxes {
-                    batch_eval_centers(child_tape, &kids[..n], &mut vals, &mut sc)?;
-                    points += n as u64;
-                    for i in 0..n {
-                        let k = kids[i];
-                        let k_sampling = k.longest_side() <= leaf;
-                        if vals[i].abs() > (k.hi - k.lo).length() / 2.0 {
-                            boxes += 1;
-                            if k_sampling {
-                                samples += 1;
-                            }
-                        } else {
-                            stack.try_push((k, true)).map_err(|_| ModelError::Alloc { what: "a check's box stack" })?;
-                        }
-                    }
-                } else {
-                    for k in &kids[..n] {
-                        stack.try_push((*k, false)).map_err(|_| ModelError::Alloc { what: "a check's box stack" })?;
-                    }
-                }
-                continue;
-            }
-        }
-        let eps = (4.0 * tol).min(leaf * 0.05);
-        let proj_tape = tape_for_box(&s_tape, &frames, &Aabb3::around(c.center(), Vec3::splat(reach + eps)));
-        let mut pr = Probe { t: proj_tape, sc: &mut sc, points, used: 0, most: o.most_steps_per_point };
-        let res = project(&mut pr, &c, tol, false);
-        match res {
-            Projected::At(s) => {
-                if s.p.dot(local_dir) <= parting_cut {
-                    points = pr.points;
-                    continue;
-                }
-                let Some(n_local) = surface_normal(&mut pr, &s, eps) else {
-                    points = pr.points;
-                    open += 1;
-                    near.get_or_insert(lin.apply(c.center()) + shift);
-                    continue;
-                };
-                points = pr.points;
-                let d_raw = n_local.dot(local_dir);
-                let d = if ignore_sign { d_raw.abs() } else { d_raw };
-                if d < sin_min - 1e-9 {
-                    let angle = Angle::radians(blaze_math::asin(d_raw.clamp(-1.0, 1.0)));
-                    let at_world = lin.apply(s.p) + shift;
-                    let n_world = lin.apply(n_local).normalized().unwrap_or(n_local);
-                    let found = DraftFace {
-                        at: lengths(at_world),
-                        normal: n_world.to_array(),
-                        angle,
-                        min_draft: o.min_draft,
-                        undercut: d_raw < -1e-9,
-                    };
-                    return Ok(Checked { verdict: Verdict::Found(found), key, boxes, samples, points });
-                }
-            }
-            Projected::NoBracket if side > floor => {
-                points = pr.points;
-                let (kids, n) = split(&c);
-                for k in &kids[..n] {
-                    stack.try_push((*k, false)).map_err(|_| ModelError::Alloc { what: "a check's box stack" })?;
-                }
-            }
-            Projected::NoBracket | Projected::Spent => {
-                points = pr.points;
-                open += 1;
-                near.get_or_insert(lin.apply(c.center()) + shift);
-            }
-        }
-    }
-
-    let verdict = match near {
-        Some(p) => Verdict::Unknown(Unsettled::Open { cells: open, near: lengths(p) }),
-        None => Verdict::Pass,
-    };
-    Ok(Checked { verdict, key, boxes, samples, points })
+        },
+    )
 }
 
 // ---- common helpers ----------------------------------------------------------------------

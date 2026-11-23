@@ -14,7 +14,7 @@
 
 use super::*;
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// The ctor of variant `variant` (a struct's is 0) of the ADT `sig` returns, at the ADT's
     /// arguments (`self.args`): the Rust ABI's parameters, one a field (lib.rs, "Rust ABI").
     fn run_ctor_fn(&mut self, variant: u32, sig: &FnSig<'_>) -> Result<(), BuildError> {
@@ -24,8 +24,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             TyErr::Other(error) => error,
         };
         let n = sig.inputs.len();
-        let mut reprs = Vec::with_capacity_in(n, self.alloc.clone());
-        let mut passes = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut reprs = Vec::with_capacity_in(n, self.alloc);
+        let mut passes = Vec::with_capacity_in(n, self.alloc);
         for &t in sig.inputs.iter() {
             let g = self.ground_in(sig.types, t).map_err(sig_err)?;
             let repr = self.repr(g).map_err(sig_err)?;
@@ -41,7 +41,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let entry = self.create();
         self.reached[entry.index()] = true;
         self.begin(entry);
-        let mut values = Vec::with_capacity_in(params.len(), self.alloc.clone());
+        let mut values = Vec::with_capacity_in(params.len(), self.alloc);
         for p in params.iter() {
             values.push(self.b.param(p.ty));
         }
@@ -50,7 +50,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             self.sret = Some(next.next().ok_or(malformed("a result pointer without its value"))?);
         }
         self.scope_marks.push(0);
-        let mut fields = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut fields = Vec::with_capacity_in(n, self.alloc);
         for k in 0..n {
             fields.push(self.take_passed(reprs[k], passes[k], &mut next)?);
         }
@@ -83,7 +83,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 /// inputs the variant's fields, generic over the ADT's parameters) at the instance `subst`
 /// names (lib.rs `build_ctor_fn`). Its walk is given an empty body named by `ctor` and an empty
 /// check record: neither is read.
-pub(crate) fn build_ctor_fn<A: Allocator + Clone>(
+pub(crate) fn build_ctor_fn<A: Allocator + Copy>(
     ctor: ItemKey,
     variant: u32,
     sig: &FnSig<'_>,

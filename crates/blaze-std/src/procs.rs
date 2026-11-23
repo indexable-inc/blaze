@@ -182,7 +182,7 @@ mod linked;
 pub use self::linked::{
     BorrowedFd, Exit, Linked, LinkedSpec, Spawner, Waited,
     run::{
-        CHILD_FD, ChannelError, Input, Message, OutPipe, Output, PREFIX, ParentDeath, Pipes, Read, Reaped, Run,
+        CHILD_FD, ChannelError, DetachedSpec, Input, Message, OutPipe, Output, PREFIX, ParentDeath, Pipes, Read, Reaped, Run,
         RunChild, RunError, RunFault, RunSpec, RunStep, RunWaited, Served, ServedEnd, Started, Streams, whole_messages,
     },
     sim_child::{Act, MOST_DELAY, SimChild},

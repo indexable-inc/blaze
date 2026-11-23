@@ -56,7 +56,7 @@ const MUT_INDEX: &str = "a mutable place through an overloaded index the check d
                          (`Checked::index_mut`, blaze-typeck rules/mut_places.rs) and no raw pointer's dereference is \
                          between: a write or `&mut` through `Index::index`'s shared reference (rustc's E0596/E0594)";
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Whether index expression `e` is the builtin element of an array or a slice: the check's
     /// `builtin_index` took it only for an array or slice base (after autoderef) indexed by
     /// `usize`; every other index it typed is `Index` (rules/field.rs `expr_index`).
@@ -107,7 +107,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// last adjustment (the module doc): a builtin dereference from an array type.
     fn array_as_slice(&self, base: ExprId) -> Result<bool, BuildError> {
         let rows = self.adjust_rows(base);
-        let kinds = &self.checked.adjusts.column::<1>()[rows.clone()];
+        let kinds = &self.checked.adjusts.column::<1>()[rows.start..rows.end];
         let Some(&AdjustKind::Deref { overloaded: None }) = kinds.last() else { return Ok(false) };
         let before = self.ty_before(base, kinds.len() - 1)?;
         if !matches!(self.types.node(before).map_err(|_| malformed("a type past the record's table"))?, PNode::Array(..)) {

@@ -394,7 +394,10 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
             ConstKind::FnItem { .. } => return Err(self.malformed("a fn item constant of a sized type")),
             ConstKind::Item { .. } => return Err(self.unsupported("a constant item's value (the evaluator's record)")),
             ConstKind::Promoted(_) => return Err(self.unsupported("a promoted constant")),
-            ConstKind::StaticAddr(_) => return Err(self.unsupported("a static's address")),
+            ConstKind::StaticAddr(item) => {
+                let r = self.static_ref(item);
+                V::One(self.b.data_addr(r))
+            }
             ConstKind::Anon(_) => return Err(self.unsupported("an anonymous constant (a const block)")),
             ConstKind::Param(_) => return Err(self.unsupported("a const generic parameter's value")),
         };
@@ -589,7 +592,13 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                 let usize_ty = self.b.usize_ty();
                 V::One(self.b.iconst(usize_ty, u128::from(n)))
             }
-            BodyValue::ThreadLocalAddr(_) => return Err(self.unsupported("a thread-local's address")),
+            BodyValue::ThreadLocalAddr(c) => match self.v.konst(c).kind {
+                ConstKind::StaticAddr(item) => {
+                    let r = self.tls_ref(item);
+                    V::One(self.b.tls_addr(r))
+                }
+                _ => return Err(self.malformed("a thread-local's address whose constant is not a static")),
+            },
         };
         self.write(dest, x, dlay)
     }
@@ -892,6 +901,34 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         let r = self.b.reference(RefKind::Func, place);
         self.refs.push(instance);
         self.ref_ids.push(r);
+        r
+    }
+
+    /// The static reference of `item`, one per static item.
+    pub(crate) fn static_ref(&mut self, item: blaze_typeck::ItemKey) -> blaze_lir::func::RefId {
+        if let Some(i) = self.statics.iter().position(|&k| k == item)
+            && let Some(&r) = self.static_ids.get(i)
+        {
+            return r;
+        }
+        let place = u32::try_from(self.statics.len()).unwrap_or(u32::MAX);
+        let r = self.b.reference(RefKind::Static, place);
+        self.statics.push(item);
+        self.static_ids.push(r);
+        r
+    }
+
+    /// The thread-local reference of `item`, one per thread-local static.
+    pub(crate) fn tls_ref(&mut self, item: blaze_typeck::ItemKey) -> blaze_lir::func::RefId {
+        if let Some(i) = self.thread_locals.iter().position(|&k| k == item)
+            && let Some(&r) = self.tls_ids.get(i)
+        {
+            return r;
+        }
+        let place = u32::try_from(self.thread_locals.len()).unwrap_or(u32::MAX);
+        let r = self.b.reference(RefKind::Tls, place);
+        self.thread_locals.push(item);
+        self.tls_ids.push(r);
         r
     }
 }

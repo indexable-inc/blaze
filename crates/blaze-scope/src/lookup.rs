@@ -425,7 +425,7 @@ impl<'a, N: Name> Resolver<'a, N> {
                 #[cfg(test)]
                 let was = core::mem::replace(&mut sink.probing, true);
                 let mut sources = Live { at: self, ns, name, ignore: q.ignore, env, sink: &mut *sink, pend: None };
-                let walked = through(&mut sources, def, self.alloc.clone());
+                let walked = through(&mut sources, def, self.alloc);
                 let walked = sources.settle(walked);
                 #[cfg(test)]
                 {
@@ -623,7 +623,7 @@ impl<'a, N: Name> Resolver<'a, N> {
         sink: &mut Sink<'a, N>,
     ) -> Res {
         let mut sources = Live { at: self, ns, name, ignore, env, sink: &mut *sink, pend: None };
-        let walked = through(&mut sources, def, self.alloc.clone());
+        let walked = through(&mut sources, def, self.alloc);
         match sources.settle(walked) {
             Ok(None) => Res::None,
             Ok(Some(p)) => Res::Found(Hit {

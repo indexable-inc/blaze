@@ -40,6 +40,10 @@
 //! forms log their layout changes the same way, so a rule on it would count every form. That
 //! class is closed by the type (a result key takes a `ProducerId<P>`, decision D105), not here.
 
+use super::heap::{
+    ColumnSpec, RatchetCounts, RatchetSite, TableListError, TablePolicy, added_since, check_table_problems, load_table_rows,
+    parse_table_rows, render_table, report_problems, write_table,
+};
 use super::*;
 
 /// What ambient.rs's `DOC` says of the producer-string ratchet, appended to it in the usage error.
@@ -314,16 +318,10 @@ pub(super) fn producer_uses(text: &str) -> Vec<(usize, ProducerUse)> {
 }
 
 /// One producer string in the tree.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct ProducerSite {
-    /// Relative to the root.
-    path: String,
-    line: usize,
-    what: ProducerUse,
-}
+type ProducerSite = RatchetSite<ProducerUse>;
 
 /// Each crate's producer strings outside test code and in it, in file and line order.
-type ProducerCounts = BTreeMap<String, (Vec<ProducerSite>, Vec<ProducerSite>)>;
+type ProducerCounts = RatchetCounts<ProducerUse>;
 
 fn count_producers(root: &Path) -> Result<ProducerCounts, TreeError> {
     let Walked { scanned, skipped, .. } = walk(root)?;
@@ -353,48 +351,35 @@ fn count_producers(root: &Path) -> Result<ProducerCounts, TreeError> {
 /// The list as `producers-write` writes it: the header, then a row for each crate with a
 /// producer string outside test code, sorted.
 fn render_producers(counts: &ProducerCounts) -> String {
-    let mut out = PRODUCERS_HEADER.to_owned();
-    for (krate, (outside, _)) in counts {
-        if !outside.is_empty() {
-            out.push_str(&format!("{krate}\t{}\n", outside.len()));
-        }
-    }
-    out
+    render_table(PRODUCERS_HEADER, counts, |sites| [sites.len()])
 }
 
-/// A row of the list that is not one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ProducersListError {
-    NotARow { line: usize, text: String },
-    TwoRows { line: usize, krate: String },
+static PRODUCERS_POLICY: TablePolicy<1> = TablePolicy {
+    list: PRODUCERS_LIST,
+    scope: "outside tests",
+    moved_noun: "string",
+    rule: "decision D105",
+    write_cmd: "producers-write",
+    columns: [ColumnSpec { name: "count", what: "typed-in producer strings", instead: INSTEAD }],
+};
+
+fn parse_producer_rows(text: &str) -> Result<BTreeMap<String, usize>, TableListError> {
+    parse_table_rows(&PRODUCERS_POLICY, text).map(|rows| rows.into_iter().map(|(k, [n])| (k, n)).collect())
 }
 
-impl fmt::Display for ProducersListError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ProducersListError::NotARow { line, text } => write!(f, "{PRODUCERS_LIST}:{line}: `{text}` is not `<crate><TAB><count>`"),
-            ProducersListError::TwoRows { line, krate } => write!(f, "{PRODUCERS_LIST}:{line}: a second row for `{krate}`"),
-        }
-    }
-}
-
-fn parse_producer_rows(text: &str) -> Result<BTreeMap<String, usize>, ProducersListError> {
-    let mut rows = BTreeMap::new();
-    for (at, line) in text.split('\n').enumerate() {
-        if line.trim().is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let bad = || ProducersListError::NotARow { line: at + 1, text: line.to_owned() };
-        let Some((krate, count)) = line.split_once('\t') else { return Err(bad()) };
-        if krate.is_empty() {
-            return Err(bad());
-        }
-        let count: usize = count.parse().map_err(|_| bad())?;
-        if rows.insert(krate.to_owned(), count).is_some() {
-            return Err(ProducersListError::TwoRows { line: at + 1, krate: krate.to_owned() });
-        }
-    }
-    Ok(rows)
+fn producer_problems_rows(
+    counts: &ProducerCounts,
+    rows: &BTreeMap<String, [usize; 1]>,
+    added: Option<&BTreeMap<String, BTreeSet<usize>>>,
+) -> (Vec<String>, Vec<String>) {
+    check_table_problems(
+        &PRODUCERS_POLICY,
+        counts,
+        rows,
+        added,
+        |_| 0,
+        |it| format!("{}:{} {}", it.path, it.line, it.what.shown()),
+    )
 }
 
 /// What is over its row (each a refusal, the line `producers-check` prints after `ambient: `) and
@@ -404,34 +389,8 @@ fn producer_problems(
     rows: &BTreeMap<String, usize>,
     added: Option<&BTreeMap<String, BTreeSet<usize>>>,
 ) -> (Vec<String>, Vec<String>) {
-    let (mut over, mut under) = (Vec::new(), Vec::new());
-    let crates: BTreeSet<&String> = counts.keys().chain(rows.keys()).collect();
-    for krate in crates {
-        let sites = counts.get(krate).map_or(&[][..], |(outside, _)| outside.as_slice());
-        let (now, held) = (sites.len(), rows.get(krate).copied().unwrap_or(0));
-        if now > held {
-            let shown = |it: &ProducerSite| format!("{}:{} {}", it.path, it.line, it.what.shown());
-            let named: Vec<String> = match added {
-                Some(added) => {
-                    sites.iter().filter(|it| added.get(&it.path).is_some_and(|lines| lines.contains(&it.line))).map(shown).collect()
-                }
-                None => sites.iter().take(3).map(shown).collect(),
-            };
-            let new = match (added, named.is_empty()) {
-                (Some(_), true) => "none is on a line added since the base: a string moved in, or a file git does not track".to_owned(),
-                (Some(_), false) => format!("new: {}", named.join(", ")),
-                (None, _) => format!("first: {}", named.join(", ")),
-            };
-            over.push(format!(
-                "`{krate}` has {now} typed-in producer strings outside tests, over its row {held} in {PRODUCERS_LIST} ({new}): {INSTEAD} (decision D105)"
-            ));
-        } else if now < held {
-            under.push(format!(
-                "`{krate}` has {now} typed-in producer strings outside tests, under its row {held} in {PRODUCERS_LIST}: lower it (command `producers-write`)"
-            ));
-        }
-    }
-    (over, under)
+    let rows: BTreeMap<String, [usize; 1]> = rows.iter().map(|(k, n)| (k.clone(), [*n])).collect();
+    producer_problems_rows(counts, &rows, added)
 }
 
 pub(super) fn main_with(command: &str, base: Option<&str>, root: &Path) {
@@ -446,41 +405,17 @@ pub(super) fn main_with(command: &str, base: Option<&str>, root: &Path) {
         }
         return;
     }
-    let listed = read_text(&root.join(PRODUCERS_LIST));
-    let rows = match &listed {
-        Some(text) => parse_producer_rows(text).unwrap_or_else(|e| fail(SCRIPT, &e.to_string())),
-        None if command == "producers-write" => BTreeMap::new(),
-        None => fail(
-            SCRIPT,
-            &format!("{PRODUCERS_LIST} could not be read: every crate is held to its row there (command `producers-write` makes it)"),
-        ),
-    };
+    let (listed, rows) = load_table_rows(&PRODUCERS_POLICY, root, command == "producers-write");
     if command == "producers-write" {
         // The first write takes the tree as it stands; after it, rows only fall.
-        if listed.is_some() {
-            let (over, _) = producer_problems(&counts, &rows, None);
-            if !over.is_empty() {
-                let lines: Vec<String> = over.iter().map(|w| format!("{SCRIPT}: {w}")).collect();
-                eprintln!("{}\n{SCRIPT}: {PRODUCERS_LIST} is not written: the list only falls", lines.join("\n"));
-                std::process::exit(1);
-            }
-        }
-        if let Err(e) = std::fs::write(root.join(PRODUCERS_LIST), render_producers(&counts)) {
-            fail(SCRIPT, &format!("{PRODUCERS_LIST} is not written: {e}"));
-        }
+        let over = if listed.is_some() { producer_problems_rows(&counts, &rows, None).0 } else { Vec::new() };
+        write_table(PRODUCERS_LIST, root, &over, &render_producers(&counts));
         println!("{SCRIPT}: wrote {PRODUCERS_LIST}: {total} producer strings outside tests ({in_tests} in tests, not held)");
         return;
     }
-    let added = base.map(|base| super::heap::added_since(root, base).unwrap_or_else(|e| fail(SCRIPT, &e.to_string())));
-    let (over, under) = producer_problems(&counts, &rows, added.as_ref());
-    for note in &under {
-        println!("{SCRIPT}: {note}");
-    }
-    if !over.is_empty() {
-        let lines: Vec<String> = over.iter().map(|w| format!("{SCRIPT}: {w}")).collect();
-        eprintln!("{}", lines.join("\n"));
-        std::process::exit(1);
-    }
+    let added = base.map(|base| added_since(root, base).unwrap_or_else(|e| fail(SCRIPT, &e.to_string())));
+    let (over, under) = producer_problems_rows(&counts, &rows, added.as_ref());
+    report_problems(&over, &under);
     println!("{SCRIPT}: {total} producer strings outside tests, each crate at or under its row in {PRODUCERS_LIST}");
 }
 

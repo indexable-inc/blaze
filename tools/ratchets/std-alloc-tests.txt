@@ -27,7 +27,7 @@ blaze-body-lower	13	0	0	24	0	0	0	0	0	0
 blaze-borrow	3	0	0	5	0	0	0	0	0	0
 blaze-bstd-convert	13	0	0	9	8	0	0	0	0	0
 blaze-build	139	2	2	439	0	0	6	3	0	0
-blaze-build-script	137	0	0	116	3	0	0	0	0	0
+blaze-build-script	132	0	0	111	3	0	0	0	0	0
 blaze-bytes	9	0	0	20	0	0	1	0	0	0
 blaze-c	2	0	0	0	0	0	0	0	0	0
 blaze-cad	3	0	0	8	0	0	0	0	0	0

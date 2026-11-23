@@ -28,7 +28,7 @@ pub(crate) const RESUMED: &str = "panic_const_async_fn_resumed";
 /// The library's panic of a poll after a poll that unwound.
 pub(crate) const RESUMED_PANIC: &str = "panic_const_async_fn_resumed_panic";
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// The two finished-state blocks of the coroutine body being built, after
     /// [`Self::run_coroutine`]: no edge of the body leads to either.
     pub(super) fn coroutine_panics(&mut self) -> Result<Panics, BuildError> {

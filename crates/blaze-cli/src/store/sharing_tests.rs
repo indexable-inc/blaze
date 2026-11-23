@@ -76,3 +76,24 @@ fn two_placements_of_one_subject_are_two_keys() {
     assert_ne!(wasm[0].1, native[0].1, "a native and a wasm run of one subject had one key");
     std::println!("two placements, one name, two keys");
 }
+
+#[test]
+fn public_impl_bucket_record_is_publishable_and_private_stays_local() {
+    let frame = bstd::mem::Frame::with_reserve(1 << 16, bstd::mem::Tag::Other).expect("the test's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
+    let scope_subject = ContentId([10; 32]);
+    let tables_subject = ContentId([11; 32]);
+    let private_subject = ContentId([12; 32]);
+    let scope_name = Name::new(Kind::CrateScope, scope_subject);
+    let tables_name = Name::new(Kind::ImplBucket, tables_subject);
+    let private_name = Name::new(Kind::CrateScope, private_subject);
+
+    let public_tables = write_plain(tables_name, ContentId([1; 32]), ContentId([2; 32]), &[(scope_name, ContentId([3; 32]))], &[], alloc);
+    let tainted_tables = write_plain(tables_name, ContentId([1; 32]), ContentId([2; 32]), &[(private_name, ContentId([4; 32]))], &[], alloc);
+
+    let mut sharing = ToolchainCrates::new();
+    sharing.add_public(&[scope_subject, tables_subject]);
+    assert!(sharing.all_names_public(&[&public_tables]), "closed public `ImplBucket` record must be publishable");
+    assert!(!sharing.all_names_public(&[&tainted_tables]), "`ImplBucket` reading a private crate must stay local");
+}

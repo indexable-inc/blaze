@@ -39,10 +39,10 @@ use crate::BuildError;
 
 pub(super) mod scope;
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Whether `if` condition `cond` holds a `let`: alone or as a link of an `&&` chain.
     pub(super) fn cond_has_let(&self, cond: ExprId) -> Result<bool, BuildError> {
-        let mut todo: Vec<ExprId, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<ExprId, A> = Vec::new_in(self.alloc);
         todo.push(cond);
         while let Some(x) = todo.pop() {
             match self.expr(x)? {
@@ -80,8 +80,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 
     /// The links of condition `cond` left to right: `a && b && c` is `(a && b) && c`.
     fn links_of(&self, cond: ExprId) -> Result<Vec<ExprId, A>, BuildError> {
-        let mut links: Vec<ExprId, A> = Vec::new_in(self.alloc.clone());
-        let mut todo: Vec<ExprId, A> = Vec::new_in(self.alloc.clone());
+        let mut links: Vec<ExprId, A> = Vec::new_in(self.alloc);
+        let mut todo: Vec<ExprId, A> = Vec::new_in(self.alloc);
         todo.push(cond);
         while let Some(x) = todo.pop() {
             match self.expr(x)? {

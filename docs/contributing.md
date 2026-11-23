@@ -397,14 +397,14 @@ main with all the others, so:
 
 Main moves only through pull requests: nobody pushes to it or merges into it by hand. Nothing
 merges, by `land.py` or by an admin, until a release blaze built from the exact merge commit (the
-branch merged into the main it joins) has run the hello-world smoke on blaze-vm (a cold run, a
+branch merged into the main it joins) has run the hello-world smoke on the Mac or build VM (a cold run, a
 no-op, a body edit and a comment edit, each under a timeout, each counted only with exit 0 and the
-program's own line) and the result is quoted in the pull request; a compile check is not evidence
+program's own line, then `blaze check` and `blaze test` with one executed passing assertion) and the result is quoted in the pull request; a compile check is not evidence
 that the binary runs (rule `proof-before-merge`; the `landing` skill has the steps). To make the
-quote, merge origin/main into the branch, build a release blaze of that commit on blaze-vm and run
-`blaze run -q -p scripts --bin smoke -- '{"blaze": "<that blaze>", "work": "<an empty directory>"}' > smoke.txt`
+quote, merge origin/main into the branch, build the release `blaze-cli` and `blaze-launcher` of that commit in the same target directory and run
+`cargo +$(cat pins/toolchain) run --locked -q -p scripts --bin smoke -- '{"blaze": "<that blaze>", "work": "<an empty directory>"}' > smoke.txt`
 (`scripts/src/bin/smoke.rs`; it exits 0 only for `verdict ok`). The quote, the block in smoke.txt
-whose first line is `blaze-smoke 1`, goes in the pull request's body, and `land.py` puts it there
+whose first line is `blaze-smoke 2`, goes in the pull request's body, and `land.py` puts it there
 from the file you give it. `land.py` refuses to open, resume or merge a pull request whose quote
 does not name its head's exact tree, clean, with verdict ok, or whose head no longer contains
 main; no flag skips this, and an admin merge needs the quote too. Once the branch's work is

@@ -50,8 +50,8 @@ mod records;
 pub use asked::{Ask, BucketRead, INCOHERENT_FACT, UNFILED_LIST};
 pub use records::{
     BucketReadUnion,
-    AdmitError, BucketSource, ImplQuestionError, ImplShelf, ImplShelfOpts, ImplTables, ImplTablesDone, ImplTablesFailed, ItemsIndex, NoTables, ShelfError, ShelfSource, ShelvedTwice, TRAIT_HELD, TableSet, TablesError, TablesReadError, bucket_cell, cell_read, check_framed, cells_of, framed,
-    impl_tables_name, impl_tables_task, row_answers, row_digest, rows_key, trait_cell, write_impl_tables,
+    AdmitError, BucketSource, ImplChunk, ImplQuestionError, ImplShelf, ImplShelfOpts, ImplTables, ImplTablesDone, ImplTablesFailed, ItemsIndex, NoTables, ShelfError, ShelfSource, ShelvedTwice, TRAIT_HELD, TableSet, TablesError, TablesReadError, bucket_cell, cell_read, check_framed, cells_of, file_impl_rows_chunk, finish_impl_tables, framed,
+    impl_tables_name, impl_tables_out, impl_tables_task, row_answers, row_digest, rows_key, trait_cell, write_impl_tables,
 };
 
 /// A candidate impl whose header the store does not hold when the answer is made, or an

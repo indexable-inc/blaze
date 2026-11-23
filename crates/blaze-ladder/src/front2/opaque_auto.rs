@@ -684,14 +684,9 @@ fn copy_reached<'a>(
         }
         seen[at] = true;
         let node = from.node(t).map_err(|_| PAST)?;
-        let (one, two, list) = children(node);
-        for c in [one, two].into_iter().flatten() {
-            work.push(c);
-        }
-        if let Some(l) = list {
-            for &c in from.list(l).map_err(|_| PAST)? {
-                work.push(c);
-            }
+        // A nested future becomes a coroutine carrying `owner_args`, never its own output/interior.
+        if !matches!(node, PNode::Future(..)) {
+            from.children_of(node, &mut work).map_err(|_| PAST)?;
         }
     }
     let mut mapped: Vec<Option<PTy>, Alloc<'a>> = Vec::with_capacity_in(n, alloc);
@@ -768,43 +763,6 @@ fn copy_reached<'a>(
         got.push(mapped.get(t.0 as usize).copied().flatten().ok_or(PAST)?);
     }
     Ok(got)
-}
-
-/// A node's children: up to two single types and one list.
-fn children(n: PNode) -> (Option<PTy>, Option<PTy>, Option<List>) {
-    match n {
-        PNode::Bool
-        | PNode::Char
-        | PNode::Int(_)
-        | PNode::Uint(_)
-        | PNode::Float(_)
-        | PNode::Str
-        | PNode::Never
-        | PNode::Param(_)
-        | PNode::ConstParam(_)
-        | PNode::ExAuto(_)
-        | PNode::Foreign(_)
-        | PNode::Infer
-        | PNode::Error => (None, None, None),
-        PNode::ConstValue { ty, .. } => (Some(ty), None, None),
-        PNode::Ref(_, a) | PNode::Ptr(_, a) | PNode::Slice(a) => (Some(a), None, None),
-        PNode::Array(a, len) => (Some(a), Some(len), None),
-        PNode::Future(..) => (None, None, None),
-        PNode::Pat(a, r) => (Some(a), None, Some(r)),
-        PNode::ExProj { args, term, .. } => (Some(term), None, Some(args)),
-        PNode::Tuple(a)
-        | PNode::Record(a)
-        | PNode::Union(a)
-        | PNode::Adt(_, a)
-        | PNode::FnDef(_, a)
-        | PNode::FnPtr(a, _)
-        | PNode::Closure { args: a, .. }
-        | PNode::Coroutine { args: a, .. }
-        | PNode::Alias { args: a, .. }
-        | PNode::Opaque(_, a)
-        | PNode::Dynamic(a)
-        | PNode::ExTrait(_, a) => (None, None, Some(a)),
-    }
 }
 
 #[cfg(test)]

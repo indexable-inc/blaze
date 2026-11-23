@@ -30,7 +30,7 @@ use blaze_lir::{Flags, Op, Scalar, Ty, Value};
 use super::Walk;
 use crate::BuildError;
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// The constant of scalar type `ty` whose bits are `value` (little-endian, the bits past
     /// the type's width 0): an integer, a pointer's address or a float's IEEE bits.
     pub(super) fn const_scalar(&mut self, ty: Ty, value: u128) -> Result<Value, BuildError> {

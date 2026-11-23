@@ -12,33 +12,6 @@ use blaze_expand::seen::SeenRoot;
 use crate::env::{DepMetadata, Given, PackageFacts, env};
 use crate::instr::{Instr, Line, LinkTo, Malformed, OutputError, OutputLimits, SearchKind, Syntax, flags, lines, parse};
 use crate::key::{CMode, KeyInputs, RunLimits, RunnerKey, base};
-use crate::native::{self, Grant, GrantError};
-
-#[test]
-fn a_native_grant_says_only_what_it_names_and_refuses_what_it_cannot_say() {
-    let alloc = Alloc::global();
-    let grant = Grant {
-        program: "/w/script",
-        exec: &["/t/bin/clang"],
-        read: &["/w/pkg", "/t"],
-        write: &["/w/out"],
-    };
-    let profile = native::seatbelt(&grant, alloc).expect("a sayable grant");
-    let text = profile.as_str();
-    assert!(text.contains("(deny default)") && !text.contains("(allow default)"), "{text}");
-    assert!(text.contains("(allow process-exec (literal \"/w/script\") (literal \"/t/bin/clang\"))"), "{text}");
-    assert!(text.contains("(allow file-write* (subpath \"/w/out\") (literal \"/dev/null\"))"), "{text}");
-    assert!(!text.contains("network") && !text.contains("mach-lookup"), "no network, no service: {text}");
-    for (bad, want) in [
-        ("w/pkg", GrantError::NotCanonical { path: "w/pkg" }),
-        ("/w/../etc", GrantError::NotCanonical { path: "/w/../etc" }),
-        ("/w//x", GrantError::NotCanonical { path: "/w//x" }),
-        ("/w/\")(allow default", GrantError::Unsayable { path: "/w/\")(allow default" }),
-    ] {
-        let reads = [bad];
-        assert_eq!(native::seatbelt(&Grant { read: &reads, ..grant }, alloc).err(), Some(want), "{bad}");
-    }
-}
 use crate::outputs::{FileError, FileLimits, FileMode, NoteKind, OutFileRef, Outputs, OutputsRef, RecordError, StoredBytes, StoredError, StoredRef, StoredWhy};
 use crate::probe::{self, Table};
 use crate::probe_ask::Ask;

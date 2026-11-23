@@ -627,14 +627,14 @@ impl<'c, F: Files> Workspace<'c, F> {
 
     /// cargo's warnings for settings only the root may have.
     fn validate_manifest(&mut self) {
-        let Some(root_manifest) = self.root_manifest.clone() else { return };
+        let Some(root_manifest) = self.root_manifest.as_ref() else { return };
         let resolve_behavior = self.resolve_behavior;
         let mut max_member_edition = None;
-        for path in self.members.clone() {
+        for path in &self.members {
             if path == root_manifest {
                 continue;
             }
-            let Some(EitherManifest::Real(m)) = self.packages.get(&path) else { continue };
+            let Some(EitherManifest::Real(m)) = self.packages.get(path) else { continue };
             let warnings = &mut self.warnings;
             let mut warn = |what: &str| {
                 warnings.push(format!(
@@ -662,7 +662,7 @@ impl<'c, F: Files> Workspace<'c, F> {
                 max_member_edition = max_member_edition.max(Some(m.edition));
             }
         }
-        if let Some(EitherManifest::Virtual(vm)) = self.packages.get(&root_manifest)
+        if let Some(EitherManifest::Virtual(vm)) = self.packages.get(root_manifest)
             && vm.resolve_behavior.is_none()
             && let Some(edition) = max_member_edition
         {

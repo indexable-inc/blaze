@@ -207,7 +207,7 @@ pub fn write_groups<'a, N: crate::Name>(
 ) -> Result<AVec<'a, NameGroup<'a>>, GroupsError> {
     let mut out: AVec<'a, NameGroup<'a>> = AVec::with_capacity_in(shapes.len(), alloc);
     for shape in shapes.iter() {
-        let mut reads = shape.reads.clone();
+        let mut reads = shape.reads.clone_in(alloc);
         reads.extend(shape.calls.iter().map(|&call| GroupRead::Expansion {
             call,
             seen: made(call).map_or(GroupSeen::Absent, |text| GroupSeen::Digest(ContentId::of(EXPANSION_DOMAIN, text.as_bytes()))),
@@ -220,7 +220,7 @@ pub fn write_groups<'a, N: crate::Name>(
         cells_read.sort_unstable();
         let bytes = record(&shape.members, &shape.own, &reads, done, alloc)?;
         let id = ContentId::of(GROUP_DOMAIN, &bytes);
-        out.push(NameGroup { members: shape.members.clone(), reads, own: shape.own.clone(), defines: shape.defines.clone(), cells_read, bytes, id });
+        out.push(NameGroup { members: shape.members.clone_in(alloc), reads, own: shape.own.clone_in(alloc), defines: shape.defines.clone_in(alloc), cells_read, bytes, id });
     }
     Ok(out)
 }

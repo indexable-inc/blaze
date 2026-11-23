@@ -185,7 +185,12 @@ const U16: PNode = PNode::Uint(UintTy::U16);
 const U32: PNode = PNode::Uint(UintTy::U32);
 const U64: PNode = PNode::Uint(UintTy::U64);
 
-pub(crate) fn lay(w: &World, g: &mut G, ls: &mut Layouts<Global>, t: PTy) -> Result<LayoutId, super::LayoutError> {
+pub(crate) fn lay<A: core::alloc::Allocator + Clone>(
+    w: &World,
+    g: &mut G,
+    ls: &mut Layouts<A>,
+    t: PTy,
+) -> Result<LayoutId, super::LayoutError> {
     let mut cx = LayoutCx { ground: &mut g.t, facts: w, scratch: Alloc::global() };
     ls.of(t, &mut cx)
 }

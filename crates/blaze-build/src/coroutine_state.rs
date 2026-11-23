@@ -131,7 +131,7 @@ fn align_up(at: u64, align: u8) -> u64 {
 /// suspensions; the offsets in `alloc`. Refused by name: `needs_flag` not one row per saved
 /// local, an alignment past 2^31, a state past `u32::MAX` bytes, more points than an `i32` tag
 /// numbers.
-pub fn lay_state<A: Allocator + Clone>(
+pub fn lay_state<A: Allocator + Copy>(
     env: (u64, u8),
     saved: &[(u64, u8)],
     needs_flag: &[bool],
@@ -167,7 +167,7 @@ pub fn lay_state<A: Allocator + Clone>(
     let region_align = saved.iter().map(|f| f.1).max().unwrap_or(0);
     let start = align_up(env.0, region_align);
     let mut at = start;
-    let mut field: Vec<u32, A> = Vec::with_capacity_in(saved.len(), alloc.clone());
+    let mut field: Vec<u32, A> = Vec::with_capacity_in(saved.len(), alloc);
     field.resize(saved.len(), 0);
     for &i in order.iter() {
         let (size, align) = saved[i as usize];

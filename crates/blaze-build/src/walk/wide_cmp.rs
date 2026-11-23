@@ -32,7 +32,7 @@ const NOT_WIDE_PTR: &str = "a binary operator on an aggregate that is not a wide
 const WIDE_ORDER: &str = "an ordering of wide raw pointers (the pinned library documents the order of thin pointers \
                           only: by address; how the metadata takes part is not stated)";
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Binary expression `e` (`lhs op rhs`) whose operands `l` and `r` are aggregates of
     /// `lrepr` and `rrepr`: `==` or `!=` of two wide raw pointers, word by word; every other
     /// form refused by name. Returns the `bool` (an `i8` of 0 or 1).

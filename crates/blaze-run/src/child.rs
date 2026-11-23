@@ -160,7 +160,7 @@ pub fn checked(path: &str) -> Result<&str, ChildError<'_>> {
 /// not kept: oscall.rs) and to the launcher's socket when one is named; no Mach service (no
 /// XPC: the supported test program has only libSystem loaded); signals only within the
 /// sandbox; programs may start and inherit the profile (a start is not kept). The deny-default
-/// form is blaze-build-script native.rs `seatbelt_with`'s; the policy differs (a build script
+/// form matches `bstd::procs::hermetic::seatbelt`'s; the policy differs (a build script
 /// reads only what its grant names). The exact filter forms (`local ip "localhost:*"`) are to
 /// verify by a test (fork_smoke's run applies this profile).
 pub fn seatbelt<'a, 's>(temp: &'s str, control: Option<&'s str>, alloc: Alloc<'a>) -> Result<AString<'a>, ChildError<'s>> {

@@ -188,13 +188,13 @@ impl<'a, N: Name> Again<'a, N> {
     where
         N: 'r,
     {
-        let mut readers: HashMap<ItemKey, AVec<'a, (ItemKey, Read<N>)>, Alloc<'a>> = HashMap::new_in(alloc.clone());
-        let mut reads: HashMap<ItemKey, AVec<'a, ItemKey>, Alloc<'a>> = HashMap::new_in(alloc.clone());
+        let mut readers: HashMap<ItemKey, AVec<'a, (ItemKey, Read<N>)>, Alloc<'a>> = HashMap::new_in(alloc);
+        let mut reads: HashMap<ItemKey, AVec<'a, ItemKey>, Alloc<'a>> = HashMap::new_in(alloc);
         for (m, list) in records {
-            let mut owners = Vec::new_in(alloc.clone());
+            let mut owners = Vec::new_in(alloc);
             for e in list.entries.iter() {
                 let Some(owner) = owner(&e.read, &parent) else { continue };
-                readers.entry(owner).or_insert_with(|| Vec::new_in(alloc.clone())).push((m, e.read));
+                readers.entry(owner).or_insert_with(|| Vec::new_in(alloc)).push((m, e.read));
                 owners.push(owner);
             }
             owners.sort_unstable();
@@ -214,10 +214,10 @@ impl<'a, N: Name> Again<'a, N> {
         kept: impl Fn(ItemKey) -> bool,
         parent: impl Fn(ItemKey) -> Option<ItemKey>,
     ) -> AVec<'a, ItemKey> {
-        let a = self.alloc.clone();
+        let a = self.alloc;
         // Kept records reached backwards from a touched binding.
-        let mut touched: HashSet<ItemKey, Alloc<'a>> = HashSet::new_in(a.clone());
-        let mut stack = Vec::new_in(a.clone());
+        let mut touched: HashSet<ItemKey, Alloc<'a>> = HashSet::new_in(a);
+        let mut stack = Vec::new_in(a);
         for (m, _, t) in rerun.iter() {
             for (reader, read) in self.readers.get(m).map(|v| v.as_slice()).unwrap_or(&[]) {
                 if kept(*reader) && t.reads(read) && touched.insert(*reader) {
@@ -236,7 +236,7 @@ impl<'a, N: Name> Again<'a, N> {
             return Vec::new_in(a);
         }
         // Kept records the rerun reads, transitively.
-        let mut read: HashSet<ItemKey, Alloc<'a>> = HashSet::new_in(a.clone());
+        let mut read: HashSet<ItemKey, Alloc<'a>> = HashSet::new_in(a);
         for (_, list, _) in rerun.iter() {
             for e in list.entries.iter() {
                 if let Some(o) = owner(&e.read, &parent) {

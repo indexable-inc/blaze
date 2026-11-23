@@ -709,13 +709,15 @@ fn an_old_crate_list_is_refused_by_name() {
     // Version 5: each crate's row carries its package's version, for diagnostics.
     // Version 6: rows in the world's order with a by-key table, the test and public flags and
     // the planners' tables (engine.md item 2): a version-5 list is refused, never read (D160).
-    assert_eq!(VERSION, 6);
+    // Version 7: each tree row carries its pack kind.
+    // Version 8: each row carries its package binaries (`CARGO_BIN_EXE_<name>`).
+    assert_eq!(VERSION, 8);
     bytes[4..6].copy_from_slice(&2u16.to_le_bytes());
     let refused = CrateList::open(&bytes).err().expect("a version-2 list is refused");
     assert_eq!(refused, ListError::Version { found: 2 });
     let words = std::format!("{refused}");
-    assert!(words.contains("version 2, not 6"), "{words}");
-    bytes[4..6].copy_from_slice(&5u16.to_le_bytes());
-    assert_eq!(CrateList::open(&bytes).err(), Some(ListError::Version { found: 5 }), "a version-5 list is refused by name");
+    assert!(words.contains("version 2, not 8"), "{words}");
+    bytes[4..6].copy_from_slice(&7u16.to_le_bytes());
+    assert_eq!(CrateList::open(&bytes).err(), Some(ListError::Version { found: 7 }), "a version-7 list is refused by name");
     std::println!("crate list: an old list: {words}");
 }

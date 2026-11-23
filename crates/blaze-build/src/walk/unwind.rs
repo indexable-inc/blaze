@@ -55,7 +55,7 @@ use blaze_typeck::ExprId;
 use super::{Callee, V, Walk, malformed};
 use crate::{BuildError, Panic};
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// A block of `kind` (a landing block), noted as not yet reached.
     pub(super) fn landing_block(&mut self, kind: BlockKind) -> Block {
         let block = self.b.create_block(kind);

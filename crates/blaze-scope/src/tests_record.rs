@@ -394,17 +394,17 @@ fn test_of<'b>(names: &CrateNames<'_>, key: ItemKey, strings: &mut RecordBytes<'
                     "should_panic" => {
                         flags |= SHOULD_PANIC;
                         if !rest.is_empty() {
-                            let refused = TestsRecordError::Form { item: *key, attr: "should_panic" };
+                            let refused = || TestsRecordError::Form { item: *key, attr: "should_panic" };
                             let start = strings.len();
                             if rest.starts_with('=') {
-                                name_value(rest, strings).ok_or(refused)?;
+                                name_value(rest, strings).ok_or_else(refused)?;
                             } else {
                                 // `(expected = "text")`, a trailing comma allowed.
-                                let inside = rest.strip_prefix('(').and_then(|r| r.strip_suffix(')')).ok_or(refused.clone())?;
-                                let value = inside.trim_start().strip_prefix("expected").ok_or(refused.clone())?;
-                                let after = value.trim_start().strip_prefix('=').and_then(|v| literal(v, strings)).ok_or(refused.clone())?;
+                                let inside = rest.strip_prefix('(').and_then(|r| r.strip_suffix(')')).ok_or_else(refused)?;
+                                let value = inside.trim_start().strip_prefix("expected").ok_or_else(refused)?;
+                                let after = value.trim_start().strip_prefix('=').and_then(|v| literal(v, strings)).ok_or_else(refused)?;
                                 if !matches!(after.trim(), "" | ",") {
-                                    return Err(refused);
+                                    return Err(refused());
                                 }
                             }
                             expected = (u32_of(start, "the strings")?, u32_of(strings.len() - start, "an expected text")?);

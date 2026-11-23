@@ -187,3 +187,107 @@ fn the_line_is_due_once_an_interval() {
     assert!(line.starts_with("t 120 s · Bodies 0/9120 tasks · footprint "), "{line}");
     assert!(line.ends_with(" · longest: tempo_node::run 41 s\n"), "{line}");
 }
+
+/// Simultaneous `build.rs`, `fetch`, `proc-macro`, and Blaze `Names`/`Bodies` work on the
+/// status board feeds `report_live` into `blaze_screen::RunStatus` with slowest-first ordering,
+/// explicit `[external]` attribution for `build.rs`, and clean multi-line erase — AND enhances
+/// `--status-every` plain log lines with the same separation without altering stage task counts
+/// for `show_activity`.
+#[test]
+fn board_separates_build_rs_fetch_proc_macro_and_blaze_in_live_and_periodic_output() {
+    let board = Board::new(&Asking::NONE, core::time::Duration::ZERO);
+    let _scripts_mark = board.phase_began(Stage::Scripts, 10, 0);
+    let _names_mark = board.phase_began(Stage::Names, 100, 0);
+    let _bodies_mark = board.phase_began(Stage::Bodies, 400, 0);
+
+    // Start slower build.rs script AFTER a faster one to verify slowest-first sorting.
+    let _fast_script = board.show_kind(
+        Stage::Scripts,
+        blaze_screen::WorkKind::BuildScript,
+        Label::of("openssl-sys"),
+        0,
+        116_800_000_000,
+    );
+    let _slow_script = board.show_kind(
+        Stage::Scripts,
+        blaze_screen::WorkKind::BuildScript,
+        Label::of("librocksdb-sys · cc/c++"),
+        0,
+        77_900_000_000,
+    );
+    let _fetch = board.show_kind(
+        Stage::Units,
+        blaze_screen::WorkKind::Fetch,
+        Label::of("tokio"),
+        0,
+        118_200_000_000,
+    );
+    // Live Wasmtime proc-macro expansion via `show_activity` must appear without changing stage counts.
+    let _proc = board.show_activity(
+        blaze_screen::WorkKind::ProcMacro,
+        Label::of("serde_derive"),
+        117_600_000_000,
+    );
+    let _name_task = board.show(Stage::Names, Label::of("reth-db"), 0, 119_500_000_000);
+    let _body_task = board.show(Stage::Bodies, Label::of("tempo-node"), 0, 119_200_000_000);
+
+    let now_ns = 120 * SEC;
+
+    // 1. Verify `--status-every` plain log line explicitly separates external work.
+    let mut periodic = FixedString::<1024>::new();
+    crate::engine_status::line(&board, now_ns, &mut periodic).expect("periodic fits");
+    let periodic = periodic.as_str();
+    assert!(
+        periodic.contains(" · build.rs [external]: librocksdb-sys · cc/c++ 42 s, openssl-sys 3 s"),
+        "expected build.rs external attribution sorted slowest-first:\n{periodic}"
+    );
+    assert!(periodic.contains(" · fetch: tokio 1 s"), "expected fetch attribution:\n{periodic}");
+    assert!(periodic.contains(" · proc-macro: serde_derive 2 s"), "expected proc-macro attribution:\n{periodic}");
+    assert!(periodic.ends_with(" · longest: librocksdb-sys · cc/c++ 42 s\n"), "{periodic}");
+
+    // 2. Verify `report_live` -> `RunStatus` -> `encode_status` multi-line inline TUI output.
+    struct Sink(blaze_core::lock::Lock<blaze_screen::RunStatus>, u64);
+    impl blaze_screen::Watch for Sink {
+        fn see(&self, step: blaze_screen::Step<'_>) {
+            self.0.lock().see(self.1, step);
+        }
+        fn paths(&self) -> bool {
+            true
+        }
+    }
+    let sink = Sink(
+        blaze_core::lock::Lock::new(
+            "test.sink",
+            blaze_screen::RunStatus::new(blaze_screen::RunStatusOpts {
+                caps: blaze_screen::Caps { live: true, cols: 110, rows: 24, unicode: true },
+                command: blaze_screen::Command::Check,
+            }),
+        ),
+        120_000,
+    );
+    crate::engine_status::report_live(&board, now_ns, &sink);
+    let mut status = sink.0.lock();
+    let Some(frame) = status.frame() else { panic!("expected inline TUI block frame") };
+    let mut encoded = blaze_screen::LineBuf::<4096>::new();
+    blaze_screen::encode_status(&frame, &blaze_report::terminal::Terminal::PIPE, &mut encoded).expect("fits");
+    let rendered = encoded.as_str();
+    assert!(rendered.contains("blaze check"), "summary header:\n{rendered}");
+    assert!(rendered.contains("(6 active)"), "active task count:\n{rendered}");
+    assert!(
+        rendered.contains("  build.rs    librocksdb-sys · cc/c++ (42.1s), openssl-sys (3.2s)  [external]"),
+        "build.rs row:\n{rendered}"
+    );
+    assert!(rendered.contains("  fetch       tokio (1.8s)"), "fetch row:\n{rendered}");
+    assert!(rendered.contains("  proc-macro  serde_derive (2.4s)"), "proc-macro row:\n{rendered}");
+    assert!(
+        rendered.contains("  checking    tempo-node (0.8s), reth-db (0.5s)  · names / bodies"),
+        "blaze checking row:\n{rendered}"
+    );
+    assert_eq!(status.finish(), Some(blaze_screen::StatusFrame::EraseLines(5)), "must erase all 5 lines on finish");
+
+    // 3. Verify `show_activity` did not alter stage task counters.
+    let mut dump = FixedString::<{ 32 << 10 }>::new();
+    write_status(&board, Heading::End, now_ns, &mut dump).expect("dump fits");
+    assert_eq!(counts(dump.as_str(), Stage::Names), (0, 1, 100), "show_activity must not alter Names started count");
+    assert_eq!(counts(dump.as_str(), Stage::Bodies), (0, 1, 400), "show_activity must not alter Bodies started count");
+}

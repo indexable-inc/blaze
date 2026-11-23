@@ -595,6 +595,19 @@ fn impl_questions_answer_alike_in_any_order_and_look_each_bucket_up_once() {
         assert_eq!(again.records.no_impls_of, written.records.no_impls_of, "crate {krate}: NoImplsOf depends on the rows' order");
         let bytes = |t: &blaze_ladder::front2::buckets::ImplTables<'_>| t.records.buckets.iter().map(|b| b.bytes.to_vec()).collect::<Vec<_>>();
         assert_eq!(bytes(&again), bytes(&written), "crate {krate}: the buckets depend on the rows' order");
+        // Chunked filing (`file_impl_rows_chunk` + `finish_impl_tables`) must match single-pass byte-for-byte.
+        let chunk_size = (rows.len() / 3).max(1);
+        let mut chunks = blaze_own::Vec::new_in(g);
+        for slice in rows.chunks(chunk_size) {
+            chunks.push(blaze_ladder::front2::buckets::file_impl_rows_chunk(records, krate, slice, g).unwrap_or_else(|e| panic!("crate {krate} chunk: {e}")));
+        }
+        let chunked = blaze_ladder::front2::buckets::finish_impl_tables(written.krate, &chunks, g).unwrap_or_else(|e| panic!("crate {krate} finish: {e}"));
+        assert_eq!(chunked.key, written.key, "crate {krate}: chunked key differs");
+        assert_eq!(chunked.records.directory, written.records.directory, "crate {krate}: chunked directory differs");
+        assert_eq!(chunked.records.no_impls_of, written.records.no_impls_of, "crate {krate}: chunked NoImplsOf differs");
+        assert_eq!(bytes(&chunked), bytes(&written), "crate {krate}: chunked buckets differ");
+        assert_eq!(chunked.defines.as_slice(), written.defines.as_slice(), "crate {krate}: chunked defines differ");
+        assert_eq!(chunked.named.as_slice(), written.named.as_slice(), "crate {krate}: chunked named differs");
         println!("TABLES crate {krate}: {} rows, {} buckets, {} from rows, {} from text, {} named crates", rows.len(), written.records.buckets.len(), written.counts.from_rows, written.counts.from_text, written.named.len());
         crate_keys.push(written.krate);
         tables.put(written);

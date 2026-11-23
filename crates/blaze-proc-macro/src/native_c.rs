@@ -33,7 +33,6 @@ use core::time::Duration;
 use std::io::Read as _;
 
 use blaze_build_script::c_tasks::{Area, CCompiler, Compile, CompilerKind, Compiled, ERROR_LINES, FactError, FileRef, GuestRoots, Lang, Refused, StoreFailed, Today};
-use blaze_build_script::native::Grant;
 use blaze_build_script::outputs::{FileLimits, Outputs};
 use blaze_core::lock::Lock;
 use blaze_core::wait::Deadline;
@@ -585,10 +584,6 @@ impl CCompiler for ShelfClang<'_> {
         roots.push(Root { name: "a C task's folder", kind: RootKind::Output });
         mounts.push(Mount { spelling: self.task_out.as_bytes(), root: output });
         let roots = Roots::new(&roots).map_err(|_| refused(alloc, &["the roots of a C task were refused"]))?;
-
-        // The grant checked as the Seatbelt profile would say it, before anything runs.
-        blaze_build_script::native::seatbelt_with(&Grant { program: self.clang, exec: &[], read: &folders, write: &[self.task_out] }, &[], alloc)
-            .map_err(|_| refused(alloc, &["the Seatbelt grant of a C task could not be said: ", self.clang]))?;
 
         let files = CFiles { folders: &folders, out: OutDir { root: output, folder: self.task_out }, facts: self.facts };
         files.clear_output().map_err(|_| refused(alloc, &["the task folder could not be emptied: ", self.task_out]))?;

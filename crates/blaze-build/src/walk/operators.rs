@@ -118,7 +118,7 @@ enum Operand {
 const NO_ROW: &str = "the check recorded no callee for it (`Checked::callees`) and the operand types are not this \
                       operator's builtin scalar types, so it is neither the builtin operator nor a call the build can name";
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// The check recorded a callee on `e`.
     fn has_callee(&self, e: ExprId) -> bool {
         self.checked.callees.column::<0>().contains(&e)
@@ -201,11 +201,11 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         };
         let instance = self.method_callee(e)?;
         let item = instance.item;
-        let mut row = Vec::new_in(self.alloc.clone());
+        let mut row = Vec::new_in(self.alloc);
         row.extend_from_slice(self.ground.view().list(instance.args).map_err(|_| malformed("a callee's arguments past the ground table"))?);
         let abi = self.adts.abi(item).ok_or(BuildError::NoAbi { item })?;
-        let mut reprs = Vec::with_capacity_in(2, self.alloc.clone());
-        let mut passes = Vec::with_capacity_in(2, self.alloc.clone());
+        let mut reprs = Vec::with_capacity_in(2, self.alloc);
+        let mut passes = Vec::with_capacity_in(2, self.alloc);
         let mut nodes = [None, None];
         let mut mismatch = operands.iter().flatten().count() != row.len();
         for (i, operand) in operands.iter().flatten().enumerate() {
