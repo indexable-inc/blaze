@@ -22,7 +22,7 @@ pub enum ExportError {
     TwoRecords { symbol: Symbol },
     /// One static or vtable is given twice.
     TwoData { target: Target },
-    /// A datum is given under a space that is not a static's or a vtable's.
+    /// A datum is given under a space that is not a static's, a vtable's, or a thread-local's.
     DataSpace { target: Target },
     /// A datum's alignment is not a power of two of at most a page.
     DataAlign { target: Target, align: u32 },
@@ -39,8 +39,16 @@ pub enum ExportError {
     OutOfReach { from: Symbol, target: Target },
     /// A datum's word names a target that nothing given places.
     DataOutOfReach { from: Target, target: Target },
-    /// A thread-local is named: an exported file has no thread-local template yet.
-    ThreadLocal { from: Symbol },
+    /// A datum's word names a thread-local: a thread-local has no single address across threads.
+    DataTlsTarget { from: Target, target: Target },
+    /// A function or datum names a Rust thread-local (`Space::Tls`), and the program names no
+    /// [`crate::TlsRuntime`] (`descriptor` and `ender`).
+    NoTlsRuntime { target: Target },
+    /// `TlsRuntime::ender` is not among the program's functions.
+    TlsEnderNotPlaced { ender: Symbol },
+    /// An address relocation (`Page21`, `PageOff12`) names a thread-local: a thread-local is
+    /// reached through its index word (`GotPage21`/`GotPageOff12`) or relro `Abs64`.
+    TlsAddress { from: Symbol, at: u32 },
     /// A call site names something that is not a function (a static, a vtable).
     CallOfData { from: Symbol, at: u32 },
     /// A record names an outside (C) symbol whose name text it does not hold.
@@ -107,7 +115,7 @@ impl fmt::Display for ExportError {
             ExportError::TwoRecords { symbol } => write!(f, "export: function {symbol} is given twice"),
             ExportError::TwoData { target } => write!(f, "export: {:?} {} is given twice", target.space, target.symbol),
             ExportError::DataSpace { target } => {
-                write!(f, "export: a datum is given as {:?} {}; data are statics and vtables", target.space, target.symbol)
+                write!(f, "export: a datum is given as {:?} {}; data are statics, vtables, and thread-locals", target.space, target.symbol)
             }
             ExportError::DataAlign { target, align } => write!(
                 f,
@@ -137,9 +145,22 @@ impl fmt::Display for ExportError {
                 "export: {:?} {} names {:?} {}, which no function or datum given places ({HOLE})",
                 from.space, from.symbol, target.space, target.symbol
             ),
-            ExportError::ThreadLocal { from } => write!(
+            ExportError::DataTlsTarget { from, target } => write!(
                 f,
-                "export: function {from} names a thread-local; an exported file has no thread-local template yet (run.md, \"Export (writer, 2026-11-16)\")"
+                "export: {:?} {} holds a word naming thread-local {}; a thread-local has no single address across threads",
+                from.space, from.symbol, target.symbol
+            ),
+            ExportError::NoTlsRuntime { target } => write!(
+                f,
+                "export: {:?} {} is a thread-local, and the program names no TlsRuntime (descriptor and ender)",
+                target.space, target.symbol
+            ),
+            ExportError::TlsEnderNotPlaced { ender } => {
+                write!(f, "export: the thread-local ender {ender} is not among the program's functions")
+            }
+            ExportError::TlsAddress { from, at } => write!(
+                f,
+                "export: function {from}: the address relocation at byte {at} names a thread-local; a thread-local is reached through its index word"
             ),
             ExportError::CallOfData { from, at } => {
                 write!(f, "export: function {from}: the call site at byte {at} names something that is not a function")

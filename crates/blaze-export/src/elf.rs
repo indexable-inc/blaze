@@ -31,9 +31,9 @@ pub const PAGE: u64 = 0x1_0000;
 
 pub(crate) const EHDR: u64 = 64;
 pub(crate) const PHDR: u64 = 56;
-/// Every program header at the most: PHDR, INTERP, NOTE, four LOADs, DYNAMIC, GNU_RELRO,
+/// Every program header at the most: PHDR, INTERP, NOTE, four LOADs, DYNAMIC, TLS, GNU_RELRO,
 /// GNU_EH_FRAME, GNU_STACK.
-const MAX_PHDRS: u64 = 11;
+const MAX_PHDRS: u64 = 12;
 const INTERP: &str = "/lib/ld-linux-aarch64.so.1";
 const INTERP_AT: u64 = EHDR + PHDR * MAX_PHDRS;
 const NOTE_AT: u64 = (INTERP_AT + INTERP.len() as u64 + 1 + 3) & !3;
@@ -46,6 +46,13 @@ pub(crate) const PT_DYNAMIC: u32 = 2;
 const PT_INTERP: u32 = 3;
 const PT_NOTE: u32 = 4;
 const PT_PHDR: u32 = 6;
+pub(crate) const PT_TLS: u32 = 7;
+/// AArch64 ELF TLS Variant I layout for the main executable's per-thread `ROOT` pointer:
+/// TCB is 16 bytes at `tpidr_el0`, so with `p_align = 16` and `p_vaddr % p_align == 0`, both
+/// glibc and musl place byte 0 of `PT_TLS` at `tpidr_el0 + align_up(16, 16) = tpidr_el0 + 16`.
+pub(crate) const TLS_ROOT_ALIGN: u64 = 16;
+pub(crate) const TLS_ROOT_OFFSET: u64 = 16;
+pub(crate) const TLS_ROOT_MEMSZ: u64 = 8;
 /// `.eh_frame_hdr`, which glibc's and libgcc's unwinders find through `dl_iterate_phdr`.
 pub(crate) const PT_GNU_EH_FRAME: u32 = 0x6474_E550;
 pub(crate) const PT_GNU_STACK: u32 = 0x6474_E551;
@@ -177,7 +184,7 @@ pub fn write<'a>(laid: &Laid<'_, '_>, eh: &EhSections<'_>, seed: &[u8; 32], out:
     // The ELF header and program headers.
     out.clear();
     out.extend_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    let phnum = if has_data { MAX_PHDRS } else { MAX_PHDRS - 1 };
+    let phnum = MAX_PHDRS - u64::from(!has_data) - u64::from(!laid.has_tls);
     bytes::u16(out, 3); // ET_DYN
     bytes::u16(out, 183); // EM_AARCH64
     bytes::u32(out, 1); // EV_CURRENT
@@ -206,6 +213,12 @@ pub fn write<'a>(laid: &Laid<'_, '_>, eh: &EhSections<'_>, seed: &[u8; 32], out:
     let meta_len = meta.len() as u64;
     phdr(out, PT_LOAD, PF_R, meta_off, meta_at, meta_len, meta_len, PAGE);
     phdr(out, PT_DYNAMIC, PF_R | PF_W, laid.const_at, laid.const_at, DYN_COUNT * 16, DYN_COUNT * 16, 8);
+    if laid.has_tls {
+        // Zero-initialized 8-byte `ROOT` pointer per thread at `tpidr_el0 + TLS_ROOT_OFFSET`
+        // (`align_up(16, 16) = 16`). `laid.data_at` is page-aligned (`p_vaddr % p_align == 0`)
+        // and inside a mapped `PT_LOAD` segment.
+        phdr(out, PT_TLS, PF_R, laid.data_at, laid.data_at, 0, TLS_ROOT_MEMSZ, TLS_ROOT_ALIGN);
+    }
     phdr(out, PT_GNU_RELRO, PF_R, laid.const_at, laid.const_at, konst, const_mem, 1);
     let hdr_len = eh.eh_frame_hdr.len() as u64;
     phdr(out, PT_GNU_EH_FRAME, PF_R, eh.eh_frame_hdr_at, eh.eh_frame_hdr_at, hdr_len, hdr_len, 4);

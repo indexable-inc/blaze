@@ -48,7 +48,7 @@ pub mod wasm64;
 
 pub use error::ExportError;
 pub use export::{Exported, Panics, export};
-pub use input::{CExport, Data, DataPlace, DataWord, Entry, Function, Panic, Platform, Profile, ProgramIn, Tier};
+pub use input::{CExport, Data, DataPlace, DataWord, Entry, Function, Panic, Platform, Profile, ProgramIn, Tier, TlsRuntime};
 pub use optimized::{Function02, ProgramIn02, export_optimized, v1_to_v2};
 pub use wasm64::{
     Wasm64Check, Wasm64Data, Wasm64Error, Wasm64Exported, Wasm64Func, Wasm64Opts, Wasm64Program,

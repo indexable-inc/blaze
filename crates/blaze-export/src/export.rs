@@ -10,7 +10,7 @@ use blaze_own::{AVec, Alloc, Vec};
 use crate::eh_out::{Outside, eh_room_with, eh_sections_with};
 use crate::error::ExportError;
 use crate::input::{Entry, Panic, Platform, ProgramIn, Tier};
-use crate::layout::{Member, lay_out};
+use crate::layout::{Member, TlsPlan, lay_out_with_tls};
 use crate::start::{main_of, start};
 use crate::native_merge::{self, MergeError};
 use crate::{elf, macho};
@@ -113,7 +113,12 @@ pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a
     {
         return Err(ExportError::NoEntry { symbol: lang_start });
     }
-    let start = start(program.entry, platform, alloc)?;
+    if let Some(tls) = program.tls
+        && !has(tls.ender)
+    {
+        return Err(ExportError::TlsEnderNotPlaced { ender: tls.ender });
+    }
+    let start = start(program.entry, program.tls, platform, alloc)?;
     let mut members: AVec<'_, Member<'_>> = Vec::with_capacity_in(program.functions.len() + start.records.len(), alloc);
     for f in program.functions {
         members.push(Member { symbol: f.symbol, record: f.record, tier: Some(f.tier) });
@@ -128,13 +133,14 @@ pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a
         (Some(_), Platform::Wasm64) => return Err(ExportError::Wasm64RequiresWasmProgram),
         (Some(image), Platform::MacosArm64) => Some((image, native_merge::libraries(image, alloc).map_err(ExportError::Native)?)),
     };
-    let plan = match platform {
-        Platform::MacosArm64 => macho::plan_for(natives.as_ref().map(|(_, libraries)| &libraries[..])),
-        Platform::LinuxArm64 => elf::plan(),
+    let (plan, initial_root) = match platform {
+        Platform::MacosArm64 => (macho::plan_for(natives.as_ref().map(|(_, libraries)| &libraries[..])), 0u64),
+        Platform::LinuxArm64 => (elf::plan(), elf::TLS_ROOT_OFFSET | blaze_code::tls::ROOT_OWN),
         Platform::Wasm64 => return Err(ExportError::Wasm64RequiresWasmProgram),
     };
+    let tls_plan = program.tls.map(|t| TlsPlan { descriptor: t.descriptor, mod_init_fn: start.tls_init, initial_root });
     let room = eh_room_with(&members, program.personality, platform, program.natives, alloc)?;
-    let laid = lay_out(&members, program.data, start.entry, program.profile, plan, room, alloc)?;
+    let laid = lay_out_with_tls(&members, program.data, start.entry, program.profile, plan, room, tls_plan, alloc)?;
     let merged = match natives {
         None => None,
         Some((image, libraries)) => Some(native_merge::merge(&laid, image, program.exports, libraries, alloc).map_err(ExportError::Native)?),

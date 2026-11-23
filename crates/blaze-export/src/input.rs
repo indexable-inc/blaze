@@ -48,11 +48,15 @@ pub struct DataWord {
     pub addend: i64,
 }
 
-/// A static or a vtable, by the target the records name it with ([`Space::Static`] or
-/// [`Space::Vtable`]), with its first bytes and the words in them the loader fills.
+/// A static, vtable, or thread-local template, by the target the records name it with
+/// ([`Space::Static`], [`Space::Vtable`], or [`Space::Tls`]), with its first bytes and the words
+/// in them the loader fills. For [`Space::Tls`], `bytes` (under `ReadOnly` or `Writable`) are the
+/// initial template copied into each thread's allocation on first touch, and `Zeroed { len }`
+/// describes a zero-initialized thread-local with no file bytes.
 ///
 /// [`Space::Static`]: blaze_code::record::Space::Static
 /// [`Space::Vtable`]: blaze_code::record::Space::Vtable
+/// [`Space::Tls`]: blaze_code::record::Space::Tls
 #[derive(Clone, Copy)]
 pub struct Data<'r> {
     pub target: Target,
@@ -133,6 +137,19 @@ pub struct CExport<'r> {
     pub symbol: Symbol,
 }
 
+/// The program's thread-local runtime symbols (`blaze_code::tls`, THREADS.md D2), when the
+/// program has Rust thread-locals ([`Space::Tls`]): `descriptor` is the `Space::Static` symbol
+/// the code records name for the program-wide 40-byte `Desc` (which `blaze-export` synthesizes
+/// in writable data, together with its `VarRow` table, index words and startup initializer);
+/// `ender` is the `pthread_key_create` destructor function among `functions`.
+///
+/// [`Space::Tls`]: blaze_code::record::Space::Tls
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TlsRuntime {
+    pub descriptor: Symbol,
+    pub ender: Symbol,
+}
+
 /// One export's whole input.
 #[derive(Clone, Copy)]
 pub struct ProgramIn<'r> {
@@ -141,7 +158,8 @@ pub struct ProgramIn<'r> {
     pub name: &'r str,
     /// Every function the program reaches, each once, in any order.
     pub functions: &'r [Function<'r>],
-    /// Every static and vtable a record or a datum names, each once, in any order.
+    /// Every static, vtable, and thread-local template a record or a datum names, each once, in
+    /// any order.
     pub data: &'r [Data<'r>],
     pub entry: Entry,
     pub panic: Panic,
@@ -149,6 +167,10 @@ pub struct ProgramIn<'r> {
     /// `rust_eh_personality`), one of `functions`: named by the unwind tables' CIE when a row
     /// lands. `None` refuses any landing row by name (`ExportError::NoPersonality`).
     pub personality: Option<Symbol>,
+    /// The program's thread-local runtime (`descriptor` and `ender`), when any function or datum
+    /// names a Rust thread-local (`Space::Tls`). `None` refuses any `Space::Tls` target or datum
+    /// by name (`ExportError::NoTlsRuntime`).
+    pub tls: Option<TlsRuntime>,
     pub profile: Option<Profile<'r>>,
     /// The program's native library image (blaze-native `layout::lay`: the archive members its
     /// `#[link]` libraries and build scripts pull), merged into the file (native_merge.rs);

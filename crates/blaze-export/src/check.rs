@@ -92,6 +92,8 @@ pub struct MachoFacts {
     pub uuid: [u8; 16],
     /// `__text`'s file offset and size.
     pub text: (u64, u64),
+    /// `__DATA_CONST,__mod_init_func`'s file offset and size when present.
+    pub mod_init: Option<(u64, u64)>,
 }
 
 /// Checks a Mach-O arm64 executable.
@@ -106,6 +108,7 @@ pub fn macho(file: &[u8]) -> Result<MachoFacts, CheckError> {
     let mut segs = [MSeg::default(); MAX_SEGS];
     let mut nsegs = 0usize;
     let mut text_section = None;
+    let mut mod_init = None;
     let mut entry = None;
     let mut signature = None;
     let mut fixups = None;
@@ -166,6 +169,14 @@ pub fn macho(file: &[u8]) -> Result<MachoFacts, CheckError> {
                     }
                     if &file[s as usize..s as usize + 6] == b"__text" {
                         text_section = Some((offset, len));
+                    }
+                    if flags & 0xFF == 0x9 {
+                        field(len % 8 == 0, "__mod_init_func's size", len)?;
+                        if let Some(s_idx) = usize::try_from(s).ok()
+                            && file.get(s_idx..s_idx + 15) == Some(b"__mod_init_func".as_slice())
+                        {
+                            mod_init = Some((offset, len));
+                        }
                     }
                 }
                 segs[nsegs] = seg;
@@ -326,7 +337,7 @@ pub fn macho(file: &[u8]) -> Result<MachoFacts, CheckError> {
             return Err(CheckError::PageHash { page: page as u32 });
         }
     }
-    Ok(MachoFacts { entry, rebases, binds, pages: slots, uuid, text: text_section })
+    Ok(MachoFacts { entry, rebases, binds, pages: slots, uuid, text: text_section, mod_init })
 }
 
 /// What a checked ELF file says.
@@ -335,6 +346,8 @@ pub struct ElfFacts {
     pub entry: u64,
     pub relative: u32,
     pub binds: u32,
+    /// `PT_TLS`'s `(p_filesz, p_memsz, p_align)` when present.
+    pub tls: Option<(u64, u64, u64)>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -361,7 +374,7 @@ pub fn elf(file: &[u8]) -> Result<ElfFacts, CheckError> {
     within(file, phoff, 56 * phnum, "the program headers")?;
     let mut loads = [Load::default(); MAX_LOADS];
     let mut nloads = 0usize;
-    let (mut interp, mut dynamic, mut relro, mut stack) = (None, None, None, false);
+    let (mut interp, mut dynamic, mut relro, mut stack, mut tls) = (None, None, None, false, None);
     for k in 0..phnum {
         let at = phoff + 56 * k;
         let kind = get32(file, at as usize);
@@ -391,6 +404,17 @@ pub fn elf(file: &[u8]) -> Result<ElfFacts, CheckError> {
             }
             2 => dynamic = Some(load),
             3 => interp = Some(load),
+            7 => {
+                if !align.is_power_of_two() || load.offset % align != load.vaddr % align {
+                    return Err(CheckError::Align { what: "PT_TLS's alignment", at });
+                }
+                field(load.filesz <= load.memsz, "PT_TLS's filesz past its memsz", load.filesz)?;
+                field(load.memsz > 0, "PT_TLS's memsz", load.memsz)?;
+                if load.filesz > 0 {
+                    within(file, load.offset, load.filesz, "PT_TLS's bytes")?;
+                }
+                tls = Some((load.filesz, load.memsz, align));
+            }
             0x6474_E552 => relro = Some(load),
             0x6474_E551 => stack = true,
             _ => {}
@@ -466,5 +490,5 @@ pub fn elf(file: &[u8]) -> Result<ElfFacts, CheckError> {
             other => return Err(CheckError::Field { what: "a relocation's type", value: other }),
         }
     }
-    Ok(ElfFacts { entry, relative, binds })
+    Ok(ElfFacts { entry, relative, binds, tls })
 }
