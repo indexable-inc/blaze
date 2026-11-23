@@ -72,6 +72,14 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                     let list = self.ground_overlay_list(list, depth + 1)?;
                     PNode::Tuple(list)
                 }
+                PNode::Record(list) => {
+                    let list = self.ground_overlay_list(list, depth + 1)?;
+                    PNode::Record(list)
+                }
+                PNode::Union(list) => {
+                    let list = self.ground_overlay_list(list, depth + 1)?;
+                    PNode::Union(list)
+                }
                 PNode::Adt(k, list) => {
                     let list = self.ground_overlay_list(list, depth + 1)?;
                     PNode::Adt(k, list)

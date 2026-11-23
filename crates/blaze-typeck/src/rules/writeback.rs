@@ -71,7 +71,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
         };
         match v {
-            TyView::Tuple(l) | TyView::Adt(_, l) | TyView::FnDef(_, l) | TyView::FnPtr(l, _) | TyView::Opaque(_, l) => {
+            TyView::Tuple(l) | TyView::Record(l) | TyView::Union(l) | TyView::Adt(_, l) | TyView::FnDef(_, l) | TyView::FnPtr(l, _) | TyView::Opaque(_, l) => {
                 list(l, out)
             }
             TyView::Alias { args, .. } | TyView::ClosureOf { args, .. } => list(args, out),
@@ -332,6 +332,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 TyView::Str => PNode::Str,
                 TyView::Never => PNode::Never,
                 TyView::Tuple(l) => PNode::Tuple(self.export_list(ex, x_res, l)?),
+                TyView::Record(l) => PNode::Record(self.export_list(ex, x_res, l)?),
+                TyView::Union(l) => PNode::Union(self.export_list(ex, x_res, l)?),
                 TyView::Ref(m, c) => PNode::Ref(m, one(ex, c, self.ty)?),
                 TyView::Ptr(m, c) => PNode::Ptr(m, one(ex, c, self.ty)?),
                 TyView::Array(c, n) => PNode::Array(one(ex, c, self.ty)?, one(ex, n, self.ty)?),
@@ -843,6 +845,8 @@ fn first_unknown(r: Recs<'_, '_>, alloc: Alloc<'_>) -> Result<Option<crate::erro
             PNode::Pat(c, l) => one(c) || any(l)?,
             PNode::ExProj { args, term, .. } => one(term) || any(args)?,
             PNode::Tuple(l)
+            | PNode::Record(l)
+            | PNode::Union(l)
             | PNode::Adt(_, l)
             | PNode::FnDef(_, l)
             | PNode::FnPtr(l, _)

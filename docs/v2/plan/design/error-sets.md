@@ -94,8 +94,16 @@ covered, a member left out is the witness, written `FsError { .. }` or `Stopped:
 covered twice is unreachable), MIR lowering (a discriminant test, then the variant's field),
 the match tree and closure capture analysis.
 
-**v2 compiler representation (`blaze-ty::union_ty`, `blaze-lower`, `parser`):**
-- `UNION_TYPE` lowers directly to `TypeRef::Union(List)` in `blaze-lower` and `blaze-ladder`.
+**v2 compiler representation (`blaze-ty::union_ty`, `blaze-typeck`, `blaze-build`, `blaze-lower`, `parser`):**
+- `UNION_TYPE` lowers directly to `TypeRef::Union(List)` in `blaze-lower`, and to first-class
+  `PNode::Union(List)` / `TyView::Union(TyList)` across `blaze-typeck`, `blaze-body`,
+  `blaze-borrow`, `blaze-flow-lower`, `blaze-facts`, and `blaze-ladder`, with real tagged-sum
+  layout (`u8`/`u16` local discriminant + aligned payload, transparent for 1 member, uninhabited
+  ZST for 0 members) in `blaze-build/src/layout.rs`.
+- **Fallible return-type sugar (`T ! E`):** under `#![blaze::error_unions]`, `Row ! FsError | Stopped`
+  and `Row ! _` parse cleanly in `parser` and lower to `TypeRef::Fallible { ok, err }` in
+  `blaze-lower` (equivalent to `Result<Row, FsError | Stopped>` / `Result<Row, _>`), while
+  macro types (`foo!(..)`, `foo![..]`, `foo!{..}`) remain unchanged.
 - `blaze-ty::union_ty::UnionTy` supports arbitrary arity (>12 members, `u8` tag up to 256 members,
   `u16` beyond) with niche-reuse layout computation.
 - **Generic unions (`ParametricUnionTy`):** `fn with_timeout<T, E>(...) -> Result<T, E | Timeout>`

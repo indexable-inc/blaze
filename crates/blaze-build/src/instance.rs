@@ -242,6 +242,8 @@ fn node_head(node: PNode) -> Result<(u8, u128, Option<u32>), BuildError> {
         PNode::Str => (5, 0, None),
         PNode::Never => (6, 0, None),
         PNode::Tuple(_) => (7, 0, None),
+        PNode::Record(_) => (25, 0, None),
+        PNode::Union(_) => (26, 0, None),
         PNode::Ref(m, _) => (8, m as u128, None),
         PNode::Ptr(m, _) => (9, m as u128, None),
         // The length is the second child, a `ConstValue`.
@@ -468,6 +470,8 @@ fn map_tree(
             PNode::ConstValue { ty, bits } => PNode::ConstValue { ty: mapped[ty.0 as usize], bits },
             n @ (PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Float(_) | PNode::Str | PNode::Never) => n,
             PNode::Tuple(l) => PNode::Tuple(map_list(l, &mut list)?),
+            PNode::Record(l) => PNode::Record(map_list(l, &mut list)?),
+            PNode::Union(l) => PNode::Union(map_list(l, &mut list)?),
             PNode::Ref(m, t) => PNode::Ref(m, mapped[t.0 as usize]),
             PNode::Ptr(m, t) => PNode::Ptr(m, mapped[t.0 as usize]),
             PNode::Array(t, n) => PNode::Array(mapped[t.0 as usize], mapped[n.0 as usize]),
@@ -548,7 +552,7 @@ fn map_tree(
 pub fn each_child(from: PTys<'_>, node: PNode, out: &mut Vec<PTy, Alloc<'_>>) -> Result<(), BuildError> {
     let malformed = |_| BuildError::Malformed { what: "a list past its table" };
     match node {
-        PNode::Tuple(l) | PNode::Adt(_, l) | PNode::FnDef(_, l) | PNode::FnPtr(l, _) | PNode::Opaque(_, l) => {
+        PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) | PNode::Adt(_, l) | PNode::FnDef(_, l) | PNode::FnPtr(l, _) | PNode::Opaque(_, l) => {
             out.extend_from_slice(from.list(l).map_err(malformed)?);
         }
         PNode::Alias { args, .. } | PNode::Closure { args, .. } | PNode::Coroutine { args, .. } => {

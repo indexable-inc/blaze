@@ -29,6 +29,10 @@ pub enum PNode {
     Never,
     /// Elements in the list column; `()` is the empty tuple.
     Tuple(List),
+    /// Structural record fields in canonical sorted name order.
+    Record(List),
+    /// Structural union members in canonical order.
+    Union(List),
     Ref(Mutbl, PTy),
     Ptr(Mutbl, PTy),
     /// `[elem; len]`: `len` a `ConstValue` of `usize`, a `ConstParam`, or (in a body's types
@@ -179,7 +183,7 @@ impl<'a> PTys<'a> {
     /// Appends every child in declaration order. A projection's arguments precede its term.
     pub fn children_of(self, node: PNode, out: &mut impl Extend<PTy>) -> Result<(), CheckError> {
         match node {
-            PNode::Tuple(l) | PNode::Adt(_, l) | PNode::FnDef(_, l) | PNode::FnPtr(l, _)
+            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) | PNode::Adt(_, l) | PNode::FnDef(_, l) | PNode::FnPtr(l, _)
             | PNode::Opaque(_, l) | PNode::Closure { args: l, .. } | PNode::Coroutine { args: l, .. }
             | PNode::Alias { args: l, .. } | PNode::Dynamic(l) | PNode::ExTrait(_, l) => {
                 out.extend(self.list(l)?.iter().copied());
@@ -496,6 +500,14 @@ pub(crate) fn hash_node(n: &PNode, h: &mut StableHasher) {
             h.tag(30);
             h.u128(k.0);
         }
+        PNode::Record(l) => {
+            h.tag(31);
+            hash_list(l, h);
+        }
+        PNode::Union(l) => {
+            h.tag(32);
+            hash_list(l, h);
+        }
     }
 }
 
@@ -507,6 +519,8 @@ pub fn node_shape(n: PNode) -> PNode {
     let l = |l: List| List { start: 0, len: l.len };
     match n {
         PNode::Tuple(x) => PNode::Tuple(l(x)),
+        PNode::Record(x) => PNode::Record(l(x)),
+        PNode::Union(x) => PNode::Union(l(x)),
         PNode::Ref(m, _) => PNode::Ref(m, p),
         PNode::Ptr(m, _) => PNode::Ptr(m, p),
         PNode::Array(..) => PNode::Array(p, p),
@@ -917,6 +931,8 @@ impl<'a> PortableTys<'a> {
         let node = match node {
             PNode::ConstValue { bits, .. } => PNode::ConstValue { ty: children[0], bits },
             PNode::Tuple(_) => PNode::Tuple(self.intern_list(children)?),
+            PNode::Record(_) => PNode::Record(self.intern_list(children)?),
+            PNode::Union(_) => PNode::Union(self.intern_list(children)?),
             PNode::Ref(m, _) => PNode::Ref(m, children[0]),
             PNode::Ptr(m, _) => PNode::Ptr(m, children[0]),
             PNode::Array(..) => PNode::Array(children[0], children[1]),

@@ -463,7 +463,10 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
     pub(crate) fn adjusted_ty(&self, e: ExprId) -> Result<PTy, LowerError> {
         let (lo, hi) = self.adjust_rows(e);
         if hi > lo {
-            return Ok(self.ck.adjusts.column::<2>()[hi - 1]);
+            let Some(&ty) = self.ck.adjusts.column::<2>().get(hi - 1) else {
+                return self.refuse(Construct::Malformed, e);
+            };
+            return Ok(ty);
         }
         self.expr_ty(e)
     }
@@ -476,8 +479,10 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         (lo, hi)
     }
 
-    pub(crate) fn adjust(&self, i: usize) -> (AdjustKind, PTy) {
-        (self.ck.adjusts.column::<1>()[i], self.ck.adjusts.column::<2>()[i])
+    pub(crate) fn adjust(&self, i: usize) -> Option<(AdjustKind, PTy)> {
+        let &kind = self.ck.adjusts.column::<1>().get(i)?;
+        let &ty = self.ck.adjusts.column::<2>().get(i)?;
+        Some((kind, ty))
     }
 
     pub(crate) fn expr_def(&self, e: ExprId) -> Option<Def> {
@@ -485,7 +490,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         if row == u32::MAX {
             return None;
         }
-        Some(self.ck.expr_defs.column::<1>()[row as usize])
+        self.ck.expr_defs.column::<1>().get(row as usize).copied()
     }
 
     pub(crate) fn pat_def(&self, p: PatId) -> Option<Def> {
@@ -493,7 +498,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         if row == u32::MAX {
             return None;
         }
-        Some(self.ck.pat_defs.column::<1>()[row as usize])
+        self.ck.pat_defs.column::<1>().get(row as usize).copied()
     }
 
     /// The method or operator trait method the check chose for `e`, and its arguments.
@@ -503,7 +508,9 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
             return None;
         }
         let i = row as usize;
-        Some((self.ck.callees.column::<1>()[i], self.ck.callees.column::<2>()[i]))
+        let &k = self.ck.callees.column::<1>().get(i)?;
+        let &l = self.ck.callees.column::<2>().get(i)?;
+        Some((k, l))
     }
 
     /// The index of the field field expression `e` names.
@@ -512,7 +519,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         if row == u32::MAX {
             return None;
         }
-        Some(self.ck.fields.column::<2>()[row as usize])
+        self.ck.fields.column::<2>().get(row as usize).copied()
     }
 
     /// Type `t`'s node: the body's own (an overlay type this lowering made) or the record's.
@@ -584,8 +591,8 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
             | PNode::Ref(Mutbl::Not, _) => Some(true),
             PNode::Ref(Mutbl::Mut, _) => Some(false),
             PNode::Param(i) => Some(self.facts.param_copy(i)),
-            PNode::Tuple(l) if l.len == 0 => Some(true),
-            PNode::Tuple(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
+            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) if l.len == 0 => Some(true),
+            PNode::Tuple(_) | PNode::Record(_) | PNode::Union(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
             _ => Some(false),
         };
         if let Some(ans) = quick {
@@ -632,7 +639,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
                     }
                     return Ok(false);
                 }
-                PNode::Tuple(l) => stack.extend_from_slice(self.list(l, at)?),
+                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => stack.extend_from_slice(self.list(l, at)?),
                 PNode::Array(i, _) | PNode::Pat(i, _) => stack.push(i),
                 PNode::Adt(k, l) => {
                     if !self.adt_facts(k, at)?.copy {

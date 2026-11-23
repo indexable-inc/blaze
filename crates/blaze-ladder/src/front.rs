@@ -575,6 +575,7 @@ impl Names {
             lf::TypeRef::Pat { .. } => return Err(Why::Unsupported("a pattern type", r)),
             lf::TypeRef::Record(_) => return Err(Why::Unsupported("a record type", r)),
             lf::TypeRef::Union(_) => return Err(Why::Unsupported("a union type", r)),
+            lf::TypeRef::Fallible { .. } => return Err(Why::Unsupported("a fallible type (`T ! E`)", r)),
             lf::TypeRef::For { .. } => return Err(Why::Unsupported("a higher-ranked type (`for<'a>`)", r)),
             lf::TypeRef::Error => return Err(Why::Unsupported("this type", r)),
         }
@@ -1370,7 +1371,7 @@ fn shape_of(t: PTys<'_>, p: PTy) -> Option<Shape> {
         PNode::Float(f) => Shape::Float(f),
         PNode::Str => Shape::Str,
         PNode::Never => Shape::Never,
-        PNode::Tuple(l) => Shape::Tuple(l.len),
+        PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => Shape::Tuple(l.len),
         PNode::Ref(m, _) => Shape::Ref(m),
         PNode::Ptr(m, _) => Shape::Ptr(m),
         PNode::Array(..) => Shape::Array,

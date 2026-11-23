@@ -578,6 +578,14 @@ fn put_node(p: &mut Put, n: PNode) {
             p.u8(30);
             p.key(k);
         }
+        PNode::Record(l) => {
+            p.u8(31);
+            p.list(l);
+        }
+        PNode::Union(l) => {
+            p.u8(32);
+            p.list(l);
+        }
     }
 }
 
@@ -667,6 +675,8 @@ fn get_node(g: &mut Get<'_>, b: Bounds) -> Result<PNode, E> {
         28 => PNode::ExProj { trait_: g.key()?, name: Name(g.u64()?), args: b.list(g)?, term: b.ty(g, me)? },
         29 => PNode::ExAuto(g.key()?),
         30 => PNode::Foreign(g.key()?),
+        31 => PNode::Record(b.list(g)?),
+        32 => PNode::Union(b.list(g)?),
         _ => return Err(g.bad(tag)),
     })
 }

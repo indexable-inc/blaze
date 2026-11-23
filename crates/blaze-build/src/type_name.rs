@@ -154,6 +154,28 @@ fn node<A: Allocator>(tys: PTys<'_>, t: PTy, out: &mut String<A>, seq: &mut Vec<
             // A one-tuple keeps its comma: `(u8,)`.
             text(seq, if parts.len() == 1 { ",)" } else { ")" });
         }
+        PNode::Record(l) => {
+            let parts = list(l)?;
+            text(seq, "record(");
+            for (k, &p) in parts.iter().enumerate() {
+                if k > 0 {
+                    text(seq, ", ");
+                }
+                seq.push(Piece::Ty(p));
+            }
+            text(seq, ")");
+        }
+        PNode::Union(l) => {
+            let parts = list(l)?;
+            text(seq, "union(");
+            for (k, &p) in parts.iter().enumerate() {
+                if k > 0 {
+                    text(seq, " | ");
+                }
+                seq.push(Piece::Ty(p));
+            }
+            text(seq, ")");
+        }
         PNode::Ref(m, p) => {
             text(seq, if m == Mutbl::Mut { "&mut " } else { "&" });
             seq.push(Piece::Ty(p));
