@@ -358,6 +358,7 @@ fn no_world_is_made_under_a_standing_graph_but_by_need() {
     assert!(added.plan.stood, "an item added moves no layout row, so the graph stands");
     assert!(added.stages[blaze_engine::Stage::Names.index()].entered >= 1, "an item added enters its crate's names task");
     assert_eq!(worlds_since(&io, mark), (1, 1), "a request whose names task runs makes the world exactly once (makes, decodes)");
+    assert_eq!(added.plan.records_mapped, 0, "lazy names world maps zero fetched source records up front");
     assert_eq!(io.trace(|trace| trace.dropped()), 0, "the trace dropped records past its bound");
 }
 

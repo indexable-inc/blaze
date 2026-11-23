@@ -818,7 +818,7 @@ pub(crate) fn job<'f: 'j, 'j>(
             // Avoid building the full 1,200-crate world (mapping all fetched packages) when no
             // `Names` task has needed it yet: `open_light` opens only the toolchain shelf and
             // unit graph for script execution.
-            let opened = match listed.made() {
+            let opened = match listed.made().filter(|made| made.has_open_packs()) {
                 Some(made) => Scripts::open(&cx, env, made, bytes, lock, members, frame),
                 None => Scripts::open_light(&cx, env, listed, bytes, lock, members, frame),
             };
@@ -839,7 +839,7 @@ pub(crate) fn job<'f: 'j, 'j>(
     };
     // The crate of the list that reads this run: its cfg is the run's side's.
     let script_world = scripts.script_world;
-    let (world, raw_cfg): (&blaze_world::World<'_>, &[(&str, Option<&str>)]) = match names.as_ref().and_then(|n| n.made()) {
+    let (world, raw_cfg): (&blaze_world::World<'_>, &[(&str, Option<&str>)]) = match names.as_ref().and_then(|n| n.made()).filter(|made| made.has_open_packs()) {
         Some(made) => {
             let world = made.world();
             let wanted = blaze_world::Script::Read { subject: task.name.subject };

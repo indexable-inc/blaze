@@ -19,6 +19,22 @@ use bstd::path::Path;
 use crate::body_types::{LazyTrees, SyncLazyTrees};
 use crate::work::held_str;
 
+/// Thread-safe subset of [`Packs`] for worker pools (`Open` or `SyncLazy`).
+#[derive(Clone, Copy)]
+pub(crate) enum SyncPacks<'n> {
+    Open(&'n [PackView<'n>]),
+    SyncLazy(&'n SyncLazyTrees<'n>, &'n bstd::fs::Fs),
+}
+
+impl<'n> From<SyncPacks<'n>> for Packs<'n> {
+    fn from(packs: SyncPacks<'n>) -> Packs<'n> {
+        match packs {
+            SyncPacks::Open(views) => Packs::Open(views),
+            SyncPacks::SyncLazy(lazy, fs) => Packs::SyncLazy(lazy, fs),
+        }
+    }
+}
+
 /// The packs of a crate list's trees as a job reads them, tree `k` (1-based; tree 0 is the
 /// checkout) by [`Packs::tree`]: every tree opened before the job ([`Packs::Open`]: a check's
 /// stages, whose pool jobs share one slice), or each opened on the first read of a text from it
@@ -420,7 +436,7 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
                 board.now(clock),
             )
         });
-        procs.run(world_at, edition, def, call, alloc).map_err(|stopped| {
+        procs.run(self.cx, self.packs, world_at, edition, def, call, alloc).map_err(|stopped| {
             if let Some(error) = &stopped.call {
                 self.run_stopped.set(Some(held_str(&std::format!("{error}"), self.frame)));
             }
@@ -442,7 +458,7 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
             Err(words) => return Some(ProcUnusable::Module(words)),
             Ok(Some(procs)) => match self.caller(krate) {
                 Err(not) => std::format!("{not}"),
-                Ok((world_at, _)) => match procs.unusable(world_at, def) {
+                Ok((world_at, _)) => match procs.unusable(self.cx, self.packs, world_at, def) {
                     Some(words) => words,
                     None => return self.run_stopped.take().map(ProcUnusable::Run),
                 },
