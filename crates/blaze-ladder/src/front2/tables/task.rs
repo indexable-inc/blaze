@@ -866,11 +866,7 @@ fn body_world<'v, 'n, 'w>(view: Tables<'v, 'n>, name: Name, frame: &BodyFrame<'n
     let index = Index::from_source(view, lang_crates).map_err(TaskError::Lang)?;
     view.records().name_lang_crates(lang_crates);
     let front = Front2 { names: view, resolver: crate::resolve::Paths { names: view }, texts: Texts::empty(), keys: Keys::new(), index, frame: frame.frame };
-    let world = match frame.prepared {
-        Some(prepared) => ProjectWorld::over_prepared(front, prepared, frame.alloc),
-        None => ProjectWorld::over(front, frame.alloc),
-    };
-    let mut world = blaze_own::Box::new_in(world, alloc);
+    let mut world = blaze_own::Box::new_in(ProjectWorld::over_with(front, frame.prepared, frame.alloc), alloc);
     world.record_const_texts();
     world.set_cost(frame.cost);
     world.set_needs(frame.needs);
