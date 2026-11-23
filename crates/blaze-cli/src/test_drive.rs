@@ -2083,7 +2083,7 @@ impl<'c> Launched<'c, '_, '_> {
         let mut codes = HomeCodeStore::new(self.lent);
         // THE SEAM LINE: how the records reach the program (run_bytes.rs `Delivery`; `Inline`
         // sends them over descriptor 3 and files none).
-        let mut lazy = Lazy::new(cx, front, Chosen::of(Delivery::Files, RecordsDir { cx, dir: self.records }, alloc), &mut codes, self.builder, alloc);
+        let mut lazy = Lazy::new(cx, front, Chosen::of(Delivery::Inline, RecordsDir { cx, dir: self.records }, alloc), &mut codes, self.builder, alloc);
         // Its place in the relay, told its end however the run ends (D194).
         let child = Child(self.child_base + row as usize);
         let _asking = self.codes.map(|code| Asking { code, child });

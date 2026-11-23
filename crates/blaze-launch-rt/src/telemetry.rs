@@ -9,15 +9,16 @@
 //!
 //! # Ordering & safety
 //!
-//! Each ring cell carries a monotonic turn counter `seq: AtomicU64` initialized to its index
-//! `0..cap`:
+//! Each ring cell carries a lap-relative turn counter `seq: AtomicU64` (`turn = pos - idx`),
+//! initialized to `0` (so zero-filled OS pages after `O_TRUNC` + `ftruncate` are already valid
+//! lap-0 slots without touching or allocating pages past the header):
 //!
 //! - **Producer (`try_push`)**: claims ticket `pos` via CAS on `tail` (bounded to
 //!   [`MAX_CAS_TRIES`] attempts per rule 18; full or contended increments `dropped` and
-//!   returns `false`), verifies `cell.seq.load(Acquire) == pos`, writes `cell.event`, and
-//!   publishes `cell.seq.store(pos + 1, Release)`.
-//! - **Consumer (`pop`)**: checks `cell.seq.load(Acquire) == head + 1`, reads `cell.event`,
-//!   publishes `cell.seq.store(head + cap, Release)`, and advances `head`.
+//!   returns `false`), verifies `cell.seq.load(Acquire) == pos - idx`, writes `cell.event`, and
+//!   publishes `cell.seq.store((pos - idx) + 1, Release)`.
+//! - **Consumer (`pop`)**: checks `cell.seq.load(Acquire) == (head - idx) + 1`, reads
+//!   `cell.event`, publishes `cell.seq.store((head - idx) + cap, Release)`, and advances `head`.
 //!
 //! Because `cell.event` is written strictly before the `Release` store of `pos + 1` and read
 //! strictly after the matching `Acquire` load, and never overwritten until the consumer's
@@ -34,8 +35,11 @@ pub use blaze_launch::telemetry::{
     AllocOp, Event, EventKind, IoOp, MAGIC, SHADOW_DEPTH, SpanId, VAR, VERSION,
 };
 
-/// Default ring capacity when creating a per-run telemetry file (16,384 events = 2 MiB).
-pub const DEFAULT_CAP: u32 = 1 << 14;
+/// Default ring capacity when creating a per-run telemetry file (2,048 events = 256 KiB;
+/// APFS materializes `MAP_SHARED` mappings up to EOF on first dirty page, so sizing at 256 KiB
+/// keeps per-run disk & RAM 8x smaller than 2 MiB while still buffering >100k events/s at a
+/// 16 ms viewer poll; Linux stays sparse past the header via [`Telemetry::init_zeroed`]).
+pub const DEFAULT_CAP: u32 = 1 << 11;
 
 /// Maximum CAS attempts per `try_push` before counting a contention drop (rule 18).
 pub const MAX_CAS_TRIES: u32 = 64;
@@ -190,16 +194,39 @@ impl<'r> Telemetry<'r> {
         if bytes < need {
             return Err(TelemetryError::TooSmall { have: bytes, need });
         }
+        let cells = unsafe { NonNull::new_unchecked(base.as_ptr().add(Self::cells_offset()).cast::<Cell>()) };
+        for i in 0..cap as usize {
+            // SAFETY: `i < cap`, within the initialized region.
+            let cell = unsafe { &*cells.as_ptr().add(i) };
+            cell.seq.store(0, Ordering::Relaxed);
+            unsafe { ptr::write(cell.event.get(), Event::EMPTY) };
+        }
+        // SAFETY: every cell is now zero-initialized for lap 0.
+        unsafe { Self::init_zeroed(base, bytes, cap) }
+    }
+
+    /// Initializes a ring over a memory region whose cell bytes are ALREADY zeroed (such as a
+    /// freshly truncated sparse file mapping from `O_TRUNC` + `ftruncate`). Writes only the
+    /// header page so untouched slots stay sparse on disk and uncommitted in RAM.
+    ///
+    /// # Safety
+    ///
+    /// `base..base + bytes` must be live, writable, exclusively-owned for `'r`, and every byte
+    /// from `Self::cells_offset()` through `Self::bytes_for(cap)` must be zero.
+    pub unsafe fn init_zeroed(base: NonNull<u8>, bytes: usize, cap: u32) -> Result<Telemetry<'r>, TelemetryError> {
+        let need = Self::bytes_for(cap)?;
+        let addr = base.as_ptr() as usize;
+        let align = core::mem::align_of::<Cell>();
+        if addr % align != 0 {
+            return Err(TelemetryError::Unaligned { addr, align });
+        }
+        if bytes < need {
+            return Err(TelemetryError::TooSmall { have: bytes, need });
+        }
         let header = base.cast::<Header>();
         // SAFETY: `base` is aligned to `Cell` (128 >= 64) and `bytes >= need` covers both the
         // header and all `cap` cells. Exclusive access is guaranteed by the caller.
         let cells = unsafe { NonNull::new_unchecked(base.as_ptr().add(Self::cells_offset()).cast::<Cell>()) };
-        for i in 0..u64::from(cap) {
-            // SAFETY: `i < cap`, within the initialized region.
-            let cell = unsafe { &*cells.as_ptr().add(i as usize) };
-            cell.seq.store(i, Ordering::Relaxed);
-            unsafe { ptr::write(cell.event.get(), Event::EMPTY) };
-        }
         let mask = u64::from(cap - 1);
         // SAFETY: exclusive write to header before publishing `MAGIC` with a release fence.
         unsafe {
@@ -287,9 +314,11 @@ impl<'r> Telemetry<'r> {
         let h = self.header();
         let mut pos = h.tail.load(Ordering::Relaxed);
         for _ in 0..MAX_CAS_TRIES {
-            let cell = self.cell((pos & self.mask) as usize);
-            let seq = cell.seq.load(Ordering::Acquire);
-            let diff = seq.wrapping_sub(pos) as i64;
+            let idx = pos & self.mask;
+            let expected = pos.wrapping_sub(idx);
+            let cell = self.cell(idx as usize);
+            let turn = cell.seq.load(Ordering::Acquire);
+            let diff = turn.wrapping_sub(expected) as i64;
             if diff == 0 || matches!(plant, RingPlant::SkipTurnCheck) {
                 match h.tail.compare_exchange_weak(
                     pos,
@@ -298,10 +327,10 @@ impl<'r> Telemetry<'r> {
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => {
-                        // SAFETY: we exclusively claimed turn `pos` for `cell` (its `seq` was
-                        // `pos`, meaning the consumer has finished reading any prior entry).
+                        // SAFETY: we exclusively claimed turn `pos` for `cell` (its lap turn was
+                        // `pos - idx`, meaning the consumer finished reading any prior entry).
                         unsafe { ptr::write(cell.event.get(), event) };
-                        cell.seq.store(pos.wrapping_add(1), Ordering::Release);
+                        cell.seq.store(expected.wrapping_add(1), Ordering::Release);
                         return true;
                     }
                     Err(actual) => pos = actual,
@@ -323,16 +352,18 @@ impl<'r> Telemetry<'r> {
     pub fn pop(&self) -> Option<Event> {
         let h = self.header();
         let pos = h.head.load(Ordering::Relaxed);
-        let cell = self.cell((pos & self.mask) as usize);
-        let seq = cell.seq.load(Ordering::Acquire);
-        let diff = seq.wrapping_sub(pos.wrapping_add(1)) as i64;
+        let idx = pos & self.mask;
+        let expected = pos.wrapping_sub(idx);
+        let cell = self.cell(idx as usize);
+        let turn = cell.seq.load(Ordering::Acquire);
+        let diff = turn.wrapping_sub(expected.wrapping_add(1)) as i64;
         if diff != 0 {
             return None;
         }
-        // SAFETY: `seq == pos + 1` with `Acquire` synchronizes with the producer's `Release`
-        // after writing `cell.event`; this is the sole consumer.
+        // SAFETY: `turn == (pos - idx) + 1` with `Acquire` synchronizes with the producer's
+        // `Release` after writing `cell.event`; this is the sole consumer.
         let event = unsafe { ptr::read(cell.event.get()) };
-        cell.seq.store(pos.wrapping_add(u64::from(self.cap)), Ordering::Release);
+        cell.seq.store(expected.wrapping_add(u64::from(self.cap)), Ordering::Release);
         h.head.store(pos.wrapping_add(1), Ordering::Relaxed);
         Some(event)
     }
@@ -406,8 +437,9 @@ impl MappedRing {
         let base = map_fd(fd, bytes)?;
         // SAFETY: mapping stays valid after closing `fd`.
         unsafe { libc::close(fd) };
-        // SAFETY: `base..base + bytes` is exclusively ours and remains mapped until `Drop`.
-        let ring = match unsafe { Telemetry::init(base, bytes, cap) } {
+        // SAFETY: `O_TRUNC` + `ftruncate` yields a zero-filled sparse mapping exclusively ours
+        // until `Drop`, so `init_zeroed` touches only the header page.
+        let ring = match unsafe { Telemetry::init_zeroed(base, bytes, cap) } {
             Ok(ring) => ring,
             Err(err) => {
                 unsafe { libc::munmap(base.as_ptr().cast(), bytes) };
@@ -914,5 +946,30 @@ mod tests {
         drop(reader);
         drop(writer);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mapped_ring_create_bounds_disk_and_round_trips_zeroed_init() {
+        use std::os::unix::fs::MetadataExt;
+        let path = std::env::temp_dir().join(format!("blaze-telem-sparse-{}.ring", std::process::id()));
+        let cpath = std::ffi::CString::new(path.to_str().expect("utf8 path")).expect("cstr");
+        let writer = MappedRing::create(&cpath, DEFAULT_CAP).expect("create default telemetry ring");
+        let ev = Event::span_enter(1, Slot(3), 42, 0x99, SpanId(1), SpanId::NONE);
+        assert!(writer.ring().try_push(ev));
+        let reader = MappedRing::attach_file(&cpath).expect("attach telemetry ring");
+        assert_eq!(reader.ring().pop(), Some(ev));
+        assert_eq!(reader.ring().pop(), None);
+        drop(reader);
+        drop(writer);
+        let meta = std::fs::metadata(&path).expect("stat telemetry ring");
+        let allocated = meta.blocks() * 512;
+        let _ = std::fs::remove_file(&path);
+        // Linux keeps untouched pages sparse (<= 64 KiB); macOS APFS materializes the full
+        // MAP_SHARED file on first dirty page, bounded by DEFAULT_CAP (256 KiB + header).
+        let cap_bytes = if cfg!(target_os = "macos") { 320 * 1024 } else { 64 * 1024 };
+        assert!(
+            allocated <= cap_bytes,
+            "telemetry ring allocated {allocated} bytes on disk (limit {cap_bytes})"
+        );
     }
 }
