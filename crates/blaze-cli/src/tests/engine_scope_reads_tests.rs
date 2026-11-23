@@ -566,3 +566,155 @@ fn phases_crate_scope_edit_opens_only_asked_scope_crates_and_pages_standing_shel
         "phases edit must open only scope crates bodies actually ask, not unused deps (opened {opened}): {opened_line}\n{prof}",
     );
 }
+
+/// Monster #2: on `Driver::Phases`, when `Stage::Heads` moves (e.g. a new private fn or a changed
+/// signature in `app`), `bodies_phase` keeps `PagedHeads` active via a sorted in-memory overlay of
+/// only the moved `Signature` rows instead of eagerly probing all standing `Signature` headers
+/// across unrelated workspace crates, and matches a fresh check byte-for-byte (both clean and on a
+/// signature-induced type error).
+#[test]
+fn phases_moved_heads_uses_paged_heads_overlay_and_matches_fresh() {
+    use core::fmt::Write as _;
+    use crate::engine_ready_edit::Driver;
+    let setup = |seed: u64| -> Io {
+        let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
+        let frame = bstd::mem::Frame::with_reserve(1 << 16, bstd::mem::Tag::Other).expect("test frame");
+        let mut members = blaze_own::String::from_str_in("\"app\"", &frame);
+        let mut deps = blaze_own::String::new_in(&frame);
+        for i in 0..6 {
+            let _ = write!(members, ", \"dep{i}\"");
+            let _ = writeln!(deps, "dep{i} = {{ path = \"../dep{i}\" }}");
+            write(&io, &format!("dep{i}/Cargo.toml"), &format!("[package]\nname = \"dep{i}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"));
+            write(
+                &io,
+                &format!("dep{i}/src/lib.rs"),
+                "pub mod m0;\npub mod m1;\npub mod m2;\npub mod m3;\npub fn top() -> u32 { m0::v() }\n",
+            );
+            for m in 0..4 {
+                write(&io, &format!("dep{i}/src/m{m}.rs"), &format!("pub fn v() -> u32 {{ {} }}\n", i * 10 + m));
+            }
+        }
+        write(&io, "Cargo.toml", &format!("[workspace]\nmembers = [{}]\nresolver = \"2\"\n", members.as_str()));
+        write(&io, "app/Cargo.toml", &format!("[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n{}", deps.as_str()));
+        write(&io, "app/src/lib.rs", "pub mod inner;\npub fn caller() -> u32 {\n    inner::sig_fn()\n}\n");
+        write(&io, "app/src/inner.rs", "pub fn sig_fn() -> u32 {\n    1\n}\n");
+        let (_, cold) = engine_opts(&io, opts(&io, 2, false));
+        assert_ne!(cold.status.0, Status::FAILED.0, "cold run checks clean");
+        io
+    };
+
+    let inc_io = setup(54);
+    let fresh_io = setup(54);
+
+    // 1. Add a private fn in `app/src/inner.rs`: moves `Names` + 1 `Signature` task in `Heads`,
+    //    0 `ImplBucket` tasks. Must NOT probe the 30 standing `Signature` headers of `dep0..dep5`.
+    let with_priv = "pub fn sig_fn() -> u32 {\n    1\n}\n\nfn _private_added() -> u32 {\n    42\n}\n";
+    write(&inc_io, "app/src/inner.rs", with_priv);
+    write(&fresh_io, "app/src/inner.rs", with_priv);
+    let mut inc_opts = opts(&inc_io, 2, false);
+    inc_opts.driver = Driver::Phases;
+    let (inc_ids, inc_checked) = engine_opts(&inc_io, inc_opts);
+    let (fresh_ids, fresh_checked) = engine_opts(&fresh_io, opts(&fresh_io, 2, true));
+    assert!(inc_checked.stages[blaze_engine::Stage::Heads.index()].entered > 0, "Heads stage ran");
+    assert_eq!(inc_checked.status.0, fresh_checked.status.0, "status matches fresh");
+    assert_eq!(inc_ids, fresh_ids, "findings match fresh");
+    let prof = profile(&inc_io);
+    let rows_line = prof.lines().find(|l| l.starts_with("stored answer rows asked ")).expect("stored answer rows asked line");
+    let distinct_sig: u64 = rows_line
+        .split("Signature ")
+        .nth(1)
+        .and_then(|s| s.split('/').nth(1))
+        .and_then(|s| s.split(' ').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    // 6 deps * 5 files = 30 standing Signature rows across `dep0..dep5` alone; paged overlay
+    // probes only the asked/moved `app` signatures (<= 6), never all 30+ standing ones.
+    assert!(
+        distinct_sig <= 6,
+        "PagedHeads overlay must not probe all standing Signature rows across unrelated crates (got {distinct_sig} distinct): {rows_line}",
+    );
+
+    // 2. Soundness control: change `sig_fn`'s return type `u32` -> `u64` so `app::caller` fails
+    //    with E0308; the overlay MUST serve the new `Signature` record (not stale stored bytes)
+    //    and match the fresh oracle byte-for-byte.
+    let broken_sig = "pub fn sig_fn() -> u64 {\n    1\n}\n\nfn _private_added() -> u32 {\n    42\n}\n";
+    write(&inc_io, "app/src/inner.rs", broken_sig);
+    write(&fresh_io, "app/src/inner.rs", broken_sig);
+    let mut inc_opts2 = opts(&inc_io, 2, false);
+    inc_opts2.driver = Driver::Phases;
+    let (inc_ids2, inc_checked2) = engine_opts(&inc_io, inc_opts2);
+    let (fresh_ids2, fresh_checked2) = engine_opts(&fresh_io, opts(&fresh_io, 2, true));
+    assert_eq!(inc_checked2.status.0, Status::FAILED.0, "changed signature must fail caller");
+    assert_eq!(inc_checked2.status.0, fresh_checked2.status.0, "broken sig status matches fresh");
+    assert_eq!(inc_ids2, fresh_ids2, "broken sig findings match fresh");
+}
+
+/// Monster #1: on a ready body edit that triggers trait/impl lookup (so `BucketIndex::crate_linked`
+/// queries `proc_macro(krate)` across the scope), `BodiesLoad::proc_macro` answers from the crate
+/// graph without opening unused dependency `CrateScope` records, and matches `Driver::Phases`
+/// byte-for-byte.
+#[test]
+fn ready_body_edit_with_impl_lookup_skips_unused_dep_crate_scope_opens() {
+    use core::fmt::Write as _;
+    use crate::engine_ready_edit::Driver;
+    let setup = |seed: u64| -> Io {
+        let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
+        let frame = bstd::mem::Frame::with_reserve(1 << 16, bstd::mem::Tag::Other).expect("test frame");
+        let mut members = blaze_own::String::from_str_in("\"app\"", &frame);
+        let mut deps = blaze_own::String::new_in(&frame);
+        for i in 0..6 {
+            let _ = write!(members, ", \"dep{i}\"");
+            let _ = writeln!(deps, "dep{i} = {{ path = \"../dep{i}\" }}");
+            write(&io, &format!("dep{i}/Cargo.toml"), &format!("[package]\nname = \"dep{i}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"));
+            write(
+                &io,
+                &format!("dep{i}/src/lib.rs"),
+                &format!("pub struct Tag{i};\npub trait Mark{i} {{ fn mark(&self) -> u32; }}\nimpl Mark{i} for Tag{i} {{ fn mark(&self) -> u32 {{ {i} }} }}\npub fn val() -> u32 {{ Tag{i}.mark() }}\n"),
+            );
+        }
+        write(&io, "Cargo.toml", &format!("[workspace]\nmembers = [{}]\nresolver = \"2\"\n", members.as_str()));
+        write(&io, "app/Cargo.toml", &format!("[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n{}", deps.as_str()));
+        write(
+            &io,
+            "app/src/lib.rs",
+            "pub trait Local { fn id(&self) -> u32; }\nimpl Local for u32 { fn id(&self) -> u32 { *self } }\npub fn f(x: u32) -> u32 {\n    x.id() + dep0::val()\n}\n",
+        );
+        let (_, cold) = engine_opts(&io, opts(&io, 2, false));
+        assert_ne!(cold.status.0, Status::FAILED.0, "cold run checks clean");
+        io
+    };
+
+    let ready_io = setup(55);
+    let phases_io = setup(55);
+    let edited = "pub trait Local { fn id(&self) -> u32; }\nimpl Local for u32 { fn id(&self) -> u32 { *self } }\npub fn f(x: u32) -> u32 {\n    x.id() + dep0::val() + 1\n}\n";
+    write(&ready_io, "app/src/lib.rs", edited);
+    write(&phases_io, "app/src/lib.rs", edited);
+
+    let mut ready_opts = opts(&ready_io, 2, false);
+    ready_opts.driver = Driver::Ready;
+    let (ready_ids, ready_checked) = engine_opts(&ready_io, ready_opts);
+    let mut phases_opts = opts(&phases_io, 2, false);
+    phases_opts.driver = Driver::Phases;
+    let (phases_ids, phases_checked) = engine_opts(&phases_io, phases_opts);
+    assert_eq!(ready_checked.status.0, phases_checked.status.0, "status matches Phases");
+    assert_eq!(ready_ids, phases_ids, "findings match Phases");
+    assert_eq!(
+        ready_checked.stored.expect("ready stored").root,
+        phases_checked.stored.expect("phases stored").root,
+        "ready root matches Phases byte-for-byte",
+    );
+
+    let prof = profile(&ready_io);
+    let opened_line = prof.lines().find(|l| l.starts_with("bodies: scope crates opened by need ")).expect("scope crates opened by need line");
+    let opened: u64 = opened_line
+        .strip_prefix("bodies: scope crates opened by need ")
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .expect("opened crate count");
+    // Only toolchain lang crates (<= 3) + `dep0` (1) = <= 4 crates opened; `dep1..dep5` must NOT
+    // be opened merely because impl lookup checked `proc_macro(krate)` across the scope.
+    assert!(
+        opened <= 4,
+        "proc_macro fast-path must not open unused dep CrateScope records during impl lookup (opened {opened}): {opened_line}\n{prof}",
+    );
+}

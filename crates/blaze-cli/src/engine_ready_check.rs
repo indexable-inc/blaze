@@ -266,6 +266,18 @@ pub(crate) fn walk_lints<'a>(cx: &Cx, lints: &LintsStage, root: &Dir<ReadWrite>,
         units.extend(group.iter().map(|(_, task, unit)| (*task, *unit)));
         jobs.push((group[0].0, units));
     }
+    if jobs.is_empty() {
+        return Ok(SVec::new_in(alloc));
+    }
+    if let [(file, units)] = jobs.as_slice()
+        && let Some(one) = outlined.get(*file)
+    {
+        let rows = lints.lint_units(cx, root, *file, one, units, alloc);
+        let mut parked: SVec<'a, Parked<'a>> = SVec::with_capacity_in(rows.len(), alloc);
+        parked.extend(rows.into_iter().map(|(done, kept)| Parked { name: done.name, key: done.key, done: Some(done), kept, ran: false }));
+        parked.sort_unstable_by_key(|one| one.name);
+        return Ok(parked);
+    }
     let span = cx.span("engine: the ready lint walks");
     let scope = span.scope();
     // The handles live in the walks' span frame (rule 11).
@@ -478,40 +490,36 @@ pub(crate) struct Driven<'a, 'f> {
     pub(crate) panicked: SVec<'a, Name>,
 }
 
-/// The stages a ready edit reads, made by the coordinator before the drive: the lint stage
-/// (its rules), and the bodies' one setup (`BodiesStage::prepare` over the ready engine's view
-/// before the drive, which takes any `CellDigests`) as its runs read it (`Prepared::runner` over
-/// `BodiesStage::reads_view`) with the rows that setup decided with no check to run (its buffer).
+/// The stages a ready edit reads, made by the coordinator before the drive: each entered file's
+/// parked lint rows ([`walk_lints`]), and the bodies' one setup (`BodiesStage::prepare` over the
+/// ready engine's view before the drive, which takes any `CellDigests`) as its runs read it
+/// (`Prepared::runner` over `BodiesStage::reads_view`) with the rows that setup decided with no
+/// check to run (its buffer).
 pub(crate) struct Stages<'p, 'f, 'r, 'a> {
-    pub(crate) lints: &'p LintsStage,
+    pub(crate) parked: SVec<'a, Parked<'a>>,
     pub(crate) runner: Option<BodyRunner<'p, 'f, 'r>>,
     pub(crate) decided: blaze_engine::Buffer<'a>,
 }
 
-/// One edit on `Ready` (D187): the entering `Lint` tasks (`lint_tasks`) walked once a file and
-/// parked ([`walk_lints`]), then `engine` (made by the coordinator over the last answer with the
+/// One edit on `Ready` (D187): `engine` (made by the coordinator over the last answer with the
 /// edited files' plans, each from engine_ready_edit.rs `file_tasks`, and scoped to the forward
 /// wake's entering names, which the precondition `admit` let through: every one a `FileItems`,
-/// `Lint` or `BodyCheck` task) driven on `pool` by the three kinds, and finished. A stop is the
-/// command's typed error: a kind's own (rule 19) or the driver's ([`stopped`]), copied into
-/// `heap`. Nothing here reads a header shard or a page beyond what the host reads for a woken
-/// task's row and its reads' definers.
+/// `Given`, `Lint` or `BodyCheck` task) driven on `pool` by its four kinds, and finished. A stop
+/// is the command's typed error: a kind's own (rule 19) or the driver's ([`stopped`]), copied
+/// into `heap`. Nothing here reads a header shard or a page beyond what the host reads for a
+/// woken task's row and its reads' definers.
 #[expect(clippy::too_many_arguments, reason = "the request's edge: each argument one handle of it")]
 pub(crate) fn drive_edit<'a, 'f>(
-    cx: &Cx,
     engine: blaze_engine::Engine<'a, crate::engine_ready_edit::Entering<'_>>,
-    lint_tasks: &[Task],
     given_answers: &[(Name, ContentId)],
     given_entering: &[Name],
     outlined: &[Outlined<'_>],
-    root: &Dir<ReadWrite>,
     stages: Stages<'_, 'f, '_, 'a>,
     pool: &mut Workers<'_>,
     alloc: SharedAlloc<'a>,
     heap: SharedAlloc<'static>,
 ) -> Result<Driven<'a, 'f>, CliError> {
-    let parked = walk_lints(cx, stages.lints, root, outlined, lint_tasks, alloc)?;
-    let sink: Sink<'a, 'f> = Sink::new(parked, stages.decided, alloc);
+    let sink: Sink<'a, 'f> = Sink::new(stages.parked, stages.decided, alloc);
     // The kinds borrow the sink for the drive alone: it is taken whole after it.
     let drove = {
         let outlines = FileItemsKind { outlined };

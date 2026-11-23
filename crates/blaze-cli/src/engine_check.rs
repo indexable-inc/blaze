@@ -1619,11 +1619,12 @@ fn checking<'f>(
                 }
                 pre_files.push((file, group));
             }
-            let (woken, woke) = match crate::engine_ready_edit::wake(cx, &mut store, last_stored, &tools, &outlined, &given_answers, &pre_files, alloc) {
+            let (mut woken, woke) = match crate::engine_ready_edit::wake(cx, &mut store, last_stored, &tools, &outlined, &given_answers, &pre_files, alloc) {
                 Ok(out) => out,
                 Err(CliError::EngineCheck(EngineCheckError::ReadyRefused(why))) => return Ok(Err(why)),
                 Err(error) => return Err(error),
             };
+            expand_woken_views(reach, &pre_files, &mut woken);
             match crate::engine_ready_edit::admit(&woken) {
                 Ok(crate::engine_ready_edit::EditPath::Ready(_)) => {}
                 Ok(crate::engine_ready_edit::EditPath::Phases(why)) => return Ok(Err(ReadyRefused::Root(why))),
@@ -1882,7 +1883,8 @@ fn checking<'f>(
                     let planned_given = crate::engine_script_reads::plan(&followed.now, alloc);
                     given_answers.extend(planned_given.iter().map(|(one, answer, _)| (one.name, *answer)));
                 }
-                let (woken, woke) = crate::engine_ready_edit::wake(cx, &mut store, last, &tools, &outlined, given_answers.as_slice(), &files, alloc)?;
+                let (mut woken, woke) = crate::engine_ready_edit::wake(cx, &mut store, last, &tools, &outlined, given_answers.as_slice(), &files, alloc)?;
+                expand_woken_views(bodies.reach(), &files, &mut woken);
                 let entering_tasks = crate::engine_ready_edit::entering_tasks(last, &tools, &files, &woken, alloc)?;
                 phases.mark_cx(cx, "ready wake (the entering names from the stored pages, admitted, their tasks)", frame);
                 (woken, Some(woke), entering_tasks)
@@ -3573,6 +3575,33 @@ fn outlines_phase<'r>(rq: &mut Drive<'_, '_, 'r, '_, '_>, engine: &Engine<'r, Ev
     rq.pool.failed().map_err(CliError::Pool)
 }
 
+/// Builds a sorted in-memory overlay of the `Signature` rows updated in `changes` during this
+/// request's `Stage::Heads` so `PagedHeads` stays active even when heads moved.
+#[inline(never)]
+fn build_heads_overlay(
+    changes: &SMap<'_, Name, Option<blaze_drive::Key>>,
+    view: &blaze_engine::View<'_, '_>,
+    heap: &'static blaze_own::Heap,
+) -> Result<blaze_own::Vec<(Name, crate::engine_seeds::HeadEntry), SharedAlloc<'static>>, CliError> {
+    let mut overlay = blaze_own::Vec::new_in(heap.shared());
+    for (&name, &maybe_key) in changes.iter() {
+        if name.kind != Kind::Signature {
+            continue;
+        }
+        let entry = match view.row(name) {
+            None => crate::engine_seeds::HeadEntry::None,
+            Some(row) if row.failed => crate::engine_seeds::HeadEntry::Failed,
+            Some(row) if row.out == crate::engine_heads::no_units_out(name) => crate::engine_seeds::HeadEntry::None,
+            Some(_) => match maybe_key {
+                Some(key) => crate::engine_seeds::HeadEntry::Record(key),
+                None => return Err(CliError::Text { what: "a head task's row has no record key (pages.rs `records`; engine_seeds.rs `RequestTable::build`)" }),
+            },
+        };
+        overlay.push((name, entry));
+    }
+    Ok(overlay)
+}
+
 /// A Bodies phase: the crates' tables and frozen heads made ready, then the bodies checked;
 /// its run facts, in the phase's arena.
 #[inline(never)]
@@ -3593,16 +3622,16 @@ fn bodies_phase<'r, 'm, 'p>(
     stack_probe::at("bodies_phase");
     let (cx, frame, alloc, heap, tools, planned) = (rq.cx, rq.frame, rq.alloc, rq.heap, rq.tools, rq.planned);
     let handles = crate::engine_bodies::Handles { root: rq.root, env: rq.env, graph: rq.graph, names: rq.names.as_ref().map(crate::engine_names::NamesInputs::ran), outlined: rq.outlined, workers: rq.workers, clock: rq.phases.clock(), board: rq.board, tool: tools.0[blaze_drive::Kind::BodyCheck.index()] };
-    // Read standing impl tables and frozen heads lazily from `stored` whenever their own stage
-    // did not move: if no `Units` or `ImplBucket` task ran (even when `Names` or `Signature` ran),
-    // every crate's impl table still stands in `stored`, avoiding eagerly scanning all 1,206
-    // `ImplBucket` records; if no `Units` or `Heads` task ran, every `Signature` header stands in
-    // `stored`, avoiding eagerly scanning all ~19,000 `Signature` headers.
+    // Read standing impl tables and frozen heads lazily from `stored` whenever `Units` did not
+    // move: if no `ImplBucket` task ran (even when `Names` or `Signature` ran), every crate's
+    // impl table still stands in `stored`, avoiding eagerly scanning all 1,206 `ImplBucket`
+    // records; for `Signature` heads, keep `PagedHeads` active even when `Stage::Heads` ran by
+    // overlaying only the `Signature` rows updated in `records.changes` this request, avoiding
+    // eagerly scanning all ~19,000 standing `Signature` headers.
     let units_moved = rq.ran.iter().any(|(phase, _, count)| phase.stage == Stage::Units && *count > 0);
-    let heads_moved = rq.ran.iter().any(|(phase, _, count)| phase.stage == Stage::Heads && *count > 0);
     let can_page_stored = !rq.fresh && !units_moved && rq.serve.served.get().is_none();
     let lazy_shelf_stored = stored.filter(|_| can_page_stored && !rq.bodies.entered_impl_bucket());
-    let lazy_heads_stored = stored.filter(|_| can_page_stored && !heads_moved);
+    let lazy_heads_stored = stored.filter(|_| can_page_stored);
     let stored_shelf = lazy_shelf_stored.map(|stored| crate::engine_shelf_pages::StoredShelf::new(stored, heap));
     // The tables of crates whose Heads task stands, from the store: one shelf of all when not paged.
     if stored_shelf.is_none()
@@ -3625,7 +3654,8 @@ fn bodies_phase<'r, 'm, 'p>(
             Some(list) => match lazy_heads_stored {
                 Some(stored) => {
                     let crates = crate::engine_seeds::crates_unasked(&list);
-                    let paged = crate::engine_seeds::PagedHeads::new(stored, files, crate::engine_seeds::PagedPlant::None, heap);
+                    let overlay = build_heads_overlay(&records.changes, &engine.view(), heap)?;
+                    let paged = crate::engine_seeds::PagedHeads::with_overlay(stored, files, overlay, crate::engine_seeds::PagedPlant::None, heap);
                     let inputs = crate::engine_names::NamesInputs::ran(stage);
                     Some(crate::engine_seeds::RequestTable::paged(cx, &mut *store, paged, (crates, inputs.keys()), &seed_root, seed_tool, heap)?)
                 }
@@ -4359,6 +4389,49 @@ fn read_needed<'h>(
 ///    (the scope's one obligation: nothing the wake did not enter is owed, rule 3).
 /// 6. The lint units kept, the bodies joined, the entered tasks' records put, the frozen
 ///    dependency heads merged, the entered names noted for the read grains.
+/// Expands woken base `BodyCheck` tasks of edited files to all their planned view rows (D191):
+/// `engine_ready_edit::wake` wakes keyed parts by their outline's base `part.name`, while
+/// `plan_views` plans additional view rows `at_view(part.name, UnitView::At(view))` for every
+/// reaching unit beyond rank 0. Checked view rows are woken via `FileItems` cell readers, but
+/// an absent/unchecked view row reads only its own unit's `CrateScope` and would otherwise be
+/// missed by `wake`, leaving its moved key in `owed_tasks` and knocking the next edit off `ready`.
+fn expand_woken_views(
+    reach: Option<&crate::engine_body_plan::Reach>,
+    files: &[(Name, &[Planned])],
+    woken: &mut SVec<'_, Name>,
+) {
+    let Some(reach) = reach else { return };
+    let initial = woken.len();
+    for &(file, group) in files.iter() {
+        if file.kind != Kind::FileItems {
+            continue;
+        }
+        let ranks = reach.ranks(file);
+        if ranks.len() <= 1 {
+            continue;
+        }
+        for at in 0..initial {
+            let Some(&base) = woken.get(at) else {
+                continue;
+            };
+            if base.kind != Kind::BodyCheck {
+                continue;
+            }
+            for &(_, rank) in ranks.iter() {
+                let Some(unit) = reach.unit(rank) else { continue };
+                let view_name = blaze_drive::view::at_view(base, blaze_drive::view::UnitView::At(unit.view));
+                if group.binary_search_by_key(&view_name, |one| one.name).is_ok() {
+                    woken.push(view_name);
+                }
+            }
+        }
+    }
+    if woken.len() > initial {
+        woken.sort_unstable();
+        woken.dedup();
+    }
+}
+
 #[inline(never)]
 #[expect(clippy::too_many_arguments, reason = "the drive's edge: each argument one handle of it")]
 fn ready_drive<'d, 'f, 'r, 's, 'w, 'm>(
@@ -4468,17 +4541,21 @@ fn ready_drive<'d, 'f, 'r, 's, 'w, 'm>(
     // `Prepared::scope_records`): a body's scope crate past its member opened at its first
     // question, once for every run; its counts read after the join.
     let by_need = prepared.scope_records();
-    prepared.pre_open_lang(cx, &by_need, rq.workers);
-    let stages = crate::engine_ready_check::Stages { lints: &*rq.lints, runner: prepared.runner(rq.bodies.reads_paged(&stored_shelf), &by_need), decided };
-    let driven = crate::engine_ready_check::drive_edit(cx, engine, &lint_tasks, given_answers, &given_entering, rq.outlined, rq.root, stages, &mut pool, alloc, heap.shared())?;
+    let parked = prepared.pre_open_lang_with(cx, &by_need, rq.workers, |cx| {
+        crate::engine_ready_check::walk_lints(cx, &*rq.lints, rq.root, rq.outlined, &lint_tasks, alloc)
+    })?;
+    let stages = crate::engine_ready_check::Stages { parked, runner: prepared.runner(rq.bodies.reads_paged(&stored_shelf), &by_need), decided };
+    let driven = crate::engine_ready_check::drive_edit(engine, given_answers, &given_entering, rq.outlined, stages, &mut pool, alloc, heap.shared())?;
     let crate::engine_ready_check::Driven { finished, mut sunk, panicked } = driven;
     if let Some(&name) = panicked.first() {
         return Err(EngineCheckError::ReadyHost { task: name, what: "its run panicked on the ready driver's workers (engine_ready_check.rs `Workers`)" }.into());
     }
-    if let Some(name) = finished.answer.owed_tasks.keys().copied().find(|name| names.binary_search(name).is_err()) {
-        return Err(EngineCheckError::ReadyHost { task: name, what: "owed by the ready scope: the forward wake did not enter it, and the edit moved its key or a cell it reads (engine_ready_edit.rs `wake`)" }.into());
+    let owed_tasks = blaze_engine::LastAnswer::owed(&finished.answer, blaze_own::Alloc::from(alloc)).map_err(EngineError::from)?;
+    if let Some(planned) = owed_tasks.iter().find(|planned| names.binary_search(&planned.name).is_err()) {
+        return Err(EngineCheckError::ReadyHost { task: planned.name, what: "owed by the ready scope: the forward wake did not enter it, and the edit moved its key or a cell it reads (engine_ready_edit.rs `wake`)" }.into());
     }
-    if let Some(cell) = finished.answer.owed_cells.keys().find(|cell| names.binary_search(&cell.of).is_err()) {
+    let owed_cells = blaze_engine::LastAnswer::owed_cells(&finished.answer, blaze_own::Alloc::from(alloc)).map_err(EngineError::from)?;
+    if let Some((cell, _)) = owed_cells.iter().find(|(cell, _)| names.binary_search(&cell.of).is_err()) {
         return Err(EngineCheckError::ReadyHost { task: cell.of, what: "a cell it defines is owed by the ready scope: the forward wake did not enter its definer (engine_ready_edit.rs `wake`)" }.into());
     }
     // A head task row the paged table could not take, or a stored page a run could not read, is

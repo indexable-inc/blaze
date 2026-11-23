@@ -1012,3 +1012,63 @@ fn multiple_ready_bodies_execute_cleanly_in_parallel_and_match_phases() {
     let prof = profile(&ready_io);
     assert!(prof.contains("bodies memory: 8 bodies"), "every body ran exactly once:\n{prof}");
 }
+
+/// Monster #3: repeated `Driver::Ready` / `Driver::Auto` body edits in a multi-unit file that is
+/// BOTH read via a `Given` (`include_str!`) AND contains a body whose view row is absent/unchecked
+/// in another reaching unit (e.g. `#[cfg(not(test))] fn helper()` in a lib+test crate) must wake
+/// all planned view rows of the edited body, leave 0 owed tasks/cells, match `Driver::Phases`
+/// byte-for-byte, and keep edit #2 on `Driver::Ready` instead of falling back to `phases`.
+#[test]
+fn repeated_ready_body_edits_with_given_and_absent_view_row_leave_no_owed_tasks() {
+    let setup = |seed: u64| -> Io {
+        let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
+        write(&io, "Cargo.toml", "[workspace]\nmembers = [\"a\"]\nresolver = \"2\"\n");
+        write(&io, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+        write(
+            &io,
+            "a/src/spec.rs",
+            "pub fn shared() -> u32 {\n    10\n}\n\n#[cfg(not(test))]\nfn helper_only_in_lib() -> u32 {\n    1\n}\n",
+        );
+        write(
+            &io,
+            "a/src/lib.rs",
+            "#[rustc_builtin_macro]\nmacro_rules! include_str { () => {} }\n#[rustc_builtin_macro]\nmacro_rules! concat { () => {} }\nmod spec;\npub fn read_spec() -> usize {\n    let _s = include_str!(concat!(\"\", \"spec.rs\"));\n    spec::shared() as usize\n}\n",
+        );
+        let (_, cold) = engine_opts(&io, opts(&io, 2, true));
+        assert!(cold.stored.is_some(), "cold stored");
+        io
+    };
+
+    let ready_io = setup(94);
+    let phases_io = setup(94);
+
+    // Edit #1: edit body of `#[cfg(not(test))] fn helper_only_in_lib()` (base row checked by lib,
+    // view row absent/not checked in test unit) while `read_spec` reads `spec.rs` through `Given`.
+    let edit1 = "pub fn shared() -> u32 {\n    10\n}\n\n#[cfg(not(test))]\nfn helper_only_in_lib() -> u32 {\n    2\n}\n";
+    write(&ready_io, "a/src/spec.rs", edit1);
+    write(&phases_io, "a/src/spec.rs", edit1);
+    let r1 = checked_on(&ready_io, Driver::Auto).expect("edit #1 stays on ready");
+    let p1 = checked_on(&phases_io, Driver::Phases).expect("edit #1 on phases");
+    let r1_stored = r1.stored.expect("r1 stored");
+    let p1_stored = p1.stored.expect("p1 stored");
+    let r1_prof = profile(&ready_io);
+    assert!(r1_prof.contains("driver: ready"), "edit #1 took ready:\n{r1_prof}");
+    assert_eq!(r1_stored.header_shards_read, 0, "edit #1 read 0 header shards");
+    assert_eq!(r1_stored.root, p1_stored.root, "edit #1 root matches Phases");
+    assert_eq!(r1_stored.pages, p1_stored.pages, "edit #1 pages match Phases");
+
+    // Edit #2: another body edit in `a/src/spec.rs` MUST stay on `Driver::Ready` (0 owed tasks or
+    // cells left behind by edit #1) and match `Driver::Phases` byte-for-byte.
+    let edit2 = "pub fn shared() -> u32 {\n    10\n}\n\n#[cfg(not(test))]\nfn helper_only_in_lib() -> u32 {\n    3\n}\n";
+    write(&ready_io, "a/src/spec.rs", edit2);
+    write(&phases_io, "a/src/spec.rs", edit2);
+    let r2 = checked_on(&ready_io, Driver::Auto).expect("edit #2 stays on ready");
+    let p2 = checked_on(&phases_io, Driver::Phases).expect("edit #2 on phases");
+    let r2_stored = r2.stored.expect("r2 stored");
+    let p2_stored = p2.stored.expect("p2 stored");
+    let r2_prof = profile(&ready_io);
+    assert!(r2_prof.contains("driver: ready"), "edit #2 must stay on ready (no owed tasks/cells from edit #1):\n{r2_prof}");
+    assert_eq!(r2_stored.header_shards_read, 0, "edit #2 read 0 header shards");
+    assert_eq!(r2_stored.root, p2_stored.root, "edit #2 root matches Phases");
+    assert_eq!(r2_stored.pages, p2_stored.pages, "edit #2 pages match Phases");
+}
