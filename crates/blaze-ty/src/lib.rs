@@ -48,6 +48,7 @@ mod portable;
 mod print;
 mod relate;
 mod solve;
+pub mod record_ty;
 pub mod type_set;
 pub mod union_ty;
 pub mod view_ty;

@@ -256,6 +256,11 @@ pub enum Rule {
     /// macOS Seatbelt + Linux Landlock/seccomp from one sans-IO `Plan`.
     /// The lint `blaze::raw_sandbox_exec`.
     RawSandboxExec = 35,
+    /// Deprecated `&mut` / `ref mut` unique reference spelling (`docs/v2/plan/design/edition.md`,
+    /// change 10): Blaze spells unique references `&uniq` and `ref uniq`, with mechanical auto-fix.
+    /// Does not flag `let mut`, `*mut`, `&raw mut`, or `mut x` bindings.
+    /// The lint `blaze::mut_ref`.
+    MutRef = 36,
 }
 
 impl Rule {
@@ -299,6 +304,7 @@ impl Rule {
         Rule::ProcMacroDef,
         Rule::DoubleIndirectionArc,
         Rule::RawSandboxExec,
+        Rule::MutRef,
     ];
 
     /// The ten rules ported from blaze's scripts: what [`Step::Strict`] runs. The rules after
@@ -358,6 +364,7 @@ impl Rule {
             Rule::ProcMacroDef => "proc-macro-def",
             Rule::DoubleIndirectionArc => "double-indirection-arc",
             Rule::RawSandboxExec => "raw-sandbox-exec",
+            Rule::MutRef => "mut-ref",
         }
     }
 
@@ -389,6 +396,7 @@ impl Rule {
             Rule::ProcMacroDef => Some("proc_macro_derive"),
             Rule::DoubleIndirectionArc => Some("double_indirection_arc"),
             Rule::RawSandboxExec => Some("raw_sandbox_exec"),
+            Rule::MutRef => Some("mut_ref"),
             _ => None,
         }
     }
@@ -433,7 +441,7 @@ impl Rule {
     pub const fn exempt(self) -> TestBits {
         match self {
             Rule::Allocs => TestBits::CFG,
-            Rule::UnsafeComment | Rule::VariantCount => TestBits::NONE,
+            Rule::UnsafeComment | Rule::VariantCount | Rule::MutRef => TestBits::NONE,
             _ => TestBits::ANY,
         }
     }
@@ -599,6 +607,10 @@ pub enum Template {
     DoubleIndirectionArc = 300,
     /// Literal `"sandbox-exec"` or `"/usr/bin/sandbox-exec"` outside `bstd::procs::hermetic`.
     RawSandboxExec = 310,
+    /// Deprecated `&mut` (or `&'a mut`) unique reference; fixed mechanically to `&uniq` (`&'a uniq`).
+    MutRef = 320,
+    /// Deprecated `ref mut` binding mode; fixed mechanically to `ref uniq`.
+    RefMut = 321,
 }
 
 impl Template {
@@ -637,6 +649,7 @@ impl Template {
             290 => Rule::ProcMacroDef,
             300 => Rule::DoubleIndirectionArc,
             310 => Rule::RawSandboxExec,
+            320..=321 => Rule::MutRef,
             _ => Rule::VariantCount,
         }
     }
@@ -716,6 +729,8 @@ impl Template {
             Template::ProcMacroDef => "proc-macro-def",
             Template::DoubleIndirectionArc => "double-indirection-arc",
             Template::RawSandboxExec => "raw-sandbox-exec",
+            Template::MutRef => "mut-ref",
+            Template::RefMut => "ref-mut",
         }
     }
 }
@@ -1278,8 +1293,16 @@ impl Step {
     /// toolchain has.
     pub const SUGGEST: [Rule; 4] = [Rule::UnsafeComment, Rule::Untyped, Rule::Recursion, Rule::VariantCount];
     /// The rules of [`Step::Edition`].
-    pub const EDITION: [Rule; 7] =
-        [Rule::UnsafeComment, Rule::Untyped, Rule::Recursion, Rule::VariantCount, Rule::Stops, Rule::Casts, Rule::Clones];
+    pub const EDITION: [Rule; 8] = [
+        Rule::UnsafeComment,
+        Rule::Untyped,
+        Rule::Recursion,
+        Rule::VariantCount,
+        Rule::Stops,
+        Rule::Casts,
+        Rule::Clones,
+        Rule::MutRef,
+    ];
 
     /// The step as configuration writes it (`rust`, `suggest`, `edition`, `strict`).
     pub fn from_name(name: &str) -> Option<Step> {

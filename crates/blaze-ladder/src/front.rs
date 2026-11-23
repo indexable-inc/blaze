@@ -573,6 +573,7 @@ impl Names {
             lf::TypeRef::Impl(_) => return Err(Why::Unsupported("an `impl Trait` type", r)),
             lf::TypeRef::Macro(_) => return Err(Why::Unsupported("a macro call in a type", r)),
             lf::TypeRef::Pat { .. } => return Err(Why::Unsupported("a pattern type", r)),
+            lf::TypeRef::Record(_) => return Err(Why::Unsupported("a record type", r)),
             lf::TypeRef::For { .. } => return Err(Why::Unsupported("a higher-ranked type (`for<'a>`)", r)),
             lf::TypeRef::Error => return Err(Why::Unsupported("this type", r)),
         }
