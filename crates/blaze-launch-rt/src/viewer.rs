@@ -349,8 +349,9 @@ fn acquire_viewer_lock(runs_dir: &Path, alloc: Alloc<'_>) -> Option<blaze_sys::p
     path.push(b'/');
     path.extend_from_slice(leaf);
     path.push(0);
-    let sys_path = blaze_sys::Path::from_bytes_with_nul(&path).ok()?;
-    let owned = open(sys_path, OpenFlags::RDWR | OpenFlags::CREAT | OpenFlags::CLOEXEC, 0o600).ok()?;
+    let cstr = CStr::from_bytes_with_nul(&path).ok()?;
+    let sys_path = blaze_sys::Path::new(cstr);
+    let owned = open(sys_path, OpenFlags::READ_WRITE | OpenFlags::CREATE | OpenFlags::CLOSE_ON_EXEC, 0o600).ok()?;
     flock(owned.fd(), FlockOp::SharedNonBlock).ok()?;
     Some(owned)
 }
