@@ -43,7 +43,7 @@ fn resolved(proc_macro: bool) -> (Names<'static>, [CrateInput<'static>; 2]) {
     let macros = input("macros", "/macros/lib.rs", &[]);
     let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro, entry: false };
     let crates = [input("plain", "/plain/lib.rs", &[]), CrateInput { implicit, ..macros }];
-    let names = resolve_crates(&crates, Sysroot::default(), &TEXTS, &Serial, Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &TEXTS, &Serial, super::SyncFrame::leaked()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     (names, crates)
 }
 

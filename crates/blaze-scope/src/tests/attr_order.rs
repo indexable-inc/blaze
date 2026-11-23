@@ -36,11 +36,21 @@ use crate::resolve::{CrateInput, CrateNames, Names, SourceTexts, resolve_crates}
 use crate::task::{AttrOrder, Serial};
 use crate::{CallShape, ScopeError, Unresolved};
 
-/// The test's root heap, made at its top; the names resolved borrow it, and its drop checks
-/// nothing was leaked.
-fn root() -> Root {
-    // The names resolution keeps what it makes for its arena's life (`TEST_ARENA`).
-    Root::new(RootOpts::TEST_ARENA).unwrap_or_else(|e| panic!("the test's root: {e}"))
+/// The test's bump arena, made at its top; the names resolved borrow it.
+struct TestRoot(blaze_own::Erased<blaze_mem::Frame>);
+
+impl TestRoot {
+    fn alloc(&self) -> Alloc<'_> {
+        self.0.handle()
+    }
+
+    fn bump(&self) -> blaze_own::Bump<'_> {
+        self.0.bump()
+    }
+}
+
+fn root() -> TestRoot {
+    TestRoot(blaze_own::Erased::new(blaze_mem::Frame::new(blaze_mem::Tag::Nameres).unwrap_or_else(|e| panic!("the test's frame: {e:?}"))))
 }
 
 /// reth-codecs-derive in miniature: the attribute macros `add_tests` (`add_arbitrary_tests`) and
@@ -168,7 +178,7 @@ impl<'a> SourceTexts<'a> for World {
 }
 
 /// The three crates of `world` resolved into `root`.
-fn solve<'r>(root: &'r Root, world: &World) -> Names<'r> {
+fn solve<'r>(root: &'r TestRoot, world: &World) -> Names<'r> {
     let derive = input("codecs_derive", "/codecs_derive/lib.rs", &[]);
     let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: true, entry: false };
     let crates = [
@@ -176,7 +186,7 @@ fn solve<'r>(root: &'r Root, world: &World) -> Names<'r> {
         input("codecs", "/codecs/lib.rs", &[("codecs_derive", 2)]),
         CrateInput { implicit, ..derive },
     ];
-    resolve_crates(&crates, Sysroot::default(), world, &Serial, root.alloc()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))
+    resolve_crates(&crates, Sysroot::default(), world, &Serial, root.bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))
 }
 
 /// The user root's macro errors, as (path, why), sorted.

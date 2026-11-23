@@ -485,7 +485,7 @@ impl Plan<'_> {
                 // rustc starts the tools under `lib/rustlib/<host>/bin` (`rust-objcopy`,
                 // `rust-lld`, `gcc-ld`): the pinned toolchain's, read-only.
                 let toolchain_tools = self.tool.sysroot.join("lib").join("rustlib");
-                let writes: [&Path; 4] = [ws.as_path(), target.as_path(), cargo_home.as_path(), tmp.as_path()];
+                let writes: [&Path; 4] = [target.as_path(), ws.as_path(), cargo_home.as_path(), tmp.as_path()];
                 let exec_under: [&Path; 4] = [toolchain_bin.as_path(), toolchain_tools.as_path(), shelf_bin.as_path(), target.as_path()];
                 let builder = NativeBuilder { cargo: Path::new(&self.tool.cargo()).to_owned(), reads: &reads, writes: &writes, exec_under: &exec_under };
                 builder.profile().and_then(|profile| native_sandboxed(argv.clone(), profile))
@@ -500,6 +500,7 @@ impl Plan<'_> {
             Err(why) => return Err(Failure::NoSandbox { why }),
         };
         let mut env = self.env(&self.work.join("cargo-home"));
+        env.push(("SOURCE_DATE_EPOCH".to_owned(), "0".into()));
         let mut flags = vec![format!("--remap-path-prefix={}=/build", self.work.display()), "-Cdebuginfo=0".to_owned()];
         if let Origin::Path { dir, .. } = origin {
             flags.push(format!("--remap-path-prefix={}=/build/path/{}-{}", dir.display(), wanted.name, wanted.version));
@@ -639,18 +640,17 @@ pub(super) fn main_with(text: &str, heap: &blaze_own::Heap) -> i32 {
     i32::from(failed > 0)
 }
 
-/// The confinement of a native script's build (D65, build-scripts.md "Runner 11"): what
-/// `cargo` may read, write and start. Its profile is blaze-build-script's deny-by-default one
-/// ([`blaze_build_script::native::seatbelt_with`], the profile a native script runs under), so
-/// there is one home for it: nothing outside the grant is read, the machine's compilers and
-/// `PATH` included; no network.
+/// The confinement of a native script's build (D65/D177, build-scripts.md "Runner 11"): what
+/// `cargo` may read, write and start. Its profile is rendered by `blaze_roots::seatbelt::render_sbpl`
+/// (the one deny-by-default renderer `bstd::procs::hermetic::seatbelt` uses), so there is one home
+/// for it: nothing outside the grant is read, the machine's compilers and `PATH` included; no network.
 struct NativeBuilder<'p> {
     /// The pinned toolchain's `cargo`: the program `sandbox-exec` starts.
     cargo: PathBuf,
     /// Read with what is under them: the vendored sources, the script's own source folder,
     /// the pinned Rust toolchain, the shelf's clang, the SDK.
     reads: &'p [&'p Path],
-    /// Written (and read): the script's workspace, its target folder, `CARGO_HOME`, `TMPDIR`.
+    /// Written (and read): the target folder, the script's workspace, `CARGO_HOME`, `TMPDIR`.
     writes: &'p [&'p Path],
     /// Any program under them may be started: the toolchain's and the shelf's `bin` (rustc,
     /// the linking clang, `ld64.lld`) and the target folder (the build scripts and proc macros
@@ -665,18 +665,32 @@ fn real_text(path: &Path) -> Result<String, String> {
 }
 
 impl NativeBuilder<'_> {
-    /// The Seatbelt profile's text; every path resolved first.
+    /// The Seatbelt profile's text via `blaze_roots::seatbelt::render_sbpl`; every path resolved first.
     fn profile(&self) -> Result<String, String> {
+        use blaze_roots::seatbelt::{MACOS_SYSTEM, SbplAccess, SbplRule, render_sbpl};
+
         let program = real_text(&self.cargo)?;
         let all = |paths: &[&Path]| paths.iter().map(|p| real_text(p)).collect::<Result<Vec<String>, String>>();
         let (reads, writes, exec_under) = (all(self.reads)?, all(self.writes)?, all(self.exec_under)?);
-        fn refs(list: &[String]) -> Vec<&str> {
-            list.iter().map(String::as_str).collect()
+        let mut rules: Vec<SbplRule<'_>> = Vec::with_capacity(1 + exec_under.len() + reads.len() + writes.len() + MACOS_SYSTEM.len() + 1);
+        rules.push(SbplRule { path: &program, subtree: false, access: SbplAccess::Exec });
+        for folder in &exec_under {
+            rules.push(SbplRule { path: folder, subtree: true, access: SbplAccess::Exec });
         }
-        let (reads, writes, exec_under) = (refs(&reads), refs(&writes), refs(&exec_under));
-        let grant = blaze_build_script::native::Grant { program: &program, exec: &[], read: &reads, write: &writes };
-        let text = blaze_build_script::native::seatbelt_with(&grant, &exec_under, blaze_own::Alloc::global()).map_err(|e| e.to_string())?;
-        Ok(text.as_str().to_owned())
+        for folder in &reads {
+            rules.push(SbplRule { path: folder, subtree: true, access: SbplAccess::Read });
+        }
+        for folder in &writes {
+            rules.push(SbplRule { path: folder, subtree: true, access: SbplAccess::Write });
+        }
+        for system in MACOS_SYSTEM {
+            rules.push(SbplRule { path: system, subtree: true, access: SbplAccess::Read });
+        }
+        rules.push(SbplRule { path: "/dev/null", subtree: false, access: SbplAccess::Write });
+        let mut bytes = render_sbpl(rules.into_iter(), blaze_own::Alloc::global()).map_err(|e| format!("seatbelt profile refused: {e:?}"))?;
+        // Strip the trailing NUL written for C callers.
+        bytes.pop();
+        String::from_utf8(bytes.to_vec()).map_err(|e| format!("seatbelt profile not UTF-8: {e}"))
     }
 }
 

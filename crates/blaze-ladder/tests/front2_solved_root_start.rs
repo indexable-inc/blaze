@@ -76,7 +76,7 @@ fn names_of(implicit: Implicit) -> &'static Names<'static> {
         cfg: &[],
         script: None,
     }];
-    let names = resolve_crates(&crates, Sysroot::default(), &Texts, &Serial, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &Texts, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     Box::leak(Box::new(names))
 }
 
@@ -130,7 +130,7 @@ fn a_rust_root_with_std_starts_through_lang_start() {
     let user = UserCrate { name: "hello", dir: "/hello/", root: "/hello/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names: Names<'_> = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names: Names<'_> = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let start = RootStart::of_names(&names).expect("the names hold crate 0");
     assert_eq!(start, RootStart::LangStart, "an edition-2024 root with std");
     assert_eq!(start.unexported(), Ok(Unhosted::LangStart));

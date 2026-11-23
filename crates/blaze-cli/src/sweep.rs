@@ -880,7 +880,7 @@ impl<'f> Looked<'f> {
                 LeafKind::Slot => {
                     wanted.push((path, row, 0));
                     if old.flags & MODULE != 0 {
-                        let mod_rs = mod_rs_of(path, frame).leak();
+                        let mod_rs = mod_rs_of(path, frame).into_bump_slice();
                         let mod_rs = core::str::from_utf8(mod_rs).map_err(|_| CliError::Text { what: "a module path is not UTF-8" })?;
                         wanted.push((mod_rs, row, 1));
                     }

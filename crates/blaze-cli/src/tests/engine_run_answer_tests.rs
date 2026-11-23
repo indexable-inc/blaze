@@ -309,7 +309,9 @@ fn a_second_command_reads_the_stored_answers_reads_in_place_by_need() {
         let walk = workspace_of(cx, &mut answer, TOOL, &units, None, heap.alloc()).unwrap_or_else(|e| panic!("{e}"));
         let item_of = |check: Name| walk.bodies.iter().find(|body| body.check == check).map(|body| body.item).expect("the body is walked");
         let (good_item, bad_item) = (item_of(good), item_of(bad));
-        let ids = RunIds::new(cx, blaze_toolchain::ToolchainId([7; 32]), &list, &tools, &walk.bodies, &walk.edges, &mut answer, None, Most::USUAL, heap.alloc())
+        let erased = blaze_own::Erased::new(cx.frame());
+        let bump = erased.bump();
+        let ids = RunIds::new(cx, blaze_toolchain::ToolchainId([7; 32]), &list, &tools, &walk.bodies, &walk.edges, &mut answer, None, Most::USUAL, bump)
             .unwrap_or_else(|e| panic!("{e}"));
         drop(answer);
         let asked = Asked::default();
@@ -326,7 +328,7 @@ fn a_second_command_reads_the_stored_answers_reads_in_place_by_need() {
         assert_eq!(asked.bodies(), 1, "control: and its reads were not asked");
         // The table's record, read back: the same id, its proof read from the rows again.
         let bytes = built.write(heap.alloc());
-        let back = RunIds::read(&bytes, heap.alloc()).unwrap_or_else(|e| panic!("{e}"));
+        let back = RunIds::read(&bytes, bump).unwrap_or_else(|e| panic!("{e}"));
         let again = Asked::default();
         let back = back.reading::<ByNeed>(ReadsFrom::new(&rows, &again, Most::USUAL)).unwrap_or_else(|e| panic!("{e}"));
         let id = back.body_check(good_item).expect("the read table has the clean body's id");

@@ -178,7 +178,9 @@ pub fn classify<'n, S: NamesSource<'n>>(resolver: &Paths<S>, module: LibKey, poi
             | lf::TypeRef::Infer
             | lf::TypeRef::For { .. }
             | lf::TypeRef::Pat { .. }
-            | lf::TypeRef::Record(_) => return Ok(Ok(Receiver::Other)),
+            | lf::TypeRef::Record(_)
+            | lf::TypeRef::Union(_)
+            | lf::TypeRef::Fallible { .. } => return Ok(Ok(Receiver::Other)),
         };
         if is_self(v, t)? {
             // `self: Self` is `self`; `Pin<Self>`: `Self` is no pointer.

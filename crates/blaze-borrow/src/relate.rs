@@ -320,17 +320,19 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
     /// against `for<'b, 'c> fn(&'b u8, &'c u8)`): deciding it needs placeholders, so it is
     /// refused by name ([`Refused::HigherRanked`]), never related as if renamed.
     fn bound_pair(&mut self, node: PTy, a: BoundAt, b: BoundAt) -> Result<(), Refused> {
-        for &(x, y) in self.bound[..self.bound_len].iter().flatten() {
-            match (x == a, y == b) {
-                (true, true) => return Ok(()),
-                (false, false) => {}
-                _ => return Err(Refused::HigherRanked { item: self.item, node, binder: a.binder }),
+        if let Some(used) = self.bound.get(..self.bound_len) {
+            for &(x, y) in used.iter().flatten() {
+                match (x == a, y == b) {
+                    (true, true) => return Ok(()),
+                    (false, false) => {}
+                    _ => return Err(Refused::HigherRanked { item: self.item, node, binder: a.binder }),
+                }
             }
         }
-        if self.bound_len >= MOST_BOUND_PAIRS {
+        let Some(slot) = self.bound.get_mut(self.bound_len) else {
             return Err(self.malformed(node, Bad::StepBound));
-        }
-        self.bound[self.bound_len] = Some((a, b));
+        };
+        *slot = Some((a, b));
         self.bound_len += 1;
         Ok(())
     }
@@ -628,7 +630,7 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             Resolved::Unbound { param, .. } => return Err(self.malformed(s.ty, Bad::Unconstrained { index: param })),
         };
         let n = self.node(s)?;
-        let descend = matches!(n, PNode::Ref(..) | PNode::Ptr(..) | PNode::Slice(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Tuple(_) | PNode::Adt(..));
+        let descend = matches!(n, PNode::Ref(..) | PNode::Ptr(..) | PNode::Slice(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Tuple(_) | PNode::Record(_) | PNode::Union(_) | PNode::Adt(..));
         if !descend {
             return Ok(());
         }
@@ -989,7 +991,7 @@ pub fn head_eq(a: PNode, b: PNode) -> bool {
         (PNode::Int(x), PNode::Int(y)) => x == y,
         (PNode::Uint(x), PNode::Uint(y)) => x == y,
         (PNode::Float(x), PNode::Float(y)) => x == y,
-        (PNode::Tuple(_), PNode::Tuple(_)) | (PNode::Slice(_), PNode::Slice(_)) | (PNode::Dynamic(_), PNode::Dynamic(_)) => true,
+        (PNode::Tuple(_), PNode::Tuple(_)) | (PNode::Record(_), PNode::Record(_)) | (PNode::Union(_), PNode::Union(_)) | (PNode::Slice(_), PNode::Slice(_)) | (PNode::Dynamic(_), PNode::Dynamic(_)) => true,
         (PNode::Ref(m, _), PNode::Ref(n, _)) | (PNode::Ptr(m, _), PNode::Ptr(n, _)) => m == n,
         // The length is a const: equal by the type checker.
         (PNode::Array(..), PNode::Array(..)) | (PNode::Pat(..), PNode::Pat(..)) => true,

@@ -48,6 +48,7 @@
 extern crate std;
 
 mod allowed;
+mod autofix;
 pub mod dup;
 mod engine;
 mod fix;
@@ -277,6 +278,28 @@ pub enum Rule {
     /// that trip Blaze's `alloc_global_tests` and `std-alloc-tests` ratchets.
     /// The lint `blaze::test_ambient_leak`.
     TestAmbientLeak = 40,
+    /// `let mut x = ..;` where `x` is never rebound (`x = ..`) and only borrowed uniquely
+    /// (`&uniq x` / `&mut x`); under Blaze's edition `let x` permits `&uniq x` directly and
+    /// `mut` is reserved for local rebinding. The lint `blaze::mut_for_uniq_borrow`.
+    MutForUniqBorrow = 41,
+    /// Borrowed `&Io` / `&mut Io` / `&bstd::io::Io` capability bundle outside `blaze-std` and
+    /// tests: functions and structs should take only the narrow capabilities they actually use
+    /// (`&Out`, `&Fs`, `&Clock`, `&Host`, `&Args`, `CxSpawn`, ...).
+    /// The lint `blaze::io_ref`.
+    IoRef = 42,
+    /// Unused private `use` bindings or redundant braces (`use a::{X, Y};` -> `use a::Y;`,
+    /// `use a::{X};` -> `use a::X;`), with a mechanical fix minimizing imports.
+    /// The lint `blaze::unused_import`.
+    UnusedImport = 43,
+    /// Unnecessary `mut` on a `let mut x = ...;` binding or `fn` parameter that is never mutated,
+    /// with a mechanical fix removing `mut `.
+    /// The lint `blaze::unused_mut`.
+    UnusedMut = 44,
+    /// Calling `.leak()` / `Box::leak` / `Vec::leak` outside process-root initialization: bump
+    /// arenas should use `.into_bump_slice()` / `.into_bump_str()` / `frame.alloc_str()` (backed
+    /// by `BumpAlloc`), and intentional `'static` allocations should use `ProgramArena` or `const`.
+    /// The lint `blaze::heap_leak`.
+    HeapLeak = 45,
 }
 
 impl Rule {
@@ -325,6 +348,11 @@ impl Rule {
         Rule::BoolAsInt,
         Rule::ManualSliceIdioms,
         Rule::TestAmbientLeak,
+        Rule::MutForUniqBorrow,
+        Rule::IoRef,
+        Rule::UnusedImport,
+        Rule::UnusedMut,
+        Rule::HeapLeak,
     ];
 
     /// The ten rules ported from blaze's scripts: what [`Step::Strict`] runs. The rules after
@@ -389,6 +417,11 @@ impl Rule {
             Rule::BoolAsInt => "bool-as-int",
             Rule::ManualSliceIdioms => "manual-slice-idioms",
             Rule::TestAmbientLeak => "test-ambient-leak",
+            Rule::MutForUniqBorrow => "mut-for-uniq-borrow",
+            Rule::IoRef => "io-ref",
+            Rule::UnusedImport => "unused-import",
+            Rule::UnusedMut => "unused-mut",
+            Rule::HeapLeak => "heap-leak",
         }
     }
 
@@ -425,6 +458,11 @@ impl Rule {
             Rule::BoolAsInt => Some("bool_as_int"),
             Rule::ManualSliceIdioms => Some("manual_slice_idioms"),
             Rule::TestAmbientLeak => Some("test_ambient_leak"),
+            Rule::MutForUniqBorrow => Some("mut_for_uniq_borrow"),
+            Rule::IoRef => Some("io_ref"),
+            Rule::UnusedImport => Some("unused_import"),
+            Rule::UnusedMut => Some("unused_mut"),
+            Rule::HeapLeak => Some("heap_leak"),
             _ => None,
         }
     }
@@ -469,7 +507,7 @@ impl Rule {
     pub const fn exempt(self) -> TestBits {
         match self {
             Rule::Allocs => TestBits::CFG,
-            Rule::UnsafeComment | Rule::VariantCount | Rule::MutRef | Rule::TestAmbientLeak => TestBits::NONE,
+            Rule::UnsafeComment | Rule::VariantCount | Rule::MutRef | Rule::TestAmbientLeak | Rule::MutForUniqBorrow | Rule::UnusedImport | Rule::UnusedMut => TestBits::NONE,
             _ => TestBits::ANY,
         }
     }
@@ -669,6 +707,17 @@ pub enum Template {
     TestGlobalAlloc = 360,
     /// `#[cfg(test)] extern crate std;` (trips `std-alloc-tests`).
     TestExternStd = 361,
+    /// `let mut x = ..;` when `x` is never rebound and only uniquely borrowed (`&uniq x`/`&mut x`);
+    /// fixed mechanically by removing `mut`.
+    MutForUniqBorrow = 370,
+    /// Borrowed `&Io` / `&mut Io` / `&bstd::io::Io` capability bundle outside `blaze-std` and tests.
+    IoRef = 380,
+    /// Unused private `use` binding or redundant single-item braced import; argument: name span.
+    UnusedImport = 390,
+    /// Unnecessary `mut` on a `let mut` binding or `fn` parameter; argument: binding name span.
+    UnusedMut = 400,
+    /// `.leak()` / `Box::leak` / `Vec::leak` call outside `Root::leak` and tests.
+    HeapLeak = 410,
 }
 
 impl Template {
@@ -712,6 +761,11 @@ impl Template {
             340 => Rule::BoolAsInt,
             350..=352 => Rule::ManualSliceIdioms,
             360..=361 => Rule::TestAmbientLeak,
+            370 => Rule::MutForUniqBorrow,
+            380 => Rule::IoRef,
+            390 => Rule::UnusedImport,
+            400 => Rule::UnusedMut,
+            410 => Rule::HeapLeak,
             _ => Rule::VariantCount,
         }
     }
@@ -804,6 +858,11 @@ impl Template {
             Template::ManualFindSplit => "manual-find-split",
             Template::TestGlobalAlloc => "test-global-alloc",
             Template::TestExternStd => "test-extern-std",
+            Template::MutForUniqBorrow => "mut-for-uniq-borrow",
+            Template::IoRef => "io-ref",
+            Template::UnusedImport => "unused-import",
+            Template::UnusedMut => "unused-mut",
+            Template::HeapLeak => "heap-leak",
         }
     }
 }
@@ -1366,7 +1425,7 @@ impl Step {
     /// toolchain has.
     pub const SUGGEST: [Rule; 4] = [Rule::UnsafeComment, Rule::Untyped, Rule::Recursion, Rule::VariantCount];
     /// The rules of [`Step::Edition`].
-    pub const EDITION: [Rule; 12] = [
+    pub const EDITION: [Rule; 13] = [
         Rule::UnsafeComment,
         Rule::Untyped,
         Rule::Recursion,
@@ -1379,6 +1438,7 @@ impl Step {
         Rule::BoolAsInt,
         Rule::ManualSliceIdioms,
         Rule::TestAmbientLeak,
+        Rule::MutForUniqBorrow,
     ];
 
     /// The step as configuration writes it (`rust`, `suggest`, `edition`, `strict`).
@@ -1617,6 +1677,89 @@ pub fn lint_own_in<'a>(
 ) -> Result<Linted<'a>, LintError> {
     let mut scratch = Scratch::new_in(alloc);
     lint_own_with(rules, own, scope, at, variants, &mut scratch, out)
+}
+
+/// Runs [`Rule::UnusedImport`] over top-level `use` statements in `full_text` (a whole file),
+/// pushing findings and mechanical fixes into `out`. Separate from [`lint`] because top-level
+/// `use` statements are their own outline items whose references live in sibling items.
+pub fn lint_file_imports<'a>(
+    full_text: &str,
+    scope: Scope,
+    alloc: Alloc<'a>,
+    out: &mut Findings<'a>,
+) -> Result<Run, LintError> {
+    let mut scratch = Scratch::new_in(alloc);
+    let done = engine::run_file_imports(full_text, scope, &mut scratch, out)?;
+    Ok(done.findings)
+}
+
+/// Runs [`Rule::UnusedImport`] over top-level `use` statements in `full_text` and appends those
+/// whose range lies inside `base..end` (a leaf `use` unit with no holes) into `out`, subtracting
+/// `base` so every finding/arg span is unit-relative.
+pub fn unused_imports_for_range<'a>(
+    full_text: &str,
+    scope: Scope,
+    base: u32,
+    end: u32,
+    alloc: Alloc<'a>,
+    out: &mut Findings<'a>,
+    linted: &mut Linted<'a>,
+) -> Result<(), LintError> {
+    let mut scratch = Scratch::new_in(alloc);
+    let mut temp = Findings::new_in(alloc);
+    let done = engine::run_file_imports(full_text, scope, &mut scratch, &mut temp)?;
+    linted.cost.add_all(&done.cost);
+    let map_span = |s: Span| -> Option<Span> {
+        if s.start < base || s.end > end {
+            return None;
+        }
+        Some(Span::new(s.start - base, s.end - base))
+    };
+    for finding in temp.list.iter() {
+        let Some(range) = map_span(finding.range) else { continue };
+        let args_from = count(out.args.len())?;
+        for arg in temp.args_of(finding) {
+            match *arg {
+                Arg::Span(span) => {
+                    if let Some(mapped) = map_span(span) {
+                        out.args.push(Arg::Span(mapped));
+                    }
+                }
+                Arg::Int(v) => out.args.push(Arg::Int(v)),
+                Arg::Text(run) => {
+                    let from = count(out.text.len())?;
+                    out.text.extend_from_slice(temp.text_in(run).as_bytes());
+                    let to = count(out.text.len())?;
+                    out.args.push(Arg::Text(Run { from, to }));
+                }
+            }
+        }
+        let args = Run { from: args_from, to: count(out.args.len())? };
+        let fixes_from = count(out.fixes.len())?;
+        for fix in temp.fixes_of(finding) {
+            let edits_from = count(out.edits.len())?;
+            let mut ok = true;
+            for edit in temp.edits_of(fix) {
+                // Clamp line-delete trailing newline to unit end in unit-local storage;
+                // file-level `--fix` reconstructs the full-file edit directly.
+                let clamped = Span::new(edit.range.start.max(base), edit.range.end.min(end));
+                match map_span(clamped) {
+                    Some(mapped) => out.push_edit(mapped, temp.text_of(edit))?,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                out.fixes.push(Fix { edits: Run { from: edits_from, to: count(out.edits.len())? } });
+            }
+        }
+        let fixes = Run { from: fixes_from, to: count(out.fixes.len())? };
+        out.list.push(Finding { template: finding.template, range, args, fixes });
+    }
+    linted.findings.to = count(out.list.len())?;
+    Ok(())
 }
 
 /// The tokens of a whole text, counted: what the floor of a lint pass over it is (one lex). The

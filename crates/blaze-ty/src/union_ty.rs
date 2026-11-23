@@ -107,6 +107,8 @@ pub enum UnionError {
     RefCannotWiden,
     /// Queried or narrowed member is not present in this union.
     UnknownMember { key: Ty },
+    /// A `match` arm matched a union member that was already covered by an earlier arm.
+    RedundantArm { key: Ty },
     /// User-written `impl` blocks (inherent or trait) on a union type are forbidden.
     ImplForbidden,
     /// Unannotated heterogeneous branches (`if c { 1u8 } else { "x" }`) do not implicitly infer a
@@ -760,6 +762,60 @@ impl<'a> UnionTy<'a> {
         self.narrow_remove_key(key, alloc)
     }
 
+    /// Narrows `self` by removing a sequence of matched member arms (`U \ {M1, M2, ...}`),
+    /// returning the exact residual type for a catch-all / propagation arm (`Err(other) => return Err(other)`).
+    ///
+    /// Rejects arms not present in `self` with [`UnionError::UnknownMember`] and duplicate arms
+    /// with [`UnionError::RedundantArm`].
+    pub fn narrow_remove_many(
+        &self,
+        cx: &mut TyCx<'_>,
+        matched: &[Ty],
+        alloc: Alloc<'a>,
+    ) -> Result<NarrowResult<'a>, UnionError> {
+        let mut removed: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(self.members.len(), alloc);
+        removed.resize(self.members.len(), false);
+        let mut remaining = self.members.len();
+
+        for &ty in matched {
+            let key = erase_regions(cx, ty, alloc);
+            let pos = self
+                .members
+                .binary_search_by_key(&key, |m| m.key)
+                .map_err(|_| UnionError::UnknownMember { key })?;
+            if let Some(slot) = removed.get_mut(pos) {
+                if *slot {
+                    return Err(UnionError::RedundantArm { key });
+                }
+                *slot = true;
+                remaining = remaining.saturating_sub(1);
+            }
+        }
+
+        match remaining {
+            0 => Ok(NarrowResult::Empty),
+            1 => {
+                for (m, &is_rm) in self.members.iter().zip(removed.iter()) {
+                    if !is_rm {
+                        return Ok(NarrowResult::Single(m.ty));
+                    }
+                }
+                Ok(NarrowResult::Empty)
+            }
+            _ => {
+                let mut members = Vec::with_capacity_in(remaining, alloc);
+                for (m, &is_rm) in self.members.iter().zip(removed.iter()) {
+                    if !is_rm {
+                        members.push(*m);
+                    }
+                }
+                let mut disjoint_bounds = Vec::with_capacity_in(self.disjoint_bounds.len(), alloc);
+                disjoint_bounds.extend_from_slice(&self.disjoint_bounds);
+                Ok(NarrowResult::Union(UnionTy { members, disjoint_bounds }))
+            }
+        }
+    }
+
     /// Computes the optimal local-tag layout for this union given `(size, align, niche)` for each
     /// member key.
     ///
@@ -899,6 +955,131 @@ impl<'a> UnionTy<'a> {
     #[inline]
     pub const fn check_impl_allowed(&self) -> Result<(), UnionError> {
         check_impl_allowed()
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Monomorphization-time generic unions (`E | Timeout`) & inferred private error sets (`Result<T, _>`)
+// -------------------------------------------------------------------------------------------------
+
+/// Substituted form of one member during [`ParametricUnionTy::instantiate`].
+#[derive(Clone, Copy, Debug)]
+pub enum InstMember<'s> {
+    /// Substitutes to a single type (including `!`, which is dropped as union identity).
+    Single(Ty),
+    /// Substitutes to a nested union whose concrete members flatten into the enclosing union.
+    Flatten(&'s [Ty]),
+}
+
+/// An unnormalized parametric union (`E | Timeout`, `A | B`) that may contain unconstrained type
+/// parameters and normalizes, flattens, and deduplicates at monomorphization time.
+#[derive(Debug)]
+pub struct ParametricUnionTy<'a> {
+    members: Vec<Ty, Alloc<'a>>,
+}
+
+impl<'a> ParametricUnionTy<'a> {
+    /// Constructs a parametric union from raw member types (preserving type parameters without
+    /// requiring `T != U` bounds up front; `!` is dropped immediately).
+    pub fn from_members(raw: &[Ty], alloc: Alloc<'a>) -> Self {
+        let mut members = Vec::with_capacity_in(raw.len(), alloc);
+        for &ty in raw {
+            if ty != Ty::NEVER {
+                members.push(ty);
+            }
+        }
+        Self { members }
+    }
+
+    /// Raw parametric members before instantiation.
+    #[inline]
+    pub fn members(&self) -> &[Ty] {
+        &self.members
+    }
+
+    /// Instantiates this parametric union at monomorphization time: substitutes every member,
+    /// flattens nested unions, drops `!`, deduplicates identical lifetime-erased keys, and
+    /// collapses 0 -> [`NarrowResult::Empty`], 1 -> [`NarrowResult::Single`], or 2+ -> [`NarrowResult::Union`].
+    pub fn instantiate<'b, 's>(
+        &self,
+        cx: &mut TyCx<'_>,
+        mut subst: impl FnMut(Ty) -> InstMember<'s>,
+        alloc: Alloc<'b>,
+    ) -> Result<NarrowResult<'b>, UnionError> {
+        let mut flat = Vec::with_capacity_in(self.members.len(), alloc);
+        for &m in self.members.iter() {
+            match subst(m) {
+                InstMember::Single(ty) => {
+                    if ty != Ty::NEVER {
+                        flat.push(ty);
+                    }
+                }
+                InstMember::Flatten(nested) => {
+                    for &nt in nested {
+                        if nt != Ty::NEVER {
+                            flat.push(nt);
+                        }
+                    }
+                }
+            }
+        }
+        let u = UnionTy::from_members(cx, &flat, alloc)?;
+        match u.members.len() {
+            0 => Ok(NarrowResult::Empty),
+            1 => match u.members.first() {
+                Some(sole) => Ok(NarrowResult::Single(sole.ty)),
+                None => Ok(NarrowResult::Empty),
+            },
+            _ => Ok(NarrowResult::Union(u)),
+        }
+    }
+}
+
+/// Accumulates error types returned by `?` / `Err(...)` / `return` sites in a private function
+/// whose signature writes `Result<T, _>` ("infer inside, declare at the border").
+#[derive(Debug)]
+pub struct ErrorSetInfer<'a> {
+    collected: Vec<Ty, Alloc<'a>>,
+}
+
+impl<'a> ErrorSetInfer<'a> {
+    /// Creates an empty error-set inference accumulator.
+    pub fn new(alloc: Alloc<'a>) -> Self {
+        Self { collected: Vec::new_in(alloc) }
+    }
+
+    /// Records a single error type produced by an expression (`?`, `Err(e)`).
+    pub fn record_member(&mut self, ty: Ty) {
+        if ty != Ty::NEVER {
+            self.collected.push(ty);
+        }
+    }
+
+    /// Records every member of a nested union error returned from a callee (`?` on a union).
+    pub fn record_union(&mut self, u: &UnionTy<'_>) {
+        for m in u.members() {
+            if m.ty != Ty::NEVER {
+                self.collected.push(m.ty);
+            }
+        }
+    }
+
+    /// Finalizes the inferred error set into `!` (`Empty`), a single error type (`Single`), or
+    /// the minimal canonical [`UnionTy`].
+    pub fn finish<'b>(
+        &self,
+        cx: &mut TyCx<'_>,
+        alloc: Alloc<'b>,
+    ) -> Result<NarrowResult<'b>, UnionError> {
+        let u = UnionTy::from_members(cx, &self.collected, alloc)?;
+        match u.members.len() {
+            0 => Ok(NarrowResult::Empty),
+            1 => match u.members.first() {
+                Some(sole) => Ok(NarrowResult::Single(sole.ty)),
+                None => Ok(NarrowResult::Empty),
+            },
+            _ => Ok(NarrowResult::Union(u)),
+        }
     }
 }
 
@@ -1231,5 +1412,87 @@ mod tests {
                 rhs_tag: annotated.tag_of(&mut cx, str_ref, alloc),
             }
         );
+    }
+
+    #[test]
+    fn residual_narrowing_parametric_monomorphization_inferred_set_and_20_members() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut cx = TyCx::new_in(alloc);
+
+        let io_err = cx.tys.adt(Def(10), List::EMPTY);
+        let parse_err = cx.tys.adt(Def(11), List::EMPTY);
+        let timeout_err = cx.tys.adt(Def(12), List::EMPTY);
+        let stopped_err = cx.tys.adt(Def(13), List::EMPTY);
+        let param_e = cx.tys.param(0);
+
+        // 1. Multi-member residual narrowing: handle Io + Parse, forward remaining `Timeout | Stopped`.
+        let u4 = UnionTy::from_members(&mut cx, &[io_err, parse_err, timeout_err, stopped_err], alloc).unwrap();
+        let NarrowResult::Union(residual) =
+            u4.narrow_remove_many(&mut cx, &[io_err, parse_err], alloc).unwrap()
+        else {
+            panic!("expected 2-member residual union");
+        };
+        let caller_ret = UnionTy::from_members(&mut cx, &[timeout_err, stopped_err], alloc).unwrap();
+        assert!(residual.eq_canonical(&caller_ret));
+        assert!(residual.can_widen(&caller_ret).is_ok());
+
+        // Redundant arm is rejected.
+        assert_eq!(
+            u4.narrow_remove_many(&mut cx, &[io_err, io_err], alloc).unwrap_err(),
+            UnionError::RedundantArm { key: io_err }
+        );
+
+        // 2. Parametric union `E | Timeout` instantiated at monomorphization time:
+        let poly = ParametricUnionTy::from_members(&[param_e, timeout_err], alloc);
+        // 2a. E = Timeout -> collapses to Single(Timeout)!
+        let NarrowResult::Single(collapsed) = poly
+            .instantiate(
+                &mut cx,
+                |t| if t == param_e { InstMember::Single(timeout_err) } else { InstMember::Single(t) },
+                alloc,
+            )
+            .unwrap()
+        else {
+            panic!("expected Single(Timeout)");
+        };
+        assert_eq!(collapsed, timeout_err);
+
+        // 2b. E = (Io | Parse) -> flattens into `Io | Parse | Timeout`!
+        let inner = [io_err, parse_err];
+        let NarrowResult::Union(flattened) = poly
+            .instantiate(
+                &mut cx,
+                |t| if t == param_e { InstMember::Flatten(&inner) } else { InstMember::Single(t) },
+                alloc,
+            )
+            .unwrap()
+        else {
+            panic!("expected 3-member flattened union");
+        };
+        let expected_flat = UnionTy::from_members(&mut cx, &[io_err, parse_err, timeout_err], alloc).unwrap();
+        assert!(flattened.eq_canonical(&expected_flat));
+
+        // 3. Inferred private error set (`Result<T, _>`):
+        let mut infer = ErrorSetInfer::new(alloc);
+        infer.record_member(io_err);
+        infer.record_union(&caller_ret);
+        infer.record_member(io_err); // duplicate collapsed
+        let NarrowResult::Union(inferred) = infer.finish(&mut cx, alloc).unwrap() else {
+            panic!("expected 3-member inferred error set");
+        };
+        let expected_inf = UnionTy::from_members(&mut cx, &[io_err, timeout_err, stopped_err], alloc).unwrap();
+        assert!(inferred.eq_canonical(&expected_inf));
+
+        // 4. Arbitrary arity (> 12 members): 20-member union with u8 local tag & widening.
+        let mut twenty = Vec::with_capacity_in(20, alloc);
+        for d in 100..120u32 {
+            twenty.push(cx.tys.adt(Def(d), List::EMPTY));
+        }
+        let u20 = UnionTy::from_members(&mut cx, &twenty, alloc).unwrap();
+        assert_eq!(u20.len(), 20);
+        assert_eq!(u20.local_tag_bytes(), 1);
+        let sub = UnionTy::from_members(&mut cx, &[twenty[3], twenty[17]], alloc).unwrap();
+        let tag_map = sub.widen_tag_map(&u20, alloc).unwrap();
+        assert_eq!(tag_map.as_slice(), &[3, 17]);
     }
 }

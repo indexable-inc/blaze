@@ -126,6 +126,17 @@ pub enum GitRef<'a> {
     Rev(Text<'a>),
 }
 
+impl<'a> GitRef<'a> {
+    pub(super) fn clone_in(&self, alloc: Alloc<'a>) -> GitRef<'a> {
+        match self {
+            GitRef::DefaultBranch => GitRef::DefaultBranch,
+            GitRef::Branch(s) => GitRef::Branch(s.clone_in(alloc)),
+            GitRef::Tag(s) => GitRef::Tag(s.clone_in(alloc)),
+            GitRef::Rev(s) => GitRef::Rev(s.clone_in(alloc)),
+        }
+    }
+}
+
 /// One dependency as written.
 pub(super) struct RawDep<'a> {
     pub key: Text<'a>,

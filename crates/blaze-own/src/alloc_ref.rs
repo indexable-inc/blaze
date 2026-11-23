@@ -98,6 +98,24 @@ impl fmt::Debug for Header {
 /// [`Header::of::<Self>()`](Header::of), never changed while a handle to the value exists.
 pub unsafe trait Headed: Allocator {}
 
+/// A bump/arena allocator whose allocations are reclaimed in bulk when the arena itself drops or
+/// resets (such as `&Frame`, `&Inline<N>`, or `ArenaLocal<'_>`).
+///
+/// Containers backed by a [`BumpAlloc`] can freeze their backing storage into an arena-lifetime
+/// slice or reference ([`crate::Vec::into_bump_slice`], [`crate::String::into_bump_str`],
+/// [`crate::Box::into_bump_ref`]) without leaking memory. General-purpose and global allocators
+/// (`Global`, `Heap`, `Alloc`, `Root`) must **never** implement this trait.
+///
+/// # Safety
+///
+/// Allocations handed out by `Self` stay live for as long as `Self` can be named (`Self: 'a`),
+/// and forgetting a container handle backed by `Self` does not leak memory beyond the arena's own
+/// lifetime (the arena reclaims its storage in bulk on drop/reset).
+pub unsafe trait BumpAlloc: Allocator {}
+
+// SAFETY: delegating through a shared reference preserves the arena's bulk-reclamation contract.
+unsafe impl<A: BumpAlloc + ?Sized> BumpAlloc for &A {}
+
 /// The table of a [`Headed`] type's entries (a private trait, so no type can name another).
 trait Entries {
     const TABLE: &'static Table;
@@ -465,6 +483,108 @@ unsafe impl Allocator for SharedAlloc<'_> {
 // SAFETY: as `Alloc`'s: a copy is the same allocator.
 unsafe impl AllocatorClone for SharedAlloc<'_> {}
 
+/// One-word handle to a [`BumpAlloc`] arena (`&Frame`, `&Inline`, `ArenaLocal`): the bump-arena
+/// counterpart to [`SharedAlloc`].
+///
+/// Constructible only from a [`BumpAlloc`] (`Bump::of` or `Erased::new(frame).bump()`), never
+/// from `Global` or `Heap`. Containers backed by `Bump<'a>` can freeze into arena-lifetime
+/// slices/references via [`crate::Vec::into_bump_slice`], [`crate::String::into_bump_str`], and
+/// [`crate::Box::into_bump_ref`] with compile-time proof that memory is reclaimed in bulk when the
+/// arena drops.
+#[derive(Clone, Copy)]
+pub struct Bump<'a> {
+    alloc: Alloc<'a>,
+}
+
+impl<'a> Bump<'a> {
+    /// The handle of a [`BumpAlloc`] that carries its own header.
+    #[inline]
+    pub fn of<T: Headed + BumpAlloc>(allocator: &'a T) -> Bump<'a> {
+        Bump { alloc: Alloc::of(allocator) }
+    }
+
+    /// Upcasts to a general [`Alloc<'a>`] for functions that do not require arena freezing.
+    #[inline]
+    pub fn alloc(self) -> Alloc<'a> {
+        self.alloc
+    }
+
+    /// Moves `value` into this bump arena, returning a `&'a mut T` reclaimed when the arena drops.
+    #[inline]
+    pub fn alloc_val<T>(self, value: T) -> &'a mut T {
+        crate::Box::into_bump_ref(crate::Box::new_in(value, self))
+    }
+
+    /// Copies `values` into this bump arena, returning a slice reclaimed when the arena drops.
+    #[inline]
+    pub fn alloc_slice_copy<T: Copy>(self, values: &[T]) -> &'a mut [T] {
+        crate::Vec::from_slice_in(values, self).into_bump_slice()
+    }
+
+    /// Copies `text` into this bump arena, returning a `&'a mut str` reclaimed when the arena drops.
+    #[inline]
+    pub fn alloc_str(self, text: &str) -> &'a mut str {
+        crate::String::from_str_in(text, self).into_bump_str()
+    }
+}
+
+impl<'a> From<Bump<'a>> for Alloc<'a> {
+    #[inline]
+    fn from(bump: Bump<'a>) -> Alloc<'a> {
+        bump.alloc
+    }
+}
+
+impl fmt::Debug for Bump<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Bump").field(&self.alloc.header).finish()
+    }
+}
+
+// SAFETY: every method forwards to the inner `Alloc`'s handle, whose contract it preserves.
+unsafe impl Allocator for Bump<'_> {
+    #[inline]
+    fn allocate(&self, layout: Layout) -> Grant {
+        self.alloc.allocate(layout)
+    }
+
+    #[inline]
+    fn allocate_zeroed(&self, layout: Layout) -> Grant {
+        self.alloc.allocate_zeroed(layout)
+    }
+
+    #[inline]
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        // SAFETY: the caller's contract, passed on.
+        unsafe { self.alloc.deallocate(ptr, layout) }
+    }
+
+    #[inline]
+    unsafe fn grow(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Grant {
+        // SAFETY: the caller's contract, passed on.
+        unsafe { self.alloc.grow(ptr, old, new) }
+    }
+
+    #[inline]
+    unsafe fn grow_zeroed(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Grant {
+        // SAFETY: the caller's contract, passed on.
+        unsafe { self.alloc.grow_zeroed(ptr, old, new) }
+    }
+
+    #[inline]
+    unsafe fn shrink(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Grant {
+        // SAFETY: the caller's contract, passed on.
+        unsafe { self.alloc.shrink(ptr, old, new) }
+    }
+}
+
+// SAFETY: as `Alloc`'s: a copy is the same allocator.
+unsafe impl AllocatorClone for Bump<'_> {}
+
+// SAFETY: `Bump` is only constructed from a `T: BumpAlloc` (`Bump::of`), so its backing arena
+// reclaims all allocations in bulk on drop/reset.
+unsafe impl BumpAlloc for Bump<'_> {}
+
 /// Any allocator with a [`Header`] before it, so it hands out [`Alloc`] handles:
 /// `Erased::new(&frame).handle()`, `Erased::new(&counting).handle()`.
 #[repr(C)]
@@ -526,6 +646,22 @@ impl<A: Allocator> Erased<A> {
         SharedAlloc::of(self)
     }
 
+    /// A [`Bump`] handle when `A` is a bulk-reclaimed [`BumpAlloc`] arena (`&Frame`, `&Inline`,
+    /// `ArenaLocal`); does not compile for `Global` or `Heap`:
+    ///
+    /// ```compile_fail,E0277
+    /// #![feature(allocator_api)]
+    /// let erased = blaze_own::Erased::new(std::alloc::Global);
+    /// let _ = erased.bump();
+    /// ```
+    #[inline]
+    pub fn bump(&self) -> Bump<'_>
+    where
+        A: BumpAlloc,
+    {
+        Bump::of(self)
+    }
+
     pub fn inner(&self) -> &A {
         &self.inner
     }
@@ -581,6 +717,17 @@ unsafe impl<A: Allocator> Allocator for Erased<A> {
 // SAFETY: `#[repr(C)]`, the header first, made by `Header::of::<Erased<A>>()` in `new`, the only
 // constructor, and never written after (the field is private).
 unsafe impl<A: Allocator> Headed for Erased<A> {}
+
+// SAFETY: `Erased<A>` delegates every allocation directly to `A`; when `A: BumpAlloc`, bulk
+// reclamation holds identically.
+unsafe impl<A: BumpAlloc> BumpAlloc for Erased<A> {}
+
+/// A [`Vec`] over a [`Bump`] arena handle.
+pub type BVec<'a, T> = Vec<T, Bump<'a>>;
+/// A [`String`] over a [`Bump`] arena handle.
+pub type BString<'a> = String<Bump<'a>>;
+/// A [`Box`] over a [`Bump`] arena handle.
+pub type BBox<'a, T> = Box<T, Bump<'a>>;
 
 /// A [`Vec`] over the handle.
 pub type AVec<'a, T> = Vec<T, Alloc<'a>>;

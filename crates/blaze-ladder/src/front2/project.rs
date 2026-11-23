@@ -227,7 +227,8 @@ impl<'n> ProjectWorld<'n> {
         let front = Front2::new(names, frame, user, alloc)?;
         let mut store = Store::new(front.index.lang("sized"), frame, alloc);
         store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
-        Ok(ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(alloc), alloc, by_chain: None })
+        let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
+        Ok(ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(bump), alloc, by_chain: None })
     }
 }
 
@@ -240,7 +241,8 @@ impl<'n> ProjectWorld<'n, &'n source::Records<'n>> {
         let front = Front2::from_records(records, frame, lang_crates)?;
         let mut store = Store::new(front.index.lang("sized"), frame, alloc);
         store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
-        Ok(ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(alloc), alloc, by_chain: None })
+        let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
+        Ok(ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(bump), alloc, by_chain: None })
     }
 }
 
@@ -259,7 +261,8 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
     pub fn over(front: Front2<'n, S>, alloc: Alloc<'static>) -> ProjectWorld<'n, S> {
         let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
         store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
-        ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(alloc), alloc, by_chain: None }
+        let bump = front.frame.alloc(blaze_own::Erased::new(front.frame)).bump();
+        ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(bump), alloc, by_chain: None }
     }
 
     /// The meter the checks file their parts in (front2 tables/cost.rs): a measurement only.

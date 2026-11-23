@@ -976,6 +976,10 @@ impl Drop for Frame {
 // live `&Frame` an allocation borrows allows; growing commits a span further, never moving it.
 // `deallocate` and `shrink` only move the cursor back over the top block, never touching
 // another.
+// SAFETY: `Frame` is a bump arena whose allocations stay live until the frame resets or drops,
+// reclaiming all storage in bulk; forgetting a container handle never leaks memory past the frame.
+unsafe impl blaze_own::BumpAlloc for Frame {}
+
 unsafe impl Allocator for Frame {
     #[inline]
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {

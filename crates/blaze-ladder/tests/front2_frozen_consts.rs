@@ -34,7 +34,7 @@ fn frozen_a(text: &str, evaluate: bool) -> Result<(ContentId, u128), String> {
     let user = UserCrate { name: "consts", dir: "/consts/", root: "/consts/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
     let front = Front2::new(&names, &frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
@@ -43,7 +43,7 @@ fn frozen_a(text: &str, evaluate: bool) -> Result<(ContentId, u128), String> {
         found.whole(1).unwrap_or_else(|| panic!("`{n}` not named")).key
     };
     let (a, n) = (key_of(Namespace::Types, "A"), key_of(Namespace::Values, "N"));
-    let prepared = Prepares::new_in(alloc);
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut evaluator = StoreConsts { names: &names, index: &front.index, prepared };
     let consts: Option<&mut dyn blaze_ladder::front2::tables::head::ConstValues<'_>> = if evaluate { Some(&mut evaluator) } else { None };
     let mut source = SeededHeads::new(SeededHeadsOpts { names: &names, sized: front.index.lang("sized"), pointers: blaze_ladder::front2::receiver::Pointers::NOT_LOOKED_UP, frame: &frame, scratch: alloc, alloc, consts, known: None, owners: None });

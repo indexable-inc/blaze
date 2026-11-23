@@ -357,7 +357,7 @@ impl<'f> Records<'f> for SourcesDir<'f> {
         // `SourceError`), named by its package and key: the same answer a missing one gets.
         let mapping = blaze_core::Mapping::map_file(std::path::Path::new(&path)).ok()?;
         // Kept for the command: the view over its bytes is read by every later job.
-        let mapping: &'f blaze_core::Mapping = blaze_own::Box::leak(blaze_own::Box::new_in(mapping, self.frame));
+        let mapping: &'f blaze_core::Mapping = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(mapping, self.frame));
         Some(mapping.bytes())
     }
 }
@@ -393,7 +393,7 @@ impl blaze_world::lib_features_record::FeatureRecords for CommandFeatures<'_, '_
 
 /// `bytes` copied into `frame`, held as long as it is.
 fn held_bytes<'f>(bytes: &[u8], frame: &'f Frame) -> &'f [u8] {
-    blaze_own::Vec::from_slice_in(bytes, frame).leak()
+    frame.alloc_slice_copy(bytes)
 }
 
 /// Words held in `frame`.
@@ -428,7 +428,7 @@ impl<'f> Scripts<'f> {
         for (id, dir) in listed.iter() {
             held.push((*id, crate::work::held_str(dir.as_str(), frame)));
         }
-        let members: &'f [(LockId, &'f str)] = held.leak();
+        let members: &'f [(LockId, &'f str)] = held.into_bump_slice();
         // The process's heap, handed from `main` (`FetchEnv::heap`), never the request's frame:
         // the sources' lookup lays out a package's manifests on each call and frees them when it
         // returns (blaze-unit-graph `StoreSources::locate`). In the request's bump frame, which
@@ -514,7 +514,7 @@ impl<'f> Scripts<'f> {
         // drops.
         let native: Result<NativeSetting<'f>, &'f str> = match native {
             Ok(run) => {
-                let run: &'f blaze_proc_macro::native_setting::NativeRun<'f> = blaze_own::Box::leak(blaze_own::Box::new_in(run, frame));
+                let run: &'f blaze_proc_macro::native_setting::NativeRun<'f> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(run, frame));
                 Ok(run.setting())
             }
             Err(blaze_world::script_setting::NativeRefused::Caller(words)) => Err(words),
@@ -524,7 +524,7 @@ impl<'f> Scripts<'f> {
         // resolved again here.
         let checkout = env.served.within(frame);
         let no_sdk = env.sdk.is_err();
-        let shared: &'f Shared<'f> = blaze_own::Box::leak(blaze_own::Box::new_in(Shared { result_alloc: env.heap.shared(), runtime, store, checkout, table, macro_table, spawn, native, no_sdk, graph_record }, frame));
+        let shared: &'f Shared<'f> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(Shared { result_alloc: env.heap.shared(), runtime, store, checkout, table, macro_table, spawn, native, no_sdk, graph_record }, frame));
         Ok(shared)
     }
 
@@ -772,7 +772,7 @@ pub(crate) fn job<'f: 'j, 'j>(
     for (name, value) in row.input.cfg.iter() {
         cfg.push((crate::work::held_str(name, jobs), value.map(|value| crate::work::held_str(value, jobs))));
     }
-    let cfg: &'j [(&'j str, Option<&'j str>)] = cfg.leak();
+    let cfg: &'j [(&'j str, Option<&'j str>)] = cfg.into_bump_slice();
     // Copied out of `scripts`, which the sources' lookup below borrows mutably.
     let (graph, members, lock) = (scripts.graph, scripts.members, scripts.lock);
     let unit = &graph.units[script.index()];
@@ -823,7 +823,7 @@ pub(crate) fn job<'f: 'j, 'j>(
         Ok(shared) => shared,
         Err(words) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{words}")), hole: true }),
     };
-    Ok(Prepared::Ready(ScriptJob { name: task.name, shared, script, side, cfg, files, producers: producers.leak(), checkout: CheckoutReads::Hole }))
+    Ok(Prepared::Ready(ScriptJob { name: task.name, shared, script, side, cfg, files, producers: producers.into_bump_slice(), checkout: CheckoutReads::Hole }))
 }
 
 /// What a script's run gave on its worker, in `Global` (its task frame ends with it): the

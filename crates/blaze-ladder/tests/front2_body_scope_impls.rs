@@ -98,6 +98,7 @@ impl Par for Bodies {
 #[test]
 fn the_impl_table_is_the_same_under_both_strategies() {
     let alloc = blaze_own::testing::heap().alloc();
+    let bump = blaze_own::testing::bump();
     let home = std::env::var("HOME").expect("HOME is set");
     let shelf = format!("{home}/.blaze/v2/toolchain");
     let tc: &'static Toolchain = Box::leak(Box::new(Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"))));
@@ -109,20 +110,20 @@ fn the_impl_table_is_the_same_under_both_strategies() {
     let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(u32::try_from(i).expect("few crates")));
     let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd") };
     let texts = &inputs.texts;
-    let modules: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates under Modules: {e}"))));
-    let bodies: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Bodies, alloc).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"))));
+    let modules: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates under Modules: {e}"))));
+    let bodies: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Bodies, bump).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"))));
     let (c_mod, c_bod) = (modules.crates()[0], bodies.crates()[0]);
 
     // Every held body solved as its own; a refusal is a verdict, never skipped.
     let deps = BodyDeps::of_names(bodies, 0, alloc);
-    let prepares = Prepares::new_in(alloc);
+    let prepares = Prepares::new_in(bump);
     let mut scopes: AVec<'static, BodyScope<'static>> = AVec::new_in(alloc);
     let mut refused = Vec::new();
     let mut deterministic = true;
     for held in c_bod.bodies.iter() {
-        match body_scope(c_bod, &deps, &crates[0], 0, *held, texts, prepares, alloc) {
+        match body_scope(c_bod, &deps, &crates[0], 0, *held, texts, prepares, bump) {
             Ok(scope) => {
-                let again = body_scope(c_bod, &deps, &crates[0], 0, *held, texts, prepares, alloc).unwrap_or_else(|e| panic!("body_scope again: {e}"));
+                let again = body_scope(c_bod, &deps, &crates[0], 0, *held, texts, prepares, bump).unwrap_or_else(|e| panic!("body_scope again: {e}"));
                 let (one, two) = (scope.write(alloc).unwrap_or_else(|e| panic!("write: {e:?}")), again.write(alloc).unwrap_or_else(|e| panic!("write again: {e:?}")));
                 deterministic &= one.as_slice() == two.as_slice() && scope.key == again.key;
                 scopes.push(scope);
@@ -181,7 +182,7 @@ fn the_impl_table_is_the_same_under_both_strategies() {
     let mut round_trips = 0usize;
     let mut first_bytes: Option<&'static [u8]> = None;
     for s in scopes.iter() {
-        let bytes = blaze_scope::resolve::aligned(&s.write(alloc).unwrap_or_else(|e| panic!("write: {e:?}")), alloc);
+        let bytes = blaze_scope::resolve::aligned(&s.write(alloc).unwrap_or_else(|e| panic!("write: {e:?}")), bump);
         let view = BodyScopeView::read(bytes, alloc).unwrap_or_else(|e| panic!("a written body scope reads back: {e}"));
         assert_eq!(s.differs_from(&view), None, "a body scope read back answers as its builder");
         round_trips += 1;
@@ -192,7 +193,7 @@ fn the_impl_table_is_the_same_under_both_strategies() {
     let short = BodyScopeView::read(&first[..first.len() - 1], alloc).err();
     let mut old = first.to_vec();
     old[4..8].copy_from_slice(&1u32.to_le_bytes());
-    let old_version = BodyScopeView::read(blaze_scope::resolve::aligned(&old, alloc), alloc).err();
+    let old_version = BodyScopeView::read(blaze_scope::resolve::aligned(&old, bump), alloc).err();
     println!("impls records: {round_trips} read back equal; control: another body's {other:?}, cut short {short:?}, version 1 {old_version:?}");
     if scopes.len() > 1 {
         assert!(matches!(other, Some(Ok(Some(_)))), "another body's record must differ, or the round trip proves nothing");
@@ -287,7 +288,7 @@ impl<'t> SourceTexts<'t> for Unplaced<'t> {
 /// `text` as the user crate over the installed toolchain, its names solved under both
 /// strategies: (crates, the `Modules` names, the `Bodies` names, the texts).
 fn both_strategies(text: &'static str) -> (&'static [CrateInput<'static>], &'static Names<'static>, &'static Names<'static>, &'static blaze_ladder::crates::Texts<'static>) {
-    let alloc = blaze_own::testing::heap().alloc();
+    let bump = blaze_own::testing::bump();
     let home = std::env::var("HOME").expect("HOME is set");
     let shelf = format!("{home}/.blaze/v2/toolchain");
     let tc: &'static Toolchain = Box::leak(Box::new(Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"))));
@@ -299,25 +300,26 @@ fn both_strategies(text: &'static str) -> (&'static [CrateInput<'static>], &'sta
     let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(u32::try_from(i).expect("few crates")));
     let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd") };
     let texts = &inputs.texts;
-    let modules: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates under Modules: {e}"))));
-    let bodies: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Bodies, alloc).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"))));
+    let modules: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates under Modules: {e}"))));
+    let bodies: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Bodies, bump).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"))));
     (crates, modules, bodies, texts)
 }
 
 #[test]
 fn a_body_s_globs_reach_modules_an_expansion_wrote_enums_and_its_own_modules() {
     let alloc = blaze_own::testing::heap().alloc();
+    let bump = blaze_own::testing::bump();
     let (crates, modules, bodies, texts) = both_strategies(GLOBS);
     let (c_mod, c_bod) = (modules.crates()[0], bodies.crates()[0]);
     let deps = BodyDeps::of_names(bodies, 0, alloc);
-    let prepares = Prepares::new_in(alloc);
+    let prepares = Prepares::new_in(bump);
     let mut scopes: AVec<'static, BodyScope<'static>> = AVec::new_in(alloc);
     let mut refused: Vec<String> = Vec::new();
     // Each fixture body by the struct only it declares.
     let marks = ["struct L;", "struct R;", "struct S;", "struct K;", "mod m ", "mod a "];
     let mut solved_marks: Vec<&str> = Vec::new();
     for held in c_bod.bodies.iter() {
-        match body_scope(c_bod, &deps, &crates[0], 0, *held, texts, prepares, alloc) {
+        match body_scope(c_bod, &deps, &crates[0], 0, *held, texts, prepares, bump) {
             Ok(scope) => {
                 solved_marks.extend(marks.iter().copied().filter(|m| held.src.text.contains(m)));
                 scopes.push(scope);
@@ -354,7 +356,7 @@ fn a_body_s_globs_reach_modules_an_expansion_wrote_enums_and_its_own_modules() {
     let unplaced = Unplaced(texts);
     let mut planted: Vec<String> = Vec::new();
     for held in c_bod.bodies.iter() {
-        if let Err(e) = body_scope(c_bod, &deps, &crates[0], 0, *held, &unplaced, prepares, alloc) {
+        if let Err(e) = body_scope(c_bod, &deps, &crates[0], 0, *held, &unplaced, prepares, bump) {
             planted.push(format!("{e}"));
         }
     }

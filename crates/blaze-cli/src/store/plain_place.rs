@@ -427,24 +427,21 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
         Ok(Rooted::new(self.lent.root_through(name, &indexes, ROOT_LIFE_NS)?))
     }
 
-    /// The unexpired root `name` set again, naming what it names, for `life_ns` from the next
-    /// commit: a command that answered from what the root reaches without writing it again
-    /// (`engine-check` whose certificate stood) still renews it, so a checkout built every day
-    /// never sees its answer expire. Answers whether there was such a root (an expired one is
-    /// never named again: a slice may have swept what it named). Equal bytes within a day of the
-    /// last renewal write nothing (blaze-cas `set_root`).
+    /// The unexpired root `name` renewed in O(1) for `life_ns` from the next commit without
+    /// reading, probing, sorting, or hashing the keys it holds (`Lent::renew_root`): a command
+    /// that answered from what the root reaches without writing it again (`engine-check` whose
+    /// certificate stood) still renews it, so a checkout built every day never sees its answer
+    /// expire. Answers whether there was such a live root (an expired one is never named again: a
+    /// slice may have swept what it named). Within `TOUCH_NS` of its full life nothing is queued
+    /// and no flip is owed.
     pub(crate) fn renew(&self, name: &str, life_ns: u64) -> Result<bool, PlaceError> {
-        let Some(key) = self.lent.root_named(name) else { return Ok(false) };
-        let Some(held) = self.lent.get(&key)? else { return Ok(false) };
-        let indexed = ReservedTag::IndexedRoot.is(held.tag);
-        let mut named: Vec<CasKey, StoreAlloc> = Vec::with_capacity_in(held.bytes.len() / 32, *self.lent.alloc());
-        named.extend(held.bytes.chunks_exact(32).map(|it| CasKey(blaze_ids::ContentId(it.try_into().expect("32 bytes")))));
-        if indexed {
-            self.lent.root_through(name, &named, life_ns)?;
-        } else {
-            self.lent.root_for(name, &named, life_ns)?;
-        }
-        Ok(true)
+        Ok(self.lent.renew_root(name, life_ns).is_live())
+    }
+
+    /// O(segments + roots + retired) check of whether compaction or GC housekeeping is due at
+    /// `now_ns` (`Lent::needs_housekeeping`).
+    pub fn needs_housekeeping(&self, now_ns: u64) -> bool {
+        self.lent.needs_housekeeping(now_ns)
     }
 
     /// The index of the records `owner` was put with, filed beside it (blaze-cas

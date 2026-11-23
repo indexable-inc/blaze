@@ -128,6 +128,8 @@ pub enum LoadError {
     Names(String),
     /// The proc-macro runner could not be made: what and where.
     Procs(String),
+    /// The infer frame could not be made.
+    Frame(blaze_mem::MemError),
 }
 
 impl std::fmt::Display for LoadError {
@@ -141,6 +143,7 @@ impl std::fmt::Display for LoadError {
             LoadError::Crates(e) => write!(f, "the workspace's crates: {e}"),
             LoadError::Names(e) => write!(f, "the names: {e}"),
             LoadError::Procs(e) => write!(f, "the proc-macro runner: {e}"),
+            LoadError::Frame(e) => write!(f, "the infer frame: {e:?}"),
         }
     }
 }
@@ -605,9 +608,11 @@ pub fn load(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scripts:
         }
         None => None,
     };
+    let frame: &'static blaze_mem::Frame = leak(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).map_err(LoadError::Frame)?);
+    let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
     let mut envs = Vec::with_capacity(crates.crates.len());
     for at in 0..crates.crates.len() {
-        envs.push(crates.env_of(at, graph, alloc).map_err(|e| LoadError::Crates(e.to_string()))?);
+        envs.push(crates.env_of(at, graph, bump).map_err(|e| LoadError::Crates(e.to_string()))?);
     }
     let texts: &'static Texts = leak(Texts { places, roots: read_roots, procs, envs });
     // `inputs` carries each joined record (`UnitCrates::join_scripts`, above).
@@ -616,7 +621,7 @@ pub fn load(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scripts:
     // resolved with no dependencies (rule 3): the load stops, naming it and the fix.
     let inputs = leak(crates.checked_inputs().map_err(|refused| LoadError::Crates(refused.why.to_string()))?);
     let start = Instant::now();
-    let names = resolve_crates(inputs, crates.sysroot, texts, &Serial, alloc).map_err(|e| LoadError::Names(e.to_string()))?;
+    let names = resolve_crates(inputs, crates.sysroot, texts, &Serial, bump).map_err(|e| LoadError::Names(e.to_string()))?;
     let resolve_ms = start.elapsed().as_secs_f64() * 1e3;
     Ok(Loaded { names: leak(names), crates, member, resolve_ms, procs, scripts, graph, texts })
 }

@@ -94,9 +94,9 @@ enum Piece {
 }
 
 /// `ty` (of ground table `tys`) printed as `type_name` prints it, in `alloc`.
-pub fn type_name_text<A: Allocator + Clone>(tys: PTys<'_>, ty: PTy, names: &dyn TypeNames, alloc: A) -> Result<String<A>, TypeNameError> {
-    let mut out = String::new_in(alloc.clone());
-    let mut stack: Vec<Piece, A> = Vec::new_in(alloc.clone());
+pub fn type_name_text<A: Allocator + Copy>(tys: PTys<'_>, ty: PTy, names: &dyn TypeNames, alloc: A) -> Result<String<A>, TypeNameError> {
+    let mut out = String::new_in(alloc);
+    let mut stack: Vec<Piece, A> = Vec::new_in(alloc);
     // One node's pieces in reading order, pushed onto `stack` reversed.
     let mut seq: Vec<Piece, A> = Vec::new_in(alloc);
     stack.push(Piece::Ty(ty));
@@ -153,6 +153,28 @@ fn node<A: Allocator>(tys: PTys<'_>, t: PTy, out: &mut String<A>, seq: &mut Vec<
             }
             // A one-tuple keeps its comma: `(u8,)`.
             text(seq, if parts.len() == 1 { ",)" } else { ")" });
+        }
+        PNode::Record(l) => {
+            let parts = list(l)?;
+            text(seq, "record(");
+            for (k, &p) in parts.iter().enumerate() {
+                if k > 0 {
+                    text(seq, ", ");
+                }
+                seq.push(Piece::Ty(p));
+            }
+            text(seq, ")");
+        }
+        PNode::Union(l) => {
+            let parts = list(l)?;
+            text(seq, "union(");
+            for (k, &p) in parts.iter().enumerate() {
+                if k > 0 {
+                    text(seq, " | ");
+                }
+                seq.push(Piece::Ty(p));
+            }
+            text(seq, ")");
         }
         PNode::Ref(m, p) => {
             text(seq, if m == Mutbl::Mut { "&mut " } else { "&" });

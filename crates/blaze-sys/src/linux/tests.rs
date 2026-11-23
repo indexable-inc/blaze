@@ -266,7 +266,8 @@ fn the_constants_are_libcs() {
     assert_eq!(WaitOptions::EXITED.bits() as libc::c_int, libc::WEXITED);
     assert_eq!(WaitOptions::NO_WAIT.bits() as libc::c_int, libc::WNOWAIT);
     assert_eq!(CloneFlags::PIDFD.bits(), libc::CLONE_PIDFD as u64);
-    assert_eq!(CloneFlags::CLEAR_SIGHAND.bits(), libc::CLONE_CLEAR_SIGHAND as u64);
+    // `libc::CLONE_CLEAR_SIGHAND` is typed as `c_int` in `libc`, truncating `0x1_0000_0000` to 0.
+    assert_eq!(CloneFlags::CLEAR_SIGHAND.bits(), 0x1_0000_0000u64);
     assert_eq!(CloneFlags::INTO_CGROUP.bits(), libc::CLONE_INTO_CGROUP as u64);
     assert_eq!(SockFlags::NONBLOCK.bits() as libc::c_int, libc::SOCK_NONBLOCK);
     assert_eq!(SockFlags::CLOSE_ON_EXEC.bits() as libc::c_int, libc::SOCK_CLOEXEC);
@@ -388,6 +389,13 @@ fn the_errno_table_is_libcs() {
         (Errno::Stale, libc::ESTALE),
         (Errno::DQuot, libc::EDQUOT),
         (Errno::Canceled, libc::ECANCELED),
+        (Errno::NoData, libc::ENODATA),
+        (Errno::Proto, libc::EPROTO),
+        (Errno::NoProtoOpt, libc::ENOPROTOOPT),
+        (Errno::HostDown, libc::EHOSTDOWN),
+        (Errno::NoNet, libc::ENONET),
+        // On Linux `ENOTSUP == EOPNOTSUPP`, so `Errno::NotSup` holds the sentinel `65535`.
+        (Errno::NotSup, 65535),
     ];
     assert_eq!(libcs.len(), Errno::LISTED.len(), "an error is in one table and not the other");
     for &(errno, libcs) in libcs {
@@ -778,9 +786,10 @@ fn random_bytes_come_whole_and_differ() {
 fn a_stream_is_sent_and_received_over_a_unix_socket() {
     let scratch = Scratch::new("net");
     let at = SockAddr::unix(scratch.path.join("s").to_str().unwrap().as_bytes()).unwrap();
+    let at2 = SockAddr::unix(scratch.path.join("s2").to_str().unwrap().as_bytes()).unwrap();
     let listener = socket(Family::Unix, SockKind::Stream, SockFlags::CLOSE_ON_EXEC).unwrap();
     assert_eq!(bind(listener.fd(), &at), Ok(()));
-    assert_eq!(bind(listener.fd(), &at), Err(Errno::Inval), "a socket is bound once");
+    assert_eq!(bind(listener.fd(), &at2), Err(Errno::Inval), "a socket is bound once");
     assert_eq!(listen(listener.fd(), 8), Ok(()));
     let client = socket(Family::Unix, SockKind::Stream, SockFlags::CLOSE_ON_EXEC).unwrap();
     assert_eq!(connect(client.fd(), &at), Ok(()));

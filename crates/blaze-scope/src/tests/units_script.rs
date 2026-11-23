@@ -64,7 +64,7 @@ fn record(printed: &str) -> OutputsRef<'static> {
     let out = Outputs::read(printed.as_bytes(), "/target/debug/build/dep-0123456789abcdef/out", OutputLimits::DEFAULT, a()).unwrap_or_else(|e| panic!("{e:?}"));
     let mut bytes = AVec::new_in(a());
     out.encode(&mut bytes);
-    let bytes: &'static [u8] = bytes.leak();
+    let bytes: &'static [u8] = bytes.leak_static();
     OutputsRef::open(bytes).unwrap_or_else(|e| panic!("{e:?}"))
 }
 
@@ -100,7 +100,7 @@ fn list() -> UnitCrates<'static> {
 fn resolved(crates: UnitCrates<'static>) -> Names<'static> {
     let crates: &'static UnitCrates<'static> = Box::leak(Box::new(crates));
     let inputs = Box::leak(Box::new(crates.inputs()));
-    resolve_crates(inputs, crates.sysroot, &TEXTS, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))
+    resolve_crates(inputs, crates.sysroot, &TEXTS, &Serial, crate::tests::SyncFrame::leaked()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))
 }
 
 /// What `::dep::Elem` names from `user`: the crate it is in, or why it names nothing.

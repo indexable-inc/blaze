@@ -178,8 +178,8 @@ static PER_CRATE: AtomicBool = AtomicBool::new(false);
 /// Crate by crate through records (`crate_scope::resolve_by_records`) at each thread count:
 /// every module scope equal to the whole-set call's, every record's bytes equal across thread
 /// counts, the time, and the records' sizes.
-fn per_crate(whole: &Names<'static>, inputs: &[CrateInput<'static>], sysroot: Sysroot, thread_counts: &[usize]) {
-    let scopes = |c: &CrateNames<'static>| {
+fn per_crate(whole: &Names<'_>, inputs: &[CrateInput<'static>], sysroot: Sysroot, thread_counts: &[usize]) {
+    let scopes = |c: &CrateNames<'_>| {
         let mut keys: Vec<_> = c.done.keys().copied().collect();
         keys.sort();
         keys.into_iter().map(|k| (k, format!("{:?}", c.done[&k].scope))).collect::<Vec<_>>()
@@ -193,7 +193,7 @@ fn per_crate(whole: &Names<'static>, inputs: &[CrateInput<'static>], sysroot: Sy
             &Disk,
             &Threads(threads),
             &blaze_scope::crate_scope::Ready { workers: threads, rank: None, wait: std::time::Duration::from_secs(600), hooks: &blaze_scope::crate_scope::NoHooks },
-            g(),
+            blaze_own::testing::bump(),
         ).unwrap_or_else(|(at, e)| {
             eprintln!("per crate: crate `{}`: {e:?}", inputs[at].name);
             std::process::exit(2);
@@ -338,8 +338,8 @@ fn normalize(path: &std::path::Path) -> PathBuf {
 /// text leaked for the run.
 struct Disk;
 
-impl SourceTexts<'static> for Disk {
-    fn read(&self, _krate: usize, path: &str) -> Option<&'static str> {
+impl<'a> SourceTexts<'a> for Disk {
+    fn read(&self, _krate: usize, path: &str) -> Option<&'a str> {
         std::fs::read_to_string(path).ok().map(leak)
     }
 }
@@ -1022,6 +1022,7 @@ fn run_set(set: &str, hello_dir: &std::path::Path, thread_counts: &[usize]) {
     }
     let inputs = inputs_of(&plan, &target);
     let first = if ALONE.load(Ordering::Relaxed) { First::Alone } else { First::Prefetch };
+    let bump = blaze_own::testing::bump();
     let mut last: Option<Names<'static>> = None;
     let mut times = Vec::new();
     for &threads in thread_counts {
@@ -1029,7 +1030,7 @@ fn run_set(set: &str, hello_dir: &std::path::Path, thread_counts: &[usize]) {
         drop(last.take());
         LINKS.lock().expect("no thread panicked holding the `--links-agree` list").clear();
         let start = Instant::now();
-        let resolved = resolve_crates_with(&inputs, plan.sysroot, &Disk, &Threads(threads), first, g());
+        let resolved = resolve_crates_with(&inputs, plan.sysroot, &Disk, &Threads(threads), first, bump);
         let ms = start.elapsed().as_secs_f64() * 1e3;
         let names = resolved.unwrap_or_else(|e| {
             eprintln!("the names of `{set}`: {e}");

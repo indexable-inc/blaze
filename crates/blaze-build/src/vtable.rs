@@ -165,16 +165,16 @@ pub struct Shape<A: Allocator> {
     pub args: Vec<u32, A>,
 }
 
-impl<A: Allocator + Clone> Shape<A> {
+impl<A: Allocator + Copy> Shape<A> {
     /// The shape of `principal`'s tables. `facts` is the world's [`ObjectTrait`] of a trait.
     /// Depth first without recursion: a stack of (trait, next supertrait, on the first chain,
     /// its arguments). A supertrait's arguments are its trait's, composed: `dyn Fn<(u8,)>`'s
     /// `FnMut<Args>` is at `[concrete, (u8,)]`, positions `[0, 1]`.
     pub fn of<'f>(principal: ItemKey, facts: impl Fn(ItemKey) -> Option<ObjectTrait<'f>>, alloc: A) -> Result<Shape<A>, VtableError> {
-        let mut words = Vec::new_in(alloc.clone());
-        let mut prefix = Vec::new_in(alloc.clone());
-        let mut args: Vec<u32, A> = Vec::new_in(alloc.clone());
-        let mut seen: Vec<(ItemKey, TraitArgs), A> = Vec::new_in(alloc.clone());
+        let mut words = Vec::new_in(alloc);
+        let mut prefix = Vec::new_in(alloc);
+        let mut args: Vec<u32, A> = Vec::new_in(alloc);
+        let mut seen: Vec<(ItemKey, TraitArgs), A> = Vec::new_in(alloc);
         let mut stack: Vec<(ItemKey, usize, bool, TraitArgs), A> = Vec::new_in(alloc);
         seen.push((principal, TraitArgs::Principal));
         stack.push((principal, 0, true, TraitArgs::Principal));
@@ -341,22 +341,22 @@ pub struct Vtable<A: Allocator> {
     pub relocs: Vec<(u32, VtableTarget), A>,
 }
 
-impl<A: Allocator + Clone> Vtable<A> {
+impl<A: Allocator + Copy> Vtable<A> {
     /// `concrete`'s table for `shape`'s principal at `args` (the principal's arguments, types of
     /// the ground table, which `concrete` is in too). `size` and `align` are bytes; `drop` the
     /// glue instance when `concrete` needs drop.
     pub fn build(shape: &Shape<A>, concrete: PTy, args: &[PTy], size: u64, align: u64, drop: Option<Instance>, ground: &mut PortableTys<'_>, alloc: A) -> Result<Vtable<A>, BuildError> {
         let full = || BuildError::Malformed { what: "the ground table is full" };
         let words = shape.words.len() + HEADER_WORDS as usize;
-        let mut bytes = Vec::with_capacity_in(8 * words, alloc.clone());
+        let mut bytes = Vec::with_capacity_in(8 * words, alloc);
         bytes.resize(8 * words, 0u8);
         bytes[8..16].copy_from_slice(&size.to_le_bytes());
         bytes[16..24].copy_from_slice(&align.to_le_bytes());
-        let mut relocs = Vec::with_capacity_in(words, alloc.clone());
+        let mut relocs = Vec::with_capacity_in(words, alloc);
         if let Some(glue) = drop {
             relocs.push((0, VtableTarget::Fn(glue)));
         }
-        let mut with_args: Vec<PTy, A> = Vec::with_capacity_in(1 + args.len(), alloc.clone());
+        let mut with_args: Vec<PTy, A> = Vec::with_capacity_in(1 + args.len(), alloc);
         with_args.push(concrete);
         with_args.extend_from_slice(args);
         let principal_args = ground.intern_list(&with_args).map_err(|_| full())?;
@@ -389,9 +389,9 @@ impl<A: Allocator + Clone> Vtable<A> {
         mut super_key: impl FnMut(ItemKey) -> Result<VtableKey, E>,
         alloc: A,
     ) -> Result<DataRecord<A>, E> {
-        let mut bytes = Vec::with_capacity_in(self.bytes.len(), alloc.clone());
+        let mut bytes = Vec::with_capacity_in(self.bytes.len(), alloc);
         bytes.extend_from_slice(&self.bytes);
-        let mut relocs = Vec::with_capacity_in(self.relocs.len(), alloc.clone());
+        let mut relocs = Vec::with_capacity_in(self.relocs.len(), alloc);
         for &(offset, to) in self.relocs.iter() {
             let target = match to {
                 VtableTarget::Fn(i) => DataTarget::Fn(fn_key(i)?),

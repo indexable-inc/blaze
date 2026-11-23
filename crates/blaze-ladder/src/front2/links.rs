@@ -18,7 +18,7 @@ use blaze_file_items::nested::{NestedEnd, NestedItem, NestedKind};
 use blaze_id::{CrateItemKey, ItemKey};
 use blaze_lower::{AttrMeta, Lowered, head};
 use blaze_native::resolve::VERBATIM;
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, BVec, Bump, Erased};
 use blaze_scope::attr_values::{RowRefusal, RowValue, ValueRow, is_call, row};
 use blaze_scope::resolve::{At, CrateNames, ExpansionText};
 use blaze_surface::{CallShape, Edition, Item, ItemDetail, ItemIndex, Range};
@@ -256,8 +256,9 @@ fn has_extern_word(text: &str) -> bool {
 /// the expansions of the macro calls written in it (and theirs, in source order: [`expand_met`]);
 /// then the expansions of calls no text holds as an entry (an attribute macro's, a derive's, a
 /// body's), ordered by the call's key, never by the map.
-pub(crate) fn scope_links<'a>(c: &CrateNames<'a>, alloc: Alloc<'a>) -> Result<CrateLinks<'a>, LinksError<'a>> {
-    let mut gather = Gather::new(c.name, c.edition, c.cfg.atoms(), &c.values, alloc);
+pub(crate) fn scope_links<'a>(c: &CrateNames<'a>, bump: Bump<'a>) -> Result<CrateLinks<'a>, LinksError<'a>> {
+    let alloc = bump.alloc();
+    let mut gather = Gather::new(c.name, c.edition, c.cfg.atoms(), &c.values, bump);
     gather.crate_key = Some(c.key);
     let inputs = taken_inputs(c, alloc)?;
     // The calls whose expansion was walked, sorted: each is walked once.
@@ -331,10 +332,10 @@ pub(crate) fn text_links<'a>(
     krate: &'a str,
     text: &'a str,
     atoms: &[(&str, Option<&str>)],
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Result<CrateLinks<'a>, LinksError<'a>> {
-    let outline = blaze_file_items::outline(text, Edition::E2021, alloc);
-    let mut gather = Gather::new(krate, Edition::E2021, atoms, &[], alloc);
+    let outline = blaze_file_items::outline(text, Edition::E2021, bump.alloc());
+    let mut gather = Gather::new(krate, Edition::E2021, atoms, &[], bump);
     gather.text(TextOf::File("src/lib.rs"), text, &outline, &|at| Entry::Keyed(exports_tests::index_key(at)))?;
     gather.finish()
 }
@@ -356,7 +357,7 @@ struct Gather<'a, 'c> {
     /// The crate's `link_name`/`export_name` values written as macro calls, each expanded at
     /// its item by the names' fill (`CrateNames::values`): read by item key, never expanded here.
     values: &'c [ValueRow<'a>],
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
     /// The text being walked ([`Gather::text`]'s `place`), for a refusal's words.
     place: TextOf<'a>,
     /// The text being walked is the expansion of a macro call inside an extern block: its
@@ -411,10 +412,10 @@ fn plain_str(text: &str) -> Option<&str> {
 /// on every name it must not have mangled (`#[link_name = "\u{1}_proc_listpids"]`): the rest is
 /// the exact symbol, with no platform prefix ([`VERBATIM`], blaze-native `resolve::mangle`).
 /// Refused: an empty name (or the mark alone) and a NUL byte.
-pub(crate) fn symbol_value<'a>(written: &'a str, edition: Edition, alloc: Alloc<'a>) -> Result<&'a str, SymbolWhy<'a>> {
+pub(crate) fn symbol_value<'a>(written: &'a str, edition: Edition, bump: Bump<'a>) -> Result<&'a str, SymbolWhy<'a>> {
     let value = match plain_str(written) {
         Some(plain) => plain,
-        None => blaze_expand::attr_literal(written, edition, alloc).map_err(SymbolWhy::NotAString)?,
+        None => blaze_expand::attr_literal(written, edition, bump).map_err(SymbolWhy::NotAString)?,
     };
     checked(value)
 }
@@ -436,10 +437,10 @@ pub(crate) fn symbol_of<'a>(
     key: Option<ItemKey>,
     row: impl FnOnce(ItemKey) -> Option<Option<RowValue<'a>>>,
     edition: Edition,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Result<&'a str, SymbolWhy<'a>> {
     if !is_call(written) {
-        return symbol_value(written, edition, alloc);
+        return symbol_value(written, edition, bump);
     }
     let Some(key) = key else { return Err(SymbolWhy::NoValue) };
     if key.is_inner() {
@@ -451,6 +452,40 @@ pub(crate) fn symbol_of<'a>(
         Some(Some(Ok(value))) => checked(value),
         Some(Some(Err(refused))) => Err(SymbolWhy::Value(refused)),
     }
+}
+
+/// Like [`symbol_of`], for callers that only need the resolved symbol transiently and do not hold
+/// a [`Bump`] arena: plain string literals and macro-call rows allocate nothing; escaped/raw
+/// literals or literal-only built-ins use a temporary frame that is reclaimed on return.
+pub(crate) fn with_symbol_of<'a, R>(
+    written: &'a str,
+    key: Option<ItemKey>,
+    row: impl FnOnce(ItemKey) -> Option<Option<RowValue<'a>>>,
+    edition: Edition,
+    f: impl FnOnce(Result<&str, SymbolWhy<'_>>) -> R,
+) -> R {
+    if is_call(written) {
+        let res = match key {
+            None => Err(SymbolWhy::NoValue),
+            Some(key) if key.is_inner() => Err(SymbolWhy::InBody),
+            Some(key) => match row(key) {
+                None => Err(SymbolWhy::Unanswered),
+                Some(None) => Err(SymbolWhy::NoValue),
+                Some(Some(Ok(value))) => checked(value),
+                Some(Some(Err(refused))) => Err(SymbolWhy::Value(refused)),
+            },
+        };
+        return f(res);
+    }
+    if let Some(plain) = plain_str(written) {
+        return f(checked(plain));
+    }
+    let Ok(frame) = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer) else {
+        return f(Err(SymbolWhy::Unanswered));
+    };
+    let erased = Erased::new(&frame);
+    let res = symbol_value(written, edition, erased.bump());
+    f(res)
 }
 
 /// The ABI strings of the pinned nightly whose `extern` block declares NO symbol an image imports:
@@ -530,23 +565,24 @@ fn checked(value: &str) -> Result<&str, SymbolWhy<'_>> {
 /// plain, escaped or raw, read as [`symbol_value`] reads one. A list entry takes a literal
 /// only (no macro call: the meta item grammar's list entries hold literals), so anything that
 /// does not start as a string literal is `None`.
-fn list_value<'a>(written: &'a str, edition: Edition, alloc: Alloc<'a>) -> Option<&'a str> {
+fn list_value<'a>(written: &'a str, edition: Edition, bump: Bump<'a>) -> Option<&'a str> {
     if let Some(plain) = plain_str(written) {
         return Some(plain);
     }
     let t = written.trim();
     let literal = t.starts_with('"') || t.starts_with("r\"") || t.starts_with("r#");
-    literal.then(|| blaze_expand::attr_literal(t, edition, alloc).ok()).flatten()
+    literal.then(|| blaze_expand::attr_literal(t, edition, bump).ok()).flatten()
 }
 
 impl<'a, 'c> Gather<'a, 'c> {
-    fn new(krate: &'a str, edition: Edition, atoms: &'c [(&'c str, Option<&'c str>)], values: &'c [ValueRow<'a>], alloc: Alloc<'a>) -> Gather<'a, 'c> {
+    fn new(krate: &'a str, edition: Edition, atoms: &'c [(&'c str, Option<&'c str>)], values: &'c [ValueRow<'a>], bump: Bump<'a>) -> Gather<'a, 'c> {
+        let alloc = bump.alloc();
         Gather {
             krate,
             edition,
             atoms,
             values,
-            alloc,
+            bump,
             place: TextOf::File(""),
             top_foreign: false,
             met: AVec::new_in(alloc),
@@ -600,7 +636,7 @@ impl<'a, 'c> Gather<'a, 'c> {
     /// parent chain ends at the text's top (an outline's parent precedes its child), so the
     /// walk is bounded by `at`.
     fn item_path(&self, text: &'a str, outline: &Outline<'_>, at: ItemIndex) -> Result<&'a str, LinksError<'a>> {
-        let mut names: AVec<'a, &'a str> = AVec::new_in(self.alloc);
+        let mut names: AVec<'a, &'a str> = AVec::new_in(self.bump.alloc());
         let mut next = Some(at);
         while let Some(i) = next {
             let item = outline.item(i);
@@ -611,14 +647,14 @@ impl<'a, 'c> Gather<'a, 'c> {
             }
             next = item.parent.filter(|p| p.0 < i.0);
         }
-        let mut path: AVec<'a, u8> = AVec::new_in(self.alloc);
+        let mut path: BVec<'a, u8> = BVec::new_in(self.bump);
         for (n, name) in names.iter().rev().enumerate() {
             if n > 0 {
                 path.try_extend_from_slice(b"::").map_err(|_| LinksError::Alloc)?;
             }
             path.try_extend_from_slice(name.as_bytes()).map_err(|_| LinksError::Alloc)?;
         }
-        let path: &'a [u8] = path.leak();
+        let path: &'a [u8] = path.into_bump_slice();
         core::str::from_utf8(path).map_err(|_| LinksError::Alloc)
     }
 
@@ -628,7 +664,7 @@ impl<'a, 'c> Gather<'a, 'c> {
     /// attribute: expanded once, at the item, where its macros are in scope (rule 77).
     fn symbol(&self, w: Written<'a>, attr: &'static str, text: &'a str, outline: &Outline<'_>, at: ItemIndex, key: Option<ItemKey>) -> Result<&'a str, LinksError<'a>> {
         let values = self.values;
-        match symbol_of(w.args, key, |key| Some(row(values, key, attr).map(|found| found.answer())), self.edition, self.alloc) {
+        match symbol_of(w.args, key, |key| Some(row(values, key, attr).map(|found| found.answer())), self.edition, self.bump) {
             Ok(symbol) => Ok(symbol),
             Err(why) => {
                 let item = self.item_path(text, outline, at)?;
@@ -716,7 +752,7 @@ impl<'a, 'c> Gather<'a, 'c> {
     }
 
     fn lower(&self, item_text: &'a str, at: ItemIndex) -> Result<Lowered<'a, 'a>, LinksError<'a>> {
-        blaze_lower::lower_signature(item_text, self.edition, &mut CrateCfg(self.atoms), self.alloc)
+        blaze_lower::lower_signature(item_text, self.edition, &mut CrateCfg(self.atoms), self.bump.alloc())
             .map_err(|_| LinksError::Cfg { krate: self.krate, at: self.at(at) })
     }
 
@@ -748,7 +784,7 @@ impl<'a, 'c> Gather<'a, 'c> {
         if !has_extern_word(item_text) {
             return Ok(());
         }
-        let alloc = self.alloc;
+        let alloc = self.bump.alloc();
         let mut work: AVec<'a, (&'a str, bool)> = AVec::new_in(alloc);
         work.try_push((item_text, true)).map_err(|_| LinksError::Alloc)?;
         while let Some((body, top)) = work.pop() {
@@ -825,10 +861,10 @@ impl<'a, 'c> Gather<'a, 'c> {
             // Outer ones only, as the library reads them: an inner `#![..]` at the start of the
             // block around is that block's own.
             if attrs.contains("cfg") && attrs.strip_prefix('#').is_some_and(|rest| rest.trim_start().starts_with('[')) {
-                let mut bytes: AVec<'a, u8> = AVec::new_in(self.alloc);
+                let mut bytes: BVec<'a, u8> = BVec::new_in(self.bump);
                 bytes.try_extend_from_slice(attrs.as_bytes()).map_err(|_| LinksError::Alloc)?;
                 bytes.try_extend_from_slice(b"\nmod __blaze_block {}").map_err(|_| LinksError::Alloc)?;
-                let bytes: &'a [u8] = bytes.leak();
+                let bytes: &'a [u8] = bytes.into_bump_slice();
                 let item = core::str::from_utf8(bytes).map_err(|_| LinksError::Alloc)?;
                 if self.lower(item, at)?.view().cfg_out() {
                     return Ok(false);
@@ -844,7 +880,7 @@ impl<'a, 'c> Gather<'a, 'c> {
     fn written(&self, low: &Lowered<'a, 'a>, item_text: &'a str, at: ItemIndex) -> Result<AVec<'a, Written<'a>>, LinksError<'a>> {
         let v = low.view();
         let bad = self.attr_err(at, "an attribute row the signature's lowering does not hold");
-        let mut out: AVec<'a, Written<'a>> = AVec::new_in(self.alloc);
+        let mut out: AVec<'a, Written<'a>> = AVec::new_in(self.bump.alloc());
         for &n in v.rows(v.list(head::ATTRS)).map_err(|_| bad)? {
             let a = v.attr(n).map_err(|_| bad)?;
             let path = v.item_relative(a.path).and_then(|r| cut(item_text, r)).ok_or(bad)?;
@@ -903,7 +939,7 @@ impl<'a, 'c> Gather<'a, 'c> {
                 continue;
             }
             let value = rest.strip_prefix('=').ok_or(self.attr_err(at, "an entry of `#[link(..)]` that is no `key = \"..\"`"))?;
-            let value = list_value(value, self.edition, self.alloc).ok_or(self.attr_err(at, "a `#[link]` value that is no string literal (Reference: MetaListNameValueStr)"))?;
+            let value = list_value(value, self.edition, self.bump).ok_or(self.attr_err(at, "a `#[link]` value that is no string literal (Reference: MetaListNameValueStr)"))?;
             let slot = match key {
                 "name" => &mut name,
                 "kind" => &mut kind,
@@ -929,9 +965,10 @@ impl<'a, 'c> Gather<'a, 'c> {
             return Ok(None);
         }
         if let Some(predicate) = cfg {
-            let tokens = blaze_expand::lex(predicate, self.edition, self.alloc)
+            let alloc = self.bump.alloc();
+            let tokens = blaze_expand::lex(predicate, self.edition, alloc)
                 .map_err(|_| self.attr_err(at, "a `#[link(cfg(..))]` whose predicate does not lex"))?;
-            let holds = blaze_lower::cfg_outcome(&tokens, &mut CrateCfg(self.atoms), self.alloc)
+            let holds = blaze_lower::cfg_outcome(&tokens, &mut CrateCfg(self.atoms), alloc)
                 .map_err(|_| LinksError::Cfg { krate: self.krate, at })?;
             if !holds {
                 return Ok(None);
@@ -960,7 +997,7 @@ impl<'a, 'c> Gather<'a, 'c> {
     /// The top-level comma-separated entries of a `#[link(..)]` list, each trimmed, empty ones
     /// (a trailing comma) dropped. Strings and nested groups are passed over whole.
     fn split_list(&self, inner: &'a str, at: ItemIndex) -> Result<AVec<'a, &'a str>, LinksError<'a>> {
-        let mut out: AVec<'a, &'a str> = AVec::new_in(self.alloc);
+        let mut out: AVec<'a, &'a str> = AVec::new_in(self.bump.alloc());
         let mut depth = 0u32;
         let mut in_str = false;
         let mut escaped = false;
@@ -1184,9 +1221,9 @@ mod tests {
     use super::exports_tests::index_key;
 
     /// The facts of one file `text` as the only text of crate `t`, under `atoms`.
-    fn links_of<'a>(text: &'a str, atoms: &[(&str, Option<&str>)], alloc: Alloc<'a>) -> Result<CrateLinks<'a>, LinksError<'a>> {
-        let outline = blaze_file_items::outline(text, Edition::E2021, alloc);
-        let mut gather = Gather::new("t", Edition::E2021, atoms, &[], alloc);
+    fn links_of<'a>(text: &'a str, atoms: &[(&str, Option<&str>)], bump: Bump<'a>) -> Result<CrateLinks<'a>, LinksError<'a>> {
+        let outline = blaze_file_items::outline(text, Edition::E2021, bump.alloc());
+        let mut gather = Gather::new("t", Edition::E2021, atoms, &[], bump);
         gather.text(TextOf::File("src/lib.rs"), text, &outline, &|at| Entry::Keyed(index_key(at)))?;
         gather.finish()
     }
@@ -1204,6 +1241,9 @@ mod tests {
     /// Without the piece: "cannot find `links` in `front2`".
     #[test]
     fn links_foreign_and_exports_of_a_crate() {
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = Erased::new(&frame);
+        let bump = erased.bump();
         let text = "#[link(name = \"z\")]\n\
                     extern \"C\" { fn f(); #[link_name = \"g2\"] fn g(); }\n\
                     #[cfg_attr(target_os = \"macos\", link(name = \"CoreFoundation\", kind = \"framework\"))]\n\
@@ -1212,7 +1252,7 @@ mod tests {
                     extern \"C\" {}\n\
                     #[unsafe(no_mangle)] pub extern \"C\" fn cb() {}\n\
                     #[cfg(test)] mod t { #[no_mangle] pub extern \"C\" fn hidden() {} }\n";
-        let links = links_of(text, MAC, Alloc::global()).unwrap_or_else(|e| panic!("refused: {e:?}"));
+        let links = links_of(text, MAC, bump).unwrap_or_else(|e| panic!("refused: {e:?}"));
         let plain = Modifiers { whole_archive: false, verbatim: false };
         assert_eq!(
             links.decls.as_slice(),
@@ -1224,7 +1264,7 @@ mod tests {
         assert_eq!(links.foreign.as_slice(), ["f", "g2"]);
         assert_eq!(links.exports.iter().map(|e| e.name).collect::<std::vec::Vec<_>>(), ["cb"]);
         // Off macOS the framework's `cfg_attr` does not hold: no decl from it.
-        let linux = links_of(text, &[("target_os", Some("linux")), ("unix", None)], Alloc::global())
+        let linux = links_of(text, &[("target_os", Some("linux")), ("unix", None)], bump)
             .unwrap_or_else(|e| panic!("refused: {e:?}"));
         assert_eq!(linux.decls.len(), 1);
     }
@@ -1240,19 +1280,21 @@ mod tests {
     /// Prints `links: llvm-intrinsic blocks declare no symbol; as "C" the same entries are read`.
     #[test]
     fn an_llvm_intrinsic_block_declares_no_symbol() {
-        let alloc = blaze_own::testing::heap().alloc();
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = Erased::new(&frame);
+        let bump = erased.bump();
         let intrinsic = "extern \"llvm-intrinsic\" { #[link_name = \"llvm.x.y\"] fn top(); }\n\
                          extern \"C\" { fn real(); }\n\
                          pub fn sve() { unsafe extern \"llvm-intrinsic\" { #[link_name = concat!(\"llvm.a\", \"b\")] fn inner(); } }\n";
-        let links = links_of(intrinsic, MAC, alloc).unwrap_or_else(|e| panic!("an llvm-intrinsic block was read for symbols: {e:?}"));
+        let links = links_of(intrinsic, MAC, bump).unwrap_or_else(|e| panic!("an llvm-intrinsic block was read for symbols: {e:?}"));
         assert_eq!(links.foreign.as_slice(), ["real"], "only the \"C\" block's entry is a foreign symbol");
         assert!(links.decls.is_empty());
         // CONTROL: as "C", the module-level entry is a symbol and the in-body call is refused.
         let top_c = "extern \"C\" { #[link_name = \"llvm.x.y\"] fn top(); }\n";
-        let links = links_of(top_c, MAC, alloc).unwrap_or_else(|e| panic!("refused: {e:?}"));
+        let links = links_of(top_c, MAC, bump).unwrap_or_else(|e| panic!("refused: {e:?}"));
         assert_eq!(links.foreign.as_slice(), ["llvm.x.y"]);
         let body_c = "pub fn sve() { unsafe extern \"C\" { #[link_name = concat!(\"llvm.a\", \"b\")] fn inner(); } }\n";
-        let refused = links_of(body_c, MAC, alloc);
+        let refused = links_of(body_c, MAC, bump);
         assert!(matches!(refused, Err(LinksError::Symbol { attr: "link_name", why: SymbolWhy::InBody, .. })), "{:?}", refused.as_ref().err());
         // The ABI string, not its bytes elsewhere: a bare `extern` is "C".
         for (written, none) in [("extern \"llvm-intrinsic\"", true), ("extern \"C\"", false), ("extern", false), ("extern \"C-unwind\"", false), ("extern \"rust-intrinsic\"", false)] {
@@ -1268,10 +1310,13 @@ mod tests {
     /// Prints `test front2::links::tests::raw_dylib_and_modifiers ... ok`.
     #[test]
     fn raw_dylib_and_modifiers() {
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = Erased::new(&frame);
+        let bump = erased.bump();
         let raw = "#[link(name = \"x\", kind = \"raw-dylib\")] extern \"C\" { fn x(); }\n";
-        assert_eq!(links_of(raw, MAC, Alloc::global()).err(), Some(LinksError::RawDylib { krate: "t", at: ItemIndex(0) }));
+        assert_eq!(links_of(raw, MAC, bump).err(), Some(LinksError::RawDylib { krate: "t", at: ItemIndex(0) }));
         let whole = "#[link(name = \"blst\", kind = \"static\", modifiers = \"+whole-archive,-bundle\")] extern \"C\" {}\n";
-        let links = links_of(whole, MAC, Alloc::global()).unwrap_or_else(|e| panic!("refused: {e:?}"));
+        let links = links_of(whole, MAC, bump).unwrap_or_else(|e| panic!("refused: {e:?}"));
         assert_eq!(
             links.decls.as_slice(),
             [LinkDecl {
@@ -1282,7 +1327,7 @@ mod tests {
             }]
         );
         let odd = "#[link(name = \"q\", kind = \"static\", modifiers = \"+lazy\")] extern \"C\" {}\n";
-        assert_eq!(links_of(odd, MAC, Alloc::global()).err(), Some(LinksError::UnknownModifier { krate: "t", text: "+lazy" }));
+        assert_eq!(links_of(odd, MAC, bump).err(), Some(LinksError::UnknownModifier { krate: "t", text: "+lazy" }));
     }
 
     /// The Reference, items.extern.attributes.link_name: "The link_name attribute uses the
@@ -1304,7 +1349,9 @@ mod tests {
     /// string literal" (the run of 05:52 on tempo, libproc, ItemIndex(4936)).
     #[test]
     fn link_name_is_any_string_literal() {
-        let alloc = blaze_own::testing::heap().alloc();
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = Erased::new(&frame);
+        let bump = erased.bump();
         let text = "extern \"C\" {\n\
                     #[link_name = \"\\u{1}__ZL9UUID_NULL\"] static UUID_NULL: [u8; 16];\n\
                     #[link_name = \"plain\"] fn b();\n\
@@ -1312,14 +1359,14 @@ mod tests {
                     #[link_name = r\"raw\\name\"] fn d();\n\
                     #[link_name = r#\"q\"uote\"#] fn e();\n\
                     }\n";
-        let links = links_of(text, MAC, alloc).unwrap_or_else(|e| panic!("refused: {e:?}"));
+        let links = links_of(text, MAC, bump).unwrap_or_else(|e| panic!("refused: {e:?}"));
         assert_eq!(links.foreign.as_slice(), ["\u{1}__ZL9UUID_NULL", "Ab", "plain", "q\"uote", "raw\\name"]);
 
         // Each refusal names the crate, the file, the entry's path in it, the attribute and
         // the value as written.
         let refused = |value: &'static str| {
             let text: &'static str = std::boxed::Box::leak(std::format!("mod m {{ extern \"C\" {{ #[link_name = {value}] fn x(); }} }}\n").into_boxed_str());
-            match links_of(text, MAC, alloc) {
+            match links_of(text, MAC, bump) {
                 Err(LinksError::Symbol { krate: "t", text: TextOf::File("src/lib.rs"), item: "m::x", attr: "link_name", written, why, .. }) => {
                     assert_eq!(written, value);
                     why
@@ -1334,7 +1381,7 @@ mod tests {
         assert_eq!(refused("concat!(\"con\", \"cat\")"), SymbolWhy::NoValue, "a call the names did not expand");
         // An `export_name` is read by the same rule.
         let export = "#[export_name = \"\\u{1}_exact\"] pub extern \"C\" fn g() {}\n";
-        let links = links_of(export, MAC, alloc).unwrap_or_else(|e| panic!("refused: {e:?}"));
+        let links = links_of(export, MAC, bump).unwrap_or_else(|e| panic!("refused: {e:?}"));
         assert_eq!(links.exports.iter().map(|e| e.name).collect::<std::vec::Vec<_>>(), ["\u{1}_exact"]);
         std::println!("links: link_name read as a string literal: 5 symbols; 4 refusals named");
     }
@@ -1351,13 +1398,15 @@ mod tests {
     #[test]
     fn values_written_as_calls_are_the_names_rows() {
         use blaze_scope::attr_values::{ValueRefused, ValueWhy};
-        let alloc = blaze_own::testing::heap().alloc();
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = Erased::new(&frame);
+        let bump = erased.bump();
         // Entries: 0 the block, 1 `f`; then 2 `g` outside it.
         let text = "extern \"C\" { #[link_name = concat!(prefix!(), stringify!(f))] fn f(); }\n\
                     #[export_name = concat!(prefix!(), \"g\")] pub extern \"C\" fn g() {}\n";
-        let with = |rows: &'static [ValueRow<'static>]| -> Result<CrateLinks<'static>, LinksError<'static>> {
-            let outline = blaze_file_items::outline(text, Edition::E2021, alloc);
-            let mut gather = Gather::new("t", Edition::E2021, MAC, rows, alloc);
+        let with = |rows: &'static [ValueRow<'static>]| {
+            let outline = blaze_file_items::outline(text, Edition::E2021, bump.alloc());
+            let mut gather = Gather::new("t", Edition::E2021, MAC, rows, bump);
             gather.text(TextOf::File("src/lib.rs"), text, &outline, &|at| Entry::Keyed(index_key(at)))?;
             gather.finish()
         };
@@ -1397,12 +1446,14 @@ mod tests {
     /// string literal is refused by name.
     #[test]
     fn link_values_are_any_string_literal() {
-        let alloc = blaze_own::testing::heap().alloc();
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = Erased::new(&frame);
+        let bump = erased.bump();
         let text = "#[link(name = r\"z\", kind = \"st\\x61tic\")] extern \"C\" {}\n";
-        let links = links_of(text, MAC, alloc).unwrap_or_else(|e| panic!("refused: {e:?}"));
+        let links = links_of(text, MAC, bump).unwrap_or_else(|e| panic!("refused: {e:?}"));
         assert_eq!(links.decls.iter().map(|d| (d.name, d.kind)).collect::<std::vec::Vec<_>>(), [("z", LinkKind::Static)]);
         let bad = "#[link(name = z)] extern \"C\" {}\n";
-        assert!(matches!(links_of(bad, MAC, alloc), Err(LinksError::Attr { krate: "t", .. })));
+        assert!(matches!(links_of(bad, MAC, bump), Err(LinksError::Attr { krate: "t", .. })));
     }
 
     /// Reference, items.extern.attributes.link.wasm_import_module: a wasm module's name, taken
@@ -1411,14 +1462,16 @@ mod tests {
     /// refuses it (`IncompatibleWasmLink`).
     #[test]
     fn wasm_import_module_links_nothing_off_wasm() {
-        let alloc = blaze_own::testing::heap().alloc();
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = Erased::new(&frame);
+        let bump = erased.bump();
         let text = "#[link(wasm_import_module = \"wasi:cli/exit@0.2.0\")]\n\
                     extern \"C\" { #[link_name = \"exit\"] fn wit_import(_: i32); }\n";
-        let links = links_of(text, MAC, alloc).unwrap_or_else(|e| panic!("refused: {e:?}"));
+        let links = links_of(text, MAC, bump).unwrap_or_else(|e| panic!("refused: {e:?}"));
         assert!(links.decls.is_empty(), "no library: {:?}", links.decls.as_slice());
         assert_eq!(links.foreign.as_slice(), ["exit"]);
         let both = "#[link(name = \"z\", wasm_import_module = \"m\")] extern \"C\" {}\n";
-        assert!(matches!(links_of(both, MAC, alloc), Err(LinksError::Attr { krate: "t", .. })));
+        assert!(matches!(links_of(both, MAC, bump), Err(LinksError::Attr { krate: "t", .. })));
     }
 
     /// The Reference, items.extern: an extern block's items may be macro invocations, expanded
@@ -1432,25 +1485,27 @@ mod tests {
     /// Prints `links: a macro call in an extern block: met in the block, its fn a root (ring_core_f)`.
     #[test]
     fn a_macro_call_in_an_extern_block_declares_its_entries() {
-        let alloc = blaze_own::testing::heap().alloc();
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = Erased::new(&frame);
+        let bump = erased.bump();
         let file = "extern \"C\" {\n    prefixed_item! { link_name f { fn f(); } }\n}\n";
         let expansion = "#[link_name = \"ring_core_f\"] fn f();\n";
-        fn walk<'a>(file: &'a str, expansion: &'a str, top_foreign: bool, alloc: Alloc<'a>) -> Result<CrateLinks<'a>, LinksError<'a>> {
-            let outline = blaze_file_items::outline(file, Edition::E2021, alloc);
-            let mut gather = Gather::new("t", Edition::E2021, MAC, &[], alloc);
+        fn walk<'a>(file: &'a str, expansion: &'a str, top_foreign: bool, bump: Bump<'a>) -> Result<CrateLinks<'a>, LinksError<'a>> {
+            let outline = blaze_file_items::outline(file, Edition::E2021, bump.alloc());
+            let mut gather = Gather::new("t", Edition::E2021, MAC, &[], bump);
             gather.text(TextOf::File("src/lib.rs"), file, &outline, &|at| Entry::Keyed(index_key(at)))?;
             assert_eq!(gather.met.as_slice(), [(index_key(ItemIndex(1)), true)], "the call is met inside the block");
-            let made = blaze_file_items::outline(expansion, Edition::E2021, alloc);
+            let made = blaze_file_items::outline(expansion, Edition::E2021, bump.alloc());
             gather.top_foreign = top_foreign;
             gather.text(TextOf::Expansion(index_key(ItemIndex(1))), expansion, &made, &|at| Entry::Keyed(index_key(at)))?;
             gather.finish()
         }
-        let read = walk(file, expansion, true, alloc).unwrap_or_else(|e| panic!("refused: {e:?}"));
+        let read = walk(file, expansion, true, bump).unwrap_or_else(|e| panic!("refused: {e:?}"));
         assert_eq!(read.foreign.as_slice(), ["ring_core_f"]);
-        let as_items = walk(file, expansion, false, alloc).unwrap_or_else(|e| panic!("refused: {e:?}"));
+        let as_items = walk(file, expansion, false, bump).unwrap_or_else(|e| panic!("refused: {e:?}"));
         assert!(as_items.foreign.is_empty(), "control: a module's bodiless fn is no root: {:?}", as_items.foreign.as_slice());
-        let outline = blaze_file_items::outline(file, Edition::E2021, alloc);
-        let mut unkeyed = Gather::new("t", Edition::E2021, MAC, &[], alloc);
+        let outline = blaze_file_items::outline(file, Edition::E2021, bump.alloc());
+        let mut unkeyed = Gather::new("t", Edition::E2021, MAC, &[], bump);
         assert_eq!(
             unkeyed.text(TextOf::File("src/lib.rs"), file, &outline, &|_| Entry::Unkeyed).err(),
             Some(LinksError::Unkeyed { krate: "t", text: TextOf::File("src/lib.rs"), at: ItemIndex(1), line: 2, item: "", needs: KeyFor::Call { mac: "prefixed_item" } })
@@ -1472,7 +1527,9 @@ mod tests {
     /// Prints `links: gcloud's merge_field: no extern word, no key asked; with one: Unkeyed (Body)`.
     #[test]
     fn a_member_body_without_the_word_extern_asks_no_key() {
-        let alloc = blaze_own::testing::heap().alloc();
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = Erased::new(&frame);
+        let bump = erased.bump();
         let gcloud = "impl Message for Msg {\n\
                       fn encode_raw(&self) {}\n\
                       fn merge_field(&mut self, tag: u32) -> u32 {\n\
@@ -1480,9 +1537,9 @@ mod tests {
                       match tag { 1 => self.external_id, _ => 0 }\n\
                       }\n\
                       }\n";
-        let walk = |text: &'static str| -> Result<CrateLinks<'static>, LinksError<'static>> {
-            let outline = blaze_file_items::outline(text, Edition::E2021, alloc);
-            let mut gather = Gather::new("gcloud_sdk", Edition::E2021, MAC, &[], alloc);
+        let walk = |text: &'static str| {
+            let outline = blaze_file_items::outline(text, Edition::E2021, bump.alloc());
+            let mut gather = Gather::new("gcloud_sdk", Edition::E2021, MAC, &[], bump);
             gather.text(TextOf::Expansion(index_key(ItemIndex(9))), text, &outline, &|_| Entry::Unkeyed)?;
             gather.finish()
         };
@@ -1490,11 +1547,11 @@ mod tests {
         assert!(links.foreign.is_empty() && links.exports.is_empty() && links.decls.is_empty(), "nothing to link");
 
         // The cause's CONTROL: what the old rule refused on.
-        let outline = blaze_file_items::outline(gcloud, Edition::E2021, alloc);
+        let outline = blaze_file_items::outline(gcloud, Edition::E2021, bump.alloc());
         let member = outline.item(ItemIndex(2));
         let body = cut(gcloud, member.range).unwrap_or_else(|| panic!("entry 2 is outside its text"));
         assert!(body.contains("extern") && !has_extern_word(body), "the bytes `extern` are there, the word is not");
-        assert!(blaze_file_items::nested::scan(body, alloc).writes(), "the body writes a block (its `stringify!` call)");
+        assert!(blaze_file_items::nested::scan(body, bump.alloc()).writes(), "the body writes a block (its `stringify!` call)");
 
         // CONTROL: the same member declaring an extern block needs its key, and names itself.
         let declares: &'static str = std::boxed::Box::leak(gcloud.replace("let name", "extern \"C\" { fn real(); }\nlet name").into_boxed_str());
@@ -1517,12 +1574,14 @@ mod tests {
     /// same text with the entry keyed gives both.
     #[test]
     fn an_attribute_macro_s_input_is_passed_over() {
-        let alloc = blaze_own::testing::heap().alloc();
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = Erased::new(&frame);
+        let bump = erased.bump();
         let text = "#[no_mangle] pub extern \"C\" fn taken() { extern \"C\" { fn inside(); } }\n\
                     #[no_mangle] pub extern \"C\" fn kept() {}\n";
-        let walk = |input: bool| -> CrateLinks<'static> {
-            let outline = blaze_file_items::outline(text, Edition::E2021, alloc);
-            let mut gather = Gather::new("t", Edition::E2021, MAC, &[], alloc);
+        let walk = |input: bool| {
+            let outline = blaze_file_items::outline(text, Edition::E2021, bump.alloc());
+            let mut gather = Gather::new("t", Edition::E2021, MAC, &[], bump);
             let key_of = |at: ItemIndex| if input && at == ItemIndex(0) { Entry::Input } else { Entry::Keyed(index_key(at)) };
             gather.text(TextOf::File("src/lib.rs"), text, &outline, &key_of).unwrap_or_else(|e| panic!("refused: {e:?}"));
             gather.finish().unwrap_or_else(|e| panic!("refused: {e:?}"))
@@ -1539,10 +1598,12 @@ mod tests {
     /// refused, now naming the macro, the block's path (`ffi`), its line and the text.
     #[test]
     fn an_unkeyed_call_in_an_extern_block_names_the_macro_and_the_block() {
-        let alloc = blaze_own::testing::heap().alloc();
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = Erased::new(&frame);
+        let bump = erased.bump();
         let file = "mod ffi {\n    extern \"C\" {\n        prefixed_item! { link_name f { fn f(); } }\n    }\n}\n";
-        let outline = blaze_file_items::outline(file, Edition::E2021, alloc);
-        let mut gather = Gather::new("t", Edition::E2021, MAC, &[], alloc);
+        let outline = blaze_file_items::outline(file, Edition::E2021, bump.alloc());
+        let mut gather = Gather::new("t", Edition::E2021, MAC, &[], bump);
         assert_eq!(
             gather.text(TextOf::File("src/ffi.rs"), file, &outline, &|_| Entry::Unkeyed).err(),
             Some(LinksError::Unkeyed { krate: "t", text: TextOf::File("src/ffi.rs"), at: ItemIndex(2), line: 3, item: "ffi", needs: KeyFor::Call { mac: "prefixed_item" } })

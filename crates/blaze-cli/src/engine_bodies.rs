@@ -1668,6 +1668,88 @@ impl core::fmt::Display for ScopeRefusal {
     }
 }
 
+/// Per-phase cache of each crate's opened `(Input, CrateRecords)` indexed by world crate index
+/// (`0..list.len()`), so building check scopes for many crates in one phase (`HeadsStage`) asks
+/// `EngineRecords` at most once per unique crate instead of repeating lookups across overlapping
+/// dependency closures.
+pub(crate) struct ScopeCache<'r> {
+    slots: blaze_own::Vec<Option<(blaze_drive::Input, crate::front_load::CrateRecords<'r>)>, blaze_own::Alloc<'static>>,
+}
+
+impl<'r> ScopeCache<'r> {
+    pub(crate) fn new(len: usize, alloc: blaze_own::Alloc<'static>) -> ScopeCache<'r> {
+        let mut slots = blaze_own::Vec::with_capacity_in(len, alloc);
+        slots.resize(len, None);
+        ScopeCache { slots }
+    }
+
+    pub(crate) fn records_of(
+        &mut self,
+        read: &mut EngineRecords<'r>,
+        cx: &Cx,
+        store: &mut dyn crate::store::Store<'r>,
+        names: NamesInputs<'_, '_>,
+        list: &blaze_world::crate_list::CrateList<'static>,
+        at: usize,
+        g: blaze_own::Alloc<'static>,
+    ) -> Result<(blaze_drive::Input, crate::front_load::CrateRecords<'r>), ScopeRefusal> {
+        if let Some(cached) = self.slots.get(at).copied().flatten() {
+            return Ok(cached);
+        }
+        let name = blaze_drive::key::crate_scope_name(&list.key(at));
+        let krate = CrateGraph::name(list, at);
+        let input = names.input_of(name).ok_or_else(|| ScopeRefusal::NoNamesRecord { krate, at, failed: names.failed(name) })?;
+        let records = read.scope_records(cx, store, &input, list.key(at), krate, g).map_err(|error| ScopeRefusal::Records { krate, at, error })?;
+        if let Some(slot) = self.slots.get_mut(at) {
+            *slot = Some((input, records));
+        }
+        Ok((input, records))
+    }
+}
+
+/// Crate `at`'s check scope (blaze-world check_scope.rs `check_scope_in`), reusing `cache` so
+/// each crate's records are asked of `read` at most once per phase across all scopes built with
+/// `cache`.
+#[expect(clippy::too_many_arguments, reason = "a stage's handles, each named")]
+pub(crate) fn scope_of_cached<'r>(
+    cache: &mut ScopeCache<'r>,
+    read: &mut EngineRecords<'r>,
+    cx: &Cx,
+    store: &mut dyn crate::store::Store<'r>,
+    names: NamesInputs<'_, '_>,
+    list: &blaze_world::crate_list::CrateList<'static>,
+    at: usize,
+    heap: &'static blaze_own::Heap,
+) -> Result<(Scope<'r>, bool), ScopeRefusal> {
+    let g = heap.alloc();
+    let (_, own_records) = cache.records_of(read, cx, store, names, list, at, g)?;
+    let no_core = blaze_scope::names_record::NamesRecord::open(own_records.names_proof).crate_root().head().no_core;
+    let checked = blaze_world::check_scope::check_scope_in(list, at, no_core, g).map_err(|error| ScopeRefusal::CheckScope { error })?;
+    let mut scope = Scope { own_records, crates: Vec::new_in(Global), lang: Vec::new_in(Global), scope: Vec::new_in(Global), cut: None };
+    scope.lang.extend(checked.lang_places());
+    let mut whole = true;
+    for one in checked.crates() {
+        let (input, records) = match cache.records_of(read, cx, store, names, list, one, g) {
+            Ok(found) => found,
+            Err(ScopeRefusal::NoNamesRecord { failed, .. }) => {
+                whole = false;
+                scope.cut = Some((one, CutWhy::NoNamesRecord { failed }));
+                break;
+            }
+            Err(ScopeRefusal::Records { error, .. }) => {
+                whole = false;
+                scope.cut = Some((one, CutWhy::Unreadable(error)));
+                break;
+            }
+            Err(ScopeRefusal::CheckScope { error }) => return Err(ScopeRefusal::CheckScope { error }),
+        };
+        scope.crates.push(Crate { records, name: CrateGraph::name(list, one), package: list.shown_from(one), world_at: one });
+        scope.scope.push(input.name);
+    }
+    scope.scope.sort_unstable();
+    Ok((scope, whole))
+}
+
 /// Crate `at`'s check scope (blaze-world check_scope.rs `check_scope_in`), each crate's
 /// records read in place through `read` (engine_records.rs), and whether every crate of it had
 /// records (`false`: the scope was cut, [`Scope::cut`] says where and why, and the caller refuses by
@@ -1675,36 +1757,8 @@ impl core::fmt::Display for ScopeRefusal {
 /// ([`ScopeRefusal`]); nothing is dropped (rule 3).
 #[expect(clippy::too_many_arguments, reason = "a stage's handles, each named")]
 pub(crate) fn scope_of<'r>(read: &mut EngineRecords<'r>, cx: &Cx, store: &mut dyn crate::store::Store<'r>, names: NamesInputs<'_, '_>, list: &blaze_world::crate_list::CrateList<'static>, at: usize, heap: &'static blaze_own::Heap) -> Result<(Scope<'r>, bool), ScopeRefusal> {
-    let g = heap.alloc();
-    let name_at = |at: usize| blaze_drive::key::crate_scope_name(&list.key(at));
-    let input_at = |at: usize| names.input_of(name_at(at));
-    let krate = CrateGraph::name(list, at);
-    let own = input_at(at).ok_or_else(|| ScopeRefusal::NoNamesRecord { krate, at, failed: names.failed(name_at(at)) })?;
-    let own_records = read.scope_records(cx, store, &own, list.key(at), krate, g).map_err(|error| ScopeRefusal::Records { krate, at, error })?;
-    let no_core = blaze_scope::names_record::NamesRecord::open(own_records.names_proof).crate_root().head().no_core;
-    let checked = blaze_world::check_scope::check_scope_in(list, at, no_core, g).map_err(|error| ScopeRefusal::CheckScope { error })?;
-    let mut scope = Scope { own_records, crates: Vec::new_in(Global), lang: Vec::new_in(Global), scope: Vec::new_in(Global), cut: None };
-    scope.lang.extend(checked.lang_places());
-    let mut whole = true;
-    for one in checked.crates() {
-        let Some(input) = input_at(one) else {
-            whole = false;
-            scope.cut = Some((one, CutWhy::NoNamesRecord { failed: names.failed(name_at(one)) }));
-            break;
-        };
-        let records = match read.scope_records(cx, store, &input, list.key(one), CrateGraph::name(list, one), g) {
-            Ok(records) => records,
-            Err(error) => {
-                whole = false;
-                scope.cut = Some((one, CutWhy::Unreadable(error)));
-                break;
-            }
-        };
-        scope.crates.push(Crate { records, name: CrateGraph::name(list, one), package: list.shown_from(one), world_at: one });
-        scope.scope.push(input.name);
-    }
-    scope.scope.sort_unstable();
-    Ok((scope, whole))
+    let mut cache = ScopeCache::new(CrateGraph::len(list), heap.alloc());
+    scope_of_cached(&mut cache, read, cx, store, names, list, at, heap)
 }
 
 /// Crate `at`'s check scope MADE BY NEED (piece C (a)) over its own records `own_records`, which
@@ -1799,7 +1853,7 @@ fn planned_label<'f>(labels: &mut Labels<'f>, cx: &Cx, root: &Dir<ReadWrite>, ou
         None => {
             let made = file_labels(cx, root, outlined, file, frame).map_err(|lost| {
                 let words = bstd::mem::format_in!(frame, "{{a body of a file whose text could not be read again to name it: {lost}}}");
-                core::str::from_utf8(words.into_bytes().leak()).unwrap_or("{a body of a file whose text could not be read again}")
+                &*words.into_bump_str()
             });
             labels.push((file, made));
             labels.len() - 1
@@ -1855,7 +1909,7 @@ fn file_labels<'f>(cx: &Cx, root: &Dir<ReadWrite>, outlined: &[crate::engine_tas
             false => bstd::mem::format_in!(frame, "{shown}"),
             true => bstd::mem::format_in!(frame, "{{a macro call}}"),
         };
-        let label: &'f str = core::str::from_utf8(label.into_bytes().leak()).unwrap_or("");
+        let label: &'f str = label.into_bump_str();
         found.push((work::body_name(one.name, &outline, item, text), label));
     }
     Ok(found)
@@ -1871,7 +1925,7 @@ fn body_subject<'p>(one: &Ran<'_>, name: Name, base: Name, outlined: &[Outlined<
     let file = outlined.get(one.file as usize).ok_or(EngineCheckError::Unplaced { body: name, what: "its file is none of the planner's outlines" })?;
     let path = core::str::from_utf8(&file.path).map_err(|_| EngineCheckError::Unplaced { body: name, what: "its file's checkout path is not UTF-8" })?;
     let item = bstd::mem::format_in!(frame, "{}", crate::engine_body_plan::Named::of(one.label, outlined, one.file, base));
-    let item: &'p str = core::str::from_utf8(item.into_bytes().leak()).unwrap_or("");
+    let item: &'p str = item.into_bump_str();
     Ok(blaze_report::finding::Subject::Item { file: work::held_str(path, frame), item })
 }
 
@@ -3069,7 +3123,7 @@ impl<'f> BodiesStage<'f> {
                         let mut ids = plan_cells();
                         ids.sort_unstable();
                         ids.dedup();
-                        ids.leak()
+                        ids.into_bump_slice()
                     };
                     match decided {
                         Decision::Taken { took, .. } => {
@@ -3082,7 +3136,7 @@ impl<'f> BodiesStage<'f> {
                                     if file as usize >= handles.outlined.len() {
                                         return Err(EngineCheckError::Unplaced { body: name, what: "its file is none of the planner's outlines" }.into());
                                     }
-                                    let held = plan_cells().leak();
+                                    let held = plan_cells().into_bump_slice();
                                     ones.push(One { task: *task, items, group, file, label: one.label, place: one.place, held, part: None, costs: one.costs, asked: one.asked });
                                     continue;
                                 }
@@ -3166,7 +3220,7 @@ impl<'f> BodiesStage<'f> {
         self.reach = reach;
         // 3. Your code first is the next piece (engine.md 4); today: by member, file, name.
         ones.sort_unstable_by_key(|one| (one.group, one.file, one.task.planned.name));
-        let ones: &'f [One<'f>] = ones.leak();
+        let ones: &'f [One<'f>] = ones.into_bump_slice();
         // The memory status's slots sized once for every body to check: a slice has its
         // entry's path and label, so the entries cover the slices `run_phase` cuts.
         handles.board.bodies_mem.prepare(ones, handles.outlined, heap.shared())?;
@@ -3430,7 +3484,7 @@ impl<'f> BodiesStage<'f> {
             for (row, said, head_failed) in run_out.notes {
                 let said = said.map_task(|error| {
                     let text = bstd::mem::format_in!(frame, "{error}");
-                    &*blaze_own::Box::leak(text.into_boxed_str())
+                    &*text.into_bump_str()
                 });
                 ran[row].note = Some(frame.alloc(BodyNote { said, head_failed }));
             }
@@ -4091,7 +4145,7 @@ impl<'f> BodiesStage<'f> {
                     // missed an input (engine_member_rows.rs THE KEY, rule 21).
                     #[cfg(test)]
                     if let Some(records) = records {
-                        let made = crate::engine_member_rows::make(records, expansions.as_ref(), g);
+                        let made = crate::engine_member_rows::make(records, expansions.as_ref(), frame, g);
                         let (mut fresh, mut read): (Vec<u8, blaze_own::Alloc<'static>>, Vec<u8, blaze_own::Alloc<'static>>) = (Vec::new_in(g), Vec::new_in(g));
                         crate::engine_member_rows::encode(&made, &mut fresh);
                         crate::engine_member_rows::encode(&row, &mut read);
@@ -4103,10 +4157,10 @@ impl<'f> BodiesStage<'f> {
                 }
                 (stored, Some(records)) => {
                     let damaged = matches!(stored, Some(Err(_)));
-                    let made = crate::engine_member_rows::make(records, expansions.as_ref(), g);
+                    let made = crate::engine_member_rows::make(records, expansions.as_ref(), frame, g);
                     let mut bytes: Vec<u8, blaze_own::Alloc<'static>> = Vec::new_in(g);
                     crate::engine_member_rows::encode(&made, &mut bytes);
-                    let bytes: &'static [u8] = bytes.leak();
+                    let bytes: &'static [u8] = bytes.leak_static();
                     if damaged {
                         // Other bytes stand under its key: the store refuses a second form (rule
                         // 21), so the row is made each command and counted, never put over.
@@ -4287,7 +4341,7 @@ impl<'f> BodiesStage<'f> {
                             (true, Some(by)) => bstd::mem::format_in!(g, "{{the expansion of `{by}!`}}"),
                             (true, None) => bstd::mem::format_in!(g, "{{a macro call}}"),
                         };
-                        let label: &'f str = core::str::from_utf8(label.into_bytes().leak()).unwrap_or("");
+                        let label: &'f str = blaze_own::Box::leak_static(label.into_boxed_str());
                         // The entry's bodies, each with where its findings are printed: the
                         // entry's own (`None`: from the item's start), or each body an expansion
                         // at it wrote, by its label as `check` names it (covered.rs
@@ -4298,7 +4352,7 @@ impl<'f> BodiesStage<'f> {
                         // the three are apart (a listed body with an entry is no macro's, and a
                         // walk that ends in a file is no block's): so checked once (rule 77).
                         let mut keys: Vec<ItemKey, _> = Vec::new_in(g);
-                        let mut labels: Vec<Option<Unplaced<'f>>, _> = Vec::new_in(g);
+                        let mut labels: Vec<Option<Unplaced<'static>>, _> = Vec::new_in(g);
                         // D167 (a): each key's predicted cost, made from the rows once the
                         // keys are found (below).
                         let mut costs: Vec<u32, _> = Vec::new_in(g);
@@ -4327,7 +4381,7 @@ impl<'f> BodiesStage<'f> {
                                         Some(key) => {
                                             keys.push(key);
                                             let shown = bstd::mem::format_in!(g, "{}", w.label);
-                                            let shown: &'f str = core::str::from_utf8(shown.into_bytes().leak()).unwrap_or("");
+                                            let shown: &'static str = blaze_own::Box::leak_static(shown.into_boxed_str());
                                             labels.push(Some(Unplaced { label: shown, words: crate::body_types::covered::WRITTEN_UNPLACED }));
                                         }
                                         None => break 'own Err("a member a macro wrote has no key of its own in its crate's records"),
@@ -4389,7 +4443,7 @@ impl<'f> BodiesStage<'f> {
                                         let from = blocks.partition_point(|b| b.owner < owner);
                                         for b in blocks[from..].iter().take_while(|b| b.owner == owner) {
                                             let shown = bstd::mem::format_in!(g, "{}", BlockLabel { entry: label, name: b.name });
-                                            let shown: &'f str = core::str::from_utf8(shown.into_bytes().leak()).unwrap_or("");
+                                            let shown: &'static str = blaze_own::Box::leak_static(shown.into_boxed_str());
                                             keys.push(b.key);
                                             labels.push(Some(Unplaced { label: shown, words: crate::body_types::covered::BLOCK_UNPLACED }));
                                         }
@@ -4401,11 +4455,11 @@ impl<'f> BodiesStage<'f> {
                                     let own_body = k == 0 && labels.first().is_some_and(Option::is_none);
                                     costs.push(if own_body { item.range.len().max(MIN_BODY_BYTES) } else { text_bytes(&items, &mut member_lens, outline, file, *key, g) });
                                 }
-                                Ok((at, &*keys.leak()))
+                                Ok((at, &*keys.leak_static()))
                             }
                         };
-                        let place = Place { chain: work::item_chain(outline, item, text), file, item: item.range, written: &*labels.leak() };
-                        let costs: &'f [u32] = costs.leak();
+                        let place = Place { chain: work::item_chain(outline, item, text), file, item: item.range, written: &*labels.leak_static() };
+                        let costs: &'f [u32] = costs.leak_static();
                         // Each key as a program calls it, over the records it was found in.
                         let mut called: Vec<blaze_typeck::ItemKey, _> = Vec::new_in(g);
                         if let Ok((_, keys)) = found {
@@ -4462,7 +4516,7 @@ impl<'f> BodiesStage<'f> {
                                 }
                             }
                         }
-                        let called: &'f [blaze_typeck::ItemKey] = called.leak();
+                        let called: &'f [blaze_typeck::ItemKey] = called.leak_static();
                         if grown.is_ok() {
                             grown = EngineCheckError::push(&mut took, Took { name, label, item: found, place, unit, costs, asked: called }, "the bodies found in their crates' records (engine_bodies.rs `groups`)");
                         }
@@ -5437,7 +5491,7 @@ fn join_slices<'a, 'f>(
     if noted {
         let words = leak(g, format_args!("{joined_why}"));
         let said = match types_short {
-            true => Said::Unchecked { why: words, calls: if calls.is_empty() { &[] } else { calls.leak() } },
+            true => Said::Unchecked { why: words, calls: if calls.is_empty() { &[] } else { calls.leak_static() } },
             false => Said::BorrowsUnchecked(words),
         };
         joined.notes.push((0, said, None));
@@ -5493,7 +5547,8 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
     // impl table's notes, the evaluator's sink and the constants' lists were placed in the frame
     // but grew on the process heap (`g`), never freed until the request ended: the Bodies
     // stage's growth on a 700-crate workspace (engine_bodies.rs memory table, lane BD1).
-    let fa = frame.alloc(blaze_own::Erased::new(frame)).handle();
+    let fb = frame.alloc(blaze_own::Erased::new(frame)).bump();
+    let fa = fb.alloc();
     // The impls from the request's shelf: each impl question reads its crate's bucket cell
     // (front2 tables/task.rs `cell_id`), which the Heads stage defined. Held in the stretch's
     // frame, so it lives as long as the records it is read beside (`Tables` takes both for one
@@ -5558,7 +5613,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                     }
                 });
             }
-            let consts = index.map(|index| frame.alloc(crate::engine_head_consts::HeadConsts::new(tables.reading_into(evaluated), index, fa)) as &mut (dyn ConstValues<'_> + '_));
+            let consts = index.map(|index| frame.alloc(crate::engine_head_consts::HeadConsts::new(tables.reading_into(evaluated), index, fb)) as &mut (dyn ConstValues<'_> + '_));
             // The program's receiver pointer types, as the Heads stage's freezes are made with
             // (engine_heads.rs `heads_of`): without them this freezer would write other bytes
             // under a dependency head's key (rule 21; lane H9).
@@ -6153,7 +6208,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                     } else {
                         let mut kept = Vec::with_capacity_in(calls.len(), g);
                         kept.extend_from_slice(&calls);
-                        kept.leak()
+                        kept.leak_static()
                     };
                     Said::Unchecked { why: words, calls }
                 } else {
@@ -6343,7 +6398,7 @@ fn found_of<'s>(line: &Line<'_>, written: Option<Unplaced<'_>>, item: Option<(&s
         }
     };
     message.extend_from_slice(line.words.as_str().as_bytes());
-    Ok(Some(BodyFinding { rule, at, message: &*message.leak() }))
+    Ok(Some(BodyFinding { rule, at, message: &*message.into_bump_slice() }))
 }
 
 // The code of a body's diagnostic that says its text does not parse (front2 project.rs
@@ -6368,7 +6423,7 @@ fn syntax_found<'s>(line: &Line<'_>, written: Option<Unplaced<'_>>, item: Option
     let error = outline.errors().iter().find(|error| error.range.start >= line.start).ok_or(SYNTAX_UNFOUND)?;
     let range = error.range.start as usize..error.range.end as usize;
     let at = FoundAt::Tokens(blaze_file_items::token_place(text, edition, range).map_err(|_| NOT_TOKENS)?);
-    let message = Vec::from_slice_in(outline.message(error).as_bytes(), scratch).leak();
+    let message = scratch.alloc_slice_copy(outline.message(error).as_bytes());
     Ok(BodyFinding { rule: work::SYNTAX, at, message: &*message })
 }
 
@@ -6409,7 +6464,7 @@ fn left_found<'s>(
         _ => None,
     };
     let at = placed.map_or(FoundAt::Start, FoundAt::Tokens);
-    BodyFinding { rule: crate::names::include_outside::INCLUDE_OUTSIDE_PACKAGE, at, message: &*message.leak() }
+    BodyFinding { rule: crate::names::include_outside::INCLUDE_OUTSIDE_PACKAGE, at, message: &*message.into_bump_slice() }
 }
 
 /// Why a body's syntax error has no place: its text is a macro's expansion.
@@ -6511,9 +6566,9 @@ fn absent_entry<'n>(
 /// called here, crate_env.rs `EnvLent`), as body_types.rs does for its workers.
 fn env_in<'l: 'n, 'n>(lent: Option<EnvLent<'_, 'l>>, frame: &'n Frame) -> Result<Option<&'n blaze_scope::crate_env::CrateEnv<'n>>, blaze_build_script::outputs::RecordError> {
     let Some(lent) = lent else { return Ok(None) };
-    let erased: &'n blaze_own::Erased<&'n Frame> = blaze_own::Box::leak(blaze_own::Box::new_in(blaze_own::Erased::new(frame), frame));
-    let env = lent.copy_in(erased.handle())?;
-    Ok(Some(&*blaze_own::Box::leak(blaze_own::Box::new_in(env, frame))))
+    let erased: &'n blaze_own::Erased<&'n Frame> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(blaze_own::Erased::new(frame), frame));
+    let env = lent.copy_in(erased.bump())?;
+    Ok(Some(&*blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(env, frame))))
 }
 
 /// The stretch's evaluator appends distinct keys. Place just the new suffix, retaining at most

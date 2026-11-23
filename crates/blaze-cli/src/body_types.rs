@@ -153,7 +153,7 @@ fn open_trees(cx: &Cx, env: &crate::fetch::FetchEnv<'_>, list: &CrateList<'stati
         // Within the room reserved above: allocates nothing.
         views.push(open_tree(cx, from, list, k, &mut dirs, scratch)?);
     }
-    Ok((views.leak(), corrected_of(list, from.heap)?))
+    Ok((views.leak_static(), corrected_of(list, from.heap)?))
 }
 
 /// `list`'s corrected files (D58), on `heap` for the command: read from the list, nothing opened.
@@ -165,7 +165,7 @@ pub(crate) fn corrected_of(list: &CrateList<'static>, heap: &'static blaze_own::
         }
         corrected.push((tree, path, text));
     }
-    Ok(corrected.leak())
+    Ok(corrected.leak_static())
 }
 
 /// Where a crate list's packs are opened from: the home (the shelf and the sources store are
@@ -197,7 +197,7 @@ pub(crate) struct PackDirs {
 /// the first time a tree of it is asked. A refusal's words are kept on `from.heap`.
 fn open_tree(cx: &Cx, from: PackHome<'_>, list: &CrateList<'static>, k: usize, dirs: &mut PackDirs, scratch: &Frame) -> Result<PackView<'static>, &'static str> {
     let heap = from.heap;
-    let kept = |words: &str| -> &'static str { blaze_own::Box::leak(blaze_own::AString::from_str_in(words, heap.alloc()).into_boxed_str()) };
+    let kept = |words: &str| -> &'static str { blaze_own::Box::leak_static(blaze_own::AString::from_str_in(words, heap.alloc()).into_boxed_str()) };
     let Some(row) = list.tree(k) else {
         return Err(kept(bstd::mem::format_in!(scratch, "the crate list names no tree {k} of its {} (blaze-world crate_list.rs)", list.trees()).as_str()));
     };
@@ -210,7 +210,7 @@ fn open_tree(cx: &Cx, from: PackHome<'_>, list: &CrateList<'static>, k: usize, d
 /// asked; a refusal's words are kept on `from.heap`.
 pub(crate) fn open_row(cx: &Cx, from: PackHome<'_>, row: TreeRow, k: usize, dirs: &mut PackDirs, scratch: &Frame) -> Result<PackView<'static>, &'static str> {
     let heap = from.heap;
-    let kept = |words: &str| -> &'static str { blaze_own::Box::leak(blaze_own::AString::from_str_in(words, heap.alloc()).into_boxed_str()) };
+    let kept = |words: &str| -> &'static str { blaze_own::Box::leak_static(blaze_own::AString::from_str_in(words, heap.alloc()).into_boxed_str()) };
     let (folder, name, dir) = match row.origin {
         PackOrigin::Shelf { digest } => (crate::toolchain::SHELF, digest, &mut dirs.shelf),
         PackOrigin::Source { key } => (crate::fetch::SOURCES, key.0, &mut dirs.sources),
@@ -232,7 +232,7 @@ pub(crate) fn open_row(cx: &Cx, from: PackHome<'_>, row: TreeRow, k: usize, dirs
     let file = Path::new(hex).map_err(|e| kept(bstd::mem::format_in!(scratch, "{at}: {e}").as_str()))?;
     let mapping = dir.map_read(cx, &file).map_err(|e| kept(bstd::mem::format_in!(scratch, "{at} could not be mapped: {e}").as_str()))?;
     // Kept for the command: every body reads the pack's files in place.
-    let mapping: &'static blaze_core::Mapping = blaze_own::Box::leak(blaze_own::Box::new_in(mapping, heap.alloc()));
+    let mapping: &'static blaze_core::Mapping = blaze_own::Box::leak_static(blaze_own::Box::new_in(mapping, heap.alloc()));
     let bytes = mapping.bytes();
     if let PackOrigin::Shelf { digest } = row.origin
         && bytes.get(bytes.len().saturating_sub(32)..) != Some(&digest[..])
@@ -315,7 +315,7 @@ impl<'n> LazyTrees<'n> {
         let mut slots: Vec<TreeSlot, &'n Frame> = Vec::with_capacity_in(trees, frame);
         slots.extend((0..trees).map(|_| TreeSlot::new()));
         seen.trees.set(u32::try_from(trees).unwrap_or(u32::MAX));
-        LazyTrees { opener, slots: slots.leak(), seen }
+        LazyTrees { opener, slots: slots.into_bump_slice(), seen }
     }
 
     /// Tree `k`'s pack (1-based), opened at its first ask; `None` for no such tree, or one that
@@ -375,7 +375,7 @@ pub(crate) fn owner_env_by<'j>(
             };
             let payload = crate::work::payload(cx, store, &handed, jobs)?;
             read = Some((handed.name, handed.out));
-            let bytes: &'j [u8] = blaze_own::Vec::from_slice_in(payload.payload(), jobs).leak();
+            let bytes: &'j [u8] = jobs.alloc_slice_copy(payload.payload());
             Some(bytes)
         }
     };
@@ -395,7 +395,7 @@ pub(crate) fn owner_env_by<'j>(
 /// `jobs`. Refused by name: a script record that is not an outputs record, a version that is
 /// not SemVer.
 pub(crate) fn row_env<'j>(list: &CrateList<'static>, at: usize, script: Option<&'j [u8]>, home: Option<&str>, jobs: &'j Frame) -> Result<&'j blaze_scope::crate_env::CrateEnv<'j>, &'static str> {
-    let erased: &'j blaze_own::Erased<&'j Frame> = blaze_own::Box::leak(blaze_own::Box::new_in(blaze_own::Erased::new(jobs), jobs));
+    let erased: &'j blaze_own::Erased<&'j Frame> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(blaze_own::Erased::new(jobs), jobs));
     let alloc = erased.handle();
     let mut facts: blaze_scope::crate_env::EnvFacts<'j> = list.env_facts(at);
     if let Some(bytes) = script {
@@ -405,13 +405,13 @@ pub(crate) fn row_env<'j>(list: &CrateList<'static>, at: usize, script: Option<&
         let Ok(outputs) = blaze_build_script::outputs::OutputsRef::open(record) else {
             return Err("a crate's build-script record is not an outputs record (blaze-build-script `OutputsRef::open`)");
         };
-        let area: &'j blaze_world::StoredFiles = blaze_own::Box::leak(blaze_own::Box::new_in(crate::scripts::file_area(home, &outputs), jobs));
+        let area: &'j blaze_world::StoredFiles = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(crate::scripts::file_area(home, &outputs), jobs));
         facts.script = Some(outputs.with_area(area));
     }
     let Ok(env) = blaze_scope::crate_env::CrateEnv::of(facts, alloc) else {
         return Err("a crate's package version is not MAJOR.MINOR.PATCH (the cargo book, \"The `version` field\")");
     };
-    Ok(blaze_own::Box::leak(blaze_own::Box::new_in(env, jobs)))
+    Ok(blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(env, jobs)))
 }
 
 /// An owner's lent environment and the script read it was made with ([`owner_env_by`]).

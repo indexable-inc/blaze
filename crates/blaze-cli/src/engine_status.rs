@@ -134,14 +134,46 @@ struct Counts {
     phase_from: AtomicU64,
 }
 
-/// A running task.
+/// A running task or live sub-activity.
 #[derive(Clone, Copy)]
 struct Slot {
-    stage: Stage,
+    stage: Option<Stage>,
+    kind: blaze_screen::WorkKind,
     label: Label,
     from_ns: u64,
     /// Its frame's bytes used when it began (a worker's frame is not read from another thread).
     frame: u64,
+}
+
+/// Default [`blaze_screen::WorkKind`] for an engine [`Stage`].
+const fn default_work_kind(stage: Stage) -> blaze_screen::WorkKind {
+    match stage {
+        Stage::Scripts => blaze_screen::WorkKind::BuildScript,
+        Stage::Units | Stage::Outlines | Stage::Names | Stage::Heads | Stage::Bodies | Stage::Lints => {
+            blaze_screen::WorkKind::Blaze
+        }
+    }
+}
+
+/// Concise lowercase name for a Blaze checking stage in the live TUI hint.
+const fn stage_hint_name(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Units => "units",
+        Stage::Scripts => "scripts",
+        Stage::Outlines => "outlines",
+        Stage::Names => "names",
+        Stage::Heads => "heads",
+        Stage::Bodies => "bodies",
+        Stage::Lints => "lints",
+    }
+}
+
+/// Snapshot of active tasks grouped by [`blaze_screen::WorkKind`], slowest-first per group.
+struct Grouped {
+    top: [[Option<Slot>; blaze_screen::MAX_GROUP_ITEMS]; blaze_screen::WORK_KINDS],
+    counts: [u32; blaze_screen::WORK_KINDS],
+    active: u32,
+    blaze_stages: u8,
 }
 
 /// Who writes the stopped status: the first to claim it.
@@ -185,6 +217,21 @@ pub(crate) struct Running<'b> {
     stage: Stage,
     slot: Option<usize>,
     from_ns: u64,
+}
+
+/// A live sub-activity on the board (such as a Wasmtime proc-macro expansion running inside a
+/// `Names` or `Bodies` task): frees its slot on drop without altering stage task counts.
+pub(crate) struct ActivityGuard<'b> {
+    board: &'b Board<'b>,
+    slot: Option<usize>,
+}
+
+impl Drop for ActivityGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.and_then(|at| self.board.slots.get(at)) {
+            *slot.lock() = None;
+        }
+    }
 }
 
 /// A phase begun: what [`Board::phase_ended`] tops up from.
@@ -296,22 +343,85 @@ impl<'r> Board<'r> {
     /// A task of `stage` starts now and runs whatever is asked (a stage whose tasks are begun
     /// all at once: its stop is the driver's, after them).
     pub(crate) fn show(&self, stage: Stage, label: Label, frame: u64, now: u64) -> Running<'_> {
+        self.show_kind(stage, default_work_kind(stage), label, frame, now)
+    }
+
+    /// A task of `stage` with explicit [`blaze_screen::WorkKind`] attribution starts now.
+    pub(crate) fn show_kind(
+        &self,
+        stage: Stage,
+        kind: blaze_screen::WorkKind,
+        label: Label,
+        frame: u64,
+        now: u64,
+    ) -> Running<'_> {
         self.counts[stage.index()].started.fetch_add(1, Ordering::AcqRel);
-        let first = self.cursor.fetch_add(1, Ordering::Relaxed);
-        let mut slot = None;
-        for step in 0..SLOTS {
-            let at = (first + step) % SLOTS;
-            let mut held = self.slots[at].lock();
-            if held.is_none() {
-                *held = Some(Slot { stage, label, from_ns: now, frame });
-                slot = Some(at);
-                break;
-            }
-        }
+        let slot = self.claim_slot(Slot { stage: Some(stage), kind, label, from_ns: now, frame });
         if slot.is_none() {
             self.unslotted.fetch_add(1, Ordering::AcqRel);
         }
         Running { board: self, stage, slot, from_ns: now }
+    }
+
+    /// A live sub-activity (e.g. Wasmtime proc-macro expansion) starts now: shown in the live TUI
+    /// and status dumps without modifying stage task counters.
+    pub(crate) fn show_activity(
+        &self,
+        kind: blaze_screen::WorkKind,
+        label: Label,
+        now: u64,
+    ) -> ActivityGuard<'_> {
+        let slot = self.claim_slot(Slot { stage: None, kind, label, from_ns: now, frame: 0 });
+        ActivityGuard { board: self, slot }
+    }
+
+    fn claim_slot(&self, entry: Slot) -> Option<usize> {
+        let first = self.cursor.fetch_add(1, Ordering::Relaxed);
+        for step in 0..SLOTS {
+            let at = (first + step) % SLOTS;
+            let Some(slot) = self.slots.get(at) else { continue };
+            let mut held = slot.lock();
+            if held.is_none() {
+                *held = Some(entry);
+                return Some(at);
+            }
+        }
+        None
+    }
+
+    /// Active tasks grouped by [`blaze_screen::WorkKind`], slowest-first (up to
+    /// [`blaze_screen::MAX_GROUP_ITEMS`] per category), plus active Blaze stage bitmask.
+    fn grouped(&self) -> Grouped {
+        let mut top: [[Option<Slot>; blaze_screen::MAX_GROUP_ITEMS]; blaze_screen::WORK_KINDS] =
+            [[None; blaze_screen::MAX_GROUP_ITEMS]; blaze_screen::WORK_KINDS];
+        let mut counts = [0u32; blaze_screen::WORK_KINDS];
+        let mut active = u32::try_from(self.unslotted.load(Ordering::Acquire)).unwrap_or(u32::MAX);
+        let mut blaze_stages = 0u8;
+        for slot in self.slots.iter() {
+            let Some(one) = *slot.lock() else { continue };
+            active = active.saturating_add(1);
+            let k = one.kind.index();
+            if let Some(count) = counts.get_mut(k) {
+                *count = count.saturating_add(1);
+            }
+            if one.kind == blaze_screen::WorkKind::Blaze
+                && let Some(stage) = one.stage
+            {
+                let bit = u8::try_from(stage.index()).unwrap_or(7);
+                if bit < 8 {
+                    blaze_stages |= 1u8 << bit;
+                }
+            }
+            if let Some(row) = top.get_mut(k)
+                && let Some(at) = row.iter().position(|existing| existing.is_none_or(|e| one.from_ns < e.from_ns))
+            {
+                row.copy_within(at..blaze_screen::MAX_GROUP_ITEMS - 1, at + 1);
+                if let Some(cell) = row.get_mut(at) {
+                    *cell = Some(one);
+                }
+            }
+        }
+        Grouped { top, counts, active, blaze_stages }
     }
 
     /// Each running task, the longest first (ties by slot), at most [`LONGEST`]; and how many
@@ -435,7 +545,10 @@ pub(crate) fn write_status(board: &Board<'_>, heading: Heading, now: u64, into: 
     let (longest, count) = board.longest();
     write!(into, "running: {count} task(s)")?;
     for one in longest.iter().flatten() {
-        write!(into, " · `{}` ({:?}) {} s, frame {} bytes", one.label.as_str(), one.stage, Secs(now.saturating_sub(one.from_ns)), one.frame)?;
+        match one.stage {
+            Some(stage) => write!(into, " · `{}` ({stage:?}) {} s, frame {} bytes", one.label.as_str(), Secs(now.saturating_sub(one.from_ns)), one.frame)?,
+            None => write!(into, " · `{}` ({}) {} s", one.label.as_str(), one.kind.label("blaze"), Secs(now.saturating_sub(one.from_ns)))?,
+        }
     }
     writeln!(into)?;
     if let Heading::Stopped { stuck: true, .. } = heading {
@@ -471,6 +584,36 @@ pub(crate) fn line(board: &Board<'_>, now: u64, into: &mut impl fmt::Write) -> f
     if let Some(stage) = most {
         let kept = u64::try_from(phase_mem[stage.index()].kept_on_heap.max(0)).unwrap_or(0);
         write!(into, " · kept past its phases: {stage:?} {} GB", Gb(kept))?;
+    }
+    let grouped = board.grouped();
+    // Explicitly attribute slow external work (`build.rs`, `fetch`, `proc-macro`) on periodic
+    // plain log lines so scripted / piped runs separate external script time from Blaze time.
+    for kind in [blaze_screen::WorkKind::BuildScript, blaze_screen::WorkKind::Fetch, blaze_screen::WorkKind::ProcMacro] {
+        let k = kind.index();
+        let total = grouped.counts.get(k).copied().unwrap_or(0);
+        if total == 0 {
+            continue;
+        }
+        match kind {
+            blaze_screen::WorkKind::BuildScript => write!(into, " · build.rs [external]: ")?,
+            blaze_screen::WorkKind::Fetch => write!(into, " · fetch: ")?,
+            blaze_screen::WorkKind::ProcMacro => write!(into, " · proc-macro: ")?,
+            blaze_screen::WorkKind::Blaze => {}
+        }
+        let mut shown = 0u32;
+        if let Some(row) = grouped.top.get(k) {
+            for one in row.iter().flatten() {
+                if shown > 0 {
+                    write!(into, ", ")?;
+                }
+                write!(into, "{} {} s", one.label.as_str(), now.saturating_sub(one.from_ns) / 1_000_000_000)?;
+                shown += 1;
+            }
+        }
+        let extra = total.saturating_sub(shown);
+        if extra > 0 {
+            write!(into, " +{extra}")?;
+        }
     }
     let (longest, _) = board.longest();
     if let Some(one) = longest[0] {
@@ -561,28 +704,95 @@ pub(crate) fn put(cx: &Cx, root: &Dir<ReadWrite>, err: &Out, text: &[u8]) -> Res
     Ok(())
 }
 
-/// Human-readable live progress verb for each engine stage.
-fn stage_verb(stage: Stage) -> &'static str {
-    match stage {
-        Stage::Units => "reading manifests",
-        Stage::Scripts => "running build scripts",
-        Stage::Outlines => "parsing files",
-        Stage::Names => "resolving names",
-        Stage::Heads => "checking heads",
-        Stage::Bodies => "checking bodies",
-        Stage::Lints => "linting",
+/// Publish the board's live grouped activity (`build.rs`, `fetch`, `proc-macro`, Blaze checking)
+/// and aggregate progress counts to `live`.
+pub(crate) fn report_live(board: &Board<'_>, now: u64, live: &(dyn blaze_screen::Watch + Sync)) {
+    let mut done_sum = 0u64;
+    let mut known_sum = 0u64;
+    for counts in board.counts.iter() {
+        let done = counts.done.load(Ordering::Acquire);
+        let known = counts.known.load(Ordering::Acquire).max(done);
+        done_sum = done_sum.saturating_add(done);
+        known_sum = known_sum.saturating_add(known);
     }
-}
+    let grouped = board.grouped();
+    if known_sum == 0 && grouped.active == 0 && board.stage().is_none() {
+        return;
+    }
+    let progress = (known_sum > 0).then(|| {
+        let done = u32::try_from(done_sum).unwrap_or(u32::MAX);
+        let total = u32::try_from(known_sum).unwrap_or(u32::MAX);
+        (done, total)
+    });
 
-/// Publish the board's live stage, task counts, and longest active task label to `live`.
-fn report_live(board: &Board<'_>, live: &(dyn blaze_screen::Watch + Sync)) {
-    let Some(stage) = board.stage() else { return };
-    let Some(counts) = board.counts.get(stage.index()) else { return };
-    let done = u32::try_from(counts.done.load(Ordering::Acquire)).unwrap_or(u32::MAX);
-    let total = u32::try_from(counts.known.load(Ordering::Acquire)).unwrap_or(u32::MAX);
-    let (longest, _) = board.longest();
-    let detail = longest.first().and_then(Option::as_ref).map(|slot| slot.label.as_str()).filter(|s| !s.is_empty());
-    live.see(blaze_screen::Step::Progress { stage: stage_verb(stage), done, total, detail });
+    // Build concise Blaze sub-stage hint (e.g. `names / bodies`).
+    let mut hint_buf = FixedString::<{ blaze_screen::HINT_BYTES }>::new();
+    let mut hint_parts = 0u8;
+    for stage in Stage::ALL {
+        let bit = u8::try_from(stage.index()).unwrap_or(7);
+        if bit < 8 && (grouped.blaze_stages & (1u8 << bit)) != 0 {
+            if hint_parts > 0 {
+                let _ = hint_buf.write_str(" / ");
+            }
+            let _ = hint_buf.write_str(stage_hint_name(stage));
+            hint_parts += 1;
+        }
+    }
+    let hint = (!hint_buf.as_str().is_empty()).then_some(hint_buf.as_str());
+
+    // Build per-category active item slices on the stack (zero heap allocation).
+    const EMPTY_ITEM: blaze_screen::ActiveItemRef<'static> =
+        blaze_screen::ActiveItemRef { label: "", elapsed_ms: 0 };
+    let mut item_storage = [[EMPTY_ITEM; blaze_screen::MAX_GROUP_ITEMS]; blaze_screen::WORK_KINDS];
+    let mut item_lens = [0usize; blaze_screen::WORK_KINDS];
+    for ((dst_row, dst_len), src_row) in item_storage.iter_mut().zip(item_lens.iter_mut()).zip(grouped.top.iter()) {
+        let mut len = 0usize;
+        for slot in src_row.iter().flatten() {
+            let label = slot.label.as_str();
+            if label.is_empty() {
+                continue;
+            }
+            if let Some(cell) = dst_row.get_mut(len) {
+                *cell = blaze_screen::ActiveItemRef {
+                    label,
+                    elapsed_ms: now.saturating_sub(slot.from_ns) / 1_000_000,
+                };
+                len += 1;
+            }
+        }
+        *dst_len = len;
+    }
+
+    let mut groups_buf = [blaze_screen::ActiveGroupRef {
+        kind: blaze_screen::WorkKind::Blaze,
+        items: &[],
+        extra: 0,
+    }; blaze_screen::WORK_KINDS];
+    let mut group_count = 0usize;
+    for (((kind, row), &len), &total) in blaze_screen::WorkKind::ALL
+        .into_iter()
+        .zip(item_storage.iter())
+        .zip(item_lens.iter())
+        .zip(grouped.counts.iter())
+    {
+        if len == 0 {
+            continue;
+        }
+        let Some(items) = row.get(..len) else { continue };
+        let Some(dst) = groups_buf.get_mut(group_count) else { break };
+        let extra = u16::try_from(total.saturating_sub(u32::try_from(len).unwrap_or(0))).unwrap_or(u16::MAX);
+        *dst = blaze_screen::ActiveGroupRef { kind, items, extra };
+        group_count += 1;
+    }
+
+    let groups = groups_buf.get(..group_count).unwrap_or(&[]);
+    live.see(blaze_screen::Step::Activity(blaze_screen::Activity {
+        verb: "checking",
+        progress,
+        active: grouped.active,
+        hint,
+        groups,
+    }));
 }
 
 /// `work` with the watcher beside it when a signal can ask, a line is due, or a live progress sink
@@ -633,7 +843,7 @@ pub(crate) fn watched<R>(
                 while !board.over.load(Ordering::Acquire) {
                     let now = board.now(clock);
                     if let Some(sink) = live {
-                        report_live(board, sink);
+                        report_live(board, now, sink);
                     }
                     let act = watch.look(now, board.stopping(), board.take_status(), board.claimed.load(Ordering::Acquire) != 0);
                     act_on(&cx, host, root, err, board, act, now);

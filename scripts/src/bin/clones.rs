@@ -17,8 +17,8 @@
 //! blaze lint with a fix (rule 73) replaces it; `classify` says how much of a rewrite is
 //! mechanical.
 //!
-//! The scanning is a copy of casts.rs's (itself untyped.rs's): the fourth copy of one scanner,
-//! which belongs in one shared module of blaze-script (AGENTS.md one-concept-one-home).
+//! Test code, the scanner, the file/crate walk helpers and the list/base parsing are
+//! `blaze_script::ratchet`'s.
 
 /// What the usage error prints.
 const DOC: &str = r#"clones: the `.clone()` calls only go down, per crate (AGENTS.md bump-allocate, rule 11; correct-by-construction, rule 76).
@@ -96,27 +96,21 @@ by its path under crates/ (`blaze-cargo`, `harness/harness-native`).
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt,
     path::{Path, PathBuf},
 };
 
 use blaze_script::{
     Map, TempDir, Value, fail,
     finding::{self, Finding},
-    git,
     input::{self, Fields, Input, InputError},
-    json, read_text,
-    regex::Regex,
-    universal_newlines,
+    json,
+    ratchet::{self, BaseError, Hit, ListError, Tests, comment_end, ident_len, is_ident, quote_end, string_end, word_end},
+    read_text, universal_newlines,
 };
 
 const SCRIPT: &str = "clones";
 /// The list, from the root.
 const LIST: &str = "tools/ratchets/clones.txt";
-const TEST_DIRS: [&str; 2] = ["tests", "benches"];
-const TEST_FILES: [&str; 2] = ["tests.rs", "test.rs"];
-/// The files whose out-of-line modules are beside them, not in a directory named for them.
-const ROOT_FILES: [&str; 4] = ["lib.rs", "main.rs", "mod.rs", "build.rs"];
 /// The comment that says why a call clones.
 const MARK: &str = "// clone:";
 /// How many lines above a call its comment is looked for, at most.
@@ -255,98 +249,22 @@ impl Source {
     }
 }
 
-/// One call outside test code in one file: its line, its kind, what gave it, and its comment's text.
+/// What [`classify`] says of one call: its kind, what gave it, and its comment's text.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Found {
-    line: usize,
+struct Classified {
     kind: Kind,
     source: Source,
     why: Option<String>,
 }
 
-/// One call: its file and what [`Found`] says of it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Site {
-    /// Relative to the root.
-    path: String,
-    line: usize,
-    kind: Kind,
-    source: Source,
-    why: Option<String>,
-}
-
-/// The list read wrong: where, and what is wrong there.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ListError {
-    /// A line (from 1) that is not a row, a comment or blank.
-    NotARow { line: usize, text: String },
-    /// A crate's second row, at its line (from 1).
-    TwoRows { line: usize, krate: String },
-}
-
-impl fmt::Display for ListError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ListError::NotARow { line, text } => write!(f, "{LIST}:{line}: {text:?} is not `<crate><TAB><calls>`"),
-            ListError::TwoRows { line, krate } => write!(f, "{LIST}:{line}: `{krate}` has two rows"),
-        }
-    }
-}
-
-/// The base could not be read: which base, and what of it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BaseError {
-    /// `base` names no commit of the checkout; `why` is git's message.
-    NoCommit { base: String, why: String },
-    /// A git command about `base` failed: `what` it was to do, and git's message.
-    Git { base: String, what: &'static str, why: String },
-    /// The base's list does not read.
-    List { base: String, error: ListError },
-    /// A hunk header of git's diff that is not one.
-    Hunk { text: String },
-}
-
-impl fmt::Display for BaseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            BaseError::NoCommit { base, why } => write!(f, "the base {base} is no commit here (fetch it): {why}"),
-            BaseError::Git { base, what, why } => write!(f, "git could not {what} at the base {base}: {why}"),
-            BaseError::List { base, error } => write!(f, "at the base {base}: {error}"),
-            BaseError::Hunk { text } => write!(f, "git diff's hunk {text:?} is not `@@ -<line>[,<n>] +<line>[,<n>] @@`"),
-        }
-    }
-}
-
-impl std::error::Error for ListError {}
-impl std::error::Error for BaseError {}
-
-struct Patterns {
-    cfg_test: Regex,
-    /// `#[test]`, or an attribute whose path ends in the word `test` (`#[tokio::test]`).
-    test_fn: Regex,
-    inner_cfg_test: Regex,
-    /// `mod <name>;`, attributes before it on the line allowed.
-    module: Regex,
-}
-
-impl Patterns {
-    fn new() -> Patterns {
-        let re = |pattern: &str| Regex::new(pattern).unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
-        Patterns {
-            cfg_test: re(r"\A\s*#\[cfg\((?:test|all\(test\b[^\]]*)\)\]"),
-            // To the attribute's `]`, so that the item read after it starts after the attribute.
-            test_fn: re(r"\A\s*#\[(?:\w+::)*test\b[^\]]*\]"),
-            inner_cfg_test: re(r"\A\s*#!\[cfg\((?:test|all\(test\b[^\]]*)\)\]"),
-            module: re(r"\A\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?(\w+)\s*;"),
-        }
-    }
-}
+/// One call: its file, its line, and what [`Classified`] says of it.
+type Site = Hit<Classified>;
 
 /// What one file holds.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Scanned {
-    /// Its calls outside its test code, in order.
-    sites: Vec<Found>,
+    /// Its calls outside its test code, in order, as (line from 1, classification).
+    sites: Vec<(usize, Classified)>,
     /// Each `mod <name>;` it declares, and whether test code declares it.
     mods: Vec<(String, bool)>,
     /// `#![cfg(test)]`: the whole file is test code.
@@ -354,44 +272,21 @@ struct Scanned {
 }
 
 /// The calls of one file's text, classified, and the modules it declares out of line.
-fn scan_file(p: &Patterns, text: &str) -> Scanned {
+fn scan_file(tests: &Tests, text: &str) -> Scanned {
+    let found = tests.of(text);
+    if found.whole {
+        return Scanned { sites: Vec::new(), mods: found.mods, test: true };
+    }
     let lines: Vec<&str> = text.split('\n').collect();
-    let mut test = vec![false; lines.len()];
-    let mut out = Scanned::default();
-    // The byte where line `at` starts.
-    let mut start = 0;
-    for (at, line) in lines.iter().enumerate() {
-        if p.inner_cfg_test.is_match(line) {
-            out.test = true;
-        }
-        if let Some(found) = p.cfg_test.find(line).or_else(|| p.test_fn.find(line)) {
-            // The item runs from after the attribute to its `}` or `;`, on the line of that byte.
-            let last = match item_end(text, start + found.end()) {
-                Some(end) => at + text[start..end - 1].matches('\n').count(),
-                None => at,
-            };
-            for it in &mut test[at..=last] {
-                *it = true;
-            }
-        }
-        if let Some(found) = p.module.captures(line) {
-            out.mods.push((found[1].to_owned(), test[at]));
-        }
-        start += line.len() + 1;
-    }
-    if out.test {
-        for it in &mut out.mods {
-            it.1 = true;
-        }
-        return out;
-    }
     let (calls, fns) = clone_calls(text);
     // A field's name, and whether this file declares it a handle: read once per name.
     let mut fields: BTreeMap<String, bool> = BTreeMap::new();
-    for call in calls.iter().filter(|call| !test[call.line - 1]) {
-        out.sites.push(classify(text, &lines, &fns, &mut fields, call));
-    }
-    out
+    let sites = calls
+        .iter()
+        .filter(|call| !found.test[call.line - 1])
+        .map(|call| (call.line, classify(text, &lines, &fns, &mut fields, call)))
+        .collect();
+    Scanned { sites, mods: found.mods, test: false }
 }
 
 /// A call's receiver, for a method call: the last name of the expression before its `.`.
@@ -411,7 +306,7 @@ struct Call {
 }
 
 /// Each call in `text`, in text order, and the byte of each word `fn`: comments, strings and
-/// characters skipped as [`item_end`] skips them.
+/// characters skipped as [`ratchet::item_end`] skips them.
 fn clone_calls(text: &str) -> (Vec<Call>, Vec<usize>) {
     let bytes = text.as_bytes();
     let mut calls = Vec::new();
@@ -487,15 +382,11 @@ fn receiver_of(before: &str) -> Option<Receiver> {
     Some(Receiver { name: name.to_owned(), field })
 }
 
-fn is_ident(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
 /// A call's kind: by its comment, then by its receiver's declaration.
-fn classify(text: &str, lines: &[&str], fns: &[usize], fields: &mut BTreeMap<String, bool>, call: &Call) -> Found {
+fn classify(text: &str, lines: &[&str], fns: &[usize], fields: &mut BTreeMap<String, bool>, call: &Call) -> Classified {
     let why = clone_comment(lines, call.line);
     if let Some(kind) = why.as_deref().and_then(kind_of) {
-        return Found { line: call.line, kind, source: Source::Comment, why };
+        return Classified { kind, source: Source::Comment, why };
     }
     let declared = match &call.receiver {
         Some(r) if r.field => {
@@ -509,10 +400,10 @@ fn classify(text: &str, lines: &[&str], fns: &[usize], fields: &mut BTreeMap<Str
         None => None,
     };
     match declared {
-        Some(source) => Found { line: call.line, kind: Kind::Handle, source, why },
+        Some(source) => Classified { kind: Kind::Handle, source, why },
         None => {
             let source = if why.is_some() { Source::Comment } else { Source::None };
-            Found { line: call.line, kind: Kind::Unknown, source, why }
+            Classified { kind: Kind::Unknown, source, why }
         }
     }
 }
@@ -612,193 +503,9 @@ fn handle_value(value: &str) -> bool {
     segments.len() >= 2 && HANDLES.contains(&segments[segments.len() - 2])
 }
 
-/// The byte after the `}` or `;` that ends the item starting at byte `from` of `text`: the
-/// first `;` outside brackets, or the `}` that closes its first brace; `None` when a closing
-/// bracket comes first (the item is part of a larger one) or the text ends. Comments, strings
-/// (raw and byte strings too) and character literals are skipped, so a brace in them counts not.
-fn item_end(text: &str, from: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut depth: usize = 0;
-    let mut at = from;
-    // Bounded: every turn moves `at` forward, to the end of the text at most.
-    while at < bytes.len() {
-        let byte = bytes[at];
-        let next = bytes.get(at + 1).copied();
-        at = match byte {
-            b'/' if next == Some(b'/') => text[at..].find('\n').map_or(bytes.len(), |n| at + n),
-            b'/' if next == Some(b'*') => comment_end(bytes, at),
-            b'"' => string_end(bytes, at + 1),
-            b'\'' => quote_end(text, at),
-            b'{' | b'(' | b'[' => {
-                depth += 1;
-                at + 1
-            }
-            b'}' | b')' | b']' => {
-                depth = depth.checked_sub(1)?;
-                if byte == b'}' && depth == 0 {
-                    return Some(at + 1);
-                }
-                at + 1
-            }
-            b';' if depth == 0 => return Some(at + 1),
-            b'_' | b'a'..=b'z' | b'A'..=b'Z' => word_end(text, at),
-            _ => at + 1,
-        };
-    }
-    None
-}
-
-/// The byte after the block comment that opens at `from`, comments nested in it included.
-fn comment_end(bytes: &[u8], from: usize) -> usize {
-    let mut depth: usize = 0;
-    let mut at = from;
-    while at + 1 < bytes.len() {
-        match (bytes[at], bytes[at + 1]) {
-            (b'/', b'*') => {
-                depth += 1;
-                at += 2;
-            }
-            (b'*', b'/') => {
-                depth = depth.saturating_sub(1);
-                at += 2;
-                if depth == 0 {
-                    return at;
-                }
-            }
-            _ => at += 1,
-        }
-    }
-    bytes.len()
-}
-
-/// The byte after the `"` that closes a string whose text starts at `from`.
-fn string_end(bytes: &[u8], from: usize) -> usize {
-    let mut at = from;
-    while at < bytes.len() {
-        match bytes[at] {
-            b'\\' => at += 2,
-            b'"' => return at + 1,
-            _ => at += 1,
-        }
-    }
-    bytes.len()
-}
-
-/// The byte after the character literal at the `'` at `at`, or after the `'` alone when it opens
-/// a lifetime or a label.
-fn quote_end(text: &str, at: usize) -> usize {
-    let rest = &text[at + 1..];
-    if rest.starts_with('\\') {
-        // An escape (`'\n'`, `'\''`, `'\u{7f}'`): closed by the next quote after the escaped one.
-        return rest.get(2..).and_then(|it| it.find('\'')).map_or(text.len(), |n| at + 3 + n + 1);
-    }
-    match rest.chars().next() {
-        Some(c) if rest[c.len_utf8()..].starts_with('\'') => at + 1 + c.len_utf8() + 1,
-        _ => at + 1,
-    }
-}
-
-/// The length of the identifier (or number) `bytes` starts with: ASCII letters, digits and `_`.
-fn ident_len(bytes: &[u8]) -> usize {
-    bytes.iter().take_while(|b| is_ident(**b)).count()
-}
-
-/// The byte after the word at `at`, after the literal it prefixes (`r#"..."#`, `b"..."`,
-/// `br"..."`, `c"..."`, `b'x'`), or after the raw identifier it starts (`r#clone`, read whole so
-/// that its word is not `clone`).
-fn word_end(text: &str, at: usize) -> usize {
-    let bytes = text.as_bytes();
-    let end = at + ident_len(&bytes[at..]);
-    match (&text[at..end], bytes.get(end).copied()) {
-        ("r" | "br" | "cr", Some(b'#' | b'"')) => raw_end(bytes, end),
-        ("b" | "c", Some(b'"')) => string_end(bytes, end + 1),
-        ("b", Some(b'\'')) => quote_end(text, end),
-        _ => end,
-    }
-}
-
-/// The byte after the raw string whose `#`s or `"` start at `from`; for a raw identifier
-/// (`r#as`), the byte after its identifier.
-fn raw_end(bytes: &[u8], from: usize) -> usize {
-    let hashes = bytes[from..].iter().take_while(|b| **b == b'#').count();
-    let open = from + hashes;
-    if bytes.get(open) != Some(&b'"') {
-        return open + ident_len(&bytes[open..]);
-    }
-    let mut at = open + 1;
-    while at < bytes.len() {
-        if bytes[at] == b'"' && bytes[at + 1..].iter().take(hashes).filter(|b| **b == b'#').count() == hashes {
-            return at + 1 + hashes;
-        }
-        at += 1;
-    }
-    bytes.len()
-}
-
-/// Whether the file `parts` is test code by its path.
-fn test_path(parts: &[String]) -> bool {
-    let (name, dirs) = parts.split_last().map_or(("", &[][..]), |(name, dirs)| (name.as_str(), dirs));
-    dirs.iter().any(|part| TEST_DIRS.contains(&part.as_str())) || TEST_FILES.contains(&name)
-}
-
-/// The two files the module `name`, declared out of line in the file `parts`, can be.
-fn module_files(parts: &[String], name: &str) -> [String; 2] {
-    let Some((file, dirs)) = parts.split_last() else { return [String::new(), String::new()] };
-    let mut base: Vec<&str> = dirs.iter().map(String::as_str).collect();
-    let root = ROOT_FILES.contains(&file.as_str()) || dirs.last().is_some_and(|it| it == "bin");
-    if !root {
-        base.push(file.strip_suffix(".rs").unwrap_or(file));
-    }
-    let base = base.join("/");
-    [format!("{base}/{name}.rs"), format!("{base}/{name}/mod.rs")]
-}
-
-/// `(root / "crates").rglob("*.rs")`, sorted part by part, each as its parts from the root, none
-/// under a directory named `target`. Directories that are links are not entered.
-fn rust_files(root: &Path) -> Vec<Vec<String>> {
-    let mut out = Vec::new();
-    let mut todo = vec![vec!["crates".to_owned()]];
-    // Bounded: each directory is listed once, and links to directories are not followed.
-    while let Some(dir) = todo.pop() {
-        let full: PathBuf = dir.iter().fold(root.to_path_buf(), |path, part| path.join(part));
-        let Ok(listed) = std::fs::read_dir(&full) else { continue };
-        for entry in listed.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let mut parts = dir.clone();
-            parts.push(name.clone());
-            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-            if is_dir && name != "target" {
-                todo.push(parts);
-            } else if !is_dir && name.ends_with(".rs") {
-                out.push(parts);
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
-/// The crate of the file `parts`: the nearest directory above it, under crates/, with a
-/// Cargo.toml, by its path under crates/; the first directory under crates/ when none has one.
-fn crate_of(root: &Path, parts: &[String], manifests: &mut BTreeMap<Vec<String>, bool>) -> String {
-    for end in (2..parts.len()).rev() {
-        let dir = &parts[..end];
-        let has = *manifests.entry(dir.to_vec()).or_insert_with(|| {
-            dir.iter().fold(root.to_path_buf(), |path, part| path.join(part)).join("Cargo.toml").is_file()
-        });
-        if has {
-            return parts[1..end].join("/");
-        }
-    }
-    match parts {
-        [_, first, _, ..] => first.clone(),
-        _ => "crates".to_owned(),
-    }
-}
-
 /// Each crate's calls outside test code, in file and line order; a crate with none is absent.
-fn count(p: &Patterns, root: &Path) -> BTreeMap<String, Vec<Site>> {
-    let files = rust_files(root);
+fn count(tests: &Tests, root: &Path) -> BTreeMap<String, Vec<Site>> {
+    let files = ratchet::rust_files(root);
     let known: BTreeSet<String> = files.iter().map(|it| it.join("/")).collect();
     let mut scanned: Vec<(Vec<String>, Scanned)> = Vec::new();
     let mut test: BTreeSet<String> = BTreeSet::new();
@@ -809,12 +516,12 @@ fn count(p: &Patterns, root: &Path) -> BTreeMap<String, Vec<Site>> {
         // `read_text(errors="replace")`: what is not UTF-8 becomes U+FFFD.
         let Ok(bytes) = std::fs::read(&full) else { fail(SCRIPT, &format!("{} could not be read", full.display())) };
         let text = universal_newlines(String::from_utf8_lossy(&bytes).into_owned());
-        let found = scan_file(p, &text);
-        if test_path(&parts) || found.test {
+        let found = scan_file(tests, &text);
+        if ratchet::test_path(&parts) || found.test {
             test.insert(path.clone());
         }
         for (name, in_test) in &found.mods {
-            for file in module_files(&parts, name) {
+            for file in ratchet::module_files(&parts, name) {
                 if !known.contains(&file) {
                     continue;
                 }
@@ -843,105 +550,12 @@ fn count(p: &Patterns, root: &Path) -> BTreeMap<String, Vec<Site>> {
         if found.sites.is_empty() || test.contains(&path) {
             continue;
         }
-        let krate = crate_of(root, &parts, &mut manifests);
-        out.entry(krate).or_default().extend(found.sites.into_iter().map(|it| Site {
-            path: path.clone(),
-            line: it.line,
-            kind: it.kind,
-            source: it.source,
-            why: it.why,
-        }));
+        let krate = ratchet::crate_of(root, &parts, &mut manifests);
+        out.entry(krate)
+            .or_default()
+            .extend(found.sites.into_iter().map(|(line, what)| Hit { path: path.clone(), line, what }));
     }
     out
-}
-
-/// The list as `write` writes it: the header, then `<crate><TAB><calls>` for each crate with a
-/// call, sorted.
-fn render(counts: &BTreeMap<String, Vec<Site>>) -> String {
-    let mut out = HEADER.to_owned();
-    for (krate, sites) in counts.iter().filter(|(_, sites)| !sites.is_empty()) {
-        out.push_str(&format!("{krate}\t{}\n", sites.len()));
-    }
-    out
-}
-
-/// The list's rows.
-fn parse_rows(text: &str) -> Result<BTreeMap<String, usize>, ListError> {
-    let mut rows = BTreeMap::new();
-    for (at, line) in text.split('\n').enumerate() {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let row = match line.split('\t').collect::<Vec<&str>>().as_slice() {
-            [krate, n] if !krate.is_empty() => n.parse::<usize>().ok().map(|n| (*krate, n)),
-            _ => None,
-        };
-        let Some((krate, n)) = row else {
-            return Err(ListError::NotARow { line: at + 1, text: line.to_owned() });
-        };
-        if rows.insert(krate.to_owned(), n).is_some() {
-            return Err(ListError::TwoRows { line: at + 1, krate: krate.to_owned() });
-        }
-    }
-    Ok(rows)
-}
-
-/// The lines each file has that `base` did not, from `git diff --unified=0`'s hunks: by path
-/// from the root, the line numbers in the tree.
-fn added_lines(diff: &str) -> Result<BTreeMap<String, BTreeSet<usize>>, BaseError> {
-    let mut out: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
-    let mut file: Option<String> = None;
-    // The lines of the hunk being read, which are text, never a header (`+++ x` is a line `++ x`).
-    let mut skip: usize = 0;
-    for line in diff.split('\n') {
-        if skip > 0 {
-            skip -= 1;
-            continue;
-        }
-        if let Some(path) = line.strip_prefix("+++ ") {
-            // `/dev/null` for a file deleted: no line of it is in the tree.
-            file = path.strip_prefix("b/").map(str::to_owned);
-            continue;
-        }
-        let Some(hunk) = line.strip_prefix("@@ ") else { continue };
-        // `@@ -a,b +c,d @@`: `b` lines from `a` were the base's, `d` from `c` are the tree's
-        // (one when `,b` or `,d` is left out).
-        let range = |sign: char| -> Option<(usize, usize)> {
-            let it = hunk.split(' ').find_map(|it| it.strip_prefix(sign))?;
-            let (from, len) = it.split_once(',').unwrap_or((it, "1"));
-            Some((from.parse().ok()?, len.parse().ok()?))
-        };
-        let (Some((_, removed)), Some((from, len))) = (range('-'), range('+')) else {
-            return Err(BaseError::Hunk { text: line.to_owned() });
-        };
-        skip = removed + len;
-        if let Some(path) = &file {
-            out.entry(path.clone()).or_default().extend(from..from + len);
-        }
-    }
-    Ok(out)
-}
-
-/// What `base` says: its rows (none when it has no list, before the ratchet began), and the lines
-/// added since it under crates/.
-fn at_base(root: &Path, base: &str) -> Result<(Option<BTreeMap<String, usize>>, BTreeMap<String, BTreeSet<usize>>), BaseError> {
-    let root_arg = root.to_string_lossy();
-    let dir = root_arg.as_ref();
-    let commit = format!("{base}^{{commit}}");
-    git(root, &["-C", dir, "rev-parse", "--verify", "--quiet", commit.as_str()])
-        .map_err(|why| BaseError::NoCommit { base: base.to_owned(), why })?;
-    let failed = |what: &'static str| move |why: String| BaseError::Git { base: base.to_owned(), what, why };
-    let listed = git(root, &["-C", dir, "ls-tree", "--name-only", base, "--", LIST]).map_err(failed("list its tree"))?;
-    let rows = if listed.trim().is_empty() {
-        None
-    } else {
-        let spec = format!("{base}:{LIST}");
-        let text = git(root, &["-C", dir, "show", spec.as_str()]).map_err(failed("show the list"))?;
-        Some(parse_rows(&text).map_err(|error| BaseError::List { base: base.to_owned(), error })?)
-    };
-    let diff = git(root, &["-C", dir, "diff", "--no-color", "--no-ext-diff", "--no-renames", "--unified=0", base, "--", "crates"])
-        .map_err(failed("diff the tree"))?;
-    Ok((rows, added_lines(&diff)?))
 }
 
 /// What is wrong: `counts` the tree's calls by crate, `rows` the list's, `base_rows` the base's
@@ -1012,12 +626,12 @@ fn tally(sites: &[Site], sources: bool) -> Map<String, Value> {
     let mut out = Map::new();
     out.insert("calls".to_owned(), Value::from(sites.len()));
     for kind in Kind::ALL {
-        out.insert(kind.name().to_owned(), Value::from(sites.iter().filter(|it| it.kind == kind).count()));
+        out.insert(kind.name().to_owned(), Value::from(sites.iter().filter(|it| it.what.kind == kind).count()));
     }
     if sources {
         let mut by = Map::new();
         for source in Source::ALL {
-            by.insert(source.name().to_owned(), Value::from(sites.iter().filter(|it| it.source == source).count()));
+            by.insert(source.name().to_owned(), Value::from(sites.iter().filter(|it| it.what.source == source).count()));
         }
         out.insert("sources".to_owned(), Value::Object(by));
     }
@@ -1041,9 +655,9 @@ fn report(counts: &BTreeMap<String, Vec<Site>>, with_sites: bool) -> Value {
                 let mut site = Map::new();
                 site.insert("path".to_owned(), Value::from(it.path.clone()));
                 site.insert("line".to_owned(), Value::from(it.line));
-                site.insert("kind".to_owned(), Value::from(it.kind.name()));
-                site.insert("source".to_owned(), Value::from(it.source.name()));
-                site.insert("why".to_owned(), it.why.clone().map_or(Value::Null, Value::from));
+                site.insert("kind".to_owned(), Value::from(it.what.kind.name()));
+                site.insert("source".to_owned(), Value::from(it.what.source.name()));
+                site.insert("why".to_owned(), it.what.why.clone().map_or(Value::Null, Value::from));
                 Value::Object(site)
             })
             .collect();
@@ -1052,22 +666,22 @@ fn report(counts: &BTreeMap<String, Vec<Site>>, with_sites: bool) -> Value {
     Value::Object(out)
 }
 
-fn main_with(p: &Patterns, it: &Args) {
+fn main_with(tests: &Tests, it: &Args) {
     // `Path(root).resolve()`.
     let root: PathBuf =
         std::fs::canonicalize(&it.root).unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(&it.root));
     if !root.join("crates").is_dir() {
         fail(SCRIPT, &format!("{} has no crates/ directory", root.display()));
     }
-    let counts = count(p, &root);
+    let counts = count(tests, &root);
     if it.command == "findings" {
         let found = counts.iter().flat_map(|(krate, sites)| {
             sites.iter().map(|it| Finding {
                 krate: krate.clone(),
                 file: it.path.clone(),
                 line: it.line,
-                kind: it.kind.finding().name,
-                detail: it.why.clone(),
+                kind: it.what.kind.finding().name,
+                detail: it.what.why.clone(),
             })
         });
         finding::print(SCRIPT, &Kind::ALL.map(Kind::finding), found.collect());
@@ -1078,7 +692,7 @@ fn main_with(p: &Patterns, it: &Args) {
         println!("{shown}");
         return;
     }
-    let text = render(&counts);
+    let text = ratchet::render(HEADER, &counts, &[]);
     if it.command == "write" {
         if let Err(e) = std::fs::write(root.join(LIST), &text) {
             fail(SCRIPT, &format!("{LIST} is not written: {e}"));
@@ -1089,10 +703,10 @@ fn main_with(p: &Patterns, it: &Args) {
     let Some(listed) = read_text(&root.join(LIST)) else {
         fail(SCRIPT, &format!("{LIST} could not be read: every crate is held to its row there (command `write` makes it)"))
     };
-    let rows = parse_rows(&listed).unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
+    let rows = ratchet::parse_rows(LIST, &listed).unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
     let (base_rows, added) = match &it.base {
         Some(base) => {
-            let (rows, added) = at_base(&root, base).unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
+            let (rows, added) = ratchet::at_base(&root, base, LIST).unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
             if rows.is_none() {
                 println!("{SCRIPT}: {base} has no {LIST}: the list begins with this change, so no row is compared with the base");
             }
@@ -1194,7 +808,7 @@ const FIXTURE_SITES: [(usize, Kind, Source); 11] = [
     (24, Kind::Unknown, Source::None),
 ];
 
-fn selftest(p: &Patterns) {
+fn selftest(tests: &Tests) {
     // What a call is, and its receiver.
     let calls = |text: &str| clone_calls(text).0.iter().map(|it| it.line).collect::<Vec<usize>>();
     // Counted at the line of its word `clone`.
@@ -1222,18 +836,18 @@ fn selftest(p: &Patterns) {
     want.extend([19, 21]);
     want.sort();
     expect(all == want, &format!("the fixture's calls, test code in: found {all:?}, wanted {want:?}"));
-    let found = scan_file(p, FIXTURE);
-    let got: Vec<(usize, Kind, Source)> = found.sites.iter().map(|it| (it.line, it.kind, it.source)).collect();
+    let found = scan_file(tests, FIXTURE);
+    let got: Vec<(usize, Kind, Source)> = found.sites.iter().map(|(line, it)| (*line, it.kind, it.source)).collect();
     expect(got == FIXTURE_SITES, &format!("the fixture's calls outside test code, classified: {got:?}"));
     // Planted: each cause removed, its effect goes.
-    let planted = scan_file(p, &FIXTURE.replace("#[cfg(test)]\n", "\n")).sites;
-    expect(planted.iter().any(|it| it.line == 19), "`t` outside test code is a site");
-    let planted = scan_file(p, &FIXTURE.replace("    // clone: a deep copy of the vector", "    // a deep copy of the vector")).sites;
-    expect(planted.iter().any(|it| it.line == 15 && it.kind == Kind::Unknown), "line 15 without its comment is unknown");
-    let planted = scan_file(p, &FIXTURE.replace("fn g(a: Arc<u8>)", "fn g(a: Box<u8>)")).sites;
-    expect(planted.iter().any(|it| it.line == 8 && it.kind == Kind::Unknown), "line 8 without its `Arc` is unknown");
-    let planted = scan_file(p, &FIXTURE.replace("struct H { inner: Arc<u8> }", "struct H { inner: Box<u8> }")).sites;
-    expect(planted.iter().any(|it| it.line == 23 && it.kind == Kind::Unknown), "line 23 without its field's `Arc` is unknown");
+    let planted = scan_file(tests, &FIXTURE.replace("#[cfg(test)]\n", "\n")).sites;
+    expect(planted.iter().any(|(line, _)| *line == 19), "`t` outside test code is a site");
+    let planted = scan_file(tests, &FIXTURE.replace("    // clone: a deep copy of the vector", "    // a deep copy of the vector")).sites;
+    expect(planted.iter().any(|(line, it)| *line == 15 && it.kind == Kind::Unknown), "line 15 without its comment is unknown");
+    let planted = scan_file(tests, &FIXTURE.replace("fn g(a: Arc<u8>)", "fn g(a: Box<u8>)")).sites;
+    expect(planted.iter().any(|(line, it)| *line == 8 && it.kind == Kind::Unknown), "line 8 without its `Arc` is unknown");
+    let planted = scan_file(tests, &FIXTURE.replace("struct H { inner: Arc<u8> }", "struct H { inner: Box<u8> }")).sites;
+    expect(planted.iter().any(|(line, it)| *line == 23 && it.kind == Kind::Unknown), "line 23 without its field's `Arc` is unknown");
 
     // A tree: crates, test files by path and by declaration, a nested crate.
     let tmp = TempDir::new("clones-selftest-").unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &e.to_string()));
@@ -1254,7 +868,7 @@ fn selftest(p: &Patterns) {
     put("crates/b/Cargo.toml", "[workspace]\n");
     put("crates/b/c/Cargo.toml", "[package]\nname = \"c\"\n");
     put("crates/b/c/src/lib.rs", one);
-    let counts = count(p, tmp.path());
+    let counts = count(tests, tmp.path());
     let a = counts.get("a").map_or(&[][..], Vec::as_slice);
     let lib: Vec<usize> = FIXTURE_SITES.iter().map(|it| it.0).collect();
     expect(
@@ -1288,7 +902,7 @@ fn selftest(p: &Patterns) {
     expect(listed.get("sites").and_then(Value::as_array).is_some_and(|it| it.len() == 14), "the report with its sites");
 
     // The ratchet. As recorded, nothing is wrong, and the list reads back as it was written.
-    let rows = parse_rows(&render(&counts)).unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &e.to_string()));
+    let rows = ratchet::parse_rows(LIST, &ratchet::render(HEADER, &counts, &[])).unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &e.to_string()));
     expect(rows == BTreeMap::from([("a".to_owned(), 13), ("b/c".to_owned(), 1)]), &format!("the rows read back: {rows:?}"));
     expect(problems(&counts, &rows, Some(&rows), None).is_empty(), "the tree as recorded is right");
     // Planted: one call added. Named by its crate, its place (given the base's diff), what to
@@ -1328,18 +942,18 @@ fn selftest(p: &Patterns) {
     let diff = "diff --git a/crates/a/src/lib.rs b/crates/a/src/lib.rs\n--- a/crates/a/src/lib.rs\n+++ b/crates/a/src/lib.rs\n\
         @@ -2,0 +3 @@ fn f() {\n+++ b/not/a/file\n@@ -9 +10,2 @@\n-old\n+y\n+z\n@@ -20 +21,0 @@\n-w\n\
         diff --git a/crates/a/src/gone.rs b/crates/a/src/gone.rs\n--- a/crates/a/src/gone.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-v\n";
-    let lines = added_lines(diff).unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &e.to_string()));
+    let lines = ratchet::added_lines(diff).unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &e.to_string()));
     expect(
         lines == BTreeMap::from([("crates/a/src/lib.rs".to_owned(), BTreeSet::from([3, 10, 11]))]),
         &format!("the lines added: {lines:?}"),
     );
-    expect(added_lines("@@ nonsense\n").is_err_and(|e| matches!(e, BaseError::Hunk { .. })), "a hunk that is none is refused");
+    expect(ratchet::added_lines("@@ nonsense\n").is_err_and(|e| matches!(e, BaseError::Hunk { .. })), "a hunk that is none is refused");
     expect(
-        parse_rows("a\t1\nb 2\n").is_err_and(|e| e == ListError::NotARow { line: 2, text: "b 2".to_owned() })
-            && parse_rows("a\t1\na\t2\n").is_err_and(|e| matches!(e, ListError::TwoRows { line: 2, .. }))
-            && parse_rows("a\t1\t0\n").is_err()
-            && parse_rows("a\tx\n").is_err()
-            && parse_rows("\t1\n").is_err(),
+        ratchet::parse_rows(LIST, "a\t1\nb 2\n").is_err_and(|e| e == ListError::NotARow { list: LIST.to_owned(), line: 2, text: "b 2".to_owned() })
+            && ratchet::parse_rows(LIST, "a\t1\na\t2\n").is_err_and(|e| matches!(e, ListError::TwoRows { line: 2, .. }))
+            && ratchet::parse_rows(LIST, "a\t1\t0\n").is_err()
+            && ratchet::parse_rows(LIST, "a\tx\n").is_err()
+            && ratchet::parse_rows(LIST, "\t1\n").is_err(),
         "a bad row is refused, naming its line",
     );
     println!("{SCRIPT} selftest: ok");
@@ -1347,10 +961,10 @@ fn selftest(p: &Patterns) {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let p = Patterns::new();
+    let tests = Tests::new(SCRIPT);
     match args.as_slice() {
-        [one] if one == "selftest" => selftest(&p),
-        [one] => main_with(&p, &input::parse::<Args>(one, SCRIPT)),
+        [one] if one == "selftest" => selftest(&tests),
+        [one] => main_with(&tests, &input::parse::<Args>(one, SCRIPT)),
         _ => {
             eprintln!("usage: {SCRIPT} '<json>' | selftest\n\n{DOC}");
             std::process::exit(1);
@@ -1366,13 +980,13 @@ mod tests {
     /// `blaze test`, not the script's first run.
     #[test]
     fn the_patterns_compile() {
-        let _ = Patterns::new();
+        let _ = Tests::new(SCRIPT);
     }
 
     /// The script's own cases run under `blaze test` and `cargo test` too: one that fails ends
     /// the test process with status 1, which fails the run.
     #[test]
     fn the_selftest_holds() {
-        selftest(&Patterns::new());
+        selftest(&Tests::new(SCRIPT));
     }
 }

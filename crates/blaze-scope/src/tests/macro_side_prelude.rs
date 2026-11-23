@@ -136,7 +136,7 @@ fn a_macro_side_glob_of_cores_macros_beside_the_preludes_is_no_ambiguity() {
 
     let texts = Texts::of(&crates, DEP);
     let inputs = crates.inputs();
-    let names = resolve_crates(&inputs, crates.sysroot, &texts, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&inputs, crates.sysroot, &texts, &Serial, crate::tests::SyncFrame::leaked()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     for name in ["checked", "panicked", "Shown", "Made"] {
         let side = bound_in(&names, side_dep, name);
         assert!(
@@ -202,7 +202,7 @@ fn a_written_core_stands_beside_the_injected_one_from_2018() {
     for (text, what) in [(SHADOWS_CORE, "no_std"), (SHADOWS_CORE_STD, "the control, std")] {
         let texts = Texts::of(&crates, text);
         let inputs = crates.inputs();
-        let names = resolve_crates(&inputs, crates.sysroot, &texts, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let names = resolve_crates(&inputs, crates.sysroot, &texts, &Serial, crate::tests::SyncFrame::leaked()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
         for dep in deps {
             let bound = type_in(&names, dep, "primitives");
             assert_eq!(bound, Some(dep), "{what}: `primitives` in dep #{dep}'s root is its own module (notes {:?})", names.notes(dep));

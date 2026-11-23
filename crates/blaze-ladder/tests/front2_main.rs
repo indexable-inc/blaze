@@ -80,7 +80,7 @@ fn shared_records_hold_no_body_type() {
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: BODY }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
         let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
@@ -90,7 +90,7 @@ fn shared_records_hold_no_body_type() {
         found.whole(1).unwrap_or_else(|| panic!("`{n}` not named")).key
     };
     let (sorts, copies) = (key("sorts"), key("copies"));
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let sized = front.index.lang("sized");
     // Each fn of `order` lowered and checked in turn over one store; the outcomes by fn.
     let mut run = |order: &[blaze_id::ItemKey]| -> Vec<(blaze_id::ItemKey, String)> {
@@ -134,7 +134,7 @@ fn a_macro_written_member_checks() {
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: BODY }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
         let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
@@ -144,7 +144,7 @@ fn a_macro_written_member_checks() {
     let main = found.whole(1).unwrap_or_else(|| panic!("`most` not named")).key;
     let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let mut buckets = None;
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let body = lower_fn(&names, prepared, &mut front.keys, &mut store, main).unwrap_or_else(|e| panic!("lowering `most`: {e}"));
     let view = body.lowered.view();
     let spell = Spelling::of(&view).unwrap_or_else(|e| panic!("spelling `most`: {e:?}"));
@@ -182,7 +182,7 @@ fn a_plain_main_is_std_mains_input() {
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     assert!(names.notes(0).is_empty(), "crate 0's notes: {:?}", names.notes(0));
     let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &["main"] }, Alloc::global())
         .unwrap_or_else(|e| panic!("`main` after std::main: {e}"));
@@ -211,7 +211,7 @@ fn his_main_through_the_checker() {
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let resolved = start.elapsed();
     let crate_names: Vec<&str> = crates.iter().map(|c| c.name).collect();
 
@@ -238,7 +238,7 @@ fn his_main_through_the_checker() {
     out.push_str(&format!("probe: `Ok` is {ok_shown:?}, in some enums row: {in_any:?}; `Result`'s row: {row_keys:?}\n"));
     // The walk: his main lowered and checked, `REACHABLE:` and `BUILDS:`; a lowering that fails
     // is its `WORK LIST (lowering ..)` line and nothing more (the walk returns before any hook).
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let world = World { names: &names, frame: &frame, survey_frame: &survey_frame, prepared, sources: &sources, crate_names: &crate_names, body_sources: None, receivers: Receivers::NotLookedUp };
     let ask = Ask { roots: &[main], build_from: BuildFrom::Main, read: RootRead::Callees, label: "his main" };
     let mut his = HisMain { names: &names, crate_names: &crate_names, frame: &frame, sources: &sources, main, ok };
@@ -586,7 +586,7 @@ fn second() {
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let crate_names: Vec<&str> = crates.iter().map(|c| c.name).collect();
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the walk's frame");
     let survey_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the survey's frame");
@@ -596,7 +596,7 @@ fn second() {
         found.whole(1).unwrap_or_else(|| panic!("`{name}` not named")).key
     };
     let (first, second) = (key("first"), key("second"));
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let world = World { names: &names, frame: &frame, survey_frame: &survey_frame, prepared, sources: &files, crate_names: &crate_names, body_sources: None, receivers: Receivers::Found };
     let ask = Ask { roots: &[first, second, first], build_from: BuildFrom::Roots, read: RootRead::Callees, label: "two roots" };
     let mut out = String::new();

@@ -174,8 +174,8 @@ fn kept_of(names: &Names<'_>) -> Kept {
     let g = Alloc::global();
     let mut kept = Kept { names: Vec::new(), items: Vec::new(), files: Vec::new(), expansions: Vec::new(), origins: Vec::new() };
     for c in names.crates().iter() {
-        kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), g));
-        kept.items.push(aligned(&items_record::encode_with(c, names, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), g));
+        kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
+        kept.items.push(aligned(&items_record::encode_with(c, names, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
         kept.files.push(c.files.iter().map(|f| (f.package.as_str().to_string(), leak(f.text))).collect());
         kept.expansions.push(c.expansions.iter().filter_map(|(call, e)| e.made.map(|m| (*call, leak(m.text)))).collect());
         kept.origins.push(c.expansions.iter().filter_map(|(call, e)| e.made.as_ref().map(|m| (*call, made_origins(*call, &m.origins)))).collect());
@@ -236,7 +236,7 @@ fn checked<'n, S: NamesSource<'n> + Copy>(names: S, prepared: &'n Prepares<'n>, 
 
 /// Each row's body over `names`: `name: said`, and the rows that did not check clean.
 fn rows<'n, S: NamesSource<'n> + Copy>(names: S, index: &Index<'n>, keys: &mut Keys, frame: &'n blaze_mem::Frame, sized: Option<ItemKey>, fns: &[(&str, Asked)], failed: &mut Vec<String>) -> String {
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut store = Store::new(sized, frame, Alloc::global());
     let mut said = Vec::new();
     for &(name, f) in fns {
@@ -292,9 +292,8 @@ fn macro_written_bodies_resolve_by_their_marks() {
     let crates = marks_crates(&cfg);
     let crate_names: &'static [&'static str] = &["marks", "dep"];
     let keys: &'static [CrateItemKey] = Vec::leak(crates.iter().map(|c| c.key).collect());
-    let alloc = blaze_own::testing::heap().alloc();
     let files = Files { root: ROOT, dep: DEP };
-    let names = resolve_crates(&crates, Sysroot::default(), &files, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &files, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let fn_of = |name: &str| Paths { names: &names }.path(names.root(0), false, &[name], Ns::Value).unwrap_or_else(|e| panic!("`{name}` from the program's root: {e:?}")).key;
     let fns = [("in_body", Asked::Free(fn_of("in_body"))), ("by_item", Asked::Free(fn_of("by_item"))), ("by_item_stmt", Asked::Free(fn_of("by_item_stmt")))];
     let mut failed = Vec::new();
@@ -350,7 +349,7 @@ fn counted_reads(planted: bool) -> (Vec<((usize, ItemKey), u32)>, u64, String) {
     let crate_names: &'static [&'static str] = &["marks", "dep"];
     let keys: &'static [CrateItemKey] = Vec::leak(crates.iter().map(|c| c.key).collect());
     let files = Files { root: ROOT, dep: DEP };
-    let names = resolve_crates(&crates, Sysroot::default(), &files, &Serial, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &files, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let fn_of = |name: &str| Paths { names: &names }.path(names.root(0), false, &[name], Ns::Value).unwrap_or_else(|e| panic!("`{name}` from the program's root: {e:?}")).key;
     let fns = [("by_item", Asked::Free(fn_of("by_item"))), ("by_item_stmt", Asked::Free(fn_of("by_item_stmt")))];
     let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the records reader's frame")));
@@ -436,7 +435,7 @@ fn widths() -> (dep::Width<3>, dep::Width<5>) {
 /// instantiated types. A refusal or a lowerer gap must fail both the test and its controls.
 fn width_diagnostics<'n, S: NamesSource<'n>>(front: &mut Front2<'n, S>, item: ItemKey) -> Vec<&'static str> {
     let names = front.names;
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
     let mut buckets = None;
     let mut consts = Consts::default();
@@ -468,8 +467,7 @@ fn check_widths(dep: &str, planted: bool) {
     let cfg = tc.program_cfg(blaze_build::Panic::Unwind);
     let crates = marks_crates(&cfg);
     let files = Files { root: WIDTH_ROOT, dep };
-    let heap = blaze_own::testing::heap();
-    let names = resolve_crates(&crates, Sysroot::default(), &files, &Serial, heap.alloc()).expect("resolve marks and dep");
+    let names = resolve_crates(&crates, Sysroot::default(), &files, &Serial, blaze_own::testing::bump()).expect("resolve marks and dep");
     let item = Paths { names: &names }.path(names.root(0), false, &["widths"], Ns::Value).expect("the widths function").key;
     let sources = [SourceFile { path: "src/main.rs", text: WIDTH_ROOT }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the widths frame");
@@ -605,8 +603,7 @@ fn macro_written_local_items_resolve_by_their_marks() {
     ];
     let crate_names: &'static [&'static str] = &["locals", "dep"];
     let keys: &'static [CrateItemKey] = Vec::leak(crates.iter().map(|c| c.key).collect());
-    let alloc = blaze_own::testing::heap().alloc();
-    let names = resolve_crates(&crates, Sysroot::default(), &LocalFiles, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &LocalFiles, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let main = Paths { names: &names }.path(names.root(0), false, &["main"], Ns::Value).unwrap_or_else(|e| panic!("`main` from the program's root: {e:?}")).key;
     let fns = [("main", Asked::Free(main))];
     let mut failed = Vec::new();
@@ -655,7 +652,7 @@ fn main() {}
     let keys: &'static [CrateItemKey] = Vec::leak(crates.iter().map(|c| c.key).collect());
     let position = |name: &str| crate_names.iter().position(|n| *n == name);
     let lang_crates: Vec<usize> = [Some(0), position("core"), position("alloc"), position("std"), position("bstd"), position("blaze_std")].into_iter().flatten().collect();
-    let names = inputs.resolve(&crates, Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
 
     // The one impl of the program (the derive's), and its `default`.
     let impls: Vec<ItemKey> = names.items(0).map(|(key, _, _)| key).filter(|&key| NamesSource::detail_of(&names, key).is_some_and(|d| matches!(d, ItemDetail::Impl))).collect();

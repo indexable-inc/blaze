@@ -30,9 +30,8 @@
 //! [`Toolchain::open`] over a `Shelf`, a [`Tree`] for the checkout).
 
 #![no_std]
-#![feature(allocator_api)]
 
-#[cfg(feature = "std")]
+#[cfg(any(test, feature = "std"))]
 extern crate std;
 
 #[cfg(feature = "std")]
@@ -60,7 +59,7 @@ use core::fmt;
 use blaze_fetch::PackView;
 use blaze_id::{ContentId, CrateItemKey};
 use blaze_manifest::lock::{Lock, LockId};
-use blaze_own::{AString, AVec, Alloc, Box};
+use blaze_own::{AString, AVec, Alloc, Bump};
 use blaze_scope::crate_env::{CrateEnv, MemberDirError};
 use blaze_scope::graph::Sysroot;
 use blaze_scope::resolve::{CrateInput, Names, NamesError, SourceTexts, resolve_crates};
@@ -113,7 +112,7 @@ pub struct Fetched<'s, 'l, 'w, R: Records<'w>> {
     /// Each path package's directory in the checkout, by lock id.
     pub paths: &'s [(LockId, &'w str)],
     pub lock: &'l Lock<'w>,
-    pub alloc: Alloc<'w>,
+    pub alloc: Bump<'w>,
 }
 
 impl<'w, R: Records<'w>> Packages<'w> for Fetched<'_, '_, 'w, R> {
@@ -122,11 +121,11 @@ impl<'w, R: Records<'w>> Packages<'w> for Fetched<'_, '_, 'w, R> {
         if matches!(p.source, blaze_manifest::lock::LockSource::Path) {
             return match self.paths.iter().find(|(id, _)| *id == package) {
                 Some((_, dir)) => Ok(Place::Checkout { dir }),
-                None => Err(WorldError::PathNotPlaced { package: keep(&p.name, self.alloc) }),
+                None => Err(WorldError::PathNotPlaced { package: self.alloc.alloc_str(&p.name) }),
             };
         }
         let (view, dir) = self.store.files(package).map_err(WorldError::Source)?;
-        Ok(Place::Pack { view, dir: keep(&dir, self.alloc) })
+        Ok(Place::Pack { view, dir: self.alloc.alloc_str(&dir) })
     }
 }
 
@@ -200,7 +199,7 @@ impl<'w> World<'w> {
     }
 
     /// Every crate's names, resolved together.
-    pub fn resolve<P: Par>(&self, inputs: &[CrateInput<'w>], par: &P, alloc: Alloc<'w>) -> Result<Names<'w>, NamesError<'w>> {
+    pub fn resolve<P: Par>(&self, inputs: &[CrateInput<'w>], par: &P, alloc: Bump<'w>) -> Result<Names<'w>, NamesError<'w>> {
         resolve_crates(inputs, self.sysroot, &self.texts, par, alloc)
     }
 
@@ -450,16 +449,6 @@ impl fmt::Display for WorldError<'_> {
     }
 }
 
-/// `text` copied into `alloc` for as long as it lives.
-fn keep<'w>(text: &str, alloc: Alloc<'w>) -> &'w str {
-    Box::leak(AString::from_str_in(text, alloc).into_boxed_str())
-}
-
-/// `values` copied into `alloc` for as long as it lives.
-fn keep_slice<'w, T: Copy>(values: &[T], alloc: Alloc<'w>) -> &'w [T] {
-    AVec::from_slice_in(values, alloc).leak()
-}
-
 /// `a` then `b`, joined by one `/` (none when either is empty).
 fn join<'w>(a: &str, b: &str, alloc: Alloc<'w>) -> AString<'w> {
     let mut out = AString::with_capacity_in(a.len() + b.len() + 1, alloc);
@@ -483,10 +472,11 @@ fn correct_pack<'w>(
     unit: &'w blaze_unit_graph::Unit<'w>,
     corrected: &mut AVec<'w, (u32, &'w str, &'w str)>,
     used: &mut AVec<'w, Corrected<'w>>,
-    alloc: Alloc<'w>,
+    bump: Bump<'w>,
 ) -> Result<(), WorldError<'w>> {
+    let alloc = bump.alloc();
     let path_of = |file: &str| -> AString<'w> {
-        let mut path = AString::with_capacity_in(dir.len() + file.len() + 1, alloc.clone());
+        let mut path = AString::with_capacity_in(dir.len() + file.len() + 1, alloc);
         if !dir.is_empty() {
             path.push_str(dir);
             path.push_str("/");
@@ -495,23 +485,23 @@ fn correct_pack<'w>(
         path
     };
     let files = row
-        .correct_crate(&unit.version, |file| view.find(&path_of(file)).map(|f| f.bytes), blaze_lex::Cpu::BASELINE, alloc.clone())
+        .correct_crate(&unit.version, |file| view.find(&path_of(file)).map(|f| f.bytes), blaze_lex::Cpu::BASELINE, alloc)
         .map_err(|why| {
-            let mut words = AString::new_in(alloc.clone());
+            let mut words = AString::new_in(alloc);
             let _ = fmt::write(&mut Words(&mut words), format_args!("{why}"));
-            WorldError::Correction { package: &unit.name, version: &unit.version, why: keep(&words, alloc.clone()) }
+            WorldError::Correction { package: &unit.name, version: &unit.version, why: bump.alloc_str(&words) }
         })?;
     let mut predicates = 0;
     for (file, fixed) in files.iter() {
         predicates += fixed.replaced.len();
-        corrected.push((tree, keep(&path_of(file), alloc.clone()), keep(fixed.text.as_str(), alloc.clone())));
+        corrected.push((tree, bump.alloc_str(&path_of(file)), bump.alloc_str(fixed.text.as_str())));
     }
     used.push(Corrected {
         package: &unit.name,
         version: &unit.version,
         files: files.len(),
         predicates,
-        decision: keep(&row.decision, alloc.clone()),
+        decision: bump.alloc_str(&row.decision),
     });
     Ok(())
 }

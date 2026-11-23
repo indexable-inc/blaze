@@ -56,11 +56,10 @@ static TEXTS: Texts = Texts(&[&[("/user/main.rs", USER)], &[("/std/lib.rs", STD)
 const DEPS: &[(&str, usize)] = &[("std", 1)];
 
 fn names() -> Names<'static> {
-    let alloc: Alloc<'static> = blaze_own::testing::heap().alloc();
     let mut user = input("user", "/user/main.rs", DEPS);
     user.implicit = Implicit { entry: true, ..user.implicit };
     let crates: [CrateInput<'static>; 3] = [user, input("std", "/std/lib.rs", &[]), input("maker", "/maker/lib.rs", &[])];
-    resolve_crates(&crates, Sysroot::default(), &TEXTS, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"))
+    resolve_crates(&crates, Sysroot::default(), &TEXTS, &Serial, super::SyncFrame::leaked()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))
 }
 
 fn lookup(names: &Names<'static>, krate: usize, name: &'static str) -> Result<(), PathError> {

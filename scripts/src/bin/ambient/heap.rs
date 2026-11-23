@@ -187,17 +187,213 @@ pub(super) fn heap_uses(text: &str) -> Vec<(usize, HeapUse)> {
     out
 }
 
-/// One heap use in the tree.
+/// One counted site in the tree (shared by the heap, reach and producer-string ratchets).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct HeapSite {
+pub(super) struct RatchetSite<T> {
     /// Relative to the root.
-    path: String,
-    line: usize,
-    what: HeapUse,
+    pub(super) path: String,
+    pub(super) line: usize,
+    pub(super) what: T,
 }
 
+/// Each crate's sites outside test code and in it, in file and line order.
+pub(super) type RatchetCounts<T> = BTreeMap<String, (Vec<RatchetSite<T>>, Vec<RatchetSite<T>>)>;
+
+/// Counts `sites` into an `N`-column row by `column_of`.
+pub(super) fn tally_table<T, const N: usize>(sites: &[RatchetSite<T>], column_of: impl Fn(&T) -> usize) -> [usize; N] {
+    let mut row = [0; N];
+    for it in sites {
+        row[column_of(&it.what)] += 1;
+    }
+    row
+}
+
+/// Formats an `N`-column row as tab-separated integers.
+pub(super) fn row_text<const N: usize>(row: [usize; N]) -> String {
+    row.map(|n| n.to_string()).join("\t")
+}
+
+/// Renders a ratchet list: `header`, then `<crate><TAB><cols>` for each crate with a non-zero row.
+pub(super) fn render_table<T, const N: usize>(
+    header: &str,
+    counts: &RatchetCounts<T>,
+    tally: impl Fn(&[RatchetSite<T>]) -> [usize; N],
+) -> String {
+    let mut out = header.to_owned();
+    for (krate, (outside, _)) in counts {
+        let row = tally(outside);
+        if row != [0; N] {
+            out.push_str(&format!("{krate}\t{}\n", row_text(row)));
+        }
+    }
+    out
+}
+
+/// A row of a tab-separated ratchet list that is not one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum TableListError {
+    NotARow { list: &'static str, columns: &'static [ColumnSpec], line: usize, text: String },
+    TwoRows { list: &'static str, line: usize, krate: String },
+}
+
+impl fmt::Display for TableListError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TableListError::NotARow { list, columns, line, text } => {
+                write!(f, "{list}:{line}: `{text}` is not `<crate>")?;
+                for col in *columns {
+                    write!(f, "<TAB><{}>", col.name)?;
+                }
+                write!(f, "`")
+            }
+            TableListError::TwoRows { list, line, krate } => write!(f, "{list}:{line}: a second row for `{krate}`"),
+        }
+    }
+}
+
+/// Parses a tab-separated `<crate><TAB><col_0>...<TAB><col_{N-1}>` ratchet list.
+pub(super) fn parse_table_rows<const N: usize>(
+    policy: &'static TablePolicy<N>,
+    text: &str,
+) -> Result<BTreeMap<String, [usize; N]>, TableListError> {
+    let mut rows = BTreeMap::new();
+    for (at, line) in text.split('\n').enumerate() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let bad = || TableListError::NotARow { list: policy.list, columns: &policy.columns, line: at + 1, text: line.to_owned() };
+        let cells: Vec<&str> = line.split('\t').collect();
+        let [krate, rest @ ..] = cells.as_slice() else { return Err(bad()) };
+        if krate.is_empty() || rest.len() != N {
+            return Err(bad());
+        }
+        let mut row = [0; N];
+        for (cell, it) in row.iter_mut().zip(rest) {
+            *cell = it.parse().map_err(|_| bad())?;
+        }
+        if rows.insert((*krate).to_owned(), row).is_some() {
+            return Err(TableListError::TwoRows { list: policy.list, line: at + 1, krate: (*krate).to_owned() });
+        }
+    }
+    Ok(rows)
+}
+
+/// One column's wording in a ratchet table's refusal/note messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ColumnSpec {
+    pub(super) name: &'static str,
+    pub(super) what: &'static str,
+    pub(super) instead: &'static str,
+}
+
+/// A ratchet table's message policy for [`parse_table_rows`] and [`check_table_problems`].
+pub(super) struct TablePolicy<const N: usize> {
+    pub(super) list: &'static str,
+    pub(super) scope: &'static str,
+    pub(super) moved_noun: &'static str,
+    pub(super) rule: &'static str,
+    pub(super) write_cmd: &'static str,
+    pub(super) columns: [ColumnSpec; N],
+}
+
+/// What is over its row (each a refusal) and what is under it (each a note).
+pub(super) fn check_table_problems<T, const N: usize>(
+    policy: &TablePolicy<N>,
+    counts: &RatchetCounts<T>,
+    rows: &BTreeMap<String, [usize; N]>,
+    added: Option<&BTreeMap<String, BTreeSet<usize>>>,
+    column_of: impl Fn(&T) -> usize,
+    shown: impl Fn(&RatchetSite<T>) -> String,
+) -> (Vec<String>, Vec<String>) {
+    let (mut over, mut under) = (Vec::new(), Vec::new());
+    let crates: BTreeSet<&String> = counts.keys().chain(rows.keys()).collect();
+    for krate in crates {
+        let sites = counts.get(krate).map_or(&[][..], |(outside, _)| outside.as_slice());
+        let now_row: [usize; N] = tally_table(sites, &column_of);
+        let held_row = rows.get(krate).copied().unwrap_or([0; N]);
+        for (col_idx, col) in policy.columns.iter().enumerate() {
+            let (now, held) = (now_row[col_idx], held_row[col_idx]);
+            let row_ref = if N == 1 { "its row".to_owned() } else { format!("its row's `{}`", col.name) };
+            if now > held {
+                let of_kind = sites.iter().filter(|it| column_of(&it.what) == col_idx);
+                let named: Vec<String> = match added {
+                    Some(added) => {
+                        of_kind.filter(|it| added.get(&it.path).is_some_and(|lines| lines.contains(&it.line))).map(&shown).collect()
+                    }
+                    None => of_kind.take(3).map(&shown).collect(),
+                };
+                let new = match (added, named.is_empty()) {
+                    (Some(_), true) => {
+                        format!("none is on a line added since the base: a {} moved in, or a file git does not track", policy.moved_noun)
+                    }
+                    (Some(_), false) => format!("new: {}", named.join(", ")),
+                    (None, _) => format!("first: {}", named.join(", ")),
+                };
+                over.push(format!(
+                    "`{krate}` has {now} {} {}, over {row_ref} {held} in {} ({new}): {} ({})",
+                    col.what, policy.scope, policy.list, col.instead, policy.rule
+                ));
+            } else if now < held {
+                under.push(format!(
+                    "`{krate}` has {now} {} {}, under {row_ref} {held} in {}: lower it (command `{}`)",
+                    col.what, policy.scope, policy.list, policy.write_cmd
+                ));
+            }
+        }
+    }
+    (over, under)
+}
+
+/// Reads and parses a ratchet list, allowing a missing file only when writing.
+pub(super) fn load_table_rows<const N: usize>(
+    policy: &'static TablePolicy<N>,
+    root: &Path,
+    is_write: bool,
+) -> (Option<String>, BTreeMap<String, [usize; N]>) {
+    let listed = read_text(&root.join(policy.list));
+    let rows = match &listed {
+        Some(text) => parse_table_rows(policy, text).unwrap_or_else(|e| fail(SCRIPT, &e.to_string())),
+        None if is_write => BTreeMap::new(),
+        None => fail(
+            SCRIPT,
+            &format!(
+                "{} could not be read: every crate is held to its row there (command `{}` makes it)",
+                policy.list, policy.write_cmd
+            ),
+        ),
+    };
+    (listed, rows)
+}
+
+/// Writes `text` to `list`, refusing first if `over` is non-empty ("the list only falls").
+pub(super) fn write_table(list: &str, root: &Path, over: &[String], text: &str) {
+    if !over.is_empty() {
+        let lines: Vec<String> = over.iter().map(|w| format!("{SCRIPT}: {w}")).collect();
+        eprintln!("{}\n{SCRIPT}: {list} is not written: the list only falls", lines.join("\n"));
+        std::process::exit(1);
+    }
+    if let Err(e) = std::fs::write(root.join(list), text) {
+        fail(SCRIPT, &format!("{list} is not written: {e}"));
+    }
+}
+
+/// Prints any under-row notes and, if any crate is over its row, prints refusals and exits 1.
+pub(super) fn report_problems(over: &[String], under: &[String]) {
+    for note in under {
+        println!("{SCRIPT}: {note}");
+    }
+    if !over.is_empty() {
+        let lines: Vec<String> = over.iter().map(|w| format!("{SCRIPT}: {w}")).collect();
+        eprintln!("{}", lines.join("\n"));
+        std::process::exit(1);
+    }
+}
+
+/// One heap use in the tree.
+type HeapSite = RatchetSite<HeapUse>;
+
 /// Each crate's heap uses outside test code and in it, in file and line order.
-type HeapCounts = BTreeMap<String, (Vec<HeapSite>, Vec<HeapSite>)>;
+type HeapCounts = RatchetCounts<HeapUse>;
 
 fn count_heap(root: &Path) -> Result<HeapCounts, TreeError> {
     // Test code here is `testing`: test code, and `cfg(any(test, feature = "testing"))` modules
@@ -240,24 +436,13 @@ fn count_heap(root: &Path) -> Result<HeapCounts, TreeError> {
 }
 
 fn tally_heap(sites: &[HeapSite]) -> HeapRow {
-    let mut row = [0; 5];
-    for it in sites {
-        row[it.what.column()] += 1;
-    }
-    row
+    tally_table(sites, |it| it.column())
 }
 
 /// The list as `heap-write` writes it: the header, then a row for each crate with a use
 /// outside test code, sorted.
 fn render_heap(counts: &HeapCounts) -> String {
-    let mut out = HEAP_HEADER.to_owned();
-    for (krate, (outside, _)) in counts {
-        let row = tally_heap(outside);
-        if row != [0; 5] {
-            out.push_str(&render_row(krate, row));
-        }
-    }
-    out
+    render_table(HEAP_HEADER, counts, tally_heap)
 }
 
 /// The rows `heap-write` keeps over an existing list: each column the lower of the row and the
@@ -282,55 +467,32 @@ fn render_heap_rows(rows: &BTreeMap<String, HeapRow>, notes: &BTreeMap<String, s
             out.push_str(note);
             out.push('\n');
         }
-        out.push_str(&render_row(krate, *row));
+        out.push_str(&format!("{krate}\t{}\n", row_text(*row)));
     }
     out
 }
 
-/// One row of the list: the crate and its five columns, tab-separated.
-fn render_row(krate: &str, row: HeapRow) -> String {
-    format!("{krate}\t{}\t{}\t{}\t{}\t{}\n", row[0], row[1], row[2], row[3], row[4])
+const fn heap_column(u: HeapUse) -> ColumnSpec {
+    ColumnSpec { name: u.name(), what: u.what(), instead: u.instead() }
 }
 
-/// A row of the list that is not one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum HeapListError {
-    NotARow { line: usize, text: String },
-    TwoRows { line: usize, krate: String },
-}
+static HEAP_POLICY: TablePolicy<5> = TablePolicy {
+    list: HEAP_LIST,
+    scope: "counted",
+    moved_noun: "call",
+    rule: "D102",
+    write_cmd: "heap-write",
+    columns: [
+        heap_column(COLUMNS[0]),
+        heap_column(COLUMNS[1]),
+        heap_column(COLUMNS[2]),
+        heap_column(COLUMNS[3]),
+        heap_column(COLUMNS[4]),
+    ],
+};
 
-impl fmt::Display for HeapListError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            HeapListError::NotARow { line, text } => {
-                write!(f, "{HEAP_LIST}:{line}: `{text}` is not `<crate><TAB><global><TAB><shared_global><TAB><test_heap><TAB><process><TAB><leak>`")
-            }
-            HeapListError::TwoRows { line, krate } => write!(f, "{HEAP_LIST}:{line}: a second row for `{krate}`"),
-        }
-    }
-}
-
-fn parse_heap_rows(text: &str) -> Result<BTreeMap<String, HeapRow>, HeapListError> {
-    let mut rows = BTreeMap::new();
-    for (at, line) in text.split('\n').enumerate() {
-        if line.trim().is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let bad = || HeapListError::NotARow { line: at + 1, text: line.to_owned() };
-        let cells: Vec<&str> = line.split('\t').collect();
-        let [krate, rest @ ..] = cells.as_slice() else { return Err(bad()) };
-        if krate.is_empty() || rest.len() != 5 {
-            return Err(bad());
-        }
-        let mut row = [0; 5];
-        for (cell, it) in row.iter_mut().zip(rest) {
-            *cell = it.parse().map_err(|_| bad())?;
-        }
-        if rows.insert((*krate).to_owned(), row).is_some() {
-            return Err(HeapListError::TwoRows { line: at + 1, krate: (*krate).to_owned() });
-        }
-    }
-    Ok(rows)
+fn parse_heap_rows(text: &str) -> Result<BTreeMap<String, HeapRow>, TableListError> {
+    parse_table_rows(&HEAP_POLICY, text)
 }
 
 /// The lines added since `base` under crates/ (tracked files only).
@@ -348,43 +510,7 @@ fn heap_problems(
     rows: &BTreeMap<String, HeapRow>,
     added: Option<&BTreeMap<String, BTreeSet<usize>>>,
 ) -> (Vec<String>, Vec<String>) {
-    let (mut over, mut under) = (Vec::new(), Vec::new());
-    let crates: BTreeSet<&String> = counts.keys().chain(rows.keys()).collect();
-    for krate in crates {
-        let sites = counts.get(krate).map_or(&[][..], |(outside, _)| outside.as_slice());
-        let now_row = tally_heap(sites);
-        let held_row = rows.get(krate).copied().unwrap_or([0; 5]);
-        for what in COLUMNS {
-            let (now, held) = (now_row[what.column()], held_row[what.column()]);
-            let column = what.name();
-            if now > held {
-                let of_kind = sites.iter().filter(|it| it.what == what);
-                let named: Vec<String> = match added {
-                    Some(added) => of_kind
-                        .filter(|it| added.get(&it.path).is_some_and(|lines| lines.contains(&it.line)))
-                        .map(|it| format!("{}:{}", it.path, it.line))
-                        .collect(),
-                    None => of_kind.take(3).map(|it| format!("{}:{}", it.path, it.line)).collect(),
-                };
-                let new = match (added, named.is_empty()) {
-                    (Some(_), true) => "none is on a line added since the base: a call moved in, or a file git does not track".to_owned(),
-                    (Some(_), false) => format!("new: {}", named.join(", ")),
-                    (None, _) => format!("first: {}", named.join(", ")),
-                };
-                over.push(format!(
-                    "`{krate}` has {now} {} counted, over its row's `{column}` {held} in {HEAP_LIST} ({new}): {} (D102)",
-                    what.what(),
-                    what.instead()
-                ));
-            } else if now < held {
-                under.push(format!(
-                    "`{krate}` has {now} {} counted, under its row's `{column}` {held} in {HEAP_LIST}: lower it (command `heap-write`)",
-                    what.what()
-                ));
-            }
-        }
-    }
-    (over, under)
+    check_table_problems(&HEAP_POLICY, counts, rows, added, |it| it.column(), |it| format!("{}:{}", it.path, it.line))
 }
 
 pub(super) fn main_with(command: &str, base: Option<&str>, root: &Path) {
@@ -425,12 +551,7 @@ pub(super) fn main_with(command: &str, base: Option<&str>, root: &Path) {
         println!("{SCRIPT}: outside tests {}; in tests {}", summary(totals(|it| &it.0)), summary(totals(|it| &it.1)));
         return;
     }
-    let listed = read_text(&root.join(HEAP_LIST));
-    let rows = match &listed {
-        Some(text) => parse_heap_rows(text).unwrap_or_else(|e| fail(SCRIPT, &e.to_string())),
-        None if command == "heap-write" => BTreeMap::new(),
-        None => fail(SCRIPT, &format!("{HEAP_LIST} could not be read: every crate is held to its row there (command `heap-write` makes it)")),
-    };
+    let (listed, rows) = load_table_rows(&HEAP_POLICY, root, command == "heap-write");
     if command == "heap-write" {
         // The first write takes the tree as it stands; after it, a row never rises: each column
         // is the lower of the row and the count (a crate with no row is held at 0), so a crate
@@ -446,22 +567,13 @@ pub(super) fn main_with(command: &str, base: Option<&str>, root: &Path) {
             }
             None => render_heap(&counts),
         };
-        if let Err(e) = std::fs::write(root.join(HEAP_LIST), text) {
-            fail(SCRIPT, &format!("{HEAP_LIST} is not written: {e}"));
-        }
+        write_table(HEAP_LIST, root, &[], &text);
         println!("{SCRIPT}: wrote {HEAP_LIST}: outside tests {}", summary(totals(|it| &it.0)));
         return;
     }
     let added = base.map(|base| added_since(root, base).unwrap_or_else(|e| fail(SCRIPT, &e.to_string())));
     let (over, under) = heap_problems(&counts, &rows, added.as_ref());
-    for note in &under {
-        println!("{SCRIPT}: {note}");
-    }
-    if !over.is_empty() {
-        let lines: Vec<String> = over.iter().map(|w| format!("{SCRIPT}: {w}")).collect();
-        eprintln!("{}", lines.join("\n"));
-        std::process::exit(1);
-    }
+    report_problems(&over, &under);
     println!("{SCRIPT}: outside tests {}, each crate at or under its row in {HEAP_LIST}", summary(totals(|it| &it.0)));
 }
 

@@ -15,12 +15,11 @@
 //! write a `#[macro_export]` macro, bound at the crate root. Every doubt is [`Writes::Any`].
 
 #![no_std]
-#![feature(allocator_api)]
 
 use blaze_expand::{CallWrites, MacroWrites, TokenStream, Written};
 use blaze_id::CrateItemKey;
 use blaze_names_demand::types::Writes;
-use blaze_own::{AVec, Alloc, Vec};
+use blaze_own::{AVec, Bump, Vec};
 
 mod error;
 mod source;
@@ -43,7 +42,7 @@ pub trait Texts {
 /// The demand machine's summary of one call of the definition `writes` summarises, its input
 /// `input` (`None` when the input is not at hand: a summary that needs it is then `Any`), its
 /// names in `alloc`.
-pub fn call_writes<'w>(writes: &MacroWrites<'w, '_>, input: Option<&'w TokenStream<'w>>, alloc: Alloc<'w>) -> Writes<'w> {
+pub fn call_writes<'w>(writes: &MacroWrites<'w, '_>, input: Option<&'w TokenStream<'w>>, alloc: Bump<'w>) -> Writes<'w> {
     call_writes_keeping(writes, input, &|_: &Written<'w>| true, alloc)
 }
 
@@ -54,11 +53,11 @@ pub fn call_writes_keeping<'w>(
     writes: &MacroWrites<'w, '_>,
     input: Option<&'w TokenStream<'w>>,
     keep: &impl Fn(&Written<'w>) -> bool,
-    alloc: Alloc<'w>,
+    alloc: Bump<'w>,
 ) -> Writes<'w> {
-    let mut names: AVec<'w, &'w str> = Vec::new_in(alloc);
+    let mut names: AVec<'w, &'w str> = Vec::new_in(alloc.alloc());
     match writes.for_call_keeping(input, keep, &mut names) {
         CallWrites::Any(_) => Writes::Any,
-        CallWrites::Only { exports } => Writes::Only { names: names.leak(), exports },
+        CallWrites::Only { exports } => Writes::Only { names: alloc.alloc_slice_copy(&names), exports },
     }
 }

@@ -50,8 +50,8 @@ mod records;
 pub use asked::{Ask, BucketRead, INCOHERENT_FACT, UNFILED_LIST};
 pub use records::{
     BucketReadUnion,
-    AdmitError, BucketSource, ImplQuestionError, ImplShelf, ImplShelfOpts, ImplTables, ImplTablesDone, ImplTablesFailed, ItemsIndex, NoTables, ShelfError, ShelfSource, ShelvedTwice, TRAIT_HELD, TableSet, TablesError, TablesReadError, bucket_cell, cell_read, check_framed, cells_of, framed,
-    impl_tables_name, impl_tables_task, row_answers, row_digest, rows_key, trait_cell, write_impl_tables,
+    AdmitError, BucketSource, ImplChunk, ImplQuestionError, ImplShelf, ImplShelfOpts, ImplTables, ImplTablesDone, ImplTablesFailed, ItemsIndex, NoTables, ShelfError, ShelfSource, ShelvedTwice, TRAIT_HELD, TableSet, TablesError, TablesReadError, bucket_cell, cell_read, check_framed, cells_of, file_impl_rows_chunk, finish_impl_tables, framed,
+    impl_tables_name, impl_tables_out, impl_tables_task, row_answers, row_digest, rows_key, trait_cell, write_impl_tables,
 };
 
 /// A candidate impl whose header the store does not hold when the answer is made, or an
@@ -238,7 +238,7 @@ pub(crate) fn shape_of(t: PTys<'_>, p: PTy) -> Option<Shape> {
         PNode::Float(f) => Shape::Float(f),
         PNode::Str => Shape::Str,
         PNode::Never => Shape::Never,
-        PNode::Tuple(l) => Shape::Tuple(l.len),
+        PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => Shape::Tuple(l.len),
         PNode::Ref(m, _) => Shape::Ref(m),
         PNode::Ptr(m, _) => Shape::Ptr(m),
         PNode::Array(..) => Shape::Array,

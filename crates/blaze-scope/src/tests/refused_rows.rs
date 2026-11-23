@@ -126,21 +126,22 @@ impl SourceTexts<'static> for Stopped {
 /// Passing prints "test tests::refused_rows::a_run_the_sandbox_stopped_is_refused_by_the_path_it_named ... ok".
 #[test]
 fn a_run_the_sandbox_stopped_is_refused_by_the_path_it_named() {
-    let alloc: Alloc<'static> = blaze_own::testing::heap().alloc();
+    let bump = super::SyncFrame::leaked();
+    let alloc: Alloc<'static> = bump.alloc();
     let crates: [CrateInput<'static>; 3] = [
         input("user", "/user/lib.rs", &[("procs", 1), ("bare", 2)]),
         CrateInput { implicit: PROC, ..input("procs", "/procs/lib.rs", &[]) },
         CrateInput { implicit: PROC, ..input("bare", "/bare/lib.rs", &[]) },
     ];
-    let names = resolve_crates(&crates, Sysroot::default(), &Stopped, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &Stopped, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let user = names.krate(0);
     let written = encode(user, alloc).unwrap_or_else(|e| panic!("encode: {e:?}"));
-    let record = NamesRecord::open(Verified::check(aligned(&written, alloc)).unwrap_or_else(|e| panic!("check: {e:?}")));
+    let record = NamesRecord::open(Verified::check(aligned(&written, bump)).unwrap_or_else(|e| panic!("check: {e:?}")));
     let show = user
         .expansions
         .iter()
         .filter(|(_, e)| e.refused.is_some())
-        .filter_map(|(call, _)| record.failed(*call, alloc).unwrap_or_else(|e| panic!("failed: {e:?}")))
+        .filter_map(|(call, _)| record.failed(*call, bump).unwrap_or_else(|e| panic!("failed: {e:?}")))
         .find(|row| row.path == "procs::Show")
         .unwrap_or_else(|| panic!("the derive `procs::Show` has a row"));
     let note = std::format!("not checked because the call of `{}` ({}) in {} failed: {}", show.path, show.shape.name(), show.file, show.why);
@@ -159,24 +160,25 @@ const PROC: Implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(editi
 /// Passing prints "test tests::refused_rows::every_refused_call_leaves_a_row_that_reads_back ... ok".
 #[test]
 fn every_refused_call_leaves_a_row_that_reads_back() {
-    let alloc: Alloc<'static> = blaze_own::testing::heap().alloc();
+    let bump = super::SyncFrame::leaked();
+    let alloc: Alloc<'static> = bump.alloc();
     let crates: [CrateInput<'static>; 3] = [
         input("user", "/user/lib.rs", &[("procs", 1), ("bare", 2)]),
         CrateInput { implicit: PROC, ..input("procs", "/procs/lib.rs", &[]) },
         CrateInput { implicit: PROC, ..input("bare", "/bare/lib.rs", &[]) },
     ];
-    let names = resolve_crates(&crates, Sysroot::default(), &FILES, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &FILES, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let user = names.krate(0);
     let written = encode(user, alloc).unwrap_or_else(|e| panic!("encode: {e:?}"));
-    let record = NamesRecord::open(Verified::check(aligned(&written, alloc)).unwrap_or_else(|e| panic!("check: {e:?}")));
+    let record = NamesRecord::open(Verified::check(aligned(&written, bump)).unwrap_or_else(|e| panic!("check: {e:?}")));
 
     let mut refused: Vec<ItemKey> = user.expansions.iter().filter(|(_, e)| e.refused.is_some()).map(|(k, _)| *k).collect();
     refused.sort_unstable();
     let mut rows: Vec<FailedRow<'_>> = Vec::new();
     for call in refused {
-        let row = record.failed(call, alloc).unwrap_or_else(|e| panic!("failed: {e:?}"));
+        let row = record.failed(call, bump).unwrap_or_else(|e| panic!("failed: {e:?}"));
         let row = row.unwrap_or_else(|| panic!("the refused call {call:?} has a row"));
-        assert_eq!(Some(row), refused_row(user, call, alloc), "the row reads back as the solve's join");
+        assert_eq!(Some(row), refused_row(user, call, bump), "the row reads back as the solve's join");
         rows.push(row);
     }
     let shown: Vec<String> = rows.iter().map(|r| std::format!("{} ({}) in {}: {}", r.path, r.shape.name(), r.file, r.why)).collect();
@@ -204,12 +206,12 @@ fn every_refused_call_leaves_a_row_that_reads_back() {
 
     assert!(rows.iter().all(|r| r.why.kind() != RefusalKind::Unnoted), "every refusal noted its reason: {shown:#?}");
     // The control of the lookup: a key that is no refused call.
-    assert!(record.failed(user.root, alloc).unwrap_or_else(|e| panic!("failed: {e:?}")).is_none());
+    assert!(record.failed(user.root, bump).unwrap_or_else(|e| panic!("failed: {e:?}")).is_none());
     // Deterministic: a second encode writes equal bytes.
     let again = encode(user, alloc).unwrap_or_else(|e| panic!("encode: {e:?}"));
     assert_eq!(written[..], again[..]);
     // An old home's record (version 4: failed calls only) is refused, and made again.
     let mut old = Vec::from(&written[..]);
     old[4..8].copy_from_slice(&4u32.to_le_bytes());
-    assert!(matches!(Verified::check(aligned(&old, alloc)), Err(NamesRecordError::NotThisRecord)));
+    assert!(matches!(Verified::check(aligned(&old, bump)), Err(NamesRecordError::NotThisRecord)));
 }

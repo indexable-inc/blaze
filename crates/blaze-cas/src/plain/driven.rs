@@ -21,7 +21,7 @@ use blaze_keyed::{
 };
 
 use super::{
-    core::{Batch, Committed, Found, Got, LentRecord, Liveness, Plain, PlainConfig, Probe, Probes, PutError, Report, Scrubbed, Sliced, TAGS},
+    core::{Batch, Committed, Found, Got, LentRecord, Liveness, Plain, PlainConfig, Probe, Probes, PutError, Renewed, Report, Scrubbed, Sliced, TAGS},
     format::{self, Segment},
     settings::Settings,
 };
@@ -678,6 +678,19 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
     /// [`Plain::root_through`].
     pub fn root_through(&mut self, name: &str, indexes: &[Key], life_ns: u64) -> Result<Key, StoreError> {
         self.root_through_owned(name, indexes, life_ns, &|_| false)
+    }
+
+    /// O(1) lease renewal for an already-live root `name` ([`Plain::renew_root`]): checks the
+    /// manifest's root entry against the driver's wall clock without probing or hashing held keys.
+    pub fn renew_root(&mut self, name: &str, life_ns: u64) -> Renewed {
+        let now = self.driver.wall_ns();
+        self.core.renew_root(name, life_ns, now)
+    }
+
+    /// O(segments + roots + retired) check of whether compaction or GC housekeeping is due at
+    /// `now_ns` ([`Plain::needs_housekeeping`]).
+    pub fn needs_housekeeping(&self, now_ns: u64) -> bool {
+        self.core.needs_housekeeping(now_ns)
     }
 
     /// [`Plain::index_beside`].

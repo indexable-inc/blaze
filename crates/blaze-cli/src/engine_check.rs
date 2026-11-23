@@ -352,6 +352,123 @@ pub(crate) fn why(
     serve(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap, Some(target))
 }
 
+const WARM_TOOLCHAIN_USAGE: &str = "blaze warm-toolchain [--workers N] [--origin <url|folder>] [--origin-key <hex>] [--fresh] [--stats]: warm core/alloc/std (edition 2024) and bstd (edition blaze-2026.11) into the shared home store";
+
+const WARM_WORKSPACE_TOML: &[u8] = b"[workspace]\nmembers = [\"std_probe\", \"bstd_probe\"]\nresolver = \"2\"\n";
+const WARM_STD_TOML: &[u8] = b"[package]\nname = \"std_probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+const WARM_STD_LIB: &[u8] = b"pub fn warm_std() -> usize {\n    std::vec::Vec::<u8>::new().len()\n}\n";
+const WARM_BSTD_TOML: &[u8] = b"[package]\nname = \"bstd_probe\"\nversion = \"0.1.0\"\nedition = \"blaze-2026.11\"\n";
+const WARM_BSTD_LIB: &[u8] = b"pub fn warm_bstd() -> usize {\n    0\n}\n";
+
+fn write_warm_file(cx: &Cx, dir: &Dir<ReadWrite>, path: &str, bytes: &[u8], frame: &Frame) -> Result<(), CliError> {
+    let p = Path::new(path)?;
+    let mut existing = bstd::mem::Bytes::new_in(frame, "warm-toolchain existing");
+    match dir.read_all(cx, &p, &mut existing) {
+        Ok(_) if existing.as_slice() == bytes => return Ok(()),
+        Ok(_) => {}
+        Err(err) if matches!(err.kind, bstd::fs::FsKind::NotFound) => {}
+        Err(err) => return Err(err.into()),
+    }
+    dir.publish(cx, &p, bstd::fs::Content::bytes(bytes), bstd::fs::Durable::No)?;
+    Ok(())
+}
+
+/// `blaze warm-toolchain`: pre-warms `core`/`alloc`/`std` (edition 2024) + `bstd`
+/// (edition `blaze-2026.11`) into the shared `~/.blaze/v2` store and refreshes
+/// `tool-base.<PINNED>.<TRIPLE>.<tools>` so every fresh project and worktree reuses them.
+#[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one specific capability")]
+pub(crate) fn warm_toolchain(
+    cx: &Cx,
+    args: &bstd::args::Args,
+    fs: &bstd::fs::Fs,
+    env: Option<&bstd::env::Env>,
+    net: Option<&bstd::net::Net>,
+    host: &bstd::host::Host,
+    _clock: &bstd::clock::Clock,
+    rng: &mut bstd::rng::Rng,
+    out: &Out,
+    err: &Out,
+    phases: &mut Phases,
+    heap: &'static blaze_own::Heap,
+) -> Result<Status, CliError> {
+    let mut flags = crate::Flags::empty();
+    let mut fresh = false;
+    let mut at = 2;
+    while let Some(arg) = args.get(at) {
+        at += 1;
+        match arg {
+            "-h" | "--help" => {
+                out.line(cx, WARM_TOOLCHAIN_USAGE)?;
+                return Ok(Status::OK);
+            }
+            "--fresh" => fresh = true,
+            "--stats" => flags.stats = true,
+            "--workers" => {
+                let raw = args.get(at).ok_or(CliError::Usage(WARM_TOOLCHAIN_USAGE))?;
+                at += 1;
+                let parsed = raw.parse::<NonZeroU32>().map_err(|_| CliError::Usage("--workers takes a positive integer"))?;
+                flags.workers = Some(parsed);
+            }
+            "--origin" => {
+                let raw = args.get(at).ok_or(CliError::Usage(WARM_TOOLCHAIN_USAGE))?;
+                at += 1;
+                flags.origin = Some(raw);
+            }
+            "--origin-key" => {
+                let raw = args.get(at).ok_or(CliError::Usage(WARM_TOOLCHAIN_USAGE))?;
+                at += 1;
+                flags.origin_key = Some(raw);
+            }
+            other => {
+                if let Some(raw) = other.strip_prefix("--workers=") {
+                    let parsed = raw.parse::<NonZeroU32>().map_err(|_| CliError::Usage("--workers takes a positive integer"))?;
+                    flags.workers = Some(parsed);
+                } else {
+                    return Err(CliError::Usage(WARM_TOOLCHAIN_USAGE));
+                }
+            }
+        }
+    }
+    let request = request_frame()?;
+    let home_var = env.and_then(|e| e.get(&VarName::new("HOME").ok()?).ok().flatten());
+    let home = crate::store::Home::of(cx, fs, home_var)?;
+    let rel_ws = "v2/warm-toolchain";
+    write_warm_file(cx, home.dir(), "v2/warm-toolchain/Cargo.toml", WARM_WORKSPACE_TOML, &request)?;
+    write_warm_file(cx, home.dir(), "v2/warm-toolchain/std_probe/Cargo.toml", WARM_STD_TOML, &request)?;
+    write_warm_file(cx, home.dir(), "v2/warm-toolchain/std_probe/src/lib.rs", WARM_STD_LIB, &request)?;
+    write_warm_file(cx, home.dir(), "v2/warm-toolchain/bstd_probe/Cargo.toml", WARM_BSTD_TOML, &request)?;
+    write_warm_file(cx, home.dir(), "v2/warm-toolchain/bstd_probe/src/lib.rs", WARM_BSTD_LIB, &request)?;
+    let ws_dir = home.dir().subdir(&Path::new(rel_ws)?);
+    let abs_at = match home_var {
+        Some(h) => bstd::mem::format_in!(&request, "{}/.blaze/{rel_ws}", h.trim_end_matches('/')),
+        None => bstd::mem::format_in!(&request, ".blaze/{rel_ws}"),
+    };
+    let located = crate::run_package::Located { root: ws_dir, at: work::held_str(abs_at.as_str(), &request), member: "" };
+    edge_at(cx, fs, env, net, host, out, err, phases, heap, &flags, None, Some(located), &request, |edge, phases| {
+        let Edge { root, opts, mut shown, err, frame, .. } = edge;
+        shown.quiet = true;
+        let mut check_opts = opts();
+        check_opts.fresh = fresh;
+        let checked = check(cx, fs, host, rng, Some(args), net, root, check_opts, &mut shown, phases, out, err)?;
+        let tc_hex = blaze_toolchain::PINNED.hex();
+        out.line(
+            cx,
+            format_args!(
+                "warmed toolchain {} ({}): {} of {} task(s) entered, {} record(s) put",
+                &tc_hex.as_str()[..16],
+                crate::graph::TRIPLE,
+                checked.entered,
+                checked.tasks,
+                checked.puts,
+            ),
+        )?;
+        if flags.stats {
+            err.line(cx, format_args!("{}", stats_line(&checked, phases.in_main(), frame)))?;
+        }
+        Ok(checked.status)
+    })
+}
+
 /// The command's edge, read once: the checkout, the tools, the places; then the check, or with
 /// `why` its explanation from the stored answer.
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one specific capability")]
@@ -377,7 +494,14 @@ fn serve(
         let Some(target) = why else {
             let checked = match flags.fix {
                 None => {
-                    let line = crate::run_line::LineOpts::from_env(env, err, flags.color);
+                    let line = crate::run_line::LineOpts::from_env(
+                        env,
+                        err,
+                        flags.color,
+                        blaze_screen::Command::Check,
+                        view,
+                        flags.status_every.is_some(),
+                    );
                     let ran = crate::run_line::watched(cx, err, clock, line, |watch, bg| {
                         watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Checking));
                         let live = line.live.then_some(bg);
@@ -391,8 +515,12 @@ fn serve(
                 // written as one transaction, then a second check printing what is left; the
                 // listed findings are in the request's frame, which outlives both.
                 Some((start, end)) => {
-                    let mut selectors: blaze_own::Vec<&str, &Frame> = blaze_own::Vec::with_capacity_in(end - start, frame);
+                    let cap = (end - start).max(1);
+                    let mut selectors: blaze_own::Vec<&str, &Frame> = blaze_own::Vec::with_capacity_in(cap, frame);
                     selectors.extend((start..end).filter_map(|at| args.get(at)));
+                    if selectors.is_empty() {
+                        selectors.push("all");
+                    }
                     let mut ask = |mut shown| check(cx, fs, host, rng, Some(args), net, root, opts(), &mut shown, phases, out, err).map(|checked| (checked, shown));
                     match crate::fix_then_check::<crate::fix::Atomic, Checked>(cx, root, &selectors, (caps, view, shown_root), frame, out, &mut ask)? {
                         crate::Fixed::Refused => None,
@@ -461,6 +589,26 @@ fn edge<R>(
     frame: &Frame,
     then: impl for<'f> FnOnce(Edge<'f>, &mut Phases) -> Result<R, CliError>,
 ) -> Result<R, CliError> {
+    edge_at(cx, fs, env, net, host, out, err, phases, heap, flags, why, None, frame, then)
+}
+
+#[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
+fn edge_at<'l, R>(
+    cx: &Cx,
+    fs: &bstd::fs::Fs,
+    env: Option<&bstd::env::Env>,
+    net: Option<&bstd::net::Net>,
+    host: &bstd::host::Host,
+    out: &Out,
+    err: &Out,
+    phases: &mut Phases,
+    heap: &'static blaze_own::Heap,
+    flags: &crate::Flags<'_>,
+    why: Option<&str>,
+    located_override: Option<crate::run_package::Located<'l>>,
+    frame: &'l Frame,
+    then: impl for<'f> FnOnce(Edge<'f>, &mut Phases) -> Result<R, CliError>,
+) -> Result<R, CliError> {
     let var = |name: &str| -> Option<&str> { env?.get(&VarName::new(name).ok()?).ok().flatten() };
     // The named origin, opened as `check-old` opens it (main.rs): a miss is read from it.
     // Declared before `shown`: the request's options and what it prints share one lifetime
@@ -474,15 +622,18 @@ fn edge<R>(
     phases.mark_cx(cx, "open checkout: the origin named", frame);
     // Single-file `.rs` script (`blaze run script.rs`, `blaze check script.rs`, `blaze test script.rs`),
     // or a directory/workspace checkout walking up to its workspace root (run_package.rs `locate`, R3).
-    let located = match flags.dir {
-        Some(raw) if why.is_none() && crate::single_file::is_script_arg(raw) => {
-            crate::single_file::prepare(cx, fs, var("HOME"), raw, frame)?
-        }
-        _ => {
-            // `why`'s first word is its target, never a checkout: it stands where blaze was started.
-            let checkout = crate::checkout::checkout(if why.is_some() { None } else { flags.dir }, frame)?;
-            crate::run_package::locate(cx, fs, &checkout, frame)?
-        }
+    let located = match located_override {
+        Some(located) => located,
+        None => match flags.dir {
+            Some(raw) if why.is_none() && crate::single_file::is_script_arg(raw) => {
+                crate::single_file::prepare(cx, fs, var("HOME"), raw, frame)?
+            }
+            _ => {
+                // `why`'s first word is its target, never a checkout: it stands where blaze was started.
+                let checkout = crate::checkout::checkout(if why.is_some() { None } else { flags.dir }, frame)?;
+                crate::run_package::locate(cx, fs, &checkout, frame)?
+            }
+        },
     };
     phases.mark_cx(cx, "open checkout: the workspace's root (run_package.rs `locate`: one manifest at a `[workspace]` root, else the layout whole)", frame);
     let (checkout_at, member): (&str, &str) = (located.at, located.member);
@@ -1166,9 +1317,14 @@ fn checking<'f>(
         let stored = match fresh {
             true => None,
             false => match crate::engine_answer::load_pointer(cx, &mut store, &answer_root)? {
-                // No answer of this checkout's own: its workspace's base (engine_answer.rs `load_base`, `StoredBase::OtherCheckout`).
+                // No answer of this checkout's own: its workspace's base (`load_base`), else the
+                // pre-warmed toolchain-only base (`tool-base.<PINNED>.<TRIPLE>.<tools>`), both
+                // loaded via `StoredBase::OtherCheckout`.
                 None => {
-                    let latest = crate::engine_answer::load_base(cx, &mut store, root, frame)?;
+                    let latest = match crate::engine_answer::load_base(cx, &mut store, root, frame)? {
+                        Some(found) => Some(found),
+                        None => crate::engine_answer::load_toolchain_base(cx, &mut store, toolchain, &tools, frame)?,
+                    };
                     other_checkout = latest.is_some();
                     latest
                 }
@@ -1231,13 +1387,14 @@ fn checking<'f>(
     // checkout is read (journal_sweep.rs): a write after this and before its file's read is
     // after the place this request saves, so the next request's replay names it. Moved below
     // the sweep or the plan's reads, such a write would be missed for good.
-    // The changed set through its one seam (journal_sweep.rs `ChangedSince`): the helper asked,
-    // then the journal replayed, both marking and their difference printed (journal_ask.rs
-    // `Both`) until the differential holds on tempo; then `Asked`. No helper is started
-    // (`HelperStart::None`): with none answering, this is `Replay` and one failed connect.
+    // The changed set through its one seam (journal_sweep.rs `ChangedSince`): ask the detached
+    // helper (`Shipped = Asked`); when no live helper answers on a real native host, start one
+    // detached (`HelperStart::Detached`) and replay for this command.
     use crate::journal_sweep::ChangedSince as _;
     let me = crate::journal_ask::Me::of(&host.build_id()?, place.served.root_text(), place.home, frame);
-    let strategy = crate::journal_ask::Shipped { me, start: crate::journal_ask::HelperStart::None };
+    let exe = (!cfg!(test) && !cx.is_simulated()).then(|| host.exe().ok()).flatten();
+    let start = crate::journal_ask::HelperStart::detached(host, exe.as_deref(), place.served.root_text(), place.home);
+    let strategy = crate::journal_ask::Shipped { me, start };
     let journal = strategy.changed_since(cx, root, opened.home.dir(), phases.clock(), chosen.places(), frame)?;
     let now_places = crate::journal_checkpoint::Places::of_taken(&journal, frame);
     // The lint step and rules the root manifest names, as `check` reads them (lints.rs
@@ -1410,7 +1567,7 @@ fn checking<'f>(
                 let mut discovered = {
                     let answer_units = AnswerUnits { stored: stored.as_ref(), records: &records, alloc: request };
                     let back = crate::engine_units::Back::new(&answer_units);
-                    crate::engine_units::discover(cx, root, &mut store, &mut laid_here, units, tools, &back, stood, &env, frame)?
+                    crate::engine_units::discover(cx, root, &mut store, &mut laid_here, units, tools, &back, stood, &env, board, frame)?
                 };
                 phases.mark_cx(cx, discovered.cause.phase(), frame);
                 let kept = Kept { slots: &today_slots, answer: &start, records: &records, tools: &tools, read: core::cell::Cell::new(0) };
@@ -1711,7 +1868,7 @@ fn checking<'f>(
     let mut ledger = made_boxed(heap, crate::engine_store::Ledger::new);
     // The Heads and Bodies stages' reader of the crates' records, in place in the store's
     // mapping for the store's borrow (engine_records.rs): dropped with the store, never in a stage.
-    let mut read = crate::engine_records::EngineRecords::new();
+    let mut read = crate::engine_records::EngineRecords::new(heap.alloc());
     read.plant_unreadable(planted_unreadable);
     // The same plant for a scope made by need (engine_bodies.rs `scope_by_need`).
     bodies.plant_unreadable(planted_unreadable);
@@ -2753,7 +2910,7 @@ where
     stop_point(rq)?;
     let mut prior = engine.next_phase_in(Stage::Units, &mut |_, _| true)?;
     if prior.is_none() { prior = engine.next_phase_in(Stage::Outlines, &mut |_, _| true)?; }
-    rq.pipelined |= rq.names.is_some() && engine.has_pending_stage(Stage::Scripts);
+    rq.pipelined |= rq.names.is_some() && (engine.has_pending_stage(Stage::Scripts) || engine.has_pending_stage(Stage::Names));
     let mut mixed = None;
     if prior.is_none() && rq.pipelined && let Some(stage) = rq.names.as_mut() {
         pipeline.admit(cx, &mut *engine, &mut *rq.scripts, &mut *stage, &mut *store, &mut *read, rq.handles, alloc, rq.frame)?;
@@ -3526,7 +3683,7 @@ fn ready_setup<'f, 'h, 'a>(
         let _cx = cx.span("names: the crate list read back");
         let mut held = Vec::with_capacity_in(sections.list.len(), env.heap.alloc());
         held.extend_from_slice(sections.list);
-        let held: &'static [u8] = held.leak();
+        let held: &'static [u8] = held.leak_static();
         match crate::names::Names::of_list(held, None, env.heap.alloc()) {
             Ok(names) => names,
             Err(crate::names::NamesError::List(why)) => return Ok(Err(ReadyRefused::Graph(crate::engine_units::BackRefused::List { key, why }))),

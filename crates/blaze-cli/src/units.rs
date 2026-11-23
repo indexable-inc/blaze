@@ -230,7 +230,7 @@ pub fn lay<'f, 'l>(
         }
         Some((_, None)) => match sweep::read_manifest(&cx, root, stamps, LOCK, rows, &mut text)? {
             false => None,
-            true => Some(Vec::from_slice_in(text.as_slice(), frame).leak()),
+            true => Some(frame.alloc_slice_copy(text.as_slice())),
         },
     };
     let lock = match lock_text {

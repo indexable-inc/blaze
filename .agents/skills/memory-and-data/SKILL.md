@@ -17,13 +17,18 @@ allocator: a collection that lives within one task (a query run, a codegen unit,
 uses `Vec::new_in(frame)` / `Box::new_in(.., frame)` from `blaze_mem::frame::current`, the request's
 lifetime uses the request's allocator, what outlives the request is a record and not heap
 (`outputs-are-records`), and the global heap is named `Global` where it is used
-(`Vec::new_in(Global)`, `Box::new_in(x, Global)`). An allocator is never implied (`Vec::new`,
-`vec![]`, `collect`, `Box::new`, `String::from`, `format!`, `to_string`, `to_owned`, `to_vec`, a
-`clone` of an owning value), and no comment stands in for one: `// alloc: <why>` keeps nothing, and
-an item that must keep an implied allocator says why with `#[expect(blaze::implicit_allocator,
-reason = "..")]`. `blaze::implicit_allocator` enforces this, with a fix to the explicit `Global`
-form, and `blaze::hot_alloc` for what a call reaches; `scripts/src/bin/allocs.rs` holds each crate's
-`// alloc:` lines left to convert, its `expect`s and its lines naming `Global` to a list that only
+(`Vec::new_in(Global)`, `Box::new_in(x, Global)`). Never expose or call general `.leak()`: to freeze
+bump-allocated storage into an arena-lifetime slice or reference, require `BumpAlloc` (`&Frame`,
+`ArenaLocal`, `&Inline`, `Bump<'a>`) and call `.into_bump_slice()`, `.into_bump_str()`,
+`Box::into_bump_ref()`, or `frame.alloc_str()` / `frame.alloc_slice_copy()`. Only intentional
+process-lifetime `'static` values may use `ProgramArena`, `Root::leak`, or `leak_static` (checked by
+`blaze::heap_leak`). An allocator is never implied (`Vec::new`, `vec![]`, `collect`, `Box::new`,
+`String::from`, `format!`, `to_string`, `to_owned`, `to_vec`, a `clone` of an owning value), and no
+comment stands in for one: `// alloc: <why>` keeps nothing, and an item that must keep an implied
+allocator says why with `#[expect(blaze::implicit_allocator, reason = "..")]`.
+`blaze::implicit_allocator` enforces this, with a fix to the explicit `Global` form, and
+`blaze::hot_alloc` for what a call reaches; `scripts/src/bin/allocs.rs` holds each crate's `//
+alloc:` lines left to convert, its `expect`s and its lines naming `Global` to a list that only
 shrinks.
 
 See [docs/v2/plan/design/memory.md](../../../docs/v2/plan/design/memory.md).

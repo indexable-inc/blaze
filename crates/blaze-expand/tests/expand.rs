@@ -1362,7 +1362,9 @@ fn the_closest_rule_is_named() {
     let cx = TestCx::new();
     let exp = call_fn(&rules("(a) => {}; (a b c) => {}", 1), "a b d", &cx);
     assert!(matches!(exp.diagnostics[..], [Diagnostic::NoRuleMatched { rules: 2, closest: Some(1), .. }]), "{:?}", exp.diagnostics);
-    let failed = blaze_expand::Failed::of(&exp, blaze_own::testing::heap().alloc()).expect("no rule matched is a failure");
+    let inline = blaze_own::Inline::<4096>::new();
+    let erased = blaze_own::Erased::new(&inline);
+    let failed = blaze_expand::Failed::of(&exp, erased.bump()).expect("no rule matched is a failure");
     let shown = std::format!("{failed}");
     assert!(shown.contains("rule 2 of 2"), "{shown}");
 }

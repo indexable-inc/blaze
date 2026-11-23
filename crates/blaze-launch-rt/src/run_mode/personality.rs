@@ -53,7 +53,7 @@ impl RunMode<'_> {
 /// its one writer taken for the control thread, which is the one writer of code and words.
 pub(super) fn run_registry(alloc: SharedAlloc<'static>) -> Result<Writer<'static>, RunModeError> {
     let made = Registry::new_in(MOST_SLOTS as usize, alloc).map_err(RunModeError::Unwinder)?;
-    let registry: &'static Registry = Box::leak(Box::new_in(made, alloc));
+    let registry: &'static Registry = Box::leak_static(Box::new_in(made, alloc));
     #[cfg(target_os = "macos")]
     crate::unwind_reg::install(registry).map_err(RunModeError::Unwinder)?;
     registry.writer().map_err(RunModeError::Unwinder)

@@ -160,7 +160,7 @@ fn nested_input_of_def_site_name() -> (TokenStream<'static>, ContentId, &'static
     let mut sealed = expansion.tokens.clone();
     sealed.seal(key);
     let sealed: &'static TokenStream<'static> = std::boxed::Box::leak(std::boxed::Box::new(sealed));
-    let tokens = ExpansionTokens { stream: sealed, text, places: places.leak(), words: words.leak() };
+    let tokens = ExpansionTokens { stream: sealed, text, places: places.leak_static(), words: words.leak_static() };
     let (open, close) = (text.find('{').expect("the nested call's brace"), text.rfind('}').expect("its close"));
     let inside = &text[open + 1..close];
     let nested = tokens.input(inside, InputCut::Inside).expect("the nested input is a range of the expansion's tokens");

@@ -57,14 +57,15 @@ fn paths() -> Vec<(PathKind, Vec<&'static str>)> {
 }
 
 fn case(tape: &Tape, plant: Plant) -> Result<(), Broke> {
-    let g = Alloc::global();
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
     let specs = draw(tape);
     let (texts, inputs) = world(&specs);
-    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Serial, &Ready::serial(WAIT), g).map_err(|e| Broke::Harness(format!("solve: {e:?}")))?;
+    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Serial, &Ready::serial(WAIT), bump).map_err(|e| Broke::Harness(format!("solve: {e:?}")))?;
     let all: Vec<&'static CrateNames<'static>> = solved.iter().map(|s| s.names).collect();
     let fresh = Names::of_crates(&inputs, Sysroot::default(), &all, g).map_err(|e| Broke::Harness(format!("names: {e:?}")))?;
     PLANT.with(|p| p.set(plant));
-    let records: Result<Vec<&'static [u8]>, _> = all.iter().map(|n| encode(n, g).map(|b| aligned(&b, g))).collect();
+    let records: Result<Vec<&'static [u8]>, _> = all.iter().map(|n| encode(n, g).map(|b| aligned(&b, bump))).collect();
     PLANT.with(|p| p.set(Plant::None));
     let records = records.map_err(|e| Broke::Harness(format!("encode: {e:?}")))?;
     let keys: Vec<CrateItemKey> = all.iter().map(|n| n.key).collect();

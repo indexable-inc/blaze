@@ -159,7 +159,7 @@ pub(super) fn admits(tys: &PortableTys<'_>, t: PTy, alloc: Alloc<'_>) -> Result<
             PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) => {}
             // A struct or enum: by its own `ConstParamTy_` impl (OWED: the item-level check).
             PNode::Adt(..) => {}
-            PNode::Tuple(l) => {
+            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => {
                 let elems = view.list(l).map_err(|_| NotConstParamTy::NotAType)?;
                 for &e in elems {
                     todo.push((e, false));

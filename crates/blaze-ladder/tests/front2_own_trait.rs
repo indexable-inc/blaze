@@ -38,7 +38,6 @@ use blaze_ladder::front2::keys::{MemberKind, checker_of};
 use blaze_ladder::front2::spell::Spelling;
 use blaze_ladder::refusal::SourceFile;
 use blaze_lower::scoped::Prepares;
-use blaze_own::Alloc;
 
 /// `Mix` is declared in `m` and never imported at the root: at the root it is in scope only in
 /// the bodies of `impl m::Mix for Outer`. `Hash` is core's: the trait is not in the prelude.
@@ -107,12 +106,12 @@ fn own_trait_is_in_scope_in_its_impl() {
     let user = UserCrate { name: "own", dir: "/own/", root: "/own/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
     let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
     let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut buckets = None;
     let mut failed: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();

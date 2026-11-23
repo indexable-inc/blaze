@@ -54,7 +54,7 @@ fn str_const_bytes<B: Allocator>(p: PatId, record: &crate::data::DataRecord<B>) 
     to.bytes.get(start..end).ok_or(malformed("a `&str` constant's bytes past its allocation"))
 }
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// The tests that the value at `at` equals the constant path pattern `p` names, from the
     /// current block: to `ok` when it does, else to `fail`. `false` (nothing emitted) when `p`
     /// names no constant (a struct or a variant: walk/matches.rs `variant_test`).
@@ -101,7 +101,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             Ok(part.iter().enumerate().fold(0u128, |v, (i, &byte)| v | (u128::from(byte) << (8 * i))))
         };
         let mut all: Option<Value> = None;
-        let mut todo: Vec<(Repr, u32), A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<(Repr, u32), A> = Vec::new_in(self.alloc);
         todo.push((root, 0));
         while let Some((repr, off)) = todo.pop() {
             let place = i32::try_from(off).ok().and_then(|o| at.at.1.checked_add(o)).ok_or(refuse("a constant pattern past an `i32` offset"))?;
@@ -217,10 +217,10 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// a constant with no generics.
     fn pat_const_args(&mut self, p: PatId) -> Result<Vec<PTy, A>, BuildError> {
         let Some(list) = self.checked.pat_const_args_of(p) else {
-            return Ok(Vec::new_in(self.alloc.clone()));
+            return Ok(Vec::new_in(self.alloc));
         };
         let tys = self.types.list(list).map_err(|_| malformed("a constant pattern's arguments past the record's types"))?;
-        let mut grounded = Vec::with_capacity_in(tys.len(), self.alloc.clone());
+        let mut grounded = Vec::with_capacity_in(tys.len(), self.alloc);
         for &t in tys {
             grounded.push(self.ground_ty(t).map_err(|error| Self::pat_ty_err(p, error))?);
         }
@@ -364,7 +364,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// Each name `root` binds, with its first binding pattern in source order (pre-order, left
     /// to right): the slot every or-alternative's binding of that name stores into.
     pub(super) fn first_binds(&self, root: PatId, out: &mut Vec<(Name, PatId), A>) -> Result<(), BuildError> {
-        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
         todo.push(root);
         // Children are pushed last first, so they pop in source order.
         while let Some(q) = todo.pop() {

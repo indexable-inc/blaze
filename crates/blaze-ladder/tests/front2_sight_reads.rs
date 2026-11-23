@@ -57,7 +57,7 @@ fn a_read_list_keeps_the_buckets_of_the_crates_its_body_sees() {
     let user = UserCrate { name: "probe", dir: "/probe/", root: "/probe/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, a).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let core = crates.iter().position(|c| c.name == "core").expect("the toolchain's `core`");
     let program = 0usize;
     let core_id = id((&names).crate_key(core).expect("core's key"));

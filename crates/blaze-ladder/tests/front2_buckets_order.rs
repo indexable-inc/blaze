@@ -167,7 +167,7 @@ fn names() -> &'static Names<'static> {
         input("b", "/b/lib.rs", &[("core", CORE_AT)]),
     ];
     let sysroot = Sysroot { core: Some(CrateId(CORE_AT as u32)), alloc: None, std: None, bstd: None };
-    let names = resolve_crates(&crates, sysroot, &Texts, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, sysroot, &Texts, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     Box::leak(Box::new(names))
 }
 
@@ -203,8 +203,8 @@ fn records() -> &'static Records<'static> {
     let mut crate_names: Vec<&'static str> = Vec::new();
     let mut keys: Vec<CrateItemKey> = Vec::new();
     for c in names.crates().iter() {
-        kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), g));
-        kept.items.push(aligned(&items_record::encode(c, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), g));
+        kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
+        kept.items.push(aligned(&items_record::encode(c, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
         kept.files.push(c.files.iter().map(|f| (f.package.as_str().to_string(), f.text)).collect());
         crate_names.push(c.name);
         keys.push(c.key);
@@ -595,6 +595,19 @@ fn impl_questions_answer_alike_in_any_order_and_look_each_bucket_up_once() {
         assert_eq!(again.records.no_impls_of, written.records.no_impls_of, "crate {krate}: NoImplsOf depends on the rows' order");
         let bytes = |t: &blaze_ladder::front2::buckets::ImplTables<'_>| t.records.buckets.iter().map(|b| b.bytes.to_vec()).collect::<Vec<_>>();
         assert_eq!(bytes(&again), bytes(&written), "crate {krate}: the buckets depend on the rows' order");
+        // Chunked filing (`file_impl_rows_chunk` + `finish_impl_tables`) must match single-pass byte-for-byte.
+        let chunk_size = (rows.len() / 3).max(1);
+        let mut chunks = blaze_own::Vec::new_in(g);
+        for slice in rows.chunks(chunk_size) {
+            chunks.push(blaze_ladder::front2::buckets::file_impl_rows_chunk(records, krate, slice, g).unwrap_or_else(|e| panic!("crate {krate} chunk: {e}")));
+        }
+        let chunked = blaze_ladder::front2::buckets::finish_impl_tables(written.krate, &chunks, g).unwrap_or_else(|e| panic!("crate {krate} finish: {e}"));
+        assert_eq!(chunked.key, written.key, "crate {krate}: chunked key differs");
+        assert_eq!(chunked.records.directory, written.records.directory, "crate {krate}: chunked directory differs");
+        assert_eq!(chunked.records.no_impls_of, written.records.no_impls_of, "crate {krate}: chunked NoImplsOf differs");
+        assert_eq!(bytes(&chunked), bytes(&written), "crate {krate}: chunked buckets differ");
+        assert_eq!(chunked.defines.as_slice(), written.defines.as_slice(), "crate {krate}: chunked defines differ");
+        assert_eq!(chunked.named.as_slice(), written.named.as_slice(), "crate {krate}: chunked named differs");
         println!("TABLES crate {krate}: {} rows, {} buckets, {} from rows, {} from text, {} named crates", rows.len(), written.records.buckets.len(), written.counts.from_rows, written.counts.from_text, written.named.len());
         crate_keys.push(written.krate);
         tables.put(written);

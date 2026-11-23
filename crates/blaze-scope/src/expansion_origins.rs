@@ -19,7 +19,7 @@
 
 use blaze_expand::origin_column::{ColumnError, InputShape, OriginColumn, OriginsRef, input_places};
 use blaze_id::{ContentId, ItemKey};
-use blaze_own::{AVec, Alloc, Box};
+use blaze_own::{AVec, Alloc, Bump};
 use blaze_surface::{Edition, ItemIndex};
 
 use crate::resolve::At;
@@ -103,8 +103,8 @@ fn pad4(n: usize) -> usize {
     (n + 3) & !3
 }
 
-/// The origins' bytes for `call`'s expansion, in `alloc`, leaked as the text beside them is.
-pub fn write<'a>(
+/// The origins' bytes for `call`'s expansion, in `alloc`.
+pub fn write_bytes<'a>(
     call: ItemKey,
     place: Option<CallInText>,
     shape: InputShape,
@@ -112,7 +112,7 @@ pub fn write<'a>(
     implicit: bool,
     column: &OriginColumn<'_>,
     alloc: Alloc<'a>,
-) -> Result<&'a [u8], OriginsError> {
+) -> Result<AVec<'a, u8>, OriginsError> {
     // `None`: a check call (never expanded) or an input that is no slice of its text.
     let place = place.ok_or(OriginsError::InputNotInText { call })?;
     let text = place.text.ok_or(OriginsError::Unplaced { call })?;
@@ -132,7 +132,21 @@ pub fn write<'a>(
     out.extend_from_slice(macro_name.as_bytes());
     out.resize(FIXED + pad4(macro_name.len()), 0);
     column.write(&mut out).map_err(|error| OriginsError::Column { call: Some(call), error })?;
-    Ok(Box::leak(out.into_boxed_slice()))
+    Ok(out)
+}
+
+/// The origins' bytes for `call`'s expansion, in `alloc`, frozen into the bump arena as the text beside them is.
+pub fn write<'a>(
+    call: ItemKey,
+    place: Option<CallInText>,
+    shape: InputShape,
+    macro_name: &str,
+    implicit: bool,
+    column: &OriginColumn<'_>,
+    alloc: Bump<'a>,
+) -> Result<&'a [u8], OriginsError> {
+    let out = write_bytes(call, place, shape, macro_name, implicit, column, alloc.alloc())?;
+    Ok(alloc.alloc_slice_copy(&out))
 }
 
 /// The origins of keep call `call`'s text (resolve.rs `keep_item`: the item its derives' helper
@@ -144,11 +158,12 @@ pub fn write<'a>(
 /// the item itself: a reader of a head the kept item declares walks to that file entry and its
 /// `Signature` (blaze-cli body_types/covered.rs `callers`), and a finding in the text maps to
 /// the user's own tokens. A function of the text alone (rules 25, 71).
-pub fn kept<'a>(call: ItemKey, place: Option<CallInText>, text: &str, macro_name: &str, edition: Edition, alloc: Alloc<'a>) -> Result<&'a [u8], OriginsError> {
-    let places = input_places(text, InputShape::Whole, edition, alloc).map_err(|_| OriginsError::KeptLex { call })?;
+pub fn kept<'a>(call: ItemKey, place: Option<CallInText>, text: &str, macro_name: &str, edition: Edition, alloc: Bump<'a>) -> Result<&'a [u8], OriginsError> {
+    let a = alloc.alloc();
+    let places = input_places(text, InputShape::Whole, edition, a).map_err(|_| OriginsError::KeptLex { call })?;
     // One row a PLACE, not a token: a doc comment's tokens, a lifetime's two and the groups one
     // closer closes share one (blaze-expand `OriginColumn::input_identity`).
-    let column = OriginColumn::input_identity(&places, alloc).map_err(|error| OriginsError::Column { call: Some(call), error })?;
+    let column = OriginColumn::input_identity(&places, a).map_err(|error| OriginsError::Column { call: Some(call), error })?;
     write(call, place, InputShape::Whole, macro_name, false, &column, alloc)
 }
 

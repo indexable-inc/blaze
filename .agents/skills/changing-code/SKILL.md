@@ -30,10 +30,10 @@ text (`edit-rust-by-syntax`).
 
 ## whole-ports (rule 24)
 
-A change to a shared signature or type (a struct's fields, a trait, a lock type) updates every
-caller in the same batch, so the shared tree compiles at every save point. Do it through an astlog
-rules file or a scoped `ast-grep` rewrite, then build, then hand the batch over. A half-ported tree
-blocks every lane's run.
+When replacing or retiring an API, delete the old method/type completely instead of keeping
+`#[deprecated]` shims, and update every caller in the same batch so the shared tree compiles at
+every save point. Do it through an astlog rules file or a scoped `ast-grep` rewrite, then build,
+then hand the batch over. A half-ported tree blocks every lane's run.
 
 ## best-long-term-design (rule 28)
 

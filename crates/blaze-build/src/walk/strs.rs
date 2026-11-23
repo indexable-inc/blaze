@@ -31,7 +31,7 @@ const CHAR_MAX: u128 = 0x10_FFFF;
 /// The surrogates, which are no `char`'s value.
 const SURROGATES: core::ops::RangeInclusive<u128> = 0xD800..=0xDFFF;
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// `'x'`: its scalar value as a `u32`. A value outside the scalar values is a record the
     /// checker does not make.
     pub(super) fn char_lit(&mut self, e: ExprId) -> Result<V, BuildError> {
@@ -49,7 +49,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         if bytes.contains(&0) {
             return Err(malformed("a C string literal with a nul inside"));
         }
-        let mut with_nul = blaze_own::Vec::new_in(self.alloc.clone());
+        let mut with_nul = blaze_own::Vec::new_in(self.alloc);
         with_nul.extend_from_slice(bytes);
         with_nul.push(0);
         let len = with_nul.len() as u128;

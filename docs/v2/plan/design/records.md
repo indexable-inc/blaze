@@ -21,11 +21,12 @@ Each reuses the struct form's nodes with no path; `RECORD_TYPE` is the one new n
 Rust type or pattern starts with `{`, so those two need no lookahead.
 
 **A value against a block.** Where an expression starts, a `{` opens a record value exactly when
-the next three tokens are `IDENT` `:` and a token that is not a second `:`, or `IDENT` `,`. No
-Rust block starts so. The bound is four tokens with the `{`, kinds only, which is what an
-incremental reparse already holds fixed. So `{ a }` is a block (one shorthand field is `{ a, }`
-or `{ a: a }`), `{}` is the unit block (the empty record has a type, `{}`, and no literal),
-`{ ..base }` and `{ .. }` are blocks holding ranges, and a field value starting with `::` is
+the tokens after it are `IDENT` `:` and a token that is not a second `:`, `IDENT` `,`, or
+`.` `.` `}` (`{ .. }`, the all-defaults record literal). No practical Rust block starts so. The
+bound stays four tokens with the `{`, kinds only, which is what an incremental reparse already
+holds fixed (`LOOKAHEAD = 4`). So `{ a }` is a block (one shorthand field is `{ a, }` or
+`{ a: a }`), `{}` is the unit block, `{ ..base }` is a block holding a range-to, `{ .. }` is the
+all-defaults record literal (`open(p, { .. })`), and a field value starting with `::` is
 parenthesized. Where the grammar requires a block (`fn`, `if`, `loop`, `unsafe` bodies) it never
 asks. In a generic argument list `{` stays Rust's const block unless it starts `{ IDENT :`.
 
@@ -69,26 +70,26 @@ names every field.
 
 ## Defaults and named arguments
 
-`fn open(path: &Path, opts: { create: bool = false, mode: u32 = 0o644 })`. The parameter's type
-is `{ create: bool, mode: u32 }`. A default is a const expression of the callee: an anonymous
-constant of the function's signature, type checked there against the field's type, which may
-name what the signature can (consts, const fns, the function's const and type parameters are
-refused in this slice), never another parameter.
+`fn open(path: &Path, opts: { create: bool = false, mode: u32 = 0o644 })`, or a reusable alias
+`type OpenOpts = { create: bool = false, mode: u32 = 0o644 };` (defaults are also allowed on
+type aliases and struct fields, not only inline function parameters; `blaze-ty::record_ty`
+supports arbitrary field arity beyond 12 and width subrecord projection). The parameter's
+canonical structural type is `{ create: bool, mode: u32 }` (defaults are not part of identity).
+A default is a const expression evaluated in declaration order after written arguments.
 
-- `open(p, { create: true, .. })`: each field left out takes the callee's default; a field with
-  no default must be written (error naming the field and the function). Without `..` every
-  field is written. `{ .. }` alone stays Rust's block around the full range, so a call that
-  wants every default names one field; a spelling for "all defaults" is open.
+- `open(p, { create: true })`: defaulted fields are filled automatically when omitted — trailing
+  `, ..` (`open(p, { create: true, .. })`) is accepted as optional explicit syntax, and
+  `open(p, { .. })` takes every default. Omitting a field with no default is an error naming the
+  field (`MissingRequiredField`).
 - A default is a constant, placed at each call that omits the field, in the callee's
   declaration order after the written fields; order and count are unobservable.
 - **Key** (rule `keys-cover-every-input`): `record_param_default(callee, parameter, field)` is
   the constant. A caller reads it only for a field it omits, so a changed default recomputes
   the callers that omit that field and no other.
-- A call through a function pointer, a closure or a `Fn` value has no callee to ask: `..` there
-  is an error saying so. A trait method's defaults are its declaration's; an impl repeats the
-  types and writes none (an error naming the field), so a call on a `dyn Trait` or a type
-  parameter has them too, the declaration being known statically. Nothing else changes about
-  a call: no positional-to-named conversion, no reordering, no overloading.
+- A call through a function pointer, a closure or a `Fn` value has no callee to ask: omitting a
+  defaulted field there is an error (`IndirectCallDefaults`). A trait method's defaults are its
+  declaration's; an impl repeats the types and writes none (an error naming the field), so a call
+  on a `dyn Trait` or a type parameter has them too, the declaration being known statically.
 
 ## Lints (allow by default; errors under the edition)
 
@@ -97,13 +98,13 @@ built: `blaze::options_struct`, which needs every use of the struct in the works
 
 ## MIR and codegen
 
-Nothing new past MIR building: a record is an ADT instance over a tuple, which is what borrow
-checking, drop elaboration, layout and codegen see. Four places learned the projection through
-`Record`'s one field into the tuple: `hir-ty-mir`'s `mir/lower.rs` (a record value: a tuple
-aggregate, then the struct's, defaults as constant operands; and `r.a`) and
-`mir/lower/pattern_matching.rs`, the closure capture walk (`expr_use_visitor.rs`), and match
-checking (`hir-ty-matchck/src/lower.rs`). Coarser but correct: the capture walk of
-`{ a: 1, ..base }` consumes all of `base`, and `match_tree.rs` gives up on a record pattern.
+In the v2 compiler pipeline (`blaze-typeck`, `blaze-body`, `blaze-build`, `blaze-borrow`,
+`blaze-flow-lower`, `blaze-facts`, `blaze-ladder`), structural records are represented directly
+as first-class `PNode::Record(List)` and `TyView::Record(TyList)` nodes (never erased to
+`PNode::Tuple`), laid out in `blaze-build/src/layout.rs` with canonical sorted-field `repr(Rust)`
+layout. Named records and type-keyed type sets (`blaze-ty::type_set`) also unify under
+`blaze-ty::product_row::ProductRow`, enabling open row polymorphism (`{ name: &str, ..R }` with
+`Lacks` constraints) and mixed named/type-keyed products with zero `{ ... }` syntax collision.
 
 ## Not built in this slice
 

@@ -211,7 +211,7 @@ fn walk(krate: &'static str, src: &'static str, trait_name: Option<&'static str>
     let user = UserCrate { name: krate, dir: &dir, root: &root, files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: src }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
     let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
@@ -227,7 +227,7 @@ fn walk(krate: &'static str, src: &'static str, trait_name: Option<&'static str>
     let trait_key: Option<ItemKey> = trait_name.map(|t| front.keys.item(lib(Namespace::Types, t)).unwrap_or_else(|e| panic!("{t}'s key: {e:?}")));
     let type_keys: Vec<(ItemKey, &'static str)> = types.iter().map(|&t| (front.keys.item(lib(Namespace::Types, t)).unwrap_or_else(|e| panic!("{t}'s key: {e:?}")), t)).collect();
     let value_keys: Vec<ItemKey> = values.iter().map(|&v| front.keys.item(lib(Namespace::Values, v)).unwrap_or_else(|e| panic!("{v}'s key: {e:?}"))).collect();
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut buckets = None;
     store.ensure(&names, &mut front.keys, Want::Fn(run)).unwrap_or_else(|e| panic!("run's head: {e:?}"));
     let body = lower_fn(&names, prepared, &mut front.keys, &mut store, run).unwrap_or_else(|e| panic!("run lowers: {e}"));

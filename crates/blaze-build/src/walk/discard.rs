@@ -22,7 +22,7 @@ use blaze_typeck::{Expr, ExprId};
 use super::{Task, Walk};
 use crate::BuildError;
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Whether assignment `lhs = ..` is `_ = ..`: its left side a bare `_`, as the check
     /// decides it (rules/op.rs `expr_assign`).
     pub(super) fn assigns_to_underscore(&self, lhs: ExprId) -> Result<bool, BuildError> {

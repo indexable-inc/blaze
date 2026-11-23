@@ -48,7 +48,7 @@ fn with_front(text: &str, check: impl FnOnce(Front2<'_>)) {
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
     let front = Front2::new(&names, &frame, &sources, Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
@@ -73,7 +73,7 @@ fn check_add_orders(mut front: Front2<'_>) {
     let add = key(&front, Namespace::Types, &["core", "ops", "Add"]);
     let p = key(&front, Namespace::Types, &["P"]);
     let shape = Shape::Adt(checker_of(p));
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let sized = front.index.lang("sized");
 
     let mut digests = Vec::new();
@@ -115,7 +115,7 @@ fn main() {}
         let io = key(&front, Namespace::Types, &["std", "Io"]);
         let alloc = Alloc::global();
         let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
-        let prepared = Prepares::new_in(alloc);
+        let prepared = Prepares::new_in(blaze_own::testing::bump());
         let body = lower_fn(front.names, prepared, &mut front.keys, &mut store, propagate).expect("lower propagate");
         assert!(!store.made(Want::Adt(io)), "the question must start with Io's ADT row absent");
         let view = body.lowered.view();
@@ -149,7 +149,7 @@ fn main() {}
         let f = key(&front, Namespace::Values, &["f"]);
         let alloc = Alloc::global();
         let sized = front.index.lang("sized");
-        let prepared = Prepares::new_in(alloc);
+        let prepared = Prepares::new_in(blaze_own::testing::bump());
         let mut evaluator = StoreConsts { names: front.names, index: &front.index, prepared };
         let mut heads = SeededHeads::new(SeededHeadsOpts {
             names: front.names, sized, pointers: Pointers::NOT_LOOKED_UP, frame: front.frame,

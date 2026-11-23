@@ -126,11 +126,11 @@ fn core_from_prim_alone_with_the_trace() {
     let user = UserCrate { name: "probe", dir: "/probe/", root: "/probe/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, a).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let core = crates.iter().position(|c| c.name == "core").expect("the toolchain's `core`");
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let mut front = Front2::new(&names, frame, &sources, a).unwrap_or_else(|e| panic!("front2: {e}"));
-    let prepared = Prepares::new_in(a);
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut store = Store::new(front.index.lang("sized"), front.frame, a);
     let (mut buckets, mut consts) = (None, Consts::default());
     // `impl ErrorKind`, the inherent impl that holds `from_prim` (io/error.rs).

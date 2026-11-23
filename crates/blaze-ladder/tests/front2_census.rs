@@ -34,7 +34,6 @@ use blaze_ladder::front2::types::Why;
 use blaze_ladder::front2::world_items::Gap;
 use blaze_ladder::refusal::SourceFile;
 use blaze_lower::scoped::Prepares;
-use blaze_own::Alloc;
 use blaze_scope::resolve::{At, Names};
 use blaze_surface::ItemDetail;
 
@@ -360,7 +359,7 @@ fn census_with_the_world() {
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names: Names<'_> = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names: Names<'_> = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let crate_names: Vec<&str> = crates.iter().map(|c| c.name).collect();
     let mut out = format!("census with the world: names resolved in {:?}; crates {crate_names:?}\n", start.elapsed());
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
@@ -488,7 +487,7 @@ fn census_crate<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, krate: usize, 
     let mut resets = 0usize;
     let mut suspects: BTreeMap<String, usize> = BTreeMap::new();
     let mut ex_idx: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let sized = front.index.lang("sized");
     let mut shared_store = Store::new(sized, front.frame, blaze_own::Alloc::global());
     let mut shared_buckets = None;

@@ -234,7 +234,7 @@ pub(crate) fn names_records_envs<'n>(
                 // the section is not opened again here; the records made below open it once.
                 callers.push((at, one.world_at, one.records.edition));
             }
-            crate::front_load::CratesFrom::Opened(records.leak())
+            crate::front_load::CratesFrom::Opened(records.into_bump_slice())
         }
         ScopeCrates::ByNeed(scope) => {
             crate_names.push(scope.own.name);
@@ -248,9 +248,9 @@ pub(crate) fn names_records_envs<'n>(
             crate::front_load::CratesFrom::ByNeed { own: scope.own.records, rest: scope.rest, records: scope.records }
         }
     };
-    let (crate_names, packages): (&'n [&'n str], &'n [&'n str]) = (crate_names.leak(), packages.leak());
-    let callers: &'n [(usize, usize, blaze_expand::Edition)] = callers.leak();
-    let texts: &'n JobTexts<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(
+    let (crate_names, packages): (&'n [&'n str], &'n [&'n str]) = (crate_names.into_bump_slice(), packages.into_bump_slice());
+    let callers: &'n [(usize, usize, blaze_expand::Edition)] = callers.into_bump_slice();
+    let texts: &'n JobTexts<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
         JobTexts {
             cx,
             root,
@@ -270,15 +270,16 @@ pub(crate) fn names_records_envs<'n>(
             callers,
             by_need,
             run_stopped: core::cell::Cell::new(None),
+            activity: None,
         },
         frame,
     ));
-    let storage = blaze_own::Box::leak(blaze_own::Box::new_in(blaze_own::Erased::new(frame), frame));
-    let load: &'n StoreLoad<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(StoreLoad::from_crates(from, packages, texts, snapshot, expansion_keys, files.1, storage.handle()), frame));
-    let log: &'n Log<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(Log::new(crate_names, g), frame));
-    let keys = load.keys(g);
-    let records: &'n Records<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(Records::new(keys, load, log, frame, g), frame));
-    let sources: &'n Sourced<'n, JobTexts<'n>> = blaze_own::Box::leak(blaze_own::Box::new_in(Sourced(texts), frame));
+    let storage = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(blaze_own::Erased::new(frame), frame));
+    let load: &'n StoreLoad<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(StoreLoad::from_crates(from, packages, texts, snapshot, expansion_keys, files.1, storage.handle()), frame));
+    let log: &'n Log<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(Log::new(crate_names, g), frame));
+    let keys = load.keys(frame);
+    let records: &'n Records<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(Records::new(keys, load, log, frame, g), frame));
+    let sources: &'n Sourced<'n, JobTexts<'n>> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(Sourced(texts), frame));
     Ok(Opened { records, load, sources })
 }
 
@@ -500,7 +501,7 @@ impl Program {
             let key = self.list.key(at);
             let mut prefix = [0u8; 8];
             prefix.copy_from_slice(&key.0.0[..8]);
-            crate::engine_seeds::CrateAt { prefix, key, names_at, member: self.list.member(at), closed: false }
+            crate::engine_seeds::CrateAt { prefix, key, names_at, member: self.list.member(at), closed: false, toolchain: CrateGraph::toolchain(&self.list, at) }
         };
         let mut closure = AVec::with_capacity_in(self.crates.len() + 1, alloc);
         let own = self.crates.iter().find(|(at, _)| *at == self.owner).map(|(_, input)| input.at);
@@ -665,9 +666,7 @@ fn unit_map<'f, 'm>(
     digest.id(&graph.out);
     let map_key = Key(digest.finish());
     if let Some(held) = store.get(cx, map_key).map_err(stored)? {
-        let mut copied = Vec::with_capacity_in(held.bytes.len(), frame);
-        copied.extend_from_slice(held.bytes);
-        return Ok(copied.leak());
+        return Ok(frame.alloc_slice_copy(held.bytes));
     }
     let erased = blaze_own::Erased::new(frame);
     crate::body_types::names_world(cx, root, store, facts, graph, frame, erased.handle())
@@ -675,9 +674,7 @@ fn unit_map<'f, 'm>(
     let names = facts.names.as_ref().ok_or(RunNamesError::WorldNotMade)?;
     let made = test_map(names, list, heap.alloc())?;
     store.put(cx, map_key, &made).map_err(stored)?;
-    let mut copied = Vec::with_capacity_in(made.len(), frame);
-    copied.extend_from_slice(&made);
-    Ok(copied.leak())
+    Ok(frame.alloc_slice_copy(&made))
 }
 
 /// `run`'s program crate: the crate list's row of the unit of kind `Bin` (never `for_host`)
@@ -846,10 +843,10 @@ fn rows_of<'f, 'm>(
     }
     let mut encoded = Vec::with_capacity_in(HEAD + ROW * rows.len(), frame);
     encode(graph, &rows, &mut encoded, heap.alloc())?;
-    let encoded: &'f [u8] = encoded.leak();
+    let encoded: &'f [u8] = encoded.into_bump_slice();
     let mut encoded_scripts = Vec::with_capacity_in(HEAD + ROW * scripts.len(), frame);
     encode(graph, &scripts, &mut encoded_scripts, heap.alloc())?;
-    let encoded_scripts: &'f [u8] = encoded_scripts.leak();
+    let encoded_scripts: &'f [u8] = encoded_scripts.into_bump_slice();
     let stood = Stood::open(encoded).map_err(RunNamesError::Form)?;
     let stood = stood.with_scripts(Stood::open(encoded_scripts).map_err(RunNamesError::Form)?).map_err(RunNamesError::Form)?;
     Ok((stood, list))
@@ -1236,7 +1233,7 @@ pub(crate) fn read_crates<'n, 'm: 'n>(
     frame: &'n Frame,
     heap: &'static blaze_own::Heap,
 ) -> Result<RunCrates<'n>, RunNamesError> {
-    let list: &'n CrateList<'static> = blaze_own::Box::leak(blaze_own::Box::new_in(program.list, frame));
+    let list: &'n CrateList<'static> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(program.list, frame));
     let mut crates: Vec<Crate<'n>, &'n Frame> = Vec::with_capacity_in(program.crates.len(), frame);
     for (at, input) in program.crates.iter() {
         let crate_name = CrateGraph::name(list, *at);
@@ -1250,7 +1247,7 @@ pub(crate) fn read_crates<'n, 'm: 'n>(
     scripts.extend_from_slice(&program.scripts);
     let mut lang: Vec<usize, &'n Frame> = Vec::with_capacity_in(program.lang.len(), frame);
     lang.extend_from_slice(&program.lang);
-    Ok(RunCrates { list, crates: crates.leak(), rows: rows.leak(), scripts: scripts.leak(), lang: lang.leak(), corrected, snapshot, from: PackHome::of(env), heap })
+    Ok(RunCrates { list, crates: crates.into_bump_slice(), rows: rows.into_bump_slice(), scripts: scripts.into_bump_slice(), lang: lang.into_bump_slice(), corrected, snapshot, from: PackHome::of(env), heap })
 }
 
 /// The names records over `crates`, in `frame`, on the calling thread (`cx`'s): the list's trees
@@ -1269,14 +1266,14 @@ pub(crate) fn names_in<'n>(
     let RunCrates { list, crates: opened, rows, scripts, lang, corrected, snapshot, from, heap } = crates;
     // The trees: none opened here; each at the first read of a text from it, at most once. The
     // read of them all is the `UnitGraph`'s (the doc of body_types.rs `Kept::trees`).
-    let opener: &'n ListTrees<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(
+    let opener: &'n ListTrees<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
         ListTrees { cx, from, list, scratch: frame, dirs: RefCell::new(PackDirs::default()) },
         frame,
     ));
-    let trees: &'n LazyTrees<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(LazyTrees::new(opener, list.trees(), seen, frame), frame));
+    let trees: &'n LazyTrees<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(LazyTrees::new(opener, list.trees(), seen, frame), frame));
     // Every crate's environment, each made at its first ask ([`RunEnvs`]): a body lowered by
     // need reads its own crate's, as `blaze check` gives a body its owner's.
-    let envs: &'n RunEnvs<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(RunEnvs::new(list, rows, scripts, snapshot, from.home, frame), frame));
+    let envs: &'n RunEnvs<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(RunEnvs::new(list, rows, scripts, snapshot, from.home, frame), frame));
     let envs = Envs { owner: None, rest: Some(envs) };
     let trees = (trees, None);
     let made = names_records_envs(cx, root, ScopeCrates::Opened(opened), trees, corrected, procs, std::vec::Vec::new_in(Global), envs, Some(snapshot), None, frame, heap.alloc()).map_err(|error| match error {

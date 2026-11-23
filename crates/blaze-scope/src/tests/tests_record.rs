@@ -68,8 +68,10 @@ fn the_tests_record_lists_a_test_units_tests() {
 
     let section = encode(tested, g).unwrap_or_else(|e| panic!("encode: {e}"));
     assert!(section.refused.is_empty() && section.duplicated.is_empty(), "no function is refused or doubly marked");
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
     let bytes = section.bytes;
-    let record = TestsRecord::open(aligned(&bytes, g)).unwrap_or_else(|e| panic!("open: {e}"));
+    let record = TestsRecord::open(aligned(&bytes, erased.bump())).unwrap_or_else(|e| panic!("open: {e}"));
     assert_eq!(record.key(), tested.key);
     let rows: Vec<TestRow<'_>> = (0..record.len()).map(|i| record.row(i).unwrap_or_else(|e| panic!("row {i}: {e}")).expect("a row below len")).collect();
     assert_eq!(
@@ -125,8 +127,10 @@ fn a_function_marked_twice_is_one_test_and_test_and_bench_is_refused_alone() {
     let tested = CrateInput { key: CrateItemKey(ContentId::of("blaze-scope test crate", b"m with test")), cfg: &[("test", None)], ..input("m", "/m/lib.rs", &[]) };
     let names = resolved(&[tested], &MARKS_TEXTS);
     let tested = names.krate(0);
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
     let section = encode(tested, g).unwrap_or_else(|e| panic!("encode: one function's markers never refuse the unit: {e}"));
-    let record = TestsRecord::open(aligned(&section.bytes, g)).unwrap_or_else(|e| panic!("open: {e}"));
+    let record = TestsRecord::open(aligned(&section.bytes, erased.bump())).unwrap_or_else(|e| panic!("open: {e}"));
     let paths: Vec<&str> = (0..record.len()).map(|i| record.row(i).unwrap_or_else(|e| panic!("row {i}: {e}")).expect("a row below len").path).collect();
     assert_eq!(paths, ["bare_after_prelude", "bare_twice", "once", "prelude_after_bare"], "each doubly marked function once; `both` left out");
     assert_eq!(&section.refused[..], &[TestsRecordError::TestAndBench { item: key_named(tested, "both") }][..]);

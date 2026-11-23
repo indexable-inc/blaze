@@ -22,7 +22,7 @@
 //! surface a manifold, T. K. Dey, H. Edelsbrunner, S. Guha and D. V. Nekhayev, "Topology
 //! preserving edge contraction", 1999); no two triangles on one set of vertices after it (the
 //! tetrahedron case the link condition admits); no triangle's normal turned by 90 degrees or more,
-//! and none made of zero area (NORMAL-FLIP REJECTION).
+//! and no collapse may leave an ill-conditioned face in its fan (NORMAL-FLIP REJECTION).
 //!
 //! ERROR BOUND: a SUCCESSIVE MAP (J. Cohen, M. Olano and D. Manocha, "Appearance-preserving
 //! simplification", SIGGRAPH 1998, its successive mapping), measured against the INPUT, never
@@ -1251,7 +1251,7 @@ fn evaluate_stars(
 }
 
 /// The link condition, no duplicate triangle after, no normal flipped or folded past
-/// `acos(sqrt(min_cos_sq))` (or 90° when `min_cos_sq == 0.0`), and no zero-area triangle.
+/// `acos(sqrt(min_cos_sq))` (or 90° when `min_cos_sq == 0.0`), and no nearly collinear triangle.
 /// Reuses the sorted stars `evaluate` left in `lists.star_a` and `lists.star_b`.
 fn valid(w: &Work<'_, '_>, lists: &mut Lists<'_>, plan: &Plan, min_cos_sq: f64) -> Result<bool, AllocFailure> {
     let (a, b) = (plan.keep, plan.gone);
@@ -1304,12 +1304,24 @@ fn valid(w: &Work<'_, '_>, lists: &mut Lists<'_>, plan: &Plan, min_cos_sq: f64) 
                     moved[k] = a;
                 }
             }
-            let after = tri_normal(corners[0], corners[1], corners[2]);
-            let d = dot(before, after);
-            if after == [0.0; 3] || !(d > 0.0) {
+            let ab = sub(corners[1], corners[0]);
+            let ac = sub(corners[2], corners[0]);
+            let bc = sub(corners[2], corners[1]);
+            let after = cross(ab, ac);
+            let area_sq = dot(after, after);
+            let (ab_sq, ac_sq, bc_sq) = (dot(ab, ab), dot(ac, ac), dot(bc, bc));
+            // Twice-area squared divided by the adjacent squared edge lengths is sin²(angle).
+            // Check the worst corner. A positive f64 area alone admits slivers whose normal
+            // loses most of its precision when the exported f32 corners are transformed.
+            let max_edge_product = (ab_sq * ac_sq).max(bc_sq * ab_sq.max(ac_sq));
+            if area_sq <= f64::from(f32::EPSILON) * max_edge_product {
                 return Ok(false);
             }
-            if min_cos_sq > 0.0 && !(d * d >= min_cos_sq * dot(before, before) * dot(after, after)) {
+            let d = dot(before, after);
+            if !(d > 0.0) {
+                return Ok(false);
+            }
+            if min_cos_sq > 0.0 && !(d * d >= min_cos_sq * dot(before, before) * area_sq) {
                 return Ok(false);
             }
             if moved[0] > moved[1] {

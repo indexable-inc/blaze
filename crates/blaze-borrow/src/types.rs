@@ -265,7 +265,7 @@ pub fn rule_variance<T: RegionTypes + ?Sized>(types: &T, ty: PTy, at: Pos) -> Re
         (PNode::Ref(..), Pos::Own(_)) | (PNode::Dynamic(_), Pos::Own(_)) => Variance::Co,
         (PNode::Ref(Mutbl::Not, _) | PNode::Ptr(Mutbl::Not, _), Pos::Kid(_)) => Variance::Co,
         (PNode::Ref(Mutbl::Mut, _) | PNode::Ptr(Mutbl::Mut, _), Pos::Kid(_)) => Variance::In,
-        (PNode::Tuple(_) | PNode::Slice(_) | PNode::Array(..) | PNode::Pat(..), _) => Variance::Co,
+        (PNode::Tuple(_) | PNode::Record(_) | PNode::Union(_) | PNode::Slice(_) | PNode::Array(..) | PNode::Pat(..), _) => Variance::Co,
         (PNode::Adt(adt, _), at) => {
             let i = match at {
                 Pos::Own(k) => k as usize,
@@ -329,6 +329,8 @@ impl RegionTypes for Columns<'_> {
         let list = |l| self.tys.list(l).map_err(|_| Unknown { node: ty, why: Why::Table });
         Ok(match node {
             PNode::Tuple(l)
+            | PNode::Record(l)
+            | PNode::Union(l)
             | PNode::Adt(_, l)
             | PNode::FnDef(_, l)
             | PNode::FnPtr(l, _)

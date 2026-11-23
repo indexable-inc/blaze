@@ -92,9 +92,10 @@ fn predicted(whole: &Groups, asked: &[ItemKey]) -> BTreeSet<ItemKey> {
 fn on_demand(texts: &'static Texts, order: &[&[ItemKey]]) -> Demanded<'static> {
     let alloc = blaze_own::testing::heap().alloc();
     let solve_crate = move |members: Members<'_>| -> Result<Solved<'static>, CrateScopeError<'static>> {
-        let g = blaze_own::testing::heap().alloc();
+        let bump = super::SyncFrame::leaked();
+        let g = bump.alloc();
         let inputs = [input("k0", "/k0/lib.rs", &[])];
-        let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Only { members }, &Ready::serial(WAIT), g).map_err(|(_, e)| e)?;
+        let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Only { members }, &Ready::serial(WAIT), bump).map_err(|(_, e)| e)?;
         let mut out: AVec<'static, NameGroup<'static>> = AVec::new_in(g);
         out.extend(solved[0].names.groups.iter().cloned());
         Ok(Solved { groups: out, tree: solved[0].names.tree_record })

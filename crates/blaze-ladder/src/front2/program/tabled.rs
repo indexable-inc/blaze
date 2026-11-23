@@ -288,14 +288,15 @@ mod tests {
         let files = [(String::from("/hello-world/src/main.rs"), String::from(HELLO))];
         let edition = edition::PackageEdition::of_manifest("blaze-2026.11").expect("a known edition");
         let user = crate::crates::UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
+        let erased = blaze_own::Erased::new(&frame);
         let inputs = crate::crates::Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
         let crates = inputs.crates();
         // The store's tables are `'static` (heads.rs `Store::new`): until the test grant hands
         // one down, the global allocator is the only `Alloc<'static>` a test can name.
         let alloc = blaze_own::Alloc::global();
-        let names = inputs.resolve(&crates, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let names = inputs.resolve(&crates, erased.bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
         let sources = [SourceFile { path: "src/main.rs", text: HELLO }];
-        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
         let front = crate::front2::Front2::new(&names, &frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
         let store = Store::new(front.index.lang("sized"), front.frame, alloc);
         let ghost = ItemKey(0x2980e808e42ac8c9057e8231da5614fc);

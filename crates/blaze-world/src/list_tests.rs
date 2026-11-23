@@ -40,6 +40,10 @@ fn a() -> Alloc<'static> {
     blaze_own::testing::heap().alloc()
 }
 
+fn b() -> blaze_own::Bump<'static> {
+    blaze_own::testing::bump()
+}
+
 fn t(s: &str) -> AString<'static> {
     AString::from_str_in(s, a())
 }
@@ -182,9 +186,9 @@ fn made(macro_side: bool) -> World<'static> {
     let dep = crate::fixture::pack(&[("src/lib.rs", "pub struct Expr;\n")], a());
     let mut places = Places { lock, dep: StdBox::leak(dep.into_boxed_slice()) };
     let (id, mut shelf) = shelf(macro_side);
-    let listed = open_list(&mut shelf, id, TRIPLE, graph, lock, &mut places, a()).unwrap_or_else(|e| panic!("{e}"));
+    let listed = open_list(&mut shelf, id, TRIPLE, graph, lock, &mut places, b()).unwrap_or_else(|e| panic!("{e}"));
     let listed = StdBox::leak(StdBox::new(listed));
-    world(graph, lock, listed, &mut places, &NoFiles, a()).unwrap_or_else(|e| panic!("{e}"))
+    world(graph, lock, listed, &mut places, &NoFiles, b()).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// With the `wasm32-wasip1` cut: `pm`'s extern `dep` is a crate of the macro side, with that
@@ -254,9 +258,9 @@ fn hello_on(edition: PackageEdition, shelf_of: ShelfOf) -> World<'static> {
     let mut places = Places { lock, dep: &[] };
     let (id, files) = shelf_of(TRIPLE, crate::fixture::STD, TARGET_CFG, a());
     let mut shelf = Memory(files.into_iter().collect());
-    let listed = open_list(&mut shelf, id, TRIPLE, graph, lock, &mut places, a()).unwrap_or_else(|e| panic!("{e}"));
+    let listed = open_list(&mut shelf, id, TRIPLE, graph, lock, &mut places, b()).unwrap_or_else(|e| panic!("{e}"));
     let listed = StdBox::leak(StdBox::new(listed));
-    world(graph, lock, listed, &mut places, &NoFiles, a()).unwrap_or_else(|e| panic!("{e}"))
+    world(graph, lock, listed, &mut places, &NoFiles, b()).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// A crate's implicit sysroot dependency is a fact of its own text, an edge of its shelf row
@@ -412,9 +416,9 @@ fn sides_world() -> World<'static> {
     let reg = crate::fixture::pack(&[("src/lib.rs", "pub struct Expr;\n")], a());
     let mut places = Places { lock, dep: StdBox::leak(reg.into_boxed_slice()) };
     let (id, mut shelf) = shelf(true);
-    let listed = open_list(&mut shelf, id, TRIPLE, graph, lock, &mut places, a()).unwrap_or_else(|e| panic!("{e}"));
+    let listed = open_list(&mut shelf, id, TRIPLE, graph, lock, &mut places, b()).unwrap_or_else(|e| panic!("{e}"));
     let listed = StdBox::leak(StdBox::new(listed));
-    world(graph, lock, listed, &mut places, &NoFiles, a()).unwrap_or_else(|e| panic!("{e}"))
+    world(graph, lock, listed, &mut places, &NoFiles, b()).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// The crate `helper` of `side` in `w`.
@@ -647,9 +651,9 @@ fn the_list_is_the_same_bytes_whatever_the_units_order() {
         let dep = crate::fixture::pack(&[("src/lib.rs", "pub struct Expr;\n")], a());
         let mut places = Places { lock, dep: StdBox::leak(dep.into_boxed_slice()) };
         let (id, mut shelf) = shelf(macro_side);
-        let listed = open_list(&mut shelf, id, TRIPLE, graph, lock, &mut places, a()).unwrap_or_else(|e| panic!("{e}"));
+        let listed = open_list(&mut shelf, id, TRIPLE, graph, lock, &mut places, b()).unwrap_or_else(|e| panic!("{e}"));
         let listed = StdBox::leak(StdBox::new(listed));
-        world(graph, lock, listed, &mut places, &NoFiles, a()).unwrap_or_else(|e| panic!("{e}"))
+        world(graph, lock, listed, &mut places, &NoFiles, b()).unwrap_or_else(|e| panic!("{e}"))
     };
     let (forward, backward) = (made_from(false, true), made_from(true, true));
     let one = encode(&forward, &|_| None, a()).unwrap_or_else(|e| panic!("{e}"));
@@ -698,7 +702,7 @@ fn bytes_of_deps(list: &crate::crate_list::CrateList<'_>) -> usize {
     (0..list.len()).map(|r| list.deps_named(r).count()).sum::<usize>() * crate::crate_list::DEP
 }
 
-/// A list of version 2 (no environment facts) is refused by name, never read as this form. Prints
+/// A list of an older version is refused by name, never read as this form. Prints
 /// `crate list: an old list: <the refusal's words>`.
 #[test]
 fn an_old_crate_list_is_refused_by_name() {
@@ -709,13 +713,17 @@ fn an_old_crate_list_is_refused_by_name() {
     // Version 5: each crate's row carries its package's version, for diagnostics.
     // Version 6: rows in the world's order with a by-key table, the test and public flags and
     // the planners' tables (engine.md item 2): a version-5 list is refused, never read (D160).
-    assert_eq!(VERSION, 6);
+    // Version 7: each tree row carries its pack kind.
+    // Version 8: each row carries its package binaries (`CARGO_BIN_EXE_<name>`).
+    assert_eq!(VERSION, 8);
     bytes[4..6].copy_from_slice(&2u16.to_le_bytes());
     let refused = CrateList::open(&bytes).err().expect("a version-2 list is refused");
     assert_eq!(refused, ListError::Version { found: 2 });
     let words = std::format!("{refused}");
-    assert!(words.contains("version 2, not 6"), "{words}");
-    bytes[4..6].copy_from_slice(&5u16.to_le_bytes());
-    assert_eq!(CrateList::open(&bytes).err(), Some(ListError::Version { found: 5 }), "a version-5 list is refused by name");
+    assert!(words.contains("version 2, not 8"), "{words}");
+    for old in 1..VERSION {
+        bytes[4..6].copy_from_slice(&old.to_le_bytes());
+        assert_eq!(CrateList::open(&bytes).err(), Some(ListError::Version { found: old }), "a version-{old} list is refused by name");
+    }
     std::println!("crate list: an old list: {words}");
 }

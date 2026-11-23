@@ -86,16 +86,17 @@ impl LoadNames<'static> for Loaded {
 /// solve's `Names` and from the records' `RecordNames` alike.
 #[test]
 fn the_blaze_prelude_names_what_its_globs_reach_fresh_and_from_records() {
-    let g = blaze_own::testing::heap().alloc();
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
     let inputs = [input("core", "/core/lib.rs", RUST), input("bstd", "/bstd/lib.rs", RUST), input("hello", "/hello/main.rs", BLAZE)];
     let sys = Sysroot { core: Some(CrateId(0)), alloc: None, std: None, bstd: Some(CrateId(1)) };
-    let (solved, _) = resolve_by_records(&inputs, sys, &TEXTS, &Serial, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("solve: {e:?}"));
+    let (solved, _) = resolve_by_records(&inputs, sys, &TEXTS, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("solve: {e:?}"));
     let all: Vec<&'static CrateNames<'static>> = solved.iter().map(|s| s.names).collect();
     for (i, c) in all.iter().enumerate() {
         assert!(c.notes.is_empty(), "crate {i}: notes {:?}", c.notes);
     }
     let fresh = Names::of_crates(&inputs, sys, &all, g).unwrap_or_else(|e| panic!("names: {e:?}"));
-    let records: Vec<&'static [u8]> = all.iter().map(|n| aligned(&encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")), g)).collect();
+    let records: Vec<&'static [u8]> = all.iter().map(|n| aligned(&encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")), bump)).collect();
     let keys: Vec<CrateItemKey> = all.iter().map(|n| n.key).collect();
     let read = RecordNames::new(&keys, Loaded(records), g);
     let root: ItemKey = fresh.root(2);
@@ -128,12 +129,13 @@ static EXT_TEXTS: Texts = Texts(&[&[("/ext/lib.rs", EXT)]]);
 /// Before the fix: `NotFound` at segment 0.
 #[test]
 fn a_macro_written_root_extern_crate_is_in_the_records_extern_prelude() {
-    let g = blaze_own::testing::heap().alloc();
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
     let inputs = [input("ext", "/ext/lib.rs", RUST)];
-    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), &EXT_TEXTS, &Serial, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("solve: {e:?}"));
+    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), &EXT_TEXTS, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("solve: {e:?}"));
     let all: Vec<&'static CrateNames<'static>> = solved.iter().map(|s| s.names).collect();
     let fresh = Names::of_crates(&inputs, Sysroot::default(), &all, g).unwrap_or_else(|e| panic!("names: {e:?}"));
-    let records: Vec<&'static [u8]> = all.iter().map(|n| aligned(&encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")), g)).collect();
+    let records: Vec<&'static [u8]> = all.iter().map(|n| aligned(&encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")), bump)).collect();
     let keys: Vec<CrateItemKey> = all.iter().map(|n| n.key).collect();
     let read = RecordNames::new(&keys, Loaded(records), g);
     let root: ItemKey = fresh.root(0);

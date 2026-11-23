@@ -29,6 +29,20 @@ written). `Described` is a lang-item struct and `TypeOf` a lang-item trait with 
 associated type; both are `#[rustc_deny_explicit_impl]`. No parser change, no `SyntaxKind`,
 no `TypeRef` variant: a macro in type position and a const argument are Rust already.
 
+## Ergonomic v2 `TypeDesc` (`blaze-ty::type_desc`)
+
+Passing concrete types out-of-band in `; String` and indexing them via positional `Arg(0)` /
+numeric `FieldOf(&FieldOf(&Arg(0), t), c)` is brittle when struct fields move. In `blaze-ty`,
+`TypeDescArena` replaces positional indirection with:
+
+- **`TypeDesc::of::<T>()` (`TypeDescNode::Of(Ty)`)**: direct opaque compiler-interned type
+  handle (matching `crates/blaze-real/extensions/b_type_of.rs`), removing out-of-band `; Args`.
+- **`FieldByName { base, name }`**: projects a struct or record field by identifier (`"age"`)
+  rather than declaration index, with structured `TypeDescError::FieldNotFound { field }`.
+- **First-class `Record`, `Union`, and `IntPat` synthesis**: `type_of!` evaluates iteratively
+  (zero recursion, bounded by `MAX_DESC_NODES = 4096`) into canonical structural records,
+  deduplicated unions, or `ty::PAT` pattern types.
+
 ## The description type
 
 `core::reflect::TypeDesc`, beside phase 2's reflection types, `ConstParamTy` so it is a const

@@ -112,16 +112,17 @@ fn type_key<W: names::World<&'static str>>(world: &W, module: ItemKey, name: &'s
 #[test]
 fn a_projection_through_a_body_impl_is_the_same_under_both() {
     let alloc = blaze_own::testing::heap().alloc();
+    let bump = blaze_own::testing::bump();
     let (crates, sysroot, texts, dep) = two_crates(USER, DEP);
-    let modules: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates under Modules: {e}"))));
-    let bodies: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Bodies, alloc).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"))));
+    let modules: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates under Modules: {e}"))));
+    let bodies: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Bodies, bump).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"))));
     let (c_mod, c_bod) = (modules.crates()[dep], bodies.crates()[dep]);
 
     // `up`'s body, held by the upstream crate's solve under `Bodies`, solved as its own.
     let held = c_bod.bodies.iter().find(|b| b.src.text.contains("struct Local")).copied().unwrap_or_else(|| panic!("`up`'s body is held under Bodies: {} held", c_bod.bodies.len()));
     let deps = BodyDeps::of_names(bodies, dep, alloc);
-    let prepares = Prepares::new_in(alloc);
-    let scope: BodyScope<'static> = body_scope(c_bod, &deps, &crates[dep], dep, held, texts, prepares, alloc).unwrap_or_else(|e| panic!("body_scope(up): {e}"));
+    let prepares = Prepares::new_in(bump);
+    let scope: BodyScope<'static> = body_scope(c_bod, &deps, &crates[dep], dep, held, texts, prepares, bump).unwrap_or_else(|e| panic!("body_scope(up): {e}"));
     let block = *scope.outermost.first().expect("`up`'s body has its outermost block");
 
     // The answer: `Local` read in `up`'s block, under each strategy.

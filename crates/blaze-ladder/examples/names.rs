@@ -65,7 +65,7 @@ fn main() {
     });
     let crates = inputs.crates();
     println!("program crate: edition {:?}, implicit {:?}, deps {:?}", crates[0].edition, crates[0].implicit, crates[0].deps);
-    let names = match inputs.resolve(&crates, alloc) {
+    let names = match inputs.resolve(&crates, erased.bump()) {
         Ok(n) => n,
         Err(e) => {
             println!("Names refused: {e}");

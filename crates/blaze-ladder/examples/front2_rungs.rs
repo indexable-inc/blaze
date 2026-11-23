@@ -65,6 +65,7 @@ enum Stop {
     Toolchain(CratesError),
     StandIn { edition: String, error: RunError },
     Library { edition: String, error: ApartError<'static> },
+    Frame(blaze_mem::MemError),
     Threaded,
 }
 
@@ -77,6 +78,7 @@ impl fmt::Display for Stop {
             Stop::Toolchain(error) => write!(f, "the toolchain: {error}"),
             Stop::StandIn { edition, error } => write!(f, "the stand-in program of edition `{edition}`: {error}"),
             Stop::Library { edition, error } => write!(f, "the toolchain library's names for edition `{edition}`: {error}"),
+            Stop::Frame(error) => write!(f, "the library's frame: {error}"),
             Stop::Threaded => write!(
                 f,
                 "the process has started a thread before the first fork (pthread_is_threaded_np): a forked child could inherit a lock its holder never releases; the resolve must stay on one thread (`Serial`)"
@@ -261,7 +263,7 @@ fn exit_status(counts: &x::Counts) -> i32 {
 /// The toolchain library's names for programs of `edition`, kept for the process: resolved
 /// under a stand-in program crate of the rungs' package name and that edition (`fn main() {}`;
 /// its text is not read by the library's resolve).
-fn library_of(tc: &'static Toolchain, edition: &str, alloc: blaze_own::Alloc<'static>) -> Result<&'static Library<'static>, Stop> {
+fn library_of(tc: &'static Toolchain, edition: &str, _alloc: blaze_own::Alloc<'static>) -> Result<&'static Library<'static>, Stop> {
     let stand_in = [SourceFile { path: x::ROOT, text: "fn main() {}\n" }];
     // The stand-in is never built (only the library's names are read of it): its overflow
     // setting is the dev profile's, as a rung's is unless its manifest says otherwise.
@@ -270,7 +272,9 @@ fn library_of(tc: &'static Toolchain, edition: &str, alloc: blaze_own::Alloc<'st
     let user: &'static UserCrate<'static> = kept(texts.user());
     let inputs: &'static Inputs<'static> = kept(Inputs::new(user, tc).map_err(Stop::Toolchain)?);
     let crates = kept(inputs.crates());
-    let library = Library::solve(inputs, crates, alloc).map_err(|error| Stop::Library { edition: edition.to_string(), error })?;
+    let frame: &'static blaze_mem::Frame = kept(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).map_err(Stop::Frame)?);
+    let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
+    let library = Library::solve(inputs, crates, bump).map_err(|error| Stop::Library { edition: edition.to_string(), error })?;
     Ok(kept(library))
 }
 

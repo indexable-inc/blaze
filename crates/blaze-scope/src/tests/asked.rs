@@ -165,7 +165,9 @@ impl Kept for Mem {
 }
 
 fn case(tape: &Tape, plant: Plant) -> Result<(), Broke> {
-    let g = Alloc::global();
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let g = erased.bump();
     let mut specs = draw(tape);
     let (before, inputs) = world(&specs);
     let what = edit(tape, &mut specs);

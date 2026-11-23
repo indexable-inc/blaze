@@ -242,7 +242,7 @@ fn sealed<'b>(list: &'b [u8], frame: &'b Frame) -> &'b [u8] {
     let row = (0..CrateGraph::len(&opened)).find(|r| opened.member(*r)).expect("SealsFlipped: the world has a member row to plant in");
     let mut planted = Vec::from_slice_in(list, frame);
     planted[HEADER_LEN + row * ROW + FLAGS_AT] ^= flag;
-    planted.leak()
+    planted.into_bump_slice()
 }
 
 /// The plan's reads of the stored answer, the profile's `plan:` line: the units stage's rows read
@@ -716,7 +716,7 @@ fn read_back<'f>(
         let _cx = cx.span("names: the crate list read back");
         let mut held = Vec::with_capacity_in(sections.list.len(), env.heap.alloc());
         held.extend_from_slice(sections.list);
-        let held: &'static [u8] = held.leak();
+        let held: &'static [u8] = held.leak_static();
         let maker = crate::names::Maker::new(key, view.out, lockfile.lock, graph.member_dirs(), frame);
         crate::names::Names::of_list(held, Some(maker), env.heap.alloc())
     };
@@ -767,6 +767,7 @@ pub(crate) fn discover<'f>(
     back: &Back<'_, '_>,
     stood_proof: Option<Stood>,
     env: &FetchEnv<'_>,
+    board: &crate::engine_status::Board<'_>,
     frame: &'f Frame,
 ) -> Result<Discovered<'f>, CliError> {
     let cx = cx.span(UNITS_STAGE_SPAN);
@@ -847,9 +848,11 @@ pub(crate) fn discover<'f>(
                 }
             };
             // One level's lock entries, each fetched and handed to the next level.
+            let fetch_mark = board.phase_began(blaze_engine::Stage::Units, u64::try_from(wants.len()).unwrap_or(u64::MAX), board.now(&env.clock));
             for want in wants.iter() {
                 let fetch = want.name;
                 if fetch.kind != Kind::Fetch || inputs.iter().any(|input| input.name == fetch) || failed.contains(&fetch) {
+                    board.phase_ended(fetch_mark, 0, board.now(&env.clock));
                     return Err(EngineCheckError::Unseen { task: name, read: fetch }.into());
                 }
                 let fetch_key = tools.key(fetch, &fetch.subject);
@@ -869,7 +872,20 @@ pub(crate) fn discover<'f>(
                         counts.fetches_run += 1;
                         let again = matches!(why, UnitsCause::Failed { .. } | UnitsCause::Unfetched { .. });
                         plan.owed_again = plan.owed_again.saturating_add(u32::from(again));
-                        let did = crate::fetch::run(&cx, lockfile, env, fetch, frame)?;
+                        let label = lockfile.display_name(fetch).map_or_else(
+                            || crate::engine_status::Label::of("crate"),
+                            crate::engine_status::Label::of,
+                        );
+                        let shown = board.show_kind(
+                            blaze_engine::Stage::Units,
+                            blaze_screen::WorkKind::Fetch,
+                            label,
+                            0,
+                            board.now(&env.clock),
+                        );
+                        let did = crate::fetch::run(&cx, lockfile, env, fetch, frame);
+                        shown.end(board.now(&env.clock));
+                        let did = did?;
                         if owes(fetch, &did) {
                             owed.push(fetch);
                             plan.owed_still = plan.owed_still.saturating_add(u32::from(again));
@@ -883,6 +899,7 @@ pub(crate) fn discover<'f>(
                 }
                 records.push(Published { name: fetch, source: fetch.subject, wave: 0, made });
             }
+            board.phase_ended(fetch_mark, u64::try_from(wants.len()).unwrap_or(u64::MAX), board.now(&env.clock));
         };
         let made = match made {
             Ok(mut record) => {

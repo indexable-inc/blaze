@@ -161,8 +161,11 @@ mod tests {
         let bless = std::env::var_os("BLAZE_BLESS").is_some_and(|it| it == "1");
         let mut differ = Vec::new();
         for table in schema::TABLES.iter().copied() {
+            // Golden bytes pin a platform-independent clock name so Linux and macOS produce
+            // identical Parquet bytes for the same schema and rows.
+            let golden_meta = [("blaze.table", table.name), ("blaze.schema", version()), ("blaze.clock", "darwin CLOCK_UPTIME_RAW")];
             for (name, batches) in [("empty", Vec::new()), ("three", vec![three_rows(table)])] {
-                let bytes = blaze_parquet::write(fields(table), &batches, &metadata(table), blaze_parquet::Options::DEFAULT, Global).unwrap();
+                let bytes = blaze_parquet::write(fields(table), &batches, &golden_meta, blaze_parquet::Options::DEFAULT, Global).unwrap();
                 // What is written reads back as written.
                 let file = blaze_parquet::File::open(&bytes, Global).unwrap();
                 assert_eq!(file.num_rows(), i64::try_from(batches.iter().map(Batch::num_rows).sum::<usize>()).unwrap());

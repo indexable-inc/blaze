@@ -403,7 +403,7 @@ impl Answers {
         }
         let mut held = Bytes::new_in(frame, "sdk: xcrun's recorded answer");
         self.dir.read_sized(cx, name, meta.len, &mut held).map_err(RecordError::Read)?;
-        Ok(Some(Vec::from_slice_in(held.as_slice(), frame).leak()))
+        Ok(Some(frame.alloc_slice_copy(held.as_slice())))
     }
 
     /// `bytes` made the record `name`, published whole.

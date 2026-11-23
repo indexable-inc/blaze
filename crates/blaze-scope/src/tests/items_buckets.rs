@@ -88,15 +88,16 @@ static MORE_TEXTS: Texts = Texts(&MORE_CRATES);
 
 /// The record of the one crate whose file is `texts`'s, opened.
 fn record_of(texts: &'static Texts) -> (&'static [u8], ItemsRecord<'static>) {
-    let g = Alloc::global();
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
     let inputs = [input("k0", PATH, &[])];
-    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Serial, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("solve: {e:?}"));
+    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("solve: {e:?}"));
     let names = solved[0].names;
     let a = encode(names, g).unwrap_or_else(|e| panic!("encode: {e:?}"));
     let b = encode(names, g).unwrap_or_else(|e| panic!("encode again: {e:?}"));
     assert!(a == b, "the record encodes to different bytes twice");
-    let bytes: &'static [u8] = aligned(&a, g);
-    (bytes, super::items_record::one_file(bytes, names.files[0].text, g))
+    let bytes: &'static [u8] = aligned(&a, bump);
+    (bytes, super::items_record::one_file(bytes, names.files[0].text, bump))
 }
 
 /// The key of the item of `kind` named `name`.
@@ -125,7 +126,7 @@ fn asked(record: &ItemsRecord<'static>, key: &BucketKey) -> AVec<'static, (Optio
 fn with_u32(bytes: &[u8], at: usize, value: u32) -> &'static [u8] {
     let mut copy = AVec::from_slice_in(bytes, Alloc::global());
     copy[at..at + 4].copy_from_slice(&value.to_le_bytes());
-    aligned(&copy, Alloc::global())
+    aligned(&copy, super::SyncFrame::leaked())
 }
 
 #[test]
@@ -266,12 +267,13 @@ fn prim_input(name: &'static str, root: &'static str, deps: &'static [(&'static 
 /// builtin `u64`" fails.
 #[test]
 fn a_builtin_self_outside_core_is_filed_at_the_builtin() {
-    let g = blaze_own::testing::heap().alloc();
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
     let inputs = [prim_input("core", "/core/lib.rs", &[]), prim_input("dep", "/dep/lib.rs", &[]), prim_input("user", "/user/lib.rs", PRIM_DEPS)];
     let sys = Sysroot { core: Some(CrateId(0)), alloc: None, std: None, bstd: None };
-    let (solved, _) = resolve_by_records(&inputs, sys, &PRIM_TEXTS, &Serial, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("solve: {e:?}"));
+    let (solved, _) = resolve_by_records(&inputs, sys, &PRIM_TEXTS, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("solve: {e:?}"));
     let a = encode(solved[2].names, g).unwrap_or_else(|e| panic!("encode: {e:?}"));
-    let bytes: &'static [u8] = aligned(&a, g);
+    let bytes: &'static [u8] = aligned(&a, bump);
     let record = ItemsRecord::open(bytes, g).unwrap_or_else(|e| panic!("open: {e:?}"));
     let tr = key_of(&record, ItemKind::Trait, "Tr");
     let local = key_of(&record, ItemKind::Struct, "u64");

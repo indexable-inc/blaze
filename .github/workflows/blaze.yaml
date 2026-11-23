@@ -272,12 +272,14 @@ jobs:
           [ "$jobs" -gt 16 ] && jobs=16
           export FAIL_DIR="$tmp_dir"
           export RUST_TEST_THREADS=4
-          tr '\n' '\0' < "$bins" | xargs -0 -P "$jobs" -I {} bash -c '
+          sysroot_lib="$(rustc +"$tc" --print sysroot)/lib"
+          export LD_LIBRARY_PATH="$sysroot_lib:${LD_LIBRARY_PATH:-}"
+          tr '\n' '\0' < "$bins" | xargs -0 -r -n 1 -P "$jobs" bash -c '
             dir="${1%%|*}"
             bin="${1#*|}"
             name="$(basename "$bin")"
             out="$FAIL_DIR/$name.log"
-            if (cd "$dir" && CARGO_MANIFEST_DIR="$dir" "$bin" --test-threads=4) >"$out" 2>&1; then
+            if (cd "$dir" && CARGO_MANIFEST_DIR="$dir" "$bin") >"$out" 2>&1; then
               rm -f "$out"
             else
               rc=$?
@@ -285,7 +287,7 @@ jobs:
               cat "$out"
               echo "$name" >> "$FAIL_DIR/failed.list"
             fi
-          ' _ {} < "$bins"
+          ' _
           if ! cargo +"$tc" test --locked --workspace --exclude blaze-std --doc --no-fail-fast; then
             echo "doctests" >> "$tmp_dir/failed.list"
           fi

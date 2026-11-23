@@ -48,7 +48,7 @@ static TEXTS: Texts = Texts(&[&[
 fn solved() -> Names<'static> {
     let mut d = input("d", "/d/src/lib.rs", &[]);
     d.shown_from = "/d/";
-    resolve_crates(&[d], Sysroot::default(), &TEXTS, &Serial, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))
+    resolve_crates(&[d], Sysroot::default(), &TEXTS, &Serial, super::SyncFrame::leaked()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))
 }
 
 fn binds(names: &Names<'static>, name: &'static str) -> bool {

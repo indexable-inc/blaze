@@ -38,9 +38,12 @@ static TEXTS: Texts = Texts(&[&[("/maker/lib.rs", MAKER)]]);
 /// "test tests::failed_record::the_failed_calls_reason_round_trips_through_the_names_record ... ok".
 #[test]
 fn the_failed_calls_reason_round_trips_through_the_names_record() {
-    let alloc: Alloc<'static> = blaze_own::testing::heap().alloc();
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let bump = erased.bump();
+    let alloc = bump.alloc();
     let crates: [CrateInput<'static>; 1] = [input("maker", "/maker/lib.rs", &[])];
-    let names = resolve_crates(&crates, Sysroot::default(), &TEXTS, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &TEXTS, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let c = names.crates()[0];
     let (call, path, implicit, failed) = c
         .notes
@@ -51,9 +54,9 @@ fn the_failed_calls_reason_round_trips_through_the_names_record() {
         })
         .expect("`make!(struct foo)` failed, and the solve noted it");
     let written = encode(c, alloc).unwrap_or_else(|e| panic!("encode: {e:?}"));
-    let bytes = aligned(&written, alloc);
+    let bytes = aligned(&written, bump);
     let record = NamesRecord::open(Verified::check(bytes).unwrap_or_else(|e| panic!("check: {e:?}")));
-    let row = record.failed(call, alloc).unwrap_or_else(|e| panic!("failed: {e:?}")).expect("a failed call's row is in the record");
+    let row = record.failed(call, bump).unwrap_or_else(|e| panic!("failed: {e:?}")).expect("a failed call's row is in the record");
     assert_eq!((row.call, row.path, row.implicit), (call, path, implicit));
     assert_eq!(row.path, "make");
     assert!(!row.implicit);
@@ -62,7 +65,7 @@ fn the_failed_calls_reason_round_trips_through_the_names_record() {
     assert!(format!("{}", row.why).contains("no rule of the macro's 1 matched"), "{}", row.why);
 
     // The control of the lookup: a key that is no failed call.
-    assert!(record.failed(c.root, alloc).unwrap_or_else(|e| panic!("failed: {e:?}")).is_none());
+    assert!(record.failed(c.root, bump).unwrap_or_else(|e| panic!("failed: {e:?}")).is_none());
 
     // Deterministic: a second encode writes equal bytes.
     let again = encode(c, alloc).unwrap_or_else(|e| panic!("encode: {e:?}"));
@@ -71,6 +74,6 @@ fn the_failed_calls_reason_round_trips_through_the_names_record() {
     // An old home's record (version 1, before the failed-calls section) is refused.
     let mut old = std::vec::Vec::from(&written[..]);
     old[4..8].copy_from_slice(&1u32.to_le_bytes());
-    let old = aligned(&old, alloc);
+    let old = aligned(&old, bump);
     assert!(matches!(Verified::check(old), Err(NamesRecordError::NotThisRecord)));
 }

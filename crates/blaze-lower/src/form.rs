@@ -657,6 +657,12 @@ pub enum TypeRef {
     /// A structural record type (`#![blaze::records]`): `{ name: &str, depth: u32 = 0 }`.
     /// Each element of `fields` is a [`ROW_FIELD`] row carrying name, type, and optional default.
     Record(List),
+    /// A structural type set / error union (`#![blaze::error_unions]`): `A | B | C`.
+    /// Each element of the list is a member [`TypeId`].
+    Union(List),
+    /// Fallible return/result sugar (`#![blaze::error_unions]`): `T ! E` (equivalent to
+    /// `Result<T, E>`, e.g. `Row ! FsError | Stopped` or `Row ! _`).
+    Fallible { ok: TypeId, err: TypeId },
     /// What the lowering cannot make (counted in `unhandled`).
     Error,
 }
@@ -700,6 +706,8 @@ impl TypeRef {
             TypeRef::Pat { base, pat: TyPat::NotNull } => Node { a: base.0, ..n.with(14 | 1 << 8) },
             TypeRef::Pat { base, pat: TyPat::Of(p) } => Node { a: base.0, b: p.0, ..n.with(14) },
             TypeRef::Record(l) => Node { a: l.start, b: l.len, ..n.with(15) },
+            TypeRef::Union(l) => Node { a: l.start, b: l.len, ..n.with(16) },
+            TypeRef::Fallible { ok, err } => Node { a: ok.0, b: err.0, ..n.with(17) },
         }
     }
 
@@ -733,6 +741,8 @@ impl TypeRef {
             14 if n.flags & (1 << 8) != 0 => TypeRef::Pat { base: TypeId(n.a), pat: TyPat::NotNull },
             14 => TypeRef::Pat { base: TypeId(n.a), pat: TyPat::Of(PatId(n.b)) },
             15 => TypeRef::Record(list(n.a, n.b)),
+            16 => TypeRef::Union(list(n.a, n.b)),
+            17 => TypeRef::Fallible { ok: TypeId(n.a), err: TypeId(n.b) },
             _ => return Err(bad("types", n.tag)),
         })
     }

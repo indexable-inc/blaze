@@ -41,7 +41,6 @@ use blaze_ladder::front2::keys::{MemberKind, checker_of};
 use blaze_ladder::front2::types::Why;
 use blaze_ladder::refusal::SourceFile;
 use blaze_lower::scoped::Prepares;
-use blaze_own::Alloc;
 use blaze_scope::resolve::{At, Names};
 use blaze_surface::{ItemDetail, Range};
 
@@ -251,7 +250,7 @@ fn head_census() {
     let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names: Names<'_> = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names: Names<'_> = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let crate_names: Vec<&str> = crates.iter().map(|c| c.name).collect();
     let mut out = format!("head census: names resolved in {:?}\n", start.elapsed());
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
@@ -337,7 +336,7 @@ fn census_crate<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, krate: usize, 
         .collect();
     ordered.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let mut buckets = None;
     let mut consts = Consts::default();

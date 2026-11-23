@@ -15,8 +15,8 @@ use crate::sequences::{
     ArgOf, BANG, BAR, BRACE, CLOSE, Cut, DOT, DOTDOT, Guard, LT, MAX_WORD_LEN, MIN_WORD_LEN, NE, NO_WORD, OPEN, OTHER,
     SEP, SEQS, TRIE, W_ALLOC, W_ALLOC_TYPE, W_ARC, W_AS, W_BLOCK_ON, W_CLONE, W_CRATE, W_EXPECT, W_EXTERN, W_FALSE,
     W_FILE, W_FIND, W_FN, W_FOR, W_GET, W_GLOBAL, W_GLOBAL_FN, W_IMPL, W_IN, W_INSTANT, W_IS_SOME_AND, W_JOIN, W_LEN,
-    W_LIBC, W_LOCK, W_MOD, W_MUT, W_ORDERING, W_RECV, W_REF, W_RUSTIX, W_SELF, W_SEQCST, W_SOME, W_STARTS_WITH, W_STD,
-    W_STRING, W_SYSTEM_TIME, W_THREAD_LOCAL, W_TRAIT, W_TRUE, W_TRY_INTO, W_TYPE, W_UNSAFE, W_UNWRAP, W_USE, W_VEC,
+    W_LET, W_LIBC, W_LOCK, W_MOD, W_MUT, W_ORDERING, W_RECV, W_REF, W_RUSTIX, W_SELF, W_SEQCST, W_SOME, W_STARTS_WITH, W_STD,
+    W_STRING, W_SYSTEM_TIME, W_THREAD_LOCAL, W_TRAIT, W_TRUE, W_TRY_INTO, W_TYPE, W_UNIQ, W_UNSAFE, W_UNWRAP, W_USE, W_VEC,
     W_WAIT, WC_COLLECTION, WC_DEFINING, WC_DISPATCHED, WC_IO_MODULE, WC_IO_TYPE, WC_LOCK_TYPE, WC_PRINT_MACRO,
     WC_RENAME, WC_SANS_IO, WC_STATIC, WORD, WORD_CLASS, WORD_FIRST_BY_LEN,
 };
@@ -43,7 +43,7 @@ const SEQUENCE_RULES: [Rule; 11] = [
 
 /// A token's kind, as the rules tell kinds apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum K {
+pub(crate) enum K {
     Ident,
     /// `r#name` or `k#name`: never a keyword.
     Raw,
@@ -60,10 +60,10 @@ enum K {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Tok {
-    start: u32,
-    end: u32,
-    k: K,
+pub(crate) struct Tok {
+    pub(crate) start: u32,
+    pub(crate) end: u32,
+    pub(crate) k: K,
     /// An identifier's number in the rules' word table (`sequences::WORDS`), found once while
     /// lexing; `NO_WORD` for every other token and for a word no rule reads.
     word: u8,
@@ -97,7 +97,7 @@ struct Sig {
 
 /// A fix a candidate carries, written out with it.
 #[derive(Clone, Copy)]
-enum Plan {
+pub(crate) enum Plan {
     None,
     /// The method name at `name` becomes row `row`'s new name, and when the row has a suffix,
     /// it goes at `after` (the call's `)` end).
@@ -114,15 +114,17 @@ enum Plan {
     WrapFrom { before_expr: u32, after_expr: u32, as_end: u32, prefix: &'static str, add_close: bool },
     /// Insert `!` at `bang_at` and replace `range` with `text` (e.g. `x.len() > 0` -> `!x.is_empty()`).
     NegateReplace { bang_at: u32, range: Span, text: &'static str },
+    /// `range` replaced by the UTF-8 slice `text` in `Pass::fix_buf` (empty for deletion).
+    ReplaceBuf { range: Span, text: Run },
 }
 
 /// A finding before test code is known.
 #[derive(Clone, Copy)]
-struct Cand {
-    template: Template,
-    range: Span,
-    arg: Option<Arg>,
-    plan: Plan,
+pub(crate) struct Cand {
+    pub(crate) template: Template,
+    pub(crate) range: Span,
+    pub(crate) arg: Option<Arg>,
+    pub(crate) plan: Plan,
 }
 
 /// How many lines above a clone or an `unsafe` its comment is looked for (clones.rs's `LOOK_UP`).
@@ -180,9 +182,9 @@ pub(crate) const FORMAT_MACROS: [&str; 8] =
     ["format", "format_args", "write", "writeln", "print", "println", "eprint", "eprintln"];
 /// Every word [`Pass::on_word`] matches on by name: each must be in `sequences::WORDS`, which a
 /// compile-time check there holds, since a word not in the table is never dispatched.
-pub(crate) const DISPATCHED: [&str; 24] = [
+pub(crate) const DISPATCHED: [&str; 25] = [
     "use", "as", "clone", "Global", "fn", "type", "impl", "trait", "mod", "for", "self", "unwrap", "expect", "std",
-    "alloc", "unsafe", "Ordering", "ref", "get", "starts_with", "len", "find", "Alloc", "extern",
+    "alloc", "unsafe", "Ordering", "ref", "let", "get", "starts_with", "len", "find", "Alloc", "extern",
 ];
 /// The words `process-static` starts at ([`Pass::process_static`]).
 pub(crate) const STATIC_WORDS: [&str; 2] = ["static", "thread_local"];
@@ -221,6 +223,7 @@ pub struct Scratch<'a> {
     pub(crate) alloc: Alloc<'a>,
     toks: AVec<'a, Tok>,
     cands: AVec<'a, Cand>,
+    fix_buf: AVec<'a, u8>,
     regions: AVec<'a, TestRegion>,
     reasons: AVec<'a, Span>,
     frames: AVec<'a, Frame>,
@@ -236,6 +239,7 @@ impl<'a> Scratch<'a> {
             alloc,
             toks: AVec::new_in(alloc),
             cands: AVec::new_in(alloc),
+            fix_buf: AVec::new_in(alloc),
             regions: AVec::new_in(alloc),
             reasons: AVec::new_in(alloc),
             frames: AVec::new_in(alloc),
@@ -249,6 +253,7 @@ impl<'a> Scratch<'a> {
     pub fn clear(&mut self) {
         self.toks.clear();
         self.cands.clear();
+        self.fix_buf.clear();
         self.regions.clear();
         self.reasons.clear();
         self.frames.clear();
@@ -299,6 +304,7 @@ pub(crate) fn run_with<'a>(
         scope: unit.scope,
         toks: &mut scratch.toks,
         cands: &mut scratch.cands,
+        fix_buf: &mut scratch.fix_buf,
         regions: &mut scratch.regions,
         reasons: &mut scratch.reasons,
         frames: &mut scratch.frames,
@@ -317,6 +323,18 @@ pub(crate) fn run_with<'a>(
     if SEQUENCE_RULES.iter().any(|rule| rules.runs(*rule)) {
         pass.sequences();
     }
+    if rules.runs(Rule::IoRef) {
+        pass.io_ref_pass();
+    }
+    if rules.runs(Rule::UnusedImport) {
+        pass.unused_import_pass(false);
+    }
+    if rules.runs(Rule::UnusedMut) {
+        pass.unused_mut_pass();
+    }
+    if rules.runs(Rule::HeapLeak) {
+        pass.heap_leak_pass();
+    }
     let test_at_end = pass.test_at(unit.text.len().saturating_sub(1) as u32);
     let from = count(out.list.len())?;
     pass.emit(out)?;
@@ -326,19 +344,63 @@ pub(crate) fn run_with<'a>(
     Ok(PassDone { findings: Run { from, to }, test_at_end, cost: pass.cost, tokens })
 }
 
+/// Whole-file top-level `use` pass for [`Rule::UnusedImport`], separate from [`run_with`] so
+/// per-item passes remain strictly independent of sibling items.
+pub(crate) fn run_file_imports<'a>(
+    text: &str,
+    scope: Scope,
+    scratch: &mut Scratch<'a>,
+    out: &mut Findings<'a>,
+) -> Result<PassDone, LintError> {
+    if u32::try_from(text.len()).is_err() {
+        return Err(LintError::TooLong { len: text.len() });
+    }
+    let only = RuleSet::only(&[Rule::UnusedImport]);
+    scratch.clear();
+    let mut pass = Pass {
+        rules: &only,
+        text,
+        bytes: text.as_bytes(),
+        scope,
+        toks: &mut scratch.toks,
+        cands: &mut scratch.cands,
+        fix_buf: &mut scratch.fix_buf,
+        regions: &mut scratch.regions,
+        reasons: &mut scratch.reasons,
+        frames: &mut scratch.frames,
+        bodies: &mut scratch.bodies,
+        fns: &mut scratch.fns,
+        children: &mut scratch.children,
+        header: None,
+        sig: None,
+        in_use: false,
+        defining: false,
+        last_fn: None,
+        cost: Cost::NONE,
+    };
+    pass.lex(&[])?;
+    pass.unused_import_pass(true);
+    let from = count(out.list.len())?;
+    pass.emit(out)?;
+    let to = count(out.list.len())?;
+    let tokens = count(pass.toks.len())?;
+    Ok(PassDone { findings: Run { from, to }, test_at_end: TestBits::NONE, cost: pass.cost, tokens })
+}
+
 /// The bytes of `unit` outside its holes (holes not yet checked: a bad one only mis-sizes).
 fn own_bytes(unit: &Unit<'_>) -> usize {
     let holes: usize = unit.holes.iter().map(|h| h.end.saturating_sub(h.start) as usize).sum();
     unit.text.len().saturating_sub(holes)
 }
 
-struct Pass<'u, 's, 'a> {
+pub(crate) struct Pass<'u, 's, 'a> {
     rules: &'u RuleSet,
-    text: &'u str,
-    bytes: &'u [u8],
+    pub(crate) text: &'u str,
+    pub(crate) bytes: &'u [u8],
     scope: Scope,
-    toks: &'s mut AVec<'a, Tok>,
-    cands: &'s mut AVec<'a, Cand>,
+    pub(crate) toks: &'s mut AVec<'a, Tok>,
+    pub(crate) cands: &'s mut AVec<'a, Cand>,
+    pub(crate) fix_buf: &'s mut AVec<'a, u8>,
     /// Test code: each region's range, flavor, and prefix-max end.
     regions: &'s mut AVec<'a, TestRegion>,
     /// What each `#[blaze::lock_exception(..)]` covers (D179): the statement, field, `static`,
@@ -359,7 +421,7 @@ struct Pass<'u, 's, 'a> {
     /// The last `fn` read: where a local's declaration is looked for from.
     last_fn: Option<usize>,
     /// The sites each rule tried ([`Cost`]): one count at each dispatch into a rule.
-    cost: Cost,
+    pub(crate) cost: Cost,
 }
 
 impl<'u, 's, 'a> Pass<'u, 's, 'a> {
@@ -943,6 +1005,10 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                 W_REF if rules.runs(Rule::MutRef) => {
                     self.cost.add(Rule::MutRef);
                     self.ref_mut_word(i, t);
+                }
+                W_LET if rules.runs(Rule::MutForUniqBorrow) => {
+                    self.cost.add(Rule::MutForUniqBorrow);
+                    self.let_mut_word(i, t);
                 }
                 W_GET if rules.runs(Rule::MagicSliceLen) => {
                     self.cost.add(Rule::MagicSliceLen);
@@ -3056,6 +3122,121 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
         }
     }
 
+    /// Flags `let mut x = ..;` when `x` is never rebound (`x = ..`, `x += ..`, ...) in its
+    /// enclosing block and is only borrowed uniquely (`&uniq x` / `&mut x`), attaching a
+    /// mechanical fix that removes the redundant `mut ` keyword.
+    fn let_mut_word(&mut self, i: usize, let_tok: Tok) {
+        let Some(mut_tok) = self.tok(i + 1) else { return };
+        if mut_tok.k != K::Ident || mut_tok.word != W_MUT {
+            return;
+        }
+        let Some(name_tok) = self.tok(i + 2) else { return };
+        if name_tok.k != K::Ident {
+            return;
+        }
+        // Only simple `let mut x = ...;` or `let mut x: T = ...;` bindings (not destructuring).
+        let Some(after_name) = self.tok(i + 3) else { return };
+        if !matches!(after_name.k, K::P(b'=') | K::P(b':')) {
+            return;
+        }
+        let name = self.str_of(name_tok);
+        if name.is_empty() || name.starts_with('_') {
+            return;
+        }
+
+        // Advance past the initializer statement's `;` at delimiter depth 0.
+        let mut depth = 0i32;
+        let mut j = i + 3;
+        while let Some(tok) = self.tok(j) {
+            match tok.k {
+                K::P(b'{' | b'(' | b'[') => depth += 1,
+                K::P(b'}' | b')' | b']') => {
+                    if depth == 0 {
+                        return;
+                    }
+                    depth -= 1;
+                }
+                K::P(b';') if depth == 0 => {
+                    j += 1;
+                    break;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+
+        // Scan the rest of the enclosing block (`block_depth >= 0`) until it closes or `name` is shadowed.
+        let mut uniq_borrowed = false;
+        let mut rebound = false;
+        let mut block_depth = 0i32;
+        while let Some(tok) = self.tok(j) {
+            match tok.k {
+                K::P(b'{') => block_depth += 1,
+                K::P(b'}') => {
+                    if block_depth == 0 {
+                        break;
+                    }
+                    block_depth -= 1;
+                }
+                K::Ident if tok.word == W_LET && block_depth == 0 => {
+                    let next1 = self.tok(j + 1);
+                    let shadow = if next1.is_some_and(|t| t.k == K::Ident && t.word == W_MUT) {
+                        self.tok(j + 2)
+                    } else {
+                        next1
+                    };
+                    if shadow.is_some_and(|t| t.k == K::Ident && self.str_of(t) == name) {
+                        break;
+                    }
+                }
+                K::Ident if self.str_of(tok) == name => {
+                    let prev = if j > 0 { self.tok(j - 1) } else { None };
+                    let prev2 = if j > 1 { self.tok(j - 2) } else { None };
+                    // Check `&uniq name` or `&mut name`.
+                    let is_uniq_borrow = prev.is_some_and(|p| {
+                        p.k == K::Ident && (p.word == W_UNIQ || p.word == W_MUT)
+                    }) && prev2.is_some_and(|p2| p2.k == K::P(b'&'));
+                    if is_uniq_borrow {
+                        uniq_borrowed = true;
+                    } else {
+                        // Skip field/path access `.name` / `::name`.
+                        let is_member = prev.is_some_and(|p| matches!(p.k, K::P(b'.' | b':')));
+                        if !is_member {
+                            if let Some(next) = self.tok(j + 1) {
+                                let next2 = self.tok(j + 2);
+                                // Bare rebinding: `name = expr` (not `==` / `=>`) or compound assign.
+                                let is_eq = next.k == K::P(b'=')
+                                    && !next2.is_some_and(|n2| matches!(n2.k, K::P(b'=' | b'>')));
+                                let is_compound = matches!(
+                                    next.k,
+                                    K::P(b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^')
+                                ) && next2.is_some_and(|n2| n2.k == K::P(b'='));
+                                let is_shift_assign = matches!(next.k, K::P(b'<' | b'>'))
+                                    && next2.is_some_and(|n2| n2.k == next.k)
+                                    && self.tok(j + 3).is_some_and(|n3| n3.k == K::P(b'='));
+                                if is_eq || is_compound || is_shift_assign {
+                                    rebound = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+
+        if uniq_borrowed && !rebound {
+            self.cands.push(Cand {
+                template: Template::MutForUniqBorrow,
+                range: Span::new(let_tok.start, name_tok.end),
+                arg: None,
+                plan: Plan::Replace { range: Span::new(mut_tok.start, name_tok.start), text: "" },
+            });
+        }
+    }
+
     // ---- magic-slice-len (`bytes.get(0..3) == Some(..)`, `.get(at..at + 2)`, etc.) ------
 
     /// Finds the matching closing delimiter (`open_b` / `close_b`) starting at `open_idx`.
@@ -4164,6 +4345,16 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
                     let edits_from = count(out.edits.len())?;
                     out.push_edit(Span::new(bang_at, bang_at), "!")?;
                     out.push_edit(range, text)?;
+                    out.fixes.push(Fix { edits: Run { from: edits_from, to: count(out.edits.len())? } });
+                }
+                Plan::ReplaceBuf { range, text } => {
+                    let edits_from = count(out.edits.len())?;
+                    let slice = self
+                        .fix_buf
+                        .get(text.range())
+                        .and_then(|b| core::str::from_utf8(b).ok())
+                        .unwrap_or("");
+                    out.push_edit(range, slice)?;
                     out.fixes.push(Fix { edits: Run { from: edits_from, to: count(out.edits.len())? } });
                 }
             }

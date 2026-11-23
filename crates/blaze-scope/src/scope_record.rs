@@ -356,7 +356,7 @@ struct Head {
 
 /// The bytes of `range` all zero, or the first that is not, named `what`.
 fn zeros(bytes: &[u8], range: core::ops::Range<usize>, what: &'static str) -> Result<(), RecordRead> {
-    match bytes[range.clone()].iter().position(|b| *b != 0) {
+    match bytes[range.start..range.end].iter().position(|b| *b != 0) {
         Some(i) => Err(RecordRead::BadByte { at: range.start + i, what }),
         None => Ok(()),
     }

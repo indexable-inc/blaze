@@ -139,7 +139,7 @@ fn a_dependency_constant_s_proc_macro_call_is_run_by_its_crate_s_runner() {
         input("dep", "/dep/lib.rs", &[("macros", 2)], false),
         input("macros", "/macros/lib.rs", &[], true),
     ];
-    let names = resolve_crates(&crates, Sysroot::default(), &FILES, &Serial, g).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &FILES, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the survey's frame");
     let sources: &'static dyn BodySources = Box::leak(Box::new(Sourced(&FILES)));
 

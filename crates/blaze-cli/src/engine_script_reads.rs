@@ -555,7 +555,7 @@ impl<'f> Served<'f> {
             return Ok(Served::Simulated);
         }
         let root = script_sandbox::RealRoot::of_start(crate::scripts::checkout_path(checkout), blaze_own::planted::NoPlant)?;
-        Ok(Served::Root(blaze_own::Box::leak(blaze_own::Box::new_in(root, frame))))
+        Ok(Served::Root(blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(root, frame))))
     }
 
     /// The root as text, for what prints it or names a folder from it (engine_check.rs's shown
@@ -571,7 +571,7 @@ impl<'f> Served<'f> {
     /// resolved path, never a second resolution.
     pub(crate) fn within<'g>(self, frame: &'g Frame) -> Served<'g> {
         match self {
-            Served::Root(root) => Served::Root(blaze_own::Box::leak(blaze_own::Box::new_in(root.clone(), frame))),
+            Served::Root(root) => Served::Root(blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(root.clone(), frame))),
             Served::Simulated => Served::Simulated,
         }
     }

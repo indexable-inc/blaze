@@ -1774,11 +1774,12 @@ fn main() {}
         let files = [("/kt/src/main.rs".to_string(), SOURCE.to_string())];
         let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
         let user = UserCrate { name: "kt", dir: "/kt/", root: "/kt/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
         let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
         let crates = inputs.crates();
-        let names = inputs.resolve(&crates, alloc).expect("fixture names");
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
         let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
-        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
         let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
         let bodies = world.bodies(alloc);
         let body = |name: &str| {

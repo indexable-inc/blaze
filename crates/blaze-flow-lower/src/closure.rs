@@ -554,6 +554,8 @@ pub(crate) fn node_kind(n: PNode) -> &'static str {
     match n {
         PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Float(_) | PNode::Str | PNode::Never => "scalar",
         PNode::Tuple(_) => "tuple",
+        PNode::Record(_) => "record",
+        PNode::Union(_) => "union",
         PNode::Ref(..) => "ref",
         PNode::Ptr(..) => "ptr",
         PNode::Array(..) => "array",
@@ -817,7 +819,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 }
                 (PNode::Ptr(dm, di), PNode::Ptr(am, ai)) if dm == am => stack.push((di, ai)),
                 (PNode::Slice(di), PNode::Slice(ai)) | (PNode::Array(di, _), PNode::Array(ai, _)) => stack.push((di, ai)),
-                (PNode::Tuple(_), PNode::Tuple(al)) | (PNode::Adt(..), PNode::Adt(_, al)) => {
+                (PNode::Tuple(_), PNode::Tuple(al))
+                | (PNode::Record(_), PNode::Record(al))
+                | (PNode::Union(_), PNode::Union(al))
+                | (PNode::Adt(..), PNode::Adt(_, al)) => {
                     if let (PNode::Adt(dk, _), PNode::Adt(ak, _)) = (dn, an)
                         && dk != ak
                     {
@@ -1110,7 +1115,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     }
                 }
                 PNode::Ref(_, i) | PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
-                PNode::Tuple(l) | PNode::Adt(_, l) => stack.extend_from_slice(self.list(l, e)?),
+                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) | PNode::Adt(_, l) => stack.extend_from_slice(self.list(l, e)?),
                 _ => {}
             }
         }

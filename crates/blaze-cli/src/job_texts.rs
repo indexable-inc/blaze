@@ -106,6 +106,9 @@ pub(crate) struct JobTexts<'n> {
     /// the frame: [`SourceTexts::proc_macro_unusable`] gives them for the call the solve asks
     /// about just after the run (one job, one thread: the run and the ask are in order).
     pub(crate) run_stopped: core::cell::Cell<Option<&'n str>>,
+    /// Live status board and clock, when running inside `engine_check`: reports active
+    /// Wasmtime proc-macro expansions (`WorkKind::ProcMacro`) while they execute.
+    pub(crate) activity: Option<(&'n crate::engine_status::Board<'n>, &'n bstd::clock::Clock)>,
 }
 
 /// The environments of a job's crates past its one owner ([`JobTexts::envs`]), each made at
@@ -247,12 +250,12 @@ impl<'n> JobTexts<'n> {
             return match error.kind {
                 FsKind::NotFound | FsKind::IsADirectory | FsKind::NotADirectory => Found::Absent,
                 _ => {
-                    let why: &'n bstd::fs::FsError = blaze_own::Box::leak(blaze_own::Box::new_in(error, self.frame));
+                    let why: &'n bstd::fs::FsError = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(error, self.frame));
                     Found::Unknown(Unread { path: held_str(inner, self.frame), why })
                 }
             };
         }
-        let held: &'n Bytes<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(bytes, self.frame));
+        let held: &'n Bytes<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(bytes, self.frame));
         Found::Known(held.as_slice())
     }
 
@@ -263,7 +266,7 @@ impl<'n> JobTexts<'n> {
         let at = Path::new(inner).ok()?;
         let mut bytes = Bytes::new_in(self.frame, "a pool job's checkout files");
         self.root.read_all(self.cx, &at, &mut bytes).ok()?;
-        let held: &'n Bytes<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(bytes, self.frame));
+        let held: &'n Bytes<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(bytes, self.frame));
         Some(held.as_slice())
     }
 }
@@ -313,7 +316,7 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
             Found::Known(bytes) => match core::str::from_utf8(bytes) {
                 Ok(text) => Some(text),
                 Err(error) => {
-                    let why: &'n core::str::Utf8Error = blaze_own::Box::leak(blaze_own::Box::new_in(error, self.frame));
+                    let why: &'n core::str::Utf8Error = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(error, self.frame));
                     return unknown(Unread { path: held_str(inner, self.frame), why });
                 }
             },
@@ -401,6 +404,14 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
             }
         };
         let Ok((world_at, edition)) = self.caller(krate) else { return Err(refused) };
+        let _active = self.activity.map(|(board, clock)| {
+            let name = procs.crate_name(def).or_else(|| def.proc_name()).unwrap_or("proc-macro");
+            board.show_activity(
+                blaze_screen::WorkKind::ProcMacro,
+                crate::engine_status::Label::of(name),
+                board.now(clock),
+            )
+        });
         procs.run(world_at, edition, def, call, alloc).map_err(|stopped| {
             if let Some(error) = &stopped.call {
                 self.run_stopped.set(Some(held_str(&std::format!("{error}"), self.frame)));
@@ -465,6 +476,7 @@ mod tests {
             callers: &[],
             by_need: None,
             run_stopped: core::cell::Cell::new(None),
+            activity: None,
         }
     }
 

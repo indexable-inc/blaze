@@ -66,7 +66,7 @@ fn solved() -> Names<'static> {
     let mut user = input("user", "/user/lib.rs", &[("data", DATA), ("flat", FLAT)]);
     user.shown_from = "/user/";
     let crates = [data, flat, user];
-    resolve_crates(&crates, Sysroot::default(), &TEXTS, &Serial, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))
+    resolve_crates(&crates, Sysroot::default(), &TEXTS, &Serial, super::SyncFrame::leaked()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))
 }
 
 /// Whether crate `krate`'s root binds `name` in the macro namespace.

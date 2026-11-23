@@ -903,7 +903,7 @@ Every promise of a doc comment or an effect attribute and how it is held
 `Evidence:` or `Unverified:`, an effect attribute, a `# Safety` obligation, a proved contract.
 A checked attribute and an obligation are counted, not listed.
 
-4175 claims. By level: 31 none, 4 unverified, 384 obligation, 3716 checked, 0 tested, 2 simulated, 0 model-checked, 38 proved.
+4188 claims. By level: 31 none, 4 unverified, 385 obligation, 3728 checked, 0 tested, 2 simulated, 0 model-checked, 38 proved.
 
 ### Totals
 
@@ -931,7 +931,7 @@ A checked attribute and an obligation are counted, not listed.
 | blaze-malloc | 0 | 0 | 27 | 0 | 0 | 0 | 0 | 0 |
 | blaze-mem | 0 | 0 | 26 | 0 | 0 | 0 | 0 | 0 |
 | blaze-memo | 0 | 0 | 10 | 0 | 0 | 0 | 0 | 0 |
-| blaze-own | 21 | 0 | 46 | 8 | 0 | 0 | 0 | 0 |
+| blaze-own | 21 | 0 | 47 | 8 | 0 | 0 | 0 | 0 |
 | blaze-pg | 0 | 0 | 0 | 188 | 0 | 0 | 0 | 0 |
 | blaze-profile | 0 | 0 | 9 | 0 | 0 | 0 | 0 | 0 |
 | blaze-queue | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 0 |
@@ -943,10 +943,10 @@ A checked attribute and an obligation are counted, not listed.
 | blaze-sort | 0 | 0 | 5 | 0 | 0 | 0 | 0 | 0 |
 | blaze-sql | 0 | 0 | 0 | 179 | 0 | 0 | 0 | 0 |
 | blaze-sqlite | 4 | 0 | 1 | 6 | 0 | 0 | 0 | 0 |
-| blaze-std | 0 | 0 | 19 | 1260 | 0 | 0 | 0 | 0 |
+| blaze-std | 0 | 0 | 19 | 1262 | 0 | 0 | 0 | 0 |
 | blaze-store-check | 0 | 0 | 8 | 0 | 0 | 0 | 0 | 0 |
 | blaze-surface | 0 | 0 | 3 | 0 | 0 | 0 | 0 | 0 |
-| blaze-sys | 0 | 4 | 86 | 1495 | 0 | 0 | 0 | 0 |
+| blaze-sys | 0 | 4 | 86 | 1505 | 0 | 0 | 0 | 0 |
 | blaze-text | 0 | 0 | 5 | 0 | 0 | 0 | 0 | 0 |
 | blaze-trace | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 0 |
 | blaze-url | 0 | 0 | 0 | 58 | 0 | 0 | 0 | 0 |
@@ -974,8 +974,8 @@ A checked attribute and an obligation are counted, not listed.
 - **`atomics::parks_once#1`** *proved* proved (`lean/theorems.json`): The statement blaze generates from the fixture's theorem function parks_once holds of the park and unpark it translates (an AtomicU32 token word: two compare-exchanges, a futex wait loop, a swap and a wake): for every schedule of the two threads and every pick of the world's, no run ends with the unpark returned and the park asleep; where both returned the token was taken and the word is empty, or a timed park left first and the token is still there; and an untimed park returns only with a token. Proved over the program points the translator names (park.at_n, park_loop.loop_0.at_n, unpark.at_1), with no model text copied. Evidence: Lean atomics.parks_once.spec.proof.
 - **`atomics::pokes_count#1`** *proved* proved (`lean/theorems.json`): The statement blaze generates from the fixture's theorem function pokes_count holds of its model: a trait's provided methods, translated at their implementor, on a shared word: two pokes of a zeroed word return 1 and leave 2. Evidence: Lean atomics.pokes_count.spec.proof.
 - **`atomics::two_adds_make_two#1`** *proved* proved (`lean/theorems.json`): The statement blaze generates from the fixture's theorem function two_adds_make_two holds of its model, a program over shared cells: two SeqCst fetch_add(1) on a new AtomicU32 and then a load give 2 (the first theorem whose model is a Threads.Prog, by evaluation). Evidence: Lean atomics.two_adds_make_two.spec.proof.
-- **`blaze-cas::plain::snapshot::Snapshot#1`** *simulated* evidenced (`crates/blaze-cas/src/plain/snapshot.rs:182`): Every key committed before the take reads its exact bytes for as long as the snapshot lives; every other key is absent. Evidence: `tests::a_snapshot_reads_what_was_committed_before_it_through_commits_compactions_and_crashes`.
-- **`blaze-cas::plain::snapshot::Snapshot#2`** *simulated* evidenced (`crates/blaze-cas/src/plain/snapshot.rs:185`): Read from many threads at once, it answers as from one. Evidence: `tests::a_snapshot_is_read_from_eight_threads_at_once`.
+- **`blaze-cas::plain::snapshot::Snapshot#1`** *simulated* evidenced (`crates/blaze-cas/src/plain/snapshot.rs:183`): Every key committed before the take reads its exact bytes for as long as the snapshot lives; every other key is absent. Evidence: `tests::a_snapshot_reads_what_was_committed_before_it_through_commits_compactions_and_crashes`.
+- **`blaze-cas::plain::snapshot::Snapshot#2`** *simulated* evidenced (`crates/blaze-cas/src/plain/snapshot.rs:186`): Read from many threads at once, it answers as from one. Evidence: `tests::a_snapshot_is_read_from_eight_threads_at_once`.
 - **`blaze-core::busy::next_is_bounded#1`** *proved* proved (`lean/theorems.json`): The statement blaze generates from blaze-core's theorem function next_is_bounded holds of its model: for every number of tries and every time waited, busy::next does not panic and its wait is positive, at most the cap and at most what is left of the bound (so the waits of an exec that met ETXTBSY end, on the bound exactly). Evidence: Lean blaze_core.busy.next_is_bounded.spec.proof.
 - **`blaze-core::busy::next_is_the_doubling_schedule#1`** *proved* proved (`lean/theorems.json`): The statement blaze generates from blaze-core's theorem function next_is_the_doubling_schedule holds of its model: for every number of tries and every time waited, busy::next (one shift) gives the wait of busy::doubling (the loop that doubles and caps), which returns. Evidence: Lean blaze_core.busy.next_is_the_doubling_schedule.spec.proof.
 - **`blaze-core::handoff::no_hand_back_is_missed#1`** *proved* proved (`lean/theorems.json`): The statement blaze generates from the theorem function no_hand_back_is_missed holds of the models of the real Wake::wake and Wake::drain in the weak-memory world (Prog.valueWeak): a sender's relaxed store of its slot and its wake, the driver's drain and its relaxed read of the slot, as two threads on every schedule and with every value each read may see under its ordering: where both returned, the driver saw the slot or the sender was told to wake it. The first theorem of blaze's code against weak memory. Evidence: Lean blaze_core.handoff.no_hand_back_is_missed.spec.proof.
@@ -1017,8 +1017,8 @@ A checked attribute and an obligation are counted, not listed.
 - **`blaze-own::thin_arc::ThinArc#2`** *none* none (`crates/blaze-own/src/thin_arc.rs:119`): For the private empty-string sentinel used exclusively by [`ThinStr`], `ptr` points to [`EMPTY_STR`] (`strong == u32::MAX`, `len == 0`) and only `HeaderPrefix` is ever read.
 - **`blaze-own::thin_vec::ThinVec#1`** *none* none (`crates/blaze-own/src/thin_vec.rs:85`): When `header().cap == 0`, `ptr` points to [`EMPTY_HEADER`] (`len == 0`) and nothing is allocated; [`EMPTY_HEADER`] is never mutated.
 - **`blaze-own::thin_vec::ThinVec#2`** *none* none (`crates/blaze-own/src/thin_vec.rs:87`): When `header().cap > 0`, `ptr` points to a mutable heap block allocated by `alloc` with `block_layout::<T>(cap)`, with full-block provenance; `len <= cap`, and the first `len` slots starting at `data_offset::<T>()` hold initialized `T` values.
-- **`blaze-own::vec::Drain#1`** *none* none (`crates/blaze-own/src/vec.rs:1212`): The vector's length is the range's start; slots `front..back` hold the values not yet given out, `tail_start..tail_start + tail_len` the values after the range, which the drop moves down to the length.
-- **`blaze-own::vec::IntoIter#1`** *none* none (`crates/blaze-own/src/vec.rs:1124`): Slots `front..back` of `buf` hold the values not yet given out.
+- **`blaze-own::vec::Drain#1`** *none* none (`crates/blaze-own/src/vec.rs:1233`): The vector's length is the range's start; slots `front..back` hold the values not yet given out, `tail_start..tail_start + tail_len` the values after the range, which the drop moves down to the length.
+- **`blaze-own::vec::IntoIter#1`** *none* none (`crates/blaze-own/src/vec.rs:1145`): Slots `front..back` of `buf` hold the values not yet given out.
 - **`blaze-own::vec::Vec#1`** *none* none (`crates/blaze-own/src/vec.rs:36`): The first `len` slots of `buf` hold values; `len <= buf.capacity()`.
 - **`blaze-shapes::hunts_find_the_hit#1`** *proved* proved (`lean/theorems.json`): The statement blaze generates from the fixture's theorem function hunts_find_the_hit holds of its model: a loop that returns, or breaks with, a field its match arm bound gives the Rust's values on the inputs it names. Evidence: Lean blaze_shapes.hunts_find_the_hit.spec.proof.
 - **`blaze-sqlite::CText#1`** *none* none (`crates/blaze-sqlite/src/lib.rs:470`): `CText::bytes` ends in a NUL and holds no other. Upheld by `nul_terminated`, its one constructor.

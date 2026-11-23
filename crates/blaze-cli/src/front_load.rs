@@ -28,12 +28,13 @@ use blaze_drive::{Input, Key, Name};
 use blaze_core::SharedSet;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_ladder::front2::source::{Load, LoadedExpansion};
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, Bump, Vec};
 use blaze_scope::items_record::{CurrentFile, ItemsRecord, ItemsRecordError};
 use blaze_scope::names_record::{NamesRecordError, Verified};
 use blaze_scope::package_path::PackagePath;
 use blaze_scope::resolve::SourceTexts;
 use bstd::cx::Cx;
+use bstd::mem::Frame;
 
 use blaze_scope::expansion_records::{ExpansionRecord, ExpansionRecordsError};
 
@@ -102,12 +103,12 @@ impl core::fmt::Display for LoadError {
 
 /// The sections of a `CrateScope` record's `payload`, read under `name` for crate `key`, with
 /// expansion text records deferred to the keyed demand seam.
-pub(crate) fn crate_records<'n>(name: Name, payload: &[u8], key: CrateItemKey, alloc: Alloc<'n>) -> Result<CrateRecords<'n>, LoadError> {
+pub(crate) fn crate_records<'n>(name: Name, payload: &[u8], key: CrateItemKey, bump: Bump<'n>) -> Result<CrateRecords<'n>, LoadError> {
     let parts = sections::sections(payload).map_err(|error| LoadError::Sections { name, error })?;
-    let names = blaze_scope::resolve::aligned(parts.names, alloc);
-    let items = blaze_scope::resolve::aligned(parts.items, alloc);
-    let expansions = blaze_scope::resolve::aligned(parts.expansions, alloc);
-    checked_records(name, key, names, items, expansions, alloc)
+    let names = blaze_scope::resolve::aligned(parts.names, bump);
+    let items = blaze_scope::resolve::aligned(parts.items, bump);
+    let expansions = blaze_scope::resolve::aligned(parts.expansions, bump);
+    checked_records(name, key, names, items, expansions, bump.alloc())
 }
 
 /// A crate's three sections, each 16-aligned where it lies (copied by [`crate_records`], or in
@@ -140,20 +141,20 @@ pub(crate) fn checked_records<'n>(
 /// The crate `key`'s sections from the record `input` names, read from `store` by its key
 /// (`input.at`) in place and copied into `alloc` ([`crate_records`]). Expansion text records are
 /// opened later by `StoreLoad::expansion`.
-pub(crate) fn read_crate<'n>(cx: &Cx, store: &mut dyn Store<'_>, input: &Input, key: CrateItemKey, alloc: Alloc<'n>) -> Result<CrateRecords<'n>, LoadError> {
+pub(crate) fn read_crate<'n>(cx: &Cx, store: &mut dyn Store<'_>, input: &Input, key: CrateItemKey, bump: Bump<'n>) -> Result<CrateRecords<'n>, LoadError> {
     let cx = cx.span("front load: read a crate's records");
     let Some(held) = store.get(&cx, input.at).map_err(LoadError::Store)? else {
         return Err(LoadError::NotInStore { name: input.name, at: input.at });
     };
     match blaze_drive::record::open(held.bytes) {
         Ok(blaze_drive::record::Stored::Whole(view)) => {
-            let mut slots = AVec::new_in(alloc);
+            let mut slots = Vec::new_in(bump);
             slots.extend(view.reads().filter_map(|(name, out)| {
                 (name.kind == blaze_drive::Kind::Surface && out != blaze_drive::key::ABSENT).then_some(name.subject)
             }));
             slots.sort_unstable();
-            let mut records = crate_records(input.name, view.payload, key, alloc)?;
-            records.file_slots = slots.leak();
+            let mut records = crate_records(input.name, view.payload, key, bump)?;
+            records.file_slots = slots.into_bump_slice();
             Ok(records)
         }
         Ok(blaze_drive::record::Stored::Shape(_)) => Err(LoadError::NotWhole { name: input.name, why: "a shape record, which holds no payload" }),
@@ -414,10 +415,10 @@ impl<'n> StoreLoad<'n> {
     }
 
     /// The crates' keys in reader order: `Records::new`'s `keys`.
-    pub(crate) fn keys(&self, alloc: Alloc<'n>) -> &'n [CrateItemKey] {
-        let mut keys = AVec::with_capacity_in(self.crates.len(), alloc);
+    pub(crate) fn keys(&self, frame: &'n Frame) -> &'n [CrateItemKey] {
+        let mut keys = Vec::with_capacity_in(self.crates.len(), frame);
         keys.extend((0..self.crates.len()).filter_map(|k| self.crates.key(k)));
-        keys.leak()
+        keys.into_bump_slice()
     }
 
     /// The first crate (its reader place) a question of this job asked whose record did not
@@ -489,14 +490,14 @@ impl<'n> Load<'n> for StoreLoad<'n> {
         self.texts.read(krate, &at)
     }
 
-    fn file_items(&self, krate: usize, index: u32, path: PackagePath<'_>, surface: ContentId, edition: blaze_surface::Edition, _: Alloc<'n>) -> Result<Option<CurrentFile<'n>>, ItemsRecordError> {
+    fn file_items(&self, krate: usize, index: u32, path: PackagePath<'_>, surface: ContentId, edition: blaze_surface::Edition, bump: Bump<'n>) -> Result<Option<CurrentFile<'n>>, ItemsRecordError> {
         let Some(package) = self.packages.get(krate) else { return Ok(None) };
         let Some(full) = path.in_package(package, self.alloc) else { return Ok(None) };
         let Some(text) = self.texts.read(krate, &full) else { return Ok(None) };
         // The outline planner covers checkout sources. The packed libraries and the
         // text-only driver supply immutable texts from which the view is made once.
         let (Some(outlines), Some(real)) = (self.outlines, full.strip_prefix("/0/")) else {
-            return CurrentFile::from_text(index, text, edition, self.alloc).map(Some);
+            return CurrentFile::from_text(index, text, edition, bump).map(Some);
         };
         // A physical x/mod.rs can be a literal file or the module slot x.rs.
         let locate = |slot: Name| outlines.binary_search_by_key(&slot, |one| one.name).ok()
@@ -593,7 +594,7 @@ mod tests {
     pub(super) fn solved() -> Names<'static> {
         let inputs = [input("app", "/0/app/lib.rs", &[("lib", 1)]), input("lib", "/1/lib/lib.rs", &[])];
         let sysroot = Sysroot { core: None, alloc: None, std: None, bstd: None };
-        let names = blaze_scope::resolve::resolve_crates(&inputs, sysroot, &Files, &blaze_scope::task::Serial, Alloc::global());
+        let names = blaze_scope::resolve::resolve_crates(&inputs, sysroot, &Files, &blaze_scope::task::Serial, blaze_own::testing::bump());
         names.unwrap_or_else(|e| panic!("the two crates' names: {e:?}"))
     }
 
@@ -667,11 +668,12 @@ mod tests {
         let payloads = payloads(&names);
         let frame = Frame::new(bstd::mem::Tag::Other).expect("a frame");
         let erased = blaze_own::Erased::new(&frame);
-        let g = erased.handle();
+        let bump = erased.bump();
+        let g = bump.alloc();
         let read: std::vec::Vec<_> = keys
             .iter()
             .zip(payloads.iter())
-            .map(|(key, payload)| crate_records(scope_name(*key), payload, *key, g).unwrap_or_else(|e| panic!("{e}")))
+            .map(|(key, payload)| crate_records(scope_name(*key), payload, *key, bump).unwrap_or_else(|e| panic!("{e}")))
             .collect();
         let packages = vec!["/"; read.len()];
         let snapshot = kept(&names, texts);
@@ -681,7 +683,7 @@ mod tests {
         let load: &StoreLoad<'_> = frame.alloc(StoreLoad::from_parts(&read, &packages, &Files, Some(&snapshot), None, None, g));
         let crate_names: std::vec::Vec<_> = names.crates().iter().map(|c| c.name).collect();
         let log: &Log<'_> = frame.alloc(Log::new(&crate_names, g));
-        let records = frame.alloc(Records::new(load.keys(g), load, log, &frame, g));
+        let records = frame.alloc(Records::new(load.keys(&frame), load, log, &frame, g));
         let over_store = answers(&*records);
         let unserved = load.unserved().to_vec();
         (solved_answers, over_store, log.is_empty(), unserved)
@@ -738,7 +740,7 @@ mod tests {
         let names = solved();
         let keys: std::vec::Vec<CrateItemKey> = names.crates().iter().map(|c| c.key).collect();
         let payloads = payloads(&names);
-        match crate_records(scope_name(keys[0]), &payloads[1], keys[0], Alloc::global()) {
+        match crate_records(scope_name(keys[0]), &payloads[1], keys[0], blaze_own::testing::bump()) {
             Err(LoadError::OtherCrate { asked, found, which: "names", .. }) => assert_eq!((asked, found), (keys[0], keys[1])),
             other => panic!("lib's record under app's key was {other:?}"),
         }
@@ -765,7 +767,7 @@ mod tests {
             let mut whole = std::vec::Vec::new();
             whole.extend_from_slice(&head);
             whole.extend_from_slice(payload);
-            let laid: &'static [u8] = blaze_scope::resolve::aligned(&whole, g);
+            let laid: &'static [u8] = blaze_scope::resolve::aligned(&whole, blaze_own::testing::bump());
             let record = Aligned16::new(laid).unwrap_or_else(|e| panic!("the laid record: {e}"));
             // Both routes open the same directory without reading the records it names.
             let read = open_record::<InPlace>(name, record, *key, &mut in_place, g).unwrap_or_else(|e| panic!("in place: {e}"));
@@ -828,7 +830,9 @@ mod tests {
         assert_eq!(name.kind, Kind::CrateScope);
         let at = Key(ContentId::of("blaze-cli front load test key", b"absent"));
         let input = Input { name, at, out: ContentId::of("blaze-cli front load test out", b"absent") };
-        match read_crate(&cx, &mut Empty, &input, key, Alloc::global()) {
+        let frame = Frame::new(bstd::mem::Tag::Other).expect("a frame");
+        let erased = blaze_own::Erased::new(&frame);
+        match read_crate(&cx, &mut Empty, &input, key, erased.bump()) {
             Err(error @ LoadError::NotInStore { .. }) => assert!(error.to_string().starts_with("not in the store: "), "{error}"),
             other => panic!("an empty store gave {other:?}"),
         }
@@ -863,7 +867,8 @@ mod tests {
     fn a_prelude_through_two_crates_globs_resolves_over_the_store() {
         let inputs = [input("app", "/0/app/lib.rs", &[]), input("std", "/1/std/lib.rs", &[("core", 2)]), input("core", "/2/core/lib.rs", &[])];
         let sysroot = Sysroot { core: Some(blaze_scope::graph::CrateId(2)), alloc: None, std: Some(blaze_scope::graph::CrateId(1)), bstd: None };
-        let names = blaze_scope::resolve::resolve_crates(&inputs, sysroot, &PreludeFiles, &blaze_scope::task::Serial, Alloc::global())
+        let b = blaze_own::testing::bump();
+        let names = blaze_scope::resolve::resolve_crates(&inputs, sysroot, &PreludeFiles, &blaze_scope::task::Serial, b)
             .unwrap_or_else(|e| panic!("the three crates' names: {e:?}"));
         let names: &'static Names<'static> = std::boxed::Box::leak(std::boxed::Box::new(names));
         let keys: std::vec::Vec<CrateItemKey> = names.crates().iter().map(|c| c.key).collect();
@@ -874,7 +879,7 @@ mod tests {
         let order = [0usize, 2, 1];
         let read: std::vec::Vec<CrateRecords<'static>> = order
             .iter()
-            .map(|at| crate_records(scope_name(keys[*at]), &payloads[*at], keys[*at], g).unwrap_or_else(|e| panic!("{e}")))
+            .map(|at| crate_records(scope_name(keys[*at]), &payloads[*at], keys[*at], b).unwrap_or_else(|e| panic!("{e}")))
             .collect();
         let read: &'static [CrateRecords<'static>] = std::vec::Vec::leak(read);
         let packages: &'static [&'static str] = std::vec::Vec::leak(order.iter().map(|_| "/").collect());
@@ -882,7 +887,7 @@ mod tests {
         let crate_names: &'static [&'static str] = std::vec::Vec::leak(order.iter().map(|at| &*std::string::String::from(names.crates()[*at].name).leak()).collect());
         let log: &'static Log<'static> = std::boxed::Box::leak(std::boxed::Box::new(Log::new(crate_names, g)));
         let frame: &'static Frame = std::boxed::Box::leak(std::boxed::Box::new(Frame::new(bstd::mem::Tag::Other).expect("a frame")));
-        let records: &'static Records<'static> = std::boxed::Box::leak(std::boxed::Box::new(Records::new(load.keys(g), load, log, frame, g)));
+        let records: &'static Records<'static> = std::boxed::Box::leak(std::boxed::Box::new(Records::new(load.keys(frame), load, log, frame, g)));
         let app = names.crates().iter().position(|c| c.name == "app").expect("the app crate");
         let stored_app = order.iter().position(|at| *at == app).expect("app among the readers");
         for word in ["Result", "Option"] {

@@ -45,7 +45,7 @@ pub(super) struct Groups {
 
 impl Groups {
     pub(super) fn solve(texts: &'static Texts) -> Groups {
-        let g = blaze_own::testing::heap().alloc();
+        let g = super::SyncFrame::leaked();
         let inputs = [input("k0", "/k0/lib.rs", &[])];
         let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), texts, &Grouped, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("solve: {e:?}"));
         let names = solved[0].names;

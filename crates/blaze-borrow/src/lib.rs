@@ -172,6 +172,8 @@ pub enum Head {
     Str,
     Never,
     Tuple,
+    Record,
+    Union,
     Ref,
     Ptr,
     Array,
@@ -199,7 +201,7 @@ pub enum Head {
 }
 
 impl Head {
-    pub const ALL: [Head; 32] = [
+    pub const ALL: [Head; 34] = [
         Head::Bool,
         Head::Char,
         Head::Int,
@@ -208,6 +210,8 @@ impl Head {
         Head::Str,
         Head::Never,
         Head::Tuple,
+        Head::Record,
+        Head::Union,
         Head::Ref,
         Head::Ptr,
         Head::Array,
@@ -249,6 +253,8 @@ impl Head {
             N::Str => Head::Str,
             N::Never => Head::Never,
             N::Tuple(_) => Head::Tuple,
+            N::Record(_) => Head::Record,
+            N::Union(_) => Head::Union,
             N::Ref(..) => Head::Ref,
             N::Ptr(..) => Head::Ptr,
             N::Array(..) => Head::Array,
@@ -285,6 +291,8 @@ impl Head {
             Head::Str => "str",
             Head::Never => "never",
             Head::Tuple => "tuple",
+            Head::Record => "record",
+            Head::Union => "union",
             Head::Ref => "ref",
             Head::Ptr => "ptr",
             Head::Array => "array",

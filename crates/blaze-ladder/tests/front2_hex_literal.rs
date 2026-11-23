@@ -363,7 +363,7 @@ struct CrateRecords<'a> {
 struct Saved<'a>(Vec<CrateRecords<'a>>);
 
 impl<'a> Saved<'a> {
-    fn new<'n: 'a>(names: &Names<'n>, keep: Alloc<'a>, scratch: Alloc<'_>) -> Self {
+    fn new<'n: 'a>(names: &Names<'n>, keep: blaze_own::Bump<'a>, scratch: Alloc<'_>) -> Self {
         Self(names.crates().iter().map(|c| CrateRecords {
             names: aligned(&names_record::encode(c, scratch).expect("names record"), keep),
             items: aligned(&items_record::encode_with(c, names, scratch).expect("items record"), keep),
@@ -417,7 +417,7 @@ enum Case {
     InvalidStrings,
 }
 
-fn check<'n, S: BodySource<'n>>(world: &mut ProjectWorld<'n, S>, provider: Provider, case: Case, label: &str, arena: Alloc<'n>) {
+fn check<'n, S: BodySource<'n>>(world: &mut ProjectWorld<'n, S>, provider: Provider, case: Case, label: &str, arena: blaze_own::Bump<'n>) {
     let names = world.front.names;
     let wrappers: &[&str] = match provider {
         Provider::HexLiteral => &[],
@@ -425,7 +425,7 @@ fn check<'n, S: BodySource<'n>>(world: &mut ProjectWorld<'n, S>, provider: Provi
     };
     let inbox = (provider == Provider::Alloy).then_some("inbox_token");
     for name in ["in_body", "BYTES", "STATIC_BYTES", "argument", "TWO_LITERALS"].into_iter().chain(inbox).chain(wrappers.iter().copied()) {
-        let result = world.check(BodyRef::Free(item(names, 0, &[name])), arena);
+        let result = world.check(BodyRef::Free(item(names, 0, &[name])), arena.alloc());
         match case {
             Case::Valid => assert!(result.is_clean() && result.undecided.is_empty(), "{label} {name}: {result:?}"),
             Case::Longer => {
@@ -633,16 +633,16 @@ fn fixture<'engine>(provider: Provider, dep: &str, case: Case, previous: Option<
     let solve_frame = Frame::new(Tag::Infer).expect("names frame");
     let texts = Files { app: &app, dep, frame: &solve_frame };
     let keep_names = blaze_own::Erased::new(&solve_frame);
-    let names = resolve_crates(crates, sysroot, &texts, &Serial, keep_names.handle()).expect("resolve app and dep");
+    let names = resolve_crates(crates, sysroot, &texts, &Serial, keep_names.bump()).expect("resolve app and dep");
     let sources = [SourceFile { path: "src/lib.rs", text: &app }];
     {
         let mut solved = ProjectWorld::new(&names, &solve_frame, &sources, alloc).expect("world over names");
-        check(&mut solved, provider, case, "names", keep_names.handle());
+        check(&mut solved, provider, case, "names", keep_names.bump());
     }
 
     let labels: Vec<_> = crates.iter().map(|c| c.name).collect();
     let keys: Vec<_> = crates.iter().map(|c| c.key).collect();
-    let saved = Saved::new(&names, keep_names.handle(), alloc);
+    let saved = Saved::new(&names, keep_names.bump(), alloc);
     let frame = Frame::new(Tag::Infer).expect("records frame");
     let keep_records = blaze_own::Erased::new(&frame);
     let arena = keep_records.handle();
@@ -680,7 +680,7 @@ fn fixture<'engine>(provider: Provider, dep: &str, case: Case, previous: Option<
             (dependency_definition(records, dep_index, key).cell, result.diagnostics.len())
         })
     });
-    check(&mut world, provider, case, "records", arena);
+    check(&mut world, provider, case, "records", keep_records.bump());
     assert!(records.errors().is_empty(), "record reads: {:?}", records.errors());
     request
 }

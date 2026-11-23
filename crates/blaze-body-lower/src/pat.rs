@@ -120,7 +120,10 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
                 let PNode::Tuple(l) = self.node(ty, At::Pat(p))? else { return self.refuse_pat(Construct::Malformed, p) };
                 let tys = self.list(l, At::Pat(p))?;
                 for (i, s) in self.positional(elems, rest, tys.len() as u32, p)? {
-                    out.push((i, s, tys[i as usize]));
+                    let Some(&ft) = tys.get(i as usize) else {
+                        return self.refuse_pat(Construct::Malformed, p);
+                    };
+                    out.push((i, s, ft));
                 }
                 Ok((place, false, out))
             }

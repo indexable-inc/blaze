@@ -38,7 +38,7 @@ use blaze_expand::{
     ReadKind, StreamError, TokenKind, TokenStream, attr_literal, call_key, expand, lex, write_token, write_tokens,
 };
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
-use blaze_own::{AString, AVec, Alloc, Box};
+use blaze_own::{AString, AVec, Alloc, BString, BVec, Bump};
 use blaze_surface::{Binding, CallShape, CrateRootBuilder, CrateRootHead, DefKind, Edition, Globs, MacroShapes, Namespace, RefusedWhy, ScopeBuilder};
 
 use crate::asked::Question;
@@ -233,12 +233,13 @@ pub(crate) fn value_rows<'a, C: ExpandCx>(
     built: &Built<'_, 'a>,
     cuts: &[((ItemKey, u32), u32)],
     cx_of: &dyn Fn(&ValueSite<'a>) -> C,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 ) -> AVec<'a, ValueRow<'a>> {
-    let mut sites: AVec<'a, ValueSite<'a>> = AVec::with_capacity_in(own.tables.values.len(), alloc);
+    let a = alloc.alloc();
+    let mut sites: AVec<'a, ValueSite<'a>> = AVec::with_capacity_in(own.tables.values.len(), a);
     sites.extend(own.tables.values.iter().copied());
     sites.sort_unstable_by(|a, b| (a.item, a.attr, a.value).cmp(&(b.item, b.attr, b.value)));
-    let mut rows: AVec<'a, ValueRow<'a>> = AVec::with_capacity_in(sites.len(), alloc);
+    let mut rows: AVec<'a, ValueRow<'a>> = AVec::with_capacity_in(sites.len(), a);
     let mut i = 0;
     while i < sites.len() {
         let site = sites[i];
@@ -261,28 +262,29 @@ pub(crate) fn value_rows<'a, C: ExpandCx>(
 }
 
 /// One site's row.
-fn value_of<'a, C: ExpandCx>(own: &CrateNames<'a>, built: &Built<'_, 'a>, cuts: &[((ItemKey, u32), u32)], cx: &C, site: ValueSite<'a>, alloc: Alloc<'a>) -> ValueRow<'a> {
+fn value_of<'a, C: ExpandCx>(own: &CrateNames<'a>, built: &Built<'_, 'a>, cuts: &[((ItemKey, u32), u32)], cx: &C, site: ValueSite<'a>, alloc: Bump<'a>) -> ValueRow<'a> {
     let Some(cut) = cuts.binary_search_by_key(&site.place, |c| c.0).ok().map(|i| cuts[i].1) else {
         let why = ValueRefused { item: site.item, attr: site.attr, why: ValueWhy::NoCut, form: site.value };
         return ValueRow { item: site.item, attr: site.attr, value: Err(why), reads: &[] };
     };
     let mut driver = Driver {
-        world: ValueWorld { own, built, module: site.module, cut, alloc },
+        world: ValueWorld { own, built, module: site.module, cut, alloc: alloc.alloc() },
+        bump: alloc,
         cx,
         edition: own.edition,
         item: site.item,
         attr: site.attr,
-        reads: AVec::new_in(alloc),
+        reads: BVec::new_in(alloc),
         form: site.value,
     };
     let value = driver.value(site);
-    let reads: &'a [ValueRead<'a>] = driver.reads.leak();
+    let reads: &'a [ValueRead<'a>] = driver.reads.into_bump_slice();
     ValueRow { item: site.item, attr: site.attr, value, reads }
 }
 
 /// `text` kept as long as `alloc`.
-fn keep<'a>(text: &str, alloc: Alloc<'a>) -> &'a str {
-    Box::leak(AString::from_str_in(text, alloc).into_boxed_str())
+fn keep<'a>(text: &str, alloc: Bump<'a>) -> &'a str {
+    alloc.alloc_str(text)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -512,12 +514,13 @@ struct CallAt {
 /// One site's expansion: its world, its host, and what it read so far.
 struct Driver<'q, 'r, 'a, C> {
     world: ValueWorld<'q, 'r, 'a>,
+    bump: Bump<'a>,
     cx: &'q C,
     /// The crate's edition: the site's tokens' and its calls'.
     edition: Edition,
     item: ItemKey,
     attr: &'static str,
-    reads: AVec<'a, ValueRead<'a>>,
+    reads: BVec<'a, ValueRead<'a>>,
     /// The last form reached, rendered.
     form: &'a str,
 }
@@ -598,7 +601,7 @@ impl<'q, 'r, 'a, C: ExpandCx> Driver<'q, 'r, 'a, C> {
     fn reached(&mut self, stream: &TokenStream<'_>) {
         let mut text = AString::new_in(self.alloc());
         write_tokens(stream, &mut text);
-        self.form = Box::leak(text.into_boxed_str());
+        self.form = self.bump.alloc_str(&text);
     }
 
     /// The site's value.
@@ -635,7 +638,7 @@ impl<'q, 'r, 'a, C: ExpandCx> Driver<'q, 'r, 'a, C> {
             TokenKind::Literal { kind: LitKind::Str | LitKind::StrRaw(_), suffix_len: 0, .. } => {
                 let mut text = AString::new_in(self.alloc());
                 write_token(stream, &token, &mut text);
-                attr_literal(&text, self.edition, self.alloc()).map_err(|_| self.refused(ValueWhy::Escape))
+                attr_literal(&text, self.edition, self.bump).map_err(|_| self.refused(ValueWhy::Escape))
             }
             TokenKind::Literal { kind: LitKind::Str | LitKind::StrRaw(_), .. } => Err(self.refused(ValueWhy::Suffixed)),
             _ => Err(self.refused(ValueWhy::NotAString)),
@@ -661,7 +664,7 @@ impl<'q, 'r, 'a, C: ExpandCx> Driver<'q, 'r, 'a, C> {
                 continue;
             }
             if let Some(TokenKind::Ident { .. }) = stream.tokens().get(i).map(|t| t.kind) {
-                segments.push(keep(stream.text_at(i), alloc));
+                segments.push(keep(stream.text_at(i), self.bump));
             }
             i += 1;
         }
@@ -722,9 +725,9 @@ impl<'q, 'r, 'a, C: ExpandCx> Driver<'q, 'r, 'a, C> {
             let definition = match definition_of(src, krate, runner, edition, CallShape::FnLike, alloc) {
                 Ok(definition) => definition,
                 Err(note) => {
-                    let mut text = AString::new_in(alloc);
+                    let mut text = BString::new_in(self.bump);
                     let _ = write!(text, "{note:?}");
-                    let note: &'a str = Box::leak(text.into_boxed_str());
+                    let note: &'a str = text.into_bump_str();
                     return Err(self.refused(ValueWhy::Definition { mac, note }));
                 }
             };
@@ -774,11 +777,11 @@ impl<'q, 'r, 'a, C: ExpandCx> Driver<'q, 'r, 'a, C> {
                 }
             };
             loop {
-                if let Some(failed) = Failed::of(&expansion, alloc) {
+                if let Some(failed) = Failed::of(&expansion, self.bump) {
                     return Err(self.refused(ValueWhy::Failed { mac: finished_mac, failed }));
                 }
                 for read in expansion.reads.list() {
-                    let subject = keep(expansion.reads.subject(read), alloc);
+                    let subject = keep(expansion.reads.subject(read), self.bump);
                     self.read(ValueRead::Host { kind: read.kind, subject, answer: read.answer });
                 }
                 let mut tokens = expansion.tokens;
@@ -875,7 +878,8 @@ mod tests {
 
     /// `text` solved as crate `ring` of package version `version`.
     fn solved(text: &'static str, version: &'static str) -> &'static CrateNames<'static> {
-        let alloc: Alloc<'static> = blaze_own::testing::heap().alloc();
+        let bump = crate::tests::SyncFrame::leaked();
+        let alloc: Alloc<'static> = bump.alloc();
         let facts = EnvFacts {
             crate_name: "ring",
             package: Some(("ring", version)),
@@ -901,7 +905,7 @@ mod tests {
             cfg: &[],
             script: None,
         };
-        let names = resolve_crates(&[input], Sysroot::default(), &sources, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let names = resolve_crates(&[input], Sysroot::default(), &sources, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
         names.crates()[0]
     }
 
@@ -1082,9 +1086,10 @@ mod tests {
     /// The items record of `c`, written and opened in place: the bytes its `CrateScope` record
     /// files, and the record a reader over records opens of them.
     fn items_record_of(c: &'static CrateNames<'static>) -> (&'static [u8], crate::items_record::ItemsRecord<'static>) {
-        let alloc: Alloc<'static> = blaze_own::testing::heap().alloc();
+        let bump = crate::tests::SyncFrame::leaked();
+        let alloc: Alloc<'static> = bump.alloc();
         let written = crate::items_record::encode(c, alloc).unwrap_or_else(|e| panic!("the items record was not written: {e:?}"));
-        let bytes = crate::resolve::aligned(&written, alloc);
+        let bytes = crate::resolve::aligned(&written, bump);
         let record = crate::items_record::ItemsRecord::open(bytes, alloc).unwrap_or_else(|e| panic!("the items record does not open: {e:?}"));
         (bytes, record)
     }
@@ -1132,10 +1137,13 @@ mod tests {
     #[test]
     fn an_item_cell_moves_with_its_value_alone() {
         fn item_cell(c: &'static CrateNames<'static>, key: ItemKey) -> Option<ContentId> {
-            let alloc: Alloc<'static> = blaze_own::testing::heap().alloc();
+            let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+            let erased = blaze_own::Erased::new(&frame);
+            let bump = erased.bump();
+            let alloc = bump.alloc();
             let names = crate::names_record::encode(c, alloc).unwrap_or_else(|e| panic!("the names record was not written: {e:?}"));
             let items = crate::items_record::encode(c, alloc).unwrap_or_else(|e| panic!("the items record was not written: {e:?}"));
-            let table = crate::names_cells::crate_table(c, &names, &items, &[], alloc).unwrap_or_else(|e| panic!("the cell table: {e:?}"));
+            let table = crate::names_cells::crate_table(c, &names, &items, &[], bump).unwrap_or_else(|e| panic!("the cell table: {e:?}"));
             crate::names_cells::seen_in(&table, crate::names_cells::NameCell::Item { key }.key()).unwrap_or_else(|e| panic!("the `Item` cell: {e:?}"))
         }
         let text: &'static str = std::boxed::Box::leak(std::format!("{RING}pub fn plain() {{}}\n").into_boxed_str());

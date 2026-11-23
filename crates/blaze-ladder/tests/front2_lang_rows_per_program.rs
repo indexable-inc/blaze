@@ -96,7 +96,7 @@ fn names() -> &'static Names<'static> {
         input("bin_c", "/bin_c/main.rs", &[("alloc_lib", 4)]),
         input("alloc_lib", "/alloc_lib/lib.rs", &[]),
     ];
-    let names = resolve_crates(&crates, Sysroot::default(), &Texts, &Serial, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &Texts, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     Box::leak(Box::new(names))
 }
 
@@ -191,7 +191,7 @@ fn the_macro_side_is_not_joined_into_the_target_program() {
         input("wasm_core", "/wasm_core/lib.rs", &[]),
     ];
     let names: &'static Names<'static> = Box::leak(Box::new(
-        resolve_crates(&crates, Sysroot::default(), &Sides, &Serial, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("resolve_crates: {e}")),
+        resolve_crates(&crates, Sysroot::default(), &Sides, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}")),
     ));
     let alloc = blaze_own::testing::heap().alloc();
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");

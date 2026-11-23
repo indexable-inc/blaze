@@ -48,7 +48,7 @@ fn flow_census_core() {
     let user = UserCrate { name: "probe", dir: "/probe/", root: "/probe/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, a).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let cname = want.as_deref().unwrap_or("core");
     let krate = crates.iter().position(|c| c.name == cname).unwrap_or_else(|| panic!("no crate named `{cname}` among the probe's crates (FLOW_CENSUS_CRATE)"));
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];

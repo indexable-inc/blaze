@@ -24,7 +24,7 @@ fn heap() -> Heap {
 
 /// A capture that lives as long as the test binary, in the test's heap: what a sink must be.
 fn capture() -> &'static Capture<Counter, Heap> {
-    blaze_own::Box::leak(blaze_own::Box::new_in(Capture::new(Counter::new(), heap()), heap()))
+    blaze_own::Box::leak_static(blaze_own::Box::new_in(Capture::new(Counter::new(), heap()), heap()))
 }
 
 /// A field's text as the capture keeps it.
@@ -150,7 +150,7 @@ impl Sink for NeverLeaves {
 #[test]
 fn the_oracle_catches_a_sink_that_never_leaves_a_span() {
     let never: &'static NeverLeaves =
-        blaze_own::Box::leak(blaze_own::Box::new_in(NeverLeaves(Capture::new(Counter::new(), heap())), heap()));
+        blaze_own::Box::leak_static(blaze_own::Box::new_in(NeverLeaves(Capture::new(Counter::new(), heap())), heap()));
     crate::with_thread_sink(never, nest);
     let found = nested(&never.0.records()).unwrap_err();
     assert!(found.contains("after inner") || found.contains("event "), "{found}");
@@ -320,7 +320,7 @@ fn edges_nest(entries: &[record::Entry]) -> Result<(), String> {
 #[test]
 fn the_rings_hold_each_edge_and_field_as_written() {
     let rings: &'static record::Rings =
-        blaze_own::Box::leak(blaze_own::Box::new_in(record::Rings::new_in(8, 256, heap()).unwrap(), heap()));
+        blaze_own::Box::leak_static(blaze_own::Box::new_in(record::Rings::new_in(8, 256, heap()).unwrap(), heap()));
     crate::install_rings(crate::RingConfig {
         rings,
         wants: |meta| meta.target() == RING_TARGET,

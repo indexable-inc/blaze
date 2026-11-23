@@ -1288,7 +1288,13 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
     /// The ground type of field `field` (of the variant's own numbering) of ADT or tuple `t`.
     fn field_ty(&mut self, t: PTy, variant: u32, field: u32) -> R<'a, PTy> {
         match self.node(t)? {
-            PNode::Tuple(l) => self.ground.view().list(l).ok().and_then(|l| l.get(field as usize).copied()).ok_or(malformed("a tuple field past its tuple")),
+            PNode::Tuple(l) | PNode::Record(l) => self
+                .ground
+                .view()
+                .list(l)
+                .ok()
+                .and_then(|l| usize::try_from(field).ok().and_then(|i| l.get(i).copied()))
+                .ok_or(malformed("a tuple field past its tuple")),
             PNode::Adt(key, args) => {
                 let adt = self.world.adt(key).ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: key }))?;
                 let v = adt.variants.get(variant as usize).ok_or(malformed("a variant past its ADT"))?;
@@ -2167,7 +2173,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                         }
                     }
                 }
-                PNode::Tuple(l) => {
+                PNode::Tuple(l) | PNode::Record(l) => {
                     let len = self.ground.view().list(l).map_err(|_| malformed("a list past the ground table"))?.len() as u32;
                     for f in 0..len {
                         let (off, ft) = (self.field_offset(ty, 0, f)?, self.field_ty(ty, 0, f)?);

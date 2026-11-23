@@ -1482,10 +1482,14 @@ fn named_in_bounds((v, scope, alloc): (&View<'_>, &Scope, Mem), bounds: lf::List
                         todo.push(Work::Ty(read(lf::Field::decode(n), "a record's field")?.ty, in_fn));
                     }
                 }
-                lf::TypeRef::Tuple(l) => {
+                lf::TypeRef::Tuple(l) | lf::TypeRef::Union(l) => {
                     for &id in read(v.ids(l), "a tuple's elements")? {
                         todo.push(Work::Ty(lf::TypeId(id), in_fn));
                     }
+                }
+                lf::TypeRef::Fallible { ok, err } => {
+                    todo.push(Work::Ty(ok, in_fn));
+                    todo.push(Work::Ty(err, in_fn));
                 }
                 lf::TypeRef::For { binder, inner } => {
                     binder_names(binder, &mut bound_here)?;

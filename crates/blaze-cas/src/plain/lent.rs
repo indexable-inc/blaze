@@ -29,7 +29,7 @@ use blaze_mem::Kept;
 use blaze_own::Arc;
 
 use super::arena::{Arena, ArenaView, RunEntry, Visibility};
-use super::core::{Batch, Committed, LentRecord, Named, POINTER_LEN, Probes, PutPath, Report, Sliced};
+use super::core::{Batch, Committed, LentRecord, Named, POINTER_LEN, Probes, PutPath, Renewed, Report, Sliced};
 use super::driven::Driven;
 use super::format::record_crc;
 use crate::Key;
@@ -1092,6 +1092,18 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// The record the root `name` names unexpired (`Plain::root_named`).
     pub fn root_named(&self, name: &str) -> Option<Key> {
         self.inner.borrow().store.core().root_named(name)
+    }
+
+    /// O(1) lease renewal for an already-live root `name` ([`Plain::renew_root`]): refreshes the
+    /// lease without reading, probing, sorting, or hashing the keys it holds.
+    pub fn renew_root(&self, name: &str, life_ns: u64) -> Renewed {
+        self.inner.borrow_mut().store.renew_root(name, life_ns)
+    }
+
+    /// O(segments + roots + retired) check of whether compaction or GC housekeeping is due at
+    /// `now_ns` ([`Plain::needs_housekeeping`]).
+    pub fn needs_housekeeping(&self, now_ns: u64) -> bool {
+        self.inner.borrow().store.needs_housekeeping(now_ns)
     }
 
     /// The roots this process set and the keys they name (`Plain::named`).

@@ -52,7 +52,7 @@ fn a_proc_macro_without_the_wasm_side_is_refused_by_name() {
     {
         let texts = Texts::of(&uncut);
         let inputs = uncut.inputs();
-        let names = resolve_crates(&inputs, uncut.sysroot, &texts, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let names = resolve_crates(&inputs, uncut.sysroot, &texts, &Serial, crate::tests::SyncFrame::leaked()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
         assert_eq!(seen(&names, pm, "Expr"), Err(Why::NotFound), "unread, the refusal is NotFound at segment 0");
     }
 
@@ -64,6 +64,6 @@ fn a_proc_macro_without_the_wasm_side_is_refused_by_name() {
     let side_dep = index_of(&cut, "dep", pm + 1);
     let inputs = cut.checked_inputs().unwrap_or_else(|r| panic!("with the side, nothing is refused: {}", r.why));
     let texts = Texts::of(&cut);
-    let names = resolve_crates(&inputs, cut.sysroot, &texts, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&inputs, cut.sysroot, &texts, &Serial, crate::tests::SyncFrame::leaked()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     assert_eq!(seen(&names, pm, "Expr"), Ok(side_dep), "`dep::Expr` in the proc macro: the macro side's dep");
 }

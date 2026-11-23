@@ -1124,9 +1124,17 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             lf::TypeRef::Ref { mutbl, .. } => intern(tys, PNode::Ref(mutbl, kids[0])),
             lf::TypeRef::Ptr { mutbl, .. } => intern(tys, PNode::Ptr(mutbl, kids[0])),
             lf::TypeRef::Slice(_) => intern(tys, PNode::Slice(kids[0])),
-            lf::TypeRef::Tuple(_) | lf::TypeRef::Record(_) => {
+            lf::TypeRef::Tuple(_) | lf::TypeRef::Fallible { .. } => {
                 let l = intern_list(tys, kids)?;
                 intern(tys, PNode::Tuple(l))
+            }
+            lf::TypeRef::Record(_) => {
+                let l = intern_list(tys, kids)?;
+                intern(tys, PNode::Record(l))
+            }
+            lf::TypeRef::Union(_) => {
+                let l = intern_list(tys, kids)?;
+                intern(tys, PNode::Union(l))
             }
             lf::TypeRef::Never => intern(tys, PNode::Never),
             lf::TypeRef::Infer => intern(tys, PNode::Infer),
@@ -1829,7 +1837,11 @@ pub(super) fn children(v: &View<'_>, t: lf::TypeId, out: &mut Vec<lf::TypeId, Gl
     match v.ty(t)? {
         lf::TypeRef::Ref { inner, .. } | lf::TypeRef::Ptr { inner, .. } | lf::TypeRef::Slice(inner) => out.push(inner),
         lf::TypeRef::Array { elem, .. } => out.push(elem),
-        lf::TypeRef::Tuple(l) => out.extend(v.ids(l)?.iter().map(|&i| lf::TypeId(i))),
+        lf::TypeRef::Tuple(l) | lf::TypeRef::Union(l) => out.extend(v.ids(l)?.iter().map(|&i| lf::TypeId(i))),
+        lf::TypeRef::Fallible { ok, err } => {
+            out.push(ok);
+            out.push(err);
+        }
         lf::TypeRef::Path(p) => {
             let path = v.path(p)?;
             for &n in v.segments(path)? {
@@ -2192,6 +2204,13 @@ pub enum NotLaidWhy {
     Unlisted,
 }
 
+#[derive(Clone, Copy)]
+struct NotLaidInfo {
+    byte: u8,
+    name: &'static str,
+    text: &'static str,
+}
+
 impl NotLaidWhy {
     /// Every cause, in byte order.
     pub const ALL: [NotLaidWhy; 36] = [
@@ -2233,46 +2252,51 @@ impl NotLaidWhy {
         NotLaidWhy::Unlisted,
     ];
 
+    const fn info(self) -> NotLaidInfo {
+        let (byte, name, text) = match self {
+            NotLaidWhy::Stack => (0, "Stack", "a type whose children's region slots are not where the walk left them (a producer's bug)"),
+            NotLaidWhy::OutOfStep => (1, "OutOfStep", "a type whose region walk is out of step with its made type (a producer's bug)"),
+            NotLaidWhy::TooMany => (2, "TooMany", "a written type whose region slots pass a u32 count"),
+            NotLaidWhy::Resolve => (3, "Resolve", "a path the region walk did not resolve as the type walk did"),
+            NotLaidWhy::DeclaredCount => (4, "DeclaredCount", "a declared lifetime count (an ADT's, a trait's or an associated type's) the names do not hold"),
+            NotLaidWhy::FnPtrElision => (5, "FnPtrElision", "a fn pointer's or `Fn(..)` sugar's return type elides a lifetime its inputs do not give exactly one of (rustc: E0106)"),
+            NotLaidWhy::ForBinder => (6, "ForBinder", "a `for<..>` binder over a type that is no fn pointer"),
+            NotLaidWhy::OpaqueCaptures => (7, "OpaqueCaptures", "a return `impl Trait` whose captured lifetimes its rule or `use<..>` did not decide"),
+            NotLaidWhy::OpaqueElided => (8, "OpaqueElided", "`'_` in a return `impl Trait`'s bound, and the inputs give no single lifetime for it (rustc: E0106)"),
+            NotLaidWhy::Infer => (9, "Infer", "`_` in a declared type"),
+            NotLaidWhy::TypeMacro => (10, "TypeMacro", "a type macro's expansion"),
+            NotLaidWhy::OtherForm => (11, "OtherForm", "a type form the region walk has no step for"),
+            NotLaidWhy::QualifiedNoTrait => (12, "QualifiedNoTrait", "a qualified path `<T>::Name` with no trait whose projection holds a lifetime, or whose trait is no path"),
+            NotLaidWhy::QualifiedTraitLifetimes => (13, "QualifiedTraitLifetimes", "a qualified path `<T as Tr<'a>>::Name` whose trait declares a lifetime"),
+            NotLaidWhy::OneNameArgs => (14, "OneNameArgs", "a one-name type argument whose own arguments hold a lifetime"),
+            NotLaidWhy::EarlySegmentLifetime => (15, "EarlySegmentLifetime", "a lifetime argument on a path's segment before its last"),
+            NotLaidWhy::ProjectionPath => (16, "ProjectionPath", "a projection path read through no bound whose arguments or trait hold a lifetime"),
+            NotLaidWhy::SelfUnknown => (17, "SelfUnknown", "`Self`'s regions, not known where this type is written"),
+            NotLaidWhy::DefaultArg => (18, "DefaultArg", "a defaulted type argument that holds a lifetime"),
+            NotLaidWhy::AliasUnmade => (19, "AliasUnmade", "a type alias whose head is not made"),
+            NotLaidWhy::AliasRegions => (20, "AliasRegions", "a type alias whose type holds a lifetime its head did not lay"),
+            NotLaidWhy::PathRegion => (21, "PathRegion", "a path whose made type holds a region the walk does not place"),
+            NotLaidWhy::SelfSupertrait => (22, "SelfSupertrait", "`Self::Name` of a supertrait whose trait holds a lifetime"),
+            NotLaidWhy::ImplTraitLifetimes => (23, "ImplTraitLifetimes", "`Self::Name` in an impl whose trait holds a lifetime, where the header's trait lifetimes are not known"),
+            NotLaidWhy::ProjectionHigherRanked => (24, "ProjectionHigherRanked", "a projection read through a `for<..>` bound or where clause"),
+            NotLaidWhy::ProjectionBoundElsewhere => (25, "ProjectionBoundElsewhere", "a projection `T::Name` whose trait holds a lifetime and no bound on `T` in this item names (a supertrait's or the container's)"),
+            NotLaidWhy::ProjectionTwoBounds => (26, "ProjectionTwoBounds", "a projection whose parameter has two bounds naming its trait"),
+            NotLaidWhy::ProjectionBoundArgs => (27, "ProjectionBoundArgs", "a projection whose bound's type arguments hold a lifetime"),
+            NotLaidWhy::ProjectionElidedBound => (28, "ProjectionElidedBound", "an elided lifetime in the bound a projection is read through"),
+            NotLaidWhy::DynLifetimes => (29, "DynLifetimes", "a trait object with more than one lifetime bound"),
+            NotLaidWhy::DynRegion => (30, "DynRegion", "a region position in a trait object no written lifetime gives"),
+            NotLaidWhy::BoundVariable => (31, "BoundVariable", "a bound lifetime of a fn pointer or trait object where the walk does not place it"),
+            NotLaidWhy::ContainerDisagree => (32, "ContainerDisagree", "a member whose container's lifetime group and its lifetimes' names disagree (D148)"),
+            NotLaidWhy::AsyncCount => (33, "AsyncCount", "an `async fn`'s future whose in-scope lifetimes were not counted"),
+            NotLaidWhy::ElidedOutput => (34, "ElidedOutput", "an elided lifetime of the output the inputs' group does not hold"),
+            NotLaidWhy::Unlisted => (35, "Unlisted", "a written type the head's walk did not lay"),
+        };
+        NotLaidInfo { byte, name, text }
+    }
+
     /// Its byte in a record: its index in [`NotLaidWhy::ALL`].
     pub const fn byte(self) -> u8 {
-        match self {
-            NotLaidWhy::Stack => 0,
-            NotLaidWhy::OutOfStep => 1,
-            NotLaidWhy::TooMany => 2,
-            NotLaidWhy::Resolve => 3,
-            NotLaidWhy::DeclaredCount => 4,
-            NotLaidWhy::FnPtrElision => 5,
-            NotLaidWhy::ForBinder => 6,
-            NotLaidWhy::OpaqueCaptures => 7,
-            NotLaidWhy::OpaqueElided => 8,
-            NotLaidWhy::Infer => 9,
-            NotLaidWhy::TypeMacro => 10,
-            NotLaidWhy::OtherForm => 11,
-            NotLaidWhy::QualifiedNoTrait => 12,
-            NotLaidWhy::QualifiedTraitLifetimes => 13,
-            NotLaidWhy::OneNameArgs => 14,
-            NotLaidWhy::EarlySegmentLifetime => 15,
-            NotLaidWhy::ProjectionPath => 16,
-            NotLaidWhy::SelfUnknown => 17,
-            NotLaidWhy::DefaultArg => 18,
-            NotLaidWhy::AliasUnmade => 19,
-            NotLaidWhy::AliasRegions => 20,
-            NotLaidWhy::PathRegion => 21,
-            NotLaidWhy::SelfSupertrait => 22,
-            NotLaidWhy::ImplTraitLifetimes => 23,
-            NotLaidWhy::ProjectionHigherRanked => 24,
-            NotLaidWhy::ProjectionBoundElsewhere => 25,
-            NotLaidWhy::ProjectionTwoBounds => 26,
-            NotLaidWhy::ProjectionBoundArgs => 27,
-            NotLaidWhy::ProjectionElidedBound => 28,
-            NotLaidWhy::DynLifetimes => 29,
-            NotLaidWhy::DynRegion => 30,
-            NotLaidWhy::BoundVariable => 31,
-            NotLaidWhy::ContainerDisagree => 32,
-            NotLaidWhy::AsyncCount => 33,
-            NotLaidWhy::ElidedOutput => 34,
-            NotLaidWhy::Unlisted => 35,
-        }
+        self.info().byte
     }
 
     /// The cause of byte `b`, or `None` for a byte no cause writes.
@@ -2282,86 +2306,12 @@ impl NotLaidWhy {
 
     /// Its variant's name: the short class a refusal is counted by (`[NotLaid/<name>/..]`).
     pub const fn name(self) -> &'static str {
-        match self {
-            NotLaidWhy::Stack => "Stack",
-            NotLaidWhy::OutOfStep => "OutOfStep",
-            NotLaidWhy::TooMany => "TooMany",
-            NotLaidWhy::Resolve => "Resolve",
-            NotLaidWhy::DeclaredCount => "DeclaredCount",
-            NotLaidWhy::FnPtrElision => "FnPtrElision",
-            NotLaidWhy::ForBinder => "ForBinder",
-            NotLaidWhy::OpaqueCaptures => "OpaqueCaptures",
-            NotLaidWhy::OpaqueElided => "OpaqueElided",
-            NotLaidWhy::Infer => "Infer",
-            NotLaidWhy::TypeMacro => "TypeMacro",
-            NotLaidWhy::OtherForm => "OtherForm",
-            NotLaidWhy::QualifiedNoTrait => "QualifiedNoTrait",
-            NotLaidWhy::QualifiedTraitLifetimes => "QualifiedTraitLifetimes",
-            NotLaidWhy::OneNameArgs => "OneNameArgs",
-            NotLaidWhy::EarlySegmentLifetime => "EarlySegmentLifetime",
-            NotLaidWhy::ProjectionPath => "ProjectionPath",
-            NotLaidWhy::SelfUnknown => "SelfUnknown",
-            NotLaidWhy::DefaultArg => "DefaultArg",
-            NotLaidWhy::AliasUnmade => "AliasUnmade",
-            NotLaidWhy::AliasRegions => "AliasRegions",
-            NotLaidWhy::PathRegion => "PathRegion",
-            NotLaidWhy::SelfSupertrait => "SelfSupertrait",
-            NotLaidWhy::ImplTraitLifetimes => "ImplTraitLifetimes",
-            NotLaidWhy::ProjectionHigherRanked => "ProjectionHigherRanked",
-            NotLaidWhy::ProjectionBoundElsewhere => "ProjectionBoundElsewhere",
-            NotLaidWhy::ProjectionTwoBounds => "ProjectionTwoBounds",
-            NotLaidWhy::ProjectionBoundArgs => "ProjectionBoundArgs",
-            NotLaidWhy::ProjectionElidedBound => "ProjectionElidedBound",
-            NotLaidWhy::DynLifetimes => "DynLifetimes",
-            NotLaidWhy::DynRegion => "DynRegion",
-            NotLaidWhy::BoundVariable => "BoundVariable",
-            NotLaidWhy::ContainerDisagree => "ContainerDisagree",
-            NotLaidWhy::AsyncCount => "AsyncCount",
-            NotLaidWhy::ElidedOutput => "ElidedOutput",
-            NotLaidWhy::Unlisted => "Unlisted",
-        }
+        self.info().name
     }
 
     /// What a person reads (rule 19): the region position, in Rust's words.
     pub const fn text(self) -> &'static str {
-        match self {
-            NotLaidWhy::Stack => "a type whose children's region slots are not where the walk left them (a producer's bug)",
-            NotLaidWhy::OutOfStep => "a type whose region walk is out of step with its made type (a producer's bug)",
-            NotLaidWhy::TooMany => "a written type whose region slots pass a u32 count",
-            NotLaidWhy::Resolve => "a path the region walk did not resolve as the type walk did",
-            NotLaidWhy::DeclaredCount => "a declared lifetime count (an ADT's, a trait's or an associated type's) the names do not hold",
-            NotLaidWhy::FnPtrElision => "a fn pointer's or `Fn(..)` sugar's return type elides a lifetime its inputs do not give exactly one of (rustc: E0106)",
-            NotLaidWhy::ForBinder => "a `for<..>` binder over a type that is no fn pointer",
-            NotLaidWhy::OpaqueCaptures => "a return `impl Trait` whose captured lifetimes its rule or `use<..>` did not decide",
-            NotLaidWhy::OpaqueElided => "`'_` in a return `impl Trait`'s bound, and the inputs give no single lifetime for it (rustc: E0106)",
-            NotLaidWhy::Infer => "`_` in a declared type",
-            NotLaidWhy::TypeMacro => "a type macro's expansion",
-            NotLaidWhy::OtherForm => "a type form the region walk has no step for",
-            NotLaidWhy::QualifiedNoTrait => "a qualified path `<T>::Name` with no trait whose projection holds a lifetime, or whose trait is no path",
-            NotLaidWhy::QualifiedTraitLifetimes => "a qualified path `<T as Tr<'a>>::Name` whose trait declares a lifetime",
-            NotLaidWhy::OneNameArgs => "a one-name type argument whose own arguments hold a lifetime",
-            NotLaidWhy::EarlySegmentLifetime => "a lifetime argument on a path's segment before its last",
-            NotLaidWhy::ProjectionPath => "a projection path read through no bound whose arguments or trait hold a lifetime",
-            NotLaidWhy::SelfUnknown => "`Self`'s regions, not known where this type is written",
-            NotLaidWhy::DefaultArg => "a defaulted type argument that holds a lifetime",
-            NotLaidWhy::AliasUnmade => "a type alias whose head is not made",
-            NotLaidWhy::AliasRegions => "a type alias whose type holds a lifetime its head did not lay",
-            NotLaidWhy::PathRegion => "a path whose made type holds a region the walk does not place",
-            NotLaidWhy::SelfSupertrait => "`Self::Name` of a supertrait whose trait holds a lifetime",
-            NotLaidWhy::ImplTraitLifetimes => "`Self::Name` in an impl whose trait holds a lifetime, where the header's trait lifetimes are not known",
-            NotLaidWhy::ProjectionHigherRanked => "a projection read through a `for<..>` bound or where clause",
-            NotLaidWhy::ProjectionBoundElsewhere => "a projection `T::Name` whose trait holds a lifetime and no bound on `T` in this item names (a supertrait's or the container's)",
-            NotLaidWhy::ProjectionTwoBounds => "a projection whose parameter has two bounds naming its trait",
-            NotLaidWhy::ProjectionBoundArgs => "a projection whose bound's type arguments hold a lifetime",
-            NotLaidWhy::ProjectionElidedBound => "an elided lifetime in the bound a projection is read through",
-            NotLaidWhy::DynLifetimes => "a trait object with more than one lifetime bound",
-            NotLaidWhy::DynRegion => "a region position in a trait object no written lifetime gives",
-            NotLaidWhy::BoundVariable => "a bound lifetime of a fn pointer or trait object where the walk does not place it",
-            NotLaidWhy::ContainerDisagree => "a member whose container's lifetime group and its lifetimes' names disagree (D148)",
-            NotLaidWhy::AsyncCount => "an `async fn`'s future whose in-scope lifetimes were not counted",
-            NotLaidWhy::ElidedOutput => "an elided lifetime of the output the inputs' group does not hold",
-            NotLaidWhy::Unlisted => "a written type the head's walk did not lay",
-        }
+        self.info().text
     }
 }
 
@@ -2883,7 +2833,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     let own = lifetime_kind(v, lifetime, r, s)?;
                     s.wrap(n, Some(own))
                 }
-                lf::TypeRef::Ptr { .. } | lf::TypeRef::Slice(_) | lf::TypeRef::Array { .. } | lf::TypeRef::Pat { .. } | lf::TypeRef::Tuple(_) | lf::TypeRef::Record(_) | lf::TypeRef::Never => s.wrap(n, None),
+                lf::TypeRef::Ptr { .. } | lf::TypeRef::Slice(_) | lf::TypeRef::Array { .. } | lf::TypeRef::Pat { .. } | lf::TypeRef::Tuple(_) | lf::TypeRef::Record(_) | lf::TypeRef::Union(_) | lf::TypeRef::Fallible { .. } | lf::TypeRef::Never => s.wrap(n, None),
                 lf::TypeRef::FnPtr { ret, .. } => s.fn_ptr(n, ret.is_some(), r)?,
                 lf::TypeRef::For { binder, .. } => s.for_binder(tys.view(), v, binder, made, r)?,
                 lf::TypeRef::Path(p) => self.path_regions(tys, env, v, p, made, args, n, s, r)?,

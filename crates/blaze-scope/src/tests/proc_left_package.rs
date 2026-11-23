@@ -145,7 +145,7 @@ fn crates() -> [CrateInput<'static>; 2] {
 /// One solve: the findings told during it, sorted by macro and file read (the order calls are
 /// expanded in is the solve's, not the rule's) and without repeats (the host may be asked
 /// twice for one call; blaze-cli's `include_outside::findings` drops repeats the same way).
-fn solve(sources: &'static Workspace, alloc: Alloc<'static>) -> Vec<Told> {
+fn solve(sources: &'static Workspace, alloc: blaze_own::Bump<'static>) -> Vec<Told> {
     let crates = crates();
     resolve_crates(&crates, Sysroot::default(), sources, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let mut told = core::mem::take(&mut *sources.told.lock().unwrap_or_else(|p| panic!("told: {p}")));
@@ -156,7 +156,8 @@ fn solve(sources: &'static Workspace, alloc: Alloc<'static>) -> Vec<Told> {
 
 #[test]
 fn a_member_macro_s_read_outside_its_dir_is_a_finding_the_same_from_a_kept_answer() {
-    let alloc: Alloc<'static> = blaze_own::testing::heap().alloc();
+    let bump = super::SyncFrame::leaked();
+    let alloc: Alloc<'static> = bump.alloc();
     let facts = EnvFacts {
         crate_name: "user",
         package: Some(("user", "0.1.0")),
@@ -172,7 +173,7 @@ fn a_member_macro_s_read_outside_its_dir_is_a_finding_the_same_from_a_kept_answe
     let env = CrateEnv::of(facts, alloc).unwrap_or_else(|e| panic!("the member's environment: {e:?}"));
     let sources: &'static Workspace = std::boxed::Box::leak(std::boxed::Box::new(Workspace { env, runs: AtomicUsize::new(0), kept: Mutex::new(Vec::new()), told: Mutex::new(Vec::new()) }));
 
-    let ran = solve(sources, alloc);
+    let ran = solve(sources, bump);
     assert_eq!(sources.runs.load(Ordering::Relaxed), 2, "the first solve runs both macros");
     let paths: Vec<(&str, CallShape, &str)> = ran.iter().map(|(_, _, call, shape, path)| (call.as_str(), *shape, path.as_str())).collect();
     assert_eq!(
@@ -182,7 +183,7 @@ fn a_member_macro_s_read_outside_its_dir_is_a_finding_the_same_from_a_kept_answe
     );
     assert!(ran.iter().all(|(from, _, _, _, _)| from == "/0/crates/m/src/lib.rs"), "placed in the calling file: {ran:?}");
 
-    let kept = solve(sources, alloc);
+    let kept = solve(sources, bump);
     assert_eq!(sources.runs.load(Ordering::Relaxed), 2, "the second solve runs nothing: both answers are kept");
     assert_eq!(kept, ran, "a kept answer gives the finding the run gave");
 
