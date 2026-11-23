@@ -145,6 +145,18 @@ impl<'f> Lockfile<'f> {
         })
     }
 
+    /// Short human-readable crate or repository name for a `Fetch` task (for live status display).
+    pub(crate) fn display_name(&self, name: Name) -> Option<&str> {
+        let at = usize::try_from(fetch_task::unit_of(&self.index, name)?).ok()?;
+        match self.units.get(at)? {
+            Unit::Crate { name, .. } => Some(name),
+            Unit::Git { repo, .. } => {
+                let trimmed = repo.trim_end_matches('/').trim_end_matches(".git");
+                Some(trimmed.rsplit('/').next().unwrap_or(trimmed))
+            }
+        }
+    }
+
     /// The units of the `Fetch` subjects a level of the graph asked for, wanted of the
     /// command's machine at once, before their tasks run one after another: each task then
     /// steps the machine, so the level's fetches overlap up to its in-flight limit. Nothing is

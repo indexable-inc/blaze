@@ -941,6 +941,43 @@ impl<'f> ScriptsStage<'f> {
         self.dispatch(cx, store, handles, names, queue, frame)
     }
 
+    /// Human-readable task label and [`blaze_screen::WorkKind`] for the live inline status UI.
+    fn status_info(&self, name: Name, job: Option<&ScriptWork<'_>>) -> (blaze_screen::WorkKind, crate::engine_status::Label) {
+        use core::fmt::Write as _;
+        match name.kind {
+            Kind::Given => (blaze_screen::WorkKind::BuildScript, crate::engine_status::Label::of("script inputs")),
+            Kind::Script => {
+                let run = self.runs.binary_search_by_key(&name, |run| run.task.planned.name).ok().and_then(|at| self.runs.get(at));
+                let mut label = crate::engine_status::Label::EMPTY;
+                match run.and_then(|run| run.script.map(|(_, package, _, _)| (package, run.native))) {
+                    Some((package, true)) => {
+                        let _ = write!(label, "{package} · cc/c++");
+                    }
+                    Some((package, false)) => {
+                        let _ = label.write_str(package);
+                    }
+                    None => {
+                        let _ = label.write_str("build.rs");
+                    }
+                }
+                (blaze_screen::WorkKind::BuildScript, label)
+            }
+            Kind::MacroModule => match job {
+                Some(ScriptWork::Module(ModuleJob::Build { wanted, .. })) => {
+                    (blaze_screen::WorkKind::BuildScript, crate::engine_status::Label::of(wanted.package))
+                }
+                _ => {
+                    let label = self.macros.as_ref().and_then(|crates| {
+                        let at = crates.binary_search_by_key(&name.subject, |(subject, _)| *subject).ok()?;
+                        crates.get(at)?.1.as_ref().ok().map(|id| crate::engine_status::Label::of(id.package.as_str()))
+                    }).unwrap_or_else(|| crate::engine_status::Label::of("proc-macro"));
+                    (blaze_screen::WorkKind::ProcMacro, label)
+                }
+            },
+            _ => (blaze_screen::WorkKind::BuildScript, crate::engine_status::Label::debug(&name)),
+        }
+    }
+
     pub(crate) fn dispatch<'s>(
         &mut self, cx: &Cx, store: &mut dyn crate::store::Store<'_>, handles: &Handles<'s, 'f>,
         names: &mut NamesStage<'f>, queue: &mut ScriptQueue<'s>, frame: &'f Frame,
@@ -963,7 +1000,8 @@ impl<'f> ScriptsStage<'f> {
                 Kind::Given => {
                     let board = handles.board;
                     let clock = &handles.env.clock;
-                    board.show(Stage::Scripts, crate::engine_status::Label::debug(&name), 0, board.now(clock)).end(board.now(clock));
+                    let (kind, label) = self.status_info(name, None);
+                    board.show_kind(Stage::Scripts, kind, label, 0, board.now(clock)).end(board.now(clock));
                     queue.answered.insert(name, (task, began, began));
                     continue;
                 }
@@ -974,11 +1012,13 @@ impl<'f> ScriptsStage<'f> {
                 Dispatch::Answered(done) => {
                     let board = handles.board;
                     let clock = &handles.env.clock;
-                    board.show(Stage::Scripts, crate::engine_status::Label::debug(&name), 0, board.now(clock)).end(board.now(clock));
+                    let (kind, label) = self.status_info(name, None);
+                    board.show_kind(Stage::Scripts, kind, label, 0, board.now(clock)).end(board.now(clock));
                     self.completed.insert(name, done);
                     queue.answered.insert(name, (task, began, crate::engine_times::ns(handles.env.clock.now().since_start())));
                 }
                 Dispatch::Run(job, drive) => {
+                    let (work_kind, label) = self.status_info(name, Some(&job));
                     queue.slots.take();
                     let finished: &'s bstd::sync::Flag = queue.jobs.alloc(bstd::sync::Flag::new());
                     let notice = Notice { finished, waiter: queue.waiter };
@@ -999,7 +1039,7 @@ impl<'f> ScriptsStage<'f> {
                     let handle = scope.may_overlap("build script", crate::scripts::SCRIPT_FRAME, move |cx| {
                         let _notice = notice;
                         let began = crate::engine_times::ns(clock.now().since_start());
-                        let shown = board.show(Stage::Scripts, crate::engine_status::Label::debug(&name), 0, board.now(clock));
+                        let shown = board.show_kind(Stage::Scripts, work_kind, label, 0, board.now(clock));
                         let result = match job {
                             ScriptWork::Module(job) => match work::unwinding(|| job.run(cx, task, heap)) {
                                 Ok(result) => result?,

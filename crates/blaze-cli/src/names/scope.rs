@@ -71,6 +71,8 @@ pub(crate) struct ScopeJob<'j> {
     /// compared; the clock the check is timed by.
     pub(crate) oracle: NamesOracle,
     pub(crate) clock: &'j bstd::clock::Clock,
+    /// Status board for reporting live proc-macro expansion activity.
+    pub(crate) board: Option<&'j crate::engine_status::Board<'j>>,
 }
 
 /// How a `CrateScope` job reads each dependency's exports section (rule 78: one seam). The
@@ -331,6 +333,7 @@ fn blocks_differential(
                 callers,
                 by_need: None,
                 run_stopped: core::cell::Cell::new(None),
+                activity: job.board.map(|board| (board, job.clock)),
             };
             let par = FilePar { cx: &span, meter: metered, heap: job.kept, workers: job.workers, oracle: NamesOracle::Off, now, seen: RefCell::new(None) };
             // The differential's two solves take bytes and check them again: an oracle's path,
@@ -377,6 +380,7 @@ fn blocks_differential(
             callers,
             by_need: None,
             run_stopped: core::cell::Cell::new(None),
+            activity: job.board.map(|board| (board, job.clock)),
         };
         let par = FilePar { cx: &span, meter: metered, heap: job.kept, workers: job.workers, oracle: NamesOracle::Off, now, seen: RefCell::new(None) };
         let deps = blaze_own::AVec::from_iter_in(job.deps.iter().map(|proof| proof.bytes()), alloc);
@@ -426,6 +430,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         callers,
         by_need: None,
         run_stopped: core::cell::Cell::new(None),
+        activity: job.board.map(|board| (board, job.clock)),
     };
     let prepares = Prepares::new_in(alloc);
     let now = || crate::engine_times::ns(job.clock.now().since_start());
