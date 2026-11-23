@@ -221,11 +221,14 @@ pub(crate) fn command(
     if flags.fix.is_some() {
         return Err(CliError::Usage("--fix is `blaze check`'s"));
     }
+    if command != Command::Run && flags.open == blaze_run::viewer::OpenExplore::Open {
+        return Err(CliError::Usage("--open is `blaze run`'s"));
+    }
     let select = match command {
         Command::Test => run_package::Select { test_packages: packages.as_slice(), bin: flags.select.bin, ..run_package::Select::NONE },
         Command::Run | Command::Check => run_package::Select { test_packages: packages.as_slice(), ..flags.select },
     };
-    let launch = program::Launch { fs, env, host, out, err, select, grants: &flags.grants, args: &flags.program };
+    let launch = program::Launch { fs, env, host, out, err, select, open: flags.open, grants: &flags.grants, args: &flags.program };
     let words = crate::words(command, out, err);
     // `blaze run` / `blaze test`'s live inline TUI on a terminal's stderr (run_line.rs).
     let screen_cmd = match command {

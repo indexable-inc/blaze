@@ -793,9 +793,8 @@ The launcher and `blaze run` parent exchange run-mode parameters and telemetry c
 - `BLAZE_LAUNCH_STORE`: directory holding the run's code records (paired with `BLAZE_LAUNCH_FD=3`).
 - `BLAZE_LAUNCH_NATIVE`: 64-hex-digit native library record ID when the program links C code.
 - `BLAZE_LAUNCH_TELEMETRY`: path to the per-run shared-memory telemetry ring file (`crates/blaze-launch/src/telemetry.rs`).
-- `BLAZE_LAUNCH_EXPLORE`: when set to `1` on interactive runs, instructs the launcher to ensure the local viewer daemon is running and open Explore.
+- `BLAZE_LAUNCH_EXPLORE`: when set to `1` (by `blaze run --open`), instructs the launcher to ensure the local viewer daemon is running and open Explore if no tab is connected.
 - `BLAZE_ALLOC_SAMPLE_BYTES`: byte-stride override for allocation telemetry sampling in `blaze-launcher`.
 - `BLAZE_EXPLORE_LOCAL`: when set, opens the local loopback `/explore` URL instead of `https://ix.dev/blaze/explore`.
 - `BLAZE_NO_TELEMETRY`: opt-out of per-run live shared-memory telemetry.
-- `BLAZE_NO_OPEN`: opt-out of auto-opening the Explore browser tab on interactive runs.
 

@@ -52,7 +52,7 @@ use self::watch::{Exit, Seen, Watch, WatchError};
 /// Default loopback port matching `site/explore/protocol.ts` and `blaze_run::viewer::DEFAULT_VIEWER_PORT`.
 pub const DEFAULT_PORT: u16 = 41937;
 
-/// Hosted Explore page opened by default when `active_viewers == 0`.
+/// Hosted Explore page opened by `blaze run --open` when `active_viewers == 0`.
 pub const DEFAULT_EXPLORE_URL: &str = "https://ix.dev/blaze/explore";
 
 /// Default idle expiry: 120 seconds with zero active runs and zero connected browser tabs.
@@ -1413,7 +1413,7 @@ mod tests {
         let mut handle = start_in(config, blaze_own::testing::heap().shared(), Monotonic::new()).expect("start viewer");
         let port = handle.addr().port();
 
-        // 1. Before any tab connects: active_viewers == 0 -> blaze run would open browser.
+        // 1. Before any tab connects: active_viewers == 0 -> `blaze run --open` would open browser.
         assert_eq!(probe_active_viewers(port), Some(0));
 
         // 2. Connect a real RFC 6455 WebSocket client.
