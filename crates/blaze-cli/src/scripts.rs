@@ -302,8 +302,9 @@ pub(crate) struct Scripts<'f> {
     by_subject: blaze_own::Vec<(ContentId, UnitId, Side), &'f Frame>,
     sources: StoreSources<'f, 'f, 'f, SourcesDir<'f>>,
     lock: &'f Lock<'f>,
-    /// Each member's lock entry and folder, checkout-relative, copied into the request's frame.
-    members: &'f [(LockId, &'f str)],
+    /// Each checkout path package's lock entry, folder (checkout-relative), and kind (member vs
+    /// external), copied into the request's frame.
+    members: &'f [blaze_world::CheckoutPath<'f>],
     /// Each fetched package's files as first located ([`files_of`]), sorted by lock id: a
     /// package's manifests are laid out once a command, not once for each job that runs its
     /// script or is served by it as a `links` producer (rule 77).
@@ -518,9 +519,9 @@ impl<'f> Scripts<'f> {
         let listed = members.ok_or(SetupError::NoMembers)?;
         let mut held = blaze_own::Vec::with_capacity_in(listed.len(), frame);
         for entry in listed.iter() {
-            held.push((entry.id, crate::work::held_str(entry.dir.as_str(), frame)));
+            held.push(blaze_world::CheckoutPath { id: entry.id, dir: crate::work::held_str(entry.dir.as_str(), frame), kind: entry.kind });
         }
-        let members: &'f [(LockId, &'f str)] = held.into_bump_slice();
+        let members: &'f [blaze_world::CheckoutPath<'f>] = held.into_bump_slice();
         let alloc: Alloc<'f> = env.heap.alloc();
         let _cx = cx.span("scripts: the fetched sources");
         let folder = crate::fetch::sources_native(env, frame).ok_or(SetupError::NoHome)?;
@@ -641,6 +642,10 @@ fn end_jobs(jobs: &blaze_proc_macro::jobserver::Jobserver) {
 enum Files<'j> {
     /// A workspace member at `dir` (checkout-relative): its script sees `/workspace/<dir>`.
     Member { dir: &'j str },
+    /// An external checkout path package (`[patch.*]` or excluded path dep) at `dir`
+    /// (checkout-relative): its script is confined to `/package` (its own folder, never the whole
+    /// workspace).
+    External { dir: &'j str },
     /// A fetched package's record: its files under `dir`; a git source answers `git` from the
     /// lock's commit (D54).
     Pack { view: blaze_fetch::pack::PackView<'j>, dir: &'j str, git: Option<blaze_build_script::git::Oid> },
@@ -699,14 +704,17 @@ struct Producer<'j> {
 fn files_of<'f: 'j, 'j>(
     sources: &mut StoreSources<'f, 'f, 'f, SourcesDir<'f>>,
     found: &mut std::vec::Vec<(LockId, Files<'f>), Global>,
-    members: &'f [(LockId, &'f str)],
+    members: &'f [blaze_world::CheckoutPath<'f>],
     lock: &'f Lock<'f>,
     unit: &Unit<'_>,
     frame: &'f Frame,
     jobs: &'j Frame,
 ) -> Result<Files<'j>, Prepared<'j>> {
-    if let Some((_, dir)) = members.iter().find(|(id, _)| *id == unit.package) {
-        return Ok(Files::Member { dir });
+    if let Some(entry) = members.iter().find(|entry| entry.id == unit.package) {
+        return Ok(match entry.kind {
+            blaze_world::PathKind::Member => Files::Member { dir: entry.dir },
+            blaze_world::PathKind::External => Files::External { dir: entry.dir },
+        });
     }
     let at = match found.binary_search_by_key(&unit.package, |(id, _)| *id) {
         Ok(at) => return Ok(found[at].1),
@@ -750,6 +758,19 @@ fn tree_of(files: &Files<'_>, checkout: crate::engine_script_reads::Served<'_>, 
                 Err(failed("a member's script with no served checkout", format_args!("the build script of {package}: its member folder `{dir}`: a simulated world serves no checkout on disk"), false))
             }
             (Err(error), _) => Err(failed("a member folder a script cannot see", format_args!("the build script of {package}: its member folder `{dir}`: {error}"), false)),
+        },
+        Files::External { dir } => match (ScriptRoot::member(dir), checkout) {
+            (Ok(_), crate::engine_script_reads::Served::Root(checkout)) => {
+                let pkg_path = if dir.is_empty() { checkout.path().to_path_buf() } else { checkout.path().join(dir) };
+                match blaze_proc_macro::script_sandbox::RealRoot::resolve(&pkg_path) {
+                    Ok(root) => Ok((dir_tree(&root), ScriptRoot::package())),
+                    Err(error) => Err(failed("an external package folder a script cannot see", format_args!("the build script of {package}: its external folder `{dir}`: {error}"), false)),
+                }
+            }
+            (Ok(_), crate::engine_script_reads::Served::Simulated) => {
+                Err(failed("an external package's script with no served checkout", format_args!("the build script of {package}: its external folder `{dir}`: a simulated world serves no checkout on disk"), false))
+            }
+            (Err(error), _) => Err(failed("an external package folder a script cannot see", format_args!("the build script of {package}: its external folder `{dir}`: {error}"), false)),
         },
         Files::Pack { view, dir, git } => Ok((mem_tree(view.files().map(|f| (f.path, f.bytes)), dir, *git), ScriptRoot::package())),
     }
@@ -1059,12 +1080,17 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
         Side::Target => None,
         Side::Macro => Some(side_atoms(job.cfg, alloc.clone())),
     };
-    let member = matches!(job.files, Files::Member { .. });
-    // A kept member run's failure is a hole: the reads it made are not handed back with its
-    // error (`ScriptError`), so no read list makes it stand, and standing on its drive inputs
+    let checkout_prefix = match job.files {
+        Files::Member { .. } => Some(""),
+        Files::External { dir } => Some(dir),
+        Files::Pack { .. } => None,
+    };
+    let is_checkout = checkout_prefix.is_some();
+    // A kept checkout-backed run's failure is a hole: the reads it made are not handed back with
+    // its error (`ScriptError`), so no read list makes it stand, and standing on its drive inputs
     // alone would keep it failed past the edit that fixes it (rule 21). Under
     // [`CheckoutReads::Hole`] its failure is filed.
-    let failed_hole = member && matches!(job.checkout, CheckoutReads::Kept { .. });
+    let failed_hole = is_checkout && matches!(job.checkout, CheckoutReads::Kept { .. });
     let ran = match script_unit::outputs_given(&shared.runtime, &setting, graph, job.script, side_cfg.as_ref().map(|atoms| atoms.as_slice()), tree, root, &given, alloc) {
         Ok(ran) => ran,
         Err(error) => return failed("a build script failed", format_args!("the build script of {package} failed: {error}"), failed_hole),
@@ -1085,7 +1111,7 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
     // dependent. Under [`CheckoutReads::Hole`] every read of the checkout is a hole: its outputs
     // serve nothing and it runs again next command.
     match job.checkout {
-        CheckoutReads::Kept { plant, status } => match admit_reads(&ran.reads, ran_as, &shared.spawn, member, plant, status, checkout, alloc) {
+        CheckoutReads::Kept { plant, status } => match admit_reads(&ran.reads, ran_as, &shared.spawn, checkout_prefix, plant, status, checkout, alloc) {
             Ok(()) => {
                 for read in checkout.iter() {
                     reads.push((read.name(), read.answer));
@@ -1095,7 +1121,7 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
         },
         // No cells planned: a hole.
         CheckoutReads::Hole => {
-            if member && let Some(read) = ran.reads.first() {
+            if is_checkout && let Some(read) = ran.reads.first() {
                 return failed(
                     "a member's build script read a checkout file the drive cannot name yet",
                     format_args!("the build script of {package} read `{}` of the checkout: a read of a checkout file is not a drive read on this path (engine_script_reads.rs keeps them on the engine's), so its outputs are not kept; it runs again next command", read.subject),
@@ -1116,11 +1142,47 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
 /// The fact mount is shared by members and fetched packages. A reply file is named by the
 /// whole question and followed under the next command's pins. The wasm answerer is part of
 /// the producer. A native reply additionally depends on the shim image the runner observed.
+/// Rebases a package-relative sandbox read subject (`file:`, `stat:`, `dir:`, `git:`) under
+/// `prefix` (checkout-relative external package dir) so `collect_reads` tracks the real checkout
+/// leaf path.
+fn rebase_read_subject<'a>(prefix: &str, subject: &str, alloc: Alloc<'a>) -> Option<blaze_own::AString<'a>> {
+    let mut out = blaze_own::AString::new_in(alloc);
+    if let Some((tag, rel)) = subject.split_once(':') {
+        match tag {
+            "file" | "stat" | "dir" => {
+                out.push_str(tag);
+                out.push(':');
+                out.push_str(prefix);
+                if !rel.is_empty() {
+                    out.push('/');
+                    out.push_str(rel);
+                }
+                return Some(out);
+            }
+            "git" => {
+                if let Some((folder, rest)) = rel.split_once('\n') {
+                    out.push_str("git:");
+                    out.push_str(prefix);
+                    if !folder.is_empty() {
+                        out.push('/');
+                        out.push_str(folder);
+                    }
+                    out.push('\n');
+                    out.push_str(rest);
+                    return Some(out);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 pub(crate) fn admit_reads(
     observed: &[blaze_proc_macro::script_sandbox::Read],
     ran_as: RanAs,
     setting: &SpawnSetting,
-    member: bool,
+    checkout_prefix: Option<&str>,
     plant: crate::engine_script_reads::ReadsPlant,
     status: Option<crate::engine_script_reads::StatusView>,
     cells: &mut crate::engine_script_reads::ReadList,
@@ -1188,10 +1250,17 @@ pub(crate) fn admit_reads(
         let executor = ran_as == RanAs::Wasm && blaze_build_script::host_tools::spawn_receipt(subject).is_some();
         (!executor && !blaze_proc_macro::spawn_route::is_fact_reply(subject, alloc) && !(subject == image_subject && ran_as == RanAs::Native)).then_some((subject, read.digest))
     });
-    if member {
-        reads::collect_reads(tree_reads, plant, status, cells)
-    } else {
-        reads::pinned_reads(tree_reads, result_alloc)
+    match checkout_prefix {
+        Some("") => reads::collect_reads(tree_reads, plant, status, cells),
+        Some(prefix) => {
+            let mut rebased: AVec<'_, (blaze_own::AString<'_>, Option<ContentId>)> = AVec::new_in(alloc);
+            for (subject, digest) in tree_reads {
+                let text = rebase_read_subject(prefix, subject, alloc).unwrap_or_else(|| blaze_own::AString::from_str_in(subject, alloc));
+                rebased.push((text, digest));
+            }
+            reads::collect_reads(rebased.iter().map(|(s, d)| (s.as_str(), *d)), plant, status, cells)
+        }
+        None => reads::pinned_reads(tree_reads, result_alloc),
     }
 }
 

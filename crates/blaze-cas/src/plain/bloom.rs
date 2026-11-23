@@ -426,11 +426,13 @@ impl BloomIndex {
             };
             let id = segment_id_of(&hdr.digest);
             let matched = if let Some(ref map_ids) = by_seg_id {
-                map_ids
-                    .get(&id)
-                    .and_then(|&idx| segments.get(idx))
-                    .is_some_and(|seg| seg.digest == hdr.digest)
-                    || segments.iter().any(|seg| seg.id == id && seg.digest == hdr.digest)
+                match map_ids.get(&id) {
+                    Some(&idx) => {
+                        segments.get(idx).is_some_and(|seg| seg.digest == hdr.digest)
+                            || segments.iter().any(|seg| seg.id == id && seg.digest == hdr.digest)
+                    }
+                    None => false,
+                }
             } else {
                 segments.iter().any(|seg| seg.id == id && seg.digest == hdr.digest)
             };
@@ -464,6 +466,27 @@ impl BloomIndex {
         let id = segment_id_of(&hdr.digest);
         let record = Arc::new_in(record_bytes, BLOOM_ALLOC);
         self.entries.insert(id, BloomSlot::Owned { digest: hdr.digest, blocks: hdr.blocks, record });
+    }
+
+    /// Prunes entries whose segment is no longer present in `segments`, preventing long-lived
+    /// processes from retaining owned Bloom buffers for retired segments.
+    pub(crate) fn prune(&mut self, segments: &[Segment]) {
+        self.entries.retain(|&id, slot| {
+            let digest = match slot {
+                BloomSlot::Mapped { digest, .. } | BloomSlot::Owned { digest, .. } => *digest,
+            };
+            segments.iter().any(|seg| seg.id == id && seg.digest == digest)
+        });
+    }
+
+    /// Updates tracked sidecar byte length after a successful Bloom write (`replaced = true` for
+    /// full compaction/backfill rewrite, `false` for append).
+    pub(crate) fn note_written(&mut self, replaced: bool, len: u64) {
+        if replaced {
+            self.mapped_bytes = len;
+        } else {
+            self.mapped_bytes = self.mapped_bytes.saturating_add(len);
+        }
     }
 
     /// Returns `false` ONLY when a verified filter for `seg.digest` proves `key` is absent.
@@ -674,5 +697,46 @@ mod tests {
         assert!(record_crc_valid(&record, hdr.crc));
         let key = ContentId::of("any", b"k");
         assert!(!probe_bytes(&record[RECORD_HEADER..], hdr.blocks, &key.0));
+    }
+
+    #[test]
+    fn note_written_tracks_growth_and_prune_drops_retired_segments() {
+        let mut idx = BloomIndex::new();
+        let d1 = ContentId::of("seg", b"1");
+        let d2 = ContentId::of("seg", b"2");
+        let mut b1 = BloomBuilder::new(2);
+        b1.insert(&ContentId::of("k", b"1").0);
+        let r1 = b1.finish(&d1);
+        let mut b2 = BloomBuilder::new(2);
+        b2.insert(&ContentId::of("k", b"2").0);
+        let r2 = b2.finish(&d2);
+        let r1_len = u64::try_from(r1.len()).unwrap();
+        let r2_len = u64::try_from(r2.len()).unwrap();
+        idx.insert_owned(r1);
+        idx.insert_owned(r2);
+        idx.note_written(false, r1_len);
+        idx.note_written(false, r2_len);
+        assert_eq!(idx.mapped_bytes, r1_len + r2_len);
+
+        let live_seg = Segment {
+            id: segment_id_of(&d1),
+            digest: d1,
+            len: 0,
+            index_at: 0,
+            count: 1,
+            namespace: crate::plain::Namespace::LOCAL,
+            generation: 1,
+            boot: 1,
+            local: true,
+            published: false,
+            sealed: true,
+            touched: 0,
+        };
+        idx.prune(core::slice::from_ref(&live_seg));
+        assert_eq!(idx.entries.len(), 1);
+        assert!(idx.entries.contains_key(&live_seg.id));
+        idx.note_written(true, r1_len);
+        assert_eq!(idx.mapped_bytes, r1_len);
+        assert!(!idx.needs_compact(core::slice::from_ref(&live_seg)));
     }
 }

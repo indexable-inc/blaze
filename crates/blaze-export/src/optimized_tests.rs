@@ -152,8 +152,8 @@ fn optimized_equals_export_for_converted_records() {
     let table = [0u8; 8];
     let words = [DataWord { at: 0, target: Some(func("main")), addend: 0 }];
     let data = [
-        Data { target: st, bytes: &answer, align: 8, words: &[], place: DataPlace::ReadOnly },
-        Data { target: vt, bytes: &table, align: 8, words: &words, place: DataPlace::ReadOnly },
+        Data { target: st, bytes: &answer, align: 8, words: &[], outside: &[], place: DataPlace::ReadOnly },
+        Data { target: vt, bytes: &table, align: 8, words: &words, outside: &[], place: DataPlace::ReadOnly },
     ];
     let (e, f) = both(&[("main", &reader)], &data, Platform::MacosArm64);
     assert_eq!(&e[..], &f[..], "the Mach-O files with data differ");
@@ -274,8 +274,8 @@ fn optimized_equals_export_with_rust_tls() {
     let ender_v2 = v2(&ender_v1);
     let init_bytes = 40u64.to_le_bytes();
     let data = [
-        Data { target: tls_init, bytes: &init_bytes, align: 8, words: &[], place: DataPlace::ReadOnly },
-        Data { target: tls_zero, bytes: &[], align: 16, words: &[], place: DataPlace::Zeroed { len: 16 } },
+        Data { target: tls_init, bytes: &init_bytes, align: 8, words: &[], outside: &[], place: DataPlace::ReadOnly },
+        Data { target: tls_zero, bytes: &[], align: 16, words: &[], outside: &[], place: DataPlace::Zeroed { len: 16 } },
     ];
     let tls = Some(TlsRuntime { descriptor: desc_sym, ender: ender_sym });
     let v1_funcs = [

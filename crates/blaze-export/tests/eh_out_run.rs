@@ -510,8 +510,8 @@ fn rust_tls_exported_program_runs_multithreaded_and_exits_42() {
 
     let init_bytes = 30u64.to_le_bytes();
     let data = [
-        Data { target: tls_init, bytes: &init_bytes, align: 8, words: &[], place: DataPlace::ReadOnly },
-        Data { target: tls_zero, bytes: &[], align: 8, words: &[], place: DataPlace::Zeroed { len: 8 } },
+        Data { target: tls_init, bytes: &init_bytes, align: 8, words: &[], outside: &[], place: DataPlace::ReadOnly },
+        Data { target: tls_zero, bytes: &[], align: 8, words: &[], outside: &[], place: DataPlace::Zeroed { len: 8 } },
     ];
     let tls = Some(TlsRuntime { descriptor: desc_sym, ender: ender_sym });
 

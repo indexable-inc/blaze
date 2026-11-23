@@ -215,6 +215,19 @@ impl<'r> EngineRecords<'r> {
         self.unreadable = krate;
     }
 
+    /// The crate (by name) planted unreadable for tests, if any.
+    pub(crate) fn unreadable(&self) -> Option<&'static str> {
+        self.unreadable
+    }
+
+    /// Folds lazily opened scope-record counts (e.g. `HeadsScopeRecords`) into this stage's
+    /// read accounting.
+    pub(crate) fn add_by_need(&mut self, counts: crate::front_load::ByNeedCounts) {
+        self.counts.records = self.counts.records.saturating_add(counts.opened);
+        self.counts.bytes = self.counts.bytes.saturating_add(counts.bytes);
+        self.counts.hits = self.counts.hits.saturating_add(counts.asks.saturating_sub(counts.opened));
+    }
+
     /// Crate `krate`'s records for a check scope (engine_bodies.rs `scope_of`), as
     /// [`EngineRecords::records`] reads them; the crate a test planted unreadable reads as a
     /// record gone from the store ([`LoadError::NotInStore`]), the error a refusal then names.

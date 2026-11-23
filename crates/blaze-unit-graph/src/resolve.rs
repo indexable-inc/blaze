@@ -298,6 +298,26 @@ impl<'l, 'a> Resolution<'l, 'a> {
                         count += 1;
                     }
                 }
+                if count > 1
+                    && let DepSource::Git { url } = &dep.source
+                {
+                    let want = url.trim_end_matches(".git");
+                    let mut narrowed = None;
+                    let mut narrowed_count = 0usize;
+                    for d in named() {
+                        if kind_fits(d, true)
+                            && let Some(Answer::Read(candidate)) = self.answers.get(d.index())
+                            && candidate.patched_from.iter().any(|src| src.trim_end_matches(".git") == want)
+                        {
+                            narrowed = Some(d);
+                            narrowed_count += 1;
+                        }
+                    }
+                    if narrowed_count == 1 {
+                        found = narrowed;
+                        count = 1;
+                    }
+                }
             }
         }
         match (found, count) {

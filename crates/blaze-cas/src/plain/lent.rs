@@ -30,7 +30,7 @@ use blaze_own::Arc;
 
 use super::arena::{Arena, ArenaView, RunEntry, Visibility};
 use super::core::{Batch, Committed, GcPlan, LentRecord, Named, POINTER_LEN, Probes, PutPath, Renewed, Report, Sliced};
-use super::driven::Driven;
+use super::driven::{Driven, HeadIdentity};
 use super::format::record_crc;
 use crate::Key;
 
@@ -1194,6 +1194,11 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         self.inner.borrow_mut().store.release_lease()
     }
 
+    /// Drops a named root at the next commit (`Plain::unroot`).
+    pub fn unroot(&self, name: &str) {
+        self.inner.borrow_mut().store.unroot(name)
+    }
+
     /// Re-enables automatic lease acquisition for the next request after [`Lent::release_lease`]
     /// (`Plain::rearm_lease`), so a resident daemon holds zero leases while idle yet acquires
     /// fresh lease protection on the next multi-phase request.
@@ -1206,37 +1211,58 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         self.inner.borrow().store.core().generation()
     }
 
+    /// Reads the reset-safe [`HeadIdentity`] of `head` on disk (`Driven::head_identity_on_disk`,
+    /// bounded to `HEAD_LEN + 1` bytes plus path-based `Stat` `(dev, ino)`).
+    pub fn head_identity_on_disk(&self) -> Result<Option<HeadIdentity>, LentError> {
+        self.inner.borrow_mut().store.head_identity_on_disk().map_err(stopped("reading the head identity"))
+    }
+
     /// Reads only the fixed head file on disk (`Driven::head_generation_on_disk`, zero segment
-    /// opens or mmaps) and returns the committed generation on disk so a resident daemon can
-    /// detect external commits or store wipes in O(1) and reopen only when
-    /// `disk_gen != self.generation()`.
+    /// opens or mmaps) and returns the committed generation on disk.
     pub fn head_generation_on_disk(&self) -> Result<u64, LentError> {
         self.inner.borrow_mut().store.head_generation_on_disk().map_err(stopped("reading the head generation"))
     }
 
     /// Reclaims arenas and lent private chunks held past commit once all [`Lend`] borrows have
     /// ended (proven statically by `&mut self`) and no uncommitted puts remain. Mapped segments
-    /// stay open and warm inside the underlying store. Returns the number of arenas/chunks
-    /// reclaimed so long-lived resident daemons maintain flat memory across requests.
+    /// stay open and warm inside the underlying store. Shared arenas still retained by a live
+    /// [`Snapshot`] are kept until their last owner drops so `held_bytes` stays accurate.
     pub fn reclaim_between_requests(&mut self) -> usize {
         let inner = self.inner.get_mut();
         if inner.uncommitted_bytes > 0 || inner.committed < inner.order.len() || !inner.puts.is_empty() {
             return 0;
         }
         let mut reclaimed = 0usize;
-        while let Some(arena) = inner.kept_arenas.pop() {
-            inner.counts.held_bytes = inner.counts.held_bytes.saturating_sub(u64::from(arena.blocks()) * 16);
-            inner.counts.freed_chunks = inner.counts.freed_chunks.saturating_add(1);
-            reclaimed += 1;
+        let mut i = 0usize;
+        while i < inner.kept_arenas.len() {
+            let arena = inner.kept_arenas.swap_remove(i);
+            match Arc::try_unwrap(arena) {
+                Ok(owned) => {
+                    inner.counts.held_bytes = inner.counts.held_bytes.saturating_sub(u64::from(owned.blocks()) * 16);
+                    inner.counts.freed_chunks = inner.counts.freed_chunks.saturating_add(1);
+                    reclaimed += 1;
+                }
+                Err(shared) => {
+                    inner.kept_arenas.push(shared);
+                    let last = inner.kept_arenas.len() - 1;
+                    inner.kept_arenas.swap(i, last);
+                    i += 1;
+                }
+            }
         }
-        if inner.kept_arenas.capacity() > 16 {
+        if inner.kept_arenas.capacity() > 16 && inner.kept_arenas.len() <= 16 {
             inner.kept_arenas.shrink_to_fit();
         }
         if let Some(arena) = inner.shared.take() {
-            inner.counts.held_bytes = inner.counts.held_bytes.saturating_sub(u64::from(arena.blocks()) * 16);
-            inner.counts.freed_chunks = inner.counts.freed_chunks.saturating_add(1);
             inner.shared_lent = false;
-            reclaimed += 1;
+            match Arc::try_unwrap(arena) {
+                Ok(owned) => {
+                    inner.counts.held_bytes = inner.counts.held_bytes.saturating_sub(u64::from(owned.blocks()) * 16);
+                    inner.counts.freed_chunks = inner.counts.freed_chunks.saturating_add(1);
+                    reclaimed += 1;
+                }
+                Err(shared) => inner.kept_arenas.push(shared),
+            }
         }
         while let Some(chunk) = inner.chunks.pop() {
             if chunk.capacity() > 0 {

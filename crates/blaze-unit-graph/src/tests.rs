@@ -243,6 +243,7 @@ impl P {
             features,
             deps,
             meta: crate::PackageMeta::unstated(a()),
+            patched_from: Vec::new_in(a()),
         }
     }
 }
@@ -1390,6 +1391,7 @@ version = \"0.1.0\"
             features: Vec::new_in(a()),
             deps: d,
             meta: crate::PackageMeta::unstated(a()),
+            patched_from: Vec::new_in(a()),
         }
     };
     let make_dep = |key: &str, pkg: &str, kind: DepKind, source: DepSource<'static>| Dep {
@@ -1469,4 +1471,92 @@ version = \"0.1.0\"
         other => panic!("expected Partial, got {}", matches!(other, Pass::Done(_))),
     };
     assert!(partial.missing().contains(&foo1_id), "missing should include foo 1.0.0: {:?}", partial.missing());
+}
+
+#[test]
+fn disambiguates_same_name_git_deps_patched_to_different_paths() {
+    const LOCK: &str = r#"version = 4
+
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = [
+ "foo 1.0.0",
+ "foo 2.0.0",
+]
+
+[[package]]
+name = "foo"
+version = "1.0.0"
+
+[[package]]
+name = "foo"
+version = "2.0.0"
+"#;
+    let lock = Lock::read(LOCK.as_bytes(), a()).expect("lock");
+    let app_id = lock.named("app").next().expect("app");
+    let foo1_id = lock.named("foo").find(|id| lock.package(*id).version.major == 1).expect("foo 1.0.0");
+    let foo2_id = lock.named("foo").find(|id| lock.package(*id).version.major == 2).expect("foo 2.0.0");
+
+    let make_dep = |key: &str, url: &str| Dep {
+        key: t(key),
+        package: t("foo"),
+        kind: DepKind::Normal,
+        platform: None,
+        optional: false,
+        default_features: true,
+        features: Vec::new_in(a()),
+        source: DepSource::Git { url: t(url) },
+    };
+    let make_pkg = |name: &str, deps: StdVec<Dep<'static>>, patched_from: Option<&str>| -> Package<'static> {
+        let mut d = Vec::new_in(a());
+        for dep in deps {
+            d.push(dep);
+        }
+        let mut pf = Vec::new_in(a());
+        if let Some(src) = patched_from {
+            pf.push(t(src));
+        }
+        Package {
+            name: t(name),
+            edition: PackageEdition { syntax: Edition::Edition2021, blaze: None },
+            lib: Some(Lib { crate_name: t(name), root: t("src/lib.rs"), proc_macro: false }),
+            bins: Vec::new_in(a()),
+            extras: Vec::new_in(a()),
+            build: None,
+            links: None,
+            features: Vec::new_in(a()),
+            deps: d,
+            meta: crate::PackageMeta::unstated(a()),
+            patched_from: pf,
+        }
+    };
+    let app_pkg = make_pkg(
+        "app",
+        vec![
+            make_dep("foo_a", "https://example.com/a/foo.git"),
+            make_dep("foo_b", "https://example.com/b/foo"),
+        ],
+        None,
+    );
+    let foo1_pkg = make_pkg("foo", vec![], Some("https://example.com/a/foo"));
+    let foo2_pkg = make_pkg("foo", vec![], Some("https://example.com/b/foo.git"));
+
+    let target = mac();
+    let mut roots = Vec::new_in(a());
+    roots.push(app_id);
+    let ask = Ask { roots, features: Vec::new_in(a()), all_features: false, no_default_features: false, tests: false };
+    let mut res = Resolution::new(&lock, &target, &target, &ask, Resolver::V2, a());
+    res.member(app_id, app_pkg).expect("member app");
+    res.package(foo1_id, Some(foo1_pkg)).expect("foo1");
+    res.package(foo2_id, Some(foo2_pkg)).expect("foo2");
+    let graph = match res.pass().expect("resolve patched same-name git deps") {
+        Pass::Done(g) => g,
+        Pass::Need(_) | Pass::Partial(_) => panic!("expected clean resolution"),
+    };
+    let app_unit = graph.units.iter().find(|u| u.name.as_str() == "app").expect("app unit");
+    let dep_a = app_unit.deps.iter().find(|d| d.name.as_str() == "foo_a").expect("foo_a dep");
+    let dep_b = app_unit.deps.iter().find(|d| d.name.as_str() == "foo_b").expect("foo_b dep");
+    assert_eq!(graph.units[dep_a.unit.index()].version.as_str(), "1.0.0");
+    assert_eq!(graph.units[dep_b.unit.index()].version.as_str(), "2.0.0");
 }

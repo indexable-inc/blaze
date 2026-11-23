@@ -80,7 +80,7 @@ pub(super) fn directory<'a>(kept: &Kept<'_>, alloc: SharedAlloc<'a>) -> Root<'a>
     root
 }
 
-fn encode_radix_shard<'a>(bits: u8, shard: u32, keys: &[Key], alloc: SharedAlloc<'a>) -> Option<(Key, SVec<'a, u8>)> {
+pub(super) fn encode_radix_shard<'a>(bits: u8, shard: u32, keys: &[Key], alloc: SharedAlloc<'a>) -> Option<(Key, SVec<'a, u8>)> {
     if keys.iter().all(|k| *k == Key::default()) {
         return None;
     }
@@ -1394,12 +1394,15 @@ fn reader_changes<'a>(work: &Work<'_>, source: &dyn StoredPages, delta: &mut Cha
     Ok(())
 }
 
-/// Fold the request into the existing page directory. Only pages containing a changed
-/// row, reader, cell, obligation or file plan can acquire a new key. When the merged answer
-/// outgrows `last.bits` (e.g. a cold workspace starting from a small `tool-base`), re-pages
-/// directly into `bits_kept(total, Some(last.bits))`.
-pub fn encode_changes<'a>(kept: &Kept<'_>, last: &Root<'_>, alloc: SharedAlloc<'a>) -> Result<Encoded<'a>, PagesError> {
-    encode_changes_with(kept, last, alloc, |jobs| {
+/// Fold the request into the existing page directory (both flat and 2-level radix roots). Only
+/// pages containing a changed row, reader, cell, obligation or file plan can acquire a new key.
+/// When the merged answer outgrows `last.bits` (e.g. a cold workspace starting from a small
+/// `tool-base`), re-pages directly into `bits_kept(total, Some(last.bits))`.
+pub fn encode_changes<'a, 'g, G>(kept: &Kept<'_>, last: &Root<'_>, alloc: SharedAlloc<'a>, get_record: G) -> Result<Encoded<'a>, PagesError>
+where
+    G: FnMut(Key) -> Got<'g>,
+{
+    encode_changes_radix(kept, last, alloc, get_record, |jobs| {
         let mut out = SVec::with_capacity_in(jobs.len(), alloc);
         for job in jobs {
             out.push(job.run(alloc));
@@ -1408,21 +1411,11 @@ pub fn encode_changes<'a>(kept: &Kept<'_>, last: &Root<'_>, alloc: SharedAlloc<'
     })
 }
 
-/// [`encode_changes`] with a caller-supplied executor for independent [`PageJob`]s, letting a
-/// multi-threaded driver merge and BLAKE3-hash changed pages in parallel while keeping this crate
-/// sans-IO and deterministic. For radix roots (`bits > RADIX_FLAT_MAX_BITS`), use
-/// [`encode_changes_radix`] so touched leaf shards can be fetched on demand.
-pub fn encode_changes_with<'a, F>(kept: &Kept<'_>, last: &Root<'_>, alloc: SharedAlloc<'a>, run_pages: F) -> Result<Encoded<'a>, PagesError>
-where
-    F: FnOnce(&[PageJob<'_, '_>]) -> SVec<'a, PageBuilt<'a>>,
-{
-    encode_changes_radix(kept, last, alloc, |_| None, run_pages)
-}
-
-/// [`encode_changes_with`] supporting both flat (`bits <= RADIX_FLAT_MAX_BITS`) and 2-level
-/// 256-way radix (`bits > RADIX_FLAT_MAX_BITS`) roots. Only the `<= changed_pages` touched leaf
-/// shards are fetched through `get_record`, updated, and hashed; untouched shards and unchanged
-/// directory sub-records carry their keys forward with zero reads and zero hashing.
+/// [`encode_changes`] with a caller-supplied executor for independent [`PageJob`]s, supporting
+/// both flat (`bits <= RADIX_FLAT_MAX_BITS`) and 2-level 256-way radix (`bits >
+/// RADIX_FLAT_MAX_BITS`) roots. Only the `<= changed_pages` touched leaf shards are fetched
+/// through `get_record`, updated, and hashed; untouched shards and unchanged directory
+/// sub-records carry their keys forward with zero reads and zero hashing.
 pub fn encode_changes_radix<'a, 'g, G, F>(
     kept: &Kept<'_>,
     last: &Root<'_>,

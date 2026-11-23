@@ -230,8 +230,8 @@ fn statics_and_vtables_are_placed_and_fixed() {
     let table = [0u8; 8];
     let words = [DataWord { at: 0, target: Some(func("main")), addend: 0 }];
     let data = [
-        Data { target: st, bytes: &answer, align: 8, words: &[], place: DataPlace::ReadOnly },
-        Data { target: vt, bytes: &table, align: 8, words: &words, place: DataPlace::ReadOnly },
+        Data { target: st, bytes: &answer, align: 8, words: &[], outside: &[], place: DataPlace::ReadOnly },
+        Data { target: vt, bytes: &table, align: 8, words: &words, outside: &[], place: DataPlace::ReadOnly },
     ];
     let members = [Member { symbol: sym("main"), record: CodeView::read(&main).unwrap(), tier: Some(Tier::Fast) }];
     let laid = lay_out(&members, &data, sym("main"), None, macho::plan(), 0, Alloc::global()).unwrap();
@@ -348,10 +348,10 @@ fn rust_tls_macho_and_elf_layout_and_determinism() {
     let ptr_bytes = [0u8; 8];
     let ptr_words = [DataWord { at: 0, target: Some(st_target), addend: 0 }];
     let data = [
-        Data { target: st_target, bytes: &shared_bytes, align: 8, words: &[], place: DataPlace::ReadOnly },
-        Data { target: tls_init, bytes: &init_bytes, align: 8, words: &[], place: DataPlace::ReadOnly },
-        Data { target: tls_zero, bytes: &[], align: 16, words: &[], place: DataPlace::Zeroed { len: 16 } },
-        Data { target: tls_ptr, bytes: &ptr_bytes, align: 8, words: &ptr_words, place: DataPlace::ReadOnly },
+        Data { target: st_target, bytes: &shared_bytes, align: 8, words: &[], outside: &[], place: DataPlace::ReadOnly },
+        Data { target: tls_init, bytes: &init_bytes, align: 8, words: &[], outside: &[], place: DataPlace::ReadOnly },
+        Data { target: tls_zero, bytes: &[], align: 16, words: &[], outside: &[], place: DataPlace::Zeroed { len: 16 } },
+        Data { target: tls_ptr, bytes: &ptr_bytes, align: 8, words: &ptr_words, outside: &[], place: DataPlace::ReadOnly },
     ];
     let data_rev = [data[3], data[2], data[1], data[0]];
     let fs = [
@@ -453,7 +453,7 @@ fn rust_tls_refusals_are_named() {
     let main_tls = rec(&[ADRP_X0, LDR_X0, MOV_W0_42, RET], &[(0, SiteKind::Load, tls_a)], &[]);
     let main_plain = rec(&[MOV_W0_42, RET], &[], &[]);
     let ender = rec(&[RET], &[], &[]);
-    let tls_datum = [Data { target: tls_a, bytes: &val, align: 8, words: &[], place: DataPlace::ReadOnly }];
+    let tls_datum = [Data { target: tls_a, bytes: &val, align: 8, words: &[], outside: &[], place: DataPlace::ReadOnly }];
     let mut out = Vec::new_in(alloc);
 
     // 1. Space::Tls datum without TlsRuntime -> NoTlsRuntime.
@@ -494,8 +494,8 @@ fn rust_tls_refusals_are_named() {
     let bad_words = [DataWord { at: 0, target: Some(tls_a), addend: 0 }];
     let bad_st = Target { space: Space::Static, symbol: sym("BAD_ST") };
     let data_bad_word = [
-        Data { target: tls_a, bytes: &val, align: 8, words: &[], place: DataPlace::ReadOnly },
-        Data { target: bad_st, bytes: &val, align: 8, words: &bad_words, place: DataPlace::ReadOnly },
+        Data { target: tls_a, bytes: &val, align: 8, words: &[], outside: &[], place: DataPlace::ReadOnly },
+        Data { target: bad_st, bytes: &val, align: 8, words: &bad_words, outside: &[], place: DataPlace::ReadOnly },
     ];
     let p = ProgramIn { functions: &fs_both, data: &data_bad_word, tls: rt, ..p };
     assert_eq!(export(&p, Platform::MacosArm64, &mut out, alloc), Err(ExportError::DataTlsTarget { from: bad_st, target: tls_a }));
@@ -511,13 +511,30 @@ fn rust_tls_refusals_are_named() {
 
     // 7. User static colliding with TlsRuntime::descriptor -> TwoData.
     let desc_target = Target { space: Space::Static, symbol: desc_sym };
-    let collide_data = [Data { target: desc_target, bytes: &val, align: 8, words: &[], place: DataPlace::ReadOnly }];
+    let collide_data = [Data { target: desc_target, bytes: &val, align: 8, words: &[], outside: &[], place: DataPlace::ReadOnly }];
     let fs_plain_ender = [
         Function { symbol: sym("main"), record: CodeView::read(&main_plain).unwrap(), tier: Tier::Fast },
         Function { symbol: ender_sym, record: CodeView::read(&ender).unwrap(), tier: Tier::Fast },
     ];
     let p = ProgramIn { functions: &fs_plain_ender, data: &collide_data, tls: rt, ..p };
     assert_eq!(export(&p, Platform::MacosArm64, &mut out, alloc), Err(ExportError::TwoData { target: desc_target }));
+
+    // 8. Self-relative DataWord (`target: None`) in Space::Tls -> DataTlsTarget.
+    let self_words = [DataWord { at: 0, target: None, addend: 0 }];
+    let self_tls_data = [Data { target: tls_a, bytes: &val, align: 8, words: &self_words, outside: &[], place: DataPlace::ReadOnly }];
+    let p = ProgramIn { functions: &fs_both, data: &self_tls_data, tls: rt, ..p };
+    assert_eq!(export(&p, Platform::MacosArm64, &mut out, alloc), Err(ExportError::DataTlsTarget { from: tls_a, target: tls_a }));
+
+    // 9. Space::Outside import referenced only by a Space::Tls template is gathered and bound.
+    let ext_sym = sym("puts");
+    let ext_target = Target { space: Space::Outside, symbol: ext_sym };
+    let ext_words = [DataWord { at: 0, target: Some(ext_target), addend: 0 }];
+    let ext_outside = [(ext_sym, "puts")];
+    let ext_tls_data = [Data { target: tls_a, bytes: &val, align: 8, words: &ext_words, outside: &ext_outside, place: DataPlace::ReadOnly }];
+    let p = ProgramIn { functions: &fs_both, data: &ext_tls_data, tls: rt, ..p };
+    let exported = export(&p, Platform::MacosArm64, &mut out, alloc).expect("TLS template outside import");
+    assert_eq!(exported.imports, 2, "pthread_key_create + puts");
+    check::macho(&out).expect("Mach-O valid with TLS outside import and 16B-aligned __const");
 }
 
 /// Regression: when `eh_room` reserves more pages after `__text` than `eh_sections` actually
@@ -530,7 +547,7 @@ fn macho_const_segment_lands_at_const_at_when_eh_leaves_page_gap() {
     let ro = Target { space: Space::Static, symbol: sym("RO_MAGIC") };
     let main = rec(&[ADRP_X0, LDR_X0, MOV_W0_42, RET], &[(0, SiteKind::Load, ro)], &[]);
     let members = [Member { symbol: sym("main"), record: CodeView::read(&main).unwrap(), tier: Some(Tier::Fast) }];
-    let data = [Data { target: ro, bytes: &magic, align: 8, words: &[], place: DataPlace::ReadOnly }];
+    let data = [Data { target: ro, bytes: &magic, align: 8, words: &[], outside: &[], place: DataPlace::ReadOnly }];
     let tail = 0x8000u64;
     let laid = lay_out(&members, &data, sym("main"), None, macho::plan_for(None), tail, alloc).unwrap();
     let eh = crate::eh_out::eh_sections(&laid, &members, None, Platform::MacosArm64, alloc).unwrap();
