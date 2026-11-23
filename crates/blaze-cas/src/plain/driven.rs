@@ -774,22 +774,46 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
     /// missing), so a resident daemon can detect external commits, `blaze gc`, or
     /// `blaze clean --store` in O(1) and reopen only when `disk_gen != self.core().generation()`.
     pub fn head_generation_on_disk(&mut self) -> Result<u64, StoreError> {
-        let tag = EffectTag(OWN_TAGS);
+        let stat_tag = EffectTag(OWN_TAGS);
+        let read_tag = EffectTag(OWN_TAGS + 1);
         let head = self.core.head_file().share();
-        self.effects.push(Effect::ReadAll { file: head, tag });
+        // `Effect::Stat` always resolves `head` by path (`OP_STATX` on Linux `io_uring`), whereas
+        // `Effect::ReadAll` may read from a kept descriptor in `Uring::names` if `head` was
+        // unlinked externally (e.g. `blaze clean --store`).
+        self.effects.push(Effect::Stat { file: head.share(), tag: stat_tag });
+        self.effects.push(Effect::ReadAll { file: head, tag: read_tag });
         self.run("reading the head generation")?;
+        let mut head_exists = None;
         let mut read_bytes = None;
+        let mut first_error = None;
         for completion in self.own.drain(..) {
-            if completion.tag != tag {
-                continue;
-            }
-            match completion.done {
-                Done::Read(bytes) => read_bytes = Some(bytes),
-                Done::Failed(error) | Done::Broken { error, .. } => {
-                    return Err(StoreError::Io { doing: "reading the head generation", file: StoreFile::Head, error: error.0 });
+            if completion.tag == stat_tag {
+                match completion.done {
+                    Done::Stat(meta) => head_exists = Some(meta.is_some_and(|m| !m.dir)),
+                    Done::Failed(error) | Done::Broken { error, .. } => {
+                        first_error.get_or_insert(StoreError::Io { doing: "reading the head generation", file: StoreFile::Head, error: error.0 });
+                    }
+                    _ => {
+                        first_error.get_or_insert(StoreError::Other { what: "unexpected completion while reading the head generation" });
+                    }
                 }
-                _ => return Err(StoreError::Other { what: "unexpected completion while reading the head generation" }),
+            } else if completion.tag == read_tag {
+                match completion.done {
+                    Done::Read(bytes) => read_bytes = Some(bytes),
+                    Done::Failed(error) | Done::Broken { error, .. } => {
+                        first_error.get_or_insert(StoreError::Io { doing: "reading the head generation", file: StoreFile::Head, error: error.0 });
+                    }
+                    _ => {
+                        first_error.get_or_insert(StoreError::Other { what: "unexpected completion while reading the head generation" });
+                    }
+                }
             }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        if head_exists == Some(false) {
+            return Ok(0);
         }
         let Some(bytes) = read_bytes else {
             return Err(StoreError::Unfinished { what: "reading the head generation" });

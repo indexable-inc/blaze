@@ -266,9 +266,10 @@ fn the_constants_are_libcs() {
     assert_eq!(WaitOptions::EXITED.bits() as libc::c_int, libc::WEXITED);
     assert_eq!(WaitOptions::NO_WAIT.bits() as libc::c_int, libc::WNOWAIT);
     assert_eq!(CloneFlags::PIDFD.bits(), libc::CLONE_PIDFD as u64);
-    // `libc::CLONE_CLEAR_SIGHAND` is typed as `c_int` in `libc`, truncating `0x1_0000_0000` to 0.
+    // `libc::CLONE_CLEAR_SIGHAND` and `libc::CLONE_INTO_CGROUP` are typed as `c_int` in `libc`,
+    // truncating `0x1_0000_0000` and `0x2_0000_0000` to 0.
     assert_eq!(CloneFlags::CLEAR_SIGHAND.bits(), 0x1_0000_0000u64);
-    assert_eq!(CloneFlags::INTO_CGROUP.bits(), libc::CLONE_INTO_CGROUP as u64);
+    assert_eq!(CloneFlags::INTO_CGROUP.bits(), 0x2_0000_0000u64);
     assert_eq!(SockFlags::NONBLOCK.bits() as libc::c_int, libc::SOCK_NONBLOCK);
     assert_eq!(SockFlags::CLOSE_ON_EXEC.bits() as libc::c_int, libc::SOCK_CLOEXEC);
     assert_eq!(MsgFlags::DONT_WAIT.bits() as libc::c_int, libc::MSG_DONTWAIT);

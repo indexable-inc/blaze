@@ -1260,7 +1260,7 @@ pub fn connect_unix(path: &[u8]) -> Result<super::io::OwnedFd, Errno> {
             return Err(Errno::Inval);
         }
         if let Some(slot) = un.sun_path.get_mut(i) {
-            *slot = byte.cast_signed();
+            *slot = c_char::from_ne_bytes([byte]);
         }
         i = i.wrapping_add(1);
     }
