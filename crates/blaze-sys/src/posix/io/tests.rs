@@ -111,6 +111,7 @@ fn os_constants() -> Vec<(&'static str, i64, i64)> {
         ("MADV_FREE_REUSABLE", Advice::FreeReusable.raw() as i64, libc::MADV_FREE_REUSABLE as i64),
         ("MADV_FREE_REUSE", Advice::FreeReuse.raw() as i64, libc::MADV_FREE_REUSE as i64),
         ("O_DSYNC", OpenFlags::DATA_SYNC.bits() as i64, libc::O_DSYNC as i64),
+        ("O_EVTONLY", OpenFlags::EVTONLY.bits() as i64, libc::O_EVTONLY as i64),
         ("EVFILT_READ", Filter::READ.0 as i64, libc::EVFILT_READ as i64),
         ("EVFILT_WRITE", Filter::WRITE.0 as i64, libc::EVFILT_WRITE as i64),
         ("EVFILT_VNODE", Filter::VNODE.0 as i64, libc::EVFILT_VNODE as i64),
@@ -129,7 +130,11 @@ fn os_constants() -> Vec<(&'static str, i64, i64)> {
         ("EV_EOF", KeventFlags::EOF.bits() as i64, libc::EV_EOF as i64),
         ("NOTE_DELETE", NoteFlags::DELETE.bits() as i64, libc::NOTE_DELETE as i64),
         ("NOTE_WRITE", NoteFlags::WRITE.bits() as i64, libc::NOTE_WRITE as i64),
+        ("NOTE_EXTEND", NoteFlags::EXTEND.bits() as i64, libc::NOTE_EXTEND as i64),
+        ("NOTE_ATTRIB", NoteFlags::ATTRIB.bits() as i64, libc::NOTE_ATTRIB as i64),
+        ("NOTE_LINK", NoteFlags::LINK.bits() as i64, libc::NOTE_LINK as i64),
         ("NOTE_RENAME", NoteFlags::RENAME.bits() as i64, libc::NOTE_RENAME as i64),
+        ("NOTE_REVOKE", NoteFlags::REVOKE.bits() as i64, libc::NOTE_REVOKE as i64),
         ("NOTE_TRIGGER", NoteFlags::TRIGGER.bits() as i64, libc::NOTE_TRIGGER as i64),
         ("NOTE_EXITSTATUS", NoteFlags::EXIT_STATUS.bits() as i64, libc::NOTE_EXITSTATUS as i64),
         ("NOTE_EXIT", NoteFlags::EXIT.bits() as i64, libc::NOTE_EXIT as i64),
@@ -346,6 +351,55 @@ fn a_kqueue_fires_a_user_event() {
     let (ident, udata) = (got.ident, got.udata);
     assert_eq!((ident, udata), (7, 42));
     assert_eq!(kevent(kq.fd(), &[], &mut out, Some(Timespec::ZERO)), Ok(0), "cleared once reported");
+}
+
+/// `O_EVTONLY` opens a vnode descriptor purely for `EVFILT_VNODE` watching and delivers
+/// `NOTE_WRITE`, `NOTE_EXTEND`, and `NOTE_DELETE` synchronously on a zero-timeout `kevent`.
+#[cfg(target_os = "macos")]
+#[test]
+fn evtonly_vnode_watch_reports_mutations() {
+    let dir = std::env::temp_dir().join(format!("blaze-sys-evtonly-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("watched.txt");
+    std::fs::write(&path, b"a").unwrap();
+    let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+
+    let vnode = openat(CWD, crate::Path::new(&cpath), OpenFlags::EVTONLY.with(OpenFlags::CLOSE_ON_EXEC), 0).unwrap();
+    let kq = kqueue().unwrap();
+    let all_notes = NoteFlags::DELETE
+        .with(NoteFlags::WRITE)
+        .with(NoteFlags::EXTEND)
+        .with(NoteFlags::ATTRIB)
+        .with(NoteFlags::LINK)
+        .with(NoteFlags::RENAME)
+        .with(NoteFlags::REVOKE);
+    let add = Kevent {
+        ident: vnode.fd().raw() as usize,
+        filter: Filter::VNODE,
+        flags: KeventFlags::ADD.with(KeventFlags::CLEAR),
+        fflags: all_notes,
+        data: 0,
+        udata: 99,
+    };
+    assert_eq!(kevent(kq.fd(), &[add], &mut [], None), Ok(0));
+
+    // Extending the file synchronously triggers WRITE | EXTEND.
+    std::fs::write(&path, b"abcdef").unwrap();
+    let mut out = [add; 1];
+    assert_eq!(kevent(kq.fd(), &[], &mut out, Some(Timespec::ZERO)), Ok(1));
+    let got = out[0];
+    let (fflags, udata) = (got.fflags, got.udata);
+    assert_eq!(udata, 99);
+    assert!(fflags.contains(NoteFlags::WRITE), "expected NOTE_WRITE, got {fflags:?}");
+    assert!(fflags.contains(NoteFlags::EXTEND), "expected NOTE_EXTEND, got {fflags:?}");
+
+    // Unlinking the file synchronously triggers DELETE.
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(kevent(kq.fd(), &[], &mut out, Some(Timespec::ZERO)), Ok(1));
+    let fflags = out[0].fflags;
+    assert!(fflags.contains(NoteFlags::DELETE), "expected NOTE_DELETE, got {fflags:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `poll`'s milliseconds round up and cap.

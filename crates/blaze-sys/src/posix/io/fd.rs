@@ -221,6 +221,9 @@ mod on_macos {
             TRUNCATE = 0x0400;
             /// `O_EXCL`. replaces libc::O_EXCL.
             EXCLUSIVE = 0x0800;
+            /// `O_EVTONLY`: open for event notifications only (`EVFILT_VNODE`), without blocking
+            /// volume unmount or updating access time. replaces libc::O_EVTONLY.
+            EVTONLY = 0x8000;
             /// `O_NOCTTY`. replaces libc::O_NOCTTY.
             NO_CONTROLLING_TTY = 0x0002_0000;
             /// `O_DIRECTORY`. replaces libc::O_DIRECTORY.

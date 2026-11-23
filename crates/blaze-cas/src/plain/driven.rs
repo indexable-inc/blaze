@@ -764,6 +764,44 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
         self.core.release_lease()
     }
 
+    /// [`Plain::rearm_lease`].
+    pub fn rearm_lease(&mut self) {
+        self.core.rearm_lease()
+    }
+
+    /// Reads only the fixed [`format::HEAD_LEN`] bytes of `head` through the driver (zero segment
+    /// opens or mmaps) and returns the current committed generation on disk (`0` when fresh or
+    /// missing), so a resident daemon can detect external commits, `blaze gc`, or
+    /// `blaze clean --store` in O(1) and reopen only when `disk_gen != self.core().generation()`.
+    pub fn head_generation_on_disk(&mut self) -> Result<u64, StoreError> {
+        let tag = EffectTag(OWN_TAGS);
+        let head = self.core.head_file().share();
+        self.effects.push(Effect::ReadAll { file: head, tag });
+        self.run("reading the head generation")?;
+        let mut read_bytes = None;
+        for completion in self.own.drain(..) {
+            if completion.tag != tag {
+                continue;
+            }
+            match completion.done {
+                Done::Read(bytes) => read_bytes = Some(bytes),
+                Done::Failed(error) | Done::Broken { error, .. } => {
+                    return Err(StoreError::Io { doing: "reading the head generation", file: StoreFile::Head, error: error.0 });
+                }
+                _ => return Err(StoreError::Other { what: "unexpected completion while reading the head generation" }),
+            }
+        }
+        let Some(bytes) = read_bytes else {
+            return Err(StoreError::Unfinished { what: "reading the head generation" });
+        };
+        match format::read_head(&bytes) {
+            format::HeadRead::Committed(newest, _, _) => Ok(newest.generation),
+            format::HeadRead::Fresh { .. } => Ok(0),
+            format::HeadRead::Version { found, .. } => Err(StoreError::Format { what: format::HEAD_SLOT, found, wanted: format::FORMAT }),
+            format::HeadRead::Refused(why) => Err(why),
+        }
+    }
+
     /// The exit tail sealed ([`Plain::seal`]): a command calls it after it answered, before or
     /// beside [`Driven::compact`], on a lowered thread. One barrier per segment this boot wrote
     /// and none sealed, then one flip; the next boot's open proves them with no byte read.
