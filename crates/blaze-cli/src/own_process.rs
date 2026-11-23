@@ -92,6 +92,8 @@ pub enum OwnError {
     Grants(GrantsError),
     /// The start list could not be read from the store (the store's own refusal).
     StartList(crate::start_list::ListError),
+    /// `--open` was passed, but live telemetry is unavailable for this run.
+    OpenWithoutTelemetry { why: &'static str },
     /// A line on the command's error stream.
     Out(bstd::out::OutError),
 }
@@ -117,6 +119,7 @@ impl fmt::Display for OwnError {
             OwnError::HostGrant(error) => write!(f, "{rule}: {error}"),
             OwnError::Grants(error) => write!(f, "{rule}: {error}"),
             OwnError::StartList(error) => write!(f, "`blaze run` did not start the program (run.md stage 7): {error}"),
+            OwnError::OpenWithoutTelemetry { why } => write!(f, "{rule}: `--open` needs live telemetry, and {why}"),
             OwnError::Out(error) => write!(f, "`blaze run`: the error stream: {error}"),
         }
     }
@@ -264,13 +267,9 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
     if let Some(send) = native {
         vars.push(("BLAZE_LAUNCH_NATIVE", send.hex));
     }
-    // Live shared-memory telemetry ring + Explore tab auto-open (non-comptime, opt-out via
-    // `BLAZE_NO_TELEMETRY=1` / `BLAZE_NO_OPEN=1`, auto-open only on interactive terminals).
+    // Live shared-memory telemetry ring (non-comptime, opt-out via `BLAZE_NO_TELEMETRY=1`);
+    // opening the Explore web page is opt-in via `blaze run --open`.
     let no_telemetry = VarName::new("BLAZE_NO_TELEMETRY")
-        .ok()
-        .and_then(|name| env.get(&name).ok().flatten())
-        .is_some();
-    let no_open = VarName::new("BLAZE_NO_OPEN")
         .ok()
         .and_then(|name| env.get(&name).ok().flatten())
         .is_some();
@@ -314,12 +313,12 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
             let _ = dir.publish(cx, &rel, bstd::fs::Content::bytes(body.as_bytes()), bstd::fs::Durable::No);
         }
     }
-    if let Some(ref path) = telem_path {
-        vars.push((blaze_launch::telemetry::VAR, path.as_str()));
-        if err.is_terminal() && !no_open {
-            vars.push(("BLAZE_LAUNCH_EXPLORE", "1"));
-        }
-    }
+    let telemetry = match (line.form, no_telemetry, telem_path.as_ref()) {
+        (_, _, Some(path)) => Telemetry::On(path.as_str()),
+        (EntryForm::Comptime, _, None) => Telemetry::Comptime,
+        (_, _, None) => Telemetry::DisabledByEnv,
+    };
+    explore_env(launch.open, telemetry, &mut vars)?;
     let spawner = host.spawner().map_err(OwnError::Missing)?;
     // The program's command line, for every entry form: its name first (`arg0`, the binary
     // target's), then the words after `--`.
@@ -452,6 +451,42 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
     Ok(ran.status)
 }
 
+/// Whether live telemetry is enabled for this run: disabled by `BLAZE_NO_TELEMETRY` or on a
+/// compile-time entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Telemetry<'a> {
+    On(&'a str),
+    Comptime,
+    DisabledByEnv,
+}
+
+/// Pushes the launcher's telemetry and Explore variables onto `vars`:
+/// - `BLAZE_LAUNCH_TELEMETRY` whenever telemetry is on;
+/// - `BLAZE_LAUNCH_EXPLORE=1` ONLY when `--open` was passed (`OpenExplore::Open`).
+/// Refuses `--open` when telemetry is unavailable so the flag is never quietly ignored (rule 3).
+fn explore_env<'e>(
+    open: blaze_run::viewer::OpenExplore,
+    telemetry: Telemetry<'e>,
+    vars: &mut Vec<(&'e str, &'e str), &Frame>,
+) -> Result<(), OwnError> {
+    match (open, telemetry) {
+        (_, Telemetry::On(path)) => {
+            vars.push((blaze_launch::telemetry::VAR, path));
+            if open == blaze_run::viewer::OpenExplore::Open {
+                vars.push(("BLAZE_LAUNCH_EXPLORE", "1"));
+            }
+            Ok(())
+        }
+        (blaze_run::viewer::OpenExplore::No, Telemetry::Comptime | Telemetry::DisabledByEnv) => Ok(()),
+        (blaze_run::viewer::OpenExplore::Open, Telemetry::Comptime) => {
+            Err(OwnError::OpenWithoutTelemetry { why: "a compile-time entry emits no telemetry" })
+        }
+        (blaze_run::viewer::OpenExplore::Open, Telemetry::DisabledByEnv) => {
+            Err(OwnError::OpenWithoutTelemetry { why: "`BLAZE_NO_TELEMETRY` turned live telemetry off" })
+        }
+    }
+}
+
 /// The launcher run mode's environment for the entry line `entry` (`<form>:<64 hex>`, its form
 /// `form`) and the command line's grants: the ONE place both are put. A HOSTED program is given
 /// `BLAZE_LAUNCH_GRANTS`, even when empty: each `--grant` read by host_grants.rs `host_grant`,
@@ -556,5 +591,37 @@ mod tests {
         let there = beside(&cx, &fs, launcher.as_str(), &frame);
         assert!(matches!(there, Beside::Present), "the launcher was written, and the probe said {there:?}");
         println!("own process: a launcher not beside blaze is named as missing");
+    }
+
+    /// Asserts: by default (`OpenExplore::No`), `BLAZE_LAUNCH_EXPLORE` is not set even when
+    /// telemetry is on; `--open` (`OpenExplore::Open`) sets `BLAZE_LAUNCH_EXPLORE=1`; `--open`
+    /// with telemetry disabled or on a comptime entry is refused by name instead of ignored.
+    #[test]
+    fn explore_opens_only_when_requested_and_refuses_without_telemetry() {
+        use blaze_run::viewer::OpenExplore;
+        let frame = Frame::new(bstd::mem::Tag::Other).expect("a frame");
+        fn var<'a>(vars: &[(&str, &'a str)], name: &str) -> std::vec::Vec<&'a str> {
+            vars.iter().filter(|(n, _)| *n == name).map(|(_, v)| *v).collect()
+        }
+
+        let mut vars: Vec<(&str, &str), &Frame> = Vec::new_in(&frame);
+        explore_env(OpenExplore::No, Telemetry::On("/h/.blaze/v2/runs/app.telem"), &mut vars).expect("default run");
+        assert_eq!(var(&vars, blaze_launch::telemetry::VAR), ["/h/.blaze/v2/runs/app.telem"]);
+        assert!(var(&vars, "BLAZE_LAUNCH_EXPLORE").is_empty(), "default `blaze run` must not set BLAZE_LAUNCH_EXPLORE");
+
+        let mut vars: Vec<(&str, &str), &Frame> = Vec::new_in(&frame);
+        explore_env(OpenExplore::Open, Telemetry::On("/h/.blaze/v2/runs/app.telem"), &mut vars).expect("--open run");
+        assert_eq!(var(&vars, blaze_launch::telemetry::VAR), ["/h/.blaze/v2/runs/app.telem"]);
+        assert_eq!(var(&vars, "BLAZE_LAUNCH_EXPLORE"), ["1"]);
+
+        let mut vars: Vec<(&str, &str), &Frame> = Vec::new_in(&frame);
+        assert!(matches!(
+            explore_env(OpenExplore::Open, Telemetry::DisabledByEnv, &mut vars),
+            Err(OwnError::OpenWithoutTelemetry { .. })
+        ));
+        assert!(matches!(
+            explore_env(OpenExplore::Open, Telemetry::Comptime, &mut vars),
+            Err(OwnError::OpenWithoutTelemetry { .. })
+        ));
     }
 }

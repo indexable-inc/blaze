@@ -222,7 +222,7 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
         ),
         (Some(path), _) => Some(path),
     };
-    let explore_auto = std::env::var_os("BLAZE_LAUNCH_EXPLORE").is_some_and(|v| v == "1");
+    let open_explore = std::env::var_os("BLAZE_LAUNCH_EXPLORE").is_some_and(|v| v == "1");
     if let Some(raw_stride) = std::env::var_os("BLAZE_ALLOC_SAMPLE_BYTES") {
         if let Some(stride) = raw_stride.to_str().and_then(|s| s.parse::<u64>().ok()) {
             blaze_launch_rt::telemetry::set_alloc_sample_bytes(stride);
@@ -267,7 +267,7 @@ fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::Shared
                 },
             };
             let _ = mapped.install_forever();
-            if explore_auto {
+            if open_explore {
                 if let (Ok(exe), Some(runs_dir)) = (std::env::current_exe(), path_buf.parent()) {
                     let _ = std::process::Command::new(exe)
                         .arg("--open-explore")
@@ -484,8 +484,7 @@ fn ensure_viewer_and_open_explore() -> ! {
             }
         }
     }
-    let no_open = std::env::var_os("BLAZE_NO_OPEN").is_some();
-    if !no_open && active == Some(0) {
+    if active == Some(0) {
         let url = if std::env::var_os("BLAZE_EXPLORE_LOCAL").is_some() {
             format!("http://127.0.0.1:{}/explore", cfg.port)
         } else {

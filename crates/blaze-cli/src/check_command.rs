@@ -18,7 +18,7 @@
 //! | `--fix <selector>..` | taken (engine_check.rs `serve`: a quiet check, fix.rs `apply`, a second check, through main.rs `fix_then_check`; the listed findings are in the request's frame, which outlives both checks) |
 //! | `--stats` | taken (engine_check.rs `stats_line`: one line on stderr; the profile holds the rest) |
 //! | `--origin`, `--origin-key` | taken (`Opts::origin`: the store opened with the named origin) |
-//! | `--grant`, `-p`/`--bin`, `-- args` | REFUSED: `run`'s, never `check`'s |
+//! | `--grant`, `-p`/`--bin`, `--open`, `-- args` | REFUSED: `run`'s, never `check`'s |
 //!
 //! A flag of `check` the engine does not take would be listed in [`NOT_TAKEN`] and refused as
 //! [`crate::CliError::NotOnEngine`], naming the flag and why, before anything is read or
@@ -82,6 +82,9 @@ pub(crate) fn refuse_not_taken(flags: &crate::Flags<'_>) -> Result<(), CliError>
     }
     if flags.select != crate::run_package::Select::NONE {
         return Err(CliError::Usage("-p and --bin choose `blaze run`'s program"));
+    }
+    if flags.open == blaze_run::viewer::OpenExplore::Open {
+        return Err(CliError::Usage("--open is `blaze run`'s"));
     }
     Ok(())
 }
