@@ -1487,6 +1487,10 @@ fn named_in_bounds((v, scope, alloc): (&View<'_>, &Scope, Mem), bounds: lf::List
                         todo.push(Work::Ty(lf::TypeId(id), in_fn));
                     }
                 }
+                lf::TypeRef::Fallible { ok, err } => {
+                    todo.push(Work::Ty(ok, in_fn));
+                    todo.push(Work::Ty(err, in_fn));
+                }
                 lf::TypeRef::For { binder, inner } => {
                     binder_names(binder, &mut bound_here)?;
                     todo.push(Work::Ty(inner, in_fn));

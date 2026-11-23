@@ -98,13 +98,13 @@ built: `blaze::options_struct`, which needs every use of the struct in the works
 
 ## MIR and codegen
 
-Nothing new past MIR building: a record is an ADT instance over a tuple, which is what borrow
-checking, drop elaboration, layout and codegen see. Four places learned the projection through
-`Record`'s one field into the tuple: `hir-ty-mir`'s `mir/lower.rs` (a record value: a tuple
-aggregate, then the struct's, defaults as constant operands; and `r.a`) and
-`mir/lower/pattern_matching.rs`, the closure capture walk (`expr_use_visitor.rs`), and match
-checking (`hir-ty-matchck/src/lower.rs`). Coarser but correct: the capture walk of
-`{ a: 1, ..base }` consumes all of `base`, and `match_tree.rs` gives up on a record pattern.
+In the v2 compiler pipeline (`blaze-typeck`, `blaze-body`, `blaze-build`, `blaze-borrow`,
+`blaze-flow-lower`, `blaze-facts`, `blaze-ladder`), structural records are represented directly
+as first-class `PNode::Record(List)` and `TyView::Record(TyList)` nodes (never erased to
+`PNode::Tuple`), laid out in `blaze-build/src/layout.rs` with canonical sorted-field `repr(Rust)`
+layout. Named records and type-keyed type sets (`blaze-ty::type_set`) also unify under
+`blaze-ty::product_row::ProductRow`, enabling open row polymorphism (`{ name: &str, ..R }` with
+`Lacks` constraints) and mixed named/type-keyed products with zero `{ ... }` syntax collision.
 
 ## Not built in this slice
 

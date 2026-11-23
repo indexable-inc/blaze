@@ -153,7 +153,23 @@ fn filled<A: Allocator + Clone>(check: Check, ty: PTy, layouts: &mut Layouts<A>,
                 Fields::Array { count: 0, .. } => continue,
                 _ => None,
             },
-            PNode::Tuple(_) | PNode::Closure { .. } => None,
+            PNode::Tuple(_) | PNode::Record(_) | PNode::Closure { .. } => None,
+            PNode::Union(ul) => {
+                if ul.len == 0 {
+                    return Ok(false);
+                }
+                if ul.len == 1 {
+                    None
+                } else {
+                    let v = match l.variants {
+                        Variants::Single { index } => Some(index),
+                        Variants::Multiple { tag, .. } => layouts.variant_of_tag(id, check.fill(tag.prim.bits())),
+                    };
+                    let Some(v) = v.and_then(|v| usize::try_from(v).ok()) else { return Ok(false) };
+                    let Some(end) = v.checked_add(1) else { return Ok(false) };
+                    Some(v..end)
+                }
+            }
             PNode::Future(..) | PNode::Coroutine { .. } => {
                 return Err(refuse(Refusal::Unsupported(
                     "the zero or 0x01 validity of a coroutine's state (which state the fill selects is the coroutine pass's encoding)",
@@ -226,7 +242,8 @@ fn inhabited<A: Allocator + Clone>(ty: PTy, layouts: &mut Layouts<A>, cx: &mut L
                 Fields::Array { count: 0, .. } => Form::Yes,
                 _ => Form::All,
             },
-            PNode::Tuple(_) | PNode::Closure { .. } | PNode::Coroutine { .. } | PNode::Pat(..) => Form::All,
+            PNode::Tuple(_) | PNode::Record(_) | PNode::Closure { .. } | PNode::Coroutine { .. } | PNode::Pat(..) => Form::All,
+            PNode::Union(_) => Form::Record,
             PNode::Bool
             | PNode::Char
             | PNode::Int(_)

@@ -200,7 +200,7 @@ pub fn read_back<A: Allocator + Clone>(
                 leaf(&mut b, v, &mut leaves);
             }
             PNode::Float(_) => return Err(refused("a float")),
-            PNode::Array(..) | PNode::Tuple(_) | PNode::Adt(..) => {
+            PNode::Array(..) | PNode::Tuple(_) | PNode::Record(_) | PNode::Union(_) | PNode::Adt(..) => {
                 parts.clear();
                 layouts.field_types(p.ty, cx, &mut parts)?;
                 // The fields of the variant the record holds, and that variant's layout.

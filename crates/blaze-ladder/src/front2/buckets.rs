@@ -238,7 +238,7 @@ pub(crate) fn shape_of(t: PTys<'_>, p: PTy) -> Option<Shape> {
         PNode::Float(f) => Shape::Float(f),
         PNode::Str => Shape::Str,
         PNode::Never => Shape::Never,
-        PNode::Tuple(l) => Shape::Tuple(l.len),
+        PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => Shape::Tuple(l.len),
         PNode::Ref(m, _) => Shape::Ref(m),
         PNode::Ptr(m, _) => Shape::Ptr(m),
         PNode::Array(..) => Shape::Array,

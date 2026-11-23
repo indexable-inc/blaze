@@ -213,6 +213,8 @@ pub mod ty_tag {
     pub const EX_PROJ: u32 = 29;
     pub const EX_AUTO: u32 = 30;
     pub const FOREIGN: u32 = 31;
+    pub const RECORD: u32 = 32;
+    pub const UNION: u32 = 33;
 }
 
 /// The statement tags. 0 is no form.
@@ -900,6 +902,14 @@ pub fn encode_ty(n: PNode) -> TyWords {
             put_list(&mut w, 0, l);
             ty_tag::TUPLE
         }
+        PNode::Record(l) => {
+            put_list(&mut w, 0, l);
+            ty_tag::RECORD
+        }
+        PNode::Union(l) => {
+            put_list(&mut w, 0, l);
+            ty_tag::UNION
+        }
         PNode::Ref(m, t) | PNode::Ptr(m, t) => {
             (w[0], w[1]) = (mutbl_code(m), t.0);
             match n {
@@ -1004,6 +1014,8 @@ pub fn decode_ty(r: TyWords) -> Option<PNode> {
         ty_tag::STR => PNode::Str,
         ty_tag::NEVER => PNode::Never,
         ty_tag::TUPLE => PNode::Tuple(list_at(w, 0)),
+        ty_tag::RECORD => PNode::Record(list_at(w, 0)),
+        ty_tag::UNION => PNode::Union(list_at(w, 0)),
         ty_tag::REF => PNode::Ref(mutbl_of(w[0])?, PTy(w[1])),
         ty_tag::PTR => PNode::Ptr(mutbl_of(w[0])?, PTy(w[1])),
         ty_tag::ARRAY => PNode::Array(PTy(w[0]), PTy(w[1])),
@@ -1048,6 +1060,8 @@ pub fn ty_children(n: PNode, mut ty: impl FnMut(PTy), mut list: impl FnMut(List)
             list(l);
         }
         PNode::Tuple(l)
+        | PNode::Record(l)
+        | PNode::Union(l)
         | PNode::Adt(_, l)
         | PNode::FnDef(_, l)
         | PNode::FnPtr(l, _)
@@ -1078,6 +1092,8 @@ pub fn ty_children(n: PNode, mut ty: impl FnMut(PTy), mut list: impl FnMut(List)
 pub fn map_ty_lists(n: PNode, mut f: impl FnMut(List) -> List) -> PNode {
     match n {
         PNode::Tuple(l) => PNode::Tuple(f(l)),
+        PNode::Record(l) => PNode::Record(f(l)),
+        PNode::Union(l) => PNode::Union(f(l)),
         PNode::Pat(t, l) => PNode::Pat(t, f(l)),
         PNode::Adt(k, l) => PNode::Adt(k, f(l)),
         PNode::FnDef(k, l) => PNode::FnDef(k, f(l)),

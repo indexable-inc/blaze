@@ -120,7 +120,7 @@ pub fn needs_drop<'g, E>(
             PNode::Foreign(_) => {}
             // A pattern type's values are its base's (an integer, `char` or raw pointer).
             PNode::Pat(base, _) => todo.push(base),
-            PNode::Tuple(l) => {
+            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => {
                 todo.extend_from_slice(ground_tys.view().list(l).map_err(malformed("a tuple's list past the ground table"))?);
             }
             PNode::Slice(elem) => todo.push(elem),

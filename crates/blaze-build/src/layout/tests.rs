@@ -185,7 +185,12 @@ const U16: PNode = PNode::Uint(UintTy::U16);
 const U32: PNode = PNode::Uint(UintTy::U32);
 const U64: PNode = PNode::Uint(UintTy::U64);
 
-pub(crate) fn lay(w: &World, g: &mut G, ls: &mut Layouts<Global>, t: PTy) -> Result<LayoutId, super::LayoutError> {
+pub(crate) fn lay<A: core::alloc::Allocator + Clone>(
+    w: &World,
+    g: &mut G,
+    ls: &mut Layouts<A>,
+    t: PTy,
+) -> Result<LayoutId, super::LayoutError> {
     let mut cx = LayoutCx { ground: &mut g.t, facts: w, scratch: Alloc::global() };
     ls.of(t, &mut cx)
 }
@@ -896,4 +901,49 @@ fn niche_encoding_decodes_every_value() {
         let wr = ls.tag_write(id, v).unwrap();
         assert_eq!(ls.variant_of_tag(id, wr.value), Some(v));
     }
+}
+
+#[test]
+fn record_and_union_layouts() {
+    let w = World::default();
+    let mut g = G::new();
+    let h = blaze_own::testing::heap();
+    let mut ls = Layouts::new_in(h.alloc());
+    let u64_t = g.n(PNode::Uint(UintTy::U64));
+    let u8_t = g.n(U8);
+    let bool_t = g.n(PNode::Bool);
+
+    // PNode::Record([u64, u8]) -> size 16, align 8
+    let rec_list = g.t.intern_list(&[u64_t, u8_t]).unwrap();
+    let rec_ty = g.n(PNode::Record(rec_list));
+    let rec_id = lay(&w, &mut g, &mut ls, rec_ty).unwrap();
+    assert_eq!(size_align(&ls, rec_id), (16, 8));
+    assert!(!ls.get(rec_id).uninhabited);
+
+    // PNode::Union([u64, u8]) -> size 16, align 8
+    let u_64_8_list = g.t.intern_list(&[u64_t, u8_t]).unwrap();
+    let u_64_8_ty = g.n(PNode::Union(u_64_8_list));
+    let u_64_8_id = lay(&w, &mut g, &mut ls, u_64_8_ty).unwrap();
+    assert_eq!(size_align(&ls, u_64_8_id), (16, 8));
+    assert!(!ls.get(u_64_8_id).uninhabited);
+
+    // PNode::Union([u8, bool]) -> size 2, align 1
+    let u_8_bool_list = g.t.intern_list(&[u8_t, bool_t]).unwrap();
+    let u_8_bool_ty = g.n(PNode::Union(u_8_bool_list));
+    let u_8_bool_id = lay(&w, &mut g, &mut ls, u_8_bool_ty).unwrap();
+    assert_eq!(size_align(&ls, u_8_bool_id), (2, 1));
+    assert!(!ls.get(u_8_bool_id).uninhabited);
+
+    // PNode::Union([u64]) -> size 8, align 8 (transparent)
+    let u_64_list = g.t.intern_list(&[u64_t]).unwrap();
+    let u_64_ty = g.n(PNode::Union(u_64_list));
+    let u_64_id = lay(&w, &mut g, &mut ls, u_64_ty).unwrap();
+    assert_eq!(size_align(&ls, u_64_id), (8, 8));
+    assert!(!ls.get(u_64_id).uninhabited);
+
+    // PNode::Union([]) -> size 0, uninhabited
+    let u_empty_ty = g.n(PNode::Union(List::EMPTY));
+    let u_empty_id = lay(&w, &mut g, &mut ls, u_empty_ty).unwrap();
+    assert_eq!(ls.get(u_empty_id).size, 0);
+    assert!(ls.get(u_empty_id).uninhabited);
 }

@@ -110,7 +110,9 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
         let cty = self.expr_ty(closure)?;
         let cols = self.ck.closures.column::<0>();
         let Some(row) = cols.iter().position(|x| *x == closure) else { return self.refuse(Construct::Malformed, closure) };
-        let kind = self.ck.closures.column::<1>()[row];
+        let Some(&kind) = self.ck.closures.column::<1>().get(row) else {
+            return self.refuse(Construct::Malformed, closure);
+        };
         let env_ty = match kind {
             ClosureKind::Fn => self.find_ty(PNode::Ref(Mutbl::Not, cty), at)?,
             ClosureKind::FnMut => self.find_ty(PNode::Ref(Mutbl::Mut, cty), at)?,

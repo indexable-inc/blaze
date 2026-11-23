@@ -784,6 +784,8 @@ fn field_lead(tys: tc::PTys<'_>, t: tc::PTy) -> FieldLead {
                 | tc::PNode::Str
                 | tc::PNode::Never
                 | tc::PNode::Tuple(_)
+                | tc::PNode::Record(_)
+                | tc::PNode::Union(_)
                 | tc::PNode::Ptr(..)
                 | tc::PNode::Array(..)
                 | tc::PNode::Slice(_)

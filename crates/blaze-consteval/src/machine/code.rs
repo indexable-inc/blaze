@@ -1331,7 +1331,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             let src = self.as_value(cc, code, src, ft)?;
             code.parts.push(Part { src, off, ty: fty });
         }
-        let tag = if array || matches!(self.node(t)?, PNode::Tuple(_)) {
+        let tag = if array || matches!(self.node(t)?, PNode::Tuple(_) | PNode::Record(_)) {
             None
         } else {
             let (mut cx, l) = self.cx();

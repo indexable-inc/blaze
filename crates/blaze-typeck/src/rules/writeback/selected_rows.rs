@@ -542,6 +542,8 @@ fn head(node: PNode) -> Option<PNode> {
         PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Float(_) | PNode::Str | PNode::Never
         | PNode::Foreign(_) => node,
         PNode::Tuple(_) => PNode::Tuple(l),
+        PNode::Record(_) => PNode::Record(l),
+        PNode::Union(_) => PNode::Union(l),
         PNode::Ref(m, _) => PNode::Ref(m, p),
         PNode::Ptr(m, _) => PNode::Ptr(m, p),
         PNode::Array(..) => PNode::Array(p, p),
@@ -621,6 +623,8 @@ fn rebuild_in(out: &mut PortableTys<'_>, node: PNode, kids: &[PTy]) -> Result<PT
     let node = match node {
         PNode::ConstValue { bits, .. } => PNode::ConstValue { ty: kids[0], bits },
         PNode::Tuple(_) => PNode::Tuple(out.intern_list(kids)?),
+        PNode::Record(_) => PNode::Record(out.intern_list(kids)?),
+        PNode::Union(_) => PNode::Union(out.intern_list(kids)?),
         PNode::Ref(m, _) => PNode::Ref(m, kids[0]),
         PNode::Ptr(m, _) => PNode::Ptr(m, kids[0]),
         PNode::Array(..) => PNode::Array(kids[0], kids[1]),

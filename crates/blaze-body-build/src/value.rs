@@ -53,6 +53,8 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         }
         enum ListKind {
             Tuple,
+            Record,
+            Union,
             Adt(blaze_typeck::ItemKey),
             FnDef(blaze_typeck::ItemKey),
         }
@@ -102,9 +104,11 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                         cur_depth += 1;
                         continue;
                     }
-                    PNode::Tuple(list) | PNode::Adt(_, list) | PNode::FnDef(_, list) => {
+                    PNode::Tuple(list) | PNode::Record(list) | PNode::Union(list) | PNode::Adt(_, list) | PNode::FnDef(_, list) => {
                         let kind = match node {
                             PNode::Tuple(_) => ListKind::Tuple,
+                            PNode::Record(_) => ListKind::Record,
+                            PNode::Union(_) => ListKind::Union,
                             PNode::Adt(k, _) => ListKind::Adt(k),
                             PNode::FnDef(k, _) => ListKind::FnDef(k),
                             _ => return Err(self.unsupported("a type of the body's own overlay (not in its record's table)")),
@@ -126,6 +130,8 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                         let empty = self.subst.ground.intern_list(&[]).map_err(|_| self.malformed("the ground table is full"))?;
                         let out = match kind {
                             ListKind::Tuple => PNode::Tuple(empty),
+                            ListKind::Record => PNode::Record(empty),
+                            ListKind::Union => PNode::Union(empty),
                             ListKind::Adt(k) => PNode::Adt(k, empty),
                             ListKind::FnDef(k) => PNode::FnDef(k, empty),
                         };
@@ -174,6 +180,8 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                         let interned = self.subst.ground.intern_list(&done).map_err(|_| self.malformed("the ground table is full"))?;
                         let out = match kind {
                             ListKind::Tuple => PNode::Tuple(interned),
+                            ListKind::Record => PNode::Record(interned),
+                            ListKind::Union => PNode::Union(interned),
                             ListKind::Adt(k) => PNode::Adt(k, interned),
                             ListKind::FnDef(k) => PNode::FnDef(k, interned),
                         };

@@ -50,6 +50,7 @@ mod relate;
 mod solve;
 pub mod effect_ty;
 pub mod pat_ty;
+pub mod product_row;
 pub mod record_ty;
 pub mod type_desc;
 pub mod type_set;

@@ -1631,7 +1631,7 @@ impl<'a> TypeCtx for InferCtx<'a> {
             TyView::Float(f) => B::float(terms::b_float(facts_float(f))),
             TyView::Str => B::STR,
             TyView::Never => B::NEVER,
-            TyView::Tuple(l) => {
+            TyView::Tuple(l) | TyView::Record(l) | TyView::Union(l) => {
                 let l = self.blist(l);
                 self.terms.cx.tys.tuple(l)
             }

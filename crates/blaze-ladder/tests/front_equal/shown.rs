@@ -93,6 +93,16 @@ fn node_at(o: &mut AString<'_>, tys: PTys<'_>, t: PTy, left: &mut Budget) -> Res
             list(o, tys, l, left)?;
             o.write_str(")")
         }
+        PNode::Record(l) => {
+            o.write_str("record(")?;
+            list(o, tys, l, left)?;
+            o.write_str(")")
+        }
+        PNode::Union(l) => {
+            o.write_str("union(")?;
+            list(o, tys, l, left)?;
+            o.write_str(")")
+        }
         PNode::Ref(m, inner) => {
             write!(o, "&{m:?} ")?;
             node(o, tys, inner, left)

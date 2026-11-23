@@ -1616,6 +1616,8 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         };
         match view {
             TyView::Tuple(l)
+            | TyView::Record(l)
+            | TyView::Union(l)
             | TyView::Adt(_, l)
             | TyView::FnDef(_, l)
             | TyView::FnPtr(l, _)
@@ -1699,6 +1701,8 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         use TyView::*;
         let rebuilt = match view {
             Tuple(l) => Tuple(self.normalized_list(l, done, items)?),
+            Record(l) => Record(self.normalized_list(l, done, items)?),
+            Union(l) => Union(self.normalized_list(l, done, items)?),
             Ref(m, t) => Ref(m, self.normalized_child(t, done)),
             Ptr(m, t) => Ptr(m, self.normalized_child(t, done)),
             Array(e, n) => Array(self.normalized_child(e, done), self.normalized_child(n, done)),
@@ -2071,6 +2075,8 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             PNode::Str => TyView::Str,
             PNode::Never => TyView::Never,
             PNode::Tuple(l) => TyView::Tuple(self.lowered_list(memo, types, l)?),
+            PNode::Record(l) => TyView::Record(self.lowered_list(memo, types, l)?),
+            PNode::Union(l) => TyView::Union(self.lowered_list(memo, types, l)?),
             PNode::Ref(m, t) => TyView::Ref(m, Self::lowered(memo, t)?),
             PNode::Ptr(m, t) => TyView::Ptr(m, Self::lowered(memo, t)?),
             // A hole for a length (`[u8; _]`) is a const variable, not the type variable the
@@ -2420,7 +2426,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             TyView::Float(f) => Shape::Float(f),
             TyView::Str => Shape::Str,
             TyView::Never => Shape::Never,
-            TyView::Tuple(l) => Shape::Tuple(self.ty.list_len(l)),
+            TyView::Tuple(l) | TyView::Record(l) | TyView::Union(l) => Shape::Tuple(self.ty.list_len(l)),
             TyView::Ref(m, _) => Shape::Ref(m),
             TyView::Ptr(m, _) => Shape::Ptr(m),
             TyView::Array(..) => Shape::Array,
