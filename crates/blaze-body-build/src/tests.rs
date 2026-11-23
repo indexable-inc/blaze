@@ -306,22 +306,53 @@ fn call_with_cleanup_is_an_invoke() {
     assert!(!text.contains("invoke") && text.contains("call"), "{text}");
 }
 
-/// A row this builder does not translate is refused by name, here a thread-local's address.
+/// A row this builder does not translate is refused by name, here a promoted constant.
 /// Should give `BuildError::Unsupported` at row 0.
 #[test]
 fn unsupported_row_is_named() {
     let text = "\
 local _0: t3 return
-const c0 = scalar 0x0: t0
+const c0 = promoted 0: t3
 bb0:
-  _0 = tls c0
+  _0 = const c0
   return
 ";
     match built(text, Panic::Abort) {
         Err(BuildError::Unsupported { stmt, what }) => {
             assert_eq!(stmt.0, 0);
-            assert!(what.contains("thread-local"));
+            assert!(what.contains("promoted"), "{what}");
         }
         other => panic!("not refused by name: {:?}", other.err()),
     }
+}
+
+/// `ConstKind::StaticAddr` and `BodyValue::ThreadLocalAddr` lower to `data_addr` / `tls_addr`
+/// and populate `Built.statics` / `Built.thread_locals` deduplicated by `ItemKey`.
+#[test]
+fn static_and_thread_local_addresses_emit_refs() {
+    let static_text = "\
+local _0: t3 return
+local _1: t3 temp e0 value
+const c0 = static k42: t3
+bb0:
+  _1 = const c0
+  _0 = const c0
+  return
+";
+    let b = built(static_text, Panic::Abort).expect("static addr lowers cleanly");
+    assert_eq!(b.statics.as_slice(), &[ItemKey(0x42)]);
+    let lir = printed(&b);
+    assert!(lir.contains("data_addr"), "{lir}");
+
+    let tls_text = "\
+local _0: t3 return
+const c0 = static k77: t3
+bb0:
+  _0 = tls c0
+  return
+";
+    let b_tls = built(tls_text, Panic::Abort).expect("tls addr lowers cleanly");
+    assert_eq!(b_tls.thread_locals.as_slice(), &[ItemKey(0x77)]);
+    let lir_tls = printed(&b_tls);
+    assert!(lir_tls.contains("tls_addr"), "{lir_tls}");
 }
