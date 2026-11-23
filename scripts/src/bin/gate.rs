@@ -62,10 +62,11 @@ const CI_ONLY_STEPS: [(&str, &str); 1] = [(
 )];
 
 /// The scripts another job of the workflow calls, each with why it is not a row.
-const CI_ONLY_SCRIPTS: [(&str, &str); 3] = [
+const CI_ONLY_SCRIPTS: [(&str, &str); 4] = [
     ("gate_changes", "the `changes` job: which tier of the workflow runs, from GitHub's comparison of the event's commits (needs GH_TOKEN)"),
     ("gate", "the runner itself, called by the `scripts` job's one gate step"),
     ("sys_imports", "the `cargo` job: it reads blaze-sys's objects compiled for each target, and the gate builds nothing (its selftest is a row)"),
+    ("toolchain_cut", "the `cargo` job: installs the pinned toolchain shelf in ~/.blaze/v2/toolchain before running workspace tests that read it"),
 ];
 
 /// Why the list, the justfile or the workflow is refused (rule 19: each names the file and line).

@@ -1730,7 +1730,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let s = self.kid(f, 0, |v| matches!(v, V::Tok(STRING)));
                 self.done(f);
                 let mut node = Node::of(0);
-                node.a = s.is_some() as u32;
+                node.a = u32::from(s.is_some());
                 self.vals.push(Val { v: V::Abi, id: NONE, node, range: s.map_or(r, |s| s.range) });
             }
             // Bounds and generics.

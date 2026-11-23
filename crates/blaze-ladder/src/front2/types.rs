@@ -1124,7 +1124,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             lf::TypeRef::Ref { mutbl, .. } => intern(tys, PNode::Ref(mutbl, kids[0])),
             lf::TypeRef::Ptr { mutbl, .. } => intern(tys, PNode::Ptr(mutbl, kids[0])),
             lf::TypeRef::Slice(_) => intern(tys, PNode::Slice(kids[0])),
-            lf::TypeRef::Tuple(_) => {
+            lf::TypeRef::Tuple(_) | lf::TypeRef::Record(_) => {
                 let l = intern_list(tys, kids)?;
                 intern(tys, PNode::Tuple(l))
             }
@@ -1880,8 +1880,32 @@ pub(super) fn children(v: &View<'_>, t: lf::TypeId, out: &mut Vec<lf::TypeId, Gl
         lf::TypeRef::Macro(_) => {}
         lf::TypeRef::Pat { base, .. } => out.push(base),
         lf::TypeRef::Record(fields) => {
-            for &n in v.rows(fields)? {
-                out.push(lf::Field::decode(n)?.ty);
+            // Yield record field types in canonical sorted field-name order (matching
+            // `blaze_ty::record_ty::RecordTy`) with zero extra allocation so `make()` and
+            // region lowering see the exact same canonical field order.
+            let rows = v.rows(fields)?;
+            let mut prev: Option<(&str, usize)> = None;
+            for _ in 0..rows.len() {
+                let mut best: Option<(&str, usize, lf::TypeId)> = None;
+                for (i, &n) in rows.iter().enumerate() {
+                    let f = lf::Field::decode(n)?;
+                    let name = match f.name {
+                        Some(n) => v.name_text(n)?,
+                        None => "",
+                    };
+                    if let Some((pn, pi)) = prev
+                        && (name, i) <= (pn, pi)
+                    {
+                        continue;
+                    }
+                    if best.is_none_or(|(bn, bi, _)| (name, i) < (bn, bi)) {
+                        best = Some((name, i, f.ty));
+                    }
+                }
+                if let Some((bn, bi, ty)) = best {
+                    out.push(ty);
+                    prev = Some((bn, bi));
+                }
             }
         }
         lf::TypeRef::For { binder, inner } => {
@@ -2859,7 +2883,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     let own = lifetime_kind(v, lifetime, r, s)?;
                     s.wrap(n, Some(own))
                 }
-                lf::TypeRef::Ptr { .. } | lf::TypeRef::Slice(_) | lf::TypeRef::Array { .. } | lf::TypeRef::Pat { .. } | lf::TypeRef::Tuple(_) | lf::TypeRef::Never => s.wrap(n, None),
+                lf::TypeRef::Ptr { .. } | lf::TypeRef::Slice(_) | lf::TypeRef::Array { .. } | lf::TypeRef::Pat { .. } | lf::TypeRef::Tuple(_) | lf::TypeRef::Record(_) | lf::TypeRef::Never => s.wrap(n, None),
                 lf::TypeRef::FnPtr { ret, .. } => s.fn_ptr(n, ret.is_some(), r)?,
                 lf::TypeRef::For { binder, .. } => s.for_binder(tys.view(), v, binder, made, r)?,
                 lf::TypeRef::Path(p) => self.path_regions(tys, env, v, p, made, args, n, s, r)?,

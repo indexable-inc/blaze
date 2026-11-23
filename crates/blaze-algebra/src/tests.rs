@@ -790,17 +790,22 @@ fn declarative_rules_table_drives_egraph_and_exports_lean4_obligations() {
     let src = lean.as_str();
     assert!(src.contains("namespace BlazeAlgebra.Verified"));
     assert!(src.contains("structure AllSound : Prop where"));
+    let mut pat = blaze_own::String::new_in(heap());
     for r in STANDARD_REWRITE_RULES {
-        let def_pat = std::format!("def rule_{} : Prop :=", r.name);
-        let fld_pat = std::format!("rule_{0} : rule_{0}", r.name);
-        assert!(src.contains(&def_pat), "missing {def_pat} in Lean export");
-        assert!(src.contains(&fld_pat), "missing {fld_pat} in AllSound");
+        pat.clear();
+        let _ = core::fmt::Write::write_fmt(&mut pat, format_args!("def rule_{} : Prop :=", r.name));
+        assert!(src.contains(pat.as_str()), "missing {pat} in Lean export");
+        pat.clear();
+        let _ = core::fmt::Write::write_fmt(&mut pat, format_args!("rule_{0} : rule_{0}", r.name));
+        assert!(src.contains(pat.as_str()), "missing {pat} in AllSound");
     }
     for d in DERIV_RULES {
-        let def_pat = std::format!("def deriv_{} : Prop :=", d.op);
-        let fld_pat = std::format!("deriv_{0} : deriv_{0}", d.op);
-        assert!(src.contains(&def_pat), "missing {def_pat} in Lean export");
-        assert!(src.contains(&fld_pat), "missing {fld_pat} in AllSound");
+        pat.clear();
+        let _ = core::fmt::Write::write_fmt(&mut pat, format_args!("def deriv_{} : Prop :=", d.op));
+        assert!(src.contains(pat.as_str()), "missing {pat} in Lean export");
+        pat.clear();
+        let _ = core::fmt::Write::write_fmt(&mut pat, format_args!("deriv_{0} : deriv_{0}", d.op));
+        assert!(src.contains(pat.as_str()), "missing {pat} in AllSound");
     }
 
     // 3. Zero-drift gate: checked-in `lean/analysis/BlazeDiff/Generated.lean` must match byte-for-byte!

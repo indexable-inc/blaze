@@ -63,6 +63,7 @@ impl Default for Buffers {
                 file_names: crate::names_digest::file_names_digest("", &[]),
                 own_flags: ItemFlags::NONE,
                 flags: ItemFlags::NONE,
+                extensions: parser::Extensions::NONE,
             },
             working: Working::new_in(alloc),
         }
@@ -77,7 +78,7 @@ std::thread_local! {
 impl blaze_mem::scratch::Shelved for Buffers {
     fn empty(&mut self) {
         let Buffers { out, working } = self;
-        let Outline { items, attrs, file_attrs, errors, messages, keys, names, file_names, own_flags, flags } = out;
+        let Outline { items, attrs, file_attrs, errors, messages, keys, names, file_names, own_flags, flags, extensions } = out;
         items.clear();
         attrs.clear();
         errors.clear();
@@ -88,6 +89,7 @@ impl blaze_mem::scratch::Shelved for Buffers {
         *file_attrs = AttrSpan::default();
         *own_flags = ItemFlags::NONE;
         *flags = ItemFlags::NONE;
+        *extensions = parser::Extensions::NONE;
         // The working vectors are cleared by the next outline, each as it starts.
         let Working { rows: _, columns: _, digest: _ } = working;
     }

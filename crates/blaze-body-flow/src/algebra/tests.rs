@@ -7,7 +7,7 @@ use blaze_body::{
 };
 use blaze_own::Alloc;
 
-use crate::{
+use super::{
     BodyAlgebraError, BodyPlant, BodyTransform, CalleeBodyResolver, MathEmitter, MathOp,
     MathResolver, NoMathCalls, ScalarTys, diff_body, diff_body_with_plant, eval_pure_body,
     eval_pure_multi_body, grad_bodies, hvp_body, lift_body, run_body_transform,
@@ -462,6 +462,281 @@ fn hvp_body_and_cpu_fma_simplify_verify_and_match_hessian_oracle() {
 }
 
 #[test]
+fn iterative_lift_region_handles_nested_direct_return_and_nested_diamond_switches() {
+    let f64_ty = PTy(0);
+    let span = Span { lo: 0, hi: 0 };
+
+    // 1. Nested Switch with direct returns (no join block: join = None at both levels):
+    //    if x > 0 { if y > 0 { return x * y; } else { return x - y; } } else { return y * y; }
+    let nested_ret = {
+        let mut b = BodyBuilder::new_in(heap());
+        let l0 = b.new_local(LocalDecl { ty: f64_ty, kind: LocalKind::Return, mutbl: Mutbl::Mut });
+        let lx = b.new_local(LocalDecl { ty: f64_ty, kind: LocalKind::Arg(0), mutbl: Mutbl::Not });
+        let ly = b.new_local(LocalDecl { ty: f64_ty, kind: LocalKind::Arg(1), mutbl: Mutbl::Not });
+        let c1 = b.new_local(LocalDecl {
+            ty: f64_ty,
+            kind: LocalKind::Temp(MirExprId(0), Role::Value),
+            mutbl: Mutbl::Not,
+        });
+        let c2 = b.new_local(LocalDecl {
+            ty: f64_ty,
+            kind: LocalKind::Temp(MirExprId(1), Role::Value),
+            mutbl: Mutbl::Not,
+        });
+        let p0 = b.local_place(l0);
+        let px = b.local_place(lx);
+        let py = b.local_place(ly);
+        let pc1 = b.local_place(c1);
+        let pc2 = b.local_place(c2);
+        let zero = b.new_const(ConstDecl {
+            kind: ConstKind::Scalar { bits: u128::from(0.0_f64.to_bits()) },
+            ty: f64_ty,
+        });
+
+        let bb0 = b.new_block(BlockKind::Normal);
+        let bb_x_pos = b.new_block(BlockKind::Normal);
+        let bb_x_neg = b.new_block(BlockKind::Normal);
+        let bb_xy_pos = b.new_block(BlockKind::Normal);
+        let bb_y_neg = b.new_block(BlockKind::Normal);
+
+        b.start(bb0);
+        b.assign(
+            pc1,
+            blaze_body::Value::Binary {
+                op: BinOp::Gt,
+                lhs: Operand::Copy(px),
+                rhs: Operand::Const(zero),
+            },
+            span,
+        );
+        let cases1 = b.cases(&[(1u128, bb_x_pos)]);
+        b.terminate(
+            StmtKind::Switch { on: Operand::Copy(pc1), cases: cases1, otherwise: bb_x_neg },
+            span,
+        );
+
+        b.start(bb_x_pos);
+        b.assign(
+            pc2,
+            blaze_body::Value::Binary {
+                op: BinOp::Gt,
+                lhs: Operand::Copy(py),
+                rhs: Operand::Const(zero),
+            },
+            span,
+        );
+        let cases2 = b.cases(&[(1u128, bb_xy_pos)]);
+        b.terminate(
+            StmtKind::Switch { on: Operand::Copy(pc2), cases: cases2, otherwise: bb_y_neg },
+            span,
+        );
+
+        b.start(bb_xy_pos);
+        b.assign(
+            p0,
+            blaze_body::Value::Binary {
+                op: BinOp::Mul,
+                lhs: Operand::Copy(px),
+                rhs: Operand::Copy(py),
+            },
+            span,
+        );
+        b.terminate(StmtKind::Return, span);
+
+        b.start(bb_y_neg);
+        b.assign(
+            p0,
+            blaze_body::Value::Binary {
+                op: BinOp::Sub,
+                lhs: Operand::Copy(px),
+                rhs: Operand::Copy(py),
+            },
+            span,
+        );
+        b.terminate(StmtKind::Return, span);
+
+        b.start(bb_x_neg);
+        b.assign(
+            p0,
+            blaze_body::Value::Binary {
+                op: BinOp::Mul,
+                lhs: Operand::Copy(py),
+                rhs: Operand::Copy(py),
+            },
+            span,
+        );
+        b.terminate(StmtKind::Return, span);
+
+        b.finish().expect("valid nested-return switch MIR")
+    };
+
+    let v_ret = verify(&nested_ret).expect("verify nested-return MIR");
+    let dx_ret = diff_body(v_ret, 0, &NoMathCalls, &TestMath, heap()).expect("diff wrt x");
+    let dy_ret = diff_body(v_ret, 1, &NoMathCalls, &TestMath, heap()).expect("diff wrt y");
+    let v_dx_ret = verify(&dx_ret).expect("verify dx");
+    let v_dy_ret = verify(&dy_ret).expect("verify dy");
+
+    // (x, y, expected_val, expected_dx, expected_dy)
+    for (x, y, exp_v, exp_dx, exp_dy) in [
+        (2.0, 3.0, 6.0, 3.0, 2.0),
+        (2.0, -3.0, 5.0, 1.0, -1.0),
+        (-2.0, 3.0, 9.0, 0.0, 6.0),
+        (-2.0, -3.0, 9.0, 0.0, -6.0),
+    ] {
+        let env = [x, y];
+        assert!(close(eval_pure_body(v_ret, &env, &NoMathCalls, heap()).unwrap(), exp_v, 1e-12));
+        assert!(close(eval_pure_body(v_dx_ret, &env, &TestMath, heap()).unwrap(), exp_dx, 1e-12));
+        assert!(close(eval_pure_body(v_dy_ret, &env, &TestMath, heap()).unwrap(), exp_dy, 1e-12));
+    }
+
+    // 2. Nested Switch diamond inside a Switch diamond (join = Some(...) at both levels):
+    //    let out = if x > 0 { if y > 0 { x * y } else { x + y } } else { -x };
+    //    return out * 2.0;
+    let nested_diamond = {
+        let mut b = BodyBuilder::new_in(heap());
+        let l0 = b.new_local(LocalDecl { ty: f64_ty, kind: LocalKind::Return, mutbl: Mutbl::Mut });
+        let lx = b.new_local(LocalDecl { ty: f64_ty, kind: LocalKind::Arg(0), mutbl: Mutbl::Not });
+        let ly = b.new_local(LocalDecl { ty: f64_ty, kind: LocalKind::Arg(1), mutbl: Mutbl::Not });
+        let l_out = b.new_local(LocalDecl {
+            ty: f64_ty,
+            kind: LocalKind::Temp(MirExprId(0), Role::Value),
+            mutbl: Mutbl::Mut,
+        });
+        let c1 = b.new_local(LocalDecl {
+            ty: f64_ty,
+            kind: LocalKind::Temp(MirExprId(1), Role::Value),
+            mutbl: Mutbl::Not,
+        });
+        let c2 = b.new_local(LocalDecl {
+            ty: f64_ty,
+            kind: LocalKind::Temp(MirExprId(2), Role::Value),
+            mutbl: Mutbl::Not,
+        });
+        let p0 = b.local_place(l0);
+        let px = b.local_place(lx);
+        let py = b.local_place(ly);
+        let pout = b.local_place(l_out);
+        let pc1 = b.local_place(c1);
+        let pc2 = b.local_place(c2);
+        let zero = b.new_const(ConstDecl {
+            kind: ConstKind::Scalar { bits: u128::from(0.0_f64.to_bits()) },
+            ty: f64_ty,
+        });
+        let two = b.new_const(ConstDecl {
+            kind: ConstKind::Scalar { bits: u128::from(2.0_f64.to_bits()) },
+            ty: f64_ty,
+        });
+
+        let bb0 = b.new_block(BlockKind::Normal);
+        let bb_x_pos = b.new_block(BlockKind::Normal);
+        let bb_x_neg = b.new_block(BlockKind::Normal);
+        let bb_xy_pos = b.new_block(BlockKind::Normal);
+        let bb_y_neg = b.new_block(BlockKind::Normal);
+        let bb_inner_join = b.new_block(BlockKind::Normal);
+        let bb_outer_join = b.new_block(BlockKind::Normal);
+
+        b.start(bb0);
+        b.assign(
+            pc1,
+            blaze_body::Value::Binary {
+                op: BinOp::Gt,
+                lhs: Operand::Copy(px),
+                rhs: Operand::Const(zero),
+            },
+            span,
+        );
+        let cases1 = b.cases(&[(1u128, bb_x_pos)]);
+        b.terminate(
+            StmtKind::Switch { on: Operand::Copy(pc1), cases: cases1, otherwise: bb_x_neg },
+            span,
+        );
+
+        b.start(bb_x_pos);
+        b.assign(
+            pc2,
+            blaze_body::Value::Binary {
+                op: BinOp::Gt,
+                lhs: Operand::Copy(py),
+                rhs: Operand::Const(zero),
+            },
+            span,
+        );
+        let cases2 = b.cases(&[(1u128, bb_xy_pos)]);
+        b.terminate(
+            StmtKind::Switch { on: Operand::Copy(pc2), cases: cases2, otherwise: bb_y_neg },
+            span,
+        );
+
+        b.start(bb_xy_pos);
+        b.assign(
+            pout,
+            blaze_body::Value::Binary {
+                op: BinOp::Mul,
+                lhs: Operand::Copy(px),
+                rhs: Operand::Copy(py),
+            },
+            span,
+        );
+        b.terminate(StmtKind::Goto(bb_inner_join), span);
+
+        b.start(bb_y_neg);
+        b.assign(
+            pout,
+            blaze_body::Value::Binary {
+                op: BinOp::Add,
+                lhs: Operand::Copy(px),
+                rhs: Operand::Copy(py),
+            },
+            span,
+        );
+        b.terminate(StmtKind::Goto(bb_inner_join), span);
+
+        b.start(bb_inner_join);
+        b.terminate(StmtKind::Goto(bb_outer_join), span);
+
+        b.start(bb_x_neg);
+        b.assign(
+            pout,
+            blaze_body::Value::Unary { op: blaze_body::UnOp::Neg, operand: Operand::Copy(px) },
+            span,
+        );
+        b.terminate(StmtKind::Goto(bb_outer_join), span);
+
+        b.start(bb_outer_join);
+        b.assign(
+            p0,
+            blaze_body::Value::Binary {
+                op: BinOp::Mul,
+                lhs: Operand::Copy(pout),
+                rhs: Operand::Const(two),
+            },
+            span,
+        );
+        b.terminate(StmtKind::Return, span);
+
+        b.finish().expect("valid nested-diamond switch MIR")
+    };
+
+    let v_dia = verify(&nested_diamond).expect("verify nested-diamond MIR");
+    let dx_dia = diff_body(v_dia, 0, &NoMathCalls, &TestMath, heap()).expect("diff diamond wrt x");
+    let dy_dia = diff_body(v_dia, 1, &NoMathCalls, &TestMath, heap()).expect("diff diamond wrt y");
+    let v_dx_dia = verify(&dx_dia).expect("verify diamond dx");
+    let v_dy_dia = verify(&dy_dia).expect("verify diamond dy");
+
+    for (x, y, exp_v, exp_dx, exp_dy) in [
+        (2.0, 3.0, 12.0, 6.0, 4.0),
+        (2.0, -3.0, -2.0, 2.0, 2.0),
+        (-2.0, 3.0, 4.0, -2.0, 0.0),
+        (-2.0, -3.0, 4.0, -2.0, 0.0),
+    ] {
+        let env = [x, y];
+        assert!(close(eval_pure_body(v_dia, &env, &NoMathCalls, heap()).unwrap(), exp_v, 1e-12));
+        assert!(close(eval_pure_body(v_dx_dia, &env, &TestMath, heap()).unwrap(), exp_dx, 1e-12));
+        assert!(close(eval_pure_body(v_dy_dia, &env, &TestMath, heap()).unwrap(), exp_dy, 1e-12));
+    }
+}
+
+#[test]
 fn unrolled_loop_and_fixed_array_dot_product_lifts_differentiates_and_splices() {
     // Build a real Rust MIR loop kernel:
     //   fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
@@ -822,8 +1097,8 @@ fn real_typeck_body_lower_algebra_fma_body_build_native_lir_pipeline() {
     // 1. Real typeck world with `fn spring(x: f64, y: f64) -> f64` and `fn loss(x: f64, y: f64) -> f64`.
     let mut fx = Fx::new();
     let f64_fx = fx.ty(PNode::Float(FloatTy::F64));
-    let spring_key = fx.func("spring", 0, &[f64_fx, f64_fx], f64_fx, std::vec::Vec::new());
-    let loss_key = fx.func("loss", 0, &[f64_fx, f64_fx], f64_fx, std::vec::Vec::new());
+    let spring_key = fx.func("spring", 0, &[f64_fx, f64_fx], f64_fx, Default::default());
+    let loss_key = fx.func("loss", 0, &[f64_fx, f64_fx], f64_fx, Default::default());
     fx.finish();
 
     // Helper for building typeck expressions on `Bb`.
@@ -838,10 +1113,10 @@ fn real_typeck_body_lower_algebra_fma_body_build_native_lir_pipeline() {
         id
     };
 
-    struct FloatFacts {
-        floats: std::vec::Vec<(TyExprId, f64)>,
+    struct FloatFacts<'a> {
+        floats: &'a [(TyExprId, f64)],
     }
-    impl Facts for FloatFacts {
+    impl Facts for FloatFacts<'_> {
         fn regions(&self) -> &dyn blaze_flow_lower::RegionFacts { &blaze_flow_lower::NoRegions }
         fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> { None }
         fn adt_variances(&self, _: ItemKey) -> Option<&[blaze_flow_lower::Variance]> { None }
@@ -872,14 +1147,14 @@ fn real_typeck_body_lower_algebra_fma_body_build_native_lir_pipeline() {
         fn field_count(&self, _: ItemKey, _: u32) -> Option<u32> { None }
         fn param_copy(&self, _: u32) -> bool { true }
     }
-    impl BodyFacts for FloatFacts {
+    impl BodyFacts for FloatFacts<'_> {
         fn float_lit(&self, e: TyExprId) -> Option<u128> {
             self.floats.iter().find(|&&(id, _)| id == e).map(|&(_, v)| u128::from(v.to_bits()))
         }
         fn trait_item(&self, _: ItemKey) -> Option<bool> { Some(false) }
     }
 
-    let check_and_lower = |fx: &Fx, b: &Bb, owner: ItemKey, root: TyExprId, facts: &FloatFacts| -> (Checked<'static>, Body<Alloc<'static>>) {
+    let check_and_lower = |fx: &Fx, b: &Bb, owner: ItemKey, root: TyExprId, facts: &FloatFacts<'_>| -> (Checked<'static>, Body<Alloc<'static>>) {
         let mut cx = InferCtx::new_in(heap());
         let view = b.view(owner, root);
         let ck = match blaze_typeck::check(&view, fx, &mut cx, &Needs::new_in(heap()), heap()) {
@@ -907,7 +1182,7 @@ fn real_typeck_body_lower_algebra_fma_body_build_native_lir_pipeline() {
     let sx3 = bs.local(sx);
     let s_2x = mk_bin(&mut bs, TyBinOp::Mul, lit2, sx3);
     let spring_root = mk_bin(&mut bs, TyBinOp::Add, s_x2y, s_2x);
-    let spring_facts = FloatFacts { floats: std::vec![(lit2, 2.0)] };
+    let spring_facts = FloatFacts { floats: &[(lit2, 2.0)] };
     let (_ck_spring, spring_mir) = check_and_lower(&fx, &bs, spring_key, spring_root, &spring_facts);
     let v_spring = verify(&spring_mir).expect("lowered spring MIR verifies");
 
@@ -940,7 +1215,7 @@ fn real_typeck_body_lower_algebra_fma_body_build_native_lir_pipeline() {
 
     let if_e = mk_if(&mut bl, cond, then_e, else_e);
     let loss_root = bl.block(&[let_s], Some(if_e));
-    let loss_facts = FloatFacts { floats: std::vec![(lit10, 10.0), (lit3, 3.0)] };
+    let loss_facts = FloatFacts { floats: &[(lit10, 10.0), (lit3, 3.0)] };
     let (ck_loss, loss_mir) = check_and_lower(&fx, &bl, loss_key, loss_root, &loss_facts);
     let v_loss = verify(&loss_mir).expect("lowered loss MIR verifies");
 

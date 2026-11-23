@@ -121,7 +121,7 @@ impl<'a> Tree<'a> {
 
     /// Never: a tree has a root.
     pub const fn is_empty(&self) -> bool {
-        self.kinds.len() == 0
+        self.kinds.is_empty()
     }
 
     /// The root, element 0.
@@ -427,7 +427,7 @@ impl<'a> Built<'a> {
 
     /// Whether it has none (a derive that writes nothing).
     pub const fn is_empty(&self) -> bool {
-        self.kinds.len() == 0
+        self.kinds.is_empty()
     }
 
     #[cfg(test)]

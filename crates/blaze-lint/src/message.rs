@@ -228,6 +228,55 @@ pub fn show_message<P: Put + ?Sized>(rules: &RuleSet, item: &str, findings: &Fin
         Template::RefMut => {
             out.str("`").str(range).str("` is deprecated in Blaze: spell unique reference bindings `ref uniq`");
         }
+        Template::MagicSlicePrefix => {
+            let rhs = span(0).unwrap_or("..");
+            out.str("magic slice range `").str(range).str("` hardcodes the length of `").str(rhs)
+                .str("`: derive it with `strip_prefix(").str(rhs).str(")` (to also advance past the prefix) or `starts_with(")
+                .str(rhs).str(")`");
+        }
+        Template::MagicSlicePrefixMismatch => {
+            let rhs = span(0).unwrap_or("..");
+            out.str("magic slice range `").str(range).str("` has a hardcoded length that does not match `").str(rhs)
+                .str("` (this comparison can never succeed): use `strip_prefix(").str(rhs).str(")` or `starts_with(")
+                .str(rhs).str(")` so the length is derived");
+        }
+        Template::MagicSliceAdvance => {
+            let prefix = span(0).unwrap_or("..");
+            out.str("hardcoded advance `").str(range).str("` after `starts_with(").str(prefix)
+                .str(")`: derive the remainder directly with `if let Some(rest) = ..strip_prefix(").str(prefix).str(")`");
+        }
+        Template::MagicSliceBytes => {
+            out.str("magic byte-slice length in `").str(range)
+                .str("`: derive it from `core::mem::size_of::<T>()`, a named `const`, or use `split_first_chunk` / a typed reader");
+        }
+        Template::MagicSliceRange => {
+            out.str("magic slice range `").str(range)
+                .str("`: derive the length from `strip_prefix`, `.len()`, or `size_of::<T>()`, or bind a named `const` instead of hardcoding a literal");
+        }
+        Template::BoolAsInt => {
+            let ty = span(0).unwrap_or("usize");
+            out.str("boolean-to-integer cast `").str(range).str("`: use infallible `").str(ty).str("::from(..)`");
+        }
+        Template::LenZeroCheck => {
+            out.str("manual emptiness check `").str(range).str("`: use `.is_empty()`");
+        }
+        Template::IndexLoop => {
+            let slice = span(0).unwrap_or("slice");
+            out.str("index loop `").str(range).str("` indexes `").str(slice)
+                .str("[..]` directly (unchecked stop + bounds check): iterate with `for x in &").str(slice)
+                .str("` or `").str(slice).str(".iter().enumerate()`");
+        }
+        Template::ManualFindSplit => {
+            let pat = span(0).unwrap_or("pat");
+            out.str("manual slice split after `.find(").str(pat)
+                .str(")` at `").str(range).str("`: use `.split_once(").str(pat).str(")` to derive both halves without manual offsets");
+        }
+        Template::TestGlobalAlloc => {
+            out.str("`Alloc::global()` inside test code trips `alloc_global_tests`: use `blaze_own::testing::heap().alloc()`");
+        }
+        Template::TestExternStd => {
+            out.str("`extern crate std;` in test code trips `std-alloc-tests`: keep tests `#![no_std]` with `blaze_own::testing::heap().alloc()` and `core::fmt`");
+        }
         Template::VariantCount | Template::VariantCountMany => {
             let names = || {
                 args.iter().filter_map(|arg| match arg {

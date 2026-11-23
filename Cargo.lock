@@ -236,23 +236,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blaze-algebra-body"
-version = "0.0.0"
-dependencies = [
- "blaze-algebra",
- "blaze-body",
- "blaze-body-build",
- "blaze-body-lower",
- "blaze-build",
- "blaze-flow-lower",
- "blaze-lir",
- "blaze-math",
- "blaze-own",
- "blaze-sim",
- "blaze-typeck",
-]
-
-[[package]]
 name = "blaze-alloc-count"
 version = "0.0.0"
 
@@ -399,11 +382,17 @@ dependencies = [
 name = "blaze-body-flow"
 version = "0.0.0"
 dependencies = [
+ "blaze-algebra",
  "blaze-body",
+ "blaze-body-build",
  "blaze-body-lower",
+ "blaze-build",
  "blaze-flow",
  "blaze-flow-lower",
+ "blaze-lir",
+ "blaze-math",
  "blaze-own",
+ "blaze-sim",
  "blaze-typeck",
 ]
 

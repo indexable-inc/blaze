@@ -647,6 +647,10 @@ fn new_rules_are_off_until_named() {
         Rule::DoubleIndirectionArc,
         Rule::RawSandboxExec,
         Rule::MutRef,
+        Rule::MagicSliceLen,
+        Rule::BoolAsInt,
+        Rule::ManualSliceIdioms,
+        Rule::TestAmbientLeak,
     ] {
         assert!(!Step::Strict.rules().runs(rule), "{} runs in strict", rule.name());
         assert!(Step::Strict.rules().with(rule).runs(rule));
@@ -2183,4 +2187,195 @@ fn clone_handle_autofixes_rc_to_local_share_and_arc_to_share() {
     out.clear();
     assert!(lint(&only, &Unit { text: fixed.as_str(), holes: &[], scope: FILE }, alloc, &mut out).is_ok());
     assert!(out.list.is_empty(), "fixed code must have zero clone findings");
+}
+
+#[test]
+fn magic_slice_len_detects_and_autofixes() {
+    let rule = Rule::MagicSliceLen;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(Rule::from_name("magic-slice-len"), Some(rule));
+    assert_eq!(Rule::from_lint("magic_slice_len"), Some(rule));
+    assert_eq!(Template::MagicSlicePrefix.rule(), rule);
+    assert_eq!(Template::MagicSlicePrefixMismatch.rule(), rule);
+    assert_eq!(Template::MagicSliceAdvance.rule(), rule);
+    assert_eq!(Template::MagicSliceBytes.rule(), rule);
+    assert_eq!(Template::MagicSliceRange.rule(), rule);
+    assert!(Step::Edition.rules().runs(rule), "Step::Edition runs magic-slice-len");
+    assert!(!Step::Rust.rules().runs(rule));
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+
+    // 1. Auto-fixable prefix comparisons (`0..3`, `..4`, `&x[..7] == b".."`, `.get(..4).is_some_and`).
+    let autofix_src = "fn f(bytes: &[u8], sect: &[u8]) -> bool { bytes.get(0..3) == Some(&[0xEF, 0xBB, 0xBF]) && bytes.get(..4) == Some(b\"RIFF\") && &sect[..7] == b\"__text\\0\" && bytes.get(..4).is_some_and(|m| m == b\"WEBP\") }";
+    assert!(lint(&only, &Unit { text: autofix_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 4, "expected 4 prefix findings");
+    assert!(out.list.iter().all(|f| f.template == Template::MagicSlicePrefix));
+    let mut msg = OwnString::new_in(alloc);
+    show_message(&only, autofix_src, &out, &out.list[0], &mut msg);
+    assert!(msg.as_str().contains("strip_prefix(&[0xEF, 0xBB, 0xBF])"), "{}", msg.as_str());
+    let fixed = apply_all(autofix_src, &out, alloc).expect("autofix applies cleanly");
+    assert_eq!(
+        fixed.as_str(),
+        "fn f(bytes: &[u8], sect: &[u8]) -> bool { bytes.starts_with(&[0xEF, 0xBB, 0xBF]) && bytes.starts_with(b\"RIFF\") && sect.starts_with(b\"__text\\0\") && bytes.starts_with(b\"WEBP\") }"
+    );
+    // Re-linting fixed output produces zero findings!
+    out.clear();
+    assert!(lint(&only, &Unit { text: fixed.as_str(), holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert!(out.list.is_empty(), "fixed code must have zero magic-slice-len findings");
+
+    // 2. Cursor prefix (`at..at + 2 == Some(b"//")`), `&sect[..7] == b"__text\0"`, and `.is_some_and`.
+    let cursor_src = r#"fn f(bytes: &[u8], at: usize, entry: &[u8]) -> bool {
+        if bytes.get(at..at + 2) == Some(b"//") { return true; }
+        if &bytes[..7] == b"__text\0" { return true; }
+        entry.get(..8).is_some_and(|m| m == MAGIC)
+    }"#;
+    out.clear();
+    assert!(lint(&only, &Unit { text: cursor_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 3, "expected 3 prefix findings");
+    assert!(out.list.iter().all(|f| f.template == Template::MagicSlicePrefix));
+
+    // 3. Bug detector: hardcoded length mismatches literal length (`0..4` vs `b"//"`).
+    let mismatch_src = "fn f(bytes: &[u8]) -> bool { bytes.get(0..4) == Some(b\"//\") }";
+    out.clear();
+    assert!(lint(&only, &Unit { text: mismatch_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 1);
+    assert_eq!(out.list[0].template, Template::MagicSlicePrefixMismatch);
+    assert!(out.list[0].fixes.is_empty(), "mismatched length bug must not silently autofix");
+
+    // 4. `starts_with` followed by hardcoded `[N..]` or `+= N` advance.
+    let adv_src = r#"fn f(s: &str, mut at: usize) -> &str {
+        if s.starts_with("0x") { return &s[2..]; }
+        if s.starts_with("//") { at += 2; }
+        let _ = at;
+        s
+    }"#;
+    out.clear();
+    assert!(lint(&only, &Unit { text: adv_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 2);
+    assert!(out.list.iter().all(|f| f.template == Template::MagicSliceAdvance));
+
+    // 5. Standalone byte-width `.get(at..at + 4)?.try_into()` vs general `.get(0..3)`.
+    let standalone_src = r#"fn f(bytes: &[u8], at: usize) -> Option<&[u8]> {
+        let _w: [u8; 4] = bytes.get(at..at + 4)?.try_into().ok()?;
+        bytes.get(0..3)
+    }"#;
+    out.clear();
+    assert!(lint(&only, &Unit { text: standalone_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 2);
+    assert_eq!(out.list[0].template, Template::MagicSliceBytes);
+    assert_eq!(out.list[1].template, Template::MagicSliceRange);
+
+    // 6. Negative controls: clean derived code & tests must produce zero findings.
+    none(rule, &[
+        "fn f(text: &str) -> Option<&str> { text.strip_prefix(\"//\") }",
+        "fn f(bytes: &[u8]) -> bool { bytes.starts_with(&[0xEF, 0xBB, 0xBF]) }",
+        "fn f(bytes: &[u8]) -> Option<&[u8]> { bytes.get(..MAGIC.len()) }",
+        "fn f(bytes: &[u8], at: usize) -> Option<&[u8]> { bytes.get(at..at + HEADER_LEN) }",
+        "fn f(bytes: &[u8], at: usize) -> Option<&[u8]> { bytes.get(at..at + size_of::<u32>()) }",
+        "fn f(bytes: &[u8], start: usize, end: usize) -> Option<&[u8]> { bytes.get(start..end) }",
+        "fn f(bytes: &[u8]) -> Option<&u8> { bytes.get(0) }",
+        "#[test]\nfn t() { let b = b\"abc\"; assert!(b.get(0..3) == Some(b\"abc\")); }",
+    ]);
+}
+
+#[test]
+fn bool_as_int_detects_and_autofixes() {
+    let rule = Rule::BoolAsInt;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(Rule::from_name("bool-as-int"), Some(rule));
+    assert_eq!(Rule::from_lint("bool_as_int"), Some(rule));
+    assert_eq!(Template::BoolAsInt.rule(), rule);
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+    let src = "fn f(a: u32, b: u32, opt: Option<u8>) -> usize { (a == b) as usize + opt.is_some() as usize + (a < b) as usize + true as usize }";
+    assert!(lint(&only, &Unit { text: src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 4);
+    let fixed = apply_all(src, &out, alloc).expect("autofix applies cleanly");
+    assert_eq!(
+        fixed.as_str(),
+        "fn f(a: u32, b: u32, opt: Option<u8>) -> usize { usize::from(a == b) + usize::from(opt.is_some()) + usize::from(a < b) + usize::from(true) }"
+    );
+    out.clear();
+    assert!(lint(&only, &Unit { text: fixed.as_str(), holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert!(out.list.is_empty());
+
+    none(rule, &[
+        "fn f(x: u32) -> u64 { x as u64 }",
+        "fn f(x: usize) -> u32 { (x + 1) as u32 }",
+        "fn f(x: u32) -> usize { (x << 2) as usize }",
+        "fn f(mask: u32) -> u64 { (!mask) as u64 }",
+        "fn f() -> u32 { (size_of::<u64>() / size_of::<u32>()) as u32 }",
+        "const fn f(a: u32, b: u32) -> u32 { (a == b) as u32 }",
+        "fn f(b: bool) -> usize { usize::from(b) }",
+    ]);
+}
+
+#[test]
+fn manual_slice_idioms_detects_and_autofixes() {
+    let rule = Rule::ManualSliceIdioms;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(Rule::from_name("manual-slice-idioms"), Some(rule));
+    assert_eq!(Rule::from_lint("manual_slice_idioms"), Some(rule));
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+
+    // 1. `.len() == 0` / `.len() > 0` / `.len() != 0` / `.len() >= 1` -> `is_empty()` / `!is_empty()`.
+    let len_src = "fn f(xs: &[u8], ys: &[u8]) -> bool { xs.len() == 0 && ys.len() > 0 && xs.len() != 0 && ys.len() >= 1 }";
+    assert!(lint(&only, &Unit { text: len_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 4);
+    assert!(out.list.iter().all(|f| f.template == Template::LenZeroCheck));
+    let fixed = apply_all(len_src, &out, alloc).expect("autofix applies cleanly");
+    assert_eq!(
+        fixed.as_str(),
+        "fn f(xs: &[u8], ys: &[u8]) -> bool { xs.is_empty() && !ys.is_empty() && !xs.is_empty() && !ys.is_empty() }"
+    );
+    out.clear();
+    assert!(lint(&only, &Unit { text: fixed.as_str(), holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert!(out.list.is_empty());
+
+    // 2. Index loop `for i in 0..xs.len() { let _ = xs[i]; }`.
+    let loop_src = "fn f(xs: &[u8]) -> u8 { let mut s = 0; for i in 0..xs.len() { s += xs[i]; } s }";
+    out.clear();
+    assert!(lint(&only, &Unit { text: loop_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 1);
+    assert_eq!(out.list[0].template, Template::IndexLoop);
+
+    // 3. `.find('\n')` followed by `[..pos]` / `[pos + 1..]`.
+    let find_src = "fn f(s: &str) -> (&str, &str) { if let Some(pos) = s.find(':') { (&s[..pos], &s[pos + 1..]) } else { (s, \"\") } }";
+    out.clear();
+    assert!(lint(&only, &Unit { text: find_src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 1);
+    assert_eq!(out.list[0].template, Template::ManualFindSplit);
+
+    none(rule, &[
+        "fn f(xs: &[u8], ys: &[u8]) -> bool { xs.is_empty() || xs.len() == 2 || xs.len() >= 1 << 20 || xs.len() + ys.len() >= 1 }",
+        "impl S { pub fn is_empty(&self) -> bool { self.len() == 0 } }",
+        "fn f(xs: &[u8]) -> u8 { let mut s = 0; for &x in xs { s += x; } s }",
+        "fn f(s: &str) -> Option<(&str, &str)> { s.split_once(':') }",
+    ]);
+}
+
+#[test]
+fn test_ambient_leak_catches_test_global_alloc_and_extern_std() {
+    let rule = Rule::TestAmbientLeak;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(Rule::from_name("test-ambient-leak"), Some(rule));
+    assert_eq!(Rule::from_lint("test_ambient_leak"), Some(rule));
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+    let src = "#[cfg(test)]\nextern crate std;\n#[test]\nfn t() { let _a = Alloc::global(); }\n";
+    assert!(lint(&only, &Unit { text: src, holes: &[], scope: FILE }, alloc, &mut out).is_ok());
+    assert_eq!(out.list.len(), 2);
+    assert_eq!(out.list[0].template, Template::TestExternStd);
+    assert_eq!(out.list[1].template, Template::TestGlobalAlloc);
+
+    // Outside tests, `test-ambient-leak` stays silent (other rules cover production code).
+    none(rule, &[
+        "extern crate std;\nfn prod() { let _a = Alloc::global(); }",
+        "#[test]\nfn clean() { let heap = blaze_own::testing::heap(); let _a = heap.alloc(); }",
+    ]);
 }

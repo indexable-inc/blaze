@@ -261,6 +261,22 @@ pub enum Rule {
     /// Does not flag `let mut`, `*mut`, `&raw mut`, or `mut x` bindings.
     /// The lint `blaze::mut_ref`.
     MutRef = 36,
+    /// Hardcoded magic slice range length (`bytes.get(0..3) == Some(..)`, `bytes.get(at..at + 2)`,
+    /// `&s[..7] == b".."`, or `starts_with` followed by a hardcoded advance) where the length should
+    /// be derived via `strip_prefix`, `starts_with`, `.len()`, `size_of::<T>()`, or a named `const`.
+    /// The lint `blaze::magic_slice_len`.
+    MagicSliceLen = 37,
+    /// Boolean-to-integer `as` cast (`(a == b) as u32`, `x.is_some() as usize`) that should use
+    /// infallible `T::from(..)` (with mechanical auto-fix). The lint `blaze::bool_as_int`.
+    BoolAsInt = 38,
+    /// Manual slice length/index idioms (`x.len() == 0` / `x.len() > 0` -> `is_empty()`,
+    /// `for i in 0..xs.len()` indexing `xs[i]`, `.find(..)` followed by manual slicing instead of
+    /// `split_once`). The lint `blaze::manual_slice_idioms`.
+    ManualSliceIdioms = 39,
+    /// Test-code ambient leaks (`Alloc::global()` in tests and `#[cfg(test)] extern crate std;`)
+    /// that trip Blaze's `alloc_global_tests` and `std-alloc-tests` ratchets.
+    /// The lint `blaze::test_ambient_leak`.
+    TestAmbientLeak = 40,
 }
 
 impl Rule {
@@ -305,6 +321,10 @@ impl Rule {
         Rule::DoubleIndirectionArc,
         Rule::RawSandboxExec,
         Rule::MutRef,
+        Rule::MagicSliceLen,
+        Rule::BoolAsInt,
+        Rule::ManualSliceIdioms,
+        Rule::TestAmbientLeak,
     ];
 
     /// The ten rules ported from blaze's scripts: what [`Step::Strict`] runs. The rules after
@@ -365,6 +385,10 @@ impl Rule {
             Rule::DoubleIndirectionArc => "double-indirection-arc",
             Rule::RawSandboxExec => "raw-sandbox-exec",
             Rule::MutRef => "mut-ref",
+            Rule::MagicSliceLen => "magic-slice-len",
+            Rule::BoolAsInt => "bool-as-int",
+            Rule::ManualSliceIdioms => "manual-slice-idioms",
+            Rule::TestAmbientLeak => "test-ambient-leak",
         }
     }
 
@@ -397,6 +421,10 @@ impl Rule {
             Rule::DoubleIndirectionArc => Some("double_indirection_arc"),
             Rule::RawSandboxExec => Some("raw_sandbox_exec"),
             Rule::MutRef => Some("mut_ref"),
+            Rule::MagicSliceLen => Some("magic_slice_len"),
+            Rule::BoolAsInt => Some("bool_as_int"),
+            Rule::ManualSliceIdioms => Some("manual_slice_idioms"),
+            Rule::TestAmbientLeak => Some("test_ambient_leak"),
             _ => None,
         }
     }
@@ -441,7 +469,7 @@ impl Rule {
     pub const fn exempt(self) -> TestBits {
         match self {
             Rule::Allocs => TestBits::CFG,
-            Rule::UnsafeComment | Rule::VariantCount | Rule::MutRef => TestBits::NONE,
+            Rule::UnsafeComment | Rule::VariantCount | Rule::MutRef | Rule::TestAmbientLeak => TestBits::NONE,
             _ => TestBits::ANY,
         }
     }
@@ -611,6 +639,36 @@ pub enum Template {
     MutRef = 320,
     /// Deprecated `ref mut` binding mode; fixed mechanically to `ref uniq`.
     RefMut = 321,
+    /// Hardcoded slice range compared to a prefix (`bytes.get(0..3) == Some(rhs)`,
+    /// `bytes.get(at..at + 2) == Some(rhs)`, `&s[..7] == rhs`); argument: `rhs` span.
+    /// Fixed mechanically to `.starts_with(..)` when the range starts at 0 and uses `== Some(..)`.
+    MagicSlicePrefix = 330,
+    /// Hardcoded slice range whose literal length does NOT match the compared literal prefix (bug!);
+    /// argument: `rhs` span.
+    MagicSlicePrefixMismatch = 331,
+    /// `x.starts_with(lit)` followed immediately by a hardcoded advance (`+= N`, `= N`, or `[N..]`);
+    /// argument: `lit` span.
+    MagicSliceAdvance = 332,
+    /// Hardcoded byte-width slice `.get(0..N)` / `.get(at..at + N)` feeding `.try_into()` or a
+    /// fixed-width integer decode (`2`, `4`, `8`, `16` bytes).
+    MagicSliceBytes = 333,
+    /// Standalone hardcoded magic slice range `.get(0..N)` / `.get(..N)` / `.get(at..at + N)`
+    /// where `N` is a bare integer literal instead of a derived length or named `const`.
+    MagicSliceRange = 334,
+    /// Boolean-to-integer `as` cast (`(a == b) as u32`, `x.is_some() as usize`); argument: target
+    /// integer type span. Fixed mechanically to `T::from(..)`.
+    BoolAsInt = 340,
+    /// `x.len() == 0` / `x.len() > 0` / `x.len() != 0` / `x.len() >= 1`; fixed mechanically to
+    /// `x.is_empty()` / `!x.is_empty()`.
+    LenZeroCheck = 350,
+    /// `for i in 0..xs.len()` indexing `xs[i]` in its body; argument: indexed slice span.
+    IndexLoop = 351,
+    /// `.find(pat)` followed by manual slice splitting `[..pos]` / `[pos + 1..]`; argument: `pat`.
+    ManualFindSplit = 352,
+    /// `Alloc::global()` inside test code (trips `alloc_global_tests`).
+    TestGlobalAlloc = 360,
+    /// `#[cfg(test)] extern crate std;` (trips `std-alloc-tests`).
+    TestExternStd = 361,
 }
 
 impl Template {
@@ -650,6 +708,10 @@ impl Template {
             300 => Rule::DoubleIndirectionArc,
             310 => Rule::RawSandboxExec,
             320..=321 => Rule::MutRef,
+            330..=334 => Rule::MagicSliceLen,
+            340 => Rule::BoolAsInt,
+            350..=352 => Rule::ManualSliceIdioms,
+            360..=361 => Rule::TestAmbientLeak,
             _ => Rule::VariantCount,
         }
     }
@@ -731,6 +793,17 @@ impl Template {
             Template::RawSandboxExec => "raw-sandbox-exec",
             Template::MutRef => "mut-ref",
             Template::RefMut => "ref-mut",
+            Template::MagicSlicePrefix => "magic-slice-prefix",
+            Template::MagicSlicePrefixMismatch => "magic-slice-prefix-mismatch",
+            Template::MagicSliceAdvance => "magic-slice-advance",
+            Template::MagicSliceBytes => "magic-slice-bytes",
+            Template::MagicSliceRange => "magic-slice-range",
+            Template::BoolAsInt => "bool-as-int",
+            Template::LenZeroCheck => "len-zero-check",
+            Template::IndexLoop => "index-loop",
+            Template::ManualFindSplit => "manual-find-split",
+            Template::TestGlobalAlloc => "test-global-alloc",
+            Template::TestExternStd => "test-extern-std",
         }
     }
 }
@@ -1293,7 +1366,7 @@ impl Step {
     /// toolchain has.
     pub const SUGGEST: [Rule; 4] = [Rule::UnsafeComment, Rule::Untyped, Rule::Recursion, Rule::VariantCount];
     /// The rules of [`Step::Edition`].
-    pub const EDITION: [Rule; 8] = [
+    pub const EDITION: [Rule; 12] = [
         Rule::UnsafeComment,
         Rule::Untyped,
         Rule::Recursion,
@@ -1302,6 +1375,10 @@ impl Step {
         Rule::Casts,
         Rule::Clones,
         Rule::MutRef,
+        Rule::MagicSliceLen,
+        Rule::BoolAsInt,
+        Rule::ManualSliceIdioms,
+        Rule::TestAmbientLeak,
     ];
 
     /// The step as configuration writes it (`rust`, `suggest`, `edition`, `strict`).

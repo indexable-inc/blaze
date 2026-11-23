@@ -201,7 +201,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
             return Err(self.unsupported("a vector float intrinsic call"));
         }
         let arity = fc.func.arity();
-        if args.len() as usize != arity {
+        if usize::try_from(args.len()).ok() != Some(arity) {
             return Err(self.malformed("a float intrinsic call with the wrong number of arguments"));
         }
         let ops: Vec<Operand, A> = {
@@ -211,19 +211,20 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         };
         let mut vals = [Value(0); 3];
         let elem = fc.shape.elem();
-        for (i, &o) in ops.iter().enumerate() {
+        for (slot, &o) in vals.iter_mut().zip(ops.iter()) {
             let (x, _) = self.operand(o)?;
             let v = self.scalar(x)?;
             if self.b.ty(v) != elem {
                 return Err(self.malformed("a float intrinsic argument of the wrong scalar type"));
             }
-            vals[i] = v;
+            *slot = v;
         }
+        let [v0, v1, v2] = vals;
         let op = fc.func.op();
         let res = match arity {
-            1 => self.b.unary(op, Flags::NONE, vals[0]),
-            2 => self.b.binary(op, Flags::NONE, vals[0], vals[1]),
-            3 => self.b.ternary(op, Flags::NONE, vals[0], vals[1], vals[2]),
+            1 => self.b.unary(op, Flags::NONE, v0),
+            2 => self.b.binary(op, Flags::NONE, v0, v1),
+            3 => self.b.ternary(op, Flags::NONE, v0, v1, v2),
             _ => return Err(self.malformed("a float intrinsic of unsupported arity")),
         };
         if let Some(dest) = dest {

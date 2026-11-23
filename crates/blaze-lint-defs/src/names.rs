@@ -127,6 +127,10 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::unmarked_noalloc",
             "blaze::unmarked_nonblocking",
             "blaze::mut_ref",
+            "blaze::magic_slice_len",
+            "blaze::bool_as_int",
+            "blaze::manual_slice_idioms",
+            "blaze::test_ambient_leak",
             // Code written the way the edition wants it (docs/v2/plan/design/facts.md).
             "blaze::program_lifetime",
         ],

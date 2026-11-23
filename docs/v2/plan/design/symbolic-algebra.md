@@ -76,7 +76,7 @@ re-exported as `bstd::algebra`), backed by two small compiler seams when lifting
      simplification, and `eval_const` inside `const` items today.
    - `emit_rust_fn` and multi-output `emit_rust_multi_fn` emit zero-allocation, CSE-shared SSA
      Rust functions (`pub fn f_and_grad(...) -> [f64; K]`) over `blaze_math`.
-7. **Proof-Carrying MIR Compiler Seam (`crates/blaze-algebra-body`) & Native Float/Intrinsic LIR Lowering (`crates/blaze-body-build`)**:
+7. **Proof-Carrying MIR Compiler Seam (`crates/blaze-body-flow/src/algebra`) & Native Float/Intrinsic LIR Lowering (`crates/blaze-body-build`)**:
    - `lift_body` / `lift_body_with_helpers`: lifts verified pure `blaze_body::Verified<'_>` —
      including comparison `StmtKind::Switch` diamonds (both `case 1` and `blaze-body-lower`'s
      `case 0` conventions), nested `if/else` returns, constant-trip-count `for i in 0..K` loops
@@ -101,7 +101,8 @@ re-exported as `bstd::algebra`), backed by two small compiler seams when lifting
      scalar hardware float intrinsics (`Intrinsic::Target(Target::Float(_))`: `Op::Fma`, `Op::Sqrt`,
      `Op::Fabs`, `Op::Floor`, `Op::Ceil`, `Op::Ftrunc`, `Op::Fround`, `Op::Nearest`, `Op::FminNum`,
      `Op::FmaxNum`, `Op::Fminimum`, `Op::Fmaximum`, `Op::Fcopysign`) directly into native LIR
-     instructions with zero call overhead.
+     instructions with zero call overhead, enabling full `blaze-body` → `blaze-body-flow::algebra` →
+     `blaze-body-build` → `blaze-lir::eval` compilation and execution.
 
 ## Proof
 - `blaze-algebra` (`15 passed, 0 failed`, 0 `.clone()` calls): `blaze-sim` property tests over
@@ -114,7 +115,7 @@ re-exported as `bstd::algebra`), backed by two small compiler seams when lifting
   `active_vars` sparsity vs full Hessian, custom `PatNode`/`RewriteRule`, `STANDARD_REWRITE_RULES`
   + `DERIV_RULES` + byte-for-byte zero-drift verification of `lean/analysis/BlazeDiff/Generated.lean`,
   symbolic linear system solving, and exact Newton-Raphson.
-- `blaze-algebra-body` (`12 passed, 0 failed`, 0 `.clone()` calls) & `blaze-body-build` (`7 passed,
+- `blaze-body-flow::algebra` (`13 passed, 0 failed`, 0 `.clone()` calls) & `blaze-body-build` (`7 passed,
   0 failed`, 0 `.clone()` calls): full real-compiler pipeline `blaze-typeck::check` →
   `blaze-body-lower::lower` → `blaze_body::verify` → `run_body_transform_with_helpers` (inlining
   pure helper `spring(x, y)` into `loss(x, y)`, differentiating w.r.t. `x`, and fusing via

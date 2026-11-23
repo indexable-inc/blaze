@@ -53,7 +53,7 @@ fn harness(e: impl fmt::Debug) -> Broken<CadBroken> {
 #[derive(Clone, PartialEq, Debug)]
 enum CadBroken {
     /// Two placements of one solid gave parts of different digests.
-    KeyMoved { a: String, b: String },
+    KeyMoved { a: [u8; 32], b: [u8; 32] },
     /// The assembly differs from the placed solid at a point.
     PlacedWrong { at: [f64; 3], got: f64, want: f64 },
     /// A rounded cube's field is off at a probe.
@@ -195,7 +195,7 @@ fn part_case(tape: &Tape, plant: impl Planted<PartPlant> + Copy) -> Result<(), B
     let da = part_tape(&g, &a, Detail::Full, heap()).map_err(harness)?.digest();
     let db = part_tape(&g, &b, Detail::Full, heap()).map_err(harness)?.digest();
     if da != db {
-        return Err(Broken::Oracle(CadBroken::KeyMoved { a: format!("{da:02x?}"), b: format!("{db:02x?}") }));
+        return Err(Broken::Oracle(CadBroken::KeyMoved { a: da, b: db }));
     }
     let whole = assemble(&mut g, &[a.weaken()]).map_err(harness)?;
     let tw = compile(&g, whole.id(), CompileOpts { alloc: heap(), .. }).map_err(harness)?;

@@ -301,7 +301,7 @@ fn answer(rows: &BTreeMap<u64, u64>, seed: u64, serial: u64) -> Kept<'static> {
             reads.push((read, id(seed, version, 9)));
             kept.answer.readers.entry(read).or_insert_with(|| blaze_own::BTreeSet::new_in(a)).insert(me);
         }
-        let findings = (version % 5 == 0) as u32;
+        let findings = u32::from(version % 5 == 0);
         if findings > 0 {
             kept.answer.with_findings.insert(me);
         }

@@ -323,118 +323,139 @@ fn max_pat_var(pat: &[PatNode]) -> Option<u8> {
     max_v
 }
 
-fn fmt_pat_lean<A: Allocator + Copy>(pat: &[PatNode], idx: usize, out: &mut OwnString<A>) {
-    match pat[idx] {
-        PatNode::Var(v) => {
-            let _ = write!(out, "x{v}");
-        }
-        PatNode::Const(bits) => {
-            let v = f64::from_bits(bits);
-            if v == 0.0 {
-                out.push_str("(0 : ℝ)");
-            } else if v == 1.0 {
-                out.push_str("(1 : ℝ)");
-            } else if v == 2.0 {
-                out.push_str("(2 : ℝ)");
-            } else {
-                let _ = write!(out, "({v} : ℝ)");
+enum LeanFmtStep {
+    Node(usize),
+    Str(&'static str),
+}
+
+fn fmt_pat_lean<A: Allocator + Copy>(
+    pat: &[PatNode],
+    root: usize,
+    out: &mut OwnString<A>,
+    alloc: A,
+) {
+    let mut stack: OwnVec<LeanFmtStep, A> = OwnVec::new_in(alloc);
+    stack.push(LeanFmtStep::Node(root));
+    while let Some(step) = stack.pop() {
+        match step {
+            LeanFmtStep::Str(s) => out.push_str(s),
+            LeanFmtStep::Node(idx) => {
+                let Some(&node) = pat.get(idx) else {
+                    continue;
+                };
+                match node {
+                    PatNode::Var(v) => {
+                        let _ = write!(out, "x{v}");
+                    }
+                    PatNode::Const(bits) => {
+                        let v = f64::from_bits(bits);
+                        if v == 0.0 {
+                            out.push_str("(0 : ℝ)");
+                        } else if v == 1.0 {
+                            out.push_str("(1 : ℝ)");
+                        } else if v == 2.0 {
+                            out.push_str("(2 : ℝ)");
+                        } else {
+                            let _ = write!(out, "({v} : ℝ)");
+                        }
+                    }
+                    PatNode::Neg(a) => {
+                        out.push_str("(-");
+                        stack.push(LeanFmtStep::Str(")"));
+                        stack.push(LeanFmtStep::Node(a));
+                    }
+                    PatNode::Add(a, b) => {
+                        out.push('(');
+                        stack.push(LeanFmtStep::Str(")"));
+                        stack.push(LeanFmtStep::Node(b));
+                        stack.push(LeanFmtStep::Str(" + "));
+                        stack.push(LeanFmtStep::Node(a));
+                    }
+                    PatNode::Sub(a, b) => {
+                        out.push('(');
+                        stack.push(LeanFmtStep::Str(")"));
+                        stack.push(LeanFmtStep::Node(b));
+                        stack.push(LeanFmtStep::Str(" - "));
+                        stack.push(LeanFmtStep::Node(a));
+                    }
+                    PatNode::Mul(a, b) => {
+                        out.push('(');
+                        stack.push(LeanFmtStep::Str(")"));
+                        stack.push(LeanFmtStep::Node(b));
+                        stack.push(LeanFmtStep::Str(" * "));
+                        stack.push(LeanFmtStep::Node(a));
+                    }
+                    PatNode::Div(a, b) => {
+                        out.push('(');
+                        stack.push(LeanFmtStep::Str(")"));
+                        stack.push(LeanFmtStep::Node(b));
+                        stack.push(LeanFmtStep::Str(" / "));
+                        stack.push(LeanFmtStep::Node(a));
+                    }
+                    PatNode::Pow(a, b) => {
+                        out.push('(');
+                        stack.push(LeanFmtStep::Str(")"));
+                        if let Some(&PatNode::Const(bits)) = pat.get(b)
+                            && f64::from_bits(bits) == 2.0
+                        {
+                            stack.push(LeanFmtStep::Str("(2 : ℕ)"));
+                        } else {
+                            stack.push(LeanFmtStep::Node(b));
+                        }
+                        stack.push(LeanFmtStep::Str(" ^ "));
+                        stack.push(LeanFmtStep::Node(a));
+                    }
+                    PatNode::Sin(a) => {
+                        out.push_str("(Real.sin ");
+                        stack.push(LeanFmtStep::Str(")"));
+                        stack.push(LeanFmtStep::Node(a));
+                    }
+                    PatNode::Cos(a) => {
+                        out.push_str("(Real.cos ");
+                        stack.push(LeanFmtStep::Str(")"));
+                        stack.push(LeanFmtStep::Node(a));
+                    }
+                    PatNode::Tan(a) => {
+                        out.push_str("(Real.tan ");
+                        stack.push(LeanFmtStep::Str(")"));
+                        stack.push(LeanFmtStep::Node(a));
+                    }
+                    PatNode::Exp(a) => {
+                        out.push_str("(Real.exp ");
+                        stack.push(LeanFmtStep::Str(")"));
+                        stack.push(LeanFmtStep::Node(a));
+                    }
+                    PatNode::Ln(a) => {
+                        out.push_str("(Real.log ");
+                        stack.push(LeanFmtStep::Str(")"));
+                        stack.push(LeanFmtStep::Node(a));
+                    }
+                    PatNode::Sqrt(a) => {
+                        out.push_str("(Real.sqrt ");
+                        stack.push(LeanFmtStep::Str(")"));
+                        stack.push(LeanFmtStep::Node(a));
+                    }
+                    PatNode::Tanh(a) => {
+                        out.push_str("(Real.tanh ");
+                        stack.push(LeanFmtStep::Str(")"));
+                        stack.push(LeanFmtStep::Node(a));
+                    }
+                    PatNode::Abs(a) => {
+                        out.push_str("(|");
+                        stack.push(LeanFmtStep::Str("|)"));
+                        stack.push(LeanFmtStep::Node(a));
+                    }
+                    PatNode::Fma(a, b, c) => {
+                        out.push('(');
+                        stack.push(LeanFmtStep::Str(")"));
+                        stack.push(LeanFmtStep::Node(c));
+                        stack.push(LeanFmtStep::Str(" + "));
+                        stack.push(LeanFmtStep::Node(b));
+                        stack.push(LeanFmtStep::Str(" * "));
+                        stack.push(LeanFmtStep::Node(a));
+                    }
+                }
             }
-        }
-        PatNode::Neg(a) => {
-            out.push_str("(-");
-            fmt_pat_lean(pat, a, out);
-            out.push(')');
-        }
-        PatNode::Add(a, b) => {
-            out.push('(');
-            fmt_pat_lean(pat, a, out);
-            out.push_str(" + ");
-            fmt_pat_lean(pat, b, out);
-            out.push(')');
-        }
-        PatNode::Sub(a, b) => {
-            out.push('(');
-            fmt_pat_lean(pat, a, out);
-            out.push_str(" - ");
-            fmt_pat_lean(pat, b, out);
-            out.push(')');
-        }
-        PatNode::Mul(a, b) => {
-            out.push('(');
-            fmt_pat_lean(pat, a, out);
-            out.push_str(" * ");
-            fmt_pat_lean(pat, b, out);
-            out.push(')');
-        }
-        PatNode::Div(a, b) => {
-            out.push('(');
-            fmt_pat_lean(pat, a, out);
-            out.push_str(" / ");
-            fmt_pat_lean(pat, b, out);
-            out.push(')');
-        }
-        PatNode::Pow(a, b) => {
-            out.push('(');
-            fmt_pat_lean(pat, a, out);
-            out.push_str(" ^ ");
-            // Use natural power for exact integer literal exponents (e.g. `2`), else Real.rpow.
-            if let PatNode::Const(bits) = pat[b]
-                && f64::from_bits(bits) == 2.0
-            {
-                out.push_str("(2 : ℕ)");
-            } else {
-                fmt_pat_lean(pat, b, out);
-            }
-            out.push(')');
-        }
-        PatNode::Sin(a) => {
-            out.push_str("(Real.sin ");
-            fmt_pat_lean(pat, a, out);
-            out.push(')');
-        }
-        PatNode::Cos(a) => {
-            out.push_str("(Real.cos ");
-            fmt_pat_lean(pat, a, out);
-            out.push(')');
-        }
-        PatNode::Tan(a) => {
-            out.push_str("(Real.tan ");
-            fmt_pat_lean(pat, a, out);
-            out.push(')');
-        }
-        PatNode::Exp(a) => {
-            out.push_str("(Real.exp ");
-            fmt_pat_lean(pat, a, out);
-            out.push(')');
-        }
-        PatNode::Ln(a) => {
-            out.push_str("(Real.log ");
-            fmt_pat_lean(pat, a, out);
-            out.push(')');
-        }
-        PatNode::Sqrt(a) => {
-            out.push_str("(Real.sqrt ");
-            fmt_pat_lean(pat, a, out);
-            out.push(')');
-        }
-        PatNode::Tanh(a) => {
-            out.push_str("(Real.tanh ");
-            fmt_pat_lean(pat, a, out);
-            out.push(')');
-        }
-        PatNode::Abs(a) => {
-            out.push_str("(|");
-            fmt_pat_lean(pat, a, out);
-            out.push_str("|)");
-        }
-        PatNode::Fma(a, b, c) => {
-            out.push('(');
-            fmt_pat_lean(pat, a, out);
-            out.push_str(" * ");
-            fmt_pat_lean(pat, b, out);
-            out.push_str(" + ");
-            fmt_pat_lean(pat, c, out);
-            out.push(')');
         }
     }
 }
@@ -479,9 +500,9 @@ pub fn export_lean_theorems<A: Allocator + Copy>(
         if !r.requires.is_empty() {
             let _ = write!(out, "{} → ", r.requires);
         }
-        fmt_pat_lean(r.lhs, r.lhs.len() - 1, &mut out);
+        fmt_pat_lean(r.lhs, r.lhs.len() - 1, &mut out, alloc);
         out.push_str(" = ");
-        fmt_pat_lean(r.rhs, r.rhs.len() - 1, &mut out);
+        fmt_pat_lean(r.rhs, r.rhs.len() - 1, &mut out, alloc);
         out.push_str("\n\n");
     }
 

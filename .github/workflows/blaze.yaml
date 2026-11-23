@@ -241,13 +241,59 @@ jobs:
         with:
           components: llvm-tools
           targets: x86_64-unknown-linux-gnu aarch64-apple-darwin
-      - name: cargo check --workspace --exclude blaze-std --all-targets
-        run: cargo +"$(cat pins/toolchain)" check --locked --workspace --exclude blaze-std --all-targets --message-format short
-      - name: cargo test --workspace --exclude blaze-std
-        run: cargo +"$(cat pins/toolchain)" test --locked --workspace --exclude blaze-std --no-fail-fast
       - uses: ./.github/actions/script
         with:
           job: cargo
+      - name: cut toolchain shelf
+        run: |
+          pinned="$(tr -d '[:space:]' < crates/blaze-toolchain/PINNED)"
+          shelf="$HOME/.blaze/v2/toolchain"
+          if [ ! -f "$shelf/$pinned" ]; then
+            tc="$(cat pins/toolchain)"
+            cargo +"$tc" fetch --locked --quiet
+            reg="$(ls -d "${CARGO_HOME:-$HOME/.cargo}"/registry/cache/index.crates.io-* | head -n 1)"
+            "$BLAZE_SCRIPTS/toolchain_cut" "{\"tree\": \".\", \"targets\": [\"aarch64-apple-darwin\", \"aarch64-unknown-linux-gnu\"], \"registry\": \"$reg\", \"shelf\": \"$shelf\", \"write_pin\": false, \"check\": false, \"macro_side\": true}"
+          fi
+      - name: cargo check --workspace --exclude blaze-std --all-targets
+        run: cargo +"$(cat pins/toolchain)" check --locked --workspace --exclude blaze-std --all-targets --message-format short
+      - name: cargo test --workspace --exclude blaze-std
+        run: |
+          set -euo pipefail
+          tc="$(cat pins/toolchain)"
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+          bins="$tmp_dir/bins.txt"
+          cargo +"$tc" test --locked --workspace --exclude blaze-std --no-run --message-format=json-render-diagnostics \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | "\(.manifest_path | sub("/Cargo\\.toml$"; ""))|\(.executable)"' \
+            | sort -u > "$bins"
+          nproc_val="$(nproc 2>/dev/null || echo 8)"
+          jobs=$(( nproc_val / 4 ))
+          [ "$jobs" -lt 1 ] && jobs=1
+          [ "$jobs" -gt 16 ] && jobs=16
+          export FAIL_DIR="$tmp_dir"
+          export RUST_TEST_THREADS=4
+          tr '\n' '\0' < "$bins" | xargs -0 -P "$jobs" -I {} bash -c '
+            dir="${1%%|*}"
+            bin="${1#*|}"
+            name="$(basename "$bin")"
+            out="$FAIL_DIR/$name.log"
+            if (cd "$dir" && CARGO_MANIFEST_DIR="$dir" "$bin" --test-threads=4) >"$out" 2>&1; then
+              rm -f "$out"
+            else
+              rc=$?
+              echo "::error::FAIL $name (exit $rc)"
+              cat "$out"
+              echo "$name" >> "$FAIL_DIR/failed.list"
+            fi
+          ' _ {} < "$bins"
+          if ! cargo +"$tc" test --locked --workspace --exclude blaze-std --doc --no-fail-fast; then
+            echo "doctests" >> "$tmp_dir/failed.list"
+          fi
+          if [ -s "$tmp_dir/failed.list" ]; then
+            echo "::error::failing test binaries:"
+            cat "$tmp_dir/failed.list"
+            exit 1
+          fi
       # D180: blaze-sys's compiled objects reference no C-library symbol on Linux (both
       # architectures), and on macOS only the libSystem symbols of
       # tools/ratchets/blaze-sys-libsystem.txt (scripts/src/bin/sys_imports.rs). Its lib alone,
