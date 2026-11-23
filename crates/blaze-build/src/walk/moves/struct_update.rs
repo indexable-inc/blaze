@@ -33,7 +33,7 @@ use super::super::{Held, Repr, Shape, Task, V, Walk, malformed, unsupported};
 use super::Step;
 use crate::BuildError;
 
-impl<'x, A: Allocator + Clone> Walk<'x, '_, '_, A> {
+impl<'x, A: Allocator + Copy> Walk<'x, '_, '_, A> {
     /// The written fields of struct update `e` (the body's, not borrowed from the walk), and
     /// its base.
     fn update_parts(&self, e: ExprId) -> Result<(&'x [FieldInit], ExprId), BuildError> {

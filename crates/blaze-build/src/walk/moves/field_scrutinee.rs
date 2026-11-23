@@ -41,7 +41,7 @@ use blaze_typeck::{ExprId, Pat, PatId};
 use super::super::{Walk, malformed};
 use crate::BuildError;
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// The local `e` is a part of: `e` a place path of one or more steps from a local, each a
     /// struct or tuple field or a `Box`'s contents (an overloaded `*b` of a box, a base's
     /// autoderef through boxes), through parentheses, with no adjustment on `e` itself: the

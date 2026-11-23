@@ -73,7 +73,7 @@ pub struct FeatureMemory<'a> {
 
 impl<'a> FeatureMemory<'a> {
     pub fn new(alloc: Alloc<'a>) -> FeatureMemory<'a> {
-        FeatureMemory { held: AVec::new_in(alloc.clone()), alloc }
+        FeatureMemory { held: AVec::new_in(alloc), alloc }
     }
 
     /// How many records it holds.
@@ -107,7 +107,7 @@ impl FeatureRecords for FeatureMemory<'_> {
         if let Some((_, held)) = self.held.iter().find(|(held, _)| *held == key) {
             return if held[..] == *bytes { Ok(()) } else { Err(FeatureMemoryError { key }) };
         }
-        self.held.push((key, AVec::from_slice_in(bytes, self.alloc.clone())));
+        self.held.push((key, AVec::from_slice_in(bytes, self.alloc)));
         Ok(())
     }
 }
@@ -125,13 +125,13 @@ pub struct Phase<'a> {
 /// crate its dependencies reach (the crates rustc's `lib_features` reads). The one home of the
 /// visit order: the key ([`features_key`]) and the walk (script_setting.rs) both take it.
 pub fn phases<'a>(world: &World<'_>, side: Side, alloc: Alloc<'a>) -> AVec<'a, Phase<'a>> {
-    let mut out = AVec::new_in(alloc.clone());
-    let mut seen: AVec<'a, bool> = AVec::new_in(alloc.clone());
+    let mut out = AVec::new_in(alloc);
+    let mut seen: AVec<'a, bool> = AVec::new_in(alloc);
     seen.resize(world.crates.len(), false);
     for needs in [Needs::Core, Needs::Std] {
         let Some(root) = world.crates.iter().position(|krate| toolchain_of(krate, side) && krate.input.name == needs.krate()) else { continue };
-        let mut crates = AVec::new_in(alloc.clone());
-        let mut stack: AVec<'a, usize> = AVec::new_in(alloc.clone());
+        let mut crates = AVec::new_in(alloc);
+        let mut stack: AVec<'a, usize> = AVec::new_in(alloc);
         stack.push(root);
         while let Some(at) = stack.pop() {
             if core::mem::replace(&mut seen[at], true) {
@@ -407,7 +407,7 @@ fn decoded<'b, 'a>(key: ContentId, bytes: &'b [u8], alloc: Alloc<'a>) -> Result<
     if count > MOST_PHASES {
         return Err(FeatureRecordWhy::Phases { count });
     }
-    let mut rows: AVec<'_, (Needs, u32, u32)> = AVec::with_capacity_in(count as usize, alloc.clone());
+    let mut rows: AVec<'_, (Needs, u32, u32)> = AVec::with_capacity_in(count as usize, alloc);
     let mut next = 0;
     for _ in 0..count {
         let at = cursor.at;
@@ -423,10 +423,10 @@ fn decoded<'b, 'a>(key: ContentId, bytes: &'b [u8], alloc: Alloc<'a>) -> Result<
         next = code + 1;
         rows.push((needs, cursor.u32()?, cursor.u32()?));
     }
-    let mut out = AVec::with_capacity_in(rows.len(), alloc.clone());
+    let mut out = AVec::with_capacity_in(rows.len(), alloc);
     for (needs, declared, mentioned) in rows.iter().copied() {
-        let declared = cursor.names(declared, alloc.clone())?;
-        let mentioned = cursor.names(mentioned, alloc.clone())?;
+        let declared = cursor.names(declared, alloc)?;
+        let mentioned = cursor.names(mentioned, alloc)?;
         let once = |names: &[&str]| names.windows(2).all(|pair| pair[0] < pair[1]);
         if !once(&declared[..]) || !once(&mentioned[..]) || mentioned.iter().any(|name| declared.binary_search(name).is_ok()) {
             return Err(FeatureRecordWhy::Order { needs });

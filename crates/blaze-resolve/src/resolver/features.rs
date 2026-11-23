@@ -206,6 +206,9 @@ pub enum RequestedFeatures {
     },
 }
 
+impl blaze_own::Share for RequestedFeatures {}
+impl blaze_own::LocalShare for RequestedFeatures {}
+
 /// Features specified on the command-line.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct CliFeatures {
@@ -216,6 +219,9 @@ pub struct CliFeatures {
     /// Inverse of `--no-default-features` flag.
     pub uses_default_features: bool,
 }
+
+impl blaze_own::Share for CliFeatures {}
+impl blaze_own::LocalShare for CliFeatures {}
 
 impl CliFeatures {
     /// Creates a new `CliFeatures` from the given command-line flags.
@@ -231,12 +237,12 @@ impl CliFeatures {
                 // Maybe call validate_feature_name here once it is an error?
                 FeatureValue::Feature(_) => {}
                 FeatureValue::Dep { .. } => {
-                    let feature = feature.clone(); // clone: error path
+                    let feature = *feature;
                     return Err(crate::ResolveError::CliDepSyntax { feature });
                 }
                 FeatureValue::DepFeature { dep_feature, .. } => {
                     if dep_feature.contains('/') {
-                        let feature = feature.clone(); // clone: error path
+                        let feature = *feature;
                         return Err(crate::ResolveError::CliSlashes { feature });
                     }
                 }

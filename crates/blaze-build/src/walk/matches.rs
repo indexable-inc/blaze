@@ -64,7 +64,7 @@ pub(super) struct At {
 /// failure.
 type Test = (PatId, At, Block, Block, Block);
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Whether the switch takes the match on `scrutinee` (held as `srepr`) with arms `arms`:
     /// an integer, a `bool` or an enum (through references, with variant patterns), and each
     /// arm's pattern flat (a literal, a path, `_`, a plain binding, an or of literals and
@@ -319,10 +319,10 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// or-pattern tests only the alternative `choice` takes for it, so the chain is the tests
     /// of ONE or-free pattern.
     fn test_pat_chosen(&mut self, root: PatId, at: At, ok: Block, fail: Block, choice: Option<&[alts::Choice]>) -> Result<(), BuildError> {
-        let mut todo: Vec<Test, A> = Vec::new_in(self.alloc.clone());
-        let mut parts: Vec<(PatId, At), A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<Test, A> = Vec::new_in(self.alloc);
+        let mut parts: Vec<(PatId, At), A> = Vec::new_in(self.alloc);
         // Each name's first binding in `root`, filled at the first or-pattern that binds.
-        let mut alias: Vec<(Name, PatId), A> = Vec::new_in(self.alloc.clone());
+        let mut alias: Vec<(Name, PatId), A> = Vec::new_in(self.alloc);
         let entry = self.create();
         self.jump(entry, &[]);
         todo.push((root, at, entry, ok, fail));
@@ -487,8 +487,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// `bind_tested`, each binding stored into the slot of its name's first binding in
     /// `alias` (an or-alternative's: matches/forms.rs `first_binds`), else its own.
     fn bind_with(&mut self, root: PatId, at: At, alias: &[(Name, PatId)]) -> Result<(), BuildError> {
-        let mut todo: Vec<(PatId, At), A> = Vec::new_in(self.alloc.clone());
-        let mut parts: Vec<(PatId, At), A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<(PatId, At), A> = Vec::new_in(self.alloc);
+        let mut parts: Vec<(PatId, At), A> = Vec::new_in(self.alloc);
         // An or-alternative's bindings (matches/forms.rs `first_binds`): bound on the
         // alternative's own pass, where its moves clear their bits; the first bindings own
         // their parts once, at the arm's pass (the `Pat::Or` row below).
@@ -556,7 +556,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 // owns it, once, by its first binding (every alternative stored there): in
                 // declaration order, as the bindings around it are owned.
                 Pat::Or { .. } if !alt => {
-                    let mut names: Vec<(Name, PatId), A> = Vec::new_in(self.alloc.clone());
+                    let mut names: Vec<(Name, PatId), A> = Vec::new_in(self.alloc);
                     self.first_binds(p, &mut names)?;
                     for &(_, first) in names.iter() {
                         if self.take_alt_moved(first) {
@@ -853,7 +853,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 
     /// Some binding inside pattern `p`, by a work list.
     fn binds_any(&self, p: PatId) -> Result<bool, BuildError> {
-        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
         todo.push(p);
         while let Some(q) = todo.pop() {
             match self.pat(q)? {

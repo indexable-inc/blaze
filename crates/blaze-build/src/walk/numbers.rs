@@ -31,7 +31,7 @@ pub(super) fn float_repr(f: FloatTy) -> Result<Repr, TyErr> {
     Ok(Repr::Float(halfquad::float_ty(f)))
 }
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// `1.5`: its bits at its type.
     pub(super) fn float_lit(&mut self, e: ExprId) -> Result<V, BuildError> {
         let Repr::Float(ty) = self.expr_repr(e)? else {

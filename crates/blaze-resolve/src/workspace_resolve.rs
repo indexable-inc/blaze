@@ -9,6 +9,7 @@
 //! written.
 
 use blaze_hash::{FixedState, Map, MapOpts, Set, SetOpts};
+use blaze_own::Share;
 use std::alloc::Global;
 use blaze_trace::{debug, trace};
 use url::Url;
@@ -267,7 +268,7 @@ impl<R: Registry> PackageRegistry<R> {
         for summaries in self.patches.values_mut() {
             for summary in summaries {
                 debug!("locking patch {:?}", summary);
-                *summary = lock(&self.locked, &self.patches_available, summary.clone());
+                *summary = lock(&self.locked, &self.patches_available, summary.share());
             }
         }
         self.patches_locked = true;
@@ -331,7 +332,7 @@ impl<R: Registry> Registry for PackageRegistry<R> {
         }
 
         for patch in patches.iter() {
-            f(IndexSummary::Candidate(patch.clone()));
+            f(IndexSummary::Candidate(patch.share()));
         }
 
         // Our sources shouldn't ever come back to us with two summaries
@@ -684,7 +685,7 @@ pub fn resolve_with_previous<R: Registry>(
         members_with_features(&ws.members, specs, cli_features)?
             .into_iter()
             .map(|(member, features)| {
-                let summary = registry.lock(member.clone());
+                let summary = registry.lock(member.share());
                 (summary, ResolveOpts::new(dev_deps, RequestedFeatures::CliFeatures(features)))
             })
             .collect();
@@ -942,7 +943,7 @@ fn register_patch_entries<R: Registry>(
     let mut avoid_patch_ids = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
     for (url, patches) in ws.patch.iter() {
         for patch in patches {
-            version_prefs.prefer_dependency(patch.dep.clone());
+            version_prefs.prefer_dependency(patch.dep.share());
         }
         let Some(previous) = previous else {
             let patches: Vec<_> = patches.iter().map(|p| (p, None)).collect();
@@ -968,7 +969,7 @@ fn register_patch_entries<R: Registry>(
                 // If we found an exactly matching candidate in our list of
                 // candidates, then that's the one to use.
                 Some(package_id) => {
-                    let mut locked_dep = dep.clone();
+                    let mut locked_dep = dep.share();
                     locked_dep.lock_to(package_id);
                     Some(LockedPatchDependency {
                         dependency: locked_dep,
@@ -998,7 +999,7 @@ fn register_patch_entries<R: Registry>(
                                 dep.source_id().with_precise_from(id_using_default.source_id()),
                             );
 
-                            let mut locked_dep = dep.clone();
+                            let mut locked_dep = dep.share();
                             locked_dep.lock_to(id_using_master);
                             Some(LockedPatchDependency {
                                 dependency: locked_dep,
@@ -1052,12 +1053,12 @@ fn lock_replacements(
             .map(|(spec, dep)| {
                 for (&key, &val) in r.replacements().iter() {
                     if spec.matches(key) && dep.matches_id(val) && keep(&val) {
-                        let mut dep = dep.clone();
+                        let mut dep = dep.share();
                         dep.lock_to(val);
                         return (spec.clone(), dep);
                     }
                 }
-                (spec.clone(), dep.clone())
+                (spec.clone(), dep.share())
             })
             .collect::<Vec<_>>(),
         None => ws.replace.to_vec(),

@@ -46,7 +46,7 @@ pub(super) const UNSIZED_BY_VALUE: &str = "a struct or tuple whose last field is
                                            value: the Reference, \"Dynamically Sized Types\": it exists only behind a \
                                            pointer";
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Whether walk layout row `l` is a struct or tuple whose last field is unsized (its row in
     /// `layout_fields` holds the tail's offset and no representation).
     pub(super) fn has_unsized_tail(&self, l: u32) -> bool {

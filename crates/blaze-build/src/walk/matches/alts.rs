@@ -57,10 +57,10 @@ pub(in super::super) type Choice = (PatId, u32, u32);
 /// The word an expansion's number is kept in.
 const WORD: Repr = Repr::Int { ty: Ty::I32, signed: false };
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Whether pattern `root` holds an or-pattern, by a work list.
     pub(in super::super) fn has_or(&self, root: PatId) -> Result<bool, BuildError> {
-        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
         todo.push(root);
         while let Some(q) = todo.pop() {
             match self.pat(q)? {
@@ -93,7 +93,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     fn choose(&self, root: PatId, choice: &mut Vec<Choice, A>) -> Result<(), BuildError> {
         let kept = choice.len();
         let mut met = 0usize;
-        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
         todo.push(root);
         // Children are pushed last first, so they pop in written order.
         while let Some(q) = todo.pop() {
@@ -160,7 +160,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let (size, align) = self.size_align(WORD);
         let word = self.b.slot(size, align, SlotKind::Temp);
         let chains = self.arm_blocks.len() as u32;
-        let mut choice: Vec<Choice, A> = Vec::new_in(self.alloc.clone());
+        let mut choice: Vec<Choice, A> = Vec::new_in(self.alloc);
         let mut n = 0u32;
         loop {
             self.choose(root, &mut choice)?;
@@ -206,7 +206,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let k = self.b.load(Ty::I32, Flags::NONE, a, 0, attrs);
         let after = |w: &Self, j: u32| w.arm_blocks.get((chains + j) as usize).copied().ok_or(malformed("a guarded arm's chains past `arm_blocks`"));
         let last = n.checked_sub(1).ok_or(malformed("a guarded arm of no expansions"))?;
-        let mut cases: Vec<(u128, blaze_lir::Block), A> = Vec::new_in(self.alloc.clone());
+        let mut cases: Vec<(u128, blaze_lir::Block), A> = Vec::new_in(self.alloc);
         for j in 0..last {
             cases.push((u128::from(j), after(self, j)?));
         }

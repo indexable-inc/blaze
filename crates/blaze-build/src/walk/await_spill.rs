@@ -44,7 +44,7 @@ enum Form {
     Unsized(i32),
 }
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Whether `x` is made again after a resume (blaze-lir coroutine.rs `plan`'s `remade`).
     fn remade(&self, x: Value) -> bool {
         let view = self.b.func().view();
@@ -55,7 +55,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// a resume, written to the slot of the flow local that holds it. Without a laid state (this
     /// crate's unit tests) nothing is written: the split keeps the values itself, as before.
     pub(super) fn spill_waiting(&mut self, e: ExprId) -> Result<Vec<Spilled, A>, BuildError> {
-        let mut out: Vec<Spilled, A> = Vec::new_in(self.alloc.clone());
+        let mut out: Vec<Spilled, A> = Vec::new_in(self.alloc);
         if self.names.is_none() {
             return Ok(out);
         }

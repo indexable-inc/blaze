@@ -26,7 +26,7 @@ use crate::{BuildError, Instance};
 /// The lang fn a failed assertion calls.
 const PANIC_NOUNWIND: &str = "panic_nounwind";
 
-impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// The call `e` of assertion `check` (intrinsic `which`) with generic arguments `gl` and
     /// `n` arguments (none, by its signature).
     pub(super) fn validity_check(&mut self, e: ExprId, which: Which, check: Check, gl: List, n: usize) -> Result<(), BuildError> {
@@ -45,9 +45,9 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         }
         let refuse = |why| BuildError::Intrinsic { expr: e, which, why, unsupported: true };
         let names = adts.type_names().ok_or(refuse("the name of its type: the front end names no items (`Adts::type_names`)"))?;
-        let name = type_name_text(self.ground.view(), t, names, self.alloc.clone()).map_err(|error| refuse(error.what()))?;
+        let name = type_name_text(self.ground.view(), t, names, self.alloc).map_err(|error| refuse(error.what()))?;
         let (before, after) = check.message();
-        let mut text = String::new_in(self.alloc.clone());
+        let mut text = String::new_in(self.alloc);
         text.push_str(before);
         text.push_str(name.as_str());
         text.push_str(after);
