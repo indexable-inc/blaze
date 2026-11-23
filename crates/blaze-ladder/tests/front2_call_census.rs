@@ -215,7 +215,16 @@ fn the_call_census_on_a_fixture() {
     // The gate's lines.
     assert_eq!(forward.calls().class_total(CallClass::Fewer), 0, "(b) outside the hub:\n{report}");
     assert_eq!(forward.fewer_total, 0, "no (b) row listed:\n{report}");
-    assert_eq!(forward.related_old, forward.related_one, "findings on fully related bodies agree:\n{report}");
+    // On every fully related body except `needs_static_bad` (where the one rule's empty-column
+    // selection tie catches the real E0597 that the old rule misses), the two rules agree.
+    for (name, t) in &per_body {
+        if name == "needs_static_bad" {
+            let e0597 = CODES.iter().position(|x| *x == "E0597").expect("E0597");
+            assert_eq!(t.related_one[e0597], 1, "one rule catches E0597 on needs_static_bad:\n{report}");
+        } else {
+            assert_eq!(t.related_old, t.related_one, "findings on fully related body `{name}` agree:\n{report}");
+        }
+    }
     assert_eq!(forward.not_compared, [0; 3], "every fixture body compared:\n{report}");
 
     // A finding and its twin, read per body.

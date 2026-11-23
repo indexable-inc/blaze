@@ -378,6 +378,14 @@ pub fn decide_stalled_goals<'n, 'a, S: NamesSource<'n>>(
                     Err(fail) => return Decision::Refused(Refused::Check(fail)),
                 }
             }
+            Err(tc::StalledError::Check(error @ tc::CheckError::ForeignWitness { item, ordinal: None, .. })) => {
+                let probe = tc::CheckError::OpaqueHiddenUnknown { opaque: item, trait_: tc::ItemKey(0) };
+                match super::opaque_auto::after_auto_gap(r, owner, &probe, &mut leaks) {
+                    Ok(true) => continue,
+                    Ok(false) => return check(error),
+                    Err(fail) => return Decision::Refused(Refused::Check(fail)),
+                }
+            }
             Err(tc::StalledError::Check(error)) => return check(error),
             Err(tc::StalledError::Ambiguous { trait_, site, storage, undecided }) => {
                 let stored_at = match storage {

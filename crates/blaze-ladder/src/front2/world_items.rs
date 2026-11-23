@@ -1190,9 +1190,18 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
             generics: t.generics,
             flags: t.flags,
             lang: self.index.lang_name_of(lib).and_then(trait_lang).or_else(|| {
-                (t.generics == 2
-                    && super::langs::find(self.index, self.resolver(), LangItem::From).ok().flatten() == Some(lib))
-                    .then_some(LangItem::From)
+                if t.generics != 2 {
+                    return None;
+                }
+                let from_key = match self.store.from_trait.get() {
+                    Some(cached) => cached,
+                    None => {
+                        let found = super::langs::find(self.index, self.resolver(), LangItem::From).ok().flatten();
+                        self.store.from_trait.set(Some(found));
+                        found
+                    }
+                };
+                (from_key == Some(lib)).then_some(LangItem::From)
             }),
             supertraits: &extra.supertraits,
             // With a synthetic associated type per `impl Trait` at a place of a fn's return type

@@ -773,6 +773,8 @@ pub(crate) struct Cells<'a, N> {
     cell_ids: blaze_hash::HashMap<(ModId, u8, N), CellId, Alloc<'a>>,
     items: AVec<'a, Item<'a, N>>,
     frags: AVec<'a, Frag<'a, N>>,
+    /// Reusable traversal stack for [`Cells::textual`], avoiding per-call bump allocations.
+    textual_stack: AVec<'a, (FragId, usize)>,
     cell_queue: ABTreeSet<'a, CellId>,
     item_queue: ABTreeSet<'a, ItemId>,
     /// Calls resolved and not expanded yet.
@@ -1027,6 +1029,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             cell_ids: blaze_hash::HashMap::new_in(alloc),
             items: AVec::new_in(alloc),
             frags: AVec::new_in(alloc),
+            textual_stack: AVec::new_in(alloc),
             cell_queue: ABTreeSet::new_in(alloc),
             item_queue: ABTreeSet::new_in(alloc),
             expand_queue: ABTreeSet::new_in(alloc),
@@ -3420,22 +3423,23 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     fn textual(&mut self, frag: FragId, pos: u32, name: N, sub: Option<CallShape>, guess: Option<&Guess<'a>>) -> Step<Option<Def>> {
         self.stats.textual_reads += 1;
         let (mut f, mut end) = (frag, pos);
-        let mut stack: AVec<'a, (FragId, usize)> = AVec::new_in(self.alloc);
+        self.textual_stack.clear();
         loop {
             let below = self.frags[f as usize].slots.partition_point(|s| s.0 < end);
-            stack.push((f, below));
+            self.textual_stack.push((f, below));
             // Every fragment the walk reads, its slots before the cut or all of them (one it
             // finds empty there is read too): groups.rs's textual cells.
             if let Some(log) = self.textual_log.as_mut() {
                 log.push(f);
             }
-            while let Some(top) = stack.last_mut() {
+            while let Some(top) = self.textual_stack.last_mut() {
                 if top.1 == 0 {
-                    stack.pop();
+                    self.textual_stack.pop();
                     continue;
                 }
                 top.1 -= 1;
-                let (_, slot) = self.frags[top.0 as usize].slots[top.1];
+                let (top_f, top_i) = *top;
+                let (_, slot) = self.frags[top_f as usize].slots[top_i];
                 match slot {
                     Slot::Rules(n, def, _) if n == name && (self.plant == CellPlant::SubNamespaceIgnored || sub.is_none_or(|s| same_sub(def, s))) => {
                         return Step::Done(Some(def));
@@ -3456,7 +3460,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                             }
                             continue;
                         }
-                        stack.push((t, self.frags[t as usize].slots.len()));
+                        self.textual_stack.push((t, self.frags[t as usize].slots.len()));
                         if let Some(log) = self.textual_log.as_mut() {
                             log.push(t);
                         }
@@ -3465,7 +3469,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         let it = &self.items[j as usize];
                         if it.grown {
                             if let Some(x) = it.expansion {
-                                stack.push((x, self.frags[x as usize].slots.len()));
+                                self.textual_stack.push((x, self.frags[x as usize].slots.len()));
                                 if let Some(log) = self.textual_log.as_mut() {
                                     log.push(x);
                                 }

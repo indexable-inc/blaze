@@ -168,7 +168,7 @@ fn judge(rows: &[Said], clean: &[&str], not_send: &[(&str, &[&str])]) {
         assert_eq!(s.codes.len(), traits.len(), "TWIN `{n}`: rustc reports one E0277 per failing predicate {traits:?}: {s:?}");
         for t in ["Send", "Sync"] {
             let want = traits.iter().filter(|x| **x == t).count();
-            let got = s.texts.iter().filter(|x| x.contains(t)).count();
+            let got = s.texts.iter().filter(|x| x.lines().next().unwrap_or("").contains(t)).count();
             assert_eq!(got, want, "TWIN `{n}`: {want} E0277 naming `{t}`: {s:?}");
         }
     }

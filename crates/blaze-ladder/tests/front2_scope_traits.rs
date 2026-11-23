@@ -88,20 +88,20 @@ fn r_goal(r: far::R<\"a\", u8>) -> u8 { need(r) }
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Says {
     Clean,
-    /// Refused by a head, the refusal holding this text.
-    Refused(&'static str),
+    /// A program diagnostic holding this text (e.g. `NoMethod` once `Odd`'s head builds).
+    Diags(&'static str),
 }
 
 /// The bodies, each with what it says and, for `Some(n)`, how many impl heads its check makes
 /// (over buckets of its own, so nothing another body made is counted).
 const BODIES: [(&str, Says, Option<u32>, &str); 3] = [
-    ("method", Says::Clean, None, "`x.tr()` with `Odd` in scope: `Odd` declares no `tr`, so its refused head is never made"),
     ("bound", Says::Clean, Some(1), "`u8: Tr` reads the `u8` bucket of `Tr`: `impl Tr for u8` only, never `R`'s impl"),
-    ("named", Says::Refused("adt_const_params"), None, "`x.odd()`: `Odd` declares `odd`, so it may answer: its head is made, and refused by name"),
+    ("method", Says::Clean, None, "`x.tr()` with `Odd` in scope: `Odd` declares no `tr`, so its head is never read"),
+    ("named", Says::Diags("NoMethod"), None, "`x.odd()`: `Odd` declares `odd`, so it is checked and reports no impl for `u8`"),
 ];
 
 /// The fns whose head must be refused, each with a text its refusal must hold.
-const NO_HEAD: [(&str, &str, &str); 1] = [("r_goal", "adt_const_params", "`R<\"a\", u8>` in a signature: `R`'s head is refused (stops-3 class B (c))")];
+const NO_HEAD: [(&str, &str, &str); 1] = [("r_goal", "const argument of a reference", "`R<\"a\", u8>` in a signature: `&'static str` const arg value tree is refused by name")];
 
 #[test]
 fn scope_traits_and_buckets_read_only_what_may_answer() {
@@ -185,14 +185,11 @@ fn scope_traits_and_buckets_read_only_what_may_answer() {
         let made = buckets.as_ref().map_or(0, |b| b.index().lowered);
         let ok = match want {
             Says::Clean => said == "clean",
-            Says::Refused(holds) => said.starts_with("refused") && said.contains(holds),
+            Says::Diags(holds) => said.starts_with("diagnostics") && said.contains(holds),
         };
         let counted = heads.is_none_or(|n| n == made);
         let _ = proves;
-        let shown = match want {
-            Says::Refused(holds) if ok => format!("refused, holds {holds:?}"),
-            _ => said.chars().take(240).collect(),
-        };
+        let shown = &said[..said.floor_char_boundary(240.min(said.len()))];
         match heads {
             Some(_) => notes.push(format!("{name}: {shown} (wanted {want:?}); impl heads made: {made}")),
             None => notes.push(format!("{name}: {shown} (wanted {want:?})")),

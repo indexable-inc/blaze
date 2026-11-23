@@ -3552,6 +3552,36 @@ impl<'f> BodiesStage<'f> {
         // In the request's heap through its handle that crosses threads: the body workers insert
         // (a frame is one thread's, and the set's `insert` takes a `'static` allocator).
         let expansion_keys: SharedSet<Key, SharedAlloc<'static>> = SharedSet::new_in("engine bodies expansion text record keys", heap.shared());
+        let stopped_out = |stage: &mut BodiesStage<'f>, reach, snapshot_owner, expansion_keys| {
+            stage.reach = reach;
+            let procs = handles.names.and_then(|inputs| inputs.stage().names.as_ref()).and_then(|names| names.procs());
+            let names_keys = handles.names.map(|inputs| inputs.keys());
+            Ok(Prepared {
+                snapshot: snapshot_owner,
+                expansion_keys,
+                dep_files: DependencyFiles::new(heap),
+                found: None,
+                ones: &[],
+                outlined: handles.outlined,
+                root: handles.root,
+                fs: &handles.env.fs,
+                board: handles.board,
+                clock: handles.clock,
+                listings,
+                seeds: request_heads,
+                names_keys,
+                procs,
+                heap,
+                keep_scratch: planted_keep_scratch(),
+                has_unread_outlines: stage.unread.as_ref().is_some_and(|unread| !unread.is_empty()),
+                unread_digests: stage.unread_digests.as_ref().map(blaze_own::Share::share),
+                plants: planted_rows(),
+            })
+        };
+        if handles.board.stopping().is_some() {
+            let reach = self.reach.take();
+            return stopped_out(self, reach, snapshot_owner, expansion_keys);
+        }
         // 0. What this phase OWES: the files of the entered tasks' bodies (each task's
         // `planned.file`, the outline its `BodyCheck` part is in: `plan` above), by outline
         // index, sorted, each once. Only these files' entries are outlined and keyed by chain
@@ -3560,7 +3590,11 @@ impl<'f> BodiesStage<'f> {
         // A task whose file the request has no outline of is the setup's typed refusal (rule 3:
         // the ready setup reads back every owed file, engine_check.rs `checking`), never a body
         // dropped from what is owed.
-        for task in tasks.iter() {
+        for (idx, task) in tasks.iter().enumerate() {
+            if (idx & 255) == 0 && handles.board.stopping().is_some() {
+                let reach = self.reach.take();
+                return stopped_out(self, reach, snapshot_owner, expansion_keys);
+            }
             let at = handles.outlined.binary_search_by(|one| one.name.cmp(&task.planned.file)).map_err(|_| EngineCheckError::Unplaced { body: task.planned.name, what: "its file is none of the request's outlines (the ready setup reads back every owed file: engine_check.rs `checking`)" })?;
             owed.push(u32::try_from(at).unwrap_or(u32::MAX));
         }
@@ -3591,6 +3625,9 @@ impl<'f> BodiesStage<'f> {
             shared.extend(rows.iter().filter(|row| row.rows >= 2).copied());
             shared.sort_unstable_by_key(|row| row.name);
             shared.dedup_by_key(|row| row.name);
+        }
+        if handles.board.stopping().is_some() {
+            return stopped_out(self, reach, snapshot_owner, expansion_keys);
         }
         // 1. Each member's check scope and files, and each owed body's item key, on this thread.
         let plants = planted_rows();
@@ -3631,7 +3668,13 @@ impl<'f> BodiesStage<'f> {
         if let (Some(found), Some(reach)) = (found.as_ref(), reach.as_ref()) {
             by_rank.extend((0..reach.len()).map(|rank| reach.unit(rank).and_then(|one| found.holders.unit_named(one.unit))));
         }
-        for task in tasks.iter() {
+        if handles.board.stopping().is_some() {
+            return stopped_out(self, reach, snapshot_owner, expansion_keys);
+        }
+        for (idx, task) in tasks.iter().enumerate() {
+            if (idx & 255) == 0 && handles.board.stopping().is_some() {
+                return stopped_out(self, reach, snapshot_owner, expansion_keys);
+            }
             let name = task.planned.name;
             let file = handles.outlined.binary_search_by(|one| one.name.cmp(&task.planned.file)).map_or(u32::MAX, |at| u32::try_from(at).unwrap_or(u32::MAX));
             // Each refusal with the cells it is a function of (plan row A8): its failed row

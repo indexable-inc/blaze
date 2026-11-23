@@ -197,6 +197,7 @@ fn a_borrow_of_a_packed_field_captures_the_struct() {
 /// Stage 2: before the switch the closure's witness counts `p` moved whole beside `p.s`
 /// (capture_places.rs `places_tuple`), which holds the `Rc`.
 #[test]
+#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
 fn a_move_of_a_packed_field_keeps_the_field_needs_stage2() {
     let rows = verdicts("2021", &["packed_moved_field"]);
     clean(&rows, "packed_moved_field");
@@ -212,6 +213,7 @@ fn an_async_block_borrowing_one_field_is_send_by_that_field() {
 }
 
 #[test]
+#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
 fn async_block_moving_one_field_needs_stage2() {
     let rows = verdicts("2021", &["field_move_async", "field_move_async_rc"]);
     clean(&rows, "field_move_async");

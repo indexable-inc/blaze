@@ -13,9 +13,7 @@ use core::ffi::{c_int, c_ulong, c_void};
 
 #[cfg(target_os = "macos")]
 use super::{counted, said};
-#[cfg(target_os = "macos")]
-use crate::Fd;
-use crate::{Errno, Path};
+use crate::{Errno, Fd, Path};
 
 // ---- Linux: the raw-system-call layer's own items. ----
 

@@ -91,6 +91,10 @@ fn write_source(path: &Path, text: &str, what: &str) {
     std::fs::write(path, text).unwrap_or_else(|error| panic!("writing {what}: {error}"));
 }
 
+fn pause_poll() {
+    std::thread::sleep(Duration::from_millis(10));
+}
+
 fn fixture<T>(name: &str, files: &[(&str, &str)], check: impl FnOnce(&Path, &Path) -> T) -> T {
     let base = fresh_home(name, true);
     // The test profile names the test's folder by its canonical path (blaze-run child.rs
@@ -106,11 +110,11 @@ fn fixture<T>(name: &str, files: &[(&str, &str)], check: impl FnOnce(&Path, &Pat
     }
     let result = check(&dir, &home);
     // A detached `blaze gc --background` child may still be unlinking its lock file inside `home`.
-    for attempt in 0..20 {
+    for attempt in 0..100 {
         match std::fs::remove_dir_all(&base) {
             Ok(()) => break,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
-            Err(_) if attempt + 1 < 20 => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) if !base.exists() => break,
+            Err(_) if attempt + 1 < 100 => pause_poll(),
             Err(err) => panic!("remove the scratch command fixture: {err}"),
         }
     }
@@ -143,11 +147,11 @@ fn run(dir: &Path, home: &Path, args: &[&str]) -> Said {
             let killed = Instant::now();
             while child.try_wait().expect("reap the killed test command").is_none() {
                 assert!(killed.elapsed() < Duration::from_secs(10), "reaping blaze in {}", dir.display());
-                std::thread::sleep(Duration::from_millis(10));
+                pause_poll();
             }
             panic!("`blaze test` past {DEADLINE:?} in {}: the command hung (rule 18)", dir.display());
         }
-        std::thread::sleep(Duration::from_millis(10));
+        pause_poll();
     };
     let said = Said {
         stdout: std::fs::read_to_string(stdout).expect("read blaze's standard output"),

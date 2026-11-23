@@ -1164,22 +1164,33 @@ pub fn lex_marked<'a>(
             None => token.ctx,
             Some(mark) => out.context(CtxNode { parent: token.ctx, mark: mark.as_outer_mark() })?,
         };
-        // A marked `$` whose next token is a plain `crate` starting where it ends.
+        // A marked `$` whose next token is a plain `crate` starting where it ends, or a plain
+        // `crate` carrying an opaque crate-root mark (`blaze_scope::crate_roots::root_mark`: what
+        // the item renderer wrote for `$crate` in an item-level expansion): restore both to one
+        // `$crate` identifier with `ctx` so an inner macro's `$p:path`/`$t:tt`/`$e:expr` keeps
+        // the defining crate's root.
         let crate_after = match (token.kind, mark, tokens.get(i + 1), places.get(i + 1)) {
             (TokenKind::Punct { char: '$', .. }, Some(_), Some(next), Some(&(next_start, _)))
                 if next_start == end && lexed.text_of(next) == "crate" =>
             {
                 match next.kind {
-                    TokenKind::Ident { raw: Raw::No, spacing } => Some(spacing),
+                    TokenKind::Ident { raw: Raw::No, spacing } => Some((spacing, 2usize)),
                     _ => None,
                 }
+            }
+            (TokenKind::Ident { raw: Raw::No, spacing }, Some(m), _, _)
+                if m.transparency == crate::Transparency::Opaque
+                    && m.site.module.is_none()
+                    && lexed.text_of(&token) == "crate" =>
+            {
+                Some((spacing, 1usize))
             }
             _ => None,
         };
         match crate_after {
-            Some(spacing) => {
+            Some((spacing, step)) => {
                 out.push(TokenKind::Ident { raw: Raw::No, spacing }, "$crate", ctx)?;
-                i += 2;
+                i += step;
             }
             None => {
                 out.push_whole(token.kind, lexed.whole_at(i), ctx)?;

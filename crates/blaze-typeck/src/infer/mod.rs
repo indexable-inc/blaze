@@ -331,6 +331,13 @@ fn fill_specializes<W: World>(
     let Some(trait_) = ha.trait_ else {
         return Err(CheckError::Malformed(crate::error::Malformed::NoRecord(crate::world::Question::ImplHeader(ka))).into());
     };
+    if let Some(hb) = reads.impl_header(kb)?
+        && hb.trait_ == Some(trait_)
+        && !may_specialize_headers(&ha, &hb)
+    {
+        facts.keep_specializes(a, b, false);
+        return Ok(());
+    }
     // A fact of two impls, asked of their headers alone (no body's opaque in it).
     let mut inner = InferCtx::analysis_in(alloc);
     inner.spec_depth = spec_depth + 1;
@@ -351,6 +358,77 @@ fn fill_specializes<W: World>(
     };
     facts.keep_specializes(a, b, v);
     Ok(())
+}
+
+/// Fast sound pre-filter for `specializes(a, b)`: returns `false` only when rigid top-level
+/// constructors in `hb` (general) and `ha` (specific, with `Param` rigid) definitely cannot unify,
+/// skipping full `InferCtx` allocation for disjoint impl pairs (e.g. `impl Add<u8> for u8` vs
+/// `impl Add<i32> for i32`). Returns `true` conservatively on any alias, opaque, error, or param
+/// in `hb`.
+fn may_specialize_headers(ha: &crate::world::ImplHeader<'_>, hb: &crate::world::ImplHeader<'_>) -> bool {
+    if !may_specialize_ty(ha.types, ha.self_ty, hb.types, hb.self_ty) {
+        return false;
+    }
+    let Ok(a_rest) = ha.types.list(ha.trait_args.list()) else { return true };
+    let Ok(b_rest) = hb.types.list(hb.trait_args.list()) else { return true };
+    if a_rest.len() != b_rest.len() {
+        return false;
+    }
+    for (&at, &bt) in a_rest.iter().zip(b_rest.iter()) {
+        if !may_specialize_ty(ha.types, at, hb.types, bt) {
+            return false;
+        }
+    }
+    true
+}
+
+fn may_specialize_ty(
+    a_tys: crate::portable::PTys<'_>,
+    at: crate::portable::PTy,
+    b_tys: crate::portable::PTys<'_>,
+    bt: crate::portable::PTy,
+) -> bool {
+    use crate::portable::PNode as N;
+    let (Ok(na), Ok(nb)) = (a_tys.node(at), b_tys.node(bt)) else { return true };
+    match nb {
+        // `b`'s parameters become fresh inference vars, and aliases/opaques/errors may normalize.
+        N::Param(_) | N::ConstParam(_) | N::Alias { .. } | N::Opaque(..) | N::Infer | N::Error => return true,
+        _ => {}
+    }
+    match na {
+        // `a`'s aliases/opaques/errors may normalize to `b`'s head.
+        N::Alias { .. } | N::Opaque(..) | N::Infer | N::Error => return true,
+        // `a`'s rigid `Param`/`ConstParam` cannot unify with a non-param rigid constructor in `b`.
+        N::Param(_) | N::ConstParam(_) => return false,
+        _ => {}
+    }
+    match (na, nb) {
+        (N::Bool, N::Bool) | (N::Char, N::Char) | (N::Str, N::Str) | (N::Never, N::Never) => true,
+        (N::Int(x), N::Int(y)) => x == y,
+        (N::Uint(x), N::Uint(y)) => x == y,
+        (N::Float(x), N::Float(y)) => x == y,
+        (N::Adt(x, _), N::Adt(y, _)) => x == y,
+        (N::FnDef(x, _), N::FnDef(y, _)) => x == y,
+        (N::Foreign(x), N::Foreign(y)) => x == y,
+        (N::Ref(x, _), N::Ref(y, _)) => x == y,
+        (N::Ptr(x, _), N::Ptr(y, _)) => x == y,
+        (N::Tuple(x), N::Tuple(y)) => x.len == y.len,
+        (N::Record(sx, lx), N::Record(sy, ly)) => sx == sy && lx.len == ly.len,
+        (N::Union(x), N::Union(y)) => x.len == y.len,
+        (N::Array(..), N::Array(..))
+        | (N::Slice(_), N::Slice(_))
+        | (N::Pat(..), N::Pat(..))
+        | (N::FnPtr(..), N::FnPtr(..))
+        | (N::Closure { .. }, N::Closure { .. })
+        | (N::Future(..), N::Future(..))
+        | (N::Coroutine { .. }, N::Coroutine { .. })
+        | (N::ConstValue { .. }, N::ConstValue { .. })
+        | (N::Dynamic(_), N::Dynamic(_))
+        | (N::ExTrait(..), N::ExTrait(..))
+        | (N::ExProj { .. }, N::ExProj { .. })
+        | (N::ExAuto(_), N::ExAuto(_)) => true,
+        _ => false,
+    }
 }
 
 /// Answers the solver's `ConstHolds(cond, list)` (a `where const` condition, blaze's

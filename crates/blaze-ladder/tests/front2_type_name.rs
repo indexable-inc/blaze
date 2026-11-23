@@ -36,6 +36,8 @@ use blaze_surface::{Namespace, PathKind};
 
 const MAIN: &str = "#![feature(core_intrinsics)]
 
+extern crate alloc;
+use alloc::string::String;
 use core::intrinsics::type_name;
 
 fn main() {}

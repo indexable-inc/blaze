@@ -2075,6 +2075,10 @@ pub struct Store<'n> {
     pub preds: Rows<ItemKey, Preds>,
     /// The `sized` lang trait: each own type parameter's implied bound.
     pub sized: Option<LibKey>,
+    /// Cached `LangItem::From` trait key (`None` = not yet looked up, `Some(k)` = looked up).
+    pub(super) from_trait: core::cell::Cell<Option<Option<LibKey>>>,
+    /// Cached `alloc_shim::bound` targets by `Shim` ordinal (`None` = not yet looked up).
+    pub(super) alloc_shims: core::cell::Cell<[Option<Option<ItemKey>>; 6]>,
     /// The library's `Box`, `Rc`, `Arc` and `Pin`, a trait method's typed receiver is read
     /// against for dyn compatibility ([`super::receiver::Pointers::find`]; set by the maker of
     /// the store: [`Store::new`] leaves them not looked up, so every such receiver is a gap).
@@ -2533,6 +2537,8 @@ impl<'n> Store<'n> {
             trait_inherits: Rows::new_in(alloc),
             preds: Rows::new_in(alloc),
             sized,
+            from_trait: core::cell::Cell::new(None),
+            alloc_shims: core::cell::Cell::new([None; 6]),
             pointers: super::receiver::Pointers::NOT_LOOKED_UP,
             trait_defs: Rows::new_in(alloc),
             fn_gaps: Rows::new_in(alloc),
@@ -4587,10 +4593,24 @@ impl<'n> Store<'n> {
         }
     }
 
+    /// Fast check for whether `v` contains any structural record type (`TypeRef::Record`),
+    /// avoiding allocating `Env` and entering [`Store::register_record_defaults`] on normal code.
+    pub(super) fn view_has_record_type(v: &View<'_>) -> bool {
+        for i in 0..v.types.len() {
+            let Ok(ti) = u32::try_from(i) else { break };
+            if matches!(v.ty(lf::TypeId(ti)), Ok(lf::TypeRef::Record(_))) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Registers anonymous constant heads for any `TypeRef::Record` field defaults written in `v`
     /// (`{ width: u32 = 80, name: &str }`) or inherited via structural record spread
     /// (`{ ..Base, hp: u32 = 100 }`), keyed under `RecordSchema::defaults_key()` in
     /// `self.field_defaults` so `Expr::Record { .. }` resolves them via `World::field_defaults`.
+    #[cold]
+    #[inline(never)]
     pub(super) fn register_record_defaults<S: NamesSource<'n>>(
         &mut self,
         names: S,
@@ -5292,8 +5312,10 @@ impl<'n> Store<'n> {
             }
         };
         file_regions(self, key, filed);
-        let rec_env = Env { module, params: &ps, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &anon, consts: &cs, body: None };
-        self.register_record_defaults(names, keys, lib, &rec_env, marks, v)?;
+        if Self::view_has_record_type(v) {
+            let rec_env = Env { module, params: &ps, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &anon, consts: &cs, body: None };
+            self.register_record_defaults(names, keys, lib, &rec_env, marks, v)?;
+        }
         self.fns.insert(key, FnHead { lib, text, text_prefix, container, parent, own, declared, self_param, header, c_variadic, qualifiers, legacy_const_generics, inputs, output, has_body, module, params: ps, consts: cs, bounds, self_, self_assoc });
         Ok(())
     }

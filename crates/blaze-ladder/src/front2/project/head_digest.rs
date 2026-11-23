@@ -299,17 +299,31 @@ pub fn import_with_opaque_origins<'n, 'a, N: NamesSource<'n>>(
     names: N, keys: &Keys, store: &Store<'n>, frozen: &FrozenHead<'_>,
     text_of: &mut dyn FnMut(HeadAt) -> Option<&'n str>, alloc: Alloc<'static>, out: Alloc<'a>,
 ) -> Result<AVec<'a, (HeadAt, Head<'n>)>, FreezeError> {
+    let boxed = import_with_opaque_origins_boxed(names, keys, store, frozen, text_of, alloc, out)?;
+    let mut heads = AVec::with_capacity_in(boxed.len(), out);
+    for (at, head) in boxed {
+        heads.push((at, blaze_own::Box::into_inner(head)));
+    }
+    Ok(heads)
+}
+
+/// As [`import_with_opaque_origins`], keeping each decoded [`Head`] boxed in `alloc` so importing
+/// a frozen head uses minimal stack space.
+pub fn import_with_opaque_origins_boxed<'n, 'a, N: NamesSource<'n>>(
+    names: N, keys: &Keys, store: &Store<'n>, frozen: &FrozenHead<'_>,
+    text_of: &mut dyn FnMut(HeadAt) -> Option<&'n str>, alloc: Alloc<'static>, out: Alloc<'a>,
+) -> Result<AVec<'a, (HeadAt, blaze_own::Box<Head<'n>, Alloc<'static>>)>, FreezeError> {
     let want = frozen.want();
     let mut heads = AVec::new_in(out);
     let mut origins = AVec::new_in(alloc);
     for entry in frozen.heads() {
         let rec = |error| FreezeError::Record { want, at: entry.at, error };
         let text = match entry.at { HeadAt::Fn(_) => text_of(entry.at), _ => None };
-        let head = head_record::decode_with_origins(entry.record, text, &store.tys, alloc, &mut |key, origin| {
+        let head = head_record::decode_with_origins_boxed(entry.record, text, &store.tys, alloc, &mut |key, origin| {
             origins.push((key, origin, false));
             Ok(())
         }).map_err(rec)?;
-        match (entry.at, &head) {
+        match (entry.at, &*head) {
             (HeadAt::Opaque(at), Head::Opaque { key, fn_, index, preds, .. }) if at == *key => {
                 let origin = OpaqueOrigin { want, owner: *fn_, index: *index };
                 origin.check(*key).map_err(rec)?;
@@ -324,6 +338,18 @@ pub fn import_with_opaque_origins<'n, 'a, N: NamesSource<'n>>(
         }
         heads.push((entry.at, head));
     }
+    verify_opaque_origins(names, keys, store, want, &mut origins)?;
+    Ok(heads)
+}
+
+#[inline(never)]
+fn verify_opaque_origins<'n, N: NamesSource<'n>>(
+    names: N,
+    keys: &Keys,
+    store: &Store<'n>,
+    want: Want,
+    origins: &mut AVec<'_, (ItemKey, OpaqueOrigin, bool)>,
+) -> Result<(), FreezeError> {
     origins.sort_unstable_by_key(|&(key, _, _)| key);
     // A damaged producer might omit both the row and every use in its own type.
     // A promise already imported from another cell still binds that producer.
@@ -372,12 +398,12 @@ pub fn import_with_opaque_origins<'n, 'a, N: NamesSource<'n>>(
         }
     }
     origins.dedup_by_key(|row| row.0);
-    for (key, origin, _) in origins {
+    for &(key, origin, _) in origins.iter() {
         if !store.opaques.contains_key(&key) {
             store.opaques.insert(key, (origin.owner, origin.index));
         }
     }
-    Ok(heads)
+    Ok(())
 }
 
 /// The heads `want` makes in `store` (the one list: a `Signature`'s digest above and a frozen

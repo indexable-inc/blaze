@@ -17,8 +17,8 @@ use blaze_own::Alloc;
 const EDITION: &str = "blaze-2026.11";
 
 /// His `src/main.rs` as written, plus a body with a type error.
-const MAIN: &str = "fn main(cx: &Cx, io: Io) -> Result<(), Error> {
-    io.need_out()?.line(cx, \"Hello, world!\")?;
+const MAIN: &str = "fn main(cx: &Cx, out: Out) -> Result<(), Error> {
+    out.line(cx, \"Hello, world!\")?;
     Ok(())
 }
 

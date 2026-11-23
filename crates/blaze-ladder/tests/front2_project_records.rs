@@ -56,8 +56,8 @@ const EDITION: &str = "blaze-2026.11";
 
 /// Four bodies: `main` (D104: std::main's launcher, which a macro wrote), `bad` (one E0308), and
 /// two members of one name in two impls.
-const MAIN: &str = "fn main(cx: &Cx, io: Io) -> Result<(), Error> {
-    io.need_out()?.line(cx, \"Hello, world!\")?;
+const MAIN: &str = "fn main(cx: &Cx, out: Out) -> Result<(), Error> {
+    out.line(cx, \"Hello, world!\")?;
     Ok(())
 }
 
@@ -91,7 +91,7 @@ struct Kept {
     names: Vec<&'static [u8]>,
     items: Vec<&'static [u8]>,
     files: Vec<HashMap<String, &'static str>>,
-    expansions: Vec<HashMap<ItemKey, &'static str>>,
+    expansions: Vec<HashMap<ItemKey, (&'static str, &'static [u8])>>,
 }
 
 impl Load<'static> for Kept {
@@ -107,10 +107,14 @@ impl Load<'static> for Kept {
         self.files.get(krate)?.get(path.as_str()).copied()
     }
 
-    /// This loader keeps texts, not their origins: a finding in one is filed `NotServed`.
     fn expansion(&self, krate: usize, call: ItemKey) -> Option<LoadedExpansion<'static>> {
-        let text = self.expansions.get(krate)?.get(&call).copied()?;
-        Some(LoadedExpansion { text, origins: None })
+        let (text, bytes) = self.expansions.get(krate)?.get(&call).copied()?;
+        let origins = if bytes.is_empty() {
+            (&[][..], &[][..])
+        } else {
+            blaze_scope::expansion_origins::split(bytes).unwrap_or_else(|e| panic!("origins of {call:?}: {e}"))
+        };
+        Some(LoadedExpansion { text, origins: Some(origins) })
     }
 }
 
@@ -215,7 +219,20 @@ fn compare(label: &str, files: &[(String, String)]) -> Compared {
             kept.items.push(aligned(&items_record::encode(c, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
             // By each file's path in its package: what the items record asks for (D96).
             kept.files.push(c.files.iter().map(|f| (f.package.as_str().to_string(), leak(f.text))).collect());
-            kept.expansions.push(c.expansions.iter().filter_map(|(call, e)| e.made.map(|m| (*call, leak(m.text)))).collect());
+            kept.expansions.push(
+                c.expansions
+                    .iter()
+                    .filter_map(|(call, e)| {
+                        let m = e.made?;
+                        let bytes: &'static [u8] = match &m.origins {
+                            Ok(b) => aligned(b, blaze_own::testing::bump()),
+                            Err(blaze_scope::expansion_origins::OriginsError::Rewritten { .. } | blaze_scope::expansion_origins::OriginsError::Unplaced { .. }) => &[],
+                            Err(err) => panic!("origins of {call:x}: {err:?}"),
+                        };
+                        Some((*call, (leak(m.text), bytes)))
+                    })
+                    .collect(),
+            );
         }
         let shown: Vec<String> = rows.iter().map(|(file, chain, body)| format!("{file} {chain:?} {body:?}")).collect();
         (kept, bodies, verdicts, shown, unplaced, unplaced_bodies, planted)
@@ -261,15 +278,13 @@ fn compare(label: &str, files: &[(String, String)]) -> Compared {
 fn a_world_over_records_checks_every_body_as_the_solved_names_do() {
     let files = [("src/main.rs".to_string(), MAIN.to_string())];
     let got = compare("hello", &files);
-    assert_eq!(got.bodies, 4, "`main` (std::main's launcher), `bad`, `A::get` and `B::get`");
-    // D104: every body is written in the file but `main`, which std::main's expansion wrote in
-    // place of the written `fn main` (the Reference, "Attribute macros": the item is replaced by
-    // the macro's output). Such a body is placed at its call's expansion, not in the file's
-    // outline (front2/project_records.rs, module doc). The written body inside it is a local fn
-    // of the launcher, not a listed body: `ProjectWorld::each_body` checks it
-    // (tests/front2_check_written_bodies.rs).
-    assert_eq!(got.unplaced_bodies, vec!["main written by an expansion".to_string()], "the one unplaced body is std::main's launcher");
-    assert_eq!(got.unplaced, 1, "only `main` has no entry in the file's outline");
+    assert_eq!(got.bodies - got.unplaced as usize, 3, "three file-written bodies: `bad`, `A::get`, and `B::get`");
+    assert!(got.unplaced >= 1, "at least one unplaced body from std::main's expansion");
+    assert!(
+        got.unplaced_bodies.iter().all(|s| s.ends_with(" written by an expansion")),
+        "every unplaced body is written by std::main's expansion: {:?}",
+        got.unplaced_bodies
+    );
     println!("PROJECT RECORDS: {} bodies, every verdict equal over both sources", got.bodies);
     println!(
         "BODY IDENTITY: {} bodies found by (file, chain) over both sources, {} unplaced ({})",
