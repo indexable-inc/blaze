@@ -1622,7 +1622,11 @@ mod tests {
         let hollow = check(&io);
         let out = stdout(&io);
         assert_eq!(hollow.failures, 0, "{}", hollow.profile);
-        assert!(out.contains("NOT checked: names, types, borrows"), "{out}\n{}", hollow.profile);
+        assert!(
+            out.contains("NOT checked: names:") && out.contains("NOT checked: types:") && out.contains("NOT checked: borrows:"),
+            "{out}\n{}",
+            hollow.profile
+        );
         // `f` is an item left unchecked (its crate has no unit graph), so the status is
         // `UNCHECKED_ITEMS` (4), which `close` puts before `INCOMPLETE` (3).
         assert_eq!(hollow.status, Some(4), "{out}");

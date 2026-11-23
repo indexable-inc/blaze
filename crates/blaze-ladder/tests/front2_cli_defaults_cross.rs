@@ -173,7 +173,7 @@ fn outcomes<'n>(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &str) -
     let mut front = Front2::new(names, frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
     let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let heap = blaze_own::testing::heap();
-    let prepared = Prepares::new_in(heap.alloc());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut buckets = None;
     let mut failed: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
@@ -243,7 +243,7 @@ fn cross_crate_value_path_args_are_inferred_not_defaulted() {
     let one_user = UserCrate { name: "zone", dir: "/zone/", root: "/zone/src/main.rs", files: &one_files, edition, panic: blaze_build::Panic::Unwind };
     let one_inputs = Inputs::new(&one_user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let one_crates = one_inputs.crates();
-    let one_names = one_inputs.resolve(&one_crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates (one crate): {e}"));
+    let one_names = one_inputs.resolve(&one_crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates (one crate): {e}"));
     let one_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
     let (one_failed, one_notes) = outcomes(&one_names, &one_frame, &one);
     assert!(one_failed.is_empty(), "CONTROL one crate: bodies did not check as they must: {one_failed:?}\n{}", one_notes.join("\n"));
@@ -278,7 +278,7 @@ fn cross_crate_value_path_args_are_inferred_not_defaulted() {
         script: None,
     });
     let texts = WithDep { base: &inputs.texts, dep, files: &dep_files };
-    let names = resolve_crates(&crates, sysroot, &texts, &Serial, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("resolve_crates (two crates): {e}"));
+    let names = resolve_crates(&crates, sysroot, &texts, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates (two crates): {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
     let (failed, notes) = outcomes(&names, &frame, USER);
     assert!(

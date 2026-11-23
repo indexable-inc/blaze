@@ -261,8 +261,9 @@ pub(crate) fn command(
 /// (`Standing::rows`, run_ids.rs `BodyReads`), counted in `asked` for the profile's line.
 /// COST: a hit, one get; a miss, O(workspace bodies) row reads and one put; no read list.
 fn body_ids<'a, 'r: 'a, 'm: 'a>(
-    cx: &Cx, standing: &mut Standing<'r, 'm>, list: &blaze_world::crate_list::CrateList<'_>, asked: &'a crate::run_ids::Asked, alloc: Alloc<'a>,
+    cx: &Cx, standing: &mut Standing<'r, 'm>, list: &blaze_world::crate_list::CrateList<'_>, asked: &'a crate::run_ids::Asked, bump: blaze_own::Bump<'a>,
 ) -> Result<RunIds<'a>, CliError> {
+    let alloc = bump.alloc();
     let frame = standing.frame;
     let refused = |error: RunIdsError<'_>| CliError::Start(StartError::BodyIds { shown: std::boxed::Box::from(bstd::mem::format_in!(frame, "{error}").as_str()) });
     let cert = Key(standing.root);
@@ -270,14 +271,14 @@ fn body_ids<'a, 'r: 'a, 'm: 'a>(
     let most = crate::run_ids::Most::USUAL;
     let from = crate::run_ids::ReadsFrom::new(standing.rows(), asked, most);
     let reading = |ids: RunIds<'a>| ids.reading::<crate::run_ids::Production>(from).map_err(|why| refused(RunIdsError::Unread(why)));
-    if let Some(ids) = RunIds::from_record(cx, &mut *standing.store, cert, toolchain, &tools, alloc).map_err(refused)? {
+    if let Some(ids) = RunIds::from_record(cx, &mut *standing.store, cert, toolchain, &tools, bump).map_err(refused)? {
         return reading(ids);
     }
     // Each member unit's root and view: the walk asks each unit's row of a body at its view (D191).
     let units = crate::run_ids::unit_roots(list, alloc).map_err(refused)?;
     let mut answer = standing.answer();
     let walk = crate::run_ids::workspace_of(cx, &mut answer, tools[Kind::BodyCheck.index()], &units, None, alloc).map_err(refused)?;
-    let ids = RunIds::new(cx, toolchain, list, &tools, &walk.bodies, &walk.edges, &mut answer, None, most, alloc).map_err(refused)?;
+    let ids = RunIds::new(cx, toolchain, list, &tools, &walk.bodies, &walk.edges, &mut answer, None, most, bump).map_err(refused)?;
     drop(answer);
     ids.put(cx, &mut *standing.store, cert, &tools, alloc).map_err(refused)?;
     reading(ids)
@@ -291,7 +292,8 @@ pub(crate) fn run_program(
 ) -> Result<Status, CliError> {
     let (frame, heap) = (standing.frame, standing.heap);
     let erased = blaze_own::Erased::new(frame);
-    let alloc = erased.handle();
+    let bump = erased.bump();
+    let alloc = bump.alloc();
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Crates));
     let mut read = EngineRecords::new(heap.alloc());
     let seen = TreesSeen::default();
@@ -328,7 +330,7 @@ pub(crate) fn run_program(
     let list = found.list().ok_or(CliError::Start(StartError::NoProgram))?;
     let asked = crate::run_ids::Asked::default();
     let began = phases.now();
-    let ids = body_ids(cx, &mut standing, list, &asked, alloc)?;
+    let ids = body_ids(cx, &mut standing, list, &asked, bump)?;
     let ids_ns = phases.since(began);
     // The line's table half now: the table itself is handed to the parent below.
     let ids_line = ids.line(&asked, ids_ns);
@@ -413,7 +415,8 @@ pub(crate) fn run_tests(
 ) -> Result<Status, CliError> {
     let (frame, heap) = (standing.frame, standing.heap);
     let erased = blaze_own::Erased::new(frame);
-    let alloc = erased.handle();
+    let bump = erased.bump();
+    let alloc = bump.alloc();
     let out = launch.out;
     let err = standing.err;
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Crates));
@@ -481,7 +484,7 @@ pub(crate) fn run_tests(
             return Err(CliError::Start(StartError::AbortTests { test: shown(test), dependency: shown(dependency) }));
         }
         let began = phases.now();
-        let ids = body_ids(cx, &mut standing, list, &asked, alloc)?;
+        let ids = body_ids(cx, &mut standing, list, &asked, bump)?;
         let ids_ns = phases.since(began);
         // Each suite's native image, as `run` has its program's (engine_native.rs `image_for`):
         // the C of every crate its test program links (a build script's deferred C built by
@@ -526,7 +529,7 @@ pub(crate) fn run_tests(
         // `PackageRun`): the checkout's absolute root as the edge resolved it.
         let checkout = standing.place.served.root_text();
         for (at, (found, unit)) in inventory.suites.iter().enumerate() {
-            let place = crate::test_drive::package_run(checkout, list.env_facts(unit.at), alloc)
+            let place = crate::test_drive::package_run(checkout, list.env_facts(unit.at), bump)
                 .map_err(|why| CliError::Start(StartError::TestPlace { shown: std::boxed::Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) }))?;
             // What the suite's names records are made of, kept for the command's code workers
             // (test_drive.rs `pooled`, D194), then the command thread's own names records of it.

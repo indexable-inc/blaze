@@ -3683,7 +3683,7 @@ fn ready_setup<'f, 'h, 'a>(
         let _cx = cx.span("names: the crate list read back");
         let mut held = Vec::with_capacity_in(sections.list.len(), env.heap.alloc());
         held.extend_from_slice(sections.list);
-        let held: &'static [u8] = held.leak();
+        let held: &'static [u8] = held.leak_static();
         match crate::names::Names::of_list(held, None, env.heap.alloc()) {
             Ok(names) => names,
             Err(crate::names::NamesError::List(why)) => return Ok(Err(ReadyRefused::Graph(crate::engine_units::BackRefused::List { key, why }))),

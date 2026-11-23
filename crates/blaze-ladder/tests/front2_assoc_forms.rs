@@ -61,7 +61,7 @@ fn assoc_forms_in_heads() {
     let user = UserCrate { name: "assocf", dir, root, files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
     let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
@@ -73,7 +73,7 @@ fn assoc_forms_in_heads() {
             .map(|d| d.key)
             .unwrap_or_else(|| panic!("`{name}` from the crate root"))
     };
-    let prepared = Prepares::new_in(heap.alloc());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let mut buckets = None;
     let mut outcome: Vec<(&str, Result<(), String>)> = Vec::new();
     for name in ["f", "g", "h", "h0"] {

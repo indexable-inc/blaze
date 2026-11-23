@@ -255,7 +255,7 @@ fn answer(side: &mut Side, id: LockId, registry: &Path, alloc: Alloc<'static>) -
             }
             let (pack, _) = unpack::crate_record(name, &version, sha256, &archive, &UnpackLimits::REAL, alloc)
                 .unwrap_or_else(|e| fail(&format!("{what}: {}", blaze_text::Shown(&e))));
-            let pack: &'static [u8] = pack.leak();
+            let pack: &'static [u8] = pack.leak_static();
             let view = PackView::open_verified(pack).unwrap_or_else(|e| fail(&format!("{what}: {}", blaze_text::Shown(&e))));
             let units = layout(&Files::Pack(view), "", alloc).unwrap_or_else(|e| fail(&format!("{what}: {e}")));
             side.packs.insert(id, pack);
@@ -514,7 +514,7 @@ fn tree_pack(what: &str, files: &[(String, Vec<u8>, Mode)], alloc: Alloc<'static
     for (path, bytes, mode) in files {
         builder.file(path, *mode, bytes).unwrap_or_else(|e| fail(&format!("{what}: {path}: {}", blaze_text::Shown(&e))));
     }
-    builder.finish().unwrap_or_else(|e| fail(&format!("{what}: {}", blaze_text::Shown(&e)))).leak()
+    builder.finish().unwrap_or_else(|e| fail(&format!("{what}: {}", blaze_text::Shown(&e)))).leak_static()
 }
 
 /// A crate's key across targets: its tree and its lock id there.

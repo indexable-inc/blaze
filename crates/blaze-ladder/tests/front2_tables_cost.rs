@@ -528,11 +528,11 @@ fn cost_of_one_body() {
 
     let start = Instant::now();
     let kept = {
-        let names = inputs.resolve(&crates, g).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
         let mut kept = Kept { names: Vec::new(), items: Vec::new(), files: Vec::new(), expansions: Vec::new(), origins: Vec::new() };
         for c in names.crates().iter() {
-            kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), g));
-            kept.items.push(aligned(&items_record::encode_with(c, &names, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), g));
+            kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
+            kept.items.push(aligned(&items_record::encode_with(c, &names, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
             kept.files.push(c.files.iter().map(|f| (f.package.as_str().to_string(), leak(f.text))).collect());
             kept.expansions.push(c.expansions.iter().filter_map(|(call, e)| e.made.map(|m| (*call, leak(m.text)))).collect());
             kept.origins.push(c.expansions.iter().filter_map(|(call, e)| e.made.as_ref().map(|m| (*call, made_origins(*call, &m.origins)))).collect());
@@ -756,7 +756,7 @@ fn cost_of_one_body() {
     // program's index and no prepared macros, as a `ProjectWorld` sets it up.
     let const_world: &'static ProjectWorld<'static, &'static Records<'static>> =
         Box::leak(Box::new(ProjectWorld::from_records(freeze_records, frame(), lang, g).unwrap_or_else(|e| panic!("the world did not start: {e}"))));
-    let prepared: &'static Prepares<'static> = Prepares::new_in(g);
+    let prepared: &'static Prepares<'static> = Prepares::new_in(blaze_own::testing::bump());
     let evaluator: &'static mut (dyn ConstValues<'static> + 'static) = Box::leak(Box::new(StoreConsts { names: freeze_records, index: &const_world.front.index, prepared }));
     let start = Instant::now();
     let freezing: &'static Freezing<'static, 'static, &'static Records<'static>> = Box::leak(Box::new(Freezing::new(

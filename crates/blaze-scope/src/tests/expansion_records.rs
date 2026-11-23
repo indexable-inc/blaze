@@ -62,7 +62,7 @@ fn source(edited: Option<usize>) -> &'static str {
     leak(t)
 }
 
-fn solve(text: &'static str, alloc: Alloc<'static>) -> &'static CrateNames<'static> {
+fn solve(text: &'static str, alloc: blaze_own::Bump<'static>) -> &'static CrateNames<'static> {
     let files: &'static [(&'static str, &'static str)] = Vec::leak(std::vec![("/k/lib.rs", text)]);
     let texts: &'static Texts = std::boxed::Box::leak(std::boxed::Box::new(Texts(Vec::leak(std::vec![files]))));
     let crates = [input("k", "/k/lib.rs", &[])];
@@ -73,8 +73,8 @@ fn solve(text: &'static str, alloc: Alloc<'static>) -> &'static CrateNames<'stat
     krate
 }
 
-fn split_of(names: &CrateNames<'_>, alloc: Alloc<'static>) -> (Split<'static>, Directory<'static>) {
-    let split = expansion_records::write(names, alloc).unwrap_or_else(|e| panic!("the split is written: {e}"));
+fn split_of(names: &CrateNames<'_>, alloc: blaze_own::Bump<'static>) -> (Split<'static>, Directory<'static>) {
+    let split = expansion_records::write(names, alloc.alloc()).unwrap_or_else(|e| panic!("the split is written: {e}"));
     let directory = Directory::open(aligned(&split.directory, alloc)).unwrap_or_else(|e| panic!("the directory opens: {e}"));
     (split, directory)
 }
@@ -93,7 +93,7 @@ fn record<'s>(split: &'s Split<'_>, key: ContentId) -> ExpansionRecord<'s> {
 /// Expected: "1 passed". Before B3 the section held the text and origins 50 times.
 #[test]
 fn equal_calls_share_one_expansion_record() {
-    let alloc = blaze_own::testing::heap().alloc();
+    let alloc = super::SyncFrame::leaked();
     let names = solve(source(None), alloc);
     let (split, directory) = split_of(names, alloc);
     assert_eq!(directory.len(), MODULES, "a row a call");
@@ -123,7 +123,7 @@ fn equal_calls_share_one_expansion_record() {
 /// split is a function of the solve (written twice, equal bytes: rule 25).
 #[test]
 fn the_directory_and_its_records_answer_as_the_texts_did() {
-    let alloc = blaze_own::testing::heap().alloc();
+    let alloc = super::SyncFrame::leaked();
     let names = solve(source(Some(EDITED)), alloc);
     let (split, directory) = split_of(names, alloc);
     let mut made = 0usize;
@@ -150,8 +150,8 @@ fn the_directory_and_its_records_answer_as_the_texts_did() {
     assert_eq!(made, directory.len(), "a row for each call that made a text, and no other");
     assert_eq!(split.records.len(), 2, "two inputs, two records");
 
-    let items = crate::items_record::encode(names, alloc).unwrap_or_else(|e| panic!("the items record: {e:?}"));
-    let items = ItemsRecord::open(aligned(&items, alloc), alloc).unwrap_or_else(|e| panic!("the items record opens: {e:?}"));
+    let items = crate::items_record::encode(names, alloc.alloc()).unwrap_or_else(|e| panic!("the items record: {e:?}"));
+    let items = ItemsRecord::open(aligned(&items, alloc), alloc.alloc()).unwrap_or_else(|e| panic!("the items record opens: {e:?}"));
     assert_eq!(items.expansions(), directory.len(), "the items record's expansion rows are the directory's set");
     for i in 0..directory.len() {
         let (row, entry) = (items.expansion_at(i).unwrap_or_else(|| panic!("items row {i}")), directory.entry_at(i).unwrap_or_else(|e| panic!("row {i}: {e}")));
@@ -177,7 +177,7 @@ fn rows(directory: &Directory<'_>) -> BTreeMap<ItemKey, ContentId> {
 /// a put of the held record under its held key is "same").
 #[test]
 fn an_edited_call_moves_its_own_record_only() {
-    let alloc = blaze_own::testing::heap().alloc();
+    let alloc = super::SyncFrame::leaked();
     let (before, before_dir) = split_of(solve(source(None), alloc), alloc);
     let (after, after_dir) = split_of(solve(source(Some(EDITED)), alloc), alloc);
     let (was, now) = (rows(&before_dir), rows(&after_dir));
@@ -193,17 +193,18 @@ fn an_edited_call_moves_its_own_record_only() {
 
 /// The crate's cell table as blaze-cli names.rs `scope_record` writes it (its wholes the names,
 /// the items and the directory), the table without the directory, and each call's row.
-fn tables(text: &'static str, alloc: Alloc<'static>) -> (Vec<u8>, Vec<u8>, BTreeMap<ItemKey, ContentId>) {
+fn tables(text: &'static str, alloc: blaze_own::Bump<'static>) -> (Vec<u8>, Vec<u8>, BTreeMap<ItemKey, ContentId>) {
+    let a = alloc.alloc();
     let names = solve(text, alloc);
     let (split, directory) = split_of(names, alloc);
-    let names_bytes = crate::names_record::encode(names, alloc).unwrap_or_else(|e| panic!("the names record: {e:?}"));
-    let items_bytes = crate::items_record::encode(names, alloc).unwrap_or_else(|e| panic!("the items record: {e:?}"));
+    let names_bytes = crate::names_record::encode(names, a).unwrap_or_else(|e| panic!("the names record: {e:?}"));
+    let items_bytes = crate::items_record::encode(names, a).unwrap_or_else(|e| panic!("the items record: {e:?}"));
     let wholes = [(Section::Names, &names_bytes[..]), (Section::Items, &items_bytes[..]), (Section::Expansions, &split.directory[..])];
     let with = crate_table(names, &names_bytes, &items_bytes, &wholes, alloc).unwrap_or_else(|e| panic!("the cell table: {e:?}"));
     let without = crate_table(names, &names_bytes, &items_bytes, &wholes[..2], alloc).unwrap_or_else(|e| panic!("the cell table without the directory: {e:?}"));
     // The record's own search agrees with the table, over the same wholes.
     let record = NamesRecord::open(Verified::check(aligned(&names_bytes, alloc)).unwrap_or_else(|e| panic!("the names record checks: {e:?}")));
-    let items = ItemsRecord::open(aligned(&items_bytes, alloc), alloc).unwrap_or_else(|e| panic!("the items record opens: {e:?}"));
+    let items = ItemsRecord::open(aligned(&items_bytes, alloc), a).unwrap_or_else(|e| panic!("the items record opens: {e:?}"));
     let read = |_: TextOf<'_>| -> Option<&'static str> { None };
     for (call, _) in rows(&directory) {
         let cell = NameCell::Expansion { call };
@@ -224,7 +225,7 @@ fn tables(text: &'static str, alloc: Alloc<'static>) -> (Vec<u8>, Vec<u8>, BTree
 /// Expected: "1 passed".
 #[test]
 fn an_expansion_cell_covers_its_record_key() {
-    let alloc = blaze_own::testing::heap().alloc();
+    let alloc = super::SyncFrame::leaked();
     let (before, before_without, calls) = tables(source(None), alloc);
     let (after, _, after_calls) = tables(source(Some(EDITED)), alloc);
     assert_eq!(calls.len(), MODULES, "a row a call");
@@ -258,7 +259,7 @@ fn an_expansion_cell_covers_its_record_key() {
 fn a_call_by_path_and_by_textual_scope_share_one_record() {
     const A: &str = "#![no_core]\n#[macro_export]\nmacro_rules! make {\n    ($n:ident) => {\n        pub fn $n() -> u8 { 1 }\n    };\n}\npub mod m {\n    make!(one);\n}\n";
     const B: &str = "#![no_core]\npub mod m {\n    a::make!(one);\n}\n";
-    let alloc = blaze_own::testing::heap().alloc();
+    let alloc = super::SyncFrame::leaked();
     let files: &'static [&'static [(&'static str, &'static str)]] = Vec::leak(std::vec![&[("/b/lib.rs", B)][..], &[("/a/lib.rs", A)][..]]);
     let texts: &'static Texts = std::boxed::Box::leak(std::boxed::Box::new(Texts(files)));
     let crates = [input("b", "/b/lib.rs", &[("a", 1)]), input("a", "/a/lib.rs", &[])];

@@ -144,12 +144,12 @@ fn chain(links: usize) -> World {
 /// `chain`'s body of a chain of `links` (its world `world`), checked on `side`, metered.
 fn run(world: World, links: usize, side: Side) -> Run {
     let (names, sized, frame) = world;
-    let cost: &'static Cost<'static> = blaze_own::Box::leak(blaze_own::Box::new_in(Cost::new(&STILL), a()));
+    let cost: &'static Cost<'static> = blaze_own::Box::leak_static(blaze_own::Box::new_in(Cost::new(&STILL), a()));
     let heads: Option<&'static dyn HeadSeed<'static>> = match side {
         Side::Restart => None,
         Side::Once => {
             let opts = SeededHeadsOpts { names, sized, pointers: crate::front2::receiver::Pointers::NOT_LOOKED_UP, frame, scratch: a(), alloc: a(), consts: None, known: None, owners: None };
-            let freezing: &'static Freezing<'static, 'static, Src> = blaze_own::Box::leak(blaze_own::Box::new_in(Freezing::new(names, SeededHeads::new(opts)), a()));
+            let freezing: &'static Freezing<'static, 'static, Src> = blaze_own::Box::leak_static(blaze_own::Box::new_in(Freezing::new(names, SeededHeads::new(opts)), a()));
             Some(freezing as &'static dyn HeadSeed<'static>)
         }
     };

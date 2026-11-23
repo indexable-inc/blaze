@@ -522,10 +522,10 @@ fn records_answer_what_the_solved_names_answer() {
     let make = |names: &blaze_scope::resolve::Names<'_>, no_items: Option<usize>| -> Kept {
         let mut kept = Kept { names: Vec::new(), items: Vec::new(), files: Vec::new(), expansions: Vec::new(), origins: Vec::new(), no_items };
         for c in names.crates().iter() {
-            kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), g));
+            kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
             // The bucket index resolved by the whole graph's names (`encode_with`): every impl
             // header's paths are walked to their end, as the reader's names would walk them.
-            kept.items.push(aligned(&items_record::encode_with(c, names, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), g));
+            kept.items.push(aligned(&items_record::encode_with(c, names, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
             // By each file's path in its package: what the items record asks for (D96).
             kept.files.push(c.files.iter().map(|f| (f.package.as_str().to_string(), leak(f.text))).collect());
             kept.expansions.push(c.expansions.iter().filter_map(|(call, e)| e.made.map(|m| (*call, leak(m.text)))).collect());
@@ -534,7 +534,7 @@ fn records_answer_what_the_solved_names_answer() {
         kept
     };
     let (kept, kept_planted, kept_no_core, chosen, root, solved_items, solved_langs, solved_impls, solved_candidates, kept_bodies, kept_bodies_planted, kept_question, kept_question_text, solved_bodies, (io, out_ty), solved_heads) = {
-        let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
         let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
         let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
@@ -558,7 +558,7 @@ fn records_answer_what_the_solved_names_answer() {
         let io = Paths { names: &names }.path(root, false, &["std", "Io"], Ns::Type).unwrap_or_else(|e| panic!("`std::Io` from his crate root: {e}")).key;
         // `Out`: the type `main`'s signature names (D104), for the planted bug.
         let out_ty = Paths { names: &names }.path(root, false, &["Out"], Ns::Type).unwrap_or_else(|e| panic!("`Out` from his crate root: {e}")).key;
-        let prepared = Prepares::new_in(Alloc::global());
+        let prepared = Prepares::new_in(blaze_own::testing::bump());
         let (mut store, mut body_buckets, mut consts) = (Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global()), None, Consts::default());
         let mut solved_bodies: Vec<String> = Vec::new();
         for key in chosen.iter() {
@@ -635,7 +635,7 @@ fn records_answer_what_the_solved_names_answer() {
     // opened is what the lang rows and these bodies asked for and nothing else.
     let (body_records, body_frame) = reader(keys, crate_names, kept_bodies);
     let mut body_front = Front2::from_records(body_records, body_frame, &lang_crates).unwrap_or_else(|e| panic!("front2 over the bodies' records: {e}"));
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
     let (mut store, mut body_buckets, mut consts) = (Store::new(body_front.index.lang("sized"), body_frame, blaze_own::Alloc::global()), None, Consts::default());
     let mut body_times = Vec::new();
     // Per body: its phases and what it opened beyond the bodies before it (the first body's
@@ -705,7 +705,7 @@ fn records_answer_what_the_solved_names_answer() {
     let (withheld, withheld_frame) = reader(keys, crate_names, kept_bodies_planted);
     withheld.plant_no_item(out_ty);
     let mut withheld_front = Front2::from_records(withheld, withheld_frame, &lang_crates).unwrap_or_else(|e| panic!("front2 over the withheld records: {e}"));
-    let withheld_prepared = Prepares::new_in(Alloc::global());
+    let withheld_prepared = Prepares::new_in(blaze_own::testing::bump());
     let (mut withheld_store, mut withheld_buckets, mut withheld_consts) = (Store::new(withheld_front.index.lang("sized"), withheld_frame, blaze_own::Alloc::global()), None, Consts::default());
     let withheld_main = body_checked(withheld, withheld_prepared, &mut withheld_front.keys, &withheld_front.index, &mut withheld_store, &mut withheld_buckets, &mut withheld_consts, chosen[0]);
     assert_ne!(withheld_main, solved_bodies[0], "the planted bug (the item row of `Out` withheld) was not caught: `main` checks the same");

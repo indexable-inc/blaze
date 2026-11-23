@@ -65,6 +65,7 @@ const CI_ONLY_STEPS: [(&str, &str); 1] = [(
 const CI_ONLY_SCRIPTS: [(&str, &str); 4] = [
     ("gate_changes", "the `changes` job: which tier of the workflow runs, from GitHub's comparison of the event's commits (needs GH_TOKEN)"),
     ("gate", "the runner itself, called by the `scripts` job's one gate step"),
+    ("toolchain_cut", "the `cargo` job: cuts the pinned toolchain shelf into $HOME/.blaze/v2/toolchain before `cargo test` so tests that open the shelf find it on a fresh runner"),
     ("sys_imports", "the `cargo` job: it reads blaze-sys's objects compiled for each target, and the gate builds nothing (its selftest is a row)"),
     ("toolchain_cut", "the `cargo` job: installs the pinned toolchain shelf in ~/.blaze/v2/toolchain before running workspace tests that read it"),
 ];

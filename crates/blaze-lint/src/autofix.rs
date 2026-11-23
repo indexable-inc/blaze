@@ -1137,4 +1137,43 @@ impl<'u, 's, 'a> Pass<'u, 's, 'a> {
             i += 1;
         }
     }
+
+    /// Rule [`Rule::HeapLeak`]: flags `.leak()` and `Box::leak(` / `Vec::leak(` outside tests
+    /// (allowing `Root::leak(` for process-root initialization).
+    pub(crate) fn heap_leak_pass(&mut self) {
+        let len = self.toks.len();
+        let mut i = 0usize;
+        // Bounded: `i` increases by 1 each iteration.
+        while i < len {
+            let Some(tok) = self.toks.get(i).copied() else { break };
+            if is_ident(self.text, tok, "leak")
+                && self.toks.get(i + 1).is_some_and(|n| is_punct(*n, b'('))
+                && i > 0
+            {
+                let hit_start = if self.toks.get(i - 1).is_some_and(|p| is_punct(*p, b'.')) {
+                    self.toks.get(i - 1).map(|p| p.start)
+                } else if i >= 2 && is_double_colon(self.toks, i - 2) {
+                    // Allow `Root::leak(` (intentional process-lifetime root allocator).
+                    let is_root = i >= 3 && self.toks.get(i - 3).is_some_and(|p| is_ident(self.text, *p, "Root"));
+                    if is_root {
+                        None
+                    } else {
+                        self.toks.get(i - 3).map_or(Some(tok.start), |p| Some(p.start))
+                    }
+                } else {
+                    None
+                };
+                if let Some(start) = hit_start {
+                    self.cost.add(Rule::HeapLeak);
+                    self.cands.push(Cand {
+                        template: Template::HeapLeak,
+                        range: Span::new(start, tok.end),
+                        arg: None,
+                        plan: Plan::None,
+                    });
+                }
+            }
+            i += 1;
+        }
+    }
 }

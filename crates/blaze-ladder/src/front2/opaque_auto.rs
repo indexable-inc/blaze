@@ -826,10 +826,11 @@ fn main() {}
             name: "spawned", dir: "/spawned/", root: "/spawned/src/main.rs", files: &files,
             edition: edition::PackageEdition::of_manifest("2024").expect("Rust 2024"), panic: blaze_build::Panic::Unwind,
         };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
+        let erased = blaze_own::Erased::new(&frame);
         let inputs = Inputs::new(&user, &tc).expect("fixture crate");
         let crates = inputs.crates();
-        let names = inputs.resolve(&crates, alloc).expect("fixture names");
-        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
         let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
         let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("fixture world");
         let bodies = world.bodies(alloc);
@@ -913,10 +914,11 @@ fn main() {}
             name: "witness", dir: "/witness/", root: "/witness/src/main.rs", files: &files,
             edition: edition::PackageEdition::of_manifest("2024").expect("Rust 2024"), panic: blaze_build::Panic::Unwind,
         };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
+        let erased = blaze_own::Erased::new(&frame);
         let inputs = Inputs::new(&user, &tc).expect("fixture crate");
         let crates = inputs.crates();
-        let names = inputs.resolve(&crates, alloc).expect("fixture names");
-        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
         let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
         let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("fixture world");
         let bodies = world.bodies(alloc);

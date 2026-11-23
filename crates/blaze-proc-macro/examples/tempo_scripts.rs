@@ -231,6 +231,7 @@ fn main() {
         Box::leak(Box::new(blaze_mem::Frame::with_reserve(1 << 36, blaze_mem::Tag::Usercode).expect("the entry's frame")));
     let erased: &'static blaze_own::Erased<&'static blaze_mem::Frame> = Box::leak(Box::new(blaze_own::Erased::new(frame)));
     let alloc: Alloc<'static> = erased.handle();
+    let bump: blaze_own::Bump<'static> = erased.bump();
     let bytes = std::fs::read(root.join("Cargo.lock")).unwrap_or_else(|e| panic!("{}: {e}", root.join("Cargo.lock").display()));
     let lock: &'static Lock<'static> = match Lock::read(&bytes, alloc) {
         Ok(lock) => Box::leak(Box::new(lock)),
@@ -283,11 +284,11 @@ fn main() {
     let home = std::env::var("HOME").unwrap_or_else(|_| panic!("HOME is not set: the pinned toolchain is read from $HOME/.blaze/v2/toolchain"));
     let checkout: &'static blaze_world::Checkout = Box::leak(Box::new(blaze_world::Checkout::new(root.clone())));
     let world: &'static blaze_world::World<'static> = {
-        let mut packages = blaze_world::Fetched { store: &mut sources, paths: &paths, lock, alloc };
+        let mut packages = blaze_world::Fetched { store: &mut sources, paths: &paths, lock, alloc: bump };
         let mut shelf = DirShelf(format!("{home}/.blaze/v2/toolchain"));
-        let listed = blaze_world::open_list(&mut shelf, blaze_toolchain::PINNED, TARGET, graph, lock, &mut packages, alloc).unwrap_or_else(|e| panic!("the crate list: {e}"));
+        let listed = blaze_world::open_list(&mut shelf, blaze_toolchain::PINNED, TARGET, graph, lock, &mut packages, bump).unwrap_or_else(|e| panic!("the crate list: {e}"));
         let listed: &'static blaze_world::Listed<'static, &'static [u8]> = Box::leak(Box::new(listed));
-        Box::leak(Box::new(blaze_world::world(graph, lock, listed, &mut packages, checkout, alloc).unwrap_or_else(|e| panic!("the world: {e}"))))
+        Box::leak(Box::new(blaze_world::world(graph, lock, listed, &mut packages, checkout, bump).unwrap_or_else(|e| panic!("the world: {e}"))))
     };
 
     let runtime = script_runtime(&store);

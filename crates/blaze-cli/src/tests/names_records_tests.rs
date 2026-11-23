@@ -88,8 +88,9 @@ fn a_crate_scope_record_files_its_names_and_items() {
     assert!(!parts.exports.is_empty() && !parts.names.is_empty() && !parts.items.is_empty(), "an empty section: {parts:?}");
     assert!(parts.tests.is_empty(), "`filed`'s plain library is not compiled with `test`, so it has no tests record: {parts:?}");
     let g = blaze_own::Alloc::global();
-    let names_bytes = aligned(parts.names, g);
-    let items_bytes = aligned(parts.items, g);
+    let b = blaze_own::testing::bump();
+    let names_bytes = aligned(parts.names, b);
+    let items_bytes = aligned(parts.items, b);
     let key = Verified::check(names_bytes).unwrap_or_else(|e| panic!("the names section does not check: {e:?}")).key();
     let world = RecordNames::new(&[key], OneNames(names_bytes), g);
     let root = world.record(0).unwrap_or_else(|| panic!("no names record of `filed`")).root_module();
@@ -102,7 +103,7 @@ fn a_crate_scope_record_files_its_names_and_items() {
     assert_eq!((m.consumed, m.def.kind), (1, DefKind::Module), "`crate::m`: {m:?}");
 
     // 2. The items section gives `f`'s row.
-    let items = RecordItems::new(&[key], OneItems(items_bytes), g);
+    let items = RecordItems::new(&[key], OneItems(items_bytes), b);
     let row = items
         .identity(f.def.key)
         .unwrap_or_else(|e| panic!("`f`'s row through the items section: {e:?}"))
@@ -190,8 +191,7 @@ fn a_test_units_payload_files_its_tests_record() {
 
     let parts = sections(&payload).unwrap_or_else(|e| panic!("the test unit's payload: {e}"));
     assert!(!parts.tests.is_empty(), "the test unit's tests section is empty: {parts:?}");
-    let g = blaze_own::Alloc::global();
-    let record = TestsRecord::open(aligned(parts.tests, g)).unwrap_or_else(|e| panic!("the tests section does not open: {e}"));
+    let record = TestsRecord::open(aligned(parts.tests, blaze_own::testing::bump())).unwrap_or_else(|e| panic!("the tests section does not open: {e}"));
     let mut rows = std::vec::Vec::new();
     for at in 0..record.len() {
         let row = record.row(at).unwrap_or_else(|e| panic!("row {at}: {e}")).unwrap_or_else(|| panic!("no row {at} below {}", record.len()));

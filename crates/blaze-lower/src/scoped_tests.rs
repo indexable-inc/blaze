@@ -10,8 +10,12 @@ use std::string::String;
 use std::vec::Vec as StdVec;
 
 use blaze_id::{ContentId, CrateItemKey};
-use blaze_own::Alloc;
+use blaze_own::{Alloc, Bump};
 use blaze_scope::graph::Sysroot;
+
+fn test_bump() -> Bump<'static> {
+    blaze_own::testing::bump()
+}
 use blaze_scope::resolve::{CrateInput, MacroDefError, Names, SourceTexts, resolve_crates};
 use blaze_scope::task::Serial;
 use blaze_surface::Edition;
@@ -190,7 +194,7 @@ fn names() -> &'static Names<'static> {
         input("dep", "/dep/lib.rs", &[], Edition::E2021),
         input("old", "/old/lib.rs", &[("dep", 1)], Edition::E2015),
     ];
-    let names = resolve_crates(&crates, Sysroot::default(), &Texts, &Serial, Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &Texts, &Serial, test_bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     std::boxed::Box::leak(std::boxed::Box::new(names))
 }
 
@@ -203,7 +207,7 @@ fn lowered(text: &str) -> (String, usize, StdVec<(String, u32, String)>) {
 /// [`lowered`] in crate `krate`'s root module, at that crate's edition (the unit graph's).
 fn lowered_in(krate: usize, text: &str) -> (String, usize, StdVec<(String, u32, String)>) {
     let names = names();
-    let scoped = Scoped { names, module: names.root(krate), prepared: Some(Prepares::new_in(Alloc::global())) };
+    let scoped = Scoped { names, module: names.root(krate), prepared: Some(Prepares::new_in(test_bump())) };
     let mut expander = ByName::with_names(&scoped, Host, Alloc::global());
     let l = lower_body_expanding(text, names.edition(krate), &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("{text}: needs {:?}", need.atoms));
     let findings = expander.findings().iter().map(|f| (String::from(&*f.path), f.at.start, std::format!("{}", f.why))).collect();
@@ -383,7 +387,7 @@ fn asked_paths(krate: usize, text: &str) -> (StdVec<(String, Option<blaze_id::It
         }
     }
     let names = names();
-    let scoped = Scoped { names, module: names.root(krate), prepared: Some(Prepares::new_in(Alloc::global())) };
+    let scoped = Scoped { names, module: names.root(krate), prepared: Some(Prepares::new_in(test_bump())) };
     let mut expander = ByName::with_names(&scoped, Host, Alloc::global());
     let l = lower_body_expanding(text, names.edition(krate), &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("{text}: needs {:?}", need.atoms));
     let name = ["user", "dep", "old"][krate];
@@ -436,7 +440,7 @@ fn a_path_fragment_naming_no_macro_is_a_finding() {
 #[test]
 fn an_environment_read_joins_the_body_s_read_list() {
     let names = names();
-    let scoped = Scoped { names, module: names.root(0), prepared: Some(Prepares::new_in(Alloc::global())) };
+    let scoped = Scoped { names, module: names.root(0), prepared: Some(Prepares::new_in(test_bump())) };
     let mut expander = ByName::with_names(&scoped, Host, Alloc::global());
     let text = "fn r() { let _ = dep::option_env!(\"ABSENT\"); }";
     let l = lower_body_expanding(text, names.edition(0), &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("{text}: needs {:?}", need.atoms));
@@ -453,7 +457,7 @@ fn an_environment_read_joins_the_body_s_read_list() {
 #[test]
 fn a_call_past_the_read_list_s_cap_is_a_finding_naming_the_cap() {
     let names = names();
-    let scoped = Scoped { names, module: names.root(0), prepared: Some(Prepares::new_in(Alloc::global())) };
+    let scoped = Scoped { names, module: names.root(0), prepared: Some(Prepares::new_in(test_bump())) };
     let mut expander = ByName::with_names(&scoped, Host, Alloc::global()).with_read_cap(1);
     let text = "fn r() { let _ = dep::option_env!(\"A\"); let _ = dep::option_env!(\"B\"); }";
     let l = lower_body_expanding(text, names.edition(0), &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("{text}: needs {:?}", need.atoms));
@@ -521,7 +525,7 @@ fn included(text: &str) -> (usize, StdVec<(blaze_expand::ReadKind, String)>) {
 /// [`included`] over the host `cx`.
 fn included_over<C: blaze_expand::ExpandCx>(text: &str, cx: C) -> (usize, StdVec<(blaze_expand::ReadKind, String)>) {
     let names = names();
-    let scoped = Scoped { names, module: names.root(0), prepared: Some(Prepares::new_in(Alloc::global())) };
+    let scoped = Scoped { names, module: names.root(0), prepared: Some(Prepares::new_in(test_bump())) };
     let mut expander = ByName::with_names(&scoped, cx, Alloc::global());
     let l = lower_body_expanding(text, names.edition(0), &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("{text}: needs {:?}", need.atoms));
     let reads = expander.reads();
@@ -573,7 +577,7 @@ fn an_include_reads_under_the_unit_s_source_root_and_is_refused_past_it() {
     assert_eq!(included_over(&call("../../../../etc/x"), past), want(1, &[]));
     // The refusal names the call's path and the decision.
     let names = names();
-    let scoped = Scoped { names, module: names.root(0), prepared: Some(Prepares::new_in(Alloc::global())) };
+    let scoped = Scoped { names, module: names.root(0), prepared: Some(Prepares::new_in(test_bump())) };
     let past = FileHost { root: ReadRoot { origin: Package, package: "reg" }, files: &[] };
     let mut expander = ByName::with_names(&scoped, past, Alloc::global());
     let text = call("../../x");
@@ -592,7 +596,7 @@ fn an_edit_of_an_included_file_changes_only_the_including_body_s_reads() {
     use blaze_expand::SourceOrigin::Checkout;
     let reads = |text: &str, bytes: &'static [u8]| {
         let names = names();
-        let scoped = Scoped { names, module: names.root(0), prepared: Some(Prepares::new_in(Alloc::global())) };
+        let scoped = Scoped { names, module: names.root(0), prepared: Some(Prepares::new_in(test_bump())) };
         let host = FileHost { root: ReadRoot { origin: Checkout, package: "a" }, files: std::vec![("b/g.json", bytes)].leak() };
         let mut expander = ByName::with_names(&scoped, host, Alloc::global());
         lower_body_expanding(text, names.edition(0), &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("needs {:?}", need.atoms));
@@ -752,7 +756,7 @@ impl<'d, 'p: 'd> crate::by_name::MacroNames<'d> for Recorded<'d, 'p> {
 fn read_at(text: &str) -> StdVec<(String, Option<blaze_surface::Range>)> {
     let names = names();
     let recorded = Recorded {
-        inner: Scoped { names, module: names.root(0), prepared: Some(Prepares::new_in(Alloc::global())) },
+        inner: Scoped { names, module: names.root(0), prepared: Some(Prepares::new_in(test_bump())) },
         seen: core::cell::RefCell::new(StdVec::new()),
     };
     let mut expander = ByName::with_names(&recorded, Host, Alloc::global());

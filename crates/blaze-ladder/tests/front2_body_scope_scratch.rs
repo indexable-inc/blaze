@@ -69,10 +69,10 @@ fn text(modules: usize) -> String {
 }
 
 /// A home frame for one pass, kept for the test (its handle outlives the pass).
-fn home() -> (&'static Frame, Alloc<'static>) {
+fn home() -> (&'static Frame, blaze_own::Bump<'static>) {
     let frame: &'static Frame = Box::leak(Box::new(Frame::with_reserve(1 << 30, Tag::Nameres).expect("a home frame")));
     let erased: &'static Erased<&'static Frame> = Box::leak(Box::new(Erased::new(frame)));
-    (frame, erased.handle())
+    (frame, erased.bump())
 }
 
 /// One pass over every held body of `up` (`modules` modules): each record's bytes, the home
@@ -119,12 +119,13 @@ fn up_with(modules: usize, file_mods: usize) -> Up {
     let crates: &'static [CrateInput<'static>] = Vec::leak(inputs.crates());
     let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(u32::try_from(i).expect("few crates")));
     let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd") };
-    let names: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, &inputs.texts, &Bodies, alloc).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"))));
+    let (_, bump) = home();
+    let names: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, &inputs.texts, &Bodies, bump).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"))));
     let c = names.crates()[0];
     assert_eq!(c.bodies.len(), BODIES, "every `f` is held under Bodies (its block writes an item)");
     let deps: &'static BodyDeps<'static, 'static> = Box::leak(Box::new(BodyDeps::of_names(names, 0, alloc)));
-    let tree: &'static ReadTree<'static> = Box::leak(Box::new(ReadTree::of(c, alloc).unwrap_or_else(|e| panic!("up's tree record: {e:?}"))));
-    let prepares = Prepares::new_in(alloc);
+    let tree: &'static ReadTree<'static> = Box::leak(Box::new(ReadTree::of(c, bump).unwrap_or_else(|e| panic!("up's tree record: {e:?}"))));
+    let prepares = Prepares::new_in(bump);
     Up { crates, inputs, c, deps, tree, prepares }
 }
 
@@ -179,14 +180,15 @@ impl<'t> SourceTexts<'t> for WholeTree<'t> {
 /// (`BodySolved::made_outside`) and its record's bytes; `whole` puts the whole-tree load back.
 fn made(up: &Up, whole: bool) -> (Vec<usize>, Vec<Vec<u8>>) {
     let alloc = blaze_own::testing::heap().alloc();
+    let (_, bump) = home();
     let whole_tree = WholeTree(&up.inputs.texts);
     let mut made = Vec::new();
     let mut records = Vec::new();
     for held in up.c.bodies.iter() {
         let scope = if whole {
-            body_scope_scratch(up.tree, up.deps, &up.crates[0], 0, *held, &whole_tree, up.prepares, &Scratch::kept, alloc)
+            body_scope_scratch(up.tree, up.deps, &up.crates[0], 0, *held, &whole_tree, up.prepares, &Scratch::kept, bump)
         } else {
-            body_scope_scratch(up.tree, up.deps, &up.crates[0], 0, *held, &up.inputs.texts, up.prepares, &Scratch::kept, alloc)
+            body_scope_scratch(up.tree, up.deps, &up.crates[0], 0, *held, &up.inputs.texts, up.prepares, &Scratch::kept, bump)
         }
         .unwrap_or_else(|e| panic!("body_scope: {e}"));
         made.push(scope.solved.made_outside);

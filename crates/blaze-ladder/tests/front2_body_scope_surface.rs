@@ -17,7 +17,7 @@
 use blaze_id::{ContentId, CrateItemKey};
 use blaze_ladder::crates::{DirShelf, Inputs, Texts, Toolchain, UserCrate};
 use blaze_ladder::front2::surface_names::surface_of;
-use blaze_own::{AVec, Alloc};
+use blaze_own::AVec;
 use blaze_scope::body_scope::{BodyScope, ImplHeaders, ImplRow, bodies_impl_table, body_scope, impl_diff, inside_only, modules_impl_table, written_in_a_body};
 use blaze_scope::graph::{CrateId, Sysroot};
 use blaze_scope::prepares::Prepares;
@@ -149,7 +149,8 @@ struct Verdict {
     listed_misses_modules: Vec<&'static str>,
 }
 
-fn oracle(modules: &'static Names<'static>, bodies: &'static Names<'static>, crates: &'static [CrateInput<'static>], texts: &'static WithDep<'static>, plant: Plant, alloc: Alloc<'static>) -> Verdict {
+fn oracle(modules: &'static Names<'static>, bodies: &'static Names<'static>, crates: &'static [CrateInput<'static>], texts: &'static WithDep<'static>, plant: Plant, bump: blaze_own::Bump<'static>) -> Verdict {
+    let alloc = bump.alloc();
     let (c_mod, c_bod) = (modules.crates()[0], bodies.crates()[0]);
     let root = bodies.root(0);
     let spans = [line_of(USER, "pub fn g"), line_of(USER, "pub fn h")];
@@ -158,7 +159,7 @@ fn oracle(modules: &'static Names<'static>, bodies: &'static Names<'static>, cra
 
     // Each held body of the user crate whose text is in a surface body's span gets its task.
     let deps = BodyDeps::of_names(bodies, 0, alloc);
-    let prepares = Prepares::new_in(alloc);
+    let prepares = Prepares::new_in(bump);
     let mut scopes: AVec<'static, BodyScope<'static>> = AVec::new_in(alloc);
     for held in c_bod.bodies.iter() {
         let surface = (0..spans.len()).any(|i| {
@@ -166,7 +167,7 @@ fn oracle(modules: &'static Names<'static>, bodies: &'static Names<'static>, cra
             record.is_surface(u32::try_from(i).expect("two bodies")) && span.contains(held.src.text)
         });
         if surface {
-            scopes.push(body_scope(c_bod, &deps, &crates[0], 0, *held, texts, prepares, alloc).unwrap_or_else(|e| panic!("body_scope: {e}")));
+            scopes.push(body_scope(c_bod, &deps, &crates[0], 0, *held, texts, prepares, bump).unwrap_or_else(|e| panic!("body_scope: {e}")));
         }
     }
     let rows_mod = modules_impl_table(c_mod, alloc).unwrap_or_else(|e| panic!("the Modules impl table: {e:?}"));
@@ -198,13 +199,13 @@ fn oracle(modules: &'static Names<'static>, bodies: &'static Names<'static>, cra
 
 #[test]
 fn a_renamed_emitting_macro_is_a_surface_body_and_the_oracle_catches_its_skip() {
-    let alloc = blaze_own::testing::heap().alloc();
+    let bump = blaze_own::testing::bump();
     let (crates, sysroot, texts, _dep) = two_crates(USER, DEP);
-    let modules: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates under Modules: {e}"))));
-    let bodies: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Bodies, alloc).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"))));
+    let modules: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates under Modules: {e}"))));
+    let bodies: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Bodies, bump).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"))));
 
-    let real = oracle(modules, bodies, crates, texts, Plant::None, alloc);
-    let planted = oracle(modules, bodies, crates, texts, Plant::SkipEffect, alloc);
+    let real = oracle(modules, bodies, crates, texts, Plant::None, bump);
+    let planted = oracle(modules, bodies, crates, texts, Plant::SkipEffect, bump);
     for (name, v) in [("real", &real), ("planted", &planted)] {
         println!(
             "surface oracle: {name}: misses {} of {} impl(s) written in bodies (surface bodies {}, scoped {}, only-bodies {}, differ {}); truth {:?}",
@@ -250,8 +251,9 @@ fn a_renamed_emitting_macro_is_a_surface_body_and_the_oracle_catches_its_skip() 
 fn a_plain_format_call_in_a_block_writes_no_impl() {
     const PLAIN: &str = "pub fn g() { format!(\"x\"); }\npub fn main() {}\n";
     let alloc = blaze_own::testing::heap().alloc();
+    let bump = blaze_own::testing::bump();
     let (crates, sysroot, texts, _dep) = two_crates(PLAIN, DEP);
-    let modules: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates under Modules: {e}"))));
+    let modules: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates under Modules: {e}"))));
     let c = modules.crates()[0];
     let rows = modules_impl_table(c, alloc).unwrap_or_else(|e| panic!("the Modules impl table: {e:?}"));
     let headers = ImplHeaders::of(c, &[], alloc);

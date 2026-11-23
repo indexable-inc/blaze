@@ -14,7 +14,7 @@ use blaze_build_script::instr::OutputLimits;
 use blaze_build_script::outputs::{FileLimits, OutputsRef};
 use blaze_fetch::PackView;
 use blaze_manifest::lock::{Lock, LockId};
-use blaze_own::{AString, AVec, Alloc};
+use blaze_own::{AString, AVec, Alloc, Bump};
 use blaze_scope::task::Serial;
 use blaze_toolchain::Shelf;
 use blaze_unit_graph::{CfgAtom, Resolver, StdIs, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
@@ -24,6 +24,10 @@ use crate::{Listed, Packages, Place, Script, Toolchain, Tree, World, WorldError,
 
 fn g() -> Alloc<'static> {
     blaze_own::testing::heap().alloc()
+}
+
+fn b() -> Bump<'static> {
+    blaze_own::testing::bump()
 }
 
 use crate::fixture::pack;
@@ -54,7 +58,7 @@ fn toolchain(needs: crate::Needs) -> &'static Toolchain<'static, StdVec<u8>> {
 
 fn toolchain_of(needs: crate::Needs, std: &str, cfg: &'static [(&'static str, Option<&'static str>)]) -> &'static Toolchain<'static, StdVec<u8>> {
     let (id, files) = crate::fixture::shelf(TRIPLE, std, cfg, blaze_own::testing::heap().alloc());
-    let tc = Toolchain::open(&mut Memory(files.into_iter().collect()), id, TRIPLE, needs, g()).unwrap_or_else(|e| panic!("{e}"));
+    let tc = Toolchain::open(&mut Memory(files.into_iter().collect()), id, TRIPLE, needs, b()).unwrap_or_else(|e| panic!("{e}"));
     StdBox::leak(StdBox::new(tc))
 }
 
@@ -62,7 +66,7 @@ fn toolchain_of(needs: crate::Needs, std: &str, cfg: &'static [(&'static str, Op
 /// its members placed by `store`.
 fn listed_or(graph: &'static UnitGraph<'static>, lock: &'static Lock<'static>, store: &mut Store) -> Result<&'static Listed<'static, StdVec<u8>>, WorldError<'static>> {
     let (id, files) = crate::fixture::shelf(TRIPLE, crate::fixture::STD, &[("target_os", Some("macos")), ("unix", None)], blaze_own::testing::heap().alloc());
-    let listed = open_list(&mut Memory(files.into_iter().collect()), id, TRIPLE, graph, lock, store, g())?;
+    let listed = open_list(&mut Memory(files.into_iter().collect()), id, TRIPLE, graph, lock, store, b())?;
     Ok(StdBox::leak(StdBox::new(listed)))
 }
 
@@ -265,7 +269,7 @@ fn scripts(file: &str, version: &str) -> OutputsRef<'static> {
     out.add_file("gen.rs", file.as_bytes(), FileLimits::DEFAULT, g()).unwrap_or_else(|e| panic!("{e:?}"));
     let mut bytes = AVec::new_in(g());
     out.encode(&mut bytes);
-    let bytes: &'static [u8] = bytes.leak();
+    let bytes: &'static [u8] = bytes.leak_static();
     OutputsRef::open(bytes).unwrap_or_else(|e| panic!("{e:?}"))
 }
 
@@ -278,7 +282,7 @@ fn made(order: &[u32; 9]) -> World<'static> {
     let graph = graph(lock, order);
     let mut store = store(lock);
     let listed = listed(graph, lock, &mut store);
-    world(graph, lock, listed, &mut store, checkout(), g()).unwrap_or_else(|e| panic!("{e}"))
+    world(graph, lock, listed, &mut store, checkout(), b()).unwrap_or_else(|e| panic!("{e}"))
 }
 
 fn by_name<'w>(w: &'w World<'static>, name: &str) -> StdVec<&'w crate::Crate<'static>> {
@@ -344,7 +348,7 @@ fn a_build_scripts_cfg_joins_its_library_at_task_time() {
     let util = by_name(&w, "util")[0];
     assert!(matches!(util.script, Script::Read { .. }));
     assert!(!util.input.cfg.contains(&("has_atomics", None)), "the world's input holds no script atom");
-    let input = joined(&util.input, scripts("pub fn made() {}\n", "1"), g());
+    let input = joined(&util.input, scripts("pub fn made() {}\n", "1"), b());
     assert!(input.cfg.contains(&("has_atomics", None)), "the joined input lacks the script's cfg");
     assert!(util.input.cfg.iter().all(|atom| input.cfg.contains(atom)), "the join dropped a unit atom");
     assert!(input.cfg.windows(2).all(|pair| pair[0] < pair[1]), "the joined cfg is not sorted and each once");
@@ -380,9 +384,9 @@ fn std_carries_its_build_script_cfg() {
 fn a_crates_key_does_not_hold_its_scripts_outputs() {
     let w = made(&IN_ORDER);
     let util = by_name(&w, "util")[0];
-    let first = joined(&util.input, scripts("pub fn made() {}\n", "1"), g());
-    let file = joined(&util.input, scripts("pub fn made() { }\n", "1"), g());
-    let env = joined(&util.input, scripts("pub fn made() {}\n", "2"), g());
+    let first = joined(&util.input, scripts("pub fn made() {}\n", "1"), b());
+    let file = joined(&util.input, scripts("pub fn made() { }\n", "1"), b());
+    let env = joined(&util.input, scripts("pub fn made() {}\n", "2"), b());
     assert_eq!(first.key, file.key);
     assert_eq!(first.key, env.key);
     assert_eq!(first.key, util.input.key);
@@ -487,7 +491,7 @@ fn an_absent_source_is_an_error_naming_the_package() {
     let mut store = store(lock);
     store.packs.remove("testkit");
     let listed = listed(graph, lock, &mut store);
-    match world(graph, lock, listed, &mut store, checkout(), g()) {
+    match world(graph, lock, listed, &mut store, checkout(), b()) {
         Err(e) => assert!(format!("{e}").contains("testkit"), "{e}"),
         Ok(_) => panic!("taken"),
     }
@@ -497,7 +501,7 @@ fn an_absent_source_is_an_error_naming_the_package() {
 fn the_world_resolves() {
     let w = made(&IN_ORDER);
     let inputs = w.inputs(g());
-    let names = w.resolve(&inputs, &Serial, g()).unwrap_or_else(|e| panic!("{e}"));
+    let names = w.resolve(&inputs, &Serial, b()).unwrap_or_else(|e| panic!("{e}"));
     let app = by_name(&w, "app")[0];
     let at = w.crates.iter().position(|c| core::ptr::eq(c, app)).expect("app");
     let c = names.krate(at);
@@ -538,7 +542,7 @@ fn a_dependency_sees_the_one_package_root_and_a_member_its_workspace_dir() {
 fn an_include_under_the_crates_own_root_is_served() {
     let w = made(&IN_ORDER);
     let inputs = w.inputs(g());
-    let names = w.resolve(&inputs, &Serial, g()).unwrap_or_else(|e| panic!("{e}"));
+    let names = w.resolve(&inputs, &Serial, b()).unwrap_or_else(|e| panic!("{e}"));
     let at = w.crates.iter().position(|c| c.input.name == "util").expect("util");
     let c = names.krate(at);
     let made: StdVec<&str> = c.expansions.values().filter_map(|e| e.made.map(|m| m.text)).collect();
@@ -557,7 +561,7 @@ fn an_include_under_the_crates_own_root_is_served() {
 fn file_in_a_dependency_is_its_name_version_and_path() {
     let w = made(&IN_ORDER);
     let inputs = w.inputs(g());
-    let names = w.resolve(&inputs, &Serial, g()).unwrap_or_else(|e| panic!("{e}"));
+    let names = w.resolve(&inputs, &Serial, b()).unwrap_or_else(|e| panic!("{e}"));
     let at = w.crates.iter().position(|c| c.input.name == "util").expect("util");
     let c = names.krate(at);
     let made: StdVec<&str> = c.expansions.values().filter_map(|e| e.made.map(|m| m.text)).collect();
@@ -577,7 +581,7 @@ fn file_in_a_dependency_is_its_name_version_and_path() {
 fn module_path_line_and_column_in_eager_input_are_the_call_s() {
     let w = made(&IN_ORDER);
     let inputs = w.inputs(g());
-    let names = w.resolve(&inputs, &Serial, g()).unwrap_or_else(|e| panic!("{e}"));
+    let names = w.resolve(&inputs, &Serial, b()).unwrap_or_else(|e| panic!("{e}"));
     let at = w.crates.iter().position(|c| c.input.name == "util").expect("util");
     let c = names.krate(at);
     let made: StdVec<&str> = c.expansions.values().filter_map(|e| e.made.map(|m| m.text)).collect();
@@ -597,8 +601,8 @@ fn a_members_directory_is_in_its_crate_key() {
     let mut moved = store(lock);
     moved.app_dir = "crates/app";
     let (listed_here, listed_moved) = (listed(graph, lock, &mut here), listed(graph, lock, &mut moved));
-    let a = world(graph, lock, listed_here, &mut here, checkout(), g()).unwrap_or_else(|e| panic!("{e}"));
-    let b = world(graph, lock, listed_moved, &mut moved, checkout(), g()).unwrap_or_else(|e| panic!("{e}"));
+    let a = world(graph, lock, listed_here, &mut here, checkout(), b()).unwrap_or_else(|e| panic!("{e}"));
+    let b = world(graph, lock, listed_moved, &mut moved, checkout(), b()).unwrap_or_else(|e| panic!("{e}"));
     let key = |w: &World<'static>, name: &str| by_name(w, name)[0].input.key;
     assert_ne!(key(&a, "app"), key(&b, "app"), "`app` moved to crates/app kept its key: its directory is not in it");
     assert_ne!(key(&a, "blz"), key(&b, "blz"), "`blz` depends on the moved `app`");
@@ -624,12 +628,12 @@ fn a_dependencys_records_are_equal_in_two_workspaces() {
     let other: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(g()), left_out: AVec::new_in(g()) }));
     let mut store = store(lock);
     let listed = listed(other, lock, &mut store);
-    let second = world(other, lock, listed, &mut store, checkout(), g()).unwrap_or_else(|e| panic!("{e}"));
+    let second = world(other, lock, listed, &mut store, checkout(), b()).unwrap_or_else(|e| panic!("{e}"));
     assert_ne!(first.toolchain_crates, second.toolchain_crates, "the two workspaces keep the same toolchain crates");
 
     let (a_inputs, b_inputs) = (first.inputs(g()), second.inputs(g()));
-    let a = first.resolve(&a_inputs, &Serial, g()).unwrap_or_else(|e| panic!("{e}"));
-    let b = second.resolve(&b_inputs, &Serial, g()).unwrap_or_else(|e| panic!("{e}"));
+    let a = first.resolve(&a_inputs, &Serial, b()).unwrap_or_else(|e| panic!("{e}"));
+    let b = second.resolve(&b_inputs, &Serial, b()).unwrap_or_else(|e| panic!("{e}"));
     let mut equal = 0;
     for name in ["util", "testkit", "bstd", "std", "core"] {
         let at = |w: &World<'static>| w.crates.iter().position(|c| c.input.name == name).unwrap_or_else(|| panic!("no crate `{name}`"));

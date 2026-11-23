@@ -655,6 +655,7 @@ fn new_rules_are_off_until_named() {
         Rule::IoRef,
         Rule::UnusedImport,
         Rule::UnusedMut,
+        Rule::HeapLeak,
     ] {
         assert!(!Step::Strict.rules().runs(rule), "{} runs in strict", rule.name());
         assert!(Step::Strict.rules().with(rule).runs(rule));
@@ -2589,4 +2590,26 @@ fn unused_mut_autofixes_and_preserves_mutations() {
     ] {
         assert_eq!(fix(mutated).as_str(), mutated, "should keep mut: {mutated}");
     }
+}
+
+#[test]
+fn heap_leak_flags_leak_and_allows_root_and_bump() {
+    let rule = Rule::HeapLeak;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(rule.name(), "heap-leak");
+    assert_eq!(Rule::from_name("heap-leak"), Some(rule));
+    assert_eq!(rule.lint(), Some("heap_leak"));
+    assert_eq!(Rule::from_lint("heap_leak"), Some(rule));
+    assert_eq!(Template::HeapLeak.rule(), rule);
+
+    assert_eq!(found(&only, "fn f() { let _ = v.leak(); }", FILE), [("heap-leak", ".leak")]);
+    assert_eq!(found(&only, "fn f() { let _ = Box::leak(b); }", FILE), [("heap-leak", "Box::leak")]);
+    assert_eq!(found(&only, "fn f() { let _ = Vec::leak(v); }", FILE), [("heap-leak", "Vec::leak")]);
+
+    none(rule, &[
+        "fn f(frame: &Frame) { let _ = v.into_bump_slice(); }",
+        "fn f(frame: &Frame) { let _ = s.into_bump_str(); }",
+        "fn f(root: Root) { let _ = Root::leak(root); }",
+        "#[test]\nfn t() { let _ = v.leak(); }",
+    ]);
 }

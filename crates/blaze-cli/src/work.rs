@@ -499,9 +499,7 @@ impl Sizes {
 
 /// `text` copied into `frame`, held as long as it is.
 pub(crate) fn held_str<'f>(text: &str, frame: &'f Frame) -> &'f str {
-    let bytes: &'f [u8] = Vec::from_slice_in(text.as_bytes(), frame).leak();
-    // A copy of a `str`'s bytes is UTF-8: the check cannot fail.
-    core::str::from_utf8(bytes).unwrap_or_default()
+    frame.alloc_str(text)
 }
 
 /// A task that failed, with the file it is about or in (`None` for a manifest's or a crate's),

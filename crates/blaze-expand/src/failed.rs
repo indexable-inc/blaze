@@ -7,7 +7,7 @@
 
 use core::fmt;
 
-use blaze_own::{AVec, Alloc};
+use blaze_own::{Alloc, Bump};
 
 use crate::expansion::{Diagnostic, Expansion, IncludeFailure, ProcLevel, TokenOrigin};
 use crate::record::{RecordBytes, RecordColumn, RecordError};
@@ -23,14 +23,12 @@ pub struct Failed<'a> {
 }
 
 impl<'a> Failed<'a> {
-    /// The failure of `expansion`: its first error diagnostic, its texts copied into `alloc`.
+    /// The failure of `expansion`: its first error diagnostic, its texts copied into `bump`.
     /// `None` when the expansion has no error (it expanded; a proc macro's warning is no
     /// failure).
-    pub fn of(expansion: &Expansion<'_>, alloc: Alloc<'a>) -> Option<Failed<'a>> {
+    pub fn of(expansion: &Expansion<'_>, bump: Bump<'a>) -> Option<Failed<'a>> {
         let diagnostic = *expansion.diagnostics.iter().find(|d| d.is_error())?;
-        let mut notes: AVec<'a, u8> = AVec::with_capacity_in(expansion.notes.len(), alloc);
-        notes.extend_from_slice(&expansion.notes);
-        Some(Failed { diagnostic, notes: notes.leak() })
+        Some(Failed { diagnostic, notes: bump.alloc_slice_copy(&expansion.notes) })
     }
 
     /// A failure from its parts: `notes` must be the table `diagnostic`'s texts are ranges of
@@ -66,9 +64,9 @@ impl<'a> Failed<'a> {
     /// A failure read back from [`Failed::write_record`]'s bytes (16-aligned, as every
     /// expansion record). A record holding no error diagnostic is refused by name, never read
     /// as "no failure".
-    pub fn read_record(bytes: &[u8], alloc: Alloc<'a>) -> Result<Failed<'a>, RecordError> {
-        let expansion = Expansion::read_record(bytes, alloc)?;
-        Failed::of(&expansion, alloc).ok_or(RecordError::Invalid { column: RecordColumn::Diagnostics, at: 0, what: "a failure's record holds no error diagnostic" })
+    pub fn read_record(bytes: &[u8], bump: Bump<'a>) -> Result<Failed<'a>, RecordError> {
+        let expansion = Expansion::read_record(bytes, bump.alloc())?;
+        Failed::of(&expansion, bump).ok_or(RecordError::Invalid { column: RecordColumn::Diagnostics, at: 0, what: "a failure's record holds no error diagnostic" })
     }
 
     /// Where the failure is, when it is a token of the call's input: its index there. The
@@ -173,13 +171,14 @@ mod tests {
     /// line: none printed; the assertion's text is the check.
     #[test]
     fn a_failed_call_keeps_the_matchers_words() {
-        let heap = blaze_own::testing::heap();
-        let alloc = heap.alloc();
-        let mut expansion = Expansion::new_in(alloc);
+        let inline = blaze_own::Inline::<4096>::new();
+        let erased = blaze_own::Erased::new(&inline);
+        let bump = erased.bump();
+        let mut expansion = Expansion::new_in(bump.alloc());
         let expected = expansion.note("`$cx:tt :`").expect("a note");
         let token = expansion.note(")").expect("a note");
         expansion.diagnostics.push(Diagnostic::NoRuleMatched { rules: 1, closest: None, token: Some(token), expected, at: Some(TokenOrigin::Input(3)) });
-        let failed = Failed::of(&expansion, alloc).expect("an error diagnostic is a failure");
+        let failed = Failed::of(&expansion, bump).expect("an error diagnostic is a failure");
         drop(expansion);
         let shown = failed.to_string();
         assert!(shown.contains("the closest expected `$cx:tt :` and found `)`"), "{shown}");
@@ -192,15 +191,18 @@ mod tests {
     fn a_failure_round_trips_through_its_record() {
         let heap = blaze_own::testing::heap();
         let alloc = heap.alloc();
+        let inline = blaze_own::Inline::<4096>::new();
+        let erased = blaze_own::Erased::new(&inline);
+        let bump = erased.bump();
         let mut expansion = Expansion::new_in(alloc);
         let expected = expansion.note("`)`").expect("a note");
         let token = expansion.note("x").expect("a note");
         expansion.diagnostics.push(Diagnostic::NoRuleMatched { rules: 3, closest: Some(1), token: Some(token), expected, at: Some(TokenOrigin::Input(4)) });
-        let failed = Failed::of(&expansion, alloc).expect("an error diagnostic is a failure");
+        let failed = Failed::of(&expansion, bump).expect("an error diagnostic is a failure");
         let bytes = failed.write_record(alloc);
         // The record is read in place, 16-aligned: copy it to an aligned buffer first.
         let place = blaze_format::Aligned::copy_from(&bytes);
-        let back = Failed::read_record(&place, alloc).expect("its own record reads back");
+        let back = Failed::read_record(&place, bump).expect("its own record reads back");
         assert_eq!(back, failed);
         assert_eq!(back.to_string(), failed.to_string());
         assert_eq!(failed.write_record(alloc)[..], bytes[..], "equal failures write equal bytes");

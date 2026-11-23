@@ -27,7 +27,7 @@ use blaze_ladder::front2::source::{NamesSource, Records};
 use blaze_ladder::front2::tables::head::{ConstValues, StoreConsts};
 use blaze_ladder::front2::tables::recorder::{MOST_READS, ReadSink, ReadsFull, TableRead};
 use blaze_ladder::front2::tables::view::Tables;
-use blaze_own::Alloc;
+use blaze_own::{Alloc, Bump};
 use blaze_scope::names_cells::NameCell;
 use blaze_scope::prepares::Prepares;
 use blaze_scope::resolve::At;
@@ -41,23 +41,23 @@ use crate::engine_tasks::WHOLE;
 pub(crate) struct HeadConsts<'r, 'n, S> {
     pub(crate) names: S,
     pub(crate) index: &'r Index<'n>,
-    pub(crate) alloc: Alloc<'n>,
+    pub(crate) bump: Bump<'n>,
     prepared: Option<&'n Prepares<'n>>,
     /// The constants asked of it.
     pub(crate) asked: u32,
 }
 
 impl<'r, 'n, S> HeadConsts<'r, 'n, S> {
-    pub(crate) fn new(names: S, index: &'r Index<'n>, alloc: Alloc<'n>) -> HeadConsts<'r, 'n, S> {
-        HeadConsts { names, index, alloc, prepared: None, asked: 0 }
+    pub(crate) fn new(names: S, index: &'r Index<'n>, bump: Bump<'n>) -> HeadConsts<'r, 'n, S> {
+        HeadConsts { names, index, bump, prepared: None, asked: 0 }
     }
 }
 
 impl<'n, S: NamesSource<'n>> ConstValues<'n> for HeadConsts<'_, 'n, S> {
     fn eval(&mut self, store: &mut Store<'n>, keys: &mut Keys, c: LibKey) -> Result<(), ConstFail> {
         self.asked = self.asked.saturating_add(1);
-        let alloc = self.alloc;
-        let prepared = *self.prepared.get_or_insert_with(|| Prepares::new_in(alloc));
+        let bump = self.bump;
+        let prepared = *self.prepared.get_or_insert_with(|| Prepares::new_in(bump));
         StoreConsts { names: self.names, index: self.index, prepared }.eval(store, keys, c)
     }
 }

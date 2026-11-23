@@ -49,7 +49,7 @@ use core::cell::{Cell, OnceCell, RefCell};
 
 use blaze_hash::HashMap;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
-use blaze_own::{ABox, ARc, AVec, Alloc, Box, Rc};
+use blaze_own::{ABox, ARc, AVec, Alloc, Box, Bump, Rc};
 use blaze_surface::{CallShape, Edition, FileItemsView, ImplFlags, ItemDetail, ItemIndex, ItemKind, ProcKind, RecordBytes};
 
 use crate::package_path::{NotPackagePath, PackagePath};
@@ -1240,19 +1240,19 @@ impl FileItemsId {
 }
 
 impl<'a> CurrentFile<'a> {
-    pub fn from_outline(file: u32, text: &'a str, outline: &blaze_file_items::Outline<'_>, alloc: Alloc<'a>) -> Result<Self, ItemsRecordError> {
+    pub fn from_outline(file: u32, text: &'a str, outline: &blaze_file_items::Outline<'_>, alloc: Bump<'a>) -> Result<Self, ItemsRecordError> {
         Self::from_digested(file, text, FileItemsId::of(text), outline, alloc)
     }
 
     /// [`CurrentFile::from_outline`] with the text's digest made already (in a batch).
-    fn from_digested(file: u32, text: &'a str, digest: FileItemsId, outline: &blaze_file_items::Outline<'_>, alloc: Alloc<'a>) -> Result<Self, ItemsRecordError> {
-        let bytes = outline.to_file_items(text, digest.0, alloc).map_err(|why| ItemsRecordError::FileItemsBuild { file, why })?;
+    fn from_digested(file: u32, text: &'a str, digest: FileItemsId, outline: &blaze_file_items::Outline<'_>, alloc: Bump<'a>) -> Result<Self, ItemsRecordError> {
+        let bytes = outline.to_file_items(text, digest.0, alloc.alloc()).map_err(|why| ItemsRecordError::FileItemsBuild { file, why })?;
         let view = FileItemsView::read(crate::resolve::aligned(&bytes, alloc)).map_err(|why| ItemsRecordError::FileItemsRead { file, why })?;
         Ok(Self { view, text, surface: outline.surface() })
     }
 
-    pub fn from_text(file: u32, text: &'a str, edition: Edition, alloc: Alloc<'a>) -> Result<Self, ItemsRecordError> {
-        let outline = blaze_file_items::outline(text, edition, alloc);
+    pub fn from_text(file: u32, text: &'a str, edition: Edition, alloc: Bump<'a>) -> Result<Self, ItemsRecordError> {
+        let outline = blaze_file_items::outline(text, edition, alloc.alloc());
         Self::from_outline(file, text, &outline, alloc)
     }
 }
@@ -1731,7 +1731,7 @@ impl<'a> ItemsRecord<'a> {
     }
 
     /// Reuse the solve's surface and file ranges when building cells from its records.
-    pub(super) fn use_solved_texts(&mut self, names: &CrateNames<'a>) {
+    pub(super) fn use_solved_texts(&mut self, names: &CrateNames<'a>, bump: Bump<'a>) {
         let checked = |saw, found, text| if saw == found { Seen::Fresh(text) } else { Seen::Stale(found) };
         let files = &names.files[..names.files.len().min(self.files())];
         let mut texts: AVec<'_, &[u8]> = AVec::with_capacity_in(files.len(), self.alloc);
@@ -1740,7 +1740,7 @@ impl<'a> ItemsRecord<'a> {
         for (index, (file, &digest)) in files.iter().zip(digests.iter()).enumerate() {
             let saw = id_at(self.bytes, self.row(T_FILES, index));
             let index = index as u32;
-            let result = CurrentFile::from_digested(index, file.text, digest, &file.outline, self.alloc)
+            let result = CurrentFile::from_digested(index, file.text, digest, &file.outline, bump)
                 .and_then(|current| self.check_file(index, saw, current));
             self.current.get_mut().insert(index, result);
         }
@@ -2115,7 +2115,7 @@ pub trait LoadItems<'a>: 'a {
 
     /// Return the FileItems and surface for this file of the snapshot. A text-backed loader
     /// produces the view once per file. A record-backed loader lends its already opened view.
-    fn file_items(&self, krate: usize, index: u32, path: PackagePath<'_>, _surface: ContentId, edition: Edition, alloc: Alloc<'a>) -> Result<Option<CurrentFile<'a>>, ItemsRecordError> {
+    fn file_items(&self, krate: usize, index: u32, path: PackagePath<'_>, _surface: ContentId, edition: Edition, alloc: Bump<'a>) -> Result<Option<CurrentFile<'a>>, ItemsRecordError> {
         self.file(krate, path).map(|text| CurrentFile::from_text(index, text, edition, alloc)).transpose()
     }
 }
@@ -2131,18 +2131,20 @@ pub struct RecordItems<'a, L> {
     open: AVec<'a, OnceCell<Option<ItemsRecord<'a>>>>,
     load: ARc<'a, L>,
     alloc: Alloc<'a>,
+    bump: Bump<'a>,
 }
 
 impl<'a, L: LoadItems<'a>> RecordItems<'a, L> {
     /// `keys`: each crate by index, as `load` knows them. Nothing is read here.
-    pub fn new(keys: &[CrateItemKey], load: L, alloc: Alloc<'a>) -> RecordItems<'a, L> {
+    pub fn new(keys: &[CrateItemKey], load: L, bump: Bump<'a>) -> RecordItems<'a, L> {
+        let alloc = bump.alloc();
         let mut by_prefix = HashMap::new_in(alloc);
         for (i, k) in keys.iter().enumerate() {
             by_prefix.insert(k.prefix(), i);
         }
         let mut open = AVec::with_capacity_in(keys.len(), alloc);
         open.resize_with(keys.len(), OnceCell::new);
-        RecordItems { keys: AVec::from_slice_in(keys, alloc), by_prefix, open, load: Rc::new_in(load, alloc), alloc }
+        RecordItems { keys: AVec::from_slice_in(keys, alloc), by_prefix, open, load: Rc::new_in(load, alloc), alloc, bump }
     }
 
     /// The crate whose key `key` (any item of it) begins with (question 4): no record is opened.
@@ -2161,7 +2163,8 @@ impl<'a, L: LoadItems<'a>> RecordItems<'a, L> {
                 let bytes = self.load.load(krate)?;
                 let load = self.load.clone();
                 let alloc = self.alloc;
-                let source = move |index, path, surface, edition| load.file_items(krate, index, path, surface, edition, alloc);
+                let bump = self.bump;
+                let source = move |index, path, surface, edition| load.file_items(krate, index, path, surface, edition, bump);
                 Some(ItemsRecord::open_with_files(bytes, alloc, source).unwrap_or_else(|e| panic!("the items record of crate {:?} did not open: {e:?}", self.keys[krate])))
             })
             .as_ref()

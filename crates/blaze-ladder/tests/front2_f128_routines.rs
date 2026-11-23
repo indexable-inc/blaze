@@ -66,7 +66,7 @@ fn survey(package: &'static str) -> (Vec<String>, usize, usize) {
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let segments: &[&str] = &["add"];
     let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments }, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("`add` by path: {e:?}"));
     let add = found.whole(1).unwrap_or_else(|| panic!("`add` resolves whole")).key;

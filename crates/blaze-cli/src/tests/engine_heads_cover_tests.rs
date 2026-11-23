@@ -67,7 +67,7 @@ fn cover_of(heap: &'static blaze_own::Heap, names: &[&str]) -> Cover {
     cells.extend(names.iter().map(|n| CellId { of: scope(n), cell: WHOLE }));
     cells.sort_unstable();
     let members: blaze_own::Vec<Want, blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(heap.alloc());
-    Cover { cells: cells.leak(), members: members.leak() }
+    Cover { cells: cells.leak_static(), members: members.leak_static() }
 }
 
 /// Two workers, each a look then (on a miss) a put of its cover, interleaved as the tape draws;

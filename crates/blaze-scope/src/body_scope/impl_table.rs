@@ -16,7 +16,7 @@
 use core::fmt;
 
 use blaze_id::ItemKey;
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, Bump};
 
 use super::{BodyScope, BodyScopeRefusal};
 use crate::items_record::buckets::{Filing, KEY, OwnNames};
@@ -64,24 +64,25 @@ pub struct ModulesSide<'o> {
 impl<'o> ModulesSide<'o> {
     /// The side of crate `c`, solved under `Modules`, copied into `out`; the rows are made in
     /// `scratch` (the solve's frame: what filing an impl reads is left there).
-    pub fn of(c: &CrateNames<'_>, scratch: Alloc<'_>, out: Alloc<'o>) -> Result<ModulesSide<'o>, ItemsRecordError> {
+    pub fn of(c: &CrateNames<'_>, scratch: Alloc<'_>, out: Bump<'o>) -> Result<ModulesSide<'o>, ItemsRecordError> {
+        let out_alloc = out.alloc();
         let made = modules_impl_table(c, scratch)?;
-        let mut rows: AVec<'o, ImplRow> = AVec::with_capacity_in(made.len(), out);
+        let mut rows: AVec<'o, ImplRow> = AVec::with_capacity_in(made.len(), out_alloc);
         rows.extend_from_slice(&made);
-        let mut modules: AVec<'o, ItemKey> = AVec::from_iter_in(rows.iter().map(|r| r.module), out);
+        let mut modules: AVec<'o, ItemKey> = AVec::from_iter_in(rows.iter().map(|r| r.module), out_alloc);
         modules.sort_unstable();
         modules.dedup();
-        let mut chains: AVec<'o, (ItemKey, AVec<'o, ItemKey>)> = AVec::with_capacity_in(modules.len(), out);
+        let mut chains: AVec<'o, (ItemKey, AVec<'o, ItemKey>)> = AVec::with_capacity_in(modules.len(), out_alloc);
         for &m in modules.iter() {
-            let mut chain: AVec<'o, ItemKey> = AVec::new_in(out);
+            let mut chain: AVec<'o, ItemKey> = AVec::new_in(out_alloc);
             if let Some(held) = c.chains.get(&m) {
                 chain.extend_from_slice(held);
             }
             chains.push((m, chain));
         }
-        let mut headers: AVec<'o, (ItemKey, &'o str)> = AVec::with_capacity_in(c.tables.impls.len(), out);
+        let mut headers: AVec<'o, (ItemKey, &'o str)> = AVec::with_capacity_in(c.tables.impls.len(), out_alloc);
         for i in c.tables.impls.iter() {
-            let kept: &'o str = blaze_own::Box::leak(blaze_own::AString::from_str_in(i.header, out).into_boxed_str());
+            let kept: &'o str = out.alloc_str(i.header);
             headers.push((i.key, kept));
         }
         headers.sort_unstable_by_key(|r| r.0);

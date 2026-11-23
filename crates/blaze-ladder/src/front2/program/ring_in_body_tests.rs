@@ -87,6 +87,12 @@ fn a() -> Alloc<'static> {
     blaze_own::testing::heap().alloc()
 }
 
+fn bump_static() -> blaze_own::Bump<'static> {
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+    let frame: &'static blaze_mem::Frame = blaze_own::Box::leak_static(blaze_own::Box::new_in(frame, a()));
+    frame.alloc(blaze_own::Erased::new(frame)).bump()
+}
+
 /// `text` after ring's macros, solved as crate `ring` of package version 0.17.14.
 fn solved(text: &str) -> &'static Names<'static> {
     let text: &'static str = std::boxed::Box::leak(std::format!("{RING}{text}").into_boxed_str());
@@ -115,8 +121,9 @@ fn solved(text: &str) -> &'static Names<'static> {
         cfg: &[],
         script: None,
     };
-    let names = resolve_crates(&[input], Sysroot::default(), &sources, &Serial, a()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
-    blaze_own::Box::leak(blaze_own::Box::new_in(names, a()))
+    let bump = bump_static();
+    let names = resolve_crates(&[input], Sysroot::default(), &sources, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    blaze_own::Box::leak_static(blaze_own::Box::new_in(names, a()))
 }
 
 /// The text of the item named `name` among the crate's item texts.
@@ -208,7 +215,7 @@ fn ring_s_in_body_call_is_one_symbol() {
     assert!(!item.key.is_inner(), "the block's module holds it under the library's key: {:x}", item.key);
     let code = code_symbol(names, "LIMBS_less_than").unwrap_or_else(|e| panic!("the code's symbol: {e}"));
     assert_eq!(code.as_deref(), Some("ring_core_0_17_14__LIMBS_less_than"), "the code's symbol");
-    let links = scope_links(c, a()).unwrap_or_else(|e| panic!("the link table: {e:?}"));
+    let links = scope_links(c, bump_static()).unwrap_or_else(|e| panic!("the link table: {e:?}"));
     assert_eq!(links.foreign.as_slice(), ["ring_core_0_17_14__LIMBS_less_than"], "the link root");
     std::println!("ring in body: code {}, root {}", code.as_deref().unwrap_or(""), links.foreign[0]);
 }
@@ -238,7 +245,7 @@ fn ring_s_call_in_an_expression_macro_is_one_symbol() {
     assert!(!item.key.is_inner(), "the expansion's block module holds it under the library's key: {:x}", item.key);
     let code = code_symbol(names, "aes_hw_set_encrypt_key").unwrap_or_else(|e| panic!("the code's symbol: {e}"));
     assert_eq!(code.as_deref(), Some("ring_core_0_17_14__aes_hw_set_encrypt_key"), "the code's symbol");
-    let links = scope_links(c, a()).unwrap_or_else(|e| panic!("the link table: {e:?}"));
+    let links = scope_links(c, bump_static()).unwrap_or_else(|e| panic!("the link table: {e:?}"));
     assert_eq!(links.foreign.as_slice(), ["ring_core_0_17_14__aes_hw_set_encrypt_key"], "the link root");
     std::println!("ring in an expression macro: code {}, root {}", code.as_deref().unwrap_or(""), links.foreign[0]);
 }
@@ -266,14 +273,14 @@ fn a_macro_written_after_the_item_in_its_block_is_not_in_scope() {
     );
     assert!(code_symbol(below, "late_fn").is_err(), "the code refuses it");
     assert!(
-        matches!(scope_links(c, a()), Err(LinksError::Symbol { item: "late_fn", why: SymbolWhy::Value(RowRefusal::Typed(ValueRefused { why: ValueWhy::NotFound { mac: "late", .. }, .. })), .. })),
+        matches!(scope_links(c, bump_static()), Err(LinksError::Symbol { item: "late_fn", why: SymbolWhy::Value(RowRefusal::Typed(ValueRefused { why: ValueWhy::NotFound { mac: "late", .. }, .. })), .. })),
         "the link table refuses it, naming the item and the macro"
     );
 
     // CONTROL: written above the item, it is in scope; both sides give its value.
     let above = solved(&body(true));
     assert_eq!(code_symbol(above, "late_fn").as_ref().map(|s| s.as_deref()), Ok(Some("late_fn")));
-    let links = scope_links(above.crates()[0], a()).unwrap_or_else(|e| panic!("the link table: {e:?}"));
+    let links = scope_links(above.crates()[0], bump_static()).unwrap_or_else(|e| panic!("the link table: {e:?}"));
     assert_eq!(links.foreign.as_slice(), ["late_fn"]);
     std::println!("ring in body: after the item: refused on both sides; before it: late_fn on both sides");
 }
@@ -285,7 +292,7 @@ fn a_macro_written_after_the_item_in_its_block_is_not_in_scope() {
 fn an_extern_block_in_an_unwritten_block_is_a_root() {
     let roots = |text: &str| -> std::vec::Vec<&'static str> {
         let names = solved(text);
-        let links = scope_links(names.crates()[0], a()).unwrap_or_else(|e| panic!("the link table: {e:?}"));
+        let links = scope_links(names.crates()[0], bump_static()).unwrap_or_else(|e| panic!("the link table: {e:?}"));
         links.foreign.iter().copied().collect()
     };
     let plain = "pub fn plain() -> usize {\n\
@@ -306,7 +313,7 @@ fn an_extern_block_in_an_unwritten_block_is_a_root() {
     // A value written as a macro call has no row in a block the library does not write.
     let names = solved("pub fn called() { extern \"C\" { #[link_name = concat!(\"a\", \"b\")] fn ab(); } }\n");
     assert!(
-        matches!(scope_links(names.crates()[0], a()), Err(LinksError::Symbol { item: "ab", attr: "link_name", why: SymbolWhy::InBody, .. })),
+        matches!(scope_links(names.crates()[0], bump_static()), Err(LinksError::Symbol { item: "ab", attr: "link_name", why: SymbolWhy::InBody, .. })),
         "a call value in an unwritten block is refused by name"
     );
     std::println!("ring in body: unwritten blocks: {found:?}; under cfg(any()): none; a call: InBody");
@@ -337,7 +344,7 @@ fn gcloud_s_member_shape_gathers_an_empty_table() {
         }\n",
     );
     let c = names.crates()[0];
-    let links = scope_links(c, a()).unwrap_or_else(|e| panic!("gcloud's shape was refused: {e:?}"));
+    let links = scope_links(c, bump_static()).unwrap_or_else(|e| panic!("gcloud's shape was refused: {e:?}"));
     assert!(links.foreign.is_empty() && links.exports.is_empty() && links.decls.is_empty(), "nothing to link");
 
     let member = c.tables.members.values().flat_map(|list| list.iter()).find(|m| m.name == Some("merge_field") && m.text.contains("external_id"));
@@ -366,7 +373,7 @@ fn an_unreached_no_mangle_fn_is_an_export() {
         pub extern \"C\" fn plain_c_abi() {}\n",
     );
     let c = names.crates()[0];
-    let links = scope_links(c, a()).unwrap_or_else(|e| panic!("the link table: {e:?}"));
+    let links = scope_links(c, bump_static()).unwrap_or_else(|e| panic!("the link table: {e:?}"));
     let found: std::vec::Vec<(&str, blaze_id::ItemKey)> = links.exports.iter().map(|e| (e.name, e.item)).collect();
     assert_eq!(found, [("c_calls_this", text_named(c, "c_calls_this").key), ("renamed_export", text_named(c, "inner").key)], "each export with its item");
     assert!(!links.exports.iter().any(|e| e.ident == "plain_c_abi"), "twin: an `extern \"C\"` fn with no attribute is no export");
@@ -389,7 +396,7 @@ fn an_extern_block_in_a_method_is_a_root() {
             pub fn written(&self) { noop! {} extern \"C\" { fn in_written_method(); } }\n\
         }\n",
     );
-    let links = scope_links(names.crates()[0], a()).unwrap_or_else(|e| panic!("the link table: {e:?}"));
+    let links = scope_links(names.crates()[0], bump_static()).unwrap_or_else(|e| panic!("the link table: {e:?}"));
     assert_eq!(links.foreign.as_slice(), ["in_method", "in_written_method"]);
     std::println!("ring in body: methods: {:?}", links.foreign.as_slice());
 }

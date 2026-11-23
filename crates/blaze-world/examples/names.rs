@@ -13,8 +13,6 @@
 //! crates are resolved one after another); the unresolved by cause with a count and one place
 //! each; the time of each stage; the lines read; the peak footprint.
 
-#![feature(allocator_api)]
-
 use std::collections::BTreeMap;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -26,7 +24,7 @@ use std::time::{Duration, Instant};
 use blaze_fetch::{PackView, SourceId};
 use blaze_manifest::layout::{Entry, Layout, Need, Pass as LayoutPass};
 use blaze_manifest::lock::{Lock, LockId, LockSource};
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, Bump};
 use blaze_scope::resolve::{CrateInput, CrateNames, SourceTexts};
 use blaze_scope::task::Loc;
 use blaze_surface::{BuiltinDerive, CallShape, Path, PathKind, ScopeError};
@@ -1057,7 +1055,7 @@ impl blaze_scope::crate_scope::Kept for KeptDir<'_> {
     fn expansions(&self, krate: usize) -> Option<&[u8]> {
         let file = self.path(krate).with_extension("x");
         match std::fs::read(&file) {
-            Ok(bytes) => Some(blaze_scope::resolve::aligned(&bytes, g())),
+            Ok(bytes) => Some(blaze_scope::resolve::aligned(&bytes, blaze_own::testing::bump())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => panic!("expansions set {}: {e}", file.display()),
         }
@@ -1636,11 +1634,12 @@ fn main() {
     // The toolchain and the world.
     let t1 = Instant::now();
     let home = std::env::var("HOME").expect("HOME");
+    let bump: Bump<'static> = blaze_own::testing::bump();
     let checkout: &'static Checkout = Box::leak(Box::new(Checkout::new(root.clone())));
-    let mut packages = Fetched { store: sources, paths: &paths, lock, alloc: g() };
+    let mut packages = Fetched { store: sources, paths: &paths, lock, alloc: bump };
     // The crate list (blaze-scope's units list) and the toolchain crates it needs.
-    let listed: &'static blaze_world::Listed<'static, &'static [u8]> = blaze_own::Box::leak(blaze_own::Box::new_in(
-        blaze_world::open_list(&mut DirShelf(format!("{home}/.blaze/v2/toolchain")), blaze_toolchain::PINNED, "aarch64-apple-darwin", graph, lock, &mut packages, g())
+    let listed: &'static blaze_world::Listed<'static, &'static [u8]> = blaze_own::Box::leak_static(blaze_own::Box::new_in(
+        blaze_world::open_list(&mut DirShelf(format!("{home}/.blaze/v2/toolchain")), blaze_toolchain::PINNED, "aarch64-apple-darwin", graph, lock, &mut packages, bump)
             .unwrap_or_else(|e| panic!("{e}")),
         g(),
     ));
@@ -1674,7 +1673,7 @@ fn main() {
         &*Box::leak(Box::new(records))
     });
     let world: &'static World<'static> =
-        blaze_own::Box::leak(blaze_own::Box::new_in(blaze_world::world(graph, lock, listed, &mut packages, checkout, g()).unwrap_or_else(|e| panic!("{e}")), g()));
+        blaze_own::Box::leak_static(blaze_own::Box::new_in(blaze_world::world(graph, lock, listed, &mut packages, checkout, bump).unwrap_or_else(|e| panic!("{e}")), g()));
     // The record a crate's task would join (D115 (B)): its unit's, from `--scripts`.
     let given = |c: &blaze_world::Crate<'static>| match (c.script, c.origin) {
         (Script::Read { .. }, blaze_world::Origin::Unit(unit)) => records.and_then(|r| r.outputs(unit)),
@@ -1750,7 +1749,7 @@ fn main() {
         // The crate environments (`OUT_DIR`, `rustc-env` pairs) are not joined here: an
         // `env!`/`include!` of them is refused by name in this example (CrateEnv::joined is
         // the command's, names/scope.rs).
-        let inputs: &'static [CrateInput<'static>] = world.crates.iter().map(|c| given(c).map_or(c.input, |outputs| blaze_world::joined(&c.input, outputs, g()))).collect::<Vec<_>>().leak();
+        let inputs: &'static [CrateInput<'static>] = world.crates.iter().map(|c| given(c).map_or(c.input, |outputs| blaze_world::joined(&c.input, outputs, bump))).collect::<Vec<_>>().leak();
         if by_owner {
             println!("threads {t}: before the resolve: footprint {:.1} MB, its peak so far {:.1} MB", now_footprint() as f64 / 1e6, max_footprint() as f64 / 1e6);
             print_owners();
@@ -1806,7 +1805,7 @@ fn main() {
                 missed: (0..inputs.len()).map(|_| std::sync::Mutex::new(None)).collect(),
             };
             let ready = blaze_scope::crate_scope::Ready { workers: t, rank: rank.as_deref(), wait: Duration::from_secs(1200), hooks: &clock };
-            let all = blaze_scope::crate_scope::resolve_kept(inputs, world.sysroot, texts, &Threads(t), &ready, &kept, g());
+            let all = blaze_scope::crate_scope::resolve_kept(inputs, world.sysroot, texts, &Threads(t), &ready, &kept, bump);
             let elapsed = start.elapsed();
             let (all, needs) = match all {
                 Ok(all) => all,
@@ -1912,7 +1911,7 @@ fn main() {
         }
         let names = if per_crate {
             let ready = blaze_scope::crate_scope::Ready { workers: t, rank: rank.as_deref(), wait: Duration::from_secs(1200), hooks: &clock };
-            match blaze_scope::crate_scope::resolve_by_records(inputs, world.sysroot, texts, &Threads(t), &ready, g()) {
+            match blaze_scope::crate_scope::resolve_by_records(inputs, world.sysroot, texts, &Threads(t), &ready, bump) {
                 Ok((all, needs)) => {
                     let each: Vec<&'static CrateNames<'static>> = all.iter().map(|c| c.names).collect();
                     let names = blaze_scope::resolve::Names::of_crates(inputs, world.sysroot, &each, g()).map_err(|e| e.to_string());
@@ -1922,7 +1921,7 @@ fn main() {
                 Err((at, e)) => Err(format!("crate `{}`: {e:?}", inputs[at].name)),
             }
         } else {
-            blaze_scope::resolve::resolve_crates(inputs, world.sysroot, texts, &Threads(t), g()).map_err(|e| e.to_string())
+            blaze_scope::resolve::resolve_crates(inputs, world.sysroot, texts, &Threads(t), bump).map_err(|e| e.to_string())
         };
         let elapsed = start.elapsed();
         let names = match names {
@@ -1954,7 +1953,7 @@ fn main() {
                 }
                 let bytes: Vec<&'static [u8]> = all
                     .iter()
-                    .map(|c| blaze_scope::resolve::aligned(&blaze_scope::names_record::encode(c.names, g()).unwrap_or_else(|e| panic!("encode: {e:?}")), g()))
+                    .map(|c| blaze_scope::resolve::aligned(&blaze_scope::names_record::encode(c.names, g()).unwrap_or_else(|e| panic!("encode: {e:?}")), bump))
                     .collect();
                 let keys: Vec<blaze_id::CrateItemKey> = all.iter().map(|c| c.names.key).collect();
                 let read = blaze_scope::names_record::RecordNames::new(&keys, Loaded(bytes), g());

@@ -551,12 +551,12 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
     }
 
     /// WHOLE: the names record's failed-call rows have no cell (read only on an error's path).
-    fn failed_call<'b>(self, call: ItemKey, alloc: Alloc<'b>) -> Option<blaze_scope::names_record::FailedRow<'b>>
+    fn failed_call<'b>(self, call: ItemKey, bump: blaze_own::Bump<'b>) -> Option<blaze_scope::names_record::FailedRow<'b>>
     where
         'n: 'b,
     {
         self.whole_of(call, Section::Names);
-        self.records.failed_call(call, alloc)
+        self.records.failed_call(call, bump)
     }
 
     /// WHOLE: every item of the crate (a whole-crate walk, never one body's).

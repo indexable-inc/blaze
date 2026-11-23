@@ -72,7 +72,7 @@ fn a_name_behind_a_refused_include_names_the_missing_out_dir() {
     let mut sys = input("sys", "/sys/src/lib.rs", &[]);
     sys.shown_from = "/sys/";
     let crates = [sys, input("user", "/user/lib.rs", &[("sys", 0)])];
-    let names = resolve_crates(&crates, Sysroot::default(), &sources, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &sources, &Serial, super::SyncFrame::leaked()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let user = names.root(1);
     let ffi = names
         .path(user, Namespace::Types, Written { kind: PathKind::Plain, segments: &["sys", "ffi"] }, alloc)

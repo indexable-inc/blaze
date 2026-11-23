@@ -417,8 +417,12 @@ fn main() -> ExitCode {
     );
 
     // Phase 3: the names.
+    let Ok(frame) = blaze_mem::Frame::new(blaze_mem::Tag::Nameres) else {
+        return ExitCode::from(2);
+    };
+    let erased = blaze_own::Erased::new(&frame);
     let t_res = Instant::now();
-    let names = resolve_crates(&inputs, crates.sysroot, &texts, &Serial, alloc).unwrap_or_else(|e| {
+    let names = resolve_crates(&inputs, crates.sysroot, &texts, &Serial, erased.bump()).unwrap_or_else(|e| {
         eprintln!("the names: {e}");
         std::process::exit(2);
     });

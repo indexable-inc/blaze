@@ -388,7 +388,7 @@ pub(crate) fn apply<'f, 's, W: Writer>(cx: &Cx, root: &Dir<ReadWrite>, writer: &
         if text_id(now.as_slice()) != listed[chosen[start]].read {
             return Ok(Err(Refusal::Changed { id: listed[chosen[start]].id }));
         }
-        texts.push(Vec::from_slice_in(now.as_slice(), frame).leak());
+        texts.push(frame.alloc_slice_copy(now.as_slice()));
         start = end;
     }
     let mut fixed = Vec::with_capacity_in(chosen.len(), frame);

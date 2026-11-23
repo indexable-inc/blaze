@@ -51,7 +51,7 @@ fn macro_generated_slots_bytes_are_values_in_front2() {
     let user = UserCrate { name: "eb5", dir: "/eb5/", root, files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).expect("fixture and standard library");
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, alloc).expect("fixture names");
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("fixture names");
     let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
     let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");

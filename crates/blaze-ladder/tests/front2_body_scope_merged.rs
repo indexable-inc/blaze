@@ -65,12 +65,13 @@ fn f_scope(text: &'static str, alloc: Alloc<'static>) -> &'static BodyScope<'sta
     let crates: &'static [CrateInput<'static>] = Vec::leak(inputs.crates());
     let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(u32::try_from(i).expect("few crates")));
     let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd") };
-    let names: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, &inputs.texts, &Bodies, alloc).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"))));
+    let bump = blaze_own::testing::bump();
+    let names: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, &inputs.texts, &Bodies, bump).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"))));
     let c = names.crates()[0];
     let deps = BodyDeps::of_names(names, 0, alloc);
-    let prepares = Prepares::new_in(alloc);
+    let prepares = Prepares::new_in(bump);
     let held = c.bodies.iter().find(|h| h.src.text.contains("impl Tr for X")).unwrap_or_else(|| panic!("`f` is held under Bodies: {} held", c.bodies.len()));
-    let scope = body_scope(c, &deps, &crates[0], 0, *held, &inputs.texts, prepares, alloc).unwrap_or_else(|e| panic!("body_scope of `f`: {e}"));
+    let scope = body_scope(c, &deps, &crates[0], 0, *held, &inputs.texts, prepares, bump).unwrap_or_else(|e| panic!("body_scope of `f`: {e}"));
     // The digest the record holds is the one its rows give (one function, merged.rs).
     let rows = body_rows(c, &scope, alloc).unwrap_or_else(|e| panic!("f's rows: {e:?}"));
     assert_eq!(scope.impl_rows, impl_rows_digest(&scope, &rows), "the record's impl rows digest is its rows'");

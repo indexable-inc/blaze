@@ -41,9 +41,10 @@ static TEXTS: Texts = Texts(&[&[("/user/lib.rs", USER)]]);
 /// lang row keyed by the input item (that key names no item text).
 #[test]
 fn a_global_allocator_declares_the_static_and_the_four_fns() {
-    let alloc = blaze_own::testing::heap().alloc();
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
     let crates = [input("user", "/user/lib.rs", &[])];
-    let (all, _) = resolve_by_records(&crates, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), alloc)
+    let (all, _) = resolve_by_records(&crates, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), erased.bump())
         .unwrap_or_else(|e| panic!("by records: {e:?}"));
     let user = all[0].names;
     let wanted = ["ALLOC", "__rust_alloc", "__rust_alloc_zeroed", "__rust_dealloc", "__rust_realloc"];

@@ -802,8 +802,13 @@ mod tests {
         let received = core::sync::atomic::AtomicU64::new(0);
         let bad = core::sync::atomic::AtomicU64::new(0);
 
+        let start_consumer = core::sync::atomic::AtomicBool::new(false);
+        let start_consumer_ref = &start_consumer;
         std::thread::scope(|s| {
             let consumer = s.spawn(|| {
+                while !start_consumer_ref.load(Ordering::Acquire) {
+                    core::hint::spin_loop();
+                }
                 let mut per_thread_last = [0u64; PRODUCERS as usize];
                 loop {
                     let n = ring_ref.drain(256, |ev| {
@@ -846,12 +851,16 @@ mod tests {
                         let mut ev = Event::hook_hit(tid, Slot(tid), seq, seq);
                         ev.b = seq ^ (u64::from(tid) << 32);
                         let _ = ring_ref.try_push_with(ev, plant);
+                        if tid == 0 && seq == u64::from(CAP) * 2 {
+                            start_consumer_ref.store(true, Ordering::Release);
+                        }
                     }
                 }));
             }
             for h in handles {
                 h.join().expect("producer thread");
             }
+            start_consumer.store(true, Ordering::Release);
             done.store(true, Ordering::Release);
             consumer.join().expect("consumer thread");
         });

@@ -1103,7 +1103,10 @@ fn named(error: &io::Error, what: &str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, time::Duration};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        time::Duration,
+    };
 
     use super::*;
     use crate::wait::Clock as _;
@@ -1198,7 +1201,7 @@ mod tests {
         for seed in 0..32 {
             let mut rng = crate::sim::Rng::new(seed);
             let mut ours: Dirs<u64> = Dirs::new(64).unwrap();
-            let mut theirs: Map<Vec<u8>, (u64, String), FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
+            let mut theirs: BTreeMap<Vec<u8>, (u64, String)> = BTreeMap::new();
             for step in 0..4_000u64 {
                 let handle = [rng.below(8) as u8, rng.below(8) as u8];
                 let key = Key::of(&[seed as u8; 8], 1, &handle[..1 + rng.below(2) as usize]);

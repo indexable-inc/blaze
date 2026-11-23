@@ -60,20 +60,23 @@ static TEXTS: Texts = Texts(&[&[("/user/lib.rs", USER)], &[("/k/lib.rs", K)]]);
 /// Each `use` error of `user`, by its path, with what it waits on when `failed` is handed as a
 /// failed dependency (`with_failed`; else none is: the cause removed).
 fn errors_waiting(with_failed: bool) -> BTreeMap<String, Option<String>> {
-    let g = Alloc::global();
-    let prepares = Prepares::new_in(g);
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let bump = erased.bump();
+    let g = bump.alloc();
+    let prepares = Prepares::new_in(bump);
     let k = input("k", "/k/lib.rs", &[]);
-    let k_done = resolve_crate(&k, &[], Sysroot::default(), &TEXTS, 1, &Serial, prepares, g).unwrap_or_else(|e| panic!("k resolves: {e:?}"));
-    let k_record = aligned(&k_done.record, g);
+    let k_done = resolve_crate(&k, &[], Sysroot::default(), &TEXTS, 1, &Serial, prepares, bump).unwrap_or_else(|e| panic!("k resolves: {e:?}"));
+    let k_record = aligned(&k_done.record, bump);
     let failed_key = CrateItemKey(ContentId::of("blaze-scope test crate", b"failed"));
-    let failed_record = aligned(&error_record(failed_key, "failed", Edition::E2021, g).unwrap_or_else(|e| panic!("the error record: {e:?}")), g);
+    let failed_record = aligned(&error_record(failed_key, "failed", Edition::E2021, g).unwrap_or_else(|e| panic!("the error record: {e:?}")), bump);
 
     // The error record's head names its crate; a resolved crate's record is no error record.
     assert_eq!(error_record_crate(failed_record), Some((failed_key, "failed")));
     assert_eq!(error_record_crate(k_record), None);
 
     let user = input("user", "/user/lib.rs", &[("failed", 0), ("k", 1)]);
-    let done = resolve_crate(&user, &[failed_record, k_record], Sysroot::default(), &TEXTS, 0, &Serial, prepares, g).unwrap_or_else(|e| panic!("user resolves: {e:?}"));
+    let done = resolve_crate(&user, &[failed_record, k_record], Sysroot::default(), &TEXTS, 0, &Serial, prepares, bump).unwrap_or_else(|e| panic!("user resolves: {e:?}"));
     let failed: Vec<FailedDep<'_>> = if with_failed {
         let (key, name) = error_record_crate(failed_record).expect("an error record");
         std::vec![FailedDep { called: Some("failed"), name, key }]

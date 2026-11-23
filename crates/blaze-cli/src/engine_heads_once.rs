@@ -641,7 +641,7 @@ impl<R: HeadRecords> HeadsOnce<R> {
     fn lend<T: Copy>(&self, items: &[T]) -> &'static [T] {
         let mut copy = Vec::with_capacity_in(items.len(), self.heap.alloc());
         copy.extend_from_slice(items);
-        copy.leak()
+        copy.leak_static()
     }
 
     /// Closed dependency head `cell` frozen by a worker (`bytes`, of meaning `out`), its record's
@@ -881,21 +881,21 @@ pub(crate) fn profile(counts: &OnceCounts, into: &mut blaze_own::String<&Frame>)
 pub(crate) struct OnceConsts<'r, 'n, S> {
     names: S,
     index: &'r Index<'n>,
-    alloc: Alloc<'n>,
+    bump: blaze_own::Bump<'n>,
     once: &'r HeadsOnce,
     unit: [u8; 8],
 }
 
 impl<'r, 'n, S> OnceConsts<'r, 'n, S> {
-    pub(crate) fn new(names: S, index: &'r Index<'n>, alloc: Alloc<'n>, once: &'r HeadsOnce, unit: [u8; 8]) -> OnceConsts<'r, 'n, S> {
-        OnceConsts { names, index, alloc, once, unit }
+    pub(crate) fn new(names: S, index: &'r Index<'n>, bump: blaze_own::Bump<'n>, once: &'r HeadsOnce, unit: [u8; 8]) -> OnceConsts<'r, 'n, S> {
+        OnceConsts { names, index, bump, once, unit }
     }
 }
 
 impl<'n, S: NamesSource<'n>> ConstValues<'n> for OnceConsts<'_, 'n, S> {
     fn eval(&mut self, store: &mut Store<'n>, keys: &mut Keys, c: LibKey) -> Result<(), ConstFail> {
         self.once.evaluated_one(c, self.unit);
-        HeadConsts::new(self.names, self.index, self.alloc).eval(store, keys, c)
+        HeadConsts::new(self.names, self.index, self.bump).eval(store, keys, c)
     }
 }
 
@@ -1270,7 +1270,8 @@ fn alone<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, w
     let names = job.base.reading_into(&recorder);
     // The evaluator reads through a recorder of its own (engine_head_consts.rs).
     let evaluated = Recorder::new(RecorderOpts { alloc: g });
-    let mut consts = HeadConsts::new(job.base.reading_into(&evaluated), job.index, g);
+    let bump = job.frame.alloc(blaze_own::Erased::new(job.frame)).bump();
+    let mut consts = HeadConsts::new(job.base.reading_into(&evaluated), job.index, bump);
     job.once.alone.fetch_add(1, Ordering::Relaxed);
     let mut source = SeededHeads::new(SeededHeadsOpts { names, sized: job.sized, pointers: job.pointers, frame: job.frame, scratch: g, alloc: g, consts: Some(&mut consts as &mut dyn ConstValues<'_>), known: None, owners: None });
     let made = head_task_with_key(names, &mut source, want, task.key, g);

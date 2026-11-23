@@ -69,7 +69,7 @@ fn bstd_rt_names_std_over_records_as_over_names() {
         Box::leak(Box::new(UserCrate { name: "hb", dir: "/hb/", root: "/hb/src/main.rs", files, edition, panic: blaze_build::Panic::Unwind }));
     let inputs: &'static Inputs<'static> = Box::leak(Box::new(Inputs::new(user, tc).unwrap_or_else(|e| panic!("the crates: {e}"))));
     let crates = Box::leak(Box::new(inputs.crates()));
-    let names = Box::leak(Box::new(inputs.resolve(crates, g).unwrap_or_else(|e| panic!("resolve_crates: {e}"))));
+    let names = Box::leak(Box::new(inputs.resolve(crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))));
 
     let all: Vec<&str> = names.crates().iter().map(|c| c.name).collect();
     println!("crates: {all:?}");
@@ -92,8 +92,8 @@ fn bstd_rt_names_std_over_records_as_over_names() {
     let order: Vec<usize> = std::iter::once(bstd).chain((0..names.crates().len()).filter(|&i| i != bstd)).collect();
     for &i in order.iter() {
         let c = &names.crates()[i];
-        kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), g));
-        kept.items.push(aligned(&items_record::encode(c, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), g));
+        kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
+        kept.items.push(aligned(&items_record::encode(c, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
         kept.files.push(c.files.iter().map(|f| (f.package.as_str().to_string(), f.text)).collect());
         crate_names.push(c.name);
         keys.push(c.key);

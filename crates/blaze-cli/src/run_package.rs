@@ -689,7 +689,7 @@ pub(crate) fn test_packages<'f>(cx: &Cx, root: &Dir<ReadWrite>, select: Select<'
 }
 
 fn kept<'f>(text: &str, frame: &'f Frame) -> Result<&'f str, CliError> {
-    core::str::from_utf8(Vec::from_slice_in(text.as_bytes(), frame).leak()).map_err(|_| CliError::Text { what: "a manifest is not UTF-8" })
+    Ok(frame.alloc_str(text))
 }
 
 /// The layout of the workspace of the package in `start` (beneath `root`; `""` for `root`

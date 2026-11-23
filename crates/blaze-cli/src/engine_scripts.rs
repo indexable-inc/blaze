@@ -837,7 +837,7 @@ impl<'f> ScriptsStage<'f> {
     pub(crate) fn restore(&mut self, name: Name, made: Option<(Key, ContentId)>, row: &blaze_engine::Row<'_>, _owed: bool, frame: &'f Frame) {
         self.mark(name, made);
         if name.kind == Kind::Script {
-            self.previous.insert(name, Previous { reads: Vec::from_slice_in(&row.reads, frame).leak(), out: row.out });
+            self.previous.insert(name, Previous { reads: frame.alloc_slice_copy(&row.reads), out: row.out });
         }
     }
 
@@ -879,7 +879,7 @@ impl<'f> ScriptsStage<'f> {
                 let payload: &'j [u8] = jobs.alloc(work::payload(cx, store, input, jobs)?).payload();
                 given.push((*input, payload));
             }
-            return Ok(Dispatch::Run(ScriptWork::Double(runner, name, self.reads_planned.then_some((self.plant, self.status_view)), given.leak()), drive));
+            return Ok(Dispatch::Run(ScriptWork::Double(runner, name, self.reads_planned.then_some((self.plant, self.status_view)), given.into_bump_slice()), drive));
         }
         // The `Script` kind's tool keys the library-features records the shared setup reads
         // (scripts.rs `CommandFeatures`); the plan handed the tools with the unit graph.
@@ -1305,7 +1305,7 @@ impl<'f> ScriptsStage<'f> {
                         members.push((*id, work::held_str(path, queue.jobs), leaf.id));
                     }
                 }
-                queue.macro_inputs = Some(MacroInputs { graph: queue.jobs.alloc(bytes).as_slice(), lock: side.lock.text, members: members.leak() });
+                queue.macro_inputs = Some(MacroInputs { graph: queue.jobs.alloc(bytes).as_slice(), lock: side.lock.text, members: members.into_bump_slice() });
             }
             queue.macro_inputs
         } else {

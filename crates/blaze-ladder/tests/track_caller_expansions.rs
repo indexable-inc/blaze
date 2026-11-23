@@ -80,8 +80,8 @@ fn keep<'a>(names: &Names<'_>, frame: &'a Frame, alloc: blaze_own::Alloc<'a>) ->
         let file = &c.files[0];
         KeptCrate {
             key: c.key,
-            names: aligned(&names_record::encode(c, alloc).expect("names record"), alloc),
-            items: aligned(&items_record::encode_with(c, names, alloc).expect("items record"), alloc),
+            names: aligned(&names_record::encode(c, alloc).expect("names record"), blaze_own::testing::bump()),
+            items: aligned(&items_record::encode_with(c, names, alloc).expect("items record"), blaze_own::testing::bump()),
             path: frame.alloc_str(file.package.as_str()),
             text: frame.alloc_str(file.text),
             expansions: c.expansions.iter().filter_map(|(call, e)| {
@@ -131,7 +131,7 @@ fn with_programs_kept<R: Send + 'static>(text: &'static str, drop_call_parts: bo
         let user = texts.user();
         let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("fixture inputs: {e}"));
         let crates = inputs.crates();
-        let names = inputs.resolve(&crates, a).unwrap_or_else(|e| panic!("fixture names: {e}"));
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("fixture names: {e}"));
         let whole = Front2Program::new(&names, frame, &files, a).unwrap_or_else(|e| panic!("whole program: {e}"));
         let entry = whole.function(whole.entry().expect("the fixture exports main")).key;
         let c = names.krate(0);
@@ -392,7 +392,7 @@ fn an_expansion_record_without_a_call_part_is_a_typed_answer_and_no_records_erro
         let user = texts.user();
         let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("fixture inputs: {e}"));
         let crates = inputs.crates();
-        let names = inputs.resolve(&crates, a).unwrap_or_else(|e| panic!("fixture names: {e}"));
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("fixture names: {e}"));
         let calls: Vec<LibKey> = names.krate(0).expansions.iter().filter(|(_, e)| e.made.is_some()).map(|(call, _)| *call).collect();
         assert!(!calls.is_empty(), "the derive made a text");
         let kept = keep(&names, frame, a);

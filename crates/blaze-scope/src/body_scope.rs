@@ -35,7 +35,7 @@ use core::fmt;
 
 use blaze_id::{CrateItemKey, ItemKey};
 use blaze_ids::{ContentId, Hasher};
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, Bump};
 use blaze_surface::{BuildError, ExternTarget, Namespace, Rename, ScopeBuilder};
 
 use crate::prepares::Prepares;
@@ -242,7 +242,7 @@ pub fn body_scope<'a, S: SourceTexts<'a>>(
     body: HeldBody<'a>,
     sources: &S,
     prepares: &'a Prepares<'a>,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 ) -> Result<BodyScope<'a>, BodyScopeRefusal<'a>> {
     let tree = ReadTree::of(c, alloc).map_err(|error| BodyScopeRefusal::Undecided { body: body.src.key, error: BodySolveError::TreeRecord { body: body.src.key, error } })?;
     body_scope_in(&tree, deps, input, source, body, sources, prepares, alloc)
@@ -259,7 +259,7 @@ pub fn body_scope_in<'a, S: SourceTexts<'a>>(
     body: HeldBody<'a>,
     sources: &S,
     prepares: &'a Prepares<'a>,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 ) -> Result<BodyScope<'a>, BodyScopeRefusal<'a>> {
     body_scope_scratch(tree, deps, input, source, body, sources, prepares, &crate::task::Scratch::kept, alloc)
 }
@@ -280,12 +280,13 @@ pub fn body_scope_scratch<'a, S: SourceTexts<'a>>(
     sources: &S,
     prepares: &'a Prepares<'a>,
     hook: crate::task::ScratchHook<'_>,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Result<BodyScope<'a>, BodyScopeRefusal<'a>> {
+    let alloc = bump.alloc();
     let c = tree.names();
     let at = body.src.key;
     let key = body_scope_key(c.key, &body);
-    let mut solved = solve_held_body_scratch(tree, deps, input, source, body, sources, prepares, hook, alloc).map_err(|error| BodyScopeRefusal::Undecided { body: at, error })?;
+    let mut solved = solve_held_body_scratch(tree, deps, input, source, body, sources, prepares, hook, bump).map_err(|error| BodyScopeRefusal::Undecided { body: at, error })?;
 
     // The ordinals: the body's written blocks in text order, as crate::blocks numbers them.
     let nested = blaze_file_items::nested::scan(body.src.text, alloc);

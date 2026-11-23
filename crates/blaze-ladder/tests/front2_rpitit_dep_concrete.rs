@@ -103,7 +103,7 @@ fn check_bodies(bodies: &[&str]) -> Vec<(bool, Vec<&'static str>, String)> {
         script: None,
     });
     let texts = WithDep { base: &inputs.texts, dep: dep_at, files: &dep_files };
-    let names = resolve_crates(&crates, sysroot, &texts, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates (two crates): {e}"));
+    let names = resolve_crates(&crates, sysroot, &texts, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates (two crates): {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: USER }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
     let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("body checker");

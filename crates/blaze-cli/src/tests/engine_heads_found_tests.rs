@@ -82,7 +82,7 @@ fn joined(parts: &[&[u8]], g: Alloc<'static>) -> &'static [u8] {
     for part in parts.iter() {
         out.extend_from_slice(part);
     }
-    out.leak()
+    out.leak_static()
 }
 
 /// The model's freeze of `cell` under `features`: a function of both, as head.rs `freeze_seeded`
@@ -149,7 +149,7 @@ impl ModelStore {
     fn snapshot(&self) -> Records {
         let mut rows: Vec<(Key, &'static [u8]), Alloc<'static>> = Vec::new_in(self.g);
         rows.extend_from_slice(&self.committed);
-        Records { rows: rows.leak() }
+        Records { rows: rows.leak_static() }
     }
 }
 

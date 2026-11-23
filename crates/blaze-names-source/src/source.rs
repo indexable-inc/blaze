@@ -30,7 +30,7 @@ use blaze_names_demand::driver::{DriveError, Source, resolve};
 use blaze_names_demand::types::{
     Anchor, Answer, Ask, CallRef, CrateRoot, Def, Entry, Extern, ModRef, Ns, Outline, Path, Spaces, Vis, Writes,
 };
-use blaze_own::{ABTreeMap, AString, AVec, Alloc, BTreeMap, Vec};
+use blaze_own::{ABTreeMap, AString, AVec, Alloc, BTreeMap, BVec, Bump, Vec};
 use blaze_scope::resolve::definition_of;
 use blaze_scope::task::{
     AttrOrder, CallSrc, Cfg, Files, Fragment, LowerCx, Lowered, MacroSrc, ProcDecls, Target, Tree, Where, crate_tools,
@@ -76,7 +76,7 @@ pub struct CrateSourceOpts<'w, T> {
     /// an index past them is a crate this graph does not have.
     pub sysroot: Sysroot,
     pub summaries: Summaries,
-    pub alloc: Alloc<'w>,
+    pub alloc: Bump<'w>,
 }
 
 /// What the source did: beside the machine's own `Counts`, these include every nested layer.
@@ -102,7 +102,7 @@ struct FileSet<'w, T> {
     texts: &'w T,
     krate: CrateItemKey,
     edition: Edition,
-    alloc: Alloc<'w>,
+    alloc: Bump<'w>,
     files: RefCell<AVec<'w, File<'w>>>,
     full: Cell<bool>,
 }
@@ -119,9 +119,8 @@ impl<'w, T: Texts> Files<'w> for FileSet<'w, T> {
             self.full.set(true);
             return None;
         }
-        let outline = one(blaze_file_items::outline(text, self.edition, self.alloc), self.alloc);
-        // A copy of a `&str`'s bytes is UTF-8.
-        let path = core::str::from_utf8(slice(rel.as_bytes(), self.alloc)).ok()?;
+        let outline = self.alloc.alloc_val(blaze_file_items::outline(text, self.edition, self.alloc.alloc()));
+        let path = self.alloc.alloc_str(rel);
         let mut files = self.files.borrow_mut();
         files.push(File { path, text, outline });
         Some((files.len() - 1) as u32)
@@ -162,7 +161,7 @@ pub struct CrateSource<'w, T> {
     crates: &'w [CrateFacts<'w>],
     sysroot: Sysroot,
     summaries: Summaries,
-    alloc: Alloc<'w>,
+    alloc: Bump<'w>,
     walks: AVec<'w, Option<&'w CrateWalk<'w, T>>>,
     outlines: ABTreeMap<'w, ModRef, &'w Outline<'w>>,
     /// Outlines being summarised, served provisionally to nested layers.
@@ -177,7 +176,8 @@ pub struct CrateSource<'w, T> {
 
 impl<'w, T: Texts> CrateSource<'w, T> {
     pub fn new(opts: CrateSourceOpts<'w, T>) -> CrateSource<'w, T> {
-        let a = opts.alloc;
+        let bump = opts.alloc;
+        let a = bump.alloc();
         let mut walks = Vec::new_in(a);
         walks.extend(opts.crates.iter().map(|_| None));
         CrateSource {
@@ -185,7 +185,7 @@ impl<'w, T: Texts> CrateSource<'w, T> {
             crates: opts.crates,
             sysroot: opts.sysroot,
             summaries: opts.summaries,
-            alloc: a,
+            alloc: bump,
             walks,
             outlines: BTreeMap::new_in(a),
             building: Vec::new_in(a),
@@ -217,8 +217,9 @@ impl<'w, T: Texts> CrateSource<'w, T> {
             return Ok(w);
         }
         let facts = self.crates[index];
-        let a = self.alloc;
-        let files = FileSet { texts: self.texts, krate: facts.key, edition: facts.edition, alloc: a, files: RefCell::new(Vec::new_in(a)), full: Cell::new(false) };
+        let bump = self.alloc;
+        let a = bump.alloc();
+        let files = FileSet { texts: self.texts, krate: facts.key, edition: facts.edition, alloc: bump, files: RefCell::new(Vec::new_in(a)), full: Cell::new(false) };
         let mut root_path = AString::new_in(a);
         root_path.push_str("/");
         root_path.push_str(facts.root);
@@ -228,14 +229,14 @@ impl<'w, T: Texts> CrateSource<'w, T> {
         dir.push_str("/");
         dir.push_str(root_dir);
         let cfg = Cfg::of(&Target::AARCH64_APPLE_DARWIN, facts.features, a);
-        let tree = walk(&files, &cfg, facts.key, facts.name, root, dir.as_str(), facts.edition, a);
+        let tree = walk(&files, &cfg, facts.key, facts.name, root, dir.as_str(), facts.edition, bump);
         if files.full.get() {
             return Err(SourceError::Full { table: "files of a crate", most: MOST_FILES });
         }
         let attrs = file_attrs(&cfg, files.outline(root), files.text(root), a);
-        let tools: &'w [&'w str] = crate_tools(&attrs, a).leak();
+        let tools: &'w [&'w str] = bump.alloc_slice_copy(&crate_tools(&attrs, a));
         let (no_std, no_core) = (attrs.no_std, attrs.no_core);
-        let w: &'w CrateWalk<'w, T> = one(CrateWalk { index, files, tree, cfg, tools, no_std, no_core }, a);
+        let w: &'w CrateWalk<'w, T> = bump.alloc_val(CrateWalk { index, files, tree, cfg, tools, no_std, no_core });
         self.walks[index] = Some(w);
         Ok(w)
     }
@@ -251,7 +252,9 @@ impl<'w, T: Texts> CrateSource<'w, T> {
         let w = self.walk_of(index)?;
         let &at = w.tree.by_key.get(&module.key).ok_or(SourceError::UnknownModule(module))?;
         let m = &w.tree.modules[at];
-        let mut chain: AVec<'w, ItemKey> = Vec::new_in(self.alloc);
+        let bump = self.alloc;
+        let a = bump.alloc();
+        let mut chain: BVec<'w, ItemKey> = Vec::new_in(bump);
         let mut up = m.parent;
         while let Some(p) = up {
             chain.push(w.tree.modules[p].key);
@@ -280,14 +283,11 @@ impl<'w, T: Texts> CrateSource<'w, T> {
             tokens: None,
         };
         let entry = self.crates[index].implicit.entry && m.parent.is_none();
-        let low = lower(lower_cx(w, &self.crates[index], entry), fragment, self.alloc);
-        let head = Head { chain: chain.leak(), digest, no_implicit_prelude: m.no_implicit_prelude };
-        let mut asked: AVec<'w, (CallRef, Ask<'w>, ItemKey)> = Vec::new_in(self.alloc);
+        let low = lower(lower_cx(w, &self.crates[index], entry), fragment, bump);
+        let head = Head { chain: chain.into_bump_slice(), digest, no_implicit_prelude: m.no_implicit_prelude };
+        let mut asked: AVec<'w, (CallRef, Ask<'w>, ItemKey)> = Vec::new_in(a);
         let entries = self.convert(module, index, &low, depth, Some(head), &mut asked)?;
-        let outline = one(
-            Outline { module, digest, chain: head.chain, no_implicit_prelude: head.no_implicit_prelude, entries },
-            self.alloc,
-        );
+        let outline = bump.alloc_val(Outline { module, digest, chain: head.chain, no_implicit_prelude: head.no_implicit_prelude, entries });
         self.hold(self.outlines.len())?;
         self.outlines.insert(module, outline);
         self.counts.outlines += 1;
@@ -312,7 +312,8 @@ impl<'w, T: Texts> CrateSource<'w, T> {
         let def = info.def.ok_or(SourceError::NoMacro { module, call })?;
         let index = self.index_of(module.krate)?;
         let facts = self.crates[index];
-        let a = self.alloc;
+        let bump = self.alloc;
+        let a = bump.alloc();
         let site = CallSite { edition: facts.edition, panic_edition: facts.edition, ctx: Ctx::root(facts.edition) };
         let made = expand(def, &Call::fn_like(info.input, site), &NoHost, a).map_err(|_| SourceError::Expand { module, call })?;
         let Expanded::Expansion(made) = made else { return Err(SourceError::Eager { module, call }) };
@@ -324,9 +325,9 @@ impl<'w, T: Texts> CrateSource<'w, T> {
         if rendered.as_str().contains("$crate") {
             return Err(SourceError::DollarCrate { module, call });
         }
-        let text: &'w str = core::str::from_utf8(rendered.into_bytes().leak()).map_err(|_| SourceError::Internal("a rendered expansion is not UTF-8"))?;
+        let text: &'w str = bump.alloc_str(rendered.as_str());
         let w = self.walk_of(index)?;
-        let outline = one(blaze_file_items::outline(text, facts.edition, a), a);
+        let outline = bump.alloc_val(blaze_file_items::outline(text, facts.edition, a));
         let fragment = Fragment {
             module: module.key,
             owner: ItemKey(call.0),
@@ -342,7 +343,7 @@ impl<'w, T: Texts> CrateSource<'w, T> {
             marks: None,
             tokens: None,
         };
-        let low = lower(lower_cx(w, &facts, false), fragment, a);
+        let low = lower(lower_cx(w, &facts, false), fragment, bump);
         if !low.mods_made.is_empty() {
             return Err(SourceError::MadeModule { module, call });
         }
@@ -361,8 +362,9 @@ impl<'w, T: Texts> CrateSource<'w, T> {
         let index = self.index_of(krate)?;
         let w = self.walk_of(index)?;
         let facts = self.crates[index];
-        let a = self.alloc;
-        let mut externs: AVec<'w, Extern<'w>> = Vec::new_in(a);
+        let bump = self.alloc;
+        let a = bump.alloc();
+        let mut externs: BVec<'w, Extern<'w>> = Vec::new_in(bump);
         for &(name, dep) in facts.deps {
             let key = self.crates.get(dep).ok_or(SourceError::Internal("a dependency index past the crates given"))?.key;
             externs.push(Extern { name, krate: key, root: root_key(key) });
@@ -378,9 +380,9 @@ impl<'w, T: Texts> CrateSource<'w, T> {
         }
         let prelude = (!w.no_core).then(|| {
             let std = if w.no_std { "core" } else { "std" };
-            Path { anchor: Anchor::Extern(std), segs: slice(&["prelude", facts.implicit.prelude.module()], a) }
+            Path { anchor: Anchor::Extern(std), segs: bump.alloc_slice_copy(&["prelude", facts.implicit.prelude.module()]) }
         });
-        let mut export_modules: AVec<'w, ItemKey> = Vec::new_in(a);
+        let mut export_modules: BVec<'w, ItemKey> = Vec::new_in(bump);
         for m in w.tree.modules.iter() {
             let o = w.files.outline(m.file);
             let text = w.files.text(m.file);
@@ -409,10 +411,13 @@ impl<'w, T: Texts> CrateSource<'w, T> {
         for m in export_modules.iter() {
             h.id(&m.0);
         }
-        let root = one(
-            CrateRoot { krate, digest: h.finish(), extern_prelude: externs.leak(), prelude, export_modules: export_modules.leak() },
-            a,
-        );
+        let root = bump.alloc_val(CrateRoot {
+            krate,
+            digest: h.finish(),
+            extern_prelude: externs.into_bump_slice(),
+            prelude,
+            export_modules: export_modules.into_bump_slice(),
+        });
         self.roots.insert(krate, root);
         self.counts.roots += 1;
         Ok(root)
@@ -431,7 +436,8 @@ impl<'w, T: Texts> CrateSource<'w, T> {
         head: Option<Head<'w>>,
         asked: &mut AVec<'w, (CallRef, Ask<'w>, ItemKey)>,
     ) -> Result<&'w [Entry<'w>], SourceError<'w>> {
-        let a = self.alloc;
+        let bump = self.alloc;
+        let a = bump.alloc();
         let facts = self.crates[index];
         let parent = self.parent_of(index, module)?;
         let d = &low.decls;
@@ -439,7 +445,7 @@ impl<'w, T: Texts> CrateSource<'w, T> {
             self.hold(self.macros.len())?;
             self.macros.insert(key, (index, src));
         }
-        let mut entries: AVec<'w, Entry<'w>> = Vec::new_in(a);
+        let mut entries: BVec<'w, Entry<'w>> = Vec::new_in(bump);
         for item in d.items.iter() {
             let spaces = match item.ns {
                 Namespace::Types => Spaces::TYPE,
@@ -468,7 +474,7 @@ impl<'w, T: Texts> CrateSource<'w, T> {
             match u.leaf {
                 UseForm::Glob => {
                     let (anchor, rest) = anchor_of(u.path.kind, segs, true, facts.edition, module)?;
-                    entries.push(Entry::Glob { path: Path { anchor, segs: slice(rest, a) }, vis });
+                    entries.push(Entry::Glob { path: Path { anchor, segs: bump.alloc_slice_copy(rest) }, vis });
                 }
                 UseForm::Named { rename, .. } => {
                     let Some((&target, before)) = segs.split_last() else { return Err(SourceError::UseRoot { module }) };
@@ -481,7 +487,7 @@ impl<'w, T: Texts> CrateSource<'w, T> {
                         (PathKind::Abs, true) => return Err(SourceError::UseRoot { module }),
                         _ => anchor_of(u.path.kind, before, true, facts.edition, module)?,
                     };
-                    entries.push(Entry::Use { name, path: Path { anchor, segs: slice(rest, a) }, target, vis });
+                    entries.push(Entry::Use { name, path: Path { anchor, segs: bump.alloc_slice_copy(rest) }, target, vis });
                 }
             }
         }
@@ -502,15 +508,15 @@ impl<'w, T: Texts> CrateSource<'w, T> {
         for c in d.calls.iter() {
             let call = CallRef(c.call.0);
             let src = low.calls.iter().find(|(k, _)| *k == c.call).map(|(_, s)| *s).ok_or(SourceError::UnknownCall { module, call })?;
-            let input: &'w TokenStream<'w> = one(lex(src.input, facts.edition, a).map_err(|_| SourceError::Lex { module, call })?, a);
+            let input: &'w TokenStream<'w> = bump.alloc_val(lex(src.input, facts.edition, a).map_err(|_| SourceError::Lex { module, call })?);
             self.hold(self.calls.len())?;
             self.calls.insert((module, call), CallInfo { src, shape: c.kind, def: None, input });
             entries.push(Entry::Call { call, writes: Writes::Only { names: &[], exports: false } });
         }
         let provisional = match head {
             Some(h) => {
-                let entries = slice(&entries, a);
-                let o = one(Outline { module, digest: h.digest, chain: h.chain, no_implicit_prelude: h.no_implicit_prelude, entries }, a);
+                let entries = bump.alloc_slice_copy(&entries);
+                let o = bump.alloc_val(Outline { module, digest: h.digest, chain: h.chain, no_implicit_prelude: h.no_implicit_prelude, entries });
                 self.building.push((module, o));
                 true
             }
@@ -521,7 +527,7 @@ impl<'w, T: Texts> CrateSource<'w, T> {
             self.building.pop();
         }
         summed?;
-        Ok(entries.leak())
+        Ok(entries.into_bump_slice())
     }
 
     /// Each call's summary, written into its placeholder entry.
@@ -535,7 +541,8 @@ impl<'w, T: Texts> CrateSource<'w, T> {
         asked: &mut AVec<'w, (CallRef, Ask<'w>, ItemKey)>,
         out: &mut [Entry<'w>],
     ) -> Result<(), SourceError<'w>> {
-        let a = self.alloc;
+        let bump = self.alloc;
+        let a = bump.alloc();
         let facts = self.crates[index];
         for (c, slot) in low.decls.calls.iter().zip(out.iter_mut()) {
             let call = CallRef(c.call.0);
@@ -553,7 +560,7 @@ impl<'w, T: Texts> CrateSource<'w, T> {
                 Some(key) => key,
                 None => {
                     let (anchor, rest) = anchor_of(c.path.kind, before, false, facts.edition, module)?;
-                    let ask = Ask { from: module, path: Path { anchor, segs: slice(rest, a) }, name, ns: Ns::Macro };
+                    let ask = Ask { from: module, path: Path { anchor, segs: bump.alloc_slice_copy(rest) }, name, ns: Ns::Macro };
                     let Answer::Found { def: Def::Item(key), .. } = self.ask_macro(ask, depth)? else {
                         return Err(SourceError::NoMacro { module, call });
                     };
@@ -577,7 +584,7 @@ impl<'w, T: Texts> CrateSource<'w, T> {
                         return Err(why);
                     }
                     let summary = summary.map_err(|_| SourceError::Definition { item: key })?;
-                    call_writes(&summary, Some(input), a)
+                    call_writes(&summary, Some(input), bump)
                 }
             };
             self.counts.summaries += 1;
@@ -592,7 +599,7 @@ impl<'w, T: Texts> CrateSource<'w, T> {
             return Err(SourceError::CalleeDepth { module: ask.from });
         }
         self.counts.callee_asks += 1;
-        let a = self.alloc;
+        let a = self.alloc.alloc();
         let mut resolver = Resolver::new(a);
         let mut layer = Layer { src: self, depth: depth + 1 };
         match resolve(&mut resolver, &mut layer, ask, a) {
@@ -609,8 +616,8 @@ impl<'w, T: Texts> CrateSource<'w, T> {
         }
         let &(index, src) = self.macros.get(&key).ok_or(SourceError::Definition { item: key })?;
         let facts = self.crates[index];
-        let def = definition_of(src, facts.key, None, facts.edition, CallShape::FnLike, self.alloc).map_err(|_| SourceError::Definition { item: key })?;
-        let def = one(def, self.alloc);
+        let def = definition_of(src, facts.key, None, facts.edition, CallShape::FnLike, self.alloc.alloc()).map_err(|_| SourceError::Definition { item: key })?;
+        let def = self.alloc.alloc_val(def);
         self.hold(self.defs.len())?;
         self.defs.insert(key, def);
         Ok(def)
@@ -711,19 +718,6 @@ fn anchor_of<'s, 'w, 'e>(
         },
         PathKind::DollarCrate(k) => (Anchor::Root(ModRef { krate: k, key: root_key(k) }), segs),
     })
-}
-
-/// `value` kept for as long as the arena lives.
-fn one<'w, V>(value: V, a: Alloc<'w>) -> &'w V {
-    let mut v = Vec::new_in(a);
-    v.push(value);
-    &v.leak()[0]
-}
-
-fn slice<'w, V: Copy>(values: &[V], a: Alloc<'w>) -> &'w [V] {
-    let mut v = Vec::new_in(a);
-    v.extend_from_slice(values);
-    v.leak()
 }
 
 /// The source one nested resolver asks through.

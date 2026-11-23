@@ -301,6 +301,7 @@ pub(crate) fn built_for<'s, 'm: 's>(
     // grants it and the OS build, read and keyed once (native_c_tasks.rs `tree_tools`); their
     // digest is in the built key, so a changed tool is another built record (rule 21).
     let has_tree = outputs.c_requests().any(|text| c_tasks::is_tree(text.split('\0').next().unwrap_or("")));
+    let erased_scratch = blaze_own::Erased::new(scratch);
     let trees = match has_tree {
         false => None,
         true => {
@@ -309,7 +310,7 @@ pub(crate) fn built_for<'s, 'm: 's>(
             // runner's grant does (native_unit.rs): never the crate's name (`tikv_jemalloc_sys`,
             // which `package` is here, for messages), which matched no row (the first real run:
             // "`sh` is not a host tool the table grants this package", with `sh` in the table).
-            let tools = native_c_tasks::tree_tools(list.package(r), crate::graph::TRIPLE, shelf, alloc)
+            let tools = native_c_tasks::tree_tools(list.package(r), crate::graph::TRIPLE, shelf, erased_scratch.bump())
                 .map_err(|words| CTaskWhy::Setup { words: kept(scratch, format_args!("the C of {package}: its process tree's host tools: {}", words.as_str())) })?;
             Some(tools)
         }
@@ -392,7 +393,7 @@ pub(crate) fn built_for<'s, 'm: 's>(
     let mut bytes = Vec::new_in(alloc);
     c_tasks_built::encode_built(&body, &mut bytes);
     on.store.put(&cx, Key(key), &bytes).map_err(|e| CTaskWhy::Built { words: kept(scratch, format_args!("the store: {e}")) })?;
-    let payload: &'s [u8] = blaze_own::Vec::from_slice_in(&body, scratch).leak();
+    let payload: &'s [u8] = scratch.alloc_slice_copy(&body);
     Ok((ScriptIn { name: script.name, out: key, payload }, Some(run.report)))
 }
 

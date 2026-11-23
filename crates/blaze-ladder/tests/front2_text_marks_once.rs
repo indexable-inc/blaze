@@ -85,8 +85,8 @@ impl<'n> Load<'n> for OneExpansion<'n> {
 /// not those of the solve's text: the column is opened and read by row index, never against
 /// the text's bytes (front2 source.rs `Records::text_marks`, blaze-expand origin_column.rs
 /// `OriginsRef::open`).
-fn origins_of(call: ItemKey, alloc: Alloc<'static>) -> &'static [u8] {
-    let mut column = OriginColumn::new_in(alloc);
+fn origins_of(call: ItemKey, bump: blaze_own::Bump<'static>) -> &'static [u8] {
+    let mut column = OriginColumn::new_in(bump.alloc());
     for i in 0..MARKS {
         let start = 2 * i;
         let mut module = [0u8; 32];
@@ -99,12 +99,13 @@ fn origins_of(call: ItemKey, alloc: Alloc<'static>) -> &'static [u8] {
         column.push(start, start + 1, TextOrigin::Def(i as u32), Some(mark)).expect("rows in order");
     }
     let place = CallInText { text: Some(At::File(0)), item: ItemIndex(0), input_start: 0, input_len: 0 };
-    write(call, Some(place), InputShape::Inside, "m", false, &column, alloc).expect("the origins' bytes")
+    write(call, Some(place), InputShape::Inside, "m", false, &column, bump).expect("the origins' bytes")
 }
 
 /// `ROOT` solved: its names and items records, its root file, and its one macro call with the
 /// text the solve made for it.
-fn solved(alloc: Alloc<'static>) -> (CrateItemKey, OneExpansion<'static>) {
+fn solved(bump: blaze_own::Bump<'static>) -> (CrateItemKey, OneExpansion<'static>) {
+    let alloc = bump.alloc();
     let rust = PackageEdition { syntax: edition::Edition::Edition2024, blaze: None };
     let key = CrateItemKey(ContentId::of("front2_text_marks_once crate", b"app"));
     let crates = [CrateInput {
@@ -119,7 +120,7 @@ fn solved(alloc: Alloc<'static>) -> (CrateItemKey, OneExpansion<'static>) {
         cfg: &[],
         script: None,
     }];
-    let names = resolve_crates(&crates, Sysroot::default(), &Root, &Serial, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &Root, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let krate = names.crates()[0];
     let mut made = krate.expansions.iter().filter_map(|(call, e)| e.made.map(|m| (*call, m.text)));
     let (call, text) = made.next().expect("`m!()` made a text");
@@ -128,12 +129,12 @@ fn solved(alloc: Alloc<'static>) -> (CrateItemKey, OneExpansion<'static>) {
     let names_bytes = names_record::encode(krate, alloc).unwrap_or_else(|e| panic!("the names record: {e:?}"));
     let items_bytes = items_record::encode(krate, alloc).unwrap_or_else(|e| panic!("the items record: {e:?}"));
     let one = OneExpansion {
-        names: aligned(&names_bytes, alloc),
-        items: aligned(&items_bytes, alloc),
+        names: aligned(&names_bytes, bump),
+        items: aligned(&items_bytes, bump),
         file: (std::string::String::leak(file.package.as_str().to_string()), file.text),
         call,
         text,
-        origins: origins_of(call, alloc),
+        origins: origins_of(call, bump),
     };
     (key, one)
 }
@@ -144,8 +145,9 @@ fn an_expansion_asked_five_hundred_times_is_opened_once() {
     // records may be `&'static`).
     let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame")));
     let erased: &'static blaze_own::Erased<&'static blaze_mem::Frame> = Box::leak(Box::new(blaze_own::Erased::new(frame)));
-    let alloc: Alloc<'static> = erased.handle();
-    let (key, one) = solved(alloc);
+    let bump = erased.bump();
+    let alloc: Alloc<'static> = bump.alloc();
+    let (key, one) = solved(bump);
     let (call, text) = (one.call, one.text);
     let load: &'static OneExpansion<'static> = Box::leak(Box::new(one));
     let keys: &'static [CrateItemKey] = Box::leak(Box::new([key]));

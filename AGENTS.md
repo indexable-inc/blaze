@@ -63,7 +63,7 @@ One line per rule; the full text is in its heading's skill (.agents/skills/): lo
 covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it with `--write`.
 
 ### Memory and data (skill `memory-and-data`)
-- **11. bump-allocate**: Don't allocate where a borrow does; where you must, name the allocator in code (a frame, `Global`).
+- **11. bump-allocate**: Name the allocator (`Frame`/`Bump`, `Global`); use `into_bump_slice`, never general `.leak()`.
 - **50. one-memory-measure**: Footprint is the measure, the kernel's limit the ceiling; nothing admits work by memory.
 - **51. outputs-are-records**: What outlives a task is a record written once, read in place; no cache but the page cache.
 - **52. cache-by-code-id**: A function's results are cached by its code identity and arguments; nothing invalidates by hand.
@@ -121,7 +121,7 @@ covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it
 
 ### Design and changing code (skill `changing-code`)
 - **13. fix-through-blaze-lints**: Change many sites with an astlog rules file or a `.clippy.toml` ban: never by text.
-- **24. whole-ports**: A shared signature changes with all its callers in one batch; the tree compiles at every save.
+- **24. whole-ports**: Delete replaced APIs completely, never deprecate; port all callers in one batch so it builds.
 - **28. best-long-term-design**: Pick the best long-term design, not the least work; be proud of the first iteration, then prove it.
 - **29. spec-then-build**: A change that needs a design gets a short spec, then the same lane builds it at once.
 - **30. one-concept-one-home**: One type, one rule, one place per concept; merge duplicates and ban the removed name.

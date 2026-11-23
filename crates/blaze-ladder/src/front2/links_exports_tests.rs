@@ -5,7 +5,7 @@
 //! A child of `links` (its `mod` line is in links.rs, `#[cfg(test)]`), so it reads `Gather`.
 
 use blaze_id::{ContentId, ItemKey};
-use blaze_own::Alloc;
+use blaze_own::{Bump, Erased};
 use blaze_surface::{Edition, ItemIndex};
 
 use super::{CrateExport, CrateLinks, Entry, Gather, KeyFor, LinksError, TextOf};
@@ -21,9 +21,9 @@ pub(super) fn index_key(at: ItemIndex) -> ItemKey {
 }
 
 /// The facts of one file `text` as the only text of crate `t`, on macOS.
-fn links_of<'a>(text: &'a str, alloc: Alloc<'a>) -> Result<CrateLinks<'a>, LinksError<'a>> {
-    let outline = blaze_file_items::outline(text, Edition::E2021, alloc);
-    let mut gather = Gather::new("t", Edition::E2021, MAC, &[], alloc);
+fn links_of<'a>(text: &'a str, bump: Bump<'a>) -> Result<CrateLinks<'a>, LinksError<'a>> {
+    let outline = blaze_file_items::outline(text, Edition::E2021, bump.alloc());
+    let mut gather = Gather::new("t", Edition::E2021, MAC, &[], bump);
     gather.text(TextOf::File("src/lib.rs"), text, &outline, &|at| Entry::Keyed(index_key(at)))?;
     gather.finish()
 }
@@ -42,12 +42,14 @@ fn links_of<'a>(text: &'a str, alloc: Alloc<'a>) -> Result<CrateLinks<'a>, Links
 /// first `expect_err` panics with "two exporters of `f` were merged".
 #[test]
 fn two_exporters_of_one_name_refused() {
-    let alloc = blaze_own::testing::heap().alloc();
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+    let erased = Erased::new(&frame);
+    let bump = erased.bump();
 
     // Entries in outline order: 0 `fn f`, 1 `mod m`, 2 `m::f`.
     let two = "#[no_mangle] pub extern \"C\" fn f() {}\n\
                mod m { #[unsafe(no_mangle)] pub extern \"C\" fn f() {} }\n";
-    let refused = links_of(two, alloc).err().unwrap_or_else(|| panic!("two exporters of `f` were merged"));
+    let refused = links_of(two, bump).err().unwrap_or_else(|| panic!("two exporters of `f` were merged"));
     assert_eq!(
         refused,
         LinksError::TwoExports {
@@ -59,11 +61,11 @@ fn two_exporters_of_one_name_refused() {
 
     // `export_name` and `no_mangle` naming one symbol from two items: refused the same way.
     let named = "#[export_name = \"f\"] pub static S: u8 = 0;\n#[no_mangle] pub extern \"C\" fn f() {}\n";
-    assert!(matches!(links_of(named, alloc), Err(LinksError::TwoExports { first: CrateExport { name: "f", .. }, .. })));
+    assert!(matches!(links_of(named, bump), Err(LinksError::TwoExports { first: CrateExport { name: "f", .. }, .. })));
 
     // One export of each name: each keeps its item; sorted by name, not by place.
     let one = "#[export_name = \"g\"] pub static S: u8 = 0;\n#[no_mangle] pub extern \"C\" fn f() {}\n";
-    let links = links_of(one, alloc).unwrap_or_else(|e| panic!("refused: {e:?}"));
+    let links = links_of(one, bump).unwrap_or_else(|e| panic!("refused: {e:?}"));
     assert_eq!(
         links.exports.as_slice(),
         [
@@ -73,8 +75,8 @@ fn two_exporters_of_one_name_refused() {
     );
 
     // An exported entry the names source gives no key is refused by name, never passed over.
-    let outline = blaze_file_items::outline(one, Edition::E2021, alloc);
-    let mut gather = Gather::new("t", Edition::E2021, MAC, &[], alloc);
+    let outline = blaze_file_items::outline(one, Edition::E2021, bump.alloc());
+    let mut gather = Gather::new("t", Edition::E2021, MAC, &[], bump);
     assert_eq!(
         gather.text(TextOf::File("src/lib.rs"), one, &outline, &|_| Entry::Unkeyed).err(),
         Some(LinksError::Unkeyed { krate: "t", text: TextOf::File("src/lib.rs"), at: ItemIndex(0), line: 1, item: "S", needs: KeyFor::Export })

@@ -99,7 +99,7 @@ fn inherited_projection_bounds_use_the_concrete_impl() {
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, alloc).expect("fixture names");
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("fixture names");
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
     let mut world = ProjectWorld::new(&names, &frame, &files, alloc).expect("front2");
     let bodies = world.bodies(alloc);

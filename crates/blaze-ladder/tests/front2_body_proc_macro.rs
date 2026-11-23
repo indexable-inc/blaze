@@ -120,7 +120,7 @@ fn fn_named(names: &Names<'_>, name: &str) -> blaze_id::ItemKey {
 fn a_proc_macro_call_in_a_body_is_run_by_its_crate_s_runner() {
     let g = blaze_own::Alloc::global();
     let crates = [input("user", "/user/lib.rs", &[("macros", 1)], false), input("macros", "/macros/lib.rs", &[], true)];
-    let names = resolve_crates(&crates, Sysroot::default(), &FILES, &Serial, g).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &FILES, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let roots = [fn_named(&names, "main")];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the survey's frame");
     let sources: &'static dyn BodySources = Box::leak(Box::new(Sourced(&FILES)));

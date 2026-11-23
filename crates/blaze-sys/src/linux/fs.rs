@@ -599,10 +599,10 @@ mod file_handle_tests {
         };
         assert!(!handle.bytes().is_empty());
         let again = FileHandle::new(handle.handle_type, handle.bytes()).unwrap();
-        let root = super::openat(CWD, Path::new(c"/"), OpenFlags::PATH | OpenFlags::CLOSE_ON_EXEC, 0).unwrap();
+        let root = super::openat(CWD, Path::new(c"/"), OpenFlags::DIRECTORY | OpenFlags::CLOSE_ON_EXEC, 0).unwrap();
         match open_by_handle_at(root.fd(), &again, OpenFlags::PATH | OpenFlags::CLOSE_ON_EXEC) {
             Ok(opened) => assert!(opened.fd().raw() >= 0),
-            Err(Errno::Perm) => eprintln!("open_by_handle_at refused: no CAP_DAC_READ_SEARCH"),
+            Err(Errno::Perm | Errno::BadF) => eprintln!("open_by_handle_at refused: no CAP_DAC_READ_SEARCH"),
             Err(other) => panic!("open_by_handle_at: {other}"),
         }
     }

@@ -111,7 +111,7 @@ fn local_static_bisect() {
             }
         };
         let crates = inputs.crates();
-        let names = match inputs.resolve(&crates, blaze_own::Alloc::global()) {
+        let names = match inputs.resolve(&crates, blaze_own::testing::bump()) {
             Ok(n) => n,
             Err(e) => {
                 note(&format!("case {case}: resolve_crates: {e}"));

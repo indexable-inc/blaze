@@ -12,7 +12,7 @@
 use core::fmt;
 
 use blaze_build_script::outputs::{OutputsRef, RecordError};
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, BVec, Bump};
 use blaze_scope::resolve::CrateInput;
 use blaze_unit_graph::UnitId;
 
@@ -21,13 +21,13 @@ use blaze_unit_graph::UnitId;
 /// each once, and the record as [`CrateInput::script`]. The key stays the input's own: a
 /// script's output is a read of the task (its `Script` record and out in the read list),
 /// never part of a crate's key. The cfg lives in `alloc`.
-pub fn joined<'w>(input: &CrateInput<'w>, outputs: OutputsRef<'w>, alloc: Alloc<'w>) -> CrateInput<'w> {
-    let mut cfg: AVec<'w, (&'w str, Option<&'w str>)> = AVec::with_capacity_in(input.cfg.len(), alloc);
+pub fn joined<'w>(input: &CrateInput<'w>, outputs: OutputsRef<'w>, alloc: Bump<'w>) -> CrateInput<'w> {
+    let mut cfg: BVec<'w, (&'w str, Option<&'w str>)> = BVec::with_capacity_in(input.cfg.len(), alloc);
     cfg.extend_from_slice(input.cfg);
     cfg.extend(outputs.cfgs());
     cfg.sort_unstable();
     cfg.dedup();
-    CrateInput { cfg: cfg.leak(), script: Some(outputs), ..*input }
+    CrateInput { cfg: cfg.into_bump_slice(), script: Some(outputs), ..*input }
 }
 
 /// The subject of the `Script` run a crate of the list reads: its package, version, SIDE (the

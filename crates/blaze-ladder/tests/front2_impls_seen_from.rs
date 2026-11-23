@@ -122,7 +122,7 @@ fn a_body_sees_its_crates_impls_whichever_is_checked_first() {
     let user = UserCrate { name: "probe", dir: "/probe/", root: "/probe/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, a).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let core = crates.iter().position(|c| c.name == "core").expect("the toolchain's `core`");
     let program = 0usize;
@@ -132,7 +132,7 @@ fn a_body_sees_its_crates_impls_whichever_is_checked_first() {
         .find(|&k| names.item_text(k).is_some_and(|t| t.impl_header.is_some_and(|h| h.contains("ErrorKind") && !h.contains(" for ")) && t.text.contains("fn from_prim")))
         .expect("core's `impl ErrorKind` with `from_prim`");
     let g = names.items(program).map(|(k, _, _)| k).find(|&k| names.item_text(k).is_some_and(|t| t.text.starts_with("fn g()"))).expect("the program's `fn g`");
-    let prepared = Prepares::new_in(a);
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
 
     // (planted, core's body first)
     for (planted, core_first) in [(false, true), (false, false), (true, false)] {

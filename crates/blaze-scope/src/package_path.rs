@@ -15,7 +15,7 @@
 //! written above its own directory, `#[path = "../../shared/x.rs"]`); never a leading `/`. The
 //! empty path is the package's directory itself, which names no file.
 
-use blaze_own::{AString, AVec, Alloc, Box};
+use blaze_own::{AString, AVec, Alloc, BString, Bump};
 
 /// A path relative to its crate's package directory: the only form of a file's path a record
 /// holds (see the module docs).
@@ -58,11 +58,11 @@ impl<'a> PackagePath<'a> {
     /// its root (a leading `/` is the root; `.` and `..` are taken out by text, a `..` at the
     /// root staying there as the walk's `pop_dir` does): `..` once per segment of `package`
     /// that `path` is not under.
-    pub fn of(path: &str, package: &str, alloc: Alloc<'a>) -> PackagePath<'a> {
-        let file = segments(path, alloc);
-        let dir = segments(package, alloc);
+    pub fn of(path: &str, package: &str, alloc: Bump<'a>) -> PackagePath<'a> {
+        let file = segments(path, alloc.alloc());
+        let dir = segments(package, alloc.alloc());
         let common = file.iter().zip(dir.iter()).take_while(|(a, b)| a == b).count();
-        let mut out = AString::new_in(alloc);
+        let mut out = BString::new_in(alloc);
         for _ in common..dir.len() {
             if !out.is_empty() {
                 out.push('/');
@@ -75,7 +75,7 @@ impl<'a> PackagePath<'a> {
             }
             out.push_str(segment);
         }
-        PackagePath(Box::leak(out.into_boxed_str()))
+        PackagePath(out.into_bump_str())
     }
 
     /// The text of the path.
@@ -138,16 +138,22 @@ mod tests {
 
     #[test]
     fn a_file_under_its_package_is_its_path_past_the_directory() {
+        let inline = blaze_own::Inline::<1024>::new();
+        let erased = blaze_own::Erased::new(&inline);
+        let bump = erased.bump();
         // The same file of one package placed at two trees: one record path.
-        let a = PackagePath::of("/3/serde-1.0.0/src/de/mod.rs", "/3/serde-1.0.0/", g());
-        let b = PackagePath::of("/7/serde-1.0.0/src/de/mod.rs", "/7/serde-1.0.0/", g());
+        let a = PackagePath::of("/3/serde-1.0.0/src/de/mod.rs", "/3/serde-1.0.0/", bump);
+        let b = PackagePath::of("/7/serde-1.0.0/src/de/mod.rs", "/7/serde-1.0.0/", bump);
         assert_eq!((a.as_str(), b.as_str()), ("src/de/mod.rs", "src/de/mod.rs"));
         assert_eq!(a.in_package("/7/serde-1.0.0/", g()).as_deref(), Some("/7/serde-1.0.0/src/de/mod.rs"));
     }
 
     #[test]
     fn a_file_above_its_package_keeps_leading_parents() {
-        let p = PackagePath::of("/0/crates/zones/rpc/test-utils/auth.rs", "/0/crates/zones/node/", g());
+        let inline = blaze_own::Inline::<1024>::new();
+        let erased = blaze_own::Erased::new(&inline);
+        let bump = erased.bump();
+        let p = PackagePath::of("/0/crates/zones/rpc/test-utils/auth.rs", "/0/crates/zones/node/", bump);
         assert_eq!(p.as_str(), "../rpc/test-utils/auth.rs");
         assert_eq!(PackagePath::new(p.as_str()), Ok(p));
         assert_eq!(p.in_package("/0/crates/zones/node", g()).as_deref(), Some("/0/crates/zones/rpc/test-utils/auth.rs"));

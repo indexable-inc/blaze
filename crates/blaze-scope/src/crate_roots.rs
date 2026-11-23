@@ -23,7 +23,7 @@
 use blaze_expand::origin_column::{ColumnError, OriginColumn, OriginsRef, TextMark};
 use blaze_expand::{DefSite, Edition, Transparency};
 use blaze_id::CrateItemKey;
-use blaze_own::Alloc;
+use blaze_own::{Alloc, Bump};
 
 #[cfg(test)]
 mod tests {
@@ -155,11 +155,12 @@ pub fn column_in<'a>(origins: &Result<&'a [u8], crate::expansion_origins::Origin
 
 /// `column` carried into a rewritten text ([`remap`]), written and read back in place: its bytes
 /// live in `alloc`, as the texts they mark do.
-pub fn remapped<'a>(column: OriginsRef<'_>, copies: &[Copied], alloc: Alloc<'a>) -> Result<OriginsRef<'a>, RootsLost> {
-    let moved = remap(column, copies, alloc).map_err(|error| RootsLost::Column { error })?;
-    let mut bytes: blaze_own::AVec<'a, u8> = blaze_own::AVec::new_in(alloc);
+pub fn remapped<'a>(column: OriginsRef<'_>, copies: &[Copied], alloc: Bump<'a>) -> Result<OriginsRef<'a>, RootsLost> {
+    let a = alloc.alloc();
+    let moved = remap(column, copies, a).map_err(|error| RootsLost::Column { error })?;
+    let mut bytes: blaze_own::AVec<'a, u8> = blaze_own::AVec::new_in(a);
     moved.write(&mut bytes).map_err(|error| RootsLost::Column { error })?;
-    let bytes: &'a [u8] = blaze_own::Box::leak(bytes.into_boxed_slice());
+    let bytes: &'a [u8] = alloc.alloc_slice_copy(&bytes);
     OriginsRef::open(bytes).map(|(column, _)| column).map_err(|error| RootsLost::Column { error })
 }
 

@@ -326,7 +326,7 @@ pub(crate) fn print_grouped<'b>(cx: &Cx, blocks: impl Iterator<Item = (Name, &'b
 
 /// `args` as text kept for the request (in the request's heap `g`).
 pub(crate) fn leak(g: Alloc<'static>, args: fmt::Arguments<'_>) -> &'static str {
-    blaze_own::Box::leak(blaze_own::text::format(g, args).into_boxed_str())
+    blaze_own::Box::leak_static(blaze_own::text::format(g, args).into_boxed_str())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

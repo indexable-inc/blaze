@@ -419,6 +419,10 @@ impl<'a> ArenaLocal<'a> {
     }
 }
 
+// SAFETY: `ArenaLocal` bump-allocates from its parent `Arena`, whose chunks are reclaimed in bulk
+// when the arena resets or drops; forgetting a handle never leaks memory past the arena.
+unsafe impl blaze_own::BumpAlloc for ArenaLocal<'_> {}
+
 // SAFETY: blocks come from the local's own block or from blocks and regions the arena hands
 // out once each, disjoint and committed. Each stays valid until the arena resets or drops, both
 // of which take `&mut Arena` or ownership, impossible while this local (which borrows the arena

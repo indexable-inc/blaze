@@ -30,12 +30,13 @@ fn a_store_loads_origins_are_two_parts_and_no_copy() {
     // The test's memory: one frame, handed down; the load's allocator counts over it.
     let frame = Frame::new(Tag::Other).unwrap_or_else(|e| panic!("the test's frame: {e:?}"));
     let home = Erased::new(&frame);
-    let alloc = home.handle();
+    let bump = home.bump();
+    let alloc = bump.alloc();
     let payloads = payloads(&names);
     let snapshot = kept(&names, true);
     let mut read: AVec<'_, CrateRecords<'_>> = AVec::with_capacity_in(names.crates().len(), alloc);
     for (c, payload) in names.crates().iter().zip(payloads.iter()) {
-        read.push(crate_records(scope_name(c.key), payload, c.key, alloc).unwrap_or_else(|e| panic!("crate `{}`: {e}", c.name)));
+        read.push(crate_records(scope_name(c.key), payload, c.key, bump).unwrap_or_else(|e| panic!("crate `{}`: {e}", c.name)));
     }
     let mut packages: AVec<'_, &str> = AVec::with_capacity_in(read.len(), alloc);
     packages.resize(read.len(), "/");

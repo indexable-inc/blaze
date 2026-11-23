@@ -295,6 +295,11 @@ pub enum Rule {
     /// with a mechanical fix removing `mut `.
     /// The lint `blaze::unused_mut`.
     UnusedMut = 44,
+    /// Calling `.leak()` / `Box::leak` / `Vec::leak` outside process-root initialization: bump
+    /// arenas should use `.into_bump_slice()` / `.into_bump_str()` / `frame.alloc_str()` (backed
+    /// by `BumpAlloc`), and intentional `'static` allocations should use `ProgramArena` or `const`.
+    /// The lint `blaze::heap_leak`.
+    HeapLeak = 45,
 }
 
 impl Rule {
@@ -347,6 +352,7 @@ impl Rule {
         Rule::IoRef,
         Rule::UnusedImport,
         Rule::UnusedMut,
+        Rule::HeapLeak,
     ];
 
     /// The ten rules ported from blaze's scripts: what [`Step::Strict`] runs. The rules after
@@ -415,6 +421,7 @@ impl Rule {
             Rule::IoRef => "io-ref",
             Rule::UnusedImport => "unused-import",
             Rule::UnusedMut => "unused-mut",
+            Rule::HeapLeak => "heap-leak",
         }
     }
 
@@ -455,6 +462,7 @@ impl Rule {
             Rule::IoRef => Some("io_ref"),
             Rule::UnusedImport => Some("unused_import"),
             Rule::UnusedMut => Some("unused_mut"),
+            Rule::HeapLeak => Some("heap_leak"),
             _ => None,
         }
     }
@@ -708,6 +716,8 @@ pub enum Template {
     UnusedImport = 390,
     /// Unnecessary `mut` on a `let mut` binding or `fn` parameter; argument: binding name span.
     UnusedMut = 400,
+    /// `.leak()` / `Box::leak` / `Vec::leak` call outside `Root::leak` and tests.
+    HeapLeak = 410,
 }
 
 impl Template {
@@ -755,6 +765,7 @@ impl Template {
             380 => Rule::IoRef,
             390 => Rule::UnusedImport,
             400 => Rule::UnusedMut,
+            410 => Rule::HeapLeak,
             _ => Rule::VariantCount,
         }
     }
@@ -851,6 +862,7 @@ impl Template {
             Template::IoRef => "io-ref",
             Template::UnusedImport => "unused-import",
             Template::UnusedMut => "unused-mut",
+            Template::HeapLeak => "heap-leak",
         }
     }
 }

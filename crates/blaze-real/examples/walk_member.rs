@@ -140,6 +140,11 @@ fn main() {
 
     // The roots.
     let alloc = Alloc::global();
+    let Ok(frame) = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer) else {
+        stop(&out_file, "REFUSED: the command's frame");
+    };
+    let frame: &'static blaze_mem::Frame = Box::leak(Box::new(frame));
+    let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
     let mut roots: Vec<blaze_id::ItemKey> = Vec::new();
     match target {
         Target::Bin(_) => {
@@ -154,7 +159,7 @@ fn main() {
         }
         Target::LibTests | Target::Test(_) => {
             let bytes = encode(names.krate(k), alloc).unwrap_or_else(|e| stop(&out_file, &format!("WALK {member} {target_text}: REFUSED: its tests record: {e} (tree {tree})"))).bytes;
-            let record = TestsRecord::open(blaze_scope::resolve::aligned(&bytes, alloc))
+            let record = TestsRecord::open(blaze_scope::resolve::aligned(&bytes, bump))
                 .unwrap_or_else(|e| stop(&out_file, &format!("WALK {member} {target_text}: REFUSED: its tests record does not open: {e} (tree {tree})")));
             for i in 0..record.len() {
                 match record.row(i) {
@@ -214,13 +219,12 @@ fn main() {
     // The walk, over the world's names with the bodies' macro sources and the receivers'
     // pointer types, as the census reads bodies.
     let crate_names: Vec<&str> = crates.crates.iter().map(|c| c.name).collect();
-    let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame")));
     let survey_frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the survey's frame")));
     let world = World {
         names,
         frame,
         survey_frame,
-        prepared: Prepares::new_in(alloc),
+        prepared: Prepares::new_in(bump),
         sources: &[],
         crate_names: &crate_names,
         body_sources: Some(loaded.body_sources()),

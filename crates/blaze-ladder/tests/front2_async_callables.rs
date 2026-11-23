@@ -55,7 +55,7 @@ fn check_bodies(cases: &[&str]) {
     let user = UserCrate { name: "callables", dir: "/callables/", root: "/callables/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).expect("user crate and library");
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates, alloc).expect("resolve crates");
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("resolve crates");
     let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("command frame");
     let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("production body checker");

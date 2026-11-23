@@ -80,20 +80,21 @@ fn listed(record: &ItemsRecord<'static>) -> AVec<'static, (ItemKey, ItemKey, &'s
 fn with_u32(bytes: &[u8], at: usize, value: u32) -> &'static [u8] {
     let mut copy = AVec::from_slice_in(bytes, Alloc::global());
     copy[at..at + 4].copy_from_slice(&value.to_le_bytes());
-    aligned(&copy, Alloc::global())
+    aligned(&copy, super::SyncFrame::leaked())
 }
 
 #[test]
 fn a_member_finds_its_owner_in_one_search() {
-    let g = Alloc::global();
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
     let inputs = [input("k0", PATH, &[])];
-    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("solve: {e:?}"));
+    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("solve: {e:?}"));
     let names = solved[0].names;
     let a = encode(names, g).unwrap_or_else(|e| panic!("encode: {e:?}"));
     let b = encode(names, g).unwrap_or_else(|e| panic!("encode again: {e:?}"));
     assert!(a == b, "the record encodes to different bytes twice");
-    let bytes: &'static [u8] = aligned(&a, g);
-    let record = super::items_record::one_file(bytes, names.files[0].text, g);
+    let bytes: &'static [u8] = aligned(&a, bump);
+    let record = super::items_record::one_file(bytes, names.files[0].text, bump);
 
     // Every named member, by its key alone, answers the owner and the name its list holds.
     let members = listed(&record);
@@ -113,7 +114,7 @@ fn a_member_finds_its_owner_in_one_search() {
     assert!(matches!(record.member_owner(s), Ok(None)), "a struct's key is no member's: {:?}", record.member_owner(s));
 
     // The reader over a set of crates answers the same.
-    let read = RecordItems::new(&[names.key], Kept { record: bytes }, g);
+    let read = RecordItems::new(&[names.key], Kept { record: bytes }, bump);
     for (member, owner, name) in members.iter() {
         assert!(matches!(read.member_owner(*member), Ok(Some(got)) if got == (*owner, *name)), "`{name}` through the crates' reader: {:?}", read.member_owner(*member));
     }

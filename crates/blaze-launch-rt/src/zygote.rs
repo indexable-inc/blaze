@@ -543,6 +543,9 @@ fn setup_failed(row: u32, step: &Step<'_>, errno: i32) -> ! {
 
 fn child_main<'a>(suite: &dyn Suite, row: u32, child: &mut Child<'_, 'a>, report: c_int, output: c_int, alloc: Alloc<'a>) -> ! {
     ROW.store(row, Ordering::Relaxed);
+    // Kept on `child_main`'s stack until `_exit` so POSIX `environ` points at live memory
+    // without leaking.
+    let mut env_keep: Option<(AVec<'a, AVec<'a, u8>>, AVec<'a, *mut c_char>)> = None;
     loop {
         let Some(step) = child.next() else { break };
         let failed = match step {
@@ -553,7 +556,7 @@ fn child_main<'a>(suite: &dyn Suite, row: u32, child: &mut Child<'_, 'a>, report
             Step::Signals => signals(),
             Step::Descriptors => descriptors(report, output, alloc),
             Step::TempFolder { path } => folder(path, alloc),
-            Step::Environment { vars, temp } => environment(vars, temp, alloc),
+            Step::Environment { vars, temp } => environment(vars, temp, alloc, &mut env_keep),
             Step::Sandbox { profile } => sandbox(profile, alloc),
             Step::Control { socket } => suite.control(socket).err(),
             // The spec's row, the one forked for.
@@ -566,6 +569,7 @@ fn child_main<'a>(suite: &dyn Suite, row: u32, child: &mut Child<'_, 'a>, report
     let mut running = Running { child, suite, alloc };
     RUNNING.store((&mut running as *mut Running<'_, '_, '_>).cast::<()>(), Ordering::Release);
     suite.call(row);
+    let _ = &env_keep;
     end(Ending::Returned)
 }
 
@@ -763,24 +767,32 @@ fn folder(path: &str, alloc: Alloc<'_>) -> Option<i32> {
     (unsafe { libc::mkdir(path.as_ptr().cast::<c_char>(), 0o700) } != 0).then(errno)
 }
 
-fn environment(vars: &[(&str, &str)], temp: &str, alloc: Alloc<'_>) -> Option<i32> {
-    let mut texts: AVec<'_, *mut c_char> = Vec::with_capacity_in(vars.len() + 2, alloc);
+fn environment<'a>(
+    vars: &[(&str, &str)],
+    temp: &str,
+    alloc: Alloc<'a>,
+    keep: &mut Option<(AVec<'a, AVec<'a, u8>>, AVec<'a, *mut c_char>)>,
+) -> Option<i32> {
+    let mut lines: AVec<'a, AVec<'a, u8>> = Vec::with_capacity_in(vars.len() + 1, alloc);
+    let mut texts: AVec<'a, *mut c_char> = Vec::with_capacity_in(vars.len() + 2, alloc);
     let mut add = |name: &str, value: &str| {
-        let mut line: AVec<'_, u8> = Vec::with_capacity_in(name.len() + value.len() + 2, alloc);
+        let mut line: AVec<'a, u8> = Vec::with_capacity_in(name.len() + value.len() + 2, alloc);
         line.extend_from_slice(name.as_bytes());
         line.push(b'=');
         line.extend_from_slice(value.as_bytes());
         line.push(0);
-        // Kept for the process's life: `environ` points at it.
-        texts.push(line.leak().as_mut_ptr().cast::<c_char>());
+        texts.push(line.as_mut_ptr().cast::<c_char>());
+        lines.push(line);
     };
     for (name, value) in vars {
         add(name, value);
     }
     add("TMPDIR", temp);
     texts.push(core::ptr::null_mut());
-    let table = texts.leak().as_mut_ptr();
-    // SAFETY: the process is one thread; `table` is NUL-terminated and lives for the process.
+    let (_, table_vec) = keep.insert((lines, texts));
+    let table = table_vec.as_mut_ptr();
+    // SAFETY: the process is one thread; `table` and every entry live in `keep` on `child_main`'s
+    // diverging stack frame until `_exit`.
     #[cfg(target_os = "macos")]
     unsafe {
         *libc::_NSGetEnviron() = table;

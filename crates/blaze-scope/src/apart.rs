@@ -18,7 +18,7 @@
 use core::fmt;
 
 use blaze_hash::HashMap;
-use blaze_own::{AVec, Alloc, Box};
+use blaze_own::{AVec, Alloc, Bump};
 
 use crate::crate_scope::Dep;
 use crate::expansions::KeptExpansions;
@@ -85,7 +85,7 @@ pub struct Apart<'a> {
     by_prefix: HashMap<[u8; 8], usize, Alloc<'a>>,
     prepares: &'a Prepares<'a>,
     first: First,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
 }
 
 impl<'a> Apart<'a> {
@@ -101,8 +101,9 @@ impl<'a> Apart<'a> {
         sources: &S,
         par: &P,
         first: First,
-        alloc: Alloc<'a>,
+        bump: Bump<'a>,
     ) -> Result<Apart<'a>, ApartError<'a>> {
+        let alloc = bump.alloc();
         let Some(stand_in) = crates.get(apart).copied() else {
             return Err(ApartError::NoSuchCrate { apart, crates: crates.len() });
         };
@@ -121,17 +122,20 @@ impl<'a> Apart<'a> {
         let mut whole: AVec<'a, Option<&'a CrateNames<'a>>> = AVec::with_capacity_in(crates.len(), alloc);
         whole.extend(crates.iter().map(|_| None));
         let mut by_prefix = HashMap::new_in(alloc);
-        let prepares = Prepares::new_in(alloc);
+        let prepares = Prepares::new_in(bump);
         for wave in graph.waves() {
             for &id in wave {
                 if id.index() == apart {
                     continue;
                 }
+                let Some(input) = crates.get(id.index()) else {
+                    continue;
+                };
                 let done = {
                     let built = Built { crates: &finished, by_prefix: &by_prefix, asked: None };
-                    resolve_one::<S, P>(&graph, &crates[id.index()], id, id.index(), &built, sources, par, first, prepares, &KeptExpansions::none(alloc), alloc)?
+                    resolve_one::<S, P>(&graph, input, id, id.index(), &built, sources, par, first, prepares, &KeptExpansions::none(alloc), bump)?
                 };
-                let done: &'a CrateNames<'a> = Box::leak(Box::new_in(done, alloc));
+                let done: &'a CrateNames<'a> = bump.alloc_val(done);
                 by_prefix.insert(done.key.prefix(), id.index());
                 finished[id.index()] = Some(Dep::Whole(done));
                 whole[id.index()] = Some(done);
@@ -142,7 +146,7 @@ impl<'a> Apart<'a> {
                 return Err(ApartError::Names(NamesError::NotResolved { krate: crates[at].name }));
             }
         }
-        Ok(Apart { apart, stand_in, sysroot, finished, whole, by_prefix, prepares, first, alloc })
+        Ok(Apart { apart, stand_in, sysroot, finished, whole, by_prefix, prepares, first, alloc: bump })
     }
 
     /// The index of the crate left out.
@@ -185,14 +189,15 @@ impl<'a> Apart<'a> {
                 return Err(ApartError::Differs { krate: crates[at].name, what: "key" });
             }
         }
-        let graph = graph_of(crates, self.sysroot, self.alloc)?;
+        let alloc = self.alloc.alloc();
+        let graph = graph_of(crates, self.sysroot, alloc)?;
         let id = CrateId(self.apart as u32);
         let done = {
             let built = Built { crates: &self.finished, by_prefix: &self.by_prefix, asked: None };
-            resolve_one::<S, P>(&graph, &input, id, self.apart, &built, sources, par, self.first, self.prepares, &KeptExpansions::none(self.alloc), self.alloc)?
+            resolve_one::<S, P>(&graph, &input, id, self.apart, &built, sources, par, self.first, self.prepares, &KeptExpansions::none(alloc), self.alloc)?
         };
-        let done: &'a CrateNames<'a> = Box::leak(Box::new_in(done, self.alloc));
-        let mut all: AVec<'a, &'a CrateNames<'a>> = AVec::with_capacity_in(crates.len(), self.alloc);
+        let done: &'a CrateNames<'a> = self.alloc.alloc_val(done);
+        let mut all: AVec<'a, &'a CrateNames<'a>> = AVec::with_capacity_in(crates.len(), alloc);
         for (at, c) in self.whole.iter().enumerate() {
             match c {
                 _ if at == self.apart => all.push(done),
@@ -200,6 +205,6 @@ impl<'a> Apart<'a> {
                 None => return Err(ApartError::Names(NamesError::NotResolved { krate: crates[at].name })),
             }
         }
-        Names::of_crates(crates, self.sysroot, &all, self.alloc).map_err(ApartError::Names)
+        Names::of_crates(crates, self.sysroot, &all, alloc).map_err(ApartError::Names)
     }
 }

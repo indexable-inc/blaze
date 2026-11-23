@@ -561,12 +561,12 @@ struct DataReads {
     asked: core::sync::atomic::AtomicU32,
 }
 
-impl SourceTexts<'static> for DataReads {
-    fn read(&self, krate: usize, path: &str) -> Option<&'static str> {
+impl<'a> SourceTexts<'a> for DataReads {
+    fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
         (krate == 0 && path == "/user/lib.rs").then_some(DATA_IN_A_BODY)
     }
 
-    fn read_data(&self, _krate: usize, _from: &str, _path: &str) -> Option<&'static [u8]> {
+    fn read_data(&self, _krate: usize, _from: &str, _path: &str) -> Option<&'a [u8]> {
         self.asked.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         Some(b"{}")
     }
@@ -574,9 +574,11 @@ impl SourceTexts<'static> for DataReads {
 
 #[test]
 fn a_literal_builtin_in_a_body_is_never_expanded_by_the_names() {
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
     let source = DataReads { asked: core::sync::atomic::AtomicU32::new(0) };
     let crates = [input("user", "/user/lib.rs", &[])];
-    let names = resolve_crates(&crates, Sysroot::default(), &source, &Serial, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = resolve_crates(&crates, Sysroot::default(), &source, &Serial, erased.bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let all: Vec<&str> = names.krate(0).tables.impls.iter().map(|i| i.header).collect();
     assert!(all.iter().any(|h| h.replace(' ', "").ends_with("LocalforA")), "the `sel!` beside the data reads is expanded: {all:?}");
     let asked = source.asked.load(core::sync::atomic::Ordering::Relaxed);

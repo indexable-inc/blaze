@@ -10,7 +10,7 @@
 
 use blaze_hash::HashMap;
 use blaze_id::ItemKey;
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, BVec, Bump};
 
 use blaze_surface::{ScopeBuilder, ScopeView};
 
@@ -98,14 +98,15 @@ pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>>(
     groups: bool,
     only: Option<Members<'_>>,
     part: &dyn Fn(NamesPart),
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Result<Solved<'a>, Unwritten> {
+    let alloc = bump.alloc();
     let deps = BuiltDeps { built, alloc, asks: true, through: core::cell::Cell::new(None) };
     // A one-group solve reads its members' texts alone (edit.rs).
     let read = |k: ItemKey| only.is_none_or(|o| o.holds(k));
     // Every other module of the crate from its group's record when a member first reads it,
     // its scope kept to be written as it was.
-    let records = only.map(|o| OutsideRecords { o, alloc, recorded: core::cell::RefCell::new(AVec::new_in(alloc)) });
+    let records = only.map(|o| OutsideRecords { o, alloc: bump, recorded: core::cell::RefCell::new(AVec::new_in(alloc)) });
     part(NamesPart::Load);
     let mut c = Cells::load_reading(facts, root, Some(&deps), super::CellPlant::None, &read, alloc).map_err(Unwritten::Load)?;
     // A driver's control of its oracle (task/fill.rs `Par::decide_plant`): the plant is read by
@@ -234,14 +235,14 @@ pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>>(
 }
 
 /// `bytes` copied into `alloc` at a 16-byte boundary (a record is read in place, aligned).
-fn aligned_copy<'a>(bytes: &[u8], alloc: Alloc<'a>) -> &'a [u8] {
+fn aligned_copy<'a>(bytes: &[u8], alloc: Bump<'a>) -> &'a [u8] {
     const ALIGN: usize = 16;
-    let mut b: AVec<'a, u8> = AVec::with_capacity_in(bytes.len() + ALIGN, alloc);
+    let mut b: BVec<'a, u8> = BVec::with_capacity_in(bytes.len() + ALIGN, alloc);
     // Within the capacity reserved: the buffer does not move while it is filled.
     let pad = b.as_ptr().align_offset(ALIGN).min(ALIGN);
     b.resize(pad, 0);
     b.extend_from_slice(bytes);
-    let all: &'a [u8] = b.leak();
+    let all: &'a [u8] = b.into_bump_slice();
     &all[pad..]
 }
 
@@ -250,7 +251,7 @@ fn aligned_copy<'a>(bytes: &[u8], alloc: Alloc<'a>) -> &'a [u8] {
 /// `recorded` to be written as it was.
 struct OutsideRecords<'r, 'a> {
     o: Members<'r>,
-    alloc: Alloc<'a>,
+    alloc: Bump<'a>,
     recorded: core::cell::RefCell<AVec<'a, (ItemKey, ScopeView<'a>)>>,
 }
 

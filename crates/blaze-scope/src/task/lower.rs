@@ -22,7 +22,7 @@ use blaze_file_items::{Outline, syntax_kind};
 use blaze_hash::{HashMap, HashSet};
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_ids::Hasher;
-use blaze_own::{AString, AVec, Alloc};
+use blaze_own::{AString, AVec, Alloc, BString, Bump};
 use blaze_surface::{
     AttrKind, BuiltinAttr, BuiltinDerive, CallRole, CallShape, ChildModDecl, CrateRootBuilder, CrateRootHead, DeclaredItem,
     DeclsBuilder, Def, DefKind, Dep, Edition, ExternCrateDecl, ExternTarget, Item, ItemDetail, ItemIndex, ItemKind,
@@ -1444,8 +1444,9 @@ pub fn walk_rows<'t, 'a: 't>(
     item: Option<ItemIndex>,
     edition: Edition,
     out: &mut AVec<'a, WalkRow<'t>>,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Option<(bool, bool)> {
+    let alloc = bump.alloc();
     // A file whose own `#![cfg]` is false has no `mod` lines to walk ([`walk`]).
     let own = item.is_none().then(|| {
         let f = file_attrs(cfg, o, text, alloc);
@@ -1462,7 +1463,7 @@ pub fn walk_rows<'t, 'a: 't>(
         }
         let Some(name) = child.name.map(|r| unraw(child.text(text, r))) else { continue };
         if let Some(call) = attrs.path_call.take() {
-            match read_call(call, edition, alloc) {
+            match read_call(call, edition, bump) {
                 Ok(path) => attrs.path = Some(path),
                 Err(_) => continue,
             }
@@ -1545,8 +1546,9 @@ pub fn walk<'t, 'a: 't, F: Files<'t> + ?Sized>(
     root: u32,
     root_dir: &str,
     edition: Edition,
-    alloc: Alloc<'a>,
+    bump: Bump<'a>,
 ) -> Tree<'t, 'a> {
+    let alloc = bump.alloc();
     let mut tree = Tree {
         modules: AVec::new_in(alloc),
         by_key: HashMap::new_in(alloc),
@@ -1586,7 +1588,7 @@ pub fn walk<'t, 'a: 't, F: Files<'t> + ?Sized>(
             let Some(name) = child.name.map(|r| unraw(child.text(text, r))) else { continue };
             let loc = Loc { file, offset: child.range.start };
             if let Some(call) = attrs.path_call.take() {
-                match read_call(call, edition, alloc) {
+                match read_call(call, edition, bump) {
                     Ok(path) => attrs.path = Some(path),
                     Err(refusal) => {
                         tree.notes.push(WalkNote::PathValueRefused { at: loc, refusal });
@@ -2126,7 +2128,8 @@ pub struct Fragment<'c, 't> {
 }
 
 /// Lowers `fragment`'s items under `cx`.
-pub fn lower<'p: 't, 't, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<'_, 'p, W>, fragment: Fragment<'_, 't>, alloc: Alloc<'a>) -> Lowered<'t, 'a> {
+pub fn lower<'p: 't, 't, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<'_, 'p, W>, fragment: Fragment<'_, 't>, bump: Bump<'a>) -> Lowered<'t, 'a> {
+    let alloc = bump.alloc();
     let entry = cx.entry
         && fragment.items.is_none()
         && fragment.depth == 0
@@ -2157,6 +2160,7 @@ pub fn lower<'p: 't, 't, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<'_, 'p, W>, fra
         pos: 0,
         procs: cx.procs,
         alloc,
+        bump,
         stack: AVec::new_in(alloc),
         seen: HashMap::new_in(alloc),
         checked: HashSet::new_in(alloc),
@@ -2266,6 +2270,7 @@ struct Lower<'c, 't, 'a, W: ?Sized> {
     pos: u32,
     procs: ProcDecls<'t>,
     alloc: Alloc<'a>,
+    bump: Bump<'a>,
     /// `cfg_attr`'s attributes not yet read, for [`Cfg::attr`].
     stack: AVec<'a, &'t str>,
     /// How many entries of each owner, kind and name this fragment has keyed: [`Lower::key`].
@@ -2363,13 +2368,13 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         // edition and the allocator are at hand (task/attr_value.rs); one that does not read
         // is refused by name and leaves the attribute unset.
         if let Some(call) = attrs.lang_call.take() {
-            match read_call(call, self.edition, self.alloc) {
+            match read_call(call, self.edition, self.bump) {
                 Ok(name) => attrs.lang = Some(name),
                 Err(refusal) => self.note(LowerNoteKind::AttrValueRefused(refusal), item.range.start, call.expr),
             }
         }
         if let Some(call) = attrs.path_call.take() {
-            match read_call(call, self.edition, self.alloc) {
+            match read_call(call, self.edition, self.bump) {
                 Ok(path) => attrs.path = Some(path),
                 Err(refusal) => self.note(LowerNoteKind::AttrValueRefused(refusal), item.range.start, call.expr),
             }
@@ -2438,7 +2443,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
     /// Its key is a function of the crate alone (rule 71); its content, this text, is a
     /// function of the root's declarations alone, made here, before any work (rule 65).
     fn proc_macro_harness(&mut self) {
-        let mut text = AString::new_in(self.alloc);
+        let mut text = BString::new_in(self.bump);
         text.push_str(HARNESS_HEAD);
         for &(kind, function) in self.harnessed.iter() {
             text.push_str(HARNESS_CLIENT);
@@ -2450,7 +2455,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             text.push_str("), ");
         }
         text.push_str("];\n");
-        let input: &'t str = blaze_own::Box::leak(text.into_boxed_str());
+        let input: &'t str = text.into_bump_str();
         let call = self.key(self.owner, HARNESS_TAG, HARNESS_PATH);
         let Some(parsed) = parse_path(HARNESS_PATH, self.krate, self.alloc) else {
             self.note(LowerNoteKind::MacroCallPathNotRead, 0, HARNESS_PATH);

@@ -114,17 +114,18 @@ pub(crate) enum Copying {}
 
 #[cfg(test)]
 impl Route for Copying {
-    fn section<'r>(_name: Name, _which: &'static str, bytes: &'r [u8], counts: &mut ReadCounts, alloc: Alloc<'r>) -> Result<&'r [u8], ReadError> {
+    fn section<'r>(_name: Name, _which: &'static str, bytes: &'r [u8], counts: &mut ReadCounts, _alloc: Alloc<'r>) -> Result<&'r [u8], ReadError> {
         counts.copied += bytes.len() as u64;
-        Ok(blaze_scope::resolve::aligned(bytes, alloc))
+        Ok(blaze_scope::resolve::aligned(bytes, blaze_own::testing::bump()))
     }
 
-    fn exports<'r>(_name: Name, bytes: &'r [u8], counts: &mut ReadCounts, alloc: Alloc<'r>) -> Result<&'r [u8], ReadError> {
+    fn exports<'r>(_name: Name, bytes: &'r [u8], counts: &mut ReadCounts, _alloc: Alloc<'r>) -> Result<&'r [u8], ReadError> {
         // Twice, as before: out of the store, then aligned again (names/scope.rs before this
         // reader: `work::payload` into the round's frame, then `aligned`).
         counts.copied += 2 * bytes.len() as u64;
-        let once = blaze_scope::resolve::aligned(bytes, alloc);
-        Ok(blaze_scope::resolve::aligned(once, alloc))
+        let bump = blaze_own::testing::bump();
+        let once = blaze_scope::resolve::aligned(bytes, bump);
+        Ok(blaze_scope::resolve::aligned(once, bump))
     }
 }
 
