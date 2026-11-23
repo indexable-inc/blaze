@@ -29,7 +29,7 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use core::cell::Cell;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use blaze_core::Mapping;
 use blaze_hash::{BuildKeyHasher, Map, MapOpts};
@@ -284,7 +284,7 @@ enum BloomSlot {
         offset: usize,
         blocks: u32,
         crc: u32,
-        verified: Cell<u8>,
+        state_idx: u32,
     },
     /// Built in memory during this process (after a commit or merge), already valid.
     Owned {
@@ -295,13 +295,24 @@ enum BloomSlot {
     },
 }
 
-/// Read-only, `Send + Sync`, zero-copy handle to a single verified segment Bloom filter, carried
-/// inside `Snapshot`'s listed segments so worker threads skip non-matching segments in ~2 ns.
+/// Shared mapped `bloom` sidecar and per-slot atomic verification states carried once by a
+/// `Snapshot` so taking a snapshot does not clone a `Mapping` per segment or eagerly CRC-hash
+/// filters for segments that are never probed.
+pub(crate) struct BloomMapped {
+    map: Mapping,
+    states: Arc<Vec<AtomicU8, Kept>, Kept>,
+}
+
+/// Read-only, `Send + Sync`, zero-copy handle to a single segment Bloom filter, carried
+/// inside `Snapshot`'s listed segments so worker threads skip non-matching segments in ~2 ns
+/// while verifying each mapped record's CRC lazily once on first probe.
 pub(crate) enum BloomRef {
     Mapped {
-        map: Mapping,
-        body_offset: usize,
+        offset: usize,
         blocks: u32,
+        crc: u32,
+        state_idx: u32,
+        trust_corrupt: bool,
     },
     Owned {
         record: Arc<Vec<u8, Kept>, Kept>,
@@ -312,13 +323,37 @@ pub(crate) enum BloomRef {
 impl BloomRef {
     /// Returns `false` only if `key` is guaranteed absent from this segment.
     #[inline]
-    pub(crate) fn may_contain(&self, key: &[u8; 32]) -> bool {
+    pub(crate) fn may_contain(&self, shared: Option<&BloomMapped>, key: &[u8; 32]) -> bool {
         match self {
-            BloomRef::Mapped { map, body_offset, blocks } => {
+            BloomRef::Mapped { offset, blocks, crc, state_idx, trust_corrupt } => {
+                let Some(shared) = shared else {
+                    return true;
+                };
                 let Some(body_len) = usize::try_from(*blocks).ok().and_then(|b| b.checked_mul(BLOCK_BYTES)) else {
                     return true;
                 };
-                let Some(body) = map.bytes().get(*body_offset..body_offset.saturating_add(body_len)) else {
+                let Some(end) = offset.checked_add(RECORD_HEADER).and_then(|it| it.checked_add(body_len)) else {
+                    return true;
+                };
+                let Some(record) = shared.map.bytes().get(*offset..end) else {
+                    return true;
+                };
+                let Some(slot_state) = usize::try_from(*state_idx).ok().and_then(|i| shared.states.get(i)) else {
+                    return true;
+                };
+                let state = slot_state.load(Ordering::Acquire);
+                if state == STATE_CORRUPT {
+                    return true;
+                }
+                if state == STATE_UNVERIFIED && !*trust_corrupt {
+                    if record_crc_valid(record, *crc) {
+                        slot_state.store(STATE_VALID, Ordering::Release);
+                    } else {
+                        slot_state.store(STATE_CORRUPT, Ordering::Release);
+                        return true;
+                    }
+                }
+                let Some(body) = record.get(RECORD_HEADER..) else {
                     return true;
                 };
                 probe_bytes(body, *blocks, key)
@@ -336,6 +371,8 @@ impl BloomRef {
 /// Per-store index of Bloom filters for segments in the manifest.
 pub(crate) struct BloomIndex {
     mapping: Option<Mapping>,
+    /// Shared per-slot atomic verification states for mapped records (1 allocation per open).
+    states: Option<Arc<Vec<AtomicU8, Kept>, Kept>>,
     /// Keyed by segment `id` (`u64::from_le_bytes(digest[0..8])`).
     entries: Map<u64, BloomSlot, BuildKeyHasher, Kept>,
     /// Total file size of the mapped `bloom` file when loaded (for dead-byte compaction heuristic).
@@ -346,6 +383,7 @@ impl BloomIndex {
     pub(crate) fn new() -> BloomIndex {
         BloomIndex {
             mapping: None,
+            states: None,
             entries: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: BLOOM_ALLOC, capacity: None }),
             mapped_bytes: 0,
         }
@@ -357,34 +395,65 @@ impl BloomIndex {
         self.mapping = Some(map);
     }
 
-    /// Walks framed headers in the mapped `bloom` file in O(records) (touching only 48 bytes per
-    /// record, zero body CRC checks) and indexes records whose `digest` matches a segment in
-    /// `segments`. Any trailing torn/foreign bytes stop the walk cleanly without failing open.
+    /// Returns a shared handle to the mapped `bloom` file and verification states for `Snapshot`.
+    pub(crate) fn shared_mapped(&self) -> Option<BloomMapped> {
+        Some(BloomMapped { map: self.mapping.as_ref()?.share(), states: self.states.as_ref()?.share() })
+    }
+
+    /// Walks framed headers in the mapped `bloom` file in O(records + segments) (touching only 48
+    /// bytes per record, zero body CRC checks) and indexes records whose `digest` matches a
+    /// segment in `segments`. Any trailing torn/foreign bytes stop the walk cleanly without
+    /// failing open.
     pub(crate) fn index_manifest(&mut self, segments: &[Segment]) {
         let Some(map) = self.mapping.as_ref() else {
             return;
         };
         let bytes = map.bytes();
+        let mut by_seg_id: Option<Map<u64, usize, BuildKeyHasher, Kept>> = if segments.len() > 16 {
+            let mut m = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: BLOOM_ALLOC, capacity: Some(segments.len()) });
+            for (i, seg) in segments.iter().enumerate() {
+                m.insert(seg.id, i);
+            }
+            Some(m)
+        } else {
+            None
+        };
+        let mut states = Vec::with_capacity_in(segments.len(), BLOOM_ALLOC);
         let mut at = 0usize;
         while at < bytes.len() {
             let Some(hdr) = parse_header(bytes, at) else {
                 break;
             };
             let id = segment_id_of(&hdr.digest);
-            if segments.iter().any(|seg| seg.id == id && seg.digest == hdr.digest) {
-                self.entries.insert(
-                    id,
-                    BloomSlot::Mapped {
-                        digest: hdr.digest,
-                        offset: at,
-                        blocks: hdr.blocks,
-                        crc: hdr.crc,
-                        verified: Cell::new(STATE_UNVERIFIED),
-                    },
-                );
+            let matched = if let Some(ref map_ids) = by_seg_id {
+                map_ids
+                    .get(&id)
+                    .and_then(|&idx| segments.get(idx))
+                    .is_some_and(|seg| seg.digest == hdr.digest)
+                    || segments.iter().any(|seg| seg.id == id && seg.digest == hdr.digest)
+            } else {
+                segments.iter().any(|seg| seg.id == id && seg.digest == hdr.digest)
+            };
+            if matched {
+                let state_idx = u32::try_from(states.len()).unwrap_or(u32::MAX);
+                if state_idx != u32::MAX {
+                    states.push(AtomicU8::new(STATE_UNVERIFIED));
+                    self.entries.insert(
+                        id,
+                        BloomSlot::Mapped {
+                            digest: hdr.digest,
+                            offset: at,
+                            blocks: hdr.blocks,
+                            crc: hdr.crc,
+                            state_idx,
+                        },
+                    );
+                }
             }
             at = at.saturating_add(hdr.record_len);
         }
+        let _ = by_seg_id.take();
+        self.states = Some(Arc::new_in(states, BLOOM_ALLOC));
     }
 
     /// Inserts a newly built framed record (from a commit or merge in this process) into memory.
@@ -406,11 +475,14 @@ impl BloomIndex {
             return true;
         };
         match slot {
-            BloomSlot::Mapped { digest, offset, blocks, crc, verified } => {
+            BloomSlot::Mapped { digest, offset, blocks, crc, state_idx } => {
                 if *digest != seg.digest {
                     return true;
                 }
                 let Some(map) = self.mapping.as_ref() else {
+                    return true;
+                };
+                let Some(slot_state) = self.states.as_ref().and_then(|s| usize::try_from(*state_idx).ok().and_then(|i| s.get(i))) else {
                     return true;
                 };
                 let Some(body_len) = usize::try_from(*blocks).ok().and_then(|b| b.checked_mul(BLOCK_BYTES)) else {
@@ -422,15 +494,15 @@ impl BloomIndex {
                 let Some(record) = map.bytes().get(*offset..end) else {
                     return true;
                 };
-                let state = verified.get();
+                let state = slot_state.load(Ordering::Acquire);
                 if state == STATE_CORRUPT {
                     return true;
                 }
                 if state == STATE_UNVERIFIED && !trust_corrupt {
                     if record_crc_valid(record, *crc) {
-                        verified.set(STATE_VALID);
+                        slot_state.store(STATE_VALID, Ordering::Release);
                     } else {
-                        verified.set(STATE_CORRUPT);
+                        slot_state.store(STATE_CORRUPT, Ordering::Release);
                         return true;
                     }
                 }
@@ -451,33 +523,21 @@ impl BloomIndex {
         }
     }
 
-    /// Produces a verified, `Send + Sync` [`BloomRef`] for `seg` to attach to a `Snapshot`.
-    /// Verifies the mapped record's CRC if not yet verified; returns `None` if absent or corrupt.
-    pub(crate) fn verified_ref(&self, seg: &Segment, trust_corrupt: bool) -> Option<BloomRef> {
+    /// Produces a lightweight `Send + Sync` [`BloomRef`] for `seg` to attach to a `Snapshot`.
+    /// Defers mapped-record CRC verification lazily to the first probe of `seg` (zero page faults
+    /// and zero CRC hashing during `Snapshot::of`); returns `None` if absent or already known corrupt.
+    pub(crate) fn snapshot_ref(&self, seg: &Segment, trust_corrupt: bool) -> Option<BloomRef> {
         let slot = self.entries.get(&seg.id)?;
         match slot {
-            BloomSlot::Mapped { digest, offset, blocks, crc, verified } => {
+            BloomSlot::Mapped { digest, offset, blocks, crc, state_idx } => {
                 if *digest != seg.digest {
                     return None;
                 }
-                let map = self.mapping.as_ref()?;
-                let body_len = usize::try_from(*blocks).ok()?.checked_mul(BLOCK_BYTES)?;
-                let body_offset = offset.checked_add(RECORD_HEADER)?;
-                let end = body_offset.checked_add(body_len)?;
-                let record = map.bytes().get(*offset..end)?;
-                let state = verified.get();
-                if state == STATE_CORRUPT {
+                let slot_state = self.states.as_ref().and_then(|s| usize::try_from(*state_idx).ok().and_then(|i| s.get(i)))?;
+                if !trust_corrupt && slot_state.load(Ordering::Acquire) == STATE_CORRUPT {
                     return None;
                 }
-                if state == STATE_UNVERIFIED && !trust_corrupt {
-                    if record_crc_valid(record, *crc) {
-                        verified.set(STATE_VALID);
-                    } else {
-                        verified.set(STATE_CORRUPT);
-                        return None;
-                    }
-                }
-                Some(BloomRef::Mapped { map: map.share(), body_offset, blocks: *blocks })
+                Some(BloomRef::Mapped { offset: *offset, blocks: *blocks, crc: *crc, state_idx: *state_idx, trust_corrupt })
             }
             BloomSlot::Owned { digest, blocks, record } => {
                 if *digest != seg.digest {
@@ -492,23 +552,24 @@ impl BloomIndex {
     pub(crate) fn raw_record(&self, seg: &Segment) -> Option<&[u8]> {
         let slot = self.entries.get(&seg.id)?;
         match slot {
-            BloomSlot::Mapped { digest, offset, blocks, crc, verified } => {
+            BloomSlot::Mapped { digest, offset, blocks, crc, state_idx } => {
                 if *digest != seg.digest {
                     return None;
                 }
                 let map = self.mapping.as_ref()?;
+                let slot_state = self.states.as_ref().and_then(|s| usize::try_from(*state_idx).ok().and_then(|i| s.get(i)))?;
                 let body_len = usize::try_from(*blocks).ok()?.checked_mul(BLOCK_BYTES)?;
                 let end = offset.checked_add(RECORD_HEADER)?.checked_add(body_len)?;
                 let record = map.bytes().get(*offset..end)?;
-                let state = verified.get();
+                let state = slot_state.load(Ordering::Acquire);
                 if state == STATE_CORRUPT {
                     return None;
                 }
                 if state == STATE_UNVERIFIED {
                     if record_crc_valid(record, *crc) {
-                        verified.set(STATE_VALID);
+                        slot_state.store(STATE_VALID, Ordering::Release);
                     } else {
-                        verified.set(STATE_CORRUPT);
+                        slot_state.store(STATE_CORRUPT, Ordering::Release);
                         return None;
                     }
                 }
@@ -529,7 +590,14 @@ impl BloomIndex {
             return false;
         };
         match slot {
-            BloomSlot::Mapped { digest, verified, .. } => *digest == seg.digest && verified.get() != STATE_CORRUPT,
+            BloomSlot::Mapped { digest, state_idx, .. } => {
+                *digest == seg.digest
+                    && self
+                        .states
+                        .as_ref()
+                        .and_then(|s| usize::try_from(*state_idx).ok().and_then(|i| s.get(i)))
+                        .is_some_and(|st| st.load(Ordering::Acquire) != STATE_CORRUPT)
+            }
             BloomSlot::Owned { digest, .. } => *digest == seg.digest,
         }
     }

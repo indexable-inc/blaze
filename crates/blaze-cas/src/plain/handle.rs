@@ -461,7 +461,7 @@ impl<D: Driver, S: Allocator + Clone> Store for PlainStore<D, S> {
         // Each slice replaces at least one segment, so one a segment (and one to say there is
         // no more) bounds them.
         let most = writer.core().segments().len() as u32 + 1;
-        let slices = writer.slices(most)?;
+        let slices = writer.compact_foreground(most)?;
         self.refresh(&writer);
         let mut out = Compacted::default();
         for it in &slices {

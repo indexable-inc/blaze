@@ -1032,9 +1032,19 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         self.inner.borrow_mut().store.seal().map_err(stopped("sealing the exit tail"))
     }
 
+    /// Foreground exit-tail seal at the calling thread's current priority (`Driven::seal_foreground`).
+    pub fn seal_foreground(&self) -> Result<bool, LentError> {
+        self.inner.borrow_mut().store.seal_foreground().map_err(stopped("sealing the exit tail"))
+    }
+
     /// After the answer: at most `slices` compaction slices (`Driven::compact`).
     pub fn compact(&self, slices: u32) -> Result<Vec<Sliced, A>, LentError> {
         self.inner.borrow_mut().store.compact(slices).map_err(stopped("compacting"))
+    }
+
+    /// Foreground compaction at the calling thread's current priority (`Driven::compact_foreground`).
+    pub fn compact_foreground(&self, slices: u32) -> Result<Vec<Sliced, A>, LentError> {
+        self.inner.borrow_mut().store.compact_foreground(slices).map_err(stopped("compacting"))
     }
 
     /// After the answer, before its commit: one cleanup slice written with no lock, which the

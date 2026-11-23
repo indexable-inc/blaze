@@ -337,7 +337,12 @@ pub(crate) fn run_with(
     if store_exists {
         let lent = home.open_store_with_liveness(&settings, facts, Liveness::Reached, heap.alloc())?;
         summary.bytes_before = lent.total_bytes();
-        let ran = lent.compact(GC_SLICES_MOST).map_err(|error| CliError::Store(StoreFailure::Place(PlaceError::Lent(error))))?;
+        let ran = if opts.background {
+            lent.compact(GC_SLICES_MOST)
+        } else {
+            lent.compact_foreground(GC_SLICES_MOST)
+        }
+        .map_err(|error| CliError::Store(StoreFailure::Place(PlaceError::Lent(error))))?;
         let mut totals = Sliced::default();
         for slice in &ran {
             if !slice.aborted {
@@ -349,7 +354,12 @@ pub(crate) fn run_with(
         }
         summary.evicted_roots = totals.evicted_roots;
         summary.files_unlinked = totals.removed;
-        let _ = lent.seal().map_err(|error| CliError::Store(StoreFailure::Place(PlaceError::Lent(error))))?;
+        let _ = if opts.background {
+            lent.seal()
+        } else {
+            lent.seal_foreground()
+        }
+        .map_err(|error| CliError::Store(StoreFailure::Place(PlaceError::Lent(error))))?;
         summary.bytes_after = lent.total_bytes();
         drop(lent);
     }
