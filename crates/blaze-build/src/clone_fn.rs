@@ -61,6 +61,20 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 }
                 Some(parts.env)
             }
+            PNode::Adt(adt_key, adt_args) => {
+                let facts = self.adts.facts();
+                let adt = facts.adt(adt_key).ok_or_else(|| malformed("a builtin `clone` of an ADT whose facts the world did not answer"))?;
+                if adt.kind != blaze_typeck::AdtKind::Struct || adt.variants.len() != 1 {
+                    return Err(malformed("a builtin `clone` of an ADT that is not a struct"));
+                }
+                let mut a = blaze_own::Vec::new_in(self.alloc);
+                a.extend_from_slice(self.ground.view().list(adt_args).map_err(past)?);
+                for f in adt.fields.iter() {
+                    let g = crate::instance::ground(adt.types, f.ty, &a, self.ground, self.scratch, facts)?;
+                    fields.push(g);
+                }
+                if fields.is_empty() { None } else { Some(me) }
+            }
             _ => return Err(malformed("a builtin `clone` of a type whose `Clone` the language does not give")),
         };
         // A fn item or fn pointer has no field: its clone is its bytes (the ladder asks no

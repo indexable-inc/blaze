@@ -568,6 +568,9 @@ impl TypeAttrs {
     pub const PACKED: u32 = 128;
     /// Bits 8..12: an enum's discriminant type ([`DiscrRepr`]); 0 is `Unread`.
     const DISCR: u32 = 0xf << 8;
+    /// Blaze edition: transparent all-`pub` struct eligible for automatic `Copy`/`Clone`
+    /// (`blaze_solve::facts::AdtFlags::AUTO_COPY_PUB`). Bit 12.
+    pub const AUTO_COPY_PUB: u32 = 1 << 12;
 
     /// These attributes with an enum's discriminant type set.
     pub const fn with_discr(self, d: DiscrRepr) -> Self {

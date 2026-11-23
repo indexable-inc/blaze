@@ -37,10 +37,10 @@ use blaze_own::{Alloc, Vec};
 
 use crate::assembly::{BuiltinSource, Cand, Cx, Rule as CandRule, Source, Step};
 use crate::error::{Limit, Malformed, ParamHead, SolveError, Stop, Unsupported};
-use crate::facts::{AdtFlags, Facts, FnSigDef, Portable, TraitDef, TraitFlags};
+use crate::facts::{AdtFlags, Facts, FnSigDef, ImplPolarity, Portable, TraitDef, TraitFlags};
 use crate::fold::{self, Scratch};
 use crate::term::{
-    AliasKind, Certainty, Children, Def, Flags, GoalSource, Lang, List, Mutbl, Polarity, Pred, Rigid, Safety, Ty, TyKind,
+    AliasKind, Certainty, Children, Def, Flags, GoalSource, Lang, List, Mutbl, Polarity, Pred, Rigid, Safety, Shape, Ty, TyKind,
     UintTy, Var, VarKind, children, CLOSURE_FN, CLOSURE_FN_MUT, CLOSURE_FN_ONCE,
 };
 use crate::trait_goals::TraitGoal;
@@ -942,10 +942,32 @@ fn step_copy_clone<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> 
         | TyKind::Slice(_)
         | TyKind::Foreign(_)
         | TyKind::Ref(_, _, Mutbl::Mut)
-        | TyKind::Adt(..)
         | TyKind::Alias(..)
         | TyKind::Param(_)
         | TyKind::Placeholder(..) => return Ok(Step::No),
+        TyKind::Adt(def, args) => {
+            // Check explicit positive/negative impls first so ADTs with explicit `Copy`/`Clone`
+            // impls never incur an extra `Question::Adt` read (they already read `Impls` and
+            // `ImplHeader` in `assemble_impls` / `step_impl`).
+            if has_explicit_adt_impl(cx, cand.d, def, cand.a, false)? {
+                return Ok(Step::No);
+            }
+            let adt = cx.adt(def)?;
+            if !adt.flags.has(AdtFlags::STRUCT)
+                || !adt.flags.has(AdtFlags::AUTO_COPY_PUB)
+                || adt.flags.has(AdtFlags::HAS_DROP)
+            {
+                return Ok(Step::No);
+            }
+            // `Copy: Clone`: a negative `impl !Clone` also disqualifies automatic `Copy`.
+            if cx.lang(Lang::Copy)? == Some(cand.d)
+                && let Some(clone) = cx.lang(Lang::Clone)?
+                && has_explicit_adt_impl(cx, clone, def, cand.a, true)?
+            {
+                return Ok(Step::No);
+            }
+            adt_fields(cx, def, args, &mut tys)?;
+        }
         // An async coroutine is immovable: never `Copy` or `Clone`.
         TyKind::Coroutine(..) => return Ok(Step::No),
         TyKind::Tuple(l) | TyKind::Record(_, l) | TyKind::Union(l) => tys.extend_from_slice(&cx.list_small(l)),
@@ -959,6 +981,94 @@ fn step_copy_clone<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> 
     }
     add_constituent_goals(cx, cand.d, &tys)?;
     Ok(Step::Done(Certainty::Yes))
+}
+
+/// Whether `trait_` has any non-reservation explicit impl (or, when `negative_only`, any negative
+/// impl) whose self type relates with `self_ty` (an `Adt(def, _)`): disqualifies automatic
+/// `AUTO_COPY_PUB` so explicit positive impls win without ambiguity and negative impls reject.
+fn has_explicit_adt_impl<T: Tys, F: Facts>(
+    cx: &mut Cx<'_, '_, T, F>,
+    trait_: Def,
+    def: Def,
+    self_ty: Ty,
+    negative_only: bool,
+) -> Result<bool, Stop> {
+    let set = cx.impls(trait_, Shape::Adt(def))?;
+    for &imp in set.impls {
+        let h = cx.impl_header(imp)?;
+        let relevant_polarity = match h.polarity {
+            ImplPolarity::Reservation => false,
+            ImplPolarity::Positive => !negative_only,
+            ImplPolarity::Negative => true,
+        };
+        if !relevant_polarity {
+            continue;
+        }
+        if h.args.len == 0 {
+            return Err(malformed());
+        }
+        let start = usize::try_from(h.args.start).map_err(|_| malformed())?;
+        let Some(&s) = h.portable.lists.get(start) else {
+            return Err(malformed());
+        };
+        let node = usize::try_from(s.0).map_err(|_| malformed())?;
+        let Some(&sk) = h.portable.nodes.get(node) else {
+            return Err(malformed());
+        };
+        match sk {
+            TyKind::Param(_) => return Ok(true),
+            TyKind::Adt(hd, hl) if hd == def => {
+                if portable_adt_all_distinct_params(h.portable, hl)? {
+                    return Ok(true);
+                }
+            }
+            _ => continue,
+        }
+        let snap = cx.tys.snapshot();
+        let added = cx.added.len();
+        let matched = (|| -> Result<bool, Stop> {
+            let impl_args = cx.fresh_impl_args_of(imp, &h)?;
+            let hdr_self = cx.import(h.portable, s, impl_args)?;
+            cx.eq(self_ty, hdr_self)
+        })();
+        cx.added.truncate(added);
+        cx.tys.rollback_to(snap);
+        if matched? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `hl` in `p` consists solely of distinct generic parameters (so `Adt<P0, P1, ..>`
+/// unconditionally matches every instantiation of that ADT without importing any term).
+fn portable_adt_all_distinct_params(p: Portable<'_>, hl: List) -> Result<bool, Stop> {
+    let start = usize::try_from(hl.start).map_err(|_| malformed())?;
+    let len = usize::try_from(hl.len).map_err(|_| malformed())?;
+    let end = start.checked_add(len).ok_or_else(malformed)?;
+    let Some(items) = p.lists.get(start..end) else {
+        return Err(malformed());
+    };
+    for (i, &t) in items.iter().enumerate() {
+        let idx = usize::try_from(t.0).map_err(|_| malformed())?;
+        let Some(&k) = p.nodes.get(idx) else {
+            return Err(malformed());
+        };
+        let param = match k {
+            TyKind::Param(x) | TyKind::ConstParam(x) => x,
+            _ => return Ok(false),
+        };
+        for &prev in items.iter().take(i) {
+            let pidx = usize::try_from(prev.0).map_err(|_| malformed())?;
+            let Some(&pk) = p.nodes.get(pidx) else {
+                return Err(malformed());
+            };
+            if matches!(pk, TyKind::Param(y) | TyKind::ConstParam(y) if y == param) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// A known environment is a tuple, possibly still an inference variable during

@@ -420,6 +420,15 @@ pub struct TypeckBody<'a> {
     pub inline_fors: AVec<'a, InlineForSite>,
 }
 
+/// Whether an `inline for` iterates over one aggregate or lockstep-zips two (`zip_fields(lhs, rhs)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InlineForKind {
+    /// `inline for pat in iter { body }`.
+    Single { iter: ExprId },
+    /// `inline for pat in zip_fields(lhs, rhs) { body }`.
+    Zip { lhs: ExprId, rhs: ExprId },
+}
+
 /// One lowered `inline for pat in iter { body }` expression recorded on [`TypeckBody`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InlineForSite {
@@ -427,6 +436,7 @@ pub struct InlineForSite {
     pub pat: PatId,
     pub iter: ExprId,
     pub body: ExprId,
+    pub kind: InlineForKind,
 }
 
 impl<'a> TypeckBody<'a> {
@@ -1289,7 +1299,11 @@ impl Conv<'_, '_, '_, '_, '_> {
             Expr::Underscore => tc::Expr::Underscore,
             Expr::Await(e) => tc::Expr::Await(e),
             Expr::InlineFor { pat, iter, body } => {
-                self.out.inline_fors.push(InlineForSite { expr: e, pat, iter, body });
+                let kind = match zip_fields_call(self.v, iter)? {
+                    Some((lhs, rhs)) => InlineForKind::Zip { lhs, rhs },
+                    None => InlineForKind::Single { iter },
+                };
+                self.out.inline_fors.push(InlineForSite { expr: e, pat, iter, body, kind });
                 tc::Expr::Missing
             }
         })
@@ -1566,10 +1580,43 @@ pub fn to_typeck<'a>(
     Ok(c.out)
 }
 
+/// Recognizes `zip_fields(lhs, rhs)` as an `inline for` iterable, returning `(lhs, rhs)`.
+fn zip_fields_call(v: &View<'_>, iter: ExprId) -> Result<Option<(ExprId, ExprId)>, Refused> {
+    let Expr::Call { callee, args } = v.expr(iter)? else {
+        return Ok(None);
+    };
+    let Expr::Path(p) = v.expr(callee)? else {
+        return Ok(None);
+    };
+    let path = v.path(p)?;
+    if path.absolute || path.lang.is_some() {
+        return Ok(None);
+    }
+    let [seg] = v.segments(path)? else {
+        return Ok(None);
+    };
+    let s = Segment::decode(*seg)?;
+    if s.kind != SegKind::Ident || s.has_args || s.parenthesized {
+        return Ok(None);
+    }
+    let Some(name) = s.name else {
+        return Ok(None);
+    };
+    if v.name_text(name)? != "zip_fields" {
+        return Ok(None);
+    }
+    let [lhs, rhs] = *v.ids(args)? else {
+        return Ok(None);
+    };
+    Ok(Some((ExprId(lhs), ExprId(rhs))))
+}
+
 /// Prepares unexpanded `inline for pat in iter { body }` sites for the pre-unroll typeck pass:
-/// replaces each site expression with `{ iter; }` (so `blaze-typeck` infers and records
-/// `expr_ty[iter]` and types the expression as `()`), and blanks every unreachable expression
-/// and pattern inside `body` and `pat` to `Missing` so writeback never reports `Unreached`.
+/// replaces each single site with `{ iter; }` and each `zip_fields(lhs, rhs)` site with
+/// `{ lhs; rhs; }` (blanking the synthetic `zip_fields` call and path callee so `blaze-typeck`
+/// infers and records `expr_ty` for each iterable without resolving `zip_fields`), and blanks
+/// every unreachable expression and pattern inside `body` and `pat` to `Missing` so writeback
+/// never reports `Unreached`.
 fn wire_inline_fors<'a>(out: &mut TypeckBody<'a>, alloc: Alloc<'a>) {
     enum Work {
         Expr(ExprId),
@@ -1579,16 +1626,44 @@ fn wire_inline_fors<'a>(out: &mut TypeckBody<'a>, alloc: Alloc<'a>) {
 
     for i in 0..out.inline_fors.len() {
         let Some(&site) = out.inline_fors.get(i) else { continue };
-        let stmt_id = StmtId(len(out.stmts.len()));
-        out.stmts.push(tc::Stmt::Expr { expr: site.iter, semi: true });
-        let start = len(out.stmt_lists.len());
-        out.stmt_lists.push(stmt_id);
-        if let Some(slot) = out.exprs.get_mut(site.expr.ix()) {
-            *slot = tc::Expr::Block {
-                stmts: List { start, len: 1 },
-                tail: None,
-                scope: ScopeId(0),
-            };
+        match site.kind {
+            InlineForKind::Single { iter } => {
+                let stmt_id = StmtId(len(out.stmts.len()));
+                out.stmts.push(tc::Stmt::Expr { expr: iter, semi: true });
+                let start = len(out.stmt_lists.len());
+                out.stmt_lists.push(stmt_id);
+                if let Some(slot) = out.exprs.get_mut(site.expr.ix()) {
+                    *slot = tc::Expr::Block {
+                        stmts: List { start, len: 1 },
+                        tail: None,
+                        scope: ScopeId(0),
+                    };
+                }
+            }
+            InlineForKind::Zip { lhs, rhs } => {
+                if let Some(call_slot) = out.exprs.get_mut(site.iter.ix()) {
+                    let prev = core::mem::replace(call_slot, tc::Expr::Missing);
+                    if let tc::Expr::Call { callee, .. } = prev
+                        && let Some(callee_slot) = out.exprs.get_mut(callee.ix())
+                    {
+                        *callee_slot = tc::Expr::Missing;
+                    }
+                }
+                let lhs_stmt = StmtId(len(out.stmts.len()));
+                out.stmts.push(tc::Stmt::Expr { expr: lhs, semi: true });
+                let rhs_stmt = StmtId(len(out.stmts.len()));
+                out.stmts.push(tc::Stmt::Expr { expr: rhs, semi: true });
+                let start = len(out.stmt_lists.len());
+                out.stmt_lists.push(lhs_stmt);
+                out.stmt_lists.push(rhs_stmt);
+                if let Some(slot) = out.exprs.get_mut(site.expr.ix()) {
+                    *slot = tc::Expr::Block {
+                        stmts: List { start, len: 2 },
+                        tail: None,
+                        scope: ScopeId(0),
+                    };
+                }
+            }
         }
     }
 

@@ -1137,10 +1137,15 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
             // `repr(packed)` in any form (`packed(N)`, `C, packed`): the layout's own fact
             // (`ReprAttrs::packed`), answered for the capture analysis (TypeAttrs::PACKED).
             let packed = if a.repr.packed.is_some() { TypeAttrs::PACKED } else { 0 };
+            let auto_copy = if a.kind == tc::AdtKind::Struct && self.store.is_auto_copy_pub(self.names, self.keys, item) {
+                TypeAttrs::AUTO_COPY_PUB
+            } else {
+                0
+            };
             return Ok(match a.kind {
                 tc::AdtKind::Enum => TypeAttrs(args).with_discr(super::heads::discr_ty(a.repr)),
-                tc::AdtKind::Struct if a.repr.simd => TypeAttrs(TypeAttrs::SIMD | args | packed),
-                _ => TypeAttrs(args | packed),
+                tc::AdtKind::Struct if a.repr.simd => TypeAttrs(TypeAttrs::SIMD | args | packed | auto_copy),
+                _ => TypeAttrs(args | packed | auto_copy),
             });
         }
         if let Some(f) = self.store.fns.get(&item) {

@@ -3,6 +3,7 @@
 
 pub mod plant;
 
+mod auto_copy_pub;
 mod cost;
 mod dyn_undecided;
 mod head_shape;

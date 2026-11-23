@@ -2711,7 +2711,7 @@ fn build_from<P: FrontEnd>(
             // to select; tabled as the block's owner (front2/coroutines.rs).
             // A builtin `Clone::clone` (a tuple's, a closure's, a fn item's or pointer's): built,
             // tabled at the trait's `clone` row, its `Self: Copy` asked here (clone_shim.rs).
-            let tabled_as = match clones.owner(program, &adts, world_of, called, &mut ground, alloc) {
+            let tabled_as = match clones.owner_non_adt(program, &adts, world_of, called, &mut ground, alloc) {
                 Some(Ok(c)) => Some(c),
                 Some(Err(e)) => {
                     let refusal = match e {
@@ -2765,6 +2765,62 @@ fn build_from<P: FrontEnd>(
                 Err(blaze_typeck::ResolveError::Missing(_)) if may_ask => {
                     ask_again = true;
                     break;
+                }
+                Err(blaze_typeck::ResolveError::NoImpl { trait_, item: err_item }) => {
+                    match clones.owner_adt(program, &adts, world_of, called, trait_, &mut ground, alloc) {
+                        Some(Ok(c)) => {
+                            match key_of(program, c, called, &mut ground, &adts) {
+                                Ok(key) => {
+                                    via.push(Via::Slot);
+                                    targets.push(Target::Slot(reached.slot(called, c, key)?));
+                                }
+                                Err(e) if may_ask && asks_again(&e) => {
+                                    ask_again = true;
+                                    break;
+                                }
+                                Err(e) => match unresolved(&mut survey, &mut reached, called, i, e)? {
+                                    Some(slot) => {
+                                        via.push(Via::Slot);
+                                        targets.push(Target::Slot(slot));
+                                    }
+                                    None => broken = true,
+                                },
+                            }
+                            continue;
+                        }
+                        Some(Err(crate::clone_shim::NoteError::Resolve(blaze_typeck::ResolveError::Missing(_)))) if may_ask => {
+                            ask_again = true;
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            let refusal = match e {
+                                crate::clone_shim::NoteError::Resolve(error) => {
+                                    let at = crate::callee_shown::self_shown(program, ground.view(), called.args);
+                                    RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), at, error }
+                                }
+                                crate::clone_shim::NoteError::Build(error) => RunError::Build { function: name(), error, range: None },
+                            };
+                            match unresolved(&mut survey, &mut reached, called, i, refusal)? {
+                                Some(slot) => {
+                                    via.push(Via::Slot);
+                                    targets.push(Target::Slot(slot));
+                                }
+                                None => broken = true,
+                            }
+                            continue;
+                        }
+                        None => {
+                            let refusal = resolve_refusal(program, &adts, &ground, name(), called, blaze_typeck::ResolveError::NoImpl { trait_, item: err_item });
+                            match unresolved(&mut survey, &mut reached, called, i, refusal)? {
+                                Some(slot) => {
+                                    via.push(Via::Slot);
+                                    targets.push(Target::Slot(slot));
+                                }
+                                None => broken = true,
+                            }
+                            continue;
+                        }
+                    }
                 }
                 Err(error) => {
                     let refusal = resolve_refusal(program, &adts, &ground, name(), called, error);

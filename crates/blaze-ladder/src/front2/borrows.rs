@@ -862,6 +862,233 @@ fn container_head<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, lib: blaze
     wants.iter().all(|&w| ensure_one(r, w))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyImpl {
+    None,
+    Positive,
+    Negative,
+}
+
+/// Whether `trait_` has a positive, negative, or no explicit impl for `adt`.
+fn copy_impl_state<'n, 'a, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    trait_: Option<tc::ItemKey>,
+    adt: tc::ItemKey,
+    alloc: Alloc<'a>,
+) -> Result<CopyImpl, ImplsUnknown> {
+    let trait_ = trait_.ok_or(ImplsUnknown::NoLangItem)?;
+    let shape = tc::Shape::Adt(adt);
+    let mut list: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+    if let Some(v) = answer_impls(r, trait_, shape) {
+        list.extend_from_slice(&v);
+    } else {
+        let b = r.buckets.as_ref().ok_or(ImplsUnknown::NotAnswered)?;
+        if let Some(got) = b.impls_of(trait_, shape)
+            && !got.is_empty()
+        {
+            list.extend_from_slice(got);
+        } else {
+            return match b.trait_gap(trait_, shape) {
+                Some((candidate, why)) => {
+                    use core::fmt::Write;
+                    let mut said = Words::EMPTY;
+                    let _ = write!(said, "candidate {candidate:x}, header `");
+                    match r.names.signature_text_of(candidate) {
+                        Some(t) => {
+                            for (i, word) in t.impl_header.unwrap_or(t.text).split_whitespace().take(24).enumerate() {
+                                let _ = write!(said, "{}{word}", if i == 0 { "" } else { " " });
+                            }
+                        }
+                        None => {
+                            let _ = write!(said, "(no text)");
+                        }
+                    }
+                    let _ = write!(said, "`: {why}");
+                    Err(ImplsUnknown::RefusedCandidate { candidate, krate: b.krate(candidate), why: said })
+                }
+                None => Err(ImplsUnknown::NotAnswered),
+            };
+        }
+    }
+    if list.is_empty() {
+        return Ok(CopyImpl::None);
+    }
+    let mut saw_neg = false;
+    for &imp in list.iter() {
+        if !r.store.impls.contains_key(&imp)
+            && let Some(lib) = r.keys.library_in(r.names, imp)
+        {
+            let _ = ensure_one(r, Want::Impl(lib));
+        }
+        match r.store.impls.get(&imp).map(|h| h.polarity) {
+            Some(tc::ImplPolarity::Positive) | None => return Ok(CopyImpl::Positive),
+            Some(tc::ImplPolarity::Negative) => saw_neg = true,
+            Some(tc::ImplPolarity::Reservation) => {}
+        }
+    }
+    Ok(if saw_neg { CopyImpl::Negative } else { CopyImpl::None })
+}
+
+/// Whether an `AUTO_COPY_PUB` struct `root` is `Copy` (for instantiations where its required
+/// generic parameters are `Copy`), pushing its required-parameter mask onto `need` when
+/// `generics > 0`. Iterative worklist (no recursion), bounded to 256 steps.
+fn auto_copy_of<'n, 'a, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    langs: BorrowLangs,
+    root: tc::ItemKey,
+    need: &mut AVec<'a, bool>,
+    alloc: Alloc<'a>,
+) -> Option<(bool, Option<(u32, u32)>)> {
+    let generics = r.store.adts.get(&root)?.generics;
+    let g_usize = usize::try_from(generics).ok()?;
+    let start = need.len();
+    for _ in 0..g_usize {
+        need.push(false);
+    }
+    let mut stack: AVec<'a, (tc::PTy, Option<usize>)> = AVec::new_in(alloc);
+    let mut envs: AVec<'a, (Option<usize>, tc::List)> = AVec::new_in(alloc);
+    let mut nested_need: AVec<'a, bool> = AVec::new_in(alloc);
+    if let Some(row) = r.store.adts.get(&root) {
+        for f in row.fields.iter() {
+            stack.push((f.ty, None));
+        }
+    }
+    let mut steps = 0u32;
+    while let Some((ty, env)) = stack.pop() {
+        steps += 1;
+        if steps > 256 {
+            need.truncate(start);
+            return Some((false, None));
+        }
+        let Ok(node) = r.store.tys.view().node(ty) else {
+            need.truncate(start);
+            return Some((false, None));
+        };
+        match node {
+            tc::PNode::Bool
+            | tc::PNode::Char
+            | tc::PNode::Int(_)
+            | tc::PNode::Uint(_)
+            | tc::PNode::Float(_)
+            | tc::PNode::Never
+            | tc::PNode::Ptr(..)
+            | tc::PNode::FnDef(..)
+            | tc::PNode::FnPtr(..)
+            | tc::PNode::ConstValue { .. }
+            | tc::PNode::ConstParam(_)
+            | tc::PNode::Ref(tc::Mutbl::Not, _) => {}
+            tc::PNode::Array(inner, _) | tc::PNode::Pat(inner, _) => {
+                stack.push((inner, env));
+            }
+            tc::PNode::Tuple(l) | tc::PNode::Record(_, l) | tc::PNode::Union(l) => {
+                let Ok(items) = r.store.tys.view().list(l) else {
+                    need.truncate(start);
+                    return Some((false, None));
+                };
+                for &item in items {
+                    stack.push((item, env));
+                }
+            }
+            tc::PNode::Param(p) => match env {
+                None => {
+                    let Ok(pi) = usize::try_from(p) else {
+                        need.truncate(start);
+                        return Some((false, None));
+                    };
+                    if let Some(slot) = need.get_mut(start + pi) {
+                        *slot = true;
+                    } else {
+                        need.truncate(start);
+                        return Some((false, None));
+                    }
+                }
+                Some(e) => {
+                    let &(parent, args_list) = envs.get(e)?;
+                    let Ok(items) = r.store.tys.view().list(args_list) else {
+                        need.truncate(start);
+                        return Some((false, None));
+                    };
+                    let Ok(pi) = usize::try_from(p) else {
+                        need.truncate(start);
+                        return Some((false, None));
+                    };
+                    let Some(&arg) = items.get(pi) else {
+                        need.truncate(start);
+                        return Some((false, None));
+                    };
+                    stack.push((arg, parent));
+                }
+            },
+            tc::PNode::Adt(nested_k, nested_args) => {
+                if !r.store.adts.contains_key(&nested_k)
+                    && let Some(lib) = r.keys.library_in(r.names, nested_k)
+                {
+                    let _ = ensure_one(r, Want::Adt(lib));
+                }
+                match copy_impl_state(r, langs.copy, nested_k, alloc) {
+                    Ok(CopyImpl::Positive) => {
+                        nested_need.clear();
+                        let mask = fields::copy_args_of(r, langs, nested_k, Some(true), &mut nested_need, alloc);
+                        let Ok(args) = r.store.tys.view().list(nested_args) else {
+                            need.truncate(start);
+                            return Some((false, None));
+                        };
+                        match mask {
+                            Some((ms, ml))
+                                if usize::try_from(ml).ok() == Some(args.len())
+                                    && let Ok(ms_u) = usize::try_from(ms)
+                                    && let Some(flags) = nested_need.get(ms_u..ms_u + args.len()) =>
+                            {
+                                for (&a, &req) in args.iter().zip(flags.iter()) {
+                                    if req {
+                                        stack.push((a, env));
+                                    }
+                                }
+                            }
+                            _ => {
+                                for &a in args {
+                                    stack.push((a, env));
+                                }
+                            }
+                        }
+                    }
+                    Ok(CopyImpl::None)
+                        if r.store.is_auto_copy_pub(r.names, r.keys, nested_k)
+                            && matches!(has_impl(r, langs.drop, nested_k), Ok(false) | Err(ImplsUnknown::NoLangItem))
+                            && !matches!(copy_impl_state(r, langs.clone, nested_k, alloc), Ok(CopyImpl::Negative)) =>
+                    {
+                        let env_id = envs.len();
+                        envs.push((env, nested_args));
+                        if let Some(nrow) = r.store.adts.get(&nested_k) {
+                            for f in nrow.fields.iter() {
+                                stack.push((f.ty, Some(env_id)));
+                            }
+                        } else {
+                            need.truncate(start);
+                            return Some((false, None));
+                        }
+                    }
+                    _ => {
+                        need.truncate(start);
+                        return Some((false, None));
+                    }
+                }
+            }
+            _ => {
+                need.truncate(start);
+                return Some((false, None));
+            }
+        }
+    }
+    if g_usize == 0 {
+        need.truncate(start);
+        return Some((true, None));
+    }
+    let start_u32 = u32::try_from(start).ok()?;
+    let len_u32 = u32::try_from(g_usize).ok()?;
+    Some((true, Some((start_u32, len_u32))))
+}
+
 /// Whether `trait_` has an impl for the ADT `adt`: refused when the question could not be
 /// answered (no such lang item, or the selection could not be made), with why.
 fn has_impl<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, trait_: Option<tc::ItemKey>, adt: tc::ItemKey) -> Result<bool, ImplsUnknown> {
@@ -1202,15 +1429,15 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         let regions = row.field_regions.clone();
         let field_count = row.fields.len();
         let variant_count = row.variants.len();
-        let copy = has_impl(r, langs.copy, key);
+        let copy_state = copy_impl_state(r, langs.copy, key, alloc);
         // A `Copy` type has no `Drop` impl: the Reference, "Special types and traits", `Copy`:
         // "Copy cannot be implemented for types that implement Drop" (rustc E0184), so YES to
         // `Copy` is NO to `Drop` without asking (an unread candidate cannot be its `Drop`).
-        let drop_impl = match copy {
-            Ok(true) => Ok(false),
+        let drop_impl = match copy_state {
+            Ok(CopyImpl::Positive) => Ok(false),
             _ => has_impl(r, langs.drop, key),
         };
-        if let Err(why) = copy {
+        if let Err(why) = copy_state {
             g.unknown.push((k, "Copy"));
             g.unknown_why.push(why);
         }
@@ -1218,13 +1445,36 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             g.unknown.push((k, "Drop"));
             g.unknown_why.push(why);
         }
-        let (copy, drop_impl) = (copy.ok(), drop_impl.ok());
-        // Which arguments the one `Copy` impl needs `Copy` (borrow_fields.rs); ADTs are taken
-        // in key order, so `copy_args` stays sorted.
-        let copy_need = match plant {
-            FactsPlant::NoCopyArgs => None,
-            _ => fields::copy_args_of(r, langs, key, copy, &mut g.copy_need, alloc),
+        let no_drop = matches!(drop_impl, Ok(false) | Err(ImplsUnknown::NoLangItem));
+        let (copy, copy_need) = match copy_state {
+            Ok(CopyImpl::Positive) => {
+                let copy = Some(true);
+                let copy_need = match plant {
+                    FactsPlant::NoCopyArgs => None,
+                    _ => fields::copy_args_of(r, langs, key, copy, &mut g.copy_need, alloc),
+                };
+                (copy, copy_need)
+            }
+            Ok(CopyImpl::None)
+                if no_drop
+                    && r.store.is_auto_copy_pub(r.names, r.keys, key)
+                    && !matches!(copy_impl_state(r, langs.clone, key, alloc), Ok(CopyImpl::Negative)) =>
+            {
+                match auto_copy_of(r, langs, key, &mut g.copy_need, alloc) {
+                    Some((true, mask)) => {
+                        let copy_need = match plant {
+                            FactsPlant::NoCopyArgs => None,
+                            _ => mask,
+                        };
+                        (Some(true), copy_need)
+                    }
+                    _ => (Some(false), None),
+                }
+            }
+            Ok(CopyImpl::None | CopyImpl::Negative) => (Some(false), None),
+            Err(_) => (None, None),
         };
+        let drop_impl = drop_impl.ok();
         if let Some((start, len)) = copy_need {
             g.copy_args.push((k, start, len));
         }
