@@ -879,7 +879,7 @@ impl TreeRunner for ShelfTree<'_> {
         let output = RootId(u8::try_from(root_list.len()).map_err(|_| fail(&["more than 255 folders read by a process tree"]))?);
         root_list.push(Root { name: "a process tree's folder", kind: RootKind::Output });
         mounts.push(Mount { spelling: folder.as_bytes(), root: output });
-        let files = OutDir { root: output, folder: folder.as_str() };
+        let files = OutDir { root: output, folder: folder.as_str(), package_root: None };
 
         // 5. The world, its clock and the hermetic capability: one deadline for every step.
         let (world, _) = native_world(std::path::Path::new(setting.work)).map_err(|e| fail(&["the tree's world: ", &e.to_string()]))?;

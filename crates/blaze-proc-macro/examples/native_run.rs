@@ -158,7 +158,7 @@ fn main() -> ExitCode {
         let area = format!("{}/files", out_dir.rsplit_once('/').map_or("", |(parent, _)| parent));
         std::fs::create_dir_all(&area).unwrap_or_else(|e| panic!("{area}: {e}"));
         // An example's run: no record is kept, so any key names its trees.
-        let script = NativeScript { key: blaze_ids::ContentId([7; 32]), program: script, c, env: &env, reads: &[], shown: &[], host_tools: &tools, facts: None, jobs: None, limits: RunLimits::STANDARD, deadline: Duration::from_secs(600), files: &area };
+        let script = NativeScript { key: blaze_ids::ContentId([7; 32]), program: script, c, env: &env, reads: &[], shown: &[], host_tools: &tools, facts: None, jobs: None, confined: None, limits: RunLimits::STANDARD, deadline: Duration::from_secs(600), files: &area };
         let ran = match run_script(&script, alloc) {
             Ok(ran) => ran,
             Err(error) => {

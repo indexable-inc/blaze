@@ -164,6 +164,7 @@ fn run_once(name: &str, resolved: bool) -> Result<std::vec::Vec<(std::string::St
         host_tools: &[],
         facts: None,
         jobs: None,
+        confined: None,
         limits: RunLimits::STANDARD,
         deadline: Duration::from_secs(60),
         files: &files,

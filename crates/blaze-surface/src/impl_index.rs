@@ -679,6 +679,11 @@ impl<'a> NoImplsOfView<'a> {
         self.krate
     }
 
+    /// The sorted `trait_mark` table of traits implemented in this crate.
+    pub fn trait_marks(&self) -> &'a [u64] {
+        self.traits
+    }
+
     /// False when the crate has no impl of `trait_`: exact. True when it may, and always
     /// while the crate has an impl whose trait was not read ([`ImplFlags::TRAIT_UNREAD`],
     /// [`ImplFlags::BLIND`]): that impl may be of `trait_`.
