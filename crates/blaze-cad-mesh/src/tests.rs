@@ -1716,6 +1716,38 @@ fn auto_grid_scales_for_cabin_and_respects_min_feature() {
 }
 
 #[test]
+fn simplifying_a_rounded_trapezoid_keeps_its_triangles_well_conditioned() {
+    use blaze_cad_field::{CompileOpts, ExtrudeOpts, Graph, GraphOpts, OffsetOpts, Profile, ProfileOpts, compile};
+    use blaze_units::Length;
+
+    let mut g = Graph::new(GraphOpts { alloc: heap(), .. });
+    let points = [[-16.0, -1.0], [14.8, -1.0], [18.1, 0.9], [-17.2, 0.9]].map(|p| p.map(Length::mm));
+    let profile = g.profile(ProfileOpts { profile: Profile::Polygon { points: &points }, .. }).expect("trapezoid");
+    let prism = g.extrude(profile, ExtrudeOpts { height: Length::mm(76.8), .. }).expect("extrude");
+    let rounded = g.grow(prism, OffsetOpts { by: Length::mm(0.6), .. }).expect("round");
+    let tape = compile(&g, rounded.id(), CompileOpts { alloc: heap(), .. }).expect("compile");
+    let tolerance = Length::mm(0.16);
+    let grid = auto_grid(&tape.aabb(), tolerance, None);
+    let input = mesh(&tape, MeshOpts { tolerance, piece: grid.piece, feature: grid.feature, alloc: heap(), scratch: heap(), .. })
+        .expect("mesh");
+    let result = simplified(input.verified(), Target::Error(tolerance), NoPlant).expect("decimate");
+    let output = result.mesh.view();
+    assert!(output.triangle_count() < input.mesh.view().triangle_count());
+    for view in [input.mesh.view(), output] {
+        for tri in view.triangles() {
+            let p = tri.map(|id| wide(view.positions()[id as usize]));
+            let area = tri_normal(p[0], p[1], p[2]);
+            for i in 0..3 {
+                let a = sub(p[(i + 1) % 3], p[i]);
+                let b = sub(p[(i + 2) % 3], p[i]);
+                let sin_sq = dot(area, area) / (dot(a, a) * dot(b, b));
+                assert!(sin_sq > 1e-10, "near-collinear triangle {p:?}, sin²(angle) = {sin_sq:e}");
+            }
+        }
+    }
+}
+
+#[test]
 fn target_budget_enforces_triangle_cap_and_error_ceiling() {
     use blaze_cad_field::{CompileOpts, Graph, GraphOpts, SphereOpts, compile};
     use blaze_units::Length;
