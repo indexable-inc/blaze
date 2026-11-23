@@ -29,7 +29,7 @@ use blaze_mem::Kept;
 use blaze_own::Arc;
 
 use super::arena::{Arena, ArenaView, RunEntry, Visibility};
-use super::core::{Batch, Committed, LentRecord, Named, POINTER_LEN, Probes, PutPath, Renewed, Report, Sliced};
+use super::core::{Batch, Committed, GcPlan, LentRecord, Named, POINTER_LEN, Probes, PutPath, Renewed, Report, Sliced};
 use super::driven::Driven;
 use super::format::record_crc;
 use crate::Key;
@@ -1104,6 +1104,31 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
     /// `now_ns` ([`Plain::needs_housekeeping`]).
     pub fn needs_housekeeping(&self, now_ns: u64) -> bool {
         self.inner.borrow().store.needs_housekeeping(now_ns)
+    }
+
+    /// Read-only inspection of what a GC pass would reclaim now ([`Driven::plan_gc`]).
+    pub fn plan_gc(&self) -> Result<GcPlan, LentError> {
+        self.inner.borrow_mut().store.plan_gc().map_err(stopped("planning gc"))
+    }
+
+    /// Whether total committed segment bytes exceed the high watermark of a finite budget.
+    pub fn over_budget(&self) -> bool {
+        self.inner.borrow().store.over_budget()
+    }
+
+    /// Total committed segment bytes.
+    pub fn total_bytes(&self) -> u64 {
+        self.inner.borrow().store.total_bytes()
+    }
+
+    /// Configured store byte budget (`u64::MAX` = unlimited).
+    pub fn cap_bytes(&self) -> u64 {
+        self.inner.borrow().store.cap_bytes()
+    }
+
+    /// Overrides the store byte budget for this handle (`u64::MAX` = unlimited).
+    pub fn set_cap(&self, cap_bytes: u64) {
+        self.inner.borrow_mut().store.set_cap(cap_bytes);
     }
 
     /// The roots this process set and the keys they name (`Plain::named`).

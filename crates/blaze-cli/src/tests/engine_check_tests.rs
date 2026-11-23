@@ -39,6 +39,7 @@ pub(super) fn opts(io: &Io, workers: u32, fresh: bool) -> engine_check::Opts<'st
             cert_dir: None,
             rustflags: blaze_manifest::rustflags::RustflagsEnv::default(),
             home: Some("/h"),
+            max_store_bytes: None,
             cargo_home: None,
             start: Some("/"),
             sdk: crate::sdk::NONE_IN_TESTS,

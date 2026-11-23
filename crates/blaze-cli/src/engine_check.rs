@@ -673,6 +673,7 @@ fn edge_at<'l, R>(
     phases.mark_cx(cx, "open checkout: the checkout's root resolved (one realpath)", frame);
     // cargo's `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` for this machine's target (rustflags.rs).
     let target_rustflags_var = blaze_manifest::rustflags::target_variable(crate::graph::TRIPLE, heap.alloc());
+    let max_store_bytes = crate::gc::budget_from_env(env)?;
     let place = Place {
         checkout: served.root_text().unwrap_or(checkout_at),
         served,
@@ -685,6 +686,7 @@ fn edge_at<'l, R>(
             target: var(target_rustflags_var.as_str()),
         },
         home: var("HOME"),
+        max_store_bytes,
         cargo_home: cargo_home.as_ref().map(|cargo| cargo.as_str()),
         start: served.root_text(),
         sdk,
@@ -861,7 +863,7 @@ pub(crate) fn check_for_start<R>(
         // The answer the check stored, read back from a store opened anew: the check committed
         // and closed its own (`checking`), so every record it put is in a segment, read in place.
         // No origin: the check made every record it read local.
-        let opened = crate::store::open_for_command(cx, fs, host, rng, place.home, root, place.checkout, phases.clock(), err, heap)?;
+        let opened = crate::store::open_for_command(cx, fs, host, rng, place.home, place.max_store_bytes, root, place.checkout, phases.clock(), err, heap)?;
         let erased = blaze_own::Erased::new(frame);
         let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), err, erased.handle())?;
         let request_mem = crate::engine_phase_mem::RequestMem::new()?;
@@ -975,6 +977,8 @@ pub(crate) struct Place<'f> {
     pub(crate) rustflags: blaze_manifest::rustflags::RustflagsEnv<'f>,
     /// `HOME`: the store and the sources are beneath it.
     pub(crate) home: Option<&'f str>,
+    /// `BLAZE_STORE_MAX_BYTES` / `BLAZE_STORE_MAX_GB` parsed once at the CLI edge.
+    pub(crate) max_store_bytes: Option<u64>,
     pub(crate) cargo_home: Option<&'f str>,
     /// `PWD`, where the toolchain's shelf is.
     pub(crate) start: Option<&'f str>,
@@ -1302,7 +1306,7 @@ fn checking<'f>(
     // The one store, opened as `check` opens it (main.rs), committed after the answer.
     // PHASE-MEM-DEBT(Request): the store's open takes the process heap (store.rs
     // `open_for_command`, `heap: &'static Heap`): its lease tables live to the command's end.
-    let opened = crate::store::open_for_command(cx, fs, host, rng, place.home, root, place.checkout, phases.clock(), err, heap)?;
+    let opened = crate::store::open_for_command(cx, fs, host, rng, place.home, place.max_store_bytes, root, place.checkout, phases.clock(), err, heap)?;
     crate::store::take::before_first_phase(cx, args, fs, net, &opened, toolchain, phases, err)?;
     let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, origin, phases.clock().clone(), err, erased.handle())?;
     phases.mark_cx(cx, "store open", frame);
