@@ -34,6 +34,11 @@ const HEAD: &str = "#![feature(no_core, lang_items)]
 #[lang = \"sized\"]
 trait Sized {}
 
+#[lang = \"panic_bounds_check\"]
+fn panic_bounds_check(_index: usize, _len: usize) -> ! {
+    loop {}
+}
+
 #[lang = \"copy\"]
 trait Copy {}
 
@@ -133,6 +138,11 @@ const RECORDS_HEAD: &str = "#![blaze::records]
 #[lang = \"sized\"]
 trait Sized {}
 
+#[lang = \"panic_bounds_check\"]
+fn panic_bounds_check(_index: usize, _len: usize) -> ! {
+    loop {}
+}
+
 #[lang = \"copy\"]
 trait Copy {}
 
@@ -149,6 +159,11 @@ const UNIONS_HEAD: &str = "#![blaze::error_unions]
 
 #[lang = \"sized\"]
 trait Sized {}
+
+#[lang = \"panic_bounds_check\"]
+fn panic_bounds_check(_index: usize, _len: usize) -> ! {
+    loop {}
+}
 
 #[lang = \"copy\"]
 trait Copy {}
@@ -359,9 +374,9 @@ pub extern \"C\" fn main() -> i32 {{
     assert_eq!(got_unit, Ok(7));
 }
 
-/// Fallible `T ! E` (`Result<T, E>`) with automatic error injection `ErrA -> ErrA | ErrB`.
+/// `Result<T, ErrA | ErrB>` with automatic error injection `ErrA -> ErrA | ErrB`.
 #[test]
-fn union_fallible_result_sugar() {
+fn union_result_auto_injection() {
     let defs = "
 enum Result<T, E> {
     Ok(T),
@@ -371,7 +386,7 @@ enum Result<T, E> {
 struct ErrA(u32);
 struct ErrB(u32);
 
-fn check(x: u32) -> u32 ! ErrA | ErrB {
+fn check(x: u32) -> Result<u32, ErrA | ErrB> {
     if x == 0 {
         Result::Err(ErrA(10))
     } else if x == 1 {
@@ -402,4 +417,1393 @@ pub extern \"C\" fn main() -> i32 {{
         ));
         assert_eq!(got, Ok(expected), "input {input}");
     }
+}
+
+/// Real `?` propagation across error unions (`From<ErrA> for ErrA | ErrB`,
+/// `From<ErrB> for ErrA | ErrB`, and `From<ErrA | ErrB> for ErrA | ErrB | ErrC`).
+#[test]
+fn union_try_question_mark_propagation() {
+    let defs = "
+enum Infallible {}
+
+enum ControlFlow<B, C> {
+    #[lang = \"Continue\"]
+    Continue(C),
+    #[lang = \"Break\"]
+    Break(B),
+}
+
+#[lang = \"from\"]
+trait From<T> {
+    fn from(value: T) -> Self;
+}
+
+impl<T> From<T> for T {
+    fn from(value: T) -> Self {
+        value
+    }
+}
+
+trait FromResidual<R = <Self as Try>::Residual> {
+    #[lang = \"from_residual\"]
+    fn from_residual(residual: R) -> Self;
+}
+
+trait Try: FromResidual {
+    type Output;
+    type Residual;
+    #[lang = \"branch\"]
+    fn branch(self) -> ControlFlow<Self::Residual, Self::Output>;
+}
+
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+impl<T, E> Try for Result<T, E> {
+    type Output = T;
+    type Residual = Result<Infallible, E>;
+    fn branch(self) -> ControlFlow<Self::Residual, Self::Output> {
+        match self {
+            Result::Ok(v) => ControlFlow::Continue(v),
+            Result::Err(e) => ControlFlow::Break(Result::Err(e)),
+        }
+    }
+}
+
+impl<T, E, F: From<E>> FromResidual<Result<Infallible, E>> for Result<T, F> {
+    fn from_residual(residual: Result<Infallible, E>) -> Self {
+        match residual {
+            Result::Err(e) => Result::Err(From::from(e)),
+            Result::Ok(x) => match x {},
+        }
+    }
+}
+
+struct ErrA(u32);
+struct ErrB(u32);
+struct ErrC(u32);
+
+fn read(mode: u32) -> Result<u32, ErrA> {
+    if mode == 1 {
+        Result::Err(ErrA(10))
+    } else {
+        Result::Ok(mode)
+    }
+}
+
+fn parse(x: u32) -> Result<u32, ErrB> {
+    if x == 2 {
+        Result::Err(ErrB(20))
+    } else {
+        Result::Ok(x + 42)
+    }
+}
+
+fn load(mode: u32) -> Result<u32, ErrA | ErrB> {
+    let a = read(mode)?;
+    let b = parse(a)?;
+    Result::Ok(b)
+}
+
+fn outer(mode: u32) -> Result<u32, ErrA | ErrB | ErrC> {
+    if mode == 3 {
+        return Result::Err(ErrC(30));
+    }
+    let v = load(mode)?;
+    Result::Ok(v)
+}
+
+fn dispatch(mode: u32) -> u32 {
+    match outer(mode) {
+        Result::Ok(v) => v,
+        Result::Err(e) => match e {
+            a: ErrA => a.0 + 1,
+            b: ErrB => b.0 + 2,
+            c: ErrC => c.0 + 3,
+        },
+    }
+}
+";
+    for (mode, expected) in [(0u32, 42u8), (1, 11), (2, 22), (3, 33)] {
+        let got = run_head(UNIONS_HEAD, &format!(
+            "{defs}
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {{
+    dispatch({mode}) as i32
+}}
+"
+        ));
+        assert_eq!(got, Ok(expected), "mode {mode}");
+    }
+}
+
+/// Structural record width-subtyping coercion `{ host, port, tls } -> { host }` -> exit 42.
+#[test]
+fn record_width_subtyping_coercion() {
+    let got = run_head(RECORDS_HEAD, "
+fn read_host(r: { host: u32 }) -> u32 {
+    r.host
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let wide = { host: 20u32, port: 8080u32, tls: true };
+    let a = read_host(wide);
+    let b = read_host({ host: 22u32, port: 443u32, tls: false });
+    (a + b) as i32
+}
+");
+    assert_eq!(got, Ok(42));
+}
+
+/// Structural record type-level defaults `{ a: u32, b: u32 = 32 }` with `{ a: 10u32, .. }` -> exit 42.
+#[test]
+fn record_type_level_defaults() {
+    let got = run_head(RECORDS_HEAD, "
+fn sum(r: { a: u32, b: u32 = 32 }) -> u32 {
+    r.a + r.b
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    sum({ a: 10u32, .. }) as i32
+}
+");
+    assert_eq!(got, Ok(42));
+}
+
+/// Anonymous record default elision without `, ..` (`{ a: 10u32 }`) and all-defaults `{ .. }`.
+#[test]
+fn record_default_elision_without_dots_and_all_defaults() {
+    let elided = run_head(RECORDS_HEAD, "
+fn sum(r: { a: u32, b: u32 = 32 }) -> u32 {
+    r.a + r.b
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    sum({ a: 10u32 }) as i32
+}
+");
+    assert_eq!(elided, Ok(42));
+
+    let all_def = run_head(RECORDS_HEAD, "
+fn all_def(r: { a: u32 = 10, b: u32 = 32 }) -> u32 {
+    r.a + r.b
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    all_def({ .. }) as i32
+}
+");
+    assert_eq!(all_def, Ok(42));
+}
+
+/// Inferred `Result<T, _>` error unions across private and `pub fn` with `?` call chains.
+#[test]
+fn inferred_result_error_union_and_try_chain() {
+    let defs = "
+enum Infallible {}
+
+enum ControlFlow<B, C> {
+    #[lang = \"Continue\"]
+    Continue(C),
+    #[lang = \"Break\"]
+    Break(B),
+}
+
+#[lang = \"from\"]
+trait From<T> {
+    fn from(value: T) -> Self;
+}
+
+impl<T> From<T> for T {
+    fn from(value: T) -> Self {
+        value
+    }
+}
+
+trait FromResidual<R = <Self as Try>::Residual> {
+    #[lang = \"from_residual\"]
+    fn from_residual(residual: R) -> Self;
+}
+
+trait Try: FromResidual {
+    type Output;
+    type Residual;
+    #[lang = \"branch\"]
+    fn branch(self) -> ControlFlow<Self::Residual, Self::Output>;
+}
+
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+impl<T, E> Try for Result<T, E> {
+    type Output = T;
+    type Residual = Result<Infallible, E>;
+    fn branch(self) -> ControlFlow<Self::Residual, Self::Output> {
+        match self {
+            Result::Ok(v) => ControlFlow::Continue(v),
+            Result::Err(e) => ControlFlow::Break(Result::Err(e)),
+        }
+    }
+}
+
+impl<T, E, F: From<E>> FromResidual<Result<Infallible, E>> for Result<T, F> {
+    fn from_residual(residual: Result<Infallible, E>) -> Self {
+        match residual {
+            Result::Err(e) => Result::Err(From::from(e)),
+            Result::Ok(x) => match x {},
+        }
+    }
+}
+
+struct ErrA(u32);
+struct ErrB(u32);
+struct ErrC(u32);
+
+fn read(mode: u32) -> Result<u32, _> {
+    if mode == 1 {
+        Result::Err(ErrA(10))
+    } else {
+        Result::Ok(mode)
+    }
+}
+
+fn parse(x: u32) -> Result<u32, _> {
+    if x == 2 {
+        Result::Err(ErrB(20))
+    } else {
+        Result::Ok(x + 42)
+    }
+}
+
+pub fn load(mode: u32) -> Result<u32, _> {
+    if mode == 3 {
+        return Result::Err(ErrC(30));
+    }
+    let a = read(mode)?;
+    let b = parse(a)?;
+    Result::Ok(b)
+}
+
+fn dispatch(mode: u32) -> u32 {
+    match load(mode) {
+        Result::Ok(v) => v,
+        Result::Err(e) => match e {
+            c: ErrC => c.0 + 3,
+            a: ErrA => a.0 + 1,
+            b => b.0 + 2,
+        },
+    }
+}
+";
+    for (mode, expected) in [(0u32, 42u8), (1, 11), (2, 22), (3, 33)] {
+        let got = run_head(UNIONS_HEAD, &format!(
+            "{defs}
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {{
+    dispatch({mode}) as i32
+}}
+"
+        ));
+        assert_eq!(got, Ok(expected), "mode {mode}");
+    }
+}
+
+/// General return-type `_` holes: `-> _`, `-> Option<_>`, and `-> (_, u32)` on private and `pub fn`.
+#[test]
+fn inferred_general_return_type_holes() {
+    let got = run_head(RECORDS_HEAD, "
+enum Option<T> {
+    Some(T),
+    None,
+}
+
+fn make_rec() -> _ {
+    { a: 10u32, b: 20u32 }
+}
+
+pub fn wrap() -> Option<_> {
+    Option::Some(5u32)
+}
+
+fn pair() -> (_, u32) {
+    (true, 7u32)
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let r = make_rec();
+    let w = match wrap() {
+        Option::Some(v) => v,
+        Option::None => 0,
+    };
+    let (flag, p) = pair();
+    let extra = if flag { p } else { 0 };
+    (r.a + r.b + w + extra) as i32
+}
+");
+    assert_eq!(got, Ok(42));
+}
+
+/// Mutually recursive `_`-returning functions are rejected cleanly with a cycle error.
+#[test]
+fn inferred_return_type_cycle_rejected() {
+    let got = run_head(UNIONS_HEAD, "
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+fn ping(n: u32) -> Result<u32, _> {
+    pong(n)
+}
+
+fn pong(n: u32) -> Result<u32, _> {
+    ping(n)
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    match ping(0) {
+        Result::Ok(v) => v as i32,
+        Result::Err(_) => 1,
+    }
+}
+");
+    assert!(
+        got.as_ref().is_err_and(|msg| msg.contains("Cycle") || msg.contains("cycle")),
+        "expected cycle error, got: {got:?}"
+    );
+}
+
+/// Compile-time `const` structural records and error unions evaluated via `blaze-consteval`
+/// and linked into native machine code.
+#[test]
+fn const_record_and_union_eval() {
+    let got_rec = run_head(RECORDS_HEAD, "
+const REC: { a: u32, b: u32 } = { b: 10u32, a: 32u32 };
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    (REC.a + REC.b) as i32
+}
+");
+    assert_eq!(got_rec, Ok(42));
+
+    let got_uni = run_head(UNIONS_HEAD, "
+const UNI: u32 | bool = 40u32;
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    match UNI {
+        n: u32 => (n + 2u32) as i32,
+        _: bool => 0,
+    }
+}
+");
+    assert_eq!(got_uni, Ok(42));
+}
+
+/// Full native Flecs-without-Flecs-Script Proof of Concept combining:
+/// - Composable prefab types via record type spread (`{ ..Transform, ..Velocity, ..Combat }`)
+/// - Inherited & overridden type-level defaults + elided literals (`{ hp: 30u32, vx: 2i32 }`)
+/// - Const-evaluated prefabs + partial overrides (`{ x: 3i32, ..GOBLIN }`)
+/// - Compile-time reflection intrinsics (`blaze_field_count`, `blaze_records_disjoint`,
+///   `blaze_record_schema_id`) proving canonical archetype identity and disjoint system queries
+/// - Width-subtyping systems (`RecordProject`) over both `UnitPrefab` and `BossPrefab`
+/// - SoA world + `ChildOf` cascade + `Result<u32, _>` inferred error unions (`MissingEntity | DeadEntity`)
+/// - Live `front2::inspect` LLM inlay-hint rendering over the PoC itself.
+#[test]
+fn flecs_without_flecs_script_native_poc_and_inspect() {
+    let poc_source = "#![blaze::records]
+#![blaze::error_unions]
+#![feature(no_core, lang_items, intrinsics)]
+#![no_core]
+#![no_main]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"panic_bounds_check\"]
+fn panic_bounds_check(_index: usize, _len: usize) -> ! {
+    loop {}
+}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+impl Copy for u8 {}
+impl Copy for u32 {}
+impl Copy for u64 {}
+impl Copy for i32 {}
+impl Copy for usize {}
+impl Copy for bool {}
+
+#[rustc_intrinsic]
+const fn blaze_field_count<T>() -> usize;
+
+#[rustc_intrinsic]
+const fn blaze_records_disjoint<A, B>() -> bool;
+
+#[rustc_intrinsic]
+const fn blaze_record_schema_id<T>() -> u64;
+
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+enum ControlFlow<B, C> {
+    #[lang = \"Continue\"]
+    Continue(C),
+    #[lang = \"Break\"]
+    Break(B),
+}
+
+#[lang = \"from\"]
+trait From<T> {
+    fn from(value: T) -> Self;
+}
+
+impl<T> From<T> for T {
+    fn from(value: T) -> Self {
+        value
+    }
+}
+
+#[lang = \"Try\"]
+trait Try {
+    type Output;
+    type Residual;
+    #[lang = \"from_output\"]
+    fn from_output(output: Self::Output) -> Self;
+    #[lang = \"branch\"]
+    fn branch(self) -> ControlFlow<Self::Residual, Self::Output>;
+}
+
+#[lang = \"FromResidual\"]
+trait FromResidual<R = <Self as Try>::Residual> {
+    #[lang = \"from_residual\"]
+    fn from_residual(residual: R) -> Self;
+}
+
+impl<T, E> Try for Result<T, E> {
+    type Output = T;
+    type Residual = Result<!, E>;
+    fn from_output(output: T) -> Self {
+        Result::Ok(output)
+    }
+    fn branch(self) -> ControlFlow<Result<!, E>, T> {
+        match self {
+            Result::Ok(v) => ControlFlow::Continue(v),
+            Result::Err(e) => ControlFlow::Break(Result::Err(e)),
+        }
+    }
+}
+
+impl<T, E, F: From<E>> FromResidual<Result<!, E>> for Result<T, F> {
+    fn from_residual(residual: Result<!, E>) -> Self {
+        match residual {
+            Result::Err(e) => Result::Err(F::from(e)),
+            Result::Ok(never) => match never {},
+        }
+    }
+}
+
+// 1. Declarative Flecs-style prefabs using composable record spread & inherited defaults.
+type Transform = { x: i32 = 0, y: i32 = 0, scale: i32 = 1 };
+type Velocity = { vx: i32 = 0, vy: i32 = 0 };
+type Combat = { hp: u32 = 100, armor: u32 = 0 };
+type UnitPrefab = { ..Transform, ..Velocity, ..Combat, team: u32 = 0 };
+type BossPrefab = { ..UnitPrefab, hp: u32 = 500, shield: u32 = 50, phase: u32 = 1 };
+type FlatUnit = { armor: u32, hp: u32, scale: i32, team: u32, vx: i32, vy: i32, x: i32, y: i32 };
+
+// 2. Compile-time reflection proofs (zero macros, zero runtime cost).
+const BOSS_FIELDS: usize = blaze_field_count::<BossPrefab>();
+const DISJOINT_MOVE: bool = blaze_records_disjoint::<{ x: i32, y: i32 }, { vx: i32, vy: i32 }>();
+const OVERLAP_COMBAT: bool = blaze_records_disjoint::<UnitPrefab, BossPrefab>();
+const SCHEMA_MATCH: bool = blaze_record_schema_id::<UnitPrefab>() == blaze_record_schema_id::<FlatUnit>();
+
+// 3. Const-evaluated prefabs with elided inherited defaults.
+const GOBLIN: UnitPrefab = { hp: 30u32, vx: 2i32 };
+const DRAGON: BossPrefab = { x: 10i32, shield: 80u32, vx: 5i32 };
+
+// 4. Width-subtyping physics system: accepts ANY record containing x, y, vx, vy.
+fn step_physics(e: { x: i32, y: i32, vx: i32, vy: i32 }) -> { x: i32, y: i32 } {
+    { x: e.x + e.vx, y: e.y + e.vy }
+}
+
+// 5. Minimal SoA World with ChildOf hierarchy + fallible inferred-error-set queries.
+struct MissingEntity(u32);
+struct DeadEntity(u32);
+
+struct World {
+    alive: [bool; 4],
+    parent: [usize; 4], // 4 = root (no parent)
+    local_x: [i32; 4],
+    world_x: [i32; 4],
+    hp: [u32; 4],
+    shield: [u32; 4],
+}
+
+fn spawn_unit(w: &mut World, id: usize, parent: usize, u: UnitPrefab) {
+    let moved = step_physics(u);
+    w.alive[id] = true;
+    w.parent[id] = parent;
+    w.local_x[id] = moved.x;
+    w.world_x[id] = moved.x;
+    w.hp[id] = u.hp;
+    w.shield[id] = 0;
+}
+
+fn spawn_boss(w: &mut World, id: usize, parent: usize, b: BossPrefab) {
+    let moved = step_physics(b);
+    w.alive[id] = true;
+    w.parent[id] = parent;
+    w.local_x[id] = moved.x;
+    w.world_x[id] = moved.x;
+    w.hp[id] = b.hp;
+    w.shield[id] = b.shield;
+}
+
+fn cascade_transforms(w: &mut World) {
+    let mut i: usize = 0;
+    while i < 4 {
+        if w.alive[i] {
+            let p = w.parent[i];
+            if p < 4 {
+                w.world_x[i] = w.world_x[p] + w.local_x[i];
+            } else {
+                w.world_x[i] = w.local_x[i];
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn require_alive(w: &World, id: usize) -> Result<u32, MissingEntity> {
+    if id >= 4 || !w.alive[id] {
+        Result::Err(MissingEntity(id as u32))
+    } else {
+        Result::Ok(w.hp[id])
+    }
+}
+
+pub fn query_effective_hp(w: &World, id: usize) -> Result<u32, _> {
+    let hp = require_alive(w, id)?;
+    if hp == 0 {
+        return Result::Err(DeadEntity(id as u32));
+    }
+    Result::Ok(hp + w.shield[id])
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    if BOSS_FIELDS != 10 || !DISJOINT_MOVE || OVERLAP_COMBAT || !SCHEMA_MATCH {
+        return 1;
+    }
+    let mut world = World {
+        alive: [false; 4],
+        parent: [4; 4],
+        local_x: [0; 4],
+        world_x: [0; 4],
+        hp: [0; 4],
+        shield: [0; 4],
+    };
+    // Entity 0: Dragon boss at root (x=10 + vx=5 = 15, hp=500, shield=80)
+    spawn_boss(&mut world, 0, 4, DRAGON);
+    // Entity 1: Goblin minion ChildOf(0), partial override x=3 + vx=2 = 5 => world_x = 15 + 5 = 20, hp = 30
+    let minion: UnitPrefab = { x: 3i32, ..GOBLIN };
+    spawn_unit(&mut world, 1, 0, minion);
+    // Entity 2: Fallen goblin (hp = 0)
+    let fallen: UnitPrefab = { hp: 0u32 };
+    spawn_unit(&mut world, 2, 0, fallen);
+
+    cascade_transforms(&mut world);
+
+    // Effective HP of Dragon (580) + Minion (30) -> check world_x(1) == 20, dead(2) -> DeadEntity(2), missing(3) -> MissingEntity(3).
+    let boss_hp = match query_effective_hp(&world, 0) {
+        Result::Ok(v) => v,
+        Result::Err(_) => 0,
+    };
+    let minion_hp = match query_effective_hp(&world, 1) {
+        Result::Ok(v) => v,
+        Result::Err(_) => 0,
+    };
+    let dead_code = match query_effective_hp(&world, 2) {
+        Result::Ok(_) => 0,
+        Result::Err(e) => match e {
+            d: DeadEntity => d.0 + 10,
+            m => m.0 + 100,
+        },
+    };
+    let miss_code = match query_effective_hp(&world, 3) {
+        Result::Ok(_) => 0,
+        Result::Err(e) => match e {
+            m: MissingEntity => m.0 + 7,
+            d => d.0 + 200,
+        },
+    };
+    // 580 + 30 == 610, world_x[1] == 20, dead_code == 12, miss_code == 10 => 20 + 12 + 10 = 42!
+    if boss_hp != 580 || minion_hp != 30 {
+        return 2;
+    }
+    (world.world_x[1] as u32 + dead_code + miss_code) as i32
+}
+";
+    // 1. Compile to native machine code and execute in-process!
+    let got = run_head("", poc_source);
+    assert_eq!(got, Ok(42));
+
+    // 2. Verify `blaze inspect` surfaces LLM inlay hints across the PoC!
+    let alloc = blaze_own::testing::heap().alloc();
+    let inspected = blaze_ladder::front2::inspect::inspect_source(
+        poc_source,
+        blaze_ladder::front2::inspect::BLAZE_EDITION,
+        None,
+        blaze_ladder::front2::inspect::InspectOpts::default(),
+        alloc,
+        alloc,
+    )
+    .expect("inspect PoC");
+    let annotated = blaze_ladder::front2::inspect::render_annotated(&inspected, alloc);
+    assert!(annotated.contains("DeadEntity") && annotated.contains("MissingEntity"), "inferred error union hint missing:\n{annotated}");
+    assert!(annotated.contains("project ->"), "RecordProject width-subtyping hint missing:\n{annotated}");
+    assert!(annotated.contains("..defaults:"), "elided inherited default hint missing:\n{annotated}");
+    assert!(annotated.contains("? MissingEntity"), "try propagation hint missing:\n{annotated}");
+    println!("=== FLECS-WITHOUT-FLECS-SCRIPT POC (BLAZE INSPECT) ===\n{annotated}");
+}
+
+/// Comptime field unrolling (`inline for`) on heterogeneous structural records, tuples,
+/// `&rec` name+value destructuring without moving, and `&mut rec` in-place mutation.
+#[test]
+fn inline_for_record_and_tuple_heterogeneous_dispatch() {
+    let got = run_head(RECORDS_HEAD, "
+impl Copy for usize {}
+
+#[repr(C)]
+struct Words {
+    data: usize,
+    len: usize,
+}
+
+impl Copy for Words {}
+
+union Wide {
+    s: &'static str,
+    words: Words,
+}
+
+fn str_len(s: &'static str) -> u32 {
+    unsafe { Wide { s }.words.len as u32 }
+}
+
+trait Score {
+    fn score(&self) -> u32;
+    fn take_score(self) -> u32;
+    fn bump(&mut self);
+}
+
+struct A(u32);
+struct B(u32);
+struct C(u32);
+
+impl Score for A {
+    fn score(&self) -> u32 { self.0 }
+    fn take_score(self) -> u32 { self.0 }
+    fn bump(&mut self) { self.0 = self.0 + 1; }
+}
+
+impl Score for B {
+    fn score(&self) -> u32 { self.0 * 2 }
+    fn take_score(self) -> u32 { self.0 * 2 }
+    fn bump(&mut self) { self.0 = self.0 + 2; }
+}
+
+impl Score for C {
+    fn score(&self) -> u32 { self.0 + 3 }
+    fn take_score(self) -> u32 { self.0 + 3 }
+    fn bump(&mut self) { self.0 = self.0 + 3; }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let mut total: u32 = 0;
+    let rec = { a: A(4), b: B(5), c: C(3) };
+    // Borrowed (name, field) iteration without moving `rec`:
+    // names: 1 + 1 + 1 = 3; scores: 4 + 10 + 6 = 20 => 23
+    inline for (name, field) in &rec {
+        total = total + str_len(name) + field.score();
+    }
+    // By-value heterogeneous record iteration (moves disjoint fields):
+    // 4 + 10 + 6 = 20 => 43
+    inline for field in rec {
+        total = total + field.take_score();
+    }
+    // Heterogeneous tuple iteration:
+    // 1 + 4 + 6 = 11 => 54
+    inline for x in (A(1), B(2), C(3)) {
+        total = total + x.take_score();
+    }
+    // Mutable borrowed record iteration:
+    // A(2)->3, B(3)->5 => +8 => 62
+    let mut mut_rec = { x: A(2), y: B(3) };
+    inline for f in &mut mut_rec {
+        f.bump();
+    }
+    total = total + mut_rec.x.0 + mut_rec.y.0;
+    total as i32
+}
+");
+    assert_eq!(got, Ok(62));
+}
+
+/// Generic `fn score_all<T>(bundle: T) -> u32` using `inline for` with zero trait bounds on `T`:
+/// called with a composed defaulted record prefab, a heterogeneous tuple, a named struct, and a
+/// tuple struct — compiled straight to zero-overhead monomorphized native code.
+#[test]
+fn inline_for_generic_spawn_prefab_bundle() {
+    let got = run_head(RECORDS_HEAD, "
+trait Score {
+    fn score(self) -> u32;
+}
+
+struct Health(u32);
+struct Armor(u32);
+struct Shield(u32);
+
+impl Score for Health {
+    fn score(self) -> u32 { self.0 }
+}
+
+impl Score for Armor {
+    fn score(self) -> u32 { self.0 * 2 }
+}
+
+impl Score for Shield {
+    fn score(self) -> u32 { self.0 + 1 }
+}
+
+type Unit = { hp: Health = Health(10) };
+type Boss = { ..Unit, shield: Shield = Shield(12) };
+
+struct Pack {
+    h: Health,
+    s: Shield,
+}
+
+struct Pair(Health, Armor);
+
+fn score_all<T>(bundle: T) -> u32 {
+    let mut acc: u32 = 0;
+    inline for f in bundle {
+        acc = acc + f.score();
+    }
+    acc
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    // 1. Composed defaulted record prefab: Health(20) -> 20, Shield(12) -> 13 => 33
+    let s1 = score_all::<Boss>({ hp: Health(20) });
+    // 2. Heterogeneous tuple: Health(5) -> 5, Armor(5) -> 10, Shield(2) -> 3 => 18
+    let s2 = score_all((Health(5), Armor(5), Shield(2)));
+    // 3. Named struct: Health(4) -> 4, Shield(6) -> 7 => 11
+    let s3 = score_all(Pack { h: Health(4), s: Shield(6) });
+    // 4. Tuple struct: Health(3) -> 3, Armor(4) -> 8 => 11
+    let s4 = score_all(Pair(Health(3), Armor(4)));
+    (s1 + s2 + s3 + s4) as i32
+}
+");
+    assert_eq!(got, Ok(73));
+}
+
+/// `inline for` with `?` propagation and `Result<u32, _>` inferred structural error union.
+#[test]
+fn inline_for_with_error_union_try_propagation() {
+    let got = run_head("", "#![blaze::records]
+#![blaze::error_unions]
+#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"panic_bounds_check\"]
+fn panic_bounds_check(_index: usize, _len: usize) -> ! {
+    loop {}
+}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+impl Copy for u32 {}
+impl Copy for i32 {}
+
+#[lang = \"from\"]
+trait From<T> {
+    fn from(v: T) -> Self;
+}
+
+impl<T> From<T> for T {
+    fn from(v: T) -> T { v }
+}
+
+enum ControlFlow<B, C = ()> {
+    #[lang = \"Continue\"]
+    Continue(C),
+    #[lang = \"Break\"]
+    Break(B),
+}
+
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+#[lang = \"Try\"]
+trait Try {
+    type Output;
+    type Residual;
+    #[lang = \"from_output\"]
+    fn from_output(output: Self::Output) -> Self;
+    #[lang = \"branch\"]
+    fn branch(self) -> ControlFlow<Self::Residual, Self::Output>;
+}
+
+#[lang = \"FromResidual\"]
+trait FromResidual<R = <Self as Try>::Residual> {
+    #[lang = \"from_residual\"]
+    fn from_residual(residual: R) -> Self;
+}
+
+impl<T, E> Try for Result<T, E> {
+    type Output = T;
+    type Residual = Result<T, E>;
+    fn from_output(output: T) -> Self { Result::Ok(output) }
+    fn branch(self) -> ControlFlow<Result<T, E>, T> {
+        match self {
+            Result::Ok(v) => ControlFlow::Continue(v),
+            Result::Err(e) => ControlFlow::Break(Result::Err(e)),
+        }
+    }
+}
+
+impl<T, E, F: From<E>> FromResidual<Result<T, E>> for Result<T, F> {
+    fn from_residual(residual: Result<T, E>) -> Self {
+        match residual {
+            Result::Err(e) => Result::Err(F::from(e)),
+            Result::Ok(_) => loop {},
+        }
+    }
+}
+
+struct ErrA(u32);
+struct ErrB(u32);
+struct CheckA(u32);
+struct CheckB(u32);
+
+impl CheckA {
+    fn verify(self) -> Result<u32, ErrA> {
+        if self.0 == 0 { Result::Err(ErrA(10)) } else { Result::Ok(self.0) }
+    }
+}
+
+impl CheckB {
+    fn verify(self) -> Result<u32, ErrB> {
+        if self.0 == 0 { Result::Err(ErrB(20)) } else { Result::Ok(self.0 * 2) }
+    }
+}
+
+fn check_all(r: { a: CheckA, b: CheckB }) -> Result<u32, _> {
+    let mut sum: u32 = 0;
+    inline for f in r {
+        sum = sum + f.verify()?;
+    }
+    Result::Ok(sum)
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let ok_val = match check_all({ a: CheckA(4), b: CheckB(4) }) {
+        Result::Ok(v) => v,
+        Result::Err(_) => 0,
+    };
+    let err_a = match check_all({ a: CheckA(0), b: CheckB(4) }) {
+        Result::Ok(_) => 0,
+        Result::Err(e) => match e {
+            a: ErrA => a.0,
+            b => b.0 + 100,
+        },
+    };
+    let err_b = match check_all({ a: CheckA(4), b: CheckB(0) }) {
+        Result::Ok(_) => 0,
+        Result::Err(e) => match e {
+            b: ErrB => b.0,
+            a => a.0 + 100,
+        },
+    };
+    // 12 + 10 + 20 = 42
+    (ok_val + err_a + err_b) as i32
+}
+");
+    assert_eq!(got, Ok(42));
+}
+
+/// Combined native compile-and-run e2e test proving:
+/// - All-`pub` no-`Drop` structs (`Pos`, `Vel`, `Health`) are automatically `Copy` and `Clone`
+///   (with synthesized `Clone::clone` shims and zero `#[derive]`)
+/// - Private-field structs (`FileHandle(u32)`) remain strictly move-only (rejected by `T: Copy`)
+/// - Lockstep `inline for (a, b) in zip_fields(lhs, rhs)` powers zero-macro generic structural
+///   `eq_all<T>` and `inline for (name, f) in v` powers zero-macro generic `hash_all<T>` across
+///   both auto-`Copy` structs and composed `{ ..Base }` structural records.
+#[test]
+fn auto_copy_pub_structs_and_inline_for_zip_reflection() {
+    let ok = run_head(RECORDS_HEAD, "
+#[lang = \"clone\"]
+trait Clone: Sized {
+    fn clone(&self) -> Self;
+}
+
+impl Clone for i32 {
+    fn clone(&self) -> Self { *self }
+}
+impl Clone for u32 {
+    fn clone(&self) -> Self { *self }
+}
+
+// ZERO `impl Copy` or `impl Clone` — all fields are `pub`!
+struct Pos { pub x: i32, pub y: i32 }
+struct Vel { pub dx: i32, pub dy: i32 }
+struct Health(pub u32);
+
+trait EqVal {
+    fn eq_val(&self, other: &Self) -> bool;
+}
+
+impl EqVal for i32 {
+    fn eq_val(&self, other: &Self) -> bool { *self == *other }
+}
+impl EqVal for u32 {
+    fn eq_val(&self, other: &Self) -> bool { *self == *other }
+}
+impl EqVal for Pos {
+    fn eq_val(&self, other: &Self) -> bool { eq_all(self, other) }
+}
+impl EqVal for Vel {
+    fn eq_val(&self, other: &Self) -> bool { eq_all(self, other) }
+}
+impl EqVal for Health {
+    fn eq_val(&self, other: &Self) -> bool { eq_all(self, other) }
+}
+
+fn eq_all<T>(lhs: &T, rhs: &T) -> bool {
+    inline for (a, b) in zip_fields(lhs, rhs) {
+        if !a.eq_val(b) {
+            return false;
+        }
+    }
+    true
+}
+
+fn require_copy<T: Copy>(v: T) -> T {
+    v
+}
+
+type Movable = { pos: Pos = Pos { x: 1, y: 2 }, vel: Vel = Vel { dx: 3, dy: 4 } };
+type Unit = { ..Movable, hp: Health = Health(32) };
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let p = Pos { x: 10, y: 20 };
+    let p_copy = require_copy(p);
+    let p_clone = p.clone();
+    if !eq_all(&p, &p_copy) || !eq_all(&p, &p_clone) {
+        return 1;
+    }
+
+    let u1: Unit = { pos: p };
+    let u2: Unit = u1.clone();
+    let u3: Unit = { pos: Pos { x: 10, y: 99 }, ..u1 };
+    if !eq_all(&u1, &u2) || eq_all(&u1, &u3) {
+        return 2;
+    }
+    (u2.pos.x as u32 + u2.hp.0) as i32
+}
+");
+    assert_eq!(ok, Ok(42));
+
+    // Private-field struct must remain strictly move-only (NOT auto-Copy).
+    let private_rejected = run_head(RECORDS_HEAD, "
+struct FileHandle(u32);
+
+fn require_copy<T: Copy>(v: T) -> T {
+    v
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let h = FileHandle(7);
+    let _ = require_copy(h);
+    0
+}
+");
+    assert!(
+        private_rejected.is_err(),
+        "private-field struct `FileHandle(u32)` must NOT be auto-Copy, got: {private_rejected:?}"
+    );
+}
+
+/// Native compile-and-run e2e test proving zero-macro `serde`-equivalent serialization,
+/// live in-place field patching by runtime field name, and snapshot/diff logging across:
+/// - plain all-`pub` structs (`Pos`, `Health`) with zero `#[derive]` / zero macros (auto-`Copy`/`Clone`)
+/// - composed structural records with spread & defaults (`type EntityRecord = { ..BasePos, hp: i32 = 100 }`)
+/// using `inline for (name, val) in v`, `inline for (name, field) in dst` (`&mut T`), and
+/// `inline for (name, a, b) in zip_fields(before, after)`.
+#[test]
+fn inline_for_zero_macro_serde_and_live_patch() {
+    let got = run_head(RECORDS_HEAD, "
+impl Copy for usize {}
+
+#[lang = \"panic_const_div_by_zero\"]
+fn panic_const_div_by_zero() -> ! {
+    loop {}
+}
+
+#[lang = \"panic_const_rem_by_zero\"]
+fn panic_const_rem_by_zero() -> ! {
+    loop {}
+}
+
+#[lang = \"clone\"]
+trait Clone: Sized {
+    fn clone(&self) -> Self;
+}
+
+impl Clone for i32 {
+    fn clone(&self) -> Self { *self }
+}
+
+#[repr(C)]
+struct Words {
+    data: usize,
+    len: usize,
+}
+impl Copy for Words {}
+
+union Wide {
+    s: &'static str,
+    bytes: &'static [u8],
+    words: Words,
+}
+
+fn str_len(s: &'static str) -> usize {
+    unsafe { Wide { s }.words.len }
+}
+
+fn str_bytes(s: &'static str) -> &'static [u8] {
+    unsafe { Wide { s }.bytes }
+}
+
+fn str_eq(a: &'static str, b: &'static str) -> bool {
+    let n = str_len(a);
+    if n != str_len(b) {
+        return false;
+    }
+    let ab = str_bytes(a);
+    let bb = str_bytes(b);
+    let mut i: usize = 0;
+    while i < n {
+        if ab[i] != bb[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+struct SerBuf {
+    buf: [u8; 64],
+    len: usize,
+}
+
+impl SerBuf {
+    fn new() -> SerBuf {
+        SerBuf { buf: [0u8; 64], len: 0 }
+    }
+
+    fn push_byte(&mut self, b: u8) {
+        if self.len < 64 {
+            self.buf[self.len] = b;
+            self.len = self.len + 1;
+        }
+    }
+
+    fn push_str(&mut self, s: &'static str) {
+        let n = str_len(s);
+        let bytes = str_bytes(s);
+        let mut i: usize = 0;
+        while i < n {
+            self.push_byte(bytes[i]);
+            i = i + 1;
+        }
+    }
+
+    fn push_u32(&mut self, mut v: u32) {
+        if v == 0 {
+            self.push_byte(b'0');
+            return;
+        }
+        let mut tmp = [0u8; 12];
+        let mut k: usize = 0;
+        while v > 0 {
+            let digit = (v % 10) as u8;
+            tmp[k] = b'0' + digit;
+            k = k + 1;
+            v = v / 10;
+        }
+        while k > 0 {
+            k = k - 1;
+            self.push_byte(tmp[k]);
+        }
+    }
+
+    fn push_i32(&mut self, v: i32) {
+        if v < 0 {
+            self.push_byte(b'-');
+            self.push_u32((0 - v) as u32);
+        } else {
+            self.push_u32(v as u32);
+        }
+    }
+
+    fn push_signed_i32(&mut self, v: i32) {
+        if v < 0 {
+            self.push_byte(b'-');
+            self.push_u32((0 - v) as u32);
+        } else {
+            self.push_byte(b'+');
+            self.push_u32(v as u32);
+        }
+    }
+
+    fn eq_str(&self, expected: &'static str) -> bool {
+        let n = str_len(expected);
+        if self.len != n {
+            return false;
+        }
+        let eb = str_bytes(expected);
+        let mut i: usize = 0;
+        while i < n {
+            if self.buf[i] != eb[i] {
+                return false;
+            }
+            i = i + 1;
+        }
+        true
+    }
+}
+
+// Plain all-`pub` structs with ZERO `#[derive]`, ZERO `impl Copy`/`Clone`, ZERO macros.
+struct Pos {
+    pub x: i32,
+    pub y: i32,
+}
+
+struct Health {
+    pub hp: i32,
+    pub max_hp: i32,
+}
+
+// Composed structural records with spread & defaults.
+type BasePos = { x: i32 = 10, y: i32 = 20 };
+type EntityRecord = { ..BasePos, hp: i32 = 100 };
+
+// Zero-macro `serde`-equivalent serializer over any struct or structural record with `i32` fields.
+fn serialize_i32_fields<T>(v: T, out: &mut SerBuf) {
+    inline for (name, val) in v {
+        out.push_str(name);
+        out.push_byte(b'=');
+        out.push_i32(val);
+        out.push_byte(b';');
+    }
+}
+
+// Zero-macro live in-place field patcher by runtime field name (`&mut T`).
+fn patch_i32_field<T>(dst: &mut T, target: &'static str, new_val: i32) -> bool {
+    inline for (name, field) in dst {
+        if str_eq(name, target) {
+            *field = new_val;
+            return true;
+        }
+    }
+    false
+}
+
+// Zero-macro live diff / undo log via lockstep `zip_fields(before, after)`.
+fn diff_i32_fields<T>(before: T, after: T, out: &mut SerBuf) -> i32 {
+    let mut sum_delta: i32 = 0;
+    inline for (name, a, b) in zip_fields(before, after) {
+        if a != b {
+            let delta = b - a;
+            sum_delta = sum_delta + delta;
+            out.push_str(name);
+            out.push_byte(b':');
+            out.push_signed_i32(delta);
+            out.push_byte(b';');
+        }
+    }
+    sum_delta
+}
+
+fn require_copy<T: Copy>(v: T) -> T {
+    v
+}
+
+fn runtime_field_name(sel: i32) -> &'static str {
+    if sel == 0 {
+        \"x\"
+    } else if sel == 1 {
+        \"y\"
+    } else if sel == 2 {
+        \"hp\"
+    } else if sel == 3 {
+        \"max_hp\"
+    } else {
+        \"nope\"
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    // 1. Named all-`pub` struct `Pos`: auto-Copy, auto-Clone, serialize, live patch, snapshot diff.
+    let mut pos = Pos { x: 10, y: 20 };
+    let before_pos = require_copy(pos);
+    let cloned_pos = pos.clone();
+
+    let mut s_pos = SerBuf::new();
+    serialize_i32_fields(pos, &mut s_pos);
+    if !s_pos.eq_str(\"x=10;y=20;\") {
+        return 1;
+    }
+
+    // Live-patch `pos.x` to 42 by runtime name, leave `pos.y` untouched.
+    if !patch_i32_field(&mut pos, runtime_field_name(0), 42) {
+        return 2;
+    }
+    if pos.x != 42 || pos.y != 20 {
+        return 3;
+    }
+    // Unknown field returns false and leaves `pos` unchanged.
+    if patch_i32_field(&mut pos, runtime_field_name(9), 99) {
+        return 4;
+    }
+    if pos.x != 42 || pos.y != 20 {
+        return 5;
+    }
+
+    // Snapshot diff via `zip_fields(before_pos, pos)` reports exact changed field and delta.
+    let mut pos_diff = SerBuf::new();
+    let pos_delta = diff_i32_fields(before_pos, pos, &mut pos_diff);
+    if pos_delta != 32 || !pos_diff.eq_str(\"x:+32;\") {
+        return 6;
+    }
+    // Cloned snapshot still matches `before_pos` with empty diff.
+    let mut zero_diff = SerBuf::new();
+    if diff_i32_fields(before_pos, cloned_pos, &mut zero_diff) != 0 || zero_diff.len != 0 {
+        return 7;
+    }
+
+    // Concrete (non-generic) `inline for (name, field) in &mut pos` live patch also works.
+    let target_y = runtime_field_name(1);
+    inline for (name, field) in &mut pos {
+        if str_eq(name, target_y) {
+            *field = 30;
+        }
+    }
+    if pos.x != 42 || pos.y != 30 {
+        return 8;
+    }
+    // Concrete (non-generic) `inline for (name, a, b) in zip_fields(before_pos, pos)` live diff.
+    let mut pos_diff2 = SerBuf::new();
+    inline for (name, a, b) in zip_fields(before_pos, pos) {
+        if a != b {
+            pos_diff2.push_str(name);
+            pos_diff2.push_byte(b':');
+            pos_diff2.push_signed_i32(b - a);
+            pos_diff2.push_byte(b';');
+        }
+    }
+    if !pos_diff2.eq_str(\"x:+32;y:+10;\") {
+        return 20;
+    }
+
+    // 2. Named all-`pub` struct `Health`: serialize & live patch `max_hp`.
+    let mut health = Health { hp: 80, max_hp: 100 };
+    let before_health = health;
+    let mut s_hp = SerBuf::new();
+    serialize_i32_fields(health, &mut s_hp);
+    if !s_hp.eq_str(\"hp=80;max_hp=100;\") {
+        return 9;
+    }
+    if !patch_i32_field(&mut health, runtime_field_name(3), 250) {
+        return 10;
+    }
+    if health.hp != 80 || health.max_hp != 250 {
+        return 11;
+    }
+    if patch_i32_field(&mut health, \"shield\", 50) {
+        return 12;
+    }
+    let mut hp_diff = SerBuf::new();
+    let hp_delta = diff_i32_fields(before_health, health, &mut hp_diff);
+    if hp_delta != 150 || !hp_diff.eq_str(\"max_hp:+150;\") {
+        return 13;
+    }
+
+    // 3. Composed structural record with spread & defaults (`EntityRecord`).
+    let mut ent: EntityRecord = { x: 10 };
+    let before_ent = require_copy(ent);
+    let mut s_ent_before = SerBuf::new();
+    serialize_i32_fields(ent, &mut s_ent_before);
+    // Structural record fields are canonically ordered alphabetically: `hp`, `x`, `y`.
+    if !s_ent_before.eq_str(\"hp=100;x=10;y=20;\") {
+        return 14;
+    }
+
+    if !patch_i32_field(&mut ent, runtime_field_name(1), 55) {
+        return 15;
+    }
+    if !patch_i32_field(&mut ent, runtime_field_name(2), 75) {
+        return 16;
+    }
+    if patch_i32_field(&mut ent, runtime_field_name(9), 123) {
+        return 17;
+    }
+    let mut s_ent_after = SerBuf::new();
+    serialize_i32_fields(ent, &mut s_ent_after);
+    if !s_ent_after.eq_str(\"hp=75;x=10;y=55;\") {
+        return 18;
+    }
+
+    // Snapshot diff on composed record: `hp` changed by -25, `y` changed by +35, `x` untouched.
+    let mut ent_diff = SerBuf::new();
+    let ent_delta = diff_i32_fields(before_ent, ent, &mut ent_diff);
+    if ent_delta != 10 || !ent_diff.eq_str(\"hp:-25;y:+35;\") {
+        return 19;
+    }
+
+    // Return 42 = pos_delta (32) + ent_delta (10)
+    pos_delta + ent_delta
+}
+");
+    assert_eq!(got, Ok(42));
 }

@@ -943,13 +943,16 @@ impl<'a> Stored<'a> {
     }
 
     /// Reads an auxiliary radix record from this answer's snapshot, sealed by `self.check`
-    /// (for `pages::encode_changes_radix` to read ONLY the touched leaf shards).
-    fn get_radix_record(&self, key: Key) -> pages::Got<'a> {
-        let held = crate::store::plain_place::snapshot_get(self.snapshot, key).ok()??;
-        match self.check {
+    /// (for `pages::encode_changes_radix` to read ONLY the touched leaf shards), propagating any
+    /// snapshot error rather than silently converting it to `None`.
+    fn get_radix_record(&self, key: Key) -> Result<pages::Got<'a>, blaze_cas::plain::SnapshotError> {
+        let Some(held) = crate::store::plain_place::snapshot_get(self.snapshot, key)? else {
+            return Ok(None);
+        };
+        Ok(match self.check {
             pages::Check::Store => Some(Ok(Sealed::by_store(key, held.bytes, held.proof))),
             pages::Check::Hashed => Some(Sealed::hashed(key, held.bytes)),
-        }
+        })
     }
 
     pub(crate) fn page_at(&self, index: usize) -> Result<Option<&VerifiedPage<'a>>, PagesError> {
@@ -1374,7 +1377,19 @@ fn save<'m, D: Driver, S: Sharing>(
     let encoded = match last {
         Some(stored) => {
             let mut pool_err: Option<CliError> = None;
-            let encoded = pages::encode_changes_radix(kept, stored.root, alloc, |key| stored.get_radix_record(key), |jobs| {
+            let mut snap_err: Option<CliError> = None;
+            let encoded = pages::encode_changes_radix(
+                kept,
+                stored.root,
+                alloc,
+                |key| match stored.get_radix_record(key) {
+                    Ok(got) => got,
+                    Err(err) => {
+                        snap_err.get_or_insert_with(|| CliError::from(crate::store::PlaceError::Snapshot(err)));
+                        None
+                    }
+                },
+                |jobs| {
                 let mut out = blaze_own::Vec::with_capacity_in(jobs.len(), alloc);
                 if jobs.len() <= 4 || workers.get() <= 1 {
                     for job in jobs {
@@ -1410,11 +1425,14 @@ fn save<'m, D: Driver, S: Sharing>(
                     out.clear();
                 }
                 out
-            }).map_err(page_error)?;
+            });
+            if let Some(error) = snap_err {
+                return Err(error);
+            }
             if let Some(error) = pool_err {
                 return Err(error);
             }
-            encoded
+            encoded.map_err(page_error)?
         }
         None => pages::encode(kept, None, alloc),
     };
@@ -1566,8 +1584,14 @@ fn save<'m, D: Driver, S: Sharing>(
         let (indexes, rekeyed) = page_indexes(lent, (reach_name.as_str(), answer_name.as_str()), last_pages, &encoded.pages, rekey, alloc)?;
         let count = u32::try_from(indexes.len()).unwrap_or(u32::MAX);
         lent.root_through(reach_name.as_str(), &indexes, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
+        // Retire any stale sharded reach roots left over if this answer previously exceeded the
+        // radix threshold and shrank back to unsharded, so certified no-ops never renew them.
+        unroot_reach_shards(lent, name, 0, true, frame);
         (count, rekeyed)
     } else {
+        if lent.has_root(reach_name.as_str()) {
+            lent.unroot(reach_name.as_str());
+        }
         let last_info = match (last, last_root) {
             (Some(base), Some(key)) => Some((base.root.page_count(), key)),
             _ => None,
@@ -2288,10 +2312,12 @@ fn publish_reach_shards_from<D: Driver>(
     let mut missing_root = false;
 
     // Incremental delta fast path: renew all base shards in O(1) and publish only changed page
-    // indexes in `{name}.reach.delta` while the accumulated delta fits within REACH_DELTA_CAP.
+    // indexes in `{name}.reach.delta` while no page was cleared to empty and the accumulated delta
+    // fits within REACH_DELTA_CAP.
     if proof.is_ok() {
         let mut added: blaze_own::Vec<blaze_cas::Key, SharedAlloc<'_>> = blaze_own::Vec::new_in(alloc);
         let mut moved = 0u32;
+        let mut cleared = false;
         let has_deltas = match source {
             #[cfg(test)]
             ReachSource::Flat { last: Some((old, _)), now } => {
@@ -2299,6 +2325,8 @@ fn publish_reach_shards_from<D: Driver>(
                     moved = moved.saturating_add(1);
                     if *is != Key::default() {
                         added.push(index_of(*is));
+                    } else {
+                        cleared = true;
                     }
                 }
                 true
@@ -2311,6 +2339,8 @@ fn publish_reach_shards_from<D: Driver>(
                         moved = moved.saturating_add(1);
                         if delta.new != Key::default() {
                             added.push(index_of(delta.new));
+                        } else {
+                            cleared = true;
                         }
                     }
                     true
@@ -2318,7 +2348,7 @@ fn publish_reach_shards_from<D: Driver>(
                 None => false,
             },
         };
-        if has_deltas {
+        if has_deltas && !cleared {
             if let Some(carried_delta) = held_root_bytes(lent, delta_name.as_str())? {
                 added.sort_unstable();
                 added.dedup();
@@ -2396,12 +2426,39 @@ fn publish_reach_shards_from<D: Driver>(
         lent.root_through(shard_name.as_str(), &scratch, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
     }
     lent.root_through(delta_name.as_str(), &[], blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
+    // Unroot any higher-numbered stale shards if the answer shrank to fewer shards.
+    unroot_reach_shards(lent, name, num_shards, false, frame);
     let whole = match proof {
         Err(why) => Some(why),
         Ok(_) if missing_root => Some(WhyWhole::NoRoot),
         Ok(_) => None,
     };
     Ok((total_live, Rekeyed { pages: rekeyed_pages, whole }))
+}
+
+/// Unroots live reach shard roots `from_shard..REACH_SHARDS_MOST` (and `{name}.reach.delta` when
+/// `include_delta` is true) so shrinking an answer never leaves stale shard roots behind.
+fn unroot_reach_shards<D: Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    name: &str,
+    from_shard: usize,
+    include_delta: bool,
+    frame: &Frame,
+) {
+    let mut shard_name = blaze_own::String::new_in(frame);
+    for shard in from_shard..REACH_SHARDS_MOST {
+        shard_name.clear();
+        let _ = write!(shard_name, "{name}.{REACH_ROOT}.{shard:02x}");
+        if lent.has_root(shard_name.as_str()) {
+            lent.unroot(shard_name.as_str());
+        }
+    }
+    if include_delta {
+        let delta_name = bstd::mem::format_in!(frame, "{name}.{REACH_ROOT}.{REACH_DELTA_SUFFIX}");
+        if lent.has_root(delta_name.as_str()) {
+            lent.unroot(delta_name.as_str());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2843,7 +2900,7 @@ mod reach_shard_tests {
             &edit_kept,
             stored_v1.root,
             alloc,
-            |k| stored_v1.get_radix_record(k),
+            |k| stored_v1.get_radix_record(k).expect("radix record"),
             |jobs| {
                 let mut out = blaze_own::Vec::with_capacity_in(jobs.len(), alloc);
                 for job in jobs { out.push(job.run(alloc)); }

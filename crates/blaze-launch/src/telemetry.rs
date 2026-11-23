@@ -36,11 +36,18 @@ use crate::Slot;
 /// to `blaze-launcher`; stripped before the program's first instruction.
 pub const VAR: &str = "BLAZE_LAUNCH_TELEMETRY";
 
+/// Advisory lock file held shared (`LOCK_SH`) by any live telemetry viewer under `<runs_dir>`,
+/// probed non-blocking (`LOCK_EX | LOCK_NB`) by `blaze run` / `blaze gc` to decide whether a dead
+/// run's `.telem` and `.meta` files can be unlinked immediately without racing a live viewer.
+pub const VIEWER_LOCK_LEAF: &str = "viewer.lock";
+
 /// Header magic for a live run's shared-memory telemetry ring (not persisted across runs).
 pub const MAGIC: [u8; 8] = *b"bztelem1";
 
 /// Header format version for the live shared-memory telemetry ring.
-pub const VERSION: u32 = 1;
+/// Version 2 stores lap-relative turn counters (`seq - slot_index`), so zero-filled OS pages
+/// are valid lap-0 slots without faulting the ring on `MappedRing::create`.
+pub const VERSION: u32 = 2;
 
 /// Maximum nested hooked spans per thread before overflowing to passthrough (rule 18).
 pub const SHADOW_DEPTH: usize = 256;

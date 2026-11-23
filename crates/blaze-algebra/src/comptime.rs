@@ -32,6 +32,42 @@ pub struct ConstGraph<const N: usize> {
     len: usize,
 }
 
+#[inline]
+const fn idx_u32(v: u32) -> usize {
+    v as usize
+}
+
+#[inline]
+const fn get_slice<T: Copy>(slice: &[T], idx: usize) -> Option<T> {
+    match slice.split_at_checked(idx) {
+        Some((_, [val, ..])) => Some(*val),
+        _ => None,
+    }
+}
+
+#[inline]
+const fn set_slice<T: Copy>(slice: &mut [T], idx: usize, val: T) {
+    if let Some((_, [slot, ..])) = slice.split_at_mut_checked(idx) {
+        *slot = val;
+    }
+}
+
+#[inline]
+const fn get_u32(slice: &[u32], idx: usize, default: u32) -> u32 {
+    match get_slice(slice, idx) {
+        Some(v) => v,
+        None => default,
+    }
+}
+
+#[inline]
+const fn get_f64(slice: &[f64], idx: usize, default: f64) -> f64 {
+    match get_slice(slice, idx) {
+        Some(v) => v,
+        None => default,
+    }
+}
+
 impl<const N: usize> ConstGraph<N> {
     /// Construct an empty compile-time expression graph of capacity `N`.
     pub const fn new() -> Self {
@@ -50,11 +86,14 @@ impl<const N: usize> ConstGraph<N> {
 
     #[inline]
     pub const fn node(&self, e: ConstExpr) -> Op {
-        self.nodes[e.0 as usize]
+        match get_slice(&self.nodes, idx_u32(e.0)) {
+            Some(op) => op,
+            None => Op::Const(0),
+        }
     }
 
     const fn const_of(&self, e: ConstExpr) -> Option<f64> {
-        self.nodes[e.0 as usize].as_const()
+        self.node(e).as_const()
     }
 
     const fn eq_op(a: Op, b: Op) -> bool {
@@ -88,8 +127,10 @@ impl<const N: usize> ConstGraph<N> {
         let norm = self.normalize_const(op);
         let mut i = 0;
         while i < self.len {
-            if Self::eq_op(self.nodes[i], norm) {
-                return Ok(ConstExpr(i as u32));
+            if let Some(existing) = get_slice(&self.nodes, i) {
+                if Self::eq_op(existing, norm) {
+                    return Ok(ConstExpr(i as u32));
+                }
             }
             i += 1;
         }
@@ -97,16 +138,17 @@ impl<const N: usize> ConstGraph<N> {
             return Err(AlgebraError::ConstCapacityExceeded { capacity: N });
         }
         let id = self.len as u32;
-        self.nodes[self.len] = norm;
+        set_slice(&mut self.nodes, self.len, norm);
         self.len += 1;
         Ok(ConstExpr(id))
     }
 
-    /// Intern an [`Op`], panicking at compile time if capacity `N` is exceeded.
+    /// Intern an [`Op`], returning a sentinel handle if capacity `N` is exceeded.
+    /// Prefer [`Self::try_intern`] when fallible handling is needed.
     pub const fn intern(&mut self, op: Op) -> ConstExpr {
         match self.try_intern(op) {
             Ok(id) => id,
-            Err(_) => panic!("ConstGraph capacity exceeded"),
+            Err(_) => ConstExpr(u32::MAX),
         }
     }
 
@@ -116,8 +158,8 @@ impl<const N: usize> ConstGraph<N> {
                 if let Some(c) = self.const_of(ConstExpr(a.0)) {
                     return Op::Const(canonical_f64_bits(-c));
                 }
-                if let Op::Neg(inner) = self.nodes[a.0 as usize] {
-                    return self.nodes[inner.0 as usize];
+                if let Op::Neg(inner) = self.node(ConstExpr(a.0)) {
+                    return self.node(ConstExpr(inner.0));
                 }
                 Op::Neg(a)
             }
@@ -127,12 +169,12 @@ impl<const N: usize> ConstGraph<N> {
                 }
                 if let Some(ca) = self.const_of(ConstExpr(a.0)) {
                     if ca == 0.0 {
-                        return self.nodes[b.0 as usize];
+                        return self.node(ConstExpr(b.0));
                     }
                 }
                 if let Some(cb) = self.const_of(ConstExpr(b.0)) {
                     if cb == 0.0 {
-                        return self.nodes[a.0 as usize];
+                        return self.node(ConstExpr(a.0));
                     }
                 }
                 if a.0 <= b.0 { Op::Add(a, b) } else { Op::Add(b, a) }
@@ -146,7 +188,7 @@ impl<const N: usize> ConstGraph<N> {
                 }
                 if let Some(cb) = self.const_of(ConstExpr(b.0)) {
                     if cb == 0.0 {
-                        return self.nodes[a.0 as usize];
+                        return self.node(ConstExpr(a.0));
                     }
                 }
                 if let Some(ca) = self.const_of(ConstExpr(a.0)) {
@@ -165,7 +207,7 @@ impl<const N: usize> ConstGraph<N> {
                         return Op::Const(canonical_f64_bits(0.0));
                     }
                     if ca == 1.0 {
-                        return self.nodes[b.0 as usize];
+                        return self.node(ConstExpr(b.0));
                     }
                 }
                 if let Some(cb) = self.const_of(ConstExpr(b.0)) {
@@ -173,7 +215,7 @@ impl<const N: usize> ConstGraph<N> {
                         return Op::Const(canonical_f64_bits(0.0));
                     }
                     if cb == 1.0 {
-                        return self.nodes[a.0 as usize];
+                        return self.node(ConstExpr(a.0));
                     }
                 }
                 if a.0 <= b.0 { Op::Mul(a, b) } else { Op::Mul(b, a) }
@@ -191,7 +233,7 @@ impl<const N: usize> ConstGraph<N> {
                 }
                 if let Some(cb) = self.const_of(ConstExpr(b.0)) {
                     if cb == 1.0 {
-                        return self.nodes[a.0 as usize];
+                        return self.node(ConstExpr(a.0));
                     }
                 }
                 if a.0 == b.0 {
@@ -205,20 +247,20 @@ impl<const N: usize> ConstGraph<N> {
                         return Op::Const(canonical_f64_bits(1.0));
                     }
                     if cb == 1.0 {
-                        return self.nodes[a.0 as usize];
+                        return self.node(ConstExpr(a.0));
                     }
                 }
                 Op::Pow(a, b)
             }
             Op::Select(c, t, e) => {
                 if t.0 == e.0 {
-                    return self.nodes[t.0 as usize];
+                    return self.node(ConstExpr(t.0));
                 }
                 if let Some(cv) = self.const_of(ConstExpr(c.0)) {
                     return if cv > 0.0 {
-                        self.nodes[t.0 as usize]
+                        self.node(ConstExpr(t.0))
                     } else {
-                        self.nodes[e.0 as usize]
+                        self.node(ConstExpr(e.0))
                     };
                 }
                 Op::Select(c, t, e)
@@ -307,200 +349,298 @@ impl<const N: usize> ConstGraph<N> {
         self.select(c, a, b)
     }
 
-    /// **Compile-time symbolic differentiation** `∂(expr) / ∂(var_id)` inside `const fn`!
-    pub const fn diff(&mut self, expr: ConstExpr, wrt_var: u32) -> ConstExpr {
-        let mut cache: [u32; N] = [u32::MAX; N];
-        self.diff_memo(expr, wrt_var, &mut cache)
-    }
-
-    const fn diff_memo(&mut self, expr: ConstExpr, wrt_var: u32, cache: &mut [u32; N]) -> ConstExpr {
-        let idx = expr.0 as usize;
-        if cache[idx] != u32::MAX {
-            return ConstExpr(cache[idx]);
+    const fn mark_reachable(&self, root: ConstExpr, include_select_cond: bool) -> [bool; N] {
+        let mut needed = [false; N];
+        let root_idx = idx_u32(root.0);
+        if root_idx >= self.len || root_idx >= N {
+            return needed;
         }
-        let op = self.nodes[idx];
-        let out = match op {
-            Op::Const(_) => self.lit(0.0),
-            Op::Var(v) => self.lit(if v.0 == wrt_var { 1.0 } else { 0.0 }),
-            Op::Neg(u) => {
-                let du = self.diff_memo(ConstExpr(u.0), wrt_var, cache);
-                self.neg(du)
+        set_slice(&mut needed, root_idx, true);
+        let mut i = root_idx + 1;
+        while i > 0 {
+            i -= 1;
+            if !matches!(get_slice(&needed, i), Some(true)) {
+                continue;
             }
-            Op::Add(u, v) => {
-                let du = self.diff_memo(ConstExpr(u.0), wrt_var, cache);
-                let dv = self.diff_memo(ConstExpr(v.0), wrt_var, cache);
-                self.add(du, dv)
-            }
-            Op::Sub(u, v) => {
-                let du = self.diff_memo(ConstExpr(u.0), wrt_var, cache);
-                let dv = self.diff_memo(ConstExpr(v.0), wrt_var, cache);
-                self.sub(du, dv)
-            }
-            Op::Mul(u, v) => {
-                let du = self.diff_memo(ConstExpr(u.0), wrt_var, cache);
-                let dv = self.diff_memo(ConstExpr(v.0), wrt_var, cache);
-                let t1 = self.mul(du, ConstExpr(v.0));
-                let t2 = self.mul(ConstExpr(u.0), dv);
-                self.add(t1, t2)
-            }
-            Op::Div(u, v) => {
-                let du = self.diff_memo(ConstExpr(u.0), wrt_var, cache);
-                let dv = self.diff_memo(ConstExpr(v.0), wrt_var, cache);
-                let t1 = self.mul(du, ConstExpr(v.0));
-                let t2 = self.mul(ConstExpr(u.0), dv);
-                let num = self.sub(t1, t2);
-                let two = self.lit(2.0);
-                let den = self.pow(ConstExpr(v.0), two);
-                self.div(num, den)
-            }
-            Op::Pow(u, v) => {
-                let du = self.diff_memo(ConstExpr(u.0), wrt_var, cache);
-                let dv = self.diff_memo(ConstExpr(v.0), wrt_var, cache);
-                let is_const_exp = match self.nodes[dv.0 as usize].as_const() {
-                    Some(c) => c == 0.0,
-                    None => false,
-                };
-                if is_const_exp {
-                    let one = self.lit(1.0);
-                    let vm1 = self.sub(ConstExpr(v.0), one);
-                    let up = self.pow(ConstExpr(u.0), vm1);
-                    let c_up = self.mul(ConstExpr(v.0), up);
-                    self.mul(c_up, du)
-                } else {
-                    let ln_u = self.ln(ConstExpr(u.0));
-                    let t1 = self.mul(dv, ln_u);
-                    let v_du = self.mul(ConstExpr(v.0), du);
-                    let t2 = self.div(v_du, ConstExpr(u.0));
-                    let sum = self.add(t1, t2);
-                    self.mul(expr, sum)
+            let Some(op) = get_slice(&self.nodes, i) else {
+                continue;
+            };
+            match op {
+                Op::Const(_) | Op::Var(_) => {}
+                Op::Neg(a)
+                | Op::Sin(a)
+                | Op::Cos(a)
+                | Op::Tan(a)
+                | Op::Exp(a)
+                | Op::Ln(a)
+                | Op::Sqrt(a)
+                | Op::Tanh(a)
+                | Op::Abs(a) => {
+                    set_slice(&mut needed, idx_u32(a.0), true);
+                }
+                Op::Add(a, b)
+                | Op::Sub(a, b)
+                | Op::Mul(a, b)
+                | Op::Div(a, b)
+                | Op::Pow(a, b) => {
+                    set_slice(&mut needed, idx_u32(a.0), true);
+                    set_slice(&mut needed, idx_u32(b.0), true);
+                }
+                Op::Select(c, t, e) => {
+                    if include_select_cond {
+                        set_slice(&mut needed, idx_u32(c.0), true);
+                    }
+                    set_slice(&mut needed, idx_u32(t.0), true);
+                    set_slice(&mut needed, idx_u32(e.0), true);
+                }
+                Op::Fma(a, b, c) => {
+                    set_slice(&mut needed, idx_u32(a.0), true);
+                    set_slice(&mut needed, idx_u32(b.0), true);
+                    set_slice(&mut needed, idx_u32(c.0), true);
                 }
             }
-            Op::Sin(u) => {
-                let du = self.diff_memo(ConstExpr(u.0), wrt_var, cache);
-                let cu = self.cos(ConstExpr(u.0));
-                self.mul(cu, du)
+        }
+        needed
+    }
+
+    /// **Compile-time symbolic differentiation** `∂(expr) / ∂(var_id)` inside `const fn`!
+    pub const fn diff(&mut self, expr: ConstExpr, wrt_var: u32) -> ConstExpr {
+        let root_idx = idx_u32(expr.0);
+        if root_idx >= self.len || root_idx >= N {
+            return ConstExpr(u32::MAX);
+        }
+        let needed = self.mark_reachable(expr, false);
+        let mut cache: [u32; N] = [u32::MAX; N];
+        let mut i = 0;
+        while i <= root_idx {
+            if matches!(get_slice(&needed, i), Some(true)) {
+                let cur = ConstExpr(i as u32);
+                let op = self.node(cur);
+                let out = match op {
+                    Op::Const(_) => self.lit(0.0),
+                    Op::Var(v) => self.lit(if v.0 == wrt_var { 1.0 } else { 0.0 }),
+                    Op::Neg(u) => {
+                        let du = ConstExpr(get_u32(&cache, idx_u32(u.0), u32::MAX));
+                        self.neg(du)
+                    }
+                    Op::Add(u, v) => {
+                        let du = ConstExpr(get_u32(&cache, idx_u32(u.0), u32::MAX));
+                        let dv = ConstExpr(get_u32(&cache, idx_u32(v.0), u32::MAX));
+                        self.add(du, dv)
+                    }
+                    Op::Sub(u, v) => {
+                        let du = ConstExpr(get_u32(&cache, idx_u32(u.0), u32::MAX));
+                        let dv = ConstExpr(get_u32(&cache, idx_u32(v.0), u32::MAX));
+                        self.sub(du, dv)
+                    }
+                    Op::Mul(u, v) => {
+                        let du = ConstExpr(get_u32(&cache, idx_u32(u.0), u32::MAX));
+                        let dv = ConstExpr(get_u32(&cache, idx_u32(v.0), u32::MAX));
+                        let t1 = self.mul(du, ConstExpr(v.0));
+                        let t2 = self.mul(ConstExpr(u.0), dv);
+                        self.add(t1, t2)
+                    }
+                    Op::Div(u, v) => {
+                        let du = ConstExpr(get_u32(&cache, idx_u32(u.0), u32::MAX));
+                        let dv = ConstExpr(get_u32(&cache, idx_u32(v.0), u32::MAX));
+                        let t1 = self.mul(du, ConstExpr(v.0));
+                        let t2 = self.mul(ConstExpr(u.0), dv);
+                        let num = self.sub(t1, t2);
+                        let two = self.lit(2.0);
+                        let den = self.pow(ConstExpr(v.0), two);
+                        self.div(num, den)
+                    }
+                    Op::Pow(u, v) => {
+                        let du = ConstExpr(get_u32(&cache, idx_u32(u.0), u32::MAX));
+                        let dv = ConstExpr(get_u32(&cache, idx_u32(v.0), u32::MAX));
+                        let is_const_exp = match self.node(dv).as_const() {
+                            Some(c) => c == 0.0,
+                            None => false,
+                        };
+                        if is_const_exp {
+                            let one = self.lit(1.0);
+                            let vm1 = self.sub(ConstExpr(v.0), one);
+                            let up = self.pow(ConstExpr(u.0), vm1);
+                            let c_up = self.mul(ConstExpr(v.0), up);
+                            self.mul(c_up, du)
+                        } else {
+                            let ln_u = self.ln(ConstExpr(u.0));
+                            let t1 = self.mul(dv, ln_u);
+                            let v_du = self.mul(ConstExpr(v.0), du);
+                            let t2 = self.div(v_du, ConstExpr(u.0));
+                            let sum = self.add(t1, t2);
+                            self.mul(cur, sum)
+                        }
+                    }
+                    Op::Sin(u) => {
+                        let du = ConstExpr(get_u32(&cache, idx_u32(u.0), u32::MAX));
+                        let cu = self.cos(ConstExpr(u.0));
+                        self.mul(cu, du)
+                    }
+                    Op::Cos(u) => {
+                        let du = ConstExpr(get_u32(&cache, idx_u32(u.0), u32::MAX));
+                        let su = self.sin(ConstExpr(u.0));
+                        let nsu = self.neg(su);
+                        self.mul(nsu, du)
+                    }
+                    Op::Exp(u) => {
+                        let du = ConstExpr(get_u32(&cache, idx_u32(u.0), u32::MAX));
+                        self.mul(cur, du)
+                    }
+                    Op::Ln(u) => {
+                        let du = ConstExpr(get_u32(&cache, idx_u32(u.0), u32::MAX));
+                        self.div(du, ConstExpr(u.0))
+                    }
+                    Op::Sqrt(u) => {
+                        let du = ConstExpr(get_u32(&cache, idx_u32(u.0), u32::MAX));
+                        let two = self.lit(2.0);
+                        let den = self.mul(two, cur);
+                        self.div(du, den)
+                    }
+                    Op::Tan(u) => {
+                        let du = ConstExpr(get_u32(&cache, idx_u32(u.0), u32::MAX));
+                        let cu = self.cos(ConstExpr(u.0));
+                        let two = self.lit(2.0);
+                        let cu2 = self.pow(cu, two);
+                        self.div(du, cu2)
+                    }
+                    Op::Tanh(u) => {
+                        let du = ConstExpr(get_u32(&cache, idx_u32(u.0), u32::MAX));
+                        let one = self.lit(1.0);
+                        let two = self.lit(2.0);
+                        let t2 = self.pow(cur, two);
+                        let sech2 = self.sub(one, t2);
+                        self.mul(sech2, du)
+                    }
+                    Op::Abs(u) => {
+                        let du = ConstExpr(get_u32(&cache, idx_u32(u.0), u32::MAX));
+                        let sign = self.div(ConstExpr(u.0), cur);
+                        self.mul(sign, du)
+                    }
+                    Op::Select(c, t, e) => {
+                        let dt = ConstExpr(get_u32(&cache, idx_u32(t.0), u32::MAX));
+                        let de = ConstExpr(get_u32(&cache, idx_u32(e.0), u32::MAX));
+                        self.select(ConstExpr(c.0), dt, de)
+                    }
+                    Op::Fma(a, b, c) => {
+                        let da = ConstExpr(get_u32(&cache, idx_u32(a.0), u32::MAX));
+                        let db = ConstExpr(get_u32(&cache, idx_u32(b.0), u32::MAX));
+                        let dc = ConstExpr(get_u32(&cache, idx_u32(c.0), u32::MAX));
+                        let t1 = self.mul(da, ConstExpr(b.0));
+                        let t2 = self.mul(ConstExpr(a.0), db);
+                        let sum = self.add(t1, t2);
+                        self.add(sum, dc)
+                    }
+                };
+                set_slice(&mut cache, i, out.0);
             }
-            Op::Cos(u) => {
-                let du = self.diff_memo(ConstExpr(u.0), wrt_var, cache);
-                let su = self.sin(ConstExpr(u.0));
-                let nsu = self.neg(su);
-                self.mul(nsu, du)
-            }
-            Op::Exp(u) => {
-                let du = self.diff_memo(ConstExpr(u.0), wrt_var, cache);
-                self.mul(expr, du)
-            }
-            Op::Ln(u) => {
-                let du = self.diff_memo(ConstExpr(u.0), wrt_var, cache);
-                self.div(du, ConstExpr(u.0))
-            }
-            Op::Sqrt(u) => {
-                let du = self.diff_memo(ConstExpr(u.0), wrt_var, cache);
-                let two = self.lit(2.0);
-                let den = self.mul(two, expr);
-                self.div(du, den)
-            }
-            Op::Tan(u) => {
-                let du = self.diff_memo(ConstExpr(u.0), wrt_var, cache);
-                let cu = self.cos(ConstExpr(u.0));
-                let two = self.lit(2.0);
-                let cu2 = self.pow(cu, two);
-                self.div(du, cu2)
-            }
-            Op::Tanh(u) => {
-                let du = self.diff_memo(ConstExpr(u.0), wrt_var, cache);
-                let one = self.lit(1.0);
-                let two = self.lit(2.0);
-                let t2 = self.pow(expr, two);
-                let sech2 = self.sub(one, t2);
-                self.mul(sech2, du)
-            }
-            Op::Abs(u) => {
-                let du = self.diff_memo(ConstExpr(u.0), wrt_var, cache);
-                let sign = self.div(ConstExpr(u.0), expr);
-                self.mul(sign, du)
-            }
-            Op::Select(c, t, e) => {
-                let dt = self.diff_memo(ConstExpr(t.0), wrt_var, cache);
-                let de = self.diff_memo(ConstExpr(e.0), wrt_var, cache);
-                self.select(ConstExpr(c.0), dt, de)
-            }
-            Op::Fma(a, b, c) => {
-                let da = self.diff_memo(ConstExpr(a.0), wrt_var, cache);
-                let db = self.diff_memo(ConstExpr(b.0), wrt_var, cache);
-                let dc = self.diff_memo(ConstExpr(c.0), wrt_var, cache);
-                let t1 = self.mul(da, ConstExpr(b.0));
-                let t2 = self.mul(ConstExpr(a.0), db);
-                let sum = self.add(t1, t2);
-                self.add(sum, dc)
-            }
-        };
-        cache[idx] = out.0;
-        out
+            i += 1;
+        }
+        ConstExpr(get_u32(&cache, root_idx, u32::MAX))
     }
 
     /// **Compile-time evaluation** of rational/polynomial/integer-power expressions in `const fn`!
+    /// Returns `f64::NAN` for transcendental ops (use runtime [`Self::eval`] with `blaze-math`).
     pub const fn eval_const(&self, expr: ConstExpr, env: &[f64]) -> f64 {
-        match self.nodes[expr.0 as usize] {
-            Op::Const(bits) => f64::from_bits(bits),
-            Op::Var(v) => env[v.0 as usize],
-            Op::Neg(a) => -self.eval_const(ConstExpr(a.0), env),
-            Op::Add(a, b) => self.eval_const(ConstExpr(a.0), env) + self.eval_const(ConstExpr(b.0), env),
-            Op::Sub(a, b) => self.eval_const(ConstExpr(a.0), env) - self.eval_const(ConstExpr(b.0), env),
-            Op::Mul(a, b) => self.eval_const(ConstExpr(a.0), env) * self.eval_const(ConstExpr(b.0), env),
-            Op::Div(a, b) => self.eval_const(ConstExpr(a.0), env) / self.eval_const(ConstExpr(b.0), env),
-            Op::Pow(a, b) => {
-                let base = self.eval_const(ConstExpr(a.0), env);
-                let exp = self.eval_const(ConstExpr(b.0), env);
-                const_powi(base, exp as i32)
-            }
-            Op::Select(c, t, e) => {
-                if self.eval_const(ConstExpr(c.0), env) > 0.0 {
-                    self.eval_const(ConstExpr(t.0), env)
-                } else {
-                    self.eval_const(ConstExpr(e.0), env)
-                }
-            }
-            Op::Fma(a, b, c) => {
-                self.eval_const(ConstExpr(a.0), env) * self.eval_const(ConstExpr(b.0), env)
-                    + self.eval_const(ConstExpr(c.0), env)
-            }
-            _ => panic!("transcendental eval_const requires runtime `eval` with `blaze-math`"),
+        let root_idx = idx_u32(expr.0);
+        if root_idx >= self.len || root_idx >= N {
+            return f64::NAN;
         }
+        let needed = self.mark_reachable(expr, true);
+        let mut vals: [f64; N] = [0.0; N];
+        let mut i = 0;
+        while i <= root_idx {
+            if matches!(get_slice(&needed, i), Some(true)) {
+                let op = match get_slice(&self.nodes, i) {
+                    Some(op) => op,
+                    None => Op::Const(0),
+                };
+                let val = match op {
+                    Op::Const(bits) => f64::from_bits(bits),
+                    Op::Var(v) => get_f64(env, idx_u32(v.0), f64::NAN),
+                    Op::Neg(a) => -get_f64(&vals, idx_u32(a.0), f64::NAN),
+                    Op::Add(a, b) => get_f64(&vals, idx_u32(a.0), f64::NAN) + get_f64(&vals, idx_u32(b.0), f64::NAN),
+                    Op::Sub(a, b) => get_f64(&vals, idx_u32(a.0), f64::NAN) - get_f64(&vals, idx_u32(b.0), f64::NAN),
+                    Op::Mul(a, b) => get_f64(&vals, idx_u32(a.0), f64::NAN) * get_f64(&vals, idx_u32(b.0), f64::NAN),
+                    Op::Div(a, b) => get_f64(&vals, idx_u32(a.0), f64::NAN) / get_f64(&vals, idx_u32(b.0), f64::NAN),
+                    Op::Pow(a, b) => {
+                        let base = get_f64(&vals, idx_u32(a.0), f64::NAN);
+                        let exp = get_f64(&vals, idx_u32(b.0), f64::NAN);
+                        const_powi(base, exp as i32)
+                    }
+                    Op::Select(c, t, e) => {
+                        if get_f64(&vals, idx_u32(c.0), f64::NAN) > 0.0 {
+                            get_f64(&vals, idx_u32(t.0), f64::NAN)
+                        } else {
+                            get_f64(&vals, idx_u32(e.0), f64::NAN)
+                        }
+                    }
+                    Op::Fma(a, b, c) => {
+                        get_f64(&vals, idx_u32(a.0), f64::NAN) * get_f64(&vals, idx_u32(b.0), f64::NAN)
+                            + get_f64(&vals, idx_u32(c.0), f64::NAN)
+                    }
+                    _ => f64::NAN,
+                };
+                set_slice(&mut vals, i, val);
+            }
+            i += 1;
+        }
+        get_f64(&vals, root_idx, f64::NAN)
     }
 
     /// Runtime deterministic evaluation (supports all transcendental ops via `blaze-math`).
     pub fn eval(&self, expr: ConstExpr, env: &[f64]) -> f64 {
-        match self.nodes[expr.0 as usize] {
-            Op::Const(bits) => f64::from_bits(bits),
-            Op::Var(v) => env[v.0 as usize],
-            Op::Neg(a) => -self.eval(ConstExpr(a.0), env),
-            Op::Add(a, b) => self.eval(ConstExpr(a.0), env) + self.eval(ConstExpr(b.0), env),
-            Op::Sub(a, b) => self.eval(ConstExpr(a.0), env) - self.eval(ConstExpr(b.0), env),
-            Op::Mul(a, b) => self.eval(ConstExpr(a.0), env) * self.eval(ConstExpr(b.0), env),
-            Op::Div(a, b) => self.eval(ConstExpr(a.0), env) / self.eval(ConstExpr(b.0), env),
-            Op::Pow(a, b) => blaze_math::pow(self.eval(ConstExpr(a.0), env), self.eval(ConstExpr(b.0), env)),
-            Op::Sin(a) => blaze_math::sin(self.eval(ConstExpr(a.0), env)),
-            Op::Cos(a) => blaze_math::cos(self.eval(ConstExpr(a.0), env)),
-            Op::Tan(a) => blaze_math::tan(self.eval(ConstExpr(a.0), env)),
-            Op::Exp(a) => blaze_math::exp(self.eval(ConstExpr(a.0), env)),
-            Op::Ln(a) => blaze_math::ln(self.eval(ConstExpr(a.0), env)),
-            Op::Sqrt(a) => blaze_math::sqrt(self.eval(ConstExpr(a.0), env)),
-            Op::Tanh(a) => crate::det_tanh(self.eval(ConstExpr(a.0), env)),
-            Op::Abs(a) => blaze_math::abs(self.eval(ConstExpr(a.0), env)),
-            Op::Select(c, t, e) => {
-                if self.eval(ConstExpr(c.0), env) > 0.0 {
-                    self.eval(ConstExpr(t.0), env)
-                } else {
-                    self.eval(ConstExpr(e.0), env)
-                }
-            }
-            Op::Fma(a, b, c) => blaze_math::mul_add(
-                self.eval(ConstExpr(a.0), env),
-                self.eval(ConstExpr(b.0), env),
-                self.eval(ConstExpr(c.0), env),
-            ),
+        let root_idx = idx_u32(expr.0);
+        if root_idx >= self.len || root_idx >= N {
+            return f64::NAN;
         }
+        let needed = self.mark_reachable(expr, true);
+        let mut vals: [f64; N] = [0.0; N];
+        let mut i = 0;
+        while i <= root_idx {
+            if matches!(get_slice(&needed, i), Some(true)) {
+                let op = match get_slice(&self.nodes, i) {
+                    Some(op) => op,
+                    None => Op::Const(0),
+                };
+                let val = match op {
+                    Op::Const(bits) => f64::from_bits(bits),
+                    Op::Var(v) => get_f64(env, idx_u32(v.0), f64::NAN),
+                    Op::Neg(a) => -get_f64(&vals, idx_u32(a.0), f64::NAN),
+                    Op::Add(a, b) => get_f64(&vals, idx_u32(a.0), f64::NAN) + get_f64(&vals, idx_u32(b.0), f64::NAN),
+                    Op::Sub(a, b) => get_f64(&vals, idx_u32(a.0), f64::NAN) - get_f64(&vals, idx_u32(b.0), f64::NAN),
+                    Op::Mul(a, b) => get_f64(&vals, idx_u32(a.0), f64::NAN) * get_f64(&vals, idx_u32(b.0), f64::NAN),
+                    Op::Div(a, b) => get_f64(&vals, idx_u32(a.0), f64::NAN) / get_f64(&vals, idx_u32(b.0), f64::NAN),
+                    Op::Pow(a, b) => blaze_math::pow(
+                        get_f64(&vals, idx_u32(a.0), f64::NAN),
+                        get_f64(&vals, idx_u32(b.0), f64::NAN),
+                    ),
+                    Op::Sin(a) => blaze_math::sin(get_f64(&vals, idx_u32(a.0), f64::NAN)),
+                    Op::Cos(a) => blaze_math::cos(get_f64(&vals, idx_u32(a.0), f64::NAN)),
+                    Op::Tan(a) => blaze_math::tan(get_f64(&vals, idx_u32(a.0), f64::NAN)),
+                    Op::Exp(a) => blaze_math::exp(get_f64(&vals, idx_u32(a.0), f64::NAN)),
+                    Op::Ln(a) => blaze_math::ln(get_f64(&vals, idx_u32(a.0), f64::NAN)),
+                    Op::Sqrt(a) => blaze_math::sqrt(get_f64(&vals, idx_u32(a.0), f64::NAN)),
+                    Op::Tanh(a) => crate::det_tanh(get_f64(&vals, idx_u32(a.0), f64::NAN)),
+                    Op::Abs(a) => blaze_math::abs(get_f64(&vals, idx_u32(a.0), f64::NAN)),
+                    Op::Select(c, t, e) => {
+                        if get_f64(&vals, idx_u32(c.0), f64::NAN) > 0.0 {
+                            get_f64(&vals, idx_u32(t.0), f64::NAN)
+                        } else {
+                            get_f64(&vals, idx_u32(e.0), f64::NAN)
+                        }
+                    }
+                    Op::Fma(a, b, c) => blaze_math::mul_add(
+                        get_f64(&vals, idx_u32(a.0), f64::NAN),
+                        get_f64(&vals, idx_u32(b.0), f64::NAN),
+                        get_f64(&vals, idx_u32(c.0), f64::NAN),
+                    ),
+                };
+                set_slice(&mut vals, i, val);
+            }
+            i += 1;
+        }
+        get_f64(&vals, root_idx, f64::NAN)
     }
 }
 

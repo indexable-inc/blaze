@@ -453,31 +453,44 @@ impl Expr {
     /// parens or other delimiters, e.g., `X { y: 1 }`, `X { y: 1 }.method()`, `foo == X { y: 1 }` and
     /// `X { y: 1 } == foo` all do, but `(X { y: 1 }) == foo` does not.
     fn contains_exterior_struct_lit(&self) -> bool {
-        return contains_exterior_struct_lit_inner(self).is_some();
-
-        fn contains_exterior_struct_lit_inner(expr: &Expr) -> Option<()> {
+        fn children(expr: &Expr) -> Result<(Option<Expr>, Option<Expr>), ()> {
             use Expr::*;
-
             match expr {
-                RecordExpr(..) => Some(()),
-
+                RecordExpr(..) => Err(()),
                 // X { y: 1 } + X { y: 2 }
-                BinExpr(e) => e
-                    .lhs()
-                    .as_ref()
-                    .and_then(contains_exterior_struct_lit_inner)
-                    .or_else(|| e.rhs().as_ref().and_then(contains_exterior_struct_lit_inner)),
-
+                BinExpr(e) => Ok((e.lhs(), e.rhs())),
                 // `&X { y: 1 }`, `X { y: 1 }.y`, `X { y: 1 }.bar(...)`, etc
-                IndexExpr(e) => contains_exterior_struct_lit_inner(&e.base()?),
-                AwaitExpr(e) => contains_exterior_struct_lit_inner(&e.expr()?),
-                PrefixExpr(e) => contains_exterior_struct_lit_inner(&e.expr()?),
-                CastExpr(e) => contains_exterior_struct_lit_inner(&e.expr()?),
-                FieldExpr(e) => contains_exterior_struct_lit_inner(&e.expr()?),
-                MethodCallExpr(e) => contains_exterior_struct_lit_inner(&e.receiver()?),
-
-                _ => None,
+                IndexExpr(e) => Ok((e.base(), None)),
+                AwaitExpr(e) => Ok((e.expr(), None)),
+                PrefixExpr(e) => Ok((e.expr(), None)),
+                CastExpr(e) => Ok((e.expr(), None)),
+                FieldExpr(e) => Ok((e.expr(), None)),
+                MethodCallExpr(e) => Ok((e.receiver(), None)),
+                _ => Ok((None, None)),
             }
+        }
+
+        let mut worklist = blaze_mem::scratch::Scratch::new();
+        let worklist = worklist.take();
+        let Ok((mut first, mut second)) = children(self) else {
+            return true;
+        };
+        loop {
+            let next = match (first, second) {
+                (Some(lhs), Some(rhs)) => {
+                    worklist.push(rhs);
+                    Some(lhs)
+                }
+                (Some(child), None) | (None, Some(child)) => Some(child),
+                (None, None) => None,
+            };
+            let Some(curr) = next.or_else(|| worklist.pop()) else {
+                return false;
+            };
+            let Ok(pair) = children(&curr) else {
+                return true;
+            };
+            (first, second) = pair;
         }
     }
 

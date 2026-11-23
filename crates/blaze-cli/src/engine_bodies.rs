@@ -206,14 +206,14 @@ const REFUSED_CAUSES_SHOWN: usize = 16;
 /// plan time does not know) has no row of it: a `#[cfg(test)]` body is the test build's alone,
 /// at its plain name when the test build is its first holder; a body a unit reaching its file
 /// cuts everywhere has no row at all. What plan time cannot decide keeps every reacher's row.
-pub(crate) fn plan_views<'h, P: ViewPlan>(outlined: &[Outlined<'_>], skipped: &[Name], reach: Option<&Reach>, alloc: SharedAlloc<'h>) -> SVec<'h, Planned> {
+pub(crate) fn plan_views<'h, P: ViewPlan>(outlined: &[Outlined<'_>], skipped: &[Name], external: &[Name], reach: Option<&Reach>, alloc: SharedAlloc<'h>) -> SVec<'h, Planned> {
     let mut planned: SVec<'h, Planned> = SVec::new_in(alloc);
     // The holders' views of the body at hand, in rank: what `P` is asked over.
     let mut views: SVec<'h, ViewKey> = SVec::new_in(alloc);
     for one in outlined.iter() {
         // Outlines are retained for the module closure and its note, but a file exclusive to a
-        // skipped target has no Bodies task and therefore cannot become ownerless.
-        if skipped.binary_search(&one.name).is_ok() {
+        // skipped target or an external checkout path package has no Bodies task.
+        if skipped.binary_search(&one.name).is_ok() || external.binary_search(&one.name).is_ok() {
             continue;
         }
         let Ok(record) = &one.made else { continue };
@@ -594,10 +594,9 @@ const BODY_SCRATCH: usize = 1 << 30;
 /// grew it to (blaze-mem `Frame::reset`), so a run's scratch held its largest body's high-water
 /// until the run's last body ended, once a worker. Past this the blocks ahead of the cursor go
 /// back to the kernel as the next body begins (`Frame::trim`): a worker holds at most this
-/// between bodies, and a large body pays its own page faults. 32 MiB holds the scratch of every
-/// body of the ladder's projects whose profile line names one (the recorder's cells for about
-/// 200,000 reads).
-const SCRATCH_KEEP: usize = 32 << 20;
+/// between bodies, and a large body pays its own page faults. 8 MiB holds the scratch of typical
+/// bodies without pinning 576 MiB across 18 workers.
+const SCRATCH_KEEP: usize = 8 << 20;
 
 /// What the runs' frames held committed (rule 16): the scratch's most at a body's end, the
 /// stretch frame's most at a stretch's end, and how many times a scratch was trimmed back to
@@ -1299,14 +1298,44 @@ fn stands<'v, 'r>(view: &'v crate::engine_members_record::View<'r>, place: u32, 
 }
 
 /// Whether the member `kept` of a members record is today's `unit` with today's names input
-/// (the half of [`stands`] past the record's own read list; [`stands_below`] shares it).
+/// (or refusal state for a standing refused member; the half of [`stands`] past the record's own
+/// read list; [`stands_below`] shares it).
 fn stands_as(kept: &crate::engine_members_record::Member<'_>, unit: &crate::engine_body_plan::Unit, names: NamesInputs<'_, '_>) -> bool {
-    let today = match names.entry(unit.name) {
-        Some(entered) => entered.map(|own| (own.name, own.out)),
-        None => names.stood_on().map(|_| (unit.name, kept.names_out)),
-    };
-    let Some((own_name, own_out)) = today else { return false };
-    kept.unit == *unit && kept.names == own_name && kept.names_out == own_out && own_out != work::failed_out()
+    if kept.unit != *unit {
+        return false;
+    }
+    match &kept.state {
+        crate::engine_members_record::MemberState::Held(held) => {
+            let today = match names.entry(unit.name) {
+                Some(entered) => entered.map(|own| (own.name, own.out)),
+                None => names.stood_on().map(|_| (unit.name, held.names_out)),
+            };
+            let Some((own_name, own_out)) = today else { return false };
+            held.names == own_name && held.names_out == own_out && own_out != work::failed_out()
+        }
+        crate::engine_members_record::MemberState::CutScope(cut) => {
+            let own_today = match names.entry(unit.name) {
+                Some(entered) => entered.map(|own| (own.name, own.out)),
+                None => names.stood_on().map(|_| (unit.name, cut.names_out)),
+            };
+            let Some((own_name, own_out)) = own_today else { return false };
+            if cut.names != own_name || cut.names_out != own_out || own_out == work::failed_out() {
+                return false;
+            }
+            match names.entry(cut.missing) {
+                Some(Some(_)) => false,
+                Some(None) => cut.missing_failed,
+                None => names.stood_on().is_some(),
+            }
+        }
+        crate::engine_members_record::MemberState::Refused(crate::engine_members_record::RefusedWhy::ScopeFailed) => match names.entry(unit.name) {
+            Some(None) => true,
+            Some(Some(_)) => false,
+            None => names.stood_on().is_some(),
+        },
+        crate::engine_members_record::MemberState::Refused(crate::engine_members_record::RefusedWhy::NoNamesTask) => names.entry(unit.name).is_none(),
+        crate::engine_members_record::MemberState::Refused(crate::engine_members_record::RefusedWhy::Unstood) => false,
+    }
 }
 
 /// PIECE A, THE STAND BELOW THE HEADS: member `place` stands from the members record though a
@@ -1373,7 +1402,10 @@ pub(crate) enum ReachFrom {
 /// reach and the difference named (`groups`).
 fn own_row_entered(kept: &crate::engine_members_record::Member<'_>, rows: &[TaskRow], rank: Option<u32>) -> bool {
     let Some(rank) = rank else { return true };
-    rows.iter().any(|row| row.rank == rank && kept.held.iter().any(|held| held.slot == row.file))
+    match &kept.state {
+        crate::engine_members_record::MemberState::Held(held) => rows.iter().any(|row| row.rank == rank && held.held.iter().any(|h| h.slot == row.file)),
+        crate::engine_members_record::MemberState::CutScope(_) | crate::engine_members_record::MemberState::Refused(_) => true,
+    }
 }
 
 /// The two names a held file's path in a member's items record may be outlined under: its own,
@@ -2130,6 +2162,9 @@ pub(crate) struct BodiesStage<'f> {
     /// member's held file among them is the setup's typed refusal (`groups`), never a
     /// `NotOutlined` head. `None`: every outline was read (the phase path).
     unread: Option<Vec<Name, blaze_own::Alloc<'static>>>,
+    /// Full-file `FILE_DOMAIN` digests from the request's initial sweep for unread `/0/` checkout
+    /// files, sorted by path: verifies lazy disk reads stay on the request snapshot.
+    unread_digests: Option<blaze_own::Arc<blaze_own::Vec<(blaze_own::String<SharedAlloc<'static>>, ContentId), SharedAlloc<'static>>, SharedAlloc<'static>>>,
     /// The members record this request put, for the driver to name under the checkout's
     /// members root ([`BodiesStage::members_record`]).
     members_key: Option<Key>,
@@ -2355,6 +2390,7 @@ struct CachedDepFile {
     index: u32,
     edition: u8,
     text_len: usize,
+    text_digest: ContentId,
     surface: ContentId,
     bytes: Vec<u8, SharedAlloc<'static>>,
 }
@@ -2385,6 +2421,7 @@ impl DependencyFiles {
         world_at: usize,
         index: u32,
         text: &'n str,
+        digest: ContentId,
         edition: blaze_surface::Edition,
         bump: blaze_own::Bump<'n>,
     ) -> Result<blaze_scope::items_record::CurrentFile<'n>, blaze_scope::items_record::ItemsRecordError> {
@@ -2396,6 +2433,7 @@ impl DependencyFiles {
             && cached.index == index
             && cached.edition == ed
             && cached.text_len == text.len()
+            && cached.text_digest == digest
         {
             let view = blaze_surface::FileItemsView::read(blaze_scope::resolve::aligned(&cached.bytes, bump))
                 .map_err(|why| blaze_scope::items_record::ItemsRecordError::FileItemsRead { file: index, why })?;
@@ -2403,7 +2441,6 @@ impl DependencyFiles {
         }
         let alloc = self.heap.alloc();
         let outline = blaze_file_items::outline(text, edition, alloc);
-        let digest = ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes());
         let raw = outline.to_file_items(text, digest, alloc)
             .map_err(|why| blaze_scope::items_record::ItemsRecordError::FileItemsBuild { file: index, why })?;
         let surface = outline.surface();
@@ -2420,7 +2457,7 @@ impl DependencyFiles {
             }
         };
         if let Some(slot) = slots.and_then(|slots| slots.get(at)) {
-            let _ = slot.set(CachedDepFile { world_at, index, edition: ed, text_len: text.len(), surface, bytes });
+            let _ = slot.set(CachedDepFile { world_at, index, edition: ed, text_len: text.len(), text_digest: digest, surface, bytes });
         }
         Ok(blaze_scope::items_record::CurrentFile { view, text, surface })
     }
@@ -2459,6 +2496,7 @@ struct BodiesLoad<'n> {
     list: &'n blaze_world::crate_list::CrateList<'static>,
     outlines: &'n [Outlined<'n>],
     has_unread_outlines: bool,
+    unread_digests: Option<&'n [(blaze_own::String<SharedAlloc<'static>>, ContentId)]>,
     dep_files: &'n DependencyFiles,
     alloc: blaze_own::Alloc<'n>,
 }
@@ -2505,10 +2543,37 @@ impl<'n> blaze_ladder::front2::source::Load<'n> for BodiesLoad<'n> {
         let Some(text) = blaze_scope::resolve::SourceTexts::read(self.texts, krate, &full) else {
             return Ok(None);
         };
+        let digest = ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes());
+        // If this is an unread checkout file (`/0/...`), verify its full-text digest against the
+        // request's initial sweep so concurrent post-sweep edits (e.g. body/const edits that keep
+        // `Outline::surface` identical) are refused as stale rather than mixing snapshots.
+        if let Some(real) = full.strip_prefix("/0/")
+            && let Some(digests) = self.unread_digests
+        {
+            let find = |path: &str| digests.binary_search_by(|(p, _)| p.as_str().cmp(path)).ok().and_then(|i| digests.get(i)).map(|row| row.1);
+            let expected = find(real).or_else(|| {
+                let stem = real.strip_suffix("/mod.rs")?;
+                let mut slot = blaze_own::AString::from_str_in(stem, self.alloc);
+                slot.push_str(".rs");
+                find(slot.as_str())
+            });
+            if let Some(saw) = expected
+                && saw != digest
+                && let Some(key) = self.crates.key(krate)
+            {
+                return Err(blaze_scope::items_record::ItemsRecordError::Stale {
+                    krate: key,
+                    file: Some(index),
+                    call: None,
+                    saw,
+                    found: digest,
+                });
+            }
+        }
         let Some(&world_at) = self.world_ats.get(krate) else {
             return blaze_scope::items_record::CurrentFile::from_text(index, text, edition, bump).map(Some);
         };
-        self.dep_files.get_or_outline(world_at, index, text, edition, bump).map(Some)
+        self.dep_files.get_or_outline(world_at, index, text, digest, edition, bump).map(Some)
     }
 
     fn expansion(&self, krate: usize, call: ItemKey) -> Option<blaze_ladder::front2::source::LoadedExpansion<'n>> {
@@ -2529,6 +2594,7 @@ fn open_stretch_records<'n>(
     packs: crate::job_texts::Packs<'n>,
     outlines: &'n [Outlined<'n>],
     has_unread_outlines: bool,
+    unread_digests: Option<&'n [(blaze_own::String<SharedAlloc<'static>>, ContentId)]>,
     dep_files: &'n DependencyFiles,
     corrected: &'n [(u32, &'n str, &'n str)],
     procs: Option<&'n crate::proc_runner::ProcRunner<'static>>,
@@ -2604,7 +2670,7 @@ fn open_stretch_records<'n>(
         frame,
     ));
     let bodies_load: &'n BodiesLoad<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
-        BodiesLoad { inner: load, crates: from, texts, world_ats, packages, list, outlines, has_unread_outlines, dep_files, alloc },
+        BodiesLoad { inner: load, crates: from, texts, world_ats, packages, list, outlines, has_unread_outlines, unread_digests, dep_files, alloc },
         frame,
     ));
     let log: &'n blaze_ladder::front2::source::Log<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
@@ -2649,6 +2715,7 @@ pub(crate) struct Prepared<'s, 'f, 'r> {
     heap: &'static blaze_own::Heap,
     keep_scratch: bool,
     has_unread_outlines: bool,
+    unread_digests: Option<blaze_own::Arc<blaze_own::Vec<(blaze_own::String<SharedAlloc<'static>>, ContentId), SharedAlloc<'static>>, SharedAlloc<'static>>>,
     plants: RowPlants,
 }
 
@@ -2758,6 +2825,7 @@ pub(crate) struct BodyRunner<'v, 'f, 'r> {
     board: &'v crate::engine_status::Board<'v>,
     keep_scratch: bool,
     has_unread_outlines: bool,
+    unread_digests: Option<&'v [(blaze_own::String<SharedAlloc<'static>>, ContentId)]>,
     plants: RowPlants,
     /// The bodies this setup left to check, by (member, file, name).
     ones: &'v [One<'f>],
@@ -2814,6 +2882,7 @@ impl<'v, 'f, 'r> BodyRunner<'v, 'f, 'r> {
             board: self.board,
             keep_scratch: self.keep_scratch,
             has_unread_outlines: self.has_unread_outlines,
+            unread_digests: self.unread_digests,
             plants: self.plants,
             by_need: self.by_need,
             dep_files: self.dep_files,
@@ -2868,6 +2937,7 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
             board: self.board,
             keep_scratch: self.keep_scratch,
             has_unread_outlines: self.has_unread_outlines,
+            unread_digests: self.unread_digests.as_deref().map(blaze_own::Vec::as_slice),
             plants: self.plants,
             ones: self.ones,
             clock: self.clock,
@@ -2903,16 +2973,16 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
     /// Pre-opens the distinct lang crates (`core`, `alloc`, `std`, `bstd`) of active groups (those
     /// referenced by `self.ones`) ONCE in parallel across `workers` before body stretches begin,
     /// avoiding redundant nested spawns and `OnceLock` contention across concurrent stretches.
-    pub(crate) fn pre_open_lang(&self, cx: &Cx, by_need: &LazyScopeRecords<'_>, workers: NonZeroU32) {
-        self.pre_open_lang_with(cx, by_need, workers, |_| ());
+    pub(crate) fn pre_open_lang(&self, cx: &Cx, by_need: &LazyScopeRecords<'_>, workers: NonZeroU32) -> Result<(), CliError> {
+        self.pre_open_lang_with(cx, by_need, workers, |_| ())
     }
 
     /// Runs `work` on the current thread while pre-opening the distinct lang crates (`core`,
     /// `alloc`, `std`, `bstd`) of active groups in parallel on `workers`.
-    pub(crate) fn pre_open_lang_with<T>(&self, cx: &Cx, by_need: &LazyScopeRecords<'_>, workers: NonZeroU32, work: impl FnOnce(&Cx) -> T) -> T {
-        let Some(found) = self.found.as_ref() else { return work(cx) };
+    pub(crate) fn pre_open_lang_with<T>(&self, cx: &Cx, by_need: &LazyScopeRecords<'_>, workers: NonZeroU32, work: impl FnOnce(&Cx) -> T) -> Result<T, CliError> {
+        let Some(found) = self.found.as_ref() else { return Ok(work(cx)) };
         if self.ones.is_empty() || workers.get() <= 1 {
-            return work(cx);
+            return Ok(work(cx));
         }
         let mut to_open: [Option<&crate::front_load::Unopened>; 8] = [None; 8];
         let mut count = 0usize;
@@ -2943,7 +3013,7 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
             }
         }
         if count < 2 {
-            return work(cx);
+            return Ok(work(cx));
         }
         let pre_cx = cx.span("engine: pre-open lang crates");
         let scope = pre_cx.scope();
@@ -2956,11 +3026,19 @@ impl<'s, 'f, 'r> Prepared<'s, 'f, 'r> {
             }));
         }
         let out = work(cx);
+        let mut first_err: Option<CliError> = None;
         for handle in handles.into_iter() {
-            let _ = handle.join(&pre_cx);
+            if let Err(err) = handle.join(&pre_cx) {
+                first_err.get_or_insert_with(|| CliError::Pool(err));
+            }
         }
-        let _ = scope.join(&pre_cx);
-        out
+        if let Err(err) = scope.join(&pre_cx) {
+            first_err.get_or_insert_with(|| CliError::Pool(err));
+        }
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+        Ok(out)
     }
 
     /// The `Ready` driver's bodies joined into `stage` (D187): the runs its `BodyCheck` kind
@@ -3057,6 +3135,7 @@ impl<'f> BodiesStage<'f> {
             outlines_moved: None,
             outlines_entered: None,
             unread: None,
+            unread_digests: None,
             members_key: None,
             standing_drops_heads: false,
             row_key_unit_only: false,
@@ -3179,8 +3258,13 @@ impl<'f> BodiesStage<'f> {
     /// The ready setup's: the files it has an outline of and did not read back (sorted, each
     /// once). Under [`StandingMembers`] a visited member's held file among them is refused by
     /// name in `groups` (it would key the member's row apart from the phase path's).
-    pub(crate) fn unread_outlines(&mut self, unread: Vec<Name, blaze_own::Alloc<'static>>) {
+    pub(crate) fn unread_outlines(
+        &mut self,
+        unread: Vec<Name, blaze_own::Alloc<'static>>,
+        digests: Option<blaze_own::Arc<blaze_own::Vec<(blaze_own::String<SharedAlloc<'static>>, ContentId), SharedAlloc<'static>>, SharedAlloc<'static>>>,
+    ) {
         self.unread = Some(unread);
+        self.unread_digests = digests;
     }
 
     /// THE READY SETUP'S READS (piece B2): which outlines the bodies' setup will need, before any
@@ -3234,7 +3318,11 @@ impl<'f> BodiesStage<'f> {
             }
             seeds.push(root_of(member));
             if let Some(kept) = view.as_ref().and_then(|view| view.member(place)) {
-                seeds.extend(kept.held.iter().map(|held| held.slot));
+                match &kept.state {
+                    rec::MemberState::Held(held) => seeds.extend(held.held.iter().map(|held| held.slot)),
+                    rec::MemberState::CutScope(cut) => seeds.extend(cut.held.iter().map(|held| held.slot)),
+                    rec::MemberState::Refused(_) => {}
+                }
                 seeds.extend(kept.not_held.iter().copied());
             }
         }
@@ -3359,7 +3447,7 @@ impl<'f> BodiesStage<'f> {
     /// The plan's notes into the request's lines (engine_body_plan.rs `Outside::lines`): a file
     /// no unit holds, said once, with no engine row; kept from `last` where no body of the file
     /// was entered. Its scratch is `frame`'s.
-    pub(crate) fn plan_lines(&self, outlined: &[Outlined<'_>], unread: &[Name], last: Option<&crate::engine_lines::Last<'_, '_>>, lines: &mut crate::engine_lines::Lines<'_>, frame: &Frame) {
+    pub(crate) fn plan_lines<'a>(&self, outlined: &[Outlined<'_>], unread: &[Name], last: Option<&crate::engine_lines::Last<'a, '_>>, lines: &mut crate::engine_lines::Lines<'a>, frame: &Frame) {
         self.outside.lines(self.ran.iter().map(|one| one.file), outlined, unread, last, lines, frame);
         // The bodies a macro wrote that no task checks: named once a request, never silent.
         // Decided by this request's phase when it read the members' records; else the last
@@ -3411,6 +3499,36 @@ impl<'f> BodiesStage<'f> {
         // In the request's heap through its handle that crosses threads: the body workers insert
         // (a frame is one thread's, and the set's `insert` takes a `'static` allocator).
         let expansion_keys: SharedSet<Key, SharedAlloc<'static>> = SharedSet::new_in("engine bodies expansion text record keys", heap.shared());
+        let stopped_out = |stage: &mut BodiesStage<'f>, reach, snapshot_owner, expansion_keys| {
+            stage.reach = reach;
+            let procs = handles.names.and_then(|inputs| inputs.stage().names.as_ref()).and_then(|names| names.procs());
+            let names_keys = handles.names.map(|inputs| inputs.keys());
+            Ok(Prepared {
+                snapshot: snapshot_owner,
+                expansion_keys,
+                dep_files: DependencyFiles::new(heap),
+                found: None,
+                ones: &[],
+                outlined: handles.outlined,
+                root: handles.root,
+                fs: &handles.env.fs,
+                board: handles.board,
+                clock: handles.clock,
+                listings,
+                seeds: request_heads,
+                names_keys,
+                procs,
+                heap,
+                keep_scratch: planted_keep_scratch(),
+                has_unread_outlines: stage.unread.as_ref().is_some_and(|unread| !unread.is_empty()),
+                unread_digests: stage.unread_digests.as_ref().map(blaze_own::Share::share),
+                plants: planted_rows(),
+            })
+        };
+        if handles.board.stopping().is_some() {
+            let reach = self.reach.take();
+            return stopped_out(self, reach, snapshot_owner, expansion_keys);
+        }
         // 0. What this phase OWES: the files of the entered tasks' bodies (each task's
         // `planned.file`, the outline its `BodyCheck` part is in: `plan` above), by outline
         // index, sorted, each once. Only these files' entries are outlined and keyed by chain
@@ -3419,7 +3537,11 @@ impl<'f> BodiesStage<'f> {
         // A task whose file the request has no outline of is the setup's typed refusal (rule 3:
         // the ready setup reads back every owed file, engine_check.rs `checking`), never a body
         // dropped from what is owed.
-        for task in tasks.iter() {
+        for (idx, task) in tasks.iter().enumerate() {
+            if (idx & 255) == 0 && handles.board.stopping().is_some() {
+                let reach = self.reach.take();
+                return stopped_out(self, reach, snapshot_owner, expansion_keys);
+            }
             let at = handles.outlined.binary_search_by(|one| one.name.cmp(&task.planned.file)).map_err(|_| EngineCheckError::Unplaced { body: task.planned.name, what: "its file is none of the request's outlines (the ready setup reads back every owed file: engine_check.rs `checking`)" })?;
             owed.push(u32::try_from(at).unwrap_or(u32::MAX));
         }
@@ -3450,6 +3572,9 @@ impl<'f> BodiesStage<'f> {
             shared.extend(rows.iter().filter(|row| row.rows >= 2).copied());
             shared.sort_unstable_by_key(|row| row.name);
             shared.dedup_by_key(|row| row.name);
+        }
+        if handles.board.stopping().is_some() {
+            return stopped_out(self, reach, snapshot_owner, expansion_keys);
         }
         // 1. Each member's check scope and files, and each owed body's item key, on this thread.
         let plants = planted_rows();
@@ -3490,7 +3615,13 @@ impl<'f> BodiesStage<'f> {
         if let (Some(found), Some(reach)) = (found.as_ref(), reach.as_ref()) {
             by_rank.extend((0..reach.len()).map(|rank| reach.unit(rank).and_then(|one| found.holders.unit_named(one.unit))));
         }
-        for task in tasks.iter() {
+        if handles.board.stopping().is_some() {
+            return stopped_out(self, reach, snapshot_owner, expansion_keys);
+        }
+        for (idx, task) in tasks.iter().enumerate() {
+            if (idx & 255) == 0 && handles.board.stopping().is_some() {
+                return stopped_out(self, reach, snapshot_owner, expansion_keys);
+            }
             let name = task.planned.name;
             let file = handles.outlined.binary_search_by(|one| one.name.cmp(&task.planned.file)).map_or(u32::MAX, |at| u32::try_from(at).unwrap_or(u32::MAX));
             // Each refusal with the cells it is a function of (plan row A8): its failed row
@@ -3647,6 +3778,7 @@ impl<'f> BodiesStage<'f> {
             heap,
             keep_scratch: planted_keep_scratch(),
             has_unread_outlines: self.unread.as_ref().is_some_and(|unread| !unread.is_empty()),
+            unread_digests: self.unread_digests.as_ref().map(blaze_own::Share::share),
             plants,
         })
     }
@@ -3764,7 +3896,7 @@ impl<'f> BodiesStage<'f> {
         // The phase's scope records opened by need, one for all its runs (each crate opened
         // once whichever run asks it first); its counts read after the runs end.
         let by_need = prepared.scope_records();
-        prepared.pre_open_lang(&cx, &by_need, handles.workers);
+        prepared.pre_open_lang(&cx, &by_need, handles.workers)?;
         {
             let stage_reads = match paged_shelf {
                 Some(source) => self.reads_paged(source),
@@ -3787,6 +3919,10 @@ impl<'f> BodiesStage<'f> {
                 let shared = &shared;
                 let clock = prepared.clock.clone();
                 running.push(scope.may_overlap("engine bodies run", BODIES_FRAME, move |cx: &Cx| {
+                    if shared.board.stopping().is_some() {
+                        shared.board.refused(Stage::Bodies, u64::try_from(run.len()).unwrap_or(u64::MAX));
+                        return Ok::<(), Infallible>(());
+                    }
                     let began = crate::engine_times::ns(clock.now().since_start());
                     run_bodies(cx, shared, run, &clock, out, ran, run_out, tally, alloc);
                     *span = (began, crate::engine_times::ns(clock.now().since_start()));
@@ -3803,6 +3939,13 @@ impl<'f> BodiesStage<'f> {
             if let Some(error) = failed {
                 return Err(CliError::Pool(error));
             }
+        }
+        // Stopped while the phase ran: `one_phase` calls `stop_point` right after `run_stage`
+        // and drops the phase arena without merging, so skip joining tens of thousands of
+        // unbegun bodies to stay well within `STOP_BOUND` (rule 18).
+        if handles.board.stopping().is_some() {
+            self.wall_ns = self.wall_ns.saturating_add(handles.clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)));
+            return Ok(MadeFacts { bytes: SVec::new_in(at_phase), index: SVec::new_in(at_phase) });
         }
         self.expansion_demands = prepared.snapshot.expansion_demands();
         self.expansion_keys = prepared.expansion_keys.len() as u64;
@@ -4211,12 +4354,13 @@ impl<'f> BodiesStage<'f> {
             // This member's laps ([`SetupParts`]): stood, or each part of its visit.
             let mut member_mark = handles.clock.now();
             let own_name = blaze_drive::key::crate_scope_name(&list.key(member));
+            let unit_val = crate::engine_body_plan::Unit { name: own_name, prefix: list.key(member).prefix(), test: is_test(own_name) };
             let unit = match again {
                 Some(unit) => unit,
                 None => {
                     tally.members = tally.members.saturating_add(1);
                     let unit = u32::try_from(units.len()).unwrap_or(u32::MAX);
-                    units.push(crate::engine_body_plan::Unit { name: own_name, prefix: list.key(member).prefix(), test: is_test(own_name) });
+                    units.push(unit_val);
                     member_cells.push(CellId { of: own_name, cell: WHOLE });
                     unit
                 }
@@ -4234,34 +4378,59 @@ impl<'f> BodiesStage<'f> {
             let place = u32::try_from(member).unwrap_or(u32::MAX);
             // Stood whole, or below its heads (piece A: kept in `below`, counted at its turn).
             let standing = match (again, stood_view.as_ref()) {
-                (None, Some(view)) => match stands(view, place, &today, &moved, &units[unit as usize], names) {
+                (None, Some(view)) => match stands(view, place, &today, &moved, &unit_val, names) {
                     Some(kept) => Some((kept, false)),
-                    None => stands_below(view, place, &today, &moved, &units[unit as usize], names, &entries_now).map(|kept| (kept, true)),
+                    None => stands_below(view, place, &today, &moved, &unit_val, names, &entries_now).map(|kept| (kept, true)),
                 },
                 _ => None,
             };
             if let Some((kept, below_heads)) = standing {
-                if below_heads {
-                    below.push((member, unit));
-                } else {
-                    tally.members_stood = tally.members_stood.saturating_add(1);
-                }
-                members.push(kept.names);
-                if !drop_standing_heads {
-                    heads.extend(kept.held.iter().map(|held| held.subject(kept.unit.prefix)));
-                }
-                member_files.extend(kept.not_held.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::NotHeld, reads: own_cells }));
-                tally.files = tally.files.saturating_add(u32::try_from(kept.held.len()).unwrap_or(u32::MAX));
-                self.member_rows.get_or_insert_with(|| Vec::new_in(g)).push(kept.row);
-                uncovered = uncovered.saturating_add(kept.uncovered);
-                for label in kept.named.iter() {
-                    if uncovered_named.len() < MOST_UNCOVERED_NAMED {
-                        uncovered_named.push(crate::engine_head_notes::leak(g, format_args!("{label}")));
+                match &kept.state {
+                    rec::MemberState::Held(held) => {
+                        if below_heads {
+                            below.push((member, unit));
+                        } else {
+                            tally.members_stood = tally.members_stood.saturating_add(1);
+                        }
+                        members.push(held.names);
+                        if !drop_standing_heads {
+                            heads.extend(held.held.iter().map(|h| h.subject(kept.unit.prefix)));
+                        }
+                        member_files.extend(kept.not_held.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::NotHeld, reads: own_cells }));
+                        tally.files = tally.files.saturating_add(u32::try_from(held.held.len()).unwrap_or(u32::MAX));
+                        self.member_rows.get_or_insert_with(|| Vec::new_in(g)).push(held.row);
+                        uncovered = uncovered.saturating_add(held.uncovered);
+                        for label in held.named.iter() {
+                            if uncovered_named.len() < MOST_UNCOVERED_NAMED {
+                                uncovered_named.push(crate::engine_head_notes::leak(g, format_args!("{label}")));
+                            }
+                        }
+                        members_out.member(kept);
+                        tally.parts.stood_ns = tally.parts.stood_ns.saturating_add(lap(handles.clock, &mut member_mark));
+                        continue;
+                    }
+                    rec::MemberState::CutScope(cut) => {
+                        tally.members_stood = tally.members_stood.saturating_add(1);
+                        members.push(cut.names);
+                        if !drop_standing_heads {
+                            heads.extend(cut.held.iter().map(|h| h.subject(kept.unit.prefix)));
+                        }
+                        member_files.extend(kept.not_held.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::NotHeld, reads: own_cells }));
+                        tally.files = tally.files.saturating_add(u32::try_from(cut.held.len()).unwrap_or(u32::MAX));
+                        members_out.member(kept);
+                        tally.parts.stood_ns = tally.parts.stood_ns.saturating_add(lap(handles.clock, &mut member_mark));
+                        continue;
+                    }
+                    rec::MemberState::Refused(why) => {
+                        if let Some(words) = why.words() {
+                            tally.members_stood = tally.members_stood.saturating_add(1);
+                            member_files.extend(kept.not_held.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::Refused(words), reads: own_cells }));
+                            members_out.member(kept);
+                            tally.parts.stood_ns = tally.parts.stood_ns.saturating_add(lap(handles.clock, &mut member_mark));
+                            continue;
+                        }
                     }
                 }
-                members_out.member(kept);
-                tally.parts.stood_ns = tally.parts.stood_ns.saturating_add(lap(handles.clock, &mut member_mark));
-                continue;
             }
             // The member's files: what its module tree reaches from its root under what plan
             // time knows of its `test` (engine_body_plan.rs `reached_under`), the walk the
@@ -4288,20 +4457,17 @@ impl<'f> BodiesStage<'f> {
             // reached file it does not hold, in the order the claims are made.
             let mut held_kept: Vec<rec::Held<'_>, blaze_own::Alloc<'static>> = Vec::new_in(g);
             let mut not_held_kept: Vec<Name, blaze_own::Alloc<'static>> = Vec::new_in(g);
-            let mut refuse_all = |why: &'static str, reads: &'f [CellId]| member_files.extend(reach.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::Refused(why), reads }));
+            let mut refuse_all = |files: &[Name], why: &'static str, reads: &'f [CellId]| member_files.extend(files.iter().map(|file| FileClaim { file: *file, unit, is: FileIs::Refused(why), reads }));
             let Some(own) = input_at(member) else {
                 // Its crate's own names failed (a build script, its resolution): that failure
                 // is the crate's `CrateScope` row, reported there once; its bodies say so. Read
                 // as it is today: no task defines the crate's names cell (ABSENT), or its task
                 // failed and defines none; the task that comes, or its fix, moves it.
-                refuse_all(
-                    if names.failed(own_name) {
-                        "its crate has no names record this command: its `CrateScope` task failed, and that failure is reported at it"
-                    } else {
-                        "its crate has no `Names` task this command (engine_names.rs `plan`)"
-                    },
-                    own_cells,
-                );
+                let why = if names.failed(own_name) { rec::RefusedWhy::ScopeFailed } else { rec::RefusedWhy::NoNamesTask };
+                refuse_all(&reach, why.words().unwrap_or("its crate has no `Names` task this command (engine_names.rs `plan`)"), own_cells);
+                if again.is_none() {
+                    members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(why), not_held: reach });
+                }
                 continue;
             };
             // A member visited at need was pushed at its first turn (piece A).
@@ -4323,7 +4489,10 @@ impl<'f> BodiesStage<'f> {
                     Ok(records) => records,
                     Err(error) => {
                         let cause = ScopeRefusal::Records { krate, at: member, error };
-                        refuse_all(crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        refuse_all(&reach, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        if again.is_none() {
+                            members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(rec::RefusedWhy::Unstood), not_held: reach });
+                        }
                         continue;
                     }
                 }
@@ -4335,7 +4504,10 @@ impl<'f> BodiesStage<'f> {
                         own_records
                     }
                     Err(cause) => {
-                        refuse_all(crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        refuse_all(&reach, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        if again.is_none() {
+                            members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(rec::RefusedWhy::Unstood), not_held: reach });
+                        }
                         continue;
                     }
                 }
@@ -4355,7 +4527,10 @@ impl<'f> BodiesStage<'f> {
             // The member's files: its items record's file rows, matched to the planner's outlines.
             let Ok(items) = ItemsRecord::open(own_records.items, g) else {
                 // The items record is the crate's names task's: a function of its cell.
-                refuse_all("its crate's items record does not open (blaze-scope items_record.rs `ItemsRecord::open`)", own_cells);
+                refuse_all(&reach, "its crate's items record does not open (blaze-scope items_record.rs `ItemsRecord::open`)", own_cells);
+                if again.is_none() {
+                    members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(rec::RefusedWhy::Unstood), not_held: reach });
+                }
                 continue;
             };
             // Each member's text length of the impls and traits a macro wrote, made the first
@@ -4419,7 +4594,7 @@ impl<'f> BodiesStage<'f> {
             // upfront `front_load::present` CAS lookups to `LazyScopeRecords::open` on first ask
             // while still checking `names.input_of` (in-memory on `phases`) so failed `CrateScope`
             // dependencies still cut the scope immediately.
-            let stood_in_record = again.is_some() || stood_view.as_ref().and_then(|view| view.member(place)).is_some();
+            let stood_in_record = again.is_some() || stood_view.as_ref().and_then(|view| view.member(place)).is_some_and(|m| matches!(m.state, rec::MemberState::Held(_)));
             let defer_scope_inputs = stood_in_record
                 && names.stood_on().is_some()
                 && names.stage().results.is_empty()
@@ -4443,7 +4618,10 @@ impl<'f> BodiesStage<'f> {
                     Err(cause) => {
                         // As the oracle arm refuses it: before any claim or head subject of it.
                         heads.truncate(heads_at);
-                        refuse_all(crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        refuse_all(&reach, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), own_cells);
+                        if again.is_none() {
+                            members_out.member(&rec::Member { at: place, unit: unit_val, state: rec::MemberState::Refused(rec::RefusedWhy::Unstood), not_held: reach });
+                        }
                         continue;
                     }
                 }
@@ -4453,9 +4631,13 @@ impl<'f> BodiesStage<'f> {
             // The scope's cut, the cells a refusal of it reads, and the member's group: of an
             // opened scope alone. Not opened: no file of it is owed, its row stands, and every
             // crate of its scope has an input (`scope_of` would cut none at an input).
-            let (whole, cut_words, scope_cells, group) = match whole_scope {
+            let (whole, cut_words, cut_missing, scope_cells, group) = match whole_scope {
                 Some((mut scope, unopened, whole)) => {
                     let cut_words = scope.cut_cause(&list).map(|cause| crate::engine_head_notes::leak(heap.alloc(), format_args!("its member's {cause}")));
+                    let cut_missing = match scope.cut {
+                        Some((at, CutWhy::NoNamesRecord { failed })) => Some((blaze_drive::key::crate_scope_name(&list.key(at)), failed)),
+                        _ => None,
+                    };
                     // The cells a cut scope's refusal reads: the graph's, each scope crate's that
                     // had records and the first that had none (the one whose task comes or is fixed).
                     let mut cut_reads: Vec<Name, Global> = Vec::new_in(Global);
@@ -4480,9 +4662,9 @@ impl<'f> BodiesStage<'f> {
                         (Some(rest), Some(own)) => Some(GroupCrates::ByNeed { own, rest }),
                         (Some(_), None) => None,
                     };
-                    (whole, cut_words, scope_cells, crates.map(|crates| Group { list, own: own.name, crates, env, script, lang: scope.lang, scope: scope.scope }))
+                    (whole, cut_words, cut_missing, scope_cells, crates.map(|crates| Group { list, own: own.name, crates, env, script, lang: scope.lang, scope: scope.scope }))
                 }
-                None => (true, None, own_cells, None),
+                None => (true, None, None, own_cells, None),
             };
             // A file the planner's cfg-blind walk reaches that the items record lists at no path
             // of it: this unit's cfg cut its `mod` (engine_body_plan.rs). Not this unit's file,
@@ -4625,23 +4807,50 @@ impl<'f> BodiesStage<'f> {
             // (`kept`: so its scope and environment stood) and every file row of which an outline
             // matched (a row no outline matched is a file that may appear: never stood on). A
             // member visited at need (piece A) was written at its first turn, from the record.
+            let all_outlined = !file_heads.iter().any(|head| matches!(head, crate::engine_member_rows::FileHead::NotOutlined));
             if kept
                 && again.is_none()
                 && let Some(row) = row.as_ref()
-                && !file_heads.iter().any(|head| matches!(head, crate::engine_member_rows::FileHead::NotOutlined))
+                && all_outlined
             {
                 let mut named: Vec<&str, blaze_own::Alloc<'static>> = Vec::with_capacity_in(row.named.len(), g);
                 named.extend(row.named.iter().copied());
                 members_out.member(&rec::Member {
                     at: place,
-                    unit: units[unit as usize],
-                    names: own.name,
-                    names_out: own.out,
-                    row: row_key,
-                    uncovered: row.uncovered,
-                    named,
-                    held: held_kept,
+                    unit: unit_val,
+                    state: rec::MemberState::Held(rec::HeldMember {
+                        names: own.name,
+                        names_out: own.out,
+                        row: row_key,
+                        uncovered: row.uncovered,
+                        named,
+                        held: held_kept,
+                    }),
                     not_held: not_held_kept,
+                });
+            } else if !whole
+                && again.is_none()
+                && all_outlined
+                && let Some((missing, missing_failed)) = cut_missing
+            {
+                members_out.member(&rec::Member {
+                    at: place,
+                    unit: unit_val,
+                    state: rec::MemberState::CutScope(rec::CutScopeMember {
+                        names: own.name,
+                        names_out: own.out,
+                        missing,
+                        missing_failed,
+                        held: held_kept,
+                    }),
+                    not_held: not_held_kept,
+                });
+            } else if again.is_none() {
+                members_out.member(&rec::Member {
+                    at: place,
+                    unit: unit_val,
+                    state: rec::MemberState::Refused(rec::RefusedWhy::Unstood),
+                    not_held: reach,
                 });
             }
             // The bodies a macro wrote that no entry covers: neither at a file entry nor in a
@@ -5566,6 +5775,7 @@ struct Shared<'s, 'a, 'f, 'r, R: ?Sized + CellDigests> {
     /// so `run_stretch` passes `None` for outlines and lets `StoreLoad::file_items` outline any
     /// dependency file actually queried on demand (`CurrentFile::from_text`).
     has_unread_outlines: bool,
+    unread_digests: Option<&'s [(blaze_own::String<SharedAlloc<'static>>, ContentId)]>,
     /// PLANTED BUGS, tests only ([`RowPlants`]): the old row's capacity, or the coarse step off.
     plants: RowPlants,
     /// The request's scope records opened by need ([`BodyRunner::by_need`]).
@@ -6129,6 +6339,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
         (shared.packs, shared.fs).into(),
         shared.outlined,
         shared.has_unread_outlines,
+        shared.unread_digests,
         shared.dep_files,
         shared.corrected,
         shared.procs,
@@ -6178,7 +6389,11 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
     // Each body's rounds (front2 tables/cost.rs `Spent::rounds`): one when its heads are all
     // seeded (runtime.md point 3).
     let cost: &Cost<'_> = frame.alloc(Cost::new(&NO_GAUGE));
-    let body_frame = BodyFrame { frame, alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::First, heads: seed.map(|s| s as &dyn HeadSeed<'_>), sources: Some(opened.sources), goals: None };
+    // One stretch-scoped macro preparation table shared across every body in the stretch so
+    // `ProjectWorld::over_prepared` allocates 0 bytes in `frame` per body and macros are prepared
+    // once per stretch rather than leaked per body.
+    let prepared: &blaze_scope::prepares::Prepares<'_> = blaze_scope::prepares::Prepares::new_in(fb);
+    let body_frame = BodyFrame { frame, alloc: g, plant_drop: None, cost: Some(cost), needs: NeedsMet::First, heads: seed.map(|s| s as &dyn HeadSeed<'_>), sources: Some(opened.sources), goals: None, prepared: Some(prepared) };
     // Each crate's listing from the request's table (engine_heads.rs `Listings`): made once a
     // request, not once a stretch that places a read in it.
     let set_lang = clock.now();
@@ -6311,7 +6526,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
                 let result = {
                     let keyer = BodyReadKeyer {
                         grains: shared.grains,
-                        fine_buckets: shared.scope_reads.tables_at_cells() || shared.plants.fine_buckets,
+                        fine_buckets: shared.plants.fine_buckets,
                         ids: core::cell::RefCell::new(&mut ids),
                     };
                     let active = recording.as_mut().expect("the entry owns its recorder");
@@ -7317,11 +7532,15 @@ fn data_read<R: ?Sized + CellDigests>(reads: &R, path: &str, bytes: Option<&[u8]
     let planned = || bytes.map_or_else(crate::data_include::absent_out, crate::data_include::data_out);
     if reads.row_failed(file.of) == Some(false) {
         let seen = planned();
-        // Only bind to the `FileItems` task when its `WHOLE` cell IS a `data_include` digest;
-        // an outlined `.rs` source file included via `include_str!` defines an outline digest on
-        // `FileItems::WHOLE` (not `data_out(bytes)`), so fall through to its raw-bytes `Given` cell.
+        // Only bind to the `FileItems` task when its `WHOLE` cell IS a `data_include` digest
+        // (pure `DATA_FILE`) or its `DATA` cell holds the raw bytes digest (a Rust source file
+        // also read via `include_str!` / `include_bytes!`); otherwise fall through to its `Given` cell.
         if reads.cell(&file) == seen {
             return DataRead { id: file, seen, cell: DataCell::Planned };
+        }
+        let data = CellId { of: file.of, cell: crate::engine_tasks::DATA };
+        if reads.cell(&data) == seen {
+            return DataRead { id: data, seen, cell: DataCell::Planned };
         }
     }
     match crate::engine_script_reads::file_read(path, bytes) {

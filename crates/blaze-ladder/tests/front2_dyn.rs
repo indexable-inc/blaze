@@ -166,6 +166,7 @@ fn dyn_types_through_front2() {
 }
 
 const RECEIVERS: &str = "extern crate alloc;
+use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::sync::Arc;
 use core::pin::Pin;
@@ -306,4 +307,458 @@ fn typed_receivers_through_front2() {
     let got = format!("{:?}", check_body(&mut records, &body, &scope).map(|_| "checked clean"));
     assert!(got.contains("DynUndecided"), "without the pointer types `dyn Recv` must stay undecided, got {got}");
     println!("receivers: {clean} clean, `dyn Mine` refused (E0038), undecided without the pointer types");
+}
+
+mod supertrait_args {
+    //! End-to-end tests for `dyn Trait` vtable construction when a trait has supertraits with
+    //! concrete or compound type arguments (`Buffer: AsRef<[u8]> + AsMut<[u8]>`,
+    //! `Sub<T>: Super<Option<T>>`, `Sub<T>: Super<[T]>`, and transitive chains).
+
+    use blaze_ladder::crates::{Inputs, Toolchain};
+    use blaze_ladder::front2::keys::checker_of;
+    use blaze_ladder::front2::program::Front2Program;
+    use blaze_ladder::front2::program::lazy::LazyProgram;
+    use blaze_ladder::program_texts::ProgramTexts;
+    use blaze_ladder::refusal::SourceFile;
+    use blaze_ladder::run::{FrontChoice, NewFront, build_survey, run_with};
+    use blaze_ladder::seam::FrontEnd;
+    use blaze_scope::names::{self, Written};
+    use blaze_surface::{Namespace, PathKind};
+
+    const NEW: NewFront<'static> = NewFront {
+        package: "ladder",
+        edition: "2024",
+        shelf: None,
+        overflow: blaze_build::OverflowChecks::Off,
+    };
+
+    const HEAD: &str = "#![feature(no_core, lang_items, rustc_attrs)]
+#![no_core]
+#![no_main]
+#![allow(internal_features)]
+
+#[lang = \"pointee_sized\"]
+trait PointeeSized {}
+
+#[lang = \"meta_sized\"]
+trait MetaSized: PointeeSized {}
+
+#[lang = \"sized\"]
+trait Sized: MetaSized {}
+
+#[lang = \"legacy_receiver\"]
+trait LegacyReceiver: PointeeSized {}
+
+impl<T: PointeeSized> LegacyReceiver for &T {}
+impl<T: PointeeSized> LegacyReceiver for &mut T {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+impl Copy for u8 {}
+impl Copy for u16 {}
+impl Copy for u32 {}
+impl Copy for u64 {}
+impl Copy for usize {}
+impl Copy for i32 {}
+impl<T: PointeeSized> Copy for &T {}
+
+#[lang = \"unsize\"]
+trait Unsize<T: PointeeSized>: PointeeSized {}
+
+#[lang = \"coerce_unsized\"]
+trait CoerceUnsized<T: PointeeSized> {}
+
+impl<'a, 'b: 'a, T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<&'a U> for &'b T {}
+impl<'a, T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<&'a mut U> for &'a mut T {}
+
+#[lang = \"dispatch_from_dyn\"]
+trait DispatchFromDyn<T> {}
+
+impl<'a, T: PointeeSized + Unsize<U>, U: PointeeSized> DispatchFromDyn<&'a U> for &'a T {}
+impl<'a, T: PointeeSized + Unsize<U>, U: PointeeSized> DispatchFromDyn<&'a mut U> for &'a mut T {}
+
+#[lang = \"panic_bounds_check\"]
+fn panic_bounds_check(_: usize, _: usize) -> ! {
+    loop {}
+}
+";
+
+    const BUFFER_PROGRAM: &str = "
+pub trait AsRef<T: PointeeSized>: PointeeSized {
+    fn as_ref(&self) -> &T;
+}
+
+pub trait AsMut<T: PointeeSized>: PointeeSized {
+    fn as_mut(&mut self) -> &mut T;
+}
+
+pub trait Buffer: AsRef<[u8]> + AsMut<[u8]> {
+    fn set_first(&mut self, b: u8);
+    fn tag(&self) -> u8;
+}
+
+struct SmallBuf {
+    data: [u8; 4],
+}
+
+impl AsRef<[u8]> for SmallBuf {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl AsMut<[u8]> for SmallBuf {
+    fn as_mut(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+}
+
+impl Buffer for SmallBuf {
+    fn set_first(&mut self, b: u8) {
+        self.data[0] = b;
+    }
+    fn tag(&self) -> u8 {
+        10
+    }
+}
+
+fn read_as_ref(r: &dyn AsRef<[u8]>) -> u8 {
+    let s = r.as_ref();
+    s[0] + s[1] + s[2] + s[3]
+}
+
+fn bump_second_as_mut(m: &mut dyn AsMut<[u8]>, delta: u8) {
+    let s = m.as_mut();
+    s[1] = s[1] + delta;
+}
+
+fn exercise(buf: &mut dyn Buffer) -> u8 {
+    buf.set_first(5);
+    buf.as_mut()[2] = 7;
+    bump_second_as_mut(buf, 3);
+    let direct = buf.as_ref()[3];
+    let sum = read_as_ref(buf);
+    sum + direct + buf.tag()
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let mut b = SmallBuf { data: [1, 2, 3, 4] };
+    exercise(&mut b) as i32
+}
+";
+
+    const COMPOUND_PARAM_PROGRAM: &str = "
+enum MyOpt<T> {
+    None,
+    Some(T),
+}
+
+trait Wrap<U> {
+    fn get_wrap(&self) -> U;
+}
+
+trait SubOpt<T>: Wrap<MyOpt<T>> {
+    fn own_val(&self) -> T;
+}
+
+trait SliceView<U: PointeeSized> {
+    fn view(&self) -> &U;
+}
+
+trait SubSlice<T>: SliceView<[T]> {
+    fn slice_tag(&self) -> u32;
+}
+
+struct Holder32(u32);
+struct Holder64(u64);
+
+impl Wrap<MyOpt<u32>> for Holder32 {
+    fn get_wrap(&self) -> MyOpt<u32> {
+        MyOpt::Some(self.0 + 1)
+    }
+}
+
+impl SubOpt<u32> for Holder32 {
+    fn own_val(&self) -> u32 {
+        self.0
+    }
+}
+
+impl Wrap<MyOpt<u64>> for Holder64 {
+    fn get_wrap(&self) -> MyOpt<u64> {
+        MyOpt::Some(self.0 + 2)
+    }
+}
+
+impl SubOpt<u64> for Holder64 {
+    fn own_val(&self) -> u64 {
+        self.0
+    }
+}
+
+struct Bytes([u8; 3]);
+struct Words([u16; 2]);
+
+impl SliceView<[u8]> for Bytes {
+    fn view(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl SubSlice<u8> for Bytes {
+    fn slice_tag(&self) -> u32 {
+        1
+    }
+}
+
+impl SliceView<[u16]> for Words {
+    fn view(&self) -> &[u16] {
+        &self.0
+    }
+}
+
+impl SubSlice<u16> for Words {
+    fn slice_tag(&self) -> u32 {
+        2
+    }
+}
+
+fn call_opt32(x: &dyn SubOpt<u32>) -> u32 {
+    let w = match x.get_wrap() {
+        MyOpt::Some(v) => v,
+        MyOpt::None => 0,
+    };
+    w + x.own_val()
+}
+
+fn call_opt64(x: &dyn SubOpt<u64>) -> u64 {
+    let w = match x.get_wrap() {
+        MyOpt::Some(v) => v,
+        MyOpt::None => 0,
+    };
+    w + x.own_val()
+}
+
+fn call_slice_u8(x: &dyn SubSlice<u8>) -> u32 {
+    let s = x.view();
+    (s[0] as u32) + (s[2] as u32) + x.slice_tag()
+}
+
+fn call_slice_u16(x: &dyn SubSlice<u16>) -> u32 {
+    let s = x.view();
+    (s[0] as u32) + (s[1] as u32) + x.slice_tag()
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let h32 = Holder32(10);
+    let h64 = Holder64(20);
+    let bs = Bytes([3, 9, 4]);
+    let ws = Words([5, 6]);
+    let total = call_opt32(&h32) + (call_opt64(&h64) as u32) + call_slice_u8(&bs) + call_slice_u16(&ws);
+    total as i32
+}
+";
+
+    const TRANSITIVE_PROGRAM: &str = "
+static NUM: u32 = 19;
+
+trait C<Y: PointeeSized> {
+    fn c_get(&self) -> &Y;
+}
+
+trait B<X: PointeeSized>: C<X> {
+    fn b_get(&self) -> &X;
+}
+
+trait A: B<[u8]> {
+    fn a_tag(&self) -> u32;
+}
+
+trait RefSuper<Z> {
+    fn read_ref(&self) -> Z;
+}
+
+trait MidRef<X: 'static>: RefSuper<&'static X> {
+    fn mid_tag(&self) -> u32;
+}
+
+trait Top: A + MidRef<u32> {
+    fn top_tag(&self) -> u32;
+}
+
+struct Item {
+    bytes: [u8; 2],
+}
+
+impl C<[u8]> for Item {
+    fn c_get(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl B<[u8]> for Item {
+    fn b_get(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl A for Item {
+    fn a_tag(&self) -> u32 {
+        3
+    }
+}
+
+impl RefSuper<&'static u32> for Item {
+    fn read_ref(&self) -> &'static u32 {
+        &NUM
+    }
+}
+
+impl MidRef<u32> for Item {
+    fn mid_tag(&self) -> u32 {
+        7
+    }
+}
+
+impl Top for Item {
+    fn top_tag(&self) -> u32 {
+        11
+    }
+}
+
+fn via_c(c: &dyn C<[u8]>) -> u32 {
+    c.c_get()[0] as u32
+}
+
+fn via_mid(m: &dyn MidRef<u32>) -> u32 {
+    *m.read_ref() + m.mid_tag()
+}
+
+fn via_ref_super(r: &dyn RefSuper<&'static u32>) -> u32 {
+    *r.read_ref()
+}
+
+fn run_top(t: &dyn Top) -> u32 {
+    let from_c_direct = t.c_get()[1] as u32;
+    let from_b_direct = t.b_get()[0] as u32;
+    let from_a = t.a_tag();
+    let from_c_up = via_c(t);
+    let from_mid_up = via_mid(t);
+    let from_ref_up = via_ref_super(t);
+    let from_top = t.top_tag();
+    from_c_direct + from_b_direct + from_a + from_c_up + from_mid_up + from_ref_up + from_top
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let it = Item { bytes: [4, 6] };
+    run_top(&it) as i32
+}
+";
+
+    fn survey_clean(tail: &str, label: &str) {
+        let alloc = blaze_own::testing::heap().alloc();
+        let text = [HEAD, tail].concat();
+        let files = [SourceFile { path: "src/main.rs", text: &text }];
+        let tc = Toolchain::none(alloc);
+        let texts = ProgramTexts::new(&files, "src/main.rs", NEW, &tc, blaze_build::Panic::Unwind)
+            .unwrap_or_else(|e| panic!("{label}: texts: {e}"));
+        let user = texts.user();
+        let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("{label}: inputs: {e}"));
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("{label}: resolve: {e}"));
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the survey's frame");
+        let mut left_out = Default::default();
+        let mut program = Front2Program::survey(&names, &frame, &files, &mut left_out, alloc)
+            .unwrap_or_else(|e| panic!("{label}: survey: {e}"));
+        assert!(left_out.is_empty(), "{label}: front2 left out {left_out:?}");
+        let mut refused = Default::default();
+        let counts = build_survey(&mut program, &mut refused, blaze_build::OverflowChecks::Off, alloc)
+            .unwrap_or_else(|e| panic!("{label}: build_survey: {e}"));
+        assert!(refused.is_empty(), "{label}: refused {refused:?} ({}/{})", counts.built, counts.tried);
+        assert!(counts.built > 0, "{label}: expected built instances");
+    }
+
+    fn run(tail: &str) -> Result<u8, String> {
+        let text = [HEAD, tail].concat();
+        let files = [SourceFile { path: "src/main.rs", text: &text }];
+        run_with(&files, "src/main.rs", None, FrontChoice::New(NEW), blaze_own::testing::heap().shared()).map_err(|e| format!("{e}"))
+    }
+
+    #[test]
+    fn buffer_as_ref_as_mut_u8_slice_calls_and_upcasts() {
+        survey_clean(BUFFER_PROGRAM, "Buffer");
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(run(BUFFER_PROGRAM), Ok(35), "Buffer calls and prefix + off-chain upcasts");
+    }
+
+    #[test]
+    fn parameterized_compound_supertrait_args_multiple_instantiations() {
+        survey_clean(COMPOUND_PARAM_PROGRAM, "Compound");
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(run(COMPOUND_PARAM_PROGRAM), Ok(84), "SubOpt<u32/u64> and SubSlice<u8/u16>");
+    }
+
+    #[test]
+    fn transitive_supertrait_concrete_and_compound_args() {
+        survey_clean(TRANSITIVE_PROGRAM, "Transitive");
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(run(TRANSITIVE_PROGRAM), Ok(73), "transitive concrete & compound supertraits + upcasts");
+    }
+
+    fn shape_for(arg_ty: &str) -> (blaze_ids::ContentId, blaze_ids::ContentId) {
+        let alloc = blaze_own::testing::heap().alloc();
+        let tail = format!(
+            "
+pub trait AsRef<T: PointeeSized>: PointeeSized {{
+    fn as_ref(&self) -> &T;
+}}
+pub trait Sub: AsRef<{arg_ty}> {{
+    fn f(&self);
+}}
+fn use_sub(_: &dyn Sub) {{}}
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {{
+    let _f: fn(&dyn Sub) = use_sub;
+    0
+}}
+"
+        );
+        let text = [HEAD, &tail].concat();
+        let files = [SourceFile { path: "src/main.rs", text: &text }];
+        let tc = Toolchain::none(alloc);
+        let texts = ProgramTexts::new(&files, "src/main.rs", NEW, &tc, blaze_build::Panic::Unwind).expect("texts");
+        let user = texts.user();
+        let inputs = Inputs::new(&user, &tc).expect("inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("names");
+        let key = |ns: Namespace, name: &'static str| {
+            let found = names::path(&names, names.root(0), ns, Written { kind: PathKind::Plain, segments: &[name] }, alloc)
+                .expect("path");
+            checker_of(found.whole(1).expect("whole").key)
+        };
+        let sub = key(Namespace::Types, "Sub");
+        let use_sub = key(Namespace::Values, "use_sub");
+        let main = key(Namespace::Values, "main");
+        let wf = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("whole frame");
+        let lf = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("lazy frame");
+        let whole = Front2Program::new(&names, &wf, &files, alloc).expect("whole program");
+        let mut lazy = LazyProgram::new(&names, &lf, &files, Some(main), alloc).expect("lazy program");
+        lazy.check_one(use_sub).expect("check_one").expect("use_sub fn");
+        let w_shape = whole.object_trait(sub).expect("whole Sub object_trait").shape;
+        let l_shape = lazy.object_trait(sub).expect("lazy Sub object_trait").shape;
+        (w_shape, l_shape)
+    }
+
+    #[test]
+    fn object_table_shape_hash_covers_supertrait_argument_types() {
+        let (w_u8, l_u8) = shape_for("[u8]");
+        let (w_u16, l_u16) = shape_for("[u16]");
+        assert_eq!(w_u8, l_u8, "whole and lazy object_trait shapes must agree for AsRef<[u8]>");
+        assert_eq!(w_u16, l_u16, "whole and lazy object_trait shapes must agree for AsRef<[u16]>");
+        assert_ne!(w_u8, w_u16, "changing supertrait argument [u8] -> [u16] must change ObjectTable::shape");
+    }
 }

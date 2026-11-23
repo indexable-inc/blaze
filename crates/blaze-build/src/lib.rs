@@ -1330,6 +1330,17 @@ pub fn build_builtin_clone<A: Allocator + Copy>(
     walk::build_builtin_clone(clone, copy, subst, adts, alloc)
 }
 
+/// Builds the builtin `From::from` shim for structural error unions (`subst.args = [Dst, Src]`),
+/// injecting a member or remapping a strict sub-union into `Dst`.
+pub fn build_builtin_from<A: Allocator + Copy>(
+    from: ItemKey,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    walk::build_builtin_from(from, subst, adts, alloc)
+}
+
 /// What the instance `subst` names of `body` reads of trait shapes, before it is built: its
 /// dynamic calls' slots and its upcasts' words, in expression order. With the instance's
 /// [`InstanceKey`] it makes the record's key ([`vtable::record_key`]; codegen.md, "Trait

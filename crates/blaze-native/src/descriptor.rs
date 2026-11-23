@@ -266,6 +266,9 @@ fn descriptor_at<'f>(
         .ok_or(DescriptorError::Truncated { what: "the descriptor", at: off as u64 })?;
     let d = Descriptor::from_bytes(bytes);
     d.check()?;
+    if d.words == 0 {
+        return Ok((d, Names { table: &[], count: 0 }));
+    }
     let names_off = map(d.name_at, "the names table")?;
     let table = file.get(names_off..).ok_or(DescriptorError::Truncated { what: "the names table", at: names_off as u64 })?;
     let names = Names { table, count: d.words };

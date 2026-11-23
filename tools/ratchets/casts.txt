@@ -4,7 +4,7 @@
 # starts at 0 (AGENTS.md correct-by-construction; the conversions are crates/blaze-int's).
 # Written by scripts/src/bin/casts.rs (`{"command": "write"}`), checked in CI.
 # crate	casts
-blaze-algebra	29
+blaze-algebra	11
 blaze-alloc-count	2
 blaze-answer	80
 blaze-ask	12
@@ -17,11 +17,11 @@ blaze-body	66
 blaze-body-build	22
 blaze-body-drops	16
 blaze-body-eval	57
-blaze-body-flow	25
+blaze-body-flow	24
 blaze-body-lower	24
 blaze-borrow	25
 blaze-bstd-convert	9
-blaze-build	761
+blaze-build	754
 blaze-build-script	109
 blaze-c	4
 blaze-cad	101
@@ -30,17 +30,17 @@ blaze-cad-field	233
 blaze-cad-mesh	61
 blaze-cad-out	10
 blaze-cad-picture	80
-blaze-cas	294
+blaze-cas	291
 blaze-cast	40
 blaze-cc	17
 blaze-cert	14
 blaze-check	108
-blaze-cli	674
+blaze-cli	671
 blaze-code	139
 blaze-columns	2
 blaze-comptime-sys	150
 blaze-cond	13
-blaze-consteval	363
+blaze-consteval	360
 blaze-core	755
 blaze-cunit	62
 blaze-data	1
@@ -49,14 +49,14 @@ blaze-deflate	152
 blaze-drive	64
 blaze-ed25519	5
 blaze-emit	890
-blaze-engine	120
+blaze-engine	119
 blaze-expand	284
-blaze-export	486
+blaze-export	426
 blaze-facts	12
 blaze-fetch	213
 blaze-file-items	94
 blaze-flow	144
-blaze-flow-lower	454
+blaze-flow-lower	453
 blaze-fmt	62
 blaze-format	44
 blaze-format-core	95
@@ -74,9 +74,9 @@ blaze-inproc	70
 blaze-int	7
 blaze-keyed	677
 blaze-kit	2
-blaze-ladder	1229
+blaze-ladder	1220
 blaze-launch	174
-blaze-launch-rt	467
+blaze-launch-rt	461
 blaze-launcher	6
 blaze-lint	187
 blaze-lint-defs	21
@@ -110,7 +110,7 @@ blaze-screen	13
 blaze-script	11
 blaze-sha256	1
 blaze-sim	29
-blaze-solve	464
+blaze-solve	458
 blaze-sort	14
 blaze-spawn	2
 blaze-sql	4

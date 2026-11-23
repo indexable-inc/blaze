@@ -102,12 +102,10 @@ fn a_one_body_edit_lists_only_its_file() {
     // The floor (D149 I1): only the owed file's member is opened, once a unit; `b` is read from
     // its listing row (engine_bodies.rs `groups`).
     assert_eq!(edited.members_opened, edited.members_owed, "members opened is the floor, the owed file's member once a unit: {edited:?}");
-    // A member's row is keyed by its files' HEADS (engine_member_rows.rs THE KEY, piece A
-    // 2026-11-21: an outline's `Surface` digest, which an edit inside a body moves not), and
-    // this edit is inside `k`'s body: `a`'s key stands as `b`'s does, so every row is read, none
-    // made. The test oracle (engine_bodies.rs `rows.unequal`) compares each read row with the
-    // one today's listing makes, so a stale read would not pass unseen.
-    assert_eq!((edited.rows_read, edited.rows_made, edited.rows_damaged), (edited.members, 0, 0), "a body edit moves no file's head, so every member's row is read by its key (engine_member_rows.rs THE KEY): {edited:?}");
+    // Standing members (`StandingMembers` on `Driver::Phases`, #2269): unedited member `b` stands
+    // directly from `members_record` without probing its member listing row from the store, so
+    // only the owed member `a`'s row is read by key (floor: `edited.members_owed`).
+    assert_eq!((edited.rows_read, edited.rows_made, edited.rows_damaged), (edited.members_owed, 0, 0), "a body edit moves no file's head: unedited members stand from members_record, owed members read by key: {edited:?}");
     assert_eq!(uncovered_note(&wrong_lines), uncovered_note(&fresh_lines), "the uncovered note is the same bytes whether a member's part was read or made");
 
     write(&io, "a/src/m.rs", A_M);
@@ -116,9 +114,7 @@ fn a_one_body_edit_lists_only_its_file() {
     let back = counters(&io);
     assert_eq!((back.files_listed, back.files_owed), (units, units), "taking the edit back owes the one file again: {back:?}");
     assert_eq!(back.members_opened, back.members_owed, "taking the edit back opens only the owed file's member: {back:?}");
-    // `a`'s text is the fresh text again, so its key is the fresh row's, which the answer's
-    // root kept (engine_answer.rs `save_edit`, `row_keys`): every row read, none made. A
-    // restored row and a fresh one give the same note.
-    assert_eq!((back.rows_read, back.rows_made, back.rows_damaged), (back.members, 0, 0), "taking the edit back reads every row, the fresh run's: {back:?}");
+    // Taking the edit back stands `b` from `members_record` and reads `a`'s fresh row by key.
+    assert_eq!((back.rows_read, back.rows_made, back.rows_damaged), (back.members_owed, 0, 0), "taking the edit back reads only the owed member's row, the fresh run's: {back:?}");
     assert_eq!(uncovered_note(&back_lines), uncovered_note(&fresh_lines), "the uncovered note after edit and revert is the fresh one, byte for byte");
 }

@@ -11,7 +11,7 @@ use blaze_tier::record::{Declare, DeclaredKind, Declares, Emitted, LoopHeader, P
 
 use crate::check;
 use crate::export::export;
-use crate::input::{Data, DataPlace, DataWord, Entry, Function, Panic, Platform, ProgramIn, Tier};
+use crate::input::{Data, DataPlace, DataWord, Entry, Function, Panic, Platform, ProgramIn, Tier, TlsRuntime};
 use crate::macho;
 use crate::optimized::{Function02, Member02, ProgramIn02, export_optimized, lay_out_records, v1_to_v2};
 
@@ -106,7 +106,7 @@ fn both(named: &[(&str, &[u8])], data: &[Data<'_>], platform: Platform) -> (AVec
     for &(name, bytes) in named {
         v1s.push(Function { symbol: sym(name), record: CodeView::read(bytes).unwrap(), tier: Tier::Fast });
     }
-    let program = ProgramIn { name: "tiny", functions: &v1s, data, entry: Entry::CMain { main: sym("main") }, panic: Panic::Unwind, personality: None, profile: None, natives: None, exports: &[] };
+    let program = ProgramIn { name: "tiny", functions: &v1s, data, entry: Entry::CMain { main: sym("main") }, panic: Panic::Unwind, personality: None, tls: None, profile: None, natives: None, exports: &[] };
     let mut today = Vec::new_in(alloc);
     export(&program, platform, &mut today, alloc).unwrap();
     let mut converted: AVec<'_, AVec<'static, u8>> = Vec::new_in(alloc);
@@ -117,7 +117,7 @@ fn both(named: &[(&str, &[u8])], data: &[Data<'_>], platform: Platform) -> (AVec
     for (k, &(name, _)) in named.iter().enumerate() {
         v2s.push(Function02 { symbol: sym(name), record: read(&converted[k]).unwrap(), tier: Tier::Fast });
     }
-    let program = ProgramIn02 { name: "tiny", functions: &v2s, data, entry: Entry::CMain { main: sym("main") }, panic: Panic::Unwind, personality: None, profile: None };
+    let program = ProgramIn02 { name: "tiny", functions: &v2s, data, entry: Entry::CMain { main: sym("main") }, panic: Panic::Unwind, personality: None, tls: None, profile: None };
     let mut optimized = Vec::new_in(alloc);
     export_optimized(&program, platform, &mut optimized, alloc).unwrap();
     (today, optimized)
@@ -152,8 +152,8 @@ fn optimized_equals_export_for_converted_records() {
     let table = [0u8; 8];
     let words = [DataWord { at: 0, target: Some(func("main")), addend: 0 }];
     let data = [
-        Data { target: st, bytes: &answer, align: 8, words: &[], place: DataPlace::ReadOnly },
-        Data { target: vt, bytes: &table, align: 8, words: &words, place: DataPlace::ReadOnly },
+        Data { target: st, bytes: &answer, align: 8, words: &[], outside: &[], place: DataPlace::ReadOnly },
+        Data { target: vt, bytes: &table, align: 8, words: &words, outside: &[], place: DataPlace::ReadOnly },
     ];
     let (e, f) = both(&[("main", &reader)], &data, Platform::MacosArm64);
     assert_eq!(&e[..], &f[..], "the Mach-O files with data differ");
@@ -205,7 +205,7 @@ fn branch_calls_are_direct_and_c_names_get_one_stub() {
         Function02 { symbol: sym("main"), record: read(&main).unwrap(), tier: Tier::Optimized },
         Function02 { symbol: sym("second"), record: read(&second).unwrap(), tier: Tier::Optimized },
     ];
-    let program = ProgramIn02 { name: "tiny", functions: &fs, data: &[], entry: Entry::CMain { main: sym("main") }, panic: Panic::Unwind, personality: None, profile: None };
+    let program = ProgramIn02 { name: "tiny", functions: &fs, data: &[], entry: Entry::CMain { main: sym("main") }, panic: Panic::Unwind, personality: None, tls: None, profile: None };
     let mut file = Vec::new_in(alloc);
     let summary = export_optimized(&program, Platform::MacosArm64, &mut file, alloc).unwrap();
     assert_eq!((summary.optimized, summary.fast), (2, 0));
@@ -240,4 +240,90 @@ fn polls_are_removed_and_their_page_is_not_bound() {
     assert_eq!((at(laid.entry + 4), at(laid.entry + 8)), (NOP, NOP));
     assert_eq!(laid.imports.len(), 0);
     println!("optimized: the poll is two nops and its page is not bound ({} imports)", laid.imports.len());
+}
+
+/// Rust `Space::Tls` exported from `bzcode02` records via `export_optimized` matches `export`
+/// byte-for-byte on both Mach-O arm64 and ELF arm64 (initialized + zeroed TLS + relro word).
+#[test]
+fn optimized_equals_export_with_rust_tls() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let desc_sym = sym("TLS_DESC");
+    let ender_sym = sym("tls_ender");
+    let desc_target = Target { space: Space::Static, symbol: desc_sym };
+    let tls_init = Target { space: Space::Tls, symbol: sym("TLS_INIT") };
+    let tls_zero = Target { space: Space::Tls, symbol: sym("TLS_ZERO") };
+    let main_v1 = {
+        let mut r = CodeRecord::new_in(alloc);
+        for inst in [ADRP_X0, LDR_X0, ADRP_X0, LDR_X0, ADRP_X0, LDR_X0, MOV_W0_42, RET] {
+            r.code.extend_from_slice(&inst.to_le_bytes());
+        }
+        r.relro.resize(8, 0);
+        let i_desc = r.target(desc_target);
+        let i_init = r.target(tls_init);
+        let i_zero = r.target(tls_zero);
+        r.sites.push(Site { at: 0, kind: SiteKind::Load, target: i_desc, addend: 0 });
+        r.sites.push(Site { at: 8, kind: SiteKind::Load, target: i_init, addend: 0 });
+        r.sites.push(Site { at: 16, kind: SiteKind::Load, target: i_zero, addend: 0 });
+        r.words.push(blaze_code::record::Word { at: 0, target: i_init, addend: 3 });
+        let mut out = Vec::new_in(alloc);
+        r.seal().unwrap().encode(&mut out);
+        out
+    };
+    let ender_v1 = rec(&[RET], &[], &[]);
+    let main_v2 = v2(&main_v1);
+    let ender_v2 = v2(&ender_v1);
+    let init_bytes = 40u64.to_le_bytes();
+    let data = [
+        Data { target: tls_init, bytes: &init_bytes, align: 8, words: &[], outside: &[], place: DataPlace::ReadOnly },
+        Data { target: tls_zero, bytes: &[], align: 16, words: &[], outside: &[], place: DataPlace::Zeroed { len: 16 } },
+    ];
+    let tls = Some(TlsRuntime { descriptor: desc_sym, ender: ender_sym });
+    let v1_funcs = [
+        Function { symbol: sym("main"), record: CodeView::read(&main_v1).unwrap(), tier: Tier::Fast },
+        Function { symbol: ender_sym, record: CodeView::read(&ender_v1).unwrap(), tier: Tier::Fast },
+    ];
+    let v2_funcs = [
+        Function02 { symbol: sym("main"), record: read(&main_v2).unwrap(), tier: Tier::Fast },
+        Function02 { symbol: ender_sym, record: read(&ender_v2).unwrap(), tier: Tier::Fast },
+    ];
+    let prog_v1 = ProgramIn {
+        name: "tls-opt",
+        functions: &v1_funcs,
+        data: &data,
+        entry: Entry::CMain { main: sym("main") },
+        panic: Panic::Unwind,
+        personality: None,
+        tls,
+        profile: None,
+        natives: None,
+        exports: &[],
+    };
+    let prog_v2 = ProgramIn02 {
+        name: "tls-opt",
+        functions: &v2_funcs,
+        data: &data,
+        entry: Entry::CMain { main: sym("main") },
+        panic: Panic::Unwind,
+        personality: None,
+        tls,
+        profile: None,
+    };
+    for platform in [Platform::MacosArm64, Platform::LinuxArm64] {
+        let mut a = Vec::new_in(alloc);
+        let mut b = Vec::new_in(alloc);
+        export(&prog_v1, platform, &mut a, alloc).unwrap();
+        export_optimized(&prog_v2, platform, &mut b, alloc).unwrap();
+        assert_eq!(&a[..], &b[..], "export and export_optimized must match byte-for-byte with Rust TLS on {platform:?}");
+        match platform {
+            Platform::MacosArm64 => {
+                let facts = check::macho(&b).unwrap();
+                assert!(matches!(facts.mod_init, Some((_, 8))));
+            }
+            Platform::LinuxArm64 => {
+                let facts = check::elf(&b).unwrap();
+                assert_eq!(facts.tls, Some((0, 8, 16)));
+            }
+            Platform::Wasm64 => {}
+        }
+    }
 }

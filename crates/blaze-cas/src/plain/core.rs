@@ -1410,15 +1410,6 @@ enum Keep {
     Reached { owner: ReachOwner, kept_count: u32 },
 }
 
-/// A root's record, or an index's an indexed root names, where it lies in this process's
-/// mappings: its key, the mapping, its entry there.
-#[derive(Clone, Copy)]
-struct RootPlace {
-    key: ContentId,
-    map: u32,
-    entry: Entry,
-}
-
 impl Keep {
     #[inline]
     fn keeps(&self, key: &ContentId, young: bool) -> bool {
@@ -1784,6 +1775,9 @@ struct Flip<A: Allocator + Clone> {
     /// Optional sidecar Bloom append or compact rewrite performed under the flip lock before
     /// `SLOT_WRITE`. Its failure never aborts the flip.
     bloom_effect: Option<Effect>,
+    /// `(replaced, written_bytes)` for `bloom_effect`, cleared if `BLOOM_WRITE` fails and applied
+    /// to `BloomIndex::mapped_bytes` when the flip commits.
+    bloom_written: Option<(bool, u64)>,
 }
 
 /// Parked `Ctx::Open` resolution waiting for the parallel `BLOOM_MAP` effect to settle.
@@ -2669,9 +2663,10 @@ impl<A: Allocator + Clone> Plain<A> {
     }
 
     /// Whether [`Plain::commit`] / [`Plain::commit_records`] with empty inputs has any pending
-    /// work (held records, root edits, open stamps, or a folded compaction slice).
+    /// work (held records, root edits, open stamps, acknowledged loss marks, or a folded
+    /// compaction slice).
     pub fn needs_commit(&self) -> bool {
-        self.holds_uncommitted() || !self.roots_pending.is_empty() || self.pending_stamps() || self.folding.is_some()
+        self.holds_uncommitted() || !self.roots_pending.is_empty() || self.pending_stamps() || self.folding.is_some() || !self.clearable.is_empty()
     }
 
     /// Whether [`Plain::seal`] has any unsealed local segments of this boot or pending stamps.
@@ -2724,7 +2719,8 @@ impl<A: Allocator + Clone> Plain<A> {
     /// When the store is whole (`self.eager`) and any live local segment lacks a filter (e.g.
     /// upgrading an existing store) or dead bytes exceed 2x live + 64 KiB, writes a compact
     /// replacement via atomic `WriteUnsynced`; otherwise appends only newly built records.
-    fn plan_bloom_effect(&mut self, m: &Manifest) -> Option<Effect> {
+    /// Returns `(effect, replaced, written_bytes)`.
+    fn plan_bloom_effect(&mut self, m: &Manifest) -> Option<(Effect, bool, u64)> {
         let has_pending = |pending: &[(ContentId, blaze_own::Vec<u8, Kept>)], digest: &ContentId| pending.iter().any(|(d, _)| d == digest);
         let needs_backfill = self.eager
             && m.segments
@@ -2754,7 +2750,8 @@ impl<A: Allocator + Clone> Plain<A> {
             if bytes.is_empty() {
                 return None;
             }
-            return Some(Effect::WriteUnsynced { file: self.bloom_file.share(), bytes: bytes.into_iter().collect(), tag: self.tag(BLOOM_WRITE, 0) });
+            let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            return Some((Effect::WriteUnsynced { file: self.bloom_file.share(), bytes: bytes.into_iter().collect(), tag: self.tag(BLOOM_WRITE, 0) }, true, len));
         }
         if self.pending_bloom.is_empty() {
             return None;
@@ -2768,7 +2765,8 @@ impl<A: Allocator + Clone> Plain<A> {
         if bytes.is_empty() {
             return None;
         }
-        Some(Effect::Append { file: self.bloom_file.share(), bytes: bytes.into_iter().collect(), tag: self.tag(BLOOM_WRITE, 0) })
+        let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        Some((Effect::Append { file: self.bloom_file.share(), bytes: bytes.into_iter().collect(), tag: self.tag(BLOOM_WRITE, 0) }, false, len))
     }
 
     /// The leases this generation names: `(holder's nonce, expires ns)`.
@@ -3223,10 +3221,11 @@ impl<A: Allocator + Clone> Plain<A> {
     /// Only takes effect when no lease for this process is currently held (`!self.leased`), so a
     /// resident daemon holds zero leases while idle (never blocking `blaze gc`) yet acquires fresh
     /// lease protection starting from the current generation on the next multi-phase request.
-    pub fn rearm_lease(&mut self) {
+    pub fn rearm_lease(&mut self, now_ns: u64) {
         if !self.leased && self.released {
             self.released = false;
             self.opened_generation = self.manifest.generation;
+            self.opened_ns = now_ns;
         }
     }
 
@@ -3338,7 +3337,7 @@ impl<A: Allocator + Clone> Plain<A> {
         }
         let mut rest = laid.into_iter();
         match rest.next() {
-            None if roots.is_empty() && !self.pending_stamps() && self.folding.is_none() => {
+            None if roots.is_empty() && !self.pending_stamps() && self.folding.is_none() && self.clearable.is_empty() => {
                 self.committed = Some(Ok(self.empty_committed()));
                 self.sealed.clear();
             }
@@ -3913,6 +3912,7 @@ impl<A: Allocator + Clone> Plain<A> {
         });
         let entry_overhead = u64::try_from(ENTRY).unwrap_or(0);
         let mut owner: Map<[u8; 32], u32, BuildKeyHasher, Kept> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: BLOOM_ALLOC, capacity: None });
+        let mut followed: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
         let mut total_live = 0u64;
         let mut uncounted = 0usize;
         for (pos, slot) in order.iter_mut().enumerate() {
@@ -3932,6 +3932,9 @@ impl<A: Allocator + Clone> Plain<A> {
                 TagReach::Indexes if self.plant() != Plant::IndexNotFollowed => {
                     for chunk in payload.chunks_exact(32) {
                         let Ok(raw) = <[u8; 32]>::try_from(chunk) else { continue };
+                        if followed.insert(raw, ()).is_some() {
+                            continue;
+                        }
                         let index = ContentId(raw);
                         let Some((idx_at, idx_entry)) = self.find_in(&[Namespace::LOCAL], &Key(index)) else {
                             return Err(StoreError::IndexGone { generation: self.manifest.generation, root: root.key, index });
@@ -4247,20 +4250,13 @@ impl<A: Allocator + Clone> Plain<A> {
         self.manifest.leases.iter().any(|it| seg.generation >= it.since && (it.expires_ns > now_ns || self.plant() == Plant::LeaseNeverExpires))
     }
 
-    /// Each unexpired root's key and its record's sorted keys, read in place: what
-    /// [`reached`] searches ([`Plain::root_places`], each resolved in its mapping).
-    fn live_roots(&self, now_ns: u64) -> Result<Vec<(ContentId, &[u8]), A>, StoreError> {
-        let places = self.root_places(now_ns)?;
-        let mut out = self.alloc_vec();
-        out.extend(places.iter().map(|it| (it.key, self.maps[it.map as usize].payload(&it.entry))));
-        Ok(out)
-    }
-
-    /// Where each unexpired root's record lies (its sorted keys), and each index's an indexed
-    /// root names: what [`Plain::live_roots`] reads for `reused`. A root whose record no segment
-    /// holds stops the operation by name.
-    fn root_places(&self, now_ns: u64) -> Result<Vec<RootPlace, A>, StoreError> {
-        let mut out = self.alloc_vec();
+    /// O(total unique reached keys) sets of all keys reached by unexpired roots in this view
+    /// (`keys`) and all index records followed by unexpired indexed roots (`followed`), built in a
+    /// single pass with O(1) index deduplication so [`Plain::reused`] probes in O(1) per key
+    /// instead of scanning every root/index linearly.
+    fn live_key_sets(&self, now_ns: u64) -> Result<(Map<[u8; 32], (), BuildKeyHasher, &A>, Map<[u8; 32], (), BuildKeyHasher, &A>), StoreError> {
+        let mut keys: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
+        let mut followed: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
         for (i, root) in self.manifest.roots.iter().enumerate() {
             if root.expires_ns <= now_ns || (i == 0 && self.plant() == Plant::ReachSkipsRoot) {
                 continue;
@@ -4268,31 +4264,35 @@ impl<A: Allocator + Clone> Plain<A> {
             let Some((at, entry)) = self.find_in(&[Namespace::LOCAL], &Key(root.key)) else {
                 return Err(StoreError::RootGone { generation: self.manifest.generation, key: root.key });
             };
-            out.push(RootPlace { key: root.key, map: at as u32, entry });
+            keys.insert(root.key.0, ());
+            let Some(map) = self.maps.get(at) else { continue };
+            let payload = map.payload(&entry);
+            for chunk in payload.chunks_exact(32) {
+                let Ok(raw) = <[u8; 32]>::try_from(chunk) else { continue };
+                keys.insert(raw, ());
+            }
             if reach_of(entry.tag) == TagReach::Indexes && self.plant() != Plant::IndexNotFollowed {
-                self.follow(root.key, self.maps[at].payload(&entry), &mut out)?;
+                for chunk in payload.chunks_exact(32) {
+                    let Ok(raw) = <[u8; 32]>::try_from(chunk) else { continue };
+                    if followed.insert(raw, ()).is_some() {
+                        continue;
+                    }
+                    let index = ContentId(raw);
+                    let Some((idx_at, idx_entry)) = self.find_in(&[Namespace::LOCAL], &Key(index)) else {
+                        return Err(StoreError::IndexGone { generation: self.manifest.generation, root: root.key, index });
+                    };
+                    if reach_of(idx_entry.tag) != TagReach::IndexKeys {
+                        return Err(StoreError::NotAnIndex { root: root.key, key: index, tag: idx_entry.tag });
+                    }
+                    let Some(idx_map) = self.maps.get(idx_at) else { continue };
+                    for key_chunk in idx_map.payload(&idx_entry).chunks_exact(32) {
+                        let Ok(key_raw) = <[u8; 32]>::try_from(key_chunk) else { continue };
+                        keys.insert(key_raw, ());
+                    }
+                }
             }
         }
-        Ok(out)
-    }
-
-    /// Each index the indexed root `root` names (`named`, its record's sorted keys), pushed as
-    /// where its record lies: what [`reached`] searches as it searches a root's, so the
-    /// index's own record and every key it holds are live. One level: what an index names is
-    /// not looked into. An index no segment holds, or a record there of another tag, stops the
-    /// slice by name, as a root's missing record does.
-    fn follow(&self, root: ContentId, named: &[u8], out: &mut Vec<RootPlace, A>) -> Result<(), StoreError> {
-        for index in named.chunks_exact(32) {
-            let index = ContentId(index.try_into().expect("32 bytes"));
-            let Some((at, entry)) = self.find_in(&[Namespace::LOCAL], &Key(index)) else {
-                return Err(StoreError::IndexGone { generation: self.manifest.generation, root, index });
-            };
-            if reach_of(entry.tag) != TagReach::IndexKeys {
-                return Err(StoreError::NotAnIndex { root, key: index, tag: entry.tag });
-            }
-            out.push(RootPlace { key: index, map: at as u32, entry });
-        }
-        Ok(())
+        Ok((keys, followed))
     }
 
     /// Whether this generation names a segment an earlier boot wrote and never sealed: the
@@ -4376,14 +4376,15 @@ impl<A: Allocator + Clone> Plain<A> {
             return Ok(out);
         }
         let mut live = None;
+        let mut checked_indexes: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
         macro_rules! look_key {
             ($key:expr) => {{
                 let key: &ContentId = $key;
-                let skip = live.as_deref().is_some_and(|loaded| reached(loaded, key));
+                let skip = live.as_ref().is_some_and(|(keys, _): &(Map<[u8; 32], (), BuildKeyHasher, &A>, Map<[u8; 32], (), BuildKeyHasher, &A>)| keys.contains_key(&key.0));
                 if !skip && let Some((at, _)) = self.find_in(&[Namespace::LOCAL], &Key(*key)) {
                     let already = if live.is_none() {
-                        let loaded = self.live_roots(now_ns)?;
-                        let hit = reached(&loaded, key);
+                        let loaded = self.live_key_sets(now_ns)?;
+                        let hit = loaded.0.contains_key(&key.0);
                         live = Some(loaded);
                         hit
                     } else {
@@ -4408,15 +4409,15 @@ impl<A: Allocator + Clone> Plain<A> {
                 continue;
             }
             // An indexed root: what each index holds is named too, one level. An index this
-            // view follows already (an entry of `live` of its own, as `follow` pushes it) keeps
-            // what it holds here; only another's keys are looked at. (A plain root naming an
-            // index keeps its record, not what it holds: not followed, so looked at.)
+            // view follows already (`live.1`, built by `live_key_sets`) keeps what it holds here;
+            // only another's keys are looked at, each unique index at most once. (A plain root
+            // naming an index keeps its record, not what it holds: not followed, so looked at.)
             for index in got.bytes.chunks_exact(32) {
                 let Ok(bytes) = index.try_into() else { continue };
-                let index = ContentId(bytes);
-                if live.as_deref().is_some_and(|loaded| loaded.iter().any(|(followed, _)| *followed == index)) {
+                if live.as_ref().is_some_and(|(_, followed)| followed.contains_key(&bytes)) || checked_indexes.insert(bytes, ()).is_some() {
                     continue;
                 }
+                let index = ContentId(bytes);
                 let Some(held) = self.get_in(&[Namespace::LOCAL], &Key(index)) else {
                     return Err(StoreError::IndexGone { generation: self.manifest.generation, root: root.0, index });
                 };
@@ -4460,18 +4461,22 @@ impl<A: Allocator + Clone> Plain<A> {
     /// longer in `m.segments`, used when a concurrent command LRU-evicted a root and swept its
     /// segment between this process's open and its commit flip.
     fn missing_from_eviction(&self, edits: &[RootEdit], m: &Manifest) -> Result<Vec<(u64, ContentId), A>, StoreError> {
+        let mut present: Vec<u64, &A> = Vec::with_capacity_in(m.segments.len(), &self.alloc);
+        present.extend(m.segments.iter().map(|it| it.id));
+        present.sort_unstable();
+        let mut seen_indexes: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
         let mut out = self.alloc_vec();
         for edit in edits {
             let RootEdit::Set { key: root, renew_only: false, .. } = edit else { continue };
             let mut check = |k: ContentId| {
-                if self.carried_in_commit.as_ref().is_some_and(|done| done.scan_for(&k).is_some()) {
+                if self.carried_in_commit.as_ref().is_some_and(|done| done.binary_search(&k).is_ok()) {
                     return;
                 }
                 if let Some((at, _)) = self.find_in(&[Namespace::LOCAL], &Key(k))
                     && let Some(map) = self.maps.get(at)
                 {
                     let seg_id = map.seg().id;
-                    if !m.segments.iter().any(|it| it.id == seg_id) {
+                    if present.binary_search(&seg_id).is_err() {
                         out.push((seg_id, k));
                     }
                 }
@@ -4487,6 +4492,9 @@ impl<A: Allocator + Clone> Plain<A> {
             }
             for chunk in got.bytes.chunks_exact(32) {
                 let Ok(bytes) = <[u8; 32]>::try_from(chunk) else { continue };
+                if seen_indexes.insert(bytes, ()).is_some() {
+                    continue;
+                }
                 let index = ContentId(bytes);
                 let Some(held) = self.get_in(&[Namespace::LOCAL], &Key(index)) else { continue };
                 if reach_of(held.tag) != TagReach::IndexKeys {
@@ -4696,6 +4704,7 @@ impl<A: Allocator + Clone> Plain<A> {
             early: 0,
             deferred: None,
             bloom_effect: None,
+            bloom_written: None,
         }));
         effects.push(Effect::Lock { file: self.flip.share(), mode: LockMode::Exclusive, tag: self.tag(LOCK, 0) });
     }
@@ -4844,12 +4853,15 @@ impl<A: Allocator + Clone> Plain<A> {
                 } else {
                     self.alloc_vec()
                 };
+                let mut present_segs: Vec<u64, &A> = Vec::with_capacity_in(m.segments.len(), &self.alloc);
+                present_segs.extend(m.segments.iter().map(|it| it.id));
+                present_segs.sort_unstable();
                 if refused.is_some() {
                 } else if now_ns.saturating_sub(*started_ns) > GRACE_NS / 2 {
                     // A compaction may have retired its segment as named by no generation:
                     // it is not flipped.
                     refused = Some(StoreError::CommitTooSlow { took_s: now_ns.saturating_sub(*started_ns) / 1_000_000_000, grace_s: GRACE_NS / 1_000_000_000 });
-                } else if let Some(&(segment, key)) = self.touches.iter().find(|(id, _)| !m.segments.iter().any(|it| it.id == *id)).or_else(|| extra_carry.first())
+                } else if let Some(&(segment, key)) = self.touches.iter().find(|(id, _)| present_segs.binary_search(id).is_err()).or_else(|| extra_carry.first())
                     && self.plant() != Plant::CarrySkipped
                 {
                     // A record this commit's roots name, dead in its view (or whose protecting
@@ -4865,19 +4877,23 @@ impl<A: Allocator + Clone> Plain<A> {
                         refused = Some(StoreError::SweptUnder { key, segment });
                     } else {
                         self.carrying.clear();
-                        self.carrying.extend(self.touches.iter().filter(|(id, _)| !m.segments.iter().any(|it| it.id == *id)).copied());
-                        for item in extra_carry {
-                            if !self.carrying.contains(&item) {
-                                self.carrying.push(item);
-                            }
-                        }
+                        self.carrying.extend(self.touches.iter().filter(|(id, _)| present_segs.binary_search(id).is_err()).copied());
+                        self.carrying.extend(extra_carry);
+                        self.carrying.sort_unstable();
+                        self.carrying.dedup();
                         carry = true;
                     }
                 } else {
                     // Marked before the slice below: a slice of this process that would drop
-                    // a record this commit's roots reuse aborts as another's would.
-                    for (id, _) in self.touches.iter() {
-                        if let Some(it) = m.segments.iter_mut().find(|it| it.id == *id) {
+                    // a record this commit's roots reuse aborts as another's would. `self.touches`
+                    // is sorted by `(seg_id, key)`, so each distinct `seg_id` is marked once.
+                    let mut prev_id = None;
+                    for &(id, _) in self.touches.iter() {
+                        if prev_id == Some(id) {
+                            continue;
+                        }
+                        prev_id = Some(id);
+                        if let Some(it) = m.segments.iter_mut().find(|it| it.id == id) {
                             it.touched = generation;
                         }
                     }
@@ -5077,7 +5093,13 @@ impl<A: Allocator + Clone> Plain<A> {
         flip.log = self.log_file(log);
         flip.fresh = fresh;
         flip.removals = removals;
-        flip.bloom_effect = self.plan_bloom_effect(&m);
+        if let Some((effect, replaced, len)) = self.plan_bloom_effect(&m) {
+            flip.bloom_effect = Some(effect);
+            flip.bloom_written = Some((replaced, len));
+        } else {
+            flip.bloom_effect = None;
+            flip.bloom_written = None;
+        }
         flip.next = Some((slot, m));
         let first = if flip.new_log {
             flip.manifest_bytes = bytes;
@@ -5226,6 +5248,10 @@ impl<A: Allocator + Clone> Plain<A> {
                 self.bloom.insert_owned(rec);
             }
         }
+        self.bloom.prune(&self.manifest.segments);
+        if let Some((replaced, len)) = flip.bloom_written {
+            self.bloom.note_written(replaced, len);
+        }
         self.leased = self.manifest.leases.iter().any(|it| it.holder == self.cfg.nonce);
         // The slot names the log this flip wrote its manifest to.
         self.log_lost = false;
@@ -5282,16 +5308,16 @@ impl<A: Allocator + Clone> Plain<A> {
                 return self.commit_refused(error.into_store(entry.tag), roots);
             }
         }
-        self.touches.retain(|it| !carrying.contains(it));
+        self.touches.retain(|it| carrying.binary_search(it).is_err());
         if self.carried_in_commit.is_none() {
             self.carried_in_commit = Some(self.own_vec());
         }
         if let Some(done) = &mut self.carried_in_commit {
             for &(_, key) in carrying.iter() {
-                if done.scan_for(&key).is_none() {
-                    done.push(key);
-                }
+                done.push(key);
             }
+            done.sort_unstable();
+            done.dedup();
         }
         self.carried += out.entries.len() as u64;
         match laid_of(out, self.alloc.clone()) {
@@ -6188,10 +6214,13 @@ impl<A: Allocator + Clone> Plain<A> {
                 self.write_slot(effects);
                 Ok(())
             }
-            (BLOOM_WRITE, Phase::Flipping(_)) => {
+            (BLOOM_WRITE, Phase::Flipping(flip)) => {
                 // `bloom` is a rebuildable acceleration sidecar: an I/O error writing or
-                // appending to it never aborts the generation flip.
-                let _ = done;
+                // appending to it never aborts the generation flip, but we clear `bloom_written`
+                // so `BloomIndex::mapped_bytes` is only updated when the write actually succeeded.
+                if matches!(done, Done::Failed(_) | Done::Broken { .. }) {
+                    flip.bloom_written = None;
+                }
                 self.write_slot(effects);
                 Ok(())
             }
@@ -6390,25 +6419,6 @@ fn sorted_keys<A: Allocator>(keys: &[Key], alloc: A) -> Vec<u8, A> {
     }
     bytes.truncate(kept * 32);
     bytes
-}
-
-/// `key` is one of `roots`' own keys, or among the sorted 32-byte keys a root's record holds:
-/// a binary search of each record in place, nothing collected.
-fn reached(roots: &[(ContentId, &[u8])], key: &ContentId) -> bool {
-    roots.iter().any(|(root, keys)| root == key || sorted_holds(keys, key))
-}
-
-fn sorted_holds(keys: &[u8], key: &ContentId) -> bool {
-    let (mut lo, mut hi) = (0usize, keys.len() / 32);
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        match keys[mid * 32..mid * 32 + 32].cmp(&key.0[..]) {
-            std::cmp::Ordering::Less => lo = mid + 1,
-            std::cmp::Ordering::Greater => hi = mid,
-            std::cmp::Ordering::Equal => return true,
-        }
-    }
-    false
 }
 
 fn lost_orphan() -> String {

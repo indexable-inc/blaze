@@ -230,7 +230,8 @@ impl CheckFail {
             | CheckFail::Diags { .. }
             | CheckFail::Rounds { .. }
             | CheckFail::Const { .. }
-            | CheckFail::Resolve { .. } => Scope::One,
+            | CheckFail::Resolve { .. }
+            | CheckFail::InlineFor { .. } => Scope::One,
         }
     }
 }

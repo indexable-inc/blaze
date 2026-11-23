@@ -13,9 +13,7 @@ use core::ffi::{c_int, c_ulong, c_void};
 
 #[cfg(target_os = "macos")]
 use super::{counted, said};
-#[cfg(target_os = "macos")]
-use crate::Fd;
-use crate::{Errno, Path};
+use crate::{Errno, Fd, Path};
 
 // ---- Linux: the raw-system-call layer's own items. ----
 
@@ -559,6 +557,40 @@ mod on_macos {
 #[blaze::nopanic]
 pub fn open(path: Path<'_>, flags: OpenFlags, mode: u32) -> Result<OwnedFd, Errno> {
     openat(CWD, path, flags, mode)
+}
+
+/// Non-blocking `flock` operations supported across both macOS and Linux.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FlockOp {
+    SharedNonBlock,
+    ExclusiveNonBlock,
+    Unlock,
+}
+
+/// Non-blocking advisory file lock (`flock`) across macOS and Linux.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn flock(fd: Fd, op: FlockOp) -> Result<(), Errno> {
+    #[cfg(target_os = "macos")]
+    {
+        let raw_op: c_int = match op {
+            FlockOp::SharedNonBlock => 1 | 4,
+            FlockOp::ExclusiveNonBlock => 2 | 4,
+            FlockOp::Unlock => 8,
+        };
+        // SAFETY: `flock` takes only integer fd and operation flags, touching no memory.
+        said(unsafe { crate::macos::cold::flock(fd.raw(), raw_op) }).map(|_| ())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use crate::linux::LockOp;
+        let lock_op = match op {
+            FlockOp::SharedNonBlock => LockOp::SHARED | LockOp::NONBLOCK,
+            FlockOp::ExclusiveNonBlock => LockOp::EXCLUSIVE | LockOp::NONBLOCK,
+            FlockOp::Unlock => LockOp::UNLOCK,
+        };
+        crate::linux::flock(fd, lock_op)
+    }
 }
 
 // ---- macOS: fcntl, dup, ioctl, preadv over libSystem ----

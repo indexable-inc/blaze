@@ -756,12 +756,14 @@ impl<'b> BodyRef<'b> {
 
     /// The bytes of a [`ConstKind::Bytes`] constant.
     pub fn bytes(&self, c: Const) -> Result<&'b [u8], BadRow> {
-        match self.konst(c)?.kind {
+        let w = row(Table::Consts, self.consts, c.0)?;
+        let decl = decode_const(w).ok_or(BadRow { table: Table::Consts, row: c.0, code: w.kind })?;
+        match decl.kind {
             ConstKind::Bytes { start, len } => {
                 let end = start as usize + len as usize;
                 self.data.get(start as usize..end).ok_or(BadRow { table: Table::Data, row: start, code: len })
             }
-            _ => Err(BadRow { table: Table::Consts, row: c.0, code: self.consts[c.index()].kind }),
+            _ => Err(BadRow { table: Table::Consts, row: c.0, code: w.kind }),
         }
     }
 

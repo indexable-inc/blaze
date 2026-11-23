@@ -89,12 +89,33 @@ impl Tree for PackView<'_> {
     }
 }
 
+/// Whether a checkout path package is a workspace member or an external path package (from
+/// `[patch.*]` or a path dependency outside `workspace.members`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PathKind {
+    Member,
+    External,
+}
+
+/// One path package in the checkout (tree 0): its lock entry, directory (relative to the
+/// checkout root), and whether it is a workspace member or an external path dependency.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CheckoutPath<'w> {
+    pub id: LockId,
+    pub dir: &'w str,
+    pub kind: PathKind,
+}
+
 /// Where a package's files are.
 #[derive(Clone, Copy)]
 pub enum Place<'w> {
-    /// In the checkout (tree 0), under this directory (relative to the checkout's root, no
-    /// trailing `/`; `""` for the root).
+    /// A workspace member in the checkout (tree 0), under this directory (relative to the
+    /// checkout's root, no trailing `/`; `""` for the root).
     Checkout { dir: &'w str },
+    /// A non-member path package in the checkout (tree 0), e.g. from `[patch.*]` or a path
+    /// dependency outside `workspace.members`: files are read from tree 0 under `dir`, and it
+    /// is treated as a dependency rather than a workspace member.
+    Path { dir: &'w str },
     /// In a record of the fetch store, under this directory of it (`""` for a crate; a git
     /// package's directory in its commit).
     Pack { view: PackView<'w>, dir: &'w str },
@@ -109,8 +130,8 @@ pub trait Packages<'w> {
 /// (`StoreSources::files`), a path package from the directory the caller's layout found it in.
 pub struct Fetched<'s, 'l, 'w, R: Records<'w>> {
     pub store: &'s mut StoreSources<'l, 'w, 'w, R>,
-    /// Each path package's directory in the checkout, by lock id.
-    pub paths: &'s [(LockId, &'w str)],
+    /// Each path package in the checkout, by lock id.
+    pub paths: &'s [CheckoutPath<'w>],
     pub lock: &'l Lock<'w>,
     pub alloc: Bump<'w>,
 }
@@ -119,8 +140,9 @@ impl<'w, R: Records<'w>> Packages<'w> for Fetched<'_, '_, 'w, R> {
     fn place(&mut self, package: LockId) -> Result<Place<'w>, WorldError<'w>> {
         let p = self.lock.package(package);
         if matches!(p.source, blaze_manifest::lock::LockSource::Path) {
-            return match self.paths.iter().find(|(id, _)| *id == package) {
-                Some((_, dir)) => Ok(Place::Checkout { dir }),
+            return match self.paths.iter().find(|entry| entry.id == package) {
+                Some(CheckoutPath { dir, kind: PathKind::Member, .. }) => Ok(Place::Checkout { dir }),
+                Some(CheckoutPath { dir, kind: PathKind::External, .. }) => Ok(Place::Path { dir }),
                 None => Err(WorldError::PathNotPlaced { package: self.alloc.alloc_str(&p.name) }),
             };
         }
@@ -159,6 +181,9 @@ pub struct Crate<'w> {
     pub units: u32,
     pub script: Script,
     pub proc_macro: bool,
+    /// Whether this crate belongs to a workspace member (`Place::Checkout`), as opposed to an
+    /// external path package (`Place::Path`), fetched package, or toolchain crate.
+    pub member: bool,
     /// The package's name and version, as the lock writes them (the toolchain's crate's for its).
     pub package: &'w str,
     pub version: &'w str,

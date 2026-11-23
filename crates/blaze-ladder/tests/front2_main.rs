@@ -627,7 +627,8 @@ fn report(mut out: String, start: Instant) {
 #[test]
 fn the_entry_programs_as_far_as_each_gets() {
     use blaze_ladder::run::{NewFront, build_new};
-    let home = std::env::var("HOME").expect("HOME is set");
+    use std::{env, fs, thread};
+    let home = env::var("HOME").expect("HOME is set");
     let shelf = format!("{home}/.blaze/v2/toolchain");
     // `Io` is in no prelude (D104): the old shape names it by path, so the refusal is `Grant`'s,
     // not an unresolved name.
@@ -640,34 +641,56 @@ fn the_entry_programs_as_far_as_each_gets() {
     ];
     let mut out = String::from("ENTRY PROGRAMS (D104, edition blaze-2026.11):\n");
     // Every row runs and is printed; what each missed is said at the end, all together.
+    let alloc = blaze_own::testing::heap().alloc();
+    let rows = thread::scope(|s| {
+        let mut handles = blaze_own::Vec::with_capacity_in(programs.len(), alloc);
+        for (shape, text) in programs {
+            let shelf = shelf.as_str();
+            handles.push(s.spawn(move || {
+                let files = [SourceFile { path: "src/main.rs", text }];
+                let got = build_new(&files, "src/main.rs", NewFront { package: "entry", edition: EDITION, shelf: Some(shelf), overflow: blaze_build::OverflowChecks::On }, blaze_own::Alloc::global());
+                let line = match &got {
+                    Ok(_) => "BUILT (front, checker and builder: no refusal)".to_string(),
+                    Err(e) => format!("REFUSED: {e}"),
+                };
+                let cut = line.floor_char_boundary(600.min(line.len()));
+                let out_line = format!("{shape}: {}\n", &line[..cut]);
+                let miss = match shape {
+                    "main(cx: &Cx, out: Out)" if got.is_err() => Some(format!("the owner's hello builds: {line}")),
+                    "main(cx: &Cx, io: Io)" => match got {
+                        Ok(_) => Some("a `main` taking a whole `Io` is refused, not built".into()),
+                        Err(refused) => {
+                            let shown = format!("{refused}");
+                            // Without d104-A-6 the words are the bare goal `Io: Grant`; with `impl Grant
+                            // for Io` left in bstd it builds.
+                            if !shown.contains("`main` cannot take a `Io`") || !shown.contains("cannot be asked for") {
+                                Some(format!("the `Io` row is refused in `Grant`'s words, naming what to write: {shown}"))
+                            } else {
+                                None
+                            }
+                        }
+                    },
+                    _ => None,
+                };
+                (out_line, miss)
+            }));
+        }
+        let mut collected = blaze_own::Vec::with_capacity_in(handles.len(), alloc);
+        for h in handles {
+            collected.push(h.join().unwrap());
+        }
+        collected
+    });
     let mut missed: Vec<String> = Vec::new();
-    for (shape, text) in programs {
-        let files = [SourceFile { path: "src/main.rs", text }];
-        let got = build_new(&files, "src/main.rs", NewFront { package: "entry", edition: EDITION, shelf: Some(&shelf), overflow: blaze_build::OverflowChecks::On }, blaze_own::Alloc::global());
-        let line = match &got {
-            Ok(_) => "BUILT (front, checker and builder: no refusal)".to_string(),
-            Err(e) => format!("REFUSED: {e}"),
-        };
-        out.push_str(&format!("{shape}: {}\n", line.chars().take(600).collect::<String>()));
-        match shape {
-            "main(cx: &Cx, out: Out)" if got.is_err() => missed.push(format!("the owner's hello builds: {line}")),
-            "main(cx: &Cx, io: Io)" => match got {
-                Ok(_) => missed.push(String::from("a `main` taking a whole `Io` is refused, not built")),
-                Err(refused) => {
-                    let shown = format!("{refused}");
-                    // Without d104-A-6 the words are the bare goal `Io: Grant`; with `impl Grant
-                    // for Io` left in bstd it builds.
-                    if !shown.contains("`main` cannot take a `Io`") || !shown.contains("cannot be asked for") {
-                        missed.push(format!("the `Io` row is refused in `Grant`'s words, naming what to write: {shown}"));
-                    }
-                }
-            },
-            _ => {}
+    for (out_line, miss) in rows {
+        out.push_str(&out_line);
+        if let Some(m) = miss {
+            missed.push(m);
         }
     }
     print!("{out}");
-    if let Ok(path) = std::env::var("FRONT2_ENTRY_LIST") {
-        std::fs::write(&path, &out).unwrap_or_else(|e| panic!("writing the entry list to {path}: {e}"));
+    if let Ok(path) = env::var("FRONT2_ENTRY_LIST") {
+        fs::write(&path, &out).unwrap_or_else(|e| panic!("writing the entry list to {path}: {e}"));
     }
     assert!(missed.is_empty(), "{} of the entry programs missed:\n{}", missed.len(), missed.join("\n"));
 }

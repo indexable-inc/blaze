@@ -20,20 +20,37 @@ use blaze_ids::Hasher;
 use blaze_own::{AVec, Alloc, Vec};
 
 use crate::error::ExportError;
-use crate::input::{Entry, Platform};
+use crate::input::{Entry, Platform, TlsRuntime};
 
 const START_DOMAIN: &str = "blaze-export start 1";
 
 const STP_FP_LR: u32 = 0xA9BF_7BFD; // stp x29, x30, [sp, #-16]!
+const STP_FP_LR_32: u32 = 0xA9BE_7BFD; // stp x29, x30, [sp, #-32]!
+const STP_FP_LR_48: u32 = 0xA9BD_7BFD; // stp x29, x30, [sp, #-48]!
 const MOV_FP_SP: u32 = 0x9100_03FD; // mov x29, sp
 const LDP_FP_LR: u32 = 0xA8C1_7BFD; // ldp x29, x30, [sp], #16
+const LDP_FP_LR_32: u32 = 0xA8C2_7BFD; // ldp x29, x30, [sp], #32
+const LDP_FP_LR_48: u32 = 0xA8C3_7BFD; // ldp x29, x30, [sp], #48
+const STP_X0_X1_SP_16: u32 = 0xA901_07E0; // stp x0, x1, [sp, #16]
+const STP_X2_X3_SP_32: u32 = 0xA902_0FE2; // stp x2, x3, [sp, #32]
+const LDP_X0_X1_SP_16: u32 = 0xA941_07E0; // ldp x0, x1, [sp, #16]
+const LDP_X1_X2_SP_16: u32 = 0xA941_0BE1; // ldp x1, x2, [sp, #16]
+const LDP_X2_X3_SP_32: u32 = 0xA942_0FE2; // ldp x2, x3, [sp, #32]
 const RET: u32 = 0xD65F_03C0;
 const MOV_W0_0: u32 = 0x5280_0000; // mov w0, #0
 const MOV_W3_0: u32 = 0x5280_0003; // mov w3, #0
 const MOV_X2_X1: u32 = 0xAA01_03E2; // mov x2, x1
-const MOV_X1_X0: u32 = 0xAA00_03E1; // mov x1, x0
+const SXTW_X1_W0: u32 = 0x9340_7C01; // sxtw x1, w0 (sign-extend C `int argc` to `isize`)
+const SXTW_X1_W1: u32 = 0x9340_7C21; // sxtw x1, w1 (sign-extend C `int argc` to `isize`)
 const ADRP_X0: u32 = 0x9000_0000; // adrp x0, _
 const LDR_X0: u32 = 0xF940_0000; // ldr x0, [x0, _]
+const ADRP_X1: u32 = 0x9000_0001; // adrp x1, _
+const LDR_X1: u32 = 0xF940_0021; // ldr x1, [x1, _]
+const LDR_X1_X0: u32 = 0xF940_0001; // ldr x1, [x0]
+const LSL_X1_3: u32 = 0xD37D_F021; // lsl x1, x1, #3 (ubfm x1, x1, #61, #60)
+const STR_X1_X0_8: u32 = 0xF900_0401; // str x1, [x0, #8]
+const CBZ_W0_8: u32 = 0x3400_0040; // cbz w0, +8
+const BRK_KEY_CREATE_FAILED: u32 = 0xD420_0000 | (blaze_code::trap::KEY_CREATE_FAILED << 5);
 const ADRP_X16: u32 = 0x9000_0010; // adrp x16, _
 const LDR_X16: u32 = 0xF940_0210; // ldr x16, [x16, _]
 const BLR_X16: u32 = 0xD63F_0200; // blr x16
@@ -53,6 +70,11 @@ pub struct Start<'a> {
     pub records: AVec<'a, (Symbol, AVec<'a, u8>)>,
     /// What the file's entry is: a made record's symbol, or the program's `main` itself.
     pub entry: Symbol,
+    /// On macOS, when the program uses Rust thread-locals, the `__mod_init_func` initializer
+    /// symbol (`tls_init`) that creates the pthread key and writes `DESC.root` before `main` and
+    /// before any native static constructors. `None` when there is no TLS or on Linux (where the
+    /// start wrapper calls `tls_init` directly).
+    pub tls_init: Option<Symbol>,
 }
 
 impl<'a> Start<'a> {
@@ -94,21 +116,138 @@ fn made<'a>(insts: &[u32], sites: &[(u32, SiteKind, Target)], outside: Option<(u
     Ok(out)
 }
 
+fn static_target(symbol: Symbol) -> Target {
+    Target { space: Space::Static, symbol }
+}
+
+/// The thread-local startup initializer: calls `pthread_key_create(&DESC.key, ender)`, traps on
+/// failure (`KEY_CREATE_FAILED`), and on macOS writes `DESC.root = DESC.key * 8` (on Linux,
+/// `DESC.root` is statically initialized to the `PT_TLS` root offset with `ROOT_OWN` set).
+fn tls_init_record<'a>(tls: TlsRuntime, platform: Platform, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, ExportError> {
+    let desc = static_target(tls.descriptor);
+    let ender = func(tls.ender);
+    match platform {
+        Platform::MacosArm64 => {
+            let code = [
+                STP_FP_LR,             // 0
+                MOV_FP_SP,             // 4
+                ADRP_X0,               // 8: &DESC
+                LDR_X0,                // 12
+                ADRP_X1,               // 16: &ender
+                LDR_X1,                // 20
+                ADRP_X16,              // 24: pthread_key_create
+                LDR_X16,               // 28
+                BLR_X16,               // 32
+                CBZ_W0_8,              // 36
+                BRK_KEY_CREATE_FAILED, // 40
+                ADRP_X0,               // 44: &DESC
+                LDR_X0,                // 48
+                LDR_X1_X0,             // 52: x1 = DESC.key
+                LSL_X1_3,              // 56: x1 = key * 8
+                STR_X1_X0_8,           // 60: DESC.root = key * 8
+                LDP_FP_LR,             // 64
+                RET,                   // 68
+            ];
+            let sites = [(8, SiteKind::Load, desc), (16, SiteKind::Load, ender), (44, SiteKind::Load, desc)];
+            made(&code, &sites, Some((24, "pthread_key_create")), alloc)
+        }
+        Platform::LinuxArm64 => {
+            let code = [
+                STP_FP_LR,             // 0
+                MOV_FP_SP,             // 4
+                ADRP_X0,               // 8: &DESC
+                LDR_X0,                // 12
+                ADRP_X1,               // 16: &ender
+                LDR_X1,                // 20
+                ADRP_X16,              // 24: pthread_key_create
+                LDR_X16,               // 28
+                BLR_X16,               // 32
+                CBZ_W0_8,              // 36
+                BRK_KEY_CREATE_FAILED, // 40
+                LDP_FP_LR,             // 44
+                RET,                   // 48
+            ];
+            let sites = [(8, SiteKind::Load, desc), (16, SiteKind::Load, ender)];
+            made(&code, &sites, Some((24, "pthread_key_create")), alloc)
+        }
+        Platform::Wasm64 => Err(ExportError::Wasm64RequiresWasmProgram),
+    }
+}
+
 /// The wrapper with dyld's (and `__libc_start_main`'s) C main signature, for the forms that need
-/// one; `None` for `CMain`, whose `main` is that already.
-fn wrapper<'a>(entry: Entry, alloc: Alloc<'a>) -> Result<Option<AVec<'a, u8>>, ExportError> {
-    match entry {
-        Entry::CMain { .. } => Ok(None),
-        Entry::Hosted { start } => Err(ExportError::Hosted { start }),
-        Entry::RustMain { main } => {
+/// one; `None` for `CMain` with no `init` call, whose `main` is that already.
+fn wrapper<'a>(entry: Entry, init: Option<Symbol>, alloc: Alloc<'a>) -> Result<Option<AVec<'a, u8>>, ExportError> {
+    match (entry, init) {
+        (Entry::CMain { .. }, None) => Ok(None),
+        (Entry::CMain { main }, Some(init)) => {
+            let code = [
+                STP_FP_LR_48,    // 0
+                MOV_FP_SP,       // 4
+                STP_X0_X1_SP_16, // 8
+                STP_X2_X3_SP_32, // 12
+                ADRP_X16,        // 16: init
+                LDR_X16,         // 20
+                BLR_X16,         // 24
+                LDP_X0_X1_SP_16, // 28
+                LDP_X2_X3_SP_32, // 32
+                ADRP_X16,        // 36: main
+                LDR_X16,         // 40
+                BLR_X16,         // 44
+                LDP_FP_LR_48,    // 48
+                RET,             // 52
+            ];
+            let sites = [(16, SiteKind::Call, func(init)), (36, SiteKind::Call, func(main))];
+            made(&code, &sites, None, alloc).map(Some)
+        }
+        (Entry::Hosted { start }, _) => Err(ExportError::Hosted { start }),
+        (Entry::RustMain { main }, None) => {
             let code = [STP_FP_LR, MOV_FP_SP, ADRP_X16, LDR_X16, BLR_X16, MOV_W0_0, LDP_FP_LR, RET];
             made(&code, &[(8, SiteKind::Call, func(main))], None, alloc).map(Some)
         }
-        Entry::LangStart { lang_start, main } => {
+        (Entry::RustMain { main }, Some(init)) => {
             let code = [
-                STP_FP_LR, MOV_FP_SP, MOV_X2_X1, MOV_X1_X0, ADRP_X0, LDR_X0, MOV_W3_0, ADRP_X16, LDR_X16, BLR_X16, LDP_FP_LR, RET,
+                STP_FP_LR, // 0
+                MOV_FP_SP, // 4
+                ADRP_X16,  // 8: init
+                LDR_X16,   // 12
+                BLR_X16,   // 16
+                ADRP_X16,  // 20: main
+                LDR_X16,   // 24
+                BLR_X16,   // 28
+                MOV_W0_0,  // 32
+                LDP_FP_LR, // 36
+                RET,       // 40
+            ];
+            let sites = [(8, SiteKind::Call, func(init)), (20, SiteKind::Call, func(main))];
+            made(&code, &sites, None, alloc).map(Some)
+        }
+        (Entry::LangStart { lang_start, main }, None) => {
+            let code = [
+                STP_FP_LR, MOV_FP_SP, MOV_X2_X1, SXTW_X1_W0, ADRP_X0, LDR_X0, MOV_W3_0, ADRP_X16, LDR_X16, BLR_X16, LDP_FP_LR, RET,
             ];
             let sites = [(16, SiteKind::Load, func(main)), (28, SiteKind::Call, func(lang_start))];
+            made(&code, &sites, None, alloc).map(Some)
+        }
+        (Entry::LangStart { lang_start, main }, Some(init)) => {
+            let code = [
+                STP_FP_LR_32,    // 0
+                MOV_FP_SP,       // 4
+                STP_X0_X1_SP_16, // 8
+                ADRP_X16,        // 12: init
+                LDR_X16,         // 16
+                BLR_X16,         // 20
+                LDP_X1_X2_SP_16, // 24: x1 = argc (w1 valid), x2 = argv
+                SXTW_X1_W1,      // 28: sign-extend C `int argc` to `isize`
+                ADRP_X0,         // 32: main
+                LDR_X0,          // 36
+                MOV_W3_0,        // 40: sigpipe = 0
+                ADRP_X16,        // 44: lang_start
+                LDR_X16,         // 48
+                BLR_X16,         // 52
+                LDP_FP_LR_32,    // 56
+                RET,             // 60
+            ];
+            let sites = [(12, SiteKind::Call, func(init)), (32, SiteKind::Load, func(main)), (44, SiteKind::Call, func(lang_start))];
             made(&code, &sites, None, alloc).map(Some)
         }
     }
@@ -123,10 +262,21 @@ pub fn main_of(entry: Entry) -> Symbol {
 }
 
 /// The start records `entry` needs on `platform`.
-pub fn start<'a>(entry: Entry, platform: Platform, alloc: Alloc<'a>) -> Result<Start<'a>, ExportError> {
+pub fn start<'a>(entry: Entry, tls: Option<TlsRuntime>, platform: Platform, alloc: Alloc<'a>) -> Result<Start<'a>, ExportError> {
     let mut records: AVec<'a, (Symbol, AVec<'a, u8>)> = Vec::new_in(alloc);
+    let mut tls_init_mod = None;
+    let mut wrapper_init = None;
+    if let Some(tls) = tls {
+        let init_sym = start_symbol("tls_init");
+        records.push((init_sym, tls_init_record(tls, platform, alloc)?));
+        match platform {
+            Platform::MacosArm64 => tls_init_mod = Some(init_sym),
+            Platform::LinuxArm64 => wrapper_init = Some(init_sym),
+            Platform::Wasm64 => return Err(ExportError::Wasm64RequiresWasmProgram),
+        }
+    }
     let wrapper_symbol = start_symbol("wrapper");
-    let c_main = match wrapper(entry, alloc)? {
+    let c_main = match wrapper(entry, wrapper_init, alloc)? {
         Some(bytes) => {
             records.push((wrapper_symbol, bytes));
             wrapper_symbol
@@ -147,5 +297,5 @@ pub fn start<'a>(entry: Entry, platform: Platform, alloc: Alloc<'a>) -> Result<S
         }
         Platform::Wasm64 => return Err(ExportError::Wasm64RequiresWasmProgram),
     };
-    Ok(Start { records, entry })
+    Ok(Start { records, entry, tls_init: tls_init_mod })
 }

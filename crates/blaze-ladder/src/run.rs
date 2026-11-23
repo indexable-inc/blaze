@@ -12,7 +12,7 @@ use std::alloc::Global;
 use blaze_build::data::{DataAlloc, DataError, DataRecord, DataTarget, ImageTarget, StaticImage};
 use blaze_build::tls::{self, TlsError};
 use blaze_build::layout::{LayoutCx, LayoutFacts, Layouts, Missing, ReprAttrs, ValidRange};
-use blaze_build::vtable::{Shape, Vtable, VtableRef, VtableTarget, Word};
+use blaze_build::vtable::{Shape, Vtable, VtableRef, VtableTarget};
 use blaze_consteval::{
     Answer, Codes, ConstError, ConstRecord, ConstWorld, FnKind as ConstFnKind, Limits, Lits, Need, NeedKind, RecordKey, Settle,
     Typed, value_of,
@@ -566,6 +566,7 @@ fn language_owner<P: FrontEnd>(program: &P, adts: &dyn Adts, called: Instance, g
     crate::front2::coroutines::owner_of(program, adts, called, ground)
         .or_else(|| closure_owner(program, adts, called, ground))
         .or_else(|| crate::fn_shim::fn_shim_owner(program, adts, called, ground, caller))
+        .or_else(|| crate::clone_shim::language_from(program, called, ground).and_then(|f| program.fn_index(f.from)))
 }
 
 /// The refusal of `function`'s call of trait fn `called` when impl selection refused it: a
@@ -1033,6 +1034,10 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
 
     fn lang_fn(&self, name: &str) -> Option<ItemKey> {
         self.0.fn_lang(FnLang::named(name)?)
+    }
+
+    fn type_names(&self) -> Option<&dyn blaze_build::type_name::TypeNames> {
+        self.0.type_names()
     }
 
     fn future_poll(&self) -> Option<ItemKey> {
@@ -2314,7 +2319,16 @@ fn build_from<P: FrontEnd>(
             }
         }
         // Each instance is pushed with its fn's index (`tabled`), so none is looked up again.
-        let i = reached.tabled[at - 1];
+        // If this is a generic `inline for` fn instantiated at concrete args, switch to its
+        // monomorphized unrolled specialization row (with 0 generic args of its own).
+        let orig_i = reached.tabled[at - 1];
+        let spec_i = if instance.args.len > 0 && instance.item == program.function(orig_i).key {
+            ground.view().list(instance.args).ok().and_then(|a| program.specialized_row(orig_i, a, ground.view()))
+        } else {
+            None
+        };
+        let i = spec_i.unwrap_or(orig_i);
+        let is_own_instance = spec_i.is_some() || instance.item == program.function(i).key;
         // This step's refusal `e`, filed, and the loop goes on; but an instance question's
         // `Missing` (an answer no check made: a bucket at a shape only this instance's
         // arguments hold) has the front end make what its worlds asked
@@ -2355,9 +2369,14 @@ fn build_from<P: FrontEnd>(
             None => clones.shim_of(instance, &ground).map(|s| (s, clones.copy_of(s))),
             Some(_) => None,
         };
+        // Builtin `From::from` for structural error unions (clone_shim.rs `language_from`).
+        let from_row = match function.body {
+            None if clone_row.is_none() => crate::clone_shim::language_from(&*program, instance, &ground),
+            _ => None,
+        };
         let (body, done) = match (function.body, checked[i].as_ref()) {
             (Some((body, _)), Some(done)) => (Some(body), Some(done)),
-            _ if ctor_row.is_some() || clone_row.is_some() => (None, None),
+            _ if ctor_row.is_some() || clone_row.is_some() || from_row.is_some() => (None, None),
             _ => {
             let refusal = callee_refusal(&*program, name(), instance.args, instance, crate::callee_shown::CalleeGap::NoBody, ground.view());
             // A survey files it (by the fn and the callee) and goes on, as its doc promises; a
@@ -2396,12 +2415,14 @@ fn build_from<P: FrontEnd>(
         // built at its owner's arguments, and the owner's instance, built first (it is what
         // reaches them), pulled them. A need the evaluator refuses is this instance's refusal.
         const_needs.clear();
-        if instance.item == function.key
+        if is_own_instance
             && program.evaluates_at_args()
             && let (Some(body), Some(done)) = (body, done)
         {
             args.clear();
-            args.extend_from_slice(ground.view().list(instance.args).map_err(|_| RunError::Build { function: name(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None })?);
+            if spec_i.is_none() {
+                args.extend_from_slice(ground.view().list(instance.args).map_err(|_| RunError::Build { function: name(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None })?);
+            }
             let view = body.view(program.body_types(i));
             let facts = FrontAdts(program, i, &consts, &langs, &checked_bodies);
             if let Err(error) = crate::front2::const_at::needs_of(&view, done, &args, &mut ground, &facts, alloc, &mut const_needs) {
@@ -2423,7 +2444,7 @@ fn build_from<P: FrontEnd>(
         let function = program.function(i);
         let name = || function.named();
         let body = function.body.map(|(body, _)| body);
-        if body.is_none() && ctor_row.is_none() && clone_row.is_none() {
+        if body.is_none() && ctor_row.is_none() && clone_row.is_none() && from_row.is_none() {
             return Err(callee_refusal(&*program, named, instance.args, instance, crate::callee_shown::CalleeGap::NoBody, ground.view()));
         }
         // The record walk: the entry its key's pointer names is used only when every row of its
@@ -2484,17 +2505,17 @@ fn build_from<P: FrontEnd>(
         // One of a coroutine's three functions (`Future::poll`, the resume fn, `drop_in_place`,
         // each at `[coroutine]`; tabled as the block's owner): taken from the one build of that
         // coroutine instance (front2/coroutines.rs, `build_coroutines`).
-        let coroutine = if instance.item == function.key {
+        let coroutine = if is_own_instance {
             None
         } else {
             crate::front2::coroutines::part_of(&FrontAdts(program, i, &consts, &langs, &checked_bodies), instance, &ground)
         };
-        let shim = if instance.item == function.key || coroutine.is_some() {
+        let shim = if is_own_instance || coroutine.is_some() {
             None
         } else {
             crate::fn_shim::fn_shim_of(&FrontAdts(program, i, &consts, &langs, &checked_bodies), instance, &ground)
         };
-        let closure = if instance.item == function.key || shim.is_some() || coroutine.is_some() {
+        let closure = if is_own_instance || shim.is_some() || coroutine.is_some() {
             None
         } else {
             let first = ground.view().list(instance.args).map_err(malformed)?.first().copied();
@@ -2507,12 +2528,16 @@ fn build_from<P: FrontEnd>(
                 _ => return Err(callee_refusal(&*program, name(), instance.args, instance, crate::callee_shown::CalleeGap::NotOwnInstance, ground.view())),
             }
         };
-        let owner_args = match shim {
-            Some(s) => s.item.map_or(List::EMPTY, |(_, fn_args)| fn_args),
-            None => match coroutine {
-                Some((of, _)) => of.owner_args,
-                None => closure.map_or(instance.args, |(of, _)| of.owner_args),
-            },
+        let owner_args = if spec_i.is_some() {
+            List::EMPTY
+        } else {
+            match shim {
+                Some(s) => s.item.map_or(List::EMPTY, |(_, fn_args)| fn_args),
+                None => match coroutine {
+                    Some((of, _)) => of.owner_args,
+                    None => closure.map_or(instance.args, |(of, _)| of.owner_args),
+                },
+            }
         };
         args.extend_from_slice(ground.view().list(owner_args).map_err(malformed)?);
         // A coroutine's function: its instance is built once for all three (here, when no
@@ -2550,7 +2575,7 @@ fn build_from<P: FrontEnd>(
         // built into its state BEFORE this build (run/lay_states.rs): the build never meets a
         // state not laid. A coroutine's own function was built with its coroutine; a shim has
         // no body of its own.
-        if from_coroutine.is_none() && shim.is_none() && clone_row.is_none() {
+        if from_coroutine.is_none() && shim.is_none() && clone_row.is_none() && from_row.is_none() {
             let adts = FrontAdts(&*program, i, &consts, &langs, &checked_bodies);
             let laid = match lay_states::roots_of_instance(&*program, &checked_bodies, &adts, i, &args, &mut ground, alloc) {
                 Ok(roots) if roots.is_empty() => Ok(lay_states::Lay::Done),
@@ -2587,11 +2612,18 @@ fn build_from<P: FrontEnd>(
                 Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, world, Global),
                 None => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, None, &mut subst, world, Global),
             }
-        } else if let Some((s, copy)) = clone_row {
-            // A builtin clone: its bytes when `Self: Copy`, else each field's own `clone`.
-            match copy {
-                Some(copy) => blaze_build::build_builtin_clone(s.clone, copy, &mut subst, world, Global),
-                None => Err(BuildError::Malformed { what: "a builtin `clone` built before its `Self: Copy` was asked" }),
+        } else if clone_row.is_some() || from_row.is_some() {
+            let g = Global;
+            if let Some((s, copy)) = clone_row {
+                // A builtin clone: its bytes when `Self: Copy`, else each field's own `clone`.
+                match copy {
+                    Some(copy) => blaze_build::build_builtin_clone(s.clone, copy, &mut subst, world, g),
+                    None => Err(BuildError::Malformed { what: "a builtin `clone` built before its `Self: Copy` was asked" }),
+                }
+            } else if let Some(f) = from_row {
+                blaze_build::build_builtin_from(f.from, &mut subst, world, g)
+            } else {
+                Err(BuildError::Malformed { what: "unreachable builtin row" })
             }
         } else if let Some(variant) = ctor_row {
             // The ctor's own instance (a shim of it was taken above): its fields in, its value out.
@@ -2666,6 +2698,10 @@ fn build_from<P: FrontEnd>(
                 Err(error) => {
                     let at = crate::callee_shown::self_shown(program, ground.view(), called.args);
                     let refusal = RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), at, error };
+                    if may_ask && asks_again(&refusal) {
+                        ask_again = true;
+                        break;
+                    }
                     match unresolved(&mut survey, &mut reached, called, i, refusal)? {
                         Some(slot) => {
                             via.push(Via::Slot);
@@ -2683,7 +2719,7 @@ fn build_from<P: FrontEnd>(
             // to select; tabled as the block's owner (front2/coroutines.rs).
             // A builtin `Clone::clone` (a tuple's, a closure's, a fn item's or pointer's): built,
             // tabled at the trait's `clone` row, its `Self: Copy` asked here (clone_shim.rs).
-            let tabled_as = match clones.owner(program, &adts, world_of, called, &mut ground, alloc) {
+            let tabled_as = match clones.owner_non_adt(program, &adts, world_of, called, &mut ground, alloc) {
                 Some(Ok(c)) => Some(c),
                 Some(Err(e)) => {
                     let refusal = match e {
@@ -2693,6 +2729,10 @@ fn build_from<P: FrontEnd>(
                         }
                         crate::clone_shim::NoteError::Build(error) => RunError::Build { function: name(), error, range: None },
                     };
+                    if may_ask && asks_again(&refusal) {
+                        ask_again = true;
+                        break;
+                    }
                     match unresolved(&mut survey, &mut reached, called, i, refusal)? {
                         Some(slot) => {
                             via.push(Via::Slot);
@@ -2737,6 +2777,62 @@ fn build_from<P: FrontEnd>(
                 Err(blaze_typeck::ResolveError::Missing(_)) if may_ask => {
                     ask_again = true;
                     break;
+                }
+                Err(blaze_typeck::ResolveError::NoImpl { trait_, item: err_item }) => {
+                    match clones.owner_adt(program, &adts, world_of, called, trait_, &mut ground, alloc) {
+                        Some(Ok(c)) => {
+                            match key_of(program, c, called, &mut ground, &adts) {
+                                Ok(key) => {
+                                    via.push(Via::Slot);
+                                    targets.push(Target::Slot(reached.slot(called, c, key)?));
+                                }
+                                Err(e) if may_ask && asks_again(&e) => {
+                                    ask_again = true;
+                                    break;
+                                }
+                                Err(e) => match unresolved(&mut survey, &mut reached, called, i, e)? {
+                                    Some(slot) => {
+                                        via.push(Via::Slot);
+                                        targets.push(Target::Slot(slot));
+                                    }
+                                    None => broken = true,
+                                },
+                            }
+                            continue;
+                        }
+                        Some(Err(crate::clone_shim::NoteError::Resolve(blaze_typeck::ResolveError::Missing(_)))) if may_ask => {
+                            ask_again = true;
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            let refusal = match e {
+                                crate::clone_shim::NoteError::Resolve(error) => {
+                                    let at = crate::callee_shown::self_shown(program, ground.view(), called.args);
+                                    RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), at, error }
+                                }
+                                crate::clone_shim::NoteError::Build(error) => RunError::Build { function: name(), error, range: None },
+                            };
+                            match unresolved(&mut survey, &mut reached, called, i, refusal)? {
+                                Some(slot) => {
+                                    via.push(Via::Slot);
+                                    targets.push(Target::Slot(slot));
+                                }
+                                None => broken = true,
+                            }
+                            continue;
+                        }
+                        None => {
+                            let refusal = resolve_refusal(program, &adts, &ground, name(), called, blaze_typeck::ResolveError::NoImpl { trait_, item: err_item });
+                            match unresolved(&mut survey, &mut reached, called, i, refusal)? {
+                                Some(slot) => {
+                                    via.push(Via::Slot);
+                                    targets.push(Target::Slot(slot));
+                                }
+                                None => broken = true,
+                            }
+                            continue;
+                        }
+                    }
                 }
                 Err(error) => {
                     let refusal = resolve_refusal(program, &adts, &ground, name(), called, error);
@@ -2826,16 +2922,7 @@ fn build_from<P: FrontEnd>(
                         stack.pop();
                         continue;
                     }
-                    let shape = Shape::of(t.principal, |k| program.object_trait(k), Global).map_err(|e| fail(VtableFail::Shape(e)))?;
-                    let above = |s: ItemKey| VtableRef { concrete: t.concrete, principal: s, args: List::EMPTY };
-                    let missing = shape.words.iter().find_map(|w| match *w {
-                        Word::Super(s) => (!tables.refs.contains(&above(s))).then(|| above(s)),
-                        Word::Method { .. } => None,
-                    });
-                    if let Some(r) = missing {
-                        stack.push(r);
-                        continue;
-                    }
+                    let shape = Shape::of(t.principal, |k| program.object_trait(k), alloc).map_err(|e| fail(VtableFail::Shape(e)))?;
                     let mut cx = LayoutCx { ground: &mut ground, facts: &adts, scratch: alloc };
                     let id = layouts.of(t.concrete, &mut cx).map_err(|e| fail(VtableFail::Layout(e)))?;
                     let (size, align) = (layouts.get(id).size, layouts.get(id).align_bytes());
@@ -2852,8 +2939,21 @@ fn build_from<P: FrontEnd>(
                     let glue_item = glue.map(|g| g.item);
                     let mut targs = Vec::new_in(Global);
                     targs.extend_from_slice(ground.view().list(t.args).map_err(|_| full())?);
-                    let table = Vtable::build(&shape, t.concrete, &targs, size, align, glue, &mut ground, Global)
+                    let table = Vtable::build(&shape, t.concrete, &targs, size, align, glue, &mut ground, &adts, alloc, Global)
                         .map_err(|e| fail(VtableFail::Build(e)))?;
+                    let mut pushed_super = false;
+                    for &(_, to) in table.relocs.iter() {
+                        if let VtableTarget::Super(sup) = to
+                            && !tables.refs.contains(&sup)
+                            && !stack.contains(&sup)
+                        {
+                            stack.push(sup);
+                            pushed_super = true;
+                        }
+                    }
+                    if pushed_super {
+                        continue;
+                    }
                     let mut words = Vec::with_capacity_in(table.relocs.len(), Global);
                     for &(offset, to) in table.relocs.iter() {
                         // A fn item of a trait's method as the word's self: the body that runs,
@@ -2888,9 +2988,9 @@ fn build_from<P: FrontEnd>(
                                 let key = key_of(program, c, Instance { item, args }, &mut ground, &adts)?;
                                 VtableWord::Slot(reached.slot(Instance { item, args }, c, key)?)
                             }
-                            VtableTarget::Super(s) => match tables.refs.iter().position(|r| *r == above(s)) {
+                            VtableTarget::Super(sup) => match tables.refs.iter().position(|r| *r == sup) {
                                 Some(n) => VtableWord::Table(u32::try_from(n).map_err(|_| RunError::TooManyInstances)?),
-                                None => return Err(fail(VtableFail::Shape(blaze_build::vtable::VtableError::NoTrait(s)))),
+                                None => return Err(fail(VtableFail::Shape(blaze_build::vtable::VtableError::NoTrait(sup.principal)))),
                             },
                         };
                         words.push((offset, word));

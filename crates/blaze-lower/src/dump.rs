@@ -470,6 +470,9 @@ fn expr(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, e: ExprId) -> fmt::
         Expr::OffsetOf { ty, fields } => node(p, work, "offset-of", &[W::Ty(ty), W::Names(fields)]),
         Expr::Underscore => p.atom("_"),
         Expr::Await(e) => node(p, work, "await", &[W::Expr(e)]),
+        Expr::InlineFor { pat, iter, body } => {
+            node(p, work, "inline-for", &[W::Pat(pat), W::Expr(iter), W::Expr(body)])
+        }
     }
 }
 
@@ -604,7 +607,6 @@ fn ty(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, t: TypeId) -> fmt::Re
         TypeRef::Pat { base, pat: TyPat::Of(pat) } => node(p, work, "pattern_type", &[W::Ty(base), W::Pat(pat)]),
         TypeRef::Record(fields) => node(p, work, "record_type", &[W::Rows(fields)]),
         TypeRef::Union(members) => node(p, work, "union_type", &[W::Types(members)]),
-        TypeRef::Fallible { ok, err } => node(p, work, "fallible_type", &[W::Ty(ok), W::Ty(err)]),
         TypeRef::Error => p.atom("(error)"),
     }
 }

@@ -1259,3 +1259,294 @@ fn structural_records_literal_field_update_and_destructure() {
     assert!(checked.same_result(&decoded));
     assert_eq!(decoded.types.view().record_names(schema), Some(&sorted_names[..]));
 }
+
+#[test]
+fn union_match_exhaustiveness_and_redundant_arms() {
+    use crate::body::{Arm, IntSuffix, Lit};
+    use crate::diag::DiagCode;
+    use crate::ids::{IntTy, UintTy};
+    use crate::portable::{PNode, PortableTys};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let owner = ItemKey(1005);
+    let mut tys = PortableTys::new_in(alloc);
+    let i32_t = tys.intern(PNode::Int(IntTy::I32)).expect("i32");
+    let u8_t = tys.intern(PNode::Uint(UintTy::U8)).expect("u8");
+    let ab_l = tys.intern_list(&[i32_t, u8_t]).expect("ab");
+    let ab = tys.intern(PNode::Union(ab_l)).expect("i32 | u8");
+
+    let mut body_tys = PortableTys::new_in(alloc);
+    let b_i32 = body_tys.intern(PNode::Int(IntTy::I32)).expect("b i32");
+    let b_u8 = body_tys.intern(PNode::Uint(UintTy::U8)).expect("b u8");
+
+    let world = SigWorld::new(owner, tys, &[ab], i32_t, alloc);
+    let params = [PatId(0)];
+    let p_x = Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of("x"), sub: None, ty: None };
+    let p_a = Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of("a"), sub: None, ty: Some(b_i32) };
+    let p_b = Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of("b"), sub: None, ty: Some(b_u8) };
+    let p_rest = Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of("rest"), sub: None, ty: None };
+    let p_a2 = Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of("a2"), sub: None, ty: Some(b_i32) };
+    let e_x = Expr::Local(PatId(0));
+    let e_1 = Expr::Lit(Lit::Int(Some(IntSuffix::Int(IntTy::I32))));
+    let e_2 = Expr::Lit(Lit::Int(Some(IntSuffix::Int(IntTy::I32))));
+    let e_3 = Expr::Lit(Lit::Int(Some(IntSuffix::Int(IntTy::I32))));
+    let e_true = Expr::Lit(Lit::Bool(true));
+
+    // 1. Non-exhaustive: `match x { a: i32 => 1 }` (missing `u8`).
+    let pats1 = [p_x, p_a];
+    let pat_r1 = [Range { start: 0, end: 1 }, Range { start: 2, end: 8 }];
+    let exprs1 = [e_x, e_1, Expr::Match { scrutinee: ExprId(0), arms: List { start: 0, len: 1 } }];
+    let expr_r1 = [Range { start: 10, end: 11 }, Range { start: 12, end: 13 }, Range { start: 14, end: 30 }];
+    let arms1 = [Arm { pat: PatId(1), guard: None, body: ExprId(1) }];
+    let mut bv = empty_body(owner, body_tys.view(), ExprId(2));
+    bv.params = &params;
+    bv.pats = &pats1;
+    bv.pat_ranges = &pat_r1;
+    bv.exprs = &exprs1;
+    bv.expr_ranges = &expr_r1;
+    bv.arms = &arms1;
+    let c1 = run_sig_check(&bv, &world, alloc);
+    assert_eq!(c1.diags.len(), 1, "diags: {:?}", c1.diags);
+    assert_eq!(c1.diags[0].code, DiagCode::NonExhaustiveMatch);
+    assert_eq!(c1.diags[0].expected.and_then(|t| c1.types.view().node(t).ok()), Some(PNode::Uint(UintTy::U8)));
+
+    // 2. Guarded arm: `match x { a: i32 if true => 1, b: u8 => 2 }` -> still missing `i32`!
+    let pats2 = [p_x, p_a, p_b];
+    let pat_r2 = [Range { start: 0, end: 1 }, Range { start: 2, end: 8 }, Range { start: 9, end: 14 }];
+    let exprs2 = [e_x, e_1, e_2, e_true, Expr::Match { scrutinee: ExprId(0), arms: List { start: 0, len: 2 } }];
+    let expr_r2 = [
+        Range { start: 20, end: 21 },
+        Range { start: 22, end: 23 },
+        Range { start: 24, end: 25 },
+        Range { start: 26, end: 30 },
+        Range { start: 31, end: 50 },
+    ];
+    let arms2 = [
+        Arm { pat: PatId(1), guard: Some(ExprId(3)), body: ExprId(1) },
+        Arm { pat: PatId(2), guard: None, body: ExprId(2) },
+    ];
+    let mut bv2 = empty_body(owner, body_tys.view(), ExprId(4));
+    bv2.params = &params;
+    bv2.pats = &pats2;
+    bv2.pat_ranges = &pat_r2;
+    bv2.exprs = &exprs2;
+    bv2.expr_ranges = &expr_r2;
+    bv2.arms = &arms2;
+    let c2 = run_sig_check(&bv2, &world, alloc);
+    assert_eq!(c2.diags.len(), 1, "diags: {:?}", c2.diags);
+    assert_eq!(c2.diags[0].code, DiagCode::NonExhaustiveMatch);
+    assert_eq!(c2.diags[0].expected.and_then(|t| c2.types.view().node(t).ok()), Some(PNode::Int(IntTy::I32)));
+
+    // 3. Exhaustive typed arms: `match x { a: i32 => 1, b: u8 => 2 }` -> 0 diags.
+    let exprs3 = [e_x, e_1, e_2, Expr::Match { scrutinee: ExprId(0), arms: List { start: 0, len: 2 } }];
+    let expr_r3 = [Range { start: 20, end: 21 }, Range { start: 22, end: 23 }, Range { start: 24, end: 25 }, Range { start: 26, end: 40 }];
+    let arms3 = [
+        Arm { pat: PatId(1), guard: None, body: ExprId(1) },
+        Arm { pat: PatId(2), guard: None, body: ExprId(2) },
+    ];
+    let mut bv3 = empty_body(owner, body_tys.view(), ExprId(3));
+    bv3.params = &params;
+    bv3.pats = &pats2;
+    bv3.pat_ranges = &pat_r2;
+    bv3.exprs = &exprs3;
+    bv3.expr_ranges = &expr_r3;
+    bv3.arms = &arms3;
+    let c3 = run_sig_check(&bv3, &world, alloc);
+    assert!(c3.diags.is_empty(), "diags: {:?}", c3.diags);
+
+    // 4. Exhaustive with catch-all: `match x { a: i32 => 1, rest => 2 }` -> 0 diags.
+    let pats4 = [p_x, p_a, p_rest];
+    bv3.pats = &pats4;
+    let c4 = run_sig_check(&bv3, &world, alloc);
+    assert!(c4.diags.is_empty(), "diags: {:?}", c4.diags);
+
+    // 5. Redundant arm: `match x { a: i32 => 1, a2: i32 => 2, b: u8 => 3 }` -> RedundantPattern.
+    let pats5 = [p_x, p_a, p_a2, p_b];
+    let pat_r5 = [
+        Range { start: 0, end: 1 },
+        Range { start: 2, end: 8 },
+        Range { start: 9, end: 16 },
+        Range { start: 17, end: 22 },
+    ];
+    let exprs5 = [e_x, e_1, e_2, e_3, Expr::Match { scrutinee: ExprId(0), arms: List { start: 0, len: 3 } }];
+    let arms5 = [
+        Arm { pat: PatId(1), guard: None, body: ExprId(1) },
+        Arm { pat: PatId(2), guard: None, body: ExprId(2) },
+        Arm { pat: PatId(3), guard: None, body: ExprId(3) },
+    ];
+    let mut bv5 = empty_body(owner, body_tys.view(), ExprId(4));
+    bv5.params = &params;
+    bv5.pats = &pats5;
+    bv5.pat_ranges = &pat_r5;
+    bv5.exprs = &exprs5;
+    bv5.expr_ranges = &expr_r2;
+    bv5.arms = &arms5;
+    let c5 = run_sig_check(&bv5, &world, alloc);
+    assert_eq!(c5.diags.len(), 1, "diags: {:?}", c5.diags);
+    assert_eq!(c5.diags[0].code, DiagCode::RedundantPattern);
+    assert_eq!(c5.diags[0].found.and_then(|t| c5.types.view().node(t).ok()), Some(PNode::Int(IntTy::I32)));
+}
+
+#[test]
+fn inferred_return_type_holes_and_result_error_union() {
+    use crate::body::{IntSuffix, Lit};
+    use crate::columns::AdjustKind;
+    use crate::fixture::{Bb, Fx};
+    use crate::ids::UintTy;
+    use crate::portable::{PNode, PortableTys};
+
+    let alloc = blaze_own::testing::heap().alloc();
+
+    // 1. General `fn f() -> _` returning `42u32`: inferred_output == u32, 0 diags.
+    {
+        let owner = ItemKey(1010);
+        let mut tys = PortableTys::new_in(alloc);
+        let hole = tys.intern(PNode::Infer).expect("infer");
+        let world = SigWorld::new(owner, tys, &[], hole, alloc);
+        let body_tys = PortableTys::new_in(alloc);
+        let exprs = [Expr::Lit(Lit::Int(Some(IntSuffix::Uint(UintTy::U32))))];
+        let expr_r = [Range { start: 0, end: 5 }];
+        let mut bv = empty_body(owner, body_tys.view(), ExprId(0));
+        bv.exprs = &exprs;
+        bv.expr_ranges = &expr_r;
+        let checked = run_sig_check(&bv, &world, alloc);
+        assert!(checked.diags.is_empty(), "diags: {:?}", checked.diags);
+        let out = checked.inferred_output.expect("inferred_output");
+        assert_eq!(checked.types.view().node(out), Ok(PNode::Uint(UintTy::U32)));
+    }
+
+    // 2. `fn f(flag: bool) -> Result<u32, _>` with `Err(ErrA)` and `Err(ErrB)` -> `Result<u32, ErrA | ErrB>`.
+    {
+        let mut fx = Fx::new();
+        let u32_t = fx.u32();
+        let err_a = fx.tuple_strukt("ErrA", 0, &[u32_t]);
+        let err_b = fx.tuple_strukt("ErrB", 0, &[u32_t]);
+        fx.use_path("ErrA", crate::world::Def::Ctor { adt: err_a, variant: 0, kind: crate::world::CtorKind::Tuple });
+        fx.use_path("ErrB", crate::world::Def::Ctor { adt: err_b, variant: 0, kind: crate::world::CtorKind::Tuple });
+        let err_a_t = fx.adt(err_a, &[]);
+        let err_b_t = fx.adt(err_b, &[]);
+        let p0 = fx.param(0);
+        let p1 = fx.param(1);
+        let (result, _vars) = fx.enum_("Result", 2, &[("Ok", &[p0]), ("Err", &[p1])]);
+        let bool_t = fx.ty(PNode::Bool);
+        let hole_t = fx.ty(PNode::Infer);
+        let res_infer = fx.adt(result, &[u32_t, hole_t]);
+        let f_key = fx.func("f", 0, &[bool_t], res_infer, Default::default());
+        let ab_list = fx.list(&[err_a_t, err_b_t]);
+        let ab_union = fx.ty(PNode::Union(ab_list));
+        let f_flat = fx.func("f_flat", 0, &[bool_t, ab_union], res_infer, Default::default());
+        fx.finish();
+
+        let mut b = Bb::new();
+        let p_flag = b.param("flag");
+        let e_flag = b.local(p_flag);
+        let e_err1 = b.path(&["Result", "Err"]);
+        let e_a_fn = b.path(&["ErrA"]);
+        let e_n1 = b.int(Some(IntSuffix::Uint(UintTy::U32)));
+        let e_a = b.call(e_a_fn, &[e_n1]);
+        let e_call_a = b.call(e_err1, &[e_a]);
+        let e_err2 = b.path(&["Result", "Err"]);
+        let e_b_fn = b.path(&["ErrB"]);
+        let e_n2 = b.int(Some(IntSuffix::Uint(UintTy::U32)));
+        let e_b = b.call(e_b_fn, &[e_n2]);
+        let e_call_b = b.call(e_err2, &[e_b]);
+        let w1 = b.wild();
+        let w2 = b.wild();
+        let root = b.match_(e_flag, &[(w1, e_call_a), (w2, e_call_b)]);
+
+        let view = b.view(f_key, root);
+        let mut ctx = crate::InferCtx::new_in(alloc);
+        let checked = match crate::check(&view, &fx, &mut ctx, &crate::Needs::new_in(alloc), alloc).expect("check") {
+            crate::Outcome::Done(c) => c,
+            crate::Outcome::Need(n) => panic!("unexpected need: {n:?}"),
+        };
+        assert!(checked.diags.is_empty(), "diags: {:?}", checked.diags);
+        let out = checked.inferred_output.expect("inferred_output");
+        let tv = checked.types.view();
+        let PNode::Adt(res_k, args_l) = tv.node(out).expect("out node") else {
+            panic!("expected Result ADT, got {:?}", tv.node(out));
+        };
+        assert_eq!(res_k, result);
+        let args = tv.list(args_l).expect("args");
+        assert_eq!(args.len(), 2);
+        assert_eq!(tv.node(args[0]), Ok(PNode::Uint(UintTy::U32)));
+        let PNode::Union(u_l) = tv.node(args[1]).expect("err union") else {
+            panic!("expected Union error set, got {:?}", tv.node(args[1]));
+        };
+        let members = tv.list(u_l).expect("union members");
+        assert_eq!(members.len(), 2);
+        assert!(matches!(tv.node(members[0]), Ok(PNode::Adt(k, _)) if k == err_a));
+        assert!(matches!(tv.node(members[1]), Ok(PNode::Adt(k, _)) if k == err_b));
+        assert!(
+            checked
+                .adjusts
+                .column::<0>()
+                .iter()
+                .zip(checked.adjusts.column::<1>().iter())
+                .any(|(&ex, k)| ex == e_a && matches!(k, AdjustKind::UnionInject { variant: 0 })),
+            "expected UnionInject(0) on ErrA arg"
+        );
+        assert!(
+            checked
+                .adjusts
+                .column::<0>()
+                .iter()
+                .zip(checked.adjusts.column::<1>().iter())
+                .any(|(&ex, k)| ex == e_b && matches!(k, AdjustKind::UnionInject { variant: 1 })),
+            "expected UnionInject(1) on ErrB arg"
+        );
+
+        // 3. Single error `Err(ErrA)` -> `Result<u32, ErrA>` (not a 1-element union).
+        let mut b2 = Bb::new();
+        let _p_flag2 = b2.param("flag");
+        let e_err_s = b2.path(&["Result", "Err"]);
+        let e_as_fn = b2.path(&["ErrA"]);
+        let e_ns = b2.int(Some(IntSuffix::Uint(UintTy::U32)));
+        let e_as = b2.call(e_as_fn, &[e_ns]);
+        let root2 = b2.call(e_err_s, &[e_as]);
+        let view2 = b2.view(f_key, root2);
+        let mut ctx2 = crate::InferCtx::new_in(alloc);
+        let checked2 = match crate::check(&view2, &fx, &mut ctx2, &crate::Needs::new_in(alloc), alloc).expect("check2") {
+            crate::Outcome::Done(c) => c,
+            crate::Outcome::Need(n) => panic!("unexpected need: {n:?}"),
+        };
+        assert!(checked2.diags.is_empty(), "diags2: {:?}", checked2.diags);
+        let out2 = checked2.inferred_output.expect("inferred_output2");
+        let tv2 = checked2.types.view();
+        let PNode::Adt(_, args_l2) = tv2.node(out2).expect("out2 node") else { panic!("expected Result") };
+        let args2 = tv2.list(args_l2).expect("args2");
+        assert!(matches!(tv2.node(args2[1]), Ok(PNode::Adt(k, _)) if k == err_a));
+
+        // 4. Flattening & deduplication: `Err(ErrA)` + `Err(ab)` where `ab: ErrA | ErrB` -> `ErrA | ErrB`.
+        let mut b3 = Bb::new();
+        let p_fl = b3.param("flag");
+        let p_ab = b3.param("ab");
+        let e_fl = b3.local(p_fl);
+        let e_ab = b3.local(p_ab);
+        let e_err3a = b3.path(&["Result", "Err"]);
+        let e_a3_fn = b3.path(&["ErrA"]);
+        let e_n3 = b3.int(Some(IntSuffix::Uint(UintTy::U32)));
+        let e_a3 = b3.call(e_a3_fn, &[e_n3]);
+        let c3a = b3.call(e_err3a, &[e_a3]);
+        let e_err3b = b3.path(&["Result", "Err"]);
+        let c3b = b3.call(e_err3b, &[e_ab]);
+        let w3a = b3.wild();
+        let w3b = b3.wild();
+        let root3 = b3.match_(e_fl, &[(w3a, c3a), (w3b, c3b)]);
+        let view3 = b3.view(f_flat, root3);
+        let mut ctx3 = crate::InferCtx::new_in(alloc);
+        let checked3 = match crate::check(&view3, &fx, &mut ctx3, &crate::Needs::new_in(alloc), alloc).expect("check3") {
+            crate::Outcome::Done(c) => c,
+            crate::Outcome::Need(n) => panic!("unexpected need: {n:?}"),
+        };
+        assert!(checked3.diags.is_empty(), "diags3: {:?}", checked3.diags);
+        let out3 = checked3.inferred_output.expect("inferred_output3");
+        let tv3 = checked3.types.view();
+        let PNode::Adt(_, args_l3) = tv3.node(out3).expect("out3 node") else { panic!("expected Result") };
+        let args3 = tv3.list(args_l3).expect("args3");
+        let PNode::Union(u_l3) = tv3.node(args3[1]).expect("err union3") else {
+            panic!("expected Union error set, got {:?}", tv3.node(args3[1]));
+        };
+        assert_eq!(tv3.list(u_l3).expect("union3").len(), 2);
+    }
+}

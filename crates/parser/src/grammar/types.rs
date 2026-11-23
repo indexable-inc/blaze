@@ -42,9 +42,7 @@ pub(super) fn type_no_bounds<S: Sink>(p: &mut Parser<'_, S>) {
     type_or_union(p, false);
 }
 
-/// A type, or under `#![blaze::error_unions]` an error union `A | B | C` or fallible result
-/// type `T ! E` (`Result<T, E>`, e.g. `Row ! FsError | Stopped` or `Row ! _`): the union/fallible
-/// operator binds loosest, so `Row ! FsError | Stopped` groups as `Row ! (FsError | Stopped)`.
+/// A type, or under `#![blaze::error_unions]` an error union `A | B | C`.
 /// Without the extension, or where Rust lets a `|` follow a type (a closure's parameters, after
 /// `as`: [`Parser::with_unions`]), this is the type alone and the parse is Rust's.
 fn type_or_union<S: Sink>(p: &mut Parser<'_, S>, allow_bounds: bool) {
@@ -56,20 +54,6 @@ fn type_or_union<S: Sink>(p: &mut Parser<'_, S>, allow_bounds: bool) {
     p.with_unions(false, |p| type_with_bounds_cond(p, allow_bounds));
     if at_union_bar(p) {
         union_members(p, allow_bounds);
-        m.complete(p, UNION_TYPE);
-        return;
-    }
-    if at_fallible_bang(p) {
-        p.bump(T![!]);
-        // Parse the error type non-recursively: a single type or union `E1 | E2 | ...`.
-        let err = p.start();
-        p.with_unions(false, |p| type_with_bounds_cond(p, allow_bounds));
-        if at_union_bar(p) {
-            union_members(p, allow_bounds);
-            err.complete(p, UNION_TYPE);
-        } else {
-            err.abandon(p);
-        }
         m.complete(p, UNION_TYPE);
         return;
     }
@@ -85,10 +69,9 @@ fn union_members<S: Sink>(p: &mut Parser<'_, S>, allow_bounds: bool) {
     }
 }
 
-/// The rest of an error union or fallible type whose first member, `first`, a caller parsed
-/// itself (a generic argument that starts with a name is parsed there, to tell `Item = T` and
-/// `Item: Bound` from a type): `first | B | C` or `first ! E` as one `UNION_TYPE`, or `first`
-/// where no union may be or none follows.
+/// The rest of an error union whose first member, `first`, a caller parsed itself (a generic
+/// argument that starts with a name is parsed there, to tell `Item = T` and `Item: Bound` from
+/// a type): `first | B | C` as one `UNION_TYPE`, or `first` where no union may be or none follows.
 pub(super) fn union_after<S: Sink>(p: &mut Parser<'_, S>, first: CompletedMarker) -> CompletedMarker {
     if !p.unions() {
         return first;
@@ -101,12 +84,6 @@ pub(super) fn union_after<S: Sink>(p: &mut Parser<'_, S>, first: CompletedMarker
         }
         return m.complete(p, UNION_TYPE);
     }
-    if at_fallible_bang(p) {
-        let m = first.precede(p);
-        p.bump(T![!]);
-        type_or_union(p, true);
-        return m.complete(p, UNION_TYPE);
-    }
     first
 }
 
@@ -114,16 +91,6 @@ pub(super) fn union_after<S: Sink>(p: &mut Parser<'_, S>, first: CompletedMarker
 /// the first of `||` or `|=`, that a crate with the extension wrote.
 fn at_union_bar<S: Sink>(p: &Parser<'_, S>) -> bool {
     p.at(T![|]) && !p.at(T![||]) && !p.at(T![|=]) && p.union_bar_gate()
-}
-
-/// Whether the parser is at the `!` of a fallible result type `T ! E` (`#![blaze::error_unions]`):
-/// a lone `!` (not `!=`) followed by a type start (`TYPE_FIRST`, or `{` under `#![blaze::records]`).
-/// Macro types (`foo!(..)`) already consumed their `!` inside `path_or_macro_type`.
-fn at_fallible_bang<S: Sink>(p: &Parser<'_, S>) -> bool {
-    p.at(T![!])
-        && !p.at(T![!=])
-        && p.union_bar_gate()
-        && (TYPE_FIRST.contains(p.nth(1)) || (p.nth(1) == T!['{'] && p.records_gate()))
 }
 
 fn type_with_bounds_cond<S: Sink>(p: &mut Parser<'_, S>, allow_bounds: bool) {
@@ -161,12 +128,13 @@ fn type_with_bounds_cond_here<S: Sink>(p: &mut Parser<'_, S>, allow_bounds: bool
 }
 
 /// blaze, under `#![blaze::records]`: `fn open(opts: { create: bool = false, mode: u32 }) {}`
+/// and structural spread `type Actor = { ..Transform, hp: u32 = 100 };`.
 ///
 /// A record type: a field list where a type is expected, which is nowhere a type of Rust's
 /// (the arm after this one is its error). The list and its fields are a struct's nodes, but a
-/// record's field is a name, a `:`, a type and then a default (`= expr`, as
-/// `default_field_values` writes it) and nothing else: a visibility, an attribute or `unsafe`
-/// is an error here. hir-ty refuses a default outside a function parameter.
+/// record's field is either a spread (`..Type`, a `RECORD_FIELD` with no `NAME`) or a name, a
+/// `:`, a type and then an optional default (`= expr`, as `default_field_values` writes it) and
+/// nothing else: a visibility, an attribute or `unsafe` is an error here.
 fn record_type<S: Sink>(p: &mut Parser<'_, S>) {
     assert!(p.at(T!['{']));
     let m = p.start();
@@ -177,20 +145,26 @@ fn record_type<S: Sink>(p: &mut Parser<'_, S>) {
             error_block(p, "expected a record field: a name, `:` and a type");
             continue;
         }
-        if !p.at(IDENT) {
+        if p.at(T![..]) && !p.at(T![..=]) {
+            let field = p.start();
+            p.bump(T![..]);
+            type_(p);
+            field.complete(p, RECORD_FIELD);
+        } else if p.at(IDENT) {
+            let field = p.start();
+            name(p);
+            p.expect(T![:]);
+            type_(p);
+            if p.eat(T![=]) {
+                let default = p.start();
+                expressions::expr(p);
+                default.complete(p, CONST_ARG);
+            }
+            field.complete(p, RECORD_FIELD);
+        } else {
             p.err_and_bump("expected a record field: a name, `:` and a type");
             continue;
         }
-        let field = p.start();
-        name(p);
-        p.expect(T![:]);
-        type_(p);
-        if p.eat(T![=]) {
-            let default = p.start();
-            expressions::expr(p);
-            default.complete(p, CONST_ARG);
-        }
-        field.complete(p, RECORD_FIELD);
         if !p.at(T!['}']) {
             p.expect(T![,]);
         }
@@ -207,16 +181,16 @@ pub(super) fn at_record_type<S: Sink>(p: &Parser<'_, S>) -> bool {
 }
 
 /// Whether the parser is at a record type that is a generic argument (`Vec<{ a: u8 }>`,
-/// `#![blaze::records]`): a `{`, an identifier, a `:` and a token that is not a second `:`.
-/// Any other `{` in a generic argument list is Rust's const block (`Foo<{ N + 1 }>`, `Foo<{}>`),
-/// which never starts so; the empty record there is written `({})`. Four tokens, jointness
-/// unread, the bound of [`super::expressions::at_record_value`].
+/// `Vec<{ ..Base, a: u8 }>`, `#![blaze::records]`): a `{`, then either an identifier, a `:` and
+/// a token that is not a second `:`, or a `..` spread (not `..=`). Any other `{` in a generic
+/// argument list is Rust's const block (`Foo<{ N + 1 }>`, `Foo<{}>`), which never starts so;
+/// the empty record there is written `({})`. Four tokens, jointness unread, the bound of
+/// [`super::expressions::at_record_value`].
 pub(super) fn at_record_type_arg<S: Sink>(p: &Parser<'_, S>) -> bool {
     p.at(T!['{'])
         && p.records_gate()
-        && p.nth(1) == IDENT
-        && p.nth(2) == T![:]
-        && p.nth(3) != T![:]
+        && ((p.nth(1) == IDENT && p.nth(2) == T![:] && p.nth(3) != T![:])
+            || (p.nth_at(1, T![..]) && !p.nth_at(1, T![..=])))
 }
 
 pub(crate) fn is_dyn_weak<S: Sink>(p: &Parser<'_, S>) -> bool {
@@ -524,13 +498,7 @@ fn path_or_macro_type<S: Sink>(p: &mut Parser<'_, S>, allow_bounds: bool) {
 
     paths::type_path(p);
 
-    // Under `#![blaze::error_unions]`, `Path ! ErrTy` is fallible result sugar (`T ! E`) when
-    // `!` is not followed by a macro delimiter `(`, `[`, or `{`; `foo!(..)`, `foo![..]`, and
-    // `foo!{..}` remain macro types.
-    let kind = if p.at(T![!])
-        && !p.at(T![!=])
-        && (!p.union_bar_gate() || matches!(p.nth(1), T!['('] | T!['['] | T!['{']))
-    {
+    let kind = if p.at(T![!]) && !p.at(T![!=]) {
         items::macro_call_after_excl(p);
         m.complete(p, MACRO_CALL);
         MACRO_TYPE

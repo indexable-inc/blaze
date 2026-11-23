@@ -296,13 +296,16 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         }
         let local = self.v.place(p).local;
         let i = self.ix(local)?;
-        let (mut g, mut lay) = (self.tys[i], self.lays[i]);
-        let mut at = match self.held[i] {
+        let mut g = *self.tys.get(i).ok_or(self.malformed("a local past the frame"))?;
+        let mut lay = *self.lays.get(i).ok_or(self.malformed("a local past the frame"))?;
+        let held = *self.held.get(i).ok_or(self.malformed("a local past the frame"))?;
+        let [c0, c1] = *self.cur.get(i).ok_or(self.malformed("a local past the frame"))?;
+        let mut at = match held {
             Held::None => At::Val(V::None),
-            Held::One(_) => At::Val(V::One(self.cur[i][0].ok_or(self.malformed("a read of a value local before it is written"))?)),
+            Held::One(_) => At::Val(V::One(c0.ok_or(self.malformed("a read of a value local before it is written"))?)),
             Held::Two(..) => {
-                let a = self.cur[i][0].ok_or(self.malformed("a read of a value local before it is written"))?;
-                let b = self.cur[i][1].ok_or(self.malformed("a read of a value local before it is written"))?;
+                let a = c0.ok_or(self.malformed("a read of a value local before it is written"))?;
+                let b = c1.ok_or(self.malformed("a read of a value local before it is written"))?;
                 At::Val(V::Two(a, b))
             }
             Held::Slot(_) | Held::At(_) => At::Mem { ptr: self.base(local)?, off: 0, lay, meta: None },
@@ -500,7 +503,8 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     pub(crate) fn dest_layout(&mut self, dest: Place) -> Result<LayoutId, BuildError> {
         let row = self.v.place(dest);
         if row.depth == 0 {
-            return Ok(self.lays[self.ix(row.local)?]);
+            let i = self.ix(row.local)?;
+            return self.lays.get(i).copied().ok_or(self.malformed("a local past the frame"));
         }
         match self.resolve(dest)?.0 {
             At::Mem { lay, .. } => Ok(lay),
@@ -512,7 +516,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     /// `dest`, whose layout is `lay`, and its tag.
     fn write_fields(&mut self, dest: Place, lay: LayoutId, variant: Option<u32>, fields: &[(u32, V, LayoutId)]) -> Result<(), BuildError> {
         let row = self.v.place(dest);
-        let value_local = row.depth == 0 && self.held[self.ix(row.local)?].is_value();
+        let value_local = row.depth == 0 && self.held.get(self.ix(row.local)?).is_some_and(|h| h.is_value());
         if value_local {
             if variant.is_some_and(|v| v != 0) {
                 return Err(self.malformed("an enum variant built into a value local"));
@@ -974,8 +978,10 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
 
     /// The function reference of `instance`, one per instance.
     pub(crate) fn func_ref(&mut self, instance: Instance) -> blaze_lir::func::RefId {
-        if let Some(i) = self.refs.iter().position(|&r| r == instance) {
-            return self.ref_ids[i];
+        if let Some(i) = self.refs.iter().position(|&r| r == instance)
+            && let Some(&r) = self.ref_ids.get(i)
+        {
+            return r;
         }
         let place = self.refs.len() as u32;
         let r = self.b.reference(RefKind::Func, place);

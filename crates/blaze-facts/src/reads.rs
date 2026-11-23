@@ -102,7 +102,7 @@ impl<'w, 'a, F: Facts> Reads<'w, 'a, F> {
         let digest = self.digester.answer(&answer)?;
         match self.rows.binary_search_by(|r| r.fact.cmp(&key)) {
             Ok(at) => {
-                if self.rows[at].answer != digest {
+                if self.rows.get(at).is_some_and(|r| r.answer != digest) {
                     return Err(FactError::Unstable { fact: key });
                 }
             }
@@ -141,7 +141,7 @@ impl ReadList<'_> {
 
     /// The digest recorded for `fact`, if it was read.
     pub fn get(&self, fact: FactKey) -> Option<u64> {
-        self.rows.binary_search_by(|r| r.fact.cmp(&fact)).ok().map(|at| self.rows[at].answer)
+        self.rows.binary_search_by(|r| r.fact.cmp(&fact)).ok().and_then(|at| self.rows.get(at)).map(|r| r.answer)
     }
 
     /// The digest of the whole list: its rows in order. Changes when an answer read changes,

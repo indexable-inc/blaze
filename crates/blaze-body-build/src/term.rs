@@ -323,7 +323,8 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     fn dest_memory(&mut self, dest: Place) -> Result<Option<Value>, BuildError> {
         let row = self.v.place(dest);
         if row.depth == 0 {
-            return match self.held[self.ix(row.local)?] {
+            let i = self.ix(row.local)?;
+            return match *self.held.get(i).ok_or(self.malformed("a local past the frame"))? {
                 crate::Held::Slot(_) | crate::Held::At(_) => Ok(Some(self.base(row.local)?)),
                 _ => Ok(None),
             };
@@ -338,7 +339,8 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     fn place_ty(&mut self, p: Place) -> Result<blaze_typeck::PTy, BuildError> {
         let row = self.v.place(p);
         if row.depth == 0 {
-            return Ok(self.tys[self.ix(row.local)?]);
+            let i = self.ix(row.local)?;
+            return self.tys.get(i).copied().ok_or(self.malformed("a local past the frame"));
         }
         Ok(self.resolve(p)?.1)
     }

@@ -36,7 +36,7 @@ fn a_store_loads_origins_are_two_parts_and_no_copy() {
     let snapshot = kept(&names, true);
     let mut read: AVec<'_, CrateRecords<'_>> = AVec::with_capacity_in(names.crates().len(), alloc);
     for (c, payload) in names.crates().iter().zip(payloads.iter()) {
-        read.push(crate_records(scope_name(c.key), payload, c.key, bump).unwrap_or_else(|e| panic!("crate `{}`: {e}", c.name)));
+        read.push(crate_records(scope_name(c.key), payload, c.key, bump).unwrap_or_else(|e| panic!("crate '{}': {e}", c.name)));
     }
     let mut packages: AVec<'_, &str> = AVec::with_capacity_in(read.len(), alloc);
     packages.resize(read.len(), "/");
@@ -58,26 +58,26 @@ fn a_store_loads_origins_are_two_parts_and_no_copy() {
             for (call, expansion) in c.expansions.iter() {
                 let Some(made) = expansion.made else { continue };
                 // One read serves the text and its origins (F4).
-                let read = load.expansion(krate, *call).unwrap_or_else(|| panic!("crate `{}` call {call:?}: no expansion served", c.name));
-                assert_eq!(read.text, made.text, "crate `{}` call {call:?}: its text over the store", c.name);
-                let (call_part, column) = read.origins.unwrap_or_else(|| panic!("crate `{}` call {call:?}: no origins served", c.name));
+                let read = load.expansion(krate, *call).unwrap_or_else(|| panic!("crate '{}' call {call:?}: no expansion served", c.name));
+                assert_eq!(read.text, made.text, "crate '{}' call {call:?}: its text over the store", c.name);
+                let (call_part, column) = read.origins.unwrap_or_else(|| panic!("crate '{}' call {call:?}: no origins served", c.name));
                 if round == 0 {
                     calls += 1;
                 }
                 match made.origins {
                     Ok(bytes) if !bytes.is_empty() => {
                         // The oracle: the parts are the joined bytes, cut where the column starts.
-                        assert_eq!(call_part, &bytes[..call_part.len()], "crate `{}` call {call:?}: the call part", c.name);
-                        assert_eq!(column, &bytes[call_part.len()..], "crate `{}` call {call:?}: the column", c.name);
-                        let parts = OriginsView::open_parts(call_part, column).unwrap_or_else(|e| panic!("crate `{}` call {call:?}: the parts open: {e}", c.name));
-                        let whole = OriginsView::open(bytes).unwrap_or_else(|e| panic!("crate `{}` call {call:?}: the solve's bytes open: {e}", c.name));
+                        assert_eq!(call_part, &bytes[..call_part.len()], "crate '{}' call {call:?}: the call part", c.name);
+                        assert_eq!(column, &bytes[call_part.len()..], "crate '{}' call {call:?}: the column", c.name);
+                        let parts = OriginsView::open_parts(call_part, column).unwrap_or_else(|e| panic!("crate '{}' call {call:?}: the parts open: {e}", c.name));
+                        let whole = OriginsView::open(bytes).unwrap_or_else(|e| panic!("crate '{}' call {call:?}: the solve's bytes open: {e}", c.name));
                         assert_eq!((parts.text, parts.item, parts.input_start, parts.input_len, parts.macro_name), (whole.text, whole.item, whole.input_start, whole.input_len, whole.macro_name));
                         if round == 0 {
                             with_column += 1;
                         }
                     }
                     // A text that keeps none: an empty call part (the trait's docs).
-                    _ => assert!(call_part.is_empty(), "crate `{}` call {call:?}: a text with no origins handed a call part", c.name),
+                    _ => assert!(call_part.is_empty(), "crate '{}' call {call:?}: a text with no origins handed a call part", c.name),
                 }
             }
         }

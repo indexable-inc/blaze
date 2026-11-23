@@ -720,9 +720,22 @@ pub(crate) struct Signals {
     /// What the child being polled last began ([`Doing`]): set by its run, read by
     /// [`OneEach`] after each poll, so a turn that held the command thread is named by it.
     doing: Cell<Doing>,
+    /// Exact host-work nanoseconds recorded inside the polled turn (e.g. `needs.serve` inside
+    /// `Doing::Serving`, excluding any `recv_message` wait before the frame arrived). `None`
+    /// means the turn's whole elapsed time is used whenever [`Doing::holds_command_thread`].
+    host_nanos: Cell<Option<u64>>,
     /// The polled child's time parked waiting for its code so far (D194): set from its
     /// [`Running`] before its poll, raised by its run while parked, kept back after; nanoseconds.
     parked: Cell<u64>,
+    /// Whether the polled child is currently parked waiting for a code worker (D194), so
+    /// [`OneEach`] knows whether a sibling's stall is already covered by its open code wait.
+    parked_now: Cell<bool>,
+    /// Whether the polled child has started its sandboxed process (`started_at` recorded).
+    started: Cell<bool>,
+    /// Cumulative host command-thread stall time (nanoseconds) accumulated for the polled child
+    /// after its process started: passed in by [`OneEach`] before each poll so `run_captured`
+    /// extends its own `until` deadline by the same amount the runner credits.
+    stalled: Cell<u64>,
 }
 
 /// What one child's run was doing on the command thread. Every child is served by that one
@@ -743,6 +756,15 @@ pub(crate) enum Doing {
     Serving,
     /// Reading its pipes and its deadline.
     Relaying,
+}
+
+impl Doing {
+    /// Whether this phase performs host-side work (building roots, launching the sandbox, or
+    /// compiling/publishing code) that holds the single command thread rather than waiting on
+    /// running test code.
+    const fn holds_command_thread(self) -> bool {
+        matches!(self, Doing::Roots | Doing::Starting | Doing::Serving)
+    }
 }
 
 impl fmt::Display for Doing {
@@ -776,6 +798,12 @@ impl Signals {
         if heavy(doing) || !heavy(self.doing.get()) {
             self.doing.set(doing);
         }
+    }
+
+    fn add_host_nanos(&self, elapsed: Duration) {
+        let add = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        let cur = self.host_nanos.get().unwrap_or(0);
+        self.host_nanos.set(Some(cur.saturating_add(add)));
     }
 
     fn terminate(&self, now: Duration) -> Result<bool, OneError> {
@@ -817,9 +845,20 @@ struct Running<'a> {
     row: u32,
     test: TestId,
     began: Nanos,
+    /// Whether the child's process has started (`Signals::started`).
+    started: bool,
+    /// Time elapsed before the child's process started (queued behind sibling turns, `Doing::Roots`,
+    /// `Doing::Starting`). Aligns `Runner`'s `answer_due` (from `asked`) with `run_captured`'s
+    /// allowance (from `started_at`).
+    pre_start: Nanos,
     /// How long its run was parked waiting for its code so far, as its last poll said
-    /// ([`Signals::parked`]): the runner's allowance does not count it (test_run.rs `answer_due`).
+    /// ([`Signals::parked`]) plus any unpolled sibling stall while `parked_now` is true.
     parked: Nanos,
+    /// Whether the child was parked waiting for a code worker at the end of its last poll.
+    parked_now: bool,
+    /// Command-thread host stall time accumulated after the child started: its own
+    /// `Doing::Serving` turns plus siblings' host turns while not parked on a code worker.
+    stalled: Nanos,
     child: Pin<std::boxed::Box<dyn Future<Output = Result<(RunOutcome, Output<'static>), OneError>> + 'a>>,
 }
 
@@ -854,6 +893,87 @@ impl<'b, R: RunOne, C: Fn() -> Nanos> OneEach<'b, R, C> {
             pending: Vec::new_in(alloc), batch: Vec::new_in(alloc), running, failed: None, longest: None,
         })
     }
+
+    fn sweep(&mut self, context: &mut Context<'_>) -> Result<(), RunError> {
+        let mut at = 0;
+        while let Some(current) = self.running.get_mut(at) {
+            self.signals.doing.set(Doing::Idle);
+            self.signals.host_nanos.set(None);
+            self.signals.parked.set(current.parked.0);
+            self.signals.parked_now.set(current.parked_now);
+            self.signals.started.set(current.started);
+            self.signals.stalled.set(current.stalled.0);
+            let turn = (self.now)();
+            let polled = current.child.as_mut().poll(context);
+            let after = (self.now)();
+            let nanos = after.0.saturating_sub(turn.0);
+            let doing = self.signals.doing.get();
+            let stall = if doing.holds_command_thread() {
+                self.signals.host_nanos.get().map_or(nanos, |reported| reported.min(nanos))
+            } else {
+                0
+            };
+            let was_started = current.started;
+            let is_started = self.signals.started.get();
+            current.started = is_started;
+            if !was_started && is_started {
+                // Align `Runner`'s `answer_due` (counted from `asked`) with `run_captured`'s
+                // `until` (counted from `started_at`) without double-crediting `stalled`.
+                let pre = Nanos(after.0.saturating_sub(current.began.0));
+                current.pre_start = current.pre_start.max(pre);
+            } else if stall > 0 {
+                if !was_started {
+                    current.pre_start = Nanos(current.pre_start.0.saturating_add(stall));
+                } else {
+                    current.stalled = Nanos(current.stalled.0.saturating_add(stall));
+                }
+            }
+            current.parked_now = self.signals.parked_now.get();
+            current.parked = current.parked.max(Nanos(self.signals.parked.get()));
+            let row = current.row;
+            if self.longest.is_none_or(|longest| nanos > longest.nanos) {
+                self.longest = Some(Turn { row, nanos, doing });
+            }
+            if stall > 0 {
+                // While `at` held the single command thread doing host work (building roots,
+                // starting its sandbox, or compiling/publishing code), no sibling could be polled,
+                // reaped, or served. Credit every sibling so neither its own deadline nor
+                // `Runner::watch` charges it for command-thread stall time.
+                for (index, sibling) in self.running.iter_mut().enumerate() {
+                    if index == at {
+                        continue;
+                    }
+                    if !sibling.started {
+                        sibling.pre_start = Nanos(sibling.pre_start.0.saturating_add(stall));
+                    } else if sibling.parked_now {
+                        sibling.parked = Nanos(sibling.parked.0.saturating_add(stall));
+                    } else {
+                        sibling.stalled = Nanos(sibling.stalled.0.saturating_add(stall));
+                    }
+                }
+            }
+            let Poll::Ready(result) = polled else { at += 1; continue };
+            let Running { row, test, began, .. } = self.running.swap_remove(at);
+            let item = match result {
+                Ok((outcome, output)) => Item::Ended {
+                    row,
+                    test,
+                    micros: after.0.saturating_sub(began.0) / 1_000,
+                    how: outcome.how,
+                    keep: outcome.keep,
+                    entered: outcome.entered,
+                    output,
+                },
+                Err(OneError::CannotBuild(why)) => Item::CannotBuild { row, test, why },
+                Err(error) => {
+                    self.failed = Some((row, error));
+                    return Err(RunError::Seam { call: "serving a test process", errno: 0, suite: Some(self.suite) });
+                }
+            };
+            self.batch.push(item);
+        }
+        Ok(())
+    }
 }
 
 impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
@@ -875,7 +995,17 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
             let how = runs.run(row, budget, &mut output, signals).await?;
             Ok((how, output))
         }, *self.running.allocator());
-        self.running.push(Running { row, test, began, parked: Nanos(0), child });
+        self.running.push(Running {
+            row,
+            test,
+            began,
+            started: false,
+            pre_start: Nanos(0),
+            parked: Nanos(0),
+            parked_now: false,
+            stalled: Nanos(0),
+            child,
+        });
         Ok(())
     }
 
@@ -898,41 +1028,23 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
         }
         let mut context = Context::from_waker(Waker::noop());
         let mut interval = Duration::ZERO;
-        while self.batch.is_empty() && (self.now)() < until {
-            let left = Duration::from_nanos(until.0.saturating_sub((self.now)().0));
+        let mut swept = false;
+        let mut crossed_until = false;
+        while self.batch.is_empty() && (!swept || (self.now)() < until) {
+            let before_sweep = (self.now)();
+            let left = Duration::from_nanos(until.0.saturating_sub(before_sweep.0));
             self.signals.wait.set(interval.min(left));
-            let mut at = 0;
-            while at < self.running.len() {
-                self.signals.doing.set(Doing::Idle);
-                self.signals.parked.set(self.running[at].parked.0);
-                let turn = (self.now)();
-                let polled = self.running[at].child.as_mut().poll(&mut context);
-                let nanos = (self.now)().0.saturating_sub(turn.0);
-                self.running[at].parked = Nanos(self.signals.parked.get());
-                if self.longest.is_none_or(|longest| nanos > longest.nanos) {
-                    self.longest = Some(Turn { row: self.running[at].row, nanos, doing: self.signals.doing.get() });
-                }
-                let Poll::Ready(result) = polled else { at += 1; continue };
-                let Running { row, test, began, .. } = self.running.swap_remove(at);
-                let item = match result {
-                    Ok((outcome, output)) => Item::Ended {
-                        row,
-                        test,
-                        micros: (self.now)().0.saturating_sub(began.0) / 1_000,
-                        how: outcome.how,
-                        keep: outcome.keep,
-                        entered: outcome.entered,
-                        output,
-                    },
-                    Err(OneError::CannotBuild(why)) => Item::CannotBuild { row, test, why },
-                    Err(error) => {
-                        self.failed = Some((row, error));
-                        return Err(RunError::Seam { call: "serving a test process", errno: 0, suite: Some(self.suite) });
-                    }
-                };
-                self.batch.push(item);
-            }
+            self.sweep(&mut context)?;
+            swept = true;
+            crossed_until = before_sweep < until && (self.now)() >= until;
             interval = DRAIN_EVERY;
+        }
+        // If `until` was crossed mid-sweep, give every remaining child one non-blocking poll so
+        // earlier-indexed children can report ready exits, enforce their own timeout, or refresh
+        // their parked credit before `Runner::watch` checks for silence.
+        if crossed_until && !self.running.is_empty() {
+            self.signals.wait.set(Duration::ZERO);
+            self.sweep(&mut context)?;
         }
         Ok(())
     }
@@ -970,7 +1082,9 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
     }
 
     fn parked(&self, row: u32) -> Nanos {
-        self.running.iter().find(|running| running.row == row).map_or(Nanos(0), |running| running.parked)
+        self.running.iter().find(|running| running.row == row).map_or(Nanos(0), |running| {
+            Nanos(running.pre_start.0.saturating_add(running.parked.0).saturating_add(running.stalled.0))
+        })
     }
 }
 
@@ -1072,6 +1186,232 @@ mod pool_tests {
         let turn = pool.longest.expect("a turn was timed");
         assert_eq!((turn.row, turn.doing), (5, Doing::Roots));
         assert!(turn.nanos >= 5_000, "the turn's length is not the clock's: {}", turn.nanos);
+    }
+
+    struct NoAnswers;
+
+    impl Answers for NoAnswers {
+        fn answer<'s>(
+            &'s mut self,
+            _suite: SuiteId,
+            test: TestId,
+            _entered: &[FnName],
+            _reads: &[ReadName],
+            _digests: &mut AVec<'_, (ReadName, ReadDigest)>,
+        ) -> Result<(Address, AtAddress<'s>), RunError> {
+            Ok((Address(test.0), AtAddress::EMPTY))
+        }
+    }
+
+    fn drive_one_each<'a, R: RunOne, C: Fn() -> Nanos>(
+        pool: OneEach<'a, R, C>,
+        width: u32,
+        budget: Nanos,
+        count: usize,
+    ) -> Result<(Status, AString<'static>), RunError> {
+        let g = blaze_own::testing::heap().alloc();
+        let config = LoopConfig {
+            plan: blaze_run::plan::Config {
+                width,
+                deadline: budget,
+                run_all: false,
+                ignored: blaze_run::plan::Ignored::Skip,
+                benches: false,
+                filter: blaze_run::plan::Filter::All,
+                skip: &[],
+            },
+            style: blaze_run::report::Style::text(80, false),
+            list: false,
+            run: blaze_run::CheckoutKey([1; 32]),
+            suites: 1,
+        };
+        let mut asked: AVec<'static, blaze_run::plan::Asked<'static>> = Vec::new_in(g);
+        let mut owners: AVec<'static, SuiteId> = Vec::new_in(g);
+        for row in 0..count {
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0x55;
+            bytes[1] = u8::try_from(row).unwrap_or(u8::MAX);
+            let path = match row {
+                0 => "m::sibling",
+                1 => "m::staller",
+                _ => "m::other",
+            };
+            asked.push(blaze_run::plan::Asked {
+                test: TestId(bytes),
+                path,
+                ignore: None,
+                bench: false,
+                should_panic: blaze_run::plan::ShouldPanic::No,
+            });
+            owners.push(SuiteId(0));
+        }
+        let owners_slice = owners.as_slice();
+        let heads = [Head::EMPTY];
+        let mut runner = Runner::new(pool, &config.plan, TestHost::Macos, g);
+        let mut machine = TestLoop::new(config, g).expect("test loop");
+        let mut out: AVec<'static, Effect<'static>> = Vec::new_in(g);
+        let mut effects: AVec<'static, Effect<'static>> = Vec::new_in(g);
+        machine
+            .begin_inventory(asked, owners_slice, &heads, Postings::EMPTY, &[], 0, runner.zygotes().now(), &mut out)
+            .expect("begin inventory");
+        machine.step(Event::Checked { errors: 0 }, runner.zygotes().now(), &mut out).expect("checked");
+        let mut text = String::new_in(g);
+        let mut answers = NoAnswers;
+        for _ in 0..20_000 {
+            core::mem::swap(&mut out, &mut effects);
+            let mut done = None;
+            for effect in effects.drain(..) {
+                match &effect {
+                    Effect::Run { .. } | Effect::Kill { .. } => runner.effect(&effect)?,
+                    Effect::Print { text: bytes } => {
+                        text.push_str(core::str::from_utf8(bytes.as_slice()).expect("utf8 output"));
+                    }
+                    Effect::Done { status } => done = Some(*status),
+                    _ => {}
+                }
+            }
+            if let Some(status) = done {
+                runner.finish()?;
+                return Ok((status, text));
+            }
+            if !out.is_empty() {
+                continue;
+            }
+            runner.step(&mut machine, &mut answers, &mut out)?;
+        }
+        panic!("drive_one_each did not finish within step bound");
+    }
+
+    /// Regression for tempo `ZygoteSilent`: row 1 holds the single command thread in
+    /// `Doing::Serving` (`Lazy::publication`) for 8.0 s — far past row 0's 1.0 s allowance plus
+    /// 1.4 s `ANSWER_SLACK` — and finishes on that same turn, returning a non-empty batch to
+    /// `Runner::step` -> `Runner::watch` while row 0 is still running.
+    /// Row 0 must be credited with row 1's 8.0 s host stall (both in `OneEach::parked` and in
+    /// `Signals::stalled`), so it is NOT falsely killed with `ZygoteSilent` or `TimedOut`.
+    #[test]
+    fn sibling_host_stall_past_allowance_does_not_cause_zygote_silent() {
+        const BUDGET: Nanos = Nanos(1_000_000_000);
+        const STALL_NS: u64 = 8_000_000_000;
+
+        struct StallingPair<'t> {
+            tick: &'t Cell<u64>,
+            sibling_saw_stall: Cell<u64>,
+        }
+
+        impl RunOne for StallingPair<'_> {
+            async fn run(&self, row: u32, budget: Nanos, _: &mut Output<'_>, signals: &Signals) -> Result<RunOutcome, OneError> {
+                signals.begin(Doing::Roots);
+                self.tick.set(self.tick.get() + 1_000_000);
+                signals.begin(Doing::Starting);
+                let started_at = self.tick.get();
+                signals.started.set(true);
+                next_turn().await;
+                if row == 1 {
+                    // Hold the command thread in `Lazy::publication` past sibling's allowance + ANSWER_SLACK,
+                    // then finish immediately so `OneEach::wait` returns to `Runner::watch` while row 0 runs.
+                    signals.begin(Doing::Serving);
+                    self.tick.set(self.tick.get() + STALL_NS);
+                    return Ok(RunOutcome {
+                        how: How::Reported(Said::Returned),
+                        keep: Err(NotKept::Untraced),
+                        entered: Vec::new_in(blaze_own::testing::heap().alloc()),
+                    });
+                }
+                // Row 0: sibling runs for two turns while row 1 stalls the command thread.
+                signals.begin(Doing::Relaying);
+                self.tick.set(self.tick.get() + 5_000_000);
+                next_turn().await;
+                signals.begin(Doing::Relaying);
+                let credited = signals.stalled.get();
+                self.sibling_saw_stall.set(credited);
+                let now = self.tick.get();
+                assert!(
+                    now < started_at.saturating_add(budget.0).saturating_add(credited),
+                    "sibling's own deadline would falsely expire without stall credit: now={now}, started={started_at}, budget={}, credited={credited}",
+                    budget.0
+                );
+                Ok(RunOutcome {
+                    how: How::Reported(Said::Returned),
+                    keep: Err(NotKept::Untraced),
+                    entered: Vec::new_in(blaze_own::testing::heap().alloc()),
+                })
+            }
+        }
+
+        let heap = blaze_own::testing::heap().alloc();
+        let signals = Signals::default();
+        let tick = Cell::new(0u64);
+        let children = StallingPair { tick: &tick, sibling_saw_stall: Cell::new(0) };
+        let clock = || Nanos(tick.get());
+        let pool = OneEach::new(&children, &signals, clock, heap, heap).expect("process heap");
+        let (status, text) = drive_one_each(pool, 2, BUDGET, 2).expect("sibling must not trigger ZygoteSilent");
+        assert_eq!((status.passed, status.failed), (2, 0), "{text}");
+        assert!(
+            children.sibling_saw_stall.get() >= STALL_NS,
+            "expected sibling to be credited at least {STALL_NS} ns of host stall, got {}",
+            children.sibling_saw_stall.get()
+        );
+    }
+
+    /// Control for genuine hang detection: while the command thread is idle (`Doing::Relaying`),
+    /// NO stall time is credited, so a genuinely hung child still times out right at its allowance
+    /// (`How::TimedOut`), and a child future that ignores its own deadline still triggers
+    /// `RunError::ZygoteSilent` at `allowance + ANSWER_SLACK`.
+    #[test]
+    fn genuine_hang_with_idle_command_thread_still_times_out_and_silent_child_still_fails() {
+        const BUDGET: Nanos = Nanos(1_000_000_000);
+        const STEP_NS: u64 = 100_000_000;
+
+        struct Hung {
+            tick: Cell<u64>,
+            honor_deadline: bool,
+            observed_stall: Cell<u64>,
+            timed_out_at: Cell<u64>,
+        }
+
+        impl RunOne for Hung {
+            async fn run(&self, _row: u32, budget: Nanos, _: &mut Output<'_>, signals: &Signals) -> Result<RunOutcome, OneError> {
+                let started_at = self.tick.get();
+                signals.started.set(true);
+                loop {
+                    next_turn().await;
+                    signals.begin(Doing::Relaying);
+                    let stalled = signals.stalled.get();
+                    self.observed_stall.set(stalled);
+                    let now = self.tick.get();
+                    if self.honor_deadline && now >= started_at.saturating_add(budget.0).saturating_add(stalled) {
+                        self.timed_out_at.set(now);
+                        return Ok(RunOutcome {
+                            how: How::TimedOut { after: budget },
+                            keep: Err(NotKept::Untraced),
+                            entered: Vec::new_in(blaze_own::testing::heap().alloc()),
+                        });
+                    }
+                    self.tick.set(now.saturating_add(STEP_NS));
+                }
+            }
+        }
+
+        // 1. Genuinely hung child honoring its allowance times out cleanly at `BUDGET` with 0 stall credit.
+        let heap = blaze_own::testing::heap().alloc();
+        let signals = Signals::default();
+        let hung = Hung { tick: Cell::new(0), honor_deadline: true, observed_stall: Cell::new(u64::MAX), timed_out_at: Cell::new(0) };
+        let clock = || Nanos(hung.tick.get());
+        let pool = OneEach::new(&hung, &signals, clock, heap, heap).expect("process heap");
+        let (status, text) = drive_one_each(pool, 1, BUDGET, 1).expect("hung child reports TimedOut, not ZygoteSilent");
+        assert_eq!((status.passed, status.failed), (0, 1), "{text}");
+        assert!(text.contains("killed past its deadline"), "{text}");
+        assert_eq!(hung.observed_stall.get(), 0, "idle Doing::Relaying must never credit stall time");
+        assert_eq!(hung.timed_out_at.get(), BUDGET.0, "hung child must time out right at its allowance");
+
+        // 2. A broken child future that refuses to honor its own deadline still trips `ZygoteSilent`.
+        let signals = Signals::default();
+        let silent = Hung { tick: Cell::new(0), honor_deadline: false, observed_stall: Cell::new(u64::MAX), timed_out_at: Cell::new(0) };
+        let clock = || Nanos(silent.tick.get());
+        let pool = OneEach::new(&silent, &signals, clock, heap, heap).expect("process heap");
+        let stopped = drive_one_each(pool, 1, BUDGET, 1).expect_err("silent child must trip ZygoteSilent");
+        assert!(matches!(stopped, RunError::ZygoteSilent { row: 0, .. }), "expected ZygoteSilent, got {stopped:?}");
+        assert_eq!(silent.observed_stall.get(), 0, "idle Doing::Relaying must never credit stall time");
     }
 }
 
@@ -2083,7 +2423,7 @@ impl<'c> Launched<'c, '_, '_> {
         let mut codes = HomeCodeStore::new(self.lent);
         // THE SEAM LINE: how the records reach the program (run_bytes.rs `Delivery`; `Inline`
         // sends them over descriptor 3 and files none).
-        let mut lazy = Lazy::new(cx, front, Chosen::of(Delivery::Files, RecordsDir { cx, dir: self.records }, alloc), &mut codes, self.builder, alloc);
+        let mut lazy = Lazy::new(cx, front, Chosen::of(Delivery::Inline, RecordsDir { cx, dir: self.records }, alloc), &mut codes, self.builder, alloc);
         // Its place in the relay, told its end however the run ends (D194).
         let child = Child(self.child_base + row as usize);
         let _asking = self.codes.map(|code| Asking { code, child });
@@ -2126,8 +2466,10 @@ impl<'c> Launched<'c, '_, '_> {
         signals.begin(Doing::Starting);
         let Started { child: mut run, pipes: given } = self.spawner.start_served(cx, &spec).map_err(OneError::Start)?;
         // Its allowance runs from its start, less the time it was parked waiting for its code
-        // (D194): that wait has its own deadline (`CODE_WAIT`) and error, never the test's.
+        // (D194) or stalled behind command-thread host work: those waits never eat the test's own
+        // execution budget.
         let started_at = run.now();
+        signals.started.set(true);
         let allowance = Duration::from_nanos(budget.0);
         let mut parked_for = Duration::ZERO;
         let mut parked: Option<Parked> = None;
@@ -2162,11 +2504,19 @@ impl<'c> Launched<'c, '_, '_> {
             signals.begin(Doing::Relaying);
             let now = run.now();
             let open_park = parked.map_or(Duration::ZERO, |park| now.saturating_sub(park.since));
-            let until = Deadline::after(started_at, allowance.saturating_add(parked_for).saturating_add(open_park));
+            let host_stalled = Duration::from_nanos(signals.stalled.get());
+            let until = Deadline::after(started_at, allowance.saturating_add(parked_for).saturating_add(open_park).saturating_add(host_stalled));
             if let Some(code) = self.codes {
+                let pumping = run.now();
                 code.pump()?;
+                let pumped = run.now().saturating_sub(pumping);
+                if pumped >= DRAIN_EVERY {
+                    signals.begin(Doing::Serving);
+                    signals.add_host_nanos(pumped);
+                }
                 // The runner's watch moves its answer's due by it (test_run.rs `answer_due`).
                 signals.parked.set(u64::try_from(parked_for.saturating_add(open_park).as_nanos()).unwrap_or(u64::MAX));
+                signals.parked_now.set(parked.is_some());
             }
             if let (Some(park), Some(code)) = (parked, self.codes) {
                 let came = code.answer(child, |reply| match reply {
@@ -2181,6 +2531,8 @@ impl<'c> Launched<'c, '_, '_> {
                 if let Some(came) = came {
                     parked_for = parked_for.saturating_add(open_park);
                     parked = None;
+                    signals.parked.set(u64::try_from(parked_for.as_nanos()).unwrap_or(u64::MAX));
+                    signals.parked_now.set(false);
                     let stop = match came {
                         Came::Made => None,
                         Came::Failed(cause) => Some(test_parent_error(&mut lazy, cause)),
@@ -2252,6 +2604,7 @@ impl<'c> Launched<'c, '_, '_> {
                         let taken = match needs.serve(&mut resolver, &inbox[..len], &mut reply) {
                             Ok(taken) => taken,
                             Err(cause) => {
+                                signals.add_host_nanos(run.now().saturating_sub(serving));
                                 // This group is waiting for code it will never receive.
                                 // Kill and reap before returning its typed outcome to the plan.
                                 run.kill().map_err(child_error)?;
@@ -2260,6 +2613,7 @@ impl<'c> Launched<'c, '_, '_> {
                         };
                         let elapsed = run.now().saturating_sub(serving);
                         service_time += elapsed;
+                        signals.add_host_nanos(elapsed);
                         match resolver.requested {
                             Some(TestAnswer::Unresolved(Symbol(symbol))) => {
                                 // Sending Failed would turn the unavailable instance into a launcher exit.
@@ -2333,6 +2687,7 @@ impl<'c> Launched<'c, '_, '_> {
                                     return Err(error);
                                 }
                                 parked = Some(Parked { since: run.now(), symbol });
+                                signals.parked_now.set(true);
                             }
                             // Faults and requests for an already answered slot need no resolution.
                             None => {}
@@ -2683,7 +3038,7 @@ pub(crate) fn list(cx: &Cx, suites: &[(Found<'_>, TestUnit<'_>)], config: LoopCo
         Format::Text => out.line(cx, format_args!("{tests} tests, {benches} benchmarks")),
         Format::Json => out.line(cx, format_args!("{{\"event\":\"listed_summary\",\"tests\":{tests},\"benches\":{benches}}}")),
     }.map_err(|_| DriveError::Print)?;
-    Ok(Status { failed: 0, not_run: 0, check_errors: 0 })
+    Ok(Status { passed: 0, failed: 0, ignored: 0, not_run: 0, check_errors: 0 })
 }
 
 pub(crate) struct Suite<'s, 'h> {
@@ -3063,6 +3418,9 @@ fn run_selected<'h>(
         alloc,
     );
     watch.see(blaze_screen::Step::Says);
+    // Clean up this command's per-run `$TMPDIR` tree (`v2/test/tmp/<pid>-<ns>`) on both Ok and Err
+    // paths now that all child test processes have exited.
+    let _ = crate::gc::remove_tree_best_effort(&cx, &temps, &command_path);
     // A run that stopped in blaze: ONE line naming the test, what failed and its cause, then
     // the command's own error (`OneStopped`) says the line above is why (rule 19). The
     // runner's `Seam` error says only that one stopped, so it is not shown.

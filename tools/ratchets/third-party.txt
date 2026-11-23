@@ -70,6 +70,7 @@ blaze-format-core	0	0	8
 blaze-format-tiers	1	0	40
 blaze-fuzz	0	0	8
 blaze-git-fetch	0	0	1
+blaze-glob	0	0	1
 blaze-graph	5	0	64
 blaze-h1	0	0	1
 blaze-h2	0	0	1
@@ -139,6 +140,7 @@ blaze-store-check	0	0	8
 blaze-surface	0	0	8
 blaze-swiss	0	0	1
 blaze-sys	0	1	0
+blaze-tab	0	0	1
 blaze-tar	0	1	1
 blaze-test-reach	0	0	1
 blaze-text	0	0	1

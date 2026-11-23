@@ -714,6 +714,7 @@ fn put_adjust(p: &mut Put, k: AdjustKind) {
         AdjustKind::Unsize => (7, 0, 0),
         AdjustKind::UnionInject { variant } => (8, 0, variant),
         AdjustKind::UnionWiden => (9, 0, 0),
+        AdjustKind::RecordProject => (10, 0, 0),
     };
     p.u8(tag);
     p.u8(arg);
@@ -749,6 +750,7 @@ fn get_adjust(g: &mut Get<'_>) -> Result<AdjustKind, E> {
         8 if arg == 0 => Ok(AdjustKind::UnionInject { variant }),
         8 => Err(g.bad(arg)),
         9 => plain(AdjustKind::UnionWiden),
+        10 => plain(AdjustKind::RecordProject),
         _ => Err(g.bad(tag)),
     }
 }
@@ -1777,6 +1779,7 @@ impl<'r> CheckedRecord<'r> {
             index_mut,
             findings: Vec::new_in(alloc),
             undecided: Vec::new_in(alloc),
+            inferred_output: None,
         })
     }
 }

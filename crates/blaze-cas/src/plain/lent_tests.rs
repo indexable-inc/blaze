@@ -350,6 +350,61 @@ fn reused_handles_fresh_and_reused_committed_keys_identically() {
     assert_eq!(store.got(found).bytes, &value(5003)[..]);
 }
 
+/// Many unexpired roots sharing many indexes stay O(unique keys + roots) in `Plain::reused` and
+/// `compute_reach` (no O(keys × roots × indexes) blowup), while still protecting an unrooted
+/// committed key reused through a new index.
+#[test]
+fn reused_dedups_shared_indexes_across_many_roots() {
+    use core::time::Duration;
+    use super::super::core::{LEASE_NS, ROOT_LIFE_NS};
+
+    let root = super::super::test_root();
+    let sim = Sim::new(404, Faults::default());
+    let mut store = Driven::with(sim, Path::new("/sim"), reached_cfg(1, u64::MAX, &root), &root).expect("open");
+
+    const INDEXES: usize = 32;
+    const KEYS_PER_INDEX: usize = 64;
+    let mut shared_indexes = [key(0); INDEXES];
+    for (idx_i, slot) in shared_indexes.iter_mut().enumerate() {
+        let mut keys = [key(0); KEYS_PER_INDEX];
+        for (key_j, key_slot) in keys.iter_mut().enumerate() {
+            let id = 10_000 + (idx_i * KEYS_PER_INDEX + key_j) as u32;
+            let k = key(id);
+            store.put(k, Namespace::LOCAL, TAG, &value(id)).expect("put");
+            *key_slot = k;
+        }
+        *slot = store.index(&keys).expect("index");
+    }
+    let unrooted_k = key(99_999);
+    store.put(unrooted_k, Namespace::LOCAL, TAG, &value(99_999)).expect("put unrooted");
+    for r in 0..32u32 {
+        store.root_through(&format!("shared-{r}"), &shared_indexes, ROOT_LIFE_NS).expect("root_through");
+    }
+    store.release_lease();
+    store.commit_with(&[]).expect("commit 1");
+
+    // Reopen and commit a new indexed root sharing all 32 indexes plus a new index reusing `unrooted_k`.
+    let sim = store.into_driver();
+    let mut store = Driven::with(sim, Path::new("/sim"), reached_cfg(2, u64::MAX, &root), &root).expect("reopen");
+    let extra_idx = store.index(&[unrooted_k]).expect("extra index");
+    let mut new_indexes = [key(0); INDEXES + 1];
+    new_indexes[..INDEXES].copy_from_slice(&shared_indexes);
+    new_indexes[INDEXES] = extra_idx;
+    store.root_through("new-shared", &new_indexes, ROOT_LIFE_NS).expect("root_through new");
+    store.commit_with(&[]).expect("commit new");
+
+    // Advance past lease and sweep: both shared keys and the reused unrooted key survive.
+    store.driver().advance(Duration::from_nanos(LEASE_NS) + Duration::from_secs(1));
+    store.fold_slice().expect("fold");
+    store.release_lease();
+    store.commit_with(&[]).expect("commit after fold");
+    let found = store.get(&unrooted_k).expect("get unrooted").expect("present");
+    assert_eq!(store.got(found).bytes, &value(99_999)[..]);
+    let sample = key(10_000);
+    let found = store.get(&sample).expect("get sample").expect("present");
+    assert_eq!(store.got(found).bytes, &value(10_000)[..]);
+}
+
 /// `needs_housekeeping` is `false` on a clean bounded store and `true` in each trigger condition:
 /// total bytes over cap, expired root, tier count exceeding `K`, and expired retired file.
 #[test]

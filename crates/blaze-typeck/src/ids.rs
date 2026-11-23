@@ -84,6 +84,16 @@ impl RecordSchema {
         }
         RecordSchema(h.finish())
     }
+
+    /// Deterministic synthetic key under which anonymous record type-level field defaults are
+    /// indexed in `World::field_defaults`.
+    pub fn defaults_key(self) -> ItemKey {
+        let mut lo = StableHasher::new("blaze-typeck record defaults lo");
+        lo.u64(self.0);
+        let mut hi = StableHasher::new("blaze-typeck record defaults hi");
+        hi.u64(self.0);
+        ItemKey(u128::from(lo.finish()) | (u128::from(hi.finish()) << 64))
+    }
 }
 
 impl ContentHash for RecordSchema {
@@ -363,6 +373,9 @@ pub enum LangItem {
     CallOnceFuture,
     /// `AsyncFnMut::CallRefFuture` (`call_ref_future`).
     CallRefFuture,
+    /// The trait `From` (`from` / `core::convert::From`), for error-union `?` propagation.
+    /// Last, so the earlier items keep their content hashes.
+    From,
 }
 
 impl LangItem {
@@ -398,7 +411,7 @@ impl LangItem {
     /// and the checked-body record ([`crate::checked_record`]) write. The one home of the list
     /// (blaze-ladder's front2/langs.rs `ALL` names this one; tests/front2_bounds.rs checks its
     /// length against `variant_count` and its order, so a new variant cannot be left out).
-    pub const ALL: [LangItem; 98] = {
+    pub const ALL: [LangItem; 99] = {
         use LangItem::*;
         [
             Sized, Copy, Deref, DerefMut, Add, Sub, Mul, Div, Rem, BitAnd, BitOr, BitXor, Shl, Shr, AddAssign, SubAssign, MulAssign, DivAssign, RemAssign, BitAndAssign, BitOrAssign,
@@ -409,6 +422,7 @@ impl LangItem {
             RangeToInclusive, IntoFutureIntoFuture, FuturePoll, PinNewUnchecked, GetContext, PollReady, PollPending, FutureOutput, TryTraitFromOutput,
             Freeze,
             AsyncFn, AsyncFnMut, AsyncFnOnce, AsyncFnOnceOutput, CallOnceFuture, CallRefFuture,
+            From,
         ]
     };
 

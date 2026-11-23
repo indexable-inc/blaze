@@ -340,6 +340,13 @@ pub trait Heads {
     fn assoc_lifetimes(&self, trait_: ItemKey, name: Name) -> Option<u32>;
     /// How many lifetimes the opaque type `opaque` captures (filed by its fn's head).
     fn opaque_lifetimes(&self, opaque: ItemKey) -> Option<u32>;
+    /// Records the source spelling `text` of structural record field `name` so record type spread
+    /// (`{ ..Base, extra: T }`) sorts merged fields alphabetically by source spelling.
+    fn note_record_field_name(&self, _name: Name, _text: &str) {}
+    /// The recorded source spelling of structural record field `name`, if known.
+    fn record_field_name(&self, _name: Name) -> Option<&str> {
+        None
+    }
 }
 
 /// The one region counter's facts (`regions::Arity`, D148): each DECLARED lifetime count
@@ -1137,35 +1144,65 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 let l = intern_list(tys, kids)?;
                 intern(tys, PNode::Tuple(l))
             }
-            lf::TypeRef::Fallible { .. } => {
-                let l = intern_list(tys, kids)?;
-                if let Some(result_key) = self.resolve_result_adt(env)? {
-                    intern(tys, PNode::Adt(result_key, l))
-                } else {
-                    intern(tys, PNode::Union(l))
-                }
-            }
             lf::TypeRef::Record(fields) => {
                 let rows = v.rows(fields)?;
                 let alloc = tys.alloc();
-                let mut named = blaze_own::Vec::with_capacity_in(rows.len(), alloc);
+                // Merged fields `(field_text, Name, PTy)`. Spreads (`f.name.is_none()`) expand
+                // left-to-right, and later spreads or explicit fields override earlier ones.
+                let mut merged: blaze_own::Vec<(&str, Name, PTy), Alloc<'_>> = blaze_own::Vec::with_capacity_in(rows.len(), alloc);
                 for (i, &n) in rows.iter().enumerate() {
                     let f = lf::Field::decode(n)?;
-                    let text = match f.name {
-                        Some(nm) => v.name_text(nm)?,
-                        None => "",
+                    let Some(&kid_ty) = kids.get(i) else {
+                        return Err(Why::Unsupported("record field count mismatch", r));
                     };
-                    named.push((text, i, Name::of(text)));
+                    match f.name {
+                        Some(nm) => {
+                            let text = v.name_text(nm)?;
+                            let name = Name::of(text);
+                            self.heads.note_record_field_name(name, text);
+                            if let Some(slot) = merged.iter_mut().find(|(_, existing, _)| *existing == name) {
+                                *slot = (text, name, kid_ty);
+                            } else {
+                                merged.push((text, name, kid_ty));
+                            }
+                        }
+                        None => {
+                            let tv = tys.view();
+                            let Some(PNode::Record(base_schema, base_list)) = tv.get(kid_ty).copied() else {
+                                let spread_r = place(v, v.type_range(f.ty)).unwrap_or(r);
+                                return Err(Why::Unsupported("record type spread (`..Base`) requires a structural record type", spread_r));
+                            };
+                            let base_names = tv
+                                .record_names(base_schema)
+                                .ok_or(Why::Unsupported("record type spread target has no registered schema", r))?;
+                            let base_tys = tv.list(base_list).map_err(|_| table_full())?;
+                            if base_names.len() != base_tys.len() {
+                                return Err(Why::Unsupported("record type spread field count mismatch", r));
+                            }
+                            for (&bnm, &bty) in base_names.iter().zip(base_tys.iter()) {
+                                let btext = self
+                                    .heads
+                                    .record_field_name(bnm)
+                                    .ok_or(Why::Unsupported("record type spread field name is not registered", r))?;
+                                if let Some(slot) = merged.iter_mut().find(|(_, existing, _)| *existing == bnm) {
+                                    *slot = (btext, bnm, bty);
+                                } else {
+                                    merged.push((btext, bnm, bty));
+                                }
+                            }
+                        }
+                    }
                 }
-                named.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-                let mut sorted_names = blaze_own::Vec::with_capacity_in(named.len(), alloc);
-                for &(_, _, nm) in named.iter() {
+                merged.sort_by(|a, b| a.0.cmp(b.0));
+                let mut sorted_names = blaze_own::Vec::with_capacity_in(merged.len(), alloc);
+                let mut sorted_tys = blaze_own::Vec::with_capacity_in(merged.len(), alloc);
+                for &(_, nm, fty) in merged.iter() {
                     sorted_names.push(nm);
+                    sorted_tys.push(fty);
                 }
                 let schema = tc::RecordSchema::of_sorted_names(&sorted_names);
                 tys.register_record_schema(schema, &sorted_names).map_err(|_| table_full())?;
-                // `children()` already yields `kids` in canonical sorted field-name order.
-                let l = intern_list(tys, kids)?;
+                let l = intern_list(tys, &sorted_tys)?;
                 intern(tys, PNode::Record(schema, l))
             }
             lf::TypeRef::Union(_) => {
@@ -1255,28 +1292,6 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             },
             _ => Err(Why::Unsupported("this type", r)),
         }
-    }
-
-    /// Resolves `Result<T, E>` (an enum with 2 generic parameters) for `T ! E` fallible types,
-    /// trying `::core::result::Result`, `core::result::Result`, and `Result` in scope.
-    fn resolve_result_adt(&self, env: &Env<'_>) -> Result<Option<ItemKey>, Why> {
-        const CANDIDATES: [(bool, &[&str]); 3] = [
-            (true, &["core", "result", "Result"]),
-            (false, &["core", "result", "Result"]),
-            (false, &["Result"]),
-        ];
-        for (abs, segs) in CANDIDATES {
-            if let Ok(found) = self.resolver.path(env.module, abs, segs, Ns::Type)
-                && usize::try_from(found.consumed).ok() == Some(segs.len())
-                && found.kind == Kind::Enum
-            {
-                let (g, _) = self.heads.adt_generics(found.key).ok_or(Why::Need(found.key))?;
-                if g == 2 {
-                    return Ok(Some(self.heads.checker(found.key)));
-                }
-            }
-        }
-        Ok(None)
     }
 
     /// Resolves a written path in `ns` by the block and first-token rule in
@@ -1910,10 +1925,6 @@ pub(super) fn children(v: &View<'_>, t: lf::TypeId, out: &mut Vec<lf::TypeId, Gl
         lf::TypeRef::Ref { inner, .. } | lf::TypeRef::Ptr { inner, .. } | lf::TypeRef::Slice(inner) => out.push(inner),
         lf::TypeRef::Array { elem, .. } => out.push(elem),
         lf::TypeRef::Tuple(l) | lf::TypeRef::Union(l) => out.extend(v.ids(l)?.iter().map(|&i| lf::TypeId(i))),
-        lf::TypeRef::Fallible { ok, err } => {
-            out.push(ok);
-            out.push(err);
-        }
         lf::TypeRef::Path(p) => {
             let path = v.path(p)?;
             for &n in v.segments(path)? {
@@ -1964,32 +1975,11 @@ pub(super) fn children(v: &View<'_>, t: lf::TypeId, out: &mut Vec<lf::TypeId, Gl
         lf::TypeRef::Macro(_) => {}
         lf::TypeRef::Pat { base, .. } => out.push(base),
         lf::TypeRef::Record(fields) => {
-            // Yield record field types in canonical sorted field-name order (matching
-            // `blaze_ty::record_ty::RecordTy`) with zero extra allocation so `make()` and
-            // region lowering see the exact same canonical field order.
-            let rows = v.rows(fields)?;
-            let mut prev: Option<(&str, usize)> = None;
-            for _ in 0..rows.len() {
-                let mut best: Option<(&str, usize, lf::TypeId)> = None;
-                for (i, &n) in rows.iter().enumerate() {
-                    let f = lf::Field::decode(n)?;
-                    let name = match f.name {
-                        Some(n) => v.name_text(n)?,
-                        None => "",
-                    };
-                    if let Some((pn, pi)) = prev
-                        && (name, i) <= (pn, pi)
-                    {
-                        continue;
-                    }
-                    if best.is_none_or(|(bn, bi, _)| (name, i) < (bn, bi)) {
-                        best = Some((name, i, f.ty));
-                    }
-                }
-                if let Some((bn, bi, ty)) = best {
-                    out.push(ty);
-                    prev = Some((bn, bi));
-                }
+            // Yield record field and spread types in written order so `make()` and
+            // `record_regions()` align `rows[i]` with `kids[i]` before expanding spreads and
+            // sorting into canonical alphabetical field-name order.
+            for &n in v.rows(fields)? {
+                out.push(lf::Field::decode(n)?.ty);
             }
         }
         lf::TypeRef::For { binder, inner } => {
@@ -2937,7 +2927,8 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     let own = lifetime_kind(v, lifetime, r, s)?;
                     s.wrap(n, Some(own))
                 }
-                lf::TypeRef::Ptr { .. } | lf::TypeRef::Slice(_) | lf::TypeRef::Array { .. } | lf::TypeRef::Pat { .. } | lf::TypeRef::Tuple(_) | lf::TypeRef::Record(_) | lf::TypeRef::Fallible { .. } | lf::TypeRef::Never => s.wrap(n, None),
+                lf::TypeRef::Ptr { .. } | lf::TypeRef::Slice(_) | lf::TypeRef::Array { .. } | lf::TypeRef::Pat { .. } | lf::TypeRef::Tuple(_) | lf::TypeRef::Never => s.wrap(n, None),
+                lf::TypeRef::Record(fields) => self.record_regions(tys, v, fields, kids, n, s, r)?,
                 lf::TypeRef::Union(_) => {
                     let raw_count: u32 = kids
                         .iter()
@@ -2976,6 +2967,91 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             }
         }
         Ok(())
+    }
+
+    /// A structural record type's region slots in canonical alphabetical field-name order,
+    /// expanding any `..Base` spread entries and applying left-to-right field overrides.
+    #[expect(clippy::too_many_arguments, reason = "one made record: its fields, lowered kids and region sink")]
+    fn record_regions(&self, tys: &mut PortableTys<'_>, v: &View<'_>, fields: lf::List, kids: &[PTy], n: usize, s: &mut RegionSink<'_>, r: Range) -> Result<Laid, Why> {
+        let kid_slots: u32 = (0..n).filter_map(|k| s.kid(n, k).map(|f| f.len)).sum();
+        let kid_binders: u32 = (0..n).filter_map(|k| s.kid(n, k).map(|f| f.binders)).sum();
+        if kid_slots == 0 && kid_binders == 0 {
+            return Ok(s.wrap(n, None));
+        }
+        if kid_binders != 0 {
+            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OtherForm, r)));
+        }
+        let rows = v.rows(fields)?;
+        let alloc = s.alloc;
+        let tv = tys.view();
+        let arity = HeadsArity { heads: self.heads, opaques: &s.opaques, names: self.resolver.names };
+        let mut merged: blaze_own::Vec<(&str, Name, u32, u32), Alloc<'_>> = blaze_own::Vec::with_capacity_in(rows.len(), alloc);
+        for (i, &row) in rows.iter().enumerate() {
+            let f = lf::Field::decode(row)?;
+            let frag = soft!(s.kid(n, i).ok_or(RegionRefusal::not_laid(NotLaidWhy::Stack, r)));
+            match f.name {
+                Some(nm) => {
+                    let text = v.name_text(nm)?;
+                    let name = Name::of(text);
+                    if let Some(slot) = merged.iter_mut().find(|(_, existing, _, _)| *existing == name) {
+                        *slot = (text, name, frag.start, frag.len);
+                    } else {
+                        merged.push((text, name, frag.start, frag.len));
+                    }
+                }
+                None => {
+                    let Some(&kid_ty) = kids.get(i) else {
+                        return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
+                    };
+                    let Some(PNode::Record(base_schema, base_list)) = tv.get(kid_ty).copied() else {
+                        return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OtherForm, r)));
+                    };
+                    let Some(base_names) = tv.record_names(base_schema) else {
+                        return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OtherForm, r)));
+                    };
+                    let Ok(base_tys) = tv.list(base_list) else {
+                        return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OtherForm, r)));
+                    };
+                    let mut cursor = frag.start;
+                    for (&bnm, &bty) in base_names.iter().zip(base_tys.iter()) {
+                        let sub = soft!(subtree(tv, bty, &arity, alloc));
+                        let Some(btext) = self.heads.record_field_name(bnm) else {
+                            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OtherForm, r)));
+                        };
+                        if let Some(slot) = merged.iter_mut().find(|(_, existing, _, _)| *existing == bnm) {
+                            *slot = (btext, bnm, cursor, sub.slots);
+                        } else {
+                            merged.push((btext, bnm, cursor, sub.slots));
+                        }
+                        cursor = cursor.saturating_add(sub.slots);
+                    }
+                    if cursor != frag.start.saturating_add(frag.len) {
+                        return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
+                    }
+                }
+            }
+        }
+        merged.sort_by(|a, b| a.0.cmp(b.0));
+        s.scratch.clear();
+        for &(_, _, start, len) in merged.iter() {
+            let Ok(st) = usize::try_from(start) else {
+                return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
+            };
+            let Ok(en) = usize::try_from(start.saturating_add(len)) else {
+                return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
+            };
+            let Some(slice) = s.slots.get(st..en) else {
+                return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
+            };
+            for &slot in slice {
+                let slot = match slot.kind {
+                    SlotKind::ObjectDefault(_) => Slot::quiet(SlotKind::Static),
+                    _ => slot,
+                };
+                s.scratch.push(slot);
+            }
+        }
+        Ok(Ok(0))
     }
 
     /// A path's slots. A struct's, enum's or union's: its written lifetime arguments (or one

@@ -108,6 +108,10 @@ pub struct BodyFrame<'n> {
     /// one for the request's workers): each root goal the body asks is looked up there first.
     /// `None`: every goal is solved in the body.
     pub goals: Option<&'n dyn blaze_solve::share::GoalShare>,
+    /// Stretch-scoped declarative macro preparation table shared across bodies in a stretch so
+    /// each body allocates 0 bytes in `frame` for `Prepares`. `None`: `ProjectWorld::over`
+    /// allocates a fresh one in `frame`.
+    pub prepared: Option<&'n blaze_lower::scoped::Prepares<'n>>,
 }
 
 /// The ask a failed cell belonged to. At import time the checker may have made several
@@ -585,7 +589,7 @@ fn asks_agree(a: &BodyReads<'_>, o: &BodyReads<'_>) -> bool {
 pub fn compare_asks<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, work: Alloc<'w>, plant: super::super::asks::AsksPlant) -> Result<(), AsksDiffer<'w>> {
     use super::super::asks::AsksMet;
     let run = |met: AsksMet, heads: Option<&'n dyn HeadSeed<'n>>| {
-        let shadow = BodyFrame { frame: frame.frame, alloc: frame.alloc, plant_drop: frame.plant_drop, cost: None, needs: frame.needs, heads, sources: frame.sources, goals: None };
+        let shadow = BodyFrame { frame: frame.frame, alloc: frame.alloc, plant_drop: frame.plant_drop, cost: None, needs: frame.needs, heads, sources: frame.sources, goals: None, prepared: frame.prepared };
         let mut recorder = Recorder::new(RecorderOpts { alloc: work });
         record_body_as(tables, task, &shadow, work, &mut recorder, None, Coverage::WithLocals, ReadReport::Sorted, met)
     };
@@ -810,7 +814,7 @@ impl core::fmt::Debug for RepeatsDiffer<'_> {
 /// two sides' tallies, `Offer`'s then `Quiet`'s (zero for two equal refusals).
 pub fn compare_repeats<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame<'n>, work: Alloc<'w>, plant: RepeatsPlant) -> Result<(super::recorder::ReadTally, super::recorder::ReadTally), RepeatsDiffer<'w>> {
     use super::recorder::Repeats;
-    let shadow = BodyFrame { frame: frame.frame, alloc: frame.alloc, plant_drop: frame.plant_drop, cost: None, needs: frame.needs, heads: frame.heads, sources: frame.sources, goals: None };
+    let shadow = BodyFrame { frame: frame.frame, alloc: frame.alloc, plant_drop: frame.plant_drop, cost: None, needs: frame.needs, heads: frame.heads, sources: frame.sources, goals: None, prepared: frame.prepared };
     let run = |repeats: Repeats, drop: Option<NameCell>| {
         let mut recorder = Recorder::new(RecorderOpts { alloc: work });
         recorder.set_repeats(repeats);
@@ -858,7 +862,7 @@ fn body_world<'v, 'n, 'w>(view: Tables<'v, 'n>, name: Name, frame: &BodyFrame<'n
     let index = Index::from_source(view, lang_crates).map_err(TaskError::Lang)?;
     view.records().name_lang_crates(lang_crates);
     let front = Front2 { names: view, resolver: crate::resolve::Paths { names: view }, texts: Texts::empty(), keys: Keys::new(), index, frame: frame.frame };
-    let mut world = blaze_own::Box::new_in(ProjectWorld::over(front, frame.alloc), alloc);
+    let mut world = blaze_own::Box::new_in(ProjectWorld::over_with(front, frame.prepared, frame.alloc), alloc);
     world.record_const_texts();
     world.set_cost(frame.cost);
     world.set_needs(frame.needs);
@@ -934,6 +938,82 @@ fn record_body_as<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
     if let Some(error) = seed_error {
         return Err(error);
     }
+    let sorted_report = matches!(report, ReadReport::Sorted);
+    let done = collect_body_reads(name, own, frame, alloc, &observed, view, world, reached, report)?;
+    let recorder_bytes = recorder.table_bytes();
+    let (mut reads, mut read_tally) = recorder.take_item().map_err(TaskError::Full)?;
+    recorder.checking(None);
+    if sorted_report {
+        reads.sort_unstable_by(|a, b| {
+            read_tally.sort_compares += 1;
+            a.cmp(b)
+        });
+    }
+    let work_bytes = WorkBytes {
+        recorder: recorder_bytes,
+        recorder_floor: byte_size(reads.len(), core::mem::size_of::<TableRead>()),
+        cells: 0,
+        held: done.held_bytes,
+        said: done.said_bytes,
+        verdict: byte_size(done.verdict_capacity, 1),
+        goal_hits: byte_size(goal_hits.capacity(), core::mem::size_of::<blaze_solve::share::GoalHit>()),
+    };
+    Ok(BodyReads {
+        out: done.digest,
+        failed: done.failed,
+        findings: done.findings,
+        bytes: done.bytes,
+        reads,
+        const_texts: done.const_texts,
+        locals: done.locals,
+        typed: done.typed,
+        typed_stalled: done.typed_stalled,
+        held: done.held,
+        said: done.said,
+        goal_hits,
+        read_tally,
+        work: work_bytes,
+        asked: done.asked,
+    })
+}
+
+fn byte_size(n: usize, each: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX).saturating_mul(u64::try_from(each).unwrap_or(u64::MAX))
+}
+
+struct CollectedBody<'w> {
+    digest: ContentId,
+    failed: bool,
+    findings: u32,
+    bytes: AVec<'w, u8>,
+    const_texts: AVec<'static, TableRead>,
+    locals: AVec<'w, ItemKey>,
+    typed: Option<AVec<'w, u8>>,
+    typed_stalled: bool,
+    held: AVec<'w, (TableRead, u128)>,
+    said: AVec<'w, Said<'w>>,
+    asked: blaze_ask::Counts,
+    verdict_capacity: usize,
+    held_bytes: u64,
+    said_bytes: u64,
+}
+
+/// Outlined post-check summary for [`record_body_as`] so its locals and temporaries do not stay
+/// on the stack under `world.each_from` (keeping small-stack body checks well under 512 KiB).
+#[inline(never)]
+#[expect(clippy::too_many_arguments, reason = "outlined tail of record_body_as")]
+fn collect_body_reads<'v, 'n, 'w>(
+    name: Name,
+    own: ItemKey,
+    frame: &BodyFrame<'n>,
+    alloc: Alloc<'w>,
+    observed: &'v ObservedReads<'_, 'w, '_, 'n, '_>,
+    view: Tables<'v, 'n>,
+    mut world: blaze_own::Box<ProjectWorld<'n, Tables<'v, 'n>>, Alloc<'w>>,
+    reached: AVec<'w, Reached<(BodyVerdict<'static>, BorrowVerdict)>>,
+    report: ReadReport<'_, 'w>,
+) -> Result<CollectedBody<'w>, TaskError> {
+    let recorder = observed.recorder;
     // Each fn declared in a reached body: checked here, so covered by this check. A local is
     // always written `Free` (every_body.rs `each_from`); the root is the one with no `within`.
     recorder.checking(Some("the body's local function key list"));
@@ -1009,7 +1089,7 @@ fn record_body_as<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
     let const_texts = world.take_const_texts().map_err(TaskError::Full)?;
     let asked = *world.store.asked.borrow();
     drop(world);
-    drop(view);
+    let _ = view;
     if let Some(error) = observed.error.borrow_mut().take() {
         return Err(error);
     }
@@ -1017,26 +1097,9 @@ fn record_body_as<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
     let digest = ContentId::of(OUT_DOMAIN, bytes.as_bytes());
     let verdict_capacity = bytes.capacity();
     let bytes = owned_bytes.into_bytes();
-    let recorder_bytes = recorder.table_bytes();
-    let (mut reads, mut read_tally) = recorder.take_item().map_err(TaskError::Full)?;
-    recorder.checking(None);
-    if sorted_report {
-        reads.sort_unstable_by(|a, b| {
-            read_tally.sort_compares += 1;
-            a.cmp(b)
-        });
-    }
-    let size = |n: usize, each: usize| (n as u64).saturating_mul(each as u64);
-    let work_bytes = WorkBytes {
-        recorder: recorder_bytes,
-        recorder_floor: size(reads.len(), core::mem::size_of::<TableRead>()),
-        cells: 0,
-        held: size(held_keys.capacity(), core::mem::size_of::<u128>()) + size(held.capacity(), core::mem::size_of::<(TableRead, u128)>()),
-        said: size(said.capacity(), core::mem::size_of::<Said<'_>>())
-            + said.iter().map(|s| s.words.capacity() as u64 + s.within.as_ref().map_or(0, |w| w.capacity() as u64) + if let SaidWhat::NotChecked { cause } = &s.what { cause.capacity() as u64 } else { 0 }).sum::<u64>(),
-        verdict: size(verdict_capacity, 1),
-        goal_hits: size(goal_hits.capacity(), core::mem::size_of::<blaze_solve::share::GoalHit>()),
-    };
+    let held_bytes = byte_size(held_keys.capacity(), core::mem::size_of::<u128>()) + byte_size(held.capacity(), core::mem::size_of::<(TableRead, u128)>());
+    let said_bytes = byte_size(said.capacity(), core::mem::size_of::<Said<'_>>())
+        + said.iter().map(|s| byte_size(s.words.capacity(), 1) + s.within.as_ref().map_or(0, |w| byte_size(w.capacity(), 1)) + if let SaidWhat::NotChecked { cause } = &s.what { byte_size(cause.capacity(), 1) } else { 0 }).sum::<u64>();
     drop(held_keys);
     drop(reading);
     // The root's checked record (D163 R1), copied into `work` beside the rest of the answer, of
@@ -1059,7 +1122,7 @@ fn record_body_as<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
     };
     let typed_stalled = matches!(clean.and_then(|one| one.got.0.typed.as_ref()), Some(Err(blaze_typeck::checked_record::CheckedRecordError::NotClean { what: "stalled", .. })));
     // `findings` summed over the root and its local fns (u32, saturating), as the row's.
-    Ok(BodyReads { out: digest, failed, findings, bytes, reads, const_texts, locals, typed, typed_stalled, held, said, goal_hits, read_tally, work: work_bytes, asked })
+    Ok(CollectedBody { digest, failed, findings, bytes, const_texts, locals, typed, typed_stalled, held, said, asked, verdict_capacity, held_bytes, said_bytes })
 }
 
 /// Whether a root's checked record is kept (D163 R1, D197 root 1): when its TYPES are clean (no
@@ -1731,7 +1794,7 @@ mod read_id_tests {
         let (records, _, frame) = world_of("#![no_std]\npub fn base() -> u8 { 1u8 }\npub fn left() -> u8 { base() }\npub fn right() -> u16 { base() }");
         let unused = Recorder::new(RecorderOpts { alloc: a() });
         let tables = Tables::new(TablesOpts { records, impls: None, lang_crates: &[CORE_AT], reads: &unused });
-        let frame = BodyFrame { frame, alloc: a(), plant_drop: None, cost: None, needs: NeedsMet::All, heads: None, sources: None, goals: None };
+        let frame = BodyFrame { frame, alloc: a(), plant_drop: None, cost: None, needs: NeedsMet::All, heads: None, sources: None, goals: None, prepared: None };
         let heads = cells(records);
         let mut entry = Recorder::new(RecorderOpts { alloc: a() });
         let mut encoding = AString::new_in(a());

@@ -26,7 +26,7 @@ use crate::{Abi, Adts, BuildError, Built, Instance, Intrinsic, Subst, ground};
 
 #[path = "closure.rs"]
 mod closure;
-pub(crate) use closure::{build_builtin_clone, build_ctor_fn, build_fn_shim, closures_in};
+pub(crate) use closure::{build_builtin_clone, build_builtin_from, build_ctor_fn, build_fn_shim, closures_in};
 #[cfg(test)]
 pub(crate) use closure::{empty_record as empty_record_for_tests, empty_view as empty_view_for_tests};
 #[path = "coroutine.rs"]
@@ -924,7 +924,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 if a == b {
                     continue;
                 }
-                let shape = crate::vtable::Shape::of(a, |t| self.adts.object_trait(t), self.alloc)
+                let shape = crate::vtable::Shape::of(a, |t| self.adts.object_trait(t), self.scratch)
                     .map_err(|error| BuildError::Vtable { at: Some(e), error })?;
                 let slot = match shape.upcast(b) {
                     Some(crate::vtable::Upcast::Prefix) => None,
@@ -4170,8 +4170,118 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 }
                 AdjustKind::UnionInject { variant } => self.union_inject(e, t, variant)?,
                 AdjustKind::UnionWiden => self.union_widen(e, n, t)?,
+                AdjustKind::RecordProject => self.record_project(e, n, t)?,
             }
         }
+        Ok(())
+    }
+
+    /// Projects a wider structural record on top to a narrower structural record `dst_t`
+    /// (`{ host, port, tls } -> { host }`), copying retained fields by canonical field name and
+    /// dropping any unused source fields that need drop.
+    fn record_project(&mut self, e: ExprId, n: usize, dst_t: PTy) -> Result<(), BuildError> {
+        let src_t = self.ty_before(e, n)?;
+        let src_g = self.ground_ty(src_t).map_err(|error| Self::ty_err(e, error))?;
+        let dst_g = self.ground_ty(dst_t).map_err(|error| Self::ty_err(e, error))?;
+        if src_g == dst_g {
+            return Ok(());
+        }
+        let PNode::Record(src_schema, src_list) = self.ground_node(src_g).map_err(|error| Self::ty_err(e, error))? else {
+            return Err(malformed("a record projection from other than a structural record"));
+        };
+        let PNode::Record(dst_schema, dst_list) = self.ground_node(dst_g).map_err(|error| Self::ty_err(e, error))? else {
+            return Err(malformed("a record projection to other than a structural record"));
+        };
+        let mut src_names: blaze_own::Vec<Name, A> = blaze_own::Vec::new_in(self.alloc);
+        let mut dst_names: blaze_own::Vec<Name, A> = blaze_own::Vec::new_in(self.alloc);
+        let mut src_fields: blaze_own::Vec<PTy, A> = blaze_own::Vec::new_in(self.alloc);
+        let mut dst_fields: blaze_own::Vec<PTy, A> = blaze_own::Vec::new_in(self.alloc);
+        {
+            let gv = self.ground.view();
+            let cv = self.checked.types.view();
+            let s_ns = gv
+                .record_names(src_schema)
+                .or_else(|| cv.record_names(src_schema))
+                .ok_or(malformed("a projected source record missing schema names"))?;
+            let d_ns = gv
+                .record_names(dst_schema)
+                .or_else(|| cv.record_names(dst_schema))
+                .ok_or(malformed("a projected target record missing schema names"))?;
+            src_names.extend_from_slice(s_ns);
+            dst_names.extend_from_slice(d_ns);
+            src_fields.extend_from_slice(gv.list(src_list).map_err(|_| malformed("a source record's fields past the ground table"))?);
+            dst_fields.extend_from_slice(gv.list(dst_list).map_err(|_| malformed("a target record's fields past the ground table"))?);
+        }
+        let v = self.pop()?;
+        let src_repr = self.repr(src_g).map_err(|error| Self::ty_err(e, error))?;
+        let dst_repr = self.repr(dst_g).map_err(|error| Self::ty_err(e, error))?;
+        if !self.live {
+            match dst_repr {
+                Repr::None => self.push_val(V::None, None),
+                Repr::Agg(_) => {
+                    let dst_at = self.temp(dst_repr);
+                    self.push_val(V::Place(dst_at.0, dst_at.1), None);
+                }
+                _ => return Err(malformed("a structural record not held as an aggregate")),
+            }
+            return Ok(());
+        }
+        let src_at = match src_repr {
+            Repr::None => None,
+            Repr::Agg(src_l) => Some((src_l, self.place(v, src_repr)?)),
+            _ => return Err(malformed("a structural record not held as an aggregate")),
+        };
+        let out_val = match dst_repr {
+            Repr::None => V::None,
+            Repr::Agg(dst_l) => {
+                let dst_at = self.temp(dst_repr);
+                let Some((src_l, sat)) = src_at else {
+                    return Err(malformed("a non-ZST record projected from a ZST record"));
+                };
+                for (di, &nm) in dst_names.iter().enumerate() {
+                    let si = src_names
+                        .iter()
+                        .position(|&sn| sn == nm)
+                        .ok_or(malformed("a projected record missing a target field in source"))?;
+                    let ft = *dst_fields.get(di).ok_or(malformed("a target record field past its list"))?;
+                    let frepr = self.repr(ft).map_err(|error| Self::ty_err(e, error))?;
+                    if frepr == Repr::None {
+                        continue;
+                    }
+                    let soff = self.field_offset(src_l, si)?;
+                    let doff = self.field_offset(dst_l, di)?;
+                    let soff_i32 = i32::try_from(soff).map_err(|_| malformed("a record field offset past `i32`"))?;
+                    let doff_i32 = i32::try_from(doff).map_err(|_| malformed("a record field offset past `i32`"))?;
+                    let fv = self.load(frepr, (sat.0, sat.1 + soff_i32));
+                    self.store(fv, frepr, (dst_at.0, dst_at.1 + doff_i32))?;
+                }
+                V::Place(dst_at.0, dst_at.1)
+            }
+            _ => return Err(malformed("a structural record not held as an aggregate")),
+        };
+        for (si, &sn) in src_names.iter().enumerate() {
+            if dst_names.iter().any(|&dn| dn == sn) {
+                continue;
+            }
+            let ft = *src_fields.get(si).ok_or(malformed("a source record field past its list"))?;
+            if !self.needs_drop(ft).map_err(|error| Self::ty_err(e, error))? {
+                continue;
+            }
+            let at = match src_at {
+                Some((src_l, sat)) => {
+                    let soff = self.field_offset(src_l, si)?;
+                    let soff_i32 = i32::try_from(soff).map_err(|_| malformed("a record field offset past `i32`"))?;
+                    (sat.0, sat.1 + soff_i32)
+                }
+                None => {
+                    let slot = self.b.slot(0, 1, SlotKind::Temp);
+                    (self.b.slot_addr(slot), 0)
+                }
+            };
+            self.drop_at(ft, at)?;
+        }
+        let owns = self.repr_needs_drop(dst_repr).then_some(dst_g);
+        self.push_val(out_val, owns);
         Ok(())
     }
 
@@ -4942,15 +5052,18 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         let Repr::Agg(l) = self.expr_repr(e)? else {
             return Err(malformed("a struct expression's defaults of a value held as other than an aggregate"));
         };
-        let variant = Self::def_variant(self.expr_def(e)).ok_or(malformed("a struct literal the check did not resolve to a struct or variant"))?;
-        let (first, len, _) = self.variant_rows(l, variant)?;
         let t = self.expr_ty(e)?;
         let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
-        let PNode::Adt(_, list) = self.ground_node(g).map_err(|error| Self::ty_err(e, error))? else {
-            return Err(malformed("a struct expression with defaults of a type that is not an ADT"));
-        };
         let mut args: Vec<PTy, A> = Vec::new_in(self.alloc);
-        args.extend_from_slice(self.ground.view().list(list).map_err(|_| malformed("an ADT's arguments past the ground table"))?);
+        let variant = match self.ground_node(g).map_err(|error| Self::ty_err(e, error))? {
+            PNode::Adt(_, list) => {
+                args.extend_from_slice(self.ground.view().list(list).map_err(|_| malformed("an ADT's arguments past the ground table"))?);
+                Self::def_variant(self.expr_def(e)).ok_or(malformed("a struct literal the check did not resolve to a struct or variant"))?
+            }
+            PNode::Record(..) => 0,
+            _ => return Err(malformed("a struct expression with defaults of a type that is not an ADT or record")),
+        };
+        let (first, len, _) = self.variant_rows(l, variant)?;
         let checked: &'x Checked<'c> = self.checked;
         let adts = self.adts;
         let (idx, keys) = checked.default_fields_of(e);
@@ -5551,7 +5664,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             // constant pulled before the walk by front2 const_at.rs `needs_of`).
             Expr::Struct { fields, base: base @ (blaze_typeck::StructBase::None | blaze_typeck::StructBase::Defaults), .. }
             | Expr::Record { fields, base: base @ (blaze_typeck::StructBase::None | blaze_typeck::StructBase::Defaults) } => {
-                let defaults = base == blaze_typeck::StructBase::Defaults;
+                let defaults = base == blaze_typeck::StructBase::Defaults
+                    || !self.checked.default_fields_of(e).0.is_empty();
                 let is_record = matches!(self.expr(e)?, Expr::Record { .. });
                 let repr = self.expr_repr(e)?;
                 let inits = self.body.field_inits.get(fields.range()).ok_or(malformed("a struct literal's fields past `field_inits`"))?;
@@ -5993,7 +6107,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             return Ok(None);
         };
         let adts = self.adts;
-        let shape = crate::vtable::Shape::of(principal, |t| adts.object_trait(t), self.alloc)
+        let shape = crate::vtable::Shape::of(principal, |t| adts.object_trait(t), self.scratch)
             .map_err(|error| BuildError::Vtable { at: Some(e), error })?;
         if let Some(slot) = shape.slot(instance.item) {
             return Ok(Some((principal, slot)));
@@ -6006,7 +6120,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         // or `self` by value, which `unsized_fn_params` can call on `Box<dyn FnOnce>`): refused
         // by name. A method of another trait (`impl Other for dyn Tr`) is an ordinary call.
         let traits = shape.prefix.iter().copied().chain(shape.words.iter().filter_map(|w| match *w {
-            crate::vtable::Word::Super(s) => Some(s),
+            crate::vtable::Word::Super { trait_, .. } => Some(trait_),
             crate::vtable::Word::Method { .. } => None,
         }));
         for t in traits {

@@ -435,7 +435,7 @@ impl ReadList {
 
 /// What digesting an answer stopped at.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Stop {
+pub(crate) enum Stop {
     TooLarge,
     Malformed,
     /// The answer reads the record of this item, which is not made yet ([`ReadsError::Unmade`]).
@@ -503,7 +503,7 @@ fn kids(stack: &mut Vec<PTy, Global>, types: PTys<'_>, list: List) -> Result<u32
 /// Type `t` of `types` into `h` by its structure, pre-order: each node's tag, its scalars and
 /// its lists' lengths, then its children. No handle of the table is written, so one type in
 /// two tables (or two runs) digests the same; at most [`TERM_NODES`] nodes.
-fn term(h: &mut Hasher, t: PTy, types: PTys<'_>) -> Result<(), Stop> {
+pub(crate) fn term(h: &mut Hasher, t: PTy, types: PTys<'_>) -> Result<(), Stop> {
     let mut stack: Vec<PTy, Global> = Vec::new_in(Global);
     stack.push(t);
     let mut seen = 0usize;

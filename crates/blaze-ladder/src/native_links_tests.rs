@@ -124,3 +124,30 @@ fn a_program_with_no_c_input_gets_a_system_only_image() {
     let hex: std::string::String = key.0[..8].iter().map(|b| std::format!("{b:02x}")).collect();
     println!("native_links: a program with no C input: {} inputs, {} bytes, key {hex}", summary.inputs, bytes.len());
 }
+
+/// On Linux ARM64, a program with no C input produces a real ELF shared object (via
+/// `blaze_export::native_so::write`) whose BNL2 descriptor reads back cleanly with 0 words,
+/// inits, and pointer rows, instead of failing with `Write(NotMac)`.
+#[test]
+fn linux_arm64_no_c_input_writes_elf_so() {
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let bump = erased.bump();
+    let alloc = bump.alloc();
+    let producers = Producers::for_tests(b"native_links_linux");
+    let producer = producers.get::<Whole>();
+    let table = table_of("pub fn main() { let _ = 1 + 1; }\n", bump);
+    let links = links_of(&table, alloc);
+    let crates = [ProgramCrate { package: "app", outputs: None, links: &links }];
+    let asked = program_libraries(&crates, Platform::LinuxArm64, &producer, alloc).unwrap_or_else(|e| panic!("linux libraries: {e:?}"));
+    let [one] = asked.as_slice() else { panic!("a program with no C input asks for c alone: {asked:?}") };
+    assert!(matches!(one.source, Source::Linked(_)), "Linux resolves c directly without SDK stubs");
+    let mut bytes = AVec::new_in(alloc);
+    let summary = program_image(&crates, &[], Platform::LinuxArm64, &producer, FixedState, &mut bytes, bump)
+        .unwrap_or_else(|e| panic!("linux arm64 image refused: {e:?}"));
+    assert_eq!(summary.inputs, 0);
+    assert!(bytes.starts_with(b"\x7fELF"), "expected ELF header");
+    let (desc, names) = blaze_native::descriptor::read(&bytes, Platform::LinuxArm64)
+        .unwrap_or_else(|e| panic!("linux BNL2 descriptor unread: {e:?}"));
+    assert_eq!((desc.words, desc.inits, desc.pointers, names.len()), (0, 0, 0, 0));
+}

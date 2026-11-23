@@ -92,7 +92,7 @@ impl fmt::Display for TypeDescError<'_> {
             TypeDescError::InvalidNode(id) => write!(f, "invalid TypeDesc node id {}", id.0),
             TypeDescError::NodeLimitExceeded => write!(f, "TypeDesc evaluation exceeded node limit"),
             TypeDescError::FieldNotFound { field } => {
-                write!(f, "TypeDesc `FieldByName`: field `{field}` not found on base type")
+                write!(f, "TypeDesc `FieldByName`: field '{field}' not found on base type")
             }
             TypeDescError::BareUnsized(id) => {
                 write!(f, "unsized `str` or `[T]` at TypeDesc node {} must appear under `&` or `&uniq`", id.0)

@@ -19,8 +19,8 @@ use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_own::{Alloc, Vec};
 use blaze_typeck::{
-    AdjustKind, AdtKind, BinOp, Def, Expr, ExprId, FloatTy, ItemKey, Lit, List, Mutbl, PNode, PTy, Pat, PatId, Range,
-    Stmt, StmtId, UnOp,
+    AdjustKind, AdtKind, BinOp, Def, Expr, ExprId, FloatTy, ItemKey, Lit, List, Mutbl, Name, PNode, PTy, Pat, PatId,
+    Range, RecordSchema, Stmt, StmtId, UnOp, UnionPat,
 };
 
 use super::late::Late;
@@ -371,6 +371,11 @@ impl EnumFacts {
     /// The variant whose tag reads `bits`.
     pub(super) fn variant(&self, bits: u128, discrs: &[i128]) -> Result<u32, Refusal<'static>> {
         self.tag.variant(bits, self.discrs(discrs)?)
+    }
+
+    /// The variant when the tag slot holds a non-null pointer with provenance.
+    pub(super) fn ptr_variant(&self) -> Option<u32> {
+        self.tag.ptr_variant()
     }
 
     /// Variant `v`'s discriminant.
@@ -805,7 +810,9 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                     continue;
                 }
             };
-            if let Pat::Bind { ann: blaze_typeck::BindAnn { by_ref: None, .. }, sub: None, .. } = body.pats[pat.ix()] {
+            if let Pat::Bind { ann: blaze_typeck::BindAnn { by_ref: None, .. }, sub: None, .. } = body.pats[pat.ix()]
+                && self.union_pat_c(cc, pat).is_none()
+            {
                 if self.reg_home(cc, pat, t)? {
                     cc.homes[pat.ix()] = Home::Reg(i);
                     cc.kinds[i as usize] = Kind::Local(pat);
@@ -1122,6 +1129,171 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
     fn pat_def_c(&self, cc: &Cc<'w, '_>, p: PatId) -> Option<Def> {
         let t = &cc.typed;
         rows(t.pat_defs.0, p).next().map(|i| t.pat_defs.1[i])
+    }
+
+    fn union_pat_c(&self, cc: &Cc<'w, '_>, p: PatId) -> Option<UnionPat> {
+        let t = &cc.typed;
+        let i = t.union_pats.0.binary_search(&p).ok()?;
+        t.union_pats.1.get(i).copied()
+    }
+
+    fn record_names_c(&self, cc: &Cc<'w, '_>, schema: RecordSchema) -> R<'a, Vec<Name, Alloc<'a>>> {
+        let names = self
+            .ground
+            .view()
+            .record_names(schema)
+            .or_else(|| cc.typed.types.record_names(schema))
+            .ok_or(malformed("a structural record schema missing its field names"))?;
+        let mut out: Vec<Name, Alloc<'a>> = Vec::with_capacity_in(names.len(), self.alloc);
+        out.extend_from_slice(names);
+        Ok(out)
+    }
+
+    fn record_field_index_c(&self, cc: &Cc<'w, '_>, schema: RecordSchema, name: Name) -> R<'a, u32> {
+        self.ground
+            .view()
+            .record_field_index(schema, name)
+            .or_else(|| cc.typed.types.record_field_index(schema, name))
+            .ok_or(malformed("a structural record field name its schema lacks"))
+    }
+
+    /// Binds pattern `p` (of binding type `lt`, by reference when `by_ref`) from place `pl`.
+    fn bind_at<A: Allocator + Clone>(&mut self, cc: &mut Cc<'w, '_>, code: &mut Code<A>, p: PatId, pl: Reg, lt: PTy, by_ref: bool) -> R<'a, ()> {
+        match self.home(cc, &mut code.slots, p)? {
+            Home::Reg(r) => {
+                if by_ref {
+                    self.emit(code, cc, Op::Borrow { dst: r, src: pl, meta: Meta::Keep });
+                } else {
+                    let ty = self.ty(code, lt)?;
+                    self.emit(code, cc, Op::Load { dst: r, src: pl, ty });
+                }
+            }
+            Home::Slot(_) => {
+                let local = self.local_place(cc, code, p)?;
+                if by_ref {
+                    let b = self.reg(cc, Kind::V);
+                    self.emit(code, cc, Op::Borrow { dst: b, src: pl, meta: Meta::Keep });
+                    let ty = self.ty(code, lt)?;
+                    self.emit(code, cc, Op::Store { place: local, src: b, ty });
+                } else {
+                    let (size, _) = self.size_align(lt)?;
+                    self.emit_copy(code, cc, local, pl, size);
+                }
+            }
+            Home::None => return Err(malformed("a binding with no home")),
+        }
+        Ok(())
+    }
+
+    /// Remaps a structural union at place `src_pl` (of ground type `src_ty`) into a value of
+    /// ground union type `dst_ty`, copying whichever member appears in both. When `on_miss` is
+    /// `Some(fail)`, a source variant absent from `dst_ty` jumps to fixup list `fail`
+    /// (`UnionPat::Residual`); when `None`, it stops with `Refusal::Unreachable`
+    /// (`AdjustKind::UnionWiden`).
+    fn remap_union<A: Allocator + Clone>(
+        &mut self,
+        cc: &mut Cc<'w, '_>,
+        code: &mut Code<A>,
+        src_pl: Reg,
+        src_ty: PTy,
+        dst_ty: PTy,
+        on_miss: Option<u32>,
+    ) -> R<'a, Reg> {
+        if src_ty == dst_ty {
+            return self.as_value(cc, code, src_pl, src_ty);
+        }
+        let PNode::Union(src_l) = self.node(src_ty)? else {
+            return Err(malformed("a union remap from a type that is not a structural union"));
+        };
+        let PNode::Union(dst_l) = self.node(dst_ty)? else {
+            return Err(malformed("a union remap to a type that is not a structural union"));
+        };
+        let mut src_members: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
+        src_members.extend_from_slice(self.ground.view().list(src_l).map_err(|_| malformed("a source union's members past the ground table"))?);
+        let mut dst_members: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
+        dst_members.extend_from_slice(self.ground.view().list(dst_l).map_err(|_| malformed("a target union's members past the ground table"))?);
+        if let [only] = src_members.as_slice() {
+            let Some(j_idx) = dst_members.iter().position(|dm| dm == only) else {
+                let dst = self.reg(cc, Kind::V);
+                match on_miss {
+                    Some(fail) => {
+                        let jmp = self.jump(code, cc);
+                        self.to_list(cc, fail, jmp);
+                    }
+                    None => {
+                        let k = self.keep_late(code, Late::Final(Refusal::Unreachable));
+                        self.emit(code, cc, Op::Late { k });
+                    }
+                }
+                return Ok(dst);
+            };
+            let j = u32::try_from(j_idx).map_err(|_| malformed("a union variant index past `u32`"))?;
+            let soff = self.field_offset(src_ty, 0, 0)?;
+            let fpl = self.reg(cc, Kind::P);
+            self.emit_field(code, cc, fpl, src_pl, soff, false);
+            return self.build(cc, code, dst_ty, j, &[(0, fpl, *only)], false);
+        }
+        let src_e = self.enum_facts(code, src_ty)?;
+        let facts = *code
+            .enums
+            .get(usize::try_from(src_e).map_err(|_| malformed("an enum index past `usize`"))?)
+            .ok_or(malformed("an enum past its code"))?;
+        if facts.tag_at().is_none() {
+            let index = facts.variant(0, &code.discrs)?;
+            let idx_usize = usize::try_from(index).map_err(|_| malformed("a union variant index past `usize`"))?;
+            let found = src_members
+                .get(idx_usize)
+                .copied()
+                .and_then(|sm| dst_members.iter().position(|&dm| dm == sm).map(|j| (sm, j)));
+            let Some((sm, j_idx)) = found else {
+                let dst = self.reg(cc, Kind::V);
+                match on_miss {
+                    Some(fail) => {
+                        let jmp = self.jump(code, cc);
+                        self.to_list(cc, fail, jmp);
+                    }
+                    None => {
+                        let k = self.keep_late(code, Late::Final(Refusal::Unreachable));
+                        self.emit(code, cc, Op::Late { k });
+                    }
+                }
+                return Ok(dst);
+            };
+            let j = u32::try_from(j_idx).map_err(|_| malformed("a union variant index past `u32`"))?;
+            let soff = self.field_offset(src_ty, index, 0)?;
+            let fpl = self.reg(cc, Kind::P);
+            self.emit_field(code, cc, fpl, src_pl, soff, false);
+            return self.build(cc, code, dst_ty, j, &[(0, fpl, sm)], false);
+        }
+        let dst = self.reg(cc, Kind::V);
+        let done = self.list(cc);
+        for (i_idx, &sm) in src_members.iter().enumerate() {
+            let Some(j_idx) = dst_members.iter().position(|&dm| dm == sm) else { continue };
+            let i = u32::try_from(i_idx).map_err(|_| malformed("a union variant index past `u32`"))?;
+            let j = u32::try_from(j_idx).map_err(|_| malformed("a union variant index past `u32`"))?;
+            let next_arm = self.list(cc);
+            self.if_variant(cc, code, src_pl, src_ty, i, next_arm)?;
+            let soff = self.field_offset(src_ty, i, 0)?;
+            let fpl = self.reg(cc, Kind::P);
+            self.emit_field(code, cc, fpl, src_pl, soff, false);
+            let built = self.build(cc, code, dst_ty, j, &[(0, fpl, sm)], false)?;
+            self.emit(code, cc, Op::Move { dst, src: built });
+            let jmp = self.jump(code, cc);
+            self.to_list(cc, done, jmp);
+            self.patch(code, cc, next_arm);
+        }
+        match on_miss {
+            Some(fail) => {
+                let jmp = self.jump(code, cc);
+                self.to_list(cc, fail, jmp);
+            }
+            None => {
+                let k = self.keep_late(code, Late::Final(Refusal::Unreachable));
+                self.emit(code, cc, Op::Late { k });
+            }
+        }
+        self.patch(code, cc, done);
+        Ok(dst)
     }
 
     /// The type facts of `t`, kept in the code's table.
@@ -1526,7 +1698,11 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 cc.rs.push(dst);
             }
             C::Struct(e) => {
-                let Expr::Struct { fields, base, .. } = self.expr_c(cc, e)? else { return Err(malformed("a struct task")) };
+                let (fields, base, is_record) = match self.expr_c(cc, e)? {
+                    Expr::Struct { fields, base, .. } => (fields, base, false),
+                    Expr::Record { fields, base } => (fields, base, true),
+                    _ => return Err(malformed("a struct task")),
+                };
                 let t = self.ety_c(cc, e)?;
                 let base_r = match base {
                     blaze_typeck::StructBase::Expr(_) => Some(self.pop_r(cc)?),
@@ -1536,39 +1712,59 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 };
                 let inits = body.field_inits.get(fields.range()).ok_or(malformed("field inits past their column"))?;
                 let at = cc.rs.len().checked_sub(inits.len()).ok_or(malformed("the value stack ran out"))?;
-                let PNode::Adt(key, _) = self.node(t)? else { return Err(malformed("a struct expression of a type that is not an ADT")) };
-                let adt = self.world.adt(key).ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: key }))?;
-                let variant = match self.expr_def_c(cc, e) {
-                    Some(Def::Ctor { variant, .. }) => variant,
-                    _ => 0,
-                };
-                let v = adt.variants.get(variant as usize).ok_or(malformed("a variant past its ADT"))?;
-                let names = adt.fields.get(v.fields.range()).ok_or(malformed("fields past their ADT"))?;
-                if adt.kind == AdtKind::Union && inits.len() != 1 {
-                    return Err(malformed("a union expression of other than one field"));
-                }
                 let mut vals: Vec<(u32, Reg, PTy), Alloc<'a>> = Vec::new_in(self.alloc);
-                for (fi, &r) in inits.iter().zip(cc.rs[at..].iter()) {
-                    let idx = names.iter().position(|f| f.name == fi.name).ok_or(malformed("a field name its variant lacks"))?;
-                    vals.push((idx as u32, r, PTy(0)));
-                }
+                let (variant, field_count, default_args) = if is_record {
+                    let PNode::Record(schema, flist) = self.node(t)? else {
+                        return Err(malformed("a record expression of a type that is not a structural record"));
+                    };
+                    let slice = cc.rs.get(at..).ok_or(malformed("the value stack ran out"))?;
+                    for (fi, &r) in inits.iter().zip(slice.iter()) {
+                        let idx = self.record_field_index_c(cc, schema, fi.name)?;
+                        vals.push((idx, r, PTy(0)));
+                    }
+                    let count = usize::try_from(flist.len).map_err(|_| malformed("a record field count past `usize`"))?;
+                    (0u32, count, List::EMPTY)
+                } else {
+                    let PNode::Adt(key, args) = self.node(t)? else {
+                        return Err(malformed("a struct expression of a type that is not an ADT"));
+                    };
+                    let adt = self.world.adt(key).ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: key }))?;
+                    let variant = match self.expr_def_c(cc, e) {
+                        Some(Def::Ctor { variant, .. }) => variant,
+                        _ => 0,
+                    };
+                    let v = adt.variants.get(variant as usize).ok_or(malformed("a variant past its ADT"))?;
+                    let names = adt.fields.get(v.fields.range()).ok_or(malformed("fields past their ADT"))?;
+                    if adt.kind == AdtKind::Union && inits.len() != 1 {
+                        return Err(malformed("a union expression of other than one field"));
+                    }
+                    let slice = cc.rs.get(at..).ok_or(malformed("the value stack ran out"))?;
+                    for (fi, &r) in inits.iter().zip(slice.iter()) {
+                        let idx = names.iter().position(|f| f.name == fi.name).ok_or(malformed("a field name its variant lacks"))?;
+                        let idx = u32::try_from(idx).map_err(|_| malformed("a field index past `u32`"))?;
+                        vals.push((idx, r, PTy(0)));
+                    }
+                    (variant, names.len(), args)
+                };
                 cc.rs.truncate(at);
                 // RFC 3681: each field `S { a: 1, .. }` does not write is its default
                 // (`Typed::default_fields`), a constant of the field's type over the ADT's
-                // generics, read at this expression's type's ground arguments as a constant
-                // path is read (`Op::Const`, the record evaluated first by the work list).
-                if base == blaze_typeck::StructBase::Defaults {
-                    let PNode::Adt(_, args) = self.node(t)? else { return Err(malformed("a struct expression of a type that is not an ADT")) };
+                // generics (or empty args for a structural record), read at this expression's
+                // type's ground arguments as a constant path is read (`Op::Const`).
+                if base_r.is_none() {
                     let typed = cc.typed;
                     for i in rows(typed.default_fields.0, e) {
-                        let (idx, k) = (typed.default_fields.1[i], typed.default_fields.2[i]);
-                        if idx as usize >= names.len() || vals.iter().any(|&(f, _, _)| f == idx) {
+                        let Some(&idx) = typed.default_fields.1.get(i) else { return Err(malformed("a field default past its column")) };
+                        let Some(&k) = typed.default_fields.2.get(i) else { return Err(malformed("a field default past its column")) };
+                        let idx_usize = usize::try_from(idx).map_err(|_| malformed("a field default index past `usize`"))?;
+                        if idx_usize >= field_count || vals.iter().any(|&(f, _, _)| f == idx) {
                             return Err(malformed("a field default past its variant, or of a field the expression writes"));
                         }
-                        let key = RecordKey::of(self.instance(k, args)?);
-                        code.consts.push((k, args, key));
+                        let key = RecordKey::of(self.instance(k, default_args)?);
+                        code.consts.push((k, default_args, key));
                         let dst = self.reg(cc, Kind::P);
-                        self.emit(code, cc, Op::Const { dst, k: code.consts.len() as u32 - 1 });
+                        let ck = u32::try_from(code.consts.len() - 1).map_err(|_| malformed("const table past `u32`"))?;
+                        self.emit(code, cc, Op::Const { dst, k: ck });
                         vals.push((idx, dst, PTy(0)));
                     }
                 }
@@ -1636,7 +1832,8 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                                 cc.tasks.push(C::Let { e, s });
                                 // A plain binding into a register takes the value; any other
                                 // pattern matches the place.
-                                let simple = matches!(body.pats.get(pat.ix()), Some(Pat::Bind { ann: blaze_typeck::BindAnn { by_ref: None, .. }, sub: None, .. }));
+                                let simple = matches!(body.pats.get(pat.ix()), Some(Pat::Bind { ann: blaze_typeck::BindAnn { by_ref: None, .. }, sub: None, .. }))
+                                    && self.union_pat_c(cc, pat).is_none();
                                 let reg = simple && {
                                     let t = self.cg(cc, *typed.pat_ty.get(pat.ix()).ok_or(malformed("a pattern with no type"))?)?;
                                     self.reg_home(cc, pat, t)?
@@ -2070,7 +2267,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 cc.tasks.push(C::Repeat(e));
                 cc.tasks.push(C::Eval(elem, Mode::Value));
             }
-            Expr::Struct { fields, base, .. } => {
+            Expr::Struct { fields, base, .. } | Expr::Record { fields, base } => {
                 cc.tasks.push(C::Struct(e));
                 if let Some(b) = base.expr() {
                     cc.tasks.push(C::Eval(b, Mode::Place));
@@ -2080,7 +2277,6 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                     cc.tasks.push(C::Eval(fi.expr, Mode::Value));
                 }
             }
-            Expr::Record { .. } => return Err(unsupported("a structural record literal in a constant")),
             Expr::Index { base, index } => {
                 cc.tasks.push(C::Index(e));
                 cc.tasks.push(C::Eval(index, Mode::Value));
@@ -2164,6 +2360,11 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                     let n = self.ground.view().list(l).map_err(|_| malformed("a tuple's list past the ground table"))?.len() as u32;
                     (0..n).find(|&i| blaze_typeck::Name::of_index(i) == step.name)
                 }
+                PNode::Record(schema, _) => self
+                    .ground
+                    .view()
+                    .record_field_index(schema, step.name)
+                    .or_else(|| cc.typed.types.record_field_index(schema, step.name)),
                 PNode::Adt(key, _) => {
                     let adt = self.world.adt(key).ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: key }))?;
                     if adt.kind == AdtKind::Enum {
@@ -2286,8 +2487,63 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                     self.emit_unsize(code, cc, dst, src, n);
                     dst
                 }
-                AdjustKind::UnionInject { .. } | AdjustKind::UnionWiden => {
-                    return Err(unsupported("a structural union coercion in a constant"));
+                AdjustKind::UnionInject { variant } => {
+                    let PNode::Union(ul) = self.node(next)? else {
+                        return Err(malformed("a union injection to a type that is not a structural union"));
+                    };
+                    if variant >= ul.len {
+                        return Err(malformed("a union injection variant past its union"));
+                    }
+                    self.build(cc, code, next, variant, &[(0, out, ty)], false)?
+                }
+                AdjustKind::UnionWiden => {
+                    if ty == next {
+                        out
+                    } else {
+                        let src_pl = self.as_place(cc, code, out, ty)?;
+                        self.remap_union(cc, code, src_pl, ty, next, None)?
+                    }
+                }
+                AdjustKind::RecordProject => {
+                    if ty == next {
+                        out
+                    } else {
+                        let PNode::Record(src_schema, _) = self.node(ty)? else {
+                            return Err(malformed("a record projection from a type that is not a structural record"));
+                        };
+                        let PNode::Record(dst_schema, _) = self.node(next)? else {
+                            return Err(malformed("a record projection to a type that is not a structural record"));
+                        };
+                        let dst_ty = self.ty(code, next)?;
+                        let dst_is_zst = code
+                            .tys
+                            .get(usize::try_from(dst_ty).map_err(|_| malformed("a type index past `usize`"))?)
+                            .is_some_and(|info| info.repr == Repr::Zst);
+                        if dst_is_zst {
+                            let dst = self.reg(cc, Kind::V);
+                            self.emit(code, cc, Op::ImmZst { dst });
+                            dst
+                        } else {
+                            let src_pl = self.as_place(cc, code, out, ty)?;
+                            let src_names = self.record_names_c(cc, src_schema)?;
+                            let dst_names = self.record_names_c(cc, dst_schema)?;
+                            let mut parts: Vec<(u32, Reg, PTy), Alloc<'a>> = Vec::with_capacity_in(dst_names.len(), self.alloc);
+                            for (di_idx, &nm) in dst_names.iter().enumerate() {
+                                let si_idx = src_names
+                                    .iter()
+                                    .position(|&sn| sn == nm)
+                                    .ok_or(malformed("a projected record missing a target field in source"))?;
+                                let di = u32::try_from(di_idx).map_err(|_| malformed("a record field index past `u32`"))?;
+                                let si = u32::try_from(si_idx).map_err(|_| malformed("a record field index past `u32`"))?;
+                                let ft = self.field_ty(ty, 0, si)?;
+                                let soff = self.field_offset(ty, 0, si)?;
+                                let fpl = self.reg(cc, Kind::P);
+                                self.emit_field(code, cc, fpl, src_pl, soff, false);
+                                parts.push((di, fpl, ft));
+                            }
+                            self.build(cc, code, next, 0, &parts, false)?
+                        }
+                    }
                 }
             };
             ty = next;
@@ -2464,7 +2720,8 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             // through it.
             if let PNode::Ref(_, inner) = node {
                 let through = match pat {
-                    Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Slice { .. } | Pat::Range { .. } => true,
+                    Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Record { .. } | Pat::Slice { .. } | Pat::Range { .. } => true,
+                    Pat::Bind { .. } => self.union_pat_c(cc, p).is_some(),
                     Pat::Lit(l) | Pat::NegLit(l) => !matches!(l, Lit::Str | Lit::ByteStr(_) | Lit::CStr),
                     Pat::Path(_) => matches!(self.pat_def_c(cc, p), Some(Def::Ctor { .. })),
                     _ => false,
@@ -2482,32 +2739,47 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 Pat::Wild => {}
                 Pat::Bind { ann, sub, .. } => {
                     let lt = self.cg(cc, *typed.local_ty.get(p.ix()).ok_or(malformed("a binding with no type"))?)?;
-                    let by_ref = ann.by_ref.is_some() || (lt != t && matches!(self.node(lt)?, PNode::Ref(_, i) if i == t));
-                    match self.home(cc, &mut code.slots, p)? {
-                        Home::Reg(r) => {
-                            if by_ref {
-                                self.emit(code, cc, Op::Borrow { dst: r, src: pl, meta: Meta::Keep });
-                            } else {
-                                let ty = self.ty(code, lt)?;
-                                self.emit(code, cc, Op::Load { dst: r, src: pl, ty });
+                    match self.union_pat_c(cc, p) {
+                        None => {
+                            let by_ref = ann.by_ref.is_some() || (lt != t && matches!(self.node(lt)?, PNode::Ref(_, i) if i == t));
+                            self.bind_at(cc, code, p, pl, lt, by_ref)?;
+                            if let Some(s) = sub {
+                                work.push(P::Pat { p: s, place: pl, ty: t, fail });
                             }
                         }
-                        Home::Slot(_) => {
-                            let local = self.local_place(cc, code, p)?;
-                            if by_ref {
-                                let b = self.reg(cc, Kind::V);
-                                self.emit(code, cc, Op::Borrow { dst: b, src: pl, meta: Meta::Keep });
-                                let ty = self.ty(code, lt)?;
-                                self.emit(code, cc, Op::Store { place: local, src: b, ty });
-                            } else {
-                                let (size, _) = self.size_align(lt)?;
-                                self.emit_copy(code, cc, local, pl, size);
+                        Some(UnionPat::Variant(v)) => {
+                            let PNode::Union(ul) = node else {
+                                return Err(malformed("a union variant pattern over a type that is not a structural union"));
+                            };
+                            if v >= ul.len {
+                                return Err(malformed("a union variant pattern past its union"));
+                            }
+                            if ul.len > 1 {
+                                self.if_variant(cc, code, pl, t, v, fail)?;
+                            }
+                            let ft = self.field_ty(t, v, 0)?;
+                            let off = self.field_offset(t, v, 0)?;
+                            let fpl = self.reg(cc, Kind::P);
+                            self.emit_field(code, cc, fpl, pl, off, false);
+                            let by_ref = ann.by_ref.is_some() || (lt != ft && matches!(self.node(lt)?, PNode::Ref(_, i) if i == ft));
+                            self.bind_at(cc, code, p, fpl, lt, by_ref)?;
+                            if let Some(s) = sub {
+                                work.push(P::Pat { p: s, place: fpl, ty: ft, fail });
                             }
                         }
-                        Home::None => return Err(malformed("a binding with no home")),
-                    }
-                    if let Some(s) = sub {
-                        work.push(P::Pat { p: s, place: pl, ty: t, fail });
+                        Some(UnionPat::Residual) => {
+                            let (by_ref, dst_ty) = match self.node(lt)? {
+                                PNode::Ref(_, inner) if matches!(self.node(inner)?, PNode::Union(_)) => (true, inner),
+                                PNode::Union(_) => (ann.by_ref.is_some(), lt),
+                                _ => return Err(malformed("a union residual binding whose type is not a structural union")),
+                            };
+                            let narrowed = self.remap_union(cc, code, pl, t, dst_ty, Some(fail))?;
+                            let npl = self.as_place(cc, code, narrowed, dst_ty)?;
+                            self.bind_at(cc, code, p, npl, lt, by_ref)?;
+                            if let Some(s) = sub {
+                                work.push(P::Pat { p: s, place: npl, ty: dst_ty, fail });
+                            }
+                        }
                     }
                 }
                 Pat::Ref { inner, .. } => {
@@ -2585,7 +2857,21 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                         work.push(P::Pat { p: fp.pat, place: fpl, ty: ft, fail });
                     }
                 }
-                Pat::Record { .. } => return Err(unsupported("a structural record pattern in a constant")),
+                Pat::Record { fields, .. } => {
+                    let PNode::Record(schema, _) = node else {
+                        return Err(malformed("a record pattern of a type that is not a structural record"));
+                    };
+                    let fps = body.field_pats.get(fields.range()).ok_or(malformed("field patterns past their column"))?;
+                    for fp in fps.iter().rev() {
+                        let idx = self.record_field_index_c(cc, schema, fp.name)?;
+                        let ft = self.field_ty(t, 0, idx)?;
+                        let off = self.field_offset(t, 0, idx)?;
+                        let tail = layout::is_unsized(self.world, self.ground, ft, self.alloc)?;
+                        let fpl = self.reg(cc, Kind::P);
+                        self.emit_field(code, cc, fpl, pl, off, tail);
+                        work.push(P::Pat { p: fp.pat, place: fpl, ty: ft, fail });
+                    }
+                }
                 // The Reference, "Slice patterns": the elements before a `..` at their index,
                 // those after it counted from the end, and the `..` itself (a wildcard, or the
                 // pattern a `rest @ ..` binding is over) the part between, of the checker's type
@@ -2735,6 +3021,12 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                     0
                 }
             }
+            PNode::Union(l) => {
+                for v in 0..l.len {
+                    code.discrs.push(i128::from(v));
+                }
+                l.len
+            }
             _ => 0,
         };
         code.enums.push(EnumFacts { ty: t, tag, at, n });
@@ -2820,7 +3112,9 @@ fn shape<'a>(task: C, typed: &Typed<'_>) -> R<'a, (u32, bool)> {
             _ => (0, true),
         },
         C::Struct(e) => match expr(e)? {
-            Expr::Struct { fields, base, .. } => (fields.len + u32::from(base.expr().is_some()), true),
+            Expr::Struct { fields, base, .. } | Expr::Record { fields, base } => {
+                (fields.len + u32::from(base.expr().is_some()), true)
+            }
             _ => (0, true),
         },
         C::Call(e) => match expr(e)? {

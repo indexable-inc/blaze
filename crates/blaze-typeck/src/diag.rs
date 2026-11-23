@@ -179,6 +179,15 @@ pub enum DiagCode {
     UnionPatternFields,
     /// E0271: an associated type resolves to a different type than a required equality.
     ProjectionMismatch,
+    /// E0004: non-exhaustive patterns in a structural union `match`; `expected` names the first
+    /// uncovered member type.
+    NonExhaustiveMatch,
+    /// Redundant / unreachable arm in a structural union `match` whose variant was already
+    /// covered by an earlier unguarded arm; `found` names the already-covered member type.
+    RedundantPattern,
+    /// E0391: recursive cycle while inferring a return-type `_` placeholder (e.g. `Result<T, _>`
+    /// or `-> _`); add an explicit return/error type to break the cycle.
+    InferredErrorSetCycle,
 }
 
 impl DiagCode {
@@ -187,7 +196,7 @@ impl DiagCode {
     /// other finding points at the expression or pattern it is about; one that does not is
     /// [`crate::error::CheckError::DiagWithoutPlace`].
     pub const fn covers_the_item(self) -> bool {
-        matches!(self, DiagCode::MissingLangItem | DiagCode::DynIncompatible)
+        matches!(self, DiagCode::MissingLangItem | DiagCode::DynIncompatible | DiagCode::InferredErrorSetCycle)
     }
 
     /// rustc's error code, for printing.
@@ -203,6 +212,9 @@ impl DiagCode {
             DiagCode::AnnotationsNeeded => "E0282",
             DiagCode::CannotSatisfy => "E0283",
             DiagCode::ProjectionMismatch => "E0271",
+            DiagCode::NonExhaustiveMatch => "E0004",
+            DiagCode::RedundantPattern => "E0000",
+            DiagCode::InferredErrorSetCycle => "E0391",
             DiagCode::Unsatisfied => "E0277",
             DiagCode::UnresolvedPath => "E0425",
             DiagCode::UnresolvedType => "E0412",

@@ -108,6 +108,20 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     let cause = self.sig_place(k, n_inputs);
                     inputs.push(self.lower_sig_ty(sig.types, t, cause)?);
                 }
+                let has_output_infer = Self::ptys_has_infer(sig.types, sig.output, self.alloc)?;
+                let is_result_err_infer = match sig.types.node(sig.output)? {
+                    crate::PNode::Adt(k, args) => {
+                        let list = sig.types.list(args)?;
+                        list.len() == 2
+                            && matches!(sig.types.node(list[1])?, crate::PNode::Infer)
+                            && self.is_result_adt(k)?
+                    }
+                    crate::PNode::Union(args) => {
+                        let list = sig.types.list(args)?;
+                        list.len() == 2 && matches!(sig.types.node(list[1])?, crate::PNode::Infer)
+                    }
+                    _ => false,
+                };
                 let out_cause = self.sig_place(n_inputs, n_inputs);
                 // Each opaque the output names is this body's to define (rules/opaque_def.rs).
                 // An async fn whose root is its `async move` block (the Reference, "Async
@@ -126,6 +140,22 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 } else {
                     self.lower_sig_ty(sig.types, sig.output, out_cause)?
                 };
+                if has_output_infer {
+                    self.inferred_output_ty = Some(output);
+                }
+                if is_result_err_infer {
+                    let err_ty = match self.view(output) {
+                        TyView::Adt(_, args) | TyView::Union(args) if self.ty.list_len(args) == 2 => {
+                            Some(self.ty.list_get(args, 1))
+                        }
+                        _ => None,
+                    };
+                    if let Some(ev) = err_ty
+                        && self.is_ty_var(ev)
+                    {
+                        self.inferred_err_var = Some(ev);
+                    }
+                }
                 self.sig_rows = false;
                 (inputs, output, sig.header.abi == crate::ids::Abi::RustCall)
             }
@@ -185,6 +215,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
 
     /// `check_fn`'s end: the return site's type must be the declared output, `!` excepted.
     pub(crate) fn finish_body(&mut self, output: Ty) -> Result<(), Stop> {
+        self.resolve_inferred_err()?;
         self.async_sites.pop();
         let Some(site) = self.ret_sites.pop() else { return Ok(()) };
         let actual = self.coerce_many_complete(site);
@@ -192,6 +223,139 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             // The body's value against the declared output: reported at the body's block.
             let root = self.body.root;
             self.demand_eq(At::Expr(root), output, actual)?;
+        }
+        Ok(())
+    }
+
+    /// Whether any node reachable from `root` in `types` is `PNode::Infer`.
+    fn ptys_has_infer(types: crate::portable::PTys<'_>, root: crate::PTy, alloc: Alloc<'a>) -> Result<bool, Stop> {
+        let mut todo: blaze_own::Vec<u32, Alloc<'a>> = blaze_own::Vec::new_in(alloc);
+        todo.push(root.0);
+        let mut steps = 0u32;
+        while let Some(i) = todo.pop() {
+            steps += 1;
+            if steps > 1 << 16 {
+                return Err(CheckError::Limit(crate::error::Limit::Table).into());
+            }
+            let Some(&n) = types.get(crate::PTy(i)) else {
+                return Err(CheckError::Malformed(Malformed::TypeOrder { node: i, child: i }).into());
+            };
+            if matches!(n, crate::PNode::Infer) {
+                return Ok(true);
+            }
+            crate::portable::node_children(types, n, &mut todo)?;
+        }
+        Ok(false)
+    }
+
+    /// Whether `k` is a `Result`-shaped enum (two variants named `Ok` and `Err`).
+    fn is_result_adt(&mut self, k: crate::ids::ItemKey) -> Result<bool, Stop> {
+        let Some(adt) = self.reads.adt(k)? else { return Ok(false) };
+        if adt.kind != crate::world::AdtKind::Enum || adt.variants.len() != 2 {
+            return Ok(false);
+        }
+        let ok = crate::ids::Name::of("Ok");
+        let err = crate::ids::Name::of("Err");
+        let v0 = adt.variants[0].name;
+        let v1 = adt.variants[1].name;
+        Ok((v0 == ok && v1 == err) || (v0 == err && v1 == ok))
+    }
+
+    /// Finalizes `inferred_err_var` for `Result<T, _>` / `T ! _` functions from all collected
+    /// `Err(...)` coercions and deferred `?` (`FromResidual`) obligations, then replays them so
+    /// union injection/widening adjustments and `From`/`FromResidual` selections are recorded.
+    fn resolve_inferred_err(&mut self) -> Result<(), Stop> {
+        let Some(ev) = self.inferred_err_var.take() else { return Ok(()) };
+        let coercions = core::mem::replace(&mut self.inferred_err_coercions, blaze_own::Vec::new_in(self.alloc));
+        let try_obs = core::mem::replace(&mut self.deferred_try_obs, blaze_own::Vec::new_in(self.alloc));
+        self.select()?;
+        let ev_res = self.ty.shallow_resolve(ev);
+        let final_err_ty = if self.is_ty_var(ev_res) {
+            let mut members: blaze_own::Vec<Ty, Alloc<'a>> = blaze_own::Vec::new_in(self.alloc);
+            for &(_, src_ty) in coercions.iter() {
+                self.collect_inferred_err_members(src_ty, &mut members)?;
+            }
+            for &(_, fargs, _) in try_obs.iter() {
+                if self.ty.list_len(fargs) >= 2 {
+                    let self_ty = self.ty.resolve(self.ty.list_get(fargs, 0))?;
+                    let matches_owner = match self.view(self_ty) {
+                        TyView::Adt(_, a) | TyView::Union(a) if self.ty.list_len(a) == 2 => {
+                            self.ty.shallow_resolve(self.ty.list_get(a, 1)) == ev_res
+                        }
+                        _ => false,
+                    };
+                    if matches_owner {
+                        let res_ty = self.ty.resolve(self.ty.list_get(fargs, 1))?;
+                        match self.view(res_ty) {
+                            TyView::Adt(_, rargs) | TyView::Union(rargs) if self.ty.list_len(rargs) == 2 => {
+                                let e_ty = self.ty.list_get(rargs, 1);
+                                self.collect_inferred_err_members(e_ty, &mut members)?;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let ty = match members.len() {
+                0 => self.common.never,
+                1 => members[0],
+                _ => {
+                    let list = self.mk_list(&members)?;
+                    self.mk(TyView::Union(list))?
+                }
+            };
+            self.unify(ev_res, ty)?;
+            ty
+        } else {
+            ev_res
+        };
+        for (expr_opt, src_ty) in coercions {
+            if !self.coerce(expr_opt, src_ty, final_err_ty, false)? {
+                self.diag(DiagCode::Mismatch, expr_opt.map_or(At::Body, At::Expr), About::types(final_err_ty, src_ty));
+            }
+        }
+        for (item, fargs, cause) in try_obs {
+            self.register_predicates(item, fargs, cause)?;
+        }
+        Ok(())
+    }
+
+    fn collect_inferred_err_members(&mut self, root: Ty, out: &mut blaze_own::Vec<Ty, Alloc<'a>>) -> Result<(), Stop> {
+        let mut stack: blaze_own::Vec<Ty, Alloc<'a>> = blaze_own::Vec::new_in(self.alloc);
+        stack.push(root);
+        let mut steps = 0u32;
+        while let Some(cur) = stack.pop() {
+            steps += 1;
+            if steps > 1024 {
+                return Err(CheckError::Limit(crate::error::Limit::Table).into());
+            }
+            let resolved = self.ty.resolve(cur)?;
+            let resolved = match self.view(resolved) {
+                TyView::Infer(crate::ty::Var { kind: crate::ty::VarKind::Int, .. }) => self.common.i32_,
+                TyView::Infer(crate::ty::Var { kind: crate::ty::VarKind::Float, .. }) => self.common.f64_,
+                _ => resolved,
+            };
+            match self.view(resolved) {
+                TyView::Never | TyView::Error | TyView::Infer(_) | TyView::ConstInfer(_) => {}
+                TyView::Union(list) => {
+                    let n = self.ty.list_len(list);
+                    for i in (0..n).rev() {
+                        stack.push(self.ty.list_get(list, i));
+                    }
+                }
+                _ => {
+                    let mut dup = false;
+                    for &seen in out.iter() {
+                        if seen == resolved || self.probe(|m| m.unify(seen, resolved))? {
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if !dup {
+                        out.push(resolved);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -291,7 +455,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
 
     /// `check_match`. `f.t` is the scrutinee's type, `f.a` the arm, `f.b` the site, `f.c` bit 0
     /// the scrutinee's divergence and bit 1 "every arm so far diverges".
-    pub(crate) fn expr_match(&mut self, mut f: Frame, _e: ExprId, scrutinee: ExprId, arms: List) -> Result<Flow, Stop> {
+    pub(crate) fn expr_match(&mut self, mut f: Frame, e: ExprId, scrutinee: ExprId, arms: List) -> Result<Flow, Stop> {
         let arm_list = self.body.arm_list(arms)?;
         match f.state {
             0 => {
@@ -302,6 +466,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             1 => {
                 f.t = self.ret;
                 if arm_list.is_empty() {
+                    if self.push_match_narrow(f.t)?
+                        && let Some(narrow) = self.match_narrow.pop()
+                        && let Some(&rem_v) = narrow.remaining.first()
+                    {
+                        let uncovered = self.ty.list_get(narrow.orig_members, rem_v);
+                        self.diag(DiagCode::NonExhaustiveMatch, At::Expr(e), About::expected(uncovered));
+                    }
                     return Ok(Flow::Done(self.common.never));
                 }
                 f.c = u32::from(self.diverges) | 2;
@@ -310,27 +481,93 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 if self.push_match_narrow(f.t)? {
                     f.c |= 4;
                 }
-                self.match_pats(f, arm_list)
+                self.match_pats(f, e, arm_list)
             }
             2 => {
                 if f.c & 4 != 0
                     && let Some(prev_idx) = f.a.checked_sub(1)
                     && let Some(prev_arm) = usize::try_from(prev_idx).ok().and_then(|i| arm_list.get(i))
-                    && prev_arm.guard.is_none()
                 {
-                    let matched = self
-                        .union_pats
-                        .iter()
-                        .rev()
-                        .find(|&&(p, _)| p == prev_arm.pat)
-                        .map(|&(_, kind)| kind);
-                    if let Some(UnionPat::Variant(v)) = matched
-                        && let Some(narrow) = self.match_narrow.last_mut()
-                    {
-                        narrow.remaining.retain(|&idx| idx != v);
+                    let unguarded = prev_arm.guard.is_none();
+                    let pat = self.body.pat(prev_arm.pat)?;
+                    match pat {
+                        Pat::Wild | Pat::Bind { ty: None, .. } => {
+                            if unguarded && let Some(narrow) = self.match_narrow.last_mut() {
+                                narrow.remaining.clear();
+                            }
+                        }
+                        Pat::Or { alts } => {
+                            let alt_pats = self.body.pat_list(alts)?;
+                            let mut all_typed = !alt_pats.is_empty();
+                            let mut has_catchall = false;
+                            let mut matched_vs: blaze_own::Vec<u32, Alloc<'a>> =
+                                blaze_own::Vec::with_capacity_in(alt_pats.len(), self.alloc);
+                            for &ap in alt_pats {
+                                let alt_kind = self.body.pat(ap)?;
+                                if matches!(alt_kind, Pat::Wild | Pat::Bind { ty: None, .. }) {
+                                    has_catchall = true;
+                                    all_typed = false;
+                                } else {
+                                    let m = self
+                                        .union_pats
+                                        .iter()
+                                        .rev()
+                                        .find(|&&(p, _)| p == ap)
+                                        .map(|&(_, kind)| kind);
+                                    match m {
+                                        Some(UnionPat::Variant(v)) => matched_vs.push(v),
+                                        _ => all_typed = false,
+                                    }
+                                }
+                            }
+                            if all_typed {
+                                let mut redundant_ty: Option<Ty> = None;
+                                if let Some(narrow) = self.match_narrow.last_mut() {
+                                    let orig_members = narrow.orig_members;
+                                    for &v in matched_vs.iter() {
+                                        let present = narrow.remaining.iter().any(|&idx| idx == v);
+                                        if !present && redundant_ty.is_none() {
+                                            redundant_ty = Some(self.ty.list_get(orig_members, v));
+                                        }
+                                        if unguarded {
+                                            narrow.remaining.retain(|&idx| idx != v);
+                                        }
+                                    }
+                                }
+                                if let Some(ty) = redundant_ty {
+                                    self.diag(DiagCode::RedundantPattern, At::Pat(prev_arm.pat), About::found(ty));
+                                }
+                            } else if has_catchall && unguarded && let Some(narrow) = self.match_narrow.last_mut() {
+                                narrow.remaining.clear();
+                            }
+                        }
+                        Pat::Bind { ty: Some(_), .. } => {
+                            let matched = self
+                                .union_pats
+                                .iter()
+                                .rev()
+                                .find(|&&(p, _)| p == prev_arm.pat)
+                                .map(|&(_, kind)| kind);
+                            if let Some(UnionPat::Variant(v)) = matched {
+                                let mut redundant_ty: Option<Ty> = None;
+                                if let Some(narrow) = self.match_narrow.last_mut() {
+                                    let present = narrow.remaining.iter().any(|&idx| idx == v);
+                                    if !present {
+                                        redundant_ty = Some(self.ty.list_get(narrow.orig_members, v));
+                                    }
+                                    if unguarded {
+                                        narrow.remaining.retain(|&idx| idx != v);
+                                    }
+                                }
+                                if let Some(ty) = redundant_ty {
+                                    self.diag(DiagCode::RedundantPattern, At::Pat(prev_arm.pat), About::found(ty));
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                self.match_pats(f, arm_list)
+                self.match_pats(f, e, arm_list)
             }
             3 => {
                 // The arm's guard is done (or there was none): its body.
@@ -382,7 +619,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     }
 
     /// The patterns of every arm, in order, then the first arm.
-    fn match_pats(&mut self, mut f: Frame, arms: &[crate::body::Arm]) -> Result<Flow, Stop> {
+    fn match_pats(&mut self, mut f: Frame, e: ExprId, arms: &[crate::body::Arm]) -> Result<Flow, Stop> {
         if let Some(arm) = arms.get(f.a as usize) {
             f.a += 1;
             self.resume(f, 2)?;
@@ -422,7 +659,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             return Ok(Flow::Wait);
         }
         if f.c & 4 != 0 {
-            self.match_narrow.pop();
+            if let Some(narrow) = self.match_narrow.pop()
+                && let Some(&rem_v) = narrow.remaining.first()
+            {
+                let uncovered = self.ty.list_get(narrow.orig_members, rem_v);
+                self.diag(DiagCode::NonExhaustiveMatch, At::Expr(e), About::expected(uncovered));
+            }
             f.c &= !4;
         }
         f.expect = self.adjust_for_branches(f.expect);

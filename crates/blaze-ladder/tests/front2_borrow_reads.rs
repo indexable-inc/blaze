@@ -178,13 +178,21 @@ fn borrow_reads_move_the_body_digest() {
     let copy = version(COPY);
     let life = version(LIFE);
 
-    // COPY: only `Token`'s `Copy` answer moved.
+    // COPY: only `Token`'s `Copy` answer moved. Each ADT the borrow check asks is two facts:
+    // detail 0 (`borrow_reads::adt_read`) and detail 7 (`adt_facts::ADT_FACTS_DETAIL`).
     assert_eq!(typeck_rows(&base.moves.rows), typeck_rows(&copy.moves.rows), "the control: the type check's rows of `moves` do not see `impl Copy for Token`");
-    let (a, b) = (of_kind(&base.moves.rows, FactKind::BorrowAdt), of_kind(&copy.moves.rows, FactKind::BorrowAdt));
+    let detail = |rows: &[Read], d: u64| -> Vec<Read> { rows.iter().filter(|r| r.fact.detail == d).copied().collect() };
+    let (adts, copy_adts) = (of_kind(&base.moves.rows, FactKind::BorrowAdt), of_kind(&copy.moves.rows, FactKind::BorrowAdt));
+    let (a, b) = (detail(&adts, 0), detail(&copy_adts, 0));
+    let (a7, b7) = (detail(&adts, 7), detail(&copy_adts, 7));
+    assert_eq!(adts.len(), a.len() + a7.len(), "every ADT row is detail 0 or 7: {adts:?}");
+    assert_eq!(copy_adts.len(), b.len() + b7.len(), "every ADT row is detail 0 or 7: {copy_adts:?}");
     assert_eq!(a.len(), 1, "`moves` names one ADT, `Token`: {a:?}");
     assert_eq!(b.len(), 1, "`moves` names one ADT, `Token`: {b:?}");
     assert_eq!(a[0].fact, b[0].fact, "one fact about `Token` in both versions");
     assert_ne!(a[0].answer, b[0].answer, "`Token`'s row moved when it became `Copy`");
+    assert_eq!(keys_of(&a7), keys_of(&a), "an adt-facts row for `Token`: {a7:?} beside {a:?}");
+    assert_eq!(keys_of(&b7), keys_of(&b), "an adt-facts row for `Token`: {b7:?} beside {b:?}");
     assert_ne!(base.moves.digest, copy.moves.digest, "the digest of `moves` moved");
 
     // LIFE: only `pick`'s head text moved. Each head the borrow check asks is three facts:
@@ -193,12 +201,14 @@ fn borrow_reads_move_the_body_digest() {
     // (borrows_ties.rs `DETAIL`, piece RB8). LIFE writes a lifetime and no bound, so only a
     // detail-0 row moves; the detail-1 and detail-4 rows name the same heads and stay equal.
     const TIES: u64 = 4;
+    const IMPLIED: u64 = 8;
     let (heads, life_heads) = (of_kind(&base.calls.rows, FactKind::BorrowHead), of_kind(&life.calls.rows, FactKind::BorrowHead));
-    let detail = |rows: &[Read], d: u64| -> Vec<Read> { rows.iter().filter(|r| r.fact.detail == d).copied().collect() };
     let (a, b) = (detail(&heads, 0), detail(&life_heads, 0));
     let (a1, b1) = (detail(&heads, 1), detail(&life_heads, 1));
     let (a4, b4) = (detail(&heads, TIES), detail(&life_heads, TIES));
-    assert_eq!(heads.len(), a.len() + a1.len() + a4.len(), "every head row is detail 0, 1 or 4: {heads:?}");
+    let (a8, b8) = (detail(&heads, IMPLIED), detail(&life_heads, IMPLIED));
+    assert_eq!(heads.len(), a.len() + a1.len() + a4.len() + a8.len(), "every head row is detail 0, 1, 4 or 8: {heads:?}");
+    assert_eq!(a8, b8, "the owner's implied-bounds row stayed equal: {a8:?} then {b8:?}");
     assert_eq!(keys_of(&a4), keys_of(&a), "a ties row for each head read: {a4:?} beside {a:?}");
     assert_eq!(a4, b4, "no trait bound changed, so no ties row moved: {a4:?} then {b4:?}");
     assert_eq!(a.len(), 2, "`calls` reads two heads, its own and `pick`'s: {a:?}");

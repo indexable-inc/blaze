@@ -40,12 +40,15 @@ pub fn canon<A: Allocator + Copy>(flow: &Flow<A>, out: &mut impl Write, alloc: A
         stack.push(Block(0));
     }
     while let Some(b) = stack.pop() {
-        if reached[b.index()] {
+        let Some(slot) = reached.get_mut(b.index()) else { continue };
+        if *slot {
             continue;
         }
-        reached[b.index()] = true;
+        *slot = true;
         for_each_target(flow, b, |t| {
-            preds[t.index()] += 1;
+            if let Some(p) = preds.get_mut(t.index()) {
+                *p += 1;
+            }
             stack.push(t);
         });
     }
@@ -53,12 +56,13 @@ pub fn canon<A: Allocator + Copy>(flow: &Flow<A>, out: &mut impl Write, alloc: A
     let mut joined = Vec::with_capacity_in(nb, alloc);
     joined.resize(nb, false);
     for b in 0..nb {
-        if reached[b]
-            && let StmtKind::Goto(t) = terminator(flow, Block(b as u32))
+        if reached.get(b).copied().unwrap_or(false)
+            && let Some(StmtKind::Goto(t)) = terminator(flow, Block(b as u32))
             && t.0 != 0
-            && preds[t.index()] == 1
+            && preds.get(t.index()).copied() == Some(1)
+            && let Some(slot) = joined.get_mut(t.index())
         {
-            joined[t.index()] = true;
+            *slot = true;
         }
     }
 
@@ -71,10 +75,11 @@ pub fn canon<A: Allocator + Copy>(flow: &Flow<A>, out: &mut impl Write, alloc: A
         stack.push(Block(0));
     }
     while let Some(h) = stack.pop() {
-        if number[h.index()] != NONE {
+        let Some(slot) = number.get_mut(h.index()) else { continue };
+        if *slot != NONE {
             continue;
         }
-        number[h.index()] = order.len() as u32;
+        *slot = order.len() as u32;
         order.push(h);
         let last = last_of_chain(flow, &joined, h);
         succs.clear();
@@ -101,8 +106,11 @@ pub fn canon<A: Allocator + Copy>(flow: &Flow<A>, out: &mut impl Write, alloc: A
         }
     }
     for o in 0..flow.origins {
-        if flow.placeholder[o as usize] {
-            p.origin[o as usize] = p.next_origin;
+        let idx = o as usize;
+        if flow.placeholder.get(idx).copied().unwrap_or(false)
+            && let Some(slot) = p.origin.get_mut(idx)
+        {
+            *slot = p.next_origin;
             p.next_origin += 1;
         }
     }
@@ -112,11 +120,12 @@ pub fn canon<A: Allocator + Copy>(flow: &Flow<A>, out: &mut impl Write, alloc: A
         writeln!(out, "bb{n}:")?;
         let mut b = h;
         loop {
-            let range = flow.blocks[b.index()];
+            let Some(&range) = flow.blocks.get(b.index()) else { break };
             for s in range.start..range.end {
-                let kind = flow.stmts[s as usize].kind;
+                let Some(stmt) = flow.stmts.get(s as usize) else { break };
+                let kind = stmt.kind;
                 if let StmtKind::Goto(t) = kind
-                    && joined[t.index()]
+                    && joined.get(t.index()).copied().unwrap_or(false)
                 {
                     break;
                 }
@@ -124,19 +133,21 @@ pub fn canon<A: Allocator + Copy>(flow: &Flow<A>, out: &mut impl Write, alloc: A
                 p.stmt(kind, out)?;
                 let subs = &flow.subsets;
                 let from = subs.partition_point(|&(at, _, _)| at.0 < s);
-                for &(at, f, i) in subs[from..].iter() {
-                    if at.0 != s {
-                        break;
+                if let Some(tail) = subs.get(from..) {
+                    for &(at, f, i) in tail.iter() {
+                        if at.0 != s {
+                            break;
+                        }
+                        out.write_str("; ")?;
+                        p.origin(f, out)?;
+                        out.write_str(": ")?;
+                        p.origin(i, out)?;
                     }
-                    out.write_str("; ")?;
-                    p.origin(f, out)?;
-                    out.write_str(": ")?;
-                    p.origin(i, out)?;
                 }
                 out.write_str("\n")?;
             }
             match terminator(flow, b) {
-                StmtKind::Goto(t) if joined[t.index()] => b = t,
+                Some(StmtKind::Goto(t)) if joined.get(t.index()).copied().unwrap_or(false) => b = t,
                 _ => break,
             }
         }
@@ -144,7 +155,7 @@ pub fn canon<A: Allocator + Copy>(flow: &Flow<A>, out: &mut impl Write, alloc: A
 
     out.write_str("placeholders")?;
     for o in 0..flow.origins {
-        if flow.placeholder[o as usize] {
+        if flow.placeholder.get(o as usize).copied().unwrap_or(false) {
             out.write_str(" ")?;
             p.origin(Origin(o), out)?;
         }
@@ -152,14 +163,18 @@ pub fn canon<A: Allocator + Copy>(flow: &Flow<A>, out: &mut impl Write, alloc: A
     out.write_str("\n")?;
     // Locals only `mentions` names are numbered in local order, after the walk's.
     for &(l, _) in flow.local_origins.iter() {
-        if p.local[l.index()] == NONE {
-            p.local[l.index()] = p.next_local;
+        if let Some(slot) = p.local.get_mut(l.index())
+            && *slot == NONE
+        {
+            *slot = p.next_local;
             p.next_local += 1;
         }
     }
     let mut pairs: Vec<(u32, u32), A> = Vec::new_in(alloc);
     for &(l, o) in flow.local_origins.iter() {
-        pairs.push((p.local[l.index()], p.origin_number(o)));
+        if let Some(&loc) = p.local.get(l.index()) {
+            pairs.push((loc, p.origin_number(o)));
+        }
     }
     pairs.sort_unstable();
     out.write_str("mentions")?;
@@ -186,19 +201,23 @@ fn filled<A: Allocator>(n: usize, alloc: A) -> Vec<u32, A> {
     v
 }
 
-fn terminator<A: Allocator>(flow: &Flow<A>, b: Block) -> StmtKind {
-    flow.stmts[flow.blocks[b.index()].end as usize - 1].kind
+fn terminator<A: Allocator>(flow: &Flow<A>, b: Block) -> Option<StmtKind> {
+    let end = flow.blocks.get(b.index())?.end as usize;
+    let idx = end.checked_sub(1)?;
+    flow.stmts.get(idx).map(|s| s.kind)
 }
 
 fn for_each_target<A: Allocator>(flow: &Flow<A>, b: Block, mut f: impl FnMut(Block)) {
     match terminator(flow, b) {
-        StmtKind::Goto(t) => f(t),
-        StmtKind::Switch { targets, .. } => {
-            for &t in &flow.succ[targets.start as usize..targets.end as usize] {
-                f(t);
+        Some(StmtKind::Goto(t)) => f(t),
+        Some(StmtKind::Switch { targets, .. }) => {
+            if let Some(succs) = flow.succ.get(targets.start as usize..targets.end as usize) {
+                for &t in succs {
+                    f(t);
+                }
             }
         }
-        StmtKind::Suspend { resume, cancel } => {
+        Some(StmtKind::Suspend { resume, cancel }) => {
             f(resume);
             f(cancel);
         }
@@ -210,8 +229,8 @@ fn for_each_target<A: Allocator>(flow: &Flow<A>, b: Block, mut f: impl FnMut(Blo
 /// Ends: a cycle of joined blocks would have no edge from outside it, so it is unreached.
 fn last_of_chain<A: Allocator>(flow: &Flow<A>, joined: &[bool], h: Block) -> Block {
     let mut b = h;
-    while let StmtKind::Goto(t) = terminator(flow, b)
-        && joined[t.index()]
+    while let Some(StmtKind::Goto(t)) = terminator(flow, b)
+        && joined.get(t.index()).copied().unwrap_or(false)
     {
         b = t;
     }
@@ -232,7 +251,7 @@ struct Printer<'f, A: Allocator> {
 
 impl<A: Allocator> Printer<'_, A> {
     fn origin_number(&mut self, o: Origin) -> u32 {
-        let slot = &mut self.origin[o.index()];
+        let Some(slot) = self.origin.get_mut(o.index()) else { return NONE };
         if *slot == NONE {
             *slot = self.next_origin;
             self.next_origin += 1;
@@ -246,7 +265,7 @@ impl<A: Allocator> Printer<'_, A> {
     }
 
     fn local(&mut self, l: u32, out: &mut impl Write) -> fmt::Result {
-        let slot = &mut self.local[l as usize];
+        let Some(slot) = self.local.get_mut(l as usize) else { return Err(fmt::Error) };
         if *slot == NONE {
             *slot = self.next_local;
             self.next_local += 1;
@@ -255,7 +274,7 @@ impl<A: Allocator> Printer<'_, A> {
     }
 
     fn loan(&mut self, l: blaze_flow::Loan, out: &mut impl Write) -> fmt::Result {
-        let slot = &mut self.loan[l.index()];
+        let Some(slot) = self.loan.get_mut(l.index()) else { return Err(fmt::Error) };
         if *slot == NONE {
             *slot = self.next_loan;
             self.next_loan += 1;
@@ -264,7 +283,8 @@ impl<A: Allocator> Printer<'_, A> {
     }
 
     fn block(&self, b: Block, out: &mut impl Write) -> fmt::Result {
-        write!(out, "bb{}", self.number[b.index()])
+        let Some(&num) = self.number.get(b.index()) else { return Err(fmt::Error) };
+        write!(out, "bb{num}")
     }
 
     fn place(&mut self, mut p: Place, out: &mut impl Write) -> fmt::Result {
@@ -388,9 +408,11 @@ impl<A: Allocator> Printer<'_, A> {
                 self.place(on, out)?;
                 out.write_str(" ->")?;
                 let flow = self.flow;
-                for &t in &flow.succ[targets.start as usize..targets.end as usize] {
-                    out.write_str(" ")?;
-                    self.block(t, out)?;
+                if let Some(succs) = flow.succ.get(targets.start as usize..targets.end as usize) {
+                    for &t in succs {
+                        out.write_str(" ")?;
+                        self.block(t, out)?;
+                    }
                 }
                 Ok(())
             }

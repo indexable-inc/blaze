@@ -108,7 +108,7 @@ pub(crate) struct NamesStage<'f> {
 pub(crate) struct Handles<'h, 'f> {
     pub(crate) root: &'h Dir<ReadWrite>,
     pub(crate) lock: Option<&'f blaze_manifest::lock::Lock<'static>>,
-    pub(crate) members: Option<&'h [(blaze_manifest::lock::LockId, blaze_unit_graph::Text<'static>)]>,
+    pub(crate) members: Option<&'h [crate::graph::CheckoutDir]>,
     pub(crate) env: &'h FetchEnv<'h>,
     pub(crate) side: Option<&'h crate::proc_runner::MacroSide<'h, 'h, 'h>>,
     pub(crate) outlined: &'h [Outlined<'h>],
@@ -1657,7 +1657,7 @@ impl Job<'_> {
             }
             (env, _) => env,
         };
-        let job = ScopeJob { workers: self.workers, kept: self.kept, at: self.at, input: CrateInput { deps: &own_deps, ..input }, deps: &exports, sysroot, packs: self.packs.into(), corrected: self.corrected, env, procs: self.procs, oracle: self.oracle, clock: self.clock, board: Some(self.board) };
+        let job = ScopeJob { workers: self.workers, kept: self.kept, at: self.at, member: krate.member, input: CrateInput { deps: &own_deps, ..input }, deps: &exports, sysroot, packs: self.packs.into(), corrected: self.corrected, env, procs: self.procs, oracle: self.oracle, clock: self.clock, board: Some(self.board) };
         let (resolved, ok, unresolved, oracle) = match crate::names::resolve(cx, root, &job, cx.frame()).0 {
             Resolution::Made { resolved, ok, unresolved, oracle } => (resolved, ok, unresolved, oracle),
             Resolution::Need(keys) => return need(&keys),
@@ -1691,7 +1691,7 @@ impl Job<'_> {
                     (true, Some(dir)) => blaze_own::format_in!(local, "{dir}.rs"),
                     _ => blaze_own::String::from_str_in(need.path, local),
                 };
-                let want = crate::engine_check::FoundWant { slot: slot.as_str(), module, edition: if module { edition } else { blaze_drive::record::DATA_FILE }, root: unit_root };
+                let want = crate::engine_check::FoundWant { slot: slot.as_str(), module, edition: if module { edition } else { blaze_drive::record::DATA_FILE }, root: unit_root, external: !krate.member };
                 let (one, probed) = crate::engine_check::outline_found(cx, root, &self.serve.stamps, &want, self.serve.plants, self.kept).map_err(WorkerError::Unread)?;
                 found.read.push(one.name);
                 found.probes.push((SVec::from_slice_in(slot.as_bytes(), self.kept), probed, module));
@@ -1701,11 +1701,16 @@ impl Job<'_> {
         // Its borrow of `resolved` ends before the crate moves into `finish`.
         drop(needed);
         // The walk's found files this crate read: by name, or by the path it read one at.
+        // Only match a found file whose role agrees with the read (a Rust module read against a
+        // non-data found file; a data include read against a data found file), so a crate that
+        // `include_str!`s another crate's macro-written module does not claim ownership of it.
         if !self.serve.found.is_empty() {
             let (files, _, data) = resolved.checkout_reads();
-            for path in files.iter().map(|path| path.as_str()).chain(data.iter().map(|(path, _)| path.as_str())) {
+            for (path, is_data_read) in files.iter().map(|path| (path.as_str(), false)).chain(data.iter().map(|(path, _)| (path.as_str(), true))) {
                 let Some(one) = outline_at(outlined, Name::file(path.as_bytes()), path) else { continue };
-                if self.serve.found.binary_search_by_key(&one.name, |(file, _)| *file).is_ok() {
+                if let Ok(at) = self.serve.found.binary_search_by_key(&one.name, |(file, _)| *file)
+                    && self.serve.found.get(at).is_some_and(|(_, place)| crate::data_include::is_data(place.edition) == is_data_read)
+                {
                     found.read.push(one.name);
                 }
             }
@@ -1750,9 +1755,13 @@ fn unoutlined<'p>(task: Name, krate: &str, resolved: &'p Resolved, outlined: &[O
     let datas = data.iter().map(|(path, _)| (Name::file(path.as_bytes()), path.as_str()));
     for (read, path) in modules.chain(datas) {
         // Held, even as a failed outline (that failure is its own row's, `finish` stops on it):
-        // only a file no entry holds is a need.
+        // only a file no entry holds is a need. A module read (`Kind::Surface`) is NOT satisfied
+        // by a `DATA_FILE` outline (no Rust surface): it must be outlined as Rust.
         let file = Name::file(path.as_bytes());
-        let held = outlined.binary_search_by(|one| one.name.cmp(&file)).is_ok() || outlined.iter().any(|one| one.path.as_slice() == path.as_bytes());
+        let need_surface = read.kind == Kind::Surface;
+        let ok_outline = |one: &Outlined<'_>| !need_surface || !crate::data_include::is_data(one.edition);
+        let held = outlined.binary_search_by(|one| one.name.cmp(&file)).ok().and_then(|at| outlined.get(at)).is_some_and(ok_outline)
+            || outlined.iter().any(|one| one.path.as_slice() == path.as_bytes() && ok_outline(one));
         if held || needed.iter().any(|one| one.path == path) {
             continue;
         }
@@ -1784,8 +1793,10 @@ fn unseen_file(task: Name, read: Name, krate: &str, path: &str, heap: SharedAllo
 #[expect(clippy::too_many_arguments, reason = "one resolved crate and the inputs it was handed")]
 fn finish<'a>(task: &EngineTask, krate: &str, resolved: Resolved, ok: bool, unresolved: u32, oracle: Option<OracleCrate>, deps: &[Dependency<'_>], script: Option<Input>, outlined: &[Outlined<'_>], found: FoundBy, alloc: SharedAlloc<'a>, scratch: blaze_own::Alloc<'_>, heap: SharedAlloc<'static>) -> Result<WorkerAnswer<'a>, WorkerError> {
     let name = task.planned.name;
-    // A file the request's outlines hold, else one this crate found and its worker outlined.
-    let outline_of = |file: Name, path: &str| outline_of(outlined, file, path).or_else(|| outline_of(&found.outlined, file, path));
+    // A file this crate found and its worker outlined (which may upgrade a walk `DATA_FILE` to a
+    // Rust outline), else one the request's outlines hold.
+    let outline_of = |file: Name, path: &str| outline_of(&found.outlined, file, path).or_else(|| outline_of(outlined, file, path));
+    let surface_outline_of = |file: Name, path: &str| surface_outline_of(&found.outlined, file, path).or_else(|| surface_outline_of(outlined, file, path));
     let mut record = work::Record::new_in(name, heap);
     record.out = resolved.out;
     resolved.file_findings(&mut record).map_err(|crate::names::FindingText(what)| WorkerError::Finding(what))?;
@@ -1799,10 +1810,10 @@ fn finish<'a>(task: &EngineTask, krate: &str, resolved: Resolved, ok: bool, unre
     for path in files {
         let file = Name::file(path.as_bytes());
         let surface = Name::new(Kind::Surface, file.subject);
-        let digest = outline_of(file, path).and_then(crate::engine_tasks::surface_of)
-            .ok_or_else(|| unseen(surface, path))?;
+        let record_of = surface_outline_of(file, path).ok_or_else(|| unseen(surface, path))?;
+        let digest = crate::engine_tasks::surface_of(record_of).ok_or_else(|| unseen(surface, path))?;
         record.reads.push((surface, digest));
-        reads.push((CellId { of: file, cell: crate::engine_tasks::SURFACE }, digest));
+        reads.push((CellId { of: record_of.name, cell: crate::engine_tasks::SURFACE }, digest));
     }
     for path in absent {
         let file = Name::file(path.as_bytes());
@@ -1813,9 +1824,16 @@ fn finish<'a>(task: &EngineTask, krate: &str, resolved: Resolved, ok: bool, unre
     }
     for (path, _) in data {
         let file = Name::file(path.as_bytes());
-        let out = outline_of(file, path).ok_or_else(|| unseen(file, path))?.out;
+        let record_of = outline_of(file, path).ok_or_else(|| unseen(file, path))?;
+        // A dual-included Rust source file defines its raw bytes digest on `DATA` (`WHOLE` is its
+        // outline parts digest, which comment/whitespace edits do not move); a pure `DATA_FILE`
+        // defines `data_out` / `absent_out` directly on `WHOLE`.
+        let (cell, out) = match crate::engine_tasks::data_digest_of(record_of) {
+            Some(digest) => (crate::engine_tasks::DATA, digest),
+            None => (WHOLE, record_of.out),
+        };
         record.reads.push((file, out));
-        reads.push((CellId { of: file, cell: WHOLE }, out));
+        reads.push((CellId { of: record_of.name, cell }, out));
     }
     for dep in deps {
         record.reads.push((dep.input.name, dep.input.out));
@@ -1934,6 +1952,26 @@ fn outline_of<'o, 'h>(outlined: &'o [Outlined<'h>], name: Name, path: &str) -> O
         Err(_) => outlined.iter().find(|one| one.path.as_slice() == path.as_bytes())?,
     };
     one.made.as_ref().ok()
+}
+
+/// The Rust (surface-bearing) outline of the checkout file at `path`: by its name if that record
+/// holds a `Surface`, else by its physical path (e.g. a `mod.rs` whose `Name::file` was also
+/// listed as a `DATA_FILE` beside the `mod x;` slot outline).
+fn surface_outline_of<'o, 'h>(outlined: &'o [Outlined<'h>], name: Name, path: &str) -> Option<&'o work::Record<SharedAlloc<'h>>> {
+    if let Ok(at) = outlined.binary_search_by(|one| one.name.cmp(&name))
+        && let Some(one) = outlined.get(at)
+        && let Ok(record) = &one.made
+        && crate::engine_tasks::surface_of(record).is_some()
+    {
+        return Some(record);
+    }
+    outlined.iter().find_map(|one| {
+        if one.path.as_slice() != path.as_bytes() {
+            return None;
+        }
+        let record = one.made.as_ref().ok()?;
+        crate::engine_tasks::surface_of(record).map(|_| record)
+    })
 }
 
 /// The crates the crate at `at` reads directly: its dependencies and, for a program crate, the

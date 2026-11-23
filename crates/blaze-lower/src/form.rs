@@ -660,9 +660,6 @@ pub enum TypeRef {
     /// A structural type set / error union (`#![blaze::error_unions]`): `A | B | C`.
     /// Each element of the list is a member [`TypeId`].
     Union(List),
-    /// Fallible return/result sugar (`#![blaze::error_unions]`): `T ! E` (equivalent to
-    /// `Result<T, E>`, e.g. `Row ! FsError | Stopped` or `Row ! _`).
-    Fallible { ok: TypeId, err: TypeId },
     /// What the lowering cannot make (counted in `unhandled`).
     Error,
 }
@@ -707,7 +704,6 @@ impl TypeRef {
             TypeRef::Pat { base, pat: TyPat::Of(p) } => Node { a: base.0, b: p.0, ..n.with(14) },
             TypeRef::Record(l) => Node { a: l.start, b: l.len, ..n.with(15) },
             TypeRef::Union(l) => Node { a: l.start, b: l.len, ..n.with(16) },
-            TypeRef::Fallible { ok, err } => Node { a: ok.0, b: err.0, ..n.with(17) },
         }
     }
 
@@ -742,7 +738,6 @@ impl TypeRef {
             14 => TypeRef::Pat { base: TypeId(n.a), pat: TyPat::Of(PatId(n.b)) },
             15 => TypeRef::Record(list(n.a, n.b)),
             16 => TypeRef::Union(list(n.a, n.b)),
-            17 => TypeRef::Fallible { ok: TypeId(n.a), err: TypeId(n.b) },
             _ => return Err(bad("types", n.tag)),
         })
     }
@@ -853,6 +848,9 @@ pub enum Expr {
     Await(ExprId),
     /// An anonymous structural record literal (`#![blaze::records]`): `{ name: "x", depth: 2, .. }`.
     Record { fields: List, base: StructBase },
+    /// Comptime field unrolling (`inline for pat in iter { body }`): preserved intact rather than
+    /// desugared to `IntoIterator` so `front2` can unroll it over each field's concrete type.
+    InlineFor { pat: PatId, iter: ExprId, body: ExprId },
 }
 
 const BIN_OPS: [BinOp; 18] = [
@@ -985,6 +983,7 @@ impl Expr {
                 };
                 Node { a: fields.start, b: fields.len, c, ..n(37).with(k) }
             }
+            E::InlineFor { pat, iter, body } => Node { a: pat.0, b: iter.0, c: body.0, ..n(38) },
         }
     }
 
@@ -1075,6 +1074,7 @@ impl Expr {
                     _ => return Err(err),
                 },
             },
+            38 => E::InlineFor { pat: PatId(n.a), iter: ExprId(n.b), body: ExprId(n.c) },
             _ => return Err(err),
         })
     }
@@ -1322,7 +1322,7 @@ impl FieldInit {
         Node { a: self.name.0, b: self.expr.0, ..Node::of(ROW_FIELD_INIT).with(self.shorthand as u16) }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<FieldInit, BadRow> {
+    pub fn decode(n: Node) -> Result<FieldInit, BadRow> {
         check_tag!(n, ROW_FIELD_INIT, "field inits");
         Ok(FieldInit { name: NameIdx(n.a), expr: ExprId(n.b), shorthand: n.flags & 1 != 0 })
     }
@@ -1341,7 +1341,7 @@ impl FieldPat {
         Node { a: self.name.0, b: self.pat.0, ..Node::of(ROW_FIELD_PAT).with(self.shorthand as u16) }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<FieldPat, BadRow> {
+    pub fn decode(n: Node) -> Result<FieldPat, BadRow> {
         check_tag!(n, ROW_FIELD_PAT, "field pats");
         Ok(FieldPat { name: NameIdx(n.a), pat: PatId(n.b), shorthand: n.flags & 1 != 0 })
     }

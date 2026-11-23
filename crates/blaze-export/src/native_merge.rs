@@ -1,52 +1,57 @@
 //! Export merges the native image (NATIVE.md 3.9, piece W9; main's rulings of 2026-11-16): the
 //! program's native library image (blaze-native `layout::lay`, the same image the run path loads
-//! as a dylib) placed inside the exported Mach-O executable, so the file runs with no blaze and
-//! no native library record beside it.
+//! as a dylib or ELF shared object) placed inside the exported Mach-O or ELF executable, so the
+//! file runs with no blaze and no native library record beside it.
 //!
 //! # Where the image goes
 //!
 //! The image is moved as ONE block by one `shift` (image address + `shift` = the executable's
-//! image offset), a multiple of the page: its first byte after the dylib header room
+//! image offset), a multiple of the platform's page: its first byte after the header room
 //! (`Image::file_start`) lands on the program's end (`Laid::end`). Every pc-relative reference
 //! inside the image (a branch, an `adrp` to its GOT, a word stub) keeps its distance, so
 //! `layout::lay`'s resolution stands and only the 64-bit pointers (the fixups) move. Two
-//! segments hold it: `__NATIVE_TEXT` (r-x: its code and constants; the image's own
-//! `__eh_frame` and `__unwind_info` bytes ride along unread) and `__NATIVE_DATA` (rw-: GOT,
-//! data, words, initializers, thread-local descriptors and templates, zero fill). In the file
-//! the block starts on the page after the program's file bytes (the program's `__bss` takes no
-//! file bytes); its file offsets are its image offsets less one constant ([`Merged::file_of`]).
+//! segments/loads hold it: code and constants (`__NATIVE_TEXT` on Mach-O, an `r-x` `PT_LOAD` on
+//! ELF; the image's own unwind bytes ride along unread) and writable data (`__NATIVE_DATA` on
+//! Mach-O, an `rw-` `PT_LOAD` on ELF: GOT, data, words, initializers, thread-local descriptors
+//! and templates, zero fill). In the file the block starts on the page after the program's file
+//! bytes (the program's `__bss`/zero-fill takes no file bytes); its file offsets are its image
+//! offsets less one constant ([`Merged::file_of`] / [`MergedElf::file_of`]).
 //!
 //! # What each part of the image becomes
 //!
 //! - A word (C calling Rust, NATIVE.md 3.4) becomes a direct address: word `i`'s cell and every
-//!   `FixTo::Word { index: i }` cell (the BNL2 pointer rows) is a rebase to the Rust function the
-//!   word names, found through `ProgramIn::exports` (sorted by name; the front end gives it from
-//!   `#[no_mangle]` and `#[export_name]` items) and `Laid::placed`. No launcher writes anything.
-//! - The initializers (`Inits`) are `__mod_init_func`: dyld runs them before `main`, after the
+//!   `FixTo::Word { index: i }` cell (the BNL2 pointer rows) is a rebase (`R_AARCH64_RELATIVE`
+//!   on ELF) to the Rust function the word names, found through `ProgramIn::exports` (sorted by
+//!   name; the front end gives it from `#[no_mangle]` and `#[export_name]` items) and
+//!   `Laid::placed`. No launcher writes anything.
+//! - The initializers (`Inits`) become `__mod_init_func` on Mach-O and `DT_INIT_ARRAY` /
+//!   `DT_INIT_ARRAYSZ` on ELF: the platform's loader runs them before `main`, after the
 //!   libraries' own (the order of a normal executable, NATIVE.md 3.4).
-//! - Thread-locals keep Mach-O's own form: `__thread_vars` (descriptors whose thunk binds
-//!   `__tlv_bootstrap`), `__thread_data`, `__thread_bss`, and `MH_HAS_TLV_DESCRIPTORS`; the
-//!   program's own code has none (export refuses Rust thread-locals by name).
-//! - Imports bind by flat lookup (`BIND_SPECIAL_DYLIB_FLAT_LOOKUP`, NATIVE.md 3.5) among the
-//!   file's libraries: libSystem first (the program's own ordinal 1), then one `LC_LOAD_DYLIB` per
-//!   distinct install name of `Image::libraries`, in the image's order.
+//! - Thread-locals: on Mach-O, `__thread_vars` (descriptors whose thunk binds `__tlv_bootstrap`),
+//!   `__thread_data`, `__thread_bss`, and `MH_HAS_TLV_DESCRIPTORS` coexist with Rust's indexed
+//!   descriptor; on ELF, C's `.tdata`/`.tbss` and Rust's 8-byte `ROOT` share the executable's
+//!   single `PT_TLS` (C at `[0, c_memsz)`, Rust `ROOT` after it in the zero-filled tail at
+//!   `up(c_memsz, 8)`, so every `R_AARCH64_TLSDESC`/`R_AARCH64_TLS_TPREL64` offset is unchanged).
+//! - Imports: on Mach-O, flat lookup (`BIND_SPECIAL_DYLIB_FLAT_LOOKUP`, NATIVE.md 3.5) among
+//!   libSystem and `LC_LOAD_DYLIB` per distinct install name of `Image::libraries`; on ELF,
+//!   `.dynsym` + `R_AARCH64_GLOB_DAT`/`R_AARCH64_ABS64` against `libc.so.6` and `DT_NEEDED` per
+//!   distinct soname of `Image::libraries`.
 //! - A program import the image defines (a Rust call to a C function of the image) binds to it
-//!   directly: its GOT cell is a rebase and its row leaves the import table ([`Merged::direct`]),
-//!   as the run path's `dlsym(handle, name)` finds the image's definition first.
+//!   directly: its GOT cell becomes a rebase (`R_AARCH64_RELATIVE` on ELF) and its row leaves the
+//!   import table (`direct`), as the run path's `dlsym(handle, name)` finds the image's definition
+//!   first.
 //! - The unwind rows and frame entries (`Image::unwind`, `frames`, `eh_pointers`) go to
-//!   eh_out.rs, which builds the file's ONE `__eh_frame` and ONE `__unwind_info` from the Rust
-//!   rows and these ([`crate::eh_out::Outside`]).
-//!
-//! ELF executables with a native image are refused by name ([`MergeError::ElfNotBuilt`]) until
-//! the ELF twin of this piece is written (W5 is the run path's ELF shared object).
+//!   eh_out.rs, which builds the file's ONE `__eh_frame` and ONE `__unwind_info` / `.eh_frame_hdr`
+//!   from the Rust rows and these ([`crate::eh_out::Outside`]).
 
 use core::fmt;
 
 use blaze_code::record::Symbol;
 use blaze_native::Platform as NativePlatform;
-use blaze_native::image::{FixTo as NativeFix, Image, Region};
+use blaze_native::image::{Addr56, FixTo as NativeFix, Image, Region, TlsReloc};
 use blaze_own::{AString, AVec, Alloc, String, Vec};
 
+use crate::elf;
 use crate::input::CExport;
 use crate::layout::Laid;
 use crate::macho::{self, Chain, ChainImport};
@@ -99,7 +104,7 @@ pub enum MergeError {
     /// `ProgramIn::exports` is not sorted by name at row `at` (the front end sorts it).
     ExportsUnsorted { at: u32 },
     /// Library `library` (`Image::libraries[library]`) was resolved for another platform than
-    /// macOS: its install name is no Mach-O load command's (NATIVE.md 3.5).
+    /// the executable's (NATIVE.md 3.5).
     Library { library: u32 },
     /// An image laid for another platform than the executable's.
     Platform,
@@ -107,8 +112,8 @@ pub enum MergeError {
     NoRegion { region: Region },
     /// The image's GOT does not start a page, so its two blocks could not move together.
     Unaligned { at: u64 },
-    /// An ELF executable with a native image: not built (NATIVE.md W9, macOS first).
-    ElfNotBuilt,
+    /// The image breaks a structural invariant (`what`) at image address `at`.
+    Shape { what: &'static str, at: u64 },
     /// A number past its field.
     TooLarge { what: &'static str, len: u64 },
 }
@@ -122,11 +127,11 @@ impl fmt::Display for MergeError {
             ),
             MergeError::TwoExports { first, second } => write!(f, "functions {first} and {second} export one C name (Reference, abi: no_mangle)"),
             MergeError::ExportsUnsorted { at } => write!(f, "the program's C exports are not sorted by name at row {at}"),
-            MergeError::Library { library } => write!(f, "the native image's library {library} was resolved for another platform than macOS (NATIVE.md 3.5)"),
+            MergeError::Library { library } => write!(f, "the native image's library {library} was resolved for another platform than the executable's (NATIVE.md 3.5)"),
             MergeError::Platform => write!(f, "the native image was laid for another platform than the executable's"),
             MergeError::NoRegion { region } => write!(f, "the native image has no {region:?} region"),
             MergeError::Unaligned { at } => write!(f, "the native image's GOT at {at:#x} does not start a page"),
-            MergeError::ElfNotBuilt => write!(f, "an ELF executable with a native image is not built yet (NATIVE.md W9: macOS first)"),
+            MergeError::Shape { what, at } => write!(f, "the native image breaks {what} at {at:#x}"),
             MergeError::TooLarge { what, len } => write!(f, "{what} ({len:#x}) is past its field"),
         }
     }
@@ -144,9 +149,9 @@ pub(crate) struct Sect {
     pub flags: u32,
 }
 
-/// The image merged: where its blocks are, what the loader fixes in them, the import rows and
-/// libraries they add, their sections. The executable writer (macho.rs `write_native`) copies
-/// `bytes` and writes the rest.
+/// The image merged for Mach-O: where its blocks are, what the loader fixes in them, the import
+/// rows and libraries they add, their sections. The executable writer (macho.rs `write_native`)
+/// copies `bytes` and writes the rest.
 pub struct Merged<'a, 'i> {
     /// Image address + `shift` = executable image offset.
     pub shift: u64,
@@ -197,21 +202,126 @@ impl Merged<'_, '_> {
     }
 }
 
+/// One non-relative ELF relocation emitted for the merged native image (at executable offsets).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ElfRela {
+    pub at: u64,
+    pub kind: ElfRelaKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ElfRelaKind {
+    /// `R_AARCH64_GLOB_DAT` (when `got && addend == 0`) or `R_AARCH64_ABS64`: `import` indexes
+    /// [`MergedElf::imports`].
+    Import { import: u32, addend: i64, got: bool },
+    /// `R_AARCH64_TLSDESC` on a 16-byte GOT pair: symbol 0, addend = template offset.
+    TlsDesc { offset: u64 },
+    /// `R_AARCH64_TLS_TPREL64` on an 8-byte GOT cell: symbol 0, addend = template offset.
+    TlsTpRel { offset: u64 },
+}
+
+/// Native C TLS template metadata on ELF (when `memsz > 0`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ElfTls {
+    /// Start of `.tdata` (or `.tbss` when `.tdata` is empty) at executable image offset.
+    pub vaddr: u64,
+    /// `.tdata` length (bytes in file).
+    pub filesz: u64,
+    /// `.tdata` + `.tbss` length (bytes in memory).
+    pub memsz: u64,
+    /// Required power-of-two alignment (`1 << max(tdata.align_log2, tbss.align_log2)`).
+    pub align: u64,
+}
+
+/// Native `DT_INIT_ARRAY` metadata on ELF (when `Region::Inits` is non-empty).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ElfInits {
+    pub vaddr: u64,
+    pub len: u64,
+}
+
+/// One external symbol imported by the native ELF image.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ElfImport<'i> {
+    pub name: &'i [u8],
+    pub weak: bool,
+}
+
+/// The image merged for ELF arm64: where its two loads sit, its relative and dynamic
+/// relocations, its imports, `DT_NEEDED` sonames, optional `DT_INIT_ARRAY`, and optional C TLS
+/// template. The executable writer (`elf::write_native`) copies `bytes` and writes the rest.
+pub struct MergedElf<'a, 'i> {
+    /// Image address + `shift` = executable image offset.
+    pub shift: u64,
+    /// The image's file bytes (from `Image::file_start`).
+    pub(crate) bytes: &'i [u8],
+    /// Native text (`r-x`) and data (`rw-`) load starts, end of file bytes, and end in memory.
+    pub text_at: u64,
+    pub data_at: u64,
+    pub file_end: u64,
+    pub end: u64,
+    /// Program import rows defined by the native image: `(program_row, target_vaddr)`, sorted.
+    pub(crate) direct: AVec<'a, (u32, u64)>,
+    /// External imports of the native image, in `Image::imports` order.
+    pub(crate) imports: AVec<'a, ElfImport<'i>>,
+    /// `R_AARCH64_RELATIVE` entries `(r_offset, r_addend)`, sorted by `r_offset`.
+    pub(crate) relative: AVec<'a, (u64, u64)>,
+    /// Non-relative relocations (`GLOB_DAT`, `ABS64`, `TLSDESC`, `TLS_TPREL64`), sorted by `at`.
+    pub(crate) other: AVec<'a, ElfRela>,
+    /// Distinct `DT_NEEDED` sonames in image order, `libc.so.6` excluded.
+    pub libraries: AVec<'a, AString<'a>>,
+    /// `DT_INIT_ARRAY` / `DT_INIT_ARRAYSZ` when `Region::Inits` is non-empty.
+    pub(crate) inits: Option<ElfInits>,
+    /// Native C TLS template when `.tdata` / `.tbss` is non-empty.
+    pub(crate) tls: Option<ElfTls>,
+    /// True when any `TlsReloc::TpRel` is present (`DF_STATIC_TLS`).
+    pub(crate) static_tls: bool,
+}
+
+impl MergedElf<'_, '_> {
+    /// The image's external import symbols.
+    pub fn imports(&self) -> usize {
+        self.imports.len()
+    }
+
+    /// The executable's bound external symbols when the program has `program` of its own.
+    pub fn bound(&self, program: usize) -> usize {
+        program - self.direct.len() + self.imports.len()
+    }
+
+    /// The file offset of executable image offset `at`, the block's file start being `file`.
+    pub(crate) fn file_of(&self, at: u64, file: u64) -> u64 {
+        if at >= self.text_at { at - self.text_at + file } else { at }
+    }
+}
+
 fn up(n: u64, to: u64) -> u64 {
     n.div_ceil(to) * to
 }
 
-/// The install names of `image`'s libraries: distinct, in the image's order, libSystem (the
-/// executable's first library) left out. Computed once, before the layout: the header's room
-/// depends on them (macho.rs `command_room`).
+fn u64_of_usize(n: usize, what: &'static str) -> Result<u64, MergeError> {
+    u64::try_from(n).map_err(|_| MergeError::TooLarge { what, len: u64::MAX })
+}
+
+fn u32_of_usize(n: usize, what: &'static str) -> Result<u32, MergeError> {
+    u32::try_from(n).map_err(|_| MergeError::TooLarge { what, len: u64::try_from(n).unwrap_or(u64::MAX) })
+}
+
+/// The install names (macOS) or sonames (Linux) of `image`'s libraries: distinct, in the image's
+/// order, with the platform's base C library (`libSystem.B.dylib` or `libc.so.6`, always first)
+/// left out. Computed once, before layout, since header / dynamic room depends on them.
 pub fn libraries<'a>(image: &Image<'_>, alloc: Alloc<'a>) -> Result<AVec<'a, AString<'a>>, MergeError> {
+    let base = match image.platform {
+        NativePlatform::MacosArm64 => macho::LIB_SYSTEM,
+        NativePlatform::LinuxArm64 => elf::LIBC,
+    };
     let mut paths: AVec<'a, AString<'a>> = Vec::new_in(alloc);
     for (k, library) in image.libraries.iter().enumerate() {
-        if library.platform() != NativePlatform::MacosArm64 {
-            return Err(MergeError::Library { library: k as u32 });
+        if library.platform() != image.platform {
+            return Err(MergeError::Library { library: u32_of_usize(k, "a library index")? });
         }
         let install = library.install();
-        if install == macho::LIB_SYSTEM || paths.iter().any(|p| p.as_str() == install) {
+        if install == base || paths.iter().any(|p| p.as_str() == install) {
             continue;
         }
         let mut path: AString<'a> = String::new_in(alloc);
@@ -221,8 +331,97 @@ pub fn libraries<'a>(image: &Image<'_>, alloc: Alloc<'a>) -> Result<AVec<'a, ASt
     Ok(paths)
 }
 
-/// Places `image` after `laid` and turns its fixups, words, imports and regions into the
-/// executable's terms (the module's doc says how). `exports` is `ProgramIn::exports`;
+fn check_exports(exports: &[CExport<'_>]) -> Result<(), MergeError> {
+    for (k, pair) in exports.windows(2).enumerate() {
+        match pair[0].name.cmp(pair[1].name) {
+            core::cmp::Ordering::Less => {}
+            core::cmp::Ordering::Equal => return Err(MergeError::TwoExports { first: pair[0].symbol, second: pair[1].symbol }),
+            core::cmp::Ordering::Greater => return Err(MergeError::ExportsUnsorted { at: u32_of_usize(k + 1, "an export row")? }),
+        }
+    }
+    Ok(())
+}
+
+struct Blocks {
+    shift: u64,
+    text_at: u64,
+    data_at: u64,
+    file_end: u64,
+    end: u64,
+    got_at: u64,
+    got_len: u64,
+    init_end: u64,
+}
+
+fn place_blocks(laid: &Laid<'_, '_>, image: &Image<'_>, page: u64) -> Result<Blocks, MergeError> {
+    let got = image.region(Region::Got).ok_or(MergeError::NoRegion { region: Region::Got })?;
+    if got.at % page != 0 || image.file_start % page != 0 {
+        return Err(MergeError::Unaligned { at: got.at });
+    }
+    if laid.end % page != 0 {
+        return Err(MergeError::Unaligned { at: laid.end });
+    }
+    let shift = laid.end.checked_sub(image.file_start).ok_or(MergeError::TooLarge { what: "the native image's header room", len: image.file_start })?;
+    let bytes_len = u64_of_usize(image.bytes.len(), "the native image's bytes")?;
+    let init_end = image.file_start + bytes_len;
+    let text_at = image.file_start + shift;
+    let data_at = got.at + shift;
+    let file_end = init_end + shift;
+    let end = up(image.end.max(got.at) + shift, page);
+    Ok(Blocks { shift, text_at, data_at, file_end, end, got_at: got.at, got_len: got.len, init_end })
+}
+
+fn resolve_words<'a>(
+    laid: &Laid<'_, '_>,
+    image: &Image<'_>,
+    exports: &[CExport<'_>],
+    strip_underscore: bool,
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, u64>, MergeError> {
+    let mut word_at: AVec<'a, u64> = Vec::with_capacity_in(image.words.len(), alloc);
+    for (k, &word) in image.words.iter().enumerate() {
+        let missing = MergeError::RustWordMissing { word: u32_of_usize(k, "a word index")? };
+        let name = if strip_underscore { word.strip_prefix(b"_").ok_or(missing)? } else { word };
+        let symbol = exports
+            .binary_search_by(|e| e.name.cmp(name))
+            .ok()
+            .and_then(|i| exports.get(i).map(|e| e.symbol))
+            .ok_or(missing)?;
+        let at = laid.placed.iter().find(|p| p.symbol == symbol).map(|p| p.at).ok_or(missing)?;
+        word_at.push(at);
+    }
+    Ok(word_at)
+}
+
+fn resolve_direct<'a>(
+    laid: &Laid<'_, '_>,
+    image: &Image<'_>,
+    shift: u64,
+    add_underscore: bool,
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, (u32, u64)>, MergeError> {
+    let mut direct: AVec<'a, (u32, u64)> = Vec::new_in(alloc);
+    let mut mangled: AVec<'_, u8> = Vec::new_in(alloc);
+    for (k, import) in laid.imports.iter().enumerate() {
+        let needle: &[u8] = if add_underscore {
+            mangled.clear();
+            mangled.push(b'_');
+            mangled.extend_from_slice(import.name.as_bytes());
+            &mangled[..]
+        } else {
+            import.name.as_bytes()
+        };
+        if let Ok(i) = image.exports.binary_search_by(|&(name, _)| name.cmp(needle))
+            && let Some(&(_, at)) = image.exports.get(i)
+        {
+            direct.push((u32_of_usize(k, "a program import row")?, at + shift));
+        }
+    }
+    Ok(direct)
+}
+
+/// Places a macOS `image` after `laid` and turns its fixups, words, imports and regions into the
+/// Mach-O executable's terms (the module's doc says how). `exports` is `ProgramIn::exports`;
 /// `libraries` is [`libraries`]'s answer for `image`.
 pub fn merge<'a, 'i>(
     laid: &Laid<'_, '_>,
@@ -234,36 +433,13 @@ pub fn merge<'a, 'i>(
     if image.platform != NativePlatform::MacosArm64 {
         return Err(MergeError::Platform);
     }
-    for (k, pair) in exports.windows(2).enumerate() {
-        match pair[0].name.cmp(pair[1].name) {
-            core::cmp::Ordering::Less => {}
-            core::cmp::Ordering::Equal => return Err(MergeError::TwoExports { first: pair[0].symbol, second: pair[1].symbol }),
-            core::cmp::Ordering::Greater => return Err(MergeError::ExportsUnsorted { at: k as u32 + 1 }),
-        }
-    }
+    check_exports(exports)?;
     let region = |r: Region| image.region(r).map(|p| (p.at, p.len, u32::from(p.align_log2))).ok_or(MergeError::NoRegion { region: r });
-    let (got_at, _, _) = region(Region::Got)?;
-    if got_at % PAGE != 0 || image.file_start % PAGE != 0 {
-        return Err(MergeError::Unaligned { at: got_at });
-    }
-    if laid.end % PAGE != 0 {
-        return Err(MergeError::Unaligned { at: laid.end });
-    }
-    let shift = laid.end.checked_sub(image.file_start).ok_or(MergeError::TooLarge { what: "the native image's header room", len: image.file_start })?;
-    let text_at = image.file_start + shift;
-    let data_at = got_at + shift;
-    let file_end = image.file_start + image.bytes.len() as u64 + shift;
-    let end = up(image.end.max(got_at) + shift, PAGE);
+    let blocks = place_blocks(laid, image, PAGE)?;
+    let shift = blocks.shift;
 
     // Each word's Rust function, by name (Mach-O names carry the platform's `_`).
-    let mut word_at: AVec<'_, u64> = Vec::with_capacity_in(image.words.len(), alloc);
-    for (k, &word) in image.words.iter().enumerate() {
-        let missing = MergeError::RustWordMissing { word: k as u32 };
-        let name = word.strip_prefix(b"_").ok_or(missing)?;
-        let symbol = exports.binary_search_by(|e| e.name.cmp(name)).map(|i| exports[i].symbol).map_err(|_| missing)?;
-        let at = laid.placed.iter().find(|p| p.symbol == symbol).map(|p| p.at).ok_or(missing)?;
-        word_at.push(at);
-    }
+    let word_at = resolve_words(laid, image, exports, true, alloc)?;
 
     // Import rows: one per distinct (import, addend), in that order.
     let mut rows: AVec<'_, (u32, i64)> = Vec::new_in(alloc);
@@ -276,20 +452,12 @@ pub fn merge<'a, 'i>(
     rows.dedup();
     // The program's imports the image defines: bound to the definition, moved (`exports` of
     // the image are sorted by their mangled name).
-    let mut direct: AVec<'a, (u32, u64)> = Vec::new_in(alloc);
-    let mut mangled: AVec<'_, u8> = Vec::new_in(alloc);
-    for (k, import) in laid.imports.iter().enumerate() {
-        mangled.clear();
-        mangled.push(b'_');
-        mangled.extend_from_slice(import.name.as_bytes());
-        if let Ok(i) = image.exports.binary_search_by(|&(name, _)| name.cmp(&mangled[..])) {
-            direct.push((k as u32, image.exports[i].1 + shift));
-        }
-    }
-    let first_row = (laid.imports.len() - direct.len()) as u32;
+    let direct = resolve_direct(laid, image, shift, true, alloc)?;
+    let first_row = u32_of_usize(laid.imports.len() - direct.len(), "a chained import base")?;
     let mut imports: AVec<'a, ChainImport<'i>> = Vec::with_capacity_in(rows.len(), alloc);
     for &(index, addend) in rows.iter() {
-        let row = image.imports.get(index as usize).ok_or(MergeError::TooLarge { what: "an import index of the native image", len: u64::from(index) })?;
+        let idx = usize::try_from(index).map_err(|_| MergeError::TooLarge { what: "an import index of the native image", len: u64::from(index) })?;
+        let row = image.imports.get(idx).ok_or(MergeError::TooLarge { what: "an import index of the native image", len: u64::from(index) })?;
         imports.push(ChainImport { lead: b"", name: row.name, ordinal: FLAT_LOOKUP, weak: row.weak, addend });
     }
 
@@ -304,17 +472,19 @@ pub fn merge<'a, 'i>(
             NativeFix::Rebase { address, high8 } => Chain::Rebase { target: target36(address.get() + shift)?, high8 },
             NativeFix::Import { index, addend } => {
                 let k = rows.binary_search(&(index, addend)).map_err(|_| MergeError::TooLarge { what: "an import row of the native image", len: u64::from(index) })?;
-                Chain::Bind { import: first_row + k as u32 }
+                Chain::Bind { import: first_row + u32_of_usize(k, "an import row")? }
             }
             NativeFix::Word { index } => {
-                let at = word_at.get(index as usize).ok_or(MergeError::RustWordMissing { word: index })?;
+                let idx = usize::try_from(index).map_err(|_| MergeError::RustWordMissing { word: index })?;
+                let at = word_at.get(idx).ok_or(MergeError::RustWordMissing { word: index })?;
                 Chain::Rebase { target: target36(*at)?, high8: 0 }
             }
         };
         fixups.push((f.at + shift, to));
     }
     for (k, &at) in word_at.iter().enumerate() {
-        fixups.push((words_at + 8 * k as u64 + shift, Chain::Rebase { target: target36(at)?, high8: 0 }));
+        let off = u64_of_usize(k, "a word cell index")?;
+        fixups.push((words_at + 8 * off + shift, Chain::Rebase { target: target36(at)?, high8: 0 }));
     }
     fixups.sort_unstable_by_key(|&(at, _)| at);
 
@@ -336,7 +506,172 @@ pub fn merge<'a, 'i>(
         }
     }
 
-    Ok(Merged { shift, bytes: &image.bytes, text_at, data_at, file_end, end, fixups, direct, imports, libraries, code, data, thread_vars })
+    Ok(Merged {
+        shift,
+        bytes: &image.bytes,
+        text_at: blocks.text_at,
+        data_at: blocks.data_at,
+        file_end: blocks.file_end,
+        end: blocks.end,
+        fixups,
+        direct,
+        imports,
+        libraries,
+        code,
+        data,
+        thread_vars,
+    })
+}
+
+/// Places a Linux arm64 `image` after `laid` and turns its fixups, words, imports, initializers
+/// and TLS relocations into the ELF executable's terms (the module's doc says how). `exports` is
+/// `ProgramIn::exports`; `libraries` is [`libraries`]'s answer for `image`.
+pub fn merge_elf<'a, 'i>(
+    laid: &Laid<'_, '_>,
+    image: &'i Image<'_>,
+    exports: &[CExport<'_>],
+    libraries: AVec<'a, AString<'a>>,
+    alloc: Alloc<'a>,
+) -> Result<MergedElf<'a, 'i>, MergeError> {
+    if image.platform != NativePlatform::LinuxArm64 {
+        return Err(MergeError::Platform);
+    }
+    check_exports(exports)?;
+    let region = |r: Region| image.region(r).ok_or(MergeError::NoRegion { region: r });
+    let blocks = place_blocks(laid, image, elf::PAGE)?;
+    let shift = blocks.shift;
+    let got_at = blocks.got_at;
+    let got_end = got_at + blocks.got_len;
+    let init_end = blocks.init_end;
+
+    let thread_vars = region(Region::ThreadVars)?;
+    if thread_vars.len != 0 {
+        return Err(MergeError::Shape { what: "Mach-O __thread_vars descriptors in an ELF image", at: thread_vars.at });
+    }
+
+    // Native C TLS template: ThreadData then ThreadZero.
+    let tdata = region(Region::ThreadData)?;
+    let tbss = region(Region::ThreadZero)?;
+    let tls_at = if tdata.len > 0 { tdata.at } else { tbss.at };
+    let tls_end = if tbss.len > 0 { tbss.at + tbss.len } else { tdata.at + tdata.len };
+    let tls_len = tls_end.saturating_sub(tls_at);
+    if !image.tls.is_empty() && tls_len == 0 {
+        return Err(MergeError::Shape { what: "TLS relocations with no TLS template", at: tls_at });
+    }
+    let tls = if tls_len > 0 {
+        let log2 = tdata.align_log2.max(tbss.align_log2);
+        if log2 > 16 {
+            return Err(MergeError::TooLarge { what: "a TLS alignment past a 64 KiB page", len: u64::from(log2) });
+        }
+        if tdata.len > 0 && (tdata.at < got_at || tdata.at + tdata.len > init_end) {
+            return Err(MergeError::Shape { what: "ThreadData outside writable file bytes", at: tdata.at });
+        }
+        Some(ElfTls { vaddr: tls_at + shift, filesz: tdata.len, memsz: tls_len, align: 1u64 << log2 })
+    } else {
+        None
+    };
+
+    // Initializers: `DT_INIT_ARRAY` / `DT_INIT_ARRAYSZ` when non-empty.
+    let inits_reg = region(Region::Inits)?;
+    let inits = if inits_reg.len > 0 {
+        if !inits_reg.at.is_multiple_of(8) || !inits_reg.len.is_multiple_of(8) {
+            return Err(MergeError::Shape { what: "Inits not 8-byte aligned or sized", at: inits_reg.at });
+        }
+        if inits_reg.at < got_at || inits_reg.at + inits_reg.len > init_end {
+            return Err(MergeError::Shape { what: "Inits outside writable file bytes", at: inits_reg.at });
+        }
+        Some(ElfInits { vaddr: inits_reg.at + shift, len: inits_reg.len })
+    } else {
+        None
+    };
+
+    // ELF C names carry no leading underscore.
+    let word_at = resolve_words(laid, image, exports, false, alloc)?;
+    let direct = resolve_direct(laid, image, shift, false, alloc)?;
+    let mut imports: AVec<'a, ElfImport<'i>> = Vec::with_capacity_in(image.imports.len(), alloc);
+    for imp in image.imports.iter() {
+        imports.push(ElfImport { name: imp.name, weak: imp.weak });
+    }
+
+    let words_reg = region(Region::Words)?;
+    let mut relative: AVec<'a, (u64, u64)> = Vec::with_capacity_in(image.fixups.len() + image.words.len(), alloc);
+    let mut other: AVec<'a, ElfRela> = Vec::new_in(alloc);
+    for f in image.fixups.iter() {
+        if !f.at.is_multiple_of(8) || f.at < got_at || f.at + 8 > init_end {
+            return Err(MergeError::Shape { what: "a fixup outside writable file bytes, or not 8-aligned", at: f.at });
+        }
+        match f.to {
+            NativeFix::Rebase { address, high8 } => {
+                let moved = Addr56::new(address.get() + shift).ok_or(MergeError::TooLarge { what: "a rebase target past 56 bits", len: address.get() + shift })?;
+                relative.push((f.at + shift, moved.tagged(high8)));
+            }
+            NativeFix::Import { index, addend } => {
+                let idx = usize::try_from(index).map_err(|_| MergeError::TooLarge { what: "an import index of the native image", len: u64::from(index) })?;
+                if idx >= image.imports.len() {
+                    return Err(MergeError::TooLarge { what: "an import index of the native image", len: u64::from(index) });
+                }
+                other.push(ElfRela { at: f.at + shift, kind: ElfRelaKind::Import { import: index, addend, got: f.at < got_end } });
+            }
+            NativeFix::Word { index } => {
+                let idx = usize::try_from(index).map_err(|_| MergeError::RustWordMissing { word: index })?;
+                let at = word_at.get(idx).ok_or(MergeError::RustWordMissing { word: index })?;
+                relative.push((f.at + shift, *at));
+            }
+        }
+    }
+    for (k, &at) in word_at.iter().enumerate() {
+        let cell = words_reg.at + 8 * u64_of_usize(k, "a word cell index")?;
+        if !cell.is_multiple_of(8) || cell < got_at || cell + 8 > init_end {
+            return Err(MergeError::Shape { what: "a word cell outside writable file bytes", at: cell });
+        }
+        relative.push((cell + shift, at));
+    }
+    let mut static_tls = false;
+    for t in image.tls.iter() {
+        let (at, offset, len, kind) = match *t {
+            TlsReloc::Desc { got_at: cell, offset } => (cell, offset, 16u64, ElfRelaKind::TlsDesc { offset }),
+            TlsReloc::TpRel { got_at: cell, offset } => {
+                static_tls = true;
+                (cell, offset, 8u64, ElfRelaKind::TlsTpRel { offset })
+            }
+        };
+        if !at.is_multiple_of(8) || at < got_at || at + len > got_end {
+            return Err(MergeError::Shape { what: "a TLS relocation's cell outside the Got, or not 8-aligned", at });
+        }
+        if offset >= tls_len {
+            return Err(MergeError::Shape { what: "a TLS relocation's offset past the TLS template", at });
+        }
+        other.push(ElfRela { at: at + shift, kind });
+    }
+    relative.sort_unstable_by_key(|&(at, _)| at);
+    for pair in relative.windows(2) {
+        if pair[0].0 == pair[1].0 {
+            return Err(MergeError::Shape { what: "two relative relocations at one cell", at: pair[1].0 });
+        }
+    }
+    other.sort_unstable_by_key(|r| r.at);
+    for pair in other.windows(2) {
+        if pair[0].at == pair[1].at {
+            return Err(MergeError::Shape { what: "two relocations at one cell", at: pair[1].at });
+        }
+    }
+
+    Ok(MergedElf {
+        shift,
+        bytes: &image.bytes,
+        text_at: blocks.text_at,
+        data_at: blocks.data_at,
+        file_end: blocks.file_end,
+        end: blocks.end,
+        direct,
+        imports,
+        relative,
+        other,
+        libraries,
+        inits,
+        tls,
+        static_tls,
+    })
 }
 
 /// Hand-laid images (the shape blaze-native `layout::lay` gives, as blaze-export's
@@ -495,6 +830,9 @@ mod tests {
             entry: START,
             placed: homes,
             tables_room: 0x8000 - START,
+            mod_init_at: None,
+            has_tls: false,
+            tls_count: 0,
         }
     }
 

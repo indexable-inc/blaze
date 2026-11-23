@@ -316,14 +316,14 @@ fn the_solver_s_cost_per_real_body() {
     // stops left (30, 44 frames) are typeck's `Need` of the world, which ends the check round
     // (check.rs's rounds: 84), not the fact cache's.
     ceil("frames", s.frames, 1170);
-    ceil("frames over distinct goals", s.frames, s.distinct_goals);
+    ceil("frames over distinct goals + abandoned", s.frames, s.distinct_goals + s.frames_abandoned);
     ceil("frames abandoned", s.frames_abandoned, 50);
     ceil("need stops", s.need_stops, 35);
     // One canonical walk per goal asked (frames + cache hits: 2510), less the goals with no
     // inference variable seen before, found by their own identity (blaze-solve eval.rs
     // `Solver::input_of`: 71 skipped, 2439 walked).
     ceil("canonicalized", s.canonicalized, 2560);
-    ceil("canonical walks over goals asked", s.canonicalized + s.canon_skipped, s.frames + s.cache_hits);
+    ceil("canonical walks over goals asked", s.canonicalized + s.canon_skipped, s.frames + s.cache_hits + s.frames_abandoned);
     assert!(s.canon_skipped > 0, "no goal was found by its plain key\n{lines}");
     ceil("terms imported", s.terms_imported, 6190);
     ceil("fact cache misses", total.solve.fill_misses, 2115);

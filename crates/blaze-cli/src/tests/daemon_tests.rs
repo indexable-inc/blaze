@@ -19,6 +19,8 @@
 //! 4. `daemon_opt_out_blaze_no_daemon`:
 //!    Proves `BLAZE_NO_DAEMON=1` neither connects to nor spawns a daemon socket.
 
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -61,10 +63,61 @@ struct Scratch {
     homes: std::vec::Vec<(PathBuf, PathBuf)>,
 }
 
+#[cfg(unix)]
+fn posix_stat(p: &Path) -> Option<blaze_sys::posix::proc::stat> {
+    let s = p.to_str()?;
+    let mut buf = [0u8; 4096];
+    let b = s.as_bytes();
+    if b.is_empty() || b.len() >= buf.len() { return None; }
+    buf[..b.len()].copy_from_slice(b);
+    buf[b.len()] = 0;
+    let c = core::ffi::CStr::from_bytes_with_nul(&buf[..=b.len()]).ok()?;
+    blaze_sys::posix::proc::stat_at(blaze_sys::posix::io::CWD, blaze_sys::Path::new(c), 0).ok()
+}
+
+/// Chooses a short scratch root directory that stays on the toolchain shelf's filesystem
+/// (avoiding cross-device `EXDEV` copies of the ~2.5 GB shelf) while keeping
+/// `<home>/.blaze/v2/daemon/<16-hex>.sock` within Unix `sun_path` limits (104 B macOS / 108 B Linux).
+fn scratch_parent(tag: &str, seq: u64) -> PathBuf {
+    let leaf = format!("bd-{tag}-{}-{seq}", std::process::id());
+    let dev_of = |p: &Path| posix_stat(p).map(|st| st.st_dev);
+    let (owner_home, tmp) = (std::env::var_os("HOME"), std::env::temp_dir());
+    let shelf_dev = owner_home.as_ref().and_then(|h| dev_of(&Path::new(h).join(".blaze/v2/toolchain")));
+    let fits = |dir: &Path| -> bool {
+        let sample = dir.join(&leaf).join("standalone").join("h");
+        sample.to_str().is_some_and(|s| crate::daemon_server::socket_fits(Some(s)))
+    };
+    let mut candidates = [Some(tmp), None, Some(PathBuf::from("/tmp"))];
+    if let Some(h) = owner_home.as_ref() {
+        let short_home = Path::new(h).join(".blaze/t");
+        if std::fs::create_dir_all(&short_home).is_ok() {
+            candidates[1] = Some(short_home);
+        }
+    }
+    if let Some(want_dev) = shelf_dev {
+        for cand in candidates.iter().flatten() {
+            if let Ok(canon) = cand.canonicalize()
+                && dev_of(&canon) == Some(want_dev)
+                && fits(&canon)
+            {
+                return canon.join(&leaf);
+            }
+        }
+    }
+    for cand in candidates.iter().flatten() {
+        if let Ok(canon) = cand.canonicalize()
+            && fits(&canon)
+        {
+            return canon.join(&leaf);
+        }
+    }
+    PathBuf::from(format!("/tmp/{leaf}"))
+}
+
 impl Scratch {
     fn new(tag: &str) -> Scratch {
         let seq = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let base = PathBuf::from(format!("/tmp/bd-{tag}-{}-{seq}", std::process::id()));
+        let base = scratch_parent(tag, seq);
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("create scratch base");
         let base = base.canonicalize().expect("canonicalize scratch base");
@@ -1109,4 +1162,298 @@ fn daemon_end_to_end_fast_path_with_direct_script_file_leaf() {
         prof5.contains("resident daemon fast path"),
         "expected warm no-op after ScriptFile edit to hit fast path again, got:\n{prof5}",
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn kqueue_vnode_does_not_double_count_nonexistent_module_stems() {
+    use crate::daemon_watch::{KQUEUE_CAP, KqueueVnode};
+    use crate::sweep::{ABSENT, LeafKind, Leaves, MODULE, Rows, Stamp};
+    use blaze_ids::ContentId;
+    use std::os::unix::fs::MetadataExt;
+
+    let mut scratch = Scratch::new("kqstem");
+    let (_home, proj) = scratch.lane("p", true);
+    write_file(&proj, "Cargo.toml", "[package]\nname = \"kqstem\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write_file(&proj, "src/lib.rs", "pub mod m0;\n");
+    write_file(&proj, "src/m0.rs", "pub fn x() -> u8 { 1 }\n");
+    // Create ONE existing stem directory `src/m0/` so we also prove Phase 1 still registers
+    // existing `MODULE` stem directories before Phase 2.
+    std::fs::create_dir_all(proj.join("src/m0")).expect("mkdir src/m0");
+
+    let stat_of = |rel: &str| -> Stamp {
+        let md = std::fs::symlink_metadata(proj.join(rel)).expect("stat");
+        Stamp {
+            len: md.len(),
+            mtime_ns: md.mtime().cast_unsigned().wrapping_mul(1_000_000_000).wrapping_add(md.mtime_nsec().cast_unsigned()),
+            ctime_ns: md.ctime().cast_unsigned().wrapping_mul(1_000_000_000).wrapping_add(md.ctime_nsec().cast_unsigned()),
+            ino: md.ino(),
+            dev: md.dev(),
+        }
+    };
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let frame = bstd::mem::Frame::with_reserve(16 << 20, bstd::mem::Tag::Other).expect("frame");
+    let root_s = proj.to_string_lossy();
+    let zero_id = ContentId([0; 32]);
+
+    // Add `KQUEUE_CAP + 256` absent `MODULE` slots whose `src/ghost_N/` stem directories do NOT
+    // exist on disk. Before Wave 8, inserting every `MODULE` stem into `dir_set` inflated
+    // `estimated > KQUEUE_CAP` and caused `KqueueVnode::arm_with_env` to bail out before opening
+    // a single FD; with stem dirs tracked separately, only real existing dirs + files count.
+    let mut rows = Rows::new_in(&frame);
+    rows.push(LeafKind::Manifest, 0, "Cargo.toml", Some(stat_of("Cargo.toml")), zero_id);
+    rows.push(LeafKind::Slot, 0, "src/lib.rs", Some(stat_of("src/lib.rs")), zero_id);
+    rows.push(LeafKind::Slot, MODULE, "src/m0.rs", Some(stat_of("src/m0.rs")), zero_id);
+    for i in 0..(KQUEUE_CAP + 256) {
+        let rel = std::format!("src/ghost_{i}.rs");
+        rows.push(LeafKind::Slot, MODULE | ABSENT, &rel, None, zero_id);
+    }
+    let bytes = Leaves::bytes_in(&rows, &frame).expect("encode leaves");
+    let (leaves, _) = Leaves::of(&bytes).expect("decode leaves");
+
+    let mut kq = KqueueVnode::arm_with_env(&root_s, None, None, &leaves, true, &frame, alloc)
+        .expect("nonexistent MODULE stem dirs must NOT blow KQUEUE_CAP");
+    // Only `""`, `"src"`, `"src/m0"`, `"Cargo.toml"`, `"src/lib.rs"`, `"src/m0.rs"` = 6 FDs!
+    assert_eq!(kq.watched_count(), 6, "expected exactly 6 open FDs (3 real dirs + 3 real files)");
+
+    let clean = kq.poll_dirty(&frame);
+    assert!(clean.paths.is_empty() && !clean.needs_refresh && !clean.full_rescan, "initial poll must be clean");
+
+    // Existing stem dir `src/m0/` MUST still be watched so creating `src/m0/mod.rs` fires immediately.
+    write_file(&proj, "src/m0/mod.rs", "pub fn y() -> u8 { 2 }\n");
+    let dirty = kq.poll_dirty(&frame);
+    assert!(
+        dirty.paths.iter().any(|&p| p == "src/m0.rs" || p == "src/m0"),
+        "creating src/m0/mod.rs inside existing stem dir must be caught: {:?}",
+        dirty.paths.as_slice(),
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn kqueue_vnode_script_stat_stamped_and_symlinks_do_not_loop_refresh() {
+    use crate::daemon_watch::KqueueVnode;
+    use crate::engine_script_reads::{NONE, NOT_A_FILE, NOT_A_FOLDER, ReadKind};
+    use crate::sweep::{DIRECT_PATH, LeafKind, Leaves, Plant, Rows, Stamp};
+
+    let mut scratch = Scratch::new("kqsym");
+    let (_home, proj) = scratch.lane("p", true);
+    write_file(&proj, "Cargo.toml", "[package]\nname = \"kqsym\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write_file(&proj, "src/lib.rs", "pub fn ok() -> u8 { 1 }\n");
+    write_file(&proj, "real_dir/target.txt", "hello-symlink\n");
+    symlink(proj.join("real_dir/target.txt"), proj.join("src/link.txt")).expect("file symlink");
+    symlink(proj.join("real_dir"), proj.join("link_dir")).expect("dir symlink");
+
+    // 1. Verify `engine_script_reads::now` preserves settled stamps for `ReadKind::Stat`,
+    //    `(ReadKind::File, dir -> NOT_A_FILE)`, and `(ReadKind::Listing, file -> NOT_A_FOLDER)`.
+    struct FixedStamps;
+    impl crate::sweep::Stamps for FixedStamps {
+        fn stamp(&self, _path: &str, meta: &bstd::fs::Meta) -> Option<Stamp> {
+            Some(Stamp { len: meta.len, mtime_ns: 1, ctime_ns: 1, ino: 42, dev: 7 })
+        }
+        fn swept_at_ns(&self) -> u64 {
+            10_000_000_000
+        }
+        fn granularity_ns(&self) -> u64 {
+            1_000_000_000
+        }
+    }
+    let sim = bstd::io::Io::simulated(bstd::io::SimWorld::new(77, bstd::io::Limits::USUAL));
+    let cx = sim.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("cx");
+    let sim_root = sim.need_fs().expect("fs").open_dir(&cx, &bstd::path::Path::new("ws").expect("path")).expect("open sim");
+    sim_root
+        .publish(&cx, &bstd::path::Path::new("real_dir/target.txt").expect("path"), bstd::fs::Content::bytes(b"hello-symlink\n"), bstd::fs::Durable::No)
+        .expect("write sim");
+    let frame = bstd::mem::Frame::with_reserve(16 << 20, bstd::mem::Tag::Other).expect("frame");
+    let stamps = FixedStamps;
+
+    let (_, stat_file_stamp, stat_file_id) = crate::engine_script_reads::now(&cx, &sim_root, &stamps, Plant::None, ReadKind::Stat, "real_dir/target.txt", None, &frame).expect("stat file");
+    assert!(stat_file_stamp.is_some(), "ReadKind::Stat of a file must keep its settled stamp");
+    let (_, stat_dir_stamp, stat_dir_id) = crate::engine_script_reads::now(&cx, &sim_root, &stamps, Plant::None, ReadKind::Stat, "real_dir", None, &frame).expect("stat dir");
+    assert!(stat_dir_stamp.is_some(), "ReadKind::Stat of a dir must keep its settled stamp");
+    let (_, not_file_stamp, not_file_id) = crate::engine_script_reads::now(&cx, &sim_root, &stamps, Plant::None, ReadKind::File, "real_dir", None, &frame).expect("file on dir");
+    assert_eq!(not_file_id, NOT_A_FILE);
+    assert!(not_file_stamp.is_some(), "ReadKind::File on dir (NOT_A_FILE) must keep its settled stamp");
+    let (_, not_dir_stamp, not_dir_id) = crate::engine_script_reads::now(&cx, &sim_root, &stamps, Plant::None, ReadKind::Listing, "real_dir/target.txt", None, &frame).expect("listing on file");
+    assert_eq!(not_dir_id, NOT_A_FOLDER);
+    assert!(not_dir_stamp.is_some(), "ReadKind::Listing on file (NOT_A_FOLDER) must keep its settled stamp");
+
+    // 2. Verify `KqueueVnode` with stamped `ScriptStat`, symlinked file, symlinked dir, and absent
+    //    `ScriptStat` arms cleanly with ZERO `initial_dirty` and `!needs_refresh` (no infinite re-arm!).
+    let target_stat_of = |rel: &str| -> Stamp {
+        let md = std::fs::metadata(proj.join(rel)).expect("stat following symlink");
+        Stamp {
+            len: md.len(),
+            mtime_ns: md.mtime().cast_unsigned().wrapping_mul(1_000_000_000).wrapping_add(md.mtime_nsec().cast_unsigned()),
+            ctime_ns: md.ctime().cast_unsigned().wrapping_mul(1_000_000_000).wrapping_add(md.ctime_nsec().cast_unsigned()),
+            ino: md.ino(),
+            dev: md.dev(),
+        }
+    };
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let root_s = proj.to_string_lossy();
+    let mut rows = Rows::new_in(&frame);
+    rows.push(LeafKind::ScriptStat, DIRECT_PATH, "real_dir/target.txt", Some(target_stat_of("real_dir/target.txt")), stat_file_id);
+    rows.push(LeafKind::ScriptStat, DIRECT_PATH, "real_dir", Some(target_stat_of("real_dir")), stat_dir_id);
+    rows.push(LeafKind::ScriptFile, DIRECT_PATH, "real_dir", Some(target_stat_of("real_dir")), not_file_id);
+    rows.push(LeafKind::ScriptListing, DIRECT_PATH, "real_dir/target.txt", Some(target_stat_of("real_dir/target.txt")), not_dir_id);
+    rows.push(LeafKind::ScriptStat, DIRECT_PATH, "real_dir/absent.txt", None, NONE);
+    // Symlinked file & symlinked directory (previously looped `initial_needs_refresh = true` forever!).
+    rows.push(LeafKind::ScriptStat, 0, "src/link.txt", Some(target_stat_of("src/link.txt")), stat_file_id);
+    rows.push(LeafKind::Listing, 0, "link_dir", Some(target_stat_of("link_dir")), blaze_ids::ContentId([1; 32]));
+    let bytes = Leaves::bytes_in(&rows, &frame).expect("encode leaves");
+    let (leaves, _) = Leaves::of(&bytes).expect("decode leaves");
+
+    let mut kq = KqueueVnode::arm_with_env(&root_s, None, None, &leaves, true, &frame, alloc)
+        .expect("KqueueVnode::arm_with_env with stamped ScriptStat + symlinks");
+    let p1 = kq.poll_dirty(&frame);
+    assert!(
+        p1.paths.is_empty() && !p1.needs_refresh && !p1.full_rescan,
+        "stamped ScriptStat + symlinks must be immediately clean without refresh loop: paths={:?} needs_refresh={} full_rescan={}",
+        p1.paths.as_slice(),
+        p1.needs_refresh,
+        p1.full_rescan,
+    );
+
+    // 3. Mutations to symlink target and creating the absent ScriptStat path are still caught immediately!
+    write_file(&proj, "real_dir/target.txt", "hello-edited!!\n");
+    let p2 = kq.poll_dirty(&frame);
+    assert!(
+        p2.paths.iter().any(|&p| p == "src/link.txt") && p2.paths.iter().any(|&p| p == "real_dir/target.txt"),
+        "editing symlink target must dirty both symlink and target leaves: {:?}",
+        p2.paths.as_slice(),
+    );
+
+    write_file(&proj, "real_dir/absent.txt", "appeared\n");
+    let p3 = kq.poll_dirty(&frame);
+    assert!(
+        p3.paths.iter().any(|&p| p == "real_dir/absent.txt") && p3.needs_refresh,
+        "creating absent ScriptStat file must dirty it and mark needs_refresh: paths={:?} needs_refresh={}",
+        p3.paths.as_slice(),
+        p3.needs_refresh,
+    );
+}
+
+#[test]
+fn env_fingerprint_tracks_path_developer_dir_and_toolchains() {
+    let heap = blaze_own::testing::heap();
+    let shared = heap.shared();
+    let alloc = heap.alloc();
+    let make_env = |pairs: &[(&str, &str)]| bstd::env::Env::from_vars(bstd::env::Vars::from_pairs_in(pairs, shared));
+
+    let base = super::EnvFingerprint::from_env(&make_env(&[("PATH", "/usr/bin"), ("DEVELOPER_DIR", "/dev1"), ("TOOLCHAINS", "t1")]), alloc);
+    let diff_path = super::EnvFingerprint::from_env(&make_env(&[("PATH", "/opt/bin"), ("DEVELOPER_DIR", "/dev1"), ("TOOLCHAINS", "t1")]), alloc);
+    let diff_dev = super::EnvFingerprint::from_env(&make_env(&[("PATH", "/usr/bin"), ("DEVELOPER_DIR", "/dev2"), ("TOOLCHAINS", "t1")]), alloc);
+    let diff_tc = super::EnvFingerprint::from_env(&make_env(&[("PATH", "/usr/bin"), ("DEVELOPER_DIR", "/dev1"), ("TOOLCHAINS", "t2")]), alloc);
+    assert!(base != diff_path, "PATH change must invalidate EnvFingerprint");
+    assert!(base != diff_dev, "DEVELOPER_DIR change must invalidate EnvFingerprint");
+    assert!(base != diff_tc, "TOOLCHAINS change must invalidate EnvFingerprint");
+}
+
+#[test]
+fn rebase_relative_origin_from_client_cwd() {
+    let frame = bstd::mem::Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("frame");
+    assert_eq!(super::rebase_relative_path("/ws/member", "../records", "/ws", &frame), Some("records"));
+    assert_eq!(super::rebase_relative_path("/ws/member", "sub/records", "/ws", &frame), Some("member/sub/records"));
+    assert_eq!(super::rebase_relative_path("/ws/member", "../../outside", "/ws", &frame), None);
+    assert_eq!(super::rebase_relative_path("/ws/member", "http://127.0.0.1:8080", "/ws", &frame), None);
+    assert_eq!(super::daemon_fs_root_abs("/parent/ws", "ws"), "/parent");
+}
+
+#[cfg(unix)]
+#[test]
+fn locate_workspace_root_respects_exclude_and_package_workspace() {
+    let mut scratch = Scratch::new("wsexcl");
+    let (_home, proj) = scratch.lane("p", false);
+    write_file(&proj, "Cargo.toml", "[workspace]\nmembers = [\"a\"]\nexclude = [\"excl\"]\n");
+    write_file(&proj, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\n");
+    write_file(&proj, "excl/Cargo.toml", "[package]\nname = \"excl\"\nversion = \"0.1.0\"\n");
+    write_file(&proj, "explicit/Cargo.toml", "[package]\nname = \"explicit\"\nversion = \"0.1.0\"\nworkspace = \"..\"\n");
+
+    let frame = bstd::mem::Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("frame");
+    let root_s = proj.to_string_lossy();
+    let a_s = proj.join("a").to_string_lossy().into_owned();
+    let excl_s = proj.join("excl").to_string_lossy().into_owned();
+    let explicit_s = proj.join("explicit").to_string_lossy().into_owned();
+
+    let mut out = [0u8; 4096];
+    assert_eq!(crate::daemon_client::locate_workspace_root(&a_s, &root_s, &frame, &mut out), Some(root_s.as_ref()));
+    assert_eq!(crate::daemon_client::locate_workspace_root(&excl_s, &root_s, &frame, &mut out), Some(excl_s.as_str()));
+    assert_eq!(crate::daemon_client::locate_workspace_root(&explicit_s, &root_s, &frame, &mut out), None);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn kqueue_vnode_root_symlink_retarget_invalidates_descendants_and_nested_git_watched() {
+    use crate::daemon_watch::KqueueVnode;
+    use crate::sweep::{LeafKind, Leaves, Rows, Stamp};
+    use blaze_sys::posix::io::CWD;
+    use blaze_sys::posix::proc::rename_at;
+
+    fn cpath<'a>(p: &Path, buf: &'a mut [u8; 4096]) -> blaze_sys::Path<'a> {
+        let b = p.to_str().expect("utf8").as_bytes();
+        buf[..b.len()].copy_from_slice(b);
+        buf[b.len()] = 0;
+        blaze_sys::Path::new(core::ffi::CStr::from_bytes_with_nul(&buf[..=b.len()]).expect("cstr"))
+    }
+    let make_link = |target: &Path, link: &Path| {
+        symlink(target, link).expect("symlink");
+    };
+
+    let mut scratch = Scratch::new("kqretarget");
+    let (_home, proj) = scratch.lane("p", false);
+    write_file(&proj, "target_a/Cargo.toml", "[package]\nname = \"m\"\nversion = \"0.1.0\"\n");
+    write_file(&proj, "target_a/src/lib.rs", "pub fn a() -> u32 { 1 }\n");
+    write_file(&proj, "target_b/Cargo.toml", "[package]\nname = \"m\"\nversion = \"0.1.0\"\n");
+    write_file(&proj, "target_b/src/lib.rs", "pub fn a() -> u32 { 2 }\n");
+    make_link(&proj.join("target_a"), &proj.join("member"));
+
+    // Nested git repository inside `sub/.git`.
+    write_file(&proj, "sub/.git/HEAD", "ref: refs/heads/main\n");
+    write_file(&proj, "sub/.git/refs/heads/main", "1111111111111111111111111111111111111111\n");
+
+    let target_stat_of = |rel: &str| -> Stamp {
+        let st = posix_stat(&proj.join(rel)).expect("stat");
+        Stamp {
+            len: st.st_size.cast_unsigned(),
+            mtime_ns: st.st_mtime.cast_unsigned().wrapping_mul(1_000_000_000).wrapping_add(st.st_mtime_nsec.cast_unsigned()),
+            ctime_ns: st.st_ctime.cast_unsigned().wrapping_mul(1_000_000_000).wrapping_add(st.st_ctime_nsec.cast_unsigned()),
+            ino: st.st_ino,
+            dev: i64::from(st.st_dev).cast_unsigned(),
+        }
+    };
+
+    let frame = bstd::mem::Frame::with_reserve(4 << 20, bstd::mem::Tag::Other).expect("frame");
+    let alloc = blaze_own::testing::heap().alloc();
+    let root_s = proj.to_string_lossy();
+    let mut rows = Rows::new_in(&frame);
+    rows.push(LeafKind::Manifest, 0, "member/Cargo.toml", Some(target_stat_of("member/Cargo.toml")), blaze_ids::ContentId([1; 32]));
+    rows.push(LeafKind::Slot, 0, "member/src/lib.rs", Some(target_stat_of("member/src/lib.rs")), blaze_ids::ContentId([2; 32]));
+    rows.push(LeafKind::ScriptGit, 0, "sub\nrev-parse HEAD", None, blaze_ids::ContentId([3; 32]));
+    let bytes = Leaves::bytes_in(&rows, &frame).expect("encode leaves");
+    let (leaves, _) = Leaves::of(&bytes).expect("decode leaves");
+
+    let mut kq = KqueueVnode::arm_with_env(&root_s, None, None, &leaves, true, &frame, alloc).expect("arm");
+    // Drain initial git verification.
+    let init = kq.poll_dirty(&frame);
+    assert!(init.git_dirty, "initial post-EV_ADD git drain expected");
+
+    // 1. Atomic retarget of root symlink `member`: must dirty `member/Cargo.toml` and `member/src/lib.rs`!
+    make_link(&proj.join("target_b"), &proj.join("member.tmp"));
+    let (mut b1, mut b2) = ([0u8; 4096], [0u8; 4096]);
+    rename_at(CWD, cpath(&proj.join("member.tmp"), &mut b1), CWD, cpath(&proj.join("member"), &mut b2)).expect("atomic rename");
+    let p_sym = kq.poll_dirty(&frame);
+    assert!(
+        p_sym.paths.iter().any(|&p| p == "member/Cargo.toml")
+            && p_sym.paths.iter().any(|&p| p == "member/src/lib.rs"),
+        "retargeting root symlink dir must dirty descendant leaves: {:?}",
+        p_sym.paths.as_slice(),
+    );
+
+    // 2. Updating the nested repo's `sub/.git/refs/heads/main` must fire `git_dirty`!
+    write_file(&proj, "sub/.git/refs/heads/main", "2222222222222222222222222222222222222222\n");
+    let p_git = kq.poll_dirty(&frame);
+    assert!(p_git.git_dirty, "nested ScriptGit repo ref update must fire git_dirty");
 }

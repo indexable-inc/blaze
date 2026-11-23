@@ -158,6 +158,9 @@ pub(super) struct RawDep<'a> {
 pub(super) struct Raw<'a> {
     pub workspace: Option<RawWorkspace<'a>>,
     pub package: Option<RawPackage<'a>>,
+    /// Every `[patch.<source>]` entry in this manifest as `(source_key, dep)` (only the workspace
+    /// root's is read for non-member path packages).
+    pub patches: Vec<(Text<'a>, RawDep<'a>), Alloc<'a>>,
 }
 
 /// Reads `text`, the manifest `id`, whose path is `path` (for the error).
@@ -176,7 +179,19 @@ pub(super) fn read<'a>(text: &str, id: ManifestId, path: &str, alloc: Alloc<'a>)
         Some(package) => Some(r.package(root, package)?),
         None => None,
     };
-    Ok(Raw { workspace, package })
+    let mut patches = Vec::new_in(alloc);
+    if let Some(patch) = root.get("patch") {
+        r.table(patch, "patch")?;
+        for source in patch.children() {
+            let source_key = source.key();
+            let mut deps = Vec::new_in(alloc);
+            r.deps(source, "patch", DepKind::Normal, None, &mut deps)?;
+            for dep in deps {
+                patches.push((String::from_str_in(source_key, alloc), dep));
+            }
+        }
+    }
+    Ok(Raw { workspace, package, patches })
 }
 
 struct Reader<'s, 'a> {

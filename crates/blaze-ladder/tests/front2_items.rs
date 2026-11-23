@@ -7,10 +7,10 @@
 
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::Front2;
-use blaze_ladder::front2::body::lower_fn;
 use blaze_ladder::front2::check::{BuildOrder, Records, check_body};
 use blaze_ladder::front2::consts::Consts;
 use blaze_ladder::front2::heads::Store;
+use blaze_ladder::front2::lower_made::{LowerTarget, lower_made};
 use blaze_ladder::front2::spell::Spelling;
 use blaze_ladder::refusal::SourceFile;
 use blaze_lower::scoped::Prepares;
@@ -43,13 +43,13 @@ fn check_fns(text: &str, fns: &[&str]) -> Vec<(String, String)> {
         let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &[n] }, Alloc::global())
             .unwrap_or_else(|e| panic!("`{n}`: {e}"));
         let k = found.whole(1).unwrap_or_else(|| panic!("`{n}` not named")).key;
-        let outcome = match lower_fn(&names, prepared, &mut front.keys, &mut store, k) {
+        let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, prepared)) };
+        let outcome = match lower_made(&mut records, prepared, LowerTarget::Free(k)) {
             Err(e) => format!("not lowered: {e}"),
             Ok(body) => {
                 let view = body.lowered.view();
                 let spell = Spelling::of(&view).unwrap_or_else(|e| panic!("spelling `{n}`: {e:?}"));
                 let scope = body.scope(&spell);
-                let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, prepared)) };
                 match check_body(&mut records, &body, &scope) {
                     Ok(done) if done.diags.is_empty() => "clean".to_string(),
                     Ok(done) => {

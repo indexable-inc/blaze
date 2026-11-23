@@ -812,85 +812,135 @@ pub fn expr_to_poly<A: Allocator + Copy>(
     if u32_to_usize(root.0) >= n {
         return Err(AlgebraError::InvalidExpr { expr: root, node_count: n });
     }
-    let mut cache: OwnVec<Option<Option<Poly<A>>>, A> = OwnVec::with_capacity_in(n, g.alloc());
+    let alloc = g.alloc();
+    let mut cache: OwnVec<Option<Option<Poly<A>>>, A> = OwnVec::with_capacity_in(n, alloc);
     for _ in 0..n {
         cache.push(None);
     }
-    Ok(expr_to_poly_memo(g, root, &mut cache)?)
-}
-
-fn expr_to_poly_memo<A: Allocator + Copy>(
-    g: &ExprGraph<A>,
-    id: ExprId,
-    cache: &mut OwnVec<Option<Option<Poly<A>>>, A>,
-) -> Result<Option<Poly<A>>, AlgebraError> {
-    let idx = u32_to_usize(id.0);
-    let alloc = g.alloc();
-    if let Some(Some(hit)) = cache.get(idx) {
-        return Ok(hit.as_ref().map(|p| p.clone_in(alloc)));
-    }
-    let res: Option<Poly<A>> = match g.node(id)? {
-        Op::Const(bits) => Rat::from_f64_exact(f64::from_bits(bits)).map(|r| Poly::constant_in(r, alloc)),
-        Op::Var(v) => Some(Poly::var_in(v, alloc)),
-        Op::Neg(a) => match expr_to_poly_memo(g, a, cache)? {
-            Some(pa) => pa.neg().ok(),
-            None => None,
-        },
-        Op::Add(a, b) => match (expr_to_poly_memo(g, a, cache)?, expr_to_poly_memo(g, b, cache)?) {
-            (Some(pa), Some(pb)) => pa.add(&pb).ok(),
-            _ => None,
-        },
-        Op::Sub(a, b) => match (expr_to_poly_memo(g, a, cache)?, expr_to_poly_memo(g, b, cache)?) {
-            (Some(pa), Some(pb)) => pa.sub(&pb).ok(),
-            _ => None,
-        },
-        Op::Mul(a, b) => match (expr_to_poly_memo(g, a, cache)?, expr_to_poly_memo(g, b, cache)?) {
-            (Some(pa), Some(pb)) => pa.mul(&pb).ok(),
-            _ => None,
-        },
-        Op::Div(a, b) => match (expr_to_poly_memo(g, a, cache)?, expr_to_poly_memo(g, b, cache)?) {
-            (Some(pa), Some(pb)) => match pb.as_const() {
-                Some(c) if !c.is_zero() => Rat::ONE.checked_div(c).ok().and_then(|inv| pa.scale(inv).ok()),
+    let mut stack: OwnVec<(ExprId, bool), A> = OwnVec::new_in(alloc);
+    stack.push((root, false));
+    while let Some((id, ready)) = stack.pop() {
+        let idx = u32_to_usize(id.0);
+        if matches!(cache.get(idx), Some(Some(_))) {
+            continue;
+        }
+        let op = g.node(id)?;
+        if !ready {
+            match op {
+                Op::Const(bits) => {
+                    let res = Rat::from_f64_exact(f64::from_bits(bits))
+                        .map(|r| Poly::constant_in(r, alloc));
+                    if let Some(slot) = cache.get_mut(idx) {
+                        *slot = Some(res);
+                    }
+                }
+                Op::Var(v) => {
+                    if let Some(slot) = cache.get_mut(idx) {
+                        *slot = Some(Some(Poly::var_in(v, alloc)));
+                    }
+                }
+                Op::Neg(a) => {
+                    stack.push((id, true));
+                    stack.push((a, false));
+                }
+                Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) | Op::Div(a, b) => {
+                    stack.push((id, true));
+                    stack.push((b, false));
+                    stack.push((a, false));
+                }
+                Op::Pow(a, b) => {
+                    let valid_exp = g
+                        .node(b)?
+                        .as_const()
+                        .and_then(|exp_f| (0..=MAX_POLY_DEGREE).find(|&k| f64::from(k) == exp_f));
+                    if valid_exp.is_some() {
+                        stack.push((id, true));
+                        stack.push((a, false));
+                    } else if let Some(slot) = cache.get_mut(idx) {
+                        *slot = Some(None);
+                    }
+                }
+                Op::Fma(a, b, c) => {
+                    stack.push((id, true));
+                    stack.push((c, false));
+                    stack.push((b, false));
+                    stack.push((a, false));
+                }
+                Op::Sin(_)
+                | Op::Cos(_)
+                | Op::Tan(_)
+                | Op::Exp(_)
+                | Op::Ln(_)
+                | Op::Sqrt(_)
+                | Op::Tanh(_)
+                | Op::Abs(_)
+                | Op::Select(_, _, _) => {
+                    if let Some(slot) = cache.get_mut(idx) {
+                        *slot = Some(None);
+                    }
+                }
+            }
+            continue;
+        }
+        fn get_p<'c, A: Allocator + Copy>(
+            cache: &'c [Option<Option<Poly<A>>>],
+            e: ExprId,
+        ) -> Option<&'c Poly<A>> {
+            cache
+                .get(u32_to_usize(e.0))
+                .and_then(Option::as_ref)
+                .and_then(Option::as_ref)
+        }
+        let res: Option<Poly<A>> = match op {
+            Op::Neg(a) => get_p(&cache, a).and_then(|pa| pa.neg().ok()),
+            Op::Add(a, b) => match (get_p(&cache, a), get_p(&cache, b)) {
+                (Some(pa), Some(pb)) => pa.add(pb).ok(),
                 _ => None,
             },
-            _ => None,
-        },
-        Op::Pow(a, b) => {
-            if let Some(exp_f) = g.node(b)?.as_const() {
-                if let Some(exp_u) = (0..=MAX_POLY_DEGREE).find(|&k| f64::from(k) == exp_f) {
-                    match expr_to_poly_memo(g, a, cache)? {
-                        Some(pa) => pa.pow_u32(exp_u).ok(),
-                        None => None,
+            Op::Sub(a, b) => match (get_p(&cache, a), get_p(&cache, b)) {
+                (Some(pa), Some(pb)) => pa.sub(pb).ok(),
+                _ => None,
+            },
+            Op::Mul(a, b) => match (get_p(&cache, a), get_p(&cache, b)) {
+                (Some(pa), Some(pb)) => pa.mul(pb).ok(),
+                _ => None,
+            },
+            Op::Div(a, b) => match (get_p(&cache, a), get_p(&cache, b)) {
+                (Some(pa), Some(pb)) => match pb.as_const() {
+                    Some(c) if !c.is_zero() => {
+                        Rat::ONE.checked_div(c).ok().and_then(|inv| pa.scale(inv).ok())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+            Op::Pow(a, b) => {
+                if let Some(exp_f) = g.node(b)?.as_const() {
+                    if let Some(exp_u) = (0..=MAX_POLY_DEGREE).find(|&k| f64::from(k) == exp_f) {
+                        get_p(&cache, a).and_then(|pa| pa.pow_u32(exp_u).ok())
+                    } else {
+                        None
                     }
                 } else {
                     None
                 }
-            } else {
-                None
             }
-        }
-        Op::Fma(a, b, c) => match (
-            expr_to_poly_memo(g, a, cache)?,
-            expr_to_poly_memo(g, b, cache)?,
-            expr_to_poly_memo(g, c, cache)?,
-        ) {
-            (Some(pa), Some(pb), Some(pc)) => pa.mul(&pb).ok().and_then(|ab| ab.add(&pc).ok()),
+            Op::Fma(a, b, c) => match (get_p(&cache, a), get_p(&cache, b), get_p(&cache, c)) {
+                (Some(pa), Some(pb), Some(pc)) => {
+                    pa.mul(pb).ok().and_then(|ab| ab.add(pc).ok())
+                }
+                _ => None,
+            },
             _ => None,
-        },
-        Op::Sin(_)
-        | Op::Cos(_)
-        | Op::Tan(_)
-        | Op::Exp(_)
-        | Op::Ln(_)
-        | Op::Sqrt(_)
-        | Op::Tanh(_)
-        | Op::Abs(_)
-        | Op::Select(_, _, _) => None,
-    };
-    if let Some(slot) = cache.get_mut(idx) {
-        *slot = Some(res.as_ref().map(|p| p.clone_in(alloc)));
+        };
+        if let Some(slot) = cache.get_mut(idx) {
+            *slot = Some(res);
+        }
     }
-    Ok(res)
+    Ok(cache
+        .get_mut(u32_to_usize(root.0))
+        .and_then(Option::take)
+        .flatten())
 }
 
 /// Emit a canonical [`Poly`] back into [`ExprGraph`] as a clean sum of monomials.

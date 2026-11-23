@@ -665,7 +665,7 @@ pub fn visit<T: Tys>(
     tys: &T,
     work: &mut Vec<(Ty, u32), Alloc<'_>>,
     root: Ty,
-    mut visit: impl FnMut(Ty, TyKind) -> bool,
+    mut f: impl FnMut(Ty, TyKind) -> bool,
 ) -> Result<(), SolveError> {
     let base = work.len();
     work.push((root, 0));
@@ -679,7 +679,7 @@ pub fn visit<T: Tys>(
         }
         let t = tys.shallow_resolve(t);
         let k = tys.kind(t);
-        if !visit(t, k) {
+        if !f(t, k) {
             continue;
         }
         let c = children(k);

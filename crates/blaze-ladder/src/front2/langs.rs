@@ -12,7 +12,7 @@ use super::index::Index;
 use crate::resolve::{Kind, Ns};
 
 /// The lang items that are traits: what `TraitDef::lang` may be.
-pub const TRAITS: [LangItem; 52] = [
+pub const TRAITS: [LangItem; 53] = [
     LangItem::Sized,
     LangItem::MetaSized,
     LangItem::PointeeSized,
@@ -65,6 +65,7 @@ pub const TRAITS: [LangItem; 52] = [
     LangItem::DiscriminantKind,
     LangItem::Future,
     LangItem::Freeze,
+    LangItem::From,
 ];
 
 /// The trait lang item `#[lang = "name"]` declares, if `name` is one.
@@ -84,12 +85,14 @@ pub enum Mark {
     /// (`crate::fmt::Display`), which the names library resolves from the module of core's
     /// `#[lang = "sized"]`.
     CorePath(&'static [&'static str]),
+    /// Either `#[lang = "name"]` (e.g. `#![no_core]` tests) or `core::<path>` (real `core`).
+    LangOrCorePath(&'static str, &'static [&'static str]),
 }
 
 /// The `#[lang]` name of `item`, if the library marks it so ([`mark`]).
 pub fn lang_name(item: LangItem) -> Option<&'static str> {
     match mark(item) {
-        Mark::Lang(n) => Some(n),
+        Mark::Lang(n) | Mark::LangOrCorePath(n, _) => Some(n),
         Mark::CorePath(_) => None,
     }
 }
@@ -116,6 +119,13 @@ pub fn find<'n, S: super::source::NamesSource<'n>>(index: &Index<'_>, resolver: 
     let path = match mark(item) {
         Mark::Lang(n) => return Ok(index.lang(n)),
         Mark::CorePath(p) => p,
+        Mark::LangOrCorePath(n, p) => {
+            if let Some(found) = index.lang(n) {
+                return Ok(Some(found));
+            }
+            let Some(sized) = index.lang("sized") else { return Ok(None) };
+            return Ok(in_core(resolver, sized, p).ok().flatten());
+        }
     };
     let Some(sized) = index.lang("sized") else { return Ok(None) };
     in_core(resolver, sized, path)
@@ -249,6 +259,7 @@ pub fn mark(item: LangItem) -> Mark {
         LangItem::FmtLowerExp => return Mark::CorePath(&["fmt", "LowerExp"]),
         LangItem::FmtUpperExp => return Mark::CorePath(&["fmt", "UpperExp"]),
         LangItem::FmtPointer => return Mark::CorePath(&["fmt", "Pointer"]),
+        LangItem::From => return Mark::LangOrCorePath("from", &["convert", "From"]),
     })
 }
 
@@ -257,4 +268,4 @@ pub fn mark(item: LangItem) -> Mark {
 /// `core::mem::variant_count::<LangItem>()` and its order, so a new variant cannot be left out).
 /// The list's one home is blaze-typeck's `LangItem::ALL` (the checked-body record decodes a
 /// lang item by it).
-pub const ALL: [LangItem; 98] = LangItem::ALL;
+pub const ALL: [LangItem; 99] = LangItem::ALL;

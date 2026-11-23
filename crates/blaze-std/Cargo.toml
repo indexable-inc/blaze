@@ -61,8 +61,29 @@ blaze-reclaim.workspace = true
 blaze-report.workspace = true
 blaze-sha256.workspace = true
 blaze-spin.workspace = true
-# bstd::image's zlib: inflated straight into the buffer decode sized and limited, and deflated.
-blaze-deflate = { workspace = true, optional = true }
+# Pure `#![no_std]` leaf battery crates re-exported under `bstd::*` (zero third-party deps):
+# `bstd::base64`, `bstd::toml`, `bstd::semver`, `bstd::tar`, `bstd::search`, `bstd::bitflags`,
+# `bstd::tab`, `bstd::crypto::ed25519`, `bstd::digest::sha512`, `bstd::glob`, `bstd::unicode`,
+# `bstd::math`, `bstd::units`, `bstd::int`, `bstd::h2`, `bstd::columns`, `bstd::arrow`,
+# `bstd::sort` (`blaze-sort` + `blaze-radix`), and `bstd::compress` / `bstd::digest::{Crc32, Adler32}`.
+blaze-arrow-ipc.workspace = true
+blaze-base64.workspace = true
+blaze-bitflags.workspace = true
+blaze-columns.workspace = true
+blaze-deflate.workspace = true
+blaze-ed25519.workspace = true
+blaze-glob = { workspace = true, default-features = false }
+blaze-h2.workspace = true
+blaze-int.workspace = true
+blaze-math.workspace = true
+blaze-memchr.workspace = true
+blaze-semver.workspace = true
+blaze-sort.workspace = true
+blaze-tab.workspace = true
+blaze-tar.workspace = true
+blaze-toml.workspace = true
+blaze-unicode.workspace = true
+blaze-units.workspace = true
 
 # bstd::video's VideoToolbox provider (src/video/videotoolbox.rs).
 # The runtime's own system calls (a stream's terminal facts; on macOS the topology and QoS,
@@ -94,8 +115,8 @@ requests = ["dep:blaze-h1"]
 # `#[bstd::test]`'s drawn parameters (D109): `fn t(cx: &Cx, xs: Vec<u32, _>)`, each value drawn
 # from a tape by blaze-sim, shrunk and replayed. Turn it on in [dev-dependencies] only.
 sim-draws = ["dep:blaze-sim"]
-# `bstd::image`: PNG decode and encode, and its zlib.
-image = ["dep:blaze-deflate"]
+# `bstd::image`: PNG decode and encode (zlib/deflate is always available via `bstd::compress`).
+image = []
 # `bstd::test::native`: a test's native world, from a test's root of real-OS authority
 # (`blaze_core::testing::os()`); a crate's dev-dependencies turn it on, never its build.
 testing = ["blaze-core/testing", "blaze-own/testing"]

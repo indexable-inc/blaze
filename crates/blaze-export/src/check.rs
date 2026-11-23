@@ -92,6 +92,8 @@ pub struct MachoFacts {
     pub uuid: [u8; 16],
     /// `__text`'s file offset and size.
     pub text: (u64, u64),
+    /// `__DATA_CONST,__mod_init_func`'s file offset and size when present.
+    pub mod_init: Option<(u64, u64)>,
 }
 
 /// Checks a Mach-O arm64 executable.
@@ -106,6 +108,7 @@ pub fn macho(file: &[u8]) -> Result<MachoFacts, CheckError> {
     let mut segs = [MSeg::default(); MAX_SEGS];
     let mut nsegs = 0usize;
     let mut text_section = None;
+    let mut mod_init = None;
     let mut entry = None;
     let mut signature = None;
     let mut fixups = None;
@@ -166,6 +169,15 @@ pub fn macho(file: &[u8]) -> Result<MachoFacts, CheckError> {
                     }
                     if &file[s as usize..s as usize + 6] == b"__text" {
                         text_section = Some((offset, len));
+                    }
+                    if flags & 0xFF == 0x9 {
+                        field(len % 8 == 0, "__mod_init_func's size", len)?;
+                        if seg.name.starts_with(b"__DATA_CONST\0")
+                            && let Some(s_idx) = usize::try_from(s).ok()
+                            && file.get(s_idx..s_idx + 15) == Some(b"__mod_init_func".as_slice())
+                        {
+                            mod_init = Some((offset, len));
+                        }
                     }
                 }
                 segs[nsegs] = seg;
@@ -326,7 +338,7 @@ pub fn macho(file: &[u8]) -> Result<MachoFacts, CheckError> {
             return Err(CheckError::PageHash { page: page as u32 });
         }
     }
-    Ok(MachoFacts { entry, rebases, binds, pages: slots, uuid, text: text_section })
+    Ok(MachoFacts { entry, rebases, binds, pages: slots, uuid, text: text_section, mod_init })
 }
 
 /// What a checked ELF file says.
@@ -335,6 +347,12 @@ pub struct ElfFacts {
     pub entry: u64,
     pub relative: u32,
     pub binds: u32,
+    pub tls_relocs: u32,
+    pub needed: u32,
+    /// `DT_INIT_ARRAY`'s `(vaddr, size)` when present.
+    pub init_array: Option<(u64, u64)>,
+    /// `PT_TLS`'s `(p_filesz, p_memsz, p_align)` when present.
+    pub tls: Option<(u64, u64, u64)>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -348,7 +366,7 @@ struct Load {
 
 const MAX_LOADS: usize = 8;
 
-/// Checks an AArch64 ELF executable.
+/// Checks an AArch64 ELF executable (including executables with merged native C images).
 pub fn elf(file: &[u8]) -> Result<ElfFacts, CheckError> {
     within(file, 0, 64, "Elf64_Ehdr")?;
     field(file[..4] == [0x7F, b'E', b'L', b'F'] && file[4] == 2 && file[5] == 1, "e_ident", 0)?;
@@ -361,22 +379,23 @@ pub fn elf(file: &[u8]) -> Result<ElfFacts, CheckError> {
     within(file, phoff, 56 * phnum, "the program headers")?;
     let mut loads = [Load::default(); MAX_LOADS];
     let mut nloads = 0usize;
-    let (mut interp, mut dynamic, mut relro, mut stack) = (None, None, None, false);
+    let (mut interp, mut dynamic, mut relro, mut eh_frame_hdr, mut stack, mut tls) = (None, None, None, None, false, None);
     for k in 0..phnum {
         let at = phoff + 56 * k;
-        let kind = get32(file, at as usize);
+        let at_idx = usize::try_from(at).map_err(|_| CheckError::Bounds { what: "a program header", at })?;
+        let kind = get32(file, at_idx);
         let load = Load {
-            flags: get32(file, at as usize + 4),
-            offset: get64(file, at as usize + 8),
-            vaddr: get64(file, at as usize + 16),
-            filesz: get64(file, at as usize + 32),
-            memsz: get64(file, at as usize + 40),
+            flags: get32(file, at_idx + 4),
+            offset: get64(file, at_idx + 8),
+            vaddr: get64(file, at_idx + 16),
+            filesz: get64(file, at_idx + 32),
+            memsz: get64(file, at_idx + 40),
         };
-        let align = get64(file, at as usize + 48);
+        let align = get64(file, at_idx + 48);
         match kind {
             1 => {
                 if nloads == MAX_LOADS {
-                    return Err(CheckError::Field { what: "the number of loads", value: nloads as u64 + 1 });
+                    return Err(CheckError::Field { what: "the number of loads", value: u64::try_from(nloads + 1).unwrap_or(u64::MAX) });
                 }
                 if !align.is_power_of_two() || load.offset % align != load.vaddr % align {
                     return Err(CheckError::Align { what: "a load's offset against its address", at });
@@ -391,6 +410,19 @@ pub fn elf(file: &[u8]) -> Result<ElfFacts, CheckError> {
             }
             2 => dynamic = Some(load),
             3 => interp = Some(load),
+            7 => {
+                field(tls.is_none(), "duplicate PT_TLS", 7)?;
+                if !align.is_power_of_two() || load.offset % align != load.vaddr % align {
+                    return Err(CheckError::Align { what: "PT_TLS's alignment", at });
+                }
+                field(load.filesz <= load.memsz, "PT_TLS's filesz past its memsz", load.filesz)?;
+                field(load.memsz > 0, "PT_TLS's memsz", load.memsz)?;
+                if load.filesz > 0 {
+                    within(file, load.offset, load.filesz, "PT_TLS's bytes")?;
+                }
+                tls = Some((load, align));
+            }
+            0x6474_E550 => eh_frame_hdr = Some(load),
             0x6474_E552 => relro = Some(load),
             0x6474_E551 => stack = true,
             _ => {}
@@ -398,8 +430,9 @@ pub fn elf(file: &[u8]) -> Result<ElfFacts, CheckError> {
     }
     let loads = &loads[..nloads];
     let file_of = |vaddr: u64, len: u64, writable: bool, what: &'static str| -> Result<u64, CheckError> {
+        let end = vaddr.checked_add(len).ok_or(CheckError::Bounds { what, at: vaddr })?;
         for l in loads {
-            if vaddr >= l.vaddr && vaddr + len <= l.vaddr + l.filesz && (!writable || l.flags & 2 != 0) {
+            if vaddr >= l.vaddr && end <= l.vaddr + l.filesz && (!writable || l.flags & 2 != 0) {
                 return Ok(l.offset + (vaddr - l.vaddr));
             }
         }
@@ -411,60 +444,134 @@ pub fn elf(file: &[u8]) -> Result<ElfFacts, CheckError> {
     let Some(interp) = interp else { return Err(CheckError::Missing { what: "PT_INTERP" }) };
     field(interp.filesz > 0, "PT_INTERP's size", 0)?;
     let path = file_of(interp.vaddr, interp.filesz, false, "PT_INTERP")?;
-    field(file[(path + interp.filesz - 1) as usize] == 0, "PT_INTERP's terminator", 0)?;
+    let interp_term = usize::try_from(path + interp.filesz - 1).map_err(|_| CheckError::Bounds { what: "PT_INTERP", at: path })?;
+    field(file.get(interp_term).copied() == Some(0), "PT_INTERP's terminator", 0)?;
     let Some(relro) = relro else { return Err(CheckError::Missing { what: "PT_GNU_RELRO" }) };
     file_of(relro.vaddr, relro.filesz, true, "PT_GNU_RELRO")?;
+    if let Some(eh) = eh_frame_hdr
+        && eh.filesz > 0
+    {
+        file_of(eh.vaddr, eh.filesz, false, "PT_GNU_EH_FRAME")?;
+    }
+    let tls_facts = match tls {
+        None => None,
+        Some((load, align)) => {
+            if load.filesz > 0 {
+                let mapped = file_of(load.vaddr, load.filesz, false, "PT_TLS")?;
+                field(mapped == load.offset, "PT_TLS's file offset against its load", load.offset)?;
+            }
+            Some((load.filesz, load.memsz, align))
+        }
+    };
     let Some(dynamic) = dynamic else { return Err(CheckError::Missing { what: "PT_DYNAMIC" }) };
     let dyn_at = file_of(dynamic.vaddr, dynamic.filesz, true, "PT_DYNAMIC")?;
-    let (mut rela, mut relasz, mut strtab, mut strsz, mut hash, mut needed) = (None, None, None, None, None, None);
+    let (mut rela, mut relasz, mut relacount, mut strtab, mut strsz, mut hash) = (None, None, None, None, None, None);
+    let (mut init_array, mut init_arraysz) = (None, None);
+    let mut needed = 0u32;
     let mut k = 0u64;
     loop {
         if 16 * (k + 1) > dynamic.filesz {
             return Err(CheckError::Missing { what: "DT_NULL" });
         }
-        let tag = get64(file, (dyn_at + 16 * k) as usize);
-        let value = get64(file, (dyn_at + 16 * k + 8) as usize);
+        let off = usize::try_from(dyn_at + 16 * k).map_err(|_| CheckError::Bounds { what: "PT_DYNAMIC", at: dyn_at })?;
+        let tag = get64(file, off);
+        let value = get64(file, off + 8);
         match tag {
             0 => break,
-            1 => needed = Some(value),
+            1 => needed += 1,
             4 => hash = Some(value),
             5 => strtab = Some(value),
             7 => rela = Some(value),
             8 => relasz = Some(value),
             10 => strsz = Some(value),
+            25 => init_array = Some(value),
+            27 => init_arraysz = Some(value),
+            0x6FFF_FFF9 => relacount = Some(value),
             _ => {}
         }
         k += 1;
     }
-    let (Some(rela), Some(relasz), Some(strtab), Some(strsz), Some(hash), Some(needed)) = (rela, relasz, strtab, strsz, hash, needed) else {
+    field(needed > 0, "DT_NEEDED count", u64::from(needed))?;
+    let (Some(rela), Some(relasz), Some(strtab), Some(strsz), Some(hash)) = (rela, relasz, strtab, strsz, hash) else {
         return Err(CheckError::Missing { what: "a dynamic entry (DT_RELA, DT_RELASZ, DT_STRTAB, DT_STRSZ, DT_HASH, DT_NEEDED)" });
     };
     let strings = file_of(strtab, strsz, false, "DT_STRTAB")?;
-    field(needed < strsz, "DT_NEEDED's name", needed)?;
-    field(file[(strings + strsz - 1) as usize] == 0, "the string table's terminator", 0)?;
+    let strings_end = usize::try_from(strings + strsz - 1).map_err(|_| CheckError::Bounds { what: "DT_STRTAB", at: strings })?;
+    field(file.get(strings_end).copied() == Some(0), "the string table's terminator", 0)?;
+    // Verify every `DT_NEEDED` names a non-empty NUL-terminated string inside `DT_STRTAB`.
+    for i in 0..k {
+        let off = usize::try_from(dyn_at + 16 * i).map_err(|_| CheckError::Bounds { what: "PT_DYNAMIC", at: dyn_at })?;
+        if get64(file, off) == 1 {
+            let name_off = get64(file, off + 8);
+            field(name_off < strsz, "DT_NEEDED's name", name_off)?;
+            let start = usize::try_from(strings + name_off).map_err(|_| CheckError::Bounds { what: "DT_NEEDED", at: name_off })?;
+            let end = usize::try_from(strings + strsz).map_err(|_| CheckError::Bounds { what: "DT_STRTAB", at: strings })?;
+            let len = file.get(start..end).and_then(|slice| slice.iter().position(|&b| b == 0)).unwrap_or(0);
+            field(len > 0, "DT_NEEDED's name length", u64::try_from(len).unwrap_or(0))?;
+        }
+    }
+    let init_facts = match (init_array, init_arraysz) {
+        (None, None) => None,
+        (Some(vaddr), Some(size)) => {
+            if !vaddr.is_multiple_of(8) {
+                return Err(CheckError::Align { what: "DT_INIT_ARRAY", at: vaddr });
+            }
+            field(size > 0 && size.is_multiple_of(8), "DT_INIT_ARRAYSZ", size)?;
+            file_of(vaddr, size, true, "DT_INIT_ARRAY")?;
+            Some((vaddr, size))
+        }
+        _ => return Err(CheckError::Missing { what: "matching DT_INIT_ARRAY / DT_INIT_ARRAYSZ" }),
+    };
     let hash_at = file_of(hash, 8, false, "DT_HASH")?;
-    let nsyms = u64::from(get32(file, hash_at as usize + 4));
+    let hash_idx = usize::try_from(hash_at).map_err(|_| CheckError::Bounds { what: "DT_HASH", at: hash_at })?;
+    let nsyms = u64::from(get32(file, hash_idx + 4));
     field(relasz % 24 == 0, "DT_RELASZ", relasz)?;
     let rela_at = file_of(rela, relasz, false, "DT_RELA")?;
     let image_end = loads.iter().map(|l| l.vaddr + l.memsz).max().unwrap_or(0);
-    let (mut relative, mut binds) = (0u32, 0u32);
+    let (mut relative, mut binds, mut tls_relocs) = (0u32, 0u32, 0u32);
+    let mut saw_non_relative = false;
     for r in 0..relasz / 24 {
-        let at = (rela_at + 24 * r) as usize;
+        let at = usize::try_from(rela_at + 24 * r).map_err(|_| CheckError::Bounds { what: "DT_RELA", at: rela_at })?;
         let offset = get64(file, at);
         let info = get64(file, at + 8);
         let addend = get64(file, at + 16);
-        file_of(offset, 8, true, "a relocation's word")?;
         match info & 0xFFFF_FFFF {
             1027 => {
-                field(info >> 32 == 0 && addend < image_end, "an R_AARCH64_RELATIVE", addend)?;
+                file_of(offset, 8, true, "a relocation's word")?;
+                field(!saw_non_relative, "an R_AARCH64_RELATIVE after a non-relative relocation", r)?;
+                let target = addend & ((1u64 << 56) - 1);
+                field(info >> 32 == 0 && target < image_end, "an R_AARCH64_RELATIVE", addend)?;
                 relative += 1;
             }
             1025 | 257 => {
+                saw_non_relative = true;
+                file_of(offset, 8, true, "a relocation's word")?;
                 field(info >> 32 != 0 && info >> 32 < nsyms, "a bind's symbol", info >> 32)?;
                 binds += 1;
+            }
+            1030 => {
+                saw_non_relative = true;
+                file_of(offset, 8, true, "a TLS_TPREL64 relocation's word")?;
+                let Some((_, tls_memsz, _)) = tls_facts else {
+                    return Err(CheckError::Missing { what: "PT_TLS for R_AARCH64_TLS_TPREL64" });
+                };
+                field(info >> 32 == 0 && addend < tls_memsz, "an R_AARCH64_TLS_TPREL64", addend)?;
+                tls_relocs += 1;
+            }
+            1031 => {
+                saw_non_relative = true;
+                file_of(offset, 16, true, "a TLSDESC relocation's pair")?;
+                let Some((_, tls_memsz, _)) = tls_facts else {
+                    return Err(CheckError::Missing { what: "PT_TLS for R_AARCH64_TLSDESC" });
+                };
+                field(info >> 32 == 0 && addend < tls_memsz, "an R_AARCH64_TLSDESC", addend)?;
+                tls_relocs += 1;
             }
             other => return Err(CheckError::Field { what: "a relocation's type", value: other }),
         }
     }
-    Ok(ElfFacts { entry, relative, binds })
+    if let Some(count) = relacount {
+        field(count == u64::from(relative), "DT_RELACOUNT", count)?;
+    }
+    Ok(ElfFacts { entry, relative, binds, tls_relocs, needed, init_array: init_facts, tls: tls_facts })
 }

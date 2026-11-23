@@ -195,7 +195,7 @@ impl<'n> CrateTable<'n> for CrateList<'n> {
         CrateGraph::name(self, at)
     }
     fn place(&self, at: usize) -> Place {
-        if self.member(at) {
+        if self.member(at) || self.root(at).starts_with("/0/") {
             return Place::Checkout;
         }
         let Some(k) = tree_of(self.root(at)) else { return Place::Unplaced { why: "its root names no tree (`/<k>/...`)" } };

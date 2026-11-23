@@ -417,6 +417,29 @@ pub struct TypeckBody<'a> {
     /// Closure parameter annotations whose outer reference explicitly writes `'static`
     /// (`|lock: &'static str|`): `(closure_expr, param_index)`, ascending.
     pub closure_static_params: AVec<'a, (ExprId, u32)>,
+    /// Unexpanded `inline for pat in iter { body }` sites lowered in this body (ascending by
+    /// [`ExprId`]); `front2` uses each site's checked `iter` type to unroll the body before
+    /// final checking and codegen.
+    pub inline_fors: AVec<'a, InlineForSite>,
+}
+
+/// Whether an `inline for` iterates over one aggregate or lockstep-zips two (`zip_fields(lhs, rhs)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InlineForKind {
+    /// `inline for pat in iter { body }`.
+    Single { iter: ExprId },
+    /// `inline for pat in zip_fields(lhs, rhs) { body }`.
+    Zip { lhs: ExprId, rhs: ExprId },
+}
+
+/// One lowered `inline for pat in iter { body }` expression recorded on [`TypeckBody`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InlineForSite {
+    pub expr: ExprId,
+    pub pat: PatId,
+    pub iter: ExprId,
+    pub body: ExprId,
+    pub kind: InlineForKind,
 }
 
 impl<'a> TypeckBody<'a> {
@@ -1285,6 +1308,14 @@ impl Conv<'_, '_, '_, '_, '_> {
             }
             Expr::Underscore => tc::Expr::Underscore,
             Expr::Await(e) => tc::Expr::Await(e),
+            Expr::InlineFor { pat, iter, body } => {
+                let kind = match zip_fields_call(self.v, iter)? {
+                    Some((lhs, rhs)) => InlineForKind::Zip { lhs, rhs },
+                    None => InlineForKind::Single { iter },
+                };
+                self.out.inline_fors.push(InlineForSite { expr: e, pat, iter, body, kind });
+                tc::Expr::Missing
+            }
         })
     }
 
@@ -1475,6 +1506,7 @@ pub fn to_typeck<'a>(
         const_gaps: Vec::new_in(alloc),
         record_expr_schemas: Vec::new_in(alloc),
         closure_static_params: Vec::new_in(alloc),
+        inline_fors: Vec::new_in(alloc),
     };
     let mut slice_rest: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(view.pats.len(), alloc);
     slice_rest.resize(view.pats.len(), false);
@@ -1553,7 +1585,294 @@ pub fn to_typeck<'a>(
         let s = c.stmt(StmtId(len(i)))?;
         c.out.stmts.push(s);
     }
+    if !c.out.inline_fors.is_empty() {
+        wire_inline_fors(&mut c.out, alloc);
+    }
     Ok(c.out)
+}
+
+/// Recognizes `zip_fields(lhs, rhs)` as an `inline for` iterable, returning `(lhs, rhs)`.
+fn zip_fields_call(v: &View<'_>, iter: ExprId) -> Result<Option<(ExprId, ExprId)>, Refused> {
+    let Expr::Call { callee, args } = v.expr(iter)? else {
+        return Ok(None);
+    };
+    let Expr::Path(p) = v.expr(callee)? else {
+        return Ok(None);
+    };
+    let path = v.path(p)?;
+    if path.absolute || path.lang.is_some() {
+        return Ok(None);
+    }
+    let [seg] = v.segments(path)? else {
+        return Ok(None);
+    };
+    let s = Segment::decode(*seg)?;
+    if s.kind != SegKind::Ident || s.has_args || s.parenthesized {
+        return Ok(None);
+    }
+    let Some(name) = s.name else {
+        return Ok(None);
+    };
+    if v.name_text(name)? != "zip_fields" {
+        return Ok(None);
+    }
+    let [lhs, rhs] = *v.ids(args)? else {
+        return Ok(None);
+    };
+    Ok(Some((ExprId(lhs), ExprId(rhs))))
+}
+
+/// Prepares unexpanded `inline for pat in iter { body }` sites for the pre-unroll typeck pass:
+/// replaces each single site with `{ iter; }` and each `zip_fields(lhs, rhs)` site with
+/// `{ lhs; rhs; }` (blanking the synthetic `zip_fields` call and path callee so `blaze-typeck`
+/// infers and records `expr_ty` for each iterable without resolving `zip_fields`), and blanks
+/// every unreachable expression and pattern inside `body` and `pat` to `Missing` so writeback
+/// never reports `Unreached`.
+fn wire_inline_fors<'a>(out: &mut TypeckBody<'a>, alloc: Alloc<'a>) {
+    enum Work {
+        Expr(ExprId),
+        Pat(PatId),
+        Stmt(StmtId),
+    }
+
+    for i in 0..out.inline_fors.len() {
+        let Some(&site) = out.inline_fors.get(i) else { continue };
+        match site.kind {
+            InlineForKind::Single { iter } => {
+                let stmt_id = StmtId(len(out.stmts.len()));
+                out.stmts.push(tc::Stmt::Expr { expr: iter, semi: true });
+                let start = len(out.stmt_lists.len());
+                out.stmt_lists.push(stmt_id);
+                if let Some(slot) = out.exprs.get_mut(site.expr.ix()) {
+                    *slot = tc::Expr::Block {
+                        stmts: List { start, len: 1 },
+                        tail: None,
+                        scope: ScopeId(0),
+                    };
+                }
+            }
+            InlineForKind::Zip { lhs, rhs } => {
+                if let Some(call_slot) = out.exprs.get_mut(site.iter.ix()) {
+                    let prev = core::mem::replace(call_slot, tc::Expr::Missing);
+                    if let tc::Expr::Call { callee, .. } = prev
+                        && let Some(callee_slot) = out.exprs.get_mut(callee.ix())
+                    {
+                        *callee_slot = tc::Expr::Missing;
+                    }
+                }
+                let lhs_stmt = StmtId(len(out.stmts.len()));
+                out.stmts.push(tc::Stmt::Expr { expr: lhs, semi: true });
+                let rhs_stmt = StmtId(len(out.stmts.len()));
+                out.stmts.push(tc::Stmt::Expr { expr: rhs, semi: true });
+                let start = len(out.stmt_lists.len());
+                out.stmt_lists.push(lhs_stmt);
+                out.stmt_lists.push(rhs_stmt);
+                if let Some(slot) = out.exprs.get_mut(site.expr.ix()) {
+                    *slot = tc::Expr::Block {
+                        stmts: List { start, len: 2 },
+                        tail: None,
+                        scope: ScopeId(0),
+                    };
+                }
+            }
+        }
+    }
+
+    let mut work: Vec<Work, Alloc<'a>> = Vec::with_capacity_in(out.inline_fors.len().saturating_mul(2), alloc);
+    for site in out.inline_fors.iter() {
+        work.push(Work::Expr(site.body));
+        work.push(Work::Pat(site.pat));
+    }
+
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Expr(id) => {
+                let Some(slot) = out.exprs.get_mut(id.ix()) else { continue };
+                let expr = core::mem::replace(slot, tc::Expr::Missing);
+                match expr {
+                    tc::Expr::Missing
+                    | tc::Expr::Lit(_)
+                    | tc::Expr::Local(_)
+                    | tc::Expr::Path(_)
+                    | tc::Expr::Continue { .. }
+                    | tc::Expr::Underscore
+                    | tc::Expr::OffsetOf { .. } => {}
+                    tc::Expr::Paren(x)
+                    | tc::Expr::Loop { body: x }
+                    | tc::Expr::Field { base: x, .. }
+                    | tc::Expr::TupleField { base: x, .. }
+                    | tc::Expr::Unary { operand: x, .. }
+                    | tc::Expr::Ref { operand: x, .. }
+                    | tc::Expr::RawRef { operand: x, .. }
+                    | tc::Expr::Cast { operand: x, .. }
+                    | tc::Expr::Await(x)
+                    | tc::Expr::AsyncBlock { body: x, .. } => work.push(Work::Expr(x)),
+                    tc::Expr::Break { value, .. } | tc::Expr::Return { value } => {
+                        if let Some(x) = value {
+                            work.push(Work::Expr(x));
+                        }
+                    }
+                    tc::Expr::Block { stmts, tail, .. } | tc::Expr::ConstBlock { stmts, tail, .. } => {
+                        if let Some(slice) = out.stmt_lists.get(stmts.range()) {
+                            for &s in slice {
+                                work.push(Work::Stmt(s));
+                            }
+                        }
+                        if let Some(t) = tail {
+                            work.push(Work::Expr(t));
+                        }
+                    }
+                    tc::Expr::If { cond, then, else_ } => {
+                        work.push(Work::Expr(cond));
+                        work.push(Work::Expr(then));
+                        if let Some(e) = else_ {
+                            work.push(Work::Expr(e));
+                        }
+                    }
+                    tc::Expr::Let { pat, init } => {
+                        work.push(Work::Pat(pat));
+                        work.push(Work::Expr(init));
+                    }
+                    tc::Expr::Match { scrutinee, arms } => {
+                        work.push(Work::Expr(scrutinee));
+                        if let Some(slice) = out.arms.get(arms.range()) {
+                            for arm in slice {
+                                work.push(Work::Pat(arm.pat));
+                                if let Some(g) = arm.guard {
+                                    work.push(Work::Expr(g));
+                                }
+                                work.push(Work::Expr(arm.body));
+                            }
+                        }
+                    }
+                    tc::Expr::Call { callee, args } => {
+                        work.push(Work::Expr(callee));
+                        if let Some(slice) = out.expr_lists.get(args.range()) {
+                            for &a in slice {
+                                work.push(Work::Expr(a));
+                            }
+                        }
+                    }
+                    tc::Expr::MethodCall { receiver, args, .. } => {
+                        work.push(Work::Expr(receiver));
+                        if let Some(slice) = out.expr_lists.get(args.range()) {
+                            for &a in slice {
+                                work.push(Work::Expr(a));
+                            }
+                        }
+                    }
+                    tc::Expr::Binary { lhs, rhs, .. }
+                    | tc::Expr::Assign { lhs, rhs }
+                    | tc::Expr::AssignOp { lhs, rhs, .. }
+                    | tc::Expr::Index { base: lhs, index: rhs } => {
+                        work.push(Work::Expr(lhs));
+                        work.push(Work::Expr(rhs));
+                    }
+                    tc::Expr::Tuple { elems }
+                    | tc::Expr::Array { elems }
+                    | tc::Expr::FormatArgs { args: elems, .. } => {
+                        if let Some(slice) = out.expr_lists.get(elems.range()) {
+                            for &x in slice {
+                                work.push(Work::Expr(x));
+                            }
+                        }
+                    }
+                    tc::Expr::Repeat { elem, count, .. } => {
+                        work.push(Work::Expr(elem));
+                        if let Some(c) = count {
+                            work.push(Work::Expr(c));
+                        }
+                    }
+                    tc::Expr::Struct { fields, base, .. } | tc::Expr::Record { fields, base } => {
+                        if let Some(slice) = out.field_inits.get(fields.range()) {
+                            for fi in slice {
+                                work.push(Work::Expr(fi.expr));
+                            }
+                        }
+                        if let Some(b) = base.expr() {
+                            work.push(Work::Expr(b));
+                        }
+                    }
+                    tc::Expr::Closure { params, body, .. } => {
+                        if let Some(slice) = out.pat_lists.get(params.range()) {
+                            for &p in slice {
+                                work.push(Work::Pat(p));
+                            }
+                        }
+                        work.push(Work::Expr(body));
+                    }
+                    tc::Expr::Asm { operands, .. } => {
+                        if let Some(slice) = out.asm_operands.get(operands.range()) {
+                            for op in slice {
+                                work.push(Work::Expr(op.expr));
+                                if let Some(o) = op.out_expr {
+                                    work.push(Work::Expr(o));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Work::Pat(id) => {
+                let Some(slot) = out.pats.get_mut(id.ix()) else { continue };
+                let pat = core::mem::replace(slot, tc::Pat::Missing);
+                match pat {
+                    tc::Pat::Missing
+                    | tc::Pat::Wild
+                    | tc::Pat::Lit(_)
+                    | tc::Pat::NegLit(_)
+                    | tc::Pat::Path(_) => {}
+                    tc::Pat::Bind { sub, .. } => {
+                        if let Some(s) = sub {
+                            work.push(Work::Pat(s));
+                        }
+                    }
+                    tc::Pat::Ref { inner, .. } => work.push(Work::Pat(inner)),
+                    tc::Pat::Tuple { elems, .. }
+                    | tc::Pat::TupleStruct { elems, .. }
+                    | tc::Pat::Or { alts: elems }
+                    | tc::Pat::Slice { elems, .. } => {
+                        if let Some(slice) = out.pat_lists.get(elems.range()) {
+                            for &p in slice {
+                                work.push(Work::Pat(p));
+                            }
+                        }
+                    }
+                    tc::Pat::Struct { fields, .. } | tc::Pat::Record { fields, .. } => {
+                        if let Some(slice) = out.field_pats.get(fields.range()) {
+                            for fp in slice {
+                                work.push(Work::Pat(fp.pat));
+                            }
+                        }
+                    }
+                    tc::Pat::Range { lo, hi, .. } => {
+                        if let Some(p) = lo {
+                            work.push(Work::Pat(p));
+                        }
+                        if let Some(p) = hi {
+                            work.push(Work::Pat(p));
+                        }
+                    }
+                }
+            }
+            Work::Stmt(id) => {
+                let Some(&stmt) = out.stmts.get(id.ix()) else { continue };
+                match stmt {
+                    tc::Stmt::Item => {}
+                    tc::Stmt::Expr { expr, .. } => work.push(Work::Expr(expr)),
+                    tc::Stmt::Let { pat, init, else_, .. } => {
+                        work.push(Work::Pat(pat));
+                        if let Some(x) = init {
+                            work.push(Work::Expr(x));
+                        }
+                        if let Some(x) = else_ {
+                            work.push(Work::Expr(x));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

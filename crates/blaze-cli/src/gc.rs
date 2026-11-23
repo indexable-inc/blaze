@@ -99,6 +99,8 @@ pub(crate) struct GcSummary {
     pub(crate) files_unlinked: u32,
     pub(crate) other_forms_removed: u32,
     pub(crate) other_forms_bytes: u64,
+    pub(crate) aux_files_removed: u32,
+    pub(crate) aux_bytes_freed: u64,
 }
 
 /// Parses `BLAZE_STORE_MAX_BYTES` and `BLAZE_STORE_MAX_GB` values cleanly at the CLI edge.
@@ -228,8 +230,13 @@ impl BgGc {
             BgGc::Detached { spawner, exe, home, max_store_bytes } => {
                 // Fast non-blocking probe of `gc.lock`: skip spawning a duplicate `blaze gc`
                 // process on every rapid edit while an existing background GC is already running.
-                if !gc_lock_is_free(cx, blaze_dir) {
-                    return false;
+                match gc_lock_is_free(cx, blaze_dir) {
+                    Ok(true) => {}
+                    Ok(false) => return false,
+                    Err(error) => {
+                        let _ = err.line(cx, format_args!("blaze: warning: failed to probe background gc lock: {error}"));
+                        return false;
+                    }
                 }
                 let frame = cx.frame();
                 let budget_text = max_store_bytes.map(|b| bstd::mem::format_in!(frame, "{b}"));
@@ -252,9 +259,10 @@ impl BgGc {
 
 /// Non-blocking check of whether `v2/store/gc.lock` is currently unheld by another GC process.
 /// Immediately releases the probe lock if free so a newly spawned `blaze gc --background` can
-/// acquire it; returns `false` when contended (another GC is already running).
-pub(crate) fn gc_lock_is_free(cx: &Cx, blaze_dir: &Dir<ReadWrite>) -> bool {
-    matches!(try_acquire_gc_lock(cx, blaze_dir), Ok(Some(_)))
+/// acquire it; returns `Ok(false)` when contended (another GC is already running), or `Err` on
+/// lock-path/I/O failure.
+pub(crate) fn gc_lock_is_free(cx: &Cx, blaze_dir: &Dir<ReadWrite>) -> Result<bool, CliError> {
+    Ok(try_acquire_gc_lock(cx, blaze_dir)?.is_some())
 }
 
 /// Acquires the non-blocking exclusive GC lock at `<HOME>/.blaze/v2/store/gc.lock`.
@@ -403,6 +411,13 @@ pub(crate) fn run_with(
         }
     }
 
+    // Sweep dead-PID telemetry rings / build summaries (`v2/runs/`), orphaned test temp dirs
+    // (`v2/test/tmp/`), and expired legacy run record files (`v2/run/records/`).
+    let probe = OsPidProbe;
+    let aux = sweep_aux_with(cx, home.dir(), now_ns, &probe, false, AuxSweepPlant::None);
+    summary.aux_files_removed = aux.files;
+    summary.aux_bytes_freed = aux.bytes;
+
     if !opts.background {
         let active_freed = summary.bytes_before.saturating_sub(summary.bytes_after);
         let budget_label = format_budget(cx, summary.cap_bytes);
@@ -426,6 +441,16 @@ pub(crate) fn run_with(
                     "blaze gc: removed {} old-format store(s), {} freed",
                     summary.other_forms_removed,
                     blaze_report::ui::fmt_bytes(summary.other_forms_bytes),
+                ),
+            )?;
+        }
+        if summary.aux_files_removed > 0 {
+            out.line(
+                cx,
+                format_args!(
+                    "blaze gc: swept {} stale run/temp file(s), {} freed",
+                    summary.aux_files_removed,
+                    blaze_report::ui::fmt_bytes(summary.aux_bytes_freed),
                 ),
             )?;
         }
@@ -513,6 +538,21 @@ fn run_dry(
         }
     }
 
+    let probe = OsPidProbe;
+    let aux = sweep_aux_with(cx, home.dir(), now_ns, &probe, true, AuxSweepPlant::None);
+    summary.aux_files_removed = aux.files;
+    summary.aux_bytes_freed = aux.bytes;
+    if aux.files > 0 {
+        out.line(
+            cx,
+            format_args!(
+                "blaze gc (dry-run): would sweep {} stale run/temp file(s), {}",
+                aux.files,
+                blaze_report::ui::fmt_bytes(aux.bytes),
+            ),
+        )?;
+    }
+
     Ok(summary)
 }
 
@@ -523,6 +563,431 @@ fn format_budget<'f>(cx: &'f Cx, bytes: u64) -> bstd::mem::String<&'f bstd::mem:
     } else {
         bstd::mem::format_in!(frame, "{}", blaze_report::ui::fmt_bytes(bytes))
     }
+}
+
+// ---- Auxiliary directory sweeps (`v2/runs`, `v2/test/tmp`, `v2/run/records`) ----
+
+/// Runs directory beneath `<HOME>/.blaze`.
+const RUNS_DIR: &str = "v2/runs";
+/// Test temporary root beneath `<HOME>/.blaze`.
+const TEST_TMP_DIR: &str = "v2/test/tmp";
+/// Legacy run records / native dylib directory beneath `<HOME>/.blaze`.
+const RUN_RECORDS_DIR: &str = "v2/run/records";
+
+/// Maximum entries inspected per auxiliary directory in one GC pass (rule 18).
+const AUX_SWEEP_MOST: usize = 4096;
+/// Maximum depth when removing an orphaned temp directory iteratively (rule 18).
+const TREE_DEPTH_MOST: usize = 32;
+/// Maximum bytes read from a `.meta` file when checking its PID.
+const META_READ_MOST: u64 = 64 << 10;
+/// Grace period for dead-PID telemetry rings while a live viewer holds `viewer.lock` (4x viewer's
+/// 15s `collect_after`).
+pub(crate) const VIEWER_DEAD_GRACE_NS: u64 = 60 * 1_000_000_000;
+/// Fallback age threshold for `.telem` / temp dirs whose `.meta` or PID is missing/unparseable.
+pub(crate) const ORPHAN_GRACE_NS: u64 = 3600 * 1_000_000_000;
+/// Maximum historical `.build.json` summaries retained in `v2/runs/` (matches viewer's `builds_most`).
+const BUILDS_KEEP_MOST: usize = 64;
+/// Maximum age for `.build.json` summaries and unreferenced `v2/run/records/` files (7 days).
+pub(crate) const AUX_EXPIRY_NS: u64 = 7 * 86_400 * 1_000_000_000;
+
+/// Process liveness state reported by [`PidProbe`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PidState {
+    Alive,
+    Dead,
+    Unknown,
+}
+
+/// Process liveness seam (rule 78) so auxiliary GC sweeps run deterministically under `SimWorld`.
+pub(crate) trait PidProbe {
+    fn probe(&self, pid: u32) -> PidState;
+}
+
+/// Native Unix PID probe via `kill(pid, 0)` (safe, allocation-free).
+pub(crate) struct OsPidProbe;
+
+impl PidProbe for OsPidProbe {
+    fn probe(&self, pid: u32) -> PidState {
+        #[cfg(unix)]
+        {
+            let Ok(pid_i32) = i32::try_from(pid) else {
+                return PidState::Unknown;
+            };
+            if pid_i32 <= 0 {
+                return PidState::Dead;
+            }
+            match blaze_sys::posix::signal::kill(pid_i32, 0) {
+                Ok(()) | Err(blaze_sys::Errno::Perm) => PidState::Alive,
+                Err(blaze_sys::Errno::Srch) => PidState::Dead,
+                Err(_) => PidState::Unknown,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            PidState::Unknown
+        }
+    }
+}
+
+/// Planted bug controls for auxiliary GC DST tests (rule 43).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AuxSweepPlant {
+    None,
+    /// Planted bug: treats `PidState::Alive` as `Dead`, proving the test oracle catches live-run
+    /// deletion.
+    #[cfg(test)]
+    IgnorePidAlive,
+}
+
+/// Counts from an auxiliary directory sweep.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct AuxSummary {
+    pub(crate) files: u32,
+    pub(crate) bytes: u64,
+}
+
+/// Pure parser for `pid=<u32>` inside a run's `.meta` file (`viewer/pump.rs` format).
+pub(crate) fn parse_meta_pid(bytes: &[u8]) -> Option<u32> {
+    let text = core::str::from_utf8(bytes).ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("pid=") {
+            let pid = rest.trim().parse::<u32>().ok()?;
+            return (pid > 0).then_some(pid);
+        }
+    }
+    None
+}
+
+/// Pure parser for leading `<pid>-...` directory names under `v2/test/tmp/`.
+pub(crate) fn parse_pid_prefix(name: &str) -> Option<u32> {
+    let (head, _) = name.split_once('-')?;
+    let pid = head.parse::<u32>().ok()?;
+    (pid > 0).then_some(pid)
+}
+
+/// Sans-IO decision for whether a run's `.telem`/`.meta` pair should be swept.
+pub(crate) fn should_sweep_run(
+    pid_state: Option<PidState>,
+    viewer_active: bool,
+    mtime_ns: u64,
+    now_ns: u64,
+    plant: AuxSweepPlant,
+) -> bool {
+    let age_ns = now_ns.saturating_sub(mtime_ns);
+    let effective = match (pid_state, plant) {
+        #[cfg(test)]
+        (Some(PidState::Alive), AuxSweepPlant::IgnorePidAlive) => Some(PidState::Dead),
+        (state, _) => state,
+    };
+    match effective {
+        Some(PidState::Alive) => false,
+        Some(PidState::Dead) => !viewer_active || age_ns >= VIEWER_DEAD_GRACE_NS,
+        Some(PidState::Unknown) | None => age_ns >= ORPHAN_GRACE_NS,
+    }
+}
+
+/// Probes whether a live telemetry viewer currently holds `LOCK_SH` on `<HOME>/.blaze/v2/runs/viewer.lock`.
+/// Fast path: 1 `stat` syscall returning `false` when `viewer.lock` does not exist (never creates it).
+pub(crate) fn viewer_lock_is_held(cx: &Cx, blaze_dir: &Dir<ReadWrite>) -> bool {
+    let frame = cx.frame();
+    let rel_str = bstd::mem::format_in!(frame, "{RUNS_DIR}/{}", blaze_launch::telemetry::VIEWER_LOCK_LEAF);
+    let Ok(rel) = Path::new(rel_str.as_str()) else {
+        return false;
+    };
+    match blaze_dir.stat(cx, &rel) {
+        Ok(None) => return false,
+        Ok(Some(_)) => {}
+        Err(_) => return true,
+    }
+    let Ok(runs_root) = Path::new(RUNS_DIR) else {
+        return true;
+    };
+    let driver = blaze_dir.lend(&runs_root);
+    let lock_path = bstd::mem::format_in!(frame, "{}/{}", driver.dir().as_str(), blaze_launch::telemetry::VIEWER_LOCK_LEAF);
+    let Some(file) = FileName::new(lock_path.as_str()) else {
+        return true;
+    };
+    match ExclusiveLock::try_acquire(driver, file) {
+        Ok(Some(lock)) => {
+            drop(lock);
+            false
+        }
+        Ok(None) | Err(_) => true,
+    }
+}
+
+/// Best-effort bounded iterative removal of a directory tree beneath `root` (handles files,
+/// symlinks, and special nodes like sockets/FIFOs left by sandboxed tests in `$TMPDIR`).
+pub(crate) fn remove_tree_best_effort(cx: &Cx, root: &Dir<ReadWrite>, path: &Path) -> AuxSummary {
+    remove_tree_impl(cx, root, path, false)
+}
+
+fn remove_tree_impl(cx: &Cx, root: &Dir<ReadWrite>, start: &Path, dry_run: bool) -> AuxSummary {
+    use bstd::fs::{Durable, EntryKind};
+    let frame = cx.frame();
+    let mut summary = AuxSummary::default();
+    let mut stack: blaze_own::Vec<(bstd::mem::String<&bstd::mem::Frame>, bool, usize), &bstd::mem::Frame> = blaze_own::Vec::new_in(frame);
+    stack.push((bstd::mem::format_in!(frame, "{}", start.as_str()), false, 0));
+    let mut visited = 0usize;
+    while let Some((dir_str, expanded, depth)) = stack.pop() {
+        if visited >= AUX_SWEEP_MOST {
+            break;
+        }
+        let Ok(dir_path) = Path::new(dir_str.as_str()) else {
+            continue;
+        };
+        if expanded {
+            if !dry_run {
+                let _ = root.remove_dir(cx, &dir_path, Durable::No);
+            }
+            continue;
+        }
+        visited += 1;
+        stack.push((dir_str, true, depth));
+        let Ok(Some(entries)) = root.entries(cx, &dir_path) else {
+            continue;
+        };
+        for i in 0..entries.len() {
+            if visited >= AUX_SWEEP_MOST {
+                break;
+            }
+            let Ok(child) = entries.path(i) else {
+                continue;
+            };
+            match entries.kind(i) {
+                EntryKind::Dir => {
+                    if depth < TREE_DEPTH_MOST {
+                        stack.push((bstd::mem::format_in!(frame, "{}", child.as_str()), false, depth + 1));
+                    }
+                }
+                EntryKind::File | EntryKind::Link | EntryKind::Other | EntryKind::Unknown => {
+                    visited += 1;
+                    let len = entries.len_of(i);
+                    if dry_run || root.remove(cx, &child, Durable::No).is_ok() {
+                        summary.files = summary.files.saturating_add(1);
+                        summary.bytes = summary.bytes.saturating_add(len);
+                    }
+                }
+                EntryKind::Gone => {}
+            }
+        }
+    }
+    summary
+}
+
+/// Sweeps stale files in `v2/runs/`, `v2/test/tmp/`, and `v2/run/records/`.
+pub(crate) fn sweep_aux_with(
+    cx: &Cx,
+    blaze_dir: &Dir<ReadWrite>,
+    now_ns: u64,
+    probe: &impl PidProbe,
+    dry_run: bool,
+    plant: AuxSweepPlant,
+) -> AuxSummary {
+    let mut total = AuxSummary::default();
+    let runs = sweep_runs(cx, blaze_dir, now_ns, probe, dry_run, plant);
+    let tmps = sweep_test_tmp(cx, blaze_dir, now_ns, probe, dry_run, plant);
+    let recs = sweep_run_records(cx, blaze_dir, now_ns, dry_run);
+    total.files = runs.files.saturating_add(tmps.files).saturating_add(recs.files);
+    total.bytes = runs.bytes.saturating_add(tmps.bytes).saturating_add(recs.bytes);
+    total
+}
+
+fn sweep_runs(
+    cx: &Cx,
+    blaze_dir: &Dir<ReadWrite>,
+    now_ns: u64,
+    probe: &impl PidProbe,
+    dry_run: bool,
+    plant: AuxSweepPlant,
+) -> AuxSummary {
+    use bstd::fs::{Durable, EntryKind};
+    let mut out = AuxSummary::default();
+    let Ok(runs_root) = Path::new(RUNS_DIR) else {
+        return out;
+    };
+    let Ok(Some(entries)) = blaze_dir.entries(cx, &runs_root) else {
+        return out;
+    };
+    let viewer_active = viewer_lock_is_held(cx, blaze_dir);
+    let frame = cx.frame();
+    let mut builds: blaze_own::Vec<(u64, Path, u64), &bstd::mem::Frame> = blaze_own::Vec::new_in(frame);
+    let mut alive_stems: blaze_own::Vec<bstd::mem::String<&bstd::mem::Frame>, &bstd::mem::Frame> = blaze_own::Vec::new_in(frame);
+    let mut telem_stems: blaze_own::Vec<bstd::mem::String<&bstd::mem::Frame>, &bstd::mem::Frame> = blaze_own::Vec::new_in(frame);
+    let limit = entries.len().min(AUX_SWEEP_MOST);
+    let mut meta_buf = bstd::mem::Bytes::new_in(frame, "gc run meta read");
+
+    // Pass 1: sweep dead/orphaned `.telem` + `.meta` pairs and record alive stems.
+    for i in 0..limit {
+        if entries.kind(i) != EntryKind::File {
+            continue;
+        }
+        let name = entries.name(i);
+        if name == blaze_launch::telemetry::VIEWER_LOCK_LEAF || name.ends_with(".bstd-new") {
+            continue;
+        }
+        let Some(stem) = name.strip_suffix(".telem") else {
+            continue;
+        };
+        telem_stems.push(bstd::mem::format_in!(frame, "{stem}"));
+        let Ok(telem_path) = entries.path(i) else {
+            continue;
+        };
+        let telem_len = entries.len_of(i);
+        let telem_mtime = blaze_dir.stat(cx, &telem_path).ok().flatten().map_or(0, |s| s.stamp.modified_ns);
+        let meta_rel_str = bstd::mem::format_in!(frame, "{RUNS_DIR}/{stem}.meta");
+        let meta_path = Path::new(meta_rel_str.as_str()).ok();
+        let (meta_stat, pid_state) = match meta_path.as_ref() {
+            Some(mp) => {
+                let st = blaze_dir.stat(cx, mp).ok().flatten();
+                let pid = if st.as_ref().is_some_and(|s| s.len <= META_READ_MOST) {
+                    meta_buf.clear();
+                    blaze_dir.read_all(cx, mp, &mut meta_buf).ok().and_then(|_| parse_meta_pid(meta_buf.as_slice()))
+                } else {
+                    None
+                };
+                (st, pid.map(|p| probe.probe(p)))
+            }
+            None => (None, None),
+        };
+        let mtime_ns = meta_stat.as_ref().map_or(telem_mtime, |s| telem_mtime.max(s.stamp.modified_ns));
+        if should_sweep_run(pid_state, viewer_active, mtime_ns, now_ns, plant) {
+            if dry_run || blaze_dir.remove(cx, &telem_path, Durable::No).is_ok() {
+                out.files = out.files.saturating_add(1);
+                out.bytes = out.bytes.saturating_add(telem_len);
+            }
+            if let (Some(mp), Some(st)) = (meta_path.as_ref(), meta_stat) {
+                if dry_run || blaze_dir.remove(cx, mp, Durable::No).is_ok() {
+                    out.files = out.files.saturating_add(1);
+                    out.bytes = out.bytes.saturating_add(st.len);
+                }
+            }
+        } else if pid_state == Some(PidState::Alive) {
+            alive_stems.push(bstd::mem::format_in!(frame, "{stem}"));
+        }
+    }
+
+    // Pass 2: sweep orphaned `.meta` (no sibling `.telem`) and collect `.build.json` summaries.
+    for i in 0..limit {
+        if entries.kind(i) != EntryKind::File {
+            continue;
+        }
+        let name = entries.name(i);
+        if let Some(stem) = name.strip_suffix(".meta") {
+            if telem_stems.iter().any(|s| s.as_str() == stem) {
+                continue;
+            }
+            let Ok(meta_path) = entries.path(i) else {
+                continue;
+            };
+            let meta_len = entries.len_of(i);
+            let mtime_ns = blaze_dir.stat(cx, &meta_path).ok().flatten().map_or(0, |s| s.stamp.modified_ns);
+            let pid_state = if meta_len <= META_READ_MOST {
+                meta_buf.clear();
+                blaze_dir.read_all(cx, &meta_path, &mut meta_buf).ok().and_then(|_| parse_meta_pid(meta_buf.as_slice())).map(|p| probe.probe(p))
+            } else {
+                None
+            };
+            if should_sweep_run(pid_state, viewer_active, mtime_ns, now_ns, plant) {
+                if dry_run || blaze_dir.remove(cx, &meta_path, Durable::No).is_ok() {
+                    out.files = out.files.saturating_add(1);
+                    out.bytes = out.bytes.saturating_add(meta_len);
+                }
+            }
+        } else if let Some(stem) = name.strip_suffix(".build.json") {
+            if alive_stems.iter().any(|s| s.as_str() == stem) {
+                continue;
+            }
+            let Ok(path) = entries.path(i) else {
+                continue;
+            };
+            let len = entries.len_of(i);
+            let mtime_ns = blaze_dir.stat(cx, &path).ok().flatten().map_or(0, |s| s.stamp.modified_ns);
+            builds.push((mtime_ns, path, len));
+        }
+    }
+
+    // Keep at most the newest `BUILDS_KEEP_MOST` `.build.json` summaries within `AUX_EXPIRY_NS`.
+    builds.sort_by(|a, b| b.0.cmp(&a.0));
+    for (idx, (mtime_ns, path, len)) in builds.iter().enumerate() {
+        let expired = now_ns.saturating_sub(*mtime_ns) >= AUX_EXPIRY_NS;
+        if idx >= BUILDS_KEEP_MOST || expired {
+            if dry_run || blaze_dir.remove(cx, path, Durable::No).is_ok() {
+                out.files = out.files.saturating_add(1);
+                out.bytes = out.bytes.saturating_add(*len);
+            }
+        }
+    }
+    out
+}
+
+fn sweep_test_tmp(
+    cx: &Cx,
+    blaze_dir: &Dir<ReadWrite>,
+    now_ns: u64,
+    probe: &impl PidProbe,
+    dry_run: bool,
+    plant: AuxSweepPlant,
+) -> AuxSummary {
+    use bstd::fs::EntryKind;
+    let mut out = AuxSummary::default();
+    let Ok(tmp_root) = Path::new(TEST_TMP_DIR) else {
+        return out;
+    };
+    let Ok(Some(entries)) = blaze_dir.entries(cx, &tmp_root) else {
+        return out;
+    };
+    let limit = entries.len().min(AUX_SWEEP_MOST);
+    for i in 0..limit {
+        if entries.kind(i) != EntryKind::Dir {
+            continue;
+        }
+        let Ok(path) = entries.path(i) else {
+            continue;
+        };
+        let mtime_ns = blaze_dir.stat(cx, &path).ok().flatten().map_or(0, |s| s.stamp.modified_ns);
+        let pid_state = parse_pid_prefix(entries.name(i)).map(|p| probe.probe(p));
+        if should_sweep_run(pid_state, false, mtime_ns, now_ns, plant) {
+            let gone = remove_tree_impl(cx, blaze_dir, &path, dry_run);
+            out.files = out.files.saturating_add(gone.files);
+            out.bytes = out.bytes.saturating_add(gone.bytes);
+        }
+    }
+    out
+}
+
+fn sweep_run_records(cx: &Cx, blaze_dir: &Dir<ReadWrite>, now_ns: u64, dry_run: bool) -> AuxSummary {
+    use bstd::fs::{Durable, EntryKind};
+    let mut out = AuxSummary::default();
+    let Ok(rec_root) = Path::new(RUN_RECORDS_DIR) else {
+        return out;
+    };
+    let Ok(Some(entries)) = blaze_dir.entries(cx, &rec_root) else {
+        return out;
+    };
+    let limit = entries.len().min(AUX_SWEEP_MOST);
+    for i in 0..limit {
+        if entries.kind(i) != EntryKind::File {
+            continue;
+        }
+        let name = entries.name(i);
+        if name.ends_with(".bstd-new") {
+            continue;
+        }
+        let Ok(path) = entries.path(i) else {
+            continue;
+        };
+        let mtime_ns = blaze_dir.stat(cx, &path).ok().flatten().map_or(0, |s| s.stamp.modified_ns);
+        if now_ns.saturating_sub(mtime_ns) >= AUX_EXPIRY_NS {
+            let len = entries.len_of(i);
+            if dry_run || blaze_dir.remove(cx, &path, Durable::No).is_ok() {
+                out.files = out.files.saturating_add(1);
+                out.bytes = out.bytes.saturating_add(len);
+            }
+        }
+    }
+    out
 }
 
 /// Default budget constant re-exported for tests.

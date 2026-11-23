@@ -654,6 +654,7 @@ dependencies = [
  "blaze-emit",
  "blaze-engine",
  "blaze-expand",
+ "blaze-export",
  "blaze-fetch",
  "blaze-file-items",
  "blaze-h1",
@@ -1060,6 +1061,7 @@ dependencies = [
 name = "blaze-glob"
 version = "0.0.0"
 dependencies = [
+ "blaze-own",
  "blaze-sim",
 ]
 
@@ -2092,21 +2094,31 @@ version = "0.0.0"
 dependencies = [
  "blaze-algebra",
  "blaze-alloc-count",
+ "blaze-arrow-ipc",
+ "blaze-base64",
+ "blaze-bitflags",
  "blaze-bytes",
  "blaze-cbor",
  "blaze-check",
+ "blaze-columns",
  "blaze-core",
  "blaze-data",
  "blaze-deflate",
+ "blaze-ed25519",
  "blaze-format",
+ "blaze-glob",
  "blaze-h1",
+ "blaze-h2",
  "blaze-hash",
  "blaze-hashcons",
  "blaze-http",
  "blaze-ids",
+ "blaze-int",
  "blaze-json",
  "blaze-kit",
+ "blaze-math",
  "blaze-mem",
+ "blaze-memchr",
  "blaze-meter",
  "blaze-own",
  "blaze-phf",
@@ -2115,11 +2127,18 @@ dependencies = [
  "blaze-report",
  "blaze-rng",
  "blaze-roots",
+ "blaze-semver",
  "blaze-sha256",
  "blaze-sim",
+ "blaze-sort",
  "blaze-spin",
  "blaze-sys",
+ "blaze-tab",
+ "blaze-tar",
  "blaze-text",
+ "blaze-toml",
+ "blaze-unicode",
+ "blaze-units",
  "blaze-url",
  "objc2-core-foundation",
  "objc2-core-media",
@@ -2165,6 +2184,15 @@ name = "blaze-sys"
 version = "0.0.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "blaze-tab"
+version = "0.0.0"
+dependencies = [
+ "blaze-data",
+ "blaze-json",
+ "blaze-own",
 ]
 
 [[package]]

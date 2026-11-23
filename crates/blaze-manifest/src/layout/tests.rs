@@ -46,10 +46,17 @@ impl<'f> Tree<'f> {
 
     /// [`Tree::read`], as the workspace the user builds (`test_targets`) or as a dependency.
     fn read_as(&self, start: &str, test_targets: bool) -> Result<(Units<'static>, usize), LayoutError<'static>> {
+        self.read_opts(start, test_targets, false)
+    }
+
+    fn read_opts(&self, start: &str, test_targets: bool, path_packages: bool) -> Result<(Units<'static>, usize), LayoutError<'static>> {
         let alloc = blaze_own::testing::heap().alloc();
         let mut layout = Layout::new(start, alloc)?;
         if test_targets {
             layout = layout.with_test_targets();
+        }
+        if path_packages {
+            layout = layout.with_path_packages();
         }
         for passes in 1..64 {
             match layout.pass()? {
@@ -308,4 +315,131 @@ fn a_package_under_a_root_that_does_not_list_it() {
         ],
     };
     assert!(matches!(tree.read("b"), Err(LayoutError::NotAMember { .. })));
+}
+
+#[test]
+fn patch_and_transitive_path_packages_outside_members() {
+    const WS: &str = "\
+[workspace]
+members = [\"crates/app\"]
+exclude = [\"vendor/sub\", \"vendor/helper\", \"vendor/excluded\", \"vendor/unused\"]
+
+[workspace.package]
+edition = \"2024\"
+
+[patch.crates-io]
+patched = { path = \"vendor/sub/crates/patched\" }
+unused-patch = { path = \"vendor/unused\" }
+git-patch = { git = \"https://example.com/git-patch.git\" }
+";
+    const APP_TOML: &str = "\
+[package]
+name = \"app\"
+edition.workspace = true
+
+[dependencies]
+patched = \"1.0\"
+excluded = { path = \"../../vendor/excluded\" }
+";
+    const SUB_WS: &str = "\
+[workspace]
+members = [\"crates/patched\"]
+
+[workspace.package]
+version = \"1.2.3\"
+edition = \"2021\"
+";
+    const PATCHED_TOML: &str = "\
+[package]
+name = \"patched\"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+helper = { path = \"../../../helper\" }
+
+[dev-dependencies]
+missing-dev = { path = \"../../../does-not-exist\" }
+";
+    const HELPER_TOML: &str = "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+    const EXCLUDED_TOML: &str = "[package]\nname = \"excluded\"\nversion = \"0.2.0\"\nedition = \"2021\"\n";
+    const UNUSED_TOML: &str = "[package]\nname = \"unused-patch\"\nversion = \"0.3.0\"\nedition = \"2021\"\n";
+    let tree = Tree {
+        files: &[
+            ("Cargo.toml", WS),
+            ("crates/app/Cargo.toml", APP_TOML),
+            ("crates/app/src/lib.rs", ""),
+            ("vendor/sub/Cargo.toml", SUB_WS),
+            ("vendor/sub/crates/patched/Cargo.toml", PATCHED_TOML),
+            ("vendor/sub/crates/patched/src/lib.rs", ""),
+            ("vendor/sub/crates/patched/tests/ignored.rs", ""),
+            ("vendor/helper/Cargo.toml", HELPER_TOML),
+            ("vendor/helper/src/lib.rs", ""),
+            ("vendor/excluded/Cargo.toml", EXCLUDED_TOML),
+            ("vendor/excluded/src/lib.rs", ""),
+            ("vendor/unused/Cargo.toml", UNUSED_TOML),
+            ("vendor/unused/src/lib.rs", ""),
+        ],
+    };
+    let (units, _) = tree.read_opts("", true, true).expect("layout with path packages");
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut member_names = blaze_own::Vec::new_in(alloc);
+    member_names.extend(units.members.iter().map(|m| m.name.as_str()));
+    assert_eq!(member_names.as_slice(), ["app"]);
+    let mut path_pkgs = blaze_own::Vec::new_in(alloc);
+    path_pkgs.extend(units.path_packages.iter().map(|p| (p.dir.as_str(), p.name.as_str())));
+    assert_eq!(
+        path_pkgs.as_slice(),
+        [
+            ("vendor/excluded", "excluded"),
+            ("vendor/helper", "helper"),
+            ("vendor/sub/crates/patched", "patched"),
+            ("vendor/unused", "unused-patch"),
+        ]
+    );
+    let patched = units.path_packages.iter().find(|p| p.name.as_str() == "patched").expect("patched");
+    assert_eq!(patched.version.as_ref().map(|v| v.as_str()), Some("1.2.3"), "inherited from vendor/sub workspace");
+    assert_eq!(patched.edition.syntax, edition::Edition::Edition2021, "inherited edition from vendor/sub, not root");
+    assert!(patched.extras.is_empty(), "non-member path package skips test targets");
+    assert!(
+        !patched.dependencies.iter().any(|d| d.kind == DepKind::Dev),
+        "non-member path package skips dev-dependencies"
+    );
+    // CONTROL: without `with_path_packages`, no non-member path packages are discovered.
+    let (without, _) = tree.read_opts("", true, false).expect("layout without path packages");
+    assert!(without.path_packages.is_empty());
+}
+
+#[test]
+fn unused_patch_with_missing_transitive_path_dep_does_not_fail_layout() {
+    const ROOT_TOML: &str = r#"[workspace]
+members = ["app"]
+
+[patch.crates-io]
+unused-patch = { path = "vendor/unused" }
+"#;
+    const APP_TOML: &str = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+    const UNUSED_TOML: &str = r#"[package]
+name = "unused-patch"
+version = "0.3.0"
+edition = "2021"
+
+[dependencies]
+absent-dep = { path = "../does-not-exist" }
+"#;
+    let tree = Tree {
+        files: &[
+            ("Cargo.toml", ROOT_TOML),
+            ("app/Cargo.toml", APP_TOML),
+            ("app/src/lib.rs", ""),
+            ("vendor/unused/Cargo.toml", UNUSED_TOML),
+            ("vendor/unused/src/lib.rs", ""),
+        ],
+    };
+    let (units, _) = tree.read_opts("", true, true).expect("unused patch with missing transitive dep succeeds");
+    assert_eq!(units.members.len(), 1);
+    assert_eq!(units.path_packages.len(), 1);
+    assert_eq!(units.path_packages[0].name.as_str(), "unused-patch");
+    assert_eq!(units.path_packages[0].patched_from.len(), 1);
+    assert_eq!(units.path_packages[0].patched_from[0].as_str(), "crates-io");
 }

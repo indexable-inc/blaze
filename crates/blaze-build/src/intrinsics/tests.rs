@@ -728,5 +728,155 @@ fn float_to_int_unchecked_truncates_toward_zero() {
     assert_eq!(env.call(&mut b, &c).unwrap_err().to_string(), "intrinsic `float_to_int_unchecked`: a first type argument that is not a float");
 }
 
+#[test]
+fn structural_record_reflection_intrinsics_lower_to_constants() {
+    use blaze_typeck::{ItemKey, List, Name, RecordSchema};
+
+    let mut env = Env::new();
+    let u8_ = env.g.n(U8);
+    let u32_ = env.g.n(U32);
+    let u64_ = env.g.n(U64);
+    let i32_ = env.g.n(I32);
+    let bool_ = env.g.n(PNode::Bool);
+    let usize_ = env.g.n(USIZE);
+    let unit = env.g.tuple(&[]);
+    let pair = env.g.tuple(&[u8_, u32_]);
+
+    let unit_struct = env.w.strukt(0, &[], ReprAttrs::RUST);
+    let pair_struct = env.w.strukt(0, &[F::Leaf(U32), F::Leaf(I32)], ReprAttrs::RUST);
+    let an_enum = env.w.def(AdtKind::Enum, 0, &[&[F::Leaf(U32)], &[F::Leaf(U8)]], ReprAttrs::RUST);
+    let a_union = env.w.def(AdtKind::Union, 0, &[&[F::Leaf(U32), F::Leaf(U64)]], ReprAttrs::RUST);
+
+    let t_unit_struct = env.g.adt(unit_struct, &[]);
+    let t_pair_struct = env.g.adt(pair_struct, &[]);
+    let t_enum = env.g.adt(an_enum, &[]);
+    let t_union = env.g.adt(a_union, &[]);
+    let t_missing_adt = env.g.adt(ItemKey(0xdead_beef), &[]);
+
+    env.g.t.register_record_schema(RecordSchema::EMPTY, &[]).expect("empty schema");
+    let rec_empty = env.g.n(PNode::Record(RecordSchema::EMPTY, List::EMPTY));
+
+    let pos_names = [Name::of("x"), Name::of("y")];
+    let pos_schema = RecordSchema::of_sorted_names(&pos_names);
+    env.g.t.register_record_schema(pos_schema, &pos_names).expect("pos schema");
+    let pos_fields = env.g.t.intern_list(&[i32_, i32_]).expect("pos fields");
+    let rec_pos = env.g.n(PNode::Record(pos_schema, pos_fields));
+
+    let vel_names = [Name::of("vx"), Name::of("vy")];
+    let vel_schema = RecordSchema::of_sorted_names(&vel_names);
+    env.g.t.register_record_schema(vel_schema, &vel_names).expect("vel schema");
+    let vel_fields = env.g.t.intern_list(&[i32_, i32_]).expect("vel fields");
+    let rec_vel = env.g.n(PNode::Record(vel_schema, vel_fields));
+
+    let overlap_names = [Name::of("hp"), Name::of("x")];
+    let overlap_schema = RecordSchema::of_sorted_names(&overlap_names);
+    env.g.t.register_record_schema(overlap_schema, &overlap_names).expect("overlap schema");
+    let overlap_fields = env.g.t.intern_list(&[u32_, i32_]).expect("overlap fields");
+    let rec_overlap = env.g.n(PNode::Record(overlap_schema, overlap_fields));
+
+    let eval_one = |env: &mut Env, call: &Call<'_>, rty: Ty| -> u128 {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let rs = [Param::of(rty)];
+        let sig = b.sig(Conv::C, Variadic::No, &[], &rs);
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let out = {
+            let mut cx = LayoutCx { ground: &mut env.g.t, facts: &env.w, scratch: alloc };
+            let needs_drop = |_: PTy| false;
+            let mut icx = IntrinsicCx {
+                layouts: &mut env.ls,
+                cx: &mut cx,
+                needs_drop: &needs_drop,
+                ub_checks: crate::UbChecks::Off,
+                overflow_checks: crate::OverflowChecks::Off,
+            };
+            scalar(build(&mut b, call, &mut icx).expect("intrinsic builds"))
+        };
+        b.ret(&[out]);
+        let f = b.finish_checked().expect("built function verifies");
+        match run_in(f.view(), &[], 10_000, alloc).expect("evaluator runs") {
+            Outcome::Returned(vs) => match vs.as_slice() {
+                [Val::Int(i)] => *i,
+                other => panic!("expected one int result, got {other:?}"),
+            },
+            other => panic!("did not return: {other:?}"),
+        }
+    };
+
+    // 1. `blaze_field_count`
+    for (ty, want) in [
+        (rec_empty, 0u128),
+        (rec_pos, 2),
+        (unit, 0),
+        (pair, 2),
+        (t_unit_struct, 0),
+        (t_pair_struct, 2),
+        (t_enum, 0),
+        (t_union, 0),
+        (u32_, 0),
+    ] {
+        let c = Call { which: Which::BlazeFieldCount, generics: &[GenericArg::Ty(ty)], args: &[], ret: usize_, site: None };
+        assert_eq!(eval_one(&mut env, &c, Ty::I64), want, "blaze_field_count({ty:?})");
+    }
+    // Missing ADT propagates `LayoutError` with `Refusal::NoAdt` so lazy front ends load and retry.
+    {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let mut cx = LayoutCx { ground: &mut env.g.t, facts: &env.w, scratch: alloc };
+        let needs_drop = |_: PTy| false;
+        let mut icx = IntrinsicCx {
+            layouts: &mut env.ls,
+            cx: &mut cx,
+            needs_drop: &needs_drop,
+            ub_checks: crate::UbChecks::Off,
+            overflow_checks: crate::OverflowChecks::Off,
+        };
+        let c = Call { which: Which::BlazeFieldCount, generics: &[GenericArg::Ty(t_missing_adt)], args: &[], ret: usize_, site: None };
+        assert!(matches!(
+            build(&mut b, &c, &mut icx),
+            Err(IntrinsicError::Layout(crate::layout::LayoutError { why: crate::layout::Refusal::NoAdt(k), .. })) if k == ItemKey(0xdead_beef)
+        ));
+    }
+
+    // 2. `blaze_records_disjoint`
+    for (a, b, want) in [
+        (rec_pos, rec_vel, 1u128),
+        (rec_pos, rec_overlap, 0),
+        (rec_pos, rec_pos, 0),
+        (rec_empty, rec_pos, 1),
+        (rec_pos, unit, 1),
+        (unit, rec_pos, 1),
+        (unit, unit, 1),
+        (u32_, u32_, 0),
+        (u32_, i32_, 1),
+        (rec_pos, u32_, 1),
+    ] {
+        let c = Call {
+            which: Which::BlazeRecordsDisjoint,
+            generics: &[GenericArg::Ty(a), GenericArg::Ty(b)],
+            args: &[],
+            ret: bool_,
+            site: None,
+        };
+        assert_eq!(eval_one(&mut env, &c, Ty::I8), want, "blaze_records_disjoint({a:?}, {b:?})");
+    }
+
+    // 3. `blaze_record_schema_id`
+    for (ty, want) in [
+        (rec_pos, u128::from(pos_schema.0)),
+        (rec_vel, u128::from(vel_schema.0)),
+        (rec_empty, u128::from(RecordSchema::EMPTY.0)),
+        (u32_, 0),
+        (pair, 0),
+        (t_pair_struct, 0),
+        (t_enum, 0),
+    ] {
+        let c = Call { which: Which::BlazeRecordSchemaId, generics: &[GenericArg::Ty(ty)], args: &[], ret: u64_, site: None };
+        assert_eq!(eval_one(&mut env, &c, Ty::I64), want, "blaze_record_schema_id({ty:?})");
+    }
+}
+
 mod bytes;
 mod offsets;

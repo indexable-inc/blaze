@@ -4,7 +4,6 @@
 # 0 (AGENTS.md panics-fail-one-job). Written by scripts/src/bin/stops.rs (`{"command":
 # "write"}`), checked in CI.
 # crate	stops
-blaze-algebra	27
 blaze-alloc-count	2
 blaze-answer	95
 blaze-apple-sdk	5
@@ -15,12 +14,8 @@ blaze-base-tools	9
 blaze-base64	24
 blaze-bench	7
 blaze-blake3	413
-blaze-body	82
-blaze-body-build	39
-blaze-body-drops	24
-blaze-body-flow	39
 blaze-bstd-convert	109
-blaze-build	550
+blaze-build	549
 blaze-build-script	246
 blaze-bytes	3
 blaze-c	325
@@ -30,19 +25,19 @@ blaze-cad-field	318
 blaze-cad-mesh	1164
 blaze-cad-out	218
 blaze-cad-picture	293
-blaze-cas	243
+blaze-cas	239
 blaze-cbor	27
 blaze-cc	8
 blaze-cert	108
 blaze-check	196
-blaze-cli	1387
+blaze-cli	1374
 blaze-code	94
 blaze-columns	193
 blaze-comptime	68
 blaze-comptime-sys	48
 blaze-comptime/rungs/derive-hello	2
 blaze-cond	115
-blaze-consteval	208
+blaze-consteval	205
 blaze-core	908
 blaze-cunit	41
 blaze-data	52
@@ -51,14 +46,13 @@ blaze-deflate	228
 blaze-drive	157
 blaze-ed25519	58
 blaze-emit	1000
-blaze-engine	261
+blaze-engine	259
 blaze-expand	469
-blaze-export	248
-blaze-facts	2
+blaze-export	241
 blaze-fetch	175
 blaze-file-items	277
 blaze-flow	284
-blaze-flow-lower	287
+blaze-flow-lower	286
 blaze-fmt	352
 blaze-format	24
 blaze-format-core	103
@@ -79,7 +73,7 @@ blaze-int	41
 blaze-json	32
 blaze-keyed	588
 blaze-kit	167
-blaze-ladder	1164
+blaze-ladder	1162
 blaze-launch	83
 blaze-launch-rt	219
 blaze-launcher	2
@@ -114,10 +108,9 @@ blaze-queue	9
 blaze-radix	49
 blaze-real	153
 blaze-reclaim	2
-blaze-record	7
 blaze-remote	217
 blaze-report	162
-blaze-resolve	56
+blaze-resolve	54
 blaze-rng	3
 blaze-roots	24
 blaze-run	273
@@ -128,7 +121,7 @@ blaze-script	91
 blaze-semver	9
 blaze-sha256	43
 blaze-sim	155
-blaze-solve	420
+blaze-solve	418
 blaze-sort	59
 blaze-source	15
 blaze-spawn	9
@@ -171,7 +164,7 @@ paths	9
 rustc_abi	109
 rustc_lexer	7
 stdx	71
-syntax	458
+syntax	457
 syntax-tree	112
 target-features	36
 test-utils	98

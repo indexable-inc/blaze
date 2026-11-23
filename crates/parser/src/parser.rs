@@ -567,6 +567,18 @@ impl Marker {
         Marker { pos, done: false }
     }
 
+    /// Disarms the drop check and hands back the marker's event index so an iterative grammar
+    /// loop can store pending markers in a flat `u32` scratch stack.
+    pub(crate) fn into_raw(mut self) -> u32 {
+        self.done = true;
+        self.pos
+    }
+
+    /// Reconstructs a live [`Marker`] from an index returned by [`Marker::into_raw`].
+    pub(crate) fn from_raw(pos: u32) -> Marker {
+        Marker::new(pos)
+    }
+
     /// Finishes the syntax tree node and assigns `kind` to it,
     /// and mark the create a `CompletedMarker` for possible future
     /// operation like `.precede()` to deal with forward_parent.

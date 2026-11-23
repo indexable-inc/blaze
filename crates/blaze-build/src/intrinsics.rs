@@ -40,9 +40,9 @@ use core::fmt;
 use blaze_lir::builder::MemAttrs;
 use blaze_lir::func::SlotKind;
 use blaze_lir::{AtomicRmw, Builder, Flags, IntCond, Op, Ordering, Sink, Ty, Value};
-use blaze_typeck::{PNode, PTy};
+use blaze_typeck::{AdtKind, ItemKey, PNode, PTy, PTys};
 
-use crate::layout::{LayoutCx, LayoutError, LayoutId, Layouts, Prim, Tail, TagEncoding, Variants};
+use crate::layout::{LayoutCx, LayoutError, LayoutFacts, LayoutId, Layouts, Prim, Tail, TagEncoding, Variants};
 
 /// The trap code of `abort_immediate`: `brk #0xfe00` on AArch64 (one home: blaze-code trap.rs).
 pub const ABORT_TRAP: u32 = blaze_code::trap::ABORT;
@@ -168,8 +168,17 @@ pub enum Which {
     RawEq,
     /// `compare_bytes(left, right, bytes)`: [`byte_order`] of the two ranges.
     CompareBytes,
+    /// blaze's `blaze_field_count::<T>() -> usize`: compile-time field count of a structural
+    /// record, tuple, or struct (`0` for enums, unions, and other types; [`field_count`] the rule).
+    BlazeFieldCount,
     /// blaze's `blaze_int_cast::<S, D>(x)`: `x as D` ([`int_cast_bits`] the rule).
     BlazeIntCast,
+    /// blaze's `blaze_record_schema_id::<T>() -> u64`: canonical structural schema hash of a
+    /// record (`0` for non-records; [`record_schema_id`] the rule).
+    BlazeRecordSchemaId,
+    /// blaze's `blaze_records_disjoint::<A, B>() -> bool`: whether two structural record types
+    /// share zero field names ([`records_disjoint`] the rule).
+    BlazeRecordsDisjoint,
     /// A `simd_*` intrinsic: its rows and its build are intrinsics/simd.rs's.
     Simd(simd::SimdOp),
 }
@@ -223,7 +232,10 @@ pub const TABLE: &[Entry] = &[
     e("atomic_xsub", Which::AtomicXsub, "Subtract from the current value, returning the previous value.", "`atomic_rmw sub`"),
     e("bitreverse", Which::Bitreverse, "Reverses the bits in an integer type `T`.", "`bitrev`"),
     e("black_box", Which::BlackBox, "See documentation of [`std::hint::black_box`] for details.", "its argument"),
+    e("blaze_field_count", Which::BlazeFieldCount, "blaze: compile-time field count of a structural record, tuple, or struct (`0` for enums, unions, and other types).", "a constant `usize` from `field_count`"),
     e("blaze_int_cast", Which::BlazeIntCast, "blaze: `x as D` between two integer types of any width, the standard ones and those of `#![blaze::arbitrary_ints]` (`u3`, `i24`): it truncates to `D`'s width, or extends by `S`'s sign, and never panics.", "`trunc`, or `sext`/`zext` by `S`'s sign, or the value itself at one width (`int_cast_bits` the rule)"),
+    e("blaze_record_schema_id", Which::BlazeRecordSchemaId, "blaze: canonical compile-time 64-bit structural schema ID of a record (`0` for non-records).", "a constant `u64` from `record_schema_id`"),
+    e("blaze_records_disjoint", Which::BlazeRecordsDisjoint, "blaze: compile-time check that two structural record types share zero field names.", "a constant `bool` from `records_disjoint`"),
     e("bswap", Which::Bswap, "Reverses the bytes in an integer type `T`.", "`bswap` (a byte: itself)"),
     e("caller_location", Which::CallerLocation, "Gets a reference to a static `Location` indicating where it was called.", "the address of a data row of the site's `Location`, or the location a `#[track_caller]` fn was passed"),
     e("catch_unwind", Which::CatchUnwind, "Rust's \"try catch\" construct for unwinding.", "an `invoke` of `try_fn` whose `catch` landing block calls `catch_fn` (walk/unwind.rs); under `panic = abort` a call and `false`"),
@@ -1112,6 +1124,30 @@ pub fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
             let (dty, _) = s.scalar(to)?;
             Out::Scalar(s.resize(x, dty, signed))
         }
+        // blaze's structural reflection intrinsics: each lowers to a compile-time constant by the
+        // one rule (`field_count`, `records_disjoint`, `record_schema_id`) shared with
+        // blaze-consteval.
+        W::BlazeFieldCount => {
+            let t = t0.ok_or_else(need_t)?;
+            let count = field_count(t, s.cx.cx.ground.view(), s.cx.cx.facts).map_err(|e| match e {
+                FieldCountError::MissingType => s.shape("a type argument not in the ground table"),
+                FieldCountError::NoAdt(adt) => IntrinsicError::Layout(LayoutError { ty: t, why: crate::layout::Refusal::NoAdt(adt) }),
+            })?;
+            Out::Scalar(s.usize(count))
+        }
+        W::BlazeRecordsDisjoint => {
+            let (a, b) = (t0.ok_or_else(need_t)?, ty_arg(c, 1).ok_or_else(need_t)?);
+            let disjoint = records_disjoint(a, b, s.cx.cx.ground.view()).map_err(|e| match e {
+                DisjointError::MissingType => s.shape("a type argument not in the ground table"),
+                DisjointError::MissingRecordNames => s.shape("a structural record type without registered schema field names"),
+            })?;
+            Out::Scalar(s.b.iconst(Ty::I8, u128::from(disjoint)))
+        }
+        W::BlazeRecordSchemaId => {
+            let t = t0.ok_or_else(need_t)?;
+            let id = record_schema_id(t, s.cx.cx.ground.view()).ok_or(s.shape("a type argument not in the ground table"))?;
+            Out::Scalar(s.b.iconst(Ty::I64, u128::from(id)))
+        }
     };
     Ok(out)
 }
@@ -1181,6 +1217,77 @@ pub fn int_cast_bits(x: u128, from_bits: u32, from_signed: bool, to_bits: u32) -
     let sign = from_bits > 0 && from_bits < 128 && from_signed && (x >> (from_bits - 1)) & 1 == 1;
     let wide = if sign { x | !((1u128 << from_bits) - 1) } else { x };
     keep(wide, to_bits)
+}
+
+/// Why [`field_count`] could not answer for a ground type.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FieldCountError {
+    /// The type is not in the ground table.
+    MissingType,
+    /// `T` is an ADT whose definition is not loaded in `facts` yet.
+    NoAdt(ItemKey),
+}
+
+/// `blaze_field_count::<T>()`'s rule: the field count of `T` as a `usize`:
+/// - `PNode::Record(_, fields)` -> `fields.len`
+/// - `PNode::Tuple(fields)` -> `fields.len`
+/// - `PNode::Adt(adt_key, _)` -> if struct (`AdtKind::Struct` with one variant), its field count;
+///   otherwise `0` (for enums/unions)
+/// - any other type -> `0`.
+pub fn field_count(ty: PTy, tys: PTys<'_>, facts: &dyn LayoutFacts) -> Result<u64, FieldCountError> {
+    let node = tys.get(ty).copied().ok_or(FieldCountError::MissingType)?;
+    match node {
+        PNode::Record(_, fields) | PNode::Tuple(fields) => Ok(u64::from(fields.len)),
+        PNode::Adt(adt_key, _) => {
+            let adt = facts.adt(adt_key).ok_or(FieldCountError::NoAdt(adt_key))?;
+            match (adt.kind, adt.variants) {
+                (AdtKind::Struct, [variant]) => Ok(u64::from(variant.fields.len)),
+                _ => Ok(0),
+            }
+        }
+        _ => Ok(0),
+    }
+}
+
+/// Why [`records_disjoint`] could not answer for two ground types.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DisjointError {
+    /// A type argument is not in the ground table.
+    MissingType,
+    /// A non-empty structural record type has no registered schema field names in `tys`.
+    MissingRecordNames,
+}
+
+/// `blaze_records_disjoint::<A, B>()`'s rule:
+/// - if `A` and `B` are both `PNode::Record`: `true` iff their canonical field-name sets share
+///   zero `Name` elements
+/// - if either is the empty tuple `()`: `true`
+/// - otherwise: `a != b`.
+pub fn records_disjoint(a: PTy, b: PTy, tys: PTys<'_>) -> Result<bool, DisjointError> {
+    let na = tys.get(a).copied().ok_or(DisjointError::MissingType)?;
+    let nb = tys.get(b).copied().ok_or(DisjointError::MissingType)?;
+    match (na, nb) {
+        (PNode::Record(sa, fa), PNode::Record(sb, fb)) => {
+            if fa.len == 0 || fb.len == 0 {
+                return Ok(true);
+            }
+            let names_a = tys.record_names(sa).ok_or(DisjointError::MissingRecordNames)?;
+            let names_b = tys.record_names(sb).ok_or(DisjointError::MissingRecordNames)?;
+            Ok(!names_a.iter().any(|name| names_b.contains(name)))
+        }
+        (PNode::Tuple(l), _) | (_, PNode::Tuple(l)) if l.len == 0 => Ok(true),
+        _ => Ok(a != b),
+    }
+}
+
+/// `blaze_record_schema_id::<T>()`'s rule: `schema.0` for `PNode::Record(schema, _)`, `0` for any
+/// other type.
+pub fn record_schema_id(ty: PTy, tys: PTys<'_>) -> Option<u64> {
+    let node = tys.get(ty).copied()?;
+    Some(match node {
+        PNode::Record(schema, _) => schema.0,
+        _ => 0,
+    })
 }
 
 /// `discriminant_value::<T>(v)`: the tag at `v` decoded by `T`'s encoding, as the call's type.

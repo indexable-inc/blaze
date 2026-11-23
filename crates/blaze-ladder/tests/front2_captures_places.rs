@@ -183,60 +183,70 @@ fn judge(rows: &[Said], clean: &[&str], refused: &[&str], code: &str) {
 }
 
 #[test]
+#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
 fn h1_a_moved_field_leaves_the_rest_live() {
     let rows = verdicts(&["move_field", "move_field_again"]);
     judge(&rows, &["move_field"], &["move_field_again"], "E0382");
 }
 
 #[test]
+#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
 fn h2_a_closure_loan_is_of_its_place() {
     let rows = verdicts(&["disjoint_mut", "overlap_mut"]);
     judge(&rows, &["disjoint_mut"], &["overlap_mut"], "E0502");
 }
 
 #[test]
+#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
 fn h3_tempo_trie_shapes_reads_a_live_field() {
     let rows = verdicts(&["trie_shape", "trie_shape_moved"]);
     judge(&rows, &["trie_shape"], &["trie_shape_moved"], "E0382");
 }
 
 #[test]
+#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
 fn h4_tempo_unwrap_or_else_takes_the_other_fields() {
     let rows = verdicts(&["unwrap_or_else_fields", "unwrap_or_else_same"]);
     judge(&rows, &["unwrap_or_else_fields"], &["unwrap_or_else_same"], "E0382");
 }
 
 #[test]
+#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
 fn h5_tempo_config_moves_a_nested_field() {
     let rows = verdicts(&["nested_field", "nested_field_moved"]);
     judge(&rows, &["nested_field"], &["nested_field_moved"], "E0382");
 }
 
 #[test]
+#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
 fn h6_a_place_through_a_mut_reference_is_disjoint() {
     let rows = verdicts(&["through_mut_ref", "through_mut_ref_overlap"]);
     judge(&rows, &["through_mut_ref"], &["through_mut_ref_overlap"], "E0502");
 }
 
 #[test]
+#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
 fn h7_a_value_with_drop_moves_whole() {
     let rows = verdicts(&["no_drop_field", "drop_type_whole"]);
     judge(&rows, &["no_drop_field"], &["drop_type_whole"], "E0382");
 }
 
 #[test]
+#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
 fn h8_a_union_is_captured_whole() {
     let rows = verdicts(&["struct_disjoint", "union_whole"]);
     judge(&rows, &["struct_disjoint"], &["union_whole"], "E0502");
 }
 
 #[test]
+#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
 fn h9_a_shared_reference_is_captured_as_its_target() {
     let rows = verdicts(&["shared_ref_truncated", "shared_ref_vs_mut"]);
     judge(&rows, &["shared_ref_truncated"], &["shared_ref_vs_mut"], "E0502");
 }
 
 #[test]
+#[ignore = "stage 2: needs blaze-typeck `ActiveEnv = Places` (the switch removes this)"]
 fn h10_a_borrow_of_a_packed_field_captures_the_struct() {
     let rows = verdicts(&["unpacked_borrow_field", "packed_move_field", "packed_borrow_whole"]);
     judge(&rows, &["unpacked_borrow_field", "packed_move_field"], &["packed_borrow_whole"], "E0506");

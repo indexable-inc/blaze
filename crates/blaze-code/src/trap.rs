@@ -26,6 +26,8 @@ pub const SET_FAILED: u32 = 0xfe02;
 /// A thread-local descriptor's row whose initial bytes exceed its size (blaze-build
 /// tls/index.rs).
 pub const BAD_ROW: u32 = 0xfe03;
+/// `pthread_key_create` failed during thread-local startup (blaze-export start.rs).
+pub const KEY_CREATE_FAILED: u32 = 0xfe04;
 /// A coroutine's `poll` of a state that returned or panicked (blaze-lir coroutine.rs
 /// `RESUMED_TRAP`).
 pub const ASYNC_RESUMED: u32 = 0xfe10;
@@ -45,6 +47,7 @@ pub enum Reason {
     NoMemory,
     SetFailed,
     BadRow,
+    KeyCreateFailed,
     AsyncResumed,
     NoState,
     DivZero,
@@ -61,6 +64,7 @@ impl Reason {
             NO_MEMORY => Reason::NoMemory,
             SET_FAILED => Reason::SetFailed,
             BAD_ROW => Reason::BadRow,
+            KEY_CREATE_FAILED => Reason::KeyCreateFailed,
             ASYNC_RESUMED => Reason::AsyncResumed,
             NO_STATE => Reason::NoState,
             DIV_ZERO => Reason::DivZero,
@@ -77,6 +81,7 @@ impl Reason {
             Reason::NoMemory => NO_MEMORY,
             Reason::SetFailed => SET_FAILED,
             Reason::BadRow => BAD_ROW,
+            Reason::KeyCreateFailed => KEY_CREATE_FAILED,
             Reason::AsyncResumed => ASYNC_RESUMED,
             Reason::NoState => NO_STATE,
             Reason::DivZero => DIV_ZERO,
@@ -93,6 +98,7 @@ impl Reason {
             Reason::NoMemory => "a thread's thread-local table could not be allocated",
             Reason::SetFailed => "`pthread_setspecific` failed in the thread-local getter",
             Reason::BadRow => "a thread-local descriptor row is malformed (its initial bytes exceed its size)",
+            Reason::KeyCreateFailed => "`pthread_key_create` failed during thread-local startup",
             Reason::AsyncResumed => "a coroutine (`async fn`) resumed after it completed or panicked",
             Reason::NoState => "a coroutine's state tag names no state",
             Reason::DivZero => "a division or remainder by zero",
@@ -160,7 +166,7 @@ mod tests {
     /// and an unnamed one as `Other`.
     #[test]
     fn trap_codes_read_back_from_their_instructions() {
-        for code in [ABORT, NO_MEMORY, SET_FAILED, BAD_ROW, ASYNC_RESUMED, NO_STATE, DIV_ZERO, DIV_OVERFLOW, UNREACHABLE, 7] {
+        for code in [ABORT, NO_MEMORY, SET_FAILED, BAD_ROW, KEY_CREATE_FAILED, ASYNC_RESUMED, NO_STATE, DIV_ZERO, DIV_OVERFLOW, UNREACHABLE, 7] {
             let word = 0xd420_0000 | (code << 5);
             assert_eq!(brk(word), Some(code), "brk #{code:#x}");
             assert_eq!(Reason::of(code).code(), code);

@@ -257,6 +257,11 @@ crates/blaze-squeeze/src/lib.rs	MAGIC	none
 crates/blaze-std/src/comptime.rs	BLAZE_COMPTIME_MIN_VERSION	none
 crates/blaze-std/src/hosting.rs	MAGIC	none
 crates/blaze-std/src/hosting.rs	VERSION	none
+crates/blaze-std/src/lz4.rs	FLG_VERSION_01	not persisted: LZ4 Frame v1.6.4 format header constant
+crates/blaze-std/src/lz4.rs	FLG_VERSION_MASK	not persisted: LZ4 Frame v1.6.4 format header constant
+crates/blaze-std/src/lz4.rs	LZ4_FRAME_MAGIC	not persisted: LZ4 Frame v1.6.4 format header constant
+crates/blaze-std/src/lz4.rs	LZ4_SKIPPABLE_MAGIC_BASE	not persisted: LZ4 Frame v1.6.4 format header constant
+crates/blaze-std/src/lz4.rs	LZ4_SKIPPABLE_MAGIC_MASK	not persisted: LZ4 Frame v1.6.4 format header constant
 crates/blaze-std/src/rt/image.rs	ELF_MAGIC	none
 crates/blaze-std/src/rt/image.rs	MH_MAGIC_64	none
 crates/blaze-std/src/spec.rs	VERSION	none
@@ -265,6 +270,11 @@ crates/blaze-std/src/telemetry/sampler/symbols.rs	ELF_MAGIC	none
 crates/blaze-std/src/telemetry/sampler/symbols.rs	MH_MAGIC_64	none
 crates/blaze-std/src/wasm64.rs	ABI_VERSION	none
 crates/blaze-std/src/wire.rs	VERSION	none
+crates/blaze-std/src/zip.rs	VERSION_MADE_BY_UNIX_20	not persisted: PKZIP archive header version constant
+crates/blaze-std/src/zip.rs	VERSION_NEEDED_20	not persisted: PKZIP archive header version constant
+crates/blaze-std/src/zstd/mod.rs	SKIPPABLE_MAGIC_MAX	not persisted: RFC 8878 Zstandard frame format constant
+crates/blaze-std/src/zstd/mod.rs	SKIPPABLE_MAGIC_MIN	not persisted: RFC 8878 Zstandard frame format constant
+crates/blaze-std/src/zstd/mod.rs	ZSTD_MAGIC	not persisted: RFC 8878 Zstandard frame format constant
 crates/blaze-surface/src/crate_graph.rs	GRAPH_SCHEMA	none
 crates/blaze-surface/src/file_items.rs	SCHEMA	none
 crates/blaze-surface/src/impl_index.rs	BUCKET_SCHEMA	none

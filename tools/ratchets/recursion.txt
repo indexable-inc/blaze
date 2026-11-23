@@ -4,7 +4,6 @@
 # (AGENTS.md bounded-progress). Written by scripts/src/bin/recursion.rs (`{"command":
 # "write"}`), checked in CI.
 # crate	functions
-blaze-algebra	9
 blaze-bench	1
 blaze-blake3	2
 blaze-bstd-convert	5
@@ -33,15 +32,12 @@ blaze-protocol	1
 blaze-real	2
 blaze-rel	15
 blaze-report	1
-blaze-resolve	7
 blaze-script	8
-blaze-solve	5
 blaze-sql	4
 blaze-squeeze	1
 blaze-std	5
 gpu	5
 ix-prof	2
-parser	7
+parser	4
 stdx	4
-syntax	4
 test-utils	1

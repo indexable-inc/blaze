@@ -1061,7 +1061,8 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 | AdjustKind::MutToConstPointer
                 | AdjustKind::Unsize
                 | AdjustKind::UnionInject { .. }
-                | AdjustKind::UnionWiden => {
+                | AdjustKind::UnionWiden
+                | AdjustKind::RecordProject => {
                     // Creating a fn pointer or unsizing consumes the value into an rvalue.
                     self.consume_or_copy(cp, place, At::Expr(e))?;
                     place = None;

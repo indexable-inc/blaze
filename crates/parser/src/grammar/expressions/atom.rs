@@ -80,6 +80,9 @@ pub(super) fn atom_expr<S: Sink>(
     if p.at_contextual_kw(T![builtin]) && p.nth_at(1, T![#]) {
         return Some((builtin_expr(p)?, BlockLike::NotBlock));
     }
+    if p.at_contextual_kw(T![inline]) && p.nth_at(1, T![for]) {
+        return Some((inline_for_expr(p, None), BlockLike::Block));
+    }
     if paths::is_path_start(p) {
         return Some(path_expr(p, r));
     }
@@ -679,18 +682,37 @@ fn closure_expr<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
 // }
 fn if_expr<S: Sink>(p: &mut Parser<'_, S>) -> CompletedMarker {
     assert!(p.at(T![if]));
-    let m = p.start();
+    let outer = p.start();
     p.bump(T![if]);
     expr_no_struct(p);
     block_expr(p);
-    if p.eat(T![else]) {
-        if p.at(T![if]) {
-            if_expr(p);
-        } else {
-            block_expr(p);
-        }
+    if !p.eat(T![else]) {
+        return outer.complete(p, IF_EXPR);
     }
-    m.complete(p, IF_EXPR)
+    if !p.at(T![if]) {
+        block_expr(p);
+        return outer.complete(p, IF_EXPR);
+    }
+    blaze_mem::scratch::with_u32s(|markers| {
+        loop {
+            let m = p.start();
+            p.bump(T![if]);
+            expr_no_struct(p);
+            block_expr(p);
+            markers.push(m.into_raw());
+            if !p.eat(T![else]) {
+                break;
+            }
+            if !p.at(T![if]) {
+                block_expr(p);
+                break;
+            }
+        }
+        while let Some(raw) = markers.pop() {
+            Marker::from_raw(raw).complete(p, IF_EXPR);
+        }
+    });
+    outer.complete(p, IF_EXPR)
 }
 
 // test label
@@ -715,6 +737,9 @@ fn labeled_expr<S: Sink>(p: &mut Parser<'_, S>) -> Option<CompletedMarker> {
     Some(match p.current() {
         T![loop] => loop_expr(p, Some(m)),
         T![for] => for_expr(p, Some(m)),
+        IDENT if p.at_contextual_kw(T![inline]) && p.nth_at(1, T![for]) => {
+            inline_for_expr(p, Some(m))
+        }
         T![while] => while_expr(p, Some(m)),
         // test labeled_block
         // fn f() { 'label: {}; }
@@ -761,6 +786,12 @@ fn while_expr<S: Sink>(p: &mut Parser<'_, S>, m: Option<Marker>) -> CompletedMar
     verify::loop_clauses(p);
     block_expr(p);
     m.complete(p, WHILE_EXPR)
+}
+
+fn inline_for_expr<S: Sink>(p: &mut Parser<'_, S>, m: Option<Marker>) -> CompletedMarker {
+    let m = m.unwrap_or_else(|| p.start());
+    p.bump_remap(T![inline]);
+    for_expr(p, Some(m))
 }
 
 // test for_expr

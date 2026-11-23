@@ -26,7 +26,7 @@ use blaze_own::{AVec, Alloc, Vec};
 use blaze_tier::record::{encode, from_v1, place, read, seal};
 use blaze_tier::{Emitted, Machine, Named, Names, Outside, RoutinePlaces, Table, TierError, TierName};
 
-use super::{POLL, TierFn, fast, reference, table};
+use super::{POLL_PAGE_ROOM, TierFn, carve_poll_page, fast, reference, table};
 use crate::compose::emit::POLL_PAGE;
 use crate::tests::one;
 use crate::{Isa, Os, emit_record};
@@ -141,14 +141,15 @@ fn placed(record: &[u8], tier: TierName) -> Executable {
     let align = 1usize << view.relro_align();
     let symbol = Symbol::of_name("blaze-emit tier_tests::routines: the f128 add");
     let mut done: Result<(), PlaceError> = Ok(());
-    let exec = Executable::written(view.code().len(), relro_len + align + 16, |code, data| {
-        let skip = (align - data.as_ptr() as usize % align) % align;
+    let exec = Executable::written(view.code().len(), POLL_PAGE_ROOM + relro_len + align + 16, |code, data| {
+        let (page, rest) = carve_poll_page(data);
+        let skip = (align - rest.as_ptr() as usize % align) % align;
         let word_at = skip + relro_len.next_multiple_of(8);
-        data[word_at..word_at + 8].copy_from_slice(&(__addtf3 as usize as u64).to_le_bytes());
-        let word = data[word_at..].as_ptr() as u64;
-        let relro = &mut data[skip..skip + relro_len];
+        rest[word_at..word_at + 8].copy_from_slice(&(__addtf3 as usize as u64).to_le_bytes());
+        let word = rest[word_at..].as_ptr() as u64;
+        let relro = &mut rest[skip..skip + relro_len];
         let at = At { code: code.as_ptr() as u64, relro: relro.as_ptr() as u64 };
-        let mut words = Bound { page: core::ptr::addr_of!(POLL) as u64, word };
+        let mut words = Bound { page, word };
         done = place(&view, symbol, at, &mut words, code, relro);
     })
     .expect("the code maps");

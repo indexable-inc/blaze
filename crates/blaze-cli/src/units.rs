@@ -52,6 +52,10 @@ const MOST_PASSES: usize = 64;
 pub struct Laid<'f> {
     pub root: Made<'f>,
     pub members: Vec<(Name, Made<'f>), &'f Frame>,
+    /// Each non-member checkout path package's crate root path (checkout-relative) and syntax
+    /// edition byte, from `[patch.*]` and excluded/transitive path dependencies: used to outline
+    /// reached non-member checkout crates as sweep leaves without checking them as members.
+    pub path_roots: Vec<(&'f str, u8), &'f Frame>,
     /// The workspace's `Cargo.lock` planned (fetch.rs): `None` when there is none, or when it
     /// is refused (then a [`crate::fetch::LOCK_UNREAD`] finding on the root's units).
     pub lock: Option<crate::fetch::Lockfile<'f>>,
@@ -63,6 +67,9 @@ pub struct Laid<'f> {
     /// The `rustflags` of the checkout's cargo config (graph.rs `rustflags_config`), each file a
     /// row the layout read: what `graph::target_of` gives the units' cfg.
     pub rustflags: blaze_manifest::rustflags::RustflagsConfig<'static>,
+    /// Candidate declared dependencies of each workspace member, for unused-dependency detection
+    /// (unused_deps.rs).
+    pub(crate) member_deps: Vec<crate::unused_deps::MemberDeps<'f>, &'f Frame>,
 }
 
 impl Laid<'_> {
@@ -109,10 +116,11 @@ pub fn lay<'f, 'l>(
     let mut texts: Texts<&Frame> = Texts::new_in(frame);
     let mut present: Vec<bool, &Frame> = Vec::new_in(frame);
     let laid = (|| -> Result<Result<layout::Units<'l>, LayoutError<'l>>, CliError> {
-        // The workspace's own members read their test, example and bench targets; a fetched
-        // dependency's layout never does (it ships without tests/).
+        // The workspace's own members read their test, example and bench targets, and the
+        // workspace's root `[patch.*]` and excluded/transitive path packages are discovered too;
+        // a fetched dependency's layout never reads either.
         let mut layout = match Layout::new("", alloc) {
-            Ok(layout) => layout.with_test_targets(),
+            Ok(layout) => layout.with_test_targets().with_path_packages(),
             Err(error) => return Ok(Err(error)),
         };
         for _ in 0..MOST_PASSES {
@@ -157,10 +165,13 @@ pub fn lay<'f, 'l>(
         Err(CliError::Text { what: "the workspace's layout asked for more than 64 passes" })
     })()?;
     let mut members = Vec::new_in(frame);
+    let mut path_roots: Vec<(&'f str, u8), &'f Frame> = Vec::new_in(frame);
+    let mut member_deps: Vec<crate::unused_deps::MemberDeps<'f>, &'f Frame> = Vec::new_in(frame);
     let mut root_made = Made::new_in(Name::units(), frame);
     let mut facts = None;
     match laid {
         Ok(units) => {
+            member_deps = crate::unused_deps::extract_from_layout(&units, &paths, frame);
             // With no dependency outside the workspace and the toolchain there is no graph:
             // the lock is not read (nothing in it can change the answer), so a stale one costs
             // nothing and a lock edit moves no key.
@@ -195,6 +206,17 @@ pub fn lay<'f, 'l>(
                 // stamp, so the next sweep proves the crate unchanged by stats alone (rule 77).
                 if member.lib.iter().any(|lib| lib.proc_macro) {
                     crate::macro_files::read_row(&cx, root, stamps, member.dir.as_str(), rows, frame)?;
+                }
+            }
+            // Non-member path packages: keep each target root's edition for the file walk and
+            // track proc-macro source trees in the sweep leaf table (rule 21).
+            for pkg in units.path_packages.iter() {
+                let edition = syntax_of(pkg.edition.syntax).byte();
+                for target in pkg.lib.iter().chain(pkg.bins.iter()).chain(pkg.build.iter()) {
+                    path_roots.push((frame.alloc_str(target.root.as_str()), edition));
+                }
+                if pkg.lib.iter().any(|lib| lib.proc_macro) {
+                    crate::macro_files::read_row(&cx, root, stamps, pkg.dir.as_str(), rows, frame)?;
                 }
             }
         }
@@ -260,7 +282,7 @@ pub fn lay<'f, 'l>(
     root_made.parts.sort_unstable_by_key(|part| part.name);
     root_made.parts.dedup_by_key(|part| part.name);
     root_made.out = parts_out(&root_made.parts);
-    Ok(Laid { root: root_made, members, lock, parts, graph: None, rustflags })
+    Ok(Laid { root: root_made, members, path_roots, lock, parts, graph: None, rustflags, member_deps })
 }
 
 /// Where a refusal is: the manifest's id and the span, when it names one.
@@ -778,5 +800,123 @@ mod tests {
         files.push((".cargo/config.toml", "include = [\"gone.toml\"]\n"));
         let refused = rustflags_laid(&files).expect_err("a missing include");
         assert!(refused.contains("gone.toml"), "{refused}");
+    }
+
+    /// `[patch.crates-io]` and transitive path dependencies outside `[workspace.members]` are
+    /// tracked as layout leaves (so editing them moves `units_source`), skipped cleanly when
+    /// absent from `Cargo.lock`, classified as `PathKind::External`, and resolve `UnitGraph`
+    /// without hitting `PathOutsideWorkspace`.
+    #[test]
+    fn patch_and_transitive_path_packages_track_leaves_and_resolve_unit_graph() {
+        const ROOT_TOML: &str = "\
+[workspace]
+members = [\"crates/app\"]
+exclude = [\"vendor/patched\", \"vendor/helper\", \"vendor/unused\"]
+
+[patch.crates-io]
+patched = { path = \"vendor/patched\" }
+unused = { path = \"vendor/unused\" }
+";
+        const APP_TOML: &str = "\
+[package]
+name = \"app\"
+version = \"0.1.0\"
+edition = \"2024\"
+
+[dependencies]
+patched = \"1.0\"
+";
+        const HELPER_TOML: &str = "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        const UNUSED_TOML: &str = "[package]\nname = \"unused\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        const LOCK_TOML: &str = "\
+version = 4
+
+[[package]]
+name = \"app\"
+version = \"0.1.0\"
+dependencies = [\"patched\"]
+
+[[package]]
+name = \"patched\"
+version = \"1.0.0\"
+dependencies = [\"helper\"]
+
+[[package]]
+name = \"helper\"
+version = \"0.1.0\"
+";
+        let run_once = |patched_toml: &str| {
+            let io = Io::simulated(SimWorld::new(1, Limits::USUAL));
+            let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+            let frame = cx.frame();
+            let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("data").expect("a path")).expect("open");
+            let put = |path: &str, text: &str| {
+                root.publish(&cx, &Path::new(path).expect("a path"), Content::bytes(text.as_bytes()), Durable::No).expect("write");
+            };
+            put("Cargo.toml", ROOT_TOML);
+            put("Cargo.lock", LOCK_TOML);
+            put("crates/app/Cargo.toml", APP_TOML);
+            put("crates/app/src/lib.rs", "pub fn f() {}");
+            put("vendor/patched/Cargo.toml", patched_toml);
+            put("vendor/patched/src/lib.rs", "pub fn p() {}");
+            put("vendor/helper/Cargo.toml", HELPER_TOML);
+            put("vendor/helper/src/lib.rs", "pub fn h() {}");
+            put("vendor/unused/Cargo.toml", UNUSED_TOML);
+            put("vendor/unused/src/lib.rs", "");
+            let erased = blaze_own::Erased::new(frame);
+            let mut rows = Rows::new_in(frame);
+            let mut laid = lay(&cx, &root, &FromMeta { swept_at_ns: 0 }, &mut rows, blaze_toolchain::ToolchainId([0; 32]), blaze_own::testing::heap(), frame, erased.handle()).expect("laid");
+            let source = sweep::units_source(rows.rows.iter().map(|leaf| (rows.path(leaf), leaf)), frame);
+            let heap = blaze_own::testing::heap();
+            let mut tracked = blaze_own::Vec::new_in(heap.alloc());
+            tracked.extend(rows.rows.iter().filter(|l| !l.absent()).map(|l| blaze_own::String::from_str_in(rows.path(l), heap.alloc())));
+            let mut path_roots = blaze_own::Vec::new_in(heap.alloc());
+            path_roots.extend(laid.path_roots.iter().map(|(p, _)| blaze_own::String::from_str_in(p, heap.alloc())));
+            let parts = laid.parts.take().expect("graph parts");
+            let lock = laid.lock.as_ref().expect("lock");
+            let desc = || blaze_unit_graph::TargetDesc {
+                triple: blaze_unit_graph::Text::from_str_in("aarch64-apple-darwin", heap.alloc()),
+                cfg: blaze_own::Vec::new_in(heap.alloc()),
+            };
+            let graph = crate::graph::Graph::new(parts, lock, source, desc(), desc(), false, heap, frame);
+            let mut dirs = blaze_own::Vec::new_in(heap.alloc());
+            dirs.extend(graph.member_dirs().iter().map(|d| (blaze_own::String::from_str_in(d.dir.as_str(), heap.alloc()), d.kind)));
+            struct NoRecords;
+            impl<'a> blaze_unit_graph::Records<'a> for NoRecords {
+                fn record(&mut self, _: &blaze_fetch::SourceId<'_>) -> Option<&'a [u8]> {
+                    None
+                }
+            }
+            let unheld = blaze_drive::unit_graph_task::Unheld { failed: &[], refused: &[] };
+            let resolved = match blaze_drive::unit_graph_task::run(graph.inputs(), lock.lock, NoRecords, blaze_fetch::pack::PackView::open_source_put, unheld, heap.alloc()) {
+                Ok(blaze_drive::unit_graph_task::Entry::Made(made)) => {
+                    let decoded = blaze_unit_graph::record::decode(made.record.as_slice(), heap.alloc()).expect("decode graph");
+                    let mut names = blaze_own::Vec::new_in(heap.alloc());
+                    names.extend(decoded.graph.units.iter().map(|u| blaze_own::String::from_str_in(u.name.as_str(), heap.alloc())));
+                    Ok(names)
+                }
+                Ok(blaze_drive::unit_graph_task::Entry::Need(need)) => Err(format!("unexpected need: {}", need.len())),
+                Ok(blaze_drive::unit_graph_task::Entry::NotFetched { count }) => Err(format!("not fetched: {count}")),
+                Err(why) => Err(format!("graph failed: {why}")),
+            };
+            (source, tracked, path_roots, dirs, resolved)
+        };
+        let patched_a = "[package]\nname = \"patched\"\nversion = \"1.0.0\"\nedition = \"2021\"\n\n[dependencies]\nhelper = { path = \"../helper\" }\n";
+        let patched_b = "[package]\nname = \"patched\"\nversion = \"1.0.0\"\nedition = \"2021\"\ndescription = \"edited\"\n\n[dependencies]\nhelper = { path = \"../helper\" }\n";
+        let (src_a, tracked, path_roots, dirs, resolved) = run_once(patched_a);
+        assert!(tracked.iter().any(|p| p.as_str() == "vendor/patched/Cargo.toml"), "patched manifest tracked: {tracked:?}");
+        assert!(tracked.iter().any(|p| p.as_str() == "vendor/helper/Cargo.toml"), "helper manifest tracked: {tracked:?}");
+        assert!(path_roots.iter().any(|p| p.as_str() == "vendor/patched/src/lib.rs"), "patched root recorded: {path_roots:?}");
+        assert!(path_roots.iter().any(|p| p.as_str() == "vendor/helper/src/lib.rs"), "helper root recorded: {path_roots:?}");
+        assert!(dirs.iter().any(|(d, k)| d.as_str() == "crates/app" && *k == blaze_world::PathKind::Member), "dirs: {dirs:?}");
+        assert!(dirs.iter().any(|(d, k)| d.as_str() == "vendor/patched" && *k == blaze_world::PathKind::External), "dirs: {dirs:?}");
+        assert!(dirs.iter().any(|(d, k)| d.as_str() == "vendor/helper" && *k == blaze_world::PathKind::External), "dirs: {dirs:?}");
+        assert!(!dirs.iter().any(|(d, _)| d.as_str() == "vendor/unused"), "unused patch must not be in locked dirs: {dirs:?}");
+        let units = resolved.expect("unit graph must resolve cleanly");
+        assert!(units.iter().any(|u| u.as_str() == "app"), "units: {units:?}");
+        assert!(units.iter().any(|u| u.as_str() == "patched"), "units: {units:?}");
+        assert!(units.iter().any(|u| u.as_str() == "helper"), "units: {units:?}");
+        let (src_b, _, _, _, _) = run_once(patched_b);
+        assert_ne!(src_a, src_b, "editing patched Cargo.toml must invalidate units_source");
     }
 }

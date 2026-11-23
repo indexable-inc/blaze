@@ -390,12 +390,13 @@ pub fn lang_item(l: Lang) -> LangItem {
         Lang::AsyncFnOnceOutput => LangItem::AsyncFnOnceOutput,
         Lang::CallOnceFuture => LangItem::CallOnceFuture,
         Lang::CallRefFuture => LangItem::CallRefFuture,
+        Lang::From => LangItem::From,
     }
 }
 
 /// The solver's lang item of typeck's, for the ones the solver knows.
 fn solver_lang(l: LangItem) -> Option<Lang> {
-    const ALL: [Lang; 35] = [
+    const ALL: [Lang; 36] = [
         Lang::Sized,
         Lang::MetaSized,
         Lang::PointeeSized,
@@ -431,6 +432,7 @@ fn solver_lang(l: LangItem) -> Option<Lang> {
         Lang::AsyncFnOnceOutput,
         Lang::CallOnceFuture,
         Lang::CallRefFuture,
+        Lang::From,
     ];
     ALL.into_iter().find(|&s| lang_item(s) == l)
 }
@@ -1048,13 +1050,22 @@ impl<'a> FactCache<'a> {
             _ => None,
         };
         // Only an enum's discriminant type is read (any other type's is `u8`).
+        // For structs, read `AUTO_COPY_PUB` (Blaze edition transparent all-`pub` structs).
+        let mut auto_copy_pub = false;
         let discr = match a.kind {
             AdtKind::Enum => match reads.attrs(k)?.discr() {
                 crate::world::DiscrRepr::Unread => blaze_solve::facts::Discr::Unread,
                 crate::world::DiscrRepr::Int(i) => blaze_solve::facts::Discr::Int(int(i)),
                 crate::world::DiscrRepr::Uint(u) => blaze_solve::facts::Discr::Uint(uint(u)),
             },
-            AdtKind::Struct | AdtKind::Union => blaze_solve::facts::Discr::Unread,
+            AdtKind::Struct => {
+                if reads.attrs(k)?.0 & crate::world::TypeAttrs::AUTO_COPY_PUB != 0 {
+                    flags |= AdtFlags::AUTO_COPY_PUB;
+                    auto_copy_pub = true;
+                }
+                blaze_solve::facts::Discr::Unread
+            }
+            AdtKind::Union => blaze_solve::facts::Discr::Unread,
         };
         let fields = Span::of(&self.fields, fields);
         let variants = Span::of(&self.variants, variants);
@@ -1071,7 +1082,10 @@ impl<'a> FactCache<'a> {
             discr,
             wheres,
             por: self.end(por),
-            digest: digest("blaze-typeck adt", &reads.digest(q)?) ^ digest("blaze-typeck adt where", &reads.digest(Question::Predicates(k))?) ^ digest("blaze-typeck adt discr", &(discr_code(discr) as u32)),
+            digest: digest("blaze-typeck adt", &reads.digest(q)?)
+                ^ digest("blaze-typeck adt where", &reads.digest(Question::Predicates(k))?)
+                ^ digest("blaze-typeck adt discr", &(discr_code(discr) as u32))
+                ^ digest("blaze-typeck adt auto_copy_pub", &u32::from(auto_copy_pub)),
         };
         self.adts.insert(k.0, row);
         Ok(())

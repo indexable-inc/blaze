@@ -1297,9 +1297,10 @@ impl<'n> Store<'n> {
         if has_container {
             self.container_life(names, keys, lib)?;
         }
-        let Store { tys, fns, lives, locals, .. } = self;
+        let Store { tys, fns, inferred_outputs, lives, locals, .. } = self;
         let Lives { counts, containers, alloc, .. } = lives;
         let h = fns.get(&key).ok_or(LifeRefusal::NoHead)?;
+        let h_output = inferred_outputs.get(&key).copied().unwrap_or(h.output);
         let container = if has_container {
             match containers.get(&checker_of(lib)) {
                 Some(Ok(c)) => Some(c),
@@ -1315,7 +1316,7 @@ impl<'n> Store<'n> {
         for &(name, _) in h.params.iter() {
             r.params.push(name);
         }
-        read_fn(&mut r, &low.view(), &h.inputs[..], h.output, container)
+        read_fn(&mut r, &low.view(), &h.inputs[..], h_output, container)
     }
 
     fn make_container_life<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, lib: LibKey) -> Result<ContainerLife, LifeRefusal> {

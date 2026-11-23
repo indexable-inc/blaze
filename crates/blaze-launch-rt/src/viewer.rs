@@ -52,7 +52,7 @@ use self::watch::{Exit, Seen, Watch, WatchError};
 /// Default loopback port matching `site/explore/protocol.ts` and `blaze_run::viewer::DEFAULT_VIEWER_PORT`.
 pub const DEFAULT_PORT: u16 = 41937;
 
-/// Hosted Explore page opened by default when `active_viewers == 0`.
+/// Hosted Explore page opened by `blaze run --open` when `active_viewers == 0`.
 pub const DEFAULT_EXPLORE_URL: &str = "https://ix.dev/blaze/explore";
 
 /// Default idle expiry: 120 seconds with zero active runs and zero connected browser tabs.
@@ -218,6 +218,10 @@ pub fn start_in<C: Clock + Send + 'static>(
     if let Err(io) = fs::create_dir_all(&config.runs_dir) {
         return Err(ViewerError::RunsDir { path: config.runs_dir, io });
     }
+    // Hold a shared advisory lock (`LOCK_SH`) on `<runs_dir>/viewer.lock` for the viewer's exact
+    // lifetime so `blaze run` and `blaze gc` can probe non-blocking `LOCK_EX` to detect a live
+    // viewer without racing a fast-exiting child's `.telem`/`.meta` cleanup.
+    let viewer_lock = acquire_viewer_lock(&config.runs_dir, alloc.local());
     let bind_addr = SocketAddr::from(([127, 0, 0, 1], config.port));
     let listener = TcpListener::bind(bind_addr).map_err(|io| ViewerError::Bind { addr: bind_addr, io })?;
     let addr = listener.local_addr().map_err(|io| ViewerError::Bind { addr: bind_addr, io })?;
@@ -241,7 +245,7 @@ pub fn start_in<C: Clock + Send + 'static>(
     let thread = thread::Builder::new()
         .name(String::from("blaze-viewer"))
         .spawn(move || {
-            let mut served = Loop::new(&config, listener, watch, alloc.local(), clock.now());
+            let mut served = Loop::new(&config, listener, watch, viewer_lock, alloc.local(), clock.now());
             let ended = served.run(&theirs, &clock);
             drop(served);
             theirs.active_viewers.store(0, Ordering::Release);
@@ -335,6 +339,23 @@ struct Conn<'a> {
     gone: bool,
 }
 
+/// Advisory shared flock on `<runs_dir>/viewer.lock`, released automatically when `OwnedFd` drops.
+fn acquire_viewer_lock(runs_dir: &Path, alloc: Alloc<'_>) -> Option<blaze_sys::posix::io::OwnedFd> {
+    use blaze_sys::posix::io::{FlockOp, OpenFlags, flock, open};
+    let dir_bytes = runs_dir.as_os_str().as_bytes();
+    let leaf = blaze_launch::telemetry::VIEWER_LOCK_LEAF.as_bytes();
+    let mut path = AVec::with_capacity_in(dir_bytes.len() + 1 + leaf.len() + 1, alloc);
+    path.extend_from_slice(dir_bytes);
+    path.push(b'/');
+    path.extend_from_slice(leaf);
+    path.push(0);
+    let cstr = CStr::from_bytes_with_nul(&path).ok()?;
+    let sys_path = blaze_sys::Path::new(cstr);
+    let owned = open(sys_path, OpenFlags::READ_WRITE | OpenFlags::CREATE | OpenFlags::CLOSE_ON_EXEC, 0o600).ok()?;
+    flock(owned.fd(), FlockOp::SharedNonBlock).ok()?;
+    Some(owned)
+}
+
 /// The viewer's thread: the core, and what it waits on.
 struct Loop<'a> {
     alloc: Alloc<'a>,
@@ -343,6 +364,8 @@ struct Loop<'a> {
     runs_dir: AVec<'a, u8>,
     listener: TcpListener,
     watch: Watch,
+    /// Shared advisory flock on `<runs_dir>/viewer.lock` held for the viewer's lifetime.
+    _viewer_lock: Option<blaze_sys::posix::io::OwnedFd>,
     pump: Pump<'a, Mapped>,
     conns: AVec<'a, Conn<'a>>,
     next_conn: u64,
@@ -351,13 +374,14 @@ struct Loop<'a> {
 }
 
 impl<'a> Loop<'a> {
-    fn new(config: &ViewerConfig, listener: TcpListener, watch: Watch, alloc: Alloc<'a>, now: Duration) -> Loop<'a> {
+    fn new(config: &ViewerConfig, listener: TcpListener, watch: Watch, viewer_lock: Option<blaze_sys::posix::io::OwnedFd>, alloc: Alloc<'a>, now: Duration) -> Loop<'a> {
         Loop {
             alloc,
             idle_expiry: config.idle_expiry,
             runs_dir: AVec::from_slice_in(config.runs_dir.as_os_str().as_bytes(), alloc),
             listener,
             watch,
+            _viewer_lock: viewer_lock,
             pump: Pump::new(pump::Config::new(config.idle_expiry), now, alloc),
             conns: AVec::new_in(alloc),
             next_conn: 0,
@@ -1413,7 +1437,7 @@ mod tests {
         let mut handle = start_in(config, blaze_own::testing::heap().shared(), Monotonic::new()).expect("start viewer");
         let port = handle.addr().port();
 
-        // 1. Before any tab connects: active_viewers == 0 -> blaze run would open browser.
+        // 1. Before any tab connects: active_viewers == 0 -> `blaze run --open` would open browser.
         assert_eq!(probe_active_viewers(port), Some(0));
 
         // 2. Connect a real RFC 6455 WebSocket client.

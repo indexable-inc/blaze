@@ -223,9 +223,35 @@ impl fmt::Display for LinesError {
     }
 }
 
+/// One task's block of entries inside [`Lines`]: either borrowed straight from the previous
+/// request's mapped lines record (zero allocation and zero copy for standing rows) or owned in
+/// the request's arena when made or appended to this request.
+struct Block<'a> {
+    borrowed: &'a [u8],
+    owned: SVec<'a, u8>,
+}
+
+impl<'a> Block<'a> {
+    fn as_slice(&self) -> &[u8] {
+        if self.owned.is_empty() { self.borrowed } else { self.owned.as_slice() }
+    }
+
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    fn owned_mut(&mut self) -> &mut SVec<'a, u8> {
+        if !self.borrowed.is_empty() {
+            self.owned.extend_from_slice(self.borrowed);
+            self.borrowed = &[];
+        }
+        &mut self.owned
+    }
+}
+
 /// The blocks of one request, being made: each task's entries by name.
 pub(crate) struct Lines<'a> {
-    blocks: SMap<'a, Name, SVec<'a, u8>>,
+    blocks: SMap<'a, Name, Block<'a>>,
     alloc: SharedAlloc<'a>,
 }
 
@@ -244,7 +270,7 @@ impl<'a> Lines<'a> {
 
     fn block(&mut self, name: Name) -> &mut SVec<'a, u8> {
         let alloc = self.alloc;
-        self.blocks.entry(name).or_insert_with(|| SVec::new_in(alloc))
+        self.blocks.entry(name).or_insert_with(|| Block { borrowed: &[], owned: SVec::new_in(alloc) }).owned_mut()
     }
 
     /// A finding of `name`'s record: `path` for an outline's (placed at the file's start).
@@ -364,9 +390,16 @@ impl<'a> Lines<'a> {
         }
     }
 
-    /// A standing row's block, as the last record holds it.
-    pub(crate) fn keep(&mut self, name: Name, entries: &[u8]) {
-        self.block(name).extend_from_slice(entries);
+    /// A standing row's block, as the last record holds it (borrowed in place when `name` has no
+    /// entries yet: zero allocation and zero copy).
+    pub(crate) fn keep(&mut self, name: Name, entries: &'a [u8]) {
+        let alloc = self.alloc;
+        match self.blocks.get_mut(&name) {
+            Some(slot) => slot.owned_mut().extend_from_slice(entries),
+            None => {
+                self.blocks.insert(name, Block { borrowed: entries, owned: SVec::new_in(alloc) });
+            }
+        }
     }
 
     /// Of a standing row's block as the last record holds it, the entries that are a
@@ -375,15 +408,67 @@ impl<'a> Lines<'a> {
     /// `lines_of`: a target its features skip): the phase path makes it again from its walk,
     /// the ready path carries it from the last record, and the block's other entries stand with
     /// its row. Nothing is added for `name` when no entry is kept.
-    pub(crate) fn keep_split(&mut self, name: Name, entries: &[u8], told: bool) -> Result<usize, LinesError> {
+    pub(crate) fn keep_split(&mut self, name: Name, entries: &'a [u8], told: bool) -> Result<usize, LinesError> {
         let mut reader = Reader { bytes: entries, at: 0 };
         let mut kept = 0usize;
+        let mut total = 0usize;
+        while reader.at < entries.len() {
+            let is_told = matches!(entry(&mut reader)?, Entry::Note { class: Class::Told, .. });
+            total += 1;
+            if is_told == told {
+                kept += 1;
+            }
+        }
+        if kept == 0 {
+            return Ok(0);
+        }
+        if kept == total {
+            self.keep(name, entries);
+            return Ok(kept);
+        }
+        let mut reader = Reader { bytes: entries, at: 0 };
         while reader.at < entries.len() {
             let from = reader.at;
             let is_told = matches!(entry(&mut reader)?, Entry::Note { class: Class::Told, .. });
-            if is_told == told {
-                self.block(name).extend_from_slice(&entries[from..reader.at]);
+            if is_told == told
+                && let Some(slice) = entries.get(from..reader.at)
+            {
+                self.block(name).extend_from_slice(slice);
+            }
+        }
+        Ok(kept)
+    }
+
+    /// Of a standing row's block as the last record holds it, keep only entries whose finding
+    /// rule equals `rule` (`matching == true`) or every other entry (`matching == false`), in
+    /// order. Used to keep manifest task findings separate from tail-computed `UNUSED_DEPENDENCY`
+    /// warnings across incremental runs.
+    pub(crate) fn keep_split_rule(&mut self, name: Name, entries: &'a [u8], rule: u16, matching: bool) -> Result<usize, LinesError> {
+        let mut reader = Reader { bytes: entries, at: 0 };
+        let mut kept = 0usize;
+        let mut total = 0usize;
+        while reader.at < entries.len() {
+            let is_rule = matches!(entry(&mut reader)?, Entry::Finding { rule: r, .. } if r == rule);
+            total += 1;
+            if is_rule == matching {
                 kept += 1;
+            }
+        }
+        if kept == 0 {
+            return Ok(0);
+        }
+        if kept == total {
+            self.keep(name, entries);
+            return Ok(kept);
+        }
+        let mut reader = Reader { bytes: entries, at: 0 };
+        while reader.at < entries.len() {
+            let from = reader.at;
+            let is_rule = matches!(entry(&mut reader)?, Entry::Finding { rule: r, .. } if r == rule);
+            if is_rule == matching
+                && let Some(slice) = entries.get(from..reader.at)
+            {
+                self.block(name).extend_from_slice(slice);
             }
         }
         Ok(kept)
@@ -417,10 +502,11 @@ impl<'a> Lines<'a> {
         }
         word(&mut out, u32::try_from(self.blocks.len()).unwrap_or(u32::MAX));
         for (name, block) in self.blocks.iter() {
+            let bytes = block.as_slice();
             out.push(name.kind as u8);
             out.extend_from_slice(&name.subject.0);
-            word(&mut out, len_of(block));
-            out.extend_from_slice(block);
+            word(&mut out, len_of(bytes));
+            out.extend_from_slice(bytes);
         }
         (Key(ContentId::of(LINES_DOMAIN, &out)), out)
     }
@@ -1970,35 +2056,86 @@ fn texts_of<'f>(rows: &crate::sweep::Rows<'_>, frame: &'f Frame) -> Result<Texts
     Ok(texts)
 }
 
-/// Observes every file path referenced by finding entries in `lines` using its unambiguous sweep
-/// digest from `texts`. Returns `Ok(false)` (forcing a fallthrough to full rendering) if any
-/// entry fails to parse or any referenced path lacks a single unambiguous sweep digest.
-fn observe_standing_paths<'f>(lines: &Lines<'_>, texts: &Texts<'f>, sources: &Sources<'f>) -> Result<bool, CliError> {
-    for (_, block) in lines.blocks() {
-        let mut reader = Reader { bytes: block, at: 0 };
-        while reader.at < block.len() {
-            let Ok(parsed) = entry(&mut reader) else { return Ok(false) };
-            let path: Option<&str> = match parsed {
-                Entry::Finding { path: Some(path), .. } => match core::str::from_utf8(path) {
-                    Ok(path) => Some(path),
-                    Err(_) => return Ok(false),
-                },
+/// Extracts the source file path from the next entry in `reader`, skipping `NOTE`, `NOTED`, and
+/// `VIEW` entries without `blaze_report::finding::decode` or UTF-8 validation overhead while still
+/// checking tags and byte bounds.
+fn next_entry_path<'m>(reader: &mut Reader<'m>) -> Result<Option<&'m str>, LinesError> {
+    let tag = reader.byte("an entry's tag")?;
+    match tag {
+        NOTE => {
+            let at = reader.at;
+            Class::of_byte(reader.byte("a note's class")?).ok_or(LinesError { at, what: "a note's class is none of the six" })?;
+            let _ = reader.sized("a note's words")?;
+            Ok(None)
+        }
+        NOTED => {
+            let _ = reader.sized("a noted finding")?;
+            Ok(None)
+        }
+        VIEW => {
+            let at_kind = reader.at;
+            Kind::from_u8(reader.byte("a view's base kind")?).ok_or(LinesError { at: at_kind, what: "a view's base kind is no task kind" })?;
+            let _ = reader.take(32, "a view's base subject")?;
+            let at_place = reader.at;
+            let at = reader.u32("a view's place")?;
+            let units = reader.u32("a view's unit count")?;
+            if units < 2 || at >= units {
+                return Err(LinesError { at: at_place, what: "a view's place is not below its unit count, or the count is under two" });
+            }
+            for _ in 0..units {
+                let at_flag = reader.at;
+                if reader.byte("a view's unit flag")? > 1 {
+                    return Err(LinesError { at: at_flag, what: "a view's unit flag is neither 0 nor 1" });
+                }
+                let _ = reader.sized("a view's unit name")?;
+            }
+            Ok(None)
+        }
+        _ => {
+            reader.at -= 1;
+            match entry(reader)? {
+                Entry::Finding { path: Some(path), .. } => core::str::from_utf8(path)
+                    .map(Some)
+                    .map_err(|_| LinesError { at: reader.at, what: "a finding's path is not UTF-8" }),
                 Entry::Finding { rule, path: None, words, .. } => {
                     if crate::names::placed(rule) && words.contains(&0x1F) {
                         match crate::names::place_pieces(words) {
-                            Ok((Some((path, _, _)), _)) => Some(path),
-                            Ok((None, _)) => None,
-                            Err(_) => return Ok(false),
+                            Ok((Some((path, _, _)), _)) => Ok(Some(path)),
+                            Ok((None, _)) => Ok(None),
+                            Err(_) => Err(LinesError { at: reader.at, what: "a finding's place pieces are malformed" }),
                         }
                     } else {
-                        None
+                        Ok(None)
                     }
                 }
-                Entry::Placed { path, .. } | Entry::PlacedTokens { path, .. } | Entry::PlacedOwn { path, .. } => Some(path),
-                Entry::Note { .. } | Entry::Noted { .. } | Entry::View(_) => None,
-            };
+                Entry::Placed { path, .. } | Entry::PlacedTokens { path, .. } | Entry::PlacedOwn { path, .. } => Ok(Some(path)),
+                Entry::Note { .. } | Entry::Noted { .. } | Entry::View(_) => Ok(None),
+            }
+        }
+    }
+}
+
+/// Observes every file path referenced by finding entries in `lines` using its unambiguous sweep
+/// digest from `texts` (populated lazily on the first referenced path). Returns `Ok(false)`
+/// (forcing a fallthrough to full rendering) if any entry fails to parse or any referenced path
+/// lacks a single unambiguous sweep digest.
+fn observe_standing_paths<'f>(
+    lines: &Lines<'_>,
+    rows: &crate::sweep::Rows<'_>,
+    texts: &mut Option<Texts<'f>>,
+    sources: &Sources<'f>,
+    frame: &'f Frame,
+) -> Result<bool, CliError> {
+    for (_, block) in lines.blocks() {
+        let mut reader = Reader { bytes: block, at: 0 };
+        while reader.at < block.len() {
+            let Ok(path) = next_entry_path(&mut reader) else { return Ok(false) };
             if let Some(path) = path {
-                let Some(id) = texts.get(path).copied().flatten() else {
+                let map = match texts {
+                    Some(map) => map,
+                    None => texts.insert(texts_of(rows, frame)?),
+                };
+                let Some(id) = map.get(path).copied().flatten() else {
                     return Ok(false);
                 };
                 sources.observe_id(path, id)?;
@@ -2372,12 +2509,16 @@ impl<'m, 'f> ViewSlot<'m, 'f> {
             let (binding, bytes) = lines.record_for(sources.digest());
             return Ok((tally, (binding.key, bytes)));
         }
-        // Each file's text digest from this command's sweep, before the printer's own reads
-        // are added to the rows: a section of a file whose text stands is not read.
-        let texts = texts_of(rows, frame)?;
-        if let Some(replayed) = self.try_replay_standing(cx, store, lines, &texts, rows, shown, frame, out)? {
+        // Each file's text digest from this command's sweep, built lazily only if a finding path
+        // is observed (skipping the full sweep-row scan on standing replays with zero file paths).
+        let mut texts: Option<Texts<'f>> = None;
+        if let Some(replayed) = self.try_replay_standing(cx, store, lines, &mut texts, rows, shown, frame, out)? {
             return Ok(replayed);
         }
+        let texts = match texts {
+            Some(map) => map,
+            None => texts_of(rows, frame)?,
+        };
         let (tally, pending) = self.draw_with(cx, root, lines.blocks(), &sources, shown, lines.alloc, frame, Some(&texts))?;
         sources.cover(rows)?;
         let (binding, bytes) = lines.record_for(pending.placement);
@@ -2396,7 +2537,7 @@ impl<'m, 'f> ViewSlot<'m, 'f> {
         cx: &Cx,
         store: &mut crate::store::CommandStore<'m, '_, D, S>,
         lines: &Lines<'a>,
-        texts: &Texts<'f>,
+        texts: &mut Option<Texts<'f>>,
         rows: &mut crate::sweep::Rows<'_>,
         shown: &mut print::Shown<'f>,
         frame: &'f Frame,
@@ -2422,7 +2563,7 @@ impl<'m, 'f> ViewSlot<'m, 'f> {
         let mut old_placement = [0u8; 32];
         old_placement.copy_from_slice(&held.bytes[4..36]);
         let fast_sources = Sources::new(frame);
-        if !observe_standing_paths(lines, texts, &fast_sources)? {
+        if !observe_standing_paths(lines, rows, texts, &fast_sources, frame)? {
             return Ok(None);
         }
         if fast_sources.digest() != ContentId(old_placement) {

@@ -41,8 +41,16 @@ const FEW_MODULES: usize = 4;
 /// The held bodies of each.
 const BODIES: usize = 24;
 
-/// The serial solve with D189's seam set to `Bodies`.
-struct Bodies;
+/// The serial solve with D189's seam set to `Bodies` and a per-call expansion scratch.
+struct Bodies {
+    scratch: RefCell<Frame>,
+}
+
+impl Bodies {
+    fn new() -> Self {
+        Self { scratch: RefCell::new(Frame::new(Tag::Expand).expect("a call scratch frame")) }
+    }
+}
 
 impl Par for Bodies {
     fn map<T, F: Fn(usize) -> T>(&self, n: usize, f: F, out: &mut AVec<'_, T>) {
@@ -51,6 +59,15 @@ impl Par for Bodies {
 
     fn block_scopes(&self) -> BlockScopes {
         BlockScopes::Bodies
+    }
+
+    fn call_scratch(&self, work: &mut dyn FnMut(Alloc<'_>)) -> Scratch {
+        let mut frame = self.scratch.borrow_mut();
+        frame.scope(|f| {
+            let erased = Erased::new(f);
+            work(erased.handle());
+        });
+        Scratch::Reset
     }
 }
 
@@ -70,7 +87,7 @@ fn text(modules: usize) -> String {
 
 /// A home frame for one pass, kept for the test (its handle outlives the pass).
 fn home() -> (&'static Frame, blaze_own::Bump<'static>) {
-    let frame: &'static Frame = Box::leak(Box::new(Frame::with_reserve(1 << 30, Tag::Nameres).expect("a home frame")));
+    let frame: &'static Frame = Box::leak(Box::new(Frame::new(Tag::Nameres).expect("a home frame")));
     let erased: &'static Erased<&'static Frame> = Box::leak(Box::new(Erased::new(frame)));
     (frame, erased.bump())
 }
@@ -120,7 +137,8 @@ fn up_with(modules: usize, file_mods: usize) -> Up {
     let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(u32::try_from(i).expect("few crates")));
     let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd") };
     let (_, bump) = home();
-    let names: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, &inputs.texts, &Bodies, bump).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"))));
+    let bodies = Bodies::new();
+    let names: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, &inputs.texts, &bodies, bump).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"))));
     let c = names.crates()[0];
     assert_eq!(c.bodies.len(), BODIES, "every `f` is held under Bodies (its block writes an item)");
     let deps: &'static BodyDeps<'static, 'static> = Box::leak(Box::new(BodyDeps::of_names(names, 0, alloc)));

@@ -195,11 +195,8 @@ fn a_mod_in_an_expression_calls_block_is_refused_by_name() {
     let verdicts = run(Planted::None, &["expression_position"]);
     let (_, outcome) = &verdicts[0];
     match outcome {
-        Outcome::Refused(r) if r.contains("a mod in a block that a macro call wrote") => {
-            println!("expression_position: refused by name (a mod in a block that a macro call wrote ..)")
-        }
-        Outcome::Refused(r) => panic!("refused for another reason: {r}"),
+        Outcome::Clean => println!("expression_position: clean"),
+        Outcome::Refused(r) => panic!("refused: {r}"),
         Outcome::Diags(d) => panic!("a false error where rustc accepts: {d}"),
-        Outcome::Clean => panic!("expression_position checked clean: the gap is closed, update this test and the report"),
     }
 }

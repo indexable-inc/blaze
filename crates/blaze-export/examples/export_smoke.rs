@@ -95,6 +95,7 @@ fn main() -> ExitCode {
         entry: Entry::CMain { main: Symbol::of_name("main") },
         panic: Panic::Unwind,
         personality: None,
+        tls: None,
         profile: None,
         natives: None,
         exports: &[],

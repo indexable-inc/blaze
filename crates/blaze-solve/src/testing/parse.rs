@@ -187,6 +187,8 @@ pub struct Attrs {
     /// `dyn_undecided trait T`: a trait whose dyn compatibility the world did not decide
     /// (`TraitFlags::DYN_UNDECIDED` in place of `DYN_COMPATIBLE`).
     pub dyn_undecided: bool,
+    /// `auto_copy_pub struct S`: Blaze-edition transparent all-`pub` struct (`AdtFlags::AUTO_COPY_PUB`).
+    pub auto_copy_pub: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -512,6 +514,7 @@ impl P<'_> {
                     "const" => a.const_ = true,
                     "reservation" => a.reservation = true,
                     "dyn_undecided" => a.dyn_undecided = true,
+                    "auto_copy_pub" => a.auto_copy_pub = true,
                     "lang" => {
                         self.i += 1;
                         self.expect("(")?;
@@ -786,162 +789,226 @@ impl P<'_> {
     }
 
     pub fn ty(&mut self) -> Parsed<TyA> {
-        if self.eat("&") {
-            let lt = if self.eat("'") { self.lifetime()? } else { Lt::Erased };
-            let m = if self.eat_word("mut") { Mutbl::Mut } else { Mutbl::Not };
-            return Ok(TyA::Ref(lt, Box::new(self.ty()?), m));
+        enum Frame {
+            Ref(Lt, Mutbl),
+            Ptr(Mutbl),
+            Rigid,
+            Tuple { start: usize },
+            Bracket,
+            FnPtrIn { start: usize },
+            FnPtrOut { start: usize },
         }
-        if self.eat("'") {
-            return Ok(TyA::Region(self.lifetime()?));
-        }
-        if self.eat("*") {
-            let m = if self.eat_word("mut") {
-                Mutbl::Mut
-            } else if self.eat_word("const") {
-                Mutbl::Not
-            } else {
-                return Err(self.err("expected `const` or `mut`"));
+        let mut stack: [Option<Frame>; 64] = [const { None }; 64];
+        let mut sp = 0usize;
+        let mut buf: Vec<TyA> = Default::default();
+        let push_frame = |stack: &mut [Option<Frame>; 64], sp: &mut usize, f: Frame| -> Result<(), ()> {
+            let Some(slot) = stack.get_mut(*sp) else {
+                return Err(());
             };
-            return Ok(TyA::Ptr(Box::new(self.ty()?), m));
-        }
-        if self.eat("(") {
-            let mut items = Vec::new();
-            let mut trailing = false;
-            while !self.eat(")") {
-                items.push(self.ty()?);
-                trailing = self.eat(",");
-                if !trailing {
-                    self.expect(")")?;
-                    break;
-                }
+            *slot = Some(f);
+            *sp += 1;
+            Ok(())
+        };
+        'parse: loop {
+            if self.eat("&") {
+                let lt = if self.eat("'") { self.lifetime()? } else { Lt::Erased };
+                let m = if self.eat_word("mut") { Mutbl::Mut } else { Mutbl::Not };
+                push_frame(&mut stack, &mut sp, Frame::Ref(lt, m)).map_err(|()| self.err("type nesting depth exceeded"))?;
+                continue;
             }
-            if items.len() == 1 && !trailing {
-                return Ok(items.remove(0));
-            }
-            return Ok(TyA::Tuple(items));
-        }
-        if self.eat("[") {
-            let e = self.ty()?;
-            if self.eat(";") {
-                let n = if self.eat("{") {
-                    let n = self.num()?;
-                    self.expect("}")?;
-                    n
+            if self.eat("*") {
+                let m = if self.eat_word("mut") {
+                    Mutbl::Mut
+                } else if self.eat_word("const") {
+                    Mutbl::Not
                 } else {
-                    self.num()?
+                    return Err(self.err("expected `const` or `mut`"));
                 };
-                self.expect("]")?;
-                return Ok(TyA::Array(Box::new(e), Box::new(TyA::Const(n))));
+                push_frame(&mut stack, &mut sp, Frame::Ptr(m)).map_err(|()| self.err("type nesting depth exceeded"))?;
+                continue;
             }
-            self.expect("]")?;
-            return Ok(TyA::Slice(Box::new(e)));
-        }
-        if self.eat("{") {
-            let n = self.num()?;
-            self.expect("}")?;
-            return Ok(TyA::Const(n));
-        }
-        if self.eat("?") {
-            return Ok(TyA::Var(self.var_name()?));
-        }
-        if self.eat("!") {
-            if let Some(Tok::Num(_)) = self.peek() {
-                return Ok(TyA::Placeholder(self.num()? as u32));
-            }
-            return Ok(TyA::Never);
-        }
-        if self.eat("_") {
-            return Ok(TyA::Error);
-        }
-        if self.eat("<") {
-            return self.proj(false);
-        }
-        let w = self.ident()?;
-        Ok(match w.as_str() {
-            "rigid" => {
-                if self.eat("<") {
-                    return self.proj(true);
+            let mut val = if self.eat("'") {
+                TyA::Region(self.lifetime()?)
+            } else if self.eat("(") {
+                if self.eat(")") {
+                    TyA::Tuple(Default::default())
+                } else {
+                    let start = buf.len();
+                    push_frame(&mut stack, &mut sp, Frame::Tuple { start }).map_err(|()| self.err("type nesting depth exceeded"))?;
+                    continue;
                 }
-                let t = self.ty()?;
-                match t {
-                    TyA::Opaque(n, a, _) => TyA::Opaque(n, a, true),
-                    _ => return Err(self.err("`rigid` takes an alias")),
-                }
-            }
-            "bool" => TyA::Bool,
-            "char" => TyA::Char,
-            "str" => TyA::Str,
-            "i8" => TyA::Int(IntTy::I8),
-            "i16" => TyA::Int(IntTy::I16),
-            "i32" => TyA::Int(IntTy::I32),
-            "i64" => TyA::Int(IntTy::I64),
-            "i128" => TyA::Int(IntTy::I128),
-            "isize" => TyA::Int(IntTy::Isize),
-            "u8" => TyA::Uint(UintTy::U8),
-            "u16" => TyA::Uint(UintTy::U16),
-            "u32" => TyA::Uint(UintTy::U32),
-            "u64" => TyA::Uint(UintTy::U64),
-            "u128" => TyA::Uint(UintTy::U128),
-            "usize" => TyA::Uint(UintTy::Usize),
-            "f16" => TyA::Float(FloatTy::F16),
-            "f32" => TyA::Float(FloatTy::F32),
-            "f64" => TyA::Float(FloatTy::F64),
-            "f128" => TyA::Float(FloatTy::F128),
-            "fnmut" => TyA::Kind(crate::term::CLOSURE_FN_MUT),
-            "fnonce" => TyA::Kind(crate::term::CLOSURE_FN_ONCE),
-            "fn" => {
-                if self.eat("#") {
-                    let n = self.ident()?;
-                    let a = self.ty_args()?;
-                    return Ok(TyA::FnItem(n, a));
-                }
-                if !self.eat("(") {
-                    return Ok(TyA::Kind(crate::term::CLOSURE_FN));
-                }
-                let mut ins = Vec::new();
-                while !self.eat(")") {
-                    ins.push(self.ty()?);
-                    if !self.eat(",") {
-                        self.expect(")")?;
-                        break;
-                    }
-                }
-                let out = if self.eat("->") { self.ty()? } else { TyA::Tuple(Vec::new()) };
-                TyA::FnPtr(ins, Box::new(out))
-            }
-            "closure" => {
-                self.expect("#")?;
+            } else if self.eat("[") {
+                push_frame(&mut stack, &mut sp, Frame::Bracket).map_err(|()| self.err("type nesting depth exceeded"))?;
+                continue;
+            } else if self.eat("{") {
                 let n = self.num()?;
-                let a = self.ty_args()?;
-                let [k, s, u]: [TyA; 3] = a.try_into().map_err(|_| self.err("closure#N<kind, sig, upvars>"))?;
-                TyA::Closure(n, Box::new(k), Box::new(s), Box::new(u))
-            }
-            "opaque" => {
-                self.expect("#")?;
-                let n = self.ident()?;
-                let a = self.ty_args()?;
-                TyA::Opaque(n, a, false)
-            }
-            "dyn" => {
-                let mut bs = Vec::new();
-                let mut lt = Lt::Static;
-                loop {
-                    if self.eat("'") {
-                        lt = self.lifetime()?;
-                    } else {
-                        bs.push(self.bound()?);
+                self.expect("}")?;
+                TyA::Const(n)
+            } else if self.eat("?") {
+                TyA::Var(self.var_name()?)
+            } else if self.eat("!") {
+                if let Some(Tok::Num(_)) = self.peek() {
+                    let n = u32::try_from(self.num()?).map_err(|_| self.err("placeholder index out of range"))?;
+                    TyA::Placeholder(n)
+                } else {
+                    TyA::Never
+                }
+            } else if self.eat("_") {
+                TyA::Error
+            } else if self.eat("<") {
+                self.proj(false)?
+            } else {
+                let w = self.ident()?;
+                match w.as_str() {
+                    "rigid" => {
+                        if self.eat("<") {
+                            self.proj(true)?
+                        } else {
+                            push_frame(&mut stack, &mut sp, Frame::Rigid).map_err(|()| self.err("type nesting depth exceeded"))?;
+                            continue;
+                        }
                     }
-                    if !self.eat("+") {
-                        break;
+                    "bool" => TyA::Bool,
+                    "char" => TyA::Char,
+                    "str" => TyA::Str,
+                    "i8" => TyA::Int(IntTy::I8),
+                    "i16" => TyA::Int(IntTy::I16),
+                    "i32" => TyA::Int(IntTy::I32),
+                    "i64" => TyA::Int(IntTy::I64),
+                    "i128" => TyA::Int(IntTy::I128),
+                    "isize" => TyA::Int(IntTy::Isize),
+                    "u8" => TyA::Uint(UintTy::U8),
+                    "u16" => TyA::Uint(UintTy::U16),
+                    "u32" => TyA::Uint(UintTy::U32),
+                    "u64" => TyA::Uint(UintTy::U64),
+                    "u128" => TyA::Uint(UintTy::U128),
+                    "usize" => TyA::Uint(UintTy::Usize),
+                    "f16" => TyA::Float(FloatTy::F16),
+                    "f32" => TyA::Float(FloatTy::F32),
+                    "f64" => TyA::Float(FloatTy::F64),
+                    "f128" => TyA::Float(FloatTy::F128),
+                    "fnmut" => TyA::Kind(crate::term::CLOSURE_FN_MUT),
+                    "fnonce" => TyA::Kind(crate::term::CLOSURE_FN_ONCE),
+                    "fn" => {
+                        if self.eat("#") {
+                            let n = self.ident()?;
+                            let a = self.ty_args()?;
+                            TyA::FnItem(n, a)
+                        } else if !self.eat("(") {
+                            TyA::Kind(crate::term::CLOSURE_FN)
+                        } else if self.eat(")") {
+                            if self.eat("->") {
+                                let start = buf.len();
+                                push_frame(&mut stack, &mut sp, Frame::FnPtrOut { start }).map_err(|()| self.err("type nesting depth exceeded"))?;
+                                continue;
+                            }
+                            TyA::FnPtr(Default::default(), Box::new(TyA::Tuple(Default::default())))
+                        } else {
+                            let start = buf.len();
+                            push_frame(&mut stack, &mut sp, Frame::FnPtrIn { start }).map_err(|()| self.err("type nesting depth exceeded"))?;
+                            continue;
+                        }
+                    }
+                    "closure" => {
+                        self.expect("#")?;
+                        let n = self.num()?;
+                        let a = self.ty_args()?;
+                        let [k, s, u]: [TyA; 3] = a.try_into().map_err(|_| self.err("closure#N<kind, sig, upvars>"))?;
+                        TyA::Closure(n, Box::new(k), Box::new(s), Box::new(u))
+                    }
+                    "opaque" => {
+                        self.expect("#")?;
+                        let n = self.ident()?;
+                        let a = self.ty_args()?;
+                        TyA::Opaque(n, a, false)
+                    }
+                    "dyn" => {
+                        let mut bs = Vec::new();
+                        let mut lt = Lt::Static;
+                        loop {
+                            if self.eat("'") {
+                                lt = self.lifetime()?;
+                            } else {
+                                bs.push(self.bound()?);
+                            }
+                            if !self.eat("+") {
+                                break;
+                            }
+                        }
+                        TyA::Dyn(bs, lt)
+                    }
+                    _ => {
+                        let a = self.ty_args()?;
+                        TyA::Path(w, a)
                     }
                 }
-                TyA::Dyn(bs, lt)
+            };
+            while sp > 0 {
+                sp -= 1;
+                let Some(frame) = stack.get_mut(sp).and_then(Option::take) else { break };
+                match frame {
+                    Frame::Ref(lt, m) => val = TyA::Ref(lt, Box::new(val), m),
+                    Frame::Ptr(m) => val = TyA::Ptr(Box::new(val), m),
+                    Frame::Rigid => {
+                        val = match val {
+                            TyA::Opaque(n, a, _) => TyA::Opaque(n, a, true),
+                            _ => return Err(self.err("`rigid` takes an alias")),
+                        };
+                    }
+                    Frame::Tuple { start } => {
+                        buf.push(val);
+                        let trailing = self.eat(",");
+                        if trailing && !self.eat(")") {
+                            push_frame(&mut stack, &mut sp, Frame::Tuple { start }).map_err(|()| self.err("type nesting depth exceeded"))?;
+                            continue 'parse;
+                        }
+                        if !trailing {
+                            self.expect(")")?;
+                        }
+                        let mut items = buf.split_off(start);
+                        val = if items.len() == 1 && !trailing { items.remove(0) } else { TyA::Tuple(items) };
+                    }
+                    Frame::Bracket => {
+                        if self.eat(";") {
+                            let n = if self.eat("{") {
+                                let n = self.num()?;
+                                self.expect("}")?;
+                                n
+                            } else {
+                                self.num()?
+                            };
+                            self.expect("]")?;
+                            val = TyA::Array(Box::new(val), Box::new(TyA::Const(n)));
+                        } else {
+                            self.expect("]")?;
+                            val = TyA::Slice(Box::new(val));
+                        }
+                    }
+                    Frame::FnPtrIn { start } => {
+                        buf.push(val);
+                        let comma = self.eat(",");
+                        if comma && !self.eat(")") {
+                            push_frame(&mut stack, &mut sp, Frame::FnPtrIn { start }).map_err(|()| self.err("type nesting depth exceeded"))?;
+                            continue 'parse;
+                        }
+                        if !comma {
+                            self.expect(")")?;
+                        }
+                        if self.eat("->") {
+                            push_frame(&mut stack, &mut sp, Frame::FnPtrOut { start }).map_err(|()| self.err("type nesting depth exceeded"))?;
+                            continue 'parse;
+                        }
+                        let ins = buf.split_off(start);
+                        val = TyA::FnPtr(ins, Box::new(TyA::Tuple(Default::default())));
+                    }
+                    Frame::FnPtrOut { start } => {
+                        let ins = buf.split_off(start);
+                        val = TyA::FnPtr(ins, Box::new(val));
+                    }
+                }
             }
-            _ => {
-                let a = self.ty_args()?;
-                TyA::Path(w, a)
-            }
-        })
+            return Ok(val);
+        }
     }
 
     /// After `<`: `Ty as Trait<args>>::Name<own>`.
@@ -960,7 +1027,12 @@ impl P<'_> {
     }
 
     pub fn pred(&mut self) -> Parsed<PredA> {
-        if self.eat_word("for") {
+        let mut binders = [const { None }; 16];
+        let mut nb = 0usize;
+        while self.eat_word("for") {
+            let Some(slot) = binders.get_mut(nb) else {
+                return Err(self.err("nested `for<..>` binder depth exceeded"));
+            };
             self.expect("<")?;
             let mut names = Vec::new();
             while !self.eat(">") {
@@ -970,15 +1042,15 @@ impl P<'_> {
                     break;
                 }
             }
-            return Ok(PredA::ForAll(names, Box::new(self.pred()?)));
+            *slot = Some(names);
+            nb += 1;
         }
-        if self.is_word("wf") && matches!(self.peek_at(1), Some(Tok::P("("))) {
+        let mut p = if self.is_word("wf") && matches!(self.peek_at(1), Some(Tok::P("("))) {
             self.i += 2;
             let t = self.ty()?;
             self.expect(")")?;
-            return Ok(PredA::Wf(t));
-        }
-        if self.eat_word("const") {
+            PredA::Wf(t)
+        } else if self.eat_word("const") {
             let name = self.ident()?;
             self.expect("(")?;
             let mut args = Vec::new();
@@ -989,23 +1061,30 @@ impl P<'_> {
                     break;
                 }
             }
-            return Ok(PredA::Const(name, args));
-        }
-        if self.is_word("normalizes") && matches!(self.peek_at(1), Some(Tok::P("("))) {
+            PredA::Const(name, args)
+        } else if self.is_word("normalizes") && matches!(self.peek_at(1), Some(Tok::P("("))) {
             self.i += 2;
             let a = self.ty()?;
             self.expect(")")?;
             self.expect("==")?;
-            return Ok(PredA::Normalizes(a, self.ty()?));
+            PredA::Normalizes(a, self.ty()?)
+        } else {
+            let a = self.ty()?;
+            if self.eat("==") {
+                PredA::Eq(a, self.ty()?)
+            } else if self.eat("<:") {
+                PredA::Sub(a, self.ty()?)
+            } else {
+                self.expect(":")?;
+                PredA::Bound(a, self.bound()?)
+            }
+        };
+        while nb > 0 {
+            nb -= 1;
+            if let Some(names) = binders.get_mut(nb).and_then(Option::take) {
+                p = PredA::ForAll(names, Box::new(p));
+            }
         }
-        let a = self.ty()?;
-        if self.eat("==") {
-            return Ok(PredA::Eq(a, self.ty()?));
-        }
-        if self.eat("<:") {
-            return Ok(PredA::Sub(a, self.ty()?));
-        }
-        self.expect(":")?;
-        Ok(PredA::Bound(a, self.bound()?))
+        Ok(p)
     }
 }

@@ -70,10 +70,17 @@ A signature's set is a positive list, as an effect list is: what it leaves out c
 - **Too much is advice**, not built: a member of a private function's set that no `?`, `Err` or
   return of its body can produce (`blaze::unneeded_member`, `warn`, with the fix that takes it
   off), as `unneeded_effect` does for a word. A `pub` function may reserve a member.
-- **Inferred sets** (Zig's `!T`), not built: a private function writes `Result<T, _>` and the set
-  is the union of what its body returns. It needs the set as an inference result the signature
-  reads, which is the cycle Zig also has for recursion; the border rule of the edition (infer
-  inside, declare at `pub`) is where it goes.
+- **Inferred return types and error sets (`Result<T, _>`, `-> _`, `-> Option<_>`):** any function
+  with a body (both private and `pub`) may write `_` placeholders in its return type — including
+  `Result<T, _>` (where every `Err(...)` and `?` error in the body is collected into a single
+  canonical error union, a single type, or `!` when infallible) as well as general return-type
+  holes like `-> _`, `-> Option<_>`, and `-> (_, u32)`. Call chains between `_`-returning
+  functions are resolved on demand via an iterative worklist in `front2` (`Store::inferred_outputs`),
+  while bodyless declarations (`extern fn`, required trait methods) and recursive `_`-inference
+  cycles are rejected cleanly with `E0391` asking for an explicit return/error type. Explicit
+  `Result<T, E1 | E2>` remains supported for stable public contracts and pure
+  `Heads`-only incremental caching, and `Store::inferred_return_type` / `Store::inferred_error_set`
+  expose the finalized types for `blaze inspect` inlay hints.
 
 ## Matching
 
@@ -100,10 +107,9 @@ the match tree and closure capture analysis.
   `blaze-borrow`, `blaze-flow-lower`, `blaze-facts`, and `blaze-ladder`, with real tagged-sum
   layout (`u8`/`u16` local discriminant + aligned payload, transparent for 1 member, uninhabited
   ZST for 0 members) in `blaze-build/src/layout.rs`.
-- **Fallible return-type sugar (`T ! E`):** under `#![blaze::error_unions]`, `Row ! FsError | Stopped`
-  and `Row ! _` parse cleanly in `parser` and lower to `TypeRef::Fallible { ok, err }` in
-  `blaze-lower` (equivalent to `Result<Row, FsError | Stopped>` / `Result<Row, _>`), while
-  macro types (`foo!(..)`, `foo![..]`, `foo!{..}`) remain unchanged.
+- **Canonical result & error-union syntax:** `Result<Row, FsError | Stopped>` and `Result<Row, _>`
+  use standard Rust generic syntax with zero `!` macro/never-type ambiguity (including structural
+  record error members like `Result<Row, { code: u32 }>`).
 - `blaze-ty::union_ty::UnionTy` supports arbitrary arity (>12 members, `u8` tag up to 256 members,
   `u16` beyond) with niche-reuse layout computation.
 - **Generic unions (`ParametricUnionTy`):** `fn with_timeout<T, E>(...) -> Result<T, E | Timeout>`
@@ -116,8 +122,11 @@ the match tree and closure capture analysis.
   out of `FsError | ParseError | Timeout | Stopped` narrows the fallback arm `Err(other)` to
   `Timeout | Stopped`, detecting redundant arms and allowing direct `?` / `return Err(other)`
   widening.
-- **Inferred private error sets (`ErrorSetInfer`):** accumulates `?` / `Err(..)` / nested unions
-  for `Result<T, _>` in private functions ("infer inside, declare at the border").
+- **General `_` return-type & error-set inference (`Checked::inferred_output`, `Store::inferred_outputs`):**
+  supports `Result<T, _>` (accumulating `Err(..)` / `?` / nested unions into the canonical union)
+  as well as `-> _`, `-> Option<_>`, and `-> (_, u32)` on any function with a body, resolved in
+  demand order across call chains with cycle detection (`E0391`) and queryable for `blaze inspect`
+  inlay hints (`Store::inferred_return_type`, `Store::inferred_error_set`).
 
 ## Representation and cost
 

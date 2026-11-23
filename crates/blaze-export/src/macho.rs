@@ -73,6 +73,7 @@ pub(crate) const S_REGULAR: u32 = 0;
 pub(crate) const S_EH_FRAME: u32 = 0x6800_000B;
 pub(crate) const S_ZEROFILL: u32 = 0x1;
 const S_NON_LAZY_SYMBOL_POINTERS: u32 = 0x6;
+const S_MOD_INIT_FUNC_POINTERS: u32 = 0x9;
 
 pub(crate) const PLATFORM_MACOS: u32 = 1;
 /// macOS 12.0 (`xxxx.yy.zz` in nibbles): the first whose dyld binds every executable through
@@ -101,8 +102,8 @@ const LIBSYSTEM_ORDINAL: u16 = 1 << 8;
 /// `__TEXT`'s sections, each always written (an empty one has size 0): `__text`, `__eh_frame`,
 /// `__gcc_except_tab`, `__unwind_info`.
 const TEXT_SECTIONS: usize = 4;
-/// `__DATA_CONST`'s sections at most: `__got`, `__const`.
-const DATA_CONST_SECTIONS: usize = 2;
+/// `__DATA_CONST`'s sections at most: `__got`, `__mod_init_func`, `__const`.
+const DATA_CONST_SECTIONS: usize = 3;
 /// `__DATA`'s sections at most: `__data`, `__bss`.
 const DATA_SECTIONS: usize = 2;
 
@@ -647,11 +648,17 @@ pub fn write_native<'a>(
                 cmds.segment(segment(seg), sections);
             }
             "__DATA_CONST" => {
-                let rest_at = laid.got_at + got_size;
-                let rest = laid.const_end() - rest_at;
+                let mut cursor = laid.got_at + got_size;
+                let mod_init = laid.mod_init_at.map(|at| {
+                    cursor = at + 8;
+                    section("__mod_init_func", "__DATA_CONST", at, 8, at, 3, S_MOD_INIT_FUNC_POINTERS)
+                });
+                let const_start = up(cursor, 16);
+                let rest = laid.const_end().saturating_sub(const_start);
                 let sections: [Option<Section<'_>>; DATA_CONST_SECTIONS] = [
                     (n > 0).then(|| section("__got", "__DATA_CONST", laid.got_at, got_size, laid.got_at, 3, S_NON_LAZY_SYMBOL_POINTERS)),
-                    (rest > 0).then(|| section("__const", "__DATA_CONST", rest_at, rest, rest_at, 4, S_REGULAR)),
+                    mod_init,
+                    (rest > 0).then(|| section("__const", "__DATA_CONST", const_start, rest, const_start, 4, S_REGULAR)),
                 ];
                 cmds.segment(segment(seg), sections.into_iter().flatten());
             }
@@ -711,6 +718,8 @@ pub fn write_native<'a>(
     out.extend_from_slice(&eh.unwind_info);
     out.resize(text_size as usize, 0);
     if has_const {
+        let const_at = usize::try_from(laid.const_at).map_err(|_| ExportError::TooLarge { what: "__DATA_CONST offset", len: laid.const_at })?;
+        out.resize(const_at, 0);
         out.extend_from_slice(&laid.konst);
         out.resize((laid.const_at + const_size) as usize, 0);
     }

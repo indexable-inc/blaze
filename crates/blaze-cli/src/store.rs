@@ -967,6 +967,12 @@ pub(crate) fn post_done_for_daemon(
     err: &Out,
 ) {
     let _ = lent.reclaim_between_requests();
+    // Return idle worker frame shelves, pooled large spans, and warm chunk caches to the OS
+    // (`MADV_FREE_REUSABLE` on macOS, `MADV_DONTNEED` on Linux) after the client has been answered.
+    blaze_mem::frame::ask_spare_trim();
+    let _ = blaze_mem::frame::trim_spare(0);
+    let _ = blaze_mem::frame::trim_span_pool();
+    let _ = blaze_mem::chunks::trim();
     if spawn_bg {
         let cx = cx.span("daemon post-done: spawn detached background gc");
         let _ = home.bg_gc.spawn(&cx, home.dir(), err);
@@ -1070,6 +1076,11 @@ impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
         }
         self.place.renew(roots::RootName::toolchain(toolchain).as_str(), roots::TOOLCHAIN_LIFE_NS)?;
         Ok(())
+    }
+
+    /// Renews a single named root for `ROOT_LIFE_NS`, returning `true` if the root was live.
+    pub fn renew_one(&mut self, name: &str) -> Result<bool, CliError> {
+        Ok(self.place.renew(name, blaze_cas::plain::ROOT_LIFE_NS)?)
     }
 
     /// Whether `name` is a toolchain crate's record ([`Store::toolchain_crates`]): a
@@ -1643,10 +1654,10 @@ mod after_answer_commit_tests {
 
         // 2. `gc_lock_is_free` returns true when unlocked, false while `gc.lock` is held, and true
         //    again after release — ensuring `BgGc::spawn` never spawns duplicate GC processes.
-        assert!(crate::gc::gc_lock_is_free(&cx, home.dir()), "gc.lock starts free");
+        assert!(crate::gc::gc_lock_is_free(&cx, home.dir()).expect("probe free gc.lock"), "gc.lock starts free");
         let held_lock = crate::gc::try_acquire_gc_lock(&cx, home.dir()).expect("acquire").expect("lock acquired");
-        assert!(!crate::gc::gc_lock_is_free(&cx, home.dir()), "gc_lock_is_free returns false while GC holds gc.lock");
+        assert!(!crate::gc::gc_lock_is_free(&cx, home.dir()).expect("probe contended gc.lock"), "gc_lock_is_free returns false while GC holds gc.lock");
         drop(held_lock);
-        assert!(crate::gc::gc_lock_is_free(&cx, home.dir()), "gc.lock free again after drop");
+        assert!(crate::gc::gc_lock_is_free(&cx, home.dir()).expect("probe released gc.lock"), "gc.lock free again after drop");
     }
 }

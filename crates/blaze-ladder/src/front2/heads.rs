@@ -261,6 +261,10 @@ pub struct Maps {
     pub trait_lifetimes: Rows<ItemKey, u32>,
     pub assoc_lifetimes: Rows<(ItemKey, Name), u32>,
     pub opaque_lifetimes: Rows<ItemKey, u32>,
+    /// Canonical source spellings of structural record fields lowered into this store
+    /// (`Name -> text`), used by structural record type spread (`{ ..Base, extra: T }`) to sort
+    /// merged fields alphabetically by source spelling rather than by `Name` hash.
+    pub record_field_names: Rows<Name, blaze_own::String<Alloc<'static>>>,
     /// The tables' allocator ([`Store::new`]'s): what an asked anonymous constant's marks
     /// are copied into ([`Heads::mark_alloc`]).
     alloc: Alloc<'static>,
@@ -298,6 +302,7 @@ impl Maps {
             trait_lifetimes: Rows::new_in(alloc),
             assoc_lifetimes: Rows::new_in(alloc),
             opaque_lifetimes: Rows::new_in(alloc),
+            record_field_names: Rows::new_in(alloc),
         }
     }
 }
@@ -385,6 +390,16 @@ impl Heads for Maps {
     fn opaque_lifetimes(&self, opaque: ItemKey) -> Option<u32> {
         self.opaque_lifetimes.get(&opaque).copied()
     }
+    fn note_record_field_name(&self, name: Name, text: &str) {
+        if !self.record_field_names.contains_key(&name) {
+            let mut owned = blaze_own::String::with_capacity_in(text.len(), self.alloc);
+            owned.push_str(text);
+            self.record_field_names.insert_absent(name, owned);
+        }
+    }
+    fn record_field_name(&self, name: Name) -> Option<&str> {
+        self.record_field_names.get(&name).map(|s| s.as_str())
+    }
     fn const_len(&self, key: LibKey) -> Option<u64> {
         self.replay_const(key);
         self.const_lens.get(&key).copied()
@@ -465,6 +480,41 @@ impl Heads for Maps {
     fn const_params(&self, item: LibKey) -> Option<&[(u32, PTy)]> {
         self.const_params.get(&item).map(|c| &c[..])
     }
+}
+
+/// Whether a lowered struct view `v` of item `key` (in `module`) is eligible for Blaze-edition
+/// automatic `Copy`/`Clone` (`AdtFlags::AUTO_COPY_PUB`):
+/// - defined in a crate on Blaze edition (`StdIs::Bstd(_)`),
+/// - `AdtKind::Struct`,
+/// - if it has fields: every field is `pub` (`lf::Vis::Pub`),
+/// - if it has no fields (unit/empty struct): the struct itself is `pub` (`lf::Vis::Pub`).
+pub(crate) fn is_auto_copy_pub_view<'n, S: NamesSource<'n>>(
+    names: S,
+    key: LibKey,
+    module: LibKey,
+    kind: tc::AdtKind,
+    v: &View<'_>,
+) -> Result<bool, Why> {
+    if kind != tc::AdtKind::Struct {
+        return Ok(false);
+    }
+    let Some(krate) = names.crate_of(key).or_else(|| names.crate_of(module)) else {
+        return Ok(false);
+    };
+    if !matches!(names.std_is(krate), Some(blaze_unit_graph::StdIs::Bstd(_))) {
+        return Ok(false);
+    }
+    let field_rows = v.rows(v.list(head::FIELDS))?;
+    if field_rows.is_empty() {
+        return Ok(v.vis() == lf::Vis::Pub);
+    }
+    for &n in field_rows {
+        let f = lf::Field::decode(n)?;
+        if f.vis != lf::Vis::Pub {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Whether a field default (`a: u8 = 1`, RFC 3681 `default_field_values`) may be written on
@@ -2025,6 +2075,9 @@ pub struct Store<'n> {
     pub tys: PortableTys<'static>,
     pub maps: Maps,
     pub adts: Rows<ItemKey, AdtRow>,
+    /// Each ADT's Blaze-edition automatic `Copy`/`Clone` eligibility (`AdtFlags::AUTO_COPY_PUB`),
+    /// kept in a side table so `AdtRow` and `head_record::VERSION` stay untouched.
+    pub auto_copy_pub: Rows<ItemKey, bool>,
     /// Made by `Want::Head`, including when a field type needs its own ADT's inherent constant.
     pub adt_declarations: Rows<ItemKey, AdtDeclaration>,
     /// Each ADT's field defaults (`struct S { a: u8 = 1 }`, RFC 3681), made with its head in
@@ -2058,6 +2111,10 @@ pub struct Store<'n> {
     pub preds: Rows<ItemKey, Preds>,
     /// The `sized` lang trait: each own type parameter's implied bound.
     pub sized: Option<LibKey>,
+    /// Cached `LangItem::From` trait key (`None` = not yet looked up, `Some(k)` = looked up).
+    pub(super) from_trait: core::cell::Cell<Option<Option<LibKey>>>,
+    /// Cached `alloc_shim::bound` targets by `Shim` ordinal (`None` = not yet looked up).
+    pub(super) alloc_shims: core::cell::Cell<[Option<Option<ItemKey>>; 6]>,
     /// The library's `Box`, `Rc`, `Arc` and `Pin`, a trait method's typed receiver is read
     /// against for dyn compatibility ([`super::receiver::Pointers::find`]; set by the maker of
     /// the store: [`Store::new`] leaves them not looked up, so every such receiver is a gap).
@@ -2151,6 +2208,20 @@ pub struct Store<'n> {
     /// The needs a step met beside the one it stopped at (`trait_members`), taken by the
     /// next step of [`Store::ensure_noting`].
     more_needs: Vec<LibKey, Global>,
+    /// Resolved concrete return types (in `self.tys`) for functions whose written return
+    /// signature contained one or more `_` placeholders (`-> _`, `-> Option<_>`, `-> Result<T, _>`),
+    /// populated once each function's body has been checked.
+    pub inferred_outputs: HashMap<ItemKey, PTy, Alloc<'static>>,
+    /// Active worklist stack of functions whose return-type `_` placeholders are currently being
+    /// inferred (used to detect mutual recursion cycles without native recursion).
+    pub(crate) inferring_output_stack: blaze_own::Vec<ItemKey, Alloc<'static>>,
+    /// Next unresolved `_`-returning callee discovered while inferring a function on the worklist.
+    pub(crate) inferred_output_wanted: Option<ItemKey>,
+    /// Mutual recursion cycle `(caller, callee)` discovered while inferring `_`-returning functions.
+    pub(crate) inferred_output_cycle: Option<(ItemKey, ItemKey)>,
+    /// True during the pre-unroll `inline for` probe check (allows downstream diagnostics that
+    /// depend on the unexpanded loop body and skips filing `inferred_outputs`).
+    pub(crate) inline_for_probe: bool,
     /// How a trait's members' needs are met: the seam the cost test proves equal.
     pub needs: NeedsMet,
     /// A body task's frozen heads (front2 tables/seeds.rs): with one, every head
@@ -2490,6 +2561,7 @@ impl<'n> Store<'n> {
             },
             maps: Maps::new_in(alloc),
             adts: Rows::new_in(alloc),
+            auto_copy_pub: Rows::new_in(alloc),
             adt_declarations: Rows::new_in(alloc),
             field_defaults: Rows::new_in(alloc),
             impls: Rows::new_in(alloc),
@@ -2501,6 +2573,8 @@ impl<'n> Store<'n> {
             trait_inherits: Rows::new_in(alloc),
             preds: Rows::new_in(alloc),
             sized,
+            from_trait: core::cell::Cell::new(None),
+            alloc_shims: core::cell::Cell::new([None; 6]),
             pointers: super::receiver::Pointers::NOT_LOOKED_UP,
             trait_defs: Rows::new_in(alloc),
             fn_gaps: Rows::new_in(alloc),
@@ -2527,6 +2601,11 @@ impl<'n> Store<'n> {
             trace: None,
             traced: None,
             more_needs: Vec::new_in(Global),
+            inferred_outputs: HashMap::new_in(alloc),
+            inferring_output_stack: blaze_own::Vec::new_in(alloc),
+            inferred_output_wanted: None,
+            inferred_output_cycle: None,
+            inline_for_probe: false,
             seeds: None,
             seed_error: None,
             // `First` until `All` is proven on clap-root: under `All`, clap's `Cmd` was refused
@@ -2547,6 +2626,164 @@ impl<'n> Store<'n> {
     /// records carry it, form 9).
     pub fn member_frame(&self, ck: ItemKey) -> Option<&MemberFrame> {
         self.member_frames.get(&ck)
+    }
+
+    /// Whether ADT `item` is eligible for Blaze-edition automatic `Copy`/`Clone`
+    /// (`AdtFlags::AUTO_COPY_PUB`). Cached in `self.auto_copy_pub` so `AdtRow` and
+    /// `head_record::VERSION` stay untouched; for an ADT loaded from a frozen head record,
+    /// Rust-edition crates immediately answer and cache `false` without lowering text.
+    pub(crate) fn is_auto_copy_pub<S: NamesSource<'n>>(&self, names: S, keys: &Keys, item: ItemKey) -> bool {
+        if let Some(&v) = self.auto_copy_pub.get(&item) {
+            return v;
+        }
+        let eligible = self.adts.get(&item).is_some_and(|a| a.kind == tc::AdtKind::Struct)
+            && keys.library_in(names, item).is_some_and(|lib| {
+                let Some(krate) = names.crate_of(lib) else { return false };
+                if !matches!(names.std_is(krate), Some(blaze_unit_graph::StdIs::Bstd(_))) {
+                    return false;
+                }
+                let Some(text) = names.signature_text_of(lib) else { return false };
+                let Ok(low) = lower(names, lib, text.text) else { return false };
+                let view = low.view();
+                is_auto_copy_pub_view(names, lib, lib, tc::AdtKind::Struct, &view).is_ok_and(|x| x)
+            });
+        self.auto_copy_pub.insert_absent(item, eligible);
+        eligible
+    }
+
+    /// The resolved return type of `key` in `self.tys`: for a function whose signature wrote `_`
+    /// (`-> _`, `-> Option<_>`, `-> Result<T, _>`) and whose body has been checked, the concrete
+    /// inferred return type; otherwise the head's written `output`.
+    pub fn fn_output(&self, key: ItemKey) -> Option<PTy> {
+        if let Some(&out) = self.inferred_outputs.get(&key) {
+            return Some(out);
+        }
+        self.fns.get(&key).map(|f| f.output)
+    }
+
+    /// The concrete inferred return type (in `self.tys`) for a function whose return signature
+    /// contained `_`, once its body has been checked (for callers and `blaze inspect` inlay hints).
+    pub fn inferred_return_type(&self, key: ItemKey) -> Option<PTy> {
+        self.inferred_outputs.get(&key).copied()
+    }
+
+    /// The inferred error type (in `self.tys`) for a `Result<T, _>` function, once its
+    /// body has been checked (for `blaze inspect` inlay hints).
+    pub fn inferred_error_set(&self, key: ItemKey) -> Option<PTy> {
+        let out = self.inferred_outputs.get(&key).copied()?;
+        let view = self.tys.view();
+        match view.node(out).ok()? {
+            PNode::Adt(_, args) | PNode::Union(args) => {
+                let list = view.list(args).ok()?;
+                (list.len() == 2).then_some(list[1])
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `key` has a return-type `_` placeholder whose concrete type has not been inferred yet.
+    pub fn has_unresolved_inferred_output(&self, key: ItemKey) -> bool {
+        if self.inferred_outputs.contains_key(&key) {
+            return false;
+        }
+        self.fns.get(&key).is_some_and(|f| has_infer_hole(self.tys.view(), f.output, self.tys.alloc()))
+    }
+
+    /// Copies a checked body's finalized return type `root` from `from` into `self.tys` and
+    /// records it under `owner` in `self.inferred_outputs`. Returns `None` if `root` cannot be
+    /// copied cleanly (unresolved hole/error type or full table).
+    pub(crate) fn file_inferred_output(&mut self, owner: ItemKey, from: tc::PTys<'_>, root: PTy) -> Option<PTy> {
+        let alloc = self.tys.alloc();
+        let n = from.len();
+        let mut seen: blaze_own::Vec<bool, Alloc<'static>> = blaze_own::Vec::with_capacity_in(n, alloc);
+        seen.resize(n, false);
+        let mut work: blaze_own::Vec<PTy, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        work.push(root);
+        let mut steps = 0u32;
+        while let Some(t) = work.pop() {
+            steps += 1;
+            if steps > 1 << 16 {
+                return None;
+            }
+            let at = usize::try_from(t.0).ok()?;
+            let slot = seen.get_mut(at)?;
+            if *slot {
+                continue;
+            }
+            *slot = true;
+            let node = from.node(t).ok()?;
+            from.children_of(node, &mut work).ok()?;
+        }
+        let mut mapped: blaze_own::Vec<Option<PTy>, Alloc<'static>> = blaze_own::Vec::with_capacity_in(n, alloc);
+        mapped.resize(n, None);
+        let mut kids: blaze_own::Vec<PTy, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        for i in 0..n {
+            if !seen.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let idx = u32::try_from(i).ok()?;
+            let node = from.node(PTy(idx)).ok()?;
+            let m = |c: PTy, mapped: &[Option<PTy>]| -> Option<PTy> {
+                usize::try_from(c.0)
+                    .ok()
+                    .and_then(|at| mapped.get(at).copied().flatten())
+            };
+            let mut l = |list: List, mapped: &[Option<PTy>], out: &mut PortableTys<'static>| -> Option<List> {
+                kids.clear();
+                for &c in from.list(list).ok()? {
+                    kids.push(m(c, mapped)?);
+                }
+                out.intern_list(&kids).ok()
+            };
+            let copied = match node {
+                PNode::Infer | PNode::Error | PNode::Future(..) => return None,
+                p @ (PNode::Bool
+                | PNode::Char
+                | PNode::Int(_)
+                | PNode::Uint(_)
+                | PNode::Float(_)
+                | PNode::Str
+                | PNode::Never
+                | PNode::Param(_)
+                | PNode::ConstParam(_)
+                | PNode::ExAuto(_)
+                | PNode::Foreign(_)) => p,
+                PNode::ConstValue { ty, bits } => PNode::ConstValue { ty: m(ty, &mapped)?, bits },
+                PNode::Tuple(a) => PNode::Tuple(l(a, &mapped, &mut self.tys)?),
+                PNode::Record(s, a) => {
+                    if let Some(names) = from.record_names(s) {
+                        self.tys.register_record_schema(s, names).ok()?;
+                    }
+                    PNode::Record(s, l(a, &mapped, &mut self.tys)?)
+                }
+                PNode::Union(a) => PNode::Union(l(a, &mapped, &mut self.tys)?),
+                PNode::Ref(mu, a) => PNode::Ref(mu, m(a, &mapped)?),
+                PNode::Ptr(mu, a) => PNode::Ptr(mu, m(a, &mapped)?),
+                PNode::Array(a, len) => PNode::Array(m(a, &mapped)?, m(len, &mapped)?),
+                PNode::Slice(a) => PNode::Slice(m(a, &mapped)?),
+                PNode::Pat(a, r) => PNode::Pat(m(a, &mapped)?, l(r, &mapped, &mut self.tys)?),
+                PNode::Adt(k, a) => PNode::Adt(k, l(a, &mapped, &mut self.tys)?),
+                PNode::FnDef(k, a) => PNode::FnDef(k, l(a, &mapped, &mut self.tys)?),
+                PNode::FnPtr(a, h) => PNode::FnPtr(l(a, &mapped, &mut self.tys)?, h),
+                PNode::Closure { owner: o, ordinal, args } => PNode::Closure { owner: o, ordinal, args: l(args, &mapped, &mut self.tys)? },
+                PNode::Coroutine { owner: o, ordinal, args } => PNode::Coroutine { owner: o, ordinal, args: l(args, &mapped, &mut self.tys)? },
+                PNode::Alias { trait_, name, args } => PNode::Alias { trait_, name, args: l(args, &mapped, &mut self.tys)? },
+                PNode::Opaque(k, a) => PNode::Opaque(k, l(a, &mapped, &mut self.tys)?),
+                PNode::Dynamic(a) => PNode::Dynamic(l(a, &mapped, &mut self.tys)?),
+                PNode::ExTrait(k, a) => PNode::ExTrait(k, l(a, &mapped, &mut self.tys)?),
+                PNode::ExProj { trait_, name, args, term } => {
+                    PNode::ExProj { trait_, name, args: l(args, &mapped, &mut self.tys)?, term: m(term, &mapped)? }
+                }
+            };
+            if let Some(slot) = mapped.get_mut(i) {
+                *slot = Some(self.tys.intern(copied).ok()?);
+            }
+        }
+        let copied = usize::try_from(root.0)
+            .ok()
+            .and_then(|at| mapped.get(at).copied().flatten())?;
+        self.inferred_outputs.insert(owner, copied);
+        Some(copied)
     }
 
     /// What a [`Why::Need`] of `k` asks for: its head, or, for a trait whose head is made,
@@ -2756,7 +2993,7 @@ impl<'n> Store<'n> {
             }
             (Want::Head(_), ItemDetail::Trait) => self.trait_head(names, keys, key, module, &v, text),
             (Want::Head(_), ItemDetail::TraitAlias) => self.trait_alias(names, keys, key, module, &v),
-            (Want::Head(_), ItemDetail::TypeAlias) => match self.alias(names, key, module, &v) {
+            (Want::Head(_), ItemDetail::TypeAlias) => match self.alias(names, keys, key, module, &v) {
                 Err(why @ (Why::Need(_) | Why::NeedConst(..))) => Err(why),
                 Err(why) => {
                     self.maps.aliases.insert(key, None);
@@ -2783,14 +3020,14 @@ impl<'n> Store<'n> {
             (Want::Fn(_), ItemDetail::Fn { .. } | ItemDetail::Const { .. }) => {
                 let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[], body: None };
                 let marks = self.marks(names, key, text).map_err(|why| HeadError::Item(key, why))?;
-                self.fn_head(names, key, ck, None, &env, 0, &[], &v, text, detail, marks)
+                self.fn_head(names, keys, key, ck, None, &env, 0, &[], &v, text, detail, marks)
             }
             // A static's head is its type, as a const's, and its mutability (the Reference,
             // "Static items": "Mutable statics", `static mut`).
             (Want::Fn(_), ItemDetail::Static { .. }) => {
                 let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[], body: None };
                 let marks = self.marks(names, key, text).map_err(|why| HeadError::Item(key, why))?;
-                let made = self.fn_head(names, key, ck, None, &env, 0, &[], &v, text, detail, marks);
+                let made = self.fn_head(names, keys, key, ck, None, &env, 0, &[], &v, text, detail, marks);
                 if made.is_ok() {
                     let m = if v.head[head::FLAGS] & sig::MUT != 0 { tc::Mutbl::Mut } else { tc::Mutbl::Not };
                     self.statics.insert(ck, m);
@@ -3306,7 +3543,7 @@ impl<'n> Store<'n> {
 
     /// A free type alias's head: its generics and the aliased type, read in the alias's own
     /// module with its own parameters (a bound on an alias's parameter binds nothing).
-    fn alias<S: NamesSource<'n>>(&mut self, names: S, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
+    fn alias<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
         let mut ps = Vec::new_in(Global);
         let mut cs = Vec::new_in(Global);
         let marks = self.marks(names, key, v.item())?;
@@ -3361,6 +3598,7 @@ impl<'n> Store<'n> {
             self.preds.insert(o.key, o.preds);
             self.opaques.insert(o.key, (alias_ck, o.index));
         }
+        self.register_record_defaults(names, keys, key, &env, marks, v)?;
         self.maps.alias_defaults.insert(key, defaults);
         self.maps.aliases.insert(key, Some((generics, ty)));
         self.maps.const_params.insert(key, cs);
@@ -3664,7 +3902,7 @@ impl<'n> Store<'n> {
                     // of the trait's members is met before the trait is made again, so a trait
                     // of n members is made at most a few times, not once per need (Iterator's
                     // members: 62 restarts and 126 ms of 149 a body, front2_tables_cost.rs).
-                    match self.member_fn_head(names, key, mk, Some(ck), &env, own + 1, &inherited, &mv, m, marks) {
+                    match self.member_fn_head(names, keys, key, mk, Some(ck), &env, own + 1, &inherited, &mv, m, marks) {
                         Ok(()) => {}
                         Err(Why::Need(k)) if self.needs == NeedsMet::All => needs.push(k),
                         Err(why) => return Err(why),
@@ -4063,8 +4301,11 @@ impl<'n> Store<'n> {
             args |= is_args_attr(path);
         }
         let discrs = discriminants(&b, &mut self.tys, &env, v, repr, &written)?;
+        self.register_record_defaults(names, keys, key, &env, marks, v)?;
         let (lifetimes, field_region_at, field_region_list) = super::borrows::freeze_field_regions(names, keys, self, ck, v, kind, &fields, self.tys.alloc())?;
         let field_regions = super::borrows::FieldRegions::new(field_region_at, field_region_list, self.tys.alloc());
+        let auto_copy = is_auto_copy_pub_view(names, key, module, kind, v)?;
+        self.auto_copy_pub.insert(ck, auto_copy);
         self.adts.insert(ck, AdtRow { kind, generics, variants, fields, repr, valid, discrs, args, marks: coherence, lifetimes, field_regions });
         let _ = self.adt_life(names, keys, key);
         Ok(())
@@ -4496,9 +4737,9 @@ impl<'n> Store<'n> {
     /// `fn_gaps` and the container's head goes on (a need is passed up: the store makes the
     /// head it names and makes the container again).
     #[expect(clippy::too_many_arguments, reason = "the fn's parts and its container's")]
-    fn member_fn_head<S: NamesSource<'n>>(&mut self, names: S, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, member: &Member<'n>, marks: Option<TextMarks<'n>>) -> Result<(), Why> {
+    fn member_fn_head<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, member: &Member<'n>, marks: Option<TextMarks<'n>>) -> Result<(), Why> {
         names.read_member_signature(member.lib, member.written_by);
-        match self.fn_head(names, lib, key, container, outer, parent, inherited, v, member.text, member.detail, marks) {
+        match self.fn_head(names, keys, lib, key, container, outer, parent, inherited, v, member.text, member.detail, marks) {
             Err(why @ (Why::Need(_) | Why::NeedConst(..))) => Err(why),
             Err(why) => {
                 self.fn_gaps.insert(key, why);
@@ -4512,11 +4753,196 @@ impl<'n> Store<'n> {
         }
     }
 
+    /// Fast check for whether `v` contains any structural record type (`TypeRef::Record`),
+    /// avoiding allocating `Env` and entering [`Store::register_record_defaults`] on normal code.
+    pub(super) fn view_has_record_type(v: &View<'_>) -> bool {
+        for i in 0..v.types.len() {
+            let Ok(ti) = u32::try_from(i) else { break };
+            if matches!(v.ty(lf::TypeId(ti)), Ok(lf::TypeRef::Record(_))) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Registers anonymous constant heads for any `TypeRef::Record` field defaults written in `v`
+    /// (`{ width: u32 = 80, name: &str }`) or inherited via structural record spread
+    /// (`{ ..Base, hp: u32 = 100 }`), keyed under `RecordSchema::defaults_key()` in
+    /// `self.field_defaults` so `Expr::Record { .. }` resolves them via `World::field_defaults`.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn register_record_defaults<S: NamesSource<'n>>(
+        &mut self,
+        names: S,
+        keys: &Keys,
+        lib: LibKey,
+        env: &Env<'_>,
+        marks: Option<TextMarks<'n>>,
+        v: &View<'_>,
+    ) -> Result<(), Why> {
+        #[derive(Clone, Copy)]
+        enum DefaultEntry {
+            None,
+            Inherited(ItemKey),
+            Written(lf::TypeId, lf::ConstIdx),
+        }
+
+        let alloc = self.tys.alloc();
+        for i in 0..v.types.len() {
+            let Ok(ti) = u32::try_from(i) else { break };
+            let Ok(lf::TypeRef::Record(fields)) = v.ty(lf::TypeId(ti)) else { continue };
+            let rows = v.rows(fields)?;
+            let mut has_default = false;
+            let mut has_spread = false;
+            for &row in rows {
+                let f = lf::Field::decode(row)?;
+                if f.default.is_some() {
+                    has_default = true;
+                }
+                if f.name.is_none() {
+                    has_spread = true;
+                }
+            }
+            if !has_default && !has_spread {
+                continue;
+            }
+            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+            let mut merged: blaze_own::Vec<(&str, Name, DefaultEntry), Alloc<'_>> = blaze_own::Vec::with_capacity_in(rows.len(), alloc);
+            let mut inherited_any = false;
+            let mut spread_ok = true;
+            for &row in rows {
+                let f = lf::Field::decode(row)?;
+                match f.name {
+                    Some(nm) => {
+                        let text = v.name_text(nm)?;
+                        let name = Name::of(text);
+                        self.maps.note_record_field_name(name, text);
+                        let entry = match f.default {
+                            Some(c) => DefaultEntry::Written(f.ty, c),
+                            None => DefaultEntry::None,
+                        };
+                        if let Some(slot) = merged.iter_mut().find(|(_, existing, _)| *existing == name) {
+                            *slot = (text, name, entry);
+                        } else {
+                            merged.push((text, name, entry));
+                        }
+                    }
+                    None => {
+                        let base_ty = b.ty(&mut self.tys, env, v, f.ty)?;
+                        let Some(PNode::Record(base_schema, _)) = self.tys.view().get(base_ty).copied() else {
+                            spread_ok = false;
+                            break;
+                        };
+                        let mut base_names: blaze_own::Vec<Name, Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+                        if let Some(ns) = self.tys.view().record_names(base_schema) {
+                            base_names.extend_from_slice(ns);
+                        } else {
+                            spread_ok = false;
+                            break;
+                        }
+                        let base_defaults = self.field_defaults.get(&base_schema.defaults_key());
+                        for (idx, &bnm) in base_names.iter().enumerate() {
+                            let Some(btext) = self.maps.record_field_name(bnm) else {
+                                spread_ok = false;
+                                break;
+                            };
+                            let entry = match base_defaults.and_then(|ds| ds.get(idx).copied().flatten()) {
+                                Some(dk) => {
+                                    inherited_any = true;
+                                    DefaultEntry::Inherited(dk)
+                                }
+                                None => DefaultEntry::None,
+                            };
+                            if let Some(slot) = merged.iter_mut().find(|(_, existing, _)| *existing == bnm) {
+                                *slot = (btext, bnm, entry);
+                            } else {
+                                merged.push((btext, bnm, entry));
+                            }
+                        }
+                        if !spread_ok {
+                            break;
+                        }
+                    }
+                }
+            }
+            if !spread_ok || (!has_default && !inherited_any) {
+                continue;
+            }
+            merged.sort_by(|a, b| a.0.cmp(b.0));
+            let mut sorted_names = blaze_own::Vec::with_capacity_in(merged.len(), alloc);
+            for &(_, nm, _) in merged.iter() {
+                sorted_names.push(nm);
+            }
+            let schema = tc::RecordSchema::of_sorted_names(&sorted_names);
+            let rk = schema.defaults_key();
+            let mut defaults = blaze_own::Vec::with_capacity_in(merged.len(), alloc);
+            for (j, &(_, _, entry)) in merged.iter().enumerate() {
+                let (fty, c) = match entry {
+                    DefaultEntry::None => {
+                        defaults.push(None);
+                        continue;
+                    }
+                    DefaultEntry::Inherited(dk) => {
+                        defaults.push(Some(dk));
+                        continue;
+                    }
+                    DefaultEntry::Written(fty, c) => (fty, c),
+                };
+                let ty = b.ty(&mut self.tys, env, v, fty)?;
+                let at = v.const_range(c)?;
+                let r = v.site(at)?;
+                let ty_text = v.text_at(v.type_range(fty)?)?.trim();
+                let value_text = v.text_at(at)?.trim();
+                let mut label = blaze_own::String::new_in(alloc);
+                let _ = core::fmt::Write::write_fmt(&mut label, format_args!("record default {j}: {ty_text} = {value_text}"));
+                let dk = keys
+                    .member(rk, MemberKind::Anon, &label)
+                    .map_err(|e| {
+                        let mut msg = blaze_own::String::new_in(alloc);
+                        let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("{e}"));
+                        Why::Program(msg.as_str().into(), r)
+                    })?;
+                let mut src = blaze_own::String::new_in(alloc);
+                let _ = core::fmt::Write::write_fmt(&mut src, format_args!("const _: {ty_text} = {value_text};"));
+                let text: &'n str = self.locals.keep_text(&src);
+                let scope = Scope::item(v, None, 0, alloc).map_err(Why::Regions)?;
+                self.preds.insert(dk, Preds::new_in(scope));
+                let row = FnHead {
+                    lib,
+                    text,
+                    qualifiers: FnQualifiers::CONST.note_lifetimes(text),
+                    text_prefix: None,
+                    container: None,
+                    parent: 0,
+                    own: 0,
+                    declared: 0,
+                    self_param: false,
+                    header: tc::FnPtrHeader::RUST,
+                    c_variadic: false,
+                    legacy_const_generics: Default::default(),
+                    inputs: Default::default(),
+                    output: ty,
+                    has_body: true,
+                    module: env.module,
+                    params: Default::default(),
+                    consts: Default::default(),
+                    bounds: Default::default(),
+                    self_: SelfTy::None,
+                    self_assoc: Default::default(),
+                };
+                self.fns.insert(dk, row);
+                defaults.push(Some(dk));
+            }
+            self.field_defaults.insert(rk, defaults.into_iter().collect());
+        }
+        Ok(())
+    }
+
     /// A fn's signature and clauses: `env` is its container's (its params `0..parent`),
     /// `inherited` its container's clauses, `v` its own text's, `marks` its text's tokens'
     /// (front2 item_site.rs).
     #[expect(clippy::too_many_arguments, reason = "the fn's parts and its container's")]
-    fn fn_head<S: NamesSource<'n>>(&mut self, names: S, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, text: &'n str, detail: ItemDetail, marks: Option<TextMarks<'n>>) -> Result<(), Why> {
+    fn fn_head<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, text: &'n str, detail: ItemDetail, marks: Option<TextMarks<'n>>) -> Result<(), Why> {
         let mut ps = Vec::new_in(Global);
         ps.extend_from_slice(outer.params);
         let mut cs = Vec::new_in(Global);
@@ -4915,6 +5341,9 @@ impl<'n> Store<'n> {
             return Err(Why::Unsupported("`...` on a fn of an ABI other than \"C\" or \"system\" (the Reference, [items.extern.variadic.conventions])", whole));
         }
         let has_body = flags & sig::HAS_BODY != 0;
+        if !has_body && has_infer_hole(self.tys.view(), written, alloc) {
+            return Err(Why::Program("inferred return/error type `_` requires a function body".into(), whole));
+        }
         let mut preds = Preds::new_in(fn_scope.clone_in(alloc));
         preds.inherit(inherited);
         if says_misses {
@@ -5045,9 +5474,34 @@ impl<'n> Store<'n> {
             }
         };
         file_regions(self, key, filed);
+        if Self::view_has_record_type(v) {
+            let rec_env = Env { module, params: &ps, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &anon, consts: &cs, body: None };
+            self.register_record_defaults(names, keys, lib, &rec_env, marks, v)?;
+        }
         self.fns.insert(key, FnHead { lib, text, text_prefix, container, parent, own, declared, self_param, header, c_variadic, qualifiers, legacy_const_generics, inputs, output, has_body, module, params: ps, consts: cs, bounds, self_, self_assoc });
         Ok(())
     }
+}
+
+/// Whether any type node reachable from `root` in `tys` is `PNode::Infer` (`_`).
+pub(crate) fn has_infer_hole(tys: tc::PTys<'_>, root: PTy, alloc: Alloc<'_>) -> bool {
+    let mut work: blaze_own::Vec<PTy, Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+    work.push(root);
+    let mut steps = 0u32;
+    while let Some(t) = work.pop() {
+        steps += 1;
+        if steps > 1 << 16 {
+            return false;
+        }
+        let Ok(node) = tys.node(t) else { return false };
+        if matches!(node, PNode::Infer) {
+            return true;
+        }
+        if tys.children_of(node, &mut work).is_err() {
+            return false;
+        }
+    }
+    false
 }
 
 /// A fn head's regions as the walk lays them (D148, piece L1a): numbering by declaration,
@@ -5720,7 +6174,6 @@ pub struct B;
         let rec_ab_ty = lower_param_ty(&mut store, "pub fn f(x: { a: i32, b: u8 });");
         let rec_xy_ty = lower_param_ty(&mut store, "pub fn f(x: { x: i32, y: u8 });");
         let uni_ty = lower_param_ty(&mut store, "pub fn f(x: A | (B | A));");
-        let fall_ty = lower_param_ty(&mut store, "pub fn f(x: i32 ! u8);");
 
         let tys = store.tys.view();
         assert_eq!(rec_ba_ty, rec_ab_ty, "`{{ b: u8, a: i32 }}` and `{{ a: i32, b: u8 }}` must lower to identical PTy");
@@ -5753,44 +6206,239 @@ pub struct B;
         assert!(matches!(tys.node(members[0]), Ok(PNode::Adt(k, _)) if k == a_key));
         assert!(matches!(tys.node(members[1]), Ok(PNode::Adt(k, _)) if k == b_key));
         assert_eq!(buckets::shape_of(tys, uni_ty), Some(Shape::Union(2)));
+    }
 
-        // 4. `i32 ! u8` without `Result` in scope lowers to `PNode::Union([i32, u8])` (NEVER `PNode::Tuple`).
-        let fall_node = tys.node(fall_ty).expect("fallible node");
-        assert!(!matches!(fall_node, PNode::Tuple(_)), "`T ! E` must NEVER lower to PNode::Tuple");
-        let PNode::Union(fall_members) = fall_node else {
-            panic!("expected PNode::Union when no Result ADT in scope, got {fall_node:?}");
-        };
-        let fl = tys.list(fall_members).expect("fallible members");
-        assert_eq!(fl.len(), 2);
-        assert_eq!(tys.node(fl[0]).expect("ok"), PNode::Int(IntTy::I32));
-        assert_eq!(tys.node(fl[1]).expect("err"), PNode::Uint(UintTy::U8));
+    #[test]
+    fn record_spread_canonical_schema_override_regions_and_error() {
+        use blaze_id::{ContentId, CrateItemKey};
+        use blaze_scope::graph::Sysroot;
+        use blaze_scope::resolve::{CrateInput, SourceTexts, resolve_crates};
+        use blaze_scope::task::Serial;
+        use blaze_surface::Edition;
+        use blaze_typeck::{IntTy, Name, PNode, RecordSchema, UintTy};
+        use blaze_unit_graph::{Implicit, Prelude, StdIs};
 
-        // 5. `i32 ! u8` WITH `enum Result<T, E>` in scope lowers to `PNode::Adt(Result, [i32, u8])`.
-        const WITH_RESULT: &str = "
-pub enum Result<T, E> { Ok(T), Err(E) }
+        const SRC: &str = "#![blaze::records]
+#![feature(no_core, lang_items)]
+#![no_core]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+pub type Transform = { x: i32, y: i32, scale: i32 };
+pub type Combat = { atk: u32, hp: u8 };
+pub type Actor = { ..Transform, hp: u32 };
+pub type FlatActor = { hp: u32, scale: i32, x: i32, y: i32 };
+pub type Boss = { ..Actor, ..Combat, hp: u32, shield: u32 };
+pub type FlatBoss = { atk: u32, hp: u32, scale: i32, shield: u32, x: i32, y: i32 };
+pub type Bad = { ..u32, hp: u32 };
+pub type WithRef<'a> = { name: &'a str, x: i32 };
+pub type NamedActor<'a> = { ..WithRef<'a>, hp: u32 };
+pub fn use_named<'a>(a: NamedActor<'a>) -> &'a str { a.name }
 ";
-        let (r_names, r_sized, r_frame) = world_of(WITH_RESULT);
-        let mut r_store = Store::new(r_sized, r_frame, a());
-        let mut r_keys = Keys::new();
-        let res_lib = item(r_names, "Result");
-        r_store.ensure(r_names, &mut r_keys, Want::Adt(res_lib)).expect("ensure Result");
-        let r_root = NamesSource::root_module(r_names, 0).expect("r root");
-        let r_env = Env { module: r_root, ..env };
-        let low = blaze_lower::lower_signature_with_extensions("pub fn f(x: i32 ! u8);", blaze_scope::Edition::E2024, exts, &mut NoCfg, alloc)
-            .expect("lower fallible with Result");
-        let rv = low.view();
-        let rp = lf::Param::decode(rv.rows(rv.list(head::PARAMS)).expect("params")[0]).expect("param");
-        let rb = Builder { resolver: Paths { names: r_names }, heads: &r_store.maps, marks: None };
-        let r_ty = rb.ty(&mut r_store.tys, &r_env, &rv, rp.ty.expect("param ty")).expect("Builder::ty with Result");
-        let r_tys = r_store.tys.view();
-        let result_key = checker_of(res_lib);
-        let PNode::Adt(adt_k, adt_args) = r_tys.node(r_ty).expect("fallible_with_result node") else {
-            panic!("expected PNode::Adt(Result, [i32, u8]), got {:?}", r_tys.node(r_ty));
+        struct SrcText(&'static str);
+        impl<'a> SourceTexts<'a> for SrcText {
+            fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
+                (krate == 0 && path == "/app/lib.rs").then_some(self.0)
+            }
+        }
+        let g = a();
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+        let bump = frame.alloc(blaze_own::Erased::new(&frame)).bump();
+        let crates = [CrateInput {
+            name: "app",
+            key: CrateItemKey(ContentId::of("record spread test", b"app")),
+            edition: Edition::E2024,
+            implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2024), proc_macro: false, entry: false },
+            root: "/app/lib.rs",
+            shown_from: "/",
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        }];
+        let sysroot = Sysroot { core: None, alloc: None, std: None, bstd: None };
+        let solved = resolve_crates(&crates, sysroot, &SrcText(SRC), &Serial, bump).expect("resolve_crates");
+        let names = &solved;
+        let find = |wanted: &str| -> LibKey {
+            let mut found = None;
+            NamesSource::each_item(names, 0, &mut |key, _| {
+                if NamesSource::name_of(names, key) == Some(wanted) {
+                    found = Some(key);
+                }
+            });
+            found.unwrap_or_else(|| panic!("`{wanted}` in fixture"))
         };
-        assert_eq!(adt_k, result_key);
-        let r_args = r_tys.list(adt_args).expect("result args");
-        assert_eq!(r_args.len(), 2);
-        assert_eq!(r_tys.node(r_args[0]).expect("ok"), PNode::Int(IntTy::I32));
-        assert_eq!(r_tys.node(r_args[1]).expect("err"), PNode::Uint(UintTy::U8));
+        let sized = Some(find("Sized"));
+        let mut store = Store::new(sized, &frame, g);
+        let mut keys = Keys::new();
+
+        for name in ["Actor", "FlatActor", "Boss", "FlatBoss", "NamedActor"] {
+            let lib = find(name);
+            store.ensure(names, &mut keys, Want::Head(lib)).unwrap_or_else(|e| panic!("ensure `{name}`: {e:?}"));
+        }
+        let use_named_key = find("use_named");
+        store.ensure(names, &mut keys, Want::Fn(use_named_key)).unwrap_or_else(|e| panic!("ensure `use_named`: {e:?}"));
+
+        let actor_ty = store.maps.aliases.get(&find("Actor")).copied().flatten().expect("Actor alias").1;
+        let flat_actor_ty = store.maps.aliases.get(&find("FlatActor")).copied().flatten().expect("FlatActor alias").1;
+        assert_eq!(actor_ty, flat_actor_ty, "`{{ ..Transform, hp: u32 }}` must equal `{{ hp: u32, scale: i32, x: i32, y: i32 }}`");
+
+        let tys = store.tys.view();
+        let PNode::Record(actor_schema, actor_fields) = tys.node(actor_ty).expect("actor node") else {
+            panic!("expected PNode::Record for Actor");
+        };
+        let expected_actor_schema = RecordSchema::of_sorted_names(&[Name::of("hp"), Name::of("scale"), Name::of("x"), Name::of("y")]);
+        assert_eq!(actor_schema, expected_actor_schema);
+        let af = tys.list(actor_fields).expect("actor fields");
+        assert_eq!(af.len(), 4);
+        assert_eq!(tys.node(af[0]).expect("hp"), PNode::Uint(UintTy::U32));
+        assert_eq!(tys.node(af[1]).expect("scale"), PNode::Int(IntTy::I32));
+        assert_eq!(tys.node(af[2]).expect("x"), PNode::Int(IntTy::I32));
+        assert_eq!(tys.node(af[3]).expect("y"), PNode::Int(IntTy::I32));
+
+        // Multi-spread + field override (`hp: u32` overrides `Combat`'s `hp: u8` without duplicating `hp`).
+        let boss_ty = store.maps.aliases.get(&find("Boss")).copied().flatten().expect("Boss alias").1;
+        let flat_boss_ty = store.maps.aliases.get(&find("FlatBoss")).copied().flatten().expect("FlatBoss alias").1;
+        assert_eq!(boss_ty, flat_boss_ty, "`Boss` must canonically equal `FlatBoss`");
+
+        // Lifetime-bearing spread lays regions cleanly without region gaps.
+        assert!(store.maps.alias_slots.get(&find("NamedActor")).is_some(), "NamedActor<'a> must lay alias region slots");
+        assert!(store.region_gaps.get(&checker_of(use_named_key)).is_none(), "use_named must have no region gap");
+
+        // Non-record spread `..u32` is rejected cleanly in `alias_gaps`.
+        let bad_key = find("Bad");
+        store.ensure(names, &mut keys, Want::Head(bad_key)).unwrap_or_else(|e| panic!("ensure `Bad`: {e:?}"));
+        assert!(store.maps.aliases.get(&bad_key).copied().flatten().is_none(), "`Bad` must be refused");
+        let gap = store.maps.alias_gaps.get(&bad_key).expect("Bad alias gap");
+        assert!(gap.text.contains("record type spread"), "unexpected gap message: {}", gap.text);
+    }
+
+    #[test]
+    fn record_spread_defaults_and_nested_elision_end_to_end() {
+        use crate::refusal::SourceFile;
+        use crate::run::{FrontChoice, NewFront, run_with};
+
+        const NEW: NewFront<'static> = NewFront {
+            package: "ladder",
+            edition: "blaze-2026.11",
+            shelf: None,
+            overflow: blaze_build::OverflowChecks::Off,
+        };
+        const HEAD: &str = "#![blaze::records]
+#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+impl Copy for u8 {}
+impl Copy for u32 {}
+impl Copy for i32 {}
+impl Copy for bool {}
+";
+
+        let run_src = |body: &str| -> Result<u8, blaze_own::String<blaze_own::Alloc<'static>>> {
+            let alloc = blaze_own::testing::heap().alloc();
+            let mut text = blaze_own::String::new_in(alloc);
+            text.push_str(HEAD);
+            text.push_str(body);
+            let files = [SourceFile { path: "src/main.rs", text: text.as_str() }];
+            run_with(&files, "src/main.rs", None, FrontChoice::New(NEW), blaze_own::testing::heap().shared()).map_err(|e| {
+                let mut msg = blaze_own::String::new_in(alloc);
+                let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("{e}"));
+                msg
+            })
+        };
+
+        // 1. Structural record spread with inherited, overridden, and multi-spread defaults,
+        //    plus flat structural compatibility and width-subtyping to base record.
+        let spread_ok = run_src("
+type Transform = { x: i32 = 0, y: i32 = 0, scale: i32 = 1 };
+type Combat = { atk: u32 = 10, hp: u32 = 50 };
+type Actor = { ..Transform, hp: u32 = 100 };
+type Boss = { ..Actor, ..Combat, hp: u32 = 200, shield: u32 = 15 };
+
+fn take_flat(r: { hp: u32, scale: i32, x: i32, y: i32 }) -> i32 {
+    r.x + r.y + r.scale + r.hp as i32
+}
+
+fn take_transform(t: Transform) -> i32 {
+    t.x + t.y + t.scale
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let a: Actor = { x: 10 };
+    let b: Boss = { y: 5 };
+    // take_flat(a) = 10 + 0 + 1 + 100 = 111
+    // take_transform(b) = 0 + 5 + 1 = 6
+    // b.atk (10) + b.shield (15) = 25
+    // b.hp (200) -> use delta (b.hp - 180 = 20) so total fits in exit status u8: 111 + 6 + 25 + 20 = 162
+    take_flat(a) + take_transform(b) + (b.atk + b.shield + (b.hp - 180)) as i32
+}
+");
+        assert_eq!(spread_ok, Ok(162));
+
+        // 2. Re-declaring a field without a default clears the inherited default.
+        let cleared_err = run_src("
+type Transform = { x: i32 = 0, y: i32 = 0, scale: i32 = 1 };
+type Actor = { ..Transform, hp: u32 = 100 };
+type RequiredHp = { ..Actor, hp: u32, tag: u8 = 7 };
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let r: RequiredHp = { x: 1 };
+    r.x
+}
+");
+        assert!(cleared_err.is_err(), "omitting cleared-default field `hp` must fail typecheck");
+
+        let cleared_ok = run_src("
+type Transform = { x: i32 = 0, y: i32 = 0, scale: i32 = 1 };
+type Actor = { ..Transform, hp: u32 = 100 };
+type RequiredHp = { ..Actor, hp: u32, tag: u8 = 7 };
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let r: RequiredHp = { hp: 34 };
+    r.x + r.y + r.scale + r.hp as i32 + r.tag as i32
+}
+");
+        assert_eq!(cleared_ok, Ok(42));
+
+        // 3. Nested partial record default elision:
+        //    `{ transform: { x: 10 } }`, `{ transform: { .. }, hp: 20 }`, `{ .. }`,
+        //    `{ transform: { x: 10, ..base.transform }, ..base }`, `{ transform: { x: 7 }, ..base }`.
+        let nested_ok = run_src("
+type Transform = { x: i32 = 0, y: i32 = 0, scale: i32 = 1 };
+type Entity = { transform: Transform = { x: 0, y: 0, scale: 1 }, hp: u32 = 100 };
+
+fn score(e: Entity) -> i32 {
+    e.transform.x + e.transform.y + e.transform.scale + e.hp as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let e1: Entity = { transform: { x: 10 } };
+    let e2: Entity = { transform: { .. }, hp: 20 };
+    let e3: Entity = { .. };
+    let base: Entity = { transform: { x: 3, y: 4, scale: 2 }, hp: 10 };
+    let e4: Entity = { transform: { x: 10, ..base.transform }, ..base };
+    let e5: Entity = { transform: { x: 7 }, ..base };
+    // score(e1) = 10 + 0 + 1 + 100 = 111
+    // score(e2) = 0 + 0 + 1 + 20 = 21
+    // score(e3) = 0 + 0 + 1 + 100 = 101
+    // score(e4) = 10 + 4 + 2 + 10 = 26
+    // score(e5) = 7 + 0 + 1 + 10 = 18
+    // total - 200 = 277 - 200 = 77
+    score(e1) + score(e2) + score(e3) + score(e4) + score(e5) - 200
+}
+");
+        assert_eq!(nested_ok, Ok(77));
     }
 }

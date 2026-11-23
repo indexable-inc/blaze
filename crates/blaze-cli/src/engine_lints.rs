@@ -89,10 +89,13 @@ const RULE: &str = "blaze-cli engine_lints.rs";
 /// Its source (rule 21): the file part's (every unit's name and key, lints.rs `file_part`; a
 /// unit's key holds its marks' key), the rule set's id (a change of the step or of `lints-add`
 /// relints every unit and nothing else) and the edition.
-pub(crate) fn plan<'h>(outlined: &[Outlined<'_>], rules: &RuleSet, alloc: SharedAlloc<'h>) -> SVec<'h, Planned> {
+pub(crate) fn plan<'h>(outlined: &[Outlined<'_>], external: &[Name], rules: &RuleSet, alloc: SharedAlloc<'h>) -> SVec<'h, Planned> {
     let mut planned = SVec::new_in(alloc);
     let set = rules.id();
     for one in outlined.iter() {
+        if external.binary_search(&one.name).is_ok() {
+            continue;
+        }
         let Ok(record) = &one.made else { continue };
         let name = crate::lints::file_lints_name(crate::signature::SignatureFile::new(&one.path).subject());
         let Ok(at) = record.parts.binary_search_by_key(&name, |part| part.name) else { continue };

@@ -144,6 +144,9 @@ const F_POPPED: u32 = 1 << 18;
 /// among them removes the item, as it removes a statement; at its first other child or token
 /// the rest of it is skipped wholesale (`Machine::attrs_read`).
 const F_ATTRS: u32 = 1 << 19;
+/// Comptime field-unrolling `inline for pat in iter { body }`: preserved as `Expr::InlineFor`
+/// instead of desugared to `IntoIterator`.
+const F_INLINE: u32 = 1 << 20;
 
 const NO_RANGE: Range = Range::new(NONE, NONE);
 
@@ -1084,12 +1087,16 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             FOR_EXPR if p.flags & F_FOR == 0 && self.count(&p, |v| matches!(v, V::Pat | V::Expr)) == 2 => {
                 // The body: the pattern's bindings come into scope, and the loop opens.
                 self.activate(p.pending);
-                let label = match p.aux {
-                    NONE => 0,
-                    name => self.local_key(NameIdx(name)),
-                };
-                self.push_entry(Jk::Loop, label);
-                self.top_mut().flags |= F_FOR | F_LOOP;
+                if p.flags & F_INLINE != 0 {
+                    self.top_mut().flags |= F_FOR;
+                } else {
+                    let label = match p.aux {
+                        NONE => 0,
+                        name => self.local_key(NameIdx(name)),
+                    };
+                    self.push_entry(Jk::Loop, label);
+                    self.top_mut().flags |= F_FOR | F_LOOP;
+                }
             }
             ARRAY_EXPR if p.flags & F_SEMI != 0 => {
                 // A repeat's length is an anonymous constant: no local of the body.
@@ -1173,6 +1180,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             (FN, ASYNC_KW) if depth == root => top.flags |= F_ASYNC,
             (FN, GEN_KW) if depth == root => top.flags |= F_GEN,
             (ARRAY_EXPR, SEMICOLON) => top.flags |= F_SEMI,
+            (FOR_EXPR, INLINE_KW) => top.flags |= F_INLINE,
             _ => {}
         }
     }
@@ -1721,24 +1729,9 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 self.push(V::Type, t.0, r);
             }
             UNION_TYPE => {
-                let is_fallible = self.has_tok(f, BANG);
-                let t = if is_fallible {
-                    let ok = self.kid(f, 0, |v| v == V::Type).map(|v| TypeId(v.id));
-                    let err = self.kid(f, 1, |v| v == V::Type).map(|v| TypeId(v.id));
-                    self.done(f);
-                    match (ok, err) {
-                        (Some(ok), Some(err)) => TypeRef::Fallible { ok, err },
-                        _ => {
-                            self.unhandled(f.kind, r, Why::Kind);
-                            TypeRef::Error
-                        }
-                    }
-                } else {
-                    let members = self.put_ids(f, V::Type);
-                    self.done(f);
-                    TypeRef::Union(members)
-                };
-                let t = self.put_type(t, r);
+                let members = self.put_ids(f, V::Type);
+                self.done(f);
+                let t = self.put_type(TypeRef::Union(members), r);
                 self.push(V::Type, t.0, r);
             }
             UNSAFE_BINDER_TYPE => {
@@ -2374,6 +2367,11 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let pat = pat.unwrap_or_else(|| self.put_pat(Pat::Missing, r));
                 let head = head.unwrap_or_else(|| self.put_expr(Expr::Missing, r));
                 let body = body.unwrap_or_else(|| self.put_expr(Expr::Missing, r));
+                if f.flags & F_INLINE != 0 {
+                    let e = self.put_expr(Expr::InlineFor { pat, iter: head, body }, r);
+                    self.push(V::Expr, e.0, r);
+                    return;
+                }
                 let e = self.for_loop(pat, head, body, r);
                 if f.flags & F_LOOP != 0 {
                     self.loop_target = e.inner_loop.0;

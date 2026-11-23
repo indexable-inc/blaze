@@ -232,6 +232,10 @@ pub struct Member<'a> {
     /// The `[package]` metadata cargo gives each crate of the package as `CARGO_PKG_*`
     /// (meta.rs), an inherited key the root's `[workspace.package]` value.
     pub meta: PackageMeta<'a>,
+    /// The `[patch.<source>]` source table name(s) that directly named this path package in the
+    /// workspace root manifest (e.g. `"crates-io"` or a git URL); empty for ordinary members and
+    /// unpatched path dependencies.
+    pub patched_from: Vec<Text<'a>, Alloc<'a>>,
 }
 
 /// A workspace's layout.
@@ -242,6 +246,10 @@ pub struct Units<'a> {
     pub root: ManifestId,
     /// In cargo's order (`cargo metadata`'s `workspace_members`).
     pub members: Vec<Member<'a>, Alloc<'a>>,
+    /// Non-member path packages in the checkout discovered from the root's `[patch.*]` tables,
+    /// excluded path dependencies of workspace members, and their transitive normal/build path
+    /// dependencies, sorted by directory; empty unless read with [`Layout::with_path_packages`].
+    pub path_packages: Vec<Member<'a>, Alloc<'a>>,
     /// The resolver as written: the root's `workspace.resolver`, else the root package's
     /// `package.resolver`; `None` when neither is written (the default is by edition, which
     /// the feature rules decide, not the reader).
@@ -392,6 +400,10 @@ pub struct Layout<'a> {
     /// Whether the members' integration tests, examples and benches are read
     /// ([`Layout::with_test_targets`]); off by default.
     test_targets: bool,
+    /// Whether non-member path packages (`[patch.*]`, excluded member path dependencies, and
+    /// their transitive normal/build path dependencies) are read ([`Layout::with_path_packages`]);
+    /// off by default.
+    path_packages: bool,
 }
 
 impl<'a> Layout<'a> {
@@ -402,6 +414,15 @@ impl<'a> Layout<'a> {
     /// alone, which finds none of them and reads their tables for shape only.
     pub fn with_test_targets(mut self) -> Layout<'a> {
         self.test_targets = true;
+        self
+    }
+
+    /// The same reader, also reading non-member path packages reached from the root manifest's
+    /// `[patch.*]` tables, excluded `path` dependencies of workspace members, and their transitive
+    /// normal/build `path` dependencies ([`Units::path_packages`]). Only for the workspace the user
+    /// builds: cargo ignores `[patch]` in fetched dependencies.
+    pub fn with_path_packages(mut self) -> Layout<'a> {
+        self.path_packages = true;
         self
     }
 
@@ -419,6 +440,7 @@ impl<'a> Layout<'a> {
             by_path: SortedMap::with_capacity_in(0, alloc),
             listings: SortedMap::with_capacity_in(0, alloc),
             test_targets: false,
+            path_packages: false,
         })
     }
 
@@ -479,6 +501,13 @@ struct Passing<'l, 'a> {
     needs: Vec<Need<'a>, Alloc<'a>>,
 }
 
+/// Whether a package read into a [`Member`] is a workspace member or a non-member path package.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MemberRole {
+    Workspace,
+    PathPackage,
+}
+
 /// A member found: its directory, and the manifest read.
 struct Found<'l, 'a> {
     dir: Text<'a>,
@@ -526,7 +555,7 @@ impl<'l, 'a> Passing<'l, 'a> {
 
     /// Asks for `dir/src` and `dir/src/bin` with the package's manifest, so its targets are
     /// known a pass sooner; a directory that is no package is answered `None` at little cost.
-    fn prefetch(&mut self, dir: &str) {
+    fn prefetch(&mut self, dir: &str, role: MemberRole) {
         let alloc = self.alloc();
         let src = file(dir, "src", alloc);
         let bin = file(&src, "bin", alloc);
@@ -535,8 +564,8 @@ impl<'l, 'a> Passing<'l, 'a> {
         let _ = self.list(&src);
         let _ = self.list(&bin);
         // `tests/`, `examples/`, `benches/`: the integration tests, examples and benches, when
-        // they are read at all.
-        if self.layout.test_targets {
+        // they are read at all (workspace members only).
+        if role == MemberRole::Workspace && self.layout.test_targets {
             for kind in ExtraKind::ALL {
                 let _ = self.list(&file(dir, kind.dir(), alloc));
             }
@@ -561,7 +590,7 @@ impl<'l, 'a> Passing<'l, 'a> {
         let alloc = self.alloc();
         let start = self.layout.start.clone_in(alloc);
         let start_manifest = self.manifest_of(&start);
-        self.prefetch(&start);
+        self.prefetch(&start, MemberRole::Workspace);
         let (start_id, start_raw) = match self.look(&start_manifest) {
             Look::Pending => return Ok(None),
             Look::Missing => return Err(self.missing(&start_manifest)),
@@ -609,7 +638,7 @@ impl<'l, 'a> Passing<'l, 'a> {
                             continue;
                         }
                         let manifest = self.manifest_of(&dir);
-                        self.prefetch(&dir);
+                        self.prefetch(&dir, MemberRole::Workspace);
                         let (id, raw) = match self.look(&manifest) {
                             Look::Pending => {
                                 complete = false;
@@ -626,7 +655,7 @@ impl<'l, 'a> Passing<'l, 'a> {
                             return Err(LayoutError::NotAPackage { manifest });
                         };
                         for dep in package.dependencies.iter().rev() {
-                            if let Some((path, _)) = dep_path(dep, ws, &root_dir, &dir, alloc)? {
+                            if let Some((path, _)) = dep_path(dep, Some(ws), &root_dir, &dir, alloc)? {
                                 visit.push((path, true));
                             }
                         }
@@ -647,30 +676,138 @@ impl<'l, 'a> Passing<'l, 'a> {
                 return Err(LayoutError::DuplicateName { first: first.package.span, second: member.package.span });
             }
         }
+        let root_raw = match &self.layout.manifests[root_id.0 as usize].1 {
+            Answer::Read(raw) => Some(raw),
+            Answer::Missing => None,
+        };
+        // Non-member path packages: `[patch.*]` entries in the root manifest, excluded path
+        // dependencies of workspace members, and their transitive normal/build path dependencies.
+        let mut path_found: Vec<(Found<'l, 'a>, Option<&'l RawWorkspace<'a>>, Text<'a>), Alloc<'a>> = Vec::new_in(alloc);
+        let mut patch_sources: SortedMap<Text<'a>, Vec<Text<'a>, Alloc<'a>>, Alloc<'a>> = SortedMap::new_in(alloc);
+        if self.layout.path_packages {
+            // `seen_paths` maps dir -> `required` (`true` once visited as a required path or
+            // successfully read, `false` if skipped while missing as an optional transitive patch
+            // dependency so a later required edge still reports `NoManifest`).
+            let mut seen_paths: SortedMap<Text<'a>, bool, Alloc<'a>> = SortedMap::with_capacity_in(members.len(), alloc);
+            for member in members.iter() {
+                seen_paths.insert(member.dir.clone_in(alloc), true);
+            }
+            // `(dir, optional)`: direct member path deps and direct `[patch]` entries are required
+            // (`optional = false`); transitive path deps of `[patch]` entries are `optional = true`
+            // so an unused patch with an absent transitive path dependency does not break layout.
+            let mut visit: Vec<(Text<'a>, bool), Alloc<'a>> = Vec::new_in(alloc);
+            if let Some(root_raw) = root_raw {
+                for (source_key, patch) in root_raw.patches.iter() {
+                    if let Some(path) = &patch.path
+                        && let Some(joined) = join(&root_dir, path, alloc)
+                    {
+                        let entry = patch_sources.entry(joined.clone_in(alloc)).or_insert_with(|| Vec::new_in(alloc));
+                        if !entry.iter().any(|existing| existing.as_str() == source_key.as_str()) {
+                            entry.push(source_key.clone_in(alloc));
+                        }
+                        visit.push((joined, false));
+                    }
+                }
+            }
+            for member in members.iter() {
+                for dep in member.package.dependencies.iter() {
+                    if let Some((joined, _)) = dep_path(dep, root_ws, &root_dir, &member.dir, alloc)? {
+                        visit.push((joined, false));
+                    }
+                }
+            }
+            let mut at = 0usize;
+            while let Some((dir, optional)) = visit.get(at) {
+                let dir = dir.clone_in(alloc);
+                let optional = *optional;
+                at += 1;
+                if let Some(&was_required) = seen_paths.get(dir.as_str())
+                    && (was_required || optional)
+                {
+                    continue;
+                }
+                let manifest = self.manifest_of(&dir);
+                self.prefetch(&dir, MemberRole::PathPackage);
+                let (id, raw) = match self.look(&manifest) {
+                    Look::Pending => {
+                        complete = false;
+                        continue;
+                    }
+                    Look::Missing => {
+                        if optional {
+                            seen_paths.insert(dir, false);
+                            continue;
+                        }
+                        return Err(self.missing(&manifest));
+                    }
+                    Look::Read(id, raw) => (id, raw),
+                };
+                let Some(package) = &raw.package else {
+                    if optional {
+                        seen_paths.insert(dir, false);
+                        continue;
+                    }
+                    return Err(LayoutError::NotAPackage { manifest });
+                };
+                let Some((pkg_root_dir, _, pkg_ws)) = self.root(&dir, id, raw)? else {
+                    complete = false;
+                    continue;
+                };
+                seen_paths.insert(dir.clone_in(alloc), true);
+                let child_optional = optional || patch_sources.contains_key(dir.as_str());
+                for dep in package.dependencies.iter().filter(|dep| dep.kind != DepKind::Dev) {
+                    if let Some((dep_dir, _)) = dep_path(dep, pkg_ws, &pkg_root_dir, &dir, alloc)?
+                        && !seen_paths.get(dep_dir.as_str()).is_some_and(|&was_req| was_req || child_optional)
+                    {
+                        visit.push((dep_dir, child_optional));
+                    }
+                }
+                path_found.push((Found { dir, id, package }, pkg_ws, pkg_root_dir));
+            }
+        }
         let mut out = Vec::with_capacity_in(members.len(), alloc);
         for found in members.iter() {
-            match self.member(found, &members, root_ws, &root_dir)? {
-                Some(member) => out.push(member),
+            match self.member(found, &members, root_ws, &root_dir, MemberRole::Workspace)? {
+                Some(mut member) => {
+                    if let Some(sources) = patch_sources.get(member.dir.as_str()) {
+                        for src in sources.iter() {
+                            member.patched_from.push(src.clone_in(alloc));
+                        }
+                    }
+                    out.push(member);
+                }
+                None => complete = false,
+            }
+        }
+        let mut path_packages = Vec::with_capacity_in(path_found.len(), alloc);
+        for (found, pkg_ws, pkg_root_dir) in path_found.iter() {
+            match self.member(found, &members, *pkg_ws, pkg_root_dir, MemberRole::PathPackage)? {
+                Some(mut pkg) => {
+                    if let Some(sources) = patch_sources.get(pkg.dir.as_str()) {
+                        for src in sources.iter() {
+                            pkg.patched_from.push(src.clone_in(alloc));
+                        }
+                    }
+                    path_packages.push(pkg);
+                }
                 None => complete = false,
             }
         }
         if !complete {
             return Ok(None);
         }
+        path_packages.sort_unstable_by(|a, b| a.dir.as_str().cmp(b.dir.as_str()));
         let mut manifests = Vec::with_capacity_in(self.layout.manifests.len(), alloc);
         for (path, _) in self.layout.manifests.iter() {
             manifests.push(path.clone_in(alloc));
         }
-        let root_package = match &self.layout.manifests[root_id.0 as usize].1 {
-            Answer::Read(raw) => raw.package.as_ref(),
-            Answer::Missing => None,
-        };
+        let root_package = root_raw.and_then(|raw| raw.package.as_ref());
         let resolver = match (root_ws.and_then(|ws| ws.resolver.as_ref()), root_package.and_then(|p| p.resolver.as_ref())) {
             (Some(written), _) | (None, Some(written)) => Some((written.0.clone_in(alloc), written.1)),
             (None, None) => None,
         };
         let root_edition = out.iter().find(|member| member.manifest == root_id).map(|member| member.edition);
-        Ok(Some(Units { manifests, root: root_id, members: out, resolver, root_edition }))
+        Ok(Some(Units { manifests, root: root_id, members: out, path_packages, resolver, root_edition }))
     }
 
     /// The root: its directory, manifest and `[workspace]` (`None` for a start in no
@@ -808,6 +945,7 @@ impl<'l, 'a> Passing<'l, 'a> {
         members: &[Found<'l, 'a>],
         ws: Option<&'l RawWorkspace<'a>>,
         root_dir: &str,
+        role: MemberRole,
     ) -> Result<Option<Member<'a>>, LayoutError<'a>> {
         let alloc = self.alloc();
         let package = found.package;
@@ -821,7 +959,7 @@ impl<'l, 'a> Passing<'l, 'a> {
         };
         // Both asked before either waits, so their listings come in one pass.
         let targets = self.targets(found, edition)?;
-        let extras = match self.layout.test_targets {
+        let extras = match role == MemberRole::Workspace && self.layout.test_targets {
             true => self.extras(found, edition),
             false => Some((Vec::new_in(alloc), Vec::new_in(alloc))),
         };
@@ -894,6 +1032,9 @@ impl<'l, 'a> Passing<'l, 'a> {
         let meta = PackageMeta::new(values);
         let mut dependencies = Vec::with_capacity_in(package.dependencies.len(), alloc);
         for dep in package.dependencies.iter() {
+            if role == MemberRole::PathPackage && dep.kind == DepKind::Dev {
+                continue;
+            }
             dependencies.push(self.dependency(dep, ws, root_dir, &found.dir, members)?);
         }
         // cargo's implicit features: an optional dependency no feature names as `dep:<name>`
@@ -935,6 +1076,7 @@ impl<'l, 'a> Passing<'l, 'a> {
             links: package.links.as_ref().map(|s| s.clone_in(alloc)),
             version,
             meta,
+            patched_from: Vec::new_in(alloc),
         }))
     }
 
@@ -1137,14 +1279,14 @@ impl<'l, 'a> Passing<'l, 'a> {
 /// relative to: the member's, or for an inherited one the root's.
 fn dep_path<'a>(
     dep: &RawDep<'a>,
-    ws: &RawWorkspace<'a>,
+    ws: Option<&RawWorkspace<'a>>,
     root_dir: &str,
     dir: &str,
     alloc: Alloc<'a>,
 ) -> Result<Option<(Text<'a>, Span)>, LayoutError<'a>> {
     let (path, base) = match dep.workspace {
         false => (dep.path.as_ref(), dir),
-        true => match ws.dependencies.iter().find(|it| it.key == dep.key) {
+        true => match ws.and_then(|ws| ws.dependencies.iter().find(|it| it.key == dep.key)) {
             Some(entry) => (entry.path.as_ref(), root_dir),
             None => return Err(LayoutError::NotInherited { at: dep.span, key: "dependencies" }),
         },

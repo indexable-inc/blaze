@@ -12,7 +12,7 @@
 blaze-algebra	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-alloc-count	5	1	0	0	0	0	6	10	0	1	0	1	1	1	0	0	0	0
 blaze-answer	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
-blaze-arrow-ipc	0	0	0	46	0	0	0	0	0	0	0	0	0	0	0	0	0	0
+blaze-arrow-ipc	0	0	0	46	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-ask	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	1	0	0
 blaze-audit	0	29	182	15	0	0	168	0	0	0	0	0	0	1	0	0	0	0
 blaze-base-tools	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
@@ -28,7 +28,7 @@ blaze-body-flow	0	0	0	16	0	0	0	0	0	0	0	0	0	1	0	0	0	0
 blaze-body-lower	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	1	0	0
 blaze-borrow	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	1	0	0
 blaze-bstd-convert	6	14	0	0	7	2	789	0	0	1	0	43	0	1	0	0	0	0
-blaze-build	4	0	21	676	0	325	0	0	0	0	0	0	1	1	0	1	0	0
+blaze-build	4	0	21	659	0	320	0	0	0	0	0	0	1	1	0	1	0	0
 blaze-build-script	16	0	0	0	0	40	52	0	0	1	0	37	1	1	0	1	0	0
 blaze-bytes	0	3	0	0	0	0	0	0	0	0	0	0	0	1	0	1	0	0
 blaze-cad	30	0	0	0	0	0	5	0	18	4	0	73	0	0	95	0	0	0
@@ -37,15 +37,15 @@ blaze-cad-field	1	0	0	0	0	0	6	0	3	0	0	4	0	0	7	0	0	0
 blaze-cad-mesh	1	0	0	0	0	0	2	0	2	0	0	3	0	0	5	0	0	0
 blaze-cad-out	1	0	0	0	0	0	1	0	1	0	0	3	0	0	4	0	0	0
 blaze-cad-picture	1	0	0	0	0	0	0	0	1	0	0	4	0	0	5	0	0	0
-blaze-cas	97	4	58	56	0	0	63	0	1	2	0	32	1	1	0	1	5	5
+blaze-cas	94	4	58	56	0	0	63	0	1	2	0	32	1	1	0	1	5	5
 blaze-cast	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0	0	0
 blaze-cbor	0	1	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-cc	0	5	0	0	0	0	0	0	0	0	0	0	0	1	0	0	0	0
 blaze-cert	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0	0	0
 blaze-check	73	0	0	0	0	0	61	12	4	4	0	1	1	1	0	0	6	6
-blaze-cli	634	0	420	61	0	33	149	1	1	5	0	54	1	1	0	1	22	22
+blaze-cli	633	0	419	61	0	33	148	1	1	5	0	54	1	1	0	1	22	22
 blaze-code	0	0	0	0	0	4	0	0	0	0	0	0	0	0	0	1	0	0
-blaze-columns	39	1	0	27	0	0	24	0	9	1	0	20	0	0	30	0	0	0
+blaze-columns	39	1	0	27	0	0	24	0	9	1	0	20	0	0	30	1	0	0
 blaze-comptime	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-comptime-sys	0	0	0	0	0	0	0	1	0	0	0	0	0	0	0	1	0	0
 blaze-comptime/rungs/derive-hello	0	0	0	0	0	0	3	0	0	0	0	0	1	1	0	0	0	0
@@ -75,7 +75,7 @@ blaze-git-fetch	0	2	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-glob	6	0	13	5	0	0	0	0	0	0	0	2	1	1	0	1	0	0
 blaze-graph	204	3	37	61	0	0	219	53	7	5	0	20	1	1	0	0	17	17
 blaze-h1	0	2	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
-blaze-h2	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0	0	0
+blaze-h2	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	1	0	0
 blaze-hash	4	6	11	139	0	0	6	0	3	1	1	11	0	0	16	1	0	0
 blaze-hashcons	4	6	7	9	0	0	5	0	1	0	0	4	0	1	0	1	2	2
 blaze-http	87	7	114	39	0	0	274	0	2	1	0	13	1	1	8	0	2	2
@@ -87,10 +87,10 @@ blaze-inproc-rt	0	0	0	0	0	0	0	0	0	0	0	0	1	1	0	1	0	0
 blaze-json	0	2	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-keyed	0	14	14	10	0	0	0	0	0	0	0	0	0	1	0	1	0	0
 blaze-kit	12	13	0	0	0	0	13	0	1	0	0	12	0	1	0	1	0	0
-blaze-ladder	321	2	1450	114	15	494	1005	6	25	10	0	116	1	1	0	1	1	1
+blaze-ladder	321	2	1446	114	15	494	1001	6	25	10	0	116	1	1	0	1	1	1
 blaze-launch	0	15	2	0	0	0	23	0	0	0	0	0	0	0	0	1	0	0
 blaze-launch-rt	99	1	1	9	1	33	115	50	8	12	0	348	1	1	0	1	0	0
-blaze-launcher	64	0	0	0	1	1	46	1	3	29	0	36	1	1	0	1	0	0
+blaze-launcher	63	0	0	0	1	1	46	1	3	28	0	36	1	1	0	1	0	0
 blaze-lex	16	0	0	0	0	0	14	0	1	2	0	7	0	0	11	1	0	0
 blaze-lint	17	0	0	0	0	9	18	0	5	5	0	23	0	1	0	1	0	0
 blaze-lint-defs	0	3	0	0	0	0	17	2	0	0	0	0	0	1	0	0	0	0
@@ -125,7 +125,7 @@ blaze-record	0	3	0	0	0	0	1	0	0	0	0	0	0	1	0	1	0	0
 blaze-rel	0	0	0	41	0	0	0	0	0	0	0	0	0	0	0	0	0	0
 blaze-remote	84	4	74	16	0	0	333	3	2	3	0	30	1	1	6	1	0	0
 blaze-report	12	0	2	0	0	0	86	1	0	2	0	4	1	1	0	1	0	0
-blaze-resolve	106	0	143	20	0	0	163	1	2	2	0	1	1	1	0	1	0	0
+blaze-resolve	106	0	133	20	0	0	163	1	2	2	0	1	1	1	0	1	0	0
 blaze-rng	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0	0	0
 blaze-roots	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-run	2	0	0	0	0	126	0	0	0	0	0	0	0	0	0	1	0	0
@@ -136,8 +136,8 @@ blaze-screen	0	11	0	0	0	0	208	0	0	0	0	0	0	0	0	1	0	0
 blaze-script	139	0	7	0	0	0	439	2	13	7	0	99	1	1	0	0	0	0
 blaze-semver	0	4	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-sim	31	0	48	16	0	1	71	6	0	2	0	6	1	1	0	1	0	0
-blaze-solve	27	0	0	0	0	0	165	0	3	0	0	6	0	1	0	1	0	0
-blaze-sort	5	0	0	0	0	0	1	0	3	1	0	4	0	1	0	0	0	0
+blaze-solve	26	0	0	0	0	0	163	0	3	0	0	6	0	1	0	1	0	0
+blaze-sort	5	0	0	0	0	0	1	0	3	1	0	4	0	1	0	1	0	0
 blaze-source	27	0	7	3	0	0	28	5	0	0	0	0	1	1	0	1	0	0
 blaze-spawn	0	0	0	0	0	2	0	0	0	0	0	0	0	1	0	1	0	0
 blaze-spin	2	0	0	0	0	0	0	0	2	0	0	0	1	1	0	1	0	0
@@ -149,6 +149,8 @@ blaze-store-check	17	1	3	0	0	0	9	1	0	0	0	0	1	1	0	0	0	0
 blaze-surface	2	0	0	14	0	2	0	0	0	0	0	0	0	1	0	1	0	0
 blaze-swiss	2	1	0	0	0	0	0	0	1	0	0	3	0	0	5	1	0	0
 blaze-sys	9	0	0	0	0	0	3	5	6	2	2	10	0	1	0	0	0	0
+# blaze-tab is 0 in every sans-IO column (`#![no_std]`, `#![blaze::sans_io]`, 0 third-party deps); `bare = 1` is inherited transitively from `blaze-data`/`blaze-own` once reached via `blaze-std`.
+blaze-tab	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-tar	0	1	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-text	14	0	0	0	0	0	12	0	1	0	0	5	0	0	6	1	0	0
 blaze-text-size	0	2	0	0	0	0	0	0	0	0	0	0	0	1	0	0	0	0
@@ -161,6 +163,8 @@ blaze-ty	2	0	0	0	0	0	2	0	9	0	0	9	0	1	0	1	0	0
 blaze-typeck	27	0	0	71	4	123	166	0	4	0	0	6	0	1	0	1	0	0
 blaze-unicode	0	2	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-unit-graph	18	0	0	0	0	0	14	0	10	2	0	39	0	1	0	1	0	0
+# blaze-units is 0 in every sans-IO column (`#![no_std]`, `#![blaze::sans_io]`, 0 third-party deps); `bare = 1` is inherited transitively from `blaze-own` once reached via `blaze-std`.
+blaze-units	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 blaze-url	0	3	0	0	0	0	5	0	0	0	0	0	0	0	0	1	0	0
 blaze-v2-proof	12	0	0	0	0	0	27	3	0	1	0	6	1	1	0	0	0	0
 blaze-wasi	0	3	5	0	0	0	12	0	0	0	0	0	0	1	0	0	0	0
@@ -172,7 +176,7 @@ gpu	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0	0	0
 gpu-macros	0	0	0	0	0	0	60	0	0	0	0	0	1	1	0	0	0	0
 intern	20	3	0	7	0	0	3	3	0	1	3	0	1	1	0	0	1	1
 ix-prof	281	16	84	18	0	0	483	26	14	10	5	176	1	1	0	0	13	13
-parser	41	0	0	0	0	0	40	5	0	0	0	3	1	1	0	1	0	0
+parser	41	0	0	0	0	0	39	5	0	0	0	3	1	1	0	1	0	0
 paths	2	0	0	0	0	0	3	0	0	0	0	0	1	1	0	0	0	0
 rustc_abi	31	0	0	0	0	0	10	0	0	0	0	0	1	1	0	0	0	0
 rustc_lexer	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0

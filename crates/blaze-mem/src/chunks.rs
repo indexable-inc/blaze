@@ -49,11 +49,11 @@ pub const MAX_NODES: u32 = 16;
 
 const COUNT: u32 = (SPACE_BYTES / CHUNK) as u32;
 
-/// The warm chunks a space keeps after its cache passed [`WARM_MOST`]: 512 MiB a place, 16 for
-/// each of 16 workers (a worker's frames shelve 8 of their own, `frame::SHELF`, before they
-/// give to the space). coord-102 (B5): with no bound, 3.3 GiB of the 4.72 GiB of frames a
-/// build's peak held stayed resident as warm chunks to the end, with nothing to take them.
-pub const WARM_KEEP: u32 = 256;
+/// The warm chunks a space keeps after its cache passed [`WARM_MOST`]: 64 MiB a place (a worker's
+/// frames shelve their own warm chunks, `frame::SHELF`, before giving back to the space). Keeping
+/// this bounded avoids retaining 512 MiB-1 GiB of dirty RSS across cold build phases or in an idle
+/// daemon while still absorbing small bursts without purging.
+pub const WARM_KEEP: u32 = 32;
 
 /// The warm chunks past which a give trims the space's cache down to [`WARM_KEEP`]: twice it,
 /// so a trim purges at least [`WARM_KEEP`] chunks at once, and a working set that swings under

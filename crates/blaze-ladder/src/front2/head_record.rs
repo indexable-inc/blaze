@@ -2130,6 +2130,18 @@ pub fn decode_with_origins<'n>(
     alloc: Mem,
     register: &mut dyn FnMut(ItemKey, OpaqueOrigin) -> Result<(), HeadRecordError>,
 ) -> Result<Head<'n>, HeadRecordError> {
+    decode_with_origins_boxed(bytes, text, tys, alloc, register).map(blaze_own::Box::into_inner)
+}
+
+/// As [`decode_with_origins`], keeping the decoded [`Head`] boxed in `alloc` to avoid placing
+/// a large enum value on the stack during small-stack body checks.
+pub fn decode_with_origins_boxed<'n>(
+    bytes: &[u8],
+    text: Option<&'n str>,
+    tys: &PortableTys<'_>,
+    alloc: Mem,
+    register: &mut dyn FnMut(ItemKey, OpaqueOrigin) -> Result<(), HeadRecordError>,
+) -> Result<blaze_own::Box<Head<'n>, Mem>, HeadRecordError> {
     let record = decode_retaining(bytes, text, tys, alloc)?;
     for &(key, origin) in record.origins.iter() {
         register(key, origin)?;
@@ -2140,13 +2152,13 @@ pub fn decode_with_origins<'n>(
 /// A standalone head and its origin table. The table belongs to this record, so writing it
 /// again needs only the table in which its terms were interned.
 pub struct DecodedHead<'n> {
-    head: Head<'n>,
+    head: blaze_own::Box<Head<'n>, Mem>,
     origins: Vec<(ItemKey, OpaqueOrigin), Mem>,
 }
 
 impl<'n> DecodedHead<'n> {
     pub fn as_ref(&self) -> HeadRef<'_, 'n> {
-        self.head.as_ref()
+        (*self.head).as_ref()
     }
 
     pub fn encode<'b>(&self, tys: PTys<'_>, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, HeadRecordError> {
@@ -2173,92 +2185,17 @@ pub fn decode_retaining<'n>(bytes: &[u8], text: Option<&'n str>, tys: &PortableT
     for _ in 0..terms {
         r.node()?;
     }
-    let head = match kind {
-        K_FN => r.fn_head(text)?,
-        K_ADT => r.adt()?,
-        K_CTOR => {
-            let key = r.key("a constructor's key")?;
-            let adt = r.key("a constructor's ADT")?;
-            let generics = r.u32("a constructor's generics")?;
-            let inputs = r.many("a constructor's inputs", |r| r.ty("a constructor's input"))?;
-            let output = r.ty("a constructor's output")?;
-            Head::Ctor { key, sig: CtorSig { adt, generics, inputs, output }, regions: None }
-        }
-        K_TRAIT => r.trait_()?,
-        K_IMPL => r.impl_()?,
-        K_ALIAS => {
-            let key = r.lib("an alias's key")?;
-            let generics = r.u32("an alias's generics")?;
-            let ty = r.ty("an alias's type")?;
-            let defaults = r.defaults()?;
-            let const_params = r.const_params_own()?;
-            let slots = r.opt("an alias's laid regions", |r| {
-                let lifetimes = r.u32("an alias's lifetime count")?;
-                let slots = r.own("an alias's region slots", |r| match r.u8("an alias's region slot")? {
-                    0 => match r.u32("an alias's lifetime index")? {
-                        i if i < lifetimes => Ok(AliasSlot::Lifetime(i)),
-                        _ => Err(E::Shape { what: "an alias's region slot names a lifetime past its count" }),
-                    },
-                    1 => Ok(AliasSlot::Static),
-                    2 => Ok(AliasSlot::Late { binder: r.u32("an alias's bound lifetime's binder")?, var: r.u32("an alias's bound lifetime's variable")? }),
-                    3 => Ok(AliasSlot::ObjectDefault),
-                    _ => Err(E::Shape { what: "an alias's region slot of no known kind" }),
-                })?;
-                Ok(AliasRegions { lifetimes, slots })
-            })?;
-            Head::Alias { key, generics, ty, defaults, const_params, slots }
-        }
-        K_ALIAS_REFUSED => {
-            let key = r.lib("a refused alias's key")?;
-            let n = r.count("a refused alias's why")?;
-            let text = r.take(n, "a refused alias's why")?;
-            let mut why = Vec::with_capacity_in(n, r.alloc);
-            why.extend_from_slice(text);
-            Head::AliasRefused { key, why }
-        }
-        K_FN_REFUSED => {
-            let key = r.key("a refused fn's key")?;
-            let n = r.count("a refused fn's why")?;
-            let text = r.take(n, "a refused fn's why")?;
-            let mut why = Vec::with_capacity_in(n, r.alloc);
-            why.extend_from_slice(text);
-            Head::FnRefused { key, why }
-        }
-        K_TRAIT_ALIAS => {
-            let key = r.lib("a trait alias's key")?;
-            let generics = r.u32("a trait alias's generics")?;
-            let clauses = r.many("a trait alias's clauses", |r| r.clause())?;
-            let traits = r.many("a trait alias's traits", |r| Ok((r.lib("a trait alias's trait")?, r.list("a trait alias's trait arguments")?)))?;
-            Head::TraitAlias { key, head: TraitAliasHead { generics, clauses, traits } }
-        }
-        K_OPAQUE => {
-            let key = r.key("an opaque type's key")?;
-            let fn_ = r.key("an opaque type's fn")?;
-            let index = r.u32("an opaque type's index")?;
-            check_opaque_row(key, fn_, index)?;
-            let preds = r.opt("an opaque type's bounds", |r| r.preds())?;
-            Head::Opaque { key, fn_, index, preds, regions: None }
-        }
-        byte => return Err(E::Byte { what: "the head's kind", byte }),
-    };
+    let head = r.decode_head_kind(kind, text)?;
     let mut head = head;
     // Form 22: the regions section, every column laid again over its type here, once.
     if let Some(filed) = r.opt("a head's regions section", |r| r.regions_section())? {
-        regions_fit_head(head.as_ref(), filed.regions(), tys.view())?;
+        regions_fit_head((*head).as_ref(), filed.regions(), tys.view())?;
         head.set_regions(filed)?;
     }
     if r.at != bytes.len() {
         return Err(E::Trailing { at: r.at });
     }
-    r.origins.sort_unstable_by_key(|&(key, _)| key);
-    for pair in r.origins.windows(2) {
-        let (key, first) = pair[0];
-        let (next, second) = pair[1];
-        if key == next && first != second {
-            return Err(E::ConflictingOpaqueOrigin { key, first, second });
-        }
-    }
-    r.origins.dedup_by_key(|(key, _)| *key);
+    r.dedup_origins()?;
     Ok(DecodedHead { head, origins: r.origins })
 }
 
@@ -2275,6 +2212,114 @@ struct In<'r, 't, 'a> {
 }
 
 impl<'r> In<'r, '_, '_> {
+    fn box_head<'n>(&self, head: Head<'n>) -> blaze_own::Box<Head<'n>, Mem> {
+        blaze_own::Box::new_in(head, self.alloc)
+    }
+
+    #[inline(never)]
+    fn decode_head_kind<'n>(&mut self, kind: u8, text: Option<&'n str>) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
+        match kind {
+            K_FN => self.fn_head(text),
+            K_ADT => self.adt(),
+            K_CTOR => self.ctor(),
+            K_TRAIT => self.trait_(),
+            K_IMPL => self.impl_(),
+            K_ALIAS => self.alias(),
+            K_ALIAS_REFUSED => self.alias_refused(),
+            K_FN_REFUSED => self.fn_refused(),
+            K_TRAIT_ALIAS => self.trait_alias(),
+            K_OPAQUE => self.opaque(),
+            byte => Err(E::Byte { what: "the head's kind", byte }),
+        }
+    }
+
+    #[inline(never)]
+    fn dedup_origins(&mut self) -> Result<(), E> {
+        self.origins.sort_unstable_by_key(|&(key, _)| key);
+        for pair in self.origins.windows(2) {
+            let (key, first) = pair[0];
+            let (next, second) = pair[1];
+            if key == next && first != second {
+                return Err(E::ConflictingOpaqueOrigin { key, first, second });
+            }
+        }
+        self.origins.dedup_by_key(|(key, _)| *key);
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn ctor<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
+        let key = self.key("a constructor's key")?;
+        let adt = self.key("a constructor's ADT")?;
+        let generics = self.u32("a constructor's generics")?;
+        let inputs = self.many("a constructor's inputs", |r| r.ty("a constructor's input"))?;
+        let output = self.ty("a constructor's output")?;
+        Ok(self.box_head(Head::Ctor { key, sig: CtorSig { adt, generics, inputs, output }, regions: None }))
+    }
+
+    #[inline(never)]
+    fn alias<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
+        let key = self.lib("an alias's key")?;
+        let generics = self.u32("an alias's generics")?;
+        let ty = self.ty("an alias's type")?;
+        let defaults = self.defaults()?;
+        let const_params = self.const_params_own()?;
+        let slots = self.opt("an alias's laid regions", |r| {
+            let lifetimes = r.u32("an alias's lifetime count")?;
+            let slots = r.own("an alias's region slots", |r| match r.u8("an alias's region slot")? {
+                0 => match r.u32("an alias's lifetime index")? {
+                    i if i < lifetimes => Ok(AliasSlot::Lifetime(i)),
+                    _ => Err(E::Shape { what: "an alias's region slot names a lifetime past its count" }),
+                },
+                1 => Ok(AliasSlot::Static),
+                2 => Ok(AliasSlot::Late { binder: r.u32("an alias's bound lifetime's binder")?, var: r.u32("an alias's bound lifetime's variable")? }),
+                3 => Ok(AliasSlot::ObjectDefault),
+                _ => Err(E::Shape { what: "an alias's region slot of no known kind" }),
+            })?;
+            Ok(AliasRegions { lifetimes, slots })
+        })?;
+        Ok(self.box_head(Head::Alias { key, generics, ty, defaults, const_params, slots }))
+    }
+
+    #[inline(never)]
+    fn alias_refused<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
+        let key = self.lib("a refused alias's key")?;
+        let n = self.count("a refused alias's why")?;
+        let text = self.take(n, "a refused alias's why")?;
+        let mut why = Vec::with_capacity_in(n, self.alloc);
+        why.extend_from_slice(text);
+        Ok(self.box_head(Head::AliasRefused { key, why }))
+    }
+
+    #[inline(never)]
+    fn fn_refused<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
+        let key = self.key("a refused fn's key")?;
+        let n = self.count("a refused fn's why")?;
+        let text = self.take(n, "a refused fn's why")?;
+        let mut why = Vec::with_capacity_in(n, self.alloc);
+        why.extend_from_slice(text);
+        Ok(self.box_head(Head::FnRefused { key, why }))
+    }
+
+    #[inline(never)]
+    fn trait_alias<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
+        let key = self.lib("a trait alias's key")?;
+        let generics = self.u32("a trait alias's generics")?;
+        let clauses = self.many("a trait alias's clauses", |r| r.clause())?;
+        let traits = self.many("a trait alias's traits", |r| Ok((r.lib("a trait alias's trait")?, r.list("a trait alias's trait arguments")?)))?;
+        Ok(self.box_head(Head::TraitAlias { key, head: TraitAliasHead { generics, clauses, traits } }))
+    }
+
+    #[inline(never)]
+    fn opaque<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
+        let key = self.key("an opaque type's key")?;
+        let fn_ = self.key("an opaque type's fn")?;
+        let index = self.u32("an opaque type's index")?;
+        check_opaque_row(key, fn_, index)?;
+        let preds = self.opt("an opaque type's bounds", |r| r.preds())?;
+        Ok(self.box_head(Head::Opaque { key, fn_, index, preds, regions: None }))
+    }
+
     fn take(&mut self, n: usize, what: &'static str) -> Result<&'r [u8], E> {
         let bytes: &'r [u8] = self.bytes;
         let short = E::Short { what, at: self.at };
@@ -2413,8 +2458,32 @@ impl<'r> In<'r, '_, '_> {
 
     /// One term of the record's table, interned, its children by earlier indices only.
     fn node(&mut self) -> Result<(), E> {
-        const W: &str = "a term";
-        let n = match self.u8("a term's tag")? {
+        let tag = self.u8("a term's tag")?;
+        if tag == T_DYNAMIC {
+            return self.node_dynamic();
+        }
+        let n = match tag {
+            T_BOOL | T_CHAR | T_INT | T_UINT | T_FLOAT | T_STR | T_NEVER | T_ERROR | T_PARAM | T_CONST_PARAM => self.node_scalar(tag)?,
+            T_TUPLE | T_REF | T_PTR | T_ARRAY | T_SLICE | T_PAT | T_ADT | T_FNDEF | T_FNPTR => self.node_compound(tag)?,
+            T_ALIAS | T_OPAQUE | T_CONST_VALUE | T_EX_TRAIT | T_EX_PROJ | T_EX_AUTO | T_FOREIGN => self.node_item(tag)?,
+            T_RECORD | T_UNION => self.node_structural(tag)?,
+            byte => return Err(E::Byte { what: "a term's tag", byte }),
+        };
+        self.intern(n)
+    }
+
+    #[inline(never)]
+    fn node_dynamic(&mut self) -> Result<(), E> {
+        // Through the table's own constructor, which keeps the one canonical form.
+        self.tys_into_scratch("a trait object's predicates")?;
+        let t = self.tys.dynamic_shared(&self.scratch).map_err(E::Table)?;
+        self.locals.push(t);
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn node_scalar(&mut self, tag: u8) -> Result<PNode, E> {
+        Ok(match tag {
             T_BOOL => PNode::Bool,
             T_CHAR => PNode::Char,
             T_INT => PNode::Int(int_of(self.u8("an integer type")?)?),
@@ -2428,6 +2497,17 @@ impl<'r> In<'r, '_, '_> {
             }),
             T_STR => PNode::Str,
             T_NEVER => PNode::Never,
+            T_ERROR => PNode::Error,
+            T_PARAM => PNode::Param(self.u32("a parameter's index")?),
+            T_CONST_PARAM => PNode::ConstParam(self.u32("a const parameter's index")?),
+            byte => return Err(E::Byte { what: "a term's tag", byte }),
+        })
+    }
+
+    #[inline(never)]
+    fn node_compound(&mut self, tag: u8) -> Result<PNode, E> {
+        const W: &str = "a term";
+        Ok(match tag {
             T_TUPLE => PNode::Tuple(self.list("a tuple's elements")?),
             T_REF => {
                 let m = mutbl_of(self.u8("a reference's mutability")?)?;
@@ -2459,7 +2539,14 @@ impl<'r> In<'r, '_, '_> {
                 let l = self.list("a fn pointer's inputs and output")?;
                 PNode::FnPtr(l, h)
             }
-            T_PARAM => PNode::Param(self.u32("a parameter's index")?),
+            byte => return Err(E::Byte { what: "a term's tag", byte }),
+        })
+    }
+
+    #[inline(never)]
+    fn node_item(&mut self, tag: u8) -> Result<PNode, E> {
+        const W: &str = "a term";
+        Ok(match tag {
             T_ALIAS => {
                 let trait_ = self.key("a projection's trait")?;
                 let name = self.name("a projection's name")?;
@@ -2483,18 +2570,9 @@ impl<'r> In<'r, '_, '_> {
                 self.origins.push((k, origin));
                 PNode::Opaque(k, self.list("an opaque type's arguments")?)
             }
-            T_ERROR => PNode::Error,
             T_CONST_VALUE => {
                 let ty = self.ty(W)?;
                 PNode::ConstValue { ty, bits: self.u128("a const value's bits")? }
-            }
-            T_CONST_PARAM => PNode::ConstParam(self.u32("a const parameter's index")?),
-            T_DYNAMIC => {
-                // Through the table's own constructor, which keeps the one canonical form.
-                self.tys_into_scratch("a trait object's predicates")?;
-                let t = self.tys.dynamic_shared(&self.scratch).map_err(E::Table)?;
-                self.locals.push(t);
-                return Ok(());
             }
             T_EX_TRAIT => {
                 let k = self.key("a trait object's principal")?;
@@ -2508,6 +2586,13 @@ impl<'r> In<'r, '_, '_> {
             }
             T_EX_AUTO => PNode::ExAuto(self.key("a trait object's auto trait")?),
             T_FOREIGN => PNode::Foreign(self.key("an extern type")?),
+            byte => return Err(E::Byte { what: "a term's tag", byte }),
+        })
+    }
+
+    #[inline(never)]
+    fn node_structural(&mut self, tag: u8) -> Result<PNode, E> {
+        Ok(match tag {
             T_RECORD => {
                 let s = blaze_typeck::RecordSchema(self.u64("a record's schema")?);
                 let n = self.u32("a record's field name count")?;
@@ -2522,8 +2607,7 @@ impl<'r> In<'r, '_, '_> {
             }
             T_UNION => PNode::Union(self.list("a union's members")?),
             byte => return Err(E::Byte { what: "a term's tag", byte }),
-        };
-        self.intern(n)
+        })
     }
 
     fn named_tys<C: Default + Extend<(Name, PTy)>>(&mut self, what: &'static str) -> Result<C, E> {
@@ -2665,7 +2749,8 @@ impl<'r> In<'r, '_, '_> {
     /// in strict key order, each column laid again over its type by the one counter (a slot
     /// short or long is [`HeadRecordError::Regions`]), each `Param` inside the head's count,
     /// clauses by `nth` and fields by (variant, field) strictly ascending ([`check_parts`]).
-    fn regions_section(&mut self) -> Result<FiledRegions, E> {
+    #[inline(never)]
+    fn regions_arity(&mut self) -> Result<ArityTable, E> {
         let adts = self.own("a head's region arity: ADTs", |r| Ok((r.key("an ADT's key")?, r.u32("an ADT's lifetime count")?)))?;
         let opaques = self.own("a head's region arity: opaque types", |r| Ok((r.key("an opaque type's key")?, r.u32("an opaque type's captures")?)))?;
         let aliases = self.own("a head's region arity: projections", |r| {
@@ -2679,16 +2764,18 @@ impl<'r> In<'r, '_, '_> {
         {
             return Err(E::Shape { what: "a head's region arity table is not in strict key order" });
         }
-        let arity = ArityTable { adts, opaques, aliases, traits };
-        let params = self.rparams()?;
-        let mut regions = HeadRegions::new_in(params, self.alloc);
-        regions.sig = self.opt("a head's signature column", |r| r.rcol(&arity, "a head's signature column"))?;
-        regions.written_output = self.opt("a head's written output column", |r| r.rcol(&arity, "a head's written output column"))?;
+        Ok(ArityTable { adts, opaques, aliases, traits })
+    }
+
+    #[inline(never)]
+    fn regions_clauses(&mut self, arity: &ArityTable, regions: &mut HeadRegions<Mem>) -> Result<(), E> {
+        regions.sig = self.opt("a head's signature column", |r| r.rcol(arity, "a head's signature column"))?;
+        regions.written_output = self.opt("a head's written output column", |r| r.rcol(arity, "a head's written output column"))?;
         let clauses = self.count("a head's clause columns")?;
         for _ in 0..clauses {
             let nth = self.u32("a clause column's place")?;
             let binders = self.u32("a clause column's binders")?;
-            let col = self.rcol(&arity, "a clause's column")?;
+            let col = self.rcol(arity, "a clause's column")?;
             regions.clauses.push(ClauseRegions { nth, binders, col });
         }
         let outlives = self.count("a head's outlives clauses")?;
@@ -2700,25 +2787,40 @@ impl<'r> In<'r, '_, '_> {
             };
             regions.outlives.push(c);
         }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn regions_members(&mut self, arity: &ArityTable, regions: &mut HeadRegions<Mem>) -> Result<(), E> {
         let fields = self.count("a head's field columns")?;
         for _ in 0..fields {
             let variant = self.u32("a field column's variant")?;
             let field = self.u32("a field column's field")?;
-            let col = self.rcol(&arity, "a field's column")?;
+            let col = self.rcol(arity, "a field's column")?;
             regions.fields.push((variant, field, col));
         }
         regions.impl_header = self.opt("an impl's header columns", |r| {
-            let self_ = r.rcol(&arity, "an impl's self type column")?;
-            let trait_ = r.opt("an impl's trait reference column", |r| r.rcol(&arity, "an impl's trait reference column"))?;
+            let self_ = r.rcol(arity, "an impl's self type column")?;
+            let trait_ = r.opt("an impl's trait reference column", |r| r.rcol(arity, "an impl's trait reference column"))?;
             Ok((self_, trait_))
         })?;
         let assocs = self.count("an impl's associated type columns")?;
         for _ in 0..assocs {
             let name = self.name("an impl's associated type's name")?;
-            let col = self.rcol(&arity, "an impl's associated type column")?;
+            let col = self.rcol(arity, "an impl's associated type column")?;
             regions.impl_assoc.push((name, col));
         }
         regions.opaque_captures = self.opt("an opaque type's captures", |r| r.u32("an opaque type's captures"))?;
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn regions_section(&mut self) -> Result<FiledRegions, E> {
+        let arity = self.regions_arity()?;
+        let params = self.rparams()?;
+        let mut regions = HeadRegions::new_in(params, self.alloc);
+        self.regions_clauses(&arity, &mut regions)?;
+        self.regions_members(&arity, &mut regions)?;
         check_parts(&regions)?;
         Ok(FiledRegions::of(regions, arity, self.alloc))
     }
@@ -2765,7 +2867,17 @@ impl<'r> In<'r, '_, '_> {
         })
     }
 
-    fn fn_head<'n>(&mut self, text: Option<&'n str>) -> Result<Head<'n>, E> {
+    #[inline(never)]
+    fn fn_head<'n>(&mut self, text: Option<&'n str>) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
+        let (key, head) = self.fn_head_core(text)?;
+        let preds = self.opt("a fn's where-clauses", |r| r.preds())?;
+        let static_ = self.opt("a static's mutability", |r| mutbl_of(r.u8("a static's mutability")?))?;
+        let misses = self.fn_head_misses(head.text.len())?;
+        Ok(self.box_head(Head::Fn { key, head, preds, static_, regions: None, misses }))
+    }
+
+    #[inline(never)]
+    fn fn_head_core<'n>(&mut self, text: Option<&'n str>) -> Result<(ItemKey, FnHead<'n>), E> {
         let key = self.key("a fn's key")?;
         let prefix = self.flag("a fn text's signature-prefix flag")?;
         let want_len = self.u32("a fn text's length")?;
@@ -2792,34 +2904,39 @@ impl<'r> In<'r, '_, '_> {
         let module = self.lib("a fn's module")?;
         let (params, consts, bounds, self_) = self.scope()?;
         let self_assoc = self.named_tys("a fn's `Self` associated types")?;
-        let head = FnHead {
-            lib,
-            text,
-            text_prefix,
-            container,
-            parent,
-            own,
-            declared,
-            self_param,
-            header,
-            c_variadic,
-            qualifiers,
-            legacy_const_generics,
-            inputs,
-            output,
-            has_body,
-            module,
-            params,
-            consts,
-            bounds,
-            self_,
-            self_assoc,
-        };
-        let preds = self.opt("a fn's where-clauses", |r| r.preds())?;
-        let static_ = self.opt("a static's mutability", |r| mutbl_of(r.u8("a static's mutability")?))?;
-        let misses = self.own("a fn's signature misses", |r| {
+        Ok((
+            key,
+            FnHead {
+                lib,
+                text,
+                text_prefix,
+                container,
+                parent,
+                own,
+                declared,
+                self_param,
+                header,
+                c_variadic,
+                qualifiers,
+                legacy_const_generics,
+                inputs,
+                output,
+                has_body,
+                module,
+                params,
+                consts,
+                bounds,
+                self_,
+                self_assoc,
+            },
+        ))
+    }
+
+    #[inline(never)]
+    fn fn_head_misses(&mut self, text_len: usize) -> Result<Vec<HeadMiss, Mem>, E> {
+        self.own("a fn's signature misses", |r| {
             let at = blaze_surface::Range::new(r.u32("a signature miss's start")?, r.u32("a signature miss's end")?);
-            if at.start > at.end || at.end as usize > text.len() {
+            if at.start > at.end || usize::try_from(at.end).map_or(true, |end| end > text_len) {
                 return Err(E::Shape { what: "a signature miss's range is not within the fn's text" });
             }
             let n = r.count("a signature miss's words")?;
@@ -2831,11 +2948,11 @@ impl<'r> In<'r, '_, '_> {
                 _ => return Err(E::Shape { what: "a signature miss of no known kind" }),
             };
             Ok(HeadMiss { at, words, of })
-        })?;
-        Ok(Head::Fn { key, head, preds, static_, regions: None, misses })
+        })
     }
 
-    fn adt<'n>(&mut self) -> Result<Head<'n>, E> {
+    #[inline(never)]
+    fn adt<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
         let key = self.lib("an ADT's key")?;
         let kind = match self.u8("an ADT's kind")? {
             0 => tc::AdtKind::Struct,
@@ -2914,7 +3031,7 @@ impl<'r> In<'r, '_, '_> {
         if !field_defaults.is_empty() && field_defaults.len() != row.fields.len() {
             return Err(E::Shape { what: "an ADT's field defaults are not one per field" });
         }
-        Ok(Head::Adt { key, row, defaults, const_params, field_defaults, preds, life, fieldless, regions: None })
+        Ok(self.box_head(Head::Adt { key, row, defaults, const_params, field_defaults, preds, life, fieldless, regions: None }))
     }
 
     fn repr(&mut self) -> Result<ReprAttrs, E> {
@@ -2983,7 +3100,8 @@ impl<'r> In<'r, '_, '_> {
         Ok(MemberFacts { name, shape })
     }
 
-    fn trait_<'n>(&mut self) -> Result<Head<'n>, E> {
+    #[inline(never)]
+    fn trait_<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
         let key = self.lib("a trait's key")?;
         let generics = self.u32("a trait's generics")?;
         let defaults = self.many("parameter defaults", |r| r.opt("a parameter default", |r| r.ty("a parameter default")))?;
@@ -3037,10 +3155,11 @@ impl<'r> In<'r, '_, '_> {
             assoc_side.push(AssocSide { name, generics, where_, consts, bounds });
         }
         let life = self.container_life()?;
-        Ok(Head::Trait { key, head, extra, supers, const_params, preds, assoc_side, life, regions: None })
+        Ok(self.box_head(Head::Trait { key, head, extra, supers, const_params, preds, assoc_side, life, regions: None }))
     }
 
-    fn impl_<'n>(&mut self) -> Result<Head<'n>, E> {
+    #[inline(never)]
+    fn impl_<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
         let key = self.key("an impl's key")?;
         let generics = self.u32("an impl's generics")?;
         let self_ty = self.ty("an impl's self type")?;
@@ -3101,7 +3220,7 @@ impl<'r> In<'r, '_, '_> {
             return Err(E::Shape { what: "an impl's fn visibilities are not one per fn" });
         }
         let life = self.container_life()?;
-        Ok(Head::Impl { key, head, preds, frame, life, regions: None })
+        Ok(self.box_head(Head::Impl { key, head, preds, frame, life, regions: None }))
     }
 }
 

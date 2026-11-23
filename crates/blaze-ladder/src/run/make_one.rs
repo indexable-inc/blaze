@@ -610,7 +610,10 @@ impl MakerState {
         // ([`build_one`]'s ctor arm).
         // The trait's `Clone::clone` has no body either: the one instance tabled at it is a
         // builtin clone ([`build_one`]'s arm; clone_shim.rs `language_clone`).
-        if program.ctor_of(key).is_some() || program.lang_trait_fn(LangItem::Clone, "clone") == Some(key) {
+        if program.ctor_of(key).is_some()
+            || program.lang_trait_fn(LangItem::Clone, "clone") == Some(key)
+            || program.lang_trait_fn(LangItem::From, "from") == Some(key)
+        {
             let at = program.head_row(key)?;
             self.asked.insert_shift(slot, (key, at));
             return Ok(at);
@@ -956,7 +959,10 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
     // A ctor's fn reads no constant: its fields in, its value out. Nor a builtin clone (a copy,
     // or its fields' own clones), nor a shim of a fn with no body.
     if (function.kind == FnKind::Ctor && function.body.is_none())
-        || (function.body.is_none() && (instance.item != function.key || crate::clone_shim::language_clone(&*program, instance, &work.ground).is_some()))
+        || (function.body.is_none()
+            && (instance.item != function.key
+                || crate::clone_shim::language_clone(&*program, instance, &work.ground).is_some()
+                || crate::clone_shim::language_from(&*program, instance, &work.ground).is_some()))
     {
         return Ok(());
     }
@@ -1358,9 +1364,13 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
         None if instance.item == function.key => crate::clone_shim::language_clone(program, instance, &work.ground),
         _ => None,
     };
+    let builtin_from = match function.body {
+        None if instance.item == function.key && builtin_clone.is_none() => crate::clone_shim::language_from(program, instance, &work.ground),
+        _ => None,
+    };
     let checked = match (function.body, bodies.checked.get(i).and_then(Option::as_ref)) {
         (Some((body, _)), Some(done)) => Some((body, done)),
-        _ if ctor_row.is_some() || builtin_clone.is_some() => None,
+        _ if ctor_row.is_some() || builtin_clone.is_some() || builtin_from.is_some() => None,
         _ => return Err(callee_refusal(program, name(), instance.args, instance, crate::callee_shown::CalleeGap::NoBody, work.ground.view())),
     };
     let malformed = |_| RunError::Build { function: name(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None };
@@ -1450,11 +1460,18 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
                 Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, &adts, Global),
                 None => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, None, &mut subst, &adts, Global),
             }
-        } else if let Some(made) = builtin_clone {
-            // A fn item's and a fn pointer's clone is a copy of its bytes (`Copy` by the
-            // language, no solver asked); a tuple's or a closure's clones each field by its own
-            // `clone` (clone_shim.rs `language_clone`: what it does is a function of the type).
-            blaze_build::build_builtin_clone(made.clone, made.bytes, &mut subst, &adts, Global)
+        } else if builtin_clone.is_some() || builtin_from.is_some() {
+            let g = Global;
+            if let Some(made) = builtin_clone {
+                // A fn item's and a fn pointer's clone is a copy of its bytes (`Copy` by the
+                // language, no solver asked); a tuple's or a closure's clones each field by its own
+                // `clone` (clone_shim.rs `language_clone`: what it does is a function of the type).
+                blaze_build::build_builtin_clone(made.clone, made.bytes, &mut subst, &adts, g)
+            } else if let Some(made) = builtin_from {
+                blaze_build::build_builtin_from(made.from, &mut subst, &adts, g)
+            } else {
+                Err(BuildError::Malformed { what: "unreachable builtin row" })
+            }
         } else if let Some(variant) = ctor_row {
             // The ctor's own instance (a shim of it was taken above): its fields in, its value out.
             blaze_build::build_ctor_fn(function.key, variant, &program.sig(i), &mut subst, &adts, Global)
@@ -1677,10 +1694,17 @@ fn name_ref<'p, P: FrontEnd>(
     // Config` cloning its `fn(..)` field, 30 tests NOT RUN; t1855d: the same `Config` cloning a
     // tuple field, 30 NOT RUN). Tabled at the trait's `clone` row; a tuple's field clones are
     // resolved in that row's world (world_items.rs `ctor_world`: its trait's).
-    if let Some(crate::clone_shim::LanguageClone { clone, .. }) = crate::clone_shim::language_clone(program, called, ground) {
+    if let Some(crate::clone_shim::LanguageClone { clone, .. }) = crate::clone_shim::language_clone_unconditional(program, called, ground) {
         let Some(c) = program.fn_index(clone) else {
             let refusal = callee_refusal(program, name(), at, called, crate::callee_shown::CalleeGap::NotTabled, ground.view());
             return Ok(Named1::Untabled(clone, refusal));
+        };
+        return reach.declare(program.function(c).key, called, ground, alloc).map(Named1::Instance).map_err(|e| named(e, called, &*ground));
+    }
+    if let Some(crate::clone_shim::LanguageFrom { from }) = crate::clone_shim::language_from(program, called, ground) {
+        let Some(c) = program.fn_index(from) else {
+            let refusal = callee_refusal(program, name(), at, called, crate::callee_shown::CalleeGap::NotTabled, ground.view());
+            return Ok(Named1::Untabled(from, refusal));
         };
         return reach.declare(program.function(c).key, called, ground, alloc).map(Named1::Instance).map_err(|e| named(e, called, &*ground));
     }
@@ -1694,6 +1718,17 @@ fn name_ref<'p, P: FrontEnd>(
     };
     let (item, resolved) = match selected {
         Ok(r) => r,
+        Err(blaze_typeck::ResolveError::NoImpl { trait_, .. }) => match crate::clone_shim::language_clone_adt(program, i, called, trait_, ground) {
+            Ok(Some(crate::clone_shim::LanguageClone { clone, .. })) => {
+                let Some(c) = program.fn_index(clone) else {
+                    let refusal = callee_refusal(program, name(), at, called, crate::callee_shown::CalleeGap::NotTabled, ground.view());
+                    return Ok(Named1::Untabled(clone, refusal));
+                };
+                return reach.declare(program.function(c).key, called, ground, alloc).map(Named1::Instance).map_err(|e| named(e, called, &*ground));
+            }
+            Ok(None) => return Err(resolve_refusal(program, adts, ground, name(), called, blaze_typeck::ResolveError::NoImpl { trait_, item: called.item })),
+            Err(error) => return Err(resolve_refusal(program, adts, ground, name(), called, error)),
+        },
         Err(error) => return Err(resolve_refusal(program, adts, ground, name(), called, error)),
     };
     let callee = Instance { item, args: resolved };
@@ -1776,12 +1811,7 @@ fn vtable_rows<P: FrontEnd>(
             continue;
         }
         seen.push(t);
-        let shape = Shape::of(t.principal, |k| adts.object_trait(k), Global).map_err(|e| fail(VtableFail::Shape(e)))?;
-        for w in shape.words.iter() {
-            if let Word::Super(s) = *w {
-                todo.push(VtableRef { concrete: t.concrete, principal: s, args: List::EMPTY });
-            }
-        }
+        let shape = Shape::of(t.principal, |k| adts.object_trait(k), alloc).map_err(|e| fail(VtableFail::Shape(e)))?;
         let id = {
             let mut cx = LayoutCx { ground: &mut *ground, facts: adts, scratch: alloc };
             layouts.of(t.concrete, &mut cx).map_err(|e| fail(VtableFail::Layout(e)))?
@@ -1797,7 +1827,7 @@ fn vtable_rows<P: FrontEnd>(
         let glue_item = glue.map(|g| g.item);
         let mut targs: AVec<'_, PTy> = blaze_own::Vec::new_in(alloc);
         targs.extend_from_slice(ground.view().list(t.args).map_err(|_| full())?);
-        let table = Vtable::build(&shape, t.concrete, &targs, size, align, glue, &mut *ground, Global).map_err(|e| fail(VtableFail::Build(e)))?;
+        let table = Vtable::build(&shape, t.concrete, &targs, size, align, glue, &mut *ground, adts, alloc, Global).map_err(|e| fail(VtableFail::Build(e)))?;
         // The table's datum (code_records.rs `VtableDatum`): its bytes as built (the header's
         // size and alignment, every address word 0), each address word a target by symbol.
         let mut datum = blaze_code::datum::Datum::new_in(blaze_code::datum::Place::ReadOnly, 3, alloc);
@@ -1808,8 +1838,9 @@ fn vtable_rows<P: FrontEnd>(
         for &(off, to) in table.relocs.iter() {
             let f = match to {
                 VtableTarget::Fn(f) => f,
-                VtableTarget::Super(s) => {
-                    let symbol = vtable_symbol(VtableRef { concrete: t.concrete, principal: s, args: List::EMPTY }, ground.view(), alloc).map_err(sym)?;
+                VtableTarget::Super(sup) => {
+                    todo.push(sup);
+                    let symbol = vtable_symbol(sup, ground.view(), alloc).map_err(sym)?;
                     let target = datum.target(blaze_code::record::Target { space: blaze_code::record::Space::Vtable, symbol });
                     datum.words.push(blaze_code::record::Word { at: off, target, addend: 0 });
                     continue;

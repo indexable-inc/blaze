@@ -72,6 +72,8 @@ pub mod head_text;
 pub mod heads;
 pub mod rows;
 pub mod index;
+pub mod inline_for;
+pub mod inspect;
 pub mod keys;
 pub mod linked;
 pub mod langs;
@@ -116,6 +118,7 @@ pub mod texts;
 pub mod tait;
 mod type_expand;
 mod type_marks;
+pub(crate) mod type_name;
 pub mod types;
 pub mod world_items;
 /// The world's E0425 answer: the segment a body path stopped at.

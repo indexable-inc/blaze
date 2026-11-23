@@ -23,8 +23,9 @@ use bstd::path::Path;
 use crate::CliError;
 
 /// What `blaze run` hands the program: the specific capabilities the launcher uses (`fs`, `env`,
-/// `host`, `out`, `err`), which program (`-p`, `--bin`: run_package.rs), the grants named on its
-/// command line (`--grant name=value`, run.md), and the words after `--`.
+/// `host`, `out`, `err`), which program (`-p`, `--bin`: run_package.rs), whether `--open` asked
+/// to open the Explore web page, the grants named on its command line (`--grant name=value`,
+/// run.md), and the words after `--`.
 pub struct Launch<'a> {
     pub fs: &'a Fs,
     pub env: Option<&'a Env>,
@@ -32,6 +33,7 @@ pub struct Launch<'a> {
     pub out: &'a Out,
     pub err: &'a Out,
     pub select: crate::run_package::Select<'a>,
+    pub open: blaze_run::viewer::OpenExplore,
     pub grants: &'a [(&'a str, &'a str)],
     pub args: &'a [&'a str],
 }

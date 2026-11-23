@@ -47,6 +47,9 @@ pub enum Fill {
     /// by name before it unifies self types: `impl Uint<{ <U1792>::LIMBS / 2 }> { fn concat }`
     /// is no candidate of `LIMBS`, so evaluating its header's constant never needs its own header.
     Inherent(Shape, Name),
+    /// A callee whose return signature contains `_` (`-> _`, `-> Option<_>`, `-> Result<T, _>`)
+    /// and whose body must be checked first to infer its concrete return type.
+    InferredOutput(ItemKey),
 }
 
 /// A question this front end cannot answer yet, by the item it is about.
@@ -131,6 +134,11 @@ pub enum Gap {
     /// An import through the one ask (`AsksMet::Once`, front2 asks.rs) was refused: the need
     /// and why.
     Ask(super::asks::AskRefused),
+    /// Mutual recursion cycle while inferring a return-type `_` placeholder (`-> _`, `Result<T, _>`):
+    /// add an explicit return/error type to break the cycle.
+    InferredOutputCycle { owner: ItemKey, callee: ItemKey },
+    /// A callee's inferred return/error type `_` could not be resolved from its body.
+    InferredOutputFailed { item: ItemKey, why: &'static str },
 }
 
 impl core::fmt::Display for Gap {
@@ -190,6 +198,14 @@ impl core::fmt::Display for Gap {
                 write!(f, "whether the member {name:?} of inherent impl {impl_:?} is unstable under a feature this crate does not turn on (rustc's `eval_stability`): {why}")
             }
             Gap::Ask(refused) => write!(f, "{refused}"),
+            Gap::InferredOutputCycle { owner, callee } => write!(
+                f,
+                "cycle (E0391) inferring return/error type `_` between {owner:?} and {callee:?}; add an explicit return or error type to break the cycle"
+            ),
+            Gap::InferredOutputFailed { item, why } => write!(
+                f,
+                "could not infer return/error type `_` for {item:?}: {why}"
+            ),
         }
     }
 }
@@ -421,7 +437,7 @@ impl<'w, 'n, S: NamesSource<'n>> BodyWorld<'w, 'n, S> {
         let made = match fill {
             Fill::Impls(trait_, shape, seen) => trait_question(self.names, &mut heads, b, trait_, shape, seen, BuildOrder::AsAsked),
             Fill::Inherent(shape, name) => inherent_question(self.names, &mut heads, b, shape, name, BuildOrder::AsAsked),
-            Fill::Store(_) => return self.fill(fill),
+            Fill::Store(_) | Fill::InferredOutput(_) => return self.fill(fill),
         };
         // Under the one ask, an import its question met refused is the question's gap.
         if let Some(refused) = self.store.asks.take_refused() {
@@ -637,6 +653,12 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
 impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     fn fn_sig_once(&self, item: ItemKey) -> Fetch<Option<FnSig<'_>>> {
         if let Some(f) = self.store.fns.get(&item) {
+            if item != self.owner && self.store.has_unresolved_inferred_output(item) {
+                if self.store.inferring_output_stack.scan_for(&item).is_some() {
+                    return self.gap(Gap::InferredOutputCycle { owner: self.owner, callee: item });
+                }
+                return self.fill(Fill::InferredOutput(item));
+            }
             return Ok(Some(FnSig {
                 parent_count: f.parent,
                 own_count: f.own,
@@ -646,7 +668,7 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
                 c_variadic: f.c_variadic,
                 legacy_const_generics: &f.legacy_const_generics,
                 inputs: &f.inputs,
-                output: f.output,
+                output: self.store.fn_output(item).unwrap_or(f.output),
                 types: self.types(),
             }));
         }
@@ -1115,10 +1137,15 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
             // `repr(packed)` in any form (`packed(N)`, `C, packed`): the layout's own fact
             // (`ReprAttrs::packed`), answered for the capture analysis (TypeAttrs::PACKED).
             let packed = if a.repr.packed.is_some() { TypeAttrs::PACKED } else { 0 };
+            let auto_copy = if a.kind == tc::AdtKind::Struct && self.store.is_auto_copy_pub(self.names, self.keys, item) {
+                TypeAttrs::AUTO_COPY_PUB
+            } else {
+                0
+            };
             return Ok(match a.kind {
                 tc::AdtKind::Enum => TypeAttrs(args).with_discr(super::heads::discr_ty(a.repr)),
-                tc::AdtKind::Struct if a.repr.simd => TypeAttrs(TypeAttrs::SIMD | args | packed),
-                _ => TypeAttrs(args | packed),
+                tc::AdtKind::Struct if a.repr.simd => TypeAttrs(TypeAttrs::SIMD | args | packed | auto_copy),
+                _ => TypeAttrs(args | packed | auto_copy),
             });
         }
         if let Some(f) = self.store.fns.get(&item) {
@@ -1162,7 +1189,20 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
         Ok(Some(TraitDef {
             generics: t.generics,
             flags: t.flags,
-            lang: self.index.lang_name_of(lib).and_then(trait_lang),
+            lang: self.index.lang_name_of(lib).and_then(trait_lang).or_else(|| {
+                if t.generics != 2 {
+                    return None;
+                }
+                let from_key = match self.store.from_trait.get() {
+                    Some(cached) => cached,
+                    None => {
+                        let found = super::langs::find(self.index, self.resolver(), LangItem::From).ok().flatten();
+                        self.store.from_trait.set(Some(found));
+                        found
+                    }
+                };
+                (from_key == Some(lib)).then_some(LangItem::From)
+            }),
             supertraits: &extra.supertraits,
             // With a synthetic associated type per `impl Trait` at a place of a fn's return type
             // (super::rpitit), after the written ones.

@@ -205,7 +205,8 @@ pub fn main() {}
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
         let erased = blaze_own::Erased::new(&frame);
         let texts = WithDep { base: &inputs.texts, dep, files: &dep_files };
-        let solved = resolve_crates(&crates, sysroot, &texts, &Serial, erased.bump()).unwrap_or_else(|e| panic!("resolve_crates (two crates): {e}"));
+        let par = crate::crates::ScratchSerial::new();
+        let solved = resolve_crates(&crates, sysroot, &texts, &par, erased.bump()).unwrap_or_else(|e| panic!("resolve_crates (two crates): {e}"));
         let root = solved.root(0);
         // `g` and `h` are in the root module: their module is the root.
         let named = names::path(&solved, root, Namespace::Values, Written { kind: PathKind::Plain, segments: &["g"] }, alloc).unwrap_or_else(|e| panic!("`g`: {e}"));

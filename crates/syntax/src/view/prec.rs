@@ -390,31 +390,37 @@ impl<'t> Expr<'t> {
     /// parens or other delimiters, e.g., `X { y: 1 }`, `X { y: 1 }.method()`, `foo == X { y: 1 }` and
     /// `X { y: 1 } == foo` all do, but `(X { y: 1 }) == foo` does not.
     fn contains_exterior_struct_lit(self) -> bool {
-        return contains_exterior_struct_lit_inner(self).is_some();
+        use Expr::*;
 
-        fn contains_exterior_struct_lit_inner(expr: Expr<'_>) -> Option<()> {
-            use Expr::*;
-
-            match expr {
-                RecordExpr(..) => Some(()),
+        let mut worklist = blaze_mem::scratch::Scratch::new();
+        let worklist = worklist.take();
+        let mut next = Some(self);
+        while let Some(curr) = next.or_else(|| worklist.pop()) {
+            next = match curr {
+                RecordExpr(..) => return true,
 
                 // X { y: 1 } + X { y: 2 }
-                BinExpr(e) => e
-                    .lhs()
-                    .and_then(contains_exterior_struct_lit_inner)
-                    .or_else(|| e.rhs().and_then(contains_exterior_struct_lit_inner)),
+                BinExpr(e) => match (e.lhs(), e.rhs()) {
+                    (Some(lhs), Some(rhs)) => {
+                        worklist.push(rhs);
+                        Some(lhs)
+                    }
+                    (Some(child), None) | (None, Some(child)) => Some(child),
+                    (None, None) => None,
+                },
 
                 // `&X { y: 1 }`, `X { y: 1 }.y`, `X { y: 1 }.bar(...)`, etc
-                IndexExpr(e) => contains_exterior_struct_lit_inner(e.base()?),
-                AwaitExpr(e) => contains_exterior_struct_lit_inner(e.expr()?),
-                PrefixExpr(e) => contains_exterior_struct_lit_inner(e.expr()?),
-                CastExpr(e) => contains_exterior_struct_lit_inner(e.expr()?),
-                FieldExpr(e) => contains_exterior_struct_lit_inner(e.expr()?),
-                MethodCallExpr(e) => contains_exterior_struct_lit_inner(e.receiver()?),
+                IndexExpr(e) => e.base(),
+                AwaitExpr(e) => e.expr(),
+                PrefixExpr(e) => e.expr(),
+                CastExpr(e) => e.expr(),
+                FieldExpr(e) => e.expr(),
+                MethodCallExpr(e) => e.receiver(),
 
                 _ => None,
-            }
+            };
         }
+        false
     }
 
     /// Returns true if self is one of `return`, `break`, `continue` or `yield` with **no associated value**.

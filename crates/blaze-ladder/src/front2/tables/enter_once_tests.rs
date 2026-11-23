@@ -157,7 +157,7 @@ fn run(world: World, links: usize, side: Side) -> Run {
         Side::Restart => AsksMet::Again,
         Side::Once => AsksMet::Once(AsksPlant::Clean),
     };
-    let body_frame = BodyFrame { frame, alloc: a(), plant_drop: None, cost: Some(cost), needs: NeedsMet::First, heads, sources: None, goals: None };
+    let body_frame = BodyFrame { frame, alloc: a(), plant_drop: None, cost: Some(cost), needs: NeedsMet::First, heads, sources: None, goals: None, prepared: None };
     let recorder = Recorder::new(RecorderOpts { alloc: a() });
     let tables = Tables::new(TablesOpts { records: names, impls: None, lang_crates: &[CORE_AT], reads: &recorder });
     let body = record_body_met(tables, &task_of(names, "chain"), &body_frame, a(), met).unwrap_or_else(|e| panic!("{side:?} on a chain of {links}: the chain's body task refused: {e}"));

@@ -441,10 +441,28 @@ fn target<'n, S: NamesSource<'n>>(names: S, index: &Index<'_>, shim: Shim, alloc
 /// item, the marker, and a declaration [`reached`] refused (it is then in no table, and its
 /// caller is refused with that cause).
 pub fn bound<'n, S: NamesSource<'n>>(names: S, index: &Index<'_>, store: &Store<'_>, item: ItemKey, alloc: Alloc<'_>) -> Option<ItemKey> {
-    match declares(names, store, item, alloc) {
-        Ok(Some(shim)) => target(names, index, shim, alloc).ok().flatten().map(checker_of),
-        Ok(None) | Err(_) => None,
+    let shim = match declares(names, store, item, alloc) {
+        Ok(Some(shim)) => shim,
+        Ok(None) | Err(_) => return None,
+    };
+    let slot = match shim {
+        Shim::Alloc => 0,
+        Shim::Dealloc => 1,
+        Shim::Realloc => 2,
+        Shim::AllocZeroed => 3,
+        Shim::ErrorHandler => 4,
+        Shim::Marker => 5,
+    };
+    let mut cache = store.alloc_shims.get();
+    if let Some(&Some(hit)) = cache.get(slot) {
+        return hit;
     }
+    let resolved = target(names, index, shim, alloc).ok().flatten().map(checker_of);
+    if let Some(entry) = cache.get_mut(slot) {
+        *entry = Some(resolved);
+    }
+    store.alloc_shims.set(cache);
+    resolved
 }
 
 fn failed(why: &Refused) -> Reached {

@@ -437,7 +437,7 @@ pub(crate) fn reached(outlined: &[Outlined<'_>], root: Name, g: blaze_own::Alloc
         let at = outlined.binary_search_by(|one| one.name.cmp(&name)).map_err(|_| Unoutlined { file: name, root })?;
         seen.insert_shift(slot, name);
         if let Ok(record) = &outlined[at].made {
-            next.extend(record.parts.iter().filter(|part| matches!(part.locate, Locate::File { .. })).map(|part| part.name));
+            next.extend(record.parts.iter().filter(|part| matches!(part.locate, Locate::File { edition } if !crate::data_include::is_data(edition))).map(|part| part.name));
         }
     }
     Ok(seen)
@@ -468,7 +468,7 @@ pub(crate) fn reached_under(outlined: &[Outlined<'_>], cuts: &PlanCuts<'_, '_, '
         }
         seen.insert_shift(slot, name);
         if let Ok(record) = &outlined[at].made {
-            next.extend(record.parts.iter().filter(|part| matches!(part.locate, Locate::File { .. }) && !crate::engine_plan_cfg::part_cut(file, part).cuts(test)).map(|part| part.name));
+            next.extend(record.parts.iter().filter(|part| matches!(part.locate, Locate::File { edition } if !crate::data_include::is_data(edition)) && !crate::engine_plan_cfg::part_cut(file, part).cuts(test)).map(|part| part.name));
         }
     }
     Ok(seen)
@@ -532,34 +532,19 @@ pub(crate) struct FoundEdge {
     pub(crate) file: Name,
 }
 
-/// Two member units of one root that are both test builds, or both not: the found flags of a
-/// place say non-test and test (engine_check.rs [`crate::engine_check::found_bit`]), so which of
-/// the two found a file would not be known. Named, never one of them taken (rule 3).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct FoundUnitsShare {
-    pub(crate) root: Name,
-    pub(crate) test: bool,
-}
-
-impl fmt::Display for FoundUnitsShare {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let kind = if self.test { "test" } else { "non-test" };
-        write!(f, "two {kind} member units have the root {:?}: a found file's place keeps one flag a kind of unit of its root (engine_check.rs `PLACE_FOUND_LIB`, `PLACE_FOUND_TEST`), so which of them found it would not be known ({RULE} `found_edges`)", self.root)
-    }
-}
-
-/// The member unit of `list` at each (root, test): the one a found flag of a place whose `unit`
-/// is that root names, sorted. Two at one (root, test) are [`FoundUnitsShare`]. In `g`.
-pub(crate) fn found_units(list: &CrateList<'_>, g: blaze_own::Alloc<'static>) -> Result<AVec<'static, (Name, bool, Name)>, FoundUnitsShare> {
+/// Every member unit of `list` with its `(root, test, unit)`, sorted and deduplicated: what a
+/// found flag of a place whose `unit` is that root resolves to ([`found_edges`]). Multiple member
+/// units may share `(root, test)` — for example a workspace library compiled for both
+/// `Side::Target` and `Side::Macro` (used by a member proc-macro) or under distinct feature sets.
+/// In `g`.
+pub(crate) fn found_units(list: &CrateList<'_>, g: blaze_own::Alloc<'static>) -> AVec<'static, (Name, bool, Name)> {
     let mut units: AVec<'static, (Name, bool, Name)> = Vec::new_in(g);
     for at in (0..CrateGraph::len(list)).filter(|at| list.member(*at)) {
         units.push((root_file(list, at), list.test(at), blaze_drive::key::crate_scope_name(&list.key(at))));
     }
     units.sort_unstable();
-    if let Some(pair) = units.windows(2).find(|pair| (pair[0].0, pair[0].1) == (pair[1].0, pair[1].1)) {
-        return Err(FoundUnitsShare { root: pair[0].0, test: pair[0].1 });
-    }
-    Ok(units)
+    units.dedup();
+    units
 }
 
 /// The edges of `unit` in `sorted` (sorted by unit, then file).
@@ -570,9 +555,11 @@ fn edges_of(sorted: &[FoundEdge], unit: Name) -> &[FoundEdge] {
 }
 
 /// The found edges `places` keep (engine_check.rs [`crate::engine_check::PLACE_FOUND`]): each
-/// found flag of a place names the member unit of its root and kind ([`found_units`]); a flag
-/// whose unit `list` no longer has is no edge (its file goes when no names row reads it). Sorted.
-/// In `g`.
+/// found flag of a place names every member unit of its root and kind ([`found_units`]); when
+/// multiple units share `(root, test)` (e.g. target and macro side of one library), each receives
+/// the edge so its reach includes the file, and any unit whose own cfg/items record does not hold
+/// it settles to `FileIs::NotHeld` (`Decision::NotHeld`). A flag whose `(root, test)` `list` no
+/// longer has is no edge (its file goes when no names row reads it). Sorted. In `g`.
 pub(crate) fn found_edges(units: &[(Name, bool, Name)], places: &[(Name, blaze_engine::pages::FilePlace)], g: blaze_own::Alloc<'static>) -> AVec<'static, FoundEdge> {
     let mut edges: AVec<'static, FoundEdge> = Vec::new_in(g);
     for (file, place) in places.iter() {
@@ -580,8 +567,9 @@ pub(crate) fn found_edges(units: &[(Name, bool, Name)], places: &[(Name, blaze_e
             if place.flags & crate::engine_check::found_bit(test) == 0 {
                 continue;
             }
-            if let Ok(at) = units.binary_search_by(|one| (one.0, one.1).cmp(&(place.unit, test))) {
-                edges.push(FoundEdge { unit: units[at].2, file: *file });
+            let from = units.partition_point(|one| (one.0, one.1) < (place.unit, test));
+            for &(_, _, unit) in units.iter().skip(from).take_while(|one| (one.0, one.1) == (place.unit, test)) {
+                edges.push(FoundEdge { unit, file: *file });
             }
         }
     }
@@ -710,7 +698,15 @@ impl Reach {
         for (rank, (at, one)) in ranked.iter().enumerate() {
             let rank = u32::try_from(rank).unwrap_or(u32::MAX);
             let kept = u32::try_from(*at).ok().and_then(|at| members.member(at)).filter(|kept| kept.unit.name == one.unit).ok_or(ReachUnknown { unit: one.unit })?;
-            files.extend(kept.held.iter().map(|held| (held.slot, rank)));
+            match &kept.state {
+                crate::engine_members_record::MemberState::Held(held) => {
+                    files.extend(held.held.iter().map(|held| (held.slot, rank)));
+                }
+                crate::engine_members_record::MemberState::CutScope(cut) => {
+                    files.extend(cut.held.iter().map(|held| (held.slot, rank)));
+                }
+                crate::engine_members_record::MemberState::Refused(_) => {}
+            }
             files.extend(kept.not_held.iter().map(|file| (*file, rank)));
         }
         Ok(Reach::of(&ranked, files, names, found, g))
@@ -948,7 +944,7 @@ impl Outside {
     /// setup's: their outlines stand and no body of them was entered), each its last block, as a
     /// read-back outline with none entered keeps it.
     /// Its scratch is `frame`'s.
-    pub(crate) fn lines(&self, entered: impl Iterator<Item = u32>, outlined: &[Outlined<'_>], unread: &[Name], last: Option<&crate::engine_lines::Last<'_, '_>>, lines: &mut crate::engine_lines::Lines<'_>, frame: &Frame) {
+    pub(crate) fn lines<'a>(&self, entered: impl Iterator<Item = u32>, outlined: &[Outlined<'_>], unread: &[Name], last: Option<&crate::engine_lines::Last<'a, '_>>, lines: &mut crate::engine_lines::Lines<'a>, frame: &Frame) {
         for name in unread.iter() {
             if let Some(block) = last.and_then(|last| last.block(*name)) {
                 lines.keep(*name, block);
@@ -1064,7 +1060,10 @@ impl fmt::Display for FileWords<'_, '_> {
         let outlined = self.outlined;
         let names_it = |one: &Outlined<'_>| {
             one.made.as_ref().is_ok_and(|record| {
-                record.parts.iter().any(|part| matches!(part.locate, Locate::File { .. }) && outlined.binary_search_by(|o| o.name.cmp(&part.name)).is_ok_and(|at| outlined[at].path.as_slice() == path))
+                record.parts.iter().any(|part| {
+                    matches!(part.locate, Locate::File { edition } if !crate::data_include::is_data(edition))
+                        && outlined.binary_search_by(|o| o.name.cmp(&part.name)).ok().and_then(|at| outlined.get(at)).is_some_and(|o| o.path.as_slice() == path)
+                })
             })
         };
         let text = core::str::from_utf8(path).unwrap_or("?");
@@ -1114,5 +1113,59 @@ impl fmt::Display for Named<'_> {
             (true, Some(place)) => write!(f, "{{the item at byte {place} of its file}}"),
             (true, None) => f.write_str("{an item its file's outline no longer lists}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blaze_engine::pages::FilePlace;
+
+    #[test]
+    fn found_edges_fans_out_to_all_units_sharing_root_and_kind() {
+        let heap = blaze_own::testing::heap();
+        let root_a = Name::file(b"crates/shared/src/lib.rs");
+        let root_b = Name::file(b"crates/other/src/lib.rs");
+        let found_a = Name::file(b"crates/shared/src/generated.rs");
+        let found_b = Name::file(b"crates/other/src/generated.rs");
+        let unit_a_target = Name::new(Kind::CrateScope, ContentId([1; 32]));
+        let unit_a_macro = Name::new(Kind::CrateScope, ContentId([2; 32]));
+        let unit_a_test = Name::new(Kind::CrateScope, ContentId([3; 32]));
+        let unit_b_lib = Name::new(Kind::CrateScope, ContentId([4; 32]));
+
+        let mut units = [
+            (root_a, false, unit_a_target),
+            (root_a, false, unit_a_macro),
+            (root_a, true, unit_a_test),
+            (root_b, false, unit_b_lib),
+        ];
+        units.sort_unstable();
+
+        // 1. A found file on root_a (non-test) fans out to BOTH non-test units sharing root_a,
+        //    never to the test unit on root_a or to root_b.
+        let places = [(found_a, FilePlace { unit: root_a, edition: 0, flags: crate::engine_check::PLACE_FOUND_LIB })];
+        let edges = found_edges(&units, &places, heap.alloc());
+        let mut expected = [
+            FoundEdge { unit: unit_a_target, file: found_a },
+            FoundEdge { unit: unit_a_macro, file: found_a },
+        ];
+        expected.sort_unstable();
+        assert_eq!(edges.as_slice(), expected.as_slice(), "both non-test units sharing root_a receive the edge");
+
+        // 2. A found file on root_b alone is unaffected by root_a having two non-test units.
+        let places_b = [(found_b, FilePlace { unit: root_b, edition: 0, flags: crate::engine_check::PLACE_FOUND_LIB })];
+        let edges_b = found_edges(&units, &places_b, heap.alloc());
+        assert_eq!(edges_b.as_slice(), &[FoundEdge { unit: unit_b_lib, file: found_b }]);
+
+        // 3. Both flags set on root_a emit edges for both non-test units and the test unit.
+        let places_both = [(found_a, FilePlace { unit: root_a, edition: 0, flags: crate::engine_check::PLACE_FOUND })];
+        let edges_both = found_edges(&units, &places_both, heap.alloc());
+        let mut expected_both = [
+            FoundEdge { unit: unit_a_target, file: found_a },
+            FoundEdge { unit: unit_a_macro, file: found_a },
+            FoundEdge { unit: unit_a_test, file: found_a },
+        ];
+        expected_both.sort_unstable();
+        assert_eq!(edges_both.as_slice(), expected_both.as_slice());
     }
 }

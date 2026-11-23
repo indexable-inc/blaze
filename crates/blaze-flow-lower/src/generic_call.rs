@@ -403,6 +403,10 @@ struct Proj {
     /// position one way, and the caller's own type parameters its arguments hold by their
     /// placeholders. A trait object is related both ways (`false`).
     alias: bool,
+    /// Whether this mark is an opaque return type (`Mark::Proj { opaque: Some(..), .. }`)
+    /// rather than a trait associated-type projection: its captured arguments are values (not
+    /// projected through a trait impl), so an opaque argument's lifetimes are its positions.
+    opaque: bool,
     /// What it keeps live (lib.rs `OpaqueLive`): `Captures` but for an opaque type whose
     /// item bounds say less (rust-lang/rust#116733): then only that region of the column
     /// flows into its position (`Only`), or nothing (`Nothing`, a `'static` bound).
@@ -1256,7 +1260,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         if let Some(&p) = ps.iter().find(|&&p| p as usize >= args.len()) {
                             return self.refuse(Form::CalleeParamPastArgs { callee, param: p, args: args.len() as u32 }, e);
                         }
-                        projs.push(Proj { lo, hi, rlo: r as u32, rhi: (r + n) as u32, alias: false, live: crate::OpaqueLive::Captures });
+                        projs.push(Proj { lo, hi, rlo: r as u32, rhi: (r + n) as u32, alias: false, opaque: false, live: crate::OpaqueLive::Captures });
                         r += n;
                         seq.push(Slot::Joined((projs.len() - 1) as u32));
                     }
@@ -1329,7 +1333,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                             (Some(_), Some(k)) if self.opaque_live(k) == crate::OpaqueLive::Nothing => crate::OpaqueLive::Nothing,
                             _ => crate::OpaqueLive::Captures,
                         };
-                        projs.push(Proj { lo, hi, rlo: prlo, rhi: prhi, alias, live });
+                        projs.push(Proj { lo, hi, rlo: prlo, rhi: prhi, alias, opaque: opaque.is_some(), live });
                         // The projection's type holds no lifetime here (`Iterator::find` on a
                         // `Map<_, F>` whose `Item = u32`): it relates nothing, so how its
                         // inputs hold their lifetimes does not matter. Before, a closure in
@@ -1516,7 +1520,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         }
                         if pj.alias {
                             held.clear();
-                            self.outlives_components(args[p as usize], e, &mut held, true)?;
+                            if let Some(&arg) = args.get(usize::try_from(p).unwrap_or(usize::MAX)) {
+                                self.outlives_components(arg, e, &mut held, true)?;
+                            }
                             for h in 0..held.len() {
                                 let u = self.param_origin(held[h]);
                                 self.b.subset(u, o);

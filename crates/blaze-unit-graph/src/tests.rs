@@ -243,6 +243,7 @@ impl P {
             features,
             deps,
             meta: crate::PackageMeta::unstated(a()),
+            patched_from: Vec::new_in(a()),
         }
     }
 }
@@ -1332,4 +1333,230 @@ fn an_edit_that_changes_no_resolution_leaves_the_record_equal() {
     assert_eq!(described, described_again, "a comment beside the description changed the record");
     let (asked_more, _) = graph_record(&workspace_files("\"x\", \"y\"", ""));
     assert_ne!(before, asked_more, "the control: asking b for `y` must change the record");
+}
+
+/// `[patch.crates-io]` path packages and transitive path dependencies outside `[workspace.members]`
+/// resolve via `Resolution::package` (not `Resolution::member`), including multi-version lock
+/// disambiguation when one version of a crate is patched to a path package while another remains
+/// from crates.io, and never pull in the patched package's dev-dependencies or test harnesses.
+#[test]
+fn patched_path_package_and_multi_version_disambiguation() {
+    let lock_text = "\
+version = 4
+
+[[package]]
+name = \"app\"
+version = \"0.1.0\"
+dependencies = [
+ \"foo 1.0.0\",
+ \"foo 2.0.0\",
+]
+
+[[package]]
+name = \"foo\"
+version = \"1.0.0\"
+dependencies = [
+ \"helper\",
+]
+
+[[package]]
+name = \"foo\"
+version = \"2.0.0\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+checksum = \"0000000000000000000000000000000000000000000000000000000000000000\"
+
+[[package]]
+name = \"helper\"
+version = \"0.1.0\"
+";
+    let lock = Lock::read(lock_text.as_bytes(), a()).expect("lock");
+    let app_id = lock.named("app").next().expect("app");
+    let foo1_id = lock.named("foo").find(|id| format!("{}", lock.package(*id).version) == "1.0.0").expect("foo 1.0.0");
+    let foo2_id = lock.named("foo").find(|id| format!("{}", lock.package(*id).version) == "2.0.0").expect("foo 2.0.0");
+    let helper_id = lock.named("helper").next().expect("helper");
+
+    let empty_pkg = |name: &str, deps: StdVec<Dep<'static>>| -> Package<'static> {
+        let mut d = Vec::new_in(a());
+        for dep in deps {
+            d.push(dep);
+        }
+        Package {
+            name: t(name),
+            edition: PackageEdition { syntax: Edition::Edition2021, blaze: None },
+            lib: Some(Lib { crate_name: t(name), root: t("src/lib.rs"), proc_macro: false }),
+            bins: Vec::new_in(a()),
+            extras: Vec::new_in(a()),
+            build: None,
+            links: None,
+            features: Vec::new_in(a()),
+            deps: d,
+            meta: crate::PackageMeta::unstated(a()),
+            patched_from: Vec::new_in(a()),
+        }
+    };
+    let make_dep = |key: &str, pkg: &str, kind: DepKind, source: DepSource<'static>| Dep {
+        key: t(key),
+        package: t(pkg),
+        kind,
+        platform: None,
+        optional: false,
+        default_features: true,
+        features: Vec::new_in(a()),
+        source,
+    };
+
+    let app_pkg = empty_pkg(
+        "app",
+        vec![
+            make_dep("foo", "foo", DepKind::Normal, DepSource::Registry { req: Some(t("1.0")) }),
+            make_dep("foo2", "foo", DepKind::Normal, DepSource::Registry { req: Some(t("2.0")) }),
+        ],
+    );
+    let foo1_pkg = empty_pkg(
+        "foo",
+        vec![
+            make_dep("helper", "helper", DepKind::Normal, DepSource::Path),
+            // Not in Cargo.lock: must be ignored because foo 1.0.0 is NOT a workspace member.
+            make_dep("missing_dev", "missing_dev", DepKind::Dev, DepSource::Registry { req: Some(t("1.0")) }),
+        ],
+    );
+    let foo2_pkg = empty_pkg("foo", vec![]);
+    let helper_pkg = empty_pkg("helper", vec![]);
+
+    let mut roots = Vec::new_in(a());
+    roots.push(app_id);
+    let ask = Ask { roots, features: Vec::new_in(a()), all_features: false, no_default_features: false, tests: true };
+    let target = mac();
+    let mut res = Resolution::new(&lock, &target, &target, &ask, Resolver::V2, a());
+    res.member(app_id, app_pkg.clone()).expect("member app");
+    res.package(foo1_id, Some(foo1_pkg)).expect("patched foo 1.0.0");
+    res.package(helper_id, Some(helper_pkg)).expect("transitive path helper");
+    let needed = match res.pass().expect("pass 1") {
+        Pass::Need(ids) => ids,
+        Pass::Done(_) | Pass::Partial(_) => panic!("expected foo 2.0.0 to be requested"),
+    };
+    assert_eq!(needed.as_slice(), &[foo2_id], "only unpatched registry foo 2.0.0 should be requested");
+    res.package(foo2_id, Some(foo2_pkg)).expect("registry foo 2.0.0");
+    let graph = match res.pass().expect("pass 2") {
+        Pass::Done(g) => g,
+        Pass::Need(_) | Pass::Partial(_) => panic!("graph should resolve cleanly"),
+    };
+    let summary: StdVec<StdString> = graph.units.iter().map(|u| format!("{} {} {:?}", u.name.as_str(), u.version.as_str(), u.kind)).collect();
+    assert!(summary.iter().any(|s| s == "foo 1.0.0 Lib"), "patched foo 1.0.0 missing: {summary:?}");
+    assert!(summary.iter().any(|s| s == "foo 2.0.0 Lib"), "registry foo 2.0.0 missing: {summary:?}");
+    assert!(summary.iter().any(|s| s == "helper 0.1.0 Lib"), "transitive helper missing: {summary:?}");
+    assert!(!summary.iter().any(|s| s.starts_with("foo 1.0.0 Test")), "patched package must not get a test harness: {summary:?}");
+
+    // CONTROL: without supplying the patched path package, `Pass::Partial` refuses with `foo 1.0.0` missing.
+    let mut roots2 = Vec::new_in(a());
+    roots2.push(app_id);
+    let ask2 = Ask { roots: roots2, features: Vec::new_in(a()), all_features: false, no_default_features: false, tests: false };
+    let mut missing = Resolution::new(&lock, &target, &target, &ask2, Resolver::V2, a());
+    missing.member(app_id, app_pkg).expect("member app");
+    match missing.pass().expect("pass missing") {
+        Pass::Need(ids) => {
+            for id in ids.iter().copied() {
+                if id == foo2_id {
+                    missing.package(id, Some(empty_pkg("foo", vec![]))).expect("foo2");
+                } else {
+                    missing.package(id, None).expect("unreadable");
+                }
+            }
+        }
+        Pass::Partial(_) => {}
+        Pass::Done(_) => panic!("should not succeed without patched path package"),
+    }
+    let partial = match missing.pass().expect("pass partial") {
+        Pass::Partial(p) => p,
+        other => panic!("expected Partial, got {}", matches!(other, Pass::Done(_))),
+    };
+    assert!(partial.missing().contains(&foo1_id), "missing should include foo 1.0.0: {:?}", partial.missing());
+}
+
+#[test]
+fn disambiguates_same_name_git_deps_patched_to_different_paths() {
+    const LOCK: &str = r#"version = 4
+
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = [
+ "foo 1.0.0",
+ "foo 2.0.0",
+]
+
+[[package]]
+name = "foo"
+version = "1.0.0"
+
+[[package]]
+name = "foo"
+version = "2.0.0"
+"#;
+    let lock = Lock::read(LOCK.as_bytes(), a()).expect("lock");
+    let app_id = lock.named("app").next().expect("app");
+    let foo1_id = lock.named("foo").find(|id| lock.package(*id).version.major == 1).expect("foo 1.0.0");
+    let foo2_id = lock.named("foo").find(|id| lock.package(*id).version.major == 2).expect("foo 2.0.0");
+
+    let make_dep = |key: &str, url: &str| Dep {
+        key: t(key),
+        package: t("foo"),
+        kind: DepKind::Normal,
+        platform: None,
+        optional: false,
+        default_features: true,
+        features: Vec::new_in(a()),
+        source: DepSource::Git { url: t(url) },
+    };
+    let make_pkg = |name: &str, deps: StdVec<Dep<'static>>, patched_from: Option<&str>| -> Package<'static> {
+        let mut d = Vec::new_in(a());
+        for dep in deps {
+            d.push(dep);
+        }
+        let mut pf = Vec::new_in(a());
+        if let Some(src) = patched_from {
+            pf.push(t(src));
+        }
+        Package {
+            name: t(name),
+            edition: PackageEdition { syntax: Edition::Edition2021, blaze: None },
+            lib: Some(Lib { crate_name: t(name), root: t("src/lib.rs"), proc_macro: false }),
+            bins: Vec::new_in(a()),
+            extras: Vec::new_in(a()),
+            build: None,
+            links: None,
+            features: Vec::new_in(a()),
+            deps: d,
+            meta: crate::PackageMeta::unstated(a()),
+            patched_from: pf,
+        }
+    };
+    let app_pkg = make_pkg(
+        "app",
+        vec![
+            make_dep("foo_a", "https://example.com/a/foo.git"),
+            make_dep("foo_b", "https://example.com/b/foo"),
+        ],
+        None,
+    );
+    let foo1_pkg = make_pkg("foo", vec![], Some("https://example.com/a/foo"));
+    let foo2_pkg = make_pkg("foo", vec![], Some("https://example.com/b/foo.git"));
+
+    let target = mac();
+    let mut roots = Vec::new_in(a());
+    roots.push(app_id);
+    let ask = Ask { roots, features: Vec::new_in(a()), all_features: false, no_default_features: false, tests: false };
+    let mut res = Resolution::new(&lock, &target, &target, &ask, Resolver::V2, a());
+    res.member(app_id, app_pkg).expect("member app");
+    res.package(foo1_id, Some(foo1_pkg)).expect("foo1");
+    res.package(foo2_id, Some(foo2_pkg)).expect("foo2");
+    let graph = match res.pass().expect("resolve patched same-name git deps") {
+        Pass::Done(g) => g,
+        Pass::Need(_) | Pass::Partial(_) => panic!("expected clean resolution"),
+    };
+    let app_unit = graph.units.iter().find(|u| u.name.as_str() == "app").expect("app unit");
+    let dep_a = app_unit.deps.iter().find(|d| d.name.as_str() == "foo_a").expect("foo_a dep");
+    let dep_b = app_unit.deps.iter().find(|d| d.name.as_str() == "foo_b").expect("foo_b dep");
+    assert_eq!(graph.units[dep_a.unit.index()].version.as_str(), "1.0.0");
+    assert_eq!(graph.units[dep_b.unit.index()].version.as_str(), "2.0.0");
 }

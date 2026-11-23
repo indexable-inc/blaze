@@ -252,6 +252,7 @@ impl<'r> HeadsScopeCache<'r> {
         names: crate::engine_names::NamesInputs<'_, '_>,
         list: &blaze_world::crate_list::CrateList<'static>,
         at: usize,
+        unreadable: Option<&'static str>,
         g: Alloc<'static>,
     ) -> Result<Result<crate::front_load::Unopened, crate::engine_bodies::CutWhy>, CliError> {
         if let Some(cached) = self.present.get(at).copied().flatten() {
@@ -262,6 +263,11 @@ impl<'r> HeadsScopeCache<'r> {
             return Ok(Err(crate::engine_bodies::CutWhy::NoNamesRecord { failed: names.failed(scope_name) }));
         };
         let name = CrateGraph::name(list, at);
+        if unreadable.is_some_and(|planted| planted == name) {
+            return Ok(Err(crate::engine_bodies::CutWhy::Unreadable(
+                crate::front_load::LoadError::NotInStore { name: input.name, at: input.at }.into(),
+            )));
+        }
         let unopened = crate::front_load::Unopened { input, key: list.key(at), world_at: at, name, package: list.shown_from(at) };
         match crate::front_load::present(snapshot, &unopened) {
             Ok(Ok(())) => {
@@ -280,21 +286,29 @@ impl<'r> HeadsScopeCache<'r> {
 
 /// Phase-wide lazy scope records for `Heads`: serves any crate already opened in
 /// [`HeadsScopeCache`] (active members) directly without re-reading the store, and opens every
-/// other scope crate at most once on demand from the committed snapshot.
-struct HeadsScopeRecords<'r, 's> {
+/// other scope crate at most once on demand from the shared request-wide [`ScopeRecords`].
+struct HeadsScopeRecords<'r, 's, 'l> {
     preopened: SVec<'static, Option<crate::front_load::CrateRecords<'r>>>,
-    lazy: crate::front_load::ScopeRecords<'s>,
+    lazy: &'s crate::front_load::ScopeRecords<'l>,
 }
 
-impl<'r, 's> HeadsScopeRecords<'r, 's> {
-    fn new(cache: &HeadsScopeCache<'r>, snapshot: &'s crate::store::StoreSnapshot, crates: usize, heap: &'static blaze_own::Heap) -> HeadsScopeRecords<'r, 's> {
+impl<'r, 's, 'l> HeadsScopeRecords<'r, 's, 'l> {
+    fn new(cache: &HeadsScopeCache<'r>, lazy: &'s crate::front_load::ScopeRecords<'l>, crates: usize, heap: &'static blaze_own::Heap) -> HeadsScopeRecords<'r, 's, 'l> {
         let mut preopened = SVec::with_capacity_in(crates, heap.shared());
         preopened.extend(cache.slots.iter().map(|slot| slot.map(|(_, records)| records)));
-        HeadsScopeRecords { preopened, lazy: crate::front_load::ScopeRecords::new(snapshot, crates, heap) }
+        HeadsScopeRecords { preopened, lazy }
     }
 }
 
-impl crate::front_load::OpenByNeed for HeadsScopeRecords<'_, '_> {
+fn by_need_delta(after: crate::front_load::ByNeedCounts, before: crate::front_load::ByNeedCounts) -> crate::front_load::ByNeedCounts {
+    crate::front_load::ByNeedCounts {
+        asks: after.asks.saturating_sub(before.asks),
+        opened: after.opened.saturating_sub(before.opened),
+        bytes: after.bytes.saturating_sub(before.bytes),
+    }
+}
+
+impl crate::front_load::OpenByNeed for HeadsScopeRecords<'_, '_, '_> {
     fn open<'s>(&'s self, one: &crate::front_load::Unopened) -> Result<crate::front_load::CrateRecords<'s>, &'static str> {
         if let Some(Some(records)) = self.preopened.get(one.world_at) {
             return Ok(*records);
@@ -361,7 +375,7 @@ fn scope_by_need_heads<'r>(
                 Err(crate::engine_bodies::ScopeRefusal::CheckScope { error }) => return Ok(Err(crate::engine_bodies::ScopeRefusal::CheckScope { error })),
             }
         } else {
-            match cache.unopened_of(snapshot, names, list, one, g)? {
+            match cache.unopened_of(snapshot, names, list, one, read.unreadable(), g)? {
                 Ok(unopened) => {
                     scope.push(unopened.input.name);
                     rest.push(unopened);
@@ -512,7 +526,7 @@ impl HeadsStage {
 
     /// The Heads phase: every task entered once, its result in `buffer`, its tables on `shelf`.
     #[expect(clippy::too_many_arguments, reason = "a phase's edge: each argument one handle of it")]
-    pub(crate) fn run_phase<'a, 'r>(
+    pub(crate) fn run_phase<'a, 'r, 'l>(
         &mut self,
         cx: &Cx,
         store: &mut dyn crate::store::Store<'r>,
@@ -526,11 +540,15 @@ impl HeadsStage {
         times: &mut crate::engine_times::Times,
         alloc: SharedAlloc<'a>,
         frame: &Frame,
+        heads_snap: &'l core::cell::OnceCell<crate::store::SharedSnapshot>,
+        heads_lazy: &mut Option<crate::front_load::ScopeRecords<'l>>,
     ) -> Result<(), CliError> {
         let cx = cx.span("engine: the heads phase");
         let snapshot_owner = store.snapshot()?.ok_or(CliError::Text { what: "the Heads stage needs a committed store snapshot for expansion text (engine_heads.rs)" })?;
         let snapshot = snapshot_owner.as_ref();
-        // The request's crate listings, read by key from this phase's committed records.
+        // Reuse one immutable post-Names snapshot across all Heads waves so non-member scope
+        // records (`core`, `alloc`, `std`, deps) open and validate at most once per request.
+        let lazy_snap = heads_snap.get_or_init(|| blaze_own::Share::share(&snapshot_owner));
         let _ = self.listings(handles.env.heap, Some(&snapshot_owner), handles.tool);
         // The per-item head tasks first ([`HeadsStage::run_items`]), then the crates' tables.
         // Closed-dep impl tables (`!member` with no member in scope) depend only on earlier Names
@@ -592,7 +610,7 @@ impl HeadsStage {
                 }
             }
         }
-        let closed_worked = self.run_items(&cx, store, read, handles, kept, &items, view, buffer, times, alloc, frame, snapshot, &snapshot_owner, &mut scope_cache, &closed_jobs, at_cells)?;
+        let closed_worked = self.run_items(&cx, store, read, handles, kept, &items, view, buffer, times, alloc, frame, snapshot, &snapshot_owner, &mut scope_cache, &closed_jobs, at_cells, lazy_snap.as_ref(), heads_lazy)?;
         if tasks.is_empty() {
             return Ok(());
         }
@@ -701,7 +719,9 @@ impl HeadsStage {
             false => SVec::new_in(heap.shared()),
         };
         let subjects = &subjects[..];
-        let scope_records = HeadsScopeRecords::new(cache, snapshot, CrateGraph::len(&list), heap);
+        let lazy = heads_lazy.get_or_insert_with(|| crate::front_load::ScopeRecords::new(lazy_snap.as_ref(), CrateGraph::len(&list), heap));
+        let lazy_before = lazy.counts();
+        let scope_records = HeadsScopeRecords::new(cache, lazy, CrateGraph::len(&list), heap);
         let scope_records = &scope_records;
         // 2. The tables, at once, on the workers.
         let procs = names.stage().names.as_ref().and_then(|names| names.procs());
@@ -735,6 +755,7 @@ impl HeadsStage {
                 }
             }
             scope.join(&cx).map_err(CliError::Pool)?;
+            read.add_by_need(by_need_delta(lazy.counts(), lazy_before));
             if let Some(error) = stopped {
                 return Err(CliError::Pool(error));
             }
@@ -1503,7 +1524,8 @@ pub(crate) fn outline_head_source(outline: &blaze_file_items::Outline<'_>, at: I
         let anc = outline.item(idx);
         for attr in outline.attrs(anc) {
             if matches!(attr.kind, AttrKind::Cfg | AttrKind::CfgAttr) {
-                h.update(&[1, u8::from(attr.kind == AttrKind::CfgAttr)]).part(anc.text(text, attr.range).as_bytes());
+                h.update(&[1, u8::from(attr.kind == AttrKind::CfgAttr)]);
+                crate::engine_plan_cfg::hash_cfg_tokens(&mut h, anc.text(text, attr.range));
             }
         }
         parent = anc.parent;
@@ -1512,7 +1534,8 @@ pub(crate) fn outline_head_source(outline: &blaze_file_items::Outline<'_>, at: I
         if matches!(attr.kind, AttrKind::Cfg | AttrKind::CfgAttr)
             && let Some(written) = text.get(attr.range.to_usize())
         {
-            h.update(&[2, u8::from(attr.kind == AttrKind::CfgAttr)]).part(written.as_bytes());
+            h.update(&[2, u8::from(attr.kind == AttrKind::CfgAttr)]);
+            crate::engine_plan_cfg::hash_cfg_tokens(&mut h, written);
         }
     }
     h.finish()
@@ -1523,9 +1546,12 @@ pub(crate) fn outline_head_source(outline: &blaze_file_items::Outline<'_>, at: I
 /// `signature_name`: the file and the entry's chain), so its name and key are known from text
 /// before any phase runs. Its source is the persisted signature part ([`outline_head_source`])
 /// and the edition.
-pub(crate) fn plan_items<'h>(outlined: &[Outlined<'_>], alloc: SharedAlloc<'h>) -> SVec<'h, Planned> {
+pub(crate) fn plan_items<'h>(outlined: &[Outlined<'_>], external: &[Name], alloc: SharedAlloc<'h>) -> SVec<'h, Planned> {
     let mut planned = SVec::new_in(alloc);
     for one in outlined.iter() {
+        if external.binary_search(&one.name).is_ok() {
+            continue;
+        }
         let Ok(record) = &one.made else { continue };
         for part in record.parts.iter() {
             let (Kind::Signature, Locate::Source(head)) = (part.name.kind, part.locate) else { continue };
@@ -2930,7 +2956,7 @@ impl HeadsStage {
     /// `buffer`. Overlaps any closed-dep `ImplBucket` jobs (`closed_jobs`) onto the same worker
     /// scope so closed-dep impl tables execute concurrently with `HeadsSetup` and `HeadsSplit`.
     #[expect(clippy::too_many_arguments, reason = "a phase's edge: each argument one handle of it")]
-    fn run_items<'a, 'r>(
+    fn run_items<'a, 'r, 'l>(
         &mut self,
         cx: &Cx,
         store: &mut dyn crate::store::Store<'r>,
@@ -2948,6 +2974,8 @@ impl HeadsStage {
         scope_cache: &mut Option<HeadsScopeCache<'r>>,
         closed_jobs: &[(usize, Job<'r>)],
         at_cells: bool,
+        lazy_snap: &'l crate::store::StoreSnapshot,
+        heads_lazy: &mut Option<crate::front_load::ScopeRecords<'l>>,
     ) -> Result<Vec<ClosedWorked, Alloc<'static>>, CliError> {
         let heap = handles.env.heap;
         let g = heap.alloc();
@@ -3283,7 +3311,9 @@ impl HeadsStage {
                 subjects.sort_unstable();
             }
         }
-        let scope_records = HeadsScopeRecords::new(cache, snapshot, CrateGraph::len(&list), heap);
+        let lazy = heads_lazy.get_or_insert_with(|| crate::front_load::ScopeRecords::new(lazy_snap, CrateGraph::len(&list), heap));
+        let lazy_before = lazy.counts();
+        let scope_records = HeadsScopeRecords::new(cache, lazy, CrateGraph::len(&list), heap);
         let scope_records = &scope_records;
         // Group the tasks of each file before choosing whole-file cuts.
         for job in jobs.iter_mut() {
@@ -3438,6 +3468,7 @@ impl HeadsStage {
                 }
             }
             scope.join(cx).map_err(CliError::Pool)?;
+            read.add_by_need(by_need_delta(lazy.counts(), lazy_before));
             if let Some(error) = stopped {
                 return Err(CliError::Pool(error));
             }

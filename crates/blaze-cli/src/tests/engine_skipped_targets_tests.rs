@@ -19,6 +19,6 @@ fn skipped_target_has_no_body_task() {
         edition: 3,
         made: Ok(record),
     }];
-    assert!(crate::engine_bodies::plan_views::<blaze_drive::view::Production>(&outlined, &[file], None, alloc).is_empty());
-    assert_eq!(crate::engine_bodies::plan_views::<blaze_drive::view::Production>(&outlined, &[], None, alloc).len(), 1);
+    assert!(crate::engine_bodies::plan_views::<blaze_drive::view::Production>(&outlined, &[file], &[], None, alloc).is_empty());
+    assert_eq!(crate::engine_bodies::plan_views::<blaze_drive::view::Production>(&outlined, &[], &[], None, alloc).len(), 1);
 }

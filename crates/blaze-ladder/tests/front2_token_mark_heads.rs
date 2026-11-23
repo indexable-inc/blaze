@@ -166,12 +166,16 @@ fn token_mark_heads() {
             failed.push(format!("{name}: the program holds {} fns of that name", keys.len()));
             continue;
         };
-        match (store.ensure(&names, &mut front.keys, Want::Fn(*key)), must_make) {
-            (Ok(()), true) => said.push(format!("{name}: made")),
-            (Err(HeadError::Item(_, Why::Resolve(..))), false) => said.push(format!("{name}: Resolve (the control)")),
-            (Ok(()), false) => failed.push(format!("{name}: THE CONTROL's head was made: a `macro_rules!` item's `Hidden` was found at the macro's module")),
-            (Err(e), true) => failed.push(format!("{name}: no head: {e:?}")),
-            (Err(e), false) => failed.push(format!("{name}: refused, but not as a path not found: {e:?}")),
+        let res = store.ensure(&names, &mut front.keys, Want::Fn(*key));
+        let misses = store.type_misses.get(&checker_of(*key)).map_or(&[][..], |m| &m[..]);
+        match (res, must_make, misses.is_empty()) {
+            (Ok(()), true, true) => said.push(format!("{name}: made")),
+            (Ok(()), true, false) => failed.push(format!("{name}: head had unresolved type misses: {misses:?}")),
+            (Err(HeadError::Item(_, Why::Resolve(..))), false, _) => said.push(format!("{name}: Resolve (the control)")),
+            (Ok(()), false, false) => said.push(format!("{name}: type miss (the control)")),
+            (Ok(()), false, true) => failed.push(format!("{name}: THE CONTROL's head was made cleanly: a `macro_rules!` item's `Hidden` was found at the macro's module")),
+            (Err(e), true, _) => failed.push(format!("{name}: no head: {e:?}")),
+            (Err(e), false, _) => failed.push(format!("{name}: refused, but not as a path not found: {e:?}")),
         }
     }
     assert!(failed.is_empty(), "heads that did not say what they must: {failed:?} (said: {said:?})");

@@ -37,6 +37,8 @@ pub enum AdjustKind {
     UnionInject { variant: u32 },
     /// Sub-union widening (`A | B -> A | B | C`).
     UnionWiden,
+    /// Structural record width-subtyping projection (`{ a, b } -> { a }`).
+    RecordProject,
 }
 
 /// How a pattern binds or narrows a structural union (`PNode::Union`).
@@ -234,6 +236,9 @@ pub struct Checked<'a> {
     /// What the unsafety check could not decide (rules/unsafety.rs `Undecided`), sorted by
     /// place: no type error and no pass; the command files each as "not checked" (rule 3).
     pub undecided: Vec<crate::rules::unsafety::Undecided, Alloc<'a>>,
+    /// When the owner's return signature wrote one or more `_` placeholders (`-> _`,
+    /// `-> Option<_>`, `-> Result<T, _>`), the concrete finalized return type in `types`.
+    pub inferred_output: Option<PTy>,
 }
 
 /// Two two-column tables are equal column by column.
@@ -403,6 +408,7 @@ impl<'a> Checked<'a> {
             && self.index_mut == other.index_mut
             && self.findings == other.findings
             && self.undecided == other.undecided
+            && self.inferred_output == other.inferred_output
     }
 }
 
@@ -443,6 +449,7 @@ impl<'a> core::fmt::Debug for Checked<'a> {
             .field("index_mut", &self.index_mut)
             .field("findings", &self.findings)
             .field("undecided", &self.undecided)
+            .field("inferred_output", &self.inferred_output)
             .field("reads", &self.reads)
             .field("needs", &self.needs)
             .finish()

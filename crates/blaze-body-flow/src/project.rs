@@ -251,7 +251,7 @@ pub fn project<A: Allocator + Copy>(body: Verified<'_>, alloc: A) -> Result<Proj
         let row = body.place(bd::Place(i));
         let p = match (row.parent, row.proj) {
             (Some(up), Some(proj)) => {
-                let parent = fl::Place(flow_place[up.index()]);
+                let parent = fl::Place(flow_place.get(up.index()).copied().unwrap_or(NONE));
                 let proj = match proj {
                     Proj::Field { index, .. } => fl::Proj::Field(index),
                     Proj::Deref => fl::Proj::Deref,
@@ -266,7 +266,9 @@ pub fn project<A: Allocator + Copy>(body: Verified<'_>, alloc: A) -> Result<Proj
             }
             _ => b.local(row.local.0),
         };
-        flow_place[i as usize] = p.0;
+        if let Some(slot) = flow_place.get_mut(i as usize) {
+            *slot = p.0;
+        }
     }
 
     // Blocks: every normal block in id order, so the body's entry is the flow's.
@@ -279,7 +281,9 @@ pub fn project<A: Allocator + Copy>(body: Verified<'_>, alloc: A) -> Result<Proj
         cleanup.push(kind == BlockKind::Cleanup);
         match kind {
             BlockKind::Normal => {
-                flow_block[x as usize] = b.block().0;
+                if let Some(slot) = flow_block.get_mut(x as usize) {
+                    *slot = b.block().0;
+                }
                 body_block.push(x);
             }
             BlockKind::Cleanup => left_out.push(bd::Block(x)),
@@ -290,7 +294,7 @@ pub fn project<A: Allocator + Copy>(body: Verified<'_>, alloc: A) -> Result<Proj
     let mut flow_loan = filled(body.loans() as usize, alloc);
     let mut body_loan = Vec::new_in(alloc);
     for s in 0..body.stmts() {
-        if cleanup[body.block_of(bd::Stmt(s)).index()] {
+        if cleanup.get(body.block_of(bd::Stmt(s)).index()).copied().unwrap_or(false) {
             continue;
         }
         if let StmtKind::Assign { value: Value::Borrow { loan, .. }, .. } = body.stmt(bd::Stmt(s)).kind {
@@ -328,12 +332,14 @@ pub fn project<A: Allocator + Copy>(body: Verified<'_>, alloc: A) -> Result<Proj
         let row = bd::Stmt(s);
         e.skip_subsets(row)?;
         let blk = body.block_of(row);
-        if e.cleanup[blk.index()] {
+        if e.cleanup.get(blk.index()).copied().unwrap_or(false) {
             s += 1;
             continue;
         }
-        if body.block(blk).stmts.start == s {
-            e.b.start(fl::Block(e.flow_block[blk.index()]));
+        if body.block(blk).stmts.start == s
+            && let Some(&fb) = e.flow_block.get(blk.index())
+        {
+            e.b.start(fl::Block(fb));
         }
         s += e.row(row)?;
     }
@@ -387,7 +393,7 @@ struct Emit<'v, A: Allocator + Copy> {
 
 impl<A: Allocator + Copy> Emit<'_, A> {
     fn place(&self, p: bd::Place) -> fl::Place {
-        fl::Place(self.flow_place[p.index()])
+        fl::Place(self.flow_place.get(p.index()).copied().unwrap_or(NONE))
     }
 
     fn op(&self, o: Operand) -> fl::Operand {
@@ -421,7 +427,9 @@ impl<A: Allocator + Copy> Emit<'_, A> {
     /// Records that the next flow statement is row `row`'s own: the one its findings name.
     fn primary(&mut self, row: bd::Stmt) -> fl::Stmt {
         let s = self.body_stmt.len() as u32;
-        self.flow_stmt[row.index()] = s;
+        if let Some(slot) = self.flow_stmt.get_mut(row.index()) {
+            *slot = s;
+        }
         self.body_stmt.push(row.0);
         fl::Stmt(s)
     }
@@ -438,7 +446,7 @@ impl<A: Allocator + Copy> Emit<'_, A> {
             if sub.at >= row {
                 break;
             }
-            if !self.cleanup[self.body.block_of(sub.at).index()] {
+            if !self.cleanup.get(self.body.block_of(sub.at).index()).copied().unwrap_or(false) {
                 return Err(ProjectError::SubsetOrder { at: sub.at });
             }
             self.sub_at += 1;
@@ -687,7 +695,11 @@ impl<A: Allocator + Copy> Emit<'_, A> {
                 let on = self.place(p);
                 self.switch(row, on, cases, otherwise, sp)?;
                 self.subsets_at(row);
-                self.flow_stmt[next.index()] = self.flow_stmt[row.index()];
+                if let Some(&mapped) = self.flow_stmt.get(row.index())
+                    && let Some(slot) = self.flow_stmt.get_mut(next.index())
+                {
+                    *slot = mapped;
+                }
                 self.subsets_at(next);
                 return Ok(2);
             }

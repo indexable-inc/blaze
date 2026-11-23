@@ -19,7 +19,7 @@
 use crate::columns::AdjustKind;
 use crate::diag::{At, DiagCode, PendingDiag, PendingGoal};
 use crate::error::{CheckError, Malformed, Stop};
-use crate::ids::{ExprId, FnPtrHeader, ItemKey, LangItem, Mutbl, Safety};
+use crate::ids::{ExprId, FnPtrHeader, ItemKey, LangItem, Mutbl, RecordSchema, Safety};
 use crate::machine::Machine;
 use crate::ty::{Cause, Goal, Ty, TyList, TyView, TypeCtx};
 use crate::world::World;
@@ -45,9 +45,13 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             if let Some(e) = e {
                 self.adjust.push((e, AdjustKind::NeverToAny, b));
             }
-            if self.is_ty_var(b) {
+            if self.is_ty_var(b) && self.active_inferred_err_var() != Some(b) {
                 self.diverging.push(b);
             }
+            return Ok(true);
+        }
+        if self.active_inferred_err_var() == Some(b) {
+            self.inferred_err_coercions.push((e, a));
             return Ok(true);
         }
         if self.is_ty_var(a) {
@@ -161,6 +165,12 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
                 }
                 self.adj_scratch.push((AdjustKind::UnsafeFnPointer, b));
                 Ok(Some(()))
+            }
+            // Width-subtyping projection of structural records: `{ a, b, .. } -> { a }`.
+            (TyView::Record(src_schema, src_tys), TyView::Record(dst_schema, dst_tys))
+                if src_schema != dst_schema && self.ty.list_len(src_tys) > self.ty.list_len(dst_tys) =>
+            {
+                self.coerce_record_project(b, src_schema, src_tys, dst_schema, dst_tys)
             }
             _ => self.unify_some(a, b),
         }
@@ -495,6 +505,55 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
                 self.adj_scratch.push((AdjustKind::UnionInject { variant }, b));
                 return Ok(Some(()));
             }
+        }
+        Ok(None)
+    }
+
+    /// Structural record width-subtyping projection: `{ a, b, .. } -> { a }` when every field
+    /// name of `dst_schema` exists in `src_schema` and its field types unify.
+    fn coerce_record_project(
+        &mut self,
+        b: Ty,
+        src_schema: RecordSchema,
+        src_tys: TyList,
+        dst_schema: RecordSchema,
+        dst_tys: TyList,
+    ) -> Result<Option<()>, Stop> {
+        let src_len = self.ty.list_len(src_tys);
+        let dst_len = self.ty.list_len(dst_tys);
+        if src_len <= dst_len {
+            return Ok(None);
+        }
+        let mut pairs: blaze_own::Vec<(Ty, Ty), _> =
+            blaze_own::Vec::with_capacity_in(usize::try_from(dst_len).unwrap_or(0), self.alloc);
+        {
+            let Some(src_names) = self.record_names(src_schema) else { return Ok(None) };
+            let Some(dst_names) = self.record_names(dst_schema) else { return Ok(None) };
+            if src_names.len() != usize::try_from(src_len).unwrap_or(usize::MAX)
+                || dst_names.len() != usize::try_from(dst_len).unwrap_or(usize::MAX)
+            {
+                return Ok(None);
+            }
+            for (di, &nm) in dst_names.iter().enumerate() {
+                let Some(si) = src_names.iter().position(|&sn| sn == nm) else {
+                    return Ok(None);
+                };
+                let Ok(si_u32) = u32::try_from(si) else { return Ok(None) };
+                let Ok(di_u32) = u32::try_from(di) else { return Ok(None) };
+                pairs.push((self.ty.list_get(src_tys, si_u32), self.ty.list_get(dst_tys, di_u32)));
+            }
+        }
+        let projected = self.commit_if(|m| -> Result<Option<()>, Stop> {
+            for &(st, dt) in pairs.iter() {
+                if !m.unify(st, dt)? {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(()))
+        })?;
+        if projected.is_some() {
+            self.adj_scratch.push((AdjustKind::RecordProject, b));
+            return Ok(Some(()));
         }
         Ok(None)
     }

@@ -73,9 +73,90 @@ pub(crate) fn language_clone<P: FrontEnd>(program: &P, called: Instance, ground:
     let &[me] = view.list(called.args).ok()? else { return None };
     match view.node(me).ok()? {
         PNode::FnDef(..) | PNode::FnPtr(..) => Some(LanguageClone { clone, bytes: true }),
-        PNode::Tuple(_) | PNode::Record(..) | PNode::Closure { .. } => Some(LanguageClone { clone, bytes: false }),
+        PNode::Tuple(_) | PNode::Record(..) | PNode::Union(_) | PNode::Closure { .. } | PNode::Adt(..) => {
+            Some(LanguageClone { clone, bytes: false })
+        }
         _ => None,
     }
+}
+
+/// Builtin `Clone::clone` for types that can never have a user-written `impl Clone` (checked
+/// before `FrontEnd::resolve`). `PNode::Adt` is intentionally excluded here so an explicit
+/// `impl Clone for S` always wins via `resolve`; see [`language_clone_adt`].
+pub(crate) fn language_clone_unconditional<P: FrontEnd>(program: &P, called: Instance, ground: &PortableTys<'_>) -> Option<LanguageClone> {
+    let clone = program.lang_trait_fn(LangItem::Clone, "clone")?;
+    if called.item != clone {
+        return None;
+    }
+    let view = ground.view();
+    let &[me] = view.list(called.args).ok()? else { return None };
+    match view.node(me).ok()? {
+        PNode::FnDef(..) | PNode::FnPtr(..) => Some(LanguageClone { clone, bytes: true }),
+        PNode::Tuple(_) | PNode::Record(..) | PNode::Union(_) | PNode::Closure { .. } => Some(LanguageClone { clone, bytes: false }),
+        _ => None,
+    }
+}
+
+/// Builtin `Clone::clone` fallback for a Blaze-edition `AUTO_COPY_PUB` struct after
+/// `FrontEnd::resolve` returned `ResolveError::NoImpl`: confirms `Self: Clone` holds via the
+/// solver before synthesizing the shim.
+pub(crate) fn language_clone_adt<P: FrontEnd>(
+    program: &P,
+    caller: usize,
+    called: Instance,
+    trait_: ItemKey,
+    ground: &mut PortableTys<'_>,
+) -> Result<Option<LanguageClone>, ResolveError> {
+    let Some(clone) = program.lang_trait_fn(LangItem::Clone, "clone") else {
+        return Ok(None);
+    };
+    if called.item != clone {
+        return Ok(None);
+    }
+    let me = {
+        let view = ground.view();
+        let Ok(&[me]) = view.list(called.args) else { return Ok(None) };
+        let Ok(PNode::Adt(..)) = view.node(me) else { return Ok(None) };
+        me
+    };
+    if program.holds(caller, trait_, me, ground)? {
+        Ok(Some(LanguageClone { clone, bytes: false }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Builtin `From::from` for structural error unions (`Self = A | B`, `T = A` or strict sub-union).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LanguageFrom {
+    /// The lang trait's `from`.
+    pub from: ItemKey,
+}
+
+/// Recognizes a call to `From::from` where `Self` is a structural union `Dst` and `T` is a strict
+/// member or strict sub-union of `Dst` (`Src != Dst`).
+pub(crate) fn language_from<P: FrontEnd>(program: &P, called: Instance, ground: &PortableTys<'_>) -> Option<LanguageFrom> {
+    let from = program.lang_trait_fn(LangItem::From, "from")?;
+    if called.item != from {
+        return None;
+    }
+    let view = ground.view();
+    let &[dst, src] = view.list(called.args).ok()? else { return None };
+    if dst == src {
+        return None;
+    }
+    let PNode::Union(dst_l) = view.node(dst).ok()? else { return None };
+    let dst_members = view.list(dst_l).ok()?;
+    let ok = match view.node(src).ok()? {
+        PNode::Union(src_l) => {
+            let src_members = view.list(src_l).ok()?;
+            !src_members.is_empty()
+                && src_members.len() < dst_members.len()
+                && src_members.iter().all(|sm| dst_members.iter().any(|dm| dm == sm))
+        }
+        _ => dst_members.iter().any(|&dm| dm == src),
+    };
+    ok.then_some(LanguageFrom { from })
 }
 
 /// Why a builtin clone's `Self: Copy` has no answer: the solver's (a record it could not make),
@@ -116,7 +197,8 @@ impl Clones {
         })
     }
 
-    /// `called` as a builtin `clone` (module doc); `None` for any other call.
+    /// `called` as a builtin `clone` (module doc), including `AUTO_COPY_PUB` ADTs (used once
+    /// an instance has already been declared as the trait's `clone`); `None` for any other call.
     pub(crate) fn shim_of(&self, called: Instance, ground: &PortableTys<'_>) -> Option<CloneShim> {
         let clone = self.clone?;
         if called.item != clone {
@@ -125,7 +207,24 @@ impl Clones {
         let view = ground.view();
         let &[me] = view.list(called.args).ok()? else { return None };
         match view.node(me).ok()? {
-            PNode::Tuple(_) | PNode::Record(..) | PNode::Closure { .. } | PNode::FnDef(..) | PNode::FnPtr(..) => Some(CloneShim { clone, me }),
+            PNode::Tuple(_) | PNode::Record(..) | PNode::Union(_) | PNode::Closure { .. } | PNode::FnDef(..) | PNode::FnPtr(..) | PNode::Adt(..) => {
+                Some(CloneShim { clone, me })
+            }
+            _ => None,
+        }
+    }
+
+    /// Like [`Clones::shim_of`] excluding `PNode::Adt`, checked before `FrontEnd::resolve` so an
+    /// explicit `impl Clone for S` always takes precedence.
+    pub(crate) fn shim_of_non_adt(&self, called: Instance, ground: &PortableTys<'_>) -> Option<CloneShim> {
+        let clone = self.clone?;
+        if called.item != clone {
+            return None;
+        }
+        let view = ground.view();
+        let &[me] = view.list(called.args).ok()? else { return None };
+        match view.node(me).ok()? {
+            PNode::Tuple(_) | PNode::Record(..) | PNode::Union(_) | PNode::Closure { .. } | PNode::FnDef(..) | PNode::FnPtr(..) => Some(CloneShim { clone, me }),
             _ => None,
         }
     }
@@ -144,6 +243,55 @@ impl Clones {
     ) -> Option<Result<usize, NoteError>> {
         let shim = self.shim_of(called, ground)?;
         let c = program.fn_index(shim.clone)?;
+        Some(self.note(program, facts, caller, shim, ground, alloc).map(|()| c))
+    }
+
+    /// [`Clones::owner`] for non-ADT types that never have user-written `impl Clone`.
+    pub(crate) fn owner_non_adt<P: FrontEnd>(
+        &self,
+        program: &P,
+        facts: &dyn LayoutFacts,
+        caller: usize,
+        called: Instance,
+        ground: &mut PortableTys<'_>,
+        alloc: Alloc<'_>,
+    ) -> Option<Result<usize, NoteError>> {
+        let shim = self.shim_of_non_adt(called, ground)?;
+        let c = program.fn_index(shim.clone)?;
+        Some(self.note(program, facts, caller, shim, ground, alloc).map(|()| c))
+    }
+
+    /// Fallback after `FrontEnd::resolve` returned `ResolveError::NoImpl`: if `called` is
+    /// `Clone::clone` for an `AUTO_COPY_PUB` `PNode::Adt` where `Self: Clone` holds, notes
+    /// `Self: Copy` and returns the trait's `clone` row.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn owner_adt<P: FrontEnd>(
+        &self,
+        program: &P,
+        facts: &dyn LayoutFacts,
+        caller: usize,
+        called: Instance,
+        trait_: ItemKey,
+        ground: &mut PortableTys<'_>,
+        alloc: Alloc<'_>,
+    ) -> Option<Result<usize, NoteError>> {
+        let clone = self.clone?;
+        if called.item != clone {
+            return None;
+        }
+        let me = {
+            let view = ground.view();
+            let &[me] = view.list(called.args).ok()? else { return None };
+            let PNode::Adt(..) = view.node(me).ok()? else { return None };
+            me
+        };
+        match program.holds(caller, trait_, me, ground) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(e) => return Some(Err(NoteError::Resolve(e))),
+        }
+        let c = program.fn_index(clone)?;
+        let shim = CloneShim { clone, me };
         Some(self.note(program, facts, caller, shim, ground, alloc).map(|()| c))
     }
 
@@ -217,5 +365,261 @@ impl Clones {
             }
             _ => ground.intern_list(&[shim.me]).map_err(full),
         }
+    }
+}
+
+#[cfg(test)]
+mod auto_copy_pub_tests {
+    use crate::refusal::SourceFile;
+    use crate::run::{FrontChoice, NewFront, run_with};
+
+    const BLAZE: NewFront<'static> = NewFront {
+        package: "ladder",
+        edition: "blaze-2026.11",
+        shelf: None,
+        overflow: blaze_build::OverflowChecks::Off,
+    };
+
+    const RUST2024: NewFront<'static> = NewFront {
+        package: "ladder",
+        edition: "2024",
+        shelf: None,
+        overflow: blaze_build::OverflowChecks::Off,
+    };
+
+    const PRELUDE: &str = "#![feature(no_core, lang_items, negative_impls)]
+#![no_core]
+#![no_main]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"copy\"]
+trait Copy: Clone {}
+
+#[lang = \"clone\"]
+trait Clone {
+    fn clone(&self) -> Self;
+}
+
+#[lang = \"drop\"]
+trait Drop {
+    fn drop(&mut self);
+}
+
+impl Copy for i32 {}
+impl Clone for i32 {
+    fn clone(&self) -> Self { *self }
+}
+
+impl Copy for u32 {}
+impl Clone for u32 {
+    fn clone(&self) -> Self { *self }
+}
+";
+
+    fn run_edition(front: NewFront<'static>, body: &str) -> Result<u8, blaze_own::String<blaze_own::Alloc<'static>>> {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut text = blaze_own::String::with_capacity_in(PRELUDE.len() + body.len(), alloc);
+        text.push_str(PRELUDE);
+        text.push_str(body);
+        let files = [SourceFile { path: "src/main.rs", text: text.as_str() }];
+        run_with(&files, "src/main.rs", None, FrontChoice::New(front), blaze_own::testing::heap().shared()).map_err(|e| {
+            use core::fmt::Write as _;
+            let mut s = blaze_own::String::new_in(alloc);
+            let _ = write!(s, "{e}");
+            s
+        })
+    }
+
+    #[test]
+    fn blaze_all_pub_structs_auto_copy_and_clone_run() {
+        let got = run_edition(
+            BLAZE,
+            "
+pub struct Pos { pub x: i32, pub y: i32 }
+pub struct Health(pub u32);
+pub struct Alive;
+pub struct Pair<T> { pub a: T, pub b: T }
+
+fn sum_pos(p: Pos) -> i32 { p.x + p.y }
+fn take_alive(_a: Alive) -> i32 { 1 }
+fn dup<T: Clone>(x: &T) -> T { x.clone() }
+fn use_copy<T: Copy>(x: T) -> (T, T) { (x, x) }
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let p = Pos { x: 10, y: 20 };
+    let (p1, p2) = use_copy(p);
+    let p3 = dup(&p);
+    let h = Health(7);
+    let h2 = h.clone();
+    let a = Alive;
+    let a_sum = take_alive(a) + take_alive(a) + take_alive(a.clone());
+    let pair = Pair { a: 2, b: 3 };
+    let pair2 = pair;
+    let pair3 = pair.clone();
+    sum_pos(p1) + sum_pos(p2) + sum_pos(p3) + (h.0 + h2.0) as i32 + a_sum + pair2.a + pair2.b + pair3.a + pair3.b
+}
+",
+        );
+        // 30 + 30 + 30 + 14 + 3 + 5 + 5 = 117
+        assert_eq!(got, Ok(117));
+    }
+
+    #[test]
+    fn blaze_non_copy_clone_struct_synthesizes_field_clone() {
+        let got = run_edition(
+            BLAZE,
+            "
+struct Custom { v: i32 }
+impl Clone for Custom {
+    fn clone(&self) -> Self { Custom { v: self.v + 5 } }
+}
+
+pub struct Wrapper {
+    pub tag: i32,
+    pub inner: Custom,
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let w = Wrapper { tag: 10, inner: Custom { v: 7 } };
+    let w2 = w.clone();
+    w.tag + w.inner.v + w2.tag + w2.inner.v
+}
+",
+        );
+        // 10 + 7 + 10 + 12 = 39
+        assert_eq!(got, Ok(39));
+    }
+
+    #[test]
+    fn blaze_explicit_impl_clone_wins_without_ambiguity() {
+        let got = run_edition(
+            BLAZE,
+            "
+pub struct Pos { pub x: i32, pub y: i32 }
+impl Clone for Pos {
+    fn clone(&self) -> Self { Pos { x: self.x + 100, y: self.y } }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let p = Pos { x: 3, y: 4 };
+    let q = p.clone();
+    q.x + q.y
+}
+",
+        );
+        assert_eq!(got, Ok(107));
+    }
+
+    #[test]
+    fn blaze_negative_impl_copy_rejects_copy_while_keeping_clone() {
+        let copy_res = run_edition(
+            BLAZE,
+            "
+pub struct BigBuf { pub x: i32 }
+impl !Copy for BigBuf {}
+fn need_copy<T: Copy>(x: T) -> T { x }
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let b = BigBuf { x: 1 };
+    need_copy(b).x
+}
+",
+        );
+        assert!(copy_res.is_err(), "BigBuf with impl !Copy must not satisfy Copy");
+
+        let clone_res = run_edition(
+            BLAZE,
+            "
+pub struct BigBuf { pub x: i32 }
+impl !Copy for BigBuf {}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let b = BigBuf { x: 42 };
+    let c = b.clone();
+    b.x + c.x
+}
+",
+        );
+        assert_eq!(clone_res, Ok(84));
+    }
+
+    #[test]
+    fn blaze_private_field_private_unit_and_drop_stay_move_only() {
+        let priv_field = run_edition(
+            BLAZE,
+            "
+pub struct Mixed { pub x: i32, secret: i32 }
+fn need_copy<T: Copy>(x: T) -> T { x }
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    need_copy(Mixed { x: 1, secret: 2 }).x
+}
+",
+        );
+        assert!(priv_field.is_err(), "struct with private field must not be auto-Copy");
+
+        let priv_tuple = run_edition(
+            BLAZE,
+            "
+pub struct Handle(u32);
+fn need_copy<T: Copy>(x: T) -> T { x }
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    need_copy(Handle(1)).0 as i32
+}
+",
+        );
+        assert!(priv_tuple.is_err(), "tuple struct with private field must not be auto-Copy");
+
+        let priv_unit = run_edition(
+            BLAZE,
+            "
+struct SecretToken;
+fn need_copy<T: Copy>(x: T) -> T { x }
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let _ = need_copy(SecretToken);
+    0
+}
+",
+        );
+        assert!(priv_unit.is_err(), "private unit struct must not be auto-Copy");
+
+        let has_drop = run_edition(
+            BLAZE,
+            "
+pub struct Guard { pub x: i32 }
+impl Drop for Guard { fn drop(&mut self) {} }
+fn need_copy<T: Copy>(x: T) -> T { x }
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    need_copy(Guard { x: 1 }).x
+}
+",
+        );
+        assert!(has_drop.is_err(), "struct with Drop must not be auto-Copy");
+    }
+
+    #[test]
+    fn rust_2024_edition_is_unaffected() {
+        let res = run_edition(
+            RUST2024,
+            "
+pub struct Pos { pub x: i32, pub y: i32 }
+fn need_copy<T: Copy>(x: T) -> T { x }
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    need_copy(Pos { x: 1, y: 2 }).x
+}
+",
+        );
+        assert!(res.is_err(), "Rust 2024 structs must NOT get auto-Copy");
     }
 }

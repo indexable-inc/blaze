@@ -177,6 +177,11 @@ pub trait FrontEnd {
     }
     fn sig(&self, i: usize) -> FnSig<'_>;
     fn fn_index(&self, key: ItemKey) -> Option<usize>;
+    /// For a generic `inline for` function at row `i` instantiated at concrete ground `args`
+    /// (in `ground`), returns the tabled monomorphized specialization row if one was built.
+    fn specialized_row(&self, _i: usize, _args: &[PTy], _ground: PTys<'_>) -> Option<usize> {
+        None
+    }
     /// Each soft-float routine's fn in the program's compiler_builtins, found by its exported
     /// name (front2/builtins_shim.rs `find`, INTRINSICS.md 3.5): asked once a run by the record
     /// walk's maker; `alloc` holds the scratch. Default: not looked up, so an `f128` operation
@@ -264,6 +269,10 @@ pub trait FrontEnd {
     fn adt(&self, key: ItemKey) -> Option<Adt<'_>>;
     /// An item's name for messages, where the front end can give it.
     fn item_named(&self, key: ItemKey) -> Option<Box<str>>;
+    /// The item paths `type_name` and the validity assertions print (`blaze_build::Adts::type_names`).
+    fn type_names(&self) -> Option<&dyn blaze_build::type_name::TypeNames> {
+        None
+    }
     /// Why a survey left `key` out of the program (a reached fn whose check failed, an ADT row
     /// not made, a fn with no head or no body): the build's "no ABI", "no ADT row" and "no
     /// callee" refusals of a call or a type naming it then say this cause instead of only the

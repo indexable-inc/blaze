@@ -62,10 +62,11 @@ const CI_ONLY_STEPS: [(&str, &str); 1] = [(
 )];
 
 /// The scripts another job of the workflow calls, each with why it is not a row.
-const CI_ONLY_SCRIPTS: [(&str, &str); 4] = [
+const CI_ONLY_SCRIPTS: [(&str, &str); 5] = [
     ("gate_changes", "the `changes` job: which tier of the workflow runs, from GitHub's comparison of the event's commits (needs GH_TOKEN)"),
     ("gate", "the runner itself, called by the `scripts` job's one gate step"),
     ("toolchain_cut", "the `cargo` job: cuts the pinned toolchain shelf into $HOME/.blaze/v2/toolchain before `cargo test` so tests that open the shelf find it on a fresh runner"),
+    ("ci_test", "the `cargo` job: builds and runs workspace cargo test binaries in parallel with bounded timeouts (no jq/xargs shell glue)"),
     ("sys_imports", "the `cargo` job: it reads blaze-sys's objects compiled for each target, and the gate builds nothing (its selftest is a row)"),
 ];
 

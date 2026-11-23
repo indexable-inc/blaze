@@ -342,6 +342,8 @@ pub struct Front2Program<'n> {
     recipes: Vec<super::coroutine_recipes::RecipeRow, Global>,
     /// The walk's fns by crate (crate index, fns tabled), most first ([`super::reach::by_crate`]).
     reached_by_crate: Vec<(usize, usize), Global>,
+    /// Monomorphized specializations of generic `inline for` functions (`FrontEnd::specialized_row`).
+    inline_for_specs: blaze_own::Vec<super::inline_for::SpecRow, Alloc<'static>>,
 }
 
 /// Where a program's walk starts.
@@ -370,8 +372,18 @@ struct Made<'n> {
 /// each looked up once in [`Front2Program::make`], a refusal stopping the program by the item's
 /// name there, so those answers never meet a lookup that fails. `Clone`: its `clone`, the
 /// builtin clone's (blaze-ladder clone_shim.rs).
-const SEAM_LANGS: [LangItem; 9] =
-    [LangItem::Drop, LangItem::Deref, LangItem::DerefMut, LangItem::Fn, LangItem::FnMut, LangItem::FnOnce, LangItem::Index, LangItem::IndexMut, LangItem::Clone];
+const SEAM_LANGS: [LangItem; 10] = [
+    LangItem::Drop,
+    LangItem::Deref,
+    LangItem::DerefMut,
+    LangItem::Fn,
+    LangItem::FnMut,
+    LangItem::FnOnce,
+    LangItem::Index,
+    LangItem::IndexMut,
+    LangItem::Clone,
+    LangItem::From,
+];
 
 fn lang_of(front: &Front2<'_>, item: LangItem) -> Result<Option<ItemKey>, crate::seam::LangRefusal> {
     match super::langs::find(&front.index, front.resolver, item) {
@@ -392,8 +404,9 @@ impl Front2Program<'_> {
 /// One trait as a trait object sees it (blaze-build's `vtable::ObjectTrait`, owned).
 struct ObjectTable {
     supers: Vec<blaze_build::vtable::ObjectSuper, Global>,
-    /// The pool `supers`' argument spans index (blaze-build's `ObjectTrait::super_args`).
-    super_args: Vec<u32, Global>,
+    /// The portable type table holding `supers`' argument trees (`None` when no supertrait
+    /// carries generic arguments).
+    super_tys: Option<PortableTys<'static>>,
     methods: Vec<blaze_build::vtable::ObjectMethod, Global>,
     shape: ContentId,
 }
@@ -542,34 +555,36 @@ fn object_tables<'n, S: super::source::NamesSource<'n>>(
             let head = r.store.maps.traits.get(&lib).ok_or_else(|| String::from("made, but no head filed under its key"))?;
             let supers_written = r.store.maps.supers.get(&lib).ok_or_else(|| String::from("made, but no supertraits filed under its key"))?;
             let view = r.store.tys.view();
+            let err_super = |sk: ItemKey, detail: core::fmt::Arguments<'_>| format!("its supertrait {}: {detail}", fn_shown(r, sk));
             let mut supers = Vec::with_capacity_in(supers_written.len(), Global);
-            let mut super_args: Vec<u32, Global> = Vec::new_in(Global);
+            let mut super_tys: Option<PortableTys<'static>> = None;
+            let mut copied: Vec<PTy, Global> = Vec::new_in(Global);
             let mut waiting = false;
             for &(s, args) in supers_written.iter() {
                 let sk = checker_of(s);
-                let written = view.list(args).map_err(|e| format!("its supertrait {}'s arguments: {e:?}", fn_shown(r, sk)))?;
+                let written = view.list(args).map_err(|e| err_super(sk, format_args!("arguments: {e:?}")))?;
                 // `Self` is the first argument (always the trait's own `Self`); each one after
-                // it is filed by the position of the trait's own parameter it is (`Self` 0, the
-                // trait's parameters from 1): `FnMut<Args>: FnOnce<Args>` files `[1]`. The
-                // builder composes them down the tree (blaze-build vtable.rs `Shape::of`).
-                let at = super_args.len();
-                for &a in written.iter().skip(1) {
-                    match view.node(a) {
-                        Ok(tc::PNode::Param(i) | tc::PNode::ConstParam(i)) => super_args.push(i),
-                        _ => {
-                            return Err(format!(
-                                "its supertrait {} has an argument that is not one of the trait's own parameters, which a table does not carry yet",
-                                fn_shown(r, sk)
-                            ));
-                        }
+                // it is copied as a portable type tree parameterized over this trait's own
+                // parameters (`Self` 0, its parameters from 1): both bare parameters
+                // (`FnMut<Args>: FnOnce<Args>`) and concrete/compound types
+                // (`Buffer: AsRef<[u8]>`, `Sub<T>: Super<Option<T>>`). The builder composes
+                // them down the tree (blaze-build vtable.rs `Shape::of`).
+                let span = if written.len() > 1 {
+                    let tys = super_tys.get_or_insert_with(|| PortableTys::new_in(r.store.tys.alloc()));
+                    copied.clear();
+                    for &a in written.iter().skip(1) {
+                        let c = tys.copy_from(view, a, None).map_err(|e| err_super(sk, format_args!("argument: {e:?}")))?;
+                        copied.push(c);
                     }
-                }
-                let span = blaze_build::vtable::ArgSpan {
-                    at: u32::try_from(at).map_err(|_| String::from("more supertrait arguments than a table indexes"))?,
-                    len: u32::try_from(super_args.len() - at).map_err(|_| String::from("more supertrait arguments than a table indexes"))?,
+                    if tys.view().nodes().any(|n| matches!(n, tc::PNode::Infer | tc::PNode::Error | tc::PNode::Future(..))) {
+                        return Err(err_super(sk, format_args!("non-portable argument type")));
+                    }
+                    tys.intern_list(&copied).map_err(|e| err_super(sk, format_args!("arguments: {e:?}")))?
+                } else {
+                    List::EMPTY
                 };
                 if refused.contains_key(&sk) {
-                    return Err(format!("its supertrait {} has no table", fn_shown(r, sk)));
+                    return Err(err_super(sk, format_args!("has no table")));
                 }
                 if !tables.contains_key(&sk) {
                     asked.push(sk);
@@ -590,20 +605,22 @@ fn object_tables<'n, S: super::source::NamesSource<'n>>(
                 let item = head.fns.iter().find(|(n, _)| *n == m.name).map(|(_, f)| *f).ok_or_else(|| String::from("a method with no fn filed under its name"))?;
                 methods.push(blaze_build::vtable::ObjectMethod { item, dispatch });
             }
-            let mut h = blaze_ids::Hasher::new("blaze-ladder front2 object trait 2");
+            let mut h = blaze_ids::Hasher::new("blaze-ladder front2 object trait 3");
             h.update(&k.0.to_le_bytes());
             for m in methods.iter() {
                 h.update(&m.item.0.to_le_bytes()).update(&[u8::from(m.dispatch)]);
             }
+            let super_view = super_tys.as_ref().map_or(PTys::EMPTY, PortableTys::view);
             for s in supers.iter() {
                 let below = tables.get(&s.trait_).map_or([0; 32], |t| t.shape.0);
                 h.update(&s.trait_.0.to_le_bytes()).update(&below).update(&s.args.len.to_le_bytes());
-                let at = s.args.at as usize;
-                for p in &super_args[at..at + s.args.len as usize] {
-                    h.update(&p.to_le_bytes());
+                let list = super_view.list(s.args).map_err(|e| err_super(s.trait_, format_args!("arguments: {e:?}")))?;
+                for &a in list {
+                    crate::code_records::reads::term(&mut h, a, super_view)
+                        .map_err(|e| err_super(s.trait_, format_args!("argument digest: {e:?}")))?;
                 }
             }
-            Ok(Some(ObjectTable { supers, super_args, methods, shape: h.finish() }))
+            Ok(Some(ObjectTable { supers, super_tys, methods, shape: h.finish() }))
         })();
         match why {
             Ok(None) => {}
@@ -871,25 +888,21 @@ impl<'n> Front2Program<'n> {
         }
         // The roots that lowered, in the order given: what `mains` is the bodies of.
         roots = kept;
-        let mut lowered = Vec::with_capacity_in(mains.len(), Global);
-        for m in mains.iter() {
-            lowered.push(m.lowered.view());
-        }
-        let mut spells = Vec::with_capacity_in(mains.len(), Global);
-        for v in lowered.iter() {
-            spells.push(Spelling::of(v).map_err(Front2Refusal::Spell)?);
-        }
-        let mut scopes = Vec::with_capacity_in(mains.len(), Global);
-        for (m, s) in mains.iter().zip(spells.iter()) {
-            scopes.push(m.scope(s));
-        }
         // In a survey a root that does not check is filed and left out, and the walk goes on
         // from what it calls by name: what is reachable is surveyed whatever the root is.
         let mut checked: Vec<Option<Checked<'static>>, Global> = Vec::with_capacity_in(mains.len(), Global);
         // Each checked body's async blocks' state recipes, made with its check (coroutine_recipes.rs).
         let mut recipes: Vec<super::coroutine_recipes::RecipeRow, Global> = Vec::new_in(Global);
-        for (m, scope) in mains.iter().zip(scopes.iter()) {
-            let done = check_body(&mut records, m, scope).and_then(|c| {
+        for m in mains.iter_mut() {
+            let checked_res = if m.typeck.inline_fors.is_empty() {
+                let v = m.lowered.view();
+                let s = Spelling::of(&v).map_err(Front2Refusal::Spell)?;
+                let scope = m.scope(&s);
+                check_body(&mut records, m, &scope)
+            } else {
+                super::inline_for::unroll_concrete_body(&mut records, prepared, m)
+            };
+            let done = checked_res.and_then(|c| {
                 super::coroutine_recipes::recipes_of(&mut records, m, &c, &mut recipes, alloc)
                     .map_err(|error| CheckFail::Check { owner: m.owner, error })?;
                 Ok(c)
@@ -908,6 +921,18 @@ impl<'n> Front2Program<'n> {
                     None => return Err(Front2Refusal::Check(e)),
                 },
             });
+        }
+        let mut lowered = Vec::with_capacity_in(mains.len(), Global);
+        for m in mains.iter() {
+            lowered.push(m.lowered.view());
+        }
+        let mut spells = Vec::with_capacity_in(mains.len(), Global);
+        for v in lowered.iter() {
+            spells.push(Spelling::of(v).map_err(Front2Refusal::Spell)?);
+        }
+        let mut scopes = Vec::with_capacity_in(mains.len(), Global);
+        for (m, s) in mains.iter().zip(spells.iter()) {
+            scopes.push(m.scope(s));
         }
         // A test's entry, from its head alone (test_entry.rs): a refusal is that test's own (the
         // runner fails it by name; the rest of the suite goes on). A `Report` entry's `report`
@@ -967,6 +992,10 @@ impl<'n> Front2Program<'n> {
             let report = super::reach::capped_report(&records, &census).into_boxed_str();
             return Err(Front2Refusal::Capped { entry: entry.into_boxed_str(), queued: census.queued, cap: census.cap, items: census.items, forced: census.forced, report });
         }
+        // Specialize any reached generic `inline for` functions at every concrete call site and
+        // merge newly discovered callees into `census`.
+        let inline_specs = super::inline_for::specialize_generic_inline_fors(&mut records, prepared, &mains, &checked, &mut census)
+            .map_err(Front2Refusal::Check)?;
         let reached_by_crate = super::reach::by_crate(&records, &census.fns);
         // Every fn the walk met is checked clean, or the program is refused by its first one
         // that is not: a fn with any diagnostic or gap is never built.
@@ -1022,7 +1051,7 @@ impl<'n> Front2Program<'n> {
         for m in mains.iter() {
             met.insert(m.owner, ());
         }
-        for c in checked.iter().flatten().chain(census.bodies.iter().map(|(_, c)| c)) {
+        for c in checked.iter().flatten().chain(census.bodies.iter().map(|(_, c)| c)).chain(inline_specs.iter().map(|s| &s.checked)) {
             for &item in c.callees.column::<1>() {
                 let of_trait = matches!(records.keys.origin(item), Some(super::keys::Origin::Member { container, kind: MemberKind::Fn, .. }) if !records.store.impls.contains_key(container));
                 if of_trait && met.insert(item, ()).is_none() {
@@ -1038,7 +1067,10 @@ impl<'n> Front2Program<'n> {
         let mut given_up: HashMap<ItemKey, (), Global> = HashMap::new_in(Global);
         for round in 0.. {
             let mut missing: Vec<ItemKey, Global> = Vec::new_in(Global);
-            let views = core::iter::once(records.store.tys.view()).chain(checked.iter().flatten().map(|c| c.types.view())).chain(census.bodies.iter().map(|(_, c)| c.types.view()));
+            let views = core::iter::once(records.store.tys.view())
+                .chain(checked.iter().flatten().map(|c| c.types.view()))
+                .chain(census.bodies.iter().map(|(_, c)| c.types.view()))
+                .chain(inline_specs.iter().map(|s| s.checked.types.view()));
             for v in views {
                 for n in v.nodes() {
                     if let tc::PNode::Adt(k, _) = n
@@ -1102,7 +1134,10 @@ impl<'n> Front2Program<'n> {
         // Every constant a checked body reads by value, evaluated once now (the builder's
         // `const_value` reads the record); one the evaluator refuses is named: in a survey filed
         // and left out (each reader's build then names it), in a run the program's refusal.
-        let (values, refused) = const_values(&mut records, checked.iter().flatten().chain(census.bodies.iter().map(|(_, c)| c)));
+        let (values, refused) = const_values(
+            &mut records,
+            checked.iter().flatten().chain(census.bodies.iter().map(|(_, c)| c)).chain(inline_specs.iter().map(|s| &s.checked)),
+        );
         for (k, why) in refused {
             let constant = fn_shown(&records, k).into_boxed_str();
             match left_out.as_deref_mut() {
@@ -1114,8 +1149,16 @@ impl<'n> Front2Program<'n> {
                 None => return Err(Front2Refusal::Const { constant: super::item_shown::refused(&records, k), why }),
             }
         }
-        let statics = made_statics(&mut records, checked.iter().flatten().chain(census.bodies.iter().map(|(_, c)| c)), left_out.as_deref_mut(), &mut left)?;
-        let views = core::iter::once(records.store.tys.view()).chain(checked.iter().flatten().map(|c| c.types.view())).chain(census.bodies.iter().map(|(_, c)| c.types.view()));
+        let statics = made_statics(
+            &mut records,
+            checked.iter().flatten().chain(census.bodies.iter().map(|(_, c)| c)).chain(inline_specs.iter().map(|s| &s.checked)),
+            left_out.as_deref_mut(),
+            &mut left,
+        )?;
+        let views = core::iter::once(records.store.tys.view())
+            .chain(checked.iter().flatten().map(|c| c.types.view()))
+            .chain(census.bodies.iter().map(|(_, c)| c.types.view()))
+            .chain(inline_specs.iter().map(|s| s.checked.types.view()));
         let asked = dyn_principals(views);
         let mut objects: HashMap<ItemKey, ObjectTable, Global> = HashMap::new_in(Global);
         object_tables(&mut records, asked, &mut objects, left_out.as_deref_mut())?;
@@ -1128,6 +1171,10 @@ impl<'n> Front2Program<'n> {
         let mut body_paths: Vec<Result<super::row_path::RowPath, super::row_path::NoRowPath>, Global> = Vec::with_capacity_in(census.bodies.len(), Global);
         for (b, _) in census.bodies.iter() {
             body_paths.push(super::row_path::row_path_of(&records, b.owner));
+        }
+        let mut spec_paths: blaze_own::Vec<Result<super::row_path::RowPath, super::row_path::NoRowPath>, Alloc<'static>> = blaze_own::Vec::with_capacity_in(inline_specs.len(), alloc);
+        for s in inline_specs.iter() {
+            spec_paths.push(super::row_path::row_path_of(&records, s.orig));
         }
         drop(scopes);
         drop(spells);
@@ -1161,6 +1208,13 @@ impl<'n> Front2Program<'n> {
             match tabled::lowered_row(names, prepared, &mut front.keys, &mut store, &b, &mut tys, path) {
                 Ok((body, path)) => bodies.push((body, c, path)),
                 Err((shown, refusal)) => tabled::left_out_or_stop(b.owner, shown, refusal, &mut left, left_out.as_deref_mut())?,
+            }
+        }
+        let mut spec_lowered: blaze_own::Vec<(ItemKey, blaze_own::Vec<PTy, Alloc<'static>>, Body<'n>, Checked<'static>, super::row_path::RowPath), Alloc<'static>> = blaze_own::Vec::with_capacity_in(inline_specs.len(), alloc);
+        for (s, path) in inline_specs.into_iter().zip(spec_paths) {
+            match tabled::lowered_row(names, prepared, &mut front.keys, &mut store, &s.body, &mut tys, path) {
+                Ok((body, path)) => spec_lowered.push((s.orig, s.args, body, s.checked, path)),
+                Err((shown, refusal)) => tabled::left_out_or_stop(s.spec_key, shown, refusal, &mut left, left_out.as_deref_mut())?,
             }
         }
         // The walk's steps, sorted and once each: what a test's reach is read from.
@@ -1205,6 +1259,21 @@ impl<'n> Front2Program<'n> {
                 }
             }
         }
+        let mut inline_for_specs: blaze_own::Vec<super::inline_for::SpecRow, Alloc<'static>> = blaze_own::Vec::with_capacity_in(spec_lowered.len(), alloc);
+        for (orig, args, body, checked, path) in spec_lowered {
+            let key = body.owner;
+            match tabled::table_one(names, &store, key, Some((body, checked)), path, false) {
+                tabled::Verdict::Tabled(row) => {
+                    let row_idx = fns.len();
+                    by_key.insert(key, row_idx);
+                    fns.push(row);
+                    inline_for_specs.push(super::inline_for::SpecRow { orig, args, row: row_idx });
+                }
+                tabled::Verdict::LeftOut { path, refusal } => {
+                    tabled::left_out_or_stop(key, path, refusal, &mut left, left_out.as_deref_mut())?;
+                }
+            }
+        }
         for (key, path) in ctors {
             let path = match path {
                 Ok(path) => path,
@@ -1234,7 +1303,7 @@ impl<'n> Front2Program<'n> {
         rows.extend(mains.iter().map(|m| (m.owner, by_key.get(&m.owner).copied())));
         // The evaluator is kept, not dropped: the build pulls constants at instances' ground
         // arguments from it (`FrontEnd::const_at`, const_at.rs).
-        let program = Front2Program { front, store, tys, buckets, fns, by_key, entry, objects, langs, left, const_values: values, statics, projection_why: core::cell::RefCell::new(None), asked: RefCell::new(Vec::new_in(Global)), asked_gaps: RefCell::new(Vec::new_in(Global)), definers: super::tait::Definers::new_in(alloc), edges, consts, prepared, start: start2, recipes, reached_by_crate };
+        let program = Front2Program { front, store, tys, buckets, fns, by_key, entry, objects, langs, left, const_values: values, statics, projection_why: core::cell::RefCell::new(None), asked: RefCell::new(Vec::new_in(Global)), asked_gaps: RefCell::new(Vec::new_in(Global)), definers: super::tait::Definers::new_in(alloc), edges, consts, prepared, start: start2, recipes, reached_by_crate, inline_for_specs };
         Ok(Made { program, roots: rows, shapes })
     }
 
@@ -1781,13 +1850,27 @@ impl FrontEnd for Front2Program<'_> {
             c_variadic: false,
             legacy_const_generics: &[],
             inputs: &f.inputs,
-            output: f.output,
+            output: self.store.fn_output(key).unwrap_or(f.output),
             types: self.tys.view(),
         }
     }
 
     fn fn_index(&self, key: ItemKey) -> Option<usize> {
         self.by_key.get(&key).copied()
+    }
+
+    fn specialized_row(&self, i: usize, args: &[PTy], ground: PTys<'_>) -> Option<usize> {
+        if self.inline_for_specs.is_empty() {
+            return None;
+        }
+        let orig = self.fns.get(i)?.key;
+        let alloc = self.tys.alloc();
+        for s in self.inline_for_specs.iter() {
+            if s.orig == orig && super::inline_for::args_equal(ground, args, self.tys.view(), &s.args, alloc) {
+                return Some(s.row);
+            }
+        }
+        None
     }
 
     /// The digest filed in the store when fn `i`'s body was checked: its `Checked` holds no
@@ -1866,7 +1949,8 @@ impl FrontEnd for Front2Program<'_> {
 
     fn object_trait(&self, t: ItemKey) -> Option<blaze_build::vtable::ObjectTrait<'_>> {
         let o = self.objects.get(&t)?;
-        Some(blaze_build::vtable::ObjectTrait { supers: &o.supers, super_args: &o.super_args, methods: &o.methods, shape: o.shape })
+        let tys = o.super_tys.as_ref().map_or(PTys::EMPTY, PortableTys::view);
+        Some(blaze_build::vtable::ObjectTrait { supers: &o.supers, tys, methods: &o.methods, shape: o.shape })
     }
 
     /// The fn `name` of the lang trait `trait_` (`Deref::deref`), filed with its trait's head,
@@ -1891,6 +1975,10 @@ impl FrontEnd for Front2Program<'_> {
 
     fn left_out(&self, key: ItemKey) -> Option<&str> {
         self.left.get(&key).map(|why| &**why)
+    }
+
+    fn type_names(&self) -> Option<&dyn blaze_build::type_name::TypeNames> {
+        Some(self)
     }
 
     /// The item's path in the names library (`crate::module::Name`).
@@ -2128,5 +2216,11 @@ impl FrontEnd for Front2Program<'_> {
             (None, None) => self.store.fns.get(&owner).map(|h| h.text),
         };
         super::consts::item_code_id(owner, text)
+    }
+}
+
+impl blaze_build::type_name::TypeNames for Front2Program<'_> {
+    fn item_path(&self, item: ItemKey, out: &mut dyn FnMut(&str)) -> bool {
+        super::type_name::item_path(self.front.names, &self.front.keys, &self.store, item, out)
     }
 }

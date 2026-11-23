@@ -587,56 +587,119 @@ impl<A: Allocator + Copy> ExprGraph<A> {
         for _ in 0..n {
             cache.push(None);
         }
-        self.eval_memo(root, env, &mut cache)
-    }
-
-    fn eval_memo(
-        &self,
-        id: ExprId,
-        env: &[f64],
-        cache: &mut OwnVec<Option<f64>, A>,
-    ) -> Result<f64, AlgebraError> {
-        let idx = u32_to_usize(id.0);
-        if let Some(v) = cache.get(idx).copied().flatten() {
-            return Ok(v);
-        }
-        let op = self.node(id)?;
-        let val = match op {
-            Op::Const(bits) => f64::from_bits(bits),
-            Op::Var(v) => *env
-                .get(u32_to_usize(v.0))
-                .ok_or(AlgebraError::UnknownVar { var: v, env_len: env.len() })?,
-            Op::Neg(a) => -self.eval_memo(a, env, cache)?,
-            Op::Add(a, b) => self.eval_memo(a, env, cache)? + self.eval_memo(b, env, cache)?,
-            Op::Sub(a, b) => self.eval_memo(a, env, cache)? - self.eval_memo(b, env, cache)?,
-            Op::Mul(a, b) => self.eval_memo(a, env, cache)? * self.eval_memo(b, env, cache)?,
-            Op::Div(a, b) => self.eval_memo(a, env, cache)? / self.eval_memo(b, env, cache)?,
-            Op::Pow(a, b) => blaze_math::pow(self.eval_memo(a, env, cache)?, self.eval_memo(b, env, cache)?),
-            Op::Sin(a) => blaze_math::sin(self.eval_memo(a, env, cache)?),
-            Op::Cos(a) => blaze_math::cos(self.eval_memo(a, env, cache)?),
-            Op::Tan(a) => blaze_math::tan(self.eval_memo(a, env, cache)?),
-            Op::Exp(a) => blaze_math::exp(self.eval_memo(a, env, cache)?),
-            Op::Ln(a) => blaze_math::ln(self.eval_memo(a, env, cache)?),
-            Op::Sqrt(a) => blaze_math::sqrt(self.eval_memo(a, env, cache)?),
-            Op::Tanh(a) => det_tanh(self.eval_memo(a, env, cache)?),
-            Op::Abs(a) => blaze_math::abs(self.eval_memo(a, env, cache)?),
-            Op::Select(c, t, e) => {
-                if self.eval_memo(c, env, cache)? > 0.0 {
-                    self.eval_memo(t, env, cache)?
-                } else {
-                    self.eval_memo(e, env, cache)?
+        let get_v = |cache: &[Option<f64>], e: ExprId| -> f64 {
+            cache.get(u32_to_usize(e.0)).copied().flatten().unwrap_or(f64::NAN)
+        };
+        // State: 0 = visit, 1 = evaluate op (or select condition), 2 = finalize select branch.
+        let mut stack: OwnVec<(ExprId, u8), A> = OwnVec::new_in(self.alloc);
+        stack.push((root, 0));
+        while let Some((id, state)) = stack.pop() {
+            let idx = u32_to_usize(id.0);
+            if cache.get(idx).copied().flatten().is_some() {
+                continue;
+            }
+            let op = self.node(id)?;
+            if state == 0 {
+                match op {
+                    Op::Const(bits) => {
+                        if let Some(slot) = cache.get_mut(idx) {
+                            *slot = Some(f64::from_bits(bits));
+                        }
+                    }
+                    Op::Var(v) => {
+                        let val = *env
+                            .get(u32_to_usize(v.0))
+                            .ok_or(AlgebraError::UnknownVar { var: v, env_len: env.len() })?;
+                        if let Some(slot) = cache.get_mut(idx) {
+                            *slot = Some(val);
+                        }
+                    }
+                    Op::Neg(a)
+                    | Op::Sin(a)
+                    | Op::Cos(a)
+                    | Op::Tan(a)
+                    | Op::Exp(a)
+                    | Op::Ln(a)
+                    | Op::Sqrt(a)
+                    | Op::Tanh(a)
+                    | Op::Abs(a) => {
+                        stack.push((id, 1));
+                        stack.push((a, 0));
+                    }
+                    Op::Add(a, b)
+                    | Op::Sub(a, b)
+                    | Op::Mul(a, b)
+                    | Op::Div(a, b)
+                    | Op::Pow(a, b) => {
+                        stack.push((id, 1));
+                        stack.push((b, 0));
+                        stack.push((a, 0));
+                    }
+                    Op::Select(c, _, _) => {
+                        stack.push((id, 1));
+                        stack.push((c, 0));
+                    }
+                    Op::Fma(a, b, c) => {
+                        stack.push((id, 1));
+                        stack.push((c, 0));
+                        stack.push((b, 0));
+                        stack.push((a, 0));
+                    }
+                }
+                continue;
+            }
+            if state == 1 {
+                if let Op::Select(c, t, e) = op {
+                    let branch = if get_v(&cache, c) > 0.0 { t } else { e };
+                    if let Some(hit) = cache.get(u32_to_usize(branch.0)).copied().flatten() {
+                        if let Some(slot) = cache.get_mut(idx) {
+                            *slot = Some(hit);
+                        }
+                    } else {
+                        stack.push((id, 2));
+                        stack.push((branch, 0));
+                    }
+                    continue;
                 }
             }
-            Op::Fma(a, b, c) => blaze_math::mul_add(
-                self.eval_memo(a, env, cache)?,
-                self.eval_memo(b, env, cache)?,
-                self.eval_memo(c, env, cache)?,
-            ),
-        };
-        if let Some(slot) = cache.get_mut(idx) {
-            *slot = Some(val);
+            let val = match op {
+                Op::Const(bits) => f64::from_bits(bits),
+                Op::Var(v) => *env
+                    .get(u32_to_usize(v.0))
+                    .ok_or(AlgebraError::UnknownVar { var: v, env_len: env.len() })?,
+                Op::Neg(a) => -get_v(&cache, a),
+                Op::Add(a, b) => get_v(&cache, a) + get_v(&cache, b),
+                Op::Sub(a, b) => get_v(&cache, a) - get_v(&cache, b),
+                Op::Mul(a, b) => get_v(&cache, a) * get_v(&cache, b),
+                Op::Div(a, b) => get_v(&cache, a) / get_v(&cache, b),
+                Op::Pow(a, b) => blaze_math::pow(get_v(&cache, a), get_v(&cache, b)),
+                Op::Sin(a) => blaze_math::sin(get_v(&cache, a)),
+                Op::Cos(a) => blaze_math::cos(get_v(&cache, a)),
+                Op::Tan(a) => blaze_math::tan(get_v(&cache, a)),
+                Op::Exp(a) => blaze_math::exp(get_v(&cache, a)),
+                Op::Ln(a) => blaze_math::ln(get_v(&cache, a)),
+                Op::Sqrt(a) => blaze_math::sqrt(get_v(&cache, a)),
+                Op::Tanh(a) => det_tanh(get_v(&cache, a)),
+                Op::Abs(a) => blaze_math::abs(get_v(&cache, a)),
+                Op::Select(c, t, e) => {
+                    let branch = if get_v(&cache, c) > 0.0 { t } else { e };
+                    get_v(&cache, branch)
+                }
+                Op::Fma(a, b, c) => blaze_math::mul_add(
+                    get_v(&cache, a),
+                    get_v(&cache, b),
+                    get_v(&cache, c),
+                ),
+            };
+            if let Some(slot) = cache.get_mut(idx) {
+                *slot = Some(val);
+            }
         }
-        Ok(val)
+        cache
+            .get(u32_to_usize(root.0))
+            .copied()
+            .flatten()
+            .ok_or(AlgebraError::InvalidExpr { expr: root, node_count: n })
     }
 
     /// Substitute `var := replacement` across `root`, returning a new interned [`ExprId`].
@@ -649,102 +712,146 @@ impl<A: Allocator + Copy> ExprGraph<A> {
         for _ in 0..n {
             cache.push(None);
         }
-        self.sub_memo(root, var, replacement, &mut cache)
-    }
-
-    fn sub_memo(
-        &mut self,
-        id: ExprId,
-        var: VarId,
-        replacement: ExprId,
-        cache: &mut OwnVec<Option<ExprId>, A>,
-    ) -> Result<ExprId, AlgebraError> {
-        let idx = u32_to_usize(id.0);
-        if let Some(hit) = cache.get(idx).copied().flatten() {
-            return Ok(hit);
-        }
-        let op = self.node(id)?;
-        let out = match op {
-            Op::Const(_) => id,
-            Op::Var(v) => if v == var { replacement } else { id },
-            Op::Neg(a) => {
-                let sa = self.sub_memo(a, var, replacement, cache)?;
-                self.neg(sa)
-            }
-            Op::Add(a, b) => {
-                let sa = self.sub_memo(a, var, replacement, cache)?;
-                let sb = self.sub_memo(b, var, replacement, cache)?;
-                self.add(sa, sb)
-            }
-            Op::Sub(a, b) => {
-                let sa = self.sub_memo(a, var, replacement, cache)?;
-                let sb = self.sub_memo(b, var, replacement, cache)?;
-                self.sub(sa, sb)
-            }
-            Op::Mul(a, b) => {
-                let sa = self.sub_memo(a, var, replacement, cache)?;
-                let sb = self.sub_memo(b, var, replacement, cache)?;
-                self.mul(sa, sb)
-            }
-            Op::Div(a, b) => {
-                let sa = self.sub_memo(a, var, replacement, cache)?;
-                let sb = self.sub_memo(b, var, replacement, cache)?;
-                self.div(sa, sb)
-            }
-            Op::Pow(a, b) => {
-                let sa = self.sub_memo(a, var, replacement, cache)?;
-                let sb = self.sub_memo(b, var, replacement, cache)?;
-                self.pow(sa, sb)
-            }
-            Op::Sin(a) => {
-                let sa = self.sub_memo(a, var, replacement, cache)?;
-                self.sin(sa)
-            }
-            Op::Cos(a) => {
-                let sa = self.sub_memo(a, var, replacement, cache)?;
-                self.cos(sa)
-            }
-            Op::Tan(a) => {
-                let sa = self.sub_memo(a, var, replacement, cache)?;
-                self.tan(sa)
-            }
-            Op::Exp(a) => {
-                let sa = self.sub_memo(a, var, replacement, cache)?;
-                self.exp(sa)
-            }
-            Op::Ln(a) => {
-                let sa = self.sub_memo(a, var, replacement, cache)?;
-                self.ln(sa)
-            }
-            Op::Sqrt(a) => {
-                let sa = self.sub_memo(a, var, replacement, cache)?;
-                self.sqrt(sa)
-            }
-            Op::Tanh(a) => {
-                let sa = self.sub_memo(a, var, replacement, cache)?;
-                self.tanh(sa)
-            }
-            Op::Abs(a) => {
-                let sa = self.sub_memo(a, var, replacement, cache)?;
-                self.abs(sa)
-            }
-            Op::Select(c, t, e) => {
-                let sc = self.sub_memo(c, var, replacement, cache)?;
-                let st = self.sub_memo(t, var, replacement, cache)?;
-                let se = self.sub_memo(e, var, replacement, cache)?;
-                self.select(sc, st, se)
-            }
-            Op::Fma(a, b, c) => {
-                let sa = self.sub_memo(a, var, replacement, cache)?;
-                let sb = self.sub_memo(b, var, replacement, cache)?;
-                let sc = self.sub_memo(c, var, replacement, cache)?;
-                self.fma(sa, sb, sc)
-            }
+        let get_s = |cache: &[Option<ExprId>], e: ExprId| -> ExprId {
+            cache.get(u32_to_usize(e.0)).copied().flatten().unwrap_or(e)
         };
-        if let Some(slot) = cache.get_mut(idx) {
-            *slot = Some(out);
+        let mut stack: OwnVec<(ExprId, bool), A> = OwnVec::new_in(self.alloc);
+        stack.push((root, false));
+        while let Some((id, ready)) = stack.pop() {
+            let idx = u32_to_usize(id.0);
+            if cache.get(idx).copied().flatten().is_some() {
+                continue;
+            }
+            let op = self.node(id)?;
+            if !ready {
+                match op {
+                    Op::Const(_) => {
+                        if let Some(slot) = cache.get_mut(idx) {
+                            *slot = Some(id);
+                        }
+                    }
+                    Op::Var(v) => {
+                        let out = if v == var { replacement } else { id };
+                        if let Some(slot) = cache.get_mut(idx) {
+                            *slot = Some(out);
+                        }
+                    }
+                    Op::Neg(a)
+                    | Op::Sin(a)
+                    | Op::Cos(a)
+                    | Op::Tan(a)
+                    | Op::Exp(a)
+                    | Op::Ln(a)
+                    | Op::Sqrt(a)
+                    | Op::Tanh(a)
+                    | Op::Abs(a) => {
+                        stack.push((id, true));
+                        stack.push((a, false));
+                    }
+                    Op::Add(a, b)
+                    | Op::Sub(a, b)
+                    | Op::Mul(a, b)
+                    | Op::Div(a, b)
+                    | Op::Pow(a, b) => {
+                        stack.push((id, true));
+                        stack.push((b, false));
+                        stack.push((a, false));
+                    }
+                    Op::Select(a, b, c) | Op::Fma(a, b, c) => {
+                        stack.push((id, true));
+                        stack.push((c, false));
+                        stack.push((b, false));
+                        stack.push((a, false));
+                    }
+                }
+                continue;
+            }
+            let out = match op {
+                Op::Const(_) => id,
+                Op::Var(v) => if v == var { replacement } else { id },
+                Op::Neg(a) => {
+                    let sa = get_s(&cache, a);
+                    self.neg(sa)
+                }
+                Op::Add(a, b) => {
+                    let sa = get_s(&cache, a);
+                    let sb = get_s(&cache, b);
+                    self.add(sa, sb)
+                }
+                Op::Sub(a, b) => {
+                    let sa = get_s(&cache, a);
+                    let sb = get_s(&cache, b);
+                    self.sub(sa, sb)
+                }
+                Op::Mul(a, b) => {
+                    let sa = get_s(&cache, a);
+                    let sb = get_s(&cache, b);
+                    self.mul(sa, sb)
+                }
+                Op::Div(a, b) => {
+                    let sa = get_s(&cache, a);
+                    let sb = get_s(&cache, b);
+                    self.div(sa, sb)
+                }
+                Op::Pow(a, b) => {
+                    let sa = get_s(&cache, a);
+                    let sb = get_s(&cache, b);
+                    self.pow(sa, sb)
+                }
+                Op::Sin(a) => {
+                    let sa = get_s(&cache, a);
+                    self.sin(sa)
+                }
+                Op::Cos(a) => {
+                    let sa = get_s(&cache, a);
+                    self.cos(sa)
+                }
+                Op::Tan(a) => {
+                    let sa = get_s(&cache, a);
+                    self.tan(sa)
+                }
+                Op::Exp(a) => {
+                    let sa = get_s(&cache, a);
+                    self.exp(sa)
+                }
+                Op::Ln(a) => {
+                    let sa = get_s(&cache, a);
+                    self.ln(sa)
+                }
+                Op::Sqrt(a) => {
+                    let sa = get_s(&cache, a);
+                    self.sqrt(sa)
+                }
+                Op::Tanh(a) => {
+                    let sa = get_s(&cache, a);
+                    self.tanh(sa)
+                }
+                Op::Abs(a) => {
+                    let sa = get_s(&cache, a);
+                    self.abs(sa)
+                }
+                Op::Select(c, t, e) => {
+                    let sc = get_s(&cache, c);
+                    let st = get_s(&cache, t);
+                    let se = get_s(&cache, e);
+                    self.select(sc, st, se)
+                }
+                Op::Fma(a, b, c) => {
+                    let sa = get_s(&cache, a);
+                    let sb = get_s(&cache, b);
+                    let sc = get_s(&cache, c);
+                    self.fma(sa, sb, sc)
+                }
+            };
+            if let Some(slot) = cache.get_mut(idx) {
+                *slot = Some(out);
+            }
         }
-        Ok(out)
+        cache
+            .get(u32_to_usize(root.0))
+            .copied()
+            .flatten()
+            .ok_or(AlgebraError::InvalidExpr { expr: root, node_count: n })
     }
 
     /// True if `var` occurs anywhere inside the DAG rooted at `root`.
