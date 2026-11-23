@@ -147,7 +147,7 @@ fn shape_of(t: PTys<'_>, p: PTy) -> Option<Shape> {
         PNode::Float(f) => Shape::Float(f),
         PNode::Str => Shape::Str,
         PNode::Never => Shape::Never,
-        PNode::Tuple(l) => Shape::Tuple(l.len),
+        PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => Shape::Tuple(l.len),
         PNode::Ref(m, _) => Shape::Ref(m),
         PNode::Ptr(m, _) => Shape::Ptr(m),
         PNode::Array(..) => Shape::Array,
@@ -1689,6 +1689,16 @@ pub fn show(fx: &Fx, t: PTys<'_>, p: PTy) -> String {
                     out.push_str("(");
                     stack.push(Task::Str(")"));
                     push_list(&mut stack, l, ", ");
+                }
+                PNode::Record(l) => {
+                    out.push_str("record(");
+                    stack.push(Task::Str(")"));
+                    push_list(&mut stack, l, ", ");
+                }
+                PNode::Union(l) => {
+                    out.push_str("union(");
+                    stack.push(Task::Str(")"));
+                    push_list(&mut stack, l, " | ");
                 }
                 PNode::Ref(Mutbl::Not, x) => {
                     out.push_str("&");

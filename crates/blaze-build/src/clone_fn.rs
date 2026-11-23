@@ -40,7 +40,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let mut base = 0u32;
         let held = match self.ground_node(me).map_err(sig_err)? {
             PNode::FnDef(..) | PNode::FnPtr(..) => None,
-            PNode::Tuple(l) => {
+            PNode::Tuple(l) | PNode::Record(l) => {
                 fields.extend_from_slice(self.ground.view().list(l).map_err(past)?);
                 Some(me)
             }

@@ -1721,9 +1721,24 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 self.push(V::Type, t.0, r);
             }
             UNION_TYPE => {
-                let members = self.put_ids(f, V::Type);
-                self.done(f);
-                let t = self.put_type(TypeRef::Union(members), r);
+                let is_fallible = self.has_tok(f, BANG);
+                let t = if is_fallible {
+                    let ok = self.kid(f, 0, |v| v == V::Type).map(|v| TypeId(v.id));
+                    let err = self.kid(f, 1, |v| v == V::Type).map(|v| TypeId(v.id));
+                    self.done(f);
+                    match (ok, err) {
+                        (Some(ok), Some(err)) => TypeRef::Fallible { ok, err },
+                        _ => {
+                            self.unhandled(f.kind, r, Why::Kind);
+                            TypeRef::Error
+                        }
+                    }
+                } else {
+                    let members = self.put_ids(f, V::Type);
+                    self.done(f);
+                    TypeRef::Union(members)
+                };
+                let t = self.put_type(t, r);
                 self.push(V::Type, t.0, r);
             }
             UNSAFE_BINDER_TYPE => {

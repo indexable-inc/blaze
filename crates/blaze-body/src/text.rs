@@ -266,6 +266,14 @@ fn ty_node<W: Write>(w: &mut W, n: PNode) -> fmt::Result {
             w.write_str("tuple ")?;
             list(w, l)
         }
+        PNode::Record(l) => {
+            w.write_str("record ")?;
+            list(w, l)
+        }
+        PNode::Union(l) => {
+            w.write_str("union ")?;
+            list(w, l)
+        }
         PNode::Ref(m, t) => write!(w, "ref {}t{}", if m == Mutbl::Mut { "mut " } else { "" }, t.0),
         PNode::Ptr(m, t) => write!(w, "ptr {} t{}", if m == Mutbl::Mut { "mut" } else { "const" }, t.0),
         PNode::Array(t, n) => write!(w, "array t{} t{}", t.0, n.0),
@@ -802,6 +810,8 @@ impl<A: Allocator + Copy> Parser<A> {
             "infer" => PNode::Infer,
             "error" => PNode::Error,
             "tuple" => PNode::Tuple(Self::list(c)?),
+            "record" => PNode::Record(Self::list(c)?),
+            "union" => PNode::Union(Self::list(c)?),
             "ref" => {
                 let m = match c.keyword("mut") {
                     true => Mutbl::Mut,

@@ -737,6 +737,8 @@ fn copy_reached<'a>(
             | PNode::Foreign(_)) => n,
             PNode::ConstValue { ty, bits } => PNode::ConstValue { ty: m(ty, &mapped)?, bits },
             PNode::Tuple(a) => PNode::Tuple(l(a, &mapped, out)?),
+            PNode::Record(a) => PNode::Record(l(a, &mapped, out)?),
+            PNode::Union(a) => PNode::Union(l(a, &mapped, out)?),
             PNode::Ref(mu, a) => PNode::Ref(mu, m(a, &mapped)?),
             PNode::Ptr(mu, a) => PNode::Ptr(mu, m(a, &mapped)?),
             PNode::Array(a, len) => PNode::Array(m(a, &mapped)?, m(len, &mapped)?),
@@ -791,6 +793,8 @@ fn children(n: PNode) -> (Option<PTy>, Option<PTy>, Option<List>) {
         PNode::Pat(a, r) => (Some(a), None, Some(r)),
         PNode::ExProj { args, term, .. } => (Some(term), None, Some(args)),
         PNode::Tuple(a)
+        | PNode::Record(a)
+        | PNode::Union(a)
         | PNode::Adt(_, a)
         | PNode::FnDef(_, a)
         | PNode::FnPtr(a, _)

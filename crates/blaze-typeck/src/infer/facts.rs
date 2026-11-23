@@ -749,7 +749,7 @@ impl<'a> FactCache<'a> {
                 PNode::Float(f) => K::Float(float(f)),
                 PNode::Str => K::Str,
                 PNode::Never => K::Never,
-                PNode::Tuple(l) => K::Tuple(list(l)?),
+                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => K::Tuple(list(l)?),
                 PNode::Ref(m, p) => K::Ref(STy(erased), ty(p)?, mutbl(m)),
                 PNode::Ptr(m, p) => K::RawPtr(ty(p)?, mutbl(m)),
                 PNode::Array(e, n) => K::Array(ty(e)?, ty(n)?),

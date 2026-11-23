@@ -417,6 +417,8 @@ fn children(t: PTys<'_>, n: PNode, out: &mut Vec<u32, Alloc<'_>>) -> Result<(), 
             list(l, out)
         }
         PNode::Tuple(l)
+        | PNode::Record(l)
+        | PNode::Union(l)
         | PNode::Adt(_, l)
         | PNode::FnDef(_, l)
         | PNode::FnPtr(l, _)
@@ -442,6 +444,8 @@ fn shape(n: PNode) -> PNode {
     let l = |l: List| List { start: 0, len: l.len };
     match n {
         PNode::Tuple(x) => PNode::Tuple(l(x)),
+        PNode::Record(x) => PNode::Record(l(x)),
+        PNode::Union(x) => PNode::Union(l(x)),
         PNode::Ref(m, _) => PNode::Ref(m, p),
         PNode::Ptr(m, _) => PNode::Ptr(m, p),
         PNode::Array(..) => PNode::Array(p, p),

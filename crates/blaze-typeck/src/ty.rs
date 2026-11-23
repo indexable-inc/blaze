@@ -70,6 +70,8 @@ pub enum TyView {
     Str,
     Never,
     Tuple(TyList),
+    Record(TyList),
+    Union(TyList),
     Ref(Mutbl, Ty),
     Ptr(Mutbl, Ty),
     /// `[elem; len]`: `len` a const term of type `usize` (`ConstValue`, `ConstParam`,

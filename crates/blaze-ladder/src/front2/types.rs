@@ -1124,9 +1124,17 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             lf::TypeRef::Ref { mutbl, .. } => intern(tys, PNode::Ref(mutbl, kids[0])),
             lf::TypeRef::Ptr { mutbl, .. } => intern(tys, PNode::Ptr(mutbl, kids[0])),
             lf::TypeRef::Slice(_) => intern(tys, PNode::Slice(kids[0])),
-            lf::TypeRef::Tuple(_) | lf::TypeRef::Record(_) | lf::TypeRef::Union(_) => {
+            lf::TypeRef::Tuple(_) | lf::TypeRef::Fallible { .. } => {
                 let l = intern_list(tys, kids)?;
                 intern(tys, PNode::Tuple(l))
+            }
+            lf::TypeRef::Record(_) => {
+                let l = intern_list(tys, kids)?;
+                intern(tys, PNode::Record(l))
+            }
+            lf::TypeRef::Union(_) => {
+                let l = intern_list(tys, kids)?;
+                intern(tys, PNode::Union(l))
             }
             lf::TypeRef::Never => intern(tys, PNode::Never),
             lf::TypeRef::Infer => intern(tys, PNode::Infer),
@@ -1830,6 +1838,10 @@ pub(super) fn children(v: &View<'_>, t: lf::TypeId, out: &mut Vec<lf::TypeId, Gl
         lf::TypeRef::Ref { inner, .. } | lf::TypeRef::Ptr { inner, .. } | lf::TypeRef::Slice(inner) => out.push(inner),
         lf::TypeRef::Array { elem, .. } => out.push(elem),
         lf::TypeRef::Tuple(l) | lf::TypeRef::Union(l) => out.extend(v.ids(l)?.iter().map(|&i| lf::TypeId(i))),
+        lf::TypeRef::Fallible { ok, err } => {
+            out.push(ok);
+            out.push(err);
+        }
         lf::TypeRef::Path(p) => {
             let path = v.path(p)?;
             for &n in v.segments(path)? {
@@ -2883,7 +2895,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     let own = lifetime_kind(v, lifetime, r, s)?;
                     s.wrap(n, Some(own))
                 }
-                lf::TypeRef::Ptr { .. } | lf::TypeRef::Slice(_) | lf::TypeRef::Array { .. } | lf::TypeRef::Pat { .. } | lf::TypeRef::Tuple(_) | lf::TypeRef::Record(_) | lf::TypeRef::Union(_) | lf::TypeRef::Never => s.wrap(n, None),
+                lf::TypeRef::Ptr { .. } | lf::TypeRef::Slice(_) | lf::TypeRef::Array { .. } | lf::TypeRef::Pat { .. } | lf::TypeRef::Tuple(_) | lf::TypeRef::Record(_) | lf::TypeRef::Union(_) | lf::TypeRef::Fallible { .. } | lf::TypeRef::Never => s.wrap(n, None),
                 lf::TypeRef::FnPtr { ret, .. } => s.fn_ptr(n, ret.is_some(), r)?,
                 lf::TypeRef::For { binder, .. } => s.for_binder(tys.view(), v, binder, made, r)?,
                 lf::TypeRef::Path(p) => self.path_regions(tys, env, v, p, made, args, n, s, r)?,

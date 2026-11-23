@@ -1048,7 +1048,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                     stack.push(c);
                     None
                 }
-                PNode::Tuple(l) | PNode::Adt(_, l) | PNode::FnPtr(l, _) => Some(l),
+                PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) | PNode::Adt(_, l) | PNode::FnPtr(l, _) => Some(l),
                 PNode::Dynamic(_) => match caller.count(t) {
                     Ok(c) if c.get() == 1 => None,
                     _ => return Ok(Some(t)),
@@ -1100,6 +1100,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                     None
                 }
                 PNode::Tuple(l)
+                | PNode::Record(l)
+                | PNode::Union(l)
                 | PNode::Adt(_, l)
                 | PNode::FnPtr(l, _)
                 | PNode::FnDef(_, l)
@@ -1171,6 +1173,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                     None
                 }
                 PNode::Tuple(l)
+                | PNode::Record(l)
+                | PNode::Union(l)
                 | PNode::Adt(_, l)
                 | PNode::FnPtr(l, _)
                 | PNode::FnDef(_, l)

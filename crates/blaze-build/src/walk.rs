@@ -996,15 +996,33 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     }
 
     /// How ground type `g` is held.
-    fn repr(&mut self, g: PTy) -> Result<Repr, TyErr> {
-        let g = self.pattern_base(g)?;
-        Ok(match self.ground_node(g)? {
+    fn repr(&mut self, mut g: PTy) -> Result<Repr, TyErr> {
+        let node = loop {
+            g = self.pattern_base(g)?;
+            match self.ground_node(g)? {
+                PNode::Union(l) if l.len == 1 => {
+                    let only = self
+                        .ground
+                        .view()
+                        .list(l)
+                        .ok()
+                        .and_then(|xs| xs.first().copied())
+                        .ok_or(TyErr::Malformed("a union list past the ground table"))?;
+                    if only.0 >= g.0 {
+                        return Err(TyErr::Malformed("a cycle in a single-member union"));
+                    }
+                    g = only;
+                }
+                other => break other,
+            }
+        };
+        Ok(match node {
             PNode::Pat(..) => return Err(TyErr::Malformed("a pattern type still wrapped after finding its base")),
             PNode::Bool => Repr::Bool,
             PNode::Int(i) => Repr::Int { ty: int_ty(i)?, signed: true },
             PNode::Uint(u) => Repr::Int { ty: uint_ty(u)?, signed: false },
             PNode::Never | PNode::FnDef(..) => Repr::None,
-            PNode::Tuple(l) if l.len == 0 => Repr::None,
+            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) if l.len == 0 => Repr::None,
             PNode::Future(..) => {
                 return Err(TyErr::Unsupported(
                     "an async block's future named by its expression in a ground type (only its identity, `PNode::Coroutine`, crosses a body: coroutine.rs)",
@@ -1012,7 +1030,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             // A closure: a struct of one field, its environment (closure.rs). A coroutine: its
             // state, whose first bytes are its upvars (coroutine.rs).
-            PNode::Adt(..) | PNode::Tuple(_) | PNode::Array(..) | PNode::Closure { .. } | PNode::Coroutine { .. } => {
+            PNode::Adt(..) | PNode::Tuple(_) | PNode::Record(_) | PNode::Union(_) | PNode::Array(..) | PNode::Closure { .. } | PNode::Coroutine { .. } => {
                 let l = self.layout(g)?;
                 // An unsized tail's struct is only ever behind a pointer (walk/unsized_tail.rs).
                 if self.has_unsized_tail(l) {
@@ -1090,11 +1108,29 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
 
     /// Whether ground type `g` is laid out as an aggregate: an ADT, an array, a non-empty
     /// tuple, or a wide pointer (a pointer `ls` lays out as an address and a length).
-    fn is_agg(&mut self, g: PTy) -> Result<bool, TyErr> {
-        Ok(match self.ground_node(g)? {
+    fn is_agg(&mut self, mut g: PTy) -> Result<bool, TyErr> {
+        let node = loop {
+            match self.ground_node(g)? {
+                PNode::Union(l) if l.len == 1 => {
+                    let only = self
+                        .ground
+                        .view()
+                        .list(l)
+                        .ok()
+                        .and_then(|xs| xs.first().copied())
+                        .ok_or(TyErr::Malformed("a union list past the ground table"))?;
+                    if only.0 >= g.0 {
+                        return Err(TyErr::Malformed("a cycle in a single-member union"));
+                    }
+                    g = only;
+                }
+                other => break other,
+            }
+        };
+        Ok(match node {
             // A coroutine's state holds its tag at least (coroutine.rs).
             PNode::Adt(..) | PNode::Array(..) | PNode::Coroutine { .. } => true,
-            PNode::Tuple(l) => l.len > 0,
+            PNode::Tuple(l) | PNode::Record(l) | PNode::Union(l) => l.len > 0,
             // Its environment is a tuple: an aggregate when it captures something.
             PNode::Closure { .. } => {
                 let env = self.closure_parts(g)?.env;
@@ -1276,10 +1312,19 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     parts.push((Name(0), ptr));
                     parts.push((Name(1), len));
                 }
-                PNode::Tuple(l) => {
+                PNode::Tuple(l) | PNode::Record(l) => {
                     let elems = self.ground.view().list(l).map_err(|_| TyErr::Malformed("a list past the ground table"))?;
                     for (i, &et) in elems.iter().enumerate() {
-                        parts.push((Name(i as u64), et));
+                        parts.push((Name(u64::try_from(i).map_err(|_| TyErr::Malformed("too many fields"))?), et));
+                    }
+                }
+                PNode::Union(l) => {
+                    let elems = self.ground.view().list(l).map_err(|_| TyErr::Malformed("a list past the ground table"))?;
+                    is_enum = true;
+                    for &et in elems.iter() {
+                        parts.push((Name(0), et));
+                        let end = u32::try_from(parts.len()).map_err(|_| TyErr::Malformed("too many union variants"))?;
+                        variant_ends.push(end);
                     }
                 }
                 PNode::Array(et, n) => {

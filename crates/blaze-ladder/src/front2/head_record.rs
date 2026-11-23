@@ -234,6 +234,8 @@ const T_EX_TRAIT: u8 = 23;
 const T_EX_PROJ: u8 = 24;
 const T_EX_AUTO: u8 = 25;
 const T_FOREIGN: u8 = 26;
+const T_RECORD: u8 = 27;
+const T_UNION: u8 = 28;
 
 /// Where to read an opaque's bounds even when an unrelated head first exposes its type.
 /// A trait method's checker key is `owner`; its bounds are in its trait's `Members` cell.
@@ -1856,6 +1858,8 @@ impl Out<'_, '_, '_> {
                 self.kid_list(ranges)?;
             }
             PNode::Tuple(l)
+            | PNode::Record(l)
+            | PNode::Union(l)
             | PNode::Adt(_, l)
             | PNode::FnDef(_, l)
             | PNode::FnPtr(l, _)
@@ -1938,6 +1942,14 @@ impl Out<'_, '_, '_> {
             PNode::Never => self.t8(T_NEVER),
             PNode::Tuple(l) => {
                 self.t8(T_TUPLE);
+                self.tlist(l)?;
+            }
+            PNode::Record(l) => {
+                self.t8(T_RECORD);
+                self.tlist(l)?;
+            }
+            PNode::Union(l) => {
+                self.t8(T_UNION);
                 self.tlist(l)?;
             }
             PNode::Ref(m, t) => {
@@ -2485,6 +2497,8 @@ impl<'r> In<'r, '_, '_> {
             }
             T_EX_AUTO => PNode::ExAuto(self.key("a trait object's auto trait")?),
             T_FOREIGN => PNode::Foreign(self.key("an extern type")?),
+            T_RECORD => PNode::Record(self.list("a record's fields")?),
+            T_UNION => PNode::Union(self.list("a union's members")?),
             byte => return Err(E::Byte { what: "a term's tag", byte }),
         };
         self.intern(n)
