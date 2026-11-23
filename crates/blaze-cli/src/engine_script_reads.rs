@@ -336,7 +336,7 @@ pub(crate) fn collect_reads<'s>(reads: impl Iterator<Item = (&'s str, Option<Con
 /// Whether the git question `command` is answered from the worktree's status (`status`, and
 /// `describe --dirty`, whose mark is the tracked status's): only the served checkout's sweep
 /// replays it ([`StatusView`]).
-fn reads_status(command: &str) -> bool {
+pub(crate) fn reads_status(command: &str) -> bool {
     command.starts_with("status ") || (command.starts_with("describe ") && command.split(' ').any(|word| word == "--dirty" || word == "--dirty=-dirty"))
 }
 

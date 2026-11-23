@@ -1154,6 +1154,11 @@ pub(crate) struct Saved {
     pub(crate) changed: (u32, u32),
     /// What the save did with the home's bases ([`BASES_ROOT`]).
     pub(crate) base: BaseKept,
+    /// The newly sealed pointer's key, lines key, and certificate facts (for the resident daemon
+    /// to update `HotAnswer` and `CheckoutWatcher` without tearing down `kqueue`).
+    pub(crate) pointer_key: Key,
+    pub(crate) lines_key: Key,
+    pub(crate) facts: Facts,
 }
 
 /// Which pages a commit keys into the answer's reach root ([`page_indexes`]).
@@ -1524,6 +1529,9 @@ fn save<'m, D: Driver, S: Sharing>(
     let key = Key(ContentId::of(POINTER_DOMAIN, &sealed));
     store.put(cx, key, &sealed)?;
     saved.puts += 1;
+    saved.pointer_key = key;
+    saved.lines_key = lines.0;
+    saved.facts = facts;
     // A page and the payloads of *every* row on it share one immutable reach index.
     // StoreSink also includes each names payload's expansion index and its children.
     // The store follows exactly one index level from an indexed root.
@@ -2431,6 +2439,24 @@ pub(crate) fn push_reach_shards<'f, D: Driver, S: Sharing>(
     }
     out.push(bstd::mem::format_in!(frame, "{name}.{REACH_ROOT}.{REACH_DELTA_SUFFIX}"));
     Ok(())
+}
+
+/// [`push_reach_shards`] directly through `PlainPlace` for the resident daemon's certified fast path.
+pub(crate) fn push_reach_shards_plain<'f, D: Driver>(
+    place: &crate::store::PlainPlace<'_, D>,
+    name: &str,
+    frame: &'f Frame,
+    out: &mut blaze_own::Vec<blaze_own::String<&'f Frame>, &'f Frame>,
+) {
+    let first = bstd::mem::format_in!(frame, "{name}.{REACH_ROOT}.00");
+    if place.root(first.as_str()).ok().flatten().is_none() {
+        return;
+    }
+    out.push(first);
+    for shard in 1..REACH_SHARDS_MOST {
+        out.push(bstd::mem::format_in!(frame, "{name}.{REACH_ROOT}.{shard:02x}"));
+    }
+    out.push(bstd::mem::format_in!(frame, "{name}.{REACH_ROOT}.{REACH_DELTA_SUFFIX}"));
 }
 
 fn reach_error(error: crate::engine_answer_rows::PublishError) -> CliError {
