@@ -230,3 +230,12 @@ fn every_lang_tag_decodes_to_its_item() {
     assert_eq!(seen, "CallRefFuture", "the list ends at the last variant");
     assert_eq!(LangItem::of_tag(LangItem::ALL.len() as u8), None, "control: a tag past the list");
 }
+
+/// A record written with the previous layout magic (`bzchkd06`) is rejected cleanly.
+#[test]
+fn previous_magic_bzchkd06_is_rejected() {
+    let h = blaze_own::testing::heap();
+    let mut old = bytes_of(&a_call());
+    old[..8].copy_from_slice(b"bzchkd06");
+    assert!(matches!(decode(&old, h.alloc()), Err(CheckedRecordError::Magic)));
+}

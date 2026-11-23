@@ -187,13 +187,17 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                             Some(m) => self.mk(TyView::Ref(m, ann_ty))?,
                             None => ann_ty,
                         };
-                        self.local_ty[p.ix()] = local;
+                        if let Some(slot) = self.local_ty.get_mut(p.ix()) {
+                            *slot = local;
+                        }
                         if let Some(sub) = sub {
                             self.push_pat(sub, ann_ty, cur_mode)?;
                         }
                     } else {
                         self.diag(DiagCode::Mismatch, at, About::types(resolved, ann_ty));
-                        self.local_ty[p.ix()] = self.common.err;
+                        if let Some(slot) = self.local_ty.get_mut(p.ix()) {
+                            *slot = self.common.err;
+                        }
                         if let Some(sub) = sub {
                             self.push_pat(sub, self.common.err, cur_mode)?;
                         }
@@ -204,7 +208,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         Some(m) => self.mk(TyView::Ref(m, ann_ty))?,
                         None => ann_ty,
                     };
-                    self.local_ty[p.ix()] = local;
+                    if let Some(slot) = self.local_ty.get_mut(p.ix()) {
+                        *slot = local;
+                    }
                     if let Some(sub) = sub {
                         self.push_pat(sub, ann_ty, cur_mode)?;
                     }

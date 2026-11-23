@@ -6881,7 +6881,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         let Some(i) = types.record_field_index(schema, f.name) else {
                             return self.refuse_pat(Form::UnknownField, f.pat);
                         };
-                        let Some(&ft) = field_tys.get(i as usize) else {
+                        let Some(&ft) = usize::try_from(i).ok().and_then(|ix| field_tys.get(ix)) else {
                             return self.refuse_pat(Form::Malformed, f.pat);
                         };
                         subs.push((i, ft, f.pat));

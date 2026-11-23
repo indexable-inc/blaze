@@ -126,7 +126,7 @@ crates/blaze-ladder/src/code_records.rs	ENTRY_MAGIC	none
 crates/blaze-ladder/src/front2/adt_facts.rs	ADT_FACTS_VERSION	none
 crates/blaze-ladder/src/front2/buckets/records.rs	FRAMED_MAGIC	none
 crates/blaze-ladder/src/front2/head_record.rs	MAGIC	none
-crates/blaze-ladder/src/front2/head_record.rs	VERSION	none
+crates/blaze-ladder/src/front2/head_record.rs	VERSION	test previous_version_34_is_rejected
 crates/blaze-ladder/src/front2/tables/head.rs	MAGIC	none
 crates/blaze-ladder/src/front2/tables/head.rs	VERSION	none
 crates/blaze-ladder/src/native_links.rs	TABLE_MAGIC	none
@@ -288,7 +288,7 @@ crates/blaze-tier/src/table.rs	TABLE_MAGIC	none
 crates/blaze-tokens/src/form.rs	TOKENS_SCHEMA	none
 crates/blaze-toolchain/src/record.rs	MAGIC	none
 crates/blaze-ty/src/portable.rs	MAGIC	none
-crates/blaze-typeck/src/checked_record.rs	CHECKED_RECORD_MAGIC	none
+crates/blaze-typeck/src/checked_record.rs	CHECKED_RECORD_MAGIC	test previous_magic_bzchkd06_is_rejected
 crates/blaze-unicode/src/lib.rs	UNICODE_VERSION	none
 crates/blaze-unicode/src/tables.rs	UNICODE_VERSION	none
 crates/blaze-unit-graph/src/record.rs	MAGIC	none

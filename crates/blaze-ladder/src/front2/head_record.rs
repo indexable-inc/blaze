@@ -2509,7 +2509,7 @@ impl<'r> In<'r, '_, '_> {
             T_RECORD => {
                 let s = blaze_typeck::RecordSchema(self.u64("a record's schema")?);
                 let n = self.u32("a record's field name count")?;
-                let mut names = Vec::with_capacity_in(n as usize, self.tys.alloc());
+                let mut names = Vec::with_capacity_in(usize::try_from(n).unwrap_or(0), self.tys.alloc());
                 for _ in 0..n {
                     names.push(self.name("a record's field name")?);
                 }
@@ -4283,5 +4283,17 @@ mod region_tests {
         );
         let control = filed([ASSOC_A, ASSOC_B], 1);
         assert!(control.is_ok(), "CONTROL: columns in name order were refused: {:?}", control.err().map(|e| std::format!("{e}")));
+    }
+
+    /// A head record written with the previous layout version (`34`) is rejected cleanly.
+    #[test]
+    fn previous_version_34_is_rejected() {
+        let t = tys();
+        let sig = ctor(&t);
+        let filed = every_part(&t, RRegion::Param(0));
+        let mut old = record(&t, &sig, Some(&filed));
+        old[4..8].copy_from_slice(&34u32.to_le_bytes());
+        let err = decode(&old, None, &tys_empty(), a()).err().expect("version 34 must be rejected");
+        assert_eq!(form_of(&err), Some(34));
     }
 }

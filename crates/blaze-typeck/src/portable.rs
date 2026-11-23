@@ -1681,7 +1681,7 @@ impl<'a> OwnTys<'a> {
             return Ok(base.view());
         }
         let (bn, bl) = (self.base_nodes as usize, self.base_lists as usize);
-        let (brs, brn) = (self.base_record_schemas as usize, self.base_record_names as usize);
+        let (brs, brn) = (usize::try_from(self.base_record_schemas).unwrap_or(usize::MAX), usize::try_from(self.base_record_names).unwrap_or(usize::MAX));
         let (base_nodes, base_lists) = (base.own.nodes(), base.own.lists());
         let (base_record_schemas, base_record_names) = (base.own.record_schemas(), base.own.record_names());
         let (Some(nodes), Some(lists), Some(rs), Some(rn)) = (

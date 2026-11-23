@@ -903,7 +903,7 @@ Every promise of a doc comment or an effect attribute and how it is held
 `Evidence:` or `Unverified:`, an effect attribute, a `# Safety` obligation, a proved contract.
 A checked attribute and an obligation are counted, not listed.
 
-4188 claims. By level: 31 none, 4 unverified, 385 obligation, 3728 checked, 0 tested, 2 simulated, 0 model-checked, 38 proved.
+4191 claims. By level: 31 none, 4 unverified, 385 obligation, 3731 checked, 0 tested, 2 simulated, 0 model-checked, 38 proved.
 
 ### Totals
 
@@ -943,7 +943,7 @@ A checked attribute and an obligation are counted, not listed.
 | blaze-sort | 0 | 0 | 5 | 0 | 0 | 0 | 0 | 0 |
 | blaze-sql | 0 | 0 | 0 | 179 | 0 | 0 | 0 | 0 |
 | blaze-sqlite | 4 | 0 | 1 | 6 | 0 | 0 | 0 | 0 |
-| blaze-std | 0 | 0 | 19 | 1262 | 0 | 0 | 0 | 0 |
+| blaze-std | 0 | 0 | 19 | 1265 | 0 | 0 | 0 | 0 |
 | blaze-store-check | 0 | 0 | 8 | 0 | 0 | 0 | 0 | 0 |
 | blaze-surface | 0 | 0 | 3 | 0 | 0 | 0 | 0 | 0 |
 | blaze-sys | 0 | 4 | 86 | 1505 | 0 | 0 | 0 | 0 |

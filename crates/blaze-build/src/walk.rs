@@ -4231,14 +4231,14 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         let PNode::Union(dst_l_list) = self.ground_node(dst_g).map_err(|error| Self::ty_err(e, error))? else {
             return Err(malformed("a union widening to other than a structural union"));
         };
-        let mut src_members: Vec<PTy, A> = Vec::new_in(self.alloc);
+        let mut src_members: blaze_own::Vec<PTy, A> = blaze_own::Vec::new_in(self.alloc);
         src_members.extend_from_slice(
             self.ground
                 .view()
                 .list(src_l_list)
                 .map_err(|_| malformed("a source union's members past the ground table"))?,
         );
-        let mut dst_members: Vec<PTy, A> = Vec::new_in(self.alloc);
+        let mut dst_members: blaze_own::Vec<PTy, A> = blaze_own::Vec::new_in(self.alloc);
         dst_members.extend_from_slice(
             self.ground
                 .view()
@@ -4334,8 +4334,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 let d = self.read_discriminant(src_id, src_at)?;
                 let join = self.create();
                 let none = self.create();
-                let mut cases: Vec<(u128, Block), A> = Vec::new_in(self.alloc);
-                let mut arms: Vec<(Block, u32, u32), A> = Vec::new_in(self.alloc);
+                let mut cases: blaze_own::Vec<(u128, Block), A> = blaze_own::Vec::new_in(self.alloc);
+                let mut arms: blaze_own::Vec<(Block, u32, u32), A> = blaze_own::Vec::new_in(self.alloc);
                 for (i_idx, &sm) in src_members.iter().enumerate() {
                     let Some(j_idx) = dst_members.iter().position(|&dm| dm == sm) else {
                         continue;

@@ -536,7 +536,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         if f.state == 2 || f.state == 3 {
             let cur_state = f.state;
-            if let Some(init) = inits.get(f.a as usize).copied() {
+            if let Some(init) = usize::try_from(f.a).ok().and_then(|i| inits.get(i)).copied() {
                 f.a += 1;
                 let to = if f.b == 0
                     && let TyView::Record(schema, field_tys) = self.view(f.t)
@@ -592,7 +592,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             return Ok(Flow::Done(f.t));
         }
         // State 4: inferred anonymous record literal `{ b: 1u8, a: 2i32 }`.
-        if let Some(init) = inits.get(f.a as usize).copied() {
+        if let Some(init) = usize::try_from(f.a).ok().and_then(|i| inits.get(i)).copied() {
             f.a += 1;
             self.resume(f, 4)?;
             self.push_expr(init.expr, Expectation::None, Then::Nothing)?;
@@ -607,9 +607,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         canonical.resize(field_count, self.common.err);
         for init in inits {
             if let Some(idx) = self.record_field_index(schema, init.name)
-                && let Some(slot) = canonical.get_mut(idx as usize)
+                && let Some(ix) = usize::try_from(idx).ok()
+                && let Some(slot) = canonical.get_mut(ix)
+                && let Some(&ety) = self.expr_ty.get(init.expr.ix())
             {
-                *slot = self.expr_ty[init.expr.ix()];
+                *slot = ety;
             }
         }
         let list = self.mk_list(&canonical)?;
@@ -624,8 +626,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             self.register_record_schema(RecordSchema::EMPTY, &[])?;
             return Ok(RecordSchema::EMPTY);
         }
-        for i in 0..self.record_schemas.len() {
-            let (schema, list) = self.record_schemas[i];
+        for &(schema, list) in self.record_schemas.iter() {
             let Some(names) = self.record_names.get(list.range()) else { continue };
             if names.len() == inits.len() && names.iter().all(|&nm| inits.iter().any(|w| w.name == nm)) {
                 return Ok(schema);

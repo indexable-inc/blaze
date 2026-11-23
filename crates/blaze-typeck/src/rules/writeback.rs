@@ -406,8 +406,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             steps: 0,
             reported: false,
         };
-        for i in 0..self.record_schemas.len() {
-            let (schema, list) = self.record_schemas[i];
+        for &(schema, list) in self.record_schemas.iter() {
             let names = if list.len == 0 {
                 &[][..]
             } else {
@@ -498,7 +497,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         for &(p, kind) in self.union_pats.iter() {
             union_pats.push((p, kind));
         }
-        union_pats.sort_by_key(|rows, i| rows.column::<0>()[i]);
+        union_pats.sort_by_key(|rows, i| rows.column::<0>().get(i).copied().unwrap_or(PatId(0)));
         let mut fields: Fields<'a> = Soa::with_capacity_in(self.fields.len(), alloc);
         for &(e, v, f) in self.fields.iter() {
             fields.push((e, v, f));

@@ -1334,9 +1334,9 @@ fn encode_rows<'b>(c: &Checked<'_>, stalled_proved: bool, alloc: Alloc<'b>) -> R
     })?;
     w.column(Col::TyRecordNames, view.record_names_iter(), |p, &n| p.u64(n.0))?;
     let a = &c.union_pats;
-    w.column(Col::UnionPats, 0..a.len(), |p, i| {
-        p.u32(a.column::<0>()[i].0);
-        match a.column::<1>()[i] {
+    w.column(Col::UnionPats, a.column::<0>().iter().copied().zip(a.column::<1>().iter().copied()), |p, (pat, kind)| {
+        p.u32(pat.0);
+        match kind {
             UnionPat::Variant(v) => {
                 p.u8(0);
                 p.u32(v);
@@ -1490,12 +1490,12 @@ impl<'r> CheckedRecord<'r> {
         if end != b.lists {
             return Err(E::ListRows { row: self.rows(Col::TyListRows), start: b.lists, expected: end });
         }
-        let mut record_names = Vec::with_capacity_in(self.rows(Col::TyRecordNames) as usize, alloc);
+        let mut record_names = Vec::with_capacity_in(usize::try_from(self.rows(Col::TyRecordNames)).unwrap_or(0), alloc);
         self.each(Col::TyRecordNames, |g| {
             record_names.push(Name(g.u64()?));
             Ok(())
         })?;
-        let n_record_names = record_names.len() as u64;
+        let n_record_names = u64::try_from(record_names.len()).unwrap_or(u64::MAX);
         self.each(Col::TyRecordSchemas, |g| {
             let schema = RecordSchema(g.u64()?);
             let l = g.raw_list()?;

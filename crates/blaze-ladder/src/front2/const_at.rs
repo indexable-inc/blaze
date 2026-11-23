@@ -417,7 +417,7 @@ pub fn copy_ground(from: PTys<'_>, args: &[PTy], into: &mut PortableTys<'_>, scr
             if !reached[at] {
                 continue;
             }
-            let raw_node = from.node(PTy(at as u32)).map_err(|_| CopyFail::Malformed)?;
+            let raw_node = from.node(PTy(u32::try_from(at).map_err(|_| CopyFail::Malformed)?)).map_err(|_| CopyFail::Malformed)?;
             if let PNode::Record(s, _) = raw_node
                 && let Some(names) = from.record_names(s)
             {

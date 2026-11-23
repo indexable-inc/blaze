@@ -315,7 +315,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             2 => {
                 if f.c & 4 != 0
                     && let Some(prev_idx) = f.a.checked_sub(1)
-                    && let Some(prev_arm) = arm_list.get(prev_idx as usize)
+                    && let Some(prev_arm) = usize::try_from(prev_idx).ok().and_then(|i| arm_list.get(i))
                     && prev_arm.guard.is_none()
                 {
                     let matched = self
@@ -368,7 +368,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
                 TyView::Union(orig_members) => {
                     let n = self.ty.list_len(orig_members);
-                    let mut remaining = blaze_own::Vec::with_capacity_in(n as usize, self.alloc);
+                    let mut remaining = blaze_own::Vec::with_capacity_in(usize::try_from(n).unwrap_or(0), self.alloc);
                     for i in 0..n {
                         remaining.push(i);
                     }
@@ -391,15 +391,16 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 && let Some(narrow) = self.match_narrow.last()
             {
                 let orig_members = narrow.orig_members;
-                let orig_len = self.ty.list_len(orig_members) as usize;
+                let orig_len = usize::try_from(self.ty.list_len(orig_members)).unwrap_or(usize::MAX);
                 let rem_len = narrow.remaining.len();
                 let mode = narrow.peeled_mode;
                 if rem_len < orig_len {
                     if rem_len == 0 {
                         self.push_pat(arm.pat, self.common.never, mode)?;
                         return Ok(Flow::Wait);
-                    } else if rem_len == 1 {
-                        let rem_v = narrow.remaining[0];
+                    } else if rem_len == 1
+                        && let Some(&rem_v) = narrow.remaining.first()
+                    {
                         let member_ty = self.ty.list_get(orig_members, rem_v);
                         self.union_pats.push((arm.pat, UnionPat::Variant(rem_v)));
                         self.push_pat(arm.pat, member_ty, mode)?;

@@ -357,7 +357,7 @@ impl<'a> Checked<'a> {
     /// How pattern `p` matches or narrows a structural union, if applicable.
     pub fn union_pat_of(&self, p: PatId) -> Option<UnionPat> {
         let at = self.union_pats.column::<0>().binary_search(&p).ok()?;
-        Some(self.union_pats.column::<1>()[at])
+        self.union_pats.column::<1>().get(at).copied()
     }
 
     /// Equal results ignoring the read list and needs: what the read-list property compares.
