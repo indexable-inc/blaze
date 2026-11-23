@@ -2688,8 +2688,26 @@ impl Tables<'_> {
     /// The address of `want`'s table, placed (leaked) on first use; the tables of supertraits
     /// off the first chain first, by a stack.
     fn place(&mut self, want: crate::vtable::VtableRef, fn_addr: &dyn Fn(ItemKey, Option<List>) -> u64) -> u64 {
-        use crate::vtable::{Shape, VtableRef, VtableTarget, Word};
+        use crate::layout::{LayoutFacts, Missing, ReprAttrs, ValidRange};
+        use crate::vtable::{Shape, VtableTarget};
+        struct NoFacts;
+        impl LayoutFacts for NoFacts {
+            fn adt(&self, _: ItemKey) -> Option<blaze_typeck::Adt<'_>> {
+                None
+            }
+            fn repr(&self, item: ItemKey) -> Result<ReprAttrs, Missing> {
+                Err(Missing { item })
+            }
+            fn discriminant(&self, item: ItemKey, _: u32) -> Result<Option<i128>, Missing> {
+                Err(Missing { item })
+            }
+            fn valid_range(&self, item: ItemKey) -> Result<ValidRange, Missing> {
+                Err(Missing { item })
+            }
+        }
+        let alloc = blaze_own::testing::heap().alloc();
         let facts = self.facts;
+        let world = NoFacts;
         let mut stack = Vec::new_in(Global);
         stack.push(want);
         while let Some(&t) = stack.last() {
@@ -2697,22 +2715,26 @@ impl Tables<'_> {
                 stack.pop();
                 continue;
             }
-            let shape = Shape::of(t.principal, facts, Global).expect("the test's trait facts");
-            let above = |s: ItemKey| VtableRef { concrete: t.concrete, principal: s, args: List::EMPTY };
-            let missing = shape.words.iter().find_map(|w| match *w {
-                Word::Super(s) => (!self.placed.iter().any(|(r, _)| *r == above(s))).then(|| above(s)),
-                Word::Method { .. } => None,
-            });
-            if let Some(r) = missing {
-                stack.push(r);
-                continue;
-            }
+            let shape = Shape::of(t.principal, facts, alloc).expect("the test's trait facts");
             let &(_, size, align, glue) = self.sizes.iter().find(|s| s.0 == t.concrete).expect("the concrete type's size in the test");
             let args = self.ground.view().list(t.args).expect("the table's arguments").to_vec();
             // Word 0: `drop_in_place::<T>`, the glue instance at the concrete type.
             let glue_args = self.ground.intern_list(&[t.concrete]).expect("the glue's arguments");
             let drop = glue.map(|item| Instance { item, args: glue_args });
-            let table = crate::vtable::Vtable::build(&shape, t.concrete, &args, size, align, drop, self.ground, Global).expect("the table");
+            let table = crate::vtable::Vtable::build(&shape, t.concrete, &args, size, align, drop, self.ground, &world, alloc, Global).expect("the table");
+            let mut pushed_super = false;
+            for &(_, to) in table.relocs.iter() {
+                if let VtableTarget::Super(sup) = to
+                    && !self.placed.iter().any(|(r, _)| *r == sup)
+                    && !stack.contains(&sup)
+                {
+                    stack.push(sup);
+                    pushed_super = true;
+                }
+            }
+            if pushed_super {
+                continue;
+            }
             let words: std::vec::Vec<u64> = table.bytes.chunks(8).map(|c| u64::from_le_bytes(c.try_into().expect("a word"))).collect();
             let words: &'static mut [u64] = std::vec::Vec::leak(words);
             for &(offset, to) in table.relocs.iter() {
@@ -2726,7 +2748,7 @@ impl Tables<'_> {
                             .unwrap_or_else(|| panic!("no impl fn of {:?} for the table's type in the test", i.item));
                         fn_addr(f, None)
                     }
-                    VtableTarget::Super(s) => self.placed.iter().find(|(r, _)| *r == above(s)).expect("placed above").1,
+                    VtableTarget::Super(sup) => self.placed.iter().find(|(r, _)| *r == sup).expect("placed above").1,
                 };
             }
             self.placed.push((t, words.as_ptr() as u64));

@@ -340,7 +340,7 @@ impl World {
             text.push_str(&std::format!("{k:?} {s:?} {m:?};"));
             stack.extend(s.iter().rev().map(|x| x.trait_));
         }
-        Some(ObjectTrait { supers, super_args: &[], methods, shape: id(&text) })
+        Some(ObjectTrait { supers, tys: blaze_typeck::PTys::EMPTY, methods, shape: id(&text) })
     }
 }
 
@@ -784,9 +784,11 @@ fn records(w: &World, obj: ItemKey, method: &str) -> Records {
     let main_key = record_key_of(w, &b, w.main, root, &[(lit, 5)], &mut ground);
     let gu64 = ground_of(&w.fx, &mut ground, w.u64_);
     let facts = w.object_trait(obj).expect("the trait's facts");
-    let key = crate::vtable::vtable_key(gu64, obj, &[], facts.shape, &mut ground, Alloc::global()).expect("the key");
-    let shape = crate::vtable::Shape::of(obj, |t| w.object_trait(t), Global).expect("the shape");
-    let table = crate::vtable::Vtable::build(&shape, gu64, &[], 8, 8, None, &mut ground, Global).expect("the table");
+    let alloc = blaze_own::testing::heap().alloc();
+    let key = crate::vtable::vtable_key(gu64, obj, &[], facts.shape, &mut ground, alloc).expect("the key");
+    let adts = FxAdts { w, lits: &[] };
+    let shape = crate::vtable::Shape::of(obj, |t| w.object_trait(t), alloc).expect("the shape");
+    let table = crate::vtable::Vtable::build(&shape, gu64, &[], 8, 8, None, &mut ground, &adts, alloc, Global).expect("the table");
     Records { main: blaze_lir::print(main.func.view()), main_key, key, bytes: table.bytes.to_vec(), relocs: table.relocs.to_vec() }
 }
 

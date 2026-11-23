@@ -292,7 +292,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     (_, None) => return Err(refused(e, None, "an unsizing to a trait object of auto traits alone (no principal trait)")),
                     (Some((a, _)), Some((b, _))) if a == b => vt,
                     (Some((a, _)), Some((b, _))) => {
-                        let shape = crate::vtable::Shape::of(a, |t| self.adts.object_trait(t), self.alloc)
+                        let shape = crate::vtable::Shape::of(a, |t| self.adts.object_trait(t), self.scratch)
                             .map_err(|error| BuildError::Vtable { at: Some(e), error })?;
                         match shape.upcast(b) {
                             Some(crate::vtable::Upcast::Prefix) => vt,

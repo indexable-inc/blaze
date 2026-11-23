@@ -404,8 +404,9 @@ impl Front2Program<'_> {
 /// One trait as a trait object sees it (blaze-build's `vtable::ObjectTrait`, owned).
 struct ObjectTable {
     supers: Vec<blaze_build::vtable::ObjectSuper, Global>,
-    /// The pool `supers`' argument spans index (blaze-build's `ObjectTrait::super_args`).
-    super_args: Vec<u32, Global>,
+    /// The portable type table holding `supers`' argument trees (`None` when no supertrait
+    /// carries generic arguments).
+    super_tys: Option<PortableTys<'static>>,
     methods: Vec<blaze_build::vtable::ObjectMethod, Global>,
     shape: ContentId,
 }
@@ -554,34 +555,36 @@ fn object_tables<'n, S: super::source::NamesSource<'n>>(
             let head = r.store.maps.traits.get(&lib).ok_or_else(|| String::from("made, but no head filed under its key"))?;
             let supers_written = r.store.maps.supers.get(&lib).ok_or_else(|| String::from("made, but no supertraits filed under its key"))?;
             let view = r.store.tys.view();
+            let err_super = |sk: ItemKey, detail: core::fmt::Arguments<'_>| format!("its supertrait {}: {detail}", fn_shown(r, sk));
             let mut supers = Vec::with_capacity_in(supers_written.len(), Global);
-            let mut super_args: Vec<u32, Global> = Vec::new_in(Global);
+            let mut super_tys: Option<PortableTys<'static>> = None;
+            let mut copied: Vec<PTy, Global> = Vec::new_in(Global);
             let mut waiting = false;
             for &(s, args) in supers_written.iter() {
                 let sk = checker_of(s);
-                let written = view.list(args).map_err(|e| format!("its supertrait {}'s arguments: {e:?}", fn_shown(r, sk)))?;
+                let written = view.list(args).map_err(|e| err_super(sk, format_args!("arguments: {e:?}")))?;
                 // `Self` is the first argument (always the trait's own `Self`); each one after
-                // it is filed by the position of the trait's own parameter it is (`Self` 0, the
-                // trait's parameters from 1): `FnMut<Args>: FnOnce<Args>` files `[1]`. The
-                // builder composes them down the tree (blaze-build vtable.rs `Shape::of`).
-                let at = super_args.len();
-                for &a in written.iter().skip(1) {
-                    match view.node(a) {
-                        Ok(tc::PNode::Param(i) | tc::PNode::ConstParam(i)) => super_args.push(i),
-                        _ => {
-                            return Err(format!(
-                                "its supertrait {} has an argument that is not one of the trait's own parameters, which a table does not carry yet",
-                                fn_shown(r, sk)
-                            ));
-                        }
+                // it is copied as a portable type tree parameterized over this trait's own
+                // parameters (`Self` 0, its parameters from 1): both bare parameters
+                // (`FnMut<Args>: FnOnce<Args>`) and concrete/compound types
+                // (`Buffer: AsRef<[u8]>`, `Sub<T>: Super<Option<T>>`). The builder composes
+                // them down the tree (blaze-build vtable.rs `Shape::of`).
+                let span = if written.len() > 1 {
+                    let tys = super_tys.get_or_insert_with(|| PortableTys::new_in(r.store.tys.alloc()));
+                    copied.clear();
+                    for &a in written.iter().skip(1) {
+                        let c = tys.copy_from(view, a, None).map_err(|e| err_super(sk, format_args!("argument: {e:?}")))?;
+                        copied.push(c);
                     }
-                }
-                let span = blaze_build::vtable::ArgSpan {
-                    at: u32::try_from(at).map_err(|_| String::from("more supertrait arguments than a table indexes"))?,
-                    len: u32::try_from(super_args.len() - at).map_err(|_| String::from("more supertrait arguments than a table indexes"))?,
+                    if tys.view().nodes().any(|n| matches!(n, tc::PNode::Infer | tc::PNode::Error | tc::PNode::Future(..))) {
+                        return Err(err_super(sk, format_args!("non-portable argument type")));
+                    }
+                    tys.intern_list(&copied).map_err(|e| err_super(sk, format_args!("arguments: {e:?}")))?
+                } else {
+                    List::EMPTY
                 };
                 if refused.contains_key(&sk) {
-                    return Err(format!("its supertrait {} has no table", fn_shown(r, sk)));
+                    return Err(err_super(sk, format_args!("has no table")));
                 }
                 if !tables.contains_key(&sk) {
                     asked.push(sk);
@@ -602,20 +605,22 @@ fn object_tables<'n, S: super::source::NamesSource<'n>>(
                 let item = head.fns.iter().find(|(n, _)| *n == m.name).map(|(_, f)| *f).ok_or_else(|| String::from("a method with no fn filed under its name"))?;
                 methods.push(blaze_build::vtable::ObjectMethod { item, dispatch });
             }
-            let mut h = blaze_ids::Hasher::new("blaze-ladder front2 object trait 2");
+            let mut h = blaze_ids::Hasher::new("blaze-ladder front2 object trait 3");
             h.update(&k.0.to_le_bytes());
             for m in methods.iter() {
                 h.update(&m.item.0.to_le_bytes()).update(&[u8::from(m.dispatch)]);
             }
+            let super_view = super_tys.as_ref().map_or(PTys::EMPTY, PortableTys::view);
             for s in supers.iter() {
                 let below = tables.get(&s.trait_).map_or([0; 32], |t| t.shape.0);
                 h.update(&s.trait_.0.to_le_bytes()).update(&below).update(&s.args.len.to_le_bytes());
-                let at = s.args.at as usize;
-                for p in &super_args[at..at + s.args.len as usize] {
-                    h.update(&p.to_le_bytes());
+                let list = super_view.list(s.args).map_err(|e| err_super(s.trait_, format_args!("arguments: {e:?}")))?;
+                for &a in list {
+                    crate::code_records::reads::term(&mut h, a, super_view)
+                        .map_err(|e| err_super(s.trait_, format_args!("argument digest: {e:?}")))?;
                 }
             }
-            Ok(Some(ObjectTable { supers, super_args, methods, shape: h.finish() }))
+            Ok(Some(ObjectTable { supers, super_tys, methods, shape: h.finish() }))
         })();
         match why {
             Ok(None) => {}
@@ -1944,7 +1949,8 @@ impl FrontEnd for Front2Program<'_> {
 
     fn object_trait(&self, t: ItemKey) -> Option<blaze_build::vtable::ObjectTrait<'_>> {
         let o = self.objects.get(&t)?;
-        Some(blaze_build::vtable::ObjectTrait { supers: &o.supers, super_args: &o.super_args, methods: &o.methods, shape: o.shape })
+        let tys = o.super_tys.as_ref().map_or(PTys::EMPTY, PortableTys::view);
+        Some(blaze_build::vtable::ObjectTrait { supers: &o.supers, tys, methods: &o.methods, shape: o.shape })
     }
 
     /// The fn `name` of the lang trait `trait_` (`Deref::deref`), filed with its trait's head,
