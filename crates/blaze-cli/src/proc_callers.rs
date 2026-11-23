@@ -32,12 +32,24 @@ pub(crate) struct Placed<'a> {
     by_package: Vec<(LockId, Place<'static>), Alloc<'a>>,
 }
 
-impl Placed<'_> {
+impl Placed<'static> {
+    /// Leaks the sorted package places onto the static heap slice so worker threads can share it.
+    pub(crate) fn leak_slice(self) -> &'static [(LockId, Place<'static>)] {
+        self.by_package.leak_static()
+    }
+}
+
+/// Looks up `package` in a sorted slice produced by [`Placed::leak_slice`].
+pub(crate) fn placed_of(placed: &[(LockId, Place<'static>)], package: LockId) -> Option<Place<'static>> {
+    let at = placed.partition_point(|(id, _)| *id < package);
+    placed.get(at).filter(|(id, _)| *id == package).map(|(_, place)| *place)
+}
+
+impl<'a> Placed<'a> {
     /// Where the package `package` is, as the world was told; `None`: the world never placed
     /// it (no unit of it was listed), which the runner refuses by the crate's name.
     pub(crate) fn of(&self, package: LockId) -> Option<Place<'static>> {
-        let at = self.by_package.partition_point(|(id, _)| *id < package);
-        self.by_package.get(at).filter(|(id, _)| *id == package).map(|(_, place)| *place)
+        placed_of(&self.by_package, package)
     }
 }
 

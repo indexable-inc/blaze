@@ -110,7 +110,7 @@ pub(crate) const COMMIT_BYTES: u64 = 256 << 20;
 /// `InArena`: the one copy a put makes is read in place by every reader and snapshot; a phase
 /// boundary is a checkpoint ([`PlainPlace::checkpoint`]: a commit only past [`COMMIT_BYTES`] or
 /// [`CHECKPOINT_AGE_NS`]), and the commit after the answer writes the rest.
-pub(crate) const VISIBILITY: Visibility = Visibility::AfterCommit;
+pub(crate) const VISIBILITY: Visibility = Visibility::InArena { shared: blaze_mem::Kept(blaze_mem::Tag::Store) };
 
 /// Under `Visibility::InArena`, a phase boundary commits what is put when the oldest of it has
 /// waited this long (first value, accepted 2026-11-21): a command killed after a long phase

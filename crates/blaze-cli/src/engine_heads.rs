@@ -309,7 +309,7 @@ impl HeadsStage {
         if !items.is_empty() && !tasks.is_empty()
             && let (Some(graph), Some(names)) = (handles.graph, handles.names)
             && let Some(list) = kept.list(&cx, store, &graph, frame)?
-            && kept.trees(&cx, handles.env, graph.out, &list, frame).is_ok()
+            && kept.lazy_trees(handles.env, graph.out, list).is_ok()
         {
             let cache = scope_cache.get_or_insert_with(|| crate::engine_bodies::ScopeCache::new(CrateGraph::len(&list), g));
             let mut by_name: Vec<(Name, usize), Alloc<'static>> = Vec::with_capacity_in(CrateGraph::len(&list), g);
@@ -360,6 +360,9 @@ impl HeadsStage {
             }
         }
         let closed_worked = self.run_items(&cx, store, read, handles, kept, &items, view, buffer, times, alloc, frame, snapshot, &snapshot_owner, &mut scope_cache, &closed_jobs, at_cells)?;
+        if tasks.is_empty() {
+            return Ok(());
+        }
         // Stopped while the head tasks ran (engine_status.rs): the crates' tables are not begun,
         // each refused and owed (no read), and the driver stops before the merge.
         if handles.board.stopping().is_some() {
@@ -396,12 +399,10 @@ impl HeadsStage {
             }
             return Ok(());
         };
-        let (packs, corrected) = match kept.trees(&cx, handles.env, graph.out, &list, frame) {
+        let (packs, corrected) = match kept.lazy_trees(handles.env, graph.out, list) {
             Ok(trees) => trees,
             Err(why) => {
-                // A pack missing from the shelf or the sources store, or not the one the list's
-                // world read (body_types.rs `open_trees`): the machine's files, not a cell, so
-                // owed (rule 3: no invented read).
+                // The heap refused room for the tree table (body_types.rs `lazy_trees`): owed.
                 for task in tasks.iter() {
                     refuse(task, why, &[], buffer);
                 }
@@ -460,15 +461,17 @@ impl HeadsStage {
                 Err(cause) => refuse(task, crate::engine_head_notes::leak(heap.alloc(), format_args!("its crate's check scope was not read: {cause}")), &scope_cells(graph.name, &list, at, None), buffer),
             }
         }
-        // Source text belongs to its outline under either names-read strategy.
+        // Source text belongs to its outline under either names-read strategy; only member crates
+        // appearing in the active jobs' scopes can ever be queried by `Owners::place`.
         let subjects = match !jobs.is_empty() {
-            true => member_subjects(cache, read, &cx, store, names, &list, handles.outlined, heap),
+            true => member_subjects(cache, read, &cx, store, names, &list, handles.outlined, &jobs, heap),
             false => SVec::new_in(heap.shared()),
         };
         let subjects = &subjects[..];
         // 2. The tables, at once, on the workers.
         let procs = names.stage().names.as_ref().and_then(|names| names.procs());
         let root = handles.root;
+        let fs = &handles.env.fs;
         let outlined = handles.outlined;
         let clock = handles.clock;
         let mut worked: std::vec::Vec<(Result<Result<Worked, &'static str>, work::Panicked>, u64), Global> = std::vec::Vec::with_capacity_in(jobs.len(), Global);
@@ -480,7 +483,7 @@ impl HeadsStage {
                 let clock = clock.clone();
                 running.push(scope.may_overlap("engine impl tables", HEADS_FRAME, move |cx: &Cx| {
                     let began = clock.now();
-                    let made = work::unwinding(|| tables_of(cx, root, outlined, packs, corrected, procs, job, subjects, at_cells, heap, listings, snapshot));
+                    let made = work::unwinding(|| tables_of(cx, root, fs, outlined, packs, corrected, procs, job, subjects, at_cells, heap, listings, snapshot));
                     Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
                 }));
             }
@@ -527,6 +530,11 @@ impl HeadsStage {
             times.push(name, ns);
             let one = match made {
                 Ok(Ok(one)) => one,
+                // A pack missing from the shelf or sources store is a machine failure: owed.
+                Ok(Err(why)) if packs.refused().is_some() => {
+                    refuse(task, why, &[], buffer);
+                    continue;
+                }
                 // `tables_of` over the scope's records: a refusal of them is a function of the
                 // graph's cell (the packs) and each scope crate's names cell.
                 Ok(Err(why)) => {
@@ -550,7 +558,10 @@ impl HeadsStage {
             defines.sort_unstable_by_key(|(cell, _)| *cell);
             defines.dedup_by_key(|(cell, _)| *cell);
             let mut reads: SVec<'a, (CellId, ContentId)> = SVec::with_capacity_in(one.reads.len() + 1, alloc);
-            let own = CellId { of: job.own, cell: WHOLE };
+            let own = match at_cells {
+                true => names_read(view, CellId { of: job.own, cell: Cell(blaze_scope::names_cells::NameCell::ImplRows { krate: job.krate.prefix() }.key()) }),
+                false => CellId { of: job.own, cell: WHOLE },
+            };
             reads.push((own, view.cell(&own)));
             for id in one.reads.iter() {
                 if id.of.kind == Kind::Signature {
@@ -688,8 +699,9 @@ where
 fn tables_of(
     cx: &Cx,
     root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
+    fs: &bstd::fs::Fs,
     outlined: &[Outlined<'_>],
-    packs: &'static [blaze_fetch::PackView<'static>],
+    packs: &'static crate::body_types::SyncLazyTrees<'static>,
     corrected: &'static [(u32, &'static str, &'static str)],
     procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
     job: &Job<'_>,
@@ -701,9 +713,12 @@ fn tables_of(
 ) -> Result<Worked, &'static str> {
     let frame = cx.frame();
     let g = heap.alloc();
-    let records = open_scope(cx, root, outlined, &job.crates, packs, corrected, procs, frame, g, snapshot)?;
+    let records = open_scope(cx, root, fs, outlined, &job.crates, packs, corrected, procs, frame, g, snapshot)?;
     let mut rows = Vec::new_in(g);
     if !NamesSource::each_impl_row(records, 0, &mut |row| rows.push(row)) {
+        if let Some(why) = packs.refused() {
+            return Err(why);
+        }
         return Err("its crate's records hold no impl rows (front2 source.rs `each_impl_row`)");
     }
     let workers = usize::try_from(cx.workers()).unwrap_or(1);
@@ -725,7 +740,7 @@ fn tables_of(
             for slice in rows.chunks(step) {
                 running.push(scope.may_overlap("engine impl tables chunk", HEADS_FRAME, move |cx: &Cx| {
                     let g = heap.alloc();
-                    let rec = open_scope(cx, root, outlined, &job.crates, packs, corrected, procs, cx.frame(), g, snapshot)?;
+                    let rec = open_scope(cx, root, fs, outlined, &job.crates, packs, corrected, procs, cx.frame(), g, snapshot)?;
                     let recorder = Recorder::new(RecorderOpts { alloc: g });
                     let view = Tables::new(TablesOpts { records: rec, impls: None, lang_crates: &[], reads: &recorder });
                     let chunk = file_impl_rows_chunk(view, 0, slice, shared)
@@ -752,6 +767,9 @@ fn tables_of(
                 chunk_err.get_or_insert("its impl tables chunk pool failed (engine_heads.rs `tables_of`)");
             }
         }
+        if let Some(why) = packs.refused() {
+            return Err(why);
+        }
         if let Some(why) = chunk_err {
             return Err(why);
         }
@@ -767,6 +785,9 @@ fn tables_of(
         (out, defines_v, reads_v, heads_v, written.records)
     } else {
         let done = impl_tables_task(records, 0, &rows, g);
+        if let Some(why) = packs.refused() {
+            return Err(why);
+        }
         if done.failed.is_some() {
             return Err("its impl tables were not written (front2 buckets/records.rs `impl_tables_task`: a row its writer refuses)");
         }
@@ -775,6 +796,9 @@ fn tables_of(
         }
         let tables = done.records.ok_or("its impl tables' task made no records")?;
         let (reads_v, heads_v) = place_table_reads(records, &job.crates, subjects, at_cells, listings, &done.reads, g, g).map_err(|e| e.0)?;
+        if let Some(why) = packs.refused() {
+            return Err(why);
+        }
         let mut defines_v = Vec::with_capacity_in(done.defines.len(), g);
         defines_v.extend(done.defines.iter().copied());
         (done.out, defines_v, reads_v, heads_v, tables)
@@ -2357,6 +2381,7 @@ pub(crate) fn names_read(view: View<'_, '_>, id: CellId) -> CellId {
 /// `groups` make in their member loops (to be this one home once lane RU1's per-unit heads land
 /// there). A member whose records do not open lists no file: its heads are then placed as a
 /// dependency's (its record whole), never missed.
+#[expect(clippy::too_many_arguments, reason = "phase-level member subjects lookup over active jobs")]
 fn member_subjects<'r>(
     cache: &mut crate::engine_bodies::ScopeCache<'r>,
     read: &mut EngineRecords<'r>,
@@ -2365,11 +2390,22 @@ fn member_subjects<'r>(
     names: crate::engine_names::NamesInputs<'_, '_>,
     list: &blaze_world::crate_list::CrateList<'static>,
     outlined: &[Outlined<'_>],
+    jobs: &[Job<'r>],
     heap: &'static blaze_own::Heap,
 ) -> SVec<'static, Subject> {
     let g = heap.alloc();
+    let mut members: Vec<usize, Alloc<'static>> = Vec::new_in(g);
+    for job in jobs.iter() {
+        for one in job.crates.iter() {
+            if list.member(one.world_at) {
+                members.push(one.world_at);
+            }
+        }
+    }
+    members.sort_unstable();
+    members.dedup();
     let mut subjects = SVec::new_in(heap.shared());
-    for member in (0..CrateGraph::len(list)).filter(|at| list.member(*at)) {
+    for member in members.iter().copied() {
         // A member whose own records cannot be read lists no file here (its heads placed as a
         // dependency's, coarser, never missed); its typed cause is printed by the refusal of
         // that member's own head tasks and bodies.
@@ -2651,10 +2687,10 @@ impl HeadsStage {
             }
             return Ok(Vec::new_in(g));
         };
-        let (packs, corrected) = match kept.trees(cx, handles.env, graph.out, &list, frame) {
+        let (packs, corrected) = match kept.lazy_trees(handles.env, graph.out, list) {
             Ok(trees) => trees,
             Err(why) => {
-                // The machine's packs (body_types.rs `open_trees`), not a cell: owed (rule 3).
+                // The heap refused room for the tree table (body_types.rs `lazy_trees`): owed.
                 for task in tasks.iter() {
                     refuse(task, why, &[], buffer);
                 }
@@ -2662,14 +2698,20 @@ impl HeadsStage {
             }
         };
         let cache = scope_cache.get_or_insert_with(|| crate::engine_bodies::ScopeCache::new(CrateGraph::len(&list), g));
-        // 1. Every member's files and check scope, on this thread: each scope crate's records
-        // read in place through `read`, opened and checked once a request however many members'
-        // scopes hold it (engine_records.rs), and the workers below handed shared borrows of them.
+        // 1. Only members whose module tree reaches an entered task's file have their check scope
+        // opened up front; other members are touched only if an entered task's file was not held by
+        // any reaching member, or if they appear as a member dependency inside an active job's scope.
+        let mut task_files: Vec<Name, Alloc<'static>> = Vec::with_capacity_in(tasks.len(), g);
+        task_files.extend(tasks.iter().map(|task| task.planned.file));
+        task_files.sort_unstable();
+        task_files.dedup();
         let mut subjects = SVec::new_in(alloc);
         let mut jobs: std::vec::Vec<ItemJob<'r>, Global> = std::vec::Vec::new_in(Global);
+        let mut loaded_subjects: Vec<[u8; 8], Alloc<'static>> = Vec::new_in(g);
+        let mut unvisited_members: Vec<usize, Alloc<'static>> = Vec::new_in(g);
         // What "its file is in no member crate's items record" is a function of: the graph's
-        // cell (which crates are members, their roots) and every member's names cell (its items
-        // record; ABSENT for a member whose names task failed, so its fix moves the row).
+        // cell (which crates are members, their roots) and every member's files cell (which files
+        // its items record lists; ABSENT for a member whose names task failed).
         let mut no_member: std::vec::Vec<CellId, Global> = std::vec::Vec::new_in(Global);
         no_member.push(graph_cell);
         // Every member's items record was read: then a file none lists is no unit's (a `cfg` on
@@ -2682,15 +2724,44 @@ impl HeadsStage {
         // Each member unit's cfg-blind walk of its module tree (engine_body_plan.rs `reached`,
         // the planner's walk): with its names task and crate prefix. A unit whose walk reaches a
         // task's file but whose items record does not list it (a `#[cfg(test)]` on its `mod`)
-        // is a unit the task's heads are NOT frozen under, and that is a fact of the unit's
-        // records: the row reads the unit's not-held cell (engine_body_plan.rs `not_held_cell`,
-        // the one home Bodies reads too), so a cfg taken off enters the task again (rule 21).
+        // reads its `Files` cell (`file_not_held_cell`), so a cfg taken off enters the task again.
         let mut walks: Vec<(Name, [u8; 8], Vec<Name, Alloc<'static>>), Alloc<'static>> = Vec::new_in(g);
+        let push_member_subjects = |subjects: &mut SVec<'a, Subject>, member: usize, prefix: [u8; 8], items: &ItemsRecord<'_>| -> bool {
+            let mut matched_task_file = false;
+            for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
+                let Ok(Some(row)) = items.file_surface(file) else { continue };
+                let Some(path) = row.path.in_package(list.shown_from(member), g) else { continue };
+                let Some(path) = path.strip_prefix("/0/") else { continue };
+                if let Some(one) = handles.outlined.iter().find(|one| one.path.as_slice() == path.as_bytes()) {
+                    if task_files.binary_search(&one.name).is_ok() {
+                        matched_task_file = true;
+                    }
+                    subjects.push(Subject::new(prefix, file, one));
+                }
+            }
+            matched_task_file
+        };
+        let make_job = |prefix, scope: crate::engine_bodies::Scope<'r>, whole, cut_words, cells| ItemJob {
+            prefix,
+            crates: scope.crates,
+            lang: scope.lang,
+            whole,
+            cut_words,
+            cells,
+            tasks: std::vec::Vec::new_in(Global),
+        };
         for member in (0..CrateGraph::len(&list)).filter(|at| list.member(*at)) {
             let root = list.root(member);
+            let scope_name = blaze_drive::key::crate_scope_name(&list.key(member));
+            let prefix = list.key(member).prefix();
             let reach = crate::engine_body_plan::reached(handles.outlined, Name::file(root.strip_prefix("/0/").unwrap_or(root).as_bytes()), g).map_err(EngineCheckError::Unoutlined)?;
-            walks.push((blaze_drive::key::crate_scope_name(&list.key(member)), list.key(member).prefix(), reach));
-            no_member.push(CellId { of: blaze_drive::key::crate_scope_name(&list.key(member)), cell: WHOLE });
+            let reaches_any = task_files.iter().any(|file| reach.binary_search(file).is_ok());
+            walks.push((scope_name, prefix, reach));
+            no_member.push(crate::engine_body_plan::file_not_held_cell(view, scope_name, prefix));
+            if !reaches_any {
+                unvisited_members.push(member);
+                continue;
+            }
             let (scope, whole) = match crate::engine_bodies::scope_of_cached(cache, read, cx, store, names, &list, member, heap) {
                 Ok(made) => made,
                 Err(cause) => {
@@ -2708,16 +2779,64 @@ impl HeadsStage {
                 unread.get_or_insert_with(|| crate::engine_head_notes::leak(g, format_args!("the items record of crate `{}` does not open (blaze-scope items_record.rs `ItemsRecord::open`)", CrateGraph::name(&list, member))));
                 continue;
             };
-            let prefix = list.key(member).prefix();
-            for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
-                let Ok(Some(row)) = items.file_surface(file) else { continue };
-                let Some(path) = row.path.in_package(list.shown_from(member), g) else { continue };
-                let Some(path) = path.strip_prefix("/0/") else { continue };
-                if let Some(one) = handles.outlined.iter().find(|one| one.path.as_slice() == path.as_bytes()) {
-                    subjects.push(Subject::new(prefix, file, one));
+            let _ = push_member_subjects(&mut subjects, member, prefix, &items);
+            loaded_subjects.push(prefix);
+            jobs.push(make_job(prefix, scope, whole, cut_words, cells));
+        }
+        // Fallback: if any entered task's file was not held by any reaching member (e.g. a file
+        // loaded via macro-expanded `mod`, or a file cut by `#[cfg]` where we must verify all
+        // remaining members' own items records to prove no unit holds it), inspect only their own
+        // items records first and open a full check scope only if one actually holds a task file.
+        let mut held_files: Vec<Name, Alloc<'static>> = Vec::with_capacity_in(subjects.len(), g);
+        held_files.extend(subjects.iter().map(|row| row.slot));
+        held_files.sort_unstable();
+        held_files.dedup();
+        if task_files.iter().any(|file| held_files.binary_search(file).is_err()) {
+            for member in unvisited_members.iter().copied() {
+                let prefix = list.key(member).prefix();
+                let own_records = match cache.records_of(read, cx, store, names, &list, member, g) {
+                    Ok((_, own)) => own,
+                    Err(cause) => {
+                        every_member_read = false;
+                        unread_count = unread_count.saturating_add(1);
+                        unread.get_or_insert_with(|| crate::engine_head_notes::leak(g, format_args!("its check scope was not read: {cause}")));
+                        continue;
+                    }
+                };
+                let Ok(items) = ItemsRecord::open(own_records.items, g) else {
+                    every_member_read = false;
+                    unread_count = unread_count.saturating_add(1);
+                    unread.get_or_insert_with(|| crate::engine_head_notes::leak(g, format_args!("the items record of crate `{}` does not open (blaze-scope items_record.rs `ItemsRecord::open`)", CrateGraph::name(&list, member))));
+                    continue;
+                };
+                let mut holds_task_file = false;
+                for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
+                    let Ok(Some(row)) = items.file_surface(file) else { continue };
+                    let Some(path) = row.path.in_package(list.shown_from(member), g) else { continue };
+                    let Some(path) = path.strip_prefix("/0/") else { continue };
+                    if handles.outlined.iter().any(|one| one.path.as_slice() == path.as_bytes() && task_files.binary_search(&one.name).is_ok()) {
+                        holds_task_file = true;
+                        break;
+                    }
                 }
+                if !holds_task_file {
+                    continue;
+                }
+                let (scope, whole) = match crate::engine_bodies::scope_of_cached(cache, read, cx, store, names, &list, member, heap) {
+                    Ok(made) => made,
+                    Err(cause) => {
+                        every_member_read = false;
+                        unread_count = unread_count.saturating_add(1);
+                        unread.get_or_insert_with(|| crate::engine_head_notes::leak(g, format_args!("its check scope was not read: {cause}")));
+                        continue;
+                    }
+                };
+                let cells = scope_cells(graph.name, &list, member, Some(&scope));
+                let cut_words = scope.cut_cause(&list).map(|cause| crate::engine_head_notes::leak(g, format_args!("its crate's {cause}")));
+                let _ = push_member_subjects(&mut subjects, member, prefix, &items);
+                loaded_subjects.push(prefix);
+                jobs.push(make_job(prefix, scope, whole, cut_words, cells));
             }
-            jobs.push(ItemJob { prefix, crates: scope.crates, lang: scope.lang, whole, cut_words, cells, tasks: std::vec::Vec::new_in(Global) });
         }
         subjects.sort_unstable();
         jobs.sort_unstable_by_key(|job| job.prefix);
@@ -2797,7 +2916,7 @@ impl HeadsStage {
                     let held = &held[..held.partition_point(|(file, _)| *file == task.planned.file)];
                     for (unit, prefix, reach) in walks.iter() {
                         if reach.binary_search(&task.planned.file).is_ok() && !held.iter().any(|(_, one)| one == prefix) {
-                            made.reads.push(crate::engine_body_plan::not_held_cell(view, *unit, *prefix));
+                            made.reads.push(crate::engine_body_plan::file_not_held_cell(view, *unit, *prefix));
                         }
                     }
                     accs.push((*task, made));
@@ -2810,6 +2929,31 @@ impl HeadsStage {
         shows.dedup_by_key(|(name, _)| *name);
         let shows = &shows[..];
         jobs.retain(|job| !job.tasks.is_empty());
+        // Populate `subjects` for any member dependency crate appearing inside active jobs' scopes
+        // so `Owners::place` and `crate_setup` identify every in-scope member crate accurately.
+        if !jobs.is_empty() {
+            loaded_subjects.sort_unstable();
+            loaded_subjects.dedup();
+            let mut dep_members: Vec<usize, Alloc<'static>> = Vec::new_in(g);
+            for job in jobs.iter() {
+                for one in job.crates.iter() {
+                    if list.member(one.world_at) && loaded_subjects.binary_search(&one.records.key.prefix()).is_err() {
+                        dep_members.push(one.world_at);
+                    }
+                }
+            }
+            dep_members.sort_unstable();
+            dep_members.dedup();
+            if !dep_members.is_empty() {
+                for member in dep_members.iter().copied() {
+                    let Ok((_, own_records)) = cache.records_of(read, cx, store, names, &list, member, g) else { continue };
+                    let Ok(items) = ItemsRecord::open(own_records.items, g) else { continue };
+                    let prefix = list.key(member).prefix();
+                    let _ = push_member_subjects(&mut subjects, member, prefix, &items);
+                }
+                subjects.sort_unstable();
+            }
+        }
         // Group the tasks of each file before choosing whole-file cuts.
         for job in jobs.iter_mut() {
             job.tasks.sort_unstable_by_key(|task| (task.planned.file, task.planned.name));
@@ -2820,6 +2964,7 @@ impl HeadsStage {
         // each over a source and recorders of its own (`heads_of`), all crates' splits at once.
         let procs = names.stage().names.as_ref().and_then(|names| names.procs());
         let root = handles.root;
+        let fs = &handles.env.fs;
         let outlined = handles.outlined;
         let clock = handles.clock;
         let subjects = &subjects[..];
@@ -2853,7 +2998,7 @@ impl HeadsStage {
                     let made = if board.stopping().is_some() {
                         Ok(Err(NOT_BEGUN))
                     } else {
-                        work::unwinding(|| tables_of(cx, root, outlined, packs, corrected, procs, job, &[], at_cells, heap, listings, snapshot))
+                        work::unwinding(|| tables_of(cx, root, fs, outlined, packs, corrected, procs, job, &[], at_cells, heap, listings, snapshot))
                     };
                     Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
                 }));
@@ -2863,7 +3008,7 @@ impl HeadsStage {
                 let clock = clock.clone();
                 running.push(scope.may_overlap("engine heads: a crate's setup", HEADS_FRAME, move |cx: &Cx| {
                     let began = clock.now();
-                    let made = work::unwinding(|| crate_setup(cx, root, outlined, packs, corrected, procs, job, subjects, view, heap, listings, snapshot));
+                    let made = work::unwinding(|| crate_setup(cx, root, fs, outlined, packs, corrected, procs, job, subjects, view, heap, listings, snapshot));
                     Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
                 }));
             }
@@ -2934,7 +3079,7 @@ impl HeadsStage {
                     scope.may_overlap("engine heads", HEADS_FRAME, move |cx: &Cx| {
                         let began = clock.now();
                         let on_board = OnBoard { board, clock: &clock, shows };
-                        let made = work::unwinding(|| heads_of(cx, root, outlined, packs, corrected, procs, job, setup, tasks, subjects, view, expansion_reads, heap, once, listings, head_jobs.listings, on_board, snapshot));
+                        let made = work::unwinding(|| heads_of(cx, root, fs, outlined, packs, corrected, procs, job, setup, tasks, subjects, view, expansion_reads, heap, once, listings, head_jobs.listings, on_board, snapshot));
                         Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
                     }),
                 ));
@@ -2986,12 +3131,14 @@ impl HeadsStage {
                 Ok(Ok(_)) => {}
                 // The scope's records not opened, or its lang index or listing refused
                 // (`crate_setup`): a function of the graph's cell (the packs) and each scope
-                // crate's names cell.
+                // crate's names cell, unless a pack failed on the machine (owed).
                 Ok(Err(why)) => {
                     let why = *why;
+                    let owed = packs.refused().is_some();
+                    let cells: &[CellId] = if owed { &[] } else { &job.cells };
                     for task in job.tasks.iter() {
                         if let Some(i) = acc(&accs, task) {
-                            accs[i].1.fail(why, &job.cells, false);
+                            accs[i].1.fail(why, cells, owed);
                         }
                     }
                     continue;
@@ -3020,9 +3167,11 @@ impl HeadsStage {
                     Ok(Ok(made)) => made,
                     // The split's records not opened again (`heads_of`): as the setup's.
                     Ok(Err(why)) => {
+                        let owed = packs.refused().is_some();
+                        let cells: &[CellId] = if owed { &[] } else { &job.cells };
                         for task in tasks.iter() {
                             if let Some(i) = acc(&accs, task) {
-                                accs[i].1.fail(why, &job.cells, false);
+                                accs[i].1.fail(why, cells, owed);
                             }
                         }
                         continue;
@@ -3234,16 +3383,17 @@ struct CrateSetup {
 fn open_scope<'n>(
     cx: &'n Cx,
     root: &'n bstd::fs::Dir<bstd::fs::ReadWrite>,
+    fs: &'n bstd::fs::Fs,
     outlined: &'n [Outlined<'n>],
     crates: &[Crate<'n>],
-    packs: &'static [blaze_fetch::PackView<'static>],
+    packs: &'static crate::body_types::SyncLazyTrees<'static>,
     corrected: &'static [(u32, &'static str, &'static str)],
     procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
     frame: &'n Frame,
     g: Alloc<'static>,
     snapshot: &'n crate::store::StoreSnapshot,
 ) -> Result<&'n Records<'n>, &'static str> {
-    let packs = (packs, Some(outlined));
+    let packs = ((packs, fs), Some(outlined));
     let opened = crate::run_names::names_records_with_snapshot(cx, root, crates, packs, corrected, procs, std::vec::Vec::new_in(Global), None, Some(snapshot), None, frame, g).map_err(|_| "its crate's records could not be opened (run_names.rs `names_records`)")?;
     Ok(opened.records)
 }
@@ -3256,8 +3406,9 @@ fn open_scope<'n>(
 fn crate_setup(
     cx: &Cx,
     root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
+    fs: &bstd::fs::Fs,
     outlined: &[Outlined<'_>],
-    packs: &'static [blaze_fetch::PackView<'static>],
+    packs: &'static crate::body_types::SyncLazyTrees<'static>,
     corrected: &'static [(u32, &'static str, &'static str)],
     procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
     job: &ItemJob<'_>,
@@ -3269,7 +3420,7 @@ fn crate_setup(
 ) -> Result<CrateSetup, &'static str> {
     let frame = cx.frame();
     let g = heap.alloc();
-    let records = open_scope(cx, root, outlined, &job.crates, packs, corrected, procs, frame, g, snapshot)?;
+    let records = open_scope(cx, root, fs, outlined, &job.crates, packs, corrected, procs, frame, g, snapshot)?;
     let mut lang: Vec<usize, Alloc<'static>> = Vec::with_capacity_in(job.lang.len(), g);
     lang.extend_from_slice(&job.lang);
     let lang: &'static [usize] = lang.leak_static();
@@ -3334,6 +3485,9 @@ fn crate_setup(
     }
     let over = job.crates.first().filter(|one| one.records.key == crate_key).map(|one| &one.records).ok_or("its crate is not the first of the crates its records were opened over (run_names.rs `names_records`)")?;
     let listing = listings.listing(records, over, 0, crate_key, subjects)?;
+    if let Some(why) = packs.refused() {
+        return Err(why);
+    }
     Ok(CrateSetup { lang, sized, pointers, lang_reads: lang_reads.leak_static(), pointer_reads: pointer_reads.leak_static(), members, listing })
 }
 
@@ -3348,8 +3502,9 @@ fn crate_setup(
 fn heads_of(
     cx: &Cx,
     root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
+    fs: &bstd::fs::Fs,
     outlined: &[Outlined<'_>],
-    packs: &'static [blaze_fetch::PackView<'static>],
+    packs: &'static crate::body_types::SyncLazyTrees<'static>,
     corrected: &'static [(u32, &'static str, &'static str)],
     procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
     job: &ItemJob<'_>,
@@ -3367,7 +3522,7 @@ fn heads_of(
 ) -> Result<std::vec::Vec<Result<WorkedHead, HeadFailed>, Global>, &'static str> {
     let frame = cx.frame();
     let g = heap.alloc();
-    let records = open_scope(cx, root, outlined, &job.crates, packs, corrected, procs, frame, g, snapshot)?;
+    let records = open_scope(cx, root, fs, outlined, &job.crates, packs, corrected, procs, frame, g, snapshot)?;
     let CrateSetup { lang, sized, pointers, lang_reads, pointer_reads, members, listing } = *setup;
     let unused = Recorder::new(RecorderOpts { alloc: g });
     let base = Tables::new(TablesOpts { records, impls: None, lang_crates: lang, reads: &unused });
@@ -3439,10 +3594,41 @@ fn heads_of(
             adt_failed: false,
         };
         // A head task whose entry body holds items owns any block impls first written there.
-        // Its signature source intentionally ignores body tokens, so the unit's names record
-        // is the read that re-enters the same task when the first block item appears.
-        if mine.first().is_some_and(|head| head.body_holds_items) {
-            worked.reads.push(crate::engine_body_plan::not_held_cell(view, scope_name, job.prefix));
+        // Its signature source intentionally ignores body tokens, so read each body's deterministic
+        // block-module expansion cell (`NameCell::Expansion { call: block_key(crate_key, body) }`):
+        // absent until the first block module appears, changing when one is added or edited, and
+        // completely unaffected by sibling items added elsewhere in the crate.
+        #[cfg(test)]
+        let mut own_block_reads: Vec<CellId, Alloc<'static>> = Vec::new_in(g);
+        if mine.iter().any(|head| head.body_holds_items) {
+            let mut containers: Vec<blaze_id::ItemKey, Alloc<'static>> = Vec::new_in(g);
+            let mut pushed_any = false;
+            let mut push_block = |body: blaze_id::ItemKey| {
+                let call = crate::body_types::covered::block_key(crate_key, body);
+                let id = names_read(view, CellId { of: scope_name, cell: Cell(blaze_scope::names_cells::NameCell::Expansion { call }.key()) });
+                worked.reads.push(id);
+                #[cfg(test)]
+                own_block_reads.push(id);
+                pushed_any = true;
+            };
+            for head in mine.iter().filter(|head| head.body_holds_items) {
+                match head.want {
+                    Want::Fn(lib) => push_block(lib),
+                    Want::Impl(lib) | Want::Members(lib) | Want::MemberFn(lib, _) => {
+                        if containers.scan_for(&lib).is_none() {
+                            containers.push(lib);
+                            records.each_member_row(lib, &mut |m| push_block(m.key));
+                        }
+                    }
+                    Want::Head(_) | Want::Adt(_) => {}
+                }
+            }
+            if !pushed_any {
+                let id = crate::engine_body_plan::not_held_cell(view, scope_name, job.prefix);
+                worked.reads.push(id);
+                #[cfg(test)]
+                own_block_reads.push(id);
+            }
         }
         let mut failed: Option<&'static str> = None;
         let mut incomplete_reads = false;
@@ -3512,6 +3698,10 @@ fn heads_of(
             failed.get_or_insert(why);
             incomplete_reads = true;
         }
+        if let Some(why) = packs.refused() {
+            failed.get_or_insert(why);
+            incomplete_reads = true;
+        }
         // What the phase keeps of this task until its row is written: each cell once, in a
         // block of that size.
         if failed.is_some() {
@@ -3528,7 +3718,7 @@ fn heads_of(
                 }
             }
             ListingsPlant::DropItemText(missing) => worked.reads.retain(|id| *id != missing),
-            ListingsPlant::DropOwnNames => worked.reads.retain(|id| *id != crate::engine_body_plan::not_held_cell(view, scope_name, job.prefix)),
+            ListingsPlant::DropOwnNames => worked.reads.retain(|id| own_block_reads.scan_for(id).is_none()),
             _ => {}
         }
         once_each(&mut worked.reads);

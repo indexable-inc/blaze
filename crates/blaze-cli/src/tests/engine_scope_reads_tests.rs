@@ -362,21 +362,13 @@ fn including(io: &Io, with_include: bool) -> std::string::String {
     lib
 }
 
-/// AN ITEM ADDED ENTERS NO BODY THAT READS NO FILE. D111's include filing asks a body's file
-/// (over records: the items section WHOLE, tables view.rs `file_paths`) only at the body's first
-/// include read (blaze-ladder front2/body_left.rs `file_body_left_includes`, 2026-11-21). Asked of
-/// every body (body.rs before: `body_file` for each), a struct added entered every body of the
-/// crate in every unit's row, "read moved CrateScope (names cell)" (run t82: R6 14 where 2).
+/// AN ITEM ADDED ENTERS NO BODY THAT READS NO FILE, AND WITH `NameCell::Files` EVEN AN
+/// INCLUDING BODY STANDS WHEN AN UNRELATED ITEM IS ADDED. D111's include filing asks a body's
+/// file paths (`Tables::file_paths`) through `NameCell::Files`, which hashes only the crate's
+/// file list (not its items), so adding an unrelated struct moves neither ordinary bodies nor
+/// `include_str!` bodies.
 ///
-/// THE CAUSE'S READ, KEPT (rule 23): a body that DOES include a file reads its file row, through
-/// its host and the filing alike, so the same struct added enters it, its rows alone (D191: "Every
-/// unit that holds a body checks it"; the rows per body are the first request's new rows over its
-/// bodies). That is the eager read's effect, on the one body that makes it. OPEN (said, not
-/// hidden): the file row has no cell of its own (names_cells.rs: `Whole { Items }`), so an
-/// including body re-enters on ANY item of its crate added, not only when its file's place moves.
-///
-/// Prints `an item added: 0 bodies entered; an including body: its 2 rows` (2 with D191's lib
-/// and lib-test units).
+/// Prints `an item added: 0 bodies entered (including body: 0 of 2 rows)`.
 #[test]
 fn an_item_added_enters_no_body_that_reads_no_file() {
     let mut rows_seen = 0;
@@ -395,9 +387,8 @@ fn an_item_added_enters_no_body_that_reads_no_file() {
         let added = format!("{lib}pub struct Extra;\n");
         let answers = request(&sides, &format!("{what}: an unrelated struct added"), &[("src/lib.rs", &added)]);
         let cells = &answers[0].checked;
-        let want = if with_include { rows } else { 0 };
-        assert_eq!(bodies(cells), want, "{what}: an unrelated struct added enters {} under Cells (body_left.rs `file_body_left_includes` asks the file at an include alone): {}\n{}", if with_include { "the including body's rows alone" } else { "no body" }, entries(cells), because_lines(&answers[0].profile).join("\n"));
+        assert_eq!(bodies(cells), 0, "{what}: an unrelated struct added enters no body under Cells (Tables::file_paths reads NameCell::Files): {}\n{}", entries(cells), because_lines(&answers[0].profile).join("\n"));
         println!("{what}: an unrelated struct added: cells {}; whole {}", entries(cells), entries(&answers[1].checked));
     }
-    println!("an item added: 0 bodies entered; an including body: its {rows_seen} rows");
+    println!("an item added: 0 bodies entered (including body: 0 of {rows_seen} rows)");
 }

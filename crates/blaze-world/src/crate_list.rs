@@ -1003,6 +1003,16 @@ impl<'b> CrateGraph<'b> for CrateList<'b> {
 /// shown_from, side, proc_macro, toolchain, member, refused, the environment's facts, sysroot, each dependency's name and
 /// key, each tree's origin and files, and each corrected file.
 pub fn differences(world: &World<'_>, list: &CrateList<'_>) -> usize {
+    differences_inner(world, list, true)
+}
+
+/// As [`differences`], skipping the pack/origin table comparison for worlds constructed lazily
+/// via [`crate::world_from_list`] whose packs are opened on demand rather than eagerly mapped.
+pub fn differences_without_packs(world: &World<'_>, list: &CrateList<'_>) -> usize {
+    differences_inner(world, list, false)
+}
+
+fn differences_inner(world: &World<'_>, list: &CrateList<'_>, check_packs: bool) -> usize {
     let mut differ = 0;
     if list.len() != world.crates.len() {
         differ += 1;
@@ -1042,11 +1052,13 @@ pub fn differences(world: &World<'_>, list: &CrateList<'_>) -> usize {
             differ += 1;
         }
     }
-    let (packs, origins) = (world.texts.packs(), world.texts.origins());
-    differ += packs.len().abs_diff(list.trees());
-    for (k, (pack, origin)) in packs.iter().zip(origins.iter()).enumerate() {
-        if list.tree(k + 1) != Some(TreeRow { origin: *origin, kind: pack.kind(), files: pack.tree().0 }) {
-            differ += 1;
+    if check_packs {
+        let (packs, origins) = (world.texts.packs(), world.texts.origins());
+        differ += packs.len().abs_diff(list.trees());
+        for (k, (pack, origin)) in packs.iter().zip(origins.iter()).enumerate() {
+            if list.tree(k + 1) != Some(TreeRow { origin: *origin, kind: pack.kind(), files: pack.tree().0 }) {
+                differ += 1;
+            }
         }
     }
     let mut corrected = list.corrected();

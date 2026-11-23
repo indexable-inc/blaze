@@ -187,19 +187,49 @@ pub(crate) fn outline_from<A: core::alloc::Allocator + Copy>(name: Name, key: Ke
     };
     let mut made = Record::new_in(name, alloc);
     made.out = view.out;
-    made.parts.extend(view.parts());
-    for path in view.paths() {
-        let at = made.path_bytes.len() as u32;
-        made.path_bytes.extend_from_slice(path.path);
-        made.paths.push((path.name, at, made.path_bytes.len() as u32, path.module));
+    let parts = view.parts();
+    if parts.len() > 0 {
+        made.parts.reserve_exact(parts.len());
+        made.parts.extend(parts);
     }
-    for finding in view.findings() {
-        let at = made.messages.len();
-        made.messages.extend_from_slice(finding.message);
-        made.findings.push((finding.rule, finding.start, finding.end, at, made.messages.len()));
+    let path_count = view.paths().size_hint().0;
+    if path_count > 0 {
+        made.paths.reserve_exact(path_count);
+        let mut path_bytes = 0usize;
+        for path in view.paths() {
+            path_bytes += path.path.len();
+        }
+        made.path_bytes.reserve_exact(path_bytes);
+        for path in view.paths() {
+            let at = u32::try_from(made.path_bytes.len()).unwrap_or(u32::MAX);
+            made.path_bytes.extend_from_slice(path.path);
+            let end = u32::try_from(made.path_bytes.len()).unwrap_or(u32::MAX);
+            made.paths.push((path.name, at, end, path.module));
+        }
     }
-    made.reads.extend(view.reads());
-    made.payload.extend_from_slice(view.payload);
+    let finding_count = view.finding_count();
+    if finding_count > 0 {
+        made.findings.reserve_exact(finding_count);
+        let mut msg_bytes = 0usize;
+        for finding in view.findings() {
+            msg_bytes += finding.message.len();
+        }
+        made.messages.reserve_exact(msg_bytes);
+        for finding in view.findings() {
+            let at = made.messages.len();
+            made.messages.extend_from_slice(finding.message);
+            made.findings.push((finding.rule, finding.start, finding.end, at, made.messages.len()));
+        }
+    }
+    let reads = view.reads();
+    if reads.len() > 0 {
+        made.reads.reserve_exact(reads.len());
+        made.reads.extend(reads);
+    }
+    if !view.payload.is_empty() {
+        made.payload.reserve_exact(view.payload.len());
+        made.payload.extend_from_slice(view.payload);
+    }
     Ok(made)
 }
 
@@ -217,6 +247,9 @@ pub(crate) struct RecordLine {
     /// still holds in its heap or frames (results not yet released), and every byte the store
     /// holds copied in its heap (its arena), whichever stage put it.
     pub(crate) held: u64,
+    /// Payload bytes of this stage's own results still held in its heap or frames after the merge
+    /// (excluding the store's shared arena under `Visibility::InArena`).
+    pub(crate) results_held: u64,
     /// Copies of a record's bytes made into this process's memory on the way to the store or
     /// back from it (a joined record, the store's arena), and their bytes.
     pub(crate) copies: u64,
@@ -388,7 +421,9 @@ impl Ledger {
         let (extra, extra_bytes) = core::mem::take(&mut self.extra_copies[stage.index()]);
         line.copies += store.copies.saturating_sub(self.seen.copies).saturating_sub(extra);
         line.copy_bytes += store.copy_bytes.saturating_sub(self.seen.copy_bytes).saturating_sub(extra_bytes);
-        line.held = self.results[stage.index()] + store.held_bytes;
+        let results_held = self.results[stage.index()];
+        line.results_held = results_held;
+        line.held = results_held + store.held_bytes;
         self.seen = store;
         self.memory.merged(stage);
     }

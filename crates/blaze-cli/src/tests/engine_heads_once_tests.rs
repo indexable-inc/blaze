@@ -386,6 +386,8 @@ impl HeadRows {
         part(NameCell::Incoherent { krate }, "Incoherent".into());
         part(NameCell::InternalSymbols { krate }, "InternalSymbols".into());
         part(NameCell::Links { krate }, "Links".into());
+        part(NameCell::ImplRows { krate }, "ImplRows".into());
+        part(NameCell::Files { krate }, "Files".into());
         part(NameCell::Module { module }, "Module(crate root)".into());
         part(NameCell::Item { key: module }, "Item(crate root)".into());
         part(NameCell::Textual { module }, "Textual(crate root)".into());

@@ -107,6 +107,17 @@ impl<'w, B: AsRef<[u8]>> Toolchain<'w, B> {
     /// Opens toolchain `id`'s manifest on `shelf` and reads the pack of every unit `needs`
     /// reaches for `triple`.
     pub fn open<S: Shelf<Bytes = B>>(shelf: &mut S, id: ToolchainId, triple: &'w str, needs: Needs, alloc: Bump<'w>) -> Result<Toolchain<'w, B>, WorldError<'w>> {
+        Self::open_inner(shelf, id, triple, needs, true, alloc)
+    }
+
+    /// Opens toolchain `id`'s manifest on `shelf` and computes every kept toolchain crate's
+    /// metadata and key identically to [`Toolchain::open`], without reading or hashing any
+    /// toolchain pack from the shelf. Packs are opened on demand through `SyncLazyTrees`.
+    pub fn open_manifest_only<S: Shelf<Bytes = B>>(shelf: &mut S, id: ToolchainId, triple: &'w str, needs: Needs, alloc: Bump<'w>) -> Result<Toolchain<'w, B>, WorldError<'w>> {
+        Self::open_inner(shelf, id, triple, needs, false, alloc)
+    }
+
+    fn open_inner<S: Shelf<Bytes = B>>(shelf: &mut S, id: ToolchainId, triple: &'w str, needs: Needs, load_packs: bool, alloc: Bump<'w>) -> Result<Toolchain<'w, B>, WorldError<'w>> {
         let bump = alloc;
         let alloc = bump.alloc();
         let manifest = blaze_toolchain::shelf::open_manifest(shelf, id).map_err(WorldError::Toolchain)?;
@@ -168,7 +179,14 @@ impl<'w, B: AsRef<[u8]>> Toolchain<'w, B> {
             // its row's value and edges (`row.sysroot`, `row.deps()`).
             let own = PackageEdition::of_manifest(krate.edition).map_err(|_| WorldError::ToolchainEdition { krate: name, written: bump.alloc_str(krate.edition) })?;
             let own_implicit = implicit(own, if proc_macro { &blaze_unit_graph::UnitKind::ProcMacro } else { &blaze_unit_graph::UnitKind::Lib });
-            let pack = blaze_toolchain::shelf::open_pack(shelf, id, &krate).map_err(WorldError::Toolchain)?;
+            let pack_idx = if load_packs {
+                let pack = blaze_toolchain::shelf::open_pack(shelf, id, &krate).map_err(WorldError::Toolchain)?;
+                let idx = packs.len();
+                packs.push(pack);
+                idx
+            } else {
+                usize::MAX
+            };
             let index = crates.len();
             let mut base = blaze_own::AString::with_capacity_in(16, alloc);
             base.push_str("/");
@@ -219,9 +237,8 @@ impl<'w, B: AsRef<[u8]>> Toolchain<'w, B> {
                 cfg: cfg.into_bump_slice(),
                 proc_macro,
                 role: krate.role,
-                pack: packs.len(),
+                pack: pack_idx,
             });
-            packs.push(pack);
         }
         for (c, mut deps) in crates.iter_mut().zip(raw_deps.into_iter()) {
             for dep in deps.iter_mut() {

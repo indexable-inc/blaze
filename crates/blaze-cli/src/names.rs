@@ -74,7 +74,7 @@ pub(crate) mod sections;
 // `crate_scope_name`): it names the crate's task, not its record's form, so a form change
 // moves this source domain alone (every key moves; the name a reader reads by stays). Bump it
 // there only when what a name stands for changes.
-const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 16";
+const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 17";
 /// The out: the names record AND the checkout files the crate holds ([`crate_out`]). "1" was
 /// the names record alone, but a body's check reads its crate's items record to find which
 /// crate owns its file (body_types.rs `prepare`): a module file created gave a new record at
@@ -777,9 +777,12 @@ pub(crate) struct NamesWorld<'f> {
     /// The unit graph the world was made from (leaked with it): a proc-macro crate's unit, whose
     /// module identity the runner keys it by (proc_runner.rs).
     graph: &'static blaze_unit_graph::UnitGraph<'static>,
-    /// Where the world placed each locked package (proc_callers.rs): what a proc macro called
-    /// in a crate of that package is shown.
-    placed: crate::proc_callers::Placed<'f>,
+    /// Where the world placed each locked package (proc_callers.rs): populated on the eager
+    /// discovery path (`make_world`), empty on the lazy standing-list path (`make_world_from_list`).
+    placed: &'static [(LockId, blaze_world::Place<'static>)],
+    /// On-demand pack opener when the world was made lazily from a standing `CrateList`
+    /// (`make_world_from_list`); `None` when packs were opened eagerly into `world.texts.packs()`.
+    lazy_trees: Option<&'static crate::body_types::SyncLazyTrees<'static>>,
     /// The names step's own frame ([`NAMES_FRAME`], held to the command's end): what the world
     /// read into it, for the profile's memory line ([`Names::held`]).
     frame: &'static Frame,
@@ -793,6 +796,25 @@ impl<'f> NamesWorld<'f> {
         &self.world
     }
 
+    /// Whether `self.world.texts.packs()` holds all opened packs (true for eager discovery, false
+    /// when packs are opened lazily via [`Self::lazy_trees`]).
+    pub(crate) fn has_open_packs(&self) -> bool {
+        self.lazy_trees.is_none()
+    }
+
+    /// On-demand pack opener when this world was built lazily from a standing `CrateList`.
+    pub(crate) fn lazy_trees(&self) -> Option<&'static crate::body_types::SyncLazyTrees<'static>> {
+        self.lazy_trees
+    }
+
+    /// Thread-safe packs view for names workers (`SyncLazy` when built lazily, `Open` when eager).
+    pub(crate) fn packs<'a>(&'a self, fs: &'a bstd::fs::Fs) -> crate::job_texts::SyncPacks<'a> {
+        match self.lazy_trees {
+            Some(lazy) => crate::job_texts::SyncPacks::SyncLazy(lazy, fs),
+            None => crate::job_texts::SyncPacks::Open(self.world.texts.packs()),
+        }
+    }
+
     /// The unit graph the world was made from.
     pub(crate) fn graph(&self) -> &'static blaze_unit_graph::UnitGraph<'static> {
         self.graph
@@ -804,8 +826,8 @@ impl<'f> NamesWorld<'f> {
     }
 
     /// Where the world placed each locked package (proc_callers.rs).
-    pub(crate) fn placed(&self) -> &crate::proc_callers::Placed<'f> {
-        &self.placed
+    pub(crate) fn placed(&self) -> &'static [(LockId, blaze_world::Place<'static>)] {
+        self.placed
     }
 
     /// Each build-script run the world's crates read: (its `Script` subject, as the world named
@@ -959,7 +981,7 @@ impl<'f> Names<'f> {
         if view.out != maker.out {
             return refused(WorldWhy::Back(crate::engine_units::BackRefused::Out { key: maker.record }));
         }
-        let made = match make_world(&cx, root, sections.graph, maker.lock, maker.members, env) {
+        let made = match make_world(&cx, root, sections.graph, maker.lock, maker.members, env, Some(self.list)) {
             Ok(made) => made,
             Err(why) => return refused(WorldWhy::Make(why)),
         };
@@ -1130,7 +1152,11 @@ impl Names<'_> {
     /// [`Names::list_differences`] against `made`, before it is kept.
     fn differences_from(&self, made: &NamesWorld<'_>) -> usize {
         let world = &made.world;
-        let mut differ = blaze_world::crate_list::differences(world, &self.list);
+        let mut differ = if made.has_open_packs() {
+            blaze_world::crate_list::differences(world, &self.list)
+        } else {
+            blaze_world::crate_list::differences_without_packs(world, &self.list)
+        };
         for (at, krate) in world.crates.iter().enumerate() {
             if at >= self.list.len() {
                 break;
@@ -1237,7 +1263,7 @@ pub(crate) fn world<'f>(
     let heap: Alloc<'static> = env.heap.alloc();
     let mut dirs: blaze_own::Vec<(LockId, &str), Alloc<'static>> = blaze_own::Vec::with_capacity_in(members.len(), heap);
     dirs.extend(members.iter().map(|(id, dir)| (*id, dir.as_str())));
-    let made = make_world(cx, root, graph_record, lock, &dirs, env)?;
+    let made = make_world(cx, root, graph_record, lock, &dirs, env, None)?;
     let list: &'static [u8] = {
         let _cx = cx.span("names: the crate list written");
         blaze_world::crate_list::encode_with(&made.world, &made, heap).map_err(NamesError::List)?.leak_static()
@@ -1258,8 +1284,26 @@ pub(crate) fn world<'f>(
     Ok(names)
 }
 
+/// Places only workspace path packages from `paths`, without touching any fetched source record.
+struct CheckoutOnly<'l, 'w> {
+    paths: &'w [(LockId, &'w str)],
+    lock: &'l Lock<'w>,
+    alloc: blaze_own::Bump<'w>,
+}
+
+impl<'w> blaze_world::Packages<'w> for CheckoutOnly<'_, 'w> {
+    fn place(&mut self, package: LockId) -> Result<blaze_world::Place<'w>, WorldError<'w>> {
+        match self.paths.iter().find(|(id, _)| *id == package) {
+            Some((_, dir)) => Ok(blaze_world::Place::Checkout { dir }),
+            None => Err(WorldError::PathNotPlaced { package: self.alloc.alloc_str(&self.lock.package(package).name) }),
+        }
+    }
+}
+
 /// The names world made from the graph record `graph_record`, the lock and the members'
-/// directories, anchor-relative ([`world`], [`Names::made_or_make`]).
+/// directories, anchor-relative ([`world`], [`Names::made_or_make`]). When `stored_list` is
+/// `Some`, builds lazily via `open_list_light` + `world_from_list` + `SyncLazyTrees` without
+/// opening any toolchain or fetched package pack up front.
 fn make_world<'f>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
@@ -1267,17 +1311,11 @@ fn make_world<'f>(
     lock_whole: &'f Lock<'static>,
     members: &[(LockId, &str)],
     env: &FetchEnv<'_>,
+    stored_list: Option<CrateList<'static>>,
 ) -> Result<NamesWorld<'f>, NamesError> {
-    // The lock as given, `'static` inside: the fetch path below is typed at `'static` so the
-    // places it answers can be shown to the proc-macro sandbox (proc_callers.rs).
     let lock: &'f Lock<'f> = lock_whole;
-    // The command's allocator for the world and the records: the process's heap, handed from
-    // `main` in `env`, held to the end.
     let heap: Alloc<'static> = env.heap.alloc();
-    let alloc: Alloc<'f> = heap;
     let Some(home) = env.home else { return Err(NamesError::NoHome) };
-    // Each step of the making under its own span (engine.md item 2: the read back's 180 ms on
-    // tempo had no span below "names: make the world"), its counts in `opened`.
     let opened: &'static Opened = blaze_own::Box::leak_static(blaze_own::Box::new_in(Opened::default(), heap));
     let decoded = {
         let _cx = cx.span("names: the unit graph decoded");
@@ -1286,8 +1324,6 @@ fn make_world<'f>(
     };
     let decoded: &'static blaze_unit_graph::record::Decoded<'static> = std::boxed::Box::leak(std::boxed::Box::new(decoded));
     let graph = &decoded.graph;
-    // The files read for the names step live to the end of the command: a context of the
-    // command's (its deadline) and a frame of their own, both held to the end.
     let cx: &'static Cx = std::boxed::Box::leak(std::boxed::Box::new(cx.until(cx.deadline())));
     let frame: &'static Frame = std::boxed::Box::leak(std::boxed::Box::new(Frame::with_reserve(NAMES_FRAME, bstd::mem::Tag::Other).map_err(|_| NamesError::Frame)?));
     let mut shelf = {
@@ -1295,16 +1331,6 @@ fn make_world<'f>(
         crate::toolchain::HomeShelf::open(cx, &env.fs, home, frame).map_err(NamesError::Shelf)?
     };
     let reader: &'static Reader = std::boxed::Box::leak(std::boxed::Box::new(Reader { cx, root: root.read_only(), frame }));
-    let sources = {
-        let _cx = cx.span("names: the lock's fetch plan and the sources store opened");
-        StoreSources::new(lock_whole, Folder::of(reader, env, opened)?, PackView::open_source_put, heap).map_err(|e| NamesError::Sources(std::format!("{e}")))?
-    };
-    let sources = std::boxed::Box::leak(std::boxed::Box::new(sources));
-    // Every path package the graph reaches is a member, placed at its own directory (the
-    // layout's, anchor-relative: `""` for the root's own package), so its root file and its
-    // `mod x;` files are read under it. A lock may name path packages no unit reaches: they are
-    // never placed. Two members in one directory, or a reached path package that is no member
-    // (a path dependency outside the workspace root), is refused by name: nothing is guessed.
     let mut by_dir: blaze_own::Vec<(&str, &str), &Frame> = blaze_own::Vec::with_capacity_in(members.len(), frame);
     for (id, dir) in members.iter() {
         by_dir.push((*dir, lock.package(*id).name.as_str()));
@@ -1322,7 +1348,6 @@ fn make_world<'f>(
             continue;
         }
         let Some((_, dir)) = members.iter().find(|(member, _)| *member == id) else {
-            // The first unit that depends on a unit of this package, by the graph's order.
             let dependent = graph
                 .units
                 .iter()
@@ -1330,67 +1355,71 @@ fn make_world<'f>(
                 .map(|unit| String::from(unit.name.as_str()));
             return Err(NamesError::PathNotMember { package: String::from(package.name.as_str()), dependent });
         };
-        // Held to the end of the command, in the names frame, as the files read under it are.
         let held: &'static str = frame.alloc_str(dir);
         paths.push((id, held));
     }
     let paths: &'f [(LockId, &'static str)] = std::vec::Vec::leak(paths);
     let checkout: &'f ReadTree = std::boxed::Box::leak(std::boxed::Box::new(ReadTree(reader)));
     let bump: blaze_own::Bump<'static> = frame.alloc(blaze_own::Erased::new(frame)).bump();
-    let mut fetched = Fetched { store: sources, paths, lock: lock_whole, alloc: bump };
-    // Every place the world is told, kept for the proc-macro runner (proc_callers.rs).
-    let mut packages = crate::proc_callers::Placing::new(&mut fetched, alloc);
-    // The crate list (blaze-scope's units list, the one home) and the toolchain crates it needs.
-    // Placing a member asks only its directory; the fetched packages are placed by the world.
-    let listed = {
-        let _cx = cx.span("names: the crate list and the toolchain's packs opened");
-        blaze_world::open_list(&mut shelf, env.toolchain, crate::graph::TRIPLE, graph, lock, &mut packages, bump).map_err(|e| match e {
-            WorldError::Toolchain(_) => NamesError::Toolchain(std::format!("{e}")),
-            other => NamesError::World(std::format!("{other}")),
-        })?
+    let world_err = |e: WorldError<'_>| -> NamesError {
+        let words = bstd::mem::format_in!(frame, "{e}");
+        match e {
+            WorldError::Toolchain(_) => NamesError::Toolchain(String::from(words.as_str())),
+            _ => NamesError::World(String::from(words.as_str())),
+        }
     };
-    let listed: &'f Listed<'f, crate::toolchain::Held<'static>> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(listed, frame));
-    // Every fetched package placed: its record mapped ([`Folder`]), its rows checked, its manifest
-    // laid out (blaze-unit-graph sources.rs `locate`), its crates keyed in order.
-    let world = {
-        let _cx = cx.span("names: the packages placed and the world made");
-        blaze_world::world(graph, lock, listed, &mut packages, checkout, bump).map_err(|e| NamesError::World(std::format!("{e}")))?
+    let (world, placed, lazy_trees) = if let Some(stored) = stored_list {
+        let mut packages = CheckoutOnly { paths, lock: lock_whole, alloc: bump };
+        let listed = {
+            let _cx = cx.span("names: the crate list and toolchain manifest opened (lazy)");
+            blaze_world::open_list_light(&mut shelf, env.toolchain, crate::graph::TRIPLE, graph, lock, &mut packages, bump).map_err(&world_err)?
+        };
+        let listed: &'f Listed<'f, crate::toolchain::Held<'static>> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(listed, frame));
+        let world = {
+            let _cx = cx.span("names: the world built from crate list (lazy)");
+            blaze_world::world_from_list(graph, lock, listed, &stored, &mut packages, checkout, bump).map_err(&world_err)?
+        };
+        let lazy_trees = crate::body_types::SyncLazyTrees::new_in_heap(Some(home), env.heap, stored).map_err(|why| NamesError::World(String::from(why)))?;
+        (world, &[][..], Some(lazy_trees))
+    } else {
+        let sources = {
+            let _cx = cx.span("names: the lock's fetch plan and the sources store opened");
+            StoreSources::new(lock_whole, Folder::of(reader, env, opened)?, PackView::open_source_put, heap).map_err(|e| NamesError::Sources(std::format!("{e}")))?
+        };
+        let sources = std::boxed::Box::leak(std::boxed::Box::new(sources));
+        let mut fetched = Fetched { store: sources, paths, lock: lock_whole, alloc: bump };
+        let mut packages = crate::proc_callers::Placing::new(&mut fetched, heap);
+        let listed = {
+            let _cx = cx.span("names: the crate list and the toolchain's packs opened");
+            blaze_world::open_list(&mut shelf, env.toolchain, crate::graph::TRIPLE, graph, lock, &mut packages, bump).map_err(&world_err)?
+        };
+        let listed: &'f Listed<'f, crate::toolchain::Held<'static>> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(listed, frame));
+        let world = {
+            let _cx = cx.span("names: the packages placed and the world made");
+            blaze_world::world(graph, lock, listed, &mut packages, checkout, bump).map_err(&world_err)?
+        };
+        (world, packages.finish().leak_slice(), None)
     };
-    let placed = packages.finish();
     let _cx = cx.span("names: the world's public crates and scripts");
-    // A registry package with a checksum in the lock: its archive is known by content, so its
-    // crate's records are keyed by nothing of this project. A path or git package, a member,
-    // or a registry package with no checksum stays the project's.
     let from_archive = |unit: blaze_unit_graph::UnitId| {
         let package = lock.package(graph.units[unit.0 as usize].package);
         matches!(package.source, LockSource::Registry { .. }) && matches!(package.checksum, blaze_manifest::lock::Checksum::Sha256(_))
     };
-    // Each crate's word, in world order: the crate list's `PUBLIC` flag (crate_list.rs v6).
     let mut crate_public: blaze_own::Vec<bool, Alloc<'static>> = blaze_own::Vec::with_capacity_in(world.crates.len(), heap);
     crate_public.extend(world.crates.iter().map(|krate| match krate.origin {
         blaze_world::Origin::Toolchain(_) => true,
         blaze_world::Origin::Unit(unit) => from_archive(unit),
     }));
-    // Each crate that reads a build script's run, of ITS side (ruling D115 (2)): the subject
-    // is the world's (`blaze_world::script_subject`). Crate order, so sorted by index.
     let mut scripts = std::vec::Vec::new_in(Global);
     for (at, krate) in world.crates.iter().enumerate() {
         if let blaze_world::Script::Read { subject } = krate.script {
             scripts.push((at, Name::new(Kind::Script, subject)));
         }
     }
-    // Each crate's build-script file, from the unit it is made from ([`script_units`]): the
-    // script a crate reads is one (ruling D115 (3); `blaze_world::list::one_script` refuses two
-    // units under one key with different runs), so its origin unit's script names it.
-    // And its module's lookup (script_modules.rs, ruling D115 (c)): the script UNIT's package,
-    // version and features, what the bootstrap builder's identity names.
-    // Crate order, so `script_roots` and `placements` are sorted by index, each crate once.
     let mut script_roots = std::vec::Vec::new_in(Global);
     let mut script_modules = std::vec::Vec::new_in(Global);
     let mut placements = std::vec::Vec::new_in(Global);
     for (at, script) in script_units(world.crates.iter().map(|krate| krate.origin), |unit| graph.units[unit.index()].build_script) {
-        // The module is looked up for the run's placement (D112): a native run's record is a
-        // host binary, a wasm run's a module.
         let ran_as = crate::scripts::placement(Some(home), graph, script, heap);
         placements.push((at, ran_as));
         let script = &graph.units[script.index()];
@@ -1401,9 +1430,6 @@ fn make_world<'f>(
         script_modules.push(crate::script_modules::ScriptModule { subject, crate_at: at, ran_as, package: script.name.as_str(), version: script.version.as_str(), features });
     }
     script_modules.sort_unstable_by_key(|module| (module.subject, module.crate_at));
-    // Each run's placement is its crate's module's (the list's module rows hold it; the public
-    // list's script subjects, ruling D115 sharing (i), are told from them: `Names::of_list`).
-    // A crate reading a run with no build-script unit is refused here, by name.
     for (at, _) in scripts.iter() {
         if placements.binary_search_by_key(at, |(krate, _)| *krate).is_err() {
             return Err(NamesError::World(std::format!(
@@ -1412,7 +1438,7 @@ fn make_world<'f>(
             )));
         }
     }
-    Ok(NamesWorld { world, crate_public, heap, scripts, script_roots, script_modules, graph, placed, frame, opened })
+    Ok(NamesWorld { world, crate_public, heap, scripts, script_roots, script_modules, graph, placed, lazy_trees, frame, opened })
 }
 
 /// Each crate (by world index, in order) made from a unit with a build script, with that

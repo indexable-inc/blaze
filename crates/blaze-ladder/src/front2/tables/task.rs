@@ -973,6 +973,9 @@ fn record_body_as<'n, 'w>(tables: Tables<'_, 'n>, task: &Task, frame: &BodyFrame
         // that search is the body's read (front2 internal_symbol.rs `record_search`).
         super::super::internal_symbol::record_search(view, &world.store, facts);
         for row in facts.rows.iter() {
+            if !fact_kind_has_read(row.fact.kind) || row.fact.key == 0 {
+                continue;
+            }
             // By the records, unrecorded: which cell holds a fact is the plan's, not the body's.
             // An opaque type's facts are its fn's head's (the fn's head files it); the default
             // of a provided trait fn's `impl Trait` is that fn's (front2 rpitit.rs `filed_as`).
@@ -1245,34 +1248,53 @@ fn body_of<'n>(view: Tables<'_, 'n>, name: Name) -> Result<BodyRef<'n>, TaskErro
 ///   anonymous constant (an array length or a repeat count written as an expression, in its
 ///   own text or in a head or constant it lowered) was refused, 467 of them on the
 ///   1,100-crate workspace (g190500).
-fn fact_read<'n>(names: &'n Records<'n>, keys: &Keys, kind: FactKind, key: u128, owner: Option<(blaze_typeck::ItemKey, u32)>, alloc: Alloc<'_>) -> Result<Option<TableRead>, TaskError> {
+fn fact_kind_has_read(kind: FactKind) -> bool {
     use FactKind as K;
-    match kind {
-        K::Head | K::Predicates | K::Adt | K::ImplHeader | K::AssocItem | K::Const | K::Opaque | K::Attrs | K::TraitDef | K::AssocParent | K::ConstHolds | K::ConstParams | K::AssocGenerics | K::BorrowAdt | K::BorrowHead | K::TypeAlias | K::FieldDefaults | K::MemberVisible | K::MemberUnstable
-            if key != 0 =>
-        {
-            let key = blaze_typeck::ItemKey(key);
-            let fact = owner.map_or(key, |(holder, _)| holder);
-            let refused = |error: FreezeError| TaskError::Cell { key, ask: CellAsk::Fact(kind), holder: fact, shown: FactDefinition::of(names, key, owner, alloc), error };
-            let class = kind_of_key(names, keys, fact).map_err(|error| refused(FreezeError::NoWant { key: fact, error }))?;
-            match fact_holder(class) {
-                // A block item's head comes from the enclosing body's text. No Signature task
-                // publishes it; reads made while checking it go to this task's recorder.
-                FactHolder::Head if keys.local_kind(fact).is_some() => Ok(None),
-                FactHolder::Head => {
-                    let want = fact_cell(names, keys, fact).map_err(refused)?;
-                    let id = head_cell_id(want);
-                    let mut item = [0u8; 16];
-                    item.copy_from_slice(&id.of.subject.0[..16]);
-                    Ok(Some(TableRead::Head { item, part: 0 }))
-                }
-                FactHolder::Names { lib, .. } => Ok(Some(TableRead::Names(NameCell::Item { key: lib }))),
-                FactHolder::OwnKey => Ok(None),
-            }
+    matches!(
+        kind,
+        K::Head
+            | K::Predicates
+            | K::Adt
+            | K::ImplHeader
+            | K::AssocItem
+            | K::Const
+            | K::Opaque
+            | K::Attrs
+            | K::TraitDef
+            | K::AssocParent
+            | K::ConstHolds
+            | K::ConstParams
+            | K::AssocGenerics
+            | K::BorrowAdt
+            | K::BorrowHead
+            | K::TypeAlias
+            | K::FieldDefaults
+            | K::MemberVisible
+            | K::MemberUnstable
+    )
+}
+
+fn fact_read<'n>(names: &'n Records<'n>, keys: &Keys, kind: FactKind, key: u128, owner: Option<(blaze_typeck::ItemKey, u32)>, alloc: Alloc<'_>) -> Result<Option<TableRead>, TaskError> {
+    if !fact_kind_has_read(kind) || key == 0 {
+        return Ok(None);
+    }
+    let key = blaze_typeck::ItemKey(key);
+    let fact = owner.map_or(key, |(holder, _)| holder);
+    let refused = |error: FreezeError| TaskError::Cell { key, ask: CellAsk::Fact(kind), holder: fact, shown: FactDefinition::of(names, key, owner, alloc), error };
+    let class = kind_of_key(names, keys, fact).map_err(|error| refused(FreezeError::NoWant { key: fact, error }))?;
+    match fact_holder(class) {
+        // A block item's head comes from the enclosing body's text. No Signature task
+        // publishes it; reads made while checking it go to this task's recorder.
+        FactHolder::Head if keys.local_kind(fact).is_some() => Ok(None),
+        FactHolder::Head => {
+            let want = fact_cell(names, keys, fact).map_err(refused)?;
+            let id = head_cell_id(want);
+            let mut item = [0u8; 16];
+            item.copy_from_slice(&id.of.subject.0[..16]);
+            Ok(Some(TableRead::Head { item, part: 0 }))
         }
-        // `CrateBucket`: recorded as each lookup read it (view.rs `bucket`, `unfiled`,
-        // `impls_read`); names facts: recorded by the view's walks.
-        _ => Ok(None),
+        FactHolder::Names { lib, .. } => Ok(Some(TableRead::Names(NameCell::Item { key: lib }))),
+        FactHolder::OwnKey => Ok(None),
     }
 }
 
@@ -1333,9 +1355,11 @@ pub struct ReadIds<'t, 'n, 'a> {
     tables: Tables<'t, 'n>,
     ids: blaze_hash::HashMap<TableRead, Option<CellId>, Alloc<'a>>,
     /// Per crate (its key's first sixteen bytes), its impl-tables task's name ([`impls_name`]):
-    /// one hash per crate, where `ids` misses once per impl cell. As many as the graph's crates;
-    /// cleared with `ids`.
+    /// one hash per crate, answered directly without populating or evicting `ids`.
     impl_names: blaze_hash::HashMap<[u8; 16], Name, Alloc<'a>>,
+    /// Per crate (its key's first eight bytes), its `CrateScope` task's name for `NameCell::Root`,
+    /// answered directly without populating or evicting `ids`.
+    scope_names: blaze_hash::HashMap<[u8; 8], Name, Alloc<'a>>,
     made: u64,
     hits: u64,
 }
@@ -1344,31 +1368,77 @@ impl<'t, 'n, 'a> ReadIds<'t, 'n, 'a> {
     const LIMIT: usize = 1 << 16;
 
     pub fn new(tables: Tables<'t, 'n>, alloc: Alloc<'a>) -> Self {
-        Self { tables, ids: blaze_hash::HashMap::new_in(alloc), impl_names: blaze_hash::HashMap::new_in(alloc), made: 0, hits: 0 }
+        Self {
+            tables,
+            ids: blaze_hash::HashMap::new_in(alloc),
+            impl_names: blaze_hash::HashMap::new_in(alloc),
+            scope_names: blaze_hash::HashMap::new_in(alloc),
+            made: 0,
+            hits: 0,
+        }
     }
 
     pub fn id(&mut self, read: TableRead) -> Result<Option<CellId>, TaskError> {
-        if let Some(id) = self.ids.get(&read) {
-            self.hits += 1;
-            return Ok(*id);
-        }
-        let id = match read.of() {
-            ReadOf::Impls { krate } if krate != [0; 16] => {
+        match read {
+            TableRead::Impls { krate, bucket } => {
+                if krate == [0; 16] {
+                    self.hits += 1;
+                    return Ok(Some(CellId { of: Name::new(Kind::ImplBucket, ABSENT), cell: Cell(bucket) }));
+                }
                 let of = match self.impl_names.get(&krate) {
-                    Some(&of) => of,
+                    Some(&of) => {
+                        self.hits += 1;
+                        of
+                    }
                     None => {
                         let of = impls_name(self.tables, krate)?;
                         if self.impl_names.len() == Self::LIMIT {
                             self.impl_names.clear();
                         }
                         self.impl_names.insert(krate, of);
+                        self.made += 1;
                         of
                     }
                 };
-                Some(CellId { of, cell: Cell(read.cell()) })
+                return Ok(Some(CellId { of, cell: Cell(bucket) }));
             }
-            _ => cell_id(self.tables, read)?,
-        };
+            TableRead::Names(NameCell::Root { krate }) => {
+                if krate == blaze_scope::BUILTIN_PREFIX {
+                    self.hits += 1;
+                    return Ok(None);
+                }
+                let of = match self.scope_names.get(&krate) {
+                    Some(&of) => {
+                        self.hits += 1;
+                        of
+                    }
+                    None => {
+                        let records = self.tables.records();
+                        let mut bytes = [0; 32];
+                        bytes[..8].copy_from_slice(&krate);
+                        let key = records
+                            .crate_of(ItemKey(ContentId(bytes)))
+                            .and_then(|at| records.crate_key(at))
+                            .filter(|key| key.0.0.starts_with(&krate))
+                            .ok_or(TaskError::NoCrate { prefix: krate })?;
+                        let of = blaze_drive::key::crate_scope_name(&key);
+                        if self.scope_names.len() == Self::LIMIT {
+                            self.scope_names.clear();
+                        }
+                        self.scope_names.insert(krate, of);
+                        self.made += 1;
+                        of
+                    }
+                };
+                return Ok(Some(CellId { of, cell: Cell(read.cell()) }));
+            }
+            _ => {}
+        }
+        if let Some(id) = self.ids.get(&read) {
+            self.hits += 1;
+            return Ok(*id);
+        }
+        let id = cell_id(self.tables, read)?;
         if self.ids.len() == Self::LIMIT {
             self.ids.clear();
         }
@@ -1714,6 +1784,35 @@ mod read_id_tests {
         assert_eq!(memo.id(read).unwrap(), Some(expected));
         assert_eq!(memo.counts(), (ReadIds::LIMIT as u64 + 2, 1));
         std::println!("read ID unchanged after 65,536 entries and a reset");
+    }
+
+    #[test]
+    fn impls_and_root_reads_bypass_and_do_not_evict_the_ids_table() {
+        let (records, _, _) = world_of("#![no_std]\npub fn f() {}");
+        let recorder = Recorder::new(RecorderOpts { alloc: a() });
+        let tables = Tables::new(TablesOpts { records, impls: None, lang_crates: &[CORE_AT], reads: &recorder });
+        let Some(core_key) = records.crate_key(CORE_AT) else {
+            assert!(false, "fixture core key");
+            return;
+        };
+        let mut krate16 = [0u8; 16];
+        krate16.copy_from_slice(&core_key.0.0[..16]);
+        let lang_read = TableRead::Names(NameCell::Lang { krate: core_key.prefix() });
+        let root_read = TableRead::Names(NameCell::Root { krate: core_key.prefix() });
+        let mut memo = ReadIds::new(tables, a());
+        assert_eq!(memo.id(lang_read).ok(), cell_id(tables, lang_read).ok());
+        assert_eq!(memo.ids.len(), 1);
+        assert_eq!(memo.id(root_read).ok(), cell_id(tables, root_read).ok());
+        assert_eq!(memo.ids.len(), 1, "NameCell::Root must not populate `ids`");
+        for i in 0u32..512 {
+            let mut bucket = [0u8; 16];
+            bucket[..4].copy_from_slice(&i.to_be_bytes());
+            let impl_read = TableRead::Impls { krate: krate16, bucket };
+            assert_eq!(memo.id(impl_read).ok(), cell_id(tables, impl_read).ok());
+        }
+        let absent_impl = TableRead::Impls { krate: [0; 16], bucket: [7; 16] };
+        assert_eq!(memo.id(absent_impl).ok(), cell_id(tables, absent_impl).ok());
+        assert_eq!(memo.ids.len(), 1, "TableRead::Impls must not populate or evict `ids`");
     }
 }
 

@@ -188,6 +188,15 @@ pub(crate) struct Holders<'f> {
     bodies: Vec<BodyClaim, Global>,
 }
 
+/// The two not-held proof cells for one unit: `files` (`NameCell::Files`, moving only when the
+/// unit's file list changes: `Decision::NotHeld`) and `items` (`Section::Items`, moving when an
+/// item in a held file appears or disappears: `Decision::Absent`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct UnitCells {
+    pub(crate) files: CellId,
+    pub(crate) items: CellId,
+}
+
 impl<'f> Holders<'f> {
     /// The holders of `units` (by index, the crate list's order), from what each said. A unit
     /// with `test` ranks after every unit without; within each, the list's order (rule 25: the
@@ -299,33 +308,50 @@ impl<'f> Holders<'f> {
         Some(if held_file { OutsideIs::EntryAbsent } else { OutsideIs::FileNotHeld })
     }
 
-    /// The not-held proof for each unit, shared by every decision in this phase.
-    pub(crate) fn unit_cells(&self, grains: &crate::engine_scope_reads::ReadGrains<'_>, g: blaze_own::Alloc<'static>) -> blaze_own::AVec<'static, CellId> {
+    /// The not-held proofs for each unit, shared by every decision in this phase.
+    pub(crate) fn unit_cells(&self, grains: &crate::engine_scope_reads::ReadGrains<'_>, g: blaze_own::Alloc<'static>) -> blaze_own::AVec<'static, UnitCells> {
         let mut ids = Vec::with_capacity_in(self.units.len(), g);
-        ids.extend(self.units.iter().map(|one| grains.place(items_cell(one.name, one.prefix), false)));
+        ids.extend(self.units.iter().map(|one| UnitCells {
+            files: grains.place(files_cell(one.name, one.prefix), false),
+            items: grains.place(items_cell(one.name, one.prefix), false),
+        }));
         ids
     }
 
-    /// What a row is a function of: its `passed` unit's not-held cell and its refusal's
-    /// `reads`, in the phase frame. A checked body canonicalizes these with its other IDs.
-    pub(crate) fn cells<'a>(unit_cells: &[CellId], passed: &[u32], reads: &[CellId], frame: &'a Frame) -> Vec<CellId, &'a Frame> {
+    /// What a row is a function of: its `passed` unit's not-held cell (`NameCell::Files` when the
+    /// file itself is not held, `Section::Items` when the file is held but the entry is absent) and
+    /// its refusal's `reads`, in the phase frame. A checked body canonicalizes these with its other IDs.
+    pub(crate) fn cells<'a>(unit_cells: &[UnitCells], decided: Decision, passed: &[u32], reads: &[CellId], frame: &'a Frame) -> Vec<CellId, &'a Frame> {
         let mut ids = Vec::with_capacity_in(passed.len() + reads.len(), frame);
-        ids.extend(passed.iter().map(|unit| unit_cells[*unit as usize]));
+        let file_only = matches!(decided, Decision::NotHeld);
+        ids.extend(passed.iter().map(|unit| {
+            let pair = unit_cells[*unit as usize];
+            if file_only { pair.files } else { pair.items }
+        }));
         ids.extend_from_slice(reads);
         ids
     }
 }
 
-/// THE ONE HOME of "which cell says a unit does not hold a file": the unit's items section's
+/// Which cell says a unit's items record does not list a file: the unit's `Files` cell when its
+/// crate's names task (`name`, of crate prefix `prefix`) defines a cell table ([`CELLS`]), else
+/// its names record whole ([`WHOLE`]). A `#[cfg(test)]` taken off a `mod` adds the file and moves
+/// this cell; adding or editing items within an already held file leaves it unchanged.
+pub(crate) fn file_not_held_cell(view: View<'_, '_>, name: Name, prefix: [u8; 8]) -> CellId {
+    let table = CellId { of: name, cell: CELLS };
+    if view.cell(&table) != ABSENT { files_cell(name, prefix) } else { CellId { of: name, cell: WHOLE } }
+}
+
+/// THE ONE HOME of "which cell says a unit's items section changed": the unit's items section's
 /// cell when its crate's names task (`name`, of crate prefix `prefix`) defines a cell table
-/// ([`CELLS`]), else its names record whole ([`WHOLE`]), which that section is part of. Both
-/// rules that turn on a unit holding a file read it: who checks a body ([`Holders`]) and under
-/// which units a head task freezes its heads (engine_heads.rs `run_items`, lane RU2): a unit
-/// that comes to hold the file (a `#[cfg(test)]` taken off its `mod`) moves this cell, so the
-/// row that skipped that unit is entered again (rule 21).
+/// ([`CELLS`]), else its names record whole ([`WHOLE`]), which that section is part of.
 pub(crate) fn not_held_cell(view: View<'_, '_>, name: Name, prefix: [u8; 8]) -> CellId {
     let table = CellId { of: name, cell: CELLS };
     if view.cell(&table) != ABSENT { items_cell(name, prefix) } else { CellId { of: name, cell: WHOLE } }
+}
+
+fn files_cell(of: Name, prefix: [u8; 8]) -> CellId {
+    CellId { of, cell: Cell(NameCell::Files { krate: prefix }.key()) }
 }
 
 fn items_cell(of: Name, prefix: [u8; 8]) -> CellId {

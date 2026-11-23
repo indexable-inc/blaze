@@ -467,12 +467,12 @@ pub(crate) trait ScopeReads {
 
     /// The `ImplBucket` task's reads (engine_heads.rs `run_phase`, `tables_of`). `true`: each
     /// names read its cell where the crate defines a cell table (engine_heads.rs `names_read`),
-    /// and each impl header's head read the cell of the head task that covers that head
+    /// each impl header's head read the cell of the head task that covers that head
     /// (`Owners::place`, as a body's head read: a dependency's head, or one a macro wrote, its
-    /// crate's record whole). `false`: each names read its crate's record whole, and every
-    /// header read every scope crate's record whole, so any item added to any of them enters it.
-    /// The task's own crate's record stays whole under both: its impl rows are read whole
-    /// (`NamesSource::each_impl_row`, no cell holds them).
+    /// crate's record whole), and the task's own crate reads `NameCell::ImplRows` (moving only
+    /// when impl rows change, not when private fns are added). `false`: each names read its
+    /// crate's record whole, the task's own crate stays whole, and every header read every scope
+    /// crate's record whole, so any item added to any of them enters it.
     const TABLES_AT_CELLS: bool;
 }
 

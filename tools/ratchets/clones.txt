@@ -62,7 +62,7 @@ blaze-new	7
 blaze-own	90
 blaze-pack	1
 blaze-pg	2
-blaze-proc-macro	83
+blaze-proc-macro	82
 blaze-producers	12
 blaze-profile	118
 blaze-protocol	10

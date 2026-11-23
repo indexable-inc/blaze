@@ -542,6 +542,24 @@ impl Recorder<'_> {
             self.filtered.set(self.filtered.get().saturating_add(1));
             return Ok(());
         }
+        // Impl table reads are already deduplicated per body by `BucketReadUnion` and placed in
+        // O(1) via `ReadIds::impl_names`; skip `self.mapped` (which would otherwise hold tens of
+        // thousands of one-shot impl keys alongside `self.seen`).
+        if matches!(read, TableRead::Impls { .. }) {
+            return match place() {
+                Ok(cell) => {
+                    if let Some(slot) = recent {
+                        slot.set(Some(read));
+                    }
+                    self.keep(read, cell);
+                    Ok(())
+                }
+                Err(error) => {
+                    self.keep(read, None);
+                    Err(error)
+                }
+            };
+        }
         let mut mapped = self.mapped.borrow_mut();
         if mapped.len() == MEMO_LIMIT {
             if mapped.contains(&read) {
@@ -670,6 +688,8 @@ fn slot_of(key: ReadKey) -> usize {
             NameCell::Incoherent { krate } => krate[7] ^ 0x55,
             NameCell::InternalSymbols { krate } => krate[7] ^ 0x45,
             NameCell::Links { krate } => krate[7] ^ 0x46,
+            NameCell::ImplRows { krate } => krate[7] ^ 0x47,
+            NameCell::Files { krate } => krate[7] ^ 0x48,
             NameCell::Whole { krate, section } => krate[7] ^ (section as u8) ^ 0x66,
             NameCell::Variants { owner } => item(owner) ^ 0x77,
             NameCell::Members { owner } => item(owner) ^ 0x88,
@@ -682,7 +702,7 @@ fn slot_of(key: ReadKey) -> usize {
         ReadKey::Raw(TableRead::Signature { key }) => item(key) ^ 0x0e,
         ReadKey::Raw(TableRead::Text { key }) => item(key) ^ 0x1e,
         ReadKey::Raw(TableRead::Head { item: k, part }) => k[15] ^ part.rotate_left(4),
-        ReadKey::Raw(TableRead::Impls { bucket, .. }) => bucket[0] ^ 0x2e,
+        ReadKey::Raw(TableRead::Impls { krate, bucket }) => krate[15] ^ bucket[0] ^ 0x2e,
     };
     usize::from(b) & (FILTER_SLOTS - 1)
 }
@@ -865,5 +885,30 @@ mod tests {
         r.item(key(4));
         let list = r.finish().expect("within the cap");
         assert_eq!(&list[..], &[TableRead::Names(NameCell::Item { key: key(4) })]);
+    }
+
+    /// Impl-table reads bypass the secondary `mapped` hash set while still deduplicating
+    /// cleanly in `recent_raw` + `seen` and surfacing placement errors.
+    #[test]
+    fn read_mapped_skips_mapped_set_for_impls_and_deduplicates() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let r = Recorder::new(RecorderOpts { alloc });
+        let r1 = TableRead::Impls { krate: [1; 16], bucket: [0xaa; 16] };
+        let r2 = TableRead::Impls { krate: [2; 16], bucket: [0xaa; 16] };
+        let place = |k: u8| super::PlacedCell { kind: 7, subject: [k; 32], cell: [0xaa; 16] };
+        assert!(r.read_mapped(r1, || Ok::<_, ()>(Some(place(1)))).is_ok());
+        assert!(r.read_mapped(r2, || Ok::<_, ()>(Some(place(2)))).is_ok());
+        // Repeat of r1 and r2: `seen` keeps each once and `mapped` stayed empty.
+        assert!(r.read_mapped(r1, || Ok::<_, ()>(Some(place(1)))).is_ok());
+        assert!(r.read_mapped(r2, || Ok::<_, ()>(Some(place(2)))).is_ok());
+        assert_eq!(r.mapped.borrow().len(), 0);
+        let list = match r.finish() {
+            Ok(list) => list,
+            Err(_) => {
+                assert!(false, "within the cap");
+                return;
+            }
+        };
+        assert_eq!(list.len(), 2);
     }
 }

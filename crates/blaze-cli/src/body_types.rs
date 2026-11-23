@@ -82,17 +82,16 @@ pub(crate) fn body_source(item: ContentId) -> ContentId {
 /// in place (engine_records.rs `EngineRecords`, run_names.rs).
 #[derive(Default)]
 pub struct Kept {
-    /// The `UnitGraph` input's out and its crate list (graph_payload.rs), opened (checked
+    /// The crate list of the `UnitGraph` input's out and its crate list (graph_payload.rs), opened (checked
     /// whole) once a command; `None` in the list when the world could not be made.
     list: Option<(ContentId, Option<CrateList<'static>>)>,
-    /// The packs of that list's trees and its corrected files ([`Kept::trees`]), for the
-    /// `UnitGraph` out they were opened under; or why they could not be.
-    trees: Option<(ContentId, Result<Trees, &'static str>)>,
+    /// Lazy on-demand packs of that list's trees and its corrected files ([`Kept::lazy_trees`]),
+    /// for the `UnitGraph` out they were prepared under; or why the table could not be made.
+    lazy_trees: Option<(ContentId, Result<LazyTreesHeld, &'static str>)>,
 }
 
-/// What a body serves its dependencies' texts from: tree `k` of the crate list is pack `k - 1`,
-/// mapped in place; and the files read corrected (D58).
-type Trees = (&'static [PackView<'static>], &'static [(u32, &'static str, &'static str)]);
+/// On-demand pack opener and corrected files for a command's crate list, held on `env.heap`.
+pub(crate) type LazyTreesHeld = (&'static SyncLazyTrees<'static>, &'static [(u32, &'static str, &'static str)]);
 
 /// The packs could not be held: the heap refused the table's room.
 const TREES_REFUSED: &str = "the heap refused the room for the crate list's trees (body_types.rs `open_trees`)";
@@ -117,26 +116,27 @@ impl Kept {
         Ok(list)
     }
 
-    /// The packs `list`'s trees name, mapped read-only in place and opened once a command (on
-    /// `env.heap`, the command's own lifetime, never a task's frame and never per body), and its
-    /// corrected files: what every body of the command serves another tree's text from.
-    /// `graph` is the `UnitGraph` input's out the list was read under: the packs are the list's,
-    /// so a body's `(UnitGraph, out)` read is the read of every pack it opens.
-    pub(crate) fn trees(&mut self, cx: &Cx, env: &crate::fetch::FetchEnv<'_>, graph: ContentId, list: &CrateList<'static>, scratch: &Frame) -> Result<Trees, &'static str> {
-        if let Some((out, trees)) = self.trees
+    /// The on-demand pack opener for `list`'s trees and its corrected files, prepared once a
+    /// command on `env.heap` without mapping any pack up front; each pack is mapped and verified
+    /// at its first read.
+    pub(crate) fn lazy_trees(&mut self, env: &crate::fetch::FetchEnv<'_>, graph: ContentId, list: CrateList<'static>) -> Result<LazyTreesHeld, &'static str> {
+        if let Some((out, trees)) = self.lazy_trees
             && out == graph
         {
             return trees;
         }
-        let trees = open_trees(cx, env, list, scratch);
-        self.trees = Some((graph, trees));
+        let trees = (|| {
+            let packs = SyncLazyTrees::new_in_heap(env.home, env.heap, list)?;
+            let corrected = corrected_of(&list, env.heap)?;
+            Ok((packs, corrected))
+        })();
+        self.lazy_trees = Some((graph, trees));
         trees
     }
-
 }
 
-/// Thread-safe, lock-free on-demand pack opener for `Bodies`: each tree `k` (1-based) is
-/// mapped and verified on first read and published via `PublishOnce`.
+/// Thread-safe, lock-free on-demand pack opener: each tree `k` (1-based) is mapped and verified
+/// on first read and published via `PublishOnce`.
 pub(crate) struct SyncLazyTrees<'f> {
     home: Option<&'f str>,
     heap: &'static blaze_own::Heap,
@@ -157,6 +157,24 @@ impl<'f> SyncLazyTrees<'f> {
             slots: slots.into_bump_slice(),
             refused: bstd::sync::PublishOnce::new(),
         }
+    }
+
+    pub(crate) fn new_in_heap(home: Option<&str>, heap: &'static blaze_own::Heap, list: CrateList<'static>) -> Result<&'static SyncLazyTrees<'static>, &'static str> {
+        let g = heap.alloc();
+        let mut slots: AVec<'static, bstd::sync::PublishOnce<Result<PackView<'static>, &'static str>>> = AVec::new_in(g);
+        if slots.try_reserve_exact(list.trees()).is_err() {
+            return Err(TREES_REFUSED);
+        }
+        slots.extend((0..list.trees()).map(|_| bstd::sync::PublishOnce::new()));
+        let home: Option<&'static str> = home.map(|h| &*blaze_own::Box::leak_static(blaze_own::AString::from_str_in(h, g).into_boxed_str()));
+        let lazy = SyncLazyTrees {
+            home,
+            heap,
+            list,
+            slots: slots.leak_static(),
+            refused: bstd::sync::PublishOnce::new(),
+        };
+        Ok(blaze_own::Box::leak_static(blaze_own::Box::new_in(lazy, g)))
     }
 
     pub(crate) fn tree(&self, cx: &Cx, fs: &bstd::fs::Fs, scratch: &Frame, k: usize) -> Option<PackView<'static>> {
@@ -183,28 +201,11 @@ impl<'f> SyncLazyTrees<'f> {
     pub(crate) fn refused(&self) -> Option<&'static str> {
         self.refused.get().copied()
     }
-}
 
-/// Each tree of `list` opened from where the table names it (blaze-world crate_list.rs, the
-/// tree table): a toolchain pack from the shelf by its digest, a fetched record from the sources
-/// store by its key, each mapped whole (`Dir::map_read`, nothing copied) and kept on `env.heap`.
-/// A pack is opened as a record verified when it was installed or fetched
-/// (`PackView::open_verified`, rows and form checked, bytes not hashed again), and refused unless
-/// its files are the ones the list's world read (`TreeRow::files`) and, on the shelf, its footer
-/// is its name. A refusal names the tree, its file and why; nothing is served in its place.
-fn open_trees(cx: &Cx, env: &crate::fetch::FetchEnv<'_>, list: &CrateList<'static>, scratch: &Frame) -> Result<Trees, &'static str> {
-    let _opening = cx.span("body types: open the crate list's packs");
-    let from = PackHome::of(env);
-    let mut views: AVec<'static, PackView<'static>> = AVec::new_in(from.heap.alloc());
-    if views.try_reserve_exact(list.trees()).is_err() {
-        return Err(TREES_REFUSED);
+    #[cfg(test)]
+    pub(crate) fn opened(&self) -> usize {
+        self.slots.iter().filter(|slot| slot.get().is_some()).count()
     }
-    let mut dirs = PackDirs::default();
-    for k in 1..=list.trees() {
-        // Within the room reserved above: allocates nothing.
-        views.push(open_tree(cx, from, list, k, &mut dirs, scratch)?);
-    }
-    Ok((views.leak_static(), corrected_of(list, from.heap)?))
 }
 
 /// `list`'s corrected files (D58), on `heap` for the command: read from the list, nothing opened.

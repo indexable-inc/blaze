@@ -1146,13 +1146,37 @@ fn trait_crates(home: Option<usize>, shape: Shape, local_type: Local, parameters
     // ([`Homes::blanket`]): the one narrowing that needs nothing but the trait's crate.
     let wide = Homes { blanket: Home::In(home, None), ..Homes::ANY };
     let local = match shape {
-        Shape::Adt(_) | Shape::Dynamic(Some(_)) => {
+        Shape::Adt(_) | Shape::Foreign(_) | Shape::Dynamic(Some(_)) => {
             let Local::In(c) = local_type else { return wide };
             Some(c)
         }
         // Never a local type of any crate (no fundamental type is built in but references).
-        Shape::Bool | Shape::Char | Shape::Int(_) | Shape::Uint(_) | Shape::Float(_) | Shape::AnyInt | Shape::AnyFloat | Shape::Str | Shape::Never | Shape::Tuple(_) | Shape::Record(..) | Shape::Union(_) | Shape::Slice | Shape::Array | Shape::Ptr(_) | Shape::FnPtr(_) => None,
-        _ => return wide,
+        // Matches `trait_local`: unnameable and placeholder shapes (`Param`, `Closure`, `FnDef`,
+        // `Opaque`, `Pat`, `Dynamic(None)`) are also never local to any downstream crate, so a
+        // 1-parameter trait narrows to `home` alone instead of scanning every linked crate.
+        Shape::Bool
+        | Shape::Char
+        | Shape::Int(_)
+        | Shape::Uint(_)
+        | Shape::Float(_)
+        | Shape::AnyInt
+        | Shape::AnyFloat
+        | Shape::Str
+        | Shape::Never
+        | Shape::Tuple(_)
+        | Shape::Record(..)
+        | Shape::Union(_)
+        | Shape::Slice
+        | Shape::Array
+        | Shape::Ptr(_)
+        | Shape::FnPtr(_)
+        | Shape::FnDef(_)
+        | Shape::Closure
+        | Shape::Param
+        | Shape::Opaque(_)
+        | Shape::Pat
+        | Shape::Dynamic(None) => None,
+        Shape::Ref(_) => return wide,
     };
     let by_self = Home::In(home, local);
     match parameters {
@@ -2158,5 +2182,45 @@ impl Buckets {
             return None;
         }
         Some(self.inherent.get(&(shape, name)).map_or(&[], |v| v.as_slice()))
+    }
+}
+
+#[cfg(test)]
+mod trait_crates_tests {
+    use super::{Home, Homes, ItemKey, Local, Mutbl, Shape, trait_crates};
+
+    #[test]
+    fn unnameable_and_foreign_shapes_narrow_trait_homes_by_orphan_rules() {
+        let home = Some(3);
+        let one_param = (1, false);
+        let defaulted_two = (2, true);
+        let multi_param = (2, false);
+        let only_home = Home::In(3, None);
+
+        for shape in [
+            Shape::Param,
+            Shape::Closure,
+            Shape::FnDef(ItemKey(7)),
+            Shape::Opaque(ItemKey(8)),
+            Shape::Pat,
+            Shape::Dynamic(None),
+        ] {
+            let h1 = trait_crates(home, shape, Local::Nowhere, one_param);
+            assert_eq!(h1, Homes { all: only_home, bare: only_home, blanket: only_home, local: Local::Any }, "1-param at {shape:?}");
+
+            let h2 = trait_crates(home, shape, Local::Nowhere, defaulted_two);
+            assert_eq!(h2, Homes { all: Home::Any, bare: only_home, blanket: only_home, local: Local::Any }, "defaulted 2-param at {shape:?}");
+
+            let h3 = trait_crates(home, shape, Local::Nowhere, multi_param);
+            assert_eq!(h3, Homes { all: Home::Any, bare: Home::Any, blanket: only_home, local: Local::Any }, "multi-param at {shape:?}");
+        }
+
+        // Foreign types are local to their defining crate (just like non-fundamental ADTs).
+        let foreign = trait_crates(home, Shape::Foreign(ItemKey(9)), Local::In(5), one_param);
+        assert_eq!(foreign, Homes { all: Home::In(3, Some(5)), bare: Home::In(3, Some(5)), blanket: only_home, local: Local::Any });
+
+        // References remain fundamental -> wide (`Home::Any`) for `all` and `bare`.
+        let rf = trait_crates(home, Shape::Ref(Mutbl::Not), Local::Any, one_param);
+        assert_eq!(rf, Homes { all: Home::Any, bare: Home::Any, blanket: only_home, local: Local::Any });
     }
 }

@@ -516,7 +516,7 @@ impl<'f> NamesStage<'f> {
         let world = made.world();
         let crates = world.crates.as_slice();
         let all = world.sysroot;
-        let packs = world.texts.packs();
+        let packs = made.packs(&handles.env.fs);
         let corrected = world.texts.corrected();
         let outlined = handles.outlined;
         let root = handles.root;
@@ -714,7 +714,7 @@ impl<'f> NamesStage<'f> {
 
     fn runner(names: &Names<'f>, made: &crate::names::NamesWorld<'_>, handles: &Handles<'_, 'f>, frame: &'f Frame) -> Result<Option<&'static crate::proc_runner::ProcRunner<'static>>, &'f str> {
         match (names.procs(), handles.side) {
-            (None, Some(side)) => match crate::proc_runner::make(made, side) {
+            (None, Some(side)) => match crate::proc_runner::make(made, *names.list(), side) {
                 Ok(runner) => {
                     names.set_procs(runner);
                     Ok(Some(runner))
@@ -1098,7 +1098,7 @@ impl<'j> ProducerWalk<'j> {
 #[derive(Clone, Copy)]
 struct WorldColumns<'j> {
     crates: &'j [blaze_world::Crate<'j>],
-    packs: &'j [blaze_fetch::pack::PackView<'j>],
+    packs: crate::job_texts::SyncPacks<'j>,
     corrected: &'j [(u32, &'j str, &'j str)],
 }
 
@@ -1299,7 +1299,10 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         let at = names.crate_at(name.subject).ok_or(EngineCheckError::MissingEntry { task: name, table: Table::WorldCrates, key: name })?;
         let columns = *self.columns.get_or_insert_with(|| WorldColumns {
             crates: self.frame.alloc_slice_copy(&world.crates),
-            packs: self.frame.alloc_slice_copy(world.texts.packs()),
+            packs: match made.lazy_trees() {
+                Some(lazy) => crate::job_texts::SyncPacks::SyncLazy(lazy, &handles.env.fs),
+                None => crate::job_texts::SyncPacks::Open(self.frame.alloc_slice_copy(world.texts.packs())),
+            },
             corrected: self.frame.alloc_slice_copy(world.texts.corrected()),
         });
         let krate = columns.crates[at].input.name;
@@ -1484,7 +1487,7 @@ struct Job<'j> {
     script: Option<(Input, &'j [u8])>,
     home: Option<&'j str>,
     env: Option<EnvLent<'j, 'j>>,
-    packs: &'j [blaze_fetch::pack::PackView<'j>],
+    packs: crate::job_texts::SyncPacks<'j>,
     corrected: &'j [(u32, &'j str, &'j str)],
     procs: Option<&'j crate::proc_runner::ProcRunner<'static>>,
     kept: SharedAlloc<'static>,
@@ -1654,7 +1657,7 @@ impl Job<'_> {
             }
             (env, _) => env,
         };
-        let job = ScopeJob { workers: self.workers, kept: self.kept, at: self.at, input: CrateInput { deps: &own_deps, ..input }, deps: &exports, sysroot, packs: self.packs, corrected: self.corrected, env, procs: self.procs, oracle: self.oracle, clock: self.clock, board: Some(self.board) };
+        let job = ScopeJob { workers: self.workers, kept: self.kept, at: self.at, input: CrateInput { deps: &own_deps, ..input }, deps: &exports, sysroot, packs: self.packs.into(), corrected: self.corrected, env, procs: self.procs, oracle: self.oracle, clock: self.clock, board: Some(self.board) };
         let (resolved, ok, unresolved, oracle) = match crate::names::resolve(cx, root, &job, cx.frame()).0 {
             Resolution::Made { resolved, ok, unresolved, oracle } => (resolved, ok, unresolved, oracle),
             Resolution::Need(keys) => return need(&keys),

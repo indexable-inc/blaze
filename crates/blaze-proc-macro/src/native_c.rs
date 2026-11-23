@@ -585,7 +585,7 @@ impl CCompiler for ShelfClang<'_> {
         mounts.push(Mount { spelling: self.task_out.as_bytes(), root: output });
         let roots = Roots::new(&roots).map_err(|_| refused(alloc, &["the roots of a C task were refused"]))?;
 
-        let files = CFiles { folders: &folders, out: OutDir { root: output, folder: self.task_out }, facts: self.facts };
+        let files = CFiles { folders: &folders, out: OutDir { root: output, folder: self.task_out, package_root: None }, facts: self.facts };
         files.clear_output().map_err(|_| refused(alloc, &["the task folder could not be emptied: ", self.task_out]))?;
         let env = [("SOURCE_DATE_EPOCH", "0")];
         let report = RelPath::new(DEPFILE, blaze_roots::Limits::SHIPPED.most_path).map_err(|_| refused(alloc, &["the depfile's name"]))?;

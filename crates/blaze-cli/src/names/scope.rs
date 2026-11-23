@@ -62,7 +62,7 @@ pub(crate) struct ScopeJob<'j> {
     /// O(1) and checks none again.
     pub(crate) deps: &'j [Verified<'j>],
     pub(crate) sysroot: Sysroot,
-    pub(crate) packs: &'j [PackView<'j>],
+    pub(crate) packs: crate::job_texts::Packs<'j>,
     pub(crate) corrected: &'j [(u32, &'j str, &'j str)],
     pub(crate) env: Option<EnvLent<'j, 'j>>,
     /// The command's proc-macro runner (`Names::procs`).
@@ -321,7 +321,7 @@ fn blocks_differential(
                 cx: &span,
                 root,
                 frame: &own,
-                packs: crate::job_texts::Packs::Open(job.packs),
+                packs: job.packs,
                 corrected: job.corrected,
                 env: env.map(|env| (job.at, env)),
                 envs: None,
@@ -369,7 +369,7 @@ fn blocks_differential(
             cx: &span,
             root,
             frame: &own,
-            packs: crate::job_texts::Packs::Open(job.packs),
+            packs: job.packs,
             corrected: job.corrected,
             env: env.map(|env| (job.at, env)),
             envs: None,
@@ -420,7 +420,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         cx: &cx,
         root,
         frame,
-        packs: crate::job_texts::Packs::Open(job.packs),
+        packs: job.packs,
         corrected: job.corrected,
         env: env.map(|env| (job.at, env)),
         envs: None,
@@ -443,6 +443,12 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         let done = resolve_crate_verified(&job.input, job.deps, job.sysroot, &texts, job.at, &par, prepares, bump);
         (done, par.seen.into_inner())
     };
+    if let crate::job_texts::Packs::SyncLazy(lazy, _) = job.packs
+        && let Some(why) = lazy.refused()
+    {
+        let words = bstd::mem::format_in!(frame, "crate `{crate_name}`: {why}");
+        return failed_with(String::from(words.as_str()));
+    }
     // The crate's comparison, its items named by path while its names are at hand.
     let oracle = match (job.oracle.on(), seen) {
         (true, Some(seen)) => Some(oracle_crate(crate_name, seen, done.as_ref().ok().map(|done| done.names), job.kept)),

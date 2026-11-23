@@ -70,7 +70,7 @@ use blaze_unit_graph::sources::Records;
 
 #[cfg(feature = "std")]
 pub use checkout::Checkout;
-pub use list::{Listed, ScriptWorld, Side, crate_list, needs, open_list, script_world, world};
+pub use list::{Listed, ScriptWorld, Side, crate_list, needs, open_list, open_list_light, script_world, world, world_from_list};
 pub use script::{ScriptRecords, ScriptRecordsError, joined, script_subject};
 #[cfg(feature = "std")]
 pub use stored_files::StoredFiles;
