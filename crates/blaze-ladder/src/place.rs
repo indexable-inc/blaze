@@ -651,7 +651,7 @@ impl Placed {
         };
         // A trap in the placed code on this thread ends the run at stub.rs `leave` (crate::trap's
         // handler resumes there), caught by this watch, armed for the run only.
-        let watch = crate::trap::Watch::new(self.code.clone(), self.stops.jump()).map_err(PlaceError::Trap)?;
+        let watch = crate::trap::Watch::new(self.code.start..self.code.end, self.stops.jump()).map_err(PlaceError::Trap)?;
         let armed = watch.arm().map_err(PlaceError::Trap)?;
         // SAFETY: `at` is the slot's word: the address of a body this module placed (`place`),
         // emitted by blaze-emit in the C convention for a function of no parameters (`Unit`,

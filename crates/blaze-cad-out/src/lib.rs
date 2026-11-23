@@ -4,11 +4,12 @@
 //!
 //! | module | what |
 //! |---|---|
-//! | [`scene`] | [`Scene`], [`Part`], [`Material`] and what a part carries: [`Transform`], [`MassFacts`], [`Joint`], [`Collider`], [`Lod`] |
-//! | [`glb`] | [`glb()`]: glTF 2.0 in one `.glb`, float or [`KHR_mesh_quantization`](Encoding::Quantized) |
+//! | [`scene`] | [`Scene`], [`Part`], [`Material`], [`MaterialTextures`], [`TexturePack`] and what a part carries: [`Transform`], [`MassFacts`], [`Joint`], [`Collider`], [`Lod`] |
+//! | [`glb`] | [`glb()`], [`glb_textured()`]: glTF 2.0 in one `.glb`, float or [`KHR_mesh_quantization`](Encoding::Quantized), UVs, tangents, embedded PNG textures |
+//! | [`glb_read`] | [`read_glb()`]: binary glTF 2.0 reader reconstructing meshes, hierarchy, PBR materials, and decoded PNG images |
 //! | [`stl`] | [`stl()`]: standard binary STL from a verified closed manifold mesh, in mm or m |
 //! | [`svg`] | [`svg()`]: standalone SVG 1.1 2D cross-section via Marching Squares with saddle decider |
-//! | [`png`] | [`png()`]: an RGBA8 or 8-bit grey PNG, filtered per row, zlib on blaze-deflate, CRC-32 per chunk |
+//! | [`png`] | [`png()`], [`decode_png()`]: an RGBA8 or 8-bit grey PNG encoder and decoder, zlib on blaze-deflate, CRC-32 per chunk |
 //! | [`summary`] | [`summary()`]: one part per line, plain text |
 //! | `json` | the JSON emitter the glTF's JSON chunk is written with, on blaze-text |
 //!
@@ -38,6 +39,7 @@
 extern crate std;
 
 pub mod glb;
+pub mod glb_read;
 mod json;
 mod plant;
 pub mod png;
@@ -50,11 +52,18 @@ pub mod svg;
 #[cfg(test)]
 mod tests;
 
-pub use glb::{Encoding, Field, GlbError, GlbOpts, MaterialField, MeshSlot, NormalBits, glb, glb_planted};
+pub use glb::{
+    Encoding, Field, GlbError, GlbOpts, MaterialField, MeshSlot, NormalBits, glb, glb_planted, glb_textured,
+    glb_textured_planted,
+};
+pub use glb_read::{GlbReadError, GlbReadOpts, LoadedGlb, LoadedImage, LoadedLod, LoadedMaterial, LoadedPart, read_glb};
 pub use json::JsonFault;
 pub use plant::{GlbPlant, PngPlant, StlPlant, SummaryPlant, SvgPlant};
-pub use png::{Image, PngError, PngKind, PngOpts, png, png_planted};
-pub use scene::{Clearcoat, Collider, Joint, JointKind, Lod, MassFacts, Material, Matrix, Part, Scene, Transform, Trs, Up};
+pub use png::{DecodedPng, Image, PngError, PngKind, PngOpts, decode_png, png, png_planted};
+pub use scene::{
+    Clearcoat, Collider, Joint, JointKind, Lod, MassFacts, Material, MaterialTextures, Matrix, Part, Scene, TexturePack,
+    Transform, Trs, Up,
+};
 pub use stl::{FACET_BYTES, HEADER_BYTES, StlError, StlOpts, StlUnit, stl, stl_planted};
 pub use summary::{SummaryError, SummaryOpts, summary, summary_planted};
 pub use svg::{DEFAULT_FILL, DEFAULT_STROKE, SectionGrid, SvgError, SvgOpts, svg, svg_planted};

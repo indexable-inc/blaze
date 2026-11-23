@@ -33,7 +33,7 @@ use std::{
     fmt::Write as _,
     num::NonZeroUsize,
     sync::{
-        OnceLock,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering, fence},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -334,12 +334,11 @@ impl Table {
     fn add(&mut self, base: u32, name: &str) -> Sym {
         // alloc: once per distinct name a table holds, let go with it
         let kept: std::sync::Arc<str> = name.into();
-        // clone: a refcount, the name's one string shared by both
-        self.add_arc(base, kept.clone())
+        self.add_arc(base, kept)
     }
 
     fn add_arc(&mut self, base: u32, name: std::sync::Arc<str>) -> Sym {
-        self.names.push(name.clone());
+        self.names.push(Arc::clone(&name));
         let id = base | self.names.len() as u32;
         self.ids.insert(name, id);
         id

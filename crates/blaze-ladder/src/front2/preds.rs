@@ -687,7 +687,7 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
             .and_then(|l| l.checked_sub(own))
             .ok_or_else(|| Why::Program("an associated type's alias lists fewer arguments than its own parameters".into(), Range::new(0, 0)))?;
         // In the associated type's scope (its own lifetimes after its trait's: the caller's).
-        let mut mine = Preds::new_in(out.scope.clone());
+        let mut mine = Preds::new_in(out.scope.clone_in(out.scope.alloc()));
         self.predicates(tys, env, v, base, None, sized, &mut mine)?;
         if !mine.conds.is_empty() {
             return Err(Why::Unsupported("a `where const` condition on an associated type", Range::new(0, 0)));

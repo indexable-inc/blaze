@@ -51,8 +51,10 @@ use dep_mount::DepViews;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScriptRoot {
     /// `None`: a dependency; `Some(dir)`: a member at `dir`, checked by `SeenRoot::member`.
-    member: Option<String>,
+    member: Option<Arc<str>>,
 }
+
+impl blaze_own::Share for ScriptRoot {}
 
 impl ScriptRoot {
     /// A dependency's (registry, git, toolchain) script: it sees `/package`.
@@ -64,7 +66,7 @@ impl ScriptRoot {
     /// `dir` that is not a plain path under it is refused by name.
     pub fn member(dir: &str) -> Result<ScriptRoot, MemberDirError<'_>> {
         SeenRoot::member(dir)?;
-        Ok(ScriptRoot { member: Some(dir.to_owned()) })
+        Ok(ScriptRoot { member: Some(Arc::from(dir)) })
     }
 
     pub fn seen(&self) -> SeenRoot<'_> {
@@ -85,7 +87,9 @@ pub(crate) const STDERR_TAIL: usize = 64 << 10;
 /// resolved the root too, a relative `.`, and so asked the process for its folder twice per read
 /// (tempo's edit: `getcwd` 3.25% of the command's CPU, the reads a third of its opens).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RealRoot(PathBuf);
+pub struct RealRoot(Arc<Path>);
+
+impl blaze_own::Share for RealRoot {}
 
 /// Why a served checkout's root has no [`RealRoot`].
 #[derive(Debug)]
@@ -107,12 +111,16 @@ impl std::fmt::Display for RootUnresolved {
 }
 
 impl RealRoot {
+    fn from_path(path: impl AsRef<Path>) -> RealRoot {
+        RealRoot(Arc::from(path.as_ref()))
+    }
+
     /// `absolute` with every link resolved: the one `realpath` of a served tree's root.
     pub fn resolve(absolute: &Path) -> Result<RealRoot, RootUnresolved> {
         if !absolute.is_absolute() {
             return Err(RootUnresolved::Relative(absolute.to_owned()));
         }
-        std::fs::canonicalize(absolute).map(RealRoot).map_err(|error| RootUnresolved::Io { path: absolute.to_owned(), error })
+        std::fs::canonicalize(absolute).map(RealRoot::from_path).map_err(|error| RootUnresolved::Io { path: absolute.to_owned(), error })
     }
 
     /// `rel`, relative to the folder the process was started in (`.` for it), with every link
@@ -122,9 +130,9 @@ impl RealRoot {
     /// 75). `Err` names the path and the OS's error.
     pub fn of_start(rel: &Path, plant: impl blaze_own::planted::Planted<StartPlant>) -> Result<RealRoot, RootUnresolved> {
         if plant.has(StartPlant::LeftRelative) {
-            return Ok(RealRoot(rel.to_owned()));
+            return Ok(RealRoot::from_path(rel));
         }
-        std::fs::canonicalize(rel).map(RealRoot).map_err(|error| RootUnresolved::Io { path: rel.to_owned(), error })
+        std::fs::canonicalize(rel).map(RealRoot::from_path).map_err(|error| RootUnresolved::Io { path: rel.to_owned(), error })
     }
 
     pub fn path(&self) -> &Path {
@@ -178,6 +186,8 @@ pub enum Tree {
     /// gives (D54); `None` for a crate.
     Mem { files: Arc<Vec<(String, Vec<u8>)>>, git: Option<git::Oid> },
 }
+
+impl blaze_own::Share for Tree {}
 
 /// A file or a folder of the tree.
 enum Node<'t> {
@@ -841,7 +851,7 @@ impl ScriptSandbox {
                     if !self.c_held.contains_key(&digest) {
                         self.c_held_bytes += bytes.len() as u64;
                         if self.c_held_bytes > limit {
-                            over = Some(name.clone());
+                            over = Some(name.as_str());
                             break;
                         }
                         self.c_held.insert(digest, bytes.clone());
@@ -851,9 +861,10 @@ impl ScriptSandbox {
             }
         }
         if let Some(name) = over {
-            return Err(self.refuse(Refusal::OutDir(format!(
+            let msg = format!(
                 "deferred C requests whose OUT_DIR inputs, kept as each request saw them, pass {limit} bytes (at {name})"
-            ))));
+            );
+            return Err(self.refuse(Refusal::OutDir(msg)));
         }
         let state = match self.c_states.last() {
             Some(last) if *last == entries => self.c_states.len() - 1,
@@ -940,7 +951,8 @@ impl ScriptSandbox {
         let opened = at.checked_sub(ROOT_FD + 1).and_then(|at| self.opened.get(at as usize)).and_then(Option::as_ref);
         match opened {
             Some(Opened::Ro { entries: Some(_), folder, .. }) => {
-                let mut joined = folder.clone();
+                let mut joined = Vec::with_capacity(folder.len() + 1 + path.len());
+                joined.extend_from_slice(folder);
                 joined.push(b'/');
                 joined.extend_from_slice(path);
                 Ok(joined)
@@ -1165,8 +1177,9 @@ impl ScriptSandbox {
         };
         let found = self.look_up(program)?;
         if !found {
-            let host = self.script.host.clone();
-            self.record(crate::spawn_route::absent_subject(&host, program), Some(crate::spawn_route::absent_digest(&host, program)));
+            let subject = crate::spawn_route::absent_subject(&self.script.host, program);
+            let digest = crate::spawn_route::absent_digest(&self.script.host, program);
+            self.record(subject, Some(digest));
         }
         Ok(found)
     }
@@ -1192,7 +1205,7 @@ impl ScriptSandbox {
                 return Err(self.refuse(Refusal::Spawn(SpawnRefusal::NotFoundUnasked { program: program.clone(), args: owned() })));
             }
             crate::spawn_route::Route::Rustc if self.script.probes.is_some() => {
-                let probes = self.script.probes.clone().expect("the arm's guard: the checker is on");
+                let probes = self.script.probes.as_ref().map(blaze_own::Share::share).expect("the arm's guard: the checker is on");
                 self.checked_probe(&probes, &args_text, &spawned, args)?
             }
             crate::spawn_route::Route::Rustc => match probe_ask::classify(&args_text, Alloc::global()) {
@@ -1202,22 +1215,33 @@ impl ScriptSandbox {
                 // not handed to the script host yet; refused by name, never guessed.
                 Ok(Ask::Print { .. }) => return Err(self.refuse(Refusal::Spawn(SpawnRefusal::RustcArgs { args: owned() }))),
                 Ok(Ask::Compile(compile)) => {
-                    let cwd = spawned.cwd.clone().unwrap_or_else(|| self.script.cwd());
-                    let bytes = match compile.input {
-                        Snippet::Stdin => Some(spawned.stdin.clone()),
-                        Snippet::File(path) => self.snippet_file(&cwd, path)?,
+                    let script_cwd;
+                    let cwd = match spawned.cwd.as_deref() {
+                        Some(cwd) => cwd,
+                        None => {
+                            script_cwd = self.script.cwd();
+                            &script_cwd
+                        }
+                    };
+                    let owned_bytes;
+                    let bytes: Option<&[u8]> = match compile.input {
+                        Snippet::Stdin => Some(spawned.stdin.as_slice()),
+                        Snippet::File(path) => {
+                            owned_bytes = self.snippet_file(cwd, path)?;
+                            owned_bytes.as_deref()
+                        }
                     };
                     let Some(bytes) = bytes else {
                         return Err(self.refuse(Refusal::Spawn(SpawnRefusal::RustcArgs { args: owned() })));
                     };
                     // probe_ask.rs: no output file is written; every probe of tempo's reads
                     // only the status.
-                    let answered = probe_ask::answer(&compile, &self.script.host, &bytes, &Table { rows: &self.script.table });
+                    let answered = probe_ask::answer(&compile, &self.script.host, bytes, &Table { rows: &self.script.table });
                     match answered.verdict {
                         Verdict::Accepted(_) => (0, Vec::new(), Vec::new()),
-                        Verdict::Rejected(rejection) => (1, Vec::new(), rejection.stderr(&compile, &bytes, Alloc::global()).as_bytes().to_vec()),
+                        Verdict::Rejected(rejection) => (1, Vec::new(), rejection.stderr(&compile, bytes, Alloc::global()).as_bytes().to_vec()),
                         Verdict::Unanswered(_) => {
-                            let snippet = String::from_utf8_lossy(&bytes).into_owned();
+                            let snippet = String::from_utf8_lossy(bytes).into_owned();
                             let (key, target) = (answered.key, answered.target.to_owned());
                             return Err(self.refuse(Refusal::Spawn(SpawnRefusal::CannotAnswerYet { key, args: owned(), snippet, target })));
                         }
@@ -1283,7 +1307,7 @@ impl ScriptSandbox {
                 // with (outputs.rs `CTree`): `configure` reads CC, CFLAGS and the rest.
                 if blaze_build_script::c_tasks::is_tree(program) {
                     let env = crate::spawn_route::child_env(&self.script.env, &spawned);
-                    self.c_trees.push((self.c_requests.len() as u32, cwd.clone(), env));
+                    self.c_trees.push((self.c_requests.len() as u32, cwd, env));
                 }
                 self.c_requests.push((text, state));
                 (0, Vec::new(), Vec::new())
@@ -1998,7 +2022,7 @@ pub fn mem_tree<'f>(files: impl IntoIterator<Item = (&'f str, &'f [u8])>, dir: &
 
 /// A folder of the checkout as a [`Tree::Dir`], at the root the command resolved once.
 pub fn dir_tree(root: &RealRoot) -> Tree {
-    Tree::Dir(root.clone())
+    Tree::Dir(blaze_own::Share::share(root))
 }
 
 #[cfg(test)]

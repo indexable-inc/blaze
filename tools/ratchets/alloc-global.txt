@@ -16,7 +16,7 @@ blaze-consteval	9	0	0	0	0
 blaze-deflate	0	0	1	0	0
 blaze-emit	1	0	0	0	0
 blaze-file-items	2	0	0	0	0
-blaze-ladder	17	0	0	0	6
+blaze-ladder	15	0	0	0	6
 blaze-launch-rt	0	1	0	0	0
 blaze-launcher	0	1	0	0	0
 blaze-lower	7	0	0	0	0

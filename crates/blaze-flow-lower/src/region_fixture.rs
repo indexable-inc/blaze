@@ -582,6 +582,9 @@ impl<F: Facts> Facts for WithRegions<'_, F> {
     fn copy_args(&self, adt: ItemKey) -> Option<&[bool]> {
         self.base.copy_args(adt)
     }
+    fn drop_args(&self, adt: ItemKey) -> Option<&[bool]> {
+        self.base.drop_args(adt)
+    }
     fn field_count(&self, adt: ItemKey, variant: u32) -> Option<u32> {
         self.base.field_count(adt, variant)
     }

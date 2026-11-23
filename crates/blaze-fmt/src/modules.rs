@@ -616,8 +616,7 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
         }
         let mut result = vec![];
         for path in path_visitor.paths() {
-            let mut actual_path = self.directory.path.clone();
-            actual_path.push(&path);
+            let actual_path = self.directory.path.join(&path);
             if !actual_path.exists() {
                 continue;
             }

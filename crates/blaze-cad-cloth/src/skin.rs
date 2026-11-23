@@ -322,6 +322,7 @@ pub fn cull_occluded_inner_layer(
     keep_max_abs_x: f64,
 ) -> usize {
     let orig = garment.triangles.len();
+    let has_tri_panel = garment.tri_panel.len() == orig;
     let mut write = 0usize;
     for read in 0..orig {
         let tri = garment.triangles[read];
@@ -345,12 +346,18 @@ pub fn cull_occluded_inner_layer(
             garment.triangles[write] = tri;
             garment.tri_fabric[write] = garment.tri_fabric[read];
             garment.tri_layer[write] = layer;
+            if has_tri_panel {
+                garment.tri_panel[write] = garment.tri_panel[read];
+            }
             write += 1;
         }
     }
     garment.triangles.truncate(write);
     garment.tri_fabric.truncate(write);
     garment.tri_layer.truncate(write);
+    if has_tri_panel {
+        garment.tri_panel.truncate(write);
+    }
     orig - write
 }
 
@@ -625,6 +632,9 @@ pub fn unskin_garment_to_bind<'a>(
     alloc: Alloc<'a>,
 ) -> Result<GarmentMesh<'a>, AllocFailure> {
     let mut out = GarmentMesh::new(alloc);
+    for &pm in draped.panels.iter() {
+        push(&mut out.panels, pm)?;
+    }
     for i in 0..draped.positions.len() {
         let r = draped.weld_of(i as u32) as usize;
         let m = blended_mat4(weights.joints_0[r], weights.weights_0[r], &posed.skin_mats);
@@ -633,6 +643,11 @@ pub fn unskin_garment_to_bind<'a>(
         push(&mut out.positions, p_bind)?;
         push(&mut out.normals, n_bind)?;
         push(&mut out.uvs, draped.uvs[i])?;
+        if i < draped.rest_pos_m.len() {
+            push(&mut out.rest_pos_m, draped.rest_pos_m[i])?;
+        } else {
+            push(&mut out.rest_pos_m, draped.uvs[i])?;
+        }
         push(&mut out.colors, draped.colors.get(i).copied().unwrap_or([0, 255, 0, 128]))?;
         push(&mut out.rigid_anchor, draped.rigid_anchor[i])?;
         push(&mut out.weld_rep, r as u32)?;
@@ -641,6 +656,9 @@ pub fn unskin_garment_to_bind<'a>(
         push(&mut out.triangles, draped.triangles[i])?;
         push(&mut out.tri_fabric, draped.tri_fabric[i])?;
         push(&mut out.tri_layer, draped.tri_layer[i])?;
+        if i < draped.tri_panel.len() {
+            push(&mut out.tri_panel, draped.tri_panel[i])?;
+        }
     }
     Ok(out)
 }

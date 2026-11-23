@@ -157,7 +157,7 @@ impl ParseSess {
 
         self.source_map
             .get_source_file(&rustc_filename)
-            .and_then(|source_file| source_file.src.clone())
+            .and_then(|source_file| source_file.src.as_ref().map(crate::span::source_map::share_arc))
     }
 }
 
@@ -233,7 +233,7 @@ impl LineRangeUtils for ParseSess {
         let offset = 1 + if starts_with_newline(&snippet) { 1 } else { 0 };
         // Line numbers start at 1
         LineRange {
-            file: lo.sf.clone(),
+            file: crate::span::source_map::share_arc(&lo.sf),
             lo: lo.line + offset,
             hi: hi.line + offset,
         }

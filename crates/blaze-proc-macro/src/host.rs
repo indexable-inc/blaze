@@ -449,13 +449,14 @@ impl Runtime {
     /// compiled and the record written. A second worker asking while the first loads it waits
     /// for it, up to [`LOAD_DEADLINE`].
     pub fn load(&self, module: &ModuleRecord) -> Result<Arc<Loaded>, RuntimeError> {
+        use crate::ShareArc as _;
         let (slot, mine) = {
             let mut slots = lock(&self.slots);
             match slots.get(&module.key) {
-                Some(slot) => (slot.clone(), false),
+                Some(slot) => (slot.share_arc(), false),
                 None => {
                     let slot = Arc::new(Slot { state: Mutex::new(SlotState::Loading), done: Condvar::new() });
-                    slots.insert(module.key.clone(), slot.clone());
+                    slots.insert(module.key.clone(), slot.share_arc());
                     (slot, true)
                 }
             }
@@ -464,7 +465,7 @@ impl Runtime {
         if mine {
             let loaded = self.load_now(module);
             *lock(&slot.state) = match &loaded {
-                Ok(loaded) => SlotState::Ready(loaded.clone()),
+                Ok(loaded) => SlotState::Ready(loaded.share_arc()),
                 Err(error) => SlotState::Failed(error.to_string()),
             };
             slot.done.notify_all();
@@ -476,7 +477,7 @@ impl Runtime {
         let _span = matches!(*state, SlotState::Loading).then(|| tracing::info_span!("proc_macro_module_wait", module = %label()).entered());
         loop {
             match &*state {
-                SlotState::Ready(loaded) => return Ok(loaded.clone()),
+                SlotState::Ready(loaded) => return Ok(loaded.share_arc()),
                 SlotState::Failed(why) => return Err(RuntimeError::Compile { module: label(), why: why.clone() }),
                 SlotState::Loading => {}
             }
@@ -521,8 +522,7 @@ impl Runtime {
     #[allow(unsafe_code)]
     fn load_now(&self, module: &ModuleRecord) -> Result<Arc<Loaded>, RuntimeError> {
         let started = Instant::now();
-        let crate_name = format!("{} {}", module.name, module.version);
-        let compile = |why: String| RuntimeError::Compile { module: crate_name.clone(), why };
+        let compile = |why: String| RuntimeError::Compile { module: format!("{} {}", module.name, module.version), why };
         let dir = &module.compiled;
         // The store's compiled folder is made on its first compile (mode from the user's umask;
         // `private_dir` refuses one that group or others can write).
@@ -566,6 +566,7 @@ impl Runtime {
             }
         };
         let pre = self.linker.instantiate_pre(&compiled).map_err(|e| compile(format!("{e:#}")))?;
+        let crate_name = format!("{} {}", module.name, module.version);
         Ok(Arc::new(Loaded { pre, crate_name, decls: module.decls.clone(), compiled: compiled_now, code_bytes, load_time: started.elapsed() }))
     }
 

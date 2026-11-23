@@ -76,9 +76,9 @@ impl fmt::Display for Missing {
     }
 }
 
-impl<A: Allocator + Clone> ClosureRows<A> {
+impl<A: Allocator + Copy> ClosureRows<A> {
     pub fn new_in(alloc: A) -> ClosureRows<A> {
-        ClosureRows { owners: Vec::new_in(alloc.clone()), rows: Vec::new_in(alloc) }
+        ClosureRows { owners: Vec::new_in(alloc), rows: Vec::new_in(alloc) }
     }
 
     /// Files each closure of `checked`, the clean record of `body` (its owner `body.owner`), its

@@ -79,8 +79,6 @@ use crate::utils::{
     rewrite_ident, trimmed_last_line_width, wrap_str,
 };
 
-use crate::ast::ThinVec;
-
 /// Provides the original input contents from the span
 /// of a chain element with trailing spaces trimmed.
 fn format_overflow_style(span: Span, context: &RewriteContext<'_>) -> Option<String> {
@@ -96,7 +94,7 @@ fn format_overflow_style(span: Span, context: &RewriteContext<'_>) -> Option<Str
 }
 
 fn format_chain_item(
-    item: &ChainItem,
+    item: &ChainItem<'_>,
     context: &RewriteContext<'_>,
     rewrite_shape: Shape,
     allow_overflow: bool,
@@ -167,35 +165,28 @@ enum CommentPosition {
 }
 
 /// Information about an expression in a chain.
-struct SubExpr {
-    expr: ast::Expr,
+struct SubExpr<'a> {
+    expr: Cow<'a, ast::Expr>,
     is_postfix_receiver: bool,
 }
 
 /// An expression plus trailing `?`s to be formatted together.
 #[derive(Debug)]
-struct ChainItem {
-    kind: ChainItemKind,
+struct ChainItem<'a> {
+    kind: ChainItemKind<'a>,
     tries: usize,
     // The entire span of the chain item, including the leading dot and any comments, e.g.
     // `.some_method(arg, arg)`, or  `. /* a comment */ my_attribute`.
     span: Span,
 }
 
-// FIXME: we can't use a reference here because to convert `try!` to `?` we
-// synthesise the AST node. However, I think we could use `Cow` and that
-// would remove a lot of cloning.
 #[derive(Debug)]
-enum ChainItemKind {
+enum ChainItemKind<'a> {
     Parent {
-        expr: ast::Expr,
+        expr: Cow<'a, ast::Expr>,
         parens: bool,
     },
-    MethodCall(
-        ast::PathSegment,
-        Vec<ast::GenericArg>,
-        ThinVec<Box<ast::Expr>>,
-    ),
+    MethodCall(symbol::Ident, Vec<Cow<'a, ast::GenericArg>>, Cow<'a, [Box<ast::Expr>]>),
     StructField(symbol::Ident),
     /// Tuple field access like `foo.1`.
     TupleField {
@@ -210,7 +201,7 @@ enum ChainItemKind {
     Comment(String, CommentPosition),
 }
 
-impl ChainItemKind {
+impl<'a> ChainItemKind<'a> {
     fn is_block_like(&self, context: &RewriteContext<'_>, reps: &str) -> bool {
         match self {
             ChainItemKind::Parent { expr, .. } => utils::is_block_expr(context, expr, reps),
@@ -237,68 +228,179 @@ impl ChainItemKind {
 
     fn from_ast(
         context: &RewriteContext<'_>,
-        expr: &ast::Expr,
+        expr: Cow<'a, ast::Expr>,
         is_postfix_receiver: bool,
-    ) -> (ChainItemKind, Span) {
-        let (kind, span) = match &expr.kind {
-            ast::ExprKind::MethodCall(call) => {
-                let types = match call.seg.args.as_deref() {
-                    Some(ast::GenericArgs::AngleBracketed(data)) => data
-                        .args
-                        .iter()
-                        .filter_map(|x| match x {
-                            ast::AngleBracketedArg::Arg(generic_arg) => Some(generic_arg.clone()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>(),
-                    _ => vec![],
-                };
-                let span = mk_sp(call.receiver.span.hi(), expr.span.hi());
-                let kind = ChainItemKind::MethodCall(call.seg.clone(), types, call.args.clone());
-                (kind, span)
-            }
-            ast::ExprKind::Field(nested, field) => {
-                let kind = if Self::is_tup_field_ident(field) {
-                    ChainItemKind::TupleField {
-                        field: *field,
-                        is_nested: Self::is_tup_field_access_expr(nested),
-                    }
-                } else {
-                    ChainItemKind::StructField(*field)
-                };
-                let span = mk_sp(nested.span.hi(), field.span.hi());
-                (kind, span)
-            }
-            ast::ExprKind::Await(nested, _) => {
-                let span = mk_sp(nested.span.hi(), expr.span.hi());
-                (ChainItemKind::Await, span)
-            }
-            ast::ExprKind::Use(nested, _) => {
-                let span = mk_sp(nested.span.hi(), expr.span.hi());
-                (ChainItemKind::Use, span)
-            }
-            ast::ExprKind::Yield(ast::YieldKind::Postfix(nested)) => {
-                let span = mk_sp(nested.span.hi(), expr.span.hi());
-                (ChainItemKind::Yield, span)
-            }
-            _ => {
-                return (
-                    ChainItemKind::Parent {
-                        expr: expr.clone(),
-                        parens: is_postfix_receiver && should_add_parens(expr, context),
-                    },
-                    expr.span,
-                );
-            }
+    ) -> (ChainItemKind<'a>, Span, Option<SubExpr<'a>>) {
+        let expr_span = expr.span;
+        let (kind, span, next) = match expr {
+            Cow::Borrowed(expr) => match &expr.kind {
+                ast::ExprKind::MethodCall(call) => {
+                    let types = match call.seg.args.as_deref() {
+                        Some(ast::GenericArgs::AngleBracketed(data)) => data
+                            .args
+                            .iter()
+                            .filter_map(|x| match x {
+                                ast::AngleBracketedArg::Arg(generic_arg) => {
+                                    Some(Cow::Borrowed(generic_arg))
+                                }
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => Default::default(),
+                    };
+                    let span = mk_sp(call.receiver.span.hi(), expr_span.hi());
+                    let kind = ChainItemKind::MethodCall(
+                        call.seg.ident,
+                        types,
+                        Cow::Borrowed(&call.args[..]),
+                    );
+                    let next = SubExpr {
+                        expr: Chain::convert_try(Cow::Borrowed(&call.receiver), context),
+                        is_postfix_receiver: true,
+                    };
+                    (kind, span, Some(next))
+                }
+                ast::ExprKind::Field(nested, field) => {
+                    let kind = if Self::is_tup_field_ident(field) {
+                        ChainItemKind::TupleField {
+                            field: *field,
+                            is_nested: Self::is_tup_field_access_expr(nested),
+                        }
+                    } else {
+                        ChainItemKind::StructField(*field)
+                    };
+                    let span = mk_sp(nested.span.hi(), field.span.hi());
+                    let next = SubExpr {
+                        expr: Chain::convert_try(Cow::Borrowed(nested), context),
+                        is_postfix_receiver: true,
+                    };
+                    (kind, span, Some(next))
+                }
+                ast::ExprKind::Await(nested, _) => {
+                    let span = mk_sp(nested.span.hi(), expr_span.hi());
+                    let next = SubExpr {
+                        expr: Chain::convert_try(Cow::Borrowed(nested), context),
+                        is_postfix_receiver: true,
+                    };
+                    (ChainItemKind::Await, span, Some(next))
+                }
+                ast::ExprKind::Use(nested, _) => {
+                    let span = mk_sp(nested.span.hi(), expr_span.hi());
+                    let next = SubExpr {
+                        expr: Chain::convert_try(Cow::Borrowed(nested), context),
+                        is_postfix_receiver: true,
+                    };
+                    (ChainItemKind::Use, span, Some(next))
+                }
+                ast::ExprKind::Yield(ast::YieldKind::Postfix(nested)) => {
+                    let span = mk_sp(nested.span.hi(), expr_span.hi());
+                    let next = SubExpr {
+                        expr: Chain::convert_try(Cow::Borrowed(nested), context),
+                        is_postfix_receiver: true,
+                    };
+                    (ChainItemKind::Yield, span, Some(next))
+                }
+                _ => {
+                    let parens = is_postfix_receiver && should_add_parens(expr, context);
+                    return (
+                        ChainItemKind::Parent {
+                            expr: Cow::Borrowed(expr),
+                            parens,
+                        },
+                        expr_span,
+                        None,
+                    );
+                }
+            },
+            Cow::Owned(expr) => match expr.kind {
+                ast::ExprKind::MethodCall(call) => {
+                    let call = *call;
+                    let types = match call.seg.args.map(|a| *a) {
+                        Some(ast::GenericArgs::AngleBracketed(data)) => data
+                            .args
+                            .into_iter()
+                            .filter_map(|x| match x {
+                                ast::AngleBracketedArg::Arg(generic_arg) => {
+                                    Some(Cow::Owned(generic_arg))
+                                }
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => Default::default(),
+                    };
+                    let span = mk_sp(call.receiver.span.hi(), expr_span.hi());
+                    let kind = ChainItemKind::MethodCall(
+                        call.seg.ident,
+                        types,
+                        Cow::Owned(call.args.into_iter().collect()),
+                    );
+                    let next = SubExpr {
+                        expr: Chain::convert_try(Cow::Owned(*call.receiver), context),
+                        is_postfix_receiver: true,
+                    };
+                    (kind, span, Some(next))
+                }
+                ast::ExprKind::Field(nested, field) => {
+                    let kind = if Self::is_tup_field_ident(&field) {
+                        ChainItemKind::TupleField {
+                            field,
+                            is_nested: Self::is_tup_field_access_expr(&nested),
+                        }
+                    } else {
+                        ChainItemKind::StructField(field)
+                    };
+                    let span = mk_sp(nested.span.hi(), field.span.hi());
+                    let next = SubExpr {
+                        expr: Chain::convert_try(Cow::Owned(*nested), context),
+                        is_postfix_receiver: true,
+                    };
+                    (kind, span, Some(next))
+                }
+                ast::ExprKind::Await(nested, _) => {
+                    let span = mk_sp(nested.span.hi(), expr_span.hi());
+                    let next = SubExpr {
+                        expr: Chain::convert_try(Cow::Owned(*nested), context),
+                        is_postfix_receiver: true,
+                    };
+                    (ChainItemKind::Await, span, Some(next))
+                }
+                ast::ExprKind::Use(nested, _) => {
+                    let span = mk_sp(nested.span.hi(), expr_span.hi());
+                    let next = SubExpr {
+                        expr: Chain::convert_try(Cow::Owned(*nested), context),
+                        is_postfix_receiver: true,
+                    };
+                    (ChainItemKind::Use, span, Some(next))
+                }
+                ast::ExprKind::Yield(ast::YieldKind::Postfix(nested)) => {
+                    let span = mk_sp(nested.span.hi(), expr_span.hi());
+                    let next = SubExpr {
+                        expr: Chain::convert_try(Cow::Owned(*nested), context),
+                        is_postfix_receiver: true,
+                    };
+                    (ChainItemKind::Yield, span, Some(next))
+                }
+                _ => {
+                    let parens = is_postfix_receiver && should_add_parens(&expr, context);
+                    return (
+                        ChainItemKind::Parent {
+                            expr: Cow::Owned(expr),
+                            parens,
+                        },
+                        expr_span,
+                        None,
+                    );
+                }
+            },
         };
 
         // Remove comments from the span.
         let lo = context.snippet_provider.span_before(span, ".");
-        (kind, mk_sp(lo, span.hi()))
+        (kind, mk_sp(lo, span.hi()), next)
     }
 }
 
-impl Rewrite for ChainItem {
+impl Rewrite for ChainItem<'_> {
     fn rewrite(&self, context: &RewriteContext<'_>, shape: Shape) -> Option<String> {
         self.rewrite_result(context, shape).ok()
     }
@@ -309,13 +411,13 @@ impl Rewrite for ChainItem {
             ChainItemKind::Parent {
                 ref expr,
                 parens: true,
-            } => crate::expr::rewrite_paren(context, &expr, shape, expr.span)?,
+            } => crate::expr::rewrite_paren(context, expr, shape, expr.span)?,
             ChainItemKind::Parent {
                 ref expr,
                 parens: false,
             } => expr.rewrite_result(context, shape)?,
-            ChainItemKind::MethodCall(ref segment, ref types, ref exprs) => {
-                Self::rewrite_method_call(segment.ident, types, exprs, self.span, context, shape)?
+            ChainItemKind::MethodCall(ident, ref types, ref exprs) => {
+                Self::rewrite_method_call(ident, types, exprs, self.span, context, shape)?
             }
             ChainItemKind::StructField(ident) => format!(".{}", rewrite_ident(context, ident)),
             ChainItemKind::TupleField { field, is_nested } => format!(
@@ -338,13 +440,8 @@ impl Rewrite for ChainItem {
     }
 }
 
-impl ChainItem {
-    fn new(context: &RewriteContext<'_>, expr: &SubExpr, tries: usize) -> ChainItem {
-        let (kind, span) = ChainItemKind::from_ast(context, &expr.expr, expr.is_postfix_receiver);
-        ChainItem { kind, tries, span }
-    }
-
-    fn comment(span: Span, comment: String, pos: CommentPosition) -> ChainItem {
+impl<'a> ChainItem<'a> {
+    fn comment(span: Span, comment: String, pos: CommentPosition) -> ChainItem<'a> {
         ChainItem {
             kind: ChainItemKind::Comment(comment, pos),
             tries: 0,
@@ -358,7 +455,7 @@ impl ChainItem {
 
     fn rewrite_method_call(
         method_name: symbol::Ident,
-        types: &[ast::GenericArg],
+        types: &[Cow<'_, ast::GenericArg>],
         args: &[Box<ast::Expr>],
         span: Span,
         context: &RewriteContext<'_>,
@@ -380,26 +477,55 @@ impl ChainItem {
 }
 
 #[derive(Debug)]
-struct Chain {
-    parent: ChainItem,
-    children: Vec<ChainItem>,
+struct Chain<'a> {
+    parent: ChainItem<'a>,
+    children: Vec<ChainItem<'a>>,
 }
 
-impl Chain {
-    fn from_ast(expr: &ast::Expr, context: &RewriteContext<'_>) -> Chain {
-        let subexpr_list = Self::make_subexpr_list(expr, context);
-
+impl<'a> Chain<'a> {
+    fn from_ast(expr: &'a ast::Expr, context: &RewriteContext<'_>) -> Chain<'a> {
         // Un-parse the expression tree into ChainItems
         let mut rev_children = vec![];
         let mut sub_tries = 0;
-        for subexpr in &subexpr_list {
-            match subexpr.expr.kind {
-                ast::ExprKind::Try(_) => sub_tries += 1,
-                _ => {
-                    rev_children.push(ChainItem::new(context, subexpr, sub_tries));
-                    sub_tries = 0;
+        let mut cur = Some(SubExpr {
+            expr: Cow::Borrowed(expr),
+            is_postfix_receiver: false,
+        });
+        while let Some(subexpr) = cur {
+            let next = match subexpr.expr {
+                Cow::Borrowed(ast::Expr {
+                    kind: ast::ExprKind::Try(inner),
+                    ..
+                }) => {
+                    sub_tries += 1;
+                    Some(SubExpr {
+                        expr: Self::convert_try(Cow::Borrowed(inner), context),
+                        is_postfix_receiver: false,
+                    })
                 }
-            }
+                Cow::Owned(ast::Expr {
+                    kind: ast::ExprKind::Try(inner),
+                    ..
+                }) => {
+                    sub_tries += 1;
+                    Some(SubExpr {
+                        expr: Self::convert_try(Cow::Owned(*inner), context),
+                        is_postfix_receiver: false,
+                    })
+                }
+                other => {
+                    let (kind, span, next) =
+                        ChainItemKind::from_ast(context, other, subexpr.is_postfix_receiver);
+                    rev_children.push(ChainItem {
+                        kind,
+                        tries: sub_tries,
+                        span,
+                    });
+                    sub_tries = 0;
+                    next
+                }
+            };
+            cur = next;
         }
 
         fn is_tries(s: &str) -> bool {
@@ -420,11 +546,11 @@ impl Chain {
             comment_start_index.unwrap() < newline_index.unwrap()
         }
 
-        fn handle_post_comment(
+        fn handle_post_comment<'a>(
             post_comment_span: Span,
             post_comment_snippet: &str,
             prev_span_end: &mut BytePos,
-            children: &mut Vec<ChainItem>,
+            children: &mut Vec<ChainItem<'a>>,
         ) {
             let white_spaces = &[' ', '\t'];
             if post_comment_snippet
@@ -504,56 +630,19 @@ impl Chain {
         Chain { parent, children }
     }
 
-    // Returns a Vec of the prefixes of the chain.
-    // E.g., for input `a.b.c` we return [`a.b.c`, `a.b`, 'a']
-    fn make_subexpr_list(expr: &ast::Expr, context: &RewriteContext<'_>) -> Vec<SubExpr> {
-        let mut subexpr_list = vec![SubExpr {
-            expr: expr.clone(),
-            is_postfix_receiver: false,
-        }];
-
-        while let Some(subexpr) = Self::pop_expr_chain(&subexpr_list.last().unwrap().expr, context)
+    fn convert_try(expr: Cow<'a, ast::Expr>, context: &RewriteContext<'_>) -> Cow<'a, ast::Expr> {
+        if let ast::ExprKind::MacCall(mac) = &expr.kind
+            && context.config.use_try_shorthand()
+            && let Some(converted) = convert_try_mac(mac, context)
         {
-            subexpr_list.push(subexpr);
-        }
-
-        subexpr_list
-    }
-
-    // Returns the expression's subexpression, if it exists. When the subexpr
-    // is a try! macro, we'll convert it to shorthand when the option is set.
-    fn pop_expr_chain(expr: &ast::Expr, context: &RewriteContext<'_>) -> Option<SubExpr> {
-        match &expr.kind {
-            ast::ExprKind::MethodCall(call) => Some(SubExpr {
-                expr: Self::convert_try(&call.receiver, context),
-                is_postfix_receiver: true,
-            }),
-            ast::ExprKind::Field(subexpr, _)
-            | ast::ExprKind::Await(subexpr, _)
-            | ast::ExprKind::Use(subexpr, _)
-            | ast::ExprKind::Yield(ast::YieldKind::Postfix(subexpr)) => Some(SubExpr {
-                expr: Self::convert_try(subexpr, context),
-                is_postfix_receiver: true,
-            }),
-            ast::ExprKind::Try(subexpr) => Some(SubExpr {
-                expr: Self::convert_try(subexpr, context),
-                is_postfix_receiver: false,
-            }),
-            _ => None,
-        }
-    }
-
-    fn convert_try(expr: &ast::Expr, context: &RewriteContext<'_>) -> ast::Expr {
-        match &expr.kind {
-            ast::ExprKind::MacCall(mac) if context.config.use_try_shorthand() => {
-                convert_try_mac(mac, context).unwrap_or(expr.clone())
-            }
-            _ => expr.clone(),
+            Cow::Owned(converted)
+        } else {
+            expr
         }
     }
 }
 
-impl Rewrite for Chain {
+impl Rewrite for Chain<'_> {
     fn rewrite(&self, context: &RewriteContext<'_>, shape: Shape) -> Option<String> {
         self.rewrite_result(context, shape).ok()
     }
@@ -570,7 +659,7 @@ impl Rewrite for Chain {
     }
 }
 
-impl Chain {
+impl Chain<'_> {
     fn rewrite_with(
         &self,
         mut formatter: impl ChainFormatter,
@@ -625,7 +714,7 @@ trait ChainFormatter {
     // If `bar` were not part of the root, then foo would be orphaned and 'float'.
     fn format_root(
         &mut self,
-        parent: &ChainItem,
+        parent: &ChainItem<'_>,
         context: &RewriteContext<'_>,
         shape: Shape,
     ) -> Result<(), RewriteError>;
@@ -655,7 +744,7 @@ trait ChainFormatter {
 // formatters can delegate much behaviour to `ChainFormatterShared`.
 struct ChainFormatterShared<'a> {
     // The current working set of child items.
-    children: &'a [ChainItem],
+    children: &'a [ChainItem<'a>],
     // The current rewrites of items (includes trailing `?`s, but not any way to
     // connect the rewrites together).
     rewrites: Vec<String>,
@@ -669,7 +758,7 @@ struct ChainFormatterShared<'a> {
 }
 
 impl<'a> ChainFormatterShared<'a> {
-    fn new(chain: &'a Chain) -> ChainFormatterShared<'a> {
+    fn new(chain: &'a Chain<'a>) -> ChainFormatterShared<'a> {
         ChainFormatterShared {
             children: &chain.children,
             rewrites: Vec::with_capacity(chain.children.len() + 1),
@@ -803,8 +892,8 @@ impl<'a> ChainFormatterShared<'a> {
                             last.span,
                         )?;
                         match last.rewrite_result(context, last_shape) {
-                            Ok(ref new_rw) if !could_fit_single_line => {
-                                last_subexpr_str = Some(new_rw.clone());
+                            Ok(new_rw) if !could_fit_single_line => {
+                                last_subexpr_str = Some(new_rw);
                             }
                             Ok(ref new_rw) if new_rw.lines().count() >= line_count => {
                                 last_subexpr_str = Some(rw);
@@ -851,7 +940,7 @@ impl<'a> ChainFormatterShared<'a> {
         };
 
         let mut rewrite_iter = self.rewrites.iter();
-        let mut result = rewrite_iter.next().unwrap().clone();
+        let mut result = rewrite_iter.next().unwrap().as_str().to_owned();
         let children_iter = self.children.iter();
         let iter = rewrite_iter.zip(children_iter);
 
@@ -877,7 +966,7 @@ struct ChainFormatterBlock<'a> {
 }
 
 impl<'a> ChainFormatterBlock<'a> {
-    fn new(chain: &'a Chain) -> ChainFormatterBlock<'a> {
+    fn new(chain: &'a Chain<'a>) -> ChainFormatterBlock<'a> {
         ChainFormatterBlock {
             shared: ChainFormatterShared::new(chain),
             root_ends_with_block: false,
@@ -888,7 +977,7 @@ impl<'a> ChainFormatterBlock<'a> {
 impl<'a> ChainFormatter for ChainFormatterBlock<'a> {
     fn format_root(
         &mut self,
-        parent: &ChainItem,
+        parent: &ChainItem<'_>,
         context: &RewriteContext<'_>,
         shape: Shape,
     ) -> Result<(), RewriteError> {
@@ -965,7 +1054,7 @@ struct ChainFormatterVisual<'a> {
 }
 
 impl<'a> ChainFormatterVisual<'a> {
-    fn new(chain: &'a Chain) -> ChainFormatterVisual<'a> {
+    fn new(chain: &'a Chain<'a>) -> ChainFormatterVisual<'a> {
         ChainFormatterVisual {
             shared: ChainFormatterShared::new(chain),
             offset: 0,
@@ -976,7 +1065,7 @@ impl<'a> ChainFormatterVisual<'a> {
 impl<'a> ChainFormatter for ChainFormatterVisual<'a> {
     fn format_root(
         &mut self,
-        parent: &ChainItem,
+        parent: &ChainItem<'_>,
         context: &RewriteContext<'_>,
         shape: Shape,
     ) -> Result<(), RewriteError> {

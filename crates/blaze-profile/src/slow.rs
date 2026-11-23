@@ -1480,7 +1480,7 @@ impl<'a> Ctx<'a> {
         for it in self.facts.misses.iter().filter(|it| it.cause != "first") {
             if it.step == NOT_KEPT_STEP {
                 // alloc: a finding's evidence
-                let why = it.what.clone().unwrap_or_else(|| it.example.clone()); // clone: once a report
+                let why = it.what.as_deref().unwrap_or(&it.example).to_owned();
                 out.push(Finding {
                     stacks: Stacks::default(),
                     kind: Kind::NotKept,
@@ -1496,7 +1496,7 @@ impl<'a> Ctx<'a> {
             }
             if it.step == UNFINISHED_STEP {
                 // alloc: a finding's evidence
-                let why = it.what.clone().unwrap_or_else(|| it.example.clone()); // clone: once a report
+                let why = it.what.as_deref().unwrap_or(&it.example).to_owned();
                 out.push(Finding {
                     stacks: Stacks::default(),
                     kind: Kind::Unfinished,

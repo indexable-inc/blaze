@@ -96,14 +96,14 @@ fn scalar_of<A: Allocator>(element: &SchemaElement<A>) -> Result<(i32, Scalar, O
 }
 
 /// The top-level columns of `schema` (its root first), each a leaf or a 3-level list.
-fn leaves<A: Allocator + Clone>(
+fn leaves<A: Allocator + Copy>(
     schema: &[SchemaElement<A>],
-    alloc: &A,
+    alloc: A,
 ) -> Result<(Vec<Leaf, A>, Vec<Field<A>, A>), ParquetError> {
     let root = &schema[0];
     let children = root.num_children.unwrap_or(0).narrow::<usize>().map_err(|_| corrupt("", "a root of negative children"))?;
-    let mut out = Vec::with_capacity_in(children.min(schema.len()), alloc.clone());
-    let mut fields = Vec::with_capacity_in(children.min(schema.len()), alloc.clone());
+    let mut out = Vec::with_capacity_in(children.min(schema.len()), alloc);
+    let mut fields = Vec::with_capacity_in(children.min(schema.len()), alloc);
     let mut at = 1;
     for _ in 0..children {
         let element = schema.get(at).ok_or_else(|| corrupt("", "a schema of fewer elements than its root's children"))?;
@@ -159,7 +159,7 @@ fn leaves<A: Allocator + Clone>(
             _ => return Err(unsupported(name, "a nested column (a struct or a map)", 0)),
         };
         let ty = if leaf.list { Type::List(leaf.scalar) } else { Type::One(leaf.scalar) };
-        fields.push(Field { name: Name::Owned(String::from_str_in(name, alloc.clone())), ty, nullable: leaf.nullable });
+        fields.push(Field { name: Name::Owned(String::from_str_in(name, alloc)), ty, nullable: leaf.nullable });
         out.push(leaf);
     }
     if at != schema.len() {
@@ -177,7 +177,7 @@ pub struct IntStats {
 }
 
 /// A Parquet file, its footer read.
-pub struct File<'a, A: Allocator + Clone> {
+pub struct File<'a, A: Allocator + Copy> {
     bytes: &'a [u8],
     /// Where the footer begins: no column chunk reaches past it.
     data_end: usize,
@@ -187,11 +187,11 @@ pub struct File<'a, A: Allocator + Clone> {
     alloc: A,
 }
 
-impl<'a, A: Allocator + Clone> File<'a, A> {
+impl<'a, A: Allocator + Copy> File<'a, A> {
     /// `bytes` as a Parquet file: its framing checked and its footer read.
     pub fn open(bytes: &'a [u8], alloc: A) -> Result<File<'a, A>, ParquetError> {
-        let (meta, data_end) = footer(bytes, &alloc)?;
-        let (leaves, fields) = leaves(&meta.schema, &alloc)?;
+        let (meta, data_end) = footer(bytes, alloc)?;
+        let (leaves, fields) = leaves(&meta.schema, alloc)?;
         for group in meta.row_groups.iter() {
             if group.columns.len() != leaves.len() {
                 return Err(corrupt("", "a row group of another number of columns than the schema's leaves"));
@@ -264,8 +264,8 @@ impl<'a, A: Allocator + Clone> File<'a, A> {
     /// Row group `group`'s columns `columns` (by index) as a batch.
     pub fn read_group(&self, group: usize, columns: &[usize]) -> Result<Batch<A>, ParquetError> {
         let rows = self.meta.row_groups[group].num_rows.narrow::<usize>().map_err(|_| corrupt("", "a row group of negative rows"))?;
-        let mut fields = Vec::with_capacity_in(columns.len(), self.alloc.clone());
-        let mut out = Vec::with_capacity_in(columns.len(), self.alloc.clone());
+        let mut fields = Vec::with_capacity_in(columns.len(), self.alloc);
+        let mut out = Vec::with_capacity_in(columns.len(), self.alloc);
         for &column in columns {
             let field = self.fields.get(column).ok_or(ParquetError::Field { column: column_name(""), why: "a column past the file's" })?;
             let meta = self.meta.row_groups[group].columns[column]
@@ -273,7 +273,11 @@ impl<'a, A: Allocator + Clone> File<'a, A> {
                 .as_ref()
                 .ok_or_else(|| unsupported(field.name(), "a column chunk in another file", 0))?;
             let read = self.chunk(field.name(), self.leaves[column], meta, rows)?;
-            fields.push(field.clone());
+            let name = match &field.name {
+                Name::Static(s) => Name::Static(s),
+                Name::Owned(s) => Name::Owned(s.clone_in(self.alloc)),
+            };
+            fields.push(Field { name, ty: field.ty, nullable: field.nullable });
             out.push(read);
         }
         Batch::try_new(fields, out).map_err(|error| ParquetError::Column { column: column_name(""), error })
@@ -281,7 +285,7 @@ impl<'a, A: Allocator + Clone> File<'a, A> {
 
     /// Every row group's columns `columns`, a batch each.
     pub fn read(&self, columns: &[usize]) -> Result<Vec<Batch<A>, A>, ParquetError> {
-        let mut out = Vec::with_capacity_in(self.row_groups(), self.alloc.clone());
+        let mut out = Vec::with_capacity_in(self.row_groups(), self.alloc);
         for group in 0..self.row_groups() {
             out.push(self.read_group(group, columns)?);
         }
@@ -290,13 +294,13 @@ impl<'a, A: Allocator + Clone> File<'a, A> {
 
     /// Every column the file has, a batch a row group.
     pub fn read_all(&self) -> Result<Vec<Batch<A>, A>, ParquetError> {
-        let all: Vec<usize, A> = Vec::from_iter_in(0..self.fields.len(), self.alloc.clone());
+        let all: Vec<usize, A> = Vec::from_iter_in(0..self.fields.len(), self.alloc);
         self.read(&all)
     }
 
     /// The columns named `names`, a batch a row group; a name the file lacks is refused.
     pub fn read_named(&self, names: &[&str]) -> Result<Vec<Batch<A>, A>, ParquetError> {
-        let mut columns = Vec::with_capacity_in(names.len(), self.alloc.clone());
+        let mut columns = Vec::with_capacity_in(names.len(), self.alloc);
         for name in names {
             columns.push(
                 self.column(name)
@@ -317,10 +321,10 @@ impl<'a, A: Allocator + Clone> File<'a, A> {
         let end = end.ok_or_else(|| corrupt(name, "a chunk past the file's data"))?;
         let bytes = &self.bytes[start..end];
         let entries = meta.num_values.narrow::<usize>().map_err(|_| corrupt(name, "a chunk of negative values"))?;
-        let mut state = State::new(name, leaf, rows, &self.alloc);
+        let mut state = State::new(name, leaf, rows, self.alloc);
         let mut at = 0;
         let mut dict: Option<Sink<A>> = None;
-        let mut inflated = Vec::new_in(self.alloc.clone());
+        let mut inflated = Vec::new_in(self.alloc);
         while state.entries < entries {
             let (header, header_len) = meta::read_page_header(&bytes[at..])?;
             let body_len = header.compressed_page_size.narrow::<usize>().map_err(|_| corrupt(name, "a page of negative size"))?;
@@ -340,7 +344,7 @@ impl<'a, A: Allocator + Clone> File<'a, A> {
                     if count > body.len().saturating_mul(8) {
                         return Err(corrupt(name, "a dictionary of more values than its bytes hold"));
                     }
-                    let mut sink = Sink::new(leaf.scalar, count, &self.alloc);
+                    let mut sink = Sink::new(leaf.scalar, count, self.alloc);
                     let mut cursor = Plain { bytes: body, at: 0, bit: 0 };
                     for _ in 0..count {
                         cursor.next(&mut sink, leaf, name)?;
@@ -401,7 +405,7 @@ impl<'a, A: Allocator + Clone> File<'a, A> {
 }
 
 /// The footer of `bytes`, and where it begins.
-pub(crate) fn footer<A: Allocator + Clone>(bytes: &[u8], alloc: &A) -> Result<(FileMeta<A>, usize), ParquetError> {
+pub(crate) fn footer<A: Allocator + Copy>(bytes: &[u8], alloc: A) -> Result<(FileMeta<A>, usize), ParquetError> {
     if bytes.len() < 12 {
         return Err(ParquetError::NotParquet { why: "fewer than 12 bytes" });
     }
@@ -431,9 +435,8 @@ enum Sink<A: Allocator> {
     Text(Texts<A>),
 }
 
-impl<A: Allocator + Clone> Sink<A> {
-    fn new(scalar: Scalar, capacity: usize, alloc: &A) -> Sink<A> {
-        let alloc = alloc.clone();
+impl<A: Allocator + Copy> Sink<A> {
+    fn new(scalar: Scalar, capacity: usize, alloc: A) -> Sink<A> {
         match scalar {
             Scalar::Bool => Sink::Bool(Vec::with_capacity_in(capacity, alloc)),
             Scalar::I32 => Sink::I32(Vec::with_capacity_in(capacity, alloc)),
@@ -549,7 +552,7 @@ fn int64<A: Allocator>(sink: &mut Sink<A>, raw: i64, leaf: Leaf, name: &str) -> 
 }
 
 /// A text read into `sink`.
-fn text<A: Allocator + Clone>(sink: &mut Sink<A>, raw: &[u8], name: &str) -> Result<(), ParquetError> {
+fn text<A: Allocator>(sink: &mut Sink<A>, raw: &[u8], name: &str) -> Result<(), ParquetError> {
     let Sink::Text(it) = sink else {
         return Err(corrupt(name, "a text in a column of another type"));
     };
@@ -563,14 +566,14 @@ fn length(raw: i64, room: usize, name: &str) -> Result<usize, ParquetError> {
 }
 
 /// `present` values of a page in a delta encoding or RLE, decoded into `sink`.
-fn decode<A: Allocator + Clone>(
+fn decode<A: Allocator + Copy>(
     sink: &mut Sink<A>,
     how: i32,
     values: &[u8],
     present: usize,
     leaf: Leaf,
     name: &str,
-    alloc: &A,
+    alloc: A,
 ) -> Result<(), ParquetError> {
     let bad = |_| corrupt(name, "delta-encoded values that end early or say something impossible");
     let mut failed = None;
@@ -605,7 +608,7 @@ fn decode<A: Allocator + Clone>(
             }
         }
         (encoding::DELTA_LENGTH_BYTE_ARRAY, physical::BYTE_ARRAY) => {
-            let mut lengths = Vec::with_capacity_in(present, alloc.clone());
+            let mut lengths = Vec::with_capacity_in(present, alloc);
             let (total, used) = delta::decode(values, present, |it| lengths.push(it)).map_err(bad)?;
             if total != present {
                 return Err(corrupt(name, "delta-encoded lengths of another number than the page's values"));
@@ -618,15 +621,15 @@ fn decode<A: Allocator + Clone>(
             }
         }
         (encoding::DELTA_BYTE_ARRAY, physical::BYTE_ARRAY) => {
-            let mut prefixes = Vec::with_capacity_in(present, alloc.clone());
+            let mut prefixes = Vec::with_capacity_in(present, alloc);
             let (total, used) = delta::decode(values, present, |it| prefixes.push(it)).map_err(bad)?;
-            let mut suffixes = Vec::with_capacity_in(present, alloc.clone());
+            let mut suffixes = Vec::with_capacity_in(present, alloc);
             let (rest, more) = delta::decode(&values[used..], present, |it| suffixes.push(it)).map_err(bad)?;
             if total != present || rest != present {
                 return Err(corrupt(name, "delta-encoded lengths of another number than the page's values"));
             }
             let mut at = used + more;
-            let mut last: Vec<u8, A> = Vec::new_in(alloc.clone());
+            let mut last: Vec<u8, A> = Vec::new_in(alloc);
             for (&prefix, &suffix) in prefixes.iter().zip(suffixes.iter()) {
                 let prefix = length(prefix, last.len(), name)?;
                 let suffix = length(suffix, values.len() - at, name)?;
@@ -662,7 +665,7 @@ impl<'b> Plain<'b> {
     }
 
     /// The next value, read into `sink` as the leaf says.
-    fn next<A: Allocator + Clone>(&mut self, sink: &mut Sink<A>, leaf: Leaf, name: &str) -> Result<(), ParquetError> {
+    fn next<A: Allocator>(&mut self, sink: &mut Sink<A>, leaf: Leaf, name: &str) -> Result<(), ParquetError> {
         match (leaf.physical, sink) {
             (physical::BOOLEAN, Sink::Bool(it)) => {
                 let byte = *self.bytes.get(self.at).ok_or_else(|| corrupt(name, "a page ends inside a value"))?;
@@ -700,7 +703,7 @@ enum Cursor<'b, 'd, A: Allocator> {
 }
 
 /// A column chunk being read, page by page.
-struct State<'n, A: Allocator + Clone> {
+struct State<'n, A: Allocator + Copy> {
     name: &'n str,
     leaf: Leaf,
     rows: usize,
@@ -715,9 +718,9 @@ struct State<'n, A: Allocator + Clone> {
     reps: Vec<u8, A>,
 }
 
-impl<'n, A: Allocator + Clone> State<'n, A> {
-    fn new(name: &'n str, leaf: Leaf, rows: usize, alloc: &A) -> State<'n, A> {
-        let mut offsets = Vec::new_in(alloc.clone());
+impl<'n, A: Allocator + Copy> State<'n, A> {
+    fn new(name: &'n str, leaf: Leaf, rows: usize, alloc: A) -> State<'n, A> {
+        let mut offsets = Vec::new_in(alloc);
         if leaf.list {
             offsets.push(0);
         }
@@ -725,14 +728,14 @@ impl<'n, A: Allocator + Clone> State<'n, A> {
             name,
             leaf,
             rows,
-            alloc: alloc.clone(),
+            alloc,
             values: Sink::new(leaf.scalar, if leaf.list { 0 } else { rows }, alloc),
-            valid: Vec::with_capacity_in(rows, alloc.clone()),
+            valid: Vec::with_capacity_in(rows, alloc),
             offsets,
             begun: 0,
             entries: 0,
-            defs: Vec::new_in(alloc.clone()),
-            reps: Vec::new_in(alloc.clone()),
+            defs: Vec::new_in(alloc),
+            reps: Vec::new_in(alloc),
         }
     }
 
@@ -767,8 +770,8 @@ impl<'n, A: Allocator + Clone> State<'n, A> {
             return Err(ParquetError::TooLarge { column: column_name(name), what: "a page of more values than it can hold" });
         }
         let mut at = 0;
-        let mut defs = core::mem::replace(&mut self.defs, Vec::new_in(self.alloc.clone()));
-        let mut reps = core::mem::replace(&mut self.reps, Vec::new_in(self.alloc.clone()));
+        let mut defs = core::mem::replace(&mut self.defs, Vec::new_in(self.alloc));
+        let mut reps = core::mem::replace(&mut self.reps, Vec::new_in(self.alloc));
         let mut section = |len: Option<usize>, max: u8, out: &mut Vec<u8, A>, state: &Self| -> Result<(), ParquetError> {
             let len = match len {
                 Some(it) => it,
@@ -809,7 +812,7 @@ impl<'n, A: Allocator + Clone> State<'n, A> {
             encoding::RLE_DICTIONARY | encoding::PLAIN_DICTIONARY => {
                 let dict = dict.ok_or_else(|| corrupt(name, "dictionary indices before a dictionary page"))?;
                 let (&width, packed) = values.split_first().ok_or_else(|| corrupt(name, "a page of no indices' width"))?;
-                let mut indices = Vec::with_capacity_in(present, self.alloc.clone());
+                let mut indices = Vec::with_capacity_in(present, self.alloc);
                 levels::decode(packed, width, present, |it| indices.push(it))
                     .map_err(|_| corrupt(name, "dictionary indices that end early or say too much"))?;
                 if indices.len() != present {
@@ -818,8 +821,8 @@ impl<'n, A: Allocator + Clone> State<'n, A> {
                 Cursor::Dict { indices, at: 0, dict }
             }
             how => {
-                let mut decoded = Sink::new(leaf.scalar, present, &self.alloc);
-                decode(&mut decoded, how, values, present, leaf, name, &self.alloc)?;
+                let mut decoded = Sink::new(leaf.scalar, present, self.alloc);
+                decode(&mut decoded, how, values, present, leaf, name, self.alloc)?;
                 Cursor::Decoded { values: decoded, at: 0 }
             }
         };

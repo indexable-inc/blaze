@@ -310,6 +310,8 @@ struct Current<'a, 'r> {
     /// A live request shares one pool across all suites. Its flat dispatch rows
     /// retain their actual suite for filing results and writing suite heads.
     owners: Option<&'r [SuiteId]>,
+    /// Per-suite previous heads when running a shared inventory pool across suites.
+    suite_heads: Option<&'r [Head<'r>]>,
     /// The tests record's rows, in row (path) order.
     asked: AVec<'a, Asked<'r>>,
     /// (test id, row), sorted by id.
@@ -339,6 +341,17 @@ impl<'r> Current<'_, 'r> {
             Some(owners) => Ok(owners[self.row_of(test)? as usize]),
             None => Ok(self.suite),
         }
+    }
+
+    fn head_of(&self, suite: SuiteId) -> Head<'r> {
+        self.suite_heads
+            .and_then(|heads| usize::try_from(suite.0).ok().and_then(|i| heads.get(i)).copied())
+            .unwrap_or(self.head)
+    }
+
+    fn head_row(&self, test: TestId) -> Result<Option<head::RowRef>, LoopError> {
+        let suite = self.owner(test)?;
+        Ok(self.head_of(suite).row(test))
     }
 
     /// The run's asks and reads, kept for the new head.
@@ -464,12 +477,16 @@ impl<'a, 'r> TestLoop<'a, 'r> {
         self.open(SuiteId(0), out)
     }
 
-    /// The live inventory has no saved heads. Select each raw test path before
-    /// qualifying its display name, then schedule all selected rows at one width.
+    /// Select each raw test path before qualifying its display name, then schedule all selected
+    /// rows at one width using any previously persisted suite heads, postings, and moved asks.
+    #[expect(clippy::too_many_arguments, reason = "inventory rows, suite heads, postings, and moved asks")]
     pub(crate) fn begin_inventory(
         &mut self,
         asked: AVec<'a, Asked<'r>>,
         owners: &'r [SuiteId],
+        suite_heads: &'r [Head<'r>],
+        postings: Postings<'r>,
+        moved: &[Ask],
         filtered: u32,
         now: Nanos,
         out: &mut AVec<'_, Effect<'a>>,
@@ -497,11 +514,11 @@ impl<'a, 'r> TestLoop<'a, 'r> {
         }
         self.filtered = filtered;
         self.current = Some(Current {
-            suite: pool, owners: Some(owners), asked, by_id,
-            plan: Plan::new(config, self.alloc)?, head: Head::EMPTY, postings: Postings::EMPTY,
+            suite: pool, owners: Some(owners), suite_heads: Some(suite_heads), asked, by_id,
+            plan: Plan::new(config, self.alloc)?, head: Head::EMPTY, postings,
             changes: Vec::new_in(self.alloc), pool: Vec::new_in(self.alloc), reads: Vec::new_in(self.alloc),
         });
-        self.decide(&[], now, out)
+        self.decide(moved, now, out)
     }
 
     pub(crate) fn row_detail(&mut self, row: u32, text: AVec<'a, u8>) {
@@ -627,6 +644,7 @@ impl<'a, 'r> TestLoop<'a, 'r> {
         self.current = Some(Current {
             suite,
             owners: None,
+            suite_heads: None,
             asked,
             by_id,
             head,
@@ -676,8 +694,15 @@ impl<'a, 'r> TestLoop<'a, 'r> {
         let plant = self.plant;
         let alloc = self.alloc;
         let current = current_of(&mut self.current, self.phase)?;
-        let mut kept: AVec<'_, Kept> = Vec::with_capacity_in(current.head.len(), alloc);
-        current.head.kept_into(&mut kept);
+        let mut kept: AVec<'_, Kept> = Vec::new_in(alloc);
+        if let Some(heads) = current.suite_heads {
+            for head in heads {
+                head.kept_into(&mut kept);
+            }
+            kept.sort_unstable_by_key(|row| row.test);
+        } else {
+            current.head.kept_into(&mut kept);
+        }
         if plant == Plant::KeepFailures {
             for row in kept.iter_mut() {
                 if row.last == Last::Failed {
@@ -699,7 +724,7 @@ impl<'a, 'r> TestLoop<'a, 'r> {
         let current = current_of(&mut self.current, self.phase)?;
         let path = current.path_of(test)?;
         current.plan.not_run(test, now, &mut self.scratch)?;
-        if let Some(row) = current.head.row(test) {
+        if let Some(row) = current.head_row(test)? {
             let last = match why {
                 RefusalReason::BeforeStart(_) => Some(head::unsettle(row.kept.last)),
                 RefusalReason::FirstCall(_) => None,
@@ -746,7 +771,8 @@ impl<'a, 'r> TestLoop<'a, 'r> {
         match effect {
             plan::Effect::Look { test } => {
                 let row = current.row_of(test)?;
-                out.push(Effect::Look { suite, test, row });
+                let owner = current.owner(test)?;
+                out.push(Effect::Look { suite: owner, test, row });
             }
             plan::Effect::Start { test, deadline } => {
                 let row = current.row_of(test)?;
@@ -754,7 +780,7 @@ impl<'a, 'r> TestLoop<'a, 'r> {
             }
             plan::Effect::Kill { test } => out.push(Effect::Kill { suite, test }),
             plan::Effect::Unsettle { test } => {
-                if let Some(row) = current.head.row(test) {
+                if let Some(row) = current.head_row(test)? {
                     current.changes.push(Change { test, last: Some(head::unsettle(row.kept.last)), micros: row.kept.micros, asks: None });
                 }
             }
@@ -817,7 +843,9 @@ impl<'a, 'r> TestLoop<'a, 'r> {
             }
             changes.sort_unstable_by_key(|(suite, change)| (*suite, change.test));
             for group in changes.chunk_by(|a, b| a.0 == b.0) {
-                current.suite = group[0].0;
+                let owner = group[0].0;
+                current.suite = owner;
+                current.head = current.head_of(owner);
                 current.changes.clear();
                 current.changes.extend(group.iter().map(|(_, change)| *change));
                 write_records(&mut current, self.alloc, out)?;

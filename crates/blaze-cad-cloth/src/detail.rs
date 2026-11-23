@@ -16,11 +16,56 @@
 use blaze_math::{Vec2, Vec3, cos, sin};
 use blaze_own::{Alloc, AllocFailure, Vec};
 
+use crate::grain::FabricGrain;
 use crate::mesh2d::{ClothMesh, PanelSlice, recompute_normals, sample_panel_frame};
 use crate::pattern::{HardwareKind, HardwareMount, PatternSet, SurfacePatchSpec};
 
+/// Semantic kind of a named garment panel or tailoring detail inside [`GarmentMesh`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PanelKind {
+    PatternPiece,
+    RimLining,
+    SurfacePatch,
+    Hardware,
+}
+
+impl PanelKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PatternPiece => "pattern_piece",
+            Self::RimLining => "rim_lining",
+            Self::SurfacePatch => "surface_patch",
+            Self::Hardware => "hardware",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "pattern_piece" => Some(Self::PatternPiece),
+            "rim_lining" => Some(Self::RimLining),
+            "surface_patch" => Some(Self::SurfacePatch),
+            "hardware" => Some(Self::Hardware),
+            _ => None,
+        }
+    }
+}
+
+/// Metadata for one named garment panel or tailoring detail inside [`GarmentMesh`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PanelMeta {
+    pub id: u16,
+    pub name: &'static str,
+    pub kind: PanelKind,
+    pub layer: u8,
+    pub fabric_idx: u16,
+    /// Optional host pattern piece name (for pockets, flaps, rim linings, hardware) so clicking
+    /// a detail jumps straight to both the patch AND its parent CAD pattern piece!
+    pub host_panel: Option<&'static str>,
+}
+
 /// Final render-ready garment mesh with UVs, smooth normals, baked cloth intelligence (`COLOR_0`),
-/// material roles, and optional rigid skinning anchor points (for metal hardware / buckles).
+/// material roles, grain-aligned physical rest coordinates (`rest_pos_m`), named panel metadata,
+/// and optional rigid skinning anchor points (for metal hardware / buckles).
 ///
 /// `colors` RGBA8 semantics (consumed directly by ASTRA's `human.slang` and `skin.slang`):
 /// - `R`: fold-ridge & seam wear / edge desaturation (`0..255`)
@@ -31,6 +76,10 @@ pub struct GarmentMesh<'a> {
     pub positions: Vec<Vec3, Alloc<'a>>,
     pub normals: Vec<Vec3, Alloc<'a>>,
     pub uvs: Vec<Vec2, Alloc<'a>>,
+    /// Undeformed 2D physical pattern coordinates in **metres** aligned to the fabric's
+    /// `(weft, warp)` grain frame (rotated by `-grain_angle_rad` so `+x` = weft, `+y` = warp) —
+    /// strictly independent of texture UVs (`uvs` / `TEXCOORD_0`)!
+    pub rest_pos_m: Vec<Vec2, Alloc<'a>>,
     /// Baked per-vertex cloth intelligence (`COLOR_0`: `[wear, micro_ao, topstitch, mobility]`).
     pub colors: Vec<[u8; 4], Alloc<'a>>,
     /// Material/fabric index into `PatternSet::fabrics`.
@@ -41,6 +90,10 @@ pub struct GarmentMesh<'a> {
     pub rigid_anchor: Vec<Option<Vec3>, Alloc<'a>>,
     /// Garment dressing layer (`0` = undershirt, `1` = trousers, `2` = jacket, `3` = trim/hardware).
     pub tri_layer: Vec<u8, Alloc<'a>>,
+    /// Named garment panels, rim linings, surface patches, and hardware pieces.
+    pub panels: Vec<PanelMeta, Alloc<'a>>,
+    /// Per-triangle panel ID indexing into `panels`.
+    pub tri_panel: Vec<u16, Alloc<'a>>,
     /// Canonical topological vertex representative (`weld_rep[v] <= v`) linking UV-split sewn seam
     /// vertices into one continuous watertight manifold across Loop subdivision, skinning, normal
     /// computation, curvature baking, PSD morph deltas, and automated seam integrity checks!
@@ -58,13 +111,30 @@ impl<'a> GarmentMesh<'a> {
             positions: Vec::new_in(alloc),
             normals: Vec::new_in(alloc),
             uvs: Vec::new_in(alloc),
+            rest_pos_m: Vec::new_in(alloc),
             colors: Vec::new_in(alloc),
             tri_fabric: Vec::new_in(alloc),
             triangles: Vec::new_in(alloc),
             rigid_anchor: Vec::new_in(alloc),
             tri_layer: Vec::new_in(alloc),
+            panels: Vec::new_in(alloc),
+            tri_panel: Vec::new_in(alloc),
             weld_rep: Vec::new_in(alloc),
         }
+    }
+
+    /// Register a new named panel in [`GarmentMesh::panels`] and return its assigned panel ID.
+    pub fn register_panel(
+        &mut self,
+        name: &'static str,
+        kind: PanelKind,
+        layer: u8,
+        fabric_idx: u16,
+        host_panel: Option<&'static str>,
+    ) -> Result<u16, AllocFailure> {
+        let id = self.panels.len() as u16;
+        push(&mut self.panels, PanelMeta { id, name, kind, layer, fabric_idx, host_panel })?;
+        Ok(id)
     }
 
     #[inline]
@@ -85,6 +155,25 @@ impl<'a> GarmentMesh<'a> {
         let n_src = cloth.pos.len();
         let base_v = self.positions.len() as u32;
 
+        // Register one PatternPiece PanelMeta per PanelSlice and cache each panel's FabricGrain.
+        let mut panel_id_map = Vec::new_in(scratch);
+        let mut panel_grains = Vec::new_in(scratch);
+        for pslice in cloth.panels.iter() {
+            let pid = self.register_panel(
+                pslice.name,
+                PanelKind::PatternPiece,
+                pslice.layer,
+                pslice.fabric_idx as u16,
+                None,
+            )?;
+            push(&mut panel_id_map, pid)?;
+            let grain = patterns
+                .find_panel(pslice.name)
+                .map(|(_, spec)| spec.grain)
+                .unwrap_or(FabricGrain::STRAIGHT);
+            push(&mut panel_grains, grain)?;
+        }
+
         // 1. Copy outer surface vertices with flat-felled seam trench relief + subtle deterministic
         //    seam micro-puckering evaluated strictly on the canonical welded root `r` so UV-split
         //    left/right seam twins stay bit-for-bit coincident (`0.000 mm` gap)!
@@ -104,7 +193,12 @@ impl<'a> GarmentMesh<'a> {
             let p = cloth.pos[r] - nrm * (trench - pucker);
             let fab = patterns.fabrics.get(cloth.vert_fabric[i] as usize);
             let uv_m = fab.map(|f| f.uv_meters.as_m()).unwrap_or(0.25).max(1e-4);
-            let uv = uv_m_pt * (1.0 / uv_m);
+            let grain = panel_grains
+                .get(cloth.vert_panel[i] as usize)
+                .copied()
+                .unwrap_or(FabricGrain::STRAIGHT);
+            let uv = grain.to_texture_uv(uv_m_pt, uv_m);
+            let rest_grain = grain.to_grain_rest(uv_m_pt);
 
             let is_seam = trench > 1e-5;
             let is_open = cloth.is_open_border[r] && cloth.is_open_border[i];
@@ -116,16 +210,20 @@ impl<'a> GarmentMesh<'a> {
             push(&mut self.positions, p)?;
             push(&mut self.normals, nrm)?;
             push(&mut self.uvs, uv)?;
+            push(&mut self.rest_pos_m, rest_grain)?;
             push(&mut self.colors, [wear_u8, ao_u8, stitch_u8, mob_u8])?;
             push(&mut self.rigid_anchor, None)?;
             push(&mut self.weld_rep, base_v + (r as u32))?;
         }
 
         for (ti, &[a, b, c]) in cloth.triangles.iter().enumerate() {
-            let layer = cloth.panels[cloth.tri_panel[ti] as usize].layer;
+            let local_p = cloth.tri_panel[ti] as usize;
+            let layer = cloth.panels[local_p].layer;
+            let pid = panel_id_map[local_p];
             push(&mut self.triangles, [base_v + a, base_v + b, base_v + c])?;
             push(&mut self.tri_fabric, cloth.tri_fabric[ti])?;
             push(&mut self.tri_layer, layer)?;
+            push(&mut self.tri_panel, pid)?;
         }
 
         // 2. Rim-aware solidify: build a clean physical thickness rim + shallow inner facing
@@ -133,7 +231,7 @@ impl<'a> GarmentMesh<'a> {
         //    open edges show crisp physical thickness and contrasting inner lining with ZERO inner
         //    poke-through across the body!
         if solidify_rim_rings > 0 {
-            self.append_rim_solidify(cloth, patterns, solidify_rim_rings, scratch)?;
+            self.append_rim_solidify(cloth, patterns, &panel_grains, solidify_rim_rings, scratch)?;
         }
 
         // 3. Build 3D pockets, flaps, storm plackets cleanly from the single-sided outer surface.
@@ -157,6 +255,7 @@ impl<'a> GarmentMesh<'a> {
         &mut self,
         cloth: &ClothMesh<'_>,
         patterns: &PatternSet<'_>,
+        panel_grains: &[FabricGrain],
         rim_rings: u32,
         scratch: Alloc<'_>,
     ) -> Result<(), AllocFailure> {
@@ -201,7 +300,12 @@ impl<'a> GarmentMesh<'a> {
                 let fab = patterns.fabrics.get(cloth.vert_fabric[i] as usize);
                 let thick = fab.map(|f| f.thickness.as_m()).unwrap_or(0.0016);
                 let uv_m = fab.map(|f| f.uv_meters.as_m()).unwrap_or(0.25).max(1e-4);
-                let uv = cloth.rest_uv_m[i] * (1.0 / uv_m);
+                let grain = panel_grains
+                    .get(cloth.vert_panel[i] as usize)
+                    .copied()
+                    .unwrap_or(FabricGrain::STRAIGHT);
+                let uv = grain.to_texture_uv(cloth.rest_uv_m[i], uv_m);
+                let rest_grain = grain.to_grain_rest(cloth.rest_uv_m[i]);
                 let p_out = cloth.pos[r] - nrm * cloth.seam_depth_m[i];
                 // Taper inner thickness smoothly to 0 at the inner rim edge so there is no step!
                 let taper = 1.0 - (border_dist[i] as f64 / ((rim_rings + 1) as f64)) * 0.35;
@@ -211,6 +315,7 @@ impl<'a> GarmentMesh<'a> {
                 push(&mut self.positions, p_out)?;
                 push(&mut self.normals, nrm)?;
                 push(&mut self.uvs, uv)?;
+                push(&mut self.rest_pos_m, rest_grain)?;
                 push(&mut self.colors, [110, 235, 160, 180])?;
                 push(&mut self.rigid_anchor, None)?;
                 push(&mut self.weld_rep, oi)?;
@@ -220,11 +325,18 @@ impl<'a> GarmentMesh<'a> {
                 push(&mut self.positions, p_in)?;
                 push(&mut self.normals, -nrm)?;
                 push(&mut self.uvs, uv)?;
+                push(&mut self.rest_pos_m, rest_grain)?;
                 push(&mut self.colors, [30, 125, 0, 160])?;
                 push(&mut self.rigid_anchor, None)?;
                 push(&mut self.weld_rep, ii)?;
                 inner_map[i] = ii;
             }
+        }
+
+        // Lazily register one RimLining PanelMeta per panel that emits rim-solidified triangles.
+        let mut rim_panel_ids = Vec::new_in(scratch);
+        for _ in 0..cloth.panels.len() {
+            push(&mut rim_panel_ids, u16::MAX)?;
         }
 
         // Emit reversed inner-facing triangles within `rim_rings` of open borders.
@@ -233,20 +345,36 @@ impl<'a> GarmentMesh<'a> {
             let ib = inner_map[b as usize];
             let ic = inner_map[c as usize];
             if ia != u32::MAX && ib != u32::MAX && ic != u32::MAX {
-                let panel = cloth.panels[cloth.tri_panel[ti] as usize];
+                let p_idx = cloth.tri_panel[ti] as usize;
+                let panel = cloth.panels[p_idx];
                 let inner_fab = panel.lining_fabric_idx.unwrap_or(panel.fabric_idx) as u16;
+                let rim_pid = if rim_panel_ids[p_idx] == u16::MAX {
+                    let id = self.register_panel(
+                        panel.name,
+                        PanelKind::RimLining,
+                        panel.layer,
+                        inner_fab,
+                        Some(panel.name),
+                    )?;
+                    rim_panel_ids[p_idx] = id;
+                    id
+                } else {
+                    rim_panel_ids[p_idx]
+                };
                 push(&mut self.triangles, [ia, ic, ib])?;
                 push(&mut self.tri_fabric, inner_fab)?;
                 push(&mut self.tri_layer, panel.layer)?;
+                push(&mut self.tri_panel, rim_pid)?;
             }
         }
 
         // Stitch open boundary edges with clean bevelled rim quads connecting outer -> inner.
-        for panel in cloth.panels.iter() {
+        for (p_idx, panel) in cloth.panels.iter().enumerate() {
             let fab = panel.fabric_idx as u16;
             let layer = panel.layer;
+            let inner_fab = panel.lining_fabric_idx.unwrap_or(panel.fabric_idx) as u16;
             // Walk all 4 borders in CCW outer order.
-            let stitch_edge = |u: u32, v: u32, s: &mut Self| -> Result<(), AllocFailure> {
+            let mut stitch_edge = |u: u32, v: u32, s: &mut Self| -> Result<(), AllocFailure> {
                 if !cloth.is_open_border[u as usize] || !cloth.is_open_border[v as usize] {
                     return Ok(());
                 }
@@ -257,14 +385,29 @@ impl<'a> GarmentMesh<'a> {
                 if ou == u32::MAX || ov == u32::MAX || iu == u32::MAX || iv == u32::MAX {
                     return Ok(());
                 }
+                let rim_pid = if rim_panel_ids[p_idx] == u16::MAX {
+                    let id = s.register_panel(
+                        panel.name,
+                        PanelKind::RimLining,
+                        layer,
+                        inner_fab,
+                        Some(panel.name),
+                    )?;
+                    rim_panel_ids[p_idx] = id;
+                    id
+                } else {
+                    rim_panel_ids[p_idx]
+                };
                 let (e0, e1) = if !panel.flip_normal { (u, v) } else { (v, u) };
                 let (oe0, oe1, ie0, ie1) = (outer_map[e0 as usize], outer_map[e1 as usize], inner_map[e0 as usize], inner_map[e1 as usize]);
                 push(&mut s.triangles, [oe0, ie0, ie1])?;
                 push(&mut s.tri_fabric, fab)?;
                 push(&mut s.tri_layer, layer)?;
+                push(&mut s.tri_panel, rim_pid)?;
                 push(&mut s.triangles, [oe0, ie1, oe1])?;
                 push(&mut s.tri_fabric, fab)?;
                 push(&mut s.tri_layer, layer)?;
+                push(&mut s.tri_panel, rim_pid)?;
                 Ok(())
             };
 
@@ -295,6 +438,7 @@ impl<'a> GarmentMesh<'a> {
         let crown_m = spec.crown.as_m();
         let fab_idx = spec.fabric_idx as u16;
         let uv_m = patterns.fabrics.get(spec.fabric_idx).map(|f| f.uv_meters.as_m()).unwrap_or(0.25).max(1e-4);
+        let body_pid = self.register_panel(spec.name, PanelKind::SurfacePatch, 3, fab_idx, Some(panel.name))?;
 
         // Emit crisp architectural pocket body / flat stitched panel (sharp split-normal gusset walls!).
         let body_t_max = if spec.flap_fraction > 0.01 {
@@ -318,11 +462,17 @@ impl<'a> GarmentMesh<'a> {
             fab_idx,
             uv_m,
             3,
+            body_pid,
         )?;
 
         // Optional detached overhanging pocket flap with real 3.5 mm undercut shadow gap!
         if spec.flap_fraction > 0.01 {
             let flap_fab = spec.flap_fabric_idx.unwrap_or(spec.fabric_idx) as u16;
+            let flap_pid = if flap_fab == fab_idx {
+                body_pid
+            } else {
+                self.register_panel(spec.name, PanelKind::SurfacePatch, 3, flap_fab, Some(panel.name))?
+            };
             let flap_uv_m = patterns
                 .fabrics
                 .get(flap_fab as usize)
@@ -347,6 +497,7 @@ impl<'a> GarmentMesh<'a> {
                 flap_fab,
                 flap_uv_m,
                 3,
+                flap_pid,
             )?;
         }
         Ok(())
@@ -370,6 +521,7 @@ impl<'a> GarmentMesh<'a> {
         fabric_idx: u16,
         uv_m: f64,
         layer: u8,
+        panel_id: u16,
     ) -> Result<(), AllocFailure> {
         const NU: usize = 12;
         const NV: usize = 12;
@@ -379,6 +531,7 @@ impl<'a> GarmentMesh<'a> {
         let mut bot_pos = [[Vec3::ZERO; NU + 1]; NV + 1];
         let mut surf_nrm = [[Vec3::new(0.0, 0.0, -1.0); NU + 1]; NV + 1];
         let mut grid_uv = [[Vec2::new(0.0, 0.0); NU + 1]; NV + 1];
+        let mut grid_rest = [[Vec2::new(0.0, 0.0); NU + 1]; NV + 1];
 
         for j in 0..=NV {
             let fv = (j as f64) / (NV as f64);
@@ -427,11 +580,13 @@ impl<'a> GarmentMesh<'a> {
                     }
                 }
 
-                let uv = Vec2::new((s - s_min) * 0.45 / uv_m, (tt - t_min) * 0.45 / uv_m);
+                let rest_m = Vec2::new((s - s_min) * 0.45, (tt - t_min) * 0.45);
+                let uv = rest_m * (1.0 / uv_m);
                 top_pos[j][i] = pos + nrm * h_top;
                 bot_pos[j][i] = pos + nrm * h_bot;
                 surf_nrm[j][i] = nrm;
                 grid_uv[j][i] = uv;
+                grid_rest[j][i] = rest_m;
 
                 let is_perimeter = i == 0 || i == NU || j == 0 || j == NV;
                 let is_stitch_ring = i == 1 || i + 1 == NU || j == 1 || j + 1 == NV;
@@ -445,6 +600,7 @@ impl<'a> GarmentMesh<'a> {
                 push(&mut self.positions, top_pos[j][i])?;
                 push(&mut self.normals, nrm)?;
                 push(&mut self.uvs, uv)?;
+                push(&mut self.rest_pos_m, rest_m)?;
                 push(&mut self.colors, [top_wear, top_ao, top_stitch, 40])?;
                 push(&mut self.rigid_anchor, None)?;
                 push(&mut self.weld_rep, v_top)?;
@@ -455,6 +611,7 @@ impl<'a> GarmentMesh<'a> {
                     push(&mut self.positions, bot_pos[j][i])?;
                     push(&mut self.normals, -nrm)?;
                     push(&mut self.uvs, uv)?;
+                    push(&mut self.rest_pos_m, rest_m)?;
                     push(&mut self.colors, [20, 95, 0, 40])?;
                     push(&mut self.rigid_anchor, None)?;
                     push(&mut self.weld_rep, v_bot)?;
@@ -485,6 +642,8 @@ impl<'a> GarmentMesh<'a> {
                 push(&mut self.tri_fabric, fabric_idx)?;
                 push(&mut self.tri_layer, layer)?;
                 push(&mut self.tri_layer, layer)?;
+                push(&mut self.tri_panel, panel_id)?;
+                push(&mut self.tri_panel, panel_id)?;
 
                 // For detached overhanging flaps, emit the underside face too so camera angles
                 // looking slightly upward see a solid crisp flap lip + real dark undercut shadow!
@@ -504,22 +663,25 @@ impl<'a> GarmentMesh<'a> {
                     push(&mut self.tri_fabric, fabric_idx)?;
                     push(&mut self.tri_layer, layer)?;
                     push(&mut self.tri_layer, layer)?;
+                    push(&mut self.tri_panel, panel_id)?;
+                    push(&mut self.tri_panel, panel_id)?;
                 }
             }
         }
 
         // Sharp split-normal folded gusset side walls (creates crisp 85° tailored pocket edges
         // instead of smooth marshmallow blobs!).
-        let emit_crisp_wall = |p_t0: Vec3, p_t1: Vec3, p_b0: Vec3, p_b1: Vec3, uv0: Vec2, uv1: Vec2, s: &mut Self| -> Result<(), AllocFailure> {
+        let emit_crisp_wall = |p_t0: Vec3, p_t1: Vec3, p_b0: Vec3, p_b1: Vec3, uv0: Vec2, uv1: Vec2, r0: Vec2, r1: Vec2, s: &mut Self| -> Result<(), AllocFailure> {
             let wn = (p_b1 - p_b0).cross(p_t1 - p_b0).normalized().unwrap_or(Vec3::new(1.0, 0.0, 0.0));
             let base = s.positions.len() as u32;
-            for (k, (p, uv)) in [(p_b0, uv0), (p_b1, uv1), (p_t1, uv1), (p_t0, uv0)].into_iter().enumerate() {
+            for (k, (p, uv, rm)) in [(p_b0, uv0, r0), (p_b1, uv1, r1), (p_t1, uv1, r1), (p_t0, uv0, r0)].into_iter().enumerate() {
                 // Darken base crease along stitch line (`k < 2`), subtle edge wear along fold top (`k >= 2`).
                 let c = if k < 2 { [40, 120, 190, 40] } else { [145, 220, 0, 40] };
                 let vi = s.positions.len() as u32;
                 push(&mut s.positions, p)?;
                 push(&mut s.normals, wn)?;
                 push(&mut s.uvs, uv)?;
+                push(&mut s.rest_pos_m, rm)?;
                 push(&mut s.colors, c)?;
                 push(&mut s.rigid_anchor, None)?;
                 push(&mut s.weld_rep, vi)?;
@@ -530,15 +692,17 @@ impl<'a> GarmentMesh<'a> {
             push(&mut s.tri_fabric, fabric_idx)?;
             push(&mut s.tri_layer, layer)?;
             push(&mut s.tri_layer, layer)?;
+            push(&mut s.tri_panel, panel_id)?;
+            push(&mut s.tri_panel, panel_id)?;
             Ok(())
         };
         for i in 0..NU {
-            emit_crisp_wall(top_pos[0][i], top_pos[0][i + 1], bot_pos[0][i], bot_pos[0][i + 1], grid_uv[0][i], grid_uv[0][i + 1], self)?;
-            emit_crisp_wall(top_pos[NV][i + 1], top_pos[NV][i], bot_pos[NV][i + 1], bot_pos[NV][i], grid_uv[NV][i + 1], grid_uv[NV][i], self)?;
+            emit_crisp_wall(top_pos[0][i], top_pos[0][i + 1], bot_pos[0][i], bot_pos[0][i + 1], grid_uv[0][i], grid_uv[0][i + 1], grid_rest[0][i], grid_rest[0][i + 1], self)?;
+            emit_crisp_wall(top_pos[NV][i + 1], top_pos[NV][i], bot_pos[NV][i + 1], bot_pos[NV][i], grid_uv[NV][i + 1], grid_uv[NV][i], grid_rest[NV][i + 1], grid_rest[NV][i], self)?;
         }
         for j in 0..NV {
-            emit_crisp_wall(top_pos[j][NU], top_pos[j + 1][NU], bot_pos[j][NU], bot_pos[j + 1][NU], grid_uv[j][NU], grid_uv[j + 1][NU], self)?;
-            emit_crisp_wall(top_pos[j + 1][0], top_pos[j][0], bot_pos[j + 1][0], bot_pos[j][0], grid_uv[j + 1][0], grid_uv[j][0], self)?;
+            emit_crisp_wall(top_pos[j][NU], top_pos[j + 1][NU], bot_pos[j][NU], bot_pos[j + 1][NU], grid_uv[j][NU], grid_uv[j + 1][NU], grid_rest[j][NU], grid_rest[j + 1][NU], self)?;
+            emit_crisp_wall(top_pos[j + 1][0], top_pos[j][0], bot_pos[j + 1][0], bot_pos[j][0], grid_uv[j + 1][0], grid_uv[j][0], grid_rest[j + 1][0], grid_rest[j][0], self)?;
         }
         Ok(())
     }
@@ -557,6 +721,7 @@ impl<'a> GarmentMesh<'a> {
         let origin = pos + nrm * hw.normal_offset.as_m();
         let fab = hw.fabric_idx as u16;
         let anchor = Some(pos);
+        let hw_pid = self.register_panel(hw.name, PanelKind::Hardware, 3, fab, Some(panel.name))?;
 
         match hw.kind {
             HardwareKind::SnapButton { radius, height } => {
@@ -567,6 +732,7 @@ impl<'a> GarmentMesh<'a> {
                 push(&mut self.positions, origin + nrm * (h * 1.15))?;
                 push(&mut self.normals, nrm)?;
                 push(&mut self.uvs, Vec2::new(0.5, 0.5))?;
+                push(&mut self.rest_pos_m, Vec2::new(0.0, 0.0))?;
                 push(&mut self.colors, [80, 255, 0, 0])?;
                 push(&mut self.rigid_anchor, anchor)?;
                 push(&mut self.weld_rep, center_top)?;
@@ -579,6 +745,7 @@ impl<'a> GarmentMesh<'a> {
                     push(&mut self.positions, origin + dir * (r * 0.88) + nrm * h)?;
                     push(&mut self.normals, (nrm + dir * 0.3).normalized().unwrap_or(nrm))?;
                     push(&mut self.uvs, Vec2::new(0.5 + 0.4 * cos(ang), 0.5 + 0.4 * sin(ang)))?;
+                    push(&mut self.rest_pos_m, Vec2::new(0.0, 0.0))?;
                     push(&mut self.colors, [140, 240, 0, 0])?;
                     push(&mut self.rigid_anchor, anchor)?;
                     push(&mut self.weld_rep, vi)?;
@@ -591,6 +758,7 @@ impl<'a> GarmentMesh<'a> {
                     push(&mut self.positions, origin + dir * r)?;
                     push(&mut self.normals, dir)?;
                     push(&mut self.uvs, Vec2::new(0.5 + 0.5 * cos(ang), 0.5 + 0.5 * sin(ang)))?;
+                    push(&mut self.rest_pos_m, Vec2::new(0.0, 0.0))?;
                     push(&mut self.colors, [40, 150, 0, 0])?;
                     push(&mut self.rigid_anchor, anchor)?;
                     push(&mut self.weld_rep, vi)?;
@@ -607,6 +775,7 @@ impl<'a> GarmentMesh<'a> {
                     for _ in 0..3 {
                         push(&mut self.tri_fabric, fab)?;
                         push(&mut self.tri_layer, 3)?;
+                        push(&mut self.tri_panel, hw_pid)?;
                     }
                 }
             }
@@ -621,6 +790,7 @@ impl<'a> GarmentMesh<'a> {
                     thickness.as_m() * 0.5,
                     fab,
                     anchor,
+                    hw_pid,
                 )?;
             }
             HardwareKind::Buckle { width, height, thickness } => {
@@ -634,6 +804,7 @@ impl<'a> GarmentMesh<'a> {
                     thickness.as_m() * 0.5,
                     fab,
                     anchor,
+                    hw_pid,
                 )?;
             }
             HardwareKind::ZipperRail { width, length_m, thickness } => {
@@ -647,6 +818,7 @@ impl<'a> GarmentMesh<'a> {
                     thickness.as_m() * 0.5,
                     fab,
                     anchor,
+                    hw_pid,
                 )?;
             }
         }
@@ -665,6 +837,7 @@ impl<'a> GarmentMesh<'a> {
         hz: f64,
         fab: u16,
         anchor: Option<Vec3>,
+        panel_id: u16,
     ) -> Result<(), AllocFailure> {
         let base = self.positions.len() as u32;
         let corners = [
@@ -684,6 +857,7 @@ impl<'a> GarmentMesh<'a> {
             push(&mut self.positions, p)?;
             push(&mut self.normals, n)?;
             push(&mut self.uvs, Vec2::new(0.5 + 0.5 * c[0], 0.5 + 0.5 * c[1]))?;
+            push(&mut self.rest_pos_m, Vec2::new(0.0, 0.0))?;
             push(&mut self.colors, [100, 235, 0, 0])?;
             push(&mut self.rigid_anchor, anchor)?;
             push(&mut self.weld_rep, vi)?;
@@ -703,6 +877,8 @@ impl<'a> GarmentMesh<'a> {
             push(&mut self.tri_fabric, fab)?;
             push(&mut self.tri_layer, 3)?;
             push(&mut self.tri_layer, 3)?;
+            push(&mut self.tri_panel, panel_id)?;
+            push(&mut self.tri_panel, panel_id)?;
         }
         Ok(())
     }

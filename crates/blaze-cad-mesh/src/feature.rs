@@ -246,6 +246,11 @@ pub struct FeatureZone {
     pub protect: FeatureProtect,
 }
 
+/// `cos²(12°)`: normal-turn guard for grooves and narrow channels.
+const COS_SQ_12_DEG: f64 = 0.956_772_728_821_300_4;
+/// `cos²(10°)`: normal-turn guard for bevels and rounded fillets.
+const COS_SQ_10_DEG: f64 = 0.969_846_310_392_954_2;
+
 impl FeatureZone {
     /// Construct a critical protection zone with sensible priority weighting (`16×` for
     /// [`FeatureProtect::Critical`], `64×` for [`FeatureProtect::Pinned`]).
@@ -262,6 +267,57 @@ impl FeatureZone {
             },
             protect,
         }
+    }
+
+    /// Physical-dimension zone for a groove, slot, or rabbet of `width` and `depth`: resolves
+    /// at least 3 cells across the width (`min_feature = width / 3`), bounds geometric error to
+    /// `min(width / 8, depth / 5)`, and guards normal turns at `12°`.
+    #[inline]
+    pub fn for_groove(region: FeatureRegion, width: Length, depth: Length, protect: FeatureProtect) -> FeatureZone {
+        let w = width.max(Length::ZERO);
+        let d = depth.max(Length::ZERO);
+        let mut zone = FeatureZone::new(region, protect);
+        zone.min_feature = Some(w / 3.0);
+        zone.max_error = Some((w / 8.0).min(d / 5.0));
+        zone.min_cos_sq = Some(COS_SQ_12_DEG);
+        zone
+    }
+
+    /// Physical-dimension zone for a bevel or fillet of `radius`: resolves `radius / 2` cells,
+    /// bounds chord sagitta to `radius * 0.035` (~15° arc segments), and guards normal turns at
+    /// `10°`.
+    #[inline]
+    pub fn for_bevel(region: FeatureRegion, radius: Length, protect: FeatureProtect) -> FeatureZone {
+        let r = radius.max(Length::ZERO);
+        let mut zone = FeatureZone::new(region, protect);
+        zone.min_feature = Some(r / 2.0);
+        zone.max_error = Some(r * 0.035);
+        zone.min_cos_sq = Some(COS_SQ_10_DEG);
+        zone
+    }
+
+    /// Physical-dimension zone for a mating seam or shadow gap (`gap` wide, `depth` deep):
+    /// always [`FeatureProtect::Pinned`] so budget decimation never relaxes the seam, with
+    /// `min_feature = gap / 2.5` and `max_error = min(gap / 6, depth / 4)`.
+    #[inline]
+    pub fn for_seam(region: FeatureRegion, gap: Length, depth: Length) -> FeatureZone {
+        let g = gap.max(Length::ZERO);
+        let d = depth.max(Length::ZERO);
+        let mut zone = FeatureZone::new(region, FeatureProtect::Pinned);
+        zone.min_feature = Some(g / 2.5);
+        zone.max_error = Some((g / 6.0).min(d / 4.0));
+        zone
+    }
+
+    /// Physical-dimension zone for engraved/embossed stencils or markings of `stroke_width`:
+    /// resolves `stroke_width / 2` cells and bounds error to `stroke_width / 8`.
+    #[inline]
+    pub fn for_stencil(region: FeatureRegion, stroke_width: Length) -> FeatureZone {
+        let sw = stroke_width.max(Length::ZERO);
+        let mut zone = FeatureZone::new(region, FeatureProtect::Critical);
+        zone.min_feature = Some(sw / 2.0);
+        zone.max_error = Some(sw / 8.0);
+        zone
     }
 }
 

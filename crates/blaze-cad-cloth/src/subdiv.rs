@@ -107,12 +107,17 @@ pub fn subdivide_cloth_loop<'a>(
     }
 
     let mut out = GarmentMesh::new(alloc);
+    for &pm in mesh.panels.iter() {
+        push(&mut out.panels, pm)?;
+    }
     // Copy original vertices first (even vertices will be updated on welded roots & synced).
     for i in 0..n_verts {
         let r = mesh.weld_of(i as u32);
         push(&mut out.positions, mesh.positions[r as usize])?;
         push(&mut out.normals, mesh.normals[r as usize])?;
         push(&mut out.uvs, mesh.uvs[i])?;
+        let rp = mesh.rest_pos_m.get(i).copied().unwrap_or(mesh.uvs[i]);
+        push(&mut out.rest_pos_m, rp)?;
         push(&mut out.colors, mesh.colors.get(i).copied().unwrap_or([0, 255, 0, 128]))?;
         push(&mut out.rigid_anchor, mesh.rigid_anchor[i])?;
         push(&mut out.weld_rep, r)?;
@@ -177,6 +182,9 @@ pub fn subdivide_cloth_loop<'a>(
             let rlo = es.raw_lo as usize;
             let rhi = es.raw_hi as usize;
             let uv_mid = (mesh.uvs[rlo] + mesh.uvs[rhi]) * 0.5;
+            let rest_lo = mesh.rest_pos_m.get(rlo).copied().unwrap_or(mesh.uvs[rlo]);
+            let rest_hi = mesh.rest_pos_m.get(rhi).copied().unwrap_or(mesh.uvs[rhi]);
+            let rest_mid = (rest_lo + rest_hi) * 0.5;
             let c_lo = mesh.colors.get(rlo).copied().unwrap_or([0, 255, 0, 128]);
             let c_hi = mesh.colors.get(rhi).copied().unwrap_or([0, 255, 0, 128]);
             let c_mid = [
@@ -192,6 +200,7 @@ pub fn subdivide_cloth_loop<'a>(
             push(&mut out.positions, mid_pos)?;
             push(&mut out.normals, n_mid)?;
             push(&mut out.uvs, uv_mid)?;
+            push(&mut out.rest_pos_m, rest_mid)?;
             push(&mut out.colors, c_mid)?;
             push(&mut out.rigid_anchor, None)?;
             push(&mut out.weld_rep, canon_mid_vert)?;
@@ -236,10 +245,12 @@ pub fn subdivide_cloth_loop<'a>(
     };
 
     // 5. Emit 4 subdivided triangles per cloth triangle, and pass hardware triangles straight through.
+    let has_tri_panel = mesh.tri_panel.len() == n_tris;
     for ti in 0..n_tris {
         let [a, b, c] = mesh.triangles[ti];
         let fab = mesh.tri_fabric[ti];
         let layer = mesh.tri_layer[ti];
+        let pid = if has_tri_panel { mesh.tri_panel[ti] } else { 0 };
         if layer <= max_cloth_layer {
             let mab = find_mid(a, b);
             let mbc = find_mid(b, c);
@@ -248,11 +259,17 @@ pub fn subdivide_cloth_loop<'a>(
                 push(&mut out.triangles, tri)?;
                 push(&mut out.tri_fabric, fab)?;
                 push(&mut out.tri_layer, layer)?;
+                if has_tri_panel {
+                    push(&mut out.tri_panel, pid)?;
+                }
             }
         } else {
             push(&mut out.triangles, [a, b, c])?;
             push(&mut out.tri_fabric, fab)?;
             push(&mut out.tri_layer, layer)?;
+            if has_tri_panel {
+                push(&mut out.tri_panel, pid)?;
+            }
         }
     }
 

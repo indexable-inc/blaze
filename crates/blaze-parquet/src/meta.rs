@@ -214,14 +214,51 @@ impl<A: Allocator> FileMeta<A> {
     }
 }
 
-impl<A: Allocator + Clone> Clone for SchemaElement<A> {
+impl<A: Allocator + Copy> Statistics<A> {
+    pub(crate) fn clone_in(&self, alloc: A) -> Statistics<A> {
+        Statistics {
+            max: self.max.as_ref().map(|v| v.clone_in(alloc)),
+            min: self.min.as_ref().map(|v| v.clone_in(alloc)),
+            null_count: self.null_count,
+            distinct_count: self.distinct_count,
+            max_value: self.max_value.as_ref().map(|v| v.clone_in(alloc)),
+            min_value: self.min_value.as_ref().map(|v| v.clone_in(alloc)),
+        }
+    }
+}
+
+impl<A: Allocator + Copy> ColumnMeta<A> {
+    pub(crate) fn clone_in(&self, alloc: A) -> ColumnMeta<A> {
+        ColumnMeta {
+            ty: self.ty,
+            encodings: self.encodings.clone_in(alloc),
+            path: self.path.clone_in(alloc),
+            codec: self.codec,
+            num_values: self.num_values,
+            total_uncompressed_size: self.total_uncompressed_size,
+            total_compressed_size: self.total_compressed_size,
+            data_page_offset: self.data_page_offset,
+            index_page_offset: self.index_page_offset,
+            dictionary_page_offset: self.dictionary_page_offset,
+            statistics: self.statistics.as_ref().map(|s| s.clone_in(alloc)),
+        }
+    }
+}
+
+impl<A: Allocator + Copy> KeyValue<A> {
+    pub(crate) fn clone_in(&self, alloc: A) -> KeyValue<A> {
+        KeyValue { key: self.key.clone_in(alloc), value: self.value.as_ref().map(|v| v.clone_in(alloc)) }
+    }
+}
+
+impl<A: Allocator + Copy> Clone for SchemaElement<A> {
     fn clone(&self) -> SchemaElement<A> {
+        let alloc = *self.name.allocator();
         SchemaElement {
             ty: self.ty,
             type_length: self.type_length,
             repetition: self.repetition,
-            // clone: a schema's names, once a merge
-            name: self.name.clone(),
+            name: self.name.clone_in(alloc),
             num_children: self.num_children,
             converted: self.converted,
             scale: self.scale,
@@ -232,43 +269,28 @@ impl<A: Allocator + Clone> Clone for SchemaElement<A> {
     }
 }
 
-impl<A: Allocator + Clone> Clone for Statistics<A> {
+impl<A: Allocator + Copy> Clone for Statistics<A> {
     fn clone(&self) -> Statistics<A> {
-        // clone: a chunk's statistics, as a merge copies the chunk
         Statistics {
-            max: self.max.clone(),
-            min: self.min.clone(),
+            max: self.max.as_ref().map(|v| v.clone_in(*v.allocator())),
+            min: self.min.as_ref().map(|v| v.clone_in(*v.allocator())),
             null_count: self.null_count,
             distinct_count: self.distinct_count,
-            max_value: self.max_value.clone(),
-            min_value: self.min_value.clone(),
+            max_value: self.max_value.as_ref().map(|v| v.clone_in(*v.allocator())),
+            min_value: self.min_value.as_ref().map(|v| v.clone_in(*v.allocator())),
         }
     }
 }
 
-impl<A: Allocator + Clone> Clone for ColumnMeta<A> {
+impl<A: Allocator + Copy> Clone for ColumnMeta<A> {
     fn clone(&self) -> ColumnMeta<A> {
-        // clone: a chunk's metadata, as a merge copies the chunk
-        ColumnMeta {
-            ty: self.ty,
-            encodings: self.encodings.clone(),
-            path: self.path.clone(),
-            codec: self.codec,
-            num_values: self.num_values,
-            total_uncompressed_size: self.total_uncompressed_size,
-            total_compressed_size: self.total_compressed_size,
-            data_page_offset: self.data_page_offset,
-            index_page_offset: self.index_page_offset,
-            dictionary_page_offset: self.dictionary_page_offset,
-            statistics: self.statistics.clone(),
-        }
+        self.clone_in(*self.encodings.allocator())
     }
 }
 
-impl<A: Allocator + Clone> Clone for KeyValue<A> {
+impl<A: Allocator + Copy> Clone for KeyValue<A> {
     fn clone(&self) -> KeyValue<A> {
-        // clone: a key and its value, a few a merge
-        KeyValue { key: self.key.clone(), value: self.value.clone() }
+        self.clone_in(*self.key.allocator())
     }
 }
 
@@ -586,12 +608,12 @@ fn i64_field(input: &mut In<'_>, ty: u8, what: &'static str) -> Result<i64, Parq
     input.i64()
 }
 
-fn read_schema_element<A: Allocator + Clone>(input: &mut In<'_>, alloc: &A) -> Result<SchemaElement<A>, ParquetError> {
+fn read_schema_element<A: Allocator + Copy>(input: &mut In<'_>, alloc: A) -> Result<SchemaElement<A>, ParquetError> {
     let mut it = SchemaElement {
         ty: None,
         type_length: None,
         repetition: None,
-        name: String::new_in(alloc.clone()),
+        name: String::new_in(alloc),
         num_children: None,
         converted: None,
         scale: None,
@@ -607,7 +629,7 @@ fn read_schema_element<A: Allocator + Clone>(input: &mut In<'_>, alloc: &A) -> R
             3 => it.repetition = Some(i32_field(input, ty, "a schema element's repetition is not an i32")?),
             4 => {
                 input.expect(ty, BINARY, "a schema element's name is not a string")?;
-                it.name = owned(input.string()?, alloc.clone());
+                it.name = owned(input.string()?, alloc);
                 named = true;
             }
             5 => it.num_children = Some(i32_field(input, ty, "a schema element's children is not an i32")?),
@@ -629,15 +651,12 @@ fn read_schema_element<A: Allocator + Clone>(input: &mut In<'_>, alloc: &A) -> R
     Ok(it)
 }
 
-fn read_bytes<A: Allocator>(input: &mut In<'_>, ty: u8, alloc: &A) -> Result<Vec<u8, A>, ParquetError>
-where
-    A: Clone,
-{
+fn read_bytes<A: Allocator + Copy>(input: &mut In<'_>, ty: u8, alloc: A) -> Result<Vec<u8, A>, ParquetError> {
     input.expect(ty, BINARY, "a statistic is not binary")?;
-    Ok(Vec::from_slice_in(input.binary()?, alloc.clone()))
+    Ok(Vec::from_slice_in(input.binary()?, alloc))
 }
 
-fn read_statistics<A: Allocator + Clone>(input: &mut In<'_>, alloc: &A) -> Result<Statistics<A>, ParquetError> {
+fn read_statistics<A: Allocator + Copy>(input: &mut In<'_>, alloc: A) -> Result<Statistics<A>, ParquetError> {
     let mut it = Statistics { max: None, min: None, null_count: None, distinct_count: None, max_value: None, min_value: None };
     input.strukt(|input, id, ty| {
         match id {
@@ -654,11 +673,11 @@ fn read_statistics<A: Allocator + Clone>(input: &mut In<'_>, alloc: &A) -> Resul
     Ok(it)
 }
 
-fn read_column_meta<A: Allocator + Clone>(input: &mut In<'_>, alloc: &A) -> Result<ColumnMeta<A>, ParquetError> {
+fn read_column_meta<A: Allocator + Copy>(input: &mut In<'_>, alloc: A) -> Result<ColumnMeta<A>, ParquetError> {
     let mut it = ColumnMeta {
         ty: -1,
-        encodings: Vec::new_in(alloc.clone()),
-        path: Vec::new_in(alloc.clone()),
+        encodings: Vec::new_in(alloc),
+        path: Vec::new_in(alloc),
         codec: -1,
         num_values: -1,
         total_uncompressed_size: -1,
@@ -681,7 +700,7 @@ fn read_column_meta<A: Allocator + Clone>(input: &mut In<'_>, alloc: &A) -> Resu
             3 => {
                 input.expect(ty, LIST, "a column's path is not a list")?;
                 input.list(BINARY, "a column's path is not strings", |input| {
-                    it.path.push(owned(input.string()?, alloc.clone()));
+                    it.path.push(owned(input.string()?, alloc));
                     Ok(())
                 })?;
             }
@@ -709,9 +728,9 @@ fn read_column_meta<A: Allocator + Clone>(input: &mut In<'_>, alloc: &A) -> Resu
     Ok(it)
 }
 
-fn read_row_group<A: Allocator + Clone>(input: &mut In<'_>, alloc: &A) -> Result<RowGroup<A>, ParquetError> {
+fn read_row_group<A: Allocator + Copy>(input: &mut In<'_>, alloc: A) -> Result<RowGroup<A>, ParquetError> {
     let mut it = RowGroup {
-        columns: Vec::new_in(alloc.clone()),
+        columns: Vec::new_in(alloc),
         total_byte_size: 0,
         num_rows: -1,
         file_offset: None,
@@ -728,7 +747,7 @@ fn read_row_group<A: Allocator + Clone>(input: &mut In<'_>, alloc: &A) -> Result
                         match id {
                             1 => {
                                 input.expect(ty, BINARY, "a column chunk's path is not a string")?;
-                                chunk.file_path = Some(owned(input.string()?, alloc.clone()));
+                                chunk.file_path = Some(owned(input.string()?, alloc));
                             }
                             2 => chunk.file_offset = i64_field(input, ty, "a column chunk's offset is not an i64")?,
                             3 => {
@@ -763,14 +782,14 @@ fn read_row_group<A: Allocator + Clone>(input: &mut In<'_>, alloc: &A) -> Result
 
 /// The footer of `bytes` (a `FileMetaData`, the bytes between the file's last data and its
 /// length word).
-pub(crate) fn read_file_meta<A: Allocator + Clone>(bytes: &[u8], alloc: &A) -> Result<FileMeta<A>, ParquetError> {
+pub(crate) fn read_file_meta<A: Allocator + Copy>(bytes: &[u8], alloc: A) -> Result<FileMeta<A>, ParquetError> {
     let mut input = In::new(bytes);
     let mut it = FileMeta {
         version: 0,
-        schema: Vec::new_in(alloc.clone()),
+        schema: Vec::new_in(alloc),
         num_rows: -1,
-        row_groups: Vec::new_in(alloc.clone()),
-        key_value: Vec::new_in(alloc.clone()),
+        row_groups: Vec::new_in(alloc),
+        key_value: Vec::new_in(alloc),
         created_by: None,
         column_orders: 0,
     };
@@ -797,16 +816,16 @@ pub(crate) fn read_file_meta<A: Allocator + Clone>(bytes: &[u8], alloc: &A) -> R
             5 => {
                 input.expect(ty, LIST, "the footer's key-value metadata is not a list")?;
                 input.list(STRUCT, "the footer's key-value metadata is not structs", |input| {
-                    let mut kv = KeyValue { key: String::new_in(alloc.clone()), value: None };
+                    let mut kv = KeyValue { key: String::new_in(alloc), value: None };
                     input.strukt(|input, id, ty| {
                         match id {
                             1 => {
                                 input.expect(ty, BINARY, "a key is not a string")?;
-                                kv.key = owned(input.string()?, alloc.clone());
+                                kv.key = owned(input.string()?, alloc);
                             }
                             2 => {
                                 input.expect(ty, BINARY, "a value is not a string")?;
-                                kv.value = Some(owned(input.string()?, alloc.clone()));
+                                kv.value = Some(owned(input.string()?, alloc));
                             }
                             _ => return Ok(false),
                         }
@@ -818,7 +837,7 @@ pub(crate) fn read_file_meta<A: Allocator + Clone>(bytes: &[u8], alloc: &A) -> R
             }
             6 => {
                 input.expect(ty, BINARY, "the footer's writer is not a string")?;
-                it.created_by = Some(owned(input.string()?, alloc.clone()));
+                it.created_by = Some(owned(input.string()?, alloc));
             }
             7 => {
                 input.expect(ty, LIST, "the footer's column orders are not a list")?;

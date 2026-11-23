@@ -123,7 +123,7 @@ pub(super) fn alias_opaque_preds<'n, 'a, H: Heads, S: NamesSource<'n>>(
     for (j, &entry) in opaques.iter().enumerate() {
         // `alias_opaques` numbered them below `ALIAS_OPAQUE`.
         let j = j as u32;
-        let mut preds = Preds::new_in(scope.clone());
+        let mut preds = Preds::new_in(scope.clone_in(scope.alloc()));
         b.impl_bounds(tys, env, v, &[entry], sized, &mut preds)?;
         out.push(AliasOpaque { key: opaque_key(alias, j), index: ALIAS_OPAQUE | j, preds });
     }

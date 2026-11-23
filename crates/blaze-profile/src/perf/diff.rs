@@ -152,10 +152,10 @@ pub struct Diff {
 
 /// A function's join key: its identity, or for one no map names its module's file name and
 /// symbol, so its time still lines up.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Join {
-    Identity(String),
-    Named { module: Option<String>, function: String },
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Join<'a> {
+    Identity(&'a str),
+    Named { module: Option<&'a str>, function: &'a str },
 }
 
 /// A function on one side.
@@ -198,9 +198,9 @@ fn side(run: &RunRow) -> Result<Side, String> {
     })
 }
 
-fn functions<'a>(run: &RunRow, rows: &'a [FnRow]) -> Result<BTreeMap<Join, Function<'a>>, String> {
+fn functions<'a>(run: &RunRow, rows: &'a [FnRow]) -> Result<BTreeMap<Join<'a>, Function<'a>>, String> {
     // alloc: once a side
-    let mut out: BTreeMap<Join, Function<'a>> = BTreeMap::new();
+    let mut out: BTreeMap<Join<'a>, Function<'a>> = BTreeMap::new();
     let reps = run.reps as usize;
     for row in rows {
         if row.run != run.run {
@@ -216,16 +216,10 @@ fn functions<'a>(run: &RunRow, rows: &'a [FnRow]) -> Result<BTreeMap<Join, Funct
             ));
         }
         let join = match &row.identity {
-            // clone: once a row
-            Some(identity) => Join::Identity(identity.clone()),
+            Some(identity) => Join::Identity(identity.as_str()),
             None => Join::Named {
-                // alloc: once a row
-                module: row
-                    .module
-                    .as_deref()
-                    .map(|it| it.rsplit('/').next().unwrap_or(it).to_owned()),
-                // clone: once a row
-                function: row.function.clone(),
+                module: row.module.as_deref().map(|it| it.rsplit('/').next().unwrap_or(it)),
+                function: row.function.as_str(),
             },
         };
         let it = out.entry(join).or_insert_with(|| Function {
@@ -320,20 +314,23 @@ pub fn compare(run: (&RunRow, &[FnRow]), base: (&RunRow, &[FnRow])) -> Result<Di
     let zeros = |n: u32| vec![0u64; n as usize];
     let (run_zeros, base_zeros) = (zeros(run.0.reps), zeros(base.0.reps));
     // alloc: once a diff
-    let joins: BTreeSet<&Join> = run_fns.keys().chain(base_fns.keys()).collect();
+    let joins: BTreeSet<Join<'_>> = run_fns.keys().chain(base_fns.keys()).copied().collect();
     // alloc: once a diff, its rows
     let mut rows = Vec::with_capacity(joins.len());
     for join in joins {
-        let (r, b) = (run_fns.get(join), base_fns.get(join));
-        let pick = |it: Option<&Function<'_>>, total: bool, zeros: &[u64]| -> Vec<u64> {
-            // clone: once a row, a side's counts
-            it.map_or_else(
-                || zeros.to_vec(),
-                |it| if total { it.total_samples.clone() } else { it.self_samples.clone() },
-            )
-        };
-        let self_ns = change(&pick(b, false, &base_zeros), pb, &pick(r, false, &run_zeros), pr);
-        let total_ns = change(&pick(b, true, &base_zeros), pb, &pick(r, true, &run_zeros), pr);
+        let (r, b) = (run_fns.get(&join), base_fns.get(&join));
+        let self_ns = change(
+            b.map_or(&base_zeros[..], |it| &it.self_samples),
+            pb,
+            r.map_or(&run_zeros[..], |it| &it.self_samples),
+            pr,
+        );
+        let total_ns = change(
+            b.map_or(&base_zeros[..], |it| &it.total_samples),
+            pb,
+            r.map_or(&run_zeros[..], |it| &it.total_samples),
+            pr,
+        );
         let shown = r.or(b).map(|it| it.row).ok_or("a joined function is on neither side")?;
         let cause = match (r.map(|it| it.row), b.map(|it| it.row)) {
             (Some(_), None) => Cause::Added,

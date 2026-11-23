@@ -111,6 +111,7 @@ fn build_spacefarer_patterns<'a>(
                     arc_radius: 0.160,
                 },
                 flip_normal: true,
+                ..
             },
         );
 
@@ -145,6 +146,7 @@ fn build_spacefarer_patterns<'a>(
                     arc_radius: 0.160,
                 },
                 flip_normal: true,
+                ..
             },
         );
 
@@ -255,6 +257,7 @@ fn build_spacefarer_patterns<'a>(
                         arc_radius: 0.092,
                     },
                     flip_normal: true,
+                    ..
                 },
             );
 
@@ -326,6 +329,7 @@ fn build_spacefarer_patterns<'a>(
                         arc_radius: 0.095,
                     },
                     flip_normal: true,
+                    ..
                 },
             );
 
@@ -550,6 +554,7 @@ fn build_spacefarer_patterns<'a>(
                     arc_radius: 0.185,
                 },
                 flip_normal: true,
+                ..
             },
         );
 
@@ -596,6 +601,7 @@ fn build_spacefarer_patterns<'a>(
                     arc_radius: 0.185,
                 },
                 flip_normal: true,
+                ..
             },
         );
 
@@ -643,6 +649,7 @@ fn build_spacefarer_patterns<'a>(
                     arc_radius: 0.185,
                 },
                 flip_normal: true,
+                ..
             },
         );
 
@@ -705,6 +712,7 @@ fn build_spacefarer_patterns<'a>(
                     arc_radius: 0.084,
                 },
                 flip_normal: true,
+                ..
             },
         );
         for (name, pa, ea, pb, eb, rev) in [
@@ -776,6 +784,7 @@ fn build_spacefarer_patterns<'a>(
                     left: v(alloc, &[SubEdge::new("edge_lo", Curve2D::line([f_u_lo_cap, 0.0], [f_u_lo_cuff, body_len_2d]), 22)]),
                     wrap: f_wrap,
                     flip_normal: false,
+                    ..
                 },
             );
             push(
@@ -791,6 +800,7 @@ fn build_spacefarer_patterns<'a>(
                     left: v(alloc, &[SubEdge::new("edge_lo", Curve2D::line([f_u_lo_cap, 0.0], [f_u_lo_cuff, body_len_2d]), 22)]),
                     wrap: b_wrap,
                     flip_normal: false,
+                    ..
                 },
             );
 
@@ -811,6 +821,7 @@ fn build_spacefarer_patterns<'a>(
                     left: v(alloc, &[SubEdge::new("edge_lo", Curve2D::line([-w_cuff * 0.5, 0.0], [-cuff_w_end * 0.5, cuff_len]), 5)]),
                     wrap: cf_wrap,
                     flip_normal: false,
+                    ..
                 },
             );
             push(
@@ -826,6 +837,7 @@ fn build_spacefarer_patterns<'a>(
                     left: v(alloc, &[SubEdge::new("edge_lo", Curve2D::line([-w_cuff * 0.5, 0.0], [-cuff_w_end * 0.5, cuff_len]), 5)]),
                     wrap: cb_wrap,
                     flip_normal: false,
+                    ..
                 },
             );
 
@@ -1153,6 +1165,7 @@ fn build_spacefarer_patterns<'a>(
                     arc_radius: 0.195,
                 },
                 flip_normal: true,
+                ..
             },
         );
         push(

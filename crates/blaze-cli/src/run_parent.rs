@@ -1411,6 +1411,23 @@ impl<'r, 'a, F: Front, D: Folder> Lazy<'r, 'a, F, D> {
         self.folder.read(record, &self.front, &*self.store, into)
     }
 
+    /// The walked instance for `symbol` (when it is a walked fn, not a special record) and every
+    /// static row reached while serving its last publication: `(symbol, tabled_item, name, key)`.
+    pub(crate) fn walked_entered(&self, symbol: &Symbol, mut emit: impl FnMut(Symbol, ItemKey, &[u8], Option<CodeKey>)) {
+        let Some(started) = self.started.as_ref() else { return };
+        if let Some(row) = started.walk.row_of(&CodeSymbol(symbol.0)) {
+            emit(*symbol, started.walk.tabled(row), started.walk.name(row), started.walk.key(row));
+        }
+        for &at in &self.statics {
+            emit(
+                Symbol(started.walk.symbol(at).0),
+                started.walk.tabled(at),
+                started.walk.name(at),
+                started.walk.key(at),
+            );
+        }
+    }
+
     /// What names `symbol` in a crash report (run_fault.rs): the walk's row for it is the
     /// instance's tabled item, and the names records give its path. A symbol with no row this
     /// run is a special record (the C entry shim, the thread-local getter or ender) or a row

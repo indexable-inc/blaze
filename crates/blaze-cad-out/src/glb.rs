@@ -61,7 +61,7 @@
 
 #![blaze::sans_io]
 
-use blaze_cad_mesh::geom::{Aabb, P3, narrow, plus_zeros, round_even, unit, wide};
+use blaze_cad_mesh::geom::{Aabb, P3, narrow, plus_zero, plus_zeros, round_even, unit, wide};
 use blaze_cad_mesh::{Columns, Dequantize, MaterialRole, MeshView, QuantError, QuantOpts, ShapeError, Within, quantize_positions};
 use blaze_int::{Int, idx};
 use blaze_own::planted::{NoPlant, Planted};
@@ -72,7 +72,11 @@ use blaze_units::Length;
 use crate::Limits;
 use crate::json::{Json, JsonFault};
 use crate::plant::GlbPlant;
-use crate::scene::{Collider, Material, Matrix, Part, Scene, Transform, Up, turn, turn_extent, turn_rotation, turn_tensor};
+use crate::png::SIGNATURE as PNG_SIGNATURE;
+use crate::scene::{
+    Collider, Material, MaterialTextures, Matrix, Part, Scene, TexturePack, Transform, Up, turn, turn_extent, turn_rotation,
+    turn_tensor,
+};
 use crate::sink::Bytes;
 
 type V<'a, T> = Vec<T, Alloc<'a>>;
@@ -87,6 +91,9 @@ const UNSIGNED_SHORT: u64 = 5123;
 const UNSIGNED_INT: u64 = 5125;
 const ARRAY_BUFFER: u64 = 34962;
 const ELEMENT_ARRAY_BUFFER: u64 = 34963;
+const MAG_LINEAR: u64 = 9729;
+const MIN_LINEAR_MIPMAP_LINEAR: u64 = 9987;
+const WRAP_REPEAT: u64 = 10497;
 
 /// How many bits each quantized normal component has.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -141,6 +148,7 @@ pub enum MaterialField {
     EmissiveStrength,
     Clearcoat,
     ClearcoatRoughness,
+    NormalScale,
 }
 
 /// Which of a part's meshes.
@@ -167,9 +175,19 @@ pub enum GlbError {
     UnknownRole { part: u32, mesh: MeshSlot, role: MaterialRole },
     /// A material factor that is not finite or outside its range.
     BadMaterial { material: u32, field: MaterialField },
+    /// More `material_textures` entries than `scene.materials`.
+    TooManyMaterialTextures { got: usize, materials: usize },
+    /// An embedded image slice does not start with the 8-byte PNG signature.
+    InvalidPngImage { image: u32 },
+    /// A material texture index past `textures.png_images`.
+    UnknownTexture { material: u32, index: u32, count: usize },
     EmptyMesh { part: u32, mesh: MeshSlot },
     /// A vertex normal of no direction.
     ZeroNormal { part: u32, mesh: MeshSlot, vertex: u32 },
+    /// A vertex UV coordinate that is not finite.
+    BadUv { part: u32, mesh: MeshSlot, vertex: u32 },
+    /// A vertex tangent whose `xyz` is zero/non-finite or whose handedness `w` is not `±1`.
+    BadTangent { part: u32, mesh: MeshSlot, vertex: u32 },
     Quant { part: u32, mesh: MeshSlot, error: QuantError },
     /// The positions-only view quantization reads was refused (a bug: it is built from a
     /// mesh already shape-checked).
@@ -188,7 +206,16 @@ impl From<AllocFailure> for GlbError {
 
 /// `scene` as one `.glb`, in `opts.alloc`.
 pub fn glb<'a>(scene: &Scene<'_>, opts: GlbOpts<'a, '_>) -> Result<Vec<u8, Alloc<'a>>, GlbError> {
-    glb_planted(scene, opts, NoPlant)
+    glb_textured_planted(scene, &TexturePack::EMPTY, opts, NoPlant)
+}
+
+/// `scene` with embedded PNG textures and per-material texture bindings as one `.glb`, in `opts.alloc`.
+pub fn glb_textured<'a>(
+    scene: &Scene<'_>,
+    textures: &TexturePack<'_>,
+    opts: GlbOpts<'a, '_>,
+) -> Result<Vec<u8, Alloc<'a>>, GlbError> {
+    glb_textured_planted(scene, textures, opts, NoPlant)
 }
 
 #[derive(Clone, Copy)]
@@ -197,7 +224,26 @@ struct ViewRec {
     length: u32,
     /// 0 for tightly packed (no `byteStride` written).
     stride: u32,
-    target: u64,
+    target: Option<u64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AccType {
+    Scalar,
+    Vec2,
+    Vec3,
+    Vec4,
+}
+
+impl AccType {
+    fn name(self) -> &'static str {
+        match self {
+            AccType::Scalar => "SCALAR",
+            AccType::Vec2 => "VEC2",
+            AccType::Vec3 => "VEC3",
+            AccType::Vec4 => "VEC4",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -213,7 +259,7 @@ struct AccRec {
     component: u64,
     normalized: bool,
     count: u32,
-    vec3: bool,
+    kind: AccType,
     bounds: Bounds,
 }
 
@@ -229,6 +275,8 @@ struct MeshRec {
     slot: MeshSlot,
     position: u32,
     normal: u32,
+    texcoord: Option<u32>,
+    tangent: Option<u32>,
     prims: (u32, u32),
 }
 
@@ -282,7 +330,7 @@ impl<'s, P: Planted<GlbPlant>> Bin<'s, P> {
         count32(self.bytes.len())
     }
 
-    fn end_view(&mut self, start: u32, stride: u32, target: u64) -> Result<u32, GlbError> {
+    fn end_view(&mut self, start: u32, stride: u32, target: Option<u64>) -> Result<u32, GlbError> {
         let end = count32(self.bytes.len())?;
         self.views.try_push(ViewRec { offset: start, length: end - start, stride, target }).map_err(|r| r.why)?;
         self.pad()?;
@@ -371,23 +419,29 @@ fn put_mesh<P: Planted<GlbPlant>>(
                     bin.put(&x.to_le_bytes())?;
                 }
             }
-            let pv = bin.end_view(start, 0, ARRAY_BUFFER)?;
+            let pv = bin.end_view(start, 0, Some(ARRAY_BUFFER))?;
             let bounds = bin.position_bounds(Bounds::F32 { min: b.min, max: b.max });
-            let position =
-                bin.accessor(AccRec { view: pv, component: FLOAT, normalized: false, count: nv, vec3: true, bounds })?;
+            let position = bin.accessor(AccRec {
+                view: pv,
+                component: FLOAT,
+                normalized: false,
+                count: nv,
+                kind: AccType::Vec3,
+                bounds,
+            })?;
             let start = bin.begin_view()?;
             for &u in units.iter() {
                 for x in plus_zeros(narrow(u)) {
                     bin.put(&x.to_le_bytes())?;
                 }
             }
-            let nview = bin.end_view(start, 0, ARRAY_BUFFER)?;
+            let nview = bin.end_view(start, 0, Some(ARRAY_BUFFER))?;
             let normal = bin.accessor(AccRec {
                 view: nview,
                 component: FLOAT,
                 normalized: false,
                 count: nv,
-                vec3: true,
+                kind: AccType::Vec3,
                 bounds: Bounds::None,
             })?;
             (position, normal, None)
@@ -423,14 +477,14 @@ fn put_mesh<P: Planted<GlbPlant>>(
                 }
                 bin.put(&[0, 0])?;
             }
-            let pv = bin.end_view(start, 8, ARRAY_BUFFER)?;
+            let pv = bin.end_view(start, 8, Some(ARRAY_BUFFER))?;
             let bounds = bin.position_bounds(Bounds::U16 { min: lo, max: hi });
             let position = bin.accessor(AccRec {
                 view: pv,
                 component: UNSIGNED_SHORT,
                 normalized: false,
                 count: nv,
-                vec3: true,
+                kind: AccType::Vec3,
                 bounds,
             })?;
             let scale = node_scale(q.dequantize);
@@ -457,11 +511,69 @@ fn put_mesh<P: Planted<GlbPlant>>(
                 NormalBits::Eight => (4, BYTE),
                 NormalBits::Sixteen => (8, SHORT),
             };
-            let nview = bin.end_view(start, stride, ARRAY_BUFFER)?;
-            let normal =
-                bin.accessor(AccRec { view: nview, component, normalized: true, count: nv, vec3: true, bounds: Bounds::None })?;
+            let nview = bin.end_view(start, stride, Some(ARRAY_BUFFER))?;
+            let normal = bin.accessor(AccRec {
+                view: nview,
+                component,
+                normalized: true,
+                count: nv,
+                kind: AccType::Vec3,
+                bounds: Bounds::None,
+            })?;
             (position, normal, Some(q.dequantize))
         }
+    };
+    let texcoord = match view.uvs() {
+        Some(uvs) => {
+            let start = bin.begin_view()?;
+            for (v, &[u, w]) in uvs.iter().enumerate() {
+                if !u.is_finite() || !w.is_finite() {
+                    return Err(GlbError::BadUv { part, mesh: slot, vertex: count32(v)? });
+                }
+                bin.put(&plus_zero(u).to_le_bytes())?;
+                bin.put(&plus_zero(w).to_le_bytes())?;
+            }
+            let tv = bin.end_view(start, 0, Some(ARRAY_BUFFER))?;
+            let acc = bin.accessor(AccRec {
+                view: tv,
+                component: FLOAT,
+                normalized: false,
+                count: nv,
+                kind: AccType::Vec2,
+                bounds: Bounds::None,
+            })?;
+            Some(acc)
+        }
+        None => None,
+    };
+    let tangent = match view.tangents() {
+        Some(tangents) => {
+            let start = bin.begin_view()?;
+            for (v, &t) in tangents.iter().enumerate() {
+                let w = t[3];
+                if w != 1.0 && w != -1.0 {
+                    return Err(GlbError::BadTangent { part, mesh: slot, vertex: count32(v)? });
+                }
+                let Some(u) = unit(wide(turn_p3([t[0], t[1], t[2]], ctx.up))) else {
+                    return Err(GlbError::BadTangent { part, mesh: slot, vertex: count32(v)? });
+                };
+                for x in plus_zeros(narrow(u)) {
+                    bin.put(&x.to_le_bytes())?;
+                }
+                bin.put(&w.to_le_bytes())?;
+            }
+            let tv = bin.end_view(start, 0, Some(ARRAY_BUFFER))?;
+            let acc = bin.accessor(AccRec {
+                view: tv,
+                component: FLOAT,
+                normalized: false,
+                count: nv,
+                kind: AccType::Vec4,
+                bounds: Bounds::None,
+            })?;
+            Some(acc)
+        }
+        None => None,
     };
     // Indices, one primitive per role run (or one for a hull), triangles in input order within it.
     let first_prim = count32(bin.prims.len())?;
@@ -500,20 +612,20 @@ fn put_mesh<P: Planted<GlbPlant>>(
                 }
             }
         }
-        let iview = bin.end_view(start, 0, ELEMENT_ARRAY_BUFFER)?;
+        let iview = bin.end_view(start, 0, Some(ELEMENT_ARRAY_BUFFER))?;
         let indices = bin.accessor(AccRec {
             view: iview,
             component: if wide_indices { UNSIGNED_INT } else { UNSIGNED_SHORT },
             normalized: false,
             count: count32((end - at) * 3)?,
-            vec3: false,
+            kind: AccType::Scalar,
             bounds: Bounds::None,
         })?;
         bin.prims.try_push(PrimRec { indices, material }).map_err(|r| r.why)?;
         at = end;
     }
     let prims = (first_prim, count32(bin.prims.len())?);
-    bin.meshes.try_push(MeshRec { part, slot, position, normal, prims }).map_err(|r| r.why)?;
+    bin.meshes.try_push(MeshRec { part, slot, position, normal, texcoord, tangent, prims }).map_err(|r| r.why)?;
     Ok((count32(bin.meshes.len() - 1)?, dequant))
 }
 
@@ -669,9 +781,48 @@ fn part_box(part: &Part<'_>, up: Up) -> Option<Aabb> {
     if b.is_empty() { None } else { Some(b) }
 }
 
+fn check_textures(scene: &Scene<'_>, textures: &TexturePack<'_>) -> Result<(), GlbError> {
+    if textures.material_textures.len() > scene.materials.len() {
+        return Err(GlbError::TooManyMaterialTextures {
+            got: textures.material_textures.len(),
+            materials: scene.materials.len(),
+        });
+    }
+    for (i, &img) in textures.png_images.iter().enumerate() {
+        if img.len() < PNG_SIGNATURE.len() || img[..PNG_SIGNATURE.len()] != PNG_SIGNATURE {
+            return Err(GlbError::InvalidPngImage { image: count32(i)? });
+        }
+    }
+    let count = textures.png_images.len();
+    for (i, mt) in textures.material_textures.iter().enumerate() {
+        let material = count32(i)?;
+        if !(mt.normal_scale.is_finite() && mt.normal_scale >= 0.0) {
+            return Err(GlbError::BadMaterial { material, field: MaterialField::NormalScale });
+        }
+        for opt in [mt.base_colour, mt.metallic_roughness, mt.normal] {
+            if let Some(index) = opt
+                && idx(index) >= count
+            {
+                return Err(GlbError::UnknownTexture { material, index, count });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// [`glb`] with a planted bug, for the tests' controls.
 pub fn glb_planted<'a>(
     scene: &Scene<'_>,
+    opts: GlbOpts<'a, '_>,
+    plant: impl Planted<GlbPlant>,
+) -> Result<Vec<u8, Alloc<'a>>, GlbError> {
+    glb_textured_planted(scene, &TexturePack::EMPTY, opts, plant)
+}
+
+/// [`glb_textured`] with a planted bug, for the tests' controls.
+pub fn glb_textured_planted<'a>(
+    scene: &Scene<'_>,
+    textures: &TexturePack<'_>,
     opts: GlbOpts<'a, '_>,
     plant: impl Planted<GlbPlant>,
 ) -> Result<Vec<u8, Alloc<'a>>, GlbError> {
@@ -683,6 +834,7 @@ pub fn glb_planted<'a>(
     for (i, m) in scene.materials.iter().enumerate() {
         check_material(count32(i)?, m)?;
     }
+    check_textures(scene, textures)?;
     for (i, part) in parts.iter().enumerate() {
         check_part(count32(i)?, part)?;
     }
@@ -780,6 +932,13 @@ pub fn glb_planted<'a>(
         recs.try_push(PartRec { main, lods: (lod_start, hull_start), hulls: (hull_start, hull_end), dequant })
             .map_err(|r| r.why)?;
     }
+    let mut image_views: V<'_, u32> = Vec::try_with_capacity_in(textures.png_images.len(), s)?;
+    for &img in textures.png_images {
+        let start = bin.begin_view()?;
+        bin.put(img)?;
+        let iv = bin.end_view(start, 0, None)?;
+        image_views.try_push(iv).map_err(|r| r.why)?;
+    }
     bin.pad()?;
 
     // The JSON chunk.
@@ -787,6 +946,8 @@ pub fn glb_planted<'a>(
     {
         let doc = Doc {
             scene,
+            material_textures: textures.material_textures,
+            image_views: &image_views,
             quantized,
             up: opts.up,
             node_of: &node_of,
@@ -837,6 +998,8 @@ pub fn glb_planted<'a>(
 /// What the JSON chunk is written from.
 struct Doc<'d> {
     scene: &'d Scene<'d>,
+    material_textures: &'d [MaterialTextures],
+    image_views: &'d [u32],
     quantized: bool,
     up: Up,
     node_of: &'d [u32],
@@ -912,6 +1075,12 @@ impl Doc<'_> {
                     j.key("attributes").map();
                     j.key("POSITION").uint(u64::from(m.position));
                     j.key("NORMAL").uint(u64::from(m.normal));
+                    if let Some(texcoord) = m.texcoord {
+                        j.key("TEXCOORD_0").uint(u64::from(texcoord));
+                    }
+                    if let Some(tangent) = m.tangent {
+                        j.key("TANGENT").uint(u64::from(tangent));
+                    }
                     j.end_map();
                     j.key("indices").uint(u64::from(p.indices));
                     if let Some(material) = p.material {
@@ -925,10 +1094,34 @@ impl Doc<'_> {
         }
         if !scene.materials.is_empty() {
             j.key("materials").list();
-            for m in scene.materials {
-                material(j, m);
+            for (i, m) in scene.materials.iter().enumerate() {
+                material(j, m, self.material_textures.get(i).copied());
             }
             j.end_list();
+        }
+        if !self.image_views.is_empty() {
+            j.key("textures").list();
+            for i in 0..self.image_views.len() {
+                j.map();
+                j.key("sampler").uint(0);
+                j.key("source").uint(i.widen_to());
+                j.end_map();
+            }
+            j.end_list();
+            j.key("images").list();
+            for &view in self.image_views {
+                j.map();
+                j.key("bufferView").uint(u64::from(view));
+                j.key("mimeType").str("image/png");
+                j.end_map();
+            }
+            j.end_list();
+            j.key("samplers").list().map();
+            j.key("magFilter").uint(MAG_LINEAR);
+            j.key("minFilter").uint(MIN_LINEAR_MIPMAP_LINEAR);
+            j.key("wrapS").uint(WRAP_REPEAT);
+            j.key("wrapT").uint(WRAP_REPEAT);
+            j.end_map().end_list();
         }
         if !self.accs.is_empty() {
             j.key("accessors").list();
@@ -940,7 +1133,7 @@ impl Doc<'_> {
                     j.key("normalized").bool(true);
                 }
                 j.key("count").uint(u64::from(a.count));
-                j.key("type").str(if a.vec3 { "VEC3" } else { "SCALAR" });
+                j.key("type").str(a.kind.name());
                 match a.bounds {
                     Bounds::None => {}
                     Bounds::F32 { min, max } => {
@@ -966,7 +1159,9 @@ impl Doc<'_> {
                 if v.stride != 0 {
                     j.key("byteStride").uint(u64::from(v.stride));
                 }
-                j.key("target").uint(v.target);
+                if let Some(target) = v.target {
+                    j.key("target").uint(target);
+                }
                 j.end_map();
             }
             j.end_list();
@@ -1124,14 +1319,30 @@ impl Doc<'_> {
     }
 }
 
-fn material<W: Put>(j: &mut Json<'_, W>, m: &Material<'_>) {
+fn material<W: Put>(j: &mut Json<'_, W>, m: &Material<'_>, textures: Option<MaterialTextures>) {
     j.map();
     j.key("name").str(m.name);
     j.key("pbrMetallicRoughness").map();
     j.key("baseColorFactor").nums(&m.base_colour);
+    if let Some(tex) = textures.and_then(|t| t.base_colour) {
+        j.key("baseColorTexture").map().key("index").uint(u64::from(tex)).end_map();
+    }
     j.key("metallicFactor").num(m.metallic);
     j.key("roughnessFactor").num(m.roughness);
+    if let Some(tex) = textures.and_then(|t| t.metallic_roughness) {
+        j.key("metallicRoughnessTexture").map().key("index").uint(u64::from(tex)).end_map();
+    }
     j.end_map();
+    if let Some(t) = textures
+        && let Some(tex) = t.normal
+    {
+        j.key("normalTexture").map();
+        j.key("index").uint(u64::from(tex));
+        if t.normal_scale != 1.0 {
+            j.key("scale").num(t.normal_scale);
+        }
+        j.end_map();
+    }
     if m.emissive != [0.0; 3] {
         j.key("emissiveFactor").nums(&m.emissive);
     }

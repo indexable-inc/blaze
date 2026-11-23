@@ -404,6 +404,14 @@ pub trait Facts {
     /// lowering does not check (`T: Tr`) gives `None`. Whoever answers files the read of the
     /// impl's header in the body's read list (rule 21).
     fn copy_args(&self, adt: ItemKey) -> Option<&[bool]>;
+    /// For each generic argument of `adt` (the record's argument list, as
+    /// [`Facts::copy_args`] counts it), whether `adt`'s drop glue drops a value of that
+    /// argument: `[false]` for `slice::Iter<'a, T>` (holds `NonNull<T>`, `*const T`,
+    /// `PhantomData<&'a T>`), `[true]` for `Option<T>`. Read only when
+    /// [`AdtFacts::needs_drop`] is `false`. `None`: every argument may be dropped.
+    fn drop_args(&self, _adt: ItemKey) -> Option<&[bool]> {
+        None
+    }
     /// The number of fields of `variant`.
     fn field_count(&self, adt: ItemKey, variant: u32) -> Option<u32>;
     /// Whether the body's generic parameter `index` is bounded by `Copy`.
@@ -1464,7 +1472,16 @@ pub fn pty_needs_drop<'a, 'c, F: Facts, A: Allocator + Copy, E>(
                     return Ok(true);
                 }
                 let s = list(l).ok_or_else(|| on_err(DropWalkError::Malformed))?;
-                stack.extend_from_slice(s);
+                match walk.facts.drop_args(k) {
+                    Some(need) if need.len() == s.len() => {
+                        for (&a, &drops) in s.iter().zip(need.iter()) {
+                            if drops {
+                                stack.push(a);
+                            }
+                        }
+                    }
+                    _ => stack.extend_from_slice(s),
+                }
             }
             // A future holds its captures and its saved values: dropping it may run code.
             PNode::Param(_)

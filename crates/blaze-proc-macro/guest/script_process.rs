@@ -209,7 +209,7 @@ impl Command {
             result: None,
             read: [0, 0],
         }));
-        let pipe = |which: Which| ChildPipe { child: child.clone(), which };
+        let pipe = |which: Which| ChildPipe { child: Arc::clone(&child), which };
         let pipes = StdioPipes {
             stdin: (stdin == 2).then(|| pipe(Which::Stdin)),
             stdout: (stdout == 2).then(|| pipe(Which::Stdout)),
@@ -223,7 +223,8 @@ pub fn output(cmd: &mut Command) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
     let (process, _pipes) = cmd.spawn(Stdio::MakePipe, false)?;
     let mut child = process.child.lock().unwrap_or_else(|e| e.into_inner());
     child.modes = [2, 2];
-    let (code, stdout, stderr) = child.run().clone();
+    child.run();
+    let (code, stdout, stderr) = child.result.take().unwrap_or((1, Vec::new(), Vec::new()));
     Ok((ExitStatus(code), stdout, stderr))
 }
 
@@ -248,7 +249,7 @@ impl Child {
     /// Its result: asked of the host the first time.
     fn run(&mut self) -> &(i32, Vec<u8>, Vec<u8>) {
         if self.result.is_none() {
-            let mut request = self.request.clone();
+            let mut request = core::mem::take(&mut self.request);
             put_str(&mut request, &self.stdin);
             request.extend_from_slice(&self.modes);
             // SAFETY: `request` is live for the call; the host reads `len` bytes of it.

@@ -2891,7 +2891,7 @@ impl<'n> Store<'n> {
                     // Members keep their container's parameters in this field and must stay
                     // out of the free-item map.
                     if head.container.is_none() {
-                        self.maps.const_params.insert(head.lib, head.consts.clone());
+                        self.maps.const_params.insert(head.lib, head.consts.to_vec_in(*head.consts.allocator()));
                     }
                     self.fns.insert(key, head);
                 }
@@ -3013,7 +3013,7 @@ impl<'n> Store<'n> {
                         self.regions.file(key, r);
                     }
                     if let Some(f) = frame {
-                        self.maps.const_params.insert(lib, f.consts.clone());
+                        self.maps.const_params.insert(lib, f.consts.to_vec_in(*f.consts.allocator()));
                         self.member_frames.insert(key, f);
                     }
                     if let Some(p) = preds {
@@ -3483,14 +3483,14 @@ impl<'n> Store<'n> {
         let alloc = self.tys.alloc();
         // The trait's lifetimes by name (D148): what its clauses and its members' read.
         let scope = Scope::item(v, None, 0, alloc).map_err(Why::Regions)?;
-        self.container_scopes.insert(ck, scope.clone());
+        self.container_scopes.insert(ck, scope.clone_in(alloc));
         // Its members' container group, a fact of this header as the scope is: filed here too,
         // so a trait whose head was filed from a record with no lifetime part (`Head::Trait`'s
         // `life` `None` or refused: no `restore_container`) still numbers its members' regions
         // (D148), never `RegionRefusal::NoContainer` for a header that is here. One the record
         // or `trait_head` filed stands.
         self.container_regions.insert_absent(ck, ContainerRegions::of_header(v, None, alloc)?);
-        let mut preds = Preds::new_in(scope.clone());
+        let mut preds = Preds::new_in(scope.clone_in(alloc));
         // What elaborating `T: Trait` adds: its implied clauses (`Preds::predicates_implying`:
         // the header's bounds with their associated item constraints, `where Self: ..`).
         let mut supertraits = Vec::new_in(Global);
@@ -3620,7 +3620,7 @@ impl<'n> Store<'n> {
                     // Its own lifetimes after the trait's (D148): its bounds' `'a` and its alias's
                     // identity column `Param(0..)` (`Alias`'s own slots: the trait's, then its own).
                     let assoc_scope = Scope::item(&mv, Some(&scope), scope.params(), alloc).map_err(Why::Regions)?;
-                    let mut ap = Preds::new_in(assoc_scope.clone());
+                    let mut ap = Preds::new_in(assoc_scope.clone_in(alloc));
                     match b.assoc_ty_bounds(&mut self.tys, &own_env, &mv, alias, self.sized, &mut ap) {
                         Ok(()) => {
                             self.fn_gaps.remove(&item);
@@ -3673,7 +3673,7 @@ impl<'n> Store<'n> {
                     // constant then gets the gap, by name.
                     // An associated constant has no generics of its own (blaze-lower's grammar):
                     // the trait's lifetimes are all it names.
-                    let mut cp = Preds::new_in(scope.clone());
+                    let mut cp = Preds::new_in(scope.clone_in(alloc));
                     cp.inherit(&inherited);
                     // Its type and regions from one walk ([`const_regions`]); its inherited
                     // clauses' columns are the trait's members' (`trait_inherits`).
@@ -3702,7 +3702,7 @@ impl<'n> Store<'n> {
                         qualifiers: FnQualifiers::of(&mv)?,
                         lib: key, text: m.text, text_prefix: None, container: Some(ck), parent: own + 1, own: 0, declared: 0, self_param: false,
                         header, c_variadic: false, legacy_const_generics: Vec::new_in(alloc), inputs: Vec::new_in(alloc), output, has_body,
-                        module, params: ps.clone(), consts: cs.clone(), bounds: own_bounds, self_: env.self_, self_assoc: Vec::new_in(alloc),
+                        module, params: ps.to_vec_in(alloc), consts: cs.to_vec_in(alloc), bounds: own_bounds, self_: env.self_, self_assoc: Vec::new_in(alloc),
                     };
                     self.fns.insert(mk, row);
                 }
@@ -3827,7 +3827,7 @@ impl<'n> Store<'n> {
             }
         }
         let scope = Scope::item(v, None, 0, alloc).map_err(Why::Regions)?;
-        let mut preds = Preds::new_in(scope.clone());
+        let mut preds = Preds::new_in(scope.clone_in(alloc));
         b.predicates(&mut self.tys, &env, v, 0, None, self.sized, &mut preds)?;
         // D148: the ADT's regions (its own lifetimes, its clauses' columns, its fields'), filed
         // under its checker key ([`super::head_record::regions_key`]).
@@ -3846,7 +3846,7 @@ impl<'n> Store<'n> {
         // context, generic over the ADT's parameters with its clauses (it may name `N` or
         // `T`), evaluated at each use's ground arguments (the struct expression's type's).
         for &(dk, text, output) in &default_heads {
-            let mut dp = Preds::new_in(scope.clone());
+            let mut dp = Preds::new_in(scope.clone_in(alloc));
             dp.inherit(&preds.clauses);
             self.preds.insert(dk, dp);
             let mut own_bounds = Vec::with_capacity_in(bounds.len(), Global);
@@ -3868,8 +3868,8 @@ impl<'n> Store<'n> {
                 output,
                 has_body: true,
                 module,
-                params: ps.clone(),
-                consts: cs.clone(),
+                params: ps.to_vec_in(*ps.allocator()),
+                consts: cs.to_vec_in(*cs.allocator()),
                 bounds: own_bounds,
                 self_: SelfTy::Ty(self_ty, None),
                 self_assoc: Vec::new_in(Global),
@@ -4109,7 +4109,7 @@ impl<'n> Store<'n> {
             }
         }
         let env = Env { self_assoc: &assoc, ..env };
-        let mut preds = Preds::new_in(scope.clone());
+        let mut preds = Preds::new_in(scope.clone_in(alloc));
         b.predicates(&mut self.tys, &env, v, 0, None, self.sized, &mut preds)?;
         // D148: the impl's regions (its header's columns, laid above; its clauses'; its values'),
         // filed under its key, and its members' container group. L1a's group
@@ -4193,7 +4193,8 @@ impl<'n> Store<'n> {
         // The frame its fns' signatures are made in, each by its own want (`Store::member_fn`).
         let mut frame_bounds = Vec::with_capacity_in(bounds.len(), Global);
         frame_bounds.extend_from_slice(&bounds);
-        self.member_frames.insert(ck, member_fn::MemberFrame { module, generics, params: ps.clone(), consts: cs.clone(), bounds: frame_bounds, self_: env.self_ });
+        let self_ = env.self_;
+        self.member_frames.insert(ck, member_fn::MemberFrame { module, generics, params: ps, consts: cs.to_vec_in(*cs.allocator()), bounds: frame_bounds, self_ });
         self.preds.insert(ck, preds);
         self.impls.insert(ck, ImplHead { generics, self_ty, trait_, trait_args, assoc, fns, fn_self, fn_vis, unstable, consts, polarity });
         self.maps.const_params.insert(key, cs);
@@ -4216,7 +4217,7 @@ impl<'n> Store<'n> {
         let marks = super::item_site::member_marks(names, key, written_by, text).map_err(MarksLost::why)?;
         let cb = Builder { resolver: Paths { names }, heads: &self.maps, marks };
         // An associated constant has no generics of its own: the impl's lifetimes.
-        let mut cp = Preds::new_in(scope.clone());
+        let mut cp = Preds::new_in(scope.clone_in(scope.alloc()));
         cp.inherit(clauses);
         // Its type and regions from one walk ([`const_regions`]), in the members' group filed
         // with the impl's head; its inherited clauses' columns are the impl's filed regions'.
@@ -4297,7 +4298,7 @@ impl<'n> Store<'n> {
         let mut self_assoc = Vec::with_capacity_in(head.assoc.len(), Global);
         self_assoc.extend_from_slice(&head.assoc);
         let clauses = self.preds.get(&ck).ok_or_else(|| lost("its impl's clauses are not filed"))?;
-        let scope = clauses.scope.clone();
+        let scope = clauses.scope.clone_in(clauses.scope.alloc());
         let mut inherited: Vec<PClause, Global> = Vec::with_capacity_in(clauses.clauses.len(), Global);
         inherited.extend_from_slice(&clauses.clauses);
         let env = Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts, body: None };
@@ -4671,7 +4672,7 @@ impl<'n> Store<'n> {
         };
         for (j, &(t, me)) in opaques.iter().enumerate() {
             let k = super::keys::opaque_key(key, first + j as u32);
-            let mut op = Preds::new_in(opaque_scope.clone());
+            let mut op = Preds::new_in(opaque_scope.clone_in(alloc));
             rb.impl_bounds(&mut self.tys, &ret_env, &rv, &[(t, me)], self.sized, &mut op)?;
             // Its regions, when the signature's column lays its captures (`captures` above).
             let filed = match (in_scope, all_captures.of(k)) {
@@ -4696,7 +4697,7 @@ impl<'n> Store<'n> {
             let args = intern_list(&mut self.tys, &[me])?;
             // Its clauses are made here, not written (`Src::Derived`): its regions stay refused
             // until a producer lays the `Output = T` column from the return type's slots.
-            let mut op = Preds::new_in(fn_scope.clone());
+            let mut op = Preds::new_in(fn_scope.clone_in(alloc));
             op.push(PClause::Trait { trait_: checker_of(fut), args }, hreg::Src::Derived);
             op.push(PClause::Projection { trait_: checker_of(fut), args, name: Name::of("Output"), term: written }, hreg::Src::Derived);
             if let Some(s) = self.sized {
@@ -4751,7 +4752,7 @@ impl<'n> Store<'n> {
             return Err(Why::Unsupported("`...` on a fn of an ABI other than \"C\" or \"system\" (the Reference, [items.extern.variadic.conventions])", whole));
         }
         let has_body = flags & sig::HAS_BODY != 0;
-        let mut preds = Preds::new_in(fn_scope.clone());
+        let mut preds = Preds::new_in(fn_scope.clone_in(alloc));
         preds.inherit(inherited);
         if says_misses {
             preds.keep_trait_misses();
@@ -4785,7 +4786,7 @@ impl<'n> Store<'n> {
         // too) was refused "a const parameter in a type position" when the trait's members
         // were made again. A member's own are in its `FnHead::consts`.
         if container.is_none() {
-            self.maps.const_params.insert(lib, cs.clone());
+            self.maps.const_params.insert(lib, cs.to_vec_in(*cs.allocator()));
         }
         // `#[rustc_legacy_const_generics(1)]` (stdarch's `vget_lane_u64(v, 0)`): the positions
         // of the call arguments that are the fn's own const generic arguments.

@@ -1,12 +1,13 @@
-//! Deterministic surface shading, SDF ambient occlusion, soft SDF shadows, render modes
-//! (`Shaded`, `Normals`, `Depth`, `Matcap`), and gamma-aware supersample resolve.
+//! Deterministic surface shading, SDF ambient occlusion, soft SDF shadows, movable studio strip
+//! lights, render modes (`Shaded`, `Normals`, `Depth`, `Matcap`, `Zebra`), and gamma-aware
+//! supersample resolve.
 
 #![blaze::sans_io]
 
 use blaze_cad_field::{Scratch, Tape, eval_point};
 use blaze_math::{Aabb3, Vec3};
 
-use crate::{Camera, LEAST_STEP, PictureOpts, PictureStats, RenderMode, Shading, StudioOpts, slab};
+use crate::{Camera, LEAST_STEP, PictureOpts, PictureStats, RenderMode, Shading, StripLight, StudioOpts, ZebraOpts, slab};
 
 /// Deterministic 2×2 rotated-grid supersampling (RGSS) offsets within `[0, 1]²`.
 /// Every coordinate is an exact dyadic fraction (`k / 8`).
@@ -288,6 +289,7 @@ pub(crate) fn shade_hit_sample(
             [v, v, v, 1.0]
         }
         RenderMode::Matcap => shade_matcap(cam, ctx, n),
+        RenderMode::Zebra(zebra) => shade_zebra(cam, dir, n, &zebra),
         RenderMode::Shaded => match o.shading {
             Shading::Classic => {
                 let s = 0.22 + 0.78 * n.dot(ctx.classic_light).max(0.0);
@@ -387,14 +389,144 @@ fn shade_studio(
     };
     let rim_tint = [0.95, 0.98, 1.04];
 
+    // Optional movable studio strip lights (exact no-op when all slots are `None`).
+    let strip_roughness = (1.0 / blaze_math::sqrt(studio.shininess.max(1.0))).clamp(0.08, 0.85);
+    let strip_contrib = eval_strip_lights(cam, &studio.strip_lights, n, v, strip_roughness, ao);
+
     let mut out = [0.0f64; 4];
     for c in 0..3 {
         let diff = albedo[c] * (ndotl_key * key_tint[c] + ndotl_fill * fill_tint[c] + hemi_rgb[c]);
-        let col = diff + spec * key_tint[c] + rim * rim_tint[c];
+        let mut col = diff + spec * key_tint[c] + rim * rim_tint[c];
+        if let Some((s_diff, s_spec)) = strip_contrib {
+            col += albedo[c] * s_diff[c] + s_spec[c];
+        }
         out[c] = col.clamp(0.0, 1.0);
     }
     out[3] = 1.0;
     out
+}
+
+/// Class-A reflection-line zebra analysis shared by both the SDF tracer and the mesh renderer.
+///
+/// Reflects the viewing ray `dir` across unit normal `n`, projects onto `zebra.axis` (in camera
+/// space by default, or world space when `zebra.world_space` is true), maps the elevation via
+/// `asin` for uniform angular stripe spacing across the reflection hemisphere, and applies a
+/// smoothstep anti-aliased contrast ramp between `zebra.dark` and `zebra.light`.
+pub(crate) fn shade_zebra(cam: &Camera, dir: Vec3, n: Vec3, zebra: &ZebraOpts) -> [f64; 4] {
+    let r = (dir - n * (2.0 * dir.dot(n))).normalized().unwrap_or(n);
+    let axis = Vec3::new(zebra.axis[0], zebra.axis[1], zebra.axis[2])
+        .normalized()
+        .unwrap_or(Vec3::new(0.0, 0.0, 1.0));
+    let proj = if zebra.world_space {
+        r.dot(axis)
+    } else {
+        let r_cam = Vec3::new(r.dot(cam.right), r.dot(cam.up), -r.dot(cam.forward));
+        r_cam.dot(axis)
+    };
+    let coord = blaze_math::asin(proj.clamp(-1.0, 1.0)) / core::f64::consts::PI;
+    let s = blaze_math::sin(2.0 * core::f64::consts::PI * (coord * zebra.stripes + zebra.phase));
+    let sharp = if zebra.sharpness.is_finite() { zebra.sharpness.max(0.0) } else { 8.0 };
+    let t = (0.5 + 0.5 * (s * sharp).clamp(-1.0, 1.0)).clamp(0.0, 1.0);
+    let band = t * t * (3.0 - 2.0 * t);
+
+    let mut out = [0.0f64; 4];
+    for c in 0..3 {
+        let d = f64::from(zebra.dark[c]) / 255.0;
+        let l = f64::from(zebra.light[c]) / 255.0;
+        out[c] = (d + (l - d) * band).clamp(0.0, 1.0);
+    }
+    out[3] = 1.0;
+    out
+}
+
+/// Evaluate up to 4 analytical rectangular studio strip lights (`None` when all slots are inactive,
+/// guaranteeing zero arithmetic change to default studio renders).
+///
+/// For each active strip light, transforms its camera-space `direction` and `tangent` into world
+/// space, clamps the reflection ray `R = reflect(-V, N)` onto the strip rectangle
+/// `[-half_length, half_length] × [-half_width, half_width]` at unit distance, and accumulates a
+/// roughness-aware specular ribbon plus subtle wrapped diffuse fill.
+pub(crate) fn eval_strip_lights(
+    cam: &Camera,
+    strips: &[Option<StripLight>; 4],
+    n: Vec3,
+    v: Vec3,
+    roughness: f64,
+    ao: f64,
+) -> Option<([f64; 3], [f64; 3])> {
+    let mut any = false;
+    for slot in strips {
+        if slot.is_some() {
+            any = true;
+            break;
+        }
+    }
+    if !any {
+        return None;
+    }
+
+    let ndotv = n.dot(v).max(0.0);
+    let r_vec = (n * (2.0 * n.dot(v)) - v).normalized().unwrap_or(n);
+    let rough = roughness.clamp(0.04, 1.0);
+    let sigma = (0.035 + 0.35 * rough * rough).clamp(0.035, 0.55);
+    let inv_two_sigma_sq = 0.5 / (sigma * sigma);
+    let fresnel = 0.25 + 0.75 * blaze_math::pow((1.0 - ndotv).clamp(0.0, 1.0), 3.0);
+
+    let mut diff_rgb = [0.0f64; 3];
+    let mut spec_rgb = [0.0f64; 3];
+
+    for slot in strips {
+        let Some(strip) = slot else { continue };
+        if !(strip.intensity > 0.0 && strip.intensity.is_finite()) {
+            continue;
+        }
+        let d_raw = cam.right * strip.direction[0] + cam.up * strip.direction[1] - cam.forward * strip.direction[2];
+        let Some(dir_w) = d_raw.normalized() else { continue };
+
+        let t_raw = cam.right * strip.tangent[0] + cam.up * strip.tangent[1] - cam.forward * strip.tangent[2];
+        let t_proj = t_raw - dir_w * t_raw.dot(dir_w);
+        let u_axis = match t_proj.normalized() {
+            Some(u) => u,
+            None => {
+                let fallback = if dir_w.dot(cam.right).abs() < 0.9 { cam.right } else { cam.up };
+                (fallback - dir_w * fallback.dot(dir_w)).normalized().unwrap_or(cam.right)
+            }
+        };
+        let v_axis = dir_w.cross(u_axis).normalized().unwrap_or(cam.up);
+
+        let hl = if strip.half_length.is_finite() { strip.half_length.max(0.0) } else { 0.0 };
+        let hw = if strip.half_width.is_finite() { strip.half_width.max(0.0) } else { 0.0 };
+
+        // Project reflection ray onto the strip's tangent plane at unit distance and clamp to rectangle.
+        let r_dot_d = r_vec.dot(dir_w);
+        let (u_coord, v_coord) = if r_dot_d > 1e-4 {
+            let inv = 1.0 / r_dot_d;
+            ((r_vec.dot(u_axis) * inv).clamp(-hl, hl), (r_vec.dot(v_axis) * inv).clamp(-hw, hw))
+        } else {
+            let inv = 1e4;
+            ((r_vec.dot(u_axis) * inv).clamp(-hl, hl), (r_vec.dot(v_axis) * inv).clamp(-hw, hw))
+        };
+
+        let l_rep = (dir_w + u_axis * u_coord + v_axis * v_coord).normalized().unwrap_or(dir_w);
+        let cos_ang = r_vec.dot(l_rep).clamp(-1.0, 1.0);
+        let d_ang = blaze_math::acos(cos_ang);
+        let ndotl_rep = n.dot(l_rep).max(0.0);
+        let horizon = (ndotl_rep * 4.0).clamp(0.0, 1.0);
+        let spec_lobe = blaze_math::exp(-(d_ang * d_ang) * inv_two_sigma_sq)
+            * strip.intensity
+            * fresnel
+            * horizon
+            * (0.5 + 0.5 * ao);
+        let diff_wrap = ((n.dot(dir_w) + 0.25) / 1.25).clamp(0.0, 1.0) * 0.18 * strip.intensity * ao;
+
+        for c in 0..3 {
+            let col = if strip.colour[c].is_finite() { strip.colour[c].max(0.0) } else { 0.0 };
+            diff_rgb[c] += diff_wrap * col;
+            spec_rgb[c] += spec_lobe * col;
+        }
+    }
+
+    Some((diff_rgb, spec_rgb))
 }
 
 /// Procedural studio metallic/ceramic CAD matcap from camera-space normal `(nx, ny, nz)`.
