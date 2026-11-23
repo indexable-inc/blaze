@@ -264,8 +264,14 @@ jobs:
         run: |
           set -euo pipefail
           tc="$(cat pins/toolchain)"
-          tmp_dir="$(mktemp -d)"
+          # Keep TMPDIR on $HOME's filesystem so test shelf hard-links succeed with 0 bytes copied
+          # (avoiding EXDEV copying the multi-GB toolchain shelf into /tmp tmpfs per test binary).
+          tmp_dir="$(mktemp -d "$HOME/.ci-tmp.XXXXXX")"
           trap 'rm -rf "$tmp_dir"' EXIT
+          export TMPDIR="$tmp_dir"
+          # Keep non-daemon integration tests from spawning dozens of orphaned 64-thread daemons
+          # into temporary homes; daemon_tests explicitly clears BLAZE_NO_DAEMON to test the daemon.
+          export BLAZE_NO_DAEMON=1
           bins="$tmp_dir/bins.txt"
           cargo +"$tc" test --locked --workspace --exclude blaze-std --no-run --message-format=json-render-diagnostics \
             | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | "\(.manifest_path | sub("/Cargo\\.toml$"; ""))|\(.executable)"' \
@@ -284,7 +290,7 @@ jobs:
             bin="${1#*|}"
             name="$(basename "$bin")"
             out="$FAIL_DIR/$name.log"
-            if (cd "$dir" && CARGO_MANIFEST_DIR="$dir" "$bin") >"$out" 2>&1; then
+            if (cd "$dir" && CARGO_MANIFEST_DIR="$dir" timeout 600 "$bin") >"$out" 2>&1; then
               rm -f "$out"
             else
               rc=$?
