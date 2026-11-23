@@ -133,7 +133,7 @@ fn toolchain_base_populates_cells_and_merges_from_work_rows() {
     let clock = io.need_clock().expect("clock");
     let host = io.need_host().expect("host");
     let mut rng = io.need_rng().expect("rng");
-    let opened = crate::store::open_for_command(&cx, &fs, &host, &mut rng, opts.place.home, &root, A1.dir, &clock, &err, opts.heap).expect("open store");
+    let opened = crate::store::open_for_command(&cx, &fs, &host, &mut rng, opts.place.home, None, &root, A1.dir, &clock, &err, opts.heap).expect("open store");
     let mut store = crate::store::CommandStore::new(&cx, &opened.lent, false, opened.open_ns, None, clock.clone(), &err, alloc.handle()).expect("store");
     let ptr = crate::engine_answer::load_toolchain_base(&cx, &mut store, shelf, &opts.tools, &frame)
         .expect("load tool-base")
