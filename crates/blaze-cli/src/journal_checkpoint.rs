@@ -76,6 +76,12 @@ const HEADER: usize = 4 + 32 + 4;
 /// renew its roots.
 pub(crate) const DUE_EVENTS: u64 = 1;
 
+/// When the same live journal helper instance vouched (`from.instance == to.instance`), the
+/// helper answers directly from memory without replaying `fseventsd`, so volume-wide FSEvents
+/// ticks need not force a checkpoint write + fsync on every warm check. Still checkpoint every
+/// `HELPER_DUE_EVENTS` IDs so a helper restart later has a bounded fallback replay.
+pub(crate) const HELPER_DUE_EVENTS: u64 = 65_536;
+
 /// The root naming a checkout's checkpoint, beside its answer's root.
 pub(crate) fn name<'f>(answer_root: &str, frame: &'f Frame) -> blaze_own::String<&'f Frame> {
     let mut name = blaze_own::String::new_in(frame);
@@ -339,10 +345,28 @@ pub(crate) fn due(used: Stored<'_>, now: Stored<'_>, every: u64) -> Option<Due> 
             None => unplaced = unplaced.saturating_add(1),
         }
     }
-    if unplaced > 0 {
-        return Some(Due::NewPlace { units: unplaced });
+    // A newly acquired helper place (none saved before, or a new helper instance after a restart
+    // or reboot) is checkpointed even when zero journal events fired since the previous command,
+    // so the next check gets an instant helper vouch. When the same live helper instance vouched,
+    // raise the event-ID threshold to `HELPER_DUE_EVENTS` so volume-wide FSEvents ticks do not
+    // trigger a checkpoint write + fsync on every warm check.
+    let (new_helper, same_helper) = match (
+        used.helper_place().and_then(|bytes| blaze_watch::since::Place::decode(&bytes)),
+        now.helper_place().and_then(|bytes| blaze_watch::since::Place::decode(&bytes)),
+    ) {
+        (_, None) => (false, false),
+        (None, Some(_)) => (true, false),
+        (Some(from), Some(to)) => (from.instance != to.instance, from.instance == to.instance),
+    };
+    if unplaced > 0 || new_helper {
+        return Some(Due::NewPlace { units: unplaced.max(u32::from(new_helper)) });
     }
-    (ids >= every).then_some(Due::Replayed { ids })
+    let threshold = if same_helper && every == DUE_EVENTS {
+        HELPER_DUE_EVENTS
+    } else {
+        every
+    };
+    (ids >= threshold).then_some(Due::Replayed { ids })
 }
 
 /// The profile's `journal:` line: what this command replayed against the whole suffix since

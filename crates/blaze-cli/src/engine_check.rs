@@ -1231,13 +1231,14 @@ fn checking<'f>(
     // checkout is read (journal_sweep.rs): a write after this and before its file's read is
     // after the place this request saves, so the next request's replay names it. Moved below
     // the sweep or the plan's reads, such a write would be missed for good.
-    // The changed set through its one seam (journal_sweep.rs `ChangedSince`): the helper asked,
-    // then the journal replayed, both marking and their difference printed (journal_ask.rs
-    // `Both`) until the differential holds on tempo; then `Asked`. No helper is started
-    // (`HelperStart::None`): with none answering, this is `Replay` and one failed connect.
+    // The changed set through its one seam (journal_sweep.rs `ChangedSince`): ask the detached
+    // helper (`Shipped = Asked`); when no live helper answers on a real native host, start one
+    // detached (`HelperStart::Detached`) and replay for this command.
     use crate::journal_sweep::ChangedSince as _;
     let me = crate::journal_ask::Me::of(&host.build_id()?, place.served.root_text(), place.home, frame);
-    let strategy = crate::journal_ask::Shipped { me, start: crate::journal_ask::HelperStart::None };
+    let exe = (!cfg!(test) && !cx.is_simulated()).then(|| host.exe().ok()).flatten();
+    let start = crate::journal_ask::HelperStart::detached(host, exe.as_deref(), place.served.root_text(), place.home);
+    let strategy = crate::journal_ask::Shipped { me, start };
     let journal = strategy.changed_since(cx, root, opened.home.dir(), phases.clock(), chosen.places(), frame)?;
     let now_places = crate::journal_checkpoint::Places::of_taken(&journal, frame);
     // The lint step and rules the root manifest names, as `check` reads them (lints.rs

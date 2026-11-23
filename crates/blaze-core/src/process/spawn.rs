@@ -66,6 +66,9 @@ pub(super) struct ChildAsk<'a> {
     pub(super) procs: RawFd,
     pub(super) extra: &'a [(RawFd, RawFd)],
     pub(super) group: bool,
+    /// Whether it leads a new session (`setsid()` before exec), detached from the parent's group
+    /// and controlling terminal.
+    pub(super) session: bool,
     /// This process's pid where the child arms `PR_SET_PDEATHSIG(SIGKILL)`; 0: not armed.
     pub(super) parent: libc::pid_t,
     pub(super) confine: Option<&'a blaze_sys::linux::confine::ChildConfine<'a>>,
@@ -133,7 +136,7 @@ pub(super) fn spawn_with(
     {
         let procs = procs.map(|path| open(path, libc::O_WRONLY)).transpose()?;
         let joins = procs.as_ref().map_or(-1, |it| it.as_raw_fd());
-        let child = ChildAsk { procs: joins, extra, group, parent: 0, confine: None };
+        let child = ChildAsk { procs: joins, extra, group, session: false, parent: 0, confine: None };
         match while_busy(|| clone(&plan, fds, &child))? {
             Cloned::Started { pid, pidfd } => Ok(Spawned { pid, pidfd, stdin, stdout, stderr }),
             // No confinement was asked of this start (`confine: None` above), so none refused.
@@ -145,7 +148,7 @@ pub(super) fn spawn_with(
     #[cfg(target_os = "macos")]
     {
         debug_assert!(procs.is_none(), "no cgroups on macOS");
-        let pid = posix_spawn(&plan, fds, extra, group)?;
+        let pid = posix_spawn(&plan, fds, extra, group, false)?;
         Ok(Spawned { pid, stdin, stdout, stderr })
     }
 }
@@ -420,6 +423,8 @@ struct Child<'a> {
     extra: &'a [(RawFd, RawFd)],
     /// Whether it leads a process group of its own.
     group: bool,
+    /// Whether it leads a new session (`setsid()` before exec).
+    session: bool,
     /// This process's pid where the child arms `PR_SET_PDEATHSIG(SIGKILL)`; 0: not armed.
     parent: libc::pid_t,
     /// The confinement it enters last before `execve` (D177): data the parent made, which the
@@ -465,6 +470,7 @@ unsafe fn clone_on(stack: *mut u8, plan: &Plan, fds: [RawFd; 3], ask: &ChildAsk<
         procs: ask.procs,
         extra: ask.extra,
         group: ask.group,
+        session: ask.session,
         parent: ask.parent,
         confine: ask.confine,
         step: 0,
@@ -528,6 +534,7 @@ unsafe fn clone_on(stack: *mut u8, plan: &Plan, fds: [RawFd; 3], ask: &ChildAsk<
         7 => "arming its kill at its parent's death (PR_SET_PDEATHSIG)",
         8 => "finding its parent alive after arming its kill at the parent's death",
         CONFINE_STEP => "entering its confinement (D177)",
+        10 => "making it the leader of a session of its own (setsid)",
         _ => "running its program",
     };
     let error = io::Error::from_raw_os_error(failed);
@@ -610,12 +617,20 @@ extern "C" fn run(arg: *mut libc::c_void) -> libc::c_int {
             fail(child, 8);
         }
     }
-    // A group of its own, made before its program runs, so the parent (waiting, CLONE_VFORK)
-    // can signal the group the moment `clone` returns.
-    // SAFETY: no pointers; this process's own group set to its pid. Async-signal-safe
-    // (POSIX.1-2017 section 2.4.3 lists `setpgid`).
-    if child.group && unsafe { libc::setpgid(0, 0) } != 0 {
-        fail(child, 5);
+    // A new session of its own (`setsid`, detached from parent's group and controlling terminal),
+    // or a process group of its own (`setpgid(0, 0)`), made before its program runs.
+    if child.session {
+        // SAFETY: no pointers; creates a new session for this child process (not yet a process
+        // group leader, so `setsid` succeeds). Async-signal-safe (POSIX.1-2017 section 2.4.3).
+        if unsafe { libc::setsid() } < 0 {
+            fail(child, 10);
+        }
+    } else if child.group {
+        // SAFETY: no pointers; this process's own group set to its pid. Async-signal-safe
+        // (POSIX.1-2017 section 2.4.3 lists `setpgid`).
+        if unsafe { libc::setpgid(0, 0) } != 0 {
+            fail(child, 5);
+        }
     }
     for (target, fd) in (0..).zip(child.fds) {
         // SAFETY: an open descriptor past 2 onto one of 0, 1 and 2; the copy keeps no
@@ -682,15 +697,17 @@ extern "C" fn run(arg: *mut libc::c_void) -> libc::c_int {
     fail(child, 4)
 }
 
-/// `extra` and `group` as [`spawn_with`] says: one `posix_spawn_file_actions_adddup2` per
-/// extra, after the standard three (under `CLOEXEC_DEFAULT` a descriptor a file action gives is
-/// the one kept open), and `POSIX_SPAWN_SETPGROUP` with group 0, the child's own pid.
+/// `extra`, `group` and `session` as [`spawn_with`] says: one `posix_spawn_file_actions_adddup2`
+/// per extra, after the standard three (under `CLOEXEC_DEFAULT` a descriptor a file action gives
+/// is the one kept open), `POSIX_SPAWN_SETSID` when `session` is set, else `POSIX_SPAWN_SETPGROUP`
+/// with group 0, the child's own pid.
 #[cfg(target_os = "macos")]
 fn posix_spawn(
     plan: &Plan,
     fds: [RawFd; 3],
     extra: &[(RawFd, RawFd)],
     group: bool,
+    session: bool,
 ) -> io::Result<libc::pid_t> {
     unsafe extern "C" {
         fn posix_spawn_file_actions_addchdir_np(
@@ -705,9 +722,11 @@ fn posix_spawn(
         ) -> libc::c_int;
     }
     /// Every descriptor not given by a file action is closed in the child (Apple's).
-    const CLOEXEC_DEFAULT: libc::c_short = 0x4000;
+    const CLOEXEC_DEFAULT: i16 = 0x4000;
     /// The group of `posix_spawnattr_setpgroup` is set before the program runs (spawn.h).
-    const SETPGROUP: libc::c_short = 0x0002;
+    const SETPGROUP: i16 = 0x0002;
+    /// The child starts a new session (`setsid`) before the program runs (Apple `<sys/spawn.h>`).
+    const SETSID: i16 = 0x0400;
     let check = |code: libc::c_int| match code {
         0 => Ok(()),
         _ => Err(io::Error::from_raw_os_error(code)),
@@ -732,7 +751,7 @@ fn posix_spawn(
             // reads (`spawn_with`).
             check(unsafe { libc::posix_spawn_file_actions_adddup2(&mut actions, source, target) })?;
         }
-        if group {
+        if group && !session {
             // SAFETY: made above; group 0 is the child's own pid.
             check(unsafe { posix_spawnattr_setpgroup(&mut attr, 0) })?;
         }
@@ -751,7 +770,13 @@ fn posix_spawn(
         let flags = CLOEXEC_DEFAULT
             | libc::POSIX_SPAWN_SETSIGDEF as libc::c_short
             | libc::POSIX_SPAWN_SETSIGMASK as libc::c_short
-            | if group { SETPGROUP } else { 0 };
+            | if session {
+                SETSID
+            } else if group {
+                SETPGROUP
+            } else {
+                0
+            };
         // SAFETY: made above.
         check(unsafe { libc::posix_spawnattr_setflags(&mut attr, flags) })?;
         let mut pid = 0;

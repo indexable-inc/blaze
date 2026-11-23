@@ -37,7 +37,7 @@ blaze-cbor	27
 blaze-cc	8
 blaze-cert	108
 blaze-check	196
-blaze-cli	1397
+blaze-cli	1396
 blaze-code	94
 blaze-columns	193
 blaze-comptime	68
@@ -79,7 +79,7 @@ blaze-impls	4
 blaze-inproc	55
 blaze-int	41
 blaze-json	32
-blaze-keyed	590
+blaze-keyed	588
 blaze-kit	167
 blaze-ladder	1164
 blaze-launch	83
