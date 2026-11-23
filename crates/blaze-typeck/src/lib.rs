@@ -94,7 +94,7 @@ pub use body::{
     Anchor, Arm, BinOp, BindAnn, BodyPath, BodyView, Capture, CoroutineKind, Expr, FieldInit, FieldPat, FmtTrait, FmtUse,
     IntSuffix, Lit, Pat, Segment, Stmt, StructBase, UnOp,
 };
-pub use columns::{AdjustKind, Adjusts, Callees, CaptureKind, CapturePlaceRows, CaptureProjs, Captures, Checked, Closures, ConstArgs, DefaultFields, ExprDefs, Fields, FruFields, PatConstArgs, PatDefs};
+pub use columns::{AdjustKind, Adjusts, Callees, CaptureKind, CapturePlaceRows, CaptureProjs, Captures, Checked, Closures, ConstArgs, DefaultFields, ExprDefs, Fields, FruFields, PatConstArgs, PatDefs, UnionPat, UnionPats};
 pub use columns::CoroutineWitness;
 pub use columns::SigFrom;
 pub use env_fields::{ActiveEnv, CaptureProj, EnvField, EnvFields, EnvRule, Places, WholeBindings};

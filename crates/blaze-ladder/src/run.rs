@@ -836,7 +836,12 @@ fn ground_list(ground: &mut PortableTys<'_>, args: &[PTy], types: PTys<'_>) -> O
     for &n in types.nodes() {
         let node = match n {
             PNode::Tuple(l) => PNode::Tuple(ground_of_list(ground, types, &map, l)?),
-            PNode::Record(s, l) => PNode::Record(s, ground_of_list(ground, types, &map, l)?),
+            PNode::Record(s, l) => {
+                if let Some(names) = types.record_names(s) {
+                    let _ = ground.register_record_schema(s, names);
+                }
+                PNode::Record(s, ground_of_list(ground, types, &map, l)?)
+            }
             PNode::Union(l) => PNode::Union(ground_of_list(ground, types, &map, l)?),
             PNode::Ref(m, t) => PNode::Ref(m, *map.get(t.0 as usize)?),
             PNode::Ptr(m, t) => PNode::Ptr(m, *map.get(t.0 as usize)?),

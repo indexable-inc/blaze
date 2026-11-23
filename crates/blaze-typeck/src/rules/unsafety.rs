@@ -365,6 +365,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         stack.extend(fields.iter().map(|f| f.pat));
                     }
                 }
+                Pat::Record { fields, .. } => {
+                    let fields = body.field_pat_list(fields)?;
+                    stack.extend(fields.iter().map(|f| f.pat));
+                }
             }
         }
         Ok(())

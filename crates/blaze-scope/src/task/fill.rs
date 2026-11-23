@@ -38,7 +38,7 @@ pub trait Par {
         out: &mut AVec<'a, blaze_file_items::Outline<'a>>,
     ) -> Result<(), crate::resolve::NamesError<'a>> {
         for &(_, text) in files {
-            out.push(blaze_file_items::outline(text, edition, alloc));
+            out.push(blaze_file_items::outline_auto_extensions(text, edition, blaze_file_items::Bodies::Skipped, alloc));
         }
         Ok(())
     }

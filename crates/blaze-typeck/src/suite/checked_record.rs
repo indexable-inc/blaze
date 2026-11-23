@@ -31,6 +31,7 @@ fn differs(a: &Checked<'_>, b: &Checked<'_>) -> Option<&'static str> {
         ("const_args", a.const_args.column::<0>() == b.const_args.column::<0>() && a.const_args.column::<1>() == b.const_args.column::<1>()),
         ("pat_const_args", a.pat_const_args.column::<0>() == b.pat_const_args.column::<0>() && a.pat_const_args.column::<1>() == b.pat_const_args.column::<1>()),
         ("pat_defs", a.pat_defs.column::<0>() == b.pat_defs.column::<0>() && a.pat_defs.column::<1>() == b.pat_defs.column::<1>()),
+        ("union_pats", a.union_pats.column::<0>() == b.union_pats.column::<0>() && a.union_pats.column::<1>() == b.union_pats.column::<1>()),
         ("fields", a.fields.column::<0>() == b.fields.column::<0>() && a.fields.column::<1>() == b.fields.column::<1>() && a.fields.column::<2>() == b.fields.column::<2>()),
         ("captures", a.captures.column::<0>() == b.captures.column::<0>() && a.captures.column::<1>() == b.captures.column::<1>() && a.captures.column::<2>() == b.captures.column::<2>()),
         (
@@ -228,4 +229,13 @@ fn every_lang_tag_decodes_to_its_item() {
     }
     assert_eq!(seen, "CallRefFuture", "the list ends at the last variant");
     assert_eq!(LangItem::of_tag(LangItem::ALL.len() as u8), None, "control: a tag past the list");
+}
+
+/// A record written with the previous layout magic (`bzchkd06`) is rejected cleanly.
+#[test]
+fn previous_magic_bzchkd06_is_rejected() {
+    let h = blaze_own::testing::heap();
+    let mut old = bytes_of(&a_call());
+    old[..8].copy_from_slice(b"bzchkd06");
+    assert!(matches!(decode(&old, h.alloc()), Err(CheckedRecordError::Magic)));
 }

@@ -2080,6 +2080,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                     cc.tasks.push(C::Eval(fi.expr, Mode::Value));
                 }
             }
+            Expr::Record { .. } => return Err(unsupported("a structural record literal in a constant")),
             Expr::Index { base, index } => {
                 cc.tasks.push(C::Index(e));
                 cc.tasks.push(C::Eval(index, Mode::Value));
@@ -2284,6 +2285,9 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                     let dst = self.reg(cc, Kind::V);
                     self.emit_unsize(code, cc, dst, src, n);
                     dst
+                }
+                AdjustKind::UnionInject { .. } | AdjustKind::UnionWiden => {
+                    return Err(unsupported("a structural union coercion in a constant"));
                 }
             };
             ty = next;
@@ -2581,6 +2585,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                         work.push(P::Pat { p: fp.pat, place: fpl, ty: ft, fail });
                     }
                 }
+                Pat::Record { .. } => return Err(unsupported("a structural record pattern in a constant")),
                 // The Reference, "Slice patterns": the elements before a `..` at their index,
                 // those after it counted from the end, and the `..` itself (a wildcard, or the
                 // pattern a `rest @ ..` binding is over) the part between, of the checker's type

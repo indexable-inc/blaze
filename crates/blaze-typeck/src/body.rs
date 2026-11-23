@@ -120,6 +120,9 @@ pub enum Expr {
     /// `fields` in `BodyView::field_inits`; what the fields it does not write are taken from
     /// in `base` ([`StructBase`]).
     Struct { path: PathIdx, fields: List, base: StructBase },
+    /// Anonymous structural record literal `{ a: 1, b: 2 }` or `{ a: 9, ..base }`.
+    /// `fields` in `BodyView::field_inits` in written order.
+    Record { fields: List, base: StructBase },
     Index { base: ExprId, index: ExprId },
     /// `params` in `pat_lists`; `param_tys` in `BodyView::opt_types`, one per param.
     /// `is_async`: `async |..| body`, whose call returns a future of `body` (and `ret`, when
@@ -226,7 +229,7 @@ pub struct BindAnn {
 pub enum Pat {
     Missing,
     Wild,
-    Bind { ann: BindAnn, name: Name, sub: Option<PatId> },
+    Bind { ann: BindAnn, name: Name, sub: Option<PatId>, ty: Option<PTy> },
     /// `rest` is the position of `..`, if any.
     Tuple { elems: List, rest: Option<u32> },
     Ref { mutbl: Mutbl, inner: PatId },
@@ -238,6 +241,8 @@ pub enum Pat {
     TupleStruct { path: PathIdx, elems: List, rest: Option<u32> },
     /// `fields` in `BodyView::field_pats`.
     Struct { path: PathIdx, fields: List, rest: bool },
+    /// Structural record pattern `{ a, b: p, .. }`; `fields` in `BodyView::field_pats`.
+    Record { fields: List, rest: bool },
     Or { alts: List },
     /// `elems` holds the `..` (a `Wild`, or `x @ ..`) at `rest`, if any.
     Slice { elems: List, rest: Option<u32> },
@@ -419,6 +424,9 @@ pub struct BodyView<'b> {
     /// The edition of each pattern's first word, as [`Self::expr_editions`] over pattern ids:
     /// the edition 2024 binding-mode errors are by it (rules/pat.rs).
     pub pat_editions: &'b [(PatId, Edition)],
+    /// Canonical lexicographically-sorted [`crate::ids::RecordSchema`] for each anonymous
+    /// `Expr::Record` literal, ascending by [`ExprId`].
+    pub record_expr_schemas: &'b [(ExprId, crate::ids::RecordSchema)],
 }
 
 /// The edition at `id` in the runs `runs` (rows `(first, edition)`, ascending), `body`
@@ -567,6 +575,12 @@ impl<'b> BodyView<'b> {
         edition_in(self.pat_editions, p, self.edition)
     }
 
+    /// The canonical [`crate::ids::RecordSchema`] recorded for anonymous record literal `e`.
+    pub(crate) fn record_expr_schema(&self, e: ExprId) -> Option<crate::ids::RecordSchema> {
+        let i = self.record_expr_schemas.binary_search_by_key(&e, |&(x, _)| x).ok()?;
+        self.record_expr_schemas.get(i).map(|&(_, s)| s)
+    }
+
     /// The expressions directly under `e`, pushed onto `out` in source order: a block's
     /// statements' initialisers and `else`s and its tail, a match's guards and arm bodies, a
     /// struct literal's field values and base, an `asm!`'s operand expressions. Patterns,
@@ -632,7 +646,7 @@ impl<'b> BodyView<'b> {
                 }
             }
             Expr::Repeat { elem, count, .. } => out.extend([elem].into_iter().chain(count)),
-            Expr::Struct { fields, base, .. } => {
+            Expr::Struct { fields, base, .. } | Expr::Record { fields, base } => {
                 for f in self.field_init_list(fields)? {
                     out.push(f.expr);
                 }

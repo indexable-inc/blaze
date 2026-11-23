@@ -61,6 +61,16 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
                 TyView::Tuple(l) if name.is_none() => {
                     if index < self.ty.list_len(l) { Some((self.ty.list_get(l, index), 0, index, false)) } else { None }
                 }
+                TyView::Record(schema, l) if name.is_some() => {
+                    if let Some(want) = name
+                        && let Some(at) = self.record_field_index(schema, want)
+                        && at < self.ty.list_len(l)
+                    {
+                        Some((self.ty.list_get(l, at), 0, at, false))
+                    } else {
+                        None
+                    }
+                }
                 TyView::Adt(k, args) => {
                     let Some(adt) = self.field_adt(k)? else { continue };
                     if !matches!(adt.kind, AdtKind::Struct | AdtKind::Union) {
@@ -98,7 +108,7 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
                 return Ok(Flow::Done(ty));
             }
         }
-        let primitive = !matches!(self.view(base_ty), TyView::Adt(..) | TyView::Ref(..) | TyView::Param(_));
+        let primitive = !matches!(self.view(base_ty), TyView::Adt(..) | TyView::Record(..) | TyView::Ref(..) | TyView::Param(_));
         let code = if limit {
             DiagCode::RecursionLimit
         } else if primitive && name.is_some() {
@@ -136,6 +146,11 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
                 TyView::Tuple(l) if variant.is_none() => {
                     let n = self.ty.list_len(l);
                     (0..n).find(|&i| Name::of_index(i) == want).map(|i| self.ty.list_get(l, i))
+                }
+                TyView::Record(schema, l) if variant.is_none() => {
+                    self.record_field_index(schema, want)
+                        .filter(|&i| i < self.ty.list_len(l))
+                        .map(|i| self.ty.list_get(l, i))
                 }
                 TyView::Adt(k, args) => match self.field_adt(k)? {
                     Some(adt) if adt.kind == AdtKind::Enum && variant.is_none() => {

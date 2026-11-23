@@ -1392,9 +1392,13 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     let body_sources = store.sources;
     let mut expand = ByName::with_names(&scoped, host, alloc);
     let mut values = ModuleValues { names, module, store: &mut *store, keys: &mut *keys, failed: None, krate, item, owner, text, blocks: None };
+    let extensions = names
+        .file_text(krate, 0)
+        .map(blaze_file_items::detect_blaze_extensions)
+        .unwrap_or(parser::Extensions::NONE);
     let lowered = match marks {
-        Some(marks) => blaze_lower::lower_body_expanding_marked(marks, edition, &mut CrateCfg(atoms), &mut values, &mut expand, alloc),
-        None => blaze_lower::lower_body_expanding(text, edition, &mut CrateCfg(atoms), &mut values, &mut expand, alloc),
+        Some(marks) => blaze_lower::lower_body_expanding_marked_with_extensions(marks, edition, extensions, &mut CrateCfg(atoms), &mut values, &mut expand, alloc),
+        None => blaze_lower::lower_body_expanding_with_extensions(text, edition, extensions, &mut CrateCfg(atoms), &mut values, &mut expand, alloc),
     };
     // D111: a body call's proc-macro read outside the member is a finding at the call, filed
     // through the item host's one filing (body_left.rs), whatever the body's own outcome.

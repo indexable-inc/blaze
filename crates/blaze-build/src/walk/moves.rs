@@ -504,7 +504,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 }
                 continue;
             }
-            if !matches!(pat, Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Slice { .. }) {
+            if !matches!(pat, Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Record { .. } | Pat::Slice { .. }) {
                 continue;
             }
             match self.ground_node(g).map_err(|error| Self::pat_ty_err(q, error))? {
@@ -556,7 +556,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                         todo.push((sub, self.layout_field_tys[row as usize], me, Some(step_of(row))));
                     }
                 }
-                Pat::Struct { fields, .. } => {
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                     let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
                     for fp in fps {
                         let row = (first..first + len)
@@ -1042,7 +1042,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     let subs = self.body.pat_lists.get(elems.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?;
                     todo.extend(subs.iter().map(|&s| (s, false)));
                 }
-                Pat::Struct { fields, .. } => {
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                     let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
                     todo.extend(fps.iter().map(|fp| (fp.pat, false)));
                 }

@@ -210,12 +210,16 @@ fn usize_literal(text: &str, r: Range) -> Result<Option<u128>, Why> {
     Ok(Some(value))
 }
 
+fn table_full() -> Why {
+    program(format!("the type table is full"), Range::new(0, 0))
+}
+
 pub fn intern(tys: &mut PortableTys<'_>, n: PNode) -> Result<PTy, Why> {
-    tys.intern(n).map_err(|_| program(format!("the type table is full"), Range::new(0, 0)))
+    tys.intern(n).map_err(|_| table_full())
 }
 
 pub fn intern_list(tys: &mut PortableTys<'_>, l: &[PTy]) -> Result<List, Why> {
-    tys.intern_list(l).map_err(|_| program(format!("the type table is full"), Range::new(0, 0)))
+    tys.intern_list(l).map_err(|_| table_full())
 }
 
 /// The heads the type builder reads: an item's generics, a trait's defaults and associated
@@ -1154,6 +1158,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     sorted_names.push(nm);
                 }
                 let schema = tc::RecordSchema::of_sorted_names(&sorted_names);
+                tys.register_record_schema(schema, &sorted_names).map_err(|_| table_full())?;
                 // `children()` already yields `kids` in canonical sorted field-name order.
                 let l = intern_list(tys, kids)?;
                 intern(tys, PNode::Record(schema, l))

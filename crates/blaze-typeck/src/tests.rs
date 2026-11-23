@@ -62,7 +62,7 @@ impl BodyBuf {
 
     fn bind(&mut self, name: u64) -> PatId {
         let at = self.pats.len() as u32;
-        self.pats.push(Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name(name), sub: None });
+        self.pats.push(Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name(name), sub: None, ty: None });
         self.pat_ranges.push(Range { start: at, end: at + 1 });
         PatId(at)
     }
@@ -104,6 +104,7 @@ impl BodyBuf {
             unsafe_blocks: &[],
             expr_editions: &[],
             pat_editions: &[],
+            record_expr_schemas: &[],
         }
     }
 }
@@ -757,4 +758,502 @@ fn record_schema_and_infer_non_unification() {
     let uni_var = cx.mk(TyView::Union(uni_var_fields)).expect("uni_var");
     assert!(cx.unify(uni, uni_var).expect("unify union"));
     assert_eq!(cx.shallow_resolve(v2), u8_ty);
+}
+
+/// Minimal allocator-backed world for unit-testing union coercions, union pattern narrowing,
+/// and structural records without `Global`.
+struct SigWorld<'a> {
+    owner: ItemKey,
+    types: crate::portable::PortableTys<'a>,
+    inputs: blaze_own::Vec<crate::portable::PTy, Alloc<'a>>,
+    output: crate::portable::PTy,
+}
+
+impl<'a> SigWorld<'a> {
+    fn new(
+        owner: ItemKey,
+        types: crate::portable::PortableTys<'a>,
+        inputs: &[crate::portable::PTy],
+        output: crate::portable::PTy,
+        alloc: Alloc<'a>,
+    ) -> SigWorld<'a> {
+        let mut ins = blaze_own::Vec::with_capacity_in(inputs.len(), alloc);
+        ins.extend_from_slice(inputs);
+        SigWorld { owner, types, inputs: ins, output }
+    }
+}
+
+impl crate::world::World for SigWorld<'_> {
+    fn fn_sig(&self, _: crate::world::Seal, item: ItemKey) -> crate::world::Fetch<Option<crate::world::FnSig<'_>>> {
+        if item != self.owner {
+            return Ok(None);
+        }
+        Ok(Some(crate::world::FnSig {
+            parent_count: 0,
+            own_count: 0,
+            declared_count: 0,
+            self_param: false,
+            header: crate::ids::FnPtrHeader::RUST,
+            inputs: &self.inputs,
+            output: self.output,
+            types: self.types.view(),
+            c_variadic: false,
+            legacy_const_generics: &[],
+        }))
+    }
+    fn predicates(&self, _: crate::world::Seal, _: ItemKey) -> crate::world::Fetch<crate::world::Predicates<'_>> {
+        Ok(crate::world::Predicates { clauses: &[], types: PTys::EMPTY })
+    }
+    fn adt(&self, _: crate::world::Seal, _: ItemKey) -> crate::world::Fetch<Option<crate::world::Adt<'_>>> {
+        Ok(None)
+    }
+    fn impls_of(&self, _: crate::world::Seal, _: ItemKey, _: crate::world::Shape) -> crate::world::Fetch<&[ItemKey]> {
+        Ok(&[])
+    }
+    fn impl_header(&self, _: crate::world::Seal, _: ItemKey) -> crate::world::Fetch<Option<crate::world::ImplHeader<'_>>> {
+        Ok(None)
+    }
+    fn inherent(&self, _: crate::world::Seal, _: crate::world::Shape, _: Name) -> crate::world::Fetch<&[crate::world::AssocItem]> {
+        Ok(&[])
+    }
+    fn assoc_item(&self, _: crate::world::Seal, _: ItemKey, _: Name) -> crate::world::Fetch<Option<crate::world::AssocItem>> {
+        Ok(None)
+    }
+    fn traits_in_scope(&self, _: crate::world::Seal, _: ScopeId) -> crate::world::Fetch<&[ItemKey]> {
+        Ok(&[])
+    }
+    fn resolve_path(&self, _: crate::world::Seal, _: ScopeId, _: crate::ids::PathIdx, _: &[Name]) -> crate::world::Fetch<crate::path_miss::PathAnswer> {
+        Ok(Err(crate::path_miss::PathMiss::Whole))
+    }
+    fn lang_item(&self, _: crate::world::Seal, _: crate::ids::LangItem) -> crate::world::Fetch<Option<ItemKey>> {
+        Ok(None)
+    }
+    fn lang_path(&self, _: crate::world::Seal, _: crate::ids::LangItem) -> crate::world::Fetch<Option<crate::world::Def>> {
+        Ok(None)
+    }
+    fn const_value(&self, _: crate::world::Seal, _: ItemKey) -> crate::world::Fetch<Option<u64>> {
+        Ok(None)
+    }
+    fn opaque_hidden(&self, _: crate::world::Seal, _: ItemKey) -> crate::world::Fetch<Option<crate::world::Hidden<'_>>> {
+        Ok(None)
+    }
+    fn closure(&self, _: crate::world::Seal, _: ItemKey, _: u32) -> crate::world::Fetch<Option<crate::world::ClosureFacts<'_>>> {
+        Ok(None)
+    }
+    fn attrs(&self, _: crate::world::Seal, _: ItemKey) -> crate::world::Fetch<crate::world::TypeAttrs> {
+        Ok(crate::world::TypeAttrs(0))
+    }
+    fn trait_def(&self, _: crate::world::Seal, _: ItemKey) -> crate::world::Fetch<Option<crate::world::TraitDef<'_>>> {
+        Ok(None)
+    }
+    fn assoc_parent(&self, _: crate::world::Seal, _: ItemKey) -> crate::world::Fetch<Option<crate::world::AssocParent>> {
+        Ok(None)
+    }
+    fn const_holds(&self, _: crate::world::Seal, _: ItemKey, _: &[crate::portable::PTy], _: PTys<'_>) -> crate::world::Fetch<crate::world::ConstHolds> {
+        Ok(crate::world::ConstHolds::Error)
+    }
+    fn const_params(&self, _: crate::world::Seal, _: ItemKey) -> crate::world::Fetch<crate::world::ConstParams<'_>> {
+        Ok(crate::world::ConstParams { params: &[], types: PTys::EMPTY })
+    }
+}
+
+fn run_sig_check<'a>(body: &BodyView<'_>, world: &SigWorld<'_>, alloc: Alloc<'a>) -> Checked<'a> {
+    let mut cx = InferCtx::new_in(alloc);
+    let hints = Needs::new_in(alloc);
+    match crate::check(body, world, &mut cx, &hints, alloc).expect("check ok") {
+        Outcome::Done(c) => c,
+        Outcome::Need(n) => panic!("unexpected need: {:?}", n.questions),
+    }
+}
+
+fn empty_body<'b>(owner: ItemKey, types: PTys<'b>, root: ExprId) -> BodyView<'b> {
+    BodyView {
+        owner,
+        edition: Edition::E2024,
+        params: &[],
+        root,
+        exprs: &[],
+        expr_ranges: &[],
+        pats: &[],
+        pat_ranges: &[],
+        stmts: &[],
+        expr_lists: &[],
+        pat_lists: &[],
+        stmt_lists: &[],
+        arms: &[],
+        field_inits: &[],
+        field_pats: &[],
+        paths: &[],
+        segments: &[],
+        segment_ranges: &[],
+        types,
+        type_lists: &[],
+        type_list_ranges: &[],
+        method_name_ranges: &[],
+        opt_types: &[],
+        fmt_uses: &[],
+        coroutine: None,
+        super_lets: &[],
+        asm_pieces: &[],
+        asm_operands: &[],
+        asm_clobbers: &[],
+        asm_text: "",
+        call_arg_ints: &[],
+        legacy_args: &[],
+        unsafe_blocks: &[],
+        expr_editions: &[],
+        pat_editions: &[],
+        record_expr_schemas: &[],
+    }
+}
+
+#[test]
+fn union_injection_coercion_and_rejection() {
+    use crate::body::{IntSuffix, Lit};
+    use crate::columns::AdjustKind;
+    use crate::diag::DiagCode;
+    use crate::ids::{IntTy, UintTy};
+    use crate::portable::{PNode, PortableTys};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let owner = ItemKey(1001);
+    let mut tys = PortableTys::new_in(alloc);
+    let i32_t = tys.intern(PNode::Int(IntTy::I32)).expect("i32");
+    let u8_t = tys.intern(PNode::Uint(UintTy::U8)).expect("u8");
+    let union_l = tys.intern_list(&[i32_t, u8_t]).expect("list");
+    let union_t = tys.intern(PNode::Union(union_l)).expect("union");
+
+    // 1. `42i32` coerces to `i32 | u8` via `UnionInject { variant: 0 }`.
+    let world = SigWorld::new(owner, tys, &[], union_t, alloc);
+    let exprs = [Expr::Lit(Lit::Int(Some(IntSuffix::Int(IntTy::I32))))];
+    let expr_ranges = [Range { start: 0, end: 5 }];
+    let mut bv = empty_body(owner, PTys::EMPTY, ExprId(0));
+    bv.exprs = &exprs;
+    bv.expr_ranges = &expr_ranges;
+    let checked = run_sig_check(&bv, &world, alloc);
+    assert!(checked.diags.is_empty(), "diags: {:?}", checked.diags);
+    assert_eq!(checked.adjusts.column::<0>(), &[ExprId(0)]);
+    assert_eq!(checked.adjusts.column::<1>(), &[AdjustKind::UnionInject { variant: 0 }]);
+
+    // Checked record round-trip preserves `AdjustKind::UnionInject`.
+    let bytes = crate::checked_record::encode(&checked, alloc).expect("encode");
+    let decoded = crate::checked_record::decode(&bytes, alloc).expect("decode");
+    assert!(checked.same_result(&decoded));
+
+    // 2. `7u8` coerces to `i32 | u8` via `UnionInject { variant: 1 }`.
+    let exprs2 = [Expr::Lit(Lit::Int(Some(IntSuffix::Uint(UintTy::U8))))];
+    bv.exprs = &exprs2;
+    let checked2 = run_sig_check(&bv, &world, alloc);
+    assert!(checked2.diags.is_empty(), "diags: {:?}", checked2.diags);
+    assert_eq!(checked2.adjusts.column::<1>(), &[AdjustKind::UnionInject { variant: 1 }]);
+
+    // 3. `true` (bool) does NOT coerce to `i32 | u8` -> Mismatch diagnostic.
+    let exprs3 = [Expr::Lit(Lit::Bool(true))];
+    bv.exprs = &exprs3;
+    let checked3 = run_sig_check(&bv, &world, alloc);
+    assert_eq!(checked3.diags.len(), 1);
+    assert_eq!(checked3.diags[0].code, DiagCode::Mismatch);
+}
+
+#[test]
+fn union_widening_coercion_and_rejection() {
+    use crate::columns::AdjustKind;
+    use crate::diag::DiagCode;
+    use crate::ids::{IntTy, UintTy};
+    use crate::portable::{PNode, PortableTys};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let owner = ItemKey(1002);
+    let mut tys = PortableTys::new_in(alloc);
+    let i32_t = tys.intern(PNode::Int(IntTy::I32)).expect("i32");
+    let u8_t = tys.intern(PNode::Uint(UintTy::U8)).expect("u8");
+    let bool_t = tys.intern(PNode::Bool).expect("bool");
+    let char_t = tys.intern(PNode::Char).expect("char");
+    let ab_l = tys.intern_list(&[i32_t, u8_t]).expect("ab");
+    let ab = tys.intern(PNode::Union(ab_l)).expect("A | B");
+    let abc_l = tys.intern_list(&[i32_t, u8_t, bool_t]).expect("abc");
+    let abc = tys.intern(PNode::Union(abc_l)).expect("A | B | C");
+    let ad_l = tys.intern_list(&[i32_t, char_t]).expect("ad");
+    let ad = tys.intern(PNode::Union(ad_l)).expect("A | D");
+
+    // 1. `fn f(x: i32 | u8) -> i32 | u8 | bool { x }` -> `UnionWiden`.
+    let world = SigWorld::new(owner, tys.fork_in(alloc).expect("fork"), &[ab], abc, alloc);
+    let pats = [Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of("x"), sub: None, ty: None }];
+    let pat_ranges = [Range { start: 0, end: 1 }];
+    let params = [PatId(0)];
+    let exprs = [Expr::Local(PatId(0))];
+    let expr_ranges = [Range { start: 2, end: 3 }];
+    let mut bv = empty_body(owner, PTys::EMPTY, ExprId(0));
+    bv.params = &params;
+    bv.pats = &pats;
+    bv.pat_ranges = &pat_ranges;
+    bv.exprs = &exprs;
+    bv.expr_ranges = &expr_ranges;
+    let checked = run_sig_check(&bv, &world, alloc);
+    assert!(checked.diags.is_empty(), "diags: {:?}", checked.diags);
+    assert_eq!(checked.adjusts.column::<0>(), &[ExprId(0)]);
+    assert_eq!(checked.adjusts.column::<1>(), &[AdjustKind::UnionWiden]);
+
+    // Round-trip `AdjustKind::UnionWiden` through `checked_record`.
+    let bytes = crate::checked_record::encode(&checked, alloc).expect("encode");
+    let decoded = crate::checked_record::decode(&bytes, alloc).expect("decode");
+    assert!(checked.same_result(&decoded));
+
+    // 2. `fn g(x: i32 | char) -> i32 | u8 | bool { x }` -> Mismatch (char not in target).
+    let world_bad = SigWorld::new(owner, tys, &[ad], abc, alloc);
+    let checked_bad = run_sig_check(&bv, &world_bad, alloc);
+    assert_eq!(checked_bad.diags.len(), 1);
+    assert_eq!(checked_bad.diags[0].code, DiagCode::Mismatch);
+}
+
+#[test]
+fn typed_union_pattern_and_residual_narrowing() {
+    use crate::body::{Arm, IntSuffix, Lit};
+    use crate::columns::UnionPat;
+    use crate::ids::{IntTy, Mutbl, UintTy};
+    use crate::portable::{PNode, PortableTys};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let owner = ItemKey(1003);
+
+    // Part A: `fn f(u: i32 | u8 | bool) -> u8 | bool { match u { a: i32 => 0u8, rest => rest } }`
+    let mut tys = PortableTys::new_in(alloc);
+    let i32_t = tys.intern(PNode::Int(IntTy::I32)).expect("i32");
+    let u8_t = tys.intern(PNode::Uint(UintTy::U8)).expect("u8");
+    let bool_t = tys.intern(PNode::Bool).expect("bool");
+    let u3_l = tys.intern_list(&[i32_t, u8_t, bool_t]).expect("u3");
+    let u3 = tys.intern(PNode::Union(u3_l)).expect("i32 | u8 | bool");
+    let u2_l = tys.intern_list(&[u8_t, bool_t]).expect("u2");
+    let u2 = tys.intern(PNode::Union(u2_l)).expect("u8 | bool");
+
+    let mut body_tys = PortableTys::new_in(alloc);
+    let body_i32 = body_tys.intern(PNode::Int(IntTy::I32)).expect("body i32");
+
+    let world = SigWorld::new(owner, tys.fork_in(alloc).expect("fork"), &[u3], u2, alloc);
+    let pats = [
+        Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of("u"), sub: None, ty: None },
+        Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of("a"), sub: None, ty: Some(body_i32) },
+        Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of("rest"), sub: None, ty: None },
+    ];
+    let pat_ranges = [Range { start: 0, end: 1 }, Range { start: 2, end: 8 }, Range { start: 9, end: 13 }];
+    let params = [PatId(0)];
+    let exprs = [
+        Expr::Local(PatId(0)),
+        Expr::Lit(Lit::Int(Some(IntSuffix::Uint(UintTy::U8)))),
+        Expr::Local(PatId(2)),
+        Expr::Match { scrutinee: ExprId(0), arms: List { start: 0, len: 2 } },
+    ];
+    let expr_ranges = [
+        Range { start: 14, end: 15 },
+        Range { start: 16, end: 19 },
+        Range { start: 20, end: 24 },
+        Range { start: 25, end: 40 },
+    ];
+    let arms = [
+        Arm { pat: PatId(1), guard: None, body: ExprId(1) },
+        Arm { pat: PatId(2), guard: None, body: ExprId(2) },
+    ];
+    let mut bv = empty_body(owner, body_tys.view(), ExprId(3));
+    bv.params = &params;
+    bv.pats = &pats;
+    bv.pat_ranges = &pat_ranges;
+    bv.exprs = &exprs;
+    bv.expr_ranges = &expr_ranges;
+    bv.arms = &arms;
+
+    let checked = run_sig_check(&bv, &world, alloc);
+    assert!(checked.diags.is_empty(), "diags: {:?}", checked.diags);
+    assert_eq!(checked.union_pat_of(PatId(1)), Some(UnionPat::Variant(0)));
+    assert_eq!(checked.union_pat_of(PatId(2)), Some(UnionPat::Residual));
+    let view = checked.types.view();
+    assert_eq!(view.node(checked.local_ty[1]), Ok(PNode::Int(IntTy::I32)));
+    let PNode::Union(rest_l) = view.node(checked.local_ty[2]).expect("rest node") else {
+        panic!("expected rest to narrow to a 2-member union, got {:?}", view.node(checked.local_ty[2]));
+    };
+    let rest_members = view.list(rest_l).expect("rest members");
+    assert_eq!(rest_members.len(), 2);
+    assert_eq!(view.node(rest_members[0]), Ok(PNode::Uint(UintTy::U8)));
+    assert_eq!(view.node(rest_members[1]), Ok(PNode::Bool));
+
+    // Round-trip `union_pats` through `checked_record`.
+    let bytes = crate::checked_record::encode(&checked, alloc).expect("encode");
+    let decoded = crate::checked_record::decode(&bytes, alloc).expect("decode");
+    assert!(checked.same_result(&decoded));
+
+    // Part B: single-member residual narrowing through `&`:
+    // `fn g(u: &(i32 | bool)) -> bool { match u { a: i32 => false, b => *b } }`
+    let u_ib_l = tys.intern_list(&[i32_t, bool_t]).expect("ib");
+    let u_ib = tys.intern(PNode::Union(u_ib_l)).expect("i32 | bool");
+    let ref_u_ib = tys.intern(PNode::Ref(Mutbl::Not, u_ib)).expect("&(i32 | bool)");
+    let world_b = SigWorld::new(owner, tys, &[ref_u_ib], bool_t, alloc);
+    let exprs_b = [
+        Expr::Local(PatId(0)),
+        Expr::Lit(Lit::Bool(false)),
+        Expr::Local(PatId(2)),
+        Expr::Unary { op: crate::body::UnOp::Deref, operand: ExprId(2) },
+        Expr::Match { scrutinee: ExprId(0), arms: List { start: 0, len: 2 } },
+    ];
+    let expr_ranges_b = [
+        Range { start: 14, end: 15 },
+        Range { start: 16, end: 21 },
+        Range { start: 22, end: 23 },
+        Range { start: 24, end: 26 },
+        Range { start: 27, end: 40 },
+    ];
+    let arms_b = [
+        Arm { pat: PatId(1), guard: None, body: ExprId(1) },
+        Arm { pat: PatId(2), guard: None, body: ExprId(3) },
+    ];
+    let mut bv_b = empty_body(owner, body_tys.view(), ExprId(4));
+    bv_b.params = &params;
+    bv_b.pats = &pats;
+    bv_b.pat_ranges = &pat_ranges;
+    bv_b.exprs = &exprs_b;
+    bv_b.expr_ranges = &expr_ranges_b;
+    bv_b.arms = &arms_b;
+    let checked_b = run_sig_check(&bv_b, &world_b, alloc);
+    assert!(checked_b.diags.is_empty(), "diags: {:?}", checked_b.diags);
+    assert_eq!(checked_b.union_pat_of(PatId(1)), Some(UnionPat::Variant(0)));
+    assert_eq!(checked_b.union_pat_of(PatId(2)), Some(UnionPat::Variant(1)));
+    let vb = checked_b.types.view();
+    let PNode::Ref(Mutbl::Not, a_inner) = vb.node(checked_b.local_ty[1]).expect("a ref") else {
+        panic!("expected a: &i32, got {:?}", vb.node(checked_b.local_ty[1]));
+    };
+    assert_eq!(vb.node(a_inner), Ok(PNode::Int(IntTy::I32)));
+    let PNode::Ref(Mutbl::Not, b_inner) = vb.node(checked_b.local_ty[2]).expect("b ref") else {
+        panic!("expected b: &bool, got {:?}", vb.node(checked_b.local_ty[2]));
+    };
+    assert_eq!(vb.node(b_inner), Ok(PNode::Bool));
+}
+
+#[test]
+fn structural_records_literal_field_update_and_destructure() {
+    use crate::body::{FieldInit, FieldPat, IntSuffix, Lit, StructBase};
+    use crate::ids::{IntTy, Mutbl, RecordSchema, UintTy};
+    use crate::portable::{PNode, PortableTys};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let owner = ItemKey(1004);
+    let mut tys = PortableTys::new_in(alloc);
+    let i32_t = tys.intern(PNode::Int(IntTy::I32)).expect("i32");
+    let u8_t = tys.intern(PNode::Uint(UintTy::U8)).expect("u8");
+    let sorted_names = [Name::of("a"), Name::of("b")];
+    let schema = RecordSchema::of_sorted_names(&sorted_names);
+    tys.register_record_schema(schema, &sorted_names).expect("register schema");
+    let rec_l = tys.intern_list(&[i32_t, u8_t]).expect("rec fields");
+    let rec_t = tys.intern(PNode::Record(schema, rec_l)).expect("rec");
+
+    // Body:
+    // fn f() -> { a: i32, b: u8 } {
+    //   let r = { b: 1u8, a: 2i32 };
+    //   let rr = &r;
+    //   let _x = rr.b;
+    //   let { a, .. } = r;
+    //   { a: a, ..r }
+    // }
+    let mut body_tys = PortableTys::new_in(alloc);
+    body_tys.register_record_schema(schema, &sorted_names).expect("register body schema");
+    let world = SigWorld::new(owner, tys, &[], rec_t, alloc);
+
+    let pats = [
+        // 0: r
+        Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of("r"), sub: None, ty: None },
+        // 1: rr
+        Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of("rr"), sub: None, ty: None },
+        // 2: _x
+        Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of("_x"), sub: None, ty: None },
+        // 3: a
+        Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of("a"), sub: None, ty: None },
+        // 4: { a, .. }
+        Pat::Record { fields: List { start: 0, len: 1 }, rest: true },
+    ];
+    let pat_ranges = [
+        Range { start: 0, end: 1 },
+        Range { start: 2, end: 4 },
+        Range { start: 5, end: 7 },
+        Range { start: 8, end: 9 },
+        Range { start: 10, end: 20 },
+    ];
+    let field_pats = [FieldPat { name: Name::of("a"), pat: PatId(3) }];
+
+    let exprs = [
+        // 0: 1u8
+        Expr::Lit(Lit::Int(Some(IntSuffix::Uint(UintTy::U8)))),
+        // 1: 2i32
+        Expr::Lit(Lit::Int(Some(IntSuffix::Int(IntTy::I32)))),
+        // 2: { b: 1u8, a: 2i32 }
+        Expr::Record { fields: List { start: 0, len: 2 }, base: StructBase::None },
+        // 3: r
+        Expr::Local(PatId(0)),
+        // 4: &r
+        Expr::Ref { mutbl: Mutbl::Not, operand: ExprId(3) },
+        // 5: rr
+        Expr::Local(PatId(1)),
+        // 6: rr.b
+        Expr::Field { base: ExprId(5), name: Name::of("b") },
+        // 7: r (for destructuring)
+        Expr::Local(PatId(0)),
+        // 8: a (for update)
+        Expr::Local(PatId(3)),
+        // 9: r (base for update)
+        Expr::Local(PatId(0)),
+        // 10: { a: a, ..r }
+        Expr::Record { fields: List { start: 2, len: 1 }, base: StructBase::Expr(ExprId(9)) },
+        // 11: block
+        Expr::Block { stmts: List { start: 0, len: 4 }, tail: Some(ExprId(10)), scope: ScopeId(0) },
+    ];
+    let mut expr_ranges = blaze_own::Vec::with_capacity_in(exprs.len(), alloc);
+    for i in 0..exprs.len() {
+        expr_ranges.push(Range { start: 100 + i as u32, end: 101 + i as u32 });
+    }
+    let field_inits = [
+        // Written in reversed order: b then a!
+        FieldInit { name: Name::of("b"), expr: ExprId(0) },
+        FieldInit { name: Name::of("a"), expr: ExprId(1) },
+        // Update init: a: a
+        FieldInit { name: Name::of("a"), expr: ExprId(8) },
+    ];
+    let stmts = [
+        Stmt::Let { pat: PatId(0), ty: None, init: Some(ExprId(2)), else_: None },
+        Stmt::Let { pat: PatId(1), ty: None, init: Some(ExprId(4)), else_: None },
+        Stmt::Let { pat: PatId(2), ty: None, init: Some(ExprId(6)), else_: None },
+        Stmt::Let { pat: PatId(4), ty: None, init: Some(ExprId(7)), else_: None },
+    ];
+    let stmt_lists = [StmtId(0), StmtId(1), StmtId(2), StmtId(3)];
+    let record_expr_schemas = [(ExprId(2), schema)];
+
+    let mut bv = empty_body(owner, body_tys.view(), ExprId(11));
+    bv.pats = &pats;
+    bv.pat_ranges = &pat_ranges;
+    bv.field_pats = &field_pats;
+    bv.exprs = &exprs;
+    bv.expr_ranges = &expr_ranges;
+    bv.field_inits = &field_inits;
+    bv.stmts = &stmts;
+    bv.stmt_lists = &stmt_lists;
+    bv.record_expr_schemas = &record_expr_schemas;
+
+    let checked = run_sig_check(&bv, &world, alloc);
+    assert!(checked.diags.is_empty(), "diags: {:?}", checked.diags);
+
+    let view = checked.types.view();
+    // Canonical schema names preserved in Checked::types!
+    assert_eq!(view.record_names(schema), Some(&sorted_names[..]));
+    // `rr.b` has type `u8` and field index 1 (since canonical order is a=0, b=1).
+    assert_eq!(view.node(checked.expr_ty[6]), Ok(PNode::Uint(UintTy::U8)));
+    assert_eq!(checked.fields.column::<0>(), &[ExprId(6)]);
+    assert_eq!(checked.fields.column::<2>(), &[1]);
+    // Destructured `a` has type `i32`.
+    assert_eq!(view.node(checked.local_ty[3]), Ok(PNode::Int(IntTy::I32)));
+    // Update `{ a: a, ..r }` takes unwritten field 1 (`b: u8`) from `r`.
+    let (fru_idx, fru_tys) = checked.fru_fields_of(ExprId(10));
+    assert_eq!(fru_idx, &[1]);
+    assert_eq!(fru_tys.len(), 1);
+    assert_eq!(view.node(fru_tys[0]), Ok(PNode::Uint(UintTy::U8)));
+
+    // Checked record round-trip preserves `record_schemas` + `record_names`!
+    let bytes = crate::checked_record::encode(&checked, alloc).expect("encode");
+    let decoded = crate::checked_record::decode(&bytes, alloc).expect("decode");
+    assert!(checked.same_result(&decoded));
+    assert_eq!(decoded.types.view().record_names(schema), Some(&sorted_names[..]));
 }

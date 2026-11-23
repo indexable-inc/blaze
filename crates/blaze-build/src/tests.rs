@@ -117,7 +117,7 @@ impl BodyBuf {
     }
 
     fn bind(&mut self, name: &str) -> PatId {
-        self.pat(Pat::Bind { ann: BindAnn { by_ref: None, mutable: true }, name: Name::of(name), sub: None })
+        self.pat(Pat::Bind { ann: BindAnn { by_ref: None, mutable: true }, name: Name::of(name), sub: None, ty: None })
     }
 
     fn pat_int(&mut self, value: u128) -> PatId {
@@ -246,6 +246,7 @@ impl BodyBuf {
             // A test body is one edition's text: no word of it was written by another's macro.
             expr_editions: &[],
             pat_editions: &[],
+            record_expr_schemas: &[],
         }
     }
 }
@@ -3100,7 +3101,7 @@ fn a_match_through_a_reference_binds_by_reference() {
     // Each match: `S(c) => c.x + plus, N => none`.
     let arms = |b: &mut BodyBuf, plus: u128, none: u128| -> List {
         // A plain `c`: edition 2024 refuses `mut` where the default binding mode is `ref`.
-        let c = b.pat(Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of("c"), sub: None });
+        let c = b.pat(Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of("c"), sub: None, ty: None });
         let s_path = b.path("S");
         let elems = b.pats_list(&[c]);
         let ps = b.pat(Pat::TupleStruct { path: s_path, elems, rest: None });

@@ -186,7 +186,9 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// 34: an impl's record holds its unstable members after its fn visibilities
 /// (`ImplHead::unstable`: each a name, its feature's text and an optional `implied_by` text;
 /// what method and path lookup's `World::member_unstable` reads).
-pub const VERSION: u32 = 34;
+/// 35: `T_RECORD` terms carry their canonical sorted field names so cross-item signatures keep
+/// `RecordSchema -> &[Name]` mappings.
+pub const VERSION: u32 = 35;
 /// The digest domains: the record's out digest, a fn text's check, the regions digest.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -1947,6 +1949,12 @@ impl Out<'_, '_, '_> {
             PNode::Record(s, l) => {
                 self.t8(T_RECORD);
                 self.terms.extend_from_slice(&s.0.to_le_bytes());
+                let names = self.tys.record_names(s).unwrap_or(&[]);
+                let n = u32::try_from(names.len()).map_err(|_| E::TooBig { what: "a record's field names" })?;
+                self.t32(n);
+                for &nm in names {
+                    self.terms.extend_from_slice(&nm.0.to_le_bytes());
+                }
                 self.tlist(l)?;
             }
             PNode::Union(l) => {
@@ -2500,6 +2508,14 @@ impl<'r> In<'r, '_, '_> {
             T_FOREIGN => PNode::Foreign(self.key("an extern type")?),
             T_RECORD => {
                 let s = blaze_typeck::RecordSchema(self.u64("a record's schema")?);
+                let n = self.u32("a record's field name count")?;
+                let mut names = Vec::with_capacity_in(usize::try_from(n).unwrap_or(0), self.tys.alloc());
+                for _ in 0..n {
+                    names.push(self.name("a record's field name")?);
+                }
+                if n > 0 || s == blaze_typeck::RecordSchema::EMPTY {
+                    self.tys.register_record_schema_shared(s, &names).map_err(E::Table)?;
+                }
                 PNode::Record(s, self.list("a record's fields")?)
             }
             T_UNION => PNode::Union(self.list("a union's members")?),
@@ -4267,5 +4283,17 @@ mod region_tests {
         );
         let control = filed([ASSOC_A, ASSOC_B], 1);
         assert!(control.is_ok(), "CONTROL: columns in name order were refused: {:?}", control.err().map(|e| std::format!("{e}")));
+    }
+
+    /// A head record written with the previous layout version (`34`) is rejected cleanly.
+    #[test]
+    fn previous_version_34_is_rejected() {
+        let t = tys();
+        let sig = ctor(&t);
+        let filed = every_part(&t, RRegion::Param(0));
+        let mut old = record(&t, &sig, Some(&filed));
+        old[4..8].copy_from_slice(&34u32.to_le_bytes());
+        let err = decode(&old, None, &tys_empty(), a()).err().expect("version 34 must be rejected");
+        assert_eq!(form_of(&err), Some(34));
     }
 }

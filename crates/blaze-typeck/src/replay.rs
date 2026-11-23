@@ -200,7 +200,7 @@ mod tests {
         Expr::Block { stmts: List::EMPTY, tail: Some(ExprId(1)), scope: ScopeId(0) },
     ];
     static EXPR_RANGES: [Range; 3] = [Range { start: 0, end: 1 }, Range { start: 1, end: 2 }, Range { start: 2, end: 3 }];
-    static PATS: [Pat; 1] = [Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name(0), sub: None }];
+    static PATS: [Pat; 1] = [Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name(0), sub: None, ty: None }];
     static PAT_RANGES: [Range; 1] = [Range { start: 0, end: 1 }];
     static PARAMS: [PatId; 1] = [PatId(0)];
 
@@ -242,6 +242,7 @@ mod tests {
             unsafe_blocks: &[],
             expr_editions: &[],
             pat_editions: &[],
+            record_expr_schemas: &[],
         }
     }
 

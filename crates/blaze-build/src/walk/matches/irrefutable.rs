@@ -148,7 +148,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     a.by_ref = false;
                     todo.push((inner, a, false));
                 }
-                Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Slice { .. } | Pat::Path(_) => {
+                Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Record { .. } | Pat::Slice { .. } | Pat::Path(_) => {
                     let behind = matches!(self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))?, PNode::Ref(..));
                     let a = self.peel(p, at)?;
                     let owned = owned && !behind;
@@ -309,6 +309,11 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     self.only_variant(p, g)?;
                     continue;
                 }
+                Pat::Record { fields, .. } => {
+                    let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a record pattern's fields past `field_pats`"))?;
+                    todo.extend(fps.iter().map(|fp| fp.pat));
+                    continue;
+                }
                 Pat::Or { .. } => {
                     return Err(BuildError::UnsupportedPat { pat: p, what: "an or-pattern in a `let` or parameter pattern" });
                 }
@@ -354,7 +359,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 Pat::Ref { .. } => {
                     return Err(BuildError::UnsupportedPat { pat: p, what: "a `&` pattern in a `let` without an initializer" });
                 }
-                Pat::Struct { fields, .. } => {
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                     let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
                     todo.extend(fps.iter().rev().map(|fp| fp.pat));
                     continue;
@@ -412,7 +417,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     fn left_out_drops(&mut self, p: PatId, g: PTy) -> Result<bool, BuildError> {
         let pat = self.pat(p)?;
         let variant = match pat {
-            Pat::Tuple { .. } => 0,
+            Pat::Tuple { .. } | Pat::Record { .. } => 0,
             Pat::TupleStruct { .. } | Pat::Struct { .. } => {
                 Self::def_variant(self.pat_def(p)).ok_or(malformed("a variant pattern the check did not resolve"))?
             }
@@ -438,7 +443,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     }
                 }
             }
-            Pat::Struct { fields, .. } => {
+            Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                 for row in first..first + len {
                     let name = self.layout_fields[row as usize].0;
                     let named = self
@@ -507,7 +512,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     let subs = self.body.pat_lists.get(elems.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?;
                     todo.extend(subs.iter().copied());
                 }
-                Pat::Struct { fields, .. } => {
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                     if let PNode::Ref(..) = self.ground_node(g).map_err(|error| Self::pat_ty_err(p, error))? {
                         continue;
                     }

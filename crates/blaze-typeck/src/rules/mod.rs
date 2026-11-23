@@ -87,6 +87,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             Expr::Array { elems } => self.expr_array(f, e, elems),
             Expr::Repeat { elem, len, count } => self.expr_repeat(f, e, elem, len, count),
             Expr::Struct { path, fields, base } => self.expr_struct(f, e, path, fields, base),
+            Expr::Record { fields, base } => self.expr_record(f, e, fields, base),
             Expr::Index { base, index } => self.expr_index(f, e, base, index),
             Expr::Closure { params, param_tys, ret, body, is_async, .. } => {
                 self.expr_closure(f, e, params, param_tys, ret, body, is_async)

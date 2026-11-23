@@ -80,7 +80,7 @@ impl Machine<'_, '_, '_> {
     fn hygienic_bind(&mut self, name: &str, mutable: bool, r: Range) -> PatId {
         let name = self.synth_name(name, r);
         let ann = BindAnn { by_ref: None, mutable };
-        self.put_pat(Pat::Bind { ann, name, sub: None, shadows: None }, r)
+        self.put_pat(Pat::Bind { ann, name, sub: None, shadows: None, ty: None }, r)
     }
 
     /// `Lang(elems..)` as a pattern.
@@ -258,7 +258,7 @@ impl Machine<'_, '_, '_> {
                 // `x: T` => `x: T`, then `let x = x;`, the written pattern kept.
                 Some(name) => {
                     let ann = BindAnn { by_ref: None, mutable: false };
-                    let param = self.put_pat(Pat::Bind { ann, name, sub: None, shadows: None }, pr);
+                    let param = self.put_pat(Pat::Bind { ann, name, sub: None, shadows: None, ty: None }, pr);
                     let init = self.hygienic_local(param, pr);
                     stmts.push(self.put_stmt(Stmt::Let { pat: orig, ty: None, init: Some(init), else_: None }));
                     params.push(param.0);

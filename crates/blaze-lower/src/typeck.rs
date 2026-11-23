@@ -411,6 +411,9 @@ pub struct TypeckBody<'a> {
     /// Every const term of the body left a hole ([`ConstGap`]), in the order met. Not empty:
     /// the body is checked, never checked clean.
     pub const_gaps: AVec<'a, ConstGap>,
+    /// Canonical lexicographically-sorted [`tc::RecordSchema`] for each anonymous `Expr::Record`,
+    /// ascending by [`ExprId`].
+    pub record_expr_schemas: AVec<'a, (ExprId, tc::RecordSchema)>,
 }
 
 impl<'a> TypeckBody<'a> {
@@ -452,6 +455,7 @@ impl<'a> TypeckBody<'a> {
             unsafe_blocks: &self.unsafe_blocks,
             expr_editions: &self.expr_editions,
             pat_editions: &self.pat_editions,
+            record_expr_schemas: &self.record_expr_schemas,
         }
     }
 }
@@ -1192,7 +1196,37 @@ impl Conv<'_, '_, '_, '_, '_> {
                 }
                 tc::Expr::Struct { path, fields: List { start, len: fields.len }, base }
             }
-            Expr::Record { .. } => return self.refuse("a structural record literal", r),
+            Expr::Record { fields, base } => {
+                let base = match base {
+                    StructBase::None => tc::StructBase::None,
+                    StructBase::Expr(b) => tc::StructBase::Expr(b),
+                    StructBase::Defaults => tc::StructBase::Defaults,
+                };
+                let start = len(self.out.field_inits.len());
+                let rows = self.v.rows(fields)?;
+                let alloc = self.tys.alloc();
+                let mut named = Vec::with_capacity_in(rows.len(), alloc);
+                for (i, &n) in rows.iter().enumerate() {
+                    let f = FieldInit::decode(n)?;
+                    let text = self.v.name_text(f.name)?;
+                    let name = self.name(f.name)?;
+                    self.out.field_inits.push(tc::FieldInit { name, expr: f.expr });
+                    named.push((text, i, name));
+                }
+                if matches!(base, tc::StructBase::None) {
+                    named.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+                    let mut sorted_names = Vec::with_capacity_in(named.len(), alloc);
+                    for &(_, _, nm) in named.iter() {
+                        sorted_names.push(nm);
+                    }
+                    let schema = tc::RecordSchema::of_sorted_names(&sorted_names);
+                    self.tys
+                        .register_record_schema(schema, &sorted_names)
+                        .map_err(|_| Refused::Check(tc::CheckError::Limit(tc::Limit::Table)))?;
+                    self.out.record_expr_schemas.push((e, schema));
+                }
+                tc::Expr::Record { fields: List { start, len: fields.len }, base }
+            }
             Expr::Index { base, index } => tc::Expr::Index { base, index },
             Expr::Closure { row } => {
                 let c = Closure::decode(self.v.row(row)?)?;
@@ -1309,7 +1343,7 @@ impl Conv<'_, '_, '_, '_, '_> {
         Ok(match self.v.pat(p)? {
             Pat::Missing => tc::Pat::Missing,
             Pat::Wild => tc::Pat::Wild,
-            Pat::Bind { ann, name, sub, .. } => tc::Pat::Bind { ann, name: self.name(name)?, sub },
+            Pat::Bind { ann, name, sub, ty, .. } => tc::Pat::Bind { ann, name: self.name(name)?, sub, ty: self.opt_ty(ty)? },
             Pat::Tuple { elems, rest } => tc::Pat::Tuple { elems: self.pats(elems)?, rest },
             Pat::Ref { mutbl, inner } => tc::Pat::Ref { mutbl, inner },
             Pat::Lit(l) => tc::Pat::Lit(self.lit(l, r)?),
@@ -1328,7 +1362,15 @@ impl Conv<'_, '_, '_, '_, '_> {
                 }
                 tc::Pat::Struct { path, fields: List { start, len: fields.len }, rest }
             }
-            Pat::Record { .. } => return self.refuse("a structural record pattern", r),
+            Pat::Record { fields, rest } => {
+                let start = len(self.out.field_pats.len());
+                for &n in self.v.rows(fields)? {
+                    let f = FieldPat::decode(n)?;
+                    let name = self.name(f.name)?;
+                    self.out.field_pats.push(tc::FieldPat { name, pat: f.pat });
+                }
+                tc::Pat::Record { fields: List { start, len: fields.len }, rest }
+            }
             Pat::Or { alts } => tc::Pat::Or { alts: self.pats(alts)? },
             Pat::Slice { elems, rest } => tc::Pat::Slice { elems: self.pats(elems)?, rest },
             Pat::Box(_) => return self.refuse("a box pattern", r),
@@ -1421,6 +1463,7 @@ pub fn to_typeck<'a>(
         coroutine: None,
         super_lets: crate::super_let::super_lets(view, alloc),
         const_gaps: Vec::new_in(alloc),
+        record_expr_schemas: Vec::new_in(alloc),
     };
     let mut slice_rest: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(view.pats.len(), alloc);
     slice_rest.resize(view.pats.len(), false);

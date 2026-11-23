@@ -64,7 +64,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
                 None => true,
             },
-            Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Slice { .. } | Pat::Range { .. } => true,
+            Pat::Tuple { .. }
+            | Pat::TupleStruct { .. }
+            | Pat::Struct { .. }
+            | Pat::Record { .. }
+            | Pat::Slice { .. }
+            | Pat::Range { .. } => true,
             Pat::Lit(l) | Pat::NegLit(l) => !matches!(l, Lit::Str | Lit::ByteStr(_) | Lit::CStr),
             Pat::Missing | Pat::Wild | Pat::Bind { .. } | Pat::Ref { .. } | Pat::Or { .. } => false,
         };
@@ -95,7 +100,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         match pat {
             Pat::Missing => Ok(self.common.err),
             Pat::Wild => Ok(expected),
-            Pat::Bind { ann, name, sub } => {
+            Pat::Bind { ann, name, sub, ty: None } => {
                 let explicit = ann.mutable || ann.by_ref.is_some();
                 // By the edition of the pattern's own words, not the body's (rustc
                 // migration.rs `emit`: a hard error when a label's span is
@@ -120,6 +125,95 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 self.local_ty[p.ix()] = local;
                 if let Some(sub) = sub {
                     self.push_pat(sub, expected, mode)?;
+                }
+                Ok(expected)
+            }
+            Pat::Bind { ann, name, sub, ty: Some(pty) } => {
+                let ann_ty = self.lower_body_ty(pty, at)?;
+                let mut cur_expected = self.try_structurally_resolve(expected)?;
+                let mut cur_mode = mode;
+                // Peel references on `expected` when it points to a structural union and the
+                // written type annotation itself is not a reference (so matching `&err` with
+                // `e: FsError` binds `e: &FsError`).
+                if !matches!(self.view(ann_ty), TyView::Ref(..)) && self.peels_to_union(cur_expected)? {
+                    for _ in 0..crate::machine::RECURSION_LIMIT {
+                        let t = self.try_structurally_resolve(cur_expected)?;
+                        match self.view(t) {
+                            TyView::Ref(m, inner) => {
+                                cur_mode = peeled_mode(cur_mode, m);
+                                cur_expected = inner;
+                            }
+                            _ => {
+                                cur_expected = t;
+                                break;
+                            }
+                        }
+                    }
+                }
+                let explicit = ann.mutable || ann.by_ref.is_some();
+                if explicit && cur_mode != 0 && self.body.pat_edition(p) >= Edition::E2024 {
+                    self.diag(DiagCode::BindingModifier2024, at, About::found_named(cur_expected, name));
+                }
+                let by_ref = match ann.by_ref {
+                    Some(m) => Some(m),
+                    None if ann.mutable => None,
+                    None => match cur_mode {
+                        1 => Some(Mutbl::Not),
+                        2 => Some(Mutbl::Mut),
+                        _ => None,
+                    },
+                };
+                let resolved = self.try_structurally_resolve(cur_expected)?;
+                if let TyView::Union(members) = self.view(resolved) {
+                    let n = self.ty.list_len(members);
+                    let mut matched: Option<u32> = None;
+                    let mut count = 0u32;
+                    for v in 0..n {
+                        let mv = self.ty.list_get(members, v);
+                        if self.probe(|m| m.unify(mv, ann_ty))? {
+                            matched = Some(v);
+                            count += 1;
+                            if count > 1 {
+                                break;
+                            }
+                        }
+                    }
+                    if count == 1
+                        && let Some(v) = matched
+                        && self.unify(self.ty.list_get(members, v), ann_ty)?
+                    {
+                        self.union_pats.push((p, crate::columns::UnionPat::Variant(v)));
+                        let local = match by_ref {
+                            Some(m) => self.mk(TyView::Ref(m, ann_ty))?,
+                            None => ann_ty,
+                        };
+                        if let Some(slot) = self.local_ty.get_mut(p.ix()) {
+                            *slot = local;
+                        }
+                        if let Some(sub) = sub {
+                            self.push_pat(sub, ann_ty, cur_mode)?;
+                        }
+                    } else {
+                        self.diag(DiagCode::Mismatch, at, About::types(resolved, ann_ty));
+                        if let Some(slot) = self.local_ty.get_mut(p.ix()) {
+                            *slot = self.common.err;
+                        }
+                        if let Some(sub) = sub {
+                            self.push_pat(sub, self.common.err, cur_mode)?;
+                        }
+                    }
+                } else {
+                    self.demand_eq(at, cur_expected, ann_ty)?;
+                    let local = match by_ref {
+                        Some(m) => self.mk(TyView::Ref(m, ann_ty))?,
+                        None => ann_ty,
+                    };
+                    if let Some(slot) = self.local_ty.get_mut(p.ix()) {
+                        *slot = local;
+                    }
+                    if let Some(sub) = sub {
+                        self.push_pat(sub, ann_ty, cur_mode)?;
+                    }
                 }
                 Ok(expected)
             }
@@ -249,6 +343,49 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
                 Ok(expected)
             }
+            Pat::Record { fields, rest } => {
+                let fps = self.body.field_pat_list(fields)?;
+                let t = self.structurally_resolve(expected, at)?;
+                let (schema, field_tys) = match self.view(t) {
+                    TyView::Record(schema, field_tys) => (schema, field_tys),
+                    TyView::Error => {
+                        for fp in fps.iter().rev() {
+                            self.push_pat(fp.pat, self.common.err, mode)?;
+                        }
+                        return Ok(expected);
+                    }
+                    _ => {
+                        self.diag(DiagCode::Mismatch, at, About::expected(expected));
+                        for fp in fps.iter().rev() {
+                            self.push_pat(fp.pat, self.common.err, mode)?;
+                        }
+                        return Ok(expected);
+                    }
+                };
+                let n = self.ty.list_len(field_tys);
+                let mut tys: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(fps.len(), self.alloc);
+                for fp in fps {
+                    match self.record_field_index(schema, fp.name) {
+                        Some(idx) if idx < n => tys.push(self.ty.list_get(field_tys, idx)),
+                        _ => {
+                            self.diag(DiagCode::NoField, At::Pat(fp.pat), About::found_named(t, fp.name));
+                            tys.push(self.common.err);
+                        }
+                    }
+                }
+                if !rest {
+                    let missing = self.record_names(schema).and_then(|names| {
+                        names.iter().copied().find(|&nm| !fps.iter().any(|fp| fp.name == nm))
+                    });
+                    if let Some(nm) = missing {
+                        self.diag(DiagCode::MissingFields, at, About::found_named(t, nm));
+                    }
+                }
+                for (fp, &ft) in fps.iter().zip(tys.iter()).rev() {
+                    self.push_pat(fp.pat, ft, mode)?;
+                }
+                Ok(expected)
+            }
             Pat::Or { alts } => {
                 let pats = self.body.pat_list(alts)?;
                 for &alt in pats.iter().rev() {
@@ -339,6 +476,19 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 Ok(expected)
             }
         }
+    }
+
+    /// Whether peeling zero or more references off `ty` reaches a structural union.
+    fn peels_to_union(&mut self, mut ty: Ty) -> Result<bool, Stop> {
+        for _ in 0..crate::machine::RECURSION_LIMIT {
+            let t = self.try_structurally_resolve(ty)?;
+            match self.view(t) {
+                TyView::Ref(_, inner) => ty = inner,
+                TyView::Union(_) => return Ok(true),
+                _ => return Ok(false),
+            }
+        }
+        Ok(false)
     }
 
     /// Pushes `pats` against the element types `tys`, `..` at `rest` skipping the middle

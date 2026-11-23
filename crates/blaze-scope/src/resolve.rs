@@ -2035,7 +2035,8 @@ fn walked_files<'a, S: SourceTexts<'a>, P: Par>(
     let unread = |error| NamesError::SourceUnread { krate: input.name, error };
     let root_text = sources.source(index, input.root).known().map_err(unread)?.ok_or(NamesError::RootNotRead { krate: input.name, path: input.root })?;
     let mut set = FileSet::new_in(alloc);
-    let root_file = set.add(file_of(input.root, root_text, outline(root_text, edition, alloc), input.shown_from, bump));
+    let root_outline = blaze_file_items::outline_auto_extensions(root_text, edition, blaze_file_items::Bodies::Skipped, alloc);
+    let root_file = set.add(file_of(input.root, root_text, root_outline, input.shown_from, bump));
     let mut root_dir = AString::from_str_in(input.root, alloc);
     pop_dir(&mut root_dir);
     let mut tried: HashMap<&'a str, (), Alloc<'a>> = HashMap::new_in(alloc);

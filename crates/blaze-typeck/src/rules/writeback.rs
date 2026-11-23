@@ -15,7 +15,7 @@
 
 use blaze_own::{Alloc, Soa, Vec};
 
-use crate::columns::{Adjusts, Callees, CapturePlaceRows, CaptureProjs, Captures, Checked, Closures, ConstArgs, ExprDefs, Fields, FruFields, PatConstArgs, PatDefs};
+use crate::columns::{Adjusts, Callees, CapturePlaceRows, CaptureProjs, Captures, Checked, Closures, ConstArgs, ExprDefs, Fields, FruFields, PatConstArgs, PatDefs, UnionPats};
 use crate::ty::ClosureKind;
 
 /// `Checked::selected`'s rows (impl-per-call).
@@ -406,6 +406,16 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             steps: 0,
             reported: false,
         };
+        for &(schema, list) in self.record_schemas.iter() {
+            let names = if list.len == 0 {
+                &[][..]
+            } else {
+                self.record_names.get(list.range()).unwrap_or(&[])
+            };
+            ex.out
+                .register_record_schema(schema, names)
+                .map_err(|_| CheckError::Limit(Limit::Table))?;
+        }
         let mut expr_ty: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(self.expr_ty.len(), alloc);
         for i in 0..self.expr_ty.len() {
             let t = self.expr_ty[i];
@@ -483,6 +493,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         expr_defs.sort_by_key(|rows, i| rows.column::<0>()[i]);
         pat_defs.sort_by_key(|rows, i| rows.column::<0>()[i]);
+        let mut union_pats: UnionPats<'a> = Soa::with_capacity_in(self.union_pats.len(), alloc);
+        for &(p, kind) in self.union_pats.iter() {
+            union_pats.push((p, kind));
+        }
+        union_pats.sort_by_key(|rows, i| rows.column::<0>().get(i).copied().unwrap_or(PatId(0)));
         let mut fields: Fields<'a> = Soa::with_capacity_in(self.fields.len(), alloc);
         for &(e, v, f) in self.fields.iter() {
             fields.push((e, v, f));
@@ -783,6 +798,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             const_args,
             pat_const_args,
             pat_defs,
+            union_pats,
             fields,
             captures,
             capture_places,

@@ -1204,7 +1204,7 @@ impl Bb {
     /// A binding pattern `name`.
     pub fn bind(&mut self, name: &str) -> PatId {
         let at = self.pats.len() as u32;
-        self.pats.push(Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of(name), sub: None });
+        self.pats.push(Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of(name), sub: None, ty: None });
         self.pat_ranges.push(Range { start: 1000 + at, end: 1001 + at });
         PatId(at)
     }
@@ -1280,7 +1280,7 @@ impl Bb {
     /// `name @ sub`: a binding with a subpattern (chrono's `Some(r @ 0..=99)`).
     pub fn bind_sub(&mut self, name: &str, sub: PatId) -> PatId {
         let at = self.pats.len() as u32;
-        self.pats.push(Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of(name), sub: Some(sub) });
+        self.pats.push(Pat::Bind { ann: BindAnn { by_ref: None, mutable: false }, name: Name::of(name), sub: Some(sub), ty: None });
         self.pat_ranges.push(Range { start: 1000 + at, end: 1001 + at });
         PatId(at)
     }
@@ -1490,6 +1490,7 @@ impl Bb {
             unsafe_blocks: &self.unsafe_blocks,
             expr_editions: &self.expr_editions,
             pat_editions: &self.pat_editions,
+            record_expr_schemas: &[],
         }
     }
 

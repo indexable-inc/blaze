@@ -54,7 +54,7 @@ impl Bb {
 
     /// A `mut name` binding.
     pub fn bind_mut(&mut self, name: &str) -> PatId {
-        self.push_pat(Pat::Bind { ann: BindAnn { by_ref: None, mutable: true }, name: Name::of(name), sub: None })
+        self.push_pat(Pat::Bind { ann: BindAnn { by_ref: None, mutable: true }, name: Name::of(name), sub: None, ty: None })
     }
 
     /// `&inner` (`m` is `Not`) or `&mut inner` (`Mut`).
@@ -64,7 +64,7 @@ impl Bb {
 
     /// A `ref name` (`m` is `Not`) or `ref mut name` (`Mut`) binding.
     pub fn bind_ref(&mut self, name: &str, m: Mutbl) -> PatId {
-        self.push_pat(Pat::Bind { ann: BindAnn { by_ref: Some(m), mutable: false }, name: Name::of(name), sub: None })
+        self.push_pat(Pat::Bind { ann: BindAnn { by_ref: Some(m), mutable: false }, name: Name::of(name), sub: None, ty: None })
     }
 
     /// `match scrutinee { pat if guard => body, .. }`: each arm's guard, if any.

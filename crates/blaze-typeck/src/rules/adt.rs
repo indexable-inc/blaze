@@ -22,7 +22,7 @@ use blaze_own::Alloc;
 use crate::body::Segment;
 use crate::diag::{About, At, DiagCode};
 use crate::error::{CheckError, Stop};
-use crate::ids::{ExprId, ItemKey, List, Name, PathIdx};
+use crate::ids::{ExprId, ItemKey, List, Name, PathIdx, RecordSchema};
 use crate::machine::{Expectation, Flow, Frame, Lower, Machine, Then};
 use crate::portable::PTy;
 use crate::ty::{Ty, TyList, TyView, TypeCtx};
@@ -453,6 +453,195 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             self.record_fru_fields(e, f.t, f.l, inits)?;
         }
         Ok(Flow::Done(f.t))
+    }
+
+    /// Structural record literal `{ b: 1u8, a: 2i32 }` and record update `{ a: 9, ..base }`.
+    /// States:
+    /// - 0: dispatch `StructBase::Expr` (push base -> state 1) vs `StructBase::None`/`Defaults`
+    ///   (expected record -> state 3, inferred anonymous record -> state 4).
+    /// - 1: base finished; resolve base record type, fall through to state 2.
+    /// - 2: check written fields against base record type, then record `fru_fields` and finish.
+    /// - 3: check written fields against expected record type, check missing fields, finish.
+    /// - 4: check written fields with no expectation, assemble canonical `TyView::Record`.
+    pub(crate) fn expr_record(
+        &mut self,
+        mut f: Frame,
+        e: ExprId,
+        fields: List,
+        base: crate::body::StructBase,
+    ) -> Result<Flow, Stop> {
+        use crate::body::StructBase;
+        let inits = self.body.field_init_list(fields)?;
+        if f.state == 0 {
+            let exp_rec = match f.expect.only_has_type() {
+                Some(t) => {
+                    let r = self.try_structurally_resolve(t)?;
+                    match self.view(r) {
+                        TyView::Record(_, l) => Some((r, l)),
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+            match base {
+                StructBase::Expr(base_expr) => {
+                    let base_expect = match exp_rec {
+                        Some((r, _)) => Expectation::HasType(r),
+                        None => Expectation::None,
+                    };
+                    self.resume(f, 1)?;
+                    self.push_expr(base_expr, base_expect, Then::Nothing)?;
+                    return Ok(Flow::Wait);
+                }
+                StructBase::None | StructBase::Defaults => {
+                    f.a = 0;
+                    if let Some((rec_ty, field_tys)) = exp_rec {
+                        f.t = rec_ty;
+                        f.l = field_tys;
+                        f.b = 0;
+                        f.state = 3;
+                    } else {
+                        f.b = 2;
+                        f.state = 4;
+                    }
+                }
+            }
+        }
+        if f.state == 1 {
+            let base_expr = base.expr().unwrap_or(e);
+            let base_ty = self.structurally_resolve(self.ret, At::Expr(base_expr))?;
+            match self.view(base_ty) {
+                TyView::Record(_, field_tys) => {
+                    if let Some(hint) = f.expect.only_has_type() {
+                        self.commit_if(|m| -> Result<Option<()>, Stop> {
+                            Ok(if m.unify(base_ty, hint)? { Some(()) } else { None })
+                        })?;
+                    }
+                    f.t = base_ty;
+                    f.l = field_tys;
+                    f.b = 0;
+                }
+                TyView::Error => {
+                    f.t = self.common.err;
+                    f.b = 1;
+                }
+                _ => {
+                    self.diag(DiagCode::Mismatch, At::Expr(base_expr), About::found(base_ty));
+                    f.t = self.common.err;
+                    f.b = 1;
+                }
+            }
+            f.a = 0;
+            f.state = 2;
+        }
+        if f.state == 2 || f.state == 3 {
+            let cur_state = f.state;
+            if let Some(init) = usize::try_from(f.a).ok().and_then(|i| inits.get(i)).copied() {
+                f.a += 1;
+                let to = if f.b == 0
+                    && let TyView::Record(schema, field_tys) = self.view(f.t)
+                    && let Some(idx) = self.record_field_index(schema, init.name)
+                    && idx < self.ty.list_len(field_tys)
+                {
+                    Some(self.ty.list_get(field_tys, idx))
+                } else {
+                    None
+                };
+                self.resume(f, cur_state)?;
+                match to {
+                    Some(t) => self.push_coercible(init.expr, t)?,
+                    None => {
+                        if f.b == 0 {
+                            self.diag(DiagCode::NoField, At::Expr(init.expr), About::found_named(f.t, init.name));
+                        }
+                        self.push_expr(init.expr, Expectation::None, Then::Nothing)?;
+                    }
+                }
+                return Ok(Flow::Wait);
+            }
+            if f.b == 0
+                && let TyView::Record(schema, field_tys) = self.view(f.t)
+            {
+                if cur_state == 2 {
+                    let n = self.ty.list_len(field_tys);
+                    let mut unwritten: blaze_own::Vec<u32, Alloc<'a>> = blaze_own::Vec::new_in(self.alloc);
+                    if let Some(names) = self.record_names(schema) {
+                        for (i, &nm) in names.iter().enumerate() {
+                            if !inits.iter().any(|w| w.name == nm)
+                                && let Ok(idx) = u32::try_from(i)
+                            {
+                                unwritten.push(idx);
+                            }
+                        }
+                    }
+                    for idx in unwritten {
+                        if idx < n {
+                            let t = self.ty.list_get(field_tys, idx);
+                            self.fru_fields.push((e, idx, t));
+                        }
+                    }
+                } else {
+                    let missing = self.record_names(schema).and_then(|names| {
+                        names.iter().copied().find(|&nm| !inits.iter().any(|i| i.name == nm))
+                    });
+                    if let Some(nm) = missing {
+                        self.diag(DiagCode::MissingFields, At::Expr(e), About::found_named(f.t, nm));
+                    }
+                }
+            }
+            return Ok(Flow::Done(f.t));
+        }
+        // State 4: inferred anonymous record literal `{ b: 1u8, a: 2i32 }`.
+        if let Some(init) = usize::try_from(f.a).ok().and_then(|i| inits.get(i)).copied() {
+            f.a += 1;
+            self.resume(f, 4)?;
+            self.push_expr(init.expr, Expectation::None, Then::Nothing)?;
+            return Ok(Flow::Wait);
+        }
+        let schema = match self.body.record_expr_schema(e) {
+            Some(s) => s,
+            None => self.infer_record_schema(inits)?,
+        };
+        let field_count = self.record_names(schema).map_or(inits.len(), |ns| ns.len());
+        let mut canonical: blaze_own::Vec<Ty, Alloc<'a>> = blaze_own::Vec::with_capacity_in(field_count, self.alloc);
+        canonical.resize(field_count, self.common.err);
+        for init in inits {
+            if let Some(idx) = self.record_field_index(schema, init.name)
+                && let Some(ix) = usize::try_from(idx).ok()
+                && let Some(slot) = canonical.get_mut(ix)
+                && let Some(&ety) = self.expr_ty.get(init.expr.ix())
+            {
+                *slot = ety;
+            }
+        }
+        let list = self.mk_list(&canonical)?;
+        Ok(Flow::Done(self.mk(TyView::Record(schema, list))?))
+    }
+
+    /// Fallback canonical schema lookup/creation for hand-built unit-test bodies without
+    /// `BodyView::record_expr_schemas`: reuses any already-registered schema matching the exact
+    /// set of field names, otherwise sorts by `Name` and registers a fresh schema.
+    fn infer_record_schema(&mut self, inits: &[crate::body::FieldInit]) -> Result<RecordSchema, Stop> {
+        if inits.is_empty() {
+            self.register_record_schema(RecordSchema::EMPTY, &[])?;
+            return Ok(RecordSchema::EMPTY);
+        }
+        for &(schema, list) in self.record_schemas.iter() {
+            let Some(names) = self.record_names.get(list.range()) else { continue };
+            if names.len() == inits.len() && names.iter().all(|&nm| inits.iter().any(|w| w.name == nm)) {
+                return Ok(schema);
+            }
+        }
+        let mut names: blaze_own::Vec<Name, Alloc<'a>> = blaze_own::Vec::with_capacity_in(inits.len(), self.alloc);
+        for init in inits {
+            if !names.contains(&init.name) {
+                names.push(init.name);
+            }
+        }
+        names.sort_unstable();
+        let schema = RecordSchema::of_sorted_names(&names);
+        self.register_record_schema(schema, &names)?;
+        Ok(schema)
     }
 
     /// `fru_field_types`: after the base of `S { a: x, ..base }` unified with `S<args>`, one

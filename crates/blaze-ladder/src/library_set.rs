@@ -58,7 +58,7 @@ pub fn library_of(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>, panic
 /// `extern crate core|alloc|std`. The one rule [`library_of`] and blaze-cli's names task (which
 /// sysroot crates a workspace crate is handed) both take, so the run and the check agree.
 pub fn root_names_toolchain(text: &str, edition: blaze_surface::Edition, cfg: &blaze_scope::task::Cfg<'_, '_>, alloc: Alloc<'_>) -> bool {
-    let outline = blaze_file_items::outline(text, edition, alloc);
+    let outline = blaze_file_items::outline_auto_extensions(text, edition, blaze_file_items::Bodies::Skipped, alloc);
     let attrs = blaze_scope::task::file_attrs(cfg, &outline, text, alloc);
     if !attrs.no_core {
         return true;

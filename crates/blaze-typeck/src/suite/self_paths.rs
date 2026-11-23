@@ -446,6 +446,7 @@ fn self_struct_variant() {
         ann: crate::body::BindAnn { by_ref: None, mutable: false },
         name: crate::ids::Name::of(name),
         sub: None,
+        ty: None,
     };
     let pats = [
         bind("e"),

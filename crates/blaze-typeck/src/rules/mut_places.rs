@@ -306,7 +306,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
                 Pat::Or { alts } => work.extend_from_slice(body.pat_list(alts)?),
                 Pat::Ref { inner, .. } => work.push(inner),
-                Pat::Struct { fields, .. } => {
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                     for fp in body.field_pat_list(fields)? {
                         work.push(fp.pat);
                     }

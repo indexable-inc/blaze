@@ -77,6 +77,7 @@ pub const fn expr_form(e: &Expr) -> &'static str {
         Expr::Array { .. } => "an array",
         Expr::Repeat { .. } => "an array repeat",
         Expr::Struct { .. } => "a struct expression",
+        Expr::Record { .. } => "a record expression",
         Expr::Index { .. } => "an index",
         Expr::Closure { .. } => "a closure",
         Expr::FormatArgs { .. } => "a `format_args!`",
@@ -102,6 +103,7 @@ pub const fn pat_form(p: &Pat) -> &'static str {
         Pat::Path(_) => "a path pattern",
         Pat::TupleStruct { .. } => "a tuple-struct pattern",
         Pat::Struct { .. } => "a struct pattern",
+        Pat::Record { .. } => "a record pattern",
         Pat::Or { .. } => "an or-pattern",
         Pat::Slice { .. } => "a slice pattern",
         Pat::Range { .. } => "a range pattern",
@@ -430,6 +432,7 @@ impl Sketch<'_, '_, '_, '_> {
                         Expr::Continue { .. } => self.out.write_str("continue")?,
                         Expr::Underscore => self.out.write_str("_")?,
                         Expr::Block { .. } => self.out.write_str("{ .. }")?,
+                        Expr::Record { .. } => self.out.write_str("{ .. }")?,
                         Expr::ConstBlock { .. } => self.out.write_str("const { .. }")?,
                         Expr::Loop { .. } => self.out.write_str("loop { .. }")?,
                         Expr::AsyncBlock { .. } => self.out.write_str("async { .. }")?,
@@ -482,6 +485,7 @@ impl Sketch<'_, '_, '_, '_> {
                             self.path(path)?;
                             self.out.write_str(" { .. }")?;
                         }
+                        Pat::Record { .. } => self.out.write_str("{ .. }")?,
                         Pat::Or { alts } => {
                             let _ = stack.push(SketchTask::PatList { list: alts, next: 0, sep: " | ", depth: d });
                         }
