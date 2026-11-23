@@ -8,7 +8,7 @@ blaze-arrow-ipc	51
 blaze-ask	6
 blaze-audit	30
 blaze-blake3	1
-blaze-bstd-convert	102
+blaze-bstd-convert	41
 blaze-build	12
 blaze-build-script	22
 blaze-c	2
@@ -30,7 +30,7 @@ blaze-fetch	12
 blaze-file-items	6
 blaze-flow	12
 blaze-flow-lower	2
-blaze-fmt	124
+blaze-fmt	72
 blaze-format-tiers	1
 blaze-fuzz	1
 blaze-git-fetch	13
@@ -45,7 +45,7 @@ blaze-inproc	3
 blaze-json	9
 blaze-keyed	4
 blaze-kit	15
-blaze-ladder	144
+blaze-ladder	58
 blaze-launch	4
 blaze-launch-rt	5
 blaze-launcher	2
@@ -61,11 +61,10 @@ blaze-native	1
 blaze-new	7
 blaze-own	90
 blaze-pack	1
-blaze-parquet	96
 blaze-pg	2
-blaze-proc-macro	158
+blaze-proc-macro	83
 blaze-producers	12
-blaze-profile	168
+blaze-profile	118
 blaze-protocol	10
 blaze-radix	5
 blaze-real	46

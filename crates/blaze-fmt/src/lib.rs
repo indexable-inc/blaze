@@ -290,6 +290,9 @@ pub struct FormatReport {
     non_formatted_ranges: Vec<(usize, usize)>,
 }
 
+impl blaze_own::Share for FormatReport {}
+impl blaze_own::LocalShare for FormatReport {}
+
 impl FormatReport {
     fn new() -> FormatReport {
         FormatReport {

@@ -223,7 +223,7 @@ impl<'a, T: FormatHandler + 'a> FormatContext<'a, T> {
             &self.psess,
             self.config,
             &snippet_provider,
-            self.report.clone(),
+            blaze_own::LocalShare::local_share(&self.report),
         );
         visitor.skip_context.update_with_attrs(&self.krate.attrs);
         visitor.is_macro_def = is_macro_def;
@@ -267,12 +267,12 @@ impl<'a, T: FormatHandler + 'a> FormatContext<'a, T> {
             self.report.add_macro_format_failure();
         }
         self.report
-            .add_non_formatted_ranges(visitor.skipped_range.borrow().clone());
+            .add_non_formatted_ranges(core::mem::take(&mut *visitor.skipped_range.borrow_mut()));
 
         self.handler.handle_formatted_file(
             &self.psess,
             path,
-            visitor.buffer.to_owned(),
+            core::mem::take(&mut visitor.buffer),
             &mut self.report,
         )
     }

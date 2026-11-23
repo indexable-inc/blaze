@@ -1004,14 +1004,14 @@ pub(super) fn persist(dir: &Path, blaze: &str, process: &str) -> Result<(), Post
         return Err(PostmortemError::AlreadyPersisted { path: mapping.path.clone() });
     }
     let counting_copies = super::FRAME_COPIED.get().is_some();
-    let made = Mapping::create(dir, std::process::id(), blaze, process, counting_copies)?;
+    let mut made = Mapping::create(dir, std::process::id(), blaze, process, counting_copies)?;
     made.set_clock(&clock::Scale::now());
     {
         // Under `RINGS`'s lock no thread makes a ring: every ring made so far gets its store
         // before any made from here on (`store_for`) can take one.
         let rings = lock(&RINGS);
         if rings.len() > MAPPED_RINGS {
-            let path = made.path.clone(); // alloc: an error
+            let path = core::mem::take(&mut made.path);
             drop(made);
             _ = fs::remove_file(&path);
             return Err(PostmortemError::Full {
@@ -1023,16 +1023,15 @@ pub(super) fn persist(dir: &Path, blaze: &str, process: &str) -> Result<(), Post
         // A store for each ring made so far, before any ring moves: a full disk fails the
         // whole of it here, with no ring left half way between the heap and the file.
         if let Err(error) = made.reserve(rings.len()) {
-            let path = made.path.clone(); // alloc: an error
+            let path = core::mem::take(&mut made.path);
             drop(made);
             _ = fs::remove_file(&path);
             return Err(error);
         }
-        if let Err(made) = MAPPING.set(made) {
+        if let Err(mut made) = MAPPING.set(made) {
             // Another thread persisted meanwhile (its lock on the one file of this pid would
             // have refused this one's `create` first): the file is the winner's, left as it is.
-            // alloc: an error
-            return Err(PostmortemError::AlreadyPersisted { path: made.path.clone() });
+            return Err(PostmortemError::AlreadyPersisted { path: core::mem::take(&mut made.path) });
         }
         let Some(mapping) = MAPPING.get() else { return Ok(()) };
         // One no thread holds has no writer and moves here; one a thread holds moves as its

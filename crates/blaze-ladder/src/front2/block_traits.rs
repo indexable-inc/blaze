@@ -104,7 +104,7 @@ pub struct BlockTraits {
 impl BlockTraits {
     /// Every block answers the module's traits.
     pub fn module(alloc: Alloc<'static>) -> BlockTraits {
-        BlockTraits { default: None, scopes: AVec::new_in(alloc.clone()), keys: AVec::new_in(alloc) }
+        BlockTraits { default: None, scopes: AVec::new_in(alloc), keys: AVec::new_in(alloc) }
     }
 
     /// The traits in scope at block `scope` of the body.
@@ -123,8 +123,8 @@ impl BlockTraits {
     /// `own` is in scope in every block too (a member's own trait, [`super::own_trait`]): each
     /// kept list gets it, still sorted; lists shared by blocks stay shared.
     pub fn add(&mut self, own: ItemKey, alloc: Alloc<'static>) {
-        let mut keys: AVec<'static, ItemKey> = AVec::new_in(alloc.clone());
-        let mut scopes: AVec<'static, (u32, At)> = AVec::with_capacity_in(self.scopes.len(), alloc.clone());
+        let mut keys: AVec<'static, ItemKey> = AVec::new_in(alloc);
+        let mut scopes: AVec<'static, (u32, At)> = AVec::with_capacity_in(self.scopes.len(), alloc);
         // Old range to new, for each distinct range met.
         let mut moved: AVec<'_, (u32, u32, u32, u32)> = AVec::new_in(alloc);
         let mut redo = |at: At, keys: &mut AVec<'static, ItemKey>| -> At {
@@ -195,7 +195,7 @@ impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
         // The mark of the path's first segment: the row's, or, once that segment is taken
         // through a block import, that import's (its path's first segment is first then).
         let mut first_mark = row.first_mark;
-        let mut path: AVec<'_, &str> = AVec::new_in(alloc.clone());
+        let mut path: AVec<'_, &str> = AVec::new_in(alloc);
         path.extend_from_slice(row.path);
         // Where the path is walked: the body's module, or the block module of the block `mod`
         // or `extern crate` its first segment names (the scope table's, `Row::module`).
@@ -217,7 +217,7 @@ impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
                     if steps > MOST_CHAIN {
                         return Err(Self::gap(row, CHAIN));
                     }
-                    let mut through: AVec<'_, &str> = AVec::new_in(alloc.clone());
+                    let mut through: AVec<'_, &str> = AVec::new_in(alloc);
                     through.extend_from_slice(local.path);
                     through.extend_from_slice(&path[1..]);
                     path = through;
@@ -245,7 +245,7 @@ impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
         let krate_key = self.names.crate_key(krate).ok_or(Self::gap(row, UNRESOLVED))?;
         // A `$crate` (or an opaque `crate`) a macro wrote names the macro's crate, by its mark
         // (`Row::first_mark`): read as the names library reads a module's `use`.
-        let written = to_path_marked(abs, &path, first_mark, krate_key, alloc.clone());
+        let written = to_path_marked(abs, &path, first_mark, krate_key, alloc);
         let w = Written { kind: written.kind, segments: &written.segments };
         if row.name == GLOB {
             return self.glob(row, w, krate, at, out, alloc);
@@ -357,7 +357,7 @@ impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
         for _ in 0..=body.parents.len() {
             let Some(h) = here else { break };
             for row in body.rows.iter().filter(|r| r.scope == h) {
-                if let Err(g) = self.row(owner, row, out, alloc.clone()) {
+                if let Err(g) = self.row(owner, row, out, alloc) {
                     refused = refused.or(Some(g));
                 }
             }
@@ -385,7 +385,7 @@ fn keep_list(keys: &mut AVec<'static, ItemKey>, last: &mut Option<(u32, u32)>, l
 /// `krate`) whose list is not `module_traits` (sorted checker keys, the body's `traits`).
 /// Every kept list is in `alloc`; the scratch too.
 pub fn of<'n, S: NamesSource<'n>>(names: S, locals: &Locals<'n>, owner: ItemKey, module: LibKey, krate: usize, module_traits: &[ItemKey], alloc: Alloc<'static>) -> BlockTraits {
-    let mut out = BlockTraits::module(alloc.clone());
+    let mut out = BlockTraits::module(alloc);
     let body = locals.body(owner);
     if body.is_none() && locals.head(owner).is_none() {
         return out;
@@ -393,7 +393,7 @@ pub fn of<'n, S: NamesSource<'n>>(names: S, locals: &Locals<'n>, owner: ItemKey,
     let reader = Reader { names, locals, module, rank: names.edition_of(krate).map(prelude_rank) };
     // The base: the module's traits and those of the blocks around the body's item, when the
     // body is a local item's (its declaration's block, then each block and item outward).
-    let mut base: AVec<'static, ItemKey> = AVec::new_in(alloc.clone());
+    let mut base: AVec<'static, ItemKey> = AVec::new_in(alloc);
     base.extend_from_slice(module_traits);
     let mut base_refused: Option<LocalGap> = None;
     let mut cur = owner;
@@ -405,7 +405,7 @@ pub fn of<'n, S: NamesSource<'n>>(names: S, locals: &Locals<'n>, owner: ItemKey,
             break;
         }
         if let Some(b) = locals.body(h.enclosing) {
-            if let Some(g) = reader.chain(h.enclosing, b, h.scope, &mut base, alloc.clone()) {
+            if let Some(g) = reader.chain(h.enclosing, b, h.scope, &mut base, alloc) {
                 base_refused = base_refused.or(Some(g));
             }
         }
@@ -422,13 +422,13 @@ pub fn of<'n, S: NamesSource<'n>>(names: S, locals: &Locals<'n>, owner: ItemKey,
     let Some(b) = body else { return out };
     // Each block's own rows, read once: `own[s]` is its range in `own_keys` and its refusal.
     let blocks = b.parents.len();
-    let mut own_keys: AVec<'_, ItemKey> = AVec::new_in(alloc.clone());
-    let mut own: AVec<'_, (u32, u32, Option<LocalGap>)> = AVec::with_capacity_in(blocks, alloc.clone());
+    let mut own_keys: AVec<'_, ItemKey> = AVec::new_in(alloc);
+    let mut own: AVec<'_, (u32, u32, Option<LocalGap>)> = AVec::with_capacity_in(blocks, alloc);
     for s in 0..blocks {
         let start = own_keys.len() as u32;
         let mut refused = None;
         for row in b.rows.iter().filter(|r| r.scope == s as u32) {
-            if let Err(g) = reader.row(owner, row, &mut own_keys, alloc.clone()) {
+            if let Err(g) = reader.row(owner, row, &mut own_keys, alloc) {
                 refused = refused.or(Some(g));
             }
         }
@@ -436,8 +436,8 @@ pub fn of<'n, S: NamesSource<'n>>(names: S, locals: &Locals<'n>, owner: ItemKey,
     }
     // Each block's answer: `None` is the default's. A block that adds nothing answers as its
     // parent does.
-    let mut answer: AVec<'_, Option<At>> = AVec::with_capacity_in(blocks, alloc.clone());
-    let mut list: AVec<'_, ItemKey> = AVec::new_in(alloc.clone());
+    let mut answer: AVec<'_, Option<At>> = AVec::with_capacity_in(blocks, alloc);
+    let mut list: AVec<'_, ItemKey> = AVec::new_in(alloc);
     for s in 0..blocks {
         let (start, end, refused) = own[s];
         let parent = b.parents[s];

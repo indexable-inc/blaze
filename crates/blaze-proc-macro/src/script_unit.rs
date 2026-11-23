@@ -357,7 +357,7 @@ pub fn prepare_viewing_on<'a>(
         c_mode: setting.c_mode,
         limits: RunLimits::STANDARD,
         table: Arc::clone(&setting.table),
-        probes: setting.probes.clone(),
+        probes: setting.probes.as_ref().map(blaze_own::Share::share),
         spawner: None,
         step: blaze_ids::ContentId::default(),
         spawn_setting: Arc::clone(&setting.spawn_setting),
@@ -530,7 +530,7 @@ pub fn served_links<'g, 'r: 'g>(graph: &UnitGraph<'_>, script: UnitId, given: &'
         let ups: Vec<(&str, &DepProducer)> =
             links_inputs(graph, id).into_iter().filter_map(|(up, links)| made.iter().find(|(s, _)| *s == up).map(|(_, producer)| (links, producer))).collect();
         let upstream = DepProducer::closure(&ups);
-        made.push((id, DepProducer::of_record(run.tree.clone(), run.root.clone(), &run.outputs).with_upstream(upstream)));
+        made.push((id, DepProducer::of_record(blaze_own::Share::share(&run.tree), blaze_own::Share::share(&run.root), &run.outputs).with_upstream(upstream)));
     }
     let producers = given
         .iter()
@@ -676,7 +676,7 @@ pub fn outputs_by_served<'a>(
         };
         // Brief S1b: what is upstream of this script, for its readers (a forwarded path).
         let upstream = DepProducer::closure(&given);
-        let ran = outputs_viewing(runtime, setting, graph, script, tree.clone(), root.clone(), &deps, &given, alloc);
+        let ran = outputs_viewing(runtime, setting, graph, script, blaze_own::Share::share(&tree), blaze_own::Share::share(&root), &deps, &given, alloc);
         match ran {
             Ok(ran) => {
                 if graph.units[serves.index()].links.is_some() {

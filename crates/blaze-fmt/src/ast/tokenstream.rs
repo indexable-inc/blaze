@@ -145,6 +145,8 @@ static EMPTY_TOKEN_STREAM: LazyLock<TokenStream> =
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TokenStream(Arc<Vec<TokenTree>>);
 
+impl blaze_own::Share for TokenStream {}
+
 impl TokenStream {
     pub fn new(tts: Vec<TokenTree>) -> TokenStream {
         if tts.is_empty() {
@@ -283,7 +285,7 @@ impl TokenStream {
 
 impl Default for TokenStream {
     fn default() -> TokenStream {
-        EMPTY_TOKEN_STREAM.clone()
+        blaze_own::Share::share(&*EMPTY_TOKEN_STREAM)
     }
 }
 
@@ -466,7 +468,7 @@ impl TokenCursor {
                         return res;
                     }
                     &TokenTree::Delimited(sp, spacing, delim, ref tts) => {
-                        let trees = TokenTreeCursor::new(tts.clone());
+                        let trees = TokenTreeCursor::new(blaze_own::Share::share(tts));
                         self.curr.bump(); // move past the `Delimited`
                         self.stack.push(mem::replace(&mut self.curr, trees));
                         if !delim.skip() {

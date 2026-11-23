@@ -142,6 +142,8 @@ pub struct SourceMap {
     used_address_space: std::cell::Cell<u32>,
 }
 
+pub(crate) fn share_arc<T: ?Sized>(x: &Arc<T>) -> Arc<T> { Arc::clone(x) }
+
 impl SourceMap {
     pub fn new() -> SourceMap {
         SourceMap::default()
@@ -166,7 +168,7 @@ impl SourceMap {
         let start_pos = BytePos(self.used_address_space.get());
         self.used_address_space.set(start_pos.0 + size + 1);
         let file = Arc::new(SourceFile::new(name, src, start_pos));
-        self.files.borrow_mut().push(file.clone());
+        self.files.borrow_mut().push(share_arc(&file));
         file
     }
 
@@ -183,7 +185,7 @@ impl SourceMap {
         let i = files
             .partition_point(|f| f.start_pos <= pos)
             .saturating_sub(1);
-        files[i].clone()
+        share_arc(&files[i])
     }
 
     pub fn lookup_char_pos(&self, pos: BytePos) -> Loc {

@@ -138,22 +138,22 @@ pub fn record(reps: &[Vec<u8>], inputs: &Inputs) -> Result<(RunRow, Vec<FnRow>),
     // alloc: once a run, the maps by build id
     let mut maps: BTreeMap<String, Option<Loaded>> = BTreeMap::new();
     // alloc: once a run, its functions
-    let mut slots: BTreeMap<Name, Function> = BTreeMap::new();
+    let (mut slots, mut slot_of) = (Vec::new(), BTreeMap::new());
     let mut samples = 0u64;
     let mut unmapped = 0u64;
     let mut wall_ns = 0i64;
     let mut started = i64::MAX;
     // The executable: the module whose file name is the program's.
-    let mut binary: Option<(String, Option<String>)> = None;
+    let mut binary: Option<(&str, Option<&str>)> = None;
     let reps_count = profiles.len();
     for (rep, profile) in profiles.iter().enumerate() {
         wall_ns = wall_ns.saturating_add(profile.meta.end_ns.saturating_sub(profile.meta.start_ns));
         started = started.min(profile.meta.start_unix_ns);
         // Each frame's place, resolved once a repetition.
         // alloc: once a repetition, per frame
-        let mut resolved: Vec<Option<Name>> = vec![None; profile.frames.len()];
+        let mut resolved = vec![None; profile.frames.len()];
         // alloc: once a repetition, reused per sample
-        let mut on_stack: Vec<Name> = Vec::new();
+        let mut on_stack = Vec::new();
         for sample in &profile.cpu_samples {
             if !sample.on_cpu {
                 continue;
@@ -200,43 +200,41 @@ pub fn record(reps: &[Vec<u8>], inputs: &Inputs) -> Result<(RunRow, Vec<FnRow>),
                         .file_name()
                         .is_some_and(|it| it.to_str() == Some(first.program.as_str()))
                 {
-                    // clone: once a run, the executable's path and build id
-                    binary = Some((module.clone(), frame.build_id.clone()));
+                    binary = Some((module.as_str(), frame.build_id.as_deref()));
                 }
-                let name = match &resolved[it.frame as usize] {
-                    // clone: a resolved name, per frame of a sample
-                    Some(name) => name.clone(),
+                let id = match resolved[it.frame as usize] {
+                    Some(id) => id,
                     None => {
-                        let name = resolve(
+                        let id = resolve(
                             profile,
                             it.frame,
                             &inputs.perf,
                             &mut maps,
                             &mut slots,
+                            &mut slot_of,
                             &mut gaps,
                             reps_count,
                         )?;
-                        // clone: once per frame of a repetition
-                        resolved[it.frame as usize] = Some(name.clone());
-                        name
+                        resolved[it.frame as usize] = Some(id);
+                        id
                     }
                 };
                 if leaf {
-                    leaf_mapped = matches!(name, Name::Identity(_));
-                    if let Some(function) = slots.get_mut(&name) {
+                    if let Some((name, function)) = slots.get_mut(id) {
+                        leaf_mapped = matches!(name, Name::Identity(_));
                         function.self_samples[rep] += 1;
                     }
                     leaf = false;
                 }
-                on_stack.push(name);
+                on_stack.push(id);
             }
             if !leaf_mapped {
                 unmapped += 1;
             }
             on_stack.sort_unstable();
             on_stack.dedup();
-            for name in &on_stack {
-                if let Some(function) = slots.get_mut(name) {
+            for &id in &on_stack {
+                if let Some((_, function)) = slots.get_mut(id) {
                     function.total_samples[rep] += 1;
                 }
             }
@@ -245,24 +243,24 @@ pub fn record(reps: &[Vec<u8>], inputs: &Inputs) -> Result<(RunRow, Vec<FnRow>),
 
     // The executable's hash, as it is now, unless it was written after the run began: then
     // what ran is gone, and that is the gap.
-    let (binary_hash, build_id) = match &binary {
+    let (binary_hash, build_id) = match binary {
         None => {
             gaps.insert(format!("binary: no sampled frame is in {}", first.program));
             (None, None)
         }
         Some((path, build_id)) => {
-            (hash_binary(Path::new(path), started, &mut gaps), build_id.clone())
+            (hash_binary(Path::new(path), started, &mut gaps), build_id.map(str::to_owned))
         }
     };
     // alloc: once a run, its rows
     let mut rows = Vec::new();
-    for (name, function) in &slots {
+    slots.sort_by(|(a, _), (b, _)| a.cmp(b));
+    for (name, function) in slots {
         let (identity, function_name) = match name {
             Name::Identity(id) => {
-                (Some(hex(id)), function.names.first().cloned().unwrap_or_default())
+                (Some(hex(&id)), function.names.first().cloned().unwrap_or_default())
             }
-            // clone: once a row
-            Name::Named { function, .. } => (None, function.clone()),
+            Name::Named { function, .. } => (None, function),
         };
         let one = |set: &BTreeSet<Id>| match set.len() {
             0 => None,
@@ -308,8 +306,7 @@ pub fn record(reps: &[Vec<u8>], inputs: &Inputs) -> Result<(RunRow, Vec<FnRow>),
     }
     let used_maps = maps.values().any(Option::is_some);
     let row = RunRow {
-        // clone: once a run
-        run: run.clone(),
+        run,
         format: FORMAT,
         // clone: once a run
         target: first.program.clone(),
@@ -345,10 +342,11 @@ fn resolve(
     frame: u32,
     perf: &Path,
     maps: &mut BTreeMap<String, Option<Loaded>>,
-    slots: &mut BTreeMap<Name, Function>,
+    slots: &mut Vec<(Name, Function)>,
+    slot_of: &mut BTreeMap<Name, usize>,
     gaps: &mut BTreeSet<String>,
     reps: usize,
-) -> Result<Name, String> {
+) -> Result<usize, String> {
     let it = &profile.frames[frame as usize];
     let module = it.module.as_deref();
     let shown = module.map_or("an unknown image", |it| it);
@@ -409,21 +407,32 @@ fn resolve(
             }
         }
     };
-    // clone: once a frame, the slot's key
-    let slot = slots.entry(name.clone()).or_insert_with(|| Function {
-        names: BTreeSet::new(),
-        // alloc: once a function
-        module: module.map(str::to_owned),
-        keys: BTreeSet::new(),
-        codes: BTreeSet::new(),
-        deeps: BTreeSet::new(),
-        gap,
-        // alloc: once a function
-        self_samples: vec![0; reps],
-        // alloc: once a function
-        total_samples: vec![0; reps],
-    });
-    if let Some((loaded, node)) = node {
+    let id = if let Some(&id) = slot_of.get(&name) {
+        id
+    } else {
+        let id = slots.len();
+        slots.push((
+            name.clone(),
+            Function {
+                names: Default::default(),
+                // alloc: once a function
+                module: module.map(str::to_owned),
+                keys: Default::default(),
+                codes: Default::default(),
+                deeps: Default::default(),
+                gap,
+                // alloc: once a function
+                self_samples: vec![0; reps],
+                // alloc: once a function
+                total_samples: vec![0; reps],
+            },
+        ));
+        slot_of.insert(name, id);
+        id
+    };
+    if let Some((loaded, node)) = node
+        && let Some((_, slot)) = slots.get_mut(id)
+    {
         let it = &loaded.map.nodes[node as usize];
         // clone: once a frame, a name of an instance
         slot.names.insert(it.name.clone());
@@ -431,7 +440,7 @@ fn resolve(
         slot.codes.insert(it.code);
         slot.deeps.insert(loaded.deep[node as usize]);
     }
-    Ok(name)
+    Ok(id)
 }
 
 /// The BLAKE3 hash of the executable at `path`, hex; none, with the gap named, when it can't

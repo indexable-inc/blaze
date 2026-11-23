@@ -969,12 +969,12 @@ impl TreeRunner for ShelfTree<'_> {
                 }
             }
             for (name, value) in tool_env.iter() {
-                vars.push((name.clone(), value.clone()));
+                vars.push((name.clone_in(alloc), value.clone_in(alloc)));
             }
             vars.push((String::from_str_in("MACOSX_DEPLOYMENT_TARGET", alloc), String::from_str_in(blaze_build_script::toolchain::MACOS_MIN, alloc)));
-            vars.push((String::from_str_in("PATH", alloc), path_value.clone()));
+            vars.push((String::from_str_in("PATH", alloc), path_value.clone_in(alloc)));
             vars.push((String::from_str_in("SDKROOT", alloc), String::from_str_in(sdk, alloc)));
-            vars.push((String::from_str_in("TMPDIR", alloc), tmp.clone()));
+            vars.push((String::from_str_in("TMPDIR", alloc), tmp.clone_in(alloc)));
             for (name, value) in FIXED_ENV {
                 vars.push((String::from_str_in(name, alloc), String::from_str_in(value, alloc)));
             }

@@ -37,6 +37,7 @@ use std::{
 };
 
 use blaze_core::{Completion, Done, Effect, Extent, FileName, IoError, LockMode, Mapping, Meta, Tag};
+use blaze_own::Share;
 
 use super::{
     CompactError, HistoryError, OWNER,
@@ -324,7 +325,7 @@ struct State {
     /// The manifest may name retired files still on disk: a reap looks.
     reaping: bool,
     /// The manifest as this core last read or committed it.
-    manifest: Manifest,
+    manifest: manifest::SharedManifest,
     /// Crash records a flush wrote the rows of: the next commit consumes them, then they go.
     listing: crash::Written,
 }
@@ -522,10 +523,10 @@ fn manifest_error<H: Host>(cx: &Cx<'_, H>, why: ManifestError) -> HistoryError {
 }
 
 /// The completion of an unlock, checked.
-fn unlocked(done: Done, path: PathBuf) -> Result<(), HistoryError> {
-    match check(done, || path.clone(), "letting go of the lock of")? {
+fn unlocked(done: Done, path: impl Fn() -> PathBuf) -> Result<(), HistoryError> {
+    match check(done, &path, "letting go of the lock of")? {
         Done::Unlocked => Ok(()),
-        other => Err(unexpected(path, "letting go of the lock of", &other)),
+        other => Err(unexpected(path(), "letting go of the lock of", &other)),
     }
 }
 
@@ -629,7 +630,7 @@ impl Read {
                             self.stage = Reading::Read;
                         }
                         Ok(Done::Stat(None)) => {
-                            let dir = cx.dir.clone(); // clone: a refcount
+                            let dir = cx.dir.share();
                             cx.ask(Wait::Files, |tag| Effect::List { dir: dir.into(), tag });
                             self.stage = Reading::List;
                         }
@@ -730,14 +731,14 @@ impl Read {
                     let legacy = match self.legacy {
                         true => {
                             let doing = "reading the retired files of a history before manifests";
-                            let path = cx.path(manifest::LEGACY_RETIRED);
+                            let path = || cx.path(manifest::LEGACY_RETIRED);
                             let Some(it) = done.next() else {
                                 unreachable!("one completion an effect")
                             };
-                            match check(it, || path.clone(), doing) {
+                            match check(it, path, doing) {
                                 Ok(Done::Read(bytes)) => Some(bytes),
                                 Ok(other) => {
-                                    return Step::Ready(Err(unexpected(path, doing, &other)));
+                                    return Step::Ready(Err(unexpected(path(), doing, &other)));
                                 }
                                 Err(error) => return Step::Ready(Err(error)),
                             }
@@ -1027,7 +1028,7 @@ impl Change {
                         Step::Ready(Err(error)) => return Step::Ready(Err(error)),
                         Step::Ready(Ok(())) => {
                             // clone: the manifest, once a commit
-                            st.manifest = held.manifest().clone();
+                            st.manifest = held.shared();
                             cx.unlock(self.hold.lock);
                             self.stage = Changing::Unlock;
                             return Step::Pending;
@@ -1035,7 +1036,7 @@ impl Change {
                     }
                 }
                 Changing::Unlock => {
-                    return Step::Ready(unlocked(only(done.take()), cx.path(manifest::LOCK)));
+                    return Step::Ready(unlocked(only(done.take()), || cx.path(manifest::LOCK)));
                 }
             }
         }
@@ -1324,13 +1325,13 @@ impl CapRule {
 /// The builds the rule keeps whole: every one in `running`, and the `keep` highest-numbered of
 /// the others any file of `kept` holds rows of, sorted. A file whose rows span `lo..=hi` says
 /// builds `lo` and `hi` had rows; one between them is in the same unit whatever it is.
-fn kept_builds<'a, R: Allocator + Clone + std::alloc::AllocatorClone, A: Allocator + Clone>(
+fn kept_builds<'a, R: Allocator + Clone + std::alloc::AllocatorClone, A: Allocator + Copy>(
     kept: impl Iterator<Item = &'a Kept>,
     running: &BTreeSet<u64, R>,
     keep: usize,
     alloc: A,
 ) -> Vec<u64, A> {
-    let mut known = Vec::new_in(alloc.clone());
+    let mut known = Vec::new_in(alloc);
     for it in kept {
         if let Some([lo, hi]) = builds_of(it) {
             known.push(lo);
@@ -1785,7 +1786,7 @@ impl Reap {
                 }
                 Reaping::UnlockStale => {
                     for done in round(done.take()) {
-                        if let Err(error) = unlocked(done, cx.path(PINS)) {
+                        if let Err(error) = unlocked(done, || cx.path(PINS)) {
                             return Step::Ready(Err(error));
                         }
                     }
@@ -1823,7 +1824,7 @@ impl Reap {
                         Step::Ready(Err(error)) => return Step::Ready(Err(error)),
                         Step::Ready(Ok(())) => {
                             // clone: the manifest, once a commit
-                            st.manifest = held.manifest().clone();
+                            st.manifest = held.shared();
                             st.reaping = !held.manifest().retired().files.is_empty();
                             cx.unlock(self.hold.lock);
                             self.stage = Reaping::Unlock;
@@ -1832,7 +1833,7 @@ impl Reap {
                     }
                 }
                 Reaping::Unlock => {
-                    if let Err(error) = unlocked(only(done.take()), cx.path(manifest::LOCK)) {
+                    if let Err(error) = unlocked(only(done.take()), || cx.path(manifest::LOCK)) {
                         return Step::Ready(Err(error));
                     }
                     return Step::Ready(Ok(u32::try_from(self.reapable.len()).unwrap_or(u32::MAX)));
@@ -2341,7 +2342,7 @@ impl Recover {
                 }
                 Recovering::Released => {
                     for done in round(done.take()) {
-                        if let Err(error) = unlocked(done, cx.dir_path()) {
+                        if let Err(error) = unlocked(done, || cx.dir_path()) {
                             self.note(error);
                         }
                     }
@@ -2770,7 +2771,7 @@ impl Open {
                     Step::Ready(Err(error)) => return Step::Ready(Err(error)),
                     Step::Ready(Ok(held)) => {
                         self.held = Some(held);
-                        let dir = cx.dir.clone(); // clone: a refcount
+                        let dir = cx.dir.share();
                         cx.ask(Wait::Files, |tag| Effect::List { dir: dir.into(), tag });
                         self.stage = Opening::List;
                         return Step::Pending;
@@ -2838,7 +2839,7 @@ impl Open {
                         Step::Ready(Err(error)) => return Step::Ready(Err(error)),
                         Step::Ready(Ok(())) => {
                             // clone: the manifest, once a history
-                            st.manifest = held.manifest().clone();
+                            st.manifest = held.shared();
                             // The first reap looks: a manifest a crash left may name retired files.
                             st.reaping = true;
                             cx.unlock(self.hold.lock);
@@ -2848,7 +2849,7 @@ impl Open {
                     }
                 }
                 Opening::Unlock => {
-                    if let Err(error) = unlocked(only(done.take()), cx.path(manifest::LOCK)) {
+                    if let Err(error) = unlocked(only(done.take()), || cx.path(manifest::LOCK)) {
                         return Step::Ready(Err(error));
                     }
                     // An empty `schema.<table>.parquet` of each table, each written over: a
@@ -3169,7 +3170,7 @@ impl FlushJob {
                 },
                 Flushing::Release => {
                     for it in round(done.take()) {
-                        if let Err(error) = unlocked(it, cx.dir_path()) {
+                        if let Err(error) = unlocked(it, || cx.dir_path()) {
                             self.out.deferred.push(error);
                         }
                     }
@@ -3335,7 +3336,7 @@ impl WriteListed {
                         Step::Ready(Err(error)) => return Step::Ready(Err(error)),
                         Step::Ready(Ok(())) => {
                             // clone: the manifest, once a commit
-                            st.manifest = held.manifest().clone();
+                            st.manifest = held.shared();
                             cx.unlock(self.hold.lock);
                             self.stage = Listing::Unlock;
                             return Step::Pending;
@@ -3343,7 +3344,7 @@ impl WriteListed {
                     }
                 }
                 Listing::Unlock => {
-                    if let Err(error) = unlocked(only(done.take()), cx.path(manifest::LOCK)) {
+                    if let Err(error) = unlocked(only(done.take()), || cx.path(manifest::LOCK)) {
                         return Step::Ready(Err(error));
                     }
                     return Step::Ready(Ok(Outcome::WroteListed(Ok(self.bytes))));
@@ -3535,8 +3536,8 @@ impl RecoverDead {
                             .max()
                             .unwrap_or(0);
                         st.seq = last.max(manifest.flushed()) + 1;
-                        st.manifest = manifest;
-                        let dir = cx.dir.clone(); // clone: a refcount
+                        st.manifest = manifest::SharedManifest::new(manifest);
+                        let dir = cx.dir.share();
                         cx.ask(Wait::Files, |tag| Effect::List { dir: dir.into(), tag });
                         self.stage = Dying::List;
                         return Step::Pending;
@@ -3562,7 +3563,7 @@ impl RecoverDead {
                     }
                 }
                 Dying::Unlock => {
-                    if let Err(error) = unlocked(only(done.take()), cx.path(OWNER)) {
+                    if let Err(error) = unlocked(only(done.take()), || cx.path(OWNER)) {
                         return Step::Ready(Err(error));
                     }
                     let Some((written, failed)) = self.result.take() else {
@@ -3685,19 +3686,19 @@ impl PinJob {
                     return Step::Pending;
                 }
                 Pinning::Lock => {
-                    let path = cx.path(PINS).join(self.making());
-                    match check(only(done.take()), || path.clone(), "making a reader's pin") {
+                    let path = || cx.path(PINS).join(self.making());
+                    match check(only(done.take()), path, "making a reader's pin") {
                         Ok(Done::Locked) => cx.locks.push(self.lock),
                         Ok(Done::Contended) => {
                             return Step::Ready(Err(HistoryError::Io {
-                                path,
+                                path: path(),
                                 doing: "locking a reader's pin, which another holds",
                                 error: io::ErrorKind::WouldBlock.into(),
                             }));
                         }
                         Ok(other) => {
                             return Step::Ready(Err(unexpected(
-                                path,
+                                path(),
                                 "locking a reader's pin",
                                 &other,
                             )));
@@ -3727,7 +3728,7 @@ impl PinJob {
                         let generation = manifest.retired().generation;
                         let said =
                             cx.pin_file(&PinFile::Said { id: &self.id, generation }.file_name());
-                        self.said = Some(said.clone()); // clone: a refcount
+                        self.said = Some(said.share());
                         cx.ask(Wait::Files, |tag| Effect::Truncate { file: said, len: 0, tag });
                         self.manifest = Some(manifest);
                         self.stage = Pinning::Say;
@@ -3779,12 +3780,12 @@ impl Unpin {
     ) -> Step<Result<Outcome, HistoryError>> {
         match self.stage {
             Unpinning::Said => {
-                let file = self.pin.said.clone(); // clone: a refcount
+                let file = self.pin.said.share();
                 cx.ask(Wait::Files, |tag| Effect::Remove { file, tag });
                 self.stage = Unpinning::LockFile;
             }
             Unpinning::LockFile => {
-                let file = self.pin.lock_file.clone(); // clone: a refcount
+                let file = self.pin.lock_file.share();
                 cx.ask(Wait::Files, |tag| Effect::Remove { file, tag });
                 self.stage = Unpinning::Unlock;
             }
@@ -3820,7 +3821,7 @@ impl<H: Host> Files<H> {
                 running: BTreeSet::new(),
                 seq: 1,
                 reaping: false,
-                manifest: Manifest::new(),
+                manifest: manifest::SharedManifest::new(Manifest::new()),
                 listing: crash::Written::default(),
             },
             // alloc: once a core

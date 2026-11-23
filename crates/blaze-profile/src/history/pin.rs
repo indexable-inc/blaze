@@ -8,6 +8,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use blaze_own::Share;
+
 use super::{
     HistoryError,
     drive::{Core, Live, mismatch},
@@ -57,8 +59,7 @@ impl Drop for Pin {
     /// unlocked.
     fn drop(&mut self) {
         let Some(pinned) = self.pinned.take() else { return };
-        // clone: the pin's name, for the warning if it can't be let go of
-        let named = pinned.lock_file.clone();
+        let named = pinned.lock_file.share();
         match self.core.job(|it: &mut Files<Live>| it.unpin(pinned)) {
             Ok(Outcome::Unpinned) => {}
             Ok(other) => {

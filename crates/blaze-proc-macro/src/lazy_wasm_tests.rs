@@ -11,6 +11,8 @@
 //! Expected (`cargo test -p blaze-proc-macro --lib lazy_wasm -- --nocapture`):
 //!   "a load from its compiled record: 0 wasm bytes read (floor 0), compiled 0" and three ok.
 
+#![cfg(test)]
+
 use super::{Runtime, Setup, compiled_path, folder, reader_in, reader_outputs};
 use crate::{host::RuntimeError, module::ModuleError};
 

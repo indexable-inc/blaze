@@ -25,6 +25,14 @@ pub mod parts;
 pub mod record;
 pub mod sandbox;
 
+/// O(1) refcount share of a `std::sync::Arc` handle.
+#[cfg(feature = "runtime")]
+pub(crate) trait ShareArc {
+    fn share_arc(&self) -> Self;
+}
+#[cfg(feature = "runtime")]
+impl<T: ?Sized> ShareArc for std::sync::Arc<T> { #[inline] fn share_arc(&self) -> Self { std::sync::Arc::clone(self) } }
+
 // With `runtime`: running a module (the bridge, the host, the hook, build scripts).
 #[cfg(feature = "runtime")]
 pub mod fact_pins;

@@ -129,7 +129,7 @@ fn rewrite_pairs_multiline<T: Rewrite>(
     let indent_str = nested_shape.indent.to_string_with_newline(context.config);
     let mut result = String::new();
 
-    result.push_str(list.list[0].1.as_ref().map_err(|err| err.clone())?);
+    result.push_str(list.list[0].1.as_ref().map_err(|&err| err)?);
 
     for ((e, default_rw), s) in list.list[1..].iter().zip(list.separators.iter()) {
         // The following test checks if we should keep two subexprs on the same
@@ -170,7 +170,7 @@ fn rewrite_pairs_multiline<T: Rewrite>(
             }
         }
 
-        result.push_str(default_rw.as_ref().map_err(|err| err.clone())?);
+        result.push_str(default_rw.as_ref().map_err(|&err| err)?);
     }
     Ok(result)
 }

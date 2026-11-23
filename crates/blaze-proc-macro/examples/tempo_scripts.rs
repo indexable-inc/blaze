@@ -406,7 +406,7 @@ fn main() {
                     println!("    given DEP_{}_{}={value:?}", links.to_uppercase().replace('-', "_"), key.to_uppercase().replace('-', "_"));
                 }
             }
-            given.push(GivenRun { script: input, links, outputs, tree: tree.clone(), root: root.clone(), direct });
+            given.push(GivenRun { script: input, links, outputs, tree: blaze_own::Share::share(tree), root: blaze_own::Share::share(root), direct });
         }
         // The one choice point (D112), made by the run itself: said here for the census.
         if let Runner::Native { because } = placed(graph, script, setting.mode, alloc) {
@@ -414,7 +414,7 @@ fn main() {
             println!("  native (its closure holds {} {}, D112)", because.name.as_str(), because.version.as_str());
         }
         let started = Instant::now();
-        let ran = match outputs_given(&runtime, &setting, graph, script, None, tree.clone(), folder.clone(), &given, alloc) {
+        let ran = match outputs_given(&runtime, &setting, graph, script, None, blaze_own::Share::share(&tree), blaze_own::Share::share(&folder), &given, alloc) {
             Ok(ran) => ran,
             Err(error) => {
                 println!("  run: {error}");
@@ -457,7 +457,7 @@ fn main() {
                 o.encode(&mut encoded);
                 record.extend_from_slice(&encoded);
             }
-            runs.insert(script, (record, tree.clone(), folder.clone()));
+            runs.insert(script, (record, tree, folder));
         }
         if let Some(dir) = &export {
             export_record(dir, &store, unit, served.for_host, o, alloc);

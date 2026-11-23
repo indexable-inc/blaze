@@ -254,7 +254,7 @@ impl Resolve<'_> {
                 _ => best = vec![m],
             }
         }
-        let count = |map: &Mutex<BTreeMap<String, u64>>| *map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(label.clone()).or_default() += 1;
+        let count = move |map: &Mutex<BTreeMap<String, u64>>| *map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(label).or_default() += 1;
         match best[..] {
             [] if through.is_some() => {
                 self.count_through(kind, &written, segs, "the crate the `use` names reaches no proc macro of that name");
@@ -429,7 +429,7 @@ impl ExpandCx for Counted<'_, '_> {
                     t.panics += 1;
                     let text = message.get(&produced.text).map(str::to_owned).unwrap_or_default();
                     let mut first = self.panics.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let entry = first.entry(label.clone()).or_default();
+                    let entry = first.entry(label).or_default();
                     if !entry.iter().any(|(m, _)| *m == text) && entry.len() < 4 {
                         entry.push((text, String::new()));
                     }
@@ -692,7 +692,7 @@ fn main() {
         // The source as the module is keyed by it: a path crate by its files as they are, a
         // registry crate by the lock's checksum, a git crate by its commit and its folder in the
         // repository, which the lock does not say (taken from the builder's identity).
-        let checksum = lock[package].checksum.clone().unwrap_or_default();
+        let checksum = lock[package].checksum.as_deref().unwrap_or_default();
         let digest;
         let git = git_of(store, name, version);
         let source = if lock[package].path {

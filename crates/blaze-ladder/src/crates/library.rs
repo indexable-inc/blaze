@@ -14,7 +14,7 @@ use blaze_scope::apart::{Apart, ApartError};
 use blaze_scope::resolve::{CrateInput, Names};
 use blaze_scope::task::{First, Serial};
 
-use super::{Inputs, Texts, Toolchain, UserCrate};
+use super::{Inputs, Shared, Texts, Toolchain, UserCrate};
 
 /// Every toolchain unit's names, and the inputs they were resolved from.
 pub struct Library<'t> {
@@ -42,10 +42,10 @@ impl<'t> Library<'t> {
     pub fn inputs_for(&self, user: &'t UserCrate<'t>) -> Inputs<'t> {
         let of = self.inputs;
         Inputs {
-            texts: Texts { user: user.files, packs: of.texts.packs.clone() },
-            features: of.features.clone(),
-            cfgs: of.cfgs.clone(),
-            deps: of.deps.clone(),
+            texts: Texts { user: user.files, packs: Shared::Borrowed(&of.texts.packs) },
+            features: Shared::Borrowed(&of.features),
+            cfgs: Shared::Borrowed(&of.cfgs),
+            deps: Shared::Borrowed(&of.deps),
             user,
             tc: of.tc,
             sysroot: of.sysroot,

@@ -46,10 +46,10 @@ pub fn library_of(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>, panic
     let file = files.iter().find(|f| f.path == root).ok_or(RunError::NoMain)?;
     let edition = edition::PackageEdition::of_manifest(new.edition).map_err(|_| RunError::Edition { written: new.edition.into() })?;
     let target = blaze_scope::task::Target::AARCH64_APPLE_DARWIN;
-    let target_cfg = blaze_scope::task::Cfg::of(&target, &[], alloc.clone());
+    let target_cfg = blaze_scope::task::Cfg::of(&target, &[], alloc);
     let mut atoms: Vec<(&str, Option<&str>)> = target_cfg.atoms().to_vec();
     crate::panic_strategy::derive_cfg(&mut atoms, panic);
-    let cfg = blaze_scope::task::Cfg::from_atoms(&atoms, alloc.clone());
+    let cfg = blaze_scope::task::Cfg::from_atoms(&atoms, alloc);
     Ok(if root_names_toolchain(file.text, syntax_of(edition), &cfg, alloc) { Library::Shelf } else { Library::None })
 }
 
@@ -58,7 +58,7 @@ pub fn library_of(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>, panic
 /// `extern crate core|alloc|std`. The one rule [`library_of`] and blaze-cli's names task (which
 /// sysroot crates a workspace crate is handed) both take, so the run and the check agree.
 pub fn root_names_toolchain(text: &str, edition: blaze_surface::Edition, cfg: &blaze_scope::task::Cfg<'_, '_>, alloc: Alloc<'_>) -> bool {
-    let outline = blaze_file_items::outline(text, edition, alloc.clone());
+    let outline = blaze_file_items::outline(text, edition, alloc);
     let attrs = blaze_scope::task::file_attrs(cfg, &outline, text, alloc);
     if !attrs.no_core {
         return true;

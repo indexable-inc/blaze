@@ -1660,7 +1660,7 @@ impl History {
             true => panics::since(&mut self.panicked, &mut self.raised),
             false => 0,
         };
-        let mut panic_rows = panics::rows(&self.raised);
+        let mut panic_rows = panics::rows(&mut self.raised);
         // clone: the rows of crashes recovered, once a flush until one writes them
         panic_rows.extend(self.crashes.rows.iter().cloned());
         let named =
